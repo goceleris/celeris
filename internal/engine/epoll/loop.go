@@ -3637,6 +3637,9 @@ func (l *Loop) closeConn(fd int) {
 		sockopts.CloseDrain(fd, "epoll/closeConn", cs.remoteAddr)
 		_ = unix.Close(fd)
 	}
+	if h := testHookConnClosed; h != nil {
+		h(l, fd)
+	}
 	l.removeLiveConn(cs)
 	l.connCount--
 	l.activeConns.Add(-1)

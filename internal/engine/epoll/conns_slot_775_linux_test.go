@@ -231,3 +231,85 @@ func TestCloseConnClearsSlotUnderDriverMu775(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// TestDriverTakesNumberFreedByCloseConn775: the slot is cleared before the
+// descriptor is closed, so the moment the number is free a driver can register
+// on it. The hook runs on the loop's goroutine right after close(2), where a
+// slot cleared after the close would still be set: RegisterConn must succeed
+// on the freed number, not be refused as "already an HTTP connection" for a
+// connection that is gone.
+func TestDriverTakesNumberFreedByCloseConn775(t *testing.T) {
+	defer watchdog(t, time.Minute)()
+
+	var target atomic.Int64
+	target.Store(-1)
+	type result struct {
+		regErr, unregErr error
+		slotBusy         bool
+		reused           bool
+	}
+	got := make(chan result, 1)
+	testHookConnClosed = func(l *Loop, fd int) {
+		if int64(fd) != target.Load() {
+			return
+		}
+		var r result
+		// close(2) has just returned: the number is the lowest free one, so a
+		// new socket normally gets it. Pin it with dup3 if another descriptor
+		// of the process came first (only when the number is verified free).
+		nfd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			r.regErr = err
+			got <- r
+			return
+		}
+		if nfd != fd {
+			if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == unix.EBADF {
+				if err := unix.Dup3(nfd, fd, unix.O_CLOEXEC); err == nil {
+					r.reused = true
+				}
+			}
+			_ = unix.Close(nfd)
+		} else {
+			r.reused = true
+		}
+		if !r.reused {
+			got <- r
+			return
+		}
+		l.driverMu.RLock()
+		r.slotBusy = fd < len(l.conns) && l.conns[fd] != nil
+		l.driverMu.RUnlock()
+		r.regErr = l.RegisterConn(fd, func([]byte) {}, func(error) {})
+		if r.regErr == nil {
+			r.unregErr = l.UnregisterConn(fd)
+		}
+		_ = unix.Close(fd)
+		got <- r
+	}
+	t.Cleanup(func() { testHookConnClosed = nil })
+
+	eng, stopEng := newTestEngine(t)
+	t.Cleanup(stopEng)
+	clients, fds := acceptedConns(t, eng, 1)
+	target.Store(int64(fds[0]))
+	_ = clients[0].Close()
+
+	select {
+	case r := <-got:
+		if !r.reused {
+			t.Fatalf("the freed number %d could not be taken by a new descriptor: the test did not reach RegisterConn", fds[0])
+		}
+		if r.slotBusy {
+			t.Errorf("l.conns[%d] was still set after closeConn closed the descriptor: the slot is cleared after the close, not before", fds[0])
+		}
+		if r.regErr != nil {
+			t.Errorf("RegisterConn on the number closeConn had just freed: %v", r.regErr)
+		}
+		if r.unregErr != nil {
+			t.Errorf("UnregisterConn: %v", r.unregErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("closeConn did not close the connection")
+	}
+}

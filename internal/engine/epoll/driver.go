@@ -111,6 +111,13 @@ func (dc *driverConn) epollEvent(events uint32) unix.EpollEvent {
 // it after the engine is stopped.
 var testHookCloseDriverClaimed func(dc *driverConn)
 
+// testHookConnClosed, when non-nil, runs in closeConn on the loop's goroutine
+// right after the descriptor is closed, with no lock held: the number is free
+// and a driver may take it, so the slot l.conns[fd] must already be clear
+// (celeris#775). Tests only: a test sets it before it creates the engine and
+// clears it after the engine is stopped.
+var testHookConnClosed func(l *Loop, fd int)
+
 // lookupDriver returns the driverConn for fd, or nil if none is registered.
 // Safe to call from the worker goroutine during dispatch.
 func (l *Loop) lookupDriver(fd int) *driverConn {
@@ -133,8 +140,14 @@ func (l *Loop) lookupDriver(fd int) *driverConn {
 // the conn found by number, A's EPOLLRDHUP closed X (celeris#771). So the
 // event goes to the conn found only if the generations are equal, and is
 // dropped otherwise, as is a driver event whose conn has gone. An HTTP conn's
-// event (Pad 0) on a number that is a driver conn's is stale too: RegisterConn
-// refuses a number that is an HTTP conn's, so it is not the conn's own.
+// event (Pad 0) on a number that is a driver conn's is dropped too: RegisterConn
+// refuses a number that is an HTTP conn's, so that event was collected for an
+// HTTP conn that has since gone. The converse is not enforced: acceptAll does
+// not look at driverConns, and a conn that closeDriver closed on the caller's
+// goroutine stays in the map until its entry is deleted, so an HTTP conn can
+// be accepted on its number meanwhile and have its first event dropped. That is
+// a rule the worker applies (the base dispatched the same event to the closed
+// conn's no-op handler), not an invariant the loop guarantees.
 func (l *Loop) dispatchDriver(fd int, gen uint32, events uint32) bool {
 	dc := l.lookupDriver(fd)
 	if dc == nil {
