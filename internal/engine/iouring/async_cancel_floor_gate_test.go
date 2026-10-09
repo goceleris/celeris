@@ -4,10 +4,13 @@ package iouring
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 // TestRequireAsyncCancelFlags pins New's io_uring floor (celeris#682, #872)
@@ -68,5 +71,48 @@ func TestRequireAsyncCancelFlags(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestNewFloorHoldsWhenTheProbeAnswersAccepted872 runs the floor through New
+// on the running kernel (celeris#872). The probe is given the answer a
+// partial vendor backport gives (accepted: the one form it sends works) on
+// whatever kernel this runs on. Before 5.19 New must refuse io_uring with the
+// kernel requirement in its error; from 5.19 it must build the engine. On a
+// kernel before 5.19 this is the defect itself: the answer decided, and an
+// engine was built whose other cancel forms can fail on every close.
+func TestNewFloorHoldsWhenTheProbeAnswersAccepted872(t *testing.T) {
+	r, err := NewRing(8, 0, 0)
+	if err != nil {
+		skipOrFail656(t, "io_uring unavailable: %v", err)
+	}
+	_ = r.Close()
+	profile := probe.Probe()
+	if !profile.IOUringTier.Available() {
+		skipOrFail656(t, "the profile reports no io_uring tier on kernel %s", profile.KernelVersion)
+	}
+	fromFloor := profile.KernelMajor > 5 || (profile.KernelMajor == 5 && profile.KernelMinor >= 19)
+	saved := runAsyncCancelProbe
+	runAsyncCancelProbe = func() (asyncCancelProbe, string) { return asyncCancelAccepted, "" }
+	resetAsyncCancelProbeCache()
+	t.Cleanup(func() {
+		runAsyncCancelProbe = saved
+		resetAsyncCancelProbeCache() // the next New probes the kernel again
+	})
+	e, err := New(resource.Config{
+		Addr:     "127.0.0.1:0",
+		Protocol: engine.HTTP1,
+		Logger:   slog.New(slog.DiscardHandler),
+	}, transplantTestHandler{})
+	t.Logf("celeris872 kernel=%s (from 5.19: %v) probe=accepted: engine built=%v err=%v", profile.KernelVersion, fromFloor, e != nil, err)
+	switch {
+	case fromFloor && err != nil:
+		t.Fatalf("New refused io_uring on kernel %s, which has the floor, for a probe that answered accepted: %v", profile.KernelVersion, err)
+	case !fromFloor && err == nil:
+		t.Fatalf("New built an io_uring engine on kernel %s, before 5.19, because the probe answered accepted: "+
+			"a kernel that carries only some of the IORING_ASYNC_CANCEL flags answers so while the close path's "+
+			"other cancel forms fail with -EINVAL (celeris#872)", profile.KernelVersion)
+	case !fromFloor && (!strings.Contains(err.Error(), "5.19") || !strings.HasPrefix(err.Error(), "io_uring not available on this system")):
+		t.Errorf("New's error %q: want it to say io_uring is not available and name Linux 5.19", err)
 	}
 }
