@@ -463,6 +463,13 @@ type connState struct {
 	// The close paths use it to target an ASYNC_CANCEL at the armed
 	// recv's exact generation-tagged user_data. Worker-thread-only.
 	recvArmed bool
+	// cancelMissed is set by a close path that queued cs for release without
+	// having placed the cancel of a recv or send it left armed, because the
+	// SQ ring had no room (cancelConnOps, celeris#869). The op is then owed
+	// without anything having asked the kernel to end it: drainPendingRelease
+	// places the cancel again, and its backstop holds cs for the op instead of
+	// releasing it. Worker-thread-only; cleared at release.
+	cancelMissed bool
 	// recvOutstanding counts recv SQEs placed for this conn (prepareRecv,
 	// flushSendLink's linked recv) minus terminal udRecv CQEs dispatched
 	// to it. Mirrors recvArmed as a count so a second placement (2) and a
@@ -627,6 +634,7 @@ func releaseConnState(cs *connState) {
 	// the identity's count, not this one, waits for its notification).
 	cs.kernelInflight = 0
 	cs.recvArmed = false
+	cs.cancelMissed = false
 	cs.recvOutstanding = 0
 	cs.fd = 0
 	cs.liveIdx = -1

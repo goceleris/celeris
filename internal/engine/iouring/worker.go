@@ -204,7 +204,10 @@ type pendingReleaseEntry struct {
 	detached       bool
 	holdsFD        bool
 	zcHeld         bool
-	fd             int32
+	// cancelHeld records that the backstop held the entry for a cancel that
+	// was never placed (cs.cancelMissed) and counted it, once.
+	cancelHeld bool
+	fd         int32
 }
 
 // closedOpsEntry is the Worker.closedOps value: the conn(s) closed under
@@ -2556,6 +2559,10 @@ func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
 	}
 }
 
+// errHijackNoSQE is what hijackConn answers when the SQ ring has no room for
+// the cancel of the recv it would leave armed on the hijacker's socket.
+var errHijackNoSQE = errors.New("celeris: cannot hijack: the io_uring submission queue is full, the connection's receive cannot be cancelled")
+
 func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	cs := w.conns[fd]
 	if cs == nil {
@@ -2585,6 +2592,19 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	}
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
+	}
+	// Place the cancel of the recv still armed on the socket before anything
+	// changes (celeris#869). The socket lives on under the hijacker, so nothing
+	// but this cancel stops that recv from reading its first bytes (the close
+	// paths shut the read side down; a hijack cannot), and the release backstop
+	// must not be left to give the connState up with the recv still owed. With
+	// no room in the SQ ring even after a submit the hijack is refused, the
+	// conn untouched, and the handler can answer the request instead.
+	// Only the recv's cancel is placed here, and the rest of the cancels
+	// after the conn has left the tables: a refused hijack leaves the conn as
+	// it was, its header timer included.
+	if !w.cancelRecvOp(fd, cs) {
+		return nil, errHijackNoSQE
 	}
 	// Unlink from the dirty list (celeris#527). Here it is not just a leak:
 	// the fd stays open under the caller's net.Conn, and the dirty loop's
@@ -2634,7 +2654,8 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 		}
 		defer recvtheft.HijackHold()
 	}
-	w.cancelConnOps(fd, cs)
+	// The recv's cancel was placed above, before the conn left the tables.
+	w.cancelOtherOps(fd, cs)
 	w.noteClosedInflight(cs)
 	w.queuePendingReleaseDetached(cs)
 	// The fd-lifetime rule, hijack variant (celeris#685). The socket lives
@@ -4317,19 +4338,45 @@ func (w *Worker) closeConn(fd int) {
 // terminal CQE feeds the kernelInflight accounting.
 //
 // On a full SQ ring, mirror armHeaderTimer: Submit to drain, retry once,
-// and otherwise proceed without the cancel — the op then terminates on
-// peer data/FIN or the pendingRelease backstop reaps cs with a WARN.
-func (w *Worker) cancelConnOps(fd int, cs *connState) {
-	if cs.recvArmed {
-		if sqe := w.getCancelSQE(); sqe != nil {
-			prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, fd, cs.generation))
-			setSQEUserData(sqe, encodeUserData(udProvide, fd))
-		}
+// and otherwise proceed without the cancel and report it (missed): a recv or
+// send is left armed that nothing has asked the kernel to end. The close
+// paths then shut the socket down (an owed recv ends when it is issued),
+// mark cs (cancelMissed), and drainPendingRelease places the cancel again on
+// its next passes and, past the backstop, holds cs for the op instead of
+// releasing it (celeris#869). A hijack cannot shut the socket down, so it
+// refuses instead (hijackConn).
+func (w *Worker) cancelConnOps(fd int, cs *connState) (missed bool) {
+	missed = !w.cancelRecvOp(fd, cs)
+	return w.cancelOtherOps(fd, cs) || missed
+}
+
+// cancelRecvOp places the cancel of cs's armed recv, if it has one, and
+// reports whether it is placed (true when no recv is armed). It is the first
+// step of cancelConnOps, on its own so hijackConn can make it the whole of
+// its decision before it changes anything (celeris#869).
+func (w *Worker) cancelRecvOp(fd int, cs *connState) bool {
+	if !cs.recvArmed {
+		return true
 	}
+	sqe := w.getCancelSQE()
+	if sqe == nil {
+		return false
+	}
+	prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, fd, cs.generation))
+	setSQEUserData(sqe, encodeUserData(udProvide, fd))
+	return true
+}
+
+// cancelOtherOps is the rest of cancelConnOps: the cancels of an in-flight
+// send and of the armed header timer. It reports whether a send's cancel was
+// needed and not placed; the timer's is best effort, as it always was.
+func (w *Worker) cancelOtherOps(fd int, cs *connState) (missed bool) {
 	if cs.sending || cs.zcNotifPending {
 		if sqe := w.getCancelSQE(); sqe != nil {
 			prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udSend, fd, cs.generation))
 			setSQEUserData(sqe, encodeUserData(udProvide, fd))
+		} else {
+			missed = true
 		}
 	}
 	// Cancel the armed slowloris header timer too. armHeaderTimer leaves an
@@ -4353,6 +4400,20 @@ func (w *Worker) cancelConnOps(fd int, cs *connState) {
 			setSQEUserData(sqe, encodeUserData(udProvide, fd))
 		}
 	}
+	return missed
+}
+
+// retryMissedCancel places again the cancels a close path could not place for
+// cs (cs.cancelMissed, celeris#869). The ops it aims them at may have ended
+// meanwhile; a cancel of an op that is gone fails quietly (-ENOENT, dropped as
+// every close-path cancel's failure is). Reports whether they were placed now.
+// Worker thread only.
+func (w *Worker) retryMissedCancel(cs *connState) bool {
+	if w.cancelConnOps(cs.fd, cs) {
+		return false
+	}
+	cs.cancelMissed = false
+	return true
 }
 
 // getCancelSQE returns an SQE for a close-path cancel, submitting the
@@ -4495,10 +4556,23 @@ func (w *Worker) queuePendingReleaseDetached(cs *connState) {
 // scan, so compaction is required for prompt release behind them.
 func (w *Worker) drainPendingRelease() {
 	kept := w.pendingRelease[:0]
+	// One cancel retry per pass, for the first entry that needs it: a SQ
+	// ring that stays full would otherwise cost a failing submit per entry
+	// per pass (celeris#869).
+	retried := false
 	for i := range w.pendingRelease {
 		entry := &w.pendingRelease[i]
 		cs := entry.cs
 		if cs.kernelInflight > 0 {
+			// The close could not place the cancel of an op it left armed
+			// (cancelConnOps): place it now. The backstop's window restarts
+			// at the placement, for the cancel's terminal completion to arrive.
+			if cs.cancelMissed && !retried {
+				retried = true
+				if w.retryMissedCancel(cs) {
+					entry.releaseAtNanos = time.Now().UnixNano() + pendingReleaseHoldNanos
+				}
+			}
 			// A kept descriptor goes as soon as no owed op names it
 			// (celeris#798): what is left may be SEND_ZC notifications only,
 			// and one of those can wait on a stalled peer for as long as the
@@ -4518,6 +4592,27 @@ func (w *Worker) drainPendingRelease() {
 			// (holdZCPastBackstop).
 			if w.closedZCOwed(cs) {
 				w.holdZCPastBackstop(entry)
+				continue
+			}
+			// An op nobody asked the kernel to end is no anomaly either
+			// (celeris#869): the cancel was never placed, so the recv or
+			// send may still be armed and write (or read) the buffers
+			// below. Held in place, the cancel retried on each pass, until
+			// its terminal CQE: a leak only as long as the SQ ring stays
+			// full and the kernel leaves the op running after the close's
+			// shutdown.
+			if cs.cancelMissed {
+				if !entry.cancelHeld {
+					entry.cancelHeld = true
+					w.handoffLoss.noteCloseCancelMissedHeld()
+					if w.logger != nil {
+						w.logger.Warn("holding a closed connection's buffers past the release backstop: the cancel of an op it still owes was never placed",
+							"worker", w.id, "fd", cs.fd, "generation", cs.generation,
+							"inflight", cs.kernelInflight, "detached", entry.detached,
+							"holds_fd", entry.holdsFD)
+					}
+				}
+				kept = append(kept, *entry)
 				continue
 			}
 			// Backstop: kernel anomaly, not normal flow.
@@ -4615,7 +4710,7 @@ func (w *Worker) finishClose(fd int) {
 				defer recvtheft.HoldAfterClose(w.id, fd, linked)
 			}
 		}
-		w.cancelConnOps(fd, cs)
+		cs.cancelMissed = w.cancelConnOps(fd, cs)
 		w.noteClosedInflight(cs)
 		w.queuePendingReleaseFD(cs, false, keptFD(fd, owed))
 		if recvtheft.Enabled && recvtheft.SubmitBeforeClose() {
@@ -4752,7 +4847,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 			defer recvtheft.HoldAfterClose(w.id, fd, linked)
 		}
 	}
-	w.cancelConnOps(fd, cs)
+	cs.cancelMissed = w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
 	w.queuePendingReleaseFD(cs, true, keptFD(fd, owed))
 	if recvtheft.Enabled && recvtheft.SubmitBeforeClose() {
