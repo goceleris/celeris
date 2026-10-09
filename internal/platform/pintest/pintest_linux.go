@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -21,6 +22,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/platform"
 )
 
 // Thread is one task of this process as /proc/self/task/<tid>/status shows it.
@@ -218,6 +221,9 @@ const envChild = "CELERIS_PINTEST_CHILD"
 // RunInOwnProcess to the process it started.
 const envParentMask = "CELERIS_PINTEST_PARENT_MASK"
 
+// envMask carries the CPU list RunInOwnProcessOn narrowed the child to.
+const envMask = "CELERIS_PINTEST_MASK"
+
 // InOwnProcess reports whether this process is the one RunInOwnProcess
 // started for t.
 func InOwnProcess(t *testing.T) bool { return os.Getenv(envChild) == t.Name() }
@@ -239,6 +245,24 @@ func InOwnProcess(t *testing.T) bool { return os.Getenv(envChild) == t.Name() }
 // tests its own engine, and the child checks it again (envParentMask).
 func RunInOwnProcess(t *testing.T, timeout time.Duration) {
 	t.Helper()
+	runInOwnProcess(t, timeout, nil)
+}
+
+// RunInOwnProcessOn is RunInOwnProcess for a child that starts restricted to
+// the CPUs in cpus, as if started under taskset: the thread that forks it is
+// narrowed to cpus for the fork, then given back the process's mask. The
+// child sees the mask as StartupMask and as envMask, and checks it
+// (LoopsStayInsideTheMask).
+func RunInOwnProcessOn(t *testing.T, timeout time.Duration, cpus []int) {
+	t.Helper()
+	if len(cpus) == 0 {
+		t.Fatal("RunInOwnProcessOn: no CPUs")
+	}
+	runInOwnProcess(t, timeout, cpus)
+}
+
+func runInOwnProcess(t *testing.T, timeout time.Duration, narrow []int) {
+	t.Helper()
 	if InOwnProcess(t) {
 		t.Fatal("RunInOwnProcess called from inside the process it started")
 	}
@@ -255,6 +279,13 @@ func RunInOwnProcess(t *testing.T, timeout time.Duration) {
 		"-test.timeout="+timeout.String(),
 	)
 	cmd.Env = append(os.Environ(), envChild+"="+name, envParentMask+"="+startup.mask)
+	var narrowSet unix.CPUSet
+	if len(narrow) > 0 {
+		for _, c := range narrow {
+			narrowSet.Set(c)
+		}
+		cmd.Env = append(cmd.Env, envMask+"="+platform.FormatCPUs(narrow))
+	}
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	runtime.LockOSThread()
@@ -272,7 +303,19 @@ func RunInOwnProcess(t *testing.T, timeout time.Duration) {
 			t.Errorf("put the process's mask back on that thread before the fork: %v", err)
 		}
 	}
+	if len(narrow) > 0 {
+		if err := unix.SchedSetaffinity(0, &narrowSet); err != nil {
+			runtime.UnlockOSThread()
+			t.Fatalf("narrow the forking thread to CPUs %s: %v", platform.FormatCPUs(narrow), err)
+		}
+	}
 	err := cmd.Start()
+	if len(narrow) > 0 {
+		// Give the thread its mask back before anything else runs on it.
+		if rerr := unix.SchedSetaffinity(0, &startup.set); rerr != nil {
+			t.Errorf("put the process's mask back on the forking thread: %v", rerr)
+		}
+	}
 	runtime.UnlockOSThread()
 	if err == nil {
 		err = cmd.Wait()
@@ -298,6 +341,16 @@ func RunInOwnProcess(t *testing.T, timeout time.Duration) {
 	default:
 		t.Fatalf("%s failed in its own process: err=%v, PASS line %v (output above)", name, err, passed)
 	}
+}
+
+// MinPinnedLoops returns how many of loops engine loops are pinned to one CPU
+// at least: all of them, unless the allowed CPUs differ in capacity, where
+// the loops beyond the big CPUs run unpinned (platform.PlanWorkerCPUs).
+func MinPinnedLoops(loops int) int {
+	if loops < 1 {
+		return 0
+	}
+	return platform.PlanWorkerCPUs(loops).Pinned()
 }
 
 // StartFunc starts one engine and returns once it serves. It returns the
@@ -398,11 +451,17 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 		pinnedNotMain += len(notMain)
 		t.Logf("cycle %d: %s engine running with %d loop(s); %d of %d threads pinned to one CPU: %v",
 			cycle, engine, loops, len(pinned), len(running), pinned)
-		if loops < 1 || len(pinned) < loops {
+		// Every loop pins, except on a host whose allowed CPUs differ in
+		// capacity (arm64 big.LITTLE), where the engine leaves the loops that
+		// do not fit on the big CPUs unpinned (celeris#909). Several engines
+		// (adaptive) plan independently, each pinning at least
+		// min(its loops, the big CPUs), so min(loops, big CPUs) is a floor.
+		wantPinned := MinPinnedLoops(loops)
+		if loops < 1 || len(pinned) < wantPinned {
 			stop()
-			t.Fatalf("premise: the %s engine runs %d loop(s) but only %d thread(s) were pinned to one CPU "+
-				"while it ran (process mask %s) -- the engine no longer pins, or the pin failed here, "+
-				"and this test would check nothing", engine, loops, len(pinned), base)
+			t.Fatalf("premise: the %s engine runs %d loop(s) of which at least %d are pinned to one CPU, but only "+
+				"%d thread(s) were pinned while it ran (process mask %s) -- the engine no longer pins, or "+
+				"the pin failed here, and this test would check nothing", engine, loops, wantPinned, len(pinned), base)
 		}
 
 		stop()
@@ -485,5 +544,122 @@ func stillThere(threads, want []Thread) []Thread {
 			}
 		}
 	}
+	return out
+}
+
+// AllowedCPUs returns the members of the CPU mask this process started with.
+func AllowedCPUs() ([]int, error) {
+	if startup.err != nil {
+		return nil, startup.err
+	}
+	var out []int
+	for c := 0; c < len(startup.set)*64; c++ {
+		if startup.set.IsSet(c) {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// MaskWithoutTheLowestCPU returns the process's allowed CPUs except the lowest,
+// the mask RunInOwnProcessOn is given to test celeris#909: an engine that pins
+// loop i to CPU index i pins loop 0 to a CPU the mask excludes. It skips the
+// test when the process may use fewer than 3 CPUs, where such a mask cannot
+// tell a loop pinned inside it from one pinned outside it.
+func MaskWithoutTheLowestCPU(t *testing.T) []int {
+	t.Helper()
+	cpus, err := AllowedCPUs()
+	if err != nil {
+		t.Fatalf("read the process's CPU mask: %v", err)
+	}
+	if len(cpus) < 3 {
+		t.Skipf("the process may use %d CPU(s) (%s): a mask that leaves out the lowest of them and still has two "+
+			"members needs 3", len(cpus), platform.FormatCPUs(cpus))
+	}
+	return cpus[1:]
+}
+
+// LoopsStayInsideTheMask is the body of the celeris#909 tests. Call it from the
+// process RunInOwnProcessOn started. It starts one engine and checks, from
+// /proc/self/task/*/status, that
+//   - the process really started on the mask it was given (the premise);
+//   - every thread pinned to one CPU is pinned to a member of the mask;
+//   - at least as many threads are pinned as the plan pins (all loops, but on a
+//     host whose allowed CPUs differ in capacity the loops beyond the big CPUs
+//     run unpinned), and
+//   - on a host whose allowed CPUs are alike, the engine's loops took the first
+//     CPUs of the mask, in order, which is "the i-th member of the allowed
+//     set" written out independently of the planner.
+func LoopsStayInsideTheMask(t *testing.T, engine string, start StartFunc) {
+	t.Helper()
+	want := os.Getenv(envMask)
+	if want == "" {
+		t.Fatal("premise: LoopsStayInsideTheMask must run in the process RunInOwnProcessOn started")
+	}
+	base, err := StartupMask()
+	if err != nil {
+		t.Fatalf("read the process's CPU mask: %v", err)
+	}
+	if base != want {
+		t.Fatalf("premise: the process started on CPU mask %s, not the %s it was narrowed to", base, want)
+	}
+	members, err := AllowedCPUs()
+	if err != nil || len(members) < 2 {
+		t.Fatalf("premise: mask %s has members %v (%v)", base, members, err)
+	}
+	loops, stop := start(t)
+	defer stop()
+	running, err := Census()
+	if err != nil {
+		t.Fatalf("census: %v", err)
+	}
+	var pinned []Thread
+	inMask := map[int]bool{}
+	for _, c := range members {
+		inMask[c] = true
+	}
+	for _, th := range running {
+		if th.IOUringKernelThread() || !th.Single() {
+			continue
+		}
+		pinned = append(pinned, th)
+	}
+	got := map[int]bool{}
+	for _, th := range pinned {
+		c, err := strconv.Atoi(th.CPUs)
+		if err != nil {
+			t.Fatalf("thread %v: cannot read its CPU", th)
+		}
+		got[c] = true
+		if !inMask[c] {
+			t.Errorf("celeris#909: the %s engine pinned a thread to CPU %d, outside the process's mask %s: %v",
+				engine, c, base, th)
+		}
+	}
+	plan := platform.PlanWorkerCPUs(loops)
+	if need := plan.Pinned(); len(pinned) < need {
+		t.Errorf("the %s engine runs %d loop(s) of which %d should be pinned, but %d thread(s) are pinned to one CPU "+
+			"(mask %s): %v", engine, loops, need, len(pinned), base, pinned)
+	}
+	if !plan.Heterogeneous {
+		exp := map[int]bool{}
+		for i := range loops {
+			exp[members[i%len(members)]] = true
+		}
+		if !reflect.DeepEqual(exp, got) {
+			t.Errorf("celeris#909: the %s engine's %d loop(s) are pinned to CPUs %v, want the first %d member(s) of the mask %s: %v",
+				engine, loops, platform.FormatCPUs(keys(got)), min(loops, len(members)), base, platform.FormatCPUs(keys(exp)))
+		}
+	}
+	t.Logf("celeris909 RESULT engine=%s mask=%s loops=%d pinned=%d pinned_cpus=%s heterogeneous=%v",
+		engine, base, loops, len(pinned), platform.FormatCPUs(keys(got)), plan.Heterogeneous)
+}
+
+func keys(m map[int]bool) []int {
+	out := make([]int, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Ints(out)
 	return out
 }
