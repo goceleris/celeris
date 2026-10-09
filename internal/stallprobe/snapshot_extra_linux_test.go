@@ -66,7 +66,7 @@ func (p *profCapture) stop() string {
 	p.on = false
 	enc := base64.StdEncoding.EncodeToString(p.buf.Bytes())
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "cpu profile of the gap between the two captures: %d bytes gzip pprof, StopCPUProfile took %.1f ms; decode: grep pprof-b64 | sed 's/.*pprof-b64 //' | tr -d '\\n' | base64 -d > cpu.pb.gz; go tool pprof -top cpu.pb.gz\n", p.buf.Len(), float64(time.Since(t0))/1e6)
+	fmt.Fprintf(&sb, "cpu profile of the gap between the two captures: %d bytes gzip pprof, StopCPUProfile took %.1f ms; decode: d1-read/scripts/decode_pprof.sh LOG LINE_OF_THIS_LINE OUT.pb.gz\n", p.buf.Len(), float64(time.Since(t0))/1e6)
 	for len(enc) > 0 {
 		n := min(len(enc), 160)
 		fmt.Fprintf(&sb, "pprof-b64 %s\n", enc[:n])
