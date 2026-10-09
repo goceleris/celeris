@@ -21,12 +21,30 @@ type Bridge struct {
 
 // ServeHTTP converts an http.Request to a stream.Stream, calls the handler, and writes the response.
 func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	b.engine.metrics.reqCount.Add(1)
 	if r.ProtoMajor == 2 {
-		// An h2c stream: the drain waits for it (celeris#759).
-		b.engine.h2Streams.Add(1)
+		// An h2c stream: the drain waits for it (celeris#759), unless the
+		// drain has ended, when nothing new may start (celeris#878).
+		if !b.engine.enterH2Stream() {
+			// Only a connection that handed itself over after the drain's
+			// GOAWAY went out gets here. It is sent GOAWAY when this stream
+			// ends: net/http's HTTP/2 server does that for a connection of a
+			// server that is shutting down as soon as the connection is idle.
+			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
 		defer b.engine.h2Streams.Add(-1)
+		if b.engine.draining.Load() {
+			// A connection that handed itself over after the drain began
+			// missed the GOAWAY Shutdown sent at its start, and this is a
+			// stream it opened after it. Connection: close makes the HTTP/2
+			// server send the connection GOAWAY with this response, where
+			// otherwise it would wait for the connection to go idle, which a
+			// connection with a long stream open does not. The response is
+			// still delivered.
+			w.Header().Set("Connection", "close")
+		}
 	}
+	b.engine.metrics.reqCount.Add(1)
 
 	s := stream.NewH1Stream(1)
 	defer s.Release()

@@ -48,3 +48,22 @@ func BenchmarkBridgeServeHTTP(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkH2CFrontServeHTTP measures one HTTP/1.1 request through the whole
+// handler chain of an H2C engine: the h2c front end's checks (is this the
+// preface? an upgrade?) and then the bridge. Every request on an H2C listener
+// pays them (celeris#878 replaced x/net's h2c handler with h2cHandler).
+func BenchmarkH2CFrontServeHTTP(b *testing.B) {
+	e, err := New(resource.Config{Addr: "127.0.0.1:0", Engine: engine.Std, Protocol: engine.H2C}, okStreamHandler{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	h := e.server.Handler
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := &discardResponseWriter{h: http.Header{}}
+	b.ReportAllocs()
+	for b.Loop() {
+		clear(w.h)
+		h.ServeHTTP(w, req)
+	}
+}
