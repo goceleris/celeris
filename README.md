@@ -395,6 +395,8 @@ For Prometheus exposition and debug endpoints, use [`middleware/metrics`](middle
 | `Detach` (async keep-alive) | yes | yes | no |
 | Connection hijack | yes | yes | yes |
 
+**CPU pinning** (epoll and io_uring): loop `i` pins its thread to the `i`-th CPU the process is allowed to use (`taskset`, a cgroup cpuset, `sched_setaffinity`), never to a CPU outside that set. On a host whose allowed CPUs differ in capacity (arm64 big.LITTLE, read from `/sys/devices/system/cpu/cpuN/cpu_capacity`), loops pin only to the CPUs with at least half the largest capacity, any further loops run unpinned, and the engine logs one line saying so; a pin the kernel refuses is logged once. A handler that runs inline runs on a pinned thread and a process it starts inherits the pin: start it from a goroutine of its own, or use `AsyncHandlers` (see `Config.AsyncHandlers`).
+
 `StreamWriter()` performs synchronous incremental writes on every engine. Async `Detach()` — keeping the connection alive after the handler returns — is native-engines-only (`EngineSupportsAsyncDetach()` is false on std, which closes the conn when the handler returns).
 
 ## Benchmarks
