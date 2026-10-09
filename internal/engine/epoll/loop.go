@@ -294,8 +294,12 @@ type Loop struct {
 	// Driver integration (EventLoopProvider). The hasDriverConns gate is the
 	// ONLY check the HTTP hot path pays when no drivers are registered; it
 	// must stay an atomic.Bool load, not a map read.
-	driverConns    map[int]*driverConn
-	driverMu       sync.RWMutex
+	driverConns map[int]*driverConn
+	driverMu    sync.RWMutex
+	// driverGen is the generation of the last driver registration on this
+	// loop (protected by driverMu). Each RegisterConn takes the next one,
+	// never 0; HTTP conns' events carry 0 (celeris#771).
+	driverGen      uint32
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
 	// ctlMu guards epollFD against the driver goroutines, which issue
@@ -636,12 +640,15 @@ func (l *Loop) run(ctx context.Context) {
 				continue
 			}
 
-			// Driver fast-path: single atomic load when no drivers are
-			// registered (zero-cost for pure-HTTP workloads). The map
-			// lookup happens only when the gate is true.
-			if l.hasDriverConns.Load() {
-				if dc := l.lookupDriver(fd); dc != nil {
-					l.handleDriverEvent(dc, ev.Events)
+			// Driver fast-path: a load of the event's Pad (read with the
+			// event, the generation of a driver registration, 0 for every
+			// HTTP conn) and a single atomic load when no drivers are
+			// registered (zero-cost for pure-HTTP workloads). The map lookup
+			// happens only when one of them says driver. dispatchDriver
+			// drops an event that names a registration which has ended
+			// (celeris#771).
+			if pad := uint32(ev.Pad); l.driverCandidate(pad) {
+				if l.dispatchDriver(fd, pad, ev.Events) {
 					continue
 				}
 			}

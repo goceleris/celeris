@@ -30,7 +30,15 @@ const driverReadBufSize = 32 << 10 // 32 KiB
 // not call back into [Loop.RegisterConn] / [Loop.UnregisterConn] /
 // [Loop.Write] for the same FD.
 type driverConn struct {
-	fd      int
+	fd int
+	// gen is the generation of this registration of fd, unique on the loop
+	// and never 0. Every epoll_event of the registration carries it in Pad
+	// (the ADD and every MOD; see epollEvent), and the worker dispatches an
+	// event only to the conn whose gen it carries: an event the worker
+	// collected for a conn that has since been unregistered must not reach
+	// the conn that took its number (celeris#771). Set before the conn is
+	// published, then read-only.
+	gen     uint32
 	onRecv  func([]byte)
 	onClose func(error)
 
@@ -85,6 +93,24 @@ func (l *Loop) closeEpollFD() {
 	}
 }
 
+// epollEvent returns the epoll_event for dc's registration with the given
+// interest: the number in Fd, and the registration's generation in Pad, which
+// the kernel hands back with each event it reports for the descriptor. Every
+// EPOLL_CTL_ADD and EPOLL_CTL_MOD of a driver conn uses it: a MOD replaces the
+// whole event data, and one without the generation would make the worker drop
+// every later event of the conn (celeris#771).
+func (dc *driverConn) epollEvent(events uint32) unix.EpollEvent {
+	return unix.EpollEvent{Events: events, Fd: int32(dc.fd), Pad: int32(dc.gen)}
+}
+
+// testHookCloseDriverClaimed, when non-nil, runs in closeDriver once the conn
+// is claimed closed and removed from the interest set, with no lock held, and
+// before the conn leaves driverConns: where UnregisterConn can return, the
+// caller close the descriptor and register another conn on its number. Tests
+// only (celeris#771): a test sets it before it creates the engine and clears
+// it after the engine is stopped.
+var testHookCloseDriverClaimed func(dc *driverConn)
+
 // lookupDriver returns the driverConn for fd, or nil if none is registered.
 // Safe to call from the worker goroutine during dispatch.
 func (l *Loop) lookupDriver(fd int) *driverConn {
@@ -94,7 +120,43 @@ func (l *Loop) lookupDriver(fd int) *driverConn {
 	return dc
 }
 
-// RegisterConn adds fd to this worker's epoll interest set and installs the
+// dispatchDriver hands one epoll event to the driver conn it was collected
+// for, and reports whether the event was a driver's, delivered or dropped, so
+// that the caller does not give it to the HTTP path. Runs on the worker
+// goroutine.
+//
+// The event names its conn by the descriptor number (Fd) and the generation of
+// its registration (Pad; 0 for an HTTP conn). The worker collects a batch of
+// events and dispatches it one by one, so an event of a conn can be dispatched
+// after the conn has gone and its number has been taken: by a driver conn
+// registered since, which has another generation, or by nothing. Applied to
+// the conn found by number, A's EPOLLRDHUP closed X (celeris#771). So the
+// event goes to the conn found only if the generations are equal, and is
+// dropped otherwise, as is a driver event whose conn has gone. An HTTP conn's
+// event (Pad 0) on a number that is a driver conn's is stale too: RegisterConn
+// refuses a number that is an HTTP conn's, so it is not the conn's own.
+func (l *Loop) dispatchDriver(fd int, gen uint32, events uint32) bool {
+	dc := l.lookupDriver(fd)
+	if dc == nil {
+		// Nothing is registered on the number. An event with a generation is
+		// a driver conn's that has gone: dropped, not an HTTP conn's.
+		return gen != 0
+	}
+	if dc.gen != gen {
+		return true
+	}
+	l.handleDriverEvent(dc, events)
+	return true
+}
+
+// driverCandidate reports whether an event with this Pad may be a driver
+// conn's, so that the worker looks it up: it carries a registration's
+// generation, or a driver conn is registered. The HTTP path's whole cost.
+func (l *Loop) driverCandidate(gen uint32) bool {
+	return gen != 0 || l.hasDriverConns.Load()
+}
+
+// RegisterConn adds fd to this worker's interest set and installs the
 // data and close callbacks. fd must already be in non-blocking mode; the
 // caller retains ownership of the fd (UnregisterConn does not close it).
 //
@@ -126,8 +188,19 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 		return fmt.Errorf("celeris/epoll: fd %d is already registered", fd)
 	}
 
+	// The registration's generation, set before the conn is published
+	// (celeris#771). Under driverMu, which RegisterConn holds. 0 never names a
+	// registration; the count wraps after 2^32-1 registrations on this loop,
+	// and an event reaches the wrong conn only if the conn now on its number
+	// has the event's generation: a multiple of 2^32-1 registrations would
+	// have to come between the two while the event waits to be dispatched.
+	l.driverGen++
+	if l.driverGen == 0 {
+		l.driverGen = 1
+	}
 	dc := &driverConn{
 		fd:      fd,
+		gen:     l.driverGen,
 		onRecv:  onRecv,
 		onClose: onClose,
 	}
@@ -142,10 +215,8 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 	l.hasDriverConns.Store(true)
 	// Level-triggered EPOLLOUT is added lazily (on EAGAIN) via armEpollOut
 	// so idle driver conns don't wake the loop on every send-buffer drain.
-	if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
-		Fd:     int32(fd),
-	}); err != nil {
+	ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
+	if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
 		delete(l.driverConns, fd)
 		if len(l.driverConns) == 0 {
 			l.hasDriverConns.Store(false)
@@ -257,10 +328,8 @@ func (l *Loop) flushDriverSendLocked(dc *driverConn) error {
 					// level-triggered: it fires as long as the socket is
 					// writable, so there is no risk of a missed wakeup
 					// after sending clears. EPOLLET only applies to EPOLLIN.
-					modErr := l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &unix.EpollEvent{
-						Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP,
-						Fd:     int32(dc.fd),
-					})
+					ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP)
+					modErr := l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &ev)
 					if modErr == nil {
 						dc.epollOut = true
 					}
@@ -281,10 +350,8 @@ func (l *Loop) flushDriverSendLocked(dc *driverConn) error {
 	dc.writeBuf = dc.writeBuf[:0]
 	dc.sendPos = 0
 	if dc.epollOut {
-		_ = l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
-			Fd:     int32(dc.fd),
-		})
+		ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
+		_ = l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &ev)
 		dc.epollOut = false
 	}
 	return nil
@@ -380,6 +447,14 @@ func (l *Loop) driverRead(dc *driverConn) {
 // closeDriver removes dc from the worker's interest set and invokes
 // onClose exactly once. Safe to call concurrently; the dc.closed flag
 // serializes the close path.
+//
+// dc.fd is the caller's descriptor number and is the caller's to close once
+// UnregisterConn has returned (celeris#771; same rule as celeris#710 for
+// reads). So the EPOLL_CTL_DEL runs in the critical section that claims
+// closed: UnregisterConn takes dc.mu before it returns, hence cannot return,
+// nor the caller close the number, between the claim and the DEL. And the
+// map entry is deleted only if it is still dc: UnregisterConn may have
+// removed it, and another conn registered on the number since.
 func (l *Loop) closeDriver(dc *driverConn, cause error) {
 	dc.mu.Lock()
 	if dc.closed {
@@ -388,18 +463,21 @@ func (l *Loop) closeDriver(dc *driverConn, cause error) {
 	}
 	dc.closed = true
 	cb := dc.onClose
+	_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil)
 	dc.mu.Unlock()
 
+	if h := testHookCloseDriverClaimed; h != nil {
+		h(dc)
+	}
+
 	l.driverMu.Lock()
-	if _, ok := l.driverConns[dc.fd]; ok {
+	if l.driverConns[dc.fd] == dc {
 		delete(l.driverConns, dc.fd)
 		if len(l.driverConns) == 0 {
 			l.hasDriverConns.Store(false)
 		}
 	}
 	l.driverMu.Unlock()
-
-	_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil)
 
 	if cb != nil {
 		cb(cause)
@@ -430,8 +508,8 @@ func (l *Loop) shutdownDrivers() {
 		}
 		dc.closed = true
 		cb := dc.onClose
+		_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil) // under dc.mu: see closeDriver
 		dc.mu.Unlock()
-		_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil)
 		if cb != nil {
 			cb(nil)
 		}
