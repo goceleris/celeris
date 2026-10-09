@@ -294,8 +294,12 @@ type Loop struct {
 	// Driver integration (EventLoopProvider). The hasDriverConns gate is the
 	// ONLY check the HTTP hot path pays when no drivers are registered; it
 	// must stay an atomic.Bool load, not a map read.
-	driverConns    map[int]*driverConn
-	driverMu       sync.RWMutex
+	driverConns map[int]*driverConn
+	driverMu    sync.RWMutex
+	// driverGen is the generation of the last driver registration on this
+	// loop (protected by driverMu). Each RegisterConn takes the next one,
+	// never 0; HTTP conns' events carry 0 (celeris#771).
+	driverGen      uint32
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
 	// ctlMu guards epollFD against the driver goroutines, which issue
@@ -636,12 +640,15 @@ func (l *Loop) run(ctx context.Context) {
 				continue
 			}
 
-			// Driver fast-path: single atomic load when no drivers are
-			// registered (zero-cost for pure-HTTP workloads). The map
-			// lookup happens only when the gate is true.
-			if l.hasDriverConns.Load() {
-				if dc := l.lookupDriver(fd); dc != nil {
-					l.handleDriverEvent(dc, ev.Events)
+			// Driver fast-path: a load of the event's Pad (read with the
+			// event, the generation of a driver registration, 0 for every
+			// HTTP conn) and a single atomic load when no drivers are
+			// registered (zero-cost for pure-HTTP workloads). The map lookup
+			// happens only when one of them says driver. dispatchDriver
+			// drops an event that names a registration which has ended
+			// (celeris#771).
+			if pad := uint32(ev.Pad); l.driverCandidate(pad) {
+				if l.dispatchDriver(fd, pad, ev.Events) {
 					continue
 				}
 			}
@@ -3594,6 +3601,18 @@ func (l *Loop) closeConn(fd int) {
 		l.removeH2Conn(fd)
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
+	// Clear the slot before the descriptor is closed, and under driverMu
+	// (celeris#775). The number is free to be reissued the moment the close
+	// returns, and a driver's RegisterConn on it reads this slot, under the
+	// same lock, from its own goroutine: written bare, that is a data race,
+	// and cleared after the close, a window in which the driver is refused
+	// ("already an HTTP connection") for a number that no longer is one. The
+	// slot is read on this thread only by checks keyed by cs (ask, sweep,
+	// the ownership re-check above), none of which runs between here and the
+	// close. One uncontended lock per close, on a path of several syscalls.
+	l.driverMu.Lock()
+	l.conns[fd] = nil
+	l.driverMu.Unlock()
 	// H1 close: SHUT_WR + Close. The shutdown call forces FIN regardless
 	// of the kernel recv-buffer state — important under slowloris where
 	// the peer is still writing drips and a plain Close on a non-empty
@@ -3618,8 +3637,10 @@ func (l *Loop) closeConn(fd int) {
 		sockopts.CloseDrain(fd, "epoll/closeConn", cs.remoteAddr)
 		_ = unix.Close(fd)
 	}
+	if h := testHookConnClosed; h != nil {
+		h(l, fd)
+	}
 	l.removeLiveConn(cs)
-	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)
 	l.closeCount.Add(1)
@@ -3730,12 +3751,19 @@ func (l *Loop) shutdown() {
 			continue
 		}
 		fd := cs.fd
+		// The slot goes first, under driverMu and around the slot write
+		// alone, never across the close (which can wait on SO_LINGER,
+		// celeris#735): a driver's RegisterConn reads it, under the same
+		// lock, from its own goroutine, and the number is free to be
+		// reissued once the descriptor is closed (celeris#775).
+		l.driverMu.Lock()
+		l.conns[fd] = nil
+		l.driverMu.Unlock()
 		_ = unix.Close(fd)
 		if cs.detachMu == nil {
 			l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
 			releaseConnState(cs)
 		}
-		l.conns[fd] = nil
 	}
 	clear(l.liveConns)
 	l.liveConns = l.liveConns[:0]
