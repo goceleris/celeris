@@ -321,7 +321,7 @@ func (t topo) caseCPUs(name string) (cpus []int, note string, err error) {
 			note = "homogeneous host: the lowest ids"
 		}
 	default:
-		return nil, "", fmt.Errorf("unknown case %q (all, nopin, fast8, fast4, slow4)", name)
+		return nil, "", fmt.Errorf("unknown case %q (all, nopin, fast8, fast4, slow4; extra: allperm, fast8s1, fast8s2, fast6s4, fast4s4, slow4wide, fast8wide, fast8u1, pin720, pin520, gmp8)", name)
 	}
 	if len(cpus) < 2 {
 		return nil, "", fmt.Errorf("case %s: %d allowed CPUs on this host (%d allowed in all), the engine needs at least 2 workers", name, len(cpus), n)
@@ -330,6 +330,116 @@ func (t topo) caseCPUs(name string) (cpus []int, note string, err error) {
 		note += fmt.Sprintf(" (only %d CPUs available)", len(cpus))
 	}
 	return cpus, note, nil
+}
+
+// caseSpec is a P3 case that needs more than a CPU list: a child mask that is
+// wider than the loops' CPUs, a Workers count, a GOMAXPROCS, or loops that are
+// left unpinned. The first five cases (all, nopin, fast8, fast4, slow4) keep
+// the code path of caseCPUs; every later case is a spec (extraCase).
+type caseSpec struct {
+	CPUs       []int // CPUs the case names, for the log (the loops' CPUs, or the child's mask)
+	Mask       []int // the child's CPU mask at fork (nil: the parent's)
+	Workers    int   // Config.Workers (0: the default, GOMAXPROCS)
+	Plan       []int // loop k (loops in the order of the CPU the engine pinned them to) is moved to Plan[k]; -1 = unpinned (full mask)
+	Keep       []int // loops the engine pinned to one of these CPUs stay where the engine put them; every other loop is unpinned
+	GOMAXPROCS int   // the child's GOMAXPROCS (0: default)
+	Note       string
+}
+
+// extraCase returns the spec of the cases added after the first run (37975655016,
+// where the stalled loop was a loop pinned on a Cortex-A520 in 19 of 19
+// snapshots). Same names on every host. On a host with one core type "fast" is
+// the highest CPU ids and "slow" the lowest, as in caseCPUs, so the shapes
+// exist on both arches (the stress tally wants the same leaves everywhere).
+//
+//	allperm    12 loops, one per CPU, but loop k is moved to CPU n-1-k: the same CPU set
+//	           as all, a different loop-to-CPU map and the probe (not the engine) does the pinning
+//	fast8s1    one loop on each of the 8 fastest CPUs and one on the slowest CPU (9 loops, mask = those 9)
+//	fast8s2    ... and two slow CPUs (10)
+//	fast6s4    6 fastest + the 4 slowest (10)
+//	fast4s4    4 fastest + the 4 slowest (8)
+//	slow4wide  4 loops on the 4 slowest CPUs, the process mask is every CPU (the fast CPUs are free for the client)
+//	fast8wide  8 loops on the 8 fastest CPUs, the process mask is every CPU (the slow CPUs are free)
+//	fast8u1    8 loops on the 8 fastest CPUs and a ninth loop left unpinned, mask = every CPU
+//	pin720     every CPU has a loop; the loops on the fastest core type stay pinned, the others are unpinned
+//	pin520     every CPU has a loop; the loops on the slowest core type stay pinned, the others are unpinned
+//	gmp8       the engine's own pinning with GOMAXPROCS=8 on all CPUs (8 loops pinned to CPU 0-7, CPUs 8+ without a loop)
+func (t topo) extraCase(name string) (caseSpec, bool, error) {
+	var fast, slow []int
+	if t.Hetero {
+		fast = t.byFastness(t.Classes[0])
+		s := append([]int(nil), t.Classes[len(t.Classes)-1]...)
+		sort.Ints(s)
+		slow = s
+	} else {
+		a := append([]int(nil), t.Allowed...)
+		sort.Ints(a)
+		fast = reverse(a)
+		slow = a
+	}
+	take := func(src []int, k int) []int {
+		if k > len(src) {
+			k = len(src)
+		}
+		return append([]int(nil), src[:k]...)
+	}
+	union := func(a, b []int) []int {
+		seen := map[int]bool{}
+		var out []int
+		for _, c := range append(append([]int(nil), a...), b...) {
+			if !seen[c] {
+				seen[c] = true
+				out = append(out, c)
+			}
+		}
+		sort.Ints(out)
+		return out
+	}
+	all := append([]int(nil), t.Allowed...)
+	sort.Ints(all)
+	var sp caseSpec
+	switch name {
+	case "allperm":
+		sp = caseSpec{CPUs: all, Workers: 0, Plan: reverse(all), Note: "every CPU has a loop, loop k moved to CPU n-1-k (all's CPU set, another map)"}
+	case "fast8s1":
+		sp.CPUs = union(take(fast, 8), take(slow, 1))
+		sp.Note = "the 8 fastest CPUs and the slowest one, a loop on each"
+	case "fast8s2":
+		sp.CPUs = union(take(fast, 8), take(slow, 2))
+		sp.Note = "the 8 fastest CPUs and the 2 slowest, a loop on each"
+	case "fast6s4":
+		sp.CPUs = union(take(fast, 6), take(slow, 4))
+		sp.Note = "the 6 fastest CPUs and the 4 slowest, a loop on each"
+	case "fast4s4":
+		sp.CPUs = union(take(fast, 4), take(slow, 4))
+		sp.Note = "the 4 fastest CPUs and the 4 slowest, a loop on each"
+	case "slow4wide":
+		sp = caseSpec{CPUs: take(slow, 4), Mask: all, Workers: len(take(slow, 4)), Plan: take(slow, 4), Note: "4 loops on the slowest CPUs, every CPU in the process mask"}
+	case "fast8wide":
+		sp = caseSpec{CPUs: take(fast, 8), Mask: all, Workers: len(take(fast, 8)), Plan: take(fast, 8), Note: "8 loops on the fastest CPUs, every CPU in the process mask"}
+	case "fast8u1":
+		f := take(fast, 8)
+		sp = caseSpec{CPUs: f, Mask: all, Workers: len(f) + 1, Plan: append(append([]int(nil), f...), -1), Note: "8 loops on the fastest CPUs, a ninth loop unpinned, every CPU in the process mask"}
+	case "pin720":
+		sp = caseSpec{CPUs: all, Keep: take(fast, 8), Note: "every CPU has a loop; only the loops the engine put on the 8 fastest CPUs stay pinned"}
+	case "pin520":
+		sp = caseSpec{CPUs: all, Keep: take(slow, 4), Note: "every CPU has a loop; only the loops the engine put on the 4 slowest CPUs stay pinned"}
+	case "gmp8":
+		sp = caseSpec{CPUs: all, GOMAXPROCS: 8, Note: "the engine's own pinning, GOMAXPROCS=8 (8 loops on CPU 0-7)"}
+	default:
+		return caseSpec{}, false, nil
+	}
+	switch name {
+	case "fast8s1", "fast8s2", "fast6s4", "fast4s4":
+		sp.Mask, sp.Workers, sp.Plan = sp.CPUs, len(sp.CPUs), sp.CPUs
+	}
+	if len(sp.CPUs) < 2 {
+		return caseSpec{}, true, fmt.Errorf("case %s: %d usable CPUs on this host, the engine needs at least 2 workers", name, len(sp.CPUs))
+	}
+	if name == "gmp8" && len(all) <= 8 {
+		sp.Note += fmt.Sprintf(" (only %d CPUs here: GOMAXPROCS=8 changes nothing)", len(all))
+	}
+	return sp, true, nil
 }
 
 func reverse(s []int) []int {

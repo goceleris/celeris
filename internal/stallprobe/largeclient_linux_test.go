@@ -108,6 +108,7 @@ func (ic *idleConn) Read(p []byte) (int, error) {
 	t0 := ic.c.now()
 	final := t0 + int64(ic.idle)
 	var a, b *snapshot
+	var prof profCapture
 	snapping := pcfg.SnapAfter > 0 && pcfg.SnapAfter+50*time.Millisecond < ic.idle && len(ic.snaps) < maxSnapsPerRep
 	for {
 		target := final
@@ -127,10 +128,22 @@ func (ic *idleConn) Read(p []byte) (int, error) {
 		if n == 0 && err != nil && isTimeout(err) && target < final {
 			// An internal timeout: capture and go on waiting.
 			s0 := ic.c.now()
+			var profText string
+			if a != nil {
+				profText = prof.stop() // the profile covers the gap between the two captures
+			}
 			snap := takeSnapshot(ic.c, ic.Conn, ic.cport, ic.sport, ic.n, time.Duration(now-t0))
+			snap.Owner = connOwner(ic.cport, ic.sport, snap.Tasks, snapLoops())
+			if a != nil {
+				snap.Extra = profText
+				if g := goroutineDump(); g != "" {
+					snap.Extra += "\n" + g
+				}
+			}
 			ic.snapNs += ic.c.now() - s0
 			if a == nil {
 				a = snap
+				prof.start()
 			} else {
 				b = snap
 			}
@@ -153,6 +166,22 @@ func (ic *idleConn) Read(p []byte) (int, error) {
 			}
 			rec.Outcome = outcome
 			rec.Full, rec.Digest = describeSnapshots(a, b, snapLoops(), outcome)
+			if prof.on { // the wait ended before the second capture
+				if pt := prof.stop(); pt != "" {
+					rec.Full += "\n" + pt
+				}
+			}
+			if a.Owner != "" {
+				rec.Full += "\nfirst capture: " + a.Owner
+			}
+			if b != nil {
+				if b.Owner != "" {
+					rec.Full += "\nsecond capture: " + b.Owner
+				}
+				if b.Extra != "" {
+					rec.Full += "\n" + b.Extra
+				}
+			}
 			ic.snaps = append(ic.snaps, rec)
 		}
 		return n, err

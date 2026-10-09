@@ -59,6 +59,8 @@ type probeCfg struct {
 	// serving every InjectEvery-th /big request sleeps InjectMS first.
 	InjectMS    int
 	InjectEvery int
+	Prof        bool // CPU profile of the gap between the two captures (CELERIS_PROBE_PROF=1; default OFF: SIGPROF to every thread can reshape a two-thread busy state)
+	GDump       bool // timed goroutine dump after the second capture (CELERIS_PROBE_GDUMP=1, default off)
 }
 
 var pcfg = loadCfg()
@@ -70,6 +72,8 @@ func loadCfg() probeCfg {
 		Slow:        time.Duration(envInt("CELERIS_PROBE_SLOW_MS", 1000)) * time.Millisecond,
 		InjectMS:    envInt("CELERIS_PROBE_INJECT_MS", 0),
 		InjectEvery: max(envInt("CELERIS_PROBE_INJECT_EVERY", 5), 1),
+		Prof:        envInt("CELERIS_PROBE_PROF", 0) == 1,
+		GDump:       envInt("CELERIS_PROBE_GDUMP", 0) == 1,
 	}
 }
 
@@ -137,6 +141,15 @@ type snapTask struct {
 	HasSched bool
 	Wchan    string
 	Allowed  string
+	// Added after run 37975655016 (19 of 19 stalls had a loop pinned on an A520
+	// running 100% with 0-3 sched-ins): voluntary and involuntary context
+	// switches (/proc/<tid>/status) and the syscall the thread is in
+	// (/proc/<tid>/syscall: "running" for a thread on a CPU, the number and
+	// arguments for a blocked one; for epoll_pwait the first argument is the
+	// epoll fd, which says which loop a connection belongs to).
+	Vol, Invol uint64
+	HasCtx     bool
+	Syscall    string
 }
 
 type snapSock struct {
@@ -178,6 +191,8 @@ type snapshot struct {
 	Idle       map[int][]idleState
 	Goroutines int
 	STW        string
+	Owner      string // connOwner at this capture
+	Extra      string // the CPU profile of the gap and the goroutine dump, on the second capture
 }
 
 func takeSnapshot(c clk, conn net.Conn, cport, sport int, bytes int, waited time.Duration) *snapshot {
@@ -217,6 +232,20 @@ func readTasks() []snapTask {
 			t.Slices, _ = strconv.ParseUint(ss[2], 10, 64)
 			t.HasSched = true
 		}
+		if stt := readTrim(base + "status"); stt != "" {
+			for _, l := range strings.Split(stt, "\n") {
+				if k, v, ok := strings.Cut(l, ":"); ok {
+					switch k {
+					case "voluntary_ctxt_switches":
+						t.Vol, _ = strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+						t.HasCtx = true
+					case "nonvoluntary_ctxt_switches":
+						t.Invol, _ = strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+					}
+				}
+			}
+		}
+		t.Syscall = readTrim(base + "syscall")
 		out = append(out, t)
 	}
 	return out
@@ -486,6 +515,8 @@ type taskDelta struct {
 	From           snapTask
 	dSlices, dRun  int64
 	dWait, dTicks  int64
+	dUser, dSys    int64
+	dVol, dInvol   int64
 	role           string
 	isLoop, moved  bool
 	prevCPU, wantC int
@@ -533,6 +564,8 @@ func describeSnapshots(a, b *snapshot, loops []loopThread, outcome string) (full
 			d.From = p
 			d.dSlices, d.dRun, d.dWait = int64(t.Slices)-int64(p.Slices), int64(t.RunNs)-int64(p.RunNs), int64(t.WaitNs)-int64(p.WaitNs)
 			d.dTicks = int64(t.UTime+t.STime) - int64(p.UTime+p.STime)
+			d.dUser, d.dSys = int64(t.UTime)-int64(p.UTime), int64(t.STime)-int64(p.STime)
+			d.dVol, d.dInvol = int64(t.Vol)-int64(p.Vol), int64(t.Invol)-int64(p.Invol)
 		}
 		ds = append(ds, d)
 	}
@@ -548,17 +581,24 @@ func describeSnapshots(a, b *snapshot, loops []loopThread, outcome string) (full
 	fmt.Fprintf(&sb, "threads (state and cpu as of the %s capture; deltas over %s):\n", map[bool]string{true: "second", false: "first"}[b != nil], span.Round(time.Millisecond))
 	fmt.Fprintf(&sb, "  %-8s %-14s %-16s %-5s %-8s %-9s %-9s %-9s %-7s %s\n", "tid", "role", "comm", "state", "cpu", "d.sched", "d.run_ms", "d.wait_ms", "d.ticks", "wchan  allowed")
 	for _, d := range ds {
-		fmt.Fprintf(&sb, "  %-8d %-14s %-16s %-5s %-8s %-9d %-9.1f %-9.1f %-7d %s  %s\n", d.Tid, d.role, d.Comm, d.State, cls(d.CPU), d.dSlices, float64(d.dRun)/1e6, float64(d.dWait)/1e6, d.dTicks, orDash(d.Wchan), d.Allowed)
+		fmt.Fprintf(&sb, "  %-8d %-14s %-16s %-5s %-8s %-9d %-9.1f %-9.1f %-7d %s  %s  utime=%d stime=%d vol=%d invol=%d sys=%s\n", d.Tid, d.role, d.Comm, d.State, cls(d.CPU), d.dSlices, float64(d.dRun)/1e6, float64(d.dWait)/1e6, d.dTicks, orDash(d.Wchan), d.Allowed, d.dUser, d.dSys, d.dVol, d.dInvol, syscallWord(d.Syscall))
 	}
 
-	loopsAlive, loopsFrozen := 0, 0
+	loopsAlive, loopsFrozen, loopsSpin := 0, 0, 0
 	var loopBits []string
 	for _, d := range ds {
 		if !d.isLoop {
 			continue
 		}
 		alive := d.dSlices >= 3 || d.dRun >= 2_000_000
-		if alive {
+		if b != nil && span > 0 && d.State == "R" && float64(d.dRun) >= 0.8*float64(span) && d.dSlices <= 3 {
+			// On a CPU for the whole window and never scheduled out: it is
+			// not "frozen" and it is not waking on a timeout either. Run
+			// 37975655016 had exactly one of these in each of 19 stalls, always
+			// a loop on a Cortex-A520, and the old rule counted it as frozen.
+			loopsSpin++
+			alive = false
+		} else if alive {
 			loopsAlive++
 		} else if b != nil {
 			loopsFrozen++
@@ -668,7 +708,7 @@ func describeSnapshots(a, b *snapshot, loops []loopThread, outcome string) (full
 		qs(srvQ), timerName(srvTimer), srvWhen, qs(cliQ), listeners, qs(lisQ), strings.SplitN(last.ClientInfo, ",", 2)[0])
 	fmt.Fprintf(&db, "\n  host: PSI %s; MHz %s", strings.Join(psiBits, ", "), strings.Join(freqBits, " "))
 	fmt.Fprintf(&db, "\n  runtime: %s", last.STW)
-	fmt.Fprintf(&db, "\n  reading: %s", readingHint(a.Bytes, srvQ, cliQ, lisQ, loopsAlive, loopsFrozen, len(loops), anyRan, b != nil))
+	fmt.Fprintf(&db, "\n  reading: %s", readingHint(a.Bytes, srvQ, cliQ, lisQ, loopsAlive, loopsFrozen, loopsSpin, len(loops), anyRan, b != nil))
 	return sb.String(), db.String()
 }
 
@@ -708,7 +748,7 @@ func timerName(t int) string {
 
 // readingHint is a mechanical reading of the numbers, not a verdict: what each
 // pattern is consistent with.
-func readingHint(bytes int, srvQ, cliQ, lisQ int64, alive, frozen, nloops, anyRan int, haveB bool) string {
+func readingHint(bytes int, srvQ, cliQ, lisQ int64, alive, frozen, spin, nloops, anyRan int, haveB bool) string {
 	var h []string
 	switch {
 	case cliQ > 0:
@@ -723,7 +763,12 @@ func readingHint(bytes int, srvQ, cliQ, lisQ int64, alive, frozen, nloops, anyRa
 		h = append(h, "a socket row was not found")
 	}
 	if haveB && nloops > 0 {
+		if spin > 0 {
+			h = append(h, fmt.Sprintf("%d loop thread(s) ON A CPU THE WHOLE WINDOW without being scheduled out (spinning, not frozen, not waking on its timeout): see the thread table for its CPU, utime/stime and syscall", spin))
+		}
 		switch {
+		case spin > 0 && alive+spin == nloops:
+			h = append(h, fmt.Sprintf("the other %d loop threads kept waking", alive))
 		case frozen == nloops:
 			h = append(h, "every loop thread was scheduled < 3 times in the window: the loops did not run (a thread or CPU stall; for epoll this includes its own 1-4 ms timeout, io_uring may legitimately sleep in the ring wait)")
 		case alive == nloops:
@@ -733,4 +778,20 @@ func readingHint(bytes int, srvQ, cliQ, lisQ int64, alive, frozen, nloops, anyRa
 		}
 	}
 	return strings.Join(h, "; ")
+}
+
+// syscallWord shortens /proc/<tid>/syscall to "running", "-1" (blocked in the
+// kernel, not in a syscall) or "<nr>(<first argument>)"; for epoll_pwait (22 on
+// arm64, 232 on amd64) the first argument is the epoll fd.
+func syscallWord(raw string) string {
+	f := strings.Fields(raw)
+	switch {
+	case len(f) == 0:
+		return "-"
+	case f[0] == "running" || f[0] == "-1":
+		return f[0]
+	case len(f) >= 2:
+		return f[0] + "(" + f[1] + ")"
+	}
+	return f[0]
 }

@@ -42,7 +42,13 @@
 //	CELERIS_PROBE_SNAP_GAP_MS P2/P3: second capture this long after the first, ms (500)
 //	CELERIS_PROBE_SLOW_MS   P2/P3: a rep whose longest wait reaches this counts as stalled even if it passed (1000)
 //	CELERIS_PROBE_ROUNDS    P3: every (case, engine) cell runs this many times in a fresh child each, ABBA order, REPS split between them (2)
-//	CELERIS_PROBE_CASES     P3: cases, from all,nopin,fast8,fast4,slow4 (all five, in this order)
+//	CELERIS_PROBE_CASES     P3: cases, from all,nopin,fast8,fast4,slow4 (all five, in this order), and the cases
+//	                        added after run 37975655016 (topo.extraCase): allperm, fast8s1, fast8s2, fast6s4,
+//	                        fast4s4, slow4wide, fast8wide, fast8u1, pin720, pin520, gmp8
+//	CELERIS_PROBE_PROF      P2/P3: 1 = CPU profile of the gap between the two stall captures, as pprof-b64 lines (0: SIGPROF can reshape the stall; mechanism runs only)
+//	CELERIS_PROBE_GDUMP     P2/P3: 1 = timed goroutine dump after the second capture; it stops the world, so it can hang a stalled child (0)
+//	CELERIS_PROBE_CHILD_GOGC     P3: GOGC of the child (unset: the default)
+//	CELERIS_PROBE_CHILD_NOASYNC  P3: 1 = GODEBUG=asyncpreemptoff=1 in the child
 //	CELERIS_PROBE_ENGINES   P3: engines, from epoll,io_uring,adaptive,std (all four)
 //	CELERIS_PROBE_SHAPES    P3: handler shapes, from sync,async-loop,async-route (sync,async-route)
 //	CELERIS_PROBE_INJECT_MS P2/P3 proof knob, off by default: every INJECT_EVERY-th /big handler sleeps this long first
