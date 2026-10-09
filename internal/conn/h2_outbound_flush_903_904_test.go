@@ -578,8 +578,7 @@ func TestInlineStreamWriterBuffersForTheWindow904(t *testing.T) {
 // answered by WriteResponse (their tail buffered) and half by a StreamWriter
 // (which waits), on the worker pool, while the "event loop" (this goroutine)
 // feeds random stream and connection WINDOW_UPDATEs and growing
-// SETTINGS_INITIAL_WINDOW_SIZEs and drains the queue after each recv, as the
-// engines do. Every stream must finish, whole, in order, HEADERS first and
+// SETTINGS_INITIAL_WINDOW_SIZEs and drains the queue every fifth recv. Every stream must finish, whole, in order, HEADERS first and
 // END_STREAM last; the run is bounded, so a deadlock fails it instead of
 // hanging. Run under -race and with -count.
 func TestOutboundFlushUnderConcurrentWindowUpdates903(t *testing.T) {
@@ -637,7 +636,12 @@ func TestOutboundFlushUnderConcurrentWindowUpdates903(t *testing.T) {
 				}
 			}))
 		}
-		c.drain()
+		// The queue is drained only every few recvs, as the loop does when
+		// recvs arrive back to back: a WINDOW_UPDATE then meets what the
+		// pool handlers queued and not yet drained (#903).
+		if i%5 == 0 {
+			c.drain()
+		}
 		if i%64 == 0 {
 			time.Sleep(time.Millisecond) // let the pool handlers run
 		}
