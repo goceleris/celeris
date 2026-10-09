@@ -4,6 +4,7 @@ package adaptive
 
 import (
 	"context"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -35,6 +36,14 @@ type lastSnapSampler struct {
 func (s *lastSnapSampler) Sample(e engine.Engine) TelemetrySnapshot {
 	s.last = s.TelemetrySampler.Sample(e)
 	return s.last
+}
+
+// Rebase forwards to the wrapped sampler, so the controller still finds the
+// optional interface through the wrapper.
+func (s *lastSnapSampler) Rebase(e engine.Engine) {
+	if r, ok := s.TelemetrySampler.(interface{ Rebase(engine.Engine) }); ok {
+		r.Rebase(e)
+	}
 }
 
 // feed856 gives the active io_uring engine one baseline sample and then one
@@ -259,5 +268,170 @@ func TestLiveAbandonedDownloadsDoNotRevertIOUring856(t *testing.T) {
 	}
 	if rec.last.ErrorRate > e.ctrl.errorRevertRate {
 		t.Errorf("celeris856: ErrorRate = %.3f over abandoned downloads, want <= %.2f", rec.last.ErrorRate, e.ctrl.errorRevertRate)
+	}
+}
+
+// The second route to the same spurious revert (celeris#856). The controller
+// samples only the active engine, so the sampler's baseline for io_uring is
+// the last sample taken BEFORE the previous revert. The first sample after a
+// re-promotion therefore reaches back over the whole time io_uring was the
+// standby: its own teardown at the pause (a cancelled accept per worker,
+// celeris#645) and the few requests it served while draining, a window in
+// which "errors over requests" says nothing about the engine now. The bench's
+// reverts come in pairs 62 s apart on every adaptive column that has them: a
+// revert, the 30 s cooldown, the re-promotion, the 30 s cooldown, and the
+// first post-cooldown sample of the stale window.
+
+// restage856 walks a controller with io_uring active through a revert and a
+// re-promotion. teardown runs while io_uring is the standby and gives its
+// counters whatever a pause leaves behind; after runs once io_uring is active
+// again. It returns whether the first evaluation after the re-promotion
+// recommends a revert, and the snapshot it decided on.
+func restage856(t *testing.T, teardown, after func(m *engine.EngineMetrics)) (bool, TelemetrySnapshot) {
+	t.Helper()
+	iou := newMockEngine(engine.IOUring)
+	sampler := &lastSnapSampler{TelemetrySampler: newLiveSampler(nil)}
+	c := newController(iou, newMockEngine(engine.Epoll), sampler, testLogger())
+	c.cooldown = 0
+	c.loadDownRevert = false
+
+	m := engine.EngineMetrics{RequestCount: 5000, ActiveConnections: 100, Workers: 4}
+	iou.SetMetrics(m)
+	now := time.Now()
+	if c.evaluate(now, false) { // the baseline sample, taken while io_uring is active
+		t.Fatal("the baseline tick recommended a switch")
+	}
+	c.recordSwitch(now) // revert: epoll is active, io_uring the standby
+	if c.activeEngine().Type() != engine.Epoll {
+		t.Fatalf("the revert left %v active", c.activeEngine().Type())
+	}
+	teardown(&m) // the pause, and the stragglers the standby serves
+	iou.SetMetrics(m)
+	time.Sleep(5 * time.Millisecond)
+	c.recordSwitch(now.Add(61 * time.Second)) // re-promotion
+	if c.activeEngine().Type() != engine.IOUring {
+		t.Fatalf("the re-promotion left %v active", c.activeEngine().Type())
+	}
+	after(&m)
+	iou.SetMetrics(m)
+	time.Sleep(5 * time.Millisecond)
+	revert := c.evaluate(now.Add(92*time.Second), false) // the first post-cooldown tick
+	return revert, sampler.last
+}
+
+// TestReactivatedEngineIsNotJudgedOnItsStandbyWindow856: four workers' accept
+// teardown and six stragglers while io_uring was the standby, nothing wrong
+// since it became active again. Before the fix that is 4 errors over 16
+// requests and a revert.
+func TestReactivatedEngineIsNotJudgedOnItsStandbyWindow856(t *testing.T) {
+	revert, snap := restage856(t,
+		func(m *engine.EngineMetrics) {
+			m.RequestCount += 6
+			m.ErrorAcceptCancelled += 4
+			m.ErrorCount += 4
+		},
+		func(m *engine.EngineMetrics) { m.RequestCount += 10 })
+	if revert || snap.ErrorRate != 0 {
+		t.Errorf("revert=%v error_rate=%v for an engine with no fault since it became active again, want no revert and 0",
+			revert, snap.ErrorRate)
+	}
+}
+
+// TestFaultsAfterReactivationStillRevert856 is the second control: the same
+// walk, with the faults happening after the re-promotion.
+func TestFaultsAfterReactivationStillRevert856(t *testing.T) {
+	revert, snap := restage856(t,
+		func(m *engine.EngineMetrics) {
+			m.RequestCount += 6
+			m.ErrorAcceptCancelled += 4
+			m.ErrorCount += 4
+		},
+		func(m *engine.EngineMetrics) {
+			m.RequestCount += 100
+			m.ErrorSend += 30
+			m.ErrorCount += 30
+		})
+	if !revert || snap.ErrorRate < 0.29 || snap.ErrorRate > 0.31 {
+		t.Errorf("revert=%v error_rate=%v for 30 faults in 100 requests since the re-promotion, want a revert at 0.30",
+			revert, snap.ErrorRate)
+	}
+}
+
+// TestLiveRepromotionIsNotJudgedOnTheStandbyWindow856 is the mechanism on a
+// real engine: promote, serve a few requests, revert (the io_uring pause
+// cancels a multishot accept per worker, which the engine counts), promote
+// again, and let the real controller take its first sample of io_uring. The
+// premise is measured: the standby window must hold errors and the pre-fix
+// ratio of them must be over the threshold.
+func TestLiveRepromotionIsNotJudgedOnTheStandbyWindow856(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	e, addr, stop := s0Bind(t, resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1}, respHandler{})
+	defer stop()
+	forceSwitchTo(t, e, engine.IOUring)
+	time.Sleep(300 * time.Millisecond)
+
+	e.switchMu.Lock()
+	rec := &lastSnapSampler{TelemetrySampler: e.ctrl.sampler}
+	e.ctrl.sampler = rec
+	e.ctrl.loadDownRevert = false
+	e.switchMu.Unlock()
+	eval := func(at time.Time) bool {
+		e.switchMu.Lock()
+		defer e.switchMu.Unlock()
+		return e.ctrl.evaluate(at, false)
+	}
+	iou := func() engine.EngineMetrics {
+		e.mu.Lock()
+		s := e.secondary
+		e.mu.Unlock()
+		return s.Metrics()
+	}
+	now := time.Now()
+	if eval(now) { // the baseline sample of io_uring, while it is active
+		t.Fatal("the baseline tick recommended a switch")
+	}
+	base := iou()
+
+	get := func() {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		_, _ = c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = io.Copy(io.Discard, c)
+	}
+	for range 4 {
+		get() // a handful of requests: what a streaming workload has
+	}
+	forceSwitchTo(t, e, engine.Epoll)
+	time.Sleep(2 * time.Second) // past io_uring's linger: its pause has torn its accepts down
+	forceSwitchTo(t, e, engine.IOUring)
+
+	after := iou()
+	errs := after.ErrorCount - base.ErrorCount
+	reqs := after.RequestCount - base.RequestCount
+	t.Logf("celeris856 REPROMOTE standby window: requests=+%d error_count=+%d accept_cancelled=+%d peer_gone=+%d send=+%d",
+		reqs, errs, after.ErrorAcceptCancelled-base.ErrorAcceptCancelled,
+		after.ErrorSendPeerGone-base.ErrorSendPeerGone, after.ErrorSend-base.ErrorSend)
+	if reqs == 0 || errs == 0 {
+		t.Fatalf("celeris856 PREMISE: the standby window holds %d requests and %d errors", reqs, errs)
+	}
+	if old := float64(errs) / float64(reqs); old <= e.ctrl.errorRevertRate {
+		t.Fatalf("celeris856 PREMISE: the pre-fix ratio %.3f is not above the revert threshold %.2f", old, e.ctrl.errorRevertRate)
+	}
+	for range 4 {
+		get() // served by io_uring again, no fault
+	}
+	// Past the oscillation lock three switches in a row set (5 min), or the
+	// controller would return before it samples.
+	revert := eval(now.Add(6 * time.Minute))
+	t.Logf("celeris856 REPROMOTE error_rate=%.4f revert=%v", rec.last.ErrorRate, revert)
+	if revert || rec.last.ErrorRate > e.ctrl.errorRevertRate {
+		t.Errorf("celeris856: the first sample after the re-promotion reads %.3f and revert=%v: it was judged on "+
+			"the time io_uring spent as the standby", rec.last.ErrorRate, revert)
 	}
 }

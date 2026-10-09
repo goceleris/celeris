@@ -89,6 +89,21 @@ func newLiveSampler(cpuMon engine.CPUMonitor) *liveSampler {
 	}
 }
 
+// Rebase makes e's current counters the baseline the next Sample of it is
+// measured from (celeris#856). The sampler keeps one baseline per engine type
+// and the controller samples only the ACTIVE engine, so without a rebase the
+// first sample after an engine becomes active again reaches back to the last
+// sample taken before it was switched away from: the whole time it spent as the
+// standby, including its own teardown at the pause (the cancelled accept of
+// every worker, celeris#645) and the stragglers it served while draining. Those
+// are divided by the few requests it counted, and a window that long is not
+// the engine's fault rate now.
+func (s *liveSampler) Rebase(e engine.Engine) {
+	et := e.Type()
+	s.prevMetrics[et] = e.Metrics()
+	s.prevTime[et] = time.Now()
+}
+
 func (s *liveSampler) Sample(e engine.Engine) TelemetrySnapshot {
 	now := time.Now()
 	m := e.Metrics()

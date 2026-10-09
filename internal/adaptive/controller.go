@@ -283,6 +283,13 @@ func (c *controller) logSwitch(from, to, reason string, cpw float64, snap Teleme
 // recordSwitch updates controller state after a switch has been performed.
 func (c *controller) recordSwitch(now time.Time) {
 	c.state.activeIsPrimary = !c.state.activeIsPrimary
+	// The engine that just became active is measured from now on, not from
+	// the last time it was sampled (celeris#856, liveSampler.Rebase).
+	if r, ok := c.sampler.(interface{ Rebase(engine.Engine) }); ok {
+		if act := c.activeEngine(); act != nil {
+			r.Rebase(act)
+		}
+	}
 	c.state.lastSwitch = now
 	c.state.upTicks = 0
 	c.state.downTicks = 0
