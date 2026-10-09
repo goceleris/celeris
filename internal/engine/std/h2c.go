@@ -53,7 +53,8 @@ import (
 //
 // It is golang.org/x/net/http2/h2c's handler (Copyright 2018 The Go
 // Authors, BSD-3-Clause), with one difference, which is why it is not that
-// package's: it calls ServeConn with no BaseConfig (celeris#878). h2c passes
+// package's: on go1.27 it calls ServeConn with no BaseConfig (celeris#878;
+// h2cBaseConfig says what the other builds pass). h2c passes
 // the http.Server the request came in on, and x/net then serves the
 // connection through a one-off http.Server built for it alone (go1.27 and
 // later, where x/net/http2 wraps net/http's HTTP/2 server; server_wrap.go),
@@ -61,7 +62,10 @@ import (
 // served through the server h2s was registered with (http2.ConfigureServer in
 // New), and http.Server.Shutdown reaches it: net/http stops tracking a hijacked
 // connection, but the GOAWAY hook registered on that server still does.
-// Detection, the 500 on a failed upgrade and the handling of the upgrade
+// The connection is thereby served under the engine's own Config limits
+// (ReadTimeout, WriteTimeout, MaxHeaderBytes) and, since h2s.IdleTimeout is
+// copied from the server by ConfigureServer, IdleTimeout, which an h2c
+// connection used to be exempt from. Detection, the 500 on a failed upgrade and the handling of the upgrade
 // request's body are unchanged.
 type h2cHandler struct {
 	next http.Handler
@@ -79,6 +83,7 @@ func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.h2s.ServeConn(conn, &http2.ServeConnOpts{ //nolint:staticcheck // SA1019: see the import comment in engine.go.
 			Context:          r.Context(),
 			Handler:          h.next,
+			BaseConfig:       h2cBaseConfig(r),
 			SawClientPreface: true,
 		})
 		return
@@ -94,6 +99,7 @@ func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.h2s.ServeConn(conn, &http2.ServeConnOpts{ //nolint:staticcheck // SA1019: see the import comment in engine.go.
 			Context:        r.Context(),
 			Handler:        h.next,
+			BaseConfig:     h2cBaseConfig(r),
 			UpgradeRequest: r,
 			Settings:       settings,
 		})

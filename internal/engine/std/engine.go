@@ -61,8 +61,12 @@ type Engine struct {
 	// drained is set once the drain has ended, whichever way. A drain that
 	// saw the h2Streams count reach zero has closed it too (see
 	// closeH2Streams); one whose budget ran out first has not, and this is
-	// all that tells Bridge.ServeHTTP. After the drain, no h2c request is
-	// handed to a handler.
+	// all that tells Bridge.ServeHTTP. Only the closed count is airtight
+	// (one CAS); this flag is a plain load, so a stream that passes it just
+	// before the drain stores it still runs, with an already cancelled
+	// request context. That is within the contract: a drain whose budget
+	// ran out leaves its handlers running. After a clean drain no h2c
+	// request is handed to a handler.
 	drained atomic.Bool
 	// h2Streams counts the HTTP/2 (h2c) requests in their handler
 	// (Bridge.ServeHTTP). net/http hands an h2c connection over (hijack)
@@ -266,6 +270,17 @@ func (e *Engine) drain() error {
 	return e.drainErr
 }
 
+// budgetCause is what a Shutdown call's expired ctx tells the drain: its
+// error, which the callers' errors.Is checks rely on, and, if the ctx
+// carries a cause of its own (WithCancelCause, WithTimeoutCause), that too.
+func budgetCause(ctx context.Context) error {
+	err, cause := ctx.Err(), context.Cause(ctx)
+	if cause == nil || cause == err { //nolint:errorlint // identity: no cause of its own
+		return err
+	}
+	return fmt.Errorf("%w: %w", err, cause)
+}
+
 // h2StreamsPoll is how often the drain looks at h2Streams while it waits.
 const h2StreamsPoll = 5 * time.Millisecond
 
@@ -359,7 +374,7 @@ func (e *Engine) waitH2Streams(ctx context.Context) error {
 // the same.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() {
-		e.drainCancel(ctx.Err())
+		e.drainCancel(budgetCause(ctx))
 		e.baseCancel()
 	})
 	if err := e.drain(); err != nil {
@@ -376,7 +391,7 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		if e.drainCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			// This call's ctx is live: another call's budget ended the
 			// drain. Say so, and whose it was.
-			return fmt.Errorf("std: the drain was ended by another Shutdown call whose budget ran out: %w", context.Cause(e.drainCtx))
+			return fmt.Errorf("std: the drain was ended by a Shutdown call whose budget ran out: %w", context.Cause(e.drainCtx))
 		}
 		return err
 	}

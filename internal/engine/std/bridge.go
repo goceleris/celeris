@@ -27,8 +27,11 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !b.engine.enterH2Stream() {
 			// Only a connection that handed itself over after the drain's
 			// GOAWAY went out gets here. It is sent GOAWAY when this stream
-			// ends: net/http's HTTP/2 server does that for a connection of a
-			// server that is shutting down as soon as the connection is idle.
+			// ends: Connection: close makes the HTTP/2 server do it with
+			// this response, on every build (net/http's server would also
+			// do it once the connection is idle, x/net's legacy one reads
+			// no such state from the server).
+			w.Header().Set("Connection", "close")
 			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
 			return
 		}
@@ -44,6 +47,8 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Connection", "close")
 		}
 	}
+	// Counted here, past the h2 gate: an h2c request refused after the drain
+	// is not one the engine served and is not in RequestCount.
 	b.engine.metrics.reqCount.Add(1)
 
 	s := stream.NewH1Stream(1)

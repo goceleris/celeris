@@ -84,6 +84,8 @@ func holdDrain(longCtx context.Context, t *testing.T) (e *Engine, first <-chan e
 	return e, ch
 }
 
+var errShutdownCause = errors.New("test: the operator pressed stop")
+
 // TestOverlappingShutdownLiveCallerIsToldWhoseBudgetEndedTheDrain pins
 // celeris#879.
 //
@@ -103,6 +105,9 @@ func TestOverlappingShutdownLiveCallerIsToldWhoseBudgetEndedTheDrain(t *testing.
 		// that call returns and the live first call must report too.
 		end  func() (context.Context, context.CancelFunc)
 		want error
+		// also, if set, is a cause the ending ctx carries (WithTimeoutCause);
+		// the live first call must be able to find it too.
+		also error
 	}{
 		{
 			name: "deadline",
@@ -110,6 +115,16 @@ func TestOverlappingShutdownLiveCallerIsToldWhoseBudgetEndedTheDrain(t *testing.
 				return context.WithTimeout(context.Background(), 200*time.Millisecond)
 			},
 			want: context.DeadlineExceeded,
+		},
+		{
+			// A ctx with its own cause: the live caller is told the ctx
+			// error (the contract) and the cause (what the caller put there).
+			name: "deadline-with-cause",
+			end: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeoutCause(context.Background(), 200*time.Millisecond, errShutdownCause)
+			},
+			want: context.DeadlineExceeded,
+			also: errShutdownCause,
 		},
 		{
 			// The second signal that means "stop now": a ctx already done.
@@ -146,6 +161,9 @@ func TestOverlappingShutdownLiveCallerIsToldWhoseBudgetEndedTheDrain(t *testing.
 				}
 				if !errors.Is(err, tc.want) {
 					t.Errorf("the live first call returned %v, want an error wrapping %v, the ending call's ctx error", err, tc.want)
+				}
+				if tc.also != nil && !errors.Is(err, tc.also) {
+					t.Errorf("the live first call returned %v, which lost the cause %v the ending call's ctx carried", err, tc.also)
 				}
 			case <-time.After(bound):
 				t.Fatalf("the live first call (30s budget) had not returned %v after the second call's budget ended the drain", bound)

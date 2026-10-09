@@ -88,17 +88,28 @@ func (h *pathHandler) enteredPaths() []string {
 // serves.
 func startH2CShutdownEngine(t *testing.T, h stream.Handler, wrap func(http.Handler) http.Handler) (*Engine, string) {
 	t.Helper()
+	return startH2CEngineWith(t, h, wrap, nil)
+}
+
+// startH2CEngineWith is startH2CShutdownEngine with mod applied to the
+// resource.Config first (it starts from no read and write timeouts).
+func startH2CEngineWith(t *testing.T, h stream.Handler, wrap func(http.Handler) http.Handler, mod func(*resource.Config)) (*Engine, string) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	e, err := New(resource.Config{
+	cfg := resource.Config{
 		Listener:     ln,
 		Engine:       engine.Std,
 		Protocol:     engine.H2C,
 		ReadTimeout:  -1,
 		WriteTimeout: -1,
-	}, h)
+	}
+	if mod != nil {
+		mod(&cfg)
+	}
+	e, err := New(cfg, h)
 	if err != nil {
 		_ = ln.Close()
 		t.Fatalf("New: %v", err)
