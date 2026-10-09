@@ -283,7 +283,7 @@ func requireAsyncCancelFlags(p asyncCancelProbe, reason string, profile engine.C
 		// The probe's answer and reason follow the version, which is the
 		// cause. Accepted is the one answer that needs explaining: it reads
 		// like a pass, and is why a version check is needed at all.
-		detail := "the IORING_ASYNC_CANCEL flags probe answered " + p.String()
+		detail := "the IORING_ASYNC_CANCEL flags probe result: " + p.String()
 		if reason != "" {
 			detail += " (" + reason + ")"
 		}

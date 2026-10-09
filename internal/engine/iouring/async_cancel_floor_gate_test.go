@@ -128,7 +128,7 @@ func TestRequireAsyncCancelFlagsErrorReads872(t *testing.T) {
 	if accepted == nil {
 		t.Fatal("accepted on 5.15 was not refused")
 	}
-	if msg := accepted.Error(); strings.Contains(msg, "()") || !strings.Contains(msg, "answered accepted") ||
+	if msg := accepted.Error(); strings.Contains(msg, "()") || !strings.Contains(msg, "probe result: accepted") ||
 		!strings.Contains(msg, "only some of the flags") || !strings.Contains(msg, "5.15.0-test predates it") {
 		t.Errorf("accepted on 5.15: error %q", msg)
 	}
@@ -136,7 +136,7 @@ func TestRequireAsyncCancelFlagsErrorReads872(t *testing.T) {
 	if noAnswer == nil {
 		t.Fatal("no answer on 5.15 was not refused")
 	}
-	if msg := noAnswer.Error(); strings.Contains(msg, "only some of the flags") || !strings.Contains(msg, "answered no answer (NewRing failed: EMFILE)") {
+	if msg := noAnswer.Error(); strings.Contains(msg, "only some of the flags") || !strings.Contains(msg, "probe result: no answer (NewRing failed: EMFILE)") {
 		t.Errorf("no answer on 5.15: error %q", msg)
 	}
 }
