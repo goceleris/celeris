@@ -1300,7 +1300,7 @@ func (c *Context) BytesWritten() int {
 // (CELERIS_IOURING_MULTISHOT_RECV=1) keeps the ring buffer the request was
 // read into and gives the ring a fresh one. On that mode the kept buffer's
 // memory is not returned before the process exits: at most one ring's worth
-// however many connections are hijacked. Hijack also copies the request
+// per worker and per engine start, however many connections are hijacked. Hijack also copies the request
 // values the Context holds, as [Context.Detach] does, so the path, params,
 // headers, query, cookies and body read from the Context after Hijack are
 // copies.
