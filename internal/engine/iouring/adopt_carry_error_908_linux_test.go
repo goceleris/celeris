@@ -157,6 +157,32 @@ func testCarryH2CUpgrade908(t *testing.T, adopt func(int, engine.Carryover) erro
 	h2Streams908(t, client, br)
 }
 
+// testCarryGoodThenUpgrade908: a good request carried ahead of an h2c upgrade.
+// The client gets the 200, then the 101, then working HTTP/2 streams: the
+// replay must answer what came before the upgrade and still switch.
+func testCarryGoodThenUpgrade908(t *testing.T, adopt func(int, engine.Carryover) error) {
+	client, br := adoptCarry908(t, adopt, carryGood908+h2cUpgradeHead908())
+	code, body, err := readBody543(client, br, 3*time.Second)
+	if err != nil || code != 200 || body != "/first" {
+		t.Fatalf("the request ahead of the upgrade: %d %q %v", code, body, err)
+	}
+	_ = client.SetDeadline(time.Now().Add(6 * time.Second))
+	status, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(status, " 101 ") {
+		t.Fatalf("the upgrade request got no 101: %q %v", status, err)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read the 101 head: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	h2Streams908(t, client, br)
+}
+
 // h2Streams908 speaks HTTP/2 on a conn whose 101 has been read.
 func h2Streams908(t *testing.T, client net.Conn, br *bufio.Reader) {
 	t.Helper()
@@ -244,6 +270,41 @@ func testRecvOnError908(t *testing.T, e *Engine, h *onErr908Handler) {
 	}
 }
 
+// waitPipeSettled908 waits, without reading, until the bytes the server has
+// pushed into c's receive queue stop growing: the loopback pair is full (the
+// receive queue plus the server's send buffer) and the server has flushed all
+// it can. It replaces a fixed sleep, which on a loaded host may not cover the
+// flush. The queue must be non-empty and unchanged for 5 polls of 20 ms.
+func waitPipeSettled908(t *testing.T, c net.Conn) {
+	t.Helper()
+	rc, err := c.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatalf("syscallconn: %v", err)
+	}
+	queued := func() int {
+		n := -1
+		_ = rc.Control(func(fd uintptr) {
+			if v, err := unix.IoctlGetInt(int(fd), unix.TIOCINQ); err == nil {
+				n = v
+			}
+		})
+		return n
+	}
+	last, stable := -1, 0
+	for dl := time.Now().Add(10 * time.Second); time.Now().Before(dl); time.Sleep(20 * time.Millisecond) {
+		n := queued()
+		if n > 0 && n == last {
+			if stable++; stable >= 5 {
+				return
+			}
+		} else {
+			stable = 0
+		}
+		last = n
+	}
+	t.Fatalf("the client's receive queue never filled and settled (%d bytes queued)", last)
+}
+
 // testCarryLargeResponse908 adopts a conn whose carried request has a response
 // larger than the socket buffers, with the client reading only after the
 // adoption. The replay's flush is partial; the rest must follow on EPOLLOUT
@@ -251,7 +312,7 @@ func testRecvOnError908(t *testing.T, e *Engine, h *onErr908Handler) {
 // engine read itself, and the conn must go on serving.
 func testCarryLargeResponse908(t *testing.T, adopt func(int, engine.Carryover) error) {
 	client, br := adoptCarry908(t, adopt, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
-	time.Sleep(200 * time.Millisecond) // the replay has flushed what the kernel took
+	waitPipeSettled908(t, client) // the replay has flushed what the kernel took
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
@@ -282,7 +343,7 @@ func testRecvLargeResponse908(t *testing.T, e *Engine) {
 	if _, err := client.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	waitPipeSettled908(t, client)
 	br := bufio.NewReader(client)
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	resp, err := http.ReadResponse(br, nil)
@@ -300,7 +361,7 @@ func testRecvLargeResponse908(t *testing.T, e *Engine) {
 // on io_uring): the client gets every byte, then EOF.
 func testCarryLargeClose908(t *testing.T, adopt func(int, engine.Carryover) error) {
 	client, br := adoptCarry908(t, adopt, "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-	time.Sleep(200 * time.Millisecond)
+	waitPipeSettled908(t, client)
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
@@ -363,6 +424,11 @@ func TestIouringAdoptCarriedH2CUpgradeSync908(t *testing.T) {
 	testCarryH2CUpgrade908(t, e.AdoptConn)
 }
 
+func TestIouringAdoptCarriedGoodThenUpgradeSync908(t *testing.T) {
+	e, _ := start908(t, false, true)
+	testCarryGoodThenUpgrade908(t, e.AdoptConn)
+}
+
 func TestIouringAdoptCarriedLargeResponseSync908(t *testing.T) {
 	e, _ := start908(t, false, false)
 	testCarryLargeResponse908(t, e.AdoptConn)
@@ -391,6 +457,11 @@ func TestIouringAdoptCarriedConnectionCloseAsync908(t *testing.T) {
 func TestIouringAdoptCarriedH2CUpgradeAsync908(t *testing.T) {
 	e, _ := start908(t, true, true)
 	testCarryH2CUpgrade908(t, e.AdoptConn)
+}
+
+func TestIouringAdoptCarriedGoodThenUpgradeAsync908(t *testing.T) {
+	e, _ := start908(t, true, true)
+	testCarryGoodThenUpgrade908(t, e.AdoptConn)
 }
 
 func TestIouringAdoptCarriedOnErrorAsync908(t *testing.T) {
