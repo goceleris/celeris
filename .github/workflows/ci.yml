@@ -1481,7 +1481,7 @@ jobs:
       # io_uring, or no working SEND_ZC, skips: so they run here by name on both
       # arches, at the runner's own 8 MiB memlock, with every run of each test
       # and its cases required to PASS and no FAIL or SKIP line.
-      - name: celeris#868 #869 #880 io_uring buffer ownership (both arches, skipping forbidden)
+      - name: celeris#868, celeris#869 and celeris#880 io_uring buffer ownership (both arches, skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
         env:
