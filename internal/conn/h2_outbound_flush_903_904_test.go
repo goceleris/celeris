@@ -424,8 +424,14 @@ func TestSettingsReflushReservesTheConnectionWindow904(t *testing.T) {
 	if n := len(c.stream(1).data); n != 65535 {
 		t.Errorf("after SETTINGS_INITIAL_WINDOW_SIZE +100000 and no connection WINDOW_UPDATE: %d DATA bytes in all, want 65535 (the connection window is used up)", n)
 	}
-	// The connection window is credited; the rest goes out, in order.
+	// The connection window is credited: the stream window (100,000) is then
+	// the limit, until it is credited too; the rest goes out, in order.
 	c.grant(200000, true)
+	c.drain()
+	if n := len(c.stream(1).data); n != 65535+100000 {
+		t.Errorf("after the connection window was credited: %d DATA bytes in all, want %d (the stream window's 100000 more)", n, 65535+100000)
+	}
+	c.grant(200000, false, 1)
 	c.drain()
 	checkWholeBody(t, "after the connection window was credited", c.stream(1), body)
 	if held := c.st.processor.GetManager().OutboundHeld(); held != 0 {

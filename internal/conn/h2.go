@@ -137,6 +137,22 @@ func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
 	}
 }
 
+// enqueueFromLoop appends pre-encoded frame bytes for the event loop's own
+// flushes of buffered DATA (a WINDOW_UPDATE, a SETTINGS frame), which run inside
+// ProcessH2 (celeris#903). It sets pending but does not signal the loop's
+// wakeup: the loop is the caller, and ProcessH2 drains the queue after every
+// frame and again before it returns, so no eventfd write is needed to bring
+// the loop back. The frame goes to the same shard as the stream's HEADERS and
+// earlier DATA, so it follows them. Only for use inside ProcessH2; any other
+// caller must use Enqueue.
+func (q *h2ShardedQueue) enqueueFromLoop(streamID uint32, data *[]byte) {
+	shard := &q.shards[(streamID>>1)%h2QueueShards]
+	shard.mu.Lock()
+	shard.bufs = append(shard.bufs, data)
+	shard.mu.Unlock()
+	q.pending.Store(true)
+}
+
 // DrainTo drains all enqueued data by calling write for each buffer,
 // then returns buffers to the pool.
 // Called from the event loop thread. The write function must not block.
@@ -539,6 +555,9 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	// two maps; collapsing into the parent would cost more than it saves.
 	proc := stream.NewProcessor(handler, fw, &s.adapter)
 	proc.InlineWriter = &s.inlineAdapter
+	// The event loop's flushes of a stream's buffered DATA go through the
+	// write queue, behind the stream's HEADERS (celeris#903).
+	proc.SetOutboundSink(s.adapter.sendDataFromLoop)
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
 	mgr := proc.GetManager()
 	mgr.SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)

@@ -170,6 +170,10 @@ type Processor struct {
 	// H2State.mu), so a per-processor scratch slice is safe.
 	connFlushScratch []*Stream
 
+	// outboundSink, when set (SetOutboundSink), carries the DATA that
+	// flushStreamOutbound and the SETTINGS_INITIAL_WINDOW_SIZE re-flush send.
+	outboundSink OutboundSend
+
 	// poolRunning counts this connection's streams whose handler has been
 	// handed to the shared worker pool and has not returned yet
 	// (celeris#759). The native engines' graceful shutdown waits for it to
@@ -466,7 +470,21 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 	}
 
 	var validationErr error
+	// What a SETTINGS_INITIAL_WINDOW_SIZE releases of the streams' buffered
+	// DATA goes through sendBuffered, after the SETTINGS ACK on the wire. With
+	// the conn layer's sink that holds by construction (the ACK is written to
+	// the connection ahead of the queue); written to the frame writer, which
+	// has no sink, the DATA is held here until the ACK is written.
 	var pendingFlushes []bufferedFlush
+	// Streams whose last buffered bytes went out with END_STREAM; closed once
+	// the manager's lock is released.
+	var finishedFlushes []uint32
+	send := OutboundSend(p.sendBuffered)
+	if p.outboundSink == nil {
+		send = func(id uint32, endStream bool, data []byte) {
+			pendingFlushes = append(pendingFlushes, bufferedFlush{streamID: id, data: append([]byte(nil), data...), endStream: endStream})
+		}
+	}
 
 	_ = f.ForeachSetting(func(s http2.Setting) error {
 		switch s.ID {
@@ -510,38 +528,12 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 				}
 				newWin := stream.windowSize.Add(delta)
 
-				// If window became positive and there's buffered data, prepare to flush.
-				if newWin > 0 {
-					stream.mu.Lock()
-					if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
-						buffered := stream.OutboundBuffer.Bytes()
-						sendLen := len(buffered)
-						curWin := stream.windowSize.Load()
-						if int32(sendLen) > curWin {
-							sendLen = int(curWin)
-						}
-						isEnd := sendLen == len(buffered) && stream.OutboundEndStream
-						data := make([]byte, sendLen)
-						copy(data, buffered[:sendLen])
-						stream.windowSize.Add(-int32(sendLen))
-						p.manager.refundOutbound(sendLen) // celeris#893
-
-						if sendLen == len(buffered) {
-							stream.OutboundBuffer.Reset()
-						} else {
-							remaining := make([]byte, len(buffered)-sendLen)
-							copy(remaining, buffered[sendLen:])
-							stream.OutboundBuffer.Reset()
-							stream.OutboundBuffer.Write(remaining)
-						}
-
-						pendingFlushes = append(pendingFlushes, bufferedFlush{
-							streamID:  sid,
-							data:      data,
-							endStream: isEnd,
-						})
-					}
-					stream.mu.Unlock()
+				// If the window became positive and the stream has buffered
+				// data, send what both windows allow. A stream whose last
+				// bytes went out with END_STREAM is closed below, after the
+				// manager's lock is released.
+				if newWin > 0 && p.manager.FlushOutbound(stream, send) {
+					finishedFlushes = append(finishedFlushes, sid)
 				}
 			}
 			p.manager.mu.Unlock()
@@ -589,17 +581,17 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 	for _, pf := range pendingFlushes {
 		_ = p.writer.WriteData(pf.streamID, pf.endStream, pf.data)
 		p.flush()
-		// If all buffered data was flushed with END_STREAM, clean up.
-		if pf.endStream {
-			if s, ok := p.manager.GetStream(pf.streamID); ok {
-				switch s.GetState() {
-				case StateHalfClosedRemote:
-					s.SetState(StateClosed)
-				case StateOpen:
-					s.SetState(StateHalfClosedLocal)
-				}
-				p.manager.DeleteStream(pf.streamID)
+	}
+	// A stream whose buffered DATA all went out with END_STREAM is done.
+	for _, sid := range finishedFlushes {
+		if s, ok := p.manager.GetStream(sid); ok {
+			switch s.GetState() {
+			case StateHalfClosedRemote:
+				s.SetState(StateClosed)
+			case StateOpen:
+				s.SetState(StateHalfClosedLocal)
 			}
+			p.manager.DeleteStream(sid)
 		}
 	}
 
@@ -701,10 +693,8 @@ func (p *Processor) runHandler(stream *Stream) {
 	run := flagAsyncRunning
 	if inline {
 		// On the pool only for the budget: none of its response is buffered,
-		// even if the budget has room again when it writes (flagBudgetPool).
-		// Its HEADERS go through the write queue, and a WINDOW_UPDATE flushes
-		// a stream's buffered DATA straight to the connection, ahead of the
-		// queue: an inline handler's HEADERS never waited there (#903).
+		// even if the budget has room again when it writes (flagBudgetPool,
+		// TryBufferOutbound).
 		run |= flagBudgetPool
 	}
 	stream.flags.Or(run)
@@ -1388,51 +1378,39 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 
 // flushStreamOutbound sends as much of a stream's buffered outbound DATA as
 // the current per-stream AND connection send windows allow, debiting both
-// windows (RFC 7540 §6.9). It returns true only when the entire buffer was
+// windows (RFC 9113 §6.9.1). It returns true only when the entire buffer was
 // flushed AND it carried END_STREAM — i.e. the stream is now fully sent and
 // the caller should transition it to closed and reclaim its slot. A stream
 // that still has bytes buffered (because either window was exhausted mid-flush)
-// returns false and stays alive for the next WINDOW_UPDATE.
+// returns false and stays alive for the next WINDOW_UPDATE. The DATA goes
+// through sendBuffered, behind the stream's HEADERS (celeris#903).
 func (p *Processor) flushStreamOutbound(s *Stream) bool {
-	flushedAll := false
-	s.mu.Lock()
-	if s.OutboundBuffer == nil || s.OutboundBuffer.Len() == 0 {
-		s.mu.Unlock()
-		return false
+	return p.manager.FlushOutbound(s, p.sendBuffered)
+}
+
+// SetOutboundSink makes send the way the event loop's flushes of buffered DATA
+// (a WINDOW_UPDATE, a SETTINGS_INITIAL_WINDOW_SIZE) reach the connection, in
+// place of the frame writer. The conn layer passes its write queue, so a
+// stream's buffered DATA follows, in the stream's order, the HEADERS and the
+// DATA its handler has queued; written to the frame writer instead, it could
+// reach the connection ahead of a HEADERS that was still in the queue, and the
+// peer would see DATA on a stream with no HEADERS (celeris#903).
+//
+// send is called on the event loop, from ProcessFrame, with the stream's lock
+// held. It must consume or copy the bytes before it returns, and the frames it
+// produces must reach the connection after what ProcessFrame wrote to the
+// frame writer (the SETTINGS ACK before the DATA a SETTINGS frame releases).
+func (p *Processor) SetOutboundSink(send OutboundSend) { p.outboundSink = send }
+
+// sendBuffered writes buffered DATA the event loop flushes: to the outbound
+// sink when the conn layer set one, to the frame writer otherwise.
+func (p *Processor) sendBuffered(id uint32, endStream bool, data []byte) {
+	if p.outboundSink != nil {
+		p.outboundSink(id, endStream, data)
+		return
 	}
-
-	buffered := s.OutboundBuffer.Bytes()
-	// Atomically reserve+debit both windows for exactly the bytes we are about
-	// to send, so a concurrent async-path reservation can never push a shared
-	// window past the peer-authorized credit (RFC 7540 §6.9).
-	sendLen := int(p.manager.ReserveSendWindow(s, int32(len(buffered))))
-	if sendLen <= 0 {
-		// No room on at least one window — leave everything buffered.
-		s.mu.Unlock()
-		return false
-	}
-
-	isEnd := sendLen == len(buffered) && s.OutboundEndStream
-	s.mu.Unlock()
-
-	_ = p.writer.WriteData(s.ID, isEnd, buffered[:sendLen])
+	_ = p.writer.WriteData(id, endStream, data)
 	p.flush()
-
-	s.mu.Lock()
-	p.manager.refundOutbound(sendLen) // celeris#893
-	if sendLen == len(buffered) {
-		s.OutboundBuffer.Reset()
-		if isEnd {
-			flushedAll = true
-		}
-	} else {
-		remaining := make([]byte, len(buffered)-sendLen)
-		copy(remaining, buffered[sendLen:])
-		s.OutboundBuffer.Reset()
-		s.OutboundBuffer.Write(remaining)
-	}
-	s.mu.Unlock()
-	return flushedAll
 }
 
 // flushConnWindowStalledStreams re-flushes every stream that still has
