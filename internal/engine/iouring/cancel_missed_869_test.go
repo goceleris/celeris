@@ -216,6 +216,64 @@ func TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced(t *testing.T) {
 	}
 }
 
+// TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC:
+// the conn also owes a SEND_ZC's notification (closedZCOwed). The backstop's
+// rule for that, hold the send buffer until the notification and give up the
+// descriptor (holdZCPastBackstop, CloseFDForced), is for a descriptor only the
+// SEND_ZC's own ops name. A recv whose cancel was never placed names it too:
+// closing it under that recv is the celeris#685 hazard, and taking the entry
+// off the walk stops the cancel's retries.
+func TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC(t *testing.T) {
+	f := newFDLFixture(t, false)
+	w, cs := f.w, f.cs
+	f.armFirstRecv()
+	if !cs.recvArmed || cs.kernelInflight != 1 {
+		t.Fatalf("recv not armed: armed=%v kernelInflight=%d", cs.recvArmed, cs.kernelInflight)
+	}
+	recvUD := encodeUserDataGen(udRecv, f.fd, f.gen)
+	// A SEND_ZC whose first completion has been applied: only its notification is owed.
+	cs.sendIsZC, cs.zcNotifPending, cs.zcSentBytes = true, true, 1
+	cs.kernelInflight = 2
+
+	full := true
+	w.cancelSQEFull = func() bool { return full }
+	cs.closing = true
+	w.finishCloseAny(f.fd, cs)
+	if w.conns[f.fd] != nil || len(w.pendingRelease) != 1 || !w.pendingRelease[0].holdsFD || !cs.cancelMissed {
+		t.Fatalf("the close did not queue the connState with its descriptor and the missed cancel: slot=%p pendingRelease=%d cancelMissed=%v",
+			w.conns[f.fd], len(w.pendingRelease), cs.cancelMissed)
+	}
+	if !w.closedZCOwed(cs) {
+		t.Fatalf("the identity does not owe the SEND_ZC: the case did not form")
+	}
+	takeSQEs(w.ring)
+
+	w.pendingRelease[0].releaseAtNanos = 1
+	w.cachedNow = time.Now().UnixNano()
+	w.drainPendingRelease()
+	t.Logf("celeris869 ORDER pendingRelease=%d zcHolds=%d fd_open=%v CloseFDForced=%d cancelMissed=%v",
+		len(w.pendingRelease), len(w.zcHolds), fdOpen704(f.fd), w.handoffLoss.closeFDForced.Load(), cs.cancelMissed)
+	if forced := w.handoffLoss.closeFDForced.Load(); forced != 0 || !fdOpen704(f.fd) {
+		t.Errorf("the backstop closed the descriptor (CloseFDForced=%d, open=%v) under a recv whose cancel was never placed", forced, fdOpen704(f.fd))
+	}
+	if len(w.pendingRelease) != 1 || len(w.zcHolds) != 0 {
+		t.Fatalf("the entry left the walk (pendingRelease=%d, zcHolds=%d): the missed cancel is no longer retried", len(w.pendingRelease), len(w.zcHolds))
+	}
+
+	// The ring has room: the next pass places the recv's cancel.
+	full = false
+	w.drainPendingRelease()
+	var cancelled bool
+	for _, r := range takeSQEs(w.ring) {
+		if r.op == opASYNCCANCEL && r.addr == recvUD {
+			cancelled = true
+		}
+	}
+	if !cancelled || cs.cancelMissed {
+		t.Errorf("after the ring had room the recv's cancel was not placed (placed=%v, cancelMissed=%v)", cancelled, cs.cancelMissed)
+	}
+}
+
 // hijackProbe869 hijacks on /hj, and answers 503 when the hijack is refused,
 // as a handler that checks Hijack's error does.
 type hijackProbe869 struct {

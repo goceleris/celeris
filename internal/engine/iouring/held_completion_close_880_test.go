@@ -165,7 +165,8 @@ func TestFdOpsLeavesOutAHeldSendZCFirstCompletion(t *testing.T) {
 		{"notification pending", 2, true, nil, 1, "celeris#798"},
 		{"first completion held", 2, false, []completionEntry{first}, 1, "celeris#880"},
 		{"first held, nothing else owed", 1, false, []completionEntry{first}, 0, "celeris#880"},
-		{"first applied, notification held", 2, true, []completionEntry{notif}, 1, "the held notification is terminal: kernelInflight has lost it already"},
+		{"first applied, notification held", 1, true, []completionEntry{notif}, 1, "the held notification is terminal: kernelInflight has lost it already (staleConnCQE, at read)"},
+		{"first and notification held", 1, false, []completionEntry{first, notif}, 1, "the notification is terminal; the first completion is not counted twice"},
 		{"plain completion held", 1, false, []completionEntry{plain}, 1, "a plain send's completion is its terminal one"},
 	} {
 		cs := &connState{kernelInflight: tc.inflight, zcNotifPending: tc.zcNotif, heldSends: tc.held}
