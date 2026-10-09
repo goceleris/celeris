@@ -358,13 +358,16 @@ func TestH2CUpgradeConfigMatrix(t *testing.T) {
 	}{
 		{"Auto default enables", engine.Auto, nil, true},
 		{"Auto explicit true", engine.Auto, h2cTrue(), true},
-		// "Auto explicit false" is intentionally omitted: at the
-		// resource.Config level, EnableH2Upgrade is a concrete bool — zero
-		// (false) is indistinguishable from "unset", and WithDefaults force-
-		// enables upgrade on Auto. Users who want Auto+disabled must go
-		// through the top-level celeris.Config path (EnableH2Upgrade *bool).
-		// The celeris.Config → resource.Config conversion path is covered
-		// by TestToResourceConfig_H2Upgrade in the root package.
+		// "Auto explicit false" is intentionally omitted: this matrix sets
+		// resource.Config.EnableH2Upgrade directly, where a bool's zero
+		// value (false) is indistinguishable from "unset", and WithDefaults
+		// enables upgrade on Auto for such a literal. Auto+disabled is the
+		// celeris.Config path (EnableH2Upgrade *bool), which resolves the
+		// pointer and marks it final with resource.Config.SetH2Upgrade
+		// (celeris#964). The conversion is covered by
+		// TestToResourceConfig_H2Upgrade, and the behaviour on every engine
+		// by TestEnableH2UpgradeFalseDisablesUpgradeOnAuto964, both in the
+		// repository root (packages celeris and celeris_test).
 		{"H2C default disabled", engine.H2C, nil, false},
 		{"H2C explicit true", engine.H2C, h2cTrue(), true},
 		{"HTTP1 default", engine.HTTP1, nil, false},

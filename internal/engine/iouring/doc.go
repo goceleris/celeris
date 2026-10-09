@@ -7,9 +7,11 @@
 // The engine needs Linux 5.19 or later. Every cancel it submits (connection close, hijack, the
 // accept pause, the WebSocket backpressure pause, the driver unregister and the io_uring→epoll
 // hand-off) sets IORING_ASYNC_CANCEL flags, which that release added; an older kernel fails each
-// one with -EINVAL and leaves the operation it targets running (celeris#682). New probes for the
-// flags and, where the kernel rejects them (or, before 5.19, where the probe gets no answer),
-// returns an error that starts "io_uring not available on this system" and names the requirement.
+// one with -EINVAL and leaves the operation it targets running (celeris#682). New refuses a
+// kernel before 5.19 whatever the flags probe answers, even accepted (celeris#872: the probe sends one
+// cancel form, which a partial backport can pass while the other forms still fail), and from 5.19
+// refuses a kernel that rejects the flags. The error starts "io_uring not available on this system"
+// and names the requirement.
 // The adaptive engine then runs on epoll.
 //
 // # Environment Knobs
