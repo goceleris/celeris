@@ -1651,6 +1651,18 @@ func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 }
 
 // Write sends a chunk of the response body. May be called multiple times.
+//
+// On HTTP/2 the chunk is held to the peer's flow-control windows
+// (RFC 9113 §6.9.1). Called from a worker-pool goroutine (an async route), Write
+// blocks until the windows let the whole chunk go, for no longer than the
+// server's WriteTimeout from the call (0 = no bound): then the stream is reset
+// with INTERNAL_ERROR and Write returns an error wrapping
+// [os.ErrDeadlineExceeded]. It returns the stream's context error when the
+// peer resets the stream or the connection closes. Called from a handler on
+// the event loop, it does not block: what the windows refuse is buffered and
+// sent as the peer grants window. When Write returns an error it reports 0
+// bytes written, though part of the chunk may already have been sent, and
+// [StreamWriter.BytesWritten] does not count it.
 func (sw *StreamWriter) Write(data []byte) (int, error) {
 	sw.markUsed()
 	err := sw.streamer.Write(sw.stream, data)

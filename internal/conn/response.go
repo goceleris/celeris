@@ -1170,7 +1170,7 @@ func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers []
 // both of the peer's flow-control windows (RFC 9113 §6.9.1), reserving what it
 // sends from each, as WriteResponse does:
 //
-//   - On a pool goroutine (an async route, a detached handler), it sends what
+//   - On a pool goroutine (an async route; a sync one the budget put on the pool), it sends what
 //     the windows allow and waits for the rest (Stream.AwaitSendWindow), the
 //     way net/http's server blocks a handler's Write on flow control. The wait
 //     takes the same WriteTimeout deadline #906 gives WriteResponse's
@@ -1181,10 +1181,13 @@ func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers []
 //     response: a stream (SSE) is meant to outlast any one write. If the
 //     stream ends while Write waits (the peer reset it, the connection
 //     closed), Write returns the stream's context error.
-//   - On the event loop (a sync handler streaming inline) it cannot wait: what
+//   - Otherwise (a sync handler streaming inline on the event loop, or a goroutine
+//     it detached: neither is flagged as a pool handler) it cannot wait: what
 //     the windows refuse is buffered on the stream behind the DATA already
-//     sent, charged to the connection's outbound budget, and the loop sends it
-//     as the peer grants window. Write returns at once.
+//     sent, charged to the connection's outbound budget (which the budget does
+//     not limit here: a slow inline stream can push its connection over budget,
+//     and its later sync GETs then run on the pool), and the loop sends it as
+//     the peer grants window. Write returns at once.
 //
 // Without a manager (adapters built by unit tests) there is no flow control.
 func (a *h2ResponseAdapter) Write(s *stream.Stream, data []byte) error {
