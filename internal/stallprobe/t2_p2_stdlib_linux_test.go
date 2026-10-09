@@ -13,13 +13,20 @@ import (
 	"time"
 )
 
-// P2 StdlibLarge. A pure net/http server (no celeris in the process), in a
+// P2 StdlibLarge, a CONTROL. A pure net/http server (no celeris in the process), in a
 // fresh process, serves 4 MiB and 64 MiB bodies to a loopback client in the
 // same process with the same rule as celeris's large-response tests: no byte
 // for 5 s fails the repetition. 20 repetitions per size by default. The
 // question: does plain Go stall on this host? A host that stalls net/http the
 // same way as celeris is not celeris's problem. The process also runs a 1 ms
 // watchdog, so a stall of the whole process (not of one connection) shows.
+//
+// Every hypothesis for the msr1 stalls predicts that this passes (net/http had
+// 0 failures and 0 slow passes in 450 leaves after the fix), so a pass tells
+// little: it is the baseline the other probes are read against. A FAIL here
+// would be the news (the host or the Go runtime stalls without celeris), and
+// the stall-time snapshot of a failing repetition says what the process and the
+// sockets looked like.
 
 type p2Result struct {
 	Pid       int
@@ -36,8 +43,7 @@ func p2Child() (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	reps := envInt("CELERIS_PROBE_REPS", 20)
-	maxStalls := envInt("CELERIS_PROBE_MAXSTALLS", 3)
+	rule := ruleFromEnv(1)
 	idle := time.Duration(envInt("CELERIS_PROBE_IDLE_MS", 5000)) * time.Millisecond
 	bodies := map[int][]byte{}
 	for _, m := range sizes {
@@ -46,6 +52,7 @@ func p2Child() (any, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) })
 	mux.HandleFunc("/big", func(w http.ResponseWriter, r *http.Request) {
+		maybeInject()
 		m, _ := strconv.Atoi(r.URL.Query().Get("mib"))
 		b, ok := bodies[m]
 		if !ok {
@@ -73,7 +80,7 @@ func p2Child() (any, error) {
 		if len(buf) < m<<20 {
 			buf = make([]byte, m<<20)
 		}
-		l := runLeaf(c, fmt.Sprintf("%dMiB", m), m, addr, "/big?mib="+strconv.Itoa(m), bodies[m], buf, reps, maxStalls, idle)
+		l := runLeaf(c, fmt.Sprintf("%dMiB", m), m, addr, "/big?mib="+strconv.Itoa(m), bodies[m], buf, rule, idle, nil)
 		res.Leaves = append(res.Leaves, l)
 	}
 	res.WD = wd.Stop()
@@ -93,14 +100,13 @@ func sizesMiB() ([]int, error) {
 }
 
 func TestProbeP2StdlibLarge(t *testing.T) {
-	tp := loadTopo()
-	reps := envInt("CELERIS_PROBE_REPS", 20)
+	rule := ruleFromEnv(1)
 	idleMs := envInt("CELERIS_PROBE_IDLE_MS", 5000)
 	sizes, err := sizesMiB()
 	if err != nil {
 		t.Fatal(err)
 	}
-	budget := time.Duration(len(sizes)*(reps+envInt("CELERIS_PROBE_MAXSTALLS", 3)*(idleMs/1000+2))+120) * time.Second
+	budget := time.Duration(len(sizes)*(rule.Reps+2*rule.MaxStalls*(idleMs/1000+2))+120) * time.Second
 	so, se, err := runChild(childSpec{kind: "p2", timeout: budget})
 	if err != nil {
 		t.Fatalf("the child failed: %v\n%s", err, tailLines(se, 20))
@@ -111,6 +117,7 @@ func TestProbeP2StdlibLarge(t *testing.T) {
 	}
 	logf(t, "net/http only, fresh process pid %d, GOMAXPROCS %d, NumCPU %d, allowed CPUs %s\nwatchdog over the whole child: max oversleep %s ms (%d sleeps)", res.Pid, res.GoMaxProc, res.NumCPU, res.Allowed, ms(res.WD.MaxNs), res.WD.Sleeps)
 	for _, l := range res.Leaves {
-		t.Run(l.Name, func(t *testing.T) { reportLeaf(t, tp, l, res.WD) })
+		l.applyWD(res.WD)
+		t.Run(l.Name, func(t *testing.T) { reportLeaf(t, l) })
 	}
 }

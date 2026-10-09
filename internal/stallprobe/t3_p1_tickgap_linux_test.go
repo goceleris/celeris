@@ -16,7 +16,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// P1 TickGap. One thread per allowed CPU, each pinned (sched_setaffinity,
+// P1 TickGap, a HOST probe: it runs no network workload and no celeris. It heat-
+// soaks the SoC (every CPU at 100% for 60 s per count), so it must not run
+// before P3 in the same hold: give it a dispatch of its own, or pass
+// extra='-shuffle=off' (the files are named so that P3, P2, then P1 run in that
+// order). One thread per allowed CPU, each pinned (sched_setaffinity,
 // runtime.LockOSThread) to its CPU and spinning on the monotonic clock for a
 // fixed window; every gap between two consecutive reads above the record
 // threshold (20 ms) is kept with its CPU, core type, the CPU's frequency right
@@ -31,11 +35,20 @@ import (
 //     hypervisor, a clock or interrupt problem);
 //   - a gap on every CPU of the spinner process only: a process-wide stall (the
 //     Go runtime or this address space; celeris#945 was one), not the machine;
-//   - a gap on one CPU: that CPU or that thread (preemption by another task,
-//     the CPU stuck in a low-power state or at a low frequency). The thread's
-//     scheduler accounting says which: "preempted" (runnable, waiting for the
+//   - a gap on one CPU: that CPU or that thread (preemption by another task, or
+//     the CPU frozen while busy). The thread's scheduler accounting says which: "preempted" (runnable, waiting for the
 //     CPU), "blocked" (neither running nor runnable), "on-cpu" (ran the whole
 //     gap and still read no new time: a hardware or interrupt stall).
+//
+// What a spinner CANNOT show: a spinner never sleeps, so it never needs a wakeup,
+// and it keeps its CPU out of idle states and at a busy frequency. A lost
+// wakeup, a deep idle state that is slow to leave, a CPU that stalls only when
+// idle, or a frequency governor that parks an idle CPU are invisible to P1
+// (P1b is the idle-side probe, without the network workload, so a null P1b
+// does not rule out a freeze that the workload triggers). And with GOGC=off and
+// no celeris in the children, P1 cannot reproduce a stop-the-world that waits
+// for a stuck P (celeris#945): the PROCESS class below means only that the
+// spinner threads stopped together while the observer did not.
 //
 // The spinner and observer children run with GOGC=off,
 // GODEBUG=asyncpreemptoff=1 and GOMAXPROCS=CPUs+2 (set in their environment:
