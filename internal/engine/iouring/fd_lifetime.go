@@ -487,6 +487,10 @@ func fdOps(cs *connState) int32 {
 	return n
 }
 
+// fdOpsSeen is fdOps for the shutdown drain, which also knows the SEND_ZC
+// completions it read itself. Seam: it counts as fdOps does until the fix.
+func fdOpsSeen(cs *connState, _, _ bool) int32 { return fdOps(cs) }
+
 // closedFDNamed reports whether an op the kernel still owes closed cs names
 // its descriptor, as drainPendingRelease asks of an entry that kept the
 // descriptor (holdsFD) while kernelInflight is not yet 0. Only a SEND_ZC
