@@ -1278,7 +1278,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// read for a multi-read POST. Disabled in async mode: the
 		// dispatch goroutine owns h1State and the worker cannot safely
 		// observe NextRecvBuf without synchronization.
-		recvBuf := cs.buf
+		// While the protocol is undetected, bytes already received and too
+		// few to decide on (detectN, at most detect.PrefaceLen-1) stay at the
+		// head of cs.buf and this read lands after them (celeris#870).
+		recvBuf := cs.buf[cs.detectN:]
 		intoBody := false
 		if !l.async && cs.h1State != nil {
 			if b := cs.h1State.NextRecvBuf(); b != nil {
@@ -1390,17 +1393,30 @@ func (l *Loop) drainRead(fd int, now int64) {
 			continue
 		}
 
-		data := cs.buf[:n]
+		// data is everything received so far that no protocol has consumed:
+		// this read plus, until detection succeeds, the bytes held back by an
+		// earlier one.
+		data := cs.buf[:int(cs.detectN)+n]
 
 		if !cs.detected {
 			proto, detectErr := detect.Detect(data)
 			if detectErr == detect.ErrInsufficientData {
+				// A first segment shorter than detection needs ("GE", or an
+				// h2c preface cut before byte 24) is kept in place and the
+				// next read appended to it. Reading every segment at the start
+				// of cs.buf overwrote it, so GE + "T /x HTTP/1.1" parsed as
+				// the method "T" and was answered 405, and a split preface
+				// was lost. Detect decides within detect.PrefaceLen bytes, so
+				// the held prefix is shorter than that and always leaves room
+				// in cs.buf (BufferSize >= resource.MinBufferSize).
+				cs.detectN = uint8(len(data))
 				continue
 			}
 			if detectErr != nil {
 				l.closeConn(fd)
 				return
 			}
+			cs.detectN = 0
 			cs.protocol = proto
 			cs.detected = true
 			l.initProtocol(cs)
@@ -1710,7 +1726,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// than the buffer can hold). Skip the EAGAIN-producing read that would
 		// otherwise cost one wasted syscall per request. Edge-triggered epoll
 		// will notify when new data arrives on this fd.
-		if n < len(cs.buf) {
+		if n < len(recvBuf) {
 			return
 		}
 	}

@@ -110,7 +110,8 @@ type connState struct {
 	detected bool            // 1 byte
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
 	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
-	_        [4]byte         // padding to 8-byte alignment
+	detectN  uint8           // 1 byte: bytes at the head of buf received but too few to detect on, under detect.PrefaceLen (celeris#870); 0 once detected
+	_        [3]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
@@ -352,6 +353,7 @@ func releaseConnState(cs *connState) {
 	cs.dirtyPrev = nil
 	cs.protocol = 0
 	cs.detected = false
+	cs.detectN = 0
 	cs.dirty = false
 	cs.epollOut = false
 	cs.pendingBytes = 0
