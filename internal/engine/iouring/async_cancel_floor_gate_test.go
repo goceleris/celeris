@@ -116,3 +116,27 @@ func TestNewFloorHoldsWhenTheProbeAnswersAccepted872(t *testing.T) {
 		t.Errorf("New's error %q: want it to say io_uring is not available and name Linux 5.19", err)
 	}
 }
+
+// TestRequireAsyncCancelFlagsErrorReads872 pins what an explicit
+// Engine: IOUring user sees on a kernel before 5.19 (celeris#872): the
+// version leads, an accepted answer carries no empty "()" for its blank
+// reason, and only that answer gets the partial-backport explanation (it is
+// false for a probe that got no answer).
+func TestRequireAsyncCancelFlagsErrorReads872(t *testing.T) {
+	profile := engine.CapabilityProfile{KernelVersion: "5.15.0-test", KernelMajor: 5, KernelMinor: 15}
+	accepted := requireAsyncCancelFlags(asyncCancelAccepted, "", profile)
+	if accepted == nil {
+		t.Fatal("accepted on 5.15 was not refused")
+	}
+	if msg := accepted.Error(); strings.Contains(msg, "()") || !strings.Contains(msg, "answered accepted") ||
+		!strings.Contains(msg, "only some of the flags") || !strings.Contains(msg, "5.15.0-test predates it") {
+		t.Errorf("accepted on 5.15: error %q", msg)
+	}
+	noAnswer := requireAsyncCancelFlags(asyncCancelNoAnswer, "NewRing failed: EMFILE", profile)
+	if noAnswer == nil {
+		t.Fatal("no answer on 5.15 was not refused")
+	}
+	if msg := noAnswer.Error(); strings.Contains(msg, "only some of the flags") || !strings.Contains(msg, "answered no answer (NewRing failed: EMFILE)") {
+		t.Errorf("no answer on 5.15: error %q", msg)
+	}
+}

@@ -280,10 +280,18 @@ func requireAsyncCancelFlags(p asyncCancelProbe, reason string, profile engine.C
 			"and kernel %s rejects the IORING_ASYNC_CANCEL flags every connection close uses (%s); "+
 			"use the epoll engine (celeris#682)", profile.KernelVersion, reason)
 	case !fromFloor:
+		// The probe's answer and reason follow the version, which is the
+		// cause. Accepted is the one answer that needs explaining: it reads
+		// like a pass, and is why a version check is needed at all.
+		detail := "the IORING_ASYNC_CANCEL flags probe answered " + p.String()
+		if reason != "" {
+			detail += " (" + reason + ")"
+		}
+		if p == asyncCancelAccepted {
+			detail += ", which a kernel that carries only some of the flags can give while its other cancel forms fail"
+		}
 		return fmt.Errorf("io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, "+
-			"and kernel %s predates it; the IORING_ASYNC_CANCEL flags probe answered %s (%s), which a kernel "+
-			"that carries only some of the flags can give while its other cancel forms fail; "+
-			"use the epoll engine (celeris#682, #872)", profile.KernelVersion, p, reason)
+			"and kernel %s predates it; %s; use the epoll engine (celeris#682, #872)", profile.KernelVersion, detail)
 	}
 	return nil
 }
