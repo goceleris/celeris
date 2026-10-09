@@ -568,8 +568,8 @@ func (s *Server) cancelListen() {
 // gone out, response DATA waiting for the client's WINDOW_UPDATE included,
 // while ctx is live (until its deadline or, for a ctx without one, until it
 // is done, but no longer than [Config.WriteTimeout]) and never for less than
-// 250 ms; std waits for its h2c streams' handlers, bounded by ctx
-// (celeris#759). Once
+// 250 ms; std sends each h2c connection GOAWAY, then waits for its h2c
+// streams' handlers, bounded by ctx (celeris#759, celeris#878). Once
 // the handlers have returned, the native engines send what the sockets have
 // not taken yet before they close the connections: epoll (and adaptive while
 // it runs epoll) for as long, and never for less than 250 ms (celeris#760);
@@ -580,7 +580,9 @@ func (s *Server) cancelListen() {
 // drain. Listen's own ctx.Done branch drains too, and a cancel of
 // StartWithContext's context reaches it first; since celeris#753 the drain
 // keeps the deadline of every Engine.Shutdown call whichever call started it,
-// where Listen's used to win the drain's sync.Once with no budget at all.
+// where Listen's used to win the drain's sync.Once with no budget at all. The
+// shortest governs: a call whose own ctx is still live when another's ends the
+// drain gets an error wrapping that call's ctx error (celeris#879).
 // A Shutdown that arrives before the server ever started still latches the
 // shut-down state, so a Start racing it returns instead of parking on a
 // context nothing will ever cancel (celeris#595).

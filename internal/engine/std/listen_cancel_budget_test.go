@@ -130,9 +130,12 @@ func TestListenCancelDrainKeepsTheShutdownBudget(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
+	// start is taken before the context is created, so the elapsed time can
+	// only overstate the budget that has run: "el < budget" below has no
+	// margin to lose (celeris#821 item 3).
+	start := time.Now()
 	shutCtx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	start := time.Now()
 	shutDone := make(chan error, 1)
 	go func() { shutDone <- e.Shutdown(shutCtx) }()
 	select {
