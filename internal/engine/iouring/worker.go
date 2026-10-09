@@ -2613,6 +2613,12 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// buffers once the last view of them is gone. The cost is one connState
 	// allocation per hijack.
 	//
+	// On the multishot receive path (CELERIS_IOURING_MULTISHOT_RECV=1) the
+	// request is not in cs.buf at all but in a provided-ring buffer, which
+	// handleRecv retires after ProcessH1 returns ErrHijacked instead of
+	// pushing it back (celeris#868): the same guarantee, one buffer
+	// allocation per hijack.
+	//
 	// celeris#685 hijack witness and hold, validation builds only: count a
 	// hijack with an op still owed on the socket (kernelInflight > 0), and
 	// hold the worker thread before it returns, and so before its next
@@ -3530,8 +3536,20 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// Batch-return the provided buffer after processing. The data has been
 	// consumed by the protocol handler. Actual publish happens after the CQE
 	// drain loop completes (P0).
+	//
+	// Not for a hijacked request (celeris#868): the handler keeps the strings
+	// it read before Hijack, views of this buffer, for the goroutine that
+	// serves the connection, and a buffer pushed back is written by the next
+	// receive of any connection of this worker. Retire it: it stays with the
+	// hijacker, and the ring gets a fresh entry in its place. The same
+	// guarantee the single-shot receive path has, whose connState (and so
+	// receive buffer) a hijack drops instead of recycling (celeris#733).
 	if hasProvidedBuf {
-		w.bufRing.PushBuffer(providedBufID)
+		if processErr != nil && errors.Is(processErr, conn.ErrHijacked) {
+			w.bufRing.RetireBuffer(providedBufID)
+		} else {
+			w.bufRing.PushBuffer(providedBufID)
+		}
 		w.hasBufReturns = true
 	}
 

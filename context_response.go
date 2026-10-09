@@ -1292,15 +1292,18 @@ func (c *Context) BytesWritten() int {
 // (multiplexed streams share a single TCP connection).
 //
 // The request's strings stay valid after Hijack, for the handler and for
-// any goroutine it hands them to (celeris#733). On epoll and io_uring they
-// are views of the connection's receive buffer, which the engine does not
-// give to another connection once the connection is hijacked. Hijack also
-// copies the request values the Context holds, as [Context.Detach] does, so
-// the path, params, headers, query, cookies and body read from the Context
-// after Hijack are copies. In io_uring's opt-in multishot receive mode
-// (CELERIS_IOURING_MULTISHOT_RECV=1) the request is received into a buffer
-// the engine hands back to the kernel when the handler returns: there, keep
-// only strings read after Hijack, or clone the ones read before it.
+// any goroutine it hands them to, and that includes the ones read BEFORE
+// Hijack (celeris#733, celeris#868). On epoll and io_uring they are views of
+// the receive buffer, which the engine does not give to another connection
+// once the connection is hijacked: epoll and io_uring's default receive give
+// up the connection's buffer, and io_uring's opt-in multishot receive mode
+// (CELERIS_IOURING_MULTISHOT_RECV=1) keeps the ring buffer the request was
+// read into and gives the ring a fresh one. On that mode the kept buffer's
+// memory is not returned before the process exits: at most one ring's worth
+// however many connections are hijacked. Hijack also copies the request
+// values the Context holds, as [Context.Detach] does, so the path, params,
+// headers, query, cookies and body read from the Context after Hijack are
+// copies.
 func (c *Context) Hijack() (net.Conn, error) {
 	if c.written {
 		return nil, errors.New("celeris: cannot hijack after response written")
