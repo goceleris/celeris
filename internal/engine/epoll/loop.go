@@ -3301,6 +3301,66 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 // branch closes the conn immediately.
 const detachDrainGrace = time.Second
 
+// h1DeadlineSnapshot is what checkTimeouts knows about a conn's H1 state: a
+// copy taken under cs.detachMu, so the pointer is never dereferenced after
+// switchToH2Local may have released it.
+type h1DeadlineSnapshot struct {
+	detached     bool  // truly detached (WS/SSE): the middleware owns the I/O lifecycle
+	idleDL       int64 // H1State.IdleDeadlineNs; read, and meaningful, only when detached
+	hdrDL        int64 // H1State.HeaderDeadlineNs, 0 when none; read only when not detached
+	writePending bool  // csWritePending(cs); read only when detached
+}
+
+// snapshotH1Deadlines copies out of cs.h1State, under cs.detachMu, the fields
+// checkTimeouts decides on (celeris#865, the epoll twin of celeris#548/#722;
+// iouring has snapshotH1Deadlines in worker.go, whose shape this follows).
+//
+// The dispatch goroutine's switchToH2Local sets cs.h1State = nil under
+// detachMu. Testing the pointer and dereferencing it again outside the lock
+// is a data race and a nil dereference waiting for its interleaving, and the
+// race detector reports the first read against that write (probatorium run
+// 37969571447). The lock is taken with TryLock and never with Lock: the
+// dispatch goroutine holds detachMu across ProcessH1, so a blocking Lock would
+// park the loop thread, and every conn on it, behind one slow handler
+// (celeris#669, celeris#593). The lock is released before the caller acts:
+// closeConn takes the same non-reentrant mutex.
+//
+// ok=false means the lock is held by a bounded holder (a detached conn's
+// guarded writeFn, for one write) and NOTHING was read: the conn is active,
+// and the next sweep looks again (25 ms apart on the timerfd when
+// ReadHeaderTimeout is set, about 100 ms otherwise).
+//
+// When the lock is held because the dispatch goroutine is inside a handler
+// (dispatchBusy), nothing is read either, and ok=true with the zero snapshot:
+// such a conn is not detached (Detach sets asyncDetachUnlocked before it
+// publishes Detached, and dispatchBusy excludes it) and has no header deadline
+// (ProcessH1 clears it once the request is parsed, before the handler runs).
+// So the zero snapshot IS the answer, and checkTimeouts applies the idle,
+// read and write timeouts to a conn whose handler overruns them, as it did
+// before (nothing refreshes lastActivity while a handler runs; celeris#669).
+func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
+	mu := cs.detachMu
+	if mu != nil && !mu.TryLock() {
+		return snap, dispatchBusy(cs, nil)
+	}
+	// Only plain and atomic loads from here to the Unlock: nothing can panic
+	// or block while the lock is held. A detached conn needs its idle deadline
+	// and write state, any other its header deadline, which are the loads the
+	// unlocked code made.
+	if h1 := cs.h1State; h1 != nil {
+		if snap.detached = h1.Detached.Load(); snap.detached {
+			snap.idleDL = h1.IdleDeadlineNs.Load()
+			snap.writePending = csWritePending(cs)
+		} else {
+			snap.hdrDL = h1.HeaderDeadlineNs.Load()
+		}
+	}
+	if mu != nil {
+		mu.Unlock()
+	}
+	return snap, true
+}
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. Called every 1024 iterations (~100ms).
 //
@@ -3327,8 +3387,15 @@ func (l *Loop) checkTimeouts() {
 		// engine-config-driven idle/read/write timeouts since the middleware
 		// owns the I/O lifecycle. Async-mode conns set detachMu up front
 		// without a true detach — fall through to the normal scan for those.
-		if cs.h1State != nil && cs.h1State.Detached.Load() {
-			dl := cs.h1State.IdleDeadlineNs.Load()
+		// h1State is read once, under detachMu (celeris#865); see
+		// snapshotH1Deadlines. A conn whose lock is held by a bounded holder
+		// is active, and is looked at again on the next sweep.
+		snap, ok := snapshotH1Deadlines(cs)
+		if !ok {
+			continue
+		}
+		if snap.detached {
+			dl := snap.idleDL
 			if dl <= 0 || now <= dl {
 				// Unset, or pushed back out by the middleware (a WS frame
 				// extends it): forget any grace stamp so a later expiry
@@ -3349,7 +3416,7 @@ func (l *Loop) checkTimeouts() {
 			// EPOLLRDHUP path's cs.peerClosed defer. Bounded: a peer that
 			// stops reading for good must not strand the fd, and a dirty conn
 			// holds the loop at a 0 ms epoll_wait.
-			if csWritePending(cs) {
+			if snap.writePending {
 				if cs.drainDeadline == 0 {
 					cs.drainDeadline = now + int64(detachDrainGrace)
 				}
@@ -3369,11 +3436,9 @@ func (l *Loop) checkTimeouts() {
 		// 26429150655 and predecessors), pointing at our extra syscalls
 		// racing with the walker's drip Write rather than at FIN/RST
 		// signaling. Simplest mirrors std.
-		if cs.h1State != nil {
-			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
-				l.closeConn(fd)
-				continue
-			}
+		if dl := snap.hdrDL; dl > 0 && now > dl {
+			l.closeConn(fd)
+			continue
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty {
