@@ -1475,8 +1475,9 @@ jobs:
       # cannot place the cancel of its armed recv is refused, and a close whose
       # cancel was never placed is held past the release backstop until the op's
       # terminal completion (#869); a send completion held for the dispatch
-      # goroutine is applied before the closing sweep tears the conn down, and a
-      # held SEND_ZC first completion names no descriptor (#880). The unit job's
+      # goroutine is applied before the closing sweep tears the conn down, a held
+      # SEND_ZC first completion names no descriptor, and the shutdown drain
+      # notes the SEND_ZC notifications it reads itself (#880). The unit job's
       # package step runs these without a tally, and a test whose rig finds no
       # io_uring, or no working SEND_ZC, skips: so they run here by name on both
       # arches, at the runner's own 8 MiB memlock, with every run of each test
@@ -1489,7 +1490,7 @@ jobs:
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestBufferRingRetireKeepsBufferAndRefreshesRing|TestBufferRingCloseKeepsOnlyRetiredPages|TestBufferRingRetireCost|TestHeldSendZCFirstCompletionDoesNotKeepTheDescriptor|TestFdOpsLeavesOutAHeldSendZCFirstCompletion|TestClosingSweepAppliesAHeldSendNotification|TestClosingSweepDoesNotWaitForARunningAsyncHandler|TestShutdownDoesNotWaitForAHeldSendZCFirstCompletion|TestHijackRefusedWhenItsMultishotRecvCannotBeCancelled|TestHijackWithNothingToCancelNeedsNoSQE|TestRefusedHijackAnswersTheRequestAndKeepsServing|TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced|TestFdOpsBothSendZCCompletionsHeld|TestFdOpsSendZCNotificationHeldAfterFirstApplied|TestShutdownDrainEndsARecvOwedBesideHeldSendZCCompletions|TestFdOpsBothSendZCCompletionsHeldByTheKernel|TestClosingSweepDoesNotCutOffASendTheReplayMoved|TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC|TestBackstopStillHoldsAZCNotificationWhoseSendCancelWasNeverPlaced'
+          names='TestBufferRingRetireKeepsBufferAndRefreshesRing|TestBufferRingCloseKeepsOnlyRetiredPages|TestBufferRingRetireCost|TestHeldSendZCFirstCompletionDoesNotKeepTheDescriptor|TestFdOpsLeavesOutAHeldSendZCFirstCompletion|TestClosingSweepAppliesAHeldSendNotification|TestClosingSweepDoesNotWaitForARunningAsyncHandler|TestShutdownDoesNotWaitForAHeldSendZCFirstCompletion|TestHijackRefusedWhenItsMultishotRecvCannotBeCancelled|TestHijackWithNothingToCancelNeedsNoSQE|TestRefusedHijackAnswersTheRequestAndKeepsServing|TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced|TestFdOpsBothSendZCCompletionsHeld|TestFdOpsSendZCNotificationHeldAfterFirstApplied|TestShutdownDrainEndsARecvOwedBesideHeldSendZCCompletions|TestFdOpsBothSendZCCompletionsHeldByTheKernel|TestClosingSweepDoesNotCutOffASendTheReplayMoved|TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC|TestBackstopStillHoldsAZCNotificationWhoseSendCancelWasNeverPlaced|TestFdOpsHeldFirstNotifReadByTheDrain|TestShutdownDrainWaitsForARecvBesideAHeldFirstCompletionItReadTheNotifOf|TestShutdownDrainWaitsAfterReadingBothSendZCCompletions|TestShutdownDrainWaitsAfterReadingTheNotifOfAnAppliedFirstCompletion'
           runs=3
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           wantsub=$(( 6 * runs ))
