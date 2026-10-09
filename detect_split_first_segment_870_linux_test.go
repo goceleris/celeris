@@ -66,6 +66,14 @@ func split870(s string, at ...int) []string {
 // needs and returns its address.
 func startServer870(t *testing.T, cfg celeris.Config) string {
 	t.Helper()
+	addr, _ := startServerSrv870(t, cfg)
+	return addr
+}
+
+// startServerSrv870 is startServer870 that also returns the server, for a test
+// that reads its metrics.
+func startServerSrv870(t *testing.T, cfg celeris.Config) (string, *celeris.Server) {
+	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -76,7 +84,14 @@ func startServer870(t *testing.T, cfg celeris.Config) string {
 		_ = ln.Close()
 		cfg.Addr = addr
 		s := celeris.New(cfg)
-		s.GET("/h", func(c *celeris.Context) error { return c.String(http.StatusOK, "h1-answer") })
+		// With AsyncHandlers on, a route that only answers runs inline and its conn
+		// is never promoted to a dispatch goroutine (AsyncPromotedConns stays 0), so
+		// the route is marked async: the conn is promoted at its first request and
+		// every later read goes through the dispatch goroutine's asyncInBuf.
+		h := s.GET("/h", func(c *celeris.Context) error { return c.String(http.StatusOK, "h1-answer") })
+		if cfg.AsyncHandlers {
+			h.Async()
+		}
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 		s.POST("/len", func(c *celeris.Context) error {
 			return c.String(http.StatusOK, "%d", len(c.Body()))
@@ -95,7 +110,7 @@ func startServer870(t *testing.T, cfg celeris.Config) string {
 					t.Errorf("Start did not return within 15s of Shutdown")
 				}
 			})
-			return addr
+			return addr, s
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = s.Shutdown(ctx)
@@ -325,7 +340,14 @@ func TestSplitFirstSegmentAsync870(t *testing.T) {
 			}
 			for _, p := range protocols870 {
 				t.Run(p.name, func(t *testing.T) {
-					addr := startServer870(t, p.cfg(celeris.Config{Engine: e.eng, AsyncHandlers: true}))
+					addr, srv := startServerSrv870(t, p.cfg(celeris.Config{Engine: e.eng, AsyncHandlers: true}))
+					// The premise: the conns below are handed to the dispatch goroutine
+					// (promoted), or the test would only cover the synchronous path.
+					defer func() {
+						if got := srv.EngineInfo().Metrics.AsyncPromotedConns; got == 0 {
+							t.Errorf("celeris870 PREMISE: AsyncPromotedConns = 0, no conn reached the dispatch goroutine")
+						}
+					}()
 					for _, at := range [][]int{{2}, {1, 2}, {3}} {
 						t.Run(fmt.Sprintf("h1-%v", at), func(t *testing.T) {
 							c := sendPieces870(t, addr, split870(req870, at...))
