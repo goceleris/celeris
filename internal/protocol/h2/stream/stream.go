@@ -34,6 +34,12 @@ const (
 	// (TryBufferOutbound): it all goes through the write queue, behind its
 	// HEADERS.
 	flagBudgetPool uint32 = 1 << 3
+	// flagDetached marks a use that Context.Detach handed to a goroutine which
+	// can outlive the handler. The stream is reset when its use ends but is not
+	// returned to the pool: the Context (a detached one is never reset or
+	// pooled by the router) keeps pointing at the object, and a pooled object
+	// is the next request's, on any connection (celeris#904).
+	flagDetached uint32 = 1 << 4
 )
 
 // Stream represents an HTTP/2 stream with its associated state and data.
@@ -370,6 +376,28 @@ func (s *Stream) Gen() uint64 { return s.gen.Load() }
 // stream for the detached goroutines.
 func (s *Stream) EndUse() { s.gen.Add(1) }
 
+// MarkDetached records that Context.Detach gave this use to a goroutine that
+// may outlive the handler. When the use ends the stream is reset but not
+// pooled, so a call the Context makes later (c.Header, c.NoContent, c.Hijack,
+// a WebSocket hook) reads or acts on an object no other request can have, not
+// on another connection's stream. The cost is the stream's allocation, once per
+// detached request (celeris#904).
+func (s *Stream) MarkDetached() { s.flags.Or(flagDetached) }
+
+// UseResponseWriter returns the stream's ResponseWriter if gen is still the
+// stream's use, and false once that use is over. The read is ordered against
+// the release's reset (which clears the field under s.mu), so it is race-free
+// even when the use ends while it runs. Context.StreamWriter takes a detached
+// Context's writer through it (celeris#904).
+func (s *Stream) UseResponseWriter(gen uint64) (ResponseWriter, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.gen.Load() != gen {
+		return nil, false
+	}
+	return s.ResponseWriter, true
+}
+
 // useErr reports why a call that presents gen must be refused, or nil. The
 // caller holds s.mu (either mode), which resetAndPool takes to write.
 func (s *Stream) useErr(gen uint64) error {
@@ -435,8 +463,12 @@ func (s *Stream) resetAndPool() {
 	s.endCtx()
 	s.mu.Lock()
 	s.gen.Add(1)
+	keep := s.flags.Load()&flagDetached != 0 // read before the reset clears the flags
 	s.resetLocked()
 	s.mu.Unlock()
+	if keep {
+		return // a detached Context may still point at s: never hand it to another request
+	}
 	streamPool.Put(s)
 }
 

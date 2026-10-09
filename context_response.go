@@ -613,9 +613,16 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 
 // NoContent writes a response with no body.
 // Returns ErrResponseWritten if a response has already been sent.
+// Returns ErrDetached if the Context has been detached, as [Context.Blob]
+// does: a detached request is answered by whoever took it over, and on
+// HTTP/2 the stream a late call would write to may by then be another
+// request's.
 func (c *Context) NoContent(code int) error {
 	if c.written {
 		return ErrResponseWritten
+	}
+	if c.detached {
+		return ErrDetached
 	}
 	if c.bufferDepth > 0 {
 		c.capturedStatus = code
@@ -1453,7 +1460,8 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // must return to free the event loop thread.
 //
 // Detach copies the request values the Context holds, so they stay valid
-// after the handler returns: the headers, method, path and query, the route
+// after the handler returns (on HTTP/2 the headers and the body are the
+// exception, see below): the headers, method, path and query, the route
 // params, the parsed query and cookies, the Host, the strings stored with
 // SetRequestID, SetClientIP, SetHost, SetScheme and SetString, the request
 // body (so Body, FormValue, Bind and BodyReader called after Detach read the
@@ -1468,6 +1476,16 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // On HTTP/2 the engine ends the stream when the handler returns, detached or
 // not, so [Context.Context] is cancelled then; it stays the request's
 // context, cancelled, when called after that.
+//
+// What the Context reads from the stream at call time is not the request's
+// after that: Header, RequestHeaders, Body, RemoteAddr and the :authority Host
+// read from a stream that has been reset, so they may return empty values, and
+// never another request's (a detached stream is not handed to another
+// request). A goroutine that needs the headers or the body of an HTTP/2
+// request reads them before the handler returns. [Context.NoContent] (and
+// [Context.Redirect]), like [Context.Blob], return [ErrDetached], and a
+// [Context.StreamWriter] taken after that returns a writer whose calls all
+// fail.
 func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
@@ -1484,6 +1502,13 @@ func (c *Context) Detach() (done func()) {
 
 	c.extended = true
 	c.detached = true
+	// The use this Context is detached from. Its goroutine can outlive the
+	// handler, and on HTTP/2 the stream goes back to the pool then: the token
+	// lets StreamWriter tell the stream's next use from this one, and the mark
+	// keeps the pool from handing the stream to another request while this
+	// Context still points at it (celeris#904).
+	c.detachGen = c.stream.Gen()
+	c.stream.MarkDetached()
 	if c.stream.OnDetach != nil {
 		c.stream.OnDetach()
 	}
@@ -1634,8 +1659,13 @@ type StreamWriter struct {
 	// ends when the handler returns, and a call that arrives later is refused
 	// instead of acting on whatever the pooled stream serves next
 	// (celeris#904).
-	use          stream.UseStreamer
-	gen          uint64
+	use stream.UseStreamer
+	gen uint64
+	// refused, when set, is the writer of a Context whose stream's use was
+	// over when the writer was asked for (a detached Context's goroutine
+	// calling Context.StreamWriter after the HTTP/2 handler returned): every
+	// call returns it and touches nothing (celeris#904).
+	refused      error
 	bytesWritten atomic.Int64
 	// used is the owning Context's streamUsed, shared by every StreamWriter
 	// taken on the request. Set by the first WriteHeader, Write, Flush or
@@ -1653,6 +1683,9 @@ func (sw *StreamWriter) markUsed() {
 
 // WriteHeader sends the status line and headers. Must be called once before Write.
 func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
+	if sw.refused != nil {
+		return sw.refused
+	}
 	sw.markUsed()
 	if sw.use != nil {
 		return sw.use.WriteHeaderUse(sw.stream, sw.gen, status, headers)
@@ -1680,6 +1713,9 @@ func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 // reach another request's response. Finish the stream before the handler
 // returns.
 func (sw *StreamWriter) Write(data []byte) (int, error) {
+	if sw.refused != nil {
+		return 0, sw.refused
+	}
 	sw.markUsed()
 	var err error
 	if sw.use != nil {
@@ -1702,6 +1738,9 @@ func (sw *StreamWriter) BytesWritten() int64 {
 
 // Flush ensures buffered data is sent to the network.
 func (sw *StreamWriter) Flush() error {
+	if sw.refused != nil {
+		return sw.refused
+	}
 	sw.markUsed()
 	return sw.streamer.Flush(sw.stream)
 }
@@ -1709,6 +1748,9 @@ func (sw *StreamWriter) Flush() error {
 // Close signals end of the response body and syncs the byte count back to
 // the owning Context so that [Context.BytesWritten] reflects the total.
 func (sw *StreamWriter) Close() error {
+	if sw.refused != nil {
+		return sw.refused
+	}
 	sw.markUsed()
 	if sw.use != nil {
 		return sw.use.CloseUse(sw.stream, sw.gen)
@@ -1741,8 +1783,11 @@ func (sw *StreamWriter) Close() error {
 // On HTTP/2 that goroutine must finish the stream before the handler returns
 // (join it, as the sse middleware does): the stream ends with the handler,
 // detached or not, and a StreamWriter call after that returns an error and
-// sends nothing. On HTTP/1 the stream lives until the detached goroutine is
-// done.
+// sends nothing. That holds for a writer taken before the handler returned and
+// for one the detached goroutine takes with this method afterwards: the
+// Context remembers the stream's use as of [Context.Detach], and the writer it
+// returns for an ended use is a non-nil writer whose calls all return an
+// error. On HTTP/1 the stream lives until the detached goroutine is done.
 func (c *Context) StreamWriter() *StreamWriter {
 	// Streaming is fundamentally incompatible with response buffering:
 	// buffered responses are held in memory for possible mutation/discard,
@@ -1750,7 +1795,30 @@ func (c *Context) StreamWriter() *StreamWriter {
 	if c.bufferDepth > 0 {
 		return nil
 	}
-	s, ok := c.stream.ResponseWriter.(stream.Streamer)
+	if c.stream == nil {
+		// A Context used after it was released (done() was called, or a
+		// handler kept a Context it never detached). Not a streaming engine's
+		// answer (nil): a refusal, so a goroutine that writes through it gets
+		// an error rather than a nil pointer.
+		return &StreamWriter{refused: stream.ErrStreamEnded, used: &c.streamUsed}
+	}
+	var rw stream.ResponseWriter
+	var gen uint64
+	if !c.detached {
+		rw, gen = c.stream.ResponseWriter, c.stream.Gen()
+	} else {
+		// A detached Context's goroutine may call this after the handler
+		// returned, when on HTTP/2 the stream has ended and the pooled object
+		// may serve another request. Read the writer only if the stream is
+		// still the use this Context was detached from; the read is ordered
+		// against the release's reset, so it cannot see the next use's.
+		var live bool
+		if rw, live = c.stream.UseResponseWriter(c.detachGen); !live {
+			return &StreamWriter{refused: stream.ErrStreamEnded, used: &c.streamUsed}
+		}
+		gen = c.detachGen
+	}
+	s, ok := rw.(stream.Streamer)
 	if !ok {
 		return nil
 	}
@@ -1767,7 +1835,7 @@ func (c *Context) StreamWriter() *StreamWriter {
 	c.written = true
 	sw := &StreamWriter{streamer: s, stream: c.stream, used: &c.streamUsed}
 	if u, ok := s.(stream.UseStreamer); ok {
-		sw.use, sw.gen = u, c.stream.Gen()
+		sw.use, sw.gen = u, gen
 	}
 	c.streamWriter = sw
 	return sw
