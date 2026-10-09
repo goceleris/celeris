@@ -149,7 +149,7 @@ func BenchmarkOneByteGrant911(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if s.OutboundBuffer.Len() == 0 {
+				if s.OutboundBuffer.Len() < 2 { // never the last byte: that would end and release the stream
 					b.StopTimer()
 					s.BufferOutbound(body, true)
 					b.StartTimer()

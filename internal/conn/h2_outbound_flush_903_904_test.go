@@ -571,3 +571,82 @@ func TestInlineStreamWriterBuffersForTheWindow904(t *testing.T) {
 		t.Errorf("the connection still holds %d buffered bytes after the stream ended", held)
 	}
 }
+
+// TestOutboundFlushUnderConcurrentWindowUpdates903: the deadlock and race
+// check for the rework (the flush now holds a stream's lock across its send,
+// a pool handler flushes its own buffer, and both queue). 40 streams, half
+// answered by WriteResponse (their tail buffered) and half by a StreamWriter
+// (which waits), on the worker pool, while the "event loop" (this goroutine)
+// feeds random stream and connection WINDOW_UPDATEs and growing
+// SETTINGS_INITIAL_WINDOW_SIZEs and drains the queue after each recv, as the
+// engines do. Every stream must finish, whole, in order, HEADERS first and
+// END_STREAM last; the run is bounded, so a deadlock fails it instead of
+// hanging. Run under -race and with -count.
+func TestOutboundFlushUnderConcurrentWindowUpdates903(t *testing.T) {
+	const streams = 40
+	body := pattern904(150000)
+	var done atomic.Int32
+	h := &asyncHandler893{run: func(ctx context.Context, s *stream.Stream) error {
+		defer done.Add(1)
+		if s.ID%4 == 1 {
+			return s.ResponseWriter.WriteResponse(s, 200, [][2]string{{"content-type", "application/octet-stream"}}, body)
+		}
+		return writeStream904(body[:50000], body[50000:])(ctx, s)
+	}}
+	c := newFlushConn(t, h, H2Config{WriteTimeout: 20 * time.Second})
+	ids := make([]uint32, streams)
+	for i := range ids {
+		ids[i] = uint32(2*i + 1)
+	}
+	c.open(0, nil, ids...)
+	rng := uint64(88172645463325252)
+	next := func(n uint64) uint64 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng % n }
+	initial := uint32(65535)
+	allEnded := func() bool {
+		for _, id := range ids {
+			if !c.stream(id).ended {
+				return false
+			}
+		}
+		return true
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for i := 0; !allEnded(); i++ {
+		if time.Now().After(deadline) {
+			c.st.processor.GetManager().Close()
+			var stuck []uint32
+			for _, id := range ids {
+				if w := c.stream(id); !w.ended {
+					stuck = append(stuck, id)
+				}
+			}
+			t.Fatalf("%d of %d streams did not finish in 60 s (handlers done %d): %v", len(stuck), streams, done.Load(), stuck)
+		}
+		switch {
+		case i%7 == 6 && initial < 1<<20:
+			initial += uint32(1 + next(30000))
+			c.setInitialWindow(initial)
+		default:
+			c.process(frames893(t, func(fr *http2.Framer, _ *hpack.Encoder, _ *bytes.Buffer) {
+				for k := 0; k < 3; k++ {
+					if id := ids[next(streams)]; next(2) == 0 {
+						_ = fr.WriteWindowUpdate(id, uint32(1+next(20000)))
+					} else {
+						_ = fr.WriteWindowUpdate(0, uint32(1+next(40000)))
+					}
+				}
+			}))
+		}
+		c.drain()
+		if i%64 == 0 {
+			time.Sleep(time.Millisecond) // let the pool handlers run
+		}
+	}
+	// Window the streams still wait on, if any, then every stream whole.
+	for _, id := range ids {
+		checkWholeBody(t, fmt.Sprintf("stream %d", id), c.stream(id), body)
+	}
+	if held := c.st.processor.GetManager().OutboundHeld(); held != 0 {
+		t.Errorf("the connection still holds %d buffered bytes after every stream ended", held)
+	}
+}
