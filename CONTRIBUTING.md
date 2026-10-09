@@ -19,7 +19,7 @@ Thank you for your interest in contributing to celeris!
 - [Mage](https://magefile.org) build tool: `go install github.com/magefile/mage@v1.17.2`, the version CI
   installs (`.github/workflows/ci.yml`)
 - Linux (for io_uring/epoll engine tests) or macOS (std engine only)
-- [golangci-lint](https://golangci-lint.run/) v2.13, the version CI's lint job runs
+- [golangci-lint](https://golangci-lint.run/) v2.14, the version CI's lint job runs
 - [h2spec](https://github.com/summerwind/h2spec) 2.6.0: `mage tools` installs it and prints the version it
   ended with
 
