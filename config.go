@@ -272,7 +272,10 @@ type Config struct {
 	//   - non-nil true: force enabled. Useful to opt into upgrade on
 	//     Protocol=H2C for clients that prefer to negotiate.
 	//   - non-nil false: force disabled, even on Protocol=Auto. Useful when
-	//     the engine intentionally only serves HTTP/1.
+	//     the engine intentionally only serves HTTP/1, or to refuse the
+	//     upgrade handshake (a request-smuggling surface behind some
+	//     proxies): a request carrying Upgrade: h2c is then served as
+	//     plain HTTP/1.1. Prior-knowledge h2c on Auto is not affected.
 	EnableH2Upgrade *bool
 }
 
