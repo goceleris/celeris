@@ -1255,20 +1255,19 @@ func (a *h2ResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) 
 		a.sendData(s.ID, false, data)
 		return nil
 	}
-	id, head, onPool, err := s.UseState(gen)
+	total := len(data)
+	n, id, onPool, err := m.StreamWrite(s, gen, data, a.sendData)
 	if err != nil {
 		return err
 	}
-	if head || len(data) == 0 {
-		return nil
-	}
+	data = data[n:]
 	if !onPool {
-		return m.SendOrBufferOutbound(s, gen, data, a.sendData)
+		return nil // taken whole: sent, buffered behind the DATA already sent, or a HEAD's, dropped
 	}
-	// The deadline starts when the call first has to wait, not before: a
-	// Write that finds the windows open reads no clock.
+	// A pool goroutine: wait for the windows and send as they allow. The
+	// deadline starts when the call first has to wait, not before: a Write
+	// that finds the windows open reads no clock, and takes one lock.
 	var deadline time.Time
-	total := len(data)
 	for len(data) > 0 {
 		if err := s.AwaitSendWindowUse(gen, a.writeTimeout, &deadline); err != nil {
 			if !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -1278,7 +1277,7 @@ func (a *h2ResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) 
 			return fmt.Errorf("h2: stream %d reset: %d of %d bytes of a write still waited for the peer's window at WriteTimeout (%v): %w",
 				id, len(data), total, a.writeTimeout, err)
 		}
-		n, err := m.SendWindowed(s, gen, data, a.sendData)
+		n, _, _, err := m.StreamWrite(s, gen, data, a.sendData)
 		if err != nil {
 			return err
 		}

@@ -58,9 +58,8 @@ func TestUseTokenGatesEverySend904(t *testing.T) {
 			}
 			return err
 		}()},
-		{"SendWindowed", func() error { _, err := m.SendWindowed(s, gen, []byte("late"), send); return err }()},
+		{"StreamWrite", func() error { _, _, _, err := m.StreamWrite(s, gen, []byte("late"), send); return err }()},
 		{"AwaitSendWindowUse", func() error { var d time.Time; return s.AwaitSendWindowUse(gen, time.Second, &d) }()},
-		{"UseState", func() error { _, _, _, err := s.UseState(gen); return err }()},
 	} {
 		if !errors.Is(c.err, ErrStreamEnded) {
 			t.Errorf("%s with the ended use's token returned %v, want ErrStreamEnded", c.name, c.err)

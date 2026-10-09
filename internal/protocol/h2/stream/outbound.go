@@ -324,40 +324,45 @@ func (m *Manager) FlushOutbound(s *Stream, send OutboundSend) (finished bool) {
 	return finished
 }
 
-// UseState reports, for a StreamWriter call that presents use token gen, what
-// the call needs to know about s, read under the lock that keeps the use from
-// ending meanwhile: the stream's ID, whether the response has no body (HEAD),
-// and whether its handler runs on the worker pool (RunsOnPool). It returns
-// why the call is refused if the use is over (see UseLock).
-func (s *Stream) UseState(gen uint64) (id uint32, head, onPool bool, err error) {
-	if err = s.UseLock(gen); err != nil {
-		return 0, false, false, err
+// StreamWrite is one step of a StreamWriter's Write (celeris#904), taken
+// under the stream's lock in one go (the check that gen is still s's use, the
+// reservation, the send or the buffering), so a write that outlived its handler
+// debits no window of the object's next use and sends or buffers nothing for it.
+// It returns how many bytes of data it took, the stream's ID, and whether the
+// stream is a pool handler's:
+//
+//   - On a pool stream (RunsOnPool) it sends what both windows allow now, n
+//     bytes (0 when a window is shut), and the caller waits for the windows
+//     (AwaitSendWindowUse) and calls again with the rest.
+//   - On any other stream (an inline handler on the event loop) it cannot wait:
+//     it takes all of data, sending what the windows allow and buffering the
+//     rest (SendOrBufferOutbound).
+//   - A HEAD response has no body: the data is taken and dropped.
+//
+// It returns ErrStreamEnded when gen is no longer s's use, and the context
+// error when the stream was reset or its connection closed.
+func (m *Manager) StreamWrite(s *Stream, gen uint64, data []byte, send OutboundSend) (n int, id uint32, onPool bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err = s.useErr(gen); err != nil {
+		return 0, 0, false, err
 	}
-	id, head, onPool = s.ID, s.IsHEAD, s.RunsOnPool()
-	s.UseUnlock()
-	return id, head, onPool, nil
-}
-
-// SendWindowed sends the part of data that both of s's send windows allow now,
-// for a pool handler's StreamWriter (celeris#904): it reserves from both
-// windows and calls send for exactly that many bytes, returning the count (0
-// when a window is shut). The check that gen is still s's use, the
-// reservation and the send are one step under the stream's lock, so a write
-// that outlived its handler debits no window of the object's next use and
-// sends nothing for it. Called in a loop with AwaitSendWindowUse.
-func (m *Manager) SendWindowed(s *Stream, gen uint64, data []byte, send OutboundSend) (int, error) {
-	if err := s.UseLock(gen); err != nil {
-		return 0, err
-	}
-	defer s.UseUnlock()
 	if s.manager != m {
-		return 0, ErrStreamEnded
+		return 0, 0, false, ErrStreamEnded
 	}
-	n := int(m.ReserveSendWindow(s, clampWindowRequest(len(data))))
+	id = s.ID
+	if s.IsHEAD || len(data) == 0 {
+		return len(data), id, false, nil
+	}
+	if !s.RunsOnPool() {
+		m.sendOrBufferLocked(s, data, send)
+		return len(data), id, false, nil
+	}
+	n = int(m.ReserveSendWindow(s, clampWindowRequest(len(data))))
 	if n > 0 {
-		send(s.ID, false, data[:n])
+		send(id, false, data[:n])
 	}
-	return n, nil
+	return n, id, true, nil
 }
 
 // SendOrBufferOutbound sends data on s for a caller that cannot wait for the
@@ -388,6 +393,12 @@ func (m *Manager) SendOrBufferOutbound(s *Stream, gen uint64, data []byte, send 
 	if s.manager != m {
 		return ErrStreamEnded
 	}
+	m.sendOrBufferLocked(s, data, send)
+	return nil
+}
+
+// sendOrBufferLocked is SendOrBufferOutbound's work, with s.mu held.
+func (m *Manager) sendOrBufferLocked(s *Stream, data []byte, send OutboundSend) {
 	n := 0
 	if s.OutboundBuffer == nil || s.OutboundBuffer.Len() == 0 {
 		n = int(m.ReserveSendWindow(s, clampWindowRequest(len(data))))
@@ -402,7 +413,6 @@ func (m *Manager) SendOrBufferOutbound(s *Stream, gen uint64, data []byte, send 
 		s.OutboundBuffer.Write(data[n:])
 		m.chargeOutbound(len(data) - n)
 	}
-	return nil
 }
 
 // EndOutbound ends s's response body (celeris#904): END_STREAM goes to send
