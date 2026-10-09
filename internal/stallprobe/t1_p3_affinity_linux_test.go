@@ -516,8 +516,15 @@ func p3Start(et celeris.EngineType, engName string, workers int, asyncServer, as
 	st.notes = append(st.notes, "loop threads as the engine pinned them: "+ls.table())
 	if st.found != st.want && engName != "std" {
 		msg := fmt.Sprintf("CASE MISLABELLED: %d loop threads found, the engine reports %d", st.found, st.want)
-		if mode.moves() {
+		// E15 (celeris#909): on a big.LITTLE host the engine pins loops only to the big CPUs and leaves
+		// the rest unpinned, so FEWER pinned loop threads than loops is expected. A case that maps loop
+		// k to a CPU (a Plan or a Move list) still needs every loop; the others (all, nopin, a Keep
+		// list) are true to their label with the unpinned loops left where the engine put them.
+		fewerIsFine := st.found < st.want && !mode.HasPlan && len(mode.Move) == 0
+		if mode.moves() && !fewerIsFine {
 			st.caseErrs = append(st.caseErrs, msg)
+		} else if fewerIsFine && mode.moves() {
+			st.notes = append(st.notes, "NOTE (fewer pinned loop threads than loops is what the capability-aware engine does on a big.LITTLE host; this case needs no loop for every CPU): "+msg)
 		} else {
 			st.notes = append(st.notes, "NOTE (case all moves nothing, so the label stays true): "+msg)
 		}
