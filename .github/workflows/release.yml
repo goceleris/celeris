@@ -119,7 +119,7 @@ jobs:
     steps:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
           cache: false
       - name: Request the root module and the sub-modules from the proxy
         env:
