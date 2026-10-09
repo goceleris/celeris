@@ -367,7 +367,7 @@ func TestH2CUpgradeConfigMatrix(t *testing.T) {
 		// (celeris#964). The conversion is covered by
 		// TestToResourceConfig_H2Upgrade, and the behaviour on every engine
 		// by TestEnableH2UpgradeFalseDisablesUpgradeOnAuto964, both in the
-		// root package.
+		// repository root (packages celeris and celeris_test).
 		{"H2C default disabled", engine.H2C, nil, false},
 		{"H2C explicit true", engine.H2C, h2cTrue(), true},
 		{"HTTP1 default", engine.HTTP1, nil, false},

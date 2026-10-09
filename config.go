@@ -276,6 +276,11 @@ type Config struct {
 	//     upgrade handshake (a request-smuggling surface behind some
 	//     proxies): a request carrying Upgrade: h2c is then served as
 	//     plain HTTP/1.1. Prior-knowledge h2c on Auto is not affected.
+	//
+	// Engine: Std does not yet honour non-nil false on Auto: it still
+	// answers an Upgrade: h2c request with 101 (celeris#964). Std is the
+	// only engine on non-Linux platforms and the default there. Epoll,
+	// IOUring and Adaptive honour it.
 	EnableH2Upgrade *bool
 }
 
