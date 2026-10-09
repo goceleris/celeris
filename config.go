@@ -330,13 +330,18 @@ func (c Config) toResourceConfig() resource.Config {
 	rc.OnDisconnect = c.OnDisconnect
 
 	// h2c upgrade resolution. Nil → protocol-dependent default (Auto → true,
-	// HTTP1/H2C → false). Non-nil → user override honored verbatim.
+	// HTTP1/H2C → false). Non-nil → user override honored verbatim. The
+	// result goes through SetH2Upgrade so resource.Config.WithDefaults, which
+	// cannot tell an explicit false from unset, leaves it alone: it used to
+	// turn &false back into true on Auto (celeris#964).
+	var enableH2Upgrade bool
 	if c.EnableH2Upgrade != nil {
-		rc.EnableH2Upgrade = *c.EnableH2Upgrade
+		enableH2Upgrade = *c.EnableH2Upgrade
 	} else {
 		p := engine.Protocol(c.Protocol)
-		rc.EnableH2Upgrade = p.IsDefault() || p == engine.Auto
+		enableH2Upgrade = p.IsDefault() || p == engine.Auto
 	}
+	rc.SetH2Upgrade(enableH2Upgrade)
 
 	return rc
 }
