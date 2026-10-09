@@ -336,7 +336,7 @@ func (m *Manager) FlushOutbound(s *Stream, send OutboundSend) (finished bool) {
 //     (AwaitSendWindowUse) and calls again with the rest.
 //   - On any other stream (an inline handler on the event loop) it cannot wait:
 //     it takes all of data, sending what the windows allow and buffering the
-//     rest (SendOrBufferOutbound).
+//     rest.
 //   - A HEAD response has no body: the data is taken and dropped.
 //
 // It returns ErrStreamEnded when gen is no longer s's use, and the context
@@ -365,39 +365,17 @@ func (m *Manager) StreamWrite(s *Stream, gen uint64, data []byte, send OutboundS
 	return n, id, true, nil
 }
 
-// SendOrBufferOutbound sends data on s for a caller that cannot wait for the
+// sendOrBufferLocked sends data on s for a caller that cannot wait for the
 // peer's window, an inline handler on the event loop streaming its response
 // (celeris#904): what both windows allow goes to send now, and the rest is
 // buffered on s, charged to the connection's outbound budget, to follow as the
 // peer grants window. While anything is buffered, more data joins the buffer,
 // so the bytes of one stream reach the connection in the order they were
-// written. Whether to send or buffer is decided under the stream's lock, so a
-// flush on the event loop and a detached goroutine's write cannot reorder.
-//
-// gen is the caller's use token (Stream.Gen). The call is refused with
-// ErrStreamEnded when that use is over, and with the context error when the
-// peer reset the stream or the connection closed: it sends and buffers
-// nothing, and charges nothing to the budget. This is decided under the same
-// lock as the release of the stream, so a goroutine that outlived its handler
-// cannot put bytes in an object that is on its way to the pool, or in the
-// pool, or already in use for another stream.
-func (m *Manager) SendOrBufferOutbound(s *Stream, gen uint64, data []byte, send OutboundSend) error {
-	if len(data) == 0 {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.useErr(gen); err != nil {
-		return err
-	}
-	if s.manager != m {
-		return ErrStreamEnded
-	}
-	m.sendOrBufferLocked(s, data, send)
-	return nil
-}
-
-// sendOrBufferLocked is SendOrBufferOutbound's work, with s.mu held.
+// written. Whether to send or buffer is decided under the stream's lock (held
+// by the caller, StreamWrite), so a flush on the event loop and a detached
+// goroutine's write cannot reorder; the same lock is the release's, so a
+// goroutine that outlived its handler cannot put bytes in an object that is on
+// its way to the pool, in the pool, or in use for another stream.
 func (m *Manager) sendOrBufferLocked(s *Stream, data []byte, send OutboundSend) {
 	n := 0
 	if s.OutboundBuffer == nil || s.OutboundBuffer.Len() == 0 {
@@ -421,7 +399,7 @@ func (m *Manager) sendOrBufferLocked(s *Stream, data []byte, send OutboundSend) 
 // END_STREAM never reaches the connection ahead of DATA written before it.
 // It is refused, sending and marking nothing, when gen is no longer s's use
 // or the stream was reset (RFC 9113 §5.1: no frame follows a RST_STREAM),
-// as SendOrBufferOutbound is.
+// as StreamWrite is.
 func (m *Manager) EndOutbound(s *Stream, gen uint64, send OutboundSend) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

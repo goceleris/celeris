@@ -15,6 +15,12 @@ import (
 // connection. The use token (Stream.Gen) and the lock the release takes keep
 // its calls from reaching the object's next use.
 
+// write904 is an inline stream's StreamWrite (SendOrBuffer's work), as a StreamWriter on the event loop calls it.
+func write904(m *Manager, s *Stream, gen uint64, data []byte, send OutboundSend) error {
+	_, _, _, err := m.StreamWrite(s, gen, data, send)
+	return err
+}
+
 type sent904 struct {
 	n    int
 	end  bool
@@ -36,7 +42,7 @@ func TestUseTokenGatesEverySend904(t *testing.T) {
 	send, rec := recorder904()
 	gen := s.Gen()
 
-	if err := m.SendOrBufferOutbound(s, gen, make([]byte, 70000), send); err != nil {
+	if err := write904(m, s, gen, make([]byte, 70000), send); err != nil {
 		t.Fatal(err)
 	}
 	if rec.n != 65535 || m.OutboundHeld() != 70000-65535 {
@@ -49,7 +55,7 @@ func TestUseTokenGatesEverySend904(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"SendOrBufferOutbound", m.SendOrBufferOutbound(s, gen, []byte("late"), send)},
+		{"StreamWrite", write904(m, s, gen, []byte("late"), send)},
 		{"EndOutbound", m.EndOutbound(s, gen, send)},
 		{"UseLock", func() error {
 			err := s.UseLock(gen)
@@ -73,7 +79,7 @@ func TestUseTokenGatesEverySend904(t *testing.T) {
 			held, m.OutboundHeld(), win, s.GetWindowSize(), connWin, m.GetConnectionWindow(), buffered, s.OutboundBuffer.Len())
 	}
 	// The new token of the same object is not refused: it is the next use's.
-	if err := m.SendOrBufferOutbound(s, s.Gen(), []byte("x"), send); err != nil {
+	if err := write904(m, s, s.Gen(), []byte("x"), send); err != nil {
 		t.Errorf("the current token was refused: %v", err)
 	}
 }
@@ -88,8 +94,8 @@ func TestCancelledStreamRefusesWrites904(t *testing.T) {
 	s.SetState(StateOpen)
 	send, rec := recorder904()
 	s.Cancel()
-	if err := m.SendOrBufferOutbound(s, s.Gen(), []byte("late"), send); !errors.Is(err, context.Canceled) {
-		t.Errorf("SendOrBufferOutbound on a cancelled stream returned %v, want context.Canceled", err)
+	if err := write904(m, s, s.Gen(), []byte("late"), send); !errors.Is(err, context.Canceled) {
+		t.Errorf("StreamWrite on a cancelled stream returned %v, want context.Canceled", err)
 	}
 	if err := m.EndOutbound(s, s.Gen(), send); !errors.Is(err, context.Canceled) {
 		t.Errorf("EndOutbound on a cancelled stream returned %v, want context.Canceled", err)
@@ -128,7 +134,7 @@ func TestAbandonedBufferIsSentWithoutEndStreamAndFinishes904(t *testing.T) {
 	s.SetState(StateOpen)
 	s.SetWindowSize(10)
 	send, rec := recorder904()
-	if err := m.SendOrBufferOutbound(s, s.Gen(), make([]byte, 25), send); err != nil {
+	if err := write904(m, s, s.Gen(), make([]byte, 25), send); err != nil {
 		t.Fatal(err)
 	}
 	if !s.AbandonOutbound() {
@@ -182,7 +188,7 @@ func TestReleaseVersusLateWriters904(t *testing.T) {
 						return
 					default:
 					}
-					err := m.SendOrBufferOutbound(s, gen, []byte("0123456789"), send)
+					err := write904(m, s, gen, []byte("0123456789"), send)
 					if err == nil {
 						accepted.Add(10)
 						continue

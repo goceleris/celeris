@@ -422,7 +422,7 @@ func ResetForPool(s *Stream) {
 
 // resetAndPool ends a use of s and returns it to the pool. The reset runs
 // under s.mu, the lock every call of a StreamWriter that outlived its handler
-// takes (SendOrBufferOutbound, EndOutbound, FlushOutbound, UseLock), and moves
+// takes (StreamWrite, EndOutbound, FlushOutbound, UseLock), and moves
 // gen, so such a call either finishes before the reset or sees that its use
 // is over and is refused (celeris#904). Without it a late Write buffered its
 // bytes in the object's OutboundBuffer after the reset, and the next use of
