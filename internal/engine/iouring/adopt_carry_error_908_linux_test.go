@@ -154,6 +154,12 @@ func testCarryH2CUpgrade908(t *testing.T, adopt func(int, engine.Carryover) erro
 			break
 		}
 	}
+	h2Streams908(t, client, br)
+}
+
+// h2Streams908 speaks HTTP/2 on a conn whose 101 has been read.
+func h2Streams908(t *testing.T, client net.Conn, br *bufio.Reader) {
+	t.Helper()
 	// HTTP/2 from here: the client preface and SETTINGS, then a request on
 	// stream 3. The framer reads what the server sends (its SETTINGS, the
 	// answer to stream 1, the answer to stream 3).
@@ -174,7 +180,7 @@ func testCarryH2CUpgrade908(t *testing.T, adopt func(int, engine.Carryover) erro
 	}
 	bodies := map[uint32]string{}
 	done := map[uint32]bool{}
-	for !(done[1] && done[3]) {
+	for !done[1] || !done[3] {
 		f, err := fr.ReadFrame()
 		if err != nil {
 			t.Fatalf("read an h2 frame after the 101 (stream 1 done=%v, stream 3 done=%v): %v", done[1], done[3], err)
