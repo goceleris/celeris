@@ -308,3 +308,75 @@ func TestSplitFirstSegmentThenReadFillingBuffer870(t *testing.T) {
 		}
 	})
 }
+
+// TestSplitFirstSegmentAsync870 runs the split shapes with AsyncHandlers on.
+// In async mode the bytes the engine read reach the dispatch goroutine through
+// a different path (the conn's asyncInBuf, not the loop's parse), so the held
+// bytes have to arrive there whole too. Only epoll and adaptive (pinned to
+// epoll) have that path; std and io_uring are covered above.
+func TestSplitFirstSegmentAsync870(t *testing.T) {
+	for _, e := range []struct {
+		name string
+		eng  celeris.EngineType
+	}{{"epoll", celeris.Epoll}, {"adaptive", celeris.Adaptive}} {
+		t.Run(e.name, func(t *testing.T) {
+			if e.eng == celeris.Adaptive {
+				t.Setenv("CELERIS_ADAPTIVE_START", "epoll")
+			}
+			for _, p := range protocols870 {
+				t.Run(p.name, func(t *testing.T) {
+					addr := startServer870(t, p.cfg(celeris.Config{Engine: e.eng, AsyncHandlers: true}))
+					for _, at := range [][]int{{2}, {1, 2}, {3}} {
+						t.Run(fmt.Sprintf("h1-%v", at), func(t *testing.T) {
+							c := sendPieces870(t, addr, split870(req870, at...))
+							br := bufio.NewReader(c)
+							// The split request, then a follow-up on the same conn.
+							for i, label := range []string{"split request", "follow-up request"} {
+								if i == 1 {
+									if _, err := io.WriteString(c, req870); err != nil {
+										t.Fatalf("write follow-up: %v", err)
+									}
+								}
+								resp, err := http.ReadResponse(br, nil)
+								if err != nil {
+									t.Fatalf("celeris870: async: no response to the %s: %v", label, err)
+								}
+								body, _ := io.ReadAll(resp.Body)
+								_ = resp.Body.Close()
+								if resp.StatusCode != http.StatusOK || string(body) != "h1-answer" {
+									t.Fatalf("celeris870: async: %s answered %d %q, want 200 %q",
+										label, resp.StatusCode, body, "h1-answer")
+								}
+							}
+						})
+					}
+					for _, at := range [][]int{{3}, {10, 13}, {23}} {
+						t.Run(fmt.Sprintf("h2c-%v", at), func(t *testing.T) {
+							c := sendPieces870(t, addr, split870(h2Request870(), at...))
+							br := bufio.NewReader(c)
+							var data []byte
+							for {
+								f, err := readFrame870(br)
+								if err != nil {
+									t.Fatalf("celeris870: async: read frame (data=%q): %v", data, err)
+								}
+								if f.typ == 0x7 {
+									t.Fatalf("celeris870: async: GOAWAY after the split preface: % x", f.payload)
+								}
+								if f.typ == 0x0 && f.stream == 1 {
+									data = append(data, f.payload...)
+								}
+								if f.stream == 1 && f.flags&0x1 != 0 && (f.typ == 0x0 || f.typ == 0x1) {
+									break
+								}
+							}
+							if string(data) != "h1-answer" {
+								t.Fatalf("celeris870: async: split preface answered data %q, want %q", data, "h1-answer")
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}

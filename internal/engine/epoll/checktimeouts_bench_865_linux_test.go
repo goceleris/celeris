@@ -19,7 +19,11 @@ import (
 // every conn the call of snapshotH1Deadlines (a nil check of detachMu in sync
 // mode, where there is no lock) in place of the loads checkTimeouts made
 // inline. One op is one whole sweep, so ns/op is read per conn as ns/op
-// divided by n; the sweep runs at most every 25 ms per loop.
+// divided by n. How often the sweep runs is not fixed: it is driven by the
+// loop's iterations (every 32 epoll_wait returns by default, see
+// checkTimeouts), and the 25 ms timerfd is only the floor on an idle loop, so
+// the share of a core is this cost times the sweep rate of the load measured
+// (lanes-20261009/E5/scripts/cadence), not times 40 a second.
 func BenchmarkCheckTimeouts865(b *testing.B) {
 	for _, mode := range []string{"sync", "async"} {
 		for _, n := range []int{256, 4096} {

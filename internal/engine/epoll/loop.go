@@ -792,10 +792,13 @@ func (l *Loop) run(ctx context.Context) {
 			l.bytesWrittenBatch = 0
 		}
 
-		// Check connection timeouts. Default cadence is every 1024 iterations
-		// (~100ms under load); when detached conns exist with idle deadlines
-		// the gate tightens to every 32 iterations (~50ms idle wall time)
-		// so the WS idle-close fires within its configured budget. When
+		// Check connection timeouts. Default cadence is every 1024 iterations;
+		// when detached conns exist with idle deadlines the gate tightens to
+		// every 32 iterations so the WS idle-close fires within its
+		// configured budget. An iteration is one epoll_wait return, so the
+		// wall time between sweeps depends on the load: on a busy loop it is
+		// well under a millisecond, and the timerfd (25 ms) is only the floor
+		// on an idle one. When
 		// ReadHeaderTimeout is enabled (the v1.4.11 slowloris defence),
 		// the gate ALSO tightens to 0x1F — the in-process synthetic
 		// reproducer (test/integration/slowloris_synthetic_test.go) showed
@@ -903,8 +906,20 @@ func (l *Loop) onPeerHalfClose(fd int) {
 	if cs == nil || cs.detachClosed || cs.asyncClosed.Load() {
 		return
 	}
+	// h1State is loaded once, into a local. switchToH2Local sets it to nil
+	// under detachMu on the dispatch goroutine, and the memory model lets a
+	// `cs.h1State != nil && cs.h1State.Detached.Load()` reload it between the
+	// test and the dereference (a nil dereference). The gc compiler happens to
+	// merge the two loads today (arm64 and amd64 disassembly, celeris#865
+	// review), so this removes a dependence on that, not a crash seen.
+	// The load itself still races with that write and is unlocked on purpose:
+	// EPOLLRDHUP is edge-triggered, so skipping a conn whose lock is held (the
+	// TryLock the sweep uses) could lose the event for good. What to do with a
+	// held lock here is for the async-abort work (celeris#844); the race report
+	// is tracked in celeris#885.
+	h1 := cs.h1State
 	switch {
-	case cs.h1State != nil && cs.h1State.Detached.Load():
+	case h1 != nil && h1.Detached.Load():
 		l.notifyDetachedPeerClosed(cs)
 	case csWritePending(cs):
 		cs.peerClosed = true
@@ -3332,19 +3347,25 @@ type h1DeadlineSnapshot struct {
 // iouring has snapshotH1Deadlines in worker.go, whose shape this follows).
 //
 // The dispatch goroutine's switchToH2Local sets cs.h1State = nil under
-// detachMu. Testing the pointer and dereferencing it again outside the lock
-// is a data race and a nil dereference waiting for its interleaving, and the
-// race detector reports the first read against that write (probatorium run
-// 37969571447). The lock is taken with TryLock and never with Lock: the
+// detachMu. Reading the pointer and what it points to outside the lock is a
+// data race, which the race detector reports against that write (probatorium
+// run 37969571447), and the memory model lets a reload find nil. The gc
+// compiler merges the adjacent loads of the old code, so what was observed is
+// the race, not a crash. The lock is taken with TryLock and never with Lock: the
 // dispatch goroutine holds detachMu across ProcessH1, so a blocking Lock would
 // park the loop thread, and every conn on it, behind one slow handler
 // (celeris#669, celeris#593). The lock is released before the caller acts:
 // closeConn takes the same non-reentrant mutex.
 //
 // ok=false means the lock is held by a bounded holder (a detached conn's
-// guarded writeFn, for one write) and NOTHING was read: the conn is active,
-// and the next sweep looks again (25 ms apart on the timerfd when
-// ReadHeaderTimeout is set, about 100 ms otherwise).
+// guarded writeFn, for one write) and NOTHING was read: the sweep skips the
+// conn this time. The skip is not bounded: a holder that takes the lock again
+// and again (a hot broadcaster) can win the TryLock race on several sweeps in
+// a row, and the sweep runs often on a busy loop (see checkTimeouts' cadence
+// note), so a run of skips is unlikely but not excluded, and a conn whose
+// deadline has passed is reaped on a later sweep, by chance, not on the next.
+// Each holder's critical section is bounded (one write), so the conn is
+// reaped once any sweep finds the lock free.
 //
 // When the lock is held because the dispatch goroutine is inside a handler
 // (dispatchBusy), nothing is read either, and ok=true with the zero snapshot:
@@ -3378,7 +3399,17 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 }
 
 // checkTimeouts scans active connections and closes any that have exceeded
-// their configured timeout. Called every 1024 iterations (~100ms).
+// their configured timeout.
+//
+// Cadence: the sweep is driven by the loop's own iterations, not by a clock.
+// The run loop calls it every 32 epoll_wait iterations when ReadHeaderTimeout
+// is set (the default is 10 s) or a conn is detached, otherwise every 1024,
+// and the 25 ms timerfd (armed only when ReadHeaderTimeout is set) is a floor
+// that guarantees a sweep on an idle loop, not a ceiling. A busy loop sweeps
+// as often as its iterations allow. Measured on 2 loops with 4096 idle
+// keep-alive conns each (celeris PR 969): about 120 sweeps a second in all with
+// no traffic (the timerfd alone gives 80), and 1,800 to 6,200 a second in all
+// with one to sixteen busy clients.
 //
 // Iterates the dense liveConns slice (#318) rather than the sparse
 // 0..maxFD range, so the cost is O(active conns) regardless of FD space.
@@ -3405,7 +3436,8 @@ func (l *Loop) checkTimeouts() {
 		// without a true detach — fall through to the normal scan for those.
 		// h1State is read once, under detachMu (celeris#865); see
 		// snapshotH1Deadlines. A conn whose lock is held by a bounded holder
-		// is active, and is looked at again on the next sweep.
+		// is skipped for this sweep and met again on a later one (not
+		// necessarily the next: the skip is probabilistic).
 		snap, ok := snapshotH1Deadlines(cs)
 		if !ok {
 			continue
