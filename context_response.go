@@ -1667,7 +1667,18 @@ func (sw *StreamWriter) BytesWritten() int64 {
 	return sw.bytesWritten.Load()
 }
 
-// Flush ensures buffered data is sent to the network.
+// Flush asks the engine to send buffered data to the network. It is a request,
+// not a guarantee, and on HTTP/1.1 on epoll and io_uring it does nothing:
+// what reaches the peer, and when, is decided by [StreamWriter.Write]. Until
+// [Context.Detach] those engines only append each Write to the connection's
+// send buffer, which goes out when the handler returns, so every byte
+// written so far stays in memory until then, however often Flush is called.
+// After Detach each Write is handed to the connection at once (the calling
+// goroutine tries the send, and the engine finishes what the socket does not
+// take). The std engine flushes through [net/http.Flusher]. To deliver bytes
+// while the handler is still running, Detach it (see
+// [Context.EngineSupportsAsyncDetach]). The behavior above is HTTP/1.1's;
+// Flush is not a delivery guarantee on HTTP/2 either.
 func (sw *StreamWriter) Flush() error {
 	sw.markUsed()
 	return sw.streamer.Flush(sw.stream)
