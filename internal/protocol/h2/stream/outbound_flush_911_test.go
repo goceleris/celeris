@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"unsafe"
@@ -26,6 +27,11 @@ const dribbleBody911 = 4 << 20
 // open connection window.
 func dribbleSetup911(t *testing.T) (*Processor, *Stream, *testFrameWriter, []byte) {
 	t.Helper()
+	return dribbleSetupSize911(t, dribbleBody911)
+}
+
+func dribbleSetupSize911(t testing.TB, size int) (*Processor, *Stream, *testFrameWriter, []byte) {
+	t.Helper()
 	fw := newTestFrameWriter()
 	p := NewProcessor(HandlerFunc(func(context.Context, *Stream) error { return nil }), fw, newTestResponseWriter())
 	m := p.GetManager()
@@ -33,7 +39,7 @@ func dribbleSetup911(t *testing.T) (*Processor, *Stream, *testFrameWriter, []byt
 	s := m.CreateStream(1)
 	s.SetState(StateOpen)
 	s.SetWindowSize(0)
-	body := make([]byte, dribbleBody911)
+	body := make([]byte, size)
 	for i := range body {
 		body[i] = byte(i % 251)
 	}
@@ -130,4 +136,35 @@ func TestSettingsDribbleDoesNotCopyTheBody911(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+// BenchmarkOneByteGrant911 is the cost of one one-byte stream WINDOW_UPDATE
+// while the stream holds a body of the given size: it was in proportion to the
+// body (the remainder copied twice), and is now in proportion to the frame.
+func BenchmarkOneByteGrant911(b *testing.B) {
+	for _, size := range []int{64 << 10, 1 << 20, 4 << 20} {
+		b.Run(byteSize911(size), func(b *testing.B) {
+			p, s, _, body := dribbleSetupSize911(b, size)
+			wu := makeWindowUpdateFrame(&testing.T{}, 1, 1)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if s.OutboundBuffer.Len() == 0 {
+					b.StopTimer()
+					s.BufferOutbound(body, true)
+					b.StartTimer()
+				}
+				if err := p.ProcessFrame(context.Background(), wu); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func byteSize911(n int) string {
+	if n >= 1<<20 {
+		return strconv.Itoa(n>>20) + "MiB"
+	}
+	return strconv.Itoa(n>>10) + "KiB"
 }
