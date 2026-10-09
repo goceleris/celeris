@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/internal/driver/redis/protocol"
 )
 
 // Tx is a MULTI/EXEC transaction. Commands are buffered into a single wire

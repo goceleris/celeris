@@ -2,8 +2,6 @@ package memcached
 
 import (
 	"time"
-
-	"github.com/goceleris/celeris/driver/internal/eventloop"
 )
 
 // Protocol selects the memcached wire dialect spoken by a Client. Every
@@ -65,7 +63,7 @@ type Config struct {
 	HealthCheckInterval time.Duration
 	// Engine hooks the driver into a running celeris.Server's event loop.
 	// If nil, a standalone loop is resolved on [NewClient].
-	Engine eventloop.ServerProvider
+	Engine ServerProvider
 }
 
 // Option mutates a [Config] during [NewClient].
@@ -99,6 +97,6 @@ func WithHealthCheckInterval(d time.Duration) Option {
 }
 
 // WithEngine hooks the driver into a celeris.Server's event loop.
-func WithEngine(sp eventloop.ServerProvider) Option {
+func WithEngine(sp ServerProvider) Option {
 	return func(c *Config) { c.Engine = sp }
 }

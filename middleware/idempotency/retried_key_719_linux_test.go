@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/middleware/idempotency"
-	"github.com/goceleris/celeris/probe"
 )
 
 // TestRetriedIdempotencyKeyReplays pins celeris#719 end to end.

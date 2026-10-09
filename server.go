@@ -14,11 +14,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/cpumon"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/resource"
 	"github.com/goceleris/celeris/observe"
-	"github.com/goceleris/celeris/protocol/h2/stream"
-	"github.com/goceleris/celeris/resource"
 )
 
 // Version is the semantic version of the celeris module.
@@ -738,6 +738,14 @@ func (s *Server) Addr() net.Addr {
 // has not been started. The returned provider is shared with the HTTP path;
 // drivers register their own file descriptors on it to colocate database or
 // cache I/O on the same worker threads as HTTP requests.
+//
+// It is for the celeris drivers: pass the server itself to
+// [github.com/goceleris/celeris/driver/redis.WithEngine] or its postgres
+// and memcached counterparts. The result's type is defined in an internal
+// package, so code outside github.com/goceleris/celeris can pass it on but
+// cannot name it.
+// That type and its methods are not supported API until celeris#453
+// defines a public engine interface; they may change in a minor release.
 func (s *Server) EventLoopProvider() engine.EventLoopProvider {
 	eng := s.loadEngine()
 	if eng == nil {
@@ -824,7 +832,7 @@ func (s *Server) EngineInfo() *EngineInfo {
 // socket closes, which is inherent to closing one, and a client whose
 // retransmitted SYN-ACK is lost or goes unanswered on a lossy path. Set
 // [Config.DisableDeferAccept] for a pause that closes the listen sockets at
-// once; see [github.com/goceleris/celeris/resource.Config.DisableDeferAccept].
+// once; its documentation says what the option saves.
 func (s *Server) PauseAccept() error {
 	eng := s.loadEngine()
 	if eng == nil {
@@ -1079,7 +1087,7 @@ func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listene
 // The Shutdown runs on a watcher goroutine that starts before Listen, not
 // after Listen returns, because on std the drain's budget comes from
 // Server.Shutdown: Listen's own ctx.Done branch drains with no deadline, and
-// only the concurrent Server.Shutdown bounds it (see engine/std Shutdown).
+// only the concurrent Server.Shutdown bounds it (see internal/engine/std Shutdown).
 //
 // celeris#673: the watcher used to choose between ctx.Done() and listenDone
 // in a single select and to return without shutting down when it got

@@ -12,7 +12,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 func init() {
@@ -24,64 +25,68 @@ func init() {
 	}
 }
 
-// The AcquireTestContext / ReleaseTestContext / TestStream / SetTest*
-// / AddTestParam helpers below are low-level building blocks for the
-// celeristest package and other in-tree test infrastructure. End-user
-// tests should reach for [celeristest.NewContext] /
-// [celeristest.NewContextT] and the With* options instead — they
-// build the Context+Stream pair, set up the recorder, and wire
-// t.Cleanup automatically. These primitives are NOT marked Deprecated
-// because celeristest itself depends on them; they are simply not
-// the recommended API for new test code.
+// The functions below give the module's test infrastructure (celeristest,
+// and the tests of the middleware) access to a Context's internals. They
+// are not exported: init registers them in internal/testhooks, which
+// cannot import this package, so a *Context crosses it as any and a
+// handler chain as a []any of HandlerFunc values. End-user tests use
+// celeristest.
 
-// AcquireTestContext returns a Context from the pool, bound to the given Stream.
-// Prefer [celeristest.NewContext] for new code.
-func AcquireTestContext(s *stream.Stream) *Context { return acquireContext(s) }
+// acquireTestContext returns a Context from the pool, bound to the given Stream.
+func acquireTestContext(s *stream.Stream) *Context { return acquireContext(s) }
 
-// ReleaseTestContext returns a Context to the pool, firing OnRelease callbacks.
-// Prefer [celeristest.ReleaseContext] for new code.
-func ReleaseTestContext(c *Context) { releaseContext(c) }
+// releaseTestContext returns a Context to the pool, firing OnRelease callbacks.
+func releaseTestContext(c *Context) { releaseContext(c) }
 
-// TestStream returns the underlying stream, or nil. Test infrastructure only.
-func TestStream(c *Context) *stream.Stream { return c.stream }
+// testStream returns the underlying stream, or nil.
+func testStream(c *Context) *stream.Stream { return c.stream }
 
-// SetTestStartTime sets the start time on a test context.
-func SetTestStartTime(c *Context, t time.Time) { c.startTime = t }
+// setTestStartTime sets the start time on a test context.
+func setTestStartTime(c *Context, t time.Time) { c.startTime = t }
 
-// SetTestFullPath sets the full path on a test context.
-// Prefer [celeristest.WithFullPath].
-func SetTestFullPath(c *Context, path string) { c.fullPath = path }
+// setTestFullPath sets the full path on a test context.
+func setTestFullPath(c *Context, path string) { c.fullPath = path }
 
-// SetTestTrustedNets sets the trusted proxy networks on a test context.
-// Prefer [celeristest.WithTrustedProxies].
-func SetTestTrustedNets(c *Context, nets []*net.IPNet) { c.trustedNets = nets }
+// setTestTrustedNets sets the trusted proxy networks on a test context.
+func setTestTrustedNets(c *Context, nets []*net.IPNet) { c.trustedNets = nets }
 
-// AddTestParam appends a route parameter to a test context.
-// Prefer [celeristest.WithParam].
-func AddTestParam(c *Context, key, value string) {
+// addTestParam appends a route parameter to a test context.
+func addTestParam(c *Context, key, value string) {
 	c.params = append(c.params, Param{Key: key, Value: value})
 }
 
-// SetTestHandlers installs a handler chain on a test context, using the
-// inline handlerBuf when the chain is small enough.
-// Prefer [celeristest.WithHandlers].
-func SetTestHandlers(c *Context, handlers []HandlerFunc) {
+// setTestHandlers installs a handler chain on a test context, using the
+// inline handlerBuf when the chain is small enough. Each element of
+// handlers is a HandlerFunc; the chain is copied, never retained.
+func setTestHandlers(c *Context, handlers []any) {
 	n := len(handlers)
 	if n <= len(c.handlerBuf) {
-		copy(c.handlerBuf[:n], handlers)
 		c.handlers = c.handlerBuf[:n]
 	} else {
 		c.handlers = make([]HandlerFunc, n)
-		copy(c.handlers, handlers)
+	}
+	for i, h := range handlers {
+		c.handlers[i] = h.(HandlerFunc)
 	}
 	c.index = -1
 }
 
-// SetTestScheme sets the scheme override on a test context.
-// Prefer [celeristest.WithScheme].
-func SetTestScheme(c *Context, scheme string) {
+// setTestScheme sets the scheme override on a test context.
+func setTestScheme(c *Context, scheme string) {
 	c.extended = true
 	c.schemeOverride = scheme
+}
+
+func init() {
+	testhooks.AcquireContext = func(s *stream.Stream) any { return acquireTestContext(s) }
+	testhooks.ReleaseContext = func(c any) { releaseTestContext(c.(*Context)) }
+	testhooks.Stream = func(c any) *stream.Stream { return testStream(c.(*Context)) }
+	testhooks.SetStartTime = func(c any, t time.Time) { setTestStartTime(c.(*Context), t) }
+	testhooks.SetFullPath = func(c any, path string) { setTestFullPath(c.(*Context), path) }
+	testhooks.SetTrustedNets = func(c any, nets []*net.IPNet) { setTestTrustedNets(c.(*Context), nets) }
+	testhooks.AddParam = func(c any, key, value string) { addTestParam(c.(*Context), key, value) }
+	testhooks.SetHandlers = func(c any, handlers []any) { setTestHandlers(c.(*Context), handlers) }
+	testhooks.SetScheme = func(c any, scheme string) { setTestScheme(c.(*Context), scheme) }
 }
 
 // respHdrBufCap is the inline response-header buffer slot count. The

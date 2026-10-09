@@ -13,7 +13,8 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 // --- mock streamer ---
@@ -98,7 +99,7 @@ func newSSEContext(t *testing.T, opts ...celeristest.Option) (*celeris.Context, 
 	t.Helper()
 	ctx, _ := celeristest.NewContextT(t, "GET", "/events", opts...)
 	ms := &mockStreamer{}
-	s := celeris.TestStream(ctx)
+	s := testhooks.Stream(ctx)
 	s.ResponseWriter = ms
 	return ctx, ms
 }
@@ -445,7 +446,7 @@ func TestHeartbeat(t *testing.T) {
 func TestWriteErrorOnHeaders(t *testing.T) {
 	ctx, _ := celeristest.NewContextT(t, "GET", "/events")
 	ms := &mockStreamer{writeErr: context.DeadlineExceeded}
-	celeris.TestStream(ctx).ResponseWriter = ms
+	testhooks.Stream(ctx).ResponseWriter = ms
 	handler := New(Config{
 		HeartbeatInterval: -1,
 		Handler:           func(client *Client) {},
@@ -513,7 +514,7 @@ func TestConcurrentClients(t *testing.T) {
 		go func() {
 			ctx, _ := celeristest.NewContext("GET", "/events")
 			ms := &mockStreamer{}
-			celeris.TestStream(ctx).ResponseWriter = ms
+			testhooks.Stream(ctx).ResponseWriter = ms
 			_ = handler(ctx)
 			celeristest.ReleaseContext(ctx)
 		}()
@@ -525,7 +526,7 @@ func TestConcurrentClients(t *testing.T) {
 
 func newDiscardContext() *celeris.Context {
 	ctx, _ := celeristest.NewContext("GET", "/events")
-	celeris.TestStream(ctx).ResponseWriter = &mockStreamer{}
+	testhooks.Stream(ctx).ResponseWriter = &mockStreamer{}
 	return ctx
 }
 
@@ -640,7 +641,7 @@ func TestConcurrentClientsStress(t *testing.T) {
 		go func(id int) {
 			ctx, _ := celeristest.NewContext("GET", "/events")
 			ms := &mockStreamer{}
-			celeris.TestStream(ctx).ResponseWriter = ms
+			testhooks.Stream(ctx).ResponseWriter = ms
 			_ = handler(ctx)
 			celeristest.ReleaseContext(ctx)
 		}(i)

@@ -5,9 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/redis/protocol"
 )
 
 // Client is the high-level handle users interact with. It owns a pool of
@@ -116,7 +114,7 @@ func (c *Client) Ping(ctx context.Context) error {
 }
 
 // Stats returns cmd-pool occupancy.
-func (c *Client) Stats() async.PoolStats {
+func (c *Client) Stats() PoolStats {
 	return c.pool.Stats()
 }
 
@@ -129,10 +127,10 @@ func (c *Client) IdleConnWorkers() []int {
 
 // Do is an escape hatch for commands the typed API does not cover
 // (OBJECT ENCODING, CLUSTER INFO, SCRIPT LOAD, XADD, FUNCTION, ...). Args
-// are converted to strings via [argify]; the returned [protocol.Value] is
+// are converted to strings via [argify]; the returned [Value] is
 // detached from the Reader buffer and safe to retain. Server error replies
 // surface as [*RedisError] via the returned error.
-func (c *Client) Do(ctx context.Context, args ...any) (*protocol.Value, error) {
+func (c *Client) Do(ctx context.Context, args ...any) (*Value, error) {
 	if len(args) == 0 {
 		return nil, errors.New("celeris-redis: Do requires at least one argument")
 	}
@@ -215,7 +213,7 @@ func (c *Client) DoSlice(ctx context.Context, args ...any) ([]string, error) {
 // OnPush registers (or replaces) the push callback for RESP3 push frames
 // arriving on command connections. It is safe to call concurrently with
 // in-flight commands; delivery is best-effort. Pass nil to clear.
-func (c *Client) OnPush(fn func(channel string, data []protocol.Value)) {
+func (c *Client) OnPush(fn func(channel string, data []Value)) {
 	c.cfg.OnPush = fn
 	c.pool.setOnPush(fn)
 }

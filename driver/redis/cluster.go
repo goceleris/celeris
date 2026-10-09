@@ -12,8 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/internal/driver/redis/protocol"
 )
 
 // readOnlyCommands is the set of Redis commands that are safe to route to
@@ -62,7 +61,7 @@ type ClusterConfig struct {
 	// Not implemented; reserved for future use.
 	ReadOnly bool
 
-	Engine eventloop.ServerProvider
+	Engine ServerProvider
 }
 
 // ErrClusterMaxRedirects is returned when the maximum number of MOVED/ASK
@@ -969,7 +968,7 @@ func (c *ClusterClient) SPublish(ctx context.Context, channel, message string) (
 	return out, err
 }
 
-func (c *ClusterClient) Do(ctx context.Context, args ...any) (*protocol.Value, error) {
+func (c *ClusterClient) Do(ctx context.Context, args ...any) (*Value, error) {
 	if len(args) < 2 {
 		node := c.anyNode()
 		if node == nil {
@@ -1055,7 +1054,7 @@ func (cp *ClusterPipeline) Set(key string, value any, ttl time.Duration) int {
 // by the original enqueue order. MOVED/ASK redirects within pipeline
 // responses are retried once: MOVED triggers a topology refresh and re-route;
 // ASK sends ASKING on the target node before re-issuing the command.
-func (cp *ClusterPipeline) Exec(ctx context.Context) ([]protocol.Value, []error) {
+func (cp *ClusterPipeline) Exec(ctx context.Context) ([]Value, []error) {
 	n := len(cp.cmds)
 	if n == 0 {
 		return nil, nil

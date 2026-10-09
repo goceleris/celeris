@@ -3,7 +3,7 @@ package conformance
 import (
 	"testing"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 func TestAutoProtocolDetection(t *testing.T) {

@@ -1,0 +1,416 @@
+//go:build linux
+
+package epoll
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/goceleris/celeris/internal/deferlinger"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/platform"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/resource"
+)
+
+// Engine implements the epoll-based I/O engine.
+type Engine struct {
+	loops        []*Loop
+	cfg          resource.Config
+	handler      stream.Handler
+	addr         atomic.Pointer[net.Addr]
+	mu           sync.Mutex
+	acceptPaused atomic.Bool
+	// pause records the pause in progress for the loops' linger step
+	// (celeris#662): when it began and whether its listeners get the
+	// tcp_synack_retries=0 guard. Written by BeginPauseAccept before it sets
+	// acceptPaused.
+	pause   deferlinger.PauseState
+	metrics struct {
+		reqCount    atomic.Uint64
+		activeConns atomic.Int64
+		// errs is the per-cause ErrorCount breakdown (celeris#645).
+		// EngineMetrics.ErrorCount is its sum; no separate total exists.
+		errs errclass.Counters
+		// asyncPromoted counts inline → dispatch-goroutine promotions
+		// across all loops (celeris #300).
+		asyncPromoted atomic.Uint64
+		// acceptCount / closeCount track cumulative connection lifecycle
+		// events; bytesRead / bytesWritten track cumulative payload bytes.
+		// All four feed the adaptive controller's load signals. Bytes are
+		// batched per-loop and flushed once per event-loop iteration
+		// (mirroring reqCount) to avoid hot-path cache-line bouncing;
+		// accepts/closes are infrequent so they increment directly like
+		// activeConns.
+		acceptCount  atomic.Uint64
+		closeCount   atomic.Uint64
+		bytesRead    atomic.Uint64
+		bytesWritten atomic.Uint64
+		// transplantAdopted / transplantDetached / transplantSlotOccupied
+		// are the #383 hand-off ledger, exported so the two halves of a
+		// transplant can be reconciled from outside the engine
+		// (celeris#624). detachFromEpoll fires no OnDisconnect and
+		// attachAdoptedFD fires no OnConnect by design, so without these
+		// the hand-off is invisible to every hook-derived counter.
+		transplantAdopted      atomic.Uint64
+		transplantDetached     atomic.Uint64
+		transplantSlotOccupied atomic.Uint64
+		// The remaining silent drop points on the #383 path, one bucket
+		// each (celeris#624). Every one of them used to lose a
+		// relinquished connection with no close, no hook and no counter.
+		transplantHandoffRefused atomic.Uint64
+		transplantDrainStopped   atomic.Uint64
+		transplantStranded       atomic.Uint64
+		transplantAdoptRefused   atomic.Uint64
+		// The post-switch sweep's own witnesses (celeris#657 P7): how
+		// many passes it has run, and the live residue by refusal class,
+		// which every loop publishes as a delta so the sum is what the
+		// engine still holds against a drain.
+		sweep sweepCounters
+	}
+	// asyncRoutes is the static AsyncRoutes count snapshotted at
+	// construction from the handler's AsyncRouteCount (#300 G3).
+	asyncRoutes int
+
+	// adoptRR round-robins io_uring→epoll transplant adoptions across loops (#383).
+	adoptRR atomic.Uint64
+
+	// drainBudget is the ctx of the last Shutdown call: the budget of the
+	// send drain the loops run when Listen's context is cancelled
+	// (celeris#760; see Loop.drainSends).
+	drainBudget atomic.Pointer[context.Context]
+}
+
+// New creates a new epoll engine.
+func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
+	cfg = cfg.WithDefaults()
+	if errs := cfg.Validate(); len(errs) > 0 {
+		return nil, fmt.Errorf("config validation: %w", errs[0])
+	}
+
+	e := &Engine{
+		cfg:     cfg,
+		handler: handler,
+	}
+	// Snapshot the static AsyncRoutes count (#300 G3).
+	if r, ok := handler.(interface{ AsyncRouteCount() int }); ok {
+		e.asyncRoutes = r.AsyncRouteCount()
+	}
+	return e, nil
+}
+
+// Listen starts the epoll engine and blocks until context is canceled.
+func (e *Engine) Listen(ctx context.Context) error {
+	// If a listener was provided (StartWithListener), use its bound address
+	// and close the Go-managed listener so our raw epoll sockets can bind
+	// with SO_REUSEPORT. Log the ownership transfer so users see it.
+	if e.cfg.Listener != nil {
+		e.cfg.Addr = e.cfg.Listener.Addr().String()
+		if e.cfg.Logger != nil {
+			e.cfg.Logger.Info("epoll: closing supplied listener to rebind via SO_REUSEPORT",
+				"addr", e.cfg.Addr)
+		}
+		_ = e.cfg.Listener.Close()
+		e.cfg.Listener = nil
+	}
+
+	resolved := e.cfg.Resources.Resolve()
+
+	topo := platform.DetectNUMA()
+	cpus := platform.DistributeWorkers(resolved.Workers, runtime.NumCPU(), topo.NumNodes)
+
+	if topo.NumNodes > 1 {
+		resolved.MaxEvents = resolved.MaxEvents / topo.NumNodes
+		if resolved.MaxEvents < 64 {
+			resolved.MaxEvents = 64
+		}
+	}
+
+	e.mu.Lock()
+	e.loops = make([]*Loop, resolved.Workers)
+	for i := range resolved.Workers {
+		l := newLoop(i, cpus[i], e.handler,
+			resolved, e.cfg,
+			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errs,
+			&e.metrics.asyncPromoted, &e.acceptPaused,
+			&e.metrics.acceptCount, &e.metrics.closeCount,
+			&e.metrics.bytesRead, &e.metrics.bytesWritten)
+		// #383 transplant ledger (celeris#624). Assigned after
+		// construction, like io_uring's, rather than widening newLoop.
+		l.transplantAdopted = &e.metrics.transplantAdopted
+		l.transplantDetached = &e.metrics.transplantDetached
+		l.transplantSlotOccupied = &e.metrics.transplantSlotOccupied
+		l.transplantHandoffRefused = &e.metrics.transplantHandoffRefused
+		l.transplantDrainStopped = &e.metrics.transplantDrainStopped
+		l.transplantStranded = &e.metrics.transplantStranded
+		l.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
+		l.sweepCnt = &e.metrics.sweep
+		l.pause = &e.pause
+		l.drainBudget = &e.drainBudget
+		e.loops[i] = l
+	}
+	e.mu.Unlock()
+
+	innerCtx, innerCancel := context.WithCancel(ctx)
+	defer innerCancel()
+
+	var wg sync.WaitGroup
+	for _, l := range e.loops {
+		wg.Go(func() {
+			l.run(innerCtx)
+		})
+	}
+
+	for _, l := range e.loops {
+		if initErr := <-l.ready; initErr != nil {
+			innerCancel()
+			wg.Wait()
+			return initErr
+		}
+	}
+
+	if len(e.loops) > 0 {
+		// celeris#639: publish an address a loop recorded before it signalled
+		// ready, never getsockname on a listenFD the loop may have closed since,
+		// and refuse to start rather than publish nil: every caller that polls
+		// Addr() reads nil as "not bound yet" and waits.
+		var addr net.Addr
+		for _, l := range e.loops {
+			if l.listenAddr != nil {
+				addr = l.listenAddr
+				break
+			}
+		}
+		if addr == nil {
+			innerCancel()
+			wg.Wait()
+			return fmt.Errorf("epoll: no loop could report the address it bound for %s", e.cfg.Addr)
+		}
+		e.addr.Store(&addr)
+	}
+
+	e.cfg.Logger.Info("epoll engine listening", "addr", e.cfg.Addr, "loops", resolved.Workers)
+	if e.cfg.AsyncHandlers && e.cfg.EnableH2Upgrade {
+		e.cfg.Logger.Info(
+			"AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker",
+		)
+	}
+
+	<-ctx.Done()
+	wg.Wait()
+	return nil
+}
+
+// Shutdown does not stop the epoll engine itself — graceful shutdown is
+// driven by context cancellation on Listen's parent context. The
+// Server calls Listen with its managed context and cancels it during
+// Server.Shutdown; the Listen goroutine returns after running
+// Loop.shutdown (which joins async dispatch goroutines via asyncWG, sends
+// the responses still queued, and closes connections). Server.Shutdown
+// waits for that return before it runs the OnShutdown hooks
+// (celeris#703).
+//
+// What Shutdown does is hand ctx to the loops as the budget of that send
+// drain (celeris#760): a response larger than the socket buffers is sent
+// while ctx is live, until its deadline or, for a ctx without one, until it
+// is done, but no longer than the config's WriteTimeout, and never for less
+// than shutdownSendDrainFloor, before its conn is closed (see
+// Loop.sendDrainWait). Server.Shutdown calls it before it cancels Listen's
+// context, and a cancel of StartWithContext's context reaches the loops
+// first but the watcher's Shutdown follows at once, within the drain's
+// floor.
+func (e *Engine) Shutdown(ctx context.Context) error {
+	e.drainBudget.Store(&ctx)
+	return nil
+}
+
+// Sendfile implements engine.SendfileCapable using sendfile(2) (celeris#317).
+// Writes `headers` via write(2) then transfers the file body to the socket
+// via the kernel's zero-copy path. Returns the number of body bytes sent.
+//
+// The connection FD must be non-blocking (the epoll engine sets SOCK_NONBLOCK
+// on accept). EAGAIN is surfaced to the caller, which defers the rest of the
+// response to the next epoll_wait iteration. The source file is owned by
+// the caller; the engine does not close it.
+func (e *Engine) Sendfile(fdOut int, file *os.File, offset, length int64, headers []byte) (int64, error) {
+	return sendfileH1(fdOut, file, offset, length, headers)
+}
+
+// Metrics returns a snapshot of engine metrics.
+func (e *Engine) Metrics() engine.EngineMetrics {
+	m := engine.EngineMetrics{
+		RequestCount:       e.metrics.reqCount.Load(),
+		ActiveConnections:  e.metrics.activeConns.Load(),
+		AsyncRoutes:        e.asyncRoutes,
+		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
+		Workers:            len(e.loops),
+		AcceptCount:        e.metrics.acceptCount.Load(),
+		CloseCount:         e.metrics.closeCount.Load(),
+		BytesRead:          e.metrics.bytesRead.Load(),
+		BytesWritten:       e.metrics.bytesWritten.Load(),
+
+		TransplantAdopted:           e.metrics.transplantAdopted.Load(),
+		TransplantDetached:          e.metrics.transplantDetached.Load(),
+		TransplantAdoptSlotOccupied: e.metrics.transplantSlotOccupied.Load(),
+		TransplantHandoffRefused:    e.metrics.transplantHandoffRefused.Load(),
+		TransplantDrainStopped:      e.metrics.transplantDrainStopped.Load(),
+		TransplantStranded:          e.metrics.transplantStranded.Load(),
+		TransplantAdoptRefused:      e.metrics.transplantAdoptRefused.Load(),
+
+		TransplantSweepPasses:       e.metrics.sweep.passes.Load(),
+		TransplantResidualDetached:  e.metrics.sweep.residual[resDetached].Load(),
+		TransplantResidualH2:        e.metrics.sweep.residual[resH2].Load(),
+		TransplantResidualPinned:    e.metrics.sweep.residual[resPinned].Load(),
+		TransplantResidualUnstarted: e.metrics.sweep.residual[resUnstarted].Load(),
+		TransplantResidualBusy:      e.metrics.sweep.residual[resBusy].Load(),
+	}
+	// ErrorCount and its eleven buckets, together, from one snapshot
+	// (celeris#645).
+	engine.FillErrorClasses(&m, e.metrics.errs.Snapshot())
+	return m
+}
+
+// Type returns the engine type.
+func (e *Engine) Type() engine.EngineType {
+	return engine.Epoll
+}
+
+// BeginPauseAccept starts pausing accept and returns without waiting
+// (celeris#662). Each loop sees the flag at the top of its next iteration,
+// a few milliseconds later at most while it listens. Then, on its own
+// thread, it clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
+// serving for the linger (about 1.5 s from that clear), and closes the
+// listener once it has drained the accept queue. A connection whose
+// handshake completed before the pause but which has sent nothing yet is
+// promoted by the kernel during the linger and served like any other,
+// instead of being reset by the close.
+//
+// It reads net.ipv4.tcp_synack_retries once, here. When that reads 0, the
+// pausing listeners also get TCP_SYNCNT=1, without which the kernel would
+// drop the connections it deferred instead of promoting them. The adaptive
+// engine calls BeginPauseAccept for the sub-engine a switch leaves, so a
+// switch does not wait for the linger.
+func (e *Engine) BeginPauseAccept() {
+	e.pause.Begin(e.cfg.Logger, "epoll")
+	e.acceptPaused.Store(true)
+}
+
+// PauseAccept stops accepting new connections. It is BeginPauseAccept
+// followed by a wait that returns once every loop has closed its listen
+// socket, so the SO_REUSEPORT group has shed this engine; or once a
+// ResumeAccept has withdrawn the pause; or once every loop has exited; or,
+// best effort, one second after the linger should have ended.
+//
+// So it takes about 1.5 s, the linger, and the engine keeps admitting
+// connections meanwhile: that is how a connection that completed its
+// handshake before the pause but had not sent its request yet is served
+// rather than reset (celeris#662, celeris#675). Connections already
+// accepted continue to be served, and those still in a loop's accept queue
+// at the close are accepted and served too. A listener built with
+// resource.Config.DisableDeferAccept has nothing to linger for and closes
+// at once.
+func (e *Engine) PauseAccept() error {
+	e.BeginPauseAccept()
+	e.mu.Lock()
+	loops := append([]*Loop(nil), e.loops...)
+	e.mu.Unlock()
+	if len(loops) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(max(deferlinger.Linger(), 0) + time.Second)
+	for {
+		// Take the channel BEFORE reading the flags: a loop that closes
+		// its listener after the read below closes this channel, so the
+		// wait cannot miss it (deferlinger.PauseState.Changed).
+		changed := e.pause.Changed()
+		if !e.acceptPaused.Load() {
+			return nil // a ResumeAccept withdrew the pause
+		}
+		allClosed := true
+		for _, l := range loops {
+			if !l.listenFDClosed.Load() {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed {
+			return nil
+		}
+		// Blocks until a loop closes its listener or exits, a resume, or
+		// the re-check (deferlinger.WaitRecheck), instead of polling every
+		// millisecond through the linger (celeris#662 review: ~1,500
+		// wakeups per pause, 65-73 ms of CPU on an idle io_uring engine).
+		if !deferlinger.WaitChanged(changed, deadline) {
+			return nil // best-effort: do not surface the timeout, the FD will close shortly
+		}
+	}
+}
+
+// ResumeAccept starts accepting new connections again.
+// Wakes any suspended loops so they re-create listen sockets.
+func (e *Engine) ResumeAccept() error {
+	e.acceptPaused.Store(false)
+	// A PauseAccept still waiting returns now: its pause is withdrawn.
+	e.pause.Notify()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, l := range e.loops {
+		// Re-arm the close-confirmation flag so a subsequent Pause cycle
+		// blocks on the new listen FD rather than the previously-closed
+		// one.
+		l.listenFDClosed.Store(false)
+		l.wakeIfSuspended()
+	}
+	return nil
+}
+
+// wakeIfSuspended ends a DRAINING→SUSPENDED park: if the loop is parked, close
+// its wake channel, give it a fresh one and clear suspended. Safe from any
+// goroutine; a no-op on a loop that is running.
+//
+// The park waits on a Go channel, not in epoll_wait, so an eventfd write does
+// not end it — only this does. ResumeAccept is one caller. AdoptConn is the
+// other: it arrives from another goroutine while the loop has no connection
+// and no listener to wake it for, and without the kick a standby loop slept
+// through the adoption until the next ResumeAccept — forever, if the engine
+// stayed the standby — while the source already counted the hand-off done
+// (celeris#658).
+//
+// No wakeup can be lost. A waker publishes its work — sets the flag the park
+// watches — BEFORE it takes wakeMu, and the loop re-checks those flags UNDER
+// wakeMu before it sets suspended. The mutex serialises the two: if the loop's
+// check runs first, the waker finds suspended set and closes wake; if the
+// waker's runs first, the flag is already set and the loop does not park.
+//
+// Lock order: e.mu → wakeMu (ResumeAccept) is the only nesting. wakeMu is a
+// leaf — nothing is acquired while it is held — so no caller may hold adoptQMu
+// or detachQMu when it calls this.
+func (l *Loop) wakeIfSuspended() {
+	l.wakeMu.Lock()
+	if l.suspended.Load() {
+		close(l.wake)
+		l.wake = make(chan struct{})
+		l.suspended.Store(false)
+	}
+	l.wakeMu.Unlock()
+}
+
+var (
+	_ engine.Engine           = (*Engine)(nil)
+	_ engine.AcceptController = (*Engine)(nil)
+)
+
+// Addr returns the bound listener address.
+func (e *Engine) Addr() net.Addr {
+	if p := e.addr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}

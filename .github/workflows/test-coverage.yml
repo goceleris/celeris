@@ -15,8 +15,8 @@
 # push; GitHub-hosted minutes are free for public repositories.
 #
 # What is NOT in the profile, and why (so a low number is read correctly):
-# ./test/... (integration/spec harness, not library code), ./adaptive/...,
-# and ./middleware/websocket. ./adaptive/... runs in ci.yml's `adaptive` job:
+# ./test/... (integration/spec harness, not library code), ./internal/adaptive/...,
+# and ./middleware/websocket. ./internal/adaptive/... runs in ci.yml's `adaptive` job:
 # it needs memlock raised with sudo, and its switch tests are load- and
 # timing-bound, with RESULT-line tallies that the job checks. Instrumenting
 # them would risk what happened to websocket (next sentence) and add the
@@ -26,7 +26,7 @@
 # and those are timing-bound: under coverage instrumentation
 # TestBackpressurePauseDoesNotCancelInflightSend failed on both engines
 # (close-timeouts, write errors) on the same commit whose uninstrumented
-# `unit` job passed (celeris#699), so they are left to ci.yml. ./engine/iouring
+# `unit` job passed (celeris#699), so they are left to ci.yml. ./internal/engine/iouring
 # runs at the runner's 8 MiB memlock, where io_uring gets one worker, so its
 # multi-worker paths read as uncovered here although the
 # goceleris/probatorium cluster runs them. Coverage is per package (no
@@ -58,6 +58,10 @@ jobs:
     env:
       # ci.yml's unit selection (see "Same packages as ci.yml" below).
       COVER_EXCLUDE: "/test/|/adaptive($|/)|/middleware/websocket($|/)"
+      # Of those packages, the one that runs in a step of its own, after the
+      # others (see "internal/engine/iouring" below); its profile is added to
+      # the root profile, so the root upload covers the same packages.
+      COVER_OWN_STEP: "/internal/engine/iouring$"
     # A fork pull request gets no OIDC token. codecov-action (v7.1.1) sees the
     # fork itself (head repository != this repository), skips OIDC even with
     # use_oidc: true, and uploads tokenless, which Codecov accepts for public
@@ -74,10 +78,12 @@ jobs:
           go-version: "1.27.2"
 
       # ci.yml's unit job takes `go list ./...` minus the pattern on its one
-      # `go list ./... | grep -vE '...'` line, and runs ./engine/iouring in a
-      # step of its own; this job runs all of them in one `go test`. The step
-      # fails, with the diff, when the two package sets differ, and when
-      # ci.yml no longer has exactly one such line or `go list` fails.
+      # `go list ./... | grep -vE '...'` line, and runs ./internal/engine/iouring in a
+      # step of its own; so does this job (COVER_OWN_STEP), and both steps
+      # write to the root profile. The step fails, with the diff, when the two
+      # package sets differ, when COVER_OWN_STEP selects anything but
+      # ./internal/engine/iouring, and when ci.yml no longer has exactly one
+      # such line or `go list` fails.
       - name: Same packages as ci.yml's unit job
         run: |
           set -euo pipefail
@@ -87,12 +93,17 @@ jobs:
             exit 1
           fi
           ci_exclude=$ci_lines
-          echo "ci.yml excludes:        $ci_exclude (+ ./engine/iouring in its own step)"
+          echo "ci.yml excludes:        $ci_exclude (+ ./internal/engine/iouring in its own step)"
           echo "test-coverage excludes: $COVER_EXCLUDE"
           # Outside a process substitution, so that set -e sees a failure.
           all=$(go list ./...)
-          iouring=$(go list ./engine/iouring)
+          iouring=$(go list ./internal/engine/iouring)
           ci_pkgs=$({ grep -vE "$ci_exclude" <<< "$all" || true; echo "$iouring"; } | sort -u)
+          own=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; } | { grep -E "$COVER_OWN_STEP" || true; })
+          if [ "$own" != "$iouring" ]; then
+            echo "::error::COVER_OWN_STEP should select $iouring alone; it selects: ${own:-nothing}"
+            exit 1
+          fi
           cover_pkgs=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; } | sort -u)
           echo "packages: ci.yml $(grep -c . <<< "$ci_pkgs"), this job $(grep -c . <<< "$cover_pkgs")"
           if ! diff <(echo "$ci_pkgs") <(echo "$cover_pkgs"); then
@@ -105,10 +116,34 @@ jobs:
           # A `go list` failure must stop the job, not hand grep a partial list.
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          pkgs=$(go list ./... | grep -vE "$COVER_EXCLUDE")
+          pkgs=$(go list ./... | grep -vE "$COVER_EXCLUDE" | grep -vE "$COVER_OWN_STEP")
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
           go test -race -count=1 -timeout=300s -covermode=atomic \
             -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
+      # ./internal/engine/iouring on its own, as ci.yml's unit job runs it.
+      # io_uring charges ring memory to the user, so every test process of the
+      # runner user shares one 8 MiB memlock budget. In the root step, the
+      # package's tests ran beside other packages' io_uring servers (the root
+      # package's, for its whole run) and failed with io_uring_setup ENOMEM
+      # (celeris#938: 3 of 7 attempts). Its profile is added to the root one:
+      # the packages are disjoint, so the blocks are appended after the mode
+      # line.
+      - name: internal/engine/iouring (own step, ci.yml unit set)
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=300s -covermode=atomic \
+            -coverprofile="$RUNNER_TEMP/cover-iouring.out" ./internal/engine/iouring/
+          root="$RUNNER_TEMP/cover-root.out"
+          own="$RUNNER_TEMP/cover-iouring.out"
+          if [ "$(head -n1 "$own")" != "$(head -n1 "$root")" ]; then
+            echo "::error::mode lines differ: $(head -n1 "$own") vs $(head -n1 "$root")"
+            exit 1
+          fi
+          blocks=$(grep -vc '^mode: ' "$own" || true)
+          echo "cover-iouring.out: $blocks blocks, appended to cover-root.out"
+          [ "$blocks" -gt 0 ]
+          tail -n +2 "$own" >> "$root"
       - name: middleware/compress
         working-directory: middleware/compress
         run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-compress.out" ./...

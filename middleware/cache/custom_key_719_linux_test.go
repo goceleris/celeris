@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/middleware/cache"
-	"github.com/goceleris/celeris/probe"
 )
 
 // TestCustomKeyStillHitsAfterNextRequest pins the cache store's site of

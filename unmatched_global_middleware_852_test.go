@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // celeris#852: the global middleware (Server.Use) runs for a request no route

@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // maxDirectResultBytes is the per-query result buffer cap in direct mode.
@@ -406,7 +406,7 @@ func growCap(old, need int) int {
 // Ctx implements async.PendingRequest.
 func (r *pgRequest) Ctx() context.Context { return r.ctx }
 
-// OnRowDesc implements [protocol.SimpleQueryObserver]. Called once per
+// OnRowDesc implements protocol.SimpleQueryObserver. Called once per
 // RowDescription frame on simple-query requests. Stashes the column
 // list and unblocks any caller waiting on colsCh for early streamRows
 // return.
@@ -417,8 +417,8 @@ func (r *pgRequest) OnRowDesc(cols []protocol.ColumnDesc) {
 	}
 }
 
-// OnRow implements [protocol.SimpleQueryObserver] and
-// [protocol.ExtendedQueryObserver]. Called once per DataRow.
+// OnRow implements protocol.SimpleQueryObserver and
+// protocol.ExtendedQueryObserver. Called once per DataRow.
 //
 // Direct-mode (sync syncMode) buffers everything into rowSlab/rows;
 // streaming mode forwards through rowCh. The simple and extended

@@ -10,7 +10,7 @@ package mcspec
 import (
 	"testing"
 
-	"github.com/goceleris/celeris/driver/memcached/protocol"
+	"github.com/goceleris/celeris/internal/driver/memcached/protocol"
 )
 
 // TestZZBinary_Flush exercises OpFlush both with and without exptime extras.

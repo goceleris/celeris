@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goceleris/celeris/internal/protocol/h2/frame"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/wakefd"
-	"github.com/goceleris/celeris/protocol/h2/frame"
-	"github.com/goceleris/celeris/protocol/h2/stream"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -71,7 +71,7 @@ func (cfg H2Config) withDefaults() H2Config {
 		cfg.InitialWindowSize = 65535
 	}
 	if cfg.MaxFrameSize == 0 {
-		cfg.MaxFrameSize = 1 << 20 // 1 MiB — see resource/config.go for rationale
+		cfg.MaxFrameSize = 1 << 20 // 1 MiB — see internal/resource/config.go for rationale
 	}
 	return cfg
 }

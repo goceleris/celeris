@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
 
 // ============================================================================

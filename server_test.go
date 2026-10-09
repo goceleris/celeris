@@ -9,8 +9,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 func TestServerEngineInfo(t *testing.T) {

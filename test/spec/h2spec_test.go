@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // TestH2Spec runs the h2spec conformance suite against every available engine in H2C mode.

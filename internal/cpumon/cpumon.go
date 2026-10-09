@@ -4,23 +4,31 @@ package cpumon
 import (
 	"errors"
 	"time"
-
-	"github.com/goceleris/celeris/engine"
 )
 
 // ErrClosed is returned by Sample after the monitor has been closed.
 var ErrClosed = errors.New("cpumon: monitor closed")
 
-// CPUSample is a point-in-time CPU utilization measurement. It is an alias of
-// the public engine.CPUSample so the internal implementations (ProcStat,
-// RuntimeMon) directly satisfy the public engine.CPUMonitor interface and can
-// be passed into adaptive.New from outside the module.
-type CPUSample = engine.CPUSample
+// CPUSample is a point-in-time CPU utilization measurement supplied by a
+// Monitor. Utilization is a fraction in [0,1]; zero means "no signal" and
+// is the documented fallback when system-wide CPU data is unavailable.
+//
+// It is defined here, and engine.CPUSample is an alias of it, so that
+// observe can use this package without importing the engine: the engine
+// imports observe for EngineMetrics.
+type CPUSample struct {
+	Utilization float64
+	Timestamp   time.Time
+}
 
-// Monitor samples CPU utilization. It is an alias of the public
-// engine.CPUMonitor interface, keeping internal/cpumon as the implementation
-// while the type surfaced in public signatures lives in the engine root.
-type Monitor = engine.CPUMonitor
+// Monitor samples CPU utilization. engine.CPUMonitor is an alias of it, and
+// the adaptive engine accepts one, so a caller can supply its own monitor or
+// the built-in /proc/stat implementation. Implementations must be safe for
+// concurrent use: a single monitor may be sampled from more than one
+// goroutine.
+type Monitor interface {
+	Sample() (CPUSample, error)
+}
 
 // Synthetic is a deterministic CPU monitor for testing.
 type Synthetic struct {

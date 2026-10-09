@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/driver/memcached/protocol"
+	"github.com/goceleris/celeris/internal/driver/memcached/protocol"
 )
 
 const (

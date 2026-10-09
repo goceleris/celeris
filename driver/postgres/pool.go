@@ -14,8 +14,8 @@ import (
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // PoolConfig controls the worker-affinity pool returned by Open.
@@ -62,7 +62,7 @@ type Option func(*options)
 
 // WithEngine routes pool connections through the event loop of a running
 // celeris.Server. When unset, Open resolves a standalone loop.
-func WithEngine(sp eventloop.ServerProvider) Option {
+func WithEngine(sp ServerProvider) Option {
 	return func(o *options) {
 		if sp == nil {
 			return
@@ -296,7 +296,7 @@ func (p *Pool) Close() error {
 }
 
 // Stats returns a snapshot of pool occupancy.
-func (p *Pool) Stats() async.PoolStats { return p.inner.Stats() }
+func (p *Pool) Stats() PoolStats { return p.inner.Stats() }
 
 // IdleConnWorkers returns the Worker() IDs of every currently-idle connection
 // across all worker slots. Same worker ID may appear multiple times when the

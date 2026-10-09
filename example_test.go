@@ -435,3 +435,23 @@ func ExampleRouteGroup_Async() {
 	fmt.Println("group configured")
 	// Output: group configured
 }
+
+// ExampleConfig_adaptive selects the adaptive engine, the default on Linux.
+// It runs epoll and io_uring side by side and moves new connections to the
+// one that serves the current load better. The engine packages are internal,
+// so Config is where an engine is chosen and tuned: WorkloadHint picks the
+// engine the server starts on.
+func ExampleConfig_adaptive() {
+	cfg := celeris.Config{
+		Addr:         ":8080",
+		Engine:       celeris.Adaptive,
+		WorkloadHint: celeris.WorkloadHighConcurrency,
+	}
+	s := celeris.New(cfg)
+	s.GET("/ping", func(c *celeris.Context) error {
+		return c.String(200, "pong")
+	})
+	// In a real app: log.Fatal(s.Start())
+	fmt.Println(cfg.Engine)
+	// Output: adaptive
+}

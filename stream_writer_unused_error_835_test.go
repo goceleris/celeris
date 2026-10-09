@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // recordingStreamer835 is a ResponseWriter that is also a Streamer, as every

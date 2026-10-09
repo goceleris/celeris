@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // startFailures are the ways a Start can fail before any engine runs: in
