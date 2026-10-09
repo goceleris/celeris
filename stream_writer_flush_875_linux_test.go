@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,8 +26,10 @@ import (
 // on the wire" (docs streaming.md) and its godoc "ensures buffered data is
 // sent to the network"; they now say what is measured here.
 //
-// The handler writes the head and one chunk, calls Flush, then waits for the
-// test to release it. The client reports whether the chunk reached it before
+// The matrix covers std, epoll, io_uring and adaptive (the default engine on
+// Linux, which runs on epoll and io_uring and behaves the same). The handler
+// writes the head and one chunk, calls Flush, then waits for the test to
+// release it. The client reports whether the chunk reached it before
 // the release (early) and then that the whole body arrives once released
 // (the control: a case that never delivered would otherwise read as "late").
 
@@ -151,7 +154,7 @@ func TestStreamWriterFlushH1_875(t *testing.T) {
 	for _, e := range []struct {
 		name string
 		eng  celeris.EngineType
-	}{{"std", celeris.Std}, {"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}} {
+	}{{"std", celeris.Std}, {"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
 		for _, sh := range []struct {
 			name  string
 			async bool
@@ -162,10 +165,13 @@ func TestStreamWriterFlushH1_875(t *testing.T) {
 					release := make(chan struct{})
 					var once sync.Once
 					rel := func() { once.Do(func() { close(release) }) }
-					t.Cleanup(rel)
 					addr := startServerConfig761(t, celeris.Config{Engine: e.eng, Protocol: celeris.HTTP1}, func(s *celeris.Server) {
 						flushRoute875(s, release, detach, sh.async)
 					})
+					// Registered after the server's own cleanup, so it runs
+					// first: a handler still waiting for release is let go
+					// before Shutdown waits for it.
+					t.Cleanup(rel)
 					early, full, err := flushProbe875(addr, rel)
 					// std flushes through http.Flusher. A native engine sends on
 					// Write only after Detach; before it the chunk waits for the
@@ -202,12 +208,11 @@ func TestStreamWriterWriteErrorAfterPeerGoneH1_875(t *testing.T) {
 	for _, e := range []struct {
 		name string
 		eng  celeris.EngineType
-	}{{"std", celeris.Std}, {"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}} {
+	}{{"std", celeris.Std}, {"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
 		t.Run(e.name, func(t *testing.T) {
 			gone := make(chan struct{})
 			var once sync.Once
 			goneNow := func() { once.Do(func() { close(gone) }) }
-			t.Cleanup(goneNow)
 			type result struct {
 				err    error
 				writes int
@@ -259,6 +264,7 @@ func TestStreamWriterWriteErrorAfterPeerGoneH1_875(t *testing.T) {
 					return nil
 				})
 			})
+			t.Cleanup(goneNow) // after the server's cleanup, so it runs before Shutdown
 			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 			if err != nil {
 				t.Fatal(err)
@@ -294,6 +300,177 @@ func TestStreamWriterWriteErrorAfterPeerGoneH1_875(t *testing.T) {
 			case <-time.After(15 * time.Second):
 				t.Fatal("the handler did not finish")
 			}
+		})
+	}
+}
+
+// The godoc advice is "to deliver bytes while the handler is still running,
+// Detach it". The matrix above detaches and then returns the handler (the
+// canonical pattern: the goroutine streams), so it does not show that the
+// advice holds for a handler that detaches and keeps writing inline, on its
+// own goroutine, while it runs. This one does: Detach, then head, chunk and
+// Flush in the handler, which blocks until released. The chunk must reach the
+// client before that, and the .Async() route (where the dispatch goroutine
+// holds the detach mutex until the Detach has been published) must not
+// deadlock on the inline Write.
+
+func TestStreamWriterDetachInlineWriteH1_875(t *testing.T) {
+	for _, e := range []struct {
+		name string
+		eng  celeris.EngineType
+	}{{"std", celeris.Std}, {"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
+		for _, async := range []bool{false, true} {
+			name := fmt.Sprintf("%s/async=%v", e.name, async)
+			t.Run(name, func(t *testing.T) {
+				release := make(chan struct{})
+				var once sync.Once
+				rel := func() { once.Do(func() { close(release) }) }
+				returned := make(chan struct{})
+				addr := startServerConfig761(t, celeris.Config{Engine: e.eng, Protocol: celeris.HTTP1}, func(s *celeris.Server) {
+					r := s.GET("/flush875", func(c *celeris.Context) error {
+						defer close(returned)
+						sw := c.StreamWriter()
+						if sw == nil {
+							return fmt.Errorf("no StreamWriter")
+						}
+						done := c.Detach()
+						defer done()
+						defer func() { _ = sw.Close() }()
+						if err := sw.WriteHeader(200, [][2]string{{"content-type", "text/plain"}}); err != nil {
+							return err
+						}
+						if _, err := sw.Write([]byte(first875)); err != nil {
+							return err
+						}
+						if err := sw.Flush(); err != nil {
+							return err
+						}
+						select {
+						case <-release:
+						case <-time.After(20 * time.Second):
+						}
+						_, _ = sw.Write([]byte(second875))
+						return nil
+					})
+					if async {
+						r.Async()
+					}
+				})
+				t.Cleanup(rel)
+				early, full, err := flushProbe875(addr, rel)
+				t.Logf("%s: detached, inline write: chunk before the handler returned = %v", name, early)
+				if err != nil {
+					t.Fatalf("read: %v (got %q)", err, full)
+				}
+				if !early {
+					t.Errorf("a detached handler's chunk did not reach the client while the handler was still running")
+				}
+				if !strings.HasPrefix(full, "HTTP/1.1 200") || !strings.Contains(full, first875) || !strings.Contains(full, second875) {
+					t.Fatalf("response incomplete after release: %q", full)
+				}
+				select {
+				case <-returned:
+				case <-time.After(5 * time.Second):
+					t.Error("the handler did not return after release")
+				}
+			})
+		}
+	}
+}
+
+// What gives a raw StreamWriter a disconnect signal on epoll and io_uring over
+// HTTP/1.1, where Write and Flush do not: Context.SetWSDetachClose and
+// Context.SetWSErrorHandler, which the SSE middleware installs for exactly
+// this (celeris#494). Despite the WS in their names they are plain
+// detached-connection hooks, with no WebSocket upgrade needed. Installed
+// before Detach, SetWSDetachClose must fire once the peer has reset the
+// connection and must not fire while the peer is still there. The error
+// handler is logged, not required (a close without an I/O error does not call
+// it). The hooks run on the engine thread, so they only record.
+
+func TestDetachedStreamPeerGoneHooksH1_875(t *testing.T) {
+	for _, e := range []struct {
+		name string
+		eng  celeris.EngineType
+	}{{"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
+		t.Run(e.name, func(t *testing.T) {
+			var resetDone atomic.Bool
+			var closeBefore, closeAfter, errBefore, errAfter atomic.Int32
+			closed := make(chan struct{})
+			var closedOnce sync.Once
+			streamEnd := make(chan struct{})
+			var endOnce sync.Once
+			end := func() { endOnce.Do(func() { close(streamEnd) }) }
+			addr := startServerConfig761(t, celeris.Config{Engine: e.eng, Protocol: celeris.HTTP1}, func(s *celeris.Server) {
+				s.GET("/hooks875", func(c *celeris.Context) error {
+					sw := c.StreamWriter()
+					if sw == nil {
+						return fmt.Errorf("no StreamWriter")
+					}
+					c.SetWSErrorHandler(func(error) {
+						if resetDone.Load() {
+							errAfter.Add(1)
+						} else {
+							errBefore.Add(1)
+						}
+					})
+					c.SetWSDetachClose(func() {
+						if resetDone.Load() {
+							closeAfter.Add(1)
+						} else {
+							closeBefore.Add(1)
+						}
+						closedOnce.Do(func() { close(closed) })
+					})
+					done := c.Detach()
+					go func() {
+						defer done()
+						_ = sw.WriteHeader(200, [][2]string{{"content-type", "text/plain"}})
+						_, _ = sw.Write([]byte(first875))
+						_ = sw.Flush()
+						select {
+						case <-closed:
+						case <-streamEnd:
+						case <-time.After(10 * time.Second):
+						}
+					}()
+					return nil
+				})
+			})
+			t.Cleanup(end) // after the server's cleanup, so it runs before Shutdown
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Write([]byte("GET /hooks875 HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+				t.Fatal(err)
+			}
+			var got strings.Builder
+			p := make([]byte, 4096)
+			for !strings.Contains(got.String(), first875) {
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				n, rerr := conn.Read(p)
+				got.Write(p[:n])
+				if rerr != nil {
+					t.Fatalf("read before the first chunk: %v (got %q)", rerr, got.String())
+				}
+			}
+			// The peer is still there: nothing may have fired.
+			time.Sleep(300 * time.Millisecond)
+			if closeBefore.Load() != 0 || errBefore.Load() != 0 {
+				t.Errorf("hooks fired while the peer was still connected: detach-close %d, error handler %d", closeBefore.Load(), errBefore.Load())
+			}
+			resetDone.Store(true)
+			_ = conn.(*net.TCPConn).SetLinger(0)
+			_ = conn.Close()
+			select {
+			case <-closed:
+			case <-time.After(8 * time.Second):
+				t.Errorf("SetWSDetachClose did not fire within 8s of the client resetting the connection")
+			}
+			end()
+			t.Logf("%s: after the reset: detach-close fired %d, error handler fired %d; before: %d, %d",
+				e.name, closeAfter.Load(), errAfter.Load(), closeBefore.Load(), errBefore.Load())
 		})
 	}
 }

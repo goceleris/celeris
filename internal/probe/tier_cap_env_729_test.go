@@ -37,11 +37,15 @@ func TestParseTierName729(t *testing.T) {
 // TestProbeTierCapEnv729 runs the real Probe. An empty value must leave the
 // profile exactly as ProbeWith detects it (no cap); the typo must cap at none
 // and leave the kernel version alone. The host's own tier decides whether the
-// cap is visible: a host that probes as none is unchanged by every value, so
-// the typo case compares against the detected profile with the tier cleared
-// instead of asserting a drop.
+// cap is visible: a host that probes as none (no io_uring, or a default
+// seccomp profile) is unchanged by every value, so the empty-value case would
+// pass even if an empty value counted as "none". The test skips there (a skip
+// is absent, not a pass) rather than pass without checking anything.
 func TestProbeTierCapEnv729(t *testing.T) {
 	detected := ProbeWith(defaultProber())
+	if detected.IOUringTier == engine.None {
+		t.Skip("io_uring tier probes as none on this host: no cap is visible")
+	}
 
 	t.Setenv("CELERIS_MAX_IOURING_TIER", "")
 	if got := Probe(); !reflect.DeepEqual(got, detected) {
