@@ -35,7 +35,7 @@ func BenchmarkStreamWriterWrite904(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					if i&1023 == 0 {
 						s.SetWindowSize(1 << 30)
-						mgr.UpdateConnectionWindow(1 << 21)
+						mgr.UpdateConnectionWindow(1<<21 - mgr.GetConnectionWindow())
 						st.DrainWriteQueue(func([]byte) {})
 					}
 					if err := sw.Write(s, chunk); err != nil {
