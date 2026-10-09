@@ -66,6 +66,13 @@ func TestIdleFollowSwitchStandbyBuildFailure804(t *testing.T) {
 			adoptCarriedAsync543(t, arm.name, arm.switches, arm.want, failStandbyBuild804)
 		case "abort-791-adopted":
 			abortAdaptive791(t, true, failStandbyBuild804)
+		case "start-on-target":
+			// The run starts on io_uring (the child's CELERIS_ADAPTIVE_START),
+			// so a forced switch "to io_uring" would leave epoll. That is not a
+			// missing standby and must not read as one.
+			e, _, stop := newBoundAdaptiveH(t, respHandler{}, false)
+			defer stop()
+			forceSwitchTo(t, e, engine.IOUring)
 		default:
 			t.Fatalf("unknown cell %q", cell)
 		}
@@ -83,7 +90,7 @@ func TestIdleFollowSwitchStandbyBuildFailure804(t *testing.T) {
 		skipOrFailUpswitch662(t, "io_uring unavailable: needs both sub-engines")
 	}
 
-	run := func(cell string, require bool) (out string, exit int) {
+	run := func(cell string, require bool, extraEnv ...string) (out string, exit int) {
 		t.Helper()
 		cmd := exec.Command(os.Args[0], "-test.run=^"+test804+"$", "-test.v", "-test.count=1", "-test.timeout=90s")
 		var env []string
@@ -94,6 +101,7 @@ func TestIdleFollowSwitchStandbyBuildFailure804(t *testing.T) {
 			env = append(env, kv)
 		}
 		env = append(env, env804Cell+"="+cell)
+		env = append(env, extraEnv...)
 		if require {
 			env = append(env, "CELERIS_REQUIRE_UPSWITCH=1")
 		}
@@ -136,6 +144,16 @@ func TestIdleFollowSwitchStandbyBuildFailure804(t *testing.T) {
 				forbid(t, cell, out)
 				t.Logf("%s: exit=%d in %v", cell, exit, time.Since(t0).Round(time.Millisecond))
 			})
+		}
+	})
+
+	t.Run("starting-on-the-target-engine-is-not-a-missing-standby", func(t *testing.T) {
+		out, exit := run("start-on-target", false, "CELERIS_ADAPTIVE_START=iouring")
+		if exit == 0 || !strings.Contains(out, "--- FAIL: "+test804) || !strings.Contains(out, "is already active") {
+			t.Errorf("want a FAIL naming the already-active engine (exit %d):\n%s", exit, out)
+		}
+		if strings.Contains(out, standbyMsg804) {
+			t.Errorf("a run that started on the target engine was reported as a missing standby:\n%s", out)
 		}
 	})
 
