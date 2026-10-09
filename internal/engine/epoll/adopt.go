@@ -233,17 +233,10 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 			return
 		}
 		if perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, l.handler, cs.writeFn); perr != nil {
-			if !errors.Is(perr, conn.ErrHijacked) {
-				l.closeConn(fd)
-			}
+			l.endCarriedReplay(cs, fd, perr)
 			return
 		}
-		if csWritePending(cs) {
-			if fErr := l.flushWrites(cs, true); fErr != nil {
-				l.closeConn(fd)
-				return
-			}
-		}
+		l.flushCarriedReplay(cs, fd)
 	}
 }
 
@@ -288,7 +281,8 @@ func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
 		return
 	}
 	if perr != nil {
-		l.closeConn(fd)
+		// Nothing below may touch cs.h1State: an h2c upgrade has replaced it.
+		l.endCarriedReplay(cs, fd, perr)
 		return
 	}
 	// Inline served the bytes, but if they ended inside a request its
@@ -297,9 +291,124 @@ func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
 		cs.asyncPromoted = true
 		l.asyncPromoted.Add(1)
 	}
+	l.flushCarriedReplay(cs, fd)
+}
+
+// endCarriedReplay finishes a replay whose ProcessH1 returned a non-nil
+// verdict other than ErrHijacked and ErrAsyncDispatch, doing what drainRead
+// does with the same verdict from a recv (celeris#908). Before, every such
+// verdict closed the conn at once: closeConn does not send what is queued, so
+// the 400 or 413 ProcessH1 had written (or the response to a request that
+// said Connection: close) was dropped, and so was the 101 of an h2c upgrade,
+// whose conn was closed instead of switched.
+//
+//   - ErrHijacked: the handler took the conn and cs is released; nothing to do.
+//   - ErrUpgradeH2C: switch the conn to HTTP/2 and send the 101 with the
+//     server preface and the answer to the upgrade request, as drainRead does
+//     (its block is the model for the flush below; loop.go is not edited here).
+//   - anything else (a parse error, errConnectionClose): flush what ProcessH1
+//     queued, tell the detached middleware (OnError) and close once the
+//     response has reached the kernel (closeWhenFlushed, celeris#761).
+//
+// Loop thread, on a conn fresh from attachAdoptedFD: no dispatch goroutine
+// exists, so the only other holder of cs.detachMu is a guarded writeFn in one
+// write. The lock is released before the close, which takes it again.
+func (l *Loop) endCarriedReplay(cs *connState, fd int, perr error) {
+	if errors.Is(perr, conn.ErrHijacked) {
+		return
+	}
+	if errors.Is(perr, conn.ErrUpgradeH2C) {
+		if err := l.switchToH2(cs, cs.writeFn); err != nil {
+			l.closeConn(fd)
+			return
+		}
+		if cs.writePos < len(cs.writeBuf) {
+			if fErr := l.flushWrites(cs, true); fErr != nil {
+				l.closeConn(fd)
+				return
+			}
+			if cs.writePos >= len(cs.writeBuf) {
+				cs.pendingBytes = 0
+				if cs.dirty {
+					l.removeDirty(cs)
+				}
+			} else {
+				// The 101 and the preface did not all fit: the send buffer is
+				// full. A newly-H2 conn is not detached, so arm EPOLLOUT
+				// rather than the busy-polling dirty list.
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+				l.armEpollOut(cs)
+			}
+		}
+		return
+	}
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+	}
+	_ = l.flushWrites(cs, true)
+	cs.pendingBytes = 0
+	if cs.h1State != nil && cs.h1State.OnError != nil {
+		cs.h1State.OnError(perr)
+	}
+	if mu := cs.detachMu; mu != nil {
+		mu.Unlock()
+	}
+	l.closeWhenFlushed(cs)
+}
+
+// flushCarriedReplay sends the responses a replay's ProcessH1 queued, as
+// drainRead's inline flush does after a recv (celeris#908). The replay used
+// to flush once and stop: a response larger than the socket buffers left its
+// rest in cs.writeBuf with no EPOLLOUT armed and the dirty list untouched
+// (EPOLLIN is edge-triggered, and nothing reads from the socket again until
+// the client sends), so the client got a truncated body and a stalled conn.
+// It also left pendingBytes at the sum of the replayed responses, which the
+// write hooks read as a backlog, and ignored a refused write.
+//
+// Loop thread, on a conn fresh from attachAdoptedFD. cs.detachMu is released
+// before any close, which takes it again.
+func (l *Loop) flushCarriedReplay(cs *connState, fd int) {
+	mu := cs.detachMu
+	if mu != nil {
+		mu.Lock()
+	}
 	if csWritePending(cs) {
 		if fErr := l.flushWrites(cs, true); fErr != nil {
+			if cs.h1State != nil && cs.h1State.OnError != nil {
+				cs.h1State.OnError(fErr)
+			}
+			if mu != nil {
+				mu.Unlock()
+			}
+			if cs.dirty {
+				l.removeDirty(cs)
+			}
 			l.closeConn(fd)
+			return
 		}
+		if !csWritePending(cs) {
+			cs.pendingBytes = 0
+			if cs.dirty {
+				l.removeDirty(cs)
+			}
+			l.disarmEpollOut(cs)
+		} else {
+			// The kernel send buffer is full: sync pendingBytes and arm
+			// EPOLLOUT, which handleWritable carries on from (a pending
+			// sendfile too). A truly detached conn keeps the dirty list.
+			cs.pendingBytes = csPendingBytes(cs)
+			if cs.h1State != nil && cs.h1State.Detached.Load() {
+				l.markDirty(cs)
+			} else {
+				l.armEpollOut(cs)
+			}
+		}
+	}
+	refused := cs.writeRefused
+	if mu != nil {
+		mu.Unlock()
+	}
+	if refused {
+		l.closeWhenFlushed(cs)
 	}
 }

@@ -120,7 +120,22 @@ type Config struct {
 	// EnableH2Upgrade enables RFC 7540 §3.2 HTTP/1.1→H2C upgrades. Resolved
 	// from celeris.Config.EnableH2Upgrade (pointer, may be nil) and Protocol.
 	// Always a concrete value after WithDefaults.
+	//
+	// A bool cannot tell an explicit false from "unset", so a caller that
+	// has already resolved the value (celeris.Config does, from its *bool)
+	// must set it through SetH2Upgrade, which tells WithDefaults to leave it
+	// alone (celeris#964). A Config literal that sets the field directly is
+	// still resolved by WithDefaults: true on Protocol Auto, as given
+	// otherwise.
 	EnableH2Upgrade bool
+
+	// h2UpgradeResolved records that EnableH2Upgrade was resolved by the
+	// caller (SetH2Upgrade), so WithDefaults must not apply the Protocol
+	// Auto default to it. Unexported like defaulted: a Config built as a
+	// literal starts unresolved, and the marker travels with the value on
+	// copy, which keeps every later WithDefaults pass (the engine
+	// constructors, adaptive's sub-engines) from re-deciding it.
+	h2UpgradeResolved bool
 
 	// defaulted records that WithDefaults has already resolved this
 	// Config's sentinel fields, which is what makes a second pass a
@@ -226,6 +241,15 @@ func (c Config) Validate() []error {
 	return errs
 }
 
+// SetH2Upgrade sets EnableH2Upgrade to a value the caller has already
+// resolved, explicit false included, and records that WithDefaults must leave
+// it as it is (celeris#964). celeris.Config calls it from toResourceConfig,
+// where the *bool still distinguishes nil from &false.
+func (c *Config) SetH2Upgrade(enable bool) {
+	c.EnableH2Upgrade = enable
+	c.h2UpgradeResolved = true
+}
+
 // WithDefaults returns a copy of Config with zero-value fields set to sensible
 // defaults.
 //
@@ -243,16 +267,17 @@ func (c Config) WithDefaults() Config {
 	if c.Engine.IsDefault() {
 		c.Engine = defaultEngine()
 	}
-	// Resolve h2c-upgrade default. Auto protocol (including the implicit
-	// default) enables h2c upgrade; HTTP1/H2C don't unless the caller
-	// explicitly set EnableH2Upgrade=true before calling WithDefaults.
-	// Callers who want upgrade disabled on Auto must go through the root
-	// celeris.Config path where EnableH2Upgrade is a *bool.
+	// Resolve the h2c-upgrade default. A value the caller resolved through
+	// SetH2Upgrade (celeris.Config's *bool: nil, &true, &false) is final and
+	// is left alone, so an explicit false survives on Protocol Auto. For a
+	// Config literal, where false is indistinguishable from unset, Auto
+	// protocol (including the implicit default) enables h2c upgrade;
+	// HTTP1/H2C don't unless the caller set EnableH2Upgrade=true.
 	wasAutoOrDefault := c.Protocol.IsDefault() || c.Protocol == engine.Auto
 	if c.Protocol.IsDefault() {
 		c.Protocol = engine.Auto
 	}
-	if wasAutoOrDefault && !c.EnableH2Upgrade {
+	if wasAutoOrDefault && !c.EnableH2Upgrade && !c.h2UpgradeResolved {
 		c.EnableH2Upgrade = true
 	}
 	if c.MaxFrameSize == 0 {

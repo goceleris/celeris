@@ -272,7 +272,15 @@ type Config struct {
 	//   - non-nil true: force enabled. Useful to opt into upgrade on
 	//     Protocol=H2C for clients that prefer to negotiate.
 	//   - non-nil false: force disabled, even on Protocol=Auto. Useful when
-	//     the engine intentionally only serves HTTP/1.
+	//     the engine intentionally only serves HTTP/1, or to refuse the
+	//     upgrade handshake (a request-smuggling surface behind some
+	//     proxies): a request carrying Upgrade: h2c is then served as
+	//     plain HTTP/1.1. Prior-knowledge h2c on Auto is not affected.
+	//
+	// Engine: Std does not yet honour non-nil false on Auto: it still
+	// answers an Upgrade: h2c request with 101 (celeris#964). Std is the
+	// only engine on non-Linux platforms and the default there. Epoll,
+	// IOUring and Adaptive honour it.
 	EnableH2Upgrade *bool
 }
 
@@ -330,13 +338,18 @@ func (c Config) toResourceConfig() resource.Config {
 	rc.OnDisconnect = c.OnDisconnect
 
 	// h2c upgrade resolution. Nil → protocol-dependent default (Auto → true,
-	// HTTP1/H2C → false). Non-nil → user override honored verbatim.
+	// HTTP1/H2C → false). Non-nil → user override honored verbatim. The
+	// result goes through SetH2Upgrade so resource.Config.WithDefaults, which
+	// cannot tell an explicit false from unset, leaves it alone: it used to
+	// turn &false back into true on Auto (celeris#964).
+	var enableH2Upgrade bool
 	if c.EnableH2Upgrade != nil {
-		rc.EnableH2Upgrade = *c.EnableH2Upgrade
+		enableH2Upgrade = *c.EnableH2Upgrade
 	} else {
 		p := engine.Protocol(c.Protocol)
-		rc.EnableH2Upgrade = p.IsDefault() || p == engine.Auto
+		enableH2Upgrade = p.IsDefault() || p == engine.Auto
 	}
+	rc.SetH2Upgrade(enableH2Upgrade)
 
 	return rc
 }
