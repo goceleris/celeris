@@ -3,6 +3,7 @@
 package adaptive
 
 import (
+	"os"
 	"testing"
 
 	"github.com/goceleris/celeris/internal/engine"
@@ -33,8 +34,20 @@ func otherEngine(t engine.EngineType) engine.EngineType {
 // or fails under CELERIS_REQUIRE_UPSWITCH=1 as the adaptive CI job sets it
 // (skipOrFailUpswitch662). Any other switch that did not happen is not an
 // environment problem and fails the test at once.
+//
+// A forced switch always leaves the OTHER engine active, so the caller must
+// start from the engine that is not want. A run that starts on io_uring
+// (CELERIS_ADAPTIVE_START=iouring, a high-concurrency workload hint) would
+// switch away from the engine the test asked for; that is a mismatch between
+// the test and its environment, not a missing standby, and it fails here with
+// its own message.
 func forceSwitchTo(t *testing.T, e *Engine, want engine.EngineType) {
 	t.Helper()
+	if before := e.ActiveEngine().Type(); before == want {
+		t.Fatalf("forceSwitchTo(%v): %v is already active and a forced switch would leave %v; this test "+
+			"assumes the run starts on the other engine (CELERIS_ADAPTIVE_START=%q)",
+			want, before, otherEngine(want), os.Getenv("CELERIS_ADAPTIVE_START"))
+	}
 	e.ForceSwitch()
 	got := e.ActiveEngine().Type()
 	if got == want {

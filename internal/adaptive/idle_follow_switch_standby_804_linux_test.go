@@ -58,6 +58,14 @@ func TestIdleFollowSwitchStandbyBuildFailure804(t *testing.T) {
 			idleFollowSwitchWith(t, respHandler{}, false, true, failStandbyBuild804)
 		case "async-revert":
 			idleFollowSwitchWith(t, asyncRespHandler{}, true, true, failStandbyBuild804)
+		case "carry-543-promote":
+			arm := carry543Arms[0]
+			adoptCarriedAsync543(t, arm.name, arm.switches, arm.want, failStandbyBuild804)
+		case "carry-543-revert":
+			arm := carry543Arms[1]
+			adoptCarriedAsync543(t, arm.name, arm.switches, arm.want, failStandbyBuild804)
+		case "abort-791-adopted":
+			abortAdaptive791(t, true, failStandbyBuild804)
 		default:
 			t.Fatalf("unknown cell %q", cell)
 		}
@@ -104,7 +112,7 @@ func TestIdleFollowSwitchStandbyBuildFailure804(t *testing.T) {
 	// Never a crash, never a verdict on a switch that did not happen.
 	forbid := func(t *testing.T, cell, out string) {
 		t.Helper()
-		for _, bad := range []string{"panic:", "SIGSEGV", "PLACEMENT", "LOSS:", "W1:", "W2:", "PREMISE"} {
+		for _, bad := range []string{"panic:", "SIGSEGV", "PLACEMENT", "LOSS:", "W1:", "W2:", "PREMISE", "AdaptiveSwitches =", "the active engine is"} {
 			if strings.Contains(out, bad) {
 				t.Errorf("%s: the child's output contains %q, it must neither crash nor judge a switch "+
 					"that never happened:\n%s", cell, bad, out)
@@ -114,7 +122,8 @@ func TestIdleFollowSwitchStandbyBuildFailure804(t *testing.T) {
 	}
 
 	t.Run("skips", func(t *testing.T) {
-		for _, cell := range []string{"sync-promote", "async-promote", "sync-revert", "async-revert"} {
+		for _, cell := range []string{"sync-promote", "async-promote", "sync-revert", "async-revert",
+			"carry-543-promote", "carry-543-revert", "abort-791-adopted"} {
 			t.Run(cell, func(t *testing.T) {
 				t0 := time.Now()
 				out, exit := run(cell, false)
@@ -131,7 +140,7 @@ func TestIdleFollowSwitchStandbyBuildFailure804(t *testing.T) {
 	})
 
 	t.Run("fails-under-require", func(t *testing.T) {
-		for _, cell := range []string{"sync-revert", "async-promote"} {
+		for _, cell := range []string{"sync-revert", "async-promote", "carry-543-revert", "abort-791-adopted"} {
 			t.Run(cell, func(t *testing.T) {
 				out, exit := run(cell, true)
 				if exit == 0 {

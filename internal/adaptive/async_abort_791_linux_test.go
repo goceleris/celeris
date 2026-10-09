@@ -130,14 +130,17 @@ func abortClass791(err error) string {
 }
 
 func TestAdaptiveAsyncHandlerPanicLeavesTheStartEngineServing(t *testing.T) {
-	abortAdaptive791(t, false)
+	abortAdaptive791(t, false, nil)
 }
 
 func TestAdaptiveAsyncHandlerPanicOnAnAdoptedConnLeavesItsWorkerServing(t *testing.T) {
-	abortAdaptive791(t, true)
+	abortAdaptive791(t, true, nil)
 }
 
-func abortAdaptive791(t *testing.T, adopted bool) {
+// abortAdaptive791 runs one shape. inject, when non-nil, runs on the bound
+// engine before any conn is dialled (celeris#804's regression test uses it to
+// make the io_uring standby fail to build).
+func abortAdaptive791(t *testing.T, adopted bool, inject func(*Engine)) {
 	var hits atomic.Int64
 	logs := &abortLog791{}
 	// Two workers per sub-engine: with abortAdoptConns conns on at most two
@@ -160,6 +163,9 @@ func abortAdaptive791(t *testing.T, adopted bool) {
 	}
 	if e.Addr() == nil {
 		t.Fatal("adaptive engine never bound")
+	}
+	if inject != nil {
+		inject(e)
 	}
 	addr := e.Addr().String()
 	start := e.ActiveEngine().Type()
@@ -201,7 +207,10 @@ func abortAdaptive791(t *testing.T, adopted bool) {
 		if promoted < abortAdoptConns {
 			t.Fatalf("PREMISE: %d of %d conns promoted to their dispatch goroutine on %s", promoted, abortAdoptConns, start)
 		}
-		e.ForceSwitch()
+		// The switch is forced through forceSwitchTo: a lazy io_uring standby
+		// that cannot be built leaves the conns on epoll, which is the
+		// environment, not a PREMISE failure (celeris#804).
+		forceSwitchTo(t, e, engine.IOUring)
 		moved := false
 		for dl := time.Now().Add(abortAdoptBound); time.Now().Before(dl); time.Sleep(25 * time.Millisecond) {
 			if subActive(e, false) == 0 && subActive(e, true) >= abortAdoptConns {
