@@ -78,6 +78,19 @@ func newLateH2(t *testing.T, srv *Server, path string) *lateH2 {
 	return l
 }
 
+// request sends GET path on stream id of an open connection.
+func (l *lateH2) request(id uint32, path string) {
+	l.t.Helper()
+	l.process(lateFrames(l.t, func(fr *http2.Framer, enc *hpack.Encoder, hb *bytes.Buffer) {
+		for _, hf := range []hpack.HeaderField{{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "x"}, {Name: ":path", Value: path}} {
+			_ = enc.WriteField(hf)
+		}
+		_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: hb.Bytes(), EndStream: true, EndHeaders: true})
+	}))
+	l.waitPool()
+	l.drain()
+}
+
 // waitPool waits for the connection's pool handlers (an async route) to have
 // returned and released their streams.
 func (l *lateH2) waitPool() {
@@ -130,7 +143,7 @@ func lateParse(t *testing.T, b []byte) []lateFrame {
 
 // lateServers returns the two routes under test: /sync (a handler on the event
 // loop) and /async (a handler on the worker pool).
-func lateServer(secretSW chan<- *StreamWriter) *Server {
+func lateServer(secretSW chan<- *StreamWriter, inject func()) *Server {
 	srv := New(Config{})
 	h := func(c *Context) error {
 		sw := c.StreamWriter()
@@ -146,6 +159,14 @@ func lateServer(secretSW chan<- *StreamWriter) *Server {
 	srv.GET("/sync", h)
 	srv.GET("/async", h).Async()
 	srv.GET("/hello", func(c *Context) error { return c.Blob(200, "text/plain", []byte("hello-b")) })
+	// /inject runs the late calls while its own stream, likely the pooled
+	// object conn A's writer holds, is the connection's live stream.
+	srv.GET("/inject", func(c *Context) error {
+		if inject != nil {
+			inject()
+		}
+		return c.Blob(200, "text/plain", []byte("hello-3"))
+	})
 	return srv
 }
 
@@ -163,8 +184,15 @@ func TestLateStreamWriterIsRefused904(t *testing.T) {
 			leaks := 0
 			for i := 0; i < tries; i++ {
 				ch := make(chan *StreamWriter, 1)
-				a := newLateH2(t, lateServer(ch), route)
+				var swA *StreamWriter
+				var injectErrs [3]error
+				a := newLateH2(t, lateServer(ch, func() {
+					_, injectErrs[0] = swA.Write(secret)
+					injectErrs[1] = swA.Close()
+					injectErrs[2] = swA.WriteHeader(200, nil)
+				}), route)
 				sw := <-ch
+				swA = sw
 				before := a.bytesWritten()
 
 				// The detached goroutine's calls, after the handler returned.
@@ -182,9 +210,30 @@ func TestLateStreamWriterIsRefused904(t *testing.T) {
 					t.Errorf("try %d: the late calls put %d bytes on conn A's wire, want none: %v", i, len(after)-len(before), lateParse(t, after[len(before):]))
 				}
 
+				// Conn A's next request, stream 3, takes the pooled object conn A's
+				// writer holds (same connection, same manager): the late calls, made
+				// from inside its handler, must not touch it.
+				a.request(3, "/inject")
+				for j, err := range injectErrs {
+					if err == nil {
+						t.Errorf("try %d: late call %d made while stream 3 was live returned nil, want a refusal", i, j)
+					}
+				}
+				var a3 []byte
+				ended3 := false
+				for _, f := range lateParse(t, a.bytesWritten()[len(before):]) {
+					if f.stream == 3 && f.typ == http2.FrameData {
+						a3 = append(a3, f.data...)
+						ended3 = ended3 || f.flags.Has(http2.FlagDataEndStream)
+					}
+				}
+				if string(a3) != "hello-3" || !ended3 {
+					t.Errorf("try %d: conn A's stream 3 body = %q (ended=%v), want %q ended: the late calls reached the next stream of the same connection", i, a3, ended3, "hello-3")
+				}
+
 				// Connection B, whose stream is likely the very object conn A's
 				// writer holds.
-				b := newLateH2(t, lateServer(make(chan *StreamWriter, 1)), "/hello")
+				b := newLateH2(t, lateServer(make(chan *StreamWriter, 1), nil), "/hello")
 				b.grant(1 << 20)
 				wire := b.bytesWritten()
 				if bytes.Contains(wire, []byte("SECRET-of-conn-A")) {

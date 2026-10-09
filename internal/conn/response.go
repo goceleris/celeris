@@ -1215,7 +1215,7 @@ func (a *h2ResponseAdapter) WriteHeaderUse(s *stream.Stream, gen uint64, status 
 //     the windows allow and waits for the rest (Stream.AwaitSendWindow), the
 //     way net/http's server blocks a handler's Write on flow control. The wait
 //     takes the same WriteTimeout deadline #906 gives WriteResponse's
-//     (sendRest), counted from this call, so a peer that withholds window cannot
+//     (sendRest), counted from the moment this call first has to wait, so a peer that withholds window cannot
 //     hold the goroutine, or a sync handler waiting on a lock it holds, for
 //     good: then the stream is reset with INTERNAL_ERROR and Write returns an
 //     error wrapping os.ErrDeadlineExceeded. One deadline per Write, not per
@@ -1229,6 +1229,10 @@ func (a *h2ResponseAdapter) WriteHeaderUse(s *stream.Stream, gen uint64, status 
 //     not limit here: a slow inline stream can push its connection over budget,
 //     and its later sync GETs then run on the pool), and the loop sends it as
 //     the peer grants window. Write returns at once.
+//
+// A StreamWriter that outlives its handler is refused (WriteUse): on HTTP/2 the
+// stream ends when the handler returns, so a goroutine it started that writes
+// later gets stream.ErrStreamEnded, and nothing is sent or buffered.
 //
 // Without a manager (adapters built by unit tests) there is no flow control.
 func (a *h2ResponseAdapter) Write(s *stream.Stream, data []byte) error {

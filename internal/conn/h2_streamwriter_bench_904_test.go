@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -49,7 +50,10 @@ func BenchmarkStreamWriterWrite904(b *testing.B) {
 			if mode == "inline" {
 				h = &syncHandler893{run: run}
 			}
-			st = NewH2State(h, H2Config{}, func([]byte) {}, nil)
+			// The server's default WriteTimeout (60 s), which is what a pool
+			// Write's deadline is computed from: a bench with none would not
+			// measure the clock reads the deadline can cost.
+			st = NewH2State(h, H2Config{WriteTimeout: time.Minute}, func([]byte) {}, nil)
 			b.Cleanup(func() { st.processor.GetManager().Close() })
 			in := append([]byte(http2.ClientPreface), frames893(&testing.T{}, func(fr *http2.Framer, enc *hpack.Encoder, hb *bytes.Buffer) {
 				_ = fr.WriteSettings()

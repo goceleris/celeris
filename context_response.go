@@ -1673,6 +1673,12 @@ func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 // sent as the peer grants window. When Write returns an error it reports 0
 // bytes written, though part of the chunk may already have been sent, and
 // [StreamWriter.BytesWritten] does not count it.
+//
+// On HTTP/2 the stream ends when the handler returns, detached or not (see
+// [Context.Detach]): a Write, WriteHeader or Close from a goroutine that
+// outlived the handler returns an error and sends nothing, so it can never
+// reach another request's response. Finish the stream before the handler
+// returns.
 func (sw *StreamWriter) Write(data []byte) (int, error) {
 	sw.markUsed()
 	var err error
@@ -1732,6 +1738,11 @@ func (sw *StreamWriter) Close() error {
 //
 // On native engines (epoll, io_uring), the caller must call [Context.Detach]
 // before spawning a goroutine that uses the StreamWriter. Call Close() when done.
+// On HTTP/2 that goroutine must finish the stream before the handler returns
+// (join it, as the sse middleware does): the stream ends with the handler,
+// detached or not, and a StreamWriter call after that returns an error and
+// sends nothing. On HTTP/1 the stream lives until the detached goroutine is
+// done.
 func (c *Context) StreamWriter() *StreamWriter {
 	// Streaming is fundamentally incompatible with response buffering:
 	// buffered responses are held in memory for possible mutation/discard,
