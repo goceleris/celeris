@@ -172,7 +172,7 @@ func (br *BufferRing) GetBuffer(bufID uint16, dataLen int) []byte {
 // The cost is paid in steady state, on top of the mapped ring: the kernel
 // cycles through the buffer IDs, so after about count hijacks nearly every
 // slot is heap-backed, and the ring then holds count x bufferSize bytes of
-// live Go heap (8 MiB per worker at the defaults, up to bufRingCountMax x
+// live Go heap (8 MiB per worker at the smallest ring, 1024 buffers of 8 KiB; up to bufRingCountMax x
 // BufferSize), which the mmap design of NewBufferRing exists to keep off the
 // heap, besides the mapped pages that are never reused. The alternative, a
 // pool of replacements mapped outside the heap, would put the unmapping of

@@ -1303,9 +1303,9 @@ func (c *Context) BytesWritten() int {
 // ring: each slot a hijack retires is replaced by a heap buffer of the same
 // size, which is live Go heap while the engine runs, and the slot's own
 // pages stay mapped. Each is at most one ring's worth per worker (the ring's
-// buffer count times the buffer size, 8 MiB at the default 1024 buffers of
-// 8 KiB), reached after about as many hijacks as the ring has buffers and
-// not grown by more; the mapped pages are kept per engine start. Hijack
+// buffer count times the buffer size: at least 1024 buffers, which is 8 MiB
+// at 8 KiB each), reached after about as many hijacks as the ring has buffers
+// and not grown by more; the mapped pages are kept per engine start. Hijack
 // also copies the request values the Context holds, as [Context.Detach]
 // does, so the path, params, headers, query, cookies and body read from the
 // Context after Hijack are copies.
