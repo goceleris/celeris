@@ -70,3 +70,48 @@ func BenchmarkStreamWriterWrite904(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkWriteResponsePool904 is the cost of WriteResponse (one 1 KiB body)
+// from a pool goroutine: the hot response path of an async route, which this
+// change reorders (HEADERS and the first DATA are queued before the rest is
+// buffered) and gives a test seam (h2BeforeEnqueueHook, one load and a nil
+// check). The same stream answers every iteration, with the windows and the
+// queue topped up every 1024, as in BenchmarkStreamWriterWrite904.
+func BenchmarkWriteResponsePool904(b *testing.B) {
+	body := make([]byte, 1024)
+	done := make(chan struct{})
+	var st *H2State
+	run := func(_ context.Context, s *stream.Stream) error {
+		defer close(done)
+		mgr := st.processor.GetManager()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if i&1023 == 0 {
+				s.SetWindowSize(1 << 30)
+				mgr.UpdateConnectionWindow(1<<21 - mgr.GetConnectionWindow())
+				st.DrainWriteQueue(func([]byte) {})
+			}
+			if err := s.ResponseWriter.WriteResponse(s, 200, nil, body); err != nil {
+				return err
+			}
+		}
+		b.StopTimer()
+		return nil
+	}
+	h := &asyncHandler893{run: run}
+	st = NewH2State(h, H2Config{WriteTimeout: time.Minute}, func([]byte) {}, nil)
+	b.Cleanup(func() { st.processor.GetManager().Close() })
+	in := append([]byte(http2.ClientPreface), frames893(&testing.T{}, func(fr *http2.Framer, enc *hpack.Encoder, hb *bytes.Buffer) {
+		_ = fr.WriteSettings()
+		hb.Reset()
+		for _, hf := range []hpack.HeaderField{{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "x"}, {Name: ":path", Value: "/b"}} {
+			_ = enc.WriteField(hf)
+		}
+		_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: hb.Bytes(), EndStream: true, EndHeaders: true})
+	})...)
+	if err := ProcessH2(context.Background(), in, st, h, func([]byte) {}, H2Config{}); err != nil {
+		b.Fatal(err)
+	}
+	<-done
+}
