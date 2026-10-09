@@ -98,7 +98,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Conformance
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
@@ -141,7 +141,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Conformance
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
@@ -184,7 +184,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Conformance (Redis driver against Valkey)
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
@@ -223,7 +223,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Conformance
         run: >-
           go test -tags memcached -race -count=1 -timeout=300s
@@ -278,7 +278,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Cluster conformance
         run: >-
           go test -tags memcached_cluster -race -count=1 -timeout=300s
@@ -313,7 +313,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Start cluster
         run: |
           docker compose -f test/conformance/redis/docker-compose.cluster.yml up -d
@@ -401,7 +401,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Start sentinel stack
         run: |
           docker compose -f test/conformance/redis/docker-compose.sentinel.yml up -d
