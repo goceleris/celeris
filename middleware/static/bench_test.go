@@ -1,6 +1,9 @@
 package static
 
 import (
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -106,5 +109,79 @@ func BenchmarkStaticServeRangeIfRange(b *testing.B) {
 		ctx, _ := celeristest.NewContext("GET", "/style.css", opts...)
 		_ = ctx.Next()
 		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// rootBench846 writes app.js (4 KiB) and app.js.gz (1 KiB) under a temp dir
+// and returns the middleware serving it (celeris#846: the Root path's
+// validators and 304 come from the file as it is opened, and from the
+// pre-compressed variant when one is served).
+func rootBench846(b *testing.B, compress bool) celeris.HandlerFunc {
+	b.Helper()
+	dir := b.TempDir()
+	mod := time.Unix(1_700_000_000, 0)
+	for name, n := range map[string]int{"app.js": 4096, "app.js.gz": 1024} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, make([]byte, n), 0o600); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.Chtimes(p, mod, mod); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return New(Config{Root: dir, MaxAge: time.Hour, Compress: compress})
+}
+
+func benchRoot846(b *testing.B, mw celeris.HandlerFunc, hdr ...string) {
+	b.Helper()
+	noop := func(_ *celeris.Context) error { return nil }
+	opts := []celeristest.Option{celeristest.WithHandlers(mw, noop)}
+	for i := 0; i+1 < len(hdr); i += 2 {
+		opts = append(opts, celeristest.WithHeader(hdr[i], hdr[i+1]))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/app.js", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkStaticServeFromRoot serves a file of the Root directory.
+func BenchmarkStaticServeFromRoot(b *testing.B) { benchRoot846(b, rootBench846(b, false)) }
+
+// BenchmarkStaticServeFromRootNotModified answers an If-None-Match that holds.
+func BenchmarkStaticServeFromRootNotModified(b *testing.B) {
+	benchRoot846(b, rootBench846(b, false), "if-none-match", `W/"6553f100-1000"`)
+}
+
+// BenchmarkStaticServeFromRootCompress serves the .gz variant of a Root file.
+func BenchmarkStaticServeFromRootCompress(b *testing.B) {
+	benchRoot846(b, rootBench846(b, true), "accept-encoding", "gzip")
+}
+
+// BenchmarkStaticServeFromRootRange serves a single range of a Root file.
+func BenchmarkStaticServeFromRootRange(b *testing.B) {
+	benchRoot846(b, rootBench846(b, false), "range", "bytes=2-9")
+}
+
+// BenchmarkStaticFSColdFill is the first request for a file of an fs.FS: it
+// reads the file and, since celeris#846, hashes it for the strong ETag. Each
+// iteration is a new middleware, so the cache is empty.
+func BenchmarkStaticFSColdFill(b *testing.B) {
+	for _, size := range []int{1 << 10, 64 << 10, 1 << 20} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			mapFS := fstest.MapFS{"app.js": {Data: make([]byte, size), ModTime: time.Unix(1_700_000_000, 0)}}
+			noop := func(_ *celeris.Context) error { return nil }
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			for b.Loop() {
+				mw := New(Config{FS: mapFS})
+				ctx, _ := celeristest.NewContext("GET", "/app.js", celeristest.WithHandlers(mw, noop))
+				_ = ctx.Next()
+				celeristest.ReleaseContext(ctx)
+			}
+		})
 	}
 }
