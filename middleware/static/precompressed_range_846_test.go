@@ -381,3 +381,39 @@ func TestOSValidatorsDescribeTheServedFile846(t *testing.T) {
 			rec.StatusCode, rec.Header("content-range"), lm, etag, rec.Body, len(rec.Body), len(v2), rec.Body)
 	}
 }
+
+// TestIndexFile304846: a request for a directory is answered with its index
+// file, and its 304 is decided against the index file's validators, not the
+// directory's.
+func TestIndexFile304846(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "index.html")
+	write := func(data []byte, mt time.Time) {
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	v1, v2 := version435(30, 0), version435(45, 7)
+	write(v1, gz1Time846)
+	mw := New(Config{Root: dir})
+	get := func(hdr ...string) *celeristest.ResponseRecorder {
+		opts := make([]celeristest.Option, 0, len(hdr)/2)
+		for i := 0; i+1 < len(hdr); i += 2 {
+			opts = append(opts, celeristest.WithHeader(hdr[i], hdr[i+1]))
+		}
+		rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/", opts...)
+		testutil.AssertNoError(t, err)
+		return rec
+	}
+	first := get()
+	testutil.AssertHeader(t, first, "etag", weak846(gz1Time846, len(v1)))
+	testutil.AssertStatus(t, get("if-none-match", first.Header("etag")), 304)
+	write(v2, gz2Time846)
+	rec := get("if-none-match", first.Header("etag"))
+	if rec.StatusCode != 200 || !bytes.Equal(rec.Body, v2) {
+		t.Fatalf("If-None-Match of the old index after it changed: status %d (%d bytes); want 200 with the new index", rec.StatusCode, len(rec.Body))
+	}
+}

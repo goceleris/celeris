@@ -926,8 +926,8 @@ func (c *Context) File(filePath string) error {
 // its size and mtime are read from the open descriptor, before anything is
 // decided about the response: middleware/static sets its validators from them
 // there, so they describe the bytes that are sent even when the path is
-// replaced meanwhile (celeris#846), and answers a 304 (handled=true).
-func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64) (handled bool, err error)) error {
+// replaced meanwhile (celeris#846).
+func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -941,9 +941,7 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 	size := stat.Size()
 
 	if onOpen != nil {
-		if handled, err := onOpen(stat.ModTime(), size); handled {
-			return err
-		}
+		onOpen(stat.ModTime(), size)
 	}
 
 	if size > int64(maxStreamBodySize) {
@@ -1064,7 +1062,7 @@ func (c *Context) FileFromDir(baseDir, userPath string) error {
 }
 
 // fileFromDir is FileFromDir with serveFile's contentType and onOpen.
-func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64) (bool, error)) error {
+func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
 	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {

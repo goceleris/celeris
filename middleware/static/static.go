@@ -169,6 +169,7 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 		indexInfo, indexErr := os.Stat(indexPath)
 		if indexErr == nil && !indexInfo.IsDir() {
 			filePath = filepath.Join(filePath, index)
+			info = indexInfo
 		} else if browse {
 			// Resolve symlinks and recheck to prevent symlink escape,
 			// mirroring the protection in Context.FileFromDir.
@@ -193,16 +194,17 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 		serveOSHook()
 	}
 
-	// The validators and the 304 come from the file as it is opened for
-	// serving (serveOSFile), and from the pre-compressed variant when one is
-	// served: the stat above only decided that there is a file.
+	// The validators of a response that sends the file come from the file as
+	// it is opened for serving (serveOSFile), and from the pre-compressed
+	// variant when one is served; this stat only decided that there is a file,
+	// and answers a 304.
 	if compress {
 		if served, err := servePreCompressed(c, cleanRoot, filePath, fullPath, cacheControl); served {
 			return err
 		}
 	}
 
-	return serveOSFile(c, cleanRoot, filePath, "", "", cacheControl)
+	return serveOSFile(c, cleanRoot, filePath, "", "", cacheControl, info)
 }
 
 // serveOSHook is a test seam (celeris#846 item 4): when set it runs in serveOS
@@ -211,26 +213,33 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 var serveOSHook func()
 
 // serveOSFile serves filePath under cleanRoot through Context.FileFromDir.
-// Last-Modified, ETag and Cache-Control are set from the mtime and size of the
-// file as it is opened, and an If-None-Match or If-Modified-Since that holds
-// for them gets the 304; a stat made earlier could describe another file than
-// the one opened when the path is replaced in between (celeris#846). So the
-// Range and If-Range that File then decides are about the very bytes sent.
+// early is a stat of the path made just before.
+//
+// A conditional request is answered from early when it holds: a 304 sends no
+// body, so there is nothing for a replaced file to contradict, and it costs one
+// stat, as it always did (FileFromDir resolves symlinks twice and opens the
+// file). Every response that sends the file gets its Last-Modified, ETag and
+// Cache-Control from the mtime and size of the file as it is opened: early
+// could describe another file than the one opened when the path is replaced in
+// between (celeris#846). So the Range and If-Range that File then decides are
+// about the very bytes sent.
 //
 // contentType, when not empty, is the response's type (a pre-compressed
 // variant is served with its original's, not the one its ".gz" maps to).
 // encoding, when not empty, is set as Content-Encoding on the response that
 // carries the file, not on a 304; File drops it again from a 416.
-func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding, cacheControl string) error {
-	return ctxkit.FileFromDir(c, cleanRoot, filePath, contentType, func(modTime time.Time, size int64) (bool, error) {
-		etag := setCacheHeaders(c, modTime, size, cacheControl)
-		if notModified(c, etag, modTime) {
-			return true, c.NoContent(304)
+func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding, cacheControl string, early os.FileInfo) error {
+	if c.Header("if-none-match") != "" || c.Header("if-modified-since") != "" {
+		etag := setCacheHeaders(c, early.ModTime(), early.Size(), cacheControl)
+		if notModified(c, etag, early.ModTime()) {
+			return c.NoContent(304)
 		}
+	}
+	return ctxkit.FileFromDir(c, cleanRoot, filePath, contentType, func(modTime time.Time, size int64) {
+		setCacheHeaders(c, modTime, size, cacheControl)
 		if encoding != "" {
 			c.SetHeader("content-encoding", encoding)
 		}
-		return false, nil
 	})
 }
 
@@ -251,7 +260,8 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cache
 		if !strings.Contains(ae, v.encoding) {
 			continue
 		}
-		if _, err := os.Stat(fullPath + v.suffix); err != nil {
+		vi, err := os.Stat(fullPath + v.suffix)
+		if err != nil {
 			continue
 		}
 		ct := mime.TypeByExtension(filepath.Ext(filePath))
@@ -260,7 +270,7 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cache
 		}
 		// Vary goes out on the 304 too.
 		addVary(c)
-		return true, serveOSFile(c, cleanRoot, filePath+v.suffix, ct, v.encoding, cacheControl)
+		return true, serveOSFile(c, cleanRoot, filePath+v.suffix, ct, v.encoding, cacheControl, vi)
 	}
 
 	return false, nil
