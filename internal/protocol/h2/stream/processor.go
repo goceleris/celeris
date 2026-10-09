@@ -761,7 +761,13 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 
 	stream.SetHandlerStarted()
 
-	if err := p.handler.HandleStream(bgCtx, stream); err != nil {
+	err := p.handler.HandleStream(bgCtx, stream)
+	// The handler is over: on HTTP/2 the stream ends with it, detached or not
+	// (Context.Detach). A StreamWriter call from a goroutine it started is
+	// refused from here on, before the check for buffered DATA below, so
+	// nothing is added to what the stream keeps (celeris#904).
+	stream.EndUse()
+	if err != nil {
 		return
 	}
 
@@ -777,10 +783,11 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 	// and clean up the stream when the window opens. Without this, the
 	// stream is removed and buffered DATA is never sent.
 	// Fixes h2spec: WINDOW_UPDATE/PRIORITY on half-closed + negative SETTINGS.
-	stream.mu.RLock()
-	hasPending := stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0
-	stream.mu.RUnlock()
-	if hasPending {
+	// A handler that returned without ending its response (a StreamWriter
+	// never closed) has the buffer sent all the same, but no END_STREAM, and
+	// the stream is released when it is out (AbandonOutbound): it would
+	// otherwise hold its slot and its budget until the connection closes.
+	if stream.AbandonOutbound() {
 		keepAlive = true
 		return
 	}
@@ -866,7 +873,9 @@ func (p *Processor) executeHandler(stream *Stream) {
 
 	stream.SetHandlerStarted()
 
-	if err := p.handler.HandleStream(bgCtx, stream); err != nil {
+	err := p.handler.HandleStream(bgCtx, stream)
+	stream.EndUse() // as in executeHandlerInline
+	if err != nil {
 		return
 	}
 

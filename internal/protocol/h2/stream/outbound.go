@@ -169,17 +169,56 @@ func (s *Stream) AwaitSendWindow(deadline time.Time) error {
 	if m == nil {
 		return nil
 	}
-	open := func() bool { return m.WindowsOpen(s) }
 	if s.IsCancelled() {
 		return context.Canceled
 	}
 	if !deadline.IsZero() && !time.Now().Before(deadline) {
 		return os.ErrDeadlineExceeded
 	}
-	if open() {
+	if m.WindowsOpen(s) {
 		return nil
 	}
+	return s.awaitSendWindow(m, s.Context().Done(), deadline)
+}
+
+// AwaitSendWindowUse is AwaitSendWindow for a StreamWriter, which may outlive
+// its handler (celeris#904): gen is its use token (Stream.Gen), and the call
+// returns ErrStreamEnded once that use is over, never touching the object's
+// next use. It also starts the deadline late: *deadline is set to timeout
+// from now (if timeout > 0 and *deadline is still zero) only when the call has
+// to wait, so a Write that finds the windows open reads no clock. A set
+// deadline is kept across calls, so it bounds the whole of one Write.
+func (s *Stream) AwaitSendWindowUse(gen uint64, timeout time.Duration, deadline *time.Time) error {
+	if err := s.UseLock(gen); err != nil {
+		return err
+	}
+	m := s.manager
+	if m == nil {
+		s.UseUnlock()
+		return ErrStreamEnded
+	}
+	if !deadline.IsZero() && !time.Now().Before(*deadline) {
+		s.UseUnlock()
+		return os.ErrDeadlineExceeded
+	}
+	if m.WindowsOpen(s) {
+		s.UseUnlock()
+		return nil
+	}
+	if deadline.IsZero() && timeout > 0 {
+		*deadline = time.Now().Add(timeout)
+	}
+	// This use's context, taken while the use is known to be live: a context
+	// made after the object was reset would be handed to its next use.
 	done := s.Context().Done()
+	s.UseUnlock()
+	return s.awaitSendWindow(m, done, *deadline)
+}
+
+// awaitSendWindow is the wait of AwaitSendWindow and AwaitSendWindowUse: m
+// and done are the live use's, taken by the caller.
+func (s *Stream) awaitSendWindow(m *Manager, done <-chan struct{}, deadline time.Time) error {
+	open := func() bool { return m.WindowsOpen(s) }
 	// Counted before the channel is taken and the windows re-checked, so a
 	// notifier that grants window either sees the waiter (and closes the
 	// channel it holds) or granted before the re-check (which sees it).
@@ -249,35 +288,76 @@ func clampWindowRequest(n int) int32 {
 
 // FlushOutbound sends as much of s's buffered DATA as both of its send
 // windows allow, reserving and debiting both (RFC 9113 §6.9.1) for exactly the
-// bytes it sends, and reports whether that was the whole buffer and it carried
-// END_STREAM: the stream is then fully sent. Whatever the windows refuse stays
-// buffered for the next WINDOW_UPDATE. It is called on the event loop for a
-// WINDOW_UPDATE or SETTINGS_INITIAL_WINDOW_SIZE, and by a pool handler that has
-// just buffered the tail of its response (celeris#903).
+// bytes it sends, and reports whether that was the whole buffer and the stream
+// is done: it carried END_STREAM (the handler ended the response), or the
+// handler returned without ending it (abandoned; nothing more will come, and
+// the stream is to be released without END_STREAM). Whatever the windows
+// refuse stays buffered for the next WINDOW_UPDATE. It is called on the event
+// loop for a WINDOW_UPDATE or SETTINGS_INITIAL_WINDOW_SIZE, and by a pool
+// handler that has just buffered the tail of its response (celeris#903).
 //
 // The stream's lock is held from the reservation to the send, so two callers
 // never send the same bytes, and what is sent is dropped from the front of
 // the buffer in place (bytes.Buffer.Next): the work of a flush is in
 // proportion to the bytes it sends, not to the bytes that stay buffered
-// (celeris#911).
+// (celeris#911). A stream that is no longer m's (released, and perhaps in use
+// on another connection) is left alone.
 func (m *Manager) FlushOutbound(s *Stream, send OutboundSend) (finished bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	buf := s.OutboundBuffer
-	if buf == nil || buf.Len() == 0 {
+	if s.manager != m || buf == nil || buf.Len() == 0 {
 		return false
 	}
 	n := int(m.ReserveSendWindow(s, clampWindowRequest(buf.Len())))
 	if n <= 0 {
 		return false // no room on at least one window: everything stays buffered
 	}
-	finished = n == buf.Len() && s.OutboundEndStream
-	send(s.ID, finished, buf.Next(n))
+	last := n == buf.Len()
+	end := last && s.OutboundEndStream
+	finished = last && (s.OutboundEndStream || s.outboundAbandoned)
+	send(s.ID, end, buf.Next(n))
 	m.refundOutbound(n) // celeris#893
 	if buf.Len() == 0 {
 		buf.Reset()
 	}
 	return finished
+}
+
+// UseState reports, for a StreamWriter call that presents use token gen, what
+// the call needs to know about s, read under the lock that keeps the use from
+// ending meanwhile: the stream's ID, whether the response has no body (HEAD),
+// and whether its handler runs on the worker pool (RunsOnPool). It returns
+// why the call is refused if the use is over (see UseLock).
+func (s *Stream) UseState(gen uint64) (id uint32, head, onPool bool, err error) {
+	if err = s.UseLock(gen); err != nil {
+		return 0, false, false, err
+	}
+	id, head, onPool = s.ID, s.IsHEAD, s.RunsOnPool()
+	s.UseUnlock()
+	return id, head, onPool, nil
+}
+
+// SendWindowed sends the part of data that both of s's send windows allow now,
+// for a pool handler's StreamWriter (celeris#904): it reserves from both
+// windows and calls send for exactly that many bytes, returning the count (0
+// when a window is shut). The check that gen is still s's use, the
+// reservation and the send are one step under the stream's lock, so a write
+// that outlived its handler debits no window of the object's next use and
+// sends nothing for it. Called in a loop with AwaitSendWindowUse.
+func (m *Manager) SendWindowed(s *Stream, gen uint64, data []byte, send OutboundSend) (int, error) {
+	if err := s.UseLock(gen); err != nil {
+		return 0, err
+	}
+	defer s.UseUnlock()
+	if s.manager != m {
+		return 0, ErrStreamEnded
+	}
+	n := int(m.ReserveSendWindow(s, clampWindowRequest(len(data))))
+	if n > 0 {
+		send(s.ID, false, data[:n])
+	}
+	return n, nil
 }
 
 // SendOrBufferOutbound sends data on s for a caller that cannot wait for the
@@ -288,12 +368,26 @@ func (m *Manager) FlushOutbound(s *Stream, send OutboundSend) (finished bool) {
 // so the bytes of one stream reach the connection in the order they were
 // written. Whether to send or buffer is decided under the stream's lock, so a
 // flush on the event loop and a detached goroutine's write cannot reorder.
-func (m *Manager) SendOrBufferOutbound(s *Stream, data []byte, send OutboundSend) {
+//
+// gen is the caller's use token (Stream.Gen). The call is refused with
+// ErrStreamEnded when that use is over, and with the context error when the
+// peer reset the stream or the connection closed: it sends and buffers
+// nothing, and charges nothing to the budget. This is decided under the same
+// lock as the release of the stream, so a goroutine that outlived its handler
+// cannot put bytes in an object that is on its way to the pool, or in the
+// pool, or already in use for another stream.
+func (m *Manager) SendOrBufferOutbound(s *Stream, gen uint64, data []byte, send OutboundSend) error {
 	if len(data) == 0 {
-		return
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.useErr(gen); err != nil {
+		return err
+	}
+	if s.manager != m {
+		return ErrStreamEnded
+	}
 	n := 0
 	if s.OutboundBuffer == nil || s.OutboundBuffer.Len() == 0 {
 		n = int(m.ReserveSendWindow(s, clampWindowRequest(len(data))))
@@ -308,18 +402,45 @@ func (m *Manager) SendOrBufferOutbound(s *Stream, data []byte, send OutboundSend
 		s.OutboundBuffer.Write(data[n:])
 		m.chargeOutbound(len(data) - n)
 	}
+	return nil
 }
 
 // EndOutbound ends s's response body (celeris#904): END_STREAM goes to send
 // at once when nothing is buffered, and otherwise rides on the last of the
 // buffered DATA, which the flush sends as the peer grants window, so that
 // END_STREAM never reaches the connection ahead of DATA written before it.
-func (m *Manager) EndOutbound(s *Stream, send OutboundSend) {
+// It is refused, sending and marking nothing, when gen is no longer s's use
+// or the stream was reset (RFC 9113 §5.1: no frame follows a RST_STREAM),
+// as SendOrBufferOutbound is.
+func (m *Manager) EndOutbound(s *Stream, gen uint64, send OutboundSend) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.useErr(gen); err != nil {
+		return err
+	}
+	if s.manager != m {
+		return ErrStreamEnded
+	}
 	if s.OutboundBuffer != nil && s.OutboundBuffer.Len() > 0 {
 		s.OutboundEndStream = true
-		return
+		return nil
 	}
 	send(s.ID, true, nil)
+	return nil
+}
+
+// AbandonOutbound is called when an inline handler returns with DATA still
+// buffered (celeris#904). A StreamWriter that was never closed leaves the
+// response unended; the buffer is still sent as the peer grants window, and
+// the stream is released once it is out, but END_STREAM is not invented: a
+// truncated body must not look complete to the client. It reports whether
+// anything is buffered, that is whether the stream stays for the event loop.
+func (s *Stream) AbandonOutbound() (pending bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending = s.OutboundBuffer != nil && s.OutboundBuffer.Len() > 0
+	if pending && !s.OutboundEndStream {
+		s.outboundAbandoned = true
+	}
+	return pending
 }

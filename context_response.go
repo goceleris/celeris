@@ -1627,8 +1627,15 @@ func appendClone(buf *[]byte, s string) string {
 // [Context.BytesWritten]. The counter uses atomic operations and is safe
 // for use from a detached goroutine.
 type StreamWriter struct {
-	streamer     stream.Streamer
-	stream       *stream.Stream
+	streamer stream.Streamer
+	stream   *stream.Stream
+	// use, when set, is the streamer taken as a stream.UseStreamer and gen the
+	// stream's use token from when the writer was made: on HTTP/2 the stream
+	// ends when the handler returns, and a call that arrives later is refused
+	// instead of acting on whatever the pooled stream serves next
+	// (celeris#904).
+	use          stream.UseStreamer
+	gen          uint64
 	bytesWritten atomic.Int64
 	// used is the owning Context's streamUsed, shared by every StreamWriter
 	// taken on the request. Set by the first WriteHeader, Write, Flush or
@@ -1647,6 +1654,9 @@ func (sw *StreamWriter) markUsed() {
 // WriteHeader sends the status line and headers. Must be called once before Write.
 func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 	sw.markUsed()
+	if sw.use != nil {
+		return sw.use.WriteHeaderUse(sw.stream, sw.gen, status, headers)
+	}
 	return sw.streamer.WriteHeader(sw.stream, status, headers)
 }
 
@@ -1665,7 +1675,12 @@ func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 // [StreamWriter.BytesWritten] does not count it.
 func (sw *StreamWriter) Write(data []byte) (int, error) {
 	sw.markUsed()
-	err := sw.streamer.Write(sw.stream, data)
+	var err error
+	if sw.use != nil {
+		err = sw.use.WriteUse(sw.stream, sw.gen, data)
+	} else {
+		err = sw.streamer.Write(sw.stream, data)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -1689,6 +1704,9 @@ func (sw *StreamWriter) Flush() error {
 // the owning Context so that [Context.BytesWritten] reflects the total.
 func (sw *StreamWriter) Close() error {
 	sw.markUsed()
+	if sw.use != nil {
+		return sw.use.CloseUse(sw.stream, sw.gen)
+	}
 	return sw.streamer.Close(sw.stream)
 }
 
@@ -1737,6 +1755,9 @@ func (c *Context) StreamWriter() *StreamWriter {
 	c.extended = true
 	c.written = true
 	sw := &StreamWriter{streamer: s, stream: c.stream, used: &c.streamUsed}
+	if u, ok := s.(stream.UseStreamer); ok {
+		sw.use, sw.gen = u, c.stream.Gen()
+	}
 	c.streamWriter = sw
 	return sw
 }

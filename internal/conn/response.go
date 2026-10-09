@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -497,6 +498,10 @@ func h2ReserveSend(mgr *stream.Manager, s *stream.Stream, n int) int {
 	if n <= 0 {
 		return 0
 	}
+	// A request over MaxInt32 is asked for as MaxInt32: int32(n) wraps to
+	// zero or a negative number, which the windows refuse, and a loop that
+	// waits for them to open would spin on a Write of 2 GiB or more.
+	n = min(n, math.MaxInt32)
 	if mgr != nil {
 		return int(mgr.ReserveSendWindow(s, int32(n)))
 	}
@@ -661,7 +666,20 @@ func (a *h2InlineResponseAdapter) Close(s *stream.Stream) error {
 	return a.queue.Close(s)
 }
 
+func (a *h2InlineResponseAdapter) WriteHeaderUse(s *stream.Stream, gen uint64, status int, headers [][2]string) error {
+	return a.queue.WriteHeaderUse(s, gen, status, headers)
+}
+
+func (a *h2InlineResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) error {
+	return a.queue.WriteUse(s, gen, data)
+}
+
+func (a *h2InlineResponseAdapter) CloseUse(s *stream.Stream, gen uint64) error {
+	return a.queue.CloseUse(s, gen)
+}
+
 var _ stream.Streamer = (*h2InlineResponseAdapter)(nil)
+var _ stream.UseStreamer = (*h2InlineResponseAdapter)(nil)
 
 type h2ResponseAdapter struct {
 	write        func([]byte)
@@ -942,6 +960,18 @@ func (a *h2ResponseAdapter) resetStream(s *stream.Stream, code http2.ErrCode) {
 	s.Cancel()
 }
 
+// resetStreamUse is resetStream for a StreamWriter, which may outlive its
+// handler (celeris#904): it does nothing once gen is no longer the stream's
+// use, so it neither sends a RST_STREAM for the object's next stream nor
+// cancels that stream.
+func (a *h2ResponseAdapter) resetStreamUse(s *stream.Stream, gen uint64, code http2.ErrCode) {
+	if s.UseLock(gen) != nil {
+		return
+	}
+	defer s.UseUnlock()
+	a.resetStream(s, code)
+}
+
 // SendGoAway writes a GOAWAY frame via the shared writer.
 // Called from the event loop under H2State.mu — no adapter mutex needed.
 func (a *h2ResponseAdapter) SendGoAway(lastStreamID uint32, code http2.ErrCode, debug []byte) error {
@@ -1132,6 +1162,17 @@ func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
 // matching the WriteResponse path for async handler safety.
 
 func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers [][2]string) error {
+	return a.WriteHeaderUse(s, s.Gen(), status, headers)
+}
+
+// WriteHeaderUse is WriteHeader for a StreamWriter: it is refused, queueing
+// nothing and marking nothing on the stream, once gen is no longer the
+// stream's use (celeris#904).
+func (a *h2ResponseAdapter) WriteHeaderUse(s *stream.Stream, gen uint64, status int, headers [][2]string) error {
+	if err := s.UseLock(gen); err != nil {
+		return err
+	}
+	defer s.UseUnlock()
 	enc := getH2StreamEncoder()
 
 	var hdrBuf [16][2]string
@@ -1191,38 +1232,53 @@ func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers []
 //
 // Without a manager (adapters built by unit tests) there is no flow control.
 func (a *h2ResponseAdapter) Write(s *stream.Stream, data []byte) error {
-	// RFC 9110 §9.3.2 / RFC 9113 §8.1.1: no DATA payload on a HEAD
-	// response. Close still ends the stream with an empty DATA frame.
-	if s.IsHEAD || len(data) == 0 {
-		return nil
-	}
+	return a.WriteUse(s, s.Gen(), data)
+}
+
+// WriteUse is Write for a StreamWriter (UseStreamer): gen is the use token it
+// took when it was made. Once the stream's use is over (its handler returned,
+// it was released, the peer reset it) the call is refused with an error and
+// sends, buffers and charges nothing (celeris#904); every step that touches
+// the stream is checked against gen under the lock its release takes.
+func (a *h2ResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) error {
 	m := a.manager
 	if m == nil {
+		// RFC 9110 §9.3.2 / RFC 9113 §8.1.1: no DATA payload on a HEAD
+		// response. Close still ends the stream with an empty DATA frame.
+		if s.IsHEAD || len(data) == 0 {
+			return nil
+		}
 		a.sendData(s.ID, false, data)
 		return nil
 	}
-	if !s.RunsOnPool() {
-		m.SendOrBufferOutbound(s, data, a.sendData)
+	id, head, onPool, err := s.UseState(gen)
+	if err != nil {
+		return err
+	}
+	if head || len(data) == 0 {
 		return nil
 	}
-	var deadline time.Time
-	if a.writeTimeout > 0 {
-		deadline = time.Now().Add(a.writeTimeout)
+	if !onPool {
+		return m.SendOrBufferOutbound(s, gen, data, a.sendData)
 	}
+	// The deadline starts when the call first has to wait, not before: a
+	// Write that finds the windows open reads no clock.
+	var deadline time.Time
 	total := len(data)
 	for len(data) > 0 {
-		if err := s.AwaitSendWindow(deadline); err != nil {
+		if err := s.AwaitSendWindowUse(gen, a.writeTimeout, &deadline); err != nil {
 			if !errors.Is(err, os.ErrDeadlineExceeded) {
-				return err // reset by the peer, or the connection closed
+				return err // reset by the peer, the connection closed, or the stream's use is over
 			}
-			a.resetStream(s, http2.ErrCodeInternal)
+			a.resetStreamUse(s, gen, http2.ErrCodeInternal)
 			return fmt.Errorf("h2: stream %d reset: %d of %d bytes of a write still waited for the peer's window at WriteTimeout (%v): %w",
-				s.ID, len(data), total, a.writeTimeout, err)
+				id, len(data), total, a.writeTimeout, err)
 		}
-		if n := h2ReserveSend(m, s, len(data)); n > 0 {
-			a.sendData(s.ID, false, data[:n])
-			data = data[n:]
+		n, err := m.SendWindowed(s, gen, data, a.sendData)
+		if err != nil {
+			return err
 		}
+		data = data[n:]
 	}
 	return nil
 }
@@ -1235,9 +1291,16 @@ func (a *h2ResponseAdapter) Flush(_ *stream.Stream) error {
 // queued at once, or, when the stream still has DATA buffered for the peer's
 // window (an inline handler's), carried by the last of it (EndOutbound).
 func (a *h2ResponseAdapter) Close(s *stream.Stream) error {
+	return a.CloseUse(s, s.Gen())
+}
+
+// CloseUse is Close for a StreamWriter: refused, sending nothing, once gen is
+// no longer the stream's use, and on a stream that was reset (the peer's
+// RST_STREAM, or the server's at a Write's timeout): RFC 9113 §5.1 allows no
+// frame after one.
+func (a *h2ResponseAdapter) CloseUse(s *stream.Stream, gen uint64) error {
 	if m := a.manager; m != nil {
-		m.EndOutbound(s, a.sendData)
-		return nil
+		return m.EndOutbound(s, gen, a.sendData)
 	}
 	a.sendData(s.ID, true, nil)
 	return nil
@@ -1274,6 +1337,7 @@ func (a *h2ResponseAdapter) dataFrames(id uint32, endStream bool, data []byte) *
 
 var _ stream.Streamer = (*h1ResponseAdapter)(nil)
 var _ stream.Streamer = (*h2ResponseAdapter)(nil)
+var _ stream.UseStreamer = (*h2ResponseAdapter)(nil)
 
 func writeErrorResponse(write func([]byte), status int, message string) {
 	pooled := getResponseBuffer()
