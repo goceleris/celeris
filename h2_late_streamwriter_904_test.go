@@ -210,6 +210,26 @@ func TestLateStreamWriterIsRefused904(t *testing.T) {
 					t.Errorf("try %d: the late calls put %d bytes on conn A's wire, want none: %v", i, len(after)-len(before), lateParse(t, after[len(before):]))
 				}
 
+				// Connection B first, whose stream is likely the very object conn A's
+				// writer holds (conn A's own next stream would otherwise take it).
+				b := newLateH2(t, lateServer(make(chan *StreamWriter, 1), nil), "/hello")
+				b.grant(1 << 20)
+				wire := b.bytesWritten()
+				if bytes.Contains(wire, []byte("SECRET-of-conn-A")) {
+					leaks++
+				}
+				var body []byte
+				ended := false
+				for _, f := range lateParse(t, wire) {
+					if f.typ == http2.FrameData && f.stream == 1 {
+						body = append(body, f.data...)
+						ended = ended || f.flags.Has(http2.FlagDataEndStream)
+					}
+				}
+				if string(body) != "hello-b" || !ended {
+					t.Errorf("try %d: conn B's stream 1 body = %q (ended=%v), want %q ended", i, body, ended, "hello-b")
+				}
+
 				// Conn A's next request, stream 3, takes the pooled object conn A's
 				// writer holds (same connection, same manager): the late calls, made
 				// from inside its handler, must not touch it.
@@ -229,26 +249,6 @@ func TestLateStreamWriterIsRefused904(t *testing.T) {
 				}
 				if string(a3) != "hello-3" || !ended3 {
 					t.Errorf("try %d: conn A's stream 3 body = %q (ended=%v), want %q ended: the late calls reached the next stream of the same connection", i, a3, ended3, "hello-3")
-				}
-
-				// Connection B, whose stream is likely the very object conn A's
-				// writer holds.
-				b := newLateH2(t, lateServer(make(chan *StreamWriter, 1), nil), "/hello")
-				b.grant(1 << 20)
-				wire := b.bytesWritten()
-				if bytes.Contains(wire, []byte("SECRET-of-conn-A")) {
-					leaks++
-				}
-				var body []byte
-				ended := false
-				for _, f := range lateParse(t, wire) {
-					if f.typ == http2.FrameData && f.stream == 1 {
-						body = append(body, f.data...)
-						ended = ended || f.flags.Has(http2.FlagDataEndStream)
-					}
-				}
-				if string(body) != "hello-b" || !ended {
-					t.Errorf("try %d: conn B's stream 1 body = %q (ended=%v), want %q ended", i, body, ended, "hello-b")
 				}
 			}
 			if leaks > 0 {
