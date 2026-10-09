@@ -29,7 +29,9 @@ import (
 //     avoid pointless churn.
 //   - A safety revert fires if io_uring is active and the error rate climbs
 //     above errorRevertRate, regardless of load, and regardless of the
-//     standby-build backoff (celeris#656).
+//     standby-build backoff (celeris#656). The rate counts engine faults, not
+//     sends to peers that had already gone away (celeris#856, see
+//     revertErrors).
 //
 // The oscillation lock (3 switches in 5 min → 5 min lock) and the post-switch
 // cooldown bound any residual thrash and hold io_uring after the fast snap.
@@ -83,7 +85,7 @@ type controller struct {
 	downThreshold     float64 // conns/worker: io_uring → epoll (hysteresis low edge)
 	highWatermark     float64 // conns/worker: heavy-load fast-path snap
 	largePayloadBytes float64 // avg bytes/req above which io_uring is suppressed
-	errorRevertRate   float64 // io_uring error rate above which we revert to epoll
+	errorRevertRate   float64 // io_uring fault rate (see revertErrors) above which we revert to epoll
 	sustainTicks      int     // consecutive ticks required for a normal switch
 
 	// connSwitchEnabled gates the conns-per-worker UP switch (epoll→io_uring).
