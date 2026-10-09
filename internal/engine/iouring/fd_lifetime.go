@@ -456,22 +456,33 @@ func fdOwed(cs *connState) bool {
 // done, zcNotifPending says so only once the completion is applied, and a
 // close that counted it as naming the descriptor kept the socket open past
 // the 5 s backstop (CloseFDForced) for an op that had ended (celeris#880).
-// Only a first CQE (F_MORE) counts: a held notification is a terminal CQE,
-// which staleConnCQE has taken off kernelInflight when it read it.
+//
+// Whether kernelInflight still counts the SEND_ZC decides whether it is left
+// out. It stops counting it when staleConnCQE READS the notification, a
+// terminal CQE, whether the worker then applies the notification or holds it.
+// So a held notification means the op is already out of kernelInflight, and
+// nothing is left out: leaving it out again would drop an armed recv from the
+// count, and a conn with a recv armed would read as owing nothing (fdOwed
+// false; the shutdown drain would not end the recv before it closed the
+// descriptor, celeris#685). Without one, the op still in kernelInflight is
+// left out once, whether the first completion is applied (zcNotifPending) or
+// held (a held F_MORE entry).
 //
 // Live connections only: a closed one's count moves in its closedOps entry
 // (closedOpsEntry.fdOps, read by closedFDNamed).
 func fdOps(cs *connState) int32 {
-	n := cs.kernelInflight
-	if cs.zcNotifPending {
-		n--
-	} else {
-		for i := range cs.heldSends {
-			if cqeHasMore(cs.heldSends[i].Flags) {
-				n--
-				break
-			}
+	zcOp, notifRead := cs.zcNotifPending, false
+	for i := range cs.heldSends {
+		switch f := cs.heldSends[i].Flags; {
+		case cqeHasMore(f):
+			zcOp = true
+		case cqeIsNotif(f):
+			notifRead = true
 		}
+	}
+	n := cs.kernelInflight
+	if zcOp && !notifRead {
+		n--
 	}
 	return n
 }

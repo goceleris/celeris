@@ -274,6 +274,40 @@ func TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC
 	}
 }
 
+// TestBackstopStillHoldsAZCNotificationWhoseSendCancelWasNeverPlaced is the
+// other side of the order above (a guard, not failing first): a conn whose
+// recv has ended and that owes nothing but a SEND_ZC's notification, with the
+// cancel of that send never placed, names no descriptor. The backstop moves its
+// send buffer to the counted hold (celeris#812) instead of keeping the whole
+// entry on the walk, where nothing would bound it or count its bytes.
+func TestBackstopStillHoldsAZCNotificationWhoseSendCancelWasNeverPlaced(t *testing.T) {
+	f := newFDLFixture(t, false)
+	w, cs := f.w, f.cs
+	cs.sendBuf = append(cs.sendBuf[:0], "tail"...)
+	cs.sendIsZC, cs.zcNotifPending, cs.zcSentBytes = true, true, 1
+	cs.kernelInflight = 1 // the notification
+
+	w.cancelSQEFull = func() bool { return true }
+	cs.closing = true
+	w.finishCloseAny(f.fd, cs)
+	if w.conns[f.fd] != nil || len(w.pendingRelease) != 1 || !cs.cancelMissed || !w.closedZCOwed(cs) {
+		t.Fatalf("the case did not form: slot=%p pendingRelease=%d cancelMissed=%v zcOwed=%v",
+			w.conns[f.fd], len(w.pendingRelease), cs.cancelMissed, w.closedZCOwed(cs))
+	}
+	w.pendingRelease[0].releaseAtNanos = 1
+	w.cachedNow = time.Now().UnixNano()
+	w.drainPendingRelease()
+	t.Logf("celeris869 NOTIFONLY pendingRelease=%d zcHolds=%d CloseFDForced=%d fd_open=%v",
+		len(w.pendingRelease), len(w.zcHolds), w.handoffLoss.closeFDForced.Load(), fdOpen704(f.fd))
+	if len(w.zcHolds) != 1 || len(w.pendingRelease) != 0 {
+		t.Errorf("zcHolds=%d pendingRelease=%d, want the send buffer in the counted hold (1) and the entry off the walk (0)",
+			len(w.zcHolds), len(w.pendingRelease))
+	}
+	if forced := w.handoffLoss.closeFDForced.Load(); forced != 0 || fdOpen704(f.fd) {
+		t.Errorf("CloseFDForced=%d, fd_open=%v: the descriptor, which no owed op names, should have gone before the backstop, unforced", forced, fdOpen704(f.fd))
+	}
+}
+
 // hijackProbe869 hijacks on /hj, and answers 503 when the hijack is refused,
 // as a handler that checks Hijack's error does.
 type hijackProbe869 struct {

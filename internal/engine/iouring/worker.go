@@ -2655,6 +2655,10 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 		defer recvtheft.HijackHold()
 	}
 	// The recv's cancel was placed above, before the conn left the tables.
+	// The result of the rest is not read: a pending send was refused above, so
+	// what is left is a SEND_ZC notification (zcNotifPending), which
+	// closedZCOwed holds the send buffer for, and the header timer, whose
+	// cancel is best effort. Nothing marks a hijack entry cancelMissed.
 	w.cancelOtherOps(fd, cs)
 	w.noteClosedInflight(cs)
 	w.queuePendingReleaseDetached(cs)
@@ -4590,7 +4594,14 @@ func (w *Worker) drainPendingRelease() {
 			// held, off this walk, until that op's notification, and the
 			// backstop gives up only the descriptor, as it always has
 			// (holdZCPastBackstop).
-			if w.closedZCOwed(cs) {
+			//
+			// Not while an op whose cancel was never placed still names the
+			// descriptor (below): holdZCPastBackstop gives the descriptor up
+			// and takes the entry off this walk, which ends the cancel's
+			// retries. Only a SEND_ZC notification left (closedFDNamed false)
+			// is the celeris#812 case.
+			missedAndNamed := cs.cancelMissed && w.closedFDNamed(cs)
+			if !missedAndNamed && w.closedZCOwed(cs) {
 				w.holdZCPastBackstop(entry)
 				continue
 			}
@@ -6366,6 +6377,15 @@ func (w *Worker) checkTimeouts() {
 						continue // the completion finished the close
 					}
 					if len(cs.heldSends) > 0 {
+						continue
+					}
+					// The replay is also what tells the drain's clock the
+					// peer is reading (completeSend restamps lastActivity
+					// for a closing conn's partial send, celeris#761), and
+					// it may have placed the rest of the response: read the
+					// bound again, or a send that is making progress is
+					// cancelled.
+					if now-cs.lastActivity <= w.closingDrainBound() {
 						continue
 					}
 				}

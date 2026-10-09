@@ -1489,7 +1489,7 @@ jobs:
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestBufferRingRetireKeepsBufferAndRefreshesRing|TestBufferRingCloseKeepsOnlyRetiredPages|TestBufferRingRetireCost|TestHeldSendZCFirstCompletionDoesNotKeepTheDescriptor|TestFdOpsLeavesOutAHeldSendZCFirstCompletion|TestClosingSweepAppliesAHeldSendNotification|TestClosingSweepDoesNotWaitForARunningAsyncHandler|TestShutdownDoesNotWaitForAHeldSendZCFirstCompletion|TestHijackRefusedWhenItsMultishotRecvCannotBeCancelled|TestHijackWithNothingToCancelNeedsNoSQE|TestRefusedHijackAnswersTheRequestAndKeepsServing|TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced'
+          names='TestBufferRingRetireKeepsBufferAndRefreshesRing|TestBufferRingCloseKeepsOnlyRetiredPages|TestBufferRingRetireCost|TestHeldSendZCFirstCompletionDoesNotKeepTheDescriptor|TestFdOpsLeavesOutAHeldSendZCFirstCompletion|TestClosingSweepAppliesAHeldSendNotification|TestClosingSweepDoesNotWaitForARunningAsyncHandler|TestShutdownDoesNotWaitForAHeldSendZCFirstCompletion|TestHijackRefusedWhenItsMultishotRecvCannotBeCancelled|TestHijackWithNothingToCancelNeedsNoSQE|TestRefusedHijackAnswersTheRequestAndKeepsServing|TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced|TestFdOpsBothSendZCCompletionsHeld|TestFdOpsSendZCNotificationHeldAfterFirstApplied|TestShutdownDrainEndsARecvOwedBesideHeldSendZCCompletions|TestFdOpsBothSendZCCompletionsHeldByTheKernel|TestClosingSweepDoesNotCutOffASendTheReplayMoved|TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC|TestBackstopStillHoldsAZCNotificationWhoseSendCancelWasNeverPlaced'
           runs=3
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           wantsub=$(( 6 * runs ))

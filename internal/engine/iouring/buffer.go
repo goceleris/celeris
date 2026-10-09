@@ -168,6 +168,15 @@ func (br *BufferRing) GetBuffer(bufID uint16, dataLen int) []byte {
 // many connections are hijacked. The fresh buffer is held by repl, as the
 // kernel's pointer to it is invisible to the collector. Like PushBuffer it
 // does not publish. Worker thread only.
+//
+// The cost is paid in steady state, on top of the mapped ring: the kernel
+// cycles through the buffer IDs, so after about count hijacks nearly every
+// slot is heap-backed, and the ring then holds count x bufferSize bytes of
+// live Go heap (8 MiB per worker at the defaults, up to bufRingCountMax x
+// BufferSize), which the mmap design of NewBufferRing exists to keep off the
+// heap, besides the mapped pages that are never reused. The alternative, a
+// pool of replacements mapped outside the heap, would put the unmapping of
+// buffers hijackers still view on the engine; it is not done here.
 func (br *BufferRing) RetireBuffer(bufID uint16) {
 	if br.repl == nil {
 		br.repl = make([][]byte, br.count)
@@ -219,7 +228,10 @@ func (br *BufferRing) Close(ring *Ring) {
 // (celeris#868), and the engine does not know when the last one goes. It
 // unmaps everything else, so the memory left behind is the retired slots'
 // pages, at most one ring's worth and none in a process that never hijacks
-// under multishot receive. Worker thread only.
+// under multishot receive. (The partial unmap leaves the region's entry in
+// x/sys/unix's mmap bookkeeping, which Munmap of the whole slice would have
+// removed. It is a map entry of a few words that lives as long as the mapping
+// it names does, and nothing reads it again.) Worker thread only.
 func (br *BufferRing) unmapBuffers() {
 	region := br.bufRegion
 	br.bufRegion = nil
