@@ -10,6 +10,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -60,7 +62,16 @@ type onErr908Handler struct {
 	errs chan error
 }
 
+// big908 is the size of the /big response: well over the socket buffers of a
+// loopback pair, so the first flush cannot take it whole.
+const big908 = 32 << 20
+
 func (h *onErr908Handler) HandleStream(ctx context.Context, s *stream.Stream) error {
+	if s.Path == "/big" && s.ResponseWriter != nil {
+		body := bytes.Repeat([]byte{'b'}, big908)
+		return s.ResponseWriter.WriteResponse(s, 200,
+			[][2]string{{"content-type", "text/plain"}, {"content-length", strconv.Itoa(len(body))}}, body)
+	}
 	if s.Path == "/onerr" && s.OnWSSetError != nil {
 		s.OnWSSetError(func(err error) {
 			select {
@@ -227,6 +238,56 @@ func testRecvOnError908(t *testing.T, e *Engine, h *onErr908Handler) {
 	}
 }
 
+// testCarryLargeResponse908 adopts a conn whose carried request has a response
+// larger than the socket buffers, with the client reading only after the
+// adoption. The replay's flush is partial; the rest must follow on EPOLLOUT
+// (epoll) or the send completion (io_uring), as it does for a request the
+// engine read itself, and the conn must go on serving.
+func testCarryLargeResponse908(t *testing.T, adopt func(int, engine.Carryover) error) {
+	client, br := adoptCarry908(t, adopt, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+	time.Sleep(200 * time.Millisecond) // the replay has flushed what the kernel took
+	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read the /big response head: %v", err)
+	}
+	n, err := io.Copy(io.Discard, resp.Body)
+	if err != nil || n != big908 {
+		t.Fatalf("read %d of %d body bytes of /big: %v (the replay's partial flush left the rest queued with nothing to send it)", n, big908, err)
+	}
+	_ = resp.Body.Close()
+	if _, err := client.Write([]byte("GET /after HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatalf("write the follow-up: %v", err)
+	}
+	if code, body, err := readBody543(client, br, 3*time.Second); err != nil || code != 200 || body != "/after" {
+		t.Errorf("follow-up after /big: %d %q, %v", code, body, err)
+	}
+}
+
+// testRecvLargeResponse908 is the control of testCarryLargeResponse908: the
+// same request read off the socket by the engine itself, the client reading
+// only after the engine has flushed what the kernel took.
+func testRecvLargeResponse908(t *testing.T, e *Engine) {
+	client, err := net.DialTimeout("tcp", e.Addr().String(), 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if _, err := client.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	br := bufio.NewReader(client)
+	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read the /big response head: %v", err)
+	}
+	if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != big908 {
+		t.Fatalf("recv path: read %d of %d body bytes of /big: %v", n, big908, err)
+	}
+}
+
 // start908 starts an io_uring engine on a free loopback port and waits until
 // it has workers to adopt onto. upgrade turns EnableH2Upgrade on.
 func start908(t *testing.T, async, upgrade bool) (*Engine, *onErr908Handler) {
@@ -274,6 +335,11 @@ func TestIouringAdoptCarriedH2CUpgradeSync908(t *testing.T) {
 	testCarryH2CUpgrade908(t, e.AdoptConn)
 }
 
+func TestIouringAdoptCarriedLargeResponseSync908(t *testing.T) {
+	e, _ := start908(t, false, false)
+	testCarryLargeResponse908(t, e.AdoptConn)
+}
+
 func TestIouringAdoptCarriedParseErrorAsync908(t *testing.T) {
 	e, _ := start908(t, true, false)
 	testCarryParseError908(t, e.AdoptConn)
@@ -299,7 +365,22 @@ func TestIouringAdoptCarriedOnErrorAsync908(t *testing.T) {
 	testCarryOnError908(t, e.AdoptConn, h)
 }
 
+func TestIouringAdoptCarriedLargeResponseAsync908(t *testing.T) {
+	e, _ := start908(t, true, false)
+	testCarryLargeResponse908(t, e.AdoptConn)
+}
+
 func TestIouringRecvPathOnErrorAsync908(t *testing.T) {
 	e, h := start908(t, true, false)
 	testRecvOnError908(t, e, h)
+}
+
+func TestIouringRecvPathLargeResponseSync908(t *testing.T) {
+	e, _ := start908(t, false, false)
+	testRecvLargeResponse908(t, e)
+}
+
+func TestIouringRecvPathLargeResponseAsync908(t *testing.T) {
+	e, _ := start908(t, true, false)
+	testRecvLargeResponse908(t, e)
 }
