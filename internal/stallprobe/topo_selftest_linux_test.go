@@ -5,6 +5,7 @@ package stallprobe
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -87,5 +88,35 @@ func TestProbeCaseSpecs(t *testing.T) {
 		if got := ls.wanted(from, from); !reflect.DeepEqual(got, w) {
 			t.Errorf("keep: loop from %d wanted %v, got %v", from, w, got)
 		}
+	}
+}
+
+// TestProbeDigestSpin feeds describeSnapshots two synthetic captures in which
+// one loop thread is on a CPU for the whole window with one sched-in (the
+// shape of all 19 stalls of run 37975655016) and one loop wakes normally, and
+// checks that the digest names the first as spinning, not frozen and not
+// "alive", and that the thread table carries the added columns.
+func TestProbeDigestSpin(t *testing.T) {
+	mk := func(at int64, spinRun, spinSl, otherRun, otherSl uint64) *snapshot {
+		return &snapshot{
+			AtNs: at, WaitedNs: at, Bytes: 0, ClientLast: -1,
+			Tasks: []snapTask{
+				{Tid: 100, Comm: "x", State: "R", CPU: 3, RunNs: spinRun, Slices: spinSl, HasSched: true, UTime: spinRun / 1e7, Vol: 1, Syscall: "running", Allowed: "3"},
+				{Tid: 101, Comm: "x", State: "S", CPU: 4, RunNs: otherRun, Slices: otherSl, HasSched: true, Wchan: "do_epoll_wait", Vol: otherSl, Syscall: "22 0x7 0x0", Allowed: "4"},
+			},
+			PSI: map[string]psiVal{}, Freq: map[int]int64{}, Idle: map[int][]idleState{},
+		}
+	}
+	a := mk(0, 0, 10, 0, 100)
+	b := mk(500e6, 500e6, 11, 2e6, 460)
+	full, digest := describeSnapshots(a, b, []loopThread{{Tid: 100, From: 3}, {Tid: 101, From: 4}}, "NO BYTE for 5s")
+	if !strings.Contains(digest, "ON A CPU THE WHOLE WINDOW") {
+		t.Errorf("digest does not name the spinning loop:\n%s", digest)
+	}
+	if strings.Contains(digest, "1 did not (frozen)") || strings.Contains(digest, "2 of 2 ran") {
+		t.Errorf("digest still counts the spinner as frozen or alive:\n%s", digest)
+	}
+	if !strings.Contains(full, "utime=") || !strings.Contains(full, "sys=running") || !strings.Contains(full, "sys=22(0x7)") {
+		t.Errorf("thread table lacks the added columns:\n%s", full)
 	}
 }
