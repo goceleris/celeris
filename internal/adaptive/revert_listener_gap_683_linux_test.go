@@ -17,6 +17,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/epoll"
+	"github.com/goceleris/celeris/internal/engine/iouring"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -142,7 +143,7 @@ func TestRevertKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing.T)
 	time.Sleep(1500 * time.Millisecond)
 	onlyIOUring, err := listenInodes(port)
 	if err != nil {
-		t.Skipf("cannot list listening sockets here: %v", err)
+		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
 	}
 	late := installLateEpoll683(t, e, 20*time.Millisecond)
 
@@ -190,6 +191,100 @@ func TestRevertKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing.T)
 	}
 }
 
+// lateIOUring683 is lateEpoll683 for the other direction: io_uring's resume is
+// just as asynchronous (its workers re-create their listeners on their own
+// threads), so the same gap can open on a promotion.
+type lateIOUring683 struct {
+	*iouring.Engine
+	delay time.Duration
+	calls atomic.Int32
+}
+
+func (l *lateIOUring683) ResumeAccept() error {
+	l.calls.Add(1)
+	go func() {
+		time.Sleep(l.delay)
+		_ = l.Engine.ResumeAccept()
+	}()
+	return nil
+}
+
+// TestPromotionKeepsAListenerUpWhenTheIncomingEngineListensLate683: the
+// promotion twin of the revert test above (RULE 61). The standby is built by
+// a first promotion and reverted away from; the second promotion resumes it
+// 20 ms late, and epoll, which closes at once under DisableDeferAccept, must
+// not close before io_uring listens.
+func TestPromotionKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	e, addr, stop := s0Bind(t, resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1, DisableDeferAccept: true,
+		Resources: resource.Resources{Workers: 4}}, respHandler{})
+	defer stop()
+	port := e.Addr().(*net.TCPAddr).Port
+
+	forceSwitchTo(t, e, engine.IOUring) // builds the standby
+	forceSwitchTo(t, e, engine.Epoll)
+	// io_uring's pause closes its listeners at once, and a worker that has
+	// not yet parked sees a resume only after its current ring wait (up to a
+	// second): let them park, so the next promotion is a plain late resume.
+	time.Sleep(2500 * time.Millisecond)
+	onlyEpoll, err := listenInodes(port)
+	if err != nil {
+		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
+	}
+	e.mu.Lock()
+	io, ok := e.secondary.(*iouring.Engine)
+	if !ok {
+		e.mu.Unlock()
+		t.Fatalf("the secondary is %T, want *iouring.Engine", e.secondary)
+	}
+	late := &lateIOUring683{Engine: io, delay: 20 * time.Millisecond}
+	e.switchMu.Lock()
+	e.secondary = late
+	e.ctrl.secondary = late
+	e.switchMu.Unlock()
+	e.mu.Unlock()
+
+	d := startDialer683(addr)
+	time.Sleep(200 * time.Millisecond)
+	swStart := time.Since(d.t0)
+	t0 := time.Now()
+	forceSwitchTo(t, e, engine.IOUring)
+	swWall := time.Since(t0)
+	swEnd := time.Since(d.t0)
+	time.Sleep(400 * time.Millisecond)
+	refused, other := d.finish()
+
+	both, _ := listenInodes(port)
+	inWindow := 0
+	for _, at := range refused {
+		if at >= swStart-20*time.Millisecond && at <= swEnd+400*time.Millisecond {
+			inWindow++
+		}
+	}
+	t.Logf("celeris683 LATE-RESUME promote: switch wall %v, %d dials, refused %d (in the switch window %d), other errors %d, "+
+		"listeners before %d after %d (%d new), wait timeouts %d, resume calls %d",
+		swWall.Round(time.Microsecond), d.dials.Load(), len(refused), inWindow, other, len(onlyEpoll), len(both),
+		freshCount683(both, onlyEpoll), e.listenWaitTimeouts(), late.calls.Load())
+	if late.calls.Load() != 1 {
+		t.Fatalf("celeris683 PREMISE: the late ResumeAccept ran %d times, want 1", late.calls.Load())
+	}
+	if freshCount683(both, onlyEpoll) == 0 {
+		t.Fatalf("celeris683 PREMISE: io_uring never listened again (before %d, after %d)", len(onlyEpoll), len(both))
+	}
+	if d.dials.Load() < 500 {
+		t.Fatalf("celeris683 PREMISE: only %d dials in the run", d.dials.Load())
+	}
+	if len(refused) != 0 {
+		t.Errorf("celeris683 GAP: %d dials were refused (%d inside the switch window): epoll's listeners closed before "+
+			"io_uring had one", len(refused), inWindow)
+	}
+	if n := e.listenWaitTimeouts(); n != 0 {
+		t.Errorf("celeris683: the wait for the incoming listener gave up %d time(s)", n)
+	}
+}
+
 // The wait is not held under freezeState: a driver registering while the
 // switch waits for a late incoming engine proceeds at once (RULE 10). With the
 // wait inside the lock the registration would sit out the whole delay.
@@ -204,7 +299,7 @@ func TestSwitchWaitForTheIncomingListenerDoesNotBlockDriverRegistration683(t *te
 	forceSwitchTo(t, e, engine.IOUring)
 	time.Sleep(1500 * time.Millisecond)
 	if _, err := listenInodes(port); err != nil {
-		t.Skipf("cannot list listening sockets here: %v", err)
+		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
 	}
 	const delay = 150 * time.Millisecond
 	installLateEpoll683(t, e, delay)
@@ -254,7 +349,7 @@ func TestListenInodesSeesASocketOnlyWhileItListens683(t *testing.T) {
 
 	set, err := listenInodes(port)
 	if err != nil {
-		t.Skipf("cannot list listening sockets here: %v", err)
+		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
 	}
 	if _, ok := set[uint32(st.Ino)]; !ok || len(set) != 1 {
 		t.Fatalf("listenInodes(%d) = %v, want exactly the listener's inode %d", port, set, st.Ino)
@@ -281,7 +376,7 @@ func TestListenWatchWaitsForANewListenerAndTimesOut683(t *testing.T) {
 	port := first.Addr().(*net.TCPAddr).Port
 	w, err := newListenWatch(port)
 	if err != nil {
-		t.Skipf("cannot list listening sockets here: %v", err)
+		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
 	}
 
 	waited, ok, err := w.wait(60 * time.Millisecond)
