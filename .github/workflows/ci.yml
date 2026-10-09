@@ -67,33 +67,33 @@ jobs:
       - name: Lint root module
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
       - name: Lint middleware/compress
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: middleware/compress
       - name: Lint middleware/metrics
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: middleware/metrics
       - name: Lint middleware/otel
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: middleware/otel
       - name: Lint middleware/protobuf
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: middleware/protobuf
       # The tools module holds apidump's source (the api/ check above);
       # golangci-lint finds the root .golangci.yml from there.
       - name: Lint .github/tools
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: .github/tools
       - name: actionlint
         # Workflow-YAML lint: catches script-injection vectors, unknown
