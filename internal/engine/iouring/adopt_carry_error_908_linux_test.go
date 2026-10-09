@@ -288,6 +288,28 @@ func testRecvLargeResponse908(t *testing.T, e *Engine) {
 	}
 }
 
+// testCarryLargeClose908: the carried request answers Connection: close with a
+// response larger than the socket buffers. The close must wait until the whole
+// body has reached the kernel (closeWhenFlushed on epoll, the deferred close
+// on io_uring): the client gets every byte, then EOF.
+func testCarryLargeClose908(t *testing.T, adopt func(int, engine.Carryover) error) {
+	client, br := adoptCarry908(t, adopt, "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	time.Sleep(200 * time.Millisecond)
+	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read the /big response head: %v", err)
+	}
+	n, err := io.Copy(io.Discard, resp.Body)
+	if err != nil || n != big908 {
+		t.Fatalf("read %d of %d body bytes of /big: %v (the conn was closed before its response had gone out)", n, big908, err)
+	}
+	_ = resp.Body.Close()
+	if !hasEOF908(client, br, 3*time.Second) {
+		t.Errorf("the conn stayed open after a Connection: close response")
+	}
+}
+
 // start908 starts an io_uring engine on a free loopback port and waits until
 // it has workers to adopt onto. upgrade turns EnableH2Upgrade on.
 func start908(t *testing.T, async, upgrade bool) (*Engine, *onErr908Handler) {
@@ -340,6 +362,11 @@ func TestIouringAdoptCarriedLargeResponseSync908(t *testing.T) {
 	testCarryLargeResponse908(t, e.AdoptConn)
 }
 
+func TestIouringAdoptCarriedLargeCloseSync908(t *testing.T) {
+	e, _ := start908(t, false, false)
+	testCarryLargeClose908(t, e.AdoptConn)
+}
+
 func TestIouringAdoptCarriedParseErrorAsync908(t *testing.T) {
 	e, _ := start908(t, true, false)
 	testCarryParseError908(t, e.AdoptConn)
@@ -368,6 +395,11 @@ func TestIouringAdoptCarriedOnErrorAsync908(t *testing.T) {
 func TestIouringAdoptCarriedLargeResponseAsync908(t *testing.T) {
 	e, _ := start908(t, true, false)
 	testCarryLargeResponse908(t, e.AdoptConn)
+}
+
+func TestIouringAdoptCarriedLargeCloseAsync908(t *testing.T) {
+	e, _ := start908(t, true, false)
+	testCarryLargeClose908(t, e.AdoptConn)
 }
 
 func TestIouringRecvPathOnErrorAsync908(t *testing.T) {
