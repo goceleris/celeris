@@ -29,7 +29,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
           # The api/ check type-checks the nested modules too, and apidump
           # builds from the tools module, so their go.sum files key the cache.
           cache-dependency-path: |
@@ -67,33 +67,33 @@ jobs:
       - name: Lint root module
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
       - name: Lint middleware/compress
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: middleware/compress
       - name: Lint middleware/metrics
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: middleware/metrics
       - name: Lint middleware/otel
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: middleware/otel
       - name: Lint middleware/protobuf
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: middleware/protobuf
       # The tools module holds apidump's source (the api/ check above);
       # golangci-lint finds the root .golangci.yml from there.
       - name: Lint .github/tools
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          version: v2.14
           working-directory: .github/tools
       - name: actionlint
         # Workflow-YAML lint: catches script-injection vectors, unknown
@@ -122,7 +122,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       # Excludes ./test/... to keep this job deterministic — those
       # suites (integration, spec, sustainedload) are timing-sensitive
       # on shared GitHub Actions runners and run locally / in the
@@ -928,7 +928,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       # celeris#641: the default engine's own package ran in no CI job. It
       # needs two things the unit job does not give it.
       #
@@ -1179,7 +1179,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       # celeris#656: the three tests that pin the failed-worker listen-socket
       # leak ask for TWO io_uring workers on one port, and RLIMIT_MEMLOCK funds
       # one per 12 MiB (engine/iouring/ring.go minMemlockPerWorker). GitHub
@@ -1273,7 +1273,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       # TestSendZCWindowGuardUnderRace holds the SEND_ZC first-CQE -> NOTIF
       # window open (internal/zcwindow.SetHold, -tags=validation only) while
       # the handler pushes 256 x 64 KiB frames at a steady pace to a client
@@ -1377,7 +1377,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       # The celeris#715 / celeris#685 trials (-tags=validation only; the
       # holds are internal/recvtheft). Each parks the worker that closed a
       # connection A with a recv still able to resolve A's descriptor number
@@ -1605,7 +1605,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Conformance matrix (engines × protocols)
         run: go test -v -race -count=1 -timeout=120s ./test/conformance/...
 
@@ -1644,7 +1644,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Postgres conformance
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
@@ -1674,7 +1674,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       - name: Build root module
         run: go build ./...
       - name: Build middleware/compress
@@ -1699,7 +1699,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       # govulncheck is a `tool` of the separate .github/tools module, so the
       # version that runs is the one its go.mod names and its go.sum hashes
       # (Dependabot bumps it), not whatever @latest resolves to on the day.
