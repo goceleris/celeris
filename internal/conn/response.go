@@ -687,6 +687,12 @@ func (a *h2ResponseAdapter) peerMaxFrame() uint32 {
 	return a.maxFrameSize
 }
 
+// h2BeforeEnqueueHook is a test seam: WriteResponse calls it, when it is set,
+// after it has reserved the windows and built its frames and just before it
+// queues them, so a test can put a WINDOW_UPDATE at the one point where a pool
+// handler is exposed to one (celeris#903). Production code never sets it.
+var h2BeforeEnqueueHook func(a *h2ResponseAdapter, s *stream.Stream)
+
 // WriteResponse builds complete response frame bytes using a goroutine-local
 // HPACK encoder (dynamic table = 0) and enqueues them to the write queue.
 // No shared locks are held during encoding — concurrent streams encode independently.
@@ -737,6 +743,9 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 			}
 			putH2StreamEncoder(enc)
 			*pooled = frameBuf
+			if h := h2BeforeEnqueueHook; h != nil {
+				h(a, s)
+			}
 			a.writeQueue.Enqueue(s.ID, pooled)
 			s.SetHeadersSent()
 			if len(rest) > 0 {
@@ -789,6 +798,9 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	putH2StreamEncoder(enc)
 
 	*pooled = frameBuf
+	if h := h2BeforeEnqueueHook; h != nil {
+		h(a, s)
+	}
 	a.writeQueue.Enqueue(s.ID, pooled)
 
 	s.SetHeadersSent()
