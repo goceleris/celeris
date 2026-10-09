@@ -329,7 +329,7 @@ The bridge buffers the adapted handler's response in memory, capped at a compile
 
 The default is **Adaptive** on Linux and **Std** elsewhere. Prefer Adaptive unless you have a specific reason to pin an engine; on non-Linux platforms only Std is available (the native engines return an error).
 
-io_uring needs Linux 5.19 or later: every cancel the engine submits uses the `IORING_ASYNC_CANCEL` flags that release added, and an older kernel fails each one with `-EINVAL` ([#682](https://github.com/goceleris/celeris/issues/682)). The engine checks it at startup with a probe cancel that the kernel answers, rather than by reading the kernel version. Where the kernel rejects the flags, `IOUring` fails to start with an error that names the requirement, and `Adaptive` runs on epoll (`CELERIS_ADAPTIVE_START=iouring` included).
+io_uring needs Linux 5.19 or later: every cancel the engine submits uses the `IORING_ASYNC_CANCEL` flags that release added, and an older kernel fails each one with `-EINVAL` ([#682](https://github.com/goceleris/celeris/issues/682)). The engine checks it at startup: a kernel version before 5.19 is refused outright (a partial vendor backport can pass a single probe cancel while its other cancel forms still fail), and from 5.19 a probe cancel that the kernel answers decides. Where the kernel version is below 5.19 or the kernel rejects the flags, `IOUring` fails to start with an error that names the requirement, and `Adaptive` runs on epoll (`CELERIS_ADAPTIVE_START=iouring` included).
 
 ### Tuning environment variables
 
