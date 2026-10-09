@@ -275,7 +275,9 @@ func (t topo) byFastness(cpus []int) []int {
 // host (the stress tally fails a run whose two arches did not run the same
 // leaves); what they select differs:
 //
-//	all    every allowed CPU
+//	all    every allowed CPU; the engine's own loop pinning is left alone (the failing run's shape)
+//	nopin  every allowed CPU; after Start every engine loop thread is given the FULL allowed
+//	       mask again (sched_setaffinity on its tid), so no loop is pinned at all
 //	fast8  the 8 fastest-core-type CPUs      (heterogeneous: the A720s on msr1)
 //	fast4  the 4 fastest of those            (msr1: cpus 0,1,10,11 at 2.5-2.6 GHz)
 //	slow4  the 4 slowest-core-type CPUs      (msr1: the A520s, cpus 2-5)
@@ -294,7 +296,9 @@ func (t topo) caseCPUs(name string) (cpus []int, note string, err error) {
 	asc := func(c []int) []int { c = append([]int(nil), c...); sort.Ints(c); return c }
 	switch name {
 	case "all":
-		return asc(t.Allowed), "every allowed CPU", nil
+		return asc(t.Allowed), "every allowed CPU, the engine's loop pinning left alone", nil
+	case "nopin":
+		return asc(t.Allowed), "every allowed CPU, every loop thread unpinned (full mask) after Start", nil
 	case "fast8", "fast4":
 		k := 8
 		if name == "fast4" {
@@ -317,7 +321,7 @@ func (t topo) caseCPUs(name string) (cpus []int, note string, err error) {
 			note = "homogeneous host: the lowest ids"
 		}
 	default:
-		return nil, "", fmt.Errorf("unknown case %q (all, fast8, fast4, slow4)", name)
+		return nil, "", fmt.Errorf("unknown case %q (all, nopin, fast8, fast4, slow4)", name)
 	}
 	if len(cpus) < 2 {
 		return nil, "", fmt.Errorf("case %s: %d allowed CPUs on this host (%d allowed in all), the engine needs at least 2 workers", name, len(cpus), n)
@@ -353,11 +357,37 @@ func taskIDs() []int {
 	return out
 }
 
-// pinnedThreads maps tid -> cpu for every thread of this process whose
-// affinity is exactly one CPU.
+// isIOThread reports whether a thread is a kernel-created io_uring thread (an
+// io-wq worker "iou-wrk-*" or an SQPOLL thread "iou-sqp-*"). They belong to a
+// ring and not to an engine loop: they appear lazily during a workload and can
+// inherit the pin of the thread that created them, so they are never counted
+// as loop threads (and their affinity is not settable from here).
+func isIOThread(tid int) bool {
+	return strings.HasPrefix(threadComm(tid), "iou-")
+}
+
+// ioThreads describes the io_uring kernel threads of the process, for notes.
+func ioThreads() string {
+	var parts []string
+	for _, tid := range taskIDs() {
+		if isIOThread(tid) {
+			parts = append(parts, fmt.Sprintf("%d %s allowed %s", tid, threadComm(tid), threadAllowed(tid)))
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// pinnedThreads maps tid -> cpu for every thread of this process, io_uring
+// kernel threads excepted, whose affinity is exactly one CPU.
 func pinnedThreads() map[int]int {
 	out := map[int]int{}
 	for _, tid := range taskIDs() {
+		if isIOThread(tid) {
+			continue
+		}
 		var s unix.CPUSet
 		if err := unix.SchedGetaffinity(tid, &s); err != nil {
 			continue

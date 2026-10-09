@@ -17,21 +17,37 @@
 // verdicts. Nothing here writes to stdout directly: the stress tally parses
 // "--- PASS/FAIL/SKIP" lines and a glued or stray line makes a shard UNPARSED.
 //
+// Run order. Go runs the tests of a package in source order when the stress
+// workflow is given extra='-shuffle=off' (it is on the workflow's allow-list;
+// without it every shard gets its own random -shuffle seed), and it reads the
+// files in name order: t1_p3 (P3, the network workload), t2_p2 (P2), t3_p1
+// (P1 and P1b, which run every CPU at 100% for 60 s per count and heat-soak
+// the SoC). The all-in-one dispatch therefore needs -shuffle=off to run P3
+// before P1 on a cool host; P1 in a dispatch of its own is cleaner still.
+//
 // Knobs (the stress workflow's extra input accepts CELERIS_* names and the
 // characters [A-Za-z0-9_.,:/+-] in values):
 //
 //	CELERIS_PROBE_SECONDS   P1/P1b measuring window, seconds (60)
 //	CELERIS_PROBE_GAP_MS    P1: record every gap above this, ms (20)
 //	CELERIS_PROBE_FAIL_MS   P1: fail on any gap above this, ms (500)
-//	CELERIS_PROBE_CPUS      P1: cpu list to observe, e.g. 0-3,8 (every allowed CPU)
+//	CELERIS_PROBE_CPUS      P1: cpu list to observe, e.g. 2-5 (every allowed CPU)
 //	CELERIS_PROBE_OBSERVER  P1: 1 = also run the independent sleeping observer process (1)
-//	CELERIS_PROBE_REPS      P2/P3: repetitions per leaf (20)
+//	CELERIS_PROBE_REPS      P2/P3: repetitions per leaf, summed over the rounds (100)
+//	CELERIS_PROBE_MINREPS   P2/P3: a leaf does not stop for its stall budget before this many reps (40)
+//	CELERIS_PROBE_MAXSTALLS P2/P3: stall budget: failed reps after which a leaf (that has run MINREPS) stops (6); twice this stops it regardless
 //	CELERIS_PROBE_SIZES     P2/P3: body sizes in MiB, e.g. 4,64 (4,64)
 //	CELERIS_PROBE_IDLE_MS   P2/P3: the no-byte rule, ms (5000, the celeris tests' idleCap761)
-//	CELERIS_PROBE_MAXSTALLS P2/P3: stop a leaf after this many failed reps (3)
-//	CELERIS_PROBE_CASES     P3: cases, from all,fast8,fast4,slow4 (all four)
-//	CELERIS_PROBE_ENGINES   P3: engines, from epoll,std,io_uring,adaptive (epoll,std)
+//	CELERIS_PROBE_SNAP_MS   P2/P3: first stall-time capture after this long without a byte, ms (2000; 0 = off)
+//	CELERIS_PROBE_SNAP_GAP_MS P2/P3: second capture this long after the first, ms (500)
+//	CELERIS_PROBE_SLOW_MS   P2/P3: a rep whose longest wait reaches this counts as stalled even if it passed (1000)
+//	CELERIS_PROBE_ROUNDS    P3: every (case, engine) cell runs this many times in a fresh child each, ABBA order, REPS split between them (2)
+//	CELERIS_PROBE_CASES     P3: cases, from all,nopin,fast8,fast4,slow4 (all five, in this order)
+//	CELERIS_PROBE_ENGINES   P3: engines, from epoll,io_uring,adaptive,std (all four)
 //	CELERIS_PROBE_SHAPES    P3: handler shapes, from sync,async-loop,async-route (sync,async-route)
+//	CELERIS_PROBE_INJECT_MS P2/P3 proof knob, off by default: every INJECT_EVERY-th /big handler sleeps this long first
+//	CELERIS_PROBE_INJECT_EVERY (5)
+//	CELERIS_PROBE_INJECT_LOOPMISS P3 proof knob, off by default: 1 = discovery pretends to miss one loop thread (a moving case must then FAIL as mislabelled)
 package stallprobe
 
 import (
@@ -62,6 +78,19 @@ func TestMain(m *testing.M) {
 func runChildMain(kind string) int {
 	var res any
 	var err error
+	if kind == "p2" || kind == "p3" {
+		// A child outlives a parent that was killed (go test -timeout): end
+		// with it, so no server keeps serving after the run is over.
+		go func() {
+			ppid := os.Getppid()
+			for {
+				time.Sleep(time.Second)
+				if os.Getppid() != ppid {
+					os.Exit(3)
+				}
+			}
+		}()
+	}
 	switch kind {
 	case "p1spin", "p1sleep":
 		res, err = p1Child(kind)
@@ -151,9 +180,13 @@ type childSpec struct {
 }
 
 // runChild starts the test binary as a child of the given kind and returns
-// its stdout (one JSON document) and stderr. With a mask, the calling thread
-// takes that affinity for the fork only: the child inherits it, and the
-// thread gets its own mask back before it is unlocked.
+// its stdout (one JSON document) and stderr. With a mask, the fork happens on
+// a goroutine of its own, on a locked thread that takes the mask for the fork
+// only: the child inherits it, and the thread gets its own mask back before it
+// is unlocked. If the thread's mask cannot be restored, the goroutine returns
+// STILL LOCKED, so the runtime retires the thread instead of handing it,
+// pinned, to other goroutines (the defect class of celeris#905). The child is
+// started and waited for either way, and the failure is reported.
 func runChild(spec childSpec) (stdout, stderr []byte, err error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -168,33 +201,48 @@ func runChild(spec childSpec) (stdout, stderr []byte, err error) {
 	cmd.Stdout, cmd.Stderr = &so, &se
 	cmd.WaitDelay = 5 * time.Second
 
+	var restoreErr error
 	if len(spec.mask) > 0 {
-		runtime.LockOSThread()
-		var prev unix.CPUSet
-		if err := unix.SchedGetaffinity(0, &prev); err != nil {
+		type forked struct{ start, restore error }
+		done := make(chan forked, 1)
+		go func() {
+			runtime.LockOSThread()
+			var prev unix.CPUSet
+			if gerr := unix.SchedGetaffinity(0, &prev); gerr != nil {
+				runtime.UnlockOSThread() // nothing was changed
+				done <- forked{start: fmt.Errorf("sched_getaffinity: %w", gerr)}
+				return
+			}
+			var f forked
+			m := maskOf(spec.mask)
+			if serr := unix.SchedSetaffinity(0, &m); serr != nil {
+				f.start = fmt.Errorf("sched_setaffinity %v: %w", spec.mask, serr)
+			} else {
+				f.start = cmd.Start()
+			}
+			if rerr := unix.SchedSetaffinity(0, &prev); rerr != nil {
+				f.restore = rerr
+				done <- f
+				return // still locked: the thread ends with this goroutine
+			}
 			runtime.UnlockOSThread()
-			return nil, nil, fmt.Errorf("sched_getaffinity: %w", err)
-		}
-		m := maskOf(spec.mask)
-		if err := unix.SchedSetaffinity(0, &m); err != nil {
-			runtime.UnlockOSThread()
-			return nil, nil, fmt.Errorf("sched_setaffinity %v: %w", spec.mask, err)
-		}
-		err = cmd.Start()
-		if rerr := unix.SchedSetaffinity(0, &prev); rerr != nil {
-			// The thread must not go back to the scheduler pinned: end the
-			// goroutine's lock by leaving it locked is not an option here, so
-			// report it loudly.
-			err = fmt.Errorf("restore affinity: %v (start: %v)", rerr, err)
-		}
-		runtime.UnlockOSThread()
+			done <- f
+		}()
+		f := <-done
+		err, restoreErr = f.start, f.restore
 	} else {
 		err = cmd.Start()
 	}
 	if err != nil {
+		if restoreErr != nil {
+			err = fmt.Errorf("%w (and the forking thread's affinity could not be restored: %v; the thread was retired)", err, restoreErr)
+		}
 		return nil, se.Bytes(), err
 	}
 	err = cmd.Wait()
+	if restoreErr != nil {
+		err = fmt.Errorf("the forking thread's affinity could not be restored (%v; the thread was retired); child: %v", restoreErr, err)
+	}
 	return so.Bytes(), se.Bytes(), err
 }
 
