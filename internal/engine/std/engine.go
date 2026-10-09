@@ -50,7 +50,8 @@ type Engine struct {
 	// budget of every caller, not only of the one that won the once
 	// (celeris#753). The cancel carries a cause, the ctx error of the call
 	// whose budget ended the drain, so a call whose own ctx is still live
-	// can report whose it was (celeris#879). drainErr is the drain's
+	// can report whose it was (celeris#879); a cause the ctx carries of its
+	// own is kept too (budgetCause). drainErr is the drain's
 	// result, read by every caller after once.Do has returned.
 	drainCtx    context.Context
 	drainCancel context.CancelCauseFunc
@@ -368,7 +369,8 @@ func (e *Engine) waitH2Streams(ctx context.Context) error {
 // returns that ctx's error. A call whose ctx is still live, when another
 // call's budget ended the drain with handlers possibly still running,
 // returns an error that wraps that call's ctx error (errors.Is reports
-// context.DeadlineExceeded or context.Canceled for it), never nil, as the
+// context.DeadlineExceeded or context.Canceled for it, and any cause the ctx
+// carries of its own, context.WithCancelCause or WithTimeoutCause), never nil, as the
 // OnShutdown hooks are about to run, and never a bare context.Canceled of an
 // internal context. A call that arrives after the drain has ended returns
 // the same.
