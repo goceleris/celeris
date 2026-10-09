@@ -42,11 +42,12 @@ const (
 // pc846 is a Compress fixture on one static path: app.js (100 bytes, mtime
 // origTime846) with a gzip variant that can be rebuilt on its own.
 type pc846 struct {
-	mw      celeris.HandlerFunc
-	orig    []byte
-	gz1     []byte
-	gz2     []byte
-	rebuild func() // replaces app.js.gz with gz2 at gz2Time846; app.js is untouched
+	mw       celeris.HandlerFunc
+	orig     []byte
+	gz1      []byte
+	gz2      []byte
+	origETag string
+	rebuild  func() // replaces app.js.gz with gz2 at gz2Time846; app.js is untouched
 }
 
 func newPC846(t *testing.T, kind string) *pc846 {
@@ -81,6 +82,7 @@ func newPC846(t *testing.T, kind string) *pc846 {
 		write("app.js", f.orig, origTime846)
 		write("app.js.gz", f.gz1, gz1Time846)
 		f.rebuild = func() { write("app.js.gz", f.gz2, gz2Time846) }
+		f.origETag = weak846(origTime846, origSize846)
 		f.mw = New(Config{Root: dir, Compress: true})
 	case "fs":
 		fsys := fstest.MapFS{
@@ -88,6 +90,7 @@ func newPC846(t *testing.T, kind string) *pc846 {
 			"app.js.gz": {Data: f.gz1, ModTime: gz1Time846},
 		}
 		f.rebuild = func() { fsys["app.js.gz"] = &fstest.MapFile{Data: f.gz2, ModTime: gz2Time846} }
+		f.origETag = strongTag846(f.orig)
 		f.mw = New(Config{FS: fsys, Compress: true})
 	default:
 		t.Fatal(kind)
@@ -129,11 +132,13 @@ func TestPrecompressedCarriesItsOwnValidators846(t *testing.T) {
 			t.Fatalf("variant body %q, want %q", rec.Body, f.gz1)
 		}
 
+		// The identity representation keeps the original's: its mtime and size on
+		// Root, a hash of its bytes on fs.FS (celeris#846 item 2c).
 		rec = f.get(t)
 		testutil.AssertStatus(t, rec, 200)
 		testutil.AssertNoHeader(t, rec, "content-encoding")
 		testutil.AssertHeader(t, rec, "last-modified", origTime846.Format("Mon, 02 Jan 2006 15:04:05 GMT"))
-		testutil.AssertHeader(t, rec, "etag", weak846(origTime846, origSize846))
+		testutil.AssertHeader(t, rec, "etag", f.origETag)
 	})
 }
 

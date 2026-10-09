@@ -70,8 +70,9 @@ func TestStaticPrecompressedRangeOnEveryEngine846(t *testing.T) {
 					write("app.js.gz", gz1, gz1Time)
 
 					addr := startServer761(t, e.eng, false, func(s *celeris.Server) {
-						s.Use(static.New(static.Config{Root: dir, Compress: true}))
-						serve := func(c *celeris.Context) error { return c.NoContent(404) }
+						// The middleware is the route's handler: Server.Use cannot be
+						// called once startServer761 has registered /ping.
+						serve := static.New(static.Config{Root: dir, Compress: true})
 						for _, r := range []*celeris.Route{s.GET("/app.js", serve), s.HEAD("/app.js", serve)} {
 							if route == "async-route" {
 								r.Async()

@@ -61,11 +61,19 @@ func Decide(method, rangeHdr, ifRange, etag, lastModified string, size int64) (s
 // equals the current ETag under the strong comparison (§8.8.3.2): neither tag
 // weak, opaque-tags identical. An HTTP-date holds only when it is the same
 // instant as the current Last-Modified. Anything else, including a missing
-// current validator or a value that is neither, does not hold. A client may
-// send a date only when it has deduced it is a strong validator (§8.8.2.2:
-// its response's Date was at least a second after Last-Modified), which is
-// what makes an exact date match safe; such a client never holds a date
-// that two versions of the file share.
+// current validator or a value that is neither, does not hold.
+//
+// A date is only as reliable as the Last-Modified it is compared with. A
+// client may send one only when it has deduced it is a strong validator
+// (§8.8.2.2: its response's Date was at least a second after Last-Modified),
+// but that rule is the client's, and a server cannot apply §13.1.5 step 1 (a
+// date that is not a strong validator makes the condition false) itself:
+// nothing here tells a date from one that two versions of the file share. When
+// a build tool normalises mtimes (ko, Nix, Bazel rules_oci,
+// SOURCE_DATE_EPOCH) every version has the same Last-Modified, and an exact
+// date match then holds across versions. A caller whose files can change
+// without their date changing needs a strong ETag, which is compared by value.
+// net/http's checkIfRange has the same limit.
 func IfRange(ifRange, etag, lastModified string) bool {
 	v := trimOWS(ifRange)
 	if isEntityTag(v) {

@@ -908,7 +908,8 @@ func (c *Context) SetCookie(cookie *Cookie) {
 // otherwise the whole file is sent as a 200. HEAD and other methods ignore
 // Range, as do an unknown range unit, an invalid range set, and a set with
 // more than one satisfiable range (multipart/byteranges is not supported).
-// See RFC 9110 §14 and §13.1.5.
+// A 416 carries no Content-Encoding even if the handler set one: its body is
+// empty, not an encoded stream. See RFC 9110 §14 and §13.1.5.
 //
 // The entire file is loaded into memory (capped at 100 MB). Returns
 // [HTTPError] with status 413 if the file exceeds this limit. For large
@@ -917,6 +918,16 @@ func (c *Context) SetCookie(cookie *Cookie) {
 // Security: filePath is opened directly — callers MUST sanitize user-supplied
 // paths (e.g. filepath.Clean + prefix check) to prevent directory traversal.
 func (c *Context) File(filePath string) error {
+	return c.serveFile(filePath, "", nil)
+}
+
+// serveFile is File. contentType, when not empty, replaces the type taken from
+// filePath's extension. onOpen, when not nil, runs once the file is open and
+// its size and mtime are read from the open descriptor, before anything is
+// decided about the response: middleware/static sets its validators from them
+// there, so they describe the bytes that are sent even when the path is
+// replaced meanwhile (celeris#846), and answers a 304 (handled=true).
+func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64) (handled bool, err error)) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -929,14 +940,21 @@ func (c *Context) File(filePath string) error {
 	}
 	size := stat.Size()
 
+	if onOpen != nil {
+		if handled, err := onOpen(stat.ModTime(), size); handled {
+			return err
+		}
+	}
+
 	if size > int64(maxStreamBodySize) {
 		return NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
-	ext := filepath.Ext(filePath)
-	contentType := mime.TypeByExtension(ext)
 	if contentType == "" {
-		contentType = "application/octet-stream"
+		contentType = mime.TypeByExtension(filepath.Ext(filePath))
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
 	}
 
 	c.SetHeader("accept-ranges", "bytes")
@@ -951,6 +969,8 @@ func (c *Context) File(filePath string) error {
 		case httprange.Unsatisfiable:
 			var crBuf [32]byte
 			c.SetHeader("content-range", string(httprange.AppendUnsatisfied(crBuf[:0], size)))
+			// The empty body of a 416 is not an encoded stream.
+			c.delRespHeader("content-encoding")
 			return c.NoContent(http.StatusRequestedRangeNotSatisfiable)
 		case httprange.Partial:
 			length := end - start + 1
@@ -1040,6 +1060,11 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // error is returned. Symlinks are resolved and rechecked to prevent a
 // symlink under baseDir from escaping the directory boundary.
 func (c *Context) FileFromDir(baseDir, userPath string) error {
+	return c.fileFromDir(baseDir, userPath, "", nil)
+}
+
+// fileFromDir is FileFromDir with serveFile's contentType and onOpen.
+func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64) (bool, error)) error {
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
 	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {
@@ -1064,7 +1089,7 @@ func (c *Context) FileFromDir(baseDir, userPath string) error {
 	if info.IsDir() {
 		return NewHTTPError(400, "invalid file path")
 	}
-	return c.File(resolved)
+	return c.serveFile(resolved, contentType, onOpen)
 }
 
 // FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
@@ -1113,6 +1138,17 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		return err
 	}
 	return c.Blob(200, contentType, data)
+}
+
+// delRespHeader removes the response header key (lowercase, as SetHeader
+// stores it) if it is set.
+func (c *Context) delRespHeader(key string) {
+	for i, h := range c.respHeaders {
+		if h[0] == key {
+			c.respHeaders = append(c.respHeaders[:i], c.respHeaders[i+1:]...)
+			return
+		}
+	}
 }
 
 // respHeader returns the value of the response header key (lowercase, as

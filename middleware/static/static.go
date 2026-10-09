@@ -1,6 +1,8 @@
 package static
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"html"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/httprange"
 )
 
@@ -166,7 +169,6 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 		indexInfo, indexErr := os.Stat(indexPath)
 		if indexErr == nil && !indexInfo.IsDir() {
 			filePath = filepath.Join(filePath, index)
-			info = indexInfo
 		} else if browse {
 			// Resolve symlinks and recheck to prevent symlink escape,
 			// mirroring the protection in Context.FileFromDir.
@@ -187,44 +189,78 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 		}
 	}
 
-	etag := setCacheHeaders(c, info.ModTime(), info.Size(), cacheControl)
-	if notModified(c, etag, info.ModTime()) {
-		return c.NoContent(304)
+	if serveOSHook != nil {
+		serveOSHook()
 	}
 
+	// The validators and the 304 come from the file as it is opened for
+	// serving (serveOSFile), and from the pre-compressed variant when one is
+	// served: the stat above only decided that there is a file.
 	if compress {
-		if served, err := servePreCompressed(c, cleanRoot, filePath, fullPath); served {
+		if served, err := servePreCompressed(c, cleanRoot, filePath, fullPath, cacheControl); served {
 			return err
 		}
 	}
 
-	return c.FileFromDir(cleanRoot, filePath)
+	return serveOSFile(c, cleanRoot, filePath, "", "", cacheControl)
+}
+
+// serveOSHook is a test seam (celeris#846 item 4): when set it runs in serveOS
+// after the path was stat-ed and before the file is served, which is where
+// the path used to be replaced under the validators.
+var serveOSHook func()
+
+// serveOSFile serves filePath under cleanRoot through Context.FileFromDir.
+// Last-Modified, ETag and Cache-Control are set from the mtime and size of the
+// file as it is opened, and an If-None-Match or If-Modified-Since that holds
+// for them gets the 304; a stat made earlier could describe another file than
+// the one opened when the path is replaced in between (celeris#846). So the
+// Range and If-Range that File then decides are about the very bytes sent.
+//
+// contentType, when not empty, is the response's type (a pre-compressed
+// variant is served with its original's, not the one its ".gz" maps to).
+// encoding, when not empty, is set as Content-Encoding on the response that
+// carries the file, not on a 304; File drops it again from a 416.
+func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding, cacheControl string) error {
+	return ctxkit.FileFromDir(c, cleanRoot, filePath, contentType, func(modTime time.Time, size int64) (bool, error) {
+		etag := setCacheHeaders(c, modTime, size, cacheControl)
+		if notModified(c, etag, modTime) {
+			return true, c.NoContent(304)
+		}
+		if encoding != "" {
+			c.SetHeader("content-encoding", encoding)
+		}
+		return false, nil
+	})
 }
 
 // servePreCompressed checks for .br or .gz pre-compressed variants of the
-// requested file and serves them if the client accepts the encoding.
-// Returns (true, err) if a pre-compressed file was served, (false, nil) to
-// fall through to normal serving.
-func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath string) (bool, error) {
+// requested file and serves them if the client accepts the encoding. The
+// variant is the representation the client gets and keeps, so its validators,
+// 304, If-Range and Content-Range are its own (celeris#846), and it is served
+// with the original's content type. Returns (true, err) if a pre-compressed
+// file was served, (false, nil) to fall through to normal serving.
+func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cacheControl string) (bool, error) {
 	ae := c.Header("accept-encoding")
 	if ae == "" {
 		return false, nil
 	}
 
 	// Prefer Brotli over gzip.
-	if strings.Contains(ae, "br") {
-		if _, err := os.Stat(fullPath + ".br"); err == nil {
-			c.SetHeader("content-encoding", "br")
-			addVary(c)
-			return true, c.FileFromDir(cleanRoot, filePath+".br")
+	for _, v := range [...]struct{ suffix, encoding string }{{".br", "br"}, {".gz", "gzip"}} {
+		if !strings.Contains(ae, v.encoding) {
+			continue
 		}
-	}
-	if strings.Contains(ae, "gzip") {
-		if _, err := os.Stat(fullPath + ".gz"); err == nil {
-			c.SetHeader("content-encoding", "gzip")
-			addVary(c)
-			return true, c.FileFromDir(cleanRoot, filePath+".gz")
+		if _, err := os.Stat(fullPath + v.suffix); err != nil {
+			continue
 		}
+		ct := mime.TypeByExtension(filepath.Ext(filePath))
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		// Vary goes out on the 304 too.
+		addVary(c)
+		return true, serveOSFile(c, cleanRoot, filePath+v.suffix, ct, v.encoding, cacheControl)
 	}
 
 	return false, nil
@@ -280,8 +316,18 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		return celeris.NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
-	// 3. Cache headers + 304 check. Reuse pre-formatted strings from the
-	// fs cache when present and the modTime matches.
+	// 3. Pre-compressed check (if enabled). A variant is its own
+	// representation: it brings its own validators, 304 and range, so it is
+	// tried before the original's validators are set.
+	if compress {
+		if served, err := servePreCompressedFS(c, fsys, filePath, cacheControl); served {
+			return err
+		}
+	}
+
+	// 4. Content, from the per-file cache when present and the modTime
+	// matches, else read and cached. The cached ETag is a hash of the bytes
+	// (celeris#846), so a cold request, a 304 included, reads the file first.
 	modTime := stat.ModTime()
 	var cached *cachedFile
 	if cf, ok := cache.Load(filePath); ok {
@@ -289,78 +335,81 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 			cached = cf2
 		}
 	}
+	if cached == nil {
+		var data []byte
+		var contentType string
 
-	var etag, lastModifiedStr string
-	if !modTime.IsZero() {
-		if cached != nil {
-			etag = cached.etag
-			lastModifiedStr = cached.lastModifiedStr
+		if rs, ok := f.(io.ReadSeeker); ok {
+			contentType = sniffContentType(rs, filePath)
+			data = make([]byte, size)
+			if _, err := io.ReadFull(rs, data); err != nil {
+				return err
+			}
 		} else {
-			etag, lastModifiedStr = computeFSCacheStrings(modTime, size)
+			data = make([]byte, size)
+			if _, err := io.ReadFull(f, data); err != nil {
+				return err
+			}
+			contentType = detectContentType(filePath, data)
 		}
-		c.SetHeader("last-modified", lastModifiedStr)
-		c.SetHeader("etag", etag)
+
+		var etag, lastModifiedStr string
+		if !modTime.IsZero() {
+			etag, lastModifiedStr = strongETag(data), modTime.UTC().Format(http.TimeFormat)
+		}
+		cached = &cachedFile{
+			data:            data,
+			contentType:     contentType,
+			etag:            etag,
+			lastModifiedStr: lastModifiedStr,
+			modTime:         modTime,
+		}
+		// filePath is a sub-slice of c.Path(), which on the native engines is
+		// a zero-copy view over the connection's read buffer. sync.Map retains
+		// the key; the buffer is reused by the next request on that conn, so
+		// the stored key's bytes would mutate under the map and corrupt its
+		// hash trie ("internal/sync.HashTrieMap: ran out of hash bits" panics,
+		// ~67k/150s under a GET flood). Clone on the miss path only -- the hit
+		// path's Load does not retain its argument.
+		cache.Store(strings.Clone(filePath), cached)
+	}
+
+	// 5. Cache headers + 304 check.
+	if !modTime.IsZero() {
+		c.SetHeader("last-modified", cached.lastModifiedStr)
+		c.SetHeader("etag", cached.etag)
 		if cacheControl != "" {
 			c.SetHeader("cache-control", cacheControl)
 		}
-		if notModified(c, etag, modTime) {
+		if notModified(c, cached.etag, modTime) {
 			return c.NoContent(304)
 		}
 	}
 
-	// 4. Pre-compressed check (if enabled).
-	if compress {
-		if served, err := servePreCompressedFS(c, fsys, filePath); served {
-			return err
-		}
-	}
-
-	// 5. Serve cached content if available.
+	// 6. Serve.
 	c.SetHeader("accept-ranges", "bytes")
-	if cached != nil {
-		return serveFSCached(c, cached.data, cached.contentType, etag, lastModifiedStr)
-	}
-
-	// 6. Read, cache (with headers), and serve.
-	var data []byte
-	var contentType string
-
-	if rs, ok := f.(io.ReadSeeker); ok {
-		contentType = sniffContentType(rs, filePath)
-		data = make([]byte, size)
-		if _, err := io.ReadFull(rs, data); err != nil {
-			return err
-		}
-	} else {
-		data = make([]byte, size)
-		if _, err := io.ReadFull(f, data); err != nil {
-			return err
-		}
-		contentType = detectContentType(filePath, data)
-	}
-
-	// filePath is a sub-slice of c.Path(), which on the native engines is
-	// a zero-copy view over the connection's read buffer. sync.Map retains
-	// the key; the buffer is reused by the next request on that conn, so
-	// the stored key's bytes would mutate under the map and corrupt its
-	// hash trie ("internal/sync.HashTrieMap: ran out of hash bits" panics,
-	// ~67k/150s under a GET flood). Clone on the miss path only -- the hit
-	// path's Load does not retain its argument.
-	cache.Store(strings.Clone(filePath), &cachedFile{
-		data:            data,
-		contentType:     contentType,
-		etag:            etag,
-		lastModifiedStr: lastModifiedStr,
-		modTime:         modTime,
-	})
-	return serveFSCached(c, data, contentType, etag, lastModifiedStr)
+	return serveFSCached(c, cached.data, cached.contentType, cached.etag, cached.lastModifiedStr, "")
 }
 
-// computeFSCacheStrings formats the Last-Modified and ETag strings for a
-// file with the given modTime and size. Shared between the cache-miss
-// path in serveFS (which stores the result on cachedFile) and one-off
-// renderings; setCacheHeaders still handles the serveOS path where no
-// per-file cache exists.
+// strongETag is the entity-tag of data: the first 16 bytes of its SHA-256, in
+// hex, quoted. It is a strong validator (RFC 9110 §8.8.3): it changes whenever
+// the bytes do, whatever the file's mtime, and it is the same for the same
+// bytes in another process, so an If-Range carrying it holds only for the
+// version it came from.
+func strongETag(data []byte) string {
+	sum := sha256.Sum256(data)
+	var buf [34]byte
+	buf[0] = '"'
+	hex.Encode(buf[1:33], sum[:16])
+	buf[33] = '"'
+	return string(buf[:])
+}
+
+// computeFSCacheStrings formats the Last-Modified and weak ETag strings for a
+// file with the given modTime and size. servePreCompressedFS uses it for a
+// variant, which is read per request and not cached, so hashing it would cost
+// its whole size each time; the cached files of serveFS get strongETag
+// instead. setCacheHeaders handles the serveOS path.
 func computeFSCacheStrings(modTime time.Time, size int64) (etag, lastModifiedStr string) {
 	lastModifiedStr = modTime.UTC().Format(http.TimeFormat)
 	var etagBuf [64]byte
@@ -374,9 +423,11 @@ func computeFSCacheStrings(modTime time.Time, size int64) (etag, lastModifiedStr
 }
 
 // servePreCompressedFS attempts to serve a pre-compressed variant (.br or .gz)
-// of the requested file from an fs.FS. Returns (true, err) if a compressed
-// variant was served, (false, nil) to fall through to normal serving.
-func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool, error) {
+// of the requested file from an fs.FS. The variant is the representation the
+// client gets, so the Last-Modified, ETag, 304 and range are its own
+// (celeris#846). Returns (true, err) if a compressed variant was served,
+// (false, nil) to fall through to normal serving.
+func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath, cacheControl string) (bool, error) {
 	ae := c.Header("accept-encoding")
 	if ae == "" {
 		return false, nil
@@ -405,11 +456,26 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 			_ = f.Close()
 			continue
 		}
+		// Vary goes out on the 304 too.
+		addVary(c)
+		var etag, lastModified string
+		if modTime := stat.ModTime(); !modTime.IsZero() {
+			etag, lastModified = computeFSCacheStrings(modTime, stat.Size())
+			c.SetHeader("last-modified", lastModified)
+			c.SetHeader("etag", etag)
+			if cacheControl != "" {
+				c.SetHeader("cache-control", cacheControl)
+			}
+			if notModified(c, etag, modTime) {
+				_ = f.Close()
+				return true, c.NoContent(304)
+			}
+		}
 		data := make([]byte, stat.Size())
 		_, readErr := io.ReadFull(f, data)
 		_ = f.Close()
 		if readErr != nil {
-			continue
+			return true, readErr
 		}
 		ct := mime.TypeByExtension(filepath.Ext(filePath))
 		if ct == "" {
@@ -426,9 +492,8 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 				ct = "application/octet-stream"
 			}
 		}
-		c.SetHeader("content-encoding", v.encoding)
-		addVary(c)
-		return true, c.Blob(200, ct, data)
+		c.SetHeader("accept-ranges", "bytes")
+		return true, serveFSCached(c, data, ct, etag, lastModified, v.encoding)
 	}
 
 	return false, nil
@@ -438,8 +503,10 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 // handling range requests via byte slicing. etag and lastModified are the
 // validators serveFS put on the response ("" when the file has no modTime),
 // which If-Range is checked against. The decision is the one
-// Context.File makes for the Root path (internal/httprange).
-func serveFSCached(c *celeris.Context, data []byte, contentType, etag, lastModified string) error {
+// Context.File makes for the Root path (internal/httprange). encoding, when
+// not empty, is the Content-Encoding of data (a pre-compressed variant); a
+// 416 does not carry it, as File's does not.
+func serveFSCached(c *celeris.Context, data []byte, contentType, etag, lastModified, encoding string) error {
 	if rng := c.Header("range"); rng != "" {
 		size := int64(len(data))
 		start, end, out := httprange.Decide(c.Method(), rng, c.Header("if-range"), etag, lastModified, size)
@@ -451,8 +518,14 @@ func serveFSCached(c *celeris.Context, data []byte, contentType, etag, lastModif
 		case httprange.Partial:
 			var rngBuf [64]byte
 			c.SetHeader("content-range", string(httprange.AppendContentRange(rngBuf[:0], start, end, size)))
+			if encoding != "" {
+				c.SetHeader("content-encoding", encoding)
+			}
 			return c.Blob(206, contentType, data[start:end+1])
 		}
+	}
+	if encoding != "" {
+		c.SetHeader("content-encoding", encoding)
 	}
 	return c.Blob(200, contentType, data)
 }
