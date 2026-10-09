@@ -340,6 +340,60 @@ func TestValidateNegativePort(t *testing.T) {
 	}
 }
 
+// TestWithDefaults_H2UpgradeResolved covers celeris#964: a value the caller
+// resolved through SetH2Upgrade is final. WithDefaults used to read a resolved
+// false as "unset" and turn it into true on Protocol Auto, so the documented
+// celeris.Config.EnableH2Upgrade = &false never took effect. A literal that
+// sets the bool directly still gets the Auto default, and the marker must
+// survive every later pass (the engine constructors normalise again).
+func TestWithDefaults_H2UpgradeResolved(t *testing.T) {
+	cases := []struct {
+		name string
+		in   func() Config
+		want bool
+	}{
+		{"auto resolved false stays false", func() Config {
+			c := Config{Protocol: engine.Auto}
+			c.SetH2Upgrade(false)
+			return c
+		}, false},
+		{"default protocol resolved false stays false", func() Config {
+			var c Config
+			c.SetH2Upgrade(false)
+			return c
+		}, false},
+		{"auto resolved true stays true", func() Config {
+			c := Config{Protocol: engine.Auto}
+			c.SetH2Upgrade(true)
+			return c
+		}, true},
+		{"h2c resolved true stays true", func() Config {
+			c := Config{Protocol: engine.H2C}
+			c.SetH2Upgrade(true)
+			return c
+		}, true},
+		{"http1 resolved false stays false", func() Config {
+			c := Config{Protocol: engine.HTTP1}
+			c.SetH2Upgrade(false)
+			return c
+		}, false},
+		{"auto literal false is still defaulted to true", func() Config {
+			return Config{Protocol: engine.Auto}
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.in()
+			for pass := 1; pass <= 3; pass++ {
+				c = c.WithDefaults()
+				if c.EnableH2Upgrade != tc.want {
+					t.Fatalf("pass %d: EnableH2Upgrade = %v, want %v", pass, c.EnableH2Upgrade, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestWithDefaults_EnableH2Upgrade(t *testing.T) {
 	cases := []struct {
 		name     string
