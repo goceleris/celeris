@@ -245,7 +245,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 }
 
 // requireAsyncCancelFlags is New's gate on the async-cancel-flags probe
-// (celeris#682): io_uring needs Linux 5.19, the release that added the
+// (celeris#682, #872): io_uring needs Linux 5.19, the release that added the
 // IORING_ASYNC_CANCEL flags. Through 5.18 the kernel fails every cancel the
 // engine submits with -EINVAL and leaves its target running. On 5.15 the
 // recv of a connection the engine closes keeps the socket open, so the peer
@@ -253,30 +253,45 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 // hand that recv's buffer to another connection while the recv can still
 // complete into it (the #256 class, read from code).
 //
-// It refuses io_uring, as unavailable, where the kernel rejected the flags,
-// whatever version it claims, and on a kernel whose version predates 5.19
-// unless the probe found the flags accepted (a vendor backport). From 5.19 a
-// probe with no answer, or one it does not recognise, does not refuse: the
-// flags exist there, and the probe's private ring can fail with EMFILE or
-// ENOMEM under load (celeris#681 N1); that engine only keeps the hand-off's
-// reap off. The error starts "io_uring not available on this system", as
-// New's error for a kernel with no io_uring does: the adaptive engine then
-// starts on epoll (and CELERIS_ADAPTIVE_START=iouring falls back to it), and
-// an explicit io_uring engine fails to start with the kernel requirement in
-// its error.
+// Below 5.19 the answer is the version, whatever the probe said. The probe
+// sends one of the four cancel forms the engine builds (by user_data with
+// CANCEL_ALL, no skip-success), so on a kernel that carries only some of the
+// flags (a partial vendor backport) it answers accepted while the close
+// path's skip-success form or the by-fd forms still fail with -EINVAL on
+// every close (celeris#872). Nothing below the floor is told apart from that
+// case by one form, and the supported floor is 5.19, so the engine is not
+// built there.
+//
+// From 5.19 the kernel's answer decides: it refuses io_uring, as
+// unavailable, where the kernel rejected the flags whatever version it
+// claims. A probe with no answer, or one it does not recognise, does not
+// refuse from 5.19: the flags exist there, and the probe's private ring can
+// fail with EMFILE or ENOMEM under load (celeris#681 N1); that engine only
+// keeps the hand-off's reap off. The error starts "io_uring not available on
+// this system", as New's error for a kernel with no io_uring does: the
+// adaptive engine then starts on epoll (and CELERIS_ADAPTIVE_START=iouring
+// falls back to it), and an explicit io_uring engine fails to start with the
+// kernel requirement in its error.
 func requireAsyncCancelFlags(p asyncCancelProbe, reason string, profile engine.CapabilityProfile) error {
 	fromFloor := profile.KernelMajor > 5 || (profile.KernelMajor == 5 && profile.KernelMinor >= 19)
 	switch {
-	case p == asyncCancelAccepted:
-		return nil
 	case p == asyncCancelRejected:
 		return fmt.Errorf("io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, "+
 			"and kernel %s rejects the IORING_ASYNC_CANCEL flags every connection close uses (%s); "+
 			"use the epoll engine (celeris#682)", profile.KernelVersion, reason)
 	case !fromFloor:
+		// The probe's answer and reason follow the version, which is the
+		// cause. Accepted is the one answer that needs explaining: it reads
+		// like a pass, and is why a version check is needed at all.
+		detail := "the IORING_ASYNC_CANCEL flags probe result: " + p.String()
+		if reason != "" {
+			detail += " (" + reason + ")"
+		}
+		if p == asyncCancelAccepted {
+			detail += ", which a kernel that carries only some of the flags can give while its other cancel forms fail"
+		}
 		return fmt.Errorf("io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, "+
-			"and kernel %s predates it; the IORING_ASYNC_CANCEL flags probe did not find them accepted "+
-			"(%s: %s); use the epoll engine (celeris#682)", profile.KernelVersion, p, reason)
+			"and kernel %s predates it; %s; use the epoll engine (celeris#682, #872)", profile.KernelVersion, detail)
 	}
 	return nil
 }

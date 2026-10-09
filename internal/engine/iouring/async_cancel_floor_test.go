@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -173,7 +174,10 @@ func runCancelForm682(t *testing.T, f cancelForm682) (cancelled bool, cancelRes 
 // is submitted against a pending recv on a private ring. Where any of them
 // leaves the recv running, New must refuse io_uring with the kernel
 // requirement in its error; where all of them cancel it, New must build the
-// engine. When an engine is built it is also run: keep-alive connections the
+// engine from 5.19. Below 5.19 New refuses on the version alone even then
+// (celeris#872: a kernel whose four forms all work there is a full vendor
+// backport, and the floor still excludes it), which the test logs and
+// accepts. When an engine is built it is also run: keep-alive connections the
 // engine closes at their idle timeout must each get a FIN, which a close
 // whose cancel failed does not send (the recv still holds the socket).
 func TestIOUringOnTheRunningKernel682(t *testing.T) {
@@ -226,7 +230,15 @@ func TestIOUringOnTheRunningKernel682(t *testing.T) {
 		}
 	} else if err != nil {
 		if strings.Contains(err.Error(), "5.19") {
-			t.Fatalf("New refused io_uring on kernel %s, where every cancel form works: %v", kernelRelease(), err)
+			// Below 5.19 New refuses on the version alone (celeris#872): a
+			// kernel whose four cancel forms all work there is a full vendor
+			// backport, and the floor still excludes it.
+			if kv := probe.Probe(); kv.KernelMajor > 5 || (kv.KernelMajor == 5 && kv.KernelMinor >= 19) {
+				t.Fatalf("New refused io_uring on kernel %s, where every cancel form works: %v", kernelRelease(), err)
+			}
+			t.Logf("celeris682 kernel %s predates 5.19: New refuses on the version although every cancel form works: %v",
+				kernelRelease(), err)
+			return
 		}
 		skipOrFail656(t, "iouring engine unavailable: %v", err)
 	}

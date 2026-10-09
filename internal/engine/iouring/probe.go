@@ -576,9 +576,13 @@ var (
 // IORING_ASYNC_CANCEL_ALL, keyed on the recv's user_data
 // (prepCancelUserDataReported). Through 5.18, io_async_cancel_prep rejects any
 // non-zero cancel_flags with -EINVAL, and no IORING_FEAT bit reports the
-// flags, so the kernel has to be asked. Version-based selection is no answer
-// either: the Base tier covers every 5.10-5.18 kernel, and a vendor kernel can
-// claim a version its feature surface does not match.
+// flags, so the kernel has to be asked. From 5.19, where New's decision
+// is the kernel's answer (requireAsyncCancelFlags), a version is still no
+// answer: a vendor kernel can claim one its feature surface does not match.
+// Below 5.19 New does use the version (celeris#872): this
+// probe sends only the user_data+CANCEL_ALL form, which a partial backport can
+// accept while the engine's other cancel forms still fail, so no answer of it
+// clears a kernel that predates the floor.
 //
 // The probe submits exactly the reap's SQE form against a user_data that
 // nothing carries and reads the cancel's own completion; see
