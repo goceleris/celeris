@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -231,8 +232,20 @@ func (ps *PubSub) control(verb string, names []string, update func()) error {
 	update()
 	conn := ps.conn
 	ps.mu.Unlock()
-	return sendPubSubControl(conn, append([]string{verb}, names...))
+	err := sendPubSubControl(conn, append([]string{verb}, names...))
+	if errors.Is(err, ErrClosed) && conn != nil && !ps.closed.Load() {
+		// conn is down and ps is not: the reconnect loop replays the sets,
+		// so tell the caller the write was not sent, but not that ps is
+		// closed (ErrClosed is final, this is not).
+		return errPubSubConnDown
+	}
+	return err
 }
+
+// errPubSubConnDown is returned by a control call that finds the pubsub conn
+// dropped and the reconnect loop not yet done. The subscription set is
+// updated and the reconnect replays it.
+var errPubSubConnDown = errors.New("celeris-redis: pubsub connection is down; reconnecting, the subscription is replayed")
 
 // sendPubSubControl writes a control command without tracking a reply (pubsub
 // control frames are delivered as push). The caller holds ps.ctlMu and read

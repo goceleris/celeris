@@ -510,3 +510,42 @@ func TestPubSubControlWritesDropsAndCloseInterleave929(t *testing.T) {
 		waitFor(t, "the pubsub pool to drain", 5*time.Second, func() bool { return r.cl.pool.pubsub.Stats().Open == 0 })
 	}
 }
+
+// (g) A control call that lands while the conn is down and the reconnect is
+// pending is not sent on the dead conn, does not claim the PubSub is closed,
+// and is replayed by the reconnect.
+func TestPubSubControlWhileConnDownIsReplayed929(t *testing.T) {
+	r := newPubsubRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ps, err := r.cl.newPubSub(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if err := ps.Subscribe(ctx, "early"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the server to see SUBSCRIBE", 5*time.Second, func() bool { return r.log.count("SUBSCRIBE") == 1 })
+
+	_ = ps.connNow().Close() // the conn drops; the reconnect waits out its first backoff (>= 40 ms)
+	err = ps.Subscribe(ctx, "late")
+	if err == nil {
+		t.Error("Subscribe on a dropped conn returned nil")
+	}
+	if errors.Is(err, ErrClosed) {
+		t.Errorf("Subscribe on a dropped conn returned ErrClosed (%v), but the PubSub is open", err)
+	}
+	waitFor(t, "the reconnect to replay both channels", 10*time.Second, func() bool {
+		r.log.mu.Lock()
+		defer r.log.mu.Unlock()
+		for _, cmds := range r.log.per {
+			for _, c := range cmds {
+				if strings.HasPrefix(c, "SUBSCRIBE ") && strings.Contains(c, "late") && strings.Contains(c, "early") {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
