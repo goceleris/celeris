@@ -34,12 +34,15 @@ type Message struct {
 // ack is not tracked synchronously. The channel returned by [PubSub.Channel]
 // is closed once [PubSub.Close] is called or the reconnect loop gives up.
 //
-// A subscribe/unsubscribe call on an open PubSub whose connection is down
-// returns a non-nil error that is not [ErrClosed]: the command was not sent,
-// the subscription set is updated and the reconnect replays it, so the call
-// need not be repeated. [ErrClosed] means the PubSub itself is closed, also
-// when [PubSub.Close] raced the call. [PubSub.Close] waits for a control
-// call that is already writing to return before it releases the connection.
+// A subscribe/unsubscribe call on an open PubSub whose connection is down is
+// not sent: it returns a non-nil error that is neither [ErrClosed] nor the
+// engine's ErrUnknownFD, the subscription set is updated and the reconnect
+// replays it, so the call need not be repeated. Any other error from the
+// write (for example [ErrQueueFull] on a live connection) means the command
+// was not sent and nothing replays it before the next reconnect. [ErrClosed]
+// means the PubSub itself is closed, also when [PubSub.Close] raced the call.
+// [PubSub.Close] waits for a control call that is already writing to return
+// before it releases the connection.
 type PubSub struct {
 	client *Client
 
