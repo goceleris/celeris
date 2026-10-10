@@ -309,6 +309,15 @@ func scenarios981() []scenario981 {
 			want: obs981{errAt: 1, goaway: []goAwayRecord{{1, http2.ErrCodeCompression}}, active: 1, streams: 1, lastClient: 3},
 		},
 		{
+			// An admitted block that does not decode is a connection error too; its GOAWAY names the
+			// last stream the server opened (1, the stream whose block it was), not 0.
+			name: "admitted-block-does-not-decode",
+			steps: func(e *enc981) []step981 {
+				return []step981{hdr981(1, false, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x80})}
+			},
+			want: obs981{errAt: 0, goaway: []goAwayRecord{{1, http2.ErrCodeCompression}}, active: 1, streams: 1, lastClient: 1},
+		},
+		{
 			name: "id-reused-after-completion",
 			steps: func(e *enc981) []step981 {
 				return []step981{hdr981(1, true, e.req()), hdr981(1, true, e.req())}

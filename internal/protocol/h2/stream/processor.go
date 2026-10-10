@@ -138,7 +138,6 @@ type Processor struct {
 	connWriter           h2Conn
 	hpackDecoder         *hpack.Decoder
 	hpackTarget          *[][2]string // current HPACK decode target slice (avoids closure alloc per request)
-	refusedFields        [][2]string  // decode target of a refused block (emit is off: nothing is appended); a field, so no allocation per refusal
 	joinCookies          bool         // the block being decoded is a request's: hpackEmit joins its cookie fields (celeris#944)
 	cookieAt             int          // index in *hpackTarget of the block's first cookie field, or -1
 	cookieJoined         bool         // cookieBuf holds the joined value of 2 or more cookie fields
@@ -199,6 +198,11 @@ type Processor struct {
 	// (event loop under H2State.mu).
 	goAwaySent   bool
 	goAwayLastID uint32
+
+	// refusedFields is the decode target of a refused stream's block (emit is
+	// off, so nothing is appended): a field, so a refusal allocates no slice.
+	// Last in the struct: the fast path's fields keep their offsets.
+	refusedFields [][2]string
 }
 
 // PoolHandlersRunning reports whether a stream of this connection has a
@@ -1218,13 +1222,16 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 		headersSlicePoolIn.Put(pooled)
 	}()
 	trailers := adm == admitTrailers
+	// A block that does not decode is a connection error (COMPRESSION_ERROR).
+	// The GOAWAY names the last stream the server opened, not 0, as refuseStream's
+	// does (RFC 9113 §6.8: 0 lets the client replay every request it has in flight).
 	p.beginHeaderDecode(pooled, !trailers)
 	if _, err := p.hpackDecoder.Write(block); err != nil {
-		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
 	}
 	if err := p.hpackDecoder.Close(); err != nil {
-		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
 	if p.endHeaderDecode() {
