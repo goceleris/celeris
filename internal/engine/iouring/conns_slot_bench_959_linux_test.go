@@ -30,16 +30,9 @@ import (
 // below it), so every call reads a slot of the same table, and, after the
 // change, takes the same lock the worker takes per accept and per close.
 func BenchmarkAcceptCloseChurn959(b *testing.B) {
-	for _, spin := range []bool{false, true} {
-		name := "plain"
-		if spin {
-			name = "spin"
-		}
-		b.Run(name, func(b *testing.B) { benchAcceptCloseChurn959(b, spin) })
-	}
-}
-
-func benchAcceptCloseChurn959(b *testing.B, spin bool) {
+	// One engine for both arms and for every run of the b.N ramp: a ring that
+	// was just closed still holds its memlock charge for a few milliseconds
+	// and starting engines back to back can fail with ENOMEM.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		b.Fatalf("pick port: %v", err)
@@ -67,6 +60,11 @@ func benchAcceptCloseChurn959(b *testing.B, spin bool) {
 		}
 	}()
 	for deadline := time.Now().Add(15 * time.Second); ; {
+		select {
+		case err := <-done:
+			b.Fatalf("Listen returned: %v", err)
+		default:
+		}
 		if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
 			_ = c.Close()
 			if e.NumWorkers() > 0 {
@@ -78,6 +76,11 @@ func benchAcceptCloseChurn959(b *testing.B, spin bool) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	b.Run("plain", func(b *testing.B) { benchAcceptCloseChurn959(b, e, addr, false) })
+	b.Run("spin", func(b *testing.B) { benchAcceptCloseChurn959(b, e, addr, true) })
+}
+
+func benchAcceptCloseChurn959(b *testing.B, e *Engine, addr string, spin bool) {
 	stopSpin := make(chan struct{})
 	var spinWG sync.WaitGroup
 	if spin {
