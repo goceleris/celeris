@@ -55,7 +55,10 @@ func (p CPUPlan) Pinned() int {
 // PlanWorkerCPUs chooses the CPU of each of numWorkers engine loops.
 //
 // The candidates are the members of the calling thread's allowed CPU set
-// (sched_getaffinity), not the indices 0..NumCPU-1: a process restricted by
+// (sched_getaffinity(0): the mask of the thread that calls Listen, which is
+// the process's mask unless something narrowed that one thread, such as a
+// server started from a goroutine locked to a thread the application pinned),
+// not the indices 0..NumCPU-1: a process restricted by
 // taskset, sched_setaffinity or a cgroup cpuset keeps its loops inside the
 // restriction (celeris#909). On a host whose allowed CPUs differ in capacity
 // (arm64 big.LITTLE; /sys/devices/system/cpu/cpuN/cpu_capacity, or the CPU
@@ -63,8 +66,9 @@ func (p CPUPlan) Pinned() int {
 // to the CPUs that are not little and the loops left over run unpinned: a loop
 // pinned to a Cortex-A520 of an msr1 host stalled its connections for 5 s and
 // more, a loop on an A720 or an unpinned one never did. Where the CPUs are
-// alike the i-th worker gets the i-th allowed CPU, wrapping, spread across
-// NUMA nodes as before.
+// alike the i-th worker gets the i-th allowed CPU, wrapping. On a host with
+// several NUMA nodes the CPUs are taken from the nodes the allowed set covers
+// in turn, and every allowed CPU gets a loop before any gets a second.
 //
 // Any read error means "homogeneous"; the plan then is what a host without
 // the information gets.
@@ -152,9 +156,10 @@ func planWorkerCPUs(numWorkers int, src planSource) CPUPlan {
 	return plan
 }
 
-// spread picks numWorkers CPUs out of cands, one NUMA node after the other
-// when the host has several (each node's CPU list intersected with cands). It
-// wraps around cands when there are more workers than CPUs. nodes may be nil.
+// spread picks numWorkers CPUs out of cands, taking the CPUs of the host's
+// NUMA nodes in turn (interleaveNodes) and wrapping around the whole order
+// only when there are more workers than CPUs, so that no CPU holds a second
+// loop while another one holds none. nodes may be nil.
 func spread(numWorkers int, cands []int, nodes [][]int) []int {
 	cpus := make([]int, numWorkers)
 	if len(cands) == 0 {
@@ -163,40 +168,59 @@ func spread(numWorkers int, cands []int, nodes [][]int) []int {
 		}
 		return cpus
 	}
-	var perNode [][]int
-	if len(nodes) > 1 {
-		found := false
-		perNode = make([][]int, len(nodes))
-		for n, list := range nodes {
-			for _, c := range list {
-				if slices.Contains(cands, c) {
-					perNode[n] = append(perNode[n], c)
-					found = true
-				}
-			}
-		}
-		if !found {
-			perNode = nil
-		}
-	}
-	if perNode == nil {
-		for i := range cpus {
-			cpus[i] = cands[i%len(cands)]
-		}
-		return cpus
-	}
-	idx := make([]int, len(perNode))
+	order := interleaveNodes(cands, nodes)
 	for i := range cpus {
-		node := i % len(perNode)
-		list := perNode[node]
-		if len(list) == 0 {
-			cpus[i] = cands[i%len(cands)]
-			continue
-		}
-		cpus[i] = list[idx[node]%len(list)]
-		idx[node]++
+		cpus[i] = order[i%len(order)]
 	}
 	return cpus
+}
+
+// interleaveNodes returns every member of cands once, ordered round-robin
+// across the NUMA nodes the set covers: the first CPU of each node, then the
+// second of each, skipping a node that has no CPU left. Only the nodes whose
+// CPU list meets cands take part (a cpuset or taskset that covers one node, or
+// covers them unevenly, leaves the others out rather than handing their turns
+// to CPUs another node already used; celeris#909). Members of cands that no
+// node lists come last. With fewer than two nodes in play the order is cands.
+func interleaveNodes(cands []int, nodes [][]int) []int {
+	if len(nodes) < 2 {
+		return cands
+	}
+	inSet := make(map[int]bool, len(cands))
+	for _, c := range cands {
+		inSet[c] = true
+	}
+	var lists [][]int
+	seen := make(map[int]bool, len(cands))
+	for _, list := range nodes {
+		var l []int
+		for _, c := range list {
+			if inSet[c] && !seen[c] {
+				seen[c] = true
+				l = append(l, c)
+			}
+		}
+		if len(l) > 0 {
+			lists = append(lists, l)
+		}
+	}
+	if len(lists) < 2 {
+		return cands
+	}
+	order := make([]int, 0, len(cands))
+	for round := 0; len(order) < len(seen); round++ {
+		for _, l := range lists {
+			if round < len(l) {
+				order = append(order, l[round])
+			}
+		}
+	}
+	for _, c := range cands {
+		if !seen[c] {
+			order = append(order, c)
+		}
+	}
+	return order
 }
 
 // littleCPUs returns the members of allowed that are little, and a short

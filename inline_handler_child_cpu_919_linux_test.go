@@ -20,13 +20,17 @@ import (
 // on an engine loop's thread, which the native engines pin to one CPU, and a
 // process started from that thread inherits the one-CPU mask (os/exec clones the
 // calling thread; SysProcAttr has no CPU field). The contract written on
-// Config.AsyncHandlers is: start the process from a goroutine of its own, which
-// never runs on the locked loop thread, and the child gets the process's mask.
+// Config.AsyncHandlers has two ways to a child that has the process's mask:
+// start the process from a goroutine of its own, or mark the route [Route.Async]
+// (an async route's handler runs on a goroutine of its own). A route that only
+// inherits the AsyncHandlers default is not one of them: it runs inline until a
+// timed run of it blocks.
 //
-// The test starts the child both ways and checks the way the documentation
-// gives. How the other way (the child started on the loop's own thread) comes
-// out is logged, not asserted: on a big.LITTLE host a loop the engine leaves
-// unpinned (celeris#909) has no pin to hand on.
+// The test starts the child both documented ways and checks that the child has
+// the process's mask. The undocumented way (the child started on the handler's
+// own thread, inline) must show a one-CPU child at least once: that is the
+// premise, "the loops are pinned and a child inherits it", without which the two
+// ways above would pass for any engine that pinned nothing.
 func TestInlineHandlerChildKeepsTheProcessMask919(t *testing.T) {
 	if !pintest.InOwnProcess(t) {
 		pintest.RunInOwnProcess(t, 3*time.Minute)
@@ -39,6 +43,10 @@ func TestInlineHandlerChildKeepsTheProcessMask919(t *testing.T) {
 	if n := pintest.CountCPUs(startMask); n < 2 {
 		t.Skipf("the process may use %d CPU (%s): a one-CPU child cannot be told from one with the process's mask", n, startMask)
 	}
+	statusChild := func() (string, error) {
+		out, err := exec.Command("cat", "/proc/self/status").Output()
+		return cpusAllowedList919(string(out)), err
+	}
 	for _, arm := range keptArms(t) {
 		if arm.async || (arm.engine != celeris.Epoll && arm.engine != celeris.IOUring) {
 			continue
@@ -46,47 +54,67 @@ func TestInlineHandlerChildKeepsTheProcessMask919(t *testing.T) {
 		t.Run(arm.name, func(t *testing.T) {
 			addr, stop := startKeptServer(t, func() *celeris.Server {
 				srv := celeris.New(celeris.Config{Engine: arm.engine, Workers: 4})
-				// The documented way: the child is started from a goroutine of its own.
-				srv.GET("/documented", func(c *celeris.Context) error {
-					type res struct {
-						out []byte
-						err error
-					}
-					ch := make(chan res, 1)
-					go func() {
-						out, err := exec.Command("cat", "/proc/self/status").Output()
-						ch <- res{out, err}
-					}()
-					r := <-ch
-					if r.err != nil {
-						return c.String(500, "%s", r.err.Error())
-					}
-					return c.String(200, "%s", cpusAllowedList919(string(r.out)))
-				})
-				// The other way: the child is started on the handler's own thread.
-				srv.GET("/direct", func(c *celeris.Context) error {
-					out, err := exec.Command("cat", "/proc/self/status").Output()
+				reply := func(c *celeris.Context, mask string, err error) error {
 					if err != nil {
 						return c.String(500, "%s", err.Error())
 					}
-					return c.String(200, "%s", cpusAllowedList919(string(out)))
+					return c.String(200, "%s", mask)
+				}
+				// Documented way 1: the child is started from a goroutine of its own.
+				srv.GET("/goroutine", func(c *celeris.Context) error {
+					type res struct {
+						mask string
+						err  error
+					}
+					ch := make(chan res, 1)
+					go func() {
+						mask, err := statusChild()
+						ch <- res{mask, err}
+					}()
+					r := <-ch
+					return reply(c, r.mask, r.err)
+				})
+				// Documented way 2: a route marked .Async(), the child started
+				// straight from the handler.
+				srv.GET("/async", func(c *celeris.Context) error {
+					mask, err := statusChild()
+					return reply(c, mask, err)
+				}).Async()
+				// Not a way: an unmarked route on an inline server, the child
+				// started straight from the handler.
+				srv.GET("/inline", func(c *celeris.Context) error {
+					mask, err := statusChild()
+					return reply(c, mask, err)
 				})
 				return srv
 			})
 			defer stop()
 
 			const rounds = 12
-			single := 0
 			for i := range rounds {
-				if got := get919(t, addr, "/documented"); got != startMask {
-					t.Errorf("request %d: a child started from a goroutine of its own has CPU mask %q, want the process's %q", i, got, startMask)
+				for _, path := range []string{"/goroutine", "/async"} {
+					if got := get919(t, addr, path); got != startMask {
+						t.Errorf("request %d to %s: the child has CPU mask %q, want the process's %q", i, path, got, startMask)
+					}
 				}
-				if got := get919(t, addr, "/direct"); pintest.CountCPUs(got) == 1 {
+			}
+			// The premise. Each connection lands on a loop of SO_REUSEPORT's
+			// choosing; with one loop pinned of four, a connection misses it
+			// three times in four, so ask until a child shows the pin.
+			const maxTries = 200
+			single, tries := 0, 0
+			for tries < maxTries && single == 0 {
+				tries++
+				if got := get919(t, addr, "/inline"); pintest.CountCPUs(got) == 1 {
 					single++
 				}
 			}
-			t.Logf("celeris919 RESULT engine=%s process_mask=%s documented_way_children=%d direct_children_on_one_cpu=%d/%d",
-				arm.name, startMask, rounds, single, rounds)
+			if single == 0 {
+				t.Errorf("premise: none of %d children an inline handler started had a one-CPU mask, so no loop that served "+
+					"them was pinned and the documented ways above show nothing", tries)
+			}
+			t.Logf("celeris919 RESULT engine=%s process_mask=%s documented_children=%d inline_child_on_one_cpu_after=%d_requests",
+				arm.name, startMask, rounds*2, tries)
 		})
 	}
 }

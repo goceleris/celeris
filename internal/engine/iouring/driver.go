@@ -317,7 +317,10 @@ func (w *Worker) Write(fd int, data []byte) error {
 	return nil
 }
 
-// CPUID returns the CPU this worker is pinned to, or -1 if unpinned.
+// CPUID returns the CPU this worker is pinned to, or -1 if unpinned (planned
+// unpinned, or the kernel refused the pin). The worker's thread settles it as
+// it starts, so the value is valid only once Listen has reported the engine
+// ready; before that it may still change.
 func (w *Worker) CPUID() int {
 	return w.cpuID
 }

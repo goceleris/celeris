@@ -286,22 +286,73 @@ func TestPlanAllowedErrorFallsBackToTheCPUCount(t *testing.T) {
 func TestPlanNUMAIntersectsTheMask(t *testing.T) {
 	// Two nodes, 0-3 and 4-7. The mask 2-3,4-6 keeps two CPUs of node 0 and
 	// three of node 1. Workers alternate between the nodes, each taking its
-	// next allowed CPU; none leaves the mask.
+	// next allowed CPU, and the node that runs out is skipped: every allowed
+	// CPU gets a loop before one gets a second, and none leaves the mask.
 	h := newFakeHost(t, []int{2, 3, 4, 5, 6})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "interleave", planWorkerCPUs(5, h.src()).CPUs, []int{2, 4, 3, 5, 2})
-	// A node the mask excludes entirely: its workers fall back to the set.
-	h = newFakeHost(t, []int{4, 5})
+	eq(t, "interleave", planWorkerCPUs(5, h.src()).CPUs, []int{2, 4, 3, 5, 6})
+	eq(t, "wrap", planWorkerCPUs(7, h.src()).CPUs, []int{2, 4, 3, 5, 6, 2, 4})
+	// A node the mask excludes entirely contributes nothing: its turns do not
+	// fall back to CPUs the other node already used.
+	h = newFakeHost(t, []int{4, 5, 6, 7})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	for _, c := range planWorkerCPUs(4, h.src()).CPUs {
-		if c != 4 && c != 5 {
-			t.Errorf("worker pinned to CPU %d outside the mask 4-5", c)
-		}
-	}
+	eq(t, "one node of two", planWorkerCPUs(4, h.src()).CPUs, []int{4, 5, 6, 7})
 	// No node list intersects the mask (stale sysfs): plain round-robin on the set.
 	h = newFakeHost(t, []int{8, 9})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
 	eq(t, "no intersection", planWorkerCPUs(3, h.src()).CPUs, []int{8, 9, 8})
+	// A member no node lists (stale sysfs) comes after the nodes' CPUs.
+	h = newFakeHost(t, []int{2, 3, 9})
+	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
+	eq(t, "unlisted member", planWorkerCPUs(4, h.src()).CPUs, []int{2, 3, 9, 2})
+}
+
+// celeris#909 (review of #973): a cpuset or taskset that covers one NUMA node,
+// or covers the nodes unevenly, must give every allowed CPU a loop before any
+// CPU gets a second, whatever the number of loops. The first version of the
+// interleave alternated over every node, and the turns of a node the mask left
+// short or empty went to CPUs the other node had already used.
+func TestPlanNUMARestrictedShapesBalanceTheLoops(t *testing.T) {
+	cases := []struct {
+		name    string
+		allowed []int
+		nodes   [][]int
+	}{
+		{"one socket of two, 4 CPUs", rng(4, 7), [][]int{rng(0, 3), rng(4, 7)}},
+		{"one socket of two, 32 CPUs", rng(32, 63), [][]int{rng(0, 31), rng(32, 63)}},
+		{"the other socket", rng(0, 31), [][]int{rng(0, 31), rng(32, 63)}},
+		{"uneven cover 2+3", []int{2, 3, 4, 5, 6}, [][]int{rng(0, 3), rng(4, 7)}},
+		{"kubernetes-like 2-7,8-9", append(rng(2, 7), 8, 9), [][]int{rng(0, 7), rng(8, 15)}},
+		{"three nodes, one empty", append(rng(0, 1), rng(8, 11)...), [][]int{rng(0, 3), rng(4, 7), rng(8, 11)}},
+		{"unrestricted, nodes of 2 and 14", rng(0, 15), [][]int{rng(0, 1), rng(2, 15)}},
+		{"unrestricted, an empty node", rng(0, 15), [][]int{rng(0, 15), nil}},
+		{"unrestricted, equal nodes", rng(0, 7), [][]int{rng(0, 3), rng(4, 7)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFakeHost(t, tc.allowed)
+			h.nodes = tc.nodes
+			for workers := 0; workers <= 2*len(tc.allowed)+3; workers++ {
+				plan := planWorkerCPUs(workers, h.src()).CPUs
+				count := map[int]int{}
+				for _, c := range plan {
+					count[c]++
+				}
+				lo, hi := workers, 0 // loops per allowed CPU
+				for _, c := range tc.allowed {
+					lo, hi = min(lo, count[c]), max(hi, count[c])
+					delete(count, c)
+				}
+				if len(count) > 0 {
+					t.Errorf("%d workers: plan %v leaves the mask %s", workers, plan, FormatCPUs(tc.allowed))
+				}
+				if hi-lo > 1 {
+					t.Errorf("%d workers on %d allowed CPUs: plan %v puts %d loops on one CPU and %d on another",
+						workers, len(tc.allowed), plan, hi, lo)
+				}
+			}
+		})
+	}
 }
 
 func TestFormatCPUs(t *testing.T) {
@@ -373,14 +424,16 @@ func oldDistributeWorkers(numWorkers, numCPU int, nodeCPUs [][]int) []int {
 	return cpus
 }
 
+// Nodes of equal size. A node list that is short, or empty, got the old plan's
+// imbalance (the short node's CPUs reused while the long node's went unused):
+// that is a deliberate change, covered by
+// TestPlanNUMARestrictedShapesBalanceTheLoops.
 func TestPlanUnrestrictedHomogeneousEqualsTheOldPlan(t *testing.T) {
 	topologies := map[string][][]int{
-		"one node":                nil,
-		"two nodes, blocks":       {rng(0, 7), rng(8, 15)},
-		"two nodes, interleaved":  {{0, 2, 4, 6, 8, 10, 12, 14}, {1, 3, 5, 7, 9, 11, 13, 15}},
-		"four nodes":              {rng(0, 3), rng(4, 7), rng(8, 11), rng(12, 15)},
-		"an empty node (no CPUs)": {rng(0, 15), nil},
-		"a short node list":       {rng(0, 1), rng(2, 15)},
+		"one node":               nil,
+		"two nodes, blocks":      {rng(0, 7), rng(8, 15)},
+		"two nodes, interleaved": {{0, 2, 4, 6, 8, 10, 12, 14}, {1, 3, 5, 7, 9, 11, 13, 15}},
+		"four nodes":             {rng(0, 3), rng(4, 7), rng(8, 11), rng(12, 15)},
 	}
 	for name, nodes := range topologies {
 		for _, ncpu := range []int{1, 2, 4, 8, 16} {

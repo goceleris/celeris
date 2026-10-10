@@ -206,12 +206,15 @@ type Config struct {
 	// children. A handler that shells out to ffmpeg, git or an image converter
 	// would run it on a single CPU. Go has no per-process CPU field in
 	// os/exec's SysProcAttr, so celeris cannot undo it inside the call. Start
-	// such a process from a goroutine of its own and wait for it, or enable
-	// AsyncHandlers (or [Route.Async]): a goroutine the handler starts never
-	// runs on the locked loop thread, so its children get the process's mask.
-	// A thread that cgo code called from an inline handler creates
-	// (pthread_create) inherits the pin the same way. Threads Go starts itself
-	// do not. On a host whose CPUs differ in capacity (arm64 big.LITTLE) the
+	// such a process from a goroutine of its own and wait for it, or mark the
+	// route [Route.Async] (or its group, [RouteGroup.Async]): a goroutine
+	// never runs on the locked loop thread, so its children get the process's
+	// mask, and an Async route's handler runs on one. Setting AsyncHandlers
+	// is not enough: a route that only inherits it runs inline, on the loop
+	// thread, until a timed run of it blocks, and returns to inline when the
+	// promotion expires. A thread that cgo code called from an inline handler
+	// creates (pthread_create) inherits the pin the same way. Threads Go
+	// starts itself do not. On a host whose CPUs differ in capacity (arm64 big.LITTLE) the
 	// loops that did not get a big CPU run unpinned and have nothing to pass
 	// on (README, "CPU pinning").
 	//

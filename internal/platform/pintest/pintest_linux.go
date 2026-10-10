@@ -345,12 +345,95 @@ func runInOwnProcess(t *testing.T, timeout time.Duration, narrow []int) {
 
 // MinPinnedLoops returns how many of loops engine loops are pinned to one CPU
 // at least: all of them, unless the allowed CPUs differ in capacity, where
-// the loops beyond the big CPUs run unpinned (platform.PlanWorkerCPUs).
+// the loops beyond the big CPUs run unpinned. It reads the machine itself
+// (PinnableCPUs) and never asks the planner what it planned: a planner that
+// pins fewer loops than it should must not lower the bar it is graded against.
 func MinPinnedLoops(loops int) int {
 	if loops < 1 {
 		return 0
 	}
-	return platform.PlanWorkerCPUs(loops).Pinned()
+	members, err := AllowedCPUs()
+	if err != nil {
+		return 1
+	}
+	return min(loops, PinnableCPUs(members))
+}
+
+// bigCapacityPercent is the cpu_capacity, as a percentage of the largest
+// among the members, from which a CPU is not little. It is the planner's
+// threshold written again on purpose: this is the test's own reading.
+const bigCapacityPercent = 50
+
+// PinnableCPUs returns how many of members an engine may pin a loop to,
+// judged from the machine and not from the planner: every member, unless
+// /sys/devices/system/cpu/cpuN/cpu_capacity of every member is readable and
+// some are below half of the largest (big.LITTLE), in which case the members
+// that are not. With no capacity files, members whose /proc/cpuinfo "CPU part"
+// lines differ count as one pinnable CPU at least (the planner knows which of
+// the parts are little; the floor does not).
+func PinnableCPUs(members []int) int {
+	if len(members) == 0 {
+		return 0
+	}
+	caps := make([]int, 0, len(members))
+	top := 0
+	for _, c := range members {
+		b, err := os.ReadFile("/sys/devices/system/cpu/cpu" + strconv.Itoa(c) + "/cpu_capacity")
+		v, convErr := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || convErr != nil || v <= 0 {
+			caps = nil
+			break
+		}
+		caps = append(caps, v)
+		top = max(top, v)
+	}
+	if caps != nil {
+		n := 0
+		for _, v := range caps {
+			if v*100 >= top*bigCapacityPercent {
+				n++
+			}
+		}
+		return n
+	}
+	if cpuPartsDiffer(members) {
+		return 1
+	}
+	return len(members)
+}
+
+// cpuPartsDiffer reports whether the "CPU part" lines of /proc/cpuinfo name
+// more than one part among members (x86 has no such line: false).
+func cpuPartsDiffer(members []int) bool {
+	b, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return false
+	}
+	want := map[int]bool{}
+	for _, c := range members {
+		want[c] = true
+	}
+	parts := map[string]bool{}
+	cur := -1
+	for line := range strings.SplitSeq(string(b), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "processor":
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				n = -1
+			}
+			cur = n
+		case "CPU part":
+			if want[cur] {
+				parts[strings.TrimSpace(v)] = true
+			}
+		}
+	}
+	return len(parts) > 1
 }
 
 // StartFunc starts one engine and returns once it serves. It returns the
@@ -584,12 +667,16 @@ func MaskWithoutTheLowestCPU(t *testing.T) []int {
 // /proc/self/task/*/status, that
 //   - the process really started on the mask it was given (the premise);
 //   - every thread pinned to one CPU is pinned to a member of the mask;
-//   - at least as many threads are pinned as the plan pins (all loops, but on a
+//   - at least min(loops, PinnableCPUs) threads are pinned (all loops, but on a
 //     host whose allowed CPUs differ in capacity the loops beyond the big CPUs
-//     run unpinned), and
-//   - on a host whose allowed CPUs are alike, the engine's loops took the first
-//     CPUs of the mask, in order, which is "the i-th member of the allowed
-//     set" written out independently of the planner.
+//     run unpinned);
+//   - no CPU holds a second loop while another allowed CPU, one a loop may be
+//     pinned to, holds none (the pins are counted per CPU, not as a set), and
+//   - on a host with one NUMA node whose allowed CPUs are alike, the engine's
+//     loops took the first CPUs of the mask, in order, which is "the i-th
+//     member of the allowed set" written out independently of the planner.
+//
+// None of the expected values comes from the planner under test.
 func LoopsStayInsideTheMask(t *testing.T, engine string, start StartFunc) {
 	t.Helper()
 	want := os.Getenv(envMask)
@@ -624,24 +711,45 @@ func LoopsStayInsideTheMask(t *testing.T, engine string, start StartFunc) {
 		}
 		pinned = append(pinned, th)
 	}
-	got := map[int]bool{}
+	perCPU := map[int]int{} // pinned threads per CPU
 	for _, th := range pinned {
 		c, err := strconv.Atoi(th.CPUs)
 		if err != nil {
 			t.Fatalf("thread %v: cannot read its CPU", th)
 		}
-		got[c] = true
+		perCPU[c]++
 		if !inMask[c] {
 			t.Errorf("celeris#909: the %s engine pinned a thread to CPU %d, outside the process's mask %s: %v",
 				engine, c, base, th)
 		}
 	}
-	plan := platform.PlanWorkerCPUs(loops)
-	if need := plan.Pinned(); len(pinned) < need {
-		t.Errorf("the %s engine runs %d loop(s) of which %d should be pinned, but %d thread(s) are pinned to one CPU "+
-			"(mask %s): %v", engine, loops, need, len(pinned), base, pinned)
+	pinnable := PinnableCPUs(members)
+	need := min(loops, pinnable)
+	if len(pinned) < need {
+		t.Errorf("the %s engine runs %d loop(s) of which %d should be pinned (%d of the %d allowed CPUs are not little), "+
+			"but %d thread(s) are pinned to one CPU (mask %s): %v", engine, loops, need, pinnable, len(members), len(pinned), base, pinned)
 	}
-	if !plan.Heterogeneous {
+	// Balance. A CPU may hold a second pinned thread only if every pinnable
+	// allowed CPU holds one: with fewer pinned loops than pinnable CPUs the
+	// loops sit on different CPUs, and at most ceil(pinned/pinnable) share one.
+	used := 0
+	for _, c := range members {
+		if perCPU[c] > 0 {
+			used++
+		}
+	}
+	if len(pinned) >= 1 && used < min(len(pinned), pinnable) {
+		t.Errorf("celeris#909: the %s engine's %d pinned loop(s) share CPUs while others of the mask %s hold none: "+
+			"%d CPU(s) hold a loop, want %d (loops per CPU %v)",
+			engine, len(pinned), base, used, min(len(pinned), pinnable), perCPU)
+	}
+	got := map[int]bool{}
+	for c := range perCPU {
+		got[c] = true
+	}
+	// Exact CPUs: only where there is no NUMA interleave and no little CPU.
+	exact := pinnable == len(members) && platform.DetectNUMA().NumNodes <= 1
+	if exact {
 		exp := map[int]bool{}
 		for i := range loops {
 			exp[members[i%len(members)]] = true
@@ -651,8 +759,8 @@ func LoopsStayInsideTheMask(t *testing.T, engine string, start StartFunc) {
 				engine, loops, platform.FormatCPUs(keys(got)), min(loops, len(members)), base, platform.FormatCPUs(keys(exp)))
 		}
 	}
-	t.Logf("celeris909 RESULT engine=%s mask=%s loops=%d pinned=%d pinned_cpus=%s heterogeneous=%v",
-		engine, base, loops, len(pinned), platform.FormatCPUs(keys(got)), plan.Heterogeneous)
+	t.Logf("celeris909 RESULT engine=%s mask=%s loops=%d pinned=%d pinned_cpus=%s pinnable=%d exact_order_checked=%v",
+		engine, base, loops, len(pinned), platform.FormatCPUs(keys(got)), pinnable, exact)
 }
 
 func keys(m map[int]bool) []int {
