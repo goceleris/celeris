@@ -4,12 +4,15 @@ package iouring
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/resource"
@@ -101,6 +104,12 @@ func benchAcceptCloseChurn959(b *testing.B, e *Engine, addr string, spin bool) {
 	stopSpin := make(chan struct{})
 	var spinWG sync.WaitGroup
 	if spin {
+		// The premise: number 4000 is not open here, so each spinner call reads
+		// the slot (through the lock after the change) and then fails the
+		// duplicate with EBADF, registering nothing.
+		if err := e.WorkerLoop(0).RegisterConn(4000, nil, nil); err == nil || !errors.Is(err, unix.EBADF) {
+			b.Fatalf("PREMISE: RegisterConn(4000) = %v, want a duplicate that fails with EBADF", err)
+		}
 		for i := 0; i < e.NumWorkers(); i++ {
 			wl := e.WorkerLoop(i)
 			spinWG.Add(1)
