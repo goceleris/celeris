@@ -100,7 +100,9 @@ func TestZoneLiteral925(t *testing.T) {
 		{"loopback-zone-prints-its-name", ctlSocket925(t), lo, "[fe80::1%" + loName + "]:443"},
 		// The name comes from an ioctl on fd. With no usable fd it cannot be
 		// resolved, and the number is printed, as for an unknown interface.
-		{"unusable-fd-prints-the-number", -1, lo, "[fe80::1%" + strconv.Itoa(int(lo)) + "]:443"},
+		// This row pins that fallback, not parity with std: std would resolve
+		// the name here. It is why a caller passes a live socket.
+		{"unusable-fd-falls-back-to-the-number", -1, lo, "[fe80::1%" + strconv.Itoa(int(lo)) + "]:443"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := SockaddrString(tc.fd, &unix.SockaddrInet6{Addr: v6, Port: 443, ZoneId: tc.zone})
