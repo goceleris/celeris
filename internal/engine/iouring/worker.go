@@ -6789,12 +6789,25 @@ func endDetachedWrites(cs *connState) {
 // Events, a WebSocket) has a goroutine of its own that keeps writing, so,
 // with the drain lasting as long as the budget, a stream that never ends
 // would keep hasPendingSends true for all of it. After this its writes no-op
-// and what is already queued is what the drain finishes. Only conns whose
-// handler has returned and detached (h1State.Detached): an async handler
-// that is still running is answered, up to the budget, as before. TryLock,
-// never Lock, as hasPendingSends: a goroutine parked inside a write must not
-// wedge the loop, and a conn whose lock is busy is tried again on the next
-// pass (it counts as pending until then). Worker thread.
+// and what is already queued is what the drain finishes. Only conns that have
+// detached (h1State.Detached) and whose dispatch goroutine is not inside the
+// handler: the goroutine holds detachMu across the handler, so the TryLock
+// below fails for a running async handler, which is answered, up to the
+// budget, as before. TryLock, never Lock, as hasPendingSends: a goroutine
+// parked inside a write must not wedge the loop, and a conn whose lock is busy
+// is tried again on the next pass (it counts as pending until then).
+//
+// What a producer's guarded writeFn left queued is flushed, not stranded: its
+// inline write may have taken only part of the bytes (or none: the accepted
+// socket is non-blocking), leaving the rest in writeBuf with no SEND in
+// flight and the conn on detachQueue, and drainDetachQueue skips a
+// detachClosed conn before it would mark the conn dirty. So a conn with bytes
+// queued and no SEND (or SEND_ZC notification, whose completion flushes them)
+// outstanding is marked dirty here; without that nothing would ever send them,
+// and the drain would last the budget although every client reads. A conn
+// whose async Detach is not yet finalised (asyncDetachPending: the same
+// drainDetachQueue pass that skips a detachClosed conn also counts it) is left
+// for that pass and tried again on the next. Worker thread.
 func (w *Worker) stopDetachedProducers() {
 	for _, fd := range w.liveConns {
 		cs := w.conns[fd]
@@ -6804,8 +6817,11 @@ func (w *Worker) stopDetachedProducers() {
 		if !cs.detachMu.TryLock() {
 			continue
 		}
-		if !cs.detachClosed {
+		if !cs.detachClosed && !cs.asyncDetachPending {
 			endDetachedWrites(cs)
+			if !cs.sending && !cs.zcNotifPending && connSendPending(cs) {
+				w.markDirty(cs)
+			}
 		}
 		cs.detachMu.Unlock()
 	}
