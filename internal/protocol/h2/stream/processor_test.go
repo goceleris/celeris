@@ -643,7 +643,7 @@ func TestProcessWindowUpdateZeroIncrement(t *testing.T) {
 
 func TestProcessConcurrentStreamsLimit(t *testing.T) {
 	fw := newTestFrameWriter()
-	rw := newTestResponseWriter()
+	rw := &rstConn944{testResponseWriter: newTestResponseWriter()}
 	handler := HandlerFunc(func(_ context.Context, _ *Stream) error {
 		return nil
 	})
@@ -666,14 +666,31 @@ func TestProcessConcurrentStreamsLimit(t *testing.T) {
 		}
 	}
 
-	// Third stream should be refused
+	// The third stream is refused: a stream error (RST_STREAM REFUSED_STREAM),
+	// not a connection error, so the connection serves the next request
+	// (celeris#981: ProcessRawHeaders always did this, ProcessFrame closed
+	// the connection).
 	hf := makeHeadersFrame(t, 5, false, true, headers)
-	err := p.ProcessFrame(ctx, hf)
-	if err == nil {
-		t.Fatal("Expected error for exceeding MAX_CONCURRENT_STREAMS")
+	if err := p.ProcessFrame(ctx, hf); err != nil {
+		t.Fatalf("a stream over MAX_CONCURRENT_STREAMS is refused, not a connection error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "MAX_CONCURRENT_STREAMS") {
-		t.Errorf("Error should mention MAX_CONCURRENT_STREAMS: %v", err)
+	if got := rw.resets(); len(got) != 1 || got[0] != (rstStreamRecord{streamID: 5, code: http2.ErrCodeRefusedStream}) {
+		t.Errorf("RST_STREAM frames %+v, want one REFUSED_STREAM for stream 5", got)
+	}
+	if n := p.manager.CountActiveStreams(); n != 2 {
+		t.Errorf("active streams %d, want 2", n)
+	}
+	if _, ok := p.manager.GetStream(5); ok {
+		t.Error("the refused stream 5 is in the manager")
+	}
+	fw.mu.Lock()
+	goaways := len(fw.goAwaysSent)
+	fw.mu.Unlock()
+	rw.testResponseWriter.mu.Lock()
+	goaways += len(rw.goAwaysSent)
+	rw.testResponseWriter.mu.Unlock()
+	if goaways != 0 {
+		t.Errorf("%d GOAWAY frames sent for a stream error", goaways)
 	}
 }
 

@@ -191,7 +191,7 @@ func (w *Worker) handOff(cs *connState, fd int, h *transplantTargetHolder, detac
 	// immortal-entry case that pins the worker at 100% CPU (celeris#529).
 	w.removeDirty(cs)
 	w.removeLiveConn(cs)
-	w.conns[fd] = nil
+	w.clearConnSlot(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 	// Detach-for-transplant, not a close: no OnDisconnect fires (the conn

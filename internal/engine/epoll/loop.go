@@ -12,7 +12,6 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1079,7 +1078,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		// calls it makes.
 		connCtx := ctxkit.WithWorkerID(ctx, l.id)
 		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize, l.async)
-		cs.remoteAddr = sockaddrString(sa)
+		cs.remoteAddr = sockaddrString(newFD, sa)
 		// Install under driverMu. An async Hijack clears its slot from the
 		// dispatch goroutine under this lock and then closes the
 		// descriptor, and the kernel's lowest-free-fd rule can hand the
@@ -4300,40 +4299,13 @@ func createListenSocket(addr string, deferAccept bool) (int, error) {
 var listenAddrOf = boundAddr
 
 func boundAddr(fd int) net.Addr {
-	sa, err := unix.Getsockname(fd)
-	if err != nil {
-		return nil
-	}
-	switch v := sa.(type) {
-	case *unix.SockaddrInet4:
-		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port}
-	case *unix.SockaddrInet6:
-		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: fmt.Sprintf("%d", v.ZoneId)}
-	}
-	return nil
+	return bindiag.BoundAddr(fd)
 }
 
-func sockaddrString(sa unix.Sockaddr) string {
-	switch v := sa.(type) {
-	case *unix.SockaddrInet4:
-		// "xxx.xxx.xxx.xxx:ppppp" — max 21 bytes. Formatting by hand
-		// eliminates fmt.Sprintf + net.IP.String allocations that would
-		// otherwise hit on every accepted conn.
-		var buf [21]byte
-		b := strconv.AppendUint(buf[:0], uint64(v.Addr[0]), 10)
-		b = append(b, '.')
-		b = strconv.AppendUint(b, uint64(v.Addr[1]), 10)
-		b = append(b, '.')
-		b = strconv.AppendUint(b, uint64(v.Addr[2]), 10)
-		b = append(b, '.')
-		b = strconv.AppendUint(b, uint64(v.Addr[3]), 10)
-		b = append(b, ':')
-		b = strconv.AppendUint(b, uint64(uint16(v.Port)), 10)
-		return string(b)
-	case *unix.SockaddrInet6:
-		return fmt.Sprintf("[%s]:%d", net.IP(v.Addr[:]), v.Port)
-	}
-	return ""
+// sockaddrString formats a peer address as std does; see bindiag.SockaddrString
+// (celeris#925).
+func sockaddrString(fd int, sa unix.Sockaddr) string {
+	return bindiag.SockaddrString(fd, sa)
 }
 
 func parseAddr(addr string) (unix.Sockaddr, error) {

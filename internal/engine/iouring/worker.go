@@ -637,6 +637,11 @@ type Worker struct {
 	detachedConns      *atomic.Int64
 	detachWindowCloses *atomic.Uint64
 
+	// connsMu guards the writes of conns' slots against RegisterConn's reads of
+	// them from a driver's goroutine (celeris#959): see conns_slot.go. A leaf
+	// lock; the worker's own reads of conns need none.
+	connsMu sync.Mutex
+
 	// EventLoopProvider state. driverConns is keyed by real FD and is
 	// completely disjoint from the HTTP conns array. hasDriverConns is the
 	// zero-cost gate: when false, the HTTP fast path pays no overhead.
@@ -2388,11 +2393,11 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 
 	if !isFixedFile {
 		if sa, err := unix.Getpeername(newFD); err == nil {
-			cs.remoteAddr = sockaddrString(sa)
+			cs.remoteAddr = sockaddrString(newFD, sa)
 		}
 	}
 
-	w.conns[newFD] = cs
+	w.setConnSlot(newFD, cs)
 	w.connCount++
 	w.addLiveConn(cs)
 	if newFD > w.maxFD {
@@ -2689,7 +2694,7 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// hijacker's first bytes.
 	w.removeDirty(cs)
 	w.removeLiveConn(cs)
-	w.conns[fd] = nil
+	w.clearConnSlot(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
@@ -4268,7 +4273,7 @@ func (w *Worker) handleClose(fd int) {
 	// With CQE_SKIP_SUCCESS, this handler may not fire for successful close.
 	// Clear the slot as a safety guard for error CQEs.
 	if fd >= 0 && fd < len(w.conns) {
-		w.conns[fd] = nil
+		w.clearConnSlot(fd)
 	}
 	// Note: liveConns removal is the caller's responsibility — every
 	// path that calls finishCloseAny reaches here through closeConn or
@@ -4811,7 +4816,7 @@ func (w *Worker) finishClose(fd int) {
 	// connState's liveIdx via w.conns[swappedFD], so the conns slice must
 	// still be intact (v1.5.0 review 1.8 hazard).
 	w.removeLiveConn(cs)
-	w.conns[fd] = nil
+	w.clearConnSlot(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
@@ -4953,7 +4958,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// Remove from liveConns BEFORE niling w.conns[fd] (same hazard as
 	// finishClose — removeLiveConn touches w.conns[swappedFD]).
 	w.removeLiveConn(cs)
-	w.conns[fd] = nil
+	w.clearConnSlot(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
@@ -7102,52 +7107,13 @@ var (
 )
 
 func boundAddr(fd int) net.Addr {
-	sa, err := unix.Getsockname(fd)
-	if err != nil {
-		return nil
-	}
-	switch v := sa.(type) {
-	case *unix.SockaddrInet4:
-		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port}
-	case *unix.SockaddrInet6:
-		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: fmt.Sprintf("%d", v.ZoneId)}
-	}
-	return nil
+	return bindiag.BoundAddr(fd)
 }
 
-// sockaddrString formats a peer address as "ip:port" (IPv4) or
-// "[ip]:port" (IPv6). It runs on the accept hot path (once per OnConnect),
-// so it avoids the fmt.Sprintf reflection/allocation cost: the IPv4 path
-// builds the dotted-quad + port directly into a stack buffer with
-// strconv.AppendInt and the IPv6 path appends net.IP's canonical form
-// (the one remaining short-lived allocation) without fmt. See v1.5.0
-// review 2.11.
-func sockaddrString(sa unix.Sockaddr) string {
-	switch v := sa.(type) {
-	case *unix.SockaddrInet4:
-		// Max "255.255.255.255:65535" = 21 bytes.
-		var b [21]byte
-		buf := b[:0]
-		buf = strconv.AppendInt(buf, int64(v.Addr[0]), 10)
-		buf = append(buf, '.')
-		buf = strconv.AppendInt(buf, int64(v.Addr[1]), 10)
-		buf = append(buf, '.')
-		buf = strconv.AppendInt(buf, int64(v.Addr[2]), 10)
-		buf = append(buf, '.')
-		buf = strconv.AppendInt(buf, int64(v.Addr[3]), 10)
-		buf = append(buf, ':')
-		buf = strconv.AppendInt(buf, int64(v.Port), 10)
-		return string(buf)
-	case *unix.SockaddrInet6:
-		ip := net.IP(v.Addr[:]).String()
-		buf := make([]byte, 0, len(ip)+8)
-		buf = append(buf, '[')
-		buf = append(buf, ip...)
-		buf = append(buf, ']', ':')
-		buf = strconv.AppendInt(buf, int64(v.Port), 10)
-		return string(buf)
-	}
-	return ""
+// sockaddrString formats a peer address as std does; see bindiag.SockaddrString
+// (celeris#925).
+func sockaddrString(fd int, sa unix.Sockaddr) string {
+	return bindiag.SockaddrString(fd, sa)
 }
 
 func parseAddr(addr string) (unix.Sockaddr, error) {
