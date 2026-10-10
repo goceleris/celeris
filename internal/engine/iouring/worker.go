@@ -3249,10 +3249,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
 	if !cs.detected {
 		// Detection needs at most detect.PrefaceLen bytes (the HTTP/2 client
-		// preface): Detect decides on any input of that length, and on fewer
-		// only when it starts "PRI " (or has under MinPeekBytes). So what
-		// this conn can hold here is bounded by construction: under PrefaceLen
-		// bytes, plus the recv in hand when a decision falls.
+		// preface): Detect decides on any input of that length or more, and
+		// on fewer it is undecided only when the input is under MinPeekBytes
+		// or starts "PRI " (any other input is HTTP/1 or unknown at once). So
+		// what this conn can hold here is bounded by construction: under
+		// PrefaceLen bytes, plus the recv in hand when a decision falls.
 		//
 		// A prefix that spans recvs (notably the 24-byte H2 client preface,
 		// v1.5.0 review 2.8) is accumulated in cs.detectAccum, a Go-heap
@@ -6430,9 +6431,10 @@ func (w *Worker) checkTimeouts() {
 			continue
 		}
 		// A conn whose protocol is not detected yet has no H1 state, so the
-		// snapshot below cannot see its header deadline. It has a dispatch
-		// goroutine neither (the first bytes decide that), so cs.detected and
-		// the deadline are the worker's own and need no lock (celeris#974).
+		// snapshot below cannot see its header deadline. Nor does it have a
+		// dispatch goroutine yet (the first bytes decide that), so
+		// cs.detected and the deadline are the worker's own and need no lock
+		// (celeris#974).
 		if !cs.detected && cs.detectDeadline > 0 && now > cs.detectDeadline {
 			w.closeConn(fd)
 			continue
