@@ -312,6 +312,28 @@ const maxHeaderListSize = 64 << 10
 // to each field's size.
 const headerFieldOverhead = 32
 
+// headerBlockExpansion is how many times longer, on the wire, the HPACK
+// block of a header list within the bound can be than the bound itself. It is
+// the cap on a block still being assembled from CONTINUATION frames
+// (handleContinuation): the bound counts decoded bytes (hpackEmit), a block
+// is wire bytes, and a field can take more of those than the bound charges it.
+// An encoder may Huffman-code a string even when the code is longer than the
+// string (RFC 7541 §5.2): up to 30 bits for a byte (19 for a printable one,
+// the backslash), 3.75 wire bytes for a byte; a string length is an integer of up to
+// 4 bytes, and a literal field carries two of them and an opcode, 9 bytes in
+// all; each string rounds up to a whole byte. A field of n name and v value
+// bytes is at most 3.75(n+v)+11 bytes on the wire, and the bound charges it
+// n+v+32, so 4 times the charge is never short of its encoding (the cap is
+// 4 x the bound, see TestFieldEncodingNeverExceedsTheBlockCap944): a block
+// within the cap is the most a list within the bound can be. It is a worst
+// case, not the exact count: a block between the bound and the cap is
+// assembled, decoded, and refused by the exact bound (RST_STREAM on its
+// stream), never by this cap (GOAWAY). What the cap does not cover is a
+// block of table-size updates (RFC 7541 §6.3), fields it does not carry:
+// an encoder sends one or two, and a block that is mostly them is not one.
+// The server keeps at most this many bytes of a block per connection.
+const headerBlockExpansion = 4
+
 // NewProcessor creates a new stream processor. The conn parameter must
 // implement both ResponseWriter and H2Controller (all H2 engine adapters do).
 // The HPACK decoder is lazily initialized on the first header-block write —
@@ -400,6 +422,10 @@ func (p *Processor) hpackEmit(hf hpack.HeaderField) {
 // fields hpackEmit joins; a trailer block is left as the peer sent it.
 func (p *Processor) beginHeaderDecode(target *[][2]string, requestHeaders bool) {
 	p.ensureHPACKDecoder()
+	// A block over the bound turned emit off; whatever ended it, this one
+	// starts with it on (not only the end of the block that tripped it:
+	// a block that fails to decode returns a connection error before that).
+	p.hpackDecoder.SetEmitEnabled(true)
 	p.hpackTarget = target
 	p.headerListSize = 0
 	p.headerListTooLarge = false
@@ -415,7 +441,6 @@ func (p *Processor) beginHeaderDecode(target *[][2]string, requestHeaders bool) 
 // (refuseHeaderList) and not use the list.
 func (p *Processor) endHeaderDecode() (tooLarge bool) {
 	if p.headerListTooLarge {
-		p.hpackDecoder.SetEmitEnabled(true)
 		p.headerListTooLarge = false
 		p.cookieJoined = false
 		p.cookieAt = -1
@@ -1110,7 +1135,6 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.beginHeaderDecode(pooledTrailers, false)
-			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -1191,7 +1215,6 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.beginHeaderDecode(pooledHeadersIn, true)
-	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -1281,7 +1304,6 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.beginHeaderDecode(pooledTrailers, false)
-			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -1328,7 +1350,6 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.beginHeaderDecode(pooledHeadersIn, true)
-	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -1741,12 +1762,14 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 				p.continuationState.streamID, f.StreamID))
 	}
 
-	// A header block longer than the header list bound is not a block of
-	// fields within it: a field is encoded in at most len(name)+len(value)+7
-	// bytes, and the bound charges it len(name)+len(value)+32. So the block
-	// is refused as soon as it is that long, and a peer that never ends it
-	// does not make the server keep the pieces (CONTINUATION flood).
-	if len(p.continuationState.headerBlock)+len(f.HeaderBlockFragment()) > p.headerListMax {
+	// A header block longer than any encoding of a list within the bound is
+	// refused as soon as it is that long (headerBlockExpansion: the wire
+	// bytes of a field can exceed what the bound charges for it, so the cap
+	// is a multiple of the bound, not the bound), and a peer that never ends
+	// it does not make the server keep the pieces after that (CONTINUATION
+	// flood). A block shorter than the cap but over the bound is refused
+	// when it ends, by the exact bound, as a stream error.
+	if len(p.continuationState.headerBlock)+len(f.HeaderBlockFragment()) > p.headerListMax*headerBlockExpansion {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
 		// The last stream the server opened, not 0: 0 tells the peer that no
@@ -1773,7 +1796,6 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 		}()
 		p.beginHeaderDecode(pooledHeadersIn, !p.continuationState.isTrailers)
 
-		p.ensureHPACKDecoder()
 		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
 			p.continuationState = nil
 			p.continuationActive.Store(false)
@@ -1854,11 +1876,16 @@ func (p *Processor) GoAwayErr(lastStreamID uint32, code http2.ErrCode, debug []b
 }
 
 // SendGoAway sends a GOAWAY frame, and records it: no stream above
-// lastStreamID is served from then on (runHandler).
+// lastStreamID is served from then on (runHandler). A GOAWAY never names a
+// higher last stream than one sent before (RFC 9113 §6.8: "endpoints MUST
+// NOT increase the value they send in the last stream identifier"): a caller
+// that names the highest stream the manager opened after a graceful GOAWAY
+// named a lower one gets the lower one.
 func (p *Processor) SendGoAway(lastStreamID uint32, code http2.ErrCode, debugData []byte) error {
-	if !p.goAwaySent || lastStreamID < p.goAwayLastID {
-		p.goAwaySent, p.goAwayLastID = true, lastStreamID
+	if p.goAwaySent && lastStreamID > p.goAwayLastID {
+		lastStreamID = p.goAwayLastID
 	}
+	p.goAwaySent, p.goAwayLastID = true, lastStreamID
 	if p.connWriter != nil {
 		return p.connWriter.SendGoAway(lastStreamID, code, debugData)
 	}

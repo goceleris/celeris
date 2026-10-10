@@ -353,8 +353,9 @@ func TestLargeHonestRequestIsServed944(t *testing.T) {
 // TestHeaderBlockFloodIsRefused944: CONTINUATION frames with no END_HEADERS
 // piled up without limit (each 16 KB, however many the peer cared to send)
 // before the block was decoded. The block cannot decode to more than the
-// bound, and no encoding of that list is longer than the list, so a block
-// longer than the bound is refused at the CONTINUATION that crosses it, and
+// bound, and no encoding of such a list is longer than headerBlockExpansion
+// times the bound (a Huffman code can be longer than the byte it codes), so a
+// block longer than that is refused at the CONTINUATION that crosses it, and
 // nothing of it is kept.
 func TestHeaderBlockFloodIsRefused944(t *testing.T) {
 	p := newProc944()
@@ -393,7 +394,7 @@ func TestHeaderBlockFloodIsRefused944(t *testing.T) {
 	if perr == nil {
 		t.Fatalf("%d CONTINUATION frames (%d KB of block) were all accepted", sent-1, (sent-1)*16)
 	}
-	if sent > 1+(maxHeaderListSize/(16<<10))+2 {
+	if sent > 1+(headerBlockExpansion*maxHeaderListSize/(16<<10))+2 {
 		t.Errorf("refused only at frame %d (%d KB)", sent, (sent-1)*16)
 	}
 	if p.IsExpectingContinuation() {
