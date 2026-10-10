@@ -225,7 +225,7 @@ func TestH2MaxConcurrentStreamsHeadersContinuation981(t *testing.T) {
 						c, ok := rst[id]
 						if !ok {
 							t.Errorf("stream %d (over the limit) got no RST_STREAM", id)
-						} else if c != http2.ErrCodeRefusedStream && !(e.eng == celeris.Std && c == http2.ErrCodeProtocol) {
+						} else if c != http2.ErrCodeRefusedStream && (e.eng != celeris.Std || c != http2.ErrCodeProtocol) {
 							t.Errorf("stream %d reset with %s, want REFUSED_STREAM", id, c)
 						}
 					}
