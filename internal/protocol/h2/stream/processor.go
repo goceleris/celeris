@@ -1174,12 +1174,16 @@ func (p *Processor) refuseStream(id uint32, block []byte) error {
 	var dropped [][2]string
 	p.beginHeaderDecode(&dropped, false)
 	p.hpackDecoder.SetEmitEnabled(false) // decode, build nothing
+	// A block that does not decode is a connection error (COMPRESSION_ERROR).
+	// The GOAWAY names the last stream the server opened, not 0 (RFC 9113
+	// §6.8: 0 lets the client replay every request it has in flight), as the
+	// over-long header block site does.
 	if _, err := p.hpackDecoder.Write(block); err != nil {
-		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
 	}
 	if err := p.hpackDecoder.Close(); err != nil {
-		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
 	p.endHeaderDecode()
