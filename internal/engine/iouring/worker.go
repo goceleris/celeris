@@ -296,12 +296,15 @@ type closedOpsEntry struct {
 // queuePendingRelease).
 const pendingReleaseHoldNanos int64 = int64(5 * time.Second)
 
-// shutdownSendDrainNanos bounds the send drain the run loop performs after
-// its context is cancelled (celeris#595): responses prepared by handlers that
-// were still running when Server.Shutdown fired are submitted and completed
-// through the normal loop rather than being discarded with the fd. 250 ms is
-// far above a loopback/LAN send completion yet small enough to stay inside
-// any sane Shutdown budget; a peer that has stopped reading simply hits it.
+// shutdownSendDrainNanos is the floor of the send drain the run loop performs
+// after its context is cancelled (celeris#595): responses prepared by
+// handlers that were still running when Server.Shutdown fired are submitted
+// and completed through the normal loop rather than being discarded with the
+// fd. 250 ms is far above a loopback/LAN send completion, and it is all the
+// drain gets when no live budget was handed over: a peer that has stopped
+// reading simply hits it. While the budget of the last Engine.Shutdown is
+// live the drain lasts as long as that budget, as epoll's send drain does
+// (drainEnd, celeris#806).
 const shutdownSendDrainNanos int64 = int64(250 * time.Millisecond)
 
 // closingDrainTimeoutNanos bounds the deferred-close drain: how long a
@@ -569,11 +572,18 @@ type Worker struct {
 	zcHoldCount int
 	zcHoldBytes int
 
-	// shutdownDrainDeadline is the wall-clock (UnixNano) bound on the
-	// send drain the run loop performs once its context is cancelled
-	// (celeris#595). Zero until the first cancelled iteration; worker
-	// thread only, never read on the hot path.
-	shutdownDrainDeadline int64
+	// shutdownDrainStart is when (UnixNano) the send drain the run loop
+	// performs once its context is cancelled began (celeris#595): after the
+	// HTTP/2 pool handlers are done (h2PoolSettled), so zero until then. The
+	// drain's end is drainEnd(shutdownDrainStart, ...), worked out afresh
+	// every iteration, since the budget it follows can arrive after the
+	// cancel (Engine.Shutdown follows the cancel of StartWithContext's
+	// context). draining is true from the first iteration that finds the
+	// context cancelled: no wait in the loop may then be unbounded
+	// (celeris#806). Worker thread only; draining is read on the hot path,
+	// in the one branch that waits without a timeout and in adaptiveTimeout.
+	shutdownDrainStart int64
+	draining           bool
 
 	// drainBudget points at the engine's record of the budget of the last
 	// Engine.Shutdown call, and h2DrainStart is when the worker, its
@@ -1248,9 +1258,9 @@ func (w *Worker) run(ctx context.Context) {
 			// Server.Shutdown died as a connection reset instead of
 			// completing. Keep pumping the loop — which submits those
 			// SQEs and reaps their completions through the normal path —
-			// until no send is queued or in flight, bounded by
-			// shutdownSendDrainNanos so a peer that stopped reading
-			// cannot hold shutdown open. The loop keeps accepting for
+			// until no send is queued or in flight, bounded (below) so a
+			// peer that stopped reading cannot hold shutdown open. The
+			// loop keeps accepting for the first shutdownSendDrainNanos of
 			// that window — it is the ordinary iteration — which is the
 			// graceful side of the trade: a connection that arrives
 			// inside it is answered rather than reset.
@@ -1263,16 +1273,35 @@ func (w *Worker) run(ctx context.Context) {
 			// nothing (stopAccepting): a connection accepted in it was
 			// served and then cut at the budget. net/http's Shutdown closes
 			// its listeners first.
+			//
+			// The drain lasts as long as the budget of the last
+			// Engine.Shutdown (drainEnd, celeris#806), and never less than
+			// shutdownSendDrainNanos; every wait in this loop is bounded
+			// meanwhile (draining), so a send the peer does not take cannot
+			// keep the worker in the kernel past that end. Past the floor
+			// the loop stops accepting, as it does while it waits for the
+			// HTTP/2 handlers: a connection accepted in a drain that can
+			// last the whole budget would be served and then cut at its end.
+			w.draining = true
 			if !w.h2PoolSettled() {
 				w.stopAccepting(ctx)
-				w.shutdownDrainDeadline = 0
+				w.shutdownDrainStart = 0
 			} else {
-				if w.shutdownDrainDeadline == 0 {
-					w.shutdownDrainDeadline = time.Now().UnixNano() + shutdownSendDrainNanos
+				now := time.Now().UnixNano()
+				if w.shutdownDrainStart == 0 {
+					w.shutdownDrainStart = now
 				}
-				if !w.hasPendingSends() || time.Now().UnixNano() > w.shutdownDrainDeadline {
+				if !w.hasPendingSends() {
 					w.shutdown()
 					return
+				}
+				if end, bounded := w.drainEnd(w.shutdownDrainStart, shutdownSendDrainNanos); bounded && now > end {
+					w.noteSendDrainGaveUp(now - w.shutdownDrainStart)
+					w.shutdown()
+					return
+				}
+				if now > w.shutdownDrainStart+shutdownSendDrainNanos {
+					w.stopAccepting(ctx)
 				}
 			}
 		}
@@ -1385,9 +1414,13 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				cqHead, cqTail = w.ring.BeginCQ()
 			} else if cqHead != cqTail { //nolint:revive // intentional no-op: CQEs ready, no pending SQEs, no syscall needed
-			} else if hasPending && w.sendsPending {
+			} else if hasPending && w.sendsPending && !w.draining {
 				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
 				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
+				// Not once the context is cancelled (celeris#806): a SEND to a
+				// peer that does not read has no completion to wait for, and
+				// the drain's end is checked only between waits. The timed
+				// wait below, capped by adaptiveTimeout, bounds it.
 				if err := w.ring.SubmitAndWait(); err != nil {
 					w.shutdown()
 					return
@@ -1543,7 +1576,8 @@ func (w *Worker) run(ctx context.Context) {
 			w.zc.noteRingBytes(w.ringBytesBatch)
 			w.ringBytesBatch = 0
 		}
-		// Same cadence for the celeris#685 deferred-close rate.
+		// Same cadence for the celeris#685 deferred-close rate. (flushBatches
+		// is this block for shutdown; a new batch goes in both, celeris#874.)
 		if w.closeFDDeferredBatch > 0 {
 			if w.handoffLoss != nil {
 				w.handoffLoss.closeFDDeferred.Add(w.closeFDDeferredBatch)
@@ -2178,7 +2212,10 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	// Waiting out HTTP/2 pool handlers at shutdown (celeris#759): a
 	// handler that ends without a completion the ring hears of must not
 	// leave the worker waiting.
-	if w.h2DrainStart != 0 && d > h2PoolDrainPoll {
+	// And the send drain after it (celeris#806): the loop looks at the
+	// drain's end between waits, and a wait ended by nothing at all is what
+	// the peer that does not read gives it.
+	if (w.draining || w.h2DrainStart != 0) && d > h2PoolDrainPoll {
 		d = h2PoolDrainPoll
 	}
 	if w.lingerUntil != 0 {
@@ -3075,12 +3112,19 @@ func (w *Worker) switchToH2Local(cs *connState) error {
 // slow handler and disconnects. So the notification rides on the close
 // instead: closeConn leaves the close to the dispatch goroutine, which exits
 // at its next check, and then runs it on this thread with the lock free,
-// delivering closeErr first.
+// delivering closeErr first, or Worker.shutdown does when it gets there
+// before the handler does (celeris#867).
 func (w *Worker) closeOnRecvEnd(fd int, cs *connState, err error) {
 	if mu := cs.detachMu; mu != nil {
 		if !mu.TryLock() {
 			if dispatchBusy(cs, nil) {
-				cs.closeErr = err
+				// The first error is the one the middleware is told: a
+				// second recv-end CQE for the same conn (the recv is not
+				// retired by the first close request) must not replace it
+				// (celeris#867).
+				if cs.closeErr == nil {
+					cs.closeErr = err
+				}
 				w.closeConn(fd)
 				return
 			}
@@ -6549,25 +6593,82 @@ func (w *Worker) h2PoolSettled() bool {
 	if !busy {
 		return true
 	}
-	// Bounded as epoll's send drain is (epoll's Loop.sendDrainWait): while
-	// the budget is live, until its deadline or, for a ctx without one,
-	// until it is done, no longer than WriteTimeout, and never less than the
-	// floor, which is all a done budget, or none, gets.
-	end := w.h2DrainStart + int64(h2PoolDrainFloor)
-	if w.drainBudget != nil {
-		if p := w.drainBudget.Load(); p != nil && (*p).Err() == nil {
-			d, bounded := (*p).Deadline()
-			ext := d.UnixNano()
-			if wt := int64(w.cfg.WriteTimeout); wt > 0 && (!bounded || w.h2DrainStart+wt < ext) {
-				ext, bounded = w.h2DrainStart+wt, true
-			}
-			if !bounded {
-				return false // until the budget is done
-			}
-			end = max(end, ext)
+	end, bounded := w.drainEnd(w.h2DrainStart, int64(h2PoolDrainFloor))
+	return bounded && now > end
+}
+
+// drainEnd is when (UnixNano) a drain that began at start gives up, and false
+// while it has no end but the budget's being done. It is bounded as epoll's
+// send drain is (epoll's Loop.sendDrainWait), and the HTTP/2 wait and the
+// send drain share it so the two agree: while the budget the last
+// Engine.Shutdown handed over (drainBudget) is live, until its deadline or,
+// for a ctx without one (context.Background, a WithCancel ctx: net/http's
+// "wait as long as it takes"), until it is done, no longer than WriteTimeout
+// after start when that is set, and never less than floor from start, which
+// is all a done budget, or none, gets. The caller works it out again each
+// time it asks: the budget can arrive, or end, in the middle of the drain.
+// Worker thread.
+func (w *Worker) drainEnd(start, floor int64) (end int64, bounded bool) {
+	end = start + floor
+	if w.drainBudget == nil {
+		return end, true
+	}
+	p := w.drainBudget.Load()
+	if p == nil || (*p).Err() != nil {
+		return end, true
+	}
+	d, hasDeadline := (*p).Deadline()
+	ext := d.UnixNano()
+	if wt := int64(w.cfg.WriteTimeout); wt > 0 && (!hasDeadline || start+wt < ext) {
+		ext, hasDeadline = start+wt, true
+	}
+	if !hasDeadline {
+		return 0, false // until the budget is done
+	}
+	return max(end, ext), true
+}
+
+// noteSendDrainGaveUp records that the send drain ran out of time with
+// response bytes still queued or in flight, and shutdown is about to close
+// those connections: the data loss the bound is. It is counted once per
+// worker shutdown (handoffLossStats.shutdownSendDrainGaveUp, not an
+// EngineMetrics field) and logged with how many connections and how many
+// queued bytes it cost; bytes the kernel had already taken are not counted,
+// and the client gets those (celeris#806). waited is how long the drain ran.
+func (w *Worker) noteSendDrainGaveUp(waited int64) {
+	w.handoffLoss.noteShutdownSendDrainGaveUp()
+	if w.logger == nil {
+		return
+	}
+	conns, queued := w.pendingSendLoss()
+	w.logger.Warn("io_uring shutdown: the send drain ran out of time; closing connections whose response the peer has not taken",
+		"worker", w.id, "conns", conns, "queued_bytes_lost", queued, "waited", time.Duration(waited))
+}
+
+// pendingSendLoss counts the connections hasPendingSends finds pending and
+// the response bytes they have queued and not yet handed to the kernel. A
+// connection whose detachMu is held by a running handler counts as one, its
+// bytes unknown (TryLock, as hasPendingSends).
+func (w *Worker) pendingSendLoss() (conns, queued int) {
+	for _, fd := range w.liveConns {
+		cs := w.conns[fd]
+		if cs == nil {
+			continue
+		}
+		mu := cs.detachMu
+		if mu != nil && !mu.TryLock() {
+			conns++
+			continue
+		}
+		if connSendPending(cs) {
+			conns++
+			queued += len(cs.sendBuf) + len(cs.writeBuf) + len(cs.bodyBuf)
+		}
+		if mu != nil {
+			mu.Unlock()
 		}
 	}
-	return now > end
+	return conns, queued
 }
 
 // hasPendingSends reports whether any live connection still has response bytes
@@ -6651,6 +6752,17 @@ func (w *Worker) shutdown() {
 				cs.asyncInMu.Unlock()
 			}
 			cs.detachMu.Lock()
+			// A recv-end error parked for the close that shutdown is now
+			// finishing in its place (closeOnRecvEnd met a running handler):
+			// delivered here as closeConn delivers it, under the lock and
+			// before OnDetachClose, or the middleware is never told
+			// (celeris#867).
+			if err := cs.closeErr; err != nil {
+				cs.closeErr = nil
+				if cs.h1State != nil && cs.h1State.OnError != nil {
+					cs.h1State.OnError(err)
+				}
+			}
 			cs.detachClosed = true
 			// Acquire barrier — see the primary close path: skip OnDetachClose
 			// until the WS upgrade has fully wired the conn (WSReady) to avoid
@@ -6699,6 +6811,11 @@ func (w *Worker) shutdown() {
 		// ends the kernel's use of it, so retainZCSendBufsAtShutdown keeps
 		// the ones still owed past the Worker (celeris#812).
 	}
+	// The counters the loop batches per iteration and flushes near the top of
+	// the next one: what was counted since that flush (a close queued later in
+	// the last iteration, bytes a send completed) would otherwise never reach
+	// the engine-wide ones, which are read after shutdown (celeris#874).
+	w.flushBatches()
 	// celeris#657 R2: this worker is gone, so it must not leave its last
 	// cycle's residue standing in the engine-wide gauges. Nothing else
 	// retracts it — the sweep does not run after shutdown.
@@ -6733,6 +6850,50 @@ func (w *Worker) shutdown() {
 	// asyncClosed + Broadcast above. Prevents stale-memory races
 	// after the engine claims to have stopped.
 	w.asyncWG.Wait()
+}
+
+// flushBatches publishes the worker-local counters the run loop adds to per
+// event and moves into the shared atomics once per iteration (the block after
+// the submit in run), for shutdown to call: the loop returns from several
+// places before its next flush, and these are all read after shutdown. Keep it
+// in step with that block; TestShutdownFlushesEveryBatch874 fails on a *Batch
+// field that this misses. Nil-safe like the witnesses it feeds, since a
+// hand-built Worker reaches shutdown. Worker thread only.
+func (w *Worker) flushBatches() {
+	if w.reqBatch > 0 {
+		if w.reqCount != nil {
+			w.reqCount.Add(w.reqBatch)
+		}
+		w.reqBatch = 0
+	}
+	if w.bytesReadBatch > 0 {
+		if w.bytesRead != nil {
+			w.bytesRead.Add(w.bytesReadBatch)
+		}
+		w.bytesReadBatch = 0
+	}
+	if w.bytesWrittenBatch > 0 {
+		if w.bytesWritten != nil {
+			w.bytesWritten.Add(w.bytesWrittenBatch)
+		}
+		w.bytesWrittenBatch = 0
+	}
+	if w.ringBytesBatch > 0 {
+		w.zc.noteRingBytes(w.ringBytesBatch)
+		w.ringBytesBatch = 0
+	}
+	if w.closeFDDeferredBatch > 0 {
+		if w.handoffLoss != nil {
+			w.handoffLoss.closeFDDeferred.Add(w.closeFDDeferredBatch)
+		}
+		w.closeFDDeferredBatch = 0
+	}
+	if w.linkArmBatch > 0 {
+		if w.recvArm != nil {
+			w.recvArm.linkedRecvArms.Add(w.linkArmBatch)
+		}
+		w.linkArmBatch = 0
+	}
 }
 
 // releaseFailedInit closes what run created for a worker that failed before

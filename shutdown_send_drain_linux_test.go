@@ -160,6 +160,54 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 	}
 }
 
+// TestShutdownSendDrainStopsAccepting806: a send drain that can last the
+// whole budget does not go on serving new connections once its first 250 ms
+// are over (a connection accepted in it would be cut at its end), as epoll's,
+// whose loops have stopped, and std's, whose listener is closed, do not.
+// Within those 250 ms io_uring still accepts (celeris#595), which this does
+// not pin. The probe is a fresh connection 600 ms into the drain.
+func TestShutdownSendDrainStopsAccepting806(t *testing.T) {
+	const budget = 3 * time.Second
+	body := make([]byte, 3<<20)
+	for _, e := range drainEngines806 {
+		if e.name == "std" || e.name == "adaptive-epoll" {
+			continue
+		}
+		t.Run(e.name, func(t *testing.T) {
+			served := make(chan struct{})
+			srv := startDrainServer806(t, e, budget, 0, nil, func(s *celeris.Server) {
+				s.GET("/big", func(c *celeris.Context) error {
+					defer close(served)
+					return c.Blob(http.StatusOK, "application/octet-stream", body)
+				})
+			})
+			c := dialSlowReader760(t, srv.addr)
+			if _, err := io.WriteString(c, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-served:
+			case <-time.After(5 * time.Second):
+				t.Fatal("handler did not run within 5s")
+			}
+			time.Sleep(100 * time.Millisecond)
+			shutErr := srv.beginShutdown("Shutdown", budget)
+			time.Sleep(600 * time.Millisecond)
+			probe := &http.Client{Timeout: 400 * time.Millisecond, Transport: &http.Transport{DisableKeepAlives: true}}
+			resp, err := probe.Get("http://" + srv.addr + "/ping")
+			if err == nil {
+				_ = resp.Body.Close()
+				t.Errorf("%s: a new connection 600 ms into a send drain that lasts %v was answered %d: the engine is still accepting", e.name, budget, resp.StatusCode)
+			} else {
+				t.Logf("%s: the probe 600 ms into the drain failed as wanted: %v", e.name, err)
+			}
+			if err := srv.waitShutdown("Shutdown", shutErr, budget+time.Second); err != nil {
+				t.Errorf("%s: %v", e.name, err)
+			}
+		})
+	}
+}
+
 // drainEngines806 are the engines the two drain tests run on. Adaptive is run
 // on each of the sub-engines it can start on, set explicitly (its automatic
 // choice is not the test's business, and a test that did not say would cover
