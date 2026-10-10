@@ -27,9 +27,10 @@ func stdPeerString(ip net.IP, port int, zoneID uint32) string {
 	return (&net.TCPAddr{IP: ip, Port: port, Zone: zone}).String()
 }
 
-// loopbackIndex925 returns the interface index of the loopback interface,
-// the one real zone id the table can use on any host.
-func loopbackIndex925(t *testing.T) uint32 {
+// loopbackIface925 returns the index and the name of the loopback interface,
+// the one real zone id the table can use on any host. The name comes from the
+// net.Interfaces entry, not from InterfaceByIndex, for TestZoneLiteral925.
+func loopbackIface925(t *testing.T) (uint32, string) {
 	t.Helper()
 	ifs, err := net.Interfaces()
 	if err != nil {
@@ -37,11 +38,11 @@ func loopbackIndex925(t *testing.T) uint32 {
 	}
 	for _, ifi := range ifs {
 		if ifi.Flags&net.FlagLoopback != 0 {
-			return uint32(ifi.Index)
+			return uint32(ifi.Index), ifi.Name
 		}
 	}
 	t.Fatal("no loopback interface")
-	return 0
+	return 0, ""
 }
 
 // TestSockaddrStringMatchesStd925 feeds raw sockaddr values to the formatter
@@ -50,7 +51,7 @@ func loopbackIndex925(t *testing.T) uint32 {
 // IPv6 with zone 0, link-local with zone 0, and link-local with a real zone
 // id and with an id no interface has.
 func TestSockaddrStringMatchesStd925(t *testing.T) {
-	lo := loopbackIndex925(t)
+	lo, _ := loopbackIface925(t)
 	v6 := func(a string) [16]byte { return netip.MustParseAddr(a).As16() }
 	for _, tc := range []struct {
 		name string
@@ -75,6 +76,32 @@ func TestSockaddrStringMatchesStd925(t *testing.T) {
 			t.Logf("925 probe: %s -> %q", tc.name, got)
 			if got != want {
 				t.Errorf("sockaddrString = %q, want %q (std)", got, want)
+			}
+		})
+	}
+}
+
+// TestZoneLiteral925 pins the zone rule with literal expectations. The table
+// above compares with stdPeerString, which calls net.InterfaceByIndex as the
+// code under test does, so it cannot catch a rule both sides share. Here a
+// scope id that no interface has prints as its number, and the loopback's id
+// prints as the name that net.Interfaces gives it.
+func TestZoneLiteral925(t *testing.T) {
+	lo, loName := loopbackIface925(t)
+	v6 := netip.MustParseAddr("fe80::1").As16()
+	for _, tc := range []struct {
+		name string
+		zone uint32
+		want string
+	}{
+		{"unknown-zone-prints-its-number", 999999, "[fe80::1%999999]:443"},
+		{"loopback-zone-prints-its-name", lo, "[fe80::1%" + loName + "]:443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SockaddrString(&unix.SockaddrInet6{Addr: v6, Port: 443, ZoneId: tc.zone})
+			t.Logf("925 probe: zone %d -> %q", tc.zone, got)
+			if got != tc.want {
+				t.Errorf("SockaddrString = %q, want %q (literal)", got, tc.want)
 			}
 		})
 	}
