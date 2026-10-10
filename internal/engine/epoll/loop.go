@@ -2304,6 +2304,9 @@ func (l *Loop) initProtocol(cs *connState) {
 			// the loop.go:2465-vs-websocket.go:243 use-after-recycle that
 			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade.
 			unlockDetachMu := l.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked
+			// completed: this closure ran to its end. Nothing is owed when this
+			// goroutine holds no lock here.
+			completed := !unlockDetachMu
 			if unlockDetachMu {
 				// Under asyncInMu: dispatchBusy reads it there, and from here
 				// on this goroutine never holds detachMu across a handler
@@ -2313,6 +2316,27 @@ func (l *Loop) initProtocol(cs *connState) {
 				cs.asyncInMu.Lock()
 				cs.asyncDetachUnlocked = true
 				cs.asyncInMu.Unlock()
+				// The flag now tells abortAsyncHandler, serveAsync and the
+				// loop that the lock is gone, so it has to be gone on every
+				// way out of here, a panic included (celeris#844): a panic
+				// between the flag and the release used to leave the lock held
+				// with every reader of the flag believing otherwise, and the
+				// next closeConn parked the loop on it. The release is
+				// deferred, after the publish below, which it also makes if a
+				// panic came first, so that a closeConn that wins the lock
+				// finds Detached set and leaves the stream to the conn's
+				// owner. A panic ends the conn: nothing that follows can
+				// finish the detach (the handler may have recovered the panic,
+				// as the router does, and returned normally), so it is closed
+				// through the detach queue.
+				defer func() {
+					cs.h1State.Detached.Store(true)
+					cs.detachMu.Unlock()
+					if !completed {
+						cs.asyncClosed.Store(true)
+						l.enqueueDetach(cs)
+					}
+				}()
 				if f := detachWindowHook.Load(); f != nil {
 					(*f)() // test seam, celeris#844 item 2
 				}
@@ -2342,14 +2366,13 @@ func (l *Loop) initProtocol(cs *connState) {
 			// let the worker act on a half-installed detach. See the data-race
 			// fix making Detached atomic.
 			cs.h1State.Detached.Store(true)
-			// Release detachMu now that Detached is published, so the guarded
-			// writeFn the middleware calls next (the 101 / SSE headers) can
-			// re-acquire it. A closeConn blocked on detachMu now proceeds and
-			// reads Detached==true, so it skips CloseH1 and leaves teardown to
-			// the middleware goroutine.
-			if unlockDetachMu {
-				cs.detachMu.Unlock()
-			}
+			completed = true
+			// detachMu is released as this closure returns (the defer above),
+			// now that Detached is published, so the guarded writeFn the
+			// middleware calls next (the 101 / SSE headers) can re-acquire it.
+			// A closeConn blocked on detachMu now proceeds and reads
+			// Detached==true, so it skips CloseH1 and leaves teardown to the
+			// middleware goroutine.
 		}
 		cs.h1State.HijackFn = func() (net.Conn, error) {
 			return l.hijackConn(cs.fd)
@@ -2568,21 +2591,58 @@ func readFullAt(file *os.File, buf []byte, offset int64) error {
 // that escapes the router (a stream.Handler used directly, or the engine's
 // own request handling) and a runtime.Goexit (t.FailNow in a test handler,
 // for one), which no recover stops. Either can unwind serveAsync from inside
-// ProcessH1, where this goroutine holds cs.detachMu; abortAsyncHandler
-// releases it and gives the conn the teardown a handler error gets.
+// ProcessH1, where this goroutine holds cs.detachMu, or from the park loop,
+// where it holds cs.asyncInMu; abortAsyncHandler releases what it still holds
+// and gives the conn the teardown a handler error gets.
 func (l *Loop) runAsyncHandler(cs *connState) {
 	defer l.asyncWG.Done()
-	// held: this goroutine holds cs.detachMu (serveAsync sets it after each
-	// Lock and clears it before each Unlock). returned: serveAsync returned,
-	// so neither a panic nor a Goexit is unwinding through here.
-	var held, returned bool
+	// holds: the locks this goroutine holds (see dispatchHolds). returned:
+	// serveAsync returned, so neither a panic nor a Goexit is unwinding
+	// through here.
+	var holds dispatchHolds
+	var returned bool
 	defer func() {
 		if !returned {
-			l.abortAsyncHandler(cs, recover(), held)
+			l.abortAsyncHandler(cs, recover(), &holds)
 		}
 	}()
-	l.serveAsync(cs, &held)
+	l.serveAsync(cs, &holds)
 	returned = true
+}
+
+// dispatchHolds is what a dispatch goroutine holds at a given instant, for
+// abortAsyncHandler: the teardown cannot otherwise tell, and a lock it took
+// that the goroutine already holds deadlocks the goroutine on itself, while a
+// lock it skipped that the goroutine still holds wedges whoever takes it next
+// (celeris#791, celeris#844).
+//
+// Both fields are owned by the dispatch goroutine's stack (runAsyncHandler);
+// nothing else reads them.
+type dispatchHolds struct {
+	// detachMu: the goroutine holds cs.detachMu (serveAsync sets it after each
+	// Lock and clears it before each Unlock). It stays set across a Detach
+	// inside ProcessH1, which releases the lock on this goroutine's behalf and
+	// records that in cs.asyncDetachUnlocked instead.
+	detachMu bool
+	// asyncInMu: the goroutine holds cs.asyncInMu in the park loop at the top
+	// of serveAsync, where it calls into code that can panic with the lock
+	// held (askAtPark: the engine's own code, so a panic there is an engine bug or a
+	// runtime fault). Set after each Lock there and cleared before
+	// each Unlock, so it is not set while the goroutine waits on asyncCond.
+	asyncInMu bool
+}
+
+// panicString formats a recovered panic value for the log. It runs the
+// value's String or Error method, which is application code, so it recovers:
+// abortAsyncHandler calls it before it releases cs.detachMu, and a second
+// panic out of it would leave the lock held.
+func panicString(r any) (s string) {
+	defer func() {
+		if p := recover(); p != nil {
+			s = "(the panic value's String or Error method panicked)"
+		}
+	}()
+	return fmt.Sprint(r)
 }
 
 // abortAsyncHandler tears cs down after its dispatch goroutine's handler
@@ -2590,42 +2650,70 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 // the goroutine ends when this returns). Deferred by runAsyncHandler, on the
 // dispatch goroutine.
 //
-// It releases cs.detachMu first, if this goroutine still holds it: held, and
-// not already released on this goroutine's behalf by a Detach inside
-// ProcessH1 (asyncDetachUnlocked, celeris#273; Unlocking that again would be
-// a fatal "unlock of unlocked mutex", cf. celeris#309). That is before the
-// log, too, whose handler is the application's and may be slow, while the
-// loop's shutdown and the guarded writes of a detached conn take the lock
-// unconditionally. The rest is the handler-error teardown in serveAsync:
-// asyncClosed, endDispatch under asyncInMu, then the hand-back through the
-// detach queue, whose asyncClosed branch closes the conn on the loop thread
-// (once what it has staged has gone out, celeris#761). Like that path it
-// never holds two of detachMu, asyncInMu and detachQMu at once.
+// It first releases cs.asyncInMu if the panic unwound out of the park loop
+// holding it (holds.asyncInMu): the teardown below takes that lock to end the
+// dispatch, and taking it again would deadlock this goroutine on itself, which
+// then never exits (Loop.shutdown waits for it) while the loop blocks on the
+// same lock the next time it feeds this conn (celeris#844).
 //
-// The lock is free from the release on, so a closeConn that meets cs before
-// the hand-back (closeOnReadEnd on a peer FIN, the timeout reap, shutdown)
-// takes it and closes the conn while this goroutine still logs: the fd is
-// closed and may be reissued, and CloseH1 releases the stream (celeris#844
-// tracks a panic value that shares its memory). cs stays valid: closeConn
-// never pools a conn that has a detachMu (!detached), and the drain skips
-// the hand-back of a conn already detachClosed. endDispatch clears asyncRun
-// after the release, so a loop that finds the lock held while the goroutine
-// reads as gone (dispatchBusy false) waits only for a bounded holder.
-func (l *Loop) abortAsyncHandler(cs *connState, r any, held bool) {
-	if held && !cs.asyncDetachUnlocked {
+// It then formats the panic value, takes cs.fd and the stack, and releases
+// cs.detachMu, if this goroutine still holds it: holds.detachMu, and not
+// already released by a Detach inside ProcessH1 (asyncDetachUnlocked,
+// celeris#273; Unlocking that again would be a fatal "unlock of unlocked
+// mutex", cf. celeris#309; OnDetach releases the lock on every way out once
+// it has set the flag, a panic included, celeris#844). The log record is
+// written after the release, with those copies: the application's slog
+// handler may be slow, while the loop's shutdown and the guarded writes of a
+// detached conn take the lock unconditionally; but once the lock is free a
+// closeConn that meets cs (closeOnReadEnd on a peer FIN, the timeout reap,
+// shutdown) takes it and closes the conn, fd included, and CloseH1 releases
+// the stream. A panic value that shares the stream's memory (s.Headers, a view
+// of the body buffer) formatted after that reads zeroed memory or another
+// conn's bytes, and cs.fd may name a reissued descriptor (celeris#844). The
+// formatting runs the value's String or Error method under the lock, so a
+// slow one holds up shutdown, which waits for the lock, and not the loop: a
+// closeConn that finds the lock held while the goroutine runs a handler
+// leaves the close to the goroutine (closeOwed).
+//
+// The rest is the handler-error teardown in serveAsync: asyncClosed,
+// endDispatch under asyncInMu, then the hand-back through the detach queue,
+// whose asyncClosed branch closes the conn on the loop thread (once what it
+// has staged has gone out, celeris#761). Like that path it never holds two of
+// detachMu, asyncInMu and detachQMu at once.
+//
+// cs stays valid while the log runs: closeConn never pools a conn that has a
+// detachMu (!detached), and the drain skips the hand-back of a conn already
+// detachClosed. endDispatch clears asyncRun after the release, so a loop that
+// finds the lock held while the goroutine reads as gone (dispatchBusy false)
+// waits only for a bounded holder.
+func (l *Loop) abortAsyncHandler(cs *connState, r any, holds *dispatchHolds) {
+	if holds.asyncInMu {
+		holds.asyncInMu = false
+		cs.asyncInMu.Unlock()
+	}
+	fd := cs.fd
+	var stack, msg string
+	if l.logger != nil {
+		stack = string(debug.Stack())
+		if r != nil {
+			msg = panicString(r)
+		}
+	}
+	if holds.detachMu && !cs.asyncDetachUnlocked {
+		holds.detachMu = false
 		cs.detachMu.Unlock()
 	}
 	if l.logger != nil {
 		if r != nil {
 			l.logger.Error("async handler panicked",
-				"panic", r,
-				"stack", string(debug.Stack()),
-				"fd", cs.fd,
+				"panic", msg,
+				"stack", stack,
+				"fd", fd,
 			)
 		} else {
 			l.logger.Error("async handler exited without returning (runtime.Goexit)",
-				"stack", string(debug.Stack()),
-				"fd", cs.fd,
+				"stack", stack,
+				"fd", fd,
 			)
 		}
 	}
@@ -2654,12 +2742,12 @@ func (l *Loop) abortAsyncHandler(cs *connState, r any, held bool) {
 // same order on cs.writeBuf before the flush. The "one goroutine at a
 // time per conn" invariant is enforced by cs.asyncRun.
 //
-// *held tracks its Lock and Unlock of cs.detachMu, for abortAsyncHandler.
-// It stays set across a Detach inside ProcessH1, which releases the lock on
-// this goroutine's behalf and records that in asyncDetachUnlocked instead.
-func (l *Loop) serveAsync(cs *connState, held *bool) {
+// holds tracks its Lock and Unlock of cs.detachMu, and of cs.asyncInMu in the
+// park loop, for abortAsyncHandler (see dispatchHolds).
+func (l *Loop) serveAsync(cs *connState, holds *dispatchHolds) {
 	for {
 		cs.asyncInMu.Lock()
+		holds.asyncInMu = true
 		if cs.relinkOwed {
 			// The loop gave this conn up while our handler held detachMu
 			// (celeris#669: the dirty pass or the EPOLLOUT resume); hand it
@@ -2694,6 +2782,7 @@ func (l *Loop) serveAsync(cs *connState, held *bool) {
 			// this goroutine ran may have been left to it (celeris#669), and
 			// then this is where it is handed back.
 			owed := cs.endDispatch()
+			holds.asyncInMu = false
 			cs.asyncInMu.Unlock()
 			if owed {
 				l.enqueueDetach(cs)
@@ -2706,6 +2795,7 @@ func (l *Loop) serveAsync(cs *connState, held *bool) {
 		// conn whose fd it has already detached, so asyncInBuf is empty here.
 		if cs.asyncQuiesce.Load() && len(cs.asyncInBuf) == 0 {
 			cs.endDispatch() // enqueued below: that is the hand-back
+			holds.asyncInMu = false
 			cs.asyncInMu.Unlock()
 			l.enqueueDetach(cs)
 			return
@@ -2716,6 +2806,7 @@ func (l *Loop) serveAsync(cs *connState, held *bool) {
 		// the retained backing array.
 		cs.asyncInBuf, cs.asyncOutBuf = cs.asyncOutBuf[:0], cs.asyncInBuf
 		data := cs.asyncOutBuf
+		holds.asyncInMu = false
 		cs.asyncInMu.Unlock()
 
 		// Post-detach iterations (WS / SSE): ProcessH1's only job is to
@@ -2733,14 +2824,14 @@ func (l *Loop) serveAsync(cs *connState, held *bool) {
 		if !cs.asyncDetachUnlocked {
 			cs.detachMu.Lock()
 			acquiredDetachMu = true
-			*held = true
+			holds.detachMu = true
 		}
 		// Re-check asyncClosed under detachMu when we acquired it;
 		// closeConn sets asyncClosed BEFORE tearing down cs.h1State.
 		// Mirrors the iouring fix.
 		if cs.asyncClosed.Load() {
 			if acquiredDetachMu {
-				*held = false
+				holds.detachMu = false
 				cs.detachMu.Unlock()
 			}
 			// Nor does this one; see the loop-top exit.
@@ -2774,7 +2865,7 @@ func (l *Loop) serveAsync(cs *connState, held *bool) {
 					promoteErr = err
 				}
 			}
-			*held = false
+			holds.detachMu = false
 			cs.detachMu.Unlock()
 			if promoteErr != nil {
 				cs.asyncClosed.Store(true)
@@ -2860,7 +2951,7 @@ func (l *Loop) serveAsync(cs *connState, held *bool) {
 		// does: this goroutine exits and the loop closes the conn once what
 		// was staged has gone out (drainDetachQueue, closeWhenFlushed).
 		refused := cs.writeRefused
-		*held = false
+		holds.detachMu = false
 		cs.detachMu.Unlock()
 
 		if partial {
