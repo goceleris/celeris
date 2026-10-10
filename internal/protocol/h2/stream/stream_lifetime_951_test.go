@@ -216,7 +216,11 @@ func TestEventLoopRacesPoolHandlerEnd951(t *testing.T) {
 		{"raw-window-update-buffered", true, rawWU}, {"conn-window-update-buffered", true, connWU},
 		{"settings-buffered", true, settings}, {"goaway-buffered", true, goaway},
 		{"window-update-then-rst-buffered", true, seq(wu, rst)}, {"window-update-then-server-rst-buffered", true, seq(wu, srst)},
+		// A detached stream is reset when its use ends but never pooled.
+		{"detached-window-update", false, wu}, {"detached-server-rst", false, srst}, {"detached-data-after-request", false, data},
+		{"detached-window-update-buffered", true, wu}, {"detached-settings-buffered", true, settings},
 	} {
+		detached := len(tc.name) > 9 && tc.name[:9] == "detached-"
 		t.Run(tc.name, func(t *testing.T) {
 			var bad atomic.Int64
 			var first atomic.Value
@@ -232,6 +236,9 @@ func TestEventLoopRacesPoolHandlerEnd951(t *testing.T) {
 			for i := range n {
 				buffered := tc.buffered
 				p := NewProcessor(HandlerFunc(func(_ context.Context, s *Stream) error {
+					if detached {
+						s.MarkDetached()
+					}
 					if buffered {
 						s.SetHeadersSent()
 						s.BufferOutbound(make([]byte, 1000), true)
@@ -239,6 +246,7 @@ func TestEventLoopRacesPoolHandlerEnd951(t *testing.T) {
 					return nil
 				}), newTestFrameWriter(), newTestResponseWriter())
 				s := openPoolStream(t, p, 1)
+				s.AddHeadersBatch([][2]string{{":method", "GET"}, {":path", "/"}, {"x-a", "b"}})
 				if buffered {
 					s.SetWindowSize(0)
 				}
@@ -438,5 +446,51 @@ func TestRetireDrainCloseDoNotDeadlock951(t *testing.T) {
 	}
 	if got := m.OutboundHeld(); got != 0 {
 		t.Fatalf("every stream is released and the connection closed, and %d bytes are still charged to its outbound budget", got)
+	}
+}
+
+// TestRetiredStreamDropsItsRequest951 checks that a pool stream does not hold
+// its request while it waits for the event loop to release it: a connection
+// that goes quiet after its async requests would otherwise keep their headers
+// (up to the header list limit each, for as many streams as it opened) until
+// it closes. A detached Context that reads the stream meanwhile sees nothing.
+func TestRetiredStreamDropsItsRequest951(t *testing.T) {
+	for _, detached := range []bool{false, true} {
+		name := "plain"
+		if detached {
+			name = "detached"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := NewProcessor(HandlerFunc(func(_ context.Context, s *Stream) error {
+				if detached {
+					s.MarkDetached()
+				}
+				return nil
+			}), newTestFrameWriter(), newTestResponseWriter())
+			s := openPoolStream(t, p, 1)
+			big := string(make([]byte, 64<<10))
+			s.AddHeadersBatch([][2]string{{":method", "GET"}, {":path", "/"}, {"x-big", big}})
+			s.Trailers = append(s.Trailers, [2]string{"x-trailer", big})
+			s.SetRawBody(make([]byte, 1<<10))
+			p.executeHandler(s)
+			if s.manager == nil {
+				t.Fatal("the stream was released by its handler's goroutine")
+			}
+			if n := len(s.GetHeaders()); n != 0 {
+				t.Fatalf("the retired stream still holds %d request headers", n)
+			}
+			for i, h := range s.hdrBuf {
+				if h != ([2]string{}) {
+					t.Fatalf("hdrBuf[%d] still references %d bytes of header", i, len(h[0])+len(h[1]))
+				}
+			}
+			if len(s.Trailers) != 0 || cap(s.Trailers) > 0 && s.Trailers[:1][0] != ([2]string{}) {
+				t.Fatalf("the retired stream still holds its trailers: %v", s.Trailers)
+			}
+			if s.rawBody != nil {
+				t.Fatalf("the retired stream still holds a %d-byte body view", len(s.rawBody))
+			}
+			p.FlushInlineCleanup()
+		})
 	}
 }

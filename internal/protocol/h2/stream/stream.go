@@ -432,7 +432,9 @@ func (s *Stream) UseUnlock() { s.mu.RUnlock() }
 // puts the object in the pool a second time, and two later streams, on any
 // connections, then share it (celeris#947, celeris#950). For a stream a pool
 // handler runs on, who releases it is decided under its Manager's lock
-// (Manager.takeLocked, Manager.handOffBuffered).
+// (Manager.takeLocked, Manager.handOffBuffered), and it is always the event
+// loop that does (Manager.retire), never the handler's goroutine: the loop may
+// hold the *Stream from a lookup (celeris#951).
 func (s *Stream) Release() {
 	if !s.h1Mode {
 		s.Cancel()
@@ -475,8 +477,7 @@ func (s *Stream) resetAndPool() {
 // resetRequestLocked drops what a Context reads of the request: its headers,
 // trailers and body view. s.mu is held. A pool handler's stream gets this when
 // the handler returns (Manager.retire), though the object is reset and pooled
-// only later, by the event loop: a detached Context that reads it meanwhile
-// sees what it saw after the old immediate release, nothing (celeris#904).
+// only later, by the event loop (celeris#951).
 func (s *Stream) resetRequestLocked() {
 	s.rawBody = nil
 	clear(s.hdrBuf[:])

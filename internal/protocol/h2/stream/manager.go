@@ -154,7 +154,8 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 // DeleteStream removes a stream and releases its pooled buffers.
 // If the stream has an async handler goroutine running (asyncRunning=true),
 // the stream is removed from the map but NOT released — the goroutine
-// will release it when its handler returns (executeHandler).
+// retires it when its handler returns (executeHandler, Manager.retire), and
+// the event loop releases it at the end of its frame batch.
 //
 // A stream that is still in an active state when it is deleted (e.g. a
 // server-initiated RST_STREAM on a stalled stream, or a half-closed-local
@@ -207,18 +208,21 @@ func (m *Manager) resetStream(id uint32) bool {
 // takeLocked takes s, the stream m.streams[id], out of the map and closes
 // it. m.mu must be held. It reports whether the caller is to release s
 // (afterTake): yes unless a pool handler's goroutine still runs on it
-// (flagAsyncRunning), which then releases it itself.
+// (flagAsyncRunning), which then retires it (retire) for the event loop to
+// release.
 //
 // That is decided here, under m.mu, because that is where the goroutine
 // hands the stream over: it takes its stream out of the map under m.mu
-// before it releases it (executeHandler), and it gives a stream whose
+// before it retires it (executeHandler), and it gives a stream whose
 // response is still buffered to the event loop under m.mu too
 // (handOffBuffered). So while s is in the map, the flag says who owns it.
 // Read after the unlock, the flag could already have been cleared by the
-// goroutine's own release (resetAndPool stores 0): the stream was then
-// released a second time and put in the stream pool twice, so two later
-// streams, on any connections, shared one object (celeris#950). Nothing
-// touches s after the unlock unless it is the caller's to release.
+// goroutine's own release (resetAndPool stores 0; the goroutine no longer
+// releases, retire leaves that to the loop, but the flag is still read
+// under the lock): the stream was then released a second time and put in
+// the stream pool twice, so two later streams, on any connections, shared
+// one object (celeris#950). Nothing touches s after the unlock unless it
+// is the caller's to release.
 func (m *Manager) takeLocked(id uint32, s *Stream) (release bool) {
 	delete(m.streams, id)
 	m.priorityTree.RemoveStream(id)
@@ -250,7 +254,7 @@ func (m *Manager) afterTake(id uint32, s *Stream, release bool) {
 // It reports false, and hands nothing over, when the stream is no longer in
 // the map: a RST_STREAM, a GOAWAY, Close or the WINDOW_UPDATE flush took it
 // out while its handler ran, and left its release to the handler's
-// goroutine, which must then release it. Handed over anyway, as it was, no
+// goroutine, which must then retire it. Handed over anyway, as it was, no
 // flush could find it again and nothing released it: its buffered bytes
 // stayed charged to the connection's outbound budget for good (celeris#948).
 func (m *Manager) handOffBuffered(s *Stream) bool {
@@ -295,9 +299,10 @@ func (m *Manager) RemoveStreamFromMap(id uint32) {
 // the same stream until the loop lets go of it.
 //
 // What must not wait for the loop is done here: the stream's context ends
-// (a derived context, and a handler waiting on Done, wake), and the bytes it
+// (a derived context, and a handler waiting on Done, wake), the bytes it
 // still buffers go back to the connection's outbound budget (celeris#893),
-// so the next stream's budget check does not count them.
+// so the next stream's budget check does not count them, and the request it
+// held is dropped.
 //
 // Lock order: s.mu alone (the budget), then m.mu alone, then windowUpdateMu
 // alone. Nothing here nests one in another, so it cannot deadlock with
@@ -311,12 +316,15 @@ func (m *Manager) retire(s *Stream) {
 		buf.Reset()
 	}
 	id := s.ID
-	if s.flags.Load()&flagDetached != 0 {
-		// A detached Context may read the request after the handler returned
-		// (the stream is never pooled, so it can only be this request's):
-		// it sees nothing, as it did when this goroutine reset the stream.
-		s.resetRequestLocked()
-	}
+	// The request is dropped now, not at the loop's next batch: a detached
+	// Context that reads the stream meanwhile sees nothing, as it did when
+	// this goroutine reset the stream (celeris#904), and a connection that
+	// goes quiet does not hold its finished requests' headers until it
+	// closes. The loop reads a stream's headers only before its handler is
+	// dispatched (validateContentLength, canRunInline), never after, as it
+	// never reads Data after: the handler's goroutine drops that too
+	// (executeHandler).
+	s.resetRequestLocked()
 	s.mu.Unlock()
 
 	m.mu.Lock()

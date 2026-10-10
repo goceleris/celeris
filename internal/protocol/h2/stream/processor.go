@@ -911,8 +911,8 @@ func (p *Processor) executeHandler(stream *Stream) {
 		// RST_STREAM or connection close) will release it, and
 		// handleWindowUpdate cleans up after a full flush. A stream that
 		// was taken out of the map while its handler ran is not handed
-		// over: nothing would find it again, so it is released here, with
-		// what it still buffers (celeris#948).
+		// over: nothing would find it again, so it is retired here (the loop
+		// releases it), with what it still buffers (celeris#948).
 		stream.mu.RLock()
 		hasPending := stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0
 		stream.mu.RUnlock()
