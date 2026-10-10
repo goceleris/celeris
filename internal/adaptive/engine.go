@@ -103,6 +103,12 @@ type Engine struct {
 	listenCancel context.CancelFunc
 	listenDone   chan struct{}
 
+	// shuttingDown is set under mu by Shutdown, in the same critical section that
+	// snapshots the sub-engines it shuts down (celeris#877). performSwitch checks
+	// it under mu and does nothing once it is set, so no standby is built after a
+	// snapshot that would never shut it down.
+	shuttingDown bool
+
 	// freezeState synchronises the three counters below. The counters are
 	// atomic so read-only checks (performSwitch) stay lock-free, but any
 	// mutation that may flip frozen must hold this mutex to avoid races
@@ -785,6 +791,14 @@ func (e *Engine) performSwitch() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Once Shutdown has taken its snapshot, a switch must not build a standby:
+	// nothing would shut it down (celeris#877). The check is under mu, and
+	// Shutdown sets the flag under mu, so either this switch finished before the
+	// snapshot or it sees the flag.
+	if e.shuttingDown {
+		return
+	}
+
 	// Driver FDs are pinned to whichever sub-engine's worker they were
 	// registered on — they cannot migrate across epoll ↔ io_uring. If any
 	// driver has live FDs we refuse the switch rather than orphan them.
@@ -1053,6 +1067,7 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	// late. Both sub-engines' Shutdown does nothing else, and they are
 	// called again, as before, once Listen has returned.
 	e.mu.Lock()
+	e.shuttingDown = true
 	subs := [2]engine.Engine{e.primary, e.secondary}
 	e.mu.Unlock()
 	for _, sub := range subs {
