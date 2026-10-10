@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/hpack"
 )
 
 // celeris#944: a client may split the Cookie header into one field per
@@ -179,43 +178,6 @@ func TestCookieJoinStateDoesNotLeakBetweenBlocks944(t *testing.T) {
 			t.Errorf("request %d: cookie fields %q, want %q", i, seen[i].cookie, want[i])
 		}
 	}
-}
-
-// TestManyTinyCookieFieldsJoinInLinearTime944 sends a header block of
-// hundreds of thousands of cookie fields of one HPACK byte each (the static
-// table's empty cookie, 0xA0). Joined pairwise, each field copies what was
-// joined before it: quadratic, seconds of CPU for one request of a few
-// hundred KB. Joined in one pass it takes milliseconds.
-func TestManyTinyCookieFieldsJoinInLinearTime944(t *testing.T) {
-	const n = 256 << 10
-	var hb bytes.Buffer
-	enc := hpack.NewEncoder(&hb)
-	for _, f := range reqHeaders944() {
-		_ = enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
-	}
-	block := append(hb.Bytes(), bytes.Repeat([]byte{0xA0}, n)...)
-
-	done := make(chan *seen944, 1)
-	p := NewProcessor(HandlerFunc(func(_ context.Context, s *Stream) error {
-		x := &seen944{}
-		x.record(s)
-		done <- x
-		return nil
-	}), newTestFrameWriter(), newTestResponseWriter())
-	start := time.Now()
-	if err := p.ProcessRawHeaders(1, true, block); err != nil {
-		t.Fatalf("ProcessRawHeaders: %v", err)
-	}
-	took := time.Since(start)
-	got := <-done
-	if len(got.cookie) != 1 || got.cookie[0] != strings.Repeat("; ", n-1) {
-		t.Fatalf("the handler saw %d cookie fields (first %d bytes), want one of %d bytes", len(got.cookie), len(got.cookie[0]), 2*(n-1))
-	}
-	// Linear: a few milliseconds. Quadratic: 256Ki fields copying up to 512 KB each.
-	if took > 2*time.Second {
-		t.Fatalf("decoding %d cookie fields took %v: the join is not linear", n, took)
-	}
-	t.Logf("%d one-byte cookie fields decoded and joined in %v", n, took)
 }
 
 // TestTrailerCookieFieldsAreNotJoined944 keeps the join to a request's

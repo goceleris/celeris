@@ -323,6 +323,17 @@ func TestRetiredStreamIsReleasedByTheLoopOnce951(t *testing.T) {
 				if s.manager == nil {
 					t.Fatalf("iteration %d: the stream was reset before the event loop released it", i)
 				}
+				if buffered {
+					// Its response bytes are dropped with the request: the
+					// buffer is back in the pool, not held with its capacity
+					// until the loop gets to the stream.
+					s.mu.RLock()
+					buf := s.OutboundBuffer
+					s.mu.RUnlock()
+					if buf != nil {
+						t.Fatalf("iteration %d: the retired stream still holds its outbound buffer (cap %d)", i, buf.Cap())
+					}
+				}
 				for range 64 {
 					if got := streamPool.Get().(*Stream); got == s {
 						t.Fatalf("iteration %d: the retired stream was in the stream pool before the loop's batch ended", i)

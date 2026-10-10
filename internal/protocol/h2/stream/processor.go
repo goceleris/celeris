@@ -142,6 +142,9 @@ type Processor struct {
 	cookieAt             int          // index in *hpackTarget of the block's first cookie field, or -1
 	cookieJoined         bool         // cookieBuf holds the joined value of 2 or more cookie fields
 	cookieBuf            []byte       // the joined cookie value, reused
+	headerListMax        int          // the most a header block may decode to, as net/http counts it (headerFieldOverhead per field); maxHeaderListSize
+	headerListSize       int          // what the block being decoded has decoded to so far
+	headerListTooLarge   bool         // the block being decoded is over headerListMax: hpackEmit drops the rest
 	continuationState    *ContinuationState
 	continuationStateMu  sync.Mutex
 	continuationActive   atomic.Bool
@@ -291,6 +294,24 @@ func (p *Processor) FlushInlineCleanup() {
 	p.manager.drainRetired()
 }
 
+// maxHeaderListSize is the most an HTTP/2 request's header list (or its
+// trailer list) may decode to: the sum, over every field, of len(name) +
+// len(value) + headerFieldOverhead, as RFC 9113 §6.5.2 defines
+// SETTINGS_MAX_HEADER_LIST_SIZE and net/http counts it. 64 KiB is the native
+// HTTP/1 limit (h1.MaxHeaderSize). A peer is not told: the server does not
+// advertise SETTINGS_MAX_HEADER_LIST_SIZE.
+//
+// The HPACK decoder bounds one string only (SetMaxStringLength): a
+// one-byte reference to a 4 KB dynamic-table entry costs the peer one byte and
+// the server a field, so without a bound on the list a 16 KB header block was
+// a list of 48 MB, and with the cookie fields joined one string of 48 MB
+// (celeris#944).
+const maxHeaderListSize = 64 << 10
+
+// headerFieldOverhead is the 32 bytes RFC 7541 §4.1 and RFC 9113 §6.5.2 add
+// to each field's size.
+const headerFieldOverhead = 32
+
 // NewProcessor creates a new stream processor. The conn parameter must
 // implement both ResponseWriter and H2Controller (all H2 engine adapters do).
 // The HPACK decoder is lazily initialized on the first header-block write —
@@ -305,6 +326,8 @@ func NewProcessor(handler Handler, writer FrameWriter, conn h2Conn) *Processor {
 		writer:     writer,
 		connWriter: conn,
 		cookieAt:   -1,
+
+		headerListMax: maxHeaderListSize,
 	}
 	if r, ok := handler.(AsyncRouteResolver); ok {
 		p.asyncResolver = r
@@ -322,12 +345,9 @@ func (p *Processor) ensureHPACKDecoder() {
 		// updated before each decode to point at the current pooled slice,
 		// eliminating a closure allocation per HEADERS/CONTINUATION frame.
 		p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
-		// SETTINGS_MAX_HEADER_LIST_SIZE enforcement: cap the total
-		// uncompressed header list size the decoder is willing to
-		// accept. Without this a single HEADERS frame can grow the
-		// decode target unboundedly (DoS). 64 KiB matches the H1
-		// MaxHeaderSize default and leaves wide margin for real
-		// requests.
+		// One string is at most 64 KiB. That bounds a string only, not
+		// the list: hpackEmit bounds the list (maxHeaderListSize),
+		// handleContinuation the block still being assembled.
 		p.hpackDecoder.SetMaxStringLength(64 << 10)
 	}
 }
@@ -344,8 +364,20 @@ func (p *Processor) ensureHPACKDecoder() {
 // ends (endHeaderDecode). The pieces are gathered in one buffer, so the work
 // is linear in the block, however many fields it splits the header into: a
 // field as small as one HPACK byte (the static table's cookie entry) must not
-// make joining quadratic (celeris#944).
+// make joining quadratic (celeris#944). The header list is bounded
+// (maxHeaderListSize) before a field is joined, so the buffer is too.
 func (p *Processor) hpackEmit(hf hpack.HeaderField) {
+	// Every field is charged before anything is kept of it, cookie fields
+	// that are joined included: the joined value is never longer than the
+	// fields' own sizes. Past the bound the decoder is told to stop emitting
+	// (it finishes the block without building the strings, which keeps its
+	// dynamic table in step with the peer's encoder, as net/http's does) and
+	// the block is refused when it ends (endHeaderDecode).
+	if p.headerListSize += len(hf.Name) + len(hf.Value) + headerFieldOverhead; p.headerListSize > p.headerListMax {
+		p.headerListTooLarge = true
+		p.hpackDecoder.SetEmitEnabled(false)
+		return
+	}
 	t := p.hpackTarget
 	if p.joinCookies && hf.Name == "cookie" {
 		if p.cookieAt < 0 {
@@ -367,7 +399,10 @@ func (p *Processor) hpackEmit(hf hpack.HeaderField) {
 // be decoded. requestHeaders says it is a request's header block, whose cookie
 // fields hpackEmit joins; a trailer block is left as the peer sent it.
 func (p *Processor) beginHeaderDecode(target *[][2]string, requestHeaders bool) {
+	p.ensureHPACKDecoder()
 	p.hpackTarget = target
+	p.headerListSize = 0
+	p.headerListTooLarge = false
 	p.joinCookies = requestHeaders
 	p.cookieAt = -1
 	p.cookieJoined = false
@@ -375,7 +410,20 @@ func (p *Processor) beginHeaderDecode(target *[][2]string, requestHeaders bool) 
 
 // endHeaderDecode finishes a header block hpackEmit decoded: if it carried
 // more than one cookie field, the first one's value becomes the joined value.
-func (p *Processor) endHeaderDecode() {
+// It reports true when the block decoded to more than the header list bound:
+// what hpackEmit kept of it is not a request, and the caller must refuse it
+// (refuseHeaderList) and not use the list.
+func (p *Processor) endHeaderDecode() (tooLarge bool) {
+	if p.headerListTooLarge {
+		p.hpackDecoder.SetEmitEnabled(true)
+		p.headerListTooLarge = false
+		p.cookieJoined = false
+		p.cookieAt = -1
+		if cap(p.cookieBuf) > 4<<10 {
+			p.cookieBuf = nil
+		}
+		return true
+	}
 	if p.cookieJoined {
 		(*p.hpackTarget)[p.cookieAt][1] = string(p.cookieBuf)
 		p.cookieJoined = false
@@ -384,6 +432,16 @@ func (p *Processor) endHeaderDecode() {
 		}
 	}
 	p.cookieAt = -1
+	return false
+}
+
+// refuseHeaderList answers a header block that decoded to more than the
+// header list bound: RST_STREAM ENHANCE_YOUR_CALM for its stream (net/http
+// answers 431), the stream freed with its MAX_CONCURRENT_STREAMS slot. The
+// block was decoded to its end, so the HPACK state is in step with the
+// peer's and the connection goes on. The request never reaches a handler.
+func (p *Processor) refuseHeaderList(streamID uint32) error {
+	return p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeEnhanceYourCalm)
 }
 
 // GetManager returns the stream manager.
@@ -883,10 +941,11 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 	}
 }
 
-// executeHandler executes the handler on a worker pool goroutine. It owns the
-// stream lifecycle: on completion it removes the stream from the manager and
-// releases it back to the pool. If outbound data is buffered (flow control),
-// the stream stays in the map for the event loop to flush via WINDOW_UPDATE.
+// executeHandler executes the handler on a worker pool goroutine. On
+// completion it retires the stream (Manager.retire): it ends its use and takes
+// it out of the manager, and the event loop returns it to the pool, never this
+// goroutine (celeris#951). If outbound data is buffered (flow control), the
+// stream stays in the map for the event loop to flush via WINDOW_UPDATE.
 func (p *Processor) executeHandler(stream *Stream) {
 	// Deferred first, so it runs last: the response is queued and the
 	// stream settled before a shutdown that waits for this count can close
@@ -1060,7 +1119,9 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to finalize trailers: %w", err))
 			}
-			p.endHeaderDecode()
+			if p.endHeaderDecode() {
+				return p.refuseHeaderList(f.StreamID)
+			}
 			trailers := *pooledTrailers
 			if err := validateTrailerHeaders(trailers); err != nil {
 				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
@@ -1139,7 +1200,9 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
-	p.endHeaderDecode()
+	if p.endHeaderDecode() {
+		return p.refuseHeaderList(f.StreamID)
+	}
 
 	headers := *pooledHeadersIn
 	if err := validateRequestHeaders(headers); err != nil {
@@ -1227,7 +1290,9 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to finalize trailers: %w", err))
 			}
-			p.endHeaderDecode()
+			if p.endHeaderDecode() {
+				return p.refuseHeaderList(streamID)
+			}
 			trailers := *pooledTrailers
 			if err := validateTrailerHeaders(trailers); err != nil {
 				_ = p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeProtocol)
@@ -1272,7 +1337,9 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
-	p.endHeaderDecode()
+	if p.endHeaderDecode() {
+		return p.refuseHeaderList(streamID)
+	}
 
 	headers := *pooledHeadersIn
 	if err := validateRequestHeaders(headers); err != nil {
@@ -1674,6 +1741,18 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 				p.continuationState.streamID, f.StreamID))
 	}
 
+	// A header block longer than the header list bound is not a block of
+	// fields within it: a field is encoded in at most len(name)+len(value)+7
+	// bytes, and the bound charges it len(name)+len(value)+32. So the block
+	// is refused as soon as it is that long, and a peer that never ends it
+	// does not make the server keep the pieces (CONTINUATION flood).
+	if len(p.continuationState.headerBlock)+len(f.HeaderBlockFragment()) > p.headerListMax {
+		p.continuationState = nil
+		p.continuationActive.Store(false)
+		return p.GoAwayErr(0, http2.ErrCodeEnhanceYourCalm, []byte("header block too large"),
+			fmt.Errorf("header block on stream %d exceeds %d bytes", f.StreamID, p.headerListMax))
+	}
+
 	p.continuationState.headerBlock = append(
 		p.continuationState.headerBlock,
 		f.HeaderBlockFragment()...,
@@ -1704,7 +1783,11 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 			return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 				fmt.Errorf("failed to finalize headers: %w", err))
 		}
-		p.endHeaderDecode()
+		if p.endHeaderDecode() {
+			p.continuationState = nil
+			p.continuationActive.Store(false)
+			return p.refuseHeaderList(f.StreamID)
+		}
 
 		headers := *pooledHeadersIn
 		if p.continuationState.isTrailers {

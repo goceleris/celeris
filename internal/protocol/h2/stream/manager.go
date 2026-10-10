@@ -49,6 +49,10 @@ type Manager struct {
 	retired    []*Stream
 	hasRetired atomic.Bool
 	closed     bool
+	// drainBuf is drainRetired's own copy of the batch it releases outside
+	// the lock. Only the event loop's drainRetired uses it, one call at a
+	// time (a frame batch ends, then the next one does), so it needs no lock.
+	drainBuf []*Stream
 }
 
 // NewManager creates a new stream manager. Auxiliary maps
@@ -268,7 +272,8 @@ func (m *Manager) handOffBuffered(s *Stream) bool {
 }
 
 // RemoveStreamFromMap removes a stream from the manager's map without releasing it.
-// Used by async handler goroutines that manage their own stream lifecycle.
+// Used by the inline paths, which release the stream themselves after the
+// frame batch (FlushInlineCleanup, executeHandlerInline).
 func (m *Manager) RemoveStreamFromMap(id uint32) {
 	m.mu.Lock()
 	delete(m.streams, id)
@@ -312,8 +317,16 @@ func (m *Manager) retire(s *Stream) {
 	s.endCtx()
 	s.mu.Lock()
 	if buf := s.OutboundBuffer; buf != nil {
+		// What the stream still buffered goes back to the budget and its
+		// buffer to the pool now, not when the loop gets to the stream: a
+		// stream reset while it held response bytes does not keep their
+		// capacity until the connection's next frame batch or close. A late
+		// writer is refused by the use token (EndUse above), and
+		// flushStreamOutbound takes a nil buffer.
 		m.refundOutbound(buf.Len())
 		buf.Reset()
+		bufferPool.Put(buf)
+		s.OutboundBuffer = nil
 	}
 	id := s.ID
 	// The request is dropped now, not at the loop's next batch: a detached
@@ -352,22 +365,28 @@ func (m *Manager) retire(s *Stream) {
 // event loop calls it, where it holds no stream: at the end of a frame batch
 // (FlushInlineCleanup). It costs one atomic load when nothing is retired.
 func (m *Manager) drainRetired() {
-	for m.hasRetired.Load() {
-		m.mu.Lock()
-		n := len(m.retired)
-		if n == 0 {
-			m.hasRetired.Store(false)
-			m.mu.Unlock()
-			return
-		}
-		s := m.retired[n-1]
-		m.retired[n-1] = nil
-		m.retired = m.retired[:n-1]
-		if n == 1 {
-			m.hasRetired.Store(false)
-		}
-		m.mu.Unlock()
+	if !m.hasRetired.Load() {
+		return
+	}
+	// One lock for the whole batch, however many handlers returned (a burst
+	// of async completions costs the loop one lock/unlock, not one each, and
+	// retire's goroutines contend with it once). The streams are released
+	// outside the lock, from the loop's own copy.
+	m.mu.Lock()
+	m.drainBuf = append(m.drainBuf[:0], m.retired...)
+	clear(m.retired)
+	m.retired = m.retired[:0]
+	if cap(m.retired) > 1024 {
+		m.retired = nil // a burst does not pin its slice for the connection's life
+	}
+	m.hasRetired.Store(false)
+	m.mu.Unlock()
+	for i, s := range m.drainBuf {
+		m.drainBuf[i] = nil
 		s.Release()
+	}
+	if cap(m.drainBuf) > 1024 {
+		m.drainBuf = nil
 	}
 }
 
