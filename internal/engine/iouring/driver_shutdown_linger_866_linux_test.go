@@ -24,6 +24,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // lingerSet866 is n lingering driver conns registered by hand on a bare
@@ -255,7 +257,7 @@ func TestCloseFDsInParallelBound866(t *testing.T) {
 		curN--
 		mu.Unlock()
 	}
-	closeFDsInParallel(dcs, workers, closeFn)
+	closeFDsInParallel(dcs, make(chan struct{}, workers), closeFn)
 	if maxN != workers {
 		t.Errorf("at most %d closes were in flight at once, want exactly the bound %d", maxN, workers)
 	}
@@ -267,8 +269,127 @@ func TestCloseFDsInParallelBound866(t *testing.T) {
 	if curN != 0 {
 		t.Errorf("%d closes still in flight after closeFDsInParallel returned", curN)
 	}
-	closeFDsInParallel(nil, workers, func(int) { t.Error("closeFn called for no conns") })
+	closeFDsInParallel(nil, make(chan struct{}, workers), func(int) { t.Error("closeFn called for no conns") })
 	if shutdownDriverCloseWorkers < 2 || shutdownDriverCloseWorkers > 1024 {
 		t.Errorf("shutdownDriverCloseWorkers = %d: outside the range that is parallel yet far from the thread limit", shutdownDriverCloseWorkers)
+	}
+	if cap(driverCloseSem) != shutdownDriverCloseWorkers {
+		t.Errorf("cap(driverCloseSem) = %d, want shutdownDriverCloseWorkers = %d", cap(driverCloseSem), shutdownDriverCloseWorkers)
+	}
+}
+
+// TestCloseFDsInParallelBoundIsSharedByWorkers866: every worker shuts down on
+// its own goroutine at once, and the bound is on threads, which are the
+// process's: callers that share a semaphore share its bound. Four "workers"
+// with 40 conns each, a bound of 8: at most 8 closes in flight among all of
+// them, and 8 of them (a per-caller bound would let 32 through).
+func TestCloseFDsInParallelBoundIsSharedByWorkers866(t *testing.T) {
+	defer watchdog959(t, time.Minute)()
+	const callers, perCaller, bound = 4, 40, 8
+	sem := make(chan struct{}, bound)
+	var (
+		mu         sync.Mutex
+		curN, maxN int
+		seen       = make(map[int]int, callers*perCaller)
+		reached    = make(chan struct{})
+		once       sync.Once
+	)
+	closeFn := func(fd int) {
+		mu.Lock()
+		seen[fd]++
+		curN++
+		if curN > maxN {
+			maxN = curN
+		}
+		if curN == bound {
+			once.Do(func() { close(reached) })
+		}
+		mu.Unlock()
+		select {
+		case <-reached:
+		case <-time.After(5 * time.Second):
+		}
+		time.Sleep(10 * time.Millisecond)
+		mu.Lock()
+		curN--
+		mu.Unlock()
+	}
+	var wg sync.WaitGroup
+	for c := range callers {
+		dcs := make([]*driverConn, perCaller)
+		for i := range dcs {
+			dcs[i] = &driverConn{opFD: c*perCaller + i}
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			closeFDsInParallel(dcs, sem, closeFn)
+		}()
+	}
+	wg.Wait()
+	if maxN != bound {
+		t.Errorf("%d closes were in flight at once across %d callers, want exactly the shared bound %d", maxN, callers, bound)
+	}
+	for fd := range callers * perCaller {
+		if seen[fd] != 1 {
+			t.Errorf("fd %d closed %d times, want once", fd, seen[fd])
+		}
+	}
+}
+
+// TestCloseDriverFDsUsesTheEngineWideBound866 pins the wiring: closeDriverFDs
+// takes its tokens from driverCloseSem, the one every worker shares. With every
+// token held it cannot close anything and does not return; once they are
+// given back it closes the descriptor and returns.
+func TestCloseDriverFDsUsesTheEngineWideBound866(t *testing.T) {
+	defer watchdog959(t, time.Minute)()
+	var p [2]int
+	if err := unix.Pipe2(p[:], unix.O_CLOEXEC); err != nil {
+		t.Fatalf("apparatus: pipe: %v", err)
+	}
+	defer unix.Close(p[1])
+	closed := false
+	defer func() {
+		if !closed {
+			unix.Close(p[0])
+		}
+	}()
+	for range cap(driverCloseSem) {
+		driverCloseSem <- struct{}{}
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		for range cap(driverCloseSem) {
+			<-driverCloseSem
+		}
+	}
+	defer release()
+	done := make(chan struct{})
+	go func() {
+		closeDriverFDs([]*driverConn{{opFD: p[0]}})
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("closeDriverFDs returned while every token of the engine-wide bound was held: it does not use driverCloseSem")
+	case <-time.After(300 * time.Millisecond):
+	}
+	// Still open: a write to the other end of the pipe does not see EPIPE.
+	if _, err := unix.Write(p[1], []byte{0}); err != nil {
+		t.Errorf("the descriptor was closed while the bound was held: %v", err)
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closeDriverFDs did not return after the tokens were given back")
+	}
+	closed = true
+	if err := unix.Fstat(p[0], new(unix.Stat_t)); err != unix.EBADF {
+		t.Errorf("fstat of the closed descriptor = %v, want EBADF", err)
 	}
 }

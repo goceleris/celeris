@@ -724,33 +724,43 @@ func (w *Worker) shutdownDrivers() {
 }
 
 // shutdownDriverCloseWorkers bounds how many of the engine's driver
-// descriptors shutdownDrivers closes at once. close(2) of a socket with
+// descriptors are being closed at once by shutdownDrivers, across every worker
+// of the process (driverCloseSem is shared). close(2) of a socket with
 // SO_LINGER set and data unsent to a peer that is not reading lasts up to the
 // linger time (celeris#735), and each such close holds an OS thread for that
-// long, so the bound is the most threads shutdown can pin this way, well under
-// the runtime's limit of 10000 (an exceeded limit is fatal). Past it the
-// closes queue behind the first ones: ceil(N/bound) x linger in the worst
-// case, against N x linger when one goroutine closed them in turn.
+// long. Every worker shuts down on its own goroutine at the same moment, so a
+// bound per worker would be W x the bound in threads (W is NumCPU by default:
+// 79 or more workers would pass the runtime's limit of 10000 threads, and an
+// exceeded limit is fatal); one bound for all of them is the most threads
+// shutdown can pin this way. Past it the closes queue behind the first ones:
+// ceil(N/bound) x linger in the worst case for N lingering sockets in the
+// whole engine, against N x linger when each worker closed its own in turn.
 const shutdownDriverCloseWorkers = 128
 
+// driverCloseSem holds a token for each close(2) shutdownDrivers has in
+// flight, in every worker.
+var driverCloseSem = make(chan struct{}, shutdownDriverCloseWorkers)
+
 // closeDriverFDs closes the engine's descriptor of each conn, at most
-// shutdownDriverCloseWorkers at a time, and returns when every close(2) has
-// returned. The worker used to close them one after another, so with N
-// lingering sockets shutdown spent up to N x linger here with its ring
-// unserved; now it waits for the slowest (celeris#866). Nothing about a close
-// changes: the same close(2) of the same descriptor, FIN after the unsent data
-// within the linger time (never an RST that discards it, as SO_LINGER{1,0}
-// would), only many at once. The conns are retired, so nothing else touches
-// opFD. Worker goroutine, from shutdownDrivers.
+// shutdownDriverCloseWorkers at a time in the whole process, and returns when
+// every close(2) has returned. The worker used to close them one after
+// another, so with N lingering sockets shutdown spent up to N x linger here
+// with its ring unserved; now it waits for the slowest (celeris#866). Nothing
+// about a close changes: the same close(2) of the same descriptor, FIN after
+// the unsent data within the linger time (never an RST that discards it, as
+// SO_LINGER{1,0} would), only many at once. The conns are retired, so nothing
+// else touches opFD. Worker goroutine, from shutdownDrivers.
 func closeDriverFDs(conns []*driverConn) {
-	closeFDsInParallel(conns, shutdownDriverCloseWorkers, func(fd int) { _ = unix.Close(fd) })
+	closeFDsInParallel(conns, driverCloseSem, func(fd int) { _ = unix.Close(fd) })
 }
 
-// closeFDsInParallel is closeDriverFDs with the bound and the close as
-// parameters, for the test of the bound: closeFn(opFD) runs once per conn, on
-// at most workers goroutines at a time.
-func closeFDsInParallel(conns []*driverConn, workers int, closeFn func(fd int)) {
-	n := min(len(conns), workers)
+// closeFDsInParallel is closeDriverFDs with the bound (the capacity of sem,
+// whose tokens it takes for each close and gives back after it) and the close
+// as parameters, for the test of the bound: closeFn(opFD) runs once per conn,
+// and calls that share a sem share its bound. A goroutine waiting for a token
+// holds no thread; only a close in progress does.
+func closeFDsInParallel(conns []*driverConn, sem chan struct{}, closeFn func(fd int)) {
+	n := min(len(conns), cap(sem))
 	if n <= 0 {
 		return
 	}
@@ -763,11 +773,14 @@ func closeFDsInParallel(conns []*driverConn, workers int, closeFn func(fd int)) 
 		go func() {
 			defer wg.Done()
 			for {
+				sem <- struct{}{}
 				i := int(next.Add(1)) - 1
 				if i >= len(conns) {
+					<-sem
 					return
 				}
 				closeFn(conns[i].opFD)
+				<-sem
 			}
 		}()
 	}
