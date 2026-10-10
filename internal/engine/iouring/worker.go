@@ -1081,16 +1081,20 @@ func (w *Worker) run(ctx context.Context) {
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}
-	_ = platform.PinToCPU(w.cpuID)
+	// celeris#909: a worker planned unpinned, or whose pin failed, has cpuID
+	// -1: no NUMA node to bind to, and NewRingCPU sets no SQPOLL affinity.
+	w.pinOwnThread()
 
 	// Bind memory allocations to this CPU's NUMA node before creating
 	// the listen socket, ring, and buffers. This ensures the socket's
 	// accept queue, mmap'd SQ/CQ rings, SQE arrays, and provided buffer
 	// regions are all NUMA-local to the worker thread, eliminating
 	// cross-socket QPI/UPI traffic on multi-socket systems.
-	numaNode := platform.CPUForNode(w.cpuID)
-	if err := platform.BindNumaNode(numaNode); err == nil {
-		defer func() { _ = platform.ResetNumaPolicy() }()
+	if w.cpuID >= 0 {
+		numaNode := platform.CPUForNode(w.cpuID)
+		if err := platform.BindNumaNode(numaNode); err == nil {
+			defer func() { _ = platform.ResetNumaPolicy() }()
+		}
 	}
 
 	// Create the listen socket on the worker's NUMA node. Each worker has its
