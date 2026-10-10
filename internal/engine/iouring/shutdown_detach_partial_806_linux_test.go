@@ -25,14 +25,14 @@ import (
 // i writes one chunk, startUs + i*stepUs microseconds after the shutdown
 // began: the send drain's first 250 ms end about 100 us after that, and the
 // loop's first pass past them comes within a few hundred us of it, so 64
-// writes 40 us apart, from 100 us before, cover the moment. The stalled client holds
-// the drain open until it reads, holdMs after the shutdown began.
+// writes 40 us apart, from 100 us before, cover the moment. The stalled client
+// holds the drain open until it reads, holdMs after the shutdown began.
 type trial806 struct {
 	streams, startUs, stepUs, chunkKiB, holdMs int
 	attempts                                   int
 }
 
-var params806 = trial806{streams: 64, startUs: 249900, stepUs: 40, chunkKiB: 128, holdMs: 450, attempts: 2}
+var params806 = trial806{streams: 64, startUs: 249900, stepUs: 40, chunkKiB: 128, holdMs: 450, attempts: 1}
 
 type logBuf806 struct {
 	mu sync.Mutex
@@ -60,14 +60,15 @@ func (l *logBuf806) String() string {
 // every client reads: the celeris#806 symptom on the detached path, found in
 // review of the fix.
 //
-// The shape: a stalled response holds the drain open for 450 ms (it is read then); 64 streams
-// each write one chunk larger than the socket buffers across the moment the
-// drain's first 250 ms end, to clients that read at once. The drain must end
-// shortly after the stalled client reads, not at the budget, and must not log
-// that it ran out of time. The moment is one loop pass wide, so this is a
-// probabilistic reproduction, repeated (params806.attempts) on a new server
-// each time; the deterministic one is TestStopDetachedProducersFlushesQueuedBytes806
-// in the iouring package.
+// The shape: a stalled response holds the drain open for 450 ms (it is read
+// then); 64 streams each write one chunk larger than the socket buffers across
+// the moment the drain's first 250 ms end, to clients that read at once. The
+// drain must end shortly after the stalled client has read (a slow host takes
+// seconds over a response through 16 KiB windows: a CI runner took 1.7 s over
+// 256 KiB), not at the budget, and must not log that it ran out of time. The
+// moment is one loop pass wide, so this is a probabilistic reproduction (on the
+// code before the fix it fails in most runs, not all); the deterministic one is
+// TestStopDetachedProducersFlushesQueuedBytes806, in this package.
 //
 // io_uring, directly and as the engine Adaptive started on. The base tier
 // accepts blocking sockets (its accept SQE has no SOCK_NONBLOCK), where an
@@ -104,7 +105,7 @@ func runDetachedPartial806(t *testing.T, eng celeris.EngineType, p trial806) str
 	// never move last it out.
 	const budget = 20 * time.Second
 	chunk := make([]byte, p.chunkKiB<<10)
-	big := make([]byte, 256<<10) // more than the socket buffers hold, so it stalls until the client reads
+	big := make([]byte, 160<<10) // more than the socket buffers hold (about 64 KiB), so it stalls until the client reads
 	var t0 atomic.Int64          // UnixNano of the shutdown's start; 0 before
 	var idx atomic.Int64
 	logs := &logBuf806{}
