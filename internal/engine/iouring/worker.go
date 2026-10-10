@@ -307,6 +307,16 @@ const pendingReleaseHoldNanos int64 = int64(5 * time.Second)
 // (drainEnd, celeris#806).
 const shutdownSendDrainNanos int64 = int64(250 * time.Millisecond)
 
+// waitUntimed reports whether the run loop may wait for a completion with no
+// timeout (mode 3a): SEND SQEs are being submitted, each of which produces a
+// CQE, and the worker is not draining. A draining worker (its context is
+// cancelled) never does: a SEND to a peer that does not read produces none, and
+// the end of the drain is looked at only between waits (celeris#806). Small
+// enough to inline; a function so the rule can be tested.
+func waitUntimed(hasPending, sendsPending, draining bool) bool {
+	return hasPending && sendsPending && !draining
+}
+
 // closingDrainTimeoutNanos bounds the deferred-close drain: how long a
 // connection may sit with cs.closing set, waiting for the SENDs queued at
 // close time to reach the kernel, before checkTimeouts tears it down anyway.
@@ -1414,7 +1424,7 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				cqHead, cqTail = w.ring.BeginCQ()
 			} else if cqHead != cqTail { //nolint:revive // intentional no-op: CQEs ready, no pending SQEs, no syscall needed
-			} else if hasPending && w.sendsPending && !w.draining {
+			} else if waitUntimed(hasPending, w.sendsPending, w.draining) {
 				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
 				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
 				// Not once the context is cancelled (celeris#806): a SEND to a
