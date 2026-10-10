@@ -2388,7 +2388,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 
 	if !isFixedFile {
 		if sa, err := unix.Getpeername(newFD); err == nil {
-			cs.remoteAddr = sockaddrString(sa)
+			cs.remoteAddr = sockaddrString(newFD, sa)
 		}
 	}
 
@@ -7107,8 +7107,8 @@ func boundAddr(fd int) net.Addr {
 
 // sockaddrString formats a peer address as std does; see bindiag.SockaddrString
 // (celeris#925).
-func sockaddrString(sa unix.Sockaddr) string {
-	return bindiag.SockaddrString(sa)
+func sockaddrString(fd int, sa unix.Sockaddr) string {
+	return bindiag.SockaddrString(fd, sa)
 }
 
 func parseAddr(addr string) (unix.Sockaddr, error) {

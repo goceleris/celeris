@@ -93,7 +93,7 @@ func Format(fd int, sa unix.Sockaddr) string {
 	var b strings.Builder
 
 	port := sockaddrPort(sa)
-	addr := SockaddrString(sa)
+	addr := SockaddrString(fd, sa)
 	if addr == "" {
 		addr = "?"
 	}
@@ -142,9 +142,14 @@ func sockaddrPort(sa unix.Sockaddr) int {
 // the scope id is nonzero, with the zone named by zoneName. An unknown address
 // type gives "".
 //
-// It runs once per accepted connection, so the IPv4 form is built by hand into
-// a stack buffer. net.InterfaceByIndex is called only for a nonzero scope id.
-func SockaddrString(sa unix.Sockaddr) string {
+// fd is any socket in the network namespace the address belongs to (the
+// accepted connection, or the listener); it resolves a scope id to an
+// interface name and is not read otherwise.
+//
+// It runs once per accepted connection on the event loop, so the IPv4 form is
+// built by hand into a stack buffer, and a scope id costs one SIOCGIFNAME
+// ioctl, not the netlink dump of net.InterfaceByIndex (celeris#925 review).
+func SockaddrString(fd int, sa unix.Sockaddr) string {
 	switch v := sa.(type) {
 	case *unix.SockaddrInet4:
 		return ipv4Port(v.Addr, v.Port)
@@ -153,7 +158,7 @@ func SockaddrString(sa unix.Sockaddr) string {
 			return ipv4Port([4]byte{v.Addr[12], v.Addr[13], v.Addr[14], v.Addr[15]}, v.Port)
 		}
 		host := net.IP(v.Addr[:]).String()
-		if zone := zoneName(v.ZoneId); zone != "" {
+		if zone := zoneName(fd, v.ZoneId); zone != "" {
 			host += "%" + zone
 		}
 		return net.JoinHostPort(host, strconv.Itoa(v.Port))
@@ -173,21 +178,43 @@ func BoundAddr(fd int) net.Addr {
 	case *unix.SockaddrInet4:
 		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port}
 	case *unix.SockaddrInet6:
-		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: zoneName(v.ZoneId)}
+		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: zoneName(fd, v.ZoneId)}
 	}
 	return nil
 }
 
 // zoneName is a scope id as net.Conn names it: the interface name, or the
-// number when no interface has that index, and "" for 0.
-func zoneName(id uint32) string {
+// number when no interface has that index, and "" for 0. The name is resolved
+// with SIOCGIFNAME on fd: one syscall, no lock, no cache to expire. It does
+// not use net.InterfaceByIndex, which is an RTM_GETLINK dump of every
+// interface (16 us with 12 interfaces, 255 us with 212, 1.7 MB of garbage),
+// too much for the accept path of an event loop that a link-local client can
+// reach once per connection. A failed ioctl (no such interface: ENODEV, or an
+// unusable fd) gives the number, as std does for an unknown interface.
+func zoneName(fd int, id uint32) string {
 	if id == 0 {
 		return ""
 	}
-	if ifi, err := net.InterfaceByIndex(int(id)); err == nil {
-		return ifi.Name
+	if name, ok := ifName(fd, id); ok {
+		return name
 	}
 	return strconv.FormatUint(uint64(id), 10)
+}
+
+// ifName is the name of the interface with index id, from SIOCGIFNAME on fd.
+func ifName(fd int, id uint32) (string, bool) {
+	ifr, err := unix.NewIfreq("")
+	if err != nil {
+		return "", false
+	}
+	ifr.SetUint32(id)
+	if err := unix.IoctlIfreq(fd, unix.SIOCGIFNAME, ifr); err != nil {
+		return "", false
+	}
+	if name := ifr.Name(); name != "" {
+		return name, true
+	}
+	return "", false
 }
 
 // isV4Mapped reports whether a is an IPv4-mapped IPv6 address, ::ffff:a.b.c.d.

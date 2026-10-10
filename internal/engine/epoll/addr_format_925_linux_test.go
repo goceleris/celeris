@@ -42,10 +42,26 @@ func loopbackIndex925(t *testing.T) uint32 {
 	return 0
 }
 
+// ctlSocket925 is a socket to resolve scope ids on, as the accepted connection
+// is for the accept path.
+func ctlSocket925(t *testing.T) int {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		fd, err = unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	}
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	return fd
+}
+
 // TestSockaddrStringMatchesStd925 feeds raw sockaddr values to the peer
 // formatter and compares each with the standard library's rendering.
 func TestSockaddrStringMatchesStd925(t *testing.T) {
 	lo := loopbackIndex925(t)
+	fd := ctlSocket925(t)
 	v6 := func(a string) [16]byte { return netip.MustParseAddr(a).As16() }
 	for _, tc := range []struct {
 		name string
@@ -66,7 +82,7 @@ func TestSockaddrStringMatchesStd925(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want := stdPeerString925(tc.ip, tc.port, tc.zone)
-			if got := sockaddrString(tc.sa); got != want {
+			if got := sockaddrString(fd, tc.sa); got != want {
 				t.Errorf("sockaddrString = %q, want %q (std)", got, want)
 			}
 		})

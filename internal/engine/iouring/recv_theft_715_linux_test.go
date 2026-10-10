@@ -364,7 +364,7 @@ func recvTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, arm theft
 	})
 	defer tr.Disarm()
 
-	a, err := net.DialTimeout("tcp", sockaddrString(sa), time.Second)
+	a, err := net.DialTimeout("tcp", sockaddrString(-1, sa), time.Second)
 	if err != nil {
 		t.Fatalf("dial A: %v", err)
 	}

@@ -52,6 +52,7 @@ func loopbackIface925(t *testing.T) (uint32, string) {
 // id and with an id no interface has.
 func TestSockaddrStringMatchesStd925(t *testing.T) {
 	lo, _ := loopbackIface925(t)
+	fd := ctlSocket925(t)
 	v6 := func(a string) [16]byte { return netip.MustParseAddr(a).As16() }
 	for _, tc := range []struct {
 		name string
@@ -72,7 +73,7 @@ func TestSockaddrStringMatchesStd925(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want := stdPeerString(tc.ip, tc.port, tc.zone)
-			got := SockaddrString(tc.sa)
+			got := SockaddrString(fd, tc.sa)
 			t.Logf("925 probe: %s -> %q", tc.name, got)
 			if got != want {
 				t.Errorf("sockaddrString = %q, want %q (std)", got, want)
@@ -91,14 +92,18 @@ func TestZoneLiteral925(t *testing.T) {
 	v6 := netip.MustParseAddr("fe80::1").As16()
 	for _, tc := range []struct {
 		name string
+		fd   int
 		zone uint32
 		want string
 	}{
-		{"unknown-zone-prints-its-number", 999999, "[fe80::1%999999]:443"},
-		{"loopback-zone-prints-its-name", lo, "[fe80::1%" + loName + "]:443"},
+		{"unknown-zone-prints-its-number", ctlSocket925(t), 999999, "[fe80::1%999999]:443"},
+		{"loopback-zone-prints-its-name", ctlSocket925(t), lo, "[fe80::1%" + loName + "]:443"},
+		// The name comes from an ioctl on fd. With no usable fd it cannot be
+		// resolved, and the number is printed, as for an unknown interface.
+		{"unusable-fd-prints-the-number", -1, lo, "[fe80::1%" + strconv.Itoa(int(lo)) + "]:443"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := SockaddrString(&unix.SockaddrInet6{Addr: v6, Port: 443, ZoneId: tc.zone})
+			got := SockaddrString(tc.fd, &unix.SockaddrInet6{Addr: v6, Port: 443, ZoneId: tc.zone})
 			t.Logf("925 probe: zone %d -> %q", tc.zone, got)
 			if got != tc.want {
 				t.Errorf("SockaddrString = %q, want %q (literal)", got, tc.want)
@@ -121,5 +126,99 @@ func TestFormatPrintsIPv6Address925(t *testing.T) {
 	want := "addr=[::1]:8080 "
 	if len(got) < len(want) || got[:len(want)] != want {
 		t.Errorf("Format() = %q, want it to start with %q", got, want)
+	}
+}
+
+// ctlSocket925 is a socket to resolve scope ids on, as the accepted connection
+// is for the accept path.
+func ctlSocket925(t *testing.T) int {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		fd, err = unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	}
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	return fd
+}
+
+// TestZoneNameEveryInterface925 resolves the index of every interface of the
+// host and expects the name net.Interfaces lists for it (a netlink dump, so
+// independent of the ioctl under test), and the number for an index no
+// interface has.
+func TestZoneNameEveryInterface925(t *testing.T) {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("net.Interfaces: %v", err)
+	}
+	fd := ctlSocket925(t)
+	for _, ifi := range ifs {
+		if got := zoneName(fd, uint32(ifi.Index)); got != ifi.Name {
+			t.Errorf("zoneName(%d) = %q, want %q (net.Interfaces)", ifi.Index, got, ifi.Name)
+		}
+	}
+	t.Logf("925 probe: %d interfaces resolved by index", len(ifs))
+	if got := zoneName(fd, 999999); got != "999999" {
+		t.Errorf("zoneName(999999) = %q, want %q", got, "999999")
+	}
+	if got := zoneName(fd, 0); got != "" {
+		t.Errorf("zoneName(0) = %q, want empty", got)
+	}
+}
+
+// TestZoneCostsNoNetlinkDump925 bounds what a link-local peer costs on the
+// accept path of an event loop (celeris#925 review). net.InterfaceByIndex is
+// an RTM_GETLINK dump of every interface: 45 allocations and 62 KB with 12
+// interfaces, 361 allocations and 1.7 MB with 212. The name from a
+// SIOCGIFNAME ioctl is one allocation whatever the number of interfaces, so
+// this bound holds on any host and fails when the dump comes back.
+func TestZoneCostsNoNetlinkDump925(t *testing.T) {
+	lo, _ := loopbackIface925(t)
+	fd := ctlSocket925(t)
+	sa := &unix.SockaddrInet6{Addr: netip.MustParseAddr("fe80::1").As16(), Port: 443, ZoneId: lo}
+	sa4 := &unix.SockaddrInet4{Addr: [4]byte{10, 0, 12, 200}, Port: 54321}
+	zoned := testing.AllocsPerRun(200, func() { _ = SockaddrString(fd, sa) })
+	plain := testing.AllocsPerRun(200, func() { _ = SockaddrString(fd, sa4) })
+	t.Logf("925 probe: allocs per call: zoned=%v ipv4=%v", zoned, plain)
+	if zoned > 8 {
+		t.Errorf("a zoned peer costs %v allocations per call, want at most 8 (a netlink dump costs 45 or more)", zoned)
+	}
+	if plain > 1 {
+		t.Errorf("an IPv4 peer costs %v allocations per call, want at most 1", plain)
+	}
+}
+
+func BenchmarkSockaddrString925(b *testing.B) {
+	lo := uint32(1)
+	if ifs, err := net.Interfaces(); err == nil {
+		for _, ifi := range ifs {
+			if ifi.Flags&net.FlagLoopback != 0 {
+				lo = uint32(ifi.Index)
+			}
+		}
+	}
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		b.Fatalf("socket: %v", err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	v6 := netip.MustParseAddr("fe80::1").As16()
+	mapped := netip.MustParseAddr("::ffff:10.0.12.200").As16()
+	for _, tc := range []struct {
+		name string
+		sa   unix.Sockaddr
+	}{
+		{"ipv4", &unix.SockaddrInet4{Addr: [4]byte{10, 0, 12, 200}, Port: 54321}},
+		{"ipv4-mapped", &unix.SockaddrInet6{Addr: mapped, Port: 54321}},
+		{"link-local-zoned", &unix.SockaddrInet6{Addr: v6, Port: 54321, ZoneId: lo}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_ = SockaddrString(fd, tc.sa)
+			}
+		})
 	}
 }

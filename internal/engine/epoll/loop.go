@@ -1078,7 +1078,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		// calls it makes.
 		connCtx := ctxkit.WithWorkerID(ctx, l.id)
 		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize, l.async)
-		cs.remoteAddr = sockaddrString(sa)
+		cs.remoteAddr = sockaddrString(newFD, sa)
 		// Install under driverMu. An async Hijack clears its slot from the
 		// dispatch goroutine under this lock and then closes the
 		// descriptor, and the kernel's lowest-free-fd rule can hand the
@@ -4304,8 +4304,8 @@ func boundAddr(fd int) net.Addr {
 
 // sockaddrString formats a peer address as std does; see bindiag.SockaddrString
 // (celeris#925).
-func sockaddrString(sa unix.Sockaddr) string {
-	return bindiag.SockaddrString(sa)
+func sockaddrString(fd int, sa unix.Sockaddr) string {
+	return bindiag.SockaddrString(fd, sa)
 }
 
 func parseAddr(addr string) (unix.Sockaddr, error) {
