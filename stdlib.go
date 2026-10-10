@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goceleris/celeris/internal/engine/std"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
@@ -23,6 +24,10 @@ func ToHandler(h HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s := stream.NewStream(1)
 		defer s.Release()
+		// c.Context() ends with r.Context(): the client leaving, an
+		// http.TimeoutHandler or server shutdown above this handler
+		// (celeris#949). Deferred after Release, so it runs before it.
+		defer std.BindStreamCancel(r.Context(), s)()
 
 		scheme := "http"
 		if r.TLS != nil {

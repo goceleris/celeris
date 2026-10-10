@@ -51,8 +51,23 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is not one the engine served and is not in RequestCount.
 	b.engine.metrics.reqCount.Add(1)
 
-	s := stream.NewH1Stream(1)
-	defer s.Release()
+	// An h2c request gets an HTTP/2 stream, whose context ends when the
+	// client resets the stream or goes away, as it does on the native
+	// engines (celeris#949). An HTTP/1 request keeps the HTTP/1 stream, whose
+	// context is context.Background() on every engine: no engine cancels it
+	// when an HTTP/1 client leaves (SSE and WebSocket handlers are told
+	// through OnWSDetachClose, below).
+	var s *stream.Stream
+	if r.ProtoMajor == 2 {
+		s = stream.NewStream(1)
+		defer s.Release()
+		// Deferred after Release, so it runs before it: a cancel must not
+		// reach the stream once it is back in the pool.
+		defer BindStreamCancel(r.Context(), s)()
+	} else {
+		s = stream.NewH1Stream(1)
+		defer s.Release()
+	}
 
 	scheme := "http"
 	if r.TLS != nil {

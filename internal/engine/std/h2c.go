@@ -34,6 +34,7 @@ package std
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -116,11 +117,17 @@ func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer func() { _ = conn.Close() }()
+		// The upgrade request is stream 1 but keeps its HTTP/1 context, which
+		// the stream's RST_STREAM does not cancel; give it one that the
+		// watcher cancels when the client resets stream 1 (celeris#949).
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		conn = newH2CStream1Watch(conn, cancel)
 		h.h2s.ServeConn(conn, &http2.ServeConnOpts{ //nolint:staticcheck // SA1019: see the import comment in engine.go.
 			Context:        r.Context(),
 			Handler:        h.next,
 			BaseConfig:     h2cBaseConfig(r),
-			UpgradeRequest: r,
+			UpgradeRequest: r.WithContext(ctx),
 			Settings:       settings,
 		})
 		return
