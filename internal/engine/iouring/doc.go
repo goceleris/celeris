@@ -37,7 +37,10 @@
 //     a non-integer keeps the auto-scaled size. See resolveBufRingCount.
 //
 //   - CELERIS_MAX_IOURING_TIER: Caps the detected io_uring tier at startup ("none", "base", "high",
-//     "optional"), to exercise lower-tier fallback paths on modern kernels. Any other value
-//     counts as "none". At "none" this engine reports io_uring as unavailable, and the adaptive
-//     engine treats io_uring as not viable, so it neither starts on it nor switches to it.
+//     "optional"), to exercise lower-tier fallback paths on modern kernels. Any other non-empty
+//     value counts as "none"; an empty value is the same as unset. At "none" this engine reports
+//     io_uring as unavailable, and the adaptive engine's automatic choice treats io_uring as not
+//     viable, so it neither starts on it nor switches to it. An explicit
+//     CELERIS_ADAPTIVE_START=iouring still tries io_uring first: this engine refuses, and the
+//     adaptive engine logs a warning and starts on epoll.
 package iouring
