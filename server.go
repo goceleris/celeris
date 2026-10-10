@@ -559,8 +559,13 @@ func (s *Server) cancelListen() {
 //
 // The drain waits for every HTTP/1.1 request and every HTTP/2 stream. std
 // and epoll accept no new connection once the shutdown has begun, and
-// io_uring none while it waits for HTTP/2 handlers (its 250 ms send drain
-// keeps accepting, celeris#595). An HTTP/2 stream on an async route (marked Async, or promoted to async under
+// io_uring none while it waits for HTTP/2 handlers or, past the first 250 ms
+// of its send drain, for that drain (it keeps accepting, and serving the
+// requests of its keep-alive connections, for those 250 ms, celeris#595,
+// celeris#806); past them it reads no more request from an HTTP/1.1
+// connection, ends the writes of its detached streams (Server-Sent Events,
+// WebSocket: epoll ends them at the cancel) and only finishes the responses
+// it has queued. An HTTP/2 stream on an async route (marked Async, or promoted to async under
 // [Config.AsyncHandlers]) runs on the shared HTTP/2 worker pool: epoll,
 // io_uring and adaptive send each HTTP/2 connection GOAWAY, refuse
 // (REFUSED_STREAM) a stream its client opens after it, and serve the
@@ -571,9 +576,20 @@ func (s *Server) cancelListen() {
 // 250 ms; std sends each h2c connection GOAWAY, then waits for its h2c
 // streams' handlers, bounded by ctx (celeris#759, celeris#878). Once
 // the handlers have returned, the native engines send what the sockets have
-// not taken yet before they close the connections: epoll (and adaptive while
-// it runs epoll) for as long, and never for less than 250 ms (celeris#760);
-// io_uring for 250 ms (celeris#806).
+// not taken yet before they close the connections: epoll for as long, and
+// never for less than 250 ms (celeris#760), and io_uring the same
+// (celeris#806), as does adaptive on whichever of the two it runs. A client
+// that has not taken its response by then loses the rest of it: the
+// connection is closed on what the socket holds, and the io_uring engine
+// logs a WARN naming how many connections and queued bytes that cost. That
+// wait is also capped by [Config.WriteTimeout], from the start of the wait:
+// 60 s by default, so a client that stops reading holds the Start* call for
+// up to that long when ctx has no deadline (and, on a cancel of
+// StartWithContext, for up to [Config.ShutdownTimeout], 30 s by default);
+// only a WriteTimeout of -1 leaves a ctx without a deadline unbounded. On
+// io_uring the cap is taken from the start of each of its two waits, the
+// HTTP/2 handlers' and the send drain that follows, so a server with HTTP/2
+// stream handlers still running can be held up to twice that.
 //
 // The listen context published by the Start* entry points is cancelled AFTER
 // the engine's graceful phase, never before: on std, Engine.Shutdown IS the
