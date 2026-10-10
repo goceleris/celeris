@@ -18,7 +18,9 @@ type ContinuationState struct {
 	headerBlock   []byte
 	endStream     bool
 	expectingMore bool
-	isTrailers    bool
+	// priority is the PRIORITY field of the HEADERS frame that started the
+	// block (nil: it had none); it applies when the block is admitted.
+	priority *headerPriority
 }
 
 var headerBlockPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
@@ -1062,303 +1064,160 @@ func (p *Processor) executeHandler(stream *Stream) {
 	}
 }
 
-// handleHeaders processes HEADERS frames.
-//
-//nolint:gocyclo // complex header block assembly and stream lifecycle logic
-func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) error {
-	existingStream, exists := p.manager.GetStream(f.StreamID)
-
-	if !f.HeadersEnded() {
-		headerBlock := f.HeaderBlockFragment()
-		frag := make([]byte, len(headerBlock))
-		copy(frag, headerBlock)
-		p.continuationStateMu.Lock()
-		p.continuationState = &ContinuationState{
-			streamID:      f.StreamID,
-			headerBlock:   frag,
-			endStream:     f.StreamEnded(),
-			expectingMore: true,
-			isTrailers:    false,
-		}
-		p.continuationActive.Store(true)
-		p.continuationStateMu.Unlock()
-		return nil
-	}
-
-	if !exists {
-		lastClientStream := p.manager.lastClientStream.Load()
-
-		if f.StreamID <= lastClientStream {
-			_ = p.SendGoAway(lastClientStream, http2.ErrCodeProtocol, []byte("HEADERS on closed stream (reused id)"))
-			return fmt.Errorf("HEADERS frame on closed stream %d (last stream: %d)", f.StreamID, lastClientStream)
-		}
-
-		if err := validateStreamID(f.StreamID, lastClientStream, false); err != nil {
-			return p.GoAwayErr(lastClientStream, http2.ErrCodeProtocol, []byte(err.Error()), err)
-		}
-
-		// Frame processing is serial (under H2State.mu), so Store is safe.
-		if f.StreamID > lastClientStream {
-			p.manager.lastClientStream.Store(f.StreamID)
-		}
-	}
-
-	if exists {
-		state := existingStream.GetState()
-		switch state {
-		case StateClosed:
-			_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeStreamClosed, []byte("HEADERS on closed stream (state closed)"))
-			return fmt.Errorf("HEADERS frame on closed stream %d", f.StreamID)
-		case StateHalfClosedRemote:
-			_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeStreamClosed, []byte("HEADERS on half-closed stream"))
-			return fmt.Errorf("HEADERS frame on half-closed (remote) stream %d", f.StreamID)
-		}
-
-		if existingStream.ReceivedInitialHeaders {
-			if !f.StreamEnded() {
-				return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("second HEADERS without END_STREAM"),
-					fmt.Errorf("second HEADERS without END_STREAM on stream %d", f.StreamID))
-			}
-			headerBlock := f.HeaderBlockFragment()
-			if !f.HeadersEnded() {
-				frag := make([]byte, len(headerBlock))
-				copy(frag, headerBlock)
-				p.continuationStateMu.Lock()
-				p.continuationState = &ContinuationState{
-					streamID:      f.StreamID,
-					headerBlock:   frag,
-					endStream:     f.StreamEnded(),
-					expectingMore: true,
-					isTrailers:    true,
-				}
-				p.continuationActive.Store(true)
-				p.continuationStateMu.Unlock()
-				return nil
-			}
-
-			pooledTrailers := headersSlicePoolIn.Get().(*[][2]string)
-			*pooledTrailers = (*pooledTrailers)[:0]
-			defer func() {
-				*pooledTrailers = (*pooledTrailers)[:0]
-				headersSlicePoolIn.Put(pooledTrailers)
-			}()
-			p.beginHeaderDecode(pooledTrailers, false)
-			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
-				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
-					fmt.Errorf("failed to decode trailers: %w", err))
-			}
-			if err := p.hpackDecoder.Close(); err != nil {
-				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
-					fmt.Errorf("failed to finalize trailers: %w", err))
-			}
-			if p.endHeaderDecode() {
-				return p.refuseHeaderList(f.StreamID)
-			}
-			trailers := *pooledTrailers
-			if err := validateTrailerHeaders(trailers); err != nil {
-				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
-				return fmt.Errorf("invalid trailers: %w", err)
-			}
-			existingStream.AddHeadersBatch(trailers)
-
-			if f.StreamEnded() {
-				existingStream.EndStream = true
-				existingStream.SetState(StateHalfClosedRemote)
-				p.runHandler(existingStream)
-			}
-			return nil
-		}
-	}
-
-	stream, ok := p.manager.TryOpenStream(f.StreamID)
-	if !ok {
-		_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeRefusedStream)
-		return fmt.Errorf("exceeds MAX_CONCURRENT_STREAMS")
-	}
-
-	if err := validateStreamState(stream.GetState(), http2.FrameHeaders, f.StreamEnded()); err != nil {
-		sendStreamError(p.writer, f.StreamID, http2.ErrCodeStreamClosed)
-		return err
-	}
-
-	if stream.ResponseWriter == nil {
-		stream.ResponseWriter = p.connWriter
-	}
-
-	headerBlock := f.HeaderBlockFragment()
-
-	if dependency, weight, exclusive, hasPriority := ParsePriorityFromHeaders(f); hasPriority {
-		if dependency == f.StreamID {
-			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("stream depends on itself"),
-				fmt.Errorf("stream %d depends on itself", f.StreamID))
-		}
-		p.manager.priorityTree.UpdateFromFrame(f.StreamID, dependency, weight, exclusive)
-	}
-
-	if !f.HeadersEnded() {
-		pooled := headerBlockPool.Get().(*[]byte)
-		frag := (*pooled)[:0]
-		frag = append(frag, headerBlock...)
-		p.continuationStateMu.Lock()
-		p.continuationState = &ContinuationState{
-			streamID:      f.StreamID,
-			headerBlock:   frag,
-			endStream:     f.StreamEnded(),
-			expectingMore: true,
-			isTrailers:    false,
-		}
-		p.continuationActive.Store(true)
-		p.continuationStateMu.Unlock()
-		// TryOpenStream already set state to StateOpen; skip redundant Swap.
-		if stream.ResponseWriter == nil {
-			stream.ResponseWriter = p.connWriter
-		}
-		return nil
-	}
-
-	pooledHeadersIn := headersSlicePoolIn.Get().(*[][2]string)
-	*pooledHeadersIn = (*pooledHeadersIn)[:0]
-	defer func() {
-		*pooledHeadersIn = (*pooledHeadersIn)[:0]
-		headersSlicePoolIn.Put(pooledHeadersIn)
-	}()
-	p.beginHeaderDecode(pooledHeadersIn, true)
-	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
-		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
-			fmt.Errorf("failed to decode headers: %w", err))
-	}
-	if err := p.hpackDecoder.Close(); err != nil {
-		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
-			fmt.Errorf("failed to finalize headers: %w", err))
-	}
-	if p.endHeaderDecode() {
-		return p.refuseHeaderList(f.StreamID)
-	}
-
-	headers := *pooledHeadersIn
-	if err := validateRequestHeaders(headers); err != nil {
-		sendStreamError(p.writer, f.StreamID, http2.ErrCodeProtocol)
-		return fmt.Errorf("invalid headers: %w", err)
-	}
-	for _, h := range headers {
-		if h[0] == ":method" && h[1] == "HEAD" {
-			stream.IsHEAD = true
-			break
-		}
-	}
-	stream.AddHeadersBatch(headers)
-	stream.ReceivedInitialHeaders = true
-
-	if f.StreamEnded() {
-		stream.EndStream = true
-		stream.SetState(StateHalfClosedRemote)
-
-		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
-			sendStreamError(p.writer, f.StreamID, http2.ErrCodeProtocol)
-			return fmt.Errorf("content-length mismatch: %w", err)
-		}
-
-		p.runHandler(stream)
-	}
-
-	return nil
+// headerPriority is the PRIORITY field of a HEADERS frame.
+type headerPriority struct {
+	dependency uint32
+	weight     uint8
+	exclusive  bool
 }
 
-// ProcessRawHeaders handles a HEADERS frame from raw bytes, bypassing the
-// x/net framer's *HeadersFrame allocation. Only valid for simple HEADERS
-// (END_HEADERS set, no PADDED, no PRIORITY, not during CONTINUATION).
-// All RFC 7540 validations are preserved.
-func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlock []byte) error {
-	existingStream, exists := p.manager.GetStream(streamID)
+// admission is what admitHeaders made of a complete header block.
+type admission uint8
+
+const (
+	// admitNew: the block is the request headers of a stream that is open.
+	admitNew admission = iota
+	// admitTrailers: the stream already has its request headers; the block
+	// is its trailers.
+	admitTrailers
+	// admitRefused: the stream was refused (RST_STREAM REFUSED_STREAM) and
+	// the block was decoded and dropped; there is nothing more to do.
+	admitRefused
+)
+
+// admitHeaders is the admission of a complete header block (HEADERS with
+// END_HEADERS, or HEADERS and the CONTINUATION frames that end it, whole):
+// the one place that decides whether the block opens a stream, is the
+// trailers of one, or is refused. Every way a header block reaches the
+// processor (ProcessRawHeaders, handleHeaders, handleContinuation) calls it
+// before it decodes the block, so none of them can skip a check another
+// makes (celeris#981: the CONTINUATION path opened its streams with
+// GetOrCreateStream, which checks nothing).
+//
+// For a stream the manager does not hold (an idle one, which includes a
+// placeholder PRIORITY left behind): its identifier must be odd and greater
+// than the last client stream (RFC 9113 §5.1.1; a lower or equal one is a
+// closed stream's, a connection error), and is then used up, refused or not;
+// the stream is opened if the peer's SETTINGS_MAX_CONCURRENT_STREAMS has room
+// (TryOpenStream), and refused with RST_STREAM REFUSED_STREAM if it has none
+// (§5.1.2; the client may retry it at once, and the connection serves the
+// next request). For a stream the manager holds: HEADERS on a closed or
+// half-closed (remote) stream is a connection error (STREAM_CLOSED); a second
+// header block is the stream's trailers and must end it.
+//
+// It returns the stream for admitNew and admitTrailers. endStream is the
+// END_STREAM flag of the HEADERS frame, block the whole header block (a
+// refused one is decoded, to keep the HPACK state in step with the peer's).
+// Frame processing is serial (under H2State.mu), so the load and the store of
+// the last client stream need no more than the atomics they are.
+func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stream, admission, error) {
+	m := p.manager
+	existing, exists := m.GetStream(id)
+	if exists && existing.GetState() == StateIdle {
+		// A PRIORITY frame put it there; the stream is not open, and its
+		// identifier is as new as one the manager has never seen.
+		exists = false
+	}
 
 	if !exists {
-		lastClientStream := p.manager.lastClientStream.Load()
+		last := m.lastClientStream.Load()
 
-		if streamID <= lastClientStream {
-			_ = p.SendGoAway(lastClientStream, http2.ErrCodeProtocol, []byte("HEADERS on closed stream (reused id)"))
-			return fmt.Errorf("HEADERS frame on closed stream %d (last stream: %d)", streamID, lastClientStream)
+		if id <= last {
+			_ = p.SendGoAway(last, http2.ErrCodeProtocol, []byte("HEADERS on closed stream (reused id)"))
+			return nil, admitNew, fmt.Errorf("HEADERS frame on closed stream %d (last stream: %d)", id, last)
 		}
 
-		if err := validateStreamID(streamID, lastClientStream, false); err != nil {
-			return p.GoAwayErr(lastClientStream, http2.ErrCodeProtocol, []byte(err.Error()), err)
+		if err := validateStreamID(id, last, false); err != nil {
+			return nil, admitNew, p.GoAwayErr(last, http2.ErrCodeProtocol, []byte(err.Error()), err)
 		}
 
-		if streamID > lastClientStream {
-			p.manager.lastClientStream.Store(streamID)
-		}
-	}
-
-	if exists {
-		state := existingStream.GetState()
-		switch state {
+		// Used up now, not when the stream opens: a stream refused below
+		// still makes every identifier up to its own a closed one's.
+		m.lastClientStream.Store(id)
+	} else {
+		switch existing.GetState() {
 		case StateClosed:
-			_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeStreamClosed, []byte("HEADERS on closed stream (state closed)"))
-			return fmt.Errorf("HEADERS frame on closed stream %d", streamID)
+			_ = p.SendGoAway(m.GetLastStreamID(), http2.ErrCodeStreamClosed, []byte("HEADERS on closed stream (state closed)"))
+			return nil, admitNew, fmt.Errorf("HEADERS frame on closed stream %d", id)
 		case StateHalfClosedRemote:
-			_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeStreamClosed, []byte("HEADERS on half-closed stream"))
-			return fmt.Errorf("HEADERS frame on half-closed (remote) stream %d", streamID)
+			_ = p.SendGoAway(m.GetLastStreamID(), http2.ErrCodeStreamClosed, []byte("HEADERS on half-closed stream"))
+			return nil, admitNew, fmt.Errorf("HEADERS frame on half-closed (remote) stream %d", id)
 		}
 
-		if existingStream.ReceivedInitialHeaders {
+		if existing.ReceivedInitialHeaders {
 			if !endStream {
-				return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("second HEADERS without END_STREAM"),
-					fmt.Errorf("second HEADERS without END_STREAM on stream %d", streamID))
+				return nil, admitNew, p.GoAwayErr(m.GetLastStreamID(), http2.ErrCodeProtocol, []byte("second HEADERS without END_STREAM"),
+					fmt.Errorf("second HEADERS without END_STREAM on stream %d", id))
 			}
-			// Trailers on existing stream.
-			pooledTrailers := headersSlicePoolIn.Get().(*[][2]string)
-			*pooledTrailers = (*pooledTrailers)[:0]
-			defer func() {
-				*pooledTrailers = (*pooledTrailers)[:0]
-				headersSlicePoolIn.Put(pooledTrailers)
-			}()
-			p.beginHeaderDecode(pooledTrailers, false)
-			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
-				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
-					fmt.Errorf("failed to decode trailers: %w", err))
-			}
-			if err := p.hpackDecoder.Close(); err != nil {
-				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
-					fmt.Errorf("failed to finalize trailers: %w", err))
-			}
-			if p.endHeaderDecode() {
-				return p.refuseHeaderList(streamID)
-			}
-			trailers := *pooledTrailers
-			if err := validateTrailerHeaders(trailers); err != nil {
-				_ = p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeProtocol)
-				return fmt.Errorf("invalid trailers: %w", err)
-			}
-			existingStream.AddHeadersBatch(trailers)
-
-			if endStream {
-				existingStream.EndStream = true
-				existingStream.SetState(StateHalfClosedRemote)
-				p.runHandler(existingStream)
-			}
-			return nil
+			return existing, admitTrailers, nil
 		}
 	}
 
-	// New stream — open it.
-	stream, ok := p.manager.TryOpenStream(streamID)
+	stream, ok := m.TryOpenStream(id)
 	if !ok {
-		sendStreamError(p.writer, streamID, http2.ErrCodeRefusedStream)
-		return nil
+		return nil, admitRefused, p.refuseStream(id, block)
 	}
 	if stream.ResponseWriter == nil {
 		stream.ResponseWriter = p.connWriter
 	}
+	return stream, admitNew, nil
+}
 
-	// No PRIORITY handling needed (flag checked by caller).
+// refuseStream refuses a stream the peer's SETTINGS_MAX_CONCURRENT_STREAMS
+// has no room for: RST_STREAM REFUSED_STREAM (a stream error: the request
+// was not processed, the client may retry it, and the connection goes on).
+// The header block is decoded to its end and dropped first, as
+// refuseHeaderList's is: HPACK state is the connection's, and a block that
+// added a field to the dynamic table must add it here too, or the peer's next
+// block references an entry this decoder does not have.
+func (p *Processor) refuseStream(id uint32, block []byte) error {
+	var dropped [][2]string
+	p.beginHeaderDecode(&dropped, false)
+	p.hpackDecoder.SetEmitEnabled(false) // decode, build nothing
+	if _, err := p.hpackDecoder.Write(block); err != nil {
+		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+			fmt.Errorf("failed to decode headers: %w", err))
+	}
+	if err := p.hpackDecoder.Close(); err != nil {
+		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+			fmt.Errorf("failed to finalize headers: %w", err))
+	}
+	p.endHeaderDecode()
+	return p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeRefusedStream)
+}
 
-	pooledHeadersIn := headersSlicePoolIn.Get().(*[][2]string)
-	*pooledHeadersIn = (*pooledHeadersIn)[:0]
+// serveHeaderBlock handles a complete header block: admission
+// (admitHeaders), the PRIORITY field of a block that opened a stream, then
+// the block itself (completeHeaderBlock). prio is nil for a HEADERS frame
+// without the PRIORITY flag.
+func (p *Processor) serveHeaderBlock(id uint32, endStream bool, prio *headerPriority, block []byte) error {
+	stream, adm, err := p.admitHeaders(id, endStream, block)
+	if err != nil || adm == admitRefused {
+		return err
+	}
+	if prio != nil && adm == admitNew {
+		if prio.dependency == id {
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("stream depends on itself"),
+				fmt.Errorf("stream %d depends on itself", id))
+		}
+		p.manager.priorityTree.UpdateFromFrame(id, prio.dependency, prio.weight, prio.exclusive)
+	}
+	return p.completeHeaderBlock(stream, adm, id, endStream, block)
+}
+
+// completeHeaderBlock decodes the header block of an admitted stream and
+// acts on it: request headers (validated, the handler run when endStream) or
+// trailers (validated, the handler run when endStream).
+func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32, endStream bool, block []byte) error {
+	pooled := headersSlicePoolIn.Get().(*[][2]string)
+	*pooled = (*pooled)[:0]
 	defer func() {
-		*pooledHeadersIn = (*pooledHeadersIn)[:0]
-		headersSlicePoolIn.Put(pooledHeadersIn)
+		*pooled = (*pooled)[:0]
+		headersSlicePoolIn.Put(pooled)
 	}()
-	p.beginHeaderDecode(pooledHeadersIn, true)
-	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
+	trailers := adm == admitTrailers
+	p.beginHeaderDecode(pooled, !trailers)
+	if _, err := p.hpackDecoder.Write(block); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
 	}
@@ -1367,12 +1226,26 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
 	if p.endHeaderDecode() {
-		return p.refuseHeaderList(streamID)
+		return p.refuseHeaderList(id)
+	}
+	headers := *pooled
+
+	if trailers {
+		if err := validateTrailerHeaders(headers); err != nil {
+			_ = p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeProtocol)
+			return fmt.Errorf("invalid trailers: %w", err)
+		}
+		stream.AddHeadersBatch(headers)
+		if endStream {
+			stream.EndStream = true
+			stream.SetState(StateHalfClosedRemote)
+			p.runHandler(stream)
+		}
+		return nil
 	}
 
-	headers := *pooledHeadersIn
 	if err := validateRequestHeaders(headers); err != nil {
-		sendStreamError(p.writer, streamID, http2.ErrCodeProtocol)
+		sendStreamError(p.writer, id, http2.ErrCodeProtocol)
 		return fmt.Errorf("invalid headers: %w", err)
 	}
 	for _, h := range headers {
@@ -1389,14 +1262,56 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 		stream.SetState(StateHalfClosedRemote)
 
 		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
-			sendStreamError(p.writer, streamID, http2.ErrCodeProtocol)
+			sendStreamError(p.writer, id, http2.ErrCodeProtocol)
 			return fmt.Errorf("content-length mismatch: %w", err)
 		}
 
 		p.runHandler(stream)
 	}
-
 	return nil
+}
+
+// handleHeaders processes HEADERS frames. A HEADERS frame without END_HEADERS
+// starts a header block that handleContinuation completes; the block is
+// admitted, as any other, when it is complete (admitHeaders).
+func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) error {
+	dependency, weight, exclusive, hasPriority := ParsePriorityFromHeaders(f)
+
+	if !f.HeadersEnded() {
+		var prio *headerPriority
+		if hasPriority {
+			prio = &headerPriority{dependency: dependency, weight: weight, exclusive: exclusive}
+		}
+		headerBlock := f.HeaderBlockFragment()
+		frag := make([]byte, len(headerBlock))
+		copy(frag, headerBlock)
+		p.continuationStateMu.Lock()
+		p.continuationState = &ContinuationState{
+			streamID:      f.StreamID,
+			headerBlock:   frag,
+			endStream:     f.StreamEnded(),
+			expectingMore: true,
+			priority:      prio,
+		}
+		p.continuationActive.Store(true)
+		p.continuationStateMu.Unlock()
+		return nil
+	}
+
+	if hasPriority {
+		prio := headerPriority{dependency: dependency, weight: weight, exclusive: exclusive}
+		return p.serveHeaderBlock(f.StreamID, f.StreamEnded(), &prio, f.HeaderBlockFragment())
+	}
+	return p.serveHeaderBlock(f.StreamID, f.StreamEnded(), nil, f.HeaderBlockFragment())
+}
+
+// ProcessRawHeaders handles a HEADERS frame from raw bytes, bypassing the
+// x/net framer's *HeadersFrame allocation. Only valid for simple HEADERS
+// (END_HEADERS set, no PADDED, no PRIORITY, not during CONTINUATION).
+// All RFC 7540 validations are preserved: it admits the block as handleHeaders
+// and handleContinuation do (admitHeaders).
+func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlock []byte) error {
+	return p.serveHeaderBlock(streamID, endStream, nil, headerBlock)
 }
 
 // handleData processes DATA frames.
@@ -1793,77 +1708,19 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 	)
 
 	if f.HeadersEnded() {
-		stream := p.manager.GetOrCreateStream(f.StreamID)
-		stream.SetState(StateOpen)
-
-		pooledHeadersIn := headersSlicePoolIn.Get().(*[][2]string)
-		*pooledHeadersIn = (*pooledHeadersIn)[:0]
-		defer func() {
-			*pooledHeadersIn = (*pooledHeadersIn)[:0]
-			headersSlicePoolIn.Put(pooledHeadersIn)
-		}()
-		p.beginHeaderDecode(pooledHeadersIn, !p.continuationState.isTrailers)
-
-		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
-			p.continuationState = nil
-			p.continuationActive.Store(false)
-			return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
-				fmt.Errorf("failed to decode headers: %w", err))
-		}
-		if err := p.hpackDecoder.Close(); err != nil {
-			p.continuationState = nil
-			p.continuationActive.Store(false)
-			return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
-				fmt.Errorf("failed to finalize headers: %w", err))
-		}
-		if p.endHeaderDecode() {
-			p.continuationState = nil
-			p.continuationActive.Store(false)
-			return p.refuseHeaderList(f.StreamID)
-		}
-
-		headers := *pooledHeadersIn
-		if p.continuationState.isTrailers {
-			if err := validateTrailerHeaders(headers); err != nil {
-				p.continuationState = nil
-				p.continuationActive.Store(false)
-				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
-				return fmt.Errorf("invalid trailers: %w", err)
-			}
-			stream.AddHeadersBatch(headers)
-		} else {
-			if err := validateRequestHeaders(headers); err != nil {
-				p.continuationState = nil
-				p.continuationActive.Store(false)
-				sendStreamError(p.writer, f.StreamID, http2.ErrCodeProtocol)
-				return fmt.Errorf("invalid headers: %w", err)
-			}
-			for _, h := range headers {
-				if h[0] == ":method" && h[1] == "HEAD" {
-					stream.IsHEAD = true
-					break
-				}
-			}
-			stream.AddHeadersBatch(headers)
-			stream.ReceivedInitialHeaders = true
-			if stream.ResponseWriter == nil {
-				stream.ResponseWriter = p.connWriter
-			}
-		}
-
-		if p.continuationState.endStream {
-			stream.EndStream = true
-			stream.SetState(StateHalfClosedRemote)
-			p.runHandler(stream)
-		}
-
-		if p.continuationState != nil {
-			b := p.continuationState.headerBlock
-			pooled := b[:0]
-			headerBlockPool.Put(&pooled)
-		}
+		// The block is complete: it is admitted as a HEADERS frame with
+		// END_HEADERS is (serveHeaderBlock), the stream-ID order, the
+		// MAX_CONCURRENT_STREAMS limit and the stream's state included. The
+		// stream is not created here: GetOrCreateStream checks none of them
+		// (celeris#981).
+		cs := p.continuationState
 		p.continuationState = nil
 		p.continuationActive.Store(false)
+		if err := p.serveHeaderBlock(f.StreamID, cs.endStream, cs.priority, cs.headerBlock); err != nil {
+			return err
+		}
+		pooled := cs.headerBlock[:0]
+		headerBlockPool.Put(&pooled)
 	}
 
 	return nil
