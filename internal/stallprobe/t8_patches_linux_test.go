@@ -20,6 +20,11 @@ package stallprobe
 //	backoff         resend delay doubles on every resend (5us, 10us, 20us ... capped at 1 ms)
 //	min100us        resend delay is a fixed 100 us instead of yieldDelay/2 (5 us)
 //	acklatency      a resend waits at least as long as the previous send took to be acknowledged
+//	cl842745        the change of Gerrit CL 842745 (runtime: start preemption retry delay after each attempt):
+//	                nextPreemptM = nanotime() + yieldDelay/2 is assigned AFTER preemptM returns instead of
+//	                nextPreemptM = now + yieldDelay/2 before it; the delay stays 5 us. The CL's diff is against a
+//	                master whose loop reads preemptM(gp)/break; the released toolchains read preemptM(asyncM), so
+//	                the same two-line move is applied at the released-toolchain anchor (ppSendAnchor).
 //	negctl-buildfail NEGATIVE CONTROL: injects an undefined symbol; the build MUST fail (MATRIX_SKIP). Proves the overlay
 //	                reaches the runtime compile. Never use it in a measurement.
 
@@ -110,6 +115,13 @@ func init() {
 			return "", err
 		}
 		return ppReplace(s, ppSendAnchor, "\t\t\t\t\tnextPreemptM = now + yieldDelay/2\n\t\t\t\t\tlastPreemptM = now\n\t\t\t\t\tpreemptM(asyncM)\n", "send")
+	})
+
+	ppRegister("cl842745", func(src string) (string, error) {
+		return ppReplace(src, ppSendAnchor,
+			"\t\t\t\t\tpreemptM(asyncM)\n"+
+				"\t\t\t\t\t// CL 842745: start the delay after preemptM returns, so the attempt itself does not count as waiting time.\n"+
+				"\t\t\t\t\tnextPreemptM = nanotime() + yieldDelay/2\n", "nextPreemptM = now + yieldDelay/2 ... preemptM(asyncM)")
 	})
 
 	ppRegister("negctl-buildfail", func(src string) (string, error) {

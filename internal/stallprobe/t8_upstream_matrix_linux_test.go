@@ -35,7 +35,7 @@ package stallprobe
 //	CELERIS_PROBE_UP_SECS        seconds per run (30)
 //	CELERIS_PROBE_UP_THRESHOLD_MS  STALL above this longest wake gap (50)
 //	CELERIS_PROBE_UP_CASES       subset of little,big,little-noasync (all three)
-//	CELERIS_PROBE_PATCH          comma list of registered runtime patches (t8_patches_linux_test.go: noop, backoff,
+//	CELERIS_PROBE_PATCH          comma list of registered runtime patches (t8_patches_linux_test.go: noop, backoff, cl842745,
 //	                             min100us, acklatency, negctl-buildfail); "none" = an unpatched arm in the same run.
 //	                             Empty = no patch machinery at all. Each arm is built once per toolchain with
 //	                             `go build -overlay` and the arms run interleaved rep by rep. When a patch is set and
