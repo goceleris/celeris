@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"sync"
@@ -17,16 +18,17 @@ import (
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 
-	"golang.org/x/net/http2"
-	//nolint:staticcheck // SA1019: h2c (and, since x/net 0.59, http2.Server) is deprecated, and its replacement
+	// golang.org/x/net/http2's Server, ServeConn and ConfigureServer are
+	// deprecated, and their replacement
 	// (http.Server.Protocols + SetUnencryptedHTTP2) does NOT cover the
 	// RFC 7540 3.2 Upgrade handshake -- net/http implements the upgrade path
 	// internally but exposes no way for a caller to reach it. celeris#440
 	// migrated to the stdlib and silently dropped h2c Upgrade from this
 	// engine; the epoll and io_uring engines still honour it, and the
 	// nightly caught the asymmetry. Until the stdlib exposes an equivalent,
-	// this package is the only way to keep the three engines agreeing.
-	"golang.org/x/net/http2/h2c"
+	// http2.Server.ServeConn (behind h2cHandler) is the only way to keep the
+	// three engines agreeing. Every use below carries the SA1019 waiver.
+	"golang.org/x/net/http2"
 )
 
 // Engine wraps net/http.Server to implement the engine.Engine interface.
@@ -46,15 +48,35 @@ type Engine struct {
 	// under, whichever call starts it; drainCancel ends it. Every
 	// Shutdown(ctx) arms drainCancel on its ctx, so the drain keeps the
 	// budget of every caller, not only of the one that won the once
-	// (celeris#753). drainErr is the drain's result, read by every caller
-	// after once.Do has returned.
+	// (celeris#753). The cancel carries a cause, the ctx error of the call
+	// whose budget ended the drain, so a call whose own ctx is still live
+	// can report whose it was (celeris#879); a cause the ctx carries of its
+	// own is kept too (budgetCause). drainErr is the drain's
+	// result, read by every caller after once.Do has returned.
 	drainCtx    context.Context
-	drainCancel context.CancelFunc
+	drainCancel context.CancelCauseFunc
 	drainErr    error
+	// draining is set when the drain begins, before http.Server.Shutdown
+	// is called; see Bridge.ServeHTTP.
+	draining atomic.Bool
+	// drained is set once the drain has ended, whichever way. A drain that
+	// saw the h2Streams count reach zero has closed it too (see
+	// closeH2Streams); one whose budget ran out first has not, and this is
+	// all that tells Bridge.ServeHTTP. Only the closed count is airtight
+	// (one CAS); this flag is a plain load, so a stream that passes it just
+	// before the drain stores it still runs, with an already cancelled
+	// request context. That is within the contract: a drain whose budget
+	// ran out leaves its handlers running. After a clean drain no h2c
+	// request is handed to a handler.
+	drained atomic.Bool
 	// h2Streams counts the HTTP/2 (h2c) requests in their handler
 	// (Bridge.ServeHTTP). net/http hands an h2c connection over (hijack)
 	// and stops tracking it, so http.Server.Shutdown does not wait for
 	// its streams; the drain waits for this count instead (celeris#759).
+	// Once the drain has seen it at zero it is closed: moved to a large
+	// negative value (h2StreamsClosed) in the same atomic step, so a stream
+	// that arrives after the drain has decided to end is refused rather
+	// than served after Shutdown has returned (celeris#878).
 	h2Streams atomic.Int64
 	metrics   struct {
 		reqCount    atomic.Uint64
@@ -89,29 +111,31 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		logger:  cfg.Logger,
 	}
 	e.baseCtx, e.baseCancel = context.WithCancel(context.Background())
-	e.drainCtx, e.drainCancel = context.WithCancel(context.Background())
+	e.drainCtx, e.drainCancel = context.WithCancelCause(context.Background())
 
 	bridge := &Bridge{engine: e, handler: handler}
 
-	// h2c through the deprecated handler rather than http.Protocols,
-	// because it is the only one of the two that performs the RFC 7540 3.2
-	// Upgrade handshake. See the import comment: dropping it took the
-	// std engine out of step with epoll and io_uring, which both honour
-	// Config.EnableH2Upgrade, and made the validation harness's h2c-churn
-	// slice vacuous on std -- 3,597 upgrade preambles, not one 101.
+	// h2c through h2cHandler rather than http.Protocols, because it is the
+	// only one of the two that performs the RFC 7540 3.2 Upgrade handshake.
+	// See the import comment: dropping it took the std engine out of step
+	// with epoll and io_uring, which both honour Config.EnableH2Upgrade, and
+	// made the validation harness's h2c-churn slice vacuous on std -- 3,597
+	// upgrade preambles, not one 101.
 	//
-	// h2c.NewHandler serves BOTH shapes: a client that opens with the
-	// HTTP/2 preface (prior knowledge) and one that asks to upgrade from
-	// HTTP/1.1. Plain HTTP/1.1 requests fall through to the wrapped
-	// handler, so an H2C listener still serves H1.
+	// h2cHandler serves BOTH shapes: a client that opens with the HTTP/2
+	// preface (prior knowledge) and one that asks to upgrade from HTTP/1.1.
+	// Plain HTTP/1.1 requests fall through to the wrapped handler, so an
+	// H2C listener still serves H1.
 	var httpHandler http.Handler = bridge
+	var h2s *http2.Server //nolint:staticcheck // SA1019: see the import comment.
 	if cfg.Protocol == engine.H2C || cfg.Protocol == engine.Auto {
 		//
 		// x/net 0.59 deprecated http2.Server along with the handler; it is
-		// still the only type h2c.NewHandler accepts, so the two carry the
-		// same waiver. Keep the literal on one line so the waiver covers it.
-		h2s := &http2.Server{MaxConcurrentStreams: cfg.MaxConcurrentStreams, MaxReadFrameSize: cfg.MaxFrameSize} //nolint:staticcheck // SA1019: the type h2c.NewHandler takes; see the import comment.
-		httpHandler = h2c.NewHandler(bridge, h2s)                                                                //nolint:staticcheck // SA1019: see the import comment -- no stdlib equivalent covers Upgrade.
+		// still the only type the h2c front end can serve with, so the two
+		// carry the same waiver. Keep the literal on one line so the waiver
+		// covers it.
+		h2s = &http2.Server{MaxConcurrentStreams: cfg.MaxConcurrentStreams, MaxReadFrameSize: cfg.MaxFrameSize} //nolint:staticcheck // SA1019: the type h2cHandler serves with; see the import comment.
+		httpHandler = &h2cHandler{next: bridge, h2s: h2s}
 	}
 
 	e.server = &http.Server{
@@ -127,6 +151,20 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 		ConnState:         e.connStateHook,
 		BaseContext:       func(net.Listener) context.Context { return e.baseCtx },
+	}
+
+	if h2s != nil {
+		// Register h2s with e.server, so the connections h2cHandler serves
+		// through h2s.ServeConn belong to it: http.Server.Shutdown then sends
+		// each of them GOAWAY at the start of the drain (celeris#878).
+		// net/http hands an h2c connection over (hijack) and stops tracking
+		// it, so without this nothing reached it: it kept accepting streams
+		// during the drain's wait and after Shutdown returned. Must come
+		// after e.server's timeouts are set, which the h2 idle timeout is
+		// read from, and before it serves.
+		if err := http2.ConfigureServer(e.server, h2s); err != nil { //nolint:staticcheck // SA1019: see the import comment.
+			return nil, fmt.Errorf("h2c server registration: %w", err)
+		}
 	}
 
 	return e, nil
@@ -214,41 +252,88 @@ func (e *Engine) Listen(ctx context.Context) error {
 // drain runs http.Server.Shutdown once, under drainCtx, and returns its
 // result to every caller; a caller that did not start it waits for it in
 // once.Do.
+//
+// http.Server.Shutdown sends every h2c connection GOAWAY as it starts
+// (celeris#878): h2cHandler serves them through the http2.Server registered
+// with the server, which net/http stops tracking at the hijack but whose
+// OnShutdown hook still reaches. Once the drain has ended, whichever way, an
+// h2c request that still arrives is refused (see enterH2Stream).
 func (e *Engine) drain() error {
 	e.once.Do(func() {
+		e.draining.Store(true)
 		err := e.server.Shutdown(e.drainCtx)
 		if err == nil {
 			err = e.waitH2Streams(e.drainCtx)
 		}
 		e.drainErr = err
+		e.drained.Store(true)
 	})
 	return e.drainErr
+}
+
+// budgetCause is what a Shutdown call's expired ctx tells the drain: its
+// error, which the callers' errors.Is checks rely on, and, if the ctx
+// carries a cause of its own (WithCancelCause, WithTimeoutCause), that too.
+func budgetCause(ctx context.Context) error {
+	err, cause := ctx.Err(), context.Cause(ctx)
+	if cause == nil || cause == err { //nolint:errorlint // identity: no cause of its own
+		return err
+	}
+	return fmt.Errorf("%w: %w", err, cause)
 }
 
 // h2StreamsPoll is how often the drain looks at h2Streams while it waits.
 const h2StreamsPoll = 5 * time.Millisecond
 
+// h2StreamsClosed is what the drain moves h2Streams to when it has seen it at
+// zero: far enough below zero that no number of arrivals brings it back above.
+const h2StreamsClosed = math.MinInt64 / 2
+
+// closeH2Streams closes the h2Streams count if it is zero, in one atomic step,
+// and reports whether it did. Closing it and an arriving stream's increment
+// cannot both succeed: the stream was counted, and the drain waits for it, or
+// it saw the closed count, and is refused (enterH2Stream).
+func (e *Engine) closeH2Streams() bool {
+	return e.h2Streams.CompareAndSwap(0, h2StreamsClosed)
+}
+
+// enterH2Stream counts an h2c request into its handler and reports whether it
+// may run. It may not once the drain has ended (celeris#878): the drain has
+// returned, or will with the count closed, and the OnShutdown hooks run after
+// it. The caller that is refused has nothing to undo; the one that is
+// admitted ends with h2Streams.Add(-1).
+func (e *Engine) enterH2Stream() bool {
+	if e.h2Streams.Add(1) <= 0 || e.drained.Load() {
+		e.h2Streams.Add(-1)
+		return false
+	}
+	return true
+}
+
 // waitH2Streams waits, bounded by ctx, until no HTTP/2 (h2c) request is in
-// its handler (celeris#759). http.Server.Shutdown does not wait for them:
-// net/http serves h2c on a connection it has handed over and no longer
-// tracks, so the OnShutdown hooks ran, and a direct Shutdown returned, while
-// an h2c handler was still running. The connection itself is left as
-// http.Server.Shutdown leaves a hijacked one: its handlers are what the drain
-// waits for.
+// its handler (celeris#759), and closes the count (see closeH2Streams).
+// http.Server.Shutdown does not wait for them: net/http serves h2c on a
+// connection it has handed over and no longer tracks, so the OnShutdown hooks
+// ran, and a direct Shutdown returned, while an h2c handler was still
+// running. The connection itself is left as http.Server.Shutdown leaves a
+// hijacked one: its handlers are what the drain waits for, and Shutdown has
+// sent it GOAWAY, so it takes no new stream while it waits (celeris#878).
 func (e *Engine) waitH2Streams(ctx context.Context) error {
-	if e.h2Streams.Load() <= 0 {
+	if e.closeH2Streams() {
 		return nil
 	}
 	t := time.NewTicker(h2StreamsPoll)
 	defer t.Stop()
-	for e.h2Streams.Load() > 0 {
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
 		}
+		if e.closeH2Streams() {
+			return nil
+		}
 	}
-	return nil
 }
 
 // Shutdown gracefully shuts down the server: in-flight requests drain
@@ -276,9 +361,22 @@ func (e *Engine) waitH2Streams(ctx context.Context) error {
 // celeris#753 the budget went only to the call that won the once, and
 // Listen's won with none, so the hooks and the Start call waited for the
 // last handler however long it ran.
+//
+// There is one drain, so overlapping calls share it, and the shortest
+// budget governs: a second call whose ctx is already done (a second signal
+// that means "stop now") ends the drain of the first. What each call gets
+// back says whose budget it was (celeris#879). A call whose own ctx expired
+// returns that ctx's error. A call whose ctx is still live, when another
+// call's budget ended the drain with handlers possibly still running,
+// returns an error that wraps that call's ctx error (errors.Is reports
+// context.DeadlineExceeded or context.Canceled for it, and any cause the ctx
+// carries of its own, context.WithCancelCause or WithTimeoutCause), never nil, as the
+// OnShutdown hooks are about to run, and never a bare context.Canceled of an
+// internal context. A call that arrives after the drain has ended returns
+// the same.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() {
-		e.drainCancel()
+		e.drainCancel(budgetCause(ctx))
 		e.baseCancel()
 	})
 	if err := e.drain(); err != nil {
@@ -291,6 +389,11 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 			// This call's budget ran out: report it as the caller's own
 			// deadline (or cancel), not as the internal drainCtx's.
 			return cerr
+		}
+		if e.drainCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			// This call's ctx is live: another call's budget ended the
+			// drain. Say so, and whose it was.
+			return fmt.Errorf("std: the drain was ended by a Shutdown call whose budget ran out: %w", context.Cause(e.drainCtx))
 		}
 		return err
 	}

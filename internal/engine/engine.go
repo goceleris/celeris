@@ -25,7 +25,10 @@ type Engine interface {
 	// ctx. An HTTP/1 handler runs to completion on every engine whatever
 	// ctx (celeris#753); a handler of an HTTP/2 stream on the shared worker
 	// pool can still be running when the native engines close its
-	// connection at the end of the budget.
+	// connection at the end of the budget. On std overlapping calls share
+	// one drain and the shortest budget governs; a call whose own ctx is
+	// still live when another's ends the drain gets an error wrapping that
+	// call's ctx error, not nil (celeris#879).
 	Shutdown(ctx context.Context) error
 	// Metrics returns a point-in-time snapshot of engine performance counters.
 	Metrics() EngineMetrics
