@@ -1,6 +1,6 @@
 //go:build linux
 
-package celeris_test
+package integration
 
 import (
 	"bytes"
@@ -66,6 +66,8 @@ func BenchmarkH2AsyncGET951(b *testing.B) {
 		enc  *hpack.Encoder
 		hb   *bytes.Buffer
 		next uint32
+		// unacked is the DATA received since the last connection WINDOW_UPDATE.
+		unacked uint32
 	}
 	cs := make([]*client, conns)
 	for i := range cs {
@@ -113,11 +115,19 @@ func BenchmarkH2AsyncGET951(b *testing.B) {
 					_ = c.fr.WriteSettingsAck()
 				}
 			case *http2.DataFrame:
+				// Give the connection window back as it is spent, or the
+				// responses stop at 64 KiB for the connection.
+				if c.unacked += uint32(len(f.Data())); c.unacked >= 8<<10 {
+					_ = c.fr.WriteWindowUpdate(0, c.unacked)
+					c.unacked = 0
+				}
 				if f.StreamEnded() {
 					ended++
 				}
 			case *http2.RSTStreamFrame:
 				return fmt.Errorf("stream %d reset: %v", f.StreamID, f.ErrCode)
+			case *http2.GoAwayFrame:
+				return fmt.Errorf("GOAWAY %v %q after %d ended of %d", f.ErrCode, f.DebugData(), ended, batch)
 			}
 		}
 		return nil

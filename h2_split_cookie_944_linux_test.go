@@ -4,8 +4,6 @@ package celeris_test
 
 import (
 	"bytes"
-	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -174,19 +172,16 @@ func errIfEmpty944(sid string) string {
 	return "<nil>"
 }
 
-// TestH2TransportSplitCookieFields944 is the same through golang.org/x/net's
-// own HTTP/2 client (h2c prior knowledge), which splits the Cookie header
-// into one field per cookie as the RFC allows.
+// TestH2TransportSplitCookieFields944 is the same through Go's own HTTP/2
+// client (net/http over h2c with prior knowledge), which splits the Cookie
+// header into one field per cookie as the RFC allows.
 func TestH2TransportSplitCookieFields944(t *testing.T) {
 	for _, e := range engines761 {
 		t.Run(e.name, func(t *testing.T) {
 			addr := startServer761(t, e.eng, false, func(s *celeris.Server) { s.GET("/c", cookieProbe944) })
-			tr := &http2.Transport{
-				AllowHTTP: true,
-				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-					return (&net.Dialer{}).DialContext(ctx, network, addr)
-				},
-			}
+			var protos http.Protocols
+			protos.SetUnencryptedHTTP2(true)
+			tr := &http.Transport{Protocols: &protos}
 			defer tr.CloseIdleConnections()
 			req, _ := http.NewRequest("GET", "http://"+addr+"/c", nil)
 			req.Header.Set("Cookie", "theme=dark; sid=alice")
@@ -196,6 +191,9 @@ func TestH2TransportSplitCookieFields944(t *testing.T) {
 			}
 			b, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
+			if resp.ProtoMajor != 2 {
+				t.Fatalf("protocol HTTP/%d, want 2", resp.ProtoMajor)
+			}
 			want := `sid="alice" err=<nil> header="theme=dark; sid=alice"`
 			if string(b) != want {
 				t.Fatalf("the handler saw\n got %s\nwant %s", b, want)
