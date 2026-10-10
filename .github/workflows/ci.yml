@@ -801,8 +801,8 @@ jobs:
       # drops out, and the multishot test skips, without a word when the
       # probe finds no ring or no multishot receive. So both run here by
       # name with CELERIS_REQUIRE_IOURING_WORKERS=1, and an exact tally: the
-      # two top-level tests and the four arms (std, epoll, epoll-async,
-      # io_uring) must PASS, with no SKIP line, and go test must exit 0.
+      # three top-level tests (celeris#868's ring-survives-hijacks test is the third)
+      # and the four arms (std, epoll, epoll-async, io_uring) must PASS, with no SKIP line, and go test must exit 0.
       - name: celeris#733 hijacked request strings (io_uring arms required)
         if: ${{ !cancelled() }}
         shell: bash
@@ -812,15 +812,15 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           failed=0
-          tests='TestHijackKeepsRequestViews|TestHijackCopiesRequestValuesUnderMultishotRecv'
+          tests='TestHijackKeepsRequestViews|TestHijackCopiesRequestValuesUnderMultishotRecv|TestMultishotRingSurvivesHijacks'
           go test -race -count=1 -timeout=300s -v -run "^(${tests})\$" . 2>&1 | tee /tmp/c733.log || failed=1
           top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c733.log || true)
           arms=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/" /tmp/c733.log || true)
           uring=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/io_uring" /tmp/c733.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c733.log || true)
-          echo "celeris#733 tests: top-level PASS $top (want 2), arm PASS $arms (want 4), io_uring arm PASS $uring (want 1), SKIP lines $skipped, go test failed $failed (want 0)"
-          if [ "$top" -ne 2 ] || [ "$arms" -ne 4 ] || [ "$uring" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
-            echo "expected both tests and all four arms (one io_uring) to PASS with no SKIP line"
+          echo "celeris#733 tests: top-level PASS $top (want 3), arm PASS $arms (want 4), io_uring arm PASS $uring (want 1), SKIP lines $skipped, go test failed $failed (want 0)"
+          if [ "$top" -ne 3 ] || [ "$arms" -ne 4 ] || [ "$uring" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all three tests and all four arms (one io_uring) to PASS with no SKIP line"
             exit 1
           fi
       # celeris#791: a handler panic, or runtime.Goexit, on an async dispatch
@@ -1467,6 +1467,44 @@ jobs:
           if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
             echo "expected exactly $want runs ($wantsub cases) to PASS with no FAIL or SKIP line -- did a"
             echo "SEND_ZC notification hold a descriptor or stall shutdown, or was a test renamed or skipped?"
+            exit 1
+          fi
+      # celeris#868, #869, #880: who owns a buffer or a descriptor when a conn
+      # leaves the io_uring worker. A hijacked request's multishot receive
+      # buffer is kept and the ring gets a fresh entry (#868); a hijack that
+      # cannot place the cancel of its armed recv is refused, and a close whose
+      # cancel was never placed is held past the release backstop until the op's
+      # terminal completion (#869); a send completion held for the dispatch
+      # goroutine is applied before the closing sweep tears the conn down, a held
+      # SEND_ZC first completion names no descriptor, and the shutdown drain
+      # notes the SEND_ZC notifications it reads itself (#880). The unit job's
+      # package step runs these without a tally, and a test whose rig finds no
+      # io_uring, or no working SEND_ZC, skips: so they run here by name on both
+      # arches, at the runner's own 8 MiB memlock, with every run of each test
+      # and its cases required to PASS and no FAIL or SKIP line.
+      - name: celeris#868, celeris#869 and celeris#880 io_uring buffer ownership (both arches, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestBufferRingRetireKeepsBufferAndRefreshesRing|TestBufferRingCloseKeepsOnlyRetiredPages|TestBufferRingRetireCost|TestHeldSendZCFirstCompletionDoesNotKeepTheDescriptor|TestFdOpsLeavesOutAHeldSendZCFirstCompletion|TestClosingSweepAppliesAHeldSendNotification|TestClosingSweepDoesNotWaitForARunningAsyncHandler|TestShutdownDoesNotWaitForAHeldSendZCFirstCompletion|TestHijackRefusedWhenItsMultishotRecvCannotBeCancelled|TestHijackWithNothingToCancelNeedsNoSQE|TestRefusedHijackAnswersTheRequestAndKeepsServing|TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced|TestFdOpsBothSendZCCompletionsHeld|TestFdOpsSendZCNotificationHeldAfterFirstApplied|TestShutdownDrainEndsARecvOwedBesideHeldSendZCCompletions|TestFdOpsBothSendZCCompletionsHeldByTheKernel|TestClosingSweepDoesNotCutOffASendTheReplayMoved|TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC|TestBackstopStillHoldsAZCNotificationWhoseSendCancelWasNeverPlaced|TestFdOpsHeldFirstNotifReadByTheDrain|TestShutdownDrainWaitsForARecvBesideAHeldFirstCompletionItReadTheNotifOf|TestShutdownDrainWaitsAfterReadingBothSendZCCompletions|TestShutdownDrainWaitsAfterReadingTheNotifOfAnAppliedFirstCompletion'
+          runs=3
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          wantsub=$(( 6 * runs ))
+          go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
+            ./internal/engine/iouring/ 2>&1 | tee /tmp/own868.log || true
+          grep -E 'celeris(869|880) |C868COST' /tmp/own868.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/own868.log || true)
+          subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/own868.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/own868.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/own868.log || true)
+          echo "celeris#868/#869/#880 tests: want $want PASS ($wantsub cases), passed $passed ($subpassed cases), FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want runs ($wantsub cases) to PASS with no FAIL or SKIP line -- did a hijacked"
+            echo "buffer, a held completion or an uncancelled recv lose its owner, or was a test renamed or skipped?"
             exit 1
           fi
       # celeris#812: the release backstop gave up a closed connection 5 s after

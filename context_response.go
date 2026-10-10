@@ -1299,15 +1299,31 @@ func (c *Context) BytesWritten() int {
 // (multiplexed streams share a single TCP connection).
 //
 // The request's strings stay valid after Hijack, for the handler and for
-// any goroutine it hands them to (celeris#733). On epoll and io_uring they
-// are views of the connection's receive buffer, which the engine does not
-// give to another connection once the connection is hijacked. Hijack also
-// copies the request values the Context holds, as [Context.Detach] does, so
-// the path, params, headers, query, cookies and body read from the Context
-// after Hijack are copies. In io_uring's opt-in multishot receive mode
-// (CELERIS_IOURING_MULTISHOT_RECV=1) the request is received into a buffer
-// the engine hands back to the kernel when the handler returns: there, keep
-// only strings read after Hijack, or clone the ones read before it.
+// any goroutine it hands them to, and that includes the ones read BEFORE
+// Hijack (celeris#733, celeris#868). On epoll and io_uring they are views of
+// the receive buffer, which the engine does not give to another connection
+// once the connection is hijacked: epoll and io_uring's default receive give
+// up the connection's buffer, and io_uring's opt-in multishot receive mode
+// (CELERIS_IOURING_MULTISHOT_RECV=1) keeps the ring buffer the request was
+// read into and gives the ring a fresh one. On that mode the kept buffer's
+// memory is not returned before the process exits, and it costs twice the
+// ring: each slot a hijack retires is replaced by a heap buffer of the same
+// size, which is live Go heap while the engine runs, and the slot's own
+// pages stay mapped. Each is at most one ring's worth per worker (the ring's
+// buffer count times the buffer size: at least 1024 buffers, which is 8 MiB
+// at 8 KiB each), reached after about as many hijacks as the ring has buffers
+// and not grown by more; the mapped pages are kept per engine start. Hijack
+// also copies the request values the Context holds, as [Context.Detach]
+// does, so the path, params, headers, query, cookies and body read from the
+// Context after Hijack are copies.
+//
+// On io_uring's multishot receive mode, Hijack can fail when the engine's
+// submission queue is full: the receive still armed on the socket has to be
+// cancelled before the socket can be handed over, and the cancel needs a free
+// queue entry. The connection is then left untouched and still the engine's,
+// so the handler can answer the request (a 503, say) and the connection goes
+// on serving. The failure is transient under engine back-pressure, and the
+// error is not exported: treat any Hijack error as "answer the request".
 func (c *Context) Hijack() (net.Conn, error) {
 	if c.written {
 		return nil, errors.New("celeris: cannot hijack after response written")
