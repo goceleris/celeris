@@ -71,7 +71,9 @@ func TestSockaddrStringMatchesStd925(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want := stdPeerString(tc.ip, tc.port, tc.zone)
-			if got := SockaddrString(tc.sa); got != want {
+			got := SockaddrString(tc.sa)
+			t.Logf("925 probe: %s -> %q", tc.name, got)
+			if got != want {
 				t.Errorf("sockaddrString = %q, want %q (std)", got, want)
 			}
 		})

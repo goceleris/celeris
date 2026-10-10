@@ -91,7 +91,9 @@ func TestBoundAddrMatchesStdListener925(t *testing.T) {
 			}
 			defer func() { _ = f.Close() }()
 			want := ln.Addr().String()
-			if got := boundAddr(int(f.Fd())).String(); got != want {
+			got := boundAddr(int(f.Fd())).String()
+			t.Logf("925 probe: listen %s bound=%q", addr, got)
+			if got != want {
 				t.Errorf("boundAddr = %q, want %q (std listener)", got, want)
 			}
 		})

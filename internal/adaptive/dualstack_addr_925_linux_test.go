@@ -128,6 +128,7 @@ func runDualStackRemote925(t *testing.T, serve func(resource.Config, stream.Hand
 	if len(p.handler) != 1 || len(p.connect) < 1 {
 		t.Fatalf("handler saw %d requests and OnConnect %d peers; want 1 and at least 1", len(p.handler), len(p.connect))
 	}
+	t.Logf("925 probe: client=%q handler=%q onconnect=%q listen=%q", client, p.handler[0], p.connect[0], listen)
 	return client, p.handler[0], p.connect[0], listen
 }
 
