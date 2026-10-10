@@ -84,7 +84,7 @@ func TestMain(m *testing.M) {
 func runChildMain(kind string) int {
 	var res any
 	var err error
-	if kind == "p2" || kind == "p3" {
+	if kind == "p2" || kind == "p3" || sigChildren[kind] != nil {
 		// A child outlives a parent that was killed (go test -timeout): end
 		// with it, so no server keeps serving after the run is over.
 		go func() {
@@ -105,7 +105,11 @@ func runChildMain(kind string) int {
 	case "p3":
 		res, err = p3Child()
 	default:
-		err = fmt.Errorf("unknown child kind %q", kind)
+		if f := sigChildren[kind]; f != nil {
+			res, err = f() // the signal-path probes E0, E3, E4 (t4_sigcommon_linux_test.go)
+		} else {
+			err = fmt.Errorf("unknown child kind %q", kind)
+		}
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "child %s: %v\n", kind, err)
