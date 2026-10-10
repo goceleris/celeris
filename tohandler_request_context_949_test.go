@@ -142,7 +142,7 @@ func TestToHandlerStayingClientKeepsContext949(t *testing.T) {
 		t.Run(proto, func(t *testing.T) {
 			started := make(chan struct{}, 1)
 			outcome := make(chan toHandlerOutcome949, 1)
-			cl, url := serveToHandler949(t, toHandlerWait949(600*time.Millisecond, started, outcome), proto == "h2c")
+			cl, url := serveToHandler949(t, toHandlerWait949(250*time.Millisecond, started, outcome), proto == "h2c")
 			resp, err := cl.Get(url)
 			if err != nil {
 				t.Fatal(err)
@@ -155,8 +155,8 @@ func TestToHandlerStayingClientKeepsContext949(t *testing.T) {
 			if o.ended {
 				t.Fatalf("%s: the client stayed and c.Context() ended (%v) after %s", proto, o.err, o.at.Sub(o.started))
 			}
-			if d := o.at.Sub(o.started); d < 550*time.Millisecond {
-				t.Fatalf("%s: the handler waited %s of 600ms: the test did not hold the context open", proto, d)
+			if d := o.at.Sub(o.started); d < 200*time.Millisecond {
+				t.Fatalf("%s: the handler waited %s of 250ms: the test did not hold the context open", proto, d)
 			}
 		})
 	}

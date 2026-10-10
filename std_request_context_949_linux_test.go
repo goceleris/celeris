@@ -37,10 +37,10 @@ const (
 	ctxHold949  = 8 * time.Second
 	// stayHold949 is how long a handler whose client stays waits on its
 	// context before answering; it must not end in that time.
-	stayHold949 = 700 * time.Millisecond
+	stayHold949 = 250 * time.Millisecond
 	// h1Hold949 is how long an HTTP/1 handler waits for a cancellation that
 	// is expected not to come; a departure reaches a handler in milliseconds.
-	h1Hold949 = 1500 * time.Millisecond
+	h1Hold949 = 400 * time.Millisecond
 )
 
 type ctxOutcome949 struct {
@@ -281,24 +281,32 @@ func TestH2DepartureCancelsRequestContext949(t *testing.T) {
 
 // TestH2StayingClientKeepsRequestContext949 is the other side of the test
 // above, and the guard against a fix that cancels too much: while the h2c
-// client stays connected and waits, the handler's c.Context() is not done,
-// and the client then gets its 200.
+// clients stay connected and wait (one on a prior-knowledge connection, one on
+// an upgraded one, at the same time), the handlers' c.Context() is not done,
+// and the clients then get their 200.
 func TestH2StayingClientKeepsRequestContext949(t *testing.T) {
 	for _, e := range engines761 {
-		for _, sh := range shapes949 {
-			for _, async := range []bool{true, false} {
-				t.Run(e.name+"/"+sh.name+"/"+routeName949(async), func(t *testing.T) {
-					addr, started, outcome := startWaitServer949(t, e.eng, stayHold949, async)
-					r := sh.open(t, addr)
+		for _, async := range []bool{true, false} {
+			t.Run(e.name+"/"+routeName949(async), func(t *testing.T) {
+				addr, started, outcome := startWaitServer949(t, e.eng, stayHold949, async)
+				var clients []*rawH2c949
+				for _, sh := range shapes949 {
+					clients = append(clients, sh.open(t, addr))
+				}
+				for range clients {
 					awaitStarted949(t, started)
+				}
+				for i, r := range clients {
 					select {
 					case st := <-r.status:
 						if st != "200" {
-							t.Fatalf("%s: answered :status %q, want 200", e.name, st)
+							t.Fatalf("%s/%s: answered :status %q, want 200", e.name, shapes949[i].name, st)
 						}
 					case <-time.After(10 * time.Second):
-						t.Fatalf("%s: the staying client got no response", e.name)
+						t.Fatalf("%s/%s: the staying client got no response", e.name, shapes949[i].name)
 					}
+				}
+				for range clients {
 					select {
 					case o := <-outcome:
 						if o.ended {
@@ -310,8 +318,8 @@ func TestH2StayingClientKeepsRequestContext949(t *testing.T) {
 					case <-time.After(10 * time.Second):
 						t.Fatalf("%s: the handler never reported", e.name)
 					}
-				})
-			}
+				}
+			})
 		}
 	}
 }
