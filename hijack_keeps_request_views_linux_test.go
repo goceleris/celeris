@@ -11,6 +11,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -188,21 +190,35 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 	}
 }
 
-// TestHijackCopiesRequestValuesUnderMultishotRecv pins the Context half of
-// celeris#733. In io_uring's opt-in multishot receive mode the request is
-// received into a buffer of the worker's provided-buffer ring, which the
-// engine hands back to the kernel when the handler returns, hijacked or not.
-// The engine cannot keep that buffer, so strings read from the Context
-// before Hijack are views the kernel will write into, and only copies made
-// at Hijack survive. Context.Hijack copies the request values the Context
-// holds, as Context.Detach does, so what the handler reads from the Context
-// after Hijack must still read its request once the ring has cycled: B, a
-// connection on A's worker, sends more requests than the ring has buffers,
-// one receive each, so every buffer, A's included, is written again.
+// TestHijackCopiesRequestValuesUnderMultishotRecv pins both halves of
+// celeris#733 and #868 under io_uring's opt-in multishot receive mode.
 //
-// The strings read before Hijack are the rig's witness: they are views of
-// A's ring buffer, so they must have changed, or the ring did not cycle and
-// the test has not shown anything.
+// In that mode the request is received into a buffer of the worker's
+// provided-buffer ring. The Context half (celeris#733): Context.Hijack copies
+// the request values the Context holds, as Context.Detach does, so what the
+// handler reads from the Context after Hijack survives. The engine half
+// (celeris#868): the strings the handler read BEFORE Hijack are views of that
+// buffer, and a hijacking handler typically hands exactly those to the
+// goroutine that serves the connection. The engine used to push the buffer
+// back to the kernel when the handler returned, hijacked or not, so those
+// strings read other connections' bytes. It now keeps the hijacked request's
+// buffer and gives the ring a fresh entry in its place, as epoll gives up
+// the receive buffer of a hijacked connection.
+//
+// B, a connection on A's worker, sends more requests than the ring has
+// buffers, one receive each, so every buffer, A's included, is written
+// again. Then the strings A's handler read before Hijack, and after it, must
+// still read A's request.
+//
+// The witness that the ring cycled is a control, not A's own strings: a
+// request on A's worker whose handler does NOT hijack, and keeps the same
+// kind of view. Its view must have changed, or the buffers were not
+// rewritten and this test has not shown anything.
+//
+// The views are read once more after the server has stopped. Stopping
+// closes the worker's buffer ring and unmaps its memory, and the buffer a
+// hijacked request was read into is kept for as long as the process lives
+// (a fault here would be the retained buffer unmapped under the hijacker).
 func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 	ok, p := c714ProbeIOUring()
 	if !ok || !p.MultishotRecv {
@@ -221,6 +237,7 @@ func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 		err       error
 	}
 	got := make(chan hijacked, 1)
+	ctlView := make(chan string, 1)
 	addr, stopServer := startC714DetachServer(t, func() *celeris.Server {
 		srv := celeris.New(celeris.Config{Engine: celeris.IOUring, Workers: 2})
 		srv.GET("/hj/:id", func(c *celeris.Context) error {
@@ -231,10 +248,17 @@ func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 			got <- hijacked{pre: pre, post: post, worker: w, conn: conn, err: err}
 			return nil
 		})
+		// The control: the same view of the request, a handler that does not
+		// hijack, so the engine gives the buffer back as it always did.
+		srv.GET("/ctl/:id", func(c *celeris.Context) error {
+			ctlView <- c.Param("id")
+			return c.String(200, "ok")
+		})
 		srv.GET("/w", func(c *celeris.Context) error { return c.String(200, "%d", c.WorkerID()) })
 		return srv
 	})
-	defer stopServer()
+	stop := sync.OnceFunc(stopServer)
+	defer stop()
 
 	const id = "id733733"
 	want := kept{param: id, header: "token-" + id, path: "/hj/" + id}
@@ -265,6 +289,22 @@ func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 	// cycle it twice.
 	b, br := c733DialWorker(t, addr, h.worker, c733Secret)
 	defer func() { _ = b.Close() }()
+
+	// The control request, on A's worker, before the ring cycles.
+	const ctlID = "idctl868"
+	if _, err := c733Get(b, br, "/ctl/"+ctlID, c733Secret); err != nil {
+		t.Fatalf("control request: %v", err)
+	}
+	var ctl string
+	select {
+	case ctl = <-ctlView:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the control handler never ran")
+	}
+	if ctl != ctlID {
+		t.Fatalf("control view read %q right after its own request, want %q: the rig is wrong", ctl, ctlID)
+	}
+
 	const requests = 2048
 	for i := 0; i < requests; i++ {
 		if _, err := c733Get(b, br, "/w", c733Secret); err != nil {
@@ -273,15 +313,103 @@ func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 	}
 
 	// Copies, taken before the server stops: the ring's memory is unmapped
-	// then, and the views read before Hijack point into it.
+	// then, and the control's view points into it.
+	ctlAfter := strings.Clone(ctl)
 	pre := strings.Clone(h.pre.param + "|" + h.pre.header + "|" + h.pre.path)
 	post := strings.Clone(h.post.param + "|" + h.post.header + "|" + h.post.path)
 	wantS := want.param + "|" + want.header + "|" + want.path
-	t.Logf("C733MSHOT worker=%d requests=%d before-Hijack %q after-Hijack %q", h.worker, requests, pre, post)
-	if pre == wantS {
-		t.Fatalf("witness: the strings read before Hijack still read A's request after %d requests on B, so the ring did not cycle (is multishot receive on?) and this test shows nothing", requests)
+	t.Logf("C733MSHOT worker=%d requests=%d control %q before-Hijack %q after-Hijack %q", h.worker, requests, ctlAfter, pre, post)
+	if ctlAfter == ctlID {
+		t.Fatalf("witness: the view of a request that did not hijack still reads %q after %d requests on B, so the ring did not cycle (is multishot receive on?) and this test shows nothing", ctlID, requests)
+	}
+	if pre != wantS {
+		t.Errorf("strings read BEFORE Hijack changed once the ring cycled: %q, want %q: the engine gave the hijacked request's receive buffer back to the kernel (celeris#868)", pre, wantS)
 	}
 	if post != wantS {
 		t.Errorf("strings read from the Context after Hijack changed once the ring cycled: %q, want %q: Hijack did not copy the request values (celeris#733)", post, wantS)
+	}
+
+	// The worker stops and unmaps its ring. What the hijacker kept must
+	// still be readable, and still be A's request. Not after a failure
+	// above: the views then point into memory that is no longer the
+	// hijacker's, and reading it after the unmap is a fault.
+	if t.Failed() {
+		return
+	}
+	stop()
+	preStopped := strings.Clone(h.pre.param + "|" + h.pre.header + "|" + h.pre.path)
+	if preStopped != wantS {
+		t.Errorf("strings read before Hijack, read again after the server stopped: %q, want %q (celeris#868)", preStopped, wantS)
+	}
+}
+
+// TestMultishotRingSurvivesHijacks pins the other half of celeris#868's
+// fix: a hijacked request's buffer is kept, and the ring gets a fresh entry
+// in its place. A fix that simply did not return the buffer would shrink the
+// ring by one buffer per hijack. Hijacking more connections than the ring has
+// buffers would then leave it empty, and the next connection's receive would
+// wait for a buffer that never comes.
+func TestMultishotRingSurvivesHijacks(t *testing.T) {
+	ok, p := c714ProbeIOUring()
+	if !ok || !p.MultishotRecv {
+		if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
+			t.Fatalf("io_uring tier=%s kernel=%s multishotRecv=%t, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids skipping", p.IOUringTier, p.KernelVersion, p.MultishotRecv)
+		}
+		t.Skipf("io_uring tier=%s kernel=%s multishotRecv=%t: no multishot receive", p.IOUringTier, p.KernelVersion, p.MultishotRecv)
+	}
+	t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", "1")
+
+	var hijacks atomic.Int64
+	addr, stopServer := startC714DetachServer(t, func() *celeris.Server {
+		srv := celeris.New(celeris.Config{Engine: celeris.IOUring, Workers: 2})
+		srv.GET("/hj/:id", func(c *celeris.Context) error {
+			conn, err := c.Hijack()
+			if err != nil {
+				return err
+			}
+			hijacks.Add(1)
+			_ = conn.Close()
+			return nil
+		})
+		srv.GET("/w", func(c *celeris.Context) error { return c.String(200, "ok") })
+		return srv
+	})
+	defer stopServer()
+
+	// Each worker's ring has 1024 buffers (see the test above), and the
+	// connections spread over the workers (one on a memlock-capped host, two
+	// otherwise): 3200 hijacks leave each worker more than 1024, with
+	// overwhelming probability. Then serve three times the ring on one
+	// connection.
+	const hijackN = 3200
+	for i := 0; i < hijackN; i++ {
+		ca, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("hijack %d: dial: %v", i, err)
+		}
+		_ = ca.SetDeadline(time.Now().Add(20 * time.Second))
+		if _, err := ca.Write([]byte("GET /hj/" + strconv.Itoa(i) + " HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatalf("hijack %d: %v", i, err)
+		}
+		// The handler closes the hijacked connection: the read ends in EOF.
+		if _, err := io.Copy(io.Discard, ca); err != nil {
+			t.Fatalf("hijack %d: reading to EOF: %v", i, err)
+		}
+		_ = ca.Close()
+	}
+	if n := hijacks.Load(); n != hijackN {
+		t.Fatalf("hijacked %d connections, want %d", n, hijackN)
+	}
+	b, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+	br := bufio.NewReader(b)
+	for i := 0; i < 3072; i++ {
+		_ = b.SetDeadline(time.Now().Add(20 * time.Second))
+		if _, err := c733Get(b, br, "/w", c733Secret); err != nil {
+			t.Fatalf("request %d after %d hijacks: %v: the ring ran out of buffers (celeris#868)", i, hijackN, err)
+		}
 	}
 }

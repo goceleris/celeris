@@ -28,11 +28,11 @@ func (h *asyncHandler893) HasAsyncRoutes() bool        { return true }
 // TestPoolHandlerOverTheBudgetSendsItsBodyInOrder893: a pool handler that the
 // connection's budget refuses a copy sends the rest of its body itself, as the
 // windows open, through the write queue. It must not buffer what is left once
-// the budget has room again: the event loop writes a stream's buffered DATA
-// straight to the connection, ahead of the chunks still in the queue, and the
-// body arrived out of order (seen in the engine test's second phase). Here
-// the budget is freed while a chunk is still queued, and a WINDOW_UPDATE is
-// processed before the queue is drained.
+// the budget has room again (that was #906's rule when the event loop wrote a
+// stream's buffered DATA straight to the connection, ahead of the chunks still
+// in the queue; the loop now sends it through the queue, celeris#903, and the
+// rule stays). Here the budget is freed while a chunk is still queued, and a
+// WINDOW_UPDATE is processed before the queue is drained.
 func TestPoolHandlerOverTheBudgetSendsItsBodyInOrder893(t *testing.T) {
 	var mu sync.Mutex
 	var wire bytes.Buffer

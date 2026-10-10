@@ -22,7 +22,7 @@ import sys
 
 PATH = sys.argv[1] if len(sys.argv) > 1 else "internal/engine/iouring/worker.go"
 
-HOLD = "\t\t\tif w.closedZCOwed(cs) {\n\t\t\t\tw.holdZCPastBackstop(entry)\n"
+HOLD = "\t\t\tif !missedAndNamed && w.closedZCOwed(cs) {\n\t\t\t\tw.holdZCPastBackstop(entry)\n"
 
 src = open(PATH).read()
 if src.count(HOLD) != 1:
@@ -31,7 +31,7 @@ if src.count(HOLD) != 1:
 mutated = src.replace(
     HOLD,
     "\t\t\t// MUTANT celeris#812: the backstop releases a SEND_ZC's send buffer\n"
-    "\t\t\tif false && w.closedZCOwed(cs) {\n\t\t\t\tw.holdZCPastBackstop(entry)\n",
+    "\t\t\tif false && !missedAndNamed && w.closedZCOwed(cs) {\n\t\t\t\tw.holdZCPastBackstop(entry)\n",
 )
 open(PATH, "w").write(mutated)
 print(f"mutant-812: backstop hold disabled ({PATH})")

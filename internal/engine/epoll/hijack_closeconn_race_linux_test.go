@@ -23,10 +23,16 @@ import (
 // and re-runs a teardown hijackConn already performed — on a connection the
 // engine no longer owns.
 //
-// The loop-thread entry these tests use is the real one: checkTimeouts. It
-// calls closeConn directly with no async guard, and nothing refreshes
-// cs.lastActivity while a handler runs (it is written only at accept,
-// on read, and on adopt). (When these tests were written, drainRead's EOF
+// The loop-thread entry these tests use is closeConn itself, called on its
+// own goroutine as the loop thread would. Until celeris#865 it was reached
+// through checkTimeouts, which called it with no async guard on a conn whose
+// lastActivity is stale (nothing refreshes it while a handler runs: it is
+// written only at accept, on read, and on adopt). checkTimeouts now reads the
+// conn's h1State under detachMu with TryLock and skips, until the next sweep,
+// a conn whose lock a bounded holder has, which is the state these arms build,
+// so it no longer reaches closeConn there; the wait-then-hijack interleaving
+// these arms pin stays reachable by every other closeConn caller. (When these
+// tests were written, drainRead's EOF
 // and error branches — the EPOLLRDHUP route the issue proposed — took
 // detachMu BEFORE calling closeConn, so they waited behind the handler and
 // then re-read a cleared slot; since celeris#669 they do not wait at all.)
@@ -130,15 +136,13 @@ func hijackRaceConn(t *testing.T) *hijackRaceRig {
 	return &hijackRaceRig{l: l, cs: cs, local: local, peer: peer, disconnects: disconnects}
 }
 
-// hijackRaceSweep runs the real reaper on its own goroutine, standing in for
-// the loop thread between epoll_wait returns. checkTimeouts walks liveConns
-// and calls closeConn itself — the trigger is part of the gate, not an
-// assumption stated beside it.
-func hijackRaceSweep(l *Loop) <-chan struct{} {
+// hijackRaceClose runs closeConn on its own goroutine, standing in for the
+// loop thread between epoll_wait returns.
+func hijackRaceClose(l *Loop, fd int) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		l.checkTimeouts()
+		l.closeConn(fd)
 	}()
 	return done
 }
@@ -162,7 +166,7 @@ func hijackRaceAwait(t *testing.T, done <-chan struct{}) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("checkTimeouts never returned after the handler released detachMu")
+		t.Fatal("closeConn never returned after the handler released detachMu")
 	}
 }
 
@@ -239,7 +243,7 @@ func hijackRaceRecycle(t *testing.T, fd int) (writeEnd int) {
 //	dispatch goroutine   loop thread
 //	------------------   -----------
 //	detachMu.Lock
-//	(handler running)    checkTimeouts: read deadline expired
+//	(handler running)    reap: read deadline expired
 //	                     closeConn: reads l.conns[fd] -> cs (non-nil)
 //	                     closeConn: asyncClosed.Store(true)
 //	                     closeConn: detachMu.Lock ... blocked
@@ -263,15 +267,15 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 	// cs.detachMu for the whole user handler call.
 	cs.detachMu.Lock()
 
-	// (b) The loop thread runs its timeout sweep. checkTimeouts finds the
-	// stale lastActivity and calls closeConn itself.
-	done := hijackRaceSweep(l)
+	// (b) The loop thread closes the conn (a timeout reap, in the shape this
+	// test was written for).
+	done := hijackRaceClose(l, local)
 
 	// (c) Barrier, not a sleep. closeConn stores asyncClosed only AFTER it
 	// has read l.conns[fd] into its own cs, and before it blocks on
 	// detachMu. Once the flag flips, closeConn is committed to this cs and
 	// can only be parked on the lock we hold.
-	hijackRaceWaitFor(t, cs.asyncClosed.Load, "checkTimeouts -> closeConn to capture the conn and reach its detachMu wait")
+	hijackRaceWaitFor(t, cs.asyncClosed.Load, "closeConn to capture the conn and reach its detachMu wait")
 
 	// (d) The handler calls Hijack, still inside ProcessH1, still holding
 	// detachMu. hijackConn performs the full engine-side teardown here.
@@ -375,8 +379,8 @@ func TestCloseConnLeavesAReissuedSlotAloneAfterWaitingOnDetachMu(t *testing.T) {
 	parkDispatch(cs)
 
 	cs.detachMu.Lock()
-	done := hijackRaceSweep(l)
-	hijackRaceWaitFor(t, cs.asyncClosed.Load, "checkTimeouts -> closeConn to reach its detachMu wait")
+	done := hijackRaceClose(l, local)
+	hijackRaceWaitFor(t, cs.asyncClosed.Load, "closeConn to reach its detachMu wait")
 
 	nc, err := l.hijackConn(local)
 	if err != nil {
@@ -522,8 +526,8 @@ func TestCloseConnClosesOnceWhenHandlerDoesNotHijack(t *testing.T) {
 	parkDispatch(cs)
 
 	cs.detachMu.Lock()
-	done := hijackRaceSweep(l)
-	hijackRaceWaitFor(t, cs.asyncClosed.Load, "checkTimeouts -> closeConn to reach its detachMu wait")
+	done := hijackRaceClose(l, local)
+	hijackRaceWaitFor(t, cs.asyncClosed.Load, "closeConn to reach its detachMu wait")
 
 	// The handler returns without hijacking anything.
 	cs.detachMu.Unlock()

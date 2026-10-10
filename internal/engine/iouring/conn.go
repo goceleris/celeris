@@ -31,8 +31,10 @@ const (
 	// maxSendQueueBytesH2 is the limit for an HTTP/2 connection. Its DATA
 	// is already bounded by the flow-control windows the peer grants (what
 	// the windows refuse waits in the streams' buffers, bounded per
-	// connection by stream.OutboundBudget, celeris#893; a StreamWriter
-	// response's is not yet, celeris#904), and a
+	// connection by stream.OutboundBudget, celeris#893; a StreamWriter on
+	// the worker pool waits for the window instead of queueing past it, and
+	// one on the event loop buffers what the window refuses on its stream,
+	// charged to that budget but not refused by it, celeris#904), and a
 	// peer that reads keeps up to a window of frames queued, or in a SEND
 	// in flight, as a matter of course (net/http's client grants 4 MiB per
 	// stream, browsers more per connection), so the H1 limit closed healthy
@@ -463,6 +465,13 @@ type connState struct {
 	// The close paths use it to target an ASYNC_CANCEL at the armed
 	// recv's exact generation-tagged user_data. Worker-thread-only.
 	recvArmed bool
+	// cancelMissed is set by a close path that queued cs for release without
+	// having placed the cancel of a recv or send it left armed, because the
+	// SQ ring had no room (cancelConnOps, celeris#869). The op is then owed
+	// without anything having asked the kernel to end it: drainPendingRelease
+	// places the cancel again, and its backstop holds cs for the op instead of
+	// releasing it. Worker-thread-only; cleared at release.
+	cancelMissed bool
 	// recvOutstanding counts recv SQEs placed for this conn (prepareRecv,
 	// flushSendLink's linked recv) minus terminal udRecv CQEs dispatched
 	// to it. Mirrors recvArmed as a count so a second placement (2) and a
@@ -627,6 +636,7 @@ func releaseConnState(cs *connState) {
 	// the identity's count, not this one, waits for its notification).
 	cs.kernelInflight = 0
 	cs.recvArmed = false
+	cs.cancelMissed = false
 	cs.recvOutstanding = 0
 	cs.fd = 0
 	cs.liveIdx = -1
