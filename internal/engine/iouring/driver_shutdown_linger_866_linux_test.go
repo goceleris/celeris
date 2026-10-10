@@ -347,11 +347,11 @@ func TestCloseDriverFDsUsesTheEngineWideBound866(t *testing.T) {
 	if err := unix.Pipe2(p[:], unix.O_CLOEXEC); err != nil {
 		t.Fatalf("apparatus: pipe: %v", err)
 	}
-	defer unix.Close(p[1])
+	defer func() { _ = unix.Close(p[1]) }()
 	closed := false
 	defer func() {
 		if !closed {
-			unix.Close(p[0])
+			_ = unix.Close(p[0])
 		}
 	}()
 	for range cap(driverCloseSem) {
