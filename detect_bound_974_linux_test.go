@@ -48,14 +48,29 @@ const (
 
 // engines974: the "-async" arms run with AsyncHandlers on, where a conn has a
 // detachMu from accept and closeConn takes the detached-close path.
+//
+// The "-mshot" arm opts into multishot recv with a provided-buffer ring
+// (CELERIS_IOURING_MULTISHOT_RECV=1). That is off by default, so without it no
+// test here runs the provided-buffer paths of the detect branch, which return
+// the ring buffer on every exit; "tier=high ... provided_buffers=true" in the
+// engine's start-up log is the tier's capability, not the ring being in use.
 type engine974 struct {
 	name  string
 	eng   celeris.EngineType
 	async bool
+	mshot bool
 }
 
-var engines974 = []engine974{{"std", celeris.Std, false}, {"epoll", celeris.Epoll, false}, {"io_uring", celeris.IOUring, false},
-	{"epoll-async", celeris.Epoll, true}, {"io_uring-async", celeris.IOUring, true}}
+var engines974 = []engine974{{"std", celeris.Std, false, false}, {"epoll", celeris.Epoll, false, false}, {"io_uring", celeris.IOUring, false, false},
+	{"epoll-async", celeris.Epoll, true, false}, {"io_uring-async", celeris.IOUring, true, false}, {"io_uring-mshot", celeris.IOUring, false, true}}
+
+// env974 applies the arm's environment; call it before the server starts.
+func (e engine974) env974(t *testing.T) {
+	t.Helper()
+	if e.mshot {
+		t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", "1")
+	}
+}
 
 // deadlineEngines974 leaves epoll out: its first-bytes state is not under any
 // header deadline either (it reaps a silent or stalled undetected connection
@@ -63,7 +78,7 @@ var engines974 = []engine974{{"std", celeris.Std, false}, {"epoll", celeris.Epol
 // listed in the PR body of celeris#974 and tracked in the epoll polish
 // checklist (celeris#885, "no header deadline before protocol detection");
 // add epoll here when that is fixed.
-var deadlineEngines974 = []engine974{{"std", celeris.Std, false}, {"io_uring", celeris.IOUring, false}, {"io_uring-async", celeris.IOUring, true}}
+var deadlineEngines974 = []engine974{{"std", celeris.Std, false, false}, {"io_uring", celeris.IOUring, false, false}, {"io_uring-async", celeris.IOUring, true, false}}
 
 func heapAfterGC974() uint64 {
 	runtime.GC()
@@ -193,78 +208,101 @@ func TestUnrecognisedBytesAreNotHeld974(t *testing.T) {
 	}
 	t.Logf("kernel %s, io_uring tier %v (CELERIS_MAX_IOURING_TIER=%q)", probe.Probe().KernelVersion,
 		probe.Probe().IOUringTier, os.Getenv("CELERIS_MAX_IOURING_TIER"))
+	// Protocol Auto takes every lead. Protocol H2C with EnableH2Upgrade runs
+	// the same detection (celeris#974 review), so it is pinned with the
+	// "PRI " lead on every engine that has the state (std has none: net/http
+	// reads the request line).
+	h2c := true
+	type floodCase struct {
+		e     engine974
+		proto string
+		set   func(*celeris.Config)
+		l     struct{ name, lead string }
+	}
+	var cases []floodCase
 	for _, e := range engines974 {
 		for _, l := range leads {
-			t.Run(e.name+"/"+l.name, func(t *testing.T) {
-				// The header deadline is out of reach: only the server's own
-				// verdict on the bytes can close this connection, so the
-				// deadline cannot stand in for it.
-				addr := startAuto974(t, e.eng, func(c *celeris.Config) {
-					c.AsyncHandlers = e.async
-					c.ReadHeaderTimeout = 5 * time.Minute
-					c.ReadTimeout = 5 * time.Minute
-					c.IdleTimeout = 5 * time.Minute
-				})
-				warm, err := net.DialTimeout("tcp", addr, 5*time.Second)
-				if err != nil {
-					t.Fatal(err)
-				}
-				_, _ = io.WriteString(warm, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-				_, _ = io.Copy(io.Discard, warm)
-				_ = warm.Close()
-
-				h0, rss0 := heapAfterGC974(), rssMiB974()
-				stopPeak := heapPeak974()
-				c, err := net.DialTimeout("tcp", addr, 5*time.Second)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() { _ = c.Close() }()
-				res := watchClose974(c, closeWithin974)
-				if _, err := io.WriteString(c, l.lead); err != nil {
-					t.Fatal(err)
-				}
-				time.Sleep(100 * time.Millisecond)
-				chunk := []byte(strings.Repeat("Z", garbageChunkSize))
-				sent := 0
-				var werr error
-				for ; sent < garbageChunks974; sent++ {
-					_ = c.SetWriteDeadline(time.Now().Add(3 * time.Second))
-					if _, werr = c.Write(chunk); werr != nil {
-						break
-					}
-				}
-				// The server has had the whole flood (or has closed): the
-				// close must be visible now, not at a timeout.
-				r := res.wait()
-				time.Sleep(300 * time.Millisecond)
-				peak := stopPeak()
-				h1, rss1 := heapAfterGC974(), rssMiB974()
-				delta := int64(h1) - int64(h0)
-				peakDelta := int64(peak) - int64(h0)
-				t.Logf("%s/%s: sent %d MiB (write error: %v), closed=%v (%v), heap %d -> %d KiB (delta %d KiB, peak delta %d KiB), rss %d -> %d MiB",
-					e.name, l.name, sent, werr, r.closed, r.err, h0>>10, h1>>10, delta>>10, peakDelta>>10, rss0, rss1)
-				if !r.closed {
-					t.Errorf("the server did not close a connection that sent %q and then %d MiB of unrecognised bytes (read ended with %v)",
-						l.lead, sent, r.err)
-				}
-				if delta > heapBound974 {
-					t.Errorf("heap grew by %d MiB (bound %d MiB) for %d MiB sent after %q: the server holds the bytes",
-						delta>>20, heapBound974>>20, sent, l.lead)
-				}
-				// std is the control for the close and the deadline cases, not
-				// for the peak: net/http reads a request line up to
-				// MaxHeaderBytes (16 MiB by default) before it answers. The
-				// peak is HeapAlloc without a GC, so it counts the garbage of
-				// that read: 21 to 87 MiB measured on std, while its heap
-				// after a GC does not move (see the PR body of celeris#974).
-				// The engines under test hold a few bytes.
-				if e.eng != celeris.Std && peakDelta > heapBound974 {
-					t.Errorf("heap peaked %d MiB over its start (bound %d MiB) while %d MiB were sent after %q: the server held the bytes before it closed",
-						peakDelta>>20, heapBound974>>20, sent, l.lead)
-				}
-			})
+			cases = append(cases, floodCase{e, "auto", nil, l})
 		}
+		if e.eng != celeris.Std {
+			cases = append(cases, floodCase{e, "h2c-upgrade", func(c *celeris.Config) { c.Protocol = celeris.H2C; c.EnableH2Upgrade = &h2c }, leads[0]})
+		}
+	}
+	for _, fc := range cases {
+		e, l := fc.e, fc.l
+		t.Run(e.name+"/"+fc.proto+"/"+l.name, func(t *testing.T) {
+			e.env974(t)
+			// The header deadline is out of reach: only the server's own
+			// verdict on the bytes can close this connection, so the
+			// deadline cannot stand in for it.
+			addr := startAuto974(t, e.eng, func(c *celeris.Config) {
+				c.AsyncHandlers = e.async
+				if fc.set != nil {
+					fc.set(c)
+				}
+				c.ReadHeaderTimeout = 5 * time.Minute
+				c.ReadTimeout = 5 * time.Minute
+				c.IdleTimeout = 5 * time.Minute
+			})
+			warm, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.WriteString(warm, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+			_, _ = io.Copy(io.Discard, warm)
+			_ = warm.Close()
+
+			h0, rss0 := heapAfterGC974(), rssMiB974()
+			stopPeak := heapPeak974()
+			c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = c.Close() }()
+			res := watchClose974(c, closeWithin974)
+			if _, err := io.WriteString(c, l.lead); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			chunk := []byte(strings.Repeat("Z", garbageChunkSize))
+			sent := 0
+			var werr error
+			for ; sent < garbageChunks974; sent++ {
+				_ = c.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if _, werr = c.Write(chunk); werr != nil {
+					break
+				}
+			}
+			// The server has had the whole flood (or has closed): the
+			// close must be visible now, not at a timeout.
+			r := res.wait()
+			time.Sleep(300 * time.Millisecond)
+			peak := stopPeak()
+			h1, rss1 := heapAfterGC974(), rssMiB974()
+			delta := int64(h1) - int64(h0)
+			peakDelta := int64(peak) - int64(h0)
+			t.Logf("%s/%s: sent %d MiB (write error: %v), closed=%v (%v), heap %d -> %d KiB (delta %d KiB, peak delta %d KiB), rss %d -> %d MiB",
+				e.name, fc.proto+"/"+l.name, sent, werr, r.closed, r.err, h0>>10, h1>>10, delta>>10, peakDelta>>10, rss0, rss1)
+			if !r.closed {
+				t.Errorf("the server did not close a connection that sent %q and then %d MiB of unrecognised bytes (read ended with %v)",
+					l.lead, sent, r.err)
+			}
+			if delta > heapBound974 {
+				t.Errorf("heap grew by %d MiB (bound %d MiB) for %d MiB sent after %q: the server holds the bytes",
+					delta>>20, heapBound974>>20, sent, l.lead)
+			}
+			// std is the control for the close and the deadline cases, not
+			// for the peak: net/http reads a request line up to
+			// MaxHeaderBytes (16 MiB by default) before it answers. The
+			// peak is HeapAlloc without a GC, so it counts the garbage of
+			// that read: 21 to 87 MiB measured on std, while its heap
+			// after a GC does not move (see the PR body of celeris#974).
+			// The engines under test hold a few bytes.
+			if e.eng != celeris.Std && peakDelta > heapBound974 {
+				t.Errorf("heap peaked %d MiB over its start (bound %d MiB) while %d MiB were sent after %q: the server held the bytes before it closed",
+					peakDelta>>20, heapBound974>>20, sent, l.lead)
+			}
+		})
 	}
 }
 
@@ -313,6 +351,7 @@ func TestStalledPreDetectionConnIsReaped974(t *testing.T) {
 					continue // std has no pre-detection state (net/http reads the request line)
 				}
 				t.Run(e.name+"/"+p.name+"/"+cs.name, func(t *testing.T) {
+					e.env974(t)
 					addr := startAuto974(t, e.eng, func(c *celeris.Config) {
 						c.AsyncHandlers = e.async
 						c.ReadHeaderTimeout = readHeaderTimeout974
@@ -355,7 +394,7 @@ func TestStalledPreDetectionConnIsReaped974(t *testing.T) {
 // only the held bytes, loses the request or the frame. std is the control;
 // epoll's split segments are celeris#870.
 func TestSplitFirstSegmentIsServed974(t *testing.T) {
-	engines := []engine974{{"std", celeris.Std, false}, {"io_uring", celeris.IOUring, false}, {"io_uring-async", celeris.IOUring, true}}
+	engines := []engine974{{"std", celeris.Std, false, false}, {"io_uring", celeris.IOUring, false, false}, {"io_uring-async", celeris.IOUring, true, false}, {"io_uring-mshot", celeris.IOUring, false, true}}
 	h1 := []struct{ name, first, rest string }{
 		{"GE", "GE", "T /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"},
 		{"G", "G", "ET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"},
@@ -371,6 +410,7 @@ func TestSplitFirstSegmentIsServed974(t *testing.T) {
 	for _, e := range engines {
 		for _, c := range h1 {
 			t.Run(e.name+"/h1/"+c.name, func(t *testing.T) {
+				e.env974(t)
 				addr := startAuto974(t, e.eng, func(c *celeris.Config) { c.AsyncHandlers = e.async })
 				conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 				if err != nil {
@@ -389,6 +429,7 @@ func TestSplitFirstSegmentIsServed974(t *testing.T) {
 		}
 		for _, c := range h2 {
 			t.Run(e.name+"/h2c/"+c.name, func(t *testing.T) {
+				e.env974(t)
 				addr := startAuto974(t, e.eng, func(c *celeris.Config) { c.AsyncHandlers = e.async })
 				conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 				if err != nil {
@@ -416,5 +457,64 @@ func TestSplitFirstSegmentIsServed974(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestUnknownProtocolReturnsItsRingBuffer974: with multishot recv the first
+// bytes of a conn arrive in a buffer of the worker's provided-buffer ring, and
+// the buffer has to go back to the ring on every exit of the detect branch,
+// the close on an unrecognised protocol included. One that is dropped is gone
+// for good (celeris#974 review). The ring of a worker holds at least 1024
+// buffers (bufRingCountMin in internal/engine/iouring, the size this test
+// pins with CELERIS_IOURING_PBUF_COUNT), so one worker that closes more
+// unrecognised first segments than that, without returning the buffers, has an
+// empty ring: the next conn gets ENOBUFS on every recv and is never answered.
+// Here that conn is a plain GET, after 1536 conns that opened with garbage.
+func TestUnknownProtocolReturnsItsRingBuffer974(t *testing.T) {
+	const (
+		ringSize = 1024 // bufRingCountMin
+		badConns = ringSize + ringSize/2
+		parallel = 64
+	)
+	t.Setenv("CELERIS_IOURING_PBUF_COUNT", strconv.Itoa(ringSize))
+	engine974{"io_uring-mshot", celeris.IOUring, false, true}.env974(t)
+	addr := startAuto974(t, celeris.IOUring, func(c *celeris.Config) { c.Workers = 1 })
+
+	var closed atomic.Int64
+	sem := make(chan struct{}, parallel)
+	done := make(chan struct{}, badConns)
+	for i := 0; i < badConns; i++ {
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; done <- struct{}{} }()
+			c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			_, _ = io.WriteString(c, "\x16\x03\x01\x02")
+			if r := watchClose974(c, 3*time.Second).wait(); r.closed {
+				closed.Add(1)
+			}
+		}()
+	}
+	for i := 0; i < badConns; i++ {
+		<-done
+	}
+	t.Logf("%d of %d conns that opened with garbage were closed by the server", closed.Load(), badConns)
+	if closed.Load() != badConns {
+		t.Errorf("only %d of %d conns that opened with garbage were closed: the worker's ring ran out of buffers", closed.Load(), badConns)
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = io.WriteString(conn, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	b, _ := io.ReadAll(conn)
+	if !strings.HasPrefix(string(b), "HTTP/1.1 200") || !strings.HasSuffix(string(b), "ok") {
+		t.Errorf("a GET after %d conns that opened with garbage got %q, want a 200 answer", badConns, b)
 	}
 }
