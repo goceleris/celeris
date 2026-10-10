@@ -217,6 +217,16 @@ func take844() census844 {
 	return c
 }
 
+// since returns c less what the process held before this test's first dial:
+// the goroutines of a test that failed earlier in the same process are still
+// there (a wedged worker never exits), and are not this test's to count.
+func (c census844) since(b census844) census844 {
+	c.stuckAbort -= b.stuckAbort
+	c.dispatch -= b.dispatch
+	c.workerBlocked -= b.workerBlocked
+	return c
+}
+
 type rig844 struct {
 	t       *testing.T
 	e       *Engine
@@ -411,7 +421,7 @@ func (r *rig844) judge(arm, want string, faults []fault844) *judge844 {
 	}
 	for deadline := time.Now().Add(settle844); ; time.Sleep(20 * time.Millisecond) {
 		j.active = r.e.Metrics().ActiveConnections
-		j.after = take844()
+		j.after = take844().since(r.base)
 		if (j.active == wantActive && j.after.stuckAbort == 0 && (want != "closed" || j.after.dispatch == 0)) ||
 			time.Now().After(deadline) {
 			break
@@ -432,7 +442,7 @@ func (r *rig844) judge(arm, want string, faults []fault844) *judge844 {
 		_ = a.c.Close()
 	}
 	for deadline := time.Now().Add(settle844); ; time.Sleep(20 * time.Millisecond) {
-		j.final = take844()
+		j.final = take844().since(r.base)
 		if j.final.dispatch == 0 || time.Now().After(deadline) {
 			break
 		}
@@ -746,6 +756,7 @@ func runCancelWhileHandlerRuns844(t *testing.T, how string) {
 	rel := func() { once.Do(func() { close(h.release) }) }
 	t.Cleanup(rel)
 	r.place()
+	blocked0, _ := shutdownBlocked844()
 	for _, id := range r.ids {
 		if _, err := fmt.Fprintf(r.boom[id].c, "GET /f HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 			t.Fatalf("write /f: %v", err)
@@ -761,7 +772,7 @@ func runCancelWhileHandlerRuns844(t *testing.T, how string) {
 	r.cancel()
 	blocked, stacks := 0, []string(nil)
 	for deadline := time.Now().Add(budget844); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
-		if blocked, stacks = shutdownBlocked844(); blocked >= r.workers {
+		if blocked, stacks = shutdownBlocked844(); blocked-blocked0 >= r.workers {
 			break
 		}
 	}
@@ -780,7 +791,8 @@ func runCancelWhileHandlerRuns844(t *testing.T, how string) {
 		case <-time.After(settle844):
 		}
 	}
-	after := take844()
+	after := take844().since(r.base)
+	blocked -= blocked0
 	t.Logf("celeris844 RESULT engine=%s tier=%s arm=cancel-%s workers=%d shutdown_blocked_on_detachMu=%d stopped_before_release=%v "+
 		"stopped=%v log_panics=%d stuck_in_abort=%d dispatch_goroutines=%d goroutines=%d->%d",
 		engineName844, tier844(r.e), how, r.workers, blocked, early, stopped, r.logs.panics.Load(),

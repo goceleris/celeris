@@ -208,6 +208,15 @@ func take844() census844 {
 	return c
 }
 
+// since returns c less what the process held before this test's first dial
+// (the goroutines of a test that failed earlier in the process are not this
+// test's to count).
+func (c census844) since(b census844) census844 {
+	c.stuck -= b.stuck
+	c.dispatch -= b.dispatch
+	return c
+}
+
 type rig844 struct {
 	t       *testing.T
 	ae      *adaptive.Engine
@@ -348,7 +357,7 @@ func (r *rig844) judge(h *a844, first, touch string, inject bool) {
 	var after census844
 	for dl := time.Now().Add(settle844); ; time.Sleep(20 * time.Millisecond) {
 		active = r.ae.Metrics().ActiveConnections
-		after = take844()
+		after = take844().since(r.base)
 		if (active == wantActive && after.stuck == 0 && after.dispatch == 0) || time.Now().After(dl) {
 			break
 		}
