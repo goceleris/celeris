@@ -82,7 +82,7 @@ func TestBoundAddrMatchesStdListener925(t *testing.T) {
 		t.Run(addr, func(t *testing.T) {
 			ln, err := net.Listen("tcp", addr)
 			if err != nil {
-				t.Skipf("listen %s: %v", addr, err)
+				requireDualStack925(t, err)
 			}
 			defer func() { _ = ln.Close() }()
 			f, err := ln.(*net.TCPListener).File()

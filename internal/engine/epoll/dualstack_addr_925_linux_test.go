@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -56,7 +57,7 @@ func runDualStackRemote925(t *testing.T, serve func(resource.Config, stream.Hand
 	t.Helper()
 	ln, err := net.Listen("tcp", "[::]:0")
 	if err != nil {
-		t.Skipf("no dual-stack listener on this host: %v", err)
+		requireDualStack925(t, err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
@@ -171,4 +172,17 @@ func portOf925(t *testing.T, hostport string) string {
 		t.Fatalf("SplitHostPort(%q): %v", hostport, err)
 	}
 	return port
+}
+
+// requireDualStack925 ends a test whose IPv6 listener could not be bound. It
+// skips on a host without IPv6, unless CELERIS_REQUIRE_DUALSTACK=1, where it
+// fails, as the dual-stack arms of the websocket test do (celeris#721): a
+// skip there would be an unlisted SKIP line in CI.
+func requireDualStack925(t *testing.T, err error) {
+	t.Helper()
+	msg := "no IPv6 listener on this host: " + err.Error()
+	if os.Getenv("CELERIS_REQUIRE_DUALSTACK") == "1" {
+		t.Fatal(msg + " -- CELERIS_REQUIRE_DUALSTACK=1 forbids skipping")
+	}
+	t.Skip(msg)
 }
