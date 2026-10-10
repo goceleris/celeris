@@ -776,6 +776,8 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
+		// (flushBatchedCounters, at shutdown, repeats these three flushes:
+		// a counter added to the batches goes in both.)
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per event loop
 		// iteration, eliminating cache-line bouncing under multi-worker
@@ -926,7 +928,7 @@ func (l *Loop) onPeerHalfClose(fd int) {
 	case h1 != nil && h1.Detached.Load():
 		l.notifyDetachedPeerClosed(cs)
 	case csWritePending(cs):
-		cs.peerClosed = true
+		l.markClosing(cs)
 	default:
 		l.closeConn(fd)
 	}
@@ -1759,8 +1761,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 // stops reading cs, so no request is parsed or answered on a conn that is
 // closing, arms EPOLLOUT and marks the close deferred (peerClosed), which
 // handleWritable and the dirty pass carry out once the conn has drained. A
-// peer that never reads again is reaped by checkTimeouts, like any conn
-// stalled on write back-pressure. A conn with nothing left to send, and a
+// peer that never reads again is reaped by checkTimeouts, WriteTimeout after
+// the close was asked or after it last took some of the response
+// (closingDrainBound, celeris#876). A conn with nothing left to send, and a
 // truly-detached one, whose middleware owns its close, are closed at once.
 //
 // Loop thread, with no handler of cs's running: the inline path after its
@@ -1770,7 +1773,7 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 		l.closeConn(cs.fd)
 		return
 	}
-	cs.peerClosed = true
+	l.markClosing(cs)
 	l.removeDirty(cs)
 	issued, err := l.modEpollOut(cs, unix.EPOLLOUT|unix.EPOLLET|unix.EPOLLRDHUP)
 	if !issued {
@@ -1781,6 +1784,105 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 		return
 	}
 	cs.epollOut = true
+}
+
+// markClosing defers cs's close until its queued response has gone out
+// (peerClosed) and starts the clock of that drain (celeris#876). Both callers,
+// closeWhenFlushed and the EPOLLRDHUP branch of onPeerHalfClose, have bytes
+// queued; neither reads cs again. The wall clock, not cachedNow: a loop with no
+// events leaves cachedNow as old as its last event, and a clock stamped with it
+// would be as stale as the lastActivity it replaces.
+//
+// The clock starts once. Both callers can run again on a conn that is already
+// closing, with nothing sent in between: an H2 conn whose write was refused
+// stays on h2Conns with writeRefused set, and the run loop's pass re-enters
+// closeWhenFlushed for every frame a handler goes on queueing; an EPOLLET RDHUP
+// bit is reported again with each later EPOLLOUT edge. A restart there would
+// let a peer that takes nothing hold the conn for as long as a handler keeps
+// writing (an SSE stream: for ever). Only evidence that the peer is taking the
+// response moves the clock (noteClosingProgress, noteClosingAcked). Loop thread.
+//
+// csPendingBytes below reads the dispatch goroutine's buffers unlocked on the
+// EPOLLRDHUP path, a known race (celeris#865, tracked in celeris#885): it feeds
+// only the progress baseline and cannot make the close wrong.
+func (l *Loop) markClosing(cs *connState) {
+	cs.peerClosed = true
+	if cs.closeSince != 0 {
+		return
+	}
+	cs.closeSince = time.Now().UnixNano()
+	cs.closePending = csPendingBytes(cs)
+}
+
+// noteClosingProgress restarts the drain clock of a conn markClosing deferred
+// when pending, what is queued for it after a flush, is less than it was: the
+// peer is taking the response, and the bound is how long it may take nothing,
+// not how long the drain may run, as for io_uring's closing drain
+// (celeris#761, celeris#805). Called from the two flush sites that return to
+// EPOLLOUT or the dirty list with bytes left, never from flushWrites. Loop
+// thread.
+//
+// This is one of two kinds of evidence that the peer is taking bytes, and the
+// coarser: the userspace queue shrinks only at a flush, and a flush follows an
+// EPOLLOUT edge, which a socket raises once about half of its send queue has
+// drained. A client taking 64 KiB/s of a response behind a send queue of MiB
+// goes a minute between two edges. noteClosingAcked is the other, and sees
+// those bytes go.
+func (cs *connState) noteClosingProgress(pending int) {
+	if pending < cs.closePending {
+		cs.closeSince = time.Now().UnixNano()
+	}
+	cs.closePending = pending
+}
+
+// noteClosingAcked is the sweep's evidence of progress on a closing conn: the
+// number of bytes the peer has acknowledged (tcp_info bytes_acked, which only
+// grows) moved since the last sample. It restarts the drain clock the same way
+// a flush that sent bytes does (noteClosingProgress), and answers whether it
+// did. The first sample of a conn is its baseline and counts as no progress,
+// unless the conn is first met after its bound had already passed (a loop whose
+// sweeps are further apart than a short WriteTimeout): there is no baseline to
+// compare with, and the conn is given one more bound rather than cut on no
+// evidence.
+//
+// Not on the hot path: checkTimeouts calls it for a closing conn, at most
+// every quarter of the bound (closeSampled), and it costs one getsockopt. A
+// descriptor that is not a TCP socket, or a kernel that does not report the
+// count (before Linux 4.1), yields no evidence, which leaves the userspace
+// queue's rule alone. Loop thread.
+func (l *Loop) noteClosingAcked(cs *connState, now int64) (progressed bool) {
+	cs.closeSampled = now
+	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	if err != nil {
+		return false
+	}
+	known, prev := cs.closeAckedKnown, cs.closeAcked
+	cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+	if known {
+		progressed = ti.Bytes_acked > prev
+	} else {
+		progressed = now-cs.closeSince > int64(l.closingDrainBound())
+	}
+	if progressed {
+		cs.closeSince = now
+	}
+	return progressed
+}
+
+// closingDrainBound is how long a conn markClosing deferred may go without the
+// peer taking a byte of its response: WriteTimeout, the bound a live conn
+// stalled on a write gets (checkTimeouts). "Taking a byte" is the userspace
+// queue shrinking at a flush (noteClosingProgress) or the peer acknowledging
+// more bytes (noteClosingAcked); a reader the kernel is still draining to is
+// never the stalled peer this bounds. WriteTimeout 0 is "no bound" for a live
+// conn, but a closing conn has no handler and no request to wait for, so one
+// whose peer reads nothing would hold its descriptor for ever; it gets
+// closingDrainFloor, as io_uring's drain does.
+func (l *Loop) closingDrainBound() time.Duration {
+	if wt := l.cfg.WriteTimeout; wt > 0 {
+		return wt
+	}
+	return closingDrainFloor
 }
 
 // closeOnReadEnd is drainRead's read-error and EOF branch: flush what is
@@ -3055,6 +3157,9 @@ func (l *Loop) flushDirty() {
 			// `next` was captured above, so the removeDirty inside
 			// armEpollOut is safe mid-iteration.
 			cs.pendingBytes = csPendingBytes(cs)
+			if cs.peerClosed {
+				cs.noteClosingProgress(cs.pendingBytes)
+			}
 			detachedWS := cs.h1State != nil && cs.h1State.Detached.Load()
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
@@ -3190,6 +3295,9 @@ func (l *Loop) handleWritable(cs *connState) {
 			cs.pendingBytes = 0
 		} else {
 			cs.pendingBytes = csPendingBytes(cs)
+			if cs.peerClosed {
+				cs.noteClosingProgress(cs.pendingBytes)
+			}
 		}
 	}
 	if err != nil && cs.h1State != nil && cs.h1State.OnError != nil {
@@ -3336,6 +3444,12 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 // branch closes the conn immediately.
 const detachDrainGrace = time.Second
 
+// closingDrainFloor bounds the drain of a conn whose close is deferred behind
+// its response (markClosing) when WriteTimeout is disabled: how long the peer
+// may take nothing of it (no acknowledged byte, no flush that sent some).
+// io_uring's closingDrainTimeoutNanos is the same 5 s.
+const closingDrainFloor = 5 * time.Second
+
 // h1DeadlineSnapshot is what checkTimeouts knows about a conn's H1 state: a
 // copy taken under cs.detachMu, so the pointer is never dereferenced after
 // switchToH2Local may have released it.
@@ -3477,6 +3591,29 @@ func (l *Loop) checkTimeouts() {
 				}
 			}
 			l.closeConn(fd)
+			continue
+		}
+		// A conn whose close is deferred behind its response (markClosing)
+		// has its own clock: the engine reads it no more, so lastActivity,
+		// the last read, says nothing about it, and ReadTimeout or
+		// IdleTimeout measured from there cut a response the client was
+		// still taking (celeris#876). Nor is there a request any more for a
+		// header deadline to bound. closeSince starts at the close request
+		// and moves forward with each flush that sends (noteClosingProgress)
+		// and with each sweep that finds the peer has acknowledged more bytes
+		// (noteClosingAcked): a socket raises EPOLLOUT only after about half
+		// of its send queue drained, so a slow client is taking the response
+		// long before the flush that would show it.
+		// Keyed on the clock, not peerClosed: a conn that carries
+		// peerClosed without it (a test fixture) takes the scan below.
+		if cs.closeSince != 0 {
+			bound := l.closingDrainBound()
+			if time.Duration(now-cs.closeSampled) >= bound/4 {
+				l.noteClosingAcked(cs, now)
+			}
+			if time.Duration(now-cs.closeSince) > bound {
+				l.closeConn(fd)
+			}
 			continue
 		}
 		// ReadHeaderTimeout: slowloris defence. Mirror net/http behavior:
@@ -3776,6 +3913,15 @@ func (l *Loop) closeConn(fd int) {
 }
 
 func (l *Loop) shutdown() {
+	// celeris#874: the run loop moves the per-iteration batches into the
+	// shared counters at the end of every iteration and has returned by now,
+	// but the send drain below writes with onLoopThread=true, into
+	// bytesWrittenBatch, and nothing moves it after that. Flushed on the way
+	// out, after the last thing that can write, so Metrics() read once the
+	// engine has stopped is exact. Once, off the iteration path: the run
+	// loop's own flush is untouched.
+	defer l.flushBatchedCounters()
+
 	// First: close every adoption still queued, and refuse every AdoptConn
 	// from here on. Everything below walks the conn table only, which a
 	// queued adoption is not in yet (celeris#658).
@@ -3846,6 +3992,10 @@ func (l *Loop) shutdown() {
 	// close fds or recycle connState below.
 	l.asyncWG.Wait()
 
+	// Phase 2a (celeris#863): a deferred transplant's conn is in no table
+	// phase 3 walks, and its hand-off will never be finished now.
+	l.closeDeferredTransplants()
+
 	// Phase 2b (celeris#760): every response the handlers wrote is queued
 	// now; send what the sockets have not taken yet before phase 3 closes
 	// them, as io_uring does before its shutdown (celeris#595). Closing at
@@ -3911,6 +4061,26 @@ func (l *Loop) shutdown() {
 	// epoll_ctl, so none of them can operate on this number once it is free
 	// to be recycled.
 	l.closeEpollFD()
+}
+
+// flushBatchedCounters moves the loop's per-iteration batches (requests, bytes
+// received, bytes sent) into the engine-wide counters. The run loop does the
+// same inline at the end of each iteration (kept inline: it is the per-event
+// path); this is shutdown's copy, for what the loop's last work after that
+// flush added (celeris#874). Loop thread.
+func (l *Loop) flushBatchedCounters() {
+	if l.reqBatch > 0 {
+		l.reqCount.Add(l.reqBatch)
+		l.reqBatch = 0
+	}
+	if l.bytesReadBatch > 0 {
+		l.bytesRead.Add(l.bytesReadBatch)
+		l.bytesReadBatch = 0
+	}
+	if l.bytesWrittenBatch > 0 {
+		l.bytesWritten.Add(l.bytesWrittenBatch)
+		l.bytesWrittenBatch = 0
+	}
 }
 
 // h2PoolSettled reports whether the loop, its context cancelled, may shut

@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
 )
 
@@ -306,5 +307,77 @@ func (l *Loop) finishTransplantHandoff(cs *connState) {
 	}
 	if err := ts.target.AdoptConn(fd, carry); err != nil {
 		l.reclaimTransplant(fd, carry, l.transplantHandoffRefused, err)
+	}
+}
+
+// closeDeferredTransplants is shutdown's settlement of the deferred hand-offs
+// still owed when the loop stops (celeris#863). tryTransplant takes such a
+// conn out of epoll, the conn table and liveConns, so phase 3 of shutdown,
+// which closes what liveConns holds, never sees it, and the hand-off itself
+// is finished only by drainDetachQueue, which a stopping loop does not run
+// again: the descriptor stayed open for the life of the process, owned by no
+// engine, with no close and no hook. The same happens on one loop's
+// self-shutdown after a listener re-create failure.
+//
+// It runs after the join of the dispatch goroutines, whose quiesce exit
+// always queues its entry before asyncWG.Done, so every owed conn has an
+// entry in detachQueue by now. The conn is closed, not handed on: the loop
+// is stopping and closes every conn it still holds, healthy keep-alives
+// included (phase 3), so a conn that was on its way out of this loop is
+// closed with them. Handing it on instead would also have a second way to
+// leak: when the adaptive engine shuts both sub-engines down the target is
+// stopping too, and the io_uring adopt queue closes. That is not so on the
+// self-shutdown path (a listener re-create failure stops this loop only and
+// the target stays live), where closing rather than handing on is simply
+// what phase 3 does to this loop's other conns.
+//
+// Nothing is counted and no hook fires, as for every other conn phase 3 of
+// shutdown closes: a stopping loop leaves its counters as they stand (it does
+// not decrement activeConns or add to closeCount for what it holds, and calls
+// no OnDisconnect), and the detach had already taken this conn out of
+// activeConns. TransplantDetached - TransplantAdopted keeps the conn, as it
+// did while the descriptor leaked, so accepted - closed - active still equals
+// it.
+//
+// Only the entries are read, under detachQMu and no other lock; the queue is
+// left as it is (shutdown drains nothing else from it). Loop thread.
+func (l *Loop) closeDeferredTransplants() {
+	l.detachQMu.Lock()
+	var owed []*connState
+	for _, cs := range l.detachQueue {
+		if cs.transplantPending {
+			owed = append(owed, cs)
+		}
+	}
+	l.detachQMu.Unlock()
+	for _, cs := range owed {
+		if !cs.transplantPending {
+			continue // a second entry naming a conn closed above
+		}
+		cs.transplantPending = false
+		if l.transplantInFlight > 0 {
+			l.transplantInFlight--
+		}
+		// Every later entry for it is a no-op (see drainDetachQueue).
+		cs.transplanted = true
+		l.dropAsk(cs)
+		// The dispatch goroutine has exited (asyncWG.Wait), so nothing runs
+		// ProcessH1 on this state; detachMu is free and is taken as every
+		// teardown of an async conn's H1 state takes it.
+		if cs.h1State != nil {
+			mu := cs.detachMu
+			if mu != nil {
+				mu.Lock()
+			}
+			if !cs.h1State.Detached.Load() {
+				conn.CloseH1(cs.h1State)
+			}
+			if mu != nil {
+				mu.Unlock()
+			}
+		}
+		fd := cs.fd
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
+		_ = unix.Close(fd)
 	}
 }

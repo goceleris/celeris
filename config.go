@@ -137,6 +137,12 @@ type Config struct {
 	// InitialWindowSize is the H2 initial stream window size (default 65535).
 	InitialWindowSize uint32
 	// MaxHeaderBytes is the max header block size (default 16 MB, min 4096).
+	// Only the std engine applies it (net/http's Server.MaxHeaderBytes).
+	// The native engines (epoll, io_uring, adaptive) ignore it: they cap an
+	// HTTP/1 request head at a fixed 64 KiB, and they refuse an HTTP/2 request
+	// whose header list is over a fixed 64 KiB (the sum, over its fields, of
+	// len(name) + len(value) + 32, as RFC 9113 section 6.5.2 counts it) with
+	// RST_STREAM(ENHANCE_YOUR_CALM) on that stream, where std answers 431.
 	MaxHeaderBytes int
 
 	// DisableKeepAlive disables HTTP keep-alive; each request gets its own connection.
