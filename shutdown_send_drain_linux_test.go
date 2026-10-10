@@ -36,10 +36,10 @@ import (
 // "wait as long as it takes", which the drain first took for no budget and
 // gave its 250 ms floor), and a cancel of StartWithContext's context; both
 // kinds of route (the handler on the worker, and on a dispatch goroutine) are
-// covered. io_uring is not: its own drain (celeris#595)
-// gives up after 250 ms whatever the budget, before this client reads, and
-// whether the tail survives then depends on what the kernel has taken
-// (celeris#806).
+// covered. So is io_uring, directly and as the engine Adaptive started on
+// (celeris#806): its drain (celeris#595) gave up after 250 ms whatever the
+// budget, before this client reads, and whether the tail survived then
+// depended on what the kernel had taken.
 func TestShutdownSendsTheWholeResponse(t *testing.T) {
 	const size = 3 << 20
 	const readDelay = 500 * time.Millisecond
@@ -47,47 +47,46 @@ func TestShutdownSendsTheWholeResponse(t *testing.T) {
 	for i := range body {
 		body[i] = byte(i*7 + i>>13)
 	}
-	for _, e := range []struct {
-		name string
-		eng  celeris.EngineType
-	}{{"std", celeris.Std}, {"epoll", celeris.Epoll}, {"adaptive", celeris.Adaptive}} {
+	for _, e := range drainEngines806 {
 		for _, route := range []string{"sync", "async-route"} {
 			for _, mode := range []string{"Shutdown", "Shutdown-background", "cancel"} {
-				t.Run(e.name+"/"+route+"/"+mode, func(t *testing.T) {
-					desc := e.name + "/" + route + "/" + mode
-					entered := make(chan struct{})
-					release := make(chan struct{})
-					srv := startServer760(t, e.eng, 30*time.Second, 0, func(s *celeris.Server) {
-						r := s.GET("/big", func(c *celeris.Context) error {
-							close(entered)
-							<-release
-							return c.Blob(http.StatusOK, "application/octet-stream", body)
+				for _, sb := range sndBufs806 {
+					t.Run(e.name+"/"+route+"/"+mode+sb.suffix, func(t *testing.T) {
+						desc := e.name + "/" + route + "/" + mode + sb.suffix
+						entered := make(chan struct{})
+						release := make(chan struct{})
+						srv := startDrainServer806(t, e, 30*time.Second, 0, sb.apply, func(s *celeris.Server) {
+							r := s.GET("/big", func(c *celeris.Context) error {
+								close(entered)
+								<-release
+								return c.Blob(http.StatusOK, "application/octet-stream", body)
+							})
+							if route == "async-route" {
+								r.Async()
+							}
 						})
-						if route == "async-route" {
-							r.Async()
+						c := dialSlowReader760(t, srv.addr)
+						if _, err := io.WriteString(c, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+							t.Fatal(err)
+						}
+						select {
+						case <-entered:
+						case <-time.After(5 * time.Second):
+							t.Fatal("handler did not start within 5s")
+						}
+						shutErr := srv.beginShutdown(mode, 30*time.Second)
+						time.Sleep(200 * time.Millisecond)
+						close(release)
+						time.Sleep(readDelay)
+						got, n, end := readResponse760(c)
+						if !bytes.Equal(got, body) {
+							t.Errorf("%s: the client got %d of %d body bytes (%d in all), then %s", desc, len(got), size, n, end)
+						}
+						if err := srv.waitShutdown(mode, shutErr, 20*time.Second); err != nil {
+							t.Errorf("%s: %v", desc, err)
 						}
 					})
-					c := dialSlowReader760(t, srv.addr)
-					if _, err := io.WriteString(c, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
-						t.Fatal(err)
-					}
-					select {
-					case <-entered:
-					case <-time.After(5 * time.Second):
-						t.Fatal("handler did not start within 5s")
-					}
-					shutErr := srv.beginShutdown(mode, 30*time.Second)
-					time.Sleep(200 * time.Millisecond)
-					close(release)
-					time.Sleep(readDelay)
-					got, n, end := readResponse760(c)
-					if !bytes.Equal(got, body) {
-						t.Errorf("%s: the client got %d of %d body bytes (%d in all), then %s", desc, len(got), size, n, end)
-					}
-					if err := srv.waitShutdown(mode, shutErr, 20*time.Second); err != nil {
-						t.Errorf("%s: %v", desc, err)
-					}
-				})
+				}
 			}
 		}
 	}
@@ -102,10 +101,10 @@ func TestShutdownSendsTheWholeResponse(t *testing.T) {
 // nothing cancels it (context.Background()), by the config's WriteTimeout,
 // the bound a live conn's stalled write gets ("Shutdown-background", with
 // WriteTimeout = budget): a client that never reads cannot hold that Shutdown
-// for ever. io_uring is not asserted: its own drain returns about 10 s late
-// with a stalled send whatever the budget (celeris#806). std's handler writes
-// the response itself and blocks in that write; net/http's WriteTimeout is
-// its bound.
+// for ever. io_uring, directly and as the engine Adaptive started on, is
+// asserted too: its drain returned about 10 s late with a stalled send
+// whatever the budget (celeris#806). std's handler writes the response
+// itself and blocks in that write; net/http's WriteTimeout is its bound.
 func TestShutdownSendDrainIsBounded(t *testing.T) {
 	// Larger than the socket buffers, so part of it stays queued while the
 	// client does not read, and smaller than the 4 MiB write cap, so the
@@ -114,10 +113,10 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 	const budget = 500 * time.Millisecond
 	const bound = time.Second
 	body := make([]byte, size)
-	for _, e := range []struct {
-		name string
-		eng  celeris.EngineType
-	}{{"epoll", celeris.Epoll}, {"adaptive", celeris.Adaptive}} {
+	for _, e := range drainEngines806 {
+		if e.name == "std" {
+			continue
+		}
 		for _, mode := range []string{"Shutdown", "Shutdown-withcancel", "Shutdown-background", "cancel"} {
 			t.Run(e.name+"/"+mode, func(t *testing.T) {
 				desc := e.name + "/" + mode
@@ -126,7 +125,7 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 				if mode == "Shutdown-background" {
 					writeTimeout = budget
 				}
-				srv := startServer760(t, e.eng, budget, writeTimeout, func(s *celeris.Server) {
+				srv := startDrainServer806(t, e, budget, writeTimeout, nil, func(s *celeris.Server) {
 					s.GET("/big", func(c *celeris.Context) error {
 						defer close(served) // native engines: the body is queued, not written, here
 						return c.Blob(http.StatusOK, "application/octet-stream", body)
@@ -161,6 +160,103 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 	}
 }
 
+// drainEngines806 are the engines the two drain tests run on. Adaptive is run
+// on each of the sub-engines it can start on, set explicitly (its automatic
+// choice is not the test's business, and a test that did not say would cover
+// whichever one the host's heuristics picked): the shutdown a server is asked
+// for reaches the sub-engine that is active, so each is a different drain.
+// setup runs in the subtest, before the server starts; premise, after it
+// answered, fails the test when the engine under test is not the one it
+// names (celeris#806).
+type drainEngine806 struct {
+	name    string
+	eng     celeris.EngineType
+	setup   func(*testing.T)
+	premise func(*server760) error
+}
+
+var drainEngines806 = []drainEngine806{
+	{"std", celeris.Std, func(*testing.T) {}, func(*server760) error { return nil }},
+	{"epoll", celeris.Epoll, func(*testing.T) {}, func(*server760) error { return nil }},
+	{"io_uring", celeris.IOUring, func(*testing.T) {}, requireIOUring806},
+	{"adaptive-epoll", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "epoll") }, requireNoIOUring806},
+	{"adaptive-iouring", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "iouring") }, requireIOUring806},
+}
+
+// sndBufs806 are the server's send buffers the whole-response test runs with:
+// the OS default, and 64 KiB, which with the client's 64 KiB receive buffer
+// leaves the kernel almost none of a 3 MiB response, however much room the
+// host's autotuning would give a larger one. Without it whether a drain that
+// gave up early lost the tail depended on the host (celeris#806: the laptop's
+// kernel took the whole response, a CI runner's about 2.6 MiB of it).
+var sndBufs806 = []struct {
+	suffix string
+	apply  func(*celeris.Config)
+}{
+	{"", nil},
+	{"/sndbuf64k", func(c *celeris.Config) { c.SocketSendBuf = 64 << 10 }},
+}
+
+// ringBytes806 is what the io_uring engine has sent so far, by either of its
+// send paths (EngineMetrics.InlineBytes, RingBytes): zero on an engine that
+// is not io_uring, so, after one answered request, it says which one is
+// serving.
+func ringBytes806(srv *server760) uint64 {
+	m := srv.s.EngineInfo().Metrics
+	return m.InlineBytes + m.RingBytes
+}
+
+func requireIOUring806(srv *server760) error {
+	// Both counters are flushed once per loop iteration: give the worker one.
+	for dl := time.Now().Add(2 * time.Second); ringBytes806(srv) == 0 && time.Now().Before(dl); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ringBytes806(srv) == 0 {
+		return errors.New("celeris806 PREMISE: the server answered /ping but the io_uring engine has sent no byte (InlineBytes+RingBytes = 0): this is not an io_uring run")
+	}
+	return nil
+}
+
+func requireNoIOUring806(srv *server760) error {
+	time.Sleep(100 * time.Millisecond)
+	if n := ringBytes806(srv); n != 0 {
+		return fmt.Errorf("celeris806 PREMISE: Adaptive started on epoll was serving through io_uring (InlineBytes+RingBytes = %d)", n)
+	}
+	return nil
+}
+
+// startDrainServer806 is startServer760 for an engine of drainEngines806, and
+// the one place its premise is checked. Adaptive started on io_uring falls
+// back to epoll, with a WARN, when the ring cannot be built (at the CI
+// runner's 8 MiB memlock a start made right after the previous server
+// stopped can fail although nothing leaked: see startServer760); that run
+// would silently test epoll twice. So a server that is not the engine asked
+// for is stopped and started again, for up to 30 s, and the test fails when
+// it never is.
+func startDrainServer806(t *testing.T, e drainEngine806, budget, writeTimeout time.Duration, cfgFn func(*celeris.Config), routes func(*celeris.Server)) *server760 {
+	t.Helper()
+	e.setup(t)
+	retryUntil := time.Now().Add(30 * time.Second)
+	for {
+		srv := startServer760(t, e.eng, budget, writeTimeout, cfgFn, routes)
+		err := e.premise(srv)
+		if err == nil {
+			return srv
+		}
+		srv.cancel()
+		select {
+		case serr := <-srv.startDone:
+			srv.startDone <- serr // for the cleanup
+		case <-time.After(30 * time.Second):
+			t.Fatalf("a server started on the wrong engine did not stop within 30s: %v", err)
+		}
+		if !time.Now().Before(retryUntil) {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 type server760 struct {
 	s         *celeris.Server
 	addr      string
@@ -176,7 +272,7 @@ type server760 struct {
 // some milliseconds after a ring closes, so at the CI runner's 8 MiB a start
 // made right after the previous server stopped can fail although nothing
 // leaked (see startC714DetachServer).
-func startServer760(t *testing.T, eng celeris.EngineType, budget, writeTimeout time.Duration, routes func(*celeris.Server)) *server760 {
+func startServer760(t *testing.T, eng celeris.EngineType, budget, writeTimeout time.Duration, cfgFn func(*celeris.Config), routes func(*celeris.Server)) *server760 {
 	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {
@@ -186,7 +282,11 @@ func startServer760(t *testing.T, eng celeris.EngineType, budget, writeTimeout t
 		}
 		addr := ln.Addr().String()
 		_ = ln.Close()
-		s := celeris.New(celeris.Config{Engine: eng, Addr: addr, ShutdownTimeout: budget, WriteTimeout: writeTimeout})
+		cfg := celeris.Config{Engine: eng, Addr: addr, ShutdownTimeout: budget, WriteTimeout: writeTimeout}
+		if cfgFn != nil {
+			cfgFn(&cfg)
+		}
+		s := celeris.New(cfg)
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 		routes(s)
 		ctx, cancel := context.WithCancel(context.Background())
