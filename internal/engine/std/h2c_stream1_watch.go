@@ -9,15 +9,19 @@ import (
 // h2cStream1Watch wraps the connection of an h2c upgrade (RFC 7540 3.2) and
 // calls onReset, once, when the client sends RST_STREAM for stream 1.
 //
-// The upgrade request is stream 1, but the HTTP/2 server runs its handler with
-// the request as it came in over HTTP/1, whose context ends with the HTTP/1
-// request (that is, with the connection), not with the stream: for every
-// other stream the server makes the request context from the stream's, which
-// RST_STREAM cancels. Without this the handler of the upgrade request is not
-// told that the client reset its stream, where epoll and io_uring cancel it
-// (celeris#949). The watcher only reads the frame headers that pass; it never
-// changes a byte, and Read, which the HTTP/2 server calls from one goroutine,
-// is the only method that touches its state.
+// The upgrade request is stream 1, but the HTTP/2 server does not make its
+// context from the stream, as it does for every other stream (the context that
+// RST_STREAM cancels). It keeps the context of the request it was given, the
+// HTTP/1 request, whose context ends with the connection. go1.27 net/http
+// rebuilds that request as HTTP/2 but keeps only its context, so this holds
+// there too; under -tags http2legacy x/net passes the request on as it came in
+// (h2c.go marks it HTTP/2, so the bridge binds the request's context to the
+// stream; the watcher is what cancels that context).
+// Without this, the handler of the upgrade request is not told that the client
+// reset stream 1, where epoll and io_uring cancel it (celeris#949). The watcher
+// only reads the frame headers that pass; it never changes a byte, and Read,
+// which the HTTP/2 server calls from one goroutine, is the only method that
+// touches its state.
 type h2cStream1Watch struct {
 	net.Conn
 	onReset func()
