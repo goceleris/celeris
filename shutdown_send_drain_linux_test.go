@@ -52,7 +52,7 @@ func TestShutdownSendsTheWholeResponse(t *testing.T) {
 	for _, e := range drainEngines806 {
 		for _, route := range []string{"sync", "async-route"} {
 			for _, mode := range []string{"Shutdown", "Shutdown-background", "cancel"} {
-				if e.slim && mode == "Shutdown-background" {
+				if e.slim && mode != e.slimMode {
 					continue
 				}
 				for _, sb := range sndBufs806 {
@@ -126,8 +126,8 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 			continue
 		}
 		for _, mode := range []string{"Shutdown", "Shutdown-withcancel", "Shutdown-background", "cancel"} {
-			if e.slim && (mode == "Shutdown" || mode == "Shutdown-withcancel") {
-				continue // slim engines: the WriteTimeout bound and the cancel
+			if e.slim && mode != e.slimBoundedMode {
+				continue
 			}
 			for _, reader := range readers806(e, mode) {
 				t.Run(e.name+"/"+mode+reader, func(t *testing.T) {
@@ -212,7 +212,7 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 // stalled one always; the slim engines add a client that reads a part of the
 // response during the drain and stops (in the cancel mode only).
 func readers806(e drainEngine806, mode string) []string {
-	if e.slim && mode == "cancel" {
+	if e.slim && e.name == "io_uring" {
 		return []string{"", "/trickle"}
 	}
 	return []string{""}
@@ -281,18 +281,23 @@ type drainEngine806 struct {
 	eng     celeris.EngineType
 	setup   func(*testing.T)
 	premise func(*server760) error
-	// slim runs a reduced matrix (see slimModes806): the root package's race
+	// slim runs a reduced matrix (see slimMode): the root package's race
 	// run has about 40 s of its 300 s timeout to spare, and the io_uring
 	// engines are added on top of it.
 	slim bool
+	// slimMode and slimBoundedMode are the one shutdown mode a slim engine
+	// runs in the whole-response and the bounded test: the two io_uring
+	// engines take different ones, so between them the direct Shutdown, the
+	// cancel and the WriteTimeout bound are all covered.
+	slimMode, slimBoundedMode string
 }
 
 var drainEngines806 = []drainEngine806{
-	{"std", celeris.Std, func(*testing.T) {}, func(*server760) error { return nil }, false},
-	{"epoll", celeris.Epoll, func(*testing.T) {}, func(*server760) error { return nil }, false},
-	{"io_uring", celeris.IOUring, func(*testing.T) {}, requireIOUring806, true},
-	{"adaptive-epoll", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "epoll") }, requireNoIOUring806, false},
-	{"adaptive-iouring", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "iouring") }, requireIOUring806, true},
+	{"std", celeris.Std, func(*testing.T) {}, func(*server760) error { return nil }, false, "", ""},
+	{"epoll", celeris.Epoll, func(*testing.T) {}, func(*server760) error { return nil }, false, "", ""},
+	{"io_uring", celeris.IOUring, func(*testing.T) {}, requireIOUring806, true, "cancel", "cancel"},
+	{"adaptive-epoll", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "epoll") }, requireNoIOUring806, false, "", ""},
+	{"adaptive-iouring", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "iouring") }, requireIOUring806, true, "Shutdown", "Shutdown-background"},
 }
 
 // sndBufs806 are the server's send buffers the whole-response test runs with:
