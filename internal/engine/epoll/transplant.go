@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
 )
 
@@ -306,5 +307,74 @@ func (l *Loop) finishTransplantHandoff(cs *connState) {
 	}
 	if err := ts.target.AdoptConn(fd, carry); err != nil {
 		l.reclaimTransplant(fd, carry, l.transplantHandoffRefused, err)
+	}
+}
+
+// closeDeferredTransplants is shutdown's settlement of the deferred hand-offs
+// still owed when the loop stops (celeris#863). tryTransplant takes such a
+// conn out of epoll, the conn table and liveConns, so phase 3 of shutdown,
+// which closes what liveConns holds, never sees it, and the hand-off itself
+// is finished only by drainDetachQueue, which a stopping loop does not run
+// again: the descriptor stayed open for the life of the process, owned by no
+// engine, with no close and no hook. The same happens on one loop's
+// self-shutdown after a listener re-create failure.
+//
+// It runs after the join of the dispatch goroutines, whose quiesce exit
+// always queues its entry before asyncWG.Done, so every owed conn has an
+// entry in detachQueue by now. The conn is closed, not handed on: the loop
+// is stopping and closes every conn it still holds, and the target may be
+// stopping too (the adaptive engine shuts both sub-engines down, and the
+// io_uring adopt queue closes), so a hand-off could leak the descriptor
+// again on its side.
+//
+// The detach fired no OnDisconnect and left closeCount alone, so the close
+// counts here, as refuseAdopt does for a relinquished conn an engine ends.
+// TransplantDetached - TransplantAdopted keeps the one conn: it is a record
+// of hand-offs begun, and this one ended in a close.
+//
+// Only the entries are read, under detachQMu and no other lock; the queue is
+// left as it is (shutdown drains nothing else from it). Loop thread.
+func (l *Loop) closeDeferredTransplants() {
+	l.detachQMu.Lock()
+	var owed []*connState
+	for _, cs := range l.detachQueue {
+		if cs.transplantPending {
+			owed = append(owed, cs)
+		}
+	}
+	l.detachQMu.Unlock()
+	for _, cs := range owed {
+		if !cs.transplantPending {
+			continue // a second entry naming a conn closed above
+		}
+		cs.transplantPending = false
+		if l.transplantInFlight > 0 {
+			l.transplantInFlight--
+		}
+		// Every later entry for it is a no-op (see drainDetachQueue).
+		cs.transplanted = true
+		l.dropAsk(cs)
+		// The dispatch goroutine has exited (asyncWG.Wait), so nothing runs
+		// ProcessH1 on this state; detachMu is free and is taken as every
+		// teardown of an async conn's H1 state takes it.
+		if cs.h1State != nil {
+			mu := cs.detachMu
+			if mu != nil {
+				mu.Lock()
+			}
+			if !cs.h1State.Detached.Load() {
+				conn.CloseH1(cs.h1State)
+			}
+			if mu != nil {
+				mu.Unlock()
+			}
+		}
+		fd := cs.fd
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
+		_ = unix.Close(fd)
+		l.closeCount.Add(1)
+		if l.cfg.OnDisconnect != nil {
+			l.cfg.OnDisconnect(cs.remoteAddr)
+		}
 	}
 }

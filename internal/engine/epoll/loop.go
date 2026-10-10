@@ -3846,6 +3846,10 @@ func (l *Loop) shutdown() {
 	// close fds or recycle connState below.
 	l.asyncWG.Wait()
 
+	// Phase 2a (celeris#863): a deferred transplant's conn is in no table
+	// phase 3 walks, and its hand-off will never be finished now.
+	l.closeDeferredTransplants()
+
 	// Phase 2b (celeris#760): every response the handlers wrote is queued
 	// now; send what the sockets have not taken yet before phase 3 closes
 	// them, as io_uring does before its shutdown (celeris#595). Closing at
