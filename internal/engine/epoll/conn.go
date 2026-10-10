@@ -153,6 +153,18 @@ type connState struct {
 	// error, a refused write; celeris#761): the close it defers is the same.
 	peerClosed bool
 
+	// closeSince and closePending are the clock of that deferred close
+	// (celeris#876): closeSince is when the engine last saw the close move
+	// forward, in nanoseconds, from the request that deferred it
+	// (markClosing) and then from each flush that took some of the response
+	// (noteClosingProgress); closePending is how many bytes were queued at
+	// that point. checkTimeouts reaps a conn whose closeSince is older than
+	// closingDrainBound, and measures nothing else on it: lastActivity is
+	// the last READ, and a conn that is closing is no longer read. 0 when no
+	// deferred close is under way. Worker-thread-only; reset on release.
+	closeSince   int64
+	closePending int
+
 	// writeRefused records that response bytes were lost (celeris#761): a
 	// write hook refused them because the conn's backlog was already over
 	// writeCap, or the write the zero-copy body hook made failed, or a
@@ -374,6 +386,8 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = trimPooledBuf(cs.asyncOutBuf)
 	cs.writeBuf = trimPooledBuf(cs.writeBuf)
 	cs.peerClosed = false
+	cs.closeSince = 0
+	cs.closePending = 0
 	cs.writeRefused = false
 	cs.drainDeadline = 0
 	cs.asyncRun = false

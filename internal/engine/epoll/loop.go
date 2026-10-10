@@ -926,7 +926,7 @@ func (l *Loop) onPeerHalfClose(fd int) {
 	case h1 != nil && h1.Detached.Load():
 		l.notifyDetachedPeerClosed(cs)
 	case csWritePending(cs):
-		cs.peerClosed = true
+		l.markClosing(cs)
 	default:
 		l.closeConn(fd)
 	}
@@ -1759,8 +1759,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 // stops reading cs, so no request is parsed or answered on a conn that is
 // closing, arms EPOLLOUT and marks the close deferred (peerClosed), which
 // handleWritable and the dirty pass carry out once the conn has drained. A
-// peer that never reads again is reaped by checkTimeouts, like any conn
-// stalled on write back-pressure. A conn with nothing left to send, and a
+// peer that never reads again is reaped by checkTimeouts, WriteTimeout after
+// the close was asked or after it last took some of the response
+// (closingDrainBound, celeris#876). A conn with nothing left to send, and a
 // truly-detached one, whose middleware owns its close, are closed at once.
 //
 // Loop thread, with no handler of cs's running: the inline path after its
@@ -1770,7 +1771,7 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 		l.closeConn(cs.fd)
 		return
 	}
-	cs.peerClosed = true
+	l.markClosing(cs)
 	l.removeDirty(cs)
 	issued, err := l.modEpollOut(cs, unix.EPOLLOUT|unix.EPOLLET|unix.EPOLLRDHUP)
 	if !issued {
@@ -1781,6 +1782,45 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 		return
 	}
 	cs.epollOut = true
+}
+
+// markClosing defers cs's close until its queued response has gone out
+// (peerClosed) and starts the clock of that drain (celeris#876). Both callers,
+// closeWhenFlushed and the EPOLLRDHUP branch of onPeerHalfClose, have bytes
+// queued; neither reads cs again. The wall clock, not cachedNow: a loop with no
+// events leaves cachedNow as old as its last event, and a clock stamped with it
+// would be as stale as the lastActivity it replaces. Loop thread.
+func (l *Loop) markClosing(cs *connState) {
+	cs.peerClosed = true
+	cs.closeSince = time.Now().UnixNano()
+	cs.closePending = csPendingBytes(cs)
+}
+
+// noteClosingProgress restarts the drain clock of a conn markClosing deferred
+// when pending, what is queued for it after a flush, is less than it was: the
+// peer is taking the response, and the bound is how long it may take nothing,
+// not how long the drain may run, as for io_uring's closing drain
+// (celeris#761, celeris#805). Called from the two flush sites that return to
+// EPOLLOUT or the dirty list with bytes left, never from flushWrites. Loop
+// thread.
+func (l *Loop) noteClosingProgress(cs *connState, pending int) {
+	if pending < cs.closePending {
+		cs.closeSince = time.Now().UnixNano()
+	}
+	cs.closePending = pending
+}
+
+// closingDrainBound is how long a conn markClosing deferred may go without the
+// peer taking a byte of its response: WriteTimeout, the bound a live conn
+// stalled on a write gets (checkTimeouts). WriteTimeout 0 is "no bound" for a
+// live conn, but a closing conn has no handler and no request to wait for, so
+// one whose peer reads nothing would hold its descriptor for ever; it gets
+// closingDrainFloor, as io_uring's drain does.
+func (l *Loop) closingDrainBound() time.Duration {
+	if wt := l.cfg.WriteTimeout; wt > 0 {
+		return wt
+	}
+	return closingDrainFloor
 }
 
 // closeOnReadEnd is drainRead's read-error and EOF branch: flush what is
@@ -3055,6 +3095,9 @@ func (l *Loop) flushDirty() {
 			// `next` was captured above, so the removeDirty inside
 			// armEpollOut is safe mid-iteration.
 			cs.pendingBytes = csPendingBytes(cs)
+			if cs.peerClosed {
+				l.noteClosingProgress(cs, cs.pendingBytes)
+			}
 			detachedWS := cs.h1State != nil && cs.h1State.Detached.Load()
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
@@ -3190,6 +3233,9 @@ func (l *Loop) handleWritable(cs *connState) {
 			cs.pendingBytes = 0
 		} else {
 			cs.pendingBytes = csPendingBytes(cs)
+			if cs.peerClosed {
+				l.noteClosingProgress(cs, cs.pendingBytes)
+			}
 		}
 	}
 	if err != nil && cs.h1State != nil && cs.h1State.OnError != nil {
@@ -3336,6 +3382,11 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 // branch closes the conn immediately.
 const detachDrainGrace = time.Second
 
+// closingDrainFloor bounds the drain of a conn whose close is deferred behind
+// its response (markClosing) when WriteTimeout is disabled: how long the peer
+// may take nothing of it. io_uring's closingDrainTimeoutNanos is the same 5 s.
+const closingDrainFloor = 5 * time.Second
+
 // h1DeadlineSnapshot is what checkTimeouts knows about a conn's H1 state: a
 // copy taken under cs.detachMu, so the pointer is never dereferenced after
 // switchToH2Local may have released it.
@@ -3477,6 +3528,21 @@ func (l *Loop) checkTimeouts() {
 				}
 			}
 			l.closeConn(fd)
+			continue
+		}
+		// A conn whose close is deferred behind its response (markClosing)
+		// has its own clock: the engine reads it no more, so lastActivity,
+		// the last read, says nothing about it, and ReadTimeout or
+		// IdleTimeout measured from there cut a response the client was
+		// still taking (celeris#876). Nor is there a request any more for a
+		// header deadline to bound. closeSince starts at the close request
+		// and moves forward with each flush that sends (noteClosingProgress).
+		// Keyed on the clock, not peerClosed: a conn that carries
+		// peerClosed without it (a test fixture) takes the scan below.
+		if cs.closeSince != 0 {
+			if time.Duration(now-cs.closeSince) > l.closingDrainBound() {
+				l.closeConn(fd)
+			}
 			continue
 		}
 		// ReadHeaderTimeout: slowloris defence. Mirror net/http behavior:
