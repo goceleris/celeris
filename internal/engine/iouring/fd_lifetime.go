@@ -739,6 +739,12 @@ func (w *Worker) noteShutdownDrainGaveUp(owed []*connState, ringErr error) {
 			n++
 		}
 	}
-	w.logger.Warn("io_uring shutdown: the ops owed on connection descriptors did not end before the descriptors were closed",
-		"worker", w.id, "conns_owed", n, "ring_err", ringErr, "bound", time.Duration(shutdownFDDrainNanos))
+	// reason says which: the bound ran out, or the ring failed (then with
+	// its error).
+	attrs := []any{"worker", w.id, "conns_owed", n, "reason", "bound", "bound", time.Duration(shutdownFDDrainNanos)}
+	if ringErr != nil {
+		attrs[5] = "ring_error"
+		attrs = append(attrs, "ring_err", ringErr)
+	}
+	w.logger.Warn("io_uring shutdown: the ops owed on connection descriptors did not end before the descriptors were closed", attrs...)
 }

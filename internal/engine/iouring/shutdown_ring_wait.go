@@ -18,9 +18,11 @@ var shutdownRingWait = (*Ring).SubmitAndWaitTimeout
 // reaping the ring and entering again is the answer. io_uring_enter(2) gives
 // it as EBUSY, when IORING_FEAT_NODROP has overflowed completions that cannot
 // be flushed into the full ring; kernels 5.19 to 6.1 return it from the wait
-// after the submit has happened (io_cqring_wait: "if we can't even flush
-// overflow, don't wait for more"), where 6.2 and later flush as the loop
-// reaps and do not. EAGAIN is the kernel's "try again" (retryPending treats
+// (io_cqring_wait: "if we can't even flush overflow, don't wait for more"),
+// and on 6.1 io_uring_enter hands it back only when the enter submitted
+// nothing ("return submitted ? submitted : ret"), where 6.2 and later flush
+// as the loop reaps and do not. Either way the drain reaps and waits again.
+// EAGAIN is the kernel's "try again" (retryPending treats
 // the two alike). Any other error is the ring failing.
 func ringWaitRetryable(err error) bool {
 	return errors.Is(err, unix.EBUSY) || errors.Is(err, unix.EAGAIN)

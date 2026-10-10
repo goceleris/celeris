@@ -9,11 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -113,6 +111,14 @@ func TestShutdownSendsTheWholeResponse(t *testing.T) {
 // asserted too: its drain returned about 10 s late with a stalled send
 // whatever the budget (celeris#806). std's handler writes the response
 // itself and blocks in that write; net/http's WriteTimeout is its bound.
+//
+// The engines run with the OS-default send buffer, the one a user has: it is
+// what exposes the late return, and a small buffer hides it (the kernel
+// then takes less of the response and the old 250 ms drain gave up in time).
+// How much of the 3 MiB the host's kernel holds decides how much stays
+// queued, so the data loss the bound is, and its WARN, are asserted
+// elsewhere with a send buffer that makes the loss certain
+// (TestShutdownBoundWarns806, internal/engine/iouring).
 func TestShutdownSendDrainIsBounded(t *testing.T) {
 	// Larger than the socket buffers, so part of it stays queued while the
 	// client does not read, and smaller than the 4 MiB write cap, so the
@@ -137,15 +143,7 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 					if mode == "Shutdown-background" {
 						writeTimeout = budget
 					}
-					logs := &syncBuf806{}
-					srv := startDrainServer806(t, e, budget, writeTimeout, func(c *celeris.Config) {
-						c.Logger = slog.New(slog.NewTextHandler(logs, nil))
-						if e.slim {
-							// The kernel cannot hold the response, so the cut the
-							// WARN below reports is certain, not host luck.
-							sndBufs806[1].apply(c)
-						}
-					}, func(s *celeris.Server) {
+					srv := startDrainServer806(t, e, budget, writeTimeout, nil, func(s *celeris.Server) {
 						s.GET("/big", func(c *celeris.Context) error {
 							defer close(served) // native engines: the body is queued, not written, here
 							return c.Blob(http.StatusOK, "application/octet-stream", body)
@@ -196,11 +194,6 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 						}
 					} else if got, n, end := readResponse760(c); end != "EOF" && end != "the end of the body" {
 						t.Errorf("%s: after the shutdown the client got %d of %d body bytes (%d in all), then %s", desc, len(got), size, n, end)
-					}
-					// The io_uring engine states the data loss the bound is: a
-					// WARN naming the connections and the queued bytes cut.
-					if e.slim && !strings.Contains(logs.String(), "the send drain ran out of time") {
-						t.Errorf("%s: the engine cut a response the client had not taken and logged nothing about it:\n%s", desc, logs.String())
 					}
 				})
 			}
@@ -375,24 +368,6 @@ func startDrainServer806(t *testing.T, e drainEngine806, budget, writeTimeout ti
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-}
-
-// syncBuf806 is a log sink the engine's threads and the test both touch.
-type syncBuf806 struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (s *syncBuf806) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncBuf806) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
 }
 
 type server760 struct {

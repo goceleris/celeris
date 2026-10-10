@@ -25,10 +25,13 @@ import (
 // the ops still owed, the pre-celeris#793 behaviour the drain exists to end.
 //
 // Which kernels answer EBUSY is a matter of source, not of this host: the
-// wait in io_cqring_wait returns it, after the submit, on v5.19 (the floor)
-// and v6.1 ("if we can't even flush overflow, don't wait for more") and no
-// longer on v6.2 and later; on this package's CI kernel and on the 7.0 kernel
-// of the laptop's Docker VM a full CQ ring with completions overflowed behind
+// wait in io_cqring_wait returns it on v5.19 (the floor) and v6.1 ("if we
+// can't even flush overflow, don't wait for more"), and no longer on v6.2 and
+// later. v6.1's io_uring_enter ends with "return submitted ? submitted : ret",
+// so there the error surfaces only when the enter submitted nothing; this
+// file's fake answers EBUSY after the submit too, a superset of that
+// contract, and the drain handles both; on this package's CI kernel and on
+// the 7.0 kernel of the laptop's Docker VM a full CQ ring with completions overflowed behind
 // it is flushed and the drain never sees the error (the "real-kernel" arm
 // below pins that). So the failing-first arm injects the answer: ebusyWait873
 // is the contract of those kernels, and the arms around it say what the
@@ -188,8 +191,8 @@ func TestShutdownDrainGiveUpIsCounted873(t *testing.T) {
 		maxTook time.Duration
 		wantErr string
 	}{
-		{"ebusy-for-ever", ebusyWait873{hold: true}, 200 * time.Millisecond, 600 * time.Millisecond, "ring_err=<nil>"},
-		{"ring-error", ebusyWait873{hold: true, err: errors.New("io_uring_enter submit+wait timeout: " + unix.EINVAL.Error())}, 0, 100 * time.Millisecond, "ring_err"},
+		{"ebusy-for-ever", ebusyWait873{hold: true}, 200 * time.Millisecond, 600 * time.Millisecond, "reason=bound"},
+		{"ring-error", ebusyWait873{hold: true, err: errors.New("io_uring_enter submit+wait timeout: " + unix.EINVAL.Error())}, 0, 100 * time.Millisecond, "reason=ring_error"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, lb := newOwedRig873(t, false)
@@ -210,6 +213,9 @@ func TestShutdownDrainGiveUpIsCounted873(t *testing.T) {
 			}
 			if !strings.Contains(lb.String(), "level=WARN") || !strings.Contains(lb.String(), tc.wantErr) || !strings.Contains(lb.String(), "conns_owed=1") {
 				t.Fatalf("no WARN naming the give-up (%s, conns_owed=1): %q", tc.wantErr, lb.String())
+			}
+			if hasErr := strings.Contains(lb.String(), "ring_err="); hasErr != (tc.name == "ring-error") {
+				t.Fatalf("the WARN's ring_err field is present=%v on case %s: it names the ring's error, so only a ring failure has one: %q", hasErr, tc.name, lb.String())
 			}
 			if took < tc.minTook || took > tc.maxTook {
 				t.Fatalf("took %v, want within [%v, %v]", took, tc.minTook, tc.maxTook)

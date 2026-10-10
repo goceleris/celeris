@@ -1300,6 +1300,11 @@ func (w *Worker) run(ctx context.Context) {
 			// the loop stops accepting, as it does while it waits for the
 			// HTTP/2 handlers: a connection accepted in a drain that can
 			// last the whole budget would be served and then cut at its end.
+			// It reads no more request from an HTTP/1 connection either
+			// (refuseRecv): on keep-alive connections whose responses queue
+			// in the worker, steady traffic would keep the queues from ever
+			// emptying and the drain would last the whole budget (or, for a
+			// ctx without one, for as long as the clients asked).
 			w.draining = true
 			if !w.h2PoolSettled() {
 				w.stopAccepting(ctx)
@@ -2542,14 +2547,16 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 
 // stopAccepting cancels the accept and closes the listener, once the
 // worker's context is cancelled and it waits for the HTTP/2 stream handlers
-// on the shared worker pool (celeris#759). That wait can last the whole
-// budget, and the worker accepted and served new connections meanwhile,
-// which were then cut at its end; net/http's Shutdown closes its listeners
-// first. What is still in the kernel's accept queue is reset, as the close
-// in shutdown did. Only then, not on every shutdown: the cancel submits the
-// SQ ring and handles its completions, and a shutdown with no HTTP/2 wait
-// goes straight on, leaving the driver conns' queued ops to shutdown
-// (TestDriverShutdownReleasesDescriptors). Idempotent. Worker thread.
+// on the shared worker pool (celeris#759), or, past the first
+// shutdownSendDrainNanos of its send drain (celeris#806). Either wait can
+// last the whole budget, and the worker accepted and served new connections
+// meanwhile, which were then cut at its end; net/http's Shutdown closes its
+// listeners first. What is still in the kernel's accept queue is reset, as
+// the close in shutdown did. Only then, not on every shutdown: the cancel
+// submits the SQ ring and handles its completions, and a shutdown whose
+// send drain is done within its first 250 ms goes straight on, leaving the
+// driver conns' queued ops to shutdown (TestDriverShutdownReleasesDescriptors).
+// Idempotent. Worker thread.
 func (w *Worker) stopAccepting(ctx context.Context) {
 	if w.listenFD < 0 {
 		return
@@ -6684,7 +6691,8 @@ func (w *Worker) noteSendDrainGaveUp(waited int64) {
 }
 
 // pendingSendLoss counts the connections hasPendingSends finds pending and
-// the response bytes they have queued and not yet handed to the kernel. A
+// the response bytes they have queued and the socket has not yet taken (staged
+// in the conn's buffers or in flight in a SEND). A
 // connection whose detachMu is held by a running handler counts as one, its
 // bytes unknown (TryLock, as hasPendingSends).
 func (w *Worker) pendingSendLoss() (conns, queued int) {
