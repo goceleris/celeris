@@ -17,7 +17,8 @@ var ReleaseContext func(c any)
 // of the file it serves from the descriptor that is then served, not from a
 // stat of the path made earlier. c is the
 // *celeris.Context. onOpen runs once the file is open, with its mtime and
-// size, before the response is decided. contentType, when not empty, replaces
+// size, before the response is decided and only for a file that will be sent
+// (not for a 413). contentType, when not empty, replaces
 // the type taken from the extension of the file served (a pre-compressed ".gz"
 // variant is served with the original's type).
 var FileFromDir func(c any, baseDir, userPath, contentType string,

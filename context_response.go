@@ -923,10 +923,10 @@ func (c *Context) File(filePath string) error {
 
 // serveFile is File. contentType, when not empty, replaces the type taken from
 // filePath's extension. onOpen, when not nil, runs once the file is open and
-// its size and mtime are read from the open descriptor, before anything is
-// decided about the response: middleware/static sets its validators from them
-// there, so they describe the bytes that are sent even when the path is
-// replaced meanwhile (celeris#846).
+// its size and mtime are read from the open descriptor, before the response is
+// decided and only for a file that is going to be sent (not for a 413):
+// middleware/static sets its validators from them there, so they describe the
+// bytes that are sent even when the path is replaced meanwhile (celeris#846).
 func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	f, err := os.Open(filePath)
 	if err != nil {
