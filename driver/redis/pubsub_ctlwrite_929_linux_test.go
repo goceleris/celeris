@@ -371,7 +371,7 @@ func TestPubSubReconnectResubscribeRacingCloseKeepsToItsConn929(t *testing.T) {
 	}
 	writerDone := make(chan error, 1)
 	writerDone <- nil // the writer is the reconnect goroutine: nothing to collect
-	closeWhileWriteHeld(t, r.gate, h, func() { _ = ps.Close() }, writerDone)
+	_ = closeWhileWriteHeld(t, r.gate, h, func() { _ = ps.Close() }, writerDone)
 }
 
 // (c) The reconnect replaces the dropped conn: the dropped conn's descriptor
