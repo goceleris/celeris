@@ -611,8 +611,8 @@ const shutdownFDDrainNanos int64 = int64(250 * time.Millisecond)
 // closed anyway, as shutdown always did, and the give-up is counted and
 // logged (handoffLossStats.shutdownDrainGaveUp). A wait the CQ ring being full
 // refuses (EBUSY, ringWaitRetryable) is not a ring error: the drain reaps the
-// ring and waits again, within the same bound (celeris#873). Worker thread only; skipped under
-// SQPOLL (no tier enables it) and without a ring.
+// ring and waits again, within the same bound (celeris#873). Worker thread
+// only; skipped under SQPOLL (no tier enables it) and without a ring.
 //
 // It waits for the ops that name a descriptor, not for SEND_ZC
 // notifications (celeris#798, see fdOps): a stalled peer can hold one for as
