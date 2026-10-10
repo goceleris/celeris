@@ -130,6 +130,12 @@ import (
 //     decided on the identity, so only a change that breaks it can move this.
 //   - zcBufRetained: send buffers worker shutdown kept for the life of the
 //     process, because a SEND_ZC may still read them when the ring closes.
+//
+// And one for the shutdown drain of the ops owed on connection descriptors:
+//
+//   - shutdownDrainGaveUp: worker shutdowns whose drain ended with an op still
+//     owed (its bound ran out or the ring failed), so descriptors were closed
+//     under it (celeris#873). Must stay 0.
 type handoffLossStats struct {
 	staleRecvDataClosed       atomic.Uint64
 	staleRecvDataTransplanted atomic.Uint64
@@ -149,6 +155,7 @@ type handoffLossStats struct {
 	zcNotifHeld               atomic.Uint64
 	zcNotifForced             atomic.Uint64
 	zcBufRetained             atomic.Uint64
+	shutdownDrainGaveUp       atomic.Uint64
 	zcHeldNow                 atomic.Int64
 	zcHeldBytes               atomic.Int64
 }
@@ -167,6 +174,17 @@ func (s *handoffLossStats) noteCloseFDForced() {
 func (s *handoffLossStats) noteCloseCancelMissedHeld() {
 	if s != nil {
 		s.closeCancelMissedHeld.Add(1)
+	}
+}
+
+// noteShutdownDrainGaveUp counts a worker shutdown whose drain of the ops owed
+// on connection descriptors (endOwedOpsAtShutdown) ended with some still owed:
+// its bound ran out or the ring failed (celeris#873). Once per worker
+// shutdown. Must stay 0 on a healthy kernel. Not an EngineMetrics field: the
+// WARN is the signal.
+func (s *handoffLossStats) noteShutdownDrainGaveUp() {
+	if s != nil {
+		s.shutdownDrainGaveUp.Add(1)
 	}
 }
 

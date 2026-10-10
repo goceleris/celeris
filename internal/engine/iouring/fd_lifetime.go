@@ -608,7 +608,10 @@ const shutdownFDDrainNanos int64 = int64(250 * time.Millisecond)
 // holds is submitted by the first enter, which is why this runs before
 // shutdownDrivers closes the driver descriptors. Bounded by
 // shutdownFDDrainNanos; past it (or on a ring error) the descriptors are
-// closed anyway, as shutdown always did. Worker thread only; skipped under
+// closed anyway, as shutdown always did, and the give-up is counted and
+// logged (handoffLossStats.shutdownDrainGaveUp). A wait the CQ ring being full
+// refuses (EBUSY, ringWaitRetryable) is not a ring error: the drain reaps the
+// ring and waits again, within the same bound (celeris#873). Worker thread only; skipped under
 // SQPOLL (no tier enables it) and without a ring.
 //
 // It waits for the ops that name a descriptor, not for SEND_ZC
@@ -650,6 +653,7 @@ func (w *Worker) endOwedOpsAtShutdown() {
 		}
 		return false
 	}
+	var ringErr error
 	if w.ring != nil && !w.sqpoll && pending() {
 		for _, cs := range owed {
 			w.cancelConnOps(cs.fd, cs)
@@ -657,8 +661,18 @@ func (w *Worker) endOwedOpsAtShutdown() {
 		}
 		deadline := time.Now().UnixNano() + shutdownFDDrainNanos
 		for pending() && time.Now().UnixNano() < deadline {
-			if err := w.ring.SubmitAndWaitTimeout(10 * time.Millisecond); err != nil {
-				break
+			if err := shutdownRingWait(w.ring, 10*time.Millisecond); err != nil {
+				if !ringWaitRetryable(err) {
+					ringErr = err
+					break
+				}
+				// The CQ ring is full and the enter would not wait for more
+				// (celeris#873): reap it, below, and enter again. When the
+				// ring holds nothing to reap the overflow list is what is
+				// pending: give the kernel a moment instead of spinning.
+				if h, t := w.ring.BeginCQ(); h == t {
+					time.Sleep(50 * time.Microsecond)
+				}
 			}
 			head, tail := w.ring.BeginCQ()
 			for ; head != tail; head++ {
@@ -695,6 +709,9 @@ func (w *Worker) endOwedOpsAtShutdown() {
 			}
 			w.ring.EndCQ(head)
 		}
+		if pending() {
+			w.noteShutdownDrainGaveUp(owed, ringErr)
+		}
 	}
 	for i := range w.pendingRelease {
 		if e := &w.pendingRelease[i]; e.holdsFD {
@@ -703,4 +720,25 @@ func (w *Worker) endOwedOpsAtShutdown() {
 		}
 	}
 	w.closeFDOwed = 0
+}
+
+// noteShutdownDrainGaveUp records that endOwedOpsAtShutdown ended with ops
+// still owed, because its bound ran out or the ring failed (ringErr): the
+// descriptors are closed with those ops in the kernel, which is the
+// pre-celeris#793 behaviour the drain exists to end. It is counted once per
+// drain and logged (the internal counter, not an EngineMetrics field, as with
+// closeCancelMissedHeld), with how many connections were still owed.
+func (w *Worker) noteShutdownDrainGaveUp(owed []*connState, ringErr error) {
+	w.handoffLoss.noteShutdownDrainGaveUp()
+	if w.logger == nil {
+		return
+	}
+	n := 0
+	for _, cs := range owed {
+		if fdOps(cs) > 0 {
+			n++
+		}
+	}
+	w.logger.Warn("io_uring shutdown: the ops owed on connection descriptors did not end before the descriptors were closed",
+		"worker", w.id, "conns_owed", n, "ring_err", ringErr, "bound", time.Duration(shutdownFDDrainNanos))
 }
