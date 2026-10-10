@@ -432,7 +432,9 @@ func (s *Stream) UseUnlock() { s.mu.RUnlock() }
 // puts the object in the pool a second time, and two later streams, on any
 // connections, then share it (celeris#947, celeris#950). For a stream a pool
 // handler runs on, who releases it is decided under its Manager's lock
-// (Manager.takeLocked, Manager.handOffBuffered).
+// (Manager.takeLocked, Manager.handOffBuffered), and it is always the event
+// loop that does (Manager.retire), never the handler's goroutine: the loop may
+// hold the *Stream from a lookup (celeris#951).
 func (s *Stream) Release() {
 	if !s.h1Mode {
 		s.Cancel()
@@ -472,13 +474,26 @@ func (s *Stream) resetAndPool() {
 	streamPool.Put(s)
 }
 
+// resetRequestLocked drops what a Context reads of the request: its headers,
+// trailers and body view. s.mu is held. A pool handler's stream gets this when
+// the handler returns (Manager.retire), though the object is reset and pooled
+// only later, by the event loop (celeris#951).
+func (s *Stream) resetRequestLocked() {
+	s.rawBody = nil
+	clear(s.hdrBuf[:])
+	s.Headers = s.hdrBuf[:0]
+	s.Trailers = s.Trailers[:cap(s.Trailers)]
+	clear(s.Trailers)
+	s.Trailers = s.Trailers[:0]
+}
+
 func (s *Stream) resetLocked() {
 	if s.Data != nil {
 		s.Data.Reset()
 		bufferPool.Put(s.Data)
 		s.Data = nil
 	}
-	s.rawBody = nil
+	s.resetRequestLocked()
 	if s.OutboundBuffer != nil {
 		// What is still buffered is dropped with the stream: give it back
 		// to the connection's budget (celeris#893).
@@ -492,11 +507,6 @@ func (s *Stream) resetLocked() {
 	s.ID = 0
 	s.state.Store(0)
 	s.manager = nil
-	clear(s.hdrBuf[:])
-	s.Headers = s.hdrBuf[:0]
-	s.Trailers = s.Trailers[:cap(s.Trailers)]
-	clear(s.Trailers)
-	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.outboundAbandoned = false
 	s.headersSent.Store(false)
@@ -769,8 +779,10 @@ func (s *Stream) ForEachHeader(fn func(name, value string)) {
 // SetState sets the stream state and atomically updates the manager's active count.
 func (s *Stream) SetState(state State) {
 	prev := State(s.state.Swap(int32(state)))
-	if s.manager != nil {
-		s.manager.updateActiveCount(prev, state)
+	// One read: a release sets the field to nil, and a second read after the
+	// nil check would then dereference it (celeris#951).
+	if m := s.manager; m != nil {
+		m.updateActiveCount(prev, state)
 	}
 }
 

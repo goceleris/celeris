@@ -34,10 +34,12 @@ package std
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -65,11 +67,20 @@ import (
 // The connection is thereby served under the engine's own Config limits
 // (ReadTimeout, WriteTimeout, MaxHeaderBytes) and, since h2s.IdleTimeout is
 // copied from the server by ConfigureServer, IdleTimeout, which an h2c
-// connection used to be exempt from. Detection, the 500 on a failed upgrade and the handling of the upgrade
-// request's body are unchanged.
+// connection used to be exempt from. Detection and the 500 on a failed
+// upgrade are unchanged. The body of an upgrade request is read as before,
+// into memory before the connection is taken over, but no further than
+// MaxRequestBodySize (celeris#976).
 type h2cHandler struct {
 	next http.Handler
 	h2s  *http2.Server //nolint:staticcheck // SA1019: the type ServeConn is a method of; see the import comment in engine.go.
+	// maxBody is Config.MaxRequestBodySize, which bounds the body of an
+	// upgrade request as it bounds every other (celeris#976); 0 = unlimited.
+	maxBody int64
+	// bodyRefused counts an upgrade request refused for its body as Bridge
+	// counts a body it refuses: a request and a request-body error (may be
+	// nil).
+	bodyRefused func()
 }
 
 func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -90,17 +101,41 @@ func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Upgrade to h2c (RFC 7540 3.2).
 	if isH2CUpgrade(r.Header) {
-		conn, settings, err := h2cUpgrade(w, r)
+		conn, settings, err := h2cUpgrade(w, r, h.maxBody)
 		if err != nil {
+			if errors.Is(err, errH2CUpgradeBodyTooLarge) {
+				// The connection is not taken over: refuse as Bridge does
+				// a body over the limit (celeris#976). Close it after the
+				// answer, as the rest of the body is unread.
+				if h.bodyRefused != nil {
+					h.bodyRefused()
+				}
+				w.Header().Set("Connection", "close")
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		defer func() { _ = conn.Close() }()
+		// The upgrade request is stream 1 but keeps its HTTP/1 context, which
+		// the stream's RST_STREAM does not cancel; give it one that the
+		// watcher cancels when the client resets stream 1 (celeris#949).
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		conn = newH2CStream1Watch(conn, cancel)
+		// x/net's legacy server (-tags http2legacy) passes the upgrade request
+		// on as the HTTP/1 request it came in as, so it is marked HTTP/2 here:
+		// the bridge then serves it on an HTTP/2 stream (c.Protocol() "2", the
+		// drain gate, the stream's cancel). net/http's go1.27 server rebuilds
+		// it as HTTP/2 itself, so that build is unchanged (celeris#949).
+		ur := r.WithContext(ctx)
+		ur.Proto, ur.ProtoMajor, ur.ProtoMinor = "HTTP/2.0", 2, 0
 		h.h2s.ServeConn(conn, &http2.ServeConnOpts{ //nolint:staticcheck // SA1019: see the import comment in engine.go.
 			Context:        r.Context(),
 			Handler:        h.next,
 			BaseConfig:     h2cBaseConfig(r),
-			UpgradeRequest: r,
+			UpgradeRequest: ur,
 			Settings:       settings,
 		})
 		return
@@ -129,16 +164,38 @@ func h2cPriorKnowledge(w http.ResponseWriter) (net.Conn, error) {
 	return nil, errors.New("h2c: invalid client preface")
 }
 
+// errH2CUpgradeBodyTooLarge is h2cUpgrade's error for an upgrade request whose
+// body is over Config.MaxRequestBodySize.
+var errH2CUpgradeBodyTooLarge = errors.New("h2c: upgrade request body over MaxRequestBodySize")
+
 // h2cUpgrade answers an HTTP/1.1 upgrade request with 101 and hijacks the
 // connection (RFC 7540 3.2); settings is the decoded HTTP2-Settings header.
-func h2cUpgrade(w http.ResponseWriter, r *http.Request) (_ net.Conn, settings []byte, err error) {
+// maxBody is the largest request body it buffers (0 = no limit): a larger one
+// is errH2CUpgradeBodyTooLarge, with the connection not taken over (celeris#976).
+func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Conn, settings []byte, err error) {
 	settings, err = h2cSettings(r.Header)
 	if err != nil {
 		return nil, nil, err
 	}
 	// The request is served as stream 1, body included: read it before the
-	// connection is taken over.
-	body, err := io.ReadAll(r.Body)
+	// connection is taken over, but no further than the limit that applies
+	// to every request body (Bridge.ServeHTTP reads the same way: one byte
+	// past the limit tells "over" from "exactly at"). It used to read all of
+	// it, so a client could make the server buffer a body of any size
+	// before MaxRequestBodySize was looked at (celeris#976).
+	var body []byte
+	if maxBody > 0 {
+		limit := maxBody
+		if limit < math.MaxInt64 { // maxBody+1 wraps for MaxInt64
+			limit++
+		}
+		body, err = io.ReadAll(io.LimitReader(r.Body, limit))
+		if err == nil && int64(len(body)) > maxBody {
+			return nil, nil, errH2CUpgradeBodyTooLarge
+		}
+	} else {
+		body, err = io.ReadAll(r.Body)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

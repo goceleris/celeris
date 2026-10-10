@@ -420,8 +420,12 @@ func (c *Context) IsAborted() bool {
 
 // Context returns the request's context.Context. The returned context is
 // always non-nil; it defaults to the stream's context. On HTTP/2 that context
-// is cancelled with the stream, and it stays cancelled after the request is
-// over: the stream is pooled, its context is not (celeris#836).
+// is cancelled with the stream (the client resets it or goes away, on every
+// engine, std included), and it stays cancelled after the request is over: the
+// stream is pooled, its context is not (celeris#836). On HTTP/1 it is
+// context.Background() on every engine: an HTTP/1 client that disconnects does
+// not cancel it. [ToHandler] is the exception: there it ends with the
+// request's context (r.Context()), on HTTP/1 as well.
 func (c *Context) Context() context.Context {
 	if c.ctx != nil {
 		return c.ctx
