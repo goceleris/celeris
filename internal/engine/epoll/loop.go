@@ -2313,6 +2313,9 @@ func (l *Loop) initProtocol(cs *connState) {
 				cs.asyncInMu.Lock()
 				cs.asyncDetachUnlocked = true
 				cs.asyncInMu.Unlock()
+				if f := detachWindowHook.Load(); f != nil {
+					(*f)() // test seam, celeris#844 item 2
+				}
 			}
 			// Async mode: enqueue cs so drainDetachQueue picks up the
 			// deferred bookkeeping (asyncDetachPending). The first

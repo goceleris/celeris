@@ -76,6 +76,9 @@ func (l *Loop) askAtPark(cs *connState) {
 // skips the drain, and is woken again by the Signal that follows — the entry
 // cannot be missed, only deferred by one iteration.
 func (l *Loop) askTransplant(cs *connState) {
+	if f := parkWindowHook.Load(); f != nil {
+		(*f)() // test seam, celeris#844 item 1: before any lock of its own
+	}
 	l.xferAskMu.Lock()
 	l.xferAskQ = append(l.xferAskQ, cs)
 	l.xferAskPending.Add(1)
