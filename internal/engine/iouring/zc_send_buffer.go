@@ -275,9 +275,9 @@ var zcRetained struct {
 // (liveZCOwed), of one queued for release (closedZCOwed) or held past the
 // backstop (zcHolds), goes into zcRetained, which is never freed, and is
 // counted (ShutdownZCBufRetained). No wait is added for them: the run loop's
-// send drain (shutdownSendDrainNanos) already gave the live connections'
-// sends their time, and a notification owed to a stalled peer can take
-// minutes. Only when there is something to keep does it first take what the
+// send drain (bounded by the shutdown's budget, celeris#806) already gave
+// the live connections' sends their time, and a notification owed to a
+// stalled peer can take minutes. Only when there is something to keep does it first take what the
 // kernel has already completed: an enter that submits nothing
 // (shutdownDrivers closed the driver descriptors on the promise that nothing
 // is submitted after it) and waits at most zcShutdownFlushWait, which also

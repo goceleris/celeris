@@ -454,7 +454,18 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	<-ctx.Done()
 	// Workers use SubmitAndWaitTimeout and check ctx.Err() on each iteration,
-	// so they will exit within ~100ms of context cancellation.
+	// so they will exit within ~100ms of context cancellation. Except the one
+	// that is waiting for SEND completions without a timeout (the loop's
+	// mode 3a), which a peer that does not read never gives: it is woken, once
+	// the workers' own context is cancelled (innerCancel; ctx's reaches it
+	// through a goroutine of its own, and a wake that came before it would find
+	// the context live and go back to the wait), through the wake eventfd whose
+	// POLL_ADD the loop keeps armed in every mode. From the next iteration on
+	// every wait is bounded (Worker.draining; celeris#806).
+	innerCancel()
+	for _, w := range workers {
+		w.wakeFD.Signal()
+	}
 	wg.Wait()
 	return nil
 }

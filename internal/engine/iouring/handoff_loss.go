@@ -130,6 +130,15 @@ import (
 //     decided on the identity, so only a change that breaks it can move this.
 //   - zcBufRetained: send buffers worker shutdown kept for the life of the
 //     process, because a SEND_ZC may still read them when the ring closes.
+//
+// And one for the shutdown drain of the ops owed on connection descriptors:
+//
+//   - shutdownDrainGaveUp: worker shutdowns whose drain ended with an op still
+//     owed (its bound ran out or the ring failed), so descriptors were closed
+//     under it (celeris#873). Must stay 0.
+//   - shutdownSendDrainGaveUp: worker shutdowns whose send drain ended at its
+//     bound with response bytes still unsent, so connections were closed on
+//     them (celeris#806). A rate: it needs a client that does not read.
 type handoffLossStats struct {
 	staleRecvDataClosed       atomic.Uint64
 	staleRecvDataTransplanted atomic.Uint64
@@ -149,6 +158,8 @@ type handoffLossStats struct {
 	zcNotifHeld               atomic.Uint64
 	zcNotifForced             atomic.Uint64
 	zcBufRetained             atomic.Uint64
+	shutdownDrainGaveUp       atomic.Uint64
+	shutdownSendDrainGaveUp   atomic.Uint64
 	zcHeldNow                 atomic.Int64
 	zcHeldBytes               atomic.Int64
 }
@@ -167,6 +178,28 @@ func (s *handoffLossStats) noteCloseFDForced() {
 func (s *handoffLossStats) noteCloseCancelMissedHeld() {
 	if s != nil {
 		s.closeCancelMissedHeld.Add(1)
+	}
+}
+
+// noteShutdownDrainGaveUp counts a worker shutdown whose drain of the ops owed
+// on connection descriptors (endOwedOpsAtShutdown) ended with some still owed:
+// its bound ran out or the ring failed (celeris#873). Once per worker
+// shutdown. Must stay 0 on a healthy kernel. Not an EngineMetrics field: the
+// WARN is the signal.
+func (s *handoffLossStats) noteShutdownDrainGaveUp() {
+	if s != nil {
+		s.shutdownDrainGaveUp.Add(1)
+	}
+}
+
+// noteShutdownSendDrainGaveUp counts a worker shutdown whose send drain ended
+// at its bound with response bytes still queued or in flight, which the close
+// that follows cuts (celeris#806). Once per worker shutdown; a rate with a
+// client that does not read. Not an EngineMetrics field: the WARN is the
+// signal.
+func (s *handoffLossStats) noteShutdownSendDrainGaveUp() {
+	if s != nil {
+		s.shutdownSendDrainGaveUp.Add(1)
 	}
 }
 
