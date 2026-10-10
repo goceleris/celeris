@@ -31,8 +31,10 @@ const (
 	// maxPendingBytesH2 is the limit for an HTTP/2 connection. Its DATA is
 	// already bounded by the flow-control windows the peer grants (what the
 	// windows refuse waits in the streams' buffers, bounded per connection by
-	// stream.OutboundBudget, celeris#893; a StreamWriter response's is not
-	// yet, celeris#904), and a
+	// stream.OutboundBudget, celeris#893; a StreamWriter on the worker pool
+	// waits for the window instead of queueing past it, and one on the event
+	// loop buffers what the window refuses on its stream, charged to that
+	// budget but not refused by it, celeris#904), and a
 	// peer that reads keeps up to a window of frames queued behind the
 	// socket as a matter of course (net/http's client grants 4 MiB per
 	// stream, browsers more per connection), so the H1 limit refused, and
@@ -110,7 +112,8 @@ type connState struct {
 	detected bool            // 1 byte
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
 	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
-	_        [4]byte         // padding to 8-byte alignment
+	detectN  uint8           // 1 byte: bytes at the head of buf received but too few to detect on, under detect.PrefaceLen (celeris#870); 0 once detected
+	_        [3]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
@@ -352,6 +355,7 @@ func releaseConnState(cs *connState) {
 	cs.dirtyPrev = nil
 	cs.protocol = 0
 	cs.detected = false
+	cs.detectN = 0
 	cs.dirty = false
 	cs.epollOut = false
 	cs.pendingBytes = 0

@@ -114,6 +114,10 @@ type Engine struct {
 	cooldownFreezes atomic.Int32  // post-switch cooldown timers currently holding the freeze
 	switchRejected  atomic.Uint64 // telemetry: how many switches were blocked by driver FDs
 
+	// listenWait counts what performSwitch's wait for the incoming engine's
+	// listener did (celeris#683, listenwait.go).
+	listenWait listenWaitCounters
+
 	// switchesTotal is the monotonic count of SUCCESSFUL epoll⇄io_uring
 	// switches (committed via active.Store). Rejected switches (driver FDs
 	// live, aborted lazy build) never increment it. Surfaced on Metrics as
@@ -916,6 +920,9 @@ func (e *Engine) performSwitch() {
 	if src, ok := newActive.(interface{ StopTransplant() }); ok {
 		src.StopTransplant()
 	}
+	// celeris#683: list the port's listeners before the resume, so that
+	// the wait below can tell the incoming engine's new one from them.
+	watch := e.watchIncomingListener(newActive, newStandby, freshlyBuilt)
 	if ac, ok := newActive.(engine.AcceptController); ok {
 		_ = ac.ResumeAccept()
 	}
@@ -930,6 +937,12 @@ func (e *Engine) performSwitch() {
 	// Active has been committed — release freezeState so concurrent
 	// driver acquireDriverFD calls observe the new active and proceed.
 	e.freezeState.Unlock()
+
+	// celeris#683: the resume above returns before the incoming engine's loops
+	// have listened. Where the outgoing engine's pause closes its listeners
+	// at once, wait for the incoming engine's first, so the port is never left
+	// with none. Bounded, and not under freezeState.
+	e.awaitIncomingListener(watch)
 
 	// Pause the old active, and do not wait for it (celeris#662). The
 	// sub-engine lingers for about 1.5 s with TCP_DEFER_ACCEPT cleared,
