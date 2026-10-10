@@ -158,7 +158,17 @@ type connState struct {
 	// split across packets) would lose its earlier bytes (v1.5.0 review
 	// 2.8). Empty/nil once cs.detected is set; only the slow split-preface
 	// path ever allocates it.
+	//
+	// It holds fewer than detect.PrefaceLen bytes while detection waits (the
+	// recv that decides adds the rest), and the conn is closed when the bytes
+	// are not a protocol the engine serves (celeris#974).
 	detectAccum []byte // 24
+	// detectDeadline is the absolute time (UnixNano) by which the protocol
+	// must be detected: accept time + ReadHeaderTimeout, 0 for none (the
+	// protocol is fixed at accept, or ReadHeaderTimeout is off). Not extended
+	// by a recv, so a client that dribbles the preface cannot move it.
+	// checkTimeouts closes an undetected conn past it (celeris#974).
+	detectDeadline int64 // 8
 	// bodyRecvPin retains the H1State.bodyBuf backing array while a
 	// single-shot recv has been armed directly into it (pickRecvTarget's
 	// recvIntoBody path). conn.CloseH1 nils H1State.bodyBuf on close, which
@@ -628,6 +638,7 @@ func releaseConnState(cs *connState) {
 	// writing into the pinned bodyBuf array (#256 body-buffer UAF guard).
 	cs.bodyRecvPin = nil
 	cs.detectAccum = cs.detectAccum[:0]
+	cs.detectDeadline = 0
 	// kernelInflight is zero on every normal release (drainPendingRelease
 	// gates on it); reset for the wall-clock-backstop path, where the worker
 	// gave up waiting on a CQE the kernel never produced, and for the
