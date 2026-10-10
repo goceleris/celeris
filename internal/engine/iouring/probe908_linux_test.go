@@ -69,7 +69,7 @@ func (p *probe908T) snap(label string) {
 	p.t.Logf("PROBE908 test t=+%s read=%d [%s]\n  client: %s", time.Since(p.start).Round(time.Millisecond), p.read, label, p.clientSnap())
 	if p.srvFD >= 0 {
 		p.t.Logf("  server: %s", probe908SockSnap(p.srvFD, p.client.LocalAddr().String()))
-		if eng := probe908Ask(label, 3*time.Second); eng != "" {
+		if eng := probe908Ask(label, p.client.LocalAddr().String(), 3*time.Second); eng != "" {
 			p.t.Logf("  %s", strings.ReplaceAll(eng, "\n", "\n  "))
 		}
 	}

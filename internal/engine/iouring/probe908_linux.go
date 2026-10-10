@@ -112,18 +112,23 @@ func (h *probe908HubT) remove(p *probe908State) {
 // worker through its eventfd, and returns what they answered, or says which
 // did not answer within d. Safe from any goroutine. Empty when the probe is
 // off.
-func probe908Ask(label string, d time.Duration) string {
+func probe908Ask(label, peer string, d time.Duration) string {
 	if !probe908On {
 		return ""
 	}
 	h := &probe908Hub
 	h.mu.Lock()
-	act := append([]*probe908State(nil), h.active...)
+	var act []*probe908State
+	for _, p := range h.active {
+		if p.peer == peer && !p.done.Load() { // only the conn this test adopted, never a leftover of an earlier test
+			act = append(act, p)
+		}
+	}
 	h.label = label
 	seq := h.seq.Add(1)
 	h.mu.Unlock()
 	if len(act) == 0 {
-		return "engine: no live probed conn (not adopted yet, or already gone from the conn table)"
+		return "engine: no live probed conn for peer " + peer + " (not adopted yet, or already gone from the conn table)"
 	}
 	if probe908Wake {
 		for _, p := range act {
@@ -142,11 +147,19 @@ func probe908Ask(label string, d time.Duration) string {
 				break
 			}
 			if p.done.Load() {
-				out = append(out, fmt.Sprintf("engine w=%d fd=%d: probe ended before it answered (conn gone)", p.w.id, p.fd))
+				out = append(out, fmt.Sprintf("engine peer=%s w=%d fd=%d: probe ended before it answered (conn gone)", p.peer, p.w.id, p.fd))
 				break
 			}
 			if time.Now().After(deadline) {
-				out = append(out, fmt.Sprintf("engine w=%d fd=%d: WORKER DID NOT ANSWER in %s (woke=%v): the worker thread did not run a loop pass, itself a finding", p.w.id, p.fd, d, probe908Wake))
+				state := "running (not in a ring wait)"
+				if since := p.inWaitSince.Load(); since != 0 {
+					m := "?"
+					if mp := p.waitModeA.Load(); mp != nil {
+						m = *mp
+					}
+					state = fmt.Sprintf("parked in a ring wait of mode [%s] for %s without returning", m, time.Since(time.Unix(0, since)).Round(time.Millisecond))
+				}
+				out = append(out, fmt.Sprintf("engine peer=%s w=%d fd=%d: WORKER DID NOT ANSWER in %s (woke=%v): it is %s; ring(atomic): %s", p.peer, p.w.id, p.fd, d, probe908Wake, state, p.w.ring.probe908Counters()))
 				break
 			}
 			if probe908Wake {
@@ -162,15 +175,21 @@ func probe908Ask(label string, d time.Duration) string {
 // only" are touched by the worker alone; done is the one the helper goroutine
 // shares.
 type probe908State struct {
-	w      *Worker
-	cs     *connState
-	fd     int
-	gen    uint32
-	peer   string // client's address, the join key
-	t0     time.Time
-	done   atomic.Bool
-	reqMu  sync.Mutex
-	replyN map[uint64]string // seq -> engine snapshot text
+	w    *Worker
+	cs   *connState
+	fd   int
+	gen  uint32
+	peer string // client's address, the join key
+	t0   time.Time
+	done atomic.Bool
+	// inWaitSince/waitModeA let a goroutine other than the worker say what the
+	// worker is doing when it does not answer: the UnixNano at which it entered
+	// the ring wait it has not returned from yet (0 when it is running), and
+	// that wait's mode (a constant string, no allocation).
+	inWaitSince atomic.Int64
+	waitModeA   atomic.Pointer[string]
+	reqMu       sync.Mutex
+	replyN      map[uint64]string // seq -> engine snapshot text
 
 	// worker thread only
 	nCQE        uint64
@@ -195,7 +214,7 @@ func (p *probe908State) ts() string {
 }
 
 func (p *probe908State) logf(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "PROBE908 w=%d fd=%d %s %s\n", p.w.id, p.fd, p.ts(), fmt.Sprintf(format, a...))
+	fmt.Fprintf(os.Stderr, "PROBE908 peer=%s w=%d fd=%d %s %s\n", p.peer, p.w.id, p.fd, p.ts(), fmt.Sprintf(format, a...))
 }
 
 // is reports whether cs is the probed conn.
@@ -296,7 +315,7 @@ func (w *Worker) probe908Adopt(cs *connState, fd int, carry engine.Carryover) {
 	_ = unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rl)
 	p.logf("ADOPT gen=%d carried=%d peer=%s async=%v bufRing=%v fixedFiles=%v sqpoll=%v sendZC=%v zcHoldBytes=%d memlock_cur=%d memlock_max=%d wake=%v workers_conns=%d tcp_wmem=%q tcp_rmem=%q",
 		cs.generation, len(carry.Buffered), carry.RemoteAddr, w.async, w.bufRing != nil, w.fixedFiles, w.sqpoll, w.sendZC, w.zcHoldBytes,
-		rl.Cur, rl.Max, probe908Wake, w.connCount, probe908Proc("/sys/net/ipv4/tcp_wmem"), probe908Proc("/sys/net/ipv4/tcp_rmem"))
+		rl.Cur, rl.Max, probe908Wake, w.connCount, probe908Proc("/proc/sys/net/ipv4/tcp_wmem"), probe908Proc("/proc/sys/net/ipv4/tcp_rmem"))
 	p.logf("ADOPT state: %s | ring: %s", p.sendState(cs), p.ringState())
 	go p.helper()
 }
@@ -358,10 +377,12 @@ func (p *probe908State) cqePre(c *completionEntry) {
 	p.preState = p.sendState(cs)
 	p.curHead = fmt.Sprintf("CQE#%d %s res=%d flags=%#x[%s] ZC=%v", p.curSeq, kind, c.Res, c.Flags, probe908Flags(c.Flags), kind != "RECV" && (cs.sendIsZC || cqeIsNotif(c.Flags)) && op == udSend)
 	if p.curEmit {
-		// NOTIF res: the kernel reports IORING_NOTIF_USAGE_ZC_COPIED (1<<31) there when it copied.
+		// NOTIF res: the kernel fills IORING_NOTIF_USAGE_ZC_COPIED (1<<31) only for a SEND_ZC armed
+		// with IORING_SEND_ZC_REPORT_USAGE. The engine's prepSendZC does not set it (only the startup
+		// probe does), so res=0 here means "usage not requested", never "really zero-copy".
 		extra := ""
 		if op == udSend && cqeIsNotif(c.Flags) {
-			extra = fmt.Sprintf(" notif_res=%#x(ZC_COPIED=%v)", uint32(c.Res), uint32(c.Res)&(1<<31) != 0)
+			extra = fmt.Sprintf(" notif_res=%#x(usage=not-requested: the engine sets no REPORT_USAGE; bit31=%v)", uint32(c.Res), uint32(c.Res)&(1<<31) != 0)
 		}
 		p.logf("%s%s PRE: %s", p.curHead, extra, p.preState)
 	}
@@ -448,6 +469,8 @@ func (w *Worker) probe908PreWait() {
 	}
 	p.waitStart = time.Now()
 	p.waitMode = mode
+	p.waitModeA.Store(&mode)
+	p.inWaitSince.Store(p.waitStart.UnixNano())
 	p.nWait++
 	now := time.Now()
 	p.waitLog = p.nWait <= probe908WaitFirst || p.nWait%probe908EveryN == 0 || strings.HasPrefix(mode, "3a") ||
@@ -465,6 +488,7 @@ func (w *Worker) probe908PostWait(h, t uint32) {
 	if p == nil || p.done.Load() || p.waitStart.IsZero() {
 		return
 	}
+	p.inWaitSince.Store(0)
 	d := time.Since(p.waitStart)
 	if p.waitLog || d >= 100*time.Millisecond {
 		p.logf("WAIT#%d post: waited=%s mode=%s cqeBatch=%d | %s", p.nWait, d.Round(time.Microsecond), p.waitMode, t-h, p.ringState())
@@ -502,8 +526,8 @@ func (w *Worker) probe908Tick() {
 		probe908Hub.mu.Lock()
 		label := probe908Hub.label
 		probe908Hub.mu.Unlock()
-		txt := fmt.Sprintf("engine w=%d fd=%d stalled=%v nCQE=%d | %s | %s | zcHoldBytes=%d draining=%v",
-			p.w.id, p.fd, p.stalled, p.nCQE, p.sendState(p.cs), p.ringState(), p.w.zcHoldBytes, p.w.draining)
+		txt := fmt.Sprintf("engine peer=%s w=%d fd=%d stalled=%v nCQE=%d | %s | %s | zcHoldBytes=%d draining=%v",
+			p.peer, p.w.id, p.fd, p.stalled, p.nCQE, p.sendState(p.cs), p.ringState(), p.w.zcHoldBytes, p.w.draining)
 		p.logf("REQ#%d %q answered: %s", seq, label, txt)
 		p.reqMu.Lock()
 		p.replyN[seq] = txt
@@ -529,9 +553,10 @@ func (p *probe908State) helper() {
 		n++
 		if n <= 8 || n%4 == 0 {
 			snap := probe908SockSnap(p.fd, p.peer)
-			fmt.Fprintf(os.Stderr, "PROBE908 w=%d fd=%d %s SOCK server %s | ring(atomic, no wake): %s\n", p.w.id, p.fd, p.ts(), snap, p.w.ring.probe908Counters())
+			fmt.Fprintf(os.Stderr, "PROBE908 peer=%s w=%d fd=%d %s SOCK server %s | ring(atomic, no wake): %s\n", p.peer, p.w.id, p.fd, p.ts(), snap, p.w.ring.probe908Counters())
 			if strings.HasPrefix(snap, "fd ") || strings.HasPrefix(snap, "getpeername") {
-				return // the descriptor is closed or reused: nothing left to look at
+				p.done.Store(true) // the descriptor is closed or reused: nothing left to look at
+				return
 			}
 		}
 	}
@@ -640,6 +665,11 @@ func (w *Worker) probe908ReplayFlush(cs *connState, where string) bool {
 // any goroutine: cq_head<cq_tail with the worker silent is a completion nobody
 // consumed; sq_unconsumed>0 is an SQE the kernel was never asked to take.
 func (r *Ring) probe908Counters() string {
+	r.probe908Mu.RLock()
+	defer r.probe908Mu.RUnlock()
+	if r.probe908Gone {
+		return "ring closed"
+	}
 	sqT := atomic.LoadUint32((*uint32)(r.sqTail))
 	sqH := atomic.LoadUint32((*uint32)(r.sqHead))
 	cqH := atomic.LoadUint32((*uint32)(r.cqHead))

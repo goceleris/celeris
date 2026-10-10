@@ -5,6 +5,7 @@ package iouring
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -144,6 +145,13 @@ type Ring struct {
 	cqHead       unsafe.Pointer
 	cqTail       unsafe.Pointer
 	cqesBase     unsafe.Pointer
+
+	// probe908Mu/probe908Gone (celeris#988 probe, not for merge): the probe's
+	// helper goroutine reads the shared ring indexes; Close marks the ring
+	// gone under the write lock before it unmaps, so a late read is refused
+	// instead of faulting.
+	probe908Mu   sync.RWMutex
+	probe908Gone bool
 }
 
 // NewRing creates a new io_uring instance. sqPollIdle sets the kernel
@@ -589,6 +597,9 @@ func (r *Ring) UnregisterPbufRing(groupID uint16) error {
 
 // Close closes the ring and unmaps memory.
 func (r *Ring) Close() error {
+	r.probe908Mu.Lock()
+	r.probe908Gone = true
+	r.probe908Mu.Unlock()
 	if r.sqes != nil {
 		_ = unix.Munmap(r.sqes)
 	}
