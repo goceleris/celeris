@@ -69,6 +69,7 @@ const (
 	arm844DetachPanic     = "detach-window"    // window 2: the panic propagates to the abort
 	arm844DetachRecovered = "detach-recovered" // window 2: the handler recovers it, as the router does
 	arm844Headers         = "headers-log"      // window 3: the panic value is the stream's own header slice
+	arm844Hold            = "hold"             // item 4: the handler waits to be released, then panics or exits
 )
 
 type h844 struct {
@@ -82,6 +83,12 @@ type h844 struct {
 	routeFire  atomic.Int64 // RouteAsync panics injected
 	hookFire   atomic.Int64 // hook panics injected
 	startDrain atomic.Pointer[func()]
+
+	// arm844Hold: the handler announces itself on entered, waits for release,
+	// then ends as how says ("panic" or "goexit").
+	how     string
+	entered chan string
+	release chan struct{}
 }
 
 func (h *h844) body(ctx context.Context, s *stream.Stream, what string) error {
@@ -115,6 +122,14 @@ func (h *h844) HandleStream(ctx context.Context, s *stream.Stream) error {
 		s.OnDetach() // panics inside the window when injected, and the panic propagates
 		h.detaches.Add(1)
 		return h.body(ctx, s, "w=")
+	case arm844Hold:
+		id, _ := ctxkit.WorkerIDFrom(ctx)
+		h.entered <- "w=" + strconv.Itoa(id)
+		<-h.release
+		if h.how == "goexit" {
+			runtime.Goexit()
+		}
+		panic("celeris844: handler panic after hold")
 	case arm844Headers:
 		panic(s.Headers) // shares the stream's hdrBuf, which CloseH1 zeroes
 	case arm844DetachRecovered:
@@ -702,4 +717,93 @@ func TestAbortLogsAPanicValueThatSharesStreamMemory844(t *testing.T) {
 		t.Errorf("celeris#844 item 3: the slog handler formatted the panic value after the conn was torn down and got %q: "+
 			"the request header %q was zeroed under it (CloseH1 released the stream while the abort still logged)", text, canary844)
 	}
+}
+
+// Item 4: the engine's context is cancelled while the handlers run. Shutdown
+// phase 1 takes each async conn's detachMu and so waits for the handler; the
+// handler then panics or calls runtime.Goexit, and the abort must release the
+// lock for shutdown to go on (celeris#840 handles this; nothing pinned it).
+// The wait for "shutdown is blocked on the lock" is a condition on the
+// stacks, not a sleep.
+
+func shutdownBlocked844() (blocked int, stacks []string) {
+	buf := make([]byte, 16<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "/engine/"+pkgDir844+".") && strings.Contains(g, ".shutdown(") &&
+			strings.Contains(g, "sync.(*Mutex).Lock") {
+			blocked++
+			stacks = append(stacks, g)
+		}
+	}
+	return blocked, stacks
+}
+
+func runCancelWhileHandlerRuns844(t *testing.T, how string) {
+	h := &h844{mode: arm844Hold, how: how, entered: make(chan string, 16), release: make(chan struct{})}
+	r := start844(t, h, nil)
+	var once sync.Once
+	rel := func() { once.Do(func() { close(h.release) }) }
+	t.Cleanup(rel)
+	r.place()
+	for _, id := range r.ids {
+		if _, err := fmt.Fprintf(r.boom[id].c, "GET /f HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+			t.Fatalf("write /f: %v", err)
+		}
+	}
+	for range r.ids {
+		select {
+		case <-h.entered:
+		case <-time.After(budget844):
+			t.Fatalf("PREMISE: only some of the %d /f handlers started within %v", len(r.ids), budget844)
+		}
+	}
+	r.cancel()
+	blocked, stacks := 0, []string(nil)
+	for deadline := time.Now().Add(budget844); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if blocked, stacks = shutdownBlocked844(); blocked >= r.workers {
+			break
+		}
+	}
+	early := false
+	select {
+	case <-r.done:
+		early = true
+	default:
+	}
+	rel()
+	stopped := early
+	if !early {
+		select {
+		case <-r.done:
+			stopped = true
+		case <-time.After(settle844):
+		}
+	}
+	after := take844()
+	t.Logf("celeris844 RESULT engine=%s tier=%s arm=cancel-%s workers=%d shutdown_blocked_on_detachMu=%d stopped_before_release=%v "+
+		"stopped=%v log_panics=%d stuck_in_abort=%d dispatch_goroutines=%d goroutines=%d->%d",
+		engineName844, tier844(r.e), how, r.workers, blocked, early, stopped, r.logs.panics.Load(),
+		after.stuckAbort, after.dispatch, r.base.total, after.total)
+	if early || blocked < r.workers {
+		for _, g := range stacks {
+			t.Logf("celeris844 shutdown stack\n%s", g)
+		}
+		t.Fatalf("PREMISE: with every handler running, shutdown was blocked on a lock in %d of %d workers (Listen returned early: %v)",
+			blocked, r.workers, early)
+	}
+	if !stopped {
+		t.Errorf("celeris#844: Listen did not return within %v after the handlers (%s) ended: shutdown stays blocked "+
+			"on a detachMu the abort did not release", settle844, how)
+	}
+	if after.stuckAbort != 0 {
+		t.Errorf("celeris#844: %d goroutines are blocked in abortAsyncHandler on a lock", after.stuckAbort)
+	}
+}
+
+func TestShutdownWaitingOnAHandlerThatPanics844(t *testing.T) {
+	runCancelWhileHandlerRuns844(t, "panic")
+}
+func TestShutdownWaitingOnAHandlerThatGoexits844(t *testing.T) {
+	runCancelWhileHandlerRuns844(t, "goexit")
 }
