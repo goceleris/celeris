@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -81,11 +82,25 @@ var (
 // owns: what a source engine hands to AdoptConn after it has detached it.
 func adoptable543(t *testing.T) (net.Conn, int) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// celeris#988 probe: CELERIS_PROBE_988_PLAINTCP=1 pins a plain TCP
+	// listener (Go >= 1.24 listens MPTCP by default where the kernel has it).
+	var lc net.ListenConfig
+	if os.Getenv("CELERIS_PROBE_988_PLAINTCP") == "1" {
+		lc.SetMultipathTCP(false)
+	}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	defer func() { _ = ln.Close() }()
+	{
+		proto := -1
+		if rc, rerr := ln.(*net.TCPListener).SyscallConn(); rerr == nil {
+			_ = rc.Control(func(fd uintptr) { proto, _ = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_PROTOCOL) })
+		}
+		en, _ := os.ReadFile("/proc/sys/net/mptcp/enabled")
+		t.Logf("PROBE988 listener SO_PROTOCOL=%d (6=TCP 262=MPTCP) net.mptcp.enabled=%q plaintcp=%q", proto, strings.TrimSpace(string(en)), os.Getenv("CELERIS_PROBE_988_PLAINTCP"))
+	}
 	client, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("dial: %v", err)
