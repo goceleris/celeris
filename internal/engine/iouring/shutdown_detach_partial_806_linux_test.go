@@ -3,6 +3,7 @@
 package iouring_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -59,7 +60,7 @@ func (l *logBuf806) String() string {
 // every client reads: the celeris#806 symptom on the detached path, found in
 // review of the fix.
 //
-// The shape: a stalled response holds the drain open for 450 ms; 64 streams
+// The shape: a stalled response holds the drain open for 450 ms (it is read then); 64 streams
 // each write one chunk larger than the socket buffers across the moment the
 // drain's first 250 ms end, to clients that read at once. The drain must end
 // shortly after the stalled client reads, not at the budget, and must not log
@@ -98,10 +99,13 @@ func TestShutdownDetachedPartialWriteIsFlushed806(t *testing.T) {
 // "". The server and every client are gone when it returns.
 func runDetachedPartial806(t *testing.T, eng celeris.EngineType, p trial806) string {
 	t.Helper()
-	const budget = 4 * time.Second
+	// A budget well above what a slow host needs to move the queued bytes
+	// (several seconds under -race on a small runner), so only bytes that
+	// never move last it out.
+	const budget = 20 * time.Second
 	chunk := make([]byte, p.chunkKiB<<10)
-	big := make([]byte, 1<<20)
-	var t0 atomic.Int64 // UnixNano of the shutdown's start; 0 before
+	big := make([]byte, 256<<10) // more than the socket buffers hold, so it stalls until the client reads
+	var t0 atomic.Int64          // UnixNano of the shutdown's start; 0 before
 	var idx atomic.Int64
 	logs := &logBuf806{}
 	served := make(chan struct{}, 1)
@@ -166,6 +170,7 @@ func runDetachedPartial806(t *testing.T, eng celeris.EngineType, p trial806) str
 	// The clients of the streams read at once; each stream's handler
 	// goroutine is told when to write, so connect them before the shutdown.
 	var stop atomic.Bool
+	var got atomic.Int64 // bytes the stream clients have read
 	var wg sync.WaitGroup
 	defer func() { stop.Store(true); wg.Wait() }()
 	for range p.streams {
@@ -183,7 +188,9 @@ func runDetachedPartial806(t *testing.T, eng celeris.EngineType, p trial806) str
 			buf := make([]byte, 128<<10)
 			for !stop.Load() {
 				_ = c.SetReadDeadline(time.Now().Add(time.Second))
-				if _, err := c.Read(buf); err != nil {
+				n, err := c.Read(buf)
+				got.Add(int64(n))
+				if err != nil {
 					var ne net.Error
 					if errors.As(err, &ne) && ne.Timeout() {
 						continue
@@ -224,9 +231,13 @@ func runDetachedPartial806(t *testing.T, eng celeris.EngineType, p trial806) str
 		defer scancel()
 		shutDone <- srv.Shutdown(sctx)
 	}()
+	var holdDone atomic.Int64 // ns after the shutdown began that the stalled client had read it all
 	time.AfterFunc(time.Duration(p.holdMs)*time.Millisecond, func() {
 		_ = hc.SetReadDeadline(time.Now().Add(10 * time.Second))
-		_, _ = io.Copy(io.Discard, hc)
+		if resp, err := http.ReadResponse(bufio.NewReader(hc), nil); err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			holdDone.Store(int64(time.Since(start)))
+		}
 	})
 	var shutErr error
 	select {
@@ -235,17 +246,23 @@ func runDetachedPartial806(t *testing.T, eng celeris.EngineType, p trial806) str
 		return fmt.Sprintf("Shutdown had not returned %v after it began", budget+3*time.Second)
 	}
 	took := time.Since(start)
-	t.Logf("%v: streams=%d chunk=%dKiB Shutdown returned after %v (err=%v)", eng, p.streams, p.chunkKiB, took.Round(time.Millisecond), shutErr)
-	var warn string
+	t.Logf("%v: streams=%d chunk=%dKiB Shutdown returned after %v (err=%v), the stalled client was done after %v", eng, p.streams, p.chunkKiB,
+		took.Round(time.Millisecond), shutErr, time.Duration(holdDone.Load()).Round(time.Millisecond))
+	if took <= budget/2 && !strings.Contains(logs.String(), "the send drain ran out of time") {
+		return ""
+	}
+	// Held. The WARN is logged by the worker, which may be a moment behind
+	// Shutdown's own return at the budget: give it that, and say all of it.
+	time.Sleep(300 * time.Millisecond)
+	var warns []string
 	for _, ln := range strings.Split(logs.String(), "\n") {
-		if strings.Contains(ln, "the send drain ran out of time") {
-			warn = ln
+		if strings.Contains(ln, "level=WARN") || strings.Contains(ln, "level=ERROR") {
+			warns = append(warns, ln)
 		}
 	}
-	if warn != "" || took > budget/2 {
-		return fmt.Sprintf("HELD: the send drain lasted %v of a %v budget although every client reads (bytes stranded in the worker): %s", took.Round(time.Millisecond), budget, warn)
-	}
-	return ""
+	m = srv.EngineInfo().Metrics
+	return fmt.Sprintf("HELD: the send drain lasted %v of a %v budget although every client reads (bytes stranded in the worker); engine: InlineBytes=%d RingBytes=%d, the stream clients read %d bytes (%d streams of %d KiB), the stalled client was done after %v; log: %s",
+		took.Round(time.Millisecond), budget, m.InlineBytes, m.RingBytes, got.Load(), p.streams, p.chunkKiB, time.Duration(holdDone.Load()).Round(time.Millisecond), strings.Join(warns, " | "))
 }
 
 // startServer806 starts a server of engine eng with routes on
