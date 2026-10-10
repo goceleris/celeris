@@ -62,8 +62,9 @@ func h2cClient836(conns int) *http.Client {
 // c.Context() and return at once (as `defer cancel()` does), on a sync and
 // an async route, 64 requests in flight over 4 h2c connections. Before the
 // fix the test binary died with the panic above on epoll, io_uring and
-// adaptive. std is the control (its streams are HTTP/1 streams, whose
-// context is context.Background()).
+// adaptive. std joined them with #949 (its h2c requests run on HTTP/2
+// streams whose context ends with the request's); it was the control before
+// (HTTP/1 streams, whose context is context.Background()).
 func TestH2DerivedContextDoesNotPanic836(t *testing.T) {
 	derive := map[string]func(context.Context) (context.Context, context.CancelFunc){
 		"WithCancel": context.WithCancel,
@@ -141,9 +142,6 @@ func TestH2DerivedContextDoesNotPanic836(t *testing.T) {
 // the fix it read "not cancelled" again as soon as its stream was reset.
 func TestH2RequestContextEndsWithItsRequest836(t *testing.T) {
 	for _, e := range engines761 {
-		if e.name == "std" {
-			continue // context.Background() on std; nothing to end
-		}
 		for _, route := range []string{"sync", "async"} {
 			t.Run(e.name+"/"+route, func(t *testing.T) {
 				const kept = 64
@@ -221,9 +219,6 @@ func TestH2RequestContextEndsWithItsRequest836(t *testing.T) {
 // and it must end with the request.
 func TestH2DetachedContextIsItsRequests836(t *testing.T) {
 	for _, e := range engines761 {
-		if e.name == "std" {
-			continue // context.Background() on std; nothing to end
-		}
 		t.Run(e.name, func(t *testing.T) {
 			n := n836(800)
 			var wrong atomic.Int64

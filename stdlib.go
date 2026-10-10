@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goceleris/celeris/internal/engine/std"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
@@ -17,12 +18,21 @@ const maxToHandlerBodySize = maxBodySize
 // converts the *http.Request into a stream.Stream, invokes the celeris
 // handler, and writes the response back via http.ResponseWriter.
 //
+// The handler's [Context.Context] ends with the request's context
+// (r.Context()), on HTTP/1 and HTTP/2: a client that goes away, a stream the
+// client resets, or an http.TimeoutHandler above ToHandler cancels it.
+//
 // This is the reverse of [Adapt] / [AdaptFunc] which wrap net/http handlers
 // for use inside celeris.
 func ToHandler(h HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s := stream.NewStream(1)
 		defer s.Release()
+		// c.Context() ends with r.Context(): the client leaving, a stream
+		// the client reset, an http.TimeoutHandler above this handler, or a
+		// Server.Close that closes the connection (celeris#949). Deferred
+		// after Release, so it runs before it.
+		defer std.BindStreamCancel(r.Context(), s)()
 
 		scheme := "http"
 		if r.TLS != nil {
