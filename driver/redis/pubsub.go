@@ -48,10 +48,13 @@ type PubSub struct {
 	// the conn is still in flight.
 	//
 	// Lock order: ctlMu, then mu. Never take ctlMu from deliver, onRecv,
-	// onClose or the close hook (the worker goroutine runs those, and no
-	// loop's Write waits for a worker, so a worker never waits on a writer
-	// that holds ctlMu). Never hold mu across a conn release: UnregisterConn
-	// can wait for an onRecv that is blocked in deliver on mu.
+	// onClose or the close hook: the worker goroutine runs those. A ctlMu
+	// holder waits for no worker: the loops' Write and UnregisterConn take a
+	// per-conn lock that no loop holds across onRecv, and the standalone
+	// non-Linux loop's blocking Write is cut short by UnregisterConn, which
+	// Close runs before it waits for ctlMu (detach). mu is held across no
+	// write and no release, so deliver, which takes mu on the worker, is
+	// never delayed by I/O.
 	ctlMu     sync.Mutex
 	mu        sync.Mutex
 	conn      *redisConn
