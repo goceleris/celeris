@@ -135,7 +135,16 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		// carry the same waiver. Keep the literal on one line so the waiver
 		// covers it.
 		h2s = &http2.Server{MaxConcurrentStreams: cfg.MaxConcurrentStreams, MaxReadFrameSize: cfg.MaxFrameSize} //nolint:staticcheck // SA1019: the type h2cHandler serves with; see the import comment.
-		httpHandler = &h2cHandler{next: bridge, h2s: h2s}
+		httpHandler = &h2cHandler{
+			next:    bridge,
+			h2s:     h2s,
+			maxBody: cfg.MaxRequestBodySize,
+			bodyRefused: func() {
+				// What Bridge counts for a request whose body it refuses.
+				e.metrics.reqCount.Add(1)
+				e.metrics.errs.RequestBody.Add(1)
+			},
+		}
 		// Auto with the upgrade disabled (Config.EnableH2Upgrade = &false,
 		// celeris#964): keep prior-knowledge h2c, which is not the
 		// handshake, and serve a request that asks for the RFC 7540 3.2
