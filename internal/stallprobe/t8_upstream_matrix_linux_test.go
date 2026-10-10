@@ -35,9 +35,13 @@ package stallprobe
 //	CELERIS_PROBE_UP_SECS        seconds per run (30)
 //	CELERIS_PROBE_UP_THRESHOLD_MS  STALL above this longest wake gap (50)
 //	CELERIS_PROBE_UP_CASES       subset of little,big,little-noasync (all three)
-//	CELERIS_PROBE_PATCH          name of a registered runtime patch (see upstreamPatches); empty = none
+//	CELERIS_PROBE_PATCH          comma list of registered runtime patches (t8_patches_linux_test.go: noop, backoff,
+//	                             min100us, acklatency, negctl-buildfail); "none" = an unpatched arm in the same run.
+//	                             Empty = no patch machinery at all. Each arm is built once per toolchain with
+//	                             `go build -overlay` and the arms run interleaved rep by rep. When a patch is set and
+//	                             CELERIS_PROBE_UP_CASES is not, the cases default to "little" only.
 //
-// Budget per version and arch: 3 cases x REPS x (SECS + ~1) s plus the first download and build.
+// Budget per version and arch: arms x cases x REPS x (SECS + ~1) s plus the first download and build.
 // Default 6 reps x 30 s: about 9.5 min per version per arch; the dispatch timeout must cover
 // versions x that, plus about 3 min for the C program and the downloads.
 
@@ -74,8 +78,10 @@ var upSigcostSrc []byte
 //
 //	func init() { upstreamPatches["suspendg-backoff"] = func(goroot, scratch string) (string, error) {...} }
 //
-// A name that is set but not registered makes every row verdict NOPATCH and nothing is run: an
-// unpatched run must never be mistaken for a patched one. Every row carries patch=<name>.
+// A name that is set but not registered makes that arm verdict NOPATCH and nothing is run for it: an
+// unpatched run must never be mistaken for a patched one. Every row carries patch=<name> ("none" for the
+// unpatched arm of a patch run, "" when CELERIS_PROBE_PATCH is empty). After each patched build the
+// harness logs MATRIX_FACTS ... suspendG_size (go tool nm -size), suspendG_insns_sha (go tool objdump) and the sha256 of the overlaid preempt.go.
 var upstreamPatches = map[string]func(goroot, scratch string) (overlayJSON string, err error){}
 
 // ---- helpers --------------------------------------------------------------------------------------
@@ -127,8 +133,11 @@ func parseKV(line string) map[string]string {
 
 type upBin struct {
 	label, path, goroot, defGODEBUG string
+	patch                           string // arm name as printed in rows: "", "none" or a registered patch
 	env                             upEnv
 }
+
+var nmSizeRe = regexp.MustCompile(`(?m)^\s*[0-9a-f]+\s+(\d+)\s+T\s+runtime\.suspendG$`)
 
 func TestUpstreamMatrix(t *testing.T) {
 	goBin, err := exec.LookPath("go")
@@ -138,9 +147,18 @@ func TestUpstreamMatrix(t *testing.T) {
 	versions := envList("CELERIS_PROBE_GOVERSIONS", "local")
 	reps, secs := envInt("CELERIS_PROBE_REPS", 6), envInt("CELERIS_PROBE_UP_SECS", 30)
 	thr := envInt("CELERIS_PROBE_UP_THRESHOLD_MS", 50)
-	patch := os.Getenv("CELERIS_PROBE_PATCH")
+	patchList := envList("CELERIS_PROBE_PATCH", "")
+	arms := patchList
+	if len(arms) == 0 {
+		arms = []string{""}
+	}
+	patch := strings.Join(patchList, ",")
+	defCases := "little,big,little-noasync"
+	if len(patchList) > 0 {
+		defCases = "little"
+	}
 	var cases []string
-	for _, c := range envList("CELERIS_PROBE_UP_CASES", "little,big,little-noasync") {
+	for _, c := range envList("CELERIS_PROBE_UP_CASES", defCases) {
 		if c == "little" || c == "big" || c == "little-noasync" {
 			cases = append(cases, c)
 		}
@@ -168,8 +186,8 @@ func TestUpstreamMatrix(t *testing.T) {
 		hostFacts(), goBin, versions, reps, secs, thr, cases, patch, sum(upReproSrc), sum(upSigcostSrc))
 	tp := loadTopo()
 	t.Logf("MATRIX_FACTS topology: %s", tp.describe())
-	t.Logf("MATRIX_FACTS estimate: %d versions x %d cases x %d reps x ~%d s = ~%d min of runs, plus downloads and builds",
-		len(versions), len(cases), reps, secs+1, (len(versions)*len(cases)*reps*(secs+1)+59)/60)
+	t.Logf("MATRIX_FACTS estimate: %d versions x %d arms x %d cases x %d reps x ~%d s = ~%d min of runs, plus downloads and builds",
+		len(versions), len(arms), len(cases), reps, secs+1, (len(versions)*len(arms)*len(cases)*reps*(secs+1)+59)/60)
 
 	srcDir := filepath.Join(tmp, "src")
 	_ = os.MkdirAll(srcDir, 0o755)
@@ -203,41 +221,10 @@ func TestUpstreamMatrix(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module stallrepro\n\ngo "+mod[1]+"\n"), 0o644)
 		goroot, _, _ := upRun(bctx, srcDir, e.env(), goBin, "env", "GOROOT")
 		goroot = strings.TrimSpace(goroot)
-		args := []string{"build", "-o", filepath.Join(tmp, "stallrepro-"+v)}
-		if patch != "" {
-			fn := upstreamPatches[patch]
-			if fn == nil {
-				cancel()
-				t.Logf("MATRIX_SKIP version=%s verdict=NOPATCH reason=%q", v, "CELERIS_PROBE_PATCH="+patch+" is not registered in upstreamPatches")
-				continue
-			}
-			scratch := filepath.Join(tmp, "patch-"+v)
-			_ = os.MkdirAll(scratch, 0o755)
-			ov, err := fn(goroot, scratch)
-			if err != nil {
-				cancel()
-				t.Logf("MATRIX_SKIP version=%s reason=%q", v, "patch "+patch+": "+err.Error())
-				continue
-			}
-			args = append(args, "-overlay="+ov)
-		}
-		_, se, err = upRun(bctx, srcDir, e.env(), goBin, append(args, ".")...)
 		cancel()
-		if err != nil {
-			t.Logf("MATRIX_SKIP version=%s reason=%q", v, "build failed: "+err.Error()+" "+tail(se, 600))
-			continue
+		for _, arm := range arms {
+			bins = append(bins, upBuildArm(t, goBin, srcDir, tmp, e, v, arm, goroot, strings.TrimSpace(goVer), mod[1])...)
 		}
-		// the GODEBUG defaults the go.mod go line gave this binary (go1.21+ records them as a build setting)
-		mctx, mcancel := context.WithTimeout(context.Background(), time.Minute)
-		mi, _, _ := upRun(mctx, srcDir, e.env(), goBin, "version", "-m", args[2])
-		mcancel()
-		defGD := regexp.MustCompile(`DefaultGODEBUG=(\S+)`).FindStringSubmatch(mi)
-		dg := ""
-		if defGD != nil {
-			dg = defGD[1]
-		}
-		t.Logf("MATRIX_FACTS version=%s built with %s (go.mod go %s) GOROOT=%s DefaultGODEBUG=%q", v, strings.TrimSpace(goVer), mod[1], goroot, dg)
-		bins = append(bins, upBin{label: v, path: args[2], goroot: goroot, env: e, defGODEBUG: dg})
 	}
 
 	// 3. rep outer, then version, then case: drift in the host never lines up with one case
@@ -271,7 +258,7 @@ func TestUpstreamMatrix(t *testing.T) {
 					verdict = "ERROR"
 				}
 				extra := fmt.Sprintf("ns_per_iter=%s work_iters=%s go=%s goarch=%s class=%s hetero=%s cpus=%s gomaxprocs=%s tick_gap_ms=%s default_godebug=%q patch=%q",
-					kv["ns_per_iter"], kv["work_iters"], kv["go"], kv["goarch"], kv["class"], kv["hetero"], kv["cpus"], kv["gomaxprocs"], kv["max_tick_gap_ms"], b.defGODEBUG, patch)
+					kv["ns_per_iter"], kv["work_iters"], kv["go"], kv["goarch"], kv["class"], kv["hetero"], kv["cpus"], kv["gomaxprocs"], kv["max_tick_gap_ms"], b.defGODEBUG, b.patch)
 				if verdict == "HANG" || verdict == "ERROR" {
 					extra += fmt.Sprintf(" err=%v stderr=%q", err, tail(se, 400))
 				}
@@ -328,4 +315,77 @@ func upSigcost(t *testing.T, srcDir, tmp string, tp topo) {
 			t.Logf("SIGCOST_MATRIX %s sender_cpu=%d %s", r.label, r.sender, l)
 		}
 	}
+}
+
+// upBuildArm builds the reproducer for one toolchain and one patch arm ("" = no patch machinery,
+// "none" = unpatched arm of a patch run, else a registered patch applied with go build -overlay).
+// It returns zero or one upBin; every failure is a MATRIX_SKIP row, never a test failure.
+func upBuildArm(t *testing.T, goBin, srcDir, tmp string, e upEnv, v, arm, goroot, goVer, goMod string) []upBin {
+	name := "stallrepro-" + v
+	if arm != "" {
+		name += "-" + arm
+	}
+	out := filepath.Join(tmp, name)
+	args := []string{"build", "-o", out}
+	if arm != "" && arm != "none" {
+		fn := upstreamPatches[arm]
+		if fn == nil {
+			t.Logf("MATRIX_SKIP version=%s patch=%q verdict=NOPATCH reason=%q", v, arm, "CELERIS_PROBE_PATCH has "+arm+", which is not registered in upstreamPatches")
+			return nil
+		}
+		scratch := filepath.Join(tmp, "patch-"+v+"-"+arm)
+		_ = os.MkdirAll(scratch, 0o755)
+		ov, err := fn(goroot, scratch)
+		if err != nil {
+			t.Logf("MATRIX_SKIP version=%s patch=%q reason=%q", v, arm, "patch failed: "+err.Error())
+			return nil
+		}
+		args = append(args, "-overlay="+ov)
+		if b, err := os.ReadFile(filepath.Join(scratch, "preempt.go")); err == nil {
+			o, _ := os.ReadFile(filepath.Join(goroot, "src/runtime/preempt.go"))
+			t.Logf("MATRIX_FACTS version=%s patch=%q overlaid preempt.go sha256 %x (toolchain's own %x), %d vs %d bytes", v, arm, sha256.Sum256(b), sha256.Sum256(o), len(b), len(o))
+		}
+	}
+	bctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute) // a patched runtime is rebuilt from source in an empty GOCACHE
+	_, se, err := upRun(bctx, srcDir, e.env(), goBin, append(args, ".")...)
+	cancel()
+	if err != nil {
+		t.Logf("MATRIX_SKIP version=%s patch=%q reason=%q", v, arm, "build failed: "+err.Error()+" "+tail(se, 600))
+		return nil
+	}
+	mctx, mcancel := context.WithTimeout(context.Background(), time.Minute)
+	defer mcancel()
+	// the GODEBUG defaults the go.mod go line gave this binary (go1.21+ records them as a build setting)
+	mi, _, _ := upRun(mctx, srcDir, e.env(), goBin, "version", "-m", out)
+	dg := ""
+	if m := regexp.MustCompile(`DefaultGODEBUG=(\S+)`).FindStringSubmatch(mi); m != nil {
+		dg = m[1]
+	}
+	// proof that the runtime in this binary is the one compiled from the overlay: the size of runtime.suspendG
+	size := "unknown"
+	if nm, _, err := upRun(mctx, srcDir, e.env(), goBin, "tool", "nm", "-size", out); err == nil {
+		if m := nmSizeRe.FindStringSubmatch(nm); m != nil {
+			size = m[1]
+		}
+	}
+	// and a hash of its instruction encodings (no addresses): equal for the unpatched and the noop arm,
+	// different for any arm that changes suspendG (a changed constant keeps the size but not the hash)
+	dis := "unknown"
+	if od, _, err := upRun(mctx, srcDir, e.env(), goBin, "tool", "objdump", "-s", `^runtime\.suspendG$`, out); err == nil {
+		var norm []string // objdump columns are separated by runs of tabs: file:line, address, encoding, instruction
+		for _, l := range strings.Split(od, "\n") {
+			var f []string
+			for _, c := range strings.Split(l, "\t") {
+				if c = strings.TrimSpace(c); c != "" {
+					f = append(f, c)
+				}
+			}
+			if len(f) >= 4 {
+				norm = append(norm, f[2]) // the machine encoding: address-free, relative branches included
+			}
+		}
+		dis = fmt.Sprintf("%d-insns-%x", len(norm), sha256.Sum256([]byte(strings.Join(norm, "\n"))))[:32]
+	}
+	t.Logf("MATRIX_FACTS version=%s patch=%q built with %s (go.mod go %s) GOROOT=%s DefaultGODEBUG=%q suspendG_size=%s suspendG_insns_sha=%s", v, arm, goVer, goMod, goroot, dg, size, dis)
+	return []upBin{{label: v, path: out, goroot: goroot, env: e, defGODEBUG: dg, patch: arm}}
 }
