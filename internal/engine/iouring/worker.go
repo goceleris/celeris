@@ -3946,8 +3946,17 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// healthy connection torn down by a transient resource shortage. This
 	// is the same correction already made thirty lines above for the
 	// CQE_F_MORE branch selection.
-	if cs.sendIsZC && (c.Res == -int32(unix.EINVAL) || c.Res == -int32(unix.ENOMEM)) {
-		w.retireSendZC(-c.Res, "SEND_ZC unavailable, falling back to regular SEND")
+	//
+	// EOPNOTSUPP (celeris#988) rides the same branch, but condemns one
+	// socket, not the opcode: see noSendZC. This is the form without
+	// F_MORE; the kernel's usual form, with F_MORE and a NOTIF, is
+	// completeSend's twin branch.
+	if cs.sendIsZC && (c.Res == -int32(unix.EINVAL) || c.Res == -int32(unix.ENOMEM) || c.Res == -int32(unix.EOPNOTSUPP)) {
+		if c.Res == -int32(unix.EOPNOTSUPP) {
+			cs.noSendZC = true
+		} else {
+			w.retireSendZC(-c.Res, "SEND_ZC unavailable, falling back to regular SEND")
+		}
 		// cs.sending is read by the inline-egress guard under detachMu; clear it
 		// and re-flush under the lock (held; flushSend for a detached conn is
 		// always called under detachMu, as in the dirty-flush loop).
@@ -4140,7 +4149,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 		}
 	}
 
-	if fromZC && (sent == -int(unix.ENOMEM) || sent == -int(unix.EINVAL)) {
+	if fromZC && (sent == -int(unix.ENOMEM) || sent == -int(unix.EINVAL) || sent == -int(unix.EOPNOTSUPP)) {
 		// SEND_ZC pins the user buffer against RLIMIT_MEMLOCK. A host with
 		// a low limit returns ENOMEM once enough sends are in flight --
 		// the same limit that caps the worker count on a CI runner
@@ -4165,7 +4174,21 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 		// a reason to kill the connection. The retry is armed by flushSend
 		// with w.sendZC already false, so it is a plain SEND and a second
 		// failure takes the generic error path -- exactly one retry.
-		w.retireSendZC(int32(-sent), "SEND_ZC notification reported failure, falling back to regular SEND")
+		//
+		// EOPNOTSUPP (celeris#988) is the odd one out: io_send_zc returns it
+		// before it sends a byte when the socket lacks SOCK_SUPPORT_ZC
+		// (an AF_UNIX socket, or a connection accepted on an MPTCP listener,
+		// which lacks the bit whether the client spoke MPTCP or fell back to
+		// plain TCP), with F_MORE and a NOTIF because the
+		// notification was allocated at prep. That is one socket's property,
+		// not the kernel's or the worker's: only this conn stops using ZC
+		// (noSendZC) and the worker's other conns keep it. Nothing was sent, so
+		// the whole of sendBuf goes again, as a plain SEND.
+		if sent == -int(unix.EOPNOTSUPP) {
+			cs.noSendZC = true
+		} else {
+			w.retireSendZC(int32(-sent), "SEND_ZC notification reported failure, falling back to regular SEND")
+		}
 		if w.flushSend(cs) {
 			w.markDirty(cs)
 		}
@@ -6175,7 +6198,10 @@ func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
 	// A worker holding zcHoldBytesMax of send buffers past the release
 	// backstop arms no new SEND_ZC until those holds end: that is what bounds
 	// them (celeris#812, see zc_send_buffer.go).
-	cs.sendIsZC = useSendZC(w.sendZC && w.zcHoldBytes < zcHoldBytesMax, linked, len(cs.sendBuf))
+	//
+	// noSendZC is tested last: the per-request sends under sendZCMinBytes
+	// leave useSendZC false and never load it (celeris#988).
+	cs.sendIsZC = useSendZC(w.sendZC && w.zcHoldBytes < zcHoldBytesMax, linked, len(cs.sendBuf)) && !cs.noSendZC
 	if cs.sendIsZC {
 		// celeris#591 exposure witnesses. Deliberately inside the ZC arm:
 		// every sub-sendZCMinBytes and every linked send — the per-request
