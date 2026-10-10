@@ -95,7 +95,8 @@ func (m *Manager) GetLocalMaxFrameSize() uint32 {
 	return v
 }
 
-// CreateStream creates a new stream with the given ID.
+// CreateStream creates a new stream with the given ID. It checks nothing: not
+// the stream limit (TryOpenStream does), not the order of identifiers.
 func (m *Manager) CreateStream(id uint32) *Stream {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -517,7 +518,11 @@ func (m *Manager) GetMaxConcurrentStreams() uint32 {
 	return m.maxStreams
 }
 
-// GetOrCreateStream gets an existing stream or creates a new one.
+// GetOrCreateStream gets an existing stream or creates a new one. The stream
+// it creates is idle: it is not counted against SETTINGS_MAX_CONCURRENT_STREAMS
+// and the last client stream does not move. It is for the placeholder a
+// PRIORITY frame leaves; a stream a HEADERS frame opens is opened by
+// TryOpenStream, through Processor.admitHeaders (celeris#981).
 func (m *Manager) GetOrCreateStream(id uint32) *Stream {
 	if stream, ok := m.GetStream(id); ok {
 		return stream
