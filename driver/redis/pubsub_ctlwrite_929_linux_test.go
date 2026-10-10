@@ -145,6 +145,7 @@ func (l *cmdLog) count(name string) int {
 }
 
 type pubsubRig struct {
+	b    *pubsubBroker
 	fake *fakeRedis
 	log  *cmdLog
 	prov engine.EventLoopProvider
@@ -170,7 +171,7 @@ func newPubsubRig(t *testing.T) *pubsubRig {
 	cfg := Config{Addr: fake.Addr()}
 	cl := &Client{cfg: cfg, pool: newPool(cfg, gateProvider{EventLoopProvider: prov, g: g}, false)}
 	t.Cleanup(func() { _ = cl.Close() })
-	return &pubsubRig{fake: fake, log: lg, prov: prov, gate: g, cl: cl}
+	return &pubsubRig{b: b, fake: fake, log: lg, prov: prov, gate: g, cl: cl}
 }
 
 func (r *pubsubRig) dropServerSide() {
@@ -474,12 +475,33 @@ func TestPubSubControlWritesDropsAndCloseInterleave929(t *testing.T) {
 				}
 			}(g)
 		}
+		// Pushes keep arriving on the worker goroutine (deliver takes ps.mu)
+		// while the writers hold ctlMu: a writer that waited for the worker
+		// would deadlock here.
+		stopPub := make(chan struct{})
+		pubDone := make(chan struct{})
+		go func() {
+			defer close(pubDone)
+			for {
+				select {
+				case <-stopPub:
+					return
+				default:
+				}
+				r.b.publish("a", "x")
+				r.b.publish("b", "y")
+				r.b.publish("p1", "z")
+				r.b.spublish("s", "w")
+			}
+		}()
 		wg.Add(1)
 		go func() { defer wg.Done(); time.Sleep(time.Duration(i%5) * time.Millisecond); r.dropServerSide() }()
 		wg.Add(1)
 		go func() { defer wg.Done(); time.Sleep(time.Duration((i*3)%7) * time.Millisecond); _ = ps.Close() }()
 		wg.Wait()
 		_ = ps.Close()
+		close(stopPub)
+		<-pubDone
 		waitFor(t, "the reconnect goroutine to finish", 10*time.Second, func() bool {
 			ps.reconnectingMu.Lock()
 			defer ps.reconnectingMu.Unlock()
