@@ -216,8 +216,8 @@ func readers806(e drainEngine806, mode string) []string {
 // are over (a connection accepted in it would be cut at its end), as epoll's,
 // whose loops have stopped, and std's, whose listener is closed, do not.
 // Within those 250 ms io_uring still accepts (celeris#595), which this does
-// not pin. The probe is a fresh connection 600 ms into the drain. io_uring
-// only: the others do not accept at all by then, and the root package's race
+// not pin. The probe is a connect attempt 600 ms into the drain, which a
+// closed listener refuses. io_uring only: the others do not accept at all by then, and the root package's race
 // run has little time to spare.
 func TestShutdownSendDrainStopsAccepting806(t *testing.T) {
 	const budget = 2 * time.Second
@@ -246,13 +246,15 @@ func TestShutdownSendDrainStopsAccepting806(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 			shutErr := srv.beginShutdown("Shutdown", budget)
 			time.Sleep(600 * time.Millisecond)
-			probe := &http.Client{Timeout: 400 * time.Millisecond, Transport: &http.Transport{DisableKeepAlives: true}}
-			resp, err := probe.Get("http://" + srv.addr + "/ping")
+			// The listener is closed, so the connect itself is refused. (A
+			// request on a connection the engine did accept would not tell:
+			// past the first 250 ms it reads nothing more from a connection.)
+			probe, err := net.DialTimeout("tcp", srv.addr, 400*time.Millisecond)
 			if err == nil {
-				_ = resp.Body.Close()
-				t.Errorf("%s: a new connection 600 ms into a send drain that lasts %v was answered %d: the engine is still accepting", e.name, budget, resp.StatusCode)
+				_ = probe.Close()
+				t.Errorf("%s: a connection 600 ms into a send drain that lasts %v was accepted: the engine is still accepting", e.name, budget)
 			} else {
-				t.Logf("%s: the probe 600 ms into the drain failed as wanted: %v", e.name, err)
+				t.Logf("%s: the connect 600 ms into the drain failed as wanted: %v", e.name, err)
 			}
 			if err := srv.waitShutdown("Shutdown", shutErr, budget+time.Second); err != nil {
 				t.Errorf("%s: %v", e.name, err)
