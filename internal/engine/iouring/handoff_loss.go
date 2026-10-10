@@ -145,6 +145,7 @@ type handoffLossStats struct {
 	reapUnsupported           atomic.Uint64
 	closeFDDeferred           atomic.Uint64
 	closeFDForced             atomic.Uint64
+	closeCancelMissedHeld     atomic.Uint64
 	zcNotifHeld               atomic.Uint64
 	zcNotifForced             atomic.Uint64
 	zcBufRetained             atomic.Uint64
@@ -155,6 +156,17 @@ type handoffLossStats struct {
 func (s *handoffLossStats) noteCloseFDForced() {
 	if s != nil {
 		s.closeFDForced.Add(1)
+	}
+}
+
+// noteCloseCancelMissedHeld counts a pendingRelease entry the backstop held
+// because the cancel of an op it still owed had never been placed
+// (celeris#869). Once per entry. Must stay 0: it takes a full SQ ring that a
+// submit does not clear, and the kernel to leave the op running after the
+// close's shutdown. Not an EngineMetrics field: the WARN is the signal.
+func (s *handoffLossStats) noteCloseCancelMissedHeld() {
+	if s != nil {
+		s.closeCancelMissedHeld.Add(1)
 	}
 }
 
