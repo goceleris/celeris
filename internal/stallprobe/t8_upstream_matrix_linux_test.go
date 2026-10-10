@@ -86,7 +86,14 @@ var upstreamPatches = map[string]func(goroot, scratch string) (overlayJSON strin
 
 // ---- helpers --------------------------------------------------------------------------------------
 
-type upEnv struct{ tmp, toolchain string }
+type upEnv struct{ tmp, toolchain, modcache string } // modcache "" = tmp/gomodcache
+
+func (e upEnv) modCache() string {
+	if e.modcache != "" {
+		return e.modcache
+	}
+	return filepath.Join(e.tmp, "gomodcache")
+}
 
 // env is the child environment: nothing inherited that could redirect the toolchain or write outside tmp.
 func (e upEnv) env(extra ...string) []string {
@@ -99,7 +106,7 @@ func (e upEnv) env(extra ...string) []string {
 	}
 	return append(out, "GOTOOLCHAIN="+e.toolchain, "GOFLAGS=-modcacherw", "GOENV=off", "GOWORK=off",
 		"GOPATH="+filepath.Join(e.tmp, "gopath"), "GOCACHE="+filepath.Join(e.tmp, "gocache"),
-		"GOMODCACHE="+filepath.Join(e.tmp, "gomodcache"), "HOME="+filepath.Join(e.tmp, "home"),
+		"GOMODCACHE="+e.modCache(), "HOME="+filepath.Join(e.tmp, "home"),
 		"XDG_CONFIG_HOME="+filepath.Join(e.tmp, "xdg"), "TMPDIR="+e.tmp, "GO111MODULE=on", "CGO_ENABLED=0",
 		"GOGC=100") // GOMAXPROCS stays unset: the runtime default
 }
@@ -327,6 +334,15 @@ func upBuildArm(t *testing.T, goBin, srcDir, tmp string, e upEnv, v, arm, goroot
 	}
 	out := filepath.Join(tmp, name)
 	args := []string{"build", "-o", out}
+	if arm != "" {
+		// A toolchain that GOTOOLCHAIN=go<ver> downloaded lives in GOMODCACHE, and the go command of go1.27.2 refuses an
+		// overlay that replaces "files beneath GOMODCACHE" (found by a 1.27.2 smoke run: every patched arm failed with
+		// that message; 1.20.14 and 1.24.6 did not check). So every arm of a patch run uses that toolchain's own go binary
+		// directly (GOTOOLCHAIN=local, GOROOT inferred from the binary) with a GOMODCACHE of its own elsewhere.
+		goBin = filepath.Join(goroot, "bin", "go")
+		e.toolchain, e.modcache = "local", filepath.Join(tmp, "gomodcache-"+v+"-"+arm)
+		_ = os.MkdirAll(e.modcache, 0o755)
+	}
 	if arm != "" && arm != "none" {
 		fn := upstreamPatches[arm]
 		if fn == nil {
