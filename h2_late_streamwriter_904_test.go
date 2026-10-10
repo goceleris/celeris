@@ -92,7 +92,12 @@ func (l *lateH2) request(id uint32, path string) {
 }
 
 // waitPool waits for the connection's pool handlers (an async route) to have
-// returned and released their streams.
+// returned and released their streams. A pool stream goes back to the stream
+// pool when the event loop ends its next frame batch (celeris#951), so one
+// PING is that batch here: without it the stream stays retired (cancelled, its
+// request dropped, not reset), where a late call is refused by the cancelled
+// flag whatever its use token says, and the next request cannot get the
+// object, as it can on a live connection.
 func (l *lateH2) waitPool() {
 	l.t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -102,6 +107,9 @@ func (l *lateH2) waitPool() {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	l.process(lateFrames(l.t, func(fr *http2.Framer, _ *hpack.Encoder, _ *bytes.Buffer) {
+		_ = fr.WritePing(false, [8]byte{})
+	}))
 }
 
 // grant sends WINDOW_UPDATEs for stream 1 and the connection.

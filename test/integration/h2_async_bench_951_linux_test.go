@@ -6,7 +6,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -155,4 +159,85 @@ func BenchmarkH2AsyncGET951(b *testing.B) {
 		}
 	}
 	b.ReportMetric(float64(b.N*conns*batch)/time.Since(start).Seconds(), "req/s")
+}
+
+// TestH2AsyncRouteRunsOnTheWorkerPool951 is the benchmark's positive control:
+// BenchmarkH2AsyncGET951 measures the pool handlers' stream release only if
+// its .Async() route really runs on the HTTP/2 worker pool (executeHandler),
+// and a sync route does not. The handlers look at their own stack.
+func TestH2AsyncRouteRunsOnTheWorkerPool951(t *testing.T) {
+	onPool := func() bool {
+		pcs := make([]uintptr, 48)
+		frames := runtime.CallersFrames(pcs[:runtime.Callers(1, pcs)])
+		for {
+			f, more := frames.Next()
+			if strings.HasSuffix(f.Function, "(*Processor).executeHandler") {
+				return true
+			}
+			if !more {
+				return false
+			}
+		}
+	}
+	for _, eng := range []struct {
+		name string
+		e    celeris.EngineType
+	}{{"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
+		t.Run(eng.name, func(t *testing.T) {
+			var addr string
+			var s *celeris.Server
+			startDone := make(chan error, 1)
+			for tries := 0; ; tries++ {
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				addr = ln.Addr().String()
+				_ = ln.Close()
+				s = celeris.New(celeris.Config{Addr: addr, Engine: eng.e})
+				s.GET("/async", func(c *celeris.Context) error { return c.String(200, "pool=%v", onPool()) }).Async()
+				s.GET("/sync", func(c *celeris.Context) error { return c.String(200, "pool=%v", onPool()) })
+				go func() { startDone <- s.Start() }()
+				ready := false
+				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+					if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+						_ = c.Close()
+						ready = true
+						break
+					}
+				}
+				if ready {
+					break
+				}
+				if tries > 3 {
+					t.Fatal("server did not start")
+				}
+			}
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = s.Shutdown(ctx)
+				<-startDone
+			}()
+			var protos http.Protocols
+			protos.SetUnencryptedHTTP2(true)
+			tr := &http.Transport{Protocols: &protos}
+			defer tr.CloseIdleConnections()
+			get := func(path string) (string, int) {
+				resp, err := (&http.Client{Transport: tr, Timeout: 10 * time.Second}).Get("http://" + addr + path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+				b, _ := io.ReadAll(resp.Body)
+				return string(b), resp.ProtoMajor
+			}
+			if body, major := get("/async"); body != "pool=true" || major != 2 {
+				t.Errorf("/async over HTTP/%d: %q, want pool=true over HTTP/2", major, body)
+			}
+			if body, major := get("/sync"); body != "pool=false" || major != 2 {
+				t.Errorf("/sync over HTTP/%d: %q, want pool=false over HTTP/2", major, body)
+			}
+		})
+	}
 }
