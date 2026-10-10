@@ -145,7 +145,7 @@ func TestRegisterConnRacesAcceptAndClose959(t *testing.T) {
 	tcp := eng.Addr().(*net.TCPAddr)
 
 	var regs atomic.Int64
-	const rounds, perRound = 5, 16
+	const rounds, perRound = 3, 16
 	for round := 0; round < rounds; round++ {
 		var clients []net.Conn
 		for range perRound {

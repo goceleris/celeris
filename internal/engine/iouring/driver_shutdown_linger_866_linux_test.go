@@ -20,7 +20,6 @@ package iouring
 import (
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -42,7 +41,7 @@ type lingerSet866 struct {
 	nFired  atomic.Int32
 }
 
-func newLingerSet866(t *testing.T, n, linger int) *lingerSet866 {
+func newLingerSet866(t testing.TB, n, linger int) *lingerSet866 {
 	t.Helper()
 	s := &lingerSet866{
 		w:       &Worker{driverConns: make(map[int]*driverConn, n)},
@@ -79,7 +78,7 @@ func (s *lingerSet866) drainAll() {
 
 // classify reports, for each socket, whether its close is in its linger wait,
 // has returned, or has not started (the number still names the socket).
-func (s *lingerSet866) classify(t *testing.T) (waiting, returned, notStarted int) {
+func (s *lingerSet866) classify(t testing.TB) (waiting, returned, notStarted int) {
 	t.Helper()
 	for i, fd := range s.fds {
 		switch w, _ := closeInLingerWait(t, s.ids[i]); {
@@ -170,34 +169,40 @@ func shutdownLingerAttempt866(t *testing.T, n, linger int) (verdict string, ok b
 	return verdict, true
 }
 
-// TestShutdownDriversLingerScale866 prints how the time shutdownDrivers and
-// waitDriverCloses take grows with the number of lingering driver conns. It is
-// a measurement for the PR (evidence/lanes-20261009/E10B/scripts), not a gate:
-// it runs only with CELERIS_866_SCALE set to a comma-separated list of counts
-// (the peers never read; the linger is CELERIS_866_LINGER seconds, default 1).
-func TestShutdownDriversLingerScale866(t *testing.T) {
-	list := os.Getenv("CELERIS_866_SCALE")
-	if list == "" {
-		t.Skip("measurement only: set CELERIS_866_SCALE=1,2,4,8")
-	}
+// BenchmarkShutdownDriversLinger866 measures how the time shutdownDrivers and
+// waitDriverCloses take grows with the number of lingering driver conns: n
+// sockets, each with SO_LINGER {1, CELERIS_866_LINGER seconds (default 1)} and
+// megabytes unsent to a peer that never reads. Run with -test.benchtime 1x
+// (scripts/scale-866.sh): one shutdown per sub-benchmark, its wall time in
+// ms/total and the part spent inside shutdownDrivers itself in ms/shutdownDrivers.
+// A benchmark and not a skipped test, so the package's -v run, which fails on
+// any skip, is not affected.
+func BenchmarkShutdownDriversLinger866(b *testing.B) {
 	linger := 1
 	if v := os.Getenv("CELERIS_866_LINGER"); v != "" {
 		linger, _ = strconv.Atoi(v)
 	}
-	for _, f := range strings.Split(list, ",") {
-		n, err := strconv.Atoi(strings.TrimSpace(f))
-		if err != nil || n < 1 {
-			t.Fatalf("CELERIS_866_SCALE: bad count %q", f)
-		}
-		s := newLingerSet866(t, n, linger)
-		start := time.Now()
-		s.w.shutdownDrivers()
-		inShutdown := time.Since(start)
-		s.w.waitDriverCloses()
-		total := time.Since(start)
-		s.drainAll()
-		t.Logf("celeris866 SCALE n=%d linger=%ds shutdownDrivers=%dms total=%dms onClose=%d",
-			n, linger, inShutdown.Milliseconds(), total.Milliseconds(), s.nFired.Load())
+	for _, n := range []int{1, 2, 4, 8, 16} {
+		b.Run("n="+strconv.Itoa(n), func(b *testing.B) {
+			for range b.N {
+				b.StopTimer()
+				s := newLingerSet866(b, n, linger)
+				b.StartTimer()
+				start := time.Now()
+				s.w.shutdownDrivers()
+				inShutdown := time.Since(start)
+				s.w.waitDriverCloses()
+				total := time.Since(start)
+				b.StopTimer()
+				s.drainAll()
+				if got := s.nFired.Load(); int(got) != n {
+					b.Fatalf("onClose fired %d times, want %d", got, n)
+				}
+				b.ReportMetric(float64(inShutdown.Milliseconds()), "ms/shutdownDrivers")
+				b.ReportMetric(float64(total.Milliseconds()), "ms/total")
+				b.StartTimer()
+			}
+		})
 	}
 }
 

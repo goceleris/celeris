@@ -41,7 +41,7 @@ const (
 // socketIdentity is what a descriptor names: its device and inode.
 type socketIdentity struct{ dev, ino uint64 }
 
-func identityOf(t *testing.T, fd int) socketIdentity {
+func identityOf(t testing.TB, fd int) socketIdentity {
 	t.Helper()
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
@@ -76,7 +76,7 @@ const lingerBacklog = 4 << 20
 // unsent: a connected, non-blocking TCP socket whose peer never reads, with
 // SO_LINGER {1, linger}, so its last close waits the whole linger time.
 // drain reads the peer, and the close then returns.
-func deeplyLingeringTCPSocket(t *testing.T, linger int) (fd int, drain func()) {
+func deeplyLingeringTCPSocket(t testing.TB, linger int) (fd int, drain func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -213,7 +213,7 @@ func waitCloseStarted(t *testing.T, opFD int, id socketIdentity) {
 // wait has ended, however it ends: the FIN acknowledged, the linger time up,
 // or a signal. So once the last close has begun, a row that still carries
 // the socket's inode says that close has not returned.
-func closeInLingerWait(t *testing.T, id socketIdentity) (waiting bool, state string) {
+func closeInLingerWait(t testing.TB, id socketIdentity) (waiting bool, state string) {
 	t.Helper()
 	b, err := os.ReadFile("/proc/net/tcp")
 	if err != nil {
