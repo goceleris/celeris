@@ -244,7 +244,9 @@ func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding,
 			etag = weakETag(early.ModTime(), early.Size())
 		}
 		if notModified(c, etag, early.ModTime()) {
-			setCacheHeaders(c, early.ModTime(), early.Size(), cacheControl)
+			if etag != "" {
+				setValidators(c, early.ModTime(), etag, cacheControl)
+			}
 			return c.NoContent(304)
 		}
 	}
@@ -612,8 +614,14 @@ func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, cacheCon
 	if modTime.IsZero() {
 		return
 	}
+	setValidators(c, modTime, weakETag(modTime, size), cacheControl)
+}
+
+// setValidators sets Last-Modified, the given ETag and Cache-Control; a 304
+// that has built the tag to compare with it sets that same string.
+func setValidators(c *celeris.Context, modTime time.Time, etag, cacheControl string) {
 	c.SetHeader("last-modified", modTime.UTC().Format(http.TimeFormat))
-	c.SetHeader("etag", weakETag(modTime, size))
+	c.SetHeader("etag", etag)
 	if cacheControl != "" {
 		c.SetHeader("cache-control", cacheControl)
 	}
