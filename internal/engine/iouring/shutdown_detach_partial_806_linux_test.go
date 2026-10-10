@@ -68,13 +68,16 @@ func (l *logBuf806) String() string {
 // 256 KiB), not at the budget, and must not log that it ran out of time. The
 // moment is one loop pass wide, so this is a probabilistic reproduction (on the
 // code before the fix it fails in most runs, not all); the deterministic one is
-// TestStopDetachedProducersFlushesQueuedBytes806, in this package.
+// TestStopDetachedProducersFlushesQueuedBytes806, in the package iouring (the
+// internal tests of this directory).
 //
 // io_uring, directly and as the engine Adaptive started on. The base tier
-// accepts blocking sockets (its accept SQE has no SOCK_NONBLOCK), where an
-// inline write waits for the client instead of leaving a remainder, so the
-// state this test makes is not reachable there and the test passes before and
-// after the fix; the unit test is tier-independent.
+// accepts blocking sockets (its accept SQE has no SOCK_NONBLOCK; O_NONBLOCK was
+// found clear on the accepted fd, the high tier's set, with the 16 KiB send
+// buffer applied on both), where an inline write waits for the client instead
+// of leaving a remainder, so the state this test makes is not reachable there
+// and the test passes before and after the fix; the unit test is
+// tier-independent.
 func TestShutdownDetachedPartialWriteIsFlushed806(t *testing.T) {
 	cases := []struct {
 		name  string
