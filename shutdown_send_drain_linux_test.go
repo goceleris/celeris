@@ -222,7 +222,7 @@ func readers806(e drainEngine806, mode string) []string {
 // closed listener refuses. io_uring only: the others do not accept at all by then, and the root package's race
 // run has little time to spare.
 func TestShutdownSendDrainStopsAccepting806(t *testing.T) {
-	const budget = 2 * time.Second
+	const budget = time.Second
 	body := make([]byte, 3<<20)
 	for _, e := range drainEngines806 {
 		if e.name != "io_uring" {
@@ -273,8 +273,8 @@ func TestShutdownSendDrainStopsAccepting806(t *testing.T) {
 // for all of it (for ever for a ctx without a deadline and a WriteTimeout of
 // -1). Epoll ends the detached writes at the cancel, before its drain; the
 // io_uring drain does so once it is past its first 250 ms. Eight clients read,
-// paced to 6 MiB/s each, a stream that is given 16 KiB every millisecond (about
-// 15 MiB/s), with a 16 KiB server send buffer: bytes are always queued in the
+// paced to 3 MiB/s each, a stream that is given 8 KiB every millisecond (about
+// 7 MiB/s), with a 16 KiB server send buffer: bytes are always queued in the
 // worker, and a backlog of a few MiB per client builds up that the clients
 // take after the drain has ended the writes, in about a second (the pacing is
 // by bytes read, so it does not depend on the host's timer or TCP windows).
@@ -286,8 +286,8 @@ func TestShutdownSendDrainStopsAccepting806(t *testing.T) {
 func TestShutdownDetachedPushDoesNotHoldTheDrain806(t *testing.T) {
 	const budget = 20 * time.Second // StartWithContext's, not Shutdown(Background)'s
 	const clients = 8
-	const rate = 6 << 20 // bytes a second each client takes
-	chunk := make([]byte, 16<<10)
+	const rate = 3 << 20 // bytes a second each client takes
+	chunk := make([]byte, 8<<10)
 	var e drainEngine806
 	for _, c := range drainEngines806 {
 		if c.name == "io_uring" {
