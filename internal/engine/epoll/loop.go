@@ -3842,6 +3842,15 @@ func (l *Loop) closeConn(fd int) {
 }
 
 func (l *Loop) shutdown() {
+	// celeris#874: the run loop moves the per-iteration batches into the
+	// shared counters at the end of every iteration and has returned by now,
+	// but the send drain below writes with onLoopThread=true, into
+	// bytesWrittenBatch, and nothing moves it after that. Flushed on the way
+	// out, after the last thing that can write, so Metrics() read once the
+	// engine has stopped is exact. Once, off the iteration path: the run
+	// loop's own flush is untouched.
+	defer l.flushBatchedCounters()
+
 	// First: close every adoption still queued, and refuse every AdoptConn
 	// from here on. Everything below walks the conn table only, which a
 	// queued adoption is not in yet (celeris#658).
@@ -3981,6 +3990,26 @@ func (l *Loop) shutdown() {
 	// epoll_ctl, so none of them can operate on this number once it is free
 	// to be recycled.
 	l.closeEpollFD()
+}
+
+// flushBatchedCounters moves the loop's per-iteration batches (requests, bytes
+// received, bytes sent) into the engine-wide counters. The run loop does the
+// same inline at the end of each iteration (kept inline: it is the per-event
+// path); this is shutdown's copy, for what the loop's last work after that
+// flush added (celeris#874). Loop thread.
+func (l *Loop) flushBatchedCounters() {
+	if l.reqBatch > 0 {
+		l.reqCount.Add(l.reqBatch)
+		l.reqBatch = 0
+	}
+	if l.bytesReadBatch > 0 {
+		l.bytesRead.Add(l.bytesReadBatch)
+		l.bytesReadBatch = 0
+	}
+	if l.bytesWrittenBatch > 0 {
+		l.bytesWritten.Add(l.bytesWrittenBatch)
+		l.bytesWrittenBatch = 0
+	}
 }
 
 // h2PoolSettled reports whether the loop, its context cancelled, may shut
