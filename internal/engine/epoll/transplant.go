@@ -322,10 +322,14 @@ func (l *Loop) finishTransplantHandoff(cs *connState) {
 // It runs after the join of the dispatch goroutines, whose quiesce exit
 // always queues its entry before asyncWG.Done, so every owed conn has an
 // entry in detachQueue by now. The conn is closed, not handed on: the loop
-// is stopping and closes every conn it still holds, and the target may be
-// stopping too (the adaptive engine shuts both sub-engines down, and the
-// io_uring adopt queue closes), so a hand-off could leak the descriptor
-// again on its side.
+// is stopping and closes every conn it still holds, healthy keep-alives
+// included (phase 3), so a conn that was on its way out of this loop is
+// closed with them. Handing it on instead would also have a second way to
+// leak: when the adaptive engine shuts both sub-engines down the target is
+// stopping too, and the io_uring adopt queue closes. That is not so on the
+// self-shutdown path (a listener re-create failure stops this loop only and
+// the target stays live), where closing rather than handing on is simply
+// what phase 3 does to this loop's other conns.
 //
 // Nothing is counted and no hook fires, as for every other conn phase 3 of
 // shutdown closes: a stopping loop leaves its counters as they stand (it does

@@ -776,6 +776,8 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
+		// (flushBatchedCounters, at shutdown, repeats these three flushes:
+		// a counter added to the batches goes in both.)
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per event loop
 		// iteration, eliminating cache-line bouncing under multi-worker
@@ -1789,9 +1791,21 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 // closeWhenFlushed and the EPOLLRDHUP branch of onPeerHalfClose, have bytes
 // queued; neither reads cs again. The wall clock, not cachedNow: a loop with no
 // events leaves cachedNow as old as its last event, and a clock stamped with it
-// would be as stale as the lastActivity it replaces. Loop thread.
+// would be as stale as the lastActivity it replaces.
+//
+// The clock starts once. Both callers can run again on a conn that is already
+// closing, with nothing sent in between: an H2 conn whose write was refused
+// stays on h2Conns with writeRefused set, and the run loop's pass re-enters
+// closeWhenFlushed for every frame a handler goes on queueing; an EPOLLET RDHUP
+// bit is reported again with each later EPOLLOUT edge. A restart there would
+// let a peer that takes nothing hold the conn for as long as a handler keeps
+// writing (an SSE stream: for ever). Only send progress moves the clock
+// (noteClosingProgress). Loop thread.
 func (l *Loop) markClosing(cs *connState) {
 	cs.peerClosed = true
+	if cs.closeSince != 0 {
+		return
+	}
 	cs.closeSince = time.Now().UnixNano()
 	cs.closePending = csPendingBytes(cs)
 }
@@ -1803,6 +1817,15 @@ func (l *Loop) markClosing(cs *connState) {
 // (celeris#761, celeris#805). Called from the two flush sites that return to
 // EPOLLOUT or the dirty list with bytes left, never from flushWrites. Loop
 // thread.
+//
+// Progress here is "the queue shrank between two flushes", not "bytes were
+// sent": a queue that grows while the peer reads (an H2 conn closed through
+// the writeRefused path keeps taking stream frames, which are flushed inline
+// without this call; a dispatch goroutine still writing behind an EPOLLRDHUP)
+// is not seen as progress, and such a conn is reaped closingDrainBound after
+// the last shrink. That errs towards cutting sooner, never towards holding a
+// conn longer; before celeris#876 such a conn was reaped ReadTimeout after its
+// last read.
 func (cs *connState) noteClosingProgress(pending int) {
 	if pending < cs.closePending {
 		cs.closeSince = time.Now().UnixNano()
