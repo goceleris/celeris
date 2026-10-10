@@ -3,7 +3,6 @@
 package epoll
 
 import (
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,13 +25,11 @@ import (
 // the socket cannot take at once, and a reader on the peer that counts what
 // arrives until the loop closes the conn.
 type drainRig874 struct {
-	l      *Loop
-	fd     int
-	peer   int
-	queued int
-	got    atomic.Int64
-	done   chan struct{}
-	once   sync.Once
+	l    *Loop
+	fd   int
+	peer int
+	got  atomic.Int64
+	done chan struct{}
 }
 
 func newDrainRig874(t *testing.T, queued int) *drainRig874 {
@@ -43,7 +40,7 @@ func newDrainRig874(t *testing.T, queued int) *drainRig874 {
 	if err != nil {
 		t.Skipf("socketpair unavailable: %v", err)
 	}
-	r := &drainRig874{l: l, fd: pair[0], peer: pair[1], queued: queued, done: make(chan struct{})}
+	r := &drainRig874{l: l, fd: pair[0], peer: pair[1], done: make(chan struct{})}
 	t.Cleanup(func() { _ = unix.Close(r.peer) })
 	if r.fd >= len(l.conns) {
 		_ = unix.Close(r.fd)

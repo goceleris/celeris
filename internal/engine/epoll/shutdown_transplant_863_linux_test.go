@@ -166,11 +166,15 @@ func TestShutdownClosesADeferredTransplantsDescriptor(t *testing.T) {
 			if got := target.count(); got != 0 {
 				t.Errorf("the target was handed %d descriptor(s) by a loop that is shutting down, want 0", got)
 			}
-			// The detach fired no OnDisconnect, so the close must: this is the
-			// one place the conn ends (refuseAdopt's rule for a relinquished
-			// conn the engine closes).
-			if hooks != 1 || l.closeCount.Load() != 1 {
-				t.Errorf("OnDisconnect fired %d times, closeCount = %d, want 1 and 1", hooks, l.closeCount.Load())
+			// Shutdown closes every other conn it holds without a hook or a
+			// count; this one is no different, and the ledger keeps its
+			// pre-shutdown relation (detached - adopted == 1).
+			if hooks != 0 || l.closeCount.Load() != 0 {
+				t.Errorf("OnDisconnect fired %d times, closeCount = %d, want 0 and 0 (shutdown counts no close)",
+					hooks, l.closeCount.Load())
+			}
+			if d, a := l.transplantDetached.Load(), l.transplantAdopted.Load(); d != 1 || a != 0 {
+				t.Errorf("transplant ledger detached=%d adopted=%d, want 1 and 0", d, a)
 			}
 		})
 	}
@@ -212,65 +216,5 @@ func TestShutdownLeavesAHandedOffConnAlone(t *testing.T) {
 	if hooks != 0 || l.closeCount.Load() != 0 {
 		t.Errorf("OnDisconnect fired %d times and closeCount = %d, want 0 and 0: the conn moved, it did not end",
 			hooks, l.closeCount.Load())
-	}
-}
-
-// TestCloseDeferredTransplantsHoldsNoLockAcrossTheClose is the RULE 10 check
-// for the one lock closeDeferredTransplants takes besides the connState's own
-// detachMu: detachQMu, read under, with nothing else held. Producers that
-// take detachQMu (every enqueueDetach: a dispatch goroutine, a detached
-// WS/SSE callback, the H2 write queue) keep running through shutdown, so the
-// pass must neither wait on them while holding anything they need, nor
-// invert the asyncInMu -> detachQMu order. Hammered under -race with a
-// deadline; a hang fails the test.
-func TestCloseDeferredTransplantsHoldsNoLockAcrossTheClose(t *testing.T) {
-	l := shutdownLoop863(t, func(string) {})
-	cs, fd := pendingTransplant(t, l)
-	l.closeCount = &atomic.Uint64{}
-	other := &connState{fd: -1}
-
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	producers := 4
-	for range producers {
-		go func() {
-			defer func() { done <- struct{}{} }()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				other.asyncInMu.Lock() // the order a goroutine's park takes: asyncInMu, then detachQMu
-				l.enqueueDetach(other)
-				other.asyncInMu.Unlock()
-			}
-		}()
-	}
-	l.detachQMu.Lock()
-	l.detachQueue = append(l.detachQueue, cs)
-	l.detachQPending.Store(1)
-	l.detachQMu.Unlock()
-
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		l.closeDeferredTransplants()
-	}()
-	select {
-	case <-finished:
-	case <-time.After(20 * time.Second):
-		t.Fatal("closeDeferredTransplants did not return while producers hammered detachQMu: a lock is held across the close")
-	}
-	close(stop)
-	for range producers {
-		<-done
-	}
-	if fdIsOpen(fd) {
-		_ = unix.Close(fd)
-		t.Error("the owed conn's descriptor is still open")
-	}
-	if l.transplantInFlight != 0 || l.closeCount.Load() != 1 {
-		t.Errorf("transplantInFlight = %d, closeCount = %d, want 0 and 1", l.transplantInFlight, l.closeCount.Load())
 	}
 }

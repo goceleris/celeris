@@ -327,10 +327,13 @@ func (l *Loop) finishTransplantHandoff(cs *connState) {
 // io_uring adopt queue closes), so a hand-off could leak the descriptor
 // again on its side.
 //
-// The detach fired no OnDisconnect and left closeCount alone, so the close
-// counts here, as refuseAdopt does for a relinquished conn an engine ends.
-// TransplantDetached - TransplantAdopted keeps the one conn: it is a record
-// of hand-offs begun, and this one ended in a close.
+// Nothing is counted and no hook fires, as for every other conn phase 3 of
+// shutdown closes: a stopping loop leaves its counters as they stand (it does
+// not decrement activeConns or add to closeCount for what it holds, and calls
+// no OnDisconnect), and the detach had already taken this conn out of
+// activeConns. TransplantDetached - TransplantAdopted keeps the conn, as it
+// did while the descriptor leaked, so accepted - closed - active still equals
+// it.
 //
 // Only the entries are read, under detachQMu and no other lock; the queue is
 // left as it is (shutdown drains nothing else from it). Loop thread.
@@ -372,9 +375,5 @@ func (l *Loop) closeDeferredTransplants() {
 		fd := cs.fd
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
 		_ = unix.Close(fd)
-		l.closeCount.Add(1)
-		if l.cfg.OnDisconnect != nil {
-			l.cfg.OnDisconnect(cs.remoteAddr)
-		}
 	}
 }

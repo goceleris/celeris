@@ -1803,7 +1803,7 @@ func (l *Loop) markClosing(cs *connState) {
 // (celeris#761, celeris#805). Called from the two flush sites that return to
 // EPOLLOUT or the dirty list with bytes left, never from flushWrites. Loop
 // thread.
-func (l *Loop) noteClosingProgress(cs *connState, pending int) {
+func (cs *connState) noteClosingProgress(pending int) {
 	if pending < cs.closePending {
 		cs.closeSince = time.Now().UnixNano()
 	}
@@ -3096,7 +3096,7 @@ func (l *Loop) flushDirty() {
 			// armEpollOut is safe mid-iteration.
 			cs.pendingBytes = csPendingBytes(cs)
 			if cs.peerClosed {
-				l.noteClosingProgress(cs, cs.pendingBytes)
+				cs.noteClosingProgress(cs.pendingBytes)
 			}
 			detachedWS := cs.h1State != nil && cs.h1State.Detached.Load()
 			if mu := cs.detachMu; mu != nil {
@@ -3234,7 +3234,7 @@ func (l *Loop) handleWritable(cs *connState) {
 		} else {
 			cs.pendingBytes = csPendingBytes(cs)
 			if cs.peerClosed {
-				l.noteClosingProgress(cs, cs.pendingBytes)
+				cs.noteClosingProgress(cs.pendingBytes)
 			}
 		}
 	}

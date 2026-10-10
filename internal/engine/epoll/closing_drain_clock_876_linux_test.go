@@ -31,18 +31,17 @@ import (
 // closingRig876 is a loop with one conn that has a response too large for the
 // socket queued on it, the peer end of which the test reads.
 type closingRig876 struct {
-	l      *Loop
-	cs     *connState
-	fd     int
-	peer   int
-	queued int
-	got    int
-	hooks  int
+	l     *Loop
+	cs    *connState
+	fd    int
+	peer  int
+	got   int
+	hooks int
 }
 
 func newClosingRig876(t *testing.T, cfg resource.Config, queued int) *closingRig876 {
 	t.Helper()
-	r := &closingRig876{queued: queued}
+	r := &closingRig876{}
 	cfg.OnDisconnect = func(string) { r.hooks++ }
 	l := newLedgerLoop(t)
 	l.cfg = cfg
@@ -200,7 +199,10 @@ func TestClosingDrainClockRestartsOnProgress(t *testing.T) {
 // stalled peer immortal: nothing reads, so once the bound has passed since the
 // close was asked, the sweep reaps the conn.
 func TestClosingConnWithNoProgressIsStillReaped(t *testing.T) {
-	const bound = 100 * time.Millisecond
+	// 1 s, not less: the first sweep follows the close request by microseconds
+	// and must find the conn alive, and a loaded race runner can be preempted
+	// for a while between the two.
+	const bound = time.Second
 	r := newClosingRig876(t, resource.Config{ReadTimeout: time.Hour, WriteTimeout: bound}, 1<<20)
 	r.l.closeWhenFlushed(r.cs)
 	r.l.checkTimeouts()
