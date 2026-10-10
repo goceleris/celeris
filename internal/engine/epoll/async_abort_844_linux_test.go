@@ -70,6 +70,7 @@ const (
 	arm844DetachRecovered = "detach-recovered" // window 2: the handler recovers it, as the router does
 	arm844Headers         = "headers-log"      // window 3: the panic value is the stream's own header slice
 	arm844Hold            = "hold"             // item 4: the handler waits to be released, then panics or exits
+	arm844BadError        = "bad-error"        // the panic value's Error method itself panics (the abort formats it under detachMu)
 )
 
 type h844 struct {
@@ -130,6 +131,8 @@ func (h *h844) HandleStream(ctx context.Context, s *stream.Stream) error {
 			runtime.Goexit()
 		}
 		panic("celeris844: handler panic after hold")
+	case arm844BadError:
+		panic(badError844{})
 	case arm844Headers:
 		panic(s.Headers) // shares the stream's hdrBuf, which CloseH1 zeroes
 	case arm844DetachRecovered:
@@ -165,6 +168,14 @@ func (h *h844) RouteAsync(_, path string) bool {
 func (*h844) HasAsyncRoutes() bool { return true }
 
 var _ stream.AsyncRouteResolver = (*h844)(nil)
+
+// badError844 is a panic value whose Error method panics: the abort formats the
+// value while it still holds detachMu, so a second panic out of the formatting
+// would skip the release and then end the process (a panic leaving a deferred
+// function in a goroutine nothing recovers).
+type badError844 struct{}
+
+func (badError844) Error() string { panic("celeris844: the panic value's Error method panics") }
 
 // refuse844 is a transplant target that takes nothing: a drain started with it
 // makes the engine's park loop ask, and every hand-off is refused and reclaimed.
@@ -590,6 +601,7 @@ func runArm844(t *testing.T, arm string, inject bool, want string) {
 			if n := h.routeFire.Load(); n != int64(r.workers) {
 				t.Errorf("INJECTION: RouteAsync panicked %d times at the park, want %d", n, r.workers)
 			}
+		case arm844BadError:
 		default:
 			if n := h.hookFire.Load(); n < int64(r.workers) {
 				t.Errorf("INJECTION: the hook fired %d times, want at least %d", n, r.workers)
@@ -630,6 +642,13 @@ func TestAbortPanicInOnDetachWindow844(t *testing.T) {
 func TestAbortPanicInOnDetachWindowRecoveredByTheHandler844(t *testing.T) {
 	runArm844(t, arm844DetachRecovered, true, "closed")
 }
+
+// A panic value whose Error method panics: the abort recovers the formatting,
+// still releases the lock and tears the conn down.
+func TestAbortPanicValueWhoseErrorPanics844(t *testing.T) {
+	runArm844(t, arm844BadError, true, "closed")
+}
+
 func TestAbortOnDetachControl844(t *testing.T) {
 	runArm844(t, arm844DetachPanic, false, "open")
 }
