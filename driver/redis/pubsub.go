@@ -35,6 +35,23 @@ type Message struct {
 type PubSub struct {
 	client *Client
 
+	// ctlMu keeps a control write and the release of its conn apart
+	// (celeris#929). A conn is written by its file-descriptor number, and the
+	// number goes back to the kernel the moment the conn is closed, so a write
+	// that reaches loop.Write after that lands on whichever socket took the
+	// number. Every control write (Subscribe, Unsubscribe, ...) and every
+	// resubscribe of the reconnect loop holds ctlMu from before it reads
+	// ps.conn until its write has returned. Whoever takes a conn out of
+	// ps.conn (Close, the reconnect loop) releases it only after it has
+	// passed through ctlMu with the conn already out, so no write that read
+	// the conn is still in flight.
+	//
+	// Lock order: ctlMu, then mu. Never take ctlMu from deliver, onRecv,
+	// onClose or the close hook (the worker goroutine runs those, and no
+	// loop's Write waits for a worker, so a worker never waits on a writer
+	// that holds ctlMu). Never hold mu across a conn release: UnregisterConn
+	// can wait for an onRecv that is blocked in deliver on mu.
+	ctlMu     sync.Mutex
 	mu        sync.Mutex
 	conn      *redisConn
 	subs      map[string]struct{}
@@ -125,115 +142,101 @@ func (ps *PubSub) Drops() uint64 { return ps.drops.Load() }
 // Subscribe adds channels to the subscription set. The ctx argument is kept
 // for API symmetry with [Client.Subscribe]; cancellation is not honored.
 func (ps *PubSub) Subscribe(_ context.Context, channels ...string) error {
-	if ps.closed.Load() {
-		return ErrClosed
-	}
-	ps.mu.Lock()
-	for _, ch := range channels {
-		ps.subs[ch] = struct{}{}
-	}
-	conn := ps.conn
-	ps.mu.Unlock()
-	args := append([]string{"SUBSCRIBE"}, channels...)
-	return sendPubSubControl(conn, args)
+	return ps.control("SUBSCRIBE", channels, func() {
+		for _, ch := range channels {
+			ps.subs[ch] = struct{}{}
+		}
+	})
 }
 
 // Unsubscribe removes channels. Empty list unsubscribes all. The ctx argument
 // is kept for API symmetry; cancellation is not honored.
 func (ps *PubSub) Unsubscribe(_ context.Context, channels ...string) error {
-	if ps.closed.Load() {
-		return ErrClosed
-	}
-	ps.mu.Lock()
-	if len(channels) == 0 {
-		ps.subs = map[string]struct{}{}
-	} else {
+	return ps.control("UNSUBSCRIBE", channels, func() {
+		if len(channels) == 0 {
+			ps.subs = map[string]struct{}{}
+			return
+		}
 		for _, ch := range channels {
 			delete(ps.subs, ch)
 		}
-	}
-	conn := ps.conn
-	ps.mu.Unlock()
-	args := append([]string{"UNSUBSCRIBE"}, channels...)
-	return sendPubSubControl(conn, args)
+	})
 }
 
 // PSubscribe adds patterns to the subscription set. The ctx argument is kept
 // for API symmetry; cancellation is not honored.
 func (ps *PubSub) PSubscribe(_ context.Context, patterns ...string) error {
-	if ps.closed.Load() {
-		return ErrClosed
-	}
-	ps.mu.Lock()
-	for _, p := range patterns {
-		ps.psubs[p] = struct{}{}
-	}
-	conn := ps.conn
-	ps.mu.Unlock()
-	args := append([]string{"PSUBSCRIBE"}, patterns...)
-	return sendPubSubControl(conn, args)
+	return ps.control("PSUBSCRIBE", patterns, func() {
+		for _, p := range patterns {
+			ps.psubs[p] = struct{}{}
+		}
+	})
 }
 
 // PUnsubscribe removes patterns. Empty list unsubscribes all patterns. The
 // ctx argument is kept for API symmetry; cancellation is not honored.
 func (ps *PubSub) PUnsubscribe(_ context.Context, patterns ...string) error {
-	if ps.closed.Load() {
-		return ErrClosed
-	}
-	ps.mu.Lock()
-	if len(patterns) == 0 {
-		ps.psubs = map[string]struct{}{}
-	} else {
+	return ps.control("PUNSUBSCRIBE", patterns, func() {
+		if len(patterns) == 0 {
+			ps.psubs = map[string]struct{}{}
+			return
+		}
 		for _, p := range patterns {
 			delete(ps.psubs, p)
 		}
-	}
-	conn := ps.conn
-	ps.mu.Unlock()
-	args := append([]string{"PUNSUBSCRIBE"}, patterns...)
-	return sendPubSubControl(conn, args)
+	})
 }
 
 // SSubscribe adds shard channels (Redis 7+ SSUBSCRIBE) to the subscription
 // set. Shard channels are scoped to the cluster slot of the channel name. The
 // ctx argument is kept for API symmetry; cancellation is not honored.
 func (ps *PubSub) SSubscribe(_ context.Context, channels ...string) error {
-	if ps.closed.Load() {
-		return ErrClosed
-	}
-	ps.mu.Lock()
-	for _, ch := range channels {
-		ps.shardSubs[ch] = struct{}{}
-	}
-	conn := ps.conn
-	ps.mu.Unlock()
-	args := append([]string{"SSUBSCRIBE"}, channels...)
-	return sendPubSubControl(conn, args)
+	return ps.control("SSUBSCRIBE", channels, func() {
+		for _, ch := range channels {
+			ps.shardSubs[ch] = struct{}{}
+		}
+	})
 }
 
 // SUnsubscribe removes shard channels. Empty list unsubscribes all shard
 // channels. The ctx argument is kept for API symmetry; cancellation is not
 // honored.
 func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
-	if ps.closed.Load() {
-		return ErrClosed
-	}
-	ps.mu.Lock()
-	if len(channels) == 0 {
-		ps.shardSubs = map[string]struct{}{}
-	} else {
+	return ps.control("SUNSUBSCRIBE", channels, func() {
+		if len(channels) == 0 {
+			ps.shardSubs = map[string]struct{}{}
+			return
+		}
 		for _, ch := range channels {
 			delete(ps.shardSubs, ch)
 		}
+	})
+}
+
+// control applies update to the tracked sets under mu, then sends verb with
+// names on the conn ps holds at that moment. The send runs under ctlMu, so
+// the conn cannot be released while it is in flight: the write goes to the
+// conn it was issued on or fails, and never reaches another socket that took
+// the conn's number (celeris#929). When ps has no conn (it is closed, or the
+// reconnect loop has not yet replaced a dropped one) the sets are still
+// updated, so the reconnect replays them, and the call returns ErrClosed as
+// it always did.
+func (ps *PubSub) control(verb string, names []string, update func()) error {
+	if ps.closed.Load() {
+		return ErrClosed
 	}
+	ps.ctlMu.Lock()
+	defer ps.ctlMu.Unlock()
+	ps.mu.Lock()
+	update()
 	conn := ps.conn
 	ps.mu.Unlock()
-	args := append([]string{"SUNSUBSCRIBE"}, channels...)
-	return sendPubSubControl(conn, args)
+	return sendPubSubControl(conn, append([]string{verb}, names...))
 }
 
 // sendPubSubControl writes a control command without tracking a reply (pubsub
-// control frames are delivered as push).
+// control frames are delivered as push). The caller holds ps.ctlMu and read
+// conn from ps.conn under it.
 func sendPubSubControl(conn *redisConn, args []string) error {
 	if conn == nil {
 		return ErrClosed
@@ -253,12 +256,40 @@ func (ps *PubSub) Close() error {
 	ps.conn = nil
 	ps.mu.Unlock()
 	if conn != nil {
-		conn.state.router.clear()
-		conn.setPubSubCloseHook(nil)
+		// Detach first: unregistering the conn fails a control write that
+		// is still in flight on it (or unblocks one that waits on a full
+		// send buffer), and the number is still the conn's own, so that
+		// write cannot reach another socket. Then wait for every writer
+		// that read conn before it was taken out (ctlMu), and release the
+		// number under it, so none can start after the release either.
+		ps.detach(conn)
+		ps.ctlMu.Lock()
 		ps.client.pool.releasePubSub(conn)
+		ps.ctlMu.Unlock()
 	}
 	ps.closeMsgCh()
 	return nil
+}
+
+// detach unhooks conn from ps and removes it from its worker's interest set.
+// It does not release the conn's number; releasePubSub does, once.
+func (ps *PubSub) detach(conn *redisConn) {
+	conn.state.router.clear()
+	conn.setPubSubCloseHook(nil)
+	conn.unregister()
+}
+
+// takeConn clears ps.conn if it is still conn and reports whether the caller
+// now owns conn. Whoever takes a conn out of ps.conn is the one that releases
+// it, so every conn the pool handed out is released exactly once.
+func (ps *PubSub) takeConn(conn *redisConn) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.conn != conn {
+		return false
+	}
+	ps.conn = nil
+	return true
 }
 
 // closeMsgCh closes msgCh exactly once. Holds ps.mu to serialize with deliver.
@@ -343,13 +374,20 @@ func (ps *PubSub) reconnectLoop() {
 		if err != nil {
 			continue
 		}
+		ps.ctlMu.Lock()
 		ps.mu.Lock()
 		if ps.closed.Load() {
 			ps.mu.Unlock()
-			_ = conn.Close()
+			ps.ctlMu.Unlock()
+			// Never installed: nothing else holds conn.
 			ps.client.pool.releasePubSub(conn)
 			return
 		}
+		// Install conn under ctlMu and mu together, and resubscribe on it
+		// before ctlMu is let go: a caller's control write then goes to
+		// conn, after the replay, and Close cannot release conn under the
+		// replay's writes.
+		old := ps.conn
 		ps.conn = conn
 		subs := make([]string, 0, len(ps.subs))
 		for s := range ps.subs {
@@ -365,34 +403,46 @@ func (ps *PubSub) reconnectLoop() {
 		}
 		ps.mu.Unlock()
 		ps.bindConn(conn)
-		if len(subs) > 0 {
-			if err := sendPubSubControl(conn, append([]string{"SUBSCRIBE"}, subs...)); err != nil {
-				ps.mu.Lock()
-				ps.conn = nil
-				ps.mu.Unlock()
-				_ = conn.Close()
+		ok := true
+		for _, r := range [...]struct {
+			verb  string
+			names []string
+		}{{"SUBSCRIBE", subs}, {"PSUBSCRIBE", psubs}, {"SSUBSCRIBE", ssubs}} {
+			if len(r.names) == 0 {
 				continue
 			}
-		}
-		if len(psubs) > 0 {
-			if err := sendPubSubControl(conn, append([]string{"PSUBSCRIBE"}, psubs...)); err != nil {
-				ps.mu.Lock()
-				ps.conn = nil
-				ps.mu.Unlock()
-				_ = conn.Close()
-				continue
+			if ps.closed.Load() {
+				ok = false
+				break
+			}
+			if err := sendPubSubControl(conn, append([]string{r.verb}, r.names...)); err != nil {
+				ok = false
+				break
 			}
 		}
-		if len(ssubs) > 0 {
-			if err := sendPubSubControl(conn, append([]string{"SSUBSCRIBE"}, ssubs...)); err != nil {
-				ps.mu.Lock()
-				ps.conn = nil
-				ps.mu.Unlock()
-				_ = conn.Close()
-				continue
-			}
+		// conn may have died after bindConn but before its close hook was
+		// set (the hook fires once, when the conn closes): look.
+		if ok && conn.closed.Load() {
+			ok = false
 		}
-		ps.backoff.Reset()
-		return
+		var failed *redisConn
+		if !ok && ps.takeConn(conn) {
+			failed = conn // else Close took it and releases it
+		}
+		ps.ctlMu.Unlock()
+		// The dropped conn is out of ps.conn, no writer can hold it (writers
+		// hold ctlMu and read ps.conn under it): release it, once.
+		if old != nil {
+			ps.detach(old)
+			ps.client.pool.releasePubSub(old)
+		}
+		if failed != nil {
+			ps.detach(failed)
+			ps.client.pool.releasePubSub(failed)
+		}
+		if ok {
+			ps.backoff.Reset()
+			return
+		}
 	}
 }
