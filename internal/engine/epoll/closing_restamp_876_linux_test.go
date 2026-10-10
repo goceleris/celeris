@@ -26,6 +26,15 @@ func TestRepeatedCloseRequestsDoNotRestartTheDrainClock(t *testing.T) {
 	aged := time.Now().Add(-10 * time.Second).UnixNano()
 	r.cs.closeSince = aged
 
+	// A flush that sends nothing is not progress (the peer reads nothing
+	// here, and the queue is exactly what it was when the clock started): the
+	// clock moves on a queue that SHRANK, not on one that did not.
+	r.l.handleWritable(r.cs)
+	if r.cs.closeSince != aged {
+		t.Fatalf("handleWritable, on a flush that sent nothing, moved closeSince by %v: a restart without progress "+
+			"(celeris#876)", time.Duration(r.cs.closeSince-aged))
+	}
+
 	for i := 0; i < 3; i++ {
 		r.cs.writeBuf = append(r.cs.writeBuf, make([]byte, 100)...) // a frame queued behind the rest
 		r.l.closeWhenFlushed(r.cs)

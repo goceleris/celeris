@@ -41,16 +41,26 @@ type closingRig876 struct {
 
 func newClosingRig876(t *testing.T, cfg resource.Config, queued int) *closingRig876 {
 	t.Helper()
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Skipf("socketpair unavailable: %v", err)
+	}
+	// A small queue (a unix stream socket queues on the sender's side), so a
+	// response of a few hundred KiB already overruns it.
+	_ = unix.SetsockoptInt(pair[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 32<<10)
+	return newClosingRigOn876(t, cfg, queued, pair[0], pair[1])
+}
+
+// newClosingRigOn876 is newClosingRig876 on the socket pair the caller made:
+// fd is the conn the loop owns, peer the client's end.
+func newClosingRigOn876(t *testing.T, cfg resource.Config, queued, fd, peer int) *closingRig876 {
+	t.Helper()
 	r := &closingRig876{}
 	cfg.OnDisconnect = func(string) { r.hooks++ }
 	l := newLedgerLoop(t)
 	l.cfg = cfg
 	r.l = l
-	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK, 0)
-	if err != nil {
-		t.Skipf("socketpair unavailable: %v", err)
-	}
-	r.fd, r.peer = pair[0], pair[1]
+	r.fd, r.peer = fd, peer
 	t.Cleanup(func() { _ = unix.Close(r.peer) })
 	if r.fd >= len(l.conns) {
 		_ = unix.Close(r.fd)
@@ -61,9 +71,6 @@ func newClosingRig876(t *testing.T, cfg resource.Config, queued int) *closingRig
 			_ = unix.Close(r.fd)
 		}
 	})
-	// A small queue (a unix stream socket queues on the sender's side), so a
-	// response of a few hundred KiB already overruns it.
-	_ = unix.SetsockoptInt(r.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 32<<10)
 	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, r.fd, &unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP, Fd: int32(r.fd),
 	}); err != nil {

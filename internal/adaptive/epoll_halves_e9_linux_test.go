@@ -196,3 +196,129 @@ func TestAdaptiveEpollSlowReaderOfAClosingResponseIsNotCut(t *testing.T) {
 	}
 
 }
+
+// slowDialSmall dials with a 16 KiB receive buffer.
+func slowDialSmall(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	d := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 16<<10)
+		})
+	}}
+	c, err := d.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// waitActiveE9 waits for the engine to have accepted the conn.
+func waitActiveE9(t *testing.T, e *Engine) {
+	t.Helper()
+	for dl := time.Now().Add(5 * time.Second); e.Metrics().ActiveConnections == 0 && time.Now().Before(dl); {
+		time.Sleep(time.Millisecond)
+	}
+	if e.Metrics().ActiveConnections != 1 {
+		t.Fatalf("e9 PREMISE: %d conns active after the request was sent", e.Metrics().ActiveConnections)
+	}
+}
+
+// readSlowlyE9 takes 16 KiB from c every 250 ms (64 KiB/s) for d. It reports
+// how much it got, the error that ended it early if one did, and how long into
+// d the SERVER closed the conn (active() == 0) if it did, 0 if it did not: with
+// a send queue of MiB behind the cut the client keeps reading what the kernel
+// holds, so a server-side close shows in the engine's own count, not in an
+// error.
+func readSlowlyE9(c net.Conn, d time.Duration, active func() uint64) (got int64, closedAt time.Duration, err error) {
+	buf := make([]byte, 16<<10)
+	start := time.Now()
+	for end := start.Add(d); time.Now().Before(end); time.Sleep(250 * time.Millisecond) {
+		if closedAt == 0 && active() == 0 {
+			closedAt = time.Since(start)
+		}
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, rerr := c.Read(buf)
+		got += int64(n)
+		if rerr != nil {
+			return got, closedAt, rerr
+		}
+	}
+	if closedAt == 0 && active() == 0 {
+		closedAt = time.Since(start)
+	}
+	return got, closedAt, nil
+}
+
+// TestAdaptiveEpollClosingResponseSurvivesASlowSteadyReader is the round-3
+// review of #876 through the adaptive engine: a Connection: close response of
+// 40 MiB taken at 64 KiB/s for 4 s with WriteTimeout 1 s (below ReadTimeout,
+// an hour) and for 7 s with WriteTimeout disabled (the 5 s floor), then the
+// rest at full speed. The epoll loop waits for an EPOLLOUT edge that a socket
+// raises only after half its send queue drained, which at this rate is far
+// beyond the bound; the response must not be cut meanwhile.
+func TestAdaptiveEpollClosingResponseSurvivesASlowSteadyReader(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wt   time.Duration
+		slow time.Duration
+	}{
+		{"WriteTimeout1s", time.Second, 4 * time.Second},
+		{"WriteTimeoutDisabled", -1, 7 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const body = 40 << 20
+			e, _, _ := startEpollAdaptive(t, resource.Config{ReadTimeout: time.Hour, WriteTimeout: tc.wt}, bigBodyHandler(body))
+			c := slowDialSmall(t, e.Addr().String())
+			if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			waitActiveE9(t, e)
+			start := time.Now()
+			active := func() uint64 { return uint64(e.Metrics().ActiveConnections) }
+			got, closedAt, err := readSlowlyE9(c, tc.slow, active)
+			if err != nil || closedAt != 0 {
+				t.Fatalf("the closing response was cut %v in (the engine closed the conn at %v, read error %v), with the "+
+					"client taking 64 KiB/s (%d bytes so far) and a bound of WriteTimeout %v (celeris#876)",
+					time.Since(start).Round(time.Millisecond), closedAt.Round(time.Millisecond), err, got, tc.wt)
+			}
+			_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+			rest, err := io.Copy(io.Discard, c)
+			got += rest
+			if err != nil || got < body {
+				t.Fatalf("the client received %d of %d body bytes (err %v): the response was cut (celeris#876)", got, body, err)
+			}
+			t.Logf("client took %d bytes slowly over %v, all %d in %v, WriteTimeout %v", got-rest, tc.slow, got,
+				time.Since(start).Round(time.Millisecond), tc.wt)
+		})
+	}
+}
+
+// TestAdaptiveEpollClosingConnIsReapedWhenASlowReaderStops is the stalled-peer
+// half: the same client reads for 2 s, then takes nothing, and the conn must
+// go about WriteTimeout (1 s) later, not at ReadTimeout (an hour).
+func TestAdaptiveEpollClosingConnIsReapedWhenASlowReaderStops(t *testing.T) {
+	e, _, _ := startEpollAdaptive(t, resource.Config{ReadTimeout: time.Hour, WriteTimeout: time.Second}, bigBodyHandler(40<<20))
+	c := slowDialSmall(t, e.Addr().String())
+	if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	waitActiveE9(t, e)
+	active := func() uint64 { return uint64(e.Metrics().ActiveConnections) }
+	if _, closedAt, err := readSlowlyE9(c, 2*time.Second, active); err != nil || closedAt != 0 {
+		t.Fatalf("the conn was closed by the engine %v into a steady read (read error %v), before the client stopped "+
+			"reading (celeris#876)", closedAt.Round(time.Millisecond), err)
+	}
+	stalled := time.Now()
+	for e.Metrics().ActiveConnections != 0 && time.Since(stalled) < 15*time.Second {
+		time.Sleep(10 * time.Millisecond)
+	}
+	took := time.Since(stalled)
+	if e.Metrics().ActiveConnections != 0 {
+		t.Fatalf("a closing conn whose client stopped reading was still open %v later (WriteTimeout 1s)", took.Round(time.Millisecond))
+	}
+	if took > 4*time.Second {
+		t.Fatalf("the conn lived %v after the client stopped reading; want about WriteTimeout (1s)", took.Round(time.Millisecond))
+	}
+	t.Logf("conn closed %v after the client stopped reading", took.Round(time.Millisecond))
+}

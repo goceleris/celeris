@@ -1799,8 +1799,12 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 // closeWhenFlushed for every frame a handler goes on queueing; an EPOLLET RDHUP
 // bit is reported again with each later EPOLLOUT edge. A restart there would
 // let a peer that takes nothing hold the conn for as long as a handler keeps
-// writing (an SSE stream: for ever). Only send progress moves the clock
-// (noteClosingProgress). Loop thread.
+// writing (an SSE stream: for ever). Only evidence that the peer is taking the
+// response moves the clock (noteClosingProgress, noteClosingAcked). Loop thread.
+//
+// csPendingBytes below reads the dispatch goroutine's buffers unlocked on the
+// EPOLLRDHUP path, a known race (celeris#865, tracked in celeris#885): it feeds
+// only the progress baseline and cannot make the close wrong.
 func (l *Loop) markClosing(cs *connState) {
 	cs.peerClosed = true
 	if cs.closeSince != 0 {
@@ -1818,14 +1822,12 @@ func (l *Loop) markClosing(cs *connState) {
 // EPOLLOUT or the dirty list with bytes left, never from flushWrites. Loop
 // thread.
 //
-// Progress here is "the queue shrank between two flushes", not "bytes were
-// sent": a queue that grows while the peer reads (an H2 conn closed through
-// the writeRefused path keeps taking stream frames, which are flushed inline
-// without this call; a dispatch goroutine still writing behind an EPOLLRDHUP)
-// is not seen as progress, and such a conn is reaped closingDrainBound after
-// the last shrink. That errs towards cutting sooner, never towards holding a
-// conn longer; before celeris#876 such a conn was reaped ReadTimeout after its
-// last read.
+// This is one of two kinds of evidence that the peer is taking bytes, and the
+// coarser: the userspace queue shrinks only at a flush, and a flush follows an
+// EPOLLOUT edge, which a socket raises once about half of its send queue has
+// drained. A client taking 64 KiB/s of a response behind a send queue of MiB
+// goes a minute between two edges. noteClosingAcked is the other, and sees
+// those bytes go.
 func (cs *connState) noteClosingProgress(pending int) {
 	if pending < cs.closePending {
 		cs.closeSince = time.Now().UnixNano()
@@ -1833,11 +1835,48 @@ func (cs *connState) noteClosingProgress(pending int) {
 	cs.closePending = pending
 }
 
+// noteClosingAcked is the sweep's evidence of progress on a closing conn: the
+// number of bytes the peer has acknowledged (tcp_info bytes_acked, which only
+// grows) moved since the last sample. It restarts the drain clock the same way
+// a flush that sent bytes does (noteClosingProgress), and answers whether it
+// did. The first sample of a conn is its baseline and counts as no progress,
+// unless the conn is first met after its bound had already passed (a loop whose
+// sweeps are further apart than a short WriteTimeout): there is no baseline to
+// compare with, and the conn is given one more bound rather than cut on no
+// evidence.
+//
+// Not on the hot path: checkTimeouts calls it for a closing conn, at most
+// every quarter of the bound (closeSampled), and it costs one getsockopt. A
+// descriptor that is not a TCP socket, or a kernel that does not report the
+// count (before Linux 4.1), yields no evidence, which leaves the userspace
+// queue's rule alone. Loop thread.
+func (l *Loop) noteClosingAcked(cs *connState, now int64) (progressed bool) {
+	cs.closeSampled = now
+	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	if err != nil {
+		return false
+	}
+	known, prev := cs.closeAckedKnown, cs.closeAcked
+	cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+	if known {
+		progressed = ti.Bytes_acked > prev
+	} else {
+		progressed = now-cs.closeSince > int64(l.closingDrainBound())
+	}
+	if progressed {
+		cs.closeSince = now
+	}
+	return progressed
+}
+
 // closingDrainBound is how long a conn markClosing deferred may go without the
 // peer taking a byte of its response: WriteTimeout, the bound a live conn
-// stalled on a write gets (checkTimeouts). WriteTimeout 0 is "no bound" for a
-// live conn, but a closing conn has no handler and no request to wait for, so
-// one whose peer reads nothing would hold its descriptor for ever; it gets
+// stalled on a write gets (checkTimeouts). "Taking a byte" is the userspace
+// queue shrinking at a flush (noteClosingProgress) or the peer acknowledging
+// more bytes (noteClosingAcked); a reader the kernel is still draining to is
+// never the stalled peer this bounds. WriteTimeout 0 is "no bound" for a live
+// conn, but a closing conn has no handler and no request to wait for, so one
+// whose peer reads nothing would hold its descriptor for ever; it gets
 // closingDrainFloor, as io_uring's drain does.
 func (l *Loop) closingDrainBound() time.Duration {
 	if wt := l.cfg.WriteTimeout; wt > 0 {
@@ -3407,7 +3446,8 @@ const detachDrainGrace = time.Second
 
 // closingDrainFloor bounds the drain of a conn whose close is deferred behind
 // its response (markClosing) when WriteTimeout is disabled: how long the peer
-// may take nothing of it. io_uring's closingDrainTimeoutNanos is the same 5 s.
+// may take nothing of it (no acknowledged byte, no flush that sent some).
+// io_uring's closingDrainTimeoutNanos is the same 5 s.
 const closingDrainFloor = 5 * time.Second
 
 // h1DeadlineSnapshot is what checkTimeouts knows about a conn's H1 state: a
@@ -3559,11 +3599,19 @@ func (l *Loop) checkTimeouts() {
 		// IdleTimeout measured from there cut a response the client was
 		// still taking (celeris#876). Nor is there a request any more for a
 		// header deadline to bound. closeSince starts at the close request
-		// and moves forward with each flush that sends (noteClosingProgress).
+		// and moves forward with each flush that sends (noteClosingProgress)
+		// and with each sweep that finds the peer has acknowledged more bytes
+		// (noteClosingAcked): a socket raises EPOLLOUT only after about half
+		// of its send queue drained, so a slow client is taking the response
+		// long before the flush that would show it.
 		// Keyed on the clock, not peerClosed: a conn that carries
 		// peerClosed without it (a test fixture) takes the scan below.
 		if cs.closeSince != 0 {
-			if time.Duration(now-cs.closeSince) > l.closingDrainBound() {
+			bound := l.closingDrainBound()
+			if time.Duration(now-cs.closeSampled) >= bound/4 {
+				l.noteClosingAcked(cs, now)
+			}
+			if time.Duration(now-cs.closeSince) > bound {
 				l.closeConn(fd)
 			}
 			continue

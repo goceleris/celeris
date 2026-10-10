@@ -153,17 +153,24 @@ type connState struct {
 	// error, a refused write; celeris#761): the close it defers is the same.
 	peerClosed bool
 
-	// closeSince and closePending are the clock of that deferred close
-	// (celeris#876): closeSince is when the engine last saw the close move
-	// forward, in nanoseconds, from the request that deferred it
-	// (markClosing) and then from each flush that took some of the response
-	// (noteClosingProgress); closePending is how many bytes were queued at
-	// that point. checkTimeouts reaps a conn whose closeSince is older than
-	// closingDrainBound, and measures nothing else on it: lastActivity is
-	// the last READ, and a conn that is closing is no longer read. 0 when no
-	// deferred close is under way. Worker-thread-only; reset on release.
-	closeSince   int64
-	closePending int
+	// closeSince, closePending and closeAcked are the clock of that deferred
+	// close (celeris#876): closeSince is when the engine last saw the close
+	// move forward, in nanoseconds, from the request that deferred it
+	// (markClosing), then from each flush that took some of the response
+	// (noteClosingProgress), then from each sample of the socket that finds
+	// the peer has acknowledged more bytes (noteClosingAcked); closePending is
+	// how many bytes were queued at the last flush, closeAcked the peer's
+	// acknowledged byte count at the last sample (closeAckedKnown: whether
+	// there is one) and closeSampled when that was. checkTimeouts reaps a conn
+	// whose closeSince is older than closingDrainBound, and measures nothing
+	// else on it: lastActivity is the last READ, and a conn that is closing is
+	// no longer read. 0 when no deferred close is under way. Worker-thread-
+	// only; reset on release.
+	closeSince      int64
+	closePending    int
+	closeAcked      uint64
+	closeSampled    int64
+	closeAckedKnown bool
 
 	// writeRefused records that response bytes were lost (celeris#761): a
 	// write hook refused them because the conn's backlog was already over
@@ -388,6 +395,9 @@ func releaseConnState(cs *connState) {
 	cs.peerClosed = false
 	cs.closeSince = 0
 	cs.closePending = 0
+	cs.closeAcked = 0
+	cs.closeAckedKnown = false
+	cs.closeSampled = 0
 	cs.writeRefused = false
 	cs.drainDeadline = 0
 	cs.asyncRun = false
