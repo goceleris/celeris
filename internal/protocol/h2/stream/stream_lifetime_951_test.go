@@ -343,6 +343,26 @@ func TestRetiredStreamIsReleasedByTheLoopOnce951(t *testing.T) {
 				if s.manager != nil {
 					t.Fatalf("iteration %d: the batch ended and the stream was not released", i)
 				}
+				// The queue is empty and keeps no pointer to a stream that is
+				// pooled now: a stale entry would release another
+				// connection's stream at the next batch.
+				m.mu.Lock()
+				left, flagged := len(m.retired), m.hasRetired.Load()
+				var held int
+				for _, q := range m.retired[:cap(m.retired)] {
+					if q != nil {
+						held++
+					}
+				}
+				for _, q := range m.drainBuf[:cap(m.drainBuf)] {
+					if q != nil {
+						held++
+					}
+				}
+				m.mu.Unlock()
+				if left != 0 || flagged || held != 0 {
+					t.Fatalf("iteration %d: after the drain %d streams are queued (flag %v) and %d pointers to released streams are kept", i, left, flagged, held)
+				}
 				p.FlushInlineCleanup() // nothing is retired now
 				seen := 0
 				for range 64 {
