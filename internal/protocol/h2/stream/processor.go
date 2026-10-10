@@ -312,26 +312,34 @@ const maxHeaderListSize = 64 << 10
 // to each field's size.
 const headerFieldOverhead = 32
 
-// headerBlockExpansion is how many times longer, on the wire, the HPACK
-// block of a header list within the bound can be than the bound itself. It is
-// the cap on a block still being assembled from CONTINUATION frames
+// headerBlockExpansion is how many times longer, on the wire, the HPACK block
+// of a header list within the bound can be than the bound itself. It sets the
+// cap on a block still being assembled from CONTINUATION frames
 // (handleContinuation): the bound counts decoded bytes (hpackEmit), a block
 // is wire bytes, and a field can take more of those than the bound charges it.
+//
 // An encoder may Huffman-code a string even when the code is longer than the
 // string (RFC 7541 §5.2): up to 30 bits for a byte (19 for a printable one,
-// the backslash), 3.75 wire bytes for a byte; a string length is an integer of up to
-// 4 bytes, and a literal field carries two of them and an opcode, 9 bytes in
-// all; each string rounds up to a whole byte. A field of n name and v value
-// bytes is at most 3.75(n+v)+11 bytes on the wire, and the bound charges it
-// n+v+32, so 4 times the charge is never short of its encoding (the cap is
-// 4 x the bound, see TestFieldEncodingNeverExceedsTheBlockCap944): a block
-// within the cap is the most a list within the bound can be. It is a worst
-// case, not the exact count: a block between the bound and the cap is
-// assembled, decoded, and refused by the exact bound (RST_STREAM on its
-// stream), never by this cap (GOAWAY). What the cap does not cover is a
-// block of table-size updates (RFC 7541 §6.3), fields it does not carry:
-// an encoder sends one or two, and a block that is mostly them is not one.
-// The server keeps at most this many bytes of a block per connection.
+// the backslash), that is 3.75 wire bytes for a byte. A string length is an
+// integer of up to 4 bytes, a literal field carries two of them and an
+// opcode (9 bytes), and each string rounds up to a whole byte. So a field of
+// n name and v value bytes is at most 3.75(n+v)+11 bytes on the wire, and the
+// bound charges it n+v+32: four times the charge, 4(n+v)+128, is never short
+// of the encoding, with 0.25(n+v)+117 bytes to spare for every field
+// (TestFieldEncodingNeverExceedsTheBlockCap944 checks it over the size
+// classes). A list within the bound is therefore a block within the cap.
+//
+// What is left over is the table-size updates of RFC 7541 §6.3, which are no
+// field: an encoder sends at most two (about 10 bytes, inside the spare of
+// any one field), and only a block padded with many of them, which the
+// decoder accepts while its table is empty, can pass the cap with a list
+// that is within the bound; that is not a header list.
+//
+// It is a worst case, not an exact count: a block between the bound and the
+// cap is assembled, decoded, and refused by the exact bound (RST_STREAM on
+// its stream), never by this cap (GOAWAY, which ends the connection). The
+// server keeps at most this many bytes of a block per connection after the
+// first fragment (which is capped by the frame size only).
 const headerBlockExpansion = 4
 
 // NewProcessor creates a new stream processor. The conn parameter must
