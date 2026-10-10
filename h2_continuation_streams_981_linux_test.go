@@ -34,6 +34,7 @@ type wire981 struct {
 	addr string
 	hb   bytes.Buffer
 	enc  *hpack.Encoder
+	wmu  sync.Mutex // the framer's writes: the test's requests and the reader's SETTINGS ack
 
 	mu     sync.Mutex
 	rst    map[uint32]http2.ErrCode
@@ -82,7 +83,9 @@ func (w *wire981) read() {
 		switch f := f.(type) {
 		case *http2.SettingsFrame:
 			if !f.IsAck() {
+				w.wmu.Lock()
 				_ = w.fr.WriteSettingsAck()
+				w.wmu.Unlock()
 			}
 		case *http2.RSTStreamFrame:
 			w.rst[f.StreamID] = f.ErrCode
@@ -103,20 +106,27 @@ func (w *wire981) read() {
 // CONTINUATION (END_HEADERS) with the rest.
 func (w *wire981) get(id uint32, split bool) {
 	w.t.Helper()
+	if err := w.try(id, split); err != nil {
+		w.t.Fatalf("stream %d: %v", id, err)
+	}
+}
+
+// try is get, returning the write error.
+func (w *wire981) try(id uint32, split bool) error {
+	w.wmu.Lock()
+	defer w.wmu.Unlock()
 	w.hb.Reset()
 	for _, f := range [][2]string{{":method", "GET"}, {":scheme", "http"}, {":authority", w.addr}, {":path", "/hold"}} {
 		_ = w.enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
 	}
 	blk := append([]byte(nil), w.hb.Bytes()...)
-	var err error
 	if !split {
-		err = w.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk, EndStream: true, EndHeaders: true})
-	} else if err = w.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk[:3], EndStream: true, EndHeaders: false}); err == nil {
-		err = w.fr.WriteContinuation(id, true, blk[3:])
+		return w.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk, EndStream: true, EndHeaders: true})
 	}
-	if err != nil {
-		w.t.Fatalf("stream %d: %v", id, err)
+	if err := w.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk[:3], EndStream: true, EndHeaders: false}); err != nil {
+		return err
 	}
+	return w.fr.WriteContinuation(id, true, blk[3:])
 }
 
 func (w *wire981) state() (rst map[uint32]http2.ErrCode, status map[uint32]string, goaway string) {
