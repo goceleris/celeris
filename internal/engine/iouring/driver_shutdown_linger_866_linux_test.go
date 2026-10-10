@@ -133,8 +133,17 @@ func shutdownLingerAttempt866(t *testing.T, n, linger int) (verdict string, ok b
 		s.w.waitDriverCloses()
 		close(done)
 	}()
-	time.Sleep(time.Duration(linger) * time.Second / 2)
-	waiting, returned, notStarted := s.classify(t)
+	// Every close must be in its linger wait together. A closer goroutine on a
+	// loaded runner may start a little late, so poll until they all are, up to
+	// three quarters of the linger; a serial close never gets there (its second
+	// close begins when the first returns, a full linger in).
+	var waiting, returned, notStarted int
+	for deadline := time.Now().Add(time.Duration(linger) * time.Second * 3 / 4); ; time.Sleep(10 * time.Millisecond) {
+		waiting, returned, notStarted = s.classify(t)
+		if returned > 0 || (waiting == n && notStarted == 0) || time.Now().After(deadline) {
+			break
+		}
+	}
 	verdict = "waiting=" + strconv.Itoa(waiting) + " returned=" + strconv.Itoa(returned) + " notStarted=" + strconv.Itoa(notStarted)
 	if returned > 0 || waiting == 0 {
 		s.drainAll()
@@ -217,20 +226,20 @@ func TestCloseFDsInParallelBound866(t *testing.T) {
 		dcs[i] = &driverConn{opFD: i}
 	}
 	var (
-		mu       sync.Mutex
-		seen     = make(map[int]int, conns)
-		cur, max int
-		reached  = make(chan struct{})
-		once     sync.Once
+		mu         sync.Mutex
+		seen       = make(map[int]int, conns)
+		curN, maxN int
+		reached    = make(chan struct{})
+		once       sync.Once
 	)
 	closeFn := func(fd int) {
 		mu.Lock()
 		seen[fd]++
-		cur++
-		if cur > max {
-			max = cur
+		curN++
+		if curN > maxN {
+			maxN = curN
 		}
-		if cur == workers {
+		if curN == workers {
 			once.Do(func() { close(reached) })
 		}
 		mu.Unlock()
@@ -243,20 +252,20 @@ func TestCloseFDsInParallelBound866(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 		mu.Lock()
-		cur--
+		curN--
 		mu.Unlock()
 	}
 	closeFDsInParallel(dcs, workers, closeFn)
-	if max != workers {
-		t.Errorf("at most %d closes were in flight at once, want exactly the bound %d", max, workers)
+	if maxN != workers {
+		t.Errorf("at most %d closes were in flight at once, want exactly the bound %d", maxN, workers)
 	}
 	for fd := 0; fd < conns; fd++ {
 		if seen[fd] != 1 {
 			t.Errorf("fd %d closed %d times, want once", fd, seen[fd])
 		}
 	}
-	if cur != 0 {
-		t.Errorf("%d closes still in flight after closeFDsInParallel returned", cur)
+	if curN != 0 {
+		t.Errorf("%d closes still in flight after closeFDsInParallel returned", curN)
 	}
 	closeFDsInParallel(nil, workers, func(int) { t.Error("closeFn called for no conns") })
 	if shutdownDriverCloseWorkers < 2 || shutdownDriverCloseWorkers > 1024 {
