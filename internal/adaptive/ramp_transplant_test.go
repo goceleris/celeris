@@ -30,12 +30,12 @@ import (
 func newRampAdaptive(t *testing.T, h stream.Handler, cfg resource.Config) (*Engine, string, func()) {
 	t.Helper()
 	if !probe.Probe().IOUringTier.Available() {
-		t.Skip("io_uring unavailable: needs both sub-engines")
+		skipOrFailUpswitch662(t, "io_uring unavailable: needs both sub-engines")
 	}
 	cfg.Addr = "127.0.0.1:0"
 	e, err := New(cfg, h, nil)
 	if err != nil {
-		t.Skipf("adaptive.New unsupported here: %v", err)
+		skipOrFailUpswitch662(t, "adaptive.New unsupported here: %v", err)
 	}
 	// Make the controller react fast + drive BOTH directions. loadDownRevert is
 	// forced ON (production=false) so the reverse path fires; connSwitchEnabled is

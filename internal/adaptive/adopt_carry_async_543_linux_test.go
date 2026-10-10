@@ -33,39 +33,59 @@ import (
 // carry a sync-mode source builds, through the same TransplantTarget call.
 // It builds and runs against the code before the fix.
 func TestAdaptiveSwitchAdoptsCarriedAsyncRequest543(t *testing.T) {
-	for _, arm := range []struct {
-		name     string
-		switches int
-		want     engine.EngineType
-	}{
-		{"promote/io_uring-adopts", 1, engine.IOUring},
-		{"revert/epoll-adopts", 2, engine.Epoll},
-	} {
-		t.Run(arm.name, func(t *testing.T) {
-			h := newCarry543Handler()
-			e, _, stop := newBoundAdaptiveH(t, h, true)
-			defer stop()
-			for range arm.switches {
-				e.ForceSwitch()
-			}
-			active := e.ActiveEngine()
-			if typ := active.Type(); typ != arm.want {
-				t.Fatalf("after %d forced switch(es) the active engine is %v, want %v", arm.switches, typ, arm.want)
-			}
-			if got := e.Metrics().AdaptiveSwitches; got != uint64(arm.switches) {
-				t.Fatalf("AdaptiveSwitches = %d after %d forced switch(es)", got, arm.switches)
-			}
-			target, ok := active.(engine.TransplantTarget)
-			if !ok {
-				t.Fatalf("active engine %T is not a TransplantTarget", active)
-			}
-			workers, ok := active.(interface{ NumWorkers() int })
-			if !ok {
-				t.Fatalf("active engine %T reports no worker count", active)
-			}
-			runCarryAsync543(t, "adaptive-"+arm.name, workers.NumWorkers(), target.AdoptConn, h)
-		})
+	for _, arm := range carry543Arms {
+		t.Run(arm.name, func(t *testing.T) { adoptCarriedAsync543(t, arm.name, arm.switches, arm.want, nil) })
 	}
+}
+
+// carry543Arms are the two switch directions the test covers: one forced
+// switch (epoll -> io_uring, io_uring adopts) and two (back to epoll, epoll
+// adopts).
+var carry543Arms = []struct {
+	name     string
+	switches int
+	want     engine.EngineType
+}{
+	{"promote/io_uring-adopts", 1, engine.IOUring},
+	{"revert/epoll-adopts", 2, engine.Epoll},
+}
+
+// adoptCarriedAsync543 runs one arm. inject, when non-nil, runs on the bound
+// engine before the first switch (celeris#804's regression test uses it to make
+// the io_uring standby fail to build).
+func adoptCarriedAsync543(t *testing.T, name string, switches int, want engine.EngineType, inject func(*Engine)) {
+	h := newCarry543Handler()
+	e, _, stop := newBoundAdaptiveH(t, h, true)
+	defer stop()
+	if inject != nil {
+		inject(e)
+	}
+	// Each switch goes through forceSwitchTo: when the lazy io_uring standby
+	// cannot be built the switch is aborted and the engines stay put, which is
+	// the environment and not an adoption defect (celeris#804).
+	for i := range switches {
+		next := engine.IOUring
+		if i%2 == 1 {
+			next = engine.Epoll
+		}
+		forceSwitchTo(t, e, next)
+	}
+	active := e.ActiveEngine()
+	if typ := active.Type(); typ != want {
+		t.Fatalf("after %d forced switch(es) the active engine is %v, want %v", switches, typ, want)
+	}
+	if got := e.Metrics().AdaptiveSwitches; got != uint64(switches) {
+		t.Fatalf("AdaptiveSwitches = %d after %d forced switch(es)", got, switches)
+	}
+	target, ok := active.(engine.TransplantTarget)
+	if !ok {
+		t.Fatalf("active engine %T is not a TransplantTarget", active)
+	}
+	workers, ok := active.(interface{ NumWorkers() int })
+	if !ok {
+		t.Fatalf("active engine %T reports no worker count", active)
+	}
+	runCarryAsync543(t, "adaptive-"+name, workers.NumWorkers(), target.AdoptConn, h)
 }
 
 // carry543Handler answers every path with its own name, except /block: an
