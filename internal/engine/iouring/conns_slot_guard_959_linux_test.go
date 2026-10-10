@@ -81,6 +81,9 @@ func TestConnSlotWritesGoThroughTheHelpers959(t *testing.T) {
 			t.Fatalf("parse %s: %v", name, err)
 		}
 		scanned++
+		for _, r := range registerConnTableReads(fset, f) {
+			t.Errorf("%s: RegisterConn reads the conn table itself; it must ask connSlotBusy (celeris#959)", r)
+		}
 		for _, w := range bareConnTableWrites(fset, f) {
 			t.Errorf("%s writes a conn-table slot outside setConnSlot/clearConnSlot: RegisterConn reads it from another goroutine under connsMu (celeris#959)", w)
 		}
@@ -88,6 +91,30 @@ func TestConnSlotWritesGoThroughTheHelpers959(t *testing.T) {
 	if scanned < 20 {
 		t.Fatalf("apparatus: scanned only %d source files", scanned)
 	}
+}
+
+// registerConnTableReads returns the position of every use of a Worker's conn
+// table inside RegisterConn, the one reader on another goroutine: it must ask
+// connSlotBusy and never look at w.conns itself. The race test cannot stand in
+// for this for the check under driverMu, whose read follows a locked one that
+// already orders the worker's earlier writes before it.
+func registerConnTableReads(fset *token.FileSet, f *ast.File) []string {
+	var out []string
+	for _, d := range f.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Name.Name != "RegisterConn" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "conns" {
+				if id, ok := sel.X.(*ast.Ident); ok && id.Name == "w" {
+					out = append(out, fset.Position(sel.Pos()).String())
+				}
+			}
+			return true
+		})
+	}
+	return out
 }
 
 // TestConnSlotGuardSeesABareWrite959 is the guard's own control: the scan
@@ -100,6 +127,7 @@ func (w *Worker) c()                      { clear(w.conns) }
 func (w *Worker) d()                      { w.conns = nil }
 func (w *Worker) e(fd int)                { x := w.conns[fd]; _ = x }
 func (ce *closedEntry) f()                { ce.conns[0] = nil }
+func (w *Worker) RegisterConn(fd int) error         { if fd < len(w.conns) && w.conns[fd] != nil { return nil }; return nil }
 func (w *Worker) setConnSlot(fd int, cs *connState) { w.conns[fd] = cs }
 func (w *Worker) clearConnSlot(fd int)              { w.conns[fd] = nil }
 `
@@ -109,6 +137,9 @@ func (w *Worker) clearConnSlot(fd int)              { w.conns[fd] = nil }
 		t.Fatal(err)
 	}
 	got := bareConnTableWrites(fset, f)
+	if reads := registerConnTableReads(fset, f); len(reads) != 2 {
+		t.Errorf("the scan found %d table reads in the snippet's RegisterConn, want 2: %v", len(reads), reads)
+	}
 	if len(got) != 4 {
 		t.Fatalf("the scan found %d bare stores in the snippet, want 4 (a, b, c, d): %v", len(got), got)
 	}
