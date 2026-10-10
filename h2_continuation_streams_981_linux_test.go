@@ -162,109 +162,114 @@ func splitName981(split bool) string {
 // the client opens 10 streams, each a GET whose handler blocks. Four handlers
 // run, and the other six streams are refused (RST_STREAM), whether the
 // request is one HEADERS frame or HEADERS + CONTINUATION. Then the handlers
-// finish, the four answers arrive and the connection serves one more request
-// of the same shape: the slots were counted back.
+// finish, the four answers arrive, and then, on the same connection,
+// either one more request of the same shape is served (the slots were counted
+// back: "slots-come-back"), or HEADERS on a refused stream's identifier is a
+// connection error (a refused stream's identifier is used up:
+// "refused-id-reused"; they are two runs because the first moves the last
+// client stream past the refused identifiers).
 func TestH2MaxConcurrentStreamsHeadersContinuation981(t *testing.T) {
 	const limit, streams = 4, 10
 	for _, e := range engines761 {
 		for _, split := range []bool{false, true} {
-			name := e.name + "/" + splitName981(split)
-			t.Run(name, func(t *testing.T) {
-				var cur, peak, entered atomic.Int64
-				release := make(chan struct{})
-				var once sync.Once
-				defer once.Do(func() { close(release) })
-				addr := startServerConfig761(t, celeris.Config{Engine: e.eng, MaxConcurrentStreams: limit}, func(s *celeris.Server) {
-					s.GET("/hold", func(c *celeris.Context) error {
-						entered.Add(1)
-						n := cur.Add(1)
-						for {
-							p := peak.Load()
-							if n <= p || peak.CompareAndSwap(p, n) {
-								break
+			for _, tail := range []string{"slots-come-back", "refused-id-reused"} {
+				name := e.name + "/" + splitName981(split) + "/" + tail
+				t.Run(name, func(t *testing.T) {
+					var cur, peak, entered atomic.Int64
+					release := make(chan struct{})
+					var once sync.Once
+					defer once.Do(func() { close(release) })
+					addr := startServerConfig761(t, celeris.Config{Engine: e.eng, MaxConcurrentStreams: limit}, func(s *celeris.Server) {
+						s.GET("/hold", func(c *celeris.Context) error {
+							entered.Add(1)
+							n := cur.Add(1)
+							for {
+								p := peak.Load()
+								if n <= p || peak.CompareAndSwap(p, n) {
+									break
+								}
+							}
+							<-release
+							cur.Add(-1)
+							return c.String(200, "ok")
+						}).Async()
+					})
+					w := dial981(t, addr)
+					for i := range streams {
+						w.get(uint32(2*i+1), split)
+					}
+					// Four are admitted; the other six are refused, which is the end of the settling.
+					waitUntil981(10*time.Second, func() bool { rst, _, _ := w.state(); return len(rst) >= streams-limit })
+					time.Sleep(200 * time.Millisecond) // a handler that should not have run would have entered by now
+					rst, _, goaway := w.state()
+					var ids []int
+					codes := map[http2.ErrCode]int{}
+					for id, c := range rst {
+						ids = append(ids, int(id))
+						codes[c]++
+					}
+					sort.Ints(ids)
+					t.Logf("%s: MaxConcurrentStreams %d; %d streams opened; handlers entered %d, peak concurrent %d; reset streams %v %v; GOAWAY %q",
+						name, limit, streams, entered.Load(), peak.Load(), ids, codes, goaway)
+					if peak.Load() > limit || entered.Load() > limit {
+						t.Errorf("%d handlers entered, %d at once, with SETTINGS_MAX_CONCURRENT_STREAMS %d", entered.Load(), peak.Load(), limit)
+					}
+					if entered.Load() != limit {
+						t.Errorf("%d handlers entered, want %d", entered.Load(), limit)
+					}
+					if goaway != "" {
+						t.Errorf("the connection got a GOAWAY %q: a stream over the limit is a stream error", goaway)
+					}
+					for id := uint32(2*limit + 1); id < 2*streams+1; id += 2 {
+						// net/http answers PROTOCOL_ERROR once the client acked its SETTINGS and REFUSED_STREAM before.
+						c, ok := rst[id]
+						if !ok {
+							t.Errorf("stream %d (over the limit) got no RST_STREAM", id)
+						} else if c != http2.ErrCodeRefusedStream && !(e.eng == celeris.Std && c == http2.ErrCodeProtocol) {
+							t.Errorf("stream %d reset with %s, want REFUSED_STREAM", id, c)
+						}
+					}
+					if len(rst) != streams-limit {
+						t.Errorf("%d streams were reset, want %d", len(rst), streams-limit)
+					}
+
+					// The four finish; their slots come back; one more request is served.
+					once.Do(func() { close(release) })
+					if !waitUntil981(10*time.Second, func() bool {
+						_, status, _ := w.state()
+						n := 0
+						for _, s := range status {
+							if s == "200" {
+								n++
 							}
 						}
-						<-release
-						cur.Add(-1)
-						return c.String(200, "ok")
-					}).Async()
-				})
-				w := dial981(t, addr)
-				for i := range streams {
-					w.get(uint32(2*i+1), split)
-				}
-				// Four are admitted; the other six are refused, which is the end of the settling.
-				waitUntil981(10*time.Second, func() bool { rst, _, _ := w.state(); return len(rst) >= streams-limit })
-				time.Sleep(200 * time.Millisecond) // a handler that should not have run would have entered by now
-				rst, _, goaway := w.state()
-				var ids []int
-				codes := map[http2.ErrCode]int{}
-				for id, c := range rst {
-					ids = append(ids, int(id))
-					codes[c]++
-				}
-				sort.Ints(ids)
-				t.Logf("%s: MaxConcurrentStreams %d; %d streams opened; handlers entered %d, peak concurrent %d; reset streams %v %v; GOAWAY %q",
-					name, limit, streams, entered.Load(), peak.Load(), ids, codes, goaway)
-				if peak.Load() > limit || entered.Load() > limit {
-					t.Errorf("%d handlers entered, %d at once, with SETTINGS_MAX_CONCURRENT_STREAMS %d", entered.Load(), peak.Load(), limit)
-				}
-				if entered.Load() != limit {
-					t.Errorf("%d handlers entered, want %d", entered.Load(), limit)
-				}
-				if goaway != "" {
-					t.Errorf("the connection got a GOAWAY %q: a stream over the limit is a stream error", goaway)
-				}
-				for id := uint32(2*limit + 1); id < 2*streams+1; id += 2 {
-					// net/http answers PROTOCOL_ERROR once the client acked its SETTINGS and REFUSED_STREAM before.
-					c, ok := rst[id]
-					if !ok {
-						t.Errorf("stream %d (over the limit) got no RST_STREAM", id)
-					} else if c != http2.ErrCodeRefusedStream && !(e.eng == celeris.Std && c == http2.ErrCodeProtocol) {
-						t.Errorf("stream %d reset with %s, want REFUSED_STREAM", id, c)
+						return n >= limit
+					}) {
+						_, status, _ := w.state()
+						t.Fatalf("the %d admitted streams were not all answered: %v", limit, status)
 					}
-				}
-				if len(rst) != streams-limit {
-					t.Errorf("%d streams were reset, want %d", len(rst), streams-limit)
-				}
-
-				// The four finish; their slots come back; one more request is served.
-				once.Do(func() { close(release) })
-				if !waitUntil981(10*time.Second, func() bool {
-					_, status, _ := w.state()
-					n := 0
-					for _, s := range status {
-						if s == "200" {
-							n++
+					if tail == "slots-come-back" {
+						w.get(2*streams+1, split)
+						if !waitUntil981(10*time.Second, func() bool { _, status, _ := w.state(); return status[2*streams+1] == "200" }) {
+							rst, status, goaway := w.state()
+							t.Errorf("stream %d after the others finished: status %v, resets %v, GOAWAY %q", 2*streams+1, status, rst, goaway)
 						}
+						return
 					}
-					return n >= limit
-				}) {
-					_, status, _ := w.state()
-					t.Fatalf("the %d admitted streams were not all answered: %v", limit, status)
-				}
-				w.get(2*streams+1, split)
-				if !waitUntil981(10*time.Second, func() bool { _, status, _ := w.state(); return status[2*streams+1] == "200" }) {
-					rst, status, goaway := w.state()
-					t.Errorf("stream %d after the others finished: status %v, resets %v, GOAWAY %q", 2*streams+1, status, rst, goaway)
-				}
-
-				// A refused stream's identifier is used up: HEADERS on it again is a connection error.
-				w.get(2*limit+1, split)
-				if !waitUntil981(10*time.Second, func() bool { _, _, g := w.state(); return strings.HasPrefix(g, http2.ErrCodeProtocol.String()) }) {
-					_, _, goaway := w.state()
-					t.Errorf("HEADERS on the refused stream %d again: GOAWAY %q, want PROTOCOL_ERROR", 2*limit+1, goaway)
-				}
-			})
+					w.get(2*limit+1, split)
+					if !waitUntil981(10*time.Second, func() bool { _, _, g := w.state(); return strings.HasPrefix(g, http2.ErrCodeProtocol.String()) }) {
+						_, _, goaway := w.state()
+						t.Errorf("HEADERS on the refused stream %d again: GOAWAY %q, want PROTOCOL_ERROR", 2*limit+1, goaway)
+					}
+					if n := entered.Load(); n != limit {
+						t.Errorf("%d handlers entered, want %d: the refused stream's second request must not run", n, limit)
+					}
+				})
+			}
 		}
 	}
 }
 
-// TestH2StreamIDOrderHeadersContinuation981: stream identifiers must increase
-// (RFC 9113 §5.1.1). HEADERS on a stream ID already used, or lower than one
-// that was, is a connection error (GOAWAY PROTOCOL_ERROR) and the handler
-// does not run, whether the request is one HEADERS frame or HEADERS +
-// CONTINUATION.
 func TestH2StreamIDOrderHeadersContinuation981(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
