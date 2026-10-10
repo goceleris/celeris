@@ -200,3 +200,61 @@ func TestShutdownDriversLingerScale866(t *testing.T) {
 			n, linger, inShutdown.Milliseconds(), total.Milliseconds(), s.nFired.Load())
 	}
 }
+
+// TestCloseFDsInParallelBound866: closeFDsInParallel runs every close exactly
+// once, on no more than the bound at a time, and does run that many at a time
+// (a serial or a smaller pool would pass a test that checked only the maximum).
+func TestCloseFDsInParallelBound866(t *testing.T) {
+	defer watchdog959(t, time.Minute)()
+	const workers, conns = 8, 100
+	dcs := make([]*driverConn, conns)
+	for i := range dcs {
+		dcs[i] = &driverConn{opFD: i}
+	}
+	var (
+		mu       sync.Mutex
+		seen     = make(map[int]int, conns)
+		cur, max int
+		reached  = make(chan struct{})
+		once     sync.Once
+	)
+	closeFn := func(fd int) {
+		mu.Lock()
+		seen[fd]++
+		cur++
+		if cur > max {
+			max = cur
+		}
+		if cur == workers {
+			once.Do(func() { close(reached) })
+		}
+		mu.Unlock()
+		// Hold every close until `workers` of them are in flight, then a
+		// little longer, as lingering closes would be: a pool larger than the
+		// bound has its extra goroutines in here by then.
+		select {
+		case <-reached:
+		case <-time.After(5 * time.Second):
+		}
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		cur--
+		mu.Unlock()
+	}
+	closeFDsInParallel(dcs, workers, closeFn)
+	if max != workers {
+		t.Errorf("at most %d closes were in flight at once, want exactly the bound %d", max, workers)
+	}
+	for fd := 0; fd < conns; fd++ {
+		if seen[fd] != 1 {
+			t.Errorf("fd %d closed %d times, want once", fd, seen[fd])
+		}
+	}
+	if cur != 0 {
+		t.Errorf("%d closes still in flight after closeFDsInParallel returned", cur)
+	}
+	closeFDsInParallel(nil, workers, func(int) { t.Error("closeFn called for no conns") })
+	if shutdownDriverCloseWorkers < 2 || shutdownDriverCloseWorkers > 1024 {
+		t.Errorf("shutdownDriverCloseWorkers = %d: outside the range that is parallel yet far from the thread limit", shutdownDriverCloseWorkers)
+	}
+}

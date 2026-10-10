@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -205,11 +206,12 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	if fd < 0 {
 		return errors.New("celeris/iouring: invalid fd")
 	}
-	// TOCTOU-safe: first check at API time (racy but cheap), then re-check
-	// under driverMu below. The worker goroutine re-checks again during
-	// action apply in armDriverRecv, closing the window between this API
-	// call and the worker's map insertion.
-	if fd < len(w.conns) && w.conns[fd] != nil {
+	// TOCTOU-safe: first check at API time (cheap, and before the duplicate
+	// below), then re-check under driverMu below. The worker goroutine
+	// re-checks again during action apply in armDriverRecv, closing the window
+	// between this API call and the worker's map insertion. The slot is read
+	// through connSlotBusy, under connsMu: the worker writes it (celeris#959).
+	if w.connSlotBusy(fd) {
 		return fmt.Errorf("celeris/iouring: fd %d is already an HTTP connection", fd)
 	}
 	// The engine's own descriptor for the socket, taken while fd is surely
@@ -230,7 +232,7 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 		// exited. Refuse, as AdoptConn does; fd stays the caller's.
 		refused = fmt.Errorf("celeris/iouring: worker %d has shut down, cannot register fd %d: %w",
 			w.id, fd, errEngineShutdown)
-	case fd < len(w.conns) && w.conns[fd] != nil:
+	case w.connSlotBusy(fd):
 		// Re-check under the lock: the worker goroutine may have accepted an
 		// HTTP conn on this fd between the first check and the lock
 		// acquisition.
@@ -667,7 +669,11 @@ var errEngineShutdown = errors.New("celeris/iouring: engine shutdown")
 // shutdownDrivers fires onClose(errEngineShutdown) for every registered
 // driver conn, clears the map, and makes every later RegisterConn fail.
 // Called from Worker.shutdown on the worker goroutine. The caller owns the
-// FDs; we do not close them.
+// FDs; we do not close them. The engine's own duplicates are closed here, in
+// parallel (closeDriverFDs, celeris#866), and on return every one of them is
+// closed and every onClose has fired: the order a driver sees is unchanged
+// (the socket closed, as far as close(2) closes it, before its onClose), but
+// an onClose now also waits for the slowest close of the batch.
 func (w *Worker) shutdownDrivers() {
 	w.driverMu.Lock()
 	// Under the lock RegisterConn inserts under: a conn is either in the map
@@ -694,21 +700,78 @@ func (w *Worker) shutdownDrivers() {
 	w.shutdownDriverHold = append(w.shutdownDriverHold, conns...)
 	w.driverMu.Unlock()
 
+	// Retire every conn first (a later UnregisterConn or Write is then a no-op),
+	// close the engine's descriptors in parallel, and only then fire the
+	// onCloses, in this goroutine, each after its socket's close(2) has
+	// returned (celeris#866).
+	//
+	// If UnregisterConn got here first, the cancel-CQE path would have fired
+	// onClose, but the ring is being torn down, so it fires here instead;
+	// finalizeDriver's map check guards against double-fire. The engine's
+	// descriptor is closed here too (celeris#691). Nothing is submitted after
+	// this point, so an SQE still carrying its number never reaches the kernel;
+	// closing the ring later in shutdown() cancels the ops armed on the socket.
+	toClose := conns[:0:0]
 	for _, dc := range conns {
-		// If UnregisterConn got here first, the cancel-CQE path would have
-		// fired onClose, but the ring is being torn down, so it fires here
-		// instead; finalizeDriver's map check guards against double-fire.
-		// The engine's descriptor is closed here too (celeris#691). Nothing
-		// is submitted after this point, so an SQE still carrying its number
-		// never reaches the kernel; closing the ring later in shutdown()
-		// cancels the ops armed on the socket. On this goroutine: the worker
-		// serves nothing more, and shutdown waits for the closes it handed
-		// off anyway (below).
 		if dc.retire() {
-			_ = unix.Close(dc.opFD)
+			toClose = append(toClose, dc)
 		}
+	}
+	closeDriverFDs(toClose)
+	for _, dc := range conns {
 		dc.fireOnClose(errEngineShutdown)
 	}
+}
+
+// shutdownDriverCloseWorkers bounds how many of the engine's driver
+// descriptors shutdownDrivers closes at once. close(2) of a socket with
+// SO_LINGER set and data unsent to a peer that is not reading lasts up to the
+// linger time (celeris#735), and each such close holds an OS thread for that
+// long, so the bound is the most threads shutdown can pin this way, well under
+// the runtime's limit of 10000 (an exceeded limit is fatal). Past it the
+// closes queue behind the first ones: ceil(N/bound) x linger in the worst
+// case, against N x linger when one goroutine closed them in turn.
+const shutdownDriverCloseWorkers = 128
+
+// closeDriverFDs closes the engine's descriptor of each conn, at most
+// shutdownDriverCloseWorkers at a time, and returns when every close(2) has
+// returned. The worker used to close them one after another, so with N
+// lingering sockets shutdown spent up to N x linger here with its ring
+// unserved; now it waits for the slowest (celeris#866). Nothing about a close
+// changes: the same close(2) of the same descriptor, FIN after the unsent data
+// within the linger time (never an RST that discards it, as SO_LINGER{1,0}
+// would), only many at once. The conns are retired, so nothing else touches
+// opFD. Worker goroutine, from shutdownDrivers.
+func closeDriverFDs(conns []*driverConn) {
+	closeFDsInParallel(conns, shutdownDriverCloseWorkers, func(fd int) { _ = unix.Close(fd) })
+}
+
+// closeFDsInParallel is closeDriverFDs with the bound and the close as
+// parameters, for the test of the bound: closeFn(opFD) runs once per conn, on
+// at most workers goroutines at a time.
+func closeFDsInParallel(conns []*driverConn, workers int, closeFn func(fd int)) {
+	n := min(len(conns), workers)
+	if n <= 0 {
+		return
+	}
+	var (
+		next atomic.Int64
+		wg   sync.WaitGroup
+	)
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(conns) {
+					return
+				}
+				closeFn(conns[i].opFD)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // waitDriverCloses is the end of shutdownDrivers for the conns finalized

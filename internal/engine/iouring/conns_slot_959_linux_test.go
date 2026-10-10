@@ -11,11 +11,15 @@ package iouring
 // epoll defect of celeris#775 (there the accept install already took
 // driverMu, here nothing is locked at all).
 //
-// The tests find the descriptor numbers the engine accepted its HTTP
-// connections on, and call RegisterConn on exactly those numbers while the
-// worker closes those connections and accepts new ones onto the same numbers,
-// so the read and the worker's write are of the same slot and the race
-// detector sees the pair. They fail by the race detector (go test -race, which
+// The test finds the descriptor numbers the engine accepted its HTTP
+// connections on, and calls RegisterConn on exactly those numbers while the
+// worker holds, then closes, those connections, so the read and the worker's
+// write (the accept's, made earlier with nothing ordering it before the
+// read, and the close's) are of the same slot and the race detector sees the
+// pair. The spinner starts only once the connections are accepted: a
+// RegisterConn that wins a number before the worker has installed its slot
+// would arm a driver recv on a live HTTP socket, and its cancel (by the
+// duplicate, which names the same file) would end the HTTP conn's recv. They fail by the race detector (go test -race, which
 // CI runs this package under) and, for the apparatus, by t.Fatal.
 
 import (
@@ -98,12 +102,12 @@ func watchdog959(t *testing.T, d time.Duration) (stop func()) {
 	return func() { close(done) }
 }
 
-// spinRegister959 calls RegisterConn on every number the targets pointer
-// names, on every worker, until stop is closed. A number that is an HTTP
-// connection's is refused after RegisterConn has read its slot; one the engine
-// has since freed fails the duplicate (EBADF) or, if another descriptor of the
-// process took it, is registered and unregistered at once.
-func spinRegister959(e *Engine, targets *atomic.Pointer[[]int], stop <-chan struct{}, regs *atomic.Int64) (wait func()) {
+// spinRegister959 calls RegisterConn on every number in fds, on every worker,
+// until stop is closed. A number that is an HTTP connection's is refused after
+// RegisterConn has read its slot; one the engine has since freed fails the
+// duplicate (EBADF) or, if another descriptor of the process took it, is
+// registered and unregistered at once.
+func spinRegister959(e *Engine, fds []int, stop <-chan struct{}, regs *atomic.Int64) (wait func()) {
 	var wg sync.WaitGroup
 	for i := 0; i < e.NumWorkers(); i++ {
 		wl := e.WorkerLoop(i)
@@ -111,17 +115,7 @@ func spinRegister959(e *Engine, targets *atomic.Pointer[[]int], stop <-chan stru
 		go func() {
 			defer wg.Done()
 			for {
-				p := targets.Load()
-				if p == nil {
-					select {
-					case <-stop:
-						return
-					default:
-					}
-					time.Sleep(50 * time.Microsecond)
-					continue
-				}
-				for _, fd := range *p {
+				for _, fd := range fds {
 					select {
 					case <-stop:
 						return
@@ -139,28 +133,19 @@ func spinRegister959(e *Engine, targets *atomic.Pointer[[]int], stop <-chan stru
 }
 
 // TestRegisterConnRacesAcceptAndClose959: driver registrations on the numbers
-// of HTTP connections the worker accepts and closes. Each round dials 16
-// connections, which the kernel numbers as the lowest free descriptors (the
-// numbers of the round before, mostly), and closes them; the spinners run
-// from the second round on over the numbers of the round before, across the
-// accepts and the closes. The accept install's slot write and finishClose's
-// must not race RegisterConn's slot reads. Reported by the race detector
-// (go test -race).
+// of HTTP connections the worker has accepted and is closing. The accept
+// install's slot write and finishClose's must not race RegisterConn's slot
+// reads. Reported by the race detector (go test -race). The engine takes up to
+// a second to notice an accept or a close on an idle ring, so a round lasts
+// seconds.
 func TestRegisterConnRacesAcceptAndClose959(t *testing.T) {
 	defer watchdog959(t, 2*time.Minute)()
 	eng, stopEng := startTestEngine(t)
 	t.Cleanup(stopEng)
 	tcp := eng.Addr().(*net.TCPAddr)
 
-	var (
-		regs    atomic.Int64
-		targets atomic.Pointer[[]int]
-		stop    = make(chan struct{})
-	)
-	wait := spinRegister959(eng, &targets, stop, &regs)
-	defer func() { close(stop); wait() }()
-
-	const rounds, perRound = 12, 16
+	var regs atomic.Int64
+	const rounds, perRound = 5, 16
 	for round := 0; round < rounds; round++ {
 		var clients []net.Conn
 		for range perRound {
@@ -171,12 +156,15 @@ func TestRegisterConnRacesAcceptAndClose959(t *testing.T) {
 			clients = append(clients, c)
 		}
 		fds := waitServerFDs959(t, tcp, perRound)
-		targets.Store(&fds)
+		stop := make(chan struct{})
+		wait := spinRegister959(eng, fds, stop, &regs)
 		time.Sleep(time.Millisecond)
 		for _, c := range clients {
 			_ = c.Close()
 		}
 		waitServerFDs959(t, tcp, 0)
+		close(stop)
+		wait()
 	}
 	if regs.Load() == 0 {
 		t.Fatal("apparatus: no RegisterConn call ran, so the slot read was never exercised")

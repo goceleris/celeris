@@ -169,7 +169,7 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	cs.fixedFile = false
 	cs.remoteAddr = carry.RemoteAddr
 
-	w.conns[newFD] = cs
+	w.setConnSlot(newFD, cs)
 	w.connCount++
 	w.addLiveConn(cs)
 	if newFD > w.maxFD {
