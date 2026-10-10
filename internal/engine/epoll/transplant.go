@@ -97,7 +97,20 @@ func (l *Loop) tryTransplant(fd int) {
 		running := cs.asyncRun
 		parked := cs.asyncParked
 		idle := len(cs.asyncInBuf) == 0
+		// Read under the lock, where the goroutine's exit orders it: it sets
+		// asyncClosed before it clears asyncRun (endDispatch), so a goroutine
+		// seen gone here has already asked for the close, which the check above
+		// may have run too early to see. Past it, a conn whose goroutine exited
+		// to close it (a panic, a handler error, "Connection: close") reads
+		// as a conn with no goroutine: handed off, its connState released, the
+		// hand-back's close acting on a connState that is no longer its own, and
+		// a refused hand-off reclaiming the conn as a new, healthy one that
+		// outlives the close (celeris#844; the io_uring twin is celeris#780).
+		closing := cs.asyncClosed.Load()
 		cs.asyncInMu.Unlock()
+		if closing {
+			return
+		}
 		if running {
 			if !parked || !idle || cs.asyncClosed.Load() || cs.asyncQuiesce.Load() {
 				return // goroutine busy / not cleanly parked / tearing down — retry later

@@ -268,6 +268,15 @@ type connState struct {
 	// cleared by drainDetachQueue once the bookkeeping runs.
 	asyncDetachPending bool
 
+	// detachCounted: this conn is in l.detachedCount. Loop thread only: set
+	// where the count is raised (OnDetach in sync mode, drainDetachQueue in
+	// async mode), cleared where it is lowered (closeConn). A conn closed
+	// between the async OnDetach and the drain's increment, which is where a
+	// panic inside OnDetach's window leaves it (celeris#844), was never
+	// counted, and lowering the count for it would take another detached
+	// conn's place (the io_uring twin is its detachCounted, celeris#549).
+	detachCounted bool
+
 	// liveIdx is this conn's index into l.liveConns (the dense slice of
 	// live connStates iterated by checkTimeouts, the sweep and shutdown).
 	// -1 when not present. Maintained by addLiveConn/removeLiveConn for O(1)
@@ -410,6 +419,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncPromoted = false
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
+	cs.detachCounted = false
 	cs.liveIdx = -1
 	cs.hijacked.Store(false)
 	cs.hijackSettled = false

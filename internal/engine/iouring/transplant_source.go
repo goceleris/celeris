@@ -270,6 +270,9 @@ func (w *Worker) reclaimTransplant(newFD int, carry engine.Carryover, cause erro
 // set before the worker starts and never written again, so this read from the
 // dispatch goroutine is race-free.
 func (w *Worker) asyncTransplantEligible(cs *connState) bool {
+	if f := parkWindowHook.Load(); f != nil {
+		(*f)() // test seam, celeris#844 item 1
+	}
 	if !w.asyncCancelFlags {
 		return false
 	}
