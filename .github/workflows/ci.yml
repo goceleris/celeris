@@ -1426,9 +1426,10 @@ jobs:
       # pin a driver close that lingers: off the worker, and waited for at
       # shutdown (celeris#735). Two more (n866) pin that shutdown closes the
       # lingering driver descriptors together, not one after another
-      # (celeris#866), and four (n959) that a driver's RegisterConn does not
-      # race the worker's writes of the conn table (celeris#959; the race test
-      # needs -race, which this step runs under).
+      # (celeris#866), and five (n959) that a driver's RegisterConn does not
+      # race the worker's writes of the conn table (celeris#959; the two race
+      # tests, one of them through the adaptive engine started on io_uring,
+      # need -race, which this step runs under).
       # TestDriverHTTPZeroOverhead is where the leak was first seen: 2 of 7
       # full-package runs failed on #674's branch (#691).
       #
@@ -1444,7 +1445,7 @@ jobs:
           new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors|TestDriverRegisterAfterShutdownIsRefused|TestDriverRegisterRacingShutdownReleasesEverySocket|TestDriverRecvRearmBeforeSubmitSparesReusedNumber|TestDriverSendBeforeSubmitSparesReusedNumber|TestDriverFailureCancelCompletesBeforeRelease|TestDriverFailureCloseCompletionSparesConnOnReusedNumber|TestDriverStrayCloseCompletionSparesConn|TestDriverUnregisterWithSendInFlightThenNumberTakenByHTTP|TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP|TestDriverRefusedRegisterWaitsForItsSend'
           n735='TestDriverLingeringCloseDoesNotStallTheWorker|TestDriverShutdownWaitsForAHandedOffClose'
           n866='TestShutdownDriversClosesLingeringDescriptorsInParallel866|TestCloseFDsInParallelBound866'
-          n959='TestRegisterConnRacesAcceptAndClose959|TestConnSlotWritesGoThroughTheHelpers959|TestConnSlotGuardSeesABareWrite959|TestConnSlotHelpersTakeConnsMu959'
+          n959='TestRegisterConnRacesAcceptAndClose959|TestAdaptiveRegisterConnRacesAcceptAndClose959|TestConnSlotWritesGoThroughTheHelpers959|TestConnSlotGuardSeesABareWrite959|TestConnSlotHelpersTakeConnsMu959'
           names="${old}|${new}|${n735}|${n866}|${n959}"
           runs=5
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
