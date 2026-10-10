@@ -451,13 +451,68 @@ func fdOwed(cs *connState) bool {
 // (flushSend and flushSendLink wait out cs.sending and cs.zcNotifPending),
 // so zcNotifPending stands for exactly one op.
 //
+// The same holds for a first CQE the worker has read and holds for the
+// dispatch goroutine instead of applying (celeris#750, heldSends): the send is
+// done, zcNotifPending says so only once the completion is applied, and a
+// close that counted it as naming the descriptor kept the socket open past
+// the 5 s backstop (CloseFDForced) for an op that had ended (celeris#880).
+//
+// Whether kernelInflight still counts the SEND_ZC decides whether it is left
+// out. It stops counting it when staleConnCQE READS the notification, a
+// terminal CQE, and three things can follow the read:
+//
+//   - the worker applies the notification (handleSend: zcNotifPending is
+//     cleared and the send done);
+//   - the worker holds it for the dispatch goroutine (a held cqeIsNotif entry);
+//   - the shutdown drain read it (endOwedOpsAtShutdown reads through
+//     staleConnCQE alone, never handleSend): neither applied nor held, and
+//     nothing on the connection says so, because the drain changes nothing on a
+//     connection the dispatch goroutine may still read. The drain keeps its own
+//     note and passes it in (fdOpsSeen).
+//
+// In all three the op is already out of kernelInflight and nothing is left
+// out: leaving it out again would drop an armed recv from the count, and a
+// conn with a recv armed would read as owing nothing (fdOwed false; the
+// shutdown drain would not end the recv before it closed the descriptor, or
+// would stop waiting for it, celeris#685). Without a notification read, the op
+// still in kernelInflight is left out once, whether the first completion is
+// applied (zcNotifPending), held (a held F_MORE entry) or, in the drain, read
+// by the drain (zcSeen's first).
+//
+// The third case is the one fdOps alone cannot see, and only the drain forms
+// it: the loop follows every staleConnCQE with handleSend, which applies or
+// holds the notification. So fdOps is exact while the loop runs. Once the
+// drain has read a notification, fdOps alone leaves the SEND_ZC out again
+// (an applied or held first completion is still there to be subtracted) and
+// can read 0 with a recv owed; the drain's own count (fdOpsSeen, with what it
+// noted) is the one that is right, and shutdown closes the descriptors right
+// after it.
+//
 // Live connections only: a closed one's count moves in its closedOps entry
 // (closedOpsEntry.fdOps, read by closedFDNamed).
 func fdOps(cs *connState) int32 {
-	if cs.zcNotifPending {
-		return cs.kernelInflight - 1
+	return fdOpsSeen(cs, false, false)
+}
+
+// fdOpsSeen is fdOps plus what the shutdown drain alone knows about cs's
+// SEND_ZC: zcDone, the drain read its first completion (F_MORE), and notifRead,
+// it read the notification (see fdOps). A held notification counts as read
+// too. Worker thread only.
+func fdOpsSeen(cs *connState, zcDone, notifRead bool) int32 {
+	zcOp := cs.zcNotifPending || zcDone
+	for i := range cs.heldSends {
+		switch f := cs.heldSends[i].Flags; {
+		case cqeHasMore(f):
+			zcOp = true
+		case cqeIsNotif(f):
+			notifRead = true
+		}
 	}
-	return cs.kernelInflight
+	n := cs.kernelInflight
+	if zcOp && !notifRead {
+		n--
+	}
+	return n
 }
 
 // closedFDNamed reports whether an op the kernel still owes closed cs names
@@ -560,9 +615,10 @@ const shutdownFDDrainNanos int64 = int64(250 * time.Millisecond)
 // notifications (celeris#798, see fdOps): a stalled peer can hold one for as
 // long as the socket is open, far past this bound. A live connection's
 // SEND_ZC whose first CQE the drain reads names the descriptor no more
-// either; handleSend, which records that in zcNotifPending, does not run
-// here, so the drain keeps its own note (zcDone) and changes nothing on the
-// connection, which the dispatch goroutine may still read.
+// either, and neither does one whose notification it reads; handleSend, which
+// records the first in zcNotifPending and applies or holds the second, does
+// not run here, so the drain keeps its own notes (zcSeen) and changes nothing
+// on the connection, which the dispatch goroutine may still read.
 func (w *Worker) endOwedOpsAtShutdown() {
 	var owed []*connState
 	for _, fd := range w.liveConns {
@@ -572,14 +628,14 @@ func (w *Worker) endOwedOpsAtShutdown() {
 		}
 		owed = append(owed, cs)
 	}
-	var zcDone map[*connState]bool
-	// named is fdOwed for the drain: fdOps, less a SEND_ZC it saw complete.
+	// What the drain read of a live connection's SEND_ZC (fdOpsSeen).
+	type zcRead struct{ first, notif bool }
+	var zcSeen map[*connState]zcRead
+	// named is fdOwed for the drain: fdOps, with the SEND_ZC completions the
+	// drain itself read.
 	named := func(cs *connState) bool {
-		n := fdOps(cs)
-		if zcDone[cs] {
-			n--
-		}
-		return n > 0
+		r := zcSeen[cs]
+		return fdOpsSeen(cs, r.first, r.notif) > 0
 	}
 	pending := func() bool {
 		for _, cs := range owed {
@@ -611,17 +667,23 @@ func (w *Worker) endOwedOpsAtShutdown() {
 				switch ud & udMask {
 				case udRecv, udSend:
 					fd := int(ud & fdMask)
-					// A live connection's SEND_ZC completing (F_MORE marks
-					// only that on a send; a connection has one send in
-					// flight at most): noted, or its notification would be
-					// waited for as an op on the descriptor. A closed
-					// identity's is counted by staleConnCQE.
-					if ud&udMask == udSend && cqeHasMore(c.Flags) && fd < len(w.conns) {
-						if cs := w.conns[fd]; cs != nil && cs.generation == decodeGen(ud) && !cs.zcNotifPending {
-							if zcDone == nil {
-								zcDone = make(map[*connState]bool)
+					// A live connection's SEND_ZC completing, noted, or its
+					// notification would be waited for as an op on the
+					// descriptor (F_MORE marks only that on a send; a
+					// connection has one send in flight at most), and its
+					// notification read, which staleConnCQE takes off
+					// kernelInflight with nothing else on the connection to
+					// say so (fdOps). A closed identity's is counted by
+					// staleConnCQE.
+					if ud&udMask == udSend && fd < len(w.conns) && (cqeIsNotif(c.Flags) || cqeHasMore(c.Flags)) {
+						if cs := w.conns[fd]; cs != nil && cs.generation == decodeGen(ud) {
+							if zcSeen == nil {
+								zcSeen = make(map[*connState]zcRead)
 							}
-							zcDone[cs] = true
+							r := zcSeen[cs]
+							r.notif = r.notif || cqeIsNotif(c.Flags)
+							r.first = r.first || cqeHasMore(c.Flags)
+							zcSeen[cs] = r
 						}
 					}
 					w.staleConnCQE(c, fd, ud)

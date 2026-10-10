@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -497,6 +498,10 @@ func h2ReserveSend(mgr *stream.Manager, s *stream.Stream, n int) int {
 	if n <= 0 {
 		return 0
 	}
+	// A request over MaxInt32 is asked for as MaxInt32: int32(n) wraps to
+	// zero or a negative number, which the windows refuse, and a loop that
+	// waits for them to open would spin on a Write of 2 GiB or more.
+	n = min(n, math.MaxInt32)
 	if mgr != nil {
 		return int(mgr.ReserveSendWindow(s, int32(n)))
 	}
@@ -661,7 +666,20 @@ func (a *h2InlineResponseAdapter) Close(s *stream.Stream) error {
 	return a.queue.Close(s)
 }
 
+func (a *h2InlineResponseAdapter) WriteHeaderUse(s *stream.Stream, gen uint64, status int, headers [][2]string) error {
+	return a.queue.WriteHeaderUse(s, gen, status, headers)
+}
+
+func (a *h2InlineResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) error {
+	return a.queue.WriteUse(s, gen, data)
+}
+
+func (a *h2InlineResponseAdapter) CloseUse(s *stream.Stream, gen uint64) error {
+	return a.queue.CloseUse(s, gen)
+}
+
 var _ stream.Streamer = (*h2InlineResponseAdapter)(nil)
+var _ stream.UseStreamer = (*h2InlineResponseAdapter)(nil)
 
 type h2ResponseAdapter struct {
 	write        func([]byte)
@@ -686,6 +704,12 @@ func (a *h2ResponseAdapter) peerMaxFrame() uint32 {
 	}
 	return a.maxFrameSize
 }
+
+// h2BeforeEnqueueHook is a test seam: WriteResponse calls it, when it is set,
+// after it has reserved the windows and built its frames and just before it
+// queues them, so a test can put a WINDOW_UPDATE at the one point where a pool
+// handler is exposed to one (celeris#903). Production code never sets it.
+var h2BeforeEnqueueHook func(a *h2ResponseAdapter, s *stream.Stream)
 
 // WriteResponse builds complete response frame bytes using a goroutine-local
 // HPACK encoder (dynamic table = 0) and enqueues them to the write queue.
@@ -737,10 +761,13 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 			}
 			putH2StreamEncoder(enc)
 			*pooled = frameBuf
+			if h := h2BeforeEnqueueHook; h != nil {
+				h(a, s)
+			}
 			a.writeQueue.Enqueue(s.ID, pooled)
 			s.SetHeadersSent()
 			if len(rest) > 0 {
-				return a.sendRest(s, rest, maxFrame)
+				return a.finishBody(s, rest, maxFrame)
 			}
 			return nil
 		}
@@ -789,11 +816,14 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	putH2StreamEncoder(enc)
 
 	*pooled = frameBuf
+	if h := h2BeforeEnqueueHook; h != nil {
+		h(a, s)
+	}
 	a.writeQueue.Enqueue(s.ID, pooled)
 
 	s.SetHeadersSent()
 	if len(rest) > 0 {
-		return a.sendRest(s, rest, maxFrame)
+		return a.finishBody(s, rest, maxFrame)
 	}
 	return nil
 }
@@ -827,11 +857,8 @@ func h2FrameBufSize(headerLen, dataLen int, maxFrame uint32) int {
 }
 
 // stageBody appends to frameBuf the sendLen bytes of DATA the flow-control
-// windows let body send with its HEADERS (reserved by the caller), and
-// buffers the rest on the stream when the connection's outbound budget has
-// room for it (celeris#893) and the stream may be buffered at all (not one
-// that runs on the pool only because of the budget: TryBufferOutbound). It
-// returns the part it could do neither with, for sendRest.
+// windows let body send with its HEADERS (reserved by the caller). It returns
+// the rest of body for finishBody, which runs after the frames are queued.
 func (a *h2ResponseAdapter) stageBody(s *stream.Stream, frameBuf, body []byte, sendLen int, maxFrame uint32) ([]byte, []byte) {
 	if sendLen > 0 {
 		isEnd := sendLen == len(body)
@@ -843,11 +870,31 @@ func (a *h2ResponseAdapter) stageBody(s *stream.Stream, frameBuf, body []byte, s
 	} else {
 		sendLen = 0
 	}
-	rest := body[sendLen:]
+	return frameBuf, body[sendLen:]
+}
+
+// finishBody deals with the part of a response body that the windows did not
+// take, once the response's HEADERS and first DATA are in the write queue:
+// it buffers it on the stream when the connection's outbound budget has room
+// for it (celeris#893) and the stream may be buffered at all (not one that
+// runs on the pool only because of the budget: TryBufferOutbound), and
+// otherwise sends it itself (sendRest).
+//
+// The rest is buffered only after the HEADERS are queued, never before
+// (celeris#903): the event loop can flush a stream's buffer at any moment, and
+// through the queue its DATA follows whatever of the stream is already in it,
+// but a buffer filled ahead of the HEADERS would let a WINDOW_UPDATE queue the
+// DATA first. And the window may have opened while the handler buffered, a
+// WINDOW_UPDATE having found nothing to flush: the handler then flushes its own
+// buffer, so the credit is not left unused until the next WINDOW_UPDATE.
+func (a *h2ResponseAdapter) finishBody(s *stream.Stream, rest []byte, maxFrame uint32) error {
 	if s.TryBufferOutbound(rest, true) {
-		return frameBuf, nil
+		if m := a.manager; m != nil && s.RunsOnPool() && m.WindowsOpen(s) {
+			m.FlushOutbound(s, a.sendData)
+		}
+		return nil
 	}
-	return frameBuf, rest
+	return a.sendRest(s, rest, maxFrame)
 }
 
 // sendRest sends the part of a worker-pool handler's response body that the
@@ -857,9 +904,8 @@ func (a *h2ResponseAdapter) stageBody(s *stream.Stream, frameBuf, body []byte, s
 // the windows and sends what they allow, through the write queue, until the
 // body is out: the handler blocks, as a net/http handler blocks in Write on
 // flow control, instead of the connection copying past its budget. None of it
-// is buffered, even once the budget has room again: the event loop writes a
-// stream's buffered DATA straight to the connection, ahead of chunks still in
-// the queue, and the body would arrive out of order.
+// is buffered, even once the budget has room again (see
+// Stream.TryBufferOutbound).
 //
 // It gives up, sending nothing more, when the stream is reset or its
 // connection closes. And it waits no longer than writeTimeout from now, the
@@ -912,6 +958,18 @@ func (a *h2ResponseAdapter) resetStream(s *stream.Stream, code http2.ErrCode) {
 	*pooled = appendH2Frame((*pooled)[:0], h2FrameRSTStream, 0, s.ID, payload[:])
 	a.writeQueue.Enqueue(s.ID, pooled)
 	s.Cancel()
+}
+
+// resetStreamUse is resetStream for a StreamWriter, which may outlive its
+// handler (celeris#904): it does nothing once gen is no longer the stream's
+// use, so it neither sends a RST_STREAM for the object's next stream nor
+// cancels that stream.
+func (a *h2ResponseAdapter) resetStreamUse(s *stream.Stream, gen uint64, code http2.ErrCode) {
+	if s.UseLock(gen) != nil {
+		return
+	}
+	defer s.UseUnlock()
+	a.resetStream(s, code)
 }
 
 // SendGoAway writes a GOAWAY frame via the shared writer.
@@ -1104,6 +1162,17 @@ func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
 // matching the WriteResponse path for async handler safety.
 
 func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers [][2]string) error {
+	return a.WriteHeaderUse(s, s.Gen(), status, headers)
+}
+
+// WriteHeaderUse is WriteHeader for a StreamWriter: it is refused, queueing
+// nothing and marking nothing on the stream, once gen is no longer the
+// stream's use (celeris#904).
+func (a *h2ResponseAdapter) WriteHeaderUse(s *stream.Stream, gen uint64, status int, headers [][2]string) error {
+	if err := s.UseLock(gen); err != nil {
+		return err
+	}
+	defer s.UseUnlock()
 	enc := getH2StreamEncoder()
 
 	var hdrBuf [16][2]string
@@ -1138,28 +1207,82 @@ func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers []
 	return nil
 }
 
+// Write sends a chunk of a streamed response body (celeris#904). It honours
+// both of the peer's flow-control windows (RFC 9113 §6.9.1), reserving what it
+// sends from each, as WriteResponse does:
+//
+//   - On a pool goroutine (an async route; a sync one the budget put on the pool), it sends what
+//     the windows allow and waits for the rest (Stream.AwaitSendWindow), the
+//     way net/http's server blocks a handler's Write on flow control. The wait
+//     takes the same WriteTimeout deadline #906 gives WriteResponse's
+//     (sendRest), counted from the moment this call first has to wait, so a peer that withholds window cannot
+//     hold the goroutine, or a sync handler waiting on a lock it holds, for
+//     good: then the stream is reset with INTERNAL_ERROR and Write returns an
+//     error wrapping os.ErrDeadlineExceeded. One deadline per Write, not per
+//     response: a stream (SSE) is meant to outlast any one write. If the
+//     stream ends while Write waits (the peer reset it, the connection
+//     closed), Write returns the stream's context error.
+//   - Otherwise (a sync handler streaming inline on the event loop, or a goroutine
+//     it detached: neither is flagged as a pool handler) it cannot wait: what
+//     the windows refuse is buffered on the stream behind the DATA already
+//     sent, charged to the connection's outbound budget (which the budget does
+//     not limit here: a slow inline stream can push its connection over budget,
+//     and its later sync GETs then run on the pool), and the loop sends it as
+//     the peer grants window. Write returns at once.
+//
+// A StreamWriter that outlives its handler is refused (WriteUse): on HTTP/2 the
+// stream ends when the handler returns, so a goroutine it started that writes
+// later gets stream.ErrStreamEnded, and nothing is sent or buffered.
+//
+// Without a manager (adapters built by unit tests) there is no flow control.
 func (a *h2ResponseAdapter) Write(s *stream.Stream, data []byte) error {
-	// RFC 9110 §9.3.2 / RFC 9113 §8.1.1: no DATA payload on a HEAD
-	// response. Close still ends the stream with an empty DATA frame.
-	if s.IsHEAD {
+	return a.WriteUse(s, s.Gen(), data)
+}
+
+// WriteUse is Write for a StreamWriter (UseStreamer): gen is the use token it
+// took when it was made. Once the stream's use is over (its handler returned,
+// it was released, the peer reset it) the call is refused with an error and
+// sends, buffers and charges nothing (celeris#904); every step that touches
+// the stream is checked against gen under the lock its release takes.
+func (a *h2ResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) error {
+	m := a.manager
+	if m == nil {
+		// RFC 9110 §9.3.2 / RFC 9113 §8.1.1: no DATA payload on a HEAD
+		// response. Close still ends the stream with an empty DATA frame.
+		if s.IsHEAD || len(data) == 0 {
+			return nil
+		}
+		a.sendData(s.ID, false, data)
 		return nil
 	}
-	maxFrame := a.peerMaxFrame()
-	pooled := getH2FrameBuf()
-	frameBuf := (*pooled)[:0]
-	// Worst case: one 9-byte header per maxFrame-sized chunk plus the data itself.
-	numChunks := (len(data) + int(maxFrame) - 1) / int(maxFrame)
-	if numChunks == 0 {
-		numChunks = 1
+	total := len(data)
+	n, id, onPool, err := m.StreamWrite(s, gen, data, a.sendData)
+	if err != nil {
+		return err
 	}
-	needed := 9*numChunks + len(data)
-	if cap(frameBuf) < needed {
-		frameBuf = make([]byte, 0, needed)
+	data = data[n:]
+	if !onPool {
+		return nil // taken whole: sent, buffered behind the DATA already sent, or a HEAD's, dropped
 	}
-	// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
-	frameBuf = appendH2DataFragmented(frameBuf, s.ID, false, data, maxFrame)
-	*pooled = frameBuf
-	a.writeQueue.Enqueue(s.ID, pooled)
+	// A pool goroutine: wait for the windows and send as they allow. The
+	// deadline starts when the call first has to wait, not before: a Write
+	// that finds the windows open reads no clock, and takes one lock.
+	var deadline time.Time
+	for len(data) > 0 {
+		if err := s.AwaitSendWindowUse(gen, a.writeTimeout, &deadline); err != nil {
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				return err // reset by the peer, the connection closed, or the stream's use is over
+			}
+			a.resetStreamUse(s, gen, http2.ErrCodeInternal)
+			return fmt.Errorf("h2: stream %d reset: %d of %d bytes of a write still waited for the peer's window at WriteTimeout (%v): %w",
+				id, len(data), total, a.writeTimeout, err)
+		}
+		n, _, _, err := m.StreamWrite(s, gen, data, a.sendData)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+	}
 	return nil
 }
 
@@ -1167,20 +1290,57 @@ func (a *h2ResponseAdapter) Flush(_ *stream.Stream) error {
 	return nil // write queue data is drained by event loop
 }
 
+// Close ends a streamed response: an empty DATA frame with END_STREAM,
+// queued at once, or, when the stream still has DATA buffered for the peer's
+// window (an inline handler's), carried by the last of it (EndOutbound).
 func (a *h2ResponseAdapter) Close(s *stream.Stream) error {
+	return a.CloseUse(s, s.Gen())
+}
+
+// CloseUse is Close for a StreamWriter: refused, sending nothing, once gen is
+// no longer the stream's use, and on a stream that was reset (the peer's
+// RST_STREAM, or the server's at a Write's timeout): RFC 9113 §5.1 allows no
+// frame after one.
+func (a *h2ResponseAdapter) CloseUse(s *stream.Stream, gen uint64) error {
+	if m := a.manager; m != nil {
+		return m.EndOutbound(s, gen, a.sendData)
+	}
+	a.sendData(s.ID, true, nil)
+	return nil
+}
+
+// sendData frames data as DATA for stream id, fragmented by the peer's
+// SETTINGS_MAX_FRAME_SIZE (RFC 9113 §4.2), and queues it behind the stream's
+// earlier frames (all of a stream's frames go to one shard). endStream is
+// set on the last frame; data may be empty only with endStream. The bytes are
+// copied into the frame buffer, so data may be a view of the caller's buffer.
+// Safe on any goroutine; it wakes the event loop.
+func (a *h2ResponseAdapter) sendData(id uint32, endStream bool, data []byte) {
+	a.writeQueue.Enqueue(id, a.dataFrames(id, endStream, data))
+}
+
+// sendDataFromLoop is sendData for the event loop's own flushes inside
+// ProcessH2 (Processor.SetOutboundSink): it needs no wakeup.
+func (a *h2ResponseAdapter) sendDataFromLoop(id uint32, endStream bool, data []byte) {
+	a.writeQueue.enqueueFromLoop(id, a.dataFrames(id, endStream, data))
+}
+
+func (a *h2ResponseAdapter) dataFrames(id uint32, endStream bool, data []byte) *[]byte {
+	maxFrame := a.peerMaxFrame()
 	pooled := getH2FrameBuf()
 	frameBuf := (*pooled)[:0]
-	if cap(frameBuf) < 9 {
-		frameBuf = make([]byte, 0, 9)
+	// Worst case: one 9-byte header per maxFrame-sized chunk plus the data itself.
+	if need := h2DataFramesLen(len(data), maxFrame); cap(frameBuf) < need {
+		frameBuf = make([]byte, 0, need)
 	}
-	frameBuf = appendH2Data(frameBuf, s.ID, true, nil)
+	frameBuf = appendH2DataFragmented(frameBuf, id, endStream, data, maxFrame)
 	*pooled = frameBuf
-	a.writeQueue.Enqueue(s.ID, pooled)
-	return nil
+	return pooled
 }
 
 var _ stream.Streamer = (*h1ResponseAdapter)(nil)
 var _ stream.Streamer = (*h2ResponseAdapter)(nil)
+var _ stream.UseStreamer = (*h2ResponseAdapter)(nil)
 
 func writeErrorResponse(write func([]byte), status int, message string) {
 	pooled := getResponseBuffer()

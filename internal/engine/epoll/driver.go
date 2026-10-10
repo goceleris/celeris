@@ -371,7 +371,9 @@ func (l *Loop) flushDriverSendLocked(dc *driverConn) error {
 }
 
 // CPUID returns the CPU the worker is pinned to, or -1 if the worker was
-// not successfully pinned (platform.PinToCPU best-effort).
+// not successfully pinned (planned unpinned, or the kernel refused the pin).
+// The loop thread settles it as it starts, so the value is valid only once
+// Listen has reported the engine ready; before that it may still change.
 func (l *Loop) CPUID() int {
 	return l.cpuID
 }

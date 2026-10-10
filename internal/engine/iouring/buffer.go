@@ -4,6 +4,8 @@ package iouring
 
 import (
 	"fmt"
+	"os"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 
@@ -34,6 +36,20 @@ type BufferRing struct {
 	ringRegion []byte         // mmap'd ring entries (for cleanup)
 	bufRegion  []byte         // mmap'd buffer memory (outside Go heap)
 	tail       uint16         // local tail counter
+
+	// repl[bid], when set, is the heap buffer that stands in for slot bid:
+	// RetireBuffer put a request's buffer out of the ring's reach (a
+	// hijacker keeps strings that view it) and gave the ring this one
+	// instead. nil until the first retirement, so the common path pays one
+	// nil check (pushEntry, GetBuffer). Worker thread only.
+	repl [][]byte
+	// kept lists the slots whose mmap'd bytes a retired buffer still is:
+	// Close leaves their pages mapped for the life of the process. Each slot
+	// appears once, whatever the number of retirements (the next retirement
+	// of a slot finds repl set, and its old buffer is the garbage collector's).
+	kept []uint16
+	// retired counts RetireBuffer calls (tests, and the cost in the PR).
+	retired uint64
 }
 
 // NewBufferRing creates and registers a ring-mapped provided buffer group.
@@ -105,7 +121,11 @@ func (br *BufferRing) pushEntry(bufID uint16) {
 	idx := br.tail & br.mask
 	entry := (*bufRingEntry)(unsafe.Add(br.ringAddr, uintptr(idx)*bufRingEntrySize))
 	offset := int(bufID) * br.bufferSize
-	entry.Addr = uint64(uintptr(unsafe.Pointer(&br.bufRegion[offset])))
+	addr := unsafe.Pointer(&br.bufRegion[offset])
+	if br.repl != nil && br.repl[bufID] != nil {
+		addr = unsafe.Pointer(&br.repl[bufID][0])
+	}
+	entry.Addr = uint64(uintptr(addr))
 	entry.Len = uint32(br.bufferSize)
 	entry.Bid = bufID
 	br.tail++
@@ -126,9 +146,51 @@ func (br *BufferRing) GetBuffer(bufID uint16, dataLen int) []byte {
 	if int(bufID) >= br.count || dataLen > br.bufferSize {
 		return nil
 	}
+	if br.repl != nil && br.repl[bufID] != nil {
+		return br.repl[bufID][:dataLen]
+	}
 	offset := int(bufID) * br.bufferSize
 	return br.bufRegion[offset : offset+dataLen]
 }
+
+// RetireBuffer is PushBuffer for a buffer that must not be written again
+// (celeris#868): it gives the ring a fresh entry under the same buffer ID, a
+// new heap buffer, and leaves the buffer the kernel just filled to whoever
+// holds a view of it. A hijacking handler keeps the strings it read from the
+// request, which view that buffer, and hands them to the goroutine that
+// serves the connection; pushed back, the buffer would hold the next
+// connection's bytes by then.
+//
+// The retired bytes are the mmap'd slot the first time a slot is retired:
+// Close then keeps that slot's pages mapped (kept). A slot already replaced
+// holds a heap buffer, which the garbage collector frees once the last view
+// of it is gone, so the pages kept are bounded by the ring's size, however
+// many connections are hijacked. The fresh buffer is held by repl, as the
+// kernel's pointer to it is invisible to the collector. Like PushBuffer it
+// does not publish. Worker thread only.
+//
+// The cost is paid in steady state, on top of the mapped ring: the kernel
+// cycles through the buffer IDs, so after about count hijacks nearly every
+// slot is heap-backed, and the ring then holds count x bufferSize bytes of
+// live Go heap (8 MiB per worker at the smallest ring, 1024 buffers of 8 KiB; up to bufRingCountMax x
+// BufferSize), which the mmap design of NewBufferRing exists to keep off the
+// heap, besides the mapped pages that are never reused. The alternative, a
+// pool of replacements mapped outside the heap, would put the unmapping of
+// buffers hijackers still view on the engine; it is not done here.
+func (br *BufferRing) RetireBuffer(bufID uint16) {
+	if br.repl == nil {
+		br.repl = make([][]byte, br.count)
+	}
+	if br.repl[bufID] == nil {
+		br.kept = append(br.kept, bufID)
+	}
+	br.repl[bufID] = make([]byte, br.bufferSize)
+	br.retired++
+	br.pushEntry(bufID)
+}
+
+// Retired returns how many buffers RetireBuffer has taken out of the ring.
+func (br *BufferRing) Retired() uint64 { return br.retired }
 
 // ReturnBuffer returns a buffer to the ring by pushing a new entry and
 // publishing the updated tail. Must be called after the buffer data has been
@@ -154,10 +216,47 @@ func (br *BufferRing) PublishBuffers() {
 func (br *BufferRing) Close(ring *Ring) {
 	_ = ring.UnregisterPbufRing(br.groupID)
 	if br.bufRegion != nil {
-		_ = unix.Munmap(br.bufRegion)
+		br.unmapBuffers()
 	}
 	if br.ringRegion != nil {
 		_ = unix.Munmap(br.ringRegion)
+	}
+}
+
+// unmapBuffers releases the buffer memory. A slot RetireBuffer kept stays
+// mapped: a hijacking handler may still read the strings that view it
+// (celeris#868), and the engine does not know when the last one goes. It
+// unmaps everything else, so the memory left behind is the retired slots'
+// pages, at most one ring's worth and none in a process that never hijacks
+// under multishot receive. (The partial unmap leaves the region's entry in
+// x/sys/unix's mmap bookkeeping, which Munmap of the whole slice would have
+// removed. It is a map entry of a few words that lives as long as the mapping
+// it names does, and nothing reads it again.) Worker thread only.
+func (br *BufferRing) unmapBuffers() {
+	region := br.bufRegion
+	br.bufRegion = nil
+	if len(br.kept) == 0 {
+		_ = unix.Munmap(region)
+		return
+	}
+	page := uintptr(os.Getpagesize())
+	base := unsafe.Pointer(&region[0])
+	end := (uintptr(len(region)) + page - 1) &^ (page - 1)
+	ids := slices.Clone(br.kept)
+	slices.Sort(ids)
+	// [at, end) is what is still to be dealt with: each kept slot's pages
+	// are skipped, and the gap before them unmapped.
+	at := uintptr(0)
+	for _, id := range ids {
+		lo := uintptr(id) * uintptr(br.bufferSize) &^ (page - 1)
+		hi := (uintptr(id)*uintptr(br.bufferSize) + uintptr(br.bufferSize) + page - 1) &^ (page - 1)
+		if lo > at {
+			_ = unix.MunmapPtr(unsafe.Add(base, at), lo-at)
+		}
+		at = max(at, hi)
+	}
+	if at < end {
+		_ = unix.MunmapPtr(unsafe.Add(base, at), end-at)
 	}
 }
 

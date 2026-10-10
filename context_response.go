@@ -613,9 +613,16 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 
 // NoContent writes a response with no body.
 // Returns ErrResponseWritten if a response has already been sent.
+// Returns ErrDetached if the Context has been detached, as [Context.Blob]
+// does: a detached request is answered by whoever took it over, and on
+// HTTP/2 the stream a late call would write to may by then be another
+// request's.
 func (c *Context) NoContent(code int) error {
 	if c.written {
 		return ErrResponseWritten
+	}
+	if c.detached {
+		return ErrDetached
 	}
 	if c.bufferDepth > 0 {
 		c.capturedStatus = code
@@ -908,7 +915,8 @@ func (c *Context) SetCookie(cookie *Cookie) {
 // otherwise the whole file is sent as a 200. HEAD and other methods ignore
 // Range, as do an unknown range unit, an invalid range set, and a set with
 // more than one satisfiable range (multipart/byteranges is not supported).
-// See RFC 9110 §14 and §13.1.5.
+// A 416 carries no Content-Encoding even if the handler set one: its body is
+// empty, not an encoded stream. See RFC 9110 §14 and §13.1.5.
 //
 // The entire file is loaded into memory (capped at 100 MB). Returns
 // [HTTPError] with status 413 if the file exceeds this limit. For large
@@ -917,6 +925,16 @@ func (c *Context) SetCookie(cookie *Cookie) {
 // Security: filePath is opened directly — callers MUST sanitize user-supplied
 // paths (e.g. filepath.Clean + prefix check) to prevent directory traversal.
 func (c *Context) File(filePath string) error {
+	return c.serveFile(filePath, "", nil)
+}
+
+// serveFile is File. contentType, when not empty, replaces the type taken from
+// filePath's extension. onOpen, when not nil, runs once the file is open and
+// its size and mtime are read from the open descriptor, before the response is
+// decided and only for a file that is going to be sent (not for a 413):
+// middleware/static sets its validators from them there, so they describe the
+// bytes that are sent even when the path is replaced meanwhile (celeris#846).
+func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -933,10 +951,15 @@ func (c *Context) File(filePath string) error {
 		return NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
-	ext := filepath.Ext(filePath)
-	contentType := mime.TypeByExtension(ext)
+	if onOpen != nil {
+		onOpen(stat.ModTime(), size)
+	}
+
 	if contentType == "" {
-		contentType = "application/octet-stream"
+		contentType = mime.TypeByExtension(filepath.Ext(filePath))
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
 	}
 
 	c.SetHeader("accept-ranges", "bytes")
@@ -951,6 +974,8 @@ func (c *Context) File(filePath string) error {
 		case httprange.Unsatisfiable:
 			var crBuf [32]byte
 			c.SetHeader("content-range", string(httprange.AppendUnsatisfied(crBuf[:0], size)))
+			// The empty body of a 416 is not an encoded stream.
+			c.delRespHeader("content-encoding")
 			return c.NoContent(http.StatusRequestedRangeNotSatisfiable)
 		case httprange.Partial:
 			length := end - start + 1
@@ -1040,6 +1065,11 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // error is returned. Symlinks are resolved and rechecked to prevent a
 // symlink under baseDir from escaping the directory boundary.
 func (c *Context) FileFromDir(baseDir, userPath string) error {
+	return c.fileFromDir(baseDir, userPath, "", nil)
+}
+
+// fileFromDir is FileFromDir with serveFile's contentType and onOpen.
+func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
 	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {
@@ -1064,7 +1094,7 @@ func (c *Context) FileFromDir(baseDir, userPath string) error {
 	if info.IsDir() {
 		return NewHTTPError(400, "invalid file path")
 	}
-	return c.File(resolved)
+	return c.serveFile(resolved, contentType, onOpen)
 }
 
 // FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
@@ -1113,6 +1143,22 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		return err
 	}
 	return c.Blob(200, contentType, data)
+}
+
+// delRespHeader removes the response header key (lowercase, as SetHeader
+// stores it) if it is set.
+func (c *Context) delRespHeader(key string) {
+	for i, h := range c.respHeaders {
+		if h[0] == key {
+			last := len(c.respHeaders) - 1
+			copy(c.respHeaders[i:], c.respHeaders[i+1:])
+			// The slot past the new end is cleared, so reset (which clears up to
+			// len) leaves no stale header pointing into a request buffer.
+			c.respHeaders[last] = [2]string{}
+			c.respHeaders = c.respHeaders[:last]
+			return
+		}
+	}
 }
 
 // respHeader returns the value of the response header key (lowercase, as
@@ -1292,15 +1338,31 @@ func (c *Context) BytesWritten() int {
 // (multiplexed streams share a single TCP connection).
 //
 // The request's strings stay valid after Hijack, for the handler and for
-// any goroutine it hands them to (celeris#733). On epoll and io_uring they
-// are views of the connection's receive buffer, which the engine does not
-// give to another connection once the connection is hijacked. Hijack also
-// copies the request values the Context holds, as [Context.Detach] does, so
-// the path, params, headers, query, cookies and body read from the Context
-// after Hijack are copies. In io_uring's opt-in multishot receive mode
-// (CELERIS_IOURING_MULTISHOT_RECV=1) the request is received into a buffer
-// the engine hands back to the kernel when the handler returns: there, keep
-// only strings read after Hijack, or clone the ones read before it.
+// any goroutine it hands them to, and that includes the ones read BEFORE
+// Hijack (celeris#733, celeris#868). On epoll and io_uring they are views of
+// the receive buffer, which the engine does not give to another connection
+// once the connection is hijacked: epoll and io_uring's default receive give
+// up the connection's buffer, and io_uring's opt-in multishot receive mode
+// (CELERIS_IOURING_MULTISHOT_RECV=1) keeps the ring buffer the request was
+// read into and gives the ring a fresh one. On that mode the kept buffer's
+// memory is not returned before the process exits, and it costs twice the
+// ring: each slot a hijack retires is replaced by a heap buffer of the same
+// size, which is live Go heap while the engine runs, and the slot's own
+// pages stay mapped. Each is at most one ring's worth per worker (the ring's
+// buffer count times the buffer size: at least 1024 buffers, which is 8 MiB
+// at 8 KiB each), reached after about as many hijacks as the ring has buffers
+// and not grown by more; the mapped pages are kept per engine start. Hijack
+// also copies the request values the Context holds, as [Context.Detach]
+// does, so the path, params, headers, query, cookies and body read from the
+// Context after Hijack are copies.
+//
+// On io_uring's multishot receive mode, Hijack can fail when the engine's
+// submission queue is full: the receive still armed on the socket has to be
+// cancelled before the socket can be handed over, and the cancel needs a free
+// queue entry. The connection is then left untouched and still the engine's,
+// so the handler can answer the request (a 503, say) and the connection goes
+// on serving. The failure is transient under engine back-pressure, and the
+// error is not exported: treat any Hijack error as "answer the request".
 func (c *Context) Hijack() (net.Conn, error) {
 	if c.written {
 		return nil, errors.New("celeris: cannot hijack after response written")
@@ -1453,7 +1515,8 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // must return to free the event loop thread.
 //
 // Detach copies the request values the Context holds, so they stay valid
-// after the handler returns: the headers, method, path and query, the route
+// after the handler returns (on HTTP/2 the headers and the body are the
+// exception, see below): the headers, method, path and query, the route
 // params, the parsed query and cookies, the Host, the strings stored with
 // SetRequestID, SetClientIP, SetHost, SetScheme and SetString, the request
 // body (so Body, FormValue, Bind and BodyReader called after Detach read the
@@ -1468,6 +1531,16 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // On HTTP/2 the engine ends the stream when the handler returns, detached or
 // not, so [Context.Context] is cancelled then; it stays the request's
 // context, cancelled, when called after that.
+//
+// What the Context reads from the stream at call time is not the request's
+// after that: Header, RequestHeaders, Body, RemoteAddr and the :authority Host
+// read from a stream that has been reset, so they may return empty values, and
+// never another request's (a detached stream is not handed to another
+// request). A goroutine that needs the headers or the body of an HTTP/2
+// request reads them before the handler returns. [Context.NoContent] (and
+// [Context.Redirect]), like [Context.Blob], return [ErrDetached], and a
+// [Context.StreamWriter] taken after that returns a writer whose calls all
+// fail.
 func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
@@ -1484,6 +1557,13 @@ func (c *Context) Detach() (done func()) {
 
 	c.extended = true
 	c.detached = true
+	// The use this Context is detached from. Its goroutine can outlive the
+	// handler, and on HTTP/2 the stream goes back to the pool then: the token
+	// lets StreamWriter tell the stream's next use from this one, and the mark
+	// keeps the pool from handing the stream to another request while this
+	// Context still points at it (celeris#904).
+	c.detachGen = c.stream.Gen()
+	c.stream.MarkDetached()
 	if c.stream.OnDetach != nil {
 		c.stream.OnDetach()
 	}
@@ -1627,8 +1707,20 @@ func appendClone(buf *[]byte, s string) string {
 // [Context.BytesWritten]. The counter uses atomic operations and is safe
 // for use from a detached goroutine.
 type StreamWriter struct {
-	streamer     stream.Streamer
-	stream       *stream.Stream
+	streamer stream.Streamer
+	stream   *stream.Stream
+	// use, when set, is the streamer taken as a stream.UseStreamer and gen the
+	// stream's use token from when the writer was made: on HTTP/2 the stream
+	// ends when the handler returns, and a call that arrives later is refused
+	// instead of acting on whatever the pooled stream serves next
+	// (celeris#904).
+	use stream.UseStreamer
+	gen uint64
+	// refused, when set, is the writer of a Context whose stream's use was
+	// over when the writer was asked for (a detached Context's goroutine
+	// calling Context.StreamWriter after the HTTP/2 handler returned): every
+	// call returns it and touches nothing (celeris#904).
+	refused      error
 	bytesWritten atomic.Int64
 	// used is the owning Context's streamUsed, shared by every StreamWriter
 	// taken on the request. Set by the first WriteHeader, Write, Flush or
@@ -1646,14 +1738,46 @@ func (sw *StreamWriter) markUsed() {
 
 // WriteHeader sends the status line and headers. Must be called once before Write.
 func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
+	if sw.refused != nil {
+		return sw.refused
+	}
 	sw.markUsed()
+	if sw.use != nil {
+		return sw.use.WriteHeaderUse(sw.stream, sw.gen, status, headers)
+	}
 	return sw.streamer.WriteHeader(sw.stream, status, headers)
 }
 
 // Write sends a chunk of the response body. May be called multiple times.
+//
+// On HTTP/2 the chunk is held to the peer's flow-control windows
+// (RFC 9113 §6.9.1). Called from a worker-pool goroutine (an async route), Write
+// blocks until the windows let the whole chunk go, for no longer than the
+// server's WriteTimeout from the call (0 = no bound): then the stream is reset
+// with INTERNAL_ERROR and Write returns an error wrapping
+// [os.ErrDeadlineExceeded]. It returns the stream's context error when the
+// peer resets the stream or the connection closes. Called from a handler on
+// the event loop, it does not block: what the windows refuse is buffered and
+// sent as the peer grants window. When Write returns an error it reports 0
+// bytes written, though part of the chunk may already have been sent, and
+// [StreamWriter.BytesWritten] does not count it.
+//
+// On HTTP/2 the stream ends when the handler returns, detached or not (see
+// [Context.Detach]): a Write, WriteHeader or Close from a goroutine that
+// outlived the handler returns an error and sends nothing, so it can never
+// reach another request's response. Finish the stream before the handler
+// returns.
 func (sw *StreamWriter) Write(data []byte) (int, error) {
+	if sw.refused != nil {
+		return 0, sw.refused
+	}
 	sw.markUsed()
-	err := sw.streamer.Write(sw.stream, data)
+	var err error
+	if sw.use != nil {
+		err = sw.use.WriteUse(sw.stream, sw.gen, data)
+	} else {
+		err = sw.streamer.Write(sw.stream, data)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -1667,8 +1791,23 @@ func (sw *StreamWriter) BytesWritten() int64 {
 	return sw.bytesWritten.Load()
 }
 
-// Flush ensures buffered data is sent to the network.
+// Flush asks the engine to send buffered data to the network. It is a request,
+// not a guarantee, and on HTTP/1.1 on epoll, io_uring and Adaptive (the Linux
+// default, which runs on the first two) it does nothing: what reaches the
+// peer, and when, is decided by [StreamWriter.Write]. Until
+// [Context.Detach] those engines only append each Write to the connection's
+// send buffer, which goes out when the handler returns, so every byte
+// written so far stays in memory until then, however often Flush is called.
+// After Detach each Write is handed to the connection at once (the calling
+// goroutine usually tries the send, and the engine finishes what the socket
+// does not take). The std engine flushes through [net/http.Flusher]. To
+// deliver bytes while the handler is still running, Detach it (see
+// [Context.EngineSupportsAsyncDetach]). The behavior above is HTTP/1.1's;
+// Flush is not a delivery guarantee on HTTP/2 either.
 func (sw *StreamWriter) Flush() error {
+	if sw.refused != nil {
+		return sw.refused
+	}
 	sw.markUsed()
 	return sw.streamer.Flush(sw.stream)
 }
@@ -1676,7 +1815,13 @@ func (sw *StreamWriter) Flush() error {
 // Close signals end of the response body and syncs the byte count back to
 // the owning Context so that [Context.BytesWritten] reflects the total.
 func (sw *StreamWriter) Close() error {
+	if sw.refused != nil {
+		return sw.refused
+	}
 	sw.markUsed()
+	if sw.use != nil {
+		return sw.use.CloseUse(sw.stream, sw.gen)
+	}
 	return sw.streamer.Close(sw.stream)
 }
 
@@ -1702,6 +1847,14 @@ func (sw *StreamWriter) Close() error {
 //
 // On native engines (epoll, io_uring), the caller must call [Context.Detach]
 // before spawning a goroutine that uses the StreamWriter. Call Close() when done.
+// On HTTP/2 that goroutine must finish the stream before the handler returns
+// (join it, as the sse middleware does): the stream ends with the handler,
+// detached or not, and a StreamWriter call after that returns an error and
+// sends nothing. That holds for a writer taken before the handler returned and
+// for one the detached goroutine takes with this method afterwards: the
+// Context remembers the stream's use as of [Context.Detach], and the writer it
+// returns for an ended use is a non-nil writer whose calls all return an
+// error. On HTTP/1 the stream lives until the detached goroutine is done.
 func (c *Context) StreamWriter() *StreamWriter {
 	// Streaming is fundamentally incompatible with response buffering:
 	// buffered responses are held in memory for possible mutation/discard,
@@ -1709,7 +1862,30 @@ func (c *Context) StreamWriter() *StreamWriter {
 	if c.bufferDepth > 0 {
 		return nil
 	}
-	s, ok := c.stream.ResponseWriter.(stream.Streamer)
+	if c.stream == nil {
+		// A Context used after it was released (done() was called, or a
+		// handler kept a Context it never detached). Not a streaming engine's
+		// answer (nil): a refusal, so a goroutine that writes through it gets
+		// an error rather than a nil pointer.
+		return &StreamWriter{refused: stream.ErrStreamEnded, used: &c.streamUsed}
+	}
+	var rw stream.ResponseWriter
+	var gen uint64
+	if !c.detached {
+		rw, gen = c.stream.ResponseWriter, c.stream.Gen()
+	} else {
+		// A detached Context's goroutine may call this after the handler
+		// returned, when on HTTP/2 the stream has ended and the pooled object
+		// may serve another request. Read the writer only if the stream is
+		// still the use this Context was detached from; the read is ordered
+		// against the release's reset, so it cannot see the next use's.
+		var live bool
+		if rw, live = c.stream.UseResponseWriter(c.detachGen); !live {
+			return &StreamWriter{refused: stream.ErrStreamEnded, used: &c.streamUsed}
+		}
+		gen = c.detachGen
+	}
+	s, ok := rw.(stream.Streamer)
 	if !ok {
 		return nil
 	}
@@ -1725,6 +1901,9 @@ func (c *Context) StreamWriter() *StreamWriter {
 	c.extended = true
 	c.written = true
 	sw := &StreamWriter{streamer: s, stream: c.stream, used: &c.streamUsed}
+	if u, ok := s.(stream.UseStreamer); ok {
+		sw.use, sw.gen = u, gen
+	}
 	c.streamWriter = sw
 	return sw
 }

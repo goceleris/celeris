@@ -50,6 +50,10 @@ type Config struct {
 	// and a listener-backlog slot for the full ReadTimeout. The std
 	// engine wires this to http.Server.ReadHeaderTimeout. The iouring
 	// and epoll engines enforce it inside their H1 header read loop.
+	// The io_uring engine also counts it from accept for a connection
+	// whose protocol is not detected yet (Auto, or H2C with the h2c
+	// upgrade), then restarts it at detection (so up to twice this value
+	// in all); epoll does not bound that first phase yet.
 	//
 	// Note: iouring/epoll's own SO_REUSEPORT-fronted multi-worker
 	// design absorbs a lot of slowloris pressure through queue

@@ -31,8 +31,10 @@ const (
 	// maxSendQueueBytesH2 is the limit for an HTTP/2 connection. Its DATA
 	// is already bounded by the flow-control windows the peer grants (what
 	// the windows refuse waits in the streams' buffers, bounded per
-	// connection by stream.OutboundBudget, celeris#893; a StreamWriter
-	// response's is not yet, celeris#904), and a
+	// connection by stream.OutboundBudget, celeris#893; a StreamWriter on
+	// the worker pool waits for the window instead of queueing past it, and
+	// one on the event loop buffers what the window refuses on its stream,
+	// charged to that budget but not refused by it, celeris#904), and a
 	// peer that reads keeps up to a window of frames queued, or in a SEND
 	// in flight, as a matter of course (net/http's client grants 4 MiB per
 	// stream, browsers more per connection), so the H1 limit closed healthy
@@ -156,7 +158,17 @@ type connState struct {
 	// split across packets) would lose its earlier bytes (v1.5.0 review
 	// 2.8). Empty/nil once cs.detected is set; only the slow split-preface
 	// path ever allocates it.
+	//
+	// It holds fewer than detect.PrefaceLen bytes while detection waits (the
+	// recv that decides adds the rest), and the conn is closed when the bytes
+	// are not a protocol the engine serves (celeris#974).
 	detectAccum []byte // 24
+	// detectDeadline is the absolute time (UnixNano) by which the protocol
+	// must be detected: accept time + ReadHeaderTimeout, 0 for none (the
+	// protocol is fixed at accept, or ReadHeaderTimeout is off). Not extended
+	// by a recv, so a client that dribbles the preface cannot move it.
+	// checkTimeouts closes an undetected conn past it (celeris#974).
+	detectDeadline int64 // 8
 	// bodyRecvPin retains the H1State.bodyBuf backing array while a
 	// single-shot recv has been armed directly into it (pickRecvTarget's
 	// recvIntoBody path). conn.CloseH1 nils H1State.bodyBuf on close, which
@@ -463,6 +475,13 @@ type connState struct {
 	// The close paths use it to target an ASYNC_CANCEL at the armed
 	// recv's exact generation-tagged user_data. Worker-thread-only.
 	recvArmed bool
+	// cancelMissed is set by a close path that queued cs for release without
+	// having placed the cancel of a recv or send it left armed, because the
+	// SQ ring had no room (cancelConnOps, celeris#869). The op is then owed
+	// without anything having asked the kernel to end it: drainPendingRelease
+	// places the cancel again, and its backstop holds cs for the op instead of
+	// releasing it. Worker-thread-only; cleared at release.
+	cancelMissed bool
 	// recvOutstanding counts recv SQEs placed for this conn (prepareRecv,
 	// flushSendLink's linked recv) minus terminal udRecv CQEs dispatched
 	// to it. Mirrors recvArmed as a count so a second placement (2) and a
@@ -619,6 +638,7 @@ func releaseConnState(cs *connState) {
 	// writing into the pinned bodyBuf array (#256 body-buffer UAF guard).
 	cs.bodyRecvPin = nil
 	cs.detectAccum = cs.detectAccum[:0]
+	cs.detectDeadline = 0
 	// kernelInflight is zero on every normal release (drainPendingRelease
 	// gates on it); reset for the wall-clock-backstop path, where the worker
 	// gave up waiting on a CQE the kernel never produced, and for the
@@ -627,6 +647,7 @@ func releaseConnState(cs *connState) {
 	// the identity's count, not this one, waits for its notification).
 	cs.kernelInflight = 0
 	cs.recvArmed = false
+	cs.cancelMissed = false
 	cs.recvOutstanding = 0
 	cs.fd = 0
 	cs.liveIdx = -1

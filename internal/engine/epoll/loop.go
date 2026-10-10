@@ -410,11 +410,15 @@ func (l *Loop) run(ctx context.Context) {
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}
-	_ = platform.PinToCPU(l.cpuID)
+	// celeris#909: a loop planned unpinned, or whose pin failed, has cpuID -1
+	// and no NUMA node to bind to.
+	l.pinOwnThread()
 
-	numaNode := platform.CPUForNode(l.cpuID)
-	if err := platform.BindNumaNode(numaNode); err == nil {
-		defer func() { _ = platform.ResetNumaPolicy() }()
+	if l.cpuID >= 0 {
+		numaNode := platform.CPUForNode(l.cpuID)
+		if err := platform.BindNumaNode(numaNode); err == nil {
+			defer func() { _ = platform.ResetNumaPolicy() }()
+		}
 	}
 
 	epollFD, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
@@ -792,10 +796,13 @@ func (l *Loop) run(ctx context.Context) {
 			l.bytesWrittenBatch = 0
 		}
 
-		// Check connection timeouts. Default cadence is every 1024 iterations
-		// (~100ms under load); when detached conns exist with idle deadlines
-		// the gate tightens to every 32 iterations (~50ms idle wall time)
-		// so the WS idle-close fires within its configured budget. When
+		// Check connection timeouts. Default cadence is every 1024 iterations;
+		// when detached conns exist with idle deadlines the gate tightens to
+		// every 32 iterations so the WS idle-close fires within its
+		// configured budget. An iteration is one epoll_wait return, so the
+		// wall time between sweeps depends on the load: on a busy loop it is
+		// well under a millisecond, and the timerfd (25 ms) is only the floor
+		// on an idle one. When
 		// ReadHeaderTimeout is enabled (the v1.4.11 slowloris defence),
 		// the gate ALSO tightens to 0x1F — the in-process synthetic
 		// reproducer (test/integration/slowloris_synthetic_test.go) showed
@@ -903,8 +910,20 @@ func (l *Loop) onPeerHalfClose(fd int) {
 	if cs == nil || cs.detachClosed || cs.asyncClosed.Load() {
 		return
 	}
+	// h1State is loaded once, into a local. switchToH2Local sets it to nil
+	// under detachMu on the dispatch goroutine, and the memory model lets a
+	// `cs.h1State != nil && cs.h1State.Detached.Load()` reload it between the
+	// test and the dereference (a nil dereference). The gc compiler happens to
+	// merge the two loads today (arm64 and amd64 disassembly, celeris#865
+	// review), so this removes a dependence on that, not a crash seen.
+	// The load itself still races with that write and is unlocked on purpose:
+	// EPOLLRDHUP is edge-triggered, so skipping a conn whose lock is held (the
+	// TryLock the sweep uses) could lose the event for good. What to do with a
+	// held lock here is for the async-abort work (celeris#844); the race report
+	// is tracked in celeris#885.
+	h1 := cs.h1State
 	switch {
-	case cs.h1State != nil && cs.h1State.Detached.Load():
+	case h1 != nil && h1.Detached.Load():
 		l.notifyDetachedPeerClosed(cs)
 	case csWritePending(cs):
 		cs.peerClosed = true
@@ -1278,7 +1297,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// read for a multi-read POST. Disabled in async mode: the
 		// dispatch goroutine owns h1State and the worker cannot safely
 		// observe NextRecvBuf without synchronization.
-		recvBuf := cs.buf
+		// While the protocol is undetected, bytes already received and too
+		// few to decide on (detectN, at most detect.PrefaceLen-1) stay at the
+		// head of cs.buf and this read lands after them (celeris#870).
+		recvBuf := cs.buf[cs.detectN:]
 		intoBody := false
 		if !l.async && cs.h1State != nil {
 			if b := cs.h1State.NextRecvBuf(); b != nil {
@@ -1390,17 +1412,30 @@ func (l *Loop) drainRead(fd int, now int64) {
 			continue
 		}
 
-		data := cs.buf[:n]
+		// data is everything received so far that no protocol has consumed:
+		// this read plus, until detection succeeds, the bytes held back by an
+		// earlier one.
+		data := cs.buf[:int(cs.detectN)+n]
 
 		if !cs.detected {
 			proto, detectErr := detect.Detect(data)
 			if detectErr == detect.ErrInsufficientData {
+				// A first segment shorter than detection needs ("GE", or an
+				// h2c preface cut before byte 24) is kept in place and the
+				// next read appended to it. Reading every segment at the start
+				// of cs.buf overwrote it, so GE + "T /x HTTP/1.1" parsed as
+				// the method "T" and was answered 405, and a split preface
+				// was lost. Detect decides within detect.PrefaceLen bytes, so
+				// the held prefix is shorter than that and always leaves room
+				// in cs.buf (BufferSize >= resource.MinBufferSize).
+				cs.detectN = uint8(len(data))
 				continue
 			}
 			if detectErr != nil {
 				l.closeConn(fd)
 				return
 			}
+			cs.detectN = 0
 			cs.protocol = proto
 			cs.detected = true
 			l.initProtocol(cs)
@@ -1710,7 +1745,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// than the buffer can hold). Skip the EAGAIN-producing read that would
 		// otherwise cost one wasted syscall per request. Edge-triggered epoll
 		// will notify when new data arrives on this fd.
-		if n < len(cs.buf) {
+		if n < len(recvBuf) {
 			return
 		}
 	}
@@ -3301,8 +3336,84 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 // branch closes the conn immediately.
 const detachDrainGrace = time.Second
 
+// h1DeadlineSnapshot is what checkTimeouts knows about a conn's H1 state: a
+// copy taken under cs.detachMu, so the pointer is never dereferenced after
+// switchToH2Local may have released it.
+type h1DeadlineSnapshot struct {
+	detached     bool  // truly detached (WS/SSE): the middleware owns the I/O lifecycle
+	idleDL       int64 // H1State.IdleDeadlineNs; read, and meaningful, only when detached
+	hdrDL        int64 // H1State.HeaderDeadlineNs, 0 when none; read only when not detached
+	writePending bool  // csWritePending(cs); read only when detached
+}
+
+// snapshotH1Deadlines copies out of cs.h1State, under cs.detachMu, the fields
+// checkTimeouts decides on (celeris#865, the epoll twin of celeris#548/#722;
+// iouring has snapshotH1Deadlines in worker.go, whose shape this follows).
+//
+// The dispatch goroutine's switchToH2Local sets cs.h1State = nil under
+// detachMu. Reading the pointer and what it points to outside the lock is a
+// data race, which the race detector reports against that write (probatorium
+// run 37969571447), and the memory model lets a reload find nil. The gc
+// compiler merges the adjacent loads of the old code, so what was observed is
+// the race, not a crash. The lock is taken with TryLock and never with Lock: the
+// dispatch goroutine holds detachMu across ProcessH1, so a blocking Lock would
+// park the loop thread, and every conn on it, behind one slow handler
+// (celeris#669, celeris#593). The lock is released before the caller acts:
+// closeConn takes the same non-reentrant mutex.
+//
+// ok=false means the lock is held by a bounded holder (a detached conn's
+// guarded writeFn, for one write) and NOTHING was read: the sweep skips the
+// conn this time. The skip is not bounded: a holder that takes the lock again
+// and again (a hot broadcaster) can win the TryLock race on several sweeps in
+// a row, and the sweep runs often on a busy loop (see checkTimeouts' cadence
+// note), so a run of skips is unlikely but not excluded, and a conn whose
+// deadline has passed is reaped on a later sweep, by chance, not on the next.
+// Each holder's critical section is bounded (one write), so the conn is
+// reaped once any sweep finds the lock free.
+//
+// When the lock is held because the dispatch goroutine is inside a handler
+// (dispatchBusy), nothing is read either, and ok=true with the zero snapshot:
+// such a conn is not detached (Detach sets asyncDetachUnlocked before it
+// publishes Detached, and dispatchBusy excludes it) and has no header deadline
+// (ProcessH1 clears it once the request is parsed, before the handler runs).
+// So the zero snapshot IS the answer, and checkTimeouts applies the idle,
+// read and write timeouts to a conn whose handler overruns them, as it did
+// before (nothing refreshes lastActivity while a handler runs; celeris#669).
+func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
+	mu := cs.detachMu
+	if mu != nil && !mu.TryLock() {
+		return snap, dispatchBusy(cs, nil)
+	}
+	// Only plain and atomic loads from here to the Unlock: nothing can panic
+	// or block while the lock is held. A detached conn needs its idle deadline
+	// and write state, any other its header deadline, which are the loads the
+	// unlocked code made.
+	if h1 := cs.h1State; h1 != nil {
+		if snap.detached = h1.Detached.Load(); snap.detached {
+			snap.idleDL = h1.IdleDeadlineNs.Load()
+			snap.writePending = csWritePending(cs)
+		} else {
+			snap.hdrDL = h1.HeaderDeadlineNs.Load()
+		}
+	}
+	if mu != nil {
+		mu.Unlock()
+	}
+	return snap, true
+}
+
 // checkTimeouts scans active connections and closes any that have exceeded
-// their configured timeout. Called every 1024 iterations (~100ms).
+// their configured timeout.
+//
+// Cadence: the sweep is driven by the loop's own iterations, not by a clock.
+// The run loop calls it every 32 epoll_wait iterations when ReadHeaderTimeout
+// is set (the default is 10 s) or a conn is detached, otherwise every 1024,
+// and the 25 ms timerfd (armed only when ReadHeaderTimeout is set) is a floor
+// that guarantees a sweep on an idle loop, not a ceiling. A busy loop sweeps
+// as often as its iterations allow. Measured on 2 loops with 4096 idle
+// keep-alive conns each (celeris PR 969): about 120 sweeps a second in all with
+// no traffic (the timerfd alone gives 80), and 1,800 to 6,200 a second in all
+// with one to sixteen busy clients.
 //
 // Iterates the dense liveConns slice (#318) rather than the sparse
 // 0..maxFD range, so the cost is O(active conns) regardless of FD space.
@@ -3327,8 +3438,16 @@ func (l *Loop) checkTimeouts() {
 		// engine-config-driven idle/read/write timeouts since the middleware
 		// owns the I/O lifecycle. Async-mode conns set detachMu up front
 		// without a true detach — fall through to the normal scan for those.
-		if cs.h1State != nil && cs.h1State.Detached.Load() {
-			dl := cs.h1State.IdleDeadlineNs.Load()
+		// h1State is read once, under detachMu (celeris#865); see
+		// snapshotH1Deadlines. A conn whose lock is held by a bounded holder
+		// is skipped for this sweep and met again on a later one (not
+		// necessarily the next: the skip is probabilistic).
+		snap, ok := snapshotH1Deadlines(cs)
+		if !ok {
+			continue
+		}
+		if snap.detached {
+			dl := snap.idleDL
 			if dl <= 0 || now <= dl {
 				// Unset, or pushed back out by the middleware (a WS frame
 				// extends it): forget any grace stamp so a later expiry
@@ -3349,7 +3468,7 @@ func (l *Loop) checkTimeouts() {
 			// EPOLLRDHUP path's cs.peerClosed defer. Bounded: a peer that
 			// stops reading for good must not strand the fd, and a dirty conn
 			// holds the loop at a 0 ms epoll_wait.
-			if csWritePending(cs) {
+			if snap.writePending {
 				if cs.drainDeadline == 0 {
 					cs.drainDeadline = now + int64(detachDrainGrace)
 				}
@@ -3369,11 +3488,9 @@ func (l *Loop) checkTimeouts() {
 		// 26429150655 and predecessors), pointing at our extra syscalls
 		// racing with the walker's drip Write rather than at FIN/RST
 		// signaling. Simplest mirrors std.
-		if cs.h1State != nil {
-			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
-				l.closeConn(fd)
-				continue
-			}
+		if dl := snap.hdrDL; dl > 0 && now > dl {
+			l.closeConn(fd)
+			continue
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty {

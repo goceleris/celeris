@@ -75,8 +75,8 @@ func TestAdaptiveSwitchVsAcceptChurn(t *testing.T) {
 	// those as a "leak" would false-fail, so force the build now (and switch
 	// back) so both sub-engines' fixed FDs are already in the baseline; after
 	// this only orphaned per-connection sockets can grow the count.
-	e.ForceSwitch() // epoll -> io_uring (builds + Listens the standby)
-	e.ForceSwitch() // io_uring -> epoll (both engines now exist + listen)
+	forceSwitchTo(t, e, engine.IOUring) // epoll -> io_uring (builds + Listens the standby)
+	forceSwitchTo(t, e, engine.Epoll)   // io_uring -> epoll (both engines now exist + listen)
 	time.Sleep(100 * time.Millisecond)
 
 	// Baseline FD count: both sub-engines built + bound, so only churn-induced

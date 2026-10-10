@@ -153,7 +153,7 @@ func TestAdaptiveSwitchesWithPreBoundListener(t *testing.T) {
 		t.Skip("switch integration test")
 	}
 	if !probe.Probe().IOUringTier.Available() {
-		t.Skip("io_uring unavailable: the switch needs both sub-engines")
+		skipOrFailUpswitch662(t, "io_uring unavailable: the switch needs both sub-engines")
 	}
 
 	e, want, stop := preBoundAdaptive(t, 2)
