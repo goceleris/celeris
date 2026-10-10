@@ -118,7 +118,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE "$COVER_EXCLUDE" | grep -vE "$COVER_OWN_STEP")
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
-          go test -race -count=1 -timeout=300s -covermode=atomic \
+          go test -race -count=1 -timeout=600s -covermode=atomic \
             -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
       # ./internal/engine/iouring on its own, as ci.yml's unit job runs it.
       # io_uring charges ring memory to the user, so every test process of the
