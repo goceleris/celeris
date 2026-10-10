@@ -182,6 +182,11 @@ func TestRSTRacesPoolHandlerEnd950(t *testing.T) {
 				go func() { defer wg.Done(); <-start; tc.reset(p) }()
 				close(start)
 				wg.Wait()
+				// The pool handler's stream goes to the stream pool from the
+				// event loop, at the end of its frame batch (celeris#951):
+				// without this the pool holds nothing, and the check below
+				// can never see a double release.
+				p.FlushInlineCleanup()
 				seen := 0
 				for range 64 {
 					if streamPool.Get().(*Stream) == s {
