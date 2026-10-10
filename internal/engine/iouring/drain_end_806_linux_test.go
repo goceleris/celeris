@@ -3,7 +3,10 @@
 package iouring
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -139,5 +142,35 @@ func TestAdaptiveTimeoutIsCappedWhileDraining806(t *testing.T) {
 				t.Fatalf("adaptiveTimeout = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSendDrainGiveUpStatesTheLoss806: when the drain runs out of time with a
+// response unsent, the cut is counted once and logged with the connections and
+// the queued bytes it costs; a conn with nothing queued is not counted.
+func TestSendDrainGiveUpStatesTheLoss806(t *testing.T) {
+	lb := &bytes.Buffer{}
+	w := &Worker{
+		id:          3,
+		listenFD:    -1,
+		conns:       make([]*connState, 8),
+		handoffLoss: &handoffLossStats{},
+		logger:      slog.New(slog.NewTextHandler(lb, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	for fd, queued := range map[int]int{4: 1000, 5: 0, 6: 24} {
+		cs := &connState{fd: fd, liveIdx: -1, writeBuf: make([]byte, queued)}
+		w.conns[fd] = cs
+		w.addLiveConn(cs)
+	}
+	w.noteSendDrainGaveUp(int64(250 * time.Millisecond))
+	got := lb.String()
+	t.Logf("celeris806 give-up log: %s", strings.TrimSpace(got))
+	if n := w.handoffLoss.shutdownSendDrainGaveUp.Load(); n != 1 {
+		t.Fatalf("shutdownSendDrainGaveUp = %d, want 1", n)
+	}
+	for _, want := range []string{"level=WARN", "worker=3", "conns=2", "queued_bytes_lost=1024", "waited=250ms"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("log lacks %q: %s", want, got)
+		}
 	}
 }

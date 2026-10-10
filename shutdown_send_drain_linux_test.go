@@ -129,59 +129,87 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 			if e.slim && (mode == "Shutdown" || mode == "Shutdown-withcancel") {
 				continue // slim engines: the WriteTimeout bound and the cancel
 			}
-			t.Run(e.name+"/"+mode, func(t *testing.T) {
-				desc := e.name + "/" + mode
-				served := make(chan struct{})
-				var writeTimeout time.Duration
-				if mode == "Shutdown-background" {
-					writeTimeout = budget
-				}
-				logs := &syncBuf806{}
-				srv := startDrainServer806(t, e, budget, writeTimeout, func(c *celeris.Config) {
-					c.Logger = slog.New(slog.NewTextHandler(logs, nil))
-					if e.slim {
-						// The kernel cannot hold the response, so the cut the
-						// WARN below reports is certain, not host luck.
-						sndBufs806[1].apply(c)
+			for _, reader := range readers806(e, mode) {
+				t.Run(e.name+"/"+mode+reader, func(t *testing.T) {
+					desc := e.name + "/" + mode + reader
+					served := make(chan struct{})
+					var writeTimeout time.Duration
+					if mode == "Shutdown-background" {
+						writeTimeout = budget
 					}
-				}, func(s *celeris.Server) {
-					s.GET("/big", func(c *celeris.Context) error {
-						defer close(served) // native engines: the body is queued, not written, here
-						return c.Blob(http.StatusOK, "application/octet-stream", body)
+					logs := &syncBuf806{}
+					srv := startDrainServer806(t, e, budget, writeTimeout, func(c *celeris.Config) {
+						c.Logger = slog.New(slog.NewTextHandler(logs, nil))
+						if e.slim {
+							// The kernel cannot hold the response, so the cut the
+							// WARN below reports is certain, not host luck.
+							sndBufs806[1].apply(c)
+						}
+					}, func(s *celeris.Server) {
+						s.GET("/big", func(c *celeris.Context) error {
+							defer close(served) // native engines: the body is queued, not written, here
+							return c.Blob(http.StatusOK, "application/octet-stream", body)
+						})
 					})
+					c := dialSlowReader760(t, srv.addr)
+					if _, err := io.WriteString(c, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+						t.Fatal(err)
+					}
+					select {
+					case <-served:
+					case <-time.After(5 * time.Second):
+						t.Fatal("handler did not run within 5s")
+					}
+					time.Sleep(100 * time.Millisecond) // the response is queued behind a full socket
+					start := time.Now()
+					shutErr := srv.beginShutdown(mode, budget)
+					if reader == "/trickle" {
+						// The client takes some of the response 100 ms into the
+						// drain, then stops again: a partial SEND completion in
+						// the drain, whose remainder the loop submits there, and
+						// the wait after that submit must still be bounded.
+						time.Sleep(100 * time.Millisecond)
+						buf := make([]byte, 32<<10)
+						for got := 0; got < 256<<10; {
+							_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+							n, err := c.Read(buf)
+							got += n
+							if err != nil {
+								t.Fatalf("%s: the trickling client's read: %v", desc, err)
+							}
+						}
+					}
+					if err := srv.waitShutdown(mode, shutErr, budget+bound); err != nil {
+						t.Fatalf("%s: %v (a drain the stalled client can hold open past the budget)", desc, err)
+					}
+					t.Logf("%s: Start returned %v after the shutdown began", desc, time.Since(start).Round(time.Millisecond))
+					// The engine has stopped, so the connection must be closed:
+					// the client, which has read nothing so far, reads what the
+					// kernel took and then EOF (or, where the kernel took it
+					// all, the whole body), never an open connection.
+					got, n, end := readResponse760(c)
+					if end != "EOF" && end != "the end of the body" {
+						t.Errorf("%s: after the shutdown the client got %d of %d body bytes (%d in all), then %s", desc, len(got), size, n, end)
+					}
+					// The io_uring engine states the data loss the bound is: a
+					// WARN naming the connections and the queued bytes cut.
+					if e.slim && !strings.Contains(logs.String(), "the send drain ran out of time") {
+						t.Errorf("%s: the engine cut a response the client had not taken and logged nothing about it:\n%s", desc, logs.String())
+					}
 				})
-				c := dialSlowReader760(t, srv.addr)
-				if _, err := io.WriteString(c, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
-					t.Fatal(err)
-				}
-				select {
-				case <-served:
-				case <-time.After(5 * time.Second):
-					t.Fatal("handler did not run within 5s")
-				}
-				time.Sleep(100 * time.Millisecond) // the response is queued behind a full socket
-				start := time.Now()
-				shutErr := srv.beginShutdown(mode, budget)
-				if err := srv.waitShutdown(mode, shutErr, budget+bound); err != nil {
-					t.Fatalf("%s: %v (a drain the stalled client can hold open past the budget)", desc, err)
-				}
-				t.Logf("%s: Start returned %v after the shutdown began", desc, time.Since(start).Round(time.Millisecond))
-				// The engine has stopped, so the connection must be closed:
-				// the client, which has read nothing so far, reads what the
-				// kernel took and then EOF (or, where the kernel took it
-				// all, the whole body), never an open connection.
-				got, n, end := readResponse760(c)
-				if end != "EOF" && end != "the end of the body" {
-					t.Errorf("%s: after the shutdown the client got %d of %d body bytes (%d in all), then %s", desc, len(got), size, n, end)
-				}
-				// The io_uring engine states the data loss the bound is: a
-				// WARN naming the connections and the queued bytes cut.
-				if e.slim && !strings.Contains(logs.String(), "the send drain ran out of time") {
-					t.Errorf("%s: the engine cut a response the client had not taken and logged nothing about it:\n%s", desc, logs.String())
-				}
-			})
+			}
 		}
 	}
+}
+
+// readers806 are the client behaviours of the bounded test for e in mode: the
+// stalled one always; the slim engines add a client that reads a part of the
+// response during the drain and stops (in the cancel mode only).
+func readers806(e drainEngine806, mode string) []string {
+	if e.slim && mode == "cancel" {
+		return []string{"", "/trickle"}
+	}
+	return []string{""}
 }
 
 // TestShutdownSendDrainStopsAccepting806: a send drain that can last the
