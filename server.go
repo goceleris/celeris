@@ -586,7 +586,10 @@ func (s *Server) cancelListen() {
 // 60 s by default, so a client that stops reading holds the Start* call for
 // up to that long when ctx has no deadline (and, on a cancel of
 // StartWithContext, for up to [Config.ShutdownTimeout], 30 s by default);
-// only a WriteTimeout of -1 leaves a ctx without a deadline unbounded.
+// only a WriteTimeout of -1 leaves a ctx without a deadline unbounded. On
+// io_uring the cap is taken from the start of each of its two waits, the
+// HTTP/2 handlers' and the send drain that follows, so a server with HTTP/2
+// stream handlers still running can be held up to twice that.
 //
 // The listen context published by the Start* entry points is cancelled AFTER
 // the engine's graceful phase, never before: on std, Engine.Shutdown IS the

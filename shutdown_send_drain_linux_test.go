@@ -180,7 +180,16 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 						}
 					}
 					if err := srv.waitShutdown(mode, shutErr, budget+bound); err != nil {
-						t.Fatalf("%s: %v (a drain the stalled client can hold open past the budget)", desc, err)
+						// How late: the issue's own defect is a return about 10 s
+						// after the shutdown began whatever the budget.
+						late := "and not within 15 s more"
+						select {
+						case serr := <-srv.startDone:
+							srv.startDone <- serr // for the cleanup
+							late = fmt.Sprintf("it returned %v after the shutdown began", time.Since(start).Round(10*time.Millisecond))
+						case <-time.After(15 * time.Second):
+						}
+						t.Fatalf("%s: %v (a drain the stalled client can hold open past the budget; %s)", desc, err, late)
 					}
 					t.Logf("%s: Start returned %v after the shutdown began", desc, time.Since(start).Round(time.Millisecond))
 					// The engine has stopped, so the connection must be closed:
