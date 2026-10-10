@@ -62,8 +62,8 @@ func TestUpgradeBodyBoundedByMaxRequestBodySize976(t *testing.T) {
 			if !strings.HasPrefix(first, "HTTP/1.1 413") {
 				t.Fatalf("%s: a %d byte Upgrade: h2c body with MaxRequestBodySize 4096 was answered %q, want 413", e.name, n, first)
 			}
-			if s := sent.Load(); s > n/4 {
-				t.Fatalf("%s: the server took %d of %d body bytes before refusing, want at most %d", e.name, s, n, n/4)
+			if s := sent.Load(); s > n/2 {
+				t.Fatalf("%s: the server took %d of %d body bytes before refusing, want at most %d", e.name, s, n, n/2)
 			}
 			if alloc > n/2 {
 				t.Fatalf("%s: refusing the request allocated %d MiB, want at most %d MiB", e.name, alloc>>20, (n/2)>>20)

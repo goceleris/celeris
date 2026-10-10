@@ -15,19 +15,18 @@ import (
 // next request that gets the object. unbind must wait for a cancel that has
 // started, so that none lands after it returns.
 func TestBindStreamCancelNeverReachesAReleasedStream949(t *testing.T) {
-	procs := runtime.GOMAXPROCS(0)
-	if procs < 2 {
-		t.Skip("needs more than one P to race the AfterFunc goroutine against Release")
-	}
+	// At least 4 workers, whatever GOMAXPROCS is: the AfterFunc goroutine
+	// races Release on one P too (a goroutine switch is enough).
+	procs := max(runtime.GOMAXPROCS(0), 4)
 	const perWorker = 20000
 	var wg sync.WaitGroup
 	bad := make(chan int, procs)
-	for w := 0; w < procs; w++ {
+	for range procs {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			n := 0
-			for i := 0; i < perWorker; i++ {
+			for range perWorker {
 				s := stream.NewStream(1)
 				ctx, cancel := context.WithCancel(context.Background())
 				unbind := BindStreamCancel(ctx, s)

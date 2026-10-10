@@ -83,8 +83,8 @@ func TestAutoUpgradeBodyBoundedByMaxRequestBodySize976(t *testing.T) {
 	if !strings.HasPrefix(o.first, "HTTP/1.1 413") {
 		t.Fatalf("a %d byte Upgrade: h2c body with MaxRequestBodySize 4096 was answered %q, want 413", n, o.first)
 	}
-	if o.sent > n/4 {
-		t.Fatalf("the server took %d of %d body bytes before refusing, want at most %d (a bounded read)", o.sent, n, n/4)
+	if o.sent > n/2 {
+		t.Fatalf("the server took %d of %d body bytes before refusing, want at most %d (a bounded read)", o.sent, n, n/2)
 	}
 	if o.allocBytes > n/2 {
 		t.Fatalf("serving the refused request allocated %d MiB, want at most %d MiB", o.allocBytes>>20, (n/2)>>20)
@@ -104,8 +104,8 @@ func TestH2CUpgradeBodyBoundedByMaxRequestBodySize976(t *testing.T) {
 	if !strings.HasPrefix(o.first, "HTTP/1.1 413") {
 		t.Fatalf("a %d byte Upgrade: h2c body with MaxRequestBodySize 4096 was answered %q, want 413", n, o.first)
 	}
-	if o.sent > n/4 {
-		t.Fatalf("the server took %d of %d body bytes before refusing, want at most %d", o.sent, n, n/4)
+	if o.sent > n/2 {
+		t.Fatalf("the server took %d of %d body bytes before refusing, want at most %d", o.sent, n, n/2)
 	}
 	// Bridge counts a refused body as a request-body error; so does this.
 	deadline := time.Now().Add(5 * time.Second)

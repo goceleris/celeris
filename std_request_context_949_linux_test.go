@@ -55,7 +55,10 @@ type ctxOutcome949 struct {
 // saw. async routes it with .Async(): on the native engines a sync handler
 // runs on the event loop, which cannot then see its client leave, so the
 // departure arms use async routes there (and both on std, where the two
-// are the same goroutine-per-request path).
+// are the same goroutine-per-request path). Measured (probes/
+// zz_probe_native_sync_949_linux_test.go in the lane's evidence): a sync
+// handler on epoll, io_uring or adaptive does not see its h2c client leave
+// before it returns; std, with a goroutine per request, does.
 func startWaitServer949(t *testing.T, e celeris.EngineType, hold time.Duration, async bool) (addr string, started chan struct{}, outcome chan ctxOutcome949) {
 	t.Helper()
 	started = make(chan struct{}, 16)
