@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -92,7 +93,10 @@ func Format(fd int, sa unix.Sockaddr) string {
 	var b strings.Builder
 
 	port := sockaddrPort(sa)
-	addr := sockaddrString(sa)
+	addr := SockaddrString(sa)
+	if addr == "" {
+		addr = "?"
+	}
 	fmt.Fprintf(&b, "addr=%s", addr)
 
 	if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR); err == nil {
@@ -131,24 +135,86 @@ func sockaddrPort(sa unix.Sockaddr) int {
 	return 0
 }
 
-func sockaddrString(sa unix.Sockaddr) string {
+// SockaddrString formats a socket address exactly as net.TCPAddr.String
+// prints the same peer (celeris#925, std's RemoteAddr): "a.b.c.d:port" for
+// IPv4, and for an IPv4-mapped IPv6 address, which is an IPv4 client of a
+// dual-stack "[::]:port" listener; "[ip]:port" for IPv6; "[ip%zone]:port" when
+// the scope id is nonzero, with the zone named by zoneName. An unknown address
+// type gives "".
+//
+// It runs once per accepted connection, so the IPv4 form is built by hand into
+// a stack buffer. net.InterfaceByIndex is called only for a nonzero scope id.
+func SockaddrString(sa unix.Sockaddr) string {
 	switch v := sa.(type) {
 	case *unix.SockaddrInet4:
-		var buf [21]byte
-		b := strconv.AppendUint(buf[:0], uint64(v.Addr[0]), 10)
-		b = append(b, '.')
-		b = strconv.AppendUint(b, uint64(v.Addr[1]), 10)
-		b = append(b, '.')
-		b = strconv.AppendUint(b, uint64(v.Addr[2]), 10)
-		b = append(b, '.')
-		b = strconv.AppendUint(b, uint64(v.Addr[3]), 10)
-		b = append(b, ':')
-		b = strconv.AppendInt(b, int64(v.Port), 10)
-		return string(b)
+		return ipv4Port(v.Addr, v.Port)
 	case *unix.SockaddrInet6:
-		return fmt.Sprintf("[%v]:%d", v.Addr, v.Port)
+		if v.ZoneId == 0 && isV4Mapped(v.Addr) {
+			return ipv4Port([4]byte{v.Addr[12], v.Addr[13], v.Addr[14], v.Addr[15]}, v.Port)
+		}
+		host := net.IP(v.Addr[:]).String()
+		if zone := zoneName(v.ZoneId); zone != "" {
+			host += "%" + zone
+		}
+		return net.JoinHostPort(host, strconv.Itoa(v.Port))
 	}
-	return "?"
+	return ""
+}
+
+// BoundAddr is the bound address of the socket fd as a *net.TCPAddr, or nil
+// when Getsockname fails. The zone is set only for a nonzero scope id: an
+// unscoped "[::]:port" listener printed as "[::%0]:port" before celeris#925.
+func BoundAddr(fd int) net.Addr {
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		return nil
+	}
+	switch v := sa.(type) {
+	case *unix.SockaddrInet4:
+		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port}
+	case *unix.SockaddrInet6:
+		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: zoneName(v.ZoneId)}
+	}
+	return nil
+}
+
+// zoneName is a scope id as net.Conn names it: the interface name, or the
+// number when no interface has that index, and "" for 0.
+func zoneName(id uint32) string {
+	if id == 0 {
+		return ""
+	}
+	if ifi, err := net.InterfaceByIndex(int(id)); err == nil {
+		return ifi.Name
+	}
+	return strconv.FormatUint(uint64(id), 10)
+}
+
+// isV4Mapped reports whether a is an IPv4-mapped IPv6 address, ::ffff:a.b.c.d.
+func isV4Mapped(a [16]byte) bool {
+	for _, b := range a[:10] {
+		if b != 0 {
+			return false
+		}
+	}
+	return a[10] == 0xff && a[11] == 0xff
+}
+
+// ipv4Port formats "a.b.c.d:port" into a stack buffer.
+func ipv4Port(a [4]byte, port int) string {
+	// Max "255.255.255.255:65535" = 21 bytes.
+	var b [21]byte
+	buf := b[:0]
+	buf = strconv.AppendInt(buf, int64(a[0]), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(a[1]), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(a[2]), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(a[3]), 10)
+	buf = append(buf, ':')
+	buf = strconv.AppendInt(buf, int64(port), 10)
+	return string(buf)
 }
 
 func procListenersOnPort(port int) []string {
