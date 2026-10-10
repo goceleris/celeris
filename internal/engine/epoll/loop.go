@@ -410,11 +410,15 @@ func (l *Loop) run(ctx context.Context) {
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}
-	_ = platform.PinToCPU(l.cpuID)
+	// celeris#909: a loop planned unpinned, or whose pin failed, has cpuID -1
+	// and no NUMA node to bind to.
+	l.pinOwnThread()
 
-	numaNode := platform.CPUForNode(l.cpuID)
-	if err := platform.BindNumaNode(numaNode); err == nil {
-		defer func() { _ = platform.ResetNumaPolicy() }()
+	if l.cpuID >= 0 {
+		numaNode := platform.CPUForNode(l.cpuID)
+		if err := platform.BindNumaNode(numaNode); err == nil {
+			defer func() { _ = platform.ResetNumaPolicy() }()
+		}
 	}
 
 	epollFD, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)

@@ -915,7 +915,8 @@ func (c *Context) SetCookie(cookie *Cookie) {
 // otherwise the whole file is sent as a 200. HEAD and other methods ignore
 // Range, as do an unknown range unit, an invalid range set, and a set with
 // more than one satisfiable range (multipart/byteranges is not supported).
-// See RFC 9110 §14 and §13.1.5.
+// A 416 carries no Content-Encoding even if the handler set one: its body is
+// empty, not an encoded stream. See RFC 9110 §14 and §13.1.5.
 //
 // The entire file is loaded into memory (capped at 100 MB). Returns
 // [HTTPError] with status 413 if the file exceeds this limit. For large
@@ -924,6 +925,16 @@ func (c *Context) SetCookie(cookie *Cookie) {
 // Security: filePath is opened directly — callers MUST sanitize user-supplied
 // paths (e.g. filepath.Clean + prefix check) to prevent directory traversal.
 func (c *Context) File(filePath string) error {
+	return c.serveFile(filePath, "", nil)
+}
+
+// serveFile is File. contentType, when not empty, replaces the type taken from
+// filePath's extension. onOpen, when not nil, runs once the file is open and
+// its size and mtime are read from the open descriptor, before the response is
+// decided and only for a file that is going to be sent (not for a 413):
+// middleware/static sets its validators from them there, so they describe the
+// bytes that are sent even when the path is replaced meanwhile (celeris#846).
+func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -940,10 +951,15 @@ func (c *Context) File(filePath string) error {
 		return NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
-	ext := filepath.Ext(filePath)
-	contentType := mime.TypeByExtension(ext)
+	if onOpen != nil {
+		onOpen(stat.ModTime(), size)
+	}
+
 	if contentType == "" {
-		contentType = "application/octet-stream"
+		contentType = mime.TypeByExtension(filepath.Ext(filePath))
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
 	}
 
 	c.SetHeader("accept-ranges", "bytes")
@@ -958,6 +974,8 @@ func (c *Context) File(filePath string) error {
 		case httprange.Unsatisfiable:
 			var crBuf [32]byte
 			c.SetHeader("content-range", string(httprange.AppendUnsatisfied(crBuf[:0], size)))
+			// The empty body of a 416 is not an encoded stream.
+			c.delRespHeader("content-encoding")
 			return c.NoContent(http.StatusRequestedRangeNotSatisfiable)
 		case httprange.Partial:
 			length := end - start + 1
@@ -1047,6 +1065,11 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // error is returned. Symlinks are resolved and rechecked to prevent a
 // symlink under baseDir from escaping the directory boundary.
 func (c *Context) FileFromDir(baseDir, userPath string) error {
+	return c.fileFromDir(baseDir, userPath, "", nil)
+}
+
+// fileFromDir is FileFromDir with serveFile's contentType and onOpen.
+func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
 	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {
@@ -1071,7 +1094,7 @@ func (c *Context) FileFromDir(baseDir, userPath string) error {
 	if info.IsDir() {
 		return NewHTTPError(400, "invalid file path")
 	}
-	return c.File(resolved)
+	return c.serveFile(resolved, contentType, onOpen)
 }
 
 // FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
@@ -1120,6 +1143,22 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		return err
 	}
 	return c.Blob(200, contentType, data)
+}
+
+// delRespHeader removes the response header key (lowercase, as SetHeader
+// stores it) if it is set.
+func (c *Context) delRespHeader(key string) {
+	for i, h := range c.respHeaders {
+		if h[0] == key {
+			last := len(c.respHeaders) - 1
+			copy(c.respHeaders[i:], c.respHeaders[i+1:])
+			// The slot past the new end is cleared, so reset (which clears up to
+			// len) leaves no stale header pointing into a request buffer.
+			c.respHeaders[last] = [2]string{}
+			c.respHeaders = c.respHeaders[:last]
+			return
+		}
+	}
 }
 
 // respHeader returns the value of the response header key (lowercase, as
@@ -1752,7 +1791,19 @@ func (sw *StreamWriter) BytesWritten() int64 {
 	return sw.bytesWritten.Load()
 }
 
-// Flush ensures buffered data is sent to the network.
+// Flush asks the engine to send buffered data to the network. It is a request,
+// not a guarantee, and on HTTP/1.1 on epoll, io_uring and Adaptive (the Linux
+// default, which runs on the first two) it does nothing: what reaches the
+// peer, and when, is decided by [StreamWriter.Write]. Until
+// [Context.Detach] those engines only append each Write to the connection's
+// send buffer, which goes out when the handler returns, so every byte
+// written so far stays in memory until then, however often Flush is called.
+// After Detach each Write is handed to the connection at once (the calling
+// goroutine usually tries the send, and the engine finishes what the socket
+// does not take). The std engine flushes through [net/http.Flusher]. To
+// deliver bytes while the handler is still running, Detach it (see
+// [Context.EngineSupportsAsyncDetach]). The behavior above is HTTP/1.1's;
+// Flush is not a delivery guarantee on HTTP/2 either.
 func (sw *StreamWriter) Flush() error {
 	if sw.refused != nil {
 		return sw.refused
