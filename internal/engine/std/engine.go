@@ -136,10 +136,14 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		// covers it.
 		h2s = &http2.Server{MaxConcurrentStreams: cfg.MaxConcurrentStreams, MaxReadFrameSize: cfg.MaxFrameSize} //nolint:staticcheck // SA1019: the type h2cHandler serves with; see the import comment.
 		httpHandler = &h2cHandler{
-			next:        bridge,
-			h2s:         h2s,
-			maxBody:     cfg.MaxRequestBodySize,
-			bodyRefused: func() { e.metrics.errs.RequestBody.Add(1) },
+			next:    bridge,
+			h2s:     h2s,
+			maxBody: cfg.MaxRequestBodySize,
+			bodyRefused: func() {
+				// What Bridge counts for a request whose body it refuses.
+				e.metrics.reqCount.Add(1)
+				e.metrics.errs.RequestBody.Add(1)
+			},
 		}
 		// Auto with the upgrade disabled (Config.EnableH2Upgrade = &false,
 		// celeris#964): keep prior-knowledge h2c, which is not the

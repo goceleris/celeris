@@ -5,10 +5,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // celeris#949: ToHandler gave the celeris handler a stream context of its
@@ -159,5 +162,61 @@ func TestToHandlerStayingClientKeepsContext949(t *testing.T) {
 				t.Fatalf("%s: the handler waited %s of 250ms: the test did not hold the context open", proto, d)
 			}
 		})
+	}
+}
+
+type toHandlerNopRW949 struct{ h http.Header }
+
+func (w *toHandlerNopRW949) Header() http.Header         { return w.h }
+func (w *toHandlerNopRW949) Write(p []byte) (int, error) { return len(p), nil }
+func (w *toHandlerNopRW949) WriteHeader(int)             {}
+
+// TestToHandlerUnbindsBeforeItReleasesTheStream949 pins the order of the two
+// defers in ToHandler: the cancel is unbound (and one that has started
+// awaited) before the stream goes back to the pool shared with the engines.
+// The handler cancels the request's context as it returns, as net/http does
+// around the end of ServeHTTP; with the order swapped the late cancel lands
+// on a pooled stream and the next request's stream is born cancelled.
+func TestToHandlerUnbindsBeforeItReleasesTheStream949(t *testing.T) {
+	procs := max(runtime.GOMAXPROCS(0), 4)
+	const perWorker = 20000
+	var wg sync.WaitGroup
+	bad := make(chan int, procs)
+	for range procs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var cancel context.CancelFunc // this worker's, set per request
+			h := celeris.ToHandler(func(c *celeris.Context) error {
+				err := c.NoContent(200)
+				cancel()
+				return err
+			})
+			w := &toHandlerNopRW949{h: http.Header{}}
+			base := httptest.NewRequest(http.MethodGet, "/", nil)
+			n := 0
+			for range perWorker {
+				var ctx context.Context
+				ctx, cancel = context.WithCancel(context.Background())
+				clear(w.h)
+				h.ServeHTTP(w, base.WithContext(ctx))
+				cancel() // already called by the handler; for vet
+				next := stream.NewStream(1)
+				if next.IsCancelled() {
+					n++
+				}
+				next.Release()
+			}
+			bad <- n
+		}()
+	}
+	wg.Wait()
+	close(bad)
+	total := 0
+	for n := range bad {
+		total += n
+	}
+	if total != 0 {
+		t.Fatalf("%d of %d fresh streams were already cancelled: ToHandler released its stream before it unbound the cancel", total, procs*perWorker)
 	}
 }

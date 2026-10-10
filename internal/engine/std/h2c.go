@@ -77,8 +77,9 @@ type h2cHandler struct {
 	// maxBody is Config.MaxRequestBodySize, which bounds the body of an
 	// upgrade request as it bounds every other (celeris#976); 0 = unlimited.
 	maxBody int64
-	// bodyRefused counts an upgrade request refused for its body, as
-	// Bridge counts a body it refuses (may be nil).
+	// bodyRefused counts an upgrade request refused for its body as Bridge
+	// counts a body it refuses: a request and a request-body error (may be
+	// nil).
 	bodyRefused func()
 }
 
