@@ -179,7 +179,10 @@ func (w *toHandlerNopRW949) WriteHeader(int)             {}
 // on a pooled stream and the next request's stream is born cancelled.
 func TestToHandlerUnbindsBeforeItReleasesTheStream949(t *testing.T) {
 	procs := max(runtime.GOMAXPROCS(0), 4)
-	const perWorker = 20000
+	// With the order swapped nearly every iteration lands the cancel on the
+	// pooled stream (159751 of 160000 at 20000 per worker), so a few hundred
+	// are plenty; this package under -race and -cover is near its time budget.
+	const perWorker = 1000
 	var wg sync.WaitGroup
 	bad := make(chan int, procs)
 	for range procs {

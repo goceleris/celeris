@@ -142,6 +142,16 @@ func TestBindStreamCancelAlreadyEndedIsSynchronous949(t *testing.T) {
 		if !s.IsCancelled() {
 			t.Fatalf("iteration %d: the stream is not cancelled when BindStreamCancel returns for a context that has ended", i)
 		}
+		// What a handler sees: its context ended (the context is made on
+		// the first look, after the cancel).
+		select {
+		case <-s.Context().Done():
+		default:
+			t.Fatalf("iteration %d: the stream's context has not ended when BindStreamCancel returns for a context that has ended", i)
+		}
+		if err := s.Context().Err(); err != context.Canceled {
+			t.Fatalf("iteration %d: stream context Err = %v, want context.Canceled", i, err)
+		}
 		unbind()
 		s.Release()
 	}
@@ -185,7 +195,10 @@ func TestBridgeUnbindsBeforeItReleasesTheStream949(t *testing.T) {
 	}
 	br := &Bridge{engine: e, handler: cancelInHandler949{}}
 	procs := max(runtime.GOMAXPROCS(0), 4)
-	const perWorker = 20000
+	// With the order swapped nearly every iteration lands the cancel on the
+	// pooled stream (159773 of 160000 at 20000 per worker), so a few hundred
+	// are plenty; the root package under -race and -cover is near its budget.
+	const perWorker = 1000
 	var wg sync.WaitGroup
 	bad := make(chan int, procs)
 	for range procs {

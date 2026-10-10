@@ -60,6 +60,41 @@ func BenchmarkBridgeServeHTTP(b *testing.B) {
 	}
 }
 
+// BenchmarkBridgeServeHTTPContexts: the bridge with the request contexts
+// net/http gives it. Fresh: a new cancelable context per request, which is
+// what the HTTP/2 binding of the stream's context (celeris#949) registers
+// with for the first time (the parent's children map is allocated then).
+// PreCancelled: the context is over before the handler starts (the
+// rapid-reset shape). The WithCancel itself is in every variant alike.
+func BenchmarkBridgeServeHTTPContexts(b *testing.B) {
+	for _, tc := range []struct {
+		name         string
+		major        int
+		preCancelled bool
+	}{{"HTTP1Fresh", 1, false}, {"HTTP2Fresh", 2, false}, {"HTTP1PreCancelled", 1, true}, {"HTTP2PreCancelled", 2, true}} {
+		b.Run(tc.name, func(b *testing.B) {
+			e, err := New(resource.Config{Addr: "127.0.0.1:0", Engine: engine.Std, Protocol: engine.HTTP1}, okStreamHandler{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			br := &Bridge{engine: e, handler: okStreamHandler{}}
+			base := httptest.NewRequest(http.MethodGet, "/", nil)
+			base.ProtoMajor = tc.major
+			w := &discardResponseWriter{h: http.Header{}}
+			b.ReportAllocs()
+			for b.Loop() {
+				ctx, cancel := context.WithCancel(context.Background())
+				if tc.preCancelled {
+					cancel()
+				}
+				clear(w.h)
+				br.ServeHTTP(w, base.WithContext(ctx))
+				cancel()
+			}
+		})
+	}
+}
+
 // BenchmarkH2CFrontServeHTTP measures one HTTP/1.1 request through the whole
 // handler chain of an H2C engine: the h2c front end's checks (is this the
 // preface? an upgrade?) and then the bridge. Every request on an H2C listener
