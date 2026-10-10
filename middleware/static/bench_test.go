@@ -185,3 +185,73 @@ func BenchmarkStaticFSColdFill(b *testing.B) {
 		})
 	}
 }
+
+// Benchmarks for the paths with Compress and a conditional request (celeris#846
+// review): with Compress a request that accepts an encoding tries the .br/.gz
+// variants before the 304, because the 304 is about the representation that
+// would be sent. These time that cost where no variant exists.
+
+func benchFSConditional846(b *testing.B, mw celeris.HandlerFunc, path string, hdr ...string) {
+	b.Helper()
+	noop := func(_ *celeris.Context) error { return nil }
+	opts := []celeristest.Option{celeristest.WithHandlers(mw, noop)}
+	for i := 0; i+1 < len(hdr); i += 2 {
+		opts = append(opts, celeristest.WithHeader(hdr[i], hdr[i+1]))
+	}
+	ctx, _ := celeristest.NewContext("GET", path, opts...) // fills the cache
+	_ = ctx.Next()
+	celeristest.ReleaseContext(ctx)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", path, opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+func fsBench846() fstest.MapFS {
+	mt := time.Unix(1_700_000_000, 0)
+	return fstest.MapFS{
+		"a.css":    {Data: []byte("body{margin:0}"), ModTime: mt},
+		"b.css":    {Data: make([]byte, 4096), ModTime: mt},
+		"b.css.gz": {Data: make([]byte, 1024), ModTime: mt},
+	}
+}
+
+// BenchmarkStaticFSCompressNotModifiedNoVariant is a cache-hit 304 of an fs.FS
+// file, Compress on, no variant on disk.
+func BenchmarkStaticFSCompressNotModifiedNoVariant(b *testing.B) {
+	benchFSConditional846(b, New(Config{FS: fsBench846(), Compress: true}), "/a.css", "accept-encoding", "gzip", "if-none-match", "*")
+}
+
+// BenchmarkStaticFSCompressNoVariant is a cache-hit 200, Compress on, no variant.
+func BenchmarkStaticFSCompressNoVariant(b *testing.B) {
+	benchFSConditional846(b, New(Config{FS: fsBench846(), Compress: true}), "/a.css", "accept-encoding", "gzip")
+}
+
+// BenchmarkStaticFSCompressVariant serves an fs.FS variant (read per request).
+func BenchmarkStaticFSCompressVariant(b *testing.B) {
+	benchFSConditional846(b, New(Config{FS: fsBench846(), Compress: true}), "/b.css", "accept-encoding", "gzip")
+}
+
+// BenchmarkStaticDirFSCompressNotModifiedNoVariant is the same 304 over
+// os.DirFS, where the two failed variant opens are real system calls.
+func BenchmarkStaticDirFSCompressNotModifiedNoVariant(b *testing.B) {
+	dir := b.TempDir()
+	mt := time.Unix(1_700_000_000, 0)
+	p := filepath.Join(dir, "a.css")
+	if err := os.WriteFile(p, []byte("body{margin:0}"), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.Chtimes(p, mt, mt); err != nil {
+		b.Fatal(err)
+	}
+	benchFSConditional846(b, New(Config{FS: os.DirFS(dir), Compress: true}), "/a.css", "accept-encoding", "gzip", "if-none-match", "*")
+}
+
+// BenchmarkStaticRootConditionalMiss is a Root request whose If-None-Match
+// does not hold: it is answered with the file, the validators set once.
+func BenchmarkStaticRootConditionalMiss(b *testing.B) {
+	benchRoot846(b, rootBench846(b, false), "if-none-match", `"nomatch"`)
+}
