@@ -187,8 +187,14 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 					// the client, which has read nothing so far, reads what the
 					// kernel took and then EOF (or, where the kernel took it
 					// all, the whole body), never an open connection.
-					got, n, end := readResponse760(c)
-					if end != "EOF" && end != "the end of the body" {
+					if reader == "/trickle" {
+						// Part of the stream was read above, so it no longer
+						// parses as a response: read what is left to the end.
+						_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+						if _, err := io.Copy(io.Discard, c); err != nil {
+							t.Errorf("%s: after the shutdown the rest of the stream ended with %v, want EOF", desc, err)
+						}
+					} else if got, n, end := readResponse760(c); end != "EOF" && end != "the end of the body" {
 						t.Errorf("%s: after the shutdown the client got %d of %d body bytes (%d in all), then %s", desc, len(got), size, n, end)
 					}
 					// The io_uring engine states the data loss the bound is: a
