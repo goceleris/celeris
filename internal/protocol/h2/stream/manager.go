@@ -39,6 +39,20 @@ type Manager struct {
 	sendWindowWaiters atomic.Int32
 	sendWindowMu      sync.Mutex
 	sendWindowCh      chan struct{}
+
+	// retired holds the pool-handler streams whose handler has returned and
+	// which are out of the map, waiting for the event loop to return them to
+	// the stream pool (retire, drainRetired; celeris#951). hasRetired is
+	// retired's non-emptiness, so a frame batch with nothing retired pays one
+	// atomic load. closed (Close) says there is no event loop any more.
+	// retired and closed are guarded by mu.
+	retired    []*Stream
+	hasRetired atomic.Bool
+	closed     bool
+	// drainBuf is drainRetired's own copy of the batch it releases outside
+	// the lock. Only the event loop's drainRetired uses it, one call at a
+	// time (a frame batch ends, then the next one does), so it needs no lock.
+	drainBuf []*Stream
 }
 
 // NewManager creates a new stream manager. Auxiliary maps
@@ -144,7 +158,8 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 // DeleteStream removes a stream and releases its pooled buffers.
 // If the stream has an async handler goroutine running (asyncRunning=true),
 // the stream is removed from the map but NOT released — the goroutine
-// will release it when its handler returns (executeHandler).
+// retires it when its handler returns (executeHandler, Manager.retire), and
+// the event loop releases it at the end of its frame batch.
 //
 // A stream that is still in an active state when it is deleted (e.g. a
 // server-initiated RST_STREAM on a stalled stream, or a half-closed-local
@@ -197,18 +212,21 @@ func (m *Manager) resetStream(id uint32) bool {
 // takeLocked takes s, the stream m.streams[id], out of the map and closes
 // it. m.mu must be held. It reports whether the caller is to release s
 // (afterTake): yes unless a pool handler's goroutine still runs on it
-// (flagAsyncRunning), which then releases it itself.
+// (flagAsyncRunning), which then retires it (retire) for the event loop to
+// release.
 //
 // That is decided here, under m.mu, because that is where the goroutine
 // hands the stream over: it takes its stream out of the map under m.mu
-// before it releases it (executeHandler), and it gives a stream whose
+// before it retires it (executeHandler), and it gives a stream whose
 // response is still buffered to the event loop under m.mu too
 // (handOffBuffered). So while s is in the map, the flag says who owns it.
 // Read after the unlock, the flag could already have been cleared by the
-// goroutine's own release (resetAndPool stores 0): the stream was then
-// released a second time and put in the stream pool twice, so two later
-// streams, on any connections, shared one object (celeris#950). Nothing
-// touches s after the unlock unless it is the caller's to release.
+// goroutine's own release (resetAndPool stores 0; the goroutine no longer
+// releases, retire leaves that to the loop, but the flag is still read
+// under the lock): the stream was then released a second time and put in
+// the stream pool twice, so two later streams, on any connections, shared
+// one object (celeris#950). Nothing touches s after the unlock unless it
+// is the caller's to release.
 func (m *Manager) takeLocked(id uint32, s *Stream) (release bool) {
 	delete(m.streams, id)
 	m.priorityTree.RemoveStream(id)
@@ -240,7 +258,7 @@ func (m *Manager) afterTake(id uint32, s *Stream, release bool) {
 // It reports false, and hands nothing over, when the stream is no longer in
 // the map: a RST_STREAM, a GOAWAY, Close or the WINDOW_UPDATE flush took it
 // out while its handler ran, and left its release to the handler's
-// goroutine, which must then release it. Handed over anyway, as it was, no
+// goroutine, which must then retire it. Handed over anyway, as it was, no
 // flush could find it again and nothing released it: its buffered bytes
 // stayed charged to the connection's outbound budget for good (celeris#948).
 func (m *Manager) handOffBuffered(s *Stream) bool {
@@ -254,7 +272,8 @@ func (m *Manager) handOffBuffered(s *Stream) bool {
 }
 
 // RemoveStreamFromMap removes a stream from the manager's map without releasing it.
-// Used by async handler goroutines that manage their own stream lifecycle.
+// Used by the inline paths, which release the stream themselves after the
+// frame batch (FlushInlineCleanup, executeHandlerInline).
 func (m *Manager) RemoveStreamFromMap(id uint32) {
 	m.mu.Lock()
 	delete(m.streams, id)
@@ -264,6 +283,111 @@ func (m *Manager) RemoveStreamFromMap(id uint32) {
 	m.windowUpdateMu.Lock()
 	delete(m.pendingStreamUpdates, id)
 	m.windowUpdateMu.Unlock()
+}
+
+// retire is a pool handler's goroutine giving up its stream when the handler
+// has returned and the response is out of the stream's hands: it ends the
+// stream's use, takes the stream out of the map and queues it for the event
+// loop, which returns it to the stream pool (drainRetired). The goroutine
+// must not touch s after the call.
+//
+// The goroutine does not release the stream itself because the event loop
+// may still hold it. The loop looks a stream up in the map and then keeps
+// using the *Stream (a WINDOW_UPDATE, a SETTINGS flush, a RST_STREAM it
+// sends), and the stream's handler can return at any moment of that. Released
+// then, the object was back in the stream pool, and often another stream's on
+// another connection, while the loop set its state, cancelled its context and
+// credited its window (celeris#951). The rule now: a stream a pool handler
+// runs on is returned to the pool by the event loop, at the end of a frame
+// batch (FlushInlineCleanup), when it holds no stream; by Close; or, when the
+// connection has closed already, here. So every *Stream the loop holds stays
+// the same stream until the loop lets go of it.
+//
+// What must not wait for the loop is done here: the stream's context ends
+// (a derived context, and a handler waiting on Done, wake), the bytes it
+// still buffers go back to the connection's outbound budget (celeris#893),
+// so the next stream's budget check does not count them, and the request it
+// held is dropped.
+//
+// Lock order: s.mu alone (the budget), then m.mu alone, then windowUpdateMu
+// alone. Nothing here nests one in another, so it cannot deadlock with
+// OutboundPending (m.mu, then s.mu) or with Close.
+func (m *Manager) retire(s *Stream) {
+	s.Cancel()
+	s.endCtx()
+	s.mu.Lock()
+	if buf := s.OutboundBuffer; buf != nil {
+		// What the stream still buffered goes back to the budget and its
+		// buffer to the pool now, not when the loop gets to the stream: a
+		// stream reset while it held response bytes does not keep their
+		// capacity until the connection's next frame batch or close. A late
+		// writer is refused by the use token (EndUse above), and
+		// flushStreamOutbound takes a nil buffer.
+		m.refundOutbound(buf.Len())
+		buf.Reset()
+		bufferPool.Put(buf)
+		s.OutboundBuffer = nil
+	}
+	id := s.ID
+	// The request is dropped now, not at the loop's next batch: a detached
+	// Context that reads the stream meanwhile sees nothing, as it did when
+	// this goroutine reset the stream (celeris#904), and a connection that
+	// goes quiet does not hold its finished requests' headers until it
+	// closes. The loop reads a stream's headers only before its handler is
+	// dispatched (validateContentLength, canRunInline), never after, as it
+	// never reads Data after: the handler's goroutine drops that too
+	// (executeHandler).
+	s.resetRequestLocked()
+	s.mu.Unlock()
+
+	m.mu.Lock()
+	if m.streams[id] == s {
+		delete(m.streams, id)
+		m.priorityTree.RemoveStream(id)
+	}
+	closed := m.closed
+	if !closed {
+		m.retired = append(m.retired, s)
+		m.hasRetired.Store(true)
+	}
+	m.mu.Unlock()
+
+	m.windowUpdateMu.Lock()
+	delete(m.pendingStreamUpdates, id)
+	m.windowUpdateMu.Unlock()
+
+	if closed {
+		s.Release() // no event loop is left to hold it
+	}
+}
+
+// drainRetired returns the retired streams to the stream pool. Only the
+// event loop calls it, where it holds no stream: at the end of a frame batch
+// (FlushInlineCleanup). It costs one atomic load when nothing is retired.
+func (m *Manager) drainRetired() {
+	if !m.hasRetired.Load() {
+		return
+	}
+	// One lock for the whole batch, however many handlers returned (a burst
+	// of async completions costs the loop one lock/unlock, not one each, and
+	// retire's goroutines contend with it once). The streams are released
+	// outside the lock, from the loop's own copy.
+	m.mu.Lock()
+	m.drainBuf = append(m.drainBuf[:0], m.retired...)
+	clear(m.retired)
+	m.retired = m.retired[:0]
+	if cap(m.retired) > 1024 {
+		m.retired = nil // a burst does not pin its slice for the connection's life
+	}
+	m.hasRetired.Store(false)
+	m.mu.Unlock()
+	for i, s := range m.drainBuf {
+		m.drainBuf[i] = nil
+		s.Release()
+	}
+	if cap(m.drainBuf) > 1024 {
+		m.drainBuf = nil
+	}
 }
 
 // StreamCount returns the number of streams in the manager.
@@ -464,7 +588,17 @@ func (m *Manager) Close() {
 			s.Release()
 		}
 	}
+	// The event loop is done with the connection: the streams pool handlers
+	// retired since its last frame batch go to the pool now, and a handler
+	// that returns from here on releases its stream itself (retire).
+	m.closed = true
+	retired := m.retired
+	m.retired = nil
+	m.hasRetired.Store(false)
 	m.mu.Unlock()
+	for _, s := range retired {
+		s.Release()
+	}
 
 	m.windowUpdateMu.Lock()
 	if m.pendingStreamUpdates != nil {
