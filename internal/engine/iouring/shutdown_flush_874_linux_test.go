@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // celeris#874, io_uring half: the counters the loop batches per iteration
@@ -15,6 +16,12 @@ import (
 // several places before that: a close queued late in the last iteration was
 // never counted in Metrics().CloseFDDeferred, the number celeris#793 quotes as
 // exact, and the bytes and requests of that iteration went the same way.
+
+// field874 is w's unexported field name, settable.
+func field874(w *Worker, name string) reflect.Value {
+	f := reflect.ValueOf(w).Elem().FieldByName(name)
+	return reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
+}
 
 // batchFields874 are the Worker's uint64 fields named *Batch: the batches.
 func batchFields874(t *testing.T) []string {
@@ -51,15 +58,14 @@ func TestShutdownFlushesEveryBatch874(t *testing.T) {
 		handoffLoss:  &e.metrics.handoffLoss,
 	}
 	fields := batchFields874(t)
-	rv := reflect.ValueOf(w).Elem()
 	for i, name := range fields {
-		rv.FieldByName(name).SetUint(uint64(1) << (i + 1))
+		field874(w, name).SetUint(uint64(1) << (i + 1))
 	}
 	// Distinct values, so a counter fed from the wrong batch is not a pass.
 	w.reqBatch, w.bytesReadBatch, w.bytesWrittenBatch = 3, 5, 7
 	w.ringBytesBatch, w.closeFDDeferredBatch, w.linkArmBatch = 11, 13, 17
 	for _, name := range fields {
-		if rv.FieldByName(name).Uint() == 0 {
+		if field874(w, name).Uint() == 0 {
 			t.Fatalf("setup: %s is zero", name)
 		}
 	}
@@ -88,7 +94,7 @@ func TestShutdownFlushesEveryBatch874(t *testing.T) {
 		}
 	}
 	for _, name := range fields {
-		if left := rv.FieldByName(name).Uint(); left != 0 {
+		if left := field874(w, name).Uint(); left != 0 {
 			t.Errorf("Worker.%s = %d after shutdown: a batch shutdown does not flush (celeris#874)", name, left)
 		}
 	}

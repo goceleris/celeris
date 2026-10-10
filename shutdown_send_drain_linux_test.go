@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,7 +52,13 @@ func TestShutdownSendsTheWholeResponse(t *testing.T) {
 	for _, e := range drainEngines806 {
 		for _, route := range []string{"sync", "async-route"} {
 			for _, mode := range []string{"Shutdown", "Shutdown-background", "cancel"} {
+				if e.slim && mode == "Shutdown-background" {
+					continue
+				}
 				for _, sb := range sndBufs806 {
+					if e.slim != (sb.apply != nil) {
+						continue // slim engines: only the small send buffer; the others only the default
+					}
 					t.Run(e.name+"/"+route+"/"+mode+sb.suffix, func(t *testing.T) {
 						desc := e.name + "/" + route + "/" + mode + sb.suffix
 						entered := make(chan struct{})
@@ -118,6 +126,9 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 			continue
 		}
 		for _, mode := range []string{"Shutdown", "Shutdown-withcancel", "Shutdown-background", "cancel"} {
+			if e.slim && (mode == "Shutdown" || mode == "Shutdown-withcancel") {
+				continue // slim engines: the WriteTimeout bound and the cancel
+			}
 			t.Run(e.name+"/"+mode, func(t *testing.T) {
 				desc := e.name + "/" + mode
 				served := make(chan struct{})
@@ -125,7 +136,15 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 				if mode == "Shutdown-background" {
 					writeTimeout = budget
 				}
-				srv := startDrainServer806(t, e, budget, writeTimeout, nil, func(s *celeris.Server) {
+				logs := &syncBuf806{}
+				srv := startDrainServer806(t, e, budget, writeTimeout, func(c *celeris.Config) {
+					c.Logger = slog.New(slog.NewTextHandler(logs, nil))
+					if e.slim {
+						// The kernel cannot hold the response, so the cut the
+						// WARN below reports is certain, not host luck.
+						sndBufs806[1].apply(c)
+					}
+				}, func(s *celeris.Server) {
 					s.GET("/big", func(c *celeris.Context) error {
 						defer close(served) // native engines: the body is queued, not written, here
 						return c.Blob(http.StatusOK, "application/octet-stream", body)
@@ -155,6 +174,11 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 				if end != "EOF" && end != "the end of the body" {
 					t.Errorf("%s: after the shutdown the client got %d of %d body bytes (%d in all), then %s", desc, len(got), size, n, end)
 				}
+				// The io_uring engine states the data loss the bound is: a
+				// WARN naming the connections and the queued bytes cut.
+				if e.slim && !strings.Contains(logs.String(), "the send drain ran out of time") {
+					t.Errorf("%s: the engine cut a response the client had not taken and logged nothing about it:\n%s", desc, logs.String())
+				}
 			})
 		}
 	}
@@ -165,12 +189,14 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 // are over (a connection accepted in it would be cut at its end), as epoll's,
 // whose loops have stopped, and std's, whose listener is closed, do not.
 // Within those 250 ms io_uring still accepts (celeris#595), which this does
-// not pin. The probe is a fresh connection 600 ms into the drain.
+// not pin. The probe is a fresh connection 600 ms into the drain. io_uring
+// only: the others do not accept at all by then, and the root package's race
+// run has little time to spare.
 func TestShutdownSendDrainStopsAccepting806(t *testing.T) {
-	const budget = 3 * time.Second
+	const budget = 2 * time.Second
 	body := make([]byte, 3<<20)
 	for _, e := range drainEngines806 {
-		if e.name == "std" || e.name == "adaptive-epoll" {
+		if e.name != "io_uring" {
 			continue
 		}
 		t.Run(e.name, func(t *testing.T) {
@@ -221,14 +247,18 @@ type drainEngine806 struct {
 	eng     celeris.EngineType
 	setup   func(*testing.T)
 	premise func(*server760) error
+	// slim runs a reduced matrix (see slimModes806): the root package's race
+	// run has about 40 s of its 300 s timeout to spare, and the io_uring
+	// engines are added on top of it.
+	slim bool
 }
 
 var drainEngines806 = []drainEngine806{
-	{"std", celeris.Std, func(*testing.T) {}, func(*server760) error { return nil }},
-	{"epoll", celeris.Epoll, func(*testing.T) {}, func(*server760) error { return nil }},
-	{"io_uring", celeris.IOUring, func(*testing.T) {}, requireIOUring806},
-	{"adaptive-epoll", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "epoll") }, requireNoIOUring806},
-	{"adaptive-iouring", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "iouring") }, requireIOUring806},
+	{"std", celeris.Std, func(*testing.T) {}, func(*server760) error { return nil }, false},
+	{"epoll", celeris.Epoll, func(*testing.T) {}, func(*server760) error { return nil }, false},
+	{"io_uring", celeris.IOUring, func(*testing.T) {}, requireIOUring806, true},
+	{"adaptive-epoll", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "epoll") }, requireNoIOUring806, false},
+	{"adaptive-iouring", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "iouring") }, requireIOUring806, true},
 }
 
 // sndBufs806 are the server's send buffers the whole-response test runs with:
@@ -236,7 +266,10 @@ var drainEngines806 = []drainEngine806{
 // leaves the kernel almost none of a 3 MiB response, however much room the
 // host's autotuning would give a larger one. Without it whether a drain that
 // gave up early lost the tail depended on the host (celeris#806: the laptop's
-// kernel took the whole response, a CI runner's about 2.6 MiB of it).
+// kernel took the whole response, a CI runner's about 2.6 MiB of it). The
+// io_uring engines run the small one only (the engines that drain by the
+// budget pass either, and the matrix has to stay small, see
+// drainEngine806.slim); the others the default.
 var sndBufs806 = []struct {
 	suffix string
 	apply  func(*celeris.Config)
@@ -303,6 +336,24 @@ func startDrainServer806(t *testing.T, e drainEngine806, budget, writeTimeout ti
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// syncBuf806 is a log sink the engine's threads and the test both touch.
+type syncBuf806 struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf806) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf806) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 type server760 struct {
