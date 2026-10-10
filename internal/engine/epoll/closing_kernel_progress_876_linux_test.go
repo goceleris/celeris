@@ -149,3 +149,27 @@ func TestClosingConnWhoseClientStopsReadingIsReapedAtTheBound(t *testing.T) {
 		t.Fatalf("closeCount=%d, want 1", r.l.closeCount.Load())
 	}
 }
+
+// TestClosingConnFirstMetAfterItsBoundIsGivenOneMoreBound: a sweep that comes
+// later than the bound after the close request (a short WriteTimeout, a loop
+// that was busy) has no earlier sample of the peer's acknowledged bytes to
+// compare with, and so no evidence either way. The conn is not cut on that: it
+// is sampled, given one more bound, and reaped then if the peer takes nothing.
+func TestClosingConnFirstMetAfterItsBoundIsGivenOneMoreBound(t *testing.T) {
+	const bound = 400 * time.Millisecond
+	r := newTCPClosingRig876(t, resource.Config{ReadTimeout: time.Hour, WriteTimeout: bound}, 8<<20)
+	r.l.closeWhenFlushed(r.cs)
+	r.cs.closeSince = time.Now().Add(-10 * bound).UnixNano() // the close was asked long ago
+	r.l.checkTimeouts()
+	if !r.open() {
+		t.Fatalf("the first sweep to meet a closing conn %v past its %v bound reaped it on no evidence (celeris#876)", 10*bound, bound)
+	}
+	stalled := time.Now()
+	for r.open() && time.Since(stalled) < 10*time.Second {
+		time.Sleep(10 * time.Millisecond)
+		r.l.checkTimeouts()
+	}
+	if r.open() {
+		t.Fatalf("a closing conn whose peer reads nothing was not reaped within 10 s of a %v bound", bound)
+	}
+}
