@@ -472,13 +472,27 @@ func (s *Stream) resetAndPool() {
 	streamPool.Put(s)
 }
 
+// resetRequestLocked drops what a Context reads of the request: its headers,
+// trailers and body view. s.mu is held. A pool handler's stream gets this when
+// the handler returns (Manager.retire), though the object is reset and pooled
+// only later, by the event loop: a detached Context that reads it meanwhile
+// sees what it saw after the old immediate release, nothing (celeris#904).
+func (s *Stream) resetRequestLocked() {
+	s.rawBody = nil
+	clear(s.hdrBuf[:])
+	s.Headers = s.hdrBuf[:0]
+	s.Trailers = s.Trailers[:cap(s.Trailers)]
+	clear(s.Trailers)
+	s.Trailers = s.Trailers[:0]
+}
+
 func (s *Stream) resetLocked() {
 	if s.Data != nil {
 		s.Data.Reset()
 		bufferPool.Put(s.Data)
 		s.Data = nil
 	}
-	s.rawBody = nil
+	s.resetRequestLocked()
 	if s.OutboundBuffer != nil {
 		// What is still buffered is dropped with the stream: give it back
 		// to the connection's budget (celeris#893).
@@ -492,11 +506,6 @@ func (s *Stream) resetLocked() {
 	s.ID = 0
 	s.state.Store(0)
 	s.manager = nil
-	clear(s.hdrBuf[:])
-	s.Headers = s.hdrBuf[:0]
-	s.Trailers = s.Trailers[:cap(s.Trailers)]
-	clear(s.Trailers)
-	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.outboundAbandoned = false
 	s.headersSent.Store(false)

@@ -311,6 +311,12 @@ func (m *Manager) retire(s *Stream) {
 		buf.Reset()
 	}
 	id := s.ID
+	if s.flags.Load()&flagDetached != 0 {
+		// A detached Context may read the request after the handler returned
+		// (the stream is never pooled, so it can only be this request's):
+		// it sees nothing, as it did when this goroutine reset the stream.
+		s.resetRequestLocked()
+	}
 	s.mu.Unlock()
 
 	m.mu.Lock()
