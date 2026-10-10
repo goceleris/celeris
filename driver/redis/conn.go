@@ -133,6 +133,9 @@ type redisConn struct {
 	maxIdleTime time.Duration
 
 	closeOnce sync.Once
+	// unregOnce makes unregister (and so Close) call the loop's
+	// UnregisterConn for this conn's number at most once.
+	unregOnce sync.Once
 	closed    atomic.Bool
 	closeErr  atomic.Pointer[errBox]
 
@@ -365,6 +368,14 @@ func (c *redisConn) pollBeforeRearm() {
 func (c *redisConn) writeCommand(args ...string) ([]byte, error) {
 	c.writerMu.Lock()
 	defer c.writerMu.Unlock()
+	// A closed conn's number may name another socket by now (celeris#929):
+	// refuse instead of writing to it. This is an early refusal, not a
+	// guard against a Close that lands after the check; a caller that can
+	// race Close (PubSub) must keep Close from releasing the number while
+	// its write is in flight (see PubSub.ctlMu).
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
 	buf := c.state.writer.WriteCommand(args...)
 	if err := c.loop.Write(c.fd, buf); err != nil {
 		return nil, err
@@ -925,6 +936,20 @@ func (c *redisConn) Ping(ctx context.Context) error {
 	return nil
 }
 
+// unregister removes the conn's number from its worker's interest set, once.
+// The number is still the conn's own until Close closes the file, so a
+// caller may run unregister before it knows no writer is left: a write that
+// is in flight then fails or is dropped by the loop instead of going on
+// blocked, and it cannot reach another socket (celeris#929). Close runs it
+// too, as the first step of its teardown.
+func (c *redisConn) unregister() {
+	c.unregOnce.Do(func() {
+		if c.loop != nil && !c.useDirect {
+			_ = c.loop.UnregisterConn(c.fd)
+		}
+	})
+}
+
 // Close satisfies async.Conn.
 func (c *redisConn) Close() error {
 	c.closeOnce.Do(func() {
@@ -942,9 +967,7 @@ func (c *redisConn) Close() error {
 			c.notifyPubSubClose(drainErr)
 			return
 		}
-		if c.loop != nil {
-			_ = c.loop.UnregisterConn(c.fd)
-		}
+		c.unregister()
 		// Close via the pinned *os.File so the underlying fd is closed
 		// exactly once. Falling back to syscall.Close would race with the
 		// File's finalizer (double-close on an fd that may have been reused
