@@ -120,11 +120,18 @@ func subEngine(e *Engine, ioUring bool) engine.Engine {
 }
 
 func subActive(e *Engine, ioUring bool) int64 {
+	return subMetrics(e, ioUring).ActiveConnections
+}
+
+// subMetrics is one sub-engine's metrics, zero while its slot is empty. Read a
+// sub-engine through it and never through a bare e.secondary.Metrics(): the
+// slot is nil whenever the lazy io_uring standby has not come up (celeris#804).
+func subMetrics(e *Engine, ioUring bool) engine.EngineMetrics {
 	en := subEngine(e, ioUring)
 	if en == nil {
-		return 0
+		return engine.EngineMetrics{}
 	}
-	return en.Metrics().ActiveConnections
+	return en.Metrics()
 }
 
 // pollActive samples a live-connection gauge every 25 ms for up to bound, and
@@ -167,6 +174,13 @@ func TestIdleConnsFollowSwitchRevertAsync(t *testing.T) {
 }
 
 func idleFollowSwitch(t *testing.T, h stream.Handler, async, revert bool) {
+	idleFollowSwitchWith(t, h, async, revert, nil)
+}
+
+// idleFollowSwitchWith is idleFollowSwitch with a hook that runs on the bound
+// engine before the cell starts: the regression test for celeris#804 uses it
+// to make the lazy io_uring standby fail to build, deterministically.
+func idleFollowSwitchWith(t *testing.T, h stream.Handler, async, revert bool, inject func(*Engine)) {
 	if testing.Short() {
 		t.Skip("integration")
 	}
@@ -176,6 +190,9 @@ func idleFollowSwitch(t *testing.T, h stream.Handler, async, revert bool) {
 	)
 	e, addr, stop := s0Bind(t, resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1, AsyncHandlers: async}, h)
 	defer stop()
+	if inject != nil {
+		inject(e)
+	}
 
 	dir := "promote"
 	if revert {
@@ -183,7 +200,7 @@ func idleFollowSwitch(t *testing.T, h stream.Handler, async, revert bool) {
 		// X1's no-listener shape: switch to io_uring with nothing connected,
 		// so the outgoing epoll listener is gone before the first dial and
 		// every connection below is accepted by io_uring.
-		e.ForceSwitch()
+		forceSwitchTo(t, e, engine.IOUring)
 		time.Sleep(500 * time.Millisecond)
 	}
 	// The engine being switched AWAY from, and the one being switched to.
@@ -191,6 +208,10 @@ func idleFollowSwitch(t *testing.T, h stream.Handler, async, revert bool) {
 	// exist until this test's switch builds it.
 	srcIOU := revert
 	dstIOU := !revert
+	dstEngine := engine.IOUring
+	if revert {
+		dstEngine = engine.Epoll
+	}
 
 	var mode atomic.Int32
 	var okCount, errCount atomic.Int64
@@ -199,7 +220,7 @@ func idleFollowSwitch(t *testing.T, h stream.Handler, async, revert bool) {
 	defer func() { mode.Store(modeStop); wg.Wait() }()
 
 	time.Sleep(700 * time.Millisecond)
-	promoted := subEngine(e, srcIOU).Metrics().AsyncPromotedConns
+	promoted := subMetrics(e, srcIOU).AsyncPromotedConns
 	mode.Store(modeIdle) // each client finishes its request, then sends nothing
 	time.Sleep(300 * time.Millisecond)
 
@@ -207,7 +228,10 @@ func idleFollowSwitch(t *testing.T, h stream.Handler, async, revert bool) {
 	t.Logf("celeris657 IDLE-%s async=%v BEFORE outgoing=%d incoming=%d promoted=%d ok=%d err=%d",
 		dir, async, before, subActive(e, dstIOU), promoted, okCount.Load(), errCount.Load())
 
-	e.ForceSwitch()
+	// The promote cells build the io_uring standby HERE, so this is the first
+	// point at which it can fail to come up (celeris#804); the revert cells
+	// switch back to epoll, which always exists.
+	forceSwitchTo(t, e, dstEngine)
 	convergedMs, atBound, trace := pollActive(func() int64 { return subActive(e, srcIOU) }, 2, bound)
 	t.Logf("celeris657 IDLE-%s async=%v TRACE ms:outgoing %s", dir, async, trace)
 

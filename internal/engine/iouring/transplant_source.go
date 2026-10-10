@@ -210,7 +210,7 @@ func (w *Worker) handOff(cs *connState, fd int, h *transplantTargetHolder, detac
 	// and the identity marked as handed off, so a stale recv that later
 	// reads a request is counted as this hand-off's loss.
 	w.noteHandoffInFlight(cs)
-	w.cancelConnOps(fd, cs)
+	cs.cancelMissed = w.cancelConnOps(fd, cs)
 	w.noteHandedOffInflight(cs)
 	if detachedRelease {
 		w.queuePendingReleaseDetached(cs)

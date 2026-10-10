@@ -53,11 +53,11 @@ var (
 func newBoundAdaptiveH(t *testing.T, h stream.Handler, async bool) (*Engine, string, func()) {
 	t.Helper()
 	if !probe.Probe().IOUringTier.Available() {
-		t.Skip("io_uring unavailable: needs both sub-engines")
+		skipOrFailUpswitch662(t, "io_uring unavailable: needs both sub-engines")
 	}
 	e, err := New(resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1, AsyncHandlers: async}, h, nil)
 	if err != nil {
-		t.Skipf("adaptive.New unsupported here: %v", err)
+		skipOrFailUpswitch662(t, "adaptive.New unsupported here: %v", err)
 	}
 	e.ctrl.cooldown = 0
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,7 +128,7 @@ func reverseScenario(t *testing.T, h stream.Handler, async bool) {
 	e, addr, stop := newBoundAdaptiveH(t, h, async)
 	defer stop()
 
-	e.ForceSwitch() // epoll -> io_uring
+	forceSwitchTo(t, e, engine.IOUring) // epoll -> io_uring
 	time.Sleep(150 * time.Millisecond)
 
 	const conns = 64
@@ -142,7 +142,7 @@ func reverseScenario(t *testing.T, h stream.Handler, async bool) {
 	iouBefore := e.secondary.Metrics().ActiveConnections
 	promoted := e.secondary.Metrics().AsyncPromotedConns
 
-	e.ForceSwitch() // io_uring -> epoll (fires reverse transplant)
+	forceSwitchTo(t, e, engine.Epoll) // io_uring -> epoll (fires reverse transplant)
 	time.Sleep(1500 * time.Millisecond)
 	// In-flight snapshot: taken while load runs, so conns mid-request are still
 	// counted on io_uring (async migration is deferred to the goroutine's park).
@@ -194,7 +194,11 @@ func flapScenario(t *testing.T, h stream.Handler, async bool) {
 	time.Sleep(500 * time.Millisecond) // conns establish on epoll (default active)
 
 	for flap := 1; flap <= 3; flap++ {
-		e.ForceSwitch()
+		if flap%2 == 1 {
+			forceSwitchTo(t, e, engine.IOUring)
+		} else {
+			forceSwitchTo(t, e, engine.Epoll)
+		}
 		// Longer than the outgoing engine's accept-pause linger
 		// (celeris#662), so each flap closes the outgoing listeners and the
 		// next one re-creates them, as before the linger existed. A shorter

@@ -118,3 +118,19 @@ type Streamer interface {
 	// Close signals end of the response body.
 	Close(stream *Stream) error
 }
+
+// UseStreamer is a Streamer whose calls are tied to one use of a stream
+// object (celeris#904). A stream is pooled, and on HTTP/2 its use ends when
+// its handler returns, detached or not (Context.Detach); a StreamWriter that a
+// goroutine of the handler still holds would otherwise act on whatever the
+// object serves next, on any connection. Context.StreamWriter takes the use
+// token (Stream.Gen) when the writer is made and presents it with every call;
+// a call whose use is over returns ErrStreamEnded (or the stream's context
+// error if the peer reset it) and has no effect. Engines whose streams outlive
+// their handlers (HTTP/1) implement only Streamer.
+type UseStreamer interface {
+	Streamer
+	WriteHeaderUse(stream *Stream, gen uint64, status int, headers [][2]string) error
+	WriteUse(stream *Stream, gen uint64, data []byte) error
+	CloseUse(stream *Stream, gen uint64) error
+}
