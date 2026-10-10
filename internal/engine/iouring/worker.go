@@ -637,6 +637,11 @@ type Worker struct {
 	detachedConns      *atomic.Int64
 	detachWindowCloses *atomic.Uint64
 
+	// connsMu guards the writes of conns' slots against RegisterConn's reads of
+	// them from a driver's goroutine (celeris#959): see conns_slot.go. A leaf
+	// lock; the worker's own reads of conns need none.
+	connsMu sync.Mutex
+
 	// EventLoopProvider state. driverConns is keyed by real FD and is
 	// completely disjoint from the HTTP conns array. hasDriverConns is the
 	// zero-cost gate: when false, the HTTP fast path pays no overhead.
@@ -2392,7 +2397,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		}
 	}
 
-	w.conns[newFD] = cs
+	w.setConnSlot(newFD, cs)
 	w.connCount++
 	w.addLiveConn(cs)
 	if newFD > w.maxFD {
@@ -2689,7 +2694,7 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// hijacker's first bytes.
 	w.removeDirty(cs)
 	w.removeLiveConn(cs)
-	w.conns[fd] = nil
+	w.clearConnSlot(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
@@ -4268,7 +4273,7 @@ func (w *Worker) handleClose(fd int) {
 	// With CQE_SKIP_SUCCESS, this handler may not fire for successful close.
 	// Clear the slot as a safety guard for error CQEs.
 	if fd >= 0 && fd < len(w.conns) {
-		w.conns[fd] = nil
+		w.clearConnSlot(fd)
 	}
 	// Note: liveConns removal is the caller's responsibility — every
 	// path that calls finishCloseAny reaches here through closeConn or
@@ -4811,7 +4816,7 @@ func (w *Worker) finishClose(fd int) {
 	// connState's liveIdx via w.conns[swappedFD], so the conns slice must
 	// still be intact (v1.5.0 review 1.8 hazard).
 	w.removeLiveConn(cs)
-	w.conns[fd] = nil
+	w.clearConnSlot(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
@@ -4953,7 +4958,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// Remove from liveConns BEFORE niling w.conns[fd] (same hazard as
 	// finishClose — removeLiveConn touches w.conns[swappedFD]).
 	w.removeLiveConn(cs)
-	w.conns[fd] = nil
+	w.clearConnSlot(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
