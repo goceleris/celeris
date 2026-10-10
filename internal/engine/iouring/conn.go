@@ -142,7 +142,18 @@ type connState struct {
 	// in flushSend / flushSendLink); at most one send SQE is in flight per
 	// connection — flushSend/flushSendLink both bail on cs.sending ||
 	// cs.zcNotifPending — so one flag is exact. Worker-thread-only.
-	sendIsZC    bool   // 1: the in-flight send SQE was armed as SEND_ZC
+	sendIsZC bool // 1: the in-flight send SQE was armed as SEND_ZC
+	// noSendZC: this socket rejected SEND_ZC with EOPNOTSUPP, so every send
+	// on this conn is a plain SEND from then on. The kernel returns that
+	// before sending a byte when the socket's struct socket lacks
+	// SOCK_SUPPORT_ZC (io_uring/net.c io_send_zc): an AF_UNIX socket, or a
+	// TCP conn accepted through an MPTCP listener's plain-TCP fallback, which
+	// is what Go's net.Listen hands AdoptConn by default since Go 1.24
+	// (celeris#988). A property of ONE socket, so it lives on the conn: the
+	// worker-wide w.sendZC (retireSendZC) describes the kernel and the memlock
+	// limit and would switch ZC off for every other conn of the worker.
+	// Worker-thread-only; cleared by releaseConnState.
+	noSendZC    bool
 	zcSentBytes int32  // bytes sent from first SEND_ZC CQE (processed on NOTIF)
 	sendBuf     []byte // 24: in-flight buffer (accessed with sending flag)
 
@@ -585,6 +596,7 @@ func releaseConnState(cs *connState) {
 	cs.zcNotifPending = false
 	cs.h2GoAwaySent = false
 	cs.sendIsZC = false
+	cs.noSendZC = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0
 	cs.recvStallSince = 0
