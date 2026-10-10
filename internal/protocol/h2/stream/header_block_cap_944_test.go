@@ -22,12 +22,12 @@ import (
 // hpackInt appends the HPACK integer n with an N-bit prefix (RFC 7541 §5.1)
 // to dst, the prefix byte carrying first in its high bits.
 func hpackInt(dst []byte, first byte, prefixBits uint, n int) []byte {
-	max := 1<<prefixBits - 1
-	if n < max {
+	top := 1<<prefixBits - 1
+	if n < top {
 		return append(dst, first|byte(n))
 	}
-	dst = append(dst, first|byte(max))
-	for n -= max; n >= 128; n /= 128 {
+	dst = append(dst, first|byte(top))
+	for n -= top; n >= 128; n /= 128 {
 		dst = append(dst, byte(n%128)|0x80)
 	}
 	return append(dst, byte(n))
@@ -122,7 +122,7 @@ func TestHuffmanExpandedListOverContinuationIsServed944(t *testing.T) {
 			if err != nil {
 				t.Errorf("a list of %d bytes (bound %d) in a %d-byte block: %v", size, maxHeaderListSize, len(block), err)
 			}
-			if g := p.conn.testResponseWriter.goAwaysSent; len(g) != 0 {
+			if g := p.conn.goAwaysSent; len(g) != 0 {
 				t.Errorf("GOAWAYs %+v for a list inside the bound", g)
 			}
 			if p.runs.Load() != 1 {
@@ -157,7 +157,7 @@ func TestWorstCaseExpansionAtTheBoundIsServed944(t *testing.T) {
 				if err != nil {
 					t.Errorf("a connection error: %v", err)
 				}
-				if g := p.conn.testResponseWriter.goAwaysSent; len(g) != 0 {
+				if g := p.conn.goAwaysSent; len(g) != 0 {
 					t.Errorf("GOAWAYs %+v", g)
 				}
 				if got := p.runs.Load() == 1; got != tc.served {
@@ -287,7 +287,7 @@ func TestGoAwayLastStreamIDDoesNotIncrease944(t *testing.T) {
 			break
 		}
 	}
-	g := p.conn.testResponseWriter.goAwaysSent
+	g := p.conn.goAwaysSent
 	if len(g) != 2 || g[0].code != http2.ErrCodeNo || g[1].code != http2.ErrCodeEnhanceYourCalm {
 		t.Fatalf("GOAWAYs %+v, want the graceful one and then ENHANCE_YOUR_CALM", g)
 	}
@@ -305,7 +305,7 @@ func TestSendGoAwayNeverRaisesTheLastStreamID944(t *testing.T) {
 		_ = p.SendGoAway(id, http2.ErrCodeNo, nil)
 	}
 	var got []uint32
-	for _, g := range p.conn.testResponseWriter.goAwaysSent {
+	for _, g := range p.conn.goAwaysSent {
 		got = append(got, g.lastStreamID)
 	}
 	want := []uint32{7, 7, 3, 3, 0, 0}
