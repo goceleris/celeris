@@ -563,7 +563,9 @@ func (s *Server) cancelListen() {
 // of its send drain, for that drain (it keeps accepting, and serving the
 // requests of its keep-alive connections, for those 250 ms, celeris#595,
 // celeris#806); past them it reads no more request from an HTTP/1.1
-// connection and only finishes the responses it has. An HTTP/2 stream on an async route (marked Async, or promoted to async under
+// connection, ends the writes of its detached streams (Server-Sent Events,
+// WebSocket: epoll ends them at the cancel) and only finishes the responses
+// it has queued. An HTTP/2 stream on an async route (marked Async, or promoted to async under
 // [Config.AsyncHandlers]) runs on the shared HTTP/2 worker pool: epoll,
 // io_uring and adaptive send each HTTP/2 connection GOAWAY, refuse
 // (REFUSED_STREAM) a stream its client opens after it, and serve the
