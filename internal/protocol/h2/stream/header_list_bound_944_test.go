@@ -99,7 +99,7 @@ func feedRaw944(t *testing.T, p *Processor, path string, id uint32, endStream bo
 		return p.ProcessRawHeaders(id, endStream, block)
 	case "frame":
 		var buf bytes.Buffer
-		var fl http2.Flags = http2.FlagHeadersEndHeaders
+		fl := http2.FlagHeadersEndHeaders
 		if endStream {
 			fl |= http2.FlagHeadersEndStream
 		}
