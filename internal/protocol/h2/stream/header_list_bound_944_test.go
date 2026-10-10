@@ -358,16 +358,22 @@ func TestLargeHonestRequestIsServed944(t *testing.T) {
 // nothing of it is kept.
 func TestHeaderBlockFloodIsRefused944(t *testing.T) {
 	p := newProc944()
+	// A request the connection has served already: the GOAWAY names it, so
+	// the client does not retry it (a last stream ID of 0 says none was
+	// processed).
+	if err := feed944(t, p, "raw", 1, true, encodeHeaders(t, reqHeaders944())); err != nil || p.runs.Load() != 1 {
+		t.Fatalf("the first request: %v, handler runs %d", err, p.runs.Load())
+	}
 	var buf bytes.Buffer
 	w := http2.NewFramer(&buf, nil)
 	first := encodeHeaders(t, reqHeaders944())
-	if err := w.WriteRawFrame(http2.FrameHeaders, http2.FlagHeadersEndStream, 1, first); err != nil {
+	if err := w.WriteRawFrame(http2.FrameHeaders, http2.FlagHeadersEndStream, 3, first); err != nil {
 		t.Fatal(err)
 	}
 	const frames = 64
 	frag := bytes.Repeat([]byte{0xBE}, 16<<10)
 	for range frames {
-		if err := w.WriteRawFrame(http2.FrameContinuation, 0, 1, frag); err != nil {
+		if err := w.WriteRawFrame(http2.FrameContinuation, 0, 3, frag); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -393,11 +399,11 @@ func TestHeaderBlockFloodIsRefused944(t *testing.T) {
 	if p.IsExpectingContinuation() {
 		t.Error("the processor still expects CONTINUATION frames")
 	}
-	if g := p.conn.testResponseWriter; len(g.goAwaysSent) != 1 || g.goAwaysSent[0].code != http2.ErrCodeEnhanceYourCalm {
-		t.Errorf("GOAWAYs %+v, want one ENHANCE_YOUR_CALM", g.goAwaysSent)
+	if g := p.conn.testResponseWriter; len(g.goAwaysSent) != 1 || g.goAwaysSent[0].code != http2.ErrCodeEnhanceYourCalm || g.goAwaysSent[0].lastStreamID < 1 {
+		t.Errorf("GOAWAYs %+v, want one ENHANCE_YOUR_CALM naming stream 1 as processed (last stream ID >= 1)", g.goAwaysSent)
 	}
-	if p.runs.Load() != 0 {
-		t.Error("the handler ran")
+	if p.runs.Load() != 1 {
+		t.Errorf("handler runs %d, want 1 (the first request only)", p.runs.Load())
 	}
 }
 

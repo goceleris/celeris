@@ -1749,7 +1749,10 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 	if len(p.continuationState.headerBlock)+len(f.HeaderBlockFragment()) > p.headerListMax {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
-		return p.GoAwayErr(0, http2.ErrCodeEnhanceYourCalm, []byte("header block too large"),
+		// The last stream the server opened, not 0: 0 tells the peer that no
+		// stream was processed, and a client retries the ones it has in
+		// flight, a POST with a replayable body among them (RFC 9113 §6.8).
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("header block too large"),
 			fmt.Errorf("header block on stream %d exceeds %d bytes", f.StreamID, p.headerListMax))
 	}
 
