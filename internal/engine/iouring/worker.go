@@ -2358,6 +2358,14 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		cs.protocol.Store(int32(w.cfg.Protocol))
 		cs.detected = true
 		w.initProtocol(cs)
+	} else if w.cfg.ReadHeaderTimeout > 0 {
+		// The protocol is decided by the first bytes, so there is no H1 state
+		// and no header deadline yet (initProtocol arms it at detection). The
+		// conn gets the same absolute budget from accept: a client that sends
+		// "GE" and stalls, or dribbles the HTTP/2 preface, is reaped by
+		// checkTimeouts instead of living on the activity stamp each of its
+		// bytes refreshes (celeris#974).
+		cs.detectDeadline = now + int64(w.cfg.ReadHeaderTimeout)
 	}
 	if !w.prepareRecv(cs, cs.buf) {
 		cs.needsRecv = true
@@ -3244,34 +3252,45 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
 	if !cs.detected {
-		// Accumulate across recvs so a protocol prefix that spans multiple
-		// packets (notably the 24-byte H2 client preface) is not lost. The
-		// single-shot path re-arms into cs.buf at offset 0 and the bufRing
-		// path returns each provided buffer, so the only durable place to
-		// hold partial bytes is cs.detectAccum (a Go-heap buffer the kernel
-		// never targets). The fast common case — detection resolves on the
-		// first recv — pays no copy (v1.5.0 review 2.8).
+		// Detection needs at most detect.PrefaceLen bytes (the HTTP/2 client
+		// preface): Detect decides on any input of that length or more, and
+		// on fewer it is undecided only when the input is under MinPeekBytes
+		// or starts "PRI " (any other input is HTTP/1 or unknown at once). So
+		// what this conn can hold here is bounded by construction: under
+		// PrefaceLen bytes, plus the recv in hand when a decision falls.
+		//
+		// A prefix that spans recvs (notably the 24-byte H2 client preface,
+		// v1.5.0 review 2.8) is accumulated in cs.detectAccum, a Go-heap
+		// buffer the kernel never targets: the single-shot path re-arms into
+		// cs.buf at offset 0 and the bufRing path returns each provided
+		// buffer, so there is no durable place for partial bytes but this.
+		// The fast common case, detection resolving on the first recv, pays
+		// no copy. Only the bytes Detect can look at are added before it
+		// runs; the rest of the recv is appended once the verdict is known
+		// to be a protocol this engine serves (below).
 		detectData := data
+		taken := 0
 		if len(cs.detectAccum) > 0 {
-			cs.detectAccum = append(cs.detectAccum, data...)
+			taken = min(len(data), detect.PrefaceLen-len(cs.detectAccum))
+			cs.detectAccum = append(cs.detectAccum, data[:taken]...)
 			detectData = cs.detectAccum
 		}
 		proto, derr := detect.Detect(detectData)
-		if derr != nil {
-			// ErrInsufficientData (more bytes needed) AND ErrUnknownProtocol
-			// both re-arm recv and wait — matching the pre-2.8 behavior
-			// (the slowloris header timer / idle timeout reaps a conn that
-			// never produces recognizable bytes). The ONLY change here is
-			// that partial bytes are preserved in cs.detectAccum across
-			// recvs instead of being overwritten at cs.buf offset 0.
-			if derr == detect.ErrInsufficientData && len(cs.detectAccum) == 0 {
-				// First partial recv — begin accumulating.
+		if derr == detect.ErrInsufficientData && len(detectData) >= detect.PrefaceLen {
+			// Unreachable while Detect decides at PrefaceLen bytes; kept so
+			// that the bound does not rest on Detect's internals.
+			derr = detect.ErrUnknownProtocol
+		}
+		if derr == detect.ErrInsufficientData {
+			if len(cs.detectAccum) == 0 {
+				// First partial recv: begin accumulating (fewer than
+				// PrefaceLen bytes, as Detect has not decided).
 				cs.detectAccum = append(cs.detectAccum, data...)
 			}
 			if hasProvidedBuf {
-				// Provided-buffer bytes are now copied into detectAccum (for
-				// the ErrInsufficientData path); return the buffer to the
-				// kernel (early — we skip the normal batch publish, P0).
+				// Provided-buffer bytes are now copied into detectAccum;
+				// return the buffer to the kernel (early: we skip the normal
+				// batch publish, P0).
 				w.bufRing.ReturnBuffer(providedBufID)
 			}
 			if !cqeHasMore(c.Flags) {
@@ -3282,16 +3301,33 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			}
 			return
 		}
+		if derr != nil {
+			// ErrUnknownProtocol: these bytes are not a protocol this engine
+			// serves, and more of them will not make them one. Close, as the
+			// epoll engine does at the first unrecognised bytes. Re-arming
+			// and waiting here let a client that opened with "PRI " keep the
+			// connection, and every byte it sent, for as long as it liked
+			// (celeris#974).
+			cs.detectAccum = nil
+			if hasProvidedBuf {
+				w.bufRing.ReturnBuffer(providedBufID)
+			}
+			w.closeConn(fd)
+			return
+		}
 		cs.protocol.Store(int32(proto))
 		cs.detected = true
+		cs.detectDeadline = 0
 		w.initProtocol(cs)
 		// If we accumulated across recvs, hand the FULL accumulated prefix
-		// (not just this last recv) to the protocol handler below. Reset the
-		// accumulator header; `data`'s own slice header keeps the backing
-		// array alive for the rest of this function.
+		// (not just this last recv) to the protocol handler below: the
+		// accumulated bytes, then what of this recv Detect did not need.
+		// data keeps the accumulator's array alive for the rest of this
+		// function; the connState lets go of it, so a pooled connState
+		// never holds the array of a conn that has gone.
 		if len(cs.detectAccum) > 0 {
-			data = cs.detectAccum
-			cs.detectAccum = cs.detectAccum[:0]
+			data = append(cs.detectAccum, data[taken:]...)
+			cs.detectAccum = nil
 		}
 	}
 
@@ -6396,6 +6432,15 @@ func (w *Worker) checkTimeouts() {
 				w.removeDirty(cs)
 				w.finishCloseAny(fd, cs)
 			}
+			continue
+		}
+		// A conn whose protocol is not detected yet has no H1 state, so the
+		// snapshot below cannot see its header deadline. Nor does it have a
+		// dispatch goroutine yet (the first bytes decide that), so
+		// cs.detected and the deadline are the worker's own and need no lock
+		// (celeris#974).
+		if !cs.detected && cs.detectDeadline > 0 && now > cs.detectDeadline {
+			w.closeConn(fd)
 			continue
 		}
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
