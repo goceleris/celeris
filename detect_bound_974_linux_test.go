@@ -466,19 +466,22 @@ func TestSplitFirstSegmentIsServed974(t *testing.T) {
 // the close on an unrecognised protocol included. One that is dropped is gone
 // for good (celeris#974 review). The ring of a worker holds at least 1024
 // buffers (bufRingCountMin in internal/engine/iouring, the size this test
-// pins with CELERIS_IOURING_PBUF_COUNT), so one worker that closes more
+// pins with CELERIS_IOURING_PBUF_COUNT), so a worker that closes more
 // unrecognised first segments than that, without returning the buffers, has an
 // empty ring: the next conn gets ENOBUFS on every recv and is never answered.
-// Here that conn is a plain GET, after 1536 conns that opened with garbage.
+// The engine needs two workers or more (Config.Workers is 2 at the least; a
+// host with a low memlock limit may cap that to one), so the test sends three
+// rings' worth of conns: whatever the split, every worker is past its ring.
+// The last conn is a plain GET.
 func TestUnknownProtocolReturnsItsRingBuffer974(t *testing.T) {
 	const (
 		ringSize = 1024 // bufRingCountMin
-		badConns = ringSize + ringSize/2
-		parallel = 64
+		badConns = 3 * ringSize
+		parallel = 256
 	)
 	t.Setenv("CELERIS_IOURING_PBUF_COUNT", strconv.Itoa(ringSize))
 	engine974{"io_uring-mshot", celeris.IOUring, false, true}.env974(t)
-	addr := startAuto974(t, celeris.IOUring, func(c *celeris.Config) { c.Workers = 1 })
+	addr := startAuto974(t, celeris.IOUring, func(c *celeris.Config) { c.Workers = 2 })
 
 	var closed atomic.Int64
 	sem := make(chan struct{}, parallel)
@@ -493,7 +496,7 @@ func TestUnknownProtocolReturnsItsRingBuffer974(t *testing.T) {
 			}
 			defer func() { _ = c.Close() }()
 			_, _ = io.WriteString(c, "\x16\x03\x01\x02")
-			if r := watchClose974(c, 3*time.Second).wait(); r.closed {
+			if r := watchClose974(c, 2*time.Second).wait(); r.closed {
 				closed.Add(1)
 			}
 		}()
@@ -503,7 +506,7 @@ func TestUnknownProtocolReturnsItsRingBuffer974(t *testing.T) {
 	}
 	t.Logf("%d of %d conns that opened with garbage were closed by the server", closed.Load(), badConns)
 	if closed.Load() != badConns {
-		t.Errorf("only %d of %d conns that opened with garbage were closed: the worker's ring ran out of buffers", closed.Load(), badConns)
+		t.Errorf("only %d of %d conns that opened with garbage were closed: a worker's ring ran out of buffers", closed.Load(), badConns)
 	}
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
