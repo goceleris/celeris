@@ -206,18 +206,23 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	// read gets (replayCarriedAsync), never a plain inline ProcessH1: that ran
 	// an async route's handler on this worker thread, stalling every other
 	// conn the worker owns for as long as the handler ran (celeris#543).
+	if probe908On && len(carry.Buffered) > 0 {
+		w.probe908Adopt(cs, newFD, carry)
+	}
 	if len(carry.Buffered) > 0 {
 		if w.async {
 			if !w.replayCarriedAsync(cs, newFD, carry.Buffered) {
 				return // promoted (its recv is armed), hijacked, or closed
 			}
 		} else {
-			if perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn); perr != nil {
+			perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn)
+			w.probe908Note(cs, "REPLAY sync: ProcessH1 returned perr=%v writeBuf=%d bodyBuf=%d sendBuf=%d", perr, len(cs.writeBuf), len(cs.bodyBuf), len(cs.sendBuf))
+			if perr != nil {
 				if !w.endCarriedReplay(cs, newFD, perr) {
 					return // hijacked (handed off) or closed on error — nothing more to arm
 				}
 				// Switched to HTTP/2 (celeris#908): the 101 is sent, arm its recv below.
-			} else if w.flushSend(cs) {
+			} else if w.probe908ReplayFlush(cs, "sync") {
 				w.markDirty(cs)
 			}
 		}
@@ -249,6 +254,7 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 	if cs.h1State != nil {
 		cs.h1State.InlineMode = false
 	}
+	w.probe908Note(cs, "REPLAY async: inline ProcessH1 returned perr=%v writeBuf=%d bodyBuf=%d sendBuf=%d", perr, len(cs.writeBuf), len(cs.bodyBuf), len(cs.sendBuf))
 	if errors.Is(perr, conn.ErrAsyncDispatch) {
 		// The route that forced the promotion, cloned out of the parser
 		// buffer, for the celeris#364 revert (see handleRecv, celeris#631).
@@ -262,8 +268,9 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		// A sync request served inline before the async one ships now, ahead
 		// of the dispatch goroutine's responses (#300 L1).
 		if len(cs.writeBuf) > 0 && !cs.sending && !cs.zcNotifPending {
-			_ = w.flushSend(cs)
+			_ = w.probe908ReplayFlush(cs, "async pre-promotion flush")
 		}
+		w.probe908Note(cs, "REPLAY async: ErrAsyncDispatch, promoting to the dispatch goroutine (the request's response is written and sent by the goroutine's path, not by the replay)")
 		var first completionEntry // no IORING_CQE_F_MORE: no recv is armed yet
 		w.promoteConnToAsync(cs, fd, stashed, &first)
 		return false
@@ -279,7 +286,7 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		cs.asyncPromoted.Store(true)
 		w.asyncPromoted.Add(1)
 	}
-	if w.flushSend(cs) {
+	if w.probe908ReplayFlush(cs, "async inline") {
 		w.markDirty(cs)
 	}
 	return true

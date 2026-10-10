@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -275,7 +276,7 @@ func testRecvOnError908(t *testing.T, e *Engine, h *onErr908Handler) {
 // receive queue plus the server's send buffer) and the server has flushed all
 // it can. It replaces a fixed sleep, which on a loaded host may not cover the
 // flush. The queue must be non-empty and unchanged for 5 polls of 20 ms.
-func waitPipeSettled908(t *testing.T, c net.Conn) {
+func waitPipeSettled908(t *testing.T, c net.Conn, pt *probe908T) {
 	t.Helper()
 	rc, err := c.(*net.TCPConn).SyscallConn()
 	if err != nil {
@@ -291,8 +292,13 @@ func waitPipeSettled908(t *testing.T, c net.Conn) {
 		return n
 	}
 	last, stable := -1, 0
+	begin, marks := time.Now(), 0
 	for dl := time.Now().Add(10 * time.Second); time.Now().Before(dl); time.Sleep(20 * time.Millisecond) {
 		n := queued()
+		if probe908On && marks < 2 && time.Since(begin) > time.Duration(2+3*marks)*time.Second {
+			marks++
+			pt.snap(fmt.Sprintf("still waiting for the pipe to settle after %ds (%d bytes queued)", 2+3*(marks-1), n))
+		}
 		if n > 0 && n == last {
 			if stable++; stable >= 5 {
 				return
@@ -302,7 +308,7 @@ func waitPipeSettled908(t *testing.T, c net.Conn) {
 		}
 		last = n
 	}
-	t.Fatalf("the client's receive queue never filled and settled (%d bytes queued)", last)
+	pt.failf("the client's receive queue never filled and settled (%d bytes queued)", last)
 }
 
 // testCarryLargeResponse908 adopts a conn whose carried request has a response
@@ -311,16 +317,20 @@ func waitPipeSettled908(t *testing.T, c net.Conn) {
 // (epoll) or the send completion (io_uring), as it does for a request the
 // engine read itself, and the conn must go on serving.
 func testCarryLargeResponse908(t *testing.T, adopt func(int, engine.Carryover) error) {
-	client, br := adoptCarry908(t, adopt, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
-	waitPipeSettled908(t, client) // the replay has flushed what the kernel took
+	client, br, srvFD := adoptCarryFD908(t, adopt, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+	pt := newProbe908(t, client, srvFD)
+	waitPipeSettled908(t, client, pt) // the replay has flushed what the kernel took
+	if probe908On {
+		pt.snap("settled, before the first read")
+	}
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		t.Fatalf("read the /big response head: %v", err)
+		pt.failf("read the /big response head: %v", err)
 	}
-	n, err := io.Copy(io.Discard, resp.Body)
+	n, err := io.Copy(io.Discard, pt.halfReader(resp.Body, big908))
 	if err != nil || n != big908 {
-		t.Fatalf("read %d of %d body bytes of /big: %v (the replay's partial flush left the rest queued with nothing to send it)", n, big908, err)
+		pt.failf("read %d of %d body bytes of /big: %v (the replay's partial flush left the rest queued with nothing to send it)", n, big908, err)
 	}
 	_ = resp.Body.Close()
 	if _, err := client.Write([]byte("GET /after HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
@@ -343,15 +353,19 @@ func testRecvLargeResponse908(t *testing.T, e *Engine) {
 	if _, err := client.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	waitPipeSettled908(t, client)
+	pt := newProbe908(t, client, -1) // the control: client end only, the engine did not adopt this conn
+	waitPipeSettled908(t, client, pt)
+	if probe908On {
+		pt.snap("CONTROL settled, before the first read")
+	}
 	br := bufio.NewReader(client)
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		t.Fatalf("read the /big response head: %v", err)
+		pt.failf("read the /big response head: %v", err)
 	}
-	if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != big908 {
-		t.Fatalf("recv path: read %d of %d body bytes of /big: %v", n, big908, err)
+	if n, err := io.Copy(io.Discard, pt.halfReader(resp.Body, big908)); err != nil || n != big908 {
+		pt.failf("recv path: read %d of %d body bytes of /big: %v", n, big908, err)
 	}
 }
 
@@ -360,16 +374,20 @@ func testRecvLargeResponse908(t *testing.T, e *Engine) {
 // body has reached the kernel (closeWhenFlushed on epoll, the deferred close
 // on io_uring): the client gets every byte, then EOF.
 func testCarryLargeClose908(t *testing.T, adopt func(int, engine.Carryover) error) {
-	client, br := adoptCarry908(t, adopt, "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-	waitPipeSettled908(t, client)
+	client, br, srvFD := adoptCarryFD908(t, adopt, "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	pt := newProbe908(t, client, srvFD)
+	waitPipeSettled908(t, client, pt)
+	if probe908On {
+		pt.snap("settled, before the first read")
+	}
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		t.Fatalf("read the /big response head: %v", err)
+		pt.failf("read the /big response head: %v", err)
 	}
-	n, err := io.Copy(io.Discard, resp.Body)
+	n, err := io.Copy(io.Discard, pt.halfReader(resp.Body, big908))
 	if err != nil || n != big908 {
-		t.Fatalf("read %d of %d body bytes of /big: %v (the conn was closed before its response had gone out)", n, big908, err)
+		pt.failf("read %d of %d body bytes of /big: %v (the conn was closed before its response had gone out)", n, big908, err)
 	}
 	_ = resp.Body.Close()
 	if !hasEOF908(client, br, 3*time.Second) {

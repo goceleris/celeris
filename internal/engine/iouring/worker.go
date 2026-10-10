@@ -372,6 +372,11 @@ type Worker struct {
 	sqpoll     bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC     bool // true when SEND_ZC is available (kernel 6.0+)
 	async      bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+
+	// probe908 is the celeris#988 diagnostic probe: nil unless
+	// CELERIS_PROBE_908=1 and a conn carrying bytes was adopted. Probe branch
+	// only, not for merge.
+	probe908 *probe908State
 	// h1Only is true when engine config locks every conn to HTTP/1.1
 	// (Protocol == HTTP1 AND EnableH2Upgrade == false). cs.protocol is set
 	// once at registerConn and never written, so the recv hot path can
@@ -1397,6 +1402,9 @@ func (w *Worker) run(ctx context.Context) {
 			w.h2PollArmed = w.prepareH2Poll()
 		}
 
+		if w.probe908 != nil {
+			w.probe908PreWait()
+		}
 		var cqHead, cqTail uint32
 		if w.sqpoll {
 			// SQPOLL path: kernel thread submits SQEs from the shared ring.
@@ -1466,6 +1474,10 @@ func (w *Worker) run(ctx context.Context) {
 				cqHead, cqTail = w.ring.BeginCQ()
 			}
 		}
+		if w.probe908 != nil {
+			h, t := w.ring.BeginCQ()
+			w.probe908PostWait(h, t)
+		}
 		w.sendsPending = false
 
 		if cqHead != cqTail {
@@ -1493,6 +1505,11 @@ func (w *Worker) run(ctx context.Context) {
 				// each case. Hot ops (recv/send) are checked first.
 				ud := entry.UserData
 				fd := int(ud & fdMask)
+				var probe908 *probe908State
+				if w.probe908 != nil && w.probe908.match(ud) {
+					probe908 = w.probe908
+					probe908.cqePre(entry)
+				}
 				switch ud & udMask {
 				case udRecv:
 					// Generation gate (review 2.6): drop a stale CQE from a
@@ -1571,6 +1588,9 @@ func (w *Worker) run(ctx context.Context) {
 					w.handleDriverSend(entry, fd)
 				case udDriverClose:
 					w.handleDriverClose(fd)
+				}
+				if probe908 != nil {
+					probe908.cqePost()
 				}
 				cqHead++
 			}
@@ -1686,6 +1706,9 @@ func (w *Worker) run(ctx context.Context) {
 		// Retry pending sends and dropped recv arms on dirty connections
 		// (SQ ring was full earlier). Typically empty under normal load.
 		w.flushDirty()
+		if w.probe908 != nil {
+			w.probe908Tick()
+		}
 
 		// SENDs queued during CQE processing are submitted at the top of
 		// the next iteration: Mode 1 SubmitAndWait combines submit + CQE
@@ -5682,6 +5705,9 @@ func (w *Worker) prepareRecv(cs *connState, buf []byte) bool {
 	cs.recvArmed = true
 	cs.kernelInflight++
 	w.noteRecvPlaced(cs)
+	if p := w.probe908; p.is(cs) {
+		p.recvArmed(w.bufRing != nil)
+	}
 	return true
 }
 
@@ -5945,6 +5971,9 @@ func (w *Worker) markDirty(cs *connState) {
 	if cs.dirty {
 		return
 	}
+	if p := w.probe908; p.is(cs) {
+		p.dirtyMarked()
+	}
 	cs.dirty = true
 	cs.dirtyNext = w.dirtyHead
 	cs.dirtyPrev = nil
@@ -6090,6 +6119,10 @@ func (w *Worker) flushDirty() {
 // Returns true if data is still pending and needs retry (SQ ring was full).
 // The caller should markDirty only when this returns true.
 func (w *Worker) flushSend(cs *connState) bool {
+	if p := w.probe908; p.is(cs) {
+		entry, ws, wn := p.sendState(cs), cs.sending, cs.zcNotifPending
+		defer func() { p.flushSendDone("flushSend", entry, ws, wn) }()
+	}
 	if cs.sending || cs.zcNotifPending {
 		return false // send in-flight; handleSend/NOTIF will pick up writeBuf
 	}
@@ -6199,6 +6232,9 @@ func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
 	} else {
 		prepSendPlain(sqe, cs.fd, cs.sendBuf, linked)
 	}
+	if p := w.probe908; p.is(cs) {
+		p.sendSubmitted(linked)
+	}
 }
 
 // useSendZC decides whether a send should use zero-copy. ZC is only viable for
@@ -6216,6 +6252,10 @@ func useSendZC(sendZC, linked bool, n int) bool {
 // Only used for single-shot recv (bufRing == nil) on the normal request path.
 // Falls back to plain (unlinked) SEND if only one SQE slot is available.
 func (w *Worker) flushSendLink(cs *connState) bool {
+	if p := w.probe908; p.is(cs) {
+		entry, ws, wn := p.sendState(cs), cs.sending, cs.zcNotifPending
+		defer func() { p.flushSendDone("flushSendLink", entry, ws, wn) }()
+	}
 	if cs.sending || cs.zcNotifPending {
 		return false
 	}
