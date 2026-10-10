@@ -46,9 +46,9 @@ func reusedBy951(m2 *Manager, s *Stream) (*Stream, uint32) {
 // and credited its window, and lets the stream's pool handler end then (the
 // real executeHandler). The loop still holds the *Stream, so the object must
 // not be in the stream pool, where another connection's stream can get it:
-// before the fix the handler's goroutine released it at once, the other
-// connection's stream got it, and the loop went on to credit that stream's
-// window (and would set its state, and cancel its context).
+// before the fix the handler's goroutine released it at once and the other
+// connection's stream got it, with the loop about to act on it (set its
+// state, cancel its context, credit its window).
 func TestPoolStreamIsNotPooledWhileTheLoopHoldsIt951(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -91,10 +91,8 @@ func TestPoolStreamIsNotPooledWhileTheLoopHoldsIt951(t *testing.T) {
 
 				m2 := NewManager()
 				next, nextID := reusedBy951(m2, s)
-				var before int32
 				if next != nil {
 					pooled++
-					before = next.GetWindowSize()
 				}
 
 				m.sendWindowMu.Unlock()
@@ -104,8 +102,7 @@ func TestPoolStreamIsNotPooledWhileTheLoopHoldsIt951(t *testing.T) {
 				}
 				if next != nil {
 					t.Errorf("iteration %d: stream 1's pool handler released its object while the event loop held it, and another "+
-						"connection's stream %d got it: its window went from %d to %d, state %v, cancelled %v",
-						i, nextID, before, next.GetWindowSize(), next.GetState(), next.IsCancelled())
+						"connection's stream %d got it (state %v, cancelled %v): the loop acts on it next", i, nextID, next.GetState(), next.IsCancelled())
 				}
 
 				// The loop's batch ends: now the object is released, once.
@@ -175,9 +172,9 @@ func newBystander951(stop <-chan struct{}, bad *atomic.Int64, first *atomic.Valu
 // is not ordered against its release; without it the other connection's
 // checks catch the loop acting on a stream that is not its own.
 func TestEventLoopRacesPoolHandlerEnd951(t *testing.T) {
-	n := 4000
+	n := 20000
 	if testing.Short() {
-		n = 500
+		n = 2000
 	}
 	rst := func(p *Processor) {
 		_ = p.handleRSTStream(&http2.RSTStreamFrame{FrameHeader: http2.FrameHeader{Type: http2.FrameRSTStream, StreamID: 1}, ErrCode: http2.ErrCodeCancel})
