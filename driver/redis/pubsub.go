@@ -33,6 +33,13 @@ type Message struct {
 // Callers should treat subscribe/unsubscribe as "at most once" — the server
 // ack is not tracked synchronously. The channel returned by [PubSub.Channel]
 // is closed once [PubSub.Close] is called or the reconnect loop gives up.
+//
+// A subscribe/unsubscribe call on an open PubSub whose connection is down
+// returns a non-nil error that is not [ErrClosed]: the command was not sent,
+// the subscription set is updated and the reconnect replays it, so the call
+// need not be repeated. [ErrClosed] means the PubSub itself is closed, also
+// when [PubSub.Close] raced the call. [PubSub.Close] waits for a control
+// call that is already writing to return before it releases the connection.
 type PubSub struct {
 	client *Client
 
@@ -223,8 +230,10 @@ func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
 // conn it was issued on or fails, and never reaches another socket that took
 // the conn's number (celeris#929). When ps has no conn (it is closed, or the
 // reconnect loop has not yet replaced a dropped one) the sets are still
-// updated, so the reconnect replays them, and the call returns ErrClosed as
-// it always did.
+// updated, so the reconnect replays them, and the call returns
+// errPubSubConnDown (not ErrClosed: ErrClosed is final, and the PubSub is
+// open). ErrClosed is returned only when the PubSub is closed, including when
+// its Close raced the write and made it fail.
 func (ps *PubSub) control(verb string, names []string, update func()) error {
 	if ps.closed.Load() {
 		return ErrClosed
@@ -236,19 +245,32 @@ func (ps *PubSub) control(verb string, names []string, update func()) error {
 	conn := ps.conn
 	ps.mu.Unlock()
 	err := sendPubSubControl(conn, append([]string{verb}, names...))
-	if errors.Is(err, ErrClosed) && conn != nil && !ps.closed.Load() {
-		// conn is down and ps is not: the reconnect loop replays the sets,
-		// so tell the caller the write was not sent, but not that ps is
-		// closed (ErrClosed is final, this is not).
+	if err == nil {
+		return nil
+	}
+	if ps.closed.Load() {
+		// Close raced the write (it unregisters the conn, which makes an
+		// in-flight write fail with the engine's internal error).
+		return ErrClosed
+	}
+	// ps is open. No conn (ps.conn is nil only while a reconnect attempt
+	// that failed is backing off: Close sets closed before it takes the
+	// conn), a conn already closed, or a conn the loop has forgotten before
+	// its onClose stored closed (ErrUnknownFD) all mean the conn is down and
+	// the reconnect loop replays the sets: tell the caller the write was not
+	// sent, but not that ps is closed.
+	if conn == nil || errors.Is(err, ErrClosed) || errors.Is(err, ErrUnknownFD) {
 		return errPubSubConnDown
 	}
 	return err
 }
 
-// errPubSubConnDown is returned by a control call that finds the pubsub conn
-// dropped and the reconnect loop not yet done. The subscription set is
-// updated and the reconnect replays it.
-var errPubSubConnDown = errors.New("celeris-redis: pubsub connection is down; reconnecting, the subscription is replayed")
+// errPubSubConnDown is what a control call (Subscribe, Unsubscribe,
+// PSubscribe, PUnsubscribe, SSubscribe, SUnsubscribe) returns on an open
+// PubSub whose conn is down: the command was not sent, but the subscription
+// set is updated and the reconnect replays it, so the caller need not retry.
+// It is not exported (see the PubSub doc for what callers may rely on).
+var errPubSubConnDown = errors.New("celeris-redis: pubsub conn down, reconnecting")
 
 // sendPubSubControl writes a control command without tracking a reply (pubsub
 // control frames are delivered as push). The caller holds ps.ctlMu and read
@@ -261,7 +283,9 @@ func sendPubSubControl(conn *redisConn, args []string) error {
 	return err
 }
 
-// Close tears down the pubsub conn and closes msgCh.
+// Close tears down the pubsub conn and closes msgCh. It waits for a control
+// write that is in flight (Subscribe and the others) to return before it
+// releases the conn's descriptor; that write returns ErrClosed or succeeds.
 func (ps *PubSub) Close() error {
 	if !ps.closed.CompareAndSwap(false, true) {
 		return nil
@@ -368,6 +392,17 @@ func (ps *PubSub) reconnectLoop() {
 		ps.reconnectingMu.Lock()
 		ps.reconnecting = false
 		ps.reconnectingMu.Unlock()
+		// A close hook that fired while reconnecting was set (the new conn
+		// died during the handover) was ignored by onConnDrop, and the hook
+		// fires once: look at the conn now, after the flag is down. The
+		// conn's closed flag is stored before its hook runs, so no drop is
+		// missed between the two.
+		ps.mu.Lock()
+		cur := ps.conn
+		ps.mu.Unlock()
+		if cur != nil && cur.closed.Load() {
+			ps.onConnDrop(nil)
+		}
 	}()
 	for attempt := 0; ; attempt++ {
 		if ps.closed.Load() {
@@ -404,6 +439,10 @@ func (ps *PubSub) reconnectLoop() {
 		// conn, after the replay, and Close cannot release conn under the
 		// replay's writes.
 		old := ps.conn
+		// Bind first, so a Close that takes conn as soon as it is published
+		// detaches a conn that is already bound, and cannot be re-bound
+		// after its detach.
+		ps.bindConn(conn)
 		ps.conn = conn
 		subs := make([]string, 0, len(ps.subs))
 		for s := range ps.subs {
@@ -418,7 +457,6 @@ func (ps *PubSub) reconnectLoop() {
 			ssubs = append(ssubs, s)
 		}
 		ps.mu.Unlock()
-		ps.bindConn(conn)
 		ok := true
 		for _, r := range [...]struct {
 			verb  string
