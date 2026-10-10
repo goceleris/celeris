@@ -76,6 +76,23 @@ func BenchmarkAcceptCloseChurn959(b *testing.B) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// Warm the engine: the first connections after an idle ring wait for the
+	// worker's idle wake (up to a second each), which the b.N ramp would
+	// otherwise fold into the first, small runs.
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
+		before := e.Metrics().CloseCount
+		for range 4000 {
+			if c, err := net.Dial("tcp", addr); err == nil {
+				_ = c.Close()
+			}
+		}
+		for e.Metrics().CloseCount-before < 4000 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if e.Metrics().CloseCount-before >= 4000 {
+			break
+		}
+	}
 	b.Run("plain", func(b *testing.B) { benchAcceptCloseChurn959(b, e, addr, false) })
 	b.Run("spin", func(b *testing.B) { benchAcceptCloseChurn959(b, e, addr, true) })
 }
