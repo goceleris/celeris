@@ -296,10 +296,12 @@ type Config struct {
 	//     proxies): a request carrying Upgrade: h2c is then served as
 	//     plain HTTP/1.1. Prior-knowledge h2c on Auto is not affected.
 	//
-	// Engine: Std does not yet honour non-nil false on Auto: it still
-	// answers an Upgrade: h2c request with 101 (celeris#964). Std is the
-	// only engine on non-Linux platforms and the default there. Epoll,
-	// IOUring and Adaptive honour it.
+	// Engine: all four engines honour non-nil false on Auto. Std (the only
+	// engine on non-Linux platforms and the default there) differs from
+	// Epoll, IOUring and Adaptive on two other combinations (celeris#889):
+	// on Protocol=H2C it answers an Upgrade: h2c request with 101 for nil
+	// and false as well as true, where the others upgrade only for true; on
+	// Protocol=HTTP1 it never upgrades, true included, where the others do.
 	EnableH2Upgrade *bool
 }
 

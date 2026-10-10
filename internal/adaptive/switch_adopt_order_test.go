@@ -41,7 +41,7 @@ func TestSwitchDoesNotAdoptOntoOutgoing(t *testing.T) {
 	// Switch 1, with nothing connected: epoll becomes standby and is given
 	// the drain toward io_uring. That drain is what switch 2 must stop
 	// before epoll starts accepting again.
-	e.ForceSwitch()
+	forceSwitchTo(t, e, engine.IOUring)
 	time.Sleep(500 * time.Millisecond)
 	if n := e.secondary.Metrics().TransplantAdopted; n != 0 {
 		t.Fatalf("celeris657 B0 PREMISE: io_uring adopted %d conns before the test opened any", n)
@@ -100,7 +100,7 @@ func TestSwitchDoesNotAdoptOntoOutgoing(t *testing.T) {
 	}
 	defer func() { switchWindowHook = nil }()
 
-	e.ForceSwitch() // switch 2: io_uring -> epoll
+	forceSwitchTo(t, e, engine.Epoll) // switch 2: io_uring -> epoll
 	time.Sleep(300 * time.Millisecond)
 
 	adoptedAfter := int64(e.secondary.Metrics().TransplantAdopted)

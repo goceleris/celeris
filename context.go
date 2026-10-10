@@ -148,6 +148,13 @@ type Context struct {
 	streamUsed      atomic.Bool
 
 	detached bool
+	// detachGen is the stream's use token (Stream.Gen) when Detach ran, while
+	// the handler was still running. On HTTP/2 the stream ends with the
+	// handler and goes back to a pool shared by every connection, so a call a
+	// detached Context makes later that reads the stream at call time
+	// (StreamWriter) presents this token, not whatever the stream serves now,
+	// and is refused once the use is over (celeris#904).
+	detachGen uint64
 	// pooled guards against a double release. Returning one Context to
 	// contextPool twice lets two concurrent Get calls hand the SAME object
 	// to two goroutines, which then both write c.stream / c.index in
@@ -708,6 +715,7 @@ func (c *Context) reset() {
 		c.streamTakenOnly = false
 		c.streamUsed.Store(false)
 		c.detached = false
+		c.detachGen = 0
 		c.detachDone = nil
 		c.detachSnap = nil
 		c.clientIPOverride = ""

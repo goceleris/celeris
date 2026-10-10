@@ -94,7 +94,7 @@ const (
 	resDetached  = iota // detached WS/SSE: never movable while it lives
 	resH2               // H2, h2c, or an H1 connection mid-upgrade
 	resPinned           // cannot be handed over at all (io_uring: fixed file, no reap)
-	resUnstarted        // accepted, has sent nothing: no protocol detected yet
+	resUnstarted        // no protocol detected yet: accepted and silent, or holding fewer bytes than detection needs (celeris#870)
 	resBusy             // transient: mid-request, unflushed, handler running
 	numResidual
 )
@@ -418,9 +418,10 @@ func (l *Loop) classifyLocked(cs *connState) int {
 		return resPinned
 	}
 	if !cs.detected || cs.h1State == nil {
-		// tryTransplant's FIRST gate (transplant.go). An accepted
-		// connection that has sent no byte has no detected protocol and no
-		// H1 state, and neither appears until it speaks.
+		// tryTransplant's FIRST gate (transplant.go). A connection that
+		// has sent no byte, or fewer than detection needs (cs.detectN, held
+		// at the head of cs.buf, celeris#870), has no detected protocol and no
+		// H1 state, and neither appears until its next read.
 		return resUnstarted
 	}
 	return resBusy

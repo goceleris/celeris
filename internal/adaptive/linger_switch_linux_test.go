@@ -88,7 +88,7 @@ func TestFlapWithinLingerKeepsListeners(t *testing.T) {
 	epollSet := cookies662(epollBefore)
 
 	tPromote := time.Now()
-	e.ForceSwitch() // epoll -> io_uring: epoll lingers
+	forceSwitchTo(t, e, engine.IOUring) // epoll -> io_uring: epoll lingers
 	// Wait for io_uring's listeners. A resumed io_uring worker that had not
 	// parked yet re-creates its listener only after its current ring wait,
 	// up to a second: a known, separate lag, not what this test is about.
@@ -245,10 +245,7 @@ func TestLingerTransplantConserves(t *testing.T) {
 	epollEng := e.primary
 	e.mu.Unlock()
 	epollAccepts0 := epollEng.Metrics().AcceptCount
-	e.ForceSwitch() // epoll -> io_uring: keep-alives transplant, epoll lingers
-	if got := e.ActiveEngine().Type(); got != engine.IOUring {
-		t.Fatalf("the promotion left %v active", got)
-	}
+	forceSwitchTo(t, e, engine.IOUring) // epoll -> io_uring: keep-alives transplant, epoll lingers
 	time.Sleep(2500 * time.Millisecond) // past the linger's close
 	epollAcceptsDuringLinger := epollEng.Metrics().AcceptCount - epollAccepts0
 	stopChurn()

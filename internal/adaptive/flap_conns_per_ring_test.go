@@ -97,7 +97,11 @@ func s0FlapConnsPerRing(t *testing.T, cycles int) {
 		errBefore := errCount.Load()
 		srcBefore, dstBefore := side(!toIOUring), side(toIOUring)
 		t0 := time.Now()
-		e.ForceSwitch()
+		if toIOUring {
+			forceSwitchTo(t, e, engine.IOUring)
+		} else {
+			forceSwitchTo(t, e, engine.Epoll)
+		}
 		took := time.Since(t0)
 		time.Sleep(dwell)
 		pm, sm := e.primary.Metrics(), e.secondary.Metrics()
