@@ -40,9 +40,17 @@ type writeGate struct {
 	mu      sync.Mutex
 	armed   bool
 	fail    bool
+	failErr error
 	match   func([]byte) bool
 	hit     chan gateHit
 	release chan struct{}
+
+	// A held UnregisterConn: the first UnregisterConn(unregFD) after
+	// armUnreg blocks until unregRelease is closed.
+	unregArmed   bool
+	unregFD      int
+	unregHit     chan struct{}
+	unregRelease chan struct{}
 }
 
 type gateHit struct {
@@ -51,7 +59,10 @@ type gateHit struct {
 }
 
 func newWriteGate() *writeGate {
-	return &writeGate{hit: make(chan gateHit, 1), release: make(chan struct{})}
+	return &writeGate{
+		hit: make(chan gateHit, 1), release: make(chan struct{}),
+		unregHit: make(chan struct{}, 1), unregRelease: make(chan struct{}),
+	}
 }
 
 func hasCmd(name string) func([]byte) bool {
@@ -66,10 +77,32 @@ func (g *writeGate) arm(match func([]byte) bool) {
 }
 
 // armFail makes the next Write whose bytes match return an error.
-func (g *writeGate) armFail(match func([]byte) bool) {
+func (g *writeGate) armFail(match func([]byte) bool) { g.armFailWith(match, errGateInjected) }
+
+// armFailWith is armFail with the error to return.
+func (g *writeGate) armFailWith(match func([]byte) bool, err error) {
 	g.mu.Lock()
-	g.armed, g.fail, g.match = true, true, match
+	g.armed, g.fail, g.failErr, g.match = true, true, err, match
 	g.mu.Unlock()
+}
+
+// armUnreg makes the first UnregisterConn(fd) block until unregRelease is closed.
+func (g *writeGate) armUnreg(fd int) {
+	g.mu.Lock()
+	g.unregArmed, g.unregFD = true, fd
+	g.mu.Unlock()
+}
+
+func (g *writeGate) beforeUnreg(fd int) {
+	g.mu.Lock()
+	if !g.unregArmed || fd != g.unregFD {
+		g.mu.Unlock()
+		return
+	}
+	g.unregArmed = false
+	g.mu.Unlock()
+	g.unregHit <- struct{}{}
+	<-g.unregRelease
 }
 
 var errGateInjected = errors.New("gate: injected write failure")
@@ -81,10 +114,10 @@ func (g *writeGate) before(fd int, wl engine.WorkerLoop, data []byte) error {
 		return nil
 	}
 	g.armed = false
-	fail := g.fail
+	fail, failErr := g.fail, g.failErr
 	g.mu.Unlock()
 	if fail {
-		return errGateInjected
+		return failErr
 	}
 	g.hit <- gateHit{fd: fd, wl: wl}
 	<-g.release
@@ -101,6 +134,11 @@ func (l *gateLoop) Write(fd int, data []byte) error {
 		return err
 	}
 	return l.WorkerLoop.Write(fd, data)
+}
+
+func (l *gateLoop) UnregisterConn(fd int) error {
+	l.g.beforeUnreg(fd)
+	return l.WorkerLoop.UnregisterConn(fd)
 }
 
 // gateProvider hands out gateLoops. A gateLoop does not implement the
@@ -224,7 +262,7 @@ func socketOnNumber(t *testing.T, n int, wl engine.WorkerLoop) (b, peer int, ok 
 // closeWhileWriteHeld runs closeFn on its own goroutine while the gated write
 // is held, puts B on the conn's number if closeFn released it, lets the write
 // go, and fails if B's peer received anything.
-func closeWhileWriteHeld(t *testing.T, g *writeGate, h gateHit, closeFn func(), writerDone <-chan error) {
+func closeWhileWriteHeld(t *testing.T, g *writeGate, h gateHit, closeFn func(), writerDone <-chan error) (writerErr error) {
 	t.Helper()
 	closeDone := make(chan struct{})
 	go func() { closeFn(); close(closeDone) }()
@@ -242,6 +280,7 @@ func closeWhileWriteHeld(t *testing.T, g *writeGate, h gateHit, closeFn func(), 
 	close(g.release)
 	select {
 	case err := <-writerDone:
+		writerErr = err
 		t.Logf("held control write returned: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the held control write did not return within 5 s of its release")
@@ -260,6 +299,7 @@ func closeWhileWriteHeld(t *testing.T, g *writeGate, h gateHit, closeFn func(), 
 			t.Errorf("the closed conn's control write reached another connection on number %d: its peer received %q", h.fd, buf[:k])
 		}
 	}
+	return writerErr
 }
 
 func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
@@ -293,7 +333,13 @@ func TestPubSubSubscribeRacingCloseKeepsToItsConn929(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Subscribe never reached loop.Write")
 	}
-	closeWhileWriteHeld(t, r.gate, h, func() { _ = ps.Close() }, writerDone)
+	werr := closeWhileWriteHeld(t, r.gate, h, func() { _ = ps.Close() }, writerDone)
+	// The caller closed the PubSub while its Subscribe was in flight: the
+	// answer is ErrClosed (or success, if the write won), not the engine's
+	// internal ErrUnknownFD that Close's unregister made the write return.
+	if werr != nil && !errors.Is(werr, ErrClosed) {
+		t.Errorf("Subscribe that raced the caller's Close returned %v, want nil or ErrClosed", werr)
+	}
 }
 
 // (b) The reconnect goroutine's resubscribe races the caller's Close.
@@ -548,4 +594,117 @@ func TestPubSubControlWhileConnDownIsReplayed929(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// (h) After a reconnect attempt whose resubscribe failed, ps.conn is nil but
+// the PubSub is open and the reconnect loop keeps retrying: a control call in
+// that window is "not sent, will be replayed", not the final ErrClosed.
+func TestPubSubControlAfterFailedResubscribeIsReplayed929(t *testing.T) {
+	r := newPubsubRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ps, err := r.cl.newPubSub(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if err := ps.Subscribe(ctx, "early"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the server to see SUBSCRIBE", 5*time.Second, func() bool { return r.log.count("SUBSCRIBE") == 1 })
+	r.gate.armFail(hasCmd("SUBSCRIBE"))
+	r.dropServerSide()
+	waitFor(t, "a failed attempt to leave ps.conn nil", 10*time.Second, func() bool {
+		ps.reconnectingMu.Lock()
+		rec := ps.reconnecting
+		ps.reconnectingMu.Unlock()
+		return rec && ps.connNow() == nil
+	})
+	err = ps.Subscribe(ctx, "late")
+	if ps.closed.Load() {
+		t.Fatal("fixture: the PubSub is closed")
+	}
+	if !errors.Is(err, errPubSubConnDown) {
+		t.Errorf("Subscribe on an open PubSub with a reconnect pending returned %v, want errPubSubConnDown", err)
+	}
+	waitFor(t, "the reconnect to replay both channels", 10*time.Second, func() bool {
+		r.log.mu.Lock()
+		defer r.log.mu.Unlock()
+		for _, cmds := range r.log.per {
+			for _, c := range cmds {
+				if strings.HasPrefix(c, "SUBSCRIBE ") && strings.Contains(c, "late") && strings.Contains(c, "early") {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
+
+// (i) The event loops forget a descriptor (ErrUnknownFD from Write) before
+// the conn's onClose stores closed: a control call in that gap reports the
+// conn down, not the engine's internal error. The write failure is injected
+// at that point; the PubSub is open throughout.
+func TestPubSubControlOnForgottenFDIsReportedDown929(t *testing.T) {
+	r := newPubsubRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ps, err := r.cl.newPubSub(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	r.gate.armFailWith(hasCmd("SUBSCRIBE"), ErrUnknownFD)
+	err = ps.Subscribe(ctx, "news")
+	if errors.Is(err, ErrUnknownFD) || errors.Is(err, ErrClosed) || !errors.Is(err, errPubSubConnDown) {
+		t.Errorf("Subscribe whose write found the fd forgotten returned %v, want errPubSubConnDown", err)
+	}
+}
+
+// (j) The loop-side close hook of the new conn fires while the reconnect loop
+// is still handing over (it is releasing the dropped conn): onConnDrop ignores
+// it because a reconnect is running, so the loop must look again once it is
+// done, or the PubSub keeps a dead conn and never reconnects.
+func TestPubSubReconnectRearmsWhenNewConnDiesInHandover929(t *testing.T) {
+	r := newPubsubRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ps, err := r.cl.newPubSub(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	if err := ps.Subscribe(ctx, "news"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the server to see SUBSCRIBE", 5*time.Second, func() bool { return r.log.count("SUBSCRIBE") == 1 })
+	old := ps.connNow()
+	r.gate.armUnreg(old.fd)
+	r.dropServerSide()
+	select {
+	case <-r.gate.unregHit:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reconnect never reached the release of the dropped conn")
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			close(r.gate.unregRelease)
+		}
+	}
+	defer release()
+	nw := ps.connNow()
+	if nw == old || nw == nil {
+		t.Fatal("fixture: ps.conn is not the new conn while the dropped one is released")
+	}
+	waitFor(t, "the server to see the replayed SUBSCRIBE", 5*time.Second, func() bool { return r.log.count("SUBSCRIBE") == 2 })
+	r.dropServerSide() // the new conn dies during the handover
+	waitFor(t, "the new conn to be marked closed", 5*time.Second, nw.closed.Load)
+	time.Sleep(100 * time.Millisecond) // its close hook has run, and was ignored
+	release()
+	waitFor(t, "a second reconnect to replay the subscription", 10*time.Second, func() bool { return r.log.count("SUBSCRIBE") == 3 })
+	if cur := ps.connNow(); cur == nil || cur == nw {
+		t.Errorf("ps.conn = %p after the second reconnect, want a conn other than the dead one %p", cur, nw)
+	}
 }
