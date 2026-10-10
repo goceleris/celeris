@@ -125,10 +125,10 @@ func TestSwitchInsideShutdownSnapshotWindowBuildsNothing877(t *testing.T) {
 
 // TestSwitchAfterShutdownReturnsBuildsNothing877 (window B): a switch that runs
 // after Shutdown has returned, as the eval loop can when the caller's ctx ends
-// before Listen unwinds. The switch must not build a standby, and a standby
-// that a switch did build must not be left unshut.
+// before Listen unwinds. The switch must not build a standby, because nothing
+// would shut that standby down.
 func TestSwitchAfterShutdownReturnsBuildsNothing877(t *testing.T) {
-	e, _, lazy, builds := newShutdownWindowEngine(t, nil)
+	e, _, _, builds := newShutdownWindowEngine(t, nil)
 
 	if err := e.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
@@ -137,9 +137,6 @@ func TestSwitchAfterShutdownReturnsBuildsNothing877(t *testing.T) {
 
 	if got := builds.Load(); got != 0 {
 		t.Errorf("a switch after Shutdown returned built %d standby(s), want 0 (#877)", got)
-	}
-	if shut, _ := lazy.state(); builds.Load() > 0 && shut == 0 {
-		t.Errorf("a standby built after Shutdown returned was never shut down (#877)")
 	}
 }
 
