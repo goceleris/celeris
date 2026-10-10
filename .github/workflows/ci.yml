@@ -160,7 +160,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)|/engine/iouring$')
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
-          go test -race -count=1 -timeout=300s -v $pkgs 2>&1 | tee /tmp/root.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=300s -v $pkgs 2>&1 | tee /tmp/root.log
           # Allowed to skip in this step, each by its full name:
           #   * TestAdaptiveSettledRouteRetime592/iouring/*: the rig needs two io_uring
           #     workers and the runner's 8 MiB funds one; the step "celeris#592
@@ -282,7 +282,7 @@ jobs:
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          go test -race -count=1 -timeout=300s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=300s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
           allowed='TestListenClosesListenSocketsWhenEveryWorkerRingSetupFails|TestListenClosesListenSocketWhenOneWorkerRingSetupFails|TestListenClosesListenSocketRingAndEventfdWhenInitialSubmitFails|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero'
           required='TestListenWithCancelledContextPublishesTheBoundAddress|TestListenRefusesToStartWhenNoWorkerReportsItsAddress'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
@@ -1171,6 +1171,7 @@ jobs:
         shell: bash
         env:
           CELERIS_REQUIRE_UPSWITCH: "1"
+          CELERIS_REQUIRE_DUALSTACK: "1"
         run: |
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
