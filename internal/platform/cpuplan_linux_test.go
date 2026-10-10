@@ -344,10 +344,10 @@ func TestPlanNUMARestrictedShapesBalanceTheLoops(t *testing.T) {
 					delete(count, c)
 				}
 				if len(count) > 0 {
-					t.Errorf("%d workers: plan %v leaves the mask %s", workers, plan, FormatCPUs(tc.allowed))
+					t.Fatalf("%d workers: plan %v leaves the mask %s", workers, plan, FormatCPUs(tc.allowed))
 				}
-				if hi-lo > 1 {
-					t.Errorf("%d workers on %d allowed CPUs: plan %v puts %d loops on one CPU and %d on another",
+				if hi-lo > 1 { // the first worker count that fails is enough
+					t.Fatalf("%d workers on %d allowed CPUs: plan %v puts %d loops on one CPU and %d on another",
 						workers, len(tc.allowed), plan, hi, lo)
 				}
 			}
