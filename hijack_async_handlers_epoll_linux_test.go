@@ -4,6 +4,7 @@ package celeris_test
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -19,8 +20,9 @@ import (
 // handler runs on the event loop, and Hijack there released the connState
 // that drainRead then dereferenced. The first hijack crashed the process.
 func TestHijackWithAsyncHandlersOnEpoll(t *testing.T) {
+	var srv *celeris.Server
 	addr, stopServer := startC714DetachServer(t, func() *celeris.Server {
-		srv := celeris.New(celeris.Config{Engine: celeris.Epoll, Workers: 2, AsyncHandlers: true})
+		srv = celeris.New(celeris.Config{Engine: celeris.Epoll, Workers: 2, AsyncHandlers: true})
 		srv.GET("/hj", func(c *celeris.Context) error {
 			conn, err := c.Hijack()
 			if err != nil {
@@ -46,7 +48,8 @@ func TestHijackWithAsyncHandlersOnEpoll(t *testing.T) {
 		}
 		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
 		if err != nil {
-			return "", err
+			// celeris#936: say from the kernel's side where the request is.
+			return "", fmt.Errorf("%w\n%s", err, c936Report(srv, addr, c, "GET "+path+" unanswered at the 5 s deadline", true))
 		}
 		b, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
