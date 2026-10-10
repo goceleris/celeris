@@ -50,6 +50,13 @@ func TestFileRangeOnEveryEngine435(t *testing.T) {
 		{"resume-after-change-date", "GET", "bytes=1000-", "Tue, 30 Jun 2026 10:00:00 GMT", 200, "", body},
 		{"unsatisfiable", "GET", "bytes=70000-", "", 416, "bytes */65536", nil},
 		{"after-416-same-conn", "GET", "", "", 200, "", body},
+		// celeris#846 item 3: If-Range is checked before the range is parsed,
+		// so a validator that no longer holds on a range that is
+		// unsatisfiable gets the whole file (RFC 9110 13.2.2), not a 416.
+		{"unsatisfiable-if-range-mismatch", "GET", "bytes=70000-", `"v1"`, 200, "", body},
+		{"unsatisfiable-if-range-date-mismatch", "GET", "bytes=70000-", "Tue, 30 Jun 2026 10:00:00 GMT", 200, "", body},
+		{"unsatisfiable-if-range-matches", "GET", "bytes=70000-", etag, 416, "bytes */65536", nil},
+		{"after-if-range-416-same-conn", "GET", "", "", 200, "", body},
 		{"head-ignores-range", "HEAD", "bytes=1000-", "", 200, "", nil},
 		{"last-pos-past-end", "GET", "bytes=65000-99999", "", 206, "bytes 65000-65535/65536", body[65000:]},
 	}
