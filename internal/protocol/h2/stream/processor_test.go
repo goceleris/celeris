@@ -683,6 +683,15 @@ func TestProcessConcurrentStreamsLimit(t *testing.T) {
 	if _, ok := p.manager.GetStream(5); ok {
 		t.Error("the refused stream 5 is in the manager")
 	}
+	fw.mu.Lock()
+	goaways := len(fw.goAwaysSent)
+	fw.mu.Unlock()
+	rw.testResponseWriter.mu.Lock()
+	goaways += len(rw.goAwaysSent)
+	rw.testResponseWriter.mu.Unlock()
+	if goaways != 0 {
+		t.Errorf("%d GOAWAY frames sent for a stream error", goaways)
+	}
 }
 
 func TestProcessHeadersContinuation(t *testing.T) {

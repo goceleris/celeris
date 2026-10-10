@@ -23,8 +23,6 @@ type ContinuationState struct {
 	priority *headerPriority
 }
 
-var headerBlockPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
-
 var headersSlicePoolIn = sync.Pool{New: func() any { s := make([][2]string, 0, 16); return &s }}
 
 // h2WorkerPool is a global goroutine pool for executing H2 stream handlers.
@@ -140,6 +138,7 @@ type Processor struct {
 	connWriter           h2Conn
 	hpackDecoder         *hpack.Decoder
 	hpackTarget          *[][2]string // current HPACK decode target slice (avoids closure alloc per request)
+	refusedFields        [][2]string  // decode target of a refused block (emit is off: nothing is appended); a field, so no allocation per refusal
 	joinCookies          bool         // the block being decoded is a request's: hpackEmit joins its cookie fields (celeris#944)
 	cookieAt             int          // index in *hpackTarget of the block's first cookie field, or -1
 	cookieJoined         bool         // cookieBuf holds the joined value of 2 or more cookie fields
@@ -1171,8 +1170,7 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 // added a field to the dynamic table must add it here too, or the peer's next
 // block references an entry this decoder does not have.
 func (p *Processor) refuseStream(id uint32, block []byte) error {
-	var dropped [][2]string
-	p.beginHeaderDecode(&dropped, false)
+	p.beginHeaderDecode(&p.refusedFields, false)
 	p.hpackDecoder.SetEmitEnabled(false) // decode, build nothing
 	// A block that does not decode is a connection error (COMPRESSION_ERROR).
 	// The GOAWAY names the last stream the server opened, not 0 (RFC 9113
@@ -1673,18 +1671,38 @@ func (p *Processor) handlePing(f *http2.PingFrame) error {
 	return nil
 }
 
-// handleContinuation processes CONTINUATION frames.
+// handleContinuation processes CONTINUATION frames. The fragment is added to
+// the block under continuationStateMu; the lock is released before the
+// finished block is served (serveHeaderBlock), so a handler that runs inline
+// on this goroutine does not run inside the critical section.
 func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationFrame) error {
+	cs, err := p.appendContinuation(f)
+	if err != nil || cs == nil {
+		return err
+	}
+	// The block is complete: it is admitted as a HEADERS frame with
+	// END_HEADERS is (serveHeaderBlock), the stream-ID order, the
+	// MAX_CONCURRENT_STREAMS limit and the stream's state included. The
+	// stream is not created here: GetOrCreateStream checks none of them
+	// (celeris#981). cs is detached: continuationActive is already false, so
+	// canRunInline may pick the event loop, as it does for a plain HEADERS.
+	return p.serveHeaderBlock(f.StreamID, cs.endStream, cs.priority, cs.headerBlock)
+}
+
+// appendContinuation adds a CONTINUATION fragment to the pending header
+// block. It returns the block's state, detached from the processor, when the
+// fragment ended the block (END_HEADERS), nil while more is expected.
+func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*ContinuationState, error) {
 	p.continuationStateMu.Lock()
 	defer p.continuationStateMu.Unlock()
 
 	if p.continuationState == nil || !p.continuationState.expectingMore {
-		return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("unexpected CONTINUATION"),
+		return nil, p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("unexpected CONTINUATION"),
 			fmt.Errorf("unexpected CONTINUATION frame on stream %d", f.StreamID))
 	}
 
 	if p.continuationState.streamID != f.StreamID {
-		return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("CONTINUATION on wrong stream"),
+		return nil, p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("CONTINUATION on wrong stream"),
 			fmt.Errorf("CONTINUATION frame on wrong stream: expected %d, got %d",
 				p.continuationState.streamID, f.StreamID))
 	}
@@ -1702,7 +1720,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 		// The last stream the server opened, not 0: 0 tells the peer that no
 		// stream was processed, and a client retries the ones it has in
 		// flight, a POST with a replayable body among them (RFC 9113 §6.8).
-		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("header block too large"),
+		return nil, p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("header block too large"),
 			fmt.Errorf("header block on stream %d exceeds %d bytes", f.StreamID, p.headerListMax))
 	}
 
@@ -1711,23 +1729,13 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 		f.HeaderBlockFragment()...,
 	)
 
-	if f.HeadersEnded() {
-		// The block is complete: it is admitted as a HEADERS frame with
-		// END_HEADERS is (serveHeaderBlock), the stream-ID order, the
-		// MAX_CONCURRENT_STREAMS limit and the stream's state included. The
-		// stream is not created here: GetOrCreateStream checks none of them
-		// (celeris#981).
-		cs := p.continuationState
-		p.continuationState = nil
-		p.continuationActive.Store(false)
-		if err := p.serveHeaderBlock(f.StreamID, cs.endStream, cs.priority, cs.headerBlock); err != nil {
-			return err
-		}
-		pooled := cs.headerBlock[:0]
-		headerBlockPool.Put(&pooled)
+	if !f.HeadersEnded() {
+		return nil, nil
 	}
-
-	return nil
+	cs := p.continuationState
+	p.continuationState = nil
+	p.continuationActive.Store(false)
+	return cs, nil
 }
 
 // flush flushes the writer if it supports the Flush method.
