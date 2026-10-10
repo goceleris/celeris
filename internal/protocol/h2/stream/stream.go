@@ -769,8 +769,10 @@ func (s *Stream) ForEachHeader(fn func(name, value string)) {
 // SetState sets the stream state and atomically updates the manager's active count.
 func (s *Stream) SetState(state State) {
 	prev := State(s.state.Swap(int32(state)))
-	if s.manager != nil {
-		s.manager.updateActiveCount(prev, state)
+	// One read: a release sets the field to nil, and a second read after the
+	// nil check would then dereference it (celeris#951).
+	if m := s.manager; m != nil {
+		m.updateActiveCount(prev, state)
 	}
 }
 

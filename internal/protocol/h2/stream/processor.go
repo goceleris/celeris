@@ -138,6 +138,10 @@ type Processor struct {
 	connWriter           h2Conn
 	hpackDecoder         *hpack.Decoder
 	hpackTarget          *[][2]string // current HPACK decode target slice (avoids closure alloc per request)
+	joinCookies          bool         // the block being decoded is a request's: hpackEmit joins its cookie fields (celeris#944)
+	cookieAt             int          // index in *hpackTarget of the block's first cookie field, or -1
+	cookieJoined         bool         // cookieBuf holds the joined value of 2 or more cookie fields
+	cookieBuf            []byte       // the joined cookie value, reused
 	continuationState    *ContinuationState
 	continuationStateMu  sync.Mutex
 	continuationActive   atomic.Bool
@@ -254,7 +258,9 @@ type inlineCleanup struct {
 
 // FlushInlineCleanup transitions and removes streams that completed inline
 // during the frame loop but had cleanup deferred (pending outbound data or
-// more frames to process). Called after the frame loop, under H2State.mu.
+// more frames to process), and then returns the streams the pool handlers
+// retired to the stream pool (Manager.retire). Called after the frame loop,
+// under H2State.mu: the one place the loop holds no *Stream.
 func (p *Processor) FlushInlineCleanup() {
 	for _, e := range p.pendingInlineCleanup {
 		// The stream may have been released since, by a RST_STREAM later in
@@ -279,6 +285,10 @@ func (p *Processor) FlushInlineCleanup() {
 		s.Release()
 	}
 	p.pendingInlineCleanup = p.pendingInlineCleanup[:0]
+	// The frame batch is over and the loop holds no stream: the pool
+	// handlers' streams that returned meanwhile go to the stream pool now
+	// (celeris#951).
+	p.manager.drainRetired()
 }
 
 // NewProcessor creates a new stream processor. The conn parameter must
@@ -294,6 +304,7 @@ func NewProcessor(handler Handler, writer FrameWriter, conn h2Conn) *Processor {
 		handler:    handler,
 		writer:     writer,
 		connWriter: conn,
+		cookieAt:   -1,
 	}
 	if r, ok := handler.(AsyncRouteResolver); ok {
 		p.asyncResolver = r
@@ -323,8 +334,56 @@ func (p *Processor) ensureHPACKDecoder() {
 
 // hpackEmit is the persistent HPACK emit callback. It appends decoded headers
 // to the slice pointed to by p.hpackTarget (set before each decode call).
+//
+// In a request's header block the cookie fields are joined into one with
+// "; " (RFC 9113 §8.2.3: a client may split the Cookie header, "to allow for
+// better compression efficiency", and the server must join the fields before
+// it hands them to anything that reads a single HTTP/1.1-style field), as
+// net/http's HTTP/2 server does with strings.Join(cookies, "; "). The first
+// field keeps its place in the list and its value is replaced when the block
+// ends (endHeaderDecode). The pieces are gathered in one buffer, so the work
+// is linear in the block, however many fields it splits the header into: a
+// field as small as one HPACK byte (the static table's cookie entry) must not
+// make joining quadratic (celeris#944).
 func (p *Processor) hpackEmit(hf hpack.HeaderField) {
-	*p.hpackTarget = append(*p.hpackTarget, [2]string{internH2HeaderName(hf.Name), hf.Value})
+	t := p.hpackTarget
+	if p.joinCookies && hf.Name == "cookie" {
+		if p.cookieAt < 0 {
+			p.cookieAt = len(*t)
+		} else {
+			if !p.cookieJoined {
+				p.cookieBuf = append(p.cookieBuf[:0], (*t)[p.cookieAt][1]...)
+				p.cookieJoined = true
+			}
+			p.cookieBuf = append(p.cookieBuf, "; "...)
+			p.cookieBuf = append(p.cookieBuf, hf.Value...)
+			return
+		}
+	}
+	*t = append(*t, [2]string{internH2HeaderName(hf.Name), hf.Value})
+}
+
+// beginHeaderDecode points hpackEmit at target for the header block about to
+// be decoded. requestHeaders says it is a request's header block, whose cookie
+// fields hpackEmit joins; a trailer block is left as the peer sent it.
+func (p *Processor) beginHeaderDecode(target *[][2]string, requestHeaders bool) {
+	p.hpackTarget = target
+	p.joinCookies = requestHeaders
+	p.cookieAt = -1
+	p.cookieJoined = false
+}
+
+// endHeaderDecode finishes a header block hpackEmit decoded: if it carried
+// more than one cookie field, the first one's value becomes the joined value.
+func (p *Processor) endHeaderDecode() {
+	if p.cookieJoined {
+		(*p.hpackTarget)[p.cookieAt][1] = string(p.cookieBuf)
+		p.cookieJoined = false
+		if cap(p.cookieBuf) > 4<<10 {
+			p.cookieBuf = nil // do not pin a large buffer for the connection's life
+		}
+	}
+	p.cookieAt = -1
 }
 
 // GetManager returns the stream manager.
@@ -863,12 +922,16 @@ func (p *Processor) executeHandler(stream *Stream) {
 
 		// Free the MAX_CONCURRENT_STREAMS slot before removal (see
 		// executeHandlerInline): a no-write handler, an error return, or a
-		// half-closed-local stream still counts as active and RemoveStreamFromMap
+		// half-closed-local stream still counts as active and the removal
 		// does not decrement, so transition to Closed here (idempotent for an
 		// already-Closed stream — no double-decrement).
+		//
+		// The stream is not released here: the event loop may be using it,
+		// from a lookup, this very moment. retire takes it out of the map and
+		// leaves its release to the loop (celeris#951), and this goroutine
+		// does not touch it again.
 		stream.SetState(StateClosed)
-		p.manager.RemoveStreamFromMap(stream.ID)
-		stream.Release()
+		p.manager.retire(stream)
 	}()
 
 	stream.SetHandlerStarted()
@@ -987,7 +1050,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				*pooledTrailers = (*pooledTrailers)[:0]
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
-			p.hpackTarget = pooledTrailers
+			p.beginHeaderDecode(pooledTrailers, false)
 			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
@@ -997,6 +1060,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to finalize trailers: %w", err))
 			}
+			p.endHeaderDecode()
 			trailers := *pooledTrailers
 			if err := validateTrailerHeaders(trailers); err != nil {
 				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
@@ -1065,7 +1129,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		*pooledHeadersIn = (*pooledHeadersIn)[:0]
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
-	p.hpackTarget = pooledHeadersIn
+	p.beginHeaderDecode(pooledHeadersIn, true)
 	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
@@ -1075,6 +1139,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
+	p.endHeaderDecode()
 
 	headers := *pooledHeadersIn
 	if err := validateRequestHeaders(headers); err != nil {
@@ -1152,7 +1217,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 				*pooledTrailers = (*pooledTrailers)[:0]
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
-			p.hpackTarget = pooledTrailers
+			p.beginHeaderDecode(pooledTrailers, false)
 			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
@@ -1162,6 +1227,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to finalize trailers: %w", err))
 			}
+			p.endHeaderDecode()
 			trailers := *pooledTrailers
 			if err := validateTrailerHeaders(trailers); err != nil {
 				_ = p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeProtocol)
@@ -1196,7 +1262,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 		*pooledHeadersIn = (*pooledHeadersIn)[:0]
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
-	p.hpackTarget = pooledHeadersIn
+	p.beginHeaderDecode(pooledHeadersIn, true)
 	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
@@ -1206,6 +1272,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
+	p.endHeaderDecode()
 
 	headers := *pooledHeadersIn
 	if err := validateRequestHeaders(headers); err != nil {
@@ -1363,6 +1430,11 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	// A pool handler waiting for this stream's window (celeris#893).
 	p.manager.notifySendWindow()
 
+	// The channel is read before the flush: a flush that finishes the stream
+	// deletes it, which returns it to the stream pool, and the pooled object
+	// is any connection's next stream (celeris#951).
+	windowUpd := stream.ReceivedWindowUpd
+
 	// Flush buffered outbound data now that per-stream window space is
 	// available (clamped + debited against the connection window too).
 	if p.flushStreamOutbound(stream) {
@@ -1375,10 +1447,10 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		p.manager.DeleteStream(f.StreamID)
 	}
 
-	if stream.ReceivedWindowUpd != nil {
+	if windowUpd != nil {
 		select {
 		//nolint:gosec // G115: safe conversion
-		case stream.ReceivedWindowUpd <- int32(f.Increment):
+		case windowUpd <- int32(f.Increment):
 		default:
 		}
 	}
@@ -1617,7 +1689,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 			*pooledHeadersIn = (*pooledHeadersIn)[:0]
 			headersSlicePoolIn.Put(pooledHeadersIn)
 		}()
-		p.hpackTarget = pooledHeadersIn
+		p.beginHeaderDecode(pooledHeadersIn, !p.continuationState.isTrailers)
 
 		p.ensureHPACKDecoder()
 		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
@@ -1632,6 +1704,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 			return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 				fmt.Errorf("failed to finalize headers: %w", err))
 		}
+		p.endHeaderDecode()
 
 		headers := *pooledHeadersIn
 		if p.continuationState.isTrailers {
@@ -1815,6 +1888,11 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 	// A pool handler waiting for this stream's window (celeris#893).
 	p.manager.notifySendWindow()
 
+	// The channel is read before the flush: a flush that finishes the stream
+	// deletes it, which returns it to the stream pool, and the pooled object
+	// is any connection's next stream (celeris#951).
+	windowUpd := stream.ReceivedWindowUpd
+
 	// Flush buffered outbound data now that per-stream window space is
 	// available (clamped + debited against the connection window too).
 	if p.flushStreamOutbound(stream) {
@@ -1827,10 +1905,10 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 		p.manager.DeleteStream(streamID)
 	}
 
-	if stream.ReceivedWindowUpd != nil {
+	if windowUpd != nil {
 		select {
 		//nolint:gosec // G115: safe conversion
-		case stream.ReceivedWindowUpd <- int32(increment):
+		case windowUpd <- int32(increment):
 		default:
 		}
 	}

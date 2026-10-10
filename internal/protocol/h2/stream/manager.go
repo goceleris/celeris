@@ -39,6 +39,16 @@ type Manager struct {
 	sendWindowWaiters atomic.Int32
 	sendWindowMu      sync.Mutex
 	sendWindowCh      chan struct{}
+
+	// retired holds the pool-handler streams whose handler has returned and
+	// which are out of the map, waiting for the event loop to return them to
+	// the stream pool (retire, drainRetired; celeris#951). hasRetired is
+	// retired's non-emptiness, so a frame batch with nothing retired pays one
+	// atomic load. closed (Close) says there is no event loop any more.
+	// retired and closed are guarded by mu.
+	retired    []*Stream
+	hasRetired atomic.Bool
+	closed     bool
 }
 
 // NewManager creates a new stream manager. Auxiliary maps
@@ -266,6 +276,87 @@ func (m *Manager) RemoveStreamFromMap(id uint32) {
 	m.windowUpdateMu.Unlock()
 }
 
+// retire is a pool handler's goroutine giving up its stream when the handler
+// has returned and the response is out of the stream's hands: it ends the
+// stream's use, takes the stream out of the map and queues it for the event
+// loop, which returns it to the stream pool (drainRetired). The goroutine
+// must not touch s after the call.
+//
+// The goroutine does not release the stream itself because the event loop
+// may still hold it. The loop looks a stream up in the map and then keeps
+// using the *Stream (a WINDOW_UPDATE, a SETTINGS flush, a RST_STREAM it
+// sends), and the stream's handler can return at any moment of that. Released
+// then, the object was back in the stream pool, and often another stream's on
+// another connection, while the loop set its state, cancelled its context and
+// credited its window (celeris#951). The rule now: a stream a pool handler
+// runs on is returned to the pool by the event loop, at the end of a frame
+// batch (FlushInlineCleanup), when it holds no stream; by Close; or, when the
+// connection has closed already, here. So every *Stream the loop holds stays
+// the same stream until the loop lets go of it.
+//
+// What must not wait for the loop is done here: the stream's context ends
+// (a derived context, and a handler waiting on Done, wake), and the bytes it
+// still buffers go back to the connection's outbound budget (celeris#893),
+// so the next stream's budget check does not count them.
+//
+// Lock order: s.mu alone (the budget), then m.mu alone, then windowUpdateMu
+// alone. Nothing here nests one in another, so it cannot deadlock with
+// OutboundPending (m.mu, then s.mu) or with Close.
+func (m *Manager) retire(s *Stream) {
+	s.Cancel()
+	s.endCtx()
+	s.mu.Lock()
+	if buf := s.OutboundBuffer; buf != nil {
+		m.refundOutbound(buf.Len())
+		buf.Reset()
+	}
+	id := s.ID
+	s.mu.Unlock()
+
+	m.mu.Lock()
+	if m.streams[id] == s {
+		delete(m.streams, id)
+		m.priorityTree.RemoveStream(id)
+	}
+	closed := m.closed
+	if !closed {
+		m.retired = append(m.retired, s)
+		m.hasRetired.Store(true)
+	}
+	m.mu.Unlock()
+
+	m.windowUpdateMu.Lock()
+	delete(m.pendingStreamUpdates, id)
+	m.windowUpdateMu.Unlock()
+
+	if closed {
+		s.Release() // no event loop is left to hold it
+	}
+}
+
+// drainRetired returns the retired streams to the stream pool. Only the
+// event loop calls it, where it holds no stream: at the end of a frame batch
+// (FlushInlineCleanup). It costs one atomic load when nothing is retired.
+func (m *Manager) drainRetired() {
+	for m.hasRetired.Load() {
+		m.mu.Lock()
+		n := len(m.retired)
+		if n == 0 {
+			m.hasRetired.Store(false)
+			m.mu.Unlock()
+			return
+		}
+		s := m.retired[n-1]
+		m.retired[n-1] = nil
+		m.retired = m.retired[:n-1]
+		if n == 1 {
+			m.hasRetired.Store(false)
+		}
+		m.mu.Unlock()
+		s.Release()
+	}
+}
+
 // StreamCount returns the number of streams in the manager.
 func (m *Manager) StreamCount() int {
 	m.mu.RLock()
@@ -464,7 +555,17 @@ func (m *Manager) Close() {
 			s.Release()
 		}
 	}
+	// The event loop is done with the connection: the streams pool handlers
+	// retired since its last frame batch go to the pool now, and a handler
+	// that returns from here on releases its stream itself (retire).
+	m.closed = true
+	retired := m.retired
+	m.retired = nil
+	m.hasRetired.Store(false)
 	m.mu.Unlock()
+	for _, s := range retired {
+		s.Release()
+	}
 
 	m.windowUpdateMu.Lock()
 	if m.pendingStreamUpdates != nil {
