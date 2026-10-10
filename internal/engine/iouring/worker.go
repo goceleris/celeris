@@ -1326,6 +1326,7 @@ func (w *Worker) run(ctx context.Context) {
 				if now > w.shutdownDrainStart+shutdownSendDrainNanos {
 					w.stopAccepting(ctx)
 					w.refuseRecv = true
+					w.stopDetachedProducers()
 				}
 			}
 		}
@@ -3237,25 +3238,6 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	// Past the first 250 ms of the shutdown's send drain an HTTP/1 conn is
-	// read no more (celeris#806): the drain finishes the responses it has,
-	// and a request taken now could only be answered into a queue that the
-	// drain, which lasts as long as the budget, would never find empty
-	// under steady keep-alive traffic. Epoll's loops have stopped reading
-	// at the cancel. The bytes are dropped with the connection, which
-	// shutdown closes; the recv is not re-armed. HTTP/2 conns are served on
-	// (their peers' WINDOW_UPDATEs are what their responses wait for, and
-	// h2PoolSettled has sent them GOAWAY), as are detached ones (a
-	// WebSocket's middleware owns its input).
-	if w.refuseRecv && (cs.h1State == nil || !cs.h1State.Detached.Load()) &&
-		(!cs.detected || w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
-		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
-			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
-			w.hasBufReturns = true
-		}
-		return
-	}
-
 	cs.lastActivity = now
 	// Data: the conn is serving again, so a hand-off that failed at its dup
 	// may be tried (and its recv reaped) once more (celeris#657).
@@ -3263,6 +3245,25 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// c.Res > 0 here (the c.Res <= 0 cases returned above): bytes received
 	// on this recv CQE, regardless of which buffer they landed in.
 	w.bytesReadBatch += uint64(c.Res)
+
+	// Past the first 250 ms of the shutdown's send drain an HTTP/1 conn is
+	// read no more (celeris#806): the drain finishes the responses it has,
+	// and a request taken now could only be answered into a queue that the
+	// drain, which lasts as long as the budget, would never find empty
+	// under steady keep-alive traffic. Epoll's loops have stopped reading
+	// at the cancel. The bytes are dropped with the connection, which
+	// shutdown closes; the recv is not re-armed. A detached conn is read no
+	// more either (its writes were ended with the gate: stopDetachedProducers).
+	// HTTP/2 conns are served on: they have had GOAWAY since the pool wait,
+	// and what their responses may still wait for was waited for there or
+	// is out of time.
+	if w.refuseRecv && (!cs.detected || w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
+		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+			w.hasBufReturns = true
+		}
+		return
+	}
 
 	// Direct-into-bodyBuf path: the previous recv SQE targeted
 	// H1State.bodyBuf (NextRecvBuf). The CQE's Res applies to bodyBuf,
@@ -6759,6 +6760,57 @@ func connSendPending(cs *connState) bool {
 	return cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 || len(cs.bodyBuf) > 0
 }
 
+// endDetachedWrites ends a detached conn's writes: its recv-end error parked
+// for the close, delivered as closeConn delivers it, under the lock and before
+// OnDetachClose, or the middleware is never told (celeris#867); then
+// detachClosed, after which writeFn no-ops, and OnDetachClose. Called with
+// cs.detachMu held, by shutdown and, early, by stopDetachedProducers.
+// Idempotent: the parked error and OnDetachClose are consumed once.
+func endDetachedWrites(cs *connState) {
+	if err := cs.closeErr; err != nil {
+		cs.closeErr = nil
+		if cs.h1State != nil && cs.h1State.OnError != nil {
+			cs.h1State.OnError(err)
+		}
+	}
+	cs.detachClosed = true
+	// Acquire barrier — see the primary close path: skip OnDetachClose
+	// until the WS upgrade has fully wired the conn (WSReady) to avoid
+	// racing the post-Detach wiring on the async goroutine.
+	if cs.h1State != nil && cs.h1State.WSReady.Load() && cs.h1State.OnDetachClose != nil {
+		cs.h1State.OnDetachClose()
+		cs.h1State.OnDetachClose = nil
+	}
+}
+
+// stopDetachedProducers is the detached half of epoll's shutdown (its phase
+// 1, which runs before its send drain), run by the send drain once it is past
+// its first shutdownSendDrainNanos (celeris#806): a detached conn (Server-Sent
+// Events, a WebSocket) has a goroutine of its own that keeps writing, so,
+// with the drain lasting as long as the budget, a stream that never ends
+// would keep hasPendingSends true for all of it. After this its writes no-op
+// and what is already queued is what the drain finishes. Only conns whose
+// handler has returned and detached (h1State.Detached): an async handler
+// that is still running is answered, up to the budget, as before. TryLock,
+// never Lock, as hasPendingSends: a goroutine parked inside a write must not
+// wedge the loop, and a conn whose lock is busy is tried again on the next
+// pass (it counts as pending until then). Worker thread.
+func (w *Worker) stopDetachedProducers() {
+	for _, fd := range w.liveConns {
+		cs := w.conns[fd]
+		if cs == nil || cs.detachMu == nil || cs.h1State == nil || !cs.h1State.Detached.Load() {
+			continue
+		}
+		if !cs.detachMu.TryLock() {
+			continue
+		}
+		if !cs.detachClosed {
+			endDetachedWrites(cs)
+		}
+		cs.detachMu.Unlock()
+	}
+}
+
 func (w *Worker) shutdown() {
 	// First: close every adoption still queued, and refuse every AdoptConn
 	// from here on. Everything below walks the conn table only, which a
@@ -6798,25 +6850,7 @@ func (w *Worker) shutdown() {
 				cs.asyncInMu.Unlock()
 			}
 			cs.detachMu.Lock()
-			// A recv-end error parked for the close that shutdown is now
-			// finishing in its place (closeOnRecvEnd met a running handler):
-			// delivered here as closeConn delivers it, under the lock and
-			// before OnDetachClose, or the middleware is never told
-			// (celeris#867).
-			if err := cs.closeErr; err != nil {
-				cs.closeErr = nil
-				if cs.h1State != nil && cs.h1State.OnError != nil {
-					cs.h1State.OnError(err)
-				}
-			}
-			cs.detachClosed = true
-			// Acquire barrier — see the primary close path: skip OnDetachClose
-			// until the WS upgrade has fully wired the conn (WSReady) to avoid
-			// racing the post-Detach wiring on the async goroutine.
-			if cs.h1State != nil && cs.h1State.WSReady.Load() && cs.h1State.OnDetachClose != nil {
-				cs.h1State.OnDetachClose()
-				cs.h1State.OnDetachClose = nil
-			}
+			endDetachedWrites(cs)
 			cs.detachMu.Unlock()
 		}
 		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached.Load()

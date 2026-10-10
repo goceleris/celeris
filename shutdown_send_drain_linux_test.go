@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -259,6 +261,106 @@ func TestShutdownSendDrainStopsAccepting806(t *testing.T) {
 			if err := srv.waitShutdown("Shutdown", shutErr, budget+time.Second); err != nil {
 				t.Errorf("%s: %v", e.name, err)
 			}
+		})
+	}
+}
+
+// TestShutdownDetachedPushDoesNotHoldTheDrain806: a detached stream (Server-
+// Sent Events, a WebSocket) has a goroutine of its own that keeps writing. The
+// io_uring send drain lasts as long as the shutdown budget (celeris#806) and
+// runs before the workers close their connections, so, were those goroutines
+// left writing, a stream that never ends would hold the drain, and Start*,
+// for all of it (for ever for a ctx without a deadline and a WriteTimeout of
+// -1). Epoll ends the detached writes at the cancel, before its drain; the
+// io_uring drain does so once it is past its first 250 ms. Eight clients read,
+// paced to 6 MiB/s each, a stream that is given 16 KiB every millisecond (about
+// 15 MiB/s), with a 16 KiB server send buffer: bytes are always queued in the
+// worker, and a backlog of a few MiB per client builds up that the clients
+// take after the drain has ended the writes, in about a second (the pacing is
+// by bytes read, so it does not depend on the host's timer or TCP windows).
+// The shutdown is Shutdown(context.Background()), which has no budget, and the
+// Start call must return in 10 s: a bound the backlog stays well inside, race
+// detector included (it takes about 3 s), and a drain held open by the
+// streams (which ends when they do, which is never) does not. A budget would
+// only move the bound.
+func TestShutdownDetachedPushDoesNotHoldTheDrain806(t *testing.T) {
+	const budget = 20 * time.Second // StartWithContext's, not Shutdown(Background)'s
+	const clients = 8
+	const rate = 6 << 20 // bytes a second each client takes
+	chunk := make([]byte, 16<<10)
+	var e drainEngine806
+	for _, c := range drainEngines806 {
+		if c.name == "io_uring" {
+			e = c
+		}
+	}
+	for _, mode := range []string{"Shutdown-background"} {
+		t.Run(e.name+"/"+mode, func(t *testing.T) {
+			var stopProd atomic.Bool
+			srv := startDrainServer806(t, e, budget, 0, func(c *celeris.Config) { c.SocketSendBuf = 16 << 10 }, func(s *celeris.Server) {
+				s.GET("/push", func(c *celeris.Context) error {
+					done := c.Detach()
+					sw := c.StreamWriter()
+					_ = sw.WriteHeader(http.StatusOK, [][2]string{{"content-type", "application/octet-stream"}})
+					run := func() {
+						defer done()
+						for !stopProd.Load() {
+							if _, err := sw.Write(chunk); err != nil {
+								return
+							}
+							_ = sw.Flush()
+							time.Sleep(time.Millisecond)
+						}
+						_ = sw.Close()
+					}
+					if c.EngineSupportsAsyncDetach() {
+						go run()
+						return nil
+					}
+					run()
+					return nil
+				})
+			})
+			t.Cleanup(func() { stopProd.Store(true) })
+			var stop atomic.Bool
+			var wg sync.WaitGroup
+			t.Cleanup(func() { stop.Store(true); wg.Wait() })
+			for range clients {
+				c, err := net.Dial("tcp", srv.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.WriteString(c, "GET /push HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+					t.Fatal(err)
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer func() { _ = c.Close() }()
+					buf := make([]byte, 64<<10)
+					began := time.Now()
+					var got int64
+					for !stop.Load() {
+						if got >= int64(rate*time.Since(began).Seconds()) {
+							time.Sleep(2 * time.Millisecond) // a client that takes the stream at a finite pace
+							continue
+						}
+						_ = c.SetReadDeadline(time.Now().Add(time.Second))
+						n, err := c.Read(buf)
+						got += int64(n)
+						if err != nil {
+							return
+						}
+					}
+				}()
+			}
+			time.Sleep(300 * time.Millisecond)
+			start := time.Now()
+			shutErr := srv.beginShutdown(mode, budget)
+			if err := srv.waitShutdown(mode, shutErr, 10*time.Second); err != nil {
+				t.Fatalf("%s/%s: %v: the detached streams kept the send drain open", e.name, mode, err)
+			}
+			t.Logf("%s/%s: Start returned %v after the shutdown began", e.name, mode, time.Since(start).Round(time.Millisecond))
 		})
 	}
 }
