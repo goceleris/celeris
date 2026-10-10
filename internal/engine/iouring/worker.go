@@ -595,6 +595,14 @@ type Worker struct {
 	shutdownDrainStart int64
 	draining           bool
 
+	// refuseRecv is true once the send drain is past its first
+	// shutdownSendDrainNanos: handleRecv then reads nothing more from an
+	// HTTP/1 connection (celeris#806). The drain lasts as long as the
+	// budget, and on keep-alive connections whose responses queue in the
+	// worker, new requests would keep the queues from ever emptying.
+	// Worker thread only; read in handleRecv.
+	refuseRecv bool
+
 	// drainBudget points at the engine's record of the budget of the last
 	// Engine.Shutdown call, and h2DrainStart is when the worker, its
 	// context cancelled, began waiting for the HTTP/2 stream handlers on
@@ -1312,6 +1320,7 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				if now > w.shutdownDrainStart+shutdownSendDrainNanos {
 					w.stopAccepting(ctx)
+					w.refuseRecv = true
 				}
 			}
 		}
@@ -3218,6 +3227,25 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		}
 		// Surface read failure to detached middleware before closing.
 		w.closeOnRecvEnd(fd, cs, errIORingRecv(c.Res))
+		return
+	}
+
+	// Past the first 250 ms of the shutdown's send drain an HTTP/1 conn is
+	// read no more (celeris#806): the drain finishes the responses it has,
+	// and a request taken now could only be answered into a queue that the
+	// drain, which lasts as long as the budget, would never find empty
+	// under steady keep-alive traffic. Epoll's loops have stopped reading
+	// at the cancel. The bytes are dropped with the connection, which
+	// shutdown closes; the recv is not re-armed. HTTP/2 conns are served on
+	// (their peers' WINDOW_UPDATEs are what their responses wait for, and
+	// h2PoolSettled has sent them GOAWAY), as are detached ones (a
+	// WebSocket's middleware owns its input).
+	if w.refuseRecv && (cs.h1State == nil || !cs.h1State.Detached.Load()) &&
+		(!cs.detected || w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
+		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+			w.hasBufReturns = true
+		}
 		return
 	}
 
