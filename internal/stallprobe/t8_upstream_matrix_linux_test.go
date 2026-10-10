@@ -126,8 +126,8 @@ func parseKV(line string) map[string]string {
 }
 
 type upBin struct {
-	label, path, goroot string
-	env                 upEnv
+	label, path, goroot, defGODEBUG string
+	env                             upEnv
 }
 
 func TestUpstreamMatrix(t *testing.T) {
@@ -188,13 +188,13 @@ func TestUpstreamMatrix(t *testing.T) {
 		}
 		e := upEnv{tmp: tmp, toolchain: tc}
 		bctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		goVer, se, err := upRun(bctx, srcDir, e.env(), goBin, "env", "GOVERSION") // downloads the toolchain when needed
+		goVer, se, err := upRun(bctx, srcDir, e.env(), goBin, "version") // downloads the toolchain when needed (go env GOVERSION needs go1.17+)
 		if err != nil {
 			cancel()
 			t.Logf("MATRIX_SKIP version=%s reason=%q", v, "toolchain unavailable: "+err.Error()+" "+tail(se, 300))
 			continue
 		}
-		mod := regexp.MustCompile(`^go(\d+\.\d+)`).FindStringSubmatch(strings.TrimSpace(goVer))
+		mod := regexp.MustCompile(`go version go(\d+\.\d+)`).FindStringSubmatch(goVer)
 		if mod == nil {
 			cancel()
 			t.Logf("MATRIX_SKIP version=%s reason=%q", v, "cannot parse GOVERSION "+goVer)
@@ -227,8 +227,17 @@ func TestUpstreamMatrix(t *testing.T) {
 			t.Logf("MATRIX_SKIP version=%s reason=%q", v, "build failed: "+err.Error()+" "+tail(se, 600))
 			continue
 		}
-		t.Logf("MATRIX_FACTS version=%s built with %s (go.mod go %s) GOROOT=%s", v, strings.TrimSpace(goVer), mod[1], goroot)
-		bins = append(bins, upBin{label: v, path: args[2], goroot: goroot, env: e})
+		// the GODEBUG defaults the go.mod go line gave this binary (go1.21+ records them as a build setting)
+		mctx, mcancel := context.WithTimeout(context.Background(), time.Minute)
+		mi, _, _ := upRun(mctx, srcDir, e.env(), goBin, "version", "-m", args[2])
+		mcancel()
+		defGD := regexp.MustCompile(`DefaultGODEBUG=(\S+)`).FindStringSubmatch(mi)
+		dg := ""
+		if defGD != nil {
+			dg = defGD[1]
+		}
+		t.Logf("MATRIX_FACTS version=%s built with %s (go.mod go %s) GOROOT=%s DefaultGODEBUG=%q", v, strings.TrimSpace(goVer), mod[1], goroot, dg)
+		bins = append(bins, upBin{label: v, path: args[2], goroot: goroot, env: e, defGODEBUG: dg})
 	}
 
 	// 3. rep outer, then version, then case: drift in the host never lines up with one case
@@ -261,8 +270,8 @@ func TestUpstreamMatrix(t *testing.T) {
 				case verdict == "":
 					verdict = "ERROR"
 				}
-				extra := fmt.Sprintf("go=%s goarch=%s class=%s hetero=%s cpus=%s gomaxprocs=%s tick_gap_ms=%s default_godebug=%q patch=%q",
-					kv["go"], kv["goarch"], kv["class"], kv["hetero"], kv["cpus"], kv["gomaxprocs"], kv["max_tick_gap_ms"], kv["default_godebug"], patch)
+				extra := fmt.Sprintf("ns_per_iter=%s work_iters=%s go=%s goarch=%s class=%s hetero=%s cpus=%s gomaxprocs=%s tick_gap_ms=%s default_godebug=%q patch=%q",
+					kv["ns_per_iter"], kv["work_iters"], kv["go"], kv["goarch"], kv["class"], kv["hetero"], kv["cpus"], kv["gomaxprocs"], kv["max_tick_gap_ms"], b.defGODEBUG, patch)
 				if verdict == "HANG" || verdict == "ERROR" {
 					extra += fmt.Sprintf(" err=%v stderr=%q", err, tail(se, 400))
 				}

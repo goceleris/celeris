@@ -18,10 +18,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"runtime"
 	"runtime/debug"
-	"runtime/metrics"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -69,26 +69,15 @@ func affinity(cpu int) (set []int) {
 }
 
 func capacity(cpu int) (n int) { // 0 when the kernel does not export cpu_capacity (x86)
-	b, _ := os.ReadFile(fmt.Sprintf("/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu))
+	b, _ := ioutil.ReadFile(fmt.Sprintf("/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu))
 	fmt.Sscan(string(b), &n)
 	return n
 }
 
-func gcCycles() uint64 { // no stop-the-world, unlike ReadMemStats
-	s := []metrics.Sample{{Name: "/gc/cycles/total:gc-cycles"}}
-	metrics.Read(s)
-	return s[0].Value.Uint64()
-}
-
-func defaultGODEBUG() string { // the GODEBUG defaults the go.mod go line implies (go1.21+)
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		for _, kv := range bi.Settings {
-			if kv.Key == "DefaultGODEBUG" {
-				return kv.Value
-			}
-		}
-	}
-	return ""
+func gcCycles() int64 { // takes only the heap lock, no stop-the-world (unlike ReadMemStats)
+	var st debug.GCStats
+	debug.ReadGCStats(&st)
+	return st.NumGC
 }
 
 func main() {
@@ -137,14 +126,21 @@ func main() {
 		}
 	}
 	calib := make(chan float64)
-	go func() { // ns per spin iteration on the fastest core
+	go func() { // ns per spin iteration on the fastest core: best of 5
 		runtime.LockOSThread()
 		affinity(fast)
-		s := time.Now()
-		spin(5000000)
-		calib <- float64(time.Since(s)) / 5e6
+		best := 1e18
+		for i := 0; i < 5; i++ {
+			s := time.Now()
+			atomic.AddUint64(&sink, spin(2000000))
+			if d := float64(time.Since(s)) / 2e6; d < best {
+				best = d
+			}
+		}
+		calib <- best
 	}()
-	workIters := int(20000 / <-calib)
+	nsPerIter := <-calib
+	workIters := int(20000 / nsPerIter)
 	last, maxGap := make([]int64, len(cpus)), make([]int64, len(cpus))
 	ready := make(chan bool, len(cpus))
 	for i, c := range cpus {
@@ -229,8 +225,8 @@ func main() {
 	if float64(worst)/1e6 > *thr {
 		verdict = "STALL"
 	}
-	fmt.Printf("RESULT go=%s goarch=%s class=%s hetero=%v cpus=%s gomaxprocs=%d gogc=%q godebug=%q default_godebug=%q gc_cycles=%d max_gap_ms=%.1f max_tick_gap_ms=%.1f threshold_ms=%g verdict=%s\n",
-		runtime.Version(), runtime.GOARCH, label, hetero, strings.Trim(strings.ReplaceAll(fmt.Sprint(cpus), " ", ","), "[]"), runtime.GOMAXPROCS(0), os.Getenv("GOGC"), os.Getenv("GODEBUG"), defaultGODEBUG(),
+	fmt.Printf("RESULT go=%s goarch=%s class=%s hetero=%v cpus=%s gomaxprocs=%d gogc=%q godebug=%q ns_per_iter=%.3f work_iters=%d gc_cycles=%d max_gap_ms=%.1f max_tick_gap_ms=%.1f threshold_ms=%g verdict=%s\n",
+		runtime.Version(), runtime.GOARCH, label, hetero, strings.Trim(strings.ReplaceAll(fmt.Sprint(cpus), " ", ","), "[]"), runtime.GOMAXPROCS(0), os.Getenv("GOGC"), os.Getenv("GODEBUG"), nsPerIter, workIters,
 		gcN, float64(worst)/1e6, float64(atomic.LoadInt64(&tickMax))/1e6, *thr, verdict)
 	if verdict == "STALL" {
 		os.Exit(1)
