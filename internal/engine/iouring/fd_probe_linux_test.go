@@ -49,5 +49,5 @@ func serverFDFor(local string) int {
 // number freed and given to another socket.
 func namesPeer(fd int, local string) bool {
 	sa, err := unix.Getpeername(fd)
-	return err == nil && sockaddrString(sa) == local
+	return err == nil && sockaddrString(fd, sa) == local
 }

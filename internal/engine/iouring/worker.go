@@ -2388,7 +2388,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 
 	if !isFixedFile {
 		if sa, err := unix.Getpeername(newFD); err == nil {
-			cs.remoteAddr = sockaddrString(sa)
+			cs.remoteAddr = sockaddrString(newFD, sa)
 		}
 	}
 
@@ -7102,52 +7102,13 @@ var (
 )
 
 func boundAddr(fd int) net.Addr {
-	sa, err := unix.Getsockname(fd)
-	if err != nil {
-		return nil
-	}
-	switch v := sa.(type) {
-	case *unix.SockaddrInet4:
-		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port}
-	case *unix.SockaddrInet6:
-		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: fmt.Sprintf("%d", v.ZoneId)}
-	}
-	return nil
+	return bindiag.BoundAddr(fd)
 }
 
-// sockaddrString formats a peer address as "ip:port" (IPv4) or
-// "[ip]:port" (IPv6). It runs on the accept hot path (once per OnConnect),
-// so it avoids the fmt.Sprintf reflection/allocation cost: the IPv4 path
-// builds the dotted-quad + port directly into a stack buffer with
-// strconv.AppendInt and the IPv6 path appends net.IP's canonical form
-// (the one remaining short-lived allocation) without fmt. See v1.5.0
-// review 2.11.
-func sockaddrString(sa unix.Sockaddr) string {
-	switch v := sa.(type) {
-	case *unix.SockaddrInet4:
-		// Max "255.255.255.255:65535" = 21 bytes.
-		var b [21]byte
-		buf := b[:0]
-		buf = strconv.AppendInt(buf, int64(v.Addr[0]), 10)
-		buf = append(buf, '.')
-		buf = strconv.AppendInt(buf, int64(v.Addr[1]), 10)
-		buf = append(buf, '.')
-		buf = strconv.AppendInt(buf, int64(v.Addr[2]), 10)
-		buf = append(buf, '.')
-		buf = strconv.AppendInt(buf, int64(v.Addr[3]), 10)
-		buf = append(buf, ':')
-		buf = strconv.AppendInt(buf, int64(v.Port), 10)
-		return string(buf)
-	case *unix.SockaddrInet6:
-		ip := net.IP(v.Addr[:]).String()
-		buf := make([]byte, 0, len(ip)+8)
-		buf = append(buf, '[')
-		buf = append(buf, ip...)
-		buf = append(buf, ']', ':')
-		buf = strconv.AppendInt(buf, int64(v.Port), 10)
-		return string(buf)
-	}
-	return ""
+// sockaddrString formats a peer address as std does; see bindiag.SockaddrString
+// (celeris#925).
+func sockaddrString(fd int, sa unix.Sockaddr) string {
+	return bindiag.SockaddrString(fd, sa)
 }
 
 func parseAddr(addr string) (unix.Sockaddr, error) {

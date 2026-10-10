@@ -24,7 +24,7 @@ func TestSockaddrString(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := sockaddrString(tt.sa); got != tt.want {
+			if got := sockaddrString(-1, tt.sa); got != tt.want {
 				t.Errorf("sockaddrString = %q, want %q", got, tt.want)
 			}
 		})
@@ -36,6 +36,6 @@ func BenchmarkSockaddrStringIPv4(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = sockaddrString(sa)
+		_ = sockaddrString(-1, sa)
 	}
 }

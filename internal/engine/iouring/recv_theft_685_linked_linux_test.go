@@ -230,7 +230,7 @@ func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, arm str
 	if err != nil {
 		t.Fatalf("getsockname A: %v", err)
 	}
-	aLocal := sockaddrString(aLocalSA)
+	aLocal := sockaddrString(a, aLocalSA)
 	srv := -1
 	for deadline := time.Now().Add(2 * time.Second); srv < 0 && time.Now().Before(deadline); {
 		if srv = serverFDFor(aLocal); srv < 0 {
