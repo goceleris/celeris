@@ -144,11 +144,106 @@ jobs:
       # autobahn-fuzzingclient test under `mage testAutobahn`.
       # The named-test step at the end of this job is what covers the
       # parts of that package which CAN run here.
+      #
+      # celeris#684: the step runs with -v, and a tally fails it on any
+      # `--- SKIP` line (subtests included) that is not in the allow-list below.
+      # Without -v a skip prints nothing and the package still reports `ok`: four
+      # epoll sendfile tests and three of the celeris#592 rig's subtests skipped
+      # on every run for months, and nothing showed it. Every allow-list entry is
+      # a full test or subtest name and says why it may skip here. The tally
+      # also needs the four sendfile tests to run and PASS by name, so a rename
+      # or removal fails it too (a missing test is absent, not a pass).
       - name: Root module — race tests (excluding test/ + internal/adaptive/ + websocket + internal/engine/iouring)
+        shell: bash
         run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)|/engine/iouring$')
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
-          go test -race -count=1 -timeout=300s $pkgs
+          go test -race -count=1 -timeout=300s -v $pkgs 2>&1 | tee /tmp/root.log
+          # Allowed to skip in this step, each by its full name:
+          #   * TestAdaptiveSettledRouteRetime592/iouring/*: the rig needs two io_uring
+          #     workers and the runner's 8 MiB funds one; the step "celeris#592
+          #     settled-route retime rig" below runs them with memlock raised and
+          #     CELERIS_REQUIRE_IOURING_WORKERS=1, where a skip is a failure.
+          #   * TestRouteAdaptive_SettleReopenCost and
+          #     TestWriteBufBackpressureClosesSlowConsumer: opt-in measurements
+          #     (CELERIS_592_COST=1, GOTEST_BACKPRESSURE=1), not checks.
+          #   * the three alloc-count tests in middleware/sse: they skip
+          #     under -race and every step of this job is -race (celeris#684).
+          #   * the two TestPauseAccept...SynackRetriesZero tests in internal/engine/epoll:
+          #     they need net.ipv4.tcp_synack_retries=0 and the runner has 5; the step
+          #     "celeris#662 tcp_synack_retries=0 guard" sets it and forbids the skip.
+          #   * TestProbeNonLinux and TestValidateEngineRequiresLinux: they check
+          #     the behaviour on other operating systems, so they skip on Linux.
+          #   * TestEnableH2UpgradeFalseDisablesUpgradeOnAuto964/std/false-serves-http1:
+          #     the std engine ignores EnableH2Upgrade=&false (celeris#964, open); the
+          #     test skips that one case on every Linux run. Delete this entry with the
+          #     engine fix.
+          # The entries are matched by name, not by package: two of them
+          # (the TestPauseAccept...SynackRetriesZero pair) exist in internal/engine/iouring
+          # too. That is safe only while this step excludes /engine/iouring$ (the
+          # pkgs line above; the step after it runs that package with its own list).
+          # A name added here allows that name in every package this step runs.
+          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux|TestEnableH2UpgradeFalseDisablesUpgradeOnAuto964/std/false-serves-http1'
+          required='TestSendfileEndToEndLargeFile|TestSendfileHEADNoBody|TestSendfileRangeRequest|TestSendfileSubThresholdFallback'
+          want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
+          ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/root.log || true)
+          passed=$(grep -cE "^--- PASS: (${required}) \(" /tmp/root.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/root.log || true)
+          unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/root.log | grep -cvE "^[[:space:]]*--- SKIP: (${allowed}) \(" || true)
+          # A test that starts an io_uring engine skips when the start fails, and at the
+          # runner's 8 MiB memlock a start made while another package's test binary holds
+          # rings fails with ENOMEM although nothing is wrong (the kernel charges ring
+          # memory per UID and gives it back some milliseconds after a ring closes). That
+          # skip comes and goes: the three TestClientDisconnectCancelsStream/default/io_uring
+          # subtests in middleware/sse hit it in one run of six on one head, with the
+          # ctx-only arms of the same test passing in the same run. So a skip outside the
+          # allow-list is not final: its top-level test is run again ALONE, in its own
+          # package, and must RUN and PASS by name with no SKIP line outside the allow-list.
+          # A skip that is permanent (a planted t.Skip, a renamed gate) skips again
+          # alone, and so does a test whose package cannot be found. celeris#888 has the
+          # real fix: the sse and session start helpers should retry ENOMEM, as
+          # startServer761 does, and fail otherwise.
+          retried=0
+          retry_failed=0
+          if [ "$unlisted" -ne 0 ]; then
+            echo "root step: skip lines outside the allow-list, listed with the test's own reason where it gave one:"
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/root.log | grep -vE "^[[:space:]]*--- SKIP: (${allowed}) \(" || true
+            grep -E '_test\.go:[0-9]+: .*(unavailable|not available|cannot allocate)' /tmp/root.log | cut -c1-240 | sort | uniq -c | head -5 || true
+            tops=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/root.log | grep -vE "^[[:space:]]*--- SKIP: (${allowed}) \(" | sed -E 's/^[[:space:]]*--- SKIP: ([^/ ]+).*/\1/' | sort -u)
+            # shellcheck disable=SC2086  # as above: one package per arg
+            pkgdirs=$(go list -f '{{.Dir}}' $pkgs)
+            for top in $tops; do
+              retried=$((retried + 1))
+              found=""
+              n=0
+              for d in $pkgdirs; do
+                if grep -qE "^func ${top}\(" "$d"/*_test.go 2>/dev/null; then found=$d; n=$((n + 1)); fi
+              done
+              if [ "$n" -ne 1 ]; then
+                echo "root step: ${top} is defined in $n of this step's packages (want 1); not re-run"
+                retry_failed=$((retry_failed + 1))
+                continue
+              fi
+              (cd "$found" && go test -race -count=1 -timeout=120s -v -run "^${top}\$" . 2>&1 | tee "/tmp/root-rerun-${top}.log") || true
+              r_ran=$(grep -cE "^=== RUN   ${top}\$" "/tmp/root-rerun-${top}.log" || true)
+              r_pass=$(grep -cE "^--- PASS: ${top} \(" "/tmp/root-rerun-${top}.log" || true)
+              r_skip=$(grep -E '^[[:space:]]*--- SKIP: ' "/tmp/root-rerun-${top}.log" | grep -cvE "^[[:space:]]*--- SKIP: (${allowed}) \(" || true)
+              rel=${found#"$PWD"}
+              rel=${rel#/}
+              echo "root step: ${top} skipped in the full run; run alone in ${rel:-.}: RUN $r_ran PASS $r_pass, SKIP lines outside the allow-list $r_skip (want 1, 1, 0)"
+              if [ "$r_ran" -ne 1 ] || [ "$r_pass" -ne 1 ] || [ "$r_skip" -ne 0 ]; then retry_failed=$((retry_failed + 1)); fi
+            done
+          fi
+          echo "root step: SKIP lines $skipped, not in the allow-list $unlisted (tests re-run alone $retried, not clean $retry_failed); epoll sendfile tests want $want, ran $ran, passed $passed"
+          if [ "$retry_failed" -ne 0 ] || [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ]; then
+            echo "expected every SKIP line outside the allow-list (listed above if any) to come from a test that"
+            echo "runs and PASSES when run alone, and the four epoll sendfile tests to run and PASS --"
+            echo "did a test skip here (a skip is not coverage), or was one renamed, removed or failed?"
+            echo "Add a name to the allow-list only with the reason it may skip on a runner."
+            exit 1
+          fi
       # celeris#662 r6: ./internal/engine/iouring, on its own, at the runner's own 8 MiB
       # memlock, with -v, where no skip goes unseen.
       #
@@ -201,6 +296,41 @@ jobs:
             echo "expected no SKIP line other than the five that other steps enforce (listed above if any),"
             echo "and the two celeris#639 tests to run and PASS -- did a test skip here, or was one renamed,"
             echo "removed or failed?"
+            exit 1
+          fi
+      # celeris#709, #684: the root step above runs the celeris#592 settled-route
+      # retime rig (TestAdaptiveSettledRouteRetime592) at the runner's 8 MiB,
+      # where its three io_uring subtests need two workers, get one, and skip: the
+      # io_uring half never ran in CI. Here the whole rig runs with memlock
+      # raised, as job `adaptive` does for its package, and
+      # CELERIS_REQUIRE_IOURING_WORKERS=1 turns the rig's skip into a failure.
+      # The tally wants exactly one top-level RUN and PASS, each of the six
+      # subtests (both engines, three arms) to PASS by name, and no `--- SKIP`
+      # line of any kind. It does not assert the celeris#593 stall the rig prints
+      # for io_uring (IOURING592 ... stalled_frac): the rig asserts a median
+      # ratio there, as it does for epoll, and tightening that is a separate
+      # decision (celeris#622).
+      - name: celeris#592 settled-route retime rig, both engines (memlock raised, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          top='TestAdaptiveSettledRouteRetime592'
+          arms='(iouring|epoll)/(settled|negctrl_async|negctrl_learning)'
+          go test -race -count=1 -timeout=600s -v -run "^${top}\$" . 2>&1 | tee /tmp/c592.log
+          ran=$(grep -cE "^=== RUN   ${top}\$" /tmp/c592.log || true)
+          passed=$(grep -cE "^--- PASS: ${top} \(" /tmp/c592.log || true)
+          armpass=$(grep -cE "^[[:space:]]+--- PASS: ${top}/${arms} \(" /tmp/c592.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/c592.log || true)
+          echo "celeris#592 rig: top-level RUN $ran PASS $passed (want 1), arm PASS $armpass (want 6), SKIP lines $skipped (want 0)"
+          if [ "$ran" -ne 1 ] || [ "$passed" -ne 1 ] || [ "$armpass" -ne 6 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected $top to run once and PASS, all six arms (iouring and epoll: settled, negctrl_async,"
+            echo "negctrl_learning) to PASS, and no SKIP line -- was the rig renamed or removed, did an arm skip"
+            echo "(a skip is not coverage), or did this runner fund fewer than two io_uring workers?"
             exit 1
           fi
       # celeris#543: a transplant's carried bytes (Carryover.Buffered) must be
@@ -549,13 +679,43 @@ jobs:
             exit 1
           fi
       - name: middleware/compress
-        run: go test -race -count=1 -timeout=120s ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-compress.log
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/mw-compress.log || true)
+          echo "middleware/compress: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/mw-compress.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
         working-directory: middleware/compress
       - name: middleware/metrics
-        run: go test -race -count=1 -timeout=120s ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-metrics.log
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/mw-metrics.log || true)
+          echo "middleware/metrics: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/mw-metrics.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
         working-directory: middleware/metrics
       - name: middleware/otel
-        run: go test -race -count=1 -timeout=120s ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-otel.log
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/mw-otel.log || true)
+          echo "middleware/otel: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/mw-otel.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
         working-directory: middleware/otel
       # celeris#720, #732: Adapt must hand net/http the request headers, and
       # Adapt, adapters.WrapMiddleware and the metrics, otel and logger
@@ -643,7 +803,17 @@ jobs:
             exit 1
           fi
       - name: middleware/protobuf
-        run: go test -race -count=1 -timeout=120s ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-protobuf.log
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/mw-protobuf.log || true)
+          echo "middleware/protobuf: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/mw-protobuf.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
         working-directory: middleware/protobuf
       # celeris#667 / celeris#672: the chanReader regression tests live in
       # ./middleware/websocket, which the root race job above excludes, and
@@ -918,10 +1088,12 @@ jobs:
     runs-on: ubuntu-latest
     # 30, not 20, since celeris#657 PR-3 un-quarantined TestBidirectionalFlapAsync
     # (three promote/revert flaps over 64 loaded keep-alives) into the first step.
-    # The two steps' own `go test -timeout` values are 900s and 300s, so the job
-    # limit stays above their sum and a hung test is still killed by go test,
-    # with its stack, rather than by the runner with nothing.
-    timeout-minutes: 30
+    # The steps' own `go test -timeout` values are 900s, 300s, 300s and 300s: 30
+    # minutes in all. The job limit is 35 so that checkout, setup-go and the
+    # -race builds come out of the five minutes above that sum, and a hung test
+    # is killed by go test, with its stack, rather than by the runner with
+    # nothing. (The adaptive package takes about 4 minutes in practice.)
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -941,19 +1113,14 @@ jobs:
       # CELERIS_REQUIRE_UPSWITCH=1 turns those tests' environment skip into
       # a failure, so this job cannot go green by skipping them.
       #
-      # Quarantined by name, each with its open issue. Delete the entry when
-      # the issue closes: TestRampH1Sync and TestRampH1Async, celeris#708.
-      # The other three up-switch tests keep running.
-      #
-      # The two ramps were quarantined for celeris#657 and celeris#662, both
-      # fixed now: with the two fixes together they PASS locally (m128,
-      # -race, every high phase at epoll=0 of 2048, no read reset), and on
-      # main without the #662 fix they fail with the accept hand-over's read
-      # resets. Neither has passed on a GitHub-hosted runner yet, and the
-      # repository's lift rule is >= 6 GitHub-hosted runs of identical bytes,
-      # all green, which celeris#708 tracks together with the evidence. When
-      # they are lifted, their names go into a PASS tally below so they
-      # cannot go quiet again.
+      # TestRampH1Sync and TestRampH1Async ran quarantined (-skip) for
+      # celeris#657 and celeris#662, both fixed. They are the only coverage at the
+      # scale celeris#662 is about (2048 connections promoted and reverted on a
+      # hosted runner). The lift followed the repository's rule, >= 6
+      # GitHub-hosted runs of identical bytes, all green (celeris#708, which
+      # holds the evidence), and their names are in the PASS tally below -- one
+      # top-level RUN and one PASS each, no SKIP line, and one `ramp complete`
+      # line each -- so they cannot go quiet again.
       #
       # TestBidirectionalFlapAsync was the third entry, quarantined for
       # celeris#657 itself. PR-3 fixes what it was failing on -- at a flap the
@@ -1009,7 +1176,6 @@ jobs:
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=900s -v \
-            -skip '^(TestRampH1Sync|TestRampH1Async)$' \
             ./internal/adaptive/... 2>&1 | tee /tmp/adaptive-race.log
           t4='TestFlapConnsPerRing'
           ran=$(grep -cE "^=== RUN   ${t4}\$" /tmp/adaptive-race.log || true)
@@ -1040,6 +1206,19 @@ jobs:
             echo "(-short skips all nine), or did a cell stop reaching its own measurement?"
             exit 1
           fi
+          ramps='TestRampH1Sync|TestRampH1Async'
+          rwant=$(( $(tr '|' '\n' <<<"$ramps" | wc -l) ))
+          rran=$(grep -cE "^=== RUN   (${ramps})\$" /tmp/adaptive-race.log || true)
+          rpassed=$(grep -cE "^--- PASS: (${ramps}) \(" /tmp/adaptive-race.log || true)
+          rskipped=$(grep -cE "^[[:space:]]*--- SKIP: (${ramps})[ /]" /tmp/adaptive-race.log || true)
+          rdone=$(grep -cE '\[async=(true|false)\] ramp complete: ok=[0-9]+ err=[0-9]+ ' /tmp/adaptive-race.log || true)
+          echo "celeris#708 ramps: want $rwant, ran $rran, passed $rpassed, SKIP lines $rskipped, ramp complete lines $rdone"
+          if [ "$rran" -ne "$rwant" ] || [ "$rpassed" -ne "$rwant" ] || [ "$rskipped" -ne 0 ] || [ "$rdone" -ne "$rwant" ]; then
+            echo "expected exactly $rwant ramp tests (2048 connections promoted and reverted) to run and PASS with no"
+            echo "SKIP line and one 'ramp complete' line each -- were they quarantined again (-skip), renamed or"
+            echo "removed, or did one skip (-short skips both)? a skip is not coverage."
+            exit 1
+          fi
           guarded='TestSwitchKeepsHandshakedIdleConnections|TestSwitchKeepsHandshakedIdleConnectionsOnRevert|TestAdaptiveListenersKeepDeferAcceptAcrossSwitches|TestPerformSwitchDoesNotBlockOnLinger|TestFlapWithinLingerKeepsListeners|TestLingerTransplantConserves|TestAdaptiveSwitchVsAcceptChurn|TestAdaptiveSwitchVsAcceptChurnDefaultLinger|TestSwitchAbortedByADriverDrainsTheFreshStandby'
           gwant=$(( $(tr '|' '\n' <<<"$guarded" | wc -l) ))
           gran=$(grep -cE "^=== RUN   (${guarded})\$" /tmp/adaptive-race.log || true)
@@ -1049,6 +1228,23 @@ jobs:
           if [ "$gran" -ne "$gwant" ] || [ "$gpassed" -ne "$gwant" ] || [ "$gskipped" -ne 0 ]; then
             echo "expected exactly $gwant celeris#662 adaptive tests to run and PASS with no SKIP line --"
             echo "were they renamed or removed, or did one skip? a skip is not coverage."
+            exit 1
+          fi
+          rest='TestAdaptiveProviderAutoFreeze|TestAdaptiveUnfreezeRespectsDriverFDs|TestAdaptiveStackedFreezes|TestAdaptiveConcurrentDriverChurnVsSwitch|TestAdaptiveSwitchAfterDriverQuiescence|TestAdaptiveSwitchesWithPreBoundListener|TestReverseTransplantAsync|TestRampH2CPriorKnowledge|TestRampAutoMixedH1H2|TestRampAutoMixedAsync|TestPromotionUnderLoadAttributesEveryError|TestRevertChargesItsAcceptTeardownToTheStandby'
+          owant=$(( $(tr '|' '\n' <<<"$rest" | wc -l) ))
+          oran=$(grep -cE "^=== RUN   (${rest})\$" /tmp/adaptive-race.log || true)
+          opassed=$(grep -cE "^--- PASS: (${rest}) \(" /tmp/adaptive-race.log || true)
+          allskipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/adaptive-race.log || true)
+          # Every top-level adaptive test that skips when io_uring is unavailable (36 of them, measured
+          # under docker's default seccomp profile, which refuses io_uring_setup) is in a tally of
+          # its own, in the unit job's celeris#905 step, or in the list above. The check below also
+          # forbids a SKIP line anywhere in this step, so a new test cannot skip quietly either.
+          echo "celeris#684 other adaptive tests that skip when io_uring is unavailable: want $owant, ran $oran, passed $opassed; SKIP lines in the whole step $allskipped (want 0)"
+          if [ "$oran" -ne "$owant" ] || [ "$opassed" -ne "$owant" ] || [ "$allskipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/adaptive-race.log || true
+            echo "expected the $owant tests the named tallies above do not cover to run and PASS, and no SKIP line anywhere"
+            echo "in this step (memlock is raised and the runner has io_uring, so every test here can run) -- did one"
+            echo "skip, or was one renamed or removed? a skip is not coverage."
             exit 1
           fi
       # celeris#791 through the adaptive engine: a handler panic on the start
@@ -1644,8 +1840,20 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.2"
+      # A skip here is a hole in the matrix, not coverage (celeris#684): the
+      # step fails on any `--- SKIP` line (the matrix skips nothing today).
       - name: Conformance matrix (engines × protocols)
-        run: go test -v -race -count=1 -timeout=120s ./test/conformance/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -v -race -count=1 -timeout=120s ./test/conformance/... 2>&1 | tee /tmp/conformance.log
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/conformance.log || true)
+          echo "Conformance matrix: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/conformance.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
 
   driver-conformance:
     name: Driver Conformance (Postgres + Redis)
@@ -1684,21 +1892,59 @@ jobs:
         with:
           go-version: "1.27.2"
       - name: Postgres conformance
-        run: >-
-          go test -tags postgres -race -count=1 -timeout=300s
-          ./test/conformance/postgres/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags postgres -race -count=1 -timeout=300s -v ./test/conformance/postgres/... 2>&1 | tee /tmp/drv-pg.log
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/drv-pg.log || true)
+          echo "Postgres conformance: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pg.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
+      # The three TestAuth_Password* tests need CELERIS_REDIS_PASSWORD and the redis
+      # service above has no password, so they skip on every run (celeris#684). A
+      # password-protected service is a separate change; until it lands they are the
+      # only skips this step may print.
       - name: Redis conformance
-        run: >-
-          go test -tags redis -race -count=1 -timeout=300s
-          ./test/conformance/redis/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags redis -race -count=1 -timeout=300s -v ./test/conformance/redis/... 2>&1 | tee /tmp/drv-redis.log
+          allowed='TestAuth_PasswordSuccess|TestAuth_PasswordFailure|TestAuth_ForceRESP2WithPassword'
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/drv-redis.log || true)
+          unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-redis.log | grep -cvE "^[[:space:]]*--- SKIP: (${allowed}) \(" || true)
+          echo "Redis conformance: SKIP lines $skipped, not in the allow-list $unlisted (want 0)"
+          if [ "$unlisted" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-redis.log | grep -vE "^[[:space:]]*--- SKIP: (${allowed}) \(" || true
+            echo "expected no SKIP line outside the allow-list -- a skip is not coverage"
+            exit 1
+          fi
       - name: Postgres session store integration
-        run: >-
-          go test -tags integration -race -count=1 -timeout=120s
-          ./middleware/session/postgresstore/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags integration -race -count=1 -timeout=120s -v ./middleware/session/postgresstore/... 2>&1 | tee /tmp/drv-pgstore.log
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/drv-pgstore.log || true)
+          echo "Postgres session store integration: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pgstore.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
       - name: Redis session store integration
-        run: >-
-          go test -tags integration -race -count=1 -timeout=120s
-          ./middleware/session/redisstore/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags integration -race -count=1 -timeout=120s -v ./middleware/session/redisstore/... 2>&1 | tee /tmp/drv-redisstore.log
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/drv-redisstore.log || true)
+          echo "Redis session store integration: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-redisstore.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
 
   build:
     name: Build (${{ matrix.os }})
