@@ -3,6 +3,7 @@ package stream
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,12 @@ const (
 	// (TryBufferOutbound): it all goes through the write queue, behind its
 	// HEADERS.
 	flagBudgetPool uint32 = 1 << 3
+	// flagDetached marks a use that Context.Detach handed to a goroutine which
+	// can outlive the handler. The stream is reset when its use ends but is not
+	// returned to the pool: the Context (a detached one is never reset or
+	// pooled by the router) keeps pointing at the object, and a pooled object
+	// is the next request's, on any connection (celeris#904).
+	flagDetached uint32 = 1 << 4
 )
 
 // Stream represents an HTTP/2 stream with its associated state and data.
@@ -79,14 +86,29 @@ type Stream struct {
 	// from the engine's worker-local clock cache so HandleStream avoids a
 	// per-request time.Now() vDSO call. Zero means "unset, fall back to
 	// time.Now()" (synthetic / std-engine path).
-	StartTimeNs            int64
-	manager                *Manager
-	Headers                [][2]string
-	Trailers               [][2]string
-	Data                   *bytes.Buffer
-	rawBody                []byte // zero-copy body slice (preferred over Data when set)
-	OutboundBuffer         *bytes.Buffer
-	OutboundEndStream      bool
+	StartTimeNs       int64
+	manager           *Manager
+	Headers           [][2]string
+	Trailers          [][2]string
+	Data              *bytes.Buffer
+	rawBody           []byte // zero-copy body slice (preferred over Data when set)
+	OutboundBuffer    *bytes.Buffer
+	OutboundEndStream bool
+	// outboundAbandoned is set when an inline handler returned with DATA
+	// still buffered and without ending the response (a StreamWriter never
+	// closed). The buffer is still sent as the peer grants window, but
+	// without END_STREAM, and the stream is released when it is out
+	// (FlushOutbound's finished), so the stream does not hold its
+	// MAX_CONCURRENT_STREAMS slot and its budget until the connection closes.
+	// Guarded by mu.
+	outboundAbandoned bool
+	// gen counts the ends of this stream object's uses: it moves on when the
+	// handler of a use returns (EndUse) and again when the object is reset for
+	// the pool. A StreamWriter takes it when it is made (Gen) and presents it
+	// with every call (UseStreamer), so a call from a goroutine that outlived
+	// its handler is refused instead of landing on whatever the object is
+	// used for next, on any connection (celeris#904).
+	gen                    atomic.Uint64
 	headersSent            atomic.Bool
 	EndStream              bool
 	IsStreaming            bool
@@ -217,6 +239,11 @@ func NewStream(id uint32) *Stream {
 	if s.ctx.Load() != nil {
 		s.endCtx()
 	}
+	if s.OutboundBuffer != nil { // never set by a reset; see resetAndPool
+		s.OutboundBuffer.Reset()
+		bufferPool.Put(s.OutboundBuffer)
+		s.OutboundBuffer = nil
+	}
 	s.ID = id
 	s.state.Store(int32(StateIdle))
 	s.windowSize.Store(65535)
@@ -332,6 +359,74 @@ func (s *Stream) HasDoneCh() bool {
 	return c != nil && c.done.Load() != nil
 }
 
+// ErrStreamEnded is what a StreamWriter call returns when the stream's use is
+// over: its handler returned (on HTTP/2 the stream ends then, detached or not;
+// see Context.Detach) or the stream was released (celeris#904).
+var ErrStreamEnded = errors.New("h2: the response stream has ended (the handler returned)")
+
+// Gen returns the stream's use token: the value a StreamWriter presents with
+// its calls (UseStreamer) to prove they belong to the use that made it.
+func (s *Stream) Gen() uint64 { return s.gen.Load() }
+
+// EndUse ends the use of s that its handler served: every call that presents
+// an earlier Gen is refused from now on (ErrStreamEnded). The HTTP/2 processor
+// calls it when the handler returns, before it decides whether the stream
+// stays for a buffered response, so a goroutine the handler started cannot
+// add to what the stream keeps. Not for HTTP/1, where Detach keeps the
+// stream for the detached goroutines.
+func (s *Stream) EndUse() { s.gen.Add(1) }
+
+// MarkDetached records that Context.Detach gave this use to a goroutine that
+// may outlive the handler. When the use ends the stream is reset but not
+// pooled, so a call the Context makes later (c.Header, c.NoContent, c.Hijack,
+// a WebSocket hook) reads or acts on an object no other request can have, not
+// on another connection's stream. The cost is the stream's allocation, once per
+// detached request (celeris#904).
+func (s *Stream) MarkDetached() { s.flags.Or(flagDetached) }
+
+// UseResponseWriter returns the stream's ResponseWriter if gen is still the
+// stream's use, and false once that use is over. The read is ordered against
+// the release's reset (which clears the field under s.mu), so it is race-free
+// even when the use ends while it runs. Context.StreamWriter takes a detached
+// Context's writer through it (celeris#904).
+func (s *Stream) UseResponseWriter(gen uint64) (ResponseWriter, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.gen.Load() != gen {
+		return nil, false
+	}
+	return s.ResponseWriter, true
+}
+
+// useErr reports why a call that presents gen must be refused, or nil. The
+// caller holds s.mu (either mode), which resetAndPool takes to write.
+func (s *Stream) useErr(gen uint64) error {
+	if s.gen.Load() != gen {
+		return ErrStreamEnded
+	}
+	if s.IsCancelled() {
+		return context.Canceled // the peer reset the stream, or its connection closed
+	}
+	return nil
+}
+
+// UseLock takes s.mu for reading if gen is still the stream's use, and
+// returns nil: the use cannot end, nor the object be reset, until UseUnlock.
+// Otherwise it returns why the call is refused (ErrStreamEnded, or the
+// context error of a cancelled stream) and holds nothing. Keep it short:
+// the release of the stream waits for it.
+func (s *Stream) UseLock(gen uint64) error {
+	s.mu.RLock()
+	if err := s.useErr(gen); err != nil {
+		s.mu.RUnlock()
+		return err
+	}
+	return nil
+}
+
+// UseUnlock releases what a successful UseLock holds.
+func (s *Stream) UseUnlock() { s.mu.RUnlock() }
+
 // Release returns pooled buffers, cancels the context, and returns the stream
 // to its pool. Call it once per use: it is not idempotent. A second Release
 // puts the object in the pool a second time, and two later streams, on any
@@ -353,7 +448,31 @@ func ResetForPool(s *Stream) {
 	s.resetAndPool()
 }
 
+// resetAndPool ends a use of s and returns it to the pool. The reset runs
+// under s.mu, the lock every call of a StreamWriter that outlived its handler
+// takes (StreamWrite, EndOutbound, FlushOutbound, UseLock), and moves
+// gen, so such a call either finishes before the reset or sees that its use
+// is over and is refused (celeris#904). Without it a late Write buffered its
+// bytes in the object's OutboundBuffer after the reset, and the next use of
+// the object, on any connection, sent them to its own client.
+//
+// s.mu is a leaf for this: nothing here takes another lock (endCtx runs
+// first, outside it), and none of the callers of Release or ResetForPool hold
+// s.mu.
 func (s *Stream) resetAndPool() {
+	s.endCtx()
+	s.mu.Lock()
+	s.gen.Add(1)
+	keep := s.flags.Load()&flagDetached != 0 // read before the reset clears the flags
+	s.resetLocked()
+	s.mu.Unlock()
+	if keep {
+		return // a detached Context may still point at s: never hand it to another request
+	}
+	streamPool.Put(s)
+}
+
+func (s *Stream) resetLocked() {
 	if s.Data != nil {
 		s.Data.Reset()
 		bufferPool.Put(s.Data)
@@ -379,6 +498,7 @@ func (s *Stream) resetAndPool() {
 	clear(s.Trailers)
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
+	s.outboundAbandoned = false
 	s.headersSent.Store(false)
 	s.EndStream = false
 	s.IsStreaming = false
@@ -393,7 +513,6 @@ func (s *Stream) resetAndPool() {
 	s.IsHEAD = false
 	s.h1Mode = false
 	s.protoMajor = 0
-	s.endCtx()
 	s.flags.Store(0)
 	s.phase = 0
 	s.CachedCtx = nil
@@ -425,7 +544,6 @@ func (s *Stream) resetAndPool() {
 		}
 		s.ReceivedWindowUpd = nil
 	}
-	streamPool.Put(s)
 }
 
 // ResetH1Stream performs a lightweight per-request reset for H1 stream reuse.

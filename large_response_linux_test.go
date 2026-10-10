@@ -331,7 +331,6 @@ func TestPipelinedResponsesKeepTheirOrder(t *testing.T) {
 	for _, e := range engines761 {
 		for _, sh := range shapes {
 			t.Run(e.name+"/"+sh.name, func(t *testing.T) {
-				skipIouringAsyncPipelined751(t, e.eng, sh.asyncRoute)
 				addr := startServer761(t, e.eng, sh.asyncServer, func(s *celeris.Server) {
 					big := s.GET("/big", func(c *celeris.Context) error {
 						n, _ := strconv.Atoi(c.Query("n"))
@@ -397,7 +396,6 @@ func TestBackloggedPeerIsClosed(t *testing.T) {
 	for _, e := range engines761 {
 		for _, sh := range shapes {
 			t.Run(e.name+"/"+sh.name, func(t *testing.T) {
-				skipIouringAsyncPipelined751(t, e.eng, sh.asyncRoute)
 				addr := startServer761(t, e.eng, sh.asyncServer, func(s *celeris.Server) {
 					r := s.GET("/big", func(c *celeris.Context) error {
 						return c.Blob(http.StatusOK, "application/octet-stream", body)
@@ -489,19 +487,6 @@ func TestStreamedResponseIsDelivered(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-// skipIouringAsyncPipelined751 skips a pipelined case on io_uring with an
-// async route: the dispatch goroutine's direct write can go out while a ring
-// SEND of the connection's earlier bytes is still in flight, so pipelined
-// responses interleave (celeris#751, open PR #800), which these tests would
-// report as a wrong or out-of-order body. That route writes no zero-copy
-// body, so it is outside what these tests pin. Remove with #800.
-func skipIouringAsyncPipelined751(t *testing.T, eng celeris.EngineType, asyncRoute bool) {
-	t.Helper()
-	if eng == celeris.IOUring && asyncRoute {
-		t.Skip("celeris#751 (PR #800): an io_uring async handler's direct write can overtake a ring SEND of the conn's earlier bytes")
 	}
 }
 

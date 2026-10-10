@@ -100,7 +100,7 @@ func TestPromotionUnderLoadAttributesEveryError(t *testing.T) {
 	}
 
 	e.UnfreezeSwitching()
-	e.ForceSwitch() // epoll -> io_uring, the promotion #645 measured
+	forceSwitchTo(t, e, engine.IOUring) // epoll -> io_uring, the promotion #645 measured
 	time.Sleep(1500 * time.Millisecond)
 
 	after := e.Metrics()
@@ -146,11 +146,11 @@ func TestRevertChargesItsAcceptTeardownToTheStandby(t *testing.T) {
 	e, _, stop := newBoundAdaptiveH(t, respHandler{}, false)
 	defer stop()
 
-	e.ForceSwitch() // epoll -> io_uring: builds and starts the standby
+	forceSwitchTo(t, e, engine.IOUring) // epoll -> io_uring: builds and starts the standby
 	time.Sleep(300 * time.Millisecond)
 
 	before := e.Metrics()
-	e.ForceSwitch() // io_uring -> epoll: PAUSES io_uring, which is the cost
+	forceSwitchTo(t, e, engine.Epoll) // io_uring -> epoll: PAUSES io_uring, which is the cost
 	time.Sleep(500 * time.Millisecond)
 	after := e.Metrics()
 

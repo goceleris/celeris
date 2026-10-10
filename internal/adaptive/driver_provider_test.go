@@ -36,7 +36,7 @@ func newBoundAdaptive(t *testing.T) (*Engine, func()) {
 	// fail the first switch when the io_uring standby cannot be built. Skip up
 	// front when io_uring is genuinely unavailable.
 	if !probe.Probe().IOUringTier.Available() {
-		t.Skip("io_uring unavailable: switch test needs both sub-engines")
+		skipOrFailUpswitch662(t, "io_uring unavailable: switch test needs both sub-engines")
 	}
 	cfg := resource.Config{
 		Addr:     "127.0.0.1:0",
@@ -44,7 +44,7 @@ func newBoundAdaptive(t *testing.T) (*Engine, func()) {
 	}
 	e, err := New(cfg, noopHandler{}, nil)
 	if err != nil {
-		t.Skipf("adaptive.New unsupported here: %v", err)
+		skipOrFailUpswitch662(t, "adaptive.New unsupported here: %v", err)
 	}
 	// Ensure switching is possible (cooldown off).
 	e.ctrl.cooldown = 0
@@ -140,10 +140,7 @@ func TestAdaptiveProviderAutoFreeze(t *testing.T) {
 	}
 
 	// Now a switch should go through.
-	e.ForceSwitch()
-	if e.ActiveEngine().Type() == beforeActive {
-		t.Errorf("ForceSwitch after unregister should swap engines; still %s", beforeActive)
-	}
+	forceSwitchTo(t, e, otherEngine(beforeActive))
 }
 
 // TestAdaptiveUnfreezeRespectsDriverFDs asserts that an overzealous caller
@@ -377,8 +374,5 @@ func TestAdaptiveSwitchAfterDriverQuiescence(t *testing.T) {
 		t.Fatalf("UnregisterConn: %v", err)
 	}
 
-	e.ForceSwitch()
-	if e.ActiveEngine().Type() == beforeActive {
-		t.Fatalf("switch didn't run after unregister; still on %s", beforeActive)
-	}
+	forceSwitchTo(t, e, otherEngine(beforeActive))
 }

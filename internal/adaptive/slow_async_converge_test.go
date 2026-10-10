@@ -86,7 +86,7 @@ func TestSlowAsyncHandlerConverges(t *testing.T) {
 		pm.Workers, ok1000, errCount.Load(), cycleUs)
 
 	t0 := time.Now()
-	e.ForceSwitch() // epoll -> io_uring: the outgoing (standby) engine is epoll
+	forceSwitchTo(t, e, engine.IOUring) // epoll -> io_uring: the outgoing (standby) engine is epoll
 	took := time.Since(t0)
 
 	convergedMs := int64(-1)
