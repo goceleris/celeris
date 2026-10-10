@@ -4177,8 +4177,9 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 		//
 		// EOPNOTSUPP (celeris#988) is the odd one out: io_send_zc returns it
 		// before it sends a byte when the socket lacks SOCK_SUPPORT_ZC
-		// (an AF_UNIX socket, or a TCP conn accepted through an MPTCP
-		// listener's plain-TCP fallback), with F_MORE and a NOTIF because the
+		// (an AF_UNIX socket, or a connection accepted on an MPTCP listener,
+		// which lacks the bit whether the client spoke MPTCP or fell back to
+		// plain TCP), with F_MORE and a NOTIF because the
 		// notification was allocated at prep. That is one socket's property,
 		// not the kernel's or the worker's: only this conn stops using ZC
 		// (noSendZC) and the worker's other conns keep it. Nothing was sent, so

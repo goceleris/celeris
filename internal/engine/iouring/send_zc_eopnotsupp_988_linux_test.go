@@ -52,7 +52,8 @@ func reap988(t *testing.T, r *Ring, d time.Duration) []completionEntry {
 // TestSendZCNonZCSocketShape988 characterises the kernel, so the tests below
 // can be trusted to model it: SEND_ZC on a socket without SOCK_SUPPORT_ZC
 // completes res=-EOPNOTSUPP with F_MORE, then a NOTIF. It passes on any kernel
-// that has the opcode and skips on one that does not.
+// that has the opcode and rejects SEND_ZC on AF_UNIX; it skips on a kernel
+// without the opcode, and on one that accepts SEND_ZC on AF_UNIX.
 func TestSendZCNonZCSocketShape988(t *testing.T) {
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -69,7 +70,10 @@ func TestSendZCNonZCSocketShape988(t *testing.T) {
 	if len(got) >= 1 && got[0].Res == -int32(unix.EINVAL) {
 		t.Skip("kernel has no SEND_ZC")
 	}
-	if len(got) != 2 || got[0].Res != -int32(unix.EOPNOTSUPP) || got[0].Flags&cqeFMore == 0 || got[1].Flags&cqeFNotif == 0 {
+	if len(got) >= 1 && got[0].Res != -int32(unix.EOPNOTSUPP) {
+		t.Skip("this kernel supports SEND_ZC on AF_UNIX; the non-ZC socket shape needs another socket type")
+	}
+	if len(got) != 2 || got[0].Flags&cqeFMore == 0 || got[1].Flags&cqeFNotif == 0 {
 		t.Fatalf("want [res=-95 F_MORE, F_NOTIF], got %+v", got)
 	}
 }

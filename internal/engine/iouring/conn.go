@@ -147,9 +147,12 @@ type connState struct {
 	// on this conn is a plain SEND from then on. The kernel returns that
 	// before sending a byte when the socket's struct socket lacks
 	// SOCK_SUPPORT_ZC (io_uring/net.c io_send_zc): an AF_UNIX socket, or a
-	// TCP conn accepted through an MPTCP listener's plain-TCP fallback, which
-	// is what Go's net.Listen hands AdoptConn by default since Go 1.24
-	// (celeris#988). A property of ONE socket, so it lives on the conn: the
+	// connection accepted on an MPTCP listener, which lacks the bit whether
+	// the client spoke MPTCP or fell back to plain TCP (__inet_accept copies
+	// the bit from the listening socket) (celeris#988). In-tree AdoptConn
+	// callers adopt from engine-created proto-0 sockets, so this describes
+	// the test fixture and out-of-tree callers, not the production accept
+	// path. A property of ONE socket, so it lives on the conn: the
 	// worker-wide w.sendZC (retireSendZC) describes the kernel and the memlock
 	// limit and would switch ZC off for every other conn of the worker.
 	// Worker-thread-only; cleared by releaseConnState.
