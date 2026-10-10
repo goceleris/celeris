@@ -93,6 +93,9 @@ type rawH2c949 struct {
 
 func (r *rawH2c949) readLoop() {
 	rfr := http2.NewFramer(io.Discard, r.conn)
+	// A Framer is not safe for concurrent use: the SETTINGS acks are written
+	// with a Framer of this goroutine's own, as the test writes with r.fr.
+	afr := http2.NewFramer(r.conn, nil)
 	dec := hpack.NewDecoder(4096, nil)
 	for {
 		f, err := rfr.ReadFrame()
@@ -102,7 +105,7 @@ func (r *rawH2c949) readLoop() {
 		switch f := f.(type) {
 		case *http2.SettingsFrame:
 			if !f.IsAck() {
-				_ = r.fr.WriteSettingsAck()
+				_ = afr.WriteSettingsAck()
 			}
 		case *http2.HeadersFrame:
 			if f.StreamID != 1 {
