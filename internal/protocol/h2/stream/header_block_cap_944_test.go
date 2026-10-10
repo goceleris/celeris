@@ -199,8 +199,9 @@ func TestFieldEncodingNeverExceedsTheBlockCap944(t *testing.T) {
 }
 
 // TestHeaderBlockFloodStaysBoundedByTheCap944: the flood is still refused,
-// at the CONTINUATION frame that crosses the cap, and the cap is what the
-// constant says: headerBlockExpansion times the bound.
+// at the CONTINUATION frame that crosses the cap, and the server keeps at most
+// 4 times the bound of the block (a peer that never ends a block does not
+// make it hold more).
 func TestHeaderBlockFloodStaysBoundedByTheCap944(t *testing.T) {
 	p := newProc944()
 	if err := feed944(t, p, "raw", 1, true, encodeHeaders(t, reqHeaders944())); err != nil || p.runs.Load() != 1 {
@@ -237,8 +238,10 @@ func TestHeaderBlockFloodStaysBoundedByTheCap944(t *testing.T) {
 	if perr == nil {
 		t.Fatal("the flood was accepted")
 	}
-	if kept > headerBlockExpansion*maxHeaderListSize {
-		t.Errorf("the server kept %d bytes of the block, above the cap %d", kept, headerBlockExpansion*maxHeaderListSize)
+	// 4 x the bound, written out: the most a list within the bound needs
+	// (TestFieldEncodingNeverExceedsTheBlockCap944), and no more is kept.
+	if kept > 4*maxHeaderListSize {
+		t.Errorf("the server kept %d bytes of the block, above 4 x the bound (%d)", kept, 4*maxHeaderListSize)
 	}
 	if p.IsExpectingContinuation() {
 		t.Error("the processor still expects CONTINUATION frames")
