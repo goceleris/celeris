@@ -169,6 +169,10 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 		indexInfo, indexErr := os.Stat(indexPath)
 		if indexErr == nil && !indexInfo.IsDir() {
 			filePath = filepath.Join(filePath, index)
+			// fullPath follows the file served: its pre-compressed variant is
+			// "<dir>/index.html.gz", never "<dir>.gz" (a sibling) or, for the
+			// root itself, "<root>.gz" (a file outside the root).
+			fullPath = indexPath
 			info = indexInfo
 		} else if browse {
 			// Resolve symlinks and recheck to prevent symlink escape,
@@ -230,8 +234,17 @@ var serveOSHook func()
 // carries the file, not on a 304; File drops it again from a 416.
 func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding, cacheControl string, early os.FileInfo) error {
 	if c.Header("if-none-match") != "" || c.Header("if-modified-since") != "" {
-		etag := setCacheHeaders(c, early.ModTime(), early.Size(), cacheControl)
+		// Nothing goes on the response until the 304 is decided: early is a
+		// stat, which follows a symlink out of the root before FileFromDir
+		// refuses it, and a refused path must not leave its target's tag and
+		// date on the error. A request that does not hold gets its validators
+		// from the open file below.
+		var etag string
+		if !early.ModTime().IsZero() {
+			etag = weakETag(early.ModTime(), early.Size())
+		}
 		if notModified(c, etag, early.ModTime()) {
+			setCacheHeaders(c, early.ModTime(), early.Size(), cacheControl)
 			return c.NoContent(304)
 		}
 	}
@@ -573,6 +586,20 @@ func sniffContentType(rs io.ReadSeeker, filePath string) string {
 	return ct
 }
 
+// weakETag is the ETag static builds for a file from its mtime and size, W/"mtime-size"
+// (hex). It is built without fmt to avoid per-request fmt.Sprintf overhead
+// (formatter-scanner + arg boxing). int64 hex is <=16 chars per field, plus
+// W/"...-..." framing = 37 max; 64 is a safe margin.
+func weakETag(modTime time.Time, size int64) string {
+	var etagBuf [64]byte
+	dst := append(etagBuf[:0], 'W', '/', '"')
+	dst = strconv.AppendInt(dst, modTime.Unix(), 16)
+	dst = append(dst, '-')
+	dst = strconv.AppendInt(dst, size, 16)
+	dst = append(dst, '"')
+	return string(dst)
+}
+
 // setCacheHeaders sets Last-Modified, ETag, and Cache-Control headers from
 // file metadata. Returns the computed ETag string for reuse by notModified.
 //
@@ -586,16 +613,7 @@ func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, cacheCon
 		return ""
 	}
 	c.SetHeader("last-modified", modTime.UTC().Format(http.TimeFormat))
-	// ETag is built without fmt to avoid per-request fmt.Sprintf overhead
-	// (formatter-scanner + arg boxing). int64 hex is ≤16 chars per field,
-	// plus W/"…-…" framing = 37 max; 64 is a safe margin.
-	var etagBuf [64]byte
-	dst := append(etagBuf[:0], 'W', '/', '"')
-	dst = strconv.AppendInt(dst, modTime.Unix(), 16)
-	dst = append(dst, '-')
-	dst = strconv.AppendInt(dst, size, 16)
-	dst = append(dst, '"')
-	etag := string(dst)
+	etag := weakETag(modTime, size)
 	c.SetHeader("etag", etag)
 	if cacheControl != "" {
 		c.SetHeader("cache-control", cacheControl)

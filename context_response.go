@@ -940,12 +940,12 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 	}
 	size := stat.Size()
 
-	if onOpen != nil {
-		onOpen(stat.ModTime(), size)
-	}
-
 	if size > int64(maxStreamBodySize) {
 		return NewHTTPError(413, "file exceeds 100MB limit")
+	}
+
+	if onOpen != nil {
+		onOpen(stat.ModTime(), size)
 	}
 
 	if contentType == "" {
@@ -1143,7 +1143,12 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 func (c *Context) delRespHeader(key string) {
 	for i, h := range c.respHeaders {
 		if h[0] == key {
-			c.respHeaders = append(c.respHeaders[:i], c.respHeaders[i+1:]...)
+			last := len(c.respHeaders) - 1
+			copy(c.respHeaders[i:], c.respHeaders[i+1:])
+			// The slot past the new end is cleared, so reset (which clears up to
+			// len) leaves no stale header pointing into a request buffer.
+			c.respHeaders[last] = [2]string{}
+			c.respHeaders = c.respHeaders[:last]
 			return
 		}
 	}
