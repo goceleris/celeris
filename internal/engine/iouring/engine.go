@@ -352,7 +352,10 @@ func (e *Engine) Listen(ctx context.Context) error {
 		resolved.Workers = capped
 	}
 
-	cpus := platform.DistributeWorkers(resolved.Workers, e.profile.NumCPU, e.profile.NUMANodes)
+	// celeris#909: the CPU of worker i is the i-th member of the process's
+	// allowed set, and on a big.LITTLE host never a little CPU.
+	plan := planWorkerCPUs(resolved.Workers)
+	cpus := plan.CPUs
 
 	// Probe for the highest working tier by test-creating a ring.
 	tier := e.tier
@@ -391,6 +394,10 @@ func (e *Engine) Listen(ctx context.Context) error {
 		}()
 	}
 
+	// A start that fails drops the failures its workers recorded; the engine
+	// that serves takes them below.
+	defer func() { _ = takePinFailures(workers) }()
+
 	// Wait for all workers to finish ring initialization (done inside run()
 	// after LockOSThread, required by SINGLE_ISSUER).
 	for _, w := range workers {
@@ -401,6 +408,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 			return initErr
 		}
 	}
+	// Every worker has pinned (or failed to) before it reported ready.
+	platform.LogPinOutcome(e.cfg.Logger, "io_uring", plan, takePinFailures(workers))
 
 	// celeris#639: publish an address a worker recorded before it signalled
 	// ready, never getsockname on a listenFD the worker may have closed since,

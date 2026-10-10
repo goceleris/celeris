@@ -135,36 +135,31 @@ func TestResumeAfterChangeFS435(t *testing.T) {
 	}
 }
 
-// TestIfRangeWeakETag435: static's ETag is weak (mtime-size), and If-Range
-// uses the strong comparison, under which a weak tag never matches: the whole
-// file is sent even though nothing changed (a client must not send a weak
-// tag in If-Range at all, §13.1.5).
+// TestIfRangeWeakETag435: the Root path's ETag is weak (mtime-size), and
+// If-Range uses the strong comparison, under which a weak tag never matches:
+// the whole file is sent even though nothing changed (a client must not send
+// a weak tag in If-Range at all, §13.1.5). The fs.FS path's ETag is strong
+// since celeris#846 (fs_strong_etag_846_test.go).
 func TestIfRangeWeakETag435(t *testing.T) {
 	v1 := version435(16, 0)
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "dl.bin"), v1, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for name, mw := range map[string]celeris.HandlerFunc{
-		"os": New(Config{Root: dir}),
-		"fs": New(Config{FS: fstest.MapFS{"dl.bin": {Data: v1, ModTime: v1Time435}}}),
-	} {
-		t.Run(name, func(t *testing.T) {
-			rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/dl.bin")
-			testutil.AssertNoError(t, err)
-			etag := rec.Header("etag")
-			if len(etag) < 3 || etag[:2] != "W/" {
-				t.Fatalf("static etag %q: this test assumes a weak tag", etag)
-			}
-			rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/dl.bin",
-				celeristest.WithHeader("range", "bytes=8-"), celeristest.WithHeader("if-range", etag))
-			testutil.AssertNoError(t, err)
-			testutil.AssertStatus(t, rec, 200)
-			testutil.AssertNoHeader(t, rec, "content-range")
-			if !bytes.Equal(rec.Body, v1) {
-				t.Fatalf("body %q, want the whole file", rec.Body)
-			}
-		})
+	mw := New(Config{Root: dir})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/dl.bin")
+	testutil.AssertNoError(t, err)
+	etag := rec.Header("etag")
+	if len(etag) < 3 || etag[:2] != "W/" {
+		t.Fatalf("static etag %q: this test assumes a weak tag", etag)
+	}
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/dl.bin",
+		celeristest.WithHeader("range", "bytes=8-"), celeristest.WithHeader("if-range", etag))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	testutil.AssertNoHeader(t, rec, "content-range")
+	if !bytes.Equal(rec.Body, v1) {
+		t.Fatalf("body %q, want the whole file", rec.Body)
 	}
 }
 
@@ -217,6 +212,51 @@ func TestUnsatisfiableRange435(t *testing.T) {
 				celeristest.WithHeader("if-none-match", etag), celeristest.WithHeader("range", "bytes=100-"))
 			testutil.AssertNoError(t, err)
 			testutil.AssertStatus(t, rec, 304)
+		})
+	}
+}
+
+// TestIfRangeMismatchOnUnsatisfiableRange435 (celeris#846 item 3): If-Range
+// is checked before the range is parsed, so a range that is unsatisfiable on
+// the current file but sent with a validator that no longer holds gets the
+// whole file as a 200 (RFC 9110 §13.2.2), not a 416. With the validator that
+// holds it is the 416.
+func TestIfRangeMismatchOnUnsatisfiableRange435(t *testing.T) {
+	v1 := version435(16, 0)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "dl.bin")
+	if err := os.WriteFile(p, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(p, v1Time435, v1Time435); err != nil {
+		t.Fatal(err)
+	}
+	current := v1Time435.Format(http.TimeFormat)
+	stale := v2Time435.Add(-24 * time.Hour).Format(http.TimeFormat)
+	if current == stale {
+		t.Fatal("fixture: the stale date equals the current one")
+	}
+	for name, mw := range map[string]celeris.HandlerFunc{
+		"os": New(Config{Root: dir}),
+		"fs": New(Config{FS: fstest.MapFS{"dl.bin": {Data: v1, ModTime: v1Time435}}}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, rng := range []string{"bytes=16-", "bytes=100-200", "bytes=-0"} {
+				rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/dl.bin",
+					celeristest.WithHeader("range", rng), celeristest.WithHeader("if-range", stale))
+				testutil.AssertNoError(t, err)
+				if rec.StatusCode != 200 || rec.Header("content-range") != "" || !bytes.Equal(rec.Body, v1) {
+					t.Fatalf("%s with a stale If-Range: status %d content-range %q (%d bytes); want 200 with the whole file",
+						rng, rec.StatusCode, rec.Header("content-range"), len(rec.Body))
+				}
+				rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/dl.bin",
+					celeristest.WithHeader("range", rng), celeristest.WithHeader("if-range", current))
+				testutil.AssertNoError(t, err)
+				if rec.StatusCode != 416 || rec.Header("content-range") != "bytes */16" || len(rec.Body) != 0 {
+					t.Fatalf("%s with the current If-Range: status %d content-range %q (%d bytes); want 416 %q, empty",
+						rng, rec.StatusCode, rec.Header("content-range"), len(rec.Body), "bytes */16")
+				}
+			}
 		})
 	}
 }

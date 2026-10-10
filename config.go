@@ -100,7 +100,14 @@ type Config struct {
 	//
 	// The std engine wires this to http.Server.ReadHeaderTimeout; the
 	// iouring/epoll engines enforce the same budget inside their H1
-	// header read loop.
+	// header read loop. On the io_uring engine it also counts from accept
+	// for a connection whose protocol is not detected yet (Protocol Auto, or
+	// H2C with EnableH2Upgrade): a client that sends nothing, a few bytes of
+	// a request line, or a dribble of the HTTP/2 preface is closed at the
+	// deadline, and the header read then gets a fresh budget once the
+	// protocol is known, so a slow client can hold a connection for up to
+	// twice this value before its first request is complete. The epoll
+	// engine does not yet bound that first phase.
 	ReadHeaderTimeout time.Duration
 	// WriteTimeout is the max duration for writing the response.
 	// Zero uses the default (60s). Set to -1 for no timeout.
@@ -199,6 +206,25 @@ type Config struct {
 	// workloads; enable it for any workload that touches a DB, cache, or
 	// upstream service.
 	//
+	// A handler that runs inline runs on a thread the native engines (epoll,
+	// io_uring) pinned to one CPU, and a process it starts inherits that pin:
+	// os/exec clones the calling thread, the kernel copies its CPU mask into
+	// the child, and the mask survives execve and passes to the child's own
+	// children. A handler that shells out to ffmpeg, git or an image converter
+	// would run it on a single CPU. Go has no per-process CPU field in
+	// os/exec's SysProcAttr, so celeris cannot undo it inside the call. Start
+	// such a process from a goroutine of its own and wait for it, or mark the
+	// route [Route.Async] (or its group, [RouteGroup.Async]): a goroutine
+	// never runs on the locked loop thread, so its children get the process's
+	// mask, and an Async route's handler runs on one. Setting AsyncHandlers
+	// is not enough: a route that only inherits it runs inline, on the loop
+	// thread, until a timed run of it blocks, and returns to inline when the
+	// promotion expires. A thread that cgo code called from an inline handler
+	// creates (pthread_create) inherits the pin the same way. Threads Go
+	// starts itself do not. On a host whose CPUs differ in capacity (arm64 big.LITTLE) the
+	// loops that did not get a big CPU run unpinned and have nothing to pass
+	// on (README, "CPU pinning").
+	//
 	// AsyncHandlers is the SERVER-LEVEL default. Individual routes and
 	// groups can override it per handler with [Route.Async] /
 	// [RouteGroup.Async] (most-specific wins: route > group > this
@@ -277,10 +303,12 @@ type Config struct {
 	//     proxies): a request carrying Upgrade: h2c is then served as
 	//     plain HTTP/1.1. Prior-knowledge h2c on Auto is not affected.
 	//
-	// Engine: Std does not yet honour non-nil false on Auto: it still
-	// answers an Upgrade: h2c request with 101 (celeris#964). Std is the
-	// only engine on non-Linux platforms and the default there. Epoll,
-	// IOUring and Adaptive honour it.
+	// Engine: all four engines honour non-nil false on Auto. Std (the only
+	// engine on non-Linux platforms and the default there) differs from
+	// Epoll, IOUring and Adaptive on two other combinations (celeris#889):
+	// on Protocol=H2C it answers an Upgrade: h2c request with 101 for nil
+	// and false as well as true, where the others upgrade only for true; on
+	// Protocol=HTTP1 it never upgrades, true included, where the others do.
 	EnableH2Upgrade *bool
 }
 

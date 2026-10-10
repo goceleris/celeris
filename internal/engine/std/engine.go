@@ -136,6 +136,18 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		// covers it.
 		h2s = &http2.Server{MaxConcurrentStreams: cfg.MaxConcurrentStreams, MaxReadFrameSize: cfg.MaxFrameSize} //nolint:staticcheck // SA1019: the type h2cHandler serves with; see the import comment.
 		httpHandler = &h2cHandler{next: bridge, h2s: h2s}
+		// Auto with the upgrade disabled (Config.EnableH2Upgrade = &false,
+		// celeris#964): keep prior-knowledge h2c, which is not the
+		// handshake, and serve a request that asks for the RFC 7540 3.2
+		// upgrade as the plain HTTP/1.1 request it also is, as epoll,
+		// io_uring and adaptive do. cfg.EnableH2Upgrade is true for every
+		// Auto listener that did not turn it off (WithDefaults), so only an
+		// explicit false lands here. H2C is left as it was: the resolved
+		// flag is false there for nil and for &false alike, and std
+		// upgrades on H2C (TestStdEngineAnswersH2CUpgradeWith101).
+		if cfg.Protocol == engine.Auto && !cfg.EnableH2Upgrade {
+			httpHandler = &h2cNoUpgradeHandler{h2c: httpHandler, plain: bridge}
+		}
 	}
 
 	e.server = &http.Server{
@@ -168,6 +180,23 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	}
 
 	return e, nil
+}
+
+// h2cNoUpgradeHandler is the std handler for Protocol Auto with the h2c
+// upgrade disabled: a request that asks for the RFC 7540 3.2 upgrade goes
+// straight to the plain handler, with its headers untouched, and everything
+// else (prior-knowledge h2c, HTTP/1.1) goes through the h2c front end.
+type h2cNoUpgradeHandler struct {
+	h2c   http.Handler
+	plain http.Handler
+}
+
+func (h *h2cNoUpgradeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isH2CUpgrade(r.Header) {
+		h.plain.ServeHTTP(w, r)
+		return
+	}
+	h.h2c.ServeHTTP(w, r)
 }
 
 // stdTimeout translates celeris's internal "disabled" encoding into the value
