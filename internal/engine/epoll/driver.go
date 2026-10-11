@@ -61,9 +61,9 @@ type driverConn struct {
 	// readQueued is set while dc is in the loop's driverReadQ, and readEvents
 	// holds the teardown flags (EPOLLRDHUP, EPOLLHUP, EPOLLERR) of the events
 	// whose turn it is owed. readErr is the error of a flush that failed while
-	// the conn was owed a turn: the close waits for the bytes in the socket,
-	// with that error as its cause (readEvents then holds EPOLLERR). Loop
-	// thread only (celeris#930).
+	// the conn was owed a turn: the close waits for the bytes in the socket
+	// like the flags do, with that error as its cause. Loop thread only
+	// (celeris#930).
 	readQueued bool
 	readEvents uint32
 	readErr    error
@@ -451,7 +451,7 @@ func (l *Loop) handleDriverEvent(dc *driverConn, events uint32) {
 				if more || dc.readQueued {
 					// The bytes the read turn left in the socket come first, as
 					// they did when the one event read them before it flushed.
-					dc.readEvents |= events&closeFlags | unix.EPOLLERR
+					dc.readEvents |= events & closeFlags
 					dc.readErr = err
 					if !dc.readQueued {
 						l.queueDriverRead(dc)
@@ -503,7 +503,7 @@ func (l *Loop) serveDriverReadQ(owed int) {
 		if l.driverRead(dc) {
 			dc.readEvents, dc.readErr = flags, cause
 			l.queueDriverRead(dc)
-		} else if flags != 0 {
+		} else if flags != 0 || cause != nil {
 			l.closeDriver(dc, cause)
 		}
 	}
