@@ -136,32 +136,38 @@ import (
 //   - shutdownDrainGaveUp: worker shutdowns whose drain ended with an op still
 //     owed (its bound ran out or the ring failed), so descriptors were closed
 //     under it (celeris#873). Must stay 0.
+//   - shutdownListenCancelGaveUp: worker shutdowns that closed their listen
+//     socket with the accept armed on it not yet ended (the cancel could not
+//     be queued, was refused, or its completion did not come within the
+//     drain's bound), so the port stayed bound until the ring's teardown
+//     (celeris#896). Must stay 0.
 //   - shutdownSendDrainGaveUp: worker shutdowns whose send drain ended at its
 //     bound with response bytes still unsent, so connections were closed on
 //     them (celeris#806). A rate: it needs a client that does not read.
 type handoffLossStats struct {
-	staleRecvDataClosed       atomic.Uint64
-	staleRecvDataTransplanted atomic.Uint64
-	staleRecvDataUnattributed atomic.Uint64
-	handoffInFlight           atomic.Uint64
-	held                      atomic.Uint64
-	reaps                     atomic.Uint64
-	reapMisses                atomic.Uint64
-	holdRescued               atomic.Uint64
-	doubleClaim               atomic.Uint64
-	claimDeferred             atomic.Uint64
-	reapFailed                atomic.Uint64
-	reapUnsupported           atomic.Uint64
-	closeFDDeferred           atomic.Uint64
-	closeFDForced             atomic.Uint64
-	closeCancelMissedHeld     atomic.Uint64
-	zcNotifHeld               atomic.Uint64
-	zcNotifForced             atomic.Uint64
-	zcBufRetained             atomic.Uint64
-	shutdownDrainGaveUp       atomic.Uint64
-	shutdownSendDrainGaveUp   atomic.Uint64
-	zcHeldNow                 atomic.Int64
-	zcHeldBytes               atomic.Int64
+	staleRecvDataClosed        atomic.Uint64
+	staleRecvDataTransplanted  atomic.Uint64
+	staleRecvDataUnattributed  atomic.Uint64
+	handoffInFlight            atomic.Uint64
+	held                       atomic.Uint64
+	reaps                      atomic.Uint64
+	reapMisses                 atomic.Uint64
+	holdRescued                atomic.Uint64
+	doubleClaim                atomic.Uint64
+	claimDeferred              atomic.Uint64
+	reapFailed                 atomic.Uint64
+	reapUnsupported            atomic.Uint64
+	closeFDDeferred            atomic.Uint64
+	closeFDForced              atomic.Uint64
+	closeCancelMissedHeld      atomic.Uint64
+	zcNotifHeld                atomic.Uint64
+	zcNotifForced              atomic.Uint64
+	zcBufRetained              atomic.Uint64
+	shutdownDrainGaveUp        atomic.Uint64
+	shutdownListenCancelGaveUp atomic.Uint64
+	shutdownSendDrainGaveUp    atomic.Uint64
+	zcHeldNow                  atomic.Int64
+	zcHeldBytes                atomic.Int64
 }
 
 func (s *handoffLossStats) noteCloseFDForced() {
@@ -189,6 +195,16 @@ func (s *handoffLossStats) noteCloseCancelMissedHeld() {
 func (s *handoffLossStats) noteShutdownDrainGaveUp() {
 	if s != nil {
 		s.shutdownDrainGaveUp.Add(1)
+	}
+}
+
+// noteShutdownListenCancelGaveUp counts a worker shutdown that closed its
+// listen socket with the accept armed on it not yet ended (celeris#896). Once
+// per worker shutdown. Must stay 0 on a healthy kernel. Not an EngineMetrics
+// field: the WARN is the signal.
+func (s *handoffLossStats) noteShutdownListenCancelGaveUp() {
+	if s != nil {
+		s.shutdownListenCancelGaveUp.Add(1)
 	}
 }
 

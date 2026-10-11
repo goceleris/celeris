@@ -3,6 +3,8 @@
 package iouring
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -640,7 +642,18 @@ func (w *Worker) endOwedOpsAtShutdown() {
 		r := zcSeen[cs]
 		return fdOpsSeen(cs, r.first, r.notif) > 0
 	}
-	pending := func() bool {
+	// celeris#896: the accept armed on the listen socket is one more op the
+	// kernel owes, and the one that decides when the port comes free. It
+	// holds a reference to the socket's file, so shutdown's close of the
+	// descriptor leaves the socket bound, and in the LISTEN state, until the
+	// kernel drops that reference; with nothing ending the accept before the
+	// ring is closed that is the ring's teardown, which runs after close(2)
+	// of the ring has returned, ~2 ms later. So the accept is cancelled here,
+	// with the rest, and the drain runs until its terminal CQE: the accept
+	// has then let go of the file, and shutdown's close of the descriptor is
+	// the last reference, released before close(2) returns.
+	acceptOwed := w.queueListenAcceptCancel()
+	connsPending := func() bool {
 		for _, cs := range owed {
 			if named(cs) {
 				return true
@@ -653,6 +666,7 @@ func (w *Worker) endOwedOpsAtShutdown() {
 		}
 		return false
 	}
+	pending := func() bool { return acceptOwed || connsPending() }
 	var ringErr error
 	if w.ring != nil && !w.sqpoll && pending() {
 		for _, cs := range owed {
@@ -705,12 +719,36 @@ func (w *Worker) endOwedOpsAtShutdown() {
 					if c.Res >= 0 && !w.fixedFiles {
 						_ = unix.Close(int(c.Res))
 					}
+					// No more completions from this accept: it is over, and
+					// has let go of the listen socket's file. A multishot
+					// accept says so by clearing F_MORE (the cancel's
+					// -ECANCELED, or an error that ended it); a single-shot
+					// one always does, and is not re-armed in shutdown.
+					if !cqeHasMore(c.Flags) {
+						acceptOwed = false
+					}
+				case 0:
+					// The cancel's own CQE, which only a failure posts
+					// (CQE_SKIP_SUCCESS). -ENOENT: no accept is armed on the
+					// socket, so none holds it. -EALREADY: the accept is
+					// being completed; its CQE follows. Anything else:
+					// the cancel did not take, so the wait cannot be
+					// answered and is not made.
+					if acceptOwed && c.UserData == 0 && c.Res != -int32(unix.EALREADY) {
+						acceptOwed = false
+						if c.Res != -int32(unix.ENOENT) {
+							w.noteListenCancelGaveUp(fmt.Errorf("cancel of the accept: %w", unix.Errno(-c.Res)))
+						}
+					}
 				}
 			}
 			w.ring.EndCQ(head)
 		}
-		if pending() {
+		if connsPending() {
 			w.noteShutdownDrainGaveUp(owed, ringErr)
+		}
+		if acceptOwed {
+			w.noteListenCancelGaveUp(ringErr)
 		}
 	}
 	for i := range w.pendingRelease {
@@ -720,6 +758,49 @@ func (w *Worker) endOwedOpsAtShutdown() {
 		}
 	}
 	w.closeFDOwed = 0
+}
+
+// queueListenAcceptCancel places, in the SQ ring and without entering it, the
+// cancel of every op armed on the listen socket, and reports whether the
+// caller should wait for the accept to end (celeris#896). False, with nothing
+// placed: the worker has no listen socket (a pause or a stopAccepting closed
+// it, and cancelled the accept first), no ring or an SQPOLL ring (the drain
+// is not run there), or the SQ ring has no room, which is counted and logged
+// as a give-up like a wait that runs out: the close that follows then leaves
+// the socket to the ring's teardown, as every shutdown used to. Worker
+// thread only.
+func (w *Worker) queueListenAcceptCancel() bool {
+	if w.ring == nil || w.sqpoll || w.listenFD < 0 {
+		return false
+	}
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		w.noteListenCancelGaveUp(errors.New("the SQ ring is full"))
+		return false
+	}
+	prepCancelFDSkipSuccess(sqe, w.listenFD)
+	setSQEUserData(sqe, 0)
+	return true
+}
+
+// noteListenCancelGaveUp records that worker shutdown could not wait for the
+// accept on its listen socket to end (queueListenAcceptCancel, the drain in
+// endOwedOpsAtShutdown): the socket is then closed with the accept still
+// holding it, and stays bound until the ring's teardown, so a Listen that
+// returns can still see its port taken (celeris#896). Counted once per worker
+// shutdown and logged; must stay 0 on a healthy kernel. Not an EngineMetrics
+// field: the WARN is the signal.
+func (w *Worker) noteListenCancelGaveUp(reason error) {
+	w.handoffLoss.noteShutdownListenCancelGaveUp()
+	if w.logger == nil {
+		return
+	}
+	attrs := []any{"worker", w.id, "bound", time.Duration(shutdownFDDrainNanos)}
+	if reason != nil {
+		attrs = append(attrs, "err", reason)
+	}
+	w.logger.Warn("io_uring shutdown: the accept on the listen socket did not end before the socket was closed; "+
+		"the port may stay bound for a few ms after Listen returns", attrs...)
 }
 
 // noteShutdownDrainGaveUp records that endOwedOpsAtShutdown ended with ops

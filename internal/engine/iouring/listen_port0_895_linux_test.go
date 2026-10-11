@@ -110,6 +110,18 @@ func portOf895(t *testing.T, a net.Addr) int {
 	return p
 }
 
+// needWorkers895 skips the test (fails it under CELERIS_REQUIRE_IOURING_WORKERS=1)
+// when RLIMIT_MEMLOCK funds fewer than need io_uring workers. A test with
+// subtests calls it before the first t.Run: the CI step that runs this package
+// at 8 MiB allows a skipped top-level test by name and cannot allow a subtest.
+func needWorkers895(t *testing.T, need int) {
+	t.Helper()
+	if maxW := MaxWorkersForMemlock(); maxW >= 0 && maxW < need {
+		skipOrFail656(t, "RLIMIT_MEMLOCK funds %d io_uring workers, the test needs %d "+
+			"(raise it: `ulimit -l unlimited`, or run as root)", maxW, need)
+	}
+}
+
 type run895 struct {
 	e      *Engine
 	cancel context.CancelFunc
@@ -123,10 +135,7 @@ type run895 struct {
 // (ring_budget_linux_test.go). disableDefer makes a pause close at once.
 func start895(t *testing.T, addr string, workers, need int, disableDefer bool) *run895 {
 	t.Helper()
-	if maxW := MaxWorkersForMemlock(); maxW >= 0 && maxW < need {
-		skipOrFail656(t, "RLIMIT_MEMLOCK funds %d io_uring workers, the test needs %d "+
-			"(raise it: `ulimit -l unlimited`, or run as root)", maxW, need)
-	}
+	needWorkers895(t, need)
 	var run *run895
 	_, _, err := retryRingENOMEM(func() error {
 		e, err := New(resource.Config{
@@ -193,6 +202,7 @@ func get895(t *testing.T, addr string) int {
 // engine listens on one port, the one Addr() reports, with one socket per
 // worker; and a request to that port is served.
 func TestPort0EveryWorkerBindsTheSamePort895(t *testing.T) {
+	needWorkers895(t, 4)
 	for _, tc := range []struct{ name, addr string }{
 		{"loopback", "127.0.0.1:0"},
 		{"wildcard-empty-host", ":0"},

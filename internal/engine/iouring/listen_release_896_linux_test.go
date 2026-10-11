@@ -56,6 +56,13 @@ func (r *engineRun896) stop() (time.Time, error) {
 // cannot hide a held port.
 func start896(t *testing.T, addr string, workers int) *engineRun896 {
 	t.Helper()
+	return start896Config(t, addr, workers, false)
+}
+
+// start896Config is start896 with TCP_DEFER_ACCEPT off, so a pause closes at
+// once, when disableDefer is set.
+func start896Config(t *testing.T, addr string, workers int, disableDefer bool) *engineRun896 {
+	t.Helper()
 	var run *engineRun896
 	_, _, err := retryRingENOMEM(func() error {
 		e, err := New(resource.Config{
@@ -64,6 +71,8 @@ func start896(t *testing.T, addr string, workers int) *engineRun896 {
 			Protocol:  engine.HTTP1,
 			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 			Resources: resource.Resources{Workers: workers},
+
+			DisableDeferAccept: disableDefer,
 		}, respondingHandler{})
 		if err != nil {
 			skipOrFail656(t, "New: %v", err)
@@ -266,4 +275,85 @@ func TestListenReleasesThePortWithManyWorkers896(t *testing.T) {
 		skipOrFail656(t, "RLIMIT_MEMLOCK funds %d io_uring workers, the test needs 4", maxW)
 	}
 	check896(t, "4 workers", iterations896/2, 4, false, probeBind)
+}
+
+// TestPauseAcceptReleasesThePort896 is the sibling check of the pause: the
+// listen sockets a PauseAccept closes (closeListenerAfterDrain cancels their
+// accept first) are gone from the port when it returns, 200 times, as seen by
+// a plain bind made at once. It passes on main as well; it pins that the
+// shutdown path now behaves as the pause path always did.
+func TestPauseAcceptReleasesThePort896(t *testing.T) {
+	busy := 0
+	var slowest time.Duration
+	for i := range iterations896 {
+		addr := freeAddr639(t)
+		e := start896Config(t, addr, 2, true)
+		if err := e.e.PauseAccept(); err != nil {
+			t.Fatalf("iteration %d: PauseAccept: %v", i, err)
+		}
+		returned := time.Now()
+		if perr := plainBind896(addr); perr != nil {
+			busy++
+			slowest = max(slowest, freeAfter896(addr, returned, time.Second))
+		}
+		if _, err := e.stop(); err != nil {
+			t.Fatalf("iteration %d: Listen returned %v", i, err)
+		}
+	}
+	t.Logf("pause: %d PauseAccept calls, port still taken at return in %d (%.0f%%), slowest to come free %v",
+		iterations896, busy, 100*float64(busy)/float64(iterations896), slowest)
+	if busy != 0 {
+		t.Fatalf("PauseAccept returned with its port still taken in %d of %d pauses", busy, iterations896)
+	}
+}
+
+// TestFailedStartReleasesThePort896: a Listen that fails because one worker's
+// ring setup failed, after its sibling started, shuts the sibling down; the
+// port must be free when Listen returns the error. Needs two workers.
+func TestFailedStartReleasesThePort896(t *testing.T) {
+	const n = 50
+	busy := 0
+	for range n {
+		addr := freeAddr639(t)
+		e := newEngine656(t, addr, 2)
+		failRingSetup656(t, func(call int32) bool { return call == 1 })
+		listenExpectingInjectedFailure(t, e)
+		if perr := plainBind896(addr); perr != nil {
+			busy++
+		}
+	}
+	t.Logf("failed start: %d Listen failures, port still taken at return in %d", n, busy)
+	if busy != 0 {
+		t.Fatalf("a failed Listen returned with its port still taken in %d of %d starts", busy, n)
+	}
+}
+
+// TestShutdownWaitForTheAcceptIsBounded896 (RULE 10): a kernel that never
+// completes the cancel must not hold shutdown open. The ring wait is
+// answered with nothing ever submitted, so no CQE arrives; shutdown gives up
+// at the drain's bound, counts it, and Listen returns.
+func TestShutdownWaitForTheAcceptIsBounded896(t *testing.T) {
+	orig := shutdownRingWait
+	shutdownRingWait = func(_ *Ring, d time.Duration) error { time.Sleep(d); return nil }
+	t.Cleanup(func() { shutdownRingWait = orig })
+
+	run := start896(t, freeAddr639(t), 2)
+	t0 := time.Now()
+	returned, err := run.stop()
+	took := returned.Sub(t0)
+	if err != nil {
+		t.Fatalf("Listen returned %v", err)
+	}
+	gaveUp := run.e.metrics.handoffLoss.shutdownListenCancelGaveUp.Load()
+	t.Logf("shutdown with a ring that never answers: Listen returned after %v, give-ups counted %d (bound %v)",
+		took, gaveUp, time.Duration(shutdownFDDrainNanos))
+	if gaveUp == 0 {
+		t.Fatal("shutdown did not count the accept it could not wait for")
+	}
+	if took < time.Duration(shutdownFDDrainNanos)/2 {
+		t.Fatalf("Listen returned after %v: shutdown did not wait for the accept at all", took)
+	}
+	if took > time.Duration(shutdownFDDrainNanos)+3*time.Second {
+		t.Fatalf("Listen took %v: the wait for the accept is not bounded by %v", took, time.Duration(shutdownFDDrainNanos))
+	}
 }
