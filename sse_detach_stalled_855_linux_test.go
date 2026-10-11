@@ -1,0 +1,341 @@
+//go:build linux
+
+package celeris_test
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/sse"
+)
+
+// Tests for celeris#855, the other half: a detached stream is not cut at
+// WriteTimeout on std, so a client that stays connected and reads nothing must
+// still be got rid of. Two things end such a stream on std, neither of them an
+// absolute deadline:
+//
+//   - a write that makes no progress for WriteTimeout fails (a deadline for
+//     each write, not for the response), so a handler that is bounded, or that
+//     is told to drop a slow client, ends the stream within WriteTimeout of
+//     the write it is parked in;
+//   - the drain budget: Shutdown that runs out of budget fails the writes of
+//     the streams still running, as it cancels their contexts, so Start does
+//     not return and leave a goroutine, a file descriptor and its buffers
+//     behind.
+//
+// Review round 1 of celeris#998 found both gone after the first version of the
+// fix, which cleared the deadlines and put nothing in their place.
+
+// stalledShape855 is how the handler under a client that reads nothing sends.
+type stalledShape855 string
+
+const (
+	// shapeTight855 sends as fast as Send lets it: parked in Send's write.
+	shapeTight855 stalledShape855 = "tight"
+	// shapeTick855 sends every 10 ms and watches its context.
+	shapeTick855 stalledShape855 = "tick"
+	// shapeQueue855 is shapeTick855 through the client queue (MaxQueueDepth),
+	// whose drain goroutine is the one parked in the write.
+	shapeQueue855 stalledShape855 = "queue"
+	// shapeClose855 is a queue of 4 that closes the client when it is full.
+	shapeClose855 stalledShape855 = "closepolicy"
+)
+
+// stalledSSE855 is a server whose /events stream is held by a client that
+// connected and reads nothing.
+type stalledSSE855 struct {
+	s         *celeris.Server
+	addr      string
+	startDone chan error
+	// hret and disc are the UnixNano at which the user's handler returned
+	// and OnDisconnect ran, 0 until they have.
+	hret, disc atomic.Int64
+	conn       net.Conn
+	cl         *http.Client
+	resp       *http.Response
+}
+
+// stallBegin855 starts a server and a client that reads nothing. bound > 0 is
+// how long the handler runs before it returns of its own accord.
+func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Duration, shape stalledShape855, h2c bool, bound time.Duration) *stalledSSE855 {
+	t.Helper()
+	st := &stalledSSE855{startDone: make(chan error, 1)}
+	payload := strings.Repeat("x", 256<<10)
+	cfg := sse.Config{
+		HeartbeatInterval: -1,
+		OnDisconnect:      func(*celeris.Context, *sse.Client) { st.disc.Store(time.Now().UnixNano()) },
+		Handler: func(cl *sse.Client) {
+			defer func() { st.hret.Store(time.Now().UnixNano()) }()
+			start := time.Now()
+			ctx := cl.Context()
+			var tick <-chan time.Time
+			if shape != shapeTight855 {
+				tk := time.NewTicker(10 * time.Millisecond)
+				defer tk.Stop()
+				tick = tk.C
+			}
+			for bound <= 0 || time.Since(start) < bound {
+				if tick != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case <-tick:
+					}
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				if err := cl.Send(sse.Event{Data: payload}); err != nil {
+					return
+				}
+			}
+		},
+	}
+	switch shape {
+	case shapeQueue855:
+		cfg.MaxQueueDepth = 16
+	case shapeClose855:
+		cfg.MaxQueueDepth = 4
+		cfg.OnSlowClient = func(*sse.Client, sse.Event) sse.ClientPolicy { return sse.ClientPolicyClose }
+	}
+	var addr string
+	for tries := 0; ; tries++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr = ln.Addr().String()
+		_ = ln.Close()
+		s := celeris.New(celeris.Config{Addr: addr, Engine: eng, ReadTimeout: wt, WriteTimeout: wt, ShutdownTimeout: shutdown})
+		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+		s.GET("/events", sse.New(cfg))
+		st.s, st.startDone = s, make(chan error, 1)
+		go func(done chan error) { done <- s.Start() }(st.startDone)
+		err = waitReady761(addr, st.startDone)
+		if err == nil {
+			break
+		}
+		if tries >= 5 {
+			t.Fatalf("server did not start: %v", err)
+		}
+	}
+	st.addr = addr
+	t.Cleanup(func() {
+		if st.conn != nil {
+			_ = st.conn.Close()
+		}
+		if st.resp != nil {
+			_ = st.resp.Body.Close()
+		}
+		if st.cl != nil {
+			st.cl.CloseIdleConnections()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = st.s.Shutdown(ctx)
+	})
+	if h2c {
+		st.cl = h2cClient836(1)
+		st.cl.Timeout = 0
+		resp, err := st.cl.Get("http://" + addr + "/events")
+		if err != nil {
+			t.Fatalf("GET /events over h2c: %v", err)
+		}
+		if resp.ProtoMajor != 2 {
+			t.Fatalf("GET /events came back as %s, not HTTP/2", resp.Proto)
+		}
+		st.resp = resp // its body is never read
+		return st
+	}
+	d := net.Dialer{Timeout: 2 * time.Second, Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096)
+		})
+	}}
+	conn, err := d.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.conn = conn
+	if _, err := conn.Write([]byte("GET /events HTTP/1.1\r\nHost: " + addr + "\r\nAccept: text/event-stream\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// stalledCells855 are the cells of both tests: every engine over HTTP/1.1,
+// and std over h2c too. The native engines do not stream h2c (#889).
+func stalledCells855(shapes ...stalledShape855) []struct {
+	name  string
+	eng   celeris.EngineType
+	h2c   bool
+	shape stalledShape855
+} {
+	var cells []struct {
+		name  string
+		eng   celeris.EngineType
+		h2c   bool
+		shape stalledShape855
+	}
+	for _, e := range engines761 {
+		for _, sh := range shapes {
+			if sh == shapeClose855 && e.name != "std" {
+				// Pre-existing and not std's: ClientPolicyClose does not end
+				// the stream of a client that reads nothing on the native
+				// engines (a polish item on #888).
+				continue
+			}
+			cells = append(cells, struct {
+				name  string
+				eng   celeris.EngineType
+				h2c   bool
+				shape stalledShape855
+			}{e.name + "/h1/" + string(sh), e.eng, false, sh})
+			if e.name == "std" {
+				cells = append(cells, struct {
+					name  string
+					eng   celeris.EngineType
+					h2c   bool
+					shape stalledShape855
+				}{e.name + "/h2c/" + string(sh), e.eng, true, sh})
+			}
+		}
+	}
+	return cells
+}
+
+// TestStalledSSEEndsWithShutdown855: a client that connected and reads
+// nothing, WriteTimeout 30 s (so the write deadline is not what ends the
+// stream), a drain budget of 1 s. The stream's handler has returned, and
+// OnDisconnect has run, by the time Start has returned (within 2 s of it: the
+// handler is woken as the budget runs out, not waited for).
+func TestStalledSSEEndsWithShutdown855(t *testing.T) {
+	for _, cell := range stalledCells855(shapeTight855, shapeTick855, shapeQueue855) {
+		t.Run(cell.name, func(t *testing.T) {
+			t.Parallel()
+			st := stallBegin855(t, cell.eng, 30*time.Second, time.Second, cell.shape, cell.h2c, 0)
+			time.Sleep(time.Second) // the client reads nothing; the socket buffers fill
+			if st.hret.Load() != 0 {
+				t.Fatal("the handler returned before Shutdown")
+			}
+			sd := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			serr := st.s.Shutdown(ctx)
+			cancel()
+			var startErr error
+			select {
+			case startErr = <-st.startDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("Start has not returned 10 s after Shutdown")
+			}
+			startRet := time.Since(sd)
+			deadline := time.Now().Add(2 * time.Second)
+			for (st.hret.Load() == 0 || st.disc.Load() == 0) && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			rel := func(v int64) string {
+				if v == 0 {
+					return "never"
+				}
+				return time.Duration(v - sd.UnixNano()).Round(time.Millisecond).String()
+			}
+			t.Logf("STALL855 cell=%s shutdownErr=%v startErr=%v startReturned=%v handlerReturned=%s onDisconnect=%s",
+				cell.name, serr, startErr, startRet.Round(time.Millisecond), rel(st.hret.Load()), rel(st.disc.Load()))
+			if st.hret.Load() == 0 || st.disc.Load() == 0 {
+				t.Fatalf("the stalled stream's handler had not returned (%s) or OnDisconnect had not run (%s) 2 s after Start returned",
+					rel(st.hret.Load()), rel(st.disc.Load()))
+			}
+		})
+	}
+}
+
+// TestStalledSSEEndsWhenItsHandlerIsBounded855: a client that reads nothing,
+// WriteTimeout 2 s, a handler that returns after 3 s (or, for closepolicy, a
+// queue of 4 that closes the client when it is full). OnDisconnect has run
+// within the handler's bound and the WriteTimeout of the write it is parked
+// in, and a few seconds of slack: where the stream used to be held for ever on
+// std once it was detached.
+func TestStalledSSEEndsWhenItsHandlerIsBounded855(t *testing.T) {
+	const (
+		wt    = 2 * time.Second
+		bound = 3 * time.Second
+	)
+	for _, cell := range stalledCells855(shapeTight855, shapeClose855) {
+		t.Run(cell.name, func(t *testing.T) {
+			t.Parallel()
+			start := time.Now()
+			st := stallBegin855(t, cell.eng, wt, 10*time.Second, cell.shape, cell.h2c, bound)
+			limit := bound + wt + 3*time.Second
+			deadline := time.Now().Add(limit)
+			for st.disc.Load() == 0 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			after := "never"
+			if v := st.disc.Load(); v != 0 {
+				after = time.Duration(v - start.UnixNano()).Round(10 * time.Millisecond).String()
+			}
+			t.Logf("STALL855 cell=%s onDisconnectAfter=%s (bound %v, WriteTimeout %v)", cell.name, after, bound, wt)
+			if after == "never" {
+				t.Fatalf("OnDisconnect has not run %v after a client that reads nothing connected (handler bound %v, WriteTimeout %v)", limit, bound, wt)
+			}
+		})
+	}
+}
+
+// TestSSEIdleBetweenEventsPastWriteTimeoutStd855: the per-write deadline is
+// armed around a write and cleared after it, so a stream whose events are
+// further apart than WriteTimeout is not cut while idle. Over h2c this
+// matters: the HTTP/2 server resets a stream when its write deadline passes,
+// whether or not a write is pending.
+func TestSSEIdleBetweenEventsPastWriteTimeoutStd855(t *testing.T) {
+	for _, h2c := range []bool{false, true} {
+		name := "h1"
+		if h2c {
+			name = "h2c"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			addr := startServerConfig761(t, armWrite855.config(celeris.Std, false), func(s *celeris.Server) {
+				s.GET("/events", sse.New(sse.Config{
+					HeartbeatInterval: -1,
+					Handler: func(client *sse.Client) {
+						ctx := client.Context()
+						for i := 1; ; i++ {
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(3 * timeout855 / 2):
+							}
+							if err := client.Send(sse.Event{Data: fmt.Sprint(i)}); err != nil {
+								return
+							}
+						}
+					},
+				}))
+			})
+			var (
+				events int
+				span   time.Duration
+				err    error
+			)
+			if h2c {
+				events, span, err = sseOverH2C855(t, addr)
+			} else {
+				events, span, err = sseOverH1855(t, addr)
+			}
+			t.Logf("SSE855 idle cell=%s events=%d span=%v err=%v", name, events, span.Round(time.Millisecond), err)
+			if err != nil {
+				t.Fatalf("the stream ended after %d events and %v with an event every %v and a WriteTimeout of %v: %v",
+					events, span.Round(time.Millisecond), 3*timeout855/2, timeout855, err)
+			}
+		})
+	}
+}
