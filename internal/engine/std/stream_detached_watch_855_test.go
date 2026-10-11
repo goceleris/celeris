@@ -434,7 +434,7 @@ func h2cServer855(tb testing.TB, h http.Handler) (cl *http.Client, url string) {
 		}
 	}()
 	tr := &http2.Transport{AllowHTTP: true, //nolint:staticcheck // SA1019: an h2c client for the server above.
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) { //nolint:staticcheck // SA1019: as above.
 			return (&net.Dialer{}).DialContext(ctx, network, addr)
 		}}
 	tb.Cleanup(func() {
