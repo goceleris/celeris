@@ -516,6 +516,10 @@ type Worker struct {
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed on every CQE-bearing iteration and by checkTimeouts
 	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
+	// dirtySendGiveUps counts the dirty pass's give-ups of a conn with a SEND
+	// outstanding (celeris#811). Worker-owned; read by tests after the
+	// worker has stopped, as the witness that a benchmark exercised the path.
+	dirtySendGiveUps uint64
 
 	// pendingRelease defers returning connState structs to the pool
 	// until the kernel has drained every in-flight I/O SQE that may
@@ -6275,6 +6279,7 @@ func (w *Worker) flushDirty() {
 				w.beginRecvStall(cs)
 			}
 			w.unlinkDirty(cs)
+			w.dirtySendGiveUps++
 		} else {
 			if mu := cs.detachMu; mu != nil && !mu.TryLock() {
 				if dispatchBusy(cs, &cs.relinkOwed) {

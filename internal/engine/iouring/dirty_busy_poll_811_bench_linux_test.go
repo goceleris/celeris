@@ -152,11 +152,17 @@ func BenchmarkResponseSize811(b *testing.B) {
 				// 200 ms above are in it (a few hundred, at most, over b.N
 				// requests).
 				stop()
-				var iters uint64
+				var iters, giveUps uint64
 				for _, w := range e.workers {
 					iters += w.iterCount
+					giveUps += w.dirtySendGiveUps
 				}
 				b.ReportMetric(float64(iters)/float64(b.N+21), "iters_per_op")
+				// giveups_per_op: the dirty pass's give-ups of a conn with a
+				// SEND outstanding, the path the fix adds. 0 means the arm did
+				// not exercise it (the base binary has no such counter: its
+				// bench line has no giveups_per_op, see ab3-analyze.py).
+				b.ReportMetric(float64(giveUps)/float64(b.N+21), "giveups_per_op")
 			})
 		}
 	}
