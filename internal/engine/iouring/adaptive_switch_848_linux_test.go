@@ -78,7 +78,7 @@ func TestAdaptiveSwitchIsNotALoopExit848(t *testing.T) {
 	logs := &exitLog848{}
 	ae, err := adaptive.New(resource.Config{
 		Addr: "127.0.0.1:0", Protocol: engine.HTTP1,
-		Resources: resource.Resources{Workers: 1}, Logger: slog.New(logs),
+		Resources: resource.Resources{Workers: 2}, Logger: slog.New(logs),
 	}, okHandler848{}, nil)
 	if err != nil {
 		t.Fatalf("adaptive.New: %v", err)
@@ -121,7 +121,8 @@ func TestAdaptiveSwitchIsNotALoopExit848(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		done <- err // the cleanup waits for it too
 	case <-time.After(30 * time.Second):
 		t.Fatal("Listen did not return within 30 s of cancel")
 	}

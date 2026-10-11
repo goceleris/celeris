@@ -10,10 +10,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -24,10 +26,15 @@ import (
 // path, is not counted. One worker everywhere: the CI step that runs this
 // package at 8 MiB of memlock funds one.
 
+// boomID848 is the id of the loop or worker the last /boom ran on.
+var boomID848 atomic.Int64
+
 type goexitHandler848 struct{}
 
-func (goexitHandler848) HandleStream(_ context.Context, s *stream.Stream) error {
+func (goexitHandler848) HandleStream(ctx context.Context, s *stream.Stream) error {
 	if s.Path == "/boom" {
+		id, _ := ctxkit.WorkerIDFrom(ctx)
+		boomID848.Store(int64(id))
 		runtime.Goexit()
 	}
 	if s.ResponseWriter == nil {
@@ -89,7 +96,7 @@ func start848(t *testing.T, addr string, disableDefer bool) (*Engine, *logCap848
 			Protocol:           engine.HTTP1,
 			Logger:             slog.New(logs),
 			DisableDeferAccept: disableDefer,
-			Resources:          resource.Resources{Workers: 1},
+			Resources:          resource.Resources{Workers: 2}, // capped to what memlock funds
 		}, goexitHandler848{})
 		if nerr != nil {
 			skipOrFail656(t, "New: %v", nerr)
@@ -140,24 +147,23 @@ func stop848(t *testing.T, cancel context.CancelFunc, done chan error) {
 
 func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 	e, logs, cancel, done := start848(t, "127.0.0.1:0", false)
-	c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
+	// Several keep-alive conns, each proven served: the loops own them.
+	var conns []net.Conn
+	for range 6 {
+		c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = c.Write([]byte("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n"))
+		buf := make([]byte, 256)
+		if n, err := c.Read(buf); err != nil || !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
+			t.Fatalf("PREMISE: /ok before the fault: %q %v", buf[:n], err)
+		}
+		conns = append(conns, c)
 	}
-	defer func() { _ = c.Close() }()
-	// A second conn on the same (only) loop: it is owned, and will not be served.
-	c2, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c2.Close() }()
-	_ = c2.SetDeadline(time.Now().Add(2 * time.Second))
-	_, _ = c2.Write([]byte("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n"))
-	buf := make([]byte, 256)
-	if n, err := c2.Read(buf); err != nil || !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
-		t.Fatalf("PREMISE: /ok before the fault: %q %v", buf[:n], err)
-	}
-	_, _ = c.Write([]byte("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"))
+	_, _ = conns[0].Write([]byte("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"))
 	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && e.abnormalWorkerExits.Load() == 0; time.Sleep(5 * time.Millisecond) {
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -167,14 +173,14 @@ func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 	}
 	recs := logs.exits()
 	if len(recs) != 1 {
-		t.Fatalf("%d worker-exit records, want 1", len(recs))
+		t.Fatalf("%d exit records, want 1", len(recs))
 	}
 	r := recs[0]
-	if r.level != slog.LevelError || r.attrs["engine"] != "io_uring" || r.attrs["worker"] != "0" {
-		t.Errorf("record = level %s attrs %v, want ERROR engine=io_uring worker=0", r.level, r.attrs)
+	if r.level != slog.LevelError || r.attrs["engine"] != "io_uring" || r.attrs["worker"] != strconv.FormatInt(boomID848.Load(), 10) {
+		t.Errorf("record = level %s attrs %v, want ERROR engine=io_uring worker=%d", r.level, r.attrs, boomID848.Load())
 	}
-	if n, err := strconv.Atoi(r.attrs["conns"]); err != nil || n != 2 {
-		t.Errorf("conns = %q, want 2", r.attrs["conns"])
+	if n, err := strconv.Atoi(r.attrs["conns"]); err != nil || n < 1 || n > len(conns) {
+		t.Errorf("conns = %q, want 1..%d (the loop's share of %d conns, the boom conn among them)", r.attrs["conns"], len(conns), len(conns))
 	}
 }
 
@@ -196,7 +202,7 @@ func TestNormalWorkerReturnsAreNotCounted848(t *testing.T) {
 		logs := &logCap848{}
 		e, err := New(resource.Config{
 			Addr: hold.Addr().String(), Engine: engine.IOUring, Protocol: engine.HTTP1,
-			Logger: slog.New(logs), Resources: resource.Resources{Workers: 1},
+			Logger: slog.New(logs), Resources: resource.Resources{Workers: 2},
 		}, goexitHandler848{})
 		if err != nil {
 			skipOrFail656(t, "New: %v", err)
@@ -241,12 +247,13 @@ func TestNormalWorkerReturnsAreNotCounted848(t *testing.T) {
 		if err := e.ResumeAccept(); err != nil {
 			t.Fatal(err)
 		}
+		want := uint64(e.Metrics().Workers)
 		var lost uint64
-		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && lost < 1; time.Sleep(5 * time.Millisecond) {
+		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && lost < want; time.Sleep(5 * time.Millisecond) {
 			lost = e.Metrics().ErrorListenerRecreate
 		}
-		if lost != 1 {
-			t.Fatalf("PREMISE: ErrorListenerRecreate = %d, want 1", lost)
+		if want == 0 || lost != want {
+			t.Fatalf("PREMISE: ErrorListenerRecreate = %d, want %d (one per worker)", lost, want)
 		}
 		time.Sleep(100 * time.Millisecond)
 		stop848(t, cancel, done)
