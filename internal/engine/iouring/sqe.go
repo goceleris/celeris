@@ -210,6 +210,21 @@ func prepCancelFDSkipSuccess(sqePtr unsafe.Pointer, fd int) {
 	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelFD | cancelAll
 }
 
+// prepCancelFD prepares the same ASYNC_CANCEL as prepCancelFDSkipSuccess, but
+// keeps its CQE whatever the outcome. With IORING_ASYNC_CANCEL_ALL the result
+// is the number of requests it cancelled, and 0 (not -ENOENT) when none
+// matched; -EALREADY when the match was already running. The skipping form
+// posts nothing for any of the successes, the empty one included, so a caller
+// that has to know the cancel is over, one that is waiting for it at shutdown
+// (celeris#896), cannot tell "done" from "not yet" with it.
+func prepCancelFD(sqePtr unsafe.Pointer, fd int) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opASYNCCANCEL
+	sqe[1] = 0
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelFD | cancelAll
+}
+
 // prepCancelUserDataSkipSuccess prepares an ASYNC_CANCEL SQE that matches the
 // in-flight op by its user_data (the kernel's default cancel key when no FD
 // flag is set), with CQE_SKIP_SUCCESS to suppress the success CQE.

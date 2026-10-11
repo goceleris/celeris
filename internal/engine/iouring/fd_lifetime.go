@@ -653,6 +653,7 @@ func (w *Worker) endOwedOpsAtShutdown() {
 	// has then let go of the file, and shutdown's close of the descriptor is
 	// the last reference, released before close(2) returns.
 	acceptOwed := w.queueListenAcceptCancel()
+	listenFDAtCancel := w.listenFD
 	connsPending := func() bool {
 		for _, cs := range owed {
 			if named(cs) {
@@ -727,16 +728,22 @@ func (w *Worker) endOwedOpsAtShutdown() {
 					if !cqeHasMore(c.Flags) {
 						acceptOwed = false
 					}
-				case 0:
-					// The cancel's own CQE, which only a failure posts
-					// (CQE_SKIP_SUCCESS). -ENOENT: no accept is armed on the
-					// socket, so none holds it. -EALREADY: the accept is
-					// being completed; its CQE follows. Anything else:
-					// the cancel did not take, so the wait cannot be
-					// answered and is not made.
-					if acceptOwed && c.UserData == 0 && c.Res != -int32(unix.EALREADY) {
-						acceptOwed = false
-						if c.Res != -int32(unix.ENOENT) {
+				case udProvide:
+					// The cancel's own CQE (queueListenAcceptCancel). With
+					// IORING_ASYNC_CANCEL_ALL its result is how many accepts
+					// it cancelled, and 0, not -ENOENT, when none was armed
+					// (__io_async_cancel returns nr). 0: no accept holds the
+					// socket and none will complete, so the wait is over.
+					// A positive count, or -EALREADY (the accept is being
+					// completed): the accept's own CQE ends the wait.
+					// Anything else: the cancel did not take, so the wait
+					// cannot be answered and is not made.
+					if acceptOwed && decodeFD(ud) == listenFDAtCancel {
+						switch {
+						case c.Res == 0 || c.Res == -int32(unix.ENOENT):
+							acceptOwed = false
+						case c.Res < 0 && c.Res != -int32(unix.EALREADY):
+							acceptOwed = false
 							w.noteListenCancelGaveUp(fmt.Errorf("cancel of the accept: %w", unix.Errno(-c.Res)))
 						}
 					}
@@ -778,8 +785,8 @@ func (w *Worker) queueListenAcceptCancel() bool {
 		w.noteListenCancelGaveUp(errors.New("the SQ ring is full"))
 		return false
 	}
-	prepCancelFDSkipSuccess(sqe, w.listenFD)
-	setSQEUserData(sqe, 0)
+	prepCancelFD(sqe, w.listenFD)
+	setSQEUserData(sqe, encodeUserData(udProvide, w.listenFD))
 	return true
 }
 
