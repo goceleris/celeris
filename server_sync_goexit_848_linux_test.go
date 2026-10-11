@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -156,6 +158,24 @@ type rig848 struct {
 // empty (a fixed port), through cfg.
 func start848(t *testing.T, cfg celeris.Config) *rig848 {
 	t.Helper()
+	// A start that fails only with ENOMEM (io_uring ring memory still charged
+	// to RLIMIT_MEMLOCK, see keptProbeIOUring) is retried with a new server.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r, err := tryStart848(t, cfg)
+		if err == nil {
+			return r
+		}
+		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		t.Fatalf("server did not start: %v", err)
+	}
+}
+
+func tryStart848(t *testing.T, cfg celeris.Config) (*rig848, error) {
+	t.Helper()
 	r := &rig848{t: t, logs: &capture848{}}
 	cfg.Logger = slog.New(r.logs)
 	if cfg.Workers == 0 {
@@ -172,11 +192,11 @@ func start848(t *testing.T, cfg celeris.Config) *rig848 {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	t.Cleanup(cancel)
 	r.done = make(chan error, 1)
+	var ln net.Listener
 	if cfg.Addr == "" {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
+		var err error
+		if ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
 			t.Fatal(err)
 		}
 		go func() { r.done <- r.s.StartWithListenerAndContext(ctx, ln) }()
@@ -185,13 +205,18 @@ func start848(t *testing.T, cfg celeris.Config) *rig848 {
 	}
 	addr, err := c714WaitReady(r.s, r.done)
 	if err != nil {
-		t.Fatalf("server did not start: %v", err)
+		cancel()
+		if ln != nil {
+			_ = ln.Close()
+		}
+		return nil, err
 	}
+	t.Cleanup(cancel)
 	r.addr = addr
 	if r.logs.total() == 0 {
 		t.Fatalf("PREMISE: the server's logger received nothing by the time it was ready")
 	}
-	return r
+	return r, nil
 }
 
 func (r *rig848) dial() *goexitConn791 {
@@ -249,6 +274,9 @@ func attrStr848(v slog.Value) string {
 func TestSyncRouteGoexitIsLoud848(t *testing.T) {
 	for _, a := range arms848() {
 		t.Run(a.name, func(t *testing.T) {
+			if !child848(t) {
+				return
+			}
 			need848(t, a.eng)
 			r := start848(t, celeris.Config{Engine: a.eng})
 			id, boom, witness, others := r.place()
@@ -464,4 +492,47 @@ func TestNormalPathsDoNotReportALoopExit848(t *testing.T) {
 			})
 		})
 	}
+}
+
+// child848 runs a test that kills an event loop in a process of its own. A
+// loop that exits on a Goexit never reaches shutdown, so its ring (io_uring
+// ring memory is charged to RLIMIT_MEMLOCK per UID), its descriptors and its
+// listen socket stay open until the process exits; left in the test binary
+// they would starve every later test that starts an io_uring engine. The
+// parent re-executes the test binary on this one test, in child mode, and
+// judges the child's output; the child (CELERIS_848_CHILD=1) runs the body.
+// It reports whether the caller is the child, which then runs the body.
+func child848(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("CELERIS_848_CHILD") == "1" {
+		return true
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	parts := strings.Split(t.Name(), "/")
+	for i, p := range parts {
+		parts[i] = "^" + regexp.QuoteMeta(p) + "$"
+	}
+	cmd := exec.Command(exe, "-test.run="+strings.Join(parts, "/"), "-test.v", "-test.count=1", "-test.timeout=180s")
+	cmd.Env = append(os.Environ(), "CELERIS_848_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	for _, ln := range strings.Split(string(out), "\n") {
+		if strings.Contains(ln, "celeris848 RESULT") {
+			t.Log(strings.TrimSpace(ln))
+		}
+	}
+	text := string(out)
+	switch {
+	case strings.Contains(text, "--- SKIP: "+t.Name()+" ("):
+		t.Skipf("skipped in the child process:\n%s", text)
+	case err != nil:
+		t.Fatalf("the child process failed: %v\n%s", err, text)
+	case !strings.Contains(text, "--- PASS: "+t.Name()+" ("):
+		t.Fatalf("the child process did not report --- PASS for %s (not a pass):\n%s", t.Name(), text)
+	case strings.Contains(text, "--- SKIP") || strings.Contains(text, "--- FAIL"):
+		t.Fatalf("the child process reported a skipped subtest or a failure:\n%s", text)
+	}
+	return false
 }

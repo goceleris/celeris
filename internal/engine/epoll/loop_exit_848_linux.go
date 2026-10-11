@@ -24,7 +24,7 @@ import "context"
 //
 // The defer runs once, when the loop goroutine ends: it costs nothing per
 // event-loop iteration and takes no lock.
-func (e *Engine) runWatched(l *Loop, ctx context.Context) {
+func (e *Engine) runWatched(ctx context.Context, l *Loop) {
 	returned := false
 	defer func() {
 		if !returned {

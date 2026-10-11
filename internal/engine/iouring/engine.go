@@ -418,7 +418,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e.runWatched(w, innerCtx)
+			e.runWatched(innerCtx, w)
 		}()
 	}
 

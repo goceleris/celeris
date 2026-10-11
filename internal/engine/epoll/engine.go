@@ -194,7 +194,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for _, l := range e.loops {
 		wg.Go(func() {
-			e.runWatched(l, innerCtx)
+			e.runWatched(innerCtx, l)
 		})
 	}
 

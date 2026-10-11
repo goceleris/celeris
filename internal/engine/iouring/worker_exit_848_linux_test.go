@@ -6,6 +6,9 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"os"
+	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -14,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -23,8 +26,8 @@ import (
 // celeris#848 at the engine: a handler that runs on the worker and calls
 // runtime.Goexit ends the worker goroutine. The engine counts it
 // (abnormalWorkerExits) and logs one Error. A worker that returns, by whatever
-// path, is not counted. One worker everywhere: the CI step that runs this
-// package at 8 MiB of memlock funds one.
+// path, is not counted. Two workers are asked for and the engine caps them to
+// what memlock funds (one at the CI step's 8 MiB); one is enough.
 
 // boomID848 is the id of the loop or worker the last /boom ran on.
 var boomID848 atomic.Int64
@@ -146,6 +149,9 @@ func stop848(t *testing.T, cancel context.CancelFunc, done chan error) {
 }
 
 func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
+	if !child848(t) {
+		return
+	}
 	e, logs, cancel, done := start848(t, "127.0.0.1:0", false)
 	// Several keep-alive conns, each proven served: the loops own them.
 	var conns []net.Conn
@@ -261,4 +267,47 @@ func TestNormalWorkerReturnsAreNotCounted848(t *testing.T) {
 			t.Fatalf("a lost listener (the loop ends itself) counted %d, logged %d", e.abnormalWorkerExits.Load(), len(logs.exits()))
 		}
 	})
+}
+
+// child848 runs a test that kills an event loop in a process of its own. A
+// loop that exits on a Goexit never reaches shutdown, so its ring (io_uring
+// ring memory is charged to RLIMIT_MEMLOCK per UID), its descriptors and its
+// listen socket stay open until the process exits; left in the test binary
+// they would starve every later test that starts an io_uring engine. The
+// parent re-executes the test binary on this one test, in child mode, and
+// judges the child's output; the child (CELERIS_848_CHILD=1) runs the body.
+// It reports whether the caller is the child, which then runs the body.
+func child848(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("CELERIS_848_CHILD") == "1" {
+		return true
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	parts := strings.Split(t.Name(), "/")
+	for i, p := range parts {
+		parts[i] = "^" + regexp.QuoteMeta(p) + "$"
+	}
+	cmd := exec.Command(exe, "-test.run="+strings.Join(parts, "/"), "-test.v", "-test.count=1", "-test.timeout=180s")
+	cmd.Env = append(os.Environ(), "CELERIS_848_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	for _, ln := range strings.Split(string(out), "\n") {
+		if strings.Contains(ln, "celeris848 RESULT") {
+			t.Log(strings.TrimSpace(ln))
+		}
+	}
+	text := string(out)
+	switch {
+	case strings.Contains(text, "--- SKIP: "+t.Name()+" ("):
+		t.Skipf("skipped in the child process:\n%s", text)
+	case err != nil:
+		t.Fatalf("the child process failed: %v\n%s", err, text)
+	case !strings.Contains(text, "--- PASS: "+t.Name()+" ("):
+		t.Fatalf("the child process did not report --- PASS for %s (not a pass):\n%s", t.Name(), text)
+	case strings.Contains(text, "--- SKIP") || strings.Contains(text, "--- FAIL"):
+		t.Fatalf("the child process reported a skipped subtest or a failure:\n%s", text)
+	}
+	return false
 }
