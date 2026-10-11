@@ -442,7 +442,7 @@ func TestUndetachedStreamStillCutAtWriteTimeoutStd855(t *testing.T) {
 			tk := time.NewTicker(tick855)
 			defer tk.Stop()
 			begin := time.Now()
-			for time.Since(begin) < hold855 {
+			for time.Since(begin) < 2*hold855 { // outlasts what the client waits for
 				<-tk.C
 				if _, err := sw.Write([]byte("data: x\n\n")); err != nil {
 					return nil
