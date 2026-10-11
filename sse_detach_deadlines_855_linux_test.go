@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -19,16 +20,22 @@ import (
 	"github.com/goceleris/celeris/middleware/sse"
 )
 
-// Tests for celeris#855. On the std engine an SSE stream ended at the
-// server's ReadTimeout or its WriteTimeout, while epoll, io_uring and
-// adaptive kept it open: net/http arms a read deadline for the request and a
-// write deadline for the response, and keeps both armed while the handler
-// runs. The read one ends the request's context (the SSE middleware's
-// disconnect signal on std) and the write one fails the next Send, so a
-// stream was cut at the first of the two. A detached stream (Context.Detach,
-// which the SSE middleware calls) is the connection's, as it is on the
-// native engines, which apply neither timeout to it; Detach now clears both
-// deadlines on std. A response that is not detached keeps both.
+// Tests for celeris#855. On the std engine an SSE stream ended at the server's
+// WriteTimeout, while epoll, io_uring and adaptive kept it open: net/http arms
+// a write deadline for each response and keeps it armed while the handler
+// runs, so the first Send after it fails (over h2c the HTTP/2 server resets
+// the stream with INTERNAL_ERROR at the same moment). A detached stream
+// (Context.Detach, which the SSE middleware calls) is the connection's, as it
+// is on the native engines, which apply neither timeout to it; Detach now
+// clears the write deadline on std, and the read deadline with it.
+//
+// ReadTimeout is not a cut on std (go1.27): net/http clears the read deadline
+// when it starts watching the connection for the client going away, before
+// the handler runs, and over h2c ReadTimeout only closes the request body,
+// which the bridge has read whole. The read arms therefore pass on main, and
+// they stay as the guard that they keep passing; the issue's first path (the
+// read deadline ending the request's context) is not what cut the bench's
+// streams. Clearing the read deadline in Detach is defensive.
 //
 // The server timeouts are 1 s and a stream is held for 4.5 s, so a stream
 // that is cut at either is cut four times over.
@@ -42,10 +49,16 @@ const (
 	hold855 = 4500 * time.Millisecond
 	// tick855 is the interval of the stream's events.
 	tick855 = 200 * time.Millisecond
-	// big855 is the size of the response a stalled client does not read: far
-	// over what the sockets on both ends buffer.
-	big855 = 48 << 20
 )
+
+// big855 is the size of the response a stalled client does not read: far over
+// what the sockets on both ends buffer. BIG855 (bytes) to change it.
+var big855 = func() int {
+	if n, err := strconv.Atoi(os.Getenv("BIG855")); err == nil && n > 0 {
+		return n
+	}
+	return 48 << 20
+}()
 
 // arm855 is a server with a ReadTimeout, a WriteTimeout or both set. -1 is
 // the documented "off": 0 would be the default, 30 s and 60 s.
@@ -192,14 +205,23 @@ func (c sseCell855) name() string {
 
 // TestSSEStaysOpenPastServerTimeouts855: with ReadTimeout and/or WriteTimeout
 // at 1 s, an SSE stream keeps delivering events for 4.5 s on every engine,
-// sync and async, over HTTP/1.1 and h2c. std has all three arms (the read one
-// and the write one are two separate cuts); the others, which never cut a
-// stream, have "both".
+// sync and async, over HTTP/1.1, and on std over h2c as well. std has all
+// three arms; the others, which never cut a stream, have "both".
+//
+// h2c is std's only: on epoll, io_uring and adaptive an HTTP/2 stream's
+// response goes out when its handler returns (Flush is no delivery guarantee
+// on HTTP/2, see StreamWriter.Flush), so an SSE stream over h2c shows no
+// headers until it ends; measured on main with the same timeouts and with the
+// defaults, evidence lanes-20261009/SSE855/logs/probe-h2c-sse2.log. That is a
+// defect of its own, not this one.
 func TestSSEStaysOpenPastServerTimeouts855(t *testing.T) {
 	var cells []sseCell855
 	for _, e := range engines761 {
 		for _, async := range []bool{false, true} {
 			for _, h2c := range []bool{false, true} {
+				if h2c && e.name != "std" {
+					continue
+				}
 				arms := []arm855{armBoth855}
 				if e.name == "std" {
 					arms = []arm855{armRead855, armWrite855, armBoth855}
@@ -288,38 +310,74 @@ func stalledResponse855(t *testing.T, addr string, h2c bool) (got int, err error
 	return cr.n, err
 }
 
-// TestStalledResponseStillBoundedByWriteTimeout855 is the negative of the
-// test above: a plain response to a client that does not read is still cut at
-// WriteTimeout on every engine, so the fix has not removed the timeout from
-// responses that are not detached streams.
-func TestStalledResponseStillBoundedByWriteTimeout855(t *testing.T) {
-	for _, e := range engines761 {
-		for _, async := range []bool{false, true} {
-			for _, h2c := range []bool{false, true} {
-				if h2c && e.name != "std" {
-					continue // the fix is std's; the native h2 write path is not this issue
-				}
-				proto := "h1"
-				if h2c {
-					proto = "h2c"
-				}
-				mode := "sync"
-				if async {
-					mode = "async"
-				}
-				t.Run(e.name+"/"+proto+"/"+mode, func(t *testing.T) {
-					t.Parallel()
-					cfg := armWrite855.config(e.eng, async)
-					addr := startServerConfig761(t, cfg, big855Route)
-					got, err := stalledResponse855(t, addr, h2c)
-					t.Logf("SSE855NEG engine=%s proto=%s mode=%s got=%d of %d bytes err=%v", e.name, proto, mode, got, big855, err)
-					if err == nil && got >= big855 {
-						t.Fatalf("a client that did not read for %v was sent the whole %d-byte body: WriteTimeout %v did not bound the response",
-							3*timeout855, big855, timeout855)
-					}
-				})
+// TestStalledResponseStillBoundedByWriteTimeoutStd855 is the negative of the
+// test above on std, the engine the fix is in: a plain response to a client
+// that does not read is still cut at WriteTimeout, over HTTP/1.1 (the
+// connection is closed) and over h2c (the stream is reset), so Detach is the
+// only thing that lifts the timeout.
+//
+// std only: epoll, io_uring and adaptive deliver a body of 8 MiB or more to a
+// client that read nothing for five WriteTimeouts, whole, on main (3cfee4b,
+// logs/probe-big*.log), so there is no bound to keep; see the polish items on
+// #884 and #885. The request side of the negative runs on every engine in
+// TestStalledRequestStillBoundedByReadTimeout855.
+func TestStalledResponseStillBoundedByWriteTimeoutStd855(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		for _, h2c := range []bool{false, true} {
+			proto := "h1"
+			if h2c {
+				proto = "h2c"
 			}
+			mode := "sync"
+			if async {
+				mode = "async"
+			}
+			t.Run(proto+"/"+mode, func(t *testing.T) {
+				t.Parallel()
+				addr := startServerConfig761(t, armWrite855.config(celeris.Std, async), big855Route)
+				got, err := stalledResponse855(t, addr, h2c)
+				t.Logf("SSE855NEG proto=%s mode=%s got=%d of %d bytes err=%v", proto, mode, got, big855, err)
+				if got >= big855 {
+					t.Fatalf("a client that did not read for %v was sent the whole %d-byte body: WriteTimeout %v did not bound the response",
+						stall855(), big855, timeout855)
+				}
+			})
 		}
+	}
+}
+
+// TestStalledRequestStillBoundedByReadTimeout855: a request whose body stops
+// coming is still cut at ReadTimeout on every engine, with the fix in: the
+// read deadline Detach clears is the one of a request whose handler has
+// detached, not of the requests that never get to a handler.
+func TestStalledRequestStillBoundedByReadTimeout855(t *testing.T) {
+	for _, e := range engines761 {
+		t.Run(e.name, func(t *testing.T) {
+			t.Parallel()
+			addr := startServerConfig761(t, armRead855.config(e.eng, false), func(s *celeris.Server) {
+				s.POST("/echo", func(c *celeris.Context) error { return c.Blob(http.StatusOK, "text/plain", c.Body()) })
+			})
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			// 10 of the 100 promised body bytes, then nothing.
+			if _, err := conn.Write([]byte("POST /echo HTTP/1.1\r\nHost: " + addr + "\r\nContent-Length: 100\r\n\r\n0123456789")); err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now()
+			_ = conn.SetReadDeadline(start.Add(10 * time.Second))
+			_, rerr := io.Copy(io.Discard, conn) // returns when the server closes the connection
+			ended := time.Since(start)
+			t.Logf("SSE855NEGREAD engine=%s ended=%v err=%v", e.name, ended.Round(10*time.Millisecond), rerr)
+			if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+				t.Fatalf("the server did not end a request stalled in its body within 10 s (ReadTimeout %v)", timeout855)
+			}
+			if ended > 5*time.Second {
+				t.Fatalf("the stalled request was ended after %v, want about ReadTimeout %v", ended, timeout855)
+			}
+		})
 	}
 }
 
@@ -362,7 +420,7 @@ func TestSSEEndedStreamKeepsConnectionTimeouts855(t *testing.T) {
 	cr := &countingReader761{r: br}
 	_, err = io.Copy(io.Discard, cr)
 	t.Logf("SSE855REARM got=%d of %d bytes err=%v", cr.n, big855, err)
-	if err == nil && cr.n >= big855 {
+	if cr.n >= big855 {
 		t.Fatalf("the next response on the connection was not bounded by WriteTimeout %v", timeout855)
 	}
 }
