@@ -25,10 +25,17 @@
 // with all celeris engines and handles stream lifecycle internally.
 //
 // An SSE stream is a detached stream, so the server's ReadTimeout and
-// WriteTimeout do not end it on any engine (celeris#855): no WriteTimeout of -1
-// is needed for it. The std engine clears the deadlines net/http armed for the
-// request when the middleware detaches. A stream that should not run for ever
-// is ended by its handler.
+// WriteTimeout do not end it on any engine (celeris#855): it stays open
+// without setting WriteTimeout to -1. The std engine clears the deadlines
+// net/http armed for the request when the middleware detaches, and bounds each
+// write of the stream by WriteTimeout instead: a client that stays connected
+// and reads nothing ends its stream that way. Until then the handler (or the
+// queue's drain goroutine) is parked in the write, so returning or
+// [ClientPolicyClose] cannot end the stream sooner. The
+// native engines do not park the handler in a write. When Shutdown's budget
+// runs out, std fails the writes of the streams still running. A stream that
+// should not run for ever is ended by its handler, which Send's error or the
+// client's context tells when the client has gone.
 //
 // A HEAD request to an SSE route (answered by its GET route) gets the stream's
 // response headers and no body. [Config.OnConnect] runs for it, and a rejection

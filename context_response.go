@@ -1515,6 +1515,14 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // This is required for streaming responses on native engines where the handler
 // must return to free the event loop thread.
 //
+// On the std engine, Detach also clears the read and write deadlines net/http
+// armed for the request (ReadTimeout, WriteTimeout), so the stream is not cut
+// at them, as it is not on the native engines. A detached stream's writes are
+// then bounded one at a time: each Write or Flush of the stream fails if the
+// client does not take its bytes within WriteTimeout (none at -1), and
+// Shutdown's budget running out fails the writes of the streams still running.
+// A handler that detaches for a long-poll or a stream of its own gets the same.
+//
 // Detach copies the request values the Context holds, so they stay valid
 // after the handler returns (on HTTP/2 the headers and the body are the
 // exception, see below): the headers, method, path and query, the route
