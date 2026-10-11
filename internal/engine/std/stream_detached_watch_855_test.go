@@ -480,12 +480,13 @@ func TestDetachedCutPokeAndReturnRace855(t *testing.T) {
 				}
 				wg.Go(func() {
 					defer cancel()
-					resp, err := get()
-					if err != nil {
-						t.Error(err)
-						return
+					// A budget that runs out before the response headers have
+					// reached the client resets the stream under its Get: that
+					// is the poke, not a failure. Either way the client reads
+					// nothing, and the handler must return.
+					if resp, err := get(); err == nil {
+						defer resp.Body.Close()
 					}
-					defer resp.Body.Close()
 					// Do not read: the server's write is parked until it is cut.
 					select {
 					case <-handlerDone:
