@@ -160,3 +160,89 @@ func TestStopAcceptingWaitForTheAcceptIsBounded896(t *testing.T) {
 		})
 	}
 }
+
+// TestStopAcceptingWithNoAcceptArmedDoesNotWait896: a worker whose accept is not
+// armed (it ended on an error and the re-arm is pending, say) has the cancel
+// answered 0 (IORING_ASYNC_CANCEL_ALL counts what it cancelled): nothing holds
+// the socket, so the close does not wait for a completion that will never come
+// and counts no give-up.
+func TestStopAcceptingWithNoAcceptArmedDoesNotWait896(t *testing.T) {
+	for _, rt := range closeRoutes896 {
+		for _, tc := range tiers896 {
+			t.Run(rt.name+"/"+tc.name, func(t *testing.T) {
+				r := newAcceptRig896(t, tc.tier(), false)
+				t0 := time.Now()
+				rt.close(r.w)
+				took := time.Since(t0)
+				if err := plainBind896(r.addr); err != nil {
+					t.Fatalf("a plain bind of %s: %v", r.addr, err)
+				}
+				if g := r.w.handoffLoss.shutdownListenCancelGaveUp.Load(); g != 0 {
+					t.Fatalf("%d give-ups counted for a socket with no accept armed", g)
+				}
+				if took > time.Duration(shutdownFDDrainNanos)/2 {
+					t.Fatalf("%s waited %v for an accept that was never armed", rt.name, took)
+				}
+			})
+		}
+	}
+}
+
+// TestShutdownDrainWithAFullSQRingReleasesTheListenSocket896: the same full SQ
+// ring at worker shutdown's drain. queueListenAcceptCancel used to count a give-up
+// and place nothing, and the close then left the socket to the ring's teardown;
+// it submits what the ring holds and places the cancel.
+func TestShutdownDrainWithAFullSQRingReleasesTheListenSocket896(t *testing.T) {
+	for _, tc := range tiers896 {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newAcceptRig896(t, tc.tier(), true)
+			placed := fillSQ896(t, r.w)
+			r.w.endOwedOpsAtShutdown()
+			r.closeListener()
+			if err := plainBind896(r.addr); err != nil {
+				t.Fatalf("a plain bind of %s right after the drain with a full SQ ring (%d NOPs queued): %v", r.addr, placed, err)
+			}
+			if g := r.w.handoffLoss.shutdownListenCancelGaveUp.Load(); g != 0 {
+				t.Fatalf("the drain gave up %d times: the ring was submitted and the cancel placed", g)
+			}
+		})
+	}
+}
+
+// TestShutdownDrainIgnoresAnotherSocketsAcceptEnd896: a terminal accept CQE of
+// another listen socket sits unread in the CQ ring when the drain starts (a
+// pause, a resume and a shutdown close together leave such a CQE). The drain
+// ends its wait on the accept of the socket it cancelled, not on that one (the
+// user data carries the descriptor). On a kernel that posts the accept's end
+// inside the one enter the two orders are not told apart by the outcome, so this
+// pins only that the stale CQE does not break the wait: no give-up, the port
+// free, and the stale CQE consumed.
+func TestShutdownDrainIgnoresAnotherSocketsAcceptEnd896(t *testing.T) {
+	for _, tc := range tiers896 {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newAcceptRig896(t, tc.tier(), true)
+			other, err := createListenSocket(freeAddr639(t), false)
+			if err != nil {
+				t.Fatalf("createListenSocket: %v", err)
+			}
+			defer func() { _ = unix.Close(other) }()
+			sqe := r.w.ring.GetSQE()
+			prepMultishotAccept(sqe, other)
+			setSQEUserData(sqe, encodeUserData(udAccept, other))
+			sqe = r.w.ring.GetSQE()
+			prepCancelFDDriver(sqe, other)
+			setSQEUserData(sqe, encodeUserData(udProvide, other))
+			if err := r.w.ring.SubmitAndWaitTimeout(50 * time.Millisecond); err != nil {
+				t.Fatalf("submit: %v", err)
+			}
+			r.w.endOwedOpsAtShutdown()
+			r.closeListener()
+			if err := plainBind896(r.addr); err != nil {
+				t.Fatalf("a plain bind of %s right after the drain: %v", r.addr, err)
+			}
+			if g := r.w.handoffLoss.shutdownListenCancelGaveUp.Load(); g != 0 {
+				t.Fatalf("the drain gave up %d times", g)
+			}
+		})
+	}
+}
