@@ -438,8 +438,20 @@ func (c *ClusterClient) measureLatencyLocked(ctx context.Context) {
 		if err := n.client.Ping(ctx); err != nil {
 			continue
 		}
-		n.latency.Store(time.Since(start).Nanoseconds())
+		n.latency.Store(latencyNanos(time.Since(start)))
 	}
+}
+
+// latencyNanos converts a measured round trip to the value stored in
+// clusterNode.latency, where 0 means "not measured". A clock coarser than the
+// round trip (Windows reads the system tick, up to ~15 ms, so a loopback PING
+// measures 0) must not turn a measurement into the absence of one: the fast
+// node would then lose to a slow node that did measure.
+func latencyNanos(d time.Duration) int64 {
+	if d <= 0 {
+		return 1
+	}
+	return d.Nanoseconds()
 }
 
 // refreshLoop runs refreshTopology periodically (every 60s) in the
