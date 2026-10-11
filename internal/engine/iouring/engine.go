@@ -14,6 +14,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/internal/bindiag"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/probe"
@@ -325,6 +326,11 @@ func logAsyncCancelProbe(l *slog.Logger, p asyncCancelProbe, reason string, kern
 	}
 }
 
+// portHoldHook is called by Listen with the address a port 0 was resolved
+// to, while the hold on that port is held and no worker has bound it yet. A
+// test hook (celeris#895), nil outside tests.
+var portHoldHook func(addr string)
+
 // Listen starts the io_uring engine and blocks until context is canceled.
 func (e *Engine) Listen(ctx context.Context) error {
 	// If a listener was provided (StartWithListener), use its bound address
@@ -338,6 +344,23 @@ func (e *Engine) Listen(ctx context.Context) error {
 		}
 		_ = e.cfg.Listener.Close()
 		e.cfg.Listener = nil
+	}
+
+	// celeris#895: decide a port 0 once, before any worker binds. Every
+	// worker binds e.cfg.Addr itself, and so does a worker that re-creates
+	// its listen socket on ResumeAccept, so each bind of port 0 would pick a
+	// port of its own. The hold keeps the chosen port until Listen returns,
+	// not only until every worker is listening: a pause closes every listen
+	// socket and the resume binds the port again, which nothing else may have
+	// taken in between. It never listens, so it takes no connection.
+	concrete, hold, err := bindiag.ResolvePort0(e.cfg.Addr, parseAddr)
+	if err != nil {
+		return fmt.Errorf("io_uring: %w", err)
+	}
+	defer func() { _ = hold.Close() }()
+	e.cfg.Addr = concrete
+	if portHoldHook != nil {
+		portHoldHook(concrete)
 	}
 
 	resolved := e.cfg.Resources.Resolve()

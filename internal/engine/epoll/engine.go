@@ -13,6 +13,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/internal/bindiag"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
@@ -87,6 +88,11 @@ type Engine struct {
 	drainBudget atomic.Pointer[context.Context]
 }
 
+// portHoldHook is called by Listen with the address a port 0 was resolved
+// to, while the hold on that port is held and no loop has bound it yet. A
+// test hook (celeris#895), nil outside tests.
+var portHoldHook func(addr string)
+
 // New creates a new epoll engine.
 func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	cfg = cfg.WithDefaults()
@@ -118,6 +124,23 @@ func (e *Engine) Listen(ctx context.Context) error {
 		}
 		_ = e.cfg.Listener.Close()
 		e.cfg.Listener = nil
+	}
+
+	// celeris#895: decide a port 0 once, before any loop binds. Every loop
+	// binds e.cfg.Addr itself, and so does a loop that re-creates its listen
+	// socket on ResumeAccept, so each bind of port 0 would pick a port of its
+	// own. The hold keeps the chosen port until Listen returns, not only
+	// until every loop is listening: a pause closes every listen socket and
+	// the resume binds the port again, which nothing else may have taken in
+	// between. It never listens, so it takes no connection.
+	concrete, hold, err := bindiag.ResolvePort0(e.cfg.Addr, parseAddr)
+	if err != nil {
+		return fmt.Errorf("epoll: %w", err)
+	}
+	defer func() { _ = hold.Close() }()
+	e.cfg.Addr = concrete
+	if portHoldHook != nil {
+		portHoldHook(concrete)
 	}
 
 	resolved := e.cfg.Resources.Resolve()

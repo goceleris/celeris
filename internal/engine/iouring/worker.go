@@ -2525,29 +2525,87 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 }
 
 // cancelAccept cancels the accept armed on the listen socket lfd, which the
-// caller has already taken out of w.listenFD, and handles the completions it
-// produces before the caller closes lfd. The cancel releases the kernel's
-// io_uring reference to the socket's file, so the close takes it out of the
-// SO_REUSEPORT group at once; unix.Close alone left a phantom socket that
-// intercepted connections.
+// caller has already taken out of w.listenFD, waits for it to end, and handles
+// the completions it meets meanwhile, all before the caller closes lfd. The
+// accept holds a reference to the socket's file, so a close(2) made while it
+// is armed leaves the socket bound and LISTENing, in the SO_REUSEPORT group,
+// until the kernel drops that reference: unix.Close alone left a phantom
+// socket that intercepted connections (celeris#662), and for as long as the
+// ring stays open a port nobody can bind (celeris#896). Once the accept has
+// delivered its terminal CQE the close is the last reference and releases the
+// socket before close(2) returns.
+//
+// Two callers close a listen socket through here: the pause
+// (closeListenerAfterDrain) and stopAccepting, which Server.Shutdown reaches
+// whenever HTTP/2 stream handlers are still running or a send drain has passed
+// shutdownSendDrainNanos. The wait is the shutdown drain's
+// (queueListenAcceptCancel, endOwedOpsAtShutdown): the cancel keeps its CQE
+// (IORING_ASYNC_CANCEL_ALL answers 0 when nothing was armed, which a
+// skip-success cancel never posts), the wait ends on the accept's own terminal
+// CQE for lfd or on the cancel's answer that nothing is armed, and is bounded
+// by shutdownFDDrainNanos. A full SQ ring is submitted once to make room
+// (getCancelSQE); only a ring still full after that, or a wait that runs out,
+// is a give-up, counted and logged (noteListenCancelGaveUp). Every other
+// completion is handled as the loop would (processCQE), so a connection the
+// accept delivered meanwhile is served.
 func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
-	if sqe := w.ring.GetSQE(); sqe != nil {
-		prepCancelFDSkipSuccess(sqe, lfd)
-		setSQEUserData(sqe, 0)
-		// Submit and wait for the cancel to complete before closing.
-		_ = w.ring.SubmitAndWaitTimeout(50 * time.Millisecond)
-		// Process CQEs: skip cancel completions (userData=0), handle
-		// everything else normally to avoid breaking active connections.
-		cancelNow := time.Now().UnixNano()
-		cqH, cqT := w.ring.BeginCQ()
-		for cqH != cqT {
-			entry := w.ring.cqeAt(cqH)
-			if entry.UserData != 0 {
-				w.processCQE(ctx, entry, cancelNow)
+	if h := cancelAcceptSeam; h != nil {
+		h(w, lfd)
+	}
+	sqe := w.getCancelSQE()
+	if sqe == nil {
+		w.noteListenCancelGaveUp(errors.New("the SQ ring is full"))
+		return
+	}
+	prepCancelFDDriver(sqe, lfd)
+	setSQEUserData(sqe, encodeUserData(udListenCancel, lfd))
+	var ringErr error
+	acceptOwed := true
+	deadline := time.Now().UnixNano() + shutdownFDDrainNanos
+	for acceptOwed && time.Now().UnixNano() < deadline {
+		if err := shutdownRingWait(w.ring, 10*time.Millisecond); err != nil {
+			if !ringWaitRetryable(err) {
+				ringErr = err
+				break
 			}
-			cqH++
+			// The CQ ring is full (celeris#873): reap it, below, and enter
+			// again; with nothing to reap give the kernel a moment.
+			if h, t := w.ring.BeginCQ(); h == t {
+				time.Sleep(50 * time.Microsecond)
+			}
 		}
-		w.ring.EndCQ(cqH)
+		now := time.Now().UnixNano()
+		head, tail := w.ring.BeginCQ()
+		for ; head != tail; head++ {
+			c := w.ring.cqeAt(head)
+			ud := c.UserData
+			switch {
+			case ud == 0:
+				// A completion with no owner (a no-op, or a cancel's that
+				// skips its success CQE): nothing to do.
+			case ud&udMask == udListenCancel:
+				// The cancel's own CQE (ours: the tag carries lfd). Not for
+				// processCQE, which has no case for it.
+				if acceptOwed && decodeFD(ud) == lfd {
+					done, err := listenCancelAnswer(c.Res)
+					if err != nil {
+						w.noteListenCancelGaveUp(err)
+					}
+					if done {
+						acceptOwed = false
+					}
+				}
+			default:
+				w.processCQE(ctx, c, now)
+				if ud&udMask == udAccept && decodeFD(ud) == lfd && !cqeHasMore(c.Flags) {
+					acceptOwed = false
+				}
+			}
+		}
+		w.ring.EndCQ(head)
+	}
+	if acceptOwed {
+		w.noteListenCancelGaveUp(ringErr)
 	}
 }
 
@@ -7313,6 +7371,11 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 			return nil, fmt.Errorf("invalid port: %s", portStr)
 		}
 		port = port*10 + int(c-'0')
+		if port > 65535 {
+			// "1.2.3.4:18446744073709551616" wrapped to port 0, which Listen
+			// then took for a request for an ephemeral port.
+			return nil, fmt.Errorf("invalid port: %s", portStr)
+		}
 	}
 
 	if host == "" || host == "0.0.0.0" {
@@ -7336,19 +7399,36 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 	parts := [4]byte{}
 	partIdx := 0
 	val := 0
+	digits := 0 // digits in the byte being read
 	for _, c := range host {
 		if c == '.' {
-			if partIdx >= 3 {
+			if partIdx >= 3 || digits == 0 {
 				return nil, fmt.Errorf("invalid addr: %s", addr)
 			}
 			parts[partIdx] = byte(val)
 			partIdx++
 			val = 0
+			digits = 0
 		} else if c >= '0' && c <= '9' {
+			if digits > 0 && val == 0 {
+				// "0127.0.0.1" and "010.0.0.1": a leading zero is ambiguous
+				// (octal in some parsers); net.ParseIP and std refuse it.
+				return nil, fmt.Errorf("invalid addr: %s", addr)
+			}
 			val = val*10 + int(c-'0')
+			digits++
+			if val > 255 {
+				// "300.1.1.1" used to wrap to 44.1.1.1 and bind that.
+				return nil, fmt.Errorf("invalid addr: %s", addr)
+			}
 		} else {
 			return nil, fmt.Errorf("invalid addr: %s", addr)
 		}
+	}
+	// "1.2.3" bound 1.2.3.0, "10" bound 10.0.0.0 and "1..2.3" bound
+	// 1.0.2.3: an address of four bytes, each written, or an error.
+	if partIdx != 3 || digits == 0 {
+		return nil, fmt.Errorf("invalid addr: %s", addr)
 	}
 	parts[partIdx] = byte(val)
 	sa.Addr = parts

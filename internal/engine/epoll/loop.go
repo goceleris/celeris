@@ -4516,6 +4516,11 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 			return nil, fmt.Errorf("invalid port: %s", portStr)
 		}
 		port = port*10 + int(c-'0')
+		if port > 65535 {
+			// "1.2.3.4:18446744073709551616" wrapped to port 0, which Listen
+			// then took for a request for an ephemeral port.
+			return nil, fmt.Errorf("invalid port: %s", portStr)
+		}
 	}
 
 	if host == "" || host == "0.0.0.0" {
@@ -4539,16 +4544,39 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 	parts := [4]byte{}
 	partIdx := 0
 	val := 0
+	digits := 0 // digits in the byte being read
 	for _, c := range host {
 		if c == '.' {
+			// A fourth dot would index past parts: the loop goroutine
+			// panicked on "1.2.3.4.5:80", which Config.Validate accepts
+			// (io_uring's parseAddr has had this guard).
+			if partIdx >= 3 || digits == 0 {
+				return nil, fmt.Errorf("invalid addr: %s", addr)
+			}
 			parts[partIdx] = byte(val)
 			partIdx++
 			val = 0
+			digits = 0
 		} else if c >= '0' && c <= '9' {
+			if digits > 0 && val == 0 {
+				// "0127.0.0.1" and "010.0.0.1": a leading zero is ambiguous
+				// (octal in some parsers); net.ParseIP and std refuse it.
+				return nil, fmt.Errorf("invalid addr: %s", addr)
+			}
 			val = val*10 + int(c-'0')
+			digits++
+			if val > 255 {
+				// "300.1.1.1" used to wrap to 44.1.1.1 and bind that.
+				return nil, fmt.Errorf("invalid addr: %s", addr)
+			}
 		} else {
 			return nil, fmt.Errorf("invalid addr: %s", addr)
 		}
+	}
+	// "1.2.3" bound 1.2.3.0, "10" bound 10.0.0.0 and "1..2.3" bound
+	// 1.0.2.3: an address of four bytes, each written, or an error.
+	if partIdx != 3 || digits == 0 {
+		return nil, fmt.Errorf("invalid addr: %s", addr)
 	}
 	parts[partIdx] = byte(val)
 	sa.Addr = parts

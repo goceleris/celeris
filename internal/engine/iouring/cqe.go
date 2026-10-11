@@ -81,6 +81,13 @@ const (
 	// iff HeaderDeadlineNs is still > 0 and now > deadline (race-free
 	// against ClearHeaderDeadline). New in v1.4.11.
 	udHeaderTimer uint64 = 0x08 << 56
+	// udListenCancel tags the ASYNC_CANCEL that a close of the listen socket
+	// submits for the accept armed on it (celeris#896): worker shutdown's drain
+	// and cancelAccept, the pause's and stopAccepting's. Its CQE is read only by
+	// the wait that made it (endOwedOpsAtShutdown, cancelAccept); the main
+	// dispatcher has no case for it, so one that is read elsewhere is dropped. A tag of its
+	// own, not udProvide's, so it cannot be mistaken for a close-path cancel's.
+	udListenCancel uint64 = 0x0A << 56
 	// Driver tags for EventLoopProvider — kept non-overlapping with HTTP tags
 	// so the main CQE dispatch can route them to the driver path without
 	// consulting the driverConns map.

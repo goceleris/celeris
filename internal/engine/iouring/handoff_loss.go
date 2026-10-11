@@ -136,6 +136,11 @@ import (
 //   - shutdownDrainGaveUp: worker shutdowns whose drain ended with an op still
 //     owed (its bound ran out or the ring failed), so descriptors were closed
 //     under it (celeris#873). Must stay 0.
+//   - shutdownListenCancelGaveUp: worker shutdowns that closed their listen
+//     socket with the accept armed on it not yet ended (the cancel could not
+//     be queued, was refused, or its completion did not come within the
+//     drain's bound), so the port stayed bound until the ring's teardown
+//     (celeris#896). Must stay 0.
 //   - shutdownSendDrainGaveUp: worker shutdowns whose send drain ended at its
 //     bound with response bytes still unsent, so connections were closed on
 //     them (celeris#806). A rate: it needs a client that does not read.
@@ -162,6 +167,10 @@ type handoffLossStats struct {
 	shutdownSendDrainGaveUp   atomic.Uint64
 	zcHeldNow                 atomic.Int64
 	zcHeldBytes               atomic.Int64
+
+	// Appended after the rest, as a section of its own, so no field moves
+	// (celeris#896).
+	shutdownListenCancelGaveUp atomic.Uint64
 }
 
 func (s *handoffLossStats) noteCloseFDForced() {
@@ -189,6 +198,16 @@ func (s *handoffLossStats) noteCloseCancelMissedHeld() {
 func (s *handoffLossStats) noteShutdownDrainGaveUp() {
 	if s != nil {
 		s.shutdownDrainGaveUp.Add(1)
+	}
+}
+
+// noteShutdownListenCancelGaveUp counts a worker shutdown that closed its
+// listen socket with the accept armed on it not yet ended (celeris#896). Once
+// per worker shutdown. Must stay 0 on a healthy kernel. Not an EngineMetrics
+// field: the WARN is the signal.
+func (s *handoffLossStats) noteShutdownListenCancelGaveUp() {
+	if s != nil {
+		s.shutdownListenCancelGaveUp.Add(1)
 	}
 }
 
