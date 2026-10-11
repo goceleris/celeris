@@ -815,13 +815,14 @@ func listenCancelAnswer(res int32) (done bool, err error) {
 	return false, nil
 }
 
-// noteListenCancelGaveUp records that worker shutdown could not wait for the
-// accept on its listen socket to end (queueListenAcceptCancel, the drain in
-// endOwedOpsAtShutdown): the socket is then closed with the accept still
-// holding it, and stays bound until the ring's teardown, so a Listen that
-// returns can still see its port taken (celeris#896). Counted once per worker
-// shutdown and logged; must stay 0 on a healthy kernel. Not an EngineMetrics
-// field: the WARN is the signal.
+// noteListenCancelGaveUp records that a close of the listen socket could not wait
+// for the accept armed on it to end (queueListenAcceptCancel and the drain in
+// endOwedOpsAtShutdown, or cancelAccept for the pause and stopAccepting): the
+// socket is then closed with the accept still holding it, and stays bound until
+// the ring's teardown, so a Listen that returns, or a pause that completes, can
+// still see its port taken (celeris#896). Counted once per close and logged;
+// must stay 0 on a healthy kernel. Not an EngineMetrics field: the WARN is the
+// signal.
 func (w *Worker) noteListenCancelGaveUp(reason error) {
 	w.handoffLoss.noteShutdownListenCancelGaveUp()
 	if w.logger == nil {
@@ -831,8 +832,8 @@ func (w *Worker) noteListenCancelGaveUp(reason error) {
 	if reason != nil {
 		attrs = append(attrs, "err", reason)
 	}
-	w.logger.Warn("io_uring shutdown: the accept on the listen socket did not end before the socket was closed; "+
-		"the port may stay bound for a few ms after Listen returns", attrs...)
+	w.logger.Warn("io_uring: the accept on the listen socket did not end before the socket was closed (shutdown, pause or stopAccepting); "+
+		"the port may stay bound for a few ms after the close", attrs...)
 }
 
 // noteShutdownDrainGaveUp records that endOwedOpsAtShutdown ended with ops
