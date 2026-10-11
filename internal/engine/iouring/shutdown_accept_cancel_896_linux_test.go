@@ -21,8 +21,19 @@ import (
 // is deterministic where the engine-level tests measure a ~2 ms window.
 
 type acceptRig896 struct {
-	w    *Worker
-	addr string
+	w          *Worker
+	addr       string
+	ring       *Ring
+	ringClosed bool
+}
+
+// closeRing closes the rig's ring now, for a test that makes many rigs; the
+// cleanup then leaves it.
+func (r *acceptRig896) closeRing() {
+	if !r.ringClosed {
+		r.ringClosed = true
+		_ = r.ring.Close()
+	}
 }
 
 // newAcceptRig896 makes a worker with a ring of the tier's kind and a listen
@@ -36,7 +47,8 @@ func newAcceptRig896(t *testing.T, tier TierStrategy, arm bool) *acceptRig896 {
 	if err != nil {
 		skipOrFail656(t, "io_uring unavailable for tier %v: %v", tier.Tier(), err)
 	}
-	t.Cleanup(func() { _ = ring.Close() })
+	rig := &acceptRig896{ring: ring}
+	t.Cleanup(func() { rig.closeRing() })
 	addr := freeAddr639(t)
 	lfd, err := createListenSocket(addr, false)
 	if err != nil {
@@ -44,6 +56,7 @@ func newAcceptRig896(t *testing.T, tier TierStrategy, arm bool) *acceptRig896 {
 	}
 	w := newLedgerWorker(lfd)
 	w.ring = ring
+	rig.w, rig.addr = w, addr
 	w.tier = tier
 	w.listenFD = lfd
 	w.handoffLoss = &handoffLossStats{}
@@ -58,7 +71,7 @@ func newAcceptRig896(t *testing.T, tier TierStrategy, arm bool) *acceptRig896 {
 			t.Fatalf("submit accept: %v", err)
 		}
 	}
-	return &acceptRig896{w: w, addr: addr}
+	return rig
 }
 
 // closeListener closes the worker's listen descriptor, as shutdown does after

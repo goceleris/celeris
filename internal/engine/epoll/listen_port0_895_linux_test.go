@@ -331,3 +331,53 @@ func TestFixedPortIsBoundAsGivenControl895(t *testing.T) {
 		t.Fatalf("LISTEN sockets by port %v, want %d on %d", c.listening, loops, port)
 	}
 }
+
+// TestResumeAfterThePortWasTaken895 pins what a resume does when the port it
+// re-binds was taken while accepting was paused, which only a fixed port allows
+// (a port 0 engine's hold refuses every plain listener, the test above). Each
+// loop's re-create fails; the loop counts it (ErrorListenerRecreate), logs it
+// and ends itself, and ResumeAccept, which only unparks the loops and cannot
+// wait for their sockets, has returned nil by then. The engine is left running
+// with no listener until its context is cancelled, which is the behaviour
+// ErrorListenerRecreate's doc describes ("an engine that has lost accept
+// capacity"); Server.ResumeAccept's doc says so too (celeris#895).
+func TestResumeAfterThePortWasTaken895(t *testing.T) {
+	const loops = 3
+	tmp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pick port: %v", err)
+	}
+	addr := tmp.Addr().String()
+	_ = tmp.Close()
+	r := start895(t, addr, loops, true)
+	if err := r.e.PauseAccept(); err != nil {
+		t.Fatalf("PauseAccept: %v", err)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("a fixed port has no hold, so a plain listener should take it while paused: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	if err := r.e.ResumeAccept(); err != nil {
+		t.Fatalf("ResumeAccept: %v", err)
+	}
+	var lost uint64
+	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(5 * time.Millisecond) {
+		if lost = r.e.Metrics().ErrorListenerRecreate; lost >= loops {
+			break
+		}
+	}
+	t.Logf("%d loops; after a resume onto a taken port ErrorListenerRecreate = %d", loops, lost)
+	if lost != loops {
+		t.Fatalf("ErrorListenerRecreate = %d, want %d (one per loop): the lost listener is not reported", lost, loops)
+	}
+	select {
+	case err := <-r.done:
+		r.done <- err
+		t.Fatalf("Listen returned (%v) on its own; the engine is documented to keep running without a listener", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := r.stop(t); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+}

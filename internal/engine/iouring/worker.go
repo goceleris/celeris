@@ -2531,6 +2531,9 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 // SO_REUSEPORT group at once; unix.Close alone left a phantom socket that
 // intercepted connections.
 func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
+	if h := cancelAcceptSeam; h != nil {
+		h(w, lfd)
+	}
 	if sqe := w.ring.GetSQE(); sqe != nil {
 		prepCancelFDSkipSuccess(sqe, lfd)
 		setSQEUserData(sqe, 0)

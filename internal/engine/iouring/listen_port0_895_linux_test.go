@@ -365,3 +365,109 @@ func TestFixedPortIsBoundAsGivenControl895(t *testing.T) {
 		t.Fatalf("LISTEN sockets by port %v, want %d on %d", c.listening, n, port)
 	}
 }
+
+// TestPort0PauseResumeWithManyWorkers895: the pause/resume arm of the hold with
+// four workers, twice over (CI ran the arms above with the one worker an 8 MiB
+// memlock funds; this one needs four and fails, not skips, under
+// CELERIS_REQUIRE_IOURING_WORKERS=1). Each cycle closes four listen sockets and
+// binds four again on the one port: a plain listener is refused in between, every
+// worker is listening on the published port after the resume, a request is
+// served, and the port is free the instant Listen returns.
+func TestPort0PauseResumeWithManyWorkers895(t *testing.T) {
+	const workers = 4
+	r := start895(t, "127.0.0.1:0", workers, workers, true)
+	r.e.mu.Lock()
+	got := len(r.e.workers)
+	r.e.mu.Unlock()
+	if got != workers {
+		t.Fatalf("the engine runs %d workers, want %d", got, workers)
+	}
+	addrPort := portOf895(t, r.e.Addr())
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(addrPort))
+	for cycle := 1; cycle <= 2; cycle++ {
+		if err := r.e.PauseAccept(); err != nil {
+			t.Fatalf("cycle %d: PauseAccept: %v", cycle, err)
+		}
+		if n := census895(t).listening[addrPort]; n != 0 {
+			t.Fatalf("cycle %d: %d listen sockets on port %d after PauseAccept, want 0", cycle, n, addrPort)
+		}
+		if ln, err := net.Listen("tcp", addr); err == nil {
+			_ = ln.Close()
+			t.Fatalf("cycle %d: a plain net.Listen on %s succeeded while all %d workers were paused", cycle, addr, workers)
+		} else if !errors.Is(err, unix.EADDRINUSE) {
+			t.Fatalf("cycle %d: net.Listen on %s while paused: %v, want EADDRINUSE", cycle, addr, err)
+		}
+		if err := r.e.ResumeAccept(); err != nil {
+			t.Fatalf("cycle %d: ResumeAccept: %v", cycle, err)
+		}
+		var c sockets895
+		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(5 * time.Millisecond) {
+			if c = census895(t); c.listening[addrPort] >= workers {
+				break
+			}
+		}
+		t.Logf("cycle %d: after resume, LISTEN sockets by port: %v (Addr() port %d)", cycle, c.listening, addrPort)
+		if gotPorts := ports895(c.listening); len(gotPorts) != 1 || gotPorts[0] != addrPort || c.listening[addrPort] != workers {
+			t.Fatalf("cycle %d: LISTEN sockets by port %v, want %d on the published %d", cycle, c.listening, workers, addrPort)
+		}
+		get895(t, addr)
+	}
+	if err := r.stop(t); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	if n := census895(t).bound[addrPort]; n != 0 {
+		t.Fatalf("%d sockets still bound to port %d after Listen returned, want 0", n, addrPort)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("net.Listen on %s the instant Listen returned: %v", addr, err)
+	}
+	_ = ln.Close()
+}
+
+// TestResumeAfterThePortWasTaken895 pins what a resume does when the port it
+// re-binds was taken while accepting was paused, which only a fixed port allows
+// (a port 0 engine's hold refuses every plain listener, the test above). Each
+// worker's re-create fails; the worker counts it (ErrorListenerRecreate), logs
+// it and ends itself, and ResumeAccept, which only wakes the workers and cannot
+// wait for their sockets, has returned nil by then. The engine is left running
+// with no listener until its context is cancelled, which is the behaviour
+// ErrorListenerRecreate's doc describes ("an engine that has lost accept
+// capacity"); Server.ResumeAccept's doc says so too (celeris#895).
+func TestResumeAfterThePortWasTaken895(t *testing.T) {
+	addr := freeAddr639(t)
+	r := start895(t, addr, 2, 1, true)
+	r.e.mu.Lock()
+	workers := len(r.e.workers)
+	r.e.mu.Unlock()
+	if err := r.e.PauseAccept(); err != nil {
+		t.Fatalf("PauseAccept: %v", err)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("a fixed port has no hold, so a plain listener should take it while paused: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	if err := r.e.ResumeAccept(); err != nil {
+		t.Fatalf("ResumeAccept: %v", err)
+	}
+	var lost uint64
+	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(5 * time.Millisecond) {
+		if lost = r.e.Metrics().ErrorListenerRecreate; lost >= uint64(workers) {
+			break
+		}
+	}
+	t.Logf("%d workers; after a resume onto a taken port ErrorListenerRecreate = %d", workers, lost)
+	if lost != uint64(workers) {
+		t.Fatalf("ErrorListenerRecreate = %d, want %d (one per worker): the lost listener is not reported", lost, workers)
+	}
+	select {
+	case err := <-r.done:
+		r.done <- err
+		t.Fatalf("Listen returned (%v) on its own; the engine is documented to keep running without a listener", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := r.stop(t); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+}
