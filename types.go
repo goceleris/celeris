@@ -17,6 +17,17 @@ import "time"
 // Goexit, but what it costs depends on the protocol: on HTTP/1.1 the native
 // engines close that connection and log an Error; on HTTP/2 only that
 // stream's goroutine ends, the stream gets no response, and nothing is logged.
+//
+// Being a route's handler is not what decides it: this applies to every
+// HandlerFunc that runs on the loop. For a request that no route matches, the
+// global middleware ([Server.Use]) and the [Server.NotFound] or
+// [Server.MethodNotAllowed] handler run inline whatever the routes are marked
+// (see [Config.AsyncHandlers]), so they must not call Goexit either. For a
+// request that matches a route, the global middleware runs as part of that
+// route's chain, on the goroutine the route's handler runs on. The
+// [Config.OnConnect], [Config.OnDisconnect] and [Config.OnExpectContinue]
+// callbacks run on the loop as well.
+//
 // The [Std] engine runs each request on its own goroutine, so a Goexit there
 // ends that request's goroutine, not a loop (net/http closes an HTTP/1.1
 // connection whose handler Goexits). See [Route.Async] and [Route.Sync].

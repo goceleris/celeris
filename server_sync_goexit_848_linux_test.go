@@ -164,11 +164,18 @@ type rig848 struct {
 // empty (a fixed port), through cfg.
 func start848(t *testing.T, cfg celeris.Config) *rig848 {
 	t.Helper()
+	return start848With(t, cfg, nil)
+}
+
+// start848With is start848 with setup, which runs on the new server before
+// any route is registered (so it can call Use, NotFound and so on).
+func start848With(t *testing.T, cfg celeris.Config, setup func(r *rig848)) *rig848 {
+	t.Helper()
 	// A start that fails only with ENOMEM (io_uring ring memory still charged
 	// to RLIMIT_MEMLOCK, see keptProbeIOUring) is retried with a new server.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		r, err := tryStart848(t, cfg)
+		r, err := tryStart848(t, cfg, setup)
 		if err == nil {
 			return r
 		}
@@ -180,7 +187,7 @@ func start848(t *testing.T, cfg celeris.Config) *rig848 {
 	}
 }
 
-func tryStart848(t *testing.T, cfg celeris.Config) (*rig848, error) {
+func tryStart848(t *testing.T, cfg celeris.Config, setup func(r *rig848)) (*rig848, error) {
 	t.Helper()
 	r := &rig848{t: t, logs: &capture848{}}
 	cfg.Logger = slog.New(r.logs)
@@ -188,6 +195,9 @@ func tryStart848(t *testing.T, cfg celeris.Config) (*rig848, error) {
 		cfg.Workers = 2
 	}
 	r.s = celeris.New(cfg)
+	if setup != nil {
+		setup(r)
+	}
 	r.s.GET("/boom", func(c *celeris.Context) error {
 		r.hits.Add(1)
 		runtime.Goexit()

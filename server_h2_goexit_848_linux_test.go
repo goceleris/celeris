@@ -3,6 +3,7 @@
 package celeris_test
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net"
@@ -13,19 +14,34 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/goceleris/celeris"
 )
 
-// celeris#848 on HTTP/2 (h2c, prior knowledge). The docs state two outcomes of
-// a runtime.Goexit in a handler, by where the stream runs:
-//   - an inline stream (a GET on a route that is not async) runs on the event
-//     loop's goroutine: the loop ends and the engine logs the loop-exit record;
-//   - a stream on the h2 worker pool (here: an async route) does not run on the
-//     loop: the loop keeps serving, and the engine does not report a loop exit.
+// celeris#848 on HTTP/2 (h2c, prior knowledge). The docs (stream.Handler,
+// Route.Sync, README) state two outcomes of a runtime.Goexit in a handler, by
+// where the stream runs. Processor.runHandler sends a stream to the event loop
+// when its request has ended (every frame path sets that before it runs the
+// handler, so whether the request has a body does not matter), its route is
+// not async and its connection is within the outbound budget. So:
+//   - a stream of a sync route runs on the event loop's goroutine whatever
+//     its request carries (a GET; a POST with a body; a header block split by
+//     CONTINUATION frames; a body followed by trailers): the loop ends and the
+//     engine logs the loop-exit record. Tests: TestH2InlineStreamGoexitIsLoud848
+//     (GET) and TestH2InlineShapesGoexitAreLoud848 (the others);
+//   - a stream on the h2 worker pool does not run on the loop: the loop keeps
+//     serving, the stream gets no answer and no RST_STREAM, the connection
+//     keeps its other streams, and the engine does not report a loop exit.
+//     That happens for an async route (TestH2AsyncStreamGoexitKeepsTheLoop848,
+//     a GET and a POST with a body) and for a sync route on a connection that
+//     already holds OutboundBudget (4 MiB) of response data
+//     (TestH2OverBudgetStreamGoexitKeepsTheLoop848).
 //
 // The second is a documented limit, not a promise of loudness: that stream gets
-// no answer (the RESULT line logs the Error records it saw, 0 today). The test
-// pins only that the loop survives and no loop-exit record is written.
+// no answer (the RESULT line logs the Error records it saw, 0 today). The tests
+// pin that the loop survives and no loop-exit record is written.
 
 type h2rig848 struct {
 	s      *celeris.Server
@@ -48,6 +64,19 @@ func (r *h2rig848) newServer(eng celeris.EngineType) {
 		runtime.Goexit()
 		return nil
 	}).Async()
+	r.s.POST("/pboom", func(c *celeris.Context) error {
+		r.hits.Add(1)
+		runtime.Goexit()
+		return nil
+	})
+	r.s.POST("/apboom", func(c *celeris.Context) error {
+		r.hits.Add(1)
+		runtime.Goexit()
+		return nil
+	}).Async()
+	r.s.GET("/fill", func(c *celeris.Context) error {
+		return c.Blob(200, "application/octet-stream", fillBody848)
+	})
 	r.s.GET("/ok", func(c *celeris.Context) error { return c.String(200, "ok") })
 }
 
@@ -147,8 +176,9 @@ func TestH2InlineStreamGoexitIsLoud848(t *testing.T) {
 			recs = r.logs.exits()
 			answered, tried := h2Probe848(r.addr, 20, 500*time.Millisecond, true)
 			stopped := r.stopWithin(loopExitStop848)
-			t.Logf("celeris848 RESULT H2-INLINE arm=%s hits=%d ok_before=%s boom=%s records=%d probes_until_unanswered=%d/20 stopped=%v",
-				a.name, r.hits.Load(), h2Class848(okBefore, errB), h2Class848(ended, err), len(recs), tried, stopped)
+			after := r.logs.exits()
+			t.Logf("celeris848 RESULT H2-INLINE arm=%s hits=%d ok_before=%s boom=%s records=%d records_after_stop=%d probes_until_unanswered=%d/20 stopped=%v",
+				a.name, r.hits.Load(), h2Class848(okBefore, errB), h2Class848(ended, err), len(recs), len(after), tried, stopped)
 			if !okBefore {
 				t.Fatalf("PREMISE: /ok before the fault was not answered: %s", h2Class848(okBefore, errB))
 			}
@@ -166,6 +196,9 @@ func TestH2InlineStreamGoexitIsLoud848(t *testing.T) {
 			}
 			if !stopped {
 				t.Errorf("the server did not stop within %v of cancel after the fault", loopExitStop848)
+			}
+			if len(after) != 1 {
+				t.Errorf("after the stop there are %d records, want still 1", len(after))
 			}
 		})
 	}
@@ -195,6 +228,291 @@ func TestH2AsyncStreamGoexitKeepsTheLoop848(t *testing.T) {
 			}
 			if exits != 0 {
 				t.Errorf("an async h2 stream's Goexit produced %d loop-exit records, want 0 (the loop did not exit)", exits)
+			}
+			if !stopped {
+				t.Errorf("the server did not stop within %v of cancel", loopExitStop848)
+			}
+		})
+	}
+}
+
+// fill848 is the size of /fill's response: over OutboundBudget (4 MiB) plus
+// the 65,535-byte connection window the peer grants, so a client that grants
+// no WINDOW_UPDATE leaves the connection holding more than the budget.
+const fill848 = 5 << 20
+
+var fillBody848 = body893(fill848)
+
+// h2shape848 is one way a client can send a request on HTTP/2.
+type h2shape848 struct {
+	name   string
+	method string
+	path   string
+	// frames
+	split    bool   // the header block is split: HEADERS without END_HEADERS, then CONTINUATION
+	body     []byte // DATA frames; nil = none
+	trailers bool   // the request ends with a trailer HEADERS frame
+	hdrEnd   bool   // END_STREAM on the HEADERS frame (a request without a body)
+}
+
+// send writes the request as stream id on fw, with the header block encoded
+// by enc into hb.
+func (sh h2shape848) send(fr *http2.Framer, enc *hpack.Encoder, hb *bytes.Buffer, id uint32, addr string) error {
+	hb.Reset()
+	for _, f := range [][2]string{{":method", sh.method}, {":scheme", "http"}, {":authority", addr}, {":path", sh.path}} {
+		if err := enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]}); err != nil {
+			return err
+		}
+	}
+	block := slices.Clone(hb.Bytes())
+	if sh.split {
+		half := len(block) / 2
+		if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:half], EndStream: sh.hdrEnd, EndHeaders: false}); err != nil {
+			return err
+		}
+		if err := fr.WriteContinuation(id, true, block[half:]); err != nil {
+			return err
+		}
+	} else if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block, EndStream: sh.hdrEnd, EndHeaders: true}); err != nil {
+		return err
+	}
+	if sh.hdrEnd {
+		return nil
+	}
+	if sh.trailers {
+		if err := fr.WriteData(id, false, sh.body); err != nil {
+			return err
+		}
+		hb.Reset()
+		if err := enc.WriteField(hpack.HeaderField{Name: "x-trailer", Value: "t"}); err != nil {
+			return err
+		}
+		return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: hb.Bytes(), EndStream: true, EndHeaders: true})
+	}
+	return fr.WriteData(id, true, sh.body)
+}
+
+// h2OnOneConn848 opens one h2c connection, sends stream 1 as sh and waits d
+// for stream 1 to end, then sends stream 3 (GET /ok) on the SAME connection
+// and waits d for it. Each result is "ended", "timeout", "rst:<code>",
+// "goaway:<code>" or "err:<text>".
+func h2OnOneConn848(addr string, sh h2shape848, d time.Duration) (s1, s3 string) {
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return "err:" + err.Error(), ""
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = conn.Write([]byte(http2.ClientPreface))
+	fr := http2.NewFramer(conn, conn)
+	_ = fr.WriteSettings()
+	var hb bytes.Buffer
+	enc := hpack.NewEncoder(&hb)
+	wait := func(id uint32) string {
+		_ = conn.SetReadDeadline(time.Now().Add(d))
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					return "timeout"
+				}
+				return "err:" + err.Error()
+			}
+			switch f := f.(type) {
+			case *http2.SettingsFrame:
+				if !f.IsAck() {
+					_ = fr.WriteSettingsAck()
+				}
+			case *http2.HeadersFrame:
+				if f.StreamID == id && f.StreamEnded() {
+					return "ended"
+				}
+			case *http2.DataFrame:
+				if f.StreamID == id && f.StreamEnded() {
+					return "ended"
+				}
+			case *http2.RSTStreamFrame:
+				if f.StreamID == id {
+					return "rst:" + f.ErrCode.String()
+				}
+			case *http2.GoAwayFrame:
+				return "goaway:" + f.ErrCode.String()
+			}
+		}
+	}
+	if err := sh.send(fr, enc, &hb, 1, addr); err != nil {
+		return "err:" + err.Error(), ""
+	}
+	s1 = wait(1)
+	ok := h2shape848{method: "GET", path: "/ok", hdrEnd: true}
+	if err := ok.send(fr, enc, &hb, 3, addr); err != nil {
+		return s1, "err:" + err.Error()
+	}
+	return s1, wait(3)
+}
+
+var inlineShapes848 = []h2shape848{
+	{name: "post-body", method: "POST", path: "/pboom", body: []byte("hello body")},
+	{name: "post-body-continuation", method: "POST", path: "/pboom", body: []byte("hello body"), split: true},
+	{name: "get-continuation", method: "GET", path: "/boom", hdrEnd: true, split: true},
+	{name: "post-body-trailers", method: "POST", path: "/pboom", body: []byte("hello body"), trailers: true},
+}
+
+// TestH2InlineShapesGoexitAreLoud848: a sync route's stream runs on the event
+// loop whatever its request carries, so its Goexit ends the loop and is
+// reported, as a GET's does (TestH2InlineStreamGoexitIsLoud848). The stream
+// and the next stream of the same connection get no answer.
+func TestH2InlineShapesGoexitAreLoud848(t *testing.T) {
+	for _, sh := range inlineShapes848 {
+		t.Run(sh.name, func(t *testing.T) {
+			for _, a := range arms848()[:2] {
+				t.Run(a.name, func(t *testing.T) {
+					if !child848(t) {
+						return
+					}
+					need848(t, a.eng)
+					r := startH2848(t, a.eng)
+					okBefore, _, errB := h2StreamEnds837(r.addr, "/ok", 2*time.Second)
+					s1, s3 := h2OnOneConn848(r.addr, sh, 2*time.Second)
+					var recs []rec848
+					for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(10 * time.Millisecond) {
+						if recs = r.logs.exits(); len(recs) > 0 {
+							break
+						}
+					}
+					time.Sleep(300 * time.Millisecond) // a second record, if the defect doubled it
+					recs = r.logs.exits()
+					answered, tried := h2Probe848(r.addr, 20, 500*time.Millisecond, true)
+					stopped := r.stopWithin(loopExitStop848)
+					after := r.logs.exits()
+					t.Logf("celeris848 RESULT H2-SHAPE shape=%s arm=%s hits=%d ok_before=%s stream1=%s stream3_same_conn=%s records=%d records_after_stop=%d probes_until_unanswered=%d/20 stopped=%v",
+						sh.name, a.name, r.hits.Load(), h2Class848(okBefore, errB), s1, s3, len(recs), len(after), tried, stopped)
+					if !okBefore {
+						t.Fatalf("PREMISE: /ok before the fault was not answered: %s", h2Class848(okBefore, errB))
+					}
+					if r.hits.Load() != 1 {
+						t.Fatalf("INJECTION: the handler ran %d times, want 1", r.hits.Load())
+					}
+					if len(recs) != 1 {
+						t.Fatalf("celeris#848: a %s stream's Goexit produced %d %q records, want exactly 1 (it ran off the loop)", sh.name, len(recs), loopExitMsg848)
+					}
+					if got := attrStr848(recs[0].attrs["engine"]); !slices.Contains(a.engine, got) {
+						t.Errorf("engine attr = %q, want one of %v", got, a.engine)
+					}
+					if s1 != "timeout" {
+						t.Errorf("stream 1 = %s, want timeout (no response, no RST_STREAM)", s1)
+					}
+					if s3 != "timeout" && s3 != "err:EOF" {
+						t.Errorf("stream 3 on the same connection = %s: the loop is dead, so it must not be answered", s3)
+					}
+					if answered == tried {
+						t.Errorf("PREMISE: all %d fresh conns after the fault were answered, so the loop did not die and the record would be false", tried)
+					}
+					if !stopped {
+						t.Errorf("the server did not stop within %v of cancel after the fault", loopExitStop848)
+					}
+					if len(after) != 1 {
+						t.Errorf("after the stop there are %d records, want still 1", len(after))
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestH2AsyncPostGoexitKeepsTheLoop848: an async route's stream with a request
+// body runs on the h2 worker pool: the loop and the connection keep serving.
+func TestH2AsyncPostGoexitKeepsTheLoop848(t *testing.T) {
+	for _, a := range arms848()[:2] {
+		t.Run(a.name, func(t *testing.T) {
+			need848(t, a.eng)
+			r := startH2848(t, a.eng)
+			s1, s3 := h2OnOneConn848(r.addr, h2shape848{method: "POST", path: "/apboom", body: []byte("hello body")}, 2*time.Second)
+			time.Sleep(300 * time.Millisecond)
+			answered, tried := h2Probe848(r.addr, 20, time.Second, false)
+			stopped := r.stopWithin(loopExitStop848)
+			exits := len(r.logs.exits())
+			t.Logf("celeris848 RESULT H2-ASYNC-POST arm=%s hits=%d stream1=%s stream3_same_conn=%s answered_after=%d/%d loop_exit_records=%d stopped=%v",
+				a.name, r.hits.Load(), s1, s3, answered, tried, exits, stopped)
+			if r.hits.Load() != 1 {
+				t.Fatalf("INJECTION: /apboom ran %d times, want 1", r.hits.Load())
+			}
+			if s1 != "timeout" {
+				t.Errorf("stream 1 = %s, want timeout (no response, no RST_STREAM)", s1)
+			}
+			if s3 != "ended" {
+				t.Errorf("stream 3 on the same connection = %s, want ended: the connection keeps serving its other streams", s3)
+			}
+			if answered != tried {
+				t.Errorf("an async h2 POST's Goexit ended a loop: %d of %d fresh conns were answered afterwards", answered, tried)
+			}
+			if exits != 0 {
+				t.Errorf("an async h2 stream's Goexit produced %d loop-exit records, want 0", exits)
+			}
+			if !stopped {
+				t.Errorf("the server did not stop within %v of cancel", loopExitStop848)
+			}
+		})
+	}
+}
+
+// TestH2OverBudgetStreamGoexitKeepsTheLoop848: a sync route's stream on a
+// connection that holds OutboundBudget bytes of response data runs on the h2
+// worker pool (Processor.runHandler), so the loop survives its Goexit, the
+// stream gets no answer and nothing is logged. The client does not read: /fill
+// (a 5 MiB response, window 65,535) leaves the connection over the budget;
+// then /boom is sent on the same connection. If the budget had not been
+// reached, /boom would run on the loop and the loop-exit check below fails.
+func TestH2OverBudgetStreamGoexitKeepsTheLoop848(t *testing.T) {
+	for _, a := range arms848()[:2] {
+		t.Run(a.name, func(t *testing.T) {
+			need848(t, a.eng)
+			r := startH2848(t, a.eng)
+			c := dialH2Client893(t, r.addr)
+			c.get(t, 1, "/fill", fillBody848)
+			if !c.waitFor(10*time.Second, func() bool { return c.data[1] > 0 }) {
+				t.Fatalf("PREMISE: no DATA of /fill within 10 s")
+			}
+			time.Sleep(500 * time.Millisecond) // the rest is buffered by now
+			c.get(t, 3, "/boom", nil)
+			for dl := time.Now().Add(5 * time.Second); r.hits.Load() == 0 && time.Now().Before(dl); time.Sleep(10 * time.Millisecond) {
+			}
+			time.Sleep(300 * time.Millisecond)
+			exitsEarly := len(r.logs.exits())
+			// The connection is served by a live loop: grant the windows, and
+			// /fill arrives whole, then a new stream is answered.
+			c.replenish.Store(true)
+			c.credit(t, 0, 8<<20)
+			c.credit(t, 1, 8<<20)
+			fillDone := c.waitFor(30*time.Second, func() bool { return c.ended[1] && c.data[1] == fill848 })
+			c.get(t, 5, "/ok", nil)
+			okDone := c.waitFor(5*time.Second, func() bool { return c.ended[5] })
+			c.mu.Lock()
+			boomEnded := c.ended[3]
+			boomRst, boomReset := c.resets[3]
+			c.mu.Unlock()
+			answered, tried := h2Probe848(r.addr, 20, time.Second, false)
+			errs := errorRecords848(r.logs)
+			stopped := r.stopWithin(loopExitStop848)
+			exits := len(r.logs.exits())
+			t.Logf("celeris848 RESULT H2-OVER-BUDGET arm=%s hits=%d loop_exit_records_before_credit=%d fill_complete=%v ok_same_conn=%v boom_ended=%v boom_reset=%v fresh_answered=%d/%d error_records=%d loop_exit_records=%d stopped=%v",
+				a.name, r.hits.Load(), exitsEarly, fillDone, okDone, boomEnded, boomReset, answered, tried, errs, exits, stopped)
+			if r.hits.Load() != 1 {
+				t.Fatalf("INJECTION: /boom ran %d times, want 1", r.hits.Load())
+			}
+			if exitsEarly != 0 || exits != 0 {
+				t.Fatalf("celeris#848: /boom produced loop-exit records (%d, then %d): it ran on the loop, so the connection was not over its outbound budget", exitsEarly, exits)
+			}
+			if boomEnded || boomReset {
+				t.Errorf("stream 3 got a response or a RST_STREAM (ended=%v reset=%v %v), want neither", boomEnded, boomReset, boomRst)
+			}
+			if !fillDone {
+				t.Errorf("the buffered /fill response did not arrive whole after the windows were granted: the connection is not served")
+			}
+			if !okDone {
+				t.Errorf("a new stream on the same connection was not answered")
+			}
+			if answered != tried {
+				t.Errorf("%d of %d fresh conns were answered: a loop died", answered, tried)
 			}
 			if !stopped {
 				t.Errorf("the server did not stop within %v of cancel", loopExitStop848)

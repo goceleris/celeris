@@ -30,21 +30,28 @@ type Hijacker interface {
 // two outcomes on HTTP/2, depending on where the stream runs. Neither can be
 // recovered (recover() returns nil for a Goexit).
 //
-// An inline stream (see Processor.canRunInline: its request has no body, no
-// CONTINUATION is active, the route is not async, and the connection is within
-// its outbound budget) runs on the engine's event-loop goroutine. A Goexit
-// ends that loop for good, and the engine logs one Error, "... goroutine ended
-// without returning" (celeris#848). A panic is recovered here and the stream
-// is closed without a response; through the celeris router a panic is a 500
+// A stream runs inline, on the engine's event-loop goroutine, unless one of
+// the two cases below applies. Whether the request has a body does not matter:
+// every frame path (HEADERS, trailers, the DATA frame that ends the stream, a
+// header block completed by CONTINUATION frames) marks the request ended
+// before it runs the handler, so a POST with a body is as inline as a GET.
+// The checks are Processor.canRunInline (the request has ended; the route is
+// not async) and, in Processor.runHandler, the outbound budget. A Goexit in an
+// inline handler ends that loop for good, and the engine logs one Error, "...
+// goroutine ended without returning" (celeris#848). The stream gets no
+// response, and neither do the other streams of the connection or the other
+// connections of that loop. A panic is recovered here and the stream is
+// closed without a response; through the celeris router a panic is a 500
 // first.
 //
-// Any other stream runs on the h2 worker pool (an async route, a request with
-// a body, a CONTINUATION in progress, a connection over its outbound budget).
-// executeHandler retires such a stream silently. The stream gets no response
-// and no RST_STREAM, nothing is logged, the connection is not closed and keeps
-// serving its other streams, and the pool goroutine that ran the handler ends.
-// Marking a route async keeps a Goexit off the event loop; it does not make
-// the Goexit visible.
+// A stream runs on the h2 worker pool in these two cases only: its route is
+// async, or its connection already holds OutboundBudget bytes of response
+// DATA for the peer's window (celeris#893), which sends even a sync route to
+// the pool. executeHandler retires such a stream silently. The stream gets no
+// response and no RST_STREAM, nothing is logged, the connection is not closed
+// and keeps serving its other streams, and the loop survives. Marking a
+// route async keeps a Goexit off the event loop; it does not make the Goexit
+// visible.
 //
 // On HTTP/1.1 the same Handler runs the request, and the epoll and io_uring
 // engines apply the same split. A sync (inline) handler runs on the event-loop
