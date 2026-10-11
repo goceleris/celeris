@@ -32,9 +32,16 @@ import (
 // takes a connection, and the loops' sockets (same user, SO_REUSEPORT) bind
 // and listen beside it. It keeps every other socket off the port, one that
 // binds with SO_REUSEADDR as net.Listen does included, until the caller
-// closes it, which it does once every loop is listening: the same hold the
+// closes it, which the engine does as Listen returns: the same hold the
 // adaptive engine takes (celeris#616, internal/adaptive/porthold.go), which
-// cannot be shared, as the adaptive package imports the engines.
+// cannot be shared, as the adaptive package imports the engines. The engine
+// keeps it that long, not only until every loop is listening, because a pause
+// closes every listen socket and the resume binds the port again: with the
+// hold released at startup a connect(2) of any process on the host, which
+// takes its source port from the same ephemeral range, could take the port
+// in between, and the resume would fail for good. A socket that binds and
+// never listens is not given a connection, and while it is bound the kernel
+// leaves the port out of that choice of a source port.
 //
 // Unlike adaptive's it sets no SO_REUSEADDR in any case: a port 0 bind is
 // given a port nothing is bound to, so it never meets the leftovers of an

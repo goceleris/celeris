@@ -129,7 +129,10 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// celeris#895: decide a port 0 once, before any loop binds. Every loop
 	// binds e.cfg.Addr itself, and so does a loop that re-creates its listen
 	// socket on ResumeAccept, so each bind of port 0 would pick a port of its
-	// own. The hold keeps the chosen port until every loop is listening.
+	// own. The hold keeps the chosen port until Listen returns, not only
+	// until every loop is listening: a pause closes every listen socket and
+	// the resume binds the port again, which nothing else may have taken in
+	// between. It never listens, so it takes no connection.
 	concrete, hold, err := bindiag.ResolvePort0(e.cfg.Addr, parseAddr)
 	if err != nil {
 		return fmt.Errorf("epoll: %w", err)
@@ -204,8 +207,6 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 	// Every loop has pinned (or failed to) before it reported ready.
 	platform.LogPinOutcome(e.cfg.Logger, "epoll", plan, takePinFailures(loops))
-	// Every loop is listening on the port: the hold has done its work.
-	_ = hold.Close()
 
 	if len(e.loops) > 0 {
 		// celeris#639: publish an address a loop recorded before it signalled

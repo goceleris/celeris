@@ -7336,16 +7336,19 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 	parts := [4]byte{}
 	partIdx := 0
 	val := 0
+	digits := 0 // digits in the byte being read
 	for _, c := range host {
 		if c == '.' {
-			if partIdx >= 3 {
+			if partIdx >= 3 || digits == 0 {
 				return nil, fmt.Errorf("invalid addr: %s", addr)
 			}
 			parts[partIdx] = byte(val)
 			partIdx++
 			val = 0
+			digits = 0
 		} else if c >= '0' && c <= '9' {
 			val = val*10 + int(c-'0')
+			digits++
 			if val > 255 {
 				// "300.1.1.1" used to wrap to 44.1.1.1 and bind that.
 				return nil, fmt.Errorf("invalid addr: %s", addr)
@@ -7353,6 +7356,11 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 		} else {
 			return nil, fmt.Errorf("invalid addr: %s", addr)
 		}
+	}
+	// "1.2.3" bound 1.2.3.0, "10" bound 10.0.0.0 and "1..2.3" bound
+	// 1.0.2.3: an address of four bytes, each written, or an error.
+	if partIdx != 3 || digits == 0 {
+		return nil, fmt.Errorf("invalid addr: %s", addr)
 	}
 	parts[partIdx] = byte(val)
 	sa.Addr = parts

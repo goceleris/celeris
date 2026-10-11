@@ -724,7 +724,13 @@ func (w *Worker) endOwedOpsAtShutdown() {
 					// has let go of the listen socket's file. A multishot
 					// accept says so by clearing F_MORE (the cancel's
 					// -ECANCELED, or an error that ended it); a single-shot
-					// one always does, and is not re-armed in shutdown.
+					// one always does, and is not re-armed in shutdown. Any
+					// terminal accept CQE ends the wait, including a stale one
+					// left unread from an earlier listen socket (pause, resume,
+					// shutdown at once): cancelAccept reaps inline, which keeps
+					// that window narrow, and the CQE carries no more than the
+					// descriptor number, which a re-created socket reuses
+					// (appended to #884).
 					if !cqeHasMore(c.Flags) {
 						acceptOwed = false
 					}
