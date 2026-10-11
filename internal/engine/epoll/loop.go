@@ -848,6 +848,12 @@ func (l *Loop) run(ctx context.Context) {
 		// DRAINING → SUSPENDED: no listen socket, no connections, events
 		// processed, and NO CROSS-ENGINE HAND-OFF STILL OWED.
 		//
+		// A driver conn that is owed a read turn (driverReadQ, celeris#930)
+		// keeps the loop awake too: this park is indefinite, and the bytes the
+		// turn would read are in the socket already, so they would wait for
+		// the next ResumeAccept. On the base one event drained the socket
+		// before the loop got here.
+		//
 		// That last clause is celeris#624. This park is indefinite — the
 		// loop leaves epoll_wait entirely and waits on a Go channel that
 		// only ResumeAccept closes — so anything still owed to
@@ -882,7 +888,7 @@ func (l *Loop) run(ctx context.Context) {
 		// whose entry does nothing. So the detach flag needs no kick; the
 		// re-check is for symmetry.)
 		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
-			l.transplantInFlight == 0 &&
+			l.transplantInFlight == 0 && len(l.driverReadQ) == 0 &&
 			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
 			// A parked loop holds nothing, and sweep() — whose empty-set
 			// retraction is what clears this loop's share of the residual

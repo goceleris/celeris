@@ -60,9 +60,13 @@ type driverConn struct {
 
 	// readQueued is set while dc is in the loop's driverReadQ, and readEvents
 	// holds the teardown flags (EPOLLRDHUP, EPOLLHUP, EPOLLERR) of the events
-	// whose turn it is owed. Loop thread only (celeris#930).
+	// whose turn it is owed. readErr is the error of a flush that failed while
+	// the conn was owed a turn: the close waits for the bytes in the socket,
+	// with that error as its cause (readEvents then holds EPOLLERR). Loop
+	// thread only (celeris#930).
 	readQueued bool
 	readEvents uint32
+	readErr    error
 }
 
 // errLoopShutdown is what a driver gets when it reaches this loop after
@@ -412,10 +416,12 @@ func (l *Loop) CPUID() int {
 // pending Write. On error/hangup the onClose callback is invoked and the conn
 // is removed from the interest set.
 //
-// A turn that stops at its budget leaves the conn queued (driverReadQ) with
-// the event's teardown flags, and the teardown runs on the turn that drains
-// the socket, as it did when the one turn drained it: bytes the peer sent
-// before it closed are still read and delivered first (celeris#930).
+// A turn that stops at its budget leaves the conn queued (driverReadQ), and
+// so does an event of a conn that is queued already. The teardown that
+// follows the event, the event's EPOLLRDHUP/EPOLLHUP/EPOLLERR and the error
+// of a failed flush, waits for the turn that drains the socket (readEvents,
+// readErr): bytes the peer sent before it closed are still read and delivered
+// first, as they were when the one turn drained the socket (celeris#930).
 func (l *Loop) handleDriverEvent(dc *driverConn, events uint32) {
 	const closeFlags = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP
 	if dc.readQueued {
@@ -437,11 +443,21 @@ func (l *Loop) handleDriverEvent(dc *driverConn, events uint32) {
 	}
 	if events&unix.EPOLLOUT != 0 {
 		dc.mu.Lock()
-		if !dc.sending && !dc.closed {
+		if !dc.sending && !dc.closed && dc.readErr == nil {
 			dc.sending = true
 			if err := l.flushDriverSendLocked(dc); err != nil {
 				dc.sending = false
 				dc.mu.Unlock()
+				if more || dc.readQueued {
+					// The bytes the read turn left in the socket come first, as
+					// they did when the one event read them before it flushed.
+					dc.readEvents |= events&closeFlags | unix.EPOLLERR
+					dc.readErr = err
+					if !dc.readQueued {
+						l.queueDriverRead(dc)
+					}
+					return
+				}
 				l.closeDriver(dc, err)
 				return
 			}
@@ -476,17 +492,19 @@ func (l *Loop) queueDriverRead(dc *driverConn) {
 // calls it only with owed > 0. Loop thread.
 func (l *Loop) serveDriverReadQ(owed int) {
 	q := l.driverReadQ
-	owed = min(owed, len(q)) // shutdownDrivers clears the queue; it runs on this goroutine, never inside a batch
+	// shutdownDrivers clears the queue; it runs on this goroutine, never
+	// inside a batch.
+	owed = min(owed, len(q))
 	l.driverReadQ = append(l.driverReadQNext[:0], q[owed:]...)
 	for i, dc := range q[:owed] {
 		q[i] = nil
-		flags := dc.readEvents
-		dc.readQueued, dc.readEvents = false, 0
+		flags, cause := dc.readEvents, dc.readErr
+		dc.readQueued, dc.readEvents, dc.readErr = false, 0, nil
 		if l.driverRead(dc) {
-			dc.readEvents = flags
+			dc.readEvents, dc.readErr = flags, cause
 			l.queueDriverRead(dc)
 		} else if flags != 0 {
-			l.closeDriver(dc, nil)
+			l.closeDriver(dc, cause)
 		}
 	}
 	clear(q[owed:])
