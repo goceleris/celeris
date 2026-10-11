@@ -2209,10 +2209,93 @@ func (l *Loop) initProtocol(cs *connState) {
 					l.wakeFD.Signal()
 				}
 			}
+			// Async mode (HTTP1): the dispatch goroutine took detachMu
+			// around ProcessH1 so writeBuf access serialises with the
+			// event loop's flushWrites. Once `guarded` is installed (which
+			// re-acquires detachMu on every call), keeping the lock held would deadlock the very next write
+			// — including the middleware-emitted 101 / SSE headers
+			// that immediately follow Detach. Release the lock here
+			// and have the dispatch goroutine observe
+			// asyncDetachUnlocked to skip its symmetric Unlock when
+			// ProcessH1 returns. See celeris#273.
+			//
+			// Gate on cs.asyncPromoted: detachMu is Locked around
+			// ProcessH1 ONLY by runAsyncHandler (the dispatch goroutine),
+			// which runs exclusively for PROMOTED conns. With per-handler
+			// async (celeris#300/#302) an async-mode conn (l.async==true,
+			// forced on whenever any route opts into .Async()) runs its
+			// FIRST request INLINE on the event-loop thread when the conn
+			// is not yet promoted (tryInline at drainRead). A SYNC route
+			// — e.g. the WebSocket /ws upgrade or the SSE /events stream,
+			// which are not themselves .Async() — does not bail with
+			// ErrAsyncDispatch, so its handler runs inline and calls
+			// Context.Detach() → OnDetach while detachMu was NEVER Locked
+			// (the inline path locks it only at the post-handler flush,
+			// loop.go:896). Unlocking here under the old `l.async`-only
+			// guard then faulted with "sync: unlock of unlocked mutex",
+			// fatally crashing the process on the first /ws or /events
+			// request. The asyncPromoted gate restricts the Unlock to the
+			// dispatch-goroutine path that actually holds the lock; the
+			// inline flush owns its own Lock/Unlock around flushWrites, so
+			// the guarded writeFn (which re-locks) still serialises with
+			// the event loop. See celeris#309.
+			// Do NOT release detachMu here — defer it to AFTER Detached.Store(
+			// true) below. A concurrent closeConn (peer RST mid-upgrade)
+			// acquires detachMu before CloseH1 and re-reads Detached under it;
+			// holding the lock across the Store guarantees closeConn observes
+			// the ownership handoff and skips CloseH1, instead of recycling the
+			// Context/stream this WS/SSE middleware goroutine is still using —
+			// the loop.go:2465-vs-websocket.go:243 use-after-recycle that
+			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade.
+			unlockDetachMu := l.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked
+			// completed: this closure ran to its end. Nothing is owed when this
+			// goroutine holds no lock here.
+			completed := !unlockDetachMu
+			// flagged: asyncDetachUnlocked has been published by this closure.
+			flagged := false
+			if unlockDetachMu {
+				// Registered before guarded is installed (celeris#844): from the moment
+				// cs.writeFn is guarded, a write through the response adapter locks
+				// detachMu, which this goroutine still holds, so a panic anywhere after
+				// the install that the handler recovers (the router does) and answers
+				// would block it on itself, and shutdown behind it. The lock has to be
+				// gone on every way out of here, and so has the belief that it is held:
+				// asyncDetachUnlocked tells abortAsyncHandler, serveAsync and the loop
+				// that this goroutine no longer holds it. A panic before the flag is
+				// published sets it first, so that an abort that sees the panic
+				// propagate does not release a second time (a fatal "unlock of unlocked
+				// mutex", celeris#309); one between the flag and the release used to
+				// leave the lock held with every reader of the flag believing
+				// otherwise, and the next closeConn parked the loop on it. The release
+				// follows the publish of Detached, which it also makes if a panic came
+				// first, so that a closeConn that wins the lock finds Detached set and
+				// leaves the stream to the conn's owner. A panic ends the conn: nothing
+				// that follows can finish the detach (the handler may have recovered the
+				// panic, as the router does, and returned normally), so it is closed
+				// through the detach queue.
+				defer func() {
+					if !flagged {
+						cs.asyncInMu.Lock()
+						cs.asyncDetachUnlocked = true
+						cs.asyncInMu.Unlock()
+					}
+					cs.h1State.Detached.Store(true)
+					cs.detachMu.Unlock()
+					if !completed {
+						cs.asyncClosed.Store(true)
+						l.enqueueDetach(cs)
+					}
+				}()
+			}
 			cs.writeFn = guarded
 			// Also update the response adapter so StreamWriter writes
 			// go through the guarded path (not the stale pre-Detach writeFn).
 			cs.h1State.UpdateWriteFn(guarded)
+			if unlockDetachMu {
+				if f := detachPreFlagHook.Load(); f != nil {
+					(*f)() // test seam, celeris#844 item 2 (before the flag)
+				}
+			}
 			// Expose raw write for WebSocket (bypasses chunked encoding).
 			cs.h1State.RawWriteFn = guarded
 			// Install pause/resume callbacks for WebSocket backpressure.
@@ -2265,49 +2348,8 @@ func (l *Loop) initProtocol(cs *connState) {
 					}
 				}
 			}
-			// Async mode (HTTP1): the dispatch goroutine took detachMu
-			// around ProcessH1 so writeBuf access serialises with the
-			// event loop's flushWrites. Now that we've installed
-			// `guarded` (which re-acquires detachMu on every call),
-			// keeping the lock held would deadlock the very next write
-			// — including the middleware-emitted 101 / SSE headers
-			// that immediately follow Detach. Release the lock here
-			// and have the dispatch goroutine observe
-			// asyncDetachUnlocked to skip its symmetric Unlock when
-			// ProcessH1 returns. See celeris#273.
-			//
-			// Gate on cs.asyncPromoted: detachMu is Locked around
-			// ProcessH1 ONLY by runAsyncHandler (the dispatch goroutine),
-			// which runs exclusively for PROMOTED conns. With per-handler
-			// async (celeris#300/#302) an async-mode conn (l.async==true,
-			// forced on whenever any route opts into .Async()) runs its
-			// FIRST request INLINE on the event-loop thread when the conn
-			// is not yet promoted (tryInline at drainRead). A SYNC route
-			// — e.g. the WebSocket /ws upgrade or the SSE /events stream,
-			// which are not themselves .Async() — does not bail with
-			// ErrAsyncDispatch, so its handler runs inline and calls
-			// Context.Detach() → OnDetach while detachMu was NEVER Locked
-			// (the inline path locks it only at the post-handler flush,
-			// loop.go:896). Unlocking here under the old `l.async`-only
-			// guard then faulted with "sync: unlock of unlocked mutex",
-			// fatally crashing the process on the first /ws or /events
-			// request. The asyncPromoted gate restricts the Unlock to the
-			// dispatch-goroutine path that actually holds the lock; the
-			// inline flush owns its own Lock/Unlock around flushWrites, so
-			// the guarded writeFn (which re-locks) still serialises with
-			// the event loop. See celeris#309.
-			// Do NOT release detachMu here — defer it to AFTER Detached.Store(
-			// true) below. A concurrent closeConn (peer RST mid-upgrade)
-			// acquires detachMu before CloseH1 and re-reads Detached under it;
-			// holding the lock across the Store guarantees closeConn observes
-			// the ownership handoff and skips CloseH1, instead of recycling the
-			// Context/stream this WS/SSE middleware goroutine is still using —
-			// the loop.go:2465-vs-websocket.go:243 use-after-recycle that
-			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade.
-			unlockDetachMu := l.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked
-			// completed: this closure ran to its end. Nothing is owed when this
-			// goroutine holds no lock here.
-			completed := !unlockDetachMu
+			// (The release of detachMu and the gate on asyncPromoted are set up before
+			// guarded is installed, above.)
 			if unlockDetachMu {
 				// Under asyncInMu: dispatchBusy reads it there, and from here
 				// on this goroutine never holds detachMu across a handler
@@ -2317,27 +2359,9 @@ func (l *Loop) initProtocol(cs *connState) {
 				cs.asyncInMu.Lock()
 				cs.asyncDetachUnlocked = true
 				cs.asyncInMu.Unlock()
-				// The flag now tells abortAsyncHandler, serveAsync and the
-				// loop that the lock is gone, so it has to be gone on every
-				// way out of here, a panic included (celeris#844): a panic
-				// between the flag and the release used to leave the lock held
-				// with every reader of the flag believing otherwise, and the
-				// next closeConn parked the loop on it. The release is
-				// deferred, after the publish below, which it also makes if a
-				// panic came first, so that a closeConn that wins the lock
-				// finds Detached set and leaves the stream to the conn's
-				// owner. A panic ends the conn: nothing that follows can
-				// finish the detach (the handler may have recovered the panic,
-				// as the router does, and returned normally), so it is closed
-				// through the detach queue.
-				defer func() {
-					cs.h1State.Detached.Store(true)
-					cs.detachMu.Unlock()
-					if !completed {
-						cs.asyncClosed.Store(true)
-						l.enqueueDetach(cs)
-					}
-				}()
+				flagged = true
+				// From here the release is the deferred one registered before guarded
+				// was installed (celeris#844).
 				if f := detachWindowHook.Load(); f != nil {
 					(*f)() // test seam, celeris#844 item 2
 				}
@@ -2628,8 +2652,9 @@ type dispatchHolds struct {
 	// asyncInMu: the goroutine holds cs.asyncInMu in the park loop at the top
 	// of serveAsync, where it calls into code that can panic with the lock
 	// held (askAtPark: the engine's own code, so a panic there is an engine bug or a
-	// runtime fault). Set after each Lock there and cleared before
-	// each Unlock, so it is not set while the goroutine waits on asyncCond.
+	// runtime fault). Set after each Lock there and cleared before each
+	// Unlock. It stays set across asyncCond.Wait, which returns with the lock
+	// held again, and nothing can unwind inside Wait.
 	asyncInMu bool
 }
 
@@ -2649,15 +2674,20 @@ type dispatchHolds struct {
 // already released by a Detach inside ProcessH1 (asyncDetachUnlocked,
 // celeris#273; Unlocking that again would be a fatal "unlock of unlocked
 // mutex", cf. celeris#309; OnDetach releases the lock on every way out once
-// it has set the flag, a panic included, celeris#844). The log record is
-// written after the release, with those copies: the application's slog
+// guarded is installed, a panic included, and sets the flag itself if it
+// unwinds before it has, celeris#844). The log record is written after the
+// release, with those copies: the application's slog
 // handler may be slow, while the loop's shutdown and the guarded writes of a
 // detached conn take the lock unconditionally; but once the lock is free a
 // closeConn that meets cs (closeOnReadEnd on a peer FIN, the timeout reap,
 // shutdown) takes it and closes the conn, fd included, and CloseH1 releases
 // the stream. A panic value that shares the stream's memory (s.Headers, a view
 // of the body buffer) formatted after that reads zeroed memory or another
-// conn's bytes, and cs.fd may name a reissued descriptor (celeris#844). The
+// conn's bytes, and cs.fd may name a reissued descriptor (celeris#844; on the path where a
+// panic unwound OnDetach, that release and the close it queues happened before
+// this function ran, so the fd attribute may already be stale there: the stream
+// is safe, Detached makes closeConn leave it alone, and only the number in the
+// log can be). The
 // formatting runs the value's String or Error method under the lock, so a
 // slow one holds up shutdown, which waits for the lock, and not the loop: a
 // closeConn that finds the lock held while the goroutine runs a handler
@@ -2689,7 +2719,7 @@ func (l *Loop) abortAsyncHandler(cs *connState, r any, holds *dispatchHolds) {
 	if l.logger != nil {
 		stack = string(debug.Stack())
 		if r != nil {
-			msg = fmt.Sprint(r) // fmt recovers a panic out of String or Error itself
+			msg = panicText844(r)
 		}
 	}
 	if holds.detachMu && !cs.asyncDetachUnlocked {
@@ -2719,6 +2749,21 @@ func (l *Loop) abortAsyncHandler(cs *connState, r any, holds *dispatchHolds) {
 	// fd from this goroutine — races with drainRead on the
 	// worker's stale l.conns slot).
 	l.enqueueDetach(cs)
+}
+
+// panicText844 formats a panic value for the abort's log record. fmt recovers
+// a panic out of the value's Error or String method, but only one level deep: a
+// method that panics with a value whose own method panics is re-raised out of
+// Sprint. The abort runs that under detachMu inside a deferred function nothing
+// recovers, so the second level is recovered here, and the type name stands in
+// for the text (celeris#844).
+func panicText844(r any) (msg string) {
+	defer func() {
+		if recover() != nil {
+			msg = fmt.Sprintf("%T (its Error or String method panicked)", r)
+		}
+	}()
+	return fmt.Sprint(r)
 }
 
 // serveAsync is the dispatch goroutine's loop (see runAsyncHandler). It

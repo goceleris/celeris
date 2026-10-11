@@ -112,6 +112,8 @@ func (l *Loop) tryTransplant(fd int) {
 			return
 		}
 		if running {
+			// asyncClosed is read again past the unlock: the abort stores it before
+			// it takes the lock, so a store made after the read above shows here.
 			if !parked || !idle || cs.asyncClosed.Load() || cs.asyncQuiesce.Load() {
 				return // goroutine busy / not cleanly parked / tearing down — retry later
 			}

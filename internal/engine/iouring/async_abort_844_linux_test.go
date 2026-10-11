@@ -64,14 +64,17 @@ const (
 
 // The arms.
 const (
-	arm844ParkRoute       = "park-route"       // window 1: RouteAsync panics at the park (application code)
-	arm844ParkHook        = "park-hook"        // window 1: the engine's code under asyncInMu panics
-	arm844DetachPanic     = "detach-window"    // window 2: the panic propagates to the abort
-	arm844DetachRecovered = "detach-recovered" // window 2: the handler recovers it, as the router does
-	arm844Headers         = "headers-log"      // window 3: the panic value is the stream's own header slice
-	arm844Hold            = "hold"             // item 4: the handler waits to be released, then panics or exits
-	arm844BadError        = "bad-error"        // the panic value's Error method itself panics (the abort formats it under detachMu)
-	arm844SlowError       = "slow-error"       // the panic value's Error method blocks until released
+	arm844ParkRoute       = "park-route"        // window 1: RouteAsync panics at the park (application code)
+	arm844ParkHook        = "park-hook"         // window 1: the engine's code under asyncInMu panics
+	arm844DetachPanic     = "detach-window"     // window 2: the panic propagates to the abort
+	arm844DetachRecovered = "detach-recovered"  // window 2: the handler recovers it, as the router does
+	arm844PreFlag         = "preflag-window"    // window 2, before the flag: the panic propagates to the abort
+	arm844PreFlagRecov    = "preflag-recovered" // window 2, before the flag: the handler recovers it and answers
+	arm844Headers         = "headers-log"       // window 3: the panic value is the stream's own header slice
+	arm844Hold            = "hold"              // item 4: the handler waits to be released, then panics or exits
+	arm844BadError        = "bad-error"         // the panic value's Error method itself panics (the abort formats it under detachMu)
+	arm844BadError2       = "bad-error-2"       // the Error method panics with a value whose Error method panics too
+	arm844SlowError       = "slow-error"        // the panic value's Error method blocks until released
 )
 
 type h844 struct {
@@ -121,7 +124,7 @@ func (h *h844) HandleStream(ctx context.Context, s *stream.Stream) error {
 			(*f)()
 		}
 		return h.body(ctx, s, "w=")
-	case arm844DetachPanic:
+	case arm844DetachPanic, arm844PreFlag:
 		if s.OnDetach == nil {
 			return errors.New("celeris844: no OnDetach on the async stream")
 		}
@@ -138,11 +141,13 @@ func (h *h844) HandleStream(ctx context.Context, s *stream.Stream) error {
 		panic("celeris844: handler panic after hold")
 	case arm844BadError:
 		panic(badError844{})
+	case arm844BadError2:
+		panic(badError2x844{})
 	case arm844SlowError:
 		panic(&slowError844{entered: h.errEntered, release: h.errRelease})
 	case arm844Headers:
 		panic(s.GetHeaders()) // materialized into the stream's own hdrBuf, which CloseH1 zeroes
-	case arm844DetachRecovered:
+	case arm844DetachRecovered, arm844PreFlagRecov:
 		if s.OnDetach == nil {
 			return errors.New("celeris844: no OnDetach on the async stream")
 		}
@@ -185,6 +190,13 @@ var _ stream.AsyncRouteResolver = (*h844)(nil)
 type badError844 struct{}
 
 func (badError844) Error() string { panic("celeris844: the panic value's Error method panics") }
+
+// badError2x844 is a panic value whose Error method panics with a value whose
+// Error method panics: fmt recovers the first level and prints the second with
+// its panicking flag set, where a further panic is re-raised out of fmt.Sprint.
+type badError2x844 struct{}
+
+func (badError2x844) Error() string { panic(badError844{}) }
 
 // slowError844 is a panic value whose Error method blocks until released: the
 // abort formats it while it holds detachMu.
@@ -573,6 +585,9 @@ func (j *judge844) expect(t *testing.T, r *rig844, h *h844) {
 	}
 }
 
+// recovers844 is true for the arms whose handler recovers the OnDetach panic itself.
+func recovers844(arm string) bool { return arm == arm844DetachRecovered || arm == arm844PreFlagRecov }
+
 // runArm844 injects the arm's fault once per worker, sequentially.
 func runArm844(t *testing.T, arm string, inject bool, want string) {
 	h := &h844{mode: arm, inject: inject}
@@ -596,15 +611,19 @@ func runArm844(t *testing.T, arm string, inject bool, want string) {
 			parkWindowHook.Store(&f)
 			t.Cleanup(func() { parkWindowHook.Store(nil) })
 		}
-	case arm844DetachPanic, arm844DetachRecovered:
+	case arm844DetachPanic, arm844DetachRecovered, arm844PreFlag, arm844PreFlagRecov:
 		if inject {
 			f := func() {
 				if h.hookFire.Add(1) <= int64(r.workers) {
 					panic("celeris844: engine fault in OnDetach")
 				}
 			}
-			detachWindowHook.Store(&f)
-			t.Cleanup(func() { detachWindowHook.Store(nil) })
+			hook := &detachWindowHook
+			if arm == arm844PreFlag || arm == arm844PreFlagRecov {
+				hook = &detachPreFlagHook
+			}
+			hook.Store(&f)
+			t.Cleanup(func() { hook.Store(nil) })
 		}
 	}
 	r.place()
@@ -624,10 +643,10 @@ func runArm844(t *testing.T, arm string, inject bool, want string) {
 			continue
 		}
 		for deadline := time.Now().Add(budget844); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
-			if arm == arm844DetachRecovered && h.recovered.Load() >= int64(i+1) {
+			if recovers844(arm) && h.recovered.Load() >= int64(i+1) {
 				break
 			}
-			if arm != arm844DetachRecovered && r.logs.panics.Load() >= int64(i+1) {
+			if !recovers844(arm) && r.logs.panics.Load() >= int64(i+1) {
 				break
 			}
 		}
@@ -643,19 +662,19 @@ func runArm844(t *testing.T, arm string, inject bool, want string) {
 			if n := h.routeFire.Load(); n != int64(r.workers) {
 				t.Errorf("INJECTION: RouteAsync panicked %d times at the park, want %d", n, r.workers)
 			}
-		case arm844BadError:
+		case arm844BadError, arm844BadError2:
 		default:
 			if n := h.hookFire.Load(); n < int64(r.workers) {
 				t.Errorf("INJECTION: the hook fired %d times, want at least %d", n, r.workers)
 			}
 		}
-		if n := r.logs.panics.Load(); n != int64(r.workers) && arm != arm844DetachRecovered {
+		if n := r.logs.panics.Load(); n != int64(r.workers) && !recovers844(arm) {
 			t.Errorf("INJECTION: the engine logged %d recovered panics, want %d", n, r.workers)
 		}
 		if n, m := r.logs.onEngine.Load(), r.logs.panics.Load(); n != m {
 			t.Errorf("INJECTION: %d of %d abort records carry no %s frame in their stack", m-n, m, pkgDir844)
 		}
-		if arm == arm844DetachRecovered {
+		if recovers844(arm) {
 			if n := h.recovered.Load(); n != int64(r.workers) {
 				t.Errorf("INJECTION: the handler recovered %d panics, want %d", n, r.workers)
 			}
@@ -686,6 +705,24 @@ func TestAbortPanicInOnDetachWindowRecoveredByTheHandler844(t *testing.T) {
 // still releases the lock and tears the conn down.
 func TestAbortPanicValueWhoseErrorPanics844(t *testing.T) {
 	runArm844(t, arm844BadError, true, "closed")
+}
+
+// Window 2, before the flag: the guarded writeFn is installed and this
+// goroutine still holds detachMu. Recovered, the handler answers through
+// guarded and must not block on the lock its own goroutine holds; propagating,
+// the abort must not release a lock the unwind already released (a second
+// Unlock is fatal, celeris#309).
+func TestAbortPanicInOnDetachBeforeTheFlag844(t *testing.T) {
+	runArm844(t, arm844PreFlag, true, "closed")
+}
+func TestAbortPanicInOnDetachBeforeTheFlagRecoveredByTheHandler844(t *testing.T) {
+	runArm844(t, arm844PreFlagRecov, true, "closed")
+}
+
+// Two levels of it: fmt itself gives up on the second, so the abort has to
+// recover that, or the process ends with detachMu held.
+func TestAbortPanicValueWhoseErrorPanicsTwice844(t *testing.T) {
+	runArm844(t, arm844BadError2, true, "closed")
 }
 
 func TestAbortOnDetachControl844(t *testing.T) {
