@@ -18,7 +18,8 @@ import "time"
 // on HTTP/1.1 it ends that connection and the engine logs an Error; on HTTP/2
 // it ends only that stream's goroutine, which gets no response, and nothing is
 // logged. The [Std] engine runs each request on its own goroutine, so a
-// Goexit there ends that request's goroutine only. See [Route.Async] and
+// Goexit there ends that request's goroutine, not a loop (net/http closes an
+// HTTP/1.1 connection whose handler Goexits). See [Route.Async] and
 // [Route.Sync].
 type HandlerFunc func(*Context) error
 
