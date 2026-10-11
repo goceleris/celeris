@@ -25,8 +25,9 @@ import "time"
 // (see [Config.AsyncHandlers]), so they must not call Goexit either. For a
 // request that matches a route, the global middleware runs as part of that
 // route's chain, on the goroutine the route's handler runs on. The
-// [Config.OnConnect], [Config.OnDisconnect] and [Config.OnExpectContinue]
-// callbacks run on the loop as well.
+// [Config.OnConnect] and [Config.OnDisconnect] callbacks run on the loop as
+// well, and so does [Config.OnExpectContinue] unless the connection was
+// promoted to async dispatch (see its godoc).
 //
 // The [Std] engine runs each request on its own goroutine, so a Goexit there
 // ends that request's goroutine, not a loop (net/http closes an HTTP/1.1
