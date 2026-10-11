@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -300,18 +301,31 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	return addr, returned
 }
 
+// iterations896For is full under CELERIS_896_FULL=1, the runs that measure the
+// failure rate over 200 shutdowns (100 for the send drain, which takes 0.3 s
+// each), and ci otherwise. CI runs the same loops with fewer: the SQ-full arms
+// fail 94% to 100% of their shutdowns without the fix, so 40 cannot all pass by
+// chance, and the package's -race run has a 420 s timeout that 200 shutdowns of
+// each of these would use up (they took 118 s of it).
+func iterations896For(full, ci int) int {
+	if os.Getenv("CELERIS_896_FULL") == "1" {
+		return full
+	}
+	return ci
+}
+
 func TestListenReleasesThePortWithH2HandlersRunningNatural896(t *testing.T) {
-	loop896(t, "h2 handler running, natural", iterations896, false, h2Iteration896)
+	loop896(t, "h2 handler running, natural", iterations896For(iterations896, 40), false, h2Iteration896)
 }
 
 func TestListenReleasesThePortWithH2HandlersRunningSQFull896(t *testing.T) {
-	loop896(t, "h2 handler running, SQ ring full", iterations896, true, h2Iteration896)
+	loop896(t, "h2 handler running, SQ ring full", iterations896For(iterations896, 40), true, h2Iteration896)
 }
 
 func TestListenReleasesThePortAfterALongSendDrainNatural896(t *testing.T) {
-	loop896(t, "send drain past 250 ms, natural", iterations896/2, false, sendDrainIteration896)
+	loop896(t, "send drain past 250 ms, natural", iterations896For(iterations896/2, 8), false, sendDrainIteration896)
 }
 
 func TestListenReleasesThePortAfterALongSendDrainSQFull896(t *testing.T) {
-	loop896(t, "send drain past 250 ms, SQ ring full", iterations896/2, true, sendDrainIteration896)
+	loop896(t, "send drain past 250 ms, SQ ring full", iterations896For(iterations896/2, 16), true, sendDrainIteration896)
 }
