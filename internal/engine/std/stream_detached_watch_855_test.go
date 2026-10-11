@@ -68,9 +68,9 @@ func TestDetachedWritesSetNoDeadlinePerWrite855(t *testing.T) {
 // review found it had grown to the 48-byte class). The engine pointer takes the
 // place of the flushed flag, which is kept on the stream (headersSent).
 func TestStdResponseWriterSize855(t *testing.T) {
-	type mainWriter struct { // stdResponseWriter on main, before celeris#855
-		w       http.ResponseWriter
-		flushed bool
+	type mainWriter struct { // stdResponseWriter on main, before celeris#855: {w, flushed}
+		_ http.ResponseWriter
+		_ bool
 	}
 	if got, want := unsafe.Sizeof(stdResponseWriter{}), unsafe.Sizeof(mainWriter{}); got != want {
 		t.Fatalf("stdResponseWriter is %d bytes, want %d as on main (every request allocates one)", got, want)
@@ -390,7 +390,7 @@ func TestDetachedHijack855(t *testing.T) {
 	if err != nil || c == nil {
 		t.Fatalf("Hijack after Detach: %v, %v", c, err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	cancel() // the budget runs out: nothing to poke
 	time.Sleep(60 * time.Millisecond)
 	rw.streamEnded()
@@ -416,7 +416,7 @@ func h2cServer855(tb testing.TB, h http.Handler) (cl *http.Client, url string) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	h2s := &http2.Server{}
+	h2s := &http2.Server{} //nolint:staticcheck // SA1019: the server the std engine's h2c runs on; see the import comment in engine.go.
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -429,15 +429,16 @@ func h2cServer855(tb testing.TB, h http.Handler) (cl *http.Client, url string) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				h2s.ServeConn(c, &http2.ServeConnOpts{Handler: h})
+				h2s.ServeConn(c, &http2.ServeConnOpts{Handler: h}) //nolint:staticcheck // SA1019: as above.
 			}()
 		}
 	}()
-	tr := &http2.Transport{AllowHTTP: true, DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, network, addr)
-	}}
+	tr := &http2.Transport{AllowHTTP: true, //nolint:staticcheck // SA1019: an h2c client for the server above.
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		}}
 	tb.Cleanup(func() {
-		tr.CloseIdleConnections()
+		tr.CloseIdleConnections() //nolint:staticcheck // SA1019: as above.
 		_ = ln.Close()
 		wg.Wait()
 	})
@@ -485,7 +486,7 @@ func TestDetachedCutPokeAndReturnRace855(t *testing.T) {
 					// is the poke, not a failure. Either way the client reads
 					// nothing, and the handler must return.
 					if resp, err := get(); err == nil {
-						defer resp.Body.Close()
+						defer func() { _ = resp.Body.Close() }()
 					}
 					// Do not read: the server's write is parked until it is cut.
 					select {
