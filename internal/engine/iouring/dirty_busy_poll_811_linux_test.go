@@ -48,13 +48,17 @@ const (
 	// busy811Conns is N: every conn is its own dirty-list entry, and a loop
 	// that spins burns the same core whatever N is.
 	busy811Conns = 4
-	// busy811Body is each conn's response: well past what the socket buffers
-	// take (the server's send buffer autotunes to a few MiB at most), so the
-	// direct write is short and a ring SEND carries the rest.
-	busy811Body = 12 << 20
+	// busy811Body is each conn's response. The server's send buffer is set to
+	// 64 KiB (busy811SndBuf), so the direct write is short on any host and a
+	// ring SEND carries the rest (the autotuned default takes up to a few MiB,
+	// and on some hosts the whole response). It stays under the HTTP/1
+	// back-pressure limit (maxSendQueueBytes, 4 MiB): a pipelined request
+	// behind a larger backlog is refused and the conn closed (celeris#761).
+	busy811Body = 3 << 20
 	// busy811Window is the CPU measurement's length. The window starts
 	// busy811Settle after the last request was sent, when every SEND is in
 	// flight and nothing can progress.
+	busy811SndBuf = 64 << 10
 	busy811Window = 3 * time.Second
 	busy811Settle = 600 * time.Millisecond
 	// busy811Budget is the CPU a worker may use in the window while nothing
@@ -241,7 +245,10 @@ func readSmall811(b *busyClient811) error {
 // every byte arrives, in order, with the second response last.
 func TestIouringStalledAsyncSendDoesNotBusyPoll811(t *testing.T) {
 	h := newBusyHandler811()
-	e, addr := startFDLEngine(t, h, func(c *resource.Config) { c.AsyncHandlers = true })
+	e, addr := startFDLEngine(t, h, func(c *resource.Config) {
+		c.AsyncHandlers = true
+		c.Resources.SocketSend = busy811SndBuf
+	})
 	t.Logf("celeris811 engine workers=%d tier=%s memlock_kib=%s tier_env=%q", e.NumWorkers(), tier844(e),
 		memlock811(), os.Getenv("CELERIS_MAX_IOURING_TIER"))
 

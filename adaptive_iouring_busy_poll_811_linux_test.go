@@ -30,7 +30,7 @@ import (
 
 const (
 	busyConns811  = 4
-	busyBody811   = 12 << 20
+	busyBody811   = 3 << 20
 	busyWindow811 = 3 * time.Second
 	busySettle811 = 900 * time.Millisecond
 	busyBudget811 = 0.10
@@ -58,7 +58,10 @@ func TestIouringStalledAsyncSendDoesNotBusyPollThroughTheServer811(t *testing.T)
 		}
 		t.Run(e.name, func(t *testing.T) {
 			srv := startDrainServer806(t, e, 5*time.Second, 0,
-				func(c *celeris.Config) { c.AsyncHandlers = true },
+				func(c *celeris.Config) {
+					c.AsyncHandlers = true
+					c.SocketSendBuf = 64 << 10 // the direct write is short on any host
+				},
 				func(s *celeris.Server) {
 					s.GET("/big", func(c *celeris.Context) error {
 						return c.Blob(http.StatusOK, "application/octet-stream", body)
