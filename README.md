@@ -10,6 +10,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/goceleris/celeris.svg)](https://pkg.go.dev/github.com/goceleris/celeris)
 [![Go Report Card](https://goreportcard.com/badge/github.com/goceleris/celeris)](https://goreportcard.com/report/github.com/goceleris/celeris)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15387/badge)](https://www.bestpractices.dev/projects/15387)
 
 celeris is a high-throughput, load-bearing HTTP engine for Go, built on a protocol-aware dual architecture of io_uring and epoll. Its standout strength is throughput under load: across the [probatorium](https://github.com/goceleris/probatorium) cross-framework matrix it leads the field on driver-backed (PostgreSQL / Redis / memcached) and write-heavy workloads, sustaining the highest request rates while holding tail-latency SLOs — powered by first-party database drivers that run their socket I/O on the same event loop as your handlers. The API is a familiar route-group and middleware model in the spirit of Gin and Echo, so teams adopt it without learning a new programming model, with zero-allocation hot paths on the HTTP/1.1 and h2c fast paths.
 

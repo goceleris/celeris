@@ -188,9 +188,12 @@ func TestSlowClientLegacyBlocking(t *testing.T) {
 
 // TestSlowClientDropEvent fills the queue while the streamer is gated, then
 // asserts the configured drop policy increments DroppedEvents and leaves
-// QueueDepth saturated at the cap. The drain goroutine may have one event
-// in-flight (between channel-receive and gated Write), so the drop count is
-// either total-queueSize or total-queueSize-1 depending on scheduling.
+// QueueDepth saturated at the cap. The first event is sent alone and the test
+// waits until the drain goroutine has popped it and is parked at the gated
+// Write; only then is the queue filled. Without that barrier the drain may
+// pop an event at any point during or after the send loop, so the depth read
+// could observe queueSize-1 (the popped event is no longer queued). With the
+// barrier the drain holds exactly one event and the queue is exactly full.
 func TestSlowClientDropEvent(t *testing.T) {
 	ctx, gs := newGatedContext(t)
 	const queueSize = 4
@@ -203,7 +206,13 @@ func TestSlowClientDropEvent(t *testing.T) {
 		HeartbeatInterval: -1,
 		MaxQueueDepth:     queueSize,
 		Handler: func(client *Client) {
-			for range total {
+			_ = client.Send(Event{Data: "x"})
+			select {
+			case <-gs.writeReachedOnce:
+			case <-time.After(3 * time.Second):
+				t.Errorf("drain goroutine did not reach the gated Write within 3s")
+			}
+			for range total - 1 {
 				_ = client.Send(Event{Data: "x"})
 			}
 			resultDepth <- client.QueueDepth()
