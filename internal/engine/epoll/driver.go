@@ -470,6 +470,7 @@ func (l *Loop) queueDriverRead(dc *driverConn) {
 // calls it only with owed > 0. Loop thread.
 func (l *Loop) serveDriverReadQ(owed int) {
 	q := l.driverReadQ
+	owed = min(owed, len(q)) // shutdownDrivers clears the queue; it runs on this goroutine, never inside a batch
 	l.driverReadQ = append(l.driverReadQNext[:0], q[owed:]...)
 	for i, dc := range q[:owed] {
 		q[i] = nil

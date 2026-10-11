@@ -19,10 +19,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// c930Turn is one full turn of a driver conn's reads: the budget's worth of
-// the loop's 32 KiB read buffer.
-const c930Turn = driverReadBudget * driverReadBufSize
-
 // TestADriverConnWithEndlessInflowDoesNotStarveTheOthers930: A's peer writes
 // 64 KiB chunks as fast as A's socket takes them, and A's onRecv sleeps 100
 // us a chunk, so A's socket never empties. B, a second driver conn on the same
@@ -120,6 +116,12 @@ func TestADriverConnWithEndlessInflowDoesNotStarveTheOthers930(t *testing.T) {
 		fed.Load(), aGot.Load(), aReads.Load(), served, at.Sub(sent), aReadsAtB.Load()-readsAtSend)
 	if !served {
 		t.Errorf("B, a driver conn on the same engine loop, was not served within 3 s while A's peer kept A's socket full")
+	}
+	// The bound that does not rest on timing: B's byte can arrive in the
+	// middle of A's turn, so A reads the rest of that turn, and then the
+	// epoll_wait that collects B comes before A's next one.
+	if between := aReadsAtB.Load() - readsAtSend; served && between > 2*driverReadBudget {
+		t.Errorf("A was read %d times between B's byte and B's service, want at most two turns (%d)", between, 2*driverReadBudget)
 	}
 }
 
@@ -226,7 +228,9 @@ func TestBudgetedDriverReadsDeliverEveryByteInOrder930(t *testing.T) {
 			case <-s.all:
 			case <-time.After(5 * time.Second):
 				s.mu.Lock()
-				t.Fatalf("A got %d of %d bytes within 5 s", s.got, size)
+				got := s.got
+				s.mu.Unlock()
+				t.Fatalf("A got %d of %d bytes within 5 s", got, size)
 			}
 			if !closeFirst {
 				_ = unix.Close(wr)

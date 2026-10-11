@@ -358,3 +358,120 @@ func TestAFreshQueuedTurnDoesNotWaitForAPollingCaller931(t *testing.T) {
 		t.Errorf("z never reached X's onRecv")
 	}
 }
+
+// TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931 is the check of the
+// worker's TryLock-and-requeue against the callers it races with. Four conns
+// each have a peer that pushes 1 to 200 bytes at random moments for 2 s, and an
+// owner that calls WriteAndPollMulti back to back, so events of a conn are
+// collected while a call holds its recvMu, between calls and in the middle of
+// the re-arm. Every byte a peer sent must be delivered, by a call's onRecv or by
+// the worker's, once the pushes stop, and the callers must keep making calls
+// (a deadlock between the worker and a caller shows as a caller that stops).
+func TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931(t *testing.T) {
+	l, err := New(1)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	w := l.WorkerLoop(0).(*worker)
+
+	const conns = 4
+	type rig struct {
+		fd, peer   int
+		sent, recv atomic.Int64
+		calls      atomic.Int64
+	}
+	rigs := make([]*rig, conns)
+	for i := range rigs {
+		r := &rig{}
+		r.fd, r.peer = socketPair(t)
+		rigs[i] = r
+		if err := w.RegisterConn(r.fd, func(b []byte) { r.recv.Add(int64(len(b))) }, func(error) {}); err != nil {
+			t.Fatalf("RegisterConn: %v", err)
+		}
+		t.Cleanup(func() { _ = w.UnregisterConn(r.fd); _ = unix.Close(r.fd); _ = unix.Close(r.peer) })
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, r := range rigs {
+		wg.Add(2)
+		go func() { // the peer: pushes at random moments, and drains what the owner sends
+			defer wg.Done()
+			rng := uint32(i*7919 + 1)
+			sink := make([]byte, 4096)
+			chunk := make([]byte, 200)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rng = rng*1664525 + 1013904223
+				n := 1 + int(rng>>8)%200
+				if wrote, err := unix.Write(r.peer, chunk[:n]); wrote > 0 {
+					r.sent.Add(int64(wrote))
+				} else if err != nil && err != unix.EAGAIN {
+					return
+				}
+				for {
+					if m, _ := unix.Read(r.peer, sink); m <= 0 {
+						break
+					}
+				}
+				time.Sleep(time.Duration(rng>>20%300) * time.Microsecond)
+			}
+		}()
+		go func() { // the owner: back-to-back calls
+			defer wg.Done()
+			rbuf := make([]byte, 1024)
+			onRecv := func(b []byte) { r.recv.Add(int64(len(b))) }
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, _ = w.WriteAndPollMulti(r.fd, []byte("req"), rbuf, onRecv, func() bool { return true }, nil)
+				r.calls.Add(1)
+			}
+		}()
+	}
+	time.Sleep(2 * time.Second)
+	var callsMid [conns]int64
+	for i, r := range rigs {
+		callsMid[i] = r.calls.Load()
+	}
+	time.Sleep(200 * time.Millisecond)
+	for i, r := range rigs {
+		if r.calls.Load() == callsMid[i] {
+			t.Errorf("conn %d: its owner made no call in the last 200 ms: a caller is stuck", i)
+		}
+	}
+	close(stop)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the callers and peers did not stop within 10 s: a deadlock")
+	}
+	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(5 * time.Millisecond) {
+		all := true
+		for _, r := range rigs {
+			all = all && r.recv.Load() == r.sent.Load()
+		}
+		if all {
+			break
+		}
+	}
+	var sent, recv, calls int64
+	for i, r := range rigs {
+		sent += r.sent.Load()
+		recv += r.recv.Load()
+		calls += r.calls.Load()
+		if r.recv.Load() != r.sent.Load() {
+			t.Errorf("conn %d: the peer sent %d bytes and %d were delivered: bytes stranded", i, r.sent.Load(), r.recv.Load())
+		}
+	}
+	t.Logf("C931 callers vs worker: %d bytes sent and %d delivered over %d WriteAndPollMulti calls on %d conns", sent, recv, calls, conns)
+}
