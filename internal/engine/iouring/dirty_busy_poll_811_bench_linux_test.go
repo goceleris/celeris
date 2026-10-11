@@ -126,11 +126,14 @@ func BenchmarkResponseSize811(b *testing.B) {
 				for b.Loop() {
 					read()
 				}
-				// The witness that the changed path ran: the fraction of the
-				// response bytes that went through a ring SEND (the direct
-				// write of an async handler is counted nowhere; a conn with a
-				// SEND in flight is what the dirty pass gives up). Published by
-				// the worker once per loop iteration: give it one.
+				// ring_frac: the ring-sent bytes over the response bytes
+				// requested (headers included, so a small body reads above 1).
+				// It shows that ring SENDs happened, which the dirty pass's
+				// give-up needs; it does not show that the give-up ran (a sync
+				// conn is ring-sent entirely and is listed only on a full SQ
+				// ring, and an async handler's direct write is counted
+				// nowhere). Published by the worker once per loop iteration:
+				// give it one.
 				b.StopTimer()
 				time.Sleep(200 * time.Millisecond)
 				b.ReportMetric(float64(e.Metrics().RingBytes)/(float64(b.N+21)*float64(size)), "ring_frac")
