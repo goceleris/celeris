@@ -61,9 +61,14 @@ func BenchmarkResponseSize811(b *testing.B) {
 				addr := ln.Addr().String()
 				_ = ln.Close()
 				e, err := New(resource.Config{
-					Addr:          addr,
-					Protocol:      engine.HTTP1,
-					Resources:     resource.Resources{Workers: 2},
+					Addr:     addr,
+					Protocol: engine.HTTP1,
+					// A 64 KiB server send buffer, as the #811 tests set: the
+					// autotuned default takes up to a few MiB, and on some hosts
+					// the whole response, in which case the direct write sends
+					// it and no ring SEND, hence no dirty-list state, ever
+					// happens.
+					Resources:     resource.Resources{Workers: 2, SocketSend: 64 << 10},
 					AsyncHandlers: async,
 					Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 				}, &sizedHandler811{body: body, async: async})
@@ -120,6 +125,16 @@ func BenchmarkResponseSize811(b *testing.B) {
 				b.ResetTimer()
 				for b.Loop() {
 					read()
+				}
+				// The witness that the changed path ran: the share of the
+				// response bytes that went through a ring SEND (a conn with a
+				// SEND in flight is what the dirty pass gives up). Published by
+				// the worker once per loop iteration: give it one.
+				b.StopTimer()
+				time.Sleep(200 * time.Millisecond)
+				m := e.Metrics()
+				if tot := m.RingBytes + m.InlineBytes; tot > 0 {
+					b.ReportMetric(float64(m.RingBytes)/float64(tot), "ring_share")
 				}
 			})
 		}

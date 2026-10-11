@@ -6258,6 +6258,16 @@ func (w *Worker) flushDirty() {
 			// is seconds. Time the episode, once, on the way in. It stays
 			// open past this give-up (unlinkDirty, not removeDirty):
 			// completeSend's arm ends it, or the conn's teardown.
+			//
+			// What backstops a SEND that never completes is now only the
+			// WriteTimeout / closing-drain bound of checkTimeouts: the spin
+			// that used to make such a conn show as a busy core (the
+			// celeris#519 / celeris#527 stranded-sending leaks were found
+			// that way) is gone, so a future stuck-sending defect parks
+			// silently until that sweep, which runs on the idle cadence
+			// (every 32 iterations with ReadHeaderTimeout > 0 or a detached
+			// conn, every 1024 otherwise, each iteration waiting up to
+			// 25 ms / 100 ms).
 			if cs.needsRecv && !cs.recvPaused && !cs.recvArmed {
 				w.beginRecvStall(cs)
 			}

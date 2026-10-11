@@ -116,6 +116,15 @@ func TestIouringStalledAsyncSendDoesNotBusyPollThroughTheServer811(t *testing.T)
 			frac := float64(spent) / float64(wall)
 			t.Logf("celeris811 CPU engine=%s conns=%d window_ms=%d cpu_ms=%.1f cpu_frac=%.3f", e.name, busyConns811,
 				wall.Milliseconds(), float64(spent)/1e6, frac)
+			// The premise again, after the window: a CPU budget met by a server
+			// that Adaptive had moved to epoll in the meantime would pass on an
+			// engine that is not the one under test.
+			if err := e.premise(srv); err != nil {
+				t.Fatalf("after the CPU window: %v", err)
+			}
+			if n := srv.s.EngineInfo().Metrics.AdaptiveSwitches; n != 0 {
+				t.Fatalf("celeris811 PREMISE: %s switched engines %d time(s) during the CPU window: the budget was not measured on one engine", e.name, n)
+			}
 			if frac > busyBudget811 {
 				t.Errorf("celeris#811: %d async conns whose clients do not read cost the server %.0f ms of CPU in %d ms "+
 					"(%.1f%% of a core, budget %.0f%%) on %s: the worker is not parked",
