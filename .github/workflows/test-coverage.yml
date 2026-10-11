@@ -129,15 +129,18 @@ jobs:
       # the packages are disjoint, so the blocks are appended after the mode
       # line.
       #
-      # -timeout=420s, the unit job's own for this package. Under -race and
+      # -timeout=480s, the unit job's own for this package. Under -race and
       # -covermode=atomic the package took 291.9 s on main (61ea3cb) and 296.7 s
       # on celeris#990's branch, of a 300 s timeout; the celeris#895/#896 tests
-      # add about 12 s, and the run ended in a timeout panic.
+      # add about 12 s, and the run ended in a timeout panic. 309.9 s on main
+      # (3cfee4b) and 341.7 s with celeris#811's tests (PR #994 at 5adaf15: the
+      # WriteTimeout bound test alone is about 16 s), of 420 s: under 25%
+      # margin, so 480 s (40%).
       - name: internal/engine/iouring (own step, ci.yml unit set)
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          go test -race -count=1 -timeout=420s -covermode=atomic \
+          go test -race -count=1 -timeout=480s -covermode=atomic \
             -coverprofile="$RUNNER_TEMP/cover-iouring.out" ./internal/engine/iouring/
           root="$RUNNER_TEMP/cover-root.out"
           own="$RUNNER_TEMP/cover-iouring.out"

@@ -279,18 +279,20 @@ jobs:
       # celeris#657 step below also needs. It runs even when the step above
       # failed: the two share no package.
       #
-      # -timeout=420s: the package's race run takes 265 to 280 s on the runner
+      # -timeout=480s: the package's race run takes 265 to 280 s on the runner
       # (270 s on main, 279 s with the celeris#959/#866 tests, which add about
-      # 9 s, 291 s with the celeris#895/#896 tests, which add about 12 s more),
-      # so 300 s left a margin of under 10%; a slower runner or the next
-      # test added would have ended in a timeout panic instead of a result.
+      # 9 s, 291 s with the celeris#895/#896 tests, which add about 12 s more,
+      # 335.8 s with celeris#811's tests: PR #994 at 5adaf15, of 420 s, a
+      # margin of 25%), so 300 s left a margin of under 10%; a slower runner or
+      # the next test added would have ended in a timeout panic instead of a
+      # result. 480 s is a 40% margin over the 335.8 s.
       - name: internal/engine/iouring — race tests at the runner's memlock (every skip accounted for)
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=420s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=480s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
           allowed='TestListenClosesListenSocketsWhenEveryWorkerRingSetupFails|TestListenClosesListenSocketWhenOneWorkerRingSetupFails|TestListenClosesListenSocketRingAndEventfdWhenInitialSubmitFails|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895'
           required='TestListenWithCancelledContextPublishesTheBoundAddress|TestListenRefusesToStartWhenNoWorkerReportsItsAddress'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
