@@ -2,7 +2,6 @@ package memcached
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -135,95 +134,6 @@ type memcachedConn struct {
 // we normalize through a pointer-friendly wrapper.
 type errBox struct{ err error }
 
-// dialMemcachedConn dials a TCP connection, sets it non-blocking, registers it
-// with the event loop, and (on binary protocol) sends a NOOP to validate the
-// handshake. Text protocol is handshake-free; we trust the connect.
-func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg Config, workerHint int) (*memcachedConn, error) {
-	timeout := cfg.DialTimeout
-	if timeout <= 0 {
-		timeout = defaultDialTimeout
-	}
-	dialer := net.Dialer{Timeout: timeout}
-	raw, err := dialer.DialContext(ctx, "tcp", cfg.Addr)
-	if err != nil {
-		return nil, err
-	}
-	tcp, ok := raw.(*net.TCPConn)
-	if !ok {
-		_ = raw.Close()
-		return nil, fmt.Errorf("celeris-memcached: expected *net.TCPConn, got %T", raw)
-	}
-	_ = tcp.SetNoDelay(true)
-
-	file, err := tcp.File()
-	if err != nil {
-		_ = tcp.Close()
-		return nil, err
-	}
-	fd := int(file.Fd())
-	if err := syscall.SetNonblock(fd, true); err != nil {
-		_ = tcp.Close()
-		_ = file.Close()
-		return nil, err
-	}
-	tuneConnSocket(fd)
-	_ = tcp.Close()
-
-	nw := prov.NumWorkers()
-	if nw <= 0 {
-		// Close via file.Close() so the *os.File's runtime finalizer is
-		// disarmed. syscall.Close(fd) alone would leave the finalizer
-		// armed; GC could then call syscall.Close(fd) a second time on an
-		// fd the kernel has since reassigned.
-		_ = file.Close()
-		return nil, errors.New("celeris-memcached: event loop has 0 workers")
-	}
-	if workerHint < 0 || workerHint >= nw {
-		workerHint = fd % nw
-		if workerHint < 0 {
-			workerHint = -workerHint
-		}
-	}
-	loop := prov.WorkerLoop(workerHint)
-
-	bin := cfg.Protocol == ProtocolBinary
-	c := &memcachedConn{
-		fd:        fd,
-		loop:      loop,
-		workerID:  workerHint,
-		file:      file,
-		state:     newMCState(bin),
-		cfg:       cfg,
-		binary:    bin,
-		createdAt: time.Now(),
-	}
-	if srt, ok := loop.(syncRoundTripper); ok {
-		c.sync = srt
-	}
-	if sbrt, ok := loop.(syncBusyRoundTripper); ok {
-		c.syncBusy = sbrt
-	}
-	c.useBusy = cfg.Engine != nil && c.syncBusy != nil
-	if smrt, ok := loop.(syncMultiRoundTripper); ok {
-		c.syncMulti = smrt
-	}
-	c.onRecvFn = c.onRecv
-	c.onCloseFn = c.onClose
-	c.pollIsDoneFn = c.pollIsDone
-	c.lastUsedAt.Store(time.Now().UnixNano())
-
-	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-
-	if err := c.handshake(ctx); err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	return c, nil
-}
-
 // dialDirectMemcachedConn dials a TCP connection in direct mode — no
 // mini-loop registration, no fd extraction. The conn keeps the live
 // *net.TCPConn and performs Write/Read directly on the caller's goroutine.
@@ -246,7 +156,7 @@ func dialDirectMemcachedConn(ctx context.Context, cfg Config) (*memcachedConn, e
 
 	var rawFd int
 	if sc, scErr := tcp.SyscallConn(); scErr == nil {
-		_ = sc.Control(func(fd uintptr) { rawFd = int(fd) })
+		_ = sc.Control(func(fd uintptr) { rawFd = peekFD(fd) })
 	}
 
 	bin := cfg.Protocol == ProtocolBinary
@@ -674,7 +584,7 @@ func (c *memcachedConn) Close() error {
 				_ = c.file.Close()
 				c.file = nil
 			} else if c.fd > 0 {
-				_ = syscall.Close(c.fd)
+				closeRawFD(c.fd)
 			}
 		}
 		drainErr := ErrClosed
@@ -717,7 +627,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, syscall.MSG_DONTWAIT); n > 0 {
+			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -765,7 +675,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, syscall.MSG_DONTWAIT); n > 0 {
+			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -814,7 +724,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, syscall.MSG_DONTWAIT); n > 0 {
+			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {

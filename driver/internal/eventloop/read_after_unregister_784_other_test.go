@@ -1,4 +1,4 @@
-//go:build !linux && !windows
+//go:build !linux && unix
 
 package eventloop
 
@@ -92,7 +92,7 @@ func TestReaderEOFSparesTheConnThatTakesTheNumber784(t *testing.T) {
 		t.Fatalf("RegisterConn(B) on A's number: %v", err)
 	}
 	t.Cleanup(func() { _ = w.UnregisterConn(b) })
-	bConn := func() *driverConn {
+	bConn := func() *portableConn {
 		w.mu.RLock()
 		defer w.mu.RUnlock()
 		return w.conns[b]

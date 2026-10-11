@@ -647,7 +647,7 @@ func (c *pgConn) closeFDOnce() {
 		return
 	}
 	if c.fd > 0 {
-		_ = syscall.Close(c.fd)
+		closeRawFD(c.fd)
 	}
 }
 
@@ -666,7 +666,7 @@ func (c *pgConn) shutdownFD() {
 	if c.fdReleased || c.fd <= 0 {
 		return
 	}
-	_ = syscall.Shutdown(c.fd, syscall.SHUT_RDWR)
+	shutdownRawFD(c.fd)
 }
 
 // writeRawFromRecv is writeRaw for onRecv, which writes the startup
@@ -752,7 +752,7 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return err
 		}
 		if c.tcpFd > 0 {
-			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.directBuf, syscall.MSG_DONTWAIT); n > 0 {
+			if n, _, perr := recvNoWait(c.tcpFd, c.directBuf); n > 0 {
 				c.onRecv(c.directBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -836,125 +836,6 @@ func (c *pgConn) startDirectReader() func() {
 	}
 }
 
-// dialConn dials a TCP connection to the DSN's host:port, sets it non-blocking,
-// and registers it with the given event loop. The returned pgConn is fully
-// initialized (including startup) and ready for queries.
-// dialConn accepts closeLoop for symmetry with Pool.dialConn; callers that
-// own the loop themselves (e.g. [Connector.Connect]) pass nil.
-//
-//nolint:unparam // closeLoop is always nil today but retained for pool reuse
-func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func(), dsn DSN, workerHint int) (*pgConn, error) {
-	if err := dsn.CheckSSL(); err != nil {
-		return nil, err
-	}
-	addr, err := resolveAddr(dsn.Host, dsn.Port)
-	if err != nil {
-		return nil, err
-	}
-
-	dialTimeout := dsn.Options.ConnectTimeout
-	dialer := net.Dialer{Timeout: dialTimeout}
-	raw, err := dialer.DialContext(ctx, "tcp", addr.String())
-	if err != nil {
-		return nil, err
-	}
-	tcp, ok := raw.(*net.TCPConn)
-	if !ok {
-		_ = raw.Close()
-		return nil, fmt.Errorf("celeris-postgres: expected *net.TCPConn, got %T", raw)
-	}
-	_ = tcp.SetNoDelay(true)
-
-	file, err := tcp.File()
-	if err != nil {
-		_ = tcp.Close()
-		return nil, err
-	}
-	// tcp.File dup'd the fd; close the net.TCPConn wrapper. We own the dup'd
-	// fd from here on. CRITICAL: *os.File carries a runtime finalizer that
-	// closes the fd on GC — if file becomes unreachable the finalizer shuts
-	// the fd out from under the event loop (observed as sporadic EBADF /
-	// hangs under GC pressure in high-rate benchmarks). Store file in the
-	// pgConn so it stays reachable for the conn's lifetime; closeFDOnce()
-	// closes via file.Close() so the finalizer is satisfied.
-	fd := int(file.Fd())
-	if err := syscall.SetNonblock(fd, true); err != nil {
-		_ = tcp.Close()
-		_ = file.Close()
-		return nil, err
-	}
-	tuneConnSocket(fd)
-	_ = tcp.Close()
-
-	nw := prov.NumWorkers()
-	if nw <= 0 {
-		// Use file.Close() (not syscall.Close(fd)) so the *os.File's
-		// runtime finalizer is disarmed. Otherwise a later GC cycle would
-		// call syscall.Close(fd) a second time, potentially on an
-		// unrelated fd the kernel has since reassigned to another socket.
-		_ = file.Close()
-		return nil, errors.New("celeris-postgres: event loop has 0 workers")
-	}
-	if workerHint < 0 || workerHint >= nw {
-		workerHint = fd % nw
-		if workerHint < 0 {
-			workerHint = -workerHint
-		}
-	}
-	loop := prov.WorkerLoop(workerHint)
-
-	// Cache the SyncRoundTripper capability for the fast path.
-	var syncL *pgSyncLoop
-	if srt, ok := loop.(syncRoundTripper); ok {
-		syncL = &pgSyncLoop{sync: srt}
-	}
-
-	c := &pgConn{
-		fd:        fd,
-		fdFile:    file,
-		loop:      loop,
-		syncLoop:  syncL,
-		workerID:  workerHint,
-		closeLoop: closeLoop,
-		addr:      addr,
-		opts:      dsn.Options,
-		dsn:       dsn,
-		reader:    protocol.NewReader(),
-		writer:    protocol.NewWriter(),
-		bridge:    async.NewBridge(),
-		stmtCache: newLRU(dsn.Options.StatementCacheSize),
-		autoCache: dsn.Options.AutoCacheStatements && dsn.Options.StatementCacheSize > 0,
-		// Pre-size pending queue for the common case (pipeline depth 1-2).
-		// Backing cap is retained across enqueue/popHead cycles thanks to
-		// the in-place shift in popHead, so bursty depths only allocate
-		// on the first surge.
-		pending:      make([]*pgRequest, 0, 8),
-		createdAt:    time.Now(),
-		serverParams: map[string]string{},
-	}
-	if syncL != nil {
-		c.syncBuf = make([]byte, 16<<10) // 16 KiB read buffer for sync path
-	}
-	c.onRecvFn = c.onRecv
-	c.onCloseFn = c.onClose
-	c.lastUsedAt.Store(time.Now().UnixNano())
-
-	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
-		// Close via file.Close() to disarm the *os.File finalizer. A stray
-		// syscall.Close(fd) here would leave the finalizer armed; when GC
-		// later fires it would close the same fd a SECOND time, possibly
-		// hitting an unrelated fd the kernel reassigned in the meantime.
-		_ = file.Close()
-		return nil, err
-	}
-
-	if err := c.doStartup(ctx); err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	return c, nil
-}
-
 func resolveAddr(host, port string) (*net.TCPAddr, error) {
 	return net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
 }
@@ -989,7 +870,7 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 	// SyscallConn fails we just fall through to plain tcp.Read.
 	var rawFd int
 	if sc, scErr := tcp.SyscallConn(); scErr == nil {
-		_ = sc.Control(func(fd uintptr) { rawFd = int(fd) })
+		_ = sc.Control(func(fd uintptr) { rawFd = peekFD(fd) })
 	}
 
 	c := &pgConn{
