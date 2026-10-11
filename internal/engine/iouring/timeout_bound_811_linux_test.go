@@ -3,6 +3,7 @@
 package iouring
 
 import (
+	"io"
 	"os"
 	"strconv"
 	"testing"
@@ -16,12 +17,17 @@ import (
 // (checkTimeouts) runs on an iteration gate: every 32 iterations with
 // ReadHeaderTimeout > 0 or a detached conn, every 1024 otherwise, and an idle
 // iteration waits up to 25 / 50 / 100 ms (baseTimeout), so the sweeps are
-// 0.8 s, 1.6 s or about 100 s apart on an idle worker, and unbounded while
-// the loop waits without a timeout for a SEND's completion (waitUntimed).
-// Those bounds are main's, for every conn whose SEND is outstanding and which
-// is not on the dirty list, and the fix does not change them. What the fix
-// changes is which workers reach them: a worker that used to spin reached the
-// gate every few microseconds.
+// 0.8 s, 1.6 s or about 100 s apart on an idle worker. A worker that used to
+// spin reached the gate every few microseconds, so main enforced WriteTimeout
+// on a stalled async conn within about a second whatever ReadHeaderTimeout
+// was; parked, it would reach it 100 s later with ReadHeaderTimeout off, so
+// the give-up sets sendWatch and the loop sweeps once a second while a SEND is
+// outstanding (sweepWatchDue).
+//
+// A worker that waits for a SEND's completion with no timeout (waitUntimed,
+// mode 3a: the last thing it submitted is a remainder SEND to a client that
+// stopped reading) runs no iteration, so no sweep: not bounded by anything
+// here, nor on main. The partial_read arms measure it (E14_PROBE=1).
 //
 // Each arm: one conn (pipelined: busy811Conns, the count that kept the old
 // worker spinning on the default configuration), a 3 MiB response nobody
@@ -30,14 +36,16 @@ import (
 // off. It logs the time from the request to the conn's teardown
 // (ActiveConnections back to 0) and the CPU over it.
 //
-// The asserted arm is the default configuration (ReadHeaderTimeout 10 s,
-// gate 32): the conn must be gone in a bound far under the 25 s a gate of
-// 1024 would give. The other arms (ReadHeaderTimeout off, async single, sync)
-// are the pre-existing bounds above, measured with E14_PROBE=1 and not
-// asserted: they wait up to E14_PROBE_WAIT seconds (default 130).
+// The asserted arms are the pipelined async ones, the shape that used to spin,
+// on the default configuration (ReadHeaderTimeout 10 s) and with it off: the
+// conn must be gone in a bound far under what the gate alone gives (about
+// 100 s with ReadHeaderTimeout off). The other arms (async single, sync, and
+// the partial_read ones) are bounds that main has as well, measured with
+// E14_PROBE=1 and not asserted: they wait up to E14_PROBE_WAIT seconds
+// (default 130).
 func TestIouringWriteTimeoutBoundOfAStalledSend811(t *testing.T) {
 	// WriteTimeout 1 s + closing drain 5 s + connState release hold 5 s +
-	// a sweep every 0.8 s: 8 s on main and on the fix (8.1 / 8.6 s measured).
+	// a sweep every 1 s or less: about 8 to 10 s.
 	const asserted = 20 * time.Second
 	wait := 130 * time.Second
 	if v, err := strconv.Atoi(os.Getenv("E14_PROBE_WAIT")); err == nil && v > 0 {
@@ -47,15 +55,18 @@ func TestIouringWriteTimeoutBoundOfAStalledSend811(t *testing.T) {
 		name      string
 		async     bool
 		pipelined bool
+		partial   int           // bytes the client reads, then stops: the first SEND completes short, a remainder SEND is the worker's last submission
 		rht       time.Duration // 0: the 10 s default; -1: off
 		assert    bool
 	}{
-		{"async_pipelined/rht_default", true, true, 0, true},
-		{"async_pipelined/rht_off", true, true, -1, false},
-		{"async_single/rht_default", true, false, 0, false},
-		{"async_single/rht_off", true, false, -1, false},
-		{"sync/rht_default", false, false, 0, false},
-		{"sync/rht_off", false, false, -1, false},
+		{"async_pipelined/rht_default", true, true, 0, 0, true},
+		{"async_pipelined/rht_off", true, true, 0, -1, true},
+		{"async_single/rht_default", true, false, 0, 0, false},
+		{"async_single/rht_off", true, false, 0, -1, false},
+		{"sync/rht_default", false, false, 0, 0, false},
+		{"sync/rht_off", false, false, 0, -1, false},
+		{"partial_read/async/rht_off", true, false, 256 << 10, -1, false},
+		{"partial_read/sync/rht_off", false, false, 256 << 10, -1, false},
 	} {
 		if !tc.assert && os.Getenv("E14_PROBE") == "" {
 			continue // a probe arm exists only under E14_PROBE=1 (a skipped subtest would be an unaccounted SKIP in CI)
@@ -84,6 +95,12 @@ func TestIouringWriteTimeoutBoundOfAStalledSend811(t *testing.T) {
 				time.Sleep(300 * time.Millisecond) // every first SEND is in flight
 				for _, cl := range cls {
 					cl.send(t, "/small")
+				}
+			}
+			if tc.partial > 0 {
+				_ = cls[0].c.SetReadDeadline(time.Now().Add(10 * time.Second))
+				if _, err := io.CopyN(io.Discard, cls[0].br, int64(tc.partial)); err != nil {
+					t.Fatalf("reading the first %d bytes of the response: %v", tc.partial, err)
 				}
 			}
 			var gone time.Duration

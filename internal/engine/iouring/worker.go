@@ -520,6 +520,16 @@ type Worker struct {
 	// outstanding (celeris#811). Worker-owned; read by tests after the
 	// worker has stopped, as the witness that a benchmark exercised the path.
 	dirtySendGiveUps uint64
+	// sendWatch is set when the dirty pass gives up a conn whose SEND is
+	// outstanding (celeris#811) and re-derived by every timeout sweep (set
+	// while a conn has a SEND or SEND_ZC notification outstanding). While it is
+	// set the loop also sweeps once lastSweep (UnixNano of the last sweep) is a
+	// second old, checked on every 8th iteration (sweepWatchDue): a parked
+	// worker's iterations are up to 100 ms apart, so the gate of 32 or 1024
+	// iterations alone is seconds to minutes, and the spin that used to
+	// reach it is gone. Worker-owned.
+	sendWatch bool
+	lastSweep int64
 
 	// pendingRelease defers returning connState structs to the pool
 	// until the kernel has drained every in-flight I/O SQE that may
@@ -1720,7 +1730,7 @@ func (w *Worker) run(ctx context.Context) {
 		if w.detachedCount > 0 || w.cfg.ReadHeaderTimeout > 0 {
 			gate = 0x1F
 		}
-		if w.tickCounter&gate == 0 {
+		if w.tickCounter&gate == 0 || w.sweepWatchDue() {
 			w.checkTimeouts()
 		}
 
@@ -6272,14 +6282,17 @@ func (w *Worker) flushDirty() {
 			// 32 iterations with ReadHeaderTimeout > 0 or a detached conn,
 			// every 1024 otherwise, and an idle iteration waits up to 25 ms
 			// (ReadHeaderTimeout > 0), 50 ms (a detached conn) or 100 ms
-			// (baseTimeout), so without ReadHeaderTimeout the sweeps are
-			// about 100 s apart, as they already are for a conn whose SEND is
-			// outstanding and which is not listed (any sync conn).
+			// (baseTimeout): without ReadHeaderTimeout the sweeps would be
+			// about 100 s apart, where the spin used to sweep within
+			// milliseconds. So the give-up sets sendWatch, which makes the
+			// loop sweep once a second (sweepWatchDue) for as long as a
+			// conn has a SEND outstanding.
 			if cs.needsRecv && !cs.recvPaused && !cs.recvArmed {
 				w.beginRecvStall(cs)
 			}
 			w.unlinkDirty(cs)
 			w.dirtySendGiveUps++
+			w.sendWatch = true
 		} else {
 			if mu := cs.detachMu; mu != nil && !mu.TryLock() {
 				if dispatchBusy(cs, &cs.relinkOwed) {
@@ -6698,12 +6711,23 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	return snap, true
 }
 
+// sweepWatchDue reports whether the loop owes a timeout sweep outside its
+// iteration gate (celeris#811): the dirty pass gave up a conn whose SEND is
+// outstanding (sendWatch), so no spin reaches the gate for its WriteTimeout,
+// and a parked worker's gate is seconds to minutes. One bool test per
+// iteration; the clock is read on every 8th, and only while the watch is set.
+func (w *Worker) sweepWatchDue() bool {
+	return w.sendWatch && w.tickCounter&0x7 == 0 &&
+		time.Now().UnixNano()-w.lastSweep >= int64(time.Second)
+}
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. The loop calls it every 32 iterations when
 // ReadHeaderTimeout > 0 or a conn is detached, every 1024 otherwise; an idle
 // iteration waits up to 25 / 50 / 100 ms (baseTimeout), so the gap is about
-// 0.8 s, 1.6 s or 102 s on an idle worker, and unbounded while the worker waits
-// without a timeout for a SEND's completion (waitUntimed). This
+// 0.8 s, 1.6 s or 102 s on an idle worker; with sendWatch set (sweepWatchDue)
+// it also runs once a second. None of it runs while the worker waits without a
+// timeout for a SEND's completion (waitUntimed). This
 // replaces the timer wheel: instead of allocating entries and updating maps
 // on every recv/send, we store a single lastActivity timestamp on the
 // connState and scan here.
@@ -6714,6 +6738,10 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 // conns) regardless of FD space.
 func (w *Worker) checkTimeouts() {
 	now := time.Now().UnixNano()
+	w.lastSweep = now
+	// sendOut: a conn has a SEND (or a SEND_ZC notification) outstanding, so
+	// the watch (sendWatch, set by the dirty pass's give-up) stays on.
+	sendOut := false
 	// Drain the deferred-release queue here too. drainPendingRelease gates on
 	// w.cachedNow, which is otherwise only refreshed inside the CQE-processing
 	// block; on a fully idle worker (no CQEs) cachedNow never advances and
@@ -6741,6 +6769,9 @@ func (w *Worker) checkTimeouts() {
 		}
 		if recvStallProbeActive {
 			w.reportRecvSilence(cs, now)
+		}
+		if cs.sending || cs.zcNotifPending {
+			sendOut = true
 		}
 		// Deferred close (closeConn): the fd stays open until the queued SENDs
 		// complete, which normally happens within a loop pass or two. Nothing
@@ -6850,6 +6881,7 @@ func (w *Worker) checkTimeouts() {
 			}
 		}
 	}
+	w.sendWatch = sendOut
 }
 
 // h2PoolDrainFloor is the least time the worker, its context cancelled,

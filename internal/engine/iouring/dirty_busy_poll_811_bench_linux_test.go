@@ -160,8 +160,8 @@ func BenchmarkResponseSize811(b *testing.B) {
 				b.ReportMetric(float64(iters)/float64(b.N+21), "iters_per_op")
 				// giveups_per_op: the dirty pass's give-ups of a conn with a
 				// SEND outstanding, the path the fix adds. 0 means the arm did
-				// not exercise it (the base binary has no such counter: its
-				// bench line has no giveups_per_op, see ab3-analyze.py).
+				// not exercise it. The base binary of the A/B declares the
+				// counter and never increments it, so it reports 0 here.
 				b.ReportMetric(float64(giveUps)/float64(b.N+21), "giveups_per_op")
 			})
 		}
