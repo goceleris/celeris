@@ -5308,7 +5308,7 @@ func (w *Worker) abortAsyncHandler(cs *connState, r any, holds *dispatchHolds) {
 	if w.logger != nil {
 		stack = string(debug.Stack())
 		if r != nil {
-			msg = panicText844(r)
+			msg = panicText(r)
 		}
 	}
 	if holds.detachMu && !cs.asyncDetachUnlocked {
@@ -5339,13 +5339,13 @@ func (w *Worker) abortAsyncHandler(cs *connState, r any, holds *dispatchHolds) {
 	w.enqueueDetach(cs)
 }
 
-// panicText844 formats a panic value for the abort's log record. fmt recovers
+// panicText formats a panic value for the abort's log record. fmt recovers
 // a panic out of the value's Error or String method, but only one level deep: a
 // method that panics with a value whose own method panics is re-raised out of
 // Sprint. The abort runs that under detachMu inside a deferred function nothing
 // recovers, so the second level is recovered here, and the type name stands in
 // for the text (celeris#844).
-func panicText844(r any) (msg string) {
+func panicText(r any) (msg string) {
 	defer func() {
 		if recover() != nil {
 			msg = fmt.Sprintf("%T (its Error or String method panicked)", r)
