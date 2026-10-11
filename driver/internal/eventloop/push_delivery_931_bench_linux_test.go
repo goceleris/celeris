@@ -128,9 +128,11 @@ func BenchmarkPushDeliveryWhileCalls931(b *testing.B) {
 // b931Rig is one conn of the benchmark and the frames it has delivered.
 type b931Rig struct {
 	fd, peer int
-	mu       sync.Mutex // the call and the worker deliver one at a time; the lock is for the race detector
-	part     []byte
-	lat      []time.Duration
+	// mu: the call and the worker deliver one at a time; the lock is for the
+	// race detector.
+	mu   sync.Mutex
+	part []byte
+	lat  []time.Duration
 }
 
 // onRecv assembles the 8-byte frames and records each one's delivery latency.

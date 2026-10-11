@@ -361,12 +361,13 @@ func TestAFreshQueuedTurnDoesNotWaitForAPollingCaller931(t *testing.T) {
 
 // TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931 is the check of the
 // worker's TryLock-and-requeue against the callers it races with. Four conns
-// each have a peer that pushes 1 to 200 bytes at random moments for 2 s (longer until a turn has found a recvMu held), and an
-// owner that calls WriteAndPollMulti back to back, so events of a conn are
-// collected while a call holds its recvMu, between calls and in the middle of
-// the re-arm. Every byte a peer sent must be delivered, by a call's onRecv or by
-// the worker's, once the pushes stop, and the callers must keep making calls
-// (a deadlock between the worker and a caller shows as a caller that stops).
+// each have a peer that pushes 1 to 200 bytes at random moments for 2 s
+// (longer until a turn has found a recvMu held), and an owner that calls
+// WriteAndPollMulti back to back, so events of a conn are collected while a
+// call holds its recvMu, between calls and in the middle of the re-arm. Every
+// byte a peer sent must be delivered, by a call's onRecv or by the worker's,
+// once the pushes stop, and the callers must keep making calls (a deadlock
+// between the worker and a caller shows as a caller that stops).
 func TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931(t *testing.T) {
 	var busyEvents, busyQueued atomic.Int64
 	testHookEventTurnBusy = func(int) { busyEvents.Add(1) }

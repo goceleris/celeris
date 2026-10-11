@@ -8,6 +8,7 @@ package epoll
 
 import (
 	"context"
+	"hash/crc32"
 	"log/slog"
 	"net"
 	"runtime"
@@ -23,10 +24,28 @@ import (
 	"github.com/goceleris/celeris/internal/resource"
 )
 
-// c930FeederSpin makes the flood's feeder spin on EAGAIN instead of sleeping 10 us, which a timer in a VM
-// stretches into a bubble of the feeder's pipeline. The throughput benchmark sets it, so that it measures
-// the loop and not the feeder's back-off.
+// c930FeederSpin makes the flood's feeder spin on EAGAIN instead of sleeping
+// 10 us, which a timer in a VM stretches into a bubble of the feeder's
+// pipeline. The throughput benchmark sets it, so that it measures the loop and
+// not the feeder's back-off.
 var c930FeederSpin atomic.Bool
+
+// c930TouchSink keeps the result of the touching onRecv functions alive.
+var c930TouchSink atomic.Uint64
+
+// c930Sum reads every byte of p: a byte sum.
+func c930Sum(p []byte) {
+	var s uint64
+	for _, c := range p {
+		s += uint64(c)
+	}
+	c930TouchSink.Add(s)
+}
+
+// c930CRC reads every byte of p: a CRC-32 (hardware-assisted, the cheapest per byte of the two).
+func c930CRC(p []byte) {
+	c930TouchSink.Add(uint64(crc32.ChecksumIEEE(p)))
+}
 
 // c930Socketpair is socketpairNonblocking for tests and benchmarks.
 func c930Socketpair(tb testing.TB) (int, int) {
@@ -173,6 +192,13 @@ func c930Flood(t testing.TB, wl engine.WorkerLoop, perChunk time.Duration) *c930
 // c930FloodCounting is c930Flood that also counts the reads of the flooded conn in reads.
 func c930FloodCounting(t testing.TB, wl engine.WorkerLoop, perChunk time.Duration, reads *atomic.Int64) *c930Flooder {
 	t.Helper()
+	return c930FloodTouching(t, wl, perChunk, reads, nil)
+}
+
+// c930FloodTouching is c930FloodCounting whose onRecv also runs touch on every chunk it receives, as an onRecv that
+// reads the bytes (a parser, a checksum) does.
+func c930FloodTouching(t testing.TB, wl engine.WorkerLoop, perChunk time.Duration, reads *atomic.Int64, touch func([]byte)) *c930Flooder {
+	t.Helper()
 	f := &c930Flooder{stop: make(chan struct{}), wl: wl}
 	f.fd, f.peer = c930Socketpair(t)
 	first := make(chan struct{}, 1)
@@ -182,6 +208,9 @@ func c930FloodCounting(t testing.TB, wl engine.WorkerLoop, perChunk time.Duratio
 		}
 		if f.got.Add(int64(len(p))) == int64(len(p)) {
 			first <- struct{}{}
+		}
+		if touch != nil {
+			touch(p)
 		}
 		if perChunk > 0 {
 			time.Sleep(perChunk)

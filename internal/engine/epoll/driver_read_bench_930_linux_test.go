@@ -13,7 +13,9 @@ package epoll
 //   - BenchmarkHTTPBesideFlood930: the same with an HTTP/1 request on a
 //     keep-alive conn of a loop that carries a flooding driver conn.
 //   - BenchmarkDriverFloodThroughput930: one op is 1 MiB delivered to A's
-//     onRecv while A's peer keeps the socket full.
+//     onRecv while A's peer keeps the socket full; onRecv is empty (0s), sleeps
+//     100 us a chunk, or reads every byte of the chunk (sum: a byte sum, crc: a
+//     CRC-32).
 //   - BenchmarkDriverPingPong930: one op is a one-byte write to an idle driver
 //     conn and the loop's read of it (the path that never floods).
 
@@ -152,11 +154,20 @@ func BenchmarkHTTPBesideFlood930(b *testing.B) {
 func BenchmarkDriverFloodThroughput930(b *testing.B) {
 	c930FeederSpin.Store(true)
 	defer c930FeederSpin.Store(false)
-	for _, perChunk := range []time.Duration{0, 100 * time.Microsecond} {
-		b.Run(fmt.Sprintf("onRecv=%v", perChunk), func(b *testing.B) {
+	for _, tc := range []struct {
+		name     string
+		perChunk time.Duration
+		touch    func([]byte)
+	}{
+		{fmt.Sprintf("onRecv=%v", time.Duration(0)), 0, nil},
+		{fmt.Sprintf("onRecv=%v", 100*time.Microsecond), 100 * time.Microsecond, nil},
+		{"onRecv=sum", 0, c930Sum},
+		{"onRecv=crc", 0, c930CRC},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
 			eng, stop := newTestEngine(b)
 			defer stop()
-			f := c930Flood(b, eng.WorkerLoop(0), perChunk)
+			f := c930FloodTouching(b, eng.WorkerLoop(0), tc.perChunk, nil, tc.touch)
 			defer f.close()
 			b.SetBytes(1 << 20)
 			start := f.got.Load()
