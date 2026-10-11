@@ -13,9 +13,8 @@ import "syscall"
 func peekFD(fd uintptr) int { return int(fd) }
 
 // recvNoWait reads whatever the kernel already holds for fd without blocking.
-func recvNoWait(fd int, p []byte) (int, error) {
-	n, _, err := syscall.Recvfrom(fd, p, syscall.MSG_DONTWAIT)
-	return n, err
+func recvNoWait(fd int, p []byte) (int, syscall.Sockaddr, error) {
+	return syscall.Recvfrom(fd, p, syscall.MSG_DONTWAIT)
 }
 
 // closeRawFD closes a descriptor the conn owns outside an *os.File.

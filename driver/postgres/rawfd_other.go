@@ -14,7 +14,9 @@ func peekFD(uintptr) int { return 0 }
 
 // recvNoWait is never called (peekFD leaves the cached descriptor at 0); it
 // reports that no data is ready.
-func recvNoWait(int, []byte) (int, error) { return 0, syscall.EAGAIN }
+func recvNoWait(int, []byte) (int, syscall.Sockaddr, error) {
+	return 0, nil, syscall.EAGAIN
+}
 
 // closeRawFD does nothing: the loop closes the net.Conn on UnregisterConn.
 func closeRawFD(int) {}

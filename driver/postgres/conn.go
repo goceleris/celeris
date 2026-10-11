@@ -752,7 +752,8 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return err
 		}
 		if c.tcpFd > 0 {
-			if n, perr := recvNoWait(c.tcpFd, c.directBuf); n > 0 {
+			n, _, perr := recvNoWait(c.tcpFd, c.directBuf)
+			if n > 0 {
 				c.onRecv(c.directBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
