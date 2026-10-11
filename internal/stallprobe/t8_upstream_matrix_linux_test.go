@@ -32,6 +32,9 @@ package stallprobe
 //	                             PATH (GOTOOLCHAIN=local, no download); default local
 //	CELERIS_PROBE_REPS           reps per (version, case) (6). NOTE: the P2/P3 probes read the same name
 //	                             with a default of 100; under run=^TestUpstreamMatrix$ they do not run.
+//	                             "tip" = golang/go built from source with src/make.bash (t8_tip_linux_test.go;
+//	                             CELERIS_PROBE_TIP_REF pins the commit, default master, resolved to a sha and logged;
+//	                             unreachable source or a failed build is MATRIX_SKIP version=tip; no patch arms for tip)
 //	CELERIS_PROBE_UP_SECS        seconds per run (30)
 //	CELERIS_PROBE_UP_THRESHOLD_MS  STALL above this longest wake gap (50)
 //	CELERIS_PROBE_UP_CASES       subset of little,big,little-noasync (all three)
@@ -212,25 +215,46 @@ func TestUpstreamMatrix(t *testing.T) {
 			tc = "local"
 		}
 		e := upEnv{tmp: tmp, toolchain: tc}
+		vGo, vArms := goBin, arms
+		if v == "tip" {
+			if vGo = upPrepareTip(t, goBin, tmp); vGo == "" {
+				continue // MATRIX_SKIP already logged
+			}
+			e.toolchain, vArms = "local", []string{""}
+		}
 		bctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		goVer, se, err := upRun(bctx, srcDir, e.env(), goBin, "version") // downloads the toolchain when needed (go env GOVERSION needs go1.17+)
+		goVer, se, err := upRun(bctx, srcDir, e.env(), vGo, "version") // downloads the toolchain when needed (go env GOVERSION needs go1.17+)
 		if err != nil {
 			cancel()
 			t.Logf("MATRIX_SKIP version=%s reason=%q", v, "toolchain unavailable: "+err.Error()+" "+tail(se, 300))
 			continue
 		}
-		mod := regexp.MustCompile(`go version go(\d+\.\d+)`).FindStringSubmatch(goVer)
+		mod := regexp.MustCompile(`go version (?:devel )?go(\d+\.\d+)`).FindStringSubmatch(goVer)
 		if mod == nil {
 			cancel()
 			t.Logf("MATRIX_SKIP version=%s reason=%q", v, "cannot parse GOVERSION "+goVer)
 			continue
 		}
-		_ = os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module stallrepro\n\ngo "+mod[1]+"\n"), 0o644)
-		goroot, _, _ := upRun(bctx, srcDir, e.env(), goBin, "env", "GOROOT")
+		goMod := mod[1]
+		_ = os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module stallrepro\n\ngo "+goMod+"\n"), 0o644)
+		if v == "tip" { // the go command of a devel toolchain may refuse its own major.minor: step down, and say so
+			minor, _ := strconv.Atoi(strings.TrimPrefix(goMod, "1."))
+			for step := 0; step < 3; step++ {
+				cand := "1." + strconv.Itoa(minor-step)
+				_ = os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module stallrepro\n\ngo "+cand+"\n"), 0o644)
+				_, lse, lerr := upRun(bctx, srcDir, e.env(), vGo, "list", "-m")
+				t.Logf("MATRIX_FACTS tip go.mod go line %s: go command accepted=%v %s", cand, lerr == nil, tail(lse, 200))
+				if lerr == nil {
+					goMod = cand
+					break
+				}
+			}
+		}
+		goroot, _, _ := upRun(bctx, srcDir, e.env(), vGo, "env", "GOROOT")
 		goroot = strings.TrimSpace(goroot)
 		cancel()
-		for _, arm := range arms {
-			bins = append(bins, upBuildArm(t, goBin, srcDir, tmp, e, v, arm, goroot, strings.TrimSpace(goVer), mod[1])...)
+		for _, arm := range vArms {
+			bins = append(bins, upBuildArm(t, vGo, srcDir, tmp, e, v, arm, goroot, strings.TrimSpace(goVer), goMod)...)
 		}
 	}
 
