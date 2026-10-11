@@ -24,6 +24,12 @@
 // default; configure with [Config.HeartbeatInterval]. The middleware works
 // with all celeris engines and handles stream lifecycle internally.
 //
+// An SSE stream is a detached stream, so the server's ReadTimeout and
+// WriteTimeout do not end it on any engine (celeris#855): no WriteTimeout of -1
+// is needed for it. The std engine clears the deadlines net/http armed for the
+// request when the middleware detaches. A stream that should not run for ever
+// is ended by its handler.
+//
 // A HEAD request to an SSE route (answered by its GET route) gets the stream's
 // response headers and no body. [Config.OnConnect] runs for it, and a rejection
 // is handled as for GET; when it accepts, [Config.OnDisconnect] runs right
