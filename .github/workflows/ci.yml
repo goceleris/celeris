@@ -281,7 +281,8 @@ jobs:
       #
       # -timeout=420s: the package's race run takes 265 to 280 s on the runner
       # (270 s on main, 279 s with the celeris#959/#866 tests, which add about
-      # 9 s), so 300 s left a margin of under 10%; a slower runner or the next
+      # 9 s, 291 s with the celeris#895/#896 tests, which add about 12 s more),
+      # so 300 s left a margin of under 10%; a slower runner or the next
       # test added would have ended in a timeout panic instead of a result.
       - name: internal/engine/iouring — race tests at the runner's memlock (every skip accounted for)
         if: ${{ !cancelled() }}
