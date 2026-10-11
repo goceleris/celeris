@@ -110,6 +110,13 @@ func BenchmarkPushDeliveryWhileCalls931(b *testing.B) {
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
 	pick := func(q float64) float64 { return float64(all[int(q*float64(len(all)-1))].Nanoseconds()) }
+	late := 0
+	for _, d := range all {
+		if d > 500*time.Microsecond {
+			late++
+		}
+	}
+	b.ReportMetric(float64(late)/float64(len(all)), "late/frame") // frames delivered more than 500 us after the push
 	b.ReportMetric(pick(0.5), "p50-ns")
 	b.ReportMetric(pick(0.99), "p99-ns")
 	b.ReportMetric(pick(0.9999), "p9999-ns")
