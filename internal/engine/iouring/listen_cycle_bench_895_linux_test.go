@@ -63,8 +63,17 @@ func BenchmarkListenCycle895(b *testing.B) {
 // (until a connect is accepted again, so every worker is listening). Two
 // workers, memlock unlimited, -benchtime=200x.
 func BenchmarkPauseResumeCycle896(b *testing.B) {
+	// A fixed port, so the benchmark runs on origin/main too: there a resume of
+	// a port 0 engine moves every worker to a new port (celeris#895) and the
+	// dial below would never succeed.
+	pl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("pick a port: %v", err)
+	}
+	fixed := pl.Addr().String()
+	_ = pl.Close()
 	e, err := New(resource.Config{
-		Addr:               "127.0.0.1:0",
+		Addr:               fixed,
 		Engine:             engine.IOUring,
 		Protocol:           engine.HTTP1,
 		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -86,7 +95,7 @@ func BenchmarkPauseResumeCycle896(b *testing.B) {
 		}
 		time.Sleep(20 * time.Microsecond)
 	}
-	addr := e.Addr().String()
+	addr := fixed
 	var pauseNs, resumeNs int64
 	b.ResetTimer()
 	for range b.N {
