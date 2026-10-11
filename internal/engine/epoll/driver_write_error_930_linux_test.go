@@ -42,22 +42,34 @@ func c930Fill(t *testing.T, fd int) int {
 
 // TestAWriteErrorOnAConnOwedBytesClosesItAfterThem930: A's own send buffer is
 // full, A's peer has put more than one turn's budget of bytes into A's
-// socket, A's owner has a write pending with EPOLLOUT armed, and then the peer
-// closes. The close reaches A as EPOLLOUT with EPOLLHUP/EPOLLERR: the flush
-// fails. onClose must fire once, with an error, after every byte the peer sent.
+// socket, A's owner has a write pending with EPOLLOUT armed, and then the
+// flush fails. onClose must fire once, with an error, after every byte the
+// peer sent.
 //
-//   - theTurnStopsAtItsBudget: the event is A's first. The turn reads its
-//     budget, stops with bytes left, and then serves EPOLLOUT.
-//   - theEventComesWhileQueued: the event is collected while A is queued with
-//     bytes left, in the epoll_wait before its next turn (a hook closes the
-//     peer there), and the merge of the event serves EPOLLOUT at once.
+//   - theTurnStopsAtItsBudget: the peer closes while the loop is held, so the
+//     event is A's first and carries EPOLLOUT with EPOLLHUP/EPOLLERR. The turn
+//     reads its budget, stops with bytes left, and then serves EPOLLOUT.
+//   - theEventComesWhileQueued: the same close, but it reaches the loop while A
+//     is queued with bytes left (a hook closes the peer in the epoll_wait before
+//     A's next turn), and the merge of the event serves EPOLLOUT at once.
+//   - theWriteSideIsShutDown: A's owner shuts the write side down in that
+//     epoll_wait instead (the peer stays open): the flush fails with EPIPE in an
+//     event that carries no EPOLLHUP/EPOLLERR/EPOLLRDHUP, so the write error
+//     itself must be what closes the conn after the turn that drains the socket.
+//
+// The last two need the hook the fix adds (testHookDriverQueueWait), which the
+// base does not call: only the first says anything about origin/main.
 func TestAWriteErrorOnAConnOwedBytesClosesItAfterThem930(t *testing.T) {
-	for _, queued := range []bool{false, true} {
-		name := "theTurnStopsAtItsBudget"
-		if queued {
-			name = "theEventComesWhileQueued"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		queued   bool // the event comes while A is queued (a hook), else A's first event
+		shutdown bool // A's owner shuts the write side down, else the peer closes
+	}{
+		{"theTurnStopsAtItsBudget", false, false},
+		{"theEventComesWhileQueued", true, false},
+		{"theWriteSideIsShutDown", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			var hook atomic.Pointer[func()]
 			var fired atomic.Bool
 			testHookDriverQueueWait = func(int, int) {
@@ -81,22 +93,32 @@ func TestAWriteErrorOnAConnOwedBytesClosesItAfterThem930(t *testing.T) {
 			t.Cleanup(func() { closePeer(); _ = unix.Close(a) })
 			_ = c930Fill(t, a) // A's send buffer is full: A's first write hits EAGAIN
 			// The socket takes about 230 KB with the default send buffer (a turn reads
-			// 256 KiB); an explicit SO_SNDBUF is doubled by the kernel.
+			// 256 KiB); an explicit SO_SNDBUF is doubled by the kernel, up to twice
+			// net.core.wmem_max.
 			if err := unix.SetsockoptInt(peer, unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20); err != nil {
 				t.Fatalf("SO_SNDBUF: %v", err)
 			}
 			fed := c930Fill(t, peer)
-			if fed <= driverReadBudget*driverReadBufSize+4096 {
-				t.Fatalf("the peer's %d bytes fit one turn (%d reads of %d): the test cannot stop a turn at its budget", fed, driverReadBudget, driverReadBufSize)
+			// The first 100 bytes are read here, so that the rest is not a multiple of
+			// the read buffer: the last read of the drain is short, and the conn is
+			// closed by the write error and not by a zero-byte read (see
+			// TestBudgetedDriverReadsDeliverEveryByteInOrder930).
+			const skip = 100
+			if n, err := unix.Read(a, make([]byte, skip)); n != skip || err != nil {
+				t.Fatalf("read the first %d bytes: %d, %v", skip, n, err)
 			}
-			s := c930NewSink(0, 0) // want 0: s.all is not used
+			want := fed - skip
+			if want <= driverReadBudget*driverReadBufSize+4096 {
+				t.Fatalf("the peer's %d bytes fit one turn (%d reads of %d): the test cannot stop a turn at its budget", want, driverReadBudget, driverReadBufSize)
+			}
+			s := c930NewSink(skip, 0) // want 0: s.all is not used
 			armWrite := func() {
 				if err := wl.Write(a, make([]byte, 1<<20)); err != nil {
 					t.Errorf("Write: %v", err)
 				}
 			}
 			var release chan struct{}
-			if !queued {
+			if !tc.queued {
 				// The loop is held in P's onRecv while A's state is prepared, so
 				// that A's first event carries everything.
 				p, pPeer := socketpairNonblocking(t)
@@ -131,7 +153,13 @@ func TestAWriteErrorOnAConnOwedBytesClosesItAfterThem930(t *testing.T) {
 			} else {
 				h := func() { // on the loop's goroutine, A queued, before the epoll_wait that collects the event
 					armWrite()
-					closePeer()
+					if tc.shutdown {
+						if err := unix.Shutdown(a, unix.SHUT_WR); err != nil {
+							t.Errorf("shutdown: %v", err)
+						}
+					} else {
+						closePeer()
+					}
 				}
 				hook.Store(&h)
 			}
@@ -139,7 +167,7 @@ func TestAWriteErrorOnAConnOwedBytesClosesItAfterThem930(t *testing.T) {
 				t.Fatalf("RegisterConn(A): %v", err)
 			}
 			t.Cleanup(func() { _ = wl.UnregisterConn(a) })
-			if !queued {
+			if !tc.queued {
 				armWrite()
 				dc := wl.(*Loop).lookupDriver(a)
 				armed := false
@@ -161,14 +189,17 @@ func TestAWriteErrorOnAConnOwedBytesClosesItAfterThem930(t *testing.T) {
 				s.mu.Lock()
 				got := s.got
 				s.mu.Unlock()
-				t.Fatalf("onClose never fired (%d of %d bytes delivered)", got, fed)
+				if tc.queued && !fired.Load() {
+					t.Fatalf("the epoll_wait hook never ran (%d of %d bytes delivered): the test did not drive the window", got, want)
+				}
+				t.Fatalf("onClose never fired (%d of %d bytes delivered)", got, want)
 			}
 			s.mu.Lock()
 			got, atClose, closes, bad := s.got, s.atClose, s.closes, s.bad
 			s.mu.Unlock()
-			t.Logf("C930 write error: the peer put %d bytes into A; %d delivered at onClose (%d calls, error: %v), first byte out of order at %d", fed, atClose, closes, closeErr, bad)
-			if atClose != fed || got != fed || bad >= 0 {
-				t.Errorf("onClose fired with %d of %d bytes delivered (%d at the end, first byte out of order: %d): the write error closed the conn before its owed bytes", atClose, fed, got, bad)
+			t.Logf("C930 write error: the peer put %d bytes into A; %d delivered at onClose (%d calls, error: %v), first byte out of order at %d", want, atClose, closes, closeErr, bad)
+			if atClose != want || got != want || bad >= 0 {
+				t.Errorf("onClose fired with %d of %d bytes delivered (%d at the end, first byte out of order: %d): the write error closed the conn before its owed bytes", atClose, want, got, bad)
 			}
 			if closes != 1 || closeErr == nil {
 				t.Errorf("onClose fired %d times, with error %v: want once, with the error that closed the conn", closes, closeErr)

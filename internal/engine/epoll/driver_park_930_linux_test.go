@@ -18,36 +18,35 @@ import (
 	"github.com/goceleris/celeris/internal/deferlinger"
 )
 
-// TestAPausedLoopServesTheBacklogItOwesBeforeItParks930: A's socket holds
-// about 2 MiB when A is registered, and A's onRecv takes 3 ms a chunk, so the
-// backlog takes the loop 64 chunks (24 ms a turn, about 200 ms in all). The
-// engine is paused (linger 0) right after: the loop closes its listener and
-// has nothing else to hold it, so it parks as soon as its park condition
-// holds. Every byte must reach A's onRecv without a ResumeAccept, and the
-// loop must park once the last has.
+// TestAPausedLoopServesTheBacklogItOwesBeforeItParks930: A's source is a pipe
+// sized to 1 MiB and filled before A is registered, and A's onRecv takes 3 ms a
+// chunk, so the backlog takes the loop 32 chunks (24 ms a turn, about 100 ms in
+// all). The engine is paused (linger 0) right after: the loop closes its
+// listener and has nothing else to hold it, so it parks as soon as its park
+// condition holds. Every byte must reach A's onRecv without a ResumeAccept, and
+// the loop must park once the last has.
 func TestAPausedLoopServesTheBacklogItOwesBeforeItParks930(t *testing.T) {
 	old := deferlinger.SetLinger(0)
 	t.Cleanup(func() { deferlinger.SetLinger(old) })
 	e := c930HTTPEngine(t)
 	wl := e.WorkerLoop(0)
 	loop := wl.(*Loop)
-	a, peer := socketpairNonblocking(t)
-	t.Cleanup(func() { _ = unix.Close(a); _ = unix.Close(peer) })
-	if err := unix.SetsockoptInt(peer, unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20); err != nil {
-		t.Fatalf("SO_SNDBUF: %v", err)
+	rd, wr := c930Pipe(t)
+	t.Cleanup(func() { _ = unix.Close(rd); _ = unix.Close(wr) })
+	// 100 bytes short of 32 reads: the last read is short, so the loop does not read
+	// on to an EOF (the write end stays open).
+	const size = 1<<20 - 100
+	if n, err := unix.Write(wr, c930Pattern(0, size)); n != size || err != nil {
+		t.Fatalf("fill the pipe: wrote %d of %d (%v)", n, size, err)
 	}
-	fed := c930Fill(t, peer)
-	if fed <= 4*driverReadBudget*driverReadBufSize {
-		t.Fatalf("the peer's %d bytes are fewer than four turns' worth: the test cannot keep the loop owing turns", fed)
-	}
-	s := c930NewSink(0, fed)
-	if err := wl.RegisterConn(a, func(b []byte) {
+	s := c930NewSink(0, size)
+	if err := wl.RegisterConn(rd, func(b []byte) {
 		s.onRecv(b)
 		time.Sleep(3 * time.Millisecond)
 	}, s.onClose); err != nil {
 		t.Fatalf("RegisterConn: %v", err)
 	}
-	t.Cleanup(func() { _ = wl.UnregisterConn(a) })
+	t.Cleanup(func() { _ = wl.UnregisterConn(rd) })
 	if err := e.PauseAccept(); err != nil {
 		t.Fatalf("PauseAccept: %v", err)
 	}
@@ -64,9 +63,9 @@ func TestAPausedLoopServesTheBacklogItOwesBeforeItParks930(t *testing.T) {
 	for dl := time.Now().Add(3 * time.Second); !parked && time.Now().Before(dl); time.Sleep(time.Millisecond) {
 		parked = loop.suspended.Load()
 	}
-	t.Logf("C930 paused loop: %d of %d bytes delivered without a ResumeAccept; the loop parked afterwards: %v", got, fed, parked)
+	t.Logf("C930 paused loop: %d of %d bytes delivered without a ResumeAccept; the loop parked afterwards: %v", got, size, parked)
 	if !delivered {
-		t.Errorf("A got %d of its %d bytes: the loop parked with them still owed", got, fed)
+		t.Errorf("A got %d of its %d bytes: the loop parked with them still owed", got, size)
 	}
 	if !parked {
 		t.Errorf("the loop did not park within 3 s of the last byte")
