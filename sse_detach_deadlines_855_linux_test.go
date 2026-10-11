@@ -315,10 +315,10 @@ func stalledResponse855(t *testing.T, addr string, h2c bool) (got int, err error
 // connection is closed) and over h2c (the stream is reset), so Detach is the
 // only thing that lifts the timeout.
 //
-// std only: epoll, io_uring and adaptive deliver a body of 8 MiB or more to a
-// client that read nothing for five WriteTimeouts, whole, on main (3cfee4b,
-// measured on main 3cfee4b), so there is no bound to keep here; see the
-// polish items on #884 and #885. The request side of the negative runs on every engine in
+// std only: epoll, io_uring and adaptive deliver a body of 8 MiB or more whole
+// to a client that read nothing for five WriteTimeouts (measured on main
+// 3cfee4b), so there is no bound to keep there; see the polish items on #884
+// and #885. The request side of the negative runs on every engine in
 // TestStalledRequestStillBoundedByReadTimeout855.
 func TestStalledResponseStillBoundedByWriteTimeoutStd855(t *testing.T) {
 	for _, async := range []bool{false, true} {
