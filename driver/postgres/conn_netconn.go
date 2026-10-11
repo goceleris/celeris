@@ -53,6 +53,11 @@ func dialConnNetConn(ctx context.Context, prov engine.EventLoopProvider, closeLo
 		_ = tcp.Close()
 		return nil, errors.New("celeris-postgres: event loop has 0 workers")
 	}
+	// The unix dial spreads conns over the workers by descriptor; a conn with
+	// no descriptor has nothing to spread by, so an unusable hint (the
+	// database/sql connector always passes -1) lands on worker 0. The
+	// portable worker runs one goroutine per conn, so the shared map lock is
+	// the only cost.
 	if workerHint < 0 || workerHint >= nw {
 		workerHint = 0
 	}

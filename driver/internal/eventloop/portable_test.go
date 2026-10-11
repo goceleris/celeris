@@ -385,7 +385,7 @@ func TestPortableIdentifiers(t *testing.T) {
 }
 
 // The drivers call back into the loop from the callbacks: pgConn.onClose
-// unregisters the conn (shutdownFD) and onRecv writes the startup exchange's
+// shuts the socket down (shutdownFD) and onRecv writes the startup exchange's
 // answers. A worker that held a lock across a callback would deadlock here;
 // the timeout is the check.
 func TestPortableCallbacksMayCallBackIntoTheLoop(t *testing.T) {

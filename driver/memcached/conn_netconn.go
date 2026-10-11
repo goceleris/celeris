@@ -18,9 +18,12 @@ import (
 // is compiled everywhere so that its tests run on Linux CI as well; only
 // conn_other.go selects it as dialMemcachedConn.
 //
-// The conn has no descriptor: c.fd holds the identifier the loop assigned,
+// The conn has no descriptor: c.fd holds the identifier the loop assigned
+// (a number from eventloop.IsNetConnID's range, >= 1<<30, not a descriptor),
 // c.file stays nil, and the loop closes the net.Conn on UnregisterConn, which
-// Close runs.
+// Close runs. This function is compiled on unix too (its tests run there),
+// where Close also reaches the raw-descriptor helpers of rawfd_unix.go with
+// that identifier; they fail with EBADF and their result is ignored.
 func dialMemcachedConnNetConn(ctx context.Context, prov engine.EventLoopProvider, cfg Config, workerHint int) (*memcachedConn, error) {
 	timeout := cfg.DialTimeout
 	if timeout <= 0 {
@@ -43,6 +46,10 @@ func dialMemcachedConnNetConn(ctx context.Context, prov engine.EventLoopProvider
 		_ = tcp.Close()
 		return nil, errors.New("celeris-memcached: event loop has 0 workers")
 	}
+	// The unix dial spreads conns over the workers by descriptor; a conn with
+	// no descriptor has nothing to spread by, so an unusable hint (the
+	// database/sql path passes -1) lands on worker 0. The portable worker
+	// runs one goroutine per conn, so the shared map lock is the only cost.
 	if workerHint < 0 || workerHint >= nw {
 		workerHint = 0
 	}
@@ -72,6 +79,10 @@ func dialMemcachedConnNetConn(ctx context.Context, prov engine.EventLoopProvider
 		_ = tcp.Close()
 		return nil, err
 	}
+	// c.fd is written after the reader goroutine may already be running, with
+	// no synchronisation (the unix dial sets it before RegisterConn): no
+	// callback may read c.fd, or this write becomes a race. (Postgres
+	// publishes its identifier under fdMu because its onClose does read it.)
 	c.fd = id
 
 	if err := c.handshake(ctx); err != nil {

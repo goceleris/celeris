@@ -2099,7 +2099,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          go test -count=1 -timeout=600s -v ./driver/internal/eventloop ./driver/redis ./driver/postgres ./driver/memcached 2>&1 | tee fallback.log
+          # The race detector needs cgo, which windows-latest's runner has no C
+          # toolchain for; macOS has one, and its leg runs the darwin worker
+          # (the same portable.go) under it.
+          race=""
+          if [ "$RUNNER_OS" = "macOS" ]; then race="-race"; fi
+          go test $race -count=1 -timeout=900s -v ./driver/internal/eventloop ./driver/redis ./driver/postgres ./driver/memcached 2>&1 | tee fallback.log
           pass=$(grep -cE '^[[:space:]]*--- PASS: ' fallback.log || true)
           fail=$(grep -cE '^[[:space:]]*--- FAIL: ' fallback.log || true)
           skip=$(grep -cE '^[[:space:]]*--- SKIP: ' fallback.log || true)
