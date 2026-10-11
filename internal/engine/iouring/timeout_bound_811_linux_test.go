@@ -57,10 +57,10 @@ func TestIouringWriteTimeoutBoundOfAStalledSend811(t *testing.T) {
 		{"sync/rht_default", false, false, 0, false},
 		{"sync/rht_off", false, false, -1, false},
 	} {
+		if !tc.assert && os.Getenv("E14_PROBE") == "" {
+			continue // a probe arm exists only under E14_PROBE=1 (a skipped subtest would be an unaccounted SKIP in CI)
+		}
 		t.Run(tc.name, func(t *testing.T) {
-			if !tc.assert && os.Getenv("E14_PROBE") == "" {
-				t.Skip("probe arm, E14_PROBE=1 runs it")
-			}
 			h := newBusyHandler811()
 			e, addr := startFDLEngine(t, h, func(c *resource.Config) {
 				c.AsyncHandlers = tc.async
