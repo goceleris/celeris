@@ -110,16 +110,6 @@ type run895 struct {
 	done   chan error
 }
 
-func (r *run895) stop(t *testing.T) {
-	t.Helper()
-	r.cancel()
-	select {
-	case <-r.done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Listen did not return within 10s of its cancel")
-	}
-}
-
 // start895 starts an epoll engine with the given loop count on addr and waits
 // for its address. disableDefer makes a pause close at once.
 func start895(t *testing.T, addr string, loops int, disableDefer bool) *run895 {
