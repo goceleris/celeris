@@ -31,10 +31,11 @@
 // engine:
 //
 //   - std: each write of the stream is bounded by WriteTimeout. A write that
-//     makes no progress for WriteTimeout fails, so [Client.Send] returns an
-//     error and the stream ends (WriteTimeout -1 sets no such bound). Until
-//     then the handler, or the queue's drain goroutine, is parked in that
-//     write, so returning or [ClientPolicyClose] cannot end the stream
+//     has not finished within WriteTimeout fails, so [Client.Send] returns an
+//     error and the stream ends (WriteTimeout -1 sets no such bound). For an
+//     SSE event, which is small, that means the client has stopped reading.
+//     Until then the handler, or the queue's drain goroutine, is parked in
+//     that write, so returning or [ClientPolicyClose] cannot end the stream
 //     sooner. When Shutdown's budget runs out, the writes of the streams still
 //     running fail too.
 //   - epoll, io_uring and adaptive: [Client.Send] was measured not to wait for

@@ -1520,9 +1520,9 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // it for this request, so the stream is not cut at WriteTimeout, as it is not
 // on the native engines. ReadTimeout never cuts a stream there: net/http has
 // stopped it by the time the handler runs. In its place, each Write or Flush
-// of the detached stream fails if the client does not take its bytes within
-// WriteTimeout (a client that stays connected and reads nothing ends the
-// stream that way; no bound at WriteTimeout -1), and when Shutdown's budget
+// of the detached stream fails if it has not finished within WriteTimeout (a
+// client that stays connected and reads nothing ends the stream that way; no
+// bound at WriteTimeout -1), and when Shutdown's budget
 // runs out the writes of the streams still running fail. A handler that
 // detaches for a long-poll or a stream of its own gets the same. The writes
 // may come from more than one goroutine, as far as the response writer allows

@@ -240,7 +240,7 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 //
 // Nothing then ends a stream whose client stays connected and reads nothing,
 // so the stream's writes are bounded the way the WebSocket middleware bounds
-// its own: a write parked for WriteTimeout is failed, and when the drain
+// its own: a write that has not finished within WriteTimeout is failed, and when the drain
 // budget runs out the writes fail (see detachedWrites). No deadline is set per
 // write: a detached stream's Write and Flush only note when they started.
 // Runs when a stream starts, never per request.

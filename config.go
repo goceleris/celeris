@@ -130,10 +130,12 @@ type Config struct {
 	// a stream there: net/http has stopped it by the time the handler runs).
 	//
 	// On std, WriteTimeout then bounds a detached stream's writes one at a
-	// time: a Write or Flush that makes no progress for WriteTimeout fails (a
-	// client that stays connected and reads nothing ends the stream that way;
-	// -1 sets no such bound), and when ShutdownTimeout runs out the writes of
-	// the streams still running fail. A response that is not detached, such as
+	// time: a Write or Flush that has not finished within WriteTimeout fails
+	// (for an SSE event, which is small, that means the client has stopped
+	// reading: a client that stays connected and reads nothing ends the stream
+	// that way; one very large write to a client that reads too slowly for it
+	// fails the same; -1 sets no such bound), and when ShutdownTimeout runs
+	// out the writes of the streams still running fail. A response that is not detached, such as
 	// a large download or a chunked body written with [Context.StreamWriter]
 	// without Detach, stays under WriteTimeout as an absolute deadline for the
 	// whole response: raise it or set -1 for such routes.

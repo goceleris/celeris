@@ -29,7 +29,7 @@ var epoch = time.Now()
 // ends a stream whose client stays connected and reads nothing: its handler
 // parks in a socket write for ever. Two things bound that, neither absolute:
 //
-//   - a watchdog: a write that has been parked for WriteTimeout is failed
+//   - a watchdog: a write that has been in flight for WriteTimeout is failed
 //     (cut). A stream that is idle between events is never cut, and a negative
 //     WriteTimeout (no timeout) has no watchdog. The deadline is not set per
 //     write: over h2c every SetWriteDeadline is a message to the connection's

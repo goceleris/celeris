@@ -22,8 +22,8 @@ import (
 // still be got rid of. Two things end such a stream on std, neither of them an
 // absolute deadline:
 //
-//   - a write that makes no progress for WriteTimeout fails (a deadline for
-//     each write, not for the response), so a handler that is bounded, or that
+//   - a write that has not finished within WriteTimeout fails (a bound on
+//     each write, not on the response), so a handler that is bounded, or that
 //     is told to drop a slow client, ends the stream within WriteTimeout of
 //     the write it is parked in;
 //   - the drain budget: Shutdown that runs out of budget fails the writes of
@@ -268,9 +268,9 @@ func TestStalledSSEEndsWithShutdown855(t *testing.T) {
 // reads nothing, WriteTimeout 1 s. The handler (it never ends of its own
 // accord) is parked in Send's write; that Send fails within about 2 s of the
 // connect (the socket buffers fill in well under a second, then the write
-// makes no progress for WriteTimeout), and Shutdown with a 5 s budget returns,
+// has not finished within WriteTimeout), and Shutdown with a 5 s budget returns,
 // with Start, at once: nothing is left to wait for. On h1 and on h2c. The
-// stream is not cut at a fixed lifetime, only for want of progress:
+// stream is not cut at a fixed lifetime, only when a write is stuck:
 // TestSSEStaysOpenPastServerTimeouts855 holds one that is read for 4.5 s.
 func TestStalledSSESendFailsAtWriteTimeoutStd855(t *testing.T) {
 	for _, h2c := range []bool{false, true} {
@@ -352,8 +352,8 @@ func TestStalledSSEEndsWhenItsHandlerIsBounded855(t *testing.T) {
 }
 
 // TestSSEIdleBetweenEventsPastWriteTimeoutStd855: the bound is on a write that
-// makes no progress, not on the stream's age or on a deadline left standing, so
-// a stream whose events are further apart than WriteTimeout is not cut while
+// is stuck, not on the stream's age or on a deadline left standing, so a
+// stream whose events are further apart than WriteTimeout is not cut while
 // idle. Over h2c this is the cell that tells the designs apart: the HTTP/2
 // server resets a stream when its write deadline passes, whether or not a
 // write is pending, so a deadline that is extended only when a write comes
