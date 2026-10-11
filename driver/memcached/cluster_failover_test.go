@@ -370,9 +370,13 @@ func (fakeInfraErr) Error() string { return "fake infra error" }
 
 // timeNowHex returns a short hex-ish string derived from the process
 // and i so tests can mint many distinct keys without stdlib iteration.
+// i must reach the low 32 bits that are kept: the clock alone does not
+// separate calls on a platform whose clock ticks every few milliseconds
+// (Windows), where every key minted inside one tick would be the same.
 func timeNowHex(i int) string {
 	var b [8]byte
-	u := uint64(time.Now().UnixNano()) ^ uint64(i)<<32
+	u := uint64(time.Now().UnixNano()) ^ (uint64(i)+1)*0x9e3779b97f4a7c15
+	u ^= u >> 32
 	for k := 0; k < 8; k++ {
 		b[k] = "0123456789abcdef"[u&0xf]
 		u >>= 4
