@@ -211,9 +211,8 @@ func (c sseCell855) name() string {
 // h2c is std's only: on epoll, io_uring and adaptive an HTTP/2 stream's
 // response goes out when its handler returns (Flush is no delivery guarantee
 // on HTTP/2, see StreamWriter.Flush), so an SSE stream over h2c shows no
-// headers until it ends; measured on main with the same timeouts and with the
-// defaults, evidence lanes-20261009/SSE855/logs/probe-h2c-sse2.log. That is a
-// defect of its own, not this one.
+// headers until it ends (a polish item on #889). That is a defect of its own,
+// not this one.
 func TestSSEStaysOpenPastServerTimeouts855(t *testing.T) {
 	var cells []sseCell855
 	for _, e := range engines761 {
@@ -318,8 +317,8 @@ func stalledResponse855(t *testing.T, addr string, h2c bool) (got int, err error
 //
 // std only: epoll, io_uring and adaptive deliver a body of 8 MiB or more to a
 // client that read nothing for five WriteTimeouts, whole, on main (3cfee4b,
-// logs/probe-big*.log), so there is no bound to keep; see the polish items on
-// #884 and #885. The request side of the negative runs on every engine in
+// measured on main 3cfee4b), so there is no bound to keep here; see the
+// polish items on #884 and #885. The request side of the negative runs on every engine in
 // TestStalledRequestStillBoundedByReadTimeout855.
 func TestStalledResponseStillBoundedByWriteTimeoutStd855(t *testing.T) {
 	for _, async := range []bool{false, true} {
