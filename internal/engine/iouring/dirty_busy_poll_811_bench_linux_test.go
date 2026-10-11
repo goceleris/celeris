@@ -36,11 +36,12 @@ func (h *sizedHandler811) HasAsyncRoutes() bool        { return h.async }
 
 // BenchmarkResponseSize811 is the path celeris#811's change sits next to,
 // with no stalled client: one keep-alive client that reads every response, a
-// request at a time. The large sizes put the response's tail on a ring SEND
-// while the client reads, so the conn is on the dirty list with a SEND in
+// request at a time. The large async sizes put the response's tail on a ring
+// SEND while the client reads, so the conn is on the dirty list with a SEND in
 // flight, which the worker used to spin through and now waits through; the
-// small size never reaches the ring. ns/op is the request round trip; MB/s the
-// goodput. The A/B script (evidence/lanes-20261009/E14/ab.sh) runs it against
+// small async size never reaches the ring. A sync conn is listed only when the
+// SQ ring is full, so the sync arms are a second A/A (see ring_frac below).
+// ns/op is the request round trip; MB/s the goodput. The A/B script (evidence/lanes-20261009/E14/ab.sh) runs it against
 // the base and the fix with an A/A floor.
 func BenchmarkResponseSize811(b *testing.B) {
 	for _, async := range []bool{false, true} {
@@ -78,14 +79,20 @@ func BenchmarkResponseSize811(b *testing.B) {
 				ctx, cancel := context.WithCancel(context.Background())
 				done := make(chan error, 1)
 				go func() { done <- e.Listen(ctx) }()
-				defer func() {
+				stopped := false
+				stop := func() {
+					if stopped {
+						return
+					}
+					stopped = true
 					cancel()
 					select {
 					case <-done:
 					case <-time.After(5 * time.Second):
 						b.Error("engine did not stop within 5s")
 					}
-				}()
+				}
+				defer stop()
 				var c net.Conn
 				for deadline := time.Now().Add(8 * time.Second); ; {
 					if c, err = net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil && e.NumWorkers() > 0 {
@@ -137,6 +144,19 @@ func BenchmarkResponseSize811(b *testing.B) {
 				b.StopTimer()
 				time.Sleep(200 * time.Millisecond)
 				b.ReportMetric(float64(e.Metrics().RingBytes)/(float64(b.N+21)*float64(size)), "ring_frac")
+				// iters_per_op: the run loops' iterations (iterCount, summed
+				// over the workers, read once Listen has returned and the
+				// workers are gone) per request. A count, not a time: a worker
+				// that polls turns the loop many times per request, one that
+				// parks does not. The idle iterations of the setup and of the
+				// 200 ms above are in it (a few hundred, at most, over b.N
+				// requests).
+				stop()
+				var iters uint64
+				for _, w := range e.workers {
+					iters += w.iterCount
+				}
+				b.ReportMetric(float64(iters)/float64(b.N+21), "iters_per_op")
 			})
 		}
 	}
