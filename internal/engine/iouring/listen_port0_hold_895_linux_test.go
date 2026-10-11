@@ -23,19 +23,35 @@ import (
 // it is decided until every worker is listening on it, so no other socket can
 // take it in between, and is let go on every path out of Listen.
 
-func newPort0Engine895(t *testing.T, workers int) *Engine {
+// newEngine895 is New, with a start that fails only on ring ENOMEM retried
+// (the engine's probes build rings, and at the runner's 8 MiB the rings of
+// the test before are uncharged asynchronously, ring_budget_linux_test.go).
+func newEngine895(t *testing.T, addr string, workers int) *Engine {
 	t.Helper()
-	e, err := New(resource.Config{
-		Addr:      "127.0.0.1:0",
-		Engine:    engine.IOUring,
-		Protocol:  engine.HTTP1,
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Resources: resource.Resources{Workers: workers},
-	}, respondingHandler{})
+	var e *Engine
+	_, _, err := retryRingENOMEM(func() error {
+		var nerr error
+		e, nerr = New(resource.Config{
+			Addr:      addr,
+			Engine:    engine.IOUring,
+			Protocol:  engine.HTTP1,
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Resources: resource.Resources{Workers: workers},
+		}, respondingHandler{})
+		return nerr
+	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		if isRingENOMEM(err) {
+			skipUnlessIOUringUnusable(t, err)
+		}
+		skipOrFail656(t, "New: %v", err)
 	}
 	return e
+}
+
+func newPort0Engine895(t *testing.T, workers int) *Engine {
+	t.Helper()
+	return newEngine895(t, "127.0.0.1:0", workers)
 }
 
 // TestPort0IsHeldBetweenBeingChosenAndBeingBound895: while the hold is held
@@ -125,17 +141,8 @@ func TestPort0HoldIsReleasedWhenListenFails895(t *testing.T) {
 // TestPort0ListenErrorWhenTheHoldCannotBeBound895: an address this host does
 // not own is an error from Listen, not workers that each fail or bind alone.
 func TestPort0ListenErrorWhenTheHoldCannotBeBound895(t *testing.T) {
-	e, err := New(resource.Config{
-		Addr:      "203.0.113.77:0",
-		Engine:    engine.IOUring,
-		Protocol:  engine.HTTP1,
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Resources: resource.Resources{Workers: 2},
-	}, respondingHandler{})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	_, _, err = retryRingENOMEM(func() error { return e.Listen(t.Context()) })
+	e := newEngine895(t, "203.0.113.77:0", 2)
+	_, _, err := retryRingENOMEM(func() error { return e.Listen(t.Context()) })
 	if err == nil || !errors.Is(err, unix.EADDRNOTAVAIL) {
 		t.Fatalf("Listen on an address this host does not own = %v, want EADDRNOTAVAIL", err)
 	}
