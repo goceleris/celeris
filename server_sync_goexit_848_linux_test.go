@@ -35,7 +35,8 @@ import (
 // The positive test sends /boom (a sync route that calls runtime.Goexit) on a
 // connection of one worker and requires, on epoll, io_uring and adaptive:
 //   - exactly one Error record that says "goroutine ended without returning",
-//     with engine=<epoll|io_uring>, loop|worker=<that worker's id> and
+//     with engine=<epoll|io_uring>, loop|worker=<that worker's id, chosen not
+//     to be 0 when the engine has more than one worker> and
 //     conns >= the connections held on it, whose text says the connections
 //     are not served and the SO_REUSEPORT listener does not accept;
 //   - the premise that the record means what it says: the witness conn on that
@@ -118,13 +119,18 @@ type arm848 struct {
 	name   string
 	eng    celeris.EngineType
 	engine []string // the engine attr values a record may carry
+	start  string   // CELERIS_ADAPTIVE_START for the adaptive arms ("" = the default, epoll)
 }
 
 func arms848() []arm848 {
 	return []arm848{
-		{"epoll", celeris.Epoll, []string{"epoll"}},
-		{"io_uring", celeris.IOUring, []string{"io_uring"}},
-		{"adaptive", celeris.Adaptive, []string{"epoll", "io_uring"}},
+		{"epoll", celeris.Epoll, []string{"epoll"}, ""},
+		{"io_uring", celeris.IOUring, []string{"io_uring"}, ""},
+		// Adaptive starts on epoll, so this arm covers the epoll call site only.
+		{"adaptive", celeris.Adaptive, []string{"epoll", "io_uring"}, ""},
+		// Adaptive started on io_uring: the only CI coverage of the io_uring
+		// call site through the adaptive engine. The record must say io_uring.
+		{"adaptive-iouring", celeris.Adaptive, []string{"io_uring"}, "iouring"},
 	}
 }
 
@@ -231,23 +237,51 @@ func (r *rig848) dial() *goexitConn791 {
 
 // place opens keep-alive conns until some worker holds two, a boom conn and a
 // witness conn, each proven by /ok, and returns that worker's id with both.
-func (r *rig848) place() (id string, boom, witness *goexitConn791, others map[string]*goexitConn791) {
+//
+// With avoidZero it keeps dialing until a worker whose id is not 0 holds two:
+// a fault on worker 0 cannot tell a loop id that is reported right from one
+// that is hard-wired to 0. An engine that runs a single worker has no such
+// worker (io_uring at the CI step's 8 MiB RLIMIT_MEMLOCK funds one), so it
+// falls back to worker 0 and returns vacuous=true: the id check proves
+// nothing there, and the result line says so.
+func (r *rig848) place(avoidZero bool) (id string, boom, witness *goexitConn791, others map[string]*goexitConn791, vacuous bool) {
 	r.t.Helper()
 	held := map[string]*goexitConn791{}
 	others = map[string]*goexitConn791{}
-	for range 64 {
+	var zero [2]*goexitConn791 // the first two conns on worker 0, kept as the fallback
+	for i := range 128 {
+		if id != "" && (!avoidZero || len(held) > 1) {
+			// A pair is placed (and, when asked to avoid worker 0, a conn
+			// sits on a second worker, so the survivors can be checked).
+			return id, boom, witness, others, false
+		}
+		if avoidZero && i >= 24 && len(held) == 1 {
+			break // 24 dials all on one worker: a single worker (2^-24 otherwise)
+		}
 		a := r.dial()
 		status, body, err := a.get("/ok")
 		if err != nil || status != 200 || !strings.HasPrefix(body, "w=") {
 			r.t.Fatalf("PREMISE: /ok before the fault: status %d body %q err %v", status, body, err)
 		}
-		if prev := held[body]; prev != nil {
-			return strings.TrimPrefix(body, "w="), prev, a, others
+		if avoidZero && body == "w=0" {
+			if zero[0] == nil {
+				zero[0] = a
+			} else if zero[1] == nil {
+				zero[1] = a
+			}
+		} else if prev := held[body]; prev != nil && id == "" {
+			id, boom, witness = strings.TrimPrefix(body, "w="), prev, a
 		}
 		held[body] = a
 		others[body] = a
 	}
-	r.t.Fatal("PREMISE: 64 dials put no worker on two conns")
+	if id != "" && (!avoidZero || len(held) > 1) {
+		return id, boom, witness, others, false
+	}
+	if avoidZero && len(held) == 1 && zero[1] != nil {
+		return "0", zero[0], zero[1], others, true
+	}
+	r.t.Fatalf("PREMISE: 128 dials found no usable placement (workers seen %d, avoidZero %v)", len(held), avoidZero)
 	return
 }
 
@@ -278,8 +312,11 @@ func TestSyncRouteGoexitIsLoud848(t *testing.T) {
 				return
 			}
 			need848(t, a.eng)
+			if a.start != "" {
+				t.Setenv("CELERIS_ADAPTIVE_START", a.start)
+			}
 			r := start848(t, celeris.Config{Engine: a.eng})
-			id, boom, witness, others := r.place()
+			id, boom, witness, others, vacuous := r.place(true)
 			delete(others, "w="+id)
 
 			// The fault: /boom on one of the two conns of worker id.
@@ -307,8 +344,8 @@ func TestSyncRouteGoexitIsLoud848(t *testing.T) {
 			}
 			stopped := r.stopWithin(loopExitStop848)
 			after := r.logs.exits()
-			t.Logf("celeris848 RESULT arm=%s worker=%s boom=%s records=%d records_after_stop=%d witness_on_dead_worker=%s other_workers_answered=%d/%d stopped=%v logs=%s",
-				a.name, id, goexitClass791(boomErr), len(recs), len(after), witnessClass, otherAnswered, len(others), stopped, r.logs.errorsSummary())
+			t.Logf("celeris848 RESULT arm=%s worker=%s boom=%s records=%d records_after_stop=%d witness_on_dead_worker=%s other_workers_answered=%d/%d id_check_vacuous=%v stopped=%v logs=%s",
+				a.name, id, goexitClass791(boomErr), len(recs), len(after), witnessClass, otherAnswered, len(others), vacuous, stopped, r.logs.errorsSummary())
 
 			if len(recs) != 1 {
 				t.Fatalf("celeris#848: a sync handler's Goexit produced %d %q Error records, want exactly 1", len(recs), loopExitMsg848)
@@ -341,6 +378,14 @@ func TestSyncRouteGoexitIsLoud848(t *testing.T) {
 					t.Errorf("stack attr lacks %q:\n%s", w, st)
 				}
 			}
+			// Only one loop died: when the engine runs more than one worker, the
+			// others still answer (the docs say a loop dies, not the server).
+			if !vacuous && len(others) == 0 {
+				t.Errorf("PREMISE: no conn was placed on a worker other than the faulted one (%s), so 'the others keep serving' is untested", id)
+			}
+			if otherAnswered != len(others) {
+				t.Errorf("only %d of %d conns on the other workers answered after the fault: more than one loop died", otherAnswered, len(others))
+			}
 			if witnessClass != "timeout" && witnessClass != "closed" {
 				t.Errorf("PREMISE: the witness conn on the faulted worker was answered (%s): the loop did not die, so the record would be false", witnessClass)
 			}
@@ -365,10 +410,13 @@ func noExit848(t *testing.T, r *rig848, what string) {
 func TestNormalPathsDoNotReportALoopExit848(t *testing.T) {
 	for _, a := range arms848() {
 		t.Run(a.name, func(t *testing.T) {
+			if a.start != "" {
+				t.Setenv("CELERIS_ADAPTIVE_START", a.start)
+			}
 			t.Run("graceful-stop", func(t *testing.T) {
 				need848(t, a.eng)
 				r := start848(t, celeris.Config{Engine: a.eng})
-				r.place() // two keep-alive conns stay open across the stop
+				r.place(false) // two keep-alive conns stay open across the stop
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				if err := r.s.Shutdown(ctx); err != nil {
@@ -384,7 +432,7 @@ func TestNormalPathsDoNotReportALoopExit848(t *testing.T) {
 			t.Run("cancel", func(t *testing.T) {
 				need848(t, a.eng)
 				r := start848(t, celeris.Config{Engine: a.eng})
-				r.place()
+				r.place(false)
 				if !r.stopWithin(loopExitStop848) {
 					t.Fatal("the server did not stop")
 				}
@@ -397,7 +445,7 @@ func TestNormalPathsDoNotReportALoopExit848(t *testing.T) {
 				t.Run("pause-resume", func(t *testing.T) {
 					need848(t, a.eng)
 					r := start848(t, celeris.Config{Engine: a.eng, DisableDeferAccept: true})
-					r.place()
+					r.place(false)
 					if err := r.s.PauseAccept(); err != nil {
 						t.Fatalf("PauseAccept: %v", err)
 					}

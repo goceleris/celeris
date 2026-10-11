@@ -228,10 +228,11 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 // [runtime.Goexit] in it (t.FailNow, t.Fatal and t.SkipNow in a test's
 // handler, or a library that does) does not end the loop; the loop keeps
 // serving. What the Goexit costs depends on the protocol. On HTTP/1.1 the
-// engine closes that connection and logs an Error. On HTTP/2 the stream's
-// goroutine ends and the stream gets no response and no RST_STREAM, nothing is
-// logged, and the connection stays open: the client waits until its own
-// timeout. A route that runs inline must not call Goexit: see [Route.Sync].
+// native engines (epoll, io_uring, adaptive) close that connection and log an
+// Error; on [Std], where Async is a no-op, net/http closes it and nothing is
+// logged. On HTTP/2 the stream's goroutine ends, the stream gets no response
+// and no RST_STREAM, nothing is logged, and the connection stays open: the
+// client waits until its own timeout. A route that runs inline must not call Goexit: see [Route.Sync].
 //
 // Precedence is route > group > server default. Must be called before
 // [Server.Start]. Chainable. Async() with no argument means true; the
@@ -279,8 +280,8 @@ func (r *Route) Async(opt ...bool) *Route {
 // the Goexit) and cannot recover. On HTTP/2 only a stream that runs inline
 // does this; a stream that runs on the h2 worker pool anyway (one with a
 // request body, say) ends silently instead, see [Route.Async]. Mark such a
-// route [Route.Async]: the loop survives a Goexit there (on HTTP/1.1 that
-// connection is closed and an Error is logged; on HTTP/2 the stream gets no
+// route [Route.Async]: the loop survives a Goexit there (on HTTP/1.1 the
+// native engines close that connection and log an Error; on HTTP/2 the stream gets no
 // answer and nothing is logged). The [Std] engine runs each request on its own
 // goroutine, where a Goexit ends that request's goroutine (net/http closes an
 // HTTP/1.1 connection). Panics are different: the router answers a panic in a

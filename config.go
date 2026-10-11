@@ -226,9 +226,9 @@ type Config struct {
 	// and a Goexit ends that loop for good, leaving its connections and its
 	// SO_REUSEPORT listener unserved. The engine logs an Error and cannot
 	// recover; see [Route.Sync]. An [Route.Async] route's handler does not run
-	// on the loop, so a Goexit there leaves the loop serving: on HTTP/1.1 it
-	// closes that connection and logs an Error; on HTTP/2 the stream gets no
-	// answer and nothing is logged (see [Route.Async]).
+	// on the loop, so a Goexit there leaves the loop serving: on HTTP/1.1 the
+	// native engines close that connection and log an Error; on HTTP/2 the
+	// stream gets no answer and nothing is logged (see [Route.Async]).
 	//
 	// A handler that runs inline runs on a thread the native engines (epoll,
 	// io_uring) pinned to one CPU, and a process it starts inherits that pin:
@@ -294,13 +294,27 @@ type Config struct {
 	// The method, the path and the header strings are request strings, valid only
 	// during the call (on epoll and io_uring, views of the receive buffer; see the
 	// package doc): copy one with [strings.Clone] before anything keeps it.
+	//
+	// The callback runs on the event-loop goroutine on the native engines, even
+	// for an [Route.Async] route, so it must not call runtime.Goexit: that ends
+	// the loop for good and the engine only logs an Error (see [Route.Sync]).
+	// A panic in it is recovered and counts as a rejection.
 	OnExpectContinue func(method, path string, headers [][2]string) bool
 
 	// OnConnect is called when a new connection is accepted. The addr is the
 	// remote peer address. Must be fast — blocks the event loop.
+	//
+	// It runs on the event-loop goroutine on the native engines, even for an
+	// [Route.Async] route, so it must not call runtime.Goexit: that ends the
+	// loop for good and the engine only logs an Error (see [Route.Sync]). A
+	// panic in it is not recovered and ends the process.
 	OnConnect func(addr string)
 	// OnDisconnect is called when a connection is closed. The addr is the
 	// remote peer address. Must be fast — blocks the event loop.
+	//
+	// The same contract as [Config.OnConnect]: it runs on the event-loop
+	// goroutine on the native engines and must not call runtime.Goexit; a
+	// panic in it is not recovered and ends the process.
 	OnDisconnect func(addr string)
 
 	// TrustedProxies is a list of trusted proxy CIDR ranges (e.g., "10.0.0.0/8",

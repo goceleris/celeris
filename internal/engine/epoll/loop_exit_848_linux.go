@@ -25,6 +25,12 @@ import (
 // shutdown returns and the failed listener re-create, is a normal one, and
 // a return added later is covered without a change here.
 //
+// A panic that unwinds the goroutine runs this defer too, before the runtime
+// prints the panic and ends the process, so the report (a logger call and a
+// debug.Stack) runs on a goroutine that is about to die; a blocking Logger
+// handler would delay the crash. Detecting a panic needs recover(), which is
+// not wanted here, so the report is not skipped for one.
+//
 // The defer runs once, when the loop goroutine ends: it costs nothing per
 // event-loop iteration and takes no lock.
 func (e *Engine) runWatched(ctx context.Context, l *Loop) {

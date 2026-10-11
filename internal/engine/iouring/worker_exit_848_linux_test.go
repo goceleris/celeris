@@ -40,11 +40,17 @@ func (goexitHandler848) HandleStream(ctx context.Context, s *stream.Stream) erro
 		boomID848.Store(int64(id))
 		runtime.Goexit()
 	}
+	if s.Path == "/panic" {
+		panic("celeris848 panic in a handler on the loop goroutine")
+	}
 	if s.ResponseWriter == nil {
 		return nil
 	}
+	// The body names the loop or worker that serves the conn.
+	id, _ := ctxkit.WorkerIDFrom(ctx)
+	body := "w=" + strconv.Itoa(id)
 	return s.ResponseWriter.WriteResponse(s, 200,
-		[][2]string{{"content-type", "text/plain"}, {"content-length", "2"}}, []byte("ok"))
+		[][2]string{{"content-type", "text/plain"}, {"content-length", strconv.Itoa(len(body))}}, []byte(body))
 }
 
 type logRec848 struct {
@@ -56,17 +62,21 @@ type logRec848 struct {
 type logCap848 struct {
 	mu   sync.Mutex
 	recs []logRec848
+	echo bool // also write each record to stderr (the panic test judges the order in the process's output)
 }
 
 func (c *logCap848) Enabled(context.Context, slog.Level) bool { return true }
 func (c *logCap848) WithAttrs([]slog.Attr) slog.Handler       { return c }
 func (c *logCap848) WithGroup(string) slog.Handler            { return c }
-func (c *logCap848) Handle(_ context.Context, r slog.Record) error {
+func (c *logCap848) Handle(ctx context.Context, r slog.Record) error {
 	rc := logRec848{level: r.Level, msg: r.Message, attrs: map[string]string{}}
 	r.Attrs(func(a slog.Attr) bool { rc.attrs[a.Key] = a.Value.Resolve().String(); return true })
 	c.mu.Lock()
 	c.recs = append(c.recs, rc)
 	c.mu.Unlock()
+	if c.echo {
+		_ = slog.NewTextHandler(os.Stderr, nil).Handle(ctx, r)
+	}
 	return nil
 }
 
@@ -85,7 +95,7 @@ func (c *logCap848) exits() []logRec848 {
 func start848(t *testing.T, addr string, disableDefer bool) (*Engine, *logCap848, context.CancelFunc, chan error) {
 	t.Helper()
 	needWorkers895(t, 1)
-	logs := &logCap848{}
+	logs := &logCap848{echo: os.Getenv(panicChildEnv848) == "1"}
 	var (
 		e      *Engine
 		cancel context.CancelFunc
@@ -153,9 +163,18 @@ func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 		return
 	}
 	e, logs, cancel, done := start848(t, "127.0.0.1:0", false)
-	// Several keep-alive conns, each proven served: the loops own them.
-	var conns []net.Conn
-	for range 6 {
+	// Keep-alive conns, each proven served by /ok, whose body names the worker
+	// that owns it. At least 6 are opened, and more until one sits on a worker
+	// other than 0: a fault on worker 0 cannot tell an id that is reported right
+	// from one hard-wired to 0. That conn takes the fault. If the engine runs a
+	// single worker (io_uring at the CI step's 8 MiB memlock), none exists and
+	// the id check proves nothing; the result line says so.
+	var (
+		conns []net.Conn
+		ids   []string
+		boom  = -1
+	)
+	for i := 0; i < 128 && (i < 6 || (boom < 0 && !(i >= 24 && allSame848(ids)))); i++ {
 		c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
 		if err != nil {
 			t.Fatal(err)
@@ -164,16 +183,48 @@ func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
 		_, _ = c.Write([]byte("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n"))
 		buf := make([]byte, 256)
-		if n, err := c.Read(buf); err != nil || !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
+		n, err := c.Read(buf)
+		if err != nil || !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
 			t.Fatalf("PREMISE: /ok before the fault: %q %v", buf[:n], err)
 		}
+		id := string(buf[strings.LastIndex(string(buf[:n]), "w="):n])
+		if boom < 0 && id != "w=0" {
+			boom = len(conns)
+		}
 		conns = append(conns, c)
+		ids = append(ids, id)
 	}
-	_, _ = conns[0].Write([]byte("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"))
+	vacuous := boom < 0
+	if vacuous {
+		boom = 0
+	}
+	_, _ = conns[boom].Write([]byte("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"))
 	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && e.abnormalWorkerExits.Load() == 0; time.Sleep(5 * time.Millisecond) {
 	}
 	time.Sleep(200 * time.Millisecond)
+	// Only one worker died: a conn on another worker is still served.
+	var otherAnswered, others int
+	for k, c := range conns {
+		if ids[k] == ids[boom] {
+			continue
+		}
+		others++
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 256)
+		if _, err := c.Write([]byte("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n")); err == nil {
+			if n, err := c.Read(buf); err == nil && strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
+				otherAnswered++
+			}
+		}
+	}
 	stop848(t, cancel, done)
+	t.Logf("celeris848 RESULT engine-iouring worker=%s id_check_vacuous=%v other_workers_answered=%d/%d counted=%d", ids[boom], vacuous, otherAnswered, others, e.abnormalWorkerExits.Load())
+	if !vacuous && others == 0 {
+		t.Errorf("PREMISE: no conn on another worker than %s", ids[boom])
+	}
+	if otherAnswered != others {
+		t.Errorf("only %d of %d conns on the other workers answered after the fault: more than one worker died", otherAnswered, others)
+	}
 	if got := e.abnormalWorkerExits.Load(); got != 1 {
 		t.Fatalf("abnormalWorkerExits = %d, want 1", got)
 	}
@@ -182,7 +233,7 @@ func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 		t.Fatalf("%d exit records, want 1", len(recs))
 	}
 	r := recs[0]
-	if r.level != slog.LevelError || r.attrs["engine"] != "io_uring" || r.attrs["worker"] != strconv.FormatInt(boomID848.Load(), 10) {
+	if r.level != slog.LevelError || r.attrs["engine"] != "io_uring" || r.attrs["worker"] != strings.TrimPrefix(ids[boom], "w=") || r.attrs["worker"] != strconv.FormatInt(boomID848.Load(), 10) {
 		t.Errorf("record = level %s attrs %v, want ERROR engine=io_uring worker=%d", r.level, r.attrs, boomID848.Load())
 	}
 	if n, err := strconv.Atoi(r.attrs["conns"]); err != nil || n < 1 || n > len(conns) {
@@ -193,6 +244,48 @@ func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 		if !strings.Contains(r.attrs["stack"], w) {
 			t.Errorf("stack attr lacks %q:\n%s", w, r.attrs["stack"])
 		}
+	}
+}
+
+const panicChildEnv848 = "CELERIS_848_PANIC_CHILD"
+
+// A panic that escapes a handler on the worker goroutine (an engine-level
+// handler: through the celeris router a panic is a 500 first) is not
+// recovered, so it ends the process. The deferred report still runs while the
+// panic unwinds, so the #848 record is written before the runtime prints the
+// panic and exits. The child runs the engine and takes the panic; the parent
+// judges the child's output (exit status, and the record before the panic).
+func TestSyncHandlerPanicIsRecordedBeforeTheCrash848(t *testing.T) {
+	if os.Getenv(panicChildEnv848) == "1" {
+		e, _, _, _ := start848(t, "127.0.0.1:0", false)
+		c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = c.Write([]byte("GET /panic HTTP/1.1\r\nHost: x\r\n\r\n"))
+		time.Sleep(5 * time.Second)
+		t.Log("celeris848 child survived the panic")
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestSyncHandlerPanicIsRecordedBeforeTheCrash848$", "-test.v", "-test.count=1", "-test.timeout=60s")
+	cmd.Env = append(os.Environ(), panicChildEnv848+"=1")
+	out, err := cmd.CombinedOutput()
+	text := string(out)
+	if strings.Contains(text, "--- SKIP") {
+		t.Skipf("skipped in the child process:\n%s", text)
+	}
+	rec := strings.Index(text, "ended without returning")
+	pan := strings.Index(text, "panic: celeris848 panic in a handler")
+	t.Logf("celeris848 RESULT engine-iouring panic child_err=%v record_at=%d panic_at=%d survived=%v", err, rec, pan, strings.Contains(text, "child survived"))
+	if err == nil || pan < 0 {
+		t.Fatalf("PREMISE: the child did not die of the panic (err %v):\n%.3000s", err, text)
+	}
+	if rec < 0 || rec > pan {
+		t.Fatalf("celeris#848: no loop-exit record before the panic message (record at %d, panic at %d):\n%.3000s", rec, pan, text)
 	}
 }
 
@@ -273,6 +366,15 @@ func TestNormalWorkerReturnsAreNotCounted848(t *testing.T) {
 			t.Fatalf("a lost listener (the loop ends itself) counted %d, logged %d", e.abnormalWorkerExits.Load(), len(logs.exits()))
 		}
 	})
+}
+
+func allSame848(ids []string) bool {
+	for _, id := range ids {
+		if id != ids[0] {
+			return false
+		}
+	}
+	return true
 }
 
 // child848 runs a test that kills an event loop in a process of its own. A

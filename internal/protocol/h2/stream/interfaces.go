@@ -45,6 +45,15 @@ type Hijacker interface {
 // serving its other streams, and the pool goroutine that ran the handler ends.
 // Marking a route async keeps a Goexit off the event loop; it does not make
 // the Goexit visible.
+//
+// On HTTP/1.1 the same Handler runs the request, and the epoll and io_uring
+// engines apply the same split. A sync (inline) handler runs on the event-loop
+// goroutine: a Goexit ends the loop and the engine logs the same Error
+// (celeris#848), and a panic that escapes the handler is not recovered and
+// ends the process (the celeris router answers a handler panic with a 500
+// first). An async handler runs on its own goroutine: its Goexit or panic
+// closes that connection and the engine logs an Error, and the loop keeps
+// serving. So a sync handler must not call runtime.Goexit on either protocol.
 type Handler interface {
 	HandleStream(ctx context.Context, stream *Stream) error
 }
