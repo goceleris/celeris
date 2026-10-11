@@ -105,7 +105,7 @@ func startServer895(t *testing.T, mk func() *celeris.Server) (*celeris.Server, f
 // TestServerPort0ListensOnOnePort895: the sockets a started server adds to the
 // process are all on the port Addr() reports, and a request to it is served.
 func TestServerPort0ListensOnOnePort895(t *testing.T) {
-	for _, eng := range []celeris.EngineType{celeris.Epoll, celeris.IOUring} {
+	for _, eng := range []celeris.EngineType{celeris.Std, celeris.Epoll, celeris.IOUring} {
 		t.Run(eng.String(), func(t *testing.T) {
 			before := listeningPorts895(t)
 			s, stop := startServer895(t, func() *celeris.Server {
@@ -146,10 +146,10 @@ func TestServerPort0ListensOnOnePort895(t *testing.T) {
 
 // TestServerShutdownFreesThePortAtOnce896: Server.Shutdown on an io_uring
 // server returns with the port free: a plain bind made once, the instant it
-// returns, succeeds, 20 times (epoll runs as the control).
+// returns, succeeds, 20 times (std and epoll run as the controls).
 func TestServerShutdownFreesThePortAtOnce896(t *testing.T) {
 	const n = 20
-	for _, eng := range []celeris.EngineType{celeris.Epoll, celeris.IOUring} {
+	for _, eng := range []celeris.EngineType{celeris.Std, celeris.Epoll, celeris.IOUring} {
 		t.Run(eng.String(), func(t *testing.T) {
 			busy := 0
 			for i := range n {

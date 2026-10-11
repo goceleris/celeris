@@ -206,8 +206,16 @@ func TestPort0EveryWorkerBindsTheSamePort895(t *testing.T) {
 	for _, tc := range []struct{ name, addr string }{
 		{"loopback", "127.0.0.1:0"},
 		{"wildcard-empty-host", ":0"},
+		{"wildcard-v6-dual-stack", "[::]:0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if strings.HasPrefix(tc.addr, "[") {
+				ln, err := net.Listen("tcp", tc.addr)
+				if err != nil {
+					requireDualStack925(t, err)
+				}
+				_ = ln.Close()
+			}
 			const workers = 4
 			r := start895(t, tc.addr, workers, workers, false)
 			addrPort := portOf895(t, r.e.Addr())

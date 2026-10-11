@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -151,5 +152,77 @@ func TestShutdownDrainWithNoAcceptArmedDoesNotWait896(t *testing.T) {
 			}
 			t.Logf("drain took %v", took)
 		})
+	}
+}
+
+// TestCancelAllWithNothingArmedAnswersZero896 pins the kernel fact the drain's
+// wait is built on, so a kernel that changes it fails here and not as a shutdown
+// that sits out its bound: an ASYNC_CANCEL with CANCEL_FD|CANCEL_ALL that
+// matches nothing completes with res 0 (a success, __io_async_cancel returns
+// the number cancelled), and the form that skips its success CQE posts
+// nothing at all for it. The keep-the-CQE form posts exactly one CQE, res 0,
+// and with an accept armed it cancels one (res 1) and the accept ends with
+// -ECANCELED and F_MORE clear.
+func TestCancelAllWithNothingArmedAnswersZero896(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	ring, err := NewRing(64, 0, 0)
+	if err != nil {
+		skipOrFail656(t, "io_uring unavailable: %v", err)
+	}
+	defer func() { _ = ring.Close() }()
+	lfd, err := createListenSocket(freeAddr639(t), false)
+	if err != nil {
+		t.Fatalf("createListenSocket: %v", err)
+	}
+	defer func() { _ = unix.Close(lfd) }()
+
+	reap := func() []completionEntry {
+		var out []completionEntry
+		head, tail := ring.BeginCQ()
+		for ; head != tail; head++ {
+			out = append(out, *ring.cqeAt(head))
+		}
+		ring.EndCQ(head)
+		return out
+	}
+	submit := func(prep func(unsafe.Pointer, int), ud uint64) []completionEntry {
+		sqe := ring.GetSQE()
+		prep(sqe, lfd)
+		setSQEUserData(sqe, ud)
+		if err := ring.SubmitAndWaitTimeout(20 * time.Millisecond); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		return reap()
+	}
+
+	if got := submit(prepCancelFDSkipSuccess, udListenCancel); len(got) != 0 {
+		t.Fatalf("the skip-success cancel of nothing posted %d CQEs %+v, want none", len(got), got)
+	}
+	got := submit(prepCancelFDDriver, udListenCancel)
+	if len(got) != 1 || got[0].UserData != udListenCancel || got[0].Res != 0 {
+		t.Fatalf("the keep-the-CQE cancel of nothing posted %+v, want one CQE with res 0", got)
+	}
+
+	sqe := ring.GetSQE()
+	prepMultishotAccept(sqe, lfd)
+	setSQEUserData(sqe, encodeUserData(udAccept, lfd))
+	if _, err := ring.Submit(); err != nil {
+		t.Fatalf("submit accept: %v", err)
+	}
+	got = submit(prepCancelFDDriver, udListenCancel)
+	var cancelRes int32 = -1
+	var acceptEnded bool
+	for _, c := range got {
+		switch c.UserData & udMask {
+		case udListenCancel:
+			cancelRes = c.Res
+		case udAccept:
+			acceptEnded = !cqeHasMore(c.Flags) && c.Res == -int32(unix.ECANCELED)
+		}
+	}
+	if cancelRes != 1 || !acceptEnded {
+		t.Fatalf("cancel of an armed accept: cancel res %d (want 1), accept ended with -ECANCELED and no F_MORE %v (want true); CQEs %+v",
+			cancelRes, acceptEnded, got)
 	}
 }

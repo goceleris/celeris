@@ -145,29 +145,32 @@ import (
 //     bound with response bytes still unsent, so connections were closed on
 //     them (celeris#806). A rate: it needs a client that does not read.
 type handoffLossStats struct {
-	staleRecvDataClosed        atomic.Uint64
-	staleRecvDataTransplanted  atomic.Uint64
-	staleRecvDataUnattributed  atomic.Uint64
-	handoffInFlight            atomic.Uint64
-	held                       atomic.Uint64
-	reaps                      atomic.Uint64
-	reapMisses                 atomic.Uint64
-	holdRescued                atomic.Uint64
-	doubleClaim                atomic.Uint64
-	claimDeferred              atomic.Uint64
-	reapFailed                 atomic.Uint64
-	reapUnsupported            atomic.Uint64
-	closeFDDeferred            atomic.Uint64
-	closeFDForced              atomic.Uint64
-	closeCancelMissedHeld      atomic.Uint64
-	zcNotifHeld                atomic.Uint64
-	zcNotifForced              atomic.Uint64
-	zcBufRetained              atomic.Uint64
-	shutdownDrainGaveUp        atomic.Uint64
+	staleRecvDataClosed       atomic.Uint64
+	staleRecvDataTransplanted atomic.Uint64
+	staleRecvDataUnattributed atomic.Uint64
+	handoffInFlight           atomic.Uint64
+	held                      atomic.Uint64
+	reaps                     atomic.Uint64
+	reapMisses                atomic.Uint64
+	holdRescued               atomic.Uint64
+	doubleClaim               atomic.Uint64
+	claimDeferred             atomic.Uint64
+	reapFailed                atomic.Uint64
+	reapUnsupported           atomic.Uint64
+	closeFDDeferred           atomic.Uint64
+	closeFDForced             atomic.Uint64
+	closeCancelMissedHeld     atomic.Uint64
+	zcNotifHeld               atomic.Uint64
+	zcNotifForced             atomic.Uint64
+	zcBufRetained             atomic.Uint64
+	shutdownDrainGaveUp       atomic.Uint64
+	shutdownSendDrainGaveUp   atomic.Uint64
+	zcHeldNow                 atomic.Int64
+	zcHeldBytes               atomic.Int64
+
+	// Appended after the rest, as a section of its own, so no field moves
+	// (celeris#896).
 	shutdownListenCancelGaveUp atomic.Uint64
-	shutdownSendDrainGaveUp    atomic.Uint64
-	zcHeldNow                  atomic.Int64
-	zcHeldBytes                atomic.Int64
 }
 
 func (s *handoffLossStats) noteCloseFDForced() {

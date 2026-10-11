@@ -728,7 +728,7 @@ func (w *Worker) endOwedOpsAtShutdown() {
 					if !cqeHasMore(c.Flags) {
 						acceptOwed = false
 					}
-				case udProvide:
+				case udListenCancel:
 					// The cancel's own CQE (queueListenAcceptCancel). With
 					// IORING_ASYNC_CANCEL_ALL its result is how many accepts
 					// it cancelled, and 0, not -ENOENT, when none was armed
@@ -785,8 +785,13 @@ func (w *Worker) queueListenAcceptCancel() bool {
 		w.noteListenCancelGaveUp(errors.New("the SQ ring is full"))
 		return false
 	}
-	prepCancelFD(sqe, w.listenFD)
-	setSQEUserData(sqe, encodeUserData(udProvide, w.listenFD))
+	// The form that keeps its CQE (prepCancelFDDriver, named for the driver
+	// close that first needed it), not prepCancelFDSkipSuccess: with
+	// IORING_ASYNC_CANCEL_ALL a cancel that matches nothing answers 0, a
+	// success, which the skipping form posts no CQE for (see
+	// prepCancelUserDataReported). The wait needs that answer.
+	prepCancelFDDriver(sqe, w.listenFD)
+	setSQEUserData(sqe, encodeUserData(udListenCancel, w.listenFD))
 	return true
 }
 
