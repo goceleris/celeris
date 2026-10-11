@@ -541,7 +541,7 @@ type pgConn struct {
 	// on the caller goroutine.
 	useDirect bool
 	tcp       *net.TCPConn
-	tcpFd     int        // cached fd for MSG_DONTWAIT peek; 0 if unavailable
+	tcpFd     sockFD     // cached fd for MSG_DONTWAIT peek; 0 if unavailable
 	directMu  sync.Mutex // serializes tcp.Write
 	directBuf []byte     // read buffer for driveDirect
 
@@ -752,7 +752,7 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return err
 		}
 		if c.tcpFd > 0 {
-			if n, _, perr := recvNoWait(c.tcpFd, c.directBuf); n > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.directBuf, msgDontWait); n > 0 {
 				c.onRecv(c.directBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -868,7 +868,7 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 
 	// Cache the raw fd for MSG_DONTWAIT peek. Best-effort: if
 	// SyscallConn fails we just fall through to plain tcp.Read.
-	var rawFd int
+	var rawFd sockFD
 	if sc, scErr := tcp.SyscallConn(); scErr == nil {
 		_ = sc.Control(func(fd uintptr) { rawFd = peekFD(fd) })
 	}

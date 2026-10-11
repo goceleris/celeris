@@ -74,7 +74,7 @@ type redisConn struct {
 	// through to tcp.Read (which parks the G via Go's netpoll). A
 	// single non-blocking peek catches loopback-fast responses without
 	// paying the netpoll wakeup round-trip. Zero when unavailable.
-	tcpFd int
+	tcpFd sockFD
 
 	// Engine-integrated fields.
 	fd       int
@@ -198,7 +198,7 @@ func dialDirectRedisConn(ctx context.Context, cfg Config) (*redisConn, error) {
 		return nil, fmt.Errorf("celeris-redis: expected *net.TCPConn, got %T", raw)
 	}
 	_ = tcp.SetNoDelay(true)
-	var rawFd int
+	var rawFd sockFD
 	if sc, scErr := tcp.SyscallConn(); scErr == nil {
 		_ = sc.Control(func(fd uintptr) { rawFd = peekFD(fd) })
 	}
@@ -340,7 +340,7 @@ func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []
 		// common case in a single syscall — tcp.Read's G-park adds
 		// ~1-2µs per read and costs measurable RPS at 90k+.
 		if c.tcpFd > 0 {
-			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, msgDontWait); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -388,7 +388,7 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 	}
 	for !last.finished.Load() {
 		if c.tcpFd > 0 {
-			if rn, _, perr := recvNoWait(c.tcpFd, c.syncBuf); rn > 0 {
+			if rn, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, msgDontWait); rn > 0 {
 				c.onRecv(c.syncBuf[:rn])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {

@@ -46,6 +46,10 @@ type portableConn struct {
 	closing bool
 	closed  bool
 	done    chan struct{}
+	// closeErr is the error shutdownConn was given (ErrLoopClosed from
+	// Loop.Close, nil from UnregisterConn); the reader reports it to onClose
+	// once it observes the close. Guarded by mu.
+	closeErr error
 }
 
 // NetConnRegistrar is implemented by workers that adopt a net.Conn directly,
@@ -248,12 +252,15 @@ func (w *portableWorker) readerLoop(c *portableConn) {
 			c.onRecv(buf[:n])
 		}
 		if err != nil {
-			// Normal teardown: UnregisterConn closed the conn.
+			// Normal teardown: UnregisterConn or Loop.Close closed the
+			// conn. onClose fires here, from the reader, so it is the last
+			// callback of the conn: no onRecv runs during it or after it,
+			// as on Linux, where shutdown runs once the worker has stopped.
 			c.mu.Lock()
-			closing := c.closing
+			closing, closeErr := c.closing, c.closeErr
 			c.mu.Unlock()
 			if closing {
-				c.fire(nil)
+				c.fire(closeErr)
 				return
 			}
 			c.fire(err)
@@ -320,8 +327,12 @@ func (w *portableWorker) Write(fd int, data []byte) error {
 	return err
 }
 
-// shutdownConn marks the conn closing and closes the underlying net.Conn. The
-// reader goroutine observes the close and fires onClose.
+// shutdownConn marks the conn closing, records err for onClose and closes the
+// underlying net.Conn. The reader goroutine observes the close and fires
+// onClose(err): firing it here instead would run onClose while the reader is
+// still delivering onRecv. No lock is held across the close or the callback.
+// A registration that never got a reader (the placeholder, conn == nil) has
+// nothing to observe the close, so its onClose fires here.
 func (c *portableConn) shutdownConn(err error) {
 	c.mu.Lock()
 	if c.closing {
@@ -329,16 +340,13 @@ func (c *portableConn) shutdownConn(err error) {
 		return
 	}
 	c.closing = true
+	c.closeErr = err
 	conn := c.conn
 	c.mu.Unlock()
-	// Report err before closing: the close makes the reader goroutine
-	// observe a closing conn and fire onClose(nil), which would win the
-	// once-only fire and turn Loop.Close's ErrLoopClosed into nil.
-	if err != nil {
-		c.fire(err)
-	}
 	if conn != nil {
 		_ = conn.Close()
+	} else if err != nil {
+		c.fire(err)
 	}
 }
 

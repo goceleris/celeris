@@ -438,7 +438,7 @@ func (c *ClusterClient) measureLatencyLocked(ctx context.Context) {
 		if err := n.client.Ping(ctx); err != nil {
 			continue
 		}
-		n.latency.Store(latencyNanos(time.Since(start)))
+		n.latency.Store(measuredNanos(time.Since(start)))
 	}
 }
 
@@ -446,7 +446,8 @@ func (c *ClusterClient) measureLatencyLocked(ctx context.Context) {
 // clusterNode.latency, where 0 means "not measured". A clock coarser than the
 // round trip (Windows reads the system tick, up to ~15 ms, so a loopback PING
 // measures 0) must not turn a measurement into the absence of one: the fast
-// node would then lose to a slow node that did measure.
+// node would then lose to a slow node that did measure. It is compiled
+// everywhere so Linux CI tests it; measuredNanos applies it where it matters.
 func latencyNanos(d time.Duration) int64 {
 	if d <= 0 {
 		return 1

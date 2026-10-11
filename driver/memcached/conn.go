@@ -65,7 +65,7 @@ type memcachedConn struct {
 	// tcpFd caches the raw fd for MSG_DONTWAIT peeks. Pre-netpoll
 	// peek catches loopback-fast responses without the G-park wakeup;
 	// zero when SyscallConn failed.
-	tcpFd int
+	tcpFd sockFD
 
 	// Engine-integrated fields.
 	fd       int
@@ -154,7 +154,7 @@ func dialDirectMemcachedConn(ctx context.Context, cfg Config) (*memcachedConn, e
 	}
 	_ = tcp.SetNoDelay(true)
 
-	var rawFd int
+	var rawFd sockFD
 	if sc, scErr := tcp.SyscallConn(); scErr == nil {
 		_ = sc.Control(func(fd uintptr) { rawFd = peekFD(fd) })
 	}
@@ -627,7 +627,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, msgDontWait); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -675,7 +675,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, msgDontWait); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -724,7 +724,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, msgDontWait); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
