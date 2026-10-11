@@ -220,6 +220,14 @@ type Config struct {
 	// workloads; enable it for any workload that touches a DB, cache, or
 	// upstream service.
 	//
+	// A handler that runs inline must not call runtime.Goexit (t.FailNow,
+	// t.Fatal and t.SkipNow in a test's handler do, and so do some
+	// libraries): on the native engines it runs on the event-loop goroutine,
+	// and a Goexit ends that loop for good, leaving its connections and its
+	// SO_REUSEPORT listener unserved. The engine logs an Error and cannot
+	// recover; see [Route.Sync]. An [Route.Async] route's handler may
+	// Goexit: only its connection ends.
+	//
 	// A handler that runs inline runs on a thread the native engines (epoll,
 	// io_uring) pinned to one CPU, and a process it starts inherits that pin:
 	// os/exec clones the calling thread, the kernel copies its CPU mask into

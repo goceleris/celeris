@@ -239,6 +239,8 @@ api.GET("/cached", cachedHandler).Sync() // opt back to sync
 
 Precedence is **route > group > server default** (`Config.AsyncHandlers`). It works identically across io_uring, epoll, and adaptive — both sub-engines honor the per-route flag, and async promotions survive sub-engine swaps: a conn is promoted **once** via the `ErrAsyncDispatch` sentinel (sticky — subsequent requests skip the inline check entirely). h2 routes the choice **per stream** between inline-on-event-loop and the shared h2 worker pool. The `Async` / `Sync` distinction is a no-op on the std engine, where net/http already does goroutine-per-request.
 
+**An inline handler must not call `runtime.Goexit`.** `t.FailNow`, `t.Fatal` and `t.SkipNow` in a test's handler call it, and so do some libraries. A panic is caught (the router answers 500), but a Goexit cannot be: on epoll, io_uring and adaptive an inline handler runs on the event-loop goroutine, so a Goexit ends that loop for good. Every connection the loop owns goes unserved and its `SO_REUSEPORT` listener stops accepting. The engine logs an Error (`... ended without returning`, with the engine, the loop or worker id and the connection count) and cannot recover. A `.Async()` route's handler may Goexit: only its connection ends (and the engine logs an Error). The std engine runs each request on its own goroutine, so a Goexit there ends only that request.
+
 Observe how often the inline → goroutine handoff fires via `Server.EngineInfo().Metrics.AsyncRoutes` (static count of `.Async()` routes) and `.AsyncPromotedConns` (cumulative promotions).
 
 ## Streaming (SSE / WebSocket / chunked)

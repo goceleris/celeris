@@ -224,6 +224,11 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 // SAFETY: do NOT call .Sync() (or .Async(false)) on a WebSocket / SSE
 // handler — detached flows run async by construction.
 //
+// An async route may call [runtime.Goexit] (t.FailNow, t.Fatal and t.SkipNow
+// in a test's handler, or a library that does): the engine closes that
+// connection and logs an Error, and the loop keeps serving every other
+// connection. A route that runs inline must not: see [Route.Sync].
+//
 // Precedence is route > group > server default. Must be called before
 // [Server.Start]. Chainable. Async() with no argument means true; the
 // variadic-bool form is kept for back-compat — prefer .Sync() to opt a
@@ -254,6 +259,22 @@ func (r *Route) Async(opt ...bool) *Route {
 // connection (WebSocket upgrade, SSE). Detached flows run async by
 // construction (a middleware goroutine owns the connection after Detach),
 // so the per-route flag cannot downgrade them to sync.
+//
+// SAFETY: a handler that runs inline must not call [runtime.Goexit], which is
+// what t.FailNow, t.Fatal and t.SkipNow in a test's handler do, and what some
+// libraries do. A route runs inline when it is marked Sync, when it is not
+// marked and [Config.AsyncHandlers] is false, and, with AsyncHandlers, until
+// a timed run of it promotes it. On the epoll and io_uring engines (and
+// [Adaptive], which runs both) an inline handler runs on the event-loop
+// goroutine, and a Goexit cannot be recovered: it ends that loop for good.
+// Every connection the loop owns goes unserved, and the loop's own
+// SO_REUSEPORT listener stops accepting, so a share of new connections hang.
+// The engine logs an Error ("... ended without returning", with the engine,
+// the loop or worker id and the number of connections it owned) and cannot
+// recover. Mark such a route [Route.Async]: a Goexit there ends that
+// connection only. The [Std] engine runs each request on its own goroutine,
+// where a Goexit ends only that request. Panics are different: the router
+// answers a panic in a handler with a 500.
 func (r *Route) Sync() *Route {
 	return r.setAsync(false)
 }

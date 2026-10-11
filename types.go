@@ -5,6 +5,18 @@ import "time"
 // HandlerFunc defines the handler used by middleware and routes.
 // Returning a non-nil error propagates it up through the middleware chain.
 // The routerAdapter safety net writes an appropriate response for unhandled errors.
+//
+// A handler must not call [runtime.Goexit] unless its route is [Route.Async]:
+// t.FailNow, t.Fatal and t.SkipNow in a test's handler call it, and so do some
+// libraries. A panic is caught by the router (it answers 500), but a Goexit
+// cannot be caught. On the epoll and io_uring engines a handler that is not
+// async runs on the event-loop goroutine, so a Goexit ends that loop for
+// good: every connection the loop owns goes unserved and the loop's listener
+// stops accepting. The engine logs an Error ("... ended without returning")
+// when that happens, and cannot recover from it. On an [Route.Async] route
+// the Goexit ends that connection only, and the engine logs an Error. The
+// [Std] engine runs each request on its own goroutine, so a Goexit there ends
+// that request's goroutine only. See [Route.Async] and [Route.Sync].
 type HandlerFunc func(*Context) error
 
 // DefaultMaxFormSize is the default maximum memory used for multipart form

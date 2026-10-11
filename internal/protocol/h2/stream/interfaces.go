@@ -25,6 +25,14 @@ type Hijacker interface {
 // The stream's own context, cancelled with the stream, is stream.Context():
 // it is made the first time a use of the stream asks for it (celeris#836),
 // so a stream whose handler never asks costs no allocation.
+//
+// On the epoll and io_uring engines a handler that panics or calls
+// runtime.Goexit has two defined outcomes. On the async path (an async route)
+// the conn is closed and an Error is
+// logged. On the sync (inline) path the handler runs on the engine's
+// event-loop goroutine: a panic that escapes it ends the process, and a
+// Goexit ends that loop (the engine logs an Error, celeris#848), so a
+// sync handler must not call runtime.Goexit.
 type Handler interface {
 	HandleStream(ctx context.Context, stream *Stream) error
 }
