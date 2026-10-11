@@ -211,7 +211,11 @@ func TestBudgetedDriverReadsDeliverEveryByteInOrder930(t *testing.T) {
 
 			rd, wr := c930Pipe(t)
 			t.Cleanup(func() { _ = unix.Close(rd); _ = unix.Close(wr) })
-			const size = 1 << 20
+			// 100 bytes short of 32 reads: the last read is short, so the loop does
+			// not read on to the EOF, and the teardown the hangup asks for is
+			// what closes the conn (a multiple of the buffer would be closed by
+			// the zero-byte read after the last full one).
+			const size = 1<<20 - 100
 			if n, err := unix.Write(wr, c930Pattern(0, size)); n != size || err != nil {
 				t.Fatalf("fill the pipe: wrote %d of %d (%v)", n, size, err)
 			}
@@ -276,7 +280,7 @@ func TestAFloodedDriverConnGetsEveryByteBeforeItsPeersFIN930(t *testing.T) {
 	wl := eng.WorkerLoop(0)
 	a, aPeer := socketpairNonblocking(t)
 	t.Cleanup(func() { _ = unix.Close(a) })
-	const total = 4 << 20
+	const total = 4<<20 - 100 // not a multiple of the read buffer: see TestBudgetedDriverReadsDeliverEveryByteInOrder930
 	s := c930NewSink(0, total)
 	if err := wl.RegisterConn(a, func(b []byte) {
 		s.onRecv(b)
