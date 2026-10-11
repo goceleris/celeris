@@ -364,3 +364,36 @@ func BenchmarkStreamDetached855(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkDetachedBookkeeping855 is what a detached stream's Write or Flush
+// pays for the stall bound, apart from the write itself: "steady" is begin and
+// done with the watchdog scheduled (the common event), "wake" is the first
+// write after the watchdog stood down, which takes the mutex and resets the
+// timer (once per WriteTimeout of idleness at most), "off" is a stream with
+// WriteTimeout -1 (none).
+func BenchmarkDetachedBookkeeping855(b *testing.B) {
+	for _, mode := range []string{"off", "steady", "wake"} {
+		b.Run(mode, func(b *testing.B) {
+			wt := time.Hour
+			if mode == "off" {
+				wt = -1
+			}
+			e, cancel := engine855(wt)
+			defer cancel()
+			rw := &stdResponseWriter{w: &discardResponseWriter{h: http.Header{}}, eng: e}
+			rw.StreamDetached()
+			defer rw.streamEnded()
+			d := rw.w.(*detachedWriter).d
+			d.begin() // schedules the watchdog
+			d.done()
+			b.ReportAllocs()
+			for b.Loop() {
+				if mode == "wake" {
+					d.watching.Store(false)
+				}
+				d.begin()
+				d.done()
+			}
+		})
+	}
+}
