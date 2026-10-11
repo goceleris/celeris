@@ -31,6 +31,11 @@ type dlWriter855 struct {
 	inWrite func()
 }
 
+// parkLimit855 is how long the fake holds a parked write that nothing cuts.
+const parkLimit855 = 3 * time.Second
+
+var errParkedUncut855 = errors.New("the write was parked and nothing cut it")
+
 func newDLWriter855() *dlWriter855 { return &dlWriter855{h: http.Header{}} }
 
 func kind855(t time.Time) string {
@@ -55,11 +60,15 @@ func (w *dlWriter855) Write(p []byte) (int, error) {
 	if w.deadlinePassed() {
 		return 0, os.ErrDeadlineExceeded
 	}
-	for w.park.Load() {
+	// A write nothing cuts must end the test, not hang it: a defect that
+	// leaves a stalled client uncut fails after parkLimit855.
+	for start := time.Now(); w.park.Load(); time.Sleep(time.Millisecond) {
 		if w.deadlinePassed() {
 			return 0, os.ErrDeadlineExceeded
 		}
-		time.Sleep(time.Millisecond)
+		if time.Since(start) > parkLimit855 {
+			return 0, errParkedUncut855
+		}
 	}
 	return len(p), nil
 }

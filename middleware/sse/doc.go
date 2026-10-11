@@ -25,17 +25,24 @@
 // with all celeris engines and handles stream lifecycle internally.
 //
 // An SSE stream is a detached stream, so the server's ReadTimeout and
-// WriteTimeout do not end it on any engine (celeris#855): it stays open
-// without setting WriteTimeout to -1. The std engine clears the deadlines
-// net/http armed for the request when the middleware detaches, and bounds each
-// write of the stream by WriteTimeout instead: a client that stays connected
-// and reads nothing ends its stream that way. Until then the handler (or the
-// queue's drain goroutine) is parked in the write, so returning or
-// [ClientPolicyClose] cannot end the stream sooner. The
-// native engines do not park the handler in a write. When Shutdown's budget
-// runs out, std fails the writes of the streams still running. A stream that
-// should not run for ever is ended by its handler, which Send's error or the
-// client's context tells when the client has gone.
+// WriteTimeout do not end it as a whole on any engine (celeris#855): it stays
+// open for as long as the client keeps reading, without setting WriteTimeout
+// to -1. A client that stays connected and stops reading is dealt with per
+// engine:
+//
+//   - std: each write of the stream is bounded by WriteTimeout. A write that
+//     makes no progress for WriteTimeout fails, so [Client.Send] returns an
+//     error and the stream ends (WriteTimeout -1 sets no such bound). Until
+//     then the handler, or the queue's drain goroutine, is parked in that
+//     write, so returning or [ClientPolicyClose] cannot end the stream
+//     sooner. When Shutdown's budget runs out, the writes of the streams still
+//     running fail too.
+//   - epoll, io_uring and adaptive: [Client.Send] was measured not to wait for
+//     a client that reads nothing, so a handler that returns (its own bound,
+//     or its context) ends the stream, and Shutdown ends it. Neither
+//     WriteTimeout nor [ClientPolicyClose] ends the connection of such a
+//     client (a known gap, tracked with the engines' polish items, celeris#884
+//     and celeris#885).
 //
 // A HEAD request to an SSE route (answered by its GET route) gets the stream's
 // response headers and no body. [Config.OnConnect] runs for it, and a rejection

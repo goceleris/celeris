@@ -1515,13 +1515,19 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // This is required for streaming responses on native engines where the handler
 // must return to free the event loop thread.
 //
-// On the std engine, Detach also clears the read and write deadlines net/http
-// armed for the request (ReadTimeout, WriteTimeout), so the stream is not cut
-// at them, as it is not on the native engines. A detached stream's writes are
-// then bounded one at a time: each Write or Flush of the stream fails if the
-// client does not take its bytes within WriteTimeout (none at -1), and
-// Shutdown's budget running out fails the writes of the streams still running.
-// A handler that detaches for a long-poll or a stream of its own gets the same.
+// On the std engine, Detach changes how the request's timeouts apply. net/http
+// arms one write deadline for the whole response (WriteTimeout); Detach clears
+// it for this request, so the stream is not cut at WriteTimeout, as it is not
+// on the native engines. ReadTimeout never cuts a stream there: net/http has
+// stopped it by the time the handler runs. In its place, each Write or Flush
+// of the detached stream fails if the client does not take its bytes within
+// WriteTimeout (a client that stays connected and reads nothing ends the
+// stream that way; no bound at WriteTimeout -1), and when Shutdown's budget
+// runs out the writes of the streams still running fail. A handler that
+// detaches for a long-poll or a stream of its own gets the same. The writes
+// may come from more than one goroutine, as far as the response writer allows
+// it; the bound is kept per stream. The native engines apply neither
+// timeout to a detached connection.
 //
 // Detach copies the request values the Context holds, so they stay valid
 // after the handler returns (on HTTP/2 the headers and the body are the

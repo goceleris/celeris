@@ -124,10 +124,11 @@ type Streamer interface {
 // the stream is the connection's, and runs until the peer or the handler ends
 // it, as it does on the native engines, which apply neither ReadTimeout nor
 // WriteTimeout to a detached connection. The std engine implements it to clear
-// the deadlines net/http armed for the request (celeris#855). StreamDetached
-// is called once per detach, on the goroutine that called Detach, before
-// Detach returns; the native engines' writers do not implement it, so the
-// check costs a detach (a stream's start) one failed type assertion.
+// the write deadline net/http armed for the request, and to bound the stream's
+// writes one at a time instead (celeris#855). StreamDetached is called once
+// per detach, on the goroutine that called Detach, before Detach returns; the
+// native engines' writers do not implement it, so the check costs a detach (a
+// stream's start) one failed type assertion.
 type DetachNotifier interface {
 	StreamDetached()
 }
