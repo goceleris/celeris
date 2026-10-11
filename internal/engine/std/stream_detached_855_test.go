@@ -52,16 +52,24 @@ func (w *dlWriter855) Write(p []byte) (int, error) {
 	if f := w.inWrite; f != nil {
 		f()
 	}
+	if w.deadlinePassed() {
+		return 0, os.ErrDeadlineExceeded
+	}
 	for w.park.Load() {
-		w.mu.Lock()
-		dl := w.writeDL
-		w.mu.Unlock()
-		if !dl.IsZero() && !dl.After(time.Now()) {
+		if w.deadlinePassed() {
 			return 0, os.ErrDeadlineExceeded
 		}
 		time.Sleep(time.Millisecond)
 	}
 	return len(p), nil
+}
+
+// deadlinePassed is whether a socket write would fail now: the write deadline
+// is set and has passed.
+func (w *dlWriter855) deadlinePassed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.writeDL.IsZero() && !w.writeDL.After(time.Now())
 }
 func (w *dlWriter855) Flush() {
 	w.mu.Lock()
@@ -152,11 +160,12 @@ func TestStreamDetachedOnAWriterWithoutDeadlines855(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 }
 
-// Each write of a detached stream is armed with a deadline and disarmed when it
-// returns; before the stream detaches, and with a WriteTimeout of -1, nothing
-// is set.
-func TestDetachedWriteArmsAndDisarms855(t *testing.T) {
-	t.Run("armed", func(t *testing.T) {
+// A detached stream's writes touch nothing but the writer; the last bytes of
+// the response (the end of a chunked body) are bounded by one deadline at the
+// end of the request. Before the stream detaches nothing is set, and with a
+// WriteTimeout of -1 nothing is set at all.
+func TestDetachedWriteEvents855(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
 		e, cancel := engine855(time.Second)
 		defer cancel()
 		w := newDLWriter855()
@@ -169,12 +178,10 @@ func TestDetachedWriteArmsAndDisarms855(t *testing.T) {
 		w.take()
 		_ = rw.Write(nil, []byte("x"))
 		_ = rw.Flush(nil)
-		want := []string{"w:future", "write", "w:zero", "w:future", "flush", "w:zero"}
-		if got := w.take(); !eq855(got, want) {
+		if got, want := w.take(), []string{"write", "flush"}; !eq855(got, want) {
 			t.Fatalf("a detached Write then Flush: %v, want %v", got, want)
 		}
 		rw.streamEnded()
-		// The last bytes of the response (end of a chunked body) are bounded too.
 		if got := w.take(); !eq855(got, []string{"w:future"}) {
 			t.Fatalf("at the end of the request: %v", got)
 		}
@@ -196,7 +203,8 @@ func TestDetachedWriteArmsAndDisarms855(t *testing.T) {
 }
 
 // The drain budget running out fails the stream's writes, and every write
-// after it, whether or not the stream has a WriteTimeout.
+// after it, whether or not the stream has a WriteTimeout. The deadline is in
+// the past and stays there: no write sets another.
 func TestDetachedPokeFailsWrites855(t *testing.T) {
 	for _, wt := range []time.Duration{time.Second, -1} {
 		e, cancel := engine855(wt)
@@ -210,57 +218,24 @@ func TestDetachedPokeFailsWrites855(t *testing.T) {
 			defer w.mu.Unlock()
 			return !w.writeDL.IsZero() && kind855(w.writeDL) == "past"
 		})
-		w.take()
+		if got := w.take(); !eq855(got, []string{"w:past"}) {
+			t.Fatalf("WriteTimeout %v: the poke set %v", wt, got)
+		}
 		_ = rw.Write(nil, []byte("x"))
 		_ = rw.Flush(nil)
-		got := w.take()
-		for _, ev := range got {
-			if ev == "w:future" || ev == "w:zero" {
-				t.Fatalf("WriteTimeout %v: after the poke a write was armed %v", wt, got)
-			}
-		}
-		if len(got) == 0 || got[0] != "w:past" {
-			t.Fatalf("WriteTimeout %v: after the poke the first write was not failed: %v", wt, got)
+		if got, want := w.take(), []string{"write", "flush"}; !eq855(got, want) {
+			t.Fatalf("WriteTimeout %v: after the poke %v, want %v", wt, got, want)
 		}
 		rw.streamEnded()
 		if got := w.take(); len(got) != 0 {
 			t.Fatalf("WriteTimeout %v: a poked stream's end set %v", wt, got)
 		}
-	}
-}
-
-// A poke that lands between arm's look at closing and its set would be undone
-// by the set: arm looks again once the deadline is in place. The poke is made
-// to land exactly there.
-func TestDetachedArmDoesNotUndoAPoke855(t *testing.T) {
-	e, cancel := engine855(time.Second)
-	defer cancel()
-	w := newDLWriter855()
-	rw := &stdResponseWriter{w: w, eng: e}
-	rw.StreamDetached()
-	w.take()
-	fired := false
-	w.beforeSet = func(dl time.Time) {
-		if fired || kind855(dl) != "future" {
-			return
+		w.mu.Lock()
+		last := kind855(w.writeDL)
+		w.mu.Unlock()
+		if last != "past" {
+			t.Fatalf("WriteTimeout %v: the poked stream's write deadline is %s, want past", wt, last)
 		}
-		fired = true
-		cancel() // the budget runs out, here
-		waitFor855(t, func() bool {
-			w.mu.Lock()
-			defer w.mu.Unlock()
-			return kind855(w.writeDL) == "past"
-		})
-	}
-	_ = rw.Write(nil, []byte("x"))
-	w.mu.Lock()
-	last := kind855(w.writeDL)
-	w.mu.Unlock()
-	if !fired {
-		t.Fatal("the poke was not made")
-	}
-	if last != "past" {
-		t.Fatalf("a Write racing the poke left a %s write deadline, want past", last)
 	}
 }
 

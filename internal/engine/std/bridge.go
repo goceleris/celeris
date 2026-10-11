@@ -166,10 +166,11 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type stdResponseWriter struct {
 	w http.ResponseWriter
 	// eng is the engine whose request this is: the write timeout and the base
-	// context a detached stream is bounded by (StreamDetached).
-	eng *Engine
-	// det is nil until the handler detaches.
-	det     *detachedWrites
+	// context a detached stream is bounded by (StreamDetached). It is the only
+	// state a request pays for the detach support: w is replaced by a
+	// *detachedWriter when the handler detaches, so nothing else is added here
+	// (32 bytes, one size class over {w, flushed}).
+	eng     *Engine
 	flushed bool
 }
 
@@ -211,24 +212,12 @@ func (rw *stdResponseWriter) WriteHeader(_ *stream.Stream, status int, headers [
 }
 
 func (rw *stdResponseWriter) Write(_ *stream.Stream, data []byte) error {
-	if d := rw.det; d != nil {
-		d.arm()
-		_, err := rw.w.Write(data)
-		d.disarm()
-		return err
-	}
 	_, err := rw.w.Write(data)
 	return err
 }
 
 func (rw *stdResponseWriter) Flush(_ *stream.Stream) error {
 	if f, ok := rw.w.(http.Flusher); ok {
-		if d := rw.det; d != nil {
-			d.arm()
-			f.Flush()
-			d.disarm()
-			return nil
-		}
 		f.Flush()
 	}
 	return nil
@@ -250,9 +239,10 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 //
 // Nothing then ends a stream whose client stays connected and reads nothing,
 // so the stream's writes are bounded the way the WebSocket middleware bounds
-// its own: each write gets WriteTimeout from its start and no deadline when it
-// has returned, and when the drain budget runs out the writes fail (see
-// detachedWrites). Runs when a stream starts, never per request.
+// its own: a write parked for WriteTimeout is failed, and when the drain
+// budget runs out the writes fail (see detachedWrites). No deadline is set per
+// write: a detached stream's Write and Flush only note when they started.
+// Runs when a stream starts, never per request.
 //
 // The read deadline is cleared as well. net/http already clears it once it
 // starts watching the connection for the client going away (before the
@@ -261,7 +251,7 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 // errors are ignored: a writer that cannot set deadlines
 // (http.ErrNotSupported) has none armed to clear.
 func (rw *stdResponseWriter) StreamDetached() {
-	if rw.det != nil {
+	if _, ok := rw.w.(*detachedWriter); ok {
 		return
 	}
 	rc := http.NewResponseController(rw.w)
@@ -277,14 +267,14 @@ func (rw *stdResponseWriter) StreamDetached() {
 			d.stopPoke = context.AfterFunc(e.baseCtx, d.poke)
 		}
 	}
-	rw.det = d
+	rw.w = &detachedWriter{ResponseWriter: rw.w, d: d}
 }
 
 // streamEnded is called as the request's ServeHTTP returns (see
 // detachedWrites.end).
 func (rw *stdResponseWriter) streamEnded() {
-	if rw.det != nil {
-		rw.det.end()
+	if dw, ok := rw.w.(*detachedWriter); ok {
+		dw.d.end()
 	}
 }
 

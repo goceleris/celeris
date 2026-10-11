@@ -7,6 +7,7 @@ package std
 // deadline design and the watchdog.
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -22,6 +23,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/net/http2"
+
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // A detached stream's Write and Flush set no deadline: over h2c each
@@ -189,6 +192,46 @@ func TestDetachedPokeDuringAWriteSticks855(t *testing.T) {
 	if last != "past" {
 		t.Fatalf("the stream ended with a %s write deadline after a poke, want past", last)
 	}
+}
+
+// hijackWriter855 is a dlWriter855 that can hand over its connection.
+type hijackWriter855 struct{ *dlWriter855 }
+
+func (w hijackWriter855) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c, _ := net.Pipe()
+	return c, nil, nil
+}
+
+// A detached stream that hijacks goes on working: the connection is the
+// caller's, and neither the watchdog nor the poke nor the end of the request
+// sets a deadline on it. A writer that cannot hijack says so as it did before.
+func TestDetachedHijack855(t *testing.T) {
+	e, cancel := engine855(30 * time.Millisecond)
+	defer cancel()
+	w := newDLWriter855()
+	rw := &stdResponseWriter{w: hijackWriter855{w}, eng: e}
+	rw.StreamDetached()
+	w.take()
+	c, err := rw.Hijack(nil)
+	if err != nil || c == nil {
+		t.Fatalf("Hijack after Detach: %v, %v", c, err)
+	}
+	defer c.Close()
+	cancel() // the budget runs out: nothing to poke
+	time.Sleep(60 * time.Millisecond)
+	rw.streamEnded()
+	if got := w.take(); len(got) != 0 {
+		t.Fatalf("a hijacked stream's connection got %v", got)
+	}
+
+	e2, cancel2 := engine855(time.Second)
+	defer cancel2()
+	rw = &stdResponseWriter{w: newDLWriter855(), eng: e2}
+	rw.StreamDetached()
+	if _, err := rw.Hijack(nil); !errors.Is(err, stream.ErrHijackNotSupported) {
+		t.Fatalf("Hijack on a writer that cannot: %v, want ErrHijackNotSupported", err)
+	}
+	rw.streamEnded()
 }
 
 // h2cServer855 serves h on an in-process h2c server (the x/net http2 server the std
