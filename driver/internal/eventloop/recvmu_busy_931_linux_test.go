@@ -361,13 +361,17 @@ func TestAFreshQueuedTurnDoesNotWaitForAPollingCaller931(t *testing.T) {
 
 // TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931 is the check of the
 // worker's TryLock-and-requeue against the callers it races with. Four conns
-// each have a peer that pushes 1 to 200 bytes at random moments for 2 s, and an
+// each have a peer that pushes 1 to 200 bytes at random moments for 2 s (longer until a turn has found a recvMu held), and an
 // owner that calls WriteAndPollMulti back to back, so events of a conn are
 // collected while a call holds its recvMu, between calls and in the middle of
 // the re-arm. Every byte a peer sent must be delivered, by a call's onRecv or by
 // the worker's, once the pushes stop, and the callers must keep making calls
 // (a deadlock between the worker and a caller shows as a caller that stops).
 func TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931(t *testing.T) {
+	var busyEvents, busyQueued atomic.Int64
+	testHookEventTurnBusy = func(int) { busyEvents.Add(1) }
+	testHookQueuedTurnBusy = func(int, bool) { busyQueued.Add(1) }
+	t.Cleanup(func() { testHookEventTurnBusy, testHookQueuedTurnBusy = nil, nil }) // runs last, after Close
 	l, err := New(1)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -437,6 +441,10 @@ func TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931(t *testing.T) {
 		}()
 	}
 	time.Sleep(2 * time.Second)
+	// Run on, up to 8 s more, until an event turn has found a recvMu held.
+	for dl := time.Now().Add(8 * time.Second); busyEvents.Load() == 0 && time.Now().Before(dl); {
+		time.Sleep(50 * time.Millisecond)
+	}
 	var callsMid [conns]int64
 	for i, r := range rigs {
 		callsMid[i] = r.calls.Load()
@@ -473,5 +481,9 @@ func TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931(t *testing.T) {
 			t.Errorf("conn %d: the peer sent %d bytes and %d were delivered: bytes stranded", i, r.sent.Load(), r.recv.Load())
 		}
 	}
-	t.Logf("C931 callers vs worker: %d bytes sent and %d delivered over %d WriteAndPollMulti calls on %d conns", sent, recv, calls, conns)
+	t.Logf("C931 callers vs worker: %d bytes sent and %d delivered over %d WriteAndPollMulti calls on %d conns; turns that found recvMu held: %d for an event, %d queued",
+		sent, recv, calls, conns, busyEvents.Load(), busyQueued.Load())
+	if busyEvents.Load() == 0 {
+		t.Errorf("no event turn found a recvMu held: the stress did not drive the window it checks")
+	}
 }
