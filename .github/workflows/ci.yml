@@ -2049,19 +2049,13 @@ jobs:
           go-version: "1.27.2"
       - name: Build root module
         run: go build ./...
-      # Packages whose files are all Linux-only (the engines, test/...) have no
-      # Go files for this target and are left out by the .GoFiles filter, which
-      # also drops internal/adaptive: its shutdown_switch_877_test.go has no
-      # build constraint and does not type-check without the Linux files, on
-      # darwin either. internal/protocol/h2/stream is excluded by name because
-      # window_waiters_bench_893_test.go calls syscall.Getrusage, which Windows
-      # does not have; both are outside this job's scope (celeris#937) -- drop
-      # the exclusion once that file carries a build constraint.
+      # The whole module: packages whose files are all Linux-only (the engines,
+      # test/...) are skipped by go vet itself (build constraints exclude all
+      # their files), and the test files that do not apply to Windows carry a
+      # build constraint. There is no package list to compute, so there is no
+      # list that can silently come back empty and vet nothing.
       - name: Vet root module
-        run: |
-          mapfile -t pkgs < <(go list -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v -e '/internal/protocol/h2/stream$')
-          echo "vetting ${#pkgs[@]} packages for $GOOS/$GOARCH"
-          go vet "${pkgs[@]}"
+        run: go vet ./...
       - name: Build middleware/compress
         run: go build ./...
         working-directory: middleware/compress

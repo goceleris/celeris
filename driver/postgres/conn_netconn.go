@@ -95,7 +95,11 @@ func dialConnNetConn(ctx context.Context, prov engine.EventLoopProvider, closeLo
 		return nil, err
 	}
 	// The loop may already have fired onClose, which reads c.fd under fdMu
-	// (shutdownFD): publish the identifier under it.
+	// (shutdownFD): publish the identifier under it. onRecv reads c.fd too
+	// (writeRawFromRecv, under recvWriteMu, not fdMu); that read needs no lock
+	// here only because the server sends nothing before the StartupMessage,
+	// which doStartup writes after this publish, so no onRecv can run before
+	// it (an onRecv that did would be a data race on c.fd).
 	c.fdMu.Lock()
 	c.fd = id
 	c.fdMu.Unlock()
