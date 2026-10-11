@@ -724,33 +724,26 @@ func (w *Worker) endOwedOpsAtShutdown() {
 					// has let go of the listen socket's file. A multishot
 					// accept says so by clearing F_MORE (the cancel's
 					// -ECANCELED, or an error that ended it); a single-shot
-					// one always does, and is not re-armed in shutdown. Any
-					// terminal accept CQE ends the wait, including a stale one
-					// left unread from an earlier listen socket (pause, resume,
-					// shutdown at once): cancelAccept reaps inline, which keeps
-					// that window narrow, and the CQE carries no more than the
-					// descriptor number, which a re-created socket reuses
-					// (appended to #884).
-					if !cqeHasMore(c.Flags) {
+					// one always does, and is not re-armed in shutdown. Only
+					// the accept of the socket being cancelled ends the wait:
+					// the user data carries its descriptor number, so a
+					// terminal CQE left unread from an earlier listen socket
+					// (a pause, a resume and a shutdown at once; cancelAccept
+					// reaps inline, which keeps that window narrow) is not
+					// taken for it unless a re-created socket reused the
+					// number (appended to #884).
+					if !cqeHasMore(c.Flags) && decodeFD(ud) == listenFDAtCancel {
 						acceptOwed = false
 					}
 				case udListenCancel:
-					// The cancel's own CQE (queueListenAcceptCancel). With
-					// IORING_ASYNC_CANCEL_ALL its result is how many accepts
-					// it cancelled, and 0, not -ENOENT, when none was armed
-					// (__io_async_cancel returns nr). 0: no accept holds the
-					// socket and none will complete, so the wait is over.
-					// A positive count, or -EALREADY (the accept is being
-					// completed): the accept's own CQE ends the wait.
-					// Anything else: the cancel did not take, so the wait
-					// cannot be answered and is not made.
+					// The cancel's own CQE (queueListenAcceptCancel).
 					if acceptOwed && decodeFD(ud) == listenFDAtCancel {
-						switch {
-						case c.Res == 0 || c.Res == -int32(unix.ENOENT):
+						done, err := listenCancelAnswer(c.Res)
+						if err != nil {
+							w.noteListenCancelGaveUp(err)
+						}
+						if done {
 							acceptOwed = false
-						case c.Res < 0 && c.Res != -int32(unix.EALREADY):
-							acceptOwed = false
-							w.noteListenCancelGaveUp(fmt.Errorf("cancel of the accept: %w", unix.Errno(-c.Res)))
 						}
 					}
 				}
@@ -773,20 +766,21 @@ func (w *Worker) endOwedOpsAtShutdown() {
 	w.closeFDOwed = 0
 }
 
-// queueListenAcceptCancel places, in the SQ ring and without entering it, the
-// cancel of every op armed on the listen socket, and reports whether the
-// caller should wait for the accept to end (celeris#896). False, with nothing
-// placed: the worker has no listen socket (a pause or a stopAccepting closed
-// it, and cancelled the accept first), no ring or an SQPOLL ring (the drain
-// is not run there), or the SQ ring has no room, which is counted and logged
-// as a give-up like a wait that runs out: the close that follows then leaves
-// the socket to the ring's teardown, as every shutdown used to. Worker
-// thread only.
+// queueListenAcceptCancel places, in the SQ ring, the cancel of every op armed
+// on the listen socket, and reports whether the caller should wait for the
+// accept to end (celeris#896). It enters the ring only when the SQ ring has no
+// room, to submit what it holds (getCancelSQE). False, with nothing placed: the
+// worker has no listen socket (a pause or a stopAccepting closed it, and
+// cancelAccept cancelled the accept and waited first), no ring or an SQPOLL
+// ring (the drain is not run there), or the SQ ring is full even after that
+// submit, which is counted and logged as a give-up like a wait that runs out:
+// the close that follows then leaves the socket to the ring's teardown, as
+// every shutdown used to. Worker thread only.
 func (w *Worker) queueListenAcceptCancel() bool {
 	if w.ring == nil || w.sqpoll || w.listenFD < 0 {
 		return false
 	}
-	sqe := w.ring.GetSQE()
+	sqe := w.getCancelSQE()
 	if sqe == nil {
 		w.noteListenCancelGaveUp(errors.New("the SQ ring is full"))
 		return false
@@ -799,6 +793,26 @@ func (w *Worker) queueListenAcceptCancel() bool {
 	prepCancelFDDriver(sqe, w.listenFD)
 	setSQEUserData(sqe, encodeUserData(udListenCancel, w.listenFD))
 	return true
+}
+
+// listenCancelAnswer reads the result of the listen socket's cancel
+// (queueListenAcceptCancel, cancelAccept) for the wait that made it. With
+// IORING_ASYNC_CANCEL_ALL the result is how many accepts it cancelled, and 0,
+// not -ENOENT, when none was armed (__io_async_cancel returns nr).
+//   - 0, or -ENOENT on a kernel that reports the miss as an error: no accept
+//     holds the socket and none will complete, so the wait is over (done).
+//   - a positive count, or -EALREADY (the accept is being completed): the
+//     accept's own CQE ends the wait.
+//   - anything else: the cancel did not take, so the wait cannot be answered
+//     and is not made (done, with the error to count as a give-up).
+func listenCancelAnswer(res int32) (done bool, err error) {
+	switch {
+	case res == 0 || res == -int32(unix.ENOENT):
+		return true, nil
+	case res < 0 && res != -int32(unix.EALREADY):
+		return true, fmt.Errorf("cancel of the accept: %w", unix.Errno(-res))
+	}
+	return false, nil
 }
 
 // noteListenCancelGaveUp records that worker shutdown could not wait for the

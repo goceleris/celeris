@@ -4482,6 +4482,11 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 			return nil, fmt.Errorf("invalid port: %s", portStr)
 		}
 		port = port*10 + int(c-'0')
+		if port > 65535 {
+			// "1.2.3.4:18446744073709551616" wrapped to port 0, which Listen
+			// then took for a request for an ephemeral port.
+			return nil, fmt.Errorf("invalid port: %s", portStr)
+		}
 	}
 
 	if host == "" || host == "0.0.0.0" {
@@ -4519,6 +4524,11 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 			val = 0
 			digits = 0
 		} else if c >= '0' && c <= '9' {
+			if digits > 0 && val == 0 {
+				// "0127.0.0.1" and "010.0.0.1": a leading zero is ambiguous
+				// (octal in some parsers); net.ParseIP and std refuse it.
+				return nil, fmt.Errorf("invalid addr: %s", addr)
+			}
 			val = val*10 + int(c-'0')
 			digits++
 			if val > 255 {

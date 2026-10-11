@@ -20,8 +20,13 @@ import (
 )
 
 // celeris#895: the port Listen decides for a port 0 is held from the moment
-// it is decided until every loop is listening on it, so no other socket can
-// take it in between, and is let go on every path out of Listen.
+// it is decided until Listen returns, on every path out of it: a socket that
+// never listens, so no other socket can take the port while the loops start,
+// while accepting is paused (the loops then have no listen socket and bind the
+// port again on a resume), or at any time in between. The loops' own sockets
+// join the port's SO_REUSEPORT group beside it, and it is closed last, after
+// they have been closed, so the port is free the instant Listen returns
+// (celeris#896).
 
 func newPort0Engine895(t *testing.T, loops int) *Engine {
 	t.Helper()
