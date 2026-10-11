@@ -72,7 +72,10 @@ func DeriveMemoryLimit(workers int) int64 {
 
 // Config holds the public server configuration.
 type Config struct {
-	// Addr is the TCP address to listen on (e.g. ":8080").
+	// Addr is the TCP address to listen on (e.g. ":8080"). A port of 0 asks
+	// for an ephemeral port, as in [net.Listen]: the engine picks it once and
+	// every worker serves on that one port, which [Server.Addr] reports and
+	// which stays the same across a pause and resume of accepting.
 	Addr string
 	// Protocol is the HTTP protocol version (default Auto — auto-detect H1/H2).
 	Protocol Protocol

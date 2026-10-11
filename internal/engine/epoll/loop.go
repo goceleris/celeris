@@ -4518,6 +4518,10 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 			val = 0
 		} else if c >= '0' && c <= '9' {
 			val = val*10 + int(c-'0')
+			if val > 255 {
+				// "300.1.1.1" used to wrap to 44.1.1.1 and bind that.
+				return nil, fmt.Errorf("invalid addr: %s", addr)
+			}
 		} else {
 			return nil, fmt.Errorf("invalid addr: %s", addr)
 		}

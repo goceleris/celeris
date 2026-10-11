@@ -25,7 +25,9 @@ type Config struct {
 	Protocol engine.Protocol
 	// Engine is the I/O engine type (IOUring, Epoll, Adaptive, or Std).
 	Engine engine.EngineType
-	// Addr is the TCP address to listen on (e.g. ":8080").
+	// Addr is the TCP address to listen on (e.g. ":8080"). With a port of 0
+	// the epoll and io_uring engines pick the port once, before any of their
+	// workers binds, and give every worker the concrete address (celeris#895).
 	Addr string
 	// Resources holds worker, buffer, and connection limit overrides.
 	Resources Resources
