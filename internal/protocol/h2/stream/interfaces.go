@@ -119,6 +119,19 @@ type Streamer interface {
 	Close(stream *Stream) error
 }
 
+// DetachNotifier is an optional interface a ResponseWriter may implement to
+// be told that the handler detached the stream (Context.Detach): from then on
+// the stream is the connection's, and runs until the peer or the handler ends
+// it, as it does on the native engines, which apply neither ReadTimeout nor
+// WriteTimeout to a detached connection. The std engine implements it to clear
+// the deadlines net/http armed for the request (celeris#855). StreamDetached
+// is called once per detach, on the goroutine that called Detach, before
+// Detach returns; the native engines' writers do not implement it, so the
+// check costs a detach (a stream's start) one failed type assertion.
+type DetachNotifier interface {
+	StreamDetached()
+}
+
 // UseStreamer is a Streamer whose calls are tied to one use of a stream
 // object (celeris#904). A stream is pooled, and on HTTP/2 its use ends when
 // its handler returns, detached or not (Context.Detach); a StreamWriter that a

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
@@ -217,6 +218,28 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 	return nil
 }
 
+// StreamDetached implements stream.DetachNotifier. net/http arms a read
+// deadline (ReadTimeout) and a write deadline (WriteTimeout) for each request
+// and keeps the write one armed while the handler runs: a response that takes
+// longer than WriteTimeout fails its next write, so an SSE stream was cut at
+// WriteTimeout while the native engines, which apply neither timeout to a
+// detached connection, kept it open (celeris#855). The handler has detached,
+// so this stream is the connection's: clear both, for this request only.
+// net/http arms them again for the next request on the connection, so
+// nothing is restored. Runs when a stream starts, never per request.
+//
+// The read deadline is cleared as well. net/http already clears it once it
+// starts watching the connection for the client going away (before the
+// handler runs, for the bodies the bridge reads whole), so on HTTP/1 this
+// is for a Go that does not; on h2 it stops the request-body timer. The
+// errors are ignored: a writer that cannot set deadlines
+// (http.ErrNotSupported) has none armed to clear.
+func (rw *stdResponseWriter) StreamDetached() {
+	rc := http.NewResponseController(rw.w)
+	_ = rc.SetReadDeadline(time.Time{})
+	_ = rc.SetWriteDeadline(time.Time{})
+}
+
 func (rw *stdResponseWriter) Hijack(_ *stream.Stream) (net.Conn, error) {
 	h, ok := rw.w.(http.Hijacker)
 	if !ok {
@@ -231,3 +254,4 @@ func (rw *stdResponseWriter) Hijack(_ *stream.Stream) (net.Conn, error) {
 
 var _ stream.Hijacker = (*stdResponseWriter)(nil)
 var _ stream.Streamer = (*stdResponseWriter)(nil)
+var _ stream.DetachNotifier = (*stdResponseWriter)(nil)

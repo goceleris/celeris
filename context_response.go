@@ -1568,6 +1568,13 @@ func (c *Context) Detach() (done func()) {
 	if c.stream.OnDetach != nil {
 		c.stream.OnDetach()
 	}
+	// The std engine's writer clears the deadlines net/http armed for the
+	// request, so a detached stream (SSE) is not cut at ReadTimeout or
+	// WriteTimeout, as it is not on the native engines (celeris#855). Here, not
+	// in OnDetach, which std leaves nil: EngineSupportsAsyncDetach reads it.
+	if dn, ok := c.stream.ResponseWriter.(stream.DetachNotifier); ok {
+		dn.StreamDetached()
+	}
 	ch := make(chan struct{})
 	c.detachDone = ch
 	return func() {
