@@ -201,10 +201,25 @@ func (w *portableWorker) register(fd int, alloc bool, open func() (net.Conn, err
 		done:    make(chan struct{}),
 	}
 	w.mu.Lock()
+	// shutdown sets closed before it takes mu to empty the table and waits for
+	// the readers afterwards, so a registration that gets here after that
+	// sees it and must not start a reader nothing will ever stop; one that
+	// got here first is in the table shutdown empties, and its wg.Add is
+	// ordered before shutdown's Wait by mu.
+	if w.closed.Load() {
+		delete(w.conns, fd)
+		w.mu.Unlock()
+		if !alloc {
+			// open made the conn (RegisterConn's duplicate): it is ours.
+			// A conn RegisterNetConn was handed stays with its caller.
+			_ = c.Close()
+		}
+		return 0, ErrLoopClosed
+	}
 	w.conns[fd] = dc
+	w.wg.Add(1)
 	w.mu.Unlock()
 
-	w.wg.Add(1)
 	go w.readerLoop(dc)
 	return fd, nil
 }

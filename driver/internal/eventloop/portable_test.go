@@ -484,3 +484,59 @@ func TestPortableWritesAreSerializedPerConn(t *testing.T) {
 		}
 	}
 }
+
+// Loop.Close racing RegisterNetConn: every call either fails with
+// ErrLoopClosed and leaves the conn with its caller, or registers a conn that
+// Close then closes. Nothing stays open and no reader goroutine outlives the
+// Close (the race detector and the -timeout are the checks).
+func TestPortableRegisterRacingCloseLeavesNothingOpen(t *testing.T) {
+	srv := newLoopbackServer(t)
+	for round := 0; round < 20; round++ {
+		l, err := NewPortable(2)
+		if err != nil {
+			t.Fatalf("NewPortable: %v", err)
+		}
+		const n = 16
+		clients := make([]net.Conn, n)
+		for i := range clients {
+			clients[i], _ = srv.dial(t)
+		}
+		registered := make([]bool, n)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				reg := l.WorkerLoop(i % 2).(NetConnRegistrar)
+				_, err := reg.RegisterNetConn(clients[i], func([]byte) {}, func(error) {})
+				if err == nil {
+					registered[i] = true
+				} else if !errors.Is(err, ErrLoopClosed) {
+					t.Errorf("RegisterNetConn: %v", err)
+				}
+			}(i)
+		}
+		close(start)
+		closed := make(chan struct{})
+		go func() { _ = l.Close(); close(closed) }()
+		select {
+		case <-closed:
+		case <-time.After(portableWait):
+			t.Fatalf("round %d: Loop.Close hung: a registration that lost the race started a reader nothing stops", round)
+		}
+		wg.Wait()
+		// A registration that lost the race was refused: its conn is the
+		// caller's. One that won is closed by Close, or by the registration
+		// itself noticing the loop is gone.
+		for i, c := range clients {
+			if registered[i] && !connClosed(c) {
+				t.Fatalf("round %d: conn %d was registered and is still open after Close", round, i)
+			}
+			if !registered[i] && connClosed(c) {
+				t.Fatalf("round %d: conn %d was refused with ErrLoopClosed but the loop closed it", round, i)
+			}
+		}
+	}
+}
