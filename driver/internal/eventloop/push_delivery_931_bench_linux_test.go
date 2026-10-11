@@ -13,7 +13,8 @@ package eventloop
 // none), so the events of a conn are collected while a call holds its recvMu,
 // between calls and in the middle of the re-arm. One op is one call. The
 // metrics are the delivery latency of a pushed frame, from the peer's write to
-// the onRecv that completes it, whoever delivers it (the call or the worker).
+// the onRecv that completes it, whoever delivers it (the call or the worker),
+// and late/frame, the share of frames delivered more than 500 us after the push.
 
 import (
 	"encoding/binary"
