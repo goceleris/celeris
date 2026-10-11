@@ -359,10 +359,13 @@ func (l *Loop) flushDriverSendLocked(dc *driverConn) error {
 			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				if !dc.epollOut {
-					// EPOLLIN stays edge-triggered (ET) but EPOLLOUT is
-					// level-triggered: it fires as long as the socket is
-					// writable, so there is no risk of a missed wakeup
-					// after sending clears. EPOLLET only applies to EPOLLIN.
+					// No EPOLLET: it is a flag of the whole registration, so
+					// while EPOLLOUT is armed EPOLLIN is level-triggered too.
+					// EPOLLOUT fires as long as the socket is writable, so
+					// there is no risk of a missed wakeup after sending
+					// clears; EPOLLIN is reported again each epoll_wait while
+					// bytes are unread, which handleDriverEvent merges into the
+					// conn's queued read turn (celeris#930).
 					ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP)
 					modErr := l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &ev)
 					if modErr == nil {

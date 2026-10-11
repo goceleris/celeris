@@ -413,3 +413,88 @@ func TestAnHTTPConnOnALoopWithAFloodingDriverConnIsServed930(t *testing.T) {
 	}
 	t.Logf("C930 HTTP beside the floods: 20 requests answered, slowest %v; floods delivered %d and %d bytes", worst, floods[0].got.Load(), floods[1].got.Load())
 }
+
+// TestAFloodedDriverConnWithEPOLLOUTArmedKeepsItsFlushAndOneTurnPerRound930:
+// flushDriverSendLocked arms EPOLLOUT with a MOD that drops EPOLLET, and the
+// flag belongs to the whole registration, so while EPOLLOUT is armed the conn's
+// EPOLLIN is level-triggered and every round reports a flooded conn again. A
+// floods, and A's owner writes 8 MiB into A, whose peer does not read, so the
+// write hits EAGAIN and EPOLLOUT is armed. B must still be served within two
+// turns of A's reads, and when A's peer reads the 8 MiB at last the flush must
+// run to the end and EPOLLOUT disarm: the merge of a queued conn's event keeps
+// its EPOLLOUT.
+func TestAFloodedDriverConnWithEPOLLOUTArmedKeepsItsFlushAndOneTurnPerRound930(t *testing.T) {
+	eng, stop := newTestEngine(t)
+	defer stop()
+	wl := eng.WorkerLoop(0)
+	var aReads atomic.Int64
+	f := c930FloodCounting(t, wl, 100*time.Microsecond, &aReads)
+	t.Cleanup(f.close)
+	bfd, bPeer := socketpairNonblocking(t)
+	t.Cleanup(func() { _ = wl.UnregisterConn(bfd); _ = unix.Close(bfd); _ = unix.Close(bPeer) })
+	var aReadsAtB atomic.Int64
+	bGot := make(chan struct{}, 1)
+	if err := wl.RegisterConn(bfd, func([]byte) {
+		aReadsAtB.Store(aReads.Load())
+		select {
+		case bGot <- struct{}{}:
+		default:
+		}
+	}, func(error) {}); err != nil {
+		t.Fatalf("RegisterConn(B): %v", err)
+	}
+
+	const out = 8 << 20
+	if err := wl.Write(f.fd, make([]byte, out)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	dc := wl.(*Loop).lookupDriver(f.fd)
+	armed := false
+	for dl := time.Now().Add(2 * time.Second); !armed && time.Now().Before(dl); time.Sleep(time.Millisecond) {
+		dc.mu.Lock()
+		armed = dc.epollOut
+		dc.mu.Unlock()
+	}
+	if !armed {
+		t.Fatal("EPOLLOUT was not armed after an 8 MiB write into a socket nobody reads")
+	}
+	readsAtSend := aReads.Load()
+	sent := time.Now()
+	if _, err := unix.Write(bPeer, []byte{'b'}); err != nil {
+		t.Fatalf("write B: %v", err)
+	}
+	select {
+	case <-bGot:
+	case <-time.After(3 * time.Second):
+		t.Fatal("B was not served within 3 s while A flooded with EPOLLOUT armed")
+	}
+	waited, between := time.Since(sent), aReadsAtB.Load()-readsAtSend
+
+	// A's peer reads A's 8 MiB: the flush resumes on EPOLLOUT and finishes.
+	got := 0
+	buf := make([]byte, 256<<10)
+	for dl := time.Now().Add(10 * time.Second); got < out && time.Now().Before(dl); {
+		n, err := unix.Read(f.peer, buf)
+		if n > 0 {
+			got += n
+			continue
+		}
+		if err != nil && err != unix.EAGAIN {
+			t.Fatalf("read A's peer: %v", err)
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+	disarmed := false
+	for dl := time.Now().Add(2 * time.Second); !disarmed && time.Now().Before(dl); time.Sleep(time.Millisecond) {
+		dc.mu.Lock()
+		disarmed = !dc.epollOut
+		dc.mu.Unlock()
+	}
+	t.Logf("C930 EPOLLOUT armed: B served %v after its byte with %d of A's reads in between; A's peer read %d of %d bytes; EPOLLOUT disarmed: %v", waited, between, got, out, disarmed)
+	if between > 2*driverReadBudget {
+		t.Errorf("A was read %d times between B's byte and B's service, want at most two turns (%d)", between, 2*driverReadBudget)
+	}
+	if got != out || !disarmed {
+		t.Errorf("A's peer read %d of %d bytes and EPOLLOUT disarmed: %v: the flush did not run to the end under the flood", got, out, disarmed)
+	}
+}

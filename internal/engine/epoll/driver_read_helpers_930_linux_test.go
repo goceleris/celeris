@@ -161,10 +161,19 @@ type c930Flooder struct {
 
 func c930Flood(t testing.TB, wl engine.WorkerLoop, perChunk time.Duration) *c930Flooder {
 	t.Helper()
+	return c930FloodCounting(t, wl, perChunk, nil)
+}
+
+// c930FloodCounting is c930Flood that also counts the reads of the flooded conn in reads.
+func c930FloodCounting(t testing.TB, wl engine.WorkerLoop, perChunk time.Duration, reads *atomic.Int64) *c930Flooder {
+	t.Helper()
 	f := &c930Flooder{stop: make(chan struct{}), wl: wl}
 	f.fd, f.peer = c930Socketpair(t)
 	first := make(chan struct{}, 1)
 	if err := wl.RegisterConn(f.fd, func(p []byte) {
+		if reads != nil {
+			reads.Add(1)
+		}
 		if f.got.Add(int64(len(p))) == int64(len(p)) {
 			first <- struct{}{}
 		}
