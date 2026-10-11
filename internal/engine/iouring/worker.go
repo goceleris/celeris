@@ -6264,10 +6264,13 @@ func (w *Worker) flushDirty() {
 			// that used to make such a conn show as a busy core (the
 			// celeris#519 / celeris#527 stranded-sending leaks were found
 			// that way) is gone, so a future stuck-sending defect parks
-			// silently until that sweep, which runs on the idle cadence
-			// (every 32 iterations with ReadHeaderTimeout > 0 or a detached
-			// conn, every 1024 otherwise, each iteration waiting up to
-			// 25 ms / 100 ms).
+			// silently until that sweep. The sweep's iteration gate is every
+			// 32 iterations with ReadHeaderTimeout > 0 or a detached conn,
+			// every 1024 otherwise, and an idle iteration waits up to 25 ms
+			// (ReadHeaderTimeout > 0), 50 ms (a detached conn) or 100 ms
+			// (baseTimeout), so without ReadHeaderTimeout the sweeps are
+			// about 100 s apart, as they already are for a conn whose SEND is
+			// outstanding and which is not listed (any sync conn).
 			if cs.needsRecv && !cs.recvPaused && !cs.recvArmed {
 				w.beginRecvStall(cs)
 			}
@@ -6691,7 +6694,11 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 }
 
 // checkTimeouts scans active connections and closes any that have exceeded
-// their configured timeout. Called every 1024 iterations (~100ms). This
+// their configured timeout. The loop calls it every 32 iterations when
+// ReadHeaderTimeout > 0 or a conn is detached, every 1024 otherwise; an idle
+// iteration waits up to 25 / 50 / 100 ms (baseTimeout), so the gap is about
+// 0.8 s, 1.6 s or 102 s on an idle worker, and unbounded while the worker waits
+// without a timeout for a SEND's completion (waitUntimed). This
 // replaces the timer wheel: instead of allocating entries and updating maps
 // on every recv/send, we store a single lastActivity timestamp on the
 // connState and scan here.
