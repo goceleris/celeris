@@ -875,7 +875,8 @@ func (s *Server) PauseAccept() error {
 // [observe.EngineMetrics].ErrorListenerRecreate and stops; ResumeAccept has
 // returned nil by then, and the server keeps running without that listener. A
 // non-zero ErrorListenerRecreate means lost accept capacity, not a transient.
-// A port 0 address on epoll or io_uring cannot be taken, as the engine holds it.
+// A port 0 address on epoll or io_uring is held by the engine, so no socket without
+// SO_REUSEPORT can take it in between.
 func (s *Server) ResumeAccept() error {
 	eng := s.loadEngine()
 	if eng == nil {
