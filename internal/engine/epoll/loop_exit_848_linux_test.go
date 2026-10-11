@@ -148,7 +148,7 @@ func TestSyncHandlerGoexitEndsOneLoopLoudly848(t *testing.T) {
 		ids   []string
 		boom  = -1
 	)
-	for i := 0; i < 128 && (i < 6 || ((boom < 0 || allSame848(ids)) && !(i >= 24 && allSame848(ids)))); i++ {
+	for i := 0; i < 128 && moreConns848(i, boom, ids); i++ {
 		c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
 		if err != nil {
 			t.Fatal(err)
@@ -338,6 +338,21 @@ func TestSyncLoopPanicIsRecordedBeforeTheCrash848(t *testing.T) {
 	if rec < 0 || rec > pan {
 		t.Fatalf("celeris#848: no loop-exit record before the panic message (record at %d, panic at %d):\n%.3000s", rec, pan, text)
 	}
+}
+
+// moreConns848 reports whether the dial loop wants conn number i: at least 6,
+// then until one conn sits on an id other than 0 (boom) and conns sit on more
+// than one id (the survivors can be checked), and not past 24 conns that all
+// share one id (a single loop or worker).
+func moreConns848(i, boom int, ids []string) bool {
+	if i < 6 {
+		return true
+	}
+	same := allSame848(ids)
+	if same && i >= 24 {
+		return false
+	}
+	return boom < 0 || same
 }
 
 func allSame848(ids []string) bool {
