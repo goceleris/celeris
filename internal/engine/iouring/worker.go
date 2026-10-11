@@ -523,8 +523,9 @@ type Worker struct {
 	// sendWatch is set when the dirty pass gives up a conn whose SEND is
 	// outstanding (celeris#811) and re-derived by every timeout sweep (set
 	// while a conn has a SEND or SEND_ZC notification outstanding). While it is
-	// set the loop also sweeps once lastSweep (UnixNano of the last sweep) is a
-	// second old, checked on every 8th iteration (sweepWatchDue): a parked
+	// set the loop also sweeps about every 1 to 2 s (once lastSweep, UnixNano of
+	// the last sweep, is a second old, checked on every 8th iteration;
+	// sweepWatchDue): a parked
 	// worker's iterations are up to 100 ms apart, so the gate of 32 or 1024
 	// iterations alone is seconds to minutes, and the spin that used to
 	// reach it is gone. Worker-owned.
@@ -6285,7 +6286,8 @@ func (w *Worker) flushDirty() {
 			// (baseTimeout): without ReadHeaderTimeout the sweeps would be
 			// about 100 s apart, where the spin used to sweep within
 			// milliseconds. So the give-up sets sendWatch, which makes the
-			// loop sweep once a second (sweepWatchDue) for as long as a
+			// loop sweep about every 1 to 2 s (checked on every 8th iteration;
+			// sweepWatchDue) for as long as a
 			// conn has a SEND outstanding.
 			if cs.needsRecv && !cs.recvPaused && !cs.recvArmed {
 				w.beginRecvStall(cs)
@@ -6726,7 +6728,8 @@ func (w *Worker) sweepWatchDue() bool {
 // ReadHeaderTimeout > 0 or a conn is detached, every 1024 otherwise; an idle
 // iteration waits up to 25 / 50 / 100 ms (baseTimeout), so the gap is about
 // 0.8 s, 1.6 s or 102 s on an idle worker; with sendWatch set (sweepWatchDue)
-// it also runs once a second. None of it runs while the worker waits without a
+// it also runs about every 1 to 2 s (checked on every 8th iteration). None
+// of it runs while the worker waits without a
 // timeout for a SEND's completion (waitUntimed). This
 // replaces the timer wheel: instead of allocating entries and updating maps
 // on every recv/send, we store a single lastActivity timestamp on the

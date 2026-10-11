@@ -285,7 +285,7 @@ jobs:
       # 335.8 s with celeris#811's tests: PR #994 at 5adaf15, of 420 s, a
       # margin of 25%), so 300 s left a margin of under 10%; a slower runner or
       # the next test added would have ended in a timeout panic instead of a
-      # result. 480 s is a 40% margin over the 335.8 s.
+      # result. 480 s is a 43% margin over the 335.8 s.
       - name: internal/engine/iouring — race tests at the runner's memlock (every skip accounted for)
         if: ${{ !cancelled() }}
         shell: bash

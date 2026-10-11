@@ -9,7 +9,7 @@ import (
 
 // TestIouringDirtyPassGiveUpSetsTheSendWatch811: the give-up leaves a parked
 // worker with no spin to reach its timeout sweep, so it sets sendWatch; the
-// loop then sweeps once the last sweep is a second old (on an 8th iteration),
+// loop then sweeps about every 1 to 2 s (checked on every 8th iteration),
 // and a sweep that finds no conn with a SEND outstanding ends the watch.
 func TestIouringDirtyPassGiveUpSetsTheSendWatch811(t *testing.T) {
 	const tail = "the rest of response 1"

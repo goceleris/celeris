@@ -42,8 +42,9 @@ func (h *sizedHandler811) HasAsyncRoutes() bool        { return h.async }
 // flight, which the worker used to spin through and now waits through; the
 // small async size never reaches the ring. A sync conn is listed only when the
 // SQ ring is full, so the sync arms are a second A/A (see ring_frac below).
-// ns/op is the request round trip; MB/s the goodput. The A/B script (evidence/lanes-20261009/E14/ab.sh) runs it against
-// the base and the fix with an A/A floor.
+// ns/op is the request round trip; MB/s the goodput. The A/B method is an
+// interleaved base/fix/base2 A/B, with base2 an A/A copy of the base, and the
+// exact counters iters_per_op, cqes_per_op and giveups_per_op.
 func BenchmarkResponseSize811(b *testing.B) {
 	for _, async := range []bool{false, true} {
 		mode := "sync"

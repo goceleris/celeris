@@ -21,8 +21,8 @@ import (
 // spin reached the gate every few microseconds, so main enforced WriteTimeout
 // on a stalled async conn within about a second whatever ReadHeaderTimeout
 // was; parked, it would reach it 100 s later with ReadHeaderTimeout off, so
-// the give-up sets sendWatch and the loop sweeps once a second while a SEND is
-// outstanding (sweepWatchDue).
+// the give-up sets sendWatch and the loop sweeps about every 1 to 2 s
+// (checked on every 8th iteration) while a SEND is outstanding (sweepWatchDue).
 //
 // A worker that waits for a SEND's completion with no timeout (waitUntimed,
 // mode 3a: the last thing it submitted is a remainder SEND to a client that
