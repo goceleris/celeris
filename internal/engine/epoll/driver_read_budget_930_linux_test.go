@@ -425,7 +425,7 @@ func TestAnHTTPConnOnALoopWithAFloodingDriverConnIsServed930(t *testing.T) {
 // its EPOLLOUT.
 func TestAFloodedDriverConnWithEPOLLOUTArmedKeepsItsFlushAndOneTurnPerRound930(t *testing.T) {
 	eng, stop := newTestEngine(t)
-	defer stop()
+	t.Cleanup(stop) // runs after f.close below: the engine cannot stop while a flood holds its loop
 	wl := eng.WorkerLoop(0)
 	var aReads atomic.Int64
 	f := c930FloodCounting(t, wl, 100*time.Microsecond, &aReads)
