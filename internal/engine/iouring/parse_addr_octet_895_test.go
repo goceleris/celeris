@@ -15,6 +15,13 @@ func TestParseAddrRejectsABadByte895(t *testing.T) {
 			t.Errorf("parseAddr(%q) = %v, want an error", addr, sa)
 		}
 	}
+	// A host that is not four bytes bound a padded address ("1.2.3" bound
+	// 1.2.3.0, "10" bound 10.0.0.0, "1..2.3" bound 1.0.2.3).
+	for _, addr := range []string{"1.2.3:80", "10:80", ".1.2.3:80", "1..2.3:80", "1.2.3.:80", "1.2.3.4.:80", "...:80"} {
+		if sa, err := parseAddr(addr); err == nil {
+			t.Errorf("parseAddr(%q) = %v, want an error", addr, sa)
+		}
+	}
 	for _, addr := range []string{"1.2.3.4:80", "255.255.255.255:0", "0.0.0.0:0", ":80", "10.0.0.1:0"} {
 		if _, err := parseAddr(addr); err != nil {
 			t.Errorf("parseAddr(%q): %v", addr, err)

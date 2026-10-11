@@ -57,7 +57,9 @@ func newPort0Engine895(t *testing.T, workers int) *Engine {
 // TestPort0IsHeldBetweenBeingChosenAndBeingBound895: while the hold is held
 // (the hook runs before any worker is created) a plain net.Listen on the chosen
 // address is refused, so nothing but the engine's own sockets can take it; and
-// once Listen is serving, the hold is gone and the workers hold the port alone.
+// while Listen is serving the hold stays beside the workers' sockets (it keeps
+// the port through a pause, TestPort0PausedPortCannotBeTaken895), and Listen
+// gives it back as it returns.
 func TestPort0IsHeldBetweenBeingChosenAndBeingBound895(t *testing.T) {
 	var hookErr atomic.Value
 	var chosen atomic.Value
@@ -90,8 +92,18 @@ func TestPort0IsHeldBetweenBeingChosenAndBeingBound895(t *testing.T) {
 		t.Fatalf("Addr() = %s, but the port chosen before the workers bound was %s", got, addr)
 	}
 	port := portOf895(t, r.e.Addr())
-	if n := census895(t).bound[port]; n != workers {
-		t.Fatalf("%d sockets bound to port %d with the engine serving, want %d (one per worker, no hold)", n, port, workers)
+	c := census895(t)
+	if n := c.listening[port]; n != workers {
+		t.Fatalf("%d sockets listen on port %d with the engine serving, want %d (one per worker)", n, port, workers)
+	}
+	if n := c.bound[port]; n != workers+1 {
+		t.Fatalf("%d sockets bound to port %d with the engine serving, want %d (one per worker and the hold)", n, port, workers+1)
+	}
+	if err := r.stop(t); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	if n := census895(t).bound[port]; n != 0 {
+		t.Fatalf("%d sockets still bound to port %d after Listen returned, want 0 (the hold included)", n, port)
 	}
 }
 

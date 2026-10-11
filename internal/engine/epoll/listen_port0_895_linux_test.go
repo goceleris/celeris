@@ -4,6 +4,7 @@ package epoll
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -110,6 +111,21 @@ type run895 struct {
 	done   chan error
 }
 
+// stop cancels Listen's context and waits for Listen to return, leaving its
+// result in done for the t.Cleanup that waits again.
+func (r *run895) stop(t *testing.T) error {
+	t.Helper()
+	r.cancel()
+	select {
+	case err := <-r.done:
+		r.done <- err
+		return err
+	case <-time.After(30 * time.Second):
+		t.Fatal("Listen did not return within 30 s of its context being cancelled")
+		return nil
+	}
+}
+
 // start895 starts an epoll engine with the given loop count on addr and waits
 // for its address. disableDefer makes a pause close at once.
 func start895(t *testing.T, addr string, loops int, disableDefer bool) *run895 {
@@ -194,8 +210,8 @@ func TestPort0EveryLoopBindsTheSamePort895(t *testing.T) {
 			if n := c.listening[addrPort]; n != loops {
 				t.Fatalf("%d listen sockets on port %d, want one per loop (%d)", n, addrPort, loops)
 			}
-			if n := c.bound[addrPort]; n != loops {
-				t.Fatalf("%d sockets bound to port %d, want %d: a port hold outlived the start", n, addrPort, loops)
+			if n := c.bound[addrPort]; n != loops+1 {
+				t.Fatalf("%d sockets bound to port %d, want %d: one per loop and the engine's port 0 hold", n, addrPort, loops+1)
 			}
 			get895(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(addrPort)))
 		})
@@ -241,6 +257,57 @@ func TestPort0ResumeKeepsThePort895(t *testing.T) {
 			get895(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(addrPort)))
 		})
 	}
+}
+
+// TestPort0PausedPortCannotBeTaken895: once every loop has paused nothing
+// listens on the port, and the resume binds that port again, so a socket of
+// anyone else that took it in between would leave the loop without a listener
+// for good. The engine's hold keeps the port until Listen returns: a plain
+// listener (net.Listen: SO_REUSEADDR, no SO_REUSEPORT) is refused while the
+// engine is paused, the resume brings every loop back, and the port is free
+// once Listen has returned.
+func TestPort0PausedPortCannotBeTaken895(t *testing.T) {
+	const loops = 3
+	r := start895(t, "127.0.0.1:0", loops, true)
+	addrPort := portOf895(t, r.e.Addr())
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(addrPort))
+	if err := r.e.PauseAccept(); err != nil {
+		t.Fatalf("PauseAccept: %v", err)
+	}
+	if n := census895(t).listening[addrPort]; n != 0 {
+		t.Fatalf("%d listen sockets on port %d after PauseAccept, want 0", n, addrPort)
+	}
+	if ln, err := net.Listen("tcp", addr); err == nil {
+		_ = ln.Close()
+		t.Fatalf("a plain net.Listen on %s succeeded while every loop was paused: "+
+			"the port was free for anyone to take before the resume re-bound it", addr)
+	} else if !errors.Is(err, unix.EADDRINUSE) {
+		t.Fatalf("net.Listen on %s while paused: %v, want EADDRINUSE", addr, err)
+	}
+	if err := r.e.ResumeAccept(); err != nil {
+		t.Fatalf("ResumeAccept: %v", err)
+	}
+	var c sockets895
+	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(5 * time.Millisecond) {
+		if c = census895(t); c.listening[addrPort] >= loops {
+			break
+		}
+	}
+	if n := c.listening[addrPort]; n != loops {
+		t.Fatalf("%d listen sockets on port %d after ResumeAccept, want %d", n, addrPort, loops)
+	}
+	get895(t, addr)
+	if err := r.stop(t); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	if n := census895(t).bound[addrPort]; n != 0 {
+		t.Fatalf("%d sockets still bound to port %d after Listen returned, want 0 (the hold included)", n, addrPort)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("net.Listen on %s after Listen returned: %v", addr, err)
+	}
+	_ = ln.Close()
 }
 
 // TestFixedPortIsBoundAsGivenControl895: the control for the two above. A
