@@ -2,11 +2,7 @@
 
 package memcached
 
-import (
-	"syscall"
-
-	"github.com/goceleris/celeris/driver/internal/eventloop"
-)
+import "syscall"
 
 // The raw-descriptor operations of the unix transport. conn.go calls them
 // where it used to call syscall directly; each one is a single call, so the
@@ -17,15 +13,10 @@ import (
 func peekFD(fd uintptr) int { return int(fd) }
 
 // recvNoWait reads whatever the kernel already holds for fd without blocking.
-func recvNoWait(fd int, p []byte) (int, syscall.Sockaddr, error) {
-	return syscall.Recvfrom(fd, p, syscall.MSG_DONTWAIT)
+func recvNoWait(fd int, p []byte) (int, error) {
+	n, _, err := syscall.Recvfrom(fd, p, syscall.MSG_DONTWAIT)
+	return n, err
 }
 
-// closeRawFD closes a descriptor the conn owns outside an *os.File. A conn
-// the loop adopted as a net.Conn has none (the loop closes it).
-func closeRawFD(fd int) {
-	if eventloop.IsNetConnID(fd) {
-		return
-	}
-	_ = syscall.Close(fd)
-}
+// closeRawFD closes a descriptor the conn owns outside an *os.File.
+func closeRawFD(fd int) { _ = syscall.Close(fd) }

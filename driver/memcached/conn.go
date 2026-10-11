@@ -627,7 +627,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
+			if n, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -675,7 +675,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
+			if n, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
@@ -724,7 +724,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 
 	for !req.finished.Load() {
 		if c.tcpFd > 0 {
-			if n, _, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
+			if n, perr := recvNoWait(c.tcpFd, c.syncBuf); n > 0 {
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
