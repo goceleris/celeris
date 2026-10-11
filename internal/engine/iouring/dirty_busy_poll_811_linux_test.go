@@ -59,8 +59,8 @@ const (
 	// busy811Settle after the last request was sent, when every SEND is in
 	// flight and nothing can progress.
 	busy811SndBuf = 64 << 10
-	busy811Window = 3 * time.Second
-	busy811Settle = 600 * time.Millisecond
+	busy811Window = 2 * time.Second
+	busy811Settle = 500 * time.Millisecond
 	// busy811Budget is the CPU a worker may use in the window while nothing
 	// can progress, as a fraction of one core. A worker that parks measures
 	// 0.5% to 3% (a timed wait wakes it every 25-100 ms); one that spins, 37%
@@ -255,7 +255,7 @@ func TestIouringStalledAsyncSendDoesNotBusyPoll811(t *testing.T) {
 	// The idle baseline: the same process, the engine up, nothing connected. A
 	// red run is read against it.
 	i0, it0 := cpu811(t), time.Now()
-	time.Sleep(time.Second)
+	time.Sleep(500 * time.Millisecond)
 	t.Logf("celeris811 IDLE window_ms=%d cpu_ms=%.1f", time.Since(it0).Milliseconds(), float64(cpu811(t)-i0)/1e6)
 
 	for _, pipelined := range []bool{false, true} {

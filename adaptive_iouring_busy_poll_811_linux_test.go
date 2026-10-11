@@ -31,8 +31,8 @@ import (
 const (
 	busyConns811  = 4
 	busyBody811   = 3 << 20
-	busyWindow811 = 3 * time.Second
-	busySettle811 = 900 * time.Millisecond
+	busyWindow811 = 2 * time.Second
+	busySettle811 = 600 * time.Millisecond
 	busyBudget811 = 0.10
 )
 
