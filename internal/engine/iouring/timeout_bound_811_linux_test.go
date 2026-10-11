@@ -104,15 +104,19 @@ func TestIouringWriteTimeoutBoundOfAStalledSend811(t *testing.T) {
 				}
 			}
 			var gone time.Duration
+			var cpu5 time.Duration
 			for time.Since(t0) < wait {
 				time.Sleep(20 * time.Millisecond)
+				if cpu5 == 0 && time.Since(t0) >= 5*time.Second {
+					cpu5 = cpu811(t) - c0 // a spin that ends at WriteTimeout (1 s) has spent its CPU by now
+				}
 				if e.Metrics().ActiveConnections == 0 {
 					gone = time.Since(t0)
 					break
 				}
 			}
-			t.Logf("celeris811 WRITETIMEOUT arm=%s conns=%d write_timeout_ms=1000 gone_ms=%d (0: still open after %d ms) cpu_frac=%.3f",
-				tc.name, conns, gone.Milliseconds(), wait.Milliseconds(), float64(cpu811(t)-c0)/float64(time.Since(t0)))
+			t.Logf("celeris811 WRITETIMEOUT arm=%s conns=%d write_timeout_ms=1000 gone_ms=%d (0: still open after %d ms) cpu_ms_at_5s=%.1f cpu_frac=%.3f",
+				tc.name, conns, gone.Milliseconds(), wait.Milliseconds(), float64(cpu5)/1e6, float64(cpu811(t)-c0)/float64(time.Since(t0)))
 			if tc.assert && (gone == 0 || gone > asserted) {
 				t.Errorf("celeris#811: %d conns whose clients do not read, WriteTimeout 1 s, were not all torn down within %v "+
 					"(gone_ms=%d, 0 = still open): the parked worker's sweep must still run in time", conns, asserted, gone.Milliseconds())
