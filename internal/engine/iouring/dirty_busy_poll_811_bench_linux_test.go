@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,6 +144,17 @@ func BenchmarkResponseSize811(b *testing.B) {
 				// give it one.
 				b.StopTimer()
 				time.Sleep(200 * time.Millisecond)
+				// cqes_per_op: the CQEs the kernel posted to the workers' CQ
+				// rings (the cumulative tail, read while the rings are still
+				// mapped, i.e. before the engine stops; the worker is idle
+				// after the sleep) per request: a count, not a time.
+				var cqes uint64
+				for _, w := range e.workers {
+					if w.ring != nil {
+						cqes += uint64(atomic.LoadUint32((*uint32)(w.ring.cqTail)))
+					}
+				}
+				b.ReportMetric(float64(cqes)/float64(b.N+21), "cqes_per_op")
 				b.ReportMetric(float64(e.Metrics().RingBytes)/(float64(b.N+21)*float64(size)), "ring_frac")
 				// iters_per_op: the run loops' iterations (iterCount, summed
 				// over the workers, read once Listen has returned and the
