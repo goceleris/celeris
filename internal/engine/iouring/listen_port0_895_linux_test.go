@@ -116,14 +116,16 @@ type run895 struct {
 	done   chan error
 }
 
-// start895 starts an io_uring engine with the given worker count on addr and
-// waits for its address, retrying a start that fails only on ring ENOMEM
+// start895 starts an io_uring engine, asking for the given worker count, on
+// addr and waits for its address. The test skips (fails under
+// CELERIS_REQUIRE_IOURING_WORKERS=1) when memlock funds fewer than need
+// workers; a request above what is funded is capped by the engine. Retrying a start that fails only on ring ENOMEM
 // (ring_budget_linux_test.go). disableDefer makes a pause close at once.
-func start895(t *testing.T, addr string, workers int, disableDefer bool) *run895 {
+func start895(t *testing.T, addr string, workers, need int, disableDefer bool) *run895 {
 	t.Helper()
-	if maxW := MaxWorkersForMemlock(); maxW >= 0 && maxW < workers {
+	if maxW := MaxWorkersForMemlock(); maxW >= 0 && maxW < need {
 		skipOrFail656(t, "RLIMIT_MEMLOCK funds %d io_uring workers, the test needs %d "+
-			"(raise it: `ulimit -l unlimited`, or run as root)", maxW, workers)
+			"(raise it: `ulimit -l unlimited`, or run as root)", maxW, need)
 	}
 	var run *run895
 	_, _, err := retryRingENOMEM(func() error {
@@ -197,7 +199,7 @@ func TestPort0EveryWorkerBindsTheSamePort895(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const workers = 4
-			r := start895(t, tc.addr, workers, false)
+			r := start895(t, tc.addr, workers, workers, false)
 			addrPort := portOf895(t, r.e.Addr())
 			c := census895(t)
 			t.Logf("Addr() = %s; LISTEN sockets by port: %v", r.e.Addr(), c.listening)
@@ -220,7 +222,7 @@ func TestPort0EveryWorkerBindsTheSamePort895(t *testing.T) {
 // reported, not on a new ephemeral one each. Two workers are requested: one
 // is funded at 8 MiB, which is enough for this defect.
 func TestPort0ResumeKeepsThePort895(t *testing.T) {
-	r := start895(t, "127.0.0.1:0", 2, true)
+	r := start895(t, "127.0.0.1:0", 2, 1, true)
 	r.e.mu.Lock()
 	workers := len(r.e.workers)
 	r.e.mu.Unlock()
@@ -261,7 +263,7 @@ func TestPort0ResumeKeepsThePort895(t *testing.T) {
 func TestFixedPortIsBoundAsGivenControl895(t *testing.T) {
 	addr := freeAddr639(t)
 	const workers = 2
-	r := start895(t, addr, workers, false)
+	r := start895(t, addr, workers, 1, false)
 	r.e.mu.Lock()
 	n := len(r.e.workers)
 	r.e.mu.Unlock()
