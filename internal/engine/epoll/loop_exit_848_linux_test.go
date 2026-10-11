@@ -148,7 +148,7 @@ func TestSyncHandlerGoexitEndsOneLoopLoudly848(t *testing.T) {
 		ids   []string
 		boom  = -1
 	)
-	for i := 0; i < 128 && (i < 6 || (boom < 0 && !(i >= 24 && allSame848(ids)))); i++ {
+	for i := 0; i < 128 && (i < 6 || ((boom < 0 || allSame848(ids)) && !(i >= 24 && allSame848(ids)))); i++ {
 		c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
 		if err != nil {
 			t.Fatal(err)
@@ -170,7 +170,7 @@ func TestSyncHandlerGoexitEndsOneLoopLoudly848(t *testing.T) {
 	}
 	vacuous := boom < 0
 	if vacuous {
-		t.Fatalf("PREMISE: 128 conns on two loops all landed on loop 0 (ids %v)", ids)
+		t.Fatalf("PREMISE: %d conns on two loops all landed on loop 0 (ids %v)", len(ids), ids)
 	}
 	_, _ = conns[boom].Write([]byte("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"))
 	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && e.abnormalLoopExits.Load() == 0; time.Sleep(5 * time.Millisecond) {
@@ -192,7 +192,7 @@ func TestSyncHandlerGoexitEndsOneLoopLoudly848(t *testing.T) {
 		}
 	}
 	stop848(t, cancel, done)
-	t.Logf("celeris848 RESULT engine-epoll loop=%s id_check_vacuous=%v other_loops_answered=%d/%d counted=%d", ids[boom], vacuous, otherAnswered, others, e.abnormalLoopExits.Load())
+	t.Logf("celeris848 RESULT engine-epoll loop=%s id_check_vacuous=%v other_loops_answered=%d/%d counted=%d", strings.TrimPrefix(ids[boom], "w="), vacuous, otherAnswered, others, e.abnormalLoopExits.Load())
 	if !vacuous && others == 0 {
 		t.Errorf("PREMISE: no conn on another loop than %s", ids[boom])
 	}
@@ -306,7 +306,7 @@ const panicChildEnv848 = "CELERIS_848_PANIC_CHILD"
 // panic unwinds, so the #848 record is written before the runtime prints the
 // panic and exits. The child runs the engine and takes the panic; the parent
 // judges the child's output (exit status, and the record before the panic).
-func TestSyncHandlerPanicIsRecordedBeforeTheCrash848(t *testing.T) {
+func TestSyncLoopPanicIsRecordedBeforeTheCrash848(t *testing.T) {
 	if os.Getenv(panicChildEnv848) == "1" {
 		e, _, _, _ := start848(t, "127.0.0.1:0", 2, false)
 		c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
@@ -322,7 +322,7 @@ func TestSyncHandlerPanicIsRecordedBeforeTheCrash848(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	cmd := exec.Command(exe, "-test.run=^TestSyncHandlerPanicIsRecordedBeforeTheCrash848$", "-test.v", "-test.count=1", "-test.timeout=60s")
+	cmd := exec.Command(exe, "-test.run=^TestSyncLoopPanicIsRecordedBeforeTheCrash848$", "-test.v", "-test.count=1", "-test.timeout=60s")
 	cmd.Env = append(os.Environ(), panicChildEnv848+"=1")
 	out, err := cmd.CombinedOutput()
 	text := string(out)

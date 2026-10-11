@@ -295,17 +295,18 @@ type Config struct {
 	// during the call (on epoll and io_uring, views of the receive buffer; see the
 	// package doc): copy one with [strings.Clone] before anything keeps it.
 	//
-	// The callback runs on the event-loop goroutine on the native engines, even
-	// for an [Route.Async] route, so it must not call runtime.Goexit: that ends
-	// the loop for good and the engine only logs an Error (see [Route.Sync]).
-	// A panic in it is recovered and counts as a rejection.
+	// On the native engines the callback runs on the event-loop goroutine,
+	// except on a connection already promoted to async dispatch, where it runs
+	// on that connection's goroutine. It must not call runtime.Goexit: on the
+	// loop that ends the loop for good, and the engine only logs an Error (see
+	// [Route.Sync]). A panic in it is recovered and counts as a rejection.
 	OnExpectContinue func(method, path string, headers [][2]string) bool
 
 	// OnConnect is called when a new connection is accepted. The addr is the
 	// remote peer address. Must be fast — blocks the event loop.
 	//
-	// It runs on the event-loop goroutine on the native engines, even for an
-	// [Route.Async] route, so it must not call runtime.Goexit: that ends the
+	// It runs on the event-loop goroutine on the native engines, even for
+	// connections of an [Route.Async] route, so it must not call runtime.Goexit: that ends the
 	// loop for good and the engine only logs an Error (see [Route.Sync]). A
 	// panic in it is not recovered and ends the process.
 	OnConnect func(addr string)
