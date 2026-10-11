@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,13 +62,58 @@ func TestDetachedWritesSetNoDeadlinePerWrite855(t *testing.T) {
 	rw.streamEnded()
 }
 
-// What every request pays for the detach support is one pointer in the
-// response writer: 32 bytes, the size class above main's 24, not 48.
+// What every request pays for the detach support is nothing: the response
+// writer is the size it was on main ({w, flushed}, the 24-byte class), so a
+// request that never detaches allocates no more than it did (the round-2
+// review found it had grown to the 48-byte class). The engine pointer takes the
+// place of the flushed flag, which is kept on the stream (headersSent).
 func TestStdResponseWriterSize855(t *testing.T) {
-	if sz := unsafe.Sizeof(stdResponseWriter{}); sz > 32 {
-		t.Fatalf("stdResponseWriter is %d bytes, want at most 32 (every request allocates one)", sz)
+	type mainWriter struct { // stdResponseWriter on main, before celeris#855
+		w       http.ResponseWriter
+		flushed bool
+	}
+	if got, want := unsafe.Sizeof(stdResponseWriter{}), unsafe.Sizeof(mainWriter{}); got != want {
+		t.Fatalf("stdResponseWriter is %d bytes, want %d as on main (every request allocates one)", got, want)
 	}
 }
+
+// The bridge answers for a handler that wrote nothing (200) or failed before
+// it wrote anything (500), and leaves a response alone once its headers are
+// out: the "flushed" state that decides it lives on the stream.
+func TestBridgeFlushedState855(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		h        func(s *stream.Stream) error
+		wantCode int
+		wantBody string
+	}{
+		{"nothing written, handler ok", func(*stream.Stream) error { return nil }, 200, ""},
+		{"nothing written, handler failed", func(*stream.Stream) error { return errors.New("boom") }, 500, "handler error\n"},
+		{"headers written, handler failed", func(s *stream.Stream) error {
+			_ = s.ResponseWriter.(stream.Streamer).WriteHeader(s, 202, nil)
+			return errors.New("boom")
+		}, 202, ""},
+		{"response written, handler failed", func(s *stream.Stream) error {
+			_ = s.ResponseWriter.WriteResponse(s, 201, nil, []byte("hi"))
+			return errors.New("boom")
+		}, 201, "hi"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, cancel := engine855(time.Second)
+			defer cancel()
+			br := &Bridge{engine: e, handler: streamFunc855(tc.h)}
+			rec := httptest.NewRecorder()
+			br.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+			if rec.Code != tc.wantCode || rec.Body.String() != tc.wantBody {
+				t.Fatalf("answered %d %q, want %d %q", rec.Code, rec.Body.String(), tc.wantCode, tc.wantBody)
+			}
+		})
+	}
+}
+
+type streamFunc855 func(s *stream.Stream) error
+
+func (f streamFunc855) HandleStream(_ context.Context, s *stream.Stream) error { return f(s) }
 
 // parkedWrite855 starts a write that the fake parks until a deadline in the
 // past is set on it, and returns when it has been cut, with how long it was
@@ -191,6 +237,126 @@ func TestDetachedPokeDuringAWriteSticks855(t *testing.T) {
 	w.mu.Unlock()
 	if last != "past" {
 		t.Fatalf("the stream ended with a %s write deadline after a poke, want past", last)
+	}
+}
+
+// pastSets855 counts the deadlines in the past that were set on w, from its
+// events (they are consumed).
+func pastSets855(w *dlWriter855) int {
+	n := 0
+	for _, ev := range w.take() {
+		if ev == "w:past" {
+			n++
+		}
+	}
+	return n
+}
+
+// A stream is cut once: when the watchdog has cut it, Shutdown's budget running
+// out, the writes that follow and the end of the request set no deadline
+// again. On h2c each deadline in the past is a message to the connection's
+// serve goroutine that queues an RST_STREAM for the stream, so a second one
+// is a second reset of a stream that is already closing.
+func TestDetachedCutIsOnce855(t *testing.T) {
+	const wt = 60 * time.Millisecond
+	e, cancel := engine855(wt)
+	defer cancel()
+	w := newDLWriter855()
+	rw := &stdResponseWriter{w: w, eng: e}
+	rw.StreamDetached()
+	w.take()
+	if _, err := parkedWrite855(rw, w); err == nil {
+		t.Fatal("a write parked for WriteTimeout was not cut")
+	}
+	cancel() // the budget runs out after the cut; the poke runs on its own goroutine
+	time.Sleep(100 * time.Millisecond)
+	for range 20 {
+		if err := rw.Write(nil, []byte("x")); err == nil {
+			t.Fatal("a write after the cut succeeded")
+		}
+		_ = rw.Flush(nil)
+	}
+	rw.streamEnded()
+	if n := pastSets855(w); n != 1 {
+		t.Fatalf("%d deadlines in the past were set on a stream cut once, want 1", n)
+	}
+}
+
+// A poke is no more than one cut either, however many pokes there are.
+func TestDetachedPokeIsOnce855(t *testing.T) {
+	e, cancel := engine855(time.Second)
+	defer cancel()
+	w := newDLWriter855()
+	rw := &stdResponseWriter{w: w, eng: e}
+	rw.StreamDetached()
+	w.take()
+	cancel()
+	waitFor855(t, func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return kind855(w.writeDL) == "past"
+	})
+	d := rw.w.(*detachedWriter).d
+	d.poke()
+	d.poke()
+	if err := rw.Write(nil, []byte("x")); err == nil {
+		t.Fatal("a write after the poke succeeded")
+	}
+	rw.streamEnded()
+	if n := pastSets855(w); n != 1 {
+		t.Fatalf("%d deadlines in the past were set after one budget, want 1", n)
+	}
+}
+
+// Context.Detach is public: a user may write to the stream from two
+// goroutines. The bookkeeping holds (run under -race): two writers that are
+// busy are never cut, and when both are parked they are both cut, by one
+// deadline in the past, and the writes after fail without setting another.
+func TestDetachedTwoWritersShareOneBound855(t *testing.T) {
+	const wt = 80 * time.Millisecond
+	e, cancel := engine855(wt)
+	defer cancel()
+	w := newDLWriter855()
+	rw := &stdResponseWriter{w: w, eng: e}
+	rw.StreamDetached()
+	defer rw.streamEnded()
+	w.take()
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	var failed atomic.Int32
+	writer := func() {
+		defer wg.Done()
+		for !stop.Load() {
+			if err := rw.Write(nil, []byte("x")); err != nil {
+				failed.Add(1)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	wg.Add(2)
+	go writer()
+	go writer()
+	time.Sleep(8 * wt) // busy for eight WriteTimeouts
+	if n := failed.Load(); n != 0 {
+		stop.Store(true)
+		wg.Wait()
+		t.Fatalf("%d of two busy writers failed", n)
+	}
+	w.park.Store(true) // the client stops reading: both writers park
+	start := time.Now()
+	wg.Wait()
+	if took := time.Since(start); took > 3*wt {
+		t.Fatalf("two parked writers were cut after %v, want about %v", took, wt)
+	}
+	if n := failed.Load(); n != 2 {
+		t.Fatalf("%d of two parked writers were cut", n)
+	}
+	if err := rw.Write(nil, []byte("x")); err == nil {
+		t.Fatal("a write after the cut succeeded")
+	}
+	if n := pastSets855(w); n != 1 {
+		t.Fatalf("%d deadlines in the past were set for two parked writers, want 1", n)
 	}
 }
 

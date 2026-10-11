@@ -58,6 +58,8 @@ type stalledSSE855 struct {
 	// hret and disc are the UnixNano at which the user's handler returned
 	// and OnDisconnect ran, 0 until they have.
 	hret, disc atomic.Int64
+	// sendErr is the UnixNano at which a Send of the handler first failed.
+	sendErr atomic.Int64
 	conn       net.Conn
 	cl         *http.Client
 	resp       *http.Response
@@ -94,6 +96,7 @@ func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Durat
 					return
 				}
 				if err := cl.Send(sse.Event{Data: payload}); err != nil {
+					st.sendErr.CompareAndSwap(0, time.Now().UnixNano())
 					return
 				}
 			}
@@ -257,6 +260,59 @@ func TestStalledSSEEndsWithShutdown855(t *testing.T) {
 	}
 }
 
+// TestStalledSSESendFailsAtWriteTimeoutStd855 is the regression test for the
+// two majors of the first review of celeris#998: a client that connects and
+// reads nothing, WriteTimeout 1 s. The handler (it never ends of its own
+// accord) is parked in Send's write; that Send fails within about 2 s of the
+// connect (the socket buffers fill in well under a second, then the write
+// makes no progress for WriteTimeout), and Shutdown with a 5 s budget returns,
+// with Start, at once: nothing is left to wait for. On h1 and on h2c. The
+// stream is not cut at a fixed lifetime, only for want of progress:
+// TestSSEStaysOpenPastServerTimeouts855 holds one that is read for 4.5 s.
+func TestStalledSSESendFailsAtWriteTimeoutStd855(t *testing.T) {
+	for _, h2c := range []bool{false, true} {
+		name := "h1"
+		if h2c {
+			name = "h2c"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			connect := time.Now()
+			st := stallBegin855(t, celeris.Std, time.Second, 5*time.Second, shapeTight855, h2c, 0)
+			deadline := time.Now().Add(10 * time.Second)
+			for st.sendErr.Load() == 0 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if st.sendErr.Load() == 0 {
+				t.Fatal("Send has not failed 10 s after a client that reads nothing connected (WriteTimeout 1 s)")
+			}
+			after := time.Duration(st.sendErr.Load() - connect.UnixNano())
+			t.Logf("STALL855 cell=std/%s sendFailedAfter=%v (WriteTimeout 1s)", name, after.Round(10*time.Millisecond))
+			if after > 2500*time.Millisecond {
+				t.Fatalf("Send failed %v after the connect, want within about 2 s (WriteTimeout 1 s)", after)
+			}
+			sd := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := st.s.Shutdown(ctx); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+			select {
+			case err := <-st.startDone:
+				t.Logf("STALL855 cell=std/%s shutdownTook=%v startErr=%v", name, time.Since(sd).Round(time.Millisecond), err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("Start has not returned after Shutdown")
+			}
+			if st.hret.Load() == 0 || st.disc.Load() == 0 {
+				t.Fatal("the stalled stream's handler had not returned or OnDisconnect had not run when Start returned")
+			}
+			if took := time.Since(sd); took > 3*time.Second {
+				t.Fatalf("Shutdown took %v with nothing running, budget 5 s", took)
+			}
+		})
+	}
+}
+
 // TestStalledSSEEndsWhenItsHandlerIsBounded855: a client that reads nothing,
 // WriteTimeout 2 s, a handler that returns after 3 s (or, for closepolicy, a
 // queue of 4 that closes the client when it is full). OnDisconnect has run
@@ -290,11 +346,13 @@ func TestStalledSSEEndsWhenItsHandlerIsBounded855(t *testing.T) {
 	}
 }
 
-// TestSSEIdleBetweenEventsPastWriteTimeoutStd855: the per-write deadline is
-// armed around a write and cleared after it, so a stream whose events are
-// further apart than WriteTimeout is not cut while idle. Over h2c this
-// matters: the HTTP/2 server resets a stream when its write deadline passes,
-// whether or not a write is pending.
+// TestSSEIdleBetweenEventsPastWriteTimeoutStd855: the bound is on a write that
+// makes no progress, not on the stream's age or on a deadline left standing, so
+// a stream whose events are further apart than WriteTimeout is not cut while
+// idle. Over h2c this is the cell that tells the designs apart: the HTTP/2
+// server resets a stream when its write deadline passes, whether or not a
+// write is pending, so a deadline that is extended only when a write comes
+// (never cleared) kills an idle stream there, where on h1 it would pass.
 func TestSSEIdleBetweenEventsPastWriteTimeoutStd855(t *testing.T) {
 	for _, h2c := range []bool{false, true} {
 		name := "h1"
