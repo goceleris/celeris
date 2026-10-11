@@ -248,8 +248,9 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 	// held here until the conn is in the map.
 	l.driverConns[fd] = dc
 	l.hasDriverConns.Store(true)
-	// Level-triggered EPOLLOUT is added lazily (on EAGAIN) via armEpollOut
-	// so idle driver conns don't wake the loop on every send-buffer drain.
+	// Level-triggered EPOLLOUT is added lazily (on EAGAIN) by
+	// flushDriverSendLocked so idle driver conns don't wake the loop on every
+	// send-buffer drain.
 	ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
 	if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
 		delete(l.driverConns, fd)
@@ -404,8 +405,10 @@ func (l *Loop) CPUID() int {
 }
 
 // handleDriverEvent dispatches an epoll event to a registered driver conn.
-// Runs on the worker goroutine. EPOLLIN reads are drained eagerly (ET), at
-// most driverReadBudget reads per turn (see driverRead); EPOLLOUT resumes a
+// Runs on the worker goroutine. EPOLLIN is edge-triggered while EPOLLOUT is
+// not armed (level-triggered while it is, see flushDriverSendLocked), so a
+// turn reads at most driverReadBudget times (see driverRead) and a conn that
+// used its budget up is queued instead of drained; EPOLLOUT resumes a
 // pending Write. On error/hangup the onClose callback is invoked and the conn
 // is removed from the interest set.
 //
