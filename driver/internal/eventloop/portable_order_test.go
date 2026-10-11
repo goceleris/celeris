@@ -111,3 +111,29 @@ func TestPortableLoopCloseOrder(t *testing.T) {
 		})
 	}
 }
+
+// An onClose that writes (RULE 10): it writes to its own conn while Loop.Close
+// runs it, and must get ErrLoopClosed, not hang.
+func TestPortableOnCloseWritingDuringLoopCloseDoesNotHang(t *testing.T) {
+	srv := newLoopbackServer(t)
+	l := newPortableTestLoop(t, 1)
+	client, _ := srv.dial(t)
+	var id int
+	fired := make(chan error, 1)
+	id, err := registrar(t, l, 0).RegisterNetConn(client, nil, func(e error) {
+		fired <- l.WorkerLoop(0).Write(id, make([]byte, 64<<20))
+	})
+	if err != nil {
+		t.Fatalf("RegisterNetConn: %v", err)
+	}
+	done := make(chan struct{})
+	go func() { _ = l.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(portableWait):
+		t.Fatal("Loop.Close hung on an onClose that writes")
+	}
+	if err := <-fired; !errors.Is(err, ErrLoopClosed) {
+		t.Fatalf("Write from onClose during Loop.Close: %v, want ErrLoopClosed", err)
+	}
+}
