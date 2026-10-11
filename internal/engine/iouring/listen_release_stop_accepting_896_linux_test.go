@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -99,6 +100,15 @@ func startHold896(t *testing.T, addr string, workers int, h stream.Handler) *eng
 			Resources:     resource.Resources{Workers: workers},
 		}, h)
 		if err != nil {
+			// New probes the tier with a ring of its own, which fails on
+			// ENOMEM while the kernel has not yet uncharged the rings of the
+			// engines this loop closed a few ms ago (ring_budget_linux_test.go):
+			// that is waited out like a Listen that fails the same way.
+			if ioUringUsableHere() {
+				if _, small := memlockBelowRingBudgetFloor(); !small {
+					return fmt.Errorf("New: %v: cannot allocate memory (ring memory not uncharged yet)", err)
+				}
+			}
 			skipOrFail656(t, "New: %v", err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -213,6 +223,11 @@ func loop896(t *testing.T, label string, n int, full bool, iter iter896) {
 			}
 			slowest = max(slowest, d)
 		}
+		// The kernel gives a closed engine's ring memory back 12 to 23 ms
+		// later and an engine start holds about 1.6 MiB of the runner's 8 MiB
+		// (ring_budget_linux_test.go): a loop this quick would have five or
+		// six starts inside that window and run out, so it paces itself.
+		time.Sleep(8 * time.Millisecond)
 	}
 	t.Logf("%s: %d shutdowns (cancelAccept called %d times), port still taken when Listen returned in %d (%.0f%%); "+
 		"slowest to come free %v (never %d)", label, n, calls.Load(), busy, 100*float64(busy)/float64(n), slowest, never)
