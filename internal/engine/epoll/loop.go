@@ -301,6 +301,14 @@ type Loop struct {
 	driverGen      uint32
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
+	// driverReadQ holds the driver conns whose last read turn used up
+	// driverReadBudget with bytes possibly left (loop thread only).
+	// Edge-triggered epoll does not report bytes already in the socket again,
+	// so the loop gives each of them one more turn per round, after that
+	// round's batch (serveDriverReadQ), and does not wait in epoll_wait while
+	// one is queued. driverReadQNext is the spare backing array the queue swaps
+	// with, so a turn costs no allocation (celeris#930).
+	driverReadQ, driverReadQNext []*driverConn
 	// ctlMu guards epollFD against the driver goroutines, which issue
 	// epoll_ctl on it from outside the loop thread. shutdown takes it as a
 	// writer before it closes the descriptor (closeEpollFD), so a driver's
@@ -592,6 +600,16 @@ func (l *Loop) run(ctx context.Context) {
 			timeoutMs = h2PoolDrainPollMs
 		}
 
+		// A driver conn is owed a read turn (celeris#930): collect what is
+		// ready and do not wait. Last, after every cap above, because
+		// edge-triggered epoll will not report the bytes it is owed again.
+		if len(l.driverReadQ) > 0 {
+			timeoutMs = 0
+			if h := testHookDriverQueueWait; h != nil {
+				h(len(l.driverReadQ), timeoutMs)
+			}
+		}
+
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
 		if err != nil {
 			if err == unix.EINTR {
@@ -600,6 +618,10 @@ func (l *Loop) run(ctx context.Context) {
 			l.logger.Error("epoll_wait error", "loop", l.id, "err", err)
 			continue
 		}
+		// The driver conns owed a turn from an earlier round. A conn that
+		// uses up its budget while this batch is dispatched waits for the
+		// next round (celeris#930).
+		owedDriverReads := len(l.driverReadQ)
 
 		var now int64
 		if n > 0 {
@@ -775,6 +797,12 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
+		// The read turns driver conns are owed (celeris#930), after this
+		// batch's HTTP responses have gone out.
+		if owedDriverReads != 0 {
+			l.serveDriverReadQ(owedDriverReads)
+		}
+
 		// (flushBatchedCounters, at shutdown, repeats these three flushes:
 		// a counter added to the batches goes in both.)
 		// Flush batched request count to the shared atomic counter. This
@@ -820,6 +848,12 @@ func (l *Loop) run(ctx context.Context) {
 		// DRAINING → SUSPENDED: no listen socket, no connections, events
 		// processed, and NO CROSS-ENGINE HAND-OFF STILL OWED.
 		//
+		// A driver conn that is owed a read turn (driverReadQ, celeris#930)
+		// keeps the loop awake too: this park is indefinite, and the bytes the
+		// turn would read are in the socket already, so they would wait for
+		// the next ResumeAccept. On the base one event drained the socket
+		// before the loop got here.
+		//
 		// That last clause is celeris#624. This park is indefinite — the
 		// loop leaves epoll_wait entirely and waits on a Go channel that
 		// only ResumeAccept closes — so anything still owed to
@@ -854,7 +888,7 @@ func (l *Loop) run(ctx context.Context) {
 		// whose entry does nothing. So the detach flag needs no kick; the
 		// re-check is for symmetry.)
 		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
-			l.transplantInFlight == 0 &&
+			l.transplantInFlight == 0 && len(l.driverReadQ) == 0 &&
 			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
 			// A parked loop holds nothing, and sweep() — whose empty-set
 			// retraction is what clears this loop's share of the residual

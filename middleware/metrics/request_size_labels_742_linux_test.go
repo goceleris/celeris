@@ -53,7 +53,7 @@ func TestRequestSizeLabelsSurviveNextRequest(t *testing.T) {
 				want = append(want, m+"|"+tenant)
 			}
 			sort.Strings(want)
-			got, gerr := seriesOf(reg, "celeris_request_size_bytes")
+			got, gerr := waitSeries(reg, "celeris_request_size_bytes", want)
 			t.Logf("MW742METRICSREQSIZE arm=%s series=%q gather_err=%v", a.name, got, gerr)
 			if gerr != nil || strings.Join(got, ",") != strings.Join(want, ",") {
 				t.Errorf("request_size_bytes series (method|tenant) %q, Gather error %v; want %q and no error", got, gerr, want)

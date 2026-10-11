@@ -23,6 +23,15 @@ const driverWriteCap = 64 << 20 // 64 MiB
 // out anything it wants to retain.
 const driverReadBufSize = 32 << 10 // 32 KiB
 
+// driverReadBudget is the number of read(2) calls the loop spends on one
+// driver conn in one turn: up to 256 KiB with the 32 KiB buffer. A conn whose
+// peer keeps its socket full would otherwise hold the loop in driverRead, and
+// every other conn on the loop, driver or HTTP, would wait for its socket to
+// empty (celeris#930, the engine twin of celeris#881). A conn that uses up its
+// budget with bytes possibly left gets its next turn in the loop's next
+// round, after the events of the next epoll_wait (see serveDriverReadQ).
+const driverReadBudget = 8
+
 // driverConn holds per-FD state for a driver-registered connection.
 //
 // Callbacks onRecv and onClose execute on the worker's goroutine (the same
@@ -48,6 +57,16 @@ type driverConn struct {
 	sending  bool   // at most one write(2) in flight per FD (invariant)
 	closed   bool   // true once onClose has been dispatched; guards double-close
 	epollOut bool   // true while EPOLLOUT is armed so ResetWrite can disarm it
+
+	// readQueued is set while dc is in the loop's driverReadQ, and readEvents
+	// holds the teardown flags (EPOLLRDHUP, EPOLLHUP, EPOLLERR) of the events
+	// whose turn it is owed. readErr is the error of a flush that failed while
+	// the conn was owed a turn: the close waits for the bytes in the socket
+	// like the flags do, with that error as its cause. Loop thread only
+	// (celeris#930).
+	readQueued bool
+	readEvents uint32
+	readErr    error
 }
 
 // errLoopShutdown is what a driver gets when it reaches this loop after
@@ -117,6 +136,13 @@ var testHookCloseDriverClaimed func(dc *driverConn)
 // (celeris#775). Tests only: a test sets it before it creates the engine and
 // clears it after the engine is stopped.
 var testHookConnClosed func(l *Loop, fd int)
+
+// testHookDriverQueueWait, when non-nil, runs on the loop's goroutine before
+// an epoll_wait made while a driver conn is owed a read turn, with the number
+// of conns owed and the timeout the loop is about to wait with. Tests only
+// (celeris#930): a test sets it before it creates the engine and clears it
+// after the engine is stopped.
+var testHookDriverQueueWait func(queued, timeoutMs int)
 
 // lookupDriver returns the driverConn for fd, or nil if none is registered.
 // Safe to call from the worker goroutine during dispatch.
@@ -226,8 +252,9 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 	// held here until the conn is in the map.
 	l.driverConns[fd] = dc
 	l.hasDriverConns.Store(true)
-	// Level-triggered EPOLLOUT is added lazily (on EAGAIN) via armEpollOut
-	// so idle driver conns don't wake the loop on every send-buffer drain.
+	// Level-triggered EPOLLOUT is added lazily (on EAGAIN) by
+	// flushDriverSendLocked so idle driver conns don't wake the loop on every
+	// send-buffer drain.
 	ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
 	if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
 		delete(l.driverConns, fd)
@@ -337,10 +364,13 @@ func (l *Loop) flushDriverSendLocked(dc *driverConn) error {
 			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				if !dc.epollOut {
-					// EPOLLIN stays edge-triggered (ET) but EPOLLOUT is
-					// level-triggered: it fires as long as the socket is
-					// writable, so there is no risk of a missed wakeup
-					// after sending clears. EPOLLET only applies to EPOLLIN.
+					// No EPOLLET: it is a flag of the whole registration, so
+					// while EPOLLOUT is armed EPOLLIN is level-triggered too.
+					// EPOLLOUT fires as long as the socket is writable, so
+					// there is no risk of a missed wakeup after sending
+					// clears; EPOLLIN is reported again each epoll_wait while
+					// bytes are unread, which handleDriverEvent merges into the
+					// conn's queued read turn (celeris#930).
 					ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP)
 					modErr := l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &ev)
 					if modErr == nil {
@@ -379,22 +409,55 @@ func (l *Loop) CPUID() int {
 }
 
 // handleDriverEvent dispatches an epoll event to a registered driver conn.
-// Runs on the worker goroutine. EPOLLIN reads are drained eagerly (ET);
-// EPOLLOUT resumes a pending Write. On error/hangup the onClose callback
-// is invoked and the conn is removed from the interest set.
+// Runs on the worker goroutine. EPOLLIN is edge-triggered while EPOLLOUT is
+// not armed (level-triggered while it is, see flushDriverSendLocked), so a
+// turn reads at most driverReadBudget times (see driverRead) and a conn that
+// used its budget up is queued instead of drained; EPOLLOUT resumes a
+// pending Write. On error/hangup the onClose callback is invoked and the conn
+// is removed from the interest set.
+//
+// A turn that stops at its budget leaves the conn queued (driverReadQ), and
+// so does an event of a conn that is queued already. The teardown that
+// follows the event, the event's EPOLLRDHUP/EPOLLHUP/EPOLLERR and the error
+// of a failed flush, waits for the turn that drains the socket (readEvents,
+// readErr): bytes the peer sent before it closed are still read and delivered
+// first, as they were when the one turn drained the socket (celeris#930).
 func (l *Loop) handleDriverEvent(dc *driverConn, events uint32) {
+	const closeFlags = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP
+	if dc.readQueued {
+		// The conn is owed a read turn, which reads this event's bytes too
+		// and runs its teardown: a conn gets one turn per round however many
+		// events it has in the batch. EPOLLOUT is not read-related and is
+		// served now.
+		dc.readEvents |= events & closeFlags
+		events &^= unix.EPOLLIN | closeFlags
+		if events == 0 {
+			return
+		}
+	}
 	// Read first: a peer may send data and immediately close, producing
 	// both EPOLLIN and EPOLLRDHUP in one event batch.
+	more := false
 	if events&unix.EPOLLIN != 0 {
-		l.driverRead(dc)
+		more = l.driverRead(dc)
 	}
 	if events&unix.EPOLLOUT != 0 {
 		dc.mu.Lock()
-		if !dc.sending && !dc.closed {
+		if !dc.sending && !dc.closed && dc.readErr == nil {
 			dc.sending = true
 			if err := l.flushDriverSendLocked(dc); err != nil {
 				dc.sending = false
 				dc.mu.Unlock()
+				if more || dc.readQueued {
+					// The bytes the read turn left in the socket come first, as
+					// they did when the one event read them before it flushed.
+					dc.readEvents |= events & closeFlags
+					dc.readErr = err
+					if !dc.readQueued {
+						l.queueDriverRead(dc)
+					}
+					return
+				}
 				l.closeDriver(dc, err)
 				return
 			}
@@ -402,13 +465,57 @@ func (l *Loop) handleDriverEvent(dc *driverConn, events uint32) {
 		}
 		dc.mu.Unlock()
 	}
-	if events&(unix.EPOLLERR|unix.EPOLLHUP|unix.EPOLLRDHUP) != 0 {
+	if more {
+		// Budget used up with bytes possibly left: the teardown waits for the
+		// turn that drains them.
+		dc.readEvents |= events & closeFlags
+		l.queueDriverRead(dc)
+		return
+	}
+	if events&closeFlags != 0 {
 		l.closeDriver(dc, nil)
 	}
 }
 
-// driverRead drains fd with edge-triggered reads into the per-loop scratch
-// buffer and fans each chunk out to onRecv. The callback runs on this
+// queueDriverRead owes dc a read turn in the loop's next round. Loop thread.
+func (l *Loop) queueDriverRead(dc *driverConn) {
+	dc.readQueued = true
+	l.driverReadQ = append(l.driverReadQ, dc)
+}
+
+// serveDriverReadQ gives the first owed conns of driverReadQ, the ones queued
+// before this round's batch, the read turn they are owed. The conns queued
+// during the batch stay queued for the next round, and so does a conn that
+// uses up its budget again: each backlogged conn gets one turn per round.
+// The turn of a conn that has been torn down since reads nothing (driverRead's
+// closed check, celeris#710); the queue holds conns, not numbers. The caller
+// calls it only with owed > 0. Loop thread.
+func (l *Loop) serveDriverReadQ(owed int) {
+	q := l.driverReadQ
+	// shutdownDrivers clears the queue; it runs on this goroutine, never
+	// inside a batch.
+	owed = min(owed, len(q))
+	l.driverReadQ = append(l.driverReadQNext[:0], q[owed:]...)
+	for i, dc := range q[:owed] {
+		q[i] = nil
+		flags, cause := dc.readEvents, dc.readErr
+		dc.readQueued, dc.readEvents, dc.readErr = false, 0, nil
+		if l.driverRead(dc) {
+			dc.readEvents, dc.readErr = flags, cause
+			l.queueDriverRead(dc)
+		} else if flags != 0 || cause != nil {
+			l.closeDriver(dc, cause)
+		}
+	}
+	clear(q[owed:])
+	l.driverReadQNext = q[:0]
+}
+
+// driverRead reads fd with edge-triggered reads into the per-loop scratch
+// buffer and fans each chunk out to onRecv, for at most driverReadBudget
+// reads. It reports whether the budget stopped it with bytes possibly left in
+// the socket: edge-triggered epoll does not report those again, so the caller
+// owes the conn another turn (queueDriverRead). The callback runs on this
 // goroutine; the slice is invalidated on return.
 //
 // Each read is issued under dc.mu, after checking dc.closed (celeris#710).
@@ -424,29 +531,29 @@ func (l *Loop) handleDriverEvent(dc *driverConn, events uint32) {
 // across the read syscall only (fd is non-blocking, RegisterConn's
 // contract), never across onRecv or closeDriver, and nothing else is
 // acquired while it is held here.
-func (l *Loop) driverRead(dc *driverConn) {
+func (l *Loop) driverRead(dc *driverConn) (more bool) {
 	if l.driverReadBuf == nil {
 		l.driverReadBuf = make([]byte, driverReadBufSize)
 	}
-	for {
+	for reads := 0; reads < driverReadBudget; reads++ {
 		dc.mu.Lock()
 		if dc.closed {
 			dc.mu.Unlock()
-			return
+			return false
 		}
 		n, err := unix.Read(dc.fd, l.driverReadBuf)
 		cb := dc.onRecv
 		dc.mu.Unlock()
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				return
+				return false
 			}
 			l.closeDriver(dc, err)
-			return
+			return false
 		}
 		if n == 0 {
 			l.closeDriver(dc, nil)
-			return
+			return false
 		}
 		if cb != nil {
 			cb(l.driverReadBuf[:n])
@@ -454,9 +561,10 @@ func (l *Loop) driverRead(dc *driverConn) {
 		if n < len(l.driverReadBuf) {
 			// Short read implies the socket is drained; ET epoll will
 			// notify on the next arrival. Skip the EAGAIN-producing read.
-			return
+			return false
 		}
 	}
+	return true
 }
 
 // closeDriver removes dc from the worker's interest set and invokes
@@ -502,6 +610,7 @@ func (l *Loop) closeDriver(dc *driverConn, cause error) {
 // shutdownDrivers closes every registered driver conn during Loop.shutdown.
 // Invoked from the worker goroutine; onClose callbacks fire synchronously.
 func (l *Loop) shutdownDrivers() {
+	l.driverReadQ, l.driverReadQNext = nil, nil // owed turns end with the conns
 	l.driverMu.Lock()
 	if len(l.driverConns) == 0 {
 		l.driverMu.Unlock()
