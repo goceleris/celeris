@@ -147,3 +147,49 @@ func TestIouringDirtyPassGiveUpKeepsTheRecvStallEpisode811(t *testing.T) {
 		t.Errorf("the conn is on the dirty list after its SEND completed and its recv was armed")
 	}
 }
+
+// TestIouringCheckTimeoutsJudgesAFailedFirstZCCompletionByWriteTimeout811: the
+// give-up takes a SEND_ZC conn whose first completion failed (sending false,
+// zcNotifPending true) off the dirty list, and the list was what made the
+// sweep judge it by WriteTimeout (cs.dirty). A conn with its notification
+// still to come is a conn with a write outstanding, so the sweep reads
+// zcNotifPending too. Both ways, so neither the hunk's removal nor a
+// blanket "always WriteTimeout" passes:
+//
+//   - WriteTimeout shorter than the conn's age, ReadTimeout and IdleTimeout
+//     longer: closed (judged by WriteTimeout);
+//   - ReadTimeout shorter than its age, WriteTimeout longer: not closed.
+func TestIouringCheckTimeoutsJudgesAFailedFirstZCCompletionByWriteTimeout811(t *testing.T) {
+	const tail = "the rest of response 1"
+	const age = 10 * time.Second
+	for _, tc := range []struct {
+		name      string
+		write     time.Duration
+		read      time.Duration
+		wantClose bool
+	}{
+		{"write_timeout_exceeded", time.Second, time.Hour, true},
+		{"only_read_timeout_exceeded", time.Hour, time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newStallRig704(t)
+			w, cs := rig.w, rig.cs
+			inFlight750(rig, tail, true)
+			w.handleSend(sendCQE750(rig, -int32(unix.ENOMEM), cqeFMore), rig.local, time.Now().UnixNano())
+			if cs.sending || !cs.zcNotifPending || cs.dirty {
+				t.Fatalf("apparatus: sending=%v zcNotifPending=%v dirty=%v, want false/true/false", cs.sending, cs.zcNotifPending, cs.dirty)
+			}
+			takeSQEs(w.ring)
+			w.cfg.WriteTimeout, w.cfg.ReadTimeout, w.cfg.IdleTimeout = tc.write, tc.read, time.Hour
+			cs.lastActivity = time.Now().Add(-age).UnixNano()
+
+			w.checkTimeouts()
+
+			if cs.closing != tc.wantClose {
+				t.Errorf("after the sweep: closing=%v, want %v (WriteTimeout %v, ReadTimeout %v, idle for %v): "+
+					"a conn with its SEND_ZC notification outstanding is judged by WriteTimeout",
+					cs.closing, tc.wantClose, tc.write, tc.read, age)
+			}
+		})
+	}
+}
