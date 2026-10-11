@@ -240,6 +240,14 @@ func TestDetachedPokeDuringAWriteSticks855(t *testing.T) {
 	}
 }
 
+// testStream855 is the stream the Streamer methods are given; the bridge reads
+// from it whether the response has begun.
+func testStream855(tb testing.TB) *stream.Stream {
+	s := stream.NewH1Stream(1)
+	tb.Cleanup(s.Release)
+	return s
+}
+
 // pastSets855 counts the deadlines in the past that were set on w, from its
 // events (they are consumed).
 func pastSets855(w *dlWriter855) int {
@@ -378,7 +386,7 @@ func TestDetachedHijack855(t *testing.T) {
 	rw := &stdResponseWriter{w: hijackWriter855{w}, eng: e}
 	rw.StreamDetached()
 	w.take()
-	c, err := rw.Hijack(nil)
+	c, err := rw.Hijack(testStream855(t))
 	if err != nil || c == nil {
 		t.Fatalf("Hijack after Detach: %v, %v", c, err)
 	}
@@ -394,7 +402,7 @@ func TestDetachedHijack855(t *testing.T) {
 	defer cancel2()
 	rw = &stdResponseWriter{w: newDLWriter855(), eng: e2}
 	rw.StreamDetached()
-	if _, err := rw.Hijack(nil); !errors.Is(err, stream.ErrHijackNotSupported) {
+	if _, err := rw.Hijack(testStream855(t)); !errors.Is(err, stream.ErrHijackNotSupported) {
 		t.Fatalf("Hijack on a writer that cannot: %v, want ErrHijackNotSupported", err)
 	}
 	rw.streamEnded()
@@ -455,7 +463,7 @@ func TestDetachedCutPokeAndReturnRace855(t *testing.T) {
 					rw := &stdResponseWriter{w: w, eng: e}
 					rw.StreamDetached()
 					defer rw.streamEnded()
-					_ = rw.WriteHeader(nil, 200, nil)
+					_ = rw.WriteHeader(testStream855(t), 200, nil)
 					_ = rw.Flush(nil)
 					// The budget runs out somewhere around the cut.
 					time.AfterFunc(time.Duration(i%8)*10*time.Millisecond, cancel)

@@ -44,10 +44,15 @@ var epoch = time.Now()
 //     never closes the connection of a handler that is still running.
 //
 // A cut is a poke: the stream's write deadline is in the past for good
-// (closing), so every later write fails, and so do the last bytes net/http
-// writes after the handler. Writes after Detach must not overlap (net/http's
-// ResponseWriter does not allow it); if they do, the bound is measured from
-// the start of the latest one.
+// (closing, set once), so every later write fails, and so do the last bytes
+// net/http writes after the handler.
+//
+// Writes after Detach may come from more than one goroutine (Context.Detach is
+// public), though net/http's ResponseWriter does not allow them to overlap
+// without the caller's own lock. The bookkeeping is atomics and does not need
+// that: with writes in flight the bound is measured from the start of the
+// latest one, so a stream that keeps starting writes is never cut for a write
+// that has finished.
 type detachedWrites struct {
 	rc *http.ResponseController
 	// wt is the longest a write may be parked, 0 for no limit.
@@ -86,7 +91,7 @@ func (d *detachedWrites) begin() {
 	}
 	d.start.Store(int64(time.Since(epoch)))
 	d.inflight.Add(1)
-	if !d.watching.Load() {
+	if !d.watching.Load() && !d.closing.Load() {
 		d.wake()
 	}
 }
@@ -143,8 +148,13 @@ func (d *detachedWrites) watch() {
 }
 
 // cutLocked fails the stream's writes; mu is held and the request is not over.
+// A stream is cut once: over h2c every deadline in the past is a message to the
+// connection's serve goroutine that queues an RST_STREAM for the stream, and a
+// stream that is closing has been reset already.
 func (d *detachedWrites) cutLocked() {
-	d.closing.Store(true)
+	if d.closing.Swap(true) {
+		return
+	}
 	_ = d.rc.SetWriteDeadline(pastDeadline)
 }
 

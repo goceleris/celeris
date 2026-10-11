@@ -122,14 +122,16 @@ func engine855(wt time.Duration) (e *Engine, cancel context.CancelFunc) {
 }
 
 // celeris#855: StreamDetached is what Context.Detach calls on std, once when a
-// stream starts. It clears both deadlines net/http armed (the read one is
-// pinned here: no end-to-end test can fail without it on go1.27, where
-// net/http has cleared it before the handler runs).
-func TestStreamDetachedClearsBothDeadlines855(t *testing.T) {
+// stream starts. It clears the write deadline net/http armed, and leaves the
+// read deadline alone: on go1.27 it has been cleared before the handler runs
+// (HTTP/1) or only closes a request body that has been read whole (h2), so
+// clearing it would be a call with no effect (the round-2 review found no test
+// could tell).
+func TestStreamDetachedClearsTheWriteDeadline855(t *testing.T) {
 	w := newDLWriter855()
 	rw := &stdResponseWriter{w: w}
 	rw.StreamDetached()
-	if got, want := w.take(), []string{"r:zero", "w:zero"}; !eq855(got, want) {
+	if got, want := w.take(), []string{"w:zero"}; !eq855(got, want) {
 		t.Fatalf("StreamDetached set %v, want %v", got, want)
 	}
 	rw.StreamDetached() // a second call changes nothing
@@ -338,7 +340,7 @@ func liveWriter855(tb testing.TB, fn func(w http.ResponseWriter)) {
 }
 
 // BenchmarkStreamDetached855 is the cost of the call itself on a live
-// connection (ResponseController, then both deadlines, then the poke's
+// connection (ResponseController, the write deadline, then the poke's
 // registration): what a stream pays once, when it starts. Requests that do not
 // detach never reach it.
 func BenchmarkStreamDetached855(b *testing.B) {
@@ -352,34 +354,4 @@ func BenchmarkStreamDetached855(b *testing.B) {
 			rw.streamEnded()
 		}
 	})
-}
-
-// BenchmarkStreamWrite855 is a stream's Write and Flush of one small event on
-// a live connection, as the SSE middleware sends them: "plain" as before the
-// detach (net/http's one deadline), "detached" with a deadline armed and
-// cleared around each (the cost of the per-write bound).
-func BenchmarkStreamWrite855(b *testing.B) {
-	payload := []byte("data: 12345678901234567890123456789012345678901234567890\n\n")
-	for _, mode := range []string{"plain", "detached"} {
-		b.Run(mode, func(b *testing.B) {
-			e, cancel := engine855(time.Minute)
-			defer cancel()
-			liveWriter855(b, func(w http.ResponseWriter) {
-				rw := &stdResponseWriter{w: w, eng: e}
-				if mode == "detached" {
-					rw.StreamDetached()
-				}
-				b.ReportAllocs()
-				for b.Loop() {
-					if err := rw.Write(nil, payload); err != nil {
-						b.Fatal(err)
-					}
-					if err := rw.Flush(nil); err != nil {
-						b.Fatal(err)
-					}
-				}
-				rw.streamEnded()
-			})
-		})
-	}
 }

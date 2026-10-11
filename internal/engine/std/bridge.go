@@ -151,30 +151,32 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if err := b.handler.HandleStream(rctx, s); err != nil {
 		b.engine.metrics.errs.Handler.Add(1)
-		if !rw.flushed {
+		if !s.GetHeadersSent() {
 			http.Error(w, "handler error", http.StatusInternalServerError)
 		}
 		return
 	}
 
-	if !rw.flushed {
+	if !s.GetHeadersSent() {
 		w.WriteHeader(http.StatusOK)
 	}
 }
 
 // stdResponseWriter adapts http.ResponseWriter to stream.ResponseWriter.
+//
+// It is 24 bytes, as it was before the detach support (celeris#855): w is
+// replaced by a *detachedWriter when the handler detaches, so a request that
+// never detaches pays nothing for it. eng, the engine whose request this is
+// (the write timeout and the base context a detached stream is bounded by,
+// see StreamDetached), takes the place of the flag that says whether the
+// response has begun, which is the stream's headersSent: the bridge reads it
+// to answer for a handler that wrote nothing.
 type stdResponseWriter struct {
-	w http.ResponseWriter
-	// eng is the engine whose request this is: the write timeout and the base
-	// context a detached stream is bounded by (StreamDetached). It is the only
-	// state a request pays for the detach support: w is replaced by a
-	// *detachedWriter when the handler detaches, so nothing else is added here
-	// (32 bytes, one size class over {w, flushed}).
-	eng     *Engine
-	flushed bool
+	w   http.ResponseWriter
+	eng *Engine
 }
 
-func (rw *stdResponseWriter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
+func (rw *stdResponseWriter) WriteResponse(s *stream.Stream, status int, headers [][2]string, body []byte) error {
 	h := rw.w.Header()
 	for _, hdr := range headers {
 		h.Add(hdr[0], hdr[1])
@@ -185,7 +187,7 @@ func (rw *stdResponseWriter) WriteResponse(_ *stream.Stream, status int, headers
 	}
 
 	rw.w.WriteHeader(status)
-	rw.flushed = true
+	s.SetHeadersSent()
 
 	if len(body) > 0 {
 		if _, err := rw.w.Write(body); err != nil {
@@ -201,13 +203,13 @@ func (rw *stdResponseWriter) WriteResponse(_ *stream.Stream, status int, headers
 
 // Streaming support — stdResponseWriter implements stream.Streamer.
 
-func (rw *stdResponseWriter) WriteHeader(_ *stream.Stream, status int, headers [][2]string) error {
+func (rw *stdResponseWriter) WriteHeader(s *stream.Stream, status int, headers [][2]string) error {
 	h := rw.w.Header()
 	for _, hdr := range headers {
 		h.Add(hdr[0], hdr[1])
 	}
 	rw.w.WriteHeader(status)
-	rw.flushed = true
+	s.SetHeadersSent()
 	return nil
 }
 
@@ -227,15 +229,14 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 	return nil
 }
 
-// StreamDetached implements stream.DetachNotifier. net/http arms a read
-// deadline (ReadTimeout) and a write deadline (WriteTimeout) for each request
-// and keeps the write one armed while the handler runs: a response that takes
-// longer than WriteTimeout fails its next write, so an SSE stream was cut at
-// WriteTimeout while the native engines, which apply neither timeout to a
-// detached connection, kept it open (celeris#855). The handler has detached,
-// so this stream is the connection's: clear both, for this request only.
-// net/http arms them again for the next request on the connection, so
-// nothing is restored.
+// StreamDetached implements stream.DetachNotifier. net/http arms a write
+// deadline (WriteTimeout) for each request and keeps it armed while the
+// handler runs: a response that takes longer than WriteTimeout fails its next
+// write, so an SSE stream was cut at WriteTimeout while the native engines,
+// which apply neither timeout to a detached connection, kept it open
+// (celeris#855). The handler has detached, so this stream is the connection's:
+// clear the write deadline, for this request only. net/http arms it again for
+// the next request on the connection, so nothing is restored.
 //
 // Nothing then ends a stream whose client stays connected and reads nothing,
 // so the stream's writes are bounded the way the WebSocket middleware bounds
@@ -244,18 +245,19 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 // write: a detached stream's Write and Flush only note when they started.
 // Runs when a stream starts, never per request.
 //
-// The read deadline is cleared as well. net/http already clears it once it
-// starts watching the connection for the client going away (before the
-// handler runs, for the bodies the bridge reads whole), so on HTTP/1 this
-// is for a Go that does not; on h2 it stops the request-body timer. The
-// errors are ignored: a writer that cannot set deadlines
-// (http.ErrNotSupported) has none armed to clear.
+// The read deadline (ReadTimeout) is left alone: it never cuts a stream the
+// bridge is serving. net/http clears it once it starts watching the
+// connection for the client going away, which for the bodies the bridge reads
+// whole is before the handler runs (HTTP/1), and on h2 it only closes the
+// request body, which the bridge has read whole. The read arms of
+// TestSSEStaysOpenPastServerTimeouts855 pin that. The error of the write
+// deadline is ignored: a writer that cannot set one (http.ErrNotSupported) has
+// none armed to clear.
 func (rw *stdResponseWriter) StreamDetached() {
 	if _, ok := rw.w.(*detachedWriter); ok {
 		return
 	}
 	rc := http.NewResponseController(rw.w)
-	_ = rc.SetReadDeadline(time.Time{})
 	_ = rc.SetWriteDeadline(time.Time{})
 	d := &detachedWrites{rc: rc}
 	if e := rw.eng; e != nil {
@@ -278,14 +280,14 @@ func (rw *stdResponseWriter) streamEnded() {
 	}
 }
 
-func (rw *stdResponseWriter) Hijack(_ *stream.Stream) (net.Conn, error) {
+func (rw *stdResponseWriter) Hijack(s *stream.Stream) (net.Conn, error) {
 	h, ok := rw.w.(http.Hijacker)
 	if !ok {
 		return nil, stream.ErrHijackNotSupported
 	}
 	conn, _, err := h.Hijack()
 	if err == nil {
-		rw.flushed = true
+		s.SetHeadersSent()
 	}
 	return conn, err
 }

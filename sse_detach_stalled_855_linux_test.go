@@ -60,9 +60,9 @@ type stalledSSE855 struct {
 	hret, disc atomic.Int64
 	// sendErr is the UnixNano at which a Send of the handler first failed.
 	sendErr atomic.Int64
-	conn       net.Conn
-	cl         *http.Client
-	resp       *http.Response
+	conn    net.Conn
+	cl      *http.Client
+	resp    *http.Response
 }
 
 // stallBegin855 starts a server and a client that reads nothing. bound > 0 is
