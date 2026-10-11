@@ -63,7 +63,7 @@ func TestLabelValuesSurviveNextRequest(t *testing.T) {
 			}
 			sort.Strings(want)
 			for _, name := range []string{"celeris_requests_total", "celeris_request_duration_seconds", "celeris_response_size_bytes"} {
-				got, gerr := seriesOf(reg, name)
+				got, gerr := waitSeries(reg, name, want)
 				t.Logf("KEPT732METRICS arm=%s %s series=%q gather_err=%v", a.name, name, got, gerr)
 				if gerr != nil || strings.Join(got, ",") != strings.Join(want, ",") {
 					t.Errorf("%s series (method|tenant) %q, Gather error %v; want %q and no error", name, got, gerr, want)
@@ -114,7 +114,7 @@ func TestLabelValuesSurviveConnectionReuse(t *testing.T) {
 				}
 			}
 			sort.Strings(want)
-			got, gerr := seriesOf(reg, "celeris_requests_total")
+			got, gerr := waitSeries(reg, "celeris_requests_total", want)
 			secret := 0
 			for _, s := range got {
 				if strings.Contains(s, "SECRET") {
@@ -148,6 +148,22 @@ func seriesOf(reg *prometheus.Registry, name string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, err
+}
+
+// waitSeries is seriesOf polled every 5 ms for up to 3 s until the series
+// equal want (sorted) with no Gather error. The middleware records a request
+// after the handler returns, which on the std engine can be after the client
+// has read the response, so a series may appear a moment after the round trip.
+// On timeout it returns the last value observed.
+func waitSeries(reg *prometheus.Registry, name string, want []string) ([]string, error) {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got, err := seriesOf(reg, name)
+		if (err == nil && strings.Join(got, ",") == strings.Join(want, ",")) || time.Now().After(deadline) {
+			return got, err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 type keptArm struct {
