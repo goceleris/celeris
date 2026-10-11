@@ -4507,6 +4507,12 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 	val := 0
 	for _, c := range host {
 		if c == '.' {
+			// A fourth dot would index past parts: the loop goroutine
+			// panicked on "1.2.3.4.5:80", which Config.Validate accepts
+			// (io_uring's parseAddr has had this guard).
+			if partIdx >= 3 {
+				return nil, fmt.Errorf("invalid addr: %s", addr)
+			}
 			parts[partIdx] = byte(val)
 			partIdx++
 			val = 0
