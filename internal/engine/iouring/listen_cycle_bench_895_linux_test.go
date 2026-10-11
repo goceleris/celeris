@@ -129,13 +129,22 @@ func BenchmarkPauseResumeCycle896(b *testing.B) {
 // worker with an accept armed on a listen socket, closed by stopAccepting (the
 // ring's cancel, the wait for the cancel to take, the close). The setup of each
 // iteration (ring, socket, armed accept) is not timed. It builds on origin/main
-// too, where the same call places a skip-success cancel and waits in one enter.
+// too, with benchWorkerHook896 (listen_cycle_bench_hook_896_linux_test.go)
+// replaced by an empty body, because the handoffLoss field is the PR's: there
+// the same call places a skip-success cancel and waits in one enter (at most
+// 50 ms for any CQE), which is the A arm of scripts/bench3.sh.
 func BenchmarkCancelAccept896(b *testing.B) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	var closeNs int64
 	for range b.N {
-		ring, err := NewRing(64, 0, 0)
+		// The probed default tier: multishot accept, as the engine runs it.
+		var tier TierStrategy = &highTier{multishotAccept: true}
+		ring, err := NewRing(64, tier.SetupFlags(), 0)
+		if err != nil {
+			tier = &baseTier{}
+			ring, err = NewRing(64, tier.SetupFlags(), 0)
+		}
 		if err != nil {
 			b.Skipf("NewRing: %v", err)
 		}
@@ -151,8 +160,9 @@ func BenchmarkCancelAccept896(b *testing.B) {
 		}
 		w := newLedgerWorker(lfd)
 		w.ring = ring
+		w.tier = tier
 		w.listenFD = lfd
-		w.handoffLoss = &handoffLossStats{}
+		benchWorkerHook896(w)
 		w.prepareAccept()
 		if _, err := w.ring.Submit(); err != nil {
 			b.Fatalf("submit accept: %v", err)
