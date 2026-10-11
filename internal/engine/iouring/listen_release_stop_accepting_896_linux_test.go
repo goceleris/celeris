@@ -46,15 +46,15 @@ import (
 type holdHandler896 struct {
 	started chan struct{}
 	release chan struct{}
-	big     []byte
+	big     []byte // the /big response; nil unless the test serves it
 }
 
-func newHoldHandler896() *holdHandler896 {
-	return &holdHandler896{
-		started: make(chan struct{}, 4),
-		release: make(chan struct{}),
-		big:     bytes.Repeat([]byte{'b'}, 32<<20),
+func newHoldHandler896(bigBody bool) *holdHandler896 {
+	h := &holdHandler896{started: make(chan struct{}, 4), release: make(chan struct{})}
+	if bigBody {
+		h.big = bytes.Repeat([]byte{'b'}, 32<<20)
 	}
+	return h
 }
 
 func (h *holdHandler896) HandleStream(_ context.Context, s *stream.Stream) error {
@@ -242,7 +242,7 @@ func loop896(t *testing.T, label string, n int, full bool, iter iter896) {
 // cancelAccept, and Listen returns after it.
 func h2Iteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
 	addr := freeAddr639(t)
-	h := newHoldHandler896()
+	h := newHoldHandler896(false)
 	run := startHold896(t, addr, 2, h)
 	c := h2Request896(t, addr, "/hold")
 	defer func() { _ = c.Close() }()
@@ -276,7 +276,7 @@ func (r *engineRun896) stopped() (time.Time, error) {
 // and Listen returns.
 func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
 	addr := freeAddr639(t)
-	h := newHoldHandler896()
+	h := newHoldHandler896(true)
 	run := startHold896(t, addr, 2, h)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {

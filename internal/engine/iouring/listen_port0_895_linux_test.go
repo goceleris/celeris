@@ -433,7 +433,10 @@ func TestPort0PauseResumeWithManyWorkers895(t *testing.T) {
 // wait for their sockets, has returned nil by then. The engine is left running
 // with no listener until its context is cancelled, which is the behaviour
 // ErrorListenerRecreate's doc describes ("an engine that has lost accept
-// capacity"); Server.ResumeAccept's doc says so too (celeris#895).
+// capacity"); Server.ResumeAccept's doc says so too (celeris#895). The assertion
+// that Listen does not return on its own pins today's behaviour: a change that
+// makes a lost listener end the engine is expected to flip that line, not to
+// be read as a regression.
 func TestResumeAfterThePortWasTaken895(t *testing.T) {
 	addr := freeAddr639(t)
 	r := start895(t, addr, 2, 1, true)

@@ -340,7 +340,10 @@ func TestFixedPortIsBoundAsGivenControl895(t *testing.T) {
 // wait for their sockets, has returned nil by then. The engine is left running
 // with no listener until its context is cancelled, which is the behaviour
 // ErrorListenerRecreate's doc describes ("an engine that has lost accept
-// capacity"); Server.ResumeAccept's doc says so too (celeris#895).
+// capacity"); Server.ResumeAccept's doc says so too (celeris#895). The assertion
+// that Listen does not return on its own pins today's behaviour: a change that
+// makes a lost listener end the engine is expected to flip that line, not to
+// be read as a regression.
 func TestResumeAfterThePortWasTaken895(t *testing.T) {
 	const loops = 3
 	tmp, err := net.Listen("tcp", "127.0.0.1:0")

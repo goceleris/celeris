@@ -209,40 +209,85 @@ func TestShutdownDrainWithAFullSQRingReleasesTheListenSocket896(t *testing.T) {
 	}
 }
 
-// TestShutdownDrainIgnoresAnotherSocketsAcceptEnd896: a terminal accept CQE of
-// another listen socket sits unread in the CQ ring when the drain starts (a
-// pause, a resume and a shutdown close together leave such a CQE). The drain
-// ends its wait on the accept of the socket it cancelled, not on that one (the
-// user data carries the descriptor). On a kernel that posts the accept's end
-// inside the one enter the two orders are not told apart by the outcome, so this
-// pins only that the stale CQE does not break the wait: no give-up, the port
-// free, and the stale CQE consumed.
+// staleAcceptEnd896 leaves the terminal accept CQE of another listen socket
+// unread in r's CQ ring (a pause, a resume and a shutdown close together leave
+// such a CQE), and makes the first ring wait of the code under test
+// (shutdownRingWait) return at once, without entering the ring: the first CQ
+// batch that code reads then holds that CQE and nothing else. A wait that took
+// it for the end of the accept it cancelled would stop there, with its own
+// cancel still in the SQ ring and never submitted, the descriptor closed with
+// the accept armed and the port held for as long as the ring is open; a wait
+// that checks the descriptor goes on, and the next (real) wait submits the cancel.
+func staleAcceptEnd896(t *testing.T, r *acceptRig896) {
+	t.Helper()
+	other, err := createListenSocket(freeAddr639(t), false)
+	if err != nil {
+		t.Fatalf("createListenSocket: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(other) })
+	sqe := r.w.ring.GetSQE()
+	prepMultishotAccept(sqe, other)
+	setSQEUserData(sqe, encodeUserData(udAccept, other))
+	sqe = r.w.ring.GetSQE()
+	prepCancelFDDriver(sqe, other)
+	setSQEUserData(sqe, encodeUserData(udProvide, other))
+	if err := r.w.ring.SubmitAndWaitTimeout(50 * time.Millisecond); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	head, tail := r.w.ring.BeginCQ()
+	if tail-head < 2 {
+		t.Fatalf("setup: %d CQEs in the ring, want the other socket's accept end and its cancel's", tail-head)
+	}
+	orig := shutdownRingWait
+	first := true
+	shutdownRingWait = func(rg *Ring, d time.Duration) error {
+		if first {
+			first = false
+			return nil
+		}
+		return orig(rg, d)
+	}
+	t.Cleanup(func() { shutdownRingWait = orig })
+}
+
+// TestShutdownDrainIgnoresAnotherSocketsAcceptEnd896: the drain ends its wait on
+// the accept of the socket it cancelled, not on another socket's (the user data
+// carries the descriptor).
 func TestShutdownDrainIgnoresAnotherSocketsAcceptEnd896(t *testing.T) {
 	for _, tc := range tiers896 {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newAcceptRig896(t, tc.tier(), true)
-			other, err := createListenSocket(freeAddr639(t), false)
-			if err != nil {
-				t.Fatalf("createListenSocket: %v", err)
-			}
-			defer func() { _ = unix.Close(other) }()
-			sqe := r.w.ring.GetSQE()
-			prepMultishotAccept(sqe, other)
-			setSQEUserData(sqe, encodeUserData(udAccept, other))
-			sqe = r.w.ring.GetSQE()
-			prepCancelFDDriver(sqe, other)
-			setSQEUserData(sqe, encodeUserData(udProvide, other))
-			if err := r.w.ring.SubmitAndWaitTimeout(50 * time.Millisecond); err != nil {
-				t.Fatalf("submit: %v", err)
-			}
+			staleAcceptEnd896(t, r)
 			r.w.endOwedOpsAtShutdown()
 			r.closeListener()
 			if err := plainBind896(r.addr); err != nil {
-				t.Fatalf("a plain bind of %s right after the drain: %v", r.addr, err)
+				t.Fatalf("a plain bind of %s right after the drain, which ended its wait on another socket's accept: %v", r.addr, err)
 			}
 			if g := r.w.handoffLoss.shutdownListenCancelGaveUp.Load(); g != 0 {
 				t.Fatalf("the drain gave up %d times", g)
 			}
 		})
+	}
+}
+
+// TestStopAcceptingIgnoresAnotherSocketsAcceptEnd896 is the same for cancelAccept
+// (the pause and stopAccepting). The round-2 head's cancelAccept did not use the
+// ring-wait seam and waited in one enter that submits the cancel, so it passes
+// there; the mutant that drops the descriptor check is what this catches.
+func TestStopAcceptingIgnoresAnotherSocketsAcceptEnd896(t *testing.T) {
+	for _, rt := range closeRoutes896 {
+		for _, tc := range tiers896 {
+			t.Run(rt.name+"/"+tc.name, func(t *testing.T) {
+				r := newAcceptRig896(t, tc.tier(), true)
+				staleAcceptEnd896(t, r)
+				rt.close(r.w)
+				if err := plainBind896(r.addr); err != nil {
+					t.Fatalf("a plain bind of %s right after %s, which ended its wait on another socket's accept: %v", r.addr, rt.name, err)
+				}
+				if g := r.w.handoffLoss.shutdownListenCancelGaveUp.Load(); g != 0 {
+					t.Fatalf("%d give-ups counted", g)
+				}
+			})
+		}
 	}
 }
