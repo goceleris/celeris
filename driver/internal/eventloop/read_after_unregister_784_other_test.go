@@ -10,8 +10,7 @@ package eventloop
 // the meantime, the removal took the new conn's entry. This test parks the
 // reader in onClose to hold it there.
 //
-// CI builds this file on macOS but runs no tests there (ci.yml "Build"); the
-// test runs on a non-Linux developer host.
+// The macos-latest leg of ci.yml's "Portable fallback" job runs it.
 
 import (
 	"testing"
