@@ -100,7 +100,7 @@ func NewPortable(workers int) (*Loop, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Loop{cancel: cancel, workers: make([]loopWorker, workers)}
 	for i := range l.workers {
-		l.workers[i] = &portableOnlyWorker{portableWorker: newPortableWorker(i, ctx)}
+		l.workers[i] = &portableOnlyWorker{portableWorker: newPortableWorker(ctx, i)}
 	}
 	return l, nil
 }
@@ -122,7 +122,7 @@ func IsNetConnID(id int) bool { return id >= netConnIDBase }
 // identifiers still registered.
 const netConnIDMax = 1<<31 - 1
 
-func newPortableWorker(id int, ctx context.Context) portableWorker {
+func newPortableWorker(ctx context.Context, id int) portableWorker {
 	return portableWorker{
 		id:    id,
 		conns: make(map[int]*portableConn),
@@ -130,6 +130,7 @@ func newPortableWorker(id int, ctx context.Context) portableWorker {
 	}
 }
 
+//nolint:unparam // satisfies loopWorker, whose other workers can fail
 func (w *portableWorker) shutdown() error {
 	if !w.closed.CompareAndSwap(false, true) {
 		return nil

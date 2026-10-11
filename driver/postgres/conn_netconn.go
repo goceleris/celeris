@@ -24,6 +24,8 @@ import (
 // c.fdFile stays nil, and the loop closes the net.Conn on UnregisterConn
 // (Close) and right after onClose. The pgConn literal below mirrors the one
 // in dialConn (conn_unix.go).
+//
+//nolint:unparam // closeLoop is always nil today but retained for pool reuse, as in dialConn
 func dialConnNetConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func(), dsn DSN, workerHint int) (*pgConn, error) {
 	if err := dsn.CheckSSL(); err != nil {
 		return nil, err

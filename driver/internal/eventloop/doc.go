@@ -7,11 +7,23 @@
 // # What it provides
 //
 // A stripped-down event loop — one worker per CPU (or per request) owning
-// an epoll fd on Linux, a net.Conn per FD on other platforms — that
+// an epoll fd on Linux, a goroutine per net.Conn on other platforms — that
 // drivers use when no celeris HTTP server is available. When a Server is
 // registered via [Resolve], the Server's own [engine.EventLoopProvider] is
 // returned and the standalone loop is never created; drivers and HTTP
 // workers then share the same kernel resources.
+//
+// # The portable fallback
+//
+// Off Linux every worker is a portable one: it holds net.Conn values and
+// runs one reader goroutine per connection (portable.go). On darwin and other
+// unix hosts a caller registers a descriptor (RegisterConn), which the worker
+// duplicates into a net.Conn. Without unix descriptors (windows) a caller
+// registers the net.Conn itself through [NetConnRegistrar] and RegisterConn
+// returns [ErrNoFDRegistration]. The fallback exists so the drivers compile
+// and work for development and testing on those platforms; it is not tuned
+// and has no write queue, so Write blocks until the kernel accepts the data.
+// The portable worker is compiled on Linux too, for its tests.
 //
 // # ServerProvider indirection
 //

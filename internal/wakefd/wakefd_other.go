@@ -1,5 +1,7 @@
 //go:build !unix
 
+// Package wakefd owns an event loop's wakeup eventfd. On a platform without
+// unix descriptors it holds no eventfd at all: see [WakeFD].
 package wakefd
 
 // WakeFD on a platform without unix descriptors (windows). The engines that

@@ -26,7 +26,7 @@ func newLoop(workers int) (*Loop, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Loop{cancel: cancel, workers: make([]loopWorker, workers)}
 	for i := 0; i < workers; i++ {
-		l.workers[i] = &worker{portableWorker: newPortableWorker(i, ctx)}
+		l.workers[i] = &worker{portableWorker: newPortableWorker(ctx, i)}
 	}
 	return l, nil
 }

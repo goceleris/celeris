@@ -20,8 +20,6 @@ import (
 // initialized (including startup) and ready for queries.
 // dialConn accepts closeLoop for symmetry with Pool.dialConn; callers that
 // own the loop themselves (e.g. [Connector.Connect]) pass nil.
-//
-//nolint:unparam // closeLoop is always nil today but retained for pool reuse
 func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func(), dsn DSN, workerHint int) (*pgConn, error) {
 	if err := dsn.CheckSSL(); err != nil {
 		return nil, err

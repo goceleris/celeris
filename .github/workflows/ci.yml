@@ -2025,6 +2025,99 @@ jobs:
         run: go build ./...
         working-directory: middleware/protobuf
 
+  # Windows is a development/testing target: the drivers (redis, postgres,
+  # memcached) and the nine middleware stores built on them compile there and
+  # run on the portable goroutine-per-connection loop (celeris#937). Nothing
+  # here needs a Windows runner: a cross-compile type-checks every package for
+  # the target, including the _test.go files `go vet` loads.
+  windows-cross:
+    name: Cross-compile (windows/${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      GOOS: windows
+      GOARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2"
+      - name: Build root module
+        run: go build ./...
+      # Packages whose files are all Linux-only (the engines, test/...) have no
+      # Go files for this target and are left out by the .GoFiles filter, which
+      # also drops internal/adaptive: its shutdown_switch_877_test.go has no
+      # build constraint and does not type-check without the Linux files, on
+      # darwin either. internal/protocol/h2/stream is excluded by name because
+      # window_waiters_bench_893_test.go calls syscall.Getrusage, which Windows
+      # does not have; both are outside this job's scope (celeris#937) -- drop
+      # the exclusion once that file carries a build constraint.
+      - name: Vet root module
+        run: |
+          mapfile -t pkgs < <(go list -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v -e '/internal/protocol/h2/stream$')
+          echo "vetting ${#pkgs[@]} packages for $GOOS/$GOARCH"
+          go vet "${pkgs[@]}"
+      - name: Build middleware/compress
+        run: go build ./...
+        working-directory: middleware/compress
+      - name: Build middleware/metrics
+        run: go build ./...
+        working-directory: middleware/metrics
+      - name: Build middleware/otel
+        run: go build ./...
+        working-directory: middleware/otel
+      - name: Build middleware/protobuf
+        run: go build ./...
+        working-directory: middleware/protobuf
+
+  # The portable fallback's own tests, on the OS it exists for (windows) and on
+  # macOS, which runs the same worker code behind its descriptor wrapper. The
+  # drivers' fake-server tests (in-process servers on loopback TCP) run here
+  # whole; the integration suites against real Redis, Postgres and Memcached
+  # stay on Linux (driver-conformance). Event-loop behaviour is Linux's
+  # epoll/io_uring path and is not tested or tuned here.
+  portable-fallback:
+    name: Portable fallback (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2"
+      - name: Fallback and driver tests
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout=600s -v ./driver/internal/eventloop ./driver/redis ./driver/postgres ./driver/memcached 2>&1 | tee fallback.log
+          pass=$(grep -cE '^[[:space:]]*--- PASS: ' fallback.log || true)
+          fail=$(grep -cE '^[[:space:]]*--- FAIL: ' fallback.log || true)
+          skip=$(grep -cE '^[[:space:]]*--- SKIP: ' fallback.log || true)
+          echo "PASS $pass  FAIL $fail  SKIP $skip"
+          # A test that is absent or skipped is not a pass: name the ones that
+          # must have run and passed on this OS.
+          required="TestPortableRegisterDeliversAndWrites TestPortablePeerCloseFiresOnCloseAndReleasesConn TestPortableUnregisterClosesConnAndFiresOnCloseNil TestPortableLoopCloseFiresOnCloseForEveryConn TestPortableIdentifiers TestPortableCallbacksMayCallBackIntoTheLoop TestPortableWritesAreSerializedPerConn TestLoopWorkersAdoptNetConns TestRedisNetConnRoundTripAndClose TestRedisNetConnServerHangUpFailsPendingAndLaterCommands TestRedisNetConnDialErrorsCloseTheSocket TestRedisNetConnRegisterErrorClosesTheSocket TestMemcachedNetConnRoundTripAndClose TestMemcachedNetConnServerHangUpFailsLaterCommands TestMemcachedNetConnDialErrorsCloseTheSocket TestPgNetConnStartupRoundTripAndClose TestPgNetConnServerHangUpFailsLaterQueries TestPgNetConnLoopCloseFailsTheConn TestPgNetConnDialErrorsCloseTheSocket"
+          if [ "$RUNNER_OS" = "Windows" ]; then required="$required TestRegisterConnIsUnsupportedWithoutUnixDescriptors"; fi
+          missing=0
+          for t in $required; do
+            if ! grep -qE "^--- PASS: $t " fallback.log; then echo "required test did not pass: $t"; missing=1; fi
+          done
+          if [ "$fail" -ne 0 ] || [ "$skip" -ne 0 ] || [ "$missing" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- (FAIL|SKIP): ' fallback.log || true
+            echo "expected no FAIL, no SKIP and every required test PASS -- a skip is not coverage"
+            exit 1
+          fi
+
   vulncheck:
     name: Vulnerability Check
     runs-on: ubuntu-latest

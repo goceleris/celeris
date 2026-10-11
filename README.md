@@ -60,7 +60,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 go get github.com/goceleris/celeris@latest
 ```
 
-Requires **Go 1.27.0+** (the `go` directive in `go.mod` is the source of truth). Linux for the io_uring / epoll / adaptive engines; any OS for the std engine.
+Requires **Go 1.27.0+** (the `go` directive in `go.mod` is the source of truth). Linux for the io_uring / epoll / adaptive engines; any OS for the std engine. On Windows the server (std engine) and the database drivers build and run for development and testing; Linux is the supported production platform (see [Platform support](#platform-support)).
 
 ```go
 package main
@@ -302,6 +302,12 @@ The drivers have no TLS stack: connect them over a trusted network (loopback, a 
 
 Driver-side TLS is part of [#446](https://github.com/goceleris/celeris/issues/446).
 
+### Platform support
+
+The drivers (and the middleware stores built on them: CSRF, JWT cache, rate limit and session stores over Redis, Postgres and memcached) run on the celeris event loop on **Linux**, which is the supported production path and the one the benchmarks measure. On macOS and the other unix hosts they run on a goroutine-per-connection fallback for development and testing.
+
+On **Windows** the drivers and every store compile (`GOOS=windows go build ./...` and `go vet`), and work through the same kind of portable fallback: each connection is a `net.Conn` read by its own goroutine, with no `WithEngine` colocation, no write queue and no tuning. CI cross-compiles for windows/amd64 and windows/arm64 and runs the fallback's tests and the drivers' fake-server tests on `windows-latest` (the integration suites against real Redis, Postgres and memcached run on Linux only). Windows is not benchmarked and not a production target: deploy on Linux.
+
 ## net/http compatibility
 
 Wrap existing `net/http` handlers and middleware:
@@ -454,6 +460,7 @@ validation/     Runtime invariant assertions + validation hooks (debug builds)
 - **Go 1.27.0+** (see the `go` directive in `go.mod`)
 - **Linux** for the io_uring / epoll / adaptive engines (kernel 5.19+ for io_uring; 5.10+ for epoll and adaptive, which runs on epoll below 5.19)
 - **Any OS** for the std engine
+- **Windows**: development and testing only, with the std engine and the portable driver fallback; see [Platform support](#platform-support)
 - Direct runtime dependencies: `golang.org/x/sys` and `golang.org/x/net` only (`golang.org/x/text` is indirect)
 
 ## Ecosystem
