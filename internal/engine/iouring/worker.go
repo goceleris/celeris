@@ -6187,6 +6187,13 @@ func (w *Worker) removeDirty(cs *connState) {
 	// at all and the worst case — the stall that outlived its connection
 	// — is exactly the one that must not go missing (celeris#607).
 	w.endRecvStall(cs)
+	w.unlinkDirty(cs)
+}
+
+// unlinkDirty takes cs off the dirty list, if it is on it, and leaves an open
+// recv-arming stall episode (celeris#607) open: for a conn that stays owed
+// its arm. removeDirty is this plus the end of that episode.
+func (w *Worker) unlinkDirty(cs *connState) {
 	if !cs.dirty {
 		return
 	}
@@ -6227,15 +6234,34 @@ func (w *Worker) flushDirty() {
 			cs = next
 			continue
 		}
-		if cs.sending {
+		if cs.sending || cs.zcNotifPending {
+			// A ring SEND of this conn is outstanding (a SEND_ZC's
+			// notification counts: its first completion may have cleared
+			// sending). Nothing is retried for the conn until that
+			// completion, so give it up, as the held-completion give-up
+			// above does (celeris#811). Kept listed, it held the ring at a
+			// zero wait, a spin, for as long as the SEND stayed outstanding,
+			// which under a peer that does not read is as long as the peer
+			// holds out: a whole core for nothing. Nothing is lost by it:
+			// the completion (SEND, or the notification) arrives as a CQE
+			// that ends the wait, and completeSend sends what the SEND left
+			// (sendBuf) and what the handler wrote since (writeBuf),
+			// re-listing the conn if the SQ ring is full, and arms the recv
+			// the conn is owed; a handler's write while the SEND is
+			// outstanding lists the conn again (drainDetachQueue), and
+			// lands here again.
+			//
 			// celeris#607 witness. The retry below is gated on the
 			// send, so a connection that is owed a recv arm and has a
 			// SEND outstanding is passed over entirely — for as long
 			// as the send stays outstanding, which under a slow peer
-			// is seconds. Time the episode, once, on the way in.
+			// is seconds. Time the episode, once, on the way in. It stays
+			// open past this give-up (unlinkDirty, not removeDirty):
+			// completeSend's arm ends it, or the conn's teardown.
 			if cs.needsRecv && !cs.recvPaused && !cs.recvArmed {
 				w.beginRecvStall(cs)
 			}
+			w.unlinkDirty(cs)
 		} else {
 			if mu := cs.detachMu; mu != nil && !mu.TryLock() {
 				if dispatchBusy(cs, &cs.relinkOwed) {
@@ -6790,7 +6816,7 @@ func (w *Worker) checkTimeouts() {
 			continue
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
-		if cs.dirty || cs.sending {
+		if cs.dirty || cs.sending || cs.zcNotifPending {
 			if w.cfg.WriteTimeout > 0 && elapsed > w.cfg.WriteTimeout {
 				w.closeConn(fd)
 			}
