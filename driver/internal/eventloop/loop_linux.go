@@ -200,8 +200,8 @@ var testHookEpollWait func(queued, timeoutMs int)
 
 // testHookQueuedTurnBusy, when non-nil, runs on the worker goroutine when a
 // conn's queued read turn finds the conn's recvMu held, before the worker
-// drops the turn or waits for the lock; fresh reports whether an event of the
-// conn was merged into the turn. Tests only (celeris#881): set before the
+// drops the turn (fresh is false) or queues it again (fresh is true); fresh
+// reports whether an event of the conn was merged into the turn. Tests only (celeris#881): set before the
 // worker is created, cleared after Close.
 var testHookQueuedTurnBusy func(fd int, fresh bool)
 
