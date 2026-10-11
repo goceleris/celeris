@@ -337,9 +337,13 @@ func TestPort0PausedPortCannotBeTaken895(t *testing.T) {
 	if n := census895(t).bound[addrPort]; n != 0 {
 		t.Fatalf("%d sockets still bound to port %d after Listen returned, want 0 (the hold included)", n, addrPort)
 	}
-	if err := bindWithin656(addr, 3*time.Second); err != nil {
-		t.Fatalf("net.Listen on %s after Listen returned: %v", addr, err)
+	// An immediate bind, not bindWithin656: the port is to be free the instant
+	// Listen has returned (celeris#896), after a pause and a resume too.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("net.Listen on %s the instant Listen returned: %v", addr, err)
 	}
+	_ = ln.Close()
 }
 
 // TestFixedPortIsBoundAsGivenControl895: the control for the two above. A
