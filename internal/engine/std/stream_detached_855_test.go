@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -22,6 +24,11 @@ type dlWriter855 struct {
 	// beforeSet, if set, runs on the caller's goroutine at the start of
 	// SetWriteDeadline, before it is recorded.
 	beforeSet func(time.Time)
+	// park makes Write wait, as a socket write to a client that reads nothing
+	// does, until a write deadline in the past is set: it then fails.
+	park atomic.Bool
+	// inWrite, if set, runs in the middle of Write.
+	inWrite func()
 }
 
 func newDLWriter855() *dlWriter855 { return &dlWriter855{h: http.Header{}} }
@@ -40,8 +47,20 @@ func (w *dlWriter855) Header() http.Header { return w.h }
 func (w *dlWriter855) WriteHeader(int)     {}
 func (w *dlWriter855) Write(p []byte) (int, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.events = append(w.events, "write")
+	w.mu.Unlock()
+	if f := w.inWrite; f != nil {
+		f()
+	}
+	for w.park.Load() {
+		w.mu.Lock()
+		dl := w.writeDL
+		w.mu.Unlock()
+		if !dl.IsZero() && !dl.After(time.Now()) {
+			return 0, os.ErrDeadlineExceeded
+		}
+		time.Sleep(time.Millisecond)
+	}
 	return len(p), nil
 }
 func (w *dlWriter855) Flush() {
