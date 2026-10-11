@@ -126,16 +126,14 @@ func BenchmarkResponseSize811(b *testing.B) {
 				for b.Loop() {
 					read()
 				}
-				// The witness that the changed path ran: the share of the
-				// response bytes that went through a ring SEND (a conn with a
+				// The witness that the changed path ran: the fraction of the
+				// response bytes that went through a ring SEND (the direct
+				// write of an async handler is counted nowhere; a conn with a
 				// SEND in flight is what the dirty pass gives up). Published by
 				// the worker once per loop iteration: give it one.
 				b.StopTimer()
 				time.Sleep(200 * time.Millisecond)
-				m := e.Metrics()
-				if tot := m.RingBytes + m.InlineBytes; tot > 0 {
-					b.ReportMetric(float64(m.RingBytes)/float64(tot), "ring_share")
-				}
+				b.ReportMetric(float64(e.Metrics().RingBytes)/(float64(b.N+21)*float64(size)), "ring_frac")
 			})
 		}
 	}
