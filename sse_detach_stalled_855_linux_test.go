@@ -126,7 +126,8 @@ func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Durat
 		if err == nil {
 			break
 		}
-		if tries >= 5 {
+		time.Sleep(200 * time.Millisecond) // a ring's memlock is returned when the engine before it has closed
+		if tries >= 15 {
 			t.Fatalf("server did not start: %v", err)
 		}
 	}
@@ -223,7 +224,9 @@ func stalledCells855(shapes ...stalledShape855) []struct {
 func TestStalledSSEEndsWithShutdown855(t *testing.T) {
 	for _, cell := range stalledCells855(shapeTight855, shapeTick855, shapeQueue855) {
 		t.Run(cell.name, func(t *testing.T) {
-			t.Parallel()
+			if cell.eng == celeris.Std {
+				t.Parallel() // the native cells start one at a time: at 8 MiB of RLIMIT_MEMLOCK several rings at once fail ENOMEM
+			}
 			st := stallBegin855(t, cell.eng, 30*time.Second, time.Second, cell.shape, cell.h2c, 0)
 			time.Sleep(time.Second) // the client reads nothing; the socket buffers fill
 			if st.hret.Load() != 0 {
@@ -326,7 +329,9 @@ func TestStalledSSEEndsWhenItsHandlerIsBounded855(t *testing.T) {
 	)
 	for _, cell := range stalledCells855(shapeTight855, shapeClose855) {
 		t.Run(cell.name, func(t *testing.T) {
-			t.Parallel()
+			if cell.eng == celeris.Std {
+				t.Parallel() // the native cells start one at a time: at 8 MiB of RLIMIT_MEMLOCK several rings at once fail ENOMEM
+			}
 			start := time.Now()
 			st := stallBegin855(t, cell.eng, wt, 10*time.Second, cell.shape, cell.h2c, bound)
 			limit := bound + wt + 3*time.Second
