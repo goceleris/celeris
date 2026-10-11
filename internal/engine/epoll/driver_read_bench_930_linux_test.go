@@ -150,6 +150,8 @@ func BenchmarkHTTPBesideFlood930(b *testing.B) {
 }
 
 func BenchmarkDriverFloodThroughput930(b *testing.B) {
+	c930FeederSpin.Store(true)
+	defer c930FeederSpin.Store(false)
 	for _, perChunk := range []time.Duration{0, 100 * time.Microsecond} {
 		b.Run(fmt.Sprintf("onRecv=%v", perChunk), func(b *testing.B) {
 			eng, stop := newTestEngine(b)

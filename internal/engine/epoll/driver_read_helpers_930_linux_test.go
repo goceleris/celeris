@@ -10,6 +10,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,11 @@ import (
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
+
+// c930FeederSpin makes the flood's feeder spin on EAGAIN instead of sleeping 10 us, which a timer in a VM
+// stretches into a bubble of the feeder's pipeline. The throughput benchmark sets it, so that it measures
+// the loop and not the feeder's back-off.
+var c930FeederSpin atomic.Bool
 
 // c930Socketpair is socketpairNonblocking for tests and benchmarks.
 func c930Socketpair(tb testing.TB) (int, int) {
@@ -199,7 +205,11 @@ func c930FloodCounting(t testing.TB, wl engine.WorkerLoop, perChunk time.Duratio
 				f.fed.Add(int64(n))
 			}
 			if err == unix.EAGAIN {
-				time.Sleep(10 * time.Microsecond)
+				if c930FeederSpin.Load() {
+					runtime.Gosched()
+				} else {
+					time.Sleep(10 * time.Microsecond)
+				}
 				continue
 			}
 			if err != nil {
