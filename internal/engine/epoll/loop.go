@@ -301,6 +301,14 @@ type Loop struct {
 	driverGen      uint32
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
+	// driverReadQ holds the driver conns whose last read turn used up
+	// driverReadBudget with bytes possibly left (loop thread only).
+	// Edge-triggered epoll does not report bytes already in the socket again,
+	// so the loop gives each of them one more turn per round, after that
+	// round's batch (serveDriverReadQ), and does not wait in epoll_wait while
+	// one is queued. driverReadQNext is the spare backing array the queue swaps
+	// with, so a turn costs no allocation (celeris#930).
+	driverReadQ, driverReadQNext []*driverConn
 	// ctlMu guards epollFD against the driver goroutines, which issue
 	// epoll_ctl on it from outside the loop thread. shutdown takes it as a
 	// writer before it closes the descriptor (closeEpollFD), so a driver's
@@ -592,6 +600,16 @@ func (l *Loop) run(ctx context.Context) {
 			timeoutMs = h2PoolDrainPollMs
 		}
 
+		// A driver conn is owed a read turn (celeris#930): collect what is
+		// ready and do not wait. Last, after every cap above, because
+		// edge-triggered epoll will not report the bytes it is owed again.
+		if len(l.driverReadQ) > 0 {
+			timeoutMs = 0
+			if h := testHookDriverQueueWait; h != nil {
+				h(len(l.driverReadQ), timeoutMs)
+			}
+		}
+
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
 		if err != nil {
 			if err == unix.EINTR {
@@ -600,6 +618,10 @@ func (l *Loop) run(ctx context.Context) {
 			l.logger.Error("epoll_wait error", "loop", l.id, "err", err)
 			continue
 		}
+		// The driver conns owed a turn from an earlier round. A conn that
+		// uses up its budget while this batch is dispatched waits for the
+		// next round (celeris#930).
+		owedDriverReads := len(l.driverReadQ)
 
 		var now int64
 		if n > 0 {
@@ -773,6 +795,12 @@ func (l *Loop) run(ctx context.Context) {
 				// (celeris#761).
 				cs.pendingBytes = csPendingBytes(cs)
 			}
+		}
+
+		// The read turns driver conns are owed (celeris#930), after this
+		// batch's HTTP responses have gone out.
+		if owedDriverReads != 0 {
+			l.serveDriverReadQ(owedDriverReads)
 		}
 
 		// (flushBatchedCounters, at shutdown, repeats these three flushes:

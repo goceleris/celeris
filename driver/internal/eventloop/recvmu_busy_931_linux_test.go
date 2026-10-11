@@ -9,6 +9,7 @@ package eventloop
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,5 +134,227 @@ func TestAWorkerDoesNotWaitOnTheRecvMuOfAPollingCaller931(t *testing.T) {
 	// so a B served less than 10 ms before the end was held for the call.
 	if end.Sub(at) < 10*time.Millisecond {
 		t.Errorf("B was served %v after its byte and only %v before the WriteAndPollMulti call returned: the worker waited on X's recvMu for the caller", at.Sub(sent), end.Sub(at))
+	}
+}
+
+// TestAnEventTurnThatFindsRecvMuHeldIsKeptAndRetried931: the turn for an event
+// of a conn that was not queued finds the conn's recvMu held by a
+// WriteAndPoll* call. The worker must not drop the turn (the event can be the
+// re-arm's own report, and no other event would come for its bytes) and must
+// not poll for it with timeout 0. The worker is parked in P. X's owner calls
+// WriteAndPollMulti(X): X is empty, so the call polls once and gives up. After
+// its re-arm, with recvMu still held (testHookAfterRearm), a byte z is written
+// into X, and P is let go. The worker collects X's event for z and finds
+// recvMu held (testHookEventTurnBusy). The call holds on until the worker has
+// made three epoll_waits with the turn queued, every one with the busy
+// timeout, and then lets go. z must reach X's onRecv.
+func TestAnEventTurnThatFindsRecvMuHeldIsKeptAndRetried931(t *testing.T) {
+	x, xPeer := socketPair(t)
+	var recording atomic.Bool
+	var waits, wrongTimeout atomic.Int64
+	testHookEpollWait = func(queued, timeoutMs int) {
+		if queued > 0 && recording.Load() {
+			waits.Add(1)
+			if timeoutMs != busyRetryMs {
+				wrongTimeout.Add(1)
+			}
+		}
+	}
+	busy := make(chan struct{}, 1)
+	testHookEventTurnBusy = func(fd int) {
+		if fd == x {
+			select {
+			case busy <- struct{}{}:
+			default:
+			}
+		}
+	}
+	t.Cleanup(func() { testHookEpollWait, testHookEventTurnBusy = nil, nil }) // runs last, after Close
+	l, err := New(1)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	w := l.WorkerLoop(0).(*worker)
+
+	gotZ := make(chan struct{})
+	var zOnce sync.Once
+	if err := w.RegisterConn(x, func(b []byte) {
+		if len(b) > 0 && b[len(b)-1] == 'z' {
+			zOnce.Do(func() { close(gotZ) })
+		}
+	}, func(error) {}); err != nil {
+		t.Fatalf("RegisterConn(X): %v", err)
+	}
+	t.Cleanup(func() { _ = w.UnregisterConn(x); _ = unix.Close(x); _ = unix.Close(xPeer) })
+	p := c881NewParker(t, w)
+	c784Queue(t, p.peer, []byte("p"))
+	c881Wait(t, p.entered, "P parked the worker")
+
+	var sawBusy atomic.Bool
+	var rearms atomic.Int32
+	testHookAfterRearm = func(fd int) {
+		if fd != x || rearms.Add(1) != 1 {
+			return
+		}
+		if _, err := unix.Write(xPeer, []byte{'z'}); err != nil {
+			t.Errorf("write z: %v", err)
+		}
+		recording.Store(true)
+		p.let()
+		select {
+		case <-busy:
+			sawBusy.Store(true)
+		case <-time.After(5 * time.Second):
+			return
+		}
+		for dl := time.Now().Add(5 * time.Second); waits.Load() < 3 && time.Now().Before(dl); {
+			time.Sleep(time.Millisecond)
+		}
+		recording.Store(false)
+	}
+	callDone := make(chan struct{})
+	go func() {
+		defer close(callDone)
+		_, _ = w.WriteAndPollMulti(x, nil, make([]byte, 1024), func([]byte) {}, func() bool { return true }, nil)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-callDone:
+		case <-time.After(15 * time.Second):
+		}
+		testHookAfterRearm = nil
+	})
+	select {
+	case <-callDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the WriteAndPollMulti call did not return within 15 s")
+	}
+	delivered := false
+	select {
+	case <-gotZ:
+		delivered = true
+	case <-time.After(2 * time.Second):
+	}
+	t.Logf("C931 event turn kept: the turn found recvMu held: %v; epoll_waits with it queued while the call held on: %d, of which with another timeout than %d ms: %d; z reached X's onRecv: %v",
+		sawBusy.Load(), waits.Load(), busyRetryMs, wrongTimeout.Load(), delivered)
+	if !sawBusy.Load() {
+		t.Fatal("the turn for X's event never found X's recvMu held: the test did not drive the window")
+	}
+	if wrongTimeout.Load() != 0 {
+		t.Errorf("%d of the worker's %d epoll_waits with the busy turn queued did not use the %d ms retry timeout: 0 spins, a longer one delays the retry", wrongTimeout.Load(), waits.Load(), busyRetryMs)
+	}
+	if !delivered {
+		t.Errorf("z, written after the call's re-arm while it held X's recvMu, never reached X's onRecv: the worker dropped the turn its event was dispatched for")
+	}
+}
+
+// TestAFreshQueuedTurnDoesNotWaitForAPollingCaller931: the queued turn of X
+// has an event merged into it and finds X's recvMu held. The worker must keep
+// the turn without waiting for the call (the 881 tests pin that it is kept):
+// B, on the same worker, must be served while the call still holds X's
+// recvMu. X is queued, empty, and the worker parked in P (c881QueueX). X's
+// owner calls WriteAndPollMulti(X). After its re-arm, with recvMu held, z is
+// written into X and P is let go; the next round merges X's event into its
+// queued turn and finds recvMu held (testHookQueuedTurnBusy); then B is sent
+// a byte, and the call lets go only when B is served or after 5 s.
+func TestAFreshQueuedTurnDoesNotWaitForAPollingCaller931(t *testing.T) {
+	x, xw := c881Pipe(t)
+	busy := make(chan bool, 1)
+	testHookQueuedTurnBusy = func(fd int, fresh bool) {
+		if fd == x {
+			select {
+			case busy <- fresh:
+			default:
+			}
+		}
+	}
+	t.Cleanup(func() { testHookQueuedTurnBusy = nil }) // runs last, after Close
+	l, err := New(1)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	w := l.WorkerLoop(0).(*worker)
+
+	var xBytes atomic.Int64
+	gotZ := make(chan struct{})
+	var zOnce sync.Once
+	if err := w.RegisterConn(x, func(b []byte) {
+		xBytes.Add(int64(len(b)))
+		if len(b) > 0 && b[len(b)-1] == 'z' {
+			zOnce.Do(func() { close(gotZ) })
+		}
+	}, func(error) {}); err != nil {
+		t.Fatalf("RegisterConn(X): %v", err)
+	}
+	t.Cleanup(func() { _ = w.UnregisterConn(x); _ = unix.Close(x); _ = unix.Close(xw) })
+	b, bPeer := socketPair(t)
+	bServed := make(chan struct{})
+	var bOnce sync.Once
+	if err := w.RegisterConn(b, func([]byte) { bOnce.Do(func() { close(bServed) }) }, func(error) {}); err != nil {
+		t.Fatalf("RegisterConn(B): %v", err)
+	}
+	t.Cleanup(func() { _ = w.UnregisterConn(b); _ = unix.Close(b); _ = unix.Close(bPeer) })
+
+	p := c881QueueX(t, w, x, xw, &xBytes)
+
+	var sawBusy, fresh, servedWhileHeld atomic.Bool
+	var rearms atomic.Int32
+	testHookAfterRearm = func(fd int) {
+		if fd != x || rearms.Add(1) != 1 {
+			return
+		}
+		if _, err := unix.Write(xw, []byte{'z'}); err != nil {
+			t.Errorf("write z: %v", err)
+		}
+		p.let()
+		select {
+		case f := <-busy:
+			sawBusy.Store(true)
+			fresh.Store(f)
+		case <-time.After(5 * time.Second):
+			return
+		}
+		c784Queue(t, bPeer, []byte{'b'})
+		select {
+		case <-bServed:
+			servedWhileHeld.Store(true)
+		case <-time.After(5 * time.Second):
+		}
+	}
+	callDone := make(chan struct{})
+	go func() {
+		defer close(callDone)
+		_, _ = w.WriteAndPollMulti(x, nil, make([]byte, 1024), func([]byte) {}, func() bool { return true }, nil)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-callDone:
+		case <-time.After(15 * time.Second):
+		}
+		testHookAfterRearm = nil
+	})
+	select {
+	case <-callDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the WriteAndPollMulti call did not return within 15 s")
+	}
+	delivered := false
+	select {
+	case <-gotZ:
+		delivered = true
+	case <-time.After(2 * time.Second):
+	}
+	t.Logf("C931 fresh queued turn: found recvMu held: %v (event merged: %v); B served while the call held X's recvMu: %v; z reached X's onRecv: %v",
+		sawBusy.Load(), fresh.Load(), servedWhileHeld.Load(), delivered)
+	if !sawBusy.Load() || !fresh.Load() {
+		t.Fatal("X's queued turn did not find recvMu held with an event merged into it: the test did not drive the window")
+	}
+	if !servedWhileHeld.Load() {
+		t.Errorf("B was not served while the call held X's recvMu: the worker waited for recvMu in X's queued turn")
+	}
+	if !delivered {
+		t.Errorf("z never reached X's onRecv")
 	}
 }
