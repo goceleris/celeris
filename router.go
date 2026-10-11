@@ -224,10 +224,14 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 // SAFETY: do NOT call .Sync() (or .Async(false)) on a WebSocket / SSE
 // handler — detached flows run async by construction.
 //
-// An async route may call [runtime.Goexit] (t.FailNow, t.Fatal and t.SkipNow
-// in a test's handler, or a library that does): the engine closes that
-// connection and logs an Error, and the loop keeps serving every other
-// connection. A route that runs inline must not: see [Route.Sync].
+// An async route's handler does not run on the event loop, so a
+// [runtime.Goexit] in it (t.FailNow, t.Fatal and t.SkipNow in a test's
+// handler, or a library that does) does not end the loop; the loop keeps
+// serving. What the Goexit costs depends on the protocol. On HTTP/1.1 the
+// engine closes that connection and logs an Error. On HTTP/2 the stream's
+// goroutine ends and the stream gets no response and no RST_STREAM, nothing is
+// logged, and the connection stays open: the client waits until its own
+// timeout. A route that runs inline must not call Goexit: see [Route.Sync].
 //
 // Precedence is route > group > server default. Must be called before
 // [Server.Start]. Chainable. Async() with no argument means true; the
@@ -264,17 +268,23 @@ func (r *Route) Async(opt ...bool) *Route {
 // what t.FailNow, t.Fatal and t.SkipNow in a test's handler do, and what some
 // libraries do. A route runs inline when it is marked Sync, when it is not
 // marked and [Config.AsyncHandlers] is false, and, with AsyncHandlers, until
-// a timed run of it promotes it. On the epoll and io_uring engines (and
+// a timed run of it promotes it (a promotion lasts a few seconds, after which
+// the route is timed inline again). On the epoll and io_uring engines (and
 // [Adaptive], which runs both) an inline handler runs on the event-loop
 // goroutine, and a Goexit cannot be recovered: it ends that loop for good.
 // Every connection the loop owns goes unserved, and the loop's own
 // SO_REUSEPORT listener stops accepting, so a share of new connections hang.
 // The engine logs an Error ("... ended without returning", with the engine,
-// the loop or worker id and the number of connections it owned) and cannot
-// recover. Mark such a route [Route.Async]: a Goexit there ends that
-// connection only. The [Std] engine runs each request on its own goroutine,
-// where a Goexit ends only that request. Panics are different: the router
-// answers a panic in a handler with a 500.
+// the loop or worker id, the number of connections it owned and the stack of
+// the Goexit) and cannot recover. On HTTP/2 only a stream that runs inline
+// does this; a stream that runs on the h2 worker pool anyway (one with a
+// request body, say) ends silently instead, see [Route.Async]. Mark such a
+// route [Route.Async]: the loop survives a Goexit there (on HTTP/1.1 that
+// connection is closed and an Error is logged; on HTTP/2 the stream gets no
+// answer and nothing is logged). The [Std] engine runs each request on its own
+// goroutine, where a Goexit ends that request's goroutine (net/http closes an
+// HTTP/1.1 connection). Panics are different: the router answers a panic in a
+// handler with a 500.
 func (r *Route) Sync() *Route {
 	return r.setAsync(false)
 }

@@ -26,13 +26,24 @@ type Hijacker interface {
 // it is made the first time a use of the stream asks for it (celeris#836),
 // so a stream whose handler never asks costs no allocation.
 //
-// On the epoll and io_uring engines a handler that panics or calls
-// runtime.Goexit has two defined outcomes. On the async path (an async route)
-// the conn is closed and an Error is
-// logged. On the sync (inline) path the handler runs on the engine's
-// event-loop goroutine: a panic that escapes it ends the process, and a
-// Goexit ends that loop (the engine logs an Error, celeris#848), so a
-// sync handler must not call runtime.Goexit.
+// On the epoll and io_uring engines a handler that calls runtime.Goexit has
+// two outcomes on HTTP/2, depending on where the stream runs. Neither can be
+// recovered (recover() returns nil for a Goexit).
+//
+// An inline stream (no request body, and the route is not async, see
+// Processor.canRunInline) runs on the engine's event-loop goroutine: a Goexit
+// ends that loop for good, and the engine logs one Error, "... goroutine ended
+// without returning" (celeris#848). A panic is recovered here and the stream
+// is closed without a response. Through the celeris router a panic is a 500
+// first.
+//
+// A stream that runs on the h2 worker pool (an async route, a stream with a
+// request body, one that arrives while the connection is over its outbound
+// budget) is different: executeHandler retires the stream silently. The stream
+// gets no response and no RST_STREAM, nothing is logged, the connection is not
+// closed and keeps serving its other streams, and the pool goroutine that ran
+// the handler ends. Marking a route async keeps a Goexit off the event loop;
+// it does not make the Goexit visible.
 type Handler interface {
 	HandleStream(ctx context.Context, stream *Stream) error
 }

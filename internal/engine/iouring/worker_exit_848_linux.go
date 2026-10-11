@@ -2,7 +2,10 @@
 
 package iouring
 
-import "context"
+import (
+	"context"
+	"runtime/debug"
+)
 
 // runWatched runs worker w and reports a run that ends without returning.
 //
@@ -43,12 +46,16 @@ func (e *Engine) reportWorkerExit(w *Worker) {
 	if w.logger == nil {
 		return
 	}
+	// debug.Stack here shows the frames of the call that ended the goroutine:
+	// deferred calls run before a Goexit unwinds, so the handler (or callback)
+	// frame and the runtime.Goexit call are still on the stack. Exit path only.
 	w.logger.Error("io_uring worker goroutine ended without returning: "+
-		"a synchronous handler called runtime.Goexit (t.FailNow, t.Fatal, t.SkipNow or a library that does) or panicked; "+
+		"a handler or callback on this worker goroutine called runtime.Goexit (t.FailNow, t.Fatal, t.SkipNow or a library that does), or a panic unwound it; "+
 		"the connections this worker owned will not be served again and this worker's SO_REUSEPORT listener will not accept; "+
 		"synchronous (non-Async) handlers must not call runtime.Goexit (celeris#848)",
 		"engine", "io_uring",
 		"worker", w.id,
 		"conns", len(w.liveConns),
+		"stack", string(debug.Stack()),
 	)
 }

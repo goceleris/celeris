@@ -188,6 +188,12 @@ func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 	if n, err := strconv.Atoi(r.attrs["conns"]); err != nil || n < 1 || n > len(conns) {
 		t.Errorf("conns = %q, want 1..%d (the loop's share of %d conns, the boom conn among them)", r.attrs["conns"], len(conns), len(conns))
 	}
+	// The stack names the call that ended the goroutine, so an operator can find the handler.
+	for _, w := range []string{"runtime.Goexit", "goexitHandler848"} {
+		if !strings.Contains(r.attrs["stack"], w) {
+			t.Errorf("stack attr lacks %q:\n%s", w, r.attrs["stack"])
+		}
+	}
 }
 
 func TestNormalWorkerReturnsAreNotCounted848(t *testing.T) {

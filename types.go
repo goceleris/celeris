@@ -14,9 +14,12 @@ import "time"
 // good: every connection the loop owns goes unserved and the loop's listener
 // stops accepting. The engine logs an Error ("... ended without returning")
 // when that happens, and cannot recover from it. On an [Route.Async] route
-// the Goexit ends that connection only, and the engine logs an Error. The
-// [Std] engine runs each request on its own goroutine, so a Goexit there ends
-// that request's goroutine only. See [Route.Async] and [Route.Sync].
+// the loop keeps serving, but what the Goexit costs depends on the protocol:
+// on HTTP/1.1 it ends that connection and the engine logs an Error; on HTTP/2
+// it ends only that stream's goroutine, which gets no response, and nothing is
+// logged. The [Std] engine runs each request on its own goroutine, so a
+// Goexit there ends that request's goroutine only. See [Route.Async] and
+// [Route.Sync].
 type HandlerFunc func(*Context) error
 
 // DefaultMaxFormSize is the default maximum memory used for multipart form

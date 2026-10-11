@@ -2,7 +2,10 @@
 
 package epoll
 
-import "context"
+import (
+	"context"
+	"runtime/debug"
+)
 
 // runWatched runs loop l and reports a run that ends without returning.
 //
@@ -43,12 +46,16 @@ func (e *Engine) reportLoopExit(l *Loop) {
 	if l.logger == nil {
 		return
 	}
+	// debug.Stack here shows the frames of the call that ended the goroutine:
+	// deferred calls run before a Goexit unwinds, so the handler (or callback)
+	// frame and the runtime.Goexit call are still on the stack. Exit path only.
 	l.logger.Error("epoll loop goroutine ended without returning: "+
-		"a synchronous handler called runtime.Goexit (t.FailNow, t.Fatal, t.SkipNow or a library that does) or panicked; "+
+		"a handler or callback on this loop goroutine called runtime.Goexit (t.FailNow, t.Fatal, t.SkipNow or a library that does), or a panic unwound it; "+
 		"the connections this loop owned will not be served again and this loop's SO_REUSEPORT listener will not accept; "+
 		"synchronous (non-Async) handlers must not call runtime.Goexit (celeris#848)",
 		"engine", "epoll",
 		"loop", l.id,
 		"conns", len(l.liveConns),
+		"stack", string(debug.Stack()),
 	)
 }

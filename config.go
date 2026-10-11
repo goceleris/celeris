@@ -225,8 +225,10 @@ type Config struct {
 	// libraries): on the native engines it runs on the event-loop goroutine,
 	// and a Goexit ends that loop for good, leaving its connections and its
 	// SO_REUSEPORT listener unserved. The engine logs an Error and cannot
-	// recover; see [Route.Sync]. An [Route.Async] route's handler may
-	// Goexit: only its connection ends.
+	// recover; see [Route.Sync]. An [Route.Async] route's handler does not run
+	// on the loop, so a Goexit there leaves the loop serving: on HTTP/1.1 it
+	// closes that connection and logs an Error; on HTTP/2 the stream gets no
+	// answer and nothing is logged (see [Route.Async]).
 	//
 	// A handler that runs inline runs on a thread the native engines (epoll,
 	// io_uring) pinned to one CPU, and a process it starts inherits that pin:

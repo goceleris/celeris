@@ -335,6 +335,12 @@ func TestSyncRouteGoexitIsLoud848(t *testing.T) {
 					t.Errorf("record text lacks %q: %s", w, rc.msg)
 				}
 			}
+			// The stack names the call that ended the goroutine, so an operator can find the handler.
+			for _, w := range []string{"runtime.Goexit", "tryStart848"} {
+				if st := attrStr848(rc.attrs["stack"]); !strings.Contains(st, w) {
+					t.Errorf("stack attr lacks %q:\n%s", w, st)
+				}
+			}
 			if witnessClass != "timeout" && witnessClass != "closed" {
 				t.Errorf("PREMISE: the witness conn on the faulted worker was answered (%s): the loop did not die, so the record would be false", witnessClass)
 			}
