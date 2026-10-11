@@ -66,6 +66,11 @@ func TestIouringStalledAsyncSendDoesNotBusyPollThroughTheServer811(t *testing.T)
 					s.GET("/small", func(c *celeris.Context) error { return c.String(http.StatusOK, "small") }).Async()
 				})
 
+			i0, it0 := busyCPU811(t), time.Now()
+			time.Sleep(time.Second)
+			t.Logf("celeris811 IDLE engine=%s window_ms=%d cpu_ms=%.1f", e.name, time.Since(it0).Milliseconds(),
+				float64(busyCPU811(t)-i0)/1e6)
+
 			type client struct {
 				c  net.Conn
 				br *bufio.Reader

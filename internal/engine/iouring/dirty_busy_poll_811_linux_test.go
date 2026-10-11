@@ -245,6 +245,12 @@ func TestIouringStalledAsyncSendDoesNotBusyPoll811(t *testing.T) {
 	t.Logf("celeris811 engine workers=%d tier=%s memlock_kib=%s tier_env=%q", e.NumWorkers(), tier844(e),
 		memlock811(), os.Getenv("CELERIS_MAX_IOURING_TIER"))
 
+	// The idle baseline: the same process, the engine up, nothing connected. A
+	// red run is read against it.
+	i0, it0 := cpu811(t), time.Now()
+	time.Sleep(time.Second)
+	t.Logf("celeris811 IDLE window_ms=%d cpu_ms=%.1f", time.Since(it0).Milliseconds(), float64(cpu811(t)-i0)/1e6)
+
 	for _, pipelined := range []bool{false, true} {
 		arm := "single"
 		if pipelined {
