@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -121,4 +122,45 @@ func BenchmarkPauseResumeCycle896(b *testing.B) {
 	}
 	b.ReportMetric(float64(pauseNs)/float64(b.N)/1e3, "pause-us/op")
 	b.ReportMetric(float64(resumeNs)/float64(b.N)/1e3, "resume-us/op")
+}
+
+// BenchmarkCancelAccept896 is the cost of the close that celeris#896 changed
+// for the pause and for stopAccepting, with the engine taken out of the way: a
+// worker with an accept armed on a listen socket, closed by stopAccepting (the
+// ring's cancel, the wait for the cancel to take, the close). The setup of each
+// iteration (ring, socket, armed accept) is not timed. It builds on origin/main
+// too, where the same call places a skip-success cancel and waits in one enter.
+func BenchmarkCancelAccept896(b *testing.B) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var closeNs int64
+	for range b.N {
+		ring, err := NewRing(64, 0, 0)
+		if err != nil {
+			b.Skipf("NewRing: %v", err)
+		}
+		pl, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			b.Fatalf("pick a port: %v", err)
+		}
+		addr := pl.Addr().String()
+		_ = pl.Close()
+		lfd, err := createListenSocket(addr, false)
+		if err != nil {
+			b.Fatalf("createListenSocket: %v", err)
+		}
+		w := newLedgerWorker(lfd)
+		w.ring = ring
+		w.listenFD = lfd
+		w.handoffLoss = &handoffLossStats{}
+		w.prepareAccept()
+		if _, err := w.ring.Submit(); err != nil {
+			b.Fatalf("submit accept: %v", err)
+		}
+		t0 := time.Now()
+		w.stopAccepting(context.Background())
+		closeNs += time.Since(t0).Nanoseconds()
+		_ = ring.Close()
+	}
+	b.ReportMetric(float64(closeNs)/float64(b.N)/1e3, "close-us/op")
 }
