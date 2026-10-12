@@ -41,8 +41,12 @@
 // Unless [Config.IgnoreCacheControl] is set, the middleware honors
 // directives on the handler's response:
 //
-//   - no-store, private → the response is not cached
-//   - max-age=N         → TTL is capped at min(Config.TTL, N seconds)
+//   - no-store, private, no-cache → the response is not cached
+//   - max-age=0                   → the response is not cached
+//   - max-age=N (N > 0)           → TTL is capped at min(Config.TTL, N seconds)
+//
+// A no-cache or max-age=0 response is not stored because a stored one
+// would be served without the revalidation the origin asked for.
 //
 // # Invalidation
 //

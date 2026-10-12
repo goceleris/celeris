@@ -210,12 +210,12 @@ func capture(c *celeris.Context, cfg Config, include, exclude map[string]struct{
 				// is both correct and ~10x faster than strings.EqualFold.
 				if h[0] == "cache-control" {
 					v := strings.ToLower(h[1])
-					if strings.Contains(v, "no-store") || strings.Contains(v, "private") {
+					if forbidsStorage(v) {
 						cacheable = false
 						break
 					}
 					if secs, ok := parseMaxAge(v); ok {
-						if d := time.Duration(secs) * time.Second; d > 0 && d < effectiveTTL {
+						if d := time.Duration(secs) * time.Second; d < effectiveTTL {
 							effectiveTTL = d
 						}
 					}
@@ -295,6 +295,48 @@ func filterHeaders(hs [][2]string, include, exclude map[string]struct{}) [][2]st
 		out = append(out, h)
 	}
 	return out
+}
+
+// forbidsStorage reports whether a lowercased Cache-Control value says the
+// response must not be stored: no-store and private, as before, and now
+// no-cache (a stored response must be revalidated before every reuse, which
+// this cache does not do; the field-qualified form no-cache="x" is treated
+// the same, as the cautious reading) and max-age=0 (stale the moment it is
+// made). The directives are matched as tokens, so x-private-ext is not
+// private (celeris#888 item 27).
+func forbidsStorage(cc string) bool {
+	for len(cc) > 0 {
+		var d string
+		d, cc = nextDirective(cc)
+		name, val, _ := strings.Cut(d, "=")
+		switch strings.TrimSpace(name) {
+		case "no-store", "private", "no-cache":
+			return true
+		case "max-age":
+			if n, ok := parseMaxAge("max-age=" + strings.TrimSpace(val)); ok && n == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// nextDirective splits the first comma-separated directive off a
+// Cache-Control value; a comma inside a quoted string (no-cache="a, b") does
+// not end it.
+func nextDirective(cc string) (directive, rest string) {
+	inQuote := false
+	for i := 0; i < len(cc); i++ {
+		switch cc[i] {
+		case '"':
+			inQuote = !inQuote
+		case ',':
+			if !inQuote {
+				return cc[:i], cc[i+1:]
+			}
+		}
+	}
+	return cc, ""
 }
 
 func parseMaxAge(cc string) (int, bool) {
