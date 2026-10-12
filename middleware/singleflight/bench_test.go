@@ -82,3 +82,24 @@ func BenchmarkDefaultKeyManyHeaders(b *testing.B) {
 		_ = defaultKeyFunc(c)
 	}
 }
+
+// BenchmarkSingleflightMissManyHeaders is the whole middleware (the key, the
+// Range lookup of the bypass check, the call) for a request with thirty
+// headers, the end-to-end counterpart of BenchmarkDefaultKeyManyHeaders: the
+// default key makes seven header lookups where main's made three plus five in
+// the bypass check, so only this number says what the move cost.
+func BenchmarkSingleflightMissManyHeaders(b *testing.B) {
+	opts := []celeristest.Option{celeristest.WithHeader("accept-encoding", "gzip, deflate, br, zstd")}
+	for i := range 29 {
+		opts = append(opts, celeristest.WithHeader("x-hdr-"+strconv.Itoa(i), "value"))
+	}
+	opts = append(opts, celeristest.WithHandlers(New(), func(c *celeris.Context) error {
+		return c.Blob(200, "text/plain", []byte("hello"))
+	}))
+	b.ReportAllocs()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/items", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
