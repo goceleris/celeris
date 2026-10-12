@@ -1,6 +1,7 @@
 package std
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -93,6 +94,22 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if r.Body != nil && r.Body != http.NoBody {
 		maxBodySize := b.engine.cfg.MaxRequestBodySize // 0 = unlimited (after WithDefaults)
+		// A declared Content-Length over the limit is refused before a byte
+		// of the body is read: the client may never send it, and the read
+		// below would wait for the bytes (or for ReadTimeout). No length
+		// declared (-1, chunked) keeps the read, which stops one byte past
+		// the limit. The body is left unread, so on HTTP/1 the answer says
+		// Connection: close: otherwise net/http reads up to 256 KiB of it
+		// before it writes the answer. Not on HTTP/2, where it would end the
+		// whole connection.
+		if maxBodySize > 0 && r.ContentLength > maxBodySize {
+			b.engine.metrics.errs.RequestBody.Add(1)
+			if r.ProtoMajor == 1 {
+				w.Header().Set("Connection", "close")
+			}
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		var body []byte
 		var err error
 		if maxBodySize > 0 {
@@ -240,8 +257,8 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 //
 // Nothing then ends a stream whose client stays connected and reads nothing,
 // so the stream's writes are bounded the way the WebSocket middleware bounds
-// its own: a write that has not finished within WriteTimeout is failed, and when the drain
-// budget runs out the writes fail (see detachedWrites). No deadline is set per
+// its own: a write that has not finished within WriteTimeout is failed, and
+// when the drain budget runs out the writes fail (see detachedWrites). No deadline is set per
 // write: a detached stream's Write and Flush only note when they started.
 // Runs when a stream starts, never per request.
 //
@@ -253,8 +270,18 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 // TestSSEStaysOpenPastServerTimeouts855 pin that. The error of the write
 // deadline is ignored: a writer that cannot set one (http.ErrNotSupported) has
 // none armed to clear.
+//
+// A writer whose connection was hijacked first is left alone: the connection
+// is the caller's, so no deadline is armed on it, here or when the request
+// ends. Context.Detach does not call this after a Hijack; the check keeps a
+// direct caller from arming one.
 func (rw *stdResponseWriter) StreamDetached() {
-	if _, ok := rw.w.(*detachedWriter); ok {
+	switch rw.w.(type) {
+	case *detachedWriter:
+		return
+	case *hijackedWriter:
+		// Hijack came first: the connection is the caller's, with no deadline
+		// of ours on it, and none is armed here or when the request ends.
 		return
 	}
 	rc := http.NewResponseController(rw.w)
@@ -288,8 +315,28 @@ func (rw *stdResponseWriter) Hijack(s *stream.Stream) (net.Conn, error) {
 	conn, _, err := h.Hijack()
 	if err == nil {
 		s.SetHeadersSent()
+		// A detached writer has ended its watchdog through its own Hijack. A
+		// plain one is marked, so a Detach after the Hijack leaves it alone
+		// (StreamDetached), as the hijacked connection is the caller's.
+		// stdResponseWriter has no room for a flag (TestStdResponseWriterSize855).
+		if _, detached := rw.w.(*detachedWriter); !detached {
+			rw.w = &hijackedWriter{ResponseWriter: rw.w}
+		}
 	}
 	return conn, err
+}
+
+// hijackedWriter stands in for a plain net/http writer after a successful
+// Hijack (see stdResponseWriter.Hijack). It embeds the writer, so a Write
+// after the Hijack still fails with net/http's http.ErrHijacked; it has no
+// Unwrap, Flush or SetWriteDeadline of its own, so nothing reaches the
+// hijacked connection through it. That includes Flush: a Flush on the
+// stdResponseWriter after a Hijack is a no-op.
+type hijackedWriter struct{ http.ResponseWriter }
+
+// Hijack on a connection already hijacked: net/http's own answer.
+func (*hijackedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, http.ErrHijacked
 }
 
 var _ stream.Hijacker = (*stdResponseWriter)(nil)

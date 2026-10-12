@@ -55,6 +55,18 @@ func ToHandler(h HandlerFunc) http.Handler {
 		s.Headers = hdrs
 
 		if r.Body != nil && r.Body != http.NoBody {
+			// A declared Content-Length over the cap is refused before a byte
+			// is read, as the std bridge does for MaxRequestBodySize (the
+			// client may never send it). On HTTP/1 the unread body makes the
+			// answer say Connection: close, or net/http reads up to 256 KiB
+			// of it first; not on HTTP/2, where it would end the connection.
+			if r.ContentLength > int64(maxToHandlerBodySize) {
+				if r.ProtoMajor == 1 {
+					w.Header().Set("Connection", "close")
+				}
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxToHandlerBodySize)+1))
 			_ = r.Body.Close()
 			if err != nil {

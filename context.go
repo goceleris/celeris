@@ -118,6 +118,7 @@ type Context struct {
 	respHeaders [][2]string
 	written     bool
 	aborted     bool
+	hijacked    bool // a Hijack succeeded: Detach leaves the connection to the caller
 
 	queryCache  url.Values
 	queryCached bool
@@ -679,6 +680,7 @@ func (c *Context) reset() {
 	}
 	c.written = false
 	c.aborted = false
+	c.hijacked = false
 	c.bytesWritten = 0
 	c.maxFormSize = 0
 	c.requestID = ""
