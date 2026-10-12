@@ -15,8 +15,10 @@ import (
 )
 
 // Tests for the header budget across protocol detection. ReadHeaderTimeout is
-// one budget for the first request: it counts from accept, as on std, and
-// detecting the protocol does not start it again. Before, the engines armed
+// one budget for the first request: it counts from the engine's accept (the
+// first byte, where TCP_DEFER_ACCEPT holds the handshake back, which the
+// tests allow for with a client that sends at once; std counts from the
+// handshake), and detecting the protocol does not start it again. Before, the engines armed
 // a fresh full header deadline at detection (initProtocol), so a client that
 // sent "GET", waited most of the budget and then trickled the headers held the
 // conn for nearly twice ReadHeaderTimeout: 540 to 570 ms at 300 ms measured on
@@ -111,8 +113,12 @@ func TestHeaderBudgetSpansDetection(t *testing.T) {
 // deciding read arrives with the budget already spent, so the conn is closed
 // and the request is not answered. The io_uring sweep is 800 ms apart on an
 // idle worker, so this read can be the first the engine sees past the
-// deadline, and the clamp must close there (the "io_uring-mshot" arm also
-// checks that the provided buffer goes back to the ring on that exit).
+// deadline, and the clamp must close there. It is a weak control of the
+// io_uring clamp: on a run that put a probe on both exits (review of PR 1006)
+// the io_uring arms did not reach the clamp once, because the sweep closed the
+// conn first, and only the epoll arms fail without the fix. The io_uring exits
+// are pinned by TestSpentDetectBudgetReturnsItsRingBuffer in internal/engine/iouring,
+// which puts conns through them on demand.
 func TestRequestCompletedAfterTheBudgetIsNotServed(t *testing.T) {
 	for _, e := range budgetEngines {
 		t.Run(e.name, func(t *testing.T) {
@@ -153,11 +159,17 @@ func TestRequestCompletedAfterTheBudgetIsNotServed(t *testing.T) {
 // TestSpentBudgetReturnsItsRingBuffer: with multishot recv the deciding recv of
 // a conn arrives in a buffer of the worker's provided-buffer ring, and the
 // close of a conn whose budget is spent (the exit TestRequestCompletedAfterTheBudgetIsNotServed
-// takes) has to give the buffer back to the ring. One that is dropped is gone
+// aims at) has to give the buffer back to the ring. One that is dropped is gone
 // for good. A worker's ring holds at least 1024 buffers (bufRingCountMin, the
 // size this test pins with CELERIS_IOURING_PBUF_COUNT), so the test sends three
-// rings' worth of such conns: whatever the split between workers, each is past
-// its ring. A GET on a new conn is then answered.
+// rings' worth of such conns. A GET on a new conn is then answered.
+//
+// This is the end-to-end check and a statistical one: how many of the late
+// conns reach the exit before the idle sweep closes them depends on load (250
+// to 1300 of 3072 measured), and a run on which fewer than a ring's worth do
+// cannot show a lost buffer. The exits are pinned deterministically by
+// TestSpentDetectBudgetReturnsItsRingBuffer in internal/engine/iouring, which
+// counts the conns it put through each.
 func TestSpentBudgetReturnsItsRingBuffer(t *testing.T) {
 	const (
 		ringSize = 1024 // bufRingCountMin

@@ -3548,6 +3548,10 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// serve a request that finished late. The sweep that would catch it
 		// runs every 32 iterations, so this recv can be the first to see it.
 		// A fresh clock reading: the cached now is up to 60 ms old.
+		hook := detectStageHook.Load()
+		if hook != nil {
+			(*hook)(w, cs, detectBeforeBudgetCheck)
+		}
 		if dd := cs.detectDeadline; dd > 0 && time.Now().UnixNano() > dd {
 			cs.detectAccum = nil
 			if hasProvidedBuf {
@@ -3555,6 +3559,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			}
 			w.closeConn(fd)
 			return
+		}
+		if hook != nil {
+			(*hook)(w, cs, detectAfterBudgetCheck)
 		}
 		cs.protocol.Store(int32(proto))
 		cs.detected = true
