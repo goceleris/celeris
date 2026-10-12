@@ -112,7 +112,8 @@ func replyKind889(b []byte) string {
 }
 
 // firstReply889 sends wire and returns what the server sent first: up to the
-// first CRLF or 9 bytes, or whatever came before the connection ended or 5 s
+// first CRLF or 16 bytes (an HTTP/2 frame header and the start of its
+// payload), or whatever came before the connection ended or 5 s
 // passed.
 func firstReply889(t *testing.T, addr, wire string) []byte {
 	t.Helper()
@@ -127,7 +128,7 @@ func firstReply889(t *testing.T, addr, wire string) []byte {
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	br := bufio.NewReader(c)
 	var got []byte
-	for len(got) < 9 && !bytes.Contains(got, []byte("\r\n")) {
+	for len(got) < 16 && !bytes.Contains(got, []byte("\r\n")) {
 		b, err := br.ReadByte()
 		if err != nil {
 			break
