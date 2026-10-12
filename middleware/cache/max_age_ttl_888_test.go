@@ -34,7 +34,22 @@ func TestCacheControlSetsTheStoredTTL888(t *testing.T) {
 	}{
 		{"public, max-age=30", 30 * time.Second},
 		{"max-age=7200", cfgTTL},
-		{"max-age=", cfgTTL},
+		// Round 5 (RFC 9111 4.2.1: an invalid max-age is stale): the argument
+		// is 1*DIGIT, or the response is not stored (want 0). "max-age=" was
+		// stored for Config.TTL until then.
+		{"max-age=", 0},
+		{"max-age=abc", 0},
+		{"max-age=-1", 0},
+		{"max-age=60abc", 0},
+		{"max-age=+60", 0},
+		{"max-age=6e1", 0},
+		{"max-age=60.5", 0},
+		{`max-age="60"`, 0},
+		{`max-age="0"`, 0},
+		{"max-age=60, max-age=abc", 0},
+		{"max-age=abc, max-age=60", 0},
+		{"max-age=05", 5 * time.Second},
+		{"foo=, max-age=5", 5 * time.Second}, // "name=" stays stored for the other names
 		{"x-max-age=0", cfgTTL},
 		// A delta-seconds past what a time.Duration holds (9223372036 s is
 		// the last that fits) wrapped to a negative TTL, which the stores
@@ -65,8 +80,12 @@ func TestCacheControlSetsTheStoredTTL888(t *testing.T) {
 				}
 				mw := New(Config{Store: kv, TTL: cfgTTL, DisableSingleflight: noSF})
 				runOnce(t, mw, h, "GET", "/ttl888")
-				if kv.n != 1 || kv.last != tc.want {
-					t.Errorf("cache-control %q: %d write(s), last TTL %v, want 1 write with TTL %v", tc.cc, kv.n, kv.last, tc.want)
+				wantWrites := 1
+				if tc.want == 0 {
+					wantWrites = 0
+				}
+				if kv.n != wantWrites || kv.last != tc.want {
+					t.Errorf("cache-control %q: %d write(s), last TTL %v, want %d write(s) with TTL %v", tc.cc, kv.n, kv.last, wantWrites, tc.want)
 				}
 			})
 		}

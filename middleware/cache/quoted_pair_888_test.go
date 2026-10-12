@@ -29,7 +29,7 @@ var quotedPairCases888 = []struct {
 	{cc: `ext="a\"", max-age=5`, maxAge: 5, hasMaxAge: true, description: "a quoted-pair, then max-age=5 (the TTL is 5 s, not Config.TTL)"},
 	{cc: `ext="a\\", private`, noStore: true, description: "an escaped backslash, then the closing quote, then private"},
 	{cc: `ext="a\\\"", private`, noStore: true, description: "an escaped backslash and an escaped quote, then private"},
-	{cc: `ext="a\", private", max-age=7`, maxAge: 7, hasMaxAge: true, description: "private is inside the string (a quoted-pair keeps it open)"},
+	{cc: `ext="a\", private", max-age=7`, noStore: true, description: "private is inside the string (a quoted-pair keeps it open), and the floor refuses it all the same, as main did (round 5)"},
 	{cc: `ext="a, max-age=5`, noStore: true, description: "a quote that never closes: not storable"},
 	{cc: `ext="a\"`, noStore: true, description: "a quote that only a quoted-pair would close: not storable"},
 	{cc: `ext="a, private`, noStore: true, description: "a quote that never closes, private after it"},
@@ -44,7 +44,8 @@ var quotedPairCases888 = []struct {
 	{cc: `ext="a", private`, noStore: true, description: "a well-formed string, then private (the control)"},
 	{cc: `ext="a", max-age=9`, maxAge: 9, hasMaxAge: true, description: "a well-formed string, then max-age (the control)"},
 	{cc: `no-cache="a, b", max-age=60`, noStore: true, description: "the field-qualified no-cache with a quoted comma (the control)"},
-	{cc: `x-ext="no-cache, private", max-age=11`, maxAge: 11, hasMaxAge: true, description: "directives named inside a string are not directives (the control)"},
+	{cc: `x-ext="no-cache, private", max-age=11`, noStore: true, description: "private inside a string: the floor refuses it, as main did (round 5)"},
+	{cc: `x-ext="no-cache, public", max-age=11`, noStore: false, maxAge: 11, hasMaxAge: true, description: "directives named inside a string are not directives (the control)"},
 }
 
 // TestParseCacheControlQuotedPairs888 is the unit half.

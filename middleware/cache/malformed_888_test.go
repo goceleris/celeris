@@ -80,12 +80,13 @@ var wellFormedCC888 = []struct {
 	{cc: ",max-age=60", maxAge: 60, hasMaxAge: true},
 	{cc: "max-age=60,,must-revalidate", maxAge: 60, hasMaxAge: true},
 	{cc: "max-age=60 ", maxAge: 60, hasMaxAge: true},
-	{cc: "max-age=", noStore: false},
-	{cc: `x-ext="private; no-store", max-age=9`, maxAge: 9, hasMaxAge: true},
+	{cc: "max-age=", noStore: true},                     // round 5: an invalid max-age is stale (RFC 9111 4.2.1), 1*DIGIT only
+	{cc: "foo=, max-age=9", maxAge: 9, hasMaxAge: true}, // "name=" stays stored for the other names
+	{cc: `x-ext="private; no-store", max-age=9`, noStore: true},
 	{cc: `x-ext="a" , max-age=9`, maxAge: 9, hasMaxAge: true},
 	{cc: `no-cache="set-cookie", max-age=9`, noStore: true},
-	{cc: "x-private=1, max-age=9", maxAge: 9, hasMaxAge: true},
-	{cc: "x=private, max-age=9", maxAge: 9, hasMaxAge: true},
+	{cc: "x-private=1, max-age=9", noStore: true}, // round 5: the floor, private anywhere (as main)
+	{cc: "x=private, max-age=9", noStore: true},
 	{cc: "s-maxage=3, max-age=7", maxAge: 7, hasMaxAge: true},
 	{cc: "", noStore: false},
 	{cc: " ", noStore: false},
@@ -218,36 +219,43 @@ func refCC(s string) (dirs [][2]string, ok bool) {
 }
 
 // refDecision is what a recipient that reads a well-formed value strictly
-// does: not stored for no-store, private, no-cache or max-age=0, else the
-// first max-age with a numeric value, capped at maxDeltaSeconds.
+// does: not stored for no-store, private, no-cache, max-age=0 or a max-age
+// whose argument is not 1*DIGIT (RFC 9111 4.2.1: invalid is stale), else the
+// first max-age, capped at maxDeltaSeconds. (The reference reads no value
+// that holds "private" or "no-store": the floor refuses those before any
+// reading, see TestCacheControlFloor888.)
 func refDecision(dirs [][2]string) (noStore bool, maxAge int, has bool) {
 	for _, d := range dirs {
 		switch d[0] {
 		case "no-store", "private", "no-cache":
 			return true, 0, false
 		case "max-age":
-			if has || strings.HasPrefix(d[1], `"`) {
-				continue
-			}
-			if n, ok := atoiPrefix(d[1]); ok {
-				if n == 0 {
+			n := 0
+			for i := 0; i < len(d[1]); i++ {
+				if d[1][i] < '0' || d[1][i] > '9' {
 					return true, 0, false
 				}
-				maxAge, has = min(n, maxDeltaSeconds), true
+				n = min(n*10+int(d[1][i]-'0'), maxDeltaSeconds)
+			}
+			if d[1] == "" || n == 0 {
+				return true, 0, false
+			}
+			if !has {
+				maxAge, has = n, true
 			}
 		}
 	}
 	return false, maxAge, has
 }
 
-// TestParseCacheControlAgainstTheReference888 is the property: over random
-// strings of the tokens that matter, parseCacheControl stores nothing exactly
-// when the value is not well formed or the strict reading says not to store,
-// and gives the strict reading's TTL otherwise. In particular: every value
-// that main refused (it held "no-store" or "private" as a substring) is
-// refused unless it is a well-formed value in which they are not directives
-// (x-private=1, a quoted string, x=private). CELERIS_CC_FUZZ_N sets the number
-// of cases and CELERIS_CC_FUZZ_SEED the seed (the lane's script runs 3 million per seed).
+// TestParseCacheControlAgainstTheReference888 is the property for the reading
+// itself, on values that hold neither "private" nor "no-store" (the floor
+// refuses those first; its property is TestCacheControlFloorAgainstMain888):
+// over random strings of the tokens that matter, parseCacheControl stores
+// nothing exactly when the value is not well formed or the strict reading says
+// not to store (a max-age whose argument is not 1*DIGIT included), and gives
+// the strict reading's TTL otherwise. CELERIS_CC_FUZZ_N sets the number of cases and
+// CELERIS_CC_FUZZ_SEED the seed (the lane's script runs 3 million per seed).
 func TestParseCacheControlAgainstTheReference888(t *testing.T) {
 	n := 300_000
 	if v := os.Getenv("CELERIS_CC_FUZZ_N"); v != "" {
@@ -258,7 +266,10 @@ func TestParseCacheControlAgainstTheReference888(t *testing.T) {
 	if testing.Short() {
 		n = 20_000
 	}
-	alpha := []string{"private", "no-store", "no-cache", "max-age", "public", "x", "=", `"`, `\`, ",", " ", "\t", ";", "0", "5", "a", "-"}
+	// No "private" and no "no-store": the floor refuses those before any reading
+	// (TestCacheControlFloorAgainstMain888 is its property), so this fuzz is
+	// about the reading itself: well formed or not, and the TTL.
+	alpha := []string{"no-cache", "max-age", "max-age=", "public", "x", "=", `"`, `\`, ",", " ", "\t", ";", "0", "5", "9", "a", "-"}
 	seed := uint64(1)
 	if v := os.Getenv("CELERIS_CC_FUZZ_SEED"); v != "" {
 		if x, err := strconv.ParseUint(v, 10, 64); err == nil {
@@ -266,8 +277,7 @@ func TestParseCacheControlAgainstTheReference888(t *testing.T) {
 		}
 	}
 	r := rand.New(rand.NewPCG(seed, 2))
-	var wellFormed, malformed, mainRefusedButStored, bad int
-	example := map[string]string{}
+	var wellFormed, malformed, bad int
 	fail := func(kind, s string, got, want string) {
 		if bad++; bad <= 20 {
 			t.Errorf("%s: %q: parseCacheControl %s, want %s", kind, s, got, want)
@@ -280,7 +290,6 @@ func TestParseCacheControlAgainstTheReference888(t *testing.T) {
 		}
 		s := b.String()
 		noStore, maxAge, has := parseCacheControl(s)
-		mainRefused := strings.Contains(s, "no-store") || strings.Contains(s, "private")
 		dirs, ok := refCC(s)
 		if !ok {
 			malformed++
@@ -294,23 +303,9 @@ func TestParseCacheControlAgainstTheReference888(t *testing.T) {
 		if noStore != rNo || (!rNo && (maxAge != rMa || has != rHas)) {
 			fail("well-formed value", s, fmt.Sprintf("(%v, %d, %v)", noStore, maxAge, has), fmt.Sprintf("(%v, %d, %v)", rNo, rMa, rHas))
 		}
-		if mainRefused && !noStore {
-			mainRefusedButStored++
-			example[s] = "stored"
-		}
 	}
-	// A value main refused and this stores must be a well-formed one whose
-	// strict reading has no such directive: show that the classes are not
-	// empty (the property above is not vacuous) and not large.
 	if malformed == 0 || wellFormed == 0 {
 		t.Fatalf("degenerate corpus: %d well formed, %d malformed", wellFormed, malformed)
 	}
-	t.Logf("%d cases: %d well formed, %d malformed (all not stored); %d well-formed values that main refused and this stores (no such directive)", n, wellFormed, malformed, mainRefusedButStored)
-	shown := 0
-	for s := range example {
-		if shown++; shown > 5 {
-			break
-		}
-		t.Logf("  main refused, stored here, well formed: %q", s)
-	}
+	t.Logf("%d cases: %d well formed (checked against the strict reading, TTL included), %d malformed (all not stored)", n, wellFormed, malformed)
 }

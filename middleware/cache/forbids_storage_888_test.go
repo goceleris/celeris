@@ -3,15 +3,19 @@ package cache
 import "testing"
 
 // TestParseCacheControlMatchesDirectives888: directives are tokens: a quoted
-// comma does not split one, and a longer name is not a shorter one.
+// comma does not split one, and a longer name is not a shorter one (no-cache,
+// max-age=0). "private" and "no-store" are the exception since round 5: the
+// floor refuses them wherever they are, as main did.
 func TestParseCacheControlMatchesDirectives888(t *testing.T) {
 	for cc, want := range map[string]bool{
 		"no-store":                       true,
 		"public,no-cache":                true,
 		"public , private":               true,
 		`no-cache="a, b", max-age=60`:    true,
-		`x-ext="no-cache, private"`:      false,
-		"x-private-ext":                  false,
+		`x-ext="no-cache, private"`:      true, // round 5: the floor, private anywhere (as main)
+		"x-private-ext":                  true,
+		`x-ext="no-cache"`:               false,
+		"x-no-cache-ext":                 false,
 		"max-age = 0":                    true,
 		"max-age=00":                     true,
 		"max-age=05":                     false,
