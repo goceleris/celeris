@@ -73,6 +73,7 @@ func TestEnableH2UpgradeMatrix889(t *testing.T) {
 					case pr.p == celeris.H2C && e.name != "std":
 						want = "h2-settings"
 					}
+					t.Logf("FIRST engine=%s protocol=%s EnableH2Upgrade=%s request=upgrade -> %s %q", e.name, pr.name, en.name, replyKind889(got), got)
 					if kind := replyKind889(got); kind != want {
 						t.Errorf("Upgrade: h2c request: first reply %q (%s), want %s", got, kind, want)
 					}
@@ -81,6 +82,7 @@ func TestEnableH2UpgradeMatrix889(t *testing.T) {
 					// prior-knowledge h2c, whatever EnableH2Upgrade says, and not
 					// otherwise.
 					got = firstReply889(t, startTCPReady889(t, cfg), preface.String())
+					t.Logf("FIRST engine=%s protocol=%s EnableH2Upgrade=%s request=preface -> %s %q", e.name, pr.name, en.name, replyKind889(got), got)
 					if kind := replyKind889(got); pr.priorKnowledge != (kind == "h2-settings") {
 						t.Errorf("HTTP/2 preface: first reply %q (%s), prior-knowledge h2c served = %v, want %v",
 							got, kind, kind == "h2-settings", pr.priorKnowledge)
