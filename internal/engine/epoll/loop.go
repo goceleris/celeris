@@ -168,7 +168,7 @@ type Loop struct {
 	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
 	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
 	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
-	reqBatch          uint64         // batched request count, flushed to reqCount per iteration; WORKER-THREAD-ONLY, 3 increment sites, all on the loop (celeris#626)
+	reqBatch          uint64         // batched request count, flushed to reqCount per iteration; WORKER-THREAD-ONLY, 5 increment sites, all on the loop: three in drainRead (async feed, promotion, inline) and two in adopt.go (the transplant replay, sync and async) (celeris#626, celeris#886)
 	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
 	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
 	tickCounter       uint32

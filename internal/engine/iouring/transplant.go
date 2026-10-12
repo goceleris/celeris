@@ -212,7 +212,12 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 				return // promoted (its recv is armed), hijacked, or closed
 			}
 		} else {
-			if perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn); perr != nil {
+			perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn)
+			// The replay is the recv event of this conn's first bytes, and
+			// handleRecv counts one per recv event whatever the verdict
+			// (celeris#886).
+			w.reqBatch++
+			if perr != nil {
 				if !w.endCarriedReplay(cs, newFD, perr) {
 					return // hijacked (handed off) or closed on error — nothing more to arm
 				}
@@ -268,6 +273,11 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		w.promoteConnToAsync(cs, fd, stashed, &first)
 		return false
 	}
+	// Counted for every outcome but the promotion above, whose
+	// promoteConnToAsync counts it: the replay is the recv event of this
+	// conn's first bytes, and handleRecv counts one per recv event
+	// (celeris#886).
+	w.reqBatch++
 	if perr != nil {
 		// Nothing below may touch cs.h1State: an h2c upgrade has replaced it.
 		return w.endCarriedReplay(cs, fd, perr)
