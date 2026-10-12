@@ -375,7 +375,10 @@ func (w *portableWorker) Write(fd int, data []byte) error {
 	if err != nil && errors.Is(err, os.ErrDeadlineExceeded) {
 		// Part of data may be on the wire: the stream is torn. The reader
 		// observes the close and reports err to onClose; shutdownConn takes
-		// c.mu only, and no callback runs under writeMu.
+		// c.mu only, and no callback runs under writeMu. The entry stays in
+		// w.conns until the owner calls UnregisterConn (the reader's closing
+		// branch does not delete it): a RegisterConn of the same number before
+		// then gets ErrAlreadyRegistered. The drivers unregister in Close.
 		c.shutdownConn(err)
 	}
 	return err

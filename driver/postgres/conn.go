@@ -2637,9 +2637,11 @@ func boolByte(b bool) byte {
 // goroutines are done, the next socket the process opens could take it, and
 // these calls would reach that socket and its registration (celeris#859).
 //
-// A conn that a loop has already torn down (the server hung up, the loop
-// closed) closes without an error: the loop answers ErrUnknownFD to the
-// Terminate write and to UnregisterConn, and Close does not report it.
+// A conn that a loop has already torn down (the server hung up) closes
+// without an error: the loop answers ErrUnknownFD to the Terminate write and
+// to UnregisterConn, and Close does not report it. A loop that was closed as a
+// whole answers the Terminate write with ErrLoopClosed before it looks the
+// conn up, and Close does report that.
 func (c *pgConn) Close() error {
 	var firstErr error
 	c.closeOnce.Do(func() {
