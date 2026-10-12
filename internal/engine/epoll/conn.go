@@ -162,6 +162,15 @@ type connState struct {
 	// error, a refused write; celeris#761): the close it defers is the same.
 	peerClosed bool
 
+	// closeAckedKnown (see closeSince, below) and writeRefused (see its
+	// comment, below) are declared here, beside the other flag, and not with
+	// the fields they belong to: next to the 8-byte clocks they leave six
+	// bytes of padding each, which put connState across a Go size class
+	// (448 to 480 bytes) once detectDeadline was added, and the sweep of
+	// 4096 conns cost 7 to 12 percent more (RULE 74, BenchmarkCheckTimeouts865).
+	closeAckedKnown bool
+	writeRefused    bool
+
 	// closeSince, closePending and closeAcked are the clock of that deferred
 	// close (celeris#876): closeSince is when the engine last saw the close
 	// move forward, in nanoseconds, from the request that deferred it
@@ -175,11 +184,10 @@ type connState struct {
 	// else on it: lastActivity is the last READ, and a conn that is closing is
 	// no longer read. 0 when no deferred close is under way. Worker-thread-
 	// only; reset on release.
-	closeSince      int64
-	closePending    int
-	closeAcked      uint64
-	closeSampled    int64
-	closeAckedKnown bool
+	closeSince   int64
+	closePending int
+	closeAcked   uint64
+	closeSampled int64
 
 	// writeRefused records that response bytes were lost (celeris#761): a
 	// write hook refused them because the conn's backlog was already over
@@ -188,8 +196,7 @@ type connState struct {
 	// the handler closes the conn (closeWhenFlushed) instead of leaving the
 	// client waiting for bytes that will not come. Sticky until release.
 	// Written under detachMu when the conn has one, like the buffers it
-	// guards.
-	writeRefused bool
+	// guards. (Declared with peerClosed, above.)
 
 	// drainDeadline bounds how long checkTimeouts defers the idle-deadline
 	// reap of a truly-detached conn whose terminal bytes (SSE last event, WS

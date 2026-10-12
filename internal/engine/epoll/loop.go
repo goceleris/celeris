@@ -3739,9 +3739,15 @@ func (l *Loop) checkTimeouts() {
 		// and detectDeadline (accept + ReadHeaderTimeout) stands in for it.
 		// Such a conn is never detached, so this needs neither detachMu nor
 		// the snapshot.
-		if dl := cs.detectDeadline; dl > 0 && !cs.detected && now > dl {
-			l.closeConn(fd)
-			continue
+		// detected is tested first: it shares the cache line of fd and dirty,
+		// which this loop reads anyway, and the sweep of a loop full of
+		// established conns then never loads detectDeadline (RULE 74,
+		// BenchmarkCheckTimeouts865).
+		if !cs.detected {
+			if dl := cs.detectDeadline; dl > 0 && now > dl {
+				l.closeConn(fd)
+				continue
+			}
 		}
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
 		// supplied by the middleware via SetWSIdleDeadline. Skip the
