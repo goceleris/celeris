@@ -28,6 +28,11 @@ type Engine struct {
 	addr         atomic.Pointer[net.Addr]
 	mu           sync.Mutex
 	acceptPaused atomic.Bool
+	// abnormalLoopExits counts the loop goroutines that ended without
+	// returning (runtime.Goexit or a panic in a synchronous handler,
+	// celeris#848). Unexported: it is read by tests; the Error log is the
+	// operator-facing record.
+	abnormalLoopExits atomic.Uint64
 	// pause records the pause in progress for the loops' linger step
 	// (celeris#662): when it began and whether its listeners get the
 	// tcp_synack_retries=0 guard. Written by BeginPauseAccept before it sets
@@ -189,7 +194,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for _, l := range e.loops {
 		wg.Go(func() {
-			l.run(innerCtx)
+			e.runWatched(innerCtx, l)
 		})
 	}
 
