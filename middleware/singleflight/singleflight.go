@@ -19,7 +19,7 @@ type call struct {
 	done chan struct{}
 	// waiters counts concurrent requests that joined this leader's
 	// in-flight state. Waiter goroutines increment under the group
-	// mutex (before registering on the WaitGroup); the leader reads
+	// mutex (before waiting on done); the leader reads
 	// it under the same mutex at delete time, so count captures every
 	// waiter that will ever read from this entry. A zero count lets
 	// the leader skip body/header deep-copies — the work only matters
