@@ -472,6 +472,51 @@ func TestListenWatchWaitsForANewListenerAndTimesOut683(t *testing.T) {
 	}
 }
 
+// A listener that appears within microseconds of the resume is seen without a
+// sleep: the wait lists again at once a few times before its first sleep,
+// which on this runtime lasts about a millisecond or more whatever the request
+// (listenWaitPoll; about 1.4 ms in the arm64 container, celeris#886). The
+// kernel list is a fake here, so the counts are exact. At least 3 and at most 8
+// immediate re-lists: a listener that shows on the 4th list is found with no
+// sleep, and one that shows on the 50th has cost no more than 8 lists without
+// one, so the wait is not a busy poll.
+func TestListenWatchListsAgainAtOnceBeforeItsFirstSleep683(t *testing.T) {
+	const minSpins, maxSpins = 3, 8
+	for _, tc := range []struct {
+		name      string
+		appearsAt int // the 1-based list that first shows the new inode
+		ok        func(lists, sleeps int) bool
+		want      string
+	}{
+		{"found on the last required immediate list", 1 + minSpins,
+			func(_, sleeps int) bool { return sleeps == 0 }, "no sleep"},
+		{"found late, still a sleeping poll", 50,
+			func(lists, sleeps int) bool { return sleeps >= lists-1-maxSpins && sleeps <= lists-1 }, "at most 8 lists without a sleep"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lists, sleeps := 0, 0
+			w := &listenWatch{port: 1, before: map[uint32]struct{}{7: {}},
+				list: func(_, _ int) (map[uint32]struct{}, error) {
+					lists++
+					if lists >= tc.appearsAt {
+						return map[uint32]struct{}{7: {}, 9: {}}, nil
+					}
+					return map[uint32]struct{}{7: {}}, nil
+				},
+				sleep: func(time.Duration) { sleeps++ },
+			}
+			_, ok, err := w.wait(time.Hour)
+			if err != nil || !ok {
+				t.Skipf("no sock_diag socket here: wait = %v, %v", ok, err)
+			}
+			if lists != tc.appearsAt || !tc.ok(lists, sleeps) {
+				t.Errorf("celeris683 SPIN: %d lists and %d sleeps; want the new inode seen on list %d with %s",
+					lists, sleeps, tc.appearsAt, tc.want)
+			}
+		})
+	}
+}
+
 // freshCount683 is the number of inodes in after that are not in before.
 func freshCount683(after, before map[uint32]struct{}) int {
 	n := 0

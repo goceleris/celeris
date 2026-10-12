@@ -69,6 +69,12 @@ const listenWaitPoll = 50 * time.Microsecond
 type listenWatch struct {
 	port   int
 	before map[uint32]struct{}
+
+	// list and sleep are test seams for wait: the kernel list and the pause
+	// between two lists. Nil in production, where they are listenInodesOn and
+	// time.Sleep.
+	list  func(fd, port int) (map[uint32]struct{}, error)
+	sleep func(time.Duration)
 }
 
 // listenWaitCounters count what the wait did. They are deliberately not an
@@ -135,8 +141,15 @@ func (w *listenWatch) wait(bound time.Duration) (time.Duration, bool, error) {
 		return time.Since(t0), false, err
 	}
 	defer func() { _ = unix.Close(fd) }()
+	list, sleep := w.list, w.sleep
+	if list == nil {
+		list = listenInodesOn
+	}
+	if sleep == nil {
+		sleep = time.Sleep
+	}
 	for {
-		set, err := listenInodesOn(fd, w.port)
+		set, err := list(fd, w.port)
 		if err != nil {
 			return time.Since(t0), false, err
 		}
@@ -148,7 +161,7 @@ func (w *listenWatch) wait(bound time.Duration) (time.Duration, bool, error) {
 		if time.Since(t0) >= bound {
 			return time.Since(t0), false, nil
 		}
-		time.Sleep(listenWaitPoll)
+		sleep(listenWaitPoll)
 	}
 }
 
