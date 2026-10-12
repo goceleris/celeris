@@ -602,10 +602,14 @@ func (p *Processor) refuseHeaderList(streamID uint32) error {
 // noteRefusal counts a request the processor refused (streamLimit: for
 // SETTINGS_MAX_CONCURRENT_STREAMS; otherwise for its header list), in a window
 // of one second as handleRSTStream counts resets, and ends the connection
-// with GOAWAY(ENHANCE_YOUR_CALM) naming the last stream the server opened
-// once the window has seen more than the burst (headerListRefusalBurstMax,
-// streamRefusalBurstMax). A refusal is an answer the peer asked for with a
-// few bytes, so without a count one connection could ask for it for ever.
+// with GOAWAY(ENHANCE_YOUR_CALM) once the window has seen more than the burst
+// (headerListRefusalBurstMax, streamRefusalBurstMax). A refusal is an answer
+// the peer asked for with a few bytes, so without a count one connection could
+// ask for it for ever. The GOAWAY names the last stream the server opened
+// (GetLastStreamID); for a header list over the bound that includes the stream
+// being refused, which was opened for the decode, so a client treats that one
+// as possibly processed though it was not: the safe side, and only an abusive
+// peer sees it. A stream refused for the limit was never opened and is not named.
 func (p *Processor) noteRefusal(streamLimit bool) error {
 	var now int64
 	if p.nowUnix != nil {
@@ -1492,17 +1496,24 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	stream, ok := p.manager.GetStream(f.StreamID)
 	if !ok {
-		// A stream the manager does not hold that the server reset (a request
-		// refused for the stream limit or for its header list, a body over the
-		// limit, ...): RFC 9113 section 5.1 (closed) says the endpoint that sent
-		// RST_STREAM "MUST be prepared to receive any frames that were sent
-		// before it processed the RST_STREAM", and a POST sent without waiting
-		// for the answer has its DATA on the wire. The frame is ignored, and its
-		// length goes back to the connection's receive window like any DATA's
-		// (the peer spent that much of it). DATA on a stream that is closed for
-		// another reason (the peer reset it, or the exchange ended), on one that
-		// was never opened (above the last client stream, even, stream 0) is
-		// still a connection error: h2spec 5.1 and 6.1 pin that.
+		// A stream the manager does not hold that the server reset without
+		// ending the connection (a request refused for the stream limit, for its
+		// header list, or after the GOAWAY the server sent; every other reset
+		// returns an error, and the connection ends): RFC 9113 section 5.1
+		// (closed) says the endpoint that sent RST_STREAM "MUST be prepared to
+		// receive any frames that were sent before it processed the RST_STREAM",
+		// and a POST sent without waiting for the answer has its DATA on the
+		// wire. The frame is ignored, and its length goes back to the
+		// connection's receive window like any DATA's (the peer spent that much
+		// of it). The stream's own window is not credited, so a client that
+		// honours it stops by itself; the native path enforces no receive
+		// window, so one that does not can go on for as long as the identifier
+		// stays in the reset set, at the cost of parsing its frames (nothing is
+		// buffered). DATA on a stream that is closed for another reason (the
+		// peer reset it, or the exchange ended), on one that was never opened
+		// (above the last client stream, even, stream 0) is still a connection
+		// error: h2spec 5.1 and 6.1 pin that. The last client stream check is
+		// defensive: a reset of an identifier above it ends the connection.
 		if f.StreamID <= p.manager.GetLastClientStreamID() && p.resetIDs.has(f.StreamID) {
 			p.manager.AccumulateWindowUpdate(0, f.Header().Length)
 			p.manager.FlushWindowUpdates(p.writer, false)
