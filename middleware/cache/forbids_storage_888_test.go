@@ -2,9 +2,9 @@ package cache
 
 import "testing"
 
-// TestForbidsStorageMatchesDirectives888: directives are tokens: a quoted
+// TestParseCacheControlMatchesDirectives888: directives are tokens: a quoted
 // comma does not split one, and a longer name is not a shorter one.
-func TestForbidsStorageMatchesDirectives888(t *testing.T) {
+func TestParseCacheControlMatchesDirectives888(t *testing.T) {
 	for cc, want := range map[string]bool{
 		"no-store":                       true,
 		"public,no-cache":                true,
@@ -20,9 +20,12 @@ func TestForbidsStorageMatchesDirectives888(t *testing.T) {
 		"must-revalidate, max-age=10":    false,
 		"":                               false,
 		"public, max-age=10, immutable,": false,
+		"x-max-age=0":                    false,
+		`ext="max-age=0", max-age=60`:    false,
+		"x-max-age=0, max-age=1":         false,
 	} {
-		if got := forbidsStorage(cc); got != want {
-			t.Errorf("forbidsStorage(%q) = %v, want %v", cc, got, want)
+		if got, _, _ := parseCacheControl(cc); got != want {
+			t.Errorf("parseCacheControl(%q) stores nothing = %v, want %v", cc, got, want)
 		}
 	}
 }

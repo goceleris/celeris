@@ -246,11 +246,13 @@ func capture(c *celeris.Context, cfg Config, include, exclude map[string]struct{
 				// is both correct and ~10x faster than strings.EqualFold.
 				if h[0] == "cache-control" {
 					v := strings.ToLower(h[1])
-					if forbidsStorage(v) {
+					noStore, secs, hasMaxAge := parseCacheControl(v)
+					if noStore {
 						cacheable = false
 						break
 					}
-					if secs, ok := parseMaxAge(v); ok {
+					// secs is > 0 here: max-age=0 is a reason not to store.
+					if hasMaxAge {
 						if d := time.Duration(secs) * time.Second; d < effectiveTTL {
 							effectiveTTL = d
 						}
@@ -333,28 +335,36 @@ func filterHeaders(hs [][2]string, include, exclude map[string]struct{}) [][2]st
 	return out
 }
 
-// forbidsStorage reports whether a lowercased Cache-Control value says the
-// response must not be stored: no-store and private, as before, and now
-// no-cache (a stored response must be revalidated before every reuse, which
-// this cache does not do; the field-qualified form no-cache="x" is treated
-// the same, as the cautious reading) and max-age=0 (stale the moment it is
-// made). The directives are matched as tokens, so x-private-ext is not
-// private (celeris#888 item 27).
-func forbidsStorage(cc string) bool {
+// parseCacheControl reads a lowercased Cache-Control value as directive
+// tokens. noStore reports that the response must not be stored: no-store and
+// private, as before, and now no-cache (a stored response must be revalidated
+// before every reuse, which this cache does not do; the field-qualified form
+// no-cache="x" is treated the same, as the cautious reading) and max-age=0
+// (stale the moment it is made). hasMaxAge and maxAge give the first
+// max-age directive with a valid value. The directives are matched as tokens,
+// so x-private-ext is not private and x-max-age=0 is not max-age=0, and the
+// storage decision and the TTL come from this one parse (celeris#888 item 27).
+func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 	for len(cc) > 0 {
 		var d string
 		d, cc = nextDirective(cc)
 		name, val, _ := strings.Cut(d, "=")
 		switch strings.TrimSpace(name) {
 		case "no-store", "private", "no-cache":
-			return true
+			return true, 0, false
 		case "max-age":
-			if n, ok := parseMaxAge("max-age=" + strings.TrimSpace(val)); ok && n == 0 {
-				return true
+			if hasMaxAge {
+				continue
+			}
+			if n, ok := atoiPrefix(strings.TrimSpace(val)); ok {
+				if n == 0 {
+					return true, 0, false
+				}
+				maxAge, hasMaxAge = n, true
 			}
 		}
 	}
-	return false
+	return false, maxAge, hasMaxAge
 }
 
 // nextDirective splits the first comma-separated directive off a
@@ -375,21 +385,16 @@ func nextDirective(cc string) (directive, rest string) {
 	return cc, ""
 }
 
-func parseMaxAge(cc string) (int, bool) {
-	const tok = "max-age="
-	idx := strings.Index(cc, tok)
-	if idx < 0 {
-		return 0, false
-	}
-	rest := cc[idx+len(tok):]
+// atoiPrefix parses the leading decimal digits of v.
+func atoiPrefix(v string) (int, bool) {
 	end := 0
-	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+	for end < len(v) && v[end] >= '0' && v[end] <= '9' {
 		end++
 	}
 	if end == 0 {
 		return 0, false
 	}
-	n, err := strconv.Atoi(rest[:end])
+	n, err := strconv.Atoi(v[:end])
 	if err != nil {
 		return 0, false
 	}
