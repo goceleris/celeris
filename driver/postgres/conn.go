@@ -510,12 +510,13 @@ func (r *pgRequest) sendRow(row [][]byte) {
 // closeRowCh closes the streaming channel once, whoever calls it. A sender
 // blocked in sendRow is released first (abortCh), and rowCh is closed only
 // when none is in flight, so a Close racing a delivery cannot make OnRow send
-// on a closed channel (celeris#887). It does nothing for a request that is
-// not streaming, and when it has run before.
+// on a closed channel (celeris#887). It does nothing when it has run before.
+// It also marks a request that is not streaming yet, so that a promotion
+// that comes after (dispatch is still running) does not publish a channel
+// nothing will close.
 func (r *pgRequest) closeRowCh() {
 	r.chMu.Lock()
-	ch := r.rowCh
-	if ch == nil || r.rowChClosing {
+	if r.rowChClosing {
 		r.chMu.Unlock()
 		return
 	}
@@ -525,7 +526,11 @@ func (r *pgRequest) closeRowCh() {
 	} else {
 		close(r.abortCh)
 	}
+	ch := r.rowCh
 	r.chMu.Unlock()
+	if ch == nil {
+		return
+	}
 	r.sendMu.Lock()
 	r.rowChClosed = true
 	close(ch)
@@ -542,14 +547,6 @@ func (r *pgRequest) closeColsCh() {
 		close(r.colsCh)
 	}
 	r.chMu.Unlock()
-}
-
-// streaming reports whether the request has a streaming channel. It is for
-// goroutines other than dispatch's, which publish rowCh (promoteToStreaming).
-func (r *pgRequest) streaming() bool {
-	r.chMu.Lock()
-	defer r.chMu.Unlock()
-	return r.rowCh != nil
 }
 
 // prepareState drives a Parse + Describe S + Sync exchange. Unlike
@@ -1436,7 +1433,9 @@ func promoteToStreaming(req *pgRequest) {
 		ch <- row
 	}
 	req.chMu.Lock()
-	req.rowCh = ch // published under chMu: failAll's closeRowCh reads it from another goroutine
+	if !req.rowChClosing {
+		req.rowCh = ch // published under chMu: failAll's closeRowCh reads it from another goroutine
+	} // else failAll has been through and nothing would close ch: the request stays buffered
 	req.chMu.Unlock()
 	// Clear the buffer. We nil out the slice elements but retain the backing
 	// capacity for reuse by releasePgRequest.
@@ -1484,9 +1483,10 @@ func (c *pgConn) failAll(err error) {
 		// have closed them already, and may be sending on rowCh right now:
 		// closeRowCh and closeColsCh close each exactly once and release a
 		// blocked OnRow first (celeris#887).
-		if r.streaming() {
-			r.streamErr.Store(&err)
-		}
+		// The error is stored whether or not r is streaming yet: dispatch can
+		// promote it between a check and the close, and a consumer that sees
+		// rowCh closed without it would read the cut-off result as complete.
+		r.streamErr.Store(&err)
 		r.closeRowCh()
 		r.closeColsCh()
 		// Use fail() so concurrent failReq (caller goroutine Write-error

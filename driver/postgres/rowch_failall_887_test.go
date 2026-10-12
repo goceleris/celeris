@@ -236,3 +236,35 @@ func TestFailAllRacingProducersNeverPanics887(t *testing.T) {
 		}
 	}
 }
+
+// failAll can run before dispatch has promoted a buffered request to
+// streaming (promoteToStreaming publishes rowCh later, on the delivery
+// goroutine). The error must be recorded anyway, so that a consumer that sees
+// rowCh closed does not read a cut-off result as complete, and the promotion
+// that follows must not publish a channel nothing will close.
+func TestFailAllBeforePromotionKeepsTheErrorAndNothingToClose887(t *testing.T) {
+	c := &pgConn{bridge: async.NewBridge()}
+	req := &pgRequest{
+		ctx:    context.Background(),
+		kind:   reqSimple,
+		colsCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+	c.enqueue(req)
+	req.OnRow([][]byte{[]byte("buffered")}) // buffered mode: no rowCh yet
+
+	boom := errors.New("conn closed")
+	c.failAll(boom)
+	if ep := req.streamErr.Load(); ep == nil || !errors.Is(*ep, boom) {
+		t.Errorf("streamErr = %v after failAll on a request that had not promoted, want the failAll error", ep)
+	}
+	promoteToStreaming(req) // the delivery goroutine, still running, reaches the threshold
+	if req.rowCh != nil {
+		t.Error("promoteToStreaming published a rowCh after failAll: nothing will close it")
+	}
+	select {
+	case <-req.colsCh:
+	default:
+		t.Error("colsCh is not closed after failAll and the promotion")
+	}
+}
