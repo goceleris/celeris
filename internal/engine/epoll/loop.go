@@ -1483,7 +1483,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 			cs.detectN = 0
 			cs.protocol = proto
 			cs.detected = true
+			// initProtocol arms the H1 header deadline at what is left of the
+			// accept-time budget (detectDeadline). A deciding read that comes
+			// after the budget finds the sweep, at most one timerfd period
+			// (25 ms) behind, about to close the conn.
 			l.initProtocol(cs)
+			cs.detectDeadline = 0
 		}
 
 		// Async handler dispatch — goroutine-per-conn with an input buffer.
@@ -2130,8 +2135,14 @@ func (l *Loop) initProtocol(cs *connState) {
 		// ProcessH1 clears on successful parse and rearms on return-nil
 		// (waiting for next request); checkTimeouts closes any conn
 		// that exceeds the deadline.
+		//
+		// A conn that had to be detected carries the deadline it was given at
+		// accept (detectDeadline): the first request's budget counts from
+		// accept, so the H1 deadline is armed at what is left of it and
+		// detection does not start it again. 0 for a conn whose protocol was
+		// fixed at accept, or adopted, which arms the full budget.
 		cs.h1State.ReadHeaderTimeoutNs = int64(l.cfg.ReadHeaderTimeout)
-		cs.h1State.ArmHeaderDeadline()
+		cs.h1State.ArmHeaderDeadlineAt(cs.detectDeadline)
 		// Per-handler async (celeris #300): wire the route resolver so
 		// ProcessH1, when run inline on the event loop (InlineMode), can
 		// detect an async route and bail to the dispatch goroutine. Only

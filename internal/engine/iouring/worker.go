@@ -2442,7 +2442,8 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		w.initProtocol(cs)
 	} else if w.cfg.ReadHeaderTimeout > 0 {
 		// The protocol is decided by the first bytes, so there is no H1 state
-		// and no header deadline yet (initProtocol arms it at detection). The
+		// and no header deadline yet (initProtocol arms it at detection, at
+		// no later than this deadline). The
 		// conn gets the same absolute budget from accept: a client that sends
 		// "GE" and stalls, or dribbles the HTTP/2 preface, is reaped by
 		// checkTimeouts instead of living on the activity stamp each of its
@@ -2873,7 +2874,12 @@ func (w *Worker) initProtocol(cs *connState) {
 		if !w.async {
 			cs.h1State.OnHeaderDeadlineArmed = func() { w.armHeaderTimer(cs) }
 		}
-		cs.h1State.ArmHeaderDeadline()
+		// A conn that had to be detected carries the deadline it was given at
+		// accept (detectDeadline): the first request's budget counts from
+		// accept, so the H1 deadline is armed at what is left of it, and the
+		// timer below fires then. 0 for a conn whose protocol was fixed at
+		// accept, or adopted, which arms the full budget.
+		cs.h1State.ArmHeaderDeadlineAt(cs.detectDeadline)
 		if w.async {
 			// Direct worker-thread arm for the initial deadline; the
 			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
@@ -3534,10 +3540,35 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.closeConn(fd)
 			return
 		}
+		// The budget the conn was given at accept (detectDeadline, which
+		// initProtocol hands on to the H1 header deadline) is spent when the
+		// deciding recv comes after it: close here, before the H1 state
+		// exists, rather than arm a deadline that has passed (the arm closes
+		// the conn from inside initProtocol, under this function's feet) or
+		// serve a request that finished late. The sweep that would catch it
+		// runs every 32 iterations, so this recv can be the first to see it.
+		// A fresh clock reading: the cached now is up to 60 ms old.
+		if dd := cs.detectDeadline; dd > 0 && time.Now().UnixNano() > dd {
+			cs.detectAccum = nil
+			if hasProvidedBuf {
+				w.bufRing.ReturnBuffer(providedBufID)
+			}
+			w.closeConn(fd)
+			return
+		}
 		cs.protocol.Store(int32(proto))
 		cs.detected = true
-		cs.detectDeadline = 0
 		w.initProtocol(cs)
+		// initProtocol arms the header timer, and the arm closes the conn
+		// when the deadline passed between the check above and the arm.
+		// closeConn may have released cs, so it is not touched on that path.
+		if w.conns[fd] != cs || cs.closing {
+			if hasProvidedBuf {
+				w.bufRing.ReturnBuffer(providedBufID)
+			}
+			return
+		}
+		cs.detectDeadline = 0
 		// If we accumulated across recvs, hand the FULL accumulated prefix
 		// (not just this last recv) to the protocol handler below: the
 		// accumulated bytes, then what of this recv Detect did not need.
