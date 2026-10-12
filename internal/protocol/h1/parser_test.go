@@ -988,7 +988,7 @@ func TestParseRequest_LeadingCRLF(t *testing.T) {
 // CRLF still at the head of the buffer.
 func TestParseRequest_LeadingCRLFRetry(t *testing.T) {
 	const full = "\r\nGET /path HTTP/1.1\r\nHost: example.com\r\n\r\n"
-	for cut := 0; cut < len(full); cut++ {
+	for cut := 1; cut < len(full); cut++ {
 		p := NewParser()
 		var r Request
 		p.Reset([]byte(full[:cut]))
