@@ -251,7 +251,8 @@ func BenchmarkIsH2CUpgrade889(b *testing.B) {
 
 // TestIsH2CUpgradeTakesSoleToken889: the Upgrade header is an upgrade to h2c
 // only when every line of it is exactly h2c, whatever the case or the
-// spacing, and Connection lists HTTP2-Settings. A list that offers other
+// spacing, and Connection lists both Upgrade and HTTP2-Settings (the native
+// parser needs both: internal/protocol/h1 detectH2CHeader). A list that offers other
 // protocols as well is not one (SECURITY.md: it would let a client that asked
 // a proxy or server for a choice, h2c or websocket, get h2c).
 func TestIsH2CUpgradeTakesSoleToken889(t *testing.T) {
@@ -271,6 +272,10 @@ func TestIsH2CUpgradeTakesSoleToken889(t *testing.T) {
 		{"other protocol", http.Header{"Upgrade": {"websocket"}, "Connection": conn}, false},
 		{"no Upgrade", http.Header{"Connection": conn}, false},
 		{"no HTTP2-Settings token", http.Header{"Upgrade": {"h2c"}, "Connection": {"Upgrade"}}, false},
+		{"no Upgrade token", http.Header{"Upgrade": {"h2c"}, "Connection": {"HTTP2-Settings"}}, false},
+		{"no Connection", http.Header{"Upgrade": {"h2c"}}, false},
+		{"tokens on two Connection lines", http.Header{"Upgrade": {"h2c"}, "Connection": {"HTTP2-Settings", "upgrade"}}, true},
+		{"tokens in other case", http.Header{"Upgrade": {"h2c"}, "Connection": {"keep-alive, UPGRADE, http2-settings"}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isH2CUpgrade(tc.h); got != tc.want {
@@ -292,6 +297,25 @@ func TestMultiTokenUpgradeIsNotUpgraded889(t *testing.T) {
 			got := firstReply889(t, addr, wire)
 			if !strings.HasPrefix(string(got), "HTTP/1.1 200") {
 				t.Fatalf("Upgrade: websocket, h2c on Protocol %v with the upgrade on answered %q, want HTTP/1.1 200", p.proto, got)
+			}
+		})
+	}
+}
+
+// TestConnectionWithoutUpgradeTokenIsNotUpgraded889: on the wire, on every
+// protocol that upgrades, a request with Upgrade: h2c and HTTP2-Settings but a
+// Connection that lists only HTTP2-Settings is served as HTTP/1.1 (200), as
+// the native engines do, not answered 101: a proxy that does not see
+// "Connection: Upgrade" forwards it as an ordinary request.
+func TestConnectionWithoutUpgradeTokenIsNotUpgraded889(t *testing.T) {
+	const wire = "GET /upgrade HTTP/1.1\r\nHost: std.test\r\n" +
+		"Connection: HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n"
+	for _, p := range protocols889 {
+		t.Run(p.proto.String(), func(t *testing.T) {
+			_, addr := startH2CEngineWith(t, newPathHandler(), nil, resolve889(p.proto, bool889(true)))
+			got := firstReply889(t, addr, wire)
+			if !strings.HasPrefix(string(got), "HTTP/1.1 200") {
+				t.Fatalf("Connection: HTTP2-Settings alone on Protocol %v with the upgrade on answered %q, want HTTP/1.1 200", p.proto, got)
 			}
 		})
 	}

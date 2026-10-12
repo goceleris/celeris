@@ -94,6 +94,35 @@ func TestEnableH2UpgradeMatrix889(t *testing.T) {
 	}
 }
 
+// TestUpgradeNeedsTheUpgradeConnectionToken889: an Upgrade: h2c request whose
+// Connection lists HTTP2-Settings but not Upgrade is not the h2c upgrade on
+// any engine (the native parser needs both tokens; std used to ask for
+// HTTP2-Settings alone and answered 101). It is served as the HTTP/1.1
+// request it also is. The upgrade is on for every row.
+func TestUpgradeNeedsTheUpgradeConnectionToken889(t *testing.T) {
+	const wire = "GET /h HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Connection: HTTP2-Settings\r\n" +
+		"Upgrade: h2c\r\n" +
+		"HTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n" +
+		"\r\n"
+	for _, e := range engines761 {
+		for _, pr := range []struct {
+			name string
+			p    celeris.Protocol
+		}{{"Auto", celeris.Auto}, {"HTTP1", celeris.HTTP1}} {
+			t.Run(e.name+"/"+pr.name, func(t *testing.T) {
+				cfg := celeris.Config{Engine: e.eng, Protocol: pr.p, EnableH2Upgrade: bptr964(true)}
+				got := firstReply889(t, startTCPReady889(t, cfg), wire)
+				t.Logf("FIRST engine=%s protocol=%s request=no-upgrade-token -> %s %q", e.name, pr.name, replyKind889(got), got)
+				if kind := replyKind889(got); kind != "http1-200" {
+					t.Errorf("Connection: HTTP2-Settings alone: first reply %q (%s), want an HTTP/1.1 200", got, kind)
+				}
+			})
+		}
+	}
+}
+
 // replyKind889 classifies the first bytes of a reply: "101" (the upgrade),
 // "http1-200", "h2-settings" (an HTTP/2 SETTINGS frame header, stream 0),
 // "http1-other" (any other HTTP/1.x status line), "closed" (nothing), "other".

@@ -589,6 +589,12 @@ func TestH2CUpgradedConnGetsGoAwayAtDrainStart(t *testing.T) {
 			if got := h.enteredPaths(); len(got) != 0 {
 				t.Errorf("a stream opened after the GOAWAY was handed to the handler: %v", got)
 			}
+			// The upgraded stream is still in its handler: the drain waits for it.
+			select {
+			case err := <-shut:
+				t.Fatalf("Shutdown returned %v while the upgraded stream 1 was still in its handler", err)
+			default:
+			}
 			h.Release()
 			select {
 			case err := <-shut:

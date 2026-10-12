@@ -239,7 +239,10 @@ func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Co
 
 // isH2CUpgrade reports whether the headers properly request an upgrade to h2c
 // (RFC 7540 3.2): every Upgrade line is exactly the one token h2c, and the
-// Connection header lists HTTP2-Settings. A request that offers other
+// Connection header lists both Upgrade and HTTP2-Settings. A request whose
+// Connection lacks either token is not one: a proxy that does not see
+// "Connection: Upgrade" treats the request as an ordinary one, and switching
+// protocols behind its back is the h2c smuggling shape. A request that offers other
 // protocols as well ("Upgrade: websocket, h2c", a second Upgrade line) is not
 // one, as on epoll, io_uring and adaptive (SECURITY.md, "H2C upgrade
 // single-token Upgrade enforcement"): x/net's test, which this was, takes any
@@ -255,7 +258,9 @@ func isH2CUpgrade(h http.Header) bool {
 			return false
 		}
 	}
-	return httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Connection")], "HTTP2-Settings")
+	conn := h[textproto.CanonicalMIMEHeaderKey("Connection")]
+	return httpguts.HeaderValuesContainsToken(conn, "Upgrade") &&
+		httpguts.HeaderValuesContainsToken(conn, "HTTP2-Settings")
 }
 
 // h2cSettings returns the decoded HTTP2-Settings header.
