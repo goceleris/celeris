@@ -273,13 +273,13 @@ func (ps *PubSub) control(verb string, names []string, update func()) error {
 // PubSub whose conn is down: the command was not sent, but the subscription
 // set is updated, and the reconnect replays it while the PubSub is open, so
 // the caller need not repeat the call (see the [PubSub] doc for the cases where
-// no reconnect follows: the constructors [Client.Subscribe] and
-// [Client.PSubscribe] can return it with a nil PubSub, and after
-// [Client.Close] the reconnect has no pool to dial). It is not [ErrClosed]
+// no reconnect follows: the constructors [Client.Subscribe],
+// [Client.PSubscribe] and [ClusterClient.SSubscribe] can return it with a nil
+// PubSub, and after [Client.Close] the reconnect has no pool to dial). It is not [ErrClosed]
 // (the PubSub is open) and not [ErrUnknownFD] (the driver maps that to this
 // error when the loop forgot the conn). Match it with errors.Is. Messages
 // published while the conn is down are lost, as the [PubSub] doc says.
-var ErrPubSubConnDown = errors.New("celeris-redis: pubsub conn down, reconnecting")
+var ErrPubSubConnDown = errors.New("celeris-redis: pubsub conn down")
 
 // sendPubSubControl writes a control command without tracking a reply (pubsub
 // control frames are delivered as push). The caller holds ps.ctlMu and read
@@ -387,7 +387,11 @@ func (ps *PubSub) deliver(m *Message) bool {
 // reconnect that replaces a live conn with a fresh one and releases the old,
 // once: harmless. Comparing the dropped conn with ps.conn would avoid that
 // extra dial and cost a signature change in the hook plumbing and a second
-// lock on this path, for no case that loses a subscription or a message.
+// lock on this path. No subscription is lost by the extra reconnect; a message
+// published in the swap window (the new conn's SUBSCRIBE is sent without
+// waiting for the server's reply, then the old, live conn is released) may be
+// lost, and one published just before the old conn is released may arrive
+// twice, as on any reconnect.
 func (ps *PubSub) onConnDrop(_ error) {
 	if ps.closed.Load() {
 		return
