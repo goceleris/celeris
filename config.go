@@ -119,6 +119,26 @@ type Config struct {
 	ReadHeaderTimeout time.Duration
 	// WriteTimeout is the max duration for writing the response.
 	// Zero uses the default (60s). Set to -1 for no timeout.
+	//
+	// A detached stream (see [Context.Detach]; the SSE middleware detaches)
+	// is not cut at ReadTimeout or WriteTimeout as a whole on any engine, so
+	// an SSE stream stays open for as long as its client keeps reading,
+	// without setting WriteTimeout to -1. The native engines (epoll, io_uring,
+	// adaptive) apply neither timeout to a detached connection. On the std
+	// engine net/http arms WriteTimeout as one deadline for the whole
+	// response and Detach clears it for that request (ReadTimeout never cuts
+	// a stream there: net/http has stopped it by the time the handler runs).
+	//
+	// On std, WriteTimeout then bounds a detached stream's writes one at a
+	// time: a Write or Flush that has not finished within WriteTimeout fails
+	// (for an SSE event, which is small, that means the client has stopped
+	// reading: a client that stays connected and reads nothing ends the stream
+	// that way; one very large write to a client that reads too slowly for it
+	// fails the same; -1 sets no such bound), and when ShutdownTimeout runs
+	// out the writes of the streams still running fail. A response that is not detached, such as
+	// a large download or a chunked body written with [Context.StreamWriter]
+	// without Detach, stays under WriteTimeout as an absolute deadline for the
+	// whole response: raise it or set -1 for such routes.
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
 	// Zero uses the default (600s). Set to -1 for no timeout.
