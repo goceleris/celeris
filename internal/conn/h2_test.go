@@ -3,6 +3,7 @@ package conn
 import (
 	"bytes"
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
@@ -786,5 +787,359 @@ func TestProcessH2_ConnWindowStallResumes(t *testing.T) {
 	}
 	if !sawEndStream {
 		t.Fatal("no END_STREAM DATA frame — response did not complete")
+	}
+}
+
+// celeris#889 items 17, 21 and 25 at the connection layer: what the peer sees
+// of ProcessH2.
+
+// peer889 drives a server H2State the way a client's bytes arrive and keeps
+// what the server wrote.
+type peer889 struct {
+	t     *testing.T
+	state *H2State
+	h     stream.Handler
+	cfg   H2Config
+	mu    sync.Mutex
+	out   []byte
+	enc   bytes.Buffer
+	henc  *hpack.Encoder
+}
+
+func newPeer889(t *testing.T, h stream.Handler, cfg H2Config) *peer889 {
+	t.Helper()
+	p := &peer889{t: t, h: h, cfg: cfg}
+	p.henc = hpack.NewEncoder(&p.enc)
+	p.state = NewH2State(h, cfg, p.write, nil)
+	return p
+}
+
+func (p *peer889) write(b []byte) {
+	p.mu.Lock()
+	p.out = append(p.out, b...)
+	p.mu.Unlock()
+}
+
+// send delivers b in one ProcessH2 call.
+func (p *peer889) send(b []byte) error {
+	return ProcessH2(context.Background(), b, p.state, p.h, p.write, p.cfg)
+}
+
+// frames returns the frames the server has written so far.
+func (p *peer889) frames() []http2.Frame {
+	p.mu.Lock()
+	out := append([]byte(nil), p.out...)
+	p.mu.Unlock()
+	rf := http2.NewFramer(nil, bytes.NewReader(out))
+	rf.SetMaxReadFrameSize(1 << 24)
+	var fs []http2.Frame
+	for {
+		f, err := rf.ReadFrame()
+		if err != nil {
+			return fs
+		}
+		switch v := f.(type) { // copy: the framer reuses its buffers
+		case *http2.GoAwayFrame:
+			fs = append(fs, &http2.GoAwayFrame{FrameHeader: v.FrameHeader, LastStreamID: v.LastStreamID, ErrCode: v.ErrCode})
+		case *http2.RSTStreamFrame:
+			fs = append(fs, &http2.RSTStreamFrame{FrameHeader: v.FrameHeader, ErrCode: v.ErrCode})
+		case *http2.WindowUpdateFrame:
+			fs = append(fs, &http2.WindowUpdateFrame{FrameHeader: v.FrameHeader, Increment: v.Increment})
+		case *http2.HeadersFrame:
+			fs = append(fs, &http2.HeadersFrame{FrameHeader: v.FrameHeader})
+		case *http2.SettingsFrame:
+			fs = append(fs, &http2.SettingsFrame{FrameHeader: v.FrameHeader})
+		default:
+			fs = append(fs, f)
+		}
+	}
+}
+
+func (p *peer889) goAways() (gas []*http2.GoAwayFrame) {
+	for _, f := range p.frames() {
+		if g, ok := f.(*http2.GoAwayFrame); ok {
+			gas = append(gas, g)
+		}
+	}
+	return gas
+}
+
+func (p *peer889) headers() (ids []uint32) {
+	for _, f := range p.frames() {
+		if hf, ok := f.(*http2.HeadersFrame); ok {
+			ids = append(ids, hf.StreamID)
+		}
+	}
+	return ids
+}
+
+func (p *peer889) rsts() (rs []*http2.RSTStreamFrame) {
+	for _, f := range p.frames() {
+		if r, ok := f.(*http2.RSTStreamFrame); ok {
+			rs = append(rs, r)
+		}
+	}
+	return rs
+}
+
+// connCredit is the sum of the server's WINDOW_UPDATEs for the connection.
+func (p *peer889) connCredit() (n uint32) {
+	for _, f := range p.frames() {
+		if w, ok := f.(*http2.WindowUpdateFrame); ok && w.StreamID == 0 {
+			n += w.Increment
+		}
+	}
+	return n
+}
+
+// preface889 is the client preface plus a SETTINGS frame with settings.
+func preface889(t *testing.T, settings ...http2.Setting) []byte {
+	t.Helper()
+	var in bytes.Buffer
+	in.WriteString(frame.ClientPreface)
+	if err := http2.NewFramer(&in, nil).WriteSettings(settings...); err != nil {
+		t.Fatal(err)
+	}
+	return in.Bytes()
+}
+
+// req889 is the header block of a request (the encoder is the peer's, one per
+// connection: a block may reference what an earlier one added).
+func (p *peer889) req889(method string, extra ...hpack.HeaderField) []byte {
+	p.enc.Reset()
+	for _, f := range [][2]string{{":method", method}, {":scheme", "http"}, {":path", "/"}, {":authority", "example.com"}} {
+		_ = p.henc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
+	}
+	for _, f := range extra {
+		_ = p.henc.WriteField(f)
+	}
+	return append([]byte(nil), p.enc.Bytes()...)
+}
+
+func rawFrame889(t *testing.T, typ http2.FrameType, flags http2.Flags, id uint32, payload []byte) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	if err := http2.NewFramer(&b, nil).WriteRawFrame(typ, flags, id, payload); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+// The server advertises the bound it enforces on a request's header list
+// (RFC 9113 section 6.5.2), in its first SETTINGS frame on a connection that
+// starts as HTTP/2 and on one that starts with an h2c Upgrade: a client that
+// reads it never sends a list the server refuses.
+func TestH2AdvertisesMaxHeaderListSize889(t *testing.T) {
+	const want = 64 << 10
+	settingsOf := func(t *testing.T, out []byte) map[http2.SettingID]uint32 {
+		t.Helper()
+		rf := http2.NewFramer(nil, bytes.NewReader(out))
+		for {
+			f, err := rf.ReadFrame()
+			if err != nil {
+				t.Fatal("no SETTINGS frame without ACK in the server's output")
+			}
+			if sf, ok := f.(*http2.SettingsFrame); ok && !sf.IsAck() {
+				got := map[http2.SettingID]uint32{}
+				_ = sf.ForeachSetting(func(s http2.Setting) error { got[s.ID] = s.Val; return nil })
+				return got
+			}
+		}
+	}
+	check := func(t *testing.T, got map[http2.SettingID]uint32) {
+		t.Helper()
+		if v, ok := got[http2.SettingMaxHeaderListSize]; !ok || v != want {
+			t.Errorf("SETTINGS_MAX_HEADER_LIST_SIZE = %d (present %v), want %d; settings %v", v, ok, want, got)
+		}
+		for _, id := range []http2.SettingID{http2.SettingMaxConcurrentStreams, http2.SettingInitialWindowSize, http2.SettingMaxFrameSize} {
+			if _, ok := got[id]; !ok {
+				t.Errorf("SETTINGS lost %v: %v", id, got)
+			}
+		}
+	}
+	t.Run("direct", func(t *testing.T) {
+		p := newPeer889(t, &captureHandler{}, H2Config{})
+		if err := p.send(preface889(t)); err != nil {
+			t.Fatal(err)
+		}
+		p.mu.Lock()
+		out := append([]byte(nil), p.out...)
+		p.mu.Unlock()
+		check(t, settingsOf(t, out))
+	})
+	t.Run("upgrade", func(t *testing.T) {
+		var out []byte
+		info := &UpgradeInfo{Method: "GET", URI: "/", Headers: [][2]string{{"host", "x"}}}
+		if _, err := NewH2StateFromUpgrade(&captureHandler{}, H2Config{}, func(b []byte) { out = append(out, b...) }, nil, info); err != nil {
+			t.Fatal(err)
+		}
+		check(t, settingsOf(t, out))
+	})
+}
+
+// The HEADERS fast path and the framer path hold a frame to the same size:
+// the server's own SETTINGS_MAX_FRAME_SIZE (RFC 9113 section 4.2), not the
+// peer's, which limits what the server sends. A client that advertises 1 MiB
+// and sends a 20 KB HEADERS frame to a server that advertised 16 KiB gets
+// GOAWAY(FRAME_SIZE_ERROR), as the framer path (and std) answer, and the
+// request is not run.
+func TestProcessH2_HeadersOverTheLocalMaxFrameSize889(t *testing.T) {
+	h := &captureHandler{}
+	p := newPeer889(t, h, H2Config{MaxFrameSize: 16384})
+	block := p.req889("GET", hpack.HeaderField{Name: "x-pad", Value: strings.Repeat("\\", 20000), Sensitive: true}) // a backslash has a 19-bit Huffman code: sent as it is
+	if len(block) <= 16384 {
+		t.Fatalf("self-check: block of %d bytes", len(block))
+	}
+	// The peer's SETTINGS arrive first, in a read of their own (the fast path
+	// reads the frame size once per read).
+	if err := p.send(preface889(t, http2.Setting{ID: http2.SettingMaxFrameSize, Val: 1 << 20})); err != nil {
+		t.Fatal(err)
+	}
+	err := p.send(rawFrame889(t, http2.FrameHeaders, http2.FlagHeadersEndHeaders|http2.FlagHeadersEndStream, 1, block))
+	t.Logf("ProcessH2 returned %v", err)
+	if err == nil {
+		t.Error("ProcessH2 returned nil for a HEADERS frame over the advertised frame size, want the connection error")
+	}
+	gas := p.goAways()
+	if len(gas) != 1 || gas[0].ErrCode != http2.ErrCodeFrameSize {
+		t.Errorf("GOAWAYs = %v, want one FRAME_SIZE_ERROR", gas)
+	}
+	if h.called {
+		t.Error("the handler ran for a frame over the advertised size")
+	}
+}
+
+// A frame header that declares a length over the server's frame size ends the
+// connection at once: the server does not buffer up to 16 MiB of the frame
+// first (the length is 24 bits), whatever its type.
+func TestProcessH2_OversizeFrameHeaderDoesNotWait889(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		typ   http2.FrameType
+		flags http2.Flags
+	}{
+		{"headers", http2.FrameHeaders, http2.FlagHeadersEndHeaders},
+		{"data", http2.FrameData, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPeer889(t, &captureHandler{}, H2Config{MaxFrameSize: 16384})
+			if err := p.send(preface889(t)); err != nil {
+				t.Fatal(err)
+			}
+			// Only the 9-byte header of a frame of 16 MiB - 1: no payload follows.
+			hdr := []byte{0xff, 0xff, 0xff, byte(tc.typ), byte(tc.flags), 0, 0, 0, 1}
+			err := p.send(hdr)
+			if err == nil {
+				t.Error("ProcessH2 waited for the payload of a frame over the advertised size, want the connection error")
+			}
+			gas := p.goAways()
+			if len(gas) != 1 || gas[0].ErrCode != http2.ErrCodeFrameSize {
+				t.Errorf("GOAWAYs = %v, want one FRAME_SIZE_ERROR", gas)
+			}
+		})
+	}
+}
+
+// A frame within the frame size whose payload has not all arrived is still
+// waited for (hasCompleteFrame): the check on the declared length must not
+// turn a TCP segment boundary into an error.
+func TestProcessH2_PartialFrameStillWaits889(t *testing.T) {
+	h := &captureHandler{}
+	p := newPeer889(t, h, H2Config{MaxFrameSize: 16384})
+	if err := p.send(preface889(t)); err != nil {
+		t.Fatal(err)
+	}
+	block := p.req889("GET")
+	whole := rawFrame889(t, http2.FrameHeaders, http2.FlagHeadersEndHeaders|http2.FlagHeadersEndStream, 1, block)
+	if err := p.send(whole[:len(whole)-3]); err != nil {
+		t.Fatalf("the first part of a frame: %v", err)
+	}
+	if h.called || len(p.goAways()) != 0 {
+		t.Fatal("a partial frame was acted on")
+	}
+	if err := p.send(whole[len(whole)-3:]); err != nil {
+		t.Fatalf("the rest of the frame: %v", err)
+	}
+	if !h.called {
+		t.Error("the request was not run once its frame was whole")
+	}
+}
+
+// A request refused for MAX_CONCURRENT_STREAMS or for its header list, whose
+// body is already on the wire, does not end the connection: the DATA is
+// ignored, its length goes back to the connection window, and the next
+// request is served.
+func TestProcessH2_DataAfterRefusedStream889(t *testing.T) {
+	body := bytes.Repeat([]byte("d"), 10000) // over the 8192 bytes at which window credit is sent
+	hugeList := func(p *peer889) []byte {
+		p.enc.Reset()
+		for _, f := range [][2]string{{":method", "POST"}, {":scheme", "http"}, {":path", "/"}, {":authority", "example.com"}} {
+			_ = p.henc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
+		}
+		_ = p.henc.WriteField(hpack.HeaderField{Name: "x-pad", Value: string(bytes.Repeat([]byte("a"), 4000))})
+		return append(append([]byte(nil), p.enc.Bytes()...), bytes.Repeat([]byte{0xBE}, 12<<10)...)
+	}
+	for _, tc := range []struct {
+		name    string
+		refused uint32 // the stream that is refused
+		want    http2.ErrCode
+		setup   func(t *testing.T, p *peer889) []byte // what comes before the refused stream's HEADERS
+		block   func(p *peer889) []byte
+	}{
+		{
+			name: "stream-limit", refused: 3, want: http2.ErrCodeRefusedStream,
+			setup: func(t *testing.T, p *peer889) []byte { // stream 1 holds the only slot
+				return rawFrame889(t, http2.FrameHeaders, http2.FlagHeadersEndHeaders, 1, p.req889("POST"))
+			},
+			block: func(p *peer889) []byte { return p.req889("POST") },
+		},
+		{
+			name: "header-list", refused: 1, want: http2.ErrCodeEnhanceYourCalm,
+			setup: func(*testing.T, *peer889) []byte { return nil },
+			block: hugeList,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPeer889(t, respondHandler{body: []byte("ok")}, H2Config{MaxConcurrentStreams: 1})
+			in := append(preface889(t), tc.setup(t, p)...)
+			in = append(in, rawFrame889(t, http2.FrameHeaders, http2.FlagHeadersEndHeaders, tc.refused, tc.block(p))...)
+			if err := p.send(in); err != nil {
+				t.Fatalf("the refused request: %v", err)
+			}
+			if rs := p.rsts(); len(rs) != 1 || rs[0].StreamID != tc.refused || rs[0].ErrCode != tc.want {
+				t.Fatalf("RST_STREAMs = %v, want one on stream %d with %v", rs, tc.refused, tc.want)
+			}
+			before := p.connCredit()
+			if err := p.send(rawFrame889(t, http2.FrameData, http2.FlagDataEndStream, tc.refused, body)); err != nil {
+				t.Fatalf("DATA on stream %d, reset by the server: %v", tc.refused, err)
+			}
+			if gas := p.goAways(); len(gas) != 0 {
+				t.Fatalf("GOAWAYs = %v, want none", gas)
+			}
+			if got := p.connCredit() - before; got != uint32(len(body)) {
+				t.Errorf("WINDOW_UPDATE credit for the ignored DATA = %d, want %d", got, len(body))
+			}
+			// The slot, if one was taken, is released by finishing that stream; then a
+			// new request is served on the same connection.
+			next := tc.refused + 2
+			in = nil
+			if tc.refused == 3 {
+				in = append(in, rawFrame889(t, http2.FrameData, http2.FlagDataEndStream, 1, []byte("x"))...)
+				next = 5
+			}
+			in = append(in, rawFrame889(t, http2.FrameHeaders, http2.FlagHeadersEndHeaders|http2.FlagHeadersEndStream, next, p.req889("GET"))...)
+			if err := p.send(in); err != nil {
+				t.Fatalf("the next request: %v", err)
+			}
+			served := false
+			for _, id := range p.headers() {
+				if id == next {
+					served = true
+				}
+			}
+			if !served {
+				t.Errorf("stream %d was not answered; answered streams %v", next, p.headers())
+			}
+		})
 	}
 }

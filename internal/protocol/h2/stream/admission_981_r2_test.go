@@ -113,4 +113,12 @@ func TestRefusedBlockAllocs981(t *testing.T) {
 	if n > 0 {
 		t.Errorf("%v allocations per refused stream, want 0", n)
 	}
+	// AllocsPerRun integer-divides the amortised growth of an append, so a
+	// refusal that built its fields (the decoder's emit left on) reads 0 above
+	// while the slice grows for the life of the connection (celeris#889). The
+	// decode target is what is checked: nothing was appended to it, and no
+	// backing array was ever allocated.
+	if got, c := len(p.refusedFields), cap(p.refusedFields); got != 0 || c != 0 {
+		t.Errorf("refusedFields has len %d, cap %d after the refused blocks, want 0 and 0: a refused block is decoded with emit off", got, c)
+	}
 }
