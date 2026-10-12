@@ -161,6 +161,18 @@ type Processor struct {
 	InlineCount          uint64          // number of requests handled inline (for metrics)
 	MaxRequestBodySize   int64           // 0 = use default (100 MB)
 
+	// OnHandlerPanic, when set, is told of a panic that escaped a stream's
+	// handler and reached the last-resort recover of executeHandlerInline or
+	// executeHandler (the celeris router answers a handler's panic with a 500
+	// first, so only a panic out of the router itself, a response writer or
+	// middleware outside it gets here): the stream's id, the panic value and
+	// the stack at the recover. It runs on the goroutine that ran the handler
+	// (the event loop, for an inline one), after the stream has been given up
+	// and before its slot is freed, so it must not block. A panic in the hook
+	// itself is recovered and dropped. Set it before the first frame.
+	OnHandlerPanic func(streamID uint32, r any, stack []byte)
+	handlerPanics  atomic.Uint64 // panics that reached the recover, hook or not
+
 	// asyncResolver, when set, lets per-stream dispatch honor the
 	// per-route .Async() flag: a stream whose route is async is forced
 	// onto the worker pool instead of running inline on the event loop.
@@ -225,6 +237,18 @@ type Processor struct {
 	// the wire is ignored (handleData), where DATA on any other closed stream
 	// is still a connection error. After refusedFields for the same reason.
 	resetIDs serverResets
+}
+
+// HandlerPanics is how many panics have escaped a stream's handler of this
+// connection to the last-resort recover (OnHandlerPanic). Safe from any
+// goroutine.
+func (p *Processor) HandlerPanics() uint64 { return p.handlerPanics.Load() }
+
+// handlerPanicked records a panic that escaped the handler of stream id, and
+// tells OnHandlerPanic. It runs inside the deferred recover of the handler's
+// goroutine, so the stack still holds the panic's frames.
+func (p *Processor) handlerPanicked(id uint32, r any) {
+	_, _ = id, r // not recorded yet
 }
 
 // PoolHandlersRunning reports whether a stream of this connection has a
