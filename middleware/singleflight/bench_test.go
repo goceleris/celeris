@@ -2,6 +2,7 @@ package singleflight
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/goceleris/celeris"
@@ -101,5 +102,19 @@ func BenchmarkSingleflightMissManyHeaders(b *testing.B) {
 		ctx, _ := celeristest.NewContext("GET", "/api/items", opts...)
 		_ = ctx.Next()
 		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkDefaultKeyLongAcceptEncoding is the default key of a request whose
+// Accept-Encoding is 64 KiB of "a,a,a,..." (the most a native engine accepts
+// in a head, and the dearest value of that size for the negotiator's parser):
+// the key must cost about the copy of the value, as main's did, not the
+// parse.
+func BenchmarkDefaultKeyLongAcceptEncoding(b *testing.B) {
+	c, _ := celeristest.NewContext("GET", "/api/items", celeristest.WithHeader("accept-encoding", strings.Repeat("a,", 32<<10)))
+	defer celeristest.ReleaseContext(c)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = defaultKeyFunc(c)
 	}
 }
