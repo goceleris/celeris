@@ -6,6 +6,8 @@ package postgres
 // A/A floor are in the PR that made the change):
 //
 //	OnRowStreaming887   one streamed row per op: copyRow, the send, a consumer that keeps up
+//	OnRowStreamSolo887  the same row with no consumer goroutine: the channel is drained by the
+//	                    benchmark itself every 4096 rows, so the figure is the producer's cost alone
 //	OnRowBuffered887    one buffered row per op: the path the change does not touch
 //	StreamLifecycle887  one request per op: 16 streamed rows, then dispatch's done close
 
@@ -73,6 +75,22 @@ func BenchmarkStreamLifecycle887(b *testing.B) {
 			b.Fatal(err)
 		}
 		for range req.rowCh { //revive:disable-line:empty-block drain until closed
+		}
+	}
+}
+
+func BenchmarkOnRowStreamSolo887(b *testing.B) {
+	const capacity = 4096
+	req := &pgRequest{rowCh: make(chan [][]byte, capacity), doneCh: make(chan struct{})}
+	row := [][]byte{[]byte("0123456789"), []byte("abcdefghij")}
+	b.ReportAllocs()
+	n := 0
+	for b.Loop() {
+		req.OnRow(row)
+		if n++; n == capacity-1 {
+			for ; n > 0; n-- {
+				<-req.rowCh
+			}
 		}
 	}
 }
