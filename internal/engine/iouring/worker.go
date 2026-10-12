@@ -2698,12 +2698,14 @@ func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
 	for range len(w.conns) {
 		newFD, _, err := unix.Accept4(listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
-			switch err {
-			case unix.EAGAIN:
+			if err == unix.EAGAIN {
 				return
-			case unix.EINTR, unix.ECONNABORTED:
+			}
+			if w.acceptRetry(err) {
 				// A signal, or a queued connection reset before it was
-				// taken: the rest of the queue is still there.
+				// taken (ECONNABORTED, counted in AcceptCancelled as the
+				// accept CQE of the same errno is): the rest of the queue is
+				// still there.
 				continue
 			}
 			var errno unix.Errno
@@ -2713,6 +2715,14 @@ func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
 		}
 		w.onAcceptedFD(ctx, newFD, now, false)
 	}
+}
+
+// acceptRetry reports whether a synchronous accept4 failure is a transient
+// one to retry in place (ECONNABORTED, counted in AcceptCancelled; EINTR, not
+// counted); see errclass.Counters.AcceptRetried.
+func (w *Worker) acceptRetry(err error) bool {
+	errno, ok := err.(unix.Errno)
+	return ok && w.errs.AcceptRetried(errno)
 }
 
 // errHijackNoSQE is what hijackConn answers when the SQ ring has no room for
