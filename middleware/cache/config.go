@@ -97,6 +97,7 @@ type Config struct {
 	//   - no-store, private or no-cache → skip caching
 	//   - max-age=0                     → skip caching
 	//   - max-age=N (N > 0)             → cap TTL to min(cfg.TTL, N seconds)
+	//   - not a comma-separated list    → skip caching (private; max-age=0)
 	//
 	// No-cache and max-age=0 are not stored because a stored response would
 	// be served without the revalidation the origin asked for, and this

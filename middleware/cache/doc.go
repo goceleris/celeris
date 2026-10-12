@@ -48,6 +48,11 @@
 // A no-cache or max-age=0 response is not stored because a stored one
 // would be served without the revalidation the origin asked for.
 //
+// A Cache-Control value that is not a comma-separated list of directives
+// (private; max-age=0, max-age=60 private, a quote that never closes) is not
+// stored either: the cache does not guess which directives it holds, and a
+// wrong guess would serve one user's response to another.
+//
 // # Invalidation
 //
 //   - [Invalidate] removes a single computed key
