@@ -109,8 +109,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		// conditional request is not coalesced either: its response (a 304 or
 		// a 412) answers its validator, which that key may not include
 		// (celeris#912). The default key includes the validators, so there
-		// requests that send the same ones are coalesced (celeris#888 item
-		// 23).
+		// GET and HEAD requests that send the same ones are coalesced
+		// (celeris#888 item 23); a conditional write never is.
 		if answersItsOwnHeaders(c, customKey) {
 			return c.Next()
 		}
@@ -256,18 +256,25 @@ func New(config ...Config) celeris.HandlerFunc {
 }
 
 // answersItsOwnHeaders reports a request whose response answers one of its
-// own headers that the key does not include, so it must not be coalesced:
-// a Range (the 206 part, celeris#832), and, when the key is a custom one, a
-// precondition (If-None-Match and If-Modified-Since give a 304, If-Match and
-// If-Unmodified-Since a 412, celeris#912). If-Range applies only with a
-// Range. The default key holds the four preconditions, so it needs no bypass
-// for them.
+// own headers that the key does not include, or that must run, so it must not
+// be coalesced: a Range (the 206 part, celeris#832); a precondition when the
+// key is a custom one (If-None-Match and If-Modified-Since give a 304,
+// If-Match and If-Unmodified-Since a 412, celeris#912), because that key may
+// not include the validator; and, whatever the key, a precondition on a
+// method other than GET and HEAD. The default key holds the four
+// preconditions, so a GET or HEAD revalidation that sends the same one is
+// coalesced (celeris#888 item 23), but a conditional write (a PUT or POST
+// with If-Match, say) is not a revalidation: its handler is the update, and
+// a request that took another's response instead would lose its update and
+// never get its own 412. If-Range applies only with a Range.
 func answersItsOwnHeaders(c *celeris.Context, customKey bool) bool {
 	if c.Header("range") != "" {
 		return true
 	}
 	if !customKey {
-		return false
+		if m := c.Method(); m == "GET" || m == "HEAD" {
+			return false
+		}
 	}
 	for _, v := range keyValidators {
 		if c.Header(v.header) != "" {
