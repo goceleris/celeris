@@ -10,6 +10,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -262,9 +263,115 @@ func TestFailAllBeforePromotionKeepsTheErrorAndNothingToClose887(t *testing.T) {
 	if req.rowCh != nil {
 		t.Error("promoteToStreaming published a rowCh after failAll: nothing will close it")
 	}
+	// colsCh closed means "rowCh is published": a caller woken on it builds a
+	// streamRows over rowCh, and a nil rowCh blocks Next and Close for good.
 	select {
 	case <-req.colsCh:
+		t.Error("colsCh is closed after failAll and a declined promotion: a caller woken on it reads a nil rowCh")
 	default:
-		t.Error("colsCh is not closed after failAll and the promotion")
+	}
+}
+
+// A conn that dies before the request promoted to streaming must wake the
+// caller parked in waitForQueryRows with the conn's error. Before this, failAll
+// closed colsCh, the caller built a streamRows over the nil rowCh, and both
+// Next and Close blocked for good (review r1 of #1002; main hangs the same).
+func TestFailAllBeforePromotionWakesTheCallerWithTheError887(t *testing.T) {
+	const rounds = 50
+	boom := errors.New("conn closed")
+	for i := 0; i < rounds; i++ {
+		c := &pgConn{bridge: async.NewBridge()}
+		req := acquirePgRequest()
+		req.ctx = context.Background()
+		req.kind = reqSimple
+		req.colsCh = make(chan struct{})
+		c.enqueue(req)
+		type res struct {
+			rows driver.Rows
+			err  error
+		}
+		got := make(chan res, 1)
+		go func() {
+			r, err := c.waitForQueryRows(context.Background(), req, true)
+			got <- res{r, err}
+		}()
+		time.Sleep(2 * time.Millisecond) // the caller is parked in the select
+		c.failAll(boom)
+		var r res
+		select {
+		case r = <-got:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("round %d: waitForQueryRows did not return after failAll", i)
+		}
+		if r.rows != nil {
+			// What the old code returned: a streamRows over a nil rowCh.
+			done := make(chan error, 1)
+			go func() { done <- r.rows.Next(make([]driver.Value, 1)) }()
+			select {
+			case <-done:
+			case <-time.After(200 * time.Millisecond):
+				t.Fatalf("round %d: waitForQueryRows returned rows whose Next blocks for good", i)
+			}
+		}
+		if !errors.Is(r.err, boom) {
+			t.Fatalf("round %d: waitForQueryRows error = %v, want the failAll error", i, r.err)
+		}
+	}
+}
+
+// The caller woken by failAll reads req.rows and req.columns while the
+// delivery goroutine, still inside dispatch, reaches the streaming threshold
+// and calls promoteToStreaming. A declined promotion must leave the request
+// alone: under -race a write to req.rows there is a data race with the caller.
+func TestDeclinedPromotionDoesNotTouchTheRequestTheCallerReads887(t *testing.T) {
+	for _, kind := range []requestKind{reqSimple, reqExtended} {
+		t.Run(map[requestKind]string{reqSimple: "simple", reqExtended: "extended"}[kind], func(t *testing.T) {
+			declinedPromotionRounds887(t, kind)
+		})
+	}
+}
+
+func declinedPromotionRounds887(t *testing.T, kind requestKind) {
+	const rounds = 300
+	boom := errors.New("conn closed")
+	for i := 0; i < rounds; i++ {
+		c := &pgConn{bridge: async.NewBridge()}
+		req := acquirePgRequest()
+		req.ctx = context.Background()
+		req.kind = kind
+		req.colsCh = make(chan struct{})
+		if kind == reqExtended {
+			// The describe result promoteToStreaming would copy to req.columns.
+			req.extended.Columns = []protocol.ColumnDesc{{Name: "a"}}
+		}
+		c.enqueue(req)
+		for j := 0; j < 3; j++ {
+			req.OnRow([][]byte{[]byte("buffered")}) // below the threshold: stays buffered
+		}
+		var wg sync.WaitGroup
+		var rows driver.Rows
+		var werr error
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rows, werr = c.waitForQueryRows(context.Background(), req, true)
+		}()
+		time.Sleep(time.Millisecond)
+		c.failAll(boom)
+		wg.Add(1)
+		go func() { defer wg.Done(); promoteToStreaming(req) }()
+		wg.Wait()
+		if werr == nil && rows == nil {
+			t.Fatalf("round %d: waitForQueryRows returned neither rows nor an error", i)
+		}
+		if rows != nil {
+			closed := make(chan struct{})
+			go func() { _ = rows.Close(); close(closed) }()
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatalf("round %d: rows.Close blocks for good", i)
+			}
+		}
 	}
 }
