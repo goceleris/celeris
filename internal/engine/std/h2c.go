@@ -43,6 +43,7 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"strings"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
@@ -52,6 +53,10 @@ import (
 // HTTP/2 connection begins on a cleartext HTTP/1 listener (RFC 7540 3.4, prior
 // knowledge, and 3.2, the Upgrade handshake), hijacks the connection and
 // serves it through h2s.ServeConn, and passes every other request on to next.
+// Each way is switched on by its own field (priorKnowledge, upgrade), so one
+// handler serves every combination Config.Protocol and Config.EnableH2Upgrade
+// resolve to (engine.go says which): a way that is off is not intercepted, and
+// its request goes to next as the plain HTTP/1.1 request it also is.
 //
 // It is golang.org/x/net/http2/h2c's handler (Copyright 2018 The Go
 // Authors, BSD-3-Clause), with one difference, which is why it is not that
@@ -67,14 +72,23 @@ import (
 // The connection is thereby served under the engine's own Config limits
 // (ReadTimeout, WriteTimeout, MaxHeaderBytes) and, since h2s.IdleTimeout is
 // copied from the server by ConfigureServer, IdleTimeout, which an h2c
-// connection used to be exempt from. Detection and the 500 on a failed
-// upgrade are unchanged. The body of an upgrade request is read as before,
+// connection used to be exempt from. Prior-knowledge detection and the 500 on
+// a failed upgrade are unchanged; the upgrade test takes h2c as the sole
+// token of Upgrade (isH2CUpgrade, celeris#889). The body of an upgrade request is read as before,
 // into memory before the connection is taken over, but no further than
 // MaxRequestBodySize (celeris#976), and a declared Content-Length over it is
 // refused before any of the body is read.
 type h2cHandler struct {
 	next http.Handler
 	h2s  *http2.Server //nolint:staticcheck // SA1019: the type ServeConn is a method of; see the import comment in engine.go.
+	// priorKnowledge: serve a connection that opens with the HTTP/2 preface
+	// (RFC 7540 3.4). Off on Protocol HTTP1, which has no prior-knowledge
+	// h2c.
+	priorKnowledge bool
+	// upgrade: honour a request for the RFC 7540 3.2 upgrade
+	// (Config.EnableH2Upgrade, as resolved). Off, such a request is served
+	// as plain HTTP/1.1 with its headers untouched.
+	upgrade bool
 	// maxBody is Config.MaxRequestBodySize, which bounds the body of an
 	// upgrade request as it bounds every other (celeris#976); 0 = unlimited.
 	maxBody int64
@@ -86,7 +100,7 @@ type h2cHandler struct {
 
 func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Prior knowledge (RFC 7540 3.4).
-	if r.Method == "PRI" && len(r.Header) == 0 && r.URL.Path == "*" && r.Proto == "HTTP/2.0" {
+	if h.priorKnowledge && r.Method == "PRI" && len(r.Header) == 0 && r.URL.Path == "*" && r.Proto == "HTTP/2.0" {
 		conn, err := h2cPriorKnowledge(w)
 		if err != nil {
 			return
@@ -101,7 +115,7 @@ func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Upgrade to h2c (RFC 7540 3.2).
-	if isH2CUpgrade(r.Header) {
+	if h.upgrade && isH2CUpgrade(r.Header) {
 		conn, settings, err := h2cUpgrade(w, r, h.maxBody)
 		if err != nil {
 			if errors.Is(err, errH2CUpgradeBodyTooLarge) {
@@ -224,10 +238,29 @@ func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Co
 }
 
 // isH2CUpgrade reports whether the headers properly request an upgrade to h2c
-// (RFC 7540 3.2).
+// (RFC 7540 3.2): every Upgrade line is exactly the one token h2c, and the
+// Connection header lists both Upgrade and HTTP2-Settings. A request whose
+// Connection lacks either token is not one: a proxy that does not see
+// "Connection: Upgrade" treats the request as an ordinary one, and switching
+// protocols behind its back is the h2c smuggling shape. A request that offers other
+// protocols as well ("Upgrade: websocket, h2c", a second Upgrade line) is not
+// one, as on epoll, io_uring and adaptive (SECURITY.md, "H2C upgrade
+// single-token Upgrade enforcement"): x/net's test, which this was, takes any
+// list that contains h2c, and picks h2c for a client that asked for a choice
+// among protocols (celeris#889).
 func isH2CUpgrade(h http.Header) bool {
-	return httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Upgrade")], "h2c") &&
-		httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Connection")], "HTTP2-Settings")
+	up := h[textproto.CanonicalMIMEHeaderKey("Upgrade")]
+	if len(up) == 0 {
+		return false
+	}
+	for _, v := range up {
+		if !strings.EqualFold(strings.TrimSpace(v), "h2c") {
+			return false
+		}
+	}
+	conn := h[textproto.CanonicalMIMEHeaderKey("Connection")]
+	return httpguts.HeaderValuesContainsToken(conn, "Upgrade") &&
+		httpguts.HeaderValuesContainsToken(conn, "HTTP2-Settings")
 }
 
 // h2cSettings returns the decoded HTTP2-Settings header.

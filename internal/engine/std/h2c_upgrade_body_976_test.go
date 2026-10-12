@@ -99,11 +99,13 @@ func TestAutoUpgradeBodyBoundedByMaxRequestBodySize976(t *testing.T) {
 }
 
 // TestH2CUpgradeBodyBoundedByMaxRequestBodySize976 is the same on Protocol
-// H2C, where the upgrade is the only way in from HTTP/1.1.
+// H2C with the upgrade turned on (EnableH2Upgrade &true, which H2C needs for
+// the upgrade since celeris#889).
 func TestH2CUpgradeBodyBoundedByMaxRequestBodySize976(t *testing.T) {
 	const n = 32 << 20
 	e, addr := startH2CEngineWith(t, newPathHandler(), nil, func(c *resource.Config) {
 		c.Protocol = engine.H2C
+		c.SetH2Upgrade(true)
 		c.MaxRequestBodySize = 4096
 	})
 	o := sendUpgradeBody976(t, addr, n)
@@ -161,6 +163,7 @@ func TestRefusedUpgradeBodyCountsLikeBridge976(t *testing.T) {
 		noUp  bool
 	}{
 		{"h2c-upgrade", engine.H2C, false},
+		{"h2c-upgrade-off-bridge", engine.H2C, true},
 		{"auto-upgrade", engine.Auto, false},
 		{"auto-upgrade-off-bridge", engine.Auto, true},
 	} {
@@ -168,9 +171,7 @@ func TestRefusedUpgradeBodyCountsLikeBridge976(t *testing.T) {
 			e, addr := startH2CEngineWith(t, newPathHandler(), nil, func(c *resource.Config) {
 				c.Protocol = tc.proto
 				c.MaxRequestBodySize = 4096
-				if tc.noUp {
-					c.SetH2Upgrade(false)
-				}
+				c.SetH2Upgrade(!tc.noUp)
 			})
 			o := sendUpgradeBody976(t, addr, n)
 			if !strings.HasPrefix(o.first, "HTTP/1.1 413") {
@@ -306,6 +307,7 @@ func TestUpgradeDeclaredOversizeRefusedAtOnce976(t *testing.T) {
 			t.Run(fmt.Sprintf("%v-%d", proto, n), func(t *testing.T) {
 				e, addr := startH2CEngineWith(t, newPathHandler(), nil, func(c *resource.Config) {
 					c.Protocol = proto
+					c.SetH2Upgrade(true)
 					c.MaxRequestBodySize = 4096
 				})
 				first, took := replyWithheld976(t, addr, upgradeHead976+fmt.Sprintf("Content-Length: %d\r\n\r\n", n), 2*time.Second)
@@ -460,6 +462,7 @@ func TestBridgeDeclaredLengthDecidesBeforeTheRead976(t *testing.T) {
 func TestUpgradeBadSettingsWinsOverDeclaredOversize976(t *testing.T) {
 	e, addr := startH2CEngineWith(t, newPathHandler(), nil, func(c *resource.Config) {
 		c.Protocol = engine.H2C
+		c.SetH2Upgrade(true)
 		c.MaxRequestBodySize = 4096
 	})
 	c, err := net.DialTimeout("tcp", addr, 5*time.Second)

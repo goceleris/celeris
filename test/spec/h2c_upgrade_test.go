@@ -147,13 +147,18 @@ func findH2DataOnStream(buf []byte, streamID uint32) ([]byte, bool) {
 
 func h2cTrue() *bool { b := true; return &b }
 
+func h2cFalse() *bool { b := false; return &b }
+
 // ---------- TESTS ----------
 
 func TestH2CUpgradeBasicGET(t *testing.T) {
 	for _, se := range specEngines {
 		if se.name == "std" {
-			// std engine uses x/net/http2/h2c middleware; its upgrade path is
-			// separate. These tests target the custom engines.
+			// std upgrades (TestH2CUpgradeConfigMatrix, the std package's
+			// tests), but this test and the ones below read the native
+			// engines' framing (stream 1 as one DATA frame that ends the
+			// stream) and, for a bad HTTP2-Settings, expect HTTP/1.1 where
+			// std answers 500 (celeris#889). They target the custom engines.
 			continue
 		}
 		t.Run(se.name, func(t *testing.T) {
@@ -286,9 +291,6 @@ func TestH2CUpgradeInvalidSettings(t *testing.T) {
 
 func TestH2CUpgradeMissingConnectionToken(t *testing.T) {
 	for _, se := range specEngines {
-		if se.name == "std" {
-			continue
-		}
 		t.Run(se.name, func(t *testing.T) {
 			addr := startSpecEngineWithConfig(t, se, func(c *resource.Config) {
 				c.Protocol = engine.Auto
@@ -318,9 +320,6 @@ func TestH2CUpgradeMissingConnectionToken(t *testing.T) {
 
 func TestH2CUpgradeAmbiguousUpgrade(t *testing.T) {
 	for _, se := range specEngines {
-		if se.name == "std" {
-			continue
-		}
 		t.Run(se.name, func(t *testing.T) {
 			addr := startSpecEngineWithConfig(t, se, func(c *resource.Config) {
 				c.Protocol = engine.Auto
@@ -349,45 +348,47 @@ func TestH2CUpgradeAmbiguousUpgrade(t *testing.T) {
 	}
 }
 
+// TestH2CUpgradeConfigMatrix is the table Config.EnableH2Upgrade documents,
+// on every engine, std included since celeris#889 (item 14): which Protocol
+// and EnableH2Upgrade honour an Upgrade: h2c request with a 101.
+//
+//	Protocol  nil  &false  &true
+//	Auto      101  no      101
+//	H2C       no   no      101
+//	HTTP1     no   no      101
+//
+// "no" means no 101: on H2C the native engines answer with their HTTP/2
+// SETTINGS frame (they take the listener for HTTP/2) and std, which serves
+// plain HTTP/1.1 on an H2C listener, with the HTTP/1.1 answer; the first reply
+// of every combination is pinned per engine by TestEnableH2UpgradeMatrix889 in
+// the repository root. The matrix sets resource.Config.SetH2Upgrade, which
+// is what celeris.Config's *bool resolves to (toResourceConfig): an explicit
+// false cannot be said through the bool field, where WithDefaults reads false
+// as unset and enables the upgrade on Auto (celeris#964).
 func TestH2CUpgradeConfigMatrix(t *testing.T) {
 	cases := []struct {
 		name         string
 		proto        engine.Protocol
-		enable       *bool
+		enable       *bool // nil: left as the protocol's default
 		wantUpgraded bool
 	}{
 		{"Auto default enables", engine.Auto, nil, true},
 		{"Auto explicit true", engine.Auto, h2cTrue(), true},
-		// "Auto explicit false" is intentionally omitted: this matrix sets
-		// resource.Config.EnableH2Upgrade directly, where a bool's zero
-		// value (false) is indistinguishable from "unset", and WithDefaults
-		// enables upgrade on Auto for such a literal. Auto+disabled is the
-		// celeris.Config path (EnableH2Upgrade *bool), which resolves the
-		// pointer and marks it final with resource.Config.SetH2Upgrade
-		// (celeris#964). The conversion is covered by
-		// TestToResourceConfig_H2Upgrade, and the behaviour on every engine
-		// by TestEnableH2UpgradeFalseDisablesUpgradeOnAuto964, both in the
-		// repository root (packages celeris and celeris_test).
+		{"Auto explicit false", engine.Auto, h2cFalse(), false},
 		{"H2C default disabled", engine.H2C, nil, false},
 		{"H2C explicit true", engine.H2C, h2cTrue(), true},
+		{"H2C explicit false", engine.H2C, h2cFalse(), false},
 		{"HTTP1 default", engine.HTTP1, nil, false},
 		{"HTTP1 explicit true still upgrades", engine.HTTP1, h2cTrue(), true},
+		{"HTTP1 explicit false", engine.HTTP1, h2cFalse(), false},
 	}
 	for _, tc := range cases {
 		for _, se := range specEngines {
-			if se.name == "std" {
-				continue
-			}
-			if tc.proto == engine.H2C {
-				// H2C-only listeners reject plain HTTP/1 bytes; skip
-				// cases that rely on starting as H1 to upgrade.
-				continue
-			}
 			t.Run(tc.name+"/"+se.name, func(t *testing.T) {
 				addr := startSpecEngineWithConfig(t, se, func(c *resource.Config) {
 					c.Protocol = tc.proto
 					if tc.enable != nil {
-						c.EnableH2Upgrade = *tc.enable
+						c.SetH2Upgrade(*tc.enable)
 					}
 				})
 				cc, err := net.DialTimeout("tcp", addr, 2*time.Second)
