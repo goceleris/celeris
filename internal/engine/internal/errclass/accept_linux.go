@@ -43,7 +43,10 @@ func (c *Counters) AcceptFailed(errno unix.Errno) {
 //     AcceptFailed keeps counting that.)
 func (c *Counters) AcceptRetried(errno unix.Errno) bool {
 	switch errno {
-	case unix.ECONNABORTED, unix.EINTR:
+	case unix.ECONNABORTED:
+		c.AcceptCancelled.Add(1)
+		return true
+	case unix.EINTR:
 		return true
 	}
 	return false

@@ -43,12 +43,12 @@ type Counters struct {
 	// peer reset between SYN and accept) and EINTR.
 	//
 	// io_uring reports all four through a completion and counts them here.
-	// epoll's accept4 loop retries ECONNABORTED and EINTR in place and has
-	// never counted them at all, so its share of this bucket is only ever
-	// the failures it does not retry. That asymmetry is deliberate for now:
-	// folding epoll's retries in would change ErrorCount's value on every
-	// published epoll column. It is also the reason an epoll cell can read
-	// 0 while an io_uring cell on the same refapp does not.
+	// epoll's accept4 loop retries ECONNABORTED and EINTR in place; since
+	// celeris#886 item 13 it counts the ECONNABORTED ones here too
+	// ([Counters.AcceptRetried]), so a connection-churn workload reads the
+	// same on both engines. EINTR, an interrupted syscall, stays uncounted
+	// on epoll (an io_uring accept completing with EINTR is counted, as it
+	// is an interrupted SQE).
 	AcceptCancelled atomic.Uint64
 	// AcceptOther counts every accept failure that is neither of the above.
 	AcceptOther atomic.Uint64
