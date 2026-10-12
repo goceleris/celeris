@@ -365,8 +365,10 @@ type Config struct {
 	//     proxies): a request carrying Upgrade: h2c is then served as
 	//     plain HTTP/1.1. Prior-knowledge h2c on Auto is not affected.
 	//
-	// All four engines (Std, Epoll, IOUring, Adaptive) answer an
-	// Upgrade: h2c request the same way for every Protocol and every value:
+	// All four engines (Std, Epoll, IOUring, Adaptive) decide whether a
+	// well-formed Upgrade: h2c request (Connection lists Upgrade and
+	// HTTP2-Settings, Upgrade is exactly h2c, one non-empty HTTP2-Settings)
+	// is upgraded the same way for every Protocol and every value:
 	//
 	//	Protocol  nil   &false  &true
 	//	Auto      101   no      101
@@ -379,6 +381,12 @@ type Config struct {
 	// also serves plain HTTP/1.1 on an H2C listener, serves it as HTTP/1.1.
 	// Prior-knowledge h2c (a connection that opens with the HTTP/2 preface)
 	// is served on Auto and H2C whatever this says, and never on HTTP1.
+	//
+	// A request that is malformed in its HTTP2-Settings header is not handled
+	// alike: Std answers 500 to a missing, repeated or invalid one and
+	// upgrades an empty one, where the native engines serve a missing or
+	// invalid one as HTTP/1.1, upgrade a repeated one and serve an empty one
+	// as HTTP/1.1 (tracked on celeris#889).
 	EnableH2Upgrade *bool
 }
 
