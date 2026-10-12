@@ -243,8 +243,7 @@ func capture(c *celeris.Context, cfg Config, include, exclude map[string]struct{
 				// c.SetHeader lowercases keys on storage, so an exact ==
 				// is both correct and ~10x faster than strings.EqualFold.
 				if h[0] == "cache-control" {
-					v := strings.ToLower(h[1])
-					noStore, secs, hasMaxAge := parseCacheControl(v)
+					noStore, secs, hasMaxAge := parseCacheControl(strings.ToLower(h[1]))
 					if noStore {
 						cacheable = false
 						break
@@ -344,26 +343,41 @@ const maxDeltaSeconds = math.MaxInt32
 // before every reuse, which this cache does not do; the field-qualified form
 // no-cache="x" is treated the same, as the cautious reading) and max-age=0
 // (stale the moment it is made). hasMaxAge and maxAge give the first
-// max-age directive with a valid value, at most maxDeltaSeconds (RFC 9111
+// max-age directive, at most maxDeltaSeconds (RFC 9111
 // §1.2.2: a larger delta-seconds counts as the greatest value the cache can
 // represent), so that maxAge seconds always fits a time.Duration. The
-// directives are matched as tokens, so x-private-ext is not private and
-// x-max-age=0 is not max-age=0, and the storage decision and the TTL come from
+// directives are matched as tokens, so x-max-age=0 is not max-age=0 and
+// no-cache="x" is no-cache, and the storage decision and the TTL come from
 // this one parse (celeris#888 item 27).
+//
+// Two rules make this never looser than main, which refused any value that held
+// "private" or "no-store" anywhere. The floor: a value that holds either word,
+// anywhere, is not stored, whatever the parse below would read (a word glued to
+// other text, as when SetHeader strips a CR, LF or NUL between two directives,
+// x-private-ext, and one inside a quoted string included); nothing below can
+// undo it, the parse can only add refusals. And a max-age whose argument is not
+// 1*DIGIT (RFC 9111 §4.2.1: an invalid max-age is stale) is not stored, so
+// max-age=60abc is not max-age=60, and that includes "max-age=", abc, -1 and a
+// quoted string.
 //
 // A value that is not a list of directives (RFC 9111 §5.2: directive = token
 // ["=" (token / quoted-string)], separated by commas, RFC 9110 §5.6.1) is not
-// stored, because what a recipient reads in it is a guess, and a wrong guess
-// serves one user's response to another (main refused any value that held
-// "private" or "no-store" anywhere). It is such a value when: the name is
-// empty or holds a byte that is not a token character (so "private; max-age"
+// stored either, because what a recipient reads in it is a guess, and a wrong
+// guess serves one user's response to another. It is such a value when: the
+// name is empty or holds a byte that is not a token character (so "private; max-age"
 // is not private with a max-age, and a blank before the '=' is not accepted);
 // an unquoted value holds one (so "max-age=60 private" is not max-age=60); or a
 // quote cannot be read around: a string that never closes, a double quote
 // where a string cannot start, anything but blanks after the closing quote
 // (nextDirective). Empty list elements (",,") and blanks around the commas are
-// part of the list syntax, and "name=" is accepted as before.
+// part of the list syntax, and "name=" is accepted as before for the names other
+// than max-age.
 func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
+	// The floor, before any parsing: main's check (cc is lowercased), which
+	// nothing the parse below reads can undo.
+	if strings.Contains(cc, "private") || strings.Contains(cc, "no-store") {
+		return true, 0, false
+	}
 	for len(cc) > 0 {
 		var d string
 		var doubtful bool
@@ -385,13 +399,14 @@ func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 		case "no-store", "private", "no-cache":
 			return true, 0, false
 		case "max-age":
-			if hasMaxAge {
-				continue
+			// RFC 9111 §4.2.1: an invalid max-age is stale, and this cache
+			// stores no stale response. The argument is 1*DIGIT, nothing else
+			// (empty, abc, -1, 60abc, a quoted string), whichever max-age it is.
+			n, ok := deltaSeconds(val)
+			if !ok || n == 0 {
+				return true, 0, false
 			}
-			if n, ok := atoiPrefix(val); ok {
-				if n == 0 {
-					return true, 0, false
-				}
+			if !hasMaxAge {
 				maxAge, hasMaxAge = min(n, maxDeltaSeconds), true
 			}
 		}
@@ -464,18 +479,21 @@ func nextDirective(cc string) (directive, rest string, doubtful bool) {
 	return cc, "", inQuote
 }
 
-// atoiPrefix parses the leading decimal digits of v.
-func atoiPrefix(v string) (int, bool) {
-	end := 0
-	for end < len(v) && v[end] >= '0' && v[end] <= '9' {
-		end++
-	}
-	if end == 0 {
+// deltaSeconds parses v as delta-seconds (RFC 9111 §1.2.2: 1*DIGIT). ok is
+// false for anything else, an empty v included. A number too large for an int
+// is the greatest value, as the RFC has it.
+func deltaSeconds(v string) (n int, ok bool) {
+	if v == "" {
 		return 0, false
 	}
-	n, err := strconv.Atoi(v[:end])
+	for i := 0; i < len(v); i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(v)
 	if err != nil {
-		return 0, false
+		return math.MaxInt32, true // 1*DIGIT, too large for an int
 	}
 	return n, true
 }

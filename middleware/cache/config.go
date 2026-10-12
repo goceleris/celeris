@@ -97,6 +97,8 @@ type Config struct {
 	//   - no-store, private or no-cache → skip caching
 	//   - max-age=0                     → skip caching
 	//   - max-age=N (N > 0)             → cap TTL to min(cfg.TTL, N seconds)
+	//   - a max-age that is not digits  → skip caching (max-age=abc, max-age=60abc)
+	//   - "private" or "no-store" anywhere in the value → skip caching, always
 	//   - not a comma-separated list    → skip caching (private; max-age=0)
 	//
 	// No-cache and max-age=0 are not stored because a stored response would
