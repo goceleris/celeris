@@ -1014,15 +1014,15 @@ func (l *Loop) notifyDetachedPeerClosed(cs *connState) {
 // for a fresh SYN edge.
 const acceptAllCap = 1024
 
-// acceptRetry reports whether an accept4 failure is a transient one to retry
-// in place: a SYN that was aborted (RST before accept, ECONNABORTED, counted
-// in AcceptCancelled as io_uring counts the same completion) or an interrupted
-// syscall (EINTR, not counted). The backlog may still hold other connections,
-// so acceptAll retries its round rather than returning: a bare return would
-// strand them until the next SYN edge.
-func (l *Loop) acceptRetry(err error) bool {
-	errno, ok := err.(unix.Errno)
-	return ok && l.errs.AcceptRetried(errno)
+// countAcceptRetry counts an accept4 failure that acceptAll retries in place:
+// an aborted SYN (ECONNABORTED, a peer that reset before accept) lands in
+// AcceptCancelled, as the same errno does when io_uring's accept completes
+// with it; an interrupted syscall (EINTR) is not counted. It is called from
+// the retry cases only, so a drained queue (EAGAIN) pays nothing.
+func (l *Loop) countAcceptRetry(err error) {
+	if errno, ok := err.(unix.Errno); ok {
+		l.errs.AcceptRetried(errno)
+	}
 }
 
 // acceptStop is why acceptAll returned. The event loop only needs listenHot;
@@ -1041,15 +1041,19 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 	for i := 0; i < acceptAllCap; i++ {
 		newFD, sa, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
-			if l.acceptRetry(err) {
-				continue
-			}
 			switch err {
 			case unix.EAGAIN:
 				// Listen queue fully drained — ET edge satisfied.
 				// (EWOULDBLOCK == EAGAIN on Linux, so one case covers both.)
 				l.listenHot = false
 				return acceptDrained
+			case unix.EINTR, unix.ECONNABORTED:
+				// Transient: a SYN was aborted (RST before accept) or the
+				// syscall was interrupted. The backlog may still hold other
+				// connections, so retry this round rather than returning —
+				// a bare return would strand them until the next SYN edge.
+				l.countAcceptRetry(err)
+				continue
 			case unix.EMFILE, unix.ENFILE:
 				// Out of file descriptors (per-process / system-wide). The
 				// SYN at the head of the queue is un-acceptable right now;

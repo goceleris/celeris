@@ -114,25 +114,19 @@ func testTailUpgrade908(t *testing.T, e *Engine) {
 	h2Streams908(t, c, br)
 }
 
-// skipIfMultishot908 skips a test of the direct-body recv on an engine whose
-// workers run a provided-buffer ring (CELERIS_IOURING_MULTISHOT_RECV=1):
-// pickRecvTarget never aims a recv at bodyBuf there, so the scenario cannot
-// reach the block under test. The skip is absence, not coverage.
-func skipIfMultishot908(t *testing.T, e *Engine) {
+// singleShot908 starts the engine with the single-shot recv, whatever the
+// environment says: the direct-body recv is aimed by pickRecvTarget only
+// when no provided-buffer ring is in use (CELERIS_IOURING_MULTISHOT_RECV=1
+// builds one), so a test of that block must not depend on the variable and
+// must not skip when it is set.
+func singleShot908(t *testing.T) {
 	t.Helper()
-	e.mu.Lock()
-	ws := e.workers
-	e.mu.Unlock()
-	for _, w := range ws {
-		if w.bufRing != nil {
-			t.Skip("provided-buffer ring in use: the direct-body recv is not taken")
-		}
-	}
+	t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", "0")
 }
 
 func TestIouringH2CUpgradeAfterDirectBodyTail908(t *testing.T) {
+	singleShot908(t)
 	e, _ := start908(t, false, true)
-	skipIfMultishot908(t, e)
 	testTailUpgrade908(t, e)
 }
 
@@ -142,6 +136,7 @@ func TestIouringH2CUpgradeAfterDirectBodyTail908(t *testing.T) {
 // non-async by construction), so the conn is still read inline-first and its
 // second recv goes into bodyBuf: the same tail as the sync test.
 func TestIouringH2CUpgradeAfterDirectBodyTailAsync908(t *testing.T) {
+	singleShot908(t)
 	e, _ := start908(t, true, true)
 	testTailUpgrade908(t, e)
 }
@@ -164,8 +159,8 @@ func TestIouringH2CUpgradeAfterDirectBodyTailMultishot908(t *testing.T) {
 // path itself, or the conn is deaf to the client's HTTP/2 preface. The client
 // then reads everything and speaks HTTP/2.
 func TestIouringH2CUpgradeAfterDirectBodyTailBehindUnreadResponse908(t *testing.T) {
+	singleShot908(t)
 	e, _ := start908(t, false, true)
-	skipIfMultishot908(t, e)
 	d := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
 		return rc.Control(func(fd uintptr) { _ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4096) })
 	}}

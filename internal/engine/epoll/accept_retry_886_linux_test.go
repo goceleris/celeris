@@ -20,21 +20,18 @@ func TestEpollAcceptRetryCountsAConnAborted886(t *testing.T) {
 	l := &Loop{errs: &errclass.Counters{}}
 	for _, tc := range []struct {
 		err       error
-		retry     bool
 		cancelled uint64 // AcceptCancelled after this call, cumulative
 	}{
-		{unix.ECONNABORTED, true, 1},
-		{unix.EINTR, true, 1},
-		{unix.ECONNABORTED, true, 2},
-		{unix.EAGAIN, false, 2},
-		{unix.EMFILE, false, 2},
-		{errors.New("not an errno"), false, 2},
+		{unix.ECONNABORTED, 1},
+		{unix.EINTR, 1},
+		{unix.ECONNABORTED, 2},
+		{unix.EAGAIN, 2},
+		{unix.EMFILE, 2},
+		{errors.New("not an errno"), 2},
 	} {
-		if got := l.acceptRetry(tc.err); got != tc.retry {
-			t.Errorf("acceptRetry(%v) = %v, want %v", tc.err, got, tc.retry)
-		}
+		l.countAcceptRetry(tc.err)
 		if got := l.errs.Snapshot().AcceptCancelled; got != tc.cancelled {
-			t.Errorf("after acceptRetry(%v): AcceptCancelled = %d, want %d", tc.err, got, tc.cancelled)
+			t.Errorf("after countAcceptRetry(%v): AcceptCancelled = %d, want %d", tc.err, got, tc.cancelled)
 		}
 	}
 	if total := l.errs.Snapshot().Total(); total != 2 {
