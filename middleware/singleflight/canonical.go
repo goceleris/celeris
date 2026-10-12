@@ -54,7 +54,10 @@ func canonicalValue(name, v string) string {
 }
 
 // sameCanonical reports whether v is, canonically, the value stored (a
-// canonicalValue), without allocating.
+// canonicalValue). It builds the canonical form of v in a stack buffer, so it
+// allocates only for a value whose form is longer than 64 bytes, or that holds
+// an upper-case coding name (the negotiator lower-cases it into a new string)
+// or more than eight list entries.
 func sameCanonical(name, stored, v string) bool {
 	var buf [64]byte
 	return string(canonicalAppend(buf[:0], name, v)) == stored
