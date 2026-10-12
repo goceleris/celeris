@@ -42,49 +42,66 @@ func TestHeaderBudgetSpansDetection(t *testing.T) {
 		{"line-every-50ms-after-240ms", 240 * time.Millisecond, 50 * time.Millisecond, "X-Slow: a\r\n"},
 		{"byte-every-20ms-after-270ms", 270 * time.Millisecond, 20 * time.Millisecond, "X"},
 	}
+	// Protocol Auto, and H2C with the upgrade, which runs the same detection.
+	h2c := true
+	protos := []struct {
+		name string
+		set  func(*celeris.Config)
+	}{
+		{"auto", nil},
+		{"h2c-upgrade", func(c *celeris.Config) { c.Protocol = celeris.H2C; c.EnableH2Upgrade = &h2c }},
+	}
 	// 300 ms of budget; a close within 150 ms of it is the budget counted
 	// from accept, and one at 540 ms or later is a budget that restarted at
 	// detection.
 	const bound = readHeaderTimeout974 + 150*time.Millisecond
 	for _, e := range budgetEngines {
-		for _, sc := range scenarios {
-			t.Run(e.name+"/"+sc.name, func(t *testing.T) {
-				e.env974(t)
-				addr := startAuto974(t, e.eng, func(c *celeris.Config) {
-					c.AsyncHandlers = e.async
-					c.ReadHeaderTimeout = readHeaderTimeout974
-					c.ReadTimeout = 5 * time.Minute
-					c.IdleTimeout = 5 * time.Minute
-				})
-				c, err := net.DialTimeout("tcp", addr, 5*time.Second)
-				if err != nil {
-					t.Fatal(err)
+		for _, p := range protos {
+			for _, sc := range scenarios {
+				if p.set != nil && e.eng == celeris.Std {
+					continue // std has no pre-detection state (net/http reads the request line)
 				}
-				defer func() { _ = c.Close() }()
-				start := time.Now()
-				res := watchClose974(c, closeWithin974)
-				_, _ = io.WriteString(c, "GET")
-				time.Sleep(sc.stall)
-				_, _ = io.WriteString(c, " / HTTP/1.1\r\nHost: x\r\n")
-				tick := time.NewTicker(sc.every)
-				defer tick.Stop()
-				for !res.finished() {
-					<-tick.C
-					if _, err := io.WriteString(c, sc.chunk); err != nil {
-						break
+				t.Run(e.name+"/"+p.name+"/"+sc.name, func(t *testing.T) {
+					e.env974(t)
+					addr := startAuto974(t, e.eng, func(c *celeris.Config) {
+						c.AsyncHandlers = e.async
+						c.ReadHeaderTimeout = readHeaderTimeout974
+						c.ReadTimeout = 5 * time.Minute
+						c.IdleTimeout = 5 * time.Minute
+						if p.set != nil {
+							p.set(c)
+						}
+					})
+					c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+					if err != nil {
+						t.Fatal(err)
 					}
-				}
-				r := res.wait()
-				took := r.at.Sub(start)
-				t.Logf("BUDGET %s: closed=%v (%v) after %v (ReadHeaderTimeout %v, bound %v)", t.Name(), r.closed, r.err, took.Round(10*time.Millisecond), readHeaderTimeout974, bound)
-				if !r.closed {
-					t.Fatalf("the conn was not closed within %v: read ended with %v", closeWithin974, r.err)
-				}
-				if took > bound {
-					t.Errorf("the conn was held %v with ReadHeaderTimeout %v (bound %v): the header budget restarted at protocol detection",
-						took.Round(10*time.Millisecond), readHeaderTimeout974, bound)
-				}
-			})
+					defer func() { _ = c.Close() }()
+					start := time.Now()
+					res := watchClose974(c, closeWithin974)
+					_, _ = io.WriteString(c, "GET")
+					time.Sleep(sc.stall)
+					_, _ = io.WriteString(c, " / HTTP/1.1\r\nHost: x\r\n")
+					tick := time.NewTicker(sc.every)
+					defer tick.Stop()
+					for !res.finished() {
+						<-tick.C
+						if _, err := io.WriteString(c, sc.chunk); err != nil {
+							break
+						}
+					}
+					r := res.wait()
+					took := r.at.Sub(start)
+					t.Logf("BUDGET %s: closed=%v (%v) after %v (ReadHeaderTimeout %v, bound %v)", t.Name(), r.closed, r.err, took.Round(10*time.Millisecond), readHeaderTimeout974, bound)
+					if !r.closed {
+						t.Fatalf("the conn was not closed within %v: read ended with %v", closeWithin974, r.err)
+					}
+					if took > bound {
+						t.Errorf("the conn was held %v with ReadHeaderTimeout %v (bound %v): the header budget restarted at protocol detection",
+							took.Round(10*time.Millisecond), readHeaderTimeout974, bound)
+					}
+				})
+			}
 		}
 	}
 }
@@ -111,15 +128,23 @@ func TestRequestCompletedAfterTheBudgetIsNotServed(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = c.Close() }()
+			// The deadline counts from the server's accept and the sleep from
+			// the client's dial: the margin is what a late accept may eat.
+			// The io_uring sweep is 800 ms apart, so a conn it happens to
+			// reach before this request is closed by it instead, and the
+			// test then passes without the clamp having been tried: that is
+			// why the three io_uring arms are run, and it is the margin of
+			// the control, not of the fix.
+			const late = 150 * time.Millisecond
 			_, _ = io.WriteString(c, "GE")
-			time.Sleep(readHeaderTimeout974 + 50*time.Millisecond)
+			time.Sleep(readHeaderTimeout974 + late)
 			_, _ = io.WriteString(c, "T /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 			_ = c.SetReadDeadline(time.Now().Add(closeWithin974))
 			b, _ := io.ReadAll(c)
 			t.Logf("%s: read back %q", t.Name(), b)
 			if strings.HasPrefix(string(b), "HTTP/1.1 200") {
 				t.Errorf("a request completed %v after accept, at ReadHeaderTimeout %v, was answered: %q",
-					readHeaderTimeout974+50*time.Millisecond, readHeaderTimeout974, b)
+					readHeaderTimeout974+late, readHeaderTimeout974, b)
 			}
 		})
 	}
@@ -175,8 +200,12 @@ func TestSpentBudgetReturnsItsRingBuffer(t *testing.T) {
 		<-done
 	}
 	t.Logf("%d of %d conns completed their request after the budget: %d answered, %d closed unanswered", answered.Load()+closed.Load(), lateConn, answered.Load(), closed.Load())
-	if answered.Load() != 0 {
-		t.Errorf("%d requests completed after ReadHeaderTimeout were answered", answered.Load())
+	// Each conn's deadline counts from the server's accept and its sleep from
+	// the client's dial, with 3072 dials 256 at a time, so a conn the server
+	// accepted late can legitimately be answered. Most must not be: this is
+	// a loose bound, and the buffer return is pinned by the GET below.
+	if answered.Load()*10 > lateConn {
+		t.Errorf("%d of %d requests completed after ReadHeaderTimeout were answered", answered.Load(), lateConn)
 	}
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
