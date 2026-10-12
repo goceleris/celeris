@@ -78,8 +78,12 @@ func (c *Call[T]) publish() {
 }
 
 // wait waits for the call to be published, or for ctx to end, whichever comes
-// first, and returns ctx's error in the second case. A published call is
-// taken whatever ctx says. A ctx without a Done channel waits for the leader.
+// first, and returns ctx's error in the second case. A call that is already
+// published when wait looks is taken whatever ctx says. When the publish and
+// the end of ctx both happen before the select runs, either may win (the
+// select picks at random): a follower whose context has ended can get ctx's
+// error for a call that was published. A ctx without a Done channel waits
+// for the leader.
 func (c *Call[T]) wait(ctx context.Context) error {
 	s := c.done.Load()
 	if s == closedSignal {

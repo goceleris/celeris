@@ -11,18 +11,21 @@
 // (If-None-Match, If-Modified-Since, If-Match and If-Unmodified-Since), so
 // requests from different authenticated users are never coalesced, neither
 // are requests that accept different encodings (values the negotiator reads
-// alike, such as "gzip, br" and "gzip,br" or "GZIP" and "gzip", are the same),
-// and neither are conditional requests with different validators: a 304 or a
-// 412 answers its own validator. Identical revalidations, such as a CDN's, do coalesce. A request with a Range header
-// is never coalesced: its response answers that Range. With a custom
-// [Config.KeyFunc], which may not include the validators, a conditional
-// request is not coalesced either. Whatever the key, a waiter whose request
-// differs from the leader's in a header that the leader's response names in
-// Vary (or a response with Vary: *) runs its own handler instead of taking
-// the leader's response. Use [Config.KeyFunc] to change the key, and
-// [Config.Skip] or [Config.SkipPaths] to exclude requests (for example
-// non-idempotent methods or large-response endpoints). Waiter responses carry
-// an "x-singleflight: HIT" header.
+// alike, such as "gzip, br" and "gzip,br" or "GZIP" and "gzip", are the same;
+// a value longer than 256 bytes is compared as sent), and neither are
+// conditional requests with different validators: a 304 or a 412 answers its
+// own validator. Identical revalidations (GET or HEAD), such as a CDN's, do
+// coalesce. A conditional write (a PUT, POST, PATCH or DELETE with a
+// precondition such as If-Match) never does: its handler is the update. A
+// request with a Range header is never coalesced: its response answers that
+// Range. With a custom [Config.KeyFunc], which may not include the
+// validators, a conditional request is not coalesced either. Whatever the
+// key, a waiter whose request differs from the leader's in a header that the
+// leader's response names in Vary (or a response with Vary: *) runs its own
+// handler instead of taking the leader's response. Use [Config.KeyFunc] to
+// change the key, and [Config.Skip] or [Config.SkipPaths] to exclude requests
+// (for example non-idempotent methods or large-response endpoints). Waiter
+// responses carry an "x-singleflight: HIT" header.
 //
 // When the leader's handler returns an error or panics, every waiter returns
 // that error or panics with that value, as a copy made before the leader

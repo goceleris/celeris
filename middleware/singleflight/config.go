@@ -23,8 +23,12 @@ type Config struct {
 	// Default: method + "\x00" + path + "\x00q=" + sorted-query-string,
 	// then the Authorization, Cookie and Accept-Encoding headers and the
 	// four preconditions (If-None-Match, If-Modified-Since, If-Match and
-	// If-Unmodified-Since). The query and each header are labelled so that
-	// one can never read as another (a header value cannot hold a NUL).
+	// If-Unmodified-Since). The query and each header are labelled, so one
+	// does not read as another as long as no value holds a NUL byte. HTTP/1
+	// header values cannot, but the native engines do not check the request
+	// target (HTTP/1) or field values and :path (HTTP/2) for control bytes,
+	// so a path with a NUL can read as labelled components of another
+	// request's key, as it does in the key of earlier releases.
 	// The Authorization and Cookie components ensure that requests from
 	// different authenticated users produce different keys, preventing
 	// cross-user data leakage. Unauthenticated requests (no auth/cookie
@@ -33,10 +37,16 @@ type Config struct {
 	// singleflight. Two values are one component when the negotiator reads
 	// them alike (as c.AcceptsEncodings does: "gzip, deflate" and
 	// "gzip,deflate", "GZIP" and "gzip"), and the order is kept; "gzip;q=0"
-	// and "gzip;Q=0", which it tells apart, are two. The preconditions keep
+	// and "gzip;Q=0", which it tells apart, are two. A value longer than 256
+	// bytes is held as sent, not read, so two spellings of one long list are
+	// two components (only a missed coalescing). The preconditions keep
 	// requests with different validators apart, because the response answers
 	// its own validator (a 304 or a 412), and let identical revalidations (a
-	// CDN or browsers sending the same If-None-Match) coalesce.
+	// CDN or browsers sending the same If-None-Match) coalesce. That holds
+	// for GET and HEAD only: a request of another method that carries a
+	// precondition (a PUT with If-Match) is never coalesced, because its
+	// handler is the update, and a request that took another's response
+	// would lose it.
 	//
 	// If you provide a custom KeyFunc, ensure it incorporates user
 	// identity for any endpoint that returns user-specific data. A request
@@ -110,9 +120,9 @@ func defaultKeyFunc(c *celeris.Context) string {
 		}
 		q = sorted.Encode()
 	}
-	// Each header component is labelled, so one header's value can never
-	// read as another's (a header value cannot hold a NUL). The key is
-	// built in one allocation.
+	// Each header component is labelled, so one header's value does not
+	// read as another's (unless a value holds a NUL: see Config.KeyFunc).
+	// The key is built in one allocation.
 	n := len(m) + 1 + len(p)
 	if q != "" {
 		n += 3 + len(q)

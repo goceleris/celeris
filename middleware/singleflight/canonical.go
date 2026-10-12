@@ -27,7 +27,7 @@ const maxCanonicalAE = 256
 // internal/negotiate.ParseInto makes of it (what c.AcceptsEncodings, and so
 // compress, uses), written as the lowercase coding and, unless it is 1, its
 // weight, entries separated by ",", in order. So two values have one form
-// exactly when every negotiation gives them one answer: "gzip, deflate, br"
+// exactly when the negotiator gives them one answer: "gzip, deflate, br"
 // and "gzip,deflate,br", "GZIP" and "gzip", "gzip;q=0.8" and "gzip; q=0.8",
 // and "gzip;q=0.80" are one value, while "gzip;q=0" and "gzip;Q=0" (which the
 // negotiator reads as q=1: it matches "q=" in lower case only), "gzip;q = 0"
