@@ -226,3 +226,25 @@ func BenchmarkFrontEndServeHTTP889(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkIsH2CUpgrade889 is the one per-request addition #889 makes where
+// the upgrade is on (HTTP1 with &true), alone: the upgrade test on the headers
+// of an ordinary request, with none and with the usual few.
+func BenchmarkIsH2CUpgrade889(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		h    http.Header
+	}{
+		{"NoHeaders", http.Header{}},
+		{"Usual", http.Header{"Accept": {"*/*"}, "User-Agent": {"x"}, "Host": {"h"}, "Connection": {"keep-alive"}, "Accept-Encoding": {"gzip"}}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if isH2CUpgrade(tc.h) {
+					b.Fatal("not an upgrade")
+				}
+			}
+		})
+	}
+}
