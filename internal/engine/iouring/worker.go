@@ -1100,6 +1100,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 			MaxFrameSize:         cfg.MaxFrameSize,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 			WriteTimeout:         cfg.WriteTimeout,
+			Logger:               cfg.Logger,
 		},
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  true,

@@ -468,7 +468,10 @@ func (m *Manager) StreamCount() int {
 	return len(m.streams)
 }
 
-// GetLastStreamID returns the highest stream ID.
+// GetLastStreamID returns the highest identifier of a stream the server has
+// opened, which is what a GOAWAY names as the last stream processed (RFC 9113
+// section 6.8). An idle PRIORITY placeholder (CreatePlaceholder) is no stream
+// the server opened and does not move it.
 func (m *Manager) GetLastStreamID() uint32 {
 	m.mu.RLock()
 	id := m.maxStreamID

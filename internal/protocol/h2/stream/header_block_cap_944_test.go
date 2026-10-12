@@ -3,6 +3,9 @@ package stream
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -357,5 +360,174 @@ func TestNextBlockEmitsAfterAnAbandonedOverBoundBlock944(t *testing.T) {
 	}
 	if len(second) != 4 {
 		t.Errorf("the next block decoded to %d fields, want 4 (emit left off by the abandoned block)", len(second))
+	}
+}
+
+// celeris#889 item 18: a connection error names the last stream the server
+// opened, not 0. RFC 9113 section 6.8 reads 0 as "no stream was processed":
+// the client may retry every request it has in flight, a POST with a
+// replayable body among them, and a handler can run twice. A value that is
+// too high is safe, one that is too low is not. Fourteen sites of the
+// processor sent 0 whatever the connection had served.
+
+// frame889 is a frame as the x/net parsers cannot hand it to the processor
+// (they reject it themselves: DATA on stream 0, PING on a stream, a zero
+// WINDOW_UPDATE increment), built by hand. Only the header is set: the
+// sites under test return before they read anything else of the frame.
+func frame889(typ http2.FrameType, id, length uint32) http2.FrameHeader {
+	return http2.FrameHeader{Type: typ, StreamID: id, Length: length}
+}
+
+// split889 sends the first half of a request's header block on stream id as
+// HEADERS without END_HEADERS: the processor now expects CONTINUATION.
+func split889(t *testing.T, p *proc944, id uint32) {
+	t.Helper()
+	block := newEnc981().req()
+	if err := processFrames981(t, p.Processor, func(w *http2.Framer) {
+		if err := w.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:len(block)/2], EndHeaders: false}); err != nil {
+			t.Fatal(err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !p.IsExpectingContinuation() {
+		t.Fatal("self-check: the processor does not expect CONTINUATION")
+	}
+}
+
+// TestConnectionErrorsNameTheLastStream889 serves stream 1, then triggers
+// each connection error that used to send last-stream-id 0, and expects the
+// GOAWAY to name stream 1. Every row says which site fired by a piece of the
+// error the site returns (several sites share an error code), and runs on a
+// processor of its own.
+func TestConnectionErrorsNameTheLastStream889(t *testing.T) {
+	ctx := context.Background()
+	rows := []struct {
+		name    string
+		site    string // part of the error text only this site returns
+		code    http2.ErrCode
+		trigger func(t *testing.T, p *proc944) error
+	}{
+		{"ProcessFrame/non-CONTINUATION during a header block", "received non-CONTINUATION frame", http2.ErrCodeProtocol,
+			func(t *testing.T, p *proc944) error {
+				split889(t, p, 3)
+				return p.ProcessFrame(ctx, &http2.DataFrame{FrameHeader: frame889(http2.FrameData, 3, 1)})
+			}},
+		{"ProcessFrame/DATA frame too large", "DATA frame exceeds MAX_FRAME_SIZE", http2.ErrCodeFrameSize,
+			func(_ *testing.T, p *proc944) error {
+				return p.ProcessFrame(ctx, &http2.DataFrame{FrameHeader: frame889(http2.FrameData, 0, 1<<20+1)})
+			}},
+		{"ProcessFrame/HEADERS frame too large", "HEADERS frame exceeds MAX_FRAME_SIZE", http2.ErrCodeFrameSize,
+			func(_ *testing.T, p *proc944) error {
+				return p.ProcessFrame(ctx, &http2.HeadersFrame{FrameHeader: frame889(http2.FrameHeaders, 3, 1<<20+1)})
+			}},
+		{"ProcessFrame/PUSH_PROMISE", "client sent PUSH_PROMISE", http2.ErrCodeProtocol,
+			func(_ *testing.T, p *proc944) error {
+				return p.ProcessFrame(ctx, &http2.PushPromiseFrame{FrameHeader: frame889(http2.FramePushPromise, 1, 4)})
+			}},
+		{"handleData/DATA on an idle stream", "DATA frame on idle stream", http2.ErrCodeProtocol,
+			func(_ *testing.T, p *proc944) error {
+				return p.ProcessFrame(ctx, &http2.DataFrame{FrameHeader: frame889(http2.FrameData, 5, 1)})
+			}},
+		{"handleWindowUpdate/zero increment on the connection", "WINDOW_UPDATE with 0 increment", http2.ErrCodeProtocol,
+			func(_ *testing.T, p *proc944) error {
+				return p.ProcessFrame(ctx, &http2.WindowUpdateFrame{FrameHeader: frame889(http2.FrameWindowUpdate, 0, 4), Increment: 0})
+			}},
+		{"handleWindowUpdate/connection window overflow", "connection window overflow", http2.ErrCodeFlowControl,
+			func(_ *testing.T, p *proc944) error {
+				return p.ProcessFrame(ctx, &http2.WindowUpdateFrame{FrameHeader: frame889(http2.FrameWindowUpdate, 0, 4), Increment: 1<<31 - 1})
+			}},
+		{"handlePing/PING on a stream", "PING frame with non-zero stream id", http2.ErrCodeProtocol,
+			func(_ *testing.T, p *proc944) error {
+				return p.ProcessFrame(ctx, &http2.PingFrame{FrameHeader: frame889(http2.FramePing, 3, 8)})
+			}},
+		{"appendContinuation/unexpected CONTINUATION", "unexpected CONTINUATION frame", http2.ErrCodeProtocol,
+			func(_ *testing.T, p *proc944) error {
+				return p.ProcessFrame(ctx, &http2.ContinuationFrame{FrameHeader: frame889(http2.FrameContinuation, 3, 0)})
+			}},
+		// ProcessFrame answers a CONTINUATION on another stream than the open
+		// block's first (it names GetLastStreamID already), so this site is
+		// reached only by calling appendContinuation: a defensive check.
+		{"appendContinuation/CONTINUATION on the wrong stream", "CONTINUATION frame on wrong stream", http2.ErrCodeProtocol,
+			func(t *testing.T, p *proc944) error {
+				split889(t, p, 3)
+				_, err := p.appendContinuation(&http2.ContinuationFrame{FrameHeader: frame889(http2.FrameContinuation, 5, 0)})
+				return err
+			}},
+		{"HandleRawWindowUpdate/wrong size", "WINDOW_UPDATE frame size", http2.ErrCodeFrameSize,
+			func(_ *testing.T, p *proc944) error { return p.HandleRawWindowUpdate(0, []byte{0, 0, 1}) }},
+		{"HandleRawWindowUpdate/zero increment on the connection", "WINDOW_UPDATE with 0 increment", http2.ErrCodeProtocol,
+			func(_ *testing.T, p *proc944) error { return p.HandleRawWindowUpdate(0, []byte{0, 0, 0, 0}) }},
+		{"HandleRawWindowUpdate/connection window overflow", "connection window overflow", http2.ErrCodeFlowControl,
+			func(_ *testing.T, p *proc944) error {
+				return p.HandleRawWindowUpdate(0, []byte{0x7f, 0xff, 0xff, 0xff})
+			}},
+		{"HandleRawPing/wrong size", "PING frame size", http2.ErrCodeFrameSize,
+			func(_ *testing.T, p *proc944) error { return p.HandleRawPing(0, []byte{1, 2, 3}) }},
+	}
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newProc944()
+			if err := feed944(t, p, "raw", 1, true, encodeHeaders(t, reqHeaders944())); err != nil || p.runs.Load() != 1 {
+				t.Fatalf("stream 1: %v, handler runs %d", err, p.runs.Load())
+			}
+			if got := p.manager.GetLastStreamID(); got != 1 {
+				t.Fatalf("self-check: the last stream the server opened is %d, want 1", got)
+			}
+			if g, _ := sinks889(p.Processor); len(g) != 0 {
+				t.Fatalf("self-check: GOAWAYs %+v before the trigger", g)
+			}
+			err := tc.trigger(t, p)
+			if err == nil || !strings.Contains(err.Error(), tc.site) {
+				t.Fatalf("error = %v, want one containing %q (the site under test did not fire)", err, tc.site)
+			}
+			g, _ := sinks889(p.Processor)
+			if len(g) != 1 {
+				t.Fatalf("GOAWAYs %+v, want exactly one", g)
+			}
+			if g[0].code != tc.code {
+				t.Errorf("GOAWAY code %v, want %v", g[0].code, tc.code)
+			}
+			if g[0].lastStreamID != 1 {
+				t.Errorf("GOAWAY names last stream %d, want 1: stream 1 was served, and 0 tells the client no stream was processed (RFC 9113 section 6.8)", g[0].lastStreamID)
+			}
+		})
+	}
+}
+
+// goAwayZero889 matches a GOAWAY sent with the literal last-stream-id 0, in
+// any of the forms the processor and the connection layer call it, over line
+// breaks too.
+var goAwayZero889 = regexp.MustCompile(`(?:GoAwayErr|SendGoAway|WriteGoAway)\(\s*0\s*,`)
+
+// TestNoConnectionErrorNamesStreamZero889 is the source pin for the rows
+// above: no non-test file of the package, and no file of the connection
+// layer, sends a GOAWAY that names stream 0. The graceful GOAWAY of
+// H2State.GoAway names the last client stream and is no such call.
+func TestNoConnectionErrorNamesStreamZero889(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := filepath.Glob(filepath.Join("..", "..", "..", "conn", "*.go"))
+	if err != nil || len(conn) == 0 {
+		t.Fatalf("the connection layer's sources were not found: %v", err)
+	}
+	var checked int
+	for _, f := range append(files, conn...) {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checked++
+		for _, loc := range goAwayZero889.FindAllIndex(src, -1) {
+			t.Errorf("%s:%d sends a GOAWAY naming last stream 0: name p.manager.GetLastStreamID()", f, 1+bytes.Count(src[:loc[0]], []byte("\n")))
+		}
+	}
+	if checked < 10 {
+		t.Fatalf("only %d source files were read: the pin looked in the wrong place", checked)
 	}
 }
