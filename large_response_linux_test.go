@@ -504,7 +504,7 @@ func startServer761(t *testing.T, eng celeris.EngineType, asyncServer bool, rout
 
 // startServerConfig761 is startServer761 with a whole Config (its Addr is
 // chosen here).
-func startServerConfig761(t *testing.T, cfg celeris.Config, routes func(*celeris.Server)) string {
+func startServerConfig761(t testing.TB, cfg celeris.Config, routes func(*celeris.Server)) string {
 	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {

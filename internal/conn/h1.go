@@ -82,6 +82,37 @@ func (s *H1State) ArmHeaderDeadline() {
 	}
 }
 
+// ArmHeaderDeadlineAt is ArmHeaderDeadline for a conn whose first request
+// has already spent part of its header budget: the deadline is armed at the
+// earlier of now + ReadHeaderTimeoutNs and notAfter (absolute, Unix
+// nanoseconds; 0 for no limit, which is ArmHeaderDeadline). The engines call
+// it from initProtocol with the deadline they gave the conn at accept, so
+// that deciding the protocol does not start the budget again: ReadHeaderTimeout
+// then bounds the first request as a whole, from the engine's accept
+// (celeris#974 review). Where the listener defers accept to the first byte
+// (TCP_DEFER_ACCEPT), that is the first byte, not the handshake. Like ArmHeaderDeadline it is a no-op when the deadline
+// is already armed or ReadHeaderTimeoutNs is 0, and it calls
+// OnHeaderDeadlineArmed on arming. A notAfter that has already passed arms a
+// deadline that has passed, and OnHeaderDeadlineArmed may then close the conn
+// (io_uring's armHeaderTimerAt does): a caller that can tell beforehand closes
+// the conn itself rather than arm.
+func (s *H1State) ArmHeaderDeadlineAt(notAfter int64) {
+	if s.ReadHeaderTimeoutNs == 0 {
+		return
+	}
+	if s.HeaderDeadlineNs.Load() != 0 {
+		return
+	}
+	dl := timeNow().UnixNano() + s.ReadHeaderTimeoutNs
+	if notAfter > 0 && notAfter < dl {
+		dl = notAfter
+	}
+	s.HeaderDeadlineNs.Store(dl)
+	if s.OnHeaderDeadlineArmed != nil {
+		s.OnHeaderDeadlineArmed()
+	}
+}
+
 // errConnectionClose is returned when the client requests Connection: close.
 // Pre-allocated to avoid per-request fmt.Errorf allocation.
 var errConnectionClose = errors.New("connection close requested")

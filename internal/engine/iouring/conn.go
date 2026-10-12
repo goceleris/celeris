@@ -181,7 +181,10 @@ type connState struct {
 	// must be detected: accept time + ReadHeaderTimeout, 0 for none (the
 	// protocol is fixed at accept, or ReadHeaderTimeout is off). Not extended
 	// by a recv, so a client that dribbles the preface cannot move it.
-	// checkTimeouts closes an undetected conn past it (celeris#974).
+	// checkTimeouts closes an undetected conn past it (celeris#974), and
+	// initProtocol arms the H1 header deadline at no later than it, so
+	// detection does not start the budget again. handleRecv closes a conn
+	// whose deciding recv comes after it, and clears it once initProtocol ran.
 	detectDeadline int64 // 8
 	// bodyRecvPin retains the H1State.bodyBuf backing array while a
 	// single-shot recv has been armed directly into it (pickRecvTarget's

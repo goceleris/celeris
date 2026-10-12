@@ -1148,6 +1148,16 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 			cs.protocol = l.cfg.Protocol
 			cs.detected = true
 			l.initProtocol(cs)
+		} else if l.cfg.ReadHeaderTimeout > 0 {
+			// The protocol is decided by the first bytes, so there is no H1
+			// state and no header deadline yet (initProtocol arms it at
+			// detection). The conn gets the same absolute budget from accept:
+			// a client that stays silent, sends "GE" and stalls, or dribbles
+			// the HTTP/2 preface is reaped by checkTimeouts instead of living
+			// on the activity stamp each of its bytes refreshes, until
+			// ReadTimeout or IdleTimeout. io_uring does the same
+			// (celeris#974).
+			cs.detectDeadline = now + int64(l.cfg.ReadHeaderTimeout)
 		}
 	}
 	// Cap hit without reaching EAGAIN: more SYNs may be queued. With ET we
@@ -1473,7 +1483,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 			cs.detectN = 0
 			cs.protocol = proto
 			cs.detected = true
+			// initProtocol arms the H1 header deadline at what is left of the
+			// accept-time budget (detectDeadline). A deciding read that comes
+			// after the budget finds the sweep, at most one timerfd period
+			// (25 ms) behind, about to close the conn.
 			l.initProtocol(cs)
+			cs.detectDeadline = 0
 		}
 
 		// Async handler dispatch — goroutine-per-conn with an input buffer.
@@ -2120,8 +2135,14 @@ func (l *Loop) initProtocol(cs *connState) {
 		// ProcessH1 clears on successful parse and rearms on return-nil
 		// (waiting for next request); checkTimeouts closes any conn
 		// that exceeds the deadline.
+		//
+		// A conn that had to be detected carries the deadline it was given at
+		// accept (detectDeadline): the first request's budget counts from
+		// accept, so the H1 deadline is armed at what is left of it and
+		// detection does not start it again. 0 for a conn whose protocol was
+		// fixed at accept, or adopted, which arms the full budget.
 		cs.h1State.ReadHeaderTimeoutNs = int64(l.cfg.ReadHeaderTimeout)
-		cs.h1State.ArmHeaderDeadline()
+		cs.h1State.ArmHeaderDeadlineAt(cs.detectDeadline)
 		// Per-handler async (celeris #300): wire the route resolver so
 		// ProcessH1, when run inline on the event loop (InlineMode), can
 		// detect an async route and bail to the dispatch goroutine. Only
@@ -3713,6 +3734,21 @@ func (l *Loop) checkTimeouts() {
 			continue
 		}
 		fd := cs.fd
+		// ReadHeaderTimeout for a conn whose protocol is not detected yet: it
+		// has no H1 state, so the header deadline below has nothing to read,
+		// and detectDeadline (accept + ReadHeaderTimeout) stands in for it.
+		// Such a conn is never detached, so this needs neither detachMu nor
+		// the snapshot.
+		// detected is tested first: it shares the cache line of fd and dirty,
+		// which this loop reads anyway, and the sweep of a loop full of
+		// established conns then never loads detectDeadline (RULE 74,
+		// BenchmarkCheckTimeouts865).
+		if !cs.detected {
+			if dl := cs.detectDeadline; dl > 0 && now > dl {
+				l.closeConn(fd)
+				continue
+			}
+		}
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
 		// supplied by the middleware via SetWSIdleDeadline. Skip the
 		// engine-config-driven idle/read/write timeouts since the middleware

@@ -938,3 +938,92 @@ func TestParseRequest_ControlBytesRejected(t *testing.T) {
 		}
 	})
 }
+
+// TestParseRequest_LeadingCRLF: RFC 9112 section 2.2, a server SHOULD ignore at
+// least one empty line received before the request line. One is skipped and
+// counted in what the parse consumed; a second is an empty request line, which
+// is invalid. A request that is not complete yet is reported as such.
+func TestParseRequest_LeadingCRLF(t *testing.T) {
+	const req = "GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	cases := []struct {
+		name string
+		in   string
+		want error
+		n    int // consumed, when complete
+		done bool
+	}{
+		{"one-crlf", "\r\n" + req, nil, 2 + len(req), true},
+		{"one-crlf-then-pipelined", "\r\n" + req + req, nil, 2 + len(req), true},
+		{"two-crlf", "\r\n\r\n" + req, ErrInvalidRequestLine, 0, false},
+		{"crlf-only", "\r\n", nil, 0, false},
+		{"crlf-and-partial-line", "\r\nGET /pa", nil, 0, false},
+		{"lone-cr", "\r", nil, 0, false},
+		{"no-crlf", req, nil, len(req), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewParser()
+			p.Reset([]byte(tc.in))
+			var r Request
+			n, err := p.ParseRequest(&r)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if tc.want != nil {
+				return
+			}
+			if tc.done {
+				if n != tc.n || r.Method != "GET" || r.Path != "/path" || r.Host != "example.com" || !r.HeadersComplete {
+					t.Fatalf("consumed %d (want %d), method %q, path %q, host %q, complete %v", n, tc.n, r.Method, r.Path, r.Host, r.HeadersComplete)
+				}
+			} else if n != 0 {
+				t.Fatalf("an incomplete request consumed %d bytes", n)
+			}
+		})
+	}
+}
+
+// TestParseRequest_LeadingCRLFRetry: a caller that sees an incomplete request
+// resets the parser and parses again once more bytes have arrived, with the
+// CRLF still at the head of the buffer.
+func TestParseRequest_LeadingCRLFRetry(t *testing.T) {
+	const full = "\r\nGET /path HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	for cut := 1; cut < len(full); cut++ {
+		p := NewParser()
+		var r Request
+		p.Reset([]byte(full[:cut]))
+		if n, err := p.ParseRequest(&r); err != nil || n != 0 {
+			t.Fatalf("cut %d: n=%d err=%v, want an incomplete request", cut, n, err)
+		}
+		p.Reset([]byte(full))
+		r = Request{}
+		if n, err := p.ParseRequest(&r); err != nil || n != len(full) || r.Path != "/path" {
+			t.Fatalf("cut %d: after the rest, n=%d err=%v path=%q", cut, n, err, r.Path)
+		}
+	}
+}
+
+// TestParseRequest_EmptyLineBetweenPipelinedRequests: the empty line is skipped
+// wherever a request line starts, not only at the head of the buffer: a second
+// ParseRequest on the same buffer (the parser keeps its position) meets it
+// after the first request.
+func TestParseRequest_EmptyLineBetweenPipelinedRequests(t *testing.T) {
+	const a = "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nab"
+	const b = "GET /b HTTP/1.1\r\nHost: h\r\n\r\n"
+	buf := []byte(a + "\r\n" + b)
+	p := NewParser()
+	p.Reset(buf)
+	var r Request
+	n, err := p.ParseRequest(&r)
+	if err != nil || r.Path != "/a" {
+		t.Fatalf("first request: n=%d err=%v path=%q", n, err, r.Path)
+	}
+	if body := p.GetBody(r.ContentLength); string(body) != "ab" {
+		t.Fatalf("body = %q", body)
+	}
+	r = Request{}
+	n2, err := p.ParseRequest(&r)
+	if err != nil || r.Path != "/b" || n2 != len(buf) {
+		t.Fatalf("second request after an empty line: n=%d (want %d) err=%v path=%q", n2, len(buf), err, r.Path)
+	}
+}
