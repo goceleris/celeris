@@ -70,7 +70,8 @@ import (
 // connection used to be exempt from. Detection and the 500 on a failed
 // upgrade are unchanged. The body of an upgrade request is read as before,
 // into memory before the connection is taken over, but no further than
-// MaxRequestBodySize (celeris#976).
+// MaxRequestBodySize (celeris#976), and a declared Content-Length over it is
+// refused before any of the body is read.
 type h2cHandler struct {
 	next http.Handler
 	h2s  *http2.Server //nolint:staticcheck // SA1019: the type ServeConn is a method of; see the import comment in engine.go.
@@ -171,7 +172,8 @@ var errH2CUpgradeBodyTooLarge = errors.New("h2c: upgrade request body over MaxRe
 // h2cUpgrade answers an HTTP/1.1 upgrade request with 101 and hijacks the
 // connection (RFC 7540 3.2); settings is the decoded HTTP2-Settings header.
 // maxBody is the largest request body it buffers (0 = no limit): a larger one
-// is errH2CUpgradeBodyTooLarge, with the connection not taken over (celeris#976).
+// is errH2CUpgradeBodyTooLarge, with the connection not taken over (celeris#976),
+// and a declared Content-Length over it is that error before a byte is read.
 func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Conn, settings []byte, err error) {
 	settings, err = h2cSettings(r.Header)
 	if err != nil {
