@@ -1002,3 +1002,28 @@ func TestParseRequest_LeadingCRLFRetry(t *testing.T) {
 		}
 	}
 }
+
+// TestParseRequest_EmptyLineBetweenPipelinedRequests: the empty line is skipped
+// wherever a request line starts, not only at the head of the buffer: a second
+// ParseRequest on the same buffer (the parser keeps its position) meets it
+// after the first request.
+func TestParseRequest_EmptyLineBetweenPipelinedRequests(t *testing.T) {
+	const a = "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nab"
+	const b = "GET /b HTTP/1.1\r\nHost: h\r\n\r\n"
+	buf := []byte(a + "\r\n" + b)
+	p := NewParser()
+	p.Reset(buf)
+	var r Request
+	n, err := p.ParseRequest(&r)
+	if err != nil || r.Path != "/a" {
+		t.Fatalf("first request: n=%d err=%v path=%q", n, err, r.Path)
+	}
+	if body := p.GetBody(r.ContentLength); string(body) != "ab" {
+		t.Fatalf("body = %q", body)
+	}
+	r = Request{}
+	n2, err := p.ParseRequest(&r)
+	if err != nil || r.Path != "/b" || n2 != len(buf) {
+		t.Fatalf("second request after an empty line: n=%d (want %d) err=%v path=%q", n2, len(buf), err, r.Path)
+	}
+}
