@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -183,5 +184,45 @@ func TestPriorKnowledgeH2COnlyWhereTheProtocolHasIt889(t *testing.T) {
 				t.Logf("Protocol HTTP1, EnableH2Upgrade %s: HTTP/2 preface answered %q", en.name, got)
 			})
 		}
+	}
+}
+
+// BenchmarkFrontEndServeHTTP889 measures what #889 puts in front of the bridge
+// for an ordinary HTTP/1.1 request: the engine's own http.Handler
+// (e.server.Handler), not Bridge.ServeHTTP alone (BenchmarkBridgeServeHTTP
+// builds its Bridge by hand and never reaches the front end). On HTTP1 with
+// the upgrade off it is the bridge itself, the control; on HTTP1 with &true
+// (new) and on H2C and Auto it is h2cHandler, whose per-request cost is the
+// prior-knowledge test and, when the upgrade is on, the two header lookups of
+// isH2CUpgrade. The upgrade itself happens once per connection.
+func BenchmarkFrontEndServeHTTP889(b *testing.B) {
+	for _, tc := range []struct {
+		name   string
+		proto  engine.Protocol
+		enable bool
+	}{
+		{"HTTP1Off", engine.HTTP1, false},
+		{"HTTP1On", engine.HTTP1, true},
+		{"H2COff", engine.H2C, false},
+		{"H2COn", engine.H2C, true},
+		{"AutoOff", engine.Auto, false},
+		{"AutoOn", engine.Auto, true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			cfg := resource.Config{Addr: "127.0.0.1:0", Engine: engine.Std, Protocol: tc.proto}
+			cfg.SetH2Upgrade(tc.enable)
+			e, err := New(cfg, okStreamHandler{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			h := e.server.Handler
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			w := &discardResponseWriter{h: http.Header{}}
+			b.ReportAllocs()
+			for b.Loop() {
+				clear(w.h)
+				h.ServeHTTP(w, req)
+			}
+		})
 	}
 }
