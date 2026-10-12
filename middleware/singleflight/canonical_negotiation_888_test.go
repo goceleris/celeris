@@ -146,6 +146,11 @@ func TestCanonicalAcceptEncodingIsTheNegotiatorsReading888(t *testing.T) {
 		"gzip, br", "gzip,br", "br, gzip", "gzip, br;q=0", "g zip", "gz ip", "gzip br", "gzipbr", "*", "*;q=0", "identity", "identity;q=0",
 		"gzip;q=nan", "gzip;q=x", "gzip;q=", "br", "gzip, deflate, br, zstd", "gzip,deflate,br,zstd", "GZIP, Deflate, BR, ZSTD",
 		"a,b,c,d,e,f,g,h,i,j,k,l,m,n", "A, B, C, D, E, F, G, H, I, J, K, L, M, N",
+		// Weights that differ past the first decimal, or q=0 against a tiny
+		// positive q, are different negotiations: a canonical form that
+		// rounds the weight would give them one key.
+		"gzip;q=0.001", "gzip;q=0.85", "gzip;q=0.8", "gzip;q=0.5, br;q=0.55", "gzip;q=0.5, br;q=0.5", "gzip;q=0.5, br;q=0.50",
+		"gzip;q=0.999", "gzip;q=0.9999999", "gzip;q=1e-3", "gzip;q=.5", "gzip;q=0.5",
 	}
 	same := func(a, b []negotiate.AcceptItem) bool {
 		if len(a) != len(b) {
@@ -185,6 +190,25 @@ func TestDefaultKeyQueryIsLabelled888(t *testing.T) {
 			defer celeristest.ReleaseContext(qc)
 			if hk, qk := defaultKeyFunc(hc), defaultKeyFunc(qc); hk == qk {
 				t.Errorf("%s: abc and ?%s=abc give the same key %q", tc.header, tc.param, hk)
+			}
+		})
+	}
+}
+
+// TestDefaultKeyQueryNeverReadsAsAHeader888: the query's label is its own for
+// every header component, not only for a parameter named like a label (the
+// previous test): a header whose value is the whole query string ("x=abc"
+// against ?x=abc) reads as the query under any label the query shares with a
+// header.
+func TestDefaultKeyQueryNeverReadsAsAHeader888(t *testing.T) {
+	for _, h := range []string{"authorization", "cookie", "accept-encoding", "if-none-match", "if-modified-since", "if-match", "if-unmodified-since"} {
+		t.Run(h, func(t *testing.T) {
+			hc, _ := celeristest.NewContext("GET", "/doc", celeristest.WithHeader(h, "x=abc"))
+			qc, _ := celeristest.NewContext("GET", "/doc", celeristest.WithQuery("x", "abc"))
+			defer celeristest.ReleaseContext(hc)
+			defer celeristest.ReleaseContext(qc)
+			if hk, qk := defaultKeyFunc(hc), defaultKeyFunc(qc); hk == qk {
+				t.Errorf("%s: x=abc and ?x=abc give the same key %q", h, hk)
 			}
 		})
 	}
