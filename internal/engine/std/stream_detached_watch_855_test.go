@@ -455,6 +455,7 @@ func TestHijackThenDetachKeepsTheConnectionPastWriteTimeout855(t *testing.T) {
 		conn, err := rw.Hijack(s)
 		if err != nil {
 			late <- err
+			again <- err
 			return
 		}
 		rw.StreamDetached()
