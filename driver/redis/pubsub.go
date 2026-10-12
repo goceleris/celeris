@@ -271,11 +271,14 @@ func (ps *PubSub) control(verb string, names []string, update func()) error {
 // ErrPubSubConnDown is what a control call (Subscribe, Unsubscribe,
 // PSubscribe, PUnsubscribe, SSubscribe, SUnsubscribe) returns on an open
 // PubSub whose conn is down: the command was not sent, but the subscription
-// set is updated and the reconnect replays it, so the caller need not retry.
-// It is not [ErrClosed] (the PubSub is open) and not [ErrUnknownFD] (the
-// driver maps that to this error when the loop forgot the conn). Match it with
-// errors.Is. Messages published while the conn is down are lost, as the
-// [PubSub] doc says.
+// set is updated, and the reconnect replays it while the PubSub is open, so
+// the caller need not repeat the call (see the [PubSub] doc for the cases where
+// no reconnect follows: the constructors [Client.Subscribe] and
+// [Client.PSubscribe] can return it with a nil PubSub, and after
+// [Client.Close] the reconnect has no pool to dial). It is not [ErrClosed]
+// (the PubSub is open) and not [ErrUnknownFD] (the driver maps that to this
+// error when the loop forgot the conn). Match it with errors.Is. Messages
+// published while the conn is down are lost, as the [PubSub] doc says.
 var ErrPubSubConnDown = errors.New("celeris-redis: pubsub conn down, reconnecting")
 
 // sendPubSubControl writes a control command without tracking a reply (pubsub
