@@ -43,6 +43,15 @@ func TestCacheControlSetsTheStoredTTL888(t *testing.T) {
 		{"max-age=7200", cfgTTL},
 		{"max-age=", cfgTTL},
 		{"x-max-age=0", cfgTTL},
+		// A delta-seconds past what a time.Duration holds (9223372036 s is
+		// the last that fits) wrapped to a negative TTL, which the stores
+		// read as "no expiry" (the "forever" idiom max-age=9999999999).
+		{"max-age=9223372036", cfgTTL},
+		{"max-age=9223372037", cfgTTL},
+		{"max-age=9999999999", cfgTTL},
+		{"max-age=10000000000", cfgTTL},
+		{"max-age=99999999999999999999999", cfgTTL},
+		{"max-age=9999999999, max-age=1", cfgTTL},
 		{"x-max-age=0, max-age=1", time.Second},
 		{`ext="max-age=0", max-age=45`, 45 * time.Second},
 		{"", cfgTTL},
@@ -68,5 +77,34 @@ func TestCacheControlSetsTheStoredTTL888(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestCacheHugeMaxAgeStillExpires888: the stored TTL of a response that says
+// max-age=9999999999 is Config.TTL, so the entry is gone once that passes. A
+// wrapped (negative) TTL stored the entry with no expiry at all.
+func TestCacheHugeMaxAgeStillExpires888(t *testing.T) {
+	for _, noSF := range []bool{false, true} {
+		name := "singleflight"
+		if noSF {
+			name = "no-singleflight"
+		}
+		t.Run(name, func(t *testing.T) {
+			kv := NewMemoryStore()
+			defer kv.Close()
+			var runs int
+			h := func(c *celeris.Context) error {
+				runs++
+				c.SetHeader("cache-control", "max-age=9999999999")
+				return c.String(200, "v%d", runs)
+			}
+			mw := New(Config{Store: kv, TTL: 50 * time.Millisecond, DisableSingleflight: noSF})
+			runOnce(t, mw, h, "GET", "/huge888")
+			time.Sleep(120 * time.Millisecond)
+			rec := runOnce(t, mw, h, "GET", "/huge888")
+			if rec.Header("x-cache") != "MISS" || runs != 2 {
+				t.Errorf("120 ms after a fill with Config.TTL 50 ms: %q x-cache %q after %d handler run(s), want a MISS and 2 runs", rec.Body, rec.Header("x-cache"), runs)
+			}
+		})
 	}
 }
