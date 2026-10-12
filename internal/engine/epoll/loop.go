@@ -1382,43 +1382,29 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if !complete {
 				continue
 			}
-			rest, derr := cs.h1State.DispatchBufferedBody(cs.ctx, l.handler, cs.writeFn)
-			if errors.Is(derr, conn.ErrUpgradeH2C) {
-				if err := l.switchToH2(cs, cs.writeFn); err != nil {
-					l.closeConn(fd)
-					return
-				}
-			} else if derr != nil {
-				if errors.Is(derr, conn.ErrHijacked) {
-					return
-				}
-				if mu := cs.detachMu; mu != nil {
-					mu.Lock()
-				}
-				_ = l.flushWrites(cs, true)
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
-				}
-				l.closeWhenFlushed(cs) // celeris#761: the response's tail too
-				return
+			rest, verdict := cs.h1State.DispatchBufferedBody(cs.ctx, l.handler, cs.writeFn)
+			if verdict == nil && len(rest) > 0 {
+				// Tail bytes after the body: feed them back through the
+				// normal parser for the pipelined request(s). Their verdict
+				// is handled exactly as the body's own (an h2c upgrade
+				// request pipelined behind the body is the case that was
+				// once closed instead, celeris#885).
+				verdict = conn.ProcessH1(cs.ctx, rest, cs.h1State, l.handler, cs.writeFn)
 			}
-			if len(rest) > 0 {
-				// Tail bytes after the body — feed them back through
-				// the normal parser for pipelined request(s).
-				if perr := conn.ProcessH1(cs.ctx, rest, cs.h1State, l.handler, cs.writeFn); perr != nil {
-					if errors.Is(perr, conn.ErrHijacked) {
+			if verdict != nil {
+				if errors.Is(verdict, conn.ErrHijacked) {
+					return
+				}
+				if errors.Is(verdict, conn.ErrUpgradeH2C) {
+					// The 101 and the preface go out here; the loop goes on
+					// to read the HTTP/2 frames that follow.
+					if !l.finishH1Upgrade(cs, fd, cs.writeFn) {
 						return
 					}
-					if mu := cs.detachMu; mu != nil {
-						mu.Lock()
-					}
-					_ = l.flushWrites(cs, true)
-					if mu := cs.detachMu; mu != nil {
-						mu.Unlock()
-					}
-					l.closeWhenFlushed(cs) // celeris#761: the response's tail too
-					return
+					continue
 				}
+				l.endH1Verdict(cs, verdict)
+				return
 			}
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()

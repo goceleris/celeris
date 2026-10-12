@@ -3436,41 +3436,34 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			}
 			return
 		}
-		rest, derr := cs.h1State.DispatchBufferedBody(cs.ctx, w.handler, cs.writeFn)
-		if errors.Is(derr, conn.ErrUpgradeH2C) {
-			if err := w.switchToH2(cs); err != nil {
-				w.closeConn(fd)
-				return
-			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			cs.recvLinked = false
-			if w.bufRing == nil {
-				if w.flushSendLink(cs) {
-					w.markDirty(cs)
+		rest, verdict := cs.h1State.DispatchBufferedBody(cs.ctx, w.handler, cs.writeFn)
+		if verdict == nil && len(rest) > 0 {
+			// Tail bytes after the body: feed them back through the normal
+			// parser for the pipelined request(s). Their verdict is handled
+			// exactly as the body's own (an h2c upgrade request pipelined
+			// behind the body is the case that was once closed instead,
+			// celeris#884).
+			verdict = conn.ProcessH1(cs.ctx, rest, cs.h1State, w.handler, cs.writeFn)
+		}
+		if verdict != nil {
+			switch {
+			case errors.Is(verdict, conn.ErrHijacked):
+				// The handler took the conn: cs is no longer ours.
+			case errors.Is(verdict, conn.ErrUpgradeH2C):
+				if w.finishH1Upgrade(cs, fd, true) && !cqeHasMore(c.Flags) && !cs.recvLinked {
+					// The linked send carries a recv of its own when it was
+					// placed; otherwise (a send in flight, a full SQ ring)
+					// this recv, which the direct-body CQE consumed, must be
+					// replaced here or the conn is deaf.
+					if !w.prepareRecv(cs, cs.buf) {
+						cs.needsRecv = true
+						w.markDirty(cs)
+					}
 				}
-			} else {
-				if w.flushSend(cs) {
-					w.markDirty(cs)
-				}
-			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
+			default:
+				w.endH1Verdict(cs, fd, verdict)
 			}
 			return
-		}
-		if derr != nil {
-			w.closeConn(fd)
-			return
-		}
-		if len(rest) > 0 {
-			if perr := conn.ProcessH1(cs.ctx, rest, cs.h1State, w.handler, cs.writeFn); perr != nil {
-				if !errors.Is(perr, conn.ErrHijacked) {
-					w.closeConn(fd)
-				}
-				return
-			}
 		}
 		// The direct-body tail: flushed unlinked (the next recv may target
 		// the body buffer again), then a standalone recv — or none, held for
