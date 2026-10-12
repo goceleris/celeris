@@ -2874,17 +2874,7 @@ func (w *Worker) initProtocol(cs *connState) {
 		if !w.async {
 			cs.h1State.OnHeaderDeadlineArmed = func() { w.armHeaderTimer(cs) }
 		}
-		// A conn that had to be detected carries the deadline it was given at
-		// accept (detectDeadline): the first request's budget counts from
-		// accept, so the H1 deadline is armed at what is left of it, and the
-		// timer below fires then. 0 for a conn whose protocol was fixed at
-		// accept, or adopted, which arms the full budget.
-		cs.h1State.ArmHeaderDeadlineAt(cs.detectDeadline)
 		if w.async {
-			// Direct worker-thread arm for the initial deadline; the
-			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
-			// only stamped HeaderDeadlineNs, not the SQE.
-			w.armHeaderTimer(cs)
 			// Per-handler async (celeris #300): wire the route resolver so
 			// ProcessH1, when run inline on the worker (InlineMode), can
 			// detect an async route and bail to the dispatch goroutine.
@@ -3205,6 +3195,22 @@ func (w *Worker) initProtocol(cs *connState) {
 				return w.hijackConn(cs.fd)
 			}
 		}
+		// The header deadline is armed last. A conn that had to be detected
+		// carries the deadline it was given at accept (detectDeadline): the
+		// first request's budget counts from accept, so the H1 deadline is
+		// armed at what is left of it, and the timer fires then. 0 for a conn
+		// whose protocol was fixed at accept, or adopted, which arms the full
+		// budget. When what is left is nothing, the arm closes the conn
+		// (armHeaderTimerAt), and everything above has been set by then, so
+		// the close is the last thing initProtocol does to the conn; the
+		// caller (handleRecv) sees it as w.conns[fd] != cs || cs.closing.
+		cs.h1State.ArmHeaderDeadlineAt(cs.detectDeadline)
+		if w.async {
+			// Direct worker-thread arm for the initial deadline; the
+			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
+			// only stamped HeaderDeadlineNs, not the SQE.
+			w.armHeaderTimer(cs)
+		}
 	case engine.H2C:
 		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, w.wakeFD)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
@@ -3298,6 +3304,18 @@ func (w *Worker) closeOnRecvEnd(fd int, cs *connState, err error) {
 		mu.Unlock()
 	}
 	w.closeConn(fd)
+}
+
+// dropUndecided lets go of what a conn whose detection branch ended in a close
+// holds: the accumulated prefix (a pooled connState never holds the array of a
+// conn that has gone) and the provided buffer its deciding recv arrived in,
+// which goes back to the ring. A buffer dropped is gone for good, and a
+// worker's ring that has lost all of them answers no recv.
+func (w *Worker) dropUndecided(cs *connState, hasProvidedBuf bool, providedBufID uint16) {
+	cs.detectAccum = nil
+	if hasProvidedBuf {
+		w.bufRing.ReturnBuffer(providedBufID)
+	}
 }
 
 func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
@@ -3553,10 +3571,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			(*hook)(w, cs, detectBeforeBudgetCheck)
 		}
 		if dd := cs.detectDeadline; dd > 0 && time.Now().UnixNano() > dd {
-			cs.detectAccum = nil
-			if hasProvidedBuf {
-				w.bufRing.ReturnBuffer(providedBufID)
-			}
+			w.dropUndecided(cs, hasProvidedBuf, providedBufID)
 			w.closeConn(fd)
 			return
 		}
@@ -3566,13 +3581,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		cs.protocol.Store(int32(proto))
 		cs.detected = true
 		w.initProtocol(cs)
-		// initProtocol arms the header timer, and the arm closes the conn
-		// when the deadline passed between the check above and the arm.
-		// closeConn may have released cs, so it is not touched on that path.
+		// initProtocol arms the header timer last, and the arm closes the
+		// conn when the deadline passed between the check above and the arm.
+		// closeConn queues cs for release and does not release it
+		// (queuePendingReleaseFD), so cs is still ours to let go of here.
 		if w.conns[fd] != cs || cs.closing {
-			if hasProvidedBuf {
-				w.bufRing.ReturnBuffer(providedBufID)
-			}
+			w.dropUndecided(cs, hasProvidedBuf, providedBufID)
 			return
 		}
 		cs.detectDeadline = 0
