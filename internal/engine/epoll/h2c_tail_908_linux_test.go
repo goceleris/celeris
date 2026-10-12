@@ -113,3 +113,13 @@ func TestEpollH2CUpgradeAfterDirectBodyTail908(t *testing.T) {
 	e, _ := start908(t, false, true)
 	testTailUpgrade908(t, e)
 }
+
+// TestEpollH2CUpgradeAfterDirectBodyTailAsync908 is the same client script on
+// an AsyncHandlers loop. There drainRead reads into cs.buf only (the direct
+// body recv is gated on !l.async), so this arm does not reach the tail the
+// sync test covers (it passes on main): it guards the upgrade on the async
+// path.
+func TestEpollH2CUpgradeAfterDirectBodyTailAsync908(t *testing.T) {
+	e, _ := start908(t, true, true)
+	testTailUpgrade908(t, e)
+}

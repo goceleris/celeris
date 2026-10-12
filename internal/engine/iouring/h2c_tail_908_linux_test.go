@@ -132,12 +132,21 @@ func TestIouringH2CUpgradeAfterDirectBodyTail908(t *testing.T) {
 }
 
 // TestIouringH2CUpgradeAfterDirectBodyTailAsync908 is the same client script
-// on an AsyncHandlers engine. A conn that has not been promoted yet is read
-// the way a sync one is, and a request left half-read promotes it, so the
-// scenario may not reach the block under test here: the test holds the
-// upgrade to what the client sees either way.
+// on an AsyncHandlers engine. A fixed-length body split across recvs does not
+// promote the conn (HasPendingDispatchState excludes it: its continuation is
+// non-async by construction), so the conn is still read inline-first and its
+// second recv goes into bodyBuf: the same tail as the sync test.
 func TestIouringH2CUpgradeAfterDirectBodyTailAsync908(t *testing.T) {
 	e, _ := start908(t, true, true)
-	skipIfMultishot908(t, e)
+	testTailUpgrade908(t, e)
+}
+
+// TestIouringH2CUpgradeAfterDirectBodyTailMultishot908 is the script on an
+// engine whose workers run the provided-buffer ring
+// (CELERIS_IOURING_MULTISHOT_RECV=1): the direct-body recv is never taken
+// there, so it covers the multishot path's handling of the same bytes.
+func TestIouringH2CUpgradeAfterDirectBodyTailMultishot908(t *testing.T) {
+	t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", "1")
+	e, _ := start908(t, false, true)
 	testTailUpgrade908(t, e)
 }
