@@ -220,9 +220,10 @@ func (c *Client) DoSlice(ctx context.Context, args ...any) ([]string, error) {
 // goroutine when a command reads its reply there. So fn must return quickly
 // and must not block: while it runs, no other conn on the worker is read. It
 // must not call runtime.Goexit (a test's t.FailNow or t.SkipNow, or a library
-// that does): on the worker that ends the goroutine, every conn on it is never
-// read again, and the driver logs an error through slog.Default. A panic in fn
-// is not recovered and ends the process.
+// that does): on a worker that ends the goroutine and every conn on it is never
+// read again. The event loop logs an error when that happens (through
+// slog.Default for the drivers' own loop, through the server's Logger for an
+// engine's). A panic in fn is not recovered and ends the process.
 func (c *Client) OnPush(fn func(channel string, data []Value)) {
 	c.cfg.OnPush = fn
 	c.pool.setOnPush(fn)

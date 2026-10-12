@@ -8,7 +8,7 @@ import (
 	"runtime/debug"
 )
 
-// runWatched runs worker w and reports a run that ends without returning.
+// runWatched runs w and reports a run that ends without returning.
 //
 // The drivers' own callbacks run on the worker goroutine: every onRecv and
 // onClose, the OnPush of a redis connection, and, for postgres, the dest
@@ -29,7 +29,7 @@ import (
 // event-loop iteration and takes no lock. It runs before the deferred
 // wg.Done of the caller, so Loop.Close, which waits for the workers, returns
 // after the report.
-func runWatched(w *worker, ctx context.Context) {
+func (w *worker) runWatched(ctx context.Context) {
 	returned := false
 	defer func() {
 		if !returned {

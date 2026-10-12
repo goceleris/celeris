@@ -243,8 +243,7 @@ func (w *portableWorker) allocIDLocked() int {
 	return 0
 }
 
-func (w *portableWorker) readerLoop(c *portableConn) {
-	defer w.wg.Done()
+func (w *portableWorker) readLoop(c *portableConn) {
 	buf := make([]byte, 16<<10)
 	for {
 		n, err := c.conn.Read(buf)

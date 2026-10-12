@@ -192,8 +192,10 @@ func (p *Pool) CopyFrom(ctx context.Context, tableName string, columns []string,
 // goroutine in direct mode. So dest must return quickly and must not block:
 // while it runs, no other conn on the worker is read. It must not call
 // runtime.Goexit either (a test's t.FailNow or t.SkipNow, or a library that
-// does): that ends the worker goroutine, every conn on it is never read
-// again, and the driver logs an error through slog.Default. A panic in dest is
+// does): that ends the worker goroutine and every conn on it is never read
+// again. The event loop logs an error when that happens (through slog.Default
+// for the drivers' own loop, through the server's Logger for an engine's). A
+// panic in dest is
 // not recovered and ends the process. To do slow or fallible work with a row,
 // copy it and hand it to another goroutine, or report failure by returning an
 // error.

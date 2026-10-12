@@ -178,6 +178,15 @@ type driverConn struct {
 // after the closed check and before the read, with c.rmu held. Tests only
 // (celeris#784): a test sets it before it creates the worker and clears it
 // after the worker is shut down.
+//
+// It is a package variable that every production read loads and compares with
+// nil, inside the critical section the read already holds: one predictable
+// branch next to a lock, a read(2) and a closed check. A build tag would take
+// it out of the production build at the price of a CI step that passes the tag
+// (or TestReadCheckAndReadAreOneCriticalSection784 stops running) and a second
+// way to build the package, for no gain anyone has measured (the read cost
+// benchmarks are read_cost_784_bench_linux_test.go); so it stays (celeris#887
+// item 3).
 var testHookBeforeRead func(fd int)
 
 // testHookBeforeAdd, when non-nil, runs in RegisterConn once the conn is in
@@ -337,7 +346,7 @@ func newEpollLoop(workers int) (*Loop, error) {
 		l.wg.Add(1)
 		go func(w *worker) {
 			defer l.wg.Done()
-			runWatched(w, ctx)
+			w.runWatched(ctx)
 		}(lw.(*worker))
 	}
 	return l, nil
