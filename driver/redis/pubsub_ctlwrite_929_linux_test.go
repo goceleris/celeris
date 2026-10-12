@@ -624,8 +624,8 @@ func TestPubSubControlAfterFailedResubscribeIsReplayed929(t *testing.T) {
 	if ps.closed.Load() {
 		t.Fatal("fixture: the PubSub is closed")
 	}
-	if !errors.Is(err, errPubSubConnDown) {
-		t.Errorf("Subscribe on an open PubSub with a reconnect pending returned %v, want errPubSubConnDown", err)
+	if !errors.Is(err, ErrPubSubConnDown) {
+		t.Errorf("Subscribe on an open PubSub with a reconnect pending returned %v, want ErrPubSubConnDown", err)
 	}
 	waitFor(t, "the reconnect to replay both channels", 10*time.Second, func() bool {
 		r.log.mu.Lock()
@@ -656,8 +656,8 @@ func TestPubSubControlOnForgottenFDIsReportedDown929(t *testing.T) {
 	t.Cleanup(func() { _ = ps.Close() })
 	r.gate.armFailWith(hasCmd("SUBSCRIBE"), ErrUnknownFD)
 	err = ps.Subscribe(ctx, "news")
-	if errors.Is(err, ErrUnknownFD) || errors.Is(err, ErrClosed) || !errors.Is(err, errPubSubConnDown) {
-		t.Errorf("Subscribe whose write found the fd forgotten returned %v, want errPubSubConnDown", err)
+	if errors.Is(err, ErrUnknownFD) || errors.Is(err, ErrClosed) || !errors.Is(err, ErrPubSubConnDown) {
+		t.Errorf("Subscribe whose write found the fd forgotten returned %v, want ErrPubSubConnDown", err)
 	}
 }
 
