@@ -53,6 +53,12 @@ var (
 // (Epoll or IOUring) instead. For benchmarking, run the adaptive columns
 // multiple times: a rare switch transient can skew a single pass.
 type Engine struct {
+	// primary and secondary are written only by New and by performSwitch's
+	// slot-publish blocks, which hold mu and switchMu together. A reader
+	// holds either lock: Shutdown and performSwitch take mu, and Metrics takes
+	// switchMu, because performSwitch holds mu across the incoming engine's
+	// listener wait (celeris#683) and Metrics must not sit behind that
+	// (celeris#886).
 	primary   engine.Engine // epoll  (nil until built when it is the lazy standby)
 	secondary engine.Engine // io_uring (nil until built when it is the lazy standby)
 	active    atomic.Pointer[engine.Engine]
@@ -1119,11 +1125,19 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 
 // Metrics aggregates metrics from whichever sub-engines exist. On the lazy
 // New() path a never-built standby is nil and contributes nothing.
+//
+// It reads the two slots under switchMu, not mu: performSwitch holds mu for
+// the whole switch, including the wait for the incoming engine's listener
+// (celeris#683), and a Metrics() behind it waited out that wait (measured
+// 109 to 114 ms against 375 to 833 ns idle, celeris#886). The slots are
+// published under both locks, so switchMu alone sees them whole. Nothing holds
+// switchMu across a call to this method or for longer than a controller
+// evaluation.
 func (e *Engine) Metrics() engine.EngineMetrics {
-	e.mu.Lock()
+	e.switchMu.Lock()
 	primary := e.primary
 	secondary := e.secondary
-	e.mu.Unlock()
+	e.switchMu.Unlock()
 
 	var pm, sm engine.EngineMetrics
 	if primary != nil {
