@@ -137,7 +137,27 @@ type pgRequest struct {
 	// streamRows before all data arrives.
 	rowCh     chan [][]byte
 	colsCh    chan struct{}
-	streamErr atomic.Pointer[error] // set before close(rowCh) so readers see the error race-free
+	streamErr atomic.Pointer[error] // set before closeRowCh so readers see the error race-free
+	// The streaming channels are closed from two goroutines: dispatch (a
+	// request that finishes, an error) and failAll (the conn closes), while
+	// OnRow may be sending on rowCh from dispatch. They are closed only
+	// through closeRowCh and closeColsCh, never with close() (celeris#887).
+	//
+	//   chMu     guards rowCh's publication, rowChClosing, abortCh and colsChClosed
+	//   sendMu   OnRow holds it for reading across its send; closeRowCh takes
+	//            it for writing to close rowCh, so no send is in flight at the close
+	//   abortCh  closed by closeRowCh before it takes sendMu, to release an
+	//            OnRow blocked on a full rowCh; created by that OnRow, or by
+	//            closeRowCh if none is blocked
+	//
+	// Lock order: sendMu (read), then chMu. closeRowCh never holds chMu
+	// while it waits for sendMu.
+	chMu         sync.Mutex
+	rowChClosing bool
+	colsChClosed bool
+	abortCh      chan struct{}
+	sendMu       sync.RWMutex
+	rowChClosed  bool // guarded by sendMu
 	// syncMode suppresses the lazy streaming promotion (promoteToStreaming)
 	// when the request is being handled on the sync fast path
 	// (WriteAndPoll). The sync path runs dispatch on the calling goroutine,
@@ -325,6 +345,8 @@ func releasePgRequest(r *pgRequest) {
 	r.tag = ""
 	r.err = nil
 	r.rowCh = nil
+	r.rowChClosing, r.rowChClosed, r.colsChClosed = false, false, false
+	r.abortCh = nil
 	r.syncMode.Store(false)
 	r.colsCh = nil
 	r.streamErr.Store(nil)
@@ -413,7 +435,7 @@ func (r *pgRequest) Ctx() context.Context { return r.ctx }
 func (r *pgRequest) OnRowDesc(cols []protocol.ColumnDesc) {
 	r.columns = cols
 	if r.rowCh != nil && r.colsCh != nil {
-		close(r.colsCh)
+		r.closeColsCh()
 	}
 }
 
@@ -427,7 +449,7 @@ func (r *pgRequest) OnRowDesc(cols []protocol.ColumnDesc) {
 // Describe step, not from a per-DataRow signal).
 func (r *pgRequest) OnRow(fields [][]byte) {
 	if r.rowCh != nil {
-		r.rowCh <- copyRow(fields)
+		r.sendRow(copyRow(fields))
 		return
 	}
 	r.appendRowFromAlias(fields)
@@ -449,6 +471,85 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 	if !r.syncMode.Load() && r.colsCh != nil && len(r.rows) >= streamThreshold {
 		promoteToStreaming(r)
 	}
+}
+
+// closedAbort is the abortCh of a request whose rowCh was closed before any
+// OnRow had to block: already closed, so a late OnRow takes the abort at once.
+var closedAbort = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+
+// sendRow sends one row to the streaming consumer, blocking while rowCh is
+// full, and drops the row once closeRowCh has run or starts to run while it
+// waits. It is the only send on rowCh after promoteToStreaming's first fill.
+func (r *pgRequest) sendRow(row [][]byte) {
+	r.sendMu.RLock()
+	if r.rowChClosed {
+		r.sendMu.RUnlock()
+		return
+	}
+	ch := r.rowCh
+	select {
+	case ch <- row:
+		r.sendMu.RUnlock()
+		return
+	default:
+	}
+	// rowCh is full: wait for the consumer, or for closeRowCh to let go of us.
+	r.chMu.Lock()
+	if r.abortCh == nil {
+		r.abortCh = make(chan struct{})
+	}
+	abort := r.abortCh
+	r.chMu.Unlock()
+	select {
+	case ch <- row:
+	case <-abort:
+	}
+	r.sendMu.RUnlock()
+}
+
+// closeRowCh closes the streaming channel once, whoever calls it. A sender
+// blocked in sendRow is released first (abortCh), and rowCh is closed only
+// when none is in flight, so a Close racing a delivery cannot make OnRow send
+// on a closed channel (celeris#887). It does nothing for a request that is
+// not streaming, and when it has run before.
+func (r *pgRequest) closeRowCh() {
+	r.chMu.Lock()
+	ch := r.rowCh
+	if ch == nil || r.rowChClosing {
+		r.chMu.Unlock()
+		return
+	}
+	r.rowChClosing = true
+	if r.abortCh == nil {
+		r.abortCh = closedAbort
+	} else {
+		close(r.abortCh)
+	}
+	r.chMu.Unlock()
+	r.sendMu.Lock()
+	r.rowChClosed = true
+	close(ch)
+	r.sendMu.Unlock()
+}
+
+// closeColsCh closes colsCh once, whoever calls it (OnRowDesc,
+// promoteToStreaming, dispatch, failAll), and does nothing when the request
+// has no colsCh.
+func (r *pgRequest) closeColsCh() {
+	r.chMu.Lock()
+	if r.colsCh != nil && !r.colsChClosed {
+		r.colsChClosed = true
+		close(r.colsCh)
+	}
+	r.chMu.Unlock()
+}
+
+// streaming reports whether the request has a streaming channel. It is for
+// goroutines other than dispatch's, which publish rowCh (promoteToStreaming).
+func (r *pgRequest) streaming() bool {
+	r.chMu.Lock()
+	defer r.chMu.Unlock()
+	return r.rowCh != nil
 }
 
 // prepareState drives a Parse + Describe S + Sync exchange. Unlike
@@ -1164,14 +1265,8 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 		if err != nil {
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
-				close(head.rowCh)
-				if head.colsCh != nil {
-					select {
-					case <-head.colsCh:
-					default:
-						close(head.colsCh)
-					}
-				}
+				head.closeRowCh()
+				head.closeColsCh()
 			}
 			c.popHead()
 			head.fail(err)
@@ -1179,7 +1274,7 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 		}
 		if done {
 			if head.rowCh != nil {
-				close(head.rowCh)
+				head.closeRowCh()
 			}
 			c.popHead()
 			head.finish()
@@ -1192,14 +1287,8 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 		if err != nil {
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
-				close(head.rowCh)
-				if head.colsCh != nil {
-					select {
-					case <-head.colsCh:
-					default:
-						close(head.colsCh)
-					}
-				}
+				head.closeRowCh()
+				head.closeColsCh()
 			}
 			c.popHead()
 			head.fail(err)
@@ -1211,14 +1300,8 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 				head.columns = head.extended.Columns
 			}
 			if head.rowCh != nil {
-				if head.colsCh != nil {
-					select {
-					case <-head.colsCh:
-					default:
-						close(head.colsCh)
-					}
-				}
-				close(head.rowCh)
+				head.closeColsCh()
+				head.closeRowCh()
 			}
 			c.popHead()
 			head.finish()
@@ -1228,11 +1311,7 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			// are available so the caller can return streamRows early.
 			if head.extended.Columns != nil && head.columns == nil {
 				head.columns = head.extended.Columns
-				select {
-				case <-head.colsCh:
-				default:
-					close(head.colsCh)
-				}
+				head.closeColsCh()
 			}
 		}
 	case reqPrepare:
@@ -1352,10 +1431,13 @@ func promoteToStreaming(req *pgRequest) {
 	if n := len(req.rows); n > chanCap {
 		chanCap = n
 	}
-	req.rowCh = make(chan [][]byte, chanCap)
+	ch := make(chan [][]byte, chanCap)
 	for _, row := range req.rows {
-		req.rowCh <- row
+		ch <- row
 	}
+	req.chMu.Lock()
+	req.rowCh = ch // published under chMu: failAll's closeRowCh reads it from another goroutine
+	req.chMu.Unlock()
 	// Clear the buffer. We nil out the slice elements but retain the backing
 	// capacity for reuse by releasePgRequest.
 	for i := range req.rows {
@@ -1367,9 +1449,7 @@ func promoteToStreaming(req *pgRequest) {
 	// don't allocate one and the dispatch sites above guard on colsCh != nil
 	// before calling promoteToStreaming. Double-check here as a defense in
 	// depth — close(nil) panics.
-	if req.colsCh != nil {
-		close(req.colsCh)
-	}
+	req.closeColsCh()
 }
 
 // onClose is the event-loop callback for an fd-level shutdown. It shuts the
@@ -1400,22 +1480,15 @@ func (c *pgConn) failAll(err error) {
 		if r == nil {
 			continue
 		}
-		// Close streaming channels so the consumer unblocks.
-		if r.rowCh != nil {
+		// Close streaming channels so the consumer unblocks. dispatch may
+		// have closed them already, and may be sending on rowCh right now:
+		// closeRowCh and closeColsCh close each exactly once and release a
+		// blocked OnRow first (celeris#887).
+		if r.streaming() {
 			r.streamErr.Store(&err)
-			// Close rowCh exactly once: use a recover guard since another
-			// goroutine (dispatch) might have already closed it.
-			func() {
-				defer func() { _ = recover() }()
-				close(r.rowCh)
-			}()
 		}
-		if r.colsCh != nil {
-			func() {
-				defer func() { _ = recover() }()
-				close(r.colsCh)
-			}()
-		}
+		r.closeRowCh()
+		r.closeColsCh()
 		// Use fail() so concurrent failReq (caller goroutine Write-error
 		// path) and this failAll (event-loop onClose path) cannot race on
 		// r.err. First winner's err is the one wait() observes.
@@ -2539,6 +2612,10 @@ func boolByte(b bool) byte {
 // were released earlier, by onClose after a loop teardown or before those
 // goroutines are done, the next socket the process opens could take it, and
 // these calls would reach that socket and its registration (celeris#859).
+//
+// A conn that a loop has already torn down (the server hung up, the loop
+// closed) closes without an error: the loop answers ErrUnknownFD to the
+// Terminate write and to UnregisterConn, and Close does not report it.
 func (c *pgConn) Close() error {
 	var firstErr error
 	c.closeOnce.Do(func() {
@@ -2560,10 +2637,15 @@ func (c *pgConn) Close() error {
 				}
 			}
 		} else if c.loop != nil {
-			if err := c.writeRaw(termBytes); err != nil && firstErr == nil {
+			// Both calls are made even when a loop has torn the conn down
+			// already (they find the conn by number, and celeris#859 needs
+			// them on the conn's own number). The loop then answers
+			// ErrUnknownFD to both: that is what teardown looks like, not a
+			// failure of Close, so it is not Close's error (celeris#887).
+			if err := c.writeRaw(termBytes); err != nil && firstErr == nil && !errors.Is(err, ErrUnknownFD) {
 				firstErr = err
 			}
-			if err := c.loop.UnregisterConn(c.fd); err != nil && firstErr == nil {
+			if err := c.loop.UnregisterConn(c.fd); err != nil && firstErr == nil && !errors.Is(err, ErrUnknownFD) {
 				firstErr = err
 			}
 		}
