@@ -16,6 +16,38 @@ import (
 	"github.com/goceleris/celeris/middleware/store"
 )
 
+// versionedSetter is implemented by a store that can apply a fill's write in
+// order: setIfNewer stores the value unless the key holds a live entry that a
+// fill of a newer generation wrote. A generation is the time a fill's handler
+// started (see genNow), so a fill that started later, which read the origin
+// later, is not overwritten by an earlier one whose Set lands after it: two
+// concurrent misses with DisableSingleflight, or a coalesced call that was
+// replaced once its result expired while its Set hung. [MemoryStore]
+// implements it. Any other store gets a plain Set: the order of two writes
+// that overlap is then the order the store applies them in (celeris#888
+// item 30).
+type versionedSetter interface {
+	setIfNewer(ctx context.Context, key string, value []byte, ttl time.Duration, gen uint64) error
+}
+
+// genBase is the origin of generations: time.Since reads the monotonic clock,
+// which a wall-clock step does not move, and, unlike a shared counter, costs
+// no cache-line transfer between cores on a busy miss path.
+var genBase = time.Now()
+
+// genNow returns the generation of a fill or a write that starts now: the
+// nanoseconds since genBase, plus one so that no generation is 0. Two starts
+// in the same clock tick share a generation, and then the later write wins.
+func genNow() uint64 { return uint64(time.Since(genBase)) + 1 }
+
+// storeFill writes a fill's encoded response, in order when the store can.
+func storeFill(ctx context.Context, kv store.KV, key string, enc []byte, ttl time.Duration, gen uint64) error {
+	if vs, ok := kv.(versionedSetter); ok {
+		return vs.setIfNewer(ctx, key, enc, ttl, gen)
+	}
+	return kv.Set(ctx, key, enc, ttl)
+}
+
 // ErrNotSupported is returned by [InvalidatePrefix] when the given
 // store does not implement the required extension interface.
 var ErrNotSupported = errors.New("cache: store does not support this operation")
@@ -104,6 +136,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		// during the Set, within the response's TTL, takes the response from
 		// the call (celeris#921).
 		var ttl time.Duration
+		var gen uint64
 		encoded, leader, err := group.Do(ctx, key, func() ([]byte, time.Duration, error) {
 			// nil dst: leader returns the encoded bytes via sf.Do; followers
 			// may still be reading them after this call frame returns, so
@@ -111,12 +144,13 @@ func New(config ...Config) celeris.HandlerFunc {
 			// to a request that arrives during the Set only within its TTL,
 			// as the stored entry would be: a Set that hangs must not serve
 			// it for longer.
+			gen = genNow()
 			enc, effectiveTTL, chainErr := capture(c, cfg, include, exclude, nil)
 			ttl = effectiveTTL
 			return enc, effectiveTTL, chainErr
 		}, func(enc []byte, _ error) {
 			if enc != nil {
-				_ = cfg.Store.Set(ctx, key, enc, ttl)
+				_ = storeFill(ctx, cfg.Store, key, enc, ttl, gen)
 			}
 		})
 		if leader {
@@ -161,9 +195,10 @@ func New(config ...Config) celeris.HandlerFunc {
 // buffer is safe to recycle the moment Set returns.
 func executeAndStore(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, key string) error {
 	bufPtr := cacheBufPool.Get().(*[]byte)
+	gen := genNow()
 	encoded, ttl, chainErr := capture(c, cfg, include, exclude, (*bufPtr)[:0])
 	if encoded != nil {
-		_ = cfg.Store.Set(c.Context(), key, encoded, ttl)
+		_ = storeFill(c.Context(), cfg.Store, key, encoded, ttl, gen)
 	}
 	if cap(encoded) <= cacheBufMaxPooled {
 		*bufPtr = encoded
