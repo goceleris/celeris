@@ -143,3 +143,37 @@ func TestRegisteredMethodsAreServed(t *testing.T) {
 		}
 	}
 }
+
+// TestRegisteredFirstLetterNeedsHTTP: a first letter of the registry no longer
+// closes the conn at detection, so bytes that are not a request ("SSH-", which
+// starts with the registered S) reach the HTTP/1 parser and are answered 400.
+// Letters outside the registry (a TLS record header here) are still closed with
+// no answer. std is the control for the 400: net/http answers it too.
+func TestRegisteredFirstLetterNeedsHTTP(t *testing.T) {
+	for _, e := range crlfEngines {
+		t.Run(e.name, func(t *testing.T) {
+			addr := startCRLF(t, e)
+			ssh, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = ssh.Close() }()
+			_, _ = io.WriteString(ssh, "SSH-2.0-test\r\n\r\n")
+			if got := readUntilClose(ssh, 5*time.Second); !strings.HasPrefix(got, "HTTP/1.1 400") {
+				t.Errorf("SSH banner: got %q, want an HTTP/1.1 400 answer", got)
+			}
+			if e.eng == celeris.Std {
+				return // net/http answers a TLS record header with its own 400
+			}
+			tls, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tls.Close() }()
+			_, _ = tls.Write([]byte("\x16\x03\x01\x02\x00\x01\x00\x01\xfc"))
+			if got := readUntilClose(tls, 5*time.Second); got != "" {
+				t.Errorf("TLS record header: got %q, want the conn closed with no answer", got)
+			}
+		})
+	}
+}
