@@ -118,3 +118,19 @@ func BenchmarkDefaultKeyLongAcceptEncoding(b *testing.B) {
 		_ = defaultKeyFunc(c)
 	}
 }
+
+// BenchmarkSingleflightMissPost is the miss path of a POST with the default
+// key (an unconditional write still coalesces on main and here; Skip it): the
+// bypass check looks at the four preconditions for any method but GET and
+// HEAD, and the key looks at them again.
+func BenchmarkSingleflightMissPost(b *testing.B) {
+	opts := []celeristest.Option{celeristest.WithHandlers(New(), func(c *celeris.Context) error {
+		return c.Blob(200, "text/plain", []byte("hello"))
+	})}
+	b.ReportAllocs()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("POST", "/bench", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
