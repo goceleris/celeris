@@ -29,8 +29,10 @@ func BenchmarkDoMiss(b *testing.B) {
 func BenchmarkDoFollowerOfPublishedCall(b *testing.B) {
 	g := New[int]()
 	inThen, gate := make(chan struct{}), make(chan struct{})
-	go g.Do(context.Background(), "k", func() (int, time.Duration, error) { return 7, 0, nil },
-		func(int, error) { close(inThen); <-gate })
+	go func() {
+		_, _, _ = g.Do(context.Background(), "k", func() (int, time.Duration, error) { return 7, 0, nil },
+			func(int, error) { close(inThen); <-gate })
+	}()
 	<-inThen
 	defer close(gate)
 	ctx, cancel := context.WithCancel(context.Background())
