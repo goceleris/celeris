@@ -332,6 +332,54 @@ func TestSwitchWaitForTheIncomingListenerDoesNotBlockDriverRegistration683(t *te
 	}
 }
 
+// Nor is it held under e.mu where that blocks a reader: Engine.Metrics() (hence
+// Server.EngineInfo and the observe collector) takes only switchMu for the two
+// sub-engine slots, and nothing holds switchMu across the wait. With the wait
+// under the lock Metrics() sat out the rest of the late engine's delay
+// (celeris#886 item 12: 109 to 114 ms against 375 to 833 ns idle).
+func TestSwitchWaitForTheIncomingListenerDoesNotBlockMetrics683(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	e, _, stop := s0Bind(t, resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1, DisableDeferAccept: true,
+		Resources: resource.Resources{Workers: 2}}, respHandler{})
+	defer stop()
+	port := e.Addr().(*net.TCPAddr).Port
+	forceSwitchTo(t, e, engine.IOUring)
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := listenInodes(port); err != nil {
+		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
+	}
+	const delay = 150 * time.Millisecond
+	installLateEpoll683(t, e, delay)
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		t0 := time.Now()
+		e.ForceSwitch()
+		done <- time.Since(t0)
+	}()
+	time.Sleep(40 * time.Millisecond) // inside the wait: the engine resumed, the delay not yet over
+	t0 := time.Now()
+	m := e.Metrics()
+	took := time.Since(t0)
+	wall := <-done
+	t.Logf("celeris683 METRICS: Metrics() took %v while the switch waited (Workers %d); the switch took %v", took, m.Workers, wall)
+	if wall < delay/2 {
+		t.Fatalf("celeris683 PREMISE: the switch took %v, it did not wait for the late engine (delay %v)", wall, delay)
+	}
+	if m.Workers == 0 {
+		t.Errorf("celeris683 METRICS: Metrics() read no sub-engine (Workers 0)")
+	}
+	if took > delay/4 {
+		t.Errorf("celeris683 METRICS: Metrics() took %v during the switch's wait (delay %v): "+
+			"the wait holds the lock Metrics() takes", took, delay)
+	}
+	if got := e.ActiveEngine().Type(); got != engine.Epoll {
+		t.Errorf("the switch left %v active, want epoll", got)
+	}
+}
+
 // The kernel list the wait reads names a socket exactly when the process has
 // it open.
 func TestListenInodesSeesASocketOnlyWhileItListens683(t *testing.T) {
