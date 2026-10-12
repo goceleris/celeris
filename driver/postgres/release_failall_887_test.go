@@ -14,18 +14,21 @@ package postgres
 // The window is forced here without a hook in the driver: the test holds a
 // mutex of the request that failAll takes after it took the queue, runs the
 // caller's half in that gap, and only then lets failAll go on. Gated at chMu,
-// failAll's first access to the request, the test unlocks after the release, so
-// the release happens before everything failAll does next and the race
-// detector has nothing to report: those two tests assert what a recycled
+// the first lock failAll takes on the request (after its failPins and
+// streamErr stores, before closeRowCh), the test unlocks after the release, so
+// the release happens before everything failAll does next under chMu and the
+// race detector has nothing to report: those two tests assert what a recycled
 // request looks like (ctx reset, rowCh and colsCh never closed, err lost). The
 // third test gates at doneMu, failAll's last access, so failAll's chMu section
 // is not ordered after the release and the detector reports the release
 // against it on the pre-fix tree, besides the assertion. The -race -count run
-// of TestPgNetConnServerHangUp is the witness of the unforced order.
+// of TestPgNetConnServerHangUp and the ungated stress at the end of this file
+// are the witnesses of the unforced order.
 
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -37,9 +40,9 @@ import (
 // failAll takes), starts failAll on its own goroutine and returns once failAll
 // has taken the queue (so the caller's failReq can no longer find req in
 // pending). failAll then waits at gate until the returned release func runs;
-// wait blocks until failAll has returned. With gate = &req.chMu that is
-// failAll's first access to req (closeRowCh); with &req.doneMu it is its last
-// (fail).
+// wait blocks until failAll has returned. With gate = &req.chMu that is the
+// first lock failAll takes on req (in closeRowCh, after its pin and its
+// streamErr store); with &req.doneMu it is its last (fail).
 func c887Gated(t *testing.T, req *pgRequest, err error, gate sync.Locker) (c *pgConn, release func(), wait func()) {
 	t.Helper()
 	c = &pgConn{bridge: async.NewBridge()}
@@ -187,7 +190,10 @@ func TestReleaseWhileFailAllIsAboutToFailTheRequestDoesNotRecycleIt887(t *testin
 
 	// Give failAll time to run up to its fail() and park on doneMu (it has no
 	// observable arrival). The caller's half: the request is finished some
-	// other way and the caller releases it.
+	// other way and the caller releases it. finished is set by hand while the
+	// test holds doneMu, which fail() cannot do (it sets doneFlag before
+	// finished under doneMu): the combination is synthetic, only there to let
+	// releasePgRequest see a finished request while failAll is still to run.
 	time.Sleep(100 * time.Millisecond)
 	req.finished.Store(true)
 	releasePgRequest(req)
@@ -196,4 +202,71 @@ func TestReleaseWhileFailAllIsAboutToFailTheRequestDoesNotRecycleIt887(t *testin
 	}
 	release()
 	wait()
+}
+
+// The unforced order, without a gate: failAll on one goroutine; on another the
+// caller's failReq and releasePgRequest, then at once an acquire set up as the
+// next query (of another conn, since pgRequestPool is package-global; the same
+// P tends to get back the object just put). The old conn's failAll must
+// neither fail that request nor close its channels. On the pre-fix tree this
+// bleeds in a few of the iterations without -race and is reported by the
+// detector under it; on the fixed tree neither happens. It is a statistical
+// witness for the pin's window edges (a pin taken just after the queue lock
+// drops, an unpin before fail()), mostly under -race: a single run can miss
+// them, and a pin moved into the sweep loop is not caught by it either.
+func TestFailAllUngatedNeverTouchesTheNextQuery887(t *testing.T) {
+	const iters = 20000
+	boom := errors.New("old conn closed")
+	bleed, reused := 0, 0
+	for i := 0; i < iters; i++ {
+		req := acquirePgRequest()
+		req.kind = reqSimple
+		req.rowCh = make(chan [][]byte, 1)
+		req.colsCh = make(chan struct{})
+		c := &pgConn{bridge: async.NewBridge()}
+		c.enqueue(req)
+		var next *pgRequest
+		var nextRow chan [][]byte
+		var nextCols chan struct{}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); c.failAll(boom) }()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			c.failReq(req, errors.New("write on closed conn"))
+			releasePgRequest(req)
+			n := acquirePgRequest()
+			n.kind = reqSimple
+			nr, nc := make(chan [][]byte, 1), make(chan struct{})
+			n.chMu.Lock()
+			n.rowCh, n.colsCh = nr, nc
+			n.chMu.Unlock()
+			next, nextRow, nextCols = n, nr, nc
+		}()
+		wg.Wait()
+		if next == req {
+			reused++
+		}
+		touched := next.doneAtom.Load() != 0
+		select {
+		case <-nextRow:
+			touched = true
+		default:
+		}
+		select {
+		case <-nextCols:
+			touched = true
+		default:
+		}
+		if touched {
+			bleed++
+		}
+		next.finish()
+		releasePgRequest(next)
+	}
+	t.Logf("iterations=%d reused_same_object=%d cross_query_bleed=%d", iters, reused, bleed)
+	if bleed != 0 {
+		t.Errorf("the old conn's failAll failed or closed the next query's request in %d of %d iterations", bleed, iters)
+	}
 }

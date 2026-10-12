@@ -1513,7 +1513,10 @@ func (c *pgConn) failAll(err error) {
 	c.pending = nil
 	// Pin every request taken off the queue before the lock drops: from here
 	// on a caller's failReq no longer finds it in pending, fails it on its own
-	// and may release it while this sweep is still using it (failPins).
+	// and may release it while this sweep is still using it (failPins). The
+	// pin has to stay inside this pendingMu critical section: failReq takes
+	// the same lock to look for the request, so a pin moved below Unlock (or
+	// into the sweep loop) can land after a release that already recycled it.
 	for _, r := range queue {
 		if r != nil {
 			r.failPins.Add(1)
