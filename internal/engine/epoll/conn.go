@@ -136,6 +136,15 @@ type connState struct {
 	// Warm — timeout tracking:
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
+	// detectDeadline is the absolute time (UnixNano) by which the protocol
+	// must be detected: accept time + ReadHeaderTimeout, 0 for none (the
+	// protocol is fixed at accept, the conn was adopted, or ReadHeaderTimeout
+	// is off). It is not extended by a read, so a client that dribbles "GE" or
+	// the HTTP/2 preface cannot move it. checkTimeouts closes an undetected
+	// conn past it; initProtocol hands what is left of it to the H1 header
+	// deadline, so detection does not restart the budget. Loop thread only.
+	detectDeadline int64
+
 	// Cold — third cache line:
 	h1State      *conn.H1State
 	h2State      *conn.H2State
@@ -153,6 +162,15 @@ type connState struct {
 	// error, a refused write; celeris#761): the close it defers is the same.
 	peerClosed bool
 
+	// closeAckedKnown (see closeSince, below) and writeRefused (see its
+	// comment, below) are declared here, beside the other flag, and not with
+	// the fields they belong to: next to the 8-byte clocks they leave six
+	// bytes of padding each, which put connState across a Go size class
+	// (448 to 480 bytes) once detectDeadline was added, and the sweep of
+	// 4096 conns cost 7 to 12 percent more (RULE 74, BenchmarkCheckTimeouts865).
+	closeAckedKnown bool
+	writeRefused    bool
+
 	// closeSince, closePending and closeAcked are the clock of that deferred
 	// close (celeris#876): closeSince is when the engine last saw the close
 	// move forward, in nanoseconds, from the request that deferred it
@@ -166,11 +184,10 @@ type connState struct {
 	// else on it: lastActivity is the last READ, and a conn that is closing is
 	// no longer read. 0 when no deferred close is under way. Worker-thread-
 	// only; reset on release.
-	closeSince      int64
-	closePending    int
-	closeAcked      uint64
-	closeSampled    int64
-	closeAckedKnown bool
+	closeSince   int64
+	closePending int
+	closeAcked   uint64
+	closeSampled int64
 
 	// writeRefused records that response bytes were lost (celeris#761): a
 	// write hook refused them because the conn's backlog was already over
@@ -179,8 +196,7 @@ type connState struct {
 	// the handler closes the conn (closeWhenFlushed) instead of leaving the
 	// client waiting for bytes that will not come. Sticky until release.
 	// Written under detachMu when the conn has one, like the buffers it
-	// guards.
-	writeRefused bool
+	// guards. (Declared with peerClosed, above.)
 
 	// drainDeadline bounds how long checkTimeouts defers the idle-deadline
 	// reap of a truly-detached conn whose terminal bytes (SSE last event, WS
@@ -357,6 +373,7 @@ func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *con
 	cs.fd = fd
 	cs.ctx = ctx
 	cs.liveIdx = -1
+	cs.detectDeadline = 0
 	cs.writeBuf = cs.writeBuf[:0]
 	cs.writePos = 0
 	if cap(cs.buf) >= bufSize {
@@ -384,6 +401,7 @@ func releaseConnState(cs *connState) {
 	cs.protocol = 0
 	cs.detected = false
 	cs.detectN = 0
+	cs.detectDeadline = 0
 	cs.dirty = false
 	cs.epollOut = false
 	cs.pendingBytes = 0

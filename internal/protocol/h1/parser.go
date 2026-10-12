@@ -138,6 +138,15 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 
 func (p *Parser) parseRequestLine(req *Request) (bool, error) {
 	lineEnd := bytes.Index(p.buf[p.pos:], bCRLF)
+	if lineEnd == 0 {
+		// RFC 9112 section 2.2: a server SHOULD ignore at least one empty
+		// line received before the request line. One is skipped (a second is
+		// an empty request line, below) and counted in what the parse
+		// consumes. Callers re-parse an incomplete request from the head of
+		// the buffer, so the skip is repeated, never lost.
+		p.pos += 2
+		lineEnd = bytes.Index(p.buf[p.pos:], bCRLF)
+	}
 	if lineEnd == -1 {
 		// No CRLF yet. If what we have already exceeds the bound, the line is
 		// too long regardless of what follows — reject now rather than buffering

@@ -2442,7 +2442,8 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		w.initProtocol(cs)
 	} else if w.cfg.ReadHeaderTimeout > 0 {
 		// The protocol is decided by the first bytes, so there is no H1 state
-		// and no header deadline yet (initProtocol arms it at detection). The
+		// and no header deadline yet (initProtocol arms it at detection, at
+		// no later than this deadline). The
 		// conn gets the same absolute budget from accept: a client that sends
 		// "GE" and stalls, or dribbles the HTTP/2 preface, is reaped by
 		// checkTimeouts instead of living on the activity stamp each of its
@@ -2873,12 +2874,7 @@ func (w *Worker) initProtocol(cs *connState) {
 		if !w.async {
 			cs.h1State.OnHeaderDeadlineArmed = func() { w.armHeaderTimer(cs) }
 		}
-		cs.h1State.ArmHeaderDeadline()
 		if w.async {
-			// Direct worker-thread arm for the initial deadline; the
-			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
-			// only stamped HeaderDeadlineNs, not the SQE.
-			w.armHeaderTimer(cs)
 			// Per-handler async (celeris #300): wire the route resolver so
 			// ProcessH1, when run inline on the worker (InlineMode), can
 			// detect an async route and bail to the dispatch goroutine.
@@ -3199,6 +3195,22 @@ func (w *Worker) initProtocol(cs *connState) {
 				return w.hijackConn(cs.fd)
 			}
 		}
+		// The header deadline is armed last. A conn that had to be detected
+		// carries the deadline it was given at accept (detectDeadline): the
+		// first request's budget counts from accept, so the H1 deadline is
+		// armed at what is left of it, and the timer fires then. 0 for a conn
+		// whose protocol was fixed at accept, or adopted, which arms the full
+		// budget. When what is left is nothing, the arm closes the conn
+		// (armHeaderTimerAt), and everything above has been set by then, so
+		// the close is the last thing initProtocol does to the conn; the
+		// caller (handleRecv) sees it as w.conns[fd] != cs || cs.closing.
+		cs.h1State.ArmHeaderDeadlineAt(cs.detectDeadline)
+		if w.async {
+			// Direct worker-thread arm for the initial deadline; the
+			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
+			// only stamped HeaderDeadlineNs, not the SQE.
+			w.armHeaderTimer(cs)
+		}
 	case engine.H2C:
 		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, w.wakeFD)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
@@ -3292,6 +3304,18 @@ func (w *Worker) closeOnRecvEnd(fd int, cs *connState, err error) {
 		mu.Unlock()
 	}
 	w.closeConn(fd)
+}
+
+// dropUndecided lets go of what a conn whose detection branch ended in a close
+// holds: the accumulated prefix (a pooled connState never holds the array of a
+// conn that has gone) and the provided buffer its deciding recv arrived in,
+// which goes back to the ring. A buffer dropped is gone for good, and a
+// worker's ring that has lost all of them answers no recv.
+func (w *Worker) dropUndecided(cs *connState, hasProvidedBuf bool, providedBufID uint16) {
+	cs.detectAccum = nil
+	if hasProvidedBuf {
+		w.bufRing.ReturnBuffer(providedBufID)
+	}
 }
 
 func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
@@ -3534,10 +3558,38 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.closeConn(fd)
 			return
 		}
+		// The budget the conn was given at accept (detectDeadline, which
+		// initProtocol hands on to the H1 header deadline) is spent when the
+		// deciding recv comes after it: close here, before the H1 state
+		// exists, rather than arm a deadline that has passed (the arm closes
+		// the conn from inside initProtocol, under this function's feet) or
+		// serve a request that finished late. The sweep that would catch it
+		// runs every 32 iterations, so this recv can be the first to see it.
+		// A fresh clock reading: the cached now is up to 60 ms old.
+		hook := detectStageHook.Load()
+		if hook != nil {
+			(*hook)(w, cs, detectBeforeBudgetCheck)
+		}
+		if dd := cs.detectDeadline; dd > 0 && time.Now().UnixNano() > dd {
+			w.dropUndecided(cs, hasProvidedBuf, providedBufID)
+			w.closeConn(fd)
+			return
+		}
+		if hook != nil {
+			(*hook)(w, cs, detectAfterBudgetCheck)
+		}
 		cs.protocol.Store(int32(proto))
 		cs.detected = true
-		cs.detectDeadline = 0
 		w.initProtocol(cs)
+		// initProtocol arms the header timer last, and the arm closes the
+		// conn when the deadline passed between the check above and the arm.
+		// closeConn queues cs for release and does not release it
+		// (queuePendingReleaseFD), so cs is still ours to let go of here.
+		if w.conns[fd] != cs || cs.closing {
+			w.dropUndecided(cs, hasProvidedBuf, providedBufID)
+			return
+		}
+		cs.detectDeadline = 0
 		// If we accumulated across recvs, hand the FULL accumulated prefix
 		// (not just this last recv) to the protocol handler below: the
 		// accumulated bytes, then what of this recv Detect did not need.

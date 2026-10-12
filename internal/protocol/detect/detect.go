@@ -24,15 +24,24 @@ var (
 // Detect examines the initial bytes of a connection and returns the detected protocol.
 //
 // Detection logic:
-//  1. If len(buf) < 4, return ErrInsufficientData.
-//  2. If first 4 bytes are "PRI ", this may be HTTP/2. Need 24 bytes total.
+//  1. If the first two bytes are CRLF, return engine.HTTP1 at once, whatever
+//     follows. RFC 9112 section 2.2: a server SHOULD ignore at least one empty
+//     line received before the request line, and the HTTP/1 parser does. The
+//     decision does not depend on the bytes after the CRLF, so what detection
+//     can hold stays under PrefaceLen.
+//  2. If len(buf) < 4, return ErrInsufficientData.
+//  3. If first 4 bytes are "PRI ", this may be HTTP/2. Need 24 bytes total.
 //     If we have 24 bytes and they match ClientPreface -> engine.H2C
 //     If we have < 24 bytes -> ErrInsufficientData (need more data)
 //     If 24 bytes don't match -> ErrUnknownProtocol
-//  3. If first byte is a known HTTP method start character -> engine.HTTP1
-//  4. Otherwise -> ErrUnknownProtocol
+//  4. If first byte starts a method of the IANA HTTP Method Registry ->
+//     engine.HTTP1
+//  5. Otherwise -> ErrUnknownProtocol
 func Detect(buf []byte) (engine.Protocol, error) {
 	if len(buf) < MinPeekBytes {
+		if len(buf) >= 2 && buf[0] == '\r' && buf[1] == '\n' {
+			return engine.HTTP1, nil
+		}
 		return 0, ErrInsufficientData
 	}
 
@@ -52,14 +61,27 @@ func Detect(buf []byte) (engine.Protocol, error) {
 		return engine.HTTP1, nil
 	}
 
+	// An empty line before the request line (RFC 9112 section 2.2).
+	if buf[0] == '\r' && buf[1] == '\n' {
+		return engine.HTTP1, nil
+	}
+
 	return 0, ErrUnknownProtocol
 }
 
-// isHTTPMethodByte returns true if b is the first byte of a known HTTP method.
-// GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH, TRACE, CONNECT
+// isHTTPMethodByte returns true if b is the first byte of a method in the IANA
+// HTTP Method Registry (https://www.iana.org/assignments/http-methods): ACL,
+// BASELINE-CONTROL, BIND, CHECKIN, CHECKOUT, CONNECT, COPY, DELETE, GET, HEAD,
+// LABEL, LINK, LOCK, MERGE, MKACTIVITY, MKCALENDAR, MKCOL, MKREDIRECTREF,
+// MKWORKSPACE, MOVE, OPTIONS, ORDERPATCH, PATCH, POST, PROPFIND, PROPPATCH,
+// PUT, QUERY, REBIND, REPORT, SEARCH, TRACE, UNBIND, UNCHECKOUT, UNLINK,
+// UNLOCK, UPDATE, UPDATEREDIRECTREF and VERSION-CONTROL ("PRI" is read as the
+// start of the HTTP/2 preface before this is asked). net/http accepts any
+// token as a method; a first letter outside this set (E F I J K N W X Y Z, a
+// digit, a control byte such as a TLS record header) is not HTTP for Auto mode.
 func isHTTPMethodByte(b byte) bool {
 	switch b {
-	case 'G', 'P', 'H', 'D', 'O', 'T', 'C':
+	case 'A', 'B', 'C', 'D', 'G', 'H', 'L', 'M', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V':
 		return true
 	}
 	return false

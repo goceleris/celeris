@@ -33,7 +33,8 @@ import (
 // the connection is closed, and the heap does not grow with what was sent.
 // Then the pre-detection deadline: a client that sends "GE" and stalls, one
 // that dribbles the HTTP/2 preface, and one that sends nothing, must be
-// reaped by ReadHeaderTimeout, which counts from accept.
+// reaped by ReadHeaderTimeout, which counts from the engine's accept (the first
+// byte where TCP_DEFER_ACCEPT is on).
 
 // garbageChunk974 is one write of the flood; the flood is garbageChunks974 of
 // them. The base build keeps all of it (the E5 probe measured +146 MiB of heap
@@ -72,13 +73,13 @@ func (e engine974) env974(t *testing.T) {
 	}
 }
 
-// deadlineEngines974 leaves epoll out: its first-bytes state is not under any
-// header deadline either (it reaps a silent or stalled undetected connection
-// only at ReadTimeout or IdleTimeout), which this change does not touch. It is
-// listed in the PR body of celeris#974 and tracked in the epoll polish
-// checklist (celeris#885, "no header deadline before protocol detection");
-// add epoll here when that is fixed.
-var deadlineEngines974 = []engine974{{"std", celeris.Std, false, false}, {"io_uring", celeris.IOUring, false, false}, {"io_uring-async", celeris.IOUring, true, false}}
+// deadlineEngines974 are the engines whose first-bytes state is under
+// ReadHeaderTimeout from accept: std (net/http reads the request line under
+// its own header deadline), io_uring, and epoll (a detectDeadline set at
+// accept and swept in checkTimeouts), each with its AsyncHandlers arm where
+// the engine has one.
+var deadlineEngines974 = []engine974{{"std", celeris.Std, false, false}, {"epoll", celeris.Epoll, false, false}, {"io_uring", celeris.IOUring, false, false},
+	{"epoll-async", celeris.Epoll, true, false}, {"io_uring-async", celeris.IOUring, true, false}}
 
 func heapAfterGC974() uint64 {
 	runtime.GC()
