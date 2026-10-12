@@ -308,8 +308,11 @@ func (c *driverConn) setEvents(epfd int, in bool) {
 // the goroutine with runtime.Goexit, this re-arms EPOLLIN and lets go of
 // recvMu as the call would have, so the conn is not left masked and locked: the
 // worker would keep a busy turn of it queued for good and never read its bytes
-// again (celeris#887 item 17). A panic that the caller recovers is therefore
-// a failed call, not a dead conn.
+// again (celeris#887 item 17). At this layer a panic that the caller recovers
+// is therefore a failed call, not a dead conn. The in-tree drivers hold their
+// own writerMu across the call and release it with a plain Unlock, so for them
+// the conn stays wedged, on writerMu now rather than on recvMu (listed on
+// celeris#887).
 func (c *driverConn) releaseOnExit(epfd int, released *bool) {
 	if *released {
 		return
@@ -691,7 +694,9 @@ func (w *worker) errorClose(c *driverConn, err error) {
 //     beforeRearm) that panics, or ends the goroutine with runtime.Goexit,
 //     leaves the conn as the call would have: EPOLLIN is re-armed and recvMu
 //     is released (celeris#887). The call itself is not completed; the caller
-//     that recovers the panic should treat the conn as failed.
+//     that recovers the panic should treat the conn as failed. The in-tree
+//     drivers hold their writerMu across the call with a plain Unlock, so their
+//     conn stays blocked on it after such a panic.
 //   - Edge-triggered epoll: we drain to EAGAIN inside WriteAndPoll, so no
 //     stale edge is left. After EPOLLIN is re-armed, the next kernel-buffer
 //     arrival fires a fresh edge.
@@ -1407,20 +1412,28 @@ func (w *worker) serveReadQ(owed int) {
 		q[i] = nil
 		events, fresh := c.readEvents, c.readFresh
 		c.readQueued, c.readFresh, c.readBusy, c.readEvents = false, false, false, 0
-		if !c.recvMu.TryLock() {
-			if h := testHookQueuedTurnBusy; h != nil {
-				h(c.fd, fresh)
-			}
-			if fresh {
-				w.queueBusyTurn(c, events)
-			}
-			continue
-		}
-		w.readTurnLocked(c, events)
-		c.recvMu.Unlock()
+		w.serveQueuedTurn(c, events, fresh)
 	}
 	clear(q[owed:])
 	w.readQNext = q[:0]
+}
+
+// serveQueuedTurn is one conn's turn of serveReadQ. The unlock of recvMu is
+// deferred, as readTurn's is: an onRecv that ends the worker goroutine with
+// runtime.Goexit (celeris#887 item 18) must not leave the lock held by a dead
+// goroutine, or a later WriteAndPoll* on the conn would wait for it for good.
+func (w *worker) serveQueuedTurn(c *driverConn, events uint32, fresh bool) {
+	if !c.recvMu.TryLock() {
+		if h := testHookQueuedTurnBusy; h != nil {
+			h(c.fd, fresh)
+		}
+		if fresh {
+			w.queueBusyTurn(c, events)
+		}
+		return
+	}
+	defer c.recvMu.Unlock()
+	w.readTurnLocked(c, events)
 }
 
 // queueBusyTurn owes c, whose recvMu a WriteAndPoll* call holds, the turn of
