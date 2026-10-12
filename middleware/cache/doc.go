@@ -58,7 +58,7 @@
 // max-age="60" and max-age= are not stored.
 //
 // A Cache-Control value that is not a comma-separated list of directives
-// (private; max-age=0, max-age=60 private, a quote that never closes) is not
+// (public; max-age=3600, max-age = 60, a quote that never closes) is not
 // stored either: a value the cache cannot read with certainty is not guessed
 // at, because a wrong guess would serve one user's response to another.
 //
