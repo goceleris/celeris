@@ -48,6 +48,7 @@ func TestCacheControlSetsTheStoredTTL888(t *testing.T) {
 		{`max-age="0"`, 0},
 		{"max-age=60, max-age=abc", 0},
 		{"max-age=abc, max-age=60", 0},
+		{"max-age=60, max-age=0", 0}, // any max-age=0, not only the first
 		{"max-age=05", 5 * time.Second},
 		{"foo=, max-age=5", 5 * time.Second}, // "name=" stays stored for the other names
 		{"x-max-age=0", cfgTTL},

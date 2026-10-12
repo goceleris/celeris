@@ -235,7 +235,7 @@ func TestCacheControlFloorAgainstMain888(t *testing.T) {
 		raw := b.String()
 		wire := refStrip(raw) // what reaches the cache through SetHeader
 		for _, v := range []string{raw, wire} {
-			if !(refMainRefuses(v) || refMainRefuses(refLowerASCII(v))) {
+			if !refMainRefuses(v) && !refMainRefuses(refLowerASCII(v)) {
 				continue
 			}
 			if headStores(v) {

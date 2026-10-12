@@ -63,9 +63,10 @@ var malformedCC888 = []string{
 	"max-age=60, private;",
 }
 
-// wellFormedCC888 are the controls: values that parse, with the reading they
-// had before this round (no-store/private/no-cache/max-age=0 not stored, max-age
-// the TTL, a quoted string or a longer name hides nothing).
+// wellFormedCC888 are the controls: values that parse as a list (no-store,
+// private, no-cache, max-age=0 and an invalid max-age not stored, max-age the TTL,
+// a longer name is not a shorter one). Since round 5 the rows that hold "private"
+// or "no-store" are not stored whatever they say (the floor).
 var wellFormedCC888 = []struct {
 	cc        string
 	noStore   bool
@@ -152,8 +153,8 @@ func refTchar(b byte) bool {
 // 1#directive, directive = token ["=" (token / quoted-string)], with the list
 // syntax of RFC 9110 5.6.1: empty elements and blanks around the commas are
 // allowed). ok is false for a value that is not a list of directives. The one
-// leniency, shared with the implementation and with the max-age= row of
-// TestCacheControlSetsTheStoredTTL888: "name=" with an empty unquoted value.
+// leniency, shared with the implementation: "name=" with an empty unquoted
+// value (refDecision then refuses it for max-age, whose argument is 1*DIGIT).
 func refCC(s string) (dirs [][2]string, ok bool) {
 	i := 0
 	ows := func() {
