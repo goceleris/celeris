@@ -185,6 +185,20 @@ func (p *Pool) CopyFrom(ctx context.Context, tableName string, columns []string,
 // returning a non-nil error from dest terminates the copy — the server
 // continues to stream bytes until ReadyForQuery, so the conn remains usable
 // on return.
+//
+// dest does not run on the goroutine that called CopyTo. It runs where the
+// conn's bytes are read: on the event-loop worker goroutine that owns the conn
+// (which serves every other conn on that worker too), or on the conn's reader
+// goroutine in direct mode. So dest must return quickly and must not block:
+// while it runs, no other conn on the worker is read. It must not call
+// runtime.Goexit either (a test's t.FailNow or t.SkipNow, or a library that
+// does): that ends the worker goroutine and every conn on it is never read
+// again. The event loop logs an error when that happens (through slog.Default
+// for the drivers' own loop, through the server's Logger for an engine's). A
+// panic in dest is
+// not recovered and ends the process. To do slow or fallible work with a row,
+// copy it and hand it to another goroutine, or report failure by returning an
+// error.
 func (p *Pool) CopyTo(ctx context.Context, query string, dest func(row []byte) error) error {
 	c, err := p.acquire(ctx)
 	if err != nil {
