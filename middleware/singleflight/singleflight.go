@@ -105,17 +105,31 @@ func New(config ...Config) celeris.HandlerFunc {
 		// 206 part) answers that Range, which the key does not include, so a
 		// leader's part would be handed to requests for the whole
 		// representation, and a ranged request waiting on a full one gets
-		// more than it asked for (celeris#832). With a custom KeyFunc a
-		// conditional request is not coalesced either: its response (a 304 or
-		// a 412) answers its validator, which that key may not include
-		// (celeris#912). The default key includes the validators, so there
-		// GET and HEAD requests that send the same ones are coalesced
-		// (celeris#888 item 23); a conditional write never is.
-		if answersItsOwnHeaders(c, customKey) {
+		// more than it asked for (celeris#832).
+		if c.Header("range") != "" {
 			return c.Next()
 		}
-
-		key := keyFunc(c)
+		var key string
+		if customKey {
+			// A conditional request is not coalesced under a custom KeyFunc
+			// either: its response (a 304 or a 412) answers its validator,
+			// which that key may not include (celeris#912).
+			if hasPrecondition(c) {
+				return c.Next()
+			}
+			key = keyFunc(c)
+		} else {
+			// The default key includes the validators, so GET and HEAD
+			// requests that send the same ones are coalesced (celeris#888
+			// item 23). A conditional write never is: its handler is the
+			// update, and a request that took another's response instead
+			// would lose it and never get its own 412.
+			var conditional bool
+			key, conditional = defaultKey(c)
+			if conditional && !safeToCoalesce(c.Method()) {
+				return c.Next()
+			}
+		}
 
 		g.mu.Lock()
 		if entry, ok := g.m[key]; ok {
@@ -255,27 +269,10 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 }
 
-// answersItsOwnHeaders reports a request whose response answers one of its
-// own headers that the key does not include, or that must run, so it must not
-// be coalesced: a Range (the 206 part, celeris#832); a precondition when the
-// key is a custom one (If-None-Match and If-Modified-Since give a 304,
-// If-Match and If-Unmodified-Since a 412, celeris#912), because that key may
-// not include the validator; and, whatever the key, a precondition on a
-// method other than GET and HEAD. The default key holds the four
-// preconditions, so a GET or HEAD revalidation that sends the same one is
-// coalesced (celeris#888 item 23), but a conditional write (a PUT or POST
-// with If-Match, say) is not a revalidation: its handler is the update, and
-// a request that took another's response instead would lose its update and
-// never get its own 412. If-Range applies only with a Range.
-func answersItsOwnHeaders(c *celeris.Context, customKey bool) bool {
-	if c.Header("range") != "" {
-		return true
-	}
-	if !customKey {
-		if m := c.Method(); m == "GET" || m == "HEAD" {
-			return false
-		}
-	}
+// hasPrecondition reports a request that carries one of the four
+// preconditions (If-None-Match and If-Modified-Since give a 304, If-Match and
+// If-Unmodified-Since a 412, celeris#912). If-Range applies only with a Range.
+func hasPrecondition(c *celeris.Context) bool {
 	for _, v := range keyValidators {
 		if c.Header(v.header) != "" {
 			return true
@@ -283,6 +280,12 @@ func answersItsOwnHeaders(c *celeris.Context, customKey bool) bool {
 	}
 	return false
 }
+
+// safeToCoalesce reports a method whose conditional requests the default key
+// may coalesce: GET and HEAD, whose handler only reads, so a request that
+// sends the leader's validator gets the leader's answer. For any other method
+// a precondition marks a write guarded by it (a PUT with If-Match).
+func safeToCoalesce(method string) bool { return method == "GET" || method == "HEAD" }
 
 // captureVary records, for each request header the leader's response names
 // in Vary (entry.headers, the waiters' copy), the leader's value for it, in

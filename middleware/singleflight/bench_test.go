@@ -121,8 +121,8 @@ func BenchmarkDefaultKeyLongAcceptEncoding(b *testing.B) {
 
 // BenchmarkSingleflightMissPost is the miss path of a POST with the default
 // key (an unconditional write still coalesces on main and here; Skip it): the
-// bypass check looks at the four preconditions for any method but GET and
-// HEAD, and the key looks at them again.
+// key reads the four preconditions, and a conditional write is told from them
+// in the same pass.
 func BenchmarkSingleflightMissPost(b *testing.B) {
 	opts := []celeristest.Option{celeristest.WithHandlers(New(), func(c *celeris.Context) error {
 		return c.Blob(200, "text/plain", []byte("hello"))

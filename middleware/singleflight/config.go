@@ -85,6 +85,15 @@ var keyValidators = [...]struct{ header, label string }{
 }
 
 func defaultKeyFunc(c *celeris.Context) string {
+	key, _ := defaultKey(c)
+	return key
+}
+
+// defaultKey is the default key, and whether the request carries one of the
+// four preconditions. The middleware needs both and the key reads the
+// preconditions anyway, so one pass over the headers serves the key and the
+// bypass of a conditional write.
+func defaultKey(c *celeris.Context) (key string, conditional bool) {
 	m := c.Method()
 	p := c.Path()
 	rq := c.RawQuery()
@@ -104,6 +113,9 @@ func defaultKeyFunc(c *celeris.Context) string {
 	var val [len(keyValidators)]string
 	for i, v := range keyValidators {
 		val[i] = c.Header(v.header)
+		if val[i] != "" {
+			conditional = true
+		}
 	}
 
 	var q string
@@ -141,7 +153,7 @@ func defaultKeyFunc(c *celeris.Context) string {
 		}
 	}
 	if n == len(m)+1+len(p) {
-		return m + "\x00" + p
+		return m + "\x00" + p, false
 	}
 	var b strings.Builder
 	b.Grow(n)
@@ -171,5 +183,5 @@ func defaultKeyFunc(c *celeris.Context) string {
 			b.WriteString(v)
 		}
 	}
-	return b.String()
+	return b.String(), conditional
 }
