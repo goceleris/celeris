@@ -40,9 +40,10 @@ type Hijacker interface {
 // inline handler ends that loop for good, and the engine logs one Error, "...
 // goroutine ended without returning" (celeris#848). The stream gets no
 // response, and neither do the other streams of the connection or the other
-// connections of that loop. A panic is recovered here and the stream is
-// closed without a response; through the celeris router a panic is a 500
-// first.
+// connections of that loop. A panic is recovered here, the stream is
+// closed without a response, and Processor.OnHandlerPanic is told of it (an
+// engine that sets conn.H2Config.Logger logs an Error through it, and the
+// processor counts it); through the celeris router a panic is a 500 first.
 //
 // A stream runs on the h2 worker pool in these two cases only: its route is
 // async, or its connection already holds OutboundBudget bytes of response

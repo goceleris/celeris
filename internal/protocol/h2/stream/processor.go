@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -167,9 +168,10 @@ type Processor struct {
 	// first, so only a panic out of the router itself, a response writer or
 	// middleware outside it gets here): the stream's id, the panic value and
 	// the stack at the recover. It runs on the goroutine that ran the handler
-	// (the event loop, for an inline one), after the stream has been given up
-	// and before its slot is freed, so it must not block. A panic in the hook
-	// itself is recovered and dropped. Set it before the first frame.
+	// (the event loop, for an inline one), first thing in the handler's
+	// deferred cleanup and before the stream is retired, so it must not block.
+	// A panic in the hook itself is recovered and dropped. Set it before the
+	// first frame.
 	OnHandlerPanic func(streamID uint32, r any, stack []byte)
 	handlerPanics  atomic.Uint64 // panics that reached the recover, hook or not
 
@@ -248,7 +250,16 @@ func (p *Processor) HandlerPanics() uint64 { return p.handlerPanics.Load() }
 // tells OnHandlerPanic. It runs inside the deferred recover of the handler's
 // goroutine, so the stack still holds the panic's frames.
 func (p *Processor) handlerPanicked(id uint32, r any) {
-	_, _ = id, r // not recorded yet
+	p.handlerPanics.Add(1)
+	hook := p.OnHandlerPanic
+	if hook == nil {
+		return
+	}
+	// The hook is somebody else's code, running in a deferred function that
+	// nothing above recovers: on the event loop, a panic out of it would end
+	// the process.
+	defer func() { _ = recover() }()
+	hook(id, r, debug.Stack())
 }
 
 // PoolHandlersRunning reports whether a stream of this connection has a
@@ -1063,7 +1074,7 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			_ = r
+			p.handlerPanicked(stream.ID, r)
 		}
 
 		if stream.Data != nil {
@@ -1170,8 +1181,8 @@ func (p *Processor) executeHandler(stream *Stream) {
 	// the connection (celeris#759).
 	defer p.poolRunning.Add(-1)
 	defer func() {
-		if r := recover(); r != nil {
-			_ = r // last-resort panic recovery
+		if r := recover(); r != nil { // last-resort panic recovery
+			p.handlerPanicked(stream.ID, r)
 		}
 
 		// Eagerly release the input buffer now that the handler is done.
