@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,16 @@ type H2Config struct {
 	// wrapping os.ErrDeadlineExceeded. The engines pass the server's
 	// WriteTimeout. 0 = no bound.
 	WriteTimeout time.Duration
+	// Logger, when set, receives an Error record for each panic that escapes
+	// an HTTP/2 stream's handler (the celeris router answers a handler's
+	// panic with a 500 first, so this is a panic out of the router itself or
+	// of something outside it). The stream is dropped without a response or
+	// an RST_STREAM, as before, and the connection goes on. The record is
+	// written on the goroutine that ran the handler, which for an inline
+	// stream is the event loop with the connection's H2State lock held, so a
+	// slow log sink stalls the loop for each such panic. An
+	// engine may pass its own logger; none does yet. Nil logs nothing.
+	Logger *slog.Logger
 }
 
 // withDefaults returns a copy of cfg with zero fields set to RFC 7540 defaults.
@@ -567,6 +578,15 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	// write queue, behind the stream's HEADERS (celeris#903).
 	proc.SetOutboundSink(s.adapter.sendDataFromLoop)
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
+	if lg := cfg.Logger; lg != nil {
+		proc.OnHandlerPanic = func(id uint32, r any, stack []byte) {
+			lg.Error("h2 handler panicked",
+				"stream", id,
+				"panic", panicText(r),
+				"stack", string(stack),
+			)
+		}
+	}
 	mgr := proc.GetManager()
 	mgr.SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
 	// Tell the manager what we'll advertise in SETTINGS so inbound frame-size
@@ -601,6 +621,19 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	s.parser = p
 
 	return s
+}
+
+// panicText formats a panic value for a log record. fmt recovers a panic out
+// of the value's Error or String method, but only one level deep; the second
+// level is recovered here, and the type name stands in for the text (the
+// engines' abortAsyncHandler does the same, celeris#844).
+func panicText(r any) (msg string) {
+	defer func() {
+		if recover() != nil {
+			msg = fmt.Sprintf("%T (its Error or String method panicked)", r)
+		}
+	}()
+	return fmt.Sprint(r)
 }
 
 // NewH2StateFromUpgrade constructs an H2State that has already absorbed

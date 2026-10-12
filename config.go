@@ -140,6 +140,19 @@ type Config struct {
 	// a large download or a chunked body written with [Context.StreamWriter]
 	// without Detach, stays under WriteTimeout as an absolute deadline for the
 	// whole response: raise it or set -1 for such routes.
+	//
+	// With -1, an HTTP/2 response that has to wait for the client's
+	// flow-control window has no deadline either on epoll, io_uring and
+	// adaptive: a handler that the connection's buffering budget (4 MiB) makes
+	// wait stays blocked until the client grants window (WINDOW_UPDATE) or the
+	// connection closes, so a stalled HTTP/2 client can hold a stream (and its
+	// handler) for as long as it keeps the connection open. A synchronous
+	// handler that waits for such a handler, for example one that needs a lock
+	// the waiting handler holds across its response write, holds its event
+	// loop; if that loop also owns the slow client's connection, it never
+	// sees the WINDOW_UPDATE or the close, the wait never ends, and Shutdown
+	// cannot stop the server. std recovers once the client closes. Keep
+	// WriteTimeout finite when handlers share locks across response writes.
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
 	// Zero uses the default (600s). Set to -1 for no timeout.

@@ -237,6 +237,18 @@ func (s *Stream) awaitSendWindow(m *Manager, done <-chan struct{}, deadline time
 			m.notifySendWindow()
 		})
 		defer t.Stop()
+		// The timer is armed per wait, not once per response (celeris#889
+		// item 7; kept on purpose). A response only waits when the peer
+		// withholds window, and a reader that is over the connection's
+		// outbound budget with its stream windows open, the connection window
+		// being the bottleneck, waits once per chunk, so it arms and stops this
+		// timer once per connection WINDOW_UPDATE: about 0.6 us of CPU for
+		// each, with one waiter (#906's measurement, recorded in #892; not
+		// remeasured here). Arming it once in the caller (sendRest) and passing
+		// the expiry flag down would save that, at the price of giving the timer,
+		// and its Stop on every exit of every caller, to code that does not own
+		// the wait. The cost is paid only while a handler waits for a peer that
+		// withholds window, and no more than MAX_CONCURRENT_STREAMS of them can.
 	}
 	for {
 		ch := m.sendWindowChan()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,8 +23,11 @@ type ContinuationState struct {
 	// ones included (maxContinuationFrames).
 	continuations int
 	// priority is the PRIORITY field of the HEADERS frame that started the
-	// block (nil: it had none); it applies when the block is admitted.
-	priority *headerPriority
+	// block, when hasPriority says it had one; it applies when the block is
+	// admitted. It is held by value: a pointer here was one heap allocation
+	// per split block that carried the flag (celeris#889).
+	priority    headerPriority
+	hasPriority bool
 }
 
 var headersSlicePoolIn = sync.Pool{New: func() any { s := make([][2]string, 0, 16); return &s }}
@@ -158,6 +162,19 @@ type Processor struct {
 	InlineCount          uint64          // number of requests handled inline (for metrics)
 	MaxRequestBodySize   int64           // 0 = use default (100 MB)
 
+	// OnHandlerPanic, when set, is told of a panic that escaped a stream's
+	// handler and reached the last-resort recover of executeHandlerInline or
+	// executeHandler (the celeris router answers a handler's panic with a 500
+	// first, so only a panic out of the router itself, a response writer or
+	// middleware outside it gets here): the stream's id, the panic value and
+	// the stack at the recover. It runs on the goroutine that ran the handler
+	// (the event loop, for an inline one), first thing in the handler's
+	// deferred cleanup and before the stream is retired, so it must not block.
+	// A panic in the hook itself is recovered and dropped. Set it before the
+	// first frame.
+	OnHandlerPanic func(streamID uint32, r any, stack []byte)
+	handlerPanics  atomic.Uint64 // panics that reached the recover, hook or not
+
 	// asyncResolver, when set, lets per-stream dispatch honor the
 	// per-route .Async() flag: a stream whose route is async is forced
 	// onto the worker pool instead of running inline on the event loop.
@@ -222,6 +239,27 @@ type Processor struct {
 	// the wire is ignored (handleData), where DATA on any other closed stream
 	// is still a connection error. After refusedFields for the same reason.
 	resetIDs serverResets
+}
+
+// HandlerPanics is how many panics have escaped a stream's handler of this
+// connection to the last-resort recover (OnHandlerPanic). Safe from any
+// goroutine.
+func (p *Processor) HandlerPanics() uint64 { return p.handlerPanics.Load() }
+
+// handlerPanicked records a panic that escaped the handler of stream id, and
+// tells OnHandlerPanic. It runs inside the deferred recover of the handler's
+// goroutine, so the stack still holds the panic's frames.
+func (p *Processor) handlerPanicked(id uint32, r any) {
+	p.handlerPanics.Add(1)
+	hook := p.OnHandlerPanic
+	if hook == nil {
+		return
+	}
+	// The hook is somebody else's code, running in a deferred function that
+	// nothing above recovers: on the event loop, a panic out of it would end
+	// the process.
+	defer func() { _ = recover() }()
+	hook(id, r, debug.Stack())
 }
 
 // PoolHandlersRunning reports whether a stream of this connection has a
@@ -692,7 +730,7 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 		header := frame.Header()
 		if header.StreamID == expectingStreamID {
 			if _, isContinuation := frame.(*http2.ContinuationFrame); !isContinuation {
-				return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("non-CONTINUATION on stream expecting CONTINUATION"),
+				return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("non-CONTINUATION on stream expecting CONTINUATION"),
 					fmt.Errorf("received non-CONTINUATION frame on stream %d while expecting CONTINUATION", header.StreamID))
 			}
 		} else {
@@ -714,7 +752,7 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 	case *http2.DataFrame:
 		if header.Length > localMaxFrame {
 			if header.StreamID == 0 {
-				return p.GoAwayErr(0, http2.ErrCodeFrameSize, []byte("DATA frame too large"),
+				return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeFrameSize, []byte("DATA frame too large"),
 					fmt.Errorf("DATA frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, localMaxFrame))
 			}
 			_ = p.writer.WriteRSTStream(header.StreamID, http2.ErrCodeFrameSize)
@@ -723,7 +761,7 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 		}
 	case *http2.HeadersFrame:
 		if header.Length > localMaxFrame {
-			return p.GoAwayErr(0, http2.ErrCodeFrameSize, []byte("HEADERS frame too large"),
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeFrameSize, []byte("HEADERS frame too large"),
 				fmt.Errorf("HEADERS frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, localMaxFrame))
 		}
 	}
@@ -748,7 +786,7 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 	case *http2.ContinuationFrame:
 		return p.handleContinuation(ctx, f)
 	case *http2.PushPromiseFrame:
-		return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("client sent PUSH_PROMISE"),
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("client sent PUSH_PROMISE"),
 			fmt.Errorf("client sent PUSH_PROMISE frame"))
 	default:
 		return nil
@@ -1036,7 +1074,7 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			_ = r
+			p.handlerPanicked(stream.ID, r)
 		}
 
 		if stream.Data != nil {
@@ -1143,8 +1181,8 @@ func (p *Processor) executeHandler(stream *Stream) {
 	// the connection (celeris#759).
 	defer p.poolRunning.Add(-1)
 	defer func() {
-		if r := recover(); r != nil {
-			_ = r // last-resort panic recovery
+		if r := recover(); r != nil { // last-resort panic recovery
+			p.handlerPanicked(stream.ID, r)
 		}
 
 		// Eagerly release the input buffer now that the handler is done.
@@ -1342,7 +1380,9 @@ func (p *Processor) refuseStream(id uint32, block []byte) error {
 	// A block that does not decode is a connection error (COMPRESSION_ERROR).
 	// The GOAWAY names the last stream the server opened, not 0 (RFC 9113
 	// §6.8: 0 lets the client replay every request it has in flight), as the
-	// over-long header block site does.
+	// over-long header block site does. An idle PRIORITY placeholder is no
+	// stream the server opened and does not move that identifier
+	// (Manager.CreatePlaceholder, TestDecodeFailureGoAwayIgnoresPriorityPlaceholder889).
 	if _, err := p.hpackDecoder.Write(block); err != nil {
 		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -1388,6 +1428,9 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 	// A block that does not decode is a connection error (COMPRESSION_ERROR).
 	// The GOAWAY names the last stream the server opened, not 0, as refuseStream's
 	// does (RFC 9113 §6.8: 0 lets the client replay every request it has in flight).
+	// The stream of this block is open already (admitHeaders), so it is named too:
+	// the client takes it as possibly processed, which is the safe side. An idle
+	// PRIORITY placeholder is not named (Manager.CreatePlaceholder).
 	p.beginHeaderDecode(pooled, !trailers)
 	if _, err := p.hpackDecoder.Write(block); err != nil {
 		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeCompression, []byte("HPACK decoding failed"),
@@ -1457,20 +1500,20 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		if len(headerBlock) > p.headerListMax*headerBlockExpansion {
 			return p.headerBlockTooLarge(f.StreamID)
 		}
-		var prio *headerPriority
-		if hasPriority {
-			prio = &headerPriority{dependency: dependency, weight: weight, exclusive: exclusive}
-		}
 		frag := make([]byte, len(headerBlock))
 		copy(frag, headerBlock)
-		p.continuationStateMu.Lock()
-		p.continuationState = &ContinuationState{
+		cs := &ContinuationState{
 			streamID:      f.StreamID,
 			headerBlock:   frag,
 			endStream:     f.StreamEnded(),
 			expectingMore: true,
-			priority:      prio,
 		}
+		if hasPriority {
+			cs.priority = headerPriority{dependency: dependency, weight: weight, exclusive: exclusive}
+			cs.hasPriority = true
+		}
+		p.continuationStateMu.Lock()
+		p.continuationState = cs
 		p.continuationActive.Store(true)
 		p.continuationStateMu.Unlock()
 		return nil
@@ -1519,7 +1562,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 			p.manager.FlushWindowUpdates(p.writer, false)
 			return nil
 		}
-		return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("DATA on idle stream"),
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("DATA on idle stream"),
 			fmt.Errorf("DATA frame on idle stream %d", f.StreamID))
 	}
 
@@ -1577,7 +1620,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	if f.Increment == 0 {
 		if f.StreamID == 0 {
-			return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("WINDOW_UPDATE increment is 0"),
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("WINDOW_UPDATE increment is 0"),
 				fmt.Errorf("WINDOW_UPDATE with 0 increment"))
 		}
 		// RFC 7540 §6.9.1: zero increment on a stream is a stream error.
@@ -1590,7 +1633,7 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			oldWin := atomic.LoadInt32(&p.manager.connectionWindow)
 			newWin := int64(oldWin) + int64(f.Increment)
 			if newWin > 0x7fffffff {
-				return p.GoAwayErr(0, http2.ErrCodeFlowControl, []byte("connection window overflow"),
+				return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeFlowControl, []byte("connection window overflow"),
 					fmt.Errorf("connection window overflow: %d + %d > 2^31-1", oldWin, f.Increment))
 			}
 			//nolint:gosec // G115: safe conversion, newWin validated above
@@ -1869,7 +1912,7 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 // handlePing processes PING frames.
 func (p *Processor) handlePing(f *http2.PingFrame) error {
 	if f.Header().StreamID != 0 {
-		return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("PING on non-zero stream"),
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("PING on non-zero stream"),
 			fmt.Errorf("PING frame with non-zero stream id: %d", f.Header().StreamID))
 	}
 
@@ -1891,13 +1934,19 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 	if err != nil || cs == nil {
 		return err
 	}
-	// The block is complete: it is admitted as a HEADERS frame with
-	// END_HEADERS is (serveHeaderBlock), the stream-ID order, the
+	// The block is complete: serveHeaderBlock admits it as it admits a HEADERS
+	// frame with END_HEADERS, the stream-ID order, the
 	// MAX_CONCURRENT_STREAMS limit and the stream's state included. The
 	// stream is not created here: GetOrCreateStream checks none of them
 	// (celeris#981). cs is detached: continuationActive is already false, so
 	// canRunInline may pick the event loop, as it does for a plain HEADERS.
-	return p.serveHeaderBlock(f.StreamID, cs.endStream, cs.priority, cs.headerBlock)
+	// The field is passed by address into cs, which was heap allocated when the
+	// block began and is nobody else's now: no copy, no allocation.
+	var prio *headerPriority
+	if cs.hasPriority {
+		prio = &cs.priority
+	}
+	return p.serveHeaderBlock(f.StreamID, cs.endStream, prio, cs.headerBlock)
 }
 
 // appendContinuation adds a CONTINUATION fragment to the pending header
@@ -1908,12 +1957,12 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	defer p.continuationStateMu.Unlock()
 
 	if p.continuationState == nil || !p.continuationState.expectingMore {
-		return nil, p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("unexpected CONTINUATION"),
+		return nil, p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("unexpected CONTINUATION"),
 			fmt.Errorf("unexpected CONTINUATION frame on stream %d", f.StreamID))
 	}
 
 	if p.continuationState.streamID != f.StreamID {
-		return nil, p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("CONTINUATION on wrong stream"),
+		return nil, p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("CONTINUATION on wrong stream"),
 			fmt.Errorf("CONTINUATION frame on wrong stream: expected %d, got %d",
 				p.continuationState.streamID, f.StreamID))
 	}
@@ -2037,7 +2086,7 @@ func (p *Processor) GetStreamPriority(streamID uint32) int {
 func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error {
 	if len(payload) != 4 {
 		if streamID == 0 {
-			return p.GoAwayErr(0, http2.ErrCodeFrameSize, []byte("WINDOW_UPDATE wrong size"),
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeFrameSize, []byte("WINDOW_UPDATE wrong size"),
 				fmt.Errorf("WINDOW_UPDATE frame size %d, want 4", len(payload)))
 		}
 		_ = p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeFrameSize)
@@ -2048,7 +2097,7 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 
 	if increment == 0 {
 		if streamID == 0 {
-			return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("WINDOW_UPDATE increment is 0"),
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("WINDOW_UPDATE increment is 0"),
 				fmt.Errorf("WINDOW_UPDATE with 0 increment"))
 		}
 		_ = p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeProtocol)
@@ -2060,7 +2109,7 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 			oldWin := atomic.LoadInt32(&p.manager.connectionWindow)
 			newWin := int64(oldWin) + int64(increment)
 			if newWin > 0x7fffffff {
-				return p.GoAwayErr(0, http2.ErrCodeFlowControl, []byte("connection window overflow"),
+				return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeFlowControl, []byte("connection window overflow"),
 					fmt.Errorf("connection window overflow: %d + %d > 2^31-1", oldWin, increment))
 			}
 			//nolint:gosec // G115: safe conversion, newWin validated above
@@ -2138,7 +2187,7 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 // Payload must be exactly 8 bytes per RFC 7540 §6.7.
 func (p *Processor) HandleRawPing(flags byte, payload []byte) error {
 	if len(payload) != 8 {
-		return p.GoAwayErr(0, http2.ErrCodeFrameSize, []byte("PING wrong size"),
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeFrameSize, []byte("PING wrong size"),
 			fmt.Errorf("PING frame size %d, want 8", len(payload)))
 	}
 
