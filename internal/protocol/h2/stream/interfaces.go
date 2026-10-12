@@ -149,7 +149,11 @@ type Streamer interface {
 	WriteHeader(stream *Stream, status int, headers [][2]string) error
 	// Write sends a chunk of the response body. May be called multiple times.
 	Write(stream *Stream, data []byte) error
-	// Flush ensures buffered data is sent to the network.
+	// Flush asks the engine to send buffered data to the network; an
+	// implementation may do nothing (the HTTP/1.1 and HTTP/2 adapters of the
+	// native engines do nothing: what a Write queued goes out on the engine's
+	// schedule). It is a request, not a delivery guarantee, and a return from
+	// Flush does not mean the peer has the bytes.
 	Flush(stream *Stream) error
 	// Close signals end of the response body.
 	Close(stream *Stream) error
