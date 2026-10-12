@@ -17,20 +17,6 @@ import (
 	"github.com/goceleris/celeris/middleware/store"
 )
 
-// versionedSetter is implemented by a store that can apply a fill's write in
-// order: setIfNewer stores the value unless the key holds a live entry that a
-// fill of a newer generation wrote. A generation is the time a fill's handler
-// started (see genNow), so a fill that started later, which read the origin
-// later, is not overwritten by an earlier one whose Set lands after it: two
-// concurrent misses with DisableSingleflight, or a coalesced call that was
-// replaced once its result expired while its Set hung. [MemoryStore]
-// implements it. Any other store gets a plain Set: the order of two writes
-// that overlap is then the order the store applies them in (celeris#888
-// item 30).
-type versionedSetter interface {
-	setIfNewer(ctx context.Context, key string, value []byte, ttl time.Duration, gen uint64) error
-}
-
 // genBase is the origin of generations: time.Since reads the monotonic clock,
 // which a wall-clock step does not move, and, unlike a shared counter, costs
 // no cache-line transfer between cores on a busy miss path.
@@ -42,10 +28,21 @@ var genBase = time.Now()
 // generation, and then the later write wins.
 func genNow() uint64 { return uint64(time.Since(genBase)) + 1 }
 
-// storeFill writes a fill's encoded response, in order when the store can.
+// storeFill writes a fill's encoded response. The cache's own *MemoryStore
+// applies it in order: setIfNewer stores the value unless the key holds a live
+// entry that a fill of a newer generation wrote. A generation is the time a
+// fill's handler started (see genNow), so a fill that started later, which
+// read the origin later, is not overwritten by an earlier one whose write
+// lands after it: two concurrent misses with DisableSingleflight, or a
+// coalesced call that was replaced once its result expired while its Set hung.
+// Every other store gets a plain Set, whatever it embeds: a type that embeds
+// *MemoryStore and overrides Set (metrics, a write-through, compression) must
+// see its Set called, and an interface test would be satisfied by the
+// unexported method that embedding promotes. The order of two writes that
+// overlap is then the order that store applies them in (celeris#888 item 30).
 func storeFill(ctx context.Context, kv store.KV, key string, enc []byte, ttl time.Duration, gen uint64) error {
-	if vs, ok := kv.(versionedSetter); ok {
-		return vs.setIfNewer(ctx, key, enc, ttl, gen)
+	if ms, ok := kv.(*MemoryStore); ok {
+		return ms.setIfNewer(ctx, key, enc, ttl, gen)
 	}
 	return kv.Set(ctx, key, enc, ttl)
 }

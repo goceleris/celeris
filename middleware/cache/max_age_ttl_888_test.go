@@ -8,7 +8,8 @@ import (
 	"github.com/goceleris/celeris"
 )
 
-// ttlStore records the TTL of the last write a fill made.
+// ttlStore records the TTL of the last write a fill made (a fill into a store
+// that is not the cache's own MemoryStore is a plain Set).
 type ttlStore struct {
 	*MemoryStore
 	last time.Duration
@@ -17,14 +18,6 @@ type ttlStore struct {
 
 func (s *ttlStore) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	s.last, s.n = ttl, s.n+1
-	return s.MemoryStore.Set(ctx, key, value, ttl)
-}
-
-func (s *ttlStore) setIfNewer(ctx context.Context, key string, value []byte, ttl time.Duration, gen uint64) error {
-	s.last, s.n = ttl, s.n+1
-	if vs, ok := any(s.MemoryStore).(versioned888); ok {
-		return vs.setIfNewer(ctx, key, value, ttl, gen)
-	}
 	return s.MemoryStore.Set(ctx, key, value, ttl)
 }
 

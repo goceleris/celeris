@@ -13,11 +13,12 @@ type Config struct {
 	//
 	// Two fills of one key can overlap (concurrent misses with
 	// DisableSingleflight, or a coalesced call that was replaced once its
-	// result expired while its Set hung). [MemoryStore] applies each fill's
-	// write in order: an entry written by a fill whose handler started later
-	// is not replaced by an earlier fill's write that lands after it. Any
-	// other store gets plain Set calls, so the entry that remains is the one
-	// whose Set the store applied last.
+	// result expired while its Set hung). The cache's own [MemoryStore]
+	// applies each fill's write in order: an entry written by a fill whose
+	// handler started later is not replaced by an earlier fill's write that
+	// lands after it. Any other store, including a type that embeds
+	// *MemoryStore, gets plain Set calls (its own Set override runs), so the
+	// entry that remains is the one whose Set the store applied last.
 	Store store.KV
 
 	// TTL is the default cache entry lifetime. Default: 1 minute.

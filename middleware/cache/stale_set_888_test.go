@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,44 +17,28 @@ import (
 // started later read the origin later, so its entry is the fresher one, and
 // a Set from the earlier fill that lands after it must not replace it.
 
-// versioned888 is the ordered write the cache's own MemoryStore offers (the
-// production side declares it as versionedSetter): the test store forwards it,
-// or the test would only exercise the plain Set.
-type versioned888 interface {
-	setIfNewer(ctx context.Context, key string, value []byte, ttl time.Duration, gen uint64) error
-}
-
-// gateStore wraps a MemoryStore; before, when not nil, runs at the start of
-// each write (Set, or the ordered write), with the write's number.
-type gateStore struct {
-	*MemoryStore
-	before func(n int32)
-	n      atomic.Int32
-}
-
-func (s *gateStore) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	if n := s.n.Add(1); s.before != nil {
-		s.before(n)
+// gatedStore returns a MemoryStore that runs before at the start of each
+// fill's write, with the write's number (1 for the first). The hook is the
+// store's own (the ordered write is the cache's MemoryStore alone: a wrapper
+// would get plain Sets, see storeFill).
+func gatedStore(t *testing.T, before func(n int32)) *MemoryStore {
+	t.Helper()
+	kv := NewMemoryStore()
+	t.Cleanup(kv.Close)
+	var n atomic.Int32
+	kv.testHookFillWrite = func() {
+		if k := n.Add(1); before != nil {
+			before(k)
+		}
 	}
-	return s.MemoryStore.Set(ctx, key, value, ttl)
-}
-
-func (s *gateStore) setIfNewer(ctx context.Context, key string, value []byte, ttl time.Duration, gen uint64) error {
-	if n := s.n.Add(1); s.before != nil {
-		s.before(n)
-	}
-	if vs, ok := any(s.MemoryStore).(versioned888); ok {
-		return vs.setIfNewer(ctx, key, value, ttl, gen)
-	}
-	return s.MemoryStore.Set(ctx, key, value, ttl)
+	return kv
 }
 
 // TestCacheStaleFillDoesNotOverwriteFresherEntry888: without singleflight, a
 // request that missed first but whose handler finished last must not replace
 // the entry of the request that missed later and finished first.
 func TestCacheStaleFillDoesNotOverwriteFresherEntry888(t *testing.T) {
-	kv := &gateStore{MemoryStore: NewMemoryStore()}
-	t.Cleanup(kv.Close)
+	kv := gatedStore(t, nil)
 	entered, gate := make(chan struct{}), make(chan struct{})
 	var runs atomic.Int32
 	h := func(c *celeris.Context) error {
@@ -92,13 +75,12 @@ func TestCacheReplacedCallsHungSetDoesNotOverwriteTheNewerEntry888(t *testing.T)
 	inSet, releaseSet := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	t.Cleanup(func() { once.Do(func() { close(releaseSet) }) })
-	kv := &gateStore{MemoryStore: NewMemoryStore(), before: func(n int32) {
+	kv := gatedStore(t, func(n int32) {
 		if n == 1 {
 			close(inSet)
 			<-releaseSet
 		}
-	}}
-	t.Cleanup(kv.Close)
+	})
 	var runs atomic.Int32
 	h := func(c *celeris.Context) error {
 		n := runs.Add(1)

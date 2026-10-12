@@ -38,6 +38,10 @@ type MemoryStore struct {
 	mask   uint64
 	perMax int
 	cancel context.CancelFunc
+
+	// testHookFillWrite, when set (by a test, before the store is shared),
+	// runs at the start of every fill's write, before the shard lock.
+	testHookFillWrite func()
 }
 
 type memShard struct {
@@ -132,12 +136,15 @@ func (m *MemoryStore) Set(_ context.Context, key string, value []byte, ttl time.
 	return m.set(key, value, ttl, 0, false)
 }
 
-// setIfNewer is the write the cache middleware makes for a fill (see
-// versionedSetter): it stores value unless the key holds a live entry written
-// by a fill of a newer generation, which it leaves alone and reports no error
-// for. The check and the write are one step under the shard's lock (celeris#888
-// item 30).
+// setIfNewer is the write the cache middleware makes for a fill into a
+// *MemoryStore (see storeFill): it stores value unless the key holds a live
+// entry written by a fill of a newer generation, which it leaves alone and
+// reports no error for. The check and the write are one step under the
+// shard's lock (celeris#888 item 30).
 func (m *MemoryStore) setIfNewer(_ context.Context, key string, value []byte, ttl time.Duration, gen uint64) error {
+	if m.testHookFillWrite != nil {
+		m.testHookFillWrite()
+	}
 	return m.set(key, value, ttl, gen, true)
 }
 
