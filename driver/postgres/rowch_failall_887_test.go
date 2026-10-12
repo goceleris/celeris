@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,6 +163,11 @@ func TestFailAllAfterDispatchClosedTheStream887(t *testing.T) {
 			if rows != 1 {
 				t.Fatalf("read %d rows, want the 1 sent", rows)
 			}
+			// failAll takes its queue before dispatch pops the head, so it can
+			// hold a request dispatch has just finished: put it back.
+			c.pendingMu.Lock()
+			c.pending = append(c.pending, req)
+			c.pendingMu.Unlock()
 			func() {
 				defer func() {
 					if p := recover(); p != nil {
@@ -175,45 +181,58 @@ func TestFailAllAfterDispatchClosedTheStream887(t *testing.T) {
 	}
 }
 
-// Many rounds of failAll against a producer that keeps sending, with the
-// consumer slow: no round may panic, and every round must end with rowCh
-// closed. Run under -race it also checks the guarded close against the send.
-func TestFailAllRacingAProducerNeverPanics887(t *testing.T) {
-	const rounds = 300
+// Many rounds of failAll against producers that keep sending into a consumer
+// that keeps up, so most sends do not block and are in flight when the close
+// comes: no round may panic, and every round must end with rowCh closed. Run
+// under -race it also checks the guarded close against the send.
+func TestFailAllRacingProducersNeverPanics887(t *testing.T) {
+	const rounds, producers = 1500, 3
 	for r := 0; r < rounds; r++ {
 		c, req := c887Stream(2)
+		var stop atomic.Bool
 		var wg sync.WaitGroup
-		panics := make(chan any, 1)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() {
-				if p := recover(); p != nil {
-					select {
-					case panics <- p:
-					default:
+		panics := make(chan any, producers)
+		for p := 0; p < producers; p++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() {
+					if v := recover(); v != nil {
+						panics <- v
 					}
+				}()
+				row := [][]byte{[]byte("x")}
+				for !stop.Load() {
+					req.OnRow(row)
 				}
 			}()
-			for i := 0; i < 64; i++ {
-				req.OnRow([][]byte{[]byte("x")})
+		}
+		consumed := make(chan struct{})
+		go func() {
+			defer close(consumed)
+			for range req.rowCh { //revive:disable-line:empty-block drain until closed
 			}
 		}()
-		time.Sleep(time.Duration(r%5) * 20 * time.Microsecond)
+		time.Sleep(time.Duration(r%6) * 10 * time.Microsecond)
 		failed := make(chan struct{})
 		go func() { c.failAll(errors.New("conn closed")); close(failed) }()
 		select {
 		case <-failed:
 		case <-time.After(5 * time.Second):
+			stop.Store(true)
 			t.Fatalf("round %d: failAll did not return within 5 s", r)
 		}
+		stop.Store(true)
 		wg.Wait()
 		select {
-		case p := <-panics:
-			t.Fatalf("round %d: OnRow panicked while failAll ran: %v", r, p)
+		case v := <-panics:
+			t.Fatalf("round %d: OnRow panicked while failAll ran: %v", r, v)
 		default:
 		}
-		for range req.rowCh { //revive:disable-line:empty-block drain until closed
+		select {
+		case <-consumed: // rowCh was closed
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: rowCh was not closed", r)
 		}
 	}
 }
