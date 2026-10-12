@@ -134,3 +134,14 @@ func BenchmarkSingleflightMissPost(b *testing.B) {
 		celeristest.ReleaseContext(ctx)
 	}
 }
+
+// BenchmarkCanonicalAppendBrowser is the canonical form of a browser's
+// Accept-Encoding alone (what the negotiator's parser and the rendering cost
+// inside BenchmarkDefaultKeyBrowser), measured in the same run as the key.
+func BenchmarkCanonicalAppendBrowser(b *testing.B) {
+	var buf [64]byte
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = canonicalAppend(buf[:0], "accept-encoding", "gzip, deflate, br, zstd")
+	}
+}
