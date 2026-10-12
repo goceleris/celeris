@@ -52,6 +52,10 @@ import (
 // HTTP/2 connection begins on a cleartext HTTP/1 listener (RFC 7540 3.4, prior
 // knowledge, and 3.2, the Upgrade handshake), hijacks the connection and
 // serves it through h2s.ServeConn, and passes every other request on to next.
+// Each way is switched on by its own field (priorKnowledge, upgrade), so one
+// handler serves every combination Config.Protocol and Config.EnableH2Upgrade
+// resolve to (engine.go says which): a way that is off is not intercepted, and
+// its request goes to next as the plain HTTP/1.1 request it also is.
 //
 // It is golang.org/x/net/http2/h2c's handler (Copyright 2018 The Go
 // Authors, BSD-3-Clause), with one difference, which is why it is not that
@@ -75,6 +79,14 @@ import (
 type h2cHandler struct {
 	next http.Handler
 	h2s  *http2.Server //nolint:staticcheck // SA1019: the type ServeConn is a method of; see the import comment in engine.go.
+	// priorKnowledge: serve a connection that opens with the HTTP/2 preface
+	// (RFC 7540 3.4). Off on Protocol HTTP1, which has no prior-knowledge
+	// h2c.
+	priorKnowledge bool
+	// upgrade: honour a request for the RFC 7540 3.2 upgrade
+	// (Config.EnableH2Upgrade, as resolved). Off, such a request is served
+	// as plain HTTP/1.1 with its headers untouched.
+	upgrade bool
 	// maxBody is Config.MaxRequestBodySize, which bounds the body of an
 	// upgrade request as it bounds every other (celeris#976); 0 = unlimited.
 	maxBody int64
@@ -86,7 +98,7 @@ type h2cHandler struct {
 
 func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Prior knowledge (RFC 7540 3.4).
-	if r.Method == "PRI" && len(r.Header) == 0 && r.URL.Path == "*" && r.Proto == "HTTP/2.0" {
+	if h.priorKnowledge && r.Method == "PRI" && len(r.Header) == 0 && r.URL.Path == "*" && r.Proto == "HTTP/2.0" {
 		conn, err := h2cPriorKnowledge(w)
 		if err != nil {
 			return
@@ -101,7 +113,7 @@ func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Upgrade to h2c (RFC 7540 3.2).
-	if isH2CUpgrade(r.Header) {
+	if h.upgrade && isH2CUpgrade(r.Header) {
 		conn, settings, err := h2cUpgrade(w, r, h.maxBody)
 		if err != nil {
 			if errors.Is(err, errH2CUpgradeBodyTooLarge) {

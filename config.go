@@ -355,21 +355,30 @@ type Config struct {
 	// stream 1). Resolution follows three cases:
 	//   - nil (default): inferred from Protocol — enabled for Auto,
 	//     disabled for H2C (clients already speak H2 directly) and for
-	//     HTTP1 (upgrade is irrelevant, no H2 stack available).
+	//     HTTP1 (the connection stays HTTP/1.1 unless true asks for the
+	//     upgrade).
 	//   - non-nil true: force enabled. Useful to opt into upgrade on
-	//     Protocol=H2C for clients that prefer to negotiate.
+	//     Protocol=H2C or HTTP1 for clients that prefer to negotiate.
 	//   - non-nil false: force disabled, even on Protocol=Auto. Useful when
 	//     the engine intentionally only serves HTTP/1, or to refuse the
 	//     upgrade handshake (a request-smuggling surface behind some
 	//     proxies): a request carrying Upgrade: h2c is then served as
 	//     plain HTTP/1.1. Prior-knowledge h2c on Auto is not affected.
 	//
-	// Engine: all four engines honour non-nil false on Auto. Std (the only
-	// engine on non-Linux platforms and the default there) differs from
-	// Epoll, IOUring and Adaptive on two other combinations (celeris#889):
-	// on Protocol=H2C it answers an Upgrade: h2c request with 101 for nil
-	// and false as well as true, where the others upgrade only for true; on
-	// Protocol=HTTP1 it never upgrades, true included, where the others do.
+	// All four engines (Std, Epoll, IOUring, Adaptive) answer an
+	// Upgrade: h2c request the same way for every Protocol and every value:
+	//
+	//	Protocol  nil   &false  &true
+	//	Auto      101   no      101
+	//	H2C       no    no      101
+	//	HTTP1     no    no      101
+	//
+	// "no" is no upgrade: on Auto and HTTP1 the request is served as plain
+	// HTTP/1.1. On H2C the listener is HTTP/2: Epoll, IOUring and Adaptive
+	// answer such a request with an HTTP/2 SETTINGS frame, and Std, which
+	// also serves plain HTTP/1.1 on an H2C listener, serves it as HTTP/1.1.
+	// Prior-knowledge h2c (a connection that opens with the HTTP/2 preface)
+	// is served on Auto and H2C whatever this says, and never on HTTP1.
 	EnableH2Upgrade *bool
 }
 

@@ -34,8 +34,13 @@ import (
 //
 // This test is that missing case, on the engine that actually owns the
 // behaviour.
+//
+// Since celeris#889 the upgrade on Protocol H2C needs Config.EnableH2Upgrade
+// &true, as on epoll, io_uring and adaptive: with nil or &false the request is
+// served as plain HTTP/1.1 (TestEnableH2UpgradeMatrix889 pins every
+// combination). So this starts the listener with the upgrade on.
 func TestStdEngineAnswersH2CUpgradeWith101(t *testing.T) {
-	addr := startH2CEngine(t)
+	addr := startH2CEngine(t, func(c *resource.Config) { c.SetH2Upgrade(true) })
 
 	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -95,8 +100,9 @@ func TestStdEngineStillServesPlainHTTP1OnAnH2CListener(t *testing.T) {
 }
 
 // startH2CEngine brings up an H2C std engine on a free port and returns its
-// address, shutting it down when the test ends.
-func startH2CEngine(t *testing.T) string {
+// address, shutting it down when the test ends. mod, if given, changes the
+// resource.Config first.
+func startH2CEngine(t *testing.T, mod ...func(*resource.Config)) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -107,11 +113,15 @@ func startH2CEngine(t *testing.T) string {
 		t.Fatalf("close probe listener: %v", err)
 	}
 
-	e, err := New(resource.Config{
+	cfg := resource.Config{
 		Addr:     addr,
 		Engine:   engine.Std,
 		Protocol: engine.H2C,
-	}, &echoHandler{})
+	}
+	for _, m := range mod {
+		m(&cfg)
+	}
+	e, err := New(cfg, &echoHandler{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

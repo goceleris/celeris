@@ -550,41 +550,54 @@ func TestH2CConnHandedOverAfterShutdownReturnedIsRefusedAndSentGoAway(t *testing
 
 // TestH2CUpgradedConnGetsGoAwayAtDrainStart is the first test's counterpart for
 // a connection that began as an HTTP/1.1 Upgrade (RFC 7540 3.2), which takes
-// a different way into the HTTP/2 server.
+// a different way into the HTTP/2 server. It runs on every protocol that can
+// upgrade: H2C and, since celeris#889, HTTP1, where the h2c front end is
+// installed for the upgrade alone and must still register its HTTP/2 server
+// with the net/http server (http2.ConfigureServer), or Shutdown cannot reach
+// the upgraded connection.
 func TestH2CUpgradedConnGetsGoAwayAtDrainStart(t *testing.T) {
-	h := newPathHandler()
-	t.Cleanup(h.Release)
-	e, addr := startH2CShutdownEngine(t, h, nil)
+	for _, proto := range []engine.Protocol{engine.H2C, engine.HTTP1} {
+		t.Run(proto.String(), func(t *testing.T) {
+			h := newPathHandler()
+			t.Cleanup(h.Release)
+			// The upgrade is on: only EnableH2Upgrade &true upgrades on H2C and
+			// HTTP1 (celeris#889).
+			e, addr := startH2CEngineWith(t, h, nil, func(c *resource.Config) {
+				c.Protocol = proto
+				c.SetH2Upgrade(true)
+			})
 
-	c := dialUpgradeRawH2(t, addr, "/held") // stream 1 is the held request
-	select {
-	case <-h.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the upgrade request was not entered within 5s")
-	}
-	h.enteredPaths()
+			c := dialUpgradeRawH2(t, addr, "/held") // stream 1 is the held request
+			select {
+			case <-h.started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the upgrade request was not entered within 5s")
+			}
+			h.enteredPaths()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	shut := make(chan error, 1)
-	go func() { shut <- e.Shutdown(ctx) }()
-	if ga, seen, ok := c.waitFor(3*time.Second, isGoAway); !ok {
-		t.Fatalf("no GOAWAY on the upgraded connection within 3s of Shutdown beginning; saw %+v (celeris#878)", seen)
-	} else if ga.code != http2.ErrCodeNo {
-		t.Errorf("GOAWAY code %v, want NO_ERROR", ga.code)
-	}
-	c.get(3, "/after-goaway")
-	time.Sleep(300 * time.Millisecond)
-	if got := h.enteredPaths(); len(got) != 0 {
-		t.Errorf("a stream opened after the GOAWAY was handed to the handler: %v", got)
-	}
-	h.Release()
-	select {
-	case err := <-shut:
-		if err != nil {
-			t.Errorf("Shutdown: %v, want nil", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Shutdown had not returned 5s after the held request was released")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			shut := make(chan error, 1)
+			go func() { shut <- e.Shutdown(ctx) }()
+			if ga, seen, ok := c.waitFor(3*time.Second, isGoAway); !ok {
+				t.Fatalf("no GOAWAY on the upgraded connection within 3s of Shutdown beginning; saw %+v (celeris#878)", seen)
+			} else if ga.code != http2.ErrCodeNo {
+				t.Errorf("GOAWAY code %v, want NO_ERROR", ga.code)
+			}
+			c.get(3, "/after-goaway")
+			time.Sleep(300 * time.Millisecond)
+			if got := h.enteredPaths(); len(got) != 0 {
+				t.Errorf("a stream opened after the GOAWAY was handed to the handler: %v", got)
+			}
+			h.Release()
+			select {
+			case err := <-shut:
+				if err != nil {
+					t.Errorf("Shutdown: %v, want nil", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Shutdown had not returned 5s after the held request was released")
+			}
+		})
 	}
 }

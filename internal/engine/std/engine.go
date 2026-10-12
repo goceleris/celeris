@@ -122,13 +122,26 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// made the validation harness's h2c-churn slice vacuous on std -- 3,597
 	// upgrade preambles, not one 101.
 	//
-	// h2cHandler serves BOTH shapes: a client that opens with the HTTP/2
-	// preface (prior knowledge) and one that asks to upgrade from HTTP/1.1.
-	// Plain HTTP/1.1 requests fall through to the wrapped handler, so an
-	// H2C listener still serves H1.
+	// h2cHandler serves two shapes, each with its own switch: a client that
+	// opens with the HTTP/2 preface (prior knowledge) and one that asks to
+	// upgrade from HTTP/1.1. Plain HTTP/1.1 requests fall through to the
+	// wrapped handler, so an H2C listener still serves H1. What is on follows
+	// Config.Protocol and Config.EnableH2Upgrade (cfg.EnableH2Upgrade is the
+	// resolved flag, WithDefaults and celeris.Config's *bool: true for nil on
+	// Auto, false for nil on H2C and HTTP1, the explicit value otherwise),
+	// as on epoll, io_uring and adaptive (celeris#889):
+	//
+	//	Protocol  prior knowledge  Upgrade: h2c
+	//	Auto      yes              only if EnableH2Upgrade
+	//	H2C       yes              only if EnableH2Upgrade (&true)
+	//	HTTP1     no               only if EnableH2Upgrade (&true)
+	//
+	// A request for the upgrade that is not honoured is served as the plain
+	// HTTP/1.1 request it also is (celeris#964); on HTTP1 without the upgrade
+	// there is no front end at all.
 	var httpHandler http.Handler = bridge
 	var h2s *http2.Server //nolint:staticcheck // SA1019: see the import comment.
-	if cfg.Protocol == engine.H2C || cfg.Protocol == engine.Auto {
+	if cfg.Protocol == engine.H2C || cfg.Protocol == engine.Auto || (cfg.Protocol == engine.HTTP1 && cfg.EnableH2Upgrade) {
 		//
 		// x/net 0.59 deprecated http2.Server along with the handler; it is
 		// still the only type the h2c front end can serve with, so the two
@@ -136,26 +149,16 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		// covers it.
 		h2s = &http2.Server{MaxConcurrentStreams: cfg.MaxConcurrentStreams, MaxReadFrameSize: cfg.MaxFrameSize} //nolint:staticcheck // SA1019: the type h2cHandler serves with; see the import comment.
 		httpHandler = &h2cHandler{
-			next:    bridge,
-			h2s:     h2s,
-			maxBody: cfg.MaxRequestBodySize,
+			next:           bridge,
+			h2s:            h2s,
+			priorKnowledge: cfg.Protocol != engine.HTTP1,
+			upgrade:        cfg.EnableH2Upgrade,
+			maxBody:        cfg.MaxRequestBodySize,
 			bodyRefused: func() {
 				// What Bridge counts for a request whose body it refuses.
 				e.metrics.reqCount.Add(1)
 				e.metrics.errs.RequestBody.Add(1)
 			},
-		}
-		// Auto with the upgrade disabled (Config.EnableH2Upgrade = &false,
-		// celeris#964): keep prior-knowledge h2c, which is not the
-		// handshake, and serve a request that asks for the RFC 7540 3.2
-		// upgrade as the plain HTTP/1.1 request it also is, as epoll,
-		// io_uring and adaptive do. cfg.EnableH2Upgrade is true for every
-		// Auto listener that did not turn it off (WithDefaults), so only an
-		// explicit false lands here. H2C is left as it was: the resolved
-		// flag is false there for nil and for &false alike, and std
-		// upgrades on H2C (TestStdEngineAnswersH2CUpgradeWith101).
-		if cfg.Protocol == engine.Auto && !cfg.EnableH2Upgrade {
-			httpHandler = &h2cNoUpgradeHandler{h2c: httpHandler, plain: bridge}
 		}
 	}
 
@@ -189,23 +192,6 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	}
 
 	return e, nil
-}
-
-// h2cNoUpgradeHandler is the std handler for Protocol Auto with the h2c
-// upgrade disabled: a request that asks for the RFC 7540 3.2 upgrade goes
-// straight to the plain handler, with its headers untouched, and everything
-// else (prior-knowledge h2c, HTTP/1.1) goes through the h2c front end.
-type h2cNoUpgradeHandler struct {
-	h2c   http.Handler
-	plain http.Handler
-}
-
-func (h *h2cNoUpgradeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if isH2CUpgrade(r.Header) {
-		h.plain.ServeHTTP(w, r)
-		return
-	}
-	h.h2c.ServeHTTP(w, r)
 }
 
 // stdTimeout translates celeris's internal "disabled" encoding into the value
