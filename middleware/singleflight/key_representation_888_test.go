@@ -175,3 +175,20 @@ func TestDefaultKeyValidatorComponentsDistinct888(t *testing.T) {
 	}
 	celeristest.ReleaseContext(c)
 }
+
+// TestDefaultKeyAllocatesOnce888: the canonical Accept-Encoding and the four
+// validators are written into the key's one buffer: a browser's request (a
+// blank-separated Accept-Encoding, a validator) still costs one allocation.
+func TestDefaultKeyAllocatesOnce888(t *testing.T) {
+	c, _ := celeristest.NewContext("GET", "/doc",
+		celeristest.WithHeader("accept-encoding", "gzip, deflate, br, zstd"),
+		celeristest.WithHeader("if-none-match", `"v1"`),
+		celeristest.WithHeader("if-modified-since", "Mon, 05 Oct 2026 10:00:00 GMT"))
+	defer celeristest.ReleaseContext(c)
+	if k := defaultKeyFunc(c); !strings.Contains(k, "\x00e=gzip,deflate,br,zstd") || !strings.Contains(k, "\x00nm=\"v1\"") {
+		t.Fatalf("key %q does not hold the canonical encodings and the validator", k)
+	}
+	if allocs := testing.AllocsPerRun(1000, func() { _ = defaultKeyFunc(c) }); allocs > 1 {
+		t.Errorf("defaultKeyFunc made %.1f allocations per call, want 1", allocs)
+	}
+}

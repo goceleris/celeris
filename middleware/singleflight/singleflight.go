@@ -84,6 +84,9 @@ func New(config ...Config) celeris.HandlerFunc {
 	if len(config) > 0 {
 		cfg = config[0]
 	}
+	// A custom KeyFunc cannot be assumed to hold the validators: a
+	// conditional request is then never coalesced. The default key holds them.
+	customKey := cfg.KeyFunc != nil
 	cfg = applyDefaults(cfg)
 	cfg.validate()
 
@@ -102,10 +105,13 @@ func New(config ...Config) celeris.HandlerFunc {
 		// 206 part) answers that Range, which the key does not include, so a
 		// leader's part would be handed to requests for the whole
 		// representation, and a ranged request waiting on a full one gets
-		// more than it asked for (celeris#832). A conditional request is not
-		// coalesced either: its response (a 304 or a 412) answers its
-		// validator, which the key does not include either (celeris#912).
-		if answersItsOwnHeaders(c) {
+		// more than it asked for (celeris#832). With a custom KeyFunc a
+		// conditional request is not coalesced either: its response (a 304 or
+		// a 412) answers its validator, which that key may not include
+		// (celeris#912). The default key includes the validators, so there
+		// requests that send the same ones are coalesced (celeris#888 item
+		// 23).
+		if answersItsOwnHeaders(c, customKey) {
 			return c.Next()
 		}
 
@@ -251,22 +257,31 @@ func New(config ...Config) celeris.HandlerFunc {
 
 // answersItsOwnHeaders reports a request whose response answers one of its
 // own headers that the key does not include, so it must not be coalesced:
-// a Range (the 206 part, celeris#832), or a precondition (If-None-Match and
-// If-Modified-Since give a 304, If-Match and If-Unmodified-Since a 412,
-// celeris#912). If-Range applies only with a Range.
-func answersItsOwnHeaders(c *celeris.Context) bool {
-	return c.Header("range") != "" ||
-		c.Header("if-none-match") != "" ||
-		c.Header("if-modified-since") != "" ||
-		c.Header("if-match") != "" ||
-		c.Header("if-unmodified-since") != ""
+// a Range (the 206 part, celeris#832), and, when the key is a custom one, a
+// precondition (If-None-Match and If-Modified-Since give a 304, If-Match and
+// If-Unmodified-Since a 412, celeris#912). If-Range applies only with a
+// Range. The default key holds the four preconditions, so it needs no bypass
+// for them.
+func answersItsOwnHeaders(c *celeris.Context, customKey bool) bool {
+	if c.Header("range") != "" {
+		return true
+	}
+	if !customKey {
+		return false
+	}
+	for _, v := range keyValidators {
+		if c.Header(v.header) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // captureVary records, for each request header the leader's response names
-// in Vary (entry.headers, the waiters' copy), the leader's value for it. The
-// values are copied: on epoll and io_uring they are views of the leader
-// connection's receive buffer, and a waiter compares them after the leader
-// has returned.
+// in Vary (entry.headers, the waiters' copy), the leader's value for it, in
+// canonical form (see canonicalAppend). The values are copied: on epoll and
+// io_uring they are views of the leader connection's receive buffer, and a
+// waiter compares them after the leader has returned.
 func (e *call) captureVary(c *celeris.Context) {
 	for _, h := range e.headers {
 		if h[0] != "vary" {
@@ -279,21 +294,21 @@ func (e *call) captureVary(c *celeris.Context) {
 			case "*":
 				e.varyAll = true
 			default:
-				e.vary = append(e.vary, [2]string{name, strings.Clone(c.Header(name))})
+				e.vary = append(e.vary, [2]string{name, canonicalValue(name, c.Header(name))})
 			}
 		}
 	}
 }
 
-// sameVariant reports whether the waiter c sends the leader's value for every
-// request header the leader's response varies on, so the leader's response
-// is the one c's own request would get.
+// sameVariant reports whether the waiter c sends the leader's value (canonically
+// equal, see canonicalAppend) for every request header the leader's response
+// varies on, so the leader's response is the one c's own request would get.
 func (e *call) sameVariant(c *celeris.Context) bool {
 	if e.varyAll {
 		return false
 	}
 	for _, v := range e.vary {
-		if c.Header(v[0]) != v[1] {
+		if !sameCanonical(v[0], v[1], c.Header(v[0])) {
 			return false
 		}
 	}

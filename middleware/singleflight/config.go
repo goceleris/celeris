@@ -21,20 +21,30 @@ type Config struct {
 	// are coalesced — waiters receive a copy of the leader's response.
 	//
 	// Default: method + "\x00" + path + "\x00" + sorted-query-string,
-	// then the Authorization, Cookie and Accept-Encoding headers, each
-	// labelled so that one can never read as another. The Authorization
-	// and Cookie components ensure that requests from different
-	// authenticated users produce different keys, preventing cross-user
-	// data leakage. Unauthenticated requests (no auth/cookie headers)
-	// still coalesce normally. Accept-Encoding keeps requests that accept
-	// different encodings apart when compress runs inside singleflight.
+	// then the Authorization, Cookie and Accept-Encoding headers and the
+	// four preconditions (If-None-Match, If-Modified-Since, If-Match and
+	// If-Unmodified-Since), each labelled so that one can never read as
+	// another. The Authorization and Cookie components ensure that requests
+	// from different authenticated users produce different keys, preventing
+	// cross-user data leakage. Unauthenticated requests (no auth/cookie
+	// headers) still coalesce normally. Accept-Encoding keeps requests that
+	// accept different encodings apart when compress runs inside
+	// singleflight; values that differ only in case or blanks
+	// ("gzip, deflate" and "gzip,deflate") are one component, and the order
+	// is kept. The preconditions keep requests with different validators
+	// apart, because the response answers its own validator (a 304 or a
+	// 412), and let identical revalidations (a CDN or browsers sending the
+	// same If-None-Match) coalesce.
 	//
 	// If you provide a custom KeyFunc, ensure it incorporates user
-	// identity for any endpoint that returns user-specific data. Whatever
-	// the key, a waiter whose request differs from the leader's in a
-	// header the leader's response names in Vary (or a response with
-	// Vary: *) runs its own handler instead of taking the leader's
-	// response.
+	// identity for any endpoint that returns user-specific data. A request
+	// that carries a precondition is never coalesced under a custom key,
+	// because the key may not include the validator; a Range request never
+	// is under any key. Whatever the key, a waiter whose request differs
+	// from the leader's in a header the leader's response names in Vary (or
+	// a response with Vary: *) runs its own handler instead of taking the
+	// leader's response; Accept-Encoding values are compared as the default
+	// key does.
 	KeyFunc func(c *celeris.Context) string
 }
 
@@ -50,6 +60,18 @@ func applyDefaults(cfg Config) Config {
 // No validation needed: all Config fields have safe zero values.
 func (cfg Config) validate() {}
 
+// keyValidators are the request headers, besides Authorization, Cookie and
+// Accept-Encoding, that the default key holds: the preconditions. A conditional
+// request's response answers its own validator (a 304 or a 412), so the key
+// keeps requests with different validators apart, and requests that send the
+// same one still coalesce (celeris#888 item 23).
+var keyValidators = [...]struct{ header, label string }{
+	{"if-none-match", "\x00nm="},
+	{"if-modified-since", "\x00ms="},
+	{"if-match", "\x00ma="},
+	{"if-unmodified-since", "\x00us="},
+}
+
 func defaultKeyFunc(c *celeris.Context) string {
 	m := c.Method()
 	p := c.Path()
@@ -58,8 +80,13 @@ func defaultKeyFunc(c *celeris.Context) string {
 	cookie := c.Header("cookie")
 	// The encoding compress negotiates comes from Accept-Encoding, so
 	// requests that accept different encodings get different responses
-	// (celeris#912).
-	ae := c.Header("accept-encoding")
+	// (celeris#912). Equivalent values (blanks, case) are one key part.
+	var aeBuf [64]byte
+	ae := canonicalAppend(aeBuf[:0], "accept-encoding", c.Header("accept-encoding"))
+	var val [len(keyValidators)]string
+	for i, v := range keyValidators {
+		val[i] = c.Header(v.header)
+	}
 
 	var q string
 	if rq != "" {
@@ -75,9 +102,6 @@ func defaultKeyFunc(c *celeris.Context) string {
 		}
 		q = sorted.Encode()
 	}
-	if q == "" && auth == "" && cookie == "" && ae == "" {
-		return m + "\x00" + p
-	}
 	// Each header component is labelled, so one header's value can never
 	// read as another's (a header value cannot hold a NUL). The key is
 	// built in one allocation.
@@ -85,10 +109,21 @@ func defaultKeyFunc(c *celeris.Context) string {
 	if q != "" {
 		n += 1 + len(q)
 	}
-	for _, v := range [...]string{auth, cookie, ae} {
+	for _, v := range [...]string{auth, cookie} {
 		if v != "" {
 			n += 3 + len(v)
 		}
+	}
+	if len(ae) > 0 {
+		n += 3 + len(ae)
+	}
+	for i, v := range val {
+		if v != "" {
+			n += len(keyValidators[i].label) + len(v)
+		}
+	}
+	if n == len(m)+1+len(p) {
+		return m + "\x00" + p
 	}
 	var b strings.Builder
 	b.Grow(n)
@@ -107,9 +142,15 @@ func defaultKeyFunc(c *celeris.Context) string {
 		b.WriteString("\x00c=")
 		b.WriteString(cookie)
 	}
-	if ae != "" {
+	if len(ae) > 0 {
 		b.WriteString("\x00e=")
-		b.WriteString(ae)
+		b.Write(ae)
+	}
+	for i, v := range val {
+		if v != "" {
+			b.WriteString(keyValidators[i].label)
+			b.WriteString(v)
+		}
 	}
 	return b.String()
 }
