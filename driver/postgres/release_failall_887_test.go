@@ -22,22 +22,25 @@ package postgres
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
 )
 
-// c887Gated queues req on a fresh conn, holds req.chMu, starts failAll on its
-// own goroutine and returns once failAll has taken the queue (so the caller's
-// failReq can no longer find req in pending). failAll then waits at chMu, its
-// first access to req, until the returned release func runs; wait blocks until
-// failAll has returned.
-func c887Gated(t *testing.T, req *pgRequest, err error) (c *pgConn, release func(), wait func()) {
+// c887Gated queues req on a fresh conn, holds gate (a mutex of req that
+// failAll takes), starts failAll on its own goroutine and returns once failAll
+// has taken the queue (so the caller's failReq can no longer find req in
+// pending). failAll then waits at gate until the returned release func runs;
+// wait blocks until failAll has returned. With gate = &req.chMu that is
+// failAll's first access to req (closeRowCh); with &req.doneMu it is its last
+// (fail).
+func c887Gated(t *testing.T, req *pgRequest, err error, gate sync.Locker) (c *pgConn, release func(), wait func()) {
 	t.Helper()
 	c = &pgConn{bridge: async.NewBridge()}
 	c.enqueue(req)
-	req.chMu.Lock()
+	gate.Lock()
 	done := make(chan struct{})
 	go func() { c.failAll(err); close(done) }()
 	deadline := time.Now().Add(5 * time.Second)
@@ -49,7 +52,7 @@ func c887Gated(t *testing.T, req *pgRequest, err error) (c *pgConn, release func
 			break
 		}
 		if time.Now().After(deadline) {
-			req.chMu.Unlock()
+			gate.Unlock()
 			t.Fatal("failAll never took the pending queue")
 		}
 		time.Sleep(time.Millisecond)
@@ -58,7 +61,7 @@ func c887Gated(t *testing.T, req *pgRequest, err error) (c *pgConn, release func
 	release = func() {
 		if !unlocked {
 			unlocked = true
-			req.chMu.Unlock()
+			gate.Unlock()
 		}
 	}
 	t.Cleanup(release)
@@ -93,7 +96,7 @@ type c887Key struct{}
 func TestReleaseWhileFailAllHoldsTheRequestDoesNotRecycleIt887(t *testing.T) {
 	req := c887PooledRequest(t)
 	boom := errors.New("conn closed")
-	c, release, wait := c887Gated(t, req, boom)
+	c, release, wait := c887Gated(t, req, boom, &req.chMu)
 
 	// The caller's half: its Write found the conn closed.
 	callerErr := errors.New("write on a closed conn")
@@ -126,7 +129,7 @@ func TestReleaseWhileFailAllHoldsAStreamingRequestStillClosesItsChannels887(t *t
 	req.colsCh = make(chan struct{})
 	rowCh, colsCh := req.rowCh, req.colsCh
 	boom := errors.New("conn closed")
-	c, release, wait := c887Gated(t, req, boom)
+	c, release, wait := c887Gated(t, req, boom, &req.chMu)
 
 	c.failReq(req, errors.New("write on a closed conn"))
 	releasePgRequest(req)
@@ -167,4 +170,26 @@ func TestReleaseAfterFailAllFinishedRecyclesTheRequest887(t *testing.T) {
 	if req2.ctx != nil {
 		t.Error("a finished, unswept request was not recycled")
 	}
+}
+
+// The other end of the sweep: failAll has closed what it had to and is about
+// to fail the request (blocked on doneMu). A release in that gap would recycle
+// a request failAll is still going to fail, which can be the next query's by
+// then, so the pin must outlive everything up to and including fail().
+func TestReleaseWhileFailAllIsAboutToFailTheRequestDoesNotRecycleIt887(t *testing.T) {
+	req := c887PooledRequest(t)
+	c, release, wait := c887Gated(t, req, errors.New("conn closed"), &req.doneMu)
+	_ = c
+
+	// Give failAll time to run up to its fail() and park on doneMu (it has no
+	// observable arrival). The caller's half: the request is finished some
+	// other way and the caller releases it.
+	time.Sleep(100 * time.Millisecond)
+	req.finished.Store(true)
+	releasePgRequest(req)
+	if req.ctx == nil {
+		t.Error("releasePgRequest recycled a request failAll was about to fail: the pin ended before fail()")
+	}
+	release()
+	wait()
 }
