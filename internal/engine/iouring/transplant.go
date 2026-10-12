@@ -292,48 +292,25 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 // as HTTP/2.
 //
 //   - ErrHijacked: the handler took the conn; nothing to do.
-//   - ErrUpgradeH2C: the 101 and the preface are queued, and the conn was
-//     closed instead of switched. Switch it and send them. The send is a plain
-//     one, unlinked: the caller arms the one recv, and a SEND linked to a
-//     recv of its own would put a second recv on the fd (see handleRecv).
+//   - ErrUpgradeH2C: the 101 and the preface are queued. Switch the conn and
+//     send them (finishH1Upgrade, the block handleRecv uses). The send is a
+//     plain one, unlinked: the caller arms the one recv, and a SEND linked to
+//     a recv of its own would put a second recv on the fd.
 //   - anything else (a parse error, errConnectionClose): flush what ProcessH1
 //     queued and tell the detached middleware (OnError) under detachMu, then
-//     close, which defers behind the send until the response has gone out.
+//     close, which defers behind the send until the response has gone out
+//     (endH1Verdict, the block handleRecv uses).
 //
 // Worker thread, on a conn fresh from attachAdoptedFD: no dispatch goroutine
 // exists, so the only other holder of cs.detachMu is a guarded writeFn in one
-// write. The lock is released before the close, which takes it again.
+// write.
 func (w *Worker) endCarriedReplay(cs *connState, fd int, perr error) bool {
 	if errors.Is(perr, conn.ErrHijacked) {
 		return false
 	}
 	if errors.Is(perr, conn.ErrUpgradeH2C) {
-		if err := w.switchToH2(cs); err != nil {
-			w.closeConn(fd)
-			return false
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-		}
-		cs.recvLinked = false
-		if w.flushSend(cs) {
-			w.markDirty(cs)
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
-		return true
+		return w.finishH1Upgrade(cs, fd, false)
 	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-		_ = w.flushSend(cs)
-		if cs.h1State != nil && cs.h1State.OnError != nil {
-			cs.h1State.OnError(perr)
-		}
-		mu.Unlock()
-	} else {
-		_ = w.flushSend(cs)
-	}
-	w.closeConn(fd)
+	w.endH1Verdict(cs, fd, perr)
 	return false
 }

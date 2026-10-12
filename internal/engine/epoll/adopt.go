@@ -304,56 +304,25 @@ func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
 //
 //   - ErrHijacked: the handler took the conn and cs is released; nothing to do.
 //   - ErrUpgradeH2C: switch the conn to HTTP/2 and send the 101 with the
-//     server preface and the answer to the upgrade request, as drainRead does
-//     (its block is the model for the flush below; loop.go is not edited here).
+//     server preface and the answer to the upgrade request (finishH1Upgrade,
+//     the block drainRead uses).
 //   - anything else (a parse error, errConnectionClose): flush what ProcessH1
 //     queued, tell the detached middleware (OnError) and close once the
-//     response has reached the kernel (closeWhenFlushed, celeris#761).
+//     response has reached the kernel (endH1Verdict, the block drainRead uses;
+//     closeWhenFlushed, celeris#761).
 //
 // Loop thread, on a conn fresh from attachAdoptedFD: no dispatch goroutine
 // exists, so the only other holder of cs.detachMu is a guarded writeFn in one
-// write. The lock is released before the close, which takes it again.
+// write.
 func (l *Loop) endCarriedReplay(cs *connState, fd int, perr error) {
 	if errors.Is(perr, conn.ErrHijacked) {
 		return
 	}
 	if errors.Is(perr, conn.ErrUpgradeH2C) {
-		if err := l.switchToH2(cs, cs.writeFn); err != nil {
-			l.closeConn(fd)
-			return
-		}
-		if cs.writePos < len(cs.writeBuf) {
-			if fErr := l.flushWrites(cs, true); fErr != nil {
-				l.closeConn(fd)
-				return
-			}
-			if cs.writePos >= len(cs.writeBuf) {
-				cs.pendingBytes = 0
-				if cs.dirty {
-					l.removeDirty(cs)
-				}
-			} else {
-				// The 101 and the preface did not all fit: the send buffer is
-				// full. A newly-H2 conn is not detached, so arm EPOLLOUT
-				// rather than the busy-polling dirty list.
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
-				l.armEpollOut(cs)
-			}
-		}
+		l.finishH1Upgrade(cs, fd, cs.writeFn)
 		return
 	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-	}
-	_ = l.flushWrites(cs, true)
-	cs.pendingBytes = 0
-	if cs.h1State != nil && cs.h1State.OnError != nil {
-		cs.h1State.OnError(perr)
-	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Unlock()
-	}
-	l.closeWhenFlushed(cs)
+	l.endH1Verdict(cs, perr)
 }
 
 // flushCarriedReplay sends the responses a replay's ProcessH1 queued, as

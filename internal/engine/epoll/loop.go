@@ -1625,32 +1625,13 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if errors.Is(processErr, conn.ErrUpgradeH2C) {
 				// H1→H2 promotion. switchToH2 consumes the upgrade info,
 				// installs H2 state, and feeds any preface bytes synchronously.
-				if err := l.switchToH2(cs, writeFn); err != nil {
-					l.closeConn(fd)
-					return
-				}
 				// Flush the buffered 101 Switching Protocols response and any
 				// H2 server preface + stream 1 response bytes that switchToH2
 				// may have queued. The normal inline-flush block below is
 				// skipped by the `continue` so we must flush explicitly here,
 				// otherwise the client blocks forever waiting for the 101.
-				if cs.writePos < len(cs.writeBuf) {
-					if fErr := l.flushWrites(cs, true); fErr != nil {
-						l.closeConn(fd)
-						return
-					}
-					if cs.writePos >= len(cs.writeBuf) {
-						cs.pendingBytes = 0
-						if cs.dirty {
-							l.removeDirty(cs)
-						}
-					} else {
-						// 101 + H2 preface didn't fully drain: send buffer
-						// full. Newly-H2 conn (not detached) — arm EPOLLOUT
-						// rather than the busy-polling dirty list.
-						cs.pendingBytes = len(cs.writeBuf) - cs.writePos
-						l.armEpollOut(cs)
-					}
+				if !l.finishH1Upgrade(cs, fd, writeFn) {
+					return
 				}
 				// Fall through to continue the loop; subsequent reads go
 				// through the H2 path via cs.protocol switch above.
@@ -1692,22 +1673,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if errors.Is(processErr, conn.ErrHijacked) {
 				return // FD already detached — do not close or flush
 			}
-			// Flush any pending writes (e.g. error responses) before closing.
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			_ = l.flushWrites(cs, true)
-			cs.pendingBytes = 0
-			if cs.h1State != nil && cs.h1State.OnError != nil {
-				cs.h1State.OnError(processErr)
-			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
-			// What that one write could not send (a response larger than
-			// the socket buffers, answering Connection: close) still goes
-			// out before the close (celeris#761).
-			l.closeWhenFlushed(cs)
+			// Flush any pending writes (e.g. error responses) before closing,
+			// and tell a detached middleware: endH1Verdict.
+			l.endH1Verdict(cs, processErr)
 			return
 		}
 

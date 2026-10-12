@@ -3748,29 +3748,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 					w.bufRing.PushBuffer(providedBufID)
 					w.hasBufReturns = true
 				}
-				if err := w.switchToH2(cs); err != nil {
-					w.closeConn(fd)
-					return
-				}
 				// Flush the buffered 101 Switching Protocols + H2 server preface
 				// + stream 1 response bytes. Without this explicit flush the
 				// client blocks forever waiting for the 101 (the normal post-
 				// process flush path below is bypassed by this early return).
-				if mu := cs.detachMu; mu != nil {
-					mu.Lock()
-				}
-				cs.recvLinked = false
-				if w.bufRing == nil {
-					if w.flushSendLink(cs) {
-						w.markDirty(cs)
-					}
-				} else {
-					if w.flushSend(cs) {
-						w.markDirty(cs)
-					}
-				}
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
+				if !w.finishH1Upgrade(cs, fd, true) {
+					return
 				}
 				// Re-arm recv to keep reading H2 frames. flushSendLink may have
 				// already chained a recv via IOSQE_IO_LINK — skip our standalone
@@ -3913,36 +3896,8 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return // FD already detached
 		}
 		// Flush pending writes (e.g. error responses) before closing, and
-		// read cs.h1State, both under detachMu.
-		//
-		// The flush was previously outside the lock. completeSend's docstring
-		// states the invariant it broke: for a detached connection cs.sendBuf
-		// is read by the makeWriteFn closure on the user's goroutine, so every
-		// mutation of it needs detachMu. flushSend swaps sendBuf with writeBuf
-		// and sets cs.sending, so calling it unlocked races a handler that is
-		// writing — the same access pattern the race detector caught on the
-		// call sites that were fixed when that docstring was written
-		// (celeris#528). Reachable within one request: a handler can Detach
-		// (SSE, or a WebSocket upgrade) and then have ProcessH1 surface an
-		// error, with the guarded write closure already installed.
-		//
-		// The h1State read has its own reason to be under the lock: the async
-		// dispatch goroutine's switchToH2Local nils cs.h1State under the same
-		// mutex (the #256 TOCTOU class).
-		//
-		// internal/engine/epoll/loop.go does exactly this — one lock spanning the
-		// flush and OnError.
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-			_ = w.flushSend(cs)
-			if cs.h1State != nil && cs.h1State.OnError != nil {
-				cs.h1State.OnError(processErr)
-			}
-			mu.Unlock()
-		} else {
-			_ = w.flushSend(cs)
-		}
-		w.closeConn(fd)
+		// tell a detached middleware: endH1Verdict, under detachMu.
+		w.endH1Verdict(cs, fd, processErr)
 		return
 	}
 
