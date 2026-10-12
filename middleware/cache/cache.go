@@ -122,10 +122,13 @@ func New(config ...Config) celeris.HandlerFunc {
 		if leader {
 			return writeMiss(c, cfg, err)
 		}
-		if errors.Is(err, sf.ErrLeaderPanicked) {
+		if errors.Is(err, sf.ErrLeaderPanicked) || errors.Is(err, sf.ErrLeaderCanceled) {
 			// The leader's handler (or its Set) panicked; the panic is the
-			// leader's. This request runs its own handler, as it does when
-			// the leader's response is not cacheable (celeris#921).
+			// leader's. Or the leader's own request context ended (its
+			// client went away) and the handler said so; that error is its
+			// client's, not the key's. This request runs its own handler, as
+			// it does when the leader's response is not cacheable
+			// (celeris#921, celeris#888 item 26).
 			return executeAndStore(c, cfg, include, exclude, key)
 		}
 		if err != nil {
