@@ -1,3 +1,5 @@
+//go:build unix
+
 // Package wakefd owns an event loop's wakeup eventfd.
 //
 // The engines let producers on other goroutines wake a loop by writing its

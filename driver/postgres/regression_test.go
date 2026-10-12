@@ -13,8 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 	"github.com/goceleris/celeris/internal/engine"
@@ -60,13 +58,8 @@ func TestPgConnCloseNoDoubleClose(t *testing.T) {
 
 	// Re-invoke closeFDOnce: it must be a no-op now.
 	c.closeFDOnce()
-	// Close must have released the number: F_GETFD on it returns EBADF.
-	// F_GETFD only looks; a second close(2) here would close whatever the
-	// process has opened on the number since (celeris#859).
-	_, err = unix.FcntlInt(uintptr(c.fd), unix.F_GETFD, 0)
-	if !errors.Is(err, unix.EBADF) {
-		t.Fatalf("expected EBADF after Close(), got %v", err)
-	}
+	// Close must have released the number (celeris#859).
+	assertNumberReleased(t, c)
 }
 
 // TestPgBridgeOnWriteError simulates a Write failure on query #1 and verifies

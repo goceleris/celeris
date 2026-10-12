@@ -1,3 +1,5 @@
+//go:build unix
+
 package postgres
 
 // celeris#859: every event loop finds a driver conn by its descriptor
@@ -8,7 +10,7 @@ package postgres
 //
 // These tests build a pgConn by hand on a loop that records, for every call
 // by number, which socket the number named at that moment (by inode). They
-// need no event loop and no server, so they run on every platform.
+// need no event loop and no server, so they run on every unix platform (they hold socket numbers; windows has none).
 
 import (
 	"errors"

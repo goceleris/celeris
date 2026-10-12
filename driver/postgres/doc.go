@@ -40,6 +40,16 @@
 // and SCRAM-SHA-256 without channel binding; there is no LISTEN/NOTIFY,
 // pipeline mode, or replica routing.
 //
+// # Platforms
+//
+// On Linux (and other unix hosts) the driver runs on the celeris event loop:
+// that is the supported production path, and the one every claim about
+// throughput and latency refers to. On Windows the package compiles and works
+// through a portable fallback for development and testing: each connection
+// is a net.Conn read by its own goroutine, with no epoll or io_uring and no
+// WithEngine colocation. It is tested in CI on windows-latest against
+// in-process fake servers, not benchmarked and not tuned; do not deploy it.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/data-stores

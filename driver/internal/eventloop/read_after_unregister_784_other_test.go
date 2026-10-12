@@ -1,4 +1,4 @@
-//go:build !linux && !windows
+//go:build !linux && unix
 
 package eventloop
 
@@ -10,8 +10,7 @@ package eventloop
 // the meantime, the removal took the new conn's entry. This test parks the
 // reader in onClose to hold it there.
 //
-// CI builds this file on macOS but runs no tests there (ci.yml "Build"); the
-// test runs on a non-Linux developer host.
+// The macos-latest leg of ci.yml's "Portable fallback" job runs it.
 
 import (
 	"testing"
@@ -92,7 +91,7 @@ func TestReaderEOFSparesTheConnThatTakesTheNumber784(t *testing.T) {
 		t.Fatalf("RegisterConn(B) on A's number: %v", err)
 	}
 	t.Cleanup(func() { _ = w.UnregisterConn(b) })
-	bConn := func() *driverConn {
+	bConn := func() *portableConn {
 		w.mu.RLock()
 		defer w.mu.RUnlock()
 		return w.conns[b]
