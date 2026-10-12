@@ -125,11 +125,11 @@ func (m *MemoryStore) Get(_ context.Context, key string) ([]byte, error) {
 }
 
 // Set implements [store.KV]. Evicts the LRU entry when the shard is
-// over capacity. A Set always replaces the entry: it takes the generation of
-// the moment it is made, which is newer than that of any fill that started
-// before it (see setIfNewer).
+// over capacity. A Set always replaces the entry, and leaves it with no
+// generation: it is not ordered against the cache middleware's fills (see
+// setIfNewer), which is what it was before they were.
 func (m *MemoryStore) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
-	return m.set(key, value, ttl, genNow(), false)
+	return m.set(key, value, ttl, 0, false)
 }
 
 // setIfNewer is the write the cache middleware makes for a fill (see

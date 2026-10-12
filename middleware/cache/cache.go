@@ -36,8 +36,9 @@ type versionedSetter interface {
 var genBase = time.Now()
 
 // genNow returns the generation of a fill or a write that starts now: the
-// nanoseconds since genBase, plus one so that no generation is 0. Two starts
-// in the same clock tick share a generation, and then the later write wins.
+// nanoseconds since genBase, plus one so that no generation is 0 (an entry
+// written by a plain Set has none). Two starts in the same clock tick share a
+// generation, and then the later write wins.
 func genNow() uint64 { return uint64(time.Since(genBase)) + 1 }
 
 // storeFill writes a fill's encoded response, in order when the store can.

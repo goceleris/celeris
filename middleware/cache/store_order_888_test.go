@@ -53,12 +53,6 @@ func TestMemoryStoreSetIfNewer888(t *testing.T) {
 			_ = m.setIfNewer(ctx, "k", []byte("fill"), time.Minute, base)
 			_ = m.Set(ctx, "k", []byte("set"), time.Minute)
 		}, "set"},
-		{"fill-that-started-before-a-plain-Set-does-not-replace-it", func(m *MemoryStore) {
-			start := genNow()
-			time.Sleep(2 * time.Millisecond)
-			_ = m.Set(ctx, "k", []byte("set"), time.Minute)
-			_ = m.setIfNewer(ctx, "k", []byte("fill"), time.Minute, start)
-		}, "set"},
 		{"expired-entry-does-not-block-an-older-generation", func(m *MemoryStore) {
 			_ = m.setIfNewer(ctx, "k", []byte("new"), 20*time.Millisecond, base+10)
 			time.Sleep(40 * time.Millisecond)
