@@ -25,6 +25,42 @@ type Hijacker interface {
 // The stream's own context, cancelled with the stream, is stream.Context():
 // it is made the first time a use of the stream asks for it (celeris#836),
 // so a stream whose handler never asks costs no allocation.
+//
+// On the epoll and io_uring engines a handler that calls runtime.Goexit has
+// two outcomes on HTTP/2, depending on where the stream runs. Neither can be
+// recovered (recover() returns nil for a Goexit).
+//
+// A stream runs inline, on the engine's event-loop goroutine, unless one of
+// the two cases below applies. Whether the request has a body does not matter:
+// every frame path (HEADERS, trailers, the DATA frame that ends the stream, a
+// header block completed by CONTINUATION frames) marks the request ended
+// before it runs the handler, so a POST with a body is as inline as a GET.
+// The checks are Processor.canRunInline (the request has ended; the route is
+// not async) and, in Processor.runHandler, the outbound budget. A Goexit in an
+// inline handler ends that loop for good, and the engine logs one Error, "...
+// goroutine ended without returning" (celeris#848). The stream gets no
+// response, and neither do the other streams of the connection or the other
+// connections of that loop. A panic is recovered here and the stream is
+// closed without a response; through the celeris router a panic is a 500
+// first.
+//
+// A stream runs on the h2 worker pool in these two cases only: its route is
+// async, or its connection already holds OutboundBudget bytes of response
+// DATA for the peer's window (celeris#893), which sends even a sync route to
+// the pool. executeHandler retires such a stream silently. The stream gets no
+// response and no RST_STREAM, nothing is logged, the connection is not closed
+// and keeps serving its other streams, and the loop survives. Marking a
+// route async keeps a Goexit off the event loop; it does not make the Goexit
+// visible.
+//
+// On HTTP/1.1 the same Handler runs the request, and the epoll and io_uring
+// engines apply the same split. A sync (inline) handler runs on the event-loop
+// goroutine: a Goexit ends the loop and the engine logs the same Error
+// (celeris#848), and a panic that escapes the handler is not recovered and
+// ends the process (the celeris router answers a handler panic with a 500
+// first). An async handler runs on its own goroutine: its Goexit or panic
+// closes that connection and the engine logs an Error, and the loop keeps
+// serving. So a sync handler must not call runtime.Goexit on either protocol.
 type Handler interface {
 	HandleStream(ctx context.Context, stream *Stream) error
 }
@@ -117,6 +153,20 @@ type Streamer interface {
 	Flush(stream *Stream) error
 	// Close signals end of the response body.
 	Close(stream *Stream) error
+}
+
+// DetachNotifier is an optional interface a ResponseWriter may implement to
+// be told that the handler detached the stream (Context.Detach): from then on
+// the stream is the connection's, and runs until the peer or the handler ends
+// it, as it does on the native engines, which apply neither ReadTimeout nor
+// WriteTimeout to a detached connection. The std engine implements it to clear
+// the write deadline net/http armed for the request, and to bound the stream's
+// writes one at a time instead (celeris#855). StreamDetached is called once
+// per detach, on the goroutine that called Detach, before Detach returns; the
+// native engines' writers do not implement it, so the check costs a detach (a
+// stream's start) one failed type assertion.
+type DetachNotifier interface {
+	StreamDetached()
 }
 
 // UseStreamer is a Streamer whose calls are tied to one use of a stream

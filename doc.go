@@ -40,7 +40,10 @@
 //
 // By default handlers run inline on the I/O worker; mark I/O-bound routes with
 // [Route.Async] (or flip the default via [Config.AsyncHandlers]) to dispatch
-// them on a per-connection goroutine.
+// them on a per-connection goroutine. An inline handler must not call
+// [runtime.Goexit] (t.FailNow, t.Fatal and t.SkipNow in a test's handler do):
+// on the native engines it ends the event loop the handler runs on; see
+// [Route.Sync].
 //
 // On Linux, [Config.Engine] selects between [IOUring], [Epoll], [Adaptive] and
 // [Std]; other platforms run [Std] only. [Config.Protocol] selects [HTTP1],
