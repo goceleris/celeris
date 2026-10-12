@@ -764,6 +764,14 @@ func (e *Engine) ResumeAccept() error {
 		// one.
 		w.listenFDClosed.Store(false)
 		w.wakeIfSuspended()
+		// A worker that cannot park (it holds a connection) closed its
+		// listener at the pause and went back to its ring wait, which
+		// is up to a second long with no listener (Worker.baseTimeout).
+		// wakeIfSuspended does not reach it: the wake eventfd, whose
+		// POLL_ADD the worker keeps armed in every mode, does
+		// (celeris#886). A leaf lock and one write(2); a worker that is
+		// running just reads the counter at its next wakeup.
+		w.wakeFD.Signal()
 	}
 	return nil
 }
