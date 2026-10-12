@@ -33,7 +33,8 @@ import (
 // the connection is closed, and the heap does not grow with what was sent.
 // Then the pre-detection deadline: a client that sends "GE" and stalls, one
 // that dribbles the HTTP/2 preface, and one that sends nothing, must be
-// reaped by ReadHeaderTimeout, which counts from accept.
+// reaped by ReadHeaderTimeout, which counts from the engine's accept (the first
+// byte where TCP_DEFER_ACCEPT is on).
 
 // garbageChunk974 is one write of the flood; the flood is garbageChunks974 of
 // them. The base build keeps all of it (the E5 probe measured +146 MiB of heap

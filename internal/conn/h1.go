@@ -88,8 +88,9 @@ func (s *H1State) ArmHeaderDeadline() {
 // nanoseconds; 0 for no limit, which is ArmHeaderDeadline). The engines call
 // it from initProtocol with the deadline they gave the conn at accept, so
 // that deciding the protocol does not start the budget again: ReadHeaderTimeout
-// then bounds the first request as a whole, from accept, as net/http does
-// (celeris#974 review). Like ArmHeaderDeadline it is a no-op when the deadline
+// then bounds the first request as a whole, from the engine's accept
+// (celeris#974 review). Where the listener defers accept to the first byte
+// (TCP_DEFER_ACCEPT), that is the first byte, not the handshake. Like ArmHeaderDeadline it is a no-op when the deadline
 // is already armed or ReadHeaderTimeoutNs is 0, and it calls
 // OnHeaderDeadlineArmed on arming. A notAfter that has already passed arms a
 // deadline that has passed, and OnHeaderDeadlineArmed may then close the conn

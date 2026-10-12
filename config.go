@@ -108,14 +108,15 @@ type Config struct {
 	//
 	// The std engine wires this to http.Server.ReadHeaderTimeout; the
 	// iouring/epoll engines enforce the same budget inside their H1
-	// header read loop. On the io_uring engine it also counts from accept
-	// for a connection whose protocol is not detected yet (Protocol Auto, or
-	// H2C with EnableH2Upgrade): a client that sends nothing, a few bytes of
-	// a request line, or a dribble of the HTTP/2 preface is closed at the
-	// deadline, and the header read then gets a fresh budget once the
-	// protocol is known, so a slow client can hold a connection for up to
-	// twice this value before its first request is complete. The epoll
-	// engine does not yet bound that first phase.
+	// header read loop. On both it also counts for a connection whose
+	// protocol is not detected yet (Protocol Auto, or H2C with
+	// EnableH2Upgrade): a client that sends nothing, a few bytes of a request
+	// line, or a dribble of the HTTP/2 preface is closed at the deadline, and
+	// detecting the protocol does not start the budget again, so the first
+	// request is bounded as a whole. The budget counts from the engine's
+	// accept, which with TCP_DEFER_ACCEPT (see DisableDeferAccept) is the
+	// connection's first byte or about a second after its SYN, whichever
+	// comes first; std counts from the handshake.
 	ReadHeaderTimeout time.Duration
 	// WriteTimeout is the max duration for writing the response.
 	// Zero uses the default (60s). Set to -1 for no timeout.
