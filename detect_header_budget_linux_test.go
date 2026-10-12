@@ -5,7 +5,9 @@ package celeris_test
 import (
 	"io"
 	"net"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,5 +122,71 @@ func TestRequestCompletedAfterTheBudgetIsNotServed(t *testing.T) {
 					readHeaderTimeout974+50*time.Millisecond, readHeaderTimeout974, b)
 			}
 		})
+	}
+}
+
+// TestSpentBudgetReturnsItsRingBuffer: with multishot recv the deciding recv of
+// a conn arrives in a buffer of the worker's provided-buffer ring, and the
+// close of a conn whose budget is spent (the exit TestRequestCompletedAfterTheBudgetIsNotServed
+// takes) has to give the buffer back to the ring. One that is dropped is gone
+// for good. A worker's ring holds at least 1024 buffers (bufRingCountMin, the
+// size this test pins with CELERIS_IOURING_PBUF_COUNT), so the test sends three
+// rings' worth of such conns: whatever the split between workers, each is past
+// its ring. A GET on a new conn is then answered.
+func TestSpentBudgetReturnsItsRingBuffer(t *testing.T) {
+	const (
+		ringSize = 1024 // bufRingCountMin
+		lateConn = 3 * ringSize
+		parallel = 256
+	)
+	t.Setenv("CELERIS_IOURING_PBUF_COUNT", strconv.Itoa(ringSize))
+	engine974{"io_uring-mshot", celeris.IOUring, false, true}.env974(t)
+	addr := startAuto974(t, celeris.IOUring, func(c *celeris.Config) {
+		c.Workers = 2
+		c.ReadHeaderTimeout = readHeaderTimeout974
+		c.ReadTimeout = 5 * time.Minute
+		c.IdleTimeout = 5 * time.Minute
+	})
+	var answered, closed atomic.Int64
+	sem := make(chan struct{}, parallel)
+	done := make(chan struct{}, lateConn)
+	for i := 0; i < lateConn; i++ {
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; done <- struct{}{} }()
+			c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			_, _ = io.WriteString(c, "GE")
+			time.Sleep(readHeaderTimeout974 + 50*time.Millisecond)
+			_, _ = io.WriteString(c, "T /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+			_ = c.SetReadDeadline(time.Now().Add(closeWithin974))
+			b, _ := io.ReadAll(c)
+			if strings.HasPrefix(string(b), "HTTP/1.1 200") {
+				answered.Add(1)
+			} else {
+				closed.Add(1)
+			}
+		}()
+	}
+	for i := 0; i < lateConn; i++ {
+		<-done
+	}
+	t.Logf("%d of %d conns completed their request after the budget: %d answered, %d closed unanswered", answered.Load()+closed.Load(), lateConn, answered.Load(), closed.Load())
+	if answered.Load() != 0 {
+		t.Errorf("%d requests completed after ReadHeaderTimeout were answered", answered.Load())
+	}
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = io.WriteString(conn, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	b, _ := io.ReadAll(conn)
+	if !strings.HasPrefix(string(b), "HTTP/1.1 200") || !strings.HasSuffix(string(b), "ok") {
+		t.Errorf("a GET after %d conns closed on a spent budget got %q, want a 200 answer: a worker's ring ran out of buffers", lateConn, b)
 	}
 }
