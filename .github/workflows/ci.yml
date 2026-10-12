@@ -178,16 +178,12 @@ jobs:
           #     "celeris#662 tcp_synack_retries=0 guard" sets it and forbids the skip.
           #   * TestProbeNonLinux and TestValidateEngineRequiresLinux: they check
           #     the behaviour on other operating systems, so they skip on Linux.
-          #   * TestEnableH2UpgradeFalseDisablesUpgradeOnAuto964/std/false-serves-http1:
-          #     the std engine ignores EnableH2Upgrade=&false (celeris#964, open); the
-          #     test skips that one case on every Linux run. Delete this entry with the
-          #     engine fix.
           # The entries are matched by name, not by package: two of them
           # (the TestPauseAccept...SynackRetriesZero pair) exist in internal/engine/iouring
           # too. That is safe only while this step excludes /engine/iouring$ (the
           # pkgs line above; the step after it runs that package with its own list).
           # A name added here allows that name in every package this step runs.
-          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux|TestEnableH2UpgradeFalseDisablesUpgradeOnAuto964/std/false-serves-http1'
+          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux'
           required='TestSendfileEndToEndLargeFile|TestSendfileHEADNoBody|TestSendfileRangeRequest|TestSendfileSubThresholdFallback'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
           ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/root.log || true)
