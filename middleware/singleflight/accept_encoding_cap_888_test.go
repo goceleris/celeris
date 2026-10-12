@@ -36,7 +36,7 @@ func TestAcceptEncodingCapBoundary888(t *testing.T) {
 	if len(long) <= maxCanonicalAE {
 		t.Fatalf("test list is only %d bytes, below the cap %d", len(long), maxCanonicalAE)
 	}
-	if key(long) != key(long) || key(long) == key(longSpaced) {
+	if key(long) != key(strings.Clone(long)) || key(long) == key(longSpaced) {
 		t.Errorf("a list past the cap: want equal values to share a key and spellings not to")
 	}
 	if !strings.Contains(key(long), long) {
