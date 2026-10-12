@@ -83,8 +83,14 @@ func defaultKeyFunc(c *celeris.Context) string {
 	// The encoding compress negotiates comes from Accept-Encoding, so
 	// requests that accept different encodings get different responses
 	// (celeris#912). Equivalent values (blanks, case) are one key part.
+	// A value past maxCanonicalAE is held as sent, copied once, into the key.
 	var aeBuf [64]byte
-	ae := canonicalAppend(aeBuf[:0], "accept-encoding", c.Header("accept-encoding"))
+	var ae []byte
+	aeLong := c.Header("accept-encoding")
+	if len(aeLong) <= maxCanonicalAE {
+		ae = canonicalAppend(aeBuf[:0], "accept-encoding", aeLong)
+		aeLong = ""
+	}
 	var val [len(keyValidators)]string
 	for i, v := range keyValidators {
 		val[i] = c.Header(v.header)
@@ -116,8 +122,8 @@ func defaultKeyFunc(c *celeris.Context) string {
 			n += 3 + len(v)
 		}
 	}
-	if len(ae) > 0 {
-		n += 3 + len(ae)
+	if len(ae) > 0 || aeLong != "" {
+		n += 3 + len(ae) + len(aeLong)
 	}
 	for i, v := range val {
 		if v != "" {
@@ -144,9 +150,10 @@ func defaultKeyFunc(c *celeris.Context) string {
 		b.WriteString("\x00c=")
 		b.WriteString(cookie)
 	}
-	if len(ae) > 0 {
+	if len(ae) > 0 || aeLong != "" {
 		b.WriteString("\x00e=")
 		b.Write(ae)
+		b.WriteString(aeLong)
 	}
 	for i, v := range val {
 		if v != "" {
