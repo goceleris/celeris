@@ -96,12 +96,12 @@ func runPair(t *testing.T, mw celeris.HandlerFunc, handlers []celeris.HandlerFun
 const reprBody = "the full representation of /doc"
 
 // negotiating answers with a representation chosen by Accept-Encoding, as
-// compress does: "gzip:"-prefixed with Content-Encoding: gzip when the
+// compress does (the token is matched without regard to case): "gzip:"-prefixed with Content-Encoding: gzip when the
 // request accepts gzip, the identity body otherwise, and Vary:
 // Accept-Encoding on both.
 func negotiating(c *celeris.Context) error {
 	c.AddHeader("vary", "Accept-Encoding")
-	if strings.Contains(c.Header("accept-encoding"), "gzip") {
+	if strings.Contains(strings.ToLower(c.Header("accept-encoding")), "gzip") {
 		c.SetHeader("content-encoding", "gzip")
 		return c.Blob(200, "text/plain", []byte("gzip:"+reprBody))
 	}
