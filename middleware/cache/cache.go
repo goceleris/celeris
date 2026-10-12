@@ -349,11 +349,20 @@ const maxDeltaSeconds = math.MaxInt32
 // represent), so that maxAge seconds always fits a time.Duration. The
 // directives are matched as tokens, so x-private-ext is not private and
 // x-max-age=0 is not max-age=0, and the storage decision and the TTL come from
-// this one parse (celeris#888 item 27).
+// this one parse (celeris#888 item 27). A value with a quote that
+// nextDirective cannot read around (a string that never closes, a stray
+// double quote) counts as noStore: what follows it cannot be told from a
+// string.
 func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 	for len(cc) > 0 {
 		var d string
-		d, cc = nextDirective(cc)
+		var doubtful bool
+		d, cc, doubtful = nextDirective(cc)
+		if doubtful {
+			// A quote the directives cannot be read around: the ones after
+			// it may be hidden, so the response is not stored.
+			return true, 0, false
+		}
 		name, val, _ := strings.Cut(d, "=")
 		switch strings.TrimSpace(name) {
 		case "no-store", "private", "no-cache":
@@ -375,20 +384,40 @@ func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 
 // nextDirective splits the first comma-separated directive off a
 // Cache-Control value; a comma inside a quoted string (no-cache="a, b") does
-// not end it.
-func nextDirective(cc string) (directive, rest string) {
+// not end it. A quoted string starts only at the double quote that directly
+// follows the directive's first "=" (RFC 9111 5.2: directive = token ["="
+// (token / quoted-string)]), and inside a string a backslash escapes the byte
+// after it (RFC 9110 5.6.4: ext="a\"" is one string), so a quoted-pair does
+// not end a string early and a string does not start anywhere else.
+// doubtful reports a value this cannot read with certainty: a string still
+// open at the end of the value, or a double quote anywhere but where a string
+// starts (ext=a"b, ext=a="b, private", "private"). The directives after such
+// a quote may be hidden in a string or cut by one, so the caller must not
+// trust the rest of the value.
+func nextDirective(cc string) (directive, rest string, doubtful bool) {
 	inQuote := false
+	eq := -2 // the index of the directive's first "=", -2 until it is seen
 	for i := 0; i < len(cc); i++ {
-		switch cc[i] {
-		case '"':
-			inQuote = !inQuote
-		case ',':
-			if !inQuote {
-				return cc[:i], cc[i+1:]
+		switch {
+		case inQuote:
+			switch cc[i] {
+			case '\\':
+				i++
+			case '"':
+				inQuote = false
 			}
+		case cc[i] == '"':
+			if eq < 0 || i != eq+1 {
+				return cc, "", true
+			}
+			inQuote = true
+		case cc[i] == '=' && eq < 0:
+			eq = i
+		case cc[i] == ',':
+			return cc[:i], cc[i+1:], false
 		}
 	}
-	return cc, ""
+	return cc, "", inQuote
 }
 
 // atoiPrefix parses the leading decimal digits of v.
