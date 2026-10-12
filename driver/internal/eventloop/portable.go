@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
 )
@@ -302,8 +304,47 @@ func (w *portableWorker) UnregisterConn(fd int) error {
 	return nil
 }
 
+// DefaultPortableWriteTimeout is how long one Write of the portable fallback
+// may take to hand its bytes to the kernel before it fails. It is the default
+// of [SetPortableWriteTimeout].
+const DefaultPortableWriteTimeout = 30 * time.Second
+
+// portableWriteTimeout is the configured bound in nanoseconds: 0 stands for
+// DefaultPortableWriteTimeout, a negative value for no bound.
+var portableWriteTimeout atomic.Int64
+
+// SetPortableWriteTimeout sets how long one Write of the portable fallback
+// (the loop of darwin and windows) may block before it fails. d > 0 is that
+// bound, d == 0 restores [DefaultPortableWriteTimeout] (30 s), and d < 0
+// removes the bound, as before celeris#887. It applies to the Writes issued
+// after the call, on every portable worker of the process.
+//
+// Write must not wait for the kernel for good, as the Linux workers' Write
+// does not: it queues the bytes and returns. A peer that stops reading would
+// otherwise stall the writer under the conn's write lock, and, from an onRecv
+// that writes (postgres's startup answers), the conn's reader goroutine too,
+// until the conn is closed. A Write that times out may have sent part of its
+// bytes, so the conn is closed (onClose fires with the timeout error), not
+// left to carry a torn message.
+func SetPortableWriteTimeout(d time.Duration) { portableWriteTimeout.Store(int64(d)) }
+
+// currentPortableWriteTimeout is the bound a Write issued now applies, or 0
+// for none.
+func currentPortableWriteTimeout() time.Duration {
+	switch d := time.Duration(portableWriteTimeout.Load()); {
+	case d == 0:
+		return DefaultPortableWriteTimeout
+	case d < 0:
+		return 0
+	default:
+		return d
+	}
+}
+
 // Write serializes per-FD via writeMu; the standalone fallback has no
-// cross-conn queue so ErrQueueFull is never returned here.
+// cross-conn queue so ErrQueueFull is never returned here. The Write is
+// bounded by the write timeout (see [SetPortableWriteTimeout]); one that runs
+// out of time closes the conn and returns the timeout error.
 func (w *portableWorker) Write(fd int, data []byte) error {
 	if w.closed.Load() {
 		return ErrLoopClosed
@@ -322,7 +363,23 @@ func (w *portableWorker) Write(fd int, data []byte) error {
 		return engine.ErrUnknownFD
 	}
 	c.mu.Unlock()
+	// The deadline is set on every Write, so a changed or removed bound
+	// takes effect and a deadline left by a previous Write does not.
+	var deadline time.Time
+	if d := currentPortableWriteTimeout(); d > 0 {
+		deadline = time.Now().Add(d)
+	}
+	_ = c.conn.SetWriteDeadline(deadline)
 	_, err := c.conn.Write(data)
+	if err != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+		// Part of data may be on the wire: the stream is torn. The reader
+		// observes the close and reports err to onClose; shutdownConn takes
+		// c.mu only, and no callback runs under writeMu. The entry stays in
+		// w.conns until the owner calls UnregisterConn (the reader's closing
+		// branch does not delete it): a RegisterConn of the same number before
+		// then gets ErrAlreadyRegistered. The drivers unregister in Close.
+		c.shutdownConn(err)
+	}
 	return err
 }
 

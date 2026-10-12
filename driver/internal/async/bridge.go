@@ -122,21 +122,34 @@ func (b *Bridge) Len() int {
 }
 
 // DrainWithError pops every pending request and invokes notify with the
-// given error for each one. The queue is left empty on return. notify must
-// not call back into Bridge on the same instance — do that from a separate
-// goroutine if needed.
+// given error for each one, in queue order. The queue is left empty on
+// return. notify must not call back into Bridge on the same instance — do
+// that from a separate goroutine if needed.
+//
+// The requests are taken out of the ring, and their slots cleared, under b.mu;
+// notify runs after the lock is released and touches only that copy. The ring
+// is shared with Enqueue and Pop, which reuse its slots as soon as head and
+// size are reset: a drain that walked the ring after unlocking would read
+// and clear slots a concurrent Enqueue had just filled, notifying the new
+// request with the old requests' error and losing an old one (celeris#887).
 func (b *Bridge) DrainWithError(err error, notify func(PendingRequest, error)) {
 	b.mu.Lock()
-	head, size, mask := b.head, b.size, b.mask
-	ring := b.ring
+	var drained []PendingRequest
+	if notify != nil && b.size > 0 {
+		drained = make([]PendingRequest, 0, b.size)
+	}
+	for i := 0; i < b.size; i++ {
+		idx := (b.head + i) & b.mask
+		if drained != nil {
+			drained = append(drained, b.ring[idx])
+		}
+		b.ring[idx] = nil
+	}
 	b.head = 0
 	b.size = 0
 	b.mu.Unlock()
-	for i := 0; i < size; i++ {
-		idx := (head + i) & mask
-		req := ring[idx]
-		ring[idx] = nil
-		if notify != nil && req != nil {
+	for _, req := range drained {
+		if req != nil {
 			notify(req, err)
 		}
 	}
