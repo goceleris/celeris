@@ -11,13 +11,17 @@ package postgres
 // failAll close the channels of a request the pool already handed to the next
 // query.
 //
-// The window is forced here without a hook in the driver: the test holds the
-// request's chMu, which failAll takes (closeRowCh) as its first access to a
-// request after it took the queue, runs the caller's half in that gap, and only
-// then lets failAll go on. A forced order is also a synchronised one, so the
-// race detector cannot see this order; the tests assert what a recycled
-// request looks like instead (the -race run of TestPgNetConnServerHangUp is the
-// detector's witness).
+// The window is forced here without a hook in the driver: the test holds a
+// mutex of the request that failAll takes after it took the queue, runs the
+// caller's half in that gap, and only then lets failAll go on. Gated at chMu,
+// failAll's first access to the request, the test unlocks after the release, so
+// the release happens before everything failAll does next and the race
+// detector has nothing to report: those two tests assert what a recycled
+// request looks like (ctx reset, rowCh and colsCh never closed, err lost). The
+// third test gates at doneMu, failAll's last access, so failAll's chMu section
+// is not ordered after the release and the detector reports the release
+// against it on the pre-fix tree, besides the assertion. The -race -count run
+// of TestPgNetConnServerHangUp is the witness of the unforced order.
 
 import (
 	"context"
