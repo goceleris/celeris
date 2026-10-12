@@ -408,6 +408,92 @@ func TestDetachedHijack855(t *testing.T) {
 	rw.streamEnded()
 }
 
+// celeris#889 item 35 (from the #998 round-3 review): Context.Hijack followed
+// by Context.Detach. Hijack goes through net/http's own writer, so
+// detachedWriter.Hijack and abandon() never run; StreamDetached then wrapped the
+// already-hijacked writer, and end() set a write deadline of WriteTimeout on the
+// hijacked connection when ServeHTTP returned. The connection is the caller's:
+// nothing of ours may touch it.
+func TestHijackThenDetachSetsNoDeadline855(t *testing.T) {
+	e, cancel := engine855(30 * time.Millisecond)
+	defer cancel()
+	w := newDLWriter855()
+	rw := &stdResponseWriter{w: hijackWriter855{w}, eng: e}
+	c, err := rw.Hijack(testStream855(t))
+	if err != nil || c == nil {
+		t.Fatalf("Hijack: %v, %v", c, err)
+	}
+	defer func() { _ = c.Close() }()
+	w.take()
+	rw.StreamDetached()
+	if got := w.take(); len(got) != 0 {
+		t.Fatalf("StreamDetached on a hijacked writer touched the connection: %v", got)
+	}
+	if name := fmt.Sprintf("%T", rw.w); !strings.HasSuffix(name, ".hijackedWriter") {
+		t.Fatalf("a detach after a hijack wrapped the hijacked writer in %s, want it left as the hijackedWriter marker", name)
+	}
+	cancel() // the budget runs out: nothing to poke
+	time.Sleep(60 * time.Millisecond)
+	rw.streamEnded() // ServeHTTP returns: end() must not arm a write deadline
+	if got := w.take(); len(got) != 0 {
+		t.Fatalf("the end of a hijacked, detached request touched the connection: %v", got)
+	}
+}
+
+// The same on a real connection: the hijacked connection is still writable
+// well past WriteTimeout after the handler returned.
+func TestHijackThenDetachKeepsTheConnectionPastWriteTimeout855(t *testing.T) {
+	const wt = 150 * time.Millisecond
+	e, cancel := engine855(wt)
+	defer cancel()
+	late := make(chan error, 1)
+	again := make(chan error, 1)
+	srv := &http.Server{WriteTimeout: wt, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rw := &stdResponseWriter{w: w, eng: e}
+		defer rw.streamEnded() // as Bridge.ServeHTTP does
+		s := testStream855(t)
+		conn, err := rw.Hijack(s)
+		if err != nil {
+			late <- err
+			return
+		}
+		rw.StreamDetached()
+		_, err2 := rw.Hijack(s)
+		again <- err2
+		go func() {
+			defer func() { _ = conn.Close() }()
+			time.Sleep(3 * wt) // past the deadline end() would have armed
+			_, err := conn.Write([]byte("late"))
+			late <- err
+		}()
+	})}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(c)
+	if err := <-late; err != nil {
+		t.Fatalf("a write to the hijacked connection %v after the handler returned failed: %v (read %q)", 3*wt, err, got)
+	}
+	if string(got) != "late" {
+		t.Fatalf("the client read %q from the hijacked connection, want %q", got, "late")
+	}
+	if err := <-again; !errors.Is(err, http.ErrHijacked) {
+		t.Fatalf("a second Hijack: %v, want http.ErrHijacked", err)
+	}
+}
+
 // h2cServer855 serves h on an in-process h2c server (the x/net http2 server the std
 // engine runs on) and returns a client for it.
 func h2cServer855(tb testing.TB, h http.Handler) (cl *http.Client, url string) {
