@@ -213,6 +213,16 @@ func (c *Client) DoSlice(ctx context.Context, args ...any) ([]string, error) {
 // OnPush registers (or replaces) the push callback for RESP3 push frames
 // arriving on command connections. It is safe to call concurrently with
 // in-flight commands; delivery is best-effort. Pass nil to clear.
+//
+// fn does not run on the goroutine that issued a command. It runs where the
+// conn's bytes are read: on the event-loop worker goroutine that owns the
+// conn (which serves every other conn on that worker too), or on the calling
+// goroutine when a command reads its reply there. So fn must return quickly
+// and must not block: while it runs, no other conn on the worker is read. It
+// must not call runtime.Goexit (a test's t.FailNow or t.SkipNow, or a library
+// that does): on the worker that ends the goroutine, every conn on it is never
+// read again, and the driver logs an error through slog.Default. A panic in fn
+// is not recovered and ends the process.
 func (c *Client) OnPush(fn func(channel string, data []Value)) {
 	c.cfg.OnPush = fn
 	c.pool.setOnPush(fn)

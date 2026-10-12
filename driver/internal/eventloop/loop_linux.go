@@ -292,6 +292,23 @@ func (c *driverConn) setEvents(epfd int, in bool) {
 	}
 }
 
+// releaseOnExit is deferred by a WriteAndPoll* call right after it takes
+// c.recvMu. The call sets *released just before its own Unlock, so on the
+// normal path this does nothing and recvMu is let go before errorClose runs.
+// When a callback of the call (onRecv, isDone, beforeRearm) panics, or ends
+// the goroutine with runtime.Goexit, this re-arms EPOLLIN and lets go of
+// recvMu as the call would have, so the conn is not left masked and locked: the
+// worker would keep a busy turn of it queued for good and never read its bytes
+// again (celeris#887 item 17). A panic that the caller recovers is therefore
+// a failed call, not a dead conn.
+func (c *driverConn) releaseOnExit(epfd int, released *bool) {
+	if *released {
+		return
+	}
+	c.setEvents(epfd, true)
+	c.recvMu.Unlock()
+}
+
 func newLoop(workers int) (*Loop, error) {
 	// The standalone driver loop uses epoll. io_uring's SINGLE_ISSUER
 	// constraint conflicts with the WriteAndPoll sync fast path (caller
@@ -320,7 +337,7 @@ func newEpollLoop(workers int) (*Loop, error) {
 		l.wg.Add(1)
 		go func(w *worker) {
 			defer l.wg.Done()
-			w.run(ctx)
+			runWatched(w, ctx)
 		}(lw.(*worker))
 	}
 	return l, nil
@@ -661,6 +678,11 @@ func (w *worker) errorClose(c *driverConn, err error) {
 //     the call issues no further read(2) or epoll_ctl on the number: the
 //     next read it would issue makes it return engine.ErrUnknownFD instead
 //     (celeris#784).
+//   - A callback of the call (onRecv, and for WriteAndPollMulti isDone and
+//     beforeRearm) that panics, or ends the goroutine with runtime.Goexit,
+//     leaves the conn as the call would have: EPOLLIN is re-armed and recvMu
+//     is released (celeris#887). The call itself is not completed; the caller
+//     that recovers the panic should treat the conn as failed.
 //   - Edge-triggered epoll: we drain to EAGAIN inside WriteAndPoll, so no
 //     stale edge is left. After EPOLLIN is re-armed, the next kernel-buffer
 //     arrival fires a fresh edge.
@@ -746,6 +768,8 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 	// number: setEvents then masks nothing, so the mask cannot land on
 	// that conn (celeris#784).
 	c.recvMu.Lock()
+	released := false
+	defer c.releaseOnExit(epfd, &released)
 	c.setEvents(epfd, false)
 
 	// Step 3: Poll for the response in three phases:
@@ -858,6 +882,7 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 	// event-loop worker owns reads on this fd again. setEvents leaves a conn
 	// torn down under us alone: its number may be another conn's by now.
 	c.setEvents(epfd, true)
+	released = true
 	c.recvMu.Unlock()
 
 	if readErr != nil {
@@ -924,6 +949,8 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 
 	// Step 2: Mask EPOLLIN under recvMu.
 	c.recvMu.Lock()
+	released := false
+	defer c.releaseOnExit(epfd, &released)
 	c.setEvents(epfd, false)
 
 	// Step 3a — Phase A: 64 tight non-blocking reads. Unlike the
@@ -1045,6 +1072,7 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 	// Step 5: Re-enable EPOLLIN and release recvMu, unless the conn was torn
 	// down under us (see WriteAndPoll).
 	c.setEvents(epfd, true)
+	released = true
 	c.recvMu.Unlock()
 
 	if readErr != nil {
@@ -1120,6 +1148,8 @@ func (w *worker) WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func
 
 	// Step 2: Mask EPOLLIN.
 	c.recvMu.Lock()
+	released := false
+	defer c.releaseOnExit(epfd, &released)
 	c.setEvents(epfd, false)
 
 	// Step 3: Read loop until isDone or cumulative timeout.
@@ -1226,6 +1256,7 @@ done:
 	// Re-enable EPOLLIN, unless the conn was torn down under us (see
 	// WriteAndPoll).
 	c.setEvents(epfd, true)
+	released = true
 	c.recvMu.Unlock()
 
 	if readErr != nil {
