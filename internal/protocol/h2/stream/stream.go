@@ -40,6 +40,11 @@ const (
 	// pooled by the router) keeps pointing at the object, and a pooled object
 	// is the next request's, on any connection (celeris#904).
 	flagDetached uint32 = 1 << 4
+	// flagPlaceholder marks the idle stream a PRIORITY frame left in the
+	// manager (Manager.CreatePlaceholder): it counts against the
+	// connection's bound on placeholders until the stream is opened over it
+	// (TryOpenStream) or taken out of the map (takeLocked, handleGoAway).
+	flagPlaceholder uint32 = 1 << 5
 )
 
 // Stream represents an HTTP/2 stream with its associated state and data.
