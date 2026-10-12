@@ -1,6 +1,7 @@
 package std
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -54,6 +55,50 @@ func BenchmarkBridgeServeHTTP(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				clear(w.h)
+				br.ServeHTTP(w, req)
+			}
+		})
+	}
+}
+
+// rewindBody is a request body that can be read again (Reset) without an
+// allocation.
+type rewindBody struct{ bytes.Reader }
+
+func (*rewindBody) Close() error { return nil }
+
+// BenchmarkBridgeServeHTTPBody measures the body block of Bridge.ServeHTTP
+// (celeris#889 item 25): a POST of 512 bytes with its Content-Length declared
+// (the declared-length check is one comparison on the way to the read), and a
+// POST declaring a body over MaxRequestBodySize, which is refused before it is
+// read (the read of up to the limit plus one was the cost before).
+func BenchmarkBridgeServeHTTPBody(b *testing.B) {
+	payload := make([]byte, 512)
+	for _, tc := range []struct {
+		name  string
+		major int
+		limit int64
+		cl    int64
+	}{
+		{"HTTP1Declared", 1, 4096, 512}, {"HTTP2Declared", 2, 4096, 512},
+		{"HTTP1UnknownLength", 1, 4096, -1},
+		{"HTTP1Refused", 1, 256, 512}, {"HTTP2Refused", 2, 256, 512},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			e, err := New(resource.Config{Addr: "127.0.0.1:0", Engine: engine.Std, Protocol: engine.HTTP1, MaxRequestBodySize: tc.limit}, okStreamHandler{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			br := &Bridge{engine: e, handler: okStreamHandler{}}
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.ProtoMajor, req.ContentLength = tc.major, tc.cl
+			body := &rewindBody{}
+			w := &discardResponseWriter{h: http.Header{}}
+			b.ReportAllocs()
+			for b.Loop() {
+				clear(w.h)
+				body.Reset(payload)
+				req.Body = body
 				br.ServeHTTP(w, req)
 			}
 		})

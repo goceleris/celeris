@@ -177,6 +177,13 @@ func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Co
 	if err != nil {
 		return nil, nil, err
 	}
+	// A declared Content-Length over the limit is refused before a byte of
+	// the body is read: the client may never send it, and the read below
+	// would wait for the bytes (or for ReadTimeout). No length declared (-1,
+	// chunked) keeps the read, which stops one byte past the limit.
+	if maxBody > 0 && r.ContentLength > maxBody {
+		return nil, nil, errH2CUpgradeBodyTooLarge
+	}
 	// The request is served as stream 1, body included: read it before the
 	// connection is taken over, but no further than the limit that applies
 	// to every request body (Bridge.ServeHTTP reads the same way: one byte

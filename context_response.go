@@ -1519,7 +1519,8 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // arms one write deadline for the whole response (WriteTimeout); Detach clears
 // it for this request, so the stream is not cut at WriteTimeout, as it is not
 // on the native engines. ReadTimeout never cuts a stream there: net/http has
-// stopped it by the time the handler runs. In its place, each Write or Flush
+// stopped it by the time the handler runs. A connection that [Context.Hijack]
+// took over is the caller's: Detach after a Hijack sets no deadline on it. In its place, each Write or Flush
 // of the detached stream fails if it has not finished within WriteTimeout (a
 // client that stays connected and reads nothing ends the stream that way; no
 // bound at WriteTimeout -1), and when Shutdown's budget
@@ -1582,10 +1583,13 @@ func (c *Context) Detach() (done func()) {
 	if c.stream.OnDetach != nil {
 		c.stream.OnDetach()
 	}
-	// The std engine's writer clears the deadlines net/http armed for the
-	// request, so a detached stream (SSE) is not cut at ReadTimeout or
-	// WriteTimeout, as it is not on the native engines (celeris#855). Here, not
-	// in OnDetach, which std leaves nil: EngineSupportsAsyncDetach reads it.
+	// The std engine's writer clears the write deadline net/http armed for the
+	// request, so a detached stream (SSE) is not cut at WriteTimeout, as it is
+	// not on the native engines (celeris#855); the per-write stall bound takes
+	// its place. The read deadline is left alone: net/http has stopped it by
+	// the time the handler runs. A connection already hijacked is left alone
+	// too. Here, not in OnDetach, which std leaves nil:
+	// EngineSupportsAsyncDetach reads it.
 	if dn, ok := c.stream.ResponseWriter.(stream.DetachNotifier); ok {
 		dn.StreamDetached()
 	}
