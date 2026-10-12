@@ -1,6 +1,7 @@
 package singleflight
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -10,7 +11,12 @@ import (
 )
 
 type call struct {
-	wg sync.WaitGroup
+	// done is closed by the leader when it has published the response. It
+	// is made by the first waiter that joins, under g.mu, so a leader with
+	// no waiter never makes one; the leader reads it under the same mutex
+	// where it reads waiters, after it left the map, so no waiter can join
+	// later. Waiters select on it and their request context directly.
+	done chan struct{}
 	// waiters counts concurrent requests that joined this leader's
 	// in-flight state. Waiter goroutines increment under the group
 	// mutex (before registering on the WaitGroup); the leader reads
@@ -25,6 +31,11 @@ type call struct {
 	ct       string
 	err      error
 	panicVal any
+	// rerun is set when the leader's handler failed because the leader's own
+	// request context ended (its client went away, its deadline passed): that
+	// error is not the waiters', and each waiter runs its own handler
+	// instead of taking the leader's response (celeris#888 item 26).
+	rerun bool
 	// vary holds, for each request header the leader's response names in
 	// Vary, the header and the leader's value for it (a copy); varyAll is
 	// set when the response says Vary: *. A waiter whose request differs
@@ -59,6 +70,8 @@ func acquireCall() *call {
 	c.ct = ""
 	c.err = nil
 	c.panicVal = nil
+	c.rerun = false
+	c.done = nil
 	c.vary = c.vary[:0]
 	c.varyAll = false
 	c.waiters.Store(0)
@@ -105,29 +118,37 @@ func New(config ...Config) celeris.HandlerFunc {
 			// leader's delete-time check sees it. Any waiter that reaches
 			// this branch pairs with the leader's post-Next capture.
 			entry.waiters.Add(1)
+			if entry.done == nil {
+				entry.done = make(chan struct{})
+			}
+			done := entry.done
 			if testHookWaiterJoined != nil {
 				testHookWaiterJoined()
 			}
 			g.mu.Unlock()
-			// Race the leader's WaitGroup against the request context so a
-			// timeout middleware (or upstream client cancel) can preempt the
-			// wait instead of blocking until the leader returns. Without
+			// Race the leader's done channel against the request context so
+			// a timeout middleware (or upstream client cancel) can preempt
+			// the wait instead of blocking until the leader returns. Without
 			// this, timeout(preemptive) → singleflight(waiter) deadlocks
 			// when the leader exceeds the deadline because the timeout
-			// goroutine sits inside wg.Wait() with no way out.
-			waitDone := make(chan struct{})
-			go func() {
-				entry.wg.Wait()
-				close(waitDone)
-			}()
+			// goroutine would sit in the wait with no way out. The wait is a
+			// select on the one channel the leader closes: no goroutine per
+			// waiter (celeris#888 item 25).
 			select {
-			case <-waitDone:
+			case <-done:
 			case <-c.Context().Done():
 				return c.Context().Err()
 			}
 
 			if entry.panicVal != nil {
 				panic(entry.panicVal)
+			}
+
+			// The leader's own context ended and its handler said so: that
+			// error is the leader's client's, and this request's client may
+			// be there still. Run this request's own handler.
+			if entry.rerun {
+				return c.Next()
 			}
 
 			// The leader's response says it depends on a request header
@@ -151,7 +172,6 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		// Leader path: first request for this key.
 		entry := acquireCall()
-		entry.wg.Add(1)
 		g.m[key] = entry
 		g.mu.Unlock()
 
@@ -168,17 +188,27 @@ func New(config ...Config) celeris.HandlerFunc {
 			handlerErr = c.Next()
 		}()
 
-		// Remove from map BEFORE wg.Done so new requests after Done create
-		// fresh entries. Reading entry.waiters under the same mutex that
-		// gates waiter increments gives a consistent count of everyone who
-		// will read from this entry; capture is a no-op when nobody's
+		// Remove from map BEFORE closing done so new requests after it create
+		// fresh entries. Reading entry.waiters (and done) under the same mutex
+		// that gates waiter increments gives a consistent count of everyone
+		// who will read from this entry; capture is a no-op when nobody's
 		// waiting (the common single-flight miss).
 		g.mu.Lock()
 		delete(g.m, key)
 		numWaiters := entry.waiters.Load()
+		done := entry.done
 		g.mu.Unlock()
 
-		if numWaiters > 0 {
+		// The leader's own context ended and the handler's error says so.
+		if numWaiters > 0 && handlerErr != nil && panicVal == nil {
+			if cctx := c.Context(); cctx != nil {
+				if cerr := cctx.Err(); cerr != nil && errors.Is(handlerErr, cerr) {
+					entry.rerun = true
+				}
+			}
+		}
+
+		if numWaiters > 0 && !entry.rerun {
 			// Capture response state (deep copy) only when a waiter will
 			// consume it.
 			entry.status = c.ResponseStatus()
@@ -195,11 +225,13 @@ func New(config ...Config) celeris.HandlerFunc {
 			entry.err = handoff.Error(handlerErr)
 			entry.panicVal = handoff.Panic(panicVal)
 		}
-		entry.wg.Done()
+		if done != nil {
+			close(done)
+		}
 
 		// Pool-reuse the entry when no waiter referenced it. Entries seen
 		// by waiters stay live until the last reader drops them (the
-		// waiter path reads entry.body/headers/etc. after wg.Done); GC
+		// waiter path reads entry.body/headers/etc. after done closes); GC
 		// reclaims them then. Returning those to the pool would be a
 		// use-after-free.
 		if numWaiters == 0 {

@@ -30,7 +30,10 @@
 // the leader's own: build them from copies ([strings.Clone]) if a waiter may
 // read them, as celeris does for [celeris.BindError]'s Value. A waiter's
 // error is not the leader's error value, so compare with [errors.Is], not
-// ==.
+// ==. The exception is a leader whose own request context ended (its client
+// went away, its deadline passed) and whose handler returned that context's
+// error: that error is its client's, so each waiter runs its own handler
+// instead of returning it.
 //
 //	server.Use(singleflight.New())
 //
