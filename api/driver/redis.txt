@@ -362,6 +362,7 @@ var ErrPoolExhausted error
 var ErrProtocol error
 var ErrProtocolOversizedArray error
 var ErrProtocolOversizedBulk error
+var ErrPubSubConnDown error
 var ErrQueueFull error
 var ErrSentinelUnhealthy error
 var ErrTxAborted error

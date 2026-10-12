@@ -35,9 +35,9 @@ type Message struct {
 // is closed once [PubSub.Close] is called or the reconnect loop gives up.
 //
 // A subscribe/unsubscribe call on an open PubSub whose connection is down is
-// not sent: it returns a non-nil error that is neither [ErrClosed] nor the
-// engine's ErrUnknownFD, the subscription set is updated and the reconnect
-// replays it, so the call need not be repeated. Any other error from the
+// not sent: it returns [ErrPubSubConnDown] (match it with errors.Is; it is
+// neither [ErrClosed] nor [ErrUnknownFD]), the subscription set is updated and
+// the reconnect replays it, so the call need not be repeated. Any other error from the
 // write (for example [ErrQueueFull] on a live connection) means the command
 // was not sent and nothing replays it before the next reconnect. [ErrClosed]
 // means the PubSub itself is closed, also when [PubSub.Close] raced the call.
@@ -234,7 +234,7 @@ func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
 // the conn's number (celeris#929). When ps has no conn (it is closed, or the
 // reconnect loop has not yet replaced a dropped one) the sets are still
 // updated, so the reconnect replays them, and the call returns
-// errPubSubConnDown (not ErrClosed: ErrClosed is final, and the PubSub is
+// [ErrPubSubConnDown] (not ErrClosed: ErrClosed is final, and the PubSub is
 // open). ErrClosed is returned only when the PubSub is closed, including when
 // its Close raced the write and made it fail.
 func (ps *PubSub) control(verb string, names []string, update func()) error {
@@ -263,17 +263,23 @@ func (ps *PubSub) control(verb string, names []string, update func()) error {
 	// the reconnect loop replays the sets: tell the caller the write was not
 	// sent, but not that ps is closed.
 	if conn == nil || errors.Is(err, ErrClosed) || errors.Is(err, ErrUnknownFD) {
-		return errPubSubConnDown
+		return ErrPubSubConnDown
 	}
 	return err
 }
 
-// errPubSubConnDown is what a control call (Subscribe, Unsubscribe,
+// ErrPubSubConnDown is what a control call (Subscribe, Unsubscribe,
 // PSubscribe, PUnsubscribe, SSubscribe, SUnsubscribe) returns on an open
 // PubSub whose conn is down: the command was not sent, but the subscription
-// set is updated and the reconnect replays it, so the caller need not retry.
-// It is not exported (see the PubSub doc for what callers may rely on).
-var errPubSubConnDown = errors.New("celeris-redis: pubsub conn down, reconnecting")
+// set is updated, and the reconnect replays it while the PubSub is open, so
+// the caller need not repeat the call (see the [PubSub] doc for the cases where
+// no reconnect follows: the constructors [Client.Subscribe],
+// [Client.PSubscribe] and [ClusterClient.SSubscribe] can return it with a nil
+// PubSub, and after [Client.Close] the reconnect has no pool to dial). It is not [ErrClosed]
+// (the PubSub is open) and not [ErrUnknownFD] (the driver maps that to this
+// error when the loop forgot the conn). Match it with errors.Is. Messages
+// published while the conn is down are lost, as the [PubSub] doc says.
+var ErrPubSubConnDown = errors.New("celeris-redis: pubsub conn down")
 
 // sendPubSubControl writes a control command without tracking a reply (pubsub
 // control frames are delivered as push). The caller holds ps.ctlMu and read
@@ -372,6 +378,20 @@ func (ps *PubSub) deliver(m *Message) bool {
 // onConnDrop is invoked (on its own goroutine) by the underlying conn's close
 // hook. It spawns the reconnect loop unless one is already running or the
 // PubSub is closed.
+//
+// It does not look at which conn dropped, and that is deliberate (celeris#887
+// item 9). The reconnect loop detaches the conn it replaces (detach clears its
+// close hook) before it releases it, and a hook fires once, so a hook that
+// reaches here for a conn that is no longer ps.conn can only be one that was
+// already running when the conn was replaced. The worst it does is start one
+// reconnect that replaces a live conn with a fresh one and releases the old,
+// once: harmless. Comparing the dropped conn with ps.conn would avoid that
+// extra dial and cost a signature change in the hook plumbing and a second
+// lock on this path. No subscription is lost by the extra reconnect; a message
+// published in the swap window (the new conn's SUBSCRIBE is sent without
+// waiting for the server's reply, then the old, live conn is released) may be
+// lost, and one published just before the old conn is released may arrive
+// twice, as on any reconnect.
 func (ps *PubSub) onConnDrop(_ error) {
 	if ps.closed.Load() {
 		return

@@ -58,7 +58,9 @@ type Config struct {
 	// connection. The channel is the first element of the push array
 	// (e.g. "invalidate" for client-tracking invalidations) and data
 	// carries the remaining elements. If nil, push frames on command
-	// connections are silently dropped.
+	// connections are silently dropped. It runs on the event loop, not on
+	// the goroutine that issued a command: see [Client.OnPush] for what it
+	// must not do.
 	OnPush func(channel string, data []Value)
 }
 
@@ -116,7 +118,8 @@ func WithProto(p int) Option { return func(c *Config) { c.Proto = p } }
 // command connections (e.g. client-tracking invalidation messages). The
 // channel is the push kind (first array element) and data carries the
 // remaining elements. If unset, push frames on command connections are
-// silently dropped.
+// silently dropped. fn runs on the event loop: see [Client.OnPush] for what
+// it must not do.
 func WithOnPush(fn func(channel string, data []Value)) Option {
 	return func(c *Config) { c.OnPush = fn }
 }
