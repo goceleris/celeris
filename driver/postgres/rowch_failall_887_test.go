@@ -57,7 +57,13 @@ func TestFailAllWhileOnRowIsBlockedOnAFullRowCh887(t *testing.T) {
 	}
 
 	boom := errors.New("conn closed")
-	c.failAll(boom)
+	failed := make(chan struct{})
+	go func() { c.failAll(boom); close(failed) }()
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("failAll did not return within 5 s: it waits for an OnRow that nothing releases")
+	}
 
 	select {
 	case p := <-panicked:
@@ -194,7 +200,13 @@ func TestFailAllRacingAProducerNeverPanics887(t *testing.T) {
 			}
 		}()
 		time.Sleep(time.Duration(r%5) * 20 * time.Microsecond)
-		c.failAll(errors.New("conn closed"))
+		failed := make(chan struct{})
+		go func() { c.failAll(errors.New("conn closed")); close(failed) }()
+		select {
+		case <-failed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: failAll did not return within 5 s", r)
+		}
 		wg.Wait()
 		select {
 		case p := <-panics:
