@@ -73,7 +73,7 @@ func TestACloseOfAHealthyPortableLoopReportsNothing887(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	rec.waitClose(t)
+	_ = rec.waitClose(t)
 	if recs := h.snapshot(); len(recs) != 0 {
 		t.Errorf("a normal Close logged %d record(s): %v", len(recs), recs)
 	}
