@@ -154,8 +154,11 @@ func h2cFalse() *bool { b := false; return &b }
 func TestH2CUpgradeBasicGET(t *testing.T) {
 	for _, se := range specEngines {
 		if se.name == "std" {
-			// std engine uses x/net/http2/h2c middleware; its upgrade path is
-			// separate. These tests target the custom engines.
+			// std upgrades (TestH2CUpgradeConfigMatrix, the std package's
+			// tests), but this test and the ones below read the native
+			// engines' framing (stream 1 as one DATA frame that ends the
+			// stream) and, for a bad HTTP2-Settings, expect HTTP/1.1 where
+			// std answers 500 (celeris#889). They target the custom engines.
 			continue
 		}
 		t.Run(se.name, func(t *testing.T) {
@@ -320,9 +323,6 @@ func TestH2CUpgradeMissingConnectionToken(t *testing.T) {
 
 func TestH2CUpgradeAmbiguousUpgrade(t *testing.T) {
 	for _, se := range specEngines {
-		if se.name == "std" {
-			continue
-		}
 		t.Run(se.name, func(t *testing.T) {
 			addr := startSpecEngineWithConfig(t, se, func(c *resource.Config) {
 				c.Protocol = engine.Auto

@@ -43,6 +43,7 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"strings"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
@@ -71,8 +72,9 @@ import (
 // The connection is thereby served under the engine's own Config limits
 // (ReadTimeout, WriteTimeout, MaxHeaderBytes) and, since h2s.IdleTimeout is
 // copied from the server by ConfigureServer, IdleTimeout, which an h2c
-// connection used to be exempt from. Detection and the 500 on a failed
-// upgrade are unchanged. The body of an upgrade request is read as before,
+// connection used to be exempt from. Prior-knowledge detection and the 500 on
+// a failed upgrade are unchanged; the upgrade test takes h2c as the sole
+// token of Upgrade (isH2CUpgrade, celeris#889). The body of an upgrade request is read as before,
 // into memory before the connection is taken over, but no further than
 // MaxRequestBodySize (celeris#976), and a declared Content-Length over it is
 // refused before any of the body is read.
@@ -236,10 +238,24 @@ func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Co
 }
 
 // isH2CUpgrade reports whether the headers properly request an upgrade to h2c
-// (RFC 7540 3.2).
+// (RFC 7540 3.2): every Upgrade line is exactly the one token h2c, and the
+// Connection header lists HTTP2-Settings. A request that offers other
+// protocols as well ("Upgrade: websocket, h2c", a second Upgrade line) is not
+// one, as on epoll, io_uring and adaptive (SECURITY.md, "H2C upgrade
+// single-token Upgrade enforcement"): x/net's test, which this was, takes any
+// list that contains h2c, and picks h2c for a client that asked for a choice
+// among protocols (celeris#889).
 func isH2CUpgrade(h http.Header) bool {
-	return httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Upgrade")], "h2c") &&
-		httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Connection")], "HTTP2-Settings")
+	up := h[textproto.CanonicalMIMEHeaderKey("Upgrade")]
+	if len(up) == 0 {
+		return false
+	}
+	for _, v := range up {
+		if !strings.EqualFold(strings.TrimSpace(v), "h2c") {
+			return false
+		}
+	}
+	return httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Connection")], "HTTP2-Settings")
 }
 
 // h2cSettings returns the decoded HTTP2-Settings header.

@@ -248,3 +248,51 @@ func BenchmarkIsH2CUpgrade889(b *testing.B) {
 		})
 	}
 }
+
+// TestIsH2CUpgradeTakesSoleToken889: the Upgrade header is an upgrade to h2c
+// only when every line of it is exactly h2c, whatever the case or the
+// spacing, and Connection lists HTTP2-Settings. A list that offers other
+// protocols as well is not one (SECURITY.md: it would let a client that asked
+// a proxy or server for a choice, h2c or websocket, get h2c).
+func TestIsH2CUpgradeTakesSoleToken889(t *testing.T) {
+	conn := []string{"Upgrade, HTTP2-Settings"}
+	for _, tc := range []struct {
+		name string
+		h    http.Header
+		want bool
+	}{
+		{"h2c", http.Header{"Upgrade": {"h2c"}, "Connection": conn}, true},
+		{"H2C padded", http.Header{"Upgrade": {"  H2C "}, "Connection": conn}, true},
+		{"h2c twice", http.Header{"Upgrade": {"h2c", "h2c"}, "Connection": conn}, true},
+		{"websocket then h2c", http.Header{"Upgrade": {"websocket, h2c"}, "Connection": conn}, false},
+		{"h2c then foo", http.Header{"Upgrade": {"h2c, foo"}, "Connection": conn}, false},
+		{"two lines", http.Header{"Upgrade": {"websocket", "h2c"}, "Connection": conn}, false},
+		{"two lines, h2c first", http.Header{"Upgrade": {"h2c", "websocket"}, "Connection": conn}, false},
+		{"other protocol", http.Header{"Upgrade": {"websocket"}, "Connection": conn}, false},
+		{"no Upgrade", http.Header{"Connection": conn}, false},
+		{"no HTTP2-Settings token", http.Header{"Upgrade": {"h2c"}, "Connection": {"Upgrade"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isH2CUpgrade(tc.h); got != tc.want {
+				t.Fatalf("isH2CUpgrade(%v) = %v, want %v", tc.h, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMultiTokenUpgradeIsNotUpgraded889: on the wire, on every protocol that
+// upgrades, a request that offers h2c among other protocols is served as
+// HTTP/1.1 (200), not answered 101.
+func TestMultiTokenUpgradeIsNotUpgraded889(t *testing.T) {
+	const wire = "GET /upgrade HTTP/1.1\r\nHost: std.test\r\n" +
+		"Connection: Upgrade, HTTP2-Settings\r\nUpgrade: websocket, h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n"
+	for _, p := range protocols889 {
+		t.Run(p.proto.String(), func(t *testing.T) {
+			_, addr := startH2CEngineWith(t, newPathHandler(), nil, resolve889(p.proto, bool889(true)))
+			got := firstReply889(t, addr, wire)
+			if !strings.HasPrefix(string(got), "HTTP/1.1 200") {
+				t.Fatalf("Upgrade: websocket, h2c on Protocol %v with the upgrade on answered %q, want HTTP/1.1 200", p.proto, got)
+			}
+		})
+	}
+}
