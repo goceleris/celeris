@@ -1576,7 +1576,21 @@ func (c *Context) Detach() (done func()) {
 	}
 
 	c.extended = true
+	// detachDone is assigned before the Context is marked detached and before
+	// any engine hook runs: recoverAndRelease waits on it for every detached
+	// Context, and a nil channel blocks for ever. An OnDetach (or
+	// StreamDetached) that panics never returns the done func, so the guard
+	// below closes ch then, and the release path records the request without
+	// a snapshot and releases the Context (#889 item 32).
+	ch := make(chan struct{})
+	c.detachDone = ch
 	c.detached = true
+	returned := false
+	defer func() {
+		if !returned {
+			close(ch)
+		}
+	}()
 	// The use this Context is detached from. Its goroutine can outlive the
 	// handler, and on HTTP/2 the stream goes back to the pool then: the token
 	// lets StreamWriter tell the stream's next use from this one, and the mark
@@ -1603,8 +1617,7 @@ func (c *Context) Detach() (done func()) {
 			dn.StreamDetached()
 		}
 	}
-	ch := make(chan struct{})
-	c.detachDone = ch
+	returned = true
 	return func() {
 		// Snapshot status + elapsed BEFORE close so the metrics goroutine
 		// can read these without racing late writes from a handler that
