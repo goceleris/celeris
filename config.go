@@ -139,6 +139,18 @@ type Config struct {
 	// a large download or a chunked body written with [Context.StreamWriter]
 	// without Detach, stays under WriteTimeout as an absolute deadline for the
 	// whole response: raise it or set -1 for such routes.
+	//
+	// With -1 an HTTP/2 response on epoll, io_uring or adaptive that has to
+	// wait for the client's flow-control window has no deadline either: a
+	// handler that the connection's buffering budget (4 MiB) makes wait
+	// until the client grants window (a WINDOW_UPDATE) or the connection
+	// closes. A synchronous handler that waits for that handler, such as one
+	// that needs a lock the waiting handler holds across its response write,
+	// holds its event loop, and every connection on it, and if that loop also
+	// owns the slow client's connection it never sees the WINDOW_UPDATE or the
+	// close: the wait never ends, and Shutdown cannot stop the server. std
+	// recovers once the client closes. Keep WriteTimeout finite when handlers
+	// share locks across response writes.
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
 	// Zero uses the default (600s). Set to -1 for no timeout.
@@ -171,6 +183,10 @@ type Config struct {
 	// whose header list is over a fixed 64 KiB (the sum, over its fields, of
 	// len(name) + len(value) + 32, as RFC 9113 section 6.5.2 counts it) with
 	// RST_STREAM(ENHANCE_YOUR_CALM) on that stream, where std answers 431.
+	// They tell HTTP/2 clients that bound in their SETTINGS
+	// (SETTINGS_MAX_HEADER_LIST_SIZE = 65536), and end a connection that
+	// keeps sending header lists over it (GOAWAY ENHANCE_YOUR_CALM). std
+	// advertises the value net/http derives from MaxHeaderBytes instead.
 	MaxHeaderBytes int
 
 	// DisableKeepAlive disables HTTP keep-alive; each request gets its own connection.

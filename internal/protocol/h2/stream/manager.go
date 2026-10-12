@@ -53,6 +53,11 @@ type Manager struct {
 	// the lock. Only the event loop's drainRetired uses it, one call at a
 	// time (a frame batch ends, then the next one does), so it needs no lock.
 	drainBuf []*Stream
+
+	// placeholders counts the streams in the map that are PRIORITY placeholders
+	// (flagPlaceholder, CreatePlaceholder); guarded by mu. Last in the struct: the
+	// per-request fields keep their offsets.
+	placeholders int
 }
 
 // NewManager creates a new stream manager. Auxiliary maps
@@ -113,6 +118,52 @@ func (m *Manager) CreateStream(id uint32) *Stream {
 	return stream
 }
 
+// maxPriorityPlaceholders is the most idle streams one connection may hold
+// for PRIORITY frames (CreatePlaceholder). PRIORITY on an idle stream is how a
+// client builds a dependency tree ahead of its requests (RFC 9113 section
+// 5.3.2 deprecates it); x/net's priority write scheduler keeps at most ten idle
+// nodes (MaxIdleNodesInTree, its default, discarding the oldest). A Stream
+// costs about 1.2 KB, and a peer pays 14 bytes of wire for each, so the number
+// is small. Past it a PRIORITY frame is ignored.
+const maxPriorityPlaceholders = 16
+
+// CreatePlaceholder creates the idle stream a PRIORITY frame on a stream the
+// peer has not opened leaves behind, if the connection holds fewer than
+// maxPriorityPlaceholders; it reports false, and creates nothing, past that.
+// A stream that is in the map already is returned as it is.
+//
+// A placeholder is no stream the server has opened: it is not counted against
+// SETTINGS_MAX_CONCURRENT_STREAMS, the last client stream does not move, and
+// neither does the highest stream ID (GetLastStreamID), which a GOAWAY names.
+// TryOpenStream replaces it when HEADERS arrive on its identifier.
+func (m *Manager) CreatePlaceholder(id uint32) (*Stream, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.streams[id]; ok {
+		return s, true
+	}
+	if m.placeholders >= maxPriorityPlaceholders {
+		return nil, false
+	}
+	s := NewStream(id)
+	s.manager = m
+	s.RemoteAddr = m.RemoteAddr
+	//nolint:gosec // G115: safe conversion, initialWindowSize validated by protocol
+	s.SetWindowSize(int32(m.initialWindowSize))
+	s.flags.Or(flagPlaceholder)
+	m.streams[id] = s
+	m.placeholders++
+	return s, true
+}
+
+// dropPlaceholderLocked uncounts s if it is a placeholder that leaves the
+// map. m.mu must be held.
+func (m *Manager) dropPlaceholderLocked(s *Stream) {
+	if s.flags.Load()&flagPlaceholder != 0 && m.placeholders > 0 {
+		m.placeholders--
+	}
+}
+
 // GetStream gets a stream by ID.
 func (m *Manager) GetStream(id uint32) (*Stream, bool) {
 	m.mu.RLock()
@@ -123,19 +174,27 @@ func (m *Manager) GetStream(id uint32) (*Stream, bool) {
 
 // TryOpenStream attempts to atomically open a new stream and mark it active.
 // Returns the opened stream and true on success; returns false if the
-// MAX_CONCURRENT_STREAMS limit would be exceeded.
+// MAX_CONCURRENT_STREAMS limit would be exceeded. An idle placeholder a
+// PRIORITY frame left on the identifier is replaced, uncounted and released
+// (its priority-tree entry stays: the stream opened over it keeps the
+// priority the peer gave it).
 func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
+	var replaced *Stream
 	if s, exists := m.streams[id]; exists {
 		st := s.GetState()
 		if st == StateOpen || st == StateHalfClosedLocal || st == StateHalfClosedRemote {
+			m.mu.Unlock()
 			return s, true
+		}
+		if s.flags.Load()&flagPlaceholder != 0 {
+			replaced = s
 		}
 	}
 
 	if m.activeStreams.Load() >= m.maxStreams {
+		m.mu.Unlock()
 		return nil, false
 	}
 
@@ -146,6 +205,9 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 	s.SetWindowSize(int32(m.initialWindowSize))
 	s.state.Store(int32(StateOpen))
 	m.streams[id] = s
+	if replaced != nil {
+		m.dropPlaceholderLocked(replaced)
+	}
 	if id > m.maxStreamID {
 		m.maxStreamID = id
 	}
@@ -153,6 +215,13 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 		m.lastClientStream.Store(id)
 	}
 	m.activeStreams.Add(1)
+	m.mu.Unlock()
+
+	if replaced != nil {
+		// Out of the map and never handed to anything: back to the pool, after
+		// the unlock as afterTake does (Release takes the stream's own lock).
+		replaced.Release()
+	}
 	return s, true
 }
 
@@ -233,6 +302,7 @@ func (m *Manager) takeLocked(id uint32, s *Stream) (release bool) {
 	m.priorityTree.RemoveStream(id)
 	prev := State(s.state.Swap(int32(StateClosed)))
 	m.updateActiveCount(prev, StateClosed)
+	m.dropPlaceholderLocked(s)
 	return s.flags.Load()&flagAsyncRunning == 0
 }
 
@@ -520,8 +590,9 @@ func (m *Manager) GetMaxConcurrentStreams() uint32 {
 
 // GetOrCreateStream gets an existing stream or creates a new one. The stream
 // it creates is idle: it is not counted against SETTINGS_MAX_CONCURRENT_STREAMS
-// and the last client stream does not move. It is for the placeholder a
-// PRIORITY frame leaves; a stream a HEADERS frame opens is opened by
+// and the last client stream does not move, and nothing bounds how many it
+// creates. The placeholder a PRIORITY frame leaves is made by
+// CreatePlaceholder, which does; a stream a HEADERS frame opens is opened by
 // TryOpenStream, through Processor.admitHeaders (celeris#981).
 func (m *Manager) GetOrCreateStream(id uint32) *Stream {
 	if stream, ok := m.GetStream(id); ok {
@@ -597,6 +668,7 @@ func (m *Manager) Close() {
 	// retired since its last frame batch go to the pool now, and a handler
 	// that returns from here on releases its stream itself (retire).
 	m.closed = true
+	m.placeholders = 0
 	retired := m.retired
 	m.retired = nil
 	m.hasRetired.Store(false)

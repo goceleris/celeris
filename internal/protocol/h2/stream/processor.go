@@ -18,6 +18,9 @@ type ContinuationState struct {
 	headerBlock   []byte
 	endStream     bool
 	expectingMore bool
+	// continuations counts the CONTINUATION frames of the block so far, empty
+	// ones included (maxContinuationFrames).
+	continuations int
 	// priority is the PRIORITY field of the HEADERS frame that started the
 	// block (nil: it had none); it applies when the block is admitted.
 	priority *headerPriority
@@ -203,6 +206,22 @@ type Processor struct {
 	// off, so nothing is appended): a field, so a refusal allocates no slice.
 	// Last in the struct: the fast path's fields keep their offsets.
 	refusedFields [][2]string
+
+	// Refusals per second, like rstCount: noteRefusal counts the requests the
+	// processor refused and ends the connection past a burst no honest client
+	// makes. Frame processing is serial, so no atomics. After refusedFields
+	// for the same reason.
+	refusalWindowSec   int64  // unix-second marker for the current window
+	refusedHeaderLists uint32 // header lists over the bound refused in the current second
+	refusedStreams     uint32 // streams refused for MAX_CONCURRENT_STREAMS in the current second
+	// nowUnix is the clock noteRefusal reads (nil: the wall clock); tests set it.
+	nowUnix func() int64
+
+	// resetIDs remembers which stream identifiers this server reset
+	// (markServerReset, serverReset): the DATA of a request that was already on
+	// the wire is ignored (handleData), where DATA on any other closed stream
+	// is still a connection error. After refusedFields for the same reason.
+	resetIDs serverResets
 }
 
 // PoolHandlersRunning reports whether a stream of this connection has a
@@ -247,6 +266,93 @@ const (
 	rstRateLimitPerSec = 100
 	rstBurstMax        = 200
 )
+
+// headerListRefusalBurstMax and streamRefusalBurstMax bound the requests the
+// processor refuses per second on one connection (noteRefusal), the way
+// rstBurstMax bounds the resets. A refusal costs the peer a few bytes (13 for
+// a stream refused for the limit) and the server the decode of the whole
+// block, with emit off, and an RST_STREAM.
+//
+// A header list over the bound (maxHeaderListSize) is no request an honest
+// client sends, let alone repeatedly, and each such block builds about 5 times
+// its own size in strings for the dynamic table: the burst is small.
+//
+// A stream refused for SETTINGS_MAX_CONCURRENT_STREAMS can be honest, in a
+// burst: "Initially, there is no limit to this value" (RFC 9113 section
+// 6.5.2), so a client that has not read the server's SETTINGS yet may open
+// every stream it has queued, and each above the limit is refused. 2000 is a
+// burst of that kind, twice the 1000 streams of a client that has that many
+// requests ready. A client that has read SETTINGS keeps within the limit and
+// is refused only by a race.
+const (
+	headerListRefusalBurstMax = 100
+	streamRefusalBurstMax     = 2000
+)
+
+// serverResetWindow is how many of the most recent odd stream identifiers
+// serverResets remembers: 1024, that is the last 2048 stream identifiers. A
+// client that opens 1000 streams at once against a limit of 100 has 900 of
+// them refused, and their DATA frames can trail their HEADERS frames by as
+// many streams.
+const serverResetWindow = 1024
+
+// serverResets is a bitset over a sliding window of odd stream identifiers:
+// the ones this server sent a RST_STREAM for. An identifier older than the
+// window is forgotten, which makes its DATA a connection error, as it was
+// before the set existed. It is 128 bytes, allocates nothing, and is marked on
+// the paths that reset a stream (sendRSTStreamAndMarkClosed) in a few
+// instructions. The set is the only thing that tells a stream the server
+// reset (RFC 9113 section 5.1: the server must be prepared for the frames
+// already on the wire) from one that is closed because the peer reset it or
+// the exchange ended (any frame but PRIORITY on those is an error).
+type serverResets struct {
+	top  uint32 // one past the highest index marked (index = id>>1); 0: nothing marked
+	bits [serverResetWindow / 64]uint64
+}
+
+// mark records that the server reset stream id. Even identifiers and
+// identifiers older than the window are not recorded.
+func (r *serverResets) mark(id uint32) {
+	if id&1 == 0 {
+		return
+	}
+	idx := id >> 1
+	if idx >= r.top {
+		// Slide the window up to idx: the positions it takes over from the
+		// identifiers it drops are cleared.
+		if idx-r.top >= serverResetWindow || r.top == 0 {
+			r.bits = [serverResetWindow / 64]uint64{}
+		} else {
+			for k := r.top; k <= idx; k++ {
+				r.bits[(k%serverResetWindow)/64] &^= 1 << (k % 64)
+			}
+		}
+		r.top = idx + 1
+	} else if idx+serverResetWindow < r.top {
+		return // older than the window
+	}
+	r.bits[(idx%serverResetWindow)/64] |= 1 << (idx % 64)
+}
+
+// has reports whether stream id is one mark recorded and the window still holds.
+func (r *serverResets) has(id uint32) bool {
+	if id&1 == 0 {
+		return false
+	}
+	idx := id >> 1
+	if idx >= r.top || idx+serverResetWindow < r.top {
+		return false
+	}
+	return r.bits[(idx%serverResetWindow)/64]&(1<<(idx%64)) != 0
+}
+
+// maxContinuationFrames is the most CONTINUATION frames one header block may
+// have, empty ones included. The byte cap on a block (headerBlockExpansion)
+// does not bound them: a frame with an empty fragment adds nothing to it.
+// A block of the cap's size (256 KiB) takes 16 frames of the default
+// SETTINGS_MAX_FRAME_SIZE (16 KiB); 32 leaves room for a peer that writes
+// frames half that size.
+const maxContinuationFrames = 32
 
 func (p *Processor) maxBodySize() int64 {
 	return p.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
@@ -303,15 +409,20 @@ func (p *Processor) FlushInlineCleanup() {
 // trailer list) may decode to: the sum, over every field, of len(name) +
 // len(value) + headerFieldOverhead, as RFC 9113 §6.5.2 defines
 // SETTINGS_MAX_HEADER_LIST_SIZE and net/http counts it. 64 KiB is the native
-// HTTP/1 limit (h1.MaxHeaderSize). A peer is not told: the server does not
-// advertise SETTINGS_MAX_HEADER_LIST_SIZE.
+// HTTP/1 limit (h1.MaxHeaderSize). The server tells the peer: its SETTINGS
+// carry it (MaxHeaderListSize).
 //
 // The HPACK decoder bounds one string only (SetMaxStringLength): a
 // one-byte reference to a 4 KB dynamic-table entry costs the peer one byte and
 // the server a field, so without a bound on the list a 16 KB header block was
 // a list of 48 MB, and with the cookie fields joined one string of 48 MB
 // (celeris#944).
-const maxHeaderListSize = 64 << 10
+const maxHeaderListSize = MaxHeaderListSize
+
+// MaxHeaderListSize is the SETTINGS_MAX_HEADER_LIST_SIZE the native HTTP/2
+// connection advertises: the bound it holds a request's (or trailer's) header
+// list to. The conn layer writes it in the server's SETTINGS.
+const MaxHeaderListSize = 64 << 10
 
 // headerFieldOverhead is the 32 bytes RFC 7541 §4.1 and RFC 9113 §6.5.2 add
 // to each field's size.
@@ -343,8 +454,10 @@ const headerFieldOverhead = 32
 // It is a worst case, not an exact count: a block between the bound and the
 // cap is assembled, decoded, and refused by the exact bound (RST_STREAM on
 // its stream), never by this cap (GOAWAY, which ends the connection). The
-// server keeps at most this many bytes of a block per connection after the
-// first fragment (which is capped by the frame size only).
+// server keeps at most this many bytes of a block per connection: the first
+// fragment is held to the cap as the later ones are (handleHeaders,
+// appendContinuation), and a block that is complete in one HEADERS frame is
+// decoded, not kept.
 const headerBlockExpansion = 4
 
 // NewProcessor creates a new stream processor. The conn parameter must
@@ -478,8 +591,44 @@ func (p *Processor) endHeaderDecode() (tooLarge bool) {
 // answers 431), the stream freed with its MAX_CONCURRENT_STREAMS slot. The
 // block was decoded to its end, so the HPACK state is in step with the
 // peer's and the connection goes on. The request never reaches a handler.
+// A connection that keeps sending such blocks does not go on (noteRefusal).
 func (p *Processor) refuseHeaderList(streamID uint32) error {
+	if err := p.noteRefusal(false); err != nil {
+		return err
+	}
 	return p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeEnhanceYourCalm)
+}
+
+// noteRefusal counts a request the processor refused (streamLimit: for
+// SETTINGS_MAX_CONCURRENT_STREAMS; otherwise for its header list), in a window
+// of one second as handleRSTStream counts resets, and ends the connection
+// with GOAWAY(ENHANCE_YOUR_CALM) naming the last stream the server opened
+// once the window has seen more than the burst (headerListRefusalBurstMax,
+// streamRefusalBurstMax). A refusal is an answer the peer asked for with a
+// few bytes, so without a count one connection could ask for it for ever.
+func (p *Processor) noteRefusal(streamLimit bool) error {
+	var now int64
+	if p.nowUnix != nil {
+		now = p.nowUnix()
+	} else {
+		now = time.Now().Unix()
+	}
+	if now != p.refusalWindowSec {
+		p.refusalWindowSec = now
+		p.refusedHeaderLists, p.refusedStreams = 0, 0
+	}
+	if streamLimit {
+		if p.refusedStreams++; p.refusedStreams > streamRefusalBurstMax {
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("refused streams flood"),
+				fmt.Errorf("streams refused for MAX_CONCURRENT_STREAMS more than %d times in a second", streamRefusalBurstMax))
+		}
+		return nil
+	}
+	if p.refusedHeaderLists++; p.refusedHeaderLists > headerListRefusalBurstMax {
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("refused header lists flood"),
+			fmt.Errorf("header lists over %d bytes refused more than %d times in a second", p.headerListMax, headerListRefusalBurstMax))
+	}
+	return nil
 }
 
 // GetManager returns the stream manager.
@@ -1113,6 +1262,11 @@ const (
 // refused one is decoded, to keep the HPACK state in step with the peer's).
 // Frame processing is serial (under H2State.mu), so the load and the store of
 // the last client stream need no more than the atomics they are.
+//
+// A connection error here names the last stream the server opened
+// (GetLastStreamID), as every other site does, and not the last client stream,
+// which a refused stream moves forward: the client got REFUSED_STREAM for that
+// one, and it was not processed.
 func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stream, admission, error) {
 	m := p.manager
 	existing, exists := m.GetStream(id)
@@ -1126,12 +1280,12 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 		last := m.lastClientStream.Load()
 
 		if id <= last {
-			_ = p.SendGoAway(last, http2.ErrCodeProtocol, []byte("HEADERS on closed stream (reused id)"))
+			_ = p.SendGoAway(m.GetLastStreamID(), http2.ErrCodeProtocol, []byte("HEADERS on closed stream (reused id)"))
 			return nil, admitNew, fmt.Errorf("HEADERS frame on closed stream %d (last stream: %d)", id, last)
 		}
 
 		if err := validateStreamID(id, last, false); err != nil {
-			return nil, admitNew, p.GoAwayErr(last, http2.ErrCodeProtocol, []byte(err.Error()), err)
+			return nil, admitNew, p.GoAwayErr(m.GetLastStreamID(), http2.ErrCodeProtocol, []byte(err.Error()), err)
 		}
 
 		// Used up now, not when the stream opens: a stream refused below
@@ -1174,6 +1328,11 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 // added a field to the dynamic table must add it here too, or the peer's next
 // block references an entry this decoder does not have.
 func (p *Processor) refuseStream(id uint32, block []byte) error {
+	// Counted before the block is decoded: past the burst the connection ends,
+	// and the decode would be for nothing (noteRefusal).
+	if err := p.noteRefusal(true); err != nil {
+		return err
+	}
 	p.beginHeaderDecode(&p.refusedFields, false)
 	p.hpackDecoder.SetEmitEnabled(false) // decode, build nothing
 	// A block that does not decode is a connection error (COMPRESSION_ERROR).
@@ -1287,11 +1446,17 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 	dependency, weight, exclusive, hasPriority := ParsePriorityFromHeaders(f)
 
 	if !f.HeadersEnded() {
+		headerBlock := f.HeaderBlockFragment()
+		// The first fragment is held until the block ends, as the later ones
+		// are, so it is held to the same cap (appendContinuation), before it is
+		// copied: a frame can be as long as SETTINGS_MAX_FRAME_SIZE.
+		if len(headerBlock) > p.headerListMax*headerBlockExpansion {
+			return p.headerBlockTooLarge(f.StreamID)
+		}
 		var prio *headerPriority
 		if hasPriority {
 			prio = &headerPriority{dependency: dependency, weight: weight, exclusive: exclusive}
 		}
-		headerBlock := f.HeaderBlockFragment()
 		frag := make([]byte, len(headerBlock))
 		copy(frag, headerBlock)
 		p.continuationStateMu.Lock()
@@ -1327,6 +1492,22 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	stream, ok := p.manager.GetStream(f.StreamID)
 	if !ok {
+		// A stream the manager does not hold that the server reset (a request
+		// refused for the stream limit or for its header list, a body over the
+		// limit, ...): RFC 9113 section 5.1 (closed) says the endpoint that sent
+		// RST_STREAM "MUST be prepared to receive any frames that were sent
+		// before it processed the RST_STREAM", and a POST sent without waiting
+		// for the answer has its DATA on the wire. The frame is ignored, and its
+		// length goes back to the connection's receive window like any DATA's
+		// (the peer spent that much of it). DATA on a stream that is closed for
+		// another reason (the peer reset it, or the exchange ended), on one that
+		// was never opened (above the last client stream, even, stream 0) is
+		// still a connection error: h2spec 5.1 and 6.1 pin that.
+		if f.StreamID <= p.manager.GetLastClientStreamID() && p.resetIDs.has(f.StreamID) {
+			p.manager.AccumulateWindowUpdate(0, f.Header().Length)
+			p.manager.FlushWindowUpdates(p.writer, false)
+			return nil
+		}
 		return p.GoAwayErr(0, http2.ErrCodeProtocol, []byte("DATA on idle stream"),
 			fmt.Errorf("DATA frame on idle stream %d", f.StreamID))
 	}
@@ -1356,8 +1537,9 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 		return err
 	}
 
-	//nolint:gosec // G115: safe conversion, dataLen is frame payload size
-	updateLen := uint32(dataLen)
+	// The whole payload is flow-controlled, padding included (RFC 9113
+	// sections 6.1 and 6.9.1): that much goes back to both windows.
+	updateLen := f.Header().Length
 
 	p.manager.AccumulateWindowUpdate(f.StreamID, updateLen)
 	p.manager.AccumulateWindowUpdate(0, updateLen)
@@ -1623,10 +1805,20 @@ func (p *Processor) handlePriority(f *http2.PriorityFrame) error {
 			fmt.Errorf("PRIORITY stream %d > last client %d + window", f.StreamID, lastClient))
 	}
 
-	_, exists := p.manager.GetStream(f.StreamID)
-	if !exists {
-		stream := p.manager.GetOrCreateStream(f.StreamID)
-		stream.SetState(StateIdle)
+	// A stream the manager holds, open or a placeholder from an earlier frame,
+	// takes the new priority. One it does not hold is a closed stream's when its
+	// identifier is one the peer has used (not above the last client stream),
+	// and an even one is never opened; for those, and for an idle one past
+	// the bound on placeholders (CreatePlaceholder), the frame is ignored:
+	// priority signals are advisory (RFC 9113 section 5.3.2), and nothing is
+	// created for a stream that will not open, in the manager or the tree.
+	if _, exists := p.manager.GetStream(f.StreamID); !exists {
+		if f.StreamID <= lastClient || f.StreamID&1 == 0 {
+			return nil
+		}
+		if _, ok := p.manager.CreatePlaceholder(f.StreamID); !ok {
+			return nil
+		}
 	}
 
 	p.manager.priorityTree.UpdateFromFrame(
@@ -1648,6 +1840,7 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 	for streamID, stream := range p.manager.streams {
 		if streamID > lastStreamID {
 			prev := stream.GetState()
+			p.manager.dropPlaceholderLocked(stream) // before Release clears its flags
 			stream.state.Store(int32(StateClosed))
 			p.manager.updateActiveCount(prev, StateClosed)
 			stream.Cancel()
@@ -1724,11 +1917,16 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	if len(p.continuationState.headerBlock)+len(f.HeaderBlockFragment()) > p.headerListMax*headerBlockExpansion {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
-		// The last stream the server opened, not 0: 0 tells the peer that no
-		// stream was processed, and a client retries the ones it has in
-		// flight, a POST with a replayable body among them (RFC 9113 §6.8).
-		return nil, p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("header block too large"),
-			fmt.Errorf("header block on stream %d exceeds %d bytes", f.StreamID, p.headerListMax))
+		return nil, p.headerBlockTooLarge(f.StreamID)
+	}
+
+	// The frames of a block are counted as well as its bytes: an empty
+	// fragment adds none (maxContinuationFrames).
+	if p.continuationState.continuations++; p.continuationState.continuations > maxContinuationFrames {
+		p.continuationState = nil
+		p.continuationActive.Store(false)
+		return nil, p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("too many CONTINUATION frames"),
+			fmt.Errorf("header block on stream %d has more than %d CONTINUATION frames", f.StreamID, maxContinuationFrames))
 	}
 
 	p.continuationState.headerBlock = append(
@@ -1743,6 +1941,17 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	p.continuationState = nil
 	p.continuationActive.Store(false)
 	return cs, nil
+}
+
+// headerBlockTooLarge is the connection error for a header block, assembled
+// from its HEADERS and CONTINUATION fragments, that is longer than any
+// encoding of a list within the bound (headerBlockExpansion). It names the
+// last stream the server opened, not 0: 0 tells the peer that no stream was
+// processed, and a client retries the ones it has in flight, a POST with a
+// replayable body among them (RFC 9113 section 6.8).
+func (p *Processor) headerBlockTooLarge(streamID uint32) error {
+	return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("header block too large"),
+		fmt.Errorf("header block on stream %d exceeds %d bytes", streamID, p.headerListMax*headerBlockExpansion))
 }
 
 // flush flushes the writer if it supports the Flush method.
@@ -1782,6 +1991,7 @@ func (p *Processor) SendGoAway(lastStreamID uint32, code http2.ErrCode, debugDat
 
 // sendRSTStreamAndMarkClosed sends RST_STREAM and marks the stream as closed.
 func (p *Processor) sendRSTStreamAndMarkClosed(streamID uint32, code http2.ErrCode) error {
+	p.resetIDs.mark(streamID) // the DATA already on the wire for it is ignored (handleData)
 	stream, ok := p.manager.GetStream(streamID)
 	if ok {
 		stream.Cancel()

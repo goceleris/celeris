@@ -3,6 +3,7 @@ package conn
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -26,13 +27,20 @@ type frameBuffer struct {
 // (9-byte header + payload) is available. This prevents the x/net framer
 // from consuming partial data on TCP segment boundaries, which would cause
 // io.ErrUnexpectedEOF and close the connection.
-func (fb *frameBuffer) hasCompleteFrame() bool {
+//
+// A header that declares a frame longer than maxFrame, the SETTINGS_MAX_FRAME_SIZE
+// this server advertised, counts as complete: the framer, whose ceiling is the
+// same value, refuses it from the header alone (http2.ErrFrameTooLarge, which
+// ProcessH2 answers with GOAWAY FRAME_SIZE_ERROR), so the payload is not
+// waited for. The length is 24 bits: without this, a peer's 9 bytes made the
+// server buffer up to 16 MiB of that frame before it said anything.
+func (fb *frameBuffer) hasCompleteFrame(maxFrame uint32) bool {
 	b := fb.Bytes()
 	if len(b) < 9 {
 		return false
 	}
 	length := uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
-	return uint32(len(b)) >= 9+length
+	return length > maxFrame || uint32(len(b)) >= 9+length
 }
 
 // hasMoreThanOneFrame checks if the buffer contains more than one complete frame.
@@ -306,7 +314,7 @@ const (
 	h2FlagEndHeaders byte = 0x04
 )
 
-// writeSettingsFrame emits a SETTINGS frame with up to 4 parameters directly
+// writeSettingsFrame emits a SETTINGS frame with the given parameters directly
 // to buf without going through the shared frame.Writer (which owns an
 // http2.Framer with its own buffers + hpack machinery). The handshake path
 // only needs server SETTINGS + SETTINGS_ACK, so bypassing the framer cuts
@@ -634,6 +642,7 @@ func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]by
 		{uint32(http2.SettingMaxConcurrentStreams), state.cfg.MaxConcurrentStreams},
 		{uint32(http2.SettingInitialWindowSize), state.cfg.InitialWindowSize},
 		{uint32(http2.SettingMaxFrameSize), state.cfg.MaxFrameSize},
+		{uint32(http2.SettingMaxHeaderListSize), stream.MaxHeaderListSize},
 	})
 	writeSettingsAckFrame(&state.outBuf)
 	flushOutBuf(&state.outBuf, write)
@@ -696,6 +705,7 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 				{uint32(http2.SettingMaxConcurrentStreams), state.cfg.MaxConcurrentStreams},
 				{uint32(http2.SettingInitialWindowSize), state.cfg.InitialWindowSize},
 				{uint32(http2.SettingMaxFrameSize), state.cfg.MaxFrameSize},
+				{uint32(http2.SettingMaxHeaderListSize), stream.MaxHeaderListSize},
 			})
 			flushOutBuf(&state.outBuf, write)
 			state.serverPrefaceSent = true
@@ -738,8 +748,11 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 
 	state.inBuf.Write(data)
 
-	maxFrameSize := state.processor.GetManager().GetMaxFrameSize()
-	for state.inBuf.hasCompleteFrame() {
+	// The frame size a frame is held to is the one this server advertised in
+	// its SETTINGS (RFC 9113 section 4.2), the ceiling of the framer too, not
+	// the peer's SETTINGS_MAX_FRAME_SIZE, which limits what the server sends.
+	maxFrameSize := state.processor.GetManager().GetLocalMaxFrameSize()
+	for state.inBuf.hasCompleteFrame(maxFrameSize) {
 		// Tell the processor if more frames follow in this recv buffer.
 		// When true, canRunInline returns false to avoid sending the
 		// response before subsequent frames (WINDOW_UPDATE, PRIORITY)
@@ -783,6 +796,15 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 					_ = state.processor.SendGoAway(
 						state.processor.GetManager().GetLastStreamID(),
 						http2.ErrCode(ce), []byte(ce.Error()))
+					flushOutBuf(&state.outBuf, write)
+				} else if errors.Is(err, http2.ErrFrameTooLarge) {
+					// A frame over the advertised size, from its header alone
+					// (hasCompleteFrame): RFC 9113 section 4.2 asks for
+					// FRAME_SIZE_ERROR, a connection error for a frame that
+					// carries a field block, a SETTINGS frame or stream 0.
+					_ = state.processor.SendGoAway(
+						state.processor.GetManager().GetLastStreamID(),
+						http2.ErrCodeFrameSize, []byte(err.Error()))
 					flushOutBuf(&state.outBuf, write)
 				}
 				state.mu.Unlock()

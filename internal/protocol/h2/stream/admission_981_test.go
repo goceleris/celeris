@@ -271,20 +271,22 @@ func scenarios981() []scenario981 {
 				rst981(9, refused), rst981(11, refused), rst981(13, refused), rst981(15, refused), rst981(17, refused), rst981(19, refused)}},
 		},
 		{
-			// A refused stream's identifier is used up: HEADERS on it again is a connection error.
+			// A refused stream's identifier is used up: HEADERS on it again is a connection error, whose
+			// GOAWAY names the last stream the server opened (1), not the refused one (celeris#889 item 30).
 			name: "refused-id-reused", limit: 1,
 			steps: func(e *enc981) []step981 {
 				return []step981{hdr981(1, false, e.req()), hdr981(3, true, e.req()), hdr981(3, true, e.req())}
 			},
-			want: obs981{errAt: 2, goaway: []goAwayRecord{{3, protocol}}, rst: []rstStreamRecord{rst981(3, refused)}, active: 1, streams: 1, lastClient: 3},
+			want: obs981{errAt: 2, goaway: []goAwayRecord{{1, protocol}}, rst: []rstStreamRecord{rst981(3, refused)}, active: 1, streams: 1, lastClient: 3},
 		},
 		{
-			// ... and so is every lower one: the refusal advanced the last client stream.
+			// ... and so is every lower one: the refusal advanced the last client stream. The GOAWAY names
+			// stream 1, the last the server opened: stream 5 was refused, not processed.
 			name: "lower-id-after-refused", limit: 1,
 			steps: func(e *enc981) []step981 {
 				return []step981{hdr981(1, false, e.req()), hdr981(5, true, e.req()), hdr981(3, true, e.req())}
 			},
-			want: obs981{errAt: 2, goaway: []goAwayRecord{{5, protocol}}, rst: []rstStreamRecord{rst981(5, refused)}, active: 1, streams: 1, lastClient: 5},
+			want: obs981{errAt: 2, goaway: []goAwayRecord{{1, protocol}}, rst: []rstStreamRecord{rst981(5, refused)}, active: 1, streams: 1, lastClient: 5},
 		},
 		{
 			// A refused block is decoded: the next request references the entry it added to the HPACK table.
