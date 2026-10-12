@@ -145,3 +145,20 @@ func BenchmarkCanonicalAppendBrowser(b *testing.B) {
 		_ = canonicalAppend(buf[:0], "accept-encoding", "gzip, deflate, br, zstd")
 	}
 }
+
+// BenchmarkDefaultKeyConditionalWrite and BenchmarkDefaultKeyConditionalRead
+// are the default key of the same request with a precondition and a query, as
+// a PUT (not coalesced: no key is built) and as a GET (the whole key), measured
+// in the same run (celeris#888 item 23).
+func BenchmarkDefaultKeyConditionalWrite(b *testing.B) { benchDefaultKeyConditional(b, "PUT") }
+func BenchmarkDefaultKeyConditionalRead(b *testing.B)  { benchDefaultKeyConditional(b, "GET") }
+
+func benchDefaultKeyConditional(b *testing.B, method string) {
+	c, _ := celeristest.NewContext(method, "/api/items?z=26&y=25&x=24&b=2&a=1",
+		celeristest.WithHeader("if-match", `"v1"`), celeristest.WithHeader("accept-encoding", "gzip, deflate, br, zstd"), celeristest.WithHeader("cookie", "s=1"))
+	defer celeristest.ReleaseContext(c)
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = defaultKey(c)
+	}
+}

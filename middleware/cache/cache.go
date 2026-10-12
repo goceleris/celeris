@@ -404,19 +404,20 @@ func isToken(s string) bool { return s != "" && isTokenOrEmpty(s) }
 
 func isTokenOrEmpty(s string) bool {
 	for i := 0; i < len(s); i++ {
-		if !isTchar(s[i]) {
+		if !tchars[s[i]] {
 			return false
 		}
 	}
 	return true
 }
 
-// isTchar is RFC 9110 §5.6.2's tchar.
-func isTchar(b byte) bool {
-	return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' ||
-		b == '-' || b == '_' || b == '.' || b == '!' || b == '#' || b == '$' || b == '%' ||
-		b == '&' || b == '\'' || b == '*' || b == '+' || b == '^' || b == '`' || b == '|' || b == '~'
-}
+// tchars marks RFC 9110 §5.6.2's tchar bytes.
+var tchars = func() (t [256]bool) {
+	for _, r := range "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~" {
+		t[r] = true
+	}
+	return
+}()
 
 // isQuoted reports a value that is a quoted string. nextDirective has seen to
 // it that the string closes and that only blanks follow it.
