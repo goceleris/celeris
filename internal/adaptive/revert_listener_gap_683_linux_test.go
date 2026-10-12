@@ -506,8 +506,11 @@ func TestListenWatchListsAgainAtOnceBeforeItsFirstSleep683(t *testing.T) {
 				sleep: func(time.Duration) { sleeps++ },
 			}
 			_, ok, err := w.wait(time.Hour)
-			if err != nil || !ok {
-				t.Skipf("no sock_diag socket here: wait = %v, %v", ok, err)
+			if err != nil {
+				skipOrFailUpswitch662(t, "no sock_diag socket here: %v", err)
+			}
+			if !ok {
+				t.Fatalf("celeris683 SPIN: the wait gave up (%d lists, %d sleeps) with the new inode on list %d", lists, sleeps, tc.appearsAt)
 			}
 			if lists != tc.appearsAt || !tc.ok(lists, sleeps) {
 				t.Errorf("celeris683 SPIN: %d lists and %d sleeps; want the new inode seen on list %d with %s",
