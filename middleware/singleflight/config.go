@@ -92,9 +92,23 @@ func defaultKeyFunc(c *celeris.Context) string {
 // defaultKey is the default key, and whether the request carries one of the
 // four preconditions. The middleware needs both and the key reads the
 // preconditions anyway, so one pass over the headers serves the key and the
-// bypass of a conditional write.
+// bypass of a conditional write. For a conditional write (not GET or HEAD:
+// see safeToCoalesce) the key is "": the middleware does not coalesce it, and
+// the preconditions are read before anything is built.
 func defaultKey(c *celeris.Context) (key string, conditional bool) {
 	m := c.Method()
+	var val [len(keyValidators)]string
+	for i, v := range keyValidators {
+		val[i] = c.Header(v.header)
+		if val[i] != "" {
+			conditional = true
+		}
+	}
+	if conditional && !safeToCoalesce(m) {
+		// A conditional write is not coalesced (the caller bypasses it), so
+		// its key is not built: no query sort, no canonical form, no copy.
+		return "", true
+	}
 	p := c.Path()
 	rq := c.RawQuery()
 	auth := c.Header("authorization")
@@ -110,14 +124,6 @@ func defaultKey(c *celeris.Context) (key string, conditional bool) {
 		ae = canonicalAppend(aeBuf[:0], "accept-encoding", aeLong)
 		aeLong = ""
 	}
-	var val [len(keyValidators)]string
-	for i, v := range keyValidators {
-		val[i] = c.Header(v.header)
-		if val[i] != "" {
-			conditional = true
-		}
-	}
-
 	var q string
 	if rq != "" {
 		// Clone query params before sorting to avoid mutating the
