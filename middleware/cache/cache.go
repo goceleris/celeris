@@ -5,6 +5,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -335,15 +336,23 @@ func filterHeaders(hs [][2]string, include, exclude map[string]struct{}) [][2]st
 	return out
 }
 
+// maxDeltaSeconds caps a max-age: math.MaxInt32 seconds is about 68 years, and
+// as a Duration it is far from overflowing, where max-age=10000000000 times
+// time.Second wraps to a negative TTL, which the stores read as no expiry.
+const maxDeltaSeconds = math.MaxInt32
+
 // parseCacheControl reads a lowercased Cache-Control value as directive
 // tokens. noStore reports that the response must not be stored: no-store and
 // private, as before, and now no-cache (a stored response must be revalidated
 // before every reuse, which this cache does not do; the field-qualified form
 // no-cache="x" is treated the same, as the cautious reading) and max-age=0
 // (stale the moment it is made). hasMaxAge and maxAge give the first
-// max-age directive with a valid value. The directives are matched as tokens,
-// so x-private-ext is not private and x-max-age=0 is not max-age=0, and the
-// storage decision and the TTL come from this one parse (celeris#888 item 27).
+// max-age directive with a valid value, at most maxDeltaSeconds (RFC 9111
+// §1.2.2: a larger delta-seconds counts as the greatest value the cache can
+// represent), so that maxAge seconds always fits a time.Duration. The
+// directives are matched as tokens, so x-private-ext is not private and
+// x-max-age=0 is not max-age=0, and the storage decision and the TTL come from
+// this one parse (celeris#888 item 27).
 func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 	for len(cc) > 0 {
 		var d string
@@ -360,7 +369,7 @@ func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 				if n == 0 {
 					return true, 0, false
 				}
-				maxAge, hasMaxAge = n, true
+				maxAge, hasMaxAge = min(n, maxDeltaSeconds), true
 			}
 		}
 	}
