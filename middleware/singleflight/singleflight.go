@@ -300,9 +300,10 @@ func (e *call) captureVary(c *celeris.Context) {
 	}
 }
 
-// sameVariant reports whether the waiter c sends the leader's value (canonically
-// equal, see canonicalAppend) for every request header the leader's response
-// varies on, so the leader's response is the one c's own request would get.
+// sameVariant reports whether the waiter c sends the leader's value
+// (canonically equal, see canonicalAppend) for every request header the
+// leader's response varies on, so the leader's response is the one c's own
+// request would get.
 func (e *call) sameVariant(c *celeris.Context) bool {
 	if e.varyAll {
 		return false

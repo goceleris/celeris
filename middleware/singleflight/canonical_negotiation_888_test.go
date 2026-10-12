@@ -117,8 +117,12 @@ func TestCanonicalAcceptEncodingKeepsApartWhatTheNegotiatorSeparates888(t *testi
 			}
 			t.Run(name, func(t *testing.T) {
 				r := runPairOpts(t, mw, negotiatingReal, "/doc", aeOpt(tc.leader), "/doc", aeOpt(tc.waiter))
-				if r.joined || r.calls != 2 {
-					t.Errorf("leader %q, waiter %q: joined=%v handler runs %d, want not joined and 2 runs", tc.leader, tc.waiter, r.joined, r.calls)
+				// Under the default key the keys differ, so the waiter never
+				// joins; under the custom key it joins and the Vary
+				// comparison sends it to its own run. Either way two runs.
+				if (r.joined && !custom) || r.calls != 2 || r.second.Header("x-singleflight") == "HIT" {
+					t.Errorf("leader %q, waiter %q: joined=%v handler runs %d x-singleflight %q, want its own run (2 runs, no HIT)",
+						tc.leader, tc.waiter, r.joined, r.calls, r.second.Header("x-singleflight"))
 				}
 				// What the waiter's own run gives: the negotiator's answer to its own value.
 				want := "identity-body"

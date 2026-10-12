@@ -20,21 +20,23 @@ type Config struct {
 	// with the same key that arrive while a leader request is in-flight
 	// are coalesced — waiters receive a copy of the leader's response.
 	//
-	// Default: method + "\x00" + path + "\x00" + sorted-query-string,
+	// Default: method + "\x00" + path + "\x00q=" + sorted-query-string,
 	// then the Authorization, Cookie and Accept-Encoding headers and the
 	// four preconditions (If-None-Match, If-Modified-Since, If-Match and
-	// If-Unmodified-Since), each labelled so that one can never read as
-	// another. The Authorization and Cookie components ensure that requests
-	// from different authenticated users produce different keys, preventing
+	// If-Unmodified-Since). The query and each header are labelled so that
+	// one can never read as another (a header value cannot hold a NUL).
+	// The Authorization and Cookie components ensure that requests from
+	// different authenticated users produce different keys, preventing
 	// cross-user data leakage. Unauthenticated requests (no auth/cookie
 	// headers) still coalesce normally. Accept-Encoding keeps requests that
 	// accept different encodings apart when compress runs inside
-	// singleflight; values that differ only in case or blanks
-	// ("gzip, deflate" and "gzip,deflate") are one component, and the order
-	// is kept. The preconditions keep requests with different validators
-	// apart, because the response answers its own validator (a 304 or a
-	// 412), and let identical revalidations (a CDN or browsers sending the
-	// same If-None-Match) coalesce.
+	// singleflight. Two values are one component when the negotiator reads
+	// them alike (as c.AcceptsEncodings does: "gzip, deflate" and
+	// "gzip,deflate", "GZIP" and "gzip"), and the order is kept; "gzip;q=0"
+	// and "gzip;Q=0", which it tells apart, are two. The preconditions keep
+	// requests with different validators apart, because the response answers
+	// its own validator (a 304 or a 412), and let identical revalidations (a
+	// CDN or browsers sending the same If-None-Match) coalesce.
 	//
 	// If you provide a custom KeyFunc, ensure it incorporates user
 	// identity for any endpoint that returns user-specific data. A request
@@ -107,7 +109,7 @@ func defaultKeyFunc(c *celeris.Context) string {
 	// built in one allocation.
 	n := len(m) + 1 + len(p)
 	if q != "" {
-		n += 1 + len(q)
+		n += 3 + len(q)
 	}
 	for _, v := range [...]string{auth, cookie} {
 		if v != "" {
@@ -131,7 +133,7 @@ func defaultKeyFunc(c *celeris.Context) string {
 	b.WriteString("\x00")
 	b.WriteString(p)
 	if q != "" {
-		b.WriteString("\x00")
+		b.WriteString("\x00q=")
 		b.WriteString(q)
 	}
 	if auth != "" {

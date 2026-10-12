@@ -10,10 +10,10 @@
 // Authorization + Cookie + Accept-Encoding + the four preconditions
 // (If-None-Match, If-Modified-Since, If-Match and If-Unmodified-Since), so
 // requests from different authenticated users are never coalesced, neither
-// are requests that accept different encodings (values that differ only in
-// case or blanks are the same), and neither are conditional requests with
-// different validators: a 304 or a 412 answers its own validator. Identical
-// revalidations, such as a CDN's, do coalesce. A request with a Range header
+// are requests that accept different encodings (values the negotiator reads
+// alike, such as "gzip, br" and "gzip,br" or "GZIP" and "gzip", are the same),
+// and neither are conditional requests with different validators: a 304 or a
+// 412 answers its own validator. Identical revalidations, such as a CDN's, do coalesce. A request with a Range header
 // is never coalesced: its response answers that Range. With a custom
 // [Config.KeyFunc], which may not include the validators, a conditional
 // request is not coalesced either. Whatever the key, a waiter whose request
