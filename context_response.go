@@ -1379,6 +1379,7 @@ func (c *Context) Hijack() (net.Conn, error) {
 		return nil, err
 	}
 	c.written = true
+	c.hijacked = true
 	return conn, nil
 }
 
@@ -1519,16 +1520,19 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // arms one write deadline for the whole response (WriteTimeout); Detach clears
 // it for this request, so the stream is not cut at WriteTimeout, as it is not
 // on the native engines. ReadTimeout never cuts a stream there: net/http has
-// stopped it by the time the handler runs. A connection that [Context.Hijack]
-// took over is the caller's: Detach after a Hijack sets no deadline on it. In its place, each Write or Flush
+// stopped it by the time the handler runs. In its place, each Write or Flush
 // of the detached stream fails if it has not finished within WriteTimeout (a
 // client that stays connected and reads nothing ends the stream that way; no
-// bound at WriteTimeout -1), and when Shutdown's budget
-// runs out the writes of the streams still running fail. A handler that
-// detaches for a long-poll or a stream of its own gets the same. The writes
-// may come from more than one goroutine, as far as the response writer allows
-// it; the bound is kept per stream. The native engines apply neither
-// timeout to a detached connection.
+// bound at WriteTimeout -1), and when Shutdown's budget runs out the writes of
+// the streams still running fail. A handler that detaches for a long-poll or a
+// stream of its own gets the same. The writes may come from more than one
+// goroutine, as far as the response writer allows it; the bound is kept per
+// stream. The native engines apply neither timeout to a detached connection.
+//
+// Detach after a successful [Context.Hijack] only keeps the Context out of the
+// pool until done is called. The connection is the caller's by then, so no
+// engine hook runs and no deadline is set on it (on epoll the hook would run
+// against connection state the hijack has released).
 //
 // Detach copies the request values the Context holds, so they stay valid
 // after the handler returns (on HTTP/2 the headers and the body are the
@@ -1580,18 +1584,24 @@ func (c *Context) Detach() (done func()) {
 	// Context still points at it (celeris#904).
 	c.detachGen = c.stream.Gen()
 	c.stream.MarkDetached()
-	if c.stream.OnDetach != nil {
-		c.stream.OnDetach()
-	}
-	// The std engine's writer clears the write deadline net/http armed for the
-	// request, so a detached stream (SSE) is not cut at WriteTimeout, as it is
-	// not on the native engines (celeris#855); the per-write stall bound takes
-	// its place. The read deadline is left alone: net/http has stopped it by
-	// the time the handler runs. A connection already hijacked is left alone
-	// too. Here, not in OnDetach, which std leaves nil:
-	// EngineSupportsAsyncDetach reads it.
-	if dn, ok := c.stream.ResponseWriter.(stream.DetachNotifier); ok {
-		dn.StreamDetached()
+	// A hijacked connection is the caller's: the engine has let go of it, and
+	// on epoll its OnDetach hook would run against the connection state the
+	// hijack released (a nil dereference, and a detached count that never
+	// ends). The Context is still detached above, so a goroutine that holds it
+	// keeps it past the handler.
+	if !c.hijacked {
+		if c.stream.OnDetach != nil {
+			c.stream.OnDetach()
+		}
+		// The std engine's writer clears the write deadline net/http armed for
+		// the request, so a detached stream (SSE) is not cut at WriteTimeout,
+		// as it is not on the native engines (celeris#855); the per-write
+		// stall bound takes its place. The read deadline is left alone:
+		// net/http has stopped it by the time the handler runs. Here, not in
+		// OnDetach, which std leaves nil: EngineSupportsAsyncDetach reads it.
+		if dn, ok := c.stream.ResponseWriter.(stream.DetachNotifier); ok {
+			dn.StreamDetached()
+		}
 	}
 	ch := make(chan struct{})
 	c.detachDone = ch

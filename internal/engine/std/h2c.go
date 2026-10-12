@@ -175,6 +175,9 @@ var errH2CUpgradeBodyTooLarge = errors.New("h2c: upgrade request body over MaxRe
 // is errH2CUpgradeBodyTooLarge, with the connection not taken over (celeris#976),
 // and a declared Content-Length over it is that error before a byte is read.
 func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Conn, settings []byte, err error) {
+	// The HTTP2-Settings header is checked first: a request that has none, or
+	// an invalid one, is refused for it (500) even when its declared length is
+	// over the limit as well.
 	settings, err = h2cSettings(r.Header)
 	if err != nil {
 		return nil, nil, err

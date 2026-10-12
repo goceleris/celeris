@@ -257,8 +257,8 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 //
 // Nothing then ends a stream whose client stays connected and reads nothing,
 // so the stream's writes are bounded the way the WebSocket middleware bounds
-// its own: a write that has not finished within WriteTimeout is failed, and when the drain
-// budget runs out the writes fail (see detachedWrites). No deadline is set per
+// its own: a write that has not finished within WriteTimeout is failed, and
+// when the drain budget runs out the writes fail (see detachedWrites). No deadline is set per
 // write: a detached stream's Write and Flush only note when they started.
 // Runs when a stream starts, never per request.
 //
@@ -270,6 +270,11 @@ func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
 // TestSSEStaysOpenPastServerTimeouts855 pin that. The error of the write
 // deadline is ignored: a writer that cannot set one (http.ErrNotSupported) has
 // none armed to clear.
+//
+// A writer whose connection was hijacked first is left alone: the connection
+// is the caller's, so no deadline is armed on it, here or when the request
+// ends. Context.Detach does not call this after a Hijack; the check keeps a
+// direct caller from arming one.
 func (rw *stdResponseWriter) StreamDetached() {
 	switch rw.w.(type) {
 	case *detachedWriter:
@@ -325,7 +330,8 @@ func (rw *stdResponseWriter) Hijack(s *stream.Stream) (net.Conn, error) {
 // Hijack (see stdResponseWriter.Hijack). It embeds the writer, so a Write
 // after the Hijack still fails with net/http's http.ErrHijacked; it has no
 // Unwrap, Flush or SetWriteDeadline of its own, so nothing reaches the
-// hijacked connection through it.
+// hijacked connection through it. That includes Flush: a Flush on the
+// stdResponseWriter after a Hijack is a no-op.
 type hijackedWriter struct{ http.ResponseWriter }
 
 // Hijack on a connection already hijacked: net/http's own answer.

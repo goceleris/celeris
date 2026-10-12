@@ -452,3 +452,31 @@ func TestBridgeDeclaredLengthDecidesBeforeTheRead976(t *testing.T) {
 		}
 	}
 }
+
+// TestUpgradeBadSettingsWinsOverDeclaredOversize976 pins the order in
+// h2cUpgrade: the HTTP2-Settings header is checked before the declared length,
+// so an upgrade request with an invalid header and a declared length over the
+// limit is answered 500, not 413, and is not counted as a refused body.
+func TestUpgradeBadSettingsWinsOverDeclaredOversize976(t *testing.T) {
+	e, addr := startH2CEngineWith(t, newPathHandler(), nil, func(c *resource.Config) {
+		c.Protocol = engine.H2C
+		c.MaxRequestBodySize = 4096
+	})
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.WriteString(c, "POST /h HTTP/1.1\r\nHost: std.test\r\nConnection: Upgrade, HTTP2-Settings\r\n"+
+		"Upgrade: h2c\r\nHTTP2-Settings: !!not-base64!!\r\nContent-Length: 8192\r\n\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	line, _ := bufio.NewReader(c).ReadString('\n')
+	if !strings.HasPrefix(line, "HTTP/1.1 500") {
+		t.Fatalf("an upgrade with an invalid HTTP2-Settings and a declared length over the limit was answered %q, want 500", strings.TrimSpace(line))
+	}
+	if got := e.Metrics().ErrorRequestBody; got != 0 {
+		t.Fatalf("ErrorRequestBody = %d, want 0: the request was refused for its settings, not its body", got)
+	}
+}
