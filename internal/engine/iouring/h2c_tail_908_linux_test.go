@@ -4,11 +4,16 @@ package iouring
 
 import (
 	"bufio"
+	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // celeris#884 item 37 / #885 item 16 (the io_uring half): handleRecv's direct-body block hands the
@@ -149,4 +154,73 @@ func TestIouringH2CUpgradeAfterDirectBodyTailMultishot908(t *testing.T) {
 	t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", "1")
 	e, _ := start908(t, false, true)
 	testTailUpgrade908(t, e)
+}
+
+// TestIouringH2CUpgradeAfterDirectBodyTailBehindUnreadResponse908: the
+// upgrade verdict comes while the conn's previous response is still being
+// sent (the client has read none of it), so the 101 cannot be sent chained to
+// a recv of its own (flushSendLink does not link behind a send in flight) and
+// the recv that the direct-body CQE consumed must be replaced by the upgrade
+// path itself, or the conn is deaf to the client's HTTP/2 preface. The client
+// then reads everything and speaks HTTP/2.
+func TestIouringH2CUpgradeAfterDirectBodyTailBehindUnreadResponse908(t *testing.T) {
+	e, _ := start908(t, false, true)
+	skipIfMultishot908(t, e)
+	d := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
+		return rc.Control(func(fd uintptr) { _ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4096) })
+	}}
+	c, err := d.Dial("tcp", e.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	br := bufio.NewReader(c)
+	base := e.Metrics().BytesRead
+	sent := uint64(0)
+	write := func(s string) {
+		t.Helper()
+		if _, err := c.Write([]byte(s)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		sent += uint64(len(s))
+	}
+	// The large POST widens bodyBuf and is answered with the large /mid
+	// response, which the client does not read.
+	big := strings.Repeat("x", 20000)
+	write(postHead908("/mid", len(big)) + big[:10000])
+	waitServerRead908(t, e, base+sent)
+	write(big[10000:])
+	waitPipeSettled908(t, c) // the response is on its way and the pipe is full
+	small := strings.Repeat("y", 2000)
+	write(postHead908("/q", len(small)) + small[:1000])
+	waitServerRead908(t, e, base+sent)
+	write(small[1000:] + h2cUpgradeHead908())
+
+	_ = c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read the /mid response head: %v", err)
+	}
+	if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != mid908 {
+		t.Fatalf("read %d of %d body bytes of /mid: %v", n, mid908, err)
+	}
+	_ = resp.Body.Close()
+	if code, body, err := readBody543(c, br, 5*time.Second); err != nil || code != 200 || body != "/q" {
+		t.Fatalf("the small POST: %d %q %v", code, body, err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(6 * time.Second))
+	status, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(status, " 101 ") {
+		t.Fatalf("the upgrade request got status %q, err %v, want a 101", status, err)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read the 101 head: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	h2Streams908(t, c, br)
 }
