@@ -136,6 +136,15 @@ type connState struct {
 	// Warm — timeout tracking:
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
+	// detectDeadline is the absolute time (UnixNano) by which the protocol
+	// must be detected: accept time + ReadHeaderTimeout, 0 for none (the
+	// protocol is fixed at accept, the conn was adopted, or ReadHeaderTimeout
+	// is off). It is not extended by a read, so a client that dribbles "GE" or
+	// the HTTP/2 preface cannot move it. checkTimeouts closes an undetected
+	// conn past it; initProtocol hands what is left of it to the H1 header
+	// deadline, so detection does not restart the budget. Loop thread only.
+	detectDeadline int64
+
 	// Cold — third cache line:
 	h1State      *conn.H1State
 	h2State      *conn.H2State
@@ -357,6 +366,7 @@ func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *con
 	cs.fd = fd
 	cs.ctx = ctx
 	cs.liveIdx = -1
+	cs.detectDeadline = 0
 	cs.writeBuf = cs.writeBuf[:0]
 	cs.writePos = 0
 	if cap(cs.buf) >= bufSize {
@@ -384,6 +394,7 @@ func releaseConnState(cs *connState) {
 	cs.protocol = 0
 	cs.detected = false
 	cs.detectN = 0
+	cs.detectDeadline = 0
 	cs.dirty = false
 	cs.epollOut = false
 	cs.pendingBytes = 0

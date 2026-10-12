@@ -1148,6 +1148,16 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 			cs.protocol = l.cfg.Protocol
 			cs.detected = true
 			l.initProtocol(cs)
+		} else if l.cfg.ReadHeaderTimeout > 0 {
+			// The protocol is decided by the first bytes, so there is no H1
+			// state and no header deadline yet (initProtocol arms it at
+			// detection). The conn gets the same absolute budget from accept:
+			// a client that stays silent, sends "GE" and stalls, or dribbles
+			// the HTTP/2 preface is reaped by checkTimeouts instead of living
+			// on the activity stamp each of its bytes refreshes, until
+			// ReadTimeout or IdleTimeout. io_uring does the same
+			// (celeris#974).
+			cs.detectDeadline = now + int64(l.cfg.ReadHeaderTimeout)
 		}
 	}
 	// Cap hit without reaching EAGAIN: more SYNs may be queued. With ET we
@@ -3713,6 +3723,15 @@ func (l *Loop) checkTimeouts() {
 			continue
 		}
 		fd := cs.fd
+		// ReadHeaderTimeout for a conn whose protocol is not detected yet: it
+		// has no H1 state, so the header deadline below has nothing to read,
+		// and detectDeadline (accept + ReadHeaderTimeout) stands in for it.
+		// Such a conn is never detached, so this needs neither detachMu nor
+		// the snapshot.
+		if dl := cs.detectDeadline; dl > 0 && !cs.detected && now > dl {
+			l.closeConn(fd)
+			continue
+		}
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
 		// supplied by the middleware via SetWSIdleDeadline. Skip the
 		// engine-config-driven idle/read/write timeouts since the middleware
