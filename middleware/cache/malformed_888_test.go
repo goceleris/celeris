@@ -247,7 +247,7 @@ func refDecision(dirs [][2]string) (noStore bool, maxAge int, has bool) {
 // that main refused (it held "no-store" or "private" as a substring) is
 // refused unless it is a well-formed value in which they are not directives
 // (x-private=1, a quoted string, x=private). CELERIS_CC_FUZZ_N sets the number
-// of cases (the lane's script runs 3 million).
+// of cases and CELERIS_CC_FUZZ_SEED the seed (the lane's script runs 3 million per seed).
 func TestParseCacheControlAgainstTheReference888(t *testing.T) {
 	n := 300_000
 	if v := os.Getenv("CELERIS_CC_FUZZ_N"); v != "" {
@@ -259,7 +259,13 @@ func TestParseCacheControlAgainstTheReference888(t *testing.T) {
 		n = 20_000
 	}
 	alpha := []string{"private", "no-store", "no-cache", "max-age", "public", "x", "=", `"`, `\`, ",", " ", "\t", ";", "0", "5", "a", "-"}
-	r := rand.New(rand.NewPCG(1, 2))
+	seed := uint64(1)
+	if v := os.Getenv("CELERIS_CC_FUZZ_SEED"); v != "" {
+		if x, err := strconv.ParseUint(v, 10, 64); err == nil {
+			seed = x
+		}
+	}
+	r := rand.New(rand.NewPCG(seed, 2))
 	var wellFormed, malformed, mainRefusedButStored, bad int
 	example := map[string]string{}
 	fail := func(kind, s string, got, want string) {

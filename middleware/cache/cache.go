@@ -349,10 +349,20 @@ const maxDeltaSeconds = math.MaxInt32
 // represent), so that maxAge seconds always fits a time.Duration. The
 // directives are matched as tokens, so x-private-ext is not private and
 // x-max-age=0 is not max-age=0, and the storage decision and the TTL come from
-// this one parse (celeris#888 item 27). A value with a quote that
-// nextDirective cannot read around (a string that never closes, a stray
-// double quote) counts as noStore: what follows it cannot be told from a
-// string.
+// this one parse (celeris#888 item 27).
+//
+// A value that is not a list of directives (RFC 9111 §5.2: directive = token
+// ["=" (token / quoted-string)], separated by commas, RFC 9110 §5.6.1) is not
+// stored, because what a recipient reads in it is a guess, and a wrong guess
+// serves one user's response to another (main refused any value that held
+// "private" or "no-store" anywhere). It is such a value when: the name is
+// empty or holds a byte that is not a token character (so "private; max-age"
+// is not private with a max-age, and a blank before the '=' is not accepted);
+// an unquoted value holds one (so "max-age=60 private" is not max-age=60); or a
+// quote cannot be read around: a string that never closes, a double quote
+// where a string cannot start, anything but blanks after the closing quote
+// (nextDirective). Empty list elements (",,") and blanks around the commas are
+// part of the list syntax, and "name=" is accepted as before.
 func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 	for len(cc) > 0 {
 		var d string
@@ -363,15 +373,22 @@ func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 			// it may be hidden, so the response is not stored.
 			return true, 0, false
 		}
-		name, val, _ := strings.Cut(d, "=")
-		switch strings.TrimSpace(name) {
+		d = strings.Trim(d, " \t")
+		if d == "" {
+			continue // an empty list element
+		}
+		name, val, hasVal := strings.Cut(d, "=")
+		if !isToken(name) || hasVal && !isQuoted(val) && !isTokenOrEmpty(val) {
+			return true, 0, false
+		}
+		switch name {
 		case "no-store", "private", "no-cache":
 			return true, 0, false
 		case "max-age":
 			if hasMaxAge {
 				continue
 			}
-			if n, ok := atoiPrefix(strings.TrimSpace(val)); ok {
+			if n, ok := atoiPrefix(val); ok {
 				if n == 0 {
 					return true, 0, false
 				}
@@ -382,6 +399,29 @@ func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 	return false, maxAge, hasMaxAge
 }
 
+// isToken reports a non-empty token (RFC 9110 §5.6.2): every byte a tchar.
+func isToken(s string) bool { return s != "" && isTokenOrEmpty(s) }
+
+func isTokenOrEmpty(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !isTchar(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// isTchar is RFC 9110 §5.6.2's tchar.
+func isTchar(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' ||
+		b == '-' || b == '_' || b == '.' || b == '!' || b == '#' || b == '$' || b == '%' ||
+		b == '&' || b == '\'' || b == '*' || b == '+' || b == '^' || b == '`' || b == '|' || b == '~'
+}
+
+// isQuoted reports a value that is a quoted string. nextDirective has seen to
+// it that the string closes and that only blanks follow it.
+func isQuoted(val string) bool { return val != "" && val[0] == '"' }
+
 // nextDirective splits the first comma-separated directive off a
 // Cache-Control value; a comma inside a quoted string (no-cache="a, b") does
 // not end it. A quoted string starts only at the double quote that directly
@@ -390,12 +430,13 @@ func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
 // after it (RFC 9110 5.6.4: ext="a\"" is one string), so a quoted-pair does
 // not end a string early and a string does not start anywhere else.
 // doubtful reports a value this cannot read with certainty: a string still
-// open at the end of the value, or a double quote anywhere but where a string
-// starts (ext=a"b, ext=a="b, private", "private"). The directives after such
-// a quote may be hidden in a string or cut by one, so the caller must not
-// trust the rest of the value.
+// open at the end of the value, a double quote anywhere but where a string
+// starts (ext=a"b, ext=a="b, private", "private"), and anything but blanks
+// between the closing quote and the comma or the end (x="a"private). The
+// directives after such a quote may be hidden in a string or cut by one, so the
+// caller must not trust the rest of the value.
 func nextDirective(cc string) (directive, rest string, doubtful bool) {
-	inQuote := false
+	inQuote, closed := false, false
 	eq := -2 // the index of the directive's first "=", -2 until it is seen
 	for i := 0; i < len(cc); i++ {
 		switch {
@@ -404,8 +445,10 @@ func nextDirective(cc string) (directive, rest string, doubtful bool) {
 			case '\\':
 				i++
 			case '"':
-				inQuote = false
+				inQuote, closed = false, true
 			}
+		case closed && cc[i] != ',' && cc[i] != ' ' && cc[i] != '\t':
+			return cc, "", true
 		case cc[i] == '"':
 			if eq < 0 || i != eq+1 {
 				return cc, "", true
