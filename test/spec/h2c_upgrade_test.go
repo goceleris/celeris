@@ -291,9 +291,6 @@ func TestH2CUpgradeInvalidSettings(t *testing.T) {
 
 func TestH2CUpgradeMissingConnectionToken(t *testing.T) {
 	for _, se := range specEngines {
-		if se.name == "std" {
-			continue
-		}
 		t.Run(se.name, func(t *testing.T) {
 			addr := startSpecEngineWithConfig(t, se, func(c *resource.Config) {
 				c.Protocol = engine.Auto
