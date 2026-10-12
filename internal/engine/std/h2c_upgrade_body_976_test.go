@@ -468,8 +468,10 @@ func TestUpgradeBadSettingsWinsOverDeclaredOversize976(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	// The body is sent whole: the 500 does not close the connection, so
+	// net/http reads the declared body before it writes the answer.
 	if _, err := io.WriteString(c, "POST /h HTTP/1.1\r\nHost: std.test\r\nConnection: Upgrade, HTTP2-Settings\r\n"+
-		"Upgrade: h2c\r\nHTTP2-Settings: !!not-base64!!\r\nContent-Length: 8192\r\n\r\n"); err != nil {
+		"Upgrade: h2c\r\nHTTP2-Settings: !!not-base64!!\r\nContent-Length: 8192\r\n\r\n"+strings.Repeat("x", 8192)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	line, _ := bufio.NewReader(c).ReadString('\n')
