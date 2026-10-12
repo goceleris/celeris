@@ -1,6 +1,7 @@
 package singleflight
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/goceleris/celeris"
@@ -57,6 +58,24 @@ func BenchmarkDefaultKeyBrowser(b *testing.B) {
 // of the headers it holds.
 func BenchmarkDefaultKeyPlain(b *testing.B) {
 	c, _ := celeristest.NewContext("GET", "/api/items")
+	defer celeristest.ReleaseContext(c)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = defaultKeyFunc(c)
+	}
+}
+
+// BenchmarkDefaultKeyManyHeaders is the default key of a request that carries
+// thirty headers, none of the ones the key holds but a browser's
+// Accept-Encoding: every header lookup is a linear scan of them, so this is
+// the case where the number of lookups the key makes shows (celeris#888 item
+// 23 moved the preconditions from the bypass check into the key).
+func BenchmarkDefaultKeyManyHeaders(b *testing.B) {
+	opts := []celeristest.Option{celeristest.WithHeader("accept-encoding", "gzip, deflate, br, zstd")}
+	for i := range 29 {
+		opts = append(opts, celeristest.WithHeader("x-hdr-"+strconv.Itoa(i), "value"))
+	}
+	c, _ := celeristest.NewContext("GET", "/api/items", opts...)
 	defer celeristest.ReleaseContext(c)
 	b.ReportAllocs()
 	for b.Loop() {
