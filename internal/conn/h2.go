@@ -70,10 +70,14 @@ type H2Config struct {
 	// WriteTimeout. 0 = no bound.
 	WriteTimeout time.Duration
 	// Logger, when set, receives an Error record for each panic that escapes
-	// an HTTP/2 stream's handler (the stream is reset and the connection
-	// goes on; the celeris router answers a handler's panic with a 500 first,
-	// so this is a panic out of the router itself or of something outside
-	// it). The engines pass their own logger. Nil logs nothing.
+	// an HTTP/2 stream's handler (the celeris router answers a handler's
+	// panic with a 500 first, so this is a panic out of the router itself or
+	// of something outside it). The stream is dropped without a response or
+	// an RST_STREAM, as before, and the connection goes on. The record is
+	// written on the goroutine that ran the handler, which for an inline
+	// stream is the event loop with the connection's H2State lock held, so a
+	// slow log sink stalls the loop for each such panic. An
+	// engine may pass its own logger; none does yet. Nil logs nothing.
 	Logger *slog.Logger
 }
 
