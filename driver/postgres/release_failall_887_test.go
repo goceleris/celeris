@@ -211,9 +211,10 @@ func TestReleaseWhileFailAllIsAboutToFailTheRequestDoesNotRecycleIt887(t *testin
 // neither fail that request nor close its channels. On the pre-fix tree this
 // bleeds in a few of the iterations without -race and is reported by the
 // detector under it; on the fixed tree neither happens. It is a statistical
-// witness for the pin's window edges (a pin taken just after the queue lock
-// drops, an unpin before fail()), mostly under -race: a single run can miss
-// them, and a pin moved into the sweep loop is not caught by it either.
+// witness for the pin's window edges: an unpin before fail() is caught in every
+// -race run, a pin taken just after the queue lock drops or inside the sweep
+// loop only in some runs (a single run can miss them; the loop variant shows
+// even without -race). The deterministic tests above cannot see those two.
 func TestFailAllUngatedNeverTouchesTheNextQuery887(t *testing.T) {
 	const iters = 20000
 	boom := errors.New("old conn closed")
