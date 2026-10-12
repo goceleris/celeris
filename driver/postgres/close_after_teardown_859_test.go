@@ -37,6 +37,11 @@ type c859Loop struct {
 	calls []c859Call
 	unreg chan struct{} // closed on the first UnregisterConn
 	once  sync.Once
+	// writeErr and unregErr, when set before the conn's Close, are what
+	// Write and UnregisterConn return after they record the call: a loop that
+	// has already torn the conn down reports engine.ErrUnknownFD for both
+	// (celeris#887 item 8).
+	writeErr, unregErr error
 }
 
 type c859Call struct {
@@ -58,12 +63,12 @@ func (l *c859Loop) RegisterConn(int, func([]byte), func(error)) error { return n
 func (l *c859Loop) UnregisterConn(fd int) error {
 	l.record("UnregisterConn", fd)
 	l.once.Do(func() { close(l.unreg) })
-	return nil
+	return l.unregErr
 }
 
 func (l *c859Loop) Write(fd int, _ []byte) error {
 	l.record("Write", fd)
-	return nil
+	return l.writeErr
 }
 
 func (l *c859Loop) CPUID() int { return -1 }

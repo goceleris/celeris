@@ -8,6 +8,7 @@ package eventloop
 // that waits for the lock.
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -486,5 +487,138 @@ func TestCallersAndTheWorkerLoseNoBytesAndDoNotDeadlock931(t *testing.T) {
 		sent, recv, calls, conns, busyEvents.Load(), busyQueued.Load())
 	if busyEvents.Load() == 0 {
 		t.Errorf("no event turn found a recvMu held: the stress did not drive the window it checks")
+	}
+}
+
+// celeris#887 item 17: a WriteAndPoll* call holds the conn's recvMu and has
+// EPOLLIN masked while it runs the caller's callbacks. A callback that panics
+// (and is recovered by the caller) or calls runtime.Goexit must not leave the
+// lock held and the conn masked: the worker would then keep a busy turn of the
+// conn queued for good (a 1 kHz poll) and never read its bytes again.
+//
+// For each call and each callback, the reply is written from inside the
+// call's first read (testHookBeforeRead), so the worker cannot take it first
+// and the callback is certain to run. The callback ends the call with a panic
+// the test recovers, or with runtime.Goexit. Afterwards the conn's recvMu must
+// be free, a byte the peer sends must reach the worker's onRecv (EPOLLIN is
+// armed again), and a second call on the conn must return.
+func TestAPanickingOrExitingCallbackLeavesRecvMuAndTheRearmIn887(t *testing.T) {
+	type callFn func(w *worker, fd int, trip func()) (bool, error)
+	rbuf := func() []byte { return make([]byte, 1024) }
+	noop := func([]byte) {}
+	cases := []struct {
+		name string
+		call callFn
+	}{
+		{"WriteAndPoll/onRecv", func(w *worker, fd int, trip func()) (bool, error) {
+			return w.WriteAndPoll(fd, []byte("req"), rbuf(), func([]byte) { trip() })
+		}},
+		{"WriteAndPollBusy/onRecv", func(w *worker, fd int, trip func()) (bool, error) {
+			return w.WriteAndPollBusy(fd, []byte("req"), rbuf(), func([]byte) { trip() })
+		}},
+		{"WriteAndPollMulti/onRecv", func(w *worker, fd int, trip func()) (bool, error) {
+			return w.WriteAndPollMulti(fd, []byte("req"), rbuf(), func([]byte) { trip() }, func() bool { return true }, nil)
+		}},
+		{"WriteAndPollMulti/isDone", func(w *worker, fd int, trip func()) (bool, error) {
+			return w.WriteAndPollMulti(fd, []byte("req"), rbuf(), noop, func() bool { trip(); return true }, nil)
+		}},
+		{"WriteAndPollMulti/beforeRearm", func(w *worker, fd int, trip func()) (bool, error) {
+			return w.WriteAndPollMulti(fd, []byte("req"), rbuf(), noop, func() bool { return true }, trip)
+		}},
+	}
+	for _, tc := range cases {
+		for _, how := range []string{"panic", "goexit"} {
+			t.Run(tc.name+"/"+how, func(t *testing.T) {
+				x, xPeer := socketPair(t)
+				var armed atomic.Bool
+				testHookBeforeRead = func(fd int) {
+					// The call's first read: its reply arrives now, with recvMu
+					// held and EPOLLIN masked, so only the call can read it.
+					if fd == x && armed.CompareAndSwap(true, false) {
+						if _, err := unix.Write(xPeer, []byte("r")); err != nil {
+							t.Errorf("write the reply: %v", err)
+						}
+					}
+				}
+				t.Cleanup(func() { testHookBeforeRead = nil }) // runs last, after Close
+				l, err := New(1)
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				t.Cleanup(func() { _ = l.Close() })
+				w := l.WorkerLoop(0).(*worker)
+				workerGot := make(chan []byte, 8)
+				if err := w.RegisterConn(x, func(b []byte) {
+					select {
+					case workerGot <- append([]byte(nil), b...):
+					default:
+					}
+				}, func(error) {}); err != nil {
+					t.Fatalf("RegisterConn: %v", err)
+				}
+				t.Cleanup(func() { _ = w.UnregisterConn(x); _ = unix.Close(x); _ = unix.Close(xPeer) })
+				c := c784Lookup(w, x)
+
+				type outcome struct {
+					recovered any
+					returned  bool
+				}
+				var tripped atomic.Int32
+				trip := func() {
+					tripped.Add(1)
+					if how == "goexit" {
+						runtime.Goexit()
+					}
+					panic("887: callback panic")
+				}
+				done := make(chan outcome, 1)
+				armed.Store(true)
+				go func() {
+					var o outcome
+					defer func() { o.recovered = recover(); done <- o }()
+					_, _ = tc.call(w, x, trip)
+					o.returned = true
+				}()
+				var o outcome
+				select {
+				case o = <-done:
+				case <-time.After(10 * time.Second):
+					t.Fatal("the call did not end within 10 s")
+				}
+				if tripped.Load() != 1 || o.returned || (how == "panic") != (o.recovered != nil) {
+					t.Fatalf("the callback did not end the call as intended (tripped %d, returned %v, recovered %v): the test did not drive the window", tripped.Load(), o.returned, o.recovered)
+				}
+
+				// 1. recvMu is free.
+				if !c.recvMu.TryLock() {
+					t.Errorf("recvMu is still held after the call ended on a %s in its %s callback", how, tc.name)
+				} else {
+					c.recvMu.Unlock()
+				}
+				// 2. EPOLLIN is armed: a byte sent now reaches the worker.
+				if _, err := unix.Write(xPeer, []byte("z")); err != nil {
+					t.Fatalf("write z: %v", err)
+				}
+				select {
+				case b := <-workerGot:
+					if string(b) != "z" {
+						t.Errorf("the worker's onRecv got %q, want %q", b, "z")
+					}
+				case <-time.After(2 * time.Second):
+					t.Errorf("the worker never got the byte sent after the call ended: EPOLLIN was not re-armed, or recvMu stayed held")
+				}
+				// 3. A second call on the conn returns (no deadlock).
+				second := make(chan struct{})
+				go func() {
+					defer close(second)
+					_, _ = w.WriteAndPollMulti(x, []byte("req"), make([]byte, 1024), noop, func() bool { return true }, nil)
+				}()
+				select {
+				case <-second:
+				case <-time.After(5 * time.Second):
+					t.Errorf("a second WriteAndPollMulti on the conn did not return within 5 s: the first call left recvMu held")
+				}
+			})
+		}
 	}
 }
