@@ -158,6 +158,17 @@ type pgRequest struct {
 	abortCh      chan struct{}
 	sendMu       sync.RWMutex
 	rowChClosed  bool // guarded by sendMu
+	// failPins counts the failAll sweeps that took r off the pending queue and
+	// have not finished with it yet. failAll runs on the loop (or the closing)
+	// goroutine, while the caller that r's fail() woke can already be
+	// releasing r: releasePgRequest resets r's fields and recycles it, so a
+	// failAll still inside closeRowCh / closeColsCh / fail would race that
+	// reset, and one that comes in after the pool handed r to a new query would
+	// close that query's channels and fail it with the old error. failAll pins
+	// under pendingMu (the same lock failReq takes to find r, so a failReq that
+	// misses r sees the pin), and unpins as its last act on r;
+	// releasePgRequest drops a pinned request instead of pooling it.
+	failPins atomic.Int32
 	// syncMode suppresses the lazy streaming promotion (promoteToStreaming)
 	// when the request is being handled on the sync fast path
 	// (WriteAndPoll). The sync path runs dispatch on the calling goroutine,
@@ -316,6 +327,13 @@ func releasePgRequest(r *pgRequest) {
 	// request and let GC reclaim it — acquirePgRequest will allocate
 	// a fresh one instead.
 	if !r.finished.Load() {
+		return
+	}
+	// A failAll sweep that holds r is still closing its channels and failing
+	// it (see failPins): recycling r now would reset those fields under it, or
+	// hand a request it is about to close to the next query. Drop r the way
+	// the unfinished case above does; the sweep's last act on r is the unpin.
+	if r.failPins.Load() != 0 {
 		return
 	}
 	r.ctx = nil
@@ -1493,6 +1511,14 @@ func (c *pgConn) failAll(err error) {
 	c.pendingMu.Lock()
 	queue := c.pending
 	c.pending = nil
+	// Pin every request taken off the queue before the lock drops: from here
+	// on a caller's failReq no longer finds it in pending, fails it on its own
+	// and may release it while this sweep is still using it (failPins).
+	for _, r := range queue {
+		if r != nil {
+			r.failPins.Add(1)
+		}
+	}
 	c.pendingMu.Unlock()
 	c.bridge.DrainWithError(err, nil)
 	for _, r := range queue {
@@ -1517,6 +1543,8 @@ func (c *pgConn) failAll(err error) {
 		// path) and this failAll (event-loop onClose path) cannot race on
 		// r.err. First winner's err is the one wait() observes.
 		r.fail(err)
+		// The last touch of r: after this a releasePgRequest may recycle it.
+		r.failPins.Add(-1)
 	}
 }
 
