@@ -514,11 +514,16 @@ func (r *pgRequest) sendRow(row [][]byte) {
 // It also marks a request that is not streaming yet, so that a promotion
 // that comes after (dispatch is still running) does not publish a channel
 // nothing will close.
-func (r *pgRequest) closeRowCh() {
+//
+// It reports whether the request had published a rowCh, which is when a caller
+// parked on colsCh is owed a wake-up (closeColsCh); a request that never
+// promoted wakes its caller through doneCh.
+func (r *pgRequest) closeRowCh() (streaming bool) {
 	r.chMu.Lock()
 	if r.rowChClosing {
+		streaming = r.rowCh != nil
 		r.chMu.Unlock()
-		return
+		return streaming
 	}
 	r.rowChClosing = true
 	if r.abortCh == nil {
@@ -529,17 +534,21 @@ func (r *pgRequest) closeRowCh() {
 	ch := r.rowCh
 	r.chMu.Unlock()
 	if ch == nil {
-		return
+		return false
 	}
 	r.sendMu.Lock()
 	r.rowChClosed = true
 	close(ch)
 	r.sendMu.Unlock()
+	return true
 }
 
 // closeColsCh closes colsCh once, whoever calls it (OnRowDesc,
 // promoteToStreaming, dispatch, failAll), and does nothing when the request
-// has no colsCh.
+// has no colsCh. A closed colsCh means rowCh is published: waitForQueryRows
+// builds a streamRows over rowCh when it wakes on colsCh, and a nil rowCh
+// blocks that streamRows' Next and Close for good. Every caller closes it only
+// for a request that is streaming.
 func (r *pgRequest) closeColsCh() {
 	r.chMu.Lock()
 	if r.colsCh != nil && !r.colsChClosed {
@@ -1411,13 +1420,6 @@ func copyRow(fields [][]byte) [][]byte {
 // copyRow. The buffered rows in req.rows are already slab-backed; we send
 // them as-is into the channel (the slab memory transfers ownership).
 func promoteToStreaming(req *pgRequest) {
-	// Ensure columns are set before signaling the caller. For extended
-	// queries, columns live on req.extended.Columns until the done branch
-	// copies them to req.columns. We promote them now so the streamRows
-	// returned by waitForQueryRows has valid column metadata.
-	if req.columns == nil && req.kind == reqExtended {
-		req.columns = req.extended.Columns
-	}
 	// Channel capacity must fit every buffered row without blocking — we hold
 	// the dispatch goroutine here, and the caller is still selecting on colsCh
 	// (which we close after this flush). Normally len(req.rows) == streamThreshold,
@@ -1433,21 +1435,39 @@ func promoteToStreaming(req *pgRequest) {
 		ch <- row
 	}
 	req.chMu.Lock()
-	if !req.rowChClosing {
-		req.rowCh = ch // published under chMu: failAll's closeRowCh reads it from another goroutine
-	} // else failAll has been through and nothing would close ch: the request stays buffered
-	req.chMu.Unlock()
+	if req.rowChClosing {
+		// failAll has been through and nothing would close ch. The request is
+		// failing and stays as it is: the caller it woke through doneCh reads
+		// req.rows and req.columns right now, so nothing here may write them,
+		// and colsCh stays open (the caller must not take this for a streaming
+		// request). ch is dropped; req.rows keeps the buffered rows, which the
+		// caller returns with the error.
+		req.chMu.Unlock()
+		return
+	}
+	// Ensure columns are set before signaling the caller. For extended
+	// queries, columns live on req.extended.Columns until the done branch
+	// copies them to req.columns. We promote them now so the streamRows
+	// returned by waitForQueryRows has valid column metadata.
+	if req.columns == nil && req.kind == reqExtended {
+		req.columns = req.extended.Columns
+	}
+	req.rowCh = ch // published under chMu: failAll's closeRowCh reads it from another goroutine
 	// Clear the buffer. We nil out the slice elements but retain the backing
-	// capacity for reuse by releasePgRequest.
+	// capacity for reuse by releasePgRequest. Done under chMu, after the
+	// decline check: a caller that failAll wakes through doneCh reads req.rows
+	// only after failAll's closeRowCh took chMu, so it sees this clear and
+	// cannot race it.
 	for i := range req.rows {
 		req.rows[i] = nil
 	}
 	req.rows = req.rows[:0]
+	req.chMu.Unlock()
 	// Signal colsCh so the caller (waitForQueryRows) can return a streamRows.
 	// colsCh was pre-allocated by simpleQuery/doExtendedQuery; Exec paths
 	// don't allocate one and the dispatch sites above guard on colsCh != nil
-	// before calling promoteToStreaming. Double-check here as a defense in
-	// depth — close(nil) panics.
+	// before calling promoteToStreaming. closeColsCh does nothing for a nil
+	// colsCh (close(nil) would panic).
 	req.closeColsCh()
 }
 
@@ -1487,8 +1507,12 @@ func (c *pgConn) failAll(err error) {
 		// promote it between a check and the close, and a consumer that sees
 		// rowCh closed without it would read the cut-off result as complete.
 		r.streamErr.Store(&err)
-		r.closeRowCh()
-		r.closeColsCh()
+		if r.closeRowCh() {
+			// Streaming: the caller may be parked on colsCh. A request that
+			// has not promoted has no rowCh to hand over, and its caller wakes
+			// on the doneCh that fail() signals below with the error.
+			r.closeColsCh()
+		}
 		// Use fail() so concurrent failReq (caller goroutine Write-error
 		// path) and this failAll (event-loop onClose path) cannot race on
 		// r.err. First winner's err is the one wait() observes.
