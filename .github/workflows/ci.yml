@@ -159,8 +159,10 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)|/engine/iouring$')
+          # -timeout=1200s: the root package takes about 590 s under coverage (runs
+          # 38257771033 and 38280491235), so 1200 s keeps 2x headroom. Refs #890.
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=600s -v $pkgs 2>&1 | tee /tmp/root.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=1200s -v $pkgs 2>&1 | tee /tmp/root.log
           # Allowed to skip in this step, each by its full name:
           #   * TestAdaptiveSettledRouteRetime592/iouring/*: the rig needs two io_uring
           #     workers and the runner's 8 MiB funds one; the step "celeris#592

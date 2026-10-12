@@ -54,7 +54,10 @@ jobs:
   coverage:
     name: Coverage (root + middleware sub-modules)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 40, not 30: the root step may run 1200 s (20 min), the iouring step up to
+    # 480 s and the four middleware steps up to 120 s each, which is 36 min at
+    # their own limits before checkout and setup-go. Refs #890.
+    timeout-minutes: 40
     env:
       # ci.yml's unit selection (see "Same packages as ci.yml" below).
       COVER_EXCLUDE: "/test/|/adaptive($|/)|/middleware/websocket($|/)"
@@ -117,8 +120,10 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE "$COVER_EXCLUDE" | grep -vE "$COVER_OWN_STEP")
+          # -timeout=1200s: the root package takes about 590 s under coverage (runs
+          # 38257771033 and 38280491235), so 1200 s keeps 2x headroom. Refs #890.
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
-          go test -race -count=1 -timeout=600s -covermode=atomic \
+          go test -race -count=1 -timeout=1200s -covermode=atomic \
             -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
       # ./internal/engine/iouring on its own, as ci.yml's unit job runs it.
       # io_uring charges ring memory to the user, so every test process of the
