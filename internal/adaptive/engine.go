@@ -1145,10 +1145,11 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 // runEvalLoop holds switchMu across a controller evaluation, which writes
 // records through the configured Logger ("engine switch recommended",
 // "oscillation lock expired", and the per-tick debug record under
-// CELERIS_ADAPTIVE_DEBUG), and performSwitch logs while it holds mu and
-// switchMu ("oscillation detected" comes from controller.recordSwitch, under
-// both). A Metrics() on either lock would deadlock a Logger handler that calls
-// it (Server.EngineInfo does) from one of those records, and on switchMu would
+// CELERIS_ADAPTIVE_DEBUG), and performSwitch logs while it holds mu ("engine
+// switch completed", "refusing engine switch"; "oscillation detected" comes
+// from controller.recordSwitch, which it calls under mu and switchMu). A
+// Metrics() on mu or switchMu would deadlock a Logger handler that calls it
+// (Server.EngineInfo does) from one of those records, and on switchMu would
 // also wait behind every evaluation. slotsMu is held only by the two
 // slot-publish blocks in performSwitch and by this method, and nothing is
 // logged or called out under it, so a handler may call Metrics() from any

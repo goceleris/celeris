@@ -20,9 +20,11 @@ import (
 // does) from a record the adaptive engine writes while it holds one of its own
 // locks. runEvalLoop holds switchMu across the controller's evaluation, whose
 // records ("engine switch recommended", "oscillation lock expired", the debug
-// tick) go through that Logger, and performSwitch holds mu and switchMu while
-// it logs; a Metrics() that takes any of those locks deadlocks the goroutine
-// that is logging (celeris#886 item 12, review round 2 of the Metrics fix).
+// tick) go through that Logger, and performSwitch holds mu while it logs
+// ("engine switch completed"; the controller's "oscillation detected" is
+// written under mu and switchMu); a Metrics() that takes any of those locks
+// deadlocks the goroutine that is logging (celeris#886 item 12, review round 2
+// of the Metrics fix).
 
 type metricsFromHandler886 struct {
 	e    atomic.Pointer[Engine]
@@ -137,7 +139,8 @@ func TestMetricsFromALogHandlerOnSwitchRecommended886(t *testing.T) {
 
 // Every record the engine writes while it runs a switch: the controller's
 // recommendation and the debug tick (both under switchMu), and performSwitch's
-// own records (under mu and switchMu). Metrics() takes none of those locks.
+// own records such as "engine switch completed" (under mu). Metrics() takes
+// none of those locks.
 func TestMetricsFromALogHandlerOnEveryRecordOfASwitch886(t *testing.T) {
 	old := adaptiveDebugEnabled
 	adaptiveDebugEnabled = true // the per-tick record is only written in debug mode
