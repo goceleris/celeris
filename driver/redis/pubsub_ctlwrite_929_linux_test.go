@@ -270,6 +270,11 @@ func newPubsubRig(t *testing.T, eng rigEngine) *pubsubRig {
 // (documented on engine.WorkerLoop.UnregisterConn; with one worker, as on a
 // runner whose memlock funds one, every number lands on the same worker).
 // The dial is retried for a while on exactly that error (celeris#887 item 10).
+//
+// The retry hides a real dial failure: Pool.Acquire can fail the same way for a
+// caller under connection churn. It is tracked as the item "drivers, io_uring
+// dial: ... fd already registered" of the celeris#887 checklist. Remove this
+// retry when that dial is fixed, so the test sees the failure again.
 func (r *pubsubRig) newPubSubAfterReuse(ctx context.Context) (*PubSub, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
