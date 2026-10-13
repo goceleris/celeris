@@ -1092,6 +1092,8 @@ func statusText(code int) string {
 		return "Forbidden"
 	case 404:
 		return "Not Found"
+	case 413:
+		return "Request Entity Too Large"
 	case 500:
 		return "Internal Server Error"
 	case 502:

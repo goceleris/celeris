@@ -785,6 +785,16 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			bodyNeeded = state.req.ContentLength
 		}
 
+		// The declared length is checked before "100 Continue" is written, as
+		// on the fast path above: a client must not be asked to send a body
+		// that is about to be refused.
+		if bodyNeeded > 0 {
+			if limit := state.maxBodySize(); limit > 0 && bodyNeeded > limit {
+				writeErrorResponse(write, 413, "Request body too large")
+				return fmt.Errorf("content-length %d exceeds %d byte limit", bodyNeeded, limit)
+			}
+		}
+
 		if state.req.ExpectContinue && (bodyNeeded > 0 || bodyNeeded == -1) {
 			if state.OnExpectContinue != nil && !safeExpectContinue(state.OnExpectContinue, state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 				write(expectation417Response)
@@ -795,13 +805,6 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			}
 			write(continue100Response)
 			state.req.ExpectContinue = false
-		}
-
-		if bodyNeeded > 0 {
-			if limit := state.maxBodySize(); limit > 0 && bodyNeeded > limit {
-				writeErrorResponse(write, 413, "Request body too large")
-				return fmt.Errorf("content-length %d exceeds %d byte limit", bodyNeeded, limit)
-			}
 		}
 
 		var bodyData []byte
