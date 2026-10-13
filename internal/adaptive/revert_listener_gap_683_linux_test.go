@@ -66,7 +66,9 @@ func installLateEpoll683(t *testing.T, e *Engine, delay time.Duration) *lateEpol
 	}
 	l := &lateEpoll683{Engine: ep, delay: delay}
 	e.switchMu.Lock()
+	e.slotsMu.Lock()
 	e.primary = l
+	e.slotsMu.Unlock()
 	e.ctrl.primary = l
 	e.switchMu.Unlock()
 	if e.ActiveEngine().Type() == engine.Epoll {
@@ -248,7 +250,9 @@ func TestPromotionKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing
 	}
 	late := &lateIOUring683{Engine: io, delay: 20 * time.Millisecond}
 	e.switchMu.Lock()
+	e.slotsMu.Lock()
 	e.secondary = late
+	e.slotsMu.Unlock()
 	e.ctrl.secondary = late
 	e.switchMu.Unlock()
 	e.mu.Unlock()
@@ -337,8 +341,8 @@ func TestSwitchWaitForTheIncomingListenerDoesNotBlockDriverRegistration683(t *te
 }
 
 // Nor does Engine.Metrics() (hence Server.EngineInfo and the observe collector)
-// sit behind the wait: it takes only switchMu for the two sub-engine slots, and
-// nothing holds switchMu across the wait. Read under e.mu, it sat out the rest
+// sit behind the wait: it takes only slotsMu for the two sub-engine slots, and
+// nothing holds slotsMu across the wait. Read under e.mu, it sat out the rest
 // of the late engine's delay (celeris#886 item 12).
 func TestSwitchWaitForTheIncomingListenerDoesNotBlockMetrics683(t *testing.T) {
 	if testing.Short() {
