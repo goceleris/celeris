@@ -59,3 +59,53 @@ func forceSwitchTo(t *testing.T, e *Engine, want engine.EngineType) {
 	}
 	t.Fatalf("a forced switch to %v left %v active", want, got)
 }
+
+// afterNew886 is a hook the controller-driven tests' constructors
+// (newRampAdaptive, preBoundAdaptive) call on the engine between New and
+// Listen. nil outside a test that sets it. TestControllerSwitchVerdictsOnAFailedStandby886
+// sets it, in a child process, to make the lazy io_uring standby fail to build
+// (failStandbyBuild804).
+var afterNew886 func(*Engine)
+
+// standbyBuildFailed886 reports whether the controller wanted the lazy io_uring
+// standby and could not have it: no switch has landed, no io_uring engine
+// exists, and a build failure is on record (abortStandbyBuild, which every
+// failed build goes through, keeps the count; the next successful build clears
+// it, and then the slot is not nil).
+func standbyBuildFailed886(e *Engine) (failed bool, failures int) {
+	if e.Metrics().AdaptiveSwitches != 0 {
+		return false, 0
+	}
+	e.slotsMu.Lock()
+	secondary := e.secondary
+	e.slotsMu.Unlock()
+	e.switchMu.Lock()
+	failures = e.ctrl.state.buildFailures
+	e.switchMu.Unlock()
+	return secondary == nil && failures > 0, failures
+}
+
+// skipIfStandbyBuildFailed886 is the guard of the controller-driven switch
+// tests (celeris#886 item 11), the counterpart of forceSwitchTo's for the
+// tests that wait for the controller instead of forcing the switch.
+//
+// Call it where the test is about to judge an up-switch that did not happen.
+// When the io_uring standby could not be built (ring setup ENOMEM under
+// RLIMIT_MEMLOCK, a seccomp profile, a kernel without the ops: the engine logs
+// "aborting switch", stays on epoll and leaves e.secondary nil), that is the
+// ENVIRONMENT and it skips, or fails under CELERIS_REQUIRE_UPSWITCH=1 as the
+// adaptive CI job sets it (skipOrFailUpswitch662), instead of reporting
+// "conns not on io_uring" or "no engine switch" as an engine defect.
+//
+// It is keyed on the recorded build failure, not on AdaptiveSwitches == 0 and
+// an empty slot alone: those two also hold when the controller never asked for
+// the standby at all, which is the engine defect these tests exist to catch,
+// and which must stay a failure on a host where io_uring works.
+func skipIfStandbyBuildFailed886(t *testing.T, e *Engine) {
+	t.Helper()
+	if failed, failures := standbyBuildFailed886(e); failed {
+		skipOrFailUpswitch662(t, "the io_uring standby did not come up here: %d consecutive standby build failure(s) "+
+			"on record (the engine aborted the switch and stayed on epoll), so the up-switch this test judges could not happen",
+			failures)
+	}
+}

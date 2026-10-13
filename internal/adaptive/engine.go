@@ -578,7 +578,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// but if the active sub-engine has already returned an error to errCh
 	// (e.g. ENOMEM at io_uring_setup under low RLIMIT_MEMLOCK), surface it
 	// immediately instead of waiting out the deadline.
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(listenBindDeadline)
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer tick.Stop()
 	bindWait := time.NewTimer(time.Until(deadline))
@@ -622,7 +622,7 @@ bindLoop:
 	if active.Addr() == nil {
 		innerCancel()
 		wg.Wait()
-		return fmt.Errorf("active sub-engine failed to initialize within 20s deadline")
+		return fmt.Errorf("active sub-engine failed to initialize within %v deadline", listenBindDeadline)
 	}
 
 	// No standby to pause: only the active engine is in the SO_REUSEPORT group,
@@ -1643,6 +1643,12 @@ func reusePortAddr(ln net.Listener) (string, error) {
 // engine begins to bind: the last moment the port hold has to cover
 // (celeris#616). nil in production.
 var listenGapHook func(addr string)
+
+// listenBindDeadline is how long Listen waits for the start engine to publish
+// its address before it gives up. A variable only so that a test can reach
+// that return without waiting out 20 s (celeris#886 item 4); nothing else
+// writes it.
+var listenBindDeadline = 20 * time.Second
 
 // releasePortHold closes the socket that has held the engine's port since New
 // (celeris#616), once. Safe from any goroutine: Listen and Shutdown can both

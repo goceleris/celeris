@@ -114,6 +114,11 @@ func probeAsyncCancelFlagsCached() (asyncCancelProbe, string) {
 // today; it is documented rather than enforced because guarding the
 // seams would mean a mutex-taking setter and a save/restore helper for each
 // of the four, which is more machinery than a constraint one grep checks.
+//
+// The one exception is ForceAsyncCancelProbe (async_cancel_seam.go), for a
+// test of another package: it replaces this variable and forgets the cached
+// answer under asyncCancelMu, so it is not a race with a New on another
+// goroutine; the process-wide answer it sets is the caller's to restore.
 var runAsyncCancelProbe = probeAsyncCancelFlags
 
 // SEND_ZC ioprio flags and notification result values.

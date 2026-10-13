@@ -331,10 +331,13 @@ jobs:
       # CELERIS_REQUIRE_IOURING_WORKERS=1 turns the rig's skip into a failure.
       # The tally wants exactly one top-level RUN and PASS, each of the six
       # subtests (both engines, three arms) to PASS by name, and no `--- SKIP`
-      # line of any kind. It does not assert the celeris#593 stall the rig prints
-      # for io_uring (IOURING592 ... stalled_frac): the rig asserts a median
-      # ratio there, as it does for epoll, and tightening that is a separate
-      # decision (celeris#622).
+      # line of any kind. All three io_uring arms (the settled arm and both
+      # controls) also assert that no event-loop goroutine was parked on a mutex
+      # at a quarter or more of the stack captures taken while the /ping probe sat
+      # unanswered (celeris#886 item 1, ioUringPin592: the celeris#593 pin, read
+      # from the worker's own stack because no latency statistic separates a
+      # pinned worker from a starved free one), so a PASS of those arms is a
+      # PASS on that too; epoll is judged on the median ratio (celeris#622).
       - name: celeris#592 settled-route retime rig, both engines (memlock raised, skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -1429,6 +1432,12 @@ jobs:
       # own RESULT line, and New must hand the sub-engines net.Listen's
       # address on every free-port form. CELERIS_REQUIRE_DUALSTACK=1 turns the
       # dual-stack tests' skip on a host without IPv6 into a failure.
+      # TestAdaptiveListenEarlyReturnReleasesHold616 (celeris#886 item 4) is the
+      # one that stops Listen early: a Listen that returns before the
+      # start engine published its address, by a cancelled context, by a
+      # start engine that fails or by the bind deadline passing, must give the
+      # hold back with no Shutdown after it; four arms print an "early return"
+      # line with hold_after=false.
       - name: celeris#616 port held from New to Listen (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -1437,7 +1446,7 @@ jobs:
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHeldUntilListenReturns616|TestAdaptiveShutdownWithoutListenFreesPort616|TestAdaptivePortHeldWildcard616|TestAdaptivePortHeldBesideTimeWait616|TestAdaptiveTimeWaitStealFailsLoudly616|TestAdaptiveNoHoldOnlyWhereNetListenFails616|TestAdaptivePortHoldKind616|TestAdaptiveAddrMatchesNetListen616'
+          names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHeldUntilListenReturns616|TestAdaptiveShutdownWithoutListenFreesPort616|TestAdaptivePortHeldWildcard616|TestAdaptivePortHeldBesideTimeWait616|TestAdaptiveTimeWaitStealFailsLoudly616|TestAdaptiveNoHoldOnlyWhereNetListenFails616|TestAdaptivePortHoldKind616|TestAdaptiveAddrMatchesNetListen616|TestAdaptiveListenEarlyReturnReleasesHold616'
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./internal/adaptive/ 2>&1 | tee /tmp/c616.log
@@ -1449,9 +1458,10 @@ jobs:
           tw=$(grep -cE 'celeris616 time-wait: start=(epoll|iouring) form=[^ ]+ time_wait=[1-9][0-9]* exclusive_refused=true net_listen=([^ ]+) handed=\2 thief=(EADDRINUSE|-) started=true v4=200 v6=(200|0)$' /tmp/c616.log || true)
           twheld=$(grep -cE 'celeris616 time-wait: start=(epoll|iouring) form=(wildcard|0\.0\.0\.0|\[::\]) .* thief=EADDRINUSE started=true v4=200 v6=200$' /tmp/c616.log || true)
           untilret=$(grep -cE 'celeris616 hold until Listen returns: start=(epoll|iouring) paused_refused=\[go-listener bare-socket\] workers=[1-9][0-9]* listening_after_resume=[1-9][0-9]* error_listener_recreate=0 freed_after_listen=\[go-listener bare-socket\] in=' /tmp/c616.log || true)
+          early=$(grep -cE 'celeris616 early return: (context cancelled/(epoll|iouring)|start engine fails/epoll|bind deadline passes/epoll) listen_err=(true|false) hold_after=false thieves_failed=0 waited=' /tmp/c616.log || true)
           kind=$(grep -cE 'celeris616 hold kind: state=(free-port .* SO_REUSEADDR=0 SO_REUSEPORT=[1-9]|time-wait .* SO_REUSEADDR=[1-9] SO_REUSEPORT=[1-9])$' /tmp/c616.log || true)
-          echo "celeris#616 tests: want $want, passed $passed, SKIP lines $skipped, New-to-Listen arms refused and started $gap (want 4), in-Listen arms refused $inlisten (want 4), wildcard arms 6/6 refused and dual-stack $wild (want 2), TIME_WAIT arms on net.Listen's address $tw (want 10) of which wildcard held $twheld (want 6), hold kinds $kind (want 2), hold-until-Listen-returns arms refused while paused and freed after Listen $untilret (want 2)"
-          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$gap" -ne 4 ] || [ "$inlisten" -ne 4 ] || [ "$wild" -ne 2 ] || [ "$tw" -ne 10 ] || [ "$twheld" -ne 6 ] || [ "$kind" -ne 2 ] || [ "$untilret" -ne 2 ]; then
+          echo "celeris#616 tests: want $want, passed $passed, SKIP lines $skipped, New-to-Listen arms refused and started $gap (want 4), in-Listen arms refused $inlisten (want 4), wildcard arms 6/6 refused and dual-stack $wild (want 2), TIME_WAIT arms on net.Listen's address $tw (want 10) of which wildcard held $twheld (want 6), hold kinds $kind (want 2), hold-until-Listen-returns arms refused while paused and freed after Listen $untilret (want 2), early-return arms that gave the hold back with no Shutdown $early (want 4)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$gap" -ne 4 ] || [ "$inlisten" -ne 4 ] || [ "$wild" -ne 2 ] || [ "$tw" -ne 10 ] || [ "$twheld" -ne 6 ] || [ "$kind" -ne 2 ] || [ "$untilret" -ne 2 ] || [ "$early" -ne 4 ]; then
             echo "expected all $want celeris#616 tests to PASS with no SKIP line, and every arm on both start"
             echo "engines to report a refused steal -- was one renamed or removed, or did an io_uring arm skip?"
             exit 1
