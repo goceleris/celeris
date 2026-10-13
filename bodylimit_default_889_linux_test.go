@@ -352,7 +352,16 @@ func h2Upgraded889(t *testing.T, addr string, n int64) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = c.Close() }()
+	// readerDone is closed when the reader goroutine below has exited, so
+	// that nothing of the helper (its t.Logf included) outlives the test.
+	readerDone := make(chan struct{})
+	started := false
+	defer func() {
+		_ = c.Close()
+		if started {
+			<-readerDone
+		}
+	}()
 	_ = c.SetDeadline(time.Now().Add(60 * time.Second))
 	if _, err := io.WriteString(c, "GET /ping HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n"+
 		"HTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n"); err != nil {
@@ -393,7 +402,9 @@ func h2Upgraded889(t *testing.T, addr string, n int64) string {
 	}
 	write(func() error { _, err := io.WriteString(c, http2.ClientPreface); return err })
 	write(func() error { return fr.WriteSettings() })
+	started = true
 	go func() {
+		defer close(readerDone)
 		dec := hpack.NewDecoder(4096, func(f hpack.HeaderField) {
 			if f.Name == ":status" {
 				status = f.Value
@@ -527,6 +538,63 @@ func TestUpgradedConnectionLaterStreamBodyLimit889(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// TestExpectContinueOverLimit889: a request that declares a Content-Length
+// over the limit and asks for "Expect: 100-continue" is refused with 413
+// alone, never "100 Continue" first (the client would start sending a body the
+// server has already decided to refuse). The head goes in one write (the fast
+// path of the native engines) and split over two (their buffered path, also
+// taken by the async-route re-run): both must agree. A declared length at the
+// limit still gets its 100 Continue. The refusal carries the reason phrase
+// "Request Entity Too Large" on every engine, as std's does.
+func TestExpectContinueOverLimit889(t *testing.T) {
+	const limit = 4 * bodyMiB889
+	for _, e := range engines761 {
+		addr := bodyServer889(t, e.eng, 0)
+		for _, split := range []bool{false, true} {
+			for _, n := range []int64{limit, limit + 1} {
+				t.Run(fmt.Sprintf("%s/split=%v/n=%d", e.name, split, n), func(t *testing.T) {
+					c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = c.Close() }()
+					_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+					a := "POST /up HTTP/1.1\r\nHost: a\r\n"
+					b := fmt.Sprintf("Expect: 100-continue\r\nContent-Length: %d\r\n\r\n", n)
+					if split {
+						_, _ = io.WriteString(c, a)
+						time.Sleep(100 * time.Millisecond)
+						_, _ = io.WriteString(c, b)
+					} else {
+						_, _ = io.WriteString(c, a+b)
+					}
+					// Every status line the server sends until it closes or
+					// the 2 s deadline passes (an accepted length waits for
+					// a body that never comes).
+					var statuses []string
+					br := bufio.NewReader(c)
+					for {
+						l, err := br.ReadString('\n')
+						if err != nil {
+							break
+						}
+						if strings.HasPrefix(l, "HTTP/1.1 ") {
+							statuses = append(statuses, strings.TrimSpace(l))
+						}
+					}
+					want := []string{"HTTP/1.1 100 Continue"}
+					if n > limit {
+						want = []string{"HTTP/1.1 413 Request Entity Too Large"}
+					}
+					if fmt.Sprint(statuses) != fmt.Sprint(want) {
+						t.Fatalf("status lines %q, want %q", statuses, want)
+					}
+				})
+			}
 		}
 	}
 }
