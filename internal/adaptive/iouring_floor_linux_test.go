@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/iouring"
 	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -58,7 +59,23 @@ func (l *floorLog682) fallbackError(t *testing.T) (string, bool) {
 // the reason for any fallback: io_uring starts unless something else (no
 // io_uring at all, for one) keeps it off. Either way the engine must serve.
 func TestAdaptiveStartOverrideBelowTheIOUringFloor(t *testing.T) {
+	startOverrideFloor682(t, nil)
+}
+
+// TestAdaptiveStartOverrideProbeRejects682 is the same test with the probe
+// forced to the answer a kernel before 5.19 gives (iouring.ForceAsyncCancelProbe),
+// on whatever kernel runs it. The expectation is the one above, keyed on the
+// kernel version, which is what celeris#886 item 2 is about.
+func TestAdaptiveStartOverrideProbeRejects682(t *testing.T) {
+	r := iouring.AsyncCancelRejected
+	startOverrideFloor682(t, &r)
+}
+
+func startOverrideFloor682(t *testing.T, force *iouring.AsyncCancelAnswer) {
 	p := probe.Probe()
+	if force != nil {
+		t.Cleanup(iouring.ForceAsyncCancelProbe(*force, "forced by the test"))
+	}
 	below := p.KernelMajor < 5 || (p.KernelMajor == 5 && p.KernelMinor < 19)
 	t.Setenv("CELERIS_ADAPTIVE_START", "iouring")
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
