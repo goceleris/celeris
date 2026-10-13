@@ -462,6 +462,15 @@ type Worker struct {
 	// linger for. A listener created without it (DisableDeferAccept) closes
 	// at once. Loop-thread only.
 	deferCapable bool
+	// exited (declared here, after deferCapable, to sit in the padding that
+	// follows it and leave the layout of the fields below unchanged) is set by
+	// Engine.runWatched when the worker goroutine is gone, whether run
+	// returned or the goroutine ended without returning (a handler's
+	// runtime.Goexit, celeris#848). It is never reset. PauseAccept counts an
+	// exited worker as closed whatever listenFDClosed says, because
+	// ResumeAccept clears that flag on every worker, a dead one included, and
+	// nothing would set it again.
+	exited atomic.Bool
 	// pause is the engine's record of the pause in progress, written by
 	// BeginPauseAccept before it sets acceptPaused. Nil in bare test
 	// workers, which deferlinger treats as "no guard, no delay".
@@ -703,6 +712,16 @@ type Worker struct {
 	// no answer. A reap is only placed when it is true;
 	// createWorkers copies the engine's answer. Read-only after init.
 	asyncCancelFlags bool
+	// closingFD is the listen descriptor, plus one (0 is none), that
+	// closeListenerAfterDrain or stopAccepting has taken out of listenFD and
+	// not yet closed: they clear listenFD before they run handlers (the
+	// cancel's completions, OnConnect for the queued connections), so a
+	// Goexit in a handler would leave the descriptor open and in the
+	// SO_REUSEPORT group, and leaveGroupAfterExit closes it from here. An
+	// int32 (a descriptor is a C int) declared here, in the padding after
+	// asyncCancelFlags, so that adding it moves no other field and leaves
+	// Worker its size. Worker thread only.
+	closingFD int32
 	// dupFD duplicates the descriptor a hand-off moves: unix.Dup when nil.
 	// A test seam, so a test can make the dup fail the way a process out
 	// of descriptors does (EMFILE).
@@ -1124,9 +1143,10 @@ func (w *Worker) run(ctx context.Context) {
 	runtime.LockOSThread()
 	w.runCtx = ctx
 
-	// The save fails on a kernel with more than 1024 possible CPUs, more
-	// than unix.CPUSet holds, where the pin still succeeds: a main thread the
-	// worker ran on is then parked still pinned.
+	// The save reads the whole mask, however many CPUs the kernel has
+	// (platform.SaveThreadAffinity). It fails only on a syscall error or a
+	// mask past 8 KiB, and the pin below still goes ahead: a main thread the
+	// worker ran on is then parked still pinned (celeris#905).
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}
@@ -2527,6 +2547,7 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// worker does not own.
 	lfd := w.listenFD
 	w.listenFD = -1
+	w.closingFD = int32(lfd) + 1
 	w.cancelAccept(ctx, lfd)
 	// The completions above only cover handshakes an accept had already
 	// reached. Anything still in the kernel accept queue would be aborted
@@ -2535,6 +2556,7 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// (celeris#662).
 	w.acceptQueuedOnPause(ctx, lfd)
 	_ = unix.Close(lfd)
+	w.closingFD = 0
 	w.lingerUntil = 0
 	deferlinger.NoteClose()
 	w.listenFDClosed.Store(true)
@@ -2644,9 +2666,72 @@ func (w *Worker) stopAccepting(ctx context.Context) {
 	}
 	lfd := w.listenFD
 	w.listenFD = -1 // before the cancel's completions: handleAccept re-arms on a listenFD >= 0
+	w.closingFD = int32(lfd) + 1
 	w.cancelAccept(ctx, lfd)
 	_ = unix.Close(lfd)
+	w.closingFD = 0
 	w.lingerUntil = 0
+}
+
+// leaveGroupAfterExit takes the listener of a worker whose goroutine ended
+// without returning (a handler's runtime.Goexit, celeris#848) out of the
+// SO_REUSEPORT group. reportWorkerExit calls it on that goroutine, once, while
+// it unwinds; the worker never reaches shutdown.
+//
+// It shuts the listener down for reading, closes the ring, then closes the
+// listener, and handles no completion. The pause's close and stopAccepting
+// cancel the accept and wait for its CQE through processCQE, and the CQ head run
+// reads from is a local that the Goexit left unpublished: the wait would meet
+// again the CQEs of the batch the handler ended (the handler's own among them)
+// and run their handlers a second time. Closing the ring ends the multishot
+// accept, and with it the reference to the listener file that the armed accept
+// holds, but the kernel finishes the ring's teardown on a work queue: left to
+// the close alone, the socket would stay hashed in the SO_REUSEPORT group for
+// some milliseconds after this returns, and take connections that nothing
+// accepts (measured: 50 to 87 of them in a tight dial loop, the first read EOF).
+// shutdown(SHUT_RD) on a listening TCP socket stops it listening and unhashes
+// it from the group on the spot (tcp_disconnect, inet_csk_listen_stop), whatever
+// file references remain, so PauseAccept, which counts this worker done when
+// this returns, may promise that the group has shed it. It runs once, here.
+//
+// What it leaves, as before: the connections' descriptors (with fixed files
+// on, the ring's file table held them, and the ring close ends them: their
+// peers see EOF), the wake eventfd and the provided-buffer ring's memory. The
+// buffer ring is an anonymous mapping the kernel only reads and writes by
+// address, so it does not hold the ring open. It is not closed: a handler
+// goroutine detached from this worker may still read request bytes that view
+// it, which shutdown waits for (asyncWG) and this path cannot. The send buffers
+// a SEND_ZC may still read are kept for the life of the process, as shutdown
+// does, without its CQ reads (retainZCSendBufsAfterExit). Worker thread only.
+//
+// It returns the number of send buffers it kept; it does not log them, because a
+// Logger that blocks must not hold up a PauseAccept: reportWorkerExit logs
+// after the flags and the notify (logKeptZCSendBufs).
+func (w *Worker) leaveGroupAfterExit() (keptZC int) {
+	keptZC = w.retainZCSendBufsAfterExit()
+	if w.listenFD >= 0 {
+		_ = unix.Shutdown(w.listenFD, unix.SHUT_RD)
+	}
+	if w.closingFD > 0 {
+		_ = unix.Shutdown(int(w.closingFD)-1, unix.SHUT_RD)
+	}
+	if w.ring != nil {
+		_ = w.ring.Close()
+		w.ring = nil
+	}
+	if w.listenFD >= 0 {
+		_ = unix.Close(w.listenFD)
+		w.listenFD = -1
+	}
+	if w.closingFD > 0 {
+		// The Goexit came from a handler the pause's close or stopAccepting
+		// ran, after they took the descriptor out of listenFD.
+		_ = unix.Close(int(w.closingFD) - 1)
+		w.closingFD = 0
+	}
+	w.lingerUntil = 0
+	w.listenFDClosed.Store(true)
+	return keptZC
 }
 
 // acceptQueuedOnPause accepts every connection still waiting in the listen
@@ -7289,6 +7374,7 @@ func (w *Worker) shutdown() {
 	w.sweepRetract()
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
+		w.listenFD = -1 // a Goexit in a later step must not close the number twice (leaveGroupAfterExit)
 	}
 	// The worker has left the SO_REUSEPORT group for good. PauseAccept waits
 	// for this flag, and a worker that exits in the middle of a pause linger
@@ -7317,6 +7403,11 @@ func (w *Worker) shutdown() {
 	// asyncClosed + Broadcast above. Prevents stale-memory races
 	// after the engine claims to have stopped.
 	w.asyncWG.Wait()
+	// After the join, so no dispatch goroutine reads the field as it is
+	// written: a step added after the close, in which a Goexit ends the
+	// goroutine, must not have leaveGroupAfterExit close the ring (munmap and
+	// close of a descriptor number that may be reused) a second time.
+	w.ring = nil
 }
 
 // flushBatches publishes the worker-local counters the run loop adds to per

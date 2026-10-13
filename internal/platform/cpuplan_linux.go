@@ -10,8 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 // littleCapacityPercent is the capacity, as a percentage of the largest
@@ -94,14 +92,16 @@ type planSource struct {
 	nodeCPUs [][]int               // per NUMA node CPU lists; nil for one node
 }
 
-// schedAllowedCPUs returns the members of the calling thread's CPU mask.
+// schedAllowedCPUs returns the members of the calling thread's CPU mask, read
+// into a buffer as long as the kernel's (getAffinity), so a host with more than
+// 1024 possible CPUs is read whole.
 func schedAllowedCPUs() ([]int, error) {
-	var set unix.CPUSet
-	if err := unix.SchedGetaffinity(0, &set); err != nil {
+	set, err := getAffinity()
+	if err != nil {
 		return nil, err
 	}
 	var out []int
-	for c := 0; c < len(set)*64; c++ {
+	for c := range setBits(set) {
 		if set.IsSet(c) {
 			out = append(out, c)
 		}
