@@ -120,7 +120,9 @@ func TestMetricsStandbyZeroWhenStandbyUnbuilt(t *testing.T) {
 	e, _ := newAdaptiveStartingOnEpoll(t)
 	e.primary.(*mockEngine).SetMetrics(engine.EngineMetrics{ActiveConnections: 42, CloseCount: 17})
 	e.mu.Lock()
+	e.slotsMu.Lock()
 	e.secondary = nil // the production lazy-standby state
+	e.slotsMu.Unlock()
 	e.mu.Unlock()
 
 	m := e.Metrics()

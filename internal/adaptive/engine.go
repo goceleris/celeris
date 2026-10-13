@@ -53,6 +53,17 @@ var (
 // (Epoll or IOUring) instead. For benchmarking, run the adaptive columns
 // multiple times: a rare switch transient can skew a single pass.
 type Engine struct {
+	// primary and secondary are written only by New and by performSwitch's
+	// two slot-publish blocks, which hold mu, switchMu and slotsMu together
+	// (in that order, slotsMu innermost). A reader holds either mu or
+	// slotsMu: Shutdown and performSwitch take mu, and Metrics takes slotsMu
+	// alone, because performSwitch holds mu across the incoming engine's
+	// listener wait (celeris#683) and runEvalLoop holds switchMu across
+	// evaluate, which writes log records through the configured Logger, and
+	// Metrics must sit behind neither (celeris#886). slotsMu is a leaf: only
+	// those two blocks and Metrics take it, and nothing is logged or called
+	// while it is held, so a Logger handler that calls Metrics (what
+	// Server.EngineInfo does) cannot deadlock on it.
 	primary   engine.Engine // epoll  (nil until built when it is the lazy standby)
 	secondary engine.Engine // io_uring (nil until built when it is the lazy standby)
 	active    atomic.Pointer[engine.Engine]
@@ -62,6 +73,7 @@ type Engine struct {
 	addr      atomic.Pointer[net.Addr]
 	mu        sync.Mutex
 	switchMu  sync.Mutex // protects evaluate + performSwitch coordination
+	slotsMu   sync.Mutex // leaf: guards the primary/secondary slots against Metrics; see the field comment on primary
 	frozen    atomic.Bool
 	logger    *slog.Logger
 
@@ -857,8 +869,12 @@ func (e *Engine) performSwitch() {
 			// Publish the built engine to both the Engine and controller
 			// slots under switchMu so a concurrent evaluate (ForceSwitch
 			// racing the eval loop) never reads a torn controller slot.
+			// The Engine slot is also published under slotsMu, the leaf
+			// lock Metrics reads it under.
 			e.switchMu.Lock()
+			e.slotsMu.Lock()
 			e.secondary = built
+			e.slotsMu.Unlock()
 			e.ctrl.secondary = built
 			e.ctrl.recordStandbyBuilt()
 			e.switchMu.Unlock()
@@ -873,7 +889,9 @@ func (e *Engine) performSwitch() {
 				return
 			}
 			e.switchMu.Lock()
+			e.slotsMu.Lock()
 			e.primary = built
+			e.slotsMu.Unlock()
 			e.ctrl.primary = built
 			e.ctrl.recordStandbyBuilt()
 			e.switchMu.Unlock()
@@ -963,7 +981,7 @@ func (e *Engine) performSwitch() {
 	// serving its SO_REUSEPORT share of new connections, so that a client
 	// that completed its handshake on it but had not sent its request yet
 	// is promoted and served instead of being reset by the close. Waiting
-	// would hold e.mu, and with it Metrics() and the next switch, for that
+	// would hold e.mu, and with it Shutdown and the next switch, for that
 	// long. Issued here, under e.mu, so any later switch's ResumeAccept of
 	// this engine is ordered after it; a resume during the linger restores
 	// the option on the same listeners. Inline (not in a goroutine) so unit
@@ -1119,11 +1137,28 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 
 // Metrics aggregates metrics from whichever sub-engines exist. On the lazy
 // New() path a never-built standby is nil and contributes nothing.
+//
+// It reads the two slots under slotsMu, a leaf lock, not under mu or
+// switchMu. performSwitch holds mu for the whole switch, including the wait
+// for the incoming engine's listener (celeris#683), and a Metrics() behind it
+// waited out that wait (about the late engine's delay, celeris#886 item 12).
+// runEvalLoop holds switchMu across a controller evaluation, which writes
+// records through the configured Logger ("engine switch recommended",
+// "oscillation lock expired", and the per-tick debug record under
+// CELERIS_ADAPTIVE_DEBUG), and performSwitch logs while it holds mu ("engine
+// switch completed", "refusing engine switch"; "oscillation detected" comes
+// from controller.recordSwitch, which it calls under mu and switchMu). A
+// Metrics() on mu or switchMu would deadlock a Logger handler that calls it
+// (Server.EngineInfo does) from one of those records, and on switchMu would
+// also wait behind every evaluation. slotsMu is held only by the two
+// slot-publish blocks in performSwitch and by this method, and nothing is
+// logged or called out under it, so a handler may call Metrics() from any
+// record.
 func (e *Engine) Metrics() engine.EngineMetrics {
-	e.mu.Lock()
+	e.slotsMu.Lock()
 	primary := e.primary
 	secondary := e.secondary
-	e.mu.Unlock()
+	e.slotsMu.Unlock()
 
 	var pm, sm engine.EngineMetrics
 	if primary != nil {
