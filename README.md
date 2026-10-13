@@ -61,7 +61,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 go get github.com/goceleris/celeris@latest
 ```
 
-Requires **Go 1.27.0+** (the `go` directive in `go.mod` is the source of truth). Linux for the io_uring / epoll / adaptive engines; any OS for the std engine. On Windows the server (std engine) and the database drivers build and run for development and testing; Linux is the supported production platform (see [Platform support](#platform-support)).
+Requires **Go 1.27.2+** (the `go` directive in `go.mod` is the source of truth). Linux for the io_uring / epoll / adaptive engines; any OS for the std engine. On Windows the server (std engine) and the database drivers build and run for development and testing; Linux is the supported production platform (see [Platform support](#platform-support)).
 
 ```go
 package main
@@ -460,7 +460,7 @@ validation/     Runtime invariant assertions + validation hooks (debug builds)
 
 ## Requirements
 
-- **Go 1.27.0+** (see the `go` directive in `go.mod`)
+- **Go 1.27.2+** (see the `go` directive in `go.mod`)
 - **Linux** for the io_uring / epoll / adaptive engines (kernel 5.19+ for io_uring; 5.10+ for epoll and adaptive, which runs on epoll below 5.19)
 - **Any OS** for the std engine
 - **Windows**: development and testing only, with the std engine and the portable driver fallback; see [Platform support](#platform-support)
