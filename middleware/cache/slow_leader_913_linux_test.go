@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,14 +71,89 @@ func TestCacheFollowersDoNotWaitForTheLeadersClient913(t *testing.T) {
 	}
 }
 
+// TestCacheUncacheableAndUncoalescedPathsDoNotWaitForTheLeadersClient913
+// covers the other paths #923 changed (celeris#890 item 47), on the same
+// harness. The first three rows leave the coalesced fill: the leader's
+// response is not cacheable (Cache-Control: no-store, a 206 Partial Content),
+// so the followers fall back to their own handler runs, and the leader's write
+// is outside the call on that path too. They must answer whole, as MISS (no
+// stored entry exists to HIT) and with the status the handler gave. The
+// fourth, DisableSingleflight, never coalesces: each request runs its own
+// handler and stores before it writes, so once the leader's handler has
+// returned its entry is stored although its client has not read a byte, and
+// the second wave is answered from the store (HIT) with no further run.
+func TestCacheUncacheableAndUncoalescedPathsDoNotWaitForTheLeadersClient913(t *testing.T) {
+	big := pattern913(1536 << 10)
+	val := pattern913(256 << 10)
+	for _, e := range engines913 {
+		for _, row := range rows913 {
+			for _, wt := range []time.Duration{0, time.Second} {
+				name := e.name + "/" + row.name + "/write-timeout-default"
+				if wt > 0 {
+					name = e.name + "/" + row.name + "/write-timeout-" + wt.String()
+				}
+				t.Run(name, func(t *testing.T) { slowLeaderRow913(t, e.eng, row, wt, big, val) })
+			}
+		}
+	}
+}
+
+// row913 is one route of the slow-leader harness: how its handler answers and
+// how the cache middleware is configured, and what each wave must see.
+type row913 struct {
+	name   string
+	cfg    cache.Config
+	answer func(c *celeris.Context, val []byte) error
+	status int // the status every request must get
+	// wave1Hit, wave2Hit are the x-cache values the followers must see ("" =
+	// either).
+	wave1Hit, wave2Hit string
+	// noWave1 leaves the first wave out: without coalescing each request
+	// stores its own response, so a first wave would fill the store itself and
+	// the second wave could not tell whether the leader stored before it wrote.
+	noWave1 bool
+}
+
+var rows913 = []row913{
+	{"cache-no-store", cache.Config{}, func(c *celeris.Context, val []byte) error {
+		c.SetHeader("cache-control", "no-store")
+		return c.Blob(200, "application/octet-stream", val)
+	}, 200, "MISS", "MISS", false},
+	{"cache-206", cache.Config{}, func(c *celeris.Context, val []byte) error {
+		c.SetHeader("content-range", fmt.Sprintf("bytes 0-%d/%d", len(val)-1, len(val)))
+		return c.Blob(206, "application/octet-stream", val)
+	}, 206, "MISS", "MISS", false},
+	{"cache-DisableSingleflight", cache.Config{DisableSingleflight: true}, func(c *celeris.Context, val []byte) error {
+		return c.Blob(200, "application/octet-stream", val)
+	}, 200, "", "HIT", true},
+}
+
+func slowLeaderRow913(t *testing.T, eng celeris.EngineType, row row913, writeTimeout time.Duration, big, val []byte) {
+	runLeader913(t, eng, "cache", &row, writeTimeout, big, val)
+}
+
 func slowLeader913(t *testing.T, eng celeris.EngineType, mw string, writeTimeout time.Duration, big, val []byte) {
+	runLeader913(t, eng, mw, nil, writeTimeout, big, val)
+}
+
+// runLeader913 is the harness. row is nil for the original rows (a cacheable
+// 200 with the default configuration).
+func runLeader913(t *testing.T, eng celeris.EngineType, mw string, row *row913, writeTimeout time.Duration, big, val []byte) {
 	var m celeris.HandlerFunc
 	hitHeader := "x-cache"
 	if mw == "cache" {
-		m = cache.New()
+		cfg := cache.Config{}
+		if row != nil {
+			cfg = row.cfg
+		}
+		m = cache.New(cfg)
 	} else {
 		m = singleflight.New()
 		hitHeader = "x-singleflight"
+	}
+	wantStatus := 200
+	if row != nil {
+		wantStatus = row.status
 	}
 	var runs atomic.Int32
 	entered := make(chan struct{})  // the first run of the key's handler started
@@ -90,7 +166,12 @@ func slowLeader913(t *testing.T, eng celeris.EngineType, mw string, writeTimeout
 				close(entered)
 			}
 			time.Sleep(50 * time.Millisecond) // a backend call
-			err := c.Blob(200, "application/octet-stream", val)
+			var err error
+			if row != nil {
+				err = row.answer(c, val)
+			} else {
+				err = c.Blob(200, "application/octet-stream", val)
+			}
 			if first {
 				close(returned)
 			}
@@ -119,7 +200,9 @@ func slowLeader913(t *testing.T, eng celeris.EngineType, mw string, writeTimeout
 	wave2 := make([]answer913, n)
 	others := make([]answer913, n)
 	var wg sync.WaitGroup
-	fetchAll913(&wg, wave1, url+"/popular", 3*time.Second, hitHeader)
+	if row == nil || !row.noWave1 {
+		fetchAll913(&wg, wave1, url+"/popular", 3*time.Second, hitHeader)
+	}
 	select {
 	case <-returned:
 	case <-time.After(5 * time.Second):
@@ -133,15 +216,15 @@ func slowLeader913(t *testing.T, eng celeris.EngineType, mw string, writeTimeout
 	fetchAll913(&wg, others, url+"/ping", 2*time.Second, "")
 	wg.Wait()
 
-	check := func(wave string, as []answer913, want []byte, hit string) {
+	check := func(wave string, as []answer913, want []byte, hit string, status int) {
 		t.Helper()
 		bad := 0
 		for i, a := range as {
 			switch {
 			case a.err != nil:
 				t.Errorf("%s %d: no response after %v: %v", wave, i, a.took, a.err)
-			case a.status != 200:
-				t.Errorf("%s %d: status %d after %v, want 200", wave, i, a.status, a.took)
+			case a.status != status:
+				t.Errorf("%s %d: status %d after %v, want %d", wave, i, a.status, a.took, status)
 			case !bytes.Equal(a.body, want):
 				t.Errorf("%s %d: %d-byte body, want the handler's %d bytes", wave, i, len(a.body), len(want))
 			case hit != "" && a.hit != hit:
@@ -153,14 +236,19 @@ func slowLeader913(t *testing.T, eng celeris.EngineType, mw string, writeTimeout
 		}
 		t.Logf("%s: %d of %d answered as wanted", wave, len(as)-bad, len(as))
 	}
-	cacheHit := ""
+	cacheHit1, cacheHit2 := "", ""
 	if mw == "cache" {
-		cacheHit = "HIT"
+		cacheHit1, cacheHit2 = "HIT", "HIT"
 	}
-	check("followers while the leader's handler runs", wave1, val, cacheHit)
-	check("followers after the leader's handler returned", wave2, val, cacheHit)
-	check("requests for another route", others, []byte("ok"), "")
-	if mw == "cache" {
+	if row != nil {
+		cacheHit1, cacheHit2 = row.wave1Hit, row.wave2Hit
+	}
+	if row == nil || !row.noWave1 {
+		check("followers while the leader's handler runs", wave1, val, cacheHit1, wantStatus)
+	}
+	check("followers after the leader's handler returned", wave2, val, cacheHit2, wantStatus)
+	check("requests for another route", others, []byte("ok"), "", 200)
+	if mw == "cache" && row == nil {
 		// The fill is stored before the leader's write, so a follower that
 		// comes after the call is a HIT, not a second run.
 		if r := runs.Load(); r != 1 {
@@ -185,8 +273,8 @@ func slowLeader913(t *testing.T, eng celeris.EngineType, mw string, writeTimeout
 	if code := slow.resets[leader]; code != 0 {
 		t.Fatalf("leader: stream reset (%v) after %d body bytes", code, len(got))
 	}
-	if st := slow.status[leader]; st != "200" {
-		t.Errorf("leader: status %s, want 200", st)
+	if st := slow.status[leader]; st != strconv.Itoa(wantStatus) {
+		t.Errorf("leader: status %s, want %d", st, wantStatus)
 	}
 	if !bytes.Equal(got, val) {
 		t.Errorf("leader: %d-byte body, want the handler's %d bytes", len(got), len(val))

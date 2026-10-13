@@ -99,3 +99,34 @@ func BenchmarkCacheMissNoSingleflight(b *testing.B) {
 		celeristest.ReleaseContext(c)
 	}
 }
+
+// BenchmarkCacheMissCacheControl is BenchmarkCacheMissSingleflight for a
+// response that carries a typical Cache-Control: the miss path reads the
+// header to decide whether, and for how long, to store (celeris#888 item 27).
+// Only public API, so the same benchmark runs against the merge-base.
+func BenchmarkCacheMissCacheControl(b *testing.B) {
+	store := NewMemoryStore()
+	defer store.Close()
+	var counter int
+	mw := New(Config{
+		Store: store,
+		TTL:   time.Hour,
+		KeyGenerator: func(_ *celeris.Context) string {
+			counter++
+			return "k" + strconv.Itoa(counter)
+		},
+	})
+	handler := func(c *celeris.Context) error {
+		c.SetHeader("cache-control", "public, max-age=3600, must-revalidate")
+		return c.Blob(200, "text/plain", []byte("hello"))
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(mw, handler)}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		c, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = c.Next()
+		celeristest.ReleaseContext(c)
+	}
+}
