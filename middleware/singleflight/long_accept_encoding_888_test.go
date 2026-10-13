@@ -1,6 +1,7 @@
 package singleflight
 
 import (
+	"math"
 	"runtime"
 	"strings"
 	"testing"
@@ -30,6 +31,35 @@ func bytesPer(n int, f func()) float64 {
 	runtime.ReadMemStats(&b)
 	return float64(b.TotalAlloc-a.TotalAlloc) / float64(n)
 }
+
+// allocsPer is the fewest allocations per call of f that any of up to
+// allocWindows single-call windows sees, and it stops at the first window that
+// is at most limit. testing.AllocsPerRun counts the whole process's mallocs, not
+// the calling goroutine's, and this process has a goroutine that allocates once
+// a second whatever the test does: internal/conn refreshes its cached Date
+// header every second, 14 mallocs per tick (seven buffers, each stored through
+// a pointer that is itself allocated). AllocsPerRun divides by the number of
+// runs and drops the remainder, so one tick inside the 16 MiB subtest's three
+// runs reads (3+14)/3 = 5.0 allocations against a bound of 2 (celeris#890:
+// the Coverage job failed three times so); the 64 KiB subtest's eight runs
+// read (8+14)/8 = 2 and pass by that rounding alone. A tick lands in at most
+// one single-call window, since a call takes far less than a second, so the
+// least of several windows is the cost of the call alone; a call that
+// allocates more than the bound allocates it in every window, and the least
+// is still over it.
+func allocsPer(limit float64, f func()) float64 {
+	best := math.MaxFloat64
+	for range allocWindows {
+		best = min(best, testing.AllocsPerRun(1, f))
+		if best <= limit {
+			break
+		}
+	}
+	return best
+}
+
+// allocWindows is how many single-call windows allocsPer tries at most.
+const allocWindows = 8
 
 // worstAE is the dearest value of a given size for the parser: one entry per
 // two bytes.
@@ -62,7 +92,7 @@ func TestLongAcceptEncodingCostsAboutItsLength888(t *testing.T) {
 			if got := bytesPer(n, func() { key = defaultKeyFunc(c) }); got > float64(size)+slack {
 				t.Errorf("defaultKeyFunc allocated %.0f bytes for a %d-byte Accept-Encoding, want at most one copy (%d) and a little", got, size, size)
 			}
-			if allocs := testing.AllocsPerRun(n, func() { _ = defaultKeyFunc(c) }); allocs > 2 {
+			if allocs := allocsPer(2, func() { _ = defaultKeyFunc(c) }); allocs > 2 {
 				t.Errorf("defaultKeyFunc made %.1f allocations for a %d-byte Accept-Encoding, want at most 2", allocs, size)
 			}
 			if !strings.Contains(key, v) {
@@ -73,7 +103,7 @@ func TestLongAcceptEncodingCostsAboutItsLength888(t *testing.T) {
 			if got := bytesPer(n, func() { e.vary = e.vary[:0]; e.captureVary(c) }); got > float64(size)+slack {
 				t.Errorf("captureVary allocated %.0f bytes for a %d-byte Accept-Encoding, want at most one copy (%d) and a little", got, size, size)
 			}
-			if allocs := testing.AllocsPerRun(n, func() { e.vary = e.vary[:0]; e.captureVary(c) }); allocs > 3 {
+			if allocs := allocsPer(3, func() { e.vary = e.vary[:0]; e.captureVary(c) }); allocs > 3 {
 				t.Errorf("captureVary made %.1f allocations for a %d-byte Accept-Encoding, want at most 3", allocs, size)
 			}
 
