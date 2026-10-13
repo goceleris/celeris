@@ -778,7 +778,9 @@ func (e *Engine) ResumeAccept() error {
 
 // wakeIfSuspended ends a DRAINING→SUSPENDED park: if the worker is parked,
 // close its wake channel, give it a fresh one and clear suspended. Safe from
-// any goroutine; a no-op on a worker that is running.
+// any goroutine; a no-op on a worker that is running. A running worker that
+// holds a connection is reached by the wake eventfd instead, which
+// ResumeAccept signals after this call (celeris#886).
 //
 // The park waits on a Go channel, not on the ring, so an eventfd write does
 // not end it — only this does. ResumeAccept is one caller. The driver-action
