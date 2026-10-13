@@ -619,9 +619,10 @@ type Worker struct {
 	shutdownDrainStart int64
 	draining           bool
 
-	// refuseRecv is true once the send drain is past its first
-	// shutdownSendDrainNanos: handleRecv then reads nothing more from an
-	// HTTP/1 connection (celeris#806). The drain lasts as long as the
+	// refuseRecv is true once the send drain, or the wait for the HTTP/2
+	// pool handlers before it, is past its first shutdownSendDrainNanos:
+	// handleRecv then reads nothing more from an HTTP/1 connection
+	// (celeris#806, celeris#884). The drain lasts as long as the
 	// budget, and on keep-alive connections whose responses queue in the
 	// worker, new requests would keep the queues from ever emptying.
 	// Worker thread only; read in handleRecv.
@@ -740,6 +741,18 @@ type Worker struct {
 	// asking the kernel about a descriptor number that may now belong to
 	// something else. Written once before ready; read only after it.
 	listenAddr net.Addr
+
+	// ringWaitRetries counts the waits of the run loop that answered a
+	// retryable error (ringWaitContinues, celeris#884) and were retried. It
+	// is not a public metric: the errclass counters feed EngineMetrics.
+	// Declared last, cold, so that no field moves.
+	ringWaitRetries atomic.Uint64
+	// ringWaitWarned is set once the first retried wait was logged
+	// (ringWaitContinues). Worker thread only.
+	ringWaitWarned bool
+	// producersStopNext is when (UnixNano) the pool wait's gate may walk the
+	// detached conns again (stopProducersPaced). Worker thread only.
+	producersStopNext int64
 }
 
 // recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
@@ -1350,6 +1363,26 @@ func (w *Worker) run(ctx context.Context) {
 			if !w.h2PoolSettled() {
 				w.stopAccepting(ctx)
 				w.shutdownDrainStart = 0
+				// The wait for the handlers can last the whole budget, so
+				// the send drain's gate applies to it too, from the same
+				// point: shutdownSendDrainNanos after it began, so a request
+				// in flight when the shutdown began is still answered. Past
+				// it no more request is read from an HTTP/1 conn, and a
+				// detached stream's producer is ended (stopProducersPaced:
+				// a TryLock that finds a handler running is tried again
+				// within h2PoolDrainPoll; this wait is a serving phase, so
+				// the walk over every conn is not paid on every pass); the
+				// HTTP/2 conns this wait is for are served on
+				// (celeris#884). h2PoolSettled has set h2DrainStart. A
+				// request whose bytes have not all arrived by then is not
+				// answered: the bytes after the gate are dropped (a slow
+				// upload, headers in pieces). The producers' OnError and
+				// OnDetachClose run on this thread, as in the send drain,
+				// so a slow callback delays the HTTP/2 conns served here.
+				if now := time.Now().UnixNano(); now > w.h2DrainStart+shutdownSendDrainNanos {
+					w.refuseRecv = true
+					w.stopProducersPaced(now)
+				}
 			} else {
 				now := time.Now().UnixNano()
 				if w.shutdownDrainStart == 0 {
@@ -1448,7 +1481,8 @@ func (w *Worker) run(ctx context.Context) {
 			cqHead, cqTail = w.ring.BeginCQ()
 			if cqHead == cqTail {
 				// No CQEs — wait with adaptive timeout.
-				if err := w.ring.WaitCQETimeout(w.adaptiveTimeout()); err != nil {
+				err := w.ring.WaitCQETimeout(w.adaptiveTimeout())
+				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSQPoll, err) {
 					w.shutdown()
 					return
 				}
@@ -1474,7 +1508,8 @@ func (w *Worker) run(ctx context.Context) {
 				// Mode 1: CQEs ready + SQEs pending. SubmitAndWait combines
 				// submission + CQE retrieval into one syscall (saves ~300ns vs
 				// separate Submit + next-iteration wait).
-				if err := w.ring.SubmitAndWait(); err != nil {
+				err := w.ring.SubmitAndWait()
+				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSubmitReady, err) {
 					w.shutdown()
 					return
 				}
@@ -1487,7 +1522,8 @@ func (w *Worker) run(ctx context.Context) {
 				// peer that does not read has no completion to wait for, and
 				// the drain's end is checked only between waits. The timed
 				// wait below, capped by adaptiveTimeout, bounds it.
-				if err := w.ring.SubmitAndWait(); err != nil {
+				err := w.ring.SubmitAndWait()
+				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSubmitSends, err) {
 					w.shutdown()
 					return
 				}
@@ -1495,7 +1531,8 @@ func (w *Worker) run(ctx context.Context) {
 			} else if hasPending || cqHead == cqTail {
 				// Mode 3b: no guaranteed CQEs — wait with adaptive timeout for
 				// shutdown checks and CQE_SKIP_SUCCESS operations.
-				if err := w.ring.SubmitAndWaitTimeout(w.adaptiveTimeout()); err != nil {
+				err := w.ring.SubmitAndWaitTimeout(w.adaptiveTimeout())
+				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeTimed, err) {
 					w.shutdown()
 					return
 				}
@@ -2815,19 +2852,16 @@ func (w *Worker) acceptRetry(err error) bool {
 var errHijackNoSQE = errors.New("celeris: cannot hijack: the io_uring submission queue is full, the connection's receive cannot be cancelled")
 
 func (w *Worker) hijackConn(fd int) (net.Conn, error) {
-	cs := w.conns[fd]
-	if cs == nil {
-		return nil, errors.New("celeris: connection not found")
-	}
-	if cs.fixedFile {
-		return nil, errors.New("celeris: cannot hijack fixed file connection")
-	}
-	// Refuse on the async dispatch path (celeris#539). Everything below is
-	// worker-owned: w.conns, w.connCount, w.liveConns, the dirty list, and an
-	// ASYNC_CANCEL SQE, which the engine treats as single-issuer. In async
-	// mode the handler — and therefore this call, through h1State.HijackFn —
-	// runs on the per-connection dispatch goroutine, so doing any of it here
-	// races the worker's own loop and submits an SQE off the issuing thread.
+	// Refuse on the async dispatch path (celeris#539), before anything is
+	// read: the conn table is the worker goroutine's (connsMu orders its
+	// writes against RegisterConn's read, connSlotBusy, and no other), and in
+	// async mode this call is not on that goroutine (celeris#884). Everything
+	// below is worker-owned: w.conns, w.connCount, w.liveConns, the dirty
+	// list, and an ASYNC_CANCEL SQE, which the engine treats as
+	// single-issuer. In async mode the handler — and therefore this call,
+	// through h1State.HijackFn — runs on the per-connection dispatch
+	// goroutine, so doing any of it here races the worker's own loop and
+	// submits an SQE off the issuing thread.
 	//
 	// Every other goroutine-to-worker hand-off goes through detachQueue for
 	// exactly this reason. Hijack cannot use it as-is because Hijack() is
@@ -2840,6 +2874,13 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 		return nil, errors.New("celeris: Hijack is not supported on the io_uring engine with " +
 			"AsyncHandlers enabled (celeris#539); use the engine-integrated WebSocket/SSE path, " +
 			"or run with AsyncHandlers disabled")
+	}
+	cs := w.conns[fd]
+	if cs == nil {
+		return nil, errors.New("celeris: connection not found")
+	}
+	if cs.fixedFile {
+		return nil, errors.New("celeris: cannot hijack fixed file connection")
 	}
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
@@ -3546,13 +3587,16 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// on this recv CQE, regardless of which buffer they landed in.
 	w.bytesReadBatch += uint64(c.Res)
 
-	// Past the first 250 ms of the shutdown's send drain an HTTP/1 conn is
-	// read no more (celeris#806): the drain finishes the responses it has,
-	// and a request taken now could only be answered into a queue that the
+	// Past the first 250 ms of the shutdown's send drain, or of the wait for
+	// the HTTP/2 handlers before it (celeris#884), an HTTP/1 conn is read no
+	// more (celeris#806): the drain finishes the responses it has, and a
+	// request taken now could only be answered into a queue that the
 	// drain, which lasts as long as the budget, would never find empty
-	// under steady keep-alive traffic. Epoll's loops have stopped reading
-	// at the cancel. The bytes are dropped with the connection, which
-	// shutdown closes; the recv is not re-armed. A detached conn is read no
+	// under steady keep-alive traffic. Epoll's shutdown phases stop reading
+	// (its pool wait does not: celeris#885). The bytes are dropped with the
+	// connection, which shutdown closes; the recv is not re-armed, so a
+	// request whose bytes were still arriving at the gate (the body of an
+	// upload, headers in pieces) is never answered. A detached conn is read no
 	// more either (its writes were ended with the gate: stopDetachedProducers).
 	// HTTP/2 conns are served on: they have had GOAWAY since the pool wait,
 	// and what their responses may still wait for was waited for there or
@@ -5996,7 +6040,7 @@ func (w *Worker) prepareAccept() {
 	} else if w.tier.SupportsMultishotAccept() {
 		prepMultishotAccept(sqe, w.listenFD)
 	} else {
-		prepAccept(sqe, w.listenFD, 0)
+		prepSingleShotAccept(sqe, w.listenFD)
 	}
 	setSQEUserData(sqe, encodeUserData(udAccept, w.listenFD))
 }
@@ -7281,6 +7325,64 @@ func (w *Worker) stopDetachedProducers() {
 		}
 		cs.detachMu.Unlock()
 	}
+}
+
+// ringWaitContinues reports whether the loop may go on after the ring wait
+// of mode ended with err (nil when the wait succeeded); false means shut the
+// worker down. It is the one place the loop's four waits answer an error
+// (celeris#884 item 49).
+//
+// A retryable error (ringWaitRetryable: EBUSY, which 5.19 to 6.1 kernels
+// answer a wait when completions overflowed behind a full CQ ring cannot be
+// flushed, or EAGAIN) says the CQ ring has no room, not that the ring failed:
+// the SQEs the enter did not take stay pending (retryPending), and the loop's
+// own pass over the CQ ring after this returns is the reap that makes room.
+// The error is counted and, the first time on a worker, logged as a Warn;
+// there is no ceiling on the retries (a ring that fails for good with EBUSY
+// or EAGAIN is retried until the context is cancelled: the checklist of
+// celeris#884 records it). With nothing in the ring to reap the worker gives
+// the kernel a moment (cancelAccept's drain does the same) rather than enter
+// again at once. Any other error is the ring failing: the worker stops, and
+// closes what it owns.
+func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
+	if h := ringWaitSeam; h != nil {
+		err = h(w, mode, err)
+	}
+	if err == nil {
+		return true
+	}
+	if !ringWaitRetryable(err) {
+		return false
+	}
+	w.ringWaitRetries.Add(1)
+	if !w.ringWaitWarned {
+		// Once per worker: there is no ceiling on the retries and the counter
+		// is not a public metric, so this line is how an operator on a 5.19
+		// to 6.1 kernel sees a loop that keeps retrying.
+		w.ringWaitWarned = true
+		if w.logger != nil {
+			w.logger.Warn("io_uring: a ring wait answered a retryable error (the CQ ring has no room); the worker reaps and retries, and does not log this again",
+				"worker", w.id, "wait", mode.String(), "err", err)
+		}
+	}
+	if h, t := w.ring.BeginCQ(); h == t {
+		time.Sleep(50 * time.Microsecond)
+	}
+	return true
+}
+
+// stopProducersPaced is stopDetachedProducers at most once per
+// h2PoolDrainPoll, for the pool wait's gate (celeris#884): a producer whose
+// lock was busy is tried again within a poll, and no loop pass pays the walk
+// over every live conn twice in one. It reports whether it walked. now is the
+// pass's UnixNano. Worker thread.
+func (w *Worker) stopProducersPaced(now int64) bool {
+	if now < w.producersStopNext {
+		return false
+	}
+	w.producersStopNext = now + int64(h2PoolDrainPoll)
+	w.stopDetachedProducers()
+	return true
 }
 
 func (w *Worker) shutdown() {

@@ -71,7 +71,7 @@ func (t *baseTier) PrepareAccept(ring *Ring, listenFD int) {
 	if sqe == nil {
 		return
 	}
-	prepAccept(sqe, listenFD, 0)
+	prepSingleShotAccept(sqe, listenFD)
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
 
@@ -132,7 +132,7 @@ func (t *highTier) PrepareAccept(ring *Ring, listenFD int) {
 	case t.multishotAccept:
 		prepMultishotAccept(sqe, listenFD)
 	default:
-		prepAccept(sqe, listenFD, 0)
+		prepSingleShotAccept(sqe, listenFD)
 	}
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
@@ -213,7 +213,7 @@ func (t *optionalTier) PrepareAccept(ring *Ring, listenFD int) {
 	case t.multishotAccept:
 		prepMultishotAccept(sqe, listenFD)
 	default:
-		prepAccept(sqe, listenFD, 0)
+		prepSingleShotAccept(sqe, listenFD)
 	}
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
