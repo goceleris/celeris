@@ -15,7 +15,7 @@ import (
 
 // holdPort decides the concrete host:port that both sub-engines will serve on
 // and returns it together with a socket that keeps that port bound until the
-// start engine has bound its own sockets on it (celeris#616).
+// Listen returns (celeris#616, celeris#886 item 19).
 //
 // Both sub-engines must serve one concrete address (see New), and every one
 // of their workers binds it independently in Listen, which runs later than
@@ -23,9 +23,13 @@ import (
 // port used to be decided by binding it, reading its number and closing it
 // again, so it belonged to nobody from New until the start engine bound it,
 // and any socket that bound it in between made Listen fail with EADDRINUSE.
-// The socket returned here closes that window. Engine.Listen closes it once
-// the start engine has published its address, and Engine.Shutdown closes it
-// for an engine that is never started.
+// The socket returned here closes that window. It also keeps the port bound
+// while no sub-engine listens on it: a switch under DisableDeferAccept closes
+// the outgoing engine's listen sockets at once, and the incoming engine's are
+// up a moment after its resume (a lost bind there ends in ErrorListenerRecreate
+// and a worker that does not serve again). The sub-engines' sockets bind beside
+// the hold, so Engine.Listen keeps the hold until it returns, and
+// Engine.Shutdown closes it for an engine that is never started.
 //
 // The socket is bound the way the sub-engines bind (epoll and io_uring
 // createListenSocket), with two differences, and both are what make it safe:
@@ -34,7 +38,7 @@ import (
 //     listeners, the one an incoming SYN is matched against, and only a
 //     listening SO_REUSEPORT socket is in the port's reuseport group. So the
 //     socket cannot take a connection, a dial in the window is refused as it
-//     was before, and once the start engine's sockets are listening none of
+//     was before, and while the sub-engines' sockets are listening none of
 //     the connections they are given can land on this one.
 //   - It sets SO_REUSEPORT and, when it can, not SO_REUSEADDR. The
 //     sub-engines' sockets set SO_REUSEPORT and are owned by the same user,

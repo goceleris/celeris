@@ -78,9 +78,15 @@ type Config struct {
 	// epoll and io_uring engines keep the port bound, to a socket that never
 	// listens, while accepting is paused and until they stop, so it stays the
 	// same across a pause and resume of accepting. Adaptive (the default on
-	// Linux) holds the port only while it starts, not while accepting is
-	// paused: another process can take it in between, and the resume then
-	// fails to listen (see [Server.ResumeAccept]; goceleris/celeris#886).
+	// Linux) has no [Server.PauseAccept], and it holds the port of any address
+	// the same way: from [Server.Start] until its Listen returns, which includes
+	// the moments of an engine switch in which no sub-engine listens (with
+	// [Config.DisableDeferAccept] the outgoing engine's listen sockets close at
+	// once). It takes no hold for a listener handed to
+	// [Server.StartWithListener]. While sockets that an earlier listener left
+	// on the port have no SO_REUSEPORT (a net/http server's TIME_WAIT ends,
+	// say), the hold it can take is the weaker one: it keeps out the sockets
+	// that do not set SO_REUSEADDR, not those that do (net.Listen's do).
 	Addr string
 	// Protocol is the HTTP protocol version (default Auto — auto-detect H1/H2).
 	Protocol Protocol

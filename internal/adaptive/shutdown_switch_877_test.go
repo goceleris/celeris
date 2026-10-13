@@ -269,3 +269,17 @@ func TestShutdownHonoursCtxWhileSwitchBuildsStandby886(t *testing.T) {
 		t.Errorf("a switch after the late shutdown built a standby (builds %d -> %d)", before, got)
 	}
 }
+
+// TestSwitchAfterListenCtxCancelledBuildsNothing886: a Shutdown that gave up on
+// its ctx has cancelled Listen's context but not set shuttingDown (it never had
+// mu). A switch that runs in that gap, as one queued behind the build Shutdown
+// gave up on can, must not build a standby: it would be born cancelled and sit
+// in a slot until the late shutdown found it.
+func TestSwitchAfterListenCtxCancelledBuildsNothing886(t *testing.T) {
+	e, _, _, builds := newShutdownWindowEngine(t, nil)
+	e.listenCancel()
+	e.ForceSwitch()
+	if got := builds.Load(); got != 0 {
+		t.Errorf("a switch after Listen's context was cancelled built %d standby(s), want 0", got)
+	}
+}
