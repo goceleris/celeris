@@ -13,10 +13,12 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/goceleris/celeris"
 )
@@ -43,6 +45,10 @@ import (
 // Refusals are asserted exactly per path and engine: HTTP/1 and the Upgrade
 // answer 413; HTTP/2 on the native engines resets the stream (RST_STREAM
 // CANCEL), HTTP/2 on std goes through net/http, which answers 413.
+//
+// TestUpgradedConnectionLaterStreamBodyLimit889 adds the streams of a
+// connection that was upgraded from HTTP/1.1: epoll and io_uring build that
+// connection's HTTP/2 state in a second place.
 
 const bodyMiB889 = 1 << 20
 
@@ -331,6 +337,194 @@ func TestDefaultMaxRequestBodySize4MiB889(t *testing.T) {
 								}
 							}
 						})
+					}
+				}
+			})
+		}
+	}
+}
+
+// h2Upgraded889 is a client of an h2c connection that was upgraded from
+// HTTP/1.1 (a GET /ping with Upgrade: h2c, answered on stream 1). It opens
+// stream 3 as a POST with n body bytes under the connection's flow control and
+// reports how the server ended it: "status 200 n=..." or "rst CANCEL".
+func h2Upgraded889(t *testing.T, addr string, n int64) string {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	_ = c.SetDeadline(time.Now().Add(60 * time.Second))
+	if _, err := io.WriteString(c, "GET /ping HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n"+
+		"HTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(c)
+	if line, err := br.ReadString('\n'); err != nil || !strings.HasPrefix(line, "HTTP/1.1 101") {
+		t.Fatalf("upgrade answered %q, %v", line, err)
+	}
+	for {
+		l, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading the 101 head: %v", err)
+		}
+		if l == "\r\n" {
+			break
+		}
+	}
+	fr := http2.NewFramer(c, br)
+	fr.SetMaxReadFrameSize(1 << 20)
+	var (
+		wmu     sync.Mutex
+		mu      sync.Mutex
+		cond    = sync.NewCond(&mu)
+		connWin = int64(65535)
+		strWin  = int64(65535)
+		maxFr   = 16384
+		outcome string
+		body    bytes.Buffer
+		status  string
+	)
+	write := func(f func() error) {
+		wmu.Lock()
+		defer wmu.Unlock()
+		if err := f(); err != nil {
+			t.Logf("write: %v", err)
+		}
+	}
+	write(func() error { _, err := io.WriteString(c, http2.ClientPreface); return err })
+	write(func() error { return fr.WriteSettings() })
+	go func() {
+		dec := hpack.NewDecoder(4096, func(f hpack.HeaderField) {
+			if f.Name == ":status" {
+				status = f.Value
+			}
+		})
+		for {
+			f, err := fr.ReadFrame()
+			mu.Lock()
+			if err != nil {
+				if outcome == "" {
+					outcome = "read error: " + err.Error()
+				}
+				cond.Broadcast()
+				mu.Unlock()
+				return
+			}
+			switch f := f.(type) {
+			case *http2.SettingsFrame:
+				if !f.IsAck() {
+					_ = f.ForeachSetting(func(s http2.Setting) error {
+						switch s.ID {
+						case http2.SettingInitialWindowSize:
+							strWin += int64(s.Val) - 65535
+						case http2.SettingMaxFrameSize:
+							maxFr = int(s.Val)
+						}
+						return nil
+					})
+					mu.Unlock()
+					write(fr.WriteSettingsAck)
+					mu.Lock()
+				}
+			case *http2.WindowUpdateFrame:
+				if f.StreamID == 0 {
+					connWin += int64(f.Increment)
+				} else if f.StreamID == 3 {
+					strWin += int64(f.Increment)
+				}
+			case *http2.HeadersFrame:
+				if f.StreamID == 3 {
+					_, _ = dec.Write(f.HeaderBlockFragment())
+					if f.StreamEnded() {
+						outcome = "status " + status
+					}
+				}
+			case *http2.DataFrame:
+				if f.StreamID == 3 {
+					body.Write(f.Data())
+					if f.StreamEnded() {
+						outcome = "status " + status + " " + body.String()
+					}
+				}
+			case *http2.RSTStreamFrame:
+				if f.StreamID == 3 {
+					outcome = "rst " + f.ErrCode.String()
+				}
+			case *http2.GoAwayFrame:
+				if outcome == "" {
+					outcome = "goaway " + f.ErrCode.String()
+				}
+			}
+			cond.Broadcast()
+			mu.Unlock()
+		}
+	}()
+	var hb bytes.Buffer
+	enc := hpack.NewEncoder(&hb)
+	for _, f := range [][2]string{{":method", "POST"}, {":scheme", "http"}, {":authority", addr}, {":path", "/up"}} {
+		_ = enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
+	}
+	write(func() error {
+		return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: hb.Bytes(), EndHeaders: true})
+	})
+	chunk := bytes.Repeat([]byte{'z'}, 1<<20)
+	for left := n; left > 0; {
+		mu.Lock()
+		for outcome == "" && (connWin <= 0 || strWin <= 0) {
+			cond.Wait()
+		}
+		if outcome != "" {
+			mu.Unlock()
+			break
+		}
+		k := int64(maxFr)
+		if k > left {
+			k = left
+		}
+		if k > connWin {
+			k = connWin
+		}
+		if k > strWin {
+			k = strWin
+		}
+		connWin -= k
+		strWin -= k
+		mu.Unlock()
+		last := k == left
+		write(func() error { return fr.WriteData(3, last, chunk[:k]) })
+		left -= k
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for outcome == "" {
+		cond.Wait()
+	}
+	return outcome
+}
+
+// TestUpgradedConnectionLaterStreamBodyLimit889: the limit holds for the
+// streams of a connection that was upgraded from HTTP/1.1, not only for the
+// Upgrade request's own body (celeris RULE 61: epoll and io_uring build that
+// connection's HTTP/2 state in a second place).
+func TestUpgradedConnectionLaterStreamBodyLimit889(t *testing.T) {
+	for _, e := range engines761 {
+		for _, cfg := range bodyCfgs889 {
+			t.Run(e.name+"/"+cfg.name, func(t *testing.T) {
+				addr := bodyServer889(t, e.eng, cfg.limit)
+				for _, n := range []int64{4 * bodyMiB889, 4*bodyMiB889 + 1} {
+					got := h2Upgraded889(t, addr, n)
+					ok := cfg.max < 0 || n <= cfg.max
+					want := fmt.Sprintf("status 200 n=%d", n)
+					if !ok {
+						want = "rst CANCEL"
+						if e.name == "std" {
+							want = "status 413"
+						}
+					}
+					if !strings.HasPrefix(got, want) {
+						t.Fatalf("stream 3 of an upgraded connection, %d body bytes, limit %s: got %q, want %q", n, cfg.name, got, want)
 					}
 				}
 			})
