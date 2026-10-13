@@ -294,6 +294,15 @@ func (s *SentinelClient) connectSentinel() (*sentinelConn, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.DialTimeout)
 		ps, err := c.Subscribe(ctx, "+switch-master")
 		cancel()
+		if err == nil && ps.connDown() {
+			// Subscribe returns the PubSub, not ErrPubSubConnDown, when the
+			// conn is found down on the first SUBSCRIBE: its reconnect would
+			// retry this one address for ever while watchFailover waits. A
+			// sentinel that hung up here is skipped, as a failed Subscribe is
+			// (celeris#887 item 12).
+			_ = ps.Close()
+			err = ErrPubSubConnDown
+		}
 		if err != nil {
 			_ = c.Close()
 			continue
@@ -621,6 +630,9 @@ func (s *SentinelClient) Publish(ctx context.Context, channel, message string) (
 	return c.Publish(ctx, channel, message)
 }
 
+// Subscribe is [Client.Subscribe] on the current master: it returns the
+// PubSub with a nil error when the conn is found down on the first SUBSCRIBE,
+// and the reconnect replays the channels.
 func (s *SentinelClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	c, err := s.getClient()
 	if err != nil {

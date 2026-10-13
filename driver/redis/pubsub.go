@@ -126,6 +126,17 @@ func (c *Client) PSubscribe(ctx context.Context, patterns ...string) (*PubSub, e
 	return ps, nil
 }
 
+// connDown reports whether ps holds no live conn right now: it has none (the
+// reconnect loop took it out and has not replaced it) or the one it holds has
+// been torn down. A reconnect that has already replaced the conn makes it
+// false.
+func (ps *PubSub) connDown() bool {
+	ps.mu.Lock()
+	conn := ps.conn
+	ps.mu.Unlock()
+	return conn == nil || conn.closed.Load()
+}
+
 // firstControl is the tail of a constructor that made one control call on the
 // PubSub it just built. [ErrPubSubConnDown] means the call was not sent but the
 // subscription set holds it and the reconnect replays it (every conn that goes
@@ -143,7 +154,10 @@ func (ps *PubSub) firstControl(err error) (*PubSub, error) {
 
 // testHookBeforeBind, when non-nil, runs in newPubSub after the pool handed
 // out the conn and before bindConn. It is nil in production; a test sets it to
-// stage a conn that closes in that window (celeris#887 item 14).
+// stage a conn that closes in that window (celeris#887 item 14). It is a plain
+// variable that newPubSub reads without synchronisation: a test that sets it
+// must not call t.Parallel, and must not run beside another test that builds a
+// PubSub; it resets the hook to nil when it is done.
 var testHookBeforeBind func(conn *redisConn)
 
 func (c *Client) newPubSub(ctx context.Context) (*PubSub, error) {
