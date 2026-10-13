@@ -1576,19 +1576,23 @@ func (c *Context) Detach() (done func()) {
 	}
 
 	c.extended = true
-	// detachDone is assigned before the Context is marked detached and before
-	// any engine hook runs: recoverAndRelease waits on it for every detached
-	// Context, and a nil channel blocks for ever. An OnDetach (or
-	// StreamDetached) that panics never returns the done func, so the guard
-	// below closes ch then, and the release path records the request without
-	// a snapshot and releases the Context (#889 item 33).
-	ch := make(chan struct{})
-	c.detachDone = ch
+	// c.detached is set before the engine hooks run (they may read it), and
+	// c.detachDone only once they have returned: recoverAndRelease waits on
+	// it for every detached Context. An OnDetach (or StreamDetached) that
+	// panics never returns the done func, so no goroutine will ever own the
+	// Context: the guard undoes the detach and the request ends as an ordinary
+	// one that panicked. recoverAndRelease answers it with a 500, records its
+	// real status and elapsed time, and releases the Context as for any
+	// request, with the CachedCtx check: on a native HTTP/1 connection that
+	// stays open the stream still caches this Context, and returning it to
+	// contextPool then would give it two owners (celeris#512). A handler
+	// that recovers the panic and calls Detach again runs the hooks again.
+	// (#889 item 33)
 	c.detached = true
 	returned := false
 	defer func() {
 		if !returned {
-			close(ch)
+			c.detached = false
 		}
 	}()
 	// The use this Context is detached from. Its goroutine can outlive the
@@ -1617,6 +1621,8 @@ func (c *Context) Detach() (done func()) {
 			dn.StreamDetached()
 		}
 	}
+	ch := make(chan struct{})
+	c.detachDone = ch
 	returned = true
 	return func() {
 		// Snapshot status + elapsed BEFORE close so the metrics goroutine
@@ -1629,11 +1635,13 @@ func (c *Context) Detach() (done func()) {
 		// the zero Time (StartTime materializes it lazily), and
 		// time.Since(c.startTime) was ~292 years on the native HTTP/1
 		// engines. One clock read either way.
+		// A Context that did not go through HandleStream has neither set; it
+		// records a meaningless value, which nothing in production reaches.
 		var elapsed time.Duration
-		if c.startTimeNs != 0 {
-			elapsed = time.Duration(time.Now().UnixNano() - c.startTimeNs)
+		if !c.startTime.IsZero() {
+			elapsed = time.Since(c.startTime) // monotonic, as before
 		} else {
-			elapsed = time.Since(c.startTime)
+			elapsed = time.Duration(time.Now().UnixNano() - c.startTimeNs)
 		}
 		c.detachSnap = &detachSnapshot{
 			status:  c.statusCode,
