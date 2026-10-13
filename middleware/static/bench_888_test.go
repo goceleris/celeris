@@ -1,6 +1,7 @@
 package static
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -93,7 +94,56 @@ func BenchmarkStaticServeFromRootModifiedSinceDeep(b *testing.B) {
 }
 
 // BenchmarkStaticServeFromRootConditionalMissDeep: the conditional request does
-// not hold, so no containment check is made.
+// not hold; the containment check is made all the same (it runs before the
+// validators are compared), and the file is then sent.
 func BenchmarkStaticServeFromRootConditionalMissDeep(b *testing.B) {
 	benchRootDeep888(b, "if-none-match", `"nomatch"`)
+}
+
+// escapeBench888 is <dir>/root/a/b/leak.txt, a symlink to <dir>/outside/secret.txt,
+// and the middleware serving <dir>/root. Skips where symlinks are not available.
+func escapeBench888(b *testing.B) celeris.HandlerFunc {
+	b.Helper()
+	dir := b.TempDir()
+	out := filepath.Join(dir, "outside", "secret.txt")
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(out, secretBytes888, 0o600); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.Chtimes(out, secretTime888, secretTime888); err != nil {
+		b.Fatal(err)
+	}
+	link := filepath.Join(dir, "root", "a", "b", "leak.txt")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.Symlink(out, link); err != nil {
+		b.Skipf("symlinks are not available here: %v", err)
+	}
+	return New(Config{Root: filepath.Join(dir, "root")})
+}
+
+// BenchmarkStaticEscapeConditionalMatch888 and ...NoMatch888 time the refusal
+// (400) of a conditional request for a symlink that leaves the Root, with an
+// If-None-Match that equals the target's tag and with one a second off. They
+// must take the same time (celeris#888 item 35: the response must not tell
+// whether the guess was right). On main the matching one is a 304 that
+// discloses the target, so the pair is only comparable on this PR.
+func BenchmarkStaticEscapeConditionalMatch888(b *testing.B) {
+	benchPath888(b, escapeBench888(b), "/a/b/leak.txt",
+		"if-none-match", weakETag(secretTime888, int64(len(secretBytes888))))
+}
+
+func BenchmarkStaticEscapeConditionalNoMatch888(b *testing.B) {
+	benchPath888(b, escapeBench888(b), "/a/b/leak.txt",
+		"if-none-match", weakETag(secretTime888.Add(time.Second), int64(len(secretBytes888))))
+}
+
+// BenchmarkStaticEscapeIfModifiedSince888 is the If-Modified-Since form (a
+// binary search on the target's mtime if the time depended on the guess).
+func BenchmarkStaticEscapeIfModifiedSince888(b *testing.B) {
+	benchPath888(b, escapeBench888(b), "/a/b/leak.txt",
+		"if-modified-since", secretTime888.Add(time.Hour).UTC().Format(http.TimeFormat))
 }
