@@ -183,6 +183,59 @@ func TestGoexitedWorkerLeavesTheGroupAndThePauseDoesNotWaitForIt848(t *testing.T
 		len(ids), multi, answeredAfter, firstPause, refusedAfter, resumedAnswered, secondPause, e.abnormalWorkerExits.Load())
 }
 
+// The window the lifecycle test above waits out in its step 1: the worker is
+// counted as exited, and a PauseAccept that comes at once must still find its
+// listener out of the SO_REUSEPORT group when it returns. The ring close alone
+// leaves the socket hashed until the kernel's teardown of the ring has run on a
+// work queue (milliseconds), and connections that arrive then are accepted by
+// nothing. So no dial in between: the fault, the pause, the first dial.
+func TestGoexitedWorkerIsOutOfTheGroupWhenAnImmediatePauseReturns848(t *testing.T) {
+	if !child848(t) {
+		return
+	}
+	e, _, cancel, done := start848(t, "127.0.0.1:0", true)
+	addr := e.Addr().String()
+	// One connection, no traffic before it: the pause is as quick as it gets
+	// (the fewer connections and workers' work, the narrower its margin over the
+	// kernel's teardown).
+	boom, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = boom.Close() }()
+	_, _ = boom.Write([]byte("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"))
+	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && e.abnormalWorkerExits.Load() == 0; time.Sleep(time.Millisecond) {
+	}
+	if got := e.abnormalWorkerExits.Load(); got != 1 {
+		t.Fatalf("PREMISE: abnormalWorkerExits = %d, want 1", got)
+	}
+	t0 := time.Now()
+	if err := e.PauseAccept(); err != nil {
+		t.Fatalf("PauseAccept: %v", err)
+	}
+	pause := time.Since(t0)
+	refused := time.Duration(-1)
+	if c, err := net.DialTimeout("tcp", addr, 2*time.Second); err == nil {
+		_ = c.Close()
+		t.Errorf("the first dial after PauseAccept returned was accepted, %v after the pause began: the dead worker's listener was still in the SO_REUSEPORT group", time.Since(t0))
+	} else if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("a dial after the pause failed with %v, want connection refused", err)
+	} else {
+		refused = time.Since(t0)
+		// A tight loop for 40 ms: a socket still being torn down would take some.
+		dials := 0
+		for end := time.Now().Add(40 * time.Millisecond); time.Now().Before(end); dials++ {
+			if c, err := net.DialTimeout("tcp", addr, 2*time.Second); err == nil {
+				_ = c.Close()
+				t.Errorf("dial %d after the first refusal was accepted", dials)
+				break
+			}
+		}
+	}
+	stop848(t, cancel, done)
+	t.Logf("celeris848 RESULT iouring-immediate-pause pause=%v refused_after=%v counted=%d", pause, refused, e.abnormalWorkerExits.Load())
+}
+
 // A Goexit raised while the pause is closing the listener (a handler or a
 // callback that cancelAccept or acceptQueuedOnPause ran) comes after the close
 // took the descriptor out of Worker.listenFD, so the report path must find it
