@@ -225,9 +225,12 @@ func TestPromotionKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing
 
 	forceSwitchTo(t, e, engine.IOUring) // builds the standby
 	forceSwitchTo(t, e, engine.Epoll)
-	// io_uring's pause closes its listeners at once, and a worker that has
-	// not yet parked sees a resume only after its current ring wait (up to a
-	// second): let them park, so the next promotion is a plain late resume.
+	// io_uring's pause closes its listeners at once. Before celeris#886 a
+	// worker that had not yet parked saw a resume only after its current ring
+	// wait (up to a second), and this sleep let them park so that the next
+	// promotion was a plain late resume. ResumeAccept now signals the wake
+	// eventfd, so a worker that has not parked no longer lags; the sleep stays
+	// so the test starts from the state the revert test starts from.
 	time.Sleep(2500 * time.Millisecond)
 	onlyEpoll, err := listenInodes(port)
 	if err != nil {
