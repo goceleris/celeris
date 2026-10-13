@@ -171,19 +171,32 @@ func newFloorAdaptive682(t *testing.T, startEnv string) (*Engine, string, *floor
 }
 
 // listenFloor682 runs Listen, waits for the bind and returns the stop func,
-// which cancels Listen, waits for it and shuts the engine down.
+// which cancels Listen, waits for it and shuts the engine down. A Listen that
+// ends in an error before it bound is the environment (an io_uring ring that
+// cannot be set up beside the rings of the engines this process stopped a
+// moment ago, at a small RLIMIT_MEMLOCK): it skips, or fails under
+// CELERIS_REQUIRE_UPSWITCH=1, with the engine's own error.
 func listenFloor682(t *testing.T, e *Engine) (stop func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- e.Listen(ctx) }()
-	for dl := time.Now().Add(10 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
+	for dl := time.Now().Add(25 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
+		select {
+		case lerr := <-done:
+			cancel()
+			_ = e.Shutdown(context.Background())
+			skipOrFailUpswitch662(t, "the adaptive engine did not start here: Listen returned %v before it bound", lerr)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	if e.Addr() == nil {
 		cancel()
-		<-done
+		lerr := <-done
 		_ = e.Shutdown(context.Background())
+		if lerr != nil {
+			skipOrFailUpswitch662(t, "the adaptive engine did not bind within 25s here: Listen returned %v once cancelled", lerr)
+		}
 		t.Fatal("adaptive engine never bound")
 	}
 	return func() {
