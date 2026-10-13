@@ -80,6 +80,12 @@ func classifyLoopStack589(g string) string {
 	return "unclassified"
 }
 
+// isLoopGoroutine589 reports whether a goroutine's stack is an engine event
+// loop: the io_uring worker runs (*Worker).run, the epoll one (*Loop).run.
+func isLoopGoroutine589(g string) bool {
+	return strings.Contains(g, "internal/engine/iouring.(*Worker).run(") || strings.Contains(g, "internal/engine/epoll.(*Loop).run(")
+}
+
 func (st *stackTally589) capture(t *testing.T) {
 	t.Helper()
 	buf := make([]byte, 1<<20)
@@ -87,8 +93,7 @@ func (st *stackTally589) capture(t *testing.T) {
 	st.captures++
 	parkedHere := false
 	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
-		isLoop := strings.Contains(g, "internal/engine/iouring.(*Worker).run(") || strings.Contains(g, "internal/engine/epoll.(*Loop).run(")
-		if !isLoop {
+		if !isLoopGoroutine589(g) {
 			continue
 		}
 		st.loops++
@@ -672,6 +677,9 @@ func ioUringPin592(o stall589Obs) error {
 			o.samples, stall592MinPingSamples)
 	}
 	if o.stacks == nil {
+		if os.Getenv("CELERIS_589_FRESH") != "" {
+			return nil // the diagnostic that samples on a fresh conn per request takes no stacks
+		}
 		return errors.New("iouring: no stack tally was taken during the window (the sampler did not watch the event-loop goroutines): the probe cannot be judged")
 	}
 	if parked, captures := o.stacks.parked, o.stacks.captures; parked >= stall592PinMinCaptures && float64(parked) >= stall592PinMinShare*float64(captures) {

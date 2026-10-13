@@ -24,8 +24,15 @@ func pinObs592(engine string, mode stall589Mode, samples, captures, parked int) 
 		queuedTimeFrac: 0.5,
 	}
 	if captures >= 0 {
-		o.stacks = &stackTally589{captures: captures, parked: parked}
+		o.stacks = &stackTally589{captures: captures, parked: parked, loops: 2 * captures} // two workers, as in every capture measured
 	}
+	return o
+}
+
+// noLoops592 is an observation whose stack captures found no event-loop
+// goroutine at all, as if isLoopGoroutine589 no longer matched the engine.
+func noLoops592(o stall589Obs) stall589Obs {
+	o.stacks.loops = 0
 	return o
 }
 
@@ -62,6 +69,7 @@ func TestSettledRetimedIOUringBar592(t *testing.T) {
 		{"io_uring, no post-promotion samples at all is not a pass", pinObs592("iouring", stall589Settled, 0, 0, 0), "samples"},
 		{"io_uring, too few samples to judge is not a pass", pinObs592("iouring", stall589Settled, 5, 0, 0), "samples"},
 		{"io_uring, no stack tally at all is not a pass", pinObs592("iouring", stall589Settled, 950, -1, 0), "stack"},
+		{"io_uring, stacks taken but none held an event-loop goroutine is not a pass", noLoops592(pinObs592("iouring", stall589Settled, 100, 5, 0)), "event-loop goroutine"},
 		{"epoll with the same stacks is judged on its ratio, not on this", pinObs592("epoll", stall589Settled, 150, 33, 30), ""},
 	}
 	for _, tc := range cases {
@@ -90,6 +98,7 @@ func TestCtlWorkerFreeIOUringBar592(t *testing.T) {
 		{"io_uring, the celeris#593 TryLock reverted, async control (33 captures, 31 parked)", pinObs592("iouring", stall589ExplicitAsync, 133, 33, 31), "celeris#593"},
 		{"io_uring, too few samples to judge is not a pass", pinObs592("iouring", stall589ExplicitAsync, 5, 0, 0), "samples"},
 		{"io_uring, no stack tally at all is not a pass", pinObs592("iouring", stall589ExplicitAsync, 950, -1, 0), "stack"},
+		{"io_uring, stacks taken but none held an event-loop goroutine is not a pass", noLoops592(pinObs592("iouring", stall589ExplicitAsync, 100, 5, 0)), "event-loop goroutine"},
 		{"epoll with the same stacks is judged on its ratio", pinObs592("epoll", stall589ExplicitAsync, 150, 33, 30), ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,6 +152,14 @@ github.com/goceleris/celeris/internal/engine/iouring.(*Engine).Listen.func2()
 	/src/internal/engine/iouring/engine.go:421 +0x4c
 created by github.com/goceleris/celeris/internal/engine/iouring.(*Engine).Listen in goroutine 9
 	/src/internal/engine/iouring/engine.go:419 +0x820`
+	for _, g := range []string{pinned, idle} {
+		if !isLoopGoroutine589(g) {
+			t.Fatalf("isLoopGoroutine589 does not recognise an io_uring worker goroutine:\n%s", g)
+		}
+	}
+	if isLoopGoroutine589("goroutine 7 [sleep]:\ntime.Sleep(0x1)\n\t/usr/local/go/src/runtime/time.go:368 +0x150\ngithub.com/goceleris/celeris.(*gatedKV).Set(0x1)") {
+		t.Fatal("isLoopGoroutine589 recognises a handler goroutine as an event loop")
+	}
 	for _, tc := range []struct {
 		name, stack, want string
 		parked            bool
