@@ -246,12 +246,16 @@ func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding,
 // The common path has no symlink, and one Lstat per path element below the
 // root settles that (the root's own path is not looked at: a symlinked root
 // is the operator's choice, and FileFromDir resolves it too). A symlink, or
-// an element that is neither a directory nor a regular file (a Windows
-// junction is irregular), or an Lstat error, falls to FileFromDir's own
-// resolution, which costs two EvalSymlinks. The answer can change before the
-// 304 is sent, as it can between FileFromDir's check and its open.
+// an irregular element (a Windows junction), or an Lstat error, falls to
+// FileFromDir's own resolution, which costs two EvalSymlinks. A path that is
+// lexically outside the root (Config.Index is joined to the requested
+// directory unchecked) is refused without a syscall. The answer can change
+// before the 304 is sent, as it can between FileFromDir's check and its open.
 func resolvesInside(cleanRoot, filePath string) bool {
 	full := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
+	if full != cleanRoot && cleanRoot != "." && !strings.HasPrefix(full, cleanRoot+string(filepath.Separator)) {
+		return false
+	}
 	start := len(cleanRoot)
 	if cleanRoot == "." {
 		start = 0 // Join drops a leading ".", so full has no root prefix

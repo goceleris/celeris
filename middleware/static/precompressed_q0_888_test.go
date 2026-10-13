@@ -86,7 +86,8 @@ func TestPreCompressedHonoursQ0And888(t *testing.T) {
 		{"*, br;q=0", "gzip", gz888},
 		{"br;q=0.0, gzip;q=0.5", "gzip", gz888},
 		{"gzip;q=0, br", "br", br888},
-		{"gzip, br", "br", br888}, // control: the client accepts both, br wins
+		{"gzip;q=1, br;q=0.1", "br", br888}, // the server's preference (br first) among acceptable codings, as documented on Config.Compress
+		{"gzip, br", "br", br888},           // control: the client accepts both, br wins
 		{"gzip", "gzip", gz888},
 		{"br", "br", br888},
 		{"*", "br", br888},

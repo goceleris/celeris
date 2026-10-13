@@ -22,7 +22,10 @@ type Config struct {
 
 	// FS is an [fs.FS] from which to serve files (e.g. embed.FS).
 	// Mutually exclusive with Root. If both Root and FS are set, FS takes
-	// precedence.
+	// precedence. The middleware does not check where an FS leads: an
+	// [os.DirFS] follows a symlink out of its directory, which Root does not
+	// (see its containment check); use Root for a directory that may hold
+	// untrusted symlinks.
 	FS fs.FS
 
 	// Prefix is the URL path prefix to strip before looking up the file.
