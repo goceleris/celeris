@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // celeris#884 item 37 / #885 item 16 (the io_uring half): handleRecv's direct-body block hands the
@@ -55,8 +57,16 @@ func postHead908(path string, n int) string {
 }
 
 // testTailUpgrade908 runs the scenario against the engine e: the client must
-// get the 200 of the second POST, then the 101, then working HTTP/2.
-func testTailUpgrade908(t *testing.T, e *Engine) {
+// get the 200 of the second POST, then the 101, then working HTTP/2. With
+// linked set (a single-shot recv, where flushSendLink chains a recv behind
+// the send that carries the 101), it also checks that the upgrade arm does
+// not arm a second recv beside the chained one: that is the job of the
+// `!cs.recvLinked` guard, and prepareRecv declines (and counts the decline in
+// RecvArmDeclined) a second arm while the first is outstanding, so it is the
+// guard that keeps the counter still. A conn that took the arm twice would
+// have split the H2 frames across two recvs (celeris#484, the flaky
+// TestH2CUpgradeSubsequentStreams).
+func testTailUpgrade908(t *testing.T, e *Engine, linked bool) {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", e.Addr().String(), 3*time.Second)
 	if err != nil {
@@ -91,6 +101,7 @@ func testTailUpgrade908(t *testing.T, e *Engine) {
 	small := strings.Repeat("y", 2000)
 	write(postHead908("/q", len(small)) + small[:1000])
 	waitServerRead908(t, e, base+sent)
+	m0 := e.Metrics()
 	write(small[1000:] + h2cUpgradeHead908())
 	if code, body, err := readBody543(c, br, 3*time.Second); err != nil || code != 200 || body != "/q" {
 		t.Fatalf("the small POST: %d %q %v", code, body, err)
@@ -107,6 +118,23 @@ func testTailUpgrade908(t *testing.T, e *Engine) {
 		}
 		if line == "\r\n" {
 			break
+		}
+	}
+	if linked {
+		// The client has the 101, so handleRecv has returned from the
+		// upgrade arm: its arm decision is made. The chained recv is counted
+		// in a per-iteration batch, so give it a moment.
+		var m engine.EngineMetrics
+		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(2 * time.Millisecond) {
+			if m = e.Metrics(); m.RecvLinkedArms > m0.RecvLinkedArms {
+				break
+			}
+		}
+		if m.RecvLinkedArms <= m0.RecvLinkedArms {
+			t.Fatalf("the 101 did not go out chained to a recv (RecvLinkedArms %d -> %d): the guard is not exercised", m0.RecvLinkedArms, m.RecvLinkedArms)
+		}
+		if m.RecvArmDeclined != m0.RecvArmDeclined {
+			t.Errorf("the upgrade arm asked for a second recv beside the chained one: RecvArmDeclined %d -> %d, want no change", m0.RecvArmDeclined, m.RecvArmDeclined)
 		}
 	}
 	// The 101 alone is not the upgrade: the conn must go on as HTTP/2 (the
@@ -127,7 +155,7 @@ func singleShot908(t *testing.T) {
 func TestIouringH2CUpgradeAfterDirectBodyTail908(t *testing.T) {
 	singleShot908(t)
 	e, _ := start908(t, false, true)
-	testTailUpgrade908(t, e)
+	testTailUpgrade908(t, e, true)
 }
 
 // TestIouringH2CUpgradeAfterDirectBodyTailAsync908 is the same client script
@@ -138,7 +166,7 @@ func TestIouringH2CUpgradeAfterDirectBodyTail908(t *testing.T) {
 func TestIouringH2CUpgradeAfterDirectBodyTailAsync908(t *testing.T) {
 	singleShot908(t)
 	e, _ := start908(t, true, true)
-	testTailUpgrade908(t, e)
+	testTailUpgrade908(t, e, true)
 }
 
 // TestIouringH2CUpgradeAfterDirectBodyTailMultishot908 is the script on an
@@ -148,7 +176,7 @@ func TestIouringH2CUpgradeAfterDirectBodyTailAsync908(t *testing.T) {
 func TestIouringH2CUpgradeAfterDirectBodyTailMultishot908(t *testing.T) {
 	t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", "1")
 	e, _ := start908(t, false, true)
-	testTailUpgrade908(t, e)
+	testTailUpgrade908(t, e, false)
 }
 
 // TestIouringH2CUpgradeAfterDirectBodyTailBehindUnreadResponse908: the
