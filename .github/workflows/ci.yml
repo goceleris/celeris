@@ -1433,9 +1433,10 @@ jobs:
       # dual-stack tests' skip on a host without IPv6 into a failure.
       # TestAdaptiveListenEarlyReturnReleasesHold616 (celeris#886 item 4) is the
       # one that stops Listen early: a Listen that returns before the
-      # start engine published its address, by a cancelled context or by a
-      # start engine that fails, must give the hold back with no Shutdown after
-      # it; three arms print an "early return" line with hold_after=false.
+      # start engine published its address, by a cancelled context, by a
+      # start engine that fails or by the bind deadline passing, must give the
+      # hold back with no Shutdown after it; four arms print an "early return"
+      # line with hold_after=false.
       - name: celeris#616 port held from New to Listen (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -1456,10 +1457,10 @@ jobs:
           tw=$(grep -cE 'celeris616 time-wait: start=(epoll|iouring) form=[^ ]+ time_wait=[1-9][0-9]* exclusive_refused=true net_listen=([^ ]+) handed=\2 thief=(EADDRINUSE|-) started=true v4=200 v6=(200|0)$' /tmp/c616.log || true)
           twheld=$(grep -cE 'celeris616 time-wait: start=(epoll|iouring) form=(wildcard|0\.0\.0\.0|\[::\]) .* thief=EADDRINUSE started=true v4=200 v6=200$' /tmp/c616.log || true)
           untilret=$(grep -cE 'celeris616 hold until Listen returns: start=(epoll|iouring) paused_refused=\[go-listener bare-socket\] workers=[1-9][0-9]* listening_after_resume=[1-9][0-9]* error_listener_recreate=0 freed_after_listen=\[go-listener bare-socket\] in=' /tmp/c616.log || true)
-          early=$(grep -cE 'celeris616 early return: (context cancelled/(epoll|iouring)|start engine fails/epoll) listen_err=(true|false) hold_after=false thieves_failed=0 waited=' /tmp/c616.log || true)
+          early=$(grep -cE 'celeris616 early return: (context cancelled/(epoll|iouring)|start engine fails/epoll|bind deadline passes/epoll) listen_err=(true|false) hold_after=false thieves_failed=0 waited=' /tmp/c616.log || true)
           kind=$(grep -cE 'celeris616 hold kind: state=(free-port .* SO_REUSEADDR=0 SO_REUSEPORT=[1-9]|time-wait .* SO_REUSEADDR=[1-9] SO_REUSEPORT=[1-9])$' /tmp/c616.log || true)
-          echo "celeris#616 tests: want $want, passed $passed, SKIP lines $skipped, New-to-Listen arms refused and started $gap (want 4), in-Listen arms refused $inlisten (want 4), wildcard arms 6/6 refused and dual-stack $wild (want 2), TIME_WAIT arms on net.Listen's address $tw (want 10) of which wildcard held $twheld (want 6), hold kinds $kind (want 2), hold-until-Listen-returns arms refused while paused and freed after Listen $untilret (want 2), early-return arms that gave the hold back with no Shutdown $early (want 3)"
-          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$gap" -ne 4 ] || [ "$inlisten" -ne 4 ] || [ "$wild" -ne 2 ] || [ "$tw" -ne 10 ] || [ "$twheld" -ne 6 ] || [ "$kind" -ne 2 ] || [ "$untilret" -ne 2 ] || [ "$early" -ne 3 ]; then
+          echo "celeris#616 tests: want $want, passed $passed, SKIP lines $skipped, New-to-Listen arms refused and started $gap (want 4), in-Listen arms refused $inlisten (want 4), wildcard arms 6/6 refused and dual-stack $wild (want 2), TIME_WAIT arms on net.Listen's address $tw (want 10) of which wildcard held $twheld (want 6), hold kinds $kind (want 2), hold-until-Listen-returns arms refused while paused and freed after Listen $untilret (want 2), early-return arms that gave the hold back with no Shutdown $early (want 4)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$gap" -ne 4 ] || [ "$inlisten" -ne 4 ] || [ "$wild" -ne 2 ] || [ "$tw" -ne 10 ] || [ "$twheld" -ne 6 ] || [ "$kind" -ne 2 ] || [ "$untilret" -ne 2 ] || [ "$early" -ne 4 ]; then
             echo "expected all $want celeris#616 tests to PASS with no SKIP line, and every arm on both start"
             echo "engines to report a refused steal -- was one renamed or removed, or did an io_uring arm skip?"
             exit 1

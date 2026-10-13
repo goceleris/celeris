@@ -19,7 +19,7 @@ import (
 // that frees the port for the next socket; a hold kept would stay bound until
 // the garbage collector finalized the descriptor.
 //
-// Two ways to return early are reached, each by an injection that sends Listen
+// Three ways to return early are reached, each by an injection that sends Listen
 // down its own exit:
 //
 //   - "context cancelled": the context ends at the last moment the hold covers
@@ -59,7 +59,16 @@ func TestAdaptiveListenEarlyReturnReleasesHold616(t *testing.T) {
 				e.active.Store(&failing)
 			},
 			wantErr: "injected standby Listen failure"},
+		{name: "bind deadline passes/epoll", env: "epoll", want: engine.Epoll,
+			inject: func(e *Engine, _ context.CancelFunc) {
+				listenBindDeadline = 200 * time.Millisecond
+				var silent engine.Engine = &lateBindingStandby{mockEngine: newMockEngine(engine.Epoll), listenEnded: make(chan struct{})}
+				e.active.Store(&silent)
+			},
+			wantErr: "failed to initialize within"},
 	}
+	savedDeadline := listenBindDeadline
+	defer func() { listenBindDeadline = savedDeadline }()
 	for _, a := range arms {
 		t.Run(a.name, func(t *testing.T) {
 			e, addr, _ := newGapEngine(t, a.env, a.want)
@@ -76,7 +85,7 @@ func TestAdaptiveListenEarlyReturnReleasesHold616(t *testing.T) {
 			} else {
 				listenGapHook = func(string) { hooked = true }
 			}
-			defer func() { listenGapHook = nil }()
+			defer func() { listenGapHook = nil; listenBindDeadline = savedDeadline }()
 
 			lerr := e.Listen(ctx)
 			listenGapHook = nil
