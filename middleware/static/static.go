@@ -253,7 +253,7 @@ func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding,
 // before the 304 is sent, as it can between FileFromDir's check and its open.
 func resolvesInside(cleanRoot, filePath string) bool {
 	full := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
-	if full != cleanRoot && cleanRoot != "." && !strings.HasPrefix(full, cleanRoot+string(filepath.Separator)) {
+	if cleanRoot != "." && !pathUnder(cleanRoot, full) {
 		return false
 	}
 	start := len(cleanRoot)
@@ -289,6 +289,18 @@ func resolvesInside(cleanRoot, filePath string) bool {
 		return false
 	}
 	return resolved == resolvedRoot || strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator))
+}
+
+// pathUnder reports whether p is root or a path below it, both cleaned, without
+// building root + separator.
+func pathUnder(root, p string) bool {
+	if p == root {
+		return true
+	}
+	if !strings.HasPrefix(p, root) {
+		return false
+	}
+	return root[len(root)-1] == filepath.Separator || p[len(root)] == filepath.Separator
 }
 
 // servePreCompressed checks for .br or .gz pre-compressed variants of the

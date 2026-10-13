@@ -269,13 +269,19 @@ func TestRoot304SymlinkedRoot888(t *testing.T) {
 // names a file outside it without any symlink. Its 304 is refused as well.
 func TestRoot304IndexOutsideRoot888(t *testing.T) {
 	r := newRoot888(t)
+	r.write(t, filepath.Join(r.root+"-evil", "secret.txt"), secretBytes888, secretTime888) // shares the root's name prefix
 	tag := weakETag(secretTime888, int64(len(secretBytes888)))
-	mw := New(Config{Root: r.root, Index: filepath.Join("..", "outside", "secret.txt")})
-	for _, hdr := range [][]string{{"if-none-match", tag}, {"if-none-match", "*"}, nil} {
-		rec, err := get888(t, mw, "/", hdr...)
-		if rec.StatusCode == 304 || !isHTTP400(err) || rec.Header("etag") != "" || rec.Header("last-modified") != "" {
-			t.Errorf("%v: status %d, err %v, etag %q, last-modified %q; want a 400 and no validators",
-				hdr, rec.StatusCode, err, rec.Header("etag"), rec.Header("last-modified"))
+	for _, index := range []string{
+		filepath.Join("..", "outside", "secret.txt"),
+		filepath.Join("..", "root-evil", "secret.txt"),
+	} {
+		mw := New(Config{Root: r.root, Index: index})
+		for _, hdr := range [][]string{{"if-none-match", tag}, {"if-none-match", "*"}, nil} {
+			rec, err := get888(t, mw, "/", hdr...)
+			if rec.StatusCode == 304 || !isHTTP400(err) || rec.Header("etag") != "" || rec.Header("last-modified") != "" {
+				t.Errorf("Index %q %v: status %d, err %v, etag %q, last-modified %q; want a 400 and no validators",
+					index, hdr, rec.StatusCode, err, rec.Header("etag"), rec.Header("last-modified"))
+			}
 		}
 	}
 }
