@@ -35,7 +35,7 @@ func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheConnDown887(t *testi
 	// and stays down: its listener is closed, so the PubSub's reconnect cannot
 	// reach it again.
 	var fired atomic.Bool
-	testHookBeforeBind = func(c *redisConn) {
+	setBeforeBindHook(func(c *redisConn) {
 		if !fired.CompareAndSwap(false, true) {
 			return
 		}
@@ -56,8 +56,8 @@ func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheConnDown887(t *testi
 		_ = a.fake.ln.Close()
 		_ = last.Close()
 		waitFor(t, "the loop to tear the new conn down (onClose)", 5*time.Second, c.closed.Load)
-	}
-	t.Cleanup(func() { testHookBeforeBind = nil })
+	})
+	t.Cleanup(func() { testHookBeforeBind.Store(nil) })
 
 	sc, err := s.connectSentinel()
 	if err != nil {
@@ -67,7 +67,7 @@ func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheConnDown887(t *testi
 		_ = sc.subPS.Close()
 		_ = sc.client.Close()
 	})
-	testHookBeforeBind = nil
+	testHookBeforeBind.Store(nil)
 	if !fired.Load() {
 		t.Fatal("fixture: the before-bind hook did not run")
 	}

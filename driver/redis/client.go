@@ -74,10 +74,12 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 
 // Close tears down every pooled connection. Safe to call on a nil Client.
 //
-// Close the [PubSub]s opened from the Client first. Once the Client is closed
-// their reconnect has no pool to dial: a PubSub whose connection goes down
-// returns [ErrPubSubConnDown] from its control calls until [PubSub.Close], and
-// nothing replays them.
+// Close the [PubSub]s opened from the Client first. Close does not close them:
+// their connections are checked out of the pool. A Client that owns its event
+// loop (no WithEngine) releases the loop, which takes their connections down
+// at once. Once the Client is closed their reconnect has no pool to dial: a
+// PubSub whose connection is down returns [ErrPubSubConnDown] from its control
+// calls until [PubSub.Close], and nothing replays them.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil

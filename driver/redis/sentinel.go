@@ -292,17 +292,22 @@ func (s *SentinelClient) connectSentinel() (*sentinelConn, error) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.DialTimeout)
-		ps, err := c.Subscribe(ctx, "+switch-master")
-		cancel()
-		if err == nil && ps.connDown() {
-			// Subscribe returns the PubSub, not ErrPubSubConnDown, when the
-			// conn is found down on the first SUBSCRIBE: its reconnect would
-			// retry this one address for ever while watchFailover waits. A
-			// sentinel that hung up here is skipped, as a failed Subscribe is
-			// (celeris#887 item 12).
-			_ = ps.Close()
-			err = ErrPubSubConnDown
+		// Not Client.Subscribe: its constructor keeps the PubSub when the
+		// first SUBSCRIBE finds the conn down (ErrPubSubConnDown, the reconnect
+		// replays it). For a sentinel that is wrong: the reconnect would retry
+		// this one address for ever while watchFailover waits, and no check
+		// of the conn after the call can tell a conn that is down but not yet
+		// marked closed (the loop forgot the descriptor, ErrUnknownFD) from a
+		// live one. So the first SUBSCRIBE is made here and its own error
+		// decides: any error, ErrPubSubConnDown included, skips this sentinel
+		// as on main (celeris#887 item 12).
+		ps, err := c.newPubSub(ctx)
+		if err == nil {
+			if err = ps.Subscribe(ctx, "+switch-master"); err != nil {
+				_ = ps.Close()
+			}
 		}
+		cancel()
 		if err != nil {
 			_ = c.Close()
 			continue

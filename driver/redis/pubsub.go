@@ -39,12 +39,16 @@ type Message struct {
 // neither [ErrClosed] nor [ErrUnknownFD], the error the engine's event loop
 // returns for a descriptor it has forgotten), the subscription set is updated
 // and the reconnect replays it, so the call need not be repeated, while the
-// [Client] is open. After [Client.Close] the reconnect has no pool to dial: a
-// PubSub whose conn goes down then returns [ErrPubSubConnDown] from its
-// control calls until [PubSub.Close], and the replay never happens. The
-// constructors [Client.Subscribe], [Client.PSubscribe] and
-// [ClusterClient.SSubscribe] apply the same rule to their first call: they
-// return the PubSub and a nil error, not [ErrPubSubConnDown]. Any other error
+// [Client] is open. [Client.Close] does not close the PubSub (its conn is
+// checked out of the pool), but a Client that owns its event loop (no
+// WithEngine) releases the loop with it, which takes the PubSub's conn down at
+// once. After [Client.Close] the reconnect has no pool to dial: a PubSub whose
+// conn is down then returns [ErrPubSubConnDown] from its control calls until
+// [PubSub.Close], and the replay never happens. The constructors
+// [Client.Subscribe], [Client.PSubscribe] and [ClusterClient.SSubscribe] apply
+// the same rule to their first call: they return the PubSub and a nil error,
+// not [ErrPubSubConnDown]; the PubSub then retries the address of that one
+// node (it does not follow a cluster slot move). Any other error
 // from the write (for example [ErrQueueFull] on a live connection) means the
 // command was not sent and nothing replays it before the next reconnect.
 // [ErrClosed] means the PubSub itself is closed, also when [PubSub.Close] raced
@@ -126,17 +130,6 @@ func (c *Client) PSubscribe(ctx context.Context, patterns ...string) (*PubSub, e
 	return ps, nil
 }
 
-// connDown reports whether ps holds no live conn right now: it has none (the
-// reconnect loop took it out and has not replaced it) or the one it holds has
-// been torn down. A reconnect that has already replaced the conn makes it
-// false.
-func (ps *PubSub) connDown() bool {
-	ps.mu.Lock()
-	conn := ps.conn
-	ps.mu.Unlock()
-	return conn == nil || conn.closed.Load()
-}
-
 // firstControl is the tail of a constructor that made one control call on the
 // PubSub it just built. [ErrPubSubConnDown] means the call was not sent but the
 // subscription set holds it and the reconnect replays it (every conn that goes
@@ -144,6 +137,10 @@ func (ps *PubSub) connDown() bool {
 // newPubSub), so the PubSub is kept and returned, as the [PubSub] doc promises
 // for a control call (celeris#887 item 12). Any other error means the command
 // was not sent and nothing replays it: the PubSub is closed and not returned.
+// A caller that must not keep a PubSub whose first call was not sent (the
+// sentinel caller: its reconnect would retry one address for ever) does not
+// use this: it calls newPubSub and the control method itself and reads the
+// error.
 func (ps *PubSub) firstControl(err error) (*PubSub, error) {
 	if err == nil || errors.Is(err, ErrPubSubConnDown) {
 		return ps, nil
@@ -154,19 +151,20 @@ func (ps *PubSub) firstControl(err error) (*PubSub, error) {
 
 // testHookBeforeBind, when non-nil, runs in newPubSub after the pool handed
 // out the conn and before bindConn. It is nil in production; a test sets it to
-// stage a conn that closes in that window (celeris#887 item 14). It is a plain
-// variable that newPubSub reads without synchronisation: a test that sets it
-// must not call t.Parallel, and must not run beside another test that builds a
-// PubSub; it resets the hook to nil when it is done.
-var testHookBeforeBind func(conn *redisConn)
+// stage a conn that closes in that window (celeris#887 item 14). newPubSub
+// loads it atomically, so a leftover goroutine of an earlier test that builds
+// a PubSub cannot race with a test that sets or resets it; a test that sets it
+// still must not run beside another test that builds a PubSub it does not want
+// the hook to fire on (no t.Parallel), and resets it to nil when it is done.
+var testHookBeforeBind atomic.Pointer[func(conn *redisConn)]
 
 func (c *Client) newPubSub(ctx context.Context) (*PubSub, error) {
 	conn, err := c.pool.acquirePubSub(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if h := testHookBeforeBind; h != nil {
-		h(conn)
+	if h := testHookBeforeBind.Load(); h != nil {
+		(*h)(conn)
 	}
 	ps := &PubSub{
 		client:    c,

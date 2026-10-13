@@ -41,6 +41,10 @@ func pubsubLogHas(r *pubsubRig, verb string, names ...string) bool {
 	return false
 }
 
+// setBeforeBindHook installs f as testHookBeforeBind. The caller resets it
+// with testHookBeforeBind.Store(nil) when it is done.
+func setBeforeBindHook(f func(conn *redisConn)) { testHookBeforeBind.Store(&f) }
+
 // closePubSub closes ps and waits for its reconnect goroutine to finish, as
 // the other rig tests do before they end.
 func closePubSub(t *testing.T, ps *PubSub) {
@@ -64,14 +68,14 @@ func TestPubSubConnClosedBeforeBindStillReconnects887(t *testing.T) {
 	defer cancel()
 
 	var fired atomic.Bool
-	testHookBeforeBind = func(c *redisConn) {
+	setBeforeBindHook(func(c *redisConn) {
 		if !fired.CompareAndSwap(false, true) {
 			return
 		}
 		r.dropServerSide() // the peer hangs up: the worker tears the conn down
 		waitFor(t, "the loop to tear the new conn down (onClose)", 5*time.Second, c.closed.Load)
-	}
-	t.Cleanup(func() { testHookBeforeBind = nil })
+	})
+	t.Cleanup(func() { testHookBeforeBind.Store(nil) })
 
 	ps, err := r.cl.Subscribe(ctx) // no names: the first control call is the caller's own
 	if err != nil {
@@ -80,7 +84,7 @@ func TestPubSubConnClosedBeforeBindStillReconnects887(t *testing.T) {
 	if !fired.Load() {
 		t.Fatal("fixture: the before-bind hook did not run")
 	}
-	testHookBeforeBind = nil
+	testHookBeforeBind.Store(nil)
 	t.Cleanup(func() { closePubSub(t, ps) })
 
 	err = ps.Subscribe(ctx, "news")
