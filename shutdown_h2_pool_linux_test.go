@@ -638,8 +638,16 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 // engine is not run: which of the two it is on is not this test's to decide.
 func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 	const nH2 = 48
-	for _, e := range engines759[2:3] {
+	for _, e := range []struct {
+		name  string
+		eng   celeris.EngineType
+		setup func(*testing.T)
+	}{
+		{"io_uring", celeris.IOUring, func(*testing.T) {}},
+		{"adaptive-iouring", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "iouring") }},
+	} {
 		t.Run(e.name, func(t *testing.T) {
+			e.setup(t)
 			entered := make(chan struct{}, nH2)
 			release := make(chan struct{})
 			var releaseOnce sync.Once
@@ -729,18 +737,38 @@ func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 				c  net.Conn
 				br *bufio.Reader
 			}
-			ping := func(cl *h1Client, wait time.Duration) string {
-				if _, err := io.WriteString(cl.c, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
-					return "write: " + err.Error()
+			// pingAll writes a request on every client, then reads the
+			// answers concurrently, so that the clients that get none cost
+			// one wait between them, not one each: the windows below are as
+			// long as they are logged as.
+			pingAll := func(cls []*h1Client, wait time.Duration) []string {
+				out := make([]string, len(cls))
+				for i, cl := range cls {
+					if _, err := io.WriteString(cl.c, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+						out[i] = "write: " + err.Error()
+					}
 				}
-				_ = cl.c.SetReadDeadline(time.Now().Add(wait))
-				resp, err := http.ReadResponse(cl.br, nil)
-				if err != nil {
-					return "read: " + describeH2ReadEnd759(err)
+				var wg sync.WaitGroup
+				for i, cl := range cls {
+					if out[i] != "" {
+						continue
+					}
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						_ = cl.c.SetReadDeadline(time.Now().Add(wait))
+						resp, err := http.ReadResponse(cl.br, nil)
+						if err != nil {
+							out[i] = "read: " + describeH2ReadEnd759(err)
+							return
+						}
+						_, _ = io.Copy(io.Discard, resp.Body)
+						_ = resp.Body.Close()
+						out[i] = "served"
+					}()
 				}
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
-				return "served"
+				wg.Wait()
+				return out
 			}
 			var h1 []*h1Client
 			for range 16 {
@@ -750,7 +778,7 @@ func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 				}
 				defer func() { _ = c.Close() }()
 				cl := &h1Client{c: c, br: bufio.NewReader(c)}
-				if got := ping(cl, 2*time.Second); got != "served" {
+				if got := pingAll([]*h1Client{cl}, 2*time.Second)[0]; got != "served" {
 					t.Fatalf("a keep-alive request before the shutdown: %s", got)
 				}
 				h1 = append(h1, cl)
@@ -806,8 +834,8 @@ func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 				time.Sleep(2 * time.Millisecond)
 			}
 			inGrace := 0
-			for _, cl := range h1 {
-				if ping(cl, 500*time.Millisecond) == "served" {
+			for _, got := range pingAll(h1, 500*time.Millisecond) {
+				if got == "served" {
 					inGrace++
 				}
 			}
@@ -818,26 +846,24 @@ func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 					e.name, inGrace, len(h1), refusedAt.Round(time.Millisecond))
 			}
 			time.Sleep(time.Until(begin.Add(1500 * time.Millisecond)))
-			before := ticks.Load()
+			before, windowStart := ticks.Load(), time.Now()
 			served := 0
-			var outcomes []string
-			for _, cl := range h1 {
-				got := ping(cl, 300*time.Millisecond)
-				outcomes = append(outcomes, got)
+			outcomes := pingAll(h1, 300*time.Millisecond)
+			for _, got := range outcomes {
 				if got == "served" {
 					served++
 				}
 			}
 			time.Sleep(time.Until(begin.Add(2400 * time.Millisecond)))
-			after := ticks.Load()
-			t.Logf("celeris884 %s: 1.5 s into the shutdown %d of %d keep-alive requests were answered; the detached streams' ticks over the next 0.9 s: %d",
-				e.name, served, len(h1), after-before)
+			after, window := ticks.Load(), time.Since(windowStart)
+			t.Logf("celeris884 %s: 1.5 s into the shutdown %d of %d keep-alive requests were answered; the detached streams' ticks over the next %v: %d",
+				e.name, served, len(h1), window.Round(10*time.Millisecond), after-before)
 			if served > 0 {
 				t.Errorf("%s: %d of %d keep-alive HTTP/1 requests made 1.5 s into the shutdown, while HTTP/2 handlers were still running, were answered (%v)",
 					e.name, served, len(h1), outcomes)
 			}
 			if n := after - before; n > 4 {
-				t.Errorf("%s: the detached streams wrote %d ticks in 0.9 s, from 1.5 s into the shutdown, while HTTP/2 handlers were still running", e.name, n)
+				t.Errorf("%s: the detached streams wrote %d ticks in %v, from 1.5 s into the shutdown, while HTTP/2 handlers were still running", e.name, n, window.Round(10*time.Millisecond))
 			}
 
 			// The HTTP/2 streams are not cut by the gate: they finish.
