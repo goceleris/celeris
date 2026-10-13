@@ -36,6 +36,8 @@ const (
 	test886      = "TestControllerSwitchVerdictsOnAFailedStandby886"
 	standbyMsg   = "the io_uring standby did not come up here"
 	falseVerdict = "conns not on io_uring"
+	// upSwitchOffMsg is requireUpSwitch's message.
+	upSwitchOffMsg = "the adaptive up-switch is disabled in this environment"
 )
 
 var cells886 = map[string]func(*testing.T){
@@ -102,10 +104,23 @@ func TestControllerSwitchVerdictsOnAFailedStandby886(t *testing.T) {
 		return string(b), exit
 	}
 
+	// A host whose RLIMIT_MEMLOCK cannot fund the workers disables the
+	// up-switch (requireUpSwitch): every cell then ends there, before it ever
+	// reaches the standby, with a message of its own. That is the environment,
+	// and this test cannot judge the cell's verdict on it.
+	upSwitchOff := func(t *testing.T, out string) {
+		t.Helper()
+		if strings.Contains(out, upSwitchOffMsg) {
+			skipOrFailUpswitch662(t, "the cell stopped at the disabled up-switch (memlock worker ceiling %d, -1 = unlimited), "+
+				"before it reached the standby", maxWorkersForMemlock())
+		}
+	}
+
 	for cell := range cells886 {
 		t.Run(cell+"/skips", func(t *testing.T) {
 			t0 := time.Now()
 			out, exit := run(t, cell, false)
+			upSwitchOff(t, out)
 			if exit != 0 || !strings.Contains(out, "--- SKIP: "+test886) || !strings.Contains(out, standbyMsg) {
 				t.Errorf("want a skip naming the missing standby (%q), child exit %d:\n%s", standbyMsg, exit, out)
 			}
@@ -120,6 +135,7 @@ func TestControllerSwitchVerdictsOnAFailedStandby886(t *testing.T) {
 		}
 		t.Run(cell+"/fails-under-require", func(t *testing.T) {
 			out, exit := run(t, cell, true)
+			upSwitchOff(t, out)
 			if exit == 0 || !strings.Contains(out, "--- FAIL: "+test886) || !strings.Contains(out, "forbids skipping") ||
 				!strings.Contains(out, standbyMsg) {
 				t.Errorf("want a failure naming the missing standby and CELERIS_REQUIRE_UPSWITCH=1, child exit %d:\n%s", exit, out)
