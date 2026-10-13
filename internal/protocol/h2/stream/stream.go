@@ -107,13 +107,27 @@ type Stream struct {
 	// from the engine's worker-local clock cache so HandleStream avoids a
 	// per-request time.Now() vDSO call. Zero means "unset, fall back to
 	// time.Now()" (synthetic / std-engine path).
-	StartTimeNs       int64
-	manager           *Manager
-	Headers           [][2]string
-	Trailers          [][2]string
-	Data              *bytes.Buffer
-	rawBody           []byte // zero-copy body slice (preferred over Data when set)
-	OutboundBuffer    *bytes.Buffer
+	StartTimeNs    int64
+	manager        *Manager
+	Headers        [][2]string
+	Trailers       [][2]string
+	Data           *bytes.Buffer
+	rawBody        []byte // zero-copy body slice (preferred over Data when set)
+	OutboundBuffer *bytes.Buffer
+	// gen counts the ends of this stream object's uses: it moves on when the
+	// handler of a use returns (EndUse) and again when the object is reset for
+	// the pool. A StreamWriter takes it when it is made (Gen) and presents it
+	// with every call (UseStreamer), so a call from a goroutine that outlived
+	// its handler is refused instead of landing on whatever the object is
+	// used for next, on any connection (celeris#904).
+	gen            atomic.Uint64
+	headersSent    atomic.Bool
+	handlerStarted atomic.Bool
+	windowSize     atomic.Int32
+	// The one-byte flags sit together, after the four-byte atomics: they fill
+	// the bytes that the Stream's size class has to spare, so the fields
+	// celeris#889 added (respWritten, respDeclared) do not move a Stream, which
+	// was exactly 1024 bytes, into the next class.
 	OutboundEndStream bool
 	// outboundAbandoned is set when an inline handler returned with DATA
 	// still buffered and without ending the response (a StreamWriter never
@@ -125,26 +139,9 @@ type Stream struct {
 	// handler's return (settleStreamed) before it looks at the buffer, so this
 	// is reached only by a stream settleStreamed left alone because the peer had
 	// reset it. Guarded by mu.
-	outboundAbandoned bool
-	// respWritten is how many body bytes a StreamWriter has handed to this
-	// use of the stream, sent or buffered (Manager.StreamWrite). Guarded by mu.
-	respWritten int64
-	// respDeclared is the content-length a StreamWriter's headers declared,
-	// plus one: 0 is none declared (NoteStreamHeader).
-	respDeclared atomic.Int64
-	// gen counts the ends of this stream object's uses: it moves on when the
-	// handler of a use returns (EndUse) and again when the object is reset for
-	// the pool. A StreamWriter takes it when it is made (Gen) and presents it
-	// with every call (UseStreamer), so a call from a goroutine that outlived
-	// its handler is refused instead of landing on whatever the object is
-	// used for next, on any connection (celeris#904).
-	gen                    atomic.Uint64
-	headersSent            atomic.Bool
+	outboundAbandoned      bool
 	EndStream              bool
-	IsStreaming            bool
-	handlerStarted         atomic.Bool
 	DeferResponse          bool
-	windowSize             atomic.Int32
 	ReceivedWindowUpd      chan int32 // buffered; consumed by engine layer during DATA writes
 	mu                     sync.RWMutex
 	writeMu                sync.Mutex
@@ -168,6 +165,13 @@ type Stream struct {
 	OnWSReadPauser         func() (func(), func()) // returns (pause, resume) callbacks for inbound backpressure
 	OnWSSetIdleDeadline    func(int64)             // sets the absolute idle deadline (Unix nanoseconds)
 	hdrBuf                 [16][2]string
+	// Last in the struct, so the fields the hot paths read keep their offsets.
+	// respWritten is how many body bytes a StreamWriter has handed to this
+	// use of the stream, sent or buffered (Manager.StreamWrite). Guarded by mu.
+	respWritten int64
+	// respDeclared is the content-length a StreamWriter's headers declared,
+	// plus one: 0 is none declared (NoteStreamHeader).
+	respDeclared atomic.Int64
 }
 
 // streamCtx is the context.Context of one use of an HTTP/2 stream.
@@ -543,7 +547,6 @@ func (s *Stream) resetLocked() {
 	s.respDeclared.Store(0)
 	s.headersSent.Store(false)
 	s.EndStream = false
-	s.IsStreaming = false
 	s.handlerStarted.Store(false)
 	s.DeferResponse = false
 	s.windowSize.Store(0)
@@ -687,7 +690,6 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	s.respDeclared.Store(0)
 	s.headersSent.Store(false)
 	s.EndStream = false
-	s.IsStreaming = false
 	s.handlerStarted.Store(false)
 	s.DeferResponse = false
 	s.windowSize.Store(65535)

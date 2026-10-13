@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/net/http2"
 )
@@ -166,5 +167,17 @@ func TestPanicAndGoexitAreNotCountedAsUnfinished889(t *testing.T) {
 		if told.Load() != 0 || p.UnfinishedResponses() != 0 {
 			t.Errorf("%T: OnHandlerUnfinished told %d, UnfinishedResponses %d, want 0", h, told.Load(), p.UnfinishedResponses())
 		}
+	}
+}
+
+// celeris#889 added two fields to Stream. A Stream was exactly 1024 bytes, the
+// edge of a malloc size class; one byte more is 1152, 12% more memory for every
+// stream of every connection. The one-byte flags were regrouped to make room.
+func TestStreamStaysInItsSizeClass889(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("the size class is a 64-bit one")
+	}
+	if got := unsafe.Sizeof(Stream{}); got > 1024 {
+		t.Errorf("sizeof(Stream) = %d, want at most 1024 (the malloc size class it was in)", got)
 	}
 }
