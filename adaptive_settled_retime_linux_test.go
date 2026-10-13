@@ -28,14 +28,28 @@ import (
 // diagnostic; the per-stall tally (stackTally589) runs on every stalled sample.
 var stackDumped589 atomic.Bool
 
+// parkedDumped589 guards the one-shot full dump of the first event-loop
+// goroutine found parked on a mutex: the verbatim stack TestClassifyLoopStack589
+// is written from, and the evidence that the pin was the celeris#593 one.
+var parkedDumped589 atomic.Bool
+
 // stackTally589 classifies every engine event-loop goroutine at the moment a
 // /ping sample has been outstanding for 100 ms, so the site that pins the
 // worker is COUNTED across the window rather than named once. The io_uring
 // worker is the goroutine running (*Worker).run; the epoll one (*Loop).run.
 type stackTally589 struct {
 	captures int            // stalled samples at which a stack was taken
+	parked   int            // captures at which an event-loop goroutine was parked on a mutex (mutexParked589)
 	loops    int            // event-loop goroutines seen across captures
 	where    map[string]int // event-loop goroutine → blocking site
+}
+
+// mutexParked589 reports whether a classifyLoopStack589 class is an event-loop
+// goroutine parked on a mutex. An engine worker is never supposed to wait for
+// one while a /ping sits unanswered: the celeris#593 shape is exactly that,
+// checkTimeouts blocked on a detachMu held across a slow async handler.
+func mutexParked589(class string) bool {
+	return class == "checkTimeouts_detachMu_Lock" || class == "other_Mutex_Lock"
 }
 
 func classifyLoopStack589(g string) string {
@@ -66,25 +80,56 @@ func classifyLoopStack589(g string) string {
 	return "unclassified"
 }
 
+// isLoopGoroutine589 reports whether a goroutine's stack is an engine event
+// loop: the io_uring worker runs (*Worker).run, the epoll one (*Loop).run.
+func isLoopGoroutine589(g string) bool {
+	return strings.Contains(g, "internal/engine/iouring.(*Worker).run(") || strings.Contains(g, "internal/engine/epoll.(*Loop).run(")
+}
+
 func (st *stackTally589) capture(t *testing.T) {
 	t.Helper()
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
 	st.captures++
+	parkedHere := false
 	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
-		isLoop := strings.Contains(g, "internal/engine/iouring.(*Worker).run(") || strings.Contains(g, "internal/engine/epoll.(*Loop).run(")
-		if !isLoop {
+		if !isLoopGoroutine589(g) {
 			continue
 		}
 		st.loops++
 		if st.where == nil {
 			st.where = map[string]int{}
 		}
-		st.where[classifyLoopStack589(g)]++
-		if stackDumped589.CompareAndSwap(false, true) {
+		class := classifyLoopStack589(g)
+		st.where[class]++
+		parkedHere = parkedHere || mutexParked589(class)
+		if mutexParked589(class) && parkedDumped589.CompareAndSwap(false, true) {
+			t.Logf("STACK589 first event-loop goroutine parked on a mutex (%s):\n%s", class, g)
+		}
+		if os.Getenv("CELERIS_589_STACK") != "" && stackDumped589.CompareAndSwap(false, true) {
 			t.Logf("STACK589 first stalled sample, event-loop goroutine:\n%s", g)
 		}
 	}
+	if parkedHere {
+		st.parked++
+	}
+}
+
+// stackCaptures and stackParked are the number of stalled /ping samples at
+// which the event-loop goroutines were looked at, and the number of those at
+// which one of them was parked on a mutex (0 when no stack was taken).
+func (o stall589Obs) stackCaptures() int {
+	if o.stacks == nil {
+		return 0
+	}
+	return o.stacks.captures
+}
+
+func (o stall589Obs) stackParked() int {
+	if o.stacks == nil {
+		return 0
+	}
+	return o.stacks.parked
 }
 
 func (st *stackTally589) String() string {
@@ -137,13 +182,18 @@ func envInt589(name string, def int) int {
 //     same run on the same box, not a number of milliseconds picked for a
 //     particular one.
 //
-// io_uring's numbers are PRINTED, not asserted: when this rig was written even
-// the fully async control pinned the io_uring worker ~30 % of wall time through
-// the celeris#593 timeout sweep (see the note below), a separate defect with
-// its own fix. That fix is PR #604, which now sits underneath this branch, and
-// the io_uring fraction measured on this tree is 0.000 in 10/10 settled runs.
-// The bar stays epoll-only so this change does one thing; the IOURING592 line
-// carries the numbers for whoever tightens it.
+// io_uring is not judged on the epoll ratio (celeris#886 item 1): when this
+// rig was written even the fully async control pinned the io_uring worker
+// ~30 % of the samples through the celeris#593 timeout sweep (see the note
+// below), a separate defect with its own fix, PR #604. The settled arm used to
+// PRINT that and assert only state, so with the celeris#593 TryLock put back to
+// a blocking Lock the io_uring half still passed (10/10). It is judged on the
+// worker itself, not on a latency: ioUringPin592 fails when, while the /ping
+// probe sat unanswered for 100 ms, an event-loop goroutine was parked on a
+// mutex at a quarter or more of the stack captures. That holds in the settled arm
+// and in both controls (assertCtlWorkerFree628: with the TryLock reverted they
+// passed the ratio too). No latency statistic of the probe can do this job, and
+// the const block below records the measurements that say so.
 //
 // The observable follows the two binding adversarial-review corrections on the
 // issue: the PRIMARY assertion is the dispatch STATE after the route has turned
@@ -322,6 +372,59 @@ const (
 	stall592QueuedNotice  = 0.05
 	stall592MinRefSamples = 2
 
+	// The io_uring arms' judgement (celeris#886 item 1, from celeris#739 item
+	// 2) is a statement about the worker, not about the probe's latency:
+	// ioUringPin592. It replaced a bar on the fraction of post-promotion /ping
+	// samples over D/2 (0.20, provisional), which a review of this change
+	// showed cannot separate the two worlds, and it is worth saying why, because
+	// every latency statistic fails the same way.
+	//
+	// Measured (arm64, golang:1.27, memlock unlimited, lanes-20261009/ADTST/
+	// camp/campaign*.sh, the whole latency series of every run kept in
+	// camp/logs and read by camp/analyse.py), the fixed tree against the
+	// celeris#593 TryLock reverted to a blocking Lock, 8-24 arms each:
+	//
+	//	load                              fixed: queued_frac / time share   pinned: queued_frac / time share
+	//	idle                              0.000 / 0.000                     0.315-0.343 / 0.893-0.903
+	//	celeris#628's (--cpus 4, 28       0.000-0.011 / 0.000-0.114         0.114-0.270 / 0.506-0.850
+	//	busy loops, 2 cold builds)
+	//	twice that (--cpus 2, 56 busy     0.008-0.158 / 0.061-0.448         0.098-0.353 / 0.301-0.812
+	//	loops, 3 cold builds)
+	//
+	// queued_frac is the sample fraction over D/2 (the old bar's statistic);
+	// the time share is the sum of those samples' latencies over the window,
+	// which does not under-read a pin the way the sample fraction does (the
+	// sampler is a closed loop, so a probe stuck behind a Set takes fewer
+	// samples). Neither separates once the box is starved: a free worker's
+	// samples reach 0.158 of the count and 0.448 of the window, above the
+	// lowest pinned runs under that load (0.098 and 0.301), and an epoll free worker under the
+	// same load reaches a time share of 0.514 (celeris#622's 0.145 sample
+	// fraction on epoll was not an outlier of one engine). The time spent in
+	// samples over 5 ms is worse: 0.42-0.86 of the window on the free fixed tree
+	// under the harsh load, against 0.84-0.92 pinned.
+	//
+	// What does separate them is where the worker is. A starved free worker is
+	// runnable or in the kernel wait; a pinned one is parked on the mutex that
+	// checkTimeouts blocks on. The probe takes the event-loop goroutines'
+	// stacks 100 ms into any unanswered /ping (stackTally589). Over 90 arms of
+	// the fixed tree (idle, celeris#628's load, twice that, and -race at
+	// celeris#628's load) those were 370 captures, and not one event-loop
+	// goroutine was parked on a mutex at any of them. Over 75 arms of the tree
+	// with the celeris#593 TryLock reverted the same load shapes found one
+	// parked at 0.625 (10 of 16, the lowest) to 1.000 of the captures of every
+	// arm, 8 or more parked captures each. So the arm fails at
+	// stall592PinMinCaptures parked captures that are at least
+	// stall592PinMinShare of all captures: 3 and a quarter sit far from 0 on the
+	// one side and 8 and 0.625 on the other. The classifier is pinned on a
+	// verbatim goroutine dump (TestClassifyLoopStack589).
+	//
+	// stall592MinPingSamples: a window with fewer samples than this cannot be
+	// judged and fails (the fixed tree took 58-933 samples, the pinned one
+	// 55-135): a probe that completed so few requests was waiting on the worker.
+	stall592MinPingSamples = 20
+	stall592PinMinCaptures = 3
+	stall592PinMinShare    = 0.25
+
 	// The CONTROL arms' latency observable, celeris#628. Both controls used
 	// to end with `o.pingMed >= stall589StallBar` — the same absolute 5 ms of
 	// wall clock celeris#622 removed from the settled arm, one level down.
@@ -454,17 +557,22 @@ type stall589Obs struct {
 	// slow call until the route is promoted — i.e. while the settled route is
 	// still inline on the worker. It is the denominator the post-promotion
 	// window is judged against, so both numbers carry the same runner.
-	refSamples  int
-	refPingMed  time.Duration
-	refPingMax  time.Duration
-	refStalled  int // reference samples > stall589StallBar (reported)
-	refWindow   time.Duration
-	speedup     float64       // refPingMed / pingMed; 0 when there is no reference
-	queuedBar   time.Duration // "this /ping waited for a blocked Set" bar (stall589Delay/2)
-	queued      int           // post-promotion samples > queuedBar
-	queuedFrac  float64
-	refQueued   int // reference samples > queuedBar (the pinned world's own rate, reported)
-	refQueuedFr float64
+	refSamples int
+	refPingMed time.Duration
+	refPingMax time.Duration
+	refStalled int // reference samples > stall589StallBar (reported)
+	refWindow  time.Duration
+	speedup    float64       // refPingMed / pingMed; 0 when there is no reference
+	queuedBar  time.Duration // "this /ping waited for a blocked Set" bar (stall589Delay/2)
+	queued     int           // post-promotion samples > queuedBar
+	queuedFrac float64
+	queuedTime time.Duration // sum of the latencies of the post-promotion samples over queuedBar (REPORTED)
+	// queuedTimeFrac is queuedTime / window, the share of the wall-clock window
+	// spent waiting in samples over queuedBar (REPORTED, celeris#886 item 1:
+	// under a starved box it overlaps the pinned worker's, so it decides nothing).
+	queuedTimeFrac float64
+	refQueued      int // reference samples > queuedBar (the pinned world's own rate, reported)
+	refQueuedFr    float64
 
 	// The controls' in-run reference (celeris#628): what one blocked Set
 	// costs a keep-alive client on this box under this load, measured by the
@@ -500,13 +608,13 @@ func assertSettledStall589(o stall589Obs) error {
 
 // assertSettledRetimed592 is the FIXED behaviour: the settled classification is
 // re-timed, so a settled route whose store turns slow is promoted and stops
-// running on the engine worker. State is asserted on both engines; the latency
-// observable is asserted on epoll only, because io_uring separately pinned its
-// worker in the timeout sweep even when every conn is async-dispatched
-// (celeris#593) — its numbers are printed instead. #593 is fixed on main by
-// PR #604, which sits underneath this rig, and the printed io_uring numbers
-// invert as epoll's do; the bar is left epoll-only so this stays one change,
-// and the IOURING592 line carries what a tightening would be judged on.
+// running on the engine worker. State is asserted on both engines. The latency
+// observable differs by engine: epoll is judged on the ratio below, io_uring on
+// the fraction of post-promotion samples that waited for the blocked Set,
+// because io_uring separately pinned its worker in the timeout sweep even when
+// every conn is async-dispatched (celeris#593; fixed on main by PR #604). A
+// pinned worker shows that fraction at 0.3 and the fixed tree at 0, so it
+// needs no reference window and is not subject to the VOID case.
 //
 // The latency observable is RELATIVE (celeris#622). What the settled arm
 // claims is that a re-timed route stops costing the worker — not that a /ping
@@ -519,9 +627,9 @@ func assertSettledStall589(o stall589Obs) error {
 // was so fast that the pinned window holds fewer than stall592MinRefSamples
 // samples, and then the state assertions above carry the arm.
 //
-// The queued fraction (samples over queuedBar589) is computed and printed
-// beside it but deliberately NOT asserted — the const block records the run
-// that decided that.
+// io_uring's judgement is ioUringPin592. The queued fraction (samples over
+// queuedBar589) is computed and printed on both engines but not asserted —
+// the const block records the runs that decided that.
 func assertSettledRetimed592(o stall589Obs) error {
 	switch {
 	case !o.promotedInBound:
@@ -531,6 +639,8 @@ func assertSettledRetimed592(o stall589Obs) error {
 		return errors.New("/kv is not promoted (isPromoted=false) at the end of the window")
 	case o.asyncPromotedConns < 1:
 		return fmt.Errorf("AsyncPromotedConns=%d, want >= 1 (no conn was handed to the dispatch goroutine)", o.asyncPromotedConns)
+	case ioUringPin592(o) != nil:
+		return ioUringPin592(o)
 	case o.engine == "epoll" && o.refSamples >= stall592MinRefSamples && refUnpinned790(o):
 		// The ratio's premise failed (celeris#790): the reference window was
 		// never pinned, so there is no settled-world median to divide by.
@@ -543,6 +653,48 @@ func assertSettledRetimed592(o stall589Obs) error {
 			"against %v over %d samples taken while the route was still settled — same sampler, same blocked store, same run "+
 			"(queued %d/%d over %v)",
 			o.speedup, stall592MinSpeedup, o.pingMed, o.samples, o.refPingMed, o.refSamples, o.queued, o.samples, o.queuedBar)
+	}
+	return nil
+}
+
+// ioUringPin592 is the io_uring arms' judgement (celeris#886 item 1), shared
+// by the settled arm and both controls: while the /ping probe sat unanswered
+// for 100 ms, no event-loop goroutine may have been parked on a mutex at a
+// quarter or more of the captures (and at no fewer than stall592PinMinCaptures). That
+// is the celeris#593 pin itself — checkTimeouts blocked on a detachMu held
+// across a slow async handler — read from the worker's own stack, so it does
+// not depend on how slow the box is: a starved free worker is as slow as a
+// pinned one, and every latency statistic of the probe overlaps (see the
+// constants below). A window with fewer than stall592MinPingSamples samples,
+// or with no stack tally at all, cannot be judged and is an error, not a pass.
+func ioUringPin592(o stall589Obs) error {
+	if o.engine != "iouring" {
+		return nil
+	}
+	if o.samples < stall592MinPingSamples {
+		return fmt.Errorf("iouring: only %d post-promotion /ping samples in the window (want >= %d): the probe cannot be judged, "+
+			"and one that completed so few requests was waiting on the worker the whole time",
+			o.samples, stall592MinPingSamples)
+	}
+	if o.stacks == nil {
+		if os.Getenv("CELERIS_589_FRESH") != "" {
+			return nil // the diagnostic that samples on a fresh conn per request takes no stacks
+		}
+		return errors.New("iouring: no stack tally was taken during the window (the sampler did not watch the event-loop goroutines): the probe cannot be judged")
+	}
+	if o.stacks.captures > 0 && o.stacks.loops == 0 {
+		// Stacks were taken but not one of them held an event-loop goroutine:
+		// isLoopGoroutine589 no longer matches the engine (a rename), and a
+		// pinned worker would read as 0 parked.
+		return fmt.Errorf("iouring: %d stacks were taken while the /ping probe sat unanswered, but none held an event-loop goroutine "+
+			"(isLoopGoroutine589 matches (*Worker).run): the probe cannot be judged", o.stacks.captures)
+	}
+	if parked, captures := o.stacks.parked, o.stacks.captures; parked >= stall592PinMinCaptures && float64(parked) >= stall592PinMinShare*float64(captures) {
+		return fmt.Errorf("iouring: an event-loop goroutine was parked on a mutex at %d of the %d captures taken while the /ping probe sat unanswered "+
+			"(want < %d, or under a quarter of the captures; async_promoted_conns=%d kv_conns=%d; %d of %d samples over %v, %.3f of the window): "+
+			"the worker is pinned although every /kv conn is off it — the celeris#593 shape, checkTimeouts blocking on a detachMu "+
+			"held across a slow async handler (%s)",
+			parked, captures, stall592PinMinCaptures, o.asyncPromotedConns, o.kvConns, o.queued, o.samples, o.queuedBar, o.queuedTimeFrac, o.stacks)
 	}
 	return nil
 }
@@ -604,6 +756,15 @@ func releaseClockStub592() { stubbedNowOn.Store(false) }
 // window, because a worker serves its /kv conns serially before the probe), so
 // there the ratio is at or below 1.
 func assertCtlWorkerFree628(o stall589Obs) error {
+	// io_uring: a worker pinned in the timeout sweep (celeris#593) leaves the
+	// median of the /ping samples untouched and costs a third of them a whole
+	// Set, so the ratio below passes under it (the TryLock reverted: both
+	// controls PASS with 0.324-0.337 of their samples over D/2). The same
+	// fraction as the settled arm's bar judges them (celeris#886 item 1); it
+	// needs no reference window, so it comes first.
+	if err := ioUringPin592(o); err != nil {
+		return err
+	}
 	if o.kvSamples < stall592MinCtlRefSamples || o.pingMed <= 0 {
 		return nil
 	}
@@ -747,14 +908,14 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 		"settled_after=%t promoted_after=%t promoted_in_bound=%t promote_ms=%.0f async_promoted_conns=%d workers=%d kv_conns=%d gomaxprocs=%d warm_reqs=%d warm_depromotions=%d slow_calls=%d kv_reqs=%d "+
 		"pre_sample_ms=%.0f window_ms=%.0f samples=%d stalled=%d stalled_frac=%.3f stalled_time_ms=%.0f "+
 		"ping_min_ms=%.3f ping_med_ms=%.3f ping_max_ms=%.3f "+
-		"queued_bar_ms=%.0f queued=%d queued_frac=%.3f speedup=%.1f "+
+		"queued_bar_ms=%.0f queued=%d queued_frac=%.3f queued_time_frac=%.3f stack_captures=%d stack_parked=%d speedup=%.1f "+
 		"kv_samples=%d kv_med_ms=%.3f kv_max_ms=%.3f ctl_speedup=%.1f "+
 		"ref_samples=%d ref_window_ms=%.0f ref_ping_med_ms=%.3f ref_ping_max_ms=%.3f ref_stalled=%d ref_queued_frac=%.3f claim589_assert=%s",
 		o.engine, o.mode, stall589RunSeq.Add(1), verdict, o.settledBefore, o.promotedBefore, o.adaptive, o.settledAtFlip,
 		o.settledAfter, o.promotedAfter, o.promotedInBound, ms(o.promoteLatency), o.asyncPromotedConns, o.workers, o.kvConns, o.gomaxprocs, o.warmReqs, o.depromotions, o.slowCalls, o.kvReqs,
 		ms(o.preSample), ms(o.window), o.samples, o.stalled, o.stalledFrac, ms(o.stalledTime),
 		ms(o.pingMin), ms(o.pingMed), ms(o.pingMax),
-		ms(o.queuedBar), o.queued, o.queuedFrac, o.speedup,
+		ms(o.queuedBar), o.queued, o.queuedFrac, o.queuedTimeFrac, o.stackCaptures(), o.stackParked(), o.speedup,
 		o.kvSamples, ms(o.kvMed), ms(o.kvMax), o.ctlSpeedup,
 		o.refSamples, ms(o.refWindow), ms(o.refPingMed), ms(o.refPingMax), o.refStalled, o.refQueuedFr, claim)
 	if o.stacks != nil {
@@ -765,32 +926,32 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 	// policy but a second defect (io_uring: checkTimeouts blocks on detachMu
 	// held by runAsyncHandler across the slow ProcessH1). Name it on its own
 	// line so the CONTROL_OK verdict (decided on the median) cannot hide it.
-	// io_uring is not judged on the settled mode's latency: PRINT the two
-	// numbers the epoll arm IS judged on (celeris#622 — the queued fraction
-	// against the injected-delay bar, and the settled-vs-pinned median
-	// speedup) so the unasserted side is on the record in the asserted form.
-	// The celeris#593 sweep pin this allowance was written for is FIXED on
-	// main (PR #604, the checkTimeouts/handleHeaderTimer TryLock) — so the
-	// line is now a witness that the two fixes compose, and the numbers to
-	// watch if the bar is ever tightened to cover both engines.
+	// io_uring is judged on the worker's own stack while the probe sat
+	// unanswered (ioUringPin592, celeris#886 item 1), not on the median
+	// speedup epoll is judged on. The line is a witness that the celeris#593
+	// fix (PR #604, the checkTimeouts/handleHeaderTimer TryLock) and the
+	// celeris#592 re-opener compose, and holds the numbers to read when the
+	// assertion fires.
 	if o.engine == "iouring" && o.mode == stall589Settled.String() {
-		t.Logf("IOURING592 engine=iouring mode=settled speedup=%.1fx (epoll bar %.0fx, ref %v over %d pinned samples) "+
-			"queued=%d/%d queued_frac=%.3f over %v stalled_frac=%.3f ping_med_ms=%.3f ping_max_ms=%.1f promote_ms=%.0f "+
-			"async_promoted_conns=%d: reported, not asserted — the celeris#593 sweep pin (checkTimeouts blocking on detachMu "+
-			"held by runAsyncHandler across the slow ProcessH1) is fixed by PR #604 underneath this rig",
-			o.speedup, stall592MinSpeedup, o.refPingMed, o.refSamples,
-			o.queued, o.samples, o.queuedFrac, o.queuedBar, o.stalledFrac, ms(o.pingMed), ms(o.pingMax), ms(o.promoteLatency),
-			o.asyncPromotedConns)
+		t.Logf("IOURING592 engine=iouring mode=settled stack_parked=%d/%d (asserted: under %d, or under a quarter) queued=%d/%d queued_frac=%.3f over %v "+
+			"queued_time_frac=%.3f (reported) stalled_frac=%.3f ping_med_ms=%.3f ping_max_ms=%.1f promote_ms=%.0f async_promoted_conns=%d "+
+			"speedup=%.1fx (reported; epoll bar %.0fx, ref %v over %d pinned samples): the celeris#593 sweep pin "+
+			"(checkTimeouts blocking on detachMu held by runAsyncHandler across the slow ProcessH1) is fixed by PR #604 underneath this rig",
+			o.stackParked(), o.stackCaptures(), stall592PinMinCaptures, o.queued, o.samples, o.queuedFrac, o.queuedBar,
+			o.queuedTimeFrac, o.stalledFrac, ms(o.pingMed), ms(o.pingMax), ms(o.promoteLatency), o.asyncPromotedConns,
+			o.speedup, stall592MinSpeedup, o.refPingMed, o.refSamples)
 	}
-	// The queued fraction is the tail of the post-promotion window against the
-	// rig's own injected delay. It is NOT asserted (celeris#622: a starved
-	// runner owns that tail — 0.145 measured on a run whose median proved the
-	// worker free), but a high value next to a healthy speedup is worth having
-	// on the record, and a high value next to a poor speedup is the pin.
+	// The sample fraction over D/2 and the share of the window spent in those
+	// samples are REPORTED, never asserted: on epoll the ratio decides
+	// (celeris#622: a starved runner owns the tail, 0.145 measured on a run
+	// whose median proved the worker free) and on io_uring the worker's stack
+	// does (ioUringPin592; the const block records why no latency statistic
+	// can). A high value next to a healthy speedup is worth having on the
+	// record, and a high value next to a poor speedup is the pin.
 	if o.mode == stall589Settled.String() && o.queuedFrac > stall592QueuedNotice {
-		t.Logf("QUEUED592 engine=%s mode=settled queued=%d/%d queued_frac=%.3f over %v (reported, not asserted) speedup=%.1fx "+
+		t.Logf("QUEUED592 engine=%s mode=settled queued=%d/%d queued_frac=%.3f over %v queued_time_frac=%.3f (reported, not asserted) speedup=%.1fx "+
 			"ping_med_ms=%.3f ping_max_ms=%.1f ref_ping_med_ms=%.3f: read the speedup — a pinned worker moves BOTH",
-			o.engine, o.queued, o.samples, o.queuedFrac, o.queuedBar, o.speedup, ms(o.pingMed), ms(o.pingMax), ms(o.refPingMed))
+			o.engine, o.queued, o.samples, o.queuedFrac, o.queuedBar, o.queuedTimeFrac, o.speedup, ms(o.pingMed), ms(o.pingMax), ms(o.refPingMed))
 	}
 	// The control arms' legacy signal (celeris#628): the absolute 5 ms bar
 	// they used to be judged on. It is REPORTED, never asserted — it is the
@@ -1304,12 +1465,15 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 
 	var lat []time.Duration
 	winStart := time.Now()
-	stackDiag := !fresh && os.Getenv("CELERIS_589_STACK") != ""
+	// The post-promotion window watches for the celeris#593 pin itself
+	// (stackTally589, celeris#886 item 1): 100 ms into any /ping that has not
+	// been answered, the event-loop goroutines' stacks are classified.
+	stackDiag := !fresh
 	for time.Since(winStart) < stall589Window {
 		if stackDiag {
-			// Diagnostic: 100 ms into EVERY stalled /ping, classify the
-			// event-loop goroutines' blocking site (tallied on the STACK589
-			// result line) and dump the first one in full.
+			// 100 ms into EVERY stalled /ping, classify the event-loop
+			// goroutines' blocking site (tallied on the STACKTALLY589 line;
+			// CELERIS_589_STACK=1 also dumps the first one in full).
 			if o.stacks == nil {
 				o.stacks = &stackTally589{}
 			}
@@ -1382,7 +1546,11 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		}
 		if d > o.queuedBar {
 			o.queued++
+			o.queuedTime += d
 		}
+	}
+	if o.window > 0 {
+		o.queuedTimeFrac = float64(o.queuedTime) / float64(o.window)
 	}
 	if o.samples > 0 {
 		o.stalledFrac = float64(o.stalled) / float64(o.samples)

@@ -44,6 +44,9 @@ func newRampAdaptive(t *testing.T, h stream.Handler, cfg resource.Config) (*Engi
 	e.ctrl.evalInterval = 40 * time.Millisecond
 	e.ctrl.cooldown = 0
 	e.ctrl.loadDownRevert = true
+	if afterNew886 != nil {
+		afterNew886(e)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -579,6 +582,9 @@ func rampScenario(t *testing.T, h stream.Handler, cfg resource.Config, client fu
 	errSampleMu.Unlock()
 	// io_uring exists now, so its real worker count fixes the revert band.
 	bands.refineLow(t, e)
+	// The warm-start is what builds the standby: if that failed, no phase below
+	// can land on io_uring (celeris#886 item 11).
+	skipIfStandbyBuildFailed886(t, e)
 
 	// high → low → high → 1 → high → low: each high phase should land on
 	// io_uring with conns migrated there; each low phase back on epoll. The
@@ -623,6 +629,7 @@ func rampScenario(t *testing.T, h stream.Handler, cfg resource.Config, client fu
 		}
 		if ph.wantIOU {
 			if iou < phaseQuorum(want) {
+				skipIfStandbyBuildFailed886(t, e)
 				t.Errorf("phase %d (high load, %.1f conns/worker >= %.0f upThreshold): conns not on io_uring after %v: io_uring=%d epoll=%d (want io_uring ~%d)",
 					i, float64(want)/float64(max(bands.epollWorkers, 1)), e.ctrl.upThreshold, waited, iou, epo, want)
 			}
@@ -725,6 +732,7 @@ func TestRampAutoMixedH1H2(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	h1.rampTo(0)
 	time.Sleep(1500 * time.Millisecond)
+	skipIfStandbyBuildFailed886(t, e) // the warm-up is what builds the standby (celeris#886 item 11)
 	resetSwitchState(e)
 	h1.ok.Store(0)
 	h1.errc.Store(0)
@@ -749,6 +757,7 @@ func TestRampAutoMixedH1H2(t *testing.T) {
 			// High h1 load → io_uring active, h1 conns migrated there; epoll keeps
 			// ~the h2 conns (not transplantable).
 			if iou < int64(ph.n)/2 {
+				skipIfStandbyBuildFailed886(t, e)
 				t.Errorf("phase %d: h1 conns not on io_uring: io_uring=%d", i, iou)
 			}
 		}
@@ -785,6 +794,7 @@ func TestRampAutoMixedAsync(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	h1.rampTo(0)
 	time.Sleep(1500 * time.Millisecond)
+	skipIfStandbyBuildFailed886(t, e) // the warm-up is what builds the standby (celeris#886 item 11)
 	resetSwitchState(e)
 	h1.ok.Store(0)
 	h1.errc.Store(0)
@@ -809,6 +819,7 @@ func TestRampAutoMixedAsync(t *testing.T) {
 			// High h1 load → io_uring active, h1 conns migrated there; epoll keeps
 			// ~the h2 conns (not transplantable).
 			if iou < int64(ph.n)/2 {
+				skipIfStandbyBuildFailed886(t, e)
 				t.Errorf("phase %d: h1 conns not on io_uring: io_uring=%d", i, iou)
 			}
 		}

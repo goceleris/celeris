@@ -8,6 +8,5 @@ package iouring
 func resetAsyncCancelProbeCache() {
 	asyncCancelMu.Lock()
 	defer asyncCancelMu.Unlock()
-	asyncCancelKnown = false
-	cachedAsyncCancelRes, cachedAsyncCancelReas = asyncCancelNoAnswer, ""
+	forgetAsyncCancelAnswerLocked()
 }
