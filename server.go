@@ -653,7 +653,10 @@ func (s *Server) shutdown(ctx context.Context) error {
 	// hooks ran, and Shutdown returned, while requests were still being
 	// handled. On std, Engine.Shutdown was the drain and Listen returned when
 	// it closed the listener; on adaptive, Engine.Shutdown waited for its own
-	// Listen. Either way Listen has returned, or returns at once. Deadlock
+	// Listen, unless ctx ended while an engine switch held the engine's lock:
+	// then it returns ctx's error, and Listen returns at the latest once that
+	// switch has let go of the lock (celeris#886 item 15). Otherwise Listen has
+	// returned, or returns at once. Deadlock
 	// check: Listen waits for nothing that Shutdown holds or does after this
 	// point. The Start*Context watcher that runs this on a cancel waits here
 	// for Listen, never for the Start call. The Start call waits for the
@@ -870,13 +873,15 @@ func (s *Server) PauseAccept() error {
 // It wakes the engine's workers and returns; each worker binds its listen
 // socket again on its own thread, after the call. A worker that cannot (the
 // port was taken while accepting was paused, which an engine that does not hold
-// its port allows: a fixed address on epoll or io_uring, or any address on
-// Adaptive) logs the failure at error level, counts it in
+// its port allows: a fixed address on epoll or io_uring) logs the failure at
+// error level, counts it in
 // [observe.EngineMetrics].ErrorListenerRecreate and stops; ResumeAccept has
 // returned nil by then, and the server keeps running without that listener. A
 // non-zero ErrorListenerRecreate means lost accept capacity, not a transient.
 // A port 0 address on epoll or io_uring is held by the engine, so no socket without
-// SO_REUSEPORT can take it in between.
+// SO_REUSEPORT can take it in between. The Adaptive engine does not implement
+// accept control, so on it PauseAccept and ResumeAccept return
+// [ErrAcceptControlNotSupported]; see [Config.Addr] for what it holds.
 func (s *Server) ResumeAccept() error {
 	eng := s.loadEngine()
 	if eng == nil {

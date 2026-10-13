@@ -106,15 +106,26 @@ var startEngines = []struct {
 // requested engine, and returns it with the address New decided on.
 func newGapEngine(t *testing.T, startEnv string, want engine.EngineType) (*Engine, string, int) {
 	t.Helper()
+	return newGapEngineWith(t, startEnv, want, nil)
+}
+
+// newGapEngineWith is newGapEngine with a hook that edits the config New is
+// given (the zero hook leaves it as newGapEngine builds it).
+func newGapEngineWith(t *testing.T, startEnv string, want engine.EngineType, edit func(*resource.Config)) (*Engine, string, int) {
+	t.Helper()
 	if want == engine.IOUring && !probe.Probe().IOUringTier.Available() {
 		t.Skip("io_uring unavailable here: cannot start adaptive on it")
 	}
 	t.Setenv("CELERIS_ADAPTIVE_START", startEnv)
-	e, err := New(resource.Config{
+	cfg := resource.Config{
 		Addr:      "127.0.0.1:0",
 		Protocol:  engine.HTTP1,
 		Resources: resource.Resources{Workers: 2},
-	}, respHandler{}, nil)
+	}
+	if edit != nil {
+		edit(&cfg)
+	}
+	e, err := New(cfg, respHandler{}, nil)
 	if err != nil {
 		t.Fatalf("adaptive.New: %v", err)
 	}
@@ -139,24 +150,9 @@ func newGapEngine(t *testing.T, startEnv string, want engine.EngineType) (*Engin
 // func that cancels Listen and waits for it.
 func startAndServe(t *testing.T, e *Engine) (stop func(), err error) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	deadline := time.After(25 * time.Second)
-	for e.Addr() == nil {
-		select {
-		case lerr := <-done:
-			cancel()
-			if lerr == nil {
-				lerr = errors.New("Listen returned nil without publishing an address")
-			}
-			return nil, lerr
-		case <-deadline:
-			cancel()
-			<-done
-			return nil, errors.New("no address published within 25s")
-		case <-time.After(5 * time.Millisecond):
-		}
+	cancel, done, err := startListen(e)
+	if err != nil {
+		return nil, err
 	}
 	return func() {
 		cancel()
@@ -165,6 +161,34 @@ func startAndServe(t *testing.T, e *Engine) (stop func(), err error) {
 		}
 		_ = e.Shutdown(context.Background())
 	}, nil
+}
+
+// startListen runs Listen and waits for the engine to publish an address. On
+// success it returns the cancel func of Listen's context and the channel that
+// receives Listen's result, so a test can see the moment Listen returns (and
+// what the engine holds then) before it calls Shutdown. On failure Listen has
+// returned and its error is the result.
+func startListen(e *Engine) (cancel context.CancelFunc, done <-chan error, err error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan error, 1)
+	go func() { ch <- e.Listen(ctx) }()
+	deadline := time.After(25 * time.Second)
+	for e.Addr() == nil {
+		select {
+		case lerr := <-ch:
+			cancel()
+			if lerr == nil {
+				lerr = errors.New("Listen returned nil without publishing an address")
+			}
+			return nil, nil, lerr
+		case <-deadline:
+			cancel()
+			<-ch
+			return nil, nil, errors.New("no address published within 25s")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	return cancel, ch, nil
 }
 
 // TestAdaptivePortHeldFromNewToListen616 is the celeris#616 regression. It
