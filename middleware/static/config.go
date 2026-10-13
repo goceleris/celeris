@@ -22,7 +22,10 @@ type Config struct {
 
 	// FS is an [fs.FS] from which to serve files (e.g. embed.FS).
 	// Mutually exclusive with Root. If both Root and FS are set, FS takes
-	// precedence.
+	// precedence. The middleware does not check where an FS leads: an
+	// [os.DirFS] follows a symlink out of its directory, which Root does not
+	// (see its containment check); use Root for a directory that may hold
+	// untrusted symlinks.
 	FS fs.FS
 
 	// Prefix is the URL path prefix to strip before looking up the file.
@@ -54,9 +57,12 @@ type Config struct {
 
 	// Compress enables serving pre-compressed files. When true, the middleware
 	// checks for .br (Brotli) and .gz (gzip) variants of the requested file
-	// and serves them if the client accepts the encoding via Accept-Encoding.
-	// Brotli is preferred over gzip when both are accepted. Works with both
-	// OS filesystem (Root) and fs.FS.
+	// and serves them if the client accepts the encoding via Accept-Encoding,
+	// read with its q-values: an encoding the client refuses with q=0, by name
+	// or through "*;q=0", is not served. Brotli is preferred over gzip when
+	// both are accepted (x-gzip counts as gzip). A file served in answer to a request that carries an
+	// Accept-Encoding header names Accept-Encoding in Vary (once), whether or
+	// not the file has a variant. Works with both OS filesystem (Root) and fs.FS.
 	Compress bool
 }
 
