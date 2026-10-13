@@ -333,7 +333,7 @@ jobs:
       # subtests (both engines, three arms) to PASS by name, and no `--- SKIP`
       # line of any kind. All three io_uring arms (the settled arm and both
       # controls) also assert that no event-loop goroutine was parked on a mutex
-      # at half or more of the stack captures taken while the /ping probe sat
+      # at a quarter or more of the stack captures taken while the /ping probe sat
       # unanswered (celeris#886 item 1, ioUringPin592: the celeris#593 pin, read
       # from the worker's own stack because no latency statistic separates a
       # pinned worker from a starved free one), so a PASS of those arms is a

@@ -40,9 +40,9 @@ func pinObs592(engine string, mode stall589Mode, samples, captures, parked int) 
 // against 0.000-0.158 free, the share of the window spent in them 0.506-0.903
 // against 0.000-0.448, and a starved free worker is as slow as a pinned one for
 // as long as the box starves it. What a free worker never does is wait on a
-// mutex: in 140 stalled-probe stack captures of the fixed tree under the harsh
-// load not one event-loop goroutine was parked on one, and the pinned worker
-// is parked on one at most captures.
+// mutex: in 370 stalled-probe stack captures of the fixed tree (90 arms, idle and
+// under both loads) not one event-loop goroutine was parked on one, and the
+// pinned worker is parked on one at 0.625-1.000 of the captures.
 func TestSettledRetimedIOUringBar592(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -54,8 +54,11 @@ func TestSettledRetimedIOUringBar592(t *testing.T) {
 		{"io_uring, one stray capture on a mutex is below the floor", pinObs592("iouring", stall589Settled, 89, 11, 1), ""},
 		{"io_uring, the celeris#593 TryLock reverted (33 captures, 30 parked)", pinObs592("iouring", stall589Settled, 135, 33, 30), "celeris#593"},
 		{"io_uring, the celeris#593 TryLock reverted, at the floor (3 of 3)", pinObs592("iouring", stall589Settled, 100, 3, 3), "celeris#593"},
-		{"io_uring, the celeris#593 TryLock reverted, at half the captures (10 of 20)", pinObs592("iouring", stall589Settled, 100, 20, 10), "celeris#593"},
-		{"io_uring, parked at a minority of the captures is not the pin (3 of 20)", pinObs592("iouring", stall589Settled, 100, 20, 3), ""},
+		{"io_uring, the celeris#593 TryLock reverted, at a half of the captures (10 of 20)", pinObs592("iouring", stall589Settled, 100, 20, 10), "celeris#593"},
+		{"io_uring, parked at a small minority of the captures is not the pin (3 of 20)", pinObs592("iouring", stall589Settled, 100, 20, 3), ""},
+		{"io_uring, the celeris#593 TryLock reverted, the lowest share of 75 arms (10 of 16)", pinObs592("iouring", stall589Settled, 71, 16, 10), "celeris#593"},
+		{"io_uring, at a quarter of the captures (5 of 20)", pinObs592("iouring", stall589Settled, 100, 20, 5), "celeris#593"},
+		{"io_uring, just under a quarter of the captures (4 of 20)", pinObs592("iouring", stall589Settled, 100, 20, 4), ""},
 		{"io_uring, no post-promotion samples at all is not a pass", pinObs592("iouring", stall589Settled, 0, 0, 0), "samples"},
 		{"io_uring, too few samples to judge is not a pass", pinObs592("iouring", stall589Settled, 5, 0, 0), "samples"},
 		{"io_uring, no stack tally at all is not a pass", pinObs592("iouring", stall589Settled, 950, -1, 0), "stack"},
