@@ -34,16 +34,18 @@ import (
 //     engine logs the loop-exit record. Tests: TestH2InlineStreamGoexitIsLoud848
 //     (GET) and TestH2InlineShapesGoexitAreLoud848 (the others);
 //   - a stream on the h2 worker pool does not run on the loop: the loop keeps
-//     serving, the stream gets no answer and no RST_STREAM, the connection
-//     keeps its other streams, and the engine does not report a loop exit.
-//     That happens for an async route (TestH2AsyncStreamGoexitKeepsTheLoop848,
-//     a GET and a POST with a body) and for a sync route on a connection that
-//     already holds OutboundBudget (4 MiB) of response data
-//     (TestH2OverBudgetStreamGoexitKeepsTheLoop848).
+//     serving, the stream is reset with RST_STREAM(INTERNAL_ERROR) and the
+//     Goexit is logged with its stack as one Error record (celeris#889; it was
+//     no answer and no record before), the connection keeps its other streams,
+//     the pool goroutine that ran the handler is replaced, and the engine does
+//     not report a loop exit. That happens for an async route
+//     (TestH2AsyncStreamGoexitKeepsTheLoop848, a GET and a POST with a body)
+//     and for a sync route on a connection that already holds OutboundBudget
+//     (4 MiB) of response data (TestH2OverBudgetStreamGoexitKeepsTheLoop848).
 //
-// The second is a documented limit, not a promise of loudness: that stream gets
-// no answer (the RESULT line logs the Error records it saw, 0 today). The tests
-// pin that the loop survives and no loop-exit record is written.
+// The inline stream's Goexit is logged and counted by the processor too, and
+// the stream reset, but the loop that would send the RST_STREAM is the one that
+// ended, so its client still gets no frame.
 
 type h2rig848 struct {
 	s      *celeris.Server
@@ -258,6 +260,12 @@ func TestH2AsyncStreamGoexitKeepsTheLoop848(t *testing.T) {
 			if ended {
 				t.Errorf("PREMISE: the stream whose handler Goexited was answered")
 			}
+			if err == nil || !strings.Contains(err.Error(), "stream reset: INTERNAL_ERROR") {
+				t.Errorf("/aboom: err %v, want its stream reset with INTERNAL_ERROR (celeris#889), not left to the client's timeout", err)
+			}
+			if errs != 1 {
+				t.Errorf("%d error records for one Goexit, want 1 (the processor's, with the stack)", errs)
+			}
 			if answered != tried {
 				t.Errorf("an async h2 route's Goexit ended a loop: %d of %d fresh conns were answered afterwards", answered, tried)
 			}
@@ -434,7 +442,7 @@ func TestH2InlineShapesGoexitAreLoud848(t *testing.T) {
 						t.Errorf("engine attr = %q, want one of %v", got, a.engine)
 					}
 					if s1 != "timeout" {
-						t.Errorf("stream 1 = %s, want timeout (no response, no RST_STREAM)", s1)
+						t.Errorf("stream 1 = %s, want timeout (the stream is reset, but the loop that would send it ended)", s1)
 					}
 					if s3 != "timeout" && s3 != "err:EOF" {
 						t.Errorf("stream 3 on the same connection = %s: the loop is dead, so it must not be answered", s3)
@@ -469,8 +477,8 @@ func TestH2AsyncPostGoexitKeepsTheLoop848(t *testing.T) {
 			if r.hits.Load() != 1 {
 				t.Fatalf("INJECTION: /apboom ran %d times, want 1", r.hits.Load())
 			}
-			if s1 != "timeout" {
-				t.Errorf("stream 1 = %s, want timeout (no response, no RST_STREAM)", s1)
+			if s1 != "rst:INTERNAL_ERROR" {
+				t.Errorf("stream 1 = %s, want rst:INTERNAL_ERROR (celeris#889)", s1)
 			}
 			if s3 != "ended" {
 				t.Errorf("stream 3 on the same connection = %s, want ended: the connection keeps serving its other streams", s3)
@@ -491,7 +499,7 @@ func TestH2AsyncPostGoexitKeepsTheLoop848(t *testing.T) {
 // TestH2OverBudgetStreamGoexitKeepsTheLoop848: a sync route's stream on a
 // connection that holds OutboundBudget bytes of response data runs on the h2
 // worker pool (Processor.runHandler), so the loop survives its Goexit, the
-// stream gets no answer and nothing is logged. The client does not read: /fill
+// stream is reset and the Goexit logged once (celeris#889). The client does not read: /fill
 // (a 5 MiB response, window 65,535) leaves the connection over the budget;
 // then /boom is sent on the same connection. If the budget had not been
 // reached, /boom would run on the loop and the loop-exit check below fails.
@@ -535,8 +543,11 @@ func TestH2OverBudgetStreamGoexitKeepsTheLoop848(t *testing.T) {
 			if exitsEarly != 0 || exits != 0 {
 				t.Fatalf("celeris#848: /boom produced loop-exit records (%d, then %d): it ran on the loop, so the connection was not over its outbound budget", exitsEarly, exits)
 			}
-			if boomEnded || boomReset {
-				t.Errorf("stream 3 got a response or a RST_STREAM (ended=%v reset=%v %v), want neither", boomEnded, boomReset, boomRst)
+			if boomEnded || !boomReset || boomRst != http2.ErrCodeInternal {
+				t.Errorf("stream 3: ended=%v reset=%v (%v), want no response and a RST_STREAM(INTERNAL_ERROR) (celeris#889)", boomEnded, boomReset, boomRst)
+			}
+			if errs != 1 {
+				t.Errorf("%d error records for one Goexit, want 1", errs)
 			}
 			if !fillDone {
 				t.Errorf("the buffered /fill response did not arrive whole after the windows were granted: the connection is not served")

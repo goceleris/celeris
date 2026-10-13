@@ -1102,8 +1102,10 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 }
 
 // canRunInline returns true if the stream can be executed inline on the event
-// loop. Eligible: END_STREAM set (GET/HEAD), no CONTINUATION pending,
-// connection window > 0 (can send response immediately).
+// loop. Eligible: the request has ended (EndStream, which every frame path sets
+// before runHandler, whatever the request carried: a POST with a body is as
+// eligible as a GET), no CONTINUATION pending, and a route that is not async.
+// The connection's outbound budget is checked in runHandler, not here.
 func (p *Processor) canRunInline(stream *Stream) bool {
 	if !stream.EndStream || p.continuationActive.Load() {
 		return false
@@ -1153,9 +1155,10 @@ func (p *Processor) streamRouteAsync(stream *Stream) bool {
 	return p.asyncResolver.RouteAsync(method, path)
 }
 
-// runHandler dispatches the stream handler. For inline-eligible streams
-// (GET/HEAD with END_STREAM), executes synchronously on the event loop.
-// Otherwise dispatches to the worker pool for concurrent execution.
+// runHandler dispatches the stream handler. A stream whose request has ended
+// (canRunInline) and whose connection is within the outbound budget runs
+// synchronously on the event loop; any other goes to the worker pool for
+// concurrent execution.
 func (p *Processor) runHandler(stream *Stream) {
 	if p.handler == nil {
 		return
