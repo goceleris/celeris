@@ -54,10 +54,11 @@ jobs:
   coverage:
     name: Coverage (root + middleware sub-modules)
     runs-on: ubuntu-latest
-    # 40, not 30: the root step may run 1200 s (20 min), the iouring step up to
-    # 480 s and the four middleware steps up to 120 s each, which is 36 min at
-    # their own limits before checkout and setup-go. Refs #890.
-    timeout-minutes: 40
+    # 30: the root step may run 540 s, the iouring step up to 480 s and the four
+    # middleware steps up to 120 s each, which is 25 min at their own limits
+    # before checkout and setup-go (it was 40 while the root step's limit was
+    # 1200 s). Refs #890.
+    timeout-minutes: 30
     env:
       # ci.yml's unit selection (see "Same packages as ci.yml" below).
       COVER_EXCLUDE: "/test/|/adaptive($|/)|/middleware/websocket($|/)"
@@ -120,10 +121,23 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE "$COVER_EXCLUDE" | grep -vE "$COVER_OWN_STEP")
-          # -timeout=1200s: the root package takes about 590 s under coverage (runs
-          # 38257771033 and 38280491235), so 1200 s keeps 2x headroom. Refs #890.
+          # celeris#890: the 41 slowest root-package tests (.github/root-test-shards.txt)
+          # run in the `coverage-root-shard` jobs, each with its own profile and its
+          # own upload under the `root` flag; Codecov adds the uploads of one commit
+          # together. Everything NOT listed runs here. The guard is ci.yml's.
+          # This step runs without -v and has no tally: that each shard test runs once,
+          # in its shard only, rests on `-skip` below (which ci.yml's Unit step
+          # checks with `tally-rest` on a -v log, same regex) and on the shards' own
+          # `tally-shard`, not on a check here.
+          .github/scripts/root-shards.sh check
+          skip=$(.github/scripts/root-shards.sh skip-regex)
+          # -timeout=540s: the tests that stay here took 176.4 s under coverage on the
+          # runner (run 38348908034; 620.8 s for the whole package before the shards,
+          # run 38327908174), so 540 s keeps a margin of 3x. A new root test that is
+          # in no shard lands here until it is listed in .github/root-test-shards.txt.
+          # Refs #890.
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
-          go test -race -count=1 -timeout=1200s -covermode=atomic \
+          go test -race -count=1 -timeout=540s -covermode=atomic -skip "$skip" \
             -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
       # ./internal/engine/iouring on its own, as ci.yml's unit job runs it.
       # io_uring charges ring memory to the user, so every test process of the
@@ -230,6 +244,60 @@ jobs:
           files: ${{ runner.temp }}/cover-protobuf.out
           flags: protobuf
           name: protobuf
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: true
+
+  # celeris#890: the root package's slowest tests (.github/root-test-shards.txt),
+  # one shard per runner, as ci.yml's `unit-root-shard` runs them (own runner,
+  # own 8 MiB memlock). Each shard writes a profile of the root package for its
+  # tests and uploads it under the `root` flag; the `coverage` job uploads the
+  # rest under the same flag, and Codecov adds the uploads of a commit together
+  # (codecov.yml waits for all seven). The shard's tests must each run and PASS
+  # by name, as in ci.yml. Not a required check, like the job above.
+  #
+  # -timeout=660s: the shards took 215.5 s (a) and 221.2 s (b) under coverage on
+  # the runner (run 38348908034), so 660 s keeps a margin of 3x.
+  coverage-root-shard:
+    name: Coverage root shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every shard named in .github/root-test-shards.txt (the guard in the
+        # `coverage` job's root step fails when the two differ).
+        shard: [a, b]
+    permissions:
+      contents: read # checkout
+      id-token: write # Codecov upload over OIDC, as the job above
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2"
+      - name: Root package — shard tests with a coverage profile
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          run=$(.github/scripts/root-shards.sh run-regex "$SHARD")
+          go test -race -count=1 -timeout=660s -covermode=atomic -v -run "$run" \
+            -coverprofile="$RUNNER_TEMP/cover-root-$SHARD.out" . 2>&1 | tee /tmp/shard.log
+          .github/scripts/root-shards.sh tally-shard "$SHARD" /tmp/shard.log
+          blocks=$(grep -vc '^mode: ' "$RUNNER_TEMP/cover-root-$SHARD.out" || true)
+          echo "cover-root-$SHARD.out: $blocks blocks"
+          [ "$blocks" -gt 0 ]
+      - name: Upload root (shard)
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-root-${{ matrix.shard }}.out
+          flags: root
+          name: root-shard-${{ matrix.shard }}
           disable_search: true
           fail_ci_if_error: true
           use_oidc: true
