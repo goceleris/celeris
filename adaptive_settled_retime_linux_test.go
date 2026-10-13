@@ -145,8 +145,9 @@ func envInt589(name string, def int) int {
 // celeris#593 TryLock put back to a blocking Lock the io_uring half still
 // passed (10/10 at 0.315-0.351 against 0.000-0.001 on the fixed tree). It now
 // fails when more than stall592IOUringMaxQueuedFrac of the post-promotion
-// /ping samples waited for a blocked Set. The bar is provisional: see the
-// constant.
+// /ping samples waited for a blocked Set, in the settled arm and in both
+// controls (assertCtlWorkerFree628: with the TryLock reverted they passed too,
+// at 0.324-0.337). The bar is provisional: see the constant.
 //
 // The observable follows the two binding adversarial-review corrections on the
 // issue: the PRIMARY assertion is the dispatch STATE after the route has turned
@@ -634,6 +635,18 @@ func releaseClockStub592() { stubbedNowOn.Store(false) }
 // window, because a worker serves its /kv conns serially before the probe), so
 // there the ratio is at or below 1.
 func assertCtlWorkerFree628(o stall589Obs) error {
+	// io_uring: a worker pinned in the timeout sweep (celeris#593) leaves the
+	// median of the /ping samples untouched and costs a third of them a whole
+	// Set, so the ratio below passes under it (the TryLock reverted: both
+	// controls PASS with 0.324-0.337 of their samples over D/2). The same
+	// fraction as the settled arm's bar judges them (celeris#886 item 1); it
+	// needs no reference window, so it comes first.
+	if o.engine == "iouring" && o.queuedFrac > stall592IOUringMaxQueuedFrac {
+		return fmt.Errorf("iouring: %d of %d /ping samples (%.3f) waited for a blocked Set (over %v), want <= %.2f, "+
+			"while every /kv conn is async-dispatched (async_promoted_conns=%d kv_conns=%d): the worker is pinned in "+
+			"checkTimeouts on a detachMu held across the slow handler — the celeris#593 shape",
+			o.queued, o.samples, o.queuedFrac, o.queuedBar, stall592IOUringMaxQueuedFrac, o.asyncPromotedConns, o.kvConns)
+	}
 	if o.kvSamples < stall592MinCtlRefSamples || o.pingMed <= 0 {
 		return nil
 	}
