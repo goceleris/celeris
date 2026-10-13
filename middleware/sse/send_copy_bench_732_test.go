@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 // The cost of the copies Send makes of what it keeps (celeris#732): one
@@ -46,4 +47,40 @@ func BenchmarkSendBurstQueued732(b *testing.B) {
 
 func BenchmarkSendBurstQueuedRing732(b *testing.B) {
 	benchSendBurst732(b, Config{MaxQueueDepth: 2 * burst732, ReplayStore: NewRingBuffer(1024)})
+}
+
+// BenchmarkSendDropFullQueue is the cost of a queued Send the default
+// slow-client policy drops (celeris#888 item 21): the drain is parked at a
+// gated Write, the queue is full, and every Send is dropped. Before the drop
+// skipped the copy it was one allocation of the event's size per Send.
+func BenchmarkSendDropFullQueue(b *testing.B) {
+	ctx, _ := celeristest.NewContext("GET", "/events")
+	gs := newGatedStreamer()
+	testhooks.Stream(ctx).ResponseWriter = gs
+	defer celeristest.ReleaseContext(ctx)
+	e := Event{ID: "42", Event: "update", Data: strings.Repeat("x", 64)}
+	handler := New(Config{
+		HeartbeatInterval: -1,
+		MaxQueueDepth:     8,
+		Handler: func(client *Client) {
+			defer gs.release()
+			_ = client.Send(e)
+			<-gs.writeReachedOnce
+			for range cap(client.queue) {
+				_ = client.Send(e)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				_ = client.Send(e)
+			}
+			b.StopTimer()
+			if client.DroppedEvents() < uint64(b.N) {
+				b.Errorf("%d drops for %d Sends", client.DroppedEvents(), b.N)
+			}
+		},
+	})
+	if err := handler(ctx); err != nil {
+		b.Fatal(err)
+	}
 }

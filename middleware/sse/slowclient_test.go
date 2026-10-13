@@ -279,14 +279,20 @@ func TestSlowClientClose(t *testing.T) {
 }
 
 // TestSlowClientBlockPolicy verifies ClientPolicyBlock falls through to a blocking
-// queue send: total Send time stretches to at least the gate-release delay
-// because at least one Send must wait on drain to free a slot.
+// queue send: the Sends cannot finish before the gate is released, because at
+// least one Send must wait on drain to free a slot.
 func TestSlowClientBlockPolicy(t *testing.T) {
 	ctx, gs := newGatedContext(t)
 	const queueSize = 2
 	const total = 8
 	const gateDelay = 30 * time.Millisecond
 
+	// The gate opens gateDelay after gateStart, and no Send can finish
+	// blocking before it opens, so time measured from gateStart, taken before
+	// the gate's goroutine starts, is at least gateDelay however late the
+	// handler starts (celeris#888 item 14: a clock the handler started later
+	// than the gate's timer needed slack and still failed in CI).
+	gateStart := time.Now()
 	go func() {
 		time.Sleep(gateDelay)
 		gs.release()
@@ -300,21 +306,19 @@ func TestSlowClientBlockPolicy(t *testing.T) {
 			return ClientPolicyBlock
 		},
 		Handler: func(client *Client) {
-			start := time.Now()
 			for range total {
 				if err := client.Send(Event{Data: "x"}); err != nil {
 					t.Errorf("Send under ClientPolicyBlock returned %v", err)
 				}
 			}
-			blockedFor = time.Since(start)
+			blockedFor = time.Since(gateStart)
 		},
 	})
 	if err := handler(ctx); err != nil {
 		t.Fatal(err)
 	}
-	floor := gateDelay - 5*time.Millisecond
-	if blockedFor < floor {
-		t.Errorf("ClientPolicyBlock total Send time %v < %v — block path did not engage", blockedFor, floor)
+	if blockedFor < gateDelay {
+		t.Errorf("ClientPolicyBlock: the Sends finished %v after the gate's timer started, before the %v gate opened — block path did not engage", blockedFor, gateDelay)
 	}
 }
 
