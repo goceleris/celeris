@@ -393,7 +393,11 @@ func TestSlowClientSendNonFullQueueAllocs(t *testing.T) {
 	}()
 	client := <-ready
 
-	allocs := testing.AllocsPerRun(200, func() {
+	const budget = 1.0
+	// The least of several single-call windows, not an average over 200 calls:
+	// a tick of the Date-header goroutine (14 mallocs) inside the average would
+	// add 0.07 allocations per call to a budget of one.
+	allocs := allocsPer888(budget, func() {
 		// Drain one slot first so the next Send is non-blocking.
 		select {
 		case <-client.queue:
@@ -405,7 +409,6 @@ func TestSlowClientSendNonFullQueueAllocs(t *testing.T) {
 	gs.release() // unblock the drain goroutine so handler defer can complete
 	<-handlerDone
 
-	const budget = 1.0
 	if allocs > budget {
 		t.Fatalf("Send queued path: %.1f allocs/op, budget %.1f", allocs, budget)
 	}
@@ -456,17 +459,18 @@ var dropEvent888 = Event{ID: "42", Event: "update", Data: "payload-payload-paylo
 const allocWindows888 = 8
 
 // allocsPer888 is the fewest allocations per call of f that any of up to
-// allocWindows888 single-call windows sees. testing.AllocsPerRun counts the
+// allocWindows888 single-call windows sees, stopping at the first that is at
+// most limit. testing.AllocsPerRun counts the
 // whole process's mallocs, and internal/conn has a goroutine that allocates
 // 14 times once a second (its cached Date header), so one tick inside a
 // multi-run average reads as a fractional allocation per call. A tick lands in
 // at most one single-call window, so the least of several windows is the cost
 // of the call alone; a call that allocates in every window still reads as it.
-func allocsPer888(f func()) float64 {
+func allocsPer888(limit float64, f func()) float64 {
 	best := math.MaxFloat64
 	for range allocWindows888 {
 		best = min(best, testing.AllocsPerRun(1, f))
-		if best == 0 {
+		if best <= limit {
 			break
 		}
 	}
@@ -487,7 +491,7 @@ func TestSlowClientDropPathAllocs888(t *testing.T) {
 	var dropped, calls uint64
 	dropFullQueue(t, ctx, gs, Config{MaxQueueDepth: 4}, func(client *Client) {
 		before := client.DroppedEvents()
-		allocs = allocsPer888(func() {
+		allocs = allocsPer888(0, func() {
 			calls++
 			if err := client.Send(dropEvent888); err != nil {
 				t.Errorf("Send to a full queue under the default policy: %v", err)
