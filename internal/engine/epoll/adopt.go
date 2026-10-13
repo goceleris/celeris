@@ -232,7 +232,14 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 			l.replayCarriedAsync(cs, fd, carry.Buffered)
 			return
 		}
-		if perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, l.handler, cs.writeFn); perr != nil {
+		perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, l.handler, cs.writeFn)
+		// The replay is the recv event of this conn's first bytes and counts
+		// one, whatever the verdict (celeris#886). drainRead counts a recv
+		// after ProcessH1 too, but returns before it on an h2c upgrade and
+		// never counts a direct-body recv: a carry that is an upgrade request
+		// counts one here and its recv would have counted none.
+		l.reqBatch++
+		if perr != nil {
 			l.endCarriedReplay(cs, fd, perr)
 			return
 		}
@@ -252,6 +259,12 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
 	cs.h1State.InlineMode = true
 	perr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
+	// One request counted for the replay, whichever way it ends below: it is
+	// the recv event of this conn's first bytes (the promotion included, as
+	// in drainRead, celeris#626; celeris#886). Unlike drainRead it also counts
+	// a carry that ends in an h2c upgrade, which that path returns before
+	// counting.
+	l.reqBatch++
 	// A handler that hijacked inline has had cs released inside the Hijack
 	// call, as in drainRead, so cs is not touched again after ErrHijacked.
 	if errors.Is(perr, conn.ErrHijacked) {
@@ -304,56 +317,25 @@ func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
 //
 //   - ErrHijacked: the handler took the conn and cs is released; nothing to do.
 //   - ErrUpgradeH2C: switch the conn to HTTP/2 and send the 101 with the
-//     server preface and the answer to the upgrade request, as drainRead does
-//     (its block is the model for the flush below; loop.go is not edited here).
+//     server preface and the answer to the upgrade request (finishH1Upgrade,
+//     the block drainRead uses).
 //   - anything else (a parse error, errConnectionClose): flush what ProcessH1
 //     queued, tell the detached middleware (OnError) and close once the
-//     response has reached the kernel (closeWhenFlushed, celeris#761).
+//     response has reached the kernel (endH1Verdict, the block drainRead uses;
+//     closeWhenFlushed, celeris#761).
 //
 // Loop thread, on a conn fresh from attachAdoptedFD: no dispatch goroutine
 // exists, so the only other holder of cs.detachMu is a guarded writeFn in one
-// write. The lock is released before the close, which takes it again.
+// write.
 func (l *Loop) endCarriedReplay(cs *connState, fd int, perr error) {
 	if errors.Is(perr, conn.ErrHijacked) {
 		return
 	}
 	if errors.Is(perr, conn.ErrUpgradeH2C) {
-		if err := l.switchToH2(cs, cs.writeFn); err != nil {
-			l.closeConn(fd)
-			return
-		}
-		if cs.writePos < len(cs.writeBuf) {
-			if fErr := l.flushWrites(cs, true); fErr != nil {
-				l.closeConn(fd)
-				return
-			}
-			if cs.writePos >= len(cs.writeBuf) {
-				cs.pendingBytes = 0
-				if cs.dirty {
-					l.removeDirty(cs)
-				}
-			} else {
-				// The 101 and the preface did not all fit: the send buffer is
-				// full. A newly-H2 conn is not detached, so arm EPOLLOUT
-				// rather than the busy-polling dirty list.
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
-				l.armEpollOut(cs)
-			}
-		}
+		l.finishH1Upgrade(cs, fd, cs.writeFn)
 		return
 	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-	}
-	_ = l.flushWrites(cs, true)
-	cs.pendingBytes = 0
-	if cs.h1State != nil && cs.h1State.OnError != nil {
-		cs.h1State.OnError(perr)
-	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Unlock()
-	}
-	l.closeWhenFlushed(cs)
+	l.endH1Verdict(cs, perr)
 }
 
 // flushCarriedReplay sends the responses a replay's ProcessH1 queued, as
@@ -364,6 +346,11 @@ func (l *Loop) endCarriedReplay(cs *connState, fd int, perr error) {
 // the client sends), so the client got a truncated body and a stalled conn.
 // It also left pendingBytes at the sum of the replayed responses, which the
 // write hooks read as a backlog, and ignored a refused write.
+//
+// It stays a copy of drainRead's inline flush on purpose: one shared function
+// would put a call on the per-request path of every recv, and the copy runs
+// once per adoption (celeris#885 item 17 asks for the verdict and upgrade
+// blocks to be shared, which h1verdict.go does; this block is not one of them).
 //
 // Loop thread, on a conn fresh from attachAdoptedFD. cs.detachMu is released
 // before any close, which takes it again.

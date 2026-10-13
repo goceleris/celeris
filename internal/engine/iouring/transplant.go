@@ -212,7 +212,15 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 				return // promoted (its recv is armed), hijacked, or closed
 			}
 		} else {
-			if perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn); perr != nil {
+			perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn)
+			// The replay is the recv event of this conn's first bytes and
+			// counts one, whatever the verdict (celeris#886). handleRecv
+			// counts a recv after ProcessH1 too, but returns before it on an
+			// h2c upgrade and never counts a direct-body recv: a carry that
+			// is an upgrade request counts one here and its recv would have
+			// counted none.
+			w.reqBatch++
+			if perr != nil {
 				if !w.endCarriedReplay(cs, newFD, perr) {
 					return // hijacked (handed off) or closed on error — nothing more to arm
 				}
@@ -268,6 +276,12 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		w.promoteConnToAsync(cs, fd, stashed, &first)
 		return false
 	}
+	// Counted for every outcome but the promotion above, whose
+	// promoteConnToAsync counts it: the replay is the recv event of this
+	// conn's first bytes (celeris#886). Unlike handleRecv it also counts a
+	// carry that ends in an h2c upgrade, which that path returns before
+	// counting.
+	w.reqBatch++
 	if perr != nil {
 		// Nothing below may touch cs.h1State: an h2c upgrade has replaced it.
 		return w.endCarriedReplay(cs, fd, perr)
@@ -292,48 +306,25 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 // as HTTP/2.
 //
 //   - ErrHijacked: the handler took the conn; nothing to do.
-//   - ErrUpgradeH2C: the 101 and the preface are queued, and the conn was
-//     closed instead of switched. Switch it and send them. The send is a plain
-//     one, unlinked: the caller arms the one recv, and a SEND linked to a
-//     recv of its own would put a second recv on the fd (see handleRecv).
+//   - ErrUpgradeH2C: the 101 and the preface are queued. Switch the conn and
+//     send them (finishH1Upgrade, the block handleRecv uses). The send is a
+//     plain one, unlinked: the caller arms the one recv, and a SEND linked to
+//     a recv of its own would put a second recv on the fd.
 //   - anything else (a parse error, errConnectionClose): flush what ProcessH1
 //     queued and tell the detached middleware (OnError) under detachMu, then
-//     close, which defers behind the send until the response has gone out.
+//     close, which defers behind the send until the response has gone out
+//     (endH1Verdict, the block handleRecv uses).
 //
 // Worker thread, on a conn fresh from attachAdoptedFD: no dispatch goroutine
 // exists, so the only other holder of cs.detachMu is a guarded writeFn in one
-// write. The lock is released before the close, which takes it again.
+// write.
 func (w *Worker) endCarriedReplay(cs *connState, fd int, perr error) bool {
 	if errors.Is(perr, conn.ErrHijacked) {
 		return false
 	}
 	if errors.Is(perr, conn.ErrUpgradeH2C) {
-		if err := w.switchToH2(cs); err != nil {
-			w.closeConn(fd)
-			return false
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-		}
-		cs.recvLinked = false
-		if w.flushSend(cs) {
-			w.markDirty(cs)
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
-		return true
+		return w.finishH1Upgrade(cs, fd, false)
 	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-		_ = w.flushSend(cs)
-		if cs.h1State != nil && cs.h1State.OnError != nil {
-			cs.h1State.OnError(perr)
-		}
-		mu.Unlock()
-	} else {
-		_ = w.flushSend(cs)
-	}
-	w.closeConn(fd)
+	w.endH1Verdict(cs, fd, perr)
 	return false
 }

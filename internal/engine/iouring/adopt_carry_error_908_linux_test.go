@@ -66,7 +66,18 @@ type onErr908Handler struct {
 // loopback pair, so the first flush cannot take it whole.
 const big908 = 32 << 20
 
+// mid908 is the size of the /mid response: over what a loopback pair holds
+// when the client reads nothing and has asked for a small receive buffer,
+// and under the 4 MiB a conn may have queued (maxSendQueueBytes), so that the
+// next request on the conn is still served.
+const mid908 = 3 << 20
+
 func (h *onErr908Handler) HandleStream(ctx context.Context, s *stream.Stream) error {
+	if s.Path == "/mid" && s.ResponseWriter != nil {
+		body := bytes.Repeat([]byte{'m'}, mid908)
+		return s.ResponseWriter.WriteResponse(s, 200,
+			[][2]string{{"content-type", "text/plain"}, {"content-length", strconv.Itoa(len(body))}}, body)
+	}
 	if s.Path == "/big" && s.ResponseWriter != nil {
 		body := bytes.Repeat([]byte{'b'}, big908)
 		return s.ResponseWriter.WriteResponse(s, 200,
