@@ -615,6 +615,8 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 			}
 			if declared >= 0 {
 				attrs = append(attrs, slog.Int64("content_length", declared))
+			} else if declared == stream.DeclaredInvalid {
+				attrs = append(attrs, slog.Bool("content_length_invalid", true))
 			}
 			if err != nil {
 				attrs = append(attrs, slog.String("error", err.Error()))

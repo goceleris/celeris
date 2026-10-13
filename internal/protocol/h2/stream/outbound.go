@@ -4,7 +4,6 @@ import (
 	"context"
 	"math"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -434,26 +433,71 @@ func (m *Manager) EndOutbound(s *Stream, gen uint64, send OutboundSend) error {
 	return nil
 }
 
+// DeclaredInvalid is the content-length a response's headers declare when
+// they declare one that cannot be held to: a value that is not a plain run of
+// digits ("+5", "5.0", "abc", an empty one), or two that differ (a list such as
+// "5, 6", or two headers). Such a response is not ended when its handler
+// returns without closing the writer, it is reset (RFC 9110 §8.6 makes a
+// recipient treat the message as invalid), whatever it wrote. The declared
+// value the processor reports is -1 for none declared.
+const DeclaredInvalid int64 = -2
+
+// parseContentLength reads the content-length header values vs (one per
+// header line) as RFC 9110 §8.6 has it: a plain run of digits, or a list of
+// identical such values, which stands for that one. It returns the length, -1
+// for no content-length header, or DeclaredInvalid.
+func parseContentLength(vs []string) int64 {
+	declared := int64(-1)
+	for _, v := range vs {
+		for {
+			item, rest, more := strings.Cut(v, ",")
+			item = strings.TrimSpace(item)
+			if item == "" || len(item) > 18 {
+				return DeclaredInvalid
+			}
+			var n int64
+			for i := 0; i < len(item); i++ {
+				c := item[i]
+				if c < '0' || c > '9' {
+					return DeclaredInvalid
+				}
+				n = n*10 + int64(c-'0')
+			}
+			if declared >= 0 && declared != n {
+				return DeclaredInvalid
+			}
+			declared = n
+			if !more {
+				break
+			}
+			v = rest
+		}
+	}
+	return declared
+}
+
 // NoteStreamHeader records that s's response is a StreamWriter's: the
 // HEADERS went out without END_STREAM, so the response is not whole until its
 // handler closes the writer, and the processor settles it if the handler
 // returns without (Processor.settleStreamed). It also records the
 // content-length the headers declare, which a response ending is held to: a
-// body short of it is reset, not ended (RFC 9110 §8.6, RFC 9113 §8.1.1). A
-// HEAD response and a status that has no content (1xx, 204, 304) declare
-// none. Only atomics, so a ResponseWriter may call it with the stream's lock
-// held for reading (UseLock).
+// body that is not exactly that long is reset, not ended (RFC 9110 §8.6,
+// RFC 9113 §8.1.1), and so is any body of a content-length that is not a plain
+// number (DeclaredInvalid). A HEAD response and a status that has no content
+// (1xx, 204, 304) declare none. Only atomics, so a ResponseWriter may call it
+// with the stream's lock held for reading (UseLock).
 func (s *Stream) NoteStreamHeader(status int, headers [][2]string) {
 	declared := int64(-1)
 	if !s.IsHEAD && status >= 200 && status != 204 && status != 304 {
+		var one [1]string // the usual single content-length costs no allocation
+		vs := one[:0]
 		for _, h := range headers {
-			if len(h[0]) != len("content-length") || !strings.EqualFold(h[0], "content-length") {
-				continue
+			if len(h[0]) == len("content-length") && strings.EqualFold(h[0], "content-length") {
+				vs = append(vs, h[1])
 			}
-			if n, err := strconv.ParseInt(strings.TrimSpace(h[1]), 10, 64); err == nil && n >= 0 {
-				declared = n
-			}
-			break
+		}
+		if len(vs) > 0 {
+			declared = parseContentLength(vs)
 		}
 	}
 	s.respDeclared.Store(declared + 1)
@@ -487,13 +531,15 @@ const (
 	// outcomeComplete: a streamed response that was not closed, with every
 	// byte its headers declared (or none declared) written: it can be ended.
 	outcomeComplete
-	// outcomeShort: a streamed response that was not closed and is short of
-	// its declared content-length: it must not be ended.
+	// outcomeShort: a streamed response that was not closed and whose body is
+	// not as long as its headers declared (short of it, or over it; or the
+	// declaration cannot be held to, DeclaredInvalid): it must not be ended.
 	outcomeShort
 )
 
 // responseOutcome reports how s's response stands, with the body bytes a
-// StreamWriter wrote and the content-length it declared (-1 for none). A
+// StreamWriter wrote and the content-length it declared (-1 for none,
+// DeclaredInvalid for one that cannot be held to). A
 // response that is not a StreamWriter's costs two atomic loads and no lock.
 func (s *Stream) responseOutcome() (o responseOutcome, written, declared int64) {
 	declared = -1
@@ -512,7 +558,7 @@ func (s *Stream) responseOutcome() (o responseOutcome, written, declared int64) 
 	switch {
 	case fl&flagRespEnded != 0:
 		return outcomeSettled, written, declared
-	case fl&flagRespFailed != 0:
+	case fl&flagRespFailed != 0, declared == DeclaredInvalid:
 		return outcomeShort, written, declared
 	case declared < 0 || declared == written:
 		return outcomeComplete, written, declared

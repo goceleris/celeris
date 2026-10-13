@@ -33,18 +33,21 @@ type Hijacker interface {
 //   - a handler that streamed its response (a StreamWriter) and returned
 //     without closing it has the stream ended with END_STREAM when the
 //     response is complete (the headers are out and, for a declared
-//     content-length, that many bytes were written; with none declared it is
-//     complete whatever it wrote), and reset with RST_STREAM(INTERNAL_ERROR)
-//     when it is short of its declared length, so a truncated body never looks
-//     complete (RFC 9110 §8.6);
+//     content-length, exactly that many bytes were written; with none
+//     declared it is complete whatever it wrote), and reset with
+//     RST_STREAM(INTERNAL_ERROR) when its body is not as long as it declared
+//     (short of it or over it, or the declaration is not a plain number), so a
+//     truncated body never looks complete (RFC 9110 §8.6);
 //   - a handler that returns an error having sent nothing, panics (a panic that
 //     escapes the router, which answers a handler's panic with a 500 first) or
 //     calls runtime.Goexit has its stream reset with RST_STREAM(INTERNAL_ERROR),
-//     unless its response was already whole.
+//     unless its response was already whole (written whole, or its writer
+//     closed: END_STREAM is then sent, or queued behind DATA that waits for the
+//     peer's window, and the stream stays until that is out).
 //
 // The RST_STREAM is queued behind the frames the stream already queued
 // (Resetter). H2Config.Logger gets a Warn for a stream the processor resets
-// after a return (a body short of its declared length, an error return, a
+// after a return (a body not as long as its declared length, an error return, a
 // response the router saw break off), a Debug for one it ends, and an Error with
 // the stack for a panic and for a Goexit, which reset the stream with no Warn of
 // their own; Processor.OnHandlerPanic, OnHandlerGoexit and OnHandlerUnfinished
@@ -188,7 +191,8 @@ type Streamer interface {
 // goroutine, the event loop and a pool handler's alike. The processor uses it
 // when a handler is over without having finished its response; a writer
 // without it (a test recorder) falls back to H2Controller.WriteRSTStreamPriority,
-// which belongs to the event loop.
+// which belongs to the event loop: used for a stream whose handler ran there,
+// while a pool stream is only cancelled.
 type Resetter interface {
 	ResetStream(stream *Stream, code http2.ErrCode)
 }

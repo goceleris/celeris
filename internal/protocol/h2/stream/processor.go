@@ -268,7 +268,8 @@ type Processor struct {
 	// having finished its response (celeris#889): the stream's id, whether the
 	// processor reset the stream (true: RST_STREAM) or ended it (false:
 	// END_STREAM, for a complete response that was not closed), the body bytes
-	// the handler wrote, the content-length it declared (-1: none) and the
+	// the handler wrote, the content-length it declared (-1: none; DeclaredInvalid: one that
+	// cannot be held to, such as "+5" or "5, 6") and the
 	// error it returned, if any. It runs on the goroutine that ran the
 	// handler, after the stream was ended or reset, and must not block. Set it
 	// before the first frame.
@@ -360,8 +361,11 @@ func (p *Processor) resetHandlerStream(stream *Stream) {
 		w.ResetStream(stream, http2.ErrCodeInternal) // cancels the stream as well
 	default:
 		// A writer that cannot queue behind the stream's frames (a test
-		// recorder): the connection's own, which is the event loop's.
-		if p.connWriter != nil {
+		// recorder): the connection's own, which is the event loop's, so only
+		// for a stream whose handler ran there. A pool stream is cancelled
+		// and nothing is written: the connection's writer is not safe from a
+		// pool goroutine.
+		if p.connWriter != nil && !stream.RunsOnPool() {
 			_ = p.connWriter.WriteRSTStreamPriority(stream.ID, http2.ErrCodeInternal)
 		}
 		stream.Cancel()
@@ -371,11 +375,13 @@ func (p *Processor) resetHandlerStream(stream *Stream) {
 // settleStreamed runs when a handler that streamed its response returned
 // without closing the writer. Go's net/http ends a response when its handler
 // returns, so a response that is complete is ended with END_STREAM: the headers
-// are out and, for a declared content-length, that many bytes were written (a
-// response with none declared is complete whatever it wrote). A body short of
-// the declared length is reset instead, never ended: END_STREAM would make a
-// truncated body look complete to the client (celeris#965). Either way the peer
-// is no longer left waiting for its own timeout. The caller has ended the
+// are out and, for a declared content-length, exactly that many bytes were
+// written (a response with none declared is complete whatever it wrote). A body
+// that is not as long as declared is reset instead, never ended: END_STREAM
+// would make a truncated body look complete to the client (celeris#965). The
+// same goes for a body longer than declared, and for a declaration that cannot
+// be held to (a content-length that is not a plain number: DeclaredInvalid).
+// Either way the peer is no longer left waiting for its own timeout. The caller has ended the
 // stream's use (EndUse), so the writer's own calls are refused from here on;
 // Streamer.Close takes the use token afresh.
 func (p *Processor) settleStreamed(stream *Stream) {
@@ -402,7 +408,8 @@ func (p *Processor) settleStreamed(stream *Stream) {
 
 // settleFailed runs when a handler is over without having answered: it
 // returned an error (celeris#889), panicked, or called runtime.Goexit. Unless
-// its response is whole (written whole, or its END_STREAM is queued), the
+// its response is whole (written whole, or its END_STREAM is sent or queued
+// behind buffered DATA, which the caller then keeps the stream for), the
 // stream is reset: the peer is told, where it used to wait for its own
 // timeout. handled says the panic or Goexit hook has already told of it, so
 // OnHandlerUnfinished does not count it again.
@@ -1242,10 +1249,12 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 			p.handlerPanicked(stream.ID, r)
 			stream.EndUse()
 			p.settleFailed(stream, nil, true)
+			keepAlive = stream.AbandonOutbound()
 		} else if !returned {
 			p.handlerGoexited(stream.ID)
 			stream.EndUse()
 			p.settleFailed(stream, nil, true)
+			keepAlive = stream.AbandonOutbound()
 		}
 
 		if stream.Data != nil {
@@ -1289,6 +1298,10 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 		// Nothing answered, or a response begun and not finished: the stream
 		// is reset instead of left to the client's own timeout (celeris#889).
 		p.settleFailed(stream, err, false)
+		// A response the handler closed while its tail waited for the peer's
+		// window is whole: the stream stays for the flush that sends the tail
+		// and its END_STREAM. A reset one has nothing buffered any more.
+		keepAlive = stream.AbandonOutbound()
 		return
 	}
 

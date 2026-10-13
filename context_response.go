@@ -1922,12 +1922,13 @@ func (sw *StreamWriter) Close() error {
 // On HTTP/2 a handler that returns without calling Close does not leave the
 // client waiting, as net/http does not either: on the native engines the
 // stream is ended with END_STREAM when the response is complete (the headers
-// are sent and, for a declared content-length, that many bytes were written;
+// are sent and, for a declared content-length, exactly that many bytes were written;
 // with none declared it is complete whatever was written) and reset with
-// RST_STREAM (INTERNAL_ERROR) when it is not: a body short of its declared
-// content-length, or a handler that panicked, returned an error or called
+// RST_STREAM (INTERNAL_ERROR) when it is not: a body not as long as its declared
+// content-length (short of it or over it, or a content-length that is not a
+// plain number), or a handler that panicked, returned an error or called
 // runtime.Goexit after its headers went out. END_STREAM is never sent for a
-// body that is short of its declared length. The reset is logged through
+// body that is not as long as its declared length. The reset is logged through
 // [Config].Logger, and the end of an unclosed complete response at Debug level.
 func (c *Context) StreamWriter() *StreamWriter {
 	// Streaming is fundamentally incompatible with response buffering:
