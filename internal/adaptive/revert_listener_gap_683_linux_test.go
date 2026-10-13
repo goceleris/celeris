@@ -38,9 +38,13 @@ type lateEpoll683 struct {
 	*epoll.Engine
 	delay time.Duration
 	calls atomic.Int32
+	// calledAt is the time.Now().UnixNano() of the first ResumeAccept: the
+	// moment the switch leaves the resume and enters awaitIncomingListener.
+	calledAt atomic.Int64
 }
 
 func (l *lateEpoll683) ResumeAccept() error {
+	l.calledAt.CompareAndSwap(0, time.Now().UnixNano())
 	l.calls.Add(1)
 	go func() {
 		time.Sleep(l.delay)
@@ -62,7 +66,9 @@ func installLateEpoll683(t *testing.T, e *Engine, delay time.Duration) *lateEpol
 	}
 	l := &lateEpoll683{Engine: ep, delay: delay}
 	e.switchMu.Lock()
+	e.slotsMu.Lock()
 	e.primary = l
+	e.slotsMu.Unlock()
 	e.ctrl.primary = l
 	e.switchMu.Unlock()
 	if e.ActiveEngine().Type() == engine.Epoll {
@@ -225,9 +231,12 @@ func TestPromotionKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing
 
 	forceSwitchTo(t, e, engine.IOUring) // builds the standby
 	forceSwitchTo(t, e, engine.Epoll)
-	// io_uring's pause closes its listeners at once, and a worker that has
-	// not yet parked sees a resume only after its current ring wait (up to a
-	// second): let them park, so the next promotion is a plain late resume.
+	// io_uring's pause closes its listeners at once. Before celeris#886 a
+	// worker that had not yet parked saw a resume only after its current ring
+	// wait (up to a second), and this sleep let them park so that the next
+	// promotion was a plain late resume. ResumeAccept now signals the wake
+	// eventfd, so a worker that has not parked no longer lags; the sleep stays
+	// so the test starts from the state the revert test starts from.
 	time.Sleep(2500 * time.Millisecond)
 	onlyEpoll, err := listenInodes(port)
 	if err != nil {
@@ -241,7 +250,9 @@ func TestPromotionKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing
 	}
 	late := &lateIOUring683{Engine: io, delay: 20 * time.Millisecond}
 	e.switchMu.Lock()
+	e.slotsMu.Lock()
 	e.secondary = late
+	e.slotsMu.Unlock()
 	e.ctrl.secondary = late
 	e.switchMu.Unlock()
 	e.mu.Unlock()
@@ -323,6 +334,72 @@ func TestSwitchWaitForTheIncomingListenerDoesNotBlockDriverRegistration683(t *te
 	if reg > delay/4 {
 		t.Errorf("celeris683 LOCK: a driver registration took %v during the switch's wait (delay %v): "+
 			"the wait holds freezeState", reg, delay)
+	}
+	if got := e.ActiveEngine().Type(); got != engine.Epoll {
+		t.Errorf("the switch left %v active, want epoll", got)
+	}
+}
+
+// Nor does Engine.Metrics() (hence Server.EngineInfo and the observe collector)
+// sit behind the wait: it takes only slotsMu for the two sub-engine slots, and
+// nothing holds slotsMu across the wait. Read under e.mu, it sat out the rest
+// of the late engine's delay (celeris#886 item 12).
+func TestSwitchWaitForTheIncomingListenerDoesNotBlockMetrics683(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	e, _, stop := s0Bind(t, resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1, DisableDeferAccept: true,
+		Resources: resource.Resources{Workers: 2}}, respHandler{})
+	defer stop()
+	port := e.Addr().(*net.TCPAddr).Port
+	forceSwitchTo(t, e, engine.IOUring)
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := listenInodes(port); err != nil {
+		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
+	}
+	const delay = 150 * time.Millisecond
+	late := installLateEpoll683(t, e, delay)
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		t0 := time.Now()
+		e.ForceSwitch()
+		done <- time.Since(t0)
+	}()
+	// Enter the wait before reading: the switch has resumed the incoming
+	// engine (its ResumeAccept ran) and the late listener is not up yet. A
+	// fixed sleep would let a descheduled switch goroutine run Metrics()
+	// before performSwitch takes e.mu, and the unfixed code would pass.
+	for late.calls.Load() == 0 {
+		select {
+		case w := <-done:
+			if late.calls.Load() == 0 {
+				t.Fatalf("celeris683 PREMISE: the switch ended after %v without resuming the late engine", w)
+			}
+			done <- w // resumed and already over: the checks below say what that means
+		case <-time.After(time.Millisecond):
+		}
+	}
+	time.Sleep(10 * time.Millisecond) // past the resume, into awaitIncomingListener
+	t0 := time.Now()
+	inWait := t0.UnixNano() - late.calledAt.Load()
+	m := e.Metrics()
+	took := time.Since(t0)
+	wall := <-done
+	t.Logf("celeris683 METRICS: Metrics() started %v after the resume and took %v (Workers %d); the switch took %v",
+		time.Duration(inWait), took, m.Workers, wall)
+	if inWait < 0 || time.Duration(inWait) >= delay {
+		t.Fatalf("celeris683 PREMISE: Metrics() started %v after the resume, outside the late engine's %v delay", time.Duration(inWait), delay)
+	}
+	if wall < delay/2 {
+		t.Fatalf("celeris683 PREMISE: the switch took %v, it did not wait for the late engine (delay %v)", wall, delay)
+	}
+	if m.Workers == 0 {
+		t.Errorf("celeris683 METRICS: Metrics() read no sub-engine (Workers 0)")
+	}
+	if took > delay/4 {
+		t.Errorf("celeris683 METRICS: Metrics() took %v during the switch's wait (delay %v): "+
+			"the wait holds the lock Metrics() takes", took, delay)
 	}
 	if got := e.ActiveEngine().Type(); got != engine.Epoll {
 		t.Errorf("the switch left %v active, want epoll", got)
@@ -418,6 +495,54 @@ func TestListenWatchWaitsForANewListenerAndTimesOut683(t *testing.T) {
 	}
 	if b := <-bc; b != nil {
 		_ = b.Close()
+	}
+}
+
+// A listener that appears within microseconds of the resume is seen without a
+// sleep: the wait lists again at once a few times before its first sleep,
+// which on this runtime lasts about a millisecond or more whatever the request
+// (listenWaitPoll; about 1.4 ms in the arm64 container, celeris#886). The
+// kernel list is a fake here, so the counts are exact. At least 3 and at most 8
+// immediate re-lists: a listener that shows on the 4th list is found with no
+// sleep, and one that shows on the 50th has cost no more than 8 lists without
+// one, so the wait is not a busy poll.
+func TestListenWatchListsAgainAtOnceBeforeItsFirstSleep683(t *testing.T) {
+	const minSpins, maxSpins = 3, 8
+	for _, tc := range []struct {
+		name      string
+		appearsAt int // the 1-based list that first shows the new inode
+		ok        func(lists, sleeps int) bool
+		want      string
+	}{
+		{"found on the last required immediate list", 1 + minSpins,
+			func(_, sleeps int) bool { return sleeps == 0 }, "no sleep"},
+		{"found late, still a sleeping poll", 50,
+			func(lists, sleeps int) bool { return sleeps >= lists-1-maxSpins && sleeps <= lists-1 }, "at most 8 lists without a sleep"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lists, sleeps := 0, 0
+			w := &listenWatch{port: 1, before: map[uint32]struct{}{7: {}},
+				list: func(_, _ int) (map[uint32]struct{}, error) {
+					lists++
+					if lists >= tc.appearsAt {
+						return map[uint32]struct{}{7: {}, 9: {}}, nil
+					}
+					return map[uint32]struct{}{7: {}}, nil
+				},
+				sleep: func(time.Duration) { sleeps++ },
+			}
+			_, ok, err := w.wait(time.Hour)
+			if err != nil {
+				skipOrFailUpswitch662(t, "no sock_diag socket here: %v", err)
+			}
+			if !ok {
+				t.Fatalf("celeris683 SPIN: the wait gave up (%d lists, %d sleeps) with the new inode on list %d", lists, sleeps, tc.appearsAt)
+			}
+			if lists != tc.appearsAt || !tc.ok(lists, sleeps) {
+				t.Errorf("celeris683 SPIN: %d lists and %d sleeps; want the new inode seen on list %d with %s",
+					lists, sleeps, tc.appearsAt, tc.want)
+			}
+		})
 	}
 }
 
