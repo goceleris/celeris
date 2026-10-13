@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/driver/internal/eventloop"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheConnDown887(t *testing.T) {
@@ -70,5 +73,55 @@ func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheConnDown887(t *testi
 	}
 	if sc.addr != b.Addr() {
 		t.Fatalf("connectSentinel accepted %s (the sentinel that hung up and is down), want the next one, %s", sc.addr, b.Addr())
+	}
+}
+
+// gateServer is the SentinelConfig.Engine of a test that wraps the standalone
+// provider in the write gate of pubsub_ctlwrite_929_linux_test.go.
+type gateServer struct{ p engine.EventLoopProvider }
+
+func (s gateServer) EventLoopProvider() engine.EventLoopProvider { return s.p }
+
+// A conn that is down but not yet marked closed. The loop's teardown marks the
+// conn closed, forgets the descriptor, and only then runs onClose, which
+// stores redisConn.closed; a write in between gets ErrUnknownFD while
+// closed is still false. control() maps that to ErrPubSubConnDown, so the
+// PubSub is not closed and its conn does not look closed: nothing but the
+// error of the first control call itself says that the first SUBSCRIBE was
+// not sent. connectSentinel must read that error: a sentinel it accepts here
+// would be retried at this one address for ever while watchFailover sees no
+// failover, where main moved on to the next sentinel.
+func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheDescriptorForgotten887(t *testing.T) {
+	a := startFakeSentinel(t, "")
+	b := startFakeSentinel(t, "")
+	prov, err := eventloop.Resolve(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { eventloop.Release(prov) })
+	g := newWriteGate()
+	g.armFailWith(hasCmd("SUBSCRIBE"), ErrUnknownFD)
+	s := &SentinelClient{cfg: SentinelConfig{
+		MasterName:    "mymaster",
+		SentinelAddrs: []string{a.Addr(), b.Addr()},
+		DialTimeout:   2 * time.Second,
+		Engine:        gateServer{gateProvider{EventLoopProvider: prov, g: g}},
+	}}
+	sc, err := s.connectSentinel()
+	if err != nil {
+		t.Fatalf("connectSentinel: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sc.subPS.Close()
+		_ = sc.client.Close()
+	})
+	g.mu.Lock()
+	still := g.armed
+	g.mu.Unlock()
+	if still {
+		t.Fatal("fixture: the injected SUBSCRIBE failure never fired")
+	}
+	if sc.addr != b.Addr() {
+		t.Fatalf("connectSentinel accepted %s, whose first SUBSCRIBE was not sent (ErrUnknownFD: the loop forgot the conn before onClose stored closed), want the next sentinel, %s", sc.addr, b.Addr())
 	}
 }

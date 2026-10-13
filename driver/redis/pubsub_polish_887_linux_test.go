@@ -133,6 +133,45 @@ func TestConstructorKeepsThePubSubWhenTheFirstControlCallFindsTheConnDown887(t *
 	}
 }
 
+// (item 12, guard) Only ErrPubSubConnDown is kept: any other error of the
+// first control call means the command was not sent and nothing replays it, so
+// the constructor closes the PubSub and returns (nil, err), as before.
+// ErrQueueFull on a live conn is such an error. This passes on main as well;
+// the mutant whose firstControl keeps the PubSub on every error is its
+// control.
+func TestConstructorClosesThePubSubOnAnyOtherFirstControlError887(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		verb string
+		open func(r *pubsubRig, ctx context.Context) (*PubSub, error)
+	}{
+		{"Client.Subscribe", "SUBSCRIBE", func(r *pubsubRig, ctx context.Context) (*PubSub, error) {
+			return r.cl.Subscribe(ctx, "news")
+		}},
+		{"Client.PSubscribe", "PSUBSCRIBE", func(r *pubsubRig, ctx context.Context) (*PubSub, error) {
+			return r.cl.PSubscribe(ctx, "news*")
+		}},
+		{"ClusterClient.SSubscribe", "SSUBSCRIBE", func(r *pubsubRig, ctx context.Context) (*PubSub, error) {
+			cc := &ClusterClient{nodes: map[string]*clusterNode{"n": {addr: "n", client: r.cl, primary: true}}}
+			return cc.SSubscribe(ctx, "news")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPubsubRig(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			r.gate.armFailWith(hasCmd(tc.verb), ErrQueueFull)
+			ps, err := tc.open(r, ctx)
+			if ps != nil {
+				t.Cleanup(func() { closePubSub(t, ps) })
+			}
+			if ps != nil || !errors.Is(err, ErrQueueFull) {
+				t.Fatalf("%s whose first control call failed with ErrQueueFull returned (%v, %v), want (nil, ErrQueueFull)", tc.name, ps, err)
+			}
+		})
+	}
+}
+
 // (item 15) The reconnect loop's own check of the freshly installed conn
 // (after the replay) is what makes a conn that dies during the replay count
 // as a failed attempt, so the backoff keeps growing. Without it the attempt
