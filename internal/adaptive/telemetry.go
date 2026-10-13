@@ -40,6 +40,34 @@ type TelemetrySnapshot struct {
 	// large-payload threshold the workload is link-bound — the engines tie
 	// — so the controller suppresses an io_uring switch to avoid churn.
 	BytesPerReq float64
+	// ErrorDelta is the interval's growth of each Error* bucket of
+	// EngineMetrics, indexed like errorBuckets. Unlike ErrorRate it keeps
+	// ErrorSendPeerGone: it exists so a switch can be attributed to a bucket
+	// after the fact (celeris#886), and the controller logs the non-zero ones
+	// with the "engine switch recommended" line. All zero on the first sample
+	// of an engine, which has no baseline.
+	ErrorDelta [len(errorBuckets)]uint64
+}
+
+// errorBuckets is every Error* bucket of EngineMetrics that
+// engine.FillErrorClasses fills, ErrorCount (their sum) excluded, with the
+// attribute name the controller logs it under. TestSwitchLineNamesEveryErrorField886
+// fails when a bucket is added to EngineMetrics and not here.
+var errorBuckets = [...]struct {
+	name string
+	get  func(*engine.EngineMetrics) uint64
+}{
+	{"error_accept_fd_limit", func(m *engine.EngineMetrics) uint64 { return m.ErrorAcceptFDLimit }},
+	{"error_accept_cancelled", func(m *engine.EngineMetrics) uint64 { return m.ErrorAcceptCancelled }},
+	{"error_accept_other", func(m *engine.EngineMetrics) uint64 { return m.ErrorAcceptOther }},
+	{"error_conn_table_cap", func(m *engine.EngineMetrics) uint64 { return m.ErrorConnTableCap }},
+	{"error_conn_register", func(m *engine.EngineMetrics) uint64 { return m.ErrorConnRegister }},
+	{"error_listener_recreate", func(m *engine.EngineMetrics) uint64 { return m.ErrorListenerRecreate }},
+	{"error_transplant_adopt", func(m *engine.EngineMetrics) uint64 { return m.ErrorTransplantAdopt }},
+	{"error_send_peer_gone", func(m *engine.EngineMetrics) uint64 { return m.ErrorSendPeerGone }},
+	{"error_send", func(m *engine.EngineMetrics) uint64 { return m.ErrorSend }},
+	{"error_request_body", func(m *engine.EngineMetrics) uint64 { return m.ErrorRequestBody }},
+	{"error_handler", func(m *engine.EngineMetrics) uint64 { return m.ErrorHandler }},
 }
 
 // TelemetrySampler produces telemetry snapshots from an engine.
@@ -132,12 +160,15 @@ func (s *liveSampler) Sample(e engine.Engine) TelemetrySnapshot {
 	if hasPrev && hasT {
 		elapsed := now.Sub(prevT).Seconds()
 		if elapsed > 0 {
-			deltaReqs := m.RequestCount - prev.RequestCount
+			deltaReqs := satSub(m.RequestCount, prev.RequestCount)
 			deltaErrs := satSub(revertErrors(m), revertErrors(prev))
-			deltaAccepts := m.AcceptCount - prev.AcceptCount
-			deltaBytes := (m.BytesRead + m.BytesWritten) - (prev.BytesRead + prev.BytesWritten)
+			deltaAccepts := satSub(m.AcceptCount, prev.AcceptCount)
+			deltaBytes := satSub(m.BytesRead+m.BytesWritten, prev.BytesRead+prev.BytesWritten)
 			snap.ThroughputRPS = float64(deltaReqs) / elapsed
 			snap.AcceptRate = float64(deltaAccepts) / elapsed
+			for i := range errorBuckets {
+				snap.ErrorDelta[i] = satSub(errorBuckets[i].get(&m), errorBuckets[i].get(&prev))
+			}
 			if deltaReqs > 0 {
 				snap.ErrorRate = float64(deltaErrs) / float64(deltaReqs)
 				snap.BytesPerReq = float64(deltaBytes) / float64(deltaReqs)
