@@ -23,9 +23,14 @@
 // from an FS is read for each request and not hashed: it keeps the weak
 // mtime+size ETag. With [Config].Compress the validators, the 304 and the
 // range are those of the .br/.gz variant served, not of the original file it
-// was built from, so rebuilding only the variant changes them; the 304 names
-// Vary: Accept-Encoding. A request for a directory is answered with its index
-// file, and with the index file's own variant.
+// was built from, so rebuilding only the variant changes them; a file served,
+// or answered with a 304, for a request with an Accept-Encoding header names
+// Vary: Accept-Encoding, whether or not the file has a variant. A request for
+// a directory is answered with its index file, and with the index file's own
+// variant. With Root, a conditional request is answered 304 only after the
+// containment check that [celeris.Context.FileFromDir] applies to a file it
+// sends (symlinks resolved) has passed for its path, and that check runs for
+// every conditional request, whether or not its validator matches.
 //
 // A GET with a single byte range gets 206 Partial Content; a range no byte of
 // the file satisfies gets 416 Range Not Satisfiable with
