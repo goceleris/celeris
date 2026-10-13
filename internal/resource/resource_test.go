@@ -138,10 +138,10 @@ func TestNextPowerOf2(t *testing.T) {
 }
 
 func TestConfigMaxRequestBodySizeDefaults(t *testing.T) {
-	// 0 → default 100 MB
+	// 0 → default 4 MiB
 	c := Config{}.WithDefaults()
-	if c.MaxRequestBodySize != 100<<20 {
-		t.Fatalf("expected 100MB default, got %d", c.MaxRequestBodySize)
+	if c.MaxRequestBodySize != 4<<20 {
+		t.Fatalf("expected 4 MiB default, got %d", c.MaxRequestBodySize)
 	}
 
 	// Positive value preserved

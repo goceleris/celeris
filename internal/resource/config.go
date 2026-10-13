@@ -110,7 +110,8 @@ type Config struct {
 	// Listener is an optional pre-existing listener for socket inheritance.
 	Listener net.Listener
 	// MaxRequestBodySize is the maximum allowed request body size in bytes.
-	// 0 uses the default (100 MB). -1 disables the limit (unlimited).
+	// 0 uses the default (DefaultMaxRequestBodySize, 4 MiB). -1 disables the
+	// limit (unlimited).
 	MaxRequestBodySize int64
 	// AsyncHandlers dispatches HTTP handlers to spawned goroutines instead
 	// of inline execution on LockOSThread'd workers. See celeris.Config.
@@ -258,6 +259,10 @@ func (c *Config) SetH2Upgrade(enable bool) {
 	c.h2UpgradeResolved = true
 }
 
+// DefaultMaxRequestBodySize is what Config.MaxRequestBodySize resolves to when
+// it is 0: 4 MiB.
+const DefaultMaxRequestBodySize int64 = 4 << 20
+
 // WithDefaults returns a copy of Config with zero-value fields set to sensible
 // defaults.
 //
@@ -313,7 +318,13 @@ func (c Config) WithDefaults() Config {
 	case c.MaxRequestBodySize < 0:
 		c.MaxRequestBodySize = 0 // -1 → unlimited; 0 internally means unlimited
 	case c.MaxRequestBodySize == 0 && !c.defaulted:
-		c.MaxRequestBodySize = 100 << 20 // 100 MB
+		// 4 MiB, as fasthttp and Fiber default to. The body is buffered whole
+		// in memory before the handler runs, so this times the number of
+		// requests in flight is what clients can make the server hold. It was
+		// 100 MB, a sanity ceiling hardcoded in the HTTP/2 processor since
+		// v1.0.0 and in the HTTP/1 parser since v1.1.0 (celeris#96 made it
+		// configurable and kept the value).
+		c.MaxRequestBodySize = DefaultMaxRequestBodySize
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
