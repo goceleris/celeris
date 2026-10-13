@@ -969,7 +969,7 @@ func (e *Engine) performSwitch() {
 	// serving its SO_REUSEPORT share of new connections, so that a client
 	// that completed its handshake on it but had not sent its request yet
 	// is promoted and served instead of being reset by the close. Waiting
-	// would hold e.mu, and with it Metrics() and the next switch, for that
+	// would hold e.mu, and with it Shutdown and the next switch, for that
 	// long. Issued here, under e.mu, so any later switch's ResumeAccept of
 	// this engine is ordered after it; a resume during the linger restores
 	// the option on the same listeners. Inline (not in a goroutine) so unit
@@ -1128,11 +1128,16 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 //
 // It reads the two slots under switchMu, not mu: performSwitch holds mu for
 // the whole switch, including the wait for the incoming engine's listener
-// (celeris#683), and a Metrics() behind it waited out that wait (measured
-// 109 to 114 ms against 375 to 833 ns idle, celeris#886). The slots are
-// published under both locks, so switchMu alone sees them whole. Nothing holds
-// switchMu across a call to this method or for longer than a controller
-// evaluation.
+// (celeris#683), and a Metrics() behind it waited out that wait (about the
+// late engine's delay, celeris#886 item 12). The slots are published under
+// both locks, so switchMu alone sees them whole. No code path holds switchMu
+// across a call to this method for longer than a controller evaluation, with
+// one exception: evaluate logs through the configured Logger while it holds
+// switchMu (switch recommended, oscillation detected, the debug tick), so a
+// log handler that itself calls Metrics() (Server.EngineInfo) from such a
+// record would deadlock on the non-reentrant switchMu. Before this method
+// stopped taking mu the same handler already deadlocked in performSwitch's
+// own logs, which are written under mu.
 func (e *Engine) Metrics() engine.EngineMetrics {
 	e.switchMu.Lock()
 	primary := e.primary
