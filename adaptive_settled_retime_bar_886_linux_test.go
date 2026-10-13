@@ -54,3 +54,34 @@ func TestSettledRetimedIOUringBar592(t *testing.T) {
 		})
 	}
 }
+
+// TestCtlWorkerFreeIOUringBar592: the control arms (every /kv conn
+// async-dispatched, so the worker must be free) apply the same fraction on
+// io_uring. With the celeris#593 TryLock reverted both controls passed the
+// median ratio and showed 0.324-0.337 of their samples over D/2.
+func TestCtlWorkerFreeIOUringBar592(t *testing.T) {
+	obs := func(engine string, queuedFrac float64) stall589Obs {
+		return stall589Obs{
+			engine: engine, mode: stall589ExplicitAsync.String(), kvConns: 8, asyncPromotedConns: 8,
+			samples: 100, queued: int(queuedFrac * 100), queuedFrac: queuedFrac, queuedBar: stall589Delay / 2,
+			kvSamples: 0, // no reference: only the fraction is under test
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		o       stall589Obs
+		wantErr bool
+	}{
+		{"io_uring, the fixed tree (0.000)", obs("iouring", 0), false},
+		{"io_uring, the celeris#593 TryLock reverted (0.324)", obs("iouring", 0.324), true},
+		{"io_uring, the celeris#593 TryLock reverted (0.337)", obs("iouring", 0.337), true},
+		{"epoll with the same fraction is judged on its ratio", obs("epoll", 0.337), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := assertCtlWorkerFree628(tc.o)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("assertCtlWorkerFree628 = %v, want error: %v", err, tc.wantErr)
+			}
+		})
+	}
+}
