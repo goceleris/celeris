@@ -14,9 +14,11 @@ codecov:
   require_ci_to_pass: false
   notify:
     wait_for_ci: false
-    # One upload per module: root, compress, metrics, otel, protobuf. Waiting
-    # for all five keeps Codecov from posting a partial, misleading number.
-    after_n_builds: 5
+    # Seven uploads per commit: root (the coverage job's), the two root-package
+    # shards (coverage-root-shard jobs, also flagged root; celeris#890),
+    # compress, metrics, otel, protobuf. Waiting for all seven keeps Codecov
+    # from posting a partial, misleading number.
+    after_n_builds: 7
 
 coverage:
   precision: 2

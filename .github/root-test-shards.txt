@@ -1,0 +1,59 @@
+# Root-package test shards (celeris#890). One `<shard> <TestName>` per line; # lines are comments.
+#
+# The root package's tests run one after another: 543 top-level tests, ~550 s of test time, 596 s wall on
+# the Unit job's runner under -race (CI run 38344043158, job 115121232279). The tests below are the ones
+# that took 3 s or more there (41 of the 43). Two stay out on purpose: TestAdaptiveSettledRouteRetime592
+# (the Unit job's allow-list and the Coverage job's epoll arms need it in the rest) and
+# TestEnableH2UpgradeMatrix889 (internal/engine/std defines a test of that name too, which -skip would skip).
+# Each shard runs in a job of its own, on its own runner (own 8 MiB RLIMIT_MEMLOCK, which two processes of one runner would
+# share), and everything NOT listed here runs in the job that always ran the root package, through
+# `go test -skip`. So a test that is in no list still runs; a test listed here runs in its shard only.
+#
+# .github/scripts/root-shards.sh check (run by both workflows) fails when a name below is not a test of the
+# root package any more (renamed or removed), is listed twice, is also defined in another package (the
+# Unit job's -skip would skip that one too), or when a workflow's `shard:` matrix lacks a shard named here.
+# Add a test when it takes 3 s or more; keep the shards within ~10% of each other (the CI seconds below).
+#
+# shard a: ~221 s of CI test time, shard b: ~218 s; the rest: ~114 s (incl. TestAdaptiveSettledRouteRetime592, 37 s).
+
+a TestUnmatchedChainGoexitIsLoud848
+a TestShutdownHooksRunAfterTheDrain
+a TestH2SilentClientCannotPinResponseBodies893
+a TestUnrecognisedBytesAreNotHeld974
+a TestStalledPreDetectionConnIsReaped974
+a TestH2CUnmatchedThroughTimeoutSingleflight836
+a TestIouringStalledAsyncSendDoesNotBusyPollThroughTheServer811
+a TestHeaderBudgetSpansDetection
+a TestStreamWriterWriteErrorAfterPeerGoneH1_875
+a TestHijackThenDetachOnEveryEngine
+a TestServerMixedAsync_ConcurrentNoCrosstalk
+a TestStreamWriterFlushH1_875
+a TestH2AsyncStreamGoexitKeepsTheLoop848
+a TestShutdownWaitsForFlowControlledH2Response
+a TestSplitH2CPrefaceAnswered870
+a TestSpentBudgetReturnsItsRingBuffer
+a TestExpectContinueCallbackOfAPromotedConnKeepsTheLoop848
+a TestSplitFirstSegmentHTTP1Answered870
+a TestEmptyLineBetweenKeepAliveRequests
+a TestShutdownH2PoolWaitIsBounded
+a TestH2SendPathsHonourThePeersWindows904
+b TestH2InlineShapesGoexitAreLoud848
+b TestCallbackGoexitIsLoud848
+b TestSyncRouteGoexitIsLoud848
+b TestShutdownSendsTheWholeResponse
+b TestStalledSSEEndsWithShutdown855
+b TestStalledSSEEndsWhenItsHandlerIsBounded855
+b TestH2InlineStreamGoexitIsLoud848
+b TestShutdownSendDrainIsBounded
+b TestLeadingEmptyLineIsIgnored
+b TestBackloggedPeerIsClosed
+b TestSSEEndedStreamKeepsConnectionTimeouts855
+b TestH2LockHeldAcrossAWaitingStreamWriteDoesNotWedgeTheServer904
+b TestH2AsyncPostGoexitKeepsTheLoop848
+b TestH2LockHeldAcrossAWaitingWriteDoesNotWedgeTheServer893
+b TestLargeResponseIsDelivered
+b TestH2HandlerWaitingForWindowIsBoundedByWriteTimeout893
+b TestGlobalMiddlewareOfAnAsyncRouteKeepsTheLoop848
+b TestH2MaxConcurrentStreamsHeadersContinuation981
+b TestNoDeprecatedPublicAPI830
+b TestHijackedConnNotCutByServerTimeoutsStd855
