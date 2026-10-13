@@ -80,6 +80,27 @@ func (r *h2Return889Rig) routes(s *celeris.Server) {
 		runtime.Goexit()
 		return nil
 	}).Async()
+	// A response broken off after its headers: the router recovers the panic
+	// and cannot write its 500, and answers an error with nothing; the handler
+	// returns as if it had finished, with no content-length declared.
+	broken := func(fail func() error) celeris.HandlerFunc {
+		return func(c *celeris.Context) error {
+			sw := c.StreamWriter()
+			if err := sw.WriteHeader(200, nil); err != nil {
+				return err
+			}
+			if _, err := sw.Write([]byte("xxxxx")); err != nil {
+				return err
+			}
+			return fail()
+		}
+	}
+	panics := func() error { panic("boom889") }
+	errs := func() error { return errors.New("boom889") }
+	s.GET("/panicstream", broken(panics))
+	s.GET("/errstream", broken(errs))
+	s.GET("/apanicstream", broken(panics)).Async()
+	s.GET("/aerrstream", broken(errs)).Async()
 	s.GET("/ok", func(c *celeris.Context) error { return c.String(200, "ok") })
 }
 
@@ -202,7 +223,7 @@ func TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889(t *testing.T) {
 			r.logs.mu.Lock()
 			for _, rec := range r.logs.recs {
 				if rec.level >= slog.LevelError {
-					if !strings.Contains(rec.msg, "Goexit") || !strings.Contains(attrStr848(rec.attrs["stack"]), "TestH2AsyncHandlerGoexit") {
+					if !strings.Contains(rec.msg, "Goexit") || !strings.Contains(attrStr848(rec.attrs["stack"]), "h2Return889Rig") {
 						t.Errorf("record %q lacks the Goexit message or a stack through the handler: %v", rec.msg, rec.attrs)
 					}
 				}
@@ -214,6 +235,32 @@ func TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889(t *testing.T) {
 			}
 			if exits := len(r.logs.exits()); exits != 0 {
 				t.Errorf("%d loop-exit records, want 0 (an async handler's Goexit does not end the loop)", exits)
+			}
+		})
+	}
+}
+
+// A StreamWriter response that its handler broke off, by a panic the router
+// recovers or by returning an error, must not be ended as if it were whole: the
+// router cannot write its 500 over a response that is under way, so HandleStream
+// returns nil, and an unclosed response with no declared length would be ended
+// with END_STREAM, a truncated body that looks complete. It is reset. (The std
+// engine is not an arm: the router recovers the panic before x/net's server
+// sees it, so net/http ends that stream; a known difference.)
+func TestH2StreamedResponseBrokenOffIsReset889(t *testing.T) {
+	for _, a := range arms848()[:2] {
+		t.Run(a.name, func(t *testing.T) {
+			need848(t, a.eng)
+			r := startH2Return889(t, a.eng)
+			for _, path := range []string{"/panicstream", "/errstream", "/apanicstream", "/aerrstream"} {
+				body, err := r.get(path)
+				var se http2.StreamError
+				if !errors.As(err, &se) || se.Code != http2.ErrCodeInternal {
+					t.Errorf("GET %s: body %q err %v, want a stream error INTERNAL_ERROR: a response broken off after its headers must not end with END_STREAM", path, body, err)
+				}
+			}
+			if body, err := r.get("/ok"); err != nil || body != "ok" {
+				t.Errorf("GET /ok: %q %v", body, err)
 			}
 		})
 	}

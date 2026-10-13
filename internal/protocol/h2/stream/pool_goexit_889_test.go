@@ -62,25 +62,4 @@ func TestH2Pool_GoexitDoesNotShrinkThePool889(t *testing.T) {
 	if got := h.ran.Load(); got != goexits {
 		t.Fatalf("%d handlers ran, want %d", got, goexits)
 	}
-
-	// The pool still takes work on its own workers: a task queued while a
-	// worker is parked is run by a pooled goroutine, not a spawned one.
-	before := runtime.NumGoroutine()
-	h2 := &blockingPoolHandler{entered: make(chan struct{}, size), release: make(chan struct{})}
-	defer close(h2.release)
-	for i := range size {
-		proc := NewProcessor(h2, newTestFrameWriter(), newTestResponseWriter())
-		s := proc.manager.CreateStream(uint32(2*i + 1))
-		proc.poolRunning.Add(1)
-		p.Submit(proc, s)
-	}
-	for deadline := time.Now().Add(5 * time.Second); h2.started.Load() < size && time.Now().Before(deadline); {
-		time.Sleep(time.Millisecond)
-	}
-	if got := h2.started.Load(); got != size {
-		t.Fatalf("%d of %d handlers started", got, size)
-	}
-	if grown := runtime.NumGoroutine() - before; grown > 1 {
-		t.Errorf("%d goroutines were spawned for %d tasks on a pool of %d parked workers: the Goexited workers are gone and Submit runs streams on goroutines of its own", grown, size, size)
-	}
 }

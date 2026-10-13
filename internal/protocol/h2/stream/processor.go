@@ -336,8 +336,9 @@ func (p *Processor) handlerUnfinished(id uint32, reset bool, written, declared i
 // resetHandlerStream resets the stream whose handler is over with
 // INTERNAL_ERROR (RFC 9113 §7: "the endpoint encountered an unexpected
 // internal error"; CANCEL says the stream is no longer needed, which is not
-// what a handler that failed to answer means, and net/http's server resets a
-// panicked or short-bodied response the same way). What the stream still
+// what a handler that failed to answer means, and x/net's HTTP/2 server resets
+// the stream of a handler that panicked or called runtime.Goexit with
+// INTERNAL_ERROR too). What the stream still
 // buffers is dropped, so a flush sends nothing after the RST_STREAM, and the
 // RST_STREAM is queued behind the frames the stream already queued (all of a
 // stream's frames go to one shard, in order): sent straight to the connection,
@@ -356,15 +357,15 @@ func (p *Processor) resetHandlerStream(stream *Stream) {
 	p.manager.DiscardOutbound(stream)
 	switch w := stream.ResponseWriter.(type) {
 	case StreamResetter:
-		w.ResetStream(stream, http2.ErrCodeInternal)
+		w.ResetStream(stream, http2.ErrCodeInternal) // cancels the stream as well
 	default:
 		// A writer that cannot queue behind the stream's frames (a test
 		// recorder): the connection's own, which is the event loop's.
 		if p.connWriter != nil {
 			_ = p.connWriter.WriteRSTStreamPriority(stream.ID, http2.ErrCodeInternal)
 		}
+		stream.Cancel()
 	}
-	stream.Cancel()
 }
 
 // settleStreamed runs when a handler that streamed its response returned

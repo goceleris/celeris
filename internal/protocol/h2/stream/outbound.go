@@ -460,6 +460,21 @@ func (s *Stream) NoteStreamHeader(status int, headers [][2]string) {
 	s.flags.Or(flagStreamed)
 }
 
+// FailResponse records that the handler failed after the response was under
+// way, with the failure swallowed above the processor: the router recovers a
+// panic and answers a handler's error with a 500 only when nothing was sent, so
+// a StreamWriter response that the handler broke off returns from HandleStream
+// as if it had finished. On HTTP/2 the processor then resets the stream
+// instead of ending it (a truncated body must not look complete), whatever
+// content-length the response declared. It does nothing for an HTTP/1 stream,
+// whose object lives on for the connection's next request, and for a response
+// that is not a StreamWriter's (a response written whole is whole).
+func (s *Stream) FailResponse() {
+	if s.ProtoMajor() == 2 {
+		s.flags.Or(flagRespFailed)
+	}
+}
+
 // responseOutcome is how a handler that is over left its stream's response.
 type responseOutcome uint8
 
@@ -491,12 +506,14 @@ func (s *Stream) responseOutcome() (o responseOutcome, written, declared int64) 
 	// END_STREAM is marked under the stream's lock (EndOutbound), so the
 	// check is made under it too.
 	s.mu.RLock()
-	written, ended := s.respWritten, s.flags.Load()&flagRespEnded != 0
+	written, fl := s.respWritten, s.flags.Load()
 	s.mu.RUnlock()
 	declared = s.respDeclared.Load() - 1
 	switch {
-	case ended:
+	case fl&flagRespEnded != 0:
 		return outcomeSettled, written, declared
+	case fl&flagRespFailed != 0:
+		return outcomeShort, written, declared
 	case declared < 0 || declared == written:
 		return outcomeComplete, written, declared
 	}

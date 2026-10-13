@@ -55,6 +55,12 @@ const (
 	// flagRespEnded marks a streamed response whose END_STREAM has been sent or
 	// queued behind the buffered DATA (Manager.EndOutbound).
 	flagRespEnded uint32 = 1 << 7
+	// flagRespFailed marks a streamed response whose handler failed after the
+	// headers were out, with the failure swallowed above the processor (the
+	// router recovers a panic and cannot write its 500 over a committed
+	// response; FailResponse): the response is truncated whatever it declared,
+	// and the processor resets it instead of ending it.
+	flagRespFailed uint32 = 1 << 8
 )
 
 // Stream represents an HTTP/2 stream with its associated state and data.
@@ -115,7 +121,10 @@ type Stream struct {
 	// without END_STREAM, and the stream is released when it is out
 	// (FlushOutbound's finished), so the stream does not hold its
 	// MAX_CONCURRENT_STREAMS slot and its budget until the connection closes.
-	// Guarded by mu.
+	// Since celeris#889 the processor ends or resets a streamed response at the
+	// handler's return (settleStreamed) before it looks at the buffer, so this
+	// is reached only by a stream settleStreamed left alone because the peer had
+	// reset it. Guarded by mu.
 	outboundAbandoned bool
 	// respWritten is how many body bytes a StreamWriter has handed to this
 	// use of the stream, sent or buffered (Manager.StreamWrite). Guarded by mu.
