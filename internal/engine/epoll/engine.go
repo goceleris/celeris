@@ -404,13 +404,15 @@ func (e *Engine) ResumeAccept() error {
 		// one.
 		l.listenFDClosed.Store(false)
 		l.wakeIfSuspended()
-		// A loop that cannot park (it holds a connection) closed its
-		// listener at the pause and went back to epoll_wait, which is 500 ms
-		// long with no listener, and a loop without a header deadline has no
-		// 25 ms timerfd to end it sooner. wakeIfSuspended does not reach it:
-		// the wake eventfd, which is in the epoll set, does (celeris#886). A
-		// leaf lock and one write(2); a loop that is running just reads the
-		// counter at its next wakeup.
+		// A loop that has not parked closed its listener at the pause and
+		// went back to epoll_wait, which is 500 ms long with no listener,
+		// and a loop without a header deadline has no 25 ms timerfd to end
+		// it sooner. That is a loop that holds a connection, and also an
+		// idle one just after the pause (it parks at the iteration after
+		// the close). wakeIfSuspended does not reach it: the wake eventfd,
+		// which is in the epoll set, does (celeris#886). A leaf lock and one
+		// write(2); a loop that is running just reads the counter at its
+		// next wakeup.
 		l.wakeFD.Signal()
 	}
 	return nil
@@ -418,9 +420,9 @@ func (e *Engine) ResumeAccept() error {
 
 // wakeIfSuspended ends a DRAINING→SUSPENDED park: if the loop is parked, close
 // its wake channel, give it a fresh one and clear suspended. Safe from any
-// goroutine; a no-op on a loop that is running. A running loop that holds a
-// connection is reached by the wake eventfd instead, which ResumeAccept
-// signals after this call (celeris#886).
+// goroutine; a no-op on a loop that is running. A running loop (one that
+// holds a connection, or has not yet reached the park) is reached by the wake
+// eventfd instead, which ResumeAccept signals after this call (celeris#886).
 //
 // The park waits on a Go channel, not in epoll_wait, so an eventfd write does
 // not end it — only this does. ResumeAccept is one caller. AdoptConn is the

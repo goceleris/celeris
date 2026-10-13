@@ -18,11 +18,13 @@ import (
 )
 
 // celeris#886 item 8 (the polish list for the adaptive engine). ResumeAccept
-// woke only a loop parked in its DRAINING to SUSPENDED step. A loop that
-// cannot park (it holds a connection) closed its listener at the pause and
-// went back to waiting up to 500 ms in epoll_wait with no listener; the resume found it
-// running, did nothing, and the listener came back only when that wait ended.
-// The wake eventfd is armed in every mode, so ResumeAccept signals it.
+// woke only a loop parked in its DRAINING to SUSPENDED step. A loop that has
+// not parked closed its listener at the pause and went back to waiting up to 500 ms in epoll_wait with no listener;
+// the resume found it running, did nothing, and the listener came back only
+// when that wait ended. That is a loop that holds a connection (it cannot
+// park) and also an idle one in the first wait after the pause (it parks at
+// the iteration after the close). The wake eventfd is armed in every mode, so
+// ResumeAccept signals it.
 //
 // A loop whose Config has a ReadHeaderTimeout (the default, 10 s) also owns a
 // 25 ms timerfd, which ends that wait on its own: the lag is at most 25 ms
@@ -32,7 +34,7 @@ import (
 // live886 opens n keep-alive connections to addr, each with one answered
 // request, so that they are registered with a loop: a loop that holds a
 // connection does not park in a pause, and the resume reaches it only through
-// the wake eventfd.
+// the wake eventfd. n = 0 opens none.
 func live886(t *testing.T, addr string, n int) {
 	t.Helper()
 	conns := make([]net.Conn, 0, n)
@@ -134,11 +136,14 @@ func TestResumeAcceptReachesALoopThatCannotPark886(t *testing.T) {
 		lagBound = 200 * time.Millisecond
 	)
 	for _, tc := range []struct {
-		name string
-		rht  time.Duration
+		name  string
+		rht   time.Duration
+		conns int
 	}{
-		{"default-read-header-timeout", 0},
-		{"no-read-header-timeout", -1},
+		{"default-read-header-timeout/live-connections", 0, 16},
+		{"no-read-header-timeout/live-connections", -1, 16},
+		{"default-read-header-timeout/no-connections", 0, 0},
+		{"no-read-header-timeout/no-connections", -1, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := start886(t, 2, tc.rht)
@@ -147,17 +152,17 @@ func TestResumeAcceptReachesALoopThatCannotPark886(t *testing.T) {
 			r.e.mu.Unlock()
 			port := portOf895(t, r.e.Addr())
 			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-			live886(t, addr, 16)
+			live886(t, addr, tc.conns)
 
 			var lags []time.Duration
 			for range cycles {
 				lags = append(lags, resumeLag886(t, r.e, port, want, 3*time.Second))
 			}
-			t.Logf("celeris886 RESUME-LAG (%d loops, 16 live connections, pause then resume with no sleep): %v, bound %v", want, lags, lagBound)
+			t.Logf("celeris886 RESUME-LAG (%d loops, %d live connections, pause then resume with no sleep): %v, bound %v", want, tc.conns, lags, lagBound)
 			for i, lag := range lags {
 				if lag > lagBound {
 					t.Errorf("celeris886 LAG: cycle %d took %v to have %d loops listening again, want within %v: "+
-						"a loop with a live connection did not see the resume until its wait ended", i, lag, want, lagBound)
+						"a loop that had not parked did not see the resume until its wait ended", i, lag, want, lagBound)
 				}
 			}
 			get895(t, addr)

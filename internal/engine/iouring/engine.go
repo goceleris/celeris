@@ -764,11 +764,13 @@ func (e *Engine) ResumeAccept() error {
 		// one.
 		w.listenFDClosed.Store(false)
 		w.wakeIfSuspended()
-		// A worker that cannot park (it holds a connection) closed its
-		// listener at the pause and went back to its ring wait, which
-		// is up to a second long with no listener (Worker.baseTimeout).
-		// wakeIfSuspended does not reach it: the wake eventfd, whose
-		// POLL_ADD the worker keeps armed in every mode, does
+		// A worker that has not parked closed its listener at the pause and
+		// went back to its ring wait, which is up to a second long with no
+		// listener (Worker.baseTimeout). That is a worker that holds a
+		// connection, and also an idle one in the second after the pause
+		// (it parks at the iteration after the close, which is after that
+		// first wait). wakeIfSuspended does not reach it: the wake eventfd,
+		// whose POLL_ADD the worker keeps armed in every mode, does
 		// (celeris#886). A leaf lock and one write(2); a worker that is
 		// running just reads the counter at its next wakeup.
 		w.wakeFD.Signal()
@@ -778,9 +780,10 @@ func (e *Engine) ResumeAccept() error {
 
 // wakeIfSuspended ends a DRAINING→SUSPENDED park: if the worker is parked,
 // close its wake channel, give it a fresh one and clear suspended. Safe from
-// any goroutine; a no-op on a worker that is running. A running worker that
-// holds a connection is reached by the wake eventfd instead, which
-// ResumeAccept signals after this call (celeris#886).
+// any goroutine; a no-op on a worker that is running. A running worker (one
+// that holds a connection, or has not yet reached the park) is reached by the
+// wake eventfd instead, which ResumeAccept signals after this call
+// (celeris#886).
 //
 // The park waits on a Go channel, not on the ring, so an eventfd write does
 // not end it — only this does. ResumeAccept is one caller. The driver-action

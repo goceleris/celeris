@@ -13,16 +13,18 @@ import (
 )
 
 // celeris#886 item 8 (the polish list for the adaptive engine). ResumeAccept
-// woke only a worker parked in its DRAINING to SUSPENDED step. A worker that
-// cannot park (it holds a connection) closed its listener at the pause and
-// went back to waiting up to a second in the ring (Worker.baseTimeout) with no listener; the resume found it
-// running, did nothing, and the listener came back only when that wait ended.
-// The wake eventfd is armed in every mode, so ResumeAccept signals it.
+// woke only a worker parked in its DRAINING to SUSPENDED step. A worker that has
+// not parked closed its listener at the pause and went back to waiting up to a second in the ring (Worker.baseTimeout) with no listener;
+// the resume found it running, did nothing, and the listener came back only
+// when that wait ended. That is a worker that holds a connection (it cannot
+// park) and also an idle one in the first wait after the pause (it parks at
+// the iteration after the close). The wake eventfd is armed in every mode, so
+// ResumeAccept signals it.
 
 // live886 opens n keep-alive connections to addr, each with one answered
 // request, so that they are registered with a worker: a worker that holds a
 // connection does not park in a pause, and the resume reaches it only through
-// the wake eventfd.
+// the wake eventfd. n = 0 opens none.
 func live886(t *testing.T, addr string, n int) {
 	t.Helper()
 	conns := make([]net.Conn, 0, n)
@@ -76,33 +78,46 @@ func resumeLag886(t *testing.T, e *Engine, port, want int, gaveup time.Duration)
 }
 
 // TestResumeAcceptReachesAWorkerThatCannotPark886: a resume that comes
-// straight after the pause must make every worker listen again within lagBound.
-// The pause is DisableDeferAccept's (its listener closes at once), the resume
-// follows it with no sleep, and the cycle runs three times, since the lag is
-// the remainder of a wait.
+// straight after the pause must make every worker listen again within
+// lagBound. The pause is DisableDeferAccept's (its listener closes at once),
+// the resume follows it with no sleep, and the cycle runs three times, since
+// the lag is the remainder of a wait. The first arm holds live connections
+// (the worker can never park); the second holds none, and it lags just the
+// same, because the worker parks only at the iteration after the pause's
+// close, which is after its first wait with no listener.
 func TestResumeAcceptReachesAWorkerThatCannotPark886(t *testing.T) {
 	const (
 		cycles   = 3
 		lagBound = 200 * time.Millisecond
 	)
-	r := start895(t, "127.0.0.1:0", 2, 1, true)
-	r.e.mu.Lock()
-	want := len(r.e.workers)
-	r.e.mu.Unlock()
-	port := portOf895(t, r.e.Addr())
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	live886(t, addr, 16)
+	for _, tc := range []struct {
+		name  string
+		conns int
+	}{
+		{"live-connections", 16},
+		{"no-connections", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := start895(t, "127.0.0.1:0", 2, 1, true)
+			r.e.mu.Lock()
+			want := len(r.e.workers)
+			r.e.mu.Unlock()
+			port := portOf895(t, r.e.Addr())
+			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+			live886(t, addr, tc.conns)
 
-	var lags []time.Duration
-	for range cycles {
-		lags = append(lags, resumeLag886(t, r.e, port, want, 3*time.Second))
+			var lags []time.Duration
+			for range cycles {
+				lags = append(lags, resumeLag886(t, r.e, port, want, 3*time.Second))
+			}
+			t.Logf("celeris886 RESUME-LAG (%d workers, %d live connections, pause then resume with no sleep): %v, bound %v", want, tc.conns, lags, lagBound)
+			for i, lag := range lags {
+				if lag > lagBound {
+					t.Errorf("celeris886 LAG: cycle %d took %v to have %d workers listening again, want within %v: "+
+						"a worker that had not parked did not see the resume until its wait ended", i, lag, want, lagBound)
+				}
+			}
+			get895(t, addr)
+		})
 	}
-	t.Logf("celeris886 RESUME-LAG (%d workers, 16 live connections, pause then resume with no sleep): %v, bound %v", want, lags, lagBound)
-	for i, lag := range lags {
-		if lag > lagBound {
-			t.Errorf("celeris886 LAG: cycle %d took %v to have %d workers listening again, want within %v: "+
-				"a worker with a live connection did not see the resume until its wait ended", i, lag, want, lagBound)
-		}
-	}
-	get895(t, addr)
 }
