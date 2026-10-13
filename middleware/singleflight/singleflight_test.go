@@ -21,9 +21,10 @@ import (
 //  3. The test waits for all N-1 waiterArrived signals, then closes
 //     waiterGate to release waiters. Waiters proceed to the group lock
 //     and map check. Since the leader is still blocked in the handler,
-//     the key is in the map and waiters take the waiter path (wg.Wait).
-//  4. After a brief yield to let waiters reach wg.Wait (only a lock
-//     acquire + map lookup separates KeyFunc from wg.Wait), the test
+//     the key is in the map and waiters take the waiter path (the select on
+//     the call's done channel).
+//  4. After a brief yield to let waiters reach the select (only a lock
+//     acquire + map lookup separates KeyFunc from it), the test
 //     closes gate to release the leader.
 type concurrentTest struct {
 	handler celeris.HandlerFunc

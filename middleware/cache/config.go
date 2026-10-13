@@ -10,6 +10,15 @@ import (
 // Config defines the cache middleware configuration.
 type Config struct {
 	// Store is the cache backend. Default: [NewMemoryStore].
+	//
+	// Two fills of one key can overlap (concurrent misses with
+	// DisableSingleflight, or a coalesced call that was replaced once its
+	// result expired while its Set hung). The cache's own [MemoryStore]
+	// applies each fill's write in order: an entry written by a fill whose
+	// handler started later is not replaced by an earlier fill's write that
+	// lands after it. Any other store, including a type that embeds
+	// *MemoryStore, gets plain Set calls (its own Set override runs), so the
+	// entry that remains is the one whose Set the store applied last.
 	Store store.KV
 
 	// TTL is the default cache entry lifetime. Default: 1 minute.
@@ -31,11 +40,17 @@ type Config struct {
 	// the leader's error ([errors.Is] and [errors.As] find what it holds),
 	// and it is not == to it. When the handler (or the store's Set)
 	// panics, the panic is the leader's, and each waiter runs its own
-	// handler. A waiter waits only as long as its request context lives;
-	// on epoll and io_uring an HTTP/1 request context does not end unless
-	// a middleware such as timeout gives it a deadline, so there a waiter
-	// waits for the handler. A request that arrives during the leader's
-	// store Set takes the response too, within the response's TTL.
+	// handler. So does each waiter when the leader's handler failed
+	// because the leader's own request context ended (its client went
+	// away, its deadline passed): that error is the leader's client's.
+	// (A client that cancels its request again and again can therefore
+	// defeat the coalescing for the others, at the price of one handler
+	// run per waiter, as without singleflight.) A waiter waits only as long
+	// as its request context lives; on epoll and io_uring an HTTP/1 request
+	// context does not end unless a middleware such as timeout gives it a
+	// deadline, so there a waiter waits for the handler. A request that
+	// arrives during the leader's store Set takes the response too, within
+	// the response's TTL.
 	//
 	// It replaces the Singleflight field, which a Config literal that did
 	// not set it turned off (celeris#922).
@@ -79,8 +94,16 @@ type Config struct {
 	// IgnoreCacheControl, when true, stores responses whatever their
 	// Cache-Control says. By default (false) the response's Cache-Control
 	// directive is honoured:
-	//   - no-store or private → skip caching
-	//   - max-age=N           → cap TTL to min(cfg.TTL, N)
+	//   - no-store, private or no-cache → skip caching
+	//   - max-age=0                     → skip caching
+	//   - max-age=N (N > 0)             → cap TTL to min(cfg.TTL, N seconds)
+	//   - a max-age that is not digits  → skip caching (max-age=abc, max-age=60abc)
+	//   - "private" or "no-store" anywhere in the value → skip caching, always
+	//   - not a comma-separated list    → skip caching (public; max-age=3600)
+	//
+	// No-cache and max-age=0 are not stored because a stored response would
+	// be served without the revalidation the origin asked for, and this
+	// middleware does not revalidate (celeris#888 item 27).
 	//
 	// It replaces the RespectCacheControl field, whose false had no effect
 	// (celeris#922).

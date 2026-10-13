@@ -38,6 +38,10 @@ type MemoryStore struct {
 	mask   uint64
 	perMax int
 	cancel context.CancelFunc
+
+	// testHookFillWrite, when set (by a test, before the store is shared),
+	// runs at the start of every fill's write, before the shard lock.
+	testHookFillWrite func()
 }
 
 type memShard struct {
@@ -51,7 +55,8 @@ type memShard struct {
 type lruNode struct {
 	key    string
 	value  []byte
-	expiry int64 // UnixNano; 0 means no expiry
+	expiry int64  // UnixNano; 0 means no expiry
+	gen    uint64 // generation of the write that made the value; see genNow
 	prev   *lruNode
 	next   *lruNode
 }
@@ -124,8 +129,26 @@ func (m *MemoryStore) Get(_ context.Context, key string) ([]byte, error) {
 }
 
 // Set implements [store.KV]. Evicts the LRU entry when the shard is
-// over capacity.
+// over capacity. A Set always replaces the entry, and leaves it with no
+// generation: it is not ordered against the cache middleware's fills (see
+// setIfNewer), which is what it was before they were.
 func (m *MemoryStore) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
+	return m.set(key, value, ttl, 0, false)
+}
+
+// setIfNewer is the write the cache middleware makes for a fill into a
+// *MemoryStore (see storeFill): it stores value unless the key holds a live
+// entry written by a fill of a newer generation, which it leaves alone and
+// reports no error for. The check and the write are one step under the
+// shard's lock (celeris#888 item 30).
+func (m *MemoryStore) setIfNewer(_ context.Context, key string, value []byte, ttl time.Duration, gen uint64) error {
+	if m.testHookFillWrite != nil {
+		m.testHookFillWrite()
+	}
+	return m.set(key, value, ttl, gen, true)
+}
+
+func (m *MemoryStore) set(key string, value []byte, ttl time.Duration, gen uint64, ordered bool) error {
 	var exp int64
 	if ttl > 0 {
 		exp = time.Now().Add(ttl).UnixNano()
@@ -134,6 +157,10 @@ func (m *MemoryStore) Set(_ context.Context, key string, value []byte, ttl time.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.items[key]; ok {
+		if ordered && existing.gen > gen && (existing.expiry == 0 || time.Now().UnixNano() <= existing.expiry) {
+			return nil
+		}
+		existing.gen = gen
 		// Reuse the existing backing array when it fits — updates to
 		// the same key (ETag refresh, handler recompute) skip the
 		// per-Set heap alloc.
@@ -157,7 +184,7 @@ func (m *MemoryStore) Set(_ context.Context, key string, value []byte, ttl time.
 	// is over (celeris#719). The eviction deletes by the node's key, so both
 	// hold the same copy.
 	k := strings.Clone(key)
-	n := &lruNode{key: k, value: cp, expiry: exp}
+	n := &lruNode{key: k, value: cp, expiry: exp, gen: gen}
 	s.items[k] = n
 	s.pushFront(n)
 	if s.capacity > 0 && len(s.items) > s.capacity {

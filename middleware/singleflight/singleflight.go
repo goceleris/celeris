@@ -1,6 +1,7 @@
 package singleflight
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -10,10 +11,15 @@ import (
 )
 
 type call struct {
-	wg sync.WaitGroup
+	// done is closed by the leader when it has published the response. It
+	// is made by the first waiter that joins, under g.mu, so a leader with
+	// no waiter never makes one; the leader reads it under the same mutex
+	// where it reads waiters, after it left the map, so no waiter can join
+	// later. Waiters select on it and their request context directly.
+	done chan struct{}
 	// waiters counts concurrent requests that joined this leader's
 	// in-flight state. Waiter goroutines increment under the group
-	// mutex (before registering on the WaitGroup); the leader reads
+	// mutex (before waiting on done); the leader reads
 	// it under the same mutex at delete time, so count captures every
 	// waiter that will ever read from this entry. A zero count lets
 	// the leader skip body/header deep-copies — the work only matters
@@ -25,6 +31,11 @@ type call struct {
 	ct       string
 	err      error
 	panicVal any
+	// rerun is set when the leader's handler failed because the leader's own
+	// request context ended (its client went away, its deadline passed): that
+	// error is not the waiters', and each waiter runs its own handler
+	// instead of taking the leader's response (celeris#888 item 26).
+	rerun bool
 	// vary holds, for each request header the leader's response names in
 	// Vary, the header and the leader's value for it (a copy); varyAll is
 	// set when the response says Vary: *. A waiter whose request differs
@@ -59,6 +70,8 @@ func acquireCall() *call {
 	c.ct = ""
 	c.err = nil
 	c.panicVal = nil
+	c.rerun = false
+	c.done = nil
 	c.vary = c.vary[:0]
 	c.varyAll = false
 	c.waiters.Store(0)
@@ -71,6 +84,9 @@ func New(config ...Config) celeris.HandlerFunc {
 	if len(config) > 0 {
 		cfg = config[0]
 	}
+	// A custom KeyFunc cannot be assumed to hold the validators: a
+	// conditional request is then never coalesced. The default key holds them.
+	customKey := cfg.KeyFunc != nil
 	cfg = applyDefaults(cfg)
 	cfg.validate()
 
@@ -89,14 +105,31 @@ func New(config ...Config) celeris.HandlerFunc {
 		// 206 part) answers that Range, which the key does not include, so a
 		// leader's part would be handed to requests for the whole
 		// representation, and a ranged request waiting on a full one gets
-		// more than it asked for (celeris#832). A conditional request is not
-		// coalesced either: its response (a 304 or a 412) answers its
-		// validator, which the key does not include either (celeris#912).
-		if answersItsOwnHeaders(c) {
+		// more than it asked for (celeris#832).
+		if c.Header("range") != "" {
 			return c.Next()
 		}
-
-		key := keyFunc(c)
+		var key string
+		if customKey {
+			// A conditional request is not coalesced under a custom KeyFunc
+			// either: its response (a 304 or a 412) answers its validator,
+			// which that key may not include (celeris#912).
+			if hasPrecondition(c) {
+				return c.Next()
+			}
+			key = keyFunc(c)
+		} else {
+			// The default key includes the validators, so GET and HEAD
+			// requests that send the same ones are coalesced (celeris#888
+			// item 23). A conditional write never is: its handler is the
+			// update, and a request that took another's response instead
+			// would lose it and never get its own 412.
+			var conditional bool
+			key, conditional = defaultKey(c)
+			if conditional && !safeToCoalesce(c.Method()) {
+				return c.Next()
+			}
+		}
 
 		g.mu.Lock()
 		if entry, ok := g.m[key]; ok {
@@ -105,29 +138,37 @@ func New(config ...Config) celeris.HandlerFunc {
 			// leader's delete-time check sees it. Any waiter that reaches
 			// this branch pairs with the leader's post-Next capture.
 			entry.waiters.Add(1)
+			if entry.done == nil {
+				entry.done = make(chan struct{})
+			}
+			done := entry.done
 			if testHookWaiterJoined != nil {
 				testHookWaiterJoined()
 			}
 			g.mu.Unlock()
-			// Race the leader's WaitGroup against the request context so a
-			// timeout middleware (or upstream client cancel) can preempt the
-			// wait instead of blocking until the leader returns. Without
+			// Race the leader's done channel against the request context so
+			// a timeout middleware (or upstream client cancel) can preempt
+			// the wait instead of blocking until the leader returns. Without
 			// this, timeout(preemptive) → singleflight(waiter) deadlocks
 			// when the leader exceeds the deadline because the timeout
-			// goroutine sits inside wg.Wait() with no way out.
-			waitDone := make(chan struct{})
-			go func() {
-				entry.wg.Wait()
-				close(waitDone)
-			}()
+			// goroutine would sit in the wait with no way out. The wait is a
+			// select on the one channel the leader closes: no goroutine per
+			// waiter (celeris#888 item 25).
 			select {
-			case <-waitDone:
+			case <-done:
 			case <-c.Context().Done():
 				return c.Context().Err()
 			}
 
 			if entry.panicVal != nil {
 				panic(entry.panicVal)
+			}
+
+			// The leader's own context ended and its handler said so: that
+			// error is the leader's client's, and this request's client may
+			// be there still. Run this request's own handler.
+			if entry.rerun {
+				return c.Next()
 			}
 
 			// The leader's response says it depends on a request header
@@ -151,7 +192,6 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		// Leader path: first request for this key.
 		entry := acquireCall()
-		entry.wg.Add(1)
 		g.m[key] = entry
 		g.mu.Unlock()
 
@@ -168,17 +208,27 @@ func New(config ...Config) celeris.HandlerFunc {
 			handlerErr = c.Next()
 		}()
 
-		// Remove from map BEFORE wg.Done so new requests after Done create
-		// fresh entries. Reading entry.waiters under the same mutex that
-		// gates waiter increments gives a consistent count of everyone who
-		// will read from this entry; capture is a no-op when nobody's
+		// Remove from map BEFORE closing done so new requests after it create
+		// fresh entries. Reading entry.waiters (and done) under the same mutex
+		// that gates waiter increments gives a consistent count of everyone
+		// who will read from this entry; capture is a no-op when nobody's
 		// waiting (the common single-flight miss).
 		g.mu.Lock()
 		delete(g.m, key)
 		numWaiters := entry.waiters.Load()
+		done := entry.done
 		g.mu.Unlock()
 
-		if numWaiters > 0 {
+		// The leader's own context ended and the handler's error says so.
+		if numWaiters > 0 && handlerErr != nil && panicVal == nil {
+			if cctx := c.Context(); cctx != nil {
+				if cerr := cctx.Err(); cerr != nil && errors.Is(handlerErr, cerr) {
+					entry.rerun = true
+				}
+			}
+		}
+
+		if numWaiters > 0 && !entry.rerun {
 			// Capture response state (deep copy) only when a waiter will
 			// consume it.
 			entry.status = c.ResponseStatus()
@@ -195,11 +245,13 @@ func New(config ...Config) celeris.HandlerFunc {
 			entry.err = handoff.Error(handlerErr)
 			entry.panicVal = handoff.Panic(panicVal)
 		}
-		entry.wg.Done()
+		if done != nil {
+			close(done)
+		}
 
 		// Pool-reuse the entry when no waiter referenced it. Entries seen
 		// by waiters stay live until the last reader drops them (the
-		// waiter path reads entry.body/headers/etc. after wg.Done); GC
+		// waiter path reads entry.body/headers/etc. after done closes); GC
 		// reclaims them then. Returning those to the pool would be a
 		// use-after-free.
 		if numWaiters == 0 {
@@ -217,24 +269,29 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 }
 
-// answersItsOwnHeaders reports a request whose response answers one of its
-// own headers that the key does not include, so it must not be coalesced:
-// a Range (the 206 part, celeris#832), or a precondition (If-None-Match and
-// If-Modified-Since give a 304, If-Match and If-Unmodified-Since a 412,
-// celeris#912). If-Range applies only with a Range.
-func answersItsOwnHeaders(c *celeris.Context) bool {
-	return c.Header("range") != "" ||
-		c.Header("if-none-match") != "" ||
-		c.Header("if-modified-since") != "" ||
-		c.Header("if-match") != "" ||
-		c.Header("if-unmodified-since") != ""
+// hasPrecondition reports a request that carries one of the four
+// preconditions (If-None-Match and If-Modified-Since give a 304, If-Match and
+// If-Unmodified-Since a 412, celeris#912). If-Range applies only with a Range.
+func hasPrecondition(c *celeris.Context) bool {
+	for _, v := range keyValidators {
+		if c.Header(v.header) != "" {
+			return true
+		}
+	}
+	return false
 }
 
+// safeToCoalesce reports a method whose conditional requests the default key
+// may coalesce: GET and HEAD, whose handler only reads, so a request that
+// sends the leader's validator gets the leader's answer. For any other method
+// a precondition marks a write guarded by it (a PUT with If-Match).
+func safeToCoalesce(method string) bool { return method == "GET" || method == "HEAD" }
+
 // captureVary records, for each request header the leader's response names
-// in Vary (entry.headers, the waiters' copy), the leader's value for it. The
-// values are copied: on epoll and io_uring they are views of the leader
-// connection's receive buffer, and a waiter compares them after the leader
-// has returned.
+// in Vary (entry.headers, the waiters' copy), the leader's value for it, in
+// canonical form (see canonicalAppend). The values are copied: on epoll and
+// io_uring they are views of the leader connection's receive buffer, and a
+// waiter compares them after the leader has returned.
 func (e *call) captureVary(c *celeris.Context) {
 	for _, h := range e.headers {
 		if h[0] != "vary" {
@@ -247,21 +304,22 @@ func (e *call) captureVary(c *celeris.Context) {
 			case "*":
 				e.varyAll = true
 			default:
-				e.vary = append(e.vary, [2]string{name, strings.Clone(c.Header(name))})
+				e.vary = append(e.vary, [2]string{name, canonicalValue(name, c.Header(name))})
 			}
 		}
 	}
 }
 
-// sameVariant reports whether the waiter c sends the leader's value for every
-// request header the leader's response varies on, so the leader's response
-// is the one c's own request would get.
+// sameVariant reports whether the waiter c sends the leader's value
+// (canonically equal, see canonicalAppend) for every request header the
+// leader's response varies on, so the leader's response is the one c's own
+// request would get.
 func (e *call) sameVariant(c *celeris.Context) bool {
 	if e.varyAll {
 		return false
 	}
 	for _, v := range e.vary {
-		if c.Header(v[0]) != v[1] {
+		if !sameCanonical(v[0], v[1], c.Header(v[0])) {
 			return false
 		}
 	}

@@ -351,3 +351,68 @@ func TestConcurrentMemoryStore(t *testing.T) {
 	wg.Wait()
 	_ = scanKeys(t, m, "")
 }
+
+// TestCacheControlDirectivesDecideStorage888: a response that must be
+// revalidated before every reuse (no-cache) or that is stale at once
+// (max-age=0) used to be stored for the full Config.TTL: parseMaxAge gave 0,
+// the `d > 0` guard kept the TTL, and no-cache was never looked at, so the
+// second request was a HIT that the origin had told the cache not to serve.
+// They are not stored now, with or without singleflight; IgnoreCacheControl
+// stores them (celeris#888 item 27, from #940 review r2).
+func TestCacheControlDirectivesDecideStorage888(t *testing.T) {
+	for _, tc := range []struct {
+		cc     string
+		stored bool
+	}{
+		{"no-cache", false},
+		{"No-Cache", false},
+		{"public, no-cache", false},
+		{`no-cache="set-cookie"`, false},
+		{"max-age=0", false},
+		{"public, max-age=0", false},
+		{"max-age=0, must-revalidate", false},
+		{"no-store", false},
+		{"private", false},
+		{"max-age=60", true},
+		{"public, max-age=60, must-revalidate", true},
+		{"public", true},
+		{"must-revalidate", true},
+		{"", true},
+	} {
+		for _, mode := range []struct {
+			name string
+			cfg  Config
+			// ignore: IgnoreCacheControl stores everything.
+			ignore bool
+		}{
+			{"singleflight", Config{TTL: time.Minute}, false},
+			{"no-singleflight", Config{TTL: time.Minute, DisableSingleflight: true}, false},
+			{"IgnoreCacheControl", Config{TTL: time.Minute, IgnoreCacheControl: true}, true},
+		} {
+			t.Run(fmt.Sprintf("%q/%s", tc.cc, mode.name), func(t *testing.T) {
+				var runs atomic.Int32
+				h := func(c *celeris.Context) error {
+					runs.Add(1)
+					if tc.cc != "" {
+						c.SetHeader("cache-control", tc.cc)
+					}
+					return c.String(200, "value")
+				}
+				cfg := mode.cfg
+				cfg.Store = store.NewMemoryKV()
+				mw := New(cfg)
+				first := runOnce(t, mw, h, "GET", "/cc888")
+				second := runOnce(t, mw, h, "GET", "/cc888")
+				wantStored := tc.stored || mode.ignore
+				wantSecond, wantRuns := "MISS", int32(2)
+				if wantStored {
+					wantSecond, wantRuns = "HIT", 1
+				}
+				if first.Header("x-cache") != "MISS" || second.Header("x-cache") != wantSecond || runs.Load() != wantRuns {
+					t.Errorf("cache-control %q: x-cache %q then %q with %d handler runs, want MISS then %s with %d",
+						tc.cc, first.Header("x-cache"), second.Header("x-cache"), runs.Load(), wantSecond, wantRuns)
+				}
+			})
+		}
+	}
+}

@@ -41,8 +41,26 @@
 // Unless [Config.IgnoreCacheControl] is set, the middleware honors
 // directives on the handler's response:
 //
-//   - no-store, private → the response is not cached
-//   - max-age=N         → TTL is capped at min(Config.TTL, N seconds)
+//   - no-store, private, no-cache → the response is not cached
+//   - max-age=0                   → the response is not cached
+//   - max-age=N (N > 0)           → TTL is capped at min(Config.TTL, N seconds)
+//   - max-age that is not N       → the response is not cached
+//
+// A no-cache or max-age=0 response is not stored because a stored one
+// would be served without the revalidation the origin asked for.
+//
+// The word "private" or "no-store" anywhere in the value, in any case, keeps
+// the response out of the cache, as it always has, whatever else the value says
+// (so x-private-ext, or a "private" inside a quoted string, is refused too).
+// That is checked before the value is read, and what is read afterwards can
+// only add refusals. The argument of max-age is digits only (RFC 9111 4.2.1:
+// an invalid max-age is stale): max-age=abc, max-age=-1, max-age=60abc,
+// max-age="60" and max-age= are not stored.
+//
+// A Cache-Control value that is not a comma-separated list of directives
+// (public; max-age=3600, max-age = 60, a quote that never closes) is not
+// stored either: a value the cache cannot read with certainty is not guessed
+// at, because a wrong guess would serve one user's response to another.
 //
 // # Invalidation
 //

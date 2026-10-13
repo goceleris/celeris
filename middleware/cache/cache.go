@@ -5,6 +5,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,36 @@ import (
 	"github.com/goceleris/celeris/middleware/internal/sf"
 	"github.com/goceleris/celeris/middleware/store"
 )
+
+// genBase is the origin of generations: time.Since reads the monotonic clock,
+// which a wall-clock step does not move, and, unlike a shared counter, costs
+// no cache-line transfer between cores on a busy miss path.
+var genBase = time.Now()
+
+// genNow returns the generation of a fill or a write that starts now: the
+// nanoseconds since genBase, plus one so that no generation is 0 (an entry
+// written by a plain Set has none). Two starts in the same clock tick share a
+// generation, and then the later write wins.
+func genNow() uint64 { return uint64(time.Since(genBase)) + 1 }
+
+// storeFill writes a fill's encoded response. The cache's own *MemoryStore
+// applies it in order: setIfNewer stores the value unless the key holds a live
+// entry that a fill of a newer generation wrote. A generation is the time a
+// fill's handler started (see genNow), so a fill that started later, which
+// read the origin later, is not overwritten by an earlier one whose write
+// lands after it: two concurrent misses with DisableSingleflight, or a
+// coalesced call that was replaced once its result expired while its Set hung.
+// Every other store gets a plain Set, whatever it embeds: a type that embeds
+// *MemoryStore and overrides Set (metrics, a write-through, compression) must
+// see its Set called, and an interface test would be satisfied by the
+// unexported method that embedding promotes. The order of two writes that
+// overlap is then the order that store applies them in (celeris#888 item 30).
+func storeFill(ctx context.Context, kv store.KV, key string, enc []byte, ttl time.Duration, gen uint64) error {
+	if ms, ok := kv.(*MemoryStore); ok {
+		return ms.setIfNewer(ctx, key, enc, ttl, gen)
+	}
+	return kv.Set(ctx, key, enc, ttl)
+}
 
 // ErrNotSupported is returned by [InvalidatePrefix] when the given
 // store does not implement the required extension interface.
@@ -104,6 +135,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		// during the Set, within the response's TTL, takes the response from
 		// the call (celeris#921).
 		var ttl time.Duration
+		var gen uint64
 		encoded, leader, err := group.Do(ctx, key, func() ([]byte, time.Duration, error) {
 			// nil dst: leader returns the encoded bytes via sf.Do; followers
 			// may still be reading them after this call frame returns, so
@@ -111,21 +143,25 @@ func New(config ...Config) celeris.HandlerFunc {
 			// to a request that arrives during the Set only within its TTL,
 			// as the stored entry would be: a Set that hangs must not serve
 			// it for longer.
+			gen = genNow()
 			enc, effectiveTTL, chainErr := capture(c, cfg, include, exclude, nil)
 			ttl = effectiveTTL
 			return enc, effectiveTTL, chainErr
 		}, func(enc []byte, _ error) {
 			if enc != nil {
-				_ = cfg.Store.Set(ctx, key, enc, ttl)
+				_ = storeFill(ctx, cfg.Store, key, enc, ttl, gen)
 			}
 		})
 		if leader {
 			return writeMiss(c, cfg, err)
 		}
-		if errors.Is(err, sf.ErrLeaderPanicked) {
+		if errors.Is(err, sf.ErrLeaderPanicked) || errors.Is(err, sf.ErrLeaderCanceled) {
 			// The leader's handler (or its Set) panicked; the panic is the
-			// leader's. This request runs its own handler, as it does when
-			// the leader's response is not cacheable (celeris#921).
+			// leader's. Or the leader's own request context ended (its
+			// client went away) and the handler said so; that error is its
+			// client's, not the key's. This request runs its own handler, as
+			// it does when the leader's response is not cacheable
+			// (celeris#921, celeris#888 item 26).
 			return executeAndStore(c, cfg, include, exclude, key)
 		}
 		if err != nil {
@@ -158,9 +194,10 @@ func New(config ...Config) celeris.HandlerFunc {
 // buffer is safe to recycle the moment Set returns.
 func executeAndStore(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, key string) error {
 	bufPtr := cacheBufPool.Get().(*[]byte)
+	gen := genNow()
 	encoded, ttl, chainErr := capture(c, cfg, include, exclude, (*bufPtr)[:0])
 	if encoded != nil {
-		_ = cfg.Store.Set(c.Context(), key, encoded, ttl)
+		_ = storeFill(c.Context(), cfg.Store, key, encoded, ttl, gen)
 	}
 	if cap(encoded) <= cacheBufMaxPooled {
 		*bufPtr = encoded
@@ -206,13 +243,14 @@ func capture(c *celeris.Context, cfg Config, include, exclude map[string]struct{
 				// c.SetHeader lowercases keys on storage, so an exact ==
 				// is both correct and ~10x faster than strings.EqualFold.
 				if h[0] == "cache-control" {
-					v := strings.ToLower(h[1])
-					if strings.Contains(v, "no-store") || strings.Contains(v, "private") {
+					noStore, secs, hasMaxAge := parseCacheControl(strings.ToLower(h[1]))
+					if noStore {
 						cacheable = false
 						break
 					}
-					if secs, ok := parseMaxAge(v); ok {
-						if d := time.Duration(secs) * time.Second; d > 0 && d < effectiveTTL {
+					// secs is > 0 here: max-age=0 is a reason not to store.
+					if hasMaxAge {
+						if d := time.Duration(secs) * time.Second; d < effectiveTTL {
 							effectiveTTL = d
 						}
 					}
@@ -294,23 +332,168 @@ func filterHeaders(hs [][2]string, include, exclude map[string]struct{}) [][2]st
 	return out
 }
 
-func parseMaxAge(cc string) (int, bool) {
-	const tok = "max-age="
-	idx := strings.Index(cc, tok)
-	if idx < 0 {
+// maxDeltaSeconds caps a max-age: math.MaxInt32 seconds is about 68 years, and
+// as a Duration it is far from overflowing, where max-age=10000000000 times
+// time.Second wraps to a negative TTL, which the stores read as no expiry.
+const maxDeltaSeconds = math.MaxInt32
+
+// parseCacheControl reads a lowercased Cache-Control value as directive
+// tokens. noStore reports that the response must not be stored: no-store and
+// private, as before, and now no-cache (a stored response must be revalidated
+// before every reuse, which this cache does not do; the field-qualified form
+// no-cache="x" is treated the same, as the cautious reading) and max-age=0
+// (stale the moment it is made). hasMaxAge and maxAge give the first
+// max-age directive, at most maxDeltaSeconds (RFC 9111
+// §1.2.2: a larger delta-seconds counts as the greatest value the cache can
+// represent), so that maxAge seconds always fits a time.Duration. The
+// directives are matched as tokens, so x-max-age=0 is not max-age=0 and
+// no-cache="x" is no-cache, and the storage decision and the TTL come from
+// this one parse (celeris#888 item 27).
+//
+// Two rules make this never looser than main, which refused any value that held
+// "private" or "no-store" anywhere. The floor: a value that holds either word,
+// anywhere, is not stored, whatever the parse below would read (a word glued to
+// other text, as when SetHeader strips a CR, LF or NUL between two directives,
+// x-private-ext, and one inside a quoted string included); nothing below can
+// undo it, the parse can only add refusals. And a max-age whose argument is not
+// 1*DIGIT (RFC 9111 §4.2.1: an invalid max-age is stale) is not stored, so
+// max-age=60abc is not max-age=60, and that includes "max-age=", abc, -1 and a
+// quoted string.
+//
+// A value that is not a list of directives (RFC 9111 §5.2: directive = token
+// ["=" (token / quoted-string)], separated by commas, RFC 9110 §5.6.1) is not
+// stored either, because what a recipient reads in it is a guess, and a wrong
+// guess serves one user's response to another. It is such a value when: the
+// name is empty or holds a byte that is not a token character (so "private; max-age"
+// is not private with a max-age, and a blank before the '=' is not accepted);
+// an unquoted value holds one (so "max-age=60 private" is not max-age=60); or a
+// quote cannot be read around: a string that never closes, a double quote
+// where a string cannot start, anything but blanks after the closing quote
+// (nextDirective). Empty list elements (",,") and blanks around the commas are
+// part of the list syntax, and "name=" is accepted as before for the names other
+// than max-age.
+func parseCacheControl(cc string) (noStore bool, maxAge int, hasMaxAge bool) {
+	// The floor, before any parsing: main's check (cc is lowercased), which
+	// nothing the parse below reads can undo.
+	if strings.Contains(cc, "private") || strings.Contains(cc, "no-store") {
+		return true, 0, false
+	}
+	for len(cc) > 0 {
+		var d string
+		var doubtful bool
+		d, cc, doubtful = nextDirective(cc)
+		if doubtful {
+			// A quote the directives cannot be read around: the ones after
+			// it may be hidden, so the response is not stored.
+			return true, 0, false
+		}
+		d = strings.Trim(d, " \t")
+		if d == "" {
+			continue // an empty list element
+		}
+		name, val, hasVal := strings.Cut(d, "=")
+		if !isToken(name) || hasVal && !isQuoted(val) && !isTokenOrEmpty(val) {
+			return true, 0, false
+		}
+		switch name {
+		case "no-store", "private", "no-cache":
+			return true, 0, false
+		case "max-age":
+			// RFC 9111 §4.2.1: an invalid max-age is stale, and this cache
+			// stores no stale response. The argument is 1*DIGIT, nothing else
+			// (empty, abc, -1, 60abc, a quoted string), whichever max-age it is.
+			n, ok := deltaSeconds(val)
+			if !ok || n == 0 {
+				return true, 0, false
+			}
+			if !hasMaxAge {
+				maxAge, hasMaxAge = min(n, maxDeltaSeconds), true
+			}
+		}
+	}
+	return false, maxAge, hasMaxAge
+}
+
+// isToken reports a non-empty token (RFC 9110 §5.6.2): every byte a tchar.
+func isToken(s string) bool { return s != "" && isTokenOrEmpty(s) }
+
+func isTokenOrEmpty(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !tchars[s[i]] {
+			return false
+		}
+	}
+	return true
+}
+
+// tchars marks RFC 9110 §5.6.2's tchar bytes.
+var tchars = func() (t [256]bool) {
+	for _, r := range "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~" {
+		t[r] = true
+	}
+	return
+}()
+
+// isQuoted reports a value that is a quoted string. nextDirective has seen to
+// it that the string closes and that only blanks follow it.
+func isQuoted(val string) bool { return val != "" && val[0] == '"' }
+
+// nextDirective splits the first comma-separated directive off a
+// Cache-Control value; a comma inside a quoted string (no-cache="a, b") does
+// not end it. A quoted string starts only at the double quote that directly
+// follows the directive's first "=" (RFC 9111 5.2: directive = token ["="
+// (token / quoted-string)]), and inside a string a backslash escapes the byte
+// after it (RFC 9110 5.6.4: ext="a\"" is one string), so a quoted-pair does
+// not end a string early and a string does not start anywhere else.
+// doubtful reports a value this cannot read with certainty: a string still
+// open at the end of the value, a double quote anywhere but where a string
+// starts (ext=a"b, ext=a="b, private", "private"), and anything but blanks
+// between the closing quote and the comma or the end (x="a"private). The
+// directives after such a quote may be hidden in a string or cut by one, so the
+// caller must not trust the rest of the value.
+func nextDirective(cc string) (directive, rest string, doubtful bool) {
+	inQuote, closed := false, false
+	eq := -2 // the index of the directive's first "=", -2 until it is seen
+	for i := 0; i < len(cc); i++ {
+		switch {
+		case inQuote:
+			switch cc[i] {
+			case '\\':
+				i++
+			case '"':
+				inQuote, closed = false, true
+			}
+		case closed && cc[i] != ',' && cc[i] != ' ' && cc[i] != '\t':
+			return cc, "", true
+		case cc[i] == '"':
+			if eq < 0 || i != eq+1 {
+				return cc, "", true
+			}
+			inQuote = true
+		case cc[i] == '=' && eq < 0:
+			eq = i
+		case cc[i] == ',':
+			return cc[:i], cc[i+1:], false
+		}
+	}
+	return cc, "", inQuote
+}
+
+// deltaSeconds parses v as delta-seconds (RFC 9111 §1.2.2: 1*DIGIT). ok is
+// false for anything else, an empty v included. A number too large for an int
+// is the greatest value, as the RFC has it.
+func deltaSeconds(v string) (n int, ok bool) {
+	if v == "" {
 		return 0, false
 	}
-	rest := cc[idx+len(tok):]
-	end := 0
-	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
-		end++
+	for i := 0; i < len(v); i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return 0, false
+		}
 	}
-	if end == 0 {
-		return 0, false
-	}
-	n, err := strconv.Atoi(rest[:end])
+	n, err := strconv.Atoi(v)
 	if err != nil {
-		return 0, false
+		return math.MaxInt32, true // 1*DIGIT, too large for an int
 	}
 	return n, true
 }

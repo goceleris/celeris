@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -351,6 +352,81 @@ func TestCacheIgnoreCacheControl922(t *testing.T) {
 			}
 			if r := runs.Load(); r != tc.wantRuns {
 				t.Errorf("handler ran %d times, want %d", r, tc.wantRuns)
+			}
+		})
+	}
+}
+
+// TestCacheCanceledLeaderDoesNotFailItsFollowers888: the leader's client goes
+// away while its handler runs: the request context ends and the handler
+// returns that error. The error is the leader's client's, not the key's. A
+// follower that waited on that leader, whose own client is still there, runs
+// its own handler instead of returning the leader's cancellation (celeris#888
+// item 26, from #940 review r2). A leader error that is not its context's
+// still reaches the followers, as before.
+func TestCacheCanceledLeaderDoesNotFailItsFollowers888(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cancel     bool
+		wantRuns   int32
+		wantStatus int
+		wantBody   string
+	}{
+		// The defect: the followers answered the leader's context.Canceled.
+		{"leader-context-canceled", true, 3, 200, "value"},
+		// Control: a leader that failed for another reason hands that error on.
+		{"leader-failed-otherwise", false, 1, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			joined := joinHook(t)
+			lctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			setCtx := func(c *celeris.Context) error { c.SetContext(lctx); return c.Next() }
+			entered, gate := make(chan struct{}), make(chan struct{})
+			var runs atomic.Int32
+			errUpstream := errors.New("upstream is down")
+			h := func(c *celeris.Context) error {
+				if runs.Add(1) == 1 {
+					close(entered)
+					<-gate
+					if tc.cancel {
+						cancel()
+						return fmt.Errorf("upstream call: %w", lctx.Err())
+					}
+					return errUpstream
+				}
+				return c.String(200, "value")
+			}
+			mw := New(Config{Store: store.NewMemoryKV()})
+
+			leader := serve921(t, setCtx, mw, h)
+			<-entered
+			const followers = 2
+			outs := make([]<-chan answer921, followers)
+			for i := range outs {
+				outs[i] = serve921(t, mw, h)
+			}
+			waitJoined(t, joined, followers)
+			close(gate)
+
+			l := await921(t, "leader", leader, 5*time.Second)
+			if tc.cancel && !errors.Is(l.err, context.Canceled) {
+				t.Errorf("leader: err=%v, want its own context.Canceled", l.err)
+			}
+			for i, ch := range outs {
+				f := await921(t, fmt.Sprintf("follower %d", i), ch, 3*time.Second)
+				if !f.done {
+					continue
+				}
+				if tc.cancel && (f.err != nil || f.status != tc.wantStatus || f.body != tc.wantBody) {
+					t.Errorf("follower %d: %d %q err=%v, want %d %q from its own handler run", i, f.status, f.body, f.err, tc.wantStatus, tc.wantBody)
+				}
+				if !tc.cancel && (f.err == nil || f.err.Error() != errUpstream.Error()) {
+					t.Errorf("follower %d: err=%v, want the leader's %q", i, f.err, errUpstream)
+				}
+			}
+			if got := runs.Load(); got != tc.wantRuns {
+				t.Errorf("handler runs: %d, want %d", got, tc.wantRuns)
 			}
 		})
 	}
