@@ -262,6 +262,25 @@ func newPubsubRig(t *testing.T, eng rigEngine) *pubsubRig {
 	return &pubsubRig{b: b, fake: fake, log: lg, prov: prov, gate: g, cl: cl}
 }
 
+// newPubSubAfterReuse is newPubSub for a dial that follows the close of a conn
+// on the same rig. The next socket usually gets the lowest free number, the
+// number of the conn just released, and the io_uring engine keeps a number
+// registered on its worker until the old conn's onClose has run, so its
+// RegisterConn refuses the new conn with "fd already registered" until then
+// (documented on engine.WorkerLoop.UnregisterConn; with one worker, as on a
+// runner whose memlock funds one, every number lands on the same worker).
+// The dial is retried for a while on exactly that error (celeris#887 item 10).
+func (r *pubsubRig) newPubSubAfterReuse(ctx context.Context) (*PubSub, error) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ps, err := r.cl.newPubSub(ctx)
+		if err == nil || !strings.Contains(err.Error(), "already registered") || time.Now().After(deadline) {
+			return ps, err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func (r *pubsubRig) dropServerSide() {
 	r.fake.mu.Lock()
 	conns := append([]net.Conn(nil), r.fake.conns...)
@@ -585,7 +604,7 @@ func testPubSubControlWritesDropsAndCloseInterleave929(t *testing.T, eng rigEngi
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	for i := 0; i < 15; i++ {
-		ps, err := r.cl.newPubSub(ctx)
+		ps, err := r.newPubSubAfterReuse(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
