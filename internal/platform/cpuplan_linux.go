@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -97,7 +98,7 @@ type planSource struct {
 // schedAllowedCPUs returns the members of the calling thread's CPU mask.
 func schedAllowedCPUs() ([]int, error) {
 	var set unix.CPUSet
-	if err := unix.SchedGetaffinity(0, &set); err != nil {
+	if err := sysSchedGetaffinity(0, unsafe.Sizeof(set), unsafe.Pointer(&set)); err != nil {
 		return nil, err
 	}
 	var out []int

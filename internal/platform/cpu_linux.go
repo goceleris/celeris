@@ -47,7 +47,7 @@ type ThreadAffinity struct {
 // mask the process started with (celeris#905).
 func SaveThreadAffinity() (ThreadAffinity, error) {
 	var a ThreadAffinity
-	if err := unix.SchedGetaffinity(0, &a.set); err != nil {
+	if err := sysSchedGetaffinity(0, unsafe.Sizeof(a.set), unsafe.Pointer(&a.set)); err != nil {
 		return ThreadAffinity{}, err
 	}
 	return a, nil
@@ -59,17 +59,30 @@ func (a ThreadAffinity) Restore() error {
 }
 
 func schedSetaffinity(pid int, set *unix.CPUSet) error {
-	_, _, errno := unix.RawSyscall(
-		unix.SYS_SCHED_SETAFFINITY,
-		uintptr(pid),
-		unsafe.Sizeof(*set),
-		uintptr(unsafe.Pointer(set)),
-	)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return sysSchedSetaffinity(pid, unsafe.Sizeof(*set), unsafe.Pointer(set))
 }
+
+// sysSchedGetaffinity and sysSchedSetaffinity are the two affinity syscalls,
+// as variables so a test can stand in for a kernel the test host is not: one
+// with more than 1024 possible CPUs, whose sched_getaffinity answers EINVAL to
+// a buffer under its mask size. size is in bytes. They are replaced only by
+// tests, which restore them (and so must not run in parallel).
+var (
+	sysSchedGetaffinity = func(pid int, size uintptr, ptr unsafe.Pointer) error {
+		_, _, errno := unix.RawSyscall(unix.SYS_SCHED_GETAFFINITY, uintptr(pid), size, uintptr(ptr))
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+	sysSchedSetaffinity = func(pid int, size uintptr, ptr unsafe.Pointer) error {
+		_, _, errno := unix.RawSyscall(unix.SYS_SCHED_SETAFFINITY, uintptr(pid), size, uintptr(ptr))
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+)
 
 // BindNumaNode sets the calling thread's memory allocation policy to MPOL_BIND
 // for the given NUMA node. All subsequent mmap allocations will be satisfied
