@@ -369,8 +369,11 @@ func TestSwitchWaitForTheIncomingListenerDoesNotBlockMetrics683(t *testing.T) {
 	// before performSwitch takes e.mu, and the unfixed code would pass.
 	for late.calls.Load() == 0 {
 		select {
-		case <-done:
-			t.Fatalf("celeris683 PREMISE: the switch ended without resuming the late engine")
+		case w := <-done:
+			if late.calls.Load() == 0 {
+				t.Fatalf("celeris683 PREMISE: the switch ended after %v without resuming the late engine", w)
+			}
+			done <- w // resumed and already over: the checks below say what that means
 		case <-time.After(time.Millisecond):
 		}
 	}
