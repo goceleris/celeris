@@ -78,7 +78,7 @@ type Config struct {
 	// epoll and io_uring engines keep the port bound, to a socket that never
 	// listens, while accepting is paused and until they stop, so it stays the
 	// same across a pause and resume of accepting. Adaptive (the default on
-	// Linux) has no [Server.PauseAccept], and it holds the port of any address
+	// Linux) does not support [Server.PauseAccept], and it holds the port of any address
 	// the same way: from [Server.Start] until its Listen returns, which includes
 	// the moments of an engine switch in which no sub-engine listens (with
 	// [Config.DisableDeferAccept] the outgoing engine's listen sockets close at
