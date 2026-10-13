@@ -125,25 +125,17 @@ func TestGoexitedLoopLeavesTheGroupAndThePauseDoesNotWaitForIt848(t *testing.T) 
 		t.Errorf("PauseAccept took %v, want under 800 ms (a pause waited for the dead loop to its bound)", firstPause)
 	}
 
-	// 3. After the pause no dial is accepted: the dead listener is closed too.
-	// The kernel may release it a moment after the close, so poll for the first
-	// refusal, then require that refusal to hold for 20 dials.
+	// 3. After the pause no dial is accepted: the dead listener is closed too,
+	// and it has left the group by the time PauseAccept returns, so the very
+	// first dial is refused (no polling), and the refusal holds for 20 dials.
 	refusedAfter := time.Duration(-1)
-	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(10 * time.Millisecond) {
-		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
-		if err == nil {
-			_ = c.Close()
-			continue
-		}
-		if !errors.Is(err, syscall.ECONNREFUSED) {
-			t.Fatalf("a dial after the pause failed with %v, want connection refused", err)
-		}
-		refusedAfter = time.Since(t0)
-		break
-	}
-	if refusedAfter < 0 {
-		t.Errorf("a dial after PauseAccept was still accepted 5 s on: a listener stayed open")
+	if c, err := net.DialTimeout("tcp", addr, 2*time.Second); err == nil {
+		_ = c.Close()
+		t.Errorf("the first dial after PauseAccept returned was accepted, %v after the pause began: the dead listener was still in the SO_REUSEPORT group", time.Since(t0))
+	} else if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("a dial after the pause failed with %v, want connection refused", err)
 	} else {
+		refusedAfter = time.Since(t0)
 		for i := 0; i < 20; i++ {
 			if c, err := net.DialTimeout("tcp", addr, 2*time.Second); err == nil {
 				_ = c.Close()
