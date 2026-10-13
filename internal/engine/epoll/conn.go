@@ -171,6 +171,20 @@ type connState struct {
 	closeAckedKnown bool
 	writeRefused    bool
 
+	// gen is the generation of this conn's registration with the loop's epoll
+	// set: unique on the loop among the HTTP conns it registered, never 0, and
+	// with bit 31 set (httpGenBit), which no driver conn's has. Every
+	// epoll_event of the conn (the ADD and every MOD) carries it in Pad, and
+	// the run loop drops an event whose generation is not that of the conn in
+	// the slot of its descriptor: the event was collected for a conn that has
+	// since gone, and its number is another conn's (celeris#885 item 18, the
+	// HTTP twin of celeris#771). Drawn by the loop from httpGen on every accept
+	// and every adoption, and not counted up on the pooled connState: the same
+	// pointer comes back on the reused number, which is the case the check is
+	// for. Loop thread; reset on release. (Declared with the flags above, in
+	// the 4-byte hole before closeSince: see TestConnStateStaysInItsSizeClass.)
+	gen uint32
+
 	// closeSince, closePending and closeAcked are the clock of that deferred
 	// close (celeris#876): closeSince is when the engine last saw the close
 	// move forward, in nanoseconds, from the request that deferred it
@@ -207,7 +221,14 @@ type connState struct {
 	drainDeadline int64
 
 	// WebSocket recv backpressure (detached conns only):
-	recvPaused       bool        // engine-side current state (single-threaded write)
+	recvPaused bool // engine-side current state (single-threaded write)
+	// halfCloseOwed (loop thread only) records an EPOLLRDHUP that
+	// onPeerHalfClose could not act on because the conn's dispatch goroutine
+	// held detachMu across a handler: the event is edge-triggered and will
+	// not come again, so the goroutine's hand-back (drainDetachQueue) runs
+	// onPeerHalfClose once more (celeris#885 items 27 and 36). Reset on
+	// release. (Declared here for the padding before recvPauseDesired.)
+	halfCloseOwed    bool
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
 
 	// Async handler dispatch (Config.AsyncHandlers=true, HTTP1 only):
@@ -446,6 +467,8 @@ func releaseConnState(cs *connState) {
 	cs.closeErr = nil
 	cs.relinkOwed = false
 	cs.relinkPending = false
+	cs.halfCloseOwed = false
+	cs.gen = 0
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

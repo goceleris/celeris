@@ -159,14 +159,16 @@ func (l *Loop) lookupDriver(fd int) *driverConn {
 // goroutine.
 //
 // The event names its conn by the descriptor number (Fd) and the generation of
-// its registration (Pad; 0 for an HTTP conn). The worker collects a batch of
+// its registration (Pad; an HTTP conn's has bit 31 set, see httpGenBit). The
+// worker collects a batch of
 // events and dispatches it one by one, so an event of a conn can be dispatched
 // after the conn has gone and its number has been taken: by a driver conn
 // registered since, which has another generation, or by nothing. Applied to
 // the conn found by number, A's EPOLLRDHUP closed X (celeris#771). So the
 // event goes to the conn found only if the generations are equal, and is
 // dropped otherwise, as is a driver event whose conn has gone. An HTTP conn's
-// event (Pad 0) on a number that is a driver conn's is dropped too: RegisterConn
+// event (Pad 0 or its generation) on a number that is a driver conn's is dropped
+// too: RegisterConn
 // refuses a number that is an HTTP conn's, so that event was collected for an
 // HTTP conn that has since gone. The converse is not enforced: acceptAll does
 // not look at driverConns, and a conn that closeDriver closed on the caller's
@@ -177,9 +179,11 @@ func (l *Loop) lookupDriver(fd int) *driverConn {
 func (l *Loop) dispatchDriver(fd int, gen uint32, events uint32) bool {
 	dc := l.lookupDriver(fd)
 	if dc == nil {
-		// Nothing is registered on the number. An event with a generation is
-		// a driver conn's that has gone: dropped, not an HTTP conn's.
-		return gen != 0
+		// Nothing is registered on the number. An event with a driver
+		// generation is a driver conn's that has gone: dropped, not an HTTP
+		// conn's. An HTTP conn's (Pad 0, or its generation, bit 31 set) is
+		// the HTTP path's.
+		return isDriverGen(gen)
 	}
 	if dc.gen != gen {
 		return true
@@ -192,7 +196,51 @@ func (l *Loop) dispatchDriver(fd int, gen uint32, events uint32) bool {
 // conn's, so that the worker looks it up: it carries a registration's
 // generation, or a driver conn is registered. The HTTP path's whole cost.
 func (l *Loop) driverCandidate(gen uint32) bool {
-	return gen != 0 || l.hasDriverConns.Load()
+	return isDriverGen(gen) || l.hasDriverConns.Load()
+}
+
+// The generations in the Pad of an epoll_event, by who made the registration
+// (celeris#771, celeris#885):
+//
+//	0                           nobody's: the listen socket, the timer and
+//	                            wake descriptors, and a pre-generation conn
+//	1 .. maxDriverGen           a driver conn's (RegisterConn)
+//	httpGenBit .. 0xffffffff    an HTTP conn's (nextHTTPGen), bit 31 set
+//
+// so the two never collide, and driver generations are the positive int32s.
+const (
+	httpGenBit   uint32 = 1 << 31
+	maxDriverGen uint32 = httpGenBit - 1
+)
+
+// isDriverGen reports whether pad is a driver registration's generation.
+func isDriverGen(pad uint32) bool { return int32(pad) > 0 }
+
+// nextHTTPGen draws the generation for an HTTP conn about to be registered:
+// the next of the loop's 31-bit count, with bit 31 set, so never 0 and never a
+// driver's. The count wraps after 2^31 registrations on this loop; an event
+// reaches the wrong conn only if the conn now on its number was registered a
+// multiple of 2^31 registrations after the one the event was collected for,
+// while the event waits to be dispatched. Loop thread only.
+func (l *Loop) nextHTTPGen() uint32 {
+	l.httpGen = (l.httpGen + 1) & maxDriverGen
+	return httpGenBit | l.httpGen
+}
+
+// httpEpollEvent is the epoll_event for an HTTP conn's registration of fd with
+// the given interest: the number in Fd, and the registration's generation in
+// Pad, which the kernel hands back with each event it reports for the
+// descriptor. Every EPOLL_CTL_ADD and EPOLL_CTL_MOD of an HTTP conn uses it
+// (through connState.epollEvent once the conn exists): a MOD replaces the whole
+// event data, and one without the generation would make the conn's later
+// events skip the run loop's identity check (celeris#885 item 18).
+func httpEpollEvent(fd int, gen uint32, events uint32) unix.EpollEvent {
+	return unix.EpollEvent{Events: events, Fd: int32(fd), Pad: int32(gen)}
+}
+
+// epollEvent is httpEpollEvent for cs's own registration.
+func (cs *connState) epollEvent(events uint32) unix.EpollEvent {
+	return httpEpollEvent(cs.fd, cs.gen, events)
 }
 
 // RegisterConn adds fd to this worker's interest set and installs the
@@ -229,12 +277,14 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 
 	// The registration's generation, set before the conn is published
 	// (celeris#771). Under driverMu, which RegisterConn holds. 0 never names a
-	// registration; the count wraps after 2^32-1 registrations on this loop,
-	// and an event reaches the wrong conn only if the conn now on its number
-	// has the event's generation: a multiple of 2^32-1 registrations would
-	// have to come between the two while the event waits to be dispatched.
+	// registration, and neither does a value with bit 31 set (an HTTP conn's,
+	// see httpGenBit): the count wraps after maxDriverGen (2^31-1)
+	// registrations on this loop, and an event reaches the wrong conn only if
+	// the conn now on its number has the event's generation: a multiple of
+	// 2^31-1 registrations would have to come between the two while the event
+	// waits to be dispatched.
 	l.driverGen++
-	if l.driverGen == 0 {
+	if l.driverGen > maxDriverGen {
 		l.driverGen = 1
 	}
 	dc := &driverConn{
