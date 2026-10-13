@@ -93,12 +93,14 @@ func TestDetachOnDetachPanicKeepAliveConn889(t *testing.T) {
 		t.Errorf("request 2 got no 200: %q", r.out.String())
 	}
 
-	// The connection closes: the cached Context goes to the pool exactly once.
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	// The connection closes: the Context the stream cached (request 2's, the
+	// same object as request 1's) is released to the pool, and only now.
 	conn.CloseH1(r.state)
-	g1, g2 := contextPool.Get(), contextPool.Get()
-	if g1 == g2 {
-		t.Errorf("contextPool returned the same Context twice: released twice")
+	if !c1.pooled {
+		t.Error("the connection closed and its cached Context was not released to the pool")
+	}
+	if c2 != c1 {
+		t.Error("request 2 did not reuse the connection's cached Context")
 	}
 }
 

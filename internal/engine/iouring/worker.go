@@ -2922,10 +2922,14 @@ func (w *Worker) initProtocol(cs *connState) {
 			// owns the mutation. The first guarded() write below
 			// enqueues+signals, so drainDetachQueue fires promptly.
 			if !w.async {
-				w.detachedCount++
-				cs.detachCounted = true
-				if w.detachedConns != nil {
-					w.detachedConns.Add(1)
+				// Once per conn: a run after a panic out of an earlier one counts again
+				// otherwise, and closeConn decrements once (#889 item 34).
+				if !cs.detachCounted {
+					w.detachedCount++
+					cs.detachCounted = true
+					if w.detachedConns != nil {
+						w.detachedConns.Add(1)
+					}
 				}
 			} else {
 				cs.asyncDetachPending = true
@@ -3084,6 +3088,15 @@ func (w *Worker) initProtocol(cs *connState) {
 						w.enqueueDetach(cs)
 					}
 				}()
+			}
+			if cs.detachGuarded {
+				// A run after a panic out of an earlier one: that run's guard is
+				// still cs.writeFn, and wrapping it again would lock detachMu twice
+				// per write. Keep it; the rest of the hook installs what the panic
+				// cut short (#889 item 34).
+				guarded = cs.writeFn
+			} else {
+				cs.detachGuarded = true
 			}
 			cs.writeFn = guarded
 			// Also update the response adapter so StreamWriter writes

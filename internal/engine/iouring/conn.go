@@ -234,6 +234,12 @@ type connState struct {
 	writeFn      func([]byte) // cached write function (avoids closure allocation per recv)
 	detachMu     *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
 	detachClosed bool         // true after closeConn on a detached conn; writeFn becomes no-op
+	// detachGuarded: OnDetach installed the guarded writeFn. A panic out of the
+	// hook after that leaves the conn open, and the next Detach runs the hook
+	// again: it keeps that guard, because a guard over a guard takes the one
+	// non-reentrant detachMu twice on the first write (#889 item 34). A bool,
+	// in the padding beside detachClosed: connState is at its size class.
+	detachGuarded bool
 
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (worker-thread only)
@@ -586,6 +592,7 @@ func releaseConnState(cs *connState) {
 	cs.h2State = nil
 	cs.ctx = nil
 	cs.writeFn = nil
+	cs.detachGuarded = false
 	cs.remoteAddr = ""
 	cs.dirtyNext = nil
 	cs.dirtyPrev = nil

@@ -2198,8 +2198,12 @@ func (l *Loop) initProtocol(cs *connState) {
 			// the event-loop thread, and the eventfd allocation +
 			// EPOLL_CTL_ADD touches the loop's epoll set.
 			if !l.async {
-				l.detachedCount++
-				cs.detachCounted = true
+				// Once per conn: a run after a panic out of an earlier one counts again
+				// otherwise, and closeConn decrements once (#889 item 34).
+				if !cs.detachCounted {
+					l.detachedCount++
+					cs.detachCounted = true
+				}
 			} else {
 				cs.asyncDetachPending = true
 			}
@@ -2342,6 +2346,15 @@ func (l *Loop) initProtocol(cs *connState) {
 						l.enqueueDetach(cs)
 					}
 				}()
+			}
+			if cs.detachGuarded {
+				// A run after a panic out of an earlier one: that run's guard is
+				// still cs.writeFn, and wrapping it again would lock detachMu twice
+				// per write. Keep it; the rest of the hook installs what the panic
+				// cut short (#889 item 34).
+				guarded = cs.writeFn
+			} else {
+				cs.detachGuarded = true
 			}
 			cs.writeFn = guarded
 			// Also update the response adapter so StreamWriter writes
