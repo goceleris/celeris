@@ -172,12 +172,26 @@ type Config struct {
 	ShutdownTimeout time.Duration
 
 	// MaxFormSize is the maximum memory used for multipart form parsing
-	// (default 32 MB). Set to -1 to disable the limit.
+	// (default 32 MB). Set to -1 to disable the limit. It applies to a body
+	// the engine has already accepted, so it is also bounded by
+	// [Config.MaxRequestBodySize] (default 4 MiB): a multipart body over that
+	// is refused before the handler runs.
 	MaxFormSize int64
 
 	// MaxRequestBodySize is the maximum allowed request body size in bytes
-	// across all protocols (H1, H2, bridge). 0 uses the default (100 MB).
-	// Set to -1 to disable the limit (unlimited).
+	// across all protocols (H1, H2, bridge). 0 uses the default (4 MiB; it
+	// was 100 MB before v1.6.0). Set to -1 to disable the limit (unlimited).
+	//
+	// The engine buffers the whole body in memory before the handler runs, so
+	// the limit times the number of concurrent connections is what clients can
+	// make the server hold: raise it for the routes or servers that accept
+	// larger uploads, and treat -1 as a choice to accept that. A body over the
+	// limit is refused with 413 (HTTP/1.1, and std over HTTP/2) or with
+	// RST_STREAM (HTTP/2 on the native engines). A multipart or form body is
+	// a request body like any other: one over this limit is refused before the
+	// handler runs, so with the default the default [Config.MaxFormSize]
+	// (32 MB) is never reached; raise both for larger multipart uploads. The
+	// middleware/bodylimit package sets a per-route limit below this one.
 	MaxRequestBodySize int64
 
 	// MaxConcurrentStreams limits simultaneous H2 streams per connection (default 100).

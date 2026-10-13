@@ -149,7 +149,7 @@ type H1State struct {
 	stream             *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
 	RemoteAddr         string
 	HijackFn           func() (net.Conn, error)                            // set by engine; nil if unsupported
-	MaxRequestBodySize int64                                               // 0 = use default (100 MB)
+	MaxRequestBodySize int64                                               // 0 = unlimited; resource.Config.WithDefaults resolves the default
 	OnExpectContinue   func(method, path string, headers [][2]string) bool // nil = always accept
 	OnDetach           func()                                              // set by engine; called on Context.Detach
 	Detached           atomic.Bool                                         // set by OnDetach; breaks pipelining loop. atomic: written on the dispatch/handler goroutine (Context.Detach -> OnDetach), read on the engine worker goroutine.

@@ -46,7 +46,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 - **Response buffering** — `BufferResponse` / `FlushResponse` for transform middleware (compress, ETag, cache).
 - **File serving** — `File()` from the OS, `FileFromFS()` from `embed.FS` / `fs.FS`.
 - **Content negotiation** — `Negotiate`, `Respond`, `AcceptsEncodings`, `AcceptsLanguages`.
-- **Configurable body limits** — `MaxRequestBodySize` enforced on HTTP/1.1 and h2c (the net/http bridge has a fixed 100 MB cap).
+- **Configurable body limits** — `MaxRequestBodySize` enforced on HTTP/1.1 and h2c (default 4 MiB; the net/http bridge buffers the adapted handler's response up to a fixed 100 MB).
 - **100-continue control** — `OnExpectContinue` callback validates uploads before the body transfers.
 - **Accept control** — `PauseAccept()` / `ResumeAccept()` for graceful load shedding. A pause carries clients that have connected but not yet sent their request: it keeps the listen sockets open for about 1.5 s with `TCP_DEFER_ACCEPT` cleared before closing them, and blocks for that long; set `DisableDeferAccept` for a pause that closes at once ([#662](https://github.com/goceleris/celeris/issues/662), [#675](https://github.com/goceleris/celeris/issues/675)).
 - **Zero-downtime restart** — `InheritListener` + `StartWithListener` for socket inheritance.
@@ -215,7 +215,7 @@ s := celeris.New(celeris.Config{
 	WriteTimeout:       30 * time.Second,
 	IdleTimeout:        120 * time.Second,
 	ShutdownTimeout:    10 * time.Second,  // max wait for in-flight requests (default 30s)
-	MaxRequestBodySize: 50 << 20,          // 50 MB (default 100 MB, -1 for unlimited)
+	MaxRequestBodySize: 50 << 20,          // 50 MB (default 4 MiB, -1 for unlimited)
 	AsyncHandlers:      false,             // server-level default (per-route .Async() overrides)
 	Logger:             slog.Default(),
 })
