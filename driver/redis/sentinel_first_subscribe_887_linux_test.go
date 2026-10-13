@@ -13,6 +13,7 @@ package redis
 // another test that builds a PubSub.
 
 import (
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,10 +36,21 @@ func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheConnDown887(t *testi
 		if !fired.CompareAndSwap(false, true) {
 			return
 		}
+		// The dial returns once the socket is connected, which can be before
+		// the fake server's accept loop has recorded it: wait for it, and take
+		// the lock only inside the condition (a panic with the lock held
+		// would deadlock the fake's cleanup).
+		var last net.Conn
+		waitFor(t, "the first sentinel to accept the conn", 5*time.Second, func() bool {
+			a.fake.mu.Lock()
+			defer a.fake.mu.Unlock()
+			if len(a.fake.conns) == 0 {
+				return false
+			}
+			last = a.fake.conns[len(a.fake.conns)-1]
+			return true
+		})
 		_ = a.fake.ln.Close()
-		a.fake.mu.Lock()
-		last := a.fake.conns[len(a.fake.conns)-1]
-		a.fake.mu.Unlock()
 		_ = last.Close()
 		waitFor(t, "the loop to tear the new conn down (onClose)", 5*time.Second, c.closed.Load)
 	}
