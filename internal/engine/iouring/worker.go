@@ -1448,7 +1448,8 @@ func (w *Worker) run(ctx context.Context) {
 			cqHead, cqTail = w.ring.BeginCQ()
 			if cqHead == cqTail {
 				// No CQEs — wait with adaptive timeout.
-				if err := w.ring.WaitCQETimeout(w.adaptiveTimeout()); err != nil {
+				err := w.ring.WaitCQETimeout(w.adaptiveTimeout())
+				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSQPoll, err) {
 					w.shutdown()
 					return
 				}
@@ -1474,7 +1475,8 @@ func (w *Worker) run(ctx context.Context) {
 				// Mode 1: CQEs ready + SQEs pending. SubmitAndWait combines
 				// submission + CQE retrieval into one syscall (saves ~300ns vs
 				// separate Submit + next-iteration wait).
-				if err := w.ring.SubmitAndWait(); err != nil {
+				err := w.ring.SubmitAndWait()
+				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSubmitReady, err) {
 					w.shutdown()
 					return
 				}
@@ -1487,7 +1489,8 @@ func (w *Worker) run(ctx context.Context) {
 				// peer that does not read has no completion to wait for, and
 				// the drain's end is checked only between waits. The timed
 				// wait below, capped by adaptiveTimeout, bounds it.
-				if err := w.ring.SubmitAndWait(); err != nil {
+				err := w.ring.SubmitAndWait()
+				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSubmitSends, err) {
 					w.shutdown()
 					return
 				}
@@ -1495,7 +1498,8 @@ func (w *Worker) run(ctx context.Context) {
 			} else if hasPending || cqHead == cqTail {
 				// Mode 3b: no guaranteed CQEs — wait with adaptive timeout for
 				// shutdown checks and CQE_SKIP_SUCCESS operations.
-				if err := w.ring.SubmitAndWaitTimeout(w.adaptiveTimeout()); err != nil {
+				err := w.ring.SubmitAndWaitTimeout(w.adaptiveTimeout())
+				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeTimed, err) {
 					w.shutdown()
 					return
 				}
@@ -7281,6 +7285,16 @@ func (w *Worker) stopDetachedProducers() {
 		}
 		cs.detachMu.Unlock()
 	}
+}
+
+// ringWaitContinues reports whether the loop may go on after the ring wait
+// of mode ended with err (nil when the wait succeeded): false means shut the
+// worker down.
+func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
+	if h := ringWaitSeam; h != nil {
+		err = h(w, mode, err)
+	}
+	return err == nil
 }
 
 func (w *Worker) shutdown() {
