@@ -204,8 +204,8 @@ func TestPinToCPUAboveTheFirst1024(t *testing.T) {
 		t.Errorf("after PinToCPU(1500) the mask is %v, want [1500]", got)
 	}
 	// Past what any kernel has: refused, and nothing allocated for it.
-	if err := PinToCPU(1 << 40); !errors.Is(err, unix.EINVAL) {
-		t.Errorf("PinToCPU(1<<40) = %v, want EINVAL", err)
+	if err := PinToCPU(1 << 30); !errors.Is(err, unix.EINVAL) {
+		t.Errorf("PinToCPU(1<<30) = %v, want EINVAL", err)
 	}
 }
 
