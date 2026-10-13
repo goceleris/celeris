@@ -137,13 +137,16 @@ func envInt589(name string, def int) int {
 //     same run on the same box, not a number of milliseconds picked for a
 //     particular one.
 //
-// io_uring's numbers are PRINTED, not asserted: when this rig was written even
-// the fully async control pinned the io_uring worker ~30 % of wall time through
-// the celeris#593 timeout sweep (see the note below), a separate defect with
-// its own fix. That fix is PR #604, which now sits underneath this branch, and
-// the io_uring fraction measured on this tree is 0.000 in 10/10 settled runs.
-// The bar stays epoll-only so this change does one thing; the IOURING592 line
-// carries the numbers for whoever tightens it.
+// io_uring's latency is asserted as a FRACTION, not as the epoll ratio
+// (celeris#886 item 1): when this rig was written even the fully async control
+// pinned the io_uring worker ~30 % of wall time through the celeris#593 timeout
+// sweep (see the note below), a separate defect with its own fix, PR #604. The
+// settled arm used to PRINT that fraction and assert only state, so with the
+// celeris#593 TryLock put back to a blocking Lock the io_uring half still
+// passed (10/10 at 0.315-0.351 against 0.000-0.001 on the fixed tree). It now
+// fails when more than stall592IOUringMaxQueuedFrac of the post-promotion
+// /ping samples waited for a blocked Set. The bar is provisional: see the
+// constant.
 //
 // The observable follows the two binding adversarial-review corrections on the
 // issue: the PRIMARY assertion is the dispatch STATE after the route has turned
@@ -321,6 +324,28 @@ const (
 	stall592MinSpeedup    = 5.0
 	stall592QueuedNotice  = 0.05
 	stall592MinRefSamples = 2
+
+	// stall592IOUringMaxQueuedFrac is the io_uring settled arm's bar
+	// (celeris#886 item 1, from celeris#739 item 2): the fraction of the
+	// post-promotion /ping samples that waited for a blocked Set (over
+	// queuedBar589, D/2) may not exceed it. PROVISIONAL: the owner sets the
+	// final number.
+	//
+	// What it separates, all arm64, golang:1.27, memlock unlimited, 10 runs
+	// each (lanes-20261009/ADTST/measure-886-1.sh, logs/m1-*): the fixed tree
+	// 0.000 (idle) with the worst sample 0.001 stalled over 5 ms; the
+	// celeris#593 TryLock reverted to a blocking Lock 0.315-0.351 (the number
+	// the item quotes, 0.327-0.340). For a pinned worker the queued and the
+	// stalled (over 5 ms) fractions are the same number, because a stalled
+	// sample waits ~D; the queued one is asserted because the 5 ms bar is the
+	// runner's (celeris#622). The other side of the bar is celeris#622's 0.145
+	// outlier, an epoll run on an overloaded box whose median proved the worker
+	// free; 0.20 sits 0.055 above that and 0.115 below the lowest pinned run.
+	// With eight busy loops competing for the container's CPUs (the median
+	// /ping rises from 0.03 to 1.9 ms) the fixed tree stays at queued 0.000
+	// (stalled over 5 ms up to 0.006) and the pinned worker at 0.327-0.347,
+	// ten runs each (logs/m1-load8-*).
+	stall592IOUringMaxQueuedFrac = 0.20
 
 	// The CONTROL arms' latency observable, celeris#628. Both controls used
 	// to end with `o.pingMed >= stall589StallBar` — the same absolute 5 ms of
@@ -500,13 +525,13 @@ func assertSettledStall589(o stall589Obs) error {
 
 // assertSettledRetimed592 is the FIXED behaviour: the settled classification is
 // re-timed, so a settled route whose store turns slow is promoted and stops
-// running on the engine worker. State is asserted on both engines; the latency
-// observable is asserted on epoll only, because io_uring separately pinned its
-// worker in the timeout sweep even when every conn is async-dispatched
-// (celeris#593) — its numbers are printed instead. #593 is fixed on main by
-// PR #604, which sits underneath this rig, and the printed io_uring numbers
-// invert as epoll's do; the bar is left epoll-only so this stays one change,
-// and the IOURING592 line carries what a tightening would be judged on.
+// running on the engine worker. State is asserted on both engines. The latency
+// observable differs by engine: epoll is judged on the ratio below, io_uring on
+// the fraction of post-promotion samples that waited for the blocked Set,
+// because io_uring separately pinned its worker in the timeout sweep even when
+// every conn is async-dispatched (celeris#593; fixed on main by PR #604). A
+// pinned worker shows that fraction at 0.3 and the fixed tree at 0, so it
+// needs no reference window and is not subject to the VOID case.
 //
 // The latency observable is RELATIVE (celeris#622). What the settled arm
 // claims is that a re-timed route stops costing the worker — not that a /ping
@@ -765,22 +790,20 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 	// policy but a second defect (io_uring: checkTimeouts blocks on detachMu
 	// held by runAsyncHandler across the slow ProcessH1). Name it on its own
 	// line so the CONTROL_OK verdict (decided on the median) cannot hide it.
-	// io_uring is not judged on the settled mode's latency: PRINT the two
-	// numbers the epoll arm IS judged on (celeris#622 — the queued fraction
-	// against the injected-delay bar, and the settled-vs-pinned median
-	// speedup) so the unasserted side is on the record in the asserted form.
-	// The celeris#593 sweep pin this allowance was written for is FIXED on
-	// main (PR #604, the checkTimeouts/handleHeaderTimer TryLock) — so the
-	// line is now a witness that the two fixes compose, and the numbers to
-	// watch if the bar is ever tightened to cover both engines.
+	// io_uring is judged on the queued fraction (stall592IOUringMaxQueuedFrac,
+	// celeris#886 item 1), not on the median speedup epoll is judged on. Print
+	// both beside the stalled fraction: the line is a witness that the
+	// celeris#593 fix (PR #604, the checkTimeouts/handleHeaderTimer TryLock)
+	// and the celeris#592 re-opener compose, and the numbers to read when the
+	// bar fails.
 	if o.engine == "iouring" && o.mode == stall589Settled.String() {
 		t.Logf("IOURING592 engine=iouring mode=settled speedup=%.1fx (epoll bar %.0fx, ref %v over %d pinned samples) "+
 			"queued=%d/%d queued_frac=%.3f over %v stalled_frac=%.3f ping_med_ms=%.3f ping_max_ms=%.1f promote_ms=%.0f "+
-			"async_promoted_conns=%d: reported, not asserted — the celeris#593 sweep pin (checkTimeouts blocking on detachMu "+
-			"held by runAsyncHandler across the slow ProcessH1) is fixed by PR #604 underneath this rig",
+			"async_promoted_conns=%d: queued_frac is asserted (bar %.2f), the speedup is reported — the celeris#593 sweep pin "+
+			"(checkTimeouts blocking on detachMu held by runAsyncHandler across the slow ProcessH1) is fixed by PR #604 underneath this rig",
 			o.speedup, stall592MinSpeedup, o.refPingMed, o.refSamples,
 			o.queued, o.samples, o.queuedFrac, o.queuedBar, o.stalledFrac, ms(o.pingMed), ms(o.pingMax), ms(o.promoteLatency),
-			o.asyncPromotedConns)
+			o.asyncPromotedConns, stall592IOUringMaxQueuedFrac)
 	}
 	// The queued fraction is the tail of the post-promotion window against the
 	// rig's own injected delay. It is NOT asserted (celeris#622: a starved
