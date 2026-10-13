@@ -459,6 +459,15 @@ type Worker struct {
 	// ResumeAccept clears that flag on every worker, a dead one included, and
 	// nothing would set it again.
 	exited atomic.Bool
+	// closingFD is the listen descriptor closeListenerAfterDrain or
+	// stopAccepting has taken out of listenFD and not yet closed, when
+	// closingSet: those two clear listenFD before they run handlers (the
+	// cancel's completions, OnConnect for the queued connections), so a
+	// Goexit in a handler would leave the descriptor open and in the
+	// SO_REUSEPORT group, and leaveGroupAfterExit closes it from here.
+	// Worker thread only.
+	closingFD  int
+	closingSet bool
 	// lingerUntil is the deadline, on deferlinger's monotonic clock, of the
 	// accept-pause linger in progress, or 0 when none is (celeris#662): the
 	// listener's TCP_DEFER_ACCEPT has been cleared and its multishot accept
@@ -2535,6 +2544,7 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// worker does not own.
 	lfd := w.listenFD
 	w.listenFD = -1
+	w.closingFD, w.closingSet = lfd, true
 	w.cancelAccept(ctx, lfd)
 	// The completions above only cover handshakes an accept had already
 	// reached. Anything still in the kernel accept queue would be aborted
@@ -2543,6 +2553,7 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// (celeris#662).
 	w.acceptQueuedOnPause(ctx, lfd)
 	_ = unix.Close(lfd)
+	w.closingSet = false
 	w.lingerUntil = 0
 	deferlinger.NoteClose()
 	w.listenFDClosed.Store(true)
@@ -2652,8 +2663,10 @@ func (w *Worker) stopAccepting(ctx context.Context) {
 	}
 	lfd := w.listenFD
 	w.listenFD = -1 // before the cancel's completions: handleAccept re-arms on a listenFD >= 0
+	w.closingFD, w.closingSet = lfd, true
 	w.cancelAccept(ctx, lfd)
 	_ = unix.Close(lfd)
+	w.closingSet = false
 	w.lingerUntil = 0
 }
 
@@ -2673,8 +2686,11 @@ func (w *Worker) stopAccepting(ctx context.Context) {
 // the socket leaves the group a short moment after this returns, not within it.
 // How long is not measured (the test polls).
 //
-// What it leaves, as before: the connections' descriptors, the wake eventfd and
-// the provided-buffer ring's memory. The buffer ring is not closed: a handler
+// What it leaves, as before: the connections' descriptors (with fixed files
+// on, the ring's file table held them, and the ring close ends them: their
+// peers see EOF), the wake eventfd and the provided-buffer ring's memory. The
+// buffer ring is an anonymous mapping the kernel only reads and writes by
+// address, so it does not hold the ring open. It is not closed: a handler
 // goroutine detached from this worker may still read request bytes that view
 // it, which shutdown waits for (asyncWG) and this path cannot. The send buffers
 // a SEND_ZC may still read are kept for the life of the process, as shutdown
@@ -2688,6 +2704,12 @@ func (w *Worker) leaveGroupAfterExit() {
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
 		w.listenFD = -1
+	}
+	if w.closingSet {
+		// The Goexit came from a handler the pause's close or stopAccepting
+		// ran, after they took the descriptor out of listenFD.
+		_ = unix.Close(w.closingFD)
+		w.closingSet = false
 	}
 	w.lingerUntil = 0
 	w.listenFDClosed.Store(true)
