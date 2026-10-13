@@ -245,7 +245,7 @@ type pubsubRig struct {
 	cl   *Client
 }
 
-func newPubsubRig(t *testing.T) *pubsubRig {
+func newPubsubRig(t *testing.T, eng rigEngine) *pubsubRig {
 	t.Helper()
 	b := newBroker()
 	lg := &cmdLog{}
@@ -254,11 +254,7 @@ func newPubsubRig(t *testing.T) *pubsubRig {
 		b.handler(cmd, w)
 	})
 	b.fake = fake
-	prov, err := eventloop.Resolve(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { eventloop.Release(prov) })
+	prov := rigProvider(t, eng)
 	g := newWriteGate()
 	cfg := Config{Addr: fake.Addr()}
 	cl := &Client{cfg: cfg, pool: newPool(cfg, gateProvider{EventLoopProvider: prov, g: g}, false)}
@@ -306,8 +302,19 @@ func socketOnNumber(t *testing.T, n int, wl engine.WorkerLoop) (b, peer int, ok 
 	}
 	_ = unix.SetNonblock(b, true)
 	_ = unix.SetNonblock(peer, true)
-	if err := wl.RegisterConn(b, func([]byte) {}, func(error) {}); err != nil {
-		t.Fatalf("RegisterConn(B, number %d): %v", b, err)
+	// io_uring keeps a number registered until the dropped conn's onClose has
+	// run, which is after the number was closed: RegisterConn refuses it until
+	// then (celeris#887 item 10). Retry for a while; any other engine accepts
+	// the first time.
+	var regErr error
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		if regErr = wl.RegisterConn(b, func([]byte) {}, func(error) {}); regErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("RegisterConn(B, number %d): %v", b, regErr)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	t.Cleanup(func() { _ = wl.UnregisterConn(b); _ = unix.Close(b); _ = unix.Close(peer) })
 	return b, peer, true
@@ -369,7 +376,11 @@ func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
 
 // (a) A caller's Subscribe races the caller's own Close.
 func TestPubSubSubscribeRacingCloseKeepsToItsConn929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubSubscribeRacingCloseKeepsToItsConn929)
+}
+
+func testPubSubSubscribeRacingCloseKeepsToItsConn929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)
@@ -398,7 +409,11 @@ func TestPubSubSubscribeRacingCloseKeepsToItsConn929(t *testing.T) {
 
 // (b) The reconnect goroutine's resubscribe races the caller's Close.
 func TestPubSubReconnectResubscribeRacingCloseKeepsToItsConn929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubReconnectResubscribeRacingCloseKeepsToItsConn929)
+}
+
+func testPubSubReconnectResubscribeRacingCloseKeepsToItsConn929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)
@@ -431,7 +446,11 @@ func TestPubSubReconnectResubscribeRacingCloseKeepsToItsConn929(t *testing.T) {
 // (c) The reconnect replaces the dropped conn: the dropped conn's descriptor
 // and its pubsub-pool slot are returned, and Close returns the rest.
 func TestPubSubReconnectReleasesTheDroppedConn929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubReconnectReleasesTheDroppedConn929)
+}
+
+func testPubSubReconnectReleasesTheDroppedConn929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)
@@ -478,7 +497,11 @@ func TestPubSubReconnectReleasesTheDroppedConn929(t *testing.T) {
 // (d) A reconnect whose resubscribe write fails closes the new conn through
 // the pool, once: the slot comes back, and the next attempt succeeds.
 func TestPubSubReconnectFailedResubscribeReleasesItsConn929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubReconnectFailedResubscribeReleasesItsConn929)
+}
+
+func testPubSubReconnectFailedResubscribeReleasesItsConn929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)
@@ -554,7 +577,11 @@ func TestRedisWriteCommandOnClosedConnIsRefused929(t *testing.T) {
 // handed out must come back (the dropped conns, the reconnect's new conn, the
 // one Close releases), exactly once.
 func TestPubSubControlWritesDropsAndCloseInterleave929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubControlWritesDropsAndCloseInterleave929)
+}
+
+func testPubSubControlWritesDropsAndCloseInterleave929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	for i := 0; i < 15; i++ {
@@ -615,7 +642,11 @@ func TestPubSubControlWritesDropsAndCloseInterleave929(t *testing.T) {
 // pending is not sent on the dead conn, does not claim the PubSub is closed,
 // and is replayed by the reconnect.
 func TestPubSubControlWhileConnDownIsReplayed929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubControlWhileConnDownIsReplayed929)
+}
+
+func testPubSubControlWhileConnDownIsReplayed929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)
@@ -654,7 +685,11 @@ func TestPubSubControlWhileConnDownIsReplayed929(t *testing.T) {
 // the PubSub is open and the reconnect loop keeps retrying: a control call in
 // that window is "not sent, will be replayed", not the final ErrClosed.
 func TestPubSubControlAfterFailedResubscribeIsReplayed929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubControlAfterFailedResubscribeIsReplayed929)
+}
+
+func testPubSubControlAfterFailedResubscribeIsReplayed929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)
@@ -700,7 +735,11 @@ func TestPubSubControlAfterFailedResubscribeIsReplayed929(t *testing.T) {
 // conn down, not the engine's internal error. The write failure is injected
 // at that point; the PubSub is open throughout.
 func TestPubSubControlOnForgottenFDIsReportedDown929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubControlOnForgottenFDIsReportedDown929)
+}
+
+func testPubSubControlOnForgottenFDIsReportedDown929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)
@@ -720,7 +759,11 @@ func TestPubSubControlOnForgottenFDIsReportedDown929(t *testing.T) {
 // it because a reconnect is running, so the loop must look again once it is
 // done, or the PubSub keeps a dead conn and never reconnects.
 func TestPubSubReconnectRearmsWhenNewConnDiesInHandover929(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubReconnectRearmsWhenNewConnDiesInHandover929)
+}
+
+func testPubSubReconnectRearmsWhenNewConnDiesInHandover929(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)

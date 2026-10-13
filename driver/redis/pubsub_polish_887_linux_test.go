@@ -63,7 +63,11 @@ func closePubSub(t *testing.T, ps *PubSub) {
 // closed, never fires, and no reconnect starts. A control call then returns
 // ErrPubSubConnDown for ever, with nothing to replay it.
 func TestPubSubConnClosedBeforeBindStillReconnects887(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testPubSubConnClosedBeforeBindStillReconnects887)
+}
+
+func testPubSubConnClosedBeforeBindStillReconnects887(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -103,6 +107,10 @@ func TestPubSubConnClosedBeforeBindStillReconnects887(t *testing.T) {
 // it with a nil error. The engine's teardown that follows (the server side
 // goes away here) starts the reconnect, which replays the channels.
 func TestConstructorKeepsThePubSubWhenTheFirstControlCallFindsTheConnDown887(t *testing.T) {
+	eachRigEngine(t, testConstructorKeepsThePubSubWhenTheFirstControlCallFindsTheConnDown887)
+}
+
+func testConstructorKeepsThePubSubWhenTheFirstControlCallFindsTheConnDown887(t *testing.T, eng rigEngine) {
 	for _, tc := range []struct {
 		name string
 		verb string
@@ -120,7 +128,7 @@ func TestConstructorKeepsThePubSubWhenTheFirstControlCallFindsTheConnDown887(t *
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newPubsubRig(t)
+			r := newPubsubRig(t, eng)
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			r.gate.armFailWith(hasCmd(tc.verb), ErrUnknownFD)
@@ -194,7 +202,11 @@ func TestConstructorClosesThePubSubOnAnyOtherFirstControlError887(t *testing.T) 
 // base delay for ever. The test holds the replay's write after it returned,
 // kills the conn, and measures the delay to the next attempt.
 func TestReconnectLoopCountsAConnThatDiesDuringTheReplayAsFailed887(t *testing.T) {
-	r := newPubsubRig(t)
+	eachRigEngine(t, testReconnectLoopCountsAConnThatDiesDuringTheReplayAsFailed887)
+}
+
+func testReconnectLoopCountsAConnThatDiesDuringTheReplayAsFailed887(t *testing.T, eng rigEngine) {
+	r := newPubsubRig(t, eng)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	ps, err := r.cl.newPubSub(ctx)
