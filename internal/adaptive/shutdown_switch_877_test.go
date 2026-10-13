@@ -5,6 +5,9 @@ package adaptive
 import (
 	"context"
 	"errors"
+	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -332,13 +335,198 @@ func TestShutdownCtxVersusSwitchNeverWedges886(t *testing.T) {
 			}
 			time.Sleep(time.Millisecond)
 		}
-		if n, _ := lazy.state(); n > 0 {
-			e.mu.Lock()
-			built := e.secondary == lazy
-			e.mu.Unlock()
-			if !built {
-				t.Fatalf("round %d: the standby was shut down but is not in a slot", i)
+		e.mu.Lock()
+		built := e.secondary == lazy
+		e.mu.Unlock()
+		if n, _ := lazy.state(); n > 0 && !built {
+			t.Fatalf("round %d: the standby was shut down but is not in a slot", i)
+		}
+		if built {
+			// The other way round: a standby that was built and stored must be
+			// shut down by one of the two paths, the late one possibly a moment
+			// after mu is free.
+			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+				if n, _ := lazy.state(); n > 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("round %d: the standby was built and stored but never shut down", i)
+				}
 			}
 		}
+	}
+}
+
+// goroutinesIn counts the goroutines whose stack mentions sub.
+func goroutinesIn(sub string) int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	n := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestShutdownRetriesLeaveOneQueuedGoroutine886: a supervisor that retries
+// Shutdown(short) against a standby factory that does not return must not add a
+// goroutine, parked for e.mu, with every retry. The first Shutdown that gives up
+// leaves one, the later ones wait for it within their own ctx and leave none.
+// And a retry with a ctx that outlasts the build gets a clean result once the
+// build returns, after the late shutdown of the first.
+func TestShutdownRetriesLeaveOneQueuedGoroutine886(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once, releaseOnce sync.Once
+	rel := func() { releaseOnce.Do(func() { close(release) }) }
+	e, active, lazy, _ := newShutdownWindowEngine(t, func() {
+		once.Do(func() { close(entered) })
+		<-release
+	})
+	t.Cleanup(rel)
+	watchdog := time.AfterFunc(10*time.Second, rel)
+	defer watchdog.Stop()
+
+	switchDone := make(chan struct{})
+	go func() {
+		defer close(switchDone)
+		e.ForceSwitch()
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the switch never reached the standby build")
+	}
+
+	const retries = 6
+	for i := range retries {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		err := e.Shutdown(ctx)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("retry %d: Shutdown returned %v, want context.DeadlineExceeded", i, err)
+		}
+	}
+	queued := goroutinesIn("(*Engine).lockForShutdown.func")
+	t.Logf("celeris886 retries: shutdowns_that_gave_up=%d goroutines_queued_for_mu=%d", retries, queued)
+	if queued != 1 {
+		t.Errorf("%d goroutines are queued for e.mu after %d Shutdown(30ms) retries behind one build, want 1", queued, retries)
+	}
+
+	// A retry with room: it waits for the build, which is released while it waits.
+	retryErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		retryErr <- e.Shutdown(ctx)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	rel()
+	select {
+	case err := <-retryErr:
+		if err != nil {
+			t.Errorf("the retry with a 5s ctx returned %v, want nil once the build was released", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("the retry with a 5s ctx did not return after the build was released")
+	}
+	select {
+	case <-switchDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the switch did not return after the build was released")
+	}
+	// The late shutdown ran before the retry's own (it waited for it), so both
+	// reached the active sub-engine, and nothing is left queued.
+	if n, _ := active.state(); n < 2 {
+		t.Errorf("the active sub-engine saw %d Shutdown calls, want the late one and the retry's", n)
+	}
+	if n, _ := lazy.state(); n < 1 {
+		t.Errorf("the standby saw %d Shutdown calls, want at least 1", n)
+	}
+	for deadline := time.Now().Add(5 * time.Second); goroutinesIn("(*Engine).lockForShutdown.func") != 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a goroutine is still queued for e.mu after the retry returned")
+		}
+	}
+}
+
+// unboundSub is a standby whose Listen runs until its ctx ends and never
+// publishes an address, so the bind wait in buildAndStartStandby (up to 5 s)
+// runs to its end unless something cuts it short.
+type unboundSub struct {
+	*mockEngine
+	listened chan struct{}
+	returned chan struct{}
+}
+
+func (u *unboundSub) Listen(ctx context.Context) error {
+	close(u.listened)
+	<-ctx.Done()
+	close(u.returned)
+	return ctx.Err()
+}
+
+func (u *unboundSub) Addr() net.Addr { return nil }
+
+// TestShutdownGiveUpCutsStandbyBindWait886 is item 15 in the shape the issue
+// names: a standby parked in the 5 s bind wait while it holds e.mu. Shutdown(ctx)
+// gives up at ctx and cancels Listen's ctx, and that has to end the bind wait:
+// the switch returns, the standby's Listen unwinds and no standby is left in a
+// slot, all well before the 5 s the wait would have run.
+func TestShutdownGiveUpCutsStandbyBindWait886(t *testing.T) {
+	e, _, _, builds := newShutdownWindowEngine(t, nil)
+	ub := &unboundSub{mockEngine: newMockEngine(engine.IOUring), listened: make(chan struct{}), returned: make(chan struct{})}
+	e.buildStandby = func() (engine.Engine, error) {
+		builds.Add(1)
+		return ub, nil
+	}
+
+	switchDone := make(chan struct{})
+	go func() {
+		defer close(switchDone)
+		e.ForceSwitch()
+	}()
+	select {
+	case <-ub.listened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the standby's Listen never started")
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := e.Shutdown(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Shutdown returned %v, want context.DeadlineExceeded", err)
+	}
+	select {
+	case <-switchDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the switch is still in the standby's bind wait 3s after Shutdown gave up")
+	}
+	select {
+	case <-ub.returned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the standby's Listen did not unwind after Shutdown gave up")
+	}
+	took := time.Since(start)
+	t.Logf("celeris886 bind wait: deadline=200ms shutdown_to_switch_and_listen_unwound=%v (the wait runs 5s)", took.Round(time.Millisecond))
+	if took >= 2*time.Second {
+		t.Errorf("the bind wait took %v to end after Shutdown gave up", took)
+	}
+	e.mu.Lock()
+	inSlot := e.secondary == engine.Engine(ub)
+	e.mu.Unlock()
+	if inSlot {
+		t.Error("the standby that never bound sits in a slot")
 	}
 }
