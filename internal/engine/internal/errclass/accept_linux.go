@@ -27,6 +27,31 @@ func (c *Counters) AcceptFailed(errno unix.Errno) {
 	}
 }
 
+// AcceptRetried is AcceptFailed's counterpart for an accept4 failure that the
+// engine retries in place instead of ending the accept: it reports whether
+// errno is one to retry, and counts the retried ones that AcceptFailed
+// counts when io_uring sees them as a completion.
+//
+//   - ECONNABORTED: a peer that reset between SYN and accept (client
+//     abandonment, a connection-churn workload). Counted in AcceptCancelled,
+//     as the same errno is when io_uring's accept completes with it, so the
+//     two engines' error counts read the same event the same way (celeris#886
+//     item 13; before, epoll retried it uncounted).
+//   - EINTR: the syscall was interrupted by a signal, which says nothing of
+//     the peer or the host. Retried, not counted. (An io_uring accept that
+//     completes with EINTR is a different event, the SQE interrupted, and
+//     AcceptFailed keeps counting that.)
+func (c *Counters) AcceptRetried(errno unix.Errno) bool {
+	switch errno {
+	case unix.ECONNABORTED:
+		c.AcceptCancelled.Add(1)
+		return true
+	case unix.EINTR:
+		return true
+	}
+	return false
+}
+
 // SendFailed routes one failed send completion to its bucket by errno. Pass
 // the POSITIVE errno (io_uring callers negate Res first).
 //

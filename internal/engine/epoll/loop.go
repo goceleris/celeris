@@ -168,7 +168,7 @@ type Loop struct {
 	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
 	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
 	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
-	reqBatch          uint64         // batched request count, flushed to reqCount per iteration; WORKER-THREAD-ONLY, 3 increment sites, all on the loop (celeris#626)
+	reqBatch          uint64         // batched request count, flushed to reqCount per iteration; WORKER-THREAD-ONLY, 5 increment sites, all on the loop: three in drainRead (async feed, promotion, inline) and two in adopt.go (the transplant replay, sync and async) (celeris#626, celeris#886)
 	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
 	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
 	tickCounter       uint32
@@ -1014,6 +1014,18 @@ func (l *Loop) notifyDetachedPeerClosed(cs *connState) {
 // for a fresh SYN edge.
 const acceptAllCap = 1024
 
+// acceptRetry reports whether an accept4 failure is a transient one that
+// acceptAll retries in place: an aborted SYN (ECONNABORTED, a peer that reset
+// before accept) or an interrupted syscall (EINTR). The aborted SYN lands in
+// AcceptCancelled, as the same errno does when io_uring's accept completes
+// with it; EINTR is not counted (errclass.Counters.AcceptRetried is the one
+// list of both engines, so the two cannot drift apart). It is called from the
+// error switch's default case only, so a drained queue (EAGAIN) pays nothing.
+func (l *Loop) acceptRetry(err error) bool {
+	errno, ok := err.(unix.Errno)
+	return ok && l.errs.AcceptRetried(errno)
+}
+
 // acceptStop is why acceptAll returned. The event loop only needs listenHot;
 // acceptQueuedOnPause needs to tell a queue that is empty from one that may
 // not be (celeris#662).
@@ -1036,12 +1048,6 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 				// (EWOULDBLOCK == EAGAIN on Linux, so one case covers both.)
 				l.listenHot = false
 				return acceptDrained
-			case unix.EINTR, unix.ECONNABORTED:
-				// Transient: a SYN was aborted (RST before accept) or the
-				// syscall was interrupted. The backlog may still hold other
-				// connections, so retry this round rather than returning —
-				// a bare return would strand them until the next SYN edge.
-				continue
 			case unix.EMFILE, unix.ENFILE:
 				// Out of file descriptors (per-process / system-wide). The
 				// SYN at the head of the queue is un-acceptable right now;
@@ -1053,6 +1059,14 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 				l.listenHot = true
 				return acceptFDLimit
 			default:
+				if l.acceptRetry(err) {
+					// Transient: a SYN was aborted (RST before accept) or the
+					// syscall was interrupted. The backlog may still hold
+					// other connections, so retry this round rather than
+					// returning — a bare return would strand them until the
+					// next SYN edge.
+					continue
+				}
 				// Unexpected accept error. Count it and stop this round; the
 				// listen fd stays armed (ET) and a fresh edge re-enters.
 				l.errs.AcceptOther.Add(1)
@@ -1382,43 +1396,29 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if !complete {
 				continue
 			}
-			rest, derr := cs.h1State.DispatchBufferedBody(cs.ctx, l.handler, cs.writeFn)
-			if errors.Is(derr, conn.ErrUpgradeH2C) {
-				if err := l.switchToH2(cs, cs.writeFn); err != nil {
-					l.closeConn(fd)
-					return
-				}
-			} else if derr != nil {
-				if errors.Is(derr, conn.ErrHijacked) {
-					return
-				}
-				if mu := cs.detachMu; mu != nil {
-					mu.Lock()
-				}
-				_ = l.flushWrites(cs, true)
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
-				}
-				l.closeWhenFlushed(cs) // celeris#761: the response's tail too
-				return
+			rest, verdict := cs.h1State.DispatchBufferedBody(cs.ctx, l.handler, cs.writeFn)
+			if verdict == nil && len(rest) > 0 {
+				// Tail bytes after the body: feed them back through the
+				// normal parser for the pipelined request(s). Their verdict
+				// is handled exactly as the body's own (an h2c upgrade
+				// request pipelined behind the body is the case that was
+				// once closed instead, celeris#885).
+				verdict = conn.ProcessH1(cs.ctx, rest, cs.h1State, l.handler, cs.writeFn)
 			}
-			if len(rest) > 0 {
-				// Tail bytes after the body — feed them back through
-				// the normal parser for pipelined request(s).
-				if perr := conn.ProcessH1(cs.ctx, rest, cs.h1State, l.handler, cs.writeFn); perr != nil {
-					if errors.Is(perr, conn.ErrHijacked) {
+			if verdict != nil {
+				if errors.Is(verdict, conn.ErrHijacked) {
+					return
+				}
+				if errors.Is(verdict, conn.ErrUpgradeH2C) {
+					// The 101 and the preface go out here; the loop goes on
+					// to read the HTTP/2 frames that follow.
+					if !l.finishH1Upgrade(cs, fd, cs.writeFn) {
 						return
 					}
-					if mu := cs.detachMu; mu != nil {
-						mu.Lock()
-					}
-					_ = l.flushWrites(cs, true)
-					if mu := cs.detachMu; mu != nil {
-						mu.Unlock()
-					}
-					l.closeWhenFlushed(cs) // celeris#761: the response's tail too
-					return
+					continue
 				}
+				l.endH1Verdict(cs, verdict)
+				return
 			}
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()
@@ -1625,32 +1625,13 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if errors.Is(processErr, conn.ErrUpgradeH2C) {
 				// H1→H2 promotion. switchToH2 consumes the upgrade info,
 				// installs H2 state, and feeds any preface bytes synchronously.
-				if err := l.switchToH2(cs, writeFn); err != nil {
-					l.closeConn(fd)
-					return
-				}
 				// Flush the buffered 101 Switching Protocols response and any
 				// H2 server preface + stream 1 response bytes that switchToH2
 				// may have queued. The normal inline-flush block below is
 				// skipped by the `continue` so we must flush explicitly here,
 				// otherwise the client blocks forever waiting for the 101.
-				if cs.writePos < len(cs.writeBuf) {
-					if fErr := l.flushWrites(cs, true); fErr != nil {
-						l.closeConn(fd)
-						return
-					}
-					if cs.writePos >= len(cs.writeBuf) {
-						cs.pendingBytes = 0
-						if cs.dirty {
-							l.removeDirty(cs)
-						}
-					} else {
-						// 101 + H2 preface didn't fully drain: send buffer
-						// full. Newly-H2 conn (not detached) — arm EPOLLOUT
-						// rather than the busy-polling dirty list.
-						cs.pendingBytes = len(cs.writeBuf) - cs.writePos
-						l.armEpollOut(cs)
-					}
+				if !l.finishH1Upgrade(cs, fd, writeFn) {
+					return
 				}
 				// Fall through to continue the loop; subsequent reads go
 				// through the H2 path via cs.protocol switch above.
@@ -1692,22 +1673,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if errors.Is(processErr, conn.ErrHijacked) {
 				return // FD already detached — do not close or flush
 			}
-			// Flush any pending writes (e.g. error responses) before closing.
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			_ = l.flushWrites(cs, true)
-			cs.pendingBytes = 0
-			if cs.h1State != nil && cs.h1State.OnError != nil {
-				cs.h1State.OnError(processErr)
-			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
-			// What that one write could not send (a response larger than
-			// the socket buffers, answering Connection: close) still goes
-			// out before the close (celeris#761).
-			l.closeWhenFlushed(cs)
+			// Flush any pending writes (e.g. error responses) before closing,
+			// and tell a detached middleware: endH1Verdict.
+			l.endH1Verdict(cs, processErr)
 			return
 		}
 
