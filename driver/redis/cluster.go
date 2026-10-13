@@ -928,6 +928,10 @@ func (c *ClusterClient) Publish(ctx context.Context, channel, message string) (i
 	return node.client.Publish(ctx, channel, message)
 }
 
+// Subscribe opens a pub/sub connection on any cluster node and subscribes to
+// channels (SUBSCRIBE is cluster-wide). See [Client.Subscribe]: when the node is
+// found down on the first SUBSCRIBE the PubSub and a nil error are returned and
+// the reconnect retries that one node address.
 func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	// Regular SUBSCRIBE is cluster-wide: pick any node.
 	node := c.anyNode()
@@ -941,7 +945,11 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 // (Redis 7+ SSUBSCRIBE). Shard channels are slot-scoped: the connection is
 // established to the node owning the slot of the first channel. All channels
 // SHOULD hash to the same slot (use hash tags); mixing slots in one PubSub is
-// undefined behavior in cluster mode.
+// undefined behavior in cluster mode. Like [Client.Subscribe], it returns the
+// PubSub and a nil error when the conn is found down on the first SSUBSCRIBE:
+// the reconnect replays the channels, to the same node address. It does not
+// follow a slot move, so a caller that wants the new owner closes the PubSub
+// and calls SSubscribe again.
 func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	if len(channels) == 0 {
 		return nil, errors.New("celeris-redis: SSubscribe requires at least one channel")
@@ -958,11 +966,7 @@ func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*Pu
 	if err != nil {
 		return nil, err
 	}
-	if err := ps.SSubscribe(ctx, channels...); err != nil {
-		_ = ps.Close()
-		return nil, err
-	}
-	return ps, nil
+	return ps.firstControl(ps.SSubscribe(ctx, channels...))
 }
 
 // SPublish publishes a message to a shard channel (Redis 7+ SPUBLISH). The
