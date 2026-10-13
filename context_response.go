@@ -1625,9 +1625,19 @@ func (c *Context) Detach() (done func()) {
 		// but observed in practice with deferred logger blocks). Heap-
 		// allocated only on the Detach slow path so non-detached requests
 		// don't pay the field cost in every pooled Context.
+		// From startTimeNs when HandleStream set it: startTime is then still
+		// the zero Time (StartTime materializes it lazily), and
+		// time.Since(c.startTime) was ~292 years on the native HTTP/1
+		// engines. One clock read either way.
+		var elapsed time.Duration
+		if c.startTimeNs != 0 {
+			elapsed = time.Duration(time.Now().UnixNano() - c.startTimeNs)
+		} else {
+			elapsed = time.Since(c.startTime)
+		}
 		c.detachSnap = &detachSnapshot{
 			status:  c.statusCode,
-			elapsed: time.Since(c.startTime),
+			elapsed: elapsed,
 		}
 		close(ch)
 	}
