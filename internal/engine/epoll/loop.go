@@ -2398,6 +2398,11 @@ func (l *Loop) initProtocol(cs *connState) {
 					l.wakeFD.Signal()
 				}
 			}
+			if !unlockDetachMu {
+				if f := detachPostInstallHook.Load(); f != nil {
+					(*f)() // test seam, #889 item 34 (a conn that is not promoted)
+				}
+			}
 			// Ensure eventfd is available for wakeup. Sync mode is
 			// safe to create it inline (event-loop thread).
 			// Async mode defers to drainDetachQueue (worker thread)

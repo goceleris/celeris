@@ -3141,6 +3141,11 @@ func (w *Worker) initProtocol(cs *connState) {
 					wake.Signal()
 				}
 			}
+			if !unlockDetachMu {
+				if f := detachPostInstallHook.Load(); f != nil {
+					(*f)() // test seam, #889 item 34 (a conn that is not promoted)
+				}
+			}
 			// Ensure eventfd poll is armed so the worker wakes up.
 			// Sync mode runs OnDetach on the worker thread, so this
 			// SQE submission is safe. Async mode defers to

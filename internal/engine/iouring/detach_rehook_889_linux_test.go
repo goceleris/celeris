@@ -42,8 +42,8 @@ func TestOnDetachRunTwiceAfterPanic889(t *testing.T) {
 		hook()
 	}()
 	cs.h1State = h1
-	if w.detachedCount != 1 || !cs.detachCounted {
-		t.Fatalf("after the first run detachedCount=%d counted=%v, want 1 true", w.detachedCount, cs.detachCounted)
+	if w.detachedCount != 0 || cs.detachCounted {
+		t.Fatalf("after the panicked run detachedCount=%d counted=%v, want 0 false (the count is undone)", w.detachedCount, cs.detachCounted)
 	}
 
 	// Second run on the same conn, then a write through the installed guard.
