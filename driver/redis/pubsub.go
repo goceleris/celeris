@@ -118,10 +118,18 @@ func (c *Client) PSubscribe(ctx context.Context, patterns ...string) (*PubSub, e
 	return ps, nil
 }
 
+// testHookBeforeBind, when non-nil, runs in newPubSub after the pool handed
+// out the conn and before bindConn. It is nil in production; a test sets it to
+// stage a conn that closes in that window (celeris#887 item 14).
+var testHookBeforeBind func(conn *redisConn)
+
 func (c *Client) newPubSub(ctx context.Context) (*PubSub, error) {
 	conn, err := c.pool.acquirePubSub(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if h := testHookBeforeBind; h != nil {
+		h(conn)
 	}
 	ps := &PubSub{
 		client:    c,

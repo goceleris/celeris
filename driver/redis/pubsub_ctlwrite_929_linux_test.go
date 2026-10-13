@@ -51,6 +51,19 @@ type writeGate struct {
 	unregFD      int
 	unregHit     chan struct{}
 	unregRelease chan struct{}
+
+	// A held write, after the real Write returned: the first matching
+	// Write after armAfter parks, once it has written, until afterRelease
+	// is closed (celeris#887 item 15).
+	afterArmed   bool
+	afterMatch   func([]byte) bool
+	afterHit     chan struct{}
+	afterRelease chan struct{}
+
+	// writeTimes records when every Write that matches stampMatch reached
+	// the loop (set stampMatch before the writes of interest).
+	stampMatch func([]byte) bool
+	stamps     []time.Time
 }
 
 type gateHit struct {
@@ -62,6 +75,7 @@ func newWriteGate() *writeGate {
 	return &writeGate{
 		hit: make(chan gateHit, 1), release: make(chan struct{}),
 		unregHit: make(chan struct{}, 1), unregRelease: make(chan struct{}),
+		afterHit: make(chan struct{}, 1), afterRelease: make(chan struct{}),
 	}
 }
 
@@ -91,6 +105,44 @@ func (g *writeGate) armUnreg(fd int) {
 	g.mu.Lock()
 	g.unregArmed, g.unregFD = true, fd
 	g.mu.Unlock()
+}
+
+// armAfter makes the next Write whose bytes match park, after the real Write
+// returned nil, until afterRelease is closed.
+func (g *writeGate) armAfter(match func([]byte) bool) {
+	g.mu.Lock()
+	g.afterArmed, g.afterMatch = true, match
+	g.mu.Unlock()
+}
+
+// stampWrites starts recording the time of every Write that matches.
+func (g *writeGate) stampWrites(match func([]byte) bool) {
+	g.mu.Lock()
+	g.stampMatch, g.stamps = match, nil
+	g.mu.Unlock()
+}
+
+// stampTimes returns the recorded write times.
+func (g *writeGate) stampTimes() []time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]time.Time(nil), g.stamps...)
+}
+
+// afterWrite runs once the real Write returned err.
+func (g *writeGate) afterWrite(data []byte, err error) {
+	g.mu.Lock()
+	if g.stampMatch != nil && g.stampMatch(data) {
+		g.stamps = append(g.stamps, time.Now())
+	}
+	if !g.afterArmed || err != nil || !g.afterMatch(data) {
+		g.mu.Unlock()
+		return
+	}
+	g.afterArmed = false
+	g.mu.Unlock()
+	g.afterHit <- struct{}{}
+	<-g.afterRelease
 }
 
 func (g *writeGate) beforeUnreg(fd int) {
@@ -133,7 +185,9 @@ func (l *gateLoop) Write(fd int, data []byte) error {
 	if err := l.g.before(fd, l.WorkerLoop, data); err != nil {
 		return err
 	}
-	return l.WorkerLoop.Write(fd, data)
+	err := l.WorkerLoop.Write(fd, data)
+	l.g.afterWrite(data, err)
+	return err
 }
 
 func (l *gateLoop) UnregisterConn(fd int) error {
