@@ -1,6 +1,8 @@
 package sse
 
 import (
+	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -402,5 +404,192 @@ func TestSlowClientSendNonFullQueueAllocs(t *testing.T) {
 	const budget = 1.0
 	if allocs > budget {
 		t.Fatalf("Send queued path: %.1f allocs/op, budget %.1f", allocs, budget)
+	}
+}
+
+// dropFullQueue fills a queued client's queue while its drain is parked at
+// the gated Write, so the next Send finds the queue full, and runs f on the
+// handler's goroutine. It releases the gate before the handler returns, as
+// the handler's defer joins the drain.
+func dropFullQueue(t testing.TB, ctx *celeris.Context, gs *gatedStreamer, cfg Config, f func(client *Client)) {
+	t.Helper()
+	cfg.HeartbeatInterval = -1
+	cfg.Handler = func(client *Client) {
+		defer gs.release()
+		if err := client.Send(Event{Data: "first"}); err != nil {
+			t.Errorf("first Send: %v", err)
+			return
+		}
+		select {
+		case <-gs.writeReachedOnce:
+		case <-time.After(3 * time.Second):
+			t.Errorf("drain goroutine did not reach the gated Write within 3s")
+			return
+		}
+		for range cap(client.queue) {
+			if err := client.Send(Event{Data: "fill"}); err != nil {
+				t.Errorf("filling Send: %v", err)
+				return
+			}
+		}
+		if got := client.QueueDepth(); got != cap(client.queue) {
+			t.Errorf("QueueDepth = %d, want %d (queue full)", got, cap(client.queue))
+			return
+		}
+		f(client)
+	}
+	if err := New(cfg)(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// dropEvent888 is the event the drop-path tests send: three strings, so a
+// copy of them would be an allocation (an event with no strings copies
+// nothing).
+var dropEvent888 = Event{ID: "42", Event: "update", Data: "payload-payload-payload"}
+
+// allocWindows888 is how many single-call windows allocsPer888 tries at most.
+const allocWindows888 = 8
+
+// allocsPer888 is the fewest allocations per call of f that any of up to
+// allocWindows888 single-call windows sees. testing.AllocsPerRun counts the
+// whole process's mallocs, and internal/conn has a goroutine that allocates
+// 14 times once a second (its cached Date header), so one tick inside a
+// multi-run average reads as a fractional allocation per call. A tick lands in
+// at most one single-call window, so the least of several windows is the cost
+// of the call alone; a call that allocates in every window still reads as it.
+func allocsPer888(f func()) float64 {
+	best := math.MaxFloat64
+	for range allocWindows888 {
+		best = min(best, testing.AllocsPerRun(1, f))
+		if best == 0 {
+			break
+		}
+	}
+	return best
+}
+
+// TestSlowClientDropPathAllocs888 pins that a queued Send the default
+// slow-client policy drops makes no allocation (celeris#888 item 21). The copy
+// that keeps the event past Send (celeris#732) is for an event that is
+// queued; with OnSlowClient nil a full queue drops the event, which nothing
+// keeps, so the copy is skipped.
+func TestSlowClientDropPathAllocs888(t *testing.T) {
+	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
+		t.Skip("alloc counts unstable under -race / coverage / -short")
+	}
+	ctx, gs := newGatedContext(t)
+	var allocs float64
+	var dropped, calls uint64
+	dropFullQueue(t, ctx, gs, Config{MaxQueueDepth: 4}, func(client *Client) {
+		before := client.DroppedEvents()
+		allocs = allocsPer888(func() {
+			calls++
+			if err := client.Send(dropEvent888); err != nil {
+				t.Errorf("Send to a full queue under the default policy: %v", err)
+			}
+		})
+		dropped = client.DroppedEvents() - before
+	})
+	if allocs != 0 {
+		t.Errorf("a dropped Send made %.1f allocations, want 0", allocs)
+	}
+	if calls == 0 || dropped != calls {
+		t.Errorf("%d Sends to a full queue counted %d drops, want all of them", calls, dropped)
+	}
+}
+
+// TestSlowClientCallbackKeepsItsEvent888 pins the other side of the drop-path
+// shortcut: with OnSlowClient set the callback is handed a copy of the event,
+// not the caller's strings, because the callback can keep it (celeris#888 item
+// 21). The caller's strings are views of a buffer that changes after Send
+// returns, as a request's do on epoll and io_uring (celeris#732).
+func TestSlowClientCallbackKeepsItsEvent888(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy ClientPolicy
+	}{
+		{"drop", ClientPolicyDrop},
+		{"close", ClientPolicyClose},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, gs := newGatedContext(t)
+			var kept Event
+			var calls int
+			buf := []byte("42update-kindpayload-bytes")
+			cfg := Config{
+				MaxQueueDepth: 2,
+				OnSlowClient: func(_ *Client, e Event) ClientPolicy {
+					calls++
+					kept = e
+					return tc.policy
+				},
+			}
+			dropFullQueue(t, ctx, gs, cfg, func(client *Client) {
+				_ = client.Send(Event{ID: view(buf[:2]), Event: view(buf[2:13]), Data: view(buf[13:]), Retry: 9})
+				for k := range buf {
+					buf[k] = 'z'
+				}
+			})
+			if calls != 1 {
+				t.Fatalf("OnSlowClient ran %d times, want 1", calls)
+			}
+			if kept.ID != "42" || kept.Event != "update-kind" || kept.Data != "payload-bytes" || kept.Retry != 9 {
+				t.Errorf("the event the callback kept reads ID %q Event %q Data %q Retry %d after the caller's bytes changed, want 42, update-kind, payload-bytes, 9",
+					kept.ID, kept.Event, kept.Data, kept.Retry)
+			}
+		})
+	}
+}
+
+// TestQueuedSendToBareRingKeepsACopy888 sends in queued mode to a bare
+// NewRingBuffer store, so appendQueued hands the event to ringStore.appendOwned,
+// which keeps it without a copy of its own (celeris#888 item 20). The drain is
+// held on client.mu while the caller's bytes change, so the ring appends and the
+// wire formats the event only after they have: both must still hold what Send
+// was given. TestSentEventSurvivesSendersNextRequest covers the same on the
+// native engines, but wraps the ring, which is not a *ringStore.
+func TestQueuedSendToBareRingKeepsACopy888(t *testing.T) {
+	ctx, ms := newSSEContext(t)
+	ring := NewRingBuffer(4)
+	buf := []byte("caller-idkind-amsg-a")
+	var replay []Event
+	var replayErr error
+	handler := New(Config{
+		HeartbeatInterval: -1,
+		MaxQueueDepth:     4,
+		ReplayStore:       ring,
+		Handler: func(client *Client) {
+			client.mu.Lock() // the drain parks on it, holding or about to hold the event
+			err := client.Send(Event{ID: view(buf[:9]), Event: view(buf[9:15]), Data: view(buf[15:]), Retry: 5})
+			for k := range buf {
+				buf[k] = 'z'
+			}
+			client.mu.Unlock()
+			if err != nil {
+				t.Errorf("Send: %v", err)
+				return
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				if replay, replayErr = ring.Since(client.Context(), ""); len(replay) > 0 {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		},
+	})
+	if err := handler(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if replayErr != nil || len(replay) != 1 {
+		t.Fatalf("the ring replays %+v, %v; want the one event", replay, replayErr)
+	}
+	if got := replay[0]; got.ID != "1" || got.Event != "kind-a" || got.Data != "msg-a" || got.Retry != 5 {
+		t.Errorf("the ring kept ID %q Event %q Data %q Retry %d after the caller's bytes changed, want 1, kind-a, msg-a, 5",
+			got.ID, got.Event, got.Data, got.Retry)
+	}
+	if wire := ms.allData(); !strings.Contains(wire, "event: kind-a\n") || !strings.Contains(wire, "data: msg-a\n") {
+		t.Errorf("the wire carries %q after the caller's bytes changed, want event kind-a and data msg-a", wire)
 	}
 }
