@@ -18,6 +18,21 @@ const (
 	waitModeTimed
 )
 
+// String names the wait for the log line of a retried one.
+func (m ringWaitMode) String() string {
+	switch m {
+	case waitModeSQPoll:
+		return "sqpoll-wait"
+	case waitModeSubmitReady:
+		return "submit-and-wait (completions ready)"
+	case waitModeSubmitSends:
+		return "submit-and-wait (sends pending)"
+	case waitModeTimed:
+		return "submit-and-wait-timeout"
+	}
+	return "unknown"
+}
+
 // ringWaitSeam is a test seam (celeris#884 item 49): when set, Worker.run calls
 // it after each of its ring waits, on the worker's thread, with the wait's own
 // result, and acts on what it returns instead. A test answers EBUSY the way a

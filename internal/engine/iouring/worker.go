@@ -1368,13 +1368,20 @@ func (w *Worker) run(ctx context.Context) {
 				// point: shutdownSendDrainNanos after it began, so a request
 				// in flight when the shutdown began is still answered. Past
 				// it no more request is read from an HTTP/1 conn, and a
-				// detached stream's producer is ended (a TryLock that finds
-				// a handler running is tried again on the next pass); the
+				// detached stream's producer is ended (stopProducersPaced:
+				// a TryLock that finds a handler running is tried again
+				// within h2PoolDrainPoll; this wait is a serving phase, so
+				// the walk over every conn is not paid on every pass); the
 				// HTTP/2 conns this wait is for are served on
-				// (celeris#884). h2PoolSettled has set h2DrainStart.
-				if time.Now().UnixNano() > w.h2DrainStart+shutdownSendDrainNanos {
+				// (celeris#884). h2PoolSettled has set h2DrainStart. A
+				// request whose bytes have not all arrived by then is not
+				// answered: the bytes after the gate are dropped (a slow
+				// upload, headers in pieces). The producers' OnError and
+				// OnDetachClose run on this thread, as in the send drain,
+				// so a slow callback delays the HTTP/2 conns served here.
+				if now := time.Now().UnixNano(); now > w.h2DrainStart+shutdownSendDrainNanos {
 					w.refuseRecv = true
-					w.stopDetachedProducers()
+					w.stopProducersPaced(now)
 				}
 			} else {
 				now := time.Now().UnixNano()
@@ -3580,13 +3587,16 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// on this recv CQE, regardless of which buffer they landed in.
 	w.bytesReadBatch += uint64(c.Res)
 
-	// Past the first 250 ms of the shutdown's send drain an HTTP/1 conn is
-	// read no more (celeris#806): the drain finishes the responses it has,
-	// and a request taken now could only be answered into a queue that the
+	// Past the first 250 ms of the shutdown's send drain, or of the wait for
+	// the HTTP/2 handlers before it (celeris#884), an HTTP/1 conn is read no
+	// more (celeris#806): the drain finishes the responses it has, and a
+	// request taken now could only be answered into a queue that the
 	// drain, which lasts as long as the budget, would never find empty
-	// under steady keep-alive traffic. Epoll's loops have stopped reading
-	// at the cancel. The bytes are dropped with the connection, which
-	// shutdown closes; the recv is not re-armed. A detached conn is read no
+	// under steady keep-alive traffic. Epoll's shutdown phases stop reading
+	// (its pool wait does not: celeris#885). The bytes are dropped with the
+	// connection, which shutdown closes; the recv is not re-armed, so a
+	// request whose bytes were still arriving at the gate (the body of an
+	// upload, headers in pieces) is never answered. A detached conn is read no
 	// more either (its writes were ended with the gate: stopDetachedProducers).
 	// HTTP/2 conns are served on: they have had GOAWAY since the pool wait,
 	// and what their responses may still wait for was waited for there or
@@ -7327,7 +7337,10 @@ func (w *Worker) stopDetachedProducers() {
 // flushed, or EAGAIN) says the CQ ring has no room, not that the ring failed:
 // the SQEs the enter did not take stay pending (retryPending), and the loop's
 // own pass over the CQ ring after this returns is the reap that makes room.
-// The error is counted, and with nothing in the ring to reap the worker gives
+// The error is counted and, the first time on a worker, logged as a Warn;
+// there is no ceiling on the retries (a ring that fails for good with EBUSY
+// or EAGAIN is retried until the context is cancelled: the checklist of
+// celeris#884 records it). With nothing in the ring to reap the worker gives
 // the kernel a moment (cancelAccept's drain does the same) rather than enter
 // again at once. Any other error is the ring failing: the worker stops, and
 // closes what it owns.
@@ -7342,6 +7355,16 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 		return false
 	}
 	w.ringWaitRetries.Add(1)
+	if !w.ringWaitWarned {
+		// Once per worker: there is no ceiling on the retries and the counter
+		// is not a public metric, so this line is how an operator on a 5.19
+		// to 6.1 kernel sees a loop that keeps retrying.
+		w.ringWaitWarned = true
+		if w.logger != nil {
+			w.logger.Warn("io_uring: a ring wait answered a retryable error (the CQ ring has no room); the worker reaps and retries, and does not log this again",
+				"worker", w.id, "wait", mode.String(), "err", err)
+		}
+	}
 	if h, t := w.ring.BeginCQ(); h == t {
 		time.Sleep(50 * time.Microsecond)
 	}
@@ -7354,6 +7377,10 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 // over every live conn twice in one. It reports whether it walked. now is the
 // pass's UnixNano. Worker thread.
 func (w *Worker) stopProducersPaced(now int64) bool {
+	if now < w.producersStopNext {
+		return false
+	}
+	w.producersStopNext = now + int64(h2PoolDrainPoll)
 	w.stopDetachedProducers()
 	return true
 }
