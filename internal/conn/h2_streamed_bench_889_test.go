@@ -68,8 +68,15 @@ func BenchmarkStreamedResponse889(b *testing.B) {
 			}
 			buf := append([]byte(nil), one...)
 			id := uint32(1)
+			mgr := state.processor.GetManager()
 			b.ReportAllocs()
 			for b.Loop() {
+				if id&2047 == 1 {
+					// The client sends no WINDOW_UPDATE: top the connection's
+					// window up, or the 5-byte bodies would spend it and later
+					// responses would be buffered.
+					mgr.UpdateConnectionWindow(1<<21 - mgr.GetConnectionWindow())
+				}
 				binary.BigEndian.PutUint32(buf[5:], id)
 				id += 2
 				if err := ProcessH2(context.Background(), buf, state, h, write, cfg); err != nil {
@@ -77,9 +84,8 @@ func BenchmarkStreamedResponse889(b *testing.B) {
 				}
 				state.DrainWriteQueue(write)
 			}
-			mgr := state.processor.GetManager()
-			if mgr.CountActiveStreams() != 0 {
-				b.Fatalf("%d streams still active: responses were left open", mgr.CountActiveStreams())
+			if mgr.CountActiveStreams() != 0 || mgr.OutboundHeld() != 0 {
+				b.Fatalf("%d streams still active, %d bytes buffered: responses were left open or held back", mgr.CountActiveStreams(), mgr.OutboundHeld())
 			}
 		})
 	}
