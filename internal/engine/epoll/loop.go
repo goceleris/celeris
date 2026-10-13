@@ -967,6 +967,25 @@ func (l *Loop) run(ctx context.Context) {
 // dispatch goroutine that is still inside its handler (celeris#669); that
 // goroutine is writing the response under detachMu, so csWritePending would
 // read its buffers unlocked, and closeConn would only repeat the hand-off.
+//
+// What the verdict is made of is read under detachMu (celeris#885 items 27 and
+// 36): h1State, which switchToH2Local sets to nil on the dispatch goroutine
+// under that lock, and the write state, which the goroutine's writeFn appends
+// to under it, csWritePending and the count markClosing stamps. They are read
+// once, together, and the lock is released before anything is done with them:
+// closeConn and notifyDetachedPeerClosed take the same non-reentrant mutex.
+//
+// The lock is taken with TryLock and never with a plain Lock while a handler
+// runs: the goroutine holds it across ProcessH1, so waiting would park the
+// loop, and every conn on it, behind one slow handler (celeris#669). EPOLLRDHUP
+// is edge-triggered, so the event cannot be skipped either: it would not come
+// again. A half-close found while a handler runs is owed instead
+// (halfCloseOwed), as the dirty pass and the EPOLLOUT resume owe their flush:
+// the conn is given up (relink) and its goroutine hands it back at its next
+// park, where drainDetachQueue runs this again (handBackHalfClose). A holder
+// that is not a running handler (a detached conn's guarded writeFn, or the
+// goroutine between handlers) holds it for one write, so that wait is bounded
+// and the lock is waited for, as every other site does (dispatchBusy).
 func (l *Loop) onPeerHalfClose(fd int) {
 	if fd < 0 || fd >= len(l.conns) {
 		return
@@ -975,26 +994,67 @@ func (l *Loop) onPeerHalfClose(fd int) {
 	if cs == nil || cs.detachClosed || cs.asyncClosed.Load() {
 		return
 	}
-	// h1State is loaded once, into a local. switchToH2Local sets it to nil
-	// under detachMu on the dispatch goroutine, and the memory model lets a
-	// `cs.h1State != nil && cs.h1State.Detached.Load()` reload it between the
-	// test and the dereference (a nil dereference). The gc compiler happens to
-	// merge the two loads today (arm64 and amd64 disassembly, celeris#865
-	// review), so this removes a dependence on that, not a crash seen.
-	// The load itself still races with that write and is unlocked on purpose:
-	// EPOLLRDHUP is edge-triggered, so skipping a conn whose lock is held (the
-	// TryLock the sweep uses) could lose the event for good. What to do with a
-	// held lock here is for the async-abort work (celeris#844); the race report
-	// is tracked in celeris#885.
-	h1 := cs.h1State
+	mu := cs.detachMu
+	if mu != nil && !mu.TryLock() {
+		if dispatchBusy(cs, &cs.relinkOwed) {
+			cs.halfCloseOwed = true
+			l.relink(cs)
+			return
+		}
+		mu.Lock()
+	}
+	if mu != nil && cs.hijacked.Load() {
+		// The run loop read cs from its slot, and then the conn's handler
+		// hijacked it (celeris#668): the descriptor is closed and its number
+		// may be another file's. drainDetachQueue settles the rest.
+		mu.Unlock()
+		return
+	}
+	// Only plain and atomic loads from here to the Unlock: nothing can panic
+	// or block while the lock is held.
+	var (
+		detached bool
+		queued   bool
+		pending  int
+	)
+	if h1 := cs.h1State; h1 != nil && h1.Detached.Load() {
+		detached = true
+	} else if csWritePending(cs) {
+		queued = true
+		pending = csPendingBytes(cs)
+	}
+	if mu != nil {
+		mu.Unlock()
+	}
 	switch {
-	case h1 != nil && h1.Detached.Load():
+	case detached:
 		l.notifyDetachedPeerClosed(cs)
-	case csWritePending(cs):
-		l.markClosing(cs)
+	case queued:
+		l.markClosing(cs, pending)
 	default:
 		l.closeConn(fd)
 	}
+}
+
+// handBackHalfClose is drainDetachQueue's part of a half-close that
+// onPeerHalfClose owed (halfCloseOwed): the conn's goroutine has handed it
+// back, so the verdict that could not be read under a running handler is made
+// now. It reports whether the caller may go on to put cs back on the dirty
+// list: false when the conn was closed (cs may already be pooled) or when the
+// handler is running again and the half-close is owed again (relink has given
+// the conn up once more, and the next hand-back is its next chance). Loop
+// thread.
+func (l *Loop) handBackHalfClose(cs *connState) (live bool) {
+	if !cs.halfCloseOwed {
+		return true
+	}
+	cs.halfCloseOwed = false
+	fd := cs.fd
+	l.onPeerHalfClose(fd)
+	l.driverMu.RLock()
+	owned := fd >= 0 && fd < len(l.conns) && l.conns[fd] == cs
+	l.driverMu.RUnlock()
+	return owned && !cs.halfCloseOwed
 }
 
 // notifyDetachedPeerClosed reports an EPOLLRDHUP (peer half-close) to the
@@ -1821,7 +1881,7 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 		l.closeConn(cs.fd)
 		return
 	}
-	l.markClosing(cs)
+	l.markClosing(cs, csPendingBytes(cs))
 	l.removeDirty(cs)
 	issued, err := l.modEpollOut(cs, unix.EPOLLOUT|unix.EPOLLET|unix.EPOLLRDHUP)
 	if !issued {
@@ -1850,16 +1910,18 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 // writing (an SSE stream: for ever). Only evidence that the peer is taking the
 // response moves the clock (noteClosingProgress, noteClosingAcked). Loop thread.
 //
-// csPendingBytes below reads the dispatch goroutine's buffers unlocked on the
-// EPOLLRDHUP path, a known race (celeris#865, tracked in celeris#885): it feeds
-// only the progress baseline and cannot make the close wrong.
-func (l *Loop) markClosing(cs *connState) {
+// pending is the number of bytes queued for cs now (csPendingBytes), the
+// baseline noteClosingProgress compares the next flush against. The caller
+// counts it: where a dispatch goroutine can be writing, that is under detachMu
+// (onPeerHalfClose, celeris#885 item 36), and markClosing reads nothing of cs
+// that the lock guards.
+func (l *Loop) markClosing(cs *connState, pending int) {
 	cs.peerClosed = true
 	if cs.closeSince != 0 {
 		return
 	}
 	cs.closeSince = time.Now().UnixNano()
-	cs.closePending = csPendingBytes(cs)
+	cs.closePending = pending
 }
 
 // noteClosingProgress restarts the drain clock of a conn markClosing deferred
@@ -3244,7 +3306,12 @@ func (l *Loop) drainDetachQueue() {
 			cs.asyncH2Promoted.Store(false)
 			l.h2Conns = append(l.h2Conns, cs.fd)
 			cs.relinkPending = false // celeris#669: back on the dirty list
-			l.markDirty(cs)
+			// A peer half-close owed while the handler ran (celeris#885): made
+			// now, after the h2Conns bookkeeping so a close finds the entry it
+			// removes. This branch continues before the tail below.
+			if l.handBackHalfClose(cs) {
+				l.markDirty(cs)
+			}
 			continue
 		}
 		// Async-mode Detach finalisation: OnDetach ran on the
@@ -3291,9 +3358,13 @@ func (l *Loop) drainDetachQueue() {
 			cs.recvPaused = desired
 		}
 		// A relink hand-back (celeris#669) lands here too: the conn is back
-		// on the dirty list, whose next pass sees it as it now is.
+		// on the dirty list, whose next pass sees it as it now is. A peer
+		// half-close owed while the handler ran (celeris#885) is made first: a
+		// close it makes releases cs, which must not be put on the list.
 		cs.relinkPending = false
-		l.markDirty(cs)
+		if l.handBackHalfClose(cs) {
+			l.markDirty(cs)
+		}
 	}
 	// Drop the strong refs before reusing the array (see the io_uring
 	// worker's drainDetachQueue and drainPendingRelease for the same

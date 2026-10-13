@@ -189,6 +189,9 @@ func TestOwedHalfCloseIsServedAtTheHandBack885(t *testing.T) {
 			t.Fatalf("celeris885: the half-close found under a running handler was lost at the hand-back: slot=%p closeCount=%d",
 				l.conns[fd], l.closeCount.Load())
 		}
+		if l.dirtyHead != nil {
+			t.Errorf("celeris885: the conn the hand-back closed (and released to the pool) was put on the dirty list")
+		}
 	})
 	t.Run("bytes queued defers the close", func(t *testing.T) {
 		l, cs, _ := halfCloseRig885(t)
@@ -247,4 +250,38 @@ func TestOwedHalfCloseIsServedAtTheHandBack885(t *testing.T) {
 			t.Fatalf("celeris885: the half-close was lost at the second hand-back: slot=%p closeCount=%d", l.conns[fd], l.closeCount.Load())
 		}
 	})
+}
+
+// TestOwedHalfCloseIsServedAtTheH2UpgradeHandBack885: the hand-back of an h2c
+// upgrade is the other entry the dispatch goroutine leaves (asyncH2Promoted),
+// and drainDetachQueue's branch for it continues before the tail where the
+// relink hand-back is settled. A half-close owed to the goroutine that was in
+// the handler of the upgrade request must be made there too: nothing else will
+// ever make it.
+func TestOwedHalfCloseIsServedAtTheH2UpgradeHandBack885(t *testing.T) {
+	l, cs, _ := halfCloseRig885(t)
+	cs.writeBuf = cs.writeBuf[:0]
+	fd := cs.fd
+	release := holdAsHandler(t, cs, true)
+	l.onPeerHalfClose(fd)
+	release()
+	// What the goroutine leaves behind after switchToH2Local: h2 state, the
+	// promotion flag, one entry on the queue, and no goroutine.
+	cs.h1State = nil
+	cs.h2State = conn.NewH2State(&asyncReuseHandler{}, conn.H2Config{}, func([]byte) {}, nil)
+	cs.protocol = engine.H2C
+	cs.asyncInMu.Lock()
+	cs.asyncRun = false
+	cs.relinkOwed = false
+	cs.asyncInMu.Unlock()
+	cs.asyncH2Promoted.Store(true)
+	l.enqueueDetach(cs)
+	l.drainDetachQueue()
+	if l.conns[fd] != nil || l.closeCount.Load() != 1 {
+		t.Fatalf("celeris885: the half-close owed to the goroutine that upgraded the conn was lost at its hand-back: slot=%p closeCount=%d",
+			l.conns[fd], l.closeCount.Load())
+	}
+	if len(l.h2Conns) != 0 || l.dirtyHead != nil {
+		t.Errorf("celeris885: the closed upgrade conn is still on a list: h2Conns=%v dirtyHead=%p", l.h2Conns, l.dirtyHead)
+	}
 }
