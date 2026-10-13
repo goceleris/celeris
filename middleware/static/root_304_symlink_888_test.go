@@ -207,3 +207,28 @@ func TestRoot304FollowsSymlinkInside888(t *testing.T) {
 		})
 	}
 }
+
+// TestRoot304RelativeRoot888: the containment check of the 304 holds for a Root
+// given as a relative path, an escape in an upper element included, and the
+// symlink inside the root still gets its 304.
+func TestRoot304RelativeRoot888(t *testing.T) {
+	r := newRoot888(t)
+	r.link(t, r.outside, filepath.Join("a", "linkdir"))
+	r.write(t, filepath.Join(r.root, "a", "ok", "f.txt"), secretBytes888, secretTime888)
+	t.Chdir(filepath.Dir(r.root))
+	tag := weakETag(secretTime888, int64(len(secretBytes888)))
+	for _, rel := range []string{"root", "./root", "root/a/.."} {
+		mw := New(Config{Root: rel})
+		rec, err := get888(t, mw, "/a/linkdir/secret.txt", "if-none-match", tag)
+		if rec.StatusCode == 304 || !isHTTP400(err) {
+			t.Errorf("Root %q: escape answered status %d, err %v; want a 400", rel, rec.StatusCode, err)
+		}
+		if got := rec.Header("etag"); got != "" {
+			t.Errorf("Root %q: etag %q on a refused request, want none", rel, got)
+		}
+		rec, err = get888(t, mw, "/a/ok/f.txt", "if-none-match", tag)
+		if err != nil || rec.StatusCode != 304 {
+			t.Errorf("Root %q: file inside answered status %d, err %v; want a 304", rel, rec.StatusCode, err)
+		}
+	}
+}
