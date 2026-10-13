@@ -283,3 +283,62 @@ func TestSwitchAfterListenCtxCancelledBuildsNothing886(t *testing.T) {
 		t.Errorf("a switch after Listen's context was cancelled built %d standby(s), want 0", got)
 	}
 }
+
+// TestShutdownCtxVersusSwitchNeverWedges886 is the deadlock check for the ctx-aware
+// first lock in Shutdown (RULE 10): Shutdown calls with deadlines either side of
+// the time a concurrent switch holds e.mu, repeated, must all return, leave e.mu
+// free once the switches are done, and leave the sub-engines shut down by one of
+// the two paths (Shutdown itself or the goroutine it left queued for the lock).
+func TestShutdownCtxVersusSwitchNeverWedges886(t *testing.T) {
+	const rounds = 150
+	for i := range rounds {
+		hold := time.Duration(i%5) * time.Millisecond
+		e, active, lazy, _ := newShutdownWindowEngine(t, func() { time.Sleep(hold) })
+		var wg sync.WaitGroup
+		for range 2 {
+			wg.Go(e.ForceSwitch)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%4)*time.Millisecond)
+		errc := make(chan error, 1)
+		go func() { errc <- e.Shutdown(ctx) }()
+		select {
+		case err := <-errc:
+			if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("round %d: Shutdown returned %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: Shutdown did not return", i)
+		}
+		cancel()
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: a switch did not return", i)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			a, _ := active.state()
+			free := e.mu.TryLock()
+			if free {
+				e.mu.Unlock()
+			}
+			if a > 0 && free {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: active shutdowns=%d mu free=%v after the switches returned", i, a, free)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if n, _ := lazy.state(); n > 0 {
+			e.mu.Lock()
+			built := e.secondary == lazy
+			e.mu.Unlock()
+			if !built {
+				t.Fatalf("round %d: the standby was shut down but is not in a slot", i)
+			}
+		}
+	}
+}
