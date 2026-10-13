@@ -25,10 +25,11 @@
 // range are those of the .br/.gz variant served, not of the original file it
 // was built from, so rebuilding only the variant changes them; a file served,
 // or answered with a 304, for a request with an Accept-Encoding header names
-// Vary: Accept-Encoding, whether or not the file has a variant. A request for a directory is answered with its index
-// file, and with the index file's own variant. With Root, a conditional request
-// is answered 304 only for a path that stays inside the root once symlinks are
-// resolved, as an unconditional one is served only for such a path.
+// Vary: Accept-Encoding, whether or not the file has a variant. A request for
+// a directory is answered with its index file, and with the index file's own
+// variant. With Root, a conditional request is answered 304 only for a path
+// that stays inside the root once symlinks are resolved, as an unconditional
+// one is served only for such a path.
 //
 // A GET with a single byte range gets 206 Partial Content; a range no byte of
 // the file satisfies gets 416 Range Not Satisfiable with
