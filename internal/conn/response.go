@@ -679,15 +679,15 @@ func (a *h2InlineResponseAdapter) CloseUse(s *stream.Stream, gen uint64) error {
 }
 
 // ResetStream queues the RST_STREAM behind the stream's own frames, which an
-// inline handler's streamed response sends through the queue (stream.StreamResetter).
+// inline handler's streamed response sends through the queue (stream.Resetter).
 func (a *h2InlineResponseAdapter) ResetStream(s *stream.Stream, code http2.ErrCode) {
 	a.queue.ResetStream(s, code)
 }
 
 var _ stream.Streamer = (*h2InlineResponseAdapter)(nil)
 var _ stream.UseStreamer = (*h2InlineResponseAdapter)(nil)
-var _ stream.StreamResetter = (*h2InlineResponseAdapter)(nil)
-var _ stream.StreamResetter = (*h2ResponseAdapter)(nil)
+var _ stream.Resetter = (*h2InlineResponseAdapter)(nil)
+var _ stream.Resetter = (*h2ResponseAdapter)(nil)
 
 type h2ResponseAdapter struct {
 	write        func([]byte)
@@ -969,7 +969,7 @@ func (a *h2ResponseAdapter) resetStream(s *stream.Stream, code http2.ErrCode) {
 }
 
 // ResetStream is the processor's reset of a stream whose handler is over
-// without having finished its response (stream.StreamResetter, celeris#889).
+// without having finished its response (stream.Resetter, celeris#889).
 func (a *h2ResponseAdapter) ResetStream(s *stream.Stream, code http2.ErrCode) {
 	a.resetStream(s, code)
 }

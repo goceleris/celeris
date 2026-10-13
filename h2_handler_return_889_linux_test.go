@@ -4,7 +4,6 @@ package celeris_test
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -16,8 +15,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/net/http2"
 
 	"github.com/goceleris/celeris"
 )
@@ -133,15 +130,11 @@ func startH2Return889(t *testing.T, eng celeris.EngineType) *h2Return889Rig {
 	return r
 }
 
-// get fetches path over h2c with Go's own HTTP/2 client and reads the body.
+// get fetches path over h2c (prior knowledge) with Go's own HTTP/2 client,
+// net/http's, and reads the body.
 func (r *h2Return889Rig) get(path string) (body string, err error) {
-	tr := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, addr)
-		},
-	}
+	tr := &http.Transport{Protocols: new(http.Protocols)}
+	tr.Protocols.SetUnencryptedHTTP2(true)
 	defer tr.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -153,6 +146,12 @@ func (r *h2Return889Rig) get(path string) (body string, err error) {
 	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(resp.Body)
 	return string(b), err
+}
+
+// isInternalError889 reports whether err is the client's view of a
+// RST_STREAM(INTERNAL_ERROR): "stream error: stream ID 1; INTERNAL_ERROR".
+func isInternalError889(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "INTERNAL_ERROR")
 }
 
 func TestH2HandlerReturnWithoutClosingEndsTheStream889(t *testing.T) {
@@ -184,8 +183,7 @@ func TestH2HandlerShortOfItsContentLengthResetsTheStream889(t *testing.T) {
 			r := startH2Return889(t, a.eng)
 			for _, path := range []string{"/short", "/ashort"} {
 				body, err := r.get(path)
-				var se http2.StreamError
-				if !errors.As(err, &se) || se.Code != http2.ErrCodeInternal {
+				if !isInternalError889(err) {
 					t.Errorf("GET %s: body %q err %v, want a stream error INTERNAL_ERROR (RST_STREAM): END_STREAM would make a truncated body look complete, and no frame leaves the client to its timeout", path, body, err)
 				}
 			}
@@ -200,8 +198,7 @@ func TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889(t *testing.T) {
 			r := startH2Return889(t, a.eng)
 			for range 3 {
 				_, err := r.get("/aboom")
-				var se http2.StreamError
-				if !errors.As(err, &se) || se.Code != http2.ErrCodeInternal {
+				if !isInternalError889(err) {
 					t.Errorf("GET /aboom: err %v, want a stream error INTERNAL_ERROR (RST_STREAM)", err)
 				}
 			}
@@ -254,8 +251,7 @@ func TestH2StreamedResponseBrokenOffIsReset889(t *testing.T) {
 			r := startH2Return889(t, a.eng)
 			for _, path := range []string{"/panicstream", "/errstream", "/apanicstream", "/aerrstream"} {
 				body, err := r.get(path)
-				var se http2.StreamError
-				if !errors.As(err, &se) || se.Code != http2.ErrCodeInternal {
+				if !isInternalError889(err) {
 					t.Errorf("GET %s: body %q err %v, want a stream error INTERNAL_ERROR: a response broken off after its headers must not end with END_STREAM", path, body, err)
 				}
 			}

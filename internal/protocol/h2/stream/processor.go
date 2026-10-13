@@ -345,7 +345,7 @@ func (p *Processor) handlerUnfinished(id uint32, reset bool, written, declared i
 // it could reach the peer before the HEADERS or DATA still in the queue, and
 // DATA on a closed stream is an error for the peer. A pool goroutine cannot
 // use the connection's writer, which belongs to the event loop, so the
-// ResponseWriter does it (StreamResetter). The request has ended before any
+// ResponseWriter does it (Resetter). The request has ended before any
 // handler runs (every frame path sets EndStream first), so the peer has no
 // DATA in flight for the stream and nothing is marked in resetIDs.
 //
@@ -356,7 +356,7 @@ func (p *Processor) handlerUnfinished(id uint32, reset bool, written, declared i
 func (p *Processor) resetHandlerStream(stream *Stream) {
 	p.manager.DiscardOutbound(stream)
 	switch w := stream.ResponseWriter.(type) {
-	case StreamResetter:
+	case Resetter:
 		w.ResetStream(stream, http2.ErrCodeInternal) // cancels the stream as well
 	default:
 		// A writer that cannot queue behind the stream's frames (a test

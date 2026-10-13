@@ -43,7 +43,7 @@ type Hijacker interface {
 //     unless its response was already whole.
 //
 // The RST_STREAM is queued behind the frames the stream already queued
-// (StreamResetter). H2Config.Logger gets a Warn for a stream the processor
+// (Resetter). H2Config.Logger gets a Warn for a stream the processor
 // reset, a Debug for one it ended, and an Error with the stack for a panic and
 // for a Goexit; Processor.OnHandlerPanic, OnHandlerGoexit and
 // OnHandlerUnfinished are told, and the processor counts them.
@@ -178,7 +178,7 @@ type Streamer interface {
 	Close(stream *Stream) error
 }
 
-// StreamResetter is an optional interface a ResponseWriter may implement to
+// Resetter is an optional interface a ResponseWriter may implement to
 // reset a stream from the goroutine of its handler (celeris#889). ResetStream
 // queues RST_STREAM(code) behind the frames the stream has already queued, so
 // the peer never sees it ahead of the stream's own HEADERS or DATA, and
@@ -187,7 +187,7 @@ type Streamer interface {
 // when a handler is over without having finished its response; a writer
 // without it (a test recorder) falls back to H2Controller.WriteRSTStreamPriority,
 // which belongs to the event loop.
-type StreamResetter interface {
+type Resetter interface {
 	ResetStream(stream *Stream, code http2.ErrCode)
 }
 
