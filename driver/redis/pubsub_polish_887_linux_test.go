@@ -152,6 +152,10 @@ func testConstructorKeepsThePubSubWhenTheFirstControlCallFindsTheConnDown887(t *
 // the mutant whose firstControl keeps the PubSub on every error is its
 // control.
 func TestConstructorClosesThePubSubOnAnyOtherFirstControlError887(t *testing.T) {
+	eachRigEngine(t, testConstructorClosesThePubSubOnAnyOtherFirstControlError887)
+}
+
+func testConstructorClosesThePubSubOnAnyOtherFirstControlError887(t *testing.T, eng rigEngine) {
 	for _, tc := range []struct {
 		name string
 		verb string
@@ -169,7 +173,7 @@ func TestConstructorClosesThePubSubOnAnyOtherFirstControlError887(t *testing.T) 
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newPubsubRig(t)
+			r := newPubsubRig(t, eng)
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			r.gate.armFailWith(hasCmd(tc.verb), ErrQueueFull)
