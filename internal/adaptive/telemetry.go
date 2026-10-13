@@ -65,12 +65,16 @@ type liveSampler struct {
 // divided by is a handful of subscriptions. The ratio then reads 0.056 to 355
 // with every client request answered, and the revert fires on an engine that
 // is serving. epoll never counts it (celeris#645), so leaving it out removes the
-// send-side asymmetry between the two engines' rates. It is not the only
-// accept-side figure in it: an accept that failed with ECONNABORTED (a peer
-// that reset between SYN and accept) is counted in AcceptCancelled by both
-// engines since celeris#886 (epoll retries it in place and counts it), and
-// that stays in. send_peer_gone stays in
-// ErrorCount and in its own bucket: Metrics() and the published series still show it.
+// send-side asymmetry between the two engines' rates. send_peer_gone stays in
+// ErrorCount and in its own bucket: Metrics() and the published series still
+// show it.
+//
+// Everything else in ErrorCount stays in the rate, an accept that failed with
+// ECONNABORTED (a peer that reset between SYN and accept) among it: both
+// engines count it in AcceptCancelled since celeris#886 (epoll retries it in
+// place and counts it). The controller reads the rate only while io_uring is
+// the active engine, so on epoll that count changes the published figures and
+// nothing a switch or revert decides on.
 func revertErrors(m engine.EngineMetrics) uint64 {
 	return satSub(m.ErrorCount, m.ErrorSendPeerGone)
 }

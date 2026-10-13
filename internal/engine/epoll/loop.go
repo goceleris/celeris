@@ -1014,15 +1014,16 @@ func (l *Loop) notifyDetachedPeerClosed(cs *connState) {
 // for a fresh SYN edge.
 const acceptAllCap = 1024
 
-// countAcceptRetry counts an accept4 failure that acceptAll retries in place:
-// an aborted SYN (ECONNABORTED, a peer that reset before accept) lands in
+// acceptRetry reports whether an accept4 failure is a transient one that
+// acceptAll retries in place: an aborted SYN (ECONNABORTED, a peer that reset
+// before accept) or an interrupted syscall (EINTR). The aborted SYN lands in
 // AcceptCancelled, as the same errno does when io_uring's accept completes
-// with it; an interrupted syscall (EINTR) is not counted. It is called from
-// the retry cases only, so a drained queue (EAGAIN) pays nothing.
-func (l *Loop) countAcceptRetry(err error) {
-	if errno, ok := err.(unix.Errno); ok {
-		l.errs.AcceptRetried(errno)
-	}
+// with it; EINTR is not counted (errclass.Counters.AcceptRetried is the one
+// list of both engines, so the two cannot drift apart). It is called from the
+// error switch's default case only, so a drained queue (EAGAIN) pays nothing.
+func (l *Loop) acceptRetry(err error) bool {
+	errno, ok := err.(unix.Errno)
+	return ok && l.errs.AcceptRetried(errno)
 }
 
 // acceptStop is why acceptAll returned. The event loop only needs listenHot;
@@ -1047,13 +1048,6 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 				// (EWOULDBLOCK == EAGAIN on Linux, so one case covers both.)
 				l.listenHot = false
 				return acceptDrained
-			case unix.EINTR, unix.ECONNABORTED:
-				// Transient: a SYN was aborted (RST before accept) or the
-				// syscall was interrupted. The backlog may still hold other
-				// connections, so retry this round rather than returning —
-				// a bare return would strand them until the next SYN edge.
-				l.countAcceptRetry(err)
-				continue
 			case unix.EMFILE, unix.ENFILE:
 				// Out of file descriptors (per-process / system-wide). The
 				// SYN at the head of the queue is un-acceptable right now;
@@ -1065,6 +1059,14 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 				l.listenHot = true
 				return acceptFDLimit
 			default:
+				if l.acceptRetry(err) {
+					// Transient: a SYN was aborted (RST before accept) or the
+					// syscall was interrupted. The backlog may still hold
+					// other connections, so retry this round rather than
+					// returning — a bare return would strand them until the
+					// next SYN edge.
+					continue
+				}
 				// Unexpected accept error. Count it and stop this round; the
 				// listen fd stays armed (ET) and a fresh edge re-enters.
 				l.errs.AcceptOther.Add(1)
