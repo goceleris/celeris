@@ -152,6 +152,14 @@ type Loop struct {
 	// linger for. A listener created without it (DisableDeferAccept) closes
 	// at once. Loop-thread-only.
 	deferCapable bool
+	// exited (declared here, after deferCapable, to sit in the padding
+	// that follows it and leave the layout of the fields below unchanged) is set by Engine.runWatched when the loop goroutine is gone,
+	// whether run returned or the goroutine ended without returning (a
+	// handler's runtime.Goexit, celeris#848). It is never reset. PauseAccept
+	// counts an exited loop as closed whatever listenFDClosed says, because
+	// ResumeAccept clears that flag on every loop, a dead one included, and
+	// nothing would set it again.
+	exited atomic.Bool
 	// pause is the engine's record of the pause in progress, written by
 	// BeginPauseAccept before it sets acceptPaused. Nil in bare test loops,
 	// which deferlinger treats as "no guard, no delay".
@@ -412,9 +420,10 @@ func (l *Loop) run(ctx context.Context) {
 	// the affinity and the policy are also put back on the way out.
 	runtime.LockOSThread()
 
-	// The save fails on a kernel with more than 1024 possible CPUs, more
-	// than unix.CPUSet holds, where the pin still succeeds: a main thread the
-	// loop ran on is then parked still pinned.
+	// The save reads the whole mask, however many CPUs the kernel has
+	// (platform.SaveThreadAffinity). It fails only on a syscall error or a
+	// mask past 8 KiB, and the pin below still goes ahead: a main thread the
+	// loop ran on is then parked still pinned (celeris#905).
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}
@@ -4267,6 +4276,7 @@ func (l *Loop) shutdown() {
 
 	if l.listenFD >= 0 {
 		_ = unix.Close(l.listenFD)
+		l.listenFD = -1 // a Goexit in a later step must not close the number twice (reportLoopExit)
 	}
 	// The loop has left the SO_REUSEPORT group for good. PauseAccept waits
 	// for this flag, and a loop that exits in the middle of a pause linger
