@@ -14,21 +14,21 @@
 // `GOWORK=off go -C .github/tools get golang.org/x/perf@latest`.
 module celeris-ci-tools
 
-go 1.27.0
+go 1.27.2
 
 tool (
 	golang.org/x/perf/cmd/benchstat
 	golang.org/x/vuln/cmd/govulncheck
 )
 
-require golang.org/x/tools v0.50.0
+require golang.org/x/tools v0.52.0
 
 require (
-	github.com/aclements/go-moremath v0.0.0-20210112150236-f10218a38794 // indirect
-	golang.org/x/mod v0.41.0 // indirect
-	golang.org/x/perf v0.0.0-20260929162123-406019bb8b68 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/telemetry v0.0.0-20260908163034-4bcc4b2ee518 // indirect
-	golang.org/x/vuln v1.8.0 // indirect
+	github.com/aclements/go-moremath v0.0.0-20241023150245-c8bbc672ef66 // indirect
+	golang.org/x/mod v0.42.0 // indirect
+	golang.org/x/perf v0.0.0-20261009192801-be2c69fb417e // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/telemetry v0.0.0-20261012234344-3c2f9838340e // indirect
+	golang.org/x/vuln v1.9.0 // indirect
 )
