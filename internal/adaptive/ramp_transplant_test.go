@@ -44,6 +44,9 @@ func newRampAdaptive(t *testing.T, h stream.Handler, cfg resource.Config) (*Engi
 	e.ctrl.evalInterval = 40 * time.Millisecond
 	e.ctrl.cooldown = 0
 	e.ctrl.loadDownRevert = true
+	if afterNew886 != nil {
+		afterNew886(e)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

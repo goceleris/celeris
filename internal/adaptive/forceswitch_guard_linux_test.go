@@ -59,3 +59,10 @@ func forceSwitchTo(t *testing.T, e *Engine, want engine.EngineType) {
 	}
 	t.Fatalf("a forced switch to %v left %v active", want, got)
 }
+
+// afterNew886 is a hook the controller-driven tests' constructors
+// (newRampAdaptive, preBoundAdaptive) call on the engine between New and
+// Listen. nil outside a test that sets it. TestControllerSwitchVerdictsOnAFailedStandby886
+// sets it, in a child process, to make the lazy io_uring standby fail to build
+// (failStandbyBuild804).
+var afterNew886 func(*Engine)

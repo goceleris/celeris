@@ -156,6 +156,13 @@ func TestAdaptiveAutoSingleWorker(t *testing.T) {
 }
 
 func TestAdaptiveSwitchUnderLoad(t *testing.T) {
+	adaptiveSwitchUnderLoad(t, nil)
+}
+
+// adaptiveSwitchUnderLoad is TestAdaptiveSwitchUnderLoad; beforeSwitch, when
+// set, runs just before the forced switch (a test of the test's own verdicts
+// uses it to make the standby build fail, TestAdaptiveSwitchVerdictOnAFailedStandby886).
+func adaptiveSwitchUnderLoad(t *testing.T, beforeSwitch func(*testing.T)) {
 	port := freePort(t)
 	cfg := defaultTestConfig(port, engine.HTTP1)
 	cfg.Engine = engine.Adaptive
@@ -196,6 +203,9 @@ func TestAdaptiveSwitchUnderLoad(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Force switch.
+	if beforeSwitch != nil {
+		beforeSwitch(t)
+	}
 	e.ForceSwitch()
 
 	newType := e.ActiveEngine().Type()

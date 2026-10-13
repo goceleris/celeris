@@ -46,6 +46,9 @@ func preBoundAdaptive(t *testing.T, workers int) (*Engine, string, func()) {
 		_ = ln.Close()
 		t.Fatalf("adaptive.New with a pre-bound listener (%s): %v", want, err)
 	}
+	if afterNew886 != nil {
+		afterNew886(e)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
