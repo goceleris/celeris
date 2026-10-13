@@ -25,18 +25,24 @@ package stallprobe
 // Knobs (celeris-stress extra=NAME=V, values [A-Za-z0-9_.,:/+-]):
 //
 //	CELERIS_PROBE_LAB_PARTS       comma list of C,GO (both)
-//	CELERIS_PROBE_LAB_DS          D values in us for experiment A (0,1,2,5,10,20,50,100,200)
-//	CELERIS_PROBE_LAB_REPS        reps per cell (3)
+//	CELERIS_PROBE_LAB_DS          D values in us for experiment A (0,5,20,100; D below 5 us is below Go's own minimum)
+//	CELERIS_PROBE_LAB_GRID        full: D = 0,1,2,5,10,20,50,100,200 and 3 reps (unless DS / REPS are set)
+//	CELERIS_PROBE_LAB_REPS        reps per cell (5; the rep is the unit of replication)
+//	CELERIS_PROBE_LAB_COMPLETE    user | handler: who completes a request (user: the target loop in user mode, as in Go)
+//	CELERIS_PROBE_LAB_CAS         retry | go: retry a failed signalPending CAS (default) or follow Go (never resend after one)
+//	CELERIS_PROBE_LAB_YIELD       none | go: the sender sched_yields every 5 us after its first 10 us, like suspendG
+//	CELERIS_PROBE_LAB_POSTACK_NS  post-ack busy wait of the discriminating control cells on the primary pair (1500; 0 = none)
+//	CELERIS_PROBE_LAB_MATCHED     1 | 0: the two matched GOMAXPROCS=2 arms of experiment B (1)
 //	CELERIS_PROBE_LAB_SECS        seconds per cell (8)
 //	CELERIS_PROBE_LAB_K           handler invocations per request that are refused (1)
 //	CELERIS_PROBE_LAB_IDLE_US     idle between requests (2000)
 //	CELERIS_PROBE_LAB_TMO_MS      per-request cap, counted as a timeout (1000)
 //	CELERIS_PROBE_LAB_K0_SECS     seconds of the K=0 baseline cell per pair (4; 0 = none)
-//	CELERIS_PROBE_LAB_C_BUDGET_MIN  minutes experiment A may take before it stops after a complete cell (18)
+//	CELERIS_PROBE_LAB_C_BUDGET_MIN  minutes experiment A may take before it stops after a complete cell (16)
 //	CELERIS_PROBE_LAB_GO_VERSION  toolchain of experiment B (1.27.2)
 //	CELERIS_PROBE_LAB_GO_REPS     reps per arm (6)
 //	CELERIS_PROBE_LAB_GO_SECS     seconds per run (30)
-//	CELERIS_PROBE_LAB_GO_BUDGET_MIN  minutes experiment B may take (17)
+//	CELERIS_PROBE_LAB_GO_BUDGET_MIN  minutes experiment B may take (25)
 //	CELERIS_PROBE_LAB_FAKECLASSES BIGS/LITTLES, e.g. 4-7/0-3: pretend a homogeneous host has two core types
 //	                              (local validation only; every line says fake=true)
 
@@ -45,6 +51,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -243,7 +250,7 @@ func TestSigurgLabUnit(t *testing.T) {
 	}
 
 	// the LABCELL line
-	line := "noise\nLABCELL label=x t=2 s=0 d_us=5 k=1 requests=3 completes=2 timeouts=1 sends=9 sends_max=5 resends=6 resends_waited=2 handlers=9 reentry=4 zero_delta=4 maxconsec=3 ack_hist=0:1,9:2 gap_hist=- a2r_hist=5:1\n"
+	line := "noise\nLABCELL label=x t=2 s=0 d_us=5 k=1 requests=3 completes=2 timeouts=1 sends=9 sends_max=5 resends=6 resends_waited=2 cas_fail_first=1 handlers=9 reentry=4 zero_delta=4 maxconsec=3 ack_hist=0:1,9:2 gap_hist=- a2r_hist=5:1\n"
 	c, err := labParseCell(line)
 	if err != nil || c.Requests != 3 || c.Timeout != 1 || c.Reentry != 4 || c.Ack.total() != 3 || c.Gap.total() != 0 || c.KV["label"] != "x" {
 		t.Errorf("labParseCell: %+v err %v", c, err)
@@ -257,10 +264,10 @@ func TestSigurgLabUnit(t *testing.T) {
 	pool := newLabPool()
 	pool.add(c, reqs[:10])
 	pool.add(c, reqs[10:20])
-	if pool.reps != 2 || len(pool.reqs) != 20 || pool.ack.total() != 6 || pool.reentry != 8 || pool.resends != 12 || pool.waited != 4 {
+	if pool.reps != 2 || len(pool.reqs) != 20 || pool.ack.total() != 6 || pool.reentry != 8 || pool.resends != 12 || pool.waited != 4 || pool.casFail != 2 || len(pool.perRep) != 2 {
 		t.Errorf("pool: %+v", pool)
 	}
-	if l := labStatsLine(labSummarize(pool.reqs), pool.ack, pool.gap, pool.a2r, pool.resends, pool.waited); !strings.Contains(l, "resends_waited_frac=0.333") || !strings.Contains(l, "requests=20") {
+	if l := labStatsLine(labSummarize(pool.reqs), pool.ack, pool.gap, pool.a2r, pool.resends, pool.waited, pool.casFail); !strings.Contains(l, "resends_waited_frac=0.333") || !strings.Contains(l, "requests=20") {
 		t.Errorf("labStatsLine: %s", l)
 	}
 
@@ -281,14 +288,14 @@ func TestSigurgLabUnit(t *testing.T) {
 	for _, p := range pairs {
 		names = append(names, fmt.Sprintf("%s:%d<-%d", p.Name, p.T, p.S))
 	}
-	if got, want := strings.Join(names, " "), "little<-big:2<-0 little<-little:2<-3 big<-big:0<-1 big<-little:0<-2"; got != want {
+	if got, want := strings.Join(names, " "), "little<-big:2<-6 little<-little:2<-3 big<-big:6<-7 big<-little:6<-2"; got != want {
 		t.Errorf("labPairs = %s, want %s", got, want)
 	}
 	hom := topo{Allowed: []int{0, 1, 2, 3}, CPU: map[int]cpuInfo{}, Classes: [][]int{{0, 1, 2, 3}}}
 	ltH, _ := labClasses(hom, "")
 	pH := labPairs(ltH, labDomain(hom), func(c int) []int { return []int{c, c ^ 1} }) // SMT pairs 0/1 and 2/3
-	if ltH.Hetero || len(pH) != 1 || pH[0].T != 0 || pH[0].S != 2 || !pH[0].ControlOnly {
-		t.Errorf("homogeneous pairs: %+v (sender must skip the SMT sibling)", pH)
+	if ltH.Hetero || len(pH) != 1 || pH[0].T != 1 || pH[0].S != 2 || !pH[0].ControlOnly {
+		t.Errorf("homogeneous pairs: %+v (CPU 0 avoided, sender must skip the SMT sibling)", pH)
 	}
 	if lf, err := labClasses(hom, "2-3/0-1"); err != nil || !lf.Fake || !lf.Hetero || fmtCPUs(lf.Bigs) != "2-3" || fmtCPUs(lf.Littles) != "0-1" {
 		t.Errorf("fake map: %+v err %v", lf, err)
@@ -319,13 +326,16 @@ func TestSigurgLabUnit(t *testing.T) {
 	if plan[0].Rep != 1 || plan[len(plan)-1].Rep != 3 || plan[0].D != 0 || plan[36].Rep != 2 || plan[36].D != 10 {
 		t.Errorf("plan order: first %+v, second rep starts with %+v (want rep 2, D=10: rotated by 4)", plan[0], plan[36])
 	}
-	if got := float64(len(plan)) * labCellSeconds(8) / 60; got < 14 || got > 15.5 {
-		t.Errorf("experiment A budget %.2f min, expected about 14.9", got)
+	// the default grid: D = 0,5,20,100 x 4 pairs x 5 reps
+	def, _ := labParseDs([]string{"0", "5", "20", "100"})
+	dplan := labPlan(pairs, def, 5)
+	if got := float64(len(dplan)) * labCellSeconds(8) / 60; len(dplan) != 80 || got < 10.9 || got > 11.3 {
+		t.Errorf("default experiment A: %d cells, %.2f min, expected 80 cells about 11.1 min", len(dplan), got)
 	}
 
 	// arms
-	arms := labArms(lt, hetTp)
-	if len(arms) != 5 || arms[0].Pin != nil || arms[0].Cpus != nil || fmtCPUs(arms[1].Pin) != "2-5" || fmtCPUs(arms[1].Cpus) != "2-5" ||
+	arms := labArms(lt, hetTp, true)
+	if len(arms) != 7 || arms[1].GoMaxProcs != 4 || arms[2].GoMaxProcs != 4 || arms[0].GoMaxProcs != 0 || fmtCPUs(arms[5].Cpus) != "2-3" || fmtCPUs(arms[5].Pin) != "4-5" || arms[5].GoMaxProcs != 2 || len(arms[6].Pin) != 2 || fmtCPUs(arms[6].Cpus) != "2-3" || arms[0].Pin != nil || arms[0].Cpus != nil || fmtCPUs(arms[1].Pin) != "2-5" || fmtCPUs(arms[1].Cpus) != "2-5" ||
 		fmtCPUs(arms[2].Pin) != "0-1,6-7" || fmtCPUs(arms[2].Cpus) != "2-5" || fmtCPUs(arms[3].Pin) != "2-5" || len(arms[3].Cpus) != 4 || !arms[4].NoAsync {
 		t.Errorf("arms: %+v", arms)
 	}
@@ -356,8 +366,54 @@ func TestSigurgLabUnit(t *testing.T) {
 	if got := labStatusMask("Name:\tx\nCpus_allowed:\tff\nCpus_allowed_list:\t0-7\n"); got != "0-7" || labStatusMask("Name:\tx\n") != "?" {
 		t.Errorf("labStatusMask = %q", got)
 	}
-	if sum := labProcSummary(os.Getpid(), []int{0}, []int{1}); !strings.HasPrefix(sum, "threads=") {
+	if sum := labProcSummary(os.Getpid(), []int{0}, []int{1}, nil, nil); !strings.HasPrefix(sum, "threads=") {
 		t.Errorf("labProcSummary of this process: %s", sum)
+	}
+	if sum := labProcSummary(os.Getpid(), []int{0}, []int{1}, []int{9999}, nil); !strings.Contains(sum, "outside_mask=") || !strings.Contains(sum, "state=") {
+		t.Errorf("labProcSummary with a pin mask must list threads outside it: %s", sum)
+	}
+	if !strings.HasPrefix(labSchedSummary(os.Getpid()), "runq_wait_total_ms=") {
+		t.Errorf("labSchedSummary: %s", labSchedSummary(os.Getpid()))
+	}
+	if r, w, ok := labParseSchedstat("1234 5678 9\n"); !ok || r != 1234 || w != 5678 {
+		t.Errorf("labParseSchedstat = %d %d %v", r, w, ok)
+	}
+	if _, _, ok := labParseSchedstat("x"); ok {
+		t.Errorf("labParseSchedstat accepted garbage")
+	}
+	tick := make([]string, 50)
+	for i := range tick {
+		tick[i] = "0"
+	}
+	tick[0], tick[11], tick[12] = "S", "7", "5" // state, utime, stime
+	if st, tk, ok := labStatTicks("9 (a b) " + strings.Join(tick, " ")); !ok || st != "S" || tk != 12 {
+		t.Errorf("labStatTicks = %q %d %v, want S 12", st, tk, ok)
+	}
+
+	// exact interval and the primary comparison
+	for _, c := range []struct {
+		x, n   int64
+		lo, hi float64
+	}{{0, 10, 0, 0.3085}, {5, 10, 0.1871, 0.8129}, {10, 10, 0.6915, 1}} {
+		lo, hi := labClopperPearson(c.x, c.n, 0.05)
+		if math.Abs(lo-c.lo) > 2e-3 || math.Abs(hi-c.hi) > 2e-3 {
+			t.Errorf("labClopperPearson(%d,%d) = [%.4f, %.4f], want [%.4f, %.4f]", c.x, c.n, lo, hi, c.lo, c.hi)
+		}
+	}
+	ev := func(s labRepStat) int64 { return s.Reentry }
+	ex := func(s labRepStat) int64 { return s.Resends }
+	pa := []labRepStat{{Resends: 1000, Reentry: 50}, {Resends: 1000, Reentry: 40}, {Resends: 1000, Reentry: 60}}
+	pb := []labRepStat{{Resends: 1000, Reentry: 4}, {Resends: 1000, Reentry: 6}, {Resends: 1000, Reentry: 2}}
+	pr := labPrimary(pa, pb, ev, ex)
+	if !pr.Separated || !pr.AAbove || math.Abs(pr.Ratio-12.5) > 1e-9 || !(pr.Lo > 1 && pr.Lo < 12.5 && pr.Hi > 12.5) {
+		t.Errorf("labPrimary separated: %+v", pr)
+	}
+	pb2 := []labRepStat{{Resends: 1000, Reentry: 45}, {Resends: 1000, Reentry: 6}, {Resends: 1000, Reentry: 2}}
+	if pr2 := labPrimary(pa, pb2, ev, ex); pr2.Separated {
+		t.Errorf("labPrimary: overlapping reps reported as separated: %+v", pr2)
+	}
+	if pr3 := labPrimary(pa, []labRepStat{{Resends: 1000}, {Resends: 1000}}, ev, ex); !pr3.Separated || !math.IsInf(pr3.Ratio, 1) || pr3.Lo <= 1 {
+		t.Errorf("labPrimary with no event in B: %+v", pr3)
 	}
 
 	// the reproducer patch
@@ -401,30 +457,33 @@ func TestSigurgLabSmoke(t *testing.T) {
 		}
 		st := labSummarize(reqs)
 		t.Logf("LAB_CONTROL name=%s pair=%s t=%d s=%d d_us=%d extra=%q %s%s", name, p.Name, p.T, p.S, d, strings.Join(extra, " "),
-			labStatsLine(st, c.Ack, c.Gap, c.A2R, c.Resends, c.Waited), e.fakeTag)
+			labStatsLine(st, c.Ack, c.Gap, c.A2R, c.Resends, c.Waited, c.CasFail), e.fakeTag)
 		return c, st
 	}
 	// negative control: a handler that never acknowledges. signalPending stays 1, no resend, every request times out.
-	c, st := ctl("noack", 5, 2, "mode=noack", "tmo_ms=200")
+	c, st := ctl("noack", 5, 2, "mode=noack", "tmo_ms=200", "complete=handler")
 	if st.Requests == 0 || c.Completes != 0 || int(c.Timeout) != st.Requests || st.Timeouts != st.Requests {
 		t.Errorf("NEGATIVE CONTROL noack: requests=%d completes=%d timeouts=%d, want every request to time out", st.Requests, c.Completes, c.Timeout)
 	}
 	// huge D: the first handler is refused (K=1), the resend comes 20 ms later, the thread has run in user mode: send #2 completes, no re-entry
-	c, st = ctl("hugeD", 20000, 2)
+	c, st = ctl("hugeD", 20000, 2, "complete=handler")
 	if st.Requests < 5 || st.Timeouts != 0 || c.Sends != 2*c.Requests || st.Reentry != 0 || st.P50 < 19_000_000 {
 		t.Errorf("NEGATIVE CONTROL D=20ms: requests=%d timeouts=%d sends=%d reentry=%d p50=%d, want every request done on send #2 without re-entry", st.Requests, st.Timeouts, c.Sends, st.Reentry, st.P50)
 	}
 	// K=0: the first handler already saw user progress: send #1 completes
-	c, st = ctl("k0", 5, 1, "k=0")
+	c, st = ctl("k0", 5, 1, "k=0", "complete=handler")
 	if st.Requests < 50 || st.Timeouts != 0 || c.Sends != c.Requests || st.Reentry != 0 {
 		t.Errorf("CONTROL K=0: requests=%d timeouts=%d sends=%d reentry=%d, want every request done on send #1", st.Requests, st.Timeouts, c.Sends, st.Reentry)
 	}
 	// baseline and the two busy waits (logged, not asserted)
-	_, base := ctl("base", 5, 2)
-	_, post := ctl("postack50us", 5, 2, "postack_ns=50000")
-	_, pre := ctl("preack50us", 5, 2, "preack_ns=50000")
-	t.Logf("LAB_CONTROL summary: reentry base=%d post-ack-50us=%d pre-ack-50us=%d (expected: post-ack >> pre-ack; post-ack > 0 shows the harness detects re-entry) timeouts base=%d post=%d pre=%d%s",
-		base.Reentry, post.Reentry, pre.Reentry, base.Timeouts, post.Timeouts, pre.Timeouts, e.fakeTag)
+	_, base := ctl("base", 5, 2, "complete=handler")
+	_, post := ctl("postack50us", 5, 2, "postack_ns=50000", "complete=handler")
+	_, pre := ctl("preack50us", 5, 2, "preack_ns=50000", "complete=handler")
+	// the matrix mode: the target loop completes the request in user mode (logged, not asserted)
+	_, ubase := ctl("base-user", 5, 2, "complete=user")
+	_, upost := ctl("postack50us-user", 5, 2, "postack_ns=50000", "complete=user", "tmo_ms=200")
+	t.Logf("LAB_CONTROL summary: reentry base=%d post-ack-50us=%d pre-ack-50us=%d (expected: post-ack >> pre-ack; post-ack > 0 shows the harness detects re-entry) timeouts base=%d post=%d pre=%d; complete=user: sends/request base=%.2f vs handler mode %.2f, reentry base=%d post-ack-50us=%d timeouts post=%d%s",
+		base.Reentry, post.Reentry, pre.Reentry, base.Timeouts, post.Timeouts, pre.Timeouts, ubase.SendsMean, base.SendsMean, ubase.Reentry, upost.Reentry, upost.Timeouts, e.fakeTag)
 }
 
 // ---- TestSigurgLabC: experiment A -------------------------------------------------------------------------------------
@@ -443,14 +502,18 @@ func TestSigurgLabC(t *testing.T) {
 	if !ok {
 		return
 	}
-	ds, err := labParseDs(envList("CELERIS_PROBE_LAB_DS", "0,1,2,5,10,20,50,100,200"))
+	dsDef, repsDef := "0,5,20,100", 5
+	if os.Getenv("CELERIS_PROBE_LAB_GRID") == "full" {
+		dsDef, repsDef = "0,1,2,5,10,20,50,100,200", 3
+	}
+	ds, err := labParseDs(envList("CELERIS_PROBE_LAB_DS", dsDef))
 	if err != nil {
 		t.Logf("MATRIX_SKIP lab=C reason=%q", err.Error())
 		return
 	}
-	reps, secs := envInt("CELERIS_PROBE_LAB_REPS", 3), envInt("CELERIS_PROBE_LAB_SECS", 8)
+	reps, secs := envInt("CELERIS_PROBE_LAB_REPS", repsDef), envInt("CELERIS_PROBE_LAB_SECS", 8)
 	k, idle, tmo := envInt("CELERIS_PROBE_LAB_K", 1), envInt("CELERIS_PROBE_LAB_IDLE_US", 2000), envInt("CELERIS_PROBE_LAB_TMO_MS", 1000)
-	k0secs, budget := envInt("CELERIS_PROBE_LAB_K0_SECS", 4), time.Duration(envInt("CELERIS_PROBE_LAB_C_BUDGET_MIN", 18))*time.Minute
+	k0secs, budget := envInt("CELERIS_PROBE_LAB_K0_SECS", 4), time.Duration(envInt("CELERIS_PROBE_LAB_C_BUDGET_MIN", 16))*time.Minute
 	e.logTopology(t, "C")
 	pairs := labPairs(e.lt, labDomain(e.tp), labSibs)
 	if len(pairs) == 0 {
@@ -458,14 +521,22 @@ func TestSigurgLabC(t *testing.T) {
 		return
 	}
 	plan := labPlan(pairs, ds, reps)
+	complete := envList("CELERIS_PROBE_LAB_COMPLETE", "user")[0]
+	casRule := envList("CELERIS_PROBE_LAB_CAS", "retry")[0]
+	yieldRule := envList("CELERIS_PROBE_LAB_YIELD", "none")[0]
+	postack := envInt("CELERIS_PROBE_LAB_POSTACK_NS", 1500)
 	var pn []string
 	for _, p := range pairs {
 		pn = append(pn, fmt.Sprintf("%s(t=%d[%s] s=%d[%s] domain_t=%q domain_s=%q)", p.Name, p.T, e.tp.CPU[p.T].class(), p.S, e.tp.CPU[p.S].class(), e.tp.CPU[p.T].Domain, e.tp.CPU[p.S].Domain))
 	}
-	t.Logf("LAB_PLAN lab=C pairs=%s ds=%v reps=%d secs=%d k=%d idle_us=%d tmo_ms=%d cells=%d est_min=%.1f budget_min=%.0f%s",
-		strings.Join(pn, " "), ds, reps, secs, k, idle, tmo, len(plan), (float64(len(plan))*labCellSeconds(secs)+float64(len(pairs))*(2+float64(k0secs)+1))/60, budget.Minutes(), e.fakeTag)
+	t.Logf("LAB_PLAN lab=C pairs=%s ds=%v reps=%d secs=%d k=%d complete=%s cas=%s yield=%s postack_control_ns=%d idle_us=%d tmo_ms=%d cells=%d est_min=%.1f budget_min=%.0f%s",
+		strings.Join(pn, " "), ds, reps, secs, k, complete, casRule, yieldRule, postack, idle, tmo, len(plan),
+		(float64(len(plan))*labCellSeconds(secs)+float64(len(pairs))*(2+float64(k0secs)+1)+float64(reps)*labCellSeconds(secs))/60, budget.Minutes(), e.fakeTag)
 	start := time.Now()
-	common := []string{"k=" + strconv.Itoa(k), "idle_us=" + strconv.Itoa(idle), "tmo_ms=" + strconv.Itoa(tmo)}
+	common := []string{"k=" + strconv.Itoa(k), "idle_us=" + strconv.Itoa(idle), "tmo_ms=" + strconv.Itoa(tmo), "complete=" + complete, "cas=" + casRule, "yield=" + yieldRule}
+	tags := func(d int) string { // D under Go's own 5 us minimum is outside the regime Go can produce
+		return fmt.Sprintf("complete=%s cas=%s yield=%s below_go_min=%v", complete, casRule, yieldRule, d < 5)
+	}
 
 	// facts per pair: kernel, MIDR when readable, capacity, frequency, ns/iter, self and cross signal path timing
 	for _, p := range pairs {
@@ -483,12 +554,12 @@ func TestSigurgLabC(t *testing.T) {
 	// K=0 baseline: the literal "first handler with progress completes" rule, every request done on send #1
 	if k0secs > 0 {
 		for _, p := range pairs {
-			c, reqs, err := e.runCell("base-k0", p, 5, k0secs, "k=0", "idle_us="+strconv.Itoa(idle), "tmo_ms="+strconv.Itoa(tmo))
+			c, reqs, err := e.runCell("base-k0", p, 5, k0secs, "k=0", "idle_us="+strconv.Itoa(idle), "tmo_ms="+strconv.Itoa(tmo), "complete="+complete)
 			if err != nil {
 				t.Logf("LAB_SKIP lab=C what=base-k0 pair=%s reason=%q", p.Name, err.Error())
 				continue
 			}
-			t.Logf("LAB_BASE name=k0 pair=%s t=%d s=%d d_us=5 %s%s", p.Name, p.T, p.S, labStatsLine(labSummarize(reqs), c.Ack, c.Gap, c.A2R, c.Resends, c.Waited), e.fakeTag)
+			t.Logf("LAB_BASE name=k0 pair=%s t=%d s=%d d_us=5 %s %s%s", p.Name, p.T, p.S, tags(5), labStatsLine(labSummarize(reqs), c.Ack, c.Gap, c.A2R, c.Resends, c.Waited, c.CasFail), e.fakeTag)
 		}
 	}
 
@@ -512,8 +583,8 @@ func TestSigurgLabC(t *testing.T) {
 			pools[key(c.Pair, c.D)] = pl
 		}
 		pl.add(cell, reqs)
-		t.Logf("LAB_CELL rep=%d pair=%s t=%d s=%d tcls=%s scls=%s d_us=%d ns_per_iter=%s %s%s", c.Rep, c.Pair.Name, c.Pair.T, c.Pair.S, c.Pair.TCls, c.Pair.SCls, c.D,
-			cell.KV["ns_per_iter"], labStatsLine(labSummarize(reqs), cell.Ack, cell.Gap, cell.A2R, cell.Resends, cell.Waited), e.fakeTag)
+		t.Logf("LAB_CELL rep=%d pair=%s t=%d s=%d tcls=%s scls=%s d_us=%d ns_per_iter=%s %s %s%s", c.Rep, c.Pair.Name, c.Pair.T, c.Pair.S, c.Pair.TCls, c.Pair.SCls, c.D,
+			cell.KV["ns_per_iter"], tags(c.D), labStatsLine(labSummarize(reqs), cell.Ack, cell.Gap, cell.A2R, cell.Resends, cell.Waited, cell.CasFail), e.fakeTag)
 	}
 	for _, p := range pairs {
 		for _, d := range ds {
@@ -521,8 +592,54 @@ func TestSigurgLabC(t *testing.T) {
 			if pl == nil {
 				continue
 			}
-			t.Logf("LAB_TABLE pair=%s t=%d s=%d tcls=%s scls=%s d_us=%d reps=%d %s%s", p.Name, p.T, p.S, p.TCls, p.SCls, d, pl.reps,
-				labStatsLine(labSummarize(pl.reqs), pl.ack, pl.gap, pl.a2r, pl.resends, pl.waited), e.fakeTag)
+			t.Logf("LAB_TABLE pair=%s t=%d s=%d tcls=%s scls=%s d_us=%d reps=%d %s %s%s", p.Name, p.T, p.S, p.TCls, p.SCls, d, pl.reps, tags(d),
+				labStatsLine(labSummarize(pl.reqs), pl.ack, pl.gap, pl.a2r, pl.resends, pl.waited, pl.casFail), e.fakeTag)
+		}
+	}
+	// discriminating control on the primary pair: a 1.5 us post-ack wait must raise re-entry on little<-big (D=5)
+	if postack > 0 {
+		pp := pairs[0]
+		pl := newLabPool()
+		for r := 1; r <= reps; r++ {
+			if time.Since(start)+time.Duration(labCellSeconds(secs)*float64(time.Second)) > budget {
+				break
+			}
+			cell, reqs, err := e.runCell("postack", pp, 5, secs, append(append([]string(nil), common...), "postack_ns="+strconv.Itoa(postack))...)
+			if err != nil {
+				t.Logf("LAB_SKIP lab=C what=postack pair=%s reason=%q", pp.Name, err.Error())
+				break
+			}
+			pl.add(cell, reqs)
+		}
+		if pl.reps > 0 {
+			t.Logf("LAB_BASE name=postack%dns pair=%s t=%d s=%d d_us=5 reps=%d %s %s%s", postack, pp.Name, pp.T, pp.S, pl.reps, tags(5),
+				labStatsLine(labSummarize(pl.reqs), pl.ack, pl.gap, pl.a2r, pl.resends, pl.waited, pl.casFail), e.fakeTag)
+		}
+	}
+	// the one pre-registered primary comparison: little<-big vs little<-little at D=5 (the REP is the unit of replication)
+	// and the check that D=5 is binding-free on the little targets (resends_waited_frac near 0 on a real A520)
+	byName := map[string]labPair{}
+	for _, p := range pairs {
+		byName[p.Name] = p
+	}
+	a, b := byName["little<-big"], byName["little<-little"]
+	if pa, pb := pools[key(a, 5)], pools[key(b, 5)]; a.Name != "" && b.Name != "" && pa != nil && pb != nil {
+		for _, m := range []struct {
+			name   string
+			ev, ex func(labRepStat) int64
+		}{
+			{"reentry_per_resend", func(s labRepStat) int64 { return s.Reentry }, func(s labRepStat) int64 { return s.Resends }},
+			{"req_consec10_per_request", func(s labRepStat) int64 { return s.ReqConsec10 }, func(s labRepStat) int64 { return s.Requests }},
+		} {
+			r := labPrimary(pa.perRep, pb.perRep, m.ev, m.ex)
+			t.Logf("LAB_PRIMARY d_us=5 a=%s b=%s metric=%s reps_a=%d reps_b=%d rates_a=%s rates_b=%s separated=%v a_above_b=%v pooled_a=%.5f pooled_b=%.5f ratio=%.3f ci95=[%.3f,%.3f]%s",
+				a.Name, b.Name, m.name, len(pa.perRep), len(pb.perRep), labFloats(r.RatesA), labFloats(r.RatesB), r.Separated, r.AAbove, r.PooledA, r.PooledB, r.Ratio, r.Lo, r.Hi, e.fakeTag)
+		}
+	}
+	for _, p := range pairs {
+		if pl := pools[key(p, 5)]; pl != nil && p.TCls != "big" && pl.resends > 0 {
+			f := float64(pl.waited) / float64(pl.resends)
+			t.Logf("LAB_CHECK name=resends_waited_frac_d5 pair=%s value=%.3f expect_near_0_on_a_real_a520=%v%s", p.Name, f, f < 0.1, e.fakeTag)
 		}
 	}
 	t.Logf("LAB_DONE lab=C cells_done=%d of %d elapsed_min=%.1f%s", done, len(plan), time.Since(start).Minutes(), e.fakeTag)
@@ -532,7 +649,10 @@ func TestSigurgLabC(t *testing.T) {
 
 // labRunRepro runs the reproducer once like upRun, but with Start/Wait so that the threads of the live process can
 // be read mid-run: the proof that the arm's affinity did what it claims.
-func labRunRepro(secs int, env []string, dir, name string, args []string, littles, bigs []int) (stdout, stderr, proc string, hung bool, err error) {
+//
+// A second sample, taken about a second before the measurement ends, reads the run-queue wait (schedstat) of every thread:
+// a direct measure of CPU starvation, which the arms that share four little CPUs among all threads need.
+func labRunRepro(secs int, env []string, dir, name string, args []string, littles, bigs, pin, loops []int) (stdout, stderr, proc string, hung bool, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(secs+30)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -543,22 +663,29 @@ func labRunRepro(secs int, env []string, dir, name string, args []string, little
 		return "", err.Error(), "", false, err
 	}
 	pid := cmd.Process.Pid
-	sample := make(chan string, 1)
-	tm := time.AfterFunc(time.Duration(secs)*time.Second/2+time.Second, func() { sample <- labProcSummary(pid, littles, bigs) })
+	sample, sched := make(chan string, 1), make(chan string, 1)
+	tm := time.AfterFunc(time.Duration(secs)*time.Second/2+time.Second, func() { sample <- labProcSummary(pid, littles, bigs, pin, loops) })
+	tm2 := time.AfterFunc(time.Duration(max(secs-1, 1))*time.Second, func() { sched <- labSchedSummary(pid) })
 	err = cmd.Wait()
 	tm.Stop()
+	tm2.Stop()
+	proc = "proc=not-sampled"
 	select {
 	case proc = <-sample:
 	default:
-		proc = "proc=not-sampled"
+	}
+	select {
+	case r := <-sched:
+		proc += " " + r
+	default:
 	}
 	return so.String(), se.String(), proc, ctx.Err() != nil, err
 }
 
 // TestSigurgLabGo runs the Go reproducer under process-affinity arms (one toolchain, rep outer, arms interleaved).
 //
-// Time budget (arm64 heterogeneous, defaults): 5 arms x 6 reps x 31 s = 15.5 min plus the toolchain download and two builds
-// (~1.5 min). A homogeneous host logs MATRIX_SKIP: it has no sender class to vary and TestUpstreamMatrix already covers
+// Time budget (arm64 heterogeneous, defaults): 7 arms x 6 reps x 31 s = 21.7 min plus the toolchain download and two builds
+// (~1.5 min); without the two matched arms (CELERIS_PROBE_LAB_MATCHED=0) 5 arms = 15.5 + 1.5 min. A homogeneous host logs MATRIX_SKIP: it has no sender class to vary and TestUpstreamMatrix already covers
 // its default arm.
 func TestSigurgLabGo(t *testing.T) {
 	if !labHasPart("GO") {
@@ -581,12 +708,12 @@ func TestSigurgLabGo(t *testing.T) {
 	}
 	ver := envList("CELERIS_PROBE_LAB_GO_VERSION", "1.27.2")[0]
 	reps, secs := envInt("CELERIS_PROBE_LAB_GO_REPS", 6), envInt("CELERIS_PROBE_LAB_GO_SECS", 30)
-	budget := time.Duration(envInt("CELERIS_PROBE_LAB_GO_BUDGET_MIN", 17)) * time.Minute
+	budget := time.Duration(envInt("CELERIS_PROBE_LAB_GO_BUDGET_MIN", 25)) * time.Minute
 	start := time.Now()
-	arms := labArms(e.lt, e.tp)
+	arms := labArms(e.lt, e.tp, envInt("CELERIS_PROBE_LAB_MATCHED", 1) != 0)
 	var armNames []string
 	for _, a := range arms {
-		armNames = append(armNames, fmt.Sprintf("%s[pin=%s loops=%s]", a.Name, fmtCPUs(a.Pin), fmtCPUs(a.Cpus)))
+		armNames = append(armNames, fmt.Sprintf("%s[pin=%s loops=%s gomaxprocs_env=%d]", a.Name, fmtCPUs(a.Pin), fmtCPUs(a.Cpus), a.GoMaxProcs))
 	}
 	t.Logf("LAB_PLAN lab=GO version=%s reps=%d secs=%d arms=%s est_min=%.1f budget_min=%.0f fast_cpu=%d%s", ver, reps, secs, strings.Join(armNames, " "),
 		float64(len(arms)*reps*(secs+1))/60+1.5, budget.Minutes(), e.lt.Fast, e.fakeTag)
@@ -659,6 +786,9 @@ func TestSigurgLabGo(t *testing.T) {
 			if a.NoAsync {
 				env = append(env, "GODEBUG=asyncpreemptoff=1")
 			}
+			if a.GoMaxProcs > 0 { // the same P count in every pinned arm (the control keeps the runtime's default)
+				env = append(env, "GOMAXPROCS="+strconv.Itoa(a.GoMaxProcs))
+			}
 			flags := []string{"-secs=" + strconv.Itoa(secs), "-threshold-ms=50"}
 			if a.Cpus == nil {
 				flags = append(flags, "-class=little")
@@ -673,7 +803,7 @@ func TestSigurgLabGo(t *testing.T) {
 					continue
 				}
 			}
-			out, se, proc, hung, err := labRunRepro(secs, env, e.tmp, name, args, e.lt.Littles, e.lt.Bigs)
+			out, se, proc, hung, err := labRunRepro(secs, env, e.tmp, name, args, e.lt.Littles, e.lt.Bigs, a.Pin, a.Cpus)
 			kv := map[string]string{}
 			for _, l := range strings.Split(out, "\n") {
 				if strings.HasPrefix(l, "RESULT ") {

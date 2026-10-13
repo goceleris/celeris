@@ -19,12 +19,18 @@
  *   "Unsafe point" analogue: in Go the first signal often lands where isAsyncSafePoint refuses (it is still
  *   acknowledged). Without that every request would complete on send #1 and nothing could be learned about
  *   re-entry. The first K handler invocations of each request (K=1 by default) are therefore refused: they ack
- *   but cannot complete the request. A later handler COMPLETES the request when it saw user progress since the
- *   previous handler entry: counter delta > 0 or a different interrupted PC. A handler with delta == 0 AND the same PC is a RE-ENTRY: the
- *   kernel rebuilt the same user context, i.e. the thread never got back to user mode between two handlers
- *   (zero progress toward complying with the request). That is rhysh's mechanism: the next SIGURG is already
- *   pending when rt_sigreturn unblocks signals, so the kernel calls the handler again directly.
- *   K=0 is the literal "first handler with progress completes" rule: every request then completes on send #1.
+ *   but cannot complete the request.
+ *   Completion (complete=user|handler):
+ *     user    (matrix default, Go's behaviour): a later handler that saw user progress only ARMS the request (Go's
+ *             doSigPreempt only redirects the thread to asyncPreempt). The request ends when the TARGET LOOP, back in
+ *             USER mode, notices the armed request and sets done (asyncPreempt running). The sender keeps resending
+ *             on every ack until then, so a signal storm can keep the thread out of user mode and the request open.
+ *     handler (smoke controls): the handler itself completes the request, the sender stops at the ack.
+ *   RE-ENTRY = a handler invocation with counter delta == 0 AND the same interrupted PC as the previous handler:
+ *   no user instruction was observed to retire between the two handlers. It is consistent with the kernel calling
+ *   the handler again directly from rt_sigreturn (rhysh's mechanism) but does not prove it: an interrupt taken
+ *   right after the return to user mode looks identical. Both mean zero progress toward the preemption request.
+ *   `zero_delta` counts delta == 0 with any PC. K=0 is the literal "first handler with progress completes" rule.
  *
  * Differences from Go that matter when reading results:
  *   - Go's suspendG consumes a generation on a rate-limited iteration and then does not resend (CL 842725 is
@@ -35,8 +41,14 @@
  *     postack_ns / preack_ns add a busy wait after / before the ack to emulate a longer Go tail. Off by default.
  *   - There is no synchronous preemption fallback here (Go's stackguard0 = stackPreempt), so a request that
  *     cannot complete times out (tmo_ms) and is counted.
+ *   - Go never resends after a failed signalPending CAS (suspendG already recorded the new generation); by default this
+ *     sender retries until the CAS succeeds. cas_fail_first counts first-try CAS failures; cas=go follows Go's rule
+ *     (no retry: the request then waits for completion or times out, so its timeouts mean "Go would have fallen back").
+ *   - Go's suspendG calls osyield every 5 us after its first 10 us; yield=go does the same in the sender's spin loops
+ *     (default off: the sender spins with the arch pause hint).
  *
- * cell keys (all optional): k=1 mode=ack|noack idle_us=2000 tmo_ms=1000 preack_ns=0 postack_ns=0 out=PATH label=NAME
+ * cell keys (all optional): k=1 mode=ack|noack complete=handler|user cas=retry|go yield=none|go idle_us=2000 tmo_ms=1000
+ *   preack_ns=0 postack_ns=0 out=PATH label=NAME
  *   mode=noack: the handler never acknowledges and never completes: a negative control, every request must time out.
  *   out=PATH: one text line per request: lat_ns sends handlers reentry zero_delta maxconsec timeout.
  * Output lines (stdout): LABCELL k=v ...   LABFACTS k=v ...   Histograms are  idx:count,idx:count  with idx 0 =
@@ -124,10 +136,10 @@ static void readstr(const char *fmt, int cpu, char *out, size_t n) {
 }
 
 /* ------------------------------------------------------------------ shared state of a cell */
-static struct { int tcpu, scpu; int64_t d_ns; int secs, k, noack; int64_t idle_ns, tmo_ns, preack_ns, postack_ns; } cfg;
+static struct { int tcpu, scpu; int64_t d_ns; int secs, k, noack, usercomp, casgo, yieldgo; int64_t idle_ns, tmo_ns, preack_ns, postack_ns; } cfg;
 static CL _Atomic int sig_pending;                 /* m.signalPending */
 static CL _Atomic uint64_t gen;                    /* m.preemptGen */
-static CL _Atomic uint64_t req_seq, done_seq;
+static CL _Atomic uint64_t req_seq, done_seq, armed_seq;
 static CL _Atomic uint64_t req_handlers, req_maxconsec;
 static CL _Atomic uint64_t a_handlers, a_reentry, a_zdelta;   /* handler totals, readable by the sender */
 static CL volatile uint64_t counter;               /* the target's user-space progress */
@@ -152,7 +164,7 @@ static void handler(int sig, siginfo_t *si, void *ctx) {
 	if (cfg.noack) return;                          /* negative control: no completion, no ack, signalPending stays 1 */
 	if (cfg.preack_ns) spin_ns(cfg.preack_ns);
 	uint64_t idx = atomic_fetch_add(&req_handlers, 1);
-	if (idx >= (uint64_t)cfg.k && !reentry) atomic_store(&done_seq, atomic_load(&req_seq));  /* "this handler saw user progress and the point is safe" */
+	if (idx >= (uint64_t)cfg.k && !reentry) atomic_store(cfg.usercomp ? &armed_seq : &done_seq, atomic_load(&req_seq));  /* "this handler saw user progress and the point is safe" */
 	atomic_fetch_add(&gen, 1);                      /* preemptGen.Add(1) */
 	atomic_store(&sig_pending, 0);                  /* signalPending.Store(0), after the generation bump */
 	if (cfg.postack_ns) spin_ns(cfg.postack_ns);    /* emulates a longer post-ack tail (off by default) */
@@ -172,35 +184,44 @@ static void *target_main(void *arg) {
 	(void)arg; pin(cfg.tcpu); altstack();
 	atomic_store(&target_nspi, ns_per_iter());
 	atomic_store(&target_tid, (int)syscall(SYS_gettid));
-	while (!atomic_load_explicit(&stopf, memory_order_relaxed)) for (int i = 0; i < 256; i++) counter++;
+	while (!atomic_load_explicit(&stopf, memory_order_relaxed)) {
+		for (int i = 0; i < 16; i++) counter++;
+		if (cfg.usercomp) {                     /* complete=user: asyncPreempt runs here, in USER mode, after a handler armed the request */
+			uint64_t a = atomic_load_explicit(&armed_seq, memory_order_relaxed);
+			if (a != atomic_load_explicit(&done_seq, memory_order_relaxed)) atomic_store(&done_seq, a);
+		}
+	}
 	return NULL;
 }
 
 typedef struct { int64_t lat; uint64_t sends, handlers, reentry, zdelta, maxconsec; int timeout; } rec_t;
 
 static uint64_t ack_h[NH], gap_h[NH], a2r_h[NH];
-static uint64_t resends, resends_waited;
+static uint64_t resends, resends_waited, cas_fail_first;
 
 /* One request = one suspendG call. Returns 1 on completion, 0 on timeout. */
 static int run_request(pid_t pid, uint64_t seq, rec_t *r) {
 	pid_t tid = (pid_t)atomic_load(&target_tid);
 	atomic_store(&req_handlers, 0); atomic_store(&req_maxconsec, 0); atomic_store(&req_seq, seq);
 	uint64_t h0 = atomic_load(&a_handlers), z0 = atomic_load(&a_reentry), zd0 = atomic_load(&a_zdelta);
-	int64_t t_start = now_ns(), t_first = 0, t_send = 0, t_ack = 0; uint64_t sends = 0; int ok = 1;
+	int64_t t_start = now_ns(), t_first = 0, t_send = 0, t_ack = 0, next_yield = t_start + 10000; uint64_t sends = 0; int ok = 1, nosend = 0;
 #define DONE() (atomic_load(&done_seq) == seq)
 #define TMO() (now_ns() - t_start > cfg.tmo_ns)
+#define STEP() do { if (cfg.yieldgo) { int64_t y = now_ns(); if (y >= next_yield) { sched_yield(); next_yield = now_ns() + 5000; } else relax(); } else relax(); } while (0)
 	for (;;) {
 		if (sends > 0) {                           /* resend not before D after the previous send */
 			int64_t due = t_send + cfg.d_ns;
 			resends++; if (t_ack < due) resends_waited++;
-			while (now_ns() < due) { if (DONE()) goto fin; if (TMO()) { ok = 0; goto fin; } relax(); }
+			while (now_ns() < due) { if (DONE()) goto fin; if (TMO()) { ok = 0; goto fin; } STEP(); }
 		}
 		for (unsigned n = 0;; n++) {               /* signalPending.CompareAndSwap(0, 1) */
 			int e = 0;
 			if (atomic_compare_exchange_strong(&sig_pending, &e, 1)) break;
+			if (n == 0) { cas_fail_first++; if (cfg.casgo) nosend = 1; }
+			if (nosend) { while (!DONE()) { if (TMO()) { ok = 0; break; } STEP(); } goto fin; }   /* cas=go: Go does not resend after a failed CAS */
 			if (DONE()) goto fin;
 			if ((n & 63) == 0 && TMO()) { ok = 0; goto fin; }
-			relax();
+			STEP();
 		}
 		uint64_t g = atomic_load(&gen);
 		int64_t t = now_ns();
@@ -209,7 +230,7 @@ static int run_request(pid_t pid, uint64_t seq, rec_t *r) {
 		syscall(SYS_tgkill, pid, tid, SIGURG); sends++;
 		for (unsigned n = 0; atomic_load(&gen) == g; n++) {   /* wait for the ack */
 			if ((n & 63) == 0 && TMO()) { ok = 0; goto fin; }
-			relax();
+			STEP();
 		}
 		t_ack = now_ns(); hadd(ack_h, t_ack - t_send);
 		if (DONE()) goto fin;
@@ -243,6 +264,9 @@ static int cmd_cell(int argc, char **argv) {
 		kv_int(argv[i], "idle_us", &cfg.idle_ns, 1000); kv_int(argv[i], "tmo_ms", &cfg.tmo_ns, 1000000);
 		kv_int(argv[i], "preack_ns", &cfg.preack_ns, 1); kv_int(argv[i], "postack_ns", &cfg.postack_ns, 1);
 		if (!strncmp(argv[i], "mode=", 5)) cfg.noack = !strcmp(argv[i] + 5, "noack");
+		if (!strncmp(argv[i], "complete=", 9)) cfg.usercomp = !strcmp(argv[i] + 9, "user");
+		if (!strncmp(argv[i], "cas=", 4)) cfg.casgo = !strcmp(argv[i] + 4, "go");
+		if (!strncmp(argv[i], "yield=", 6)) cfg.yieldgo = !strcmp(argv[i] + 6, "go");
 		if (!strncmp(argv[i], "out=", 4)) out = argv[i] + 4;
 		if (!strncmp(argv[i], "label=", 6)) label = argv[i] + 6;
 	}
@@ -270,10 +294,10 @@ static int cmd_cell(int argc, char **argv) {
 			        (unsigned long long)recs[i].reentry, (unsigned long long)recs[i].zdelta, (unsigned long long)recs[i].maxconsec, recs[i].timeout);
 		fclose(f);
 	}
-	printf("LABCELL label=%s t=%d s=%d d_us=%lld k=%d mode=%s idle_us=%lld tmo_ms=%lld preack_ns=%lld postack_ns=%lld secs=%d secs_run=%.2f requests=%zu completes=%llu timeouts=%llu sends=%llu sends_max=%llu resends=%llu resends_waited=%llu handlers=%llu reentry=%llu zero_delta=%llu maxconsec=%llu gen=%llu ns_per_iter=%.3f",
-	       label, cfg.tcpu, cfg.scpu, (long long)(cfg.d_ns / 1000), cfg.k, cfg.noack ? "noack" : "ack", (long long)(cfg.idle_ns / 1000), (long long)(cfg.tmo_ns / 1000000),
+	printf("LABCELL label=%s t=%d s=%d d_us=%lld k=%d mode=%s complete=%s cas=%s yield=%s idle_us=%lld tmo_ms=%lld preack_ns=%lld postack_ns=%lld secs=%d secs_run=%.2f requests=%zu completes=%llu timeouts=%llu sends=%llu sends_max=%llu resends=%llu resends_waited=%llu cas_fail_first=%llu handlers=%llu reentry=%llu zero_delta=%llu maxconsec=%llu gen=%llu ns_per_iter=%.3f",
+	       label, cfg.tcpu, cfg.scpu, (long long)(cfg.d_ns / 1000), cfg.k, cfg.noack ? "noack" : "ack", cfg.usercomp ? "user" : "handler", cfg.casgo ? "go" : "retry", cfg.yieldgo ? "go" : "none", (long long)(cfg.idle_ns / 1000), (long long)(cfg.tmo_ns / 1000000),
 	       (long long)cfg.preack_ns, (long long)cfg.postack_ns, cfg.secs, secs_run, n, (unsigned long long)completes, (unsigned long long)timeouts, (unsigned long long)sends_total,
-	       (unsigned long long)sends_max, (unsigned long long)resends, (unsigned long long)resends_waited, (unsigned long long)h_n, (unsigned long long)h_re, (unsigned long long)h_zd,
+	       (unsigned long long)sends_max, (unsigned long long)resends, (unsigned long long)resends_waited, (unsigned long long)cas_fail_first, (unsigned long long)h_n, (unsigned long long)h_re, (unsigned long long)h_zd,
 	       (unsigned long long)maxconsec, (unsigned long long)atomic_load(&gen), atomic_load(&target_nspi));
 	hprint("ack_hist", ack_h); hprint("gap_hist", gap_h); hprint("a2r_hist", a2r_h);
 	{ int first = 1; printf(" prog_log2_hist="); for (int i = 0; i < 48; i++) if (prog_h[i]) { printf("%s%d:%llu", first ? "" : ",", i, (unsigned long long)prog_h[i]); first = 0; } if (first) printf("-"); }
