@@ -153,12 +153,6 @@ type connState struct {
 	writeFn      func([]byte) // cached write function
 	detachMu     *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
 	detachClosed bool         // true after closeConn on a detached conn; writeFn becomes no-op
-	// detachGuarded: OnDetach installed the guarded writeFn. A panic out of the
-	// hook after that leaves the conn open, and the next Detach runs the hook
-	// again: it keeps that guard, because a guard over a guard takes the one
-	// non-reentrant detachMu twice on the first write (#889 item 34). A bool,
-	// in the padding beside detachClosed: connState is at its size class.
-	detachGuarded bool
 
 	// peerClosed is set when EPOLLRDHUP reports the peer half-closed (FIN) while
 	// a response was still flushing (write backpressure). The conn is closed once
@@ -401,7 +395,6 @@ func releaseConnState(cs *connState) {
 	cs.h2State = nil
 	cs.ctx = nil
 	cs.writeFn = nil
-	cs.detachGuarded = false
 	cs.remoteAddr = ""
 	cs.dirtyNext = nil
 	cs.dirtyPrev = nil

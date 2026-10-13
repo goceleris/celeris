@@ -2184,6 +2184,17 @@ func (l *Loop) initProtocol(cs *connState) {
 			// mutex — otherwise installing a fresh mu here leaves
 			// the dispatch goroutine holding a lock nobody else
 			// sees.
+			// What a panic out of this hook must put back (see the deferred rollback
+			// below): the hook runs on a conn that goes on after the panic unless it
+			// is on the promoted async path.
+			h1 := cs.h1State
+			prevWrite, prevMu, prevPending := cs.writeFn, cs.detachMu, cs.asyncDetachPending
+			var prevRaw func([]byte)
+			var prevPause, prevResume func()
+			if h1 != nil {
+				prevRaw, prevPause, prevResume = h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv
+			}
+			counted, finished := false, false
 			var mu *sync.Mutex
 			if cs.detachMu != nil {
 				mu = cs.detachMu
@@ -2198,12 +2209,9 @@ func (l *Loop) initProtocol(cs *connState) {
 			// the event-loop thread, and the eventfd allocation +
 			// EPOLL_CTL_ADD touches the loop's epoll set.
 			if !l.async {
-				// Once per conn: a run after a panic out of an earlier one counts again
-				// otherwise, and closeConn decrements once (#889 item 34).
-				if !cs.detachCounted {
-					l.detachedCount++
-					cs.detachCounted = true
-				}
+				l.detachedCount++
+				cs.detachCounted = true
+				counted = true
 			} else {
 				cs.asyncDetachPending = true
 			}
@@ -2313,6 +2321,36 @@ func (l *Loop) initProtocol(cs *connState) {
 			completed := !unlockDetachMu
 			// flagged: asyncDetachUnlocked has been published by this closure.
 			flagged := false
+			if !unlockDetachMu {
+				// A conn that is not on the promoted async path goes on after a panic
+				// out of this hook: Context.Detach has not marked the Context detached,
+				// the router answers 500, and the next request is served on the same
+				// conn. Put back everything installed above and below, so that it is
+				// exactly as if Detach had not run: a guarded writeFn left behind
+				// locks detachMu again on the first write of the H2C branch and of
+				// serveAsync, which hold it across theirs (the loop thread, or the
+				// dispatch goroutine, deadlocks on itself), a count left behind is
+				// made again by the next Detach, and closeConn undoes one. The
+				// promoted path closes the conn instead (the deferred hook below).
+				// Assignments only, under no lock: this goroutine owns the conn's
+				// state here, as it did when the hook installed it (#889 item 34).
+				defer func() {
+					if finished {
+						return
+					}
+					cs.writeFn = prevWrite
+					if h1 != nil {
+						h1.UpdateWriteFn(prevWrite)
+						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
+					}
+					cs.detachMu = prevMu
+					cs.asyncDetachPending = prevPending
+					if counted {
+						l.detachedCount--
+						cs.detachCounted = false
+					}
+				}()
+			}
 			if unlockDetachMu {
 				// Registered before guarded is installed (celeris#844): from the moment
 				// cs.writeFn is guarded, a write through the response adapter locks
@@ -2346,15 +2384,6 @@ func (l *Loop) initProtocol(cs *connState) {
 						l.enqueueDetach(cs)
 					}
 				}()
-			}
-			if cs.detachGuarded {
-				// A run after a panic out of an earlier one: that run's guard is
-				// still cs.writeFn, and wrapping it again would lock detachMu twice
-				// per write. Keep it; the rest of the hook installs what the panic
-				// cut short (#889 item 34).
-				guarded = cs.writeFn
-			} else {
-				cs.detachGuarded = true
 			}
 			cs.writeFn = guarded
 			// Also update the response adapter so StreamWriter writes
@@ -2466,6 +2495,7 @@ func (l *Loop) initProtocol(cs *connState) {
 			// fix making Detached atomic.
 			cs.h1State.Detached.Store(true)
 			completed = true
+			finished = true
 			// detachMu is released as this closure returns (the defer above),
 			// now that Detached is published, so the guarded writeFn the
 			// middleware calls next (the 101 / SSE headers) can re-acquire it.
@@ -3227,8 +3257,11 @@ func (l *Loop) drainDetachQueue() {
 		// pass (from the same enqueue burst) is a no-op.
 		if cs.asyncDetachPending {
 			cs.asyncDetachPending = false
-			l.detachedCount++
-			cs.detachCounted = true
+			// Once per conn, whatever enqueued it again (#889 item 34).
+			if !cs.detachCounted {
+				l.detachedCount++
+				cs.detachCounted = true
+			}
 			if l.wakeFD.FD() < 0 {
 				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 				if err == nil {
