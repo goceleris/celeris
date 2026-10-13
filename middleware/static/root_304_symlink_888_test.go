@@ -285,3 +285,22 @@ func TestRoot304IndexOutsideRoot888(t *testing.T) {
 		}
 	}
 }
+
+// TestRoot304IndexOutsideDotRoot888: the same climbing Index with a Root of "."
+// (the working directory). The lexical test must hold when the root has no
+// prefix to compare with: a 304 for a file outside it is refused here too.
+func TestRoot304IndexOutsideDotRoot888(t *testing.T) {
+	r := newRoot888(t)
+	t.Chdir(r.root)
+	tag := weakETag(secretTime888, int64(len(secretBytes888)))
+	for _, root := range []string{".", "./"} {
+		mw := New(Config{Root: root, Index: filepath.Join("..", "outside", "secret.txt")})
+		for _, hdr := range [][]string{{"if-none-match", tag}, {"if-none-match", "*"}, nil} {
+			rec, err := get888(t, mw, "/", hdr...)
+			if rec.StatusCode == 304 || !isHTTP400(err) || rec.Header("etag") != "" || rec.Header("last-modified") != "" {
+				t.Errorf("Root %q %v: status %d, err %v, etag %q, last-modified %q; want a 400 and no validators",
+					root, hdr, rec.StatusCode, err, rec.Header("etag"), rec.Header("last-modified"))
+			}
+		}
+	}
+}

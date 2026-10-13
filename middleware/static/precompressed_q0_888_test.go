@@ -91,6 +91,10 @@ func TestPreCompressedHonoursQ0And888(t *testing.T) {
 		{"gzip", "gzip", gz888},
 		{"br", "br", br888},
 		{"*", "br", br888},
+		{"x-gzip", "gzip", gz888}, // RFC 9110 8.4.1.3: x-gzip is gzip; the substring test matched it
+		{"X-GZIP", "gzip", gz888},
+		{"x-gzip, br;q=0", "gzip", gz888},
+		{"x-gzip;q=0, br;q=0", "", plain888},
 		{"GZIP", "gzip", gz888}, // codings are case-insensitive
 		{"BR", "br", br888},
 	}
