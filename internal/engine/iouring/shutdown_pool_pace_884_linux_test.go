@@ -4,6 +4,9 @@ package iouring
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"sync"
 	"testing"
 
@@ -69,5 +72,84 @@ func BenchmarkStopDetachedProducers884(b *testing.B) {
 				w.stopDetachedProducers()
 			}
 		})
+	}
+}
+
+// poolGateWalks884 returns, for the if statement of fn whose condition reads
+// h2DrainStart (the pool wait's gate), the names of the walk functions its
+// body calls.
+func poolGateWalks884(fset *token.FileSet, f *ast.File, fn string) (walks []string, found bool) {
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Body == nil || fd.Name.Name != fn {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			ifs, ok := n.(*ast.IfStmt)
+			if !ok {
+				return true
+			}
+			reads := false
+			ast.Inspect(ifs.Cond, func(m ast.Node) bool {
+				if se, ok := m.(*ast.SelectorExpr); ok && se.Sel.Name == "h2DrainStart" {
+					reads = true
+				}
+				return true
+			})
+			if !reads {
+				return true
+			}
+			found = true
+			ast.Inspect(ifs.Body, func(m ast.Node) bool {
+				if call, ok := m.(*ast.CallExpr); ok {
+					if se, ok := call.Fun.(*ast.SelectorExpr); ok && (se.Sel.Name == "stopDetachedProducers" || se.Sel.Name == "stopProducersPaced") {
+						walks = append(walks, se.Sel.Name)
+					}
+				}
+				return true
+			})
+			return false
+		})
+	}
+	return walks, found
+}
+
+// TestPoolWaitGateWalksPaced884: the behaviour test cannot tell the paced
+// walk from the raw one (both end the producers), so the branch of Worker.run
+// that gates the pool wait is pinned to call stopProducersPaced, once, and not
+// stopDetachedProducers.
+func TestPoolWaitGateWalksPaced884(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "worker.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walks, found := poolGateWalks884(fset, f, "run")
+	if !found {
+		t.Fatal("Worker.run has no if reading h2DrainStart: the scan or the loop changed")
+	}
+	if len(walks) != 1 || walks[0] != "stopProducersPaced" {
+		t.Errorf("the pool wait's gate walks the detached conns with %v, want exactly [stopProducersPaced]", walks)
+	}
+}
+
+// TestPoolGateScanSeesARawWalk884 is the scan's own control.
+func TestPoolGateScanSeesARawWalk884(t *testing.T) {
+	const src = `package iouring
+func (w *Worker) run() {
+	if now > w.h2DrainStart+1 {
+		w.refuseRecv = true
+		w.stopDetachedProducers()
+	}
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "snippet.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walks, found := poolGateWalks884(fset, f, "run")
+	if !found || len(walks) != 1 || walks[0] != "stopDetachedProducers" {
+		t.Errorf("the scan saw found=%v walks=%v, want the raw walk", found, walks)
 	}
 }
