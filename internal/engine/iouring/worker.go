@@ -6006,7 +6006,7 @@ func (w *Worker) prepareAccept() {
 	} else if w.tier.SupportsMultishotAccept() {
 		prepMultishotAccept(sqe, w.listenFD)
 	} else {
-		prepAccept(sqe, w.listenFD, 0)
+		prepSingleShotAccept(sqe, w.listenFD)
 	}
 	setSQEUserData(sqe, encodeUserData(udAccept, w.listenFD))
 }
