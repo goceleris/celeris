@@ -732,7 +732,7 @@ func (e *Engine) PauseAccept() error {
 		}
 		allClosed := true
 		for _, w := range workers {
-			if !w.listenFDClosed.Load() {
+			if !w.listenFDClosed.Load() && !w.exited.Load() {
 				allClosed = false
 				break
 			}
@@ -761,7 +761,8 @@ func (e *Engine) ResumeAccept() error {
 	for _, w := range e.workers {
 		// Re-arm the close-confirmation flag so a subsequent Pause cycle
 		// blocks on the new listen FD rather than the previously-closed
-		// one.
+		// one. A worker that has exited is re-armed too, and has nothing to
+		// close again: PauseAccept counts it by exited.
 		w.listenFDClosed.Store(false)
 		w.wakeIfSuspended()
 		// A worker that has not parked closed its listener at the pause and

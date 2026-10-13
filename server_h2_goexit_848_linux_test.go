@@ -5,12 +5,14 @@ package celeris_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -137,6 +139,41 @@ func h2Probe848(addr string, n int, d time.Duration, stopOnMiss bool) (answered,
 	return
 }
 
+// freshAfterFault848 judges the fresh h2c conns made after a loop died. The
+// dead loop's SO_REUSEPORT listener is shut when its goroutine ends
+// (Engine.runWatched), so no conn lands on it: with a surviving loop every
+// probe is answered, and with none (io_uring at the CI step's 8 MiB memlock
+// funds one worker) the connect is refused. A listener left open in the group
+// would hold a share of the probes unanswered, which is what this test used to
+// read as proof that the loop had died; that is now the defect, and the proof
+// that the loop died is the one record and, in the shape test, the faulted
+// connection's stream 3.
+func freshAfterFault848(t *testing.T, addr string, answered, tried int) {
+	t.Helper()
+	if answered == tried {
+		return
+	}
+	// A miss: either no loop is left and the connect is refused, or the dead
+	// listener was not yet shut (the report counts the exit before the worker
+	// leaves the group) and a re-probe is answered once it is gone.
+	for dl := time.Now().Add(2 * time.Second); time.Now().Before(dl); time.Sleep(20 * time.Millisecond) {
+		c, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				return // no loop left, and no listener of the dead one
+			}
+			t.Errorf("a fresh conn after the fault failed with %v, want it answered or refused", err)
+			return
+		}
+		_ = c.Close()
+		if a, n := h2Probe848(addr, 10, 500*time.Millisecond, true); a == n {
+			return
+		}
+	}
+	t.Errorf("%d of %d fresh conns after the fault were answered, and the rest connected to a listener that answers nothing: "+
+		"the dead loop's listener is still in the SO_REUSEPORT group (the Goexit items from celeris#848 on the checklists celeris#884 and celeris#885)", answered, tried)
+}
+
 func h2Class848(ended bool, err error) string {
 	if ended {
 		return "ended"
@@ -191,9 +228,7 @@ func TestH2InlineStreamGoexitIsLoud848(t *testing.T) {
 			if got := attrStr848(recs[0].attrs["engine"]); !slices.Contains(a.engine, got) {
 				t.Errorf("engine attr = %q, want one of %v", got, a.engine)
 			}
-			if answered == tried {
-				t.Errorf("PREMISE: all %d fresh conns after the fault were answered, so the loop did not die and the record would be false", tried)
-			}
+			freshAfterFault848(t, r.addr, answered, tried)
 			if !stopped {
 				t.Errorf("the server did not stop within %v of cancel after the fault", loopExitStop848)
 			}
@@ -404,9 +439,7 @@ func TestH2InlineShapesGoexitAreLoud848(t *testing.T) {
 					if s3 != "timeout" && s3 != "err:EOF" {
 						t.Errorf("stream 3 on the same connection = %s: the loop is dead, so it must not be answered", s3)
 					}
-					if answered == tried {
-						t.Errorf("PREMISE: all %d fresh conns after the fault were answered, so the loop did not die and the record would be false", tried)
-					}
+					freshAfterFault848(t, r.addr, answered, tried)
 					if !stopped {
 						t.Errorf("the server did not stop within %v of cancel after the fault", loopExitStop848)
 					}
