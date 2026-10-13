@@ -4,9 +4,11 @@ package adaptive
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/resource"
@@ -175,5 +177,95 @@ func TestSwitchInProgressWhenShutdownStartsKeepsItsBudget877(t *testing.T) {
 	}
 	if shut, live := lazy.state(); shut == 0 || !live {
 		t.Errorf("standby built before Shutdown: shutdowns=%d firstLive=%v, want shut at least once with its Listen ctx live", shut, live)
+	}
+}
+
+// TestShutdownHonoursCtxWhileSwitchBuildsStandby886 (celeris#886 item 15):
+// Shutdown's first lock of e.mu waits behind a switch that is building the lazy
+// standby, and the build holds e.mu for as long as it takes (a bind wait of up
+// to 5 s, then the listener wait). A Shutdown(ctx) with a short deadline must
+// not outlast ctx because of it: it returns ctx's error at the deadline, and
+// whatever it could not do by then is done by the goroutine that was queued
+// for the lock, once it has the lock: the sub-engines are shut down and no
+// later switch builds a standby.
+//
+// The blocking hook stands for a standby factory that is slow; it is released
+// only after Shutdown has returned (or by the watchdog, so that a Shutdown that
+// waits for it fails the test instead of hanging it).
+func TestShutdownHonoursCtxWhileSwitchBuildsStandby886(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once, releaseOnce sync.Once
+	rel := func() { releaseOnce.Do(func() { close(release) }) }
+	e, active, lazy, builds := newShutdownWindowEngine(t, func() {
+		once.Do(func() { close(entered) })
+		<-release
+	})
+	t.Cleanup(rel)
+	watchdog := time.AfterFunc(5*time.Second, rel)
+	defer watchdog.Stop()
+
+	switchDone := make(chan struct{})
+	go func() {
+		defer close(switchDone)
+		e.ForceSwitch()
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the switch never reached the standby build")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := e.Shutdown(ctx)
+	took := time.Since(start)
+	t.Logf("celeris886 shutdown ctx: deadline=200ms took=%v err=%v", took.Round(time.Millisecond), err)
+	if took >= time.Second {
+		t.Errorf("Shutdown(200ms) took %v while a switch held e.mu: it waited for the build instead of honouring ctx", took)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Shutdown returned %v, want context.DeadlineExceeded", err)
+	}
+	if e.listenCtx.Err() == nil {
+		t.Error("Shutdown gave up on its deadline without cancelling the Listen context: the standby wait would run on")
+	}
+
+	// The build finishes. The goroutine queued for the lock now finishes the
+	// shutdown Shutdown could not.
+	rel()
+	select {
+	case <-switchDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the switch did not return after the build was released")
+	}
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); !ok(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s did not happen within 5s of the build finishing", what)
+			}
+		}
+	}
+	waitFor("the active sub-engine's Shutdown", func() bool { n, _ := active.state(); return n > 0 })
+	waitFor("the standby's Shutdown", func() bool { n, _ := lazy.state(); return n > 0 })
+	waitFor("e.mu to be free", func() bool {
+		if e.mu.TryLock() {
+			e.mu.Unlock()
+			return true
+		}
+		return false
+	})
+	e.mu.Lock()
+	shutting := e.shuttingDown
+	e.mu.Unlock()
+	if !shutting {
+		t.Error("shuttingDown is not set after the late shutdown ran: a later switch would build a standby nothing shuts down")
+	}
+	before := builds.Load()
+	e.ForceSwitch()
+	if got := builds.Load(); got != before {
+		t.Errorf("a switch after the late shutdown built a standby (builds %d -> %d)", before, got)
 	}
 }

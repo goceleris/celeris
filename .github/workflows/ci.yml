@@ -1355,7 +1355,7 @@ jobs:
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHoldReleasedOnceBound616|TestAdaptiveShutdownWithoutListenFreesPort616|TestAdaptivePortHeldWildcard616|TestAdaptivePortHeldBesideTimeWait616|TestAdaptiveTimeWaitStealFailsLoudly616|TestAdaptiveNoHoldOnlyWhereNetListenFails616|TestAdaptivePortHoldKind616|TestAdaptiveAddrMatchesNetListen616'
+          names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHeldUntilListenReturns616|TestAdaptiveShutdownWithoutListenFreesPort616|TestAdaptivePortHeldWildcard616|TestAdaptivePortHeldBesideTimeWait616|TestAdaptiveTimeWaitStealFailsLoudly616|TestAdaptiveNoHoldOnlyWhereNetListenFails616|TestAdaptivePortHoldKind616|TestAdaptiveAddrMatchesNetListen616'
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./internal/adaptive/ 2>&1 | tee /tmp/c616.log
