@@ -233,8 +233,11 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 			return
 		}
 		perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, l.handler, cs.writeFn)
-		// The replay is the recv event of this conn's first bytes, and drainRead
-		// counts one per recv event whatever the verdict (celeris#886).
+		// The replay is the recv event of this conn's first bytes and counts
+		// one, whatever the verdict (celeris#886). drainRead counts a recv
+		// after ProcessH1 too, but returns before it on an h2c upgrade and
+		// never counts a direct-body recv: a carry that is an upgrade request
+		// counts one here and its recv would have counted none.
 		l.reqBatch++
 		if perr != nil {
 			l.endCarriedReplay(cs, fd, perr)
@@ -257,8 +260,10 @@ func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
 	cs.h1State.InlineMode = true
 	perr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
 	// One request counted for the replay, whichever way it ends below: it is
-	// the recv event of this conn's first bytes, and drainRead counts one per
-	// recv event (the promotion included, celeris#626; celeris#886).
+	// the recv event of this conn's first bytes (the promotion included, as
+	// in drainRead, celeris#626; celeris#886). Unlike drainRead it also counts
+	// a carry that ends in an h2c upgrade, which that path returns before
+	// counting.
 	l.reqBatch++
 	// A handler that hijacked inline has had cs released inside the Hijack
 	// call, as in drainRead, so cs is not touched again after ErrHijacked.

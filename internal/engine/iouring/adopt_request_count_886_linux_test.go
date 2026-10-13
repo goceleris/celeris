@@ -102,3 +102,21 @@ func TestIouringAdoptRequestCountEmptyCarry886(t *testing.T) {
 	adoptCount886(t, e, "")
 	expectCount886(t, e, 0)
 }
+
+// A carry that is an h2c upgrade request counts one like any other non-empty
+// carry. The recv path does not: it returns on the upgrade verdict before it
+// counts, so a conn that upgraded on a recv has counted none (celeris#886
+// item 5, open question in the PR that added these). The tests pin the
+// replay's answer so that it cannot drift unnoticed, whichever way the
+// question is settled.
+func TestIouringAdoptRequestCountUpgradeCarry886(t *testing.T) {
+	e, _ := start908(t, false, true) // EnableH2Upgrade: the carry is a real upgrade
+	adoptCount886(t, e, h2cUpgradeHead908())
+	expectCount886(t, e, 1)
+}
+
+func TestIouringAdoptRequestCountUpgradeCarryAsync886(t *testing.T) {
+	e, _ := start908(t, true, true) // EnableH2Upgrade: the carry is a real upgrade
+	adoptCount886(t, e, h2cUpgradeHead908())
+	expectCount886(t, e, 1)
+}

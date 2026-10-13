@@ -213,9 +213,12 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 			}
 		} else {
 			perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn)
-			// The replay is the recv event of this conn's first bytes, and
-			// handleRecv counts one per recv event whatever the verdict
-			// (celeris#886).
+			// The replay is the recv event of this conn's first bytes and
+			// counts one, whatever the verdict (celeris#886). handleRecv
+			// counts a recv after ProcessH1 too, but returns before it on an
+			// h2c upgrade and never counts a direct-body recv: a carry that
+			// is an upgrade request counts one here and its recv would have
+			// counted none.
 			w.reqBatch++
 			if perr != nil {
 				if !w.endCarriedReplay(cs, newFD, perr) {
@@ -275,8 +278,9 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 	}
 	// Counted for every outcome but the promotion above, whose
 	// promoteConnToAsync counts it: the replay is the recv event of this
-	// conn's first bytes, and handleRecv counts one per recv event
-	// (celeris#886).
+	// conn's first bytes (celeris#886). Unlike handleRecv it also counts a
+	// carry that ends in an h2c upgrade, which that path returns before
+	// counting.
 	w.reqBatch++
 	if perr != nil {
 		// Nothing below may touch cs.h1State: an h2c upgrade has replaced it.
