@@ -115,6 +115,14 @@ type Engine struct {
 	listenCancel context.CancelFunc
 	listenDone   chan struct{}
 
+	// lateShutdowns counts the goroutines that a Shutdown which gave up on its
+	// ctx left queued for mu (lockForShutdown), and lateIdle is the channel
+	// that is closed when the count falls back to zero; it is nil while the
+	// count is zero. Both are guarded by listenMu. While one is queued, a
+	// later Shutdown queues none (celeris#886 item 15).
+	lateShutdowns int
+	lateIdle      chan struct{}
+
 	// shuttingDown is set under mu by Shutdown, in the same critical section that
 	// snapshots the sub-engines it shuts down (celeris#877). performSwitch checks
 	// it under mu and does nothing once it is set, so no standby is built after a
@@ -142,10 +150,12 @@ type Engine struct {
 	// EngineMetrics.AdaptiveSwitches.
 	switchesTotal atomic.Uint64
 
-	// portHold keeps cfg.Addr's port bound from New until the start engine
-	// has bound its own sockets on it (celeris#616; see holdPort). nil on the
-	// pre-bound-listener path, after releasePortHold, and when New could not
-	// bind the address.
+	// portHold keeps cfg.Addr's port bound, to a socket that never listens,
+	// from New until Listen returns (celeris#616, celeris#886 item 19; see
+	// holdPort), or until Shutdown, whichever comes first: the sub-engines bind
+	// their own sockets beside it, and it stays bound while their listeners
+	// are closed in a switch (DisableDeferAccept). nil on the pre-bound-listener
+	// path, after releasePortHold, and when New could not bind the address.
 	portHold atomic.Pointer[os.File]
 }
 
@@ -161,12 +171,12 @@ type Engine struct {
 //     on a 6.10+ kernel the "bundles era" branch alone used to call io_uring
 //     viable, and every promotion then failed to build it and backed off with
 //     a WARN (celeris#679). Checked first, with iouring.New's own predicate, so
-//     the two cannot disagree. iouring.New also refuses a kernel that rejects
-//     the IORING_ASYNC_CANCEL flags (every one before 5.19, celeris#682). The
-//     kernel test below already rules those kernels out by version; one that
-//     passes it and still rejects the flags fails the build like any other:
-//     a start engine falls back to epoll, a standby build is backed off
-//     (celeris#656).
+//     the two cannot disagree. iouring.New also refuses every kernel before
+//     5.19, and from 5.19 one that rejects the IORING_ASYNC_CANCEL flags
+//     (celeris#682, celeris#872). The kernel test below already rules the
+//     kernels before 5.19 out by version; one that passes it and still rejects
+//     the flags fails the build like any other: a start engine falls back to
+//     epoll, a standby build is backed off (celeris#656).
 //
 // The other two are the t0-knowable disqualifiers from the epoll-vs-io_uring
 // sweep:
@@ -268,14 +278,18 @@ func chooseStartEngine(p engine.CapabilityProfile, cfg resource.Config) engine.E
 // address alone, and joins that group. See the address-resolution block below.
 //
 // Without a pre-bound listener, New binds Config.Addr (a ":0" port becomes a
-// concrete one) and keeps it bound, without listening, until the start
-// engine has bound its own sockets on it, so that no other socket can take
-// the port in between (celeris#616). Listen gives that hold back once the
-// start engine is listening, or when it returns without starting; Shutdown
-// gives it back for an engine that was never started. An Engine that is
-// built and not started must therefore be shut down: one that is dropped
-// instead keeps the port bound until the garbage collector finalizes the
-// descriptor. The hold accepts no connections, so a dial before Listen is
+// concrete one) and keeps it bound, without listening, so that no other socket
+// can take the port in between (celeris#616). The sub-engines bind their own
+// sockets on it beside the hold, and the hold stays bound while Listen runs,
+// like the port hold of the epoll and io_uring engines, so the port is not
+// free while a switch has closed the outgoing engine's listeners and the
+// incoming engine's are not up yet (DisableDeferAccept; celeris#886 item 19).
+// Listen gives it back when it returns, started or not; Shutdown gives it back
+// as it begins, which can be before Listen returns, and is the only release
+// for an engine that was never started.
+// An Engine that is built and not started must therefore be shut down: one that
+// is dropped instead keeps the port bound until the garbage collector finalizes
+// the descriptor. The hold accepts no connections, so a dial before Listen is
 // refused. While the port still has the leftover sockets of an earlier
 // listener without SO_REUSEPORT (the TIME_WAIT ends of a net/http server's
 // connections, say) the kernel allows no stricter hold than one that sockets
@@ -311,10 +325,12 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	// listener is the source of truth; holdPort must not run.
 	//
 	// Without a listener, holdPort decides the port AND keeps it: it returns
-	// a bound, non-listening SO_REUSEPORT socket that Listen closes only once
-	// the start engine has bound its own sockets on the port, so no socket
-	// but an SO_REUSEPORT one of this user's can bind the port between New
-	// and Listen (celeris#616). When sockets an earlier listener left on the
+	// a bound, non-listening SO_REUSEPORT socket that stays bound while
+	// Listen runs (Listen closes it as it returns, Shutdown as it begins), so
+	// no socket but an SO_REUSEPORT one of this user's can bind the port
+	// between New and the start engine's bind in Listen, or in the gap of a
+	// switch that closes the outgoing engine's listeners (celeris#616,
+	// celeris#886 item 19). When sockets an earlier listener left on the
 	// port rule that hold out, the hold taken instead still refuses every
 	// socket without SO_REUSEADDR (see holdPort). Every return from New below
 	// that does not hand the socket to the engine closes it.
@@ -511,11 +527,16 @@ func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, 
 
 // Listen starts ONLY the active sub-engine and the evaluation loop. The standby
 // is built and Listen'd lazily by performSwitch on the first switch (joined
-// under the same ctx + wait group captured here).
+// under the same ctx + wait group captured here). The socket that has held the
+// port since New (see New) stays bound until Listen returns.
 func (e *Engine) Listen(ctx context.Context) error {
-	// Every return gives the port hold back, including the ones before the
-	// start engine bound anything; on success it is given back earlier, as
-	// soon as the start engine has published its address (below).
+	// The port hold lives until Listen returns, and every return gives it back,
+	// including the ones before the start engine bound anything. It is not
+	// given back once the start engine has published its address: the
+	// sub-engines' sockets are beside it, not in its place, and it is what keeps
+	// the port bound while a switch has closed the outgoing engine's listeners
+	// and the incoming engine's are not up yet (celeris#886 item 19). A hold
+	// that is a never-listening SO_REUSEPORT socket takes no connection.
 	defer e.releasePortHold()
 
 	innerCtx, innerCancel := context.WithCancel(ctx)
@@ -603,13 +624,6 @@ bindLoop:
 		wg.Wait()
 		return fmt.Errorf("active sub-engine failed to initialize within 20s deadline")
 	}
-
-	// The start engine has bound and is listening on every one of its
-	// sockets (epoll and io_uring publish Addr only after all their workers
-	// signalled ready), so the port is held by those sockets from here on and
-	// the socket that held it since New can go (celeris#616). Keeping it
-	// would only pin a descriptor for the engine's life.
-	e.releasePortHold()
 
 	// No standby to pause: only the active engine is in the SO_REUSEPORT group,
 	// so publishing Addr cannot expose a dial to a phantom standby listener.
@@ -808,6 +822,12 @@ func (e *Engine) performSwitch() {
 	// Shutdown sets the flag under mu, so either this switch finished before the
 	// snapshot or it sees the flag.
 	if e.shuttingDown {
+		return
+	}
+	// The same for a Shutdown that gave up on its ctx and cancelled Listen's
+	// without having the lock (lockForShutdown): its standby would be born
+	// cancelled and would sit in a slot until the late shutdown found it.
+	if e.listenCtx != nil && e.listenCtx.Err() != nil {
 		return
 	}
 
@@ -1069,9 +1089,33 @@ func (e *Engine) maybeThawLocked() {
 //
 // Shutdown also gives back the port New holds for an engine that was never
 // started (see New), so an Engine built and not started must be shut down.
+//
+// It honours ctx while it waits for an in-progress switch. A switch holds mu for
+// its lazy standby's build, bind wait and listener wait, which can run for
+// seconds, and Shutdown needs mu to take its sub-engine snapshot. If ctx ends
+// first, Shutdown cancels the Listen context (which cuts the switch's bind wait
+// short and unwinds Listen), returns ctx's error, and leaves the rest to a
+// goroutine that is queued for mu: once the switch lets go of it, that
+// goroutine marks the engine as shutting down, so no later switch builds a
+// standby, and shuts the sub-engines down with the ctx that has ended, which
+// is no drain budget (celeris#886 item 15). Shutdown does not join Listen in
+// that case.
+//
+// A Shutdown that gave up leaves one goroutine queued for mu, and a Shutdown
+// that follows it (a supervisor retrying) queues none of its own: it waits
+// for that goroutine to finish, within its own ctx, so the retries of a
+// factory that never returns do not pile goroutines up, and the retry's
+// sub-engine Shutdown comes after the late one, so the ctx it hands epoll as
+// the drain budget is the one that stays.
+//
+// The error depends on where ctx ended. Behind a switch, before Shutdown has
+// mu, it is ctx's error. Once Shutdown has mu, ctx ending while it waits for
+// Listen to unwind gives the result of the sub-engines' Shutdown, which is nil
+// for epoll and io_uring; Server.Shutdown reports ctx's error in both cases.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	// An engine shut down without ever being started still holds its port
-	// (celeris#616); Listen's own release covers every engine that was.
+	// (celeris#616); an engine that was started gives it back when Listen
+	// returns, which this Shutdown makes happen, and also here.
 	e.releasePortHold()
 
 	e.listenMu.Lock()
@@ -1084,7 +1128,9 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	// as they stop (celeris#760), and after the cancel it would come too
 	// late. Both sub-engines' Shutdown does nothing else, and they are
 	// called again, as before, once Listen has returned.
-	e.mu.Lock()
+	if !e.lockForShutdown(ctx, cancel) {
+		return ctx.Err()
+	}
 	e.shuttingDown = true
 	subs := [2]engine.Engine{e.primary, e.secondary}
 	e.mu.Unlock()
@@ -1117,10 +1163,16 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	e.standbyCancels = nil
 	e.mu.Unlock()
 
-	// celeris#656: stop the lazily built standbys by name. Cancelling the Listen
-	// context above already unwinds them — their contexts are its children — but
-	// holding the handle means a standby this engine started is never reachable
-	// only through a context someone else owns.
+	return stopSubEngines(ctx, primary, secondary, standbyCancels)
+}
+
+// stopSubEngines stops what Shutdown's snapshot holds.
+//
+// celeris#656: it stops the lazily built standbys by name. Cancelling the Listen
+// context already unwinds them — their contexts are its children — but holding
+// the handle means a standby this engine started is never reachable only
+// through a context someone else owns.
+func stopSubEngines(ctx context.Context, primary, secondary engine.Engine, standbyCancels []context.CancelFunc) error {
 	for _, cancel := range standbyCancels {
 		cancel()
 	}
@@ -1133,6 +1185,94 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		errs = append(errs, secondary.Shutdown(ctx))
 	}
 	return errors.Join(errs...)
+}
+
+// lockForShutdown takes e.mu for Shutdown, or gives up when ctx ends first
+// (celeris#886 item 15), and reports whether the caller now holds e.mu.
+//
+// An uncontended mu is taken in place. Otherwise one goroutine waits for it, and
+// when it has it, either hands it to Shutdown or, if Shutdown has given up
+// meanwhile, finishes the shutdown itself with the mu it holds
+// (finishShutdownLate). Exactly one of the two happens, so the lock is never
+// left held and the goroutine ends when the holder lets go. On giving up it
+// cancels the Listen context (cancelListen may be nil): that cuts short the
+// bind wait of a standby build that holds mu, and it is what the Shutdown that
+// returns ctx's error has in place of the join.
+//
+// While a goroutine that an earlier give-up left is still queued, no other is
+// queued: the caller waits for it (lateIdle), or for ctx. Callers that overlap
+// in time each queue their own, so what can pile up is bounded by that
+// concurrency, not by the number of calls.
+func (e *Engine) lockForShutdown(ctx context.Context, cancelListen context.CancelFunc) bool {
+	giveUp := func() bool {
+		if cancelListen != nil {
+			cancelListen()
+		}
+		return false
+	}
+	for {
+		e.listenMu.Lock()
+		idle := e.lateIdle
+		e.listenMu.Unlock()
+		if idle != nil {
+			select {
+			case <-idle:
+				continue
+			case <-ctx.Done():
+				return giveUp()
+			}
+		}
+		if e.mu.TryLock() {
+			return true
+		}
+		got := make(chan struct{})
+		abandoned := make(chan struct{})
+		go func() {
+			e.mu.Lock()
+			select {
+			case got <- struct{}{}:
+			case <-abandoned:
+				e.finishShutdownLate(ctx)
+			}
+		}()
+		select {
+		case <-got:
+			return true
+		case <-ctx.Done():
+			// Counted before the goroutine can see abandoned, so that it
+			// never finishes a late shutdown that was not counted.
+			e.listenMu.Lock()
+			e.lateShutdowns++
+			if e.lateIdle == nil {
+				e.lateIdle = make(chan struct{})
+			}
+			e.listenMu.Unlock()
+			close(abandoned)
+			return giveUp()
+		}
+	}
+}
+
+// finishShutdownLate is the part of Shutdown that a Shutdown which gave up on
+// its ctx (lockForShutdown) did not do. The caller holds e.mu and finishShutdownLate
+// releases it: it marks the engine as shutting down and takes the snapshot
+// under mu, as Shutdown does, and stops the sub-engines outside it.
+func (e *Engine) finishShutdownLate(ctx context.Context) {
+	e.shuttingDown = true
+	primary := e.primary
+	secondary := e.secondary
+	standbyCancels := e.standbyCancels
+	e.standbyCancels = nil
+	e.mu.Unlock()
+	_ = stopSubEngines(ctx, primary, secondary, standbyCancels)
+
+	e.listenMu.Lock()
+	e.lateShutdowns--
+	if e.lateShutdowns == 0 {
+		close(e.lateIdle)
+		e.lateIdle = nil
+	}
+	e.listenMu.Unlock()
 }
 
 // Metrics aggregates metrics from whichever sub-engines exist. On the lazy
