@@ -718,8 +718,10 @@ func (l *Loop) run(ctx context.Context) {
 			// write backpressure (armEpollOut). Flush the pending bytes and
 			// disarm once drained. drainRead above may have closed the conn,
 			// so re-validate the slot. EPOLLOUT is edge-triggered here (EPOLLET
-			// covers the whole mask), and a partial flush stops at EAGAIN, so
-			// the send buffer gaining room is the next edge that resumes it.
+			// covers the whole mask), and a partial flush (a short write or
+			// EAGAIN: one write(2) per flush, whose short count means the send
+			// buffer was full) leaves it full, so the send buffer gaining room
+			// is the next edge that resumes it.
 			if ev.Events&unix.EPOLLOUT != 0 {
 				if fd >= 0 && fd < len(l.conns) {
 					if cs := l.conns[fd]; cs != nil && cs.epollOut {
@@ -3349,7 +3351,9 @@ func (l *Loop) drainDetachQueue() {
 		// EPOLLIN|EPOLLET re-enables it. The kernel applies TCP-level
 		// backpressure (zero-window) when its recv buffer fills.
 		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
-			var events uint32 = unix.EPOLLIN | unix.EPOLLET
+			// Resume restores the interest the conn was added with, EPOLLRDHUP
+			// included (the ADD, armEpollOut and disarmEpollOut carry it).
+			var events uint32 = unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP
 			if desired {
 				events = 0
 			}
@@ -3504,8 +3508,10 @@ func (l *Loop) markDirty(cs *connState) {
 // EPOLLET covers the whole event mask, so EPOLLOUT is edge-triggered here,
 // like EPOLLIN (driver.go's flushDriverSendLocked registers no EPOLLET, so a
 // driver conn's EPOLLOUT is level-triggered). No wakeup is lost: the MOD
-// reports EPOLLOUT at once if the socket is already writable, and every flush
-// stops at EAGAIN, after which the send buffer gaining room is a new edge.
+// reports EPOLLOUT at once if the socket is already writable, and a partial
+// flush (a short write or EAGAIN: flushWrites makes one write(2) and returns
+// on a short count, it does not go on to EAGAIN) leaves the send buffer full,
+// after which the buffer gaining room is a new edge.
 func (l *Loop) armEpollOut(cs *connState) {
 	// Backpressure replaces the dirty-list retry; the two must not coexist
 	// or adaptiveTimeoutMs would still return 0 and busy-poll.
