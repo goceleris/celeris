@@ -28,14 +28,28 @@ import (
 // diagnostic; the per-stall tally (stackTally589) runs on every stalled sample.
 var stackDumped589 atomic.Bool
 
+// parkedDumped589 guards the one-shot full dump of the first event-loop
+// goroutine found parked on a mutex: the verbatim stack TestClassifyLoopStack589
+// is written from, and the evidence that the pin was the celeris#593 one.
+var parkedDumped589 atomic.Bool
+
 // stackTally589 classifies every engine event-loop goroutine at the moment a
 // /ping sample has been outstanding for 100 ms, so the site that pins the
 // worker is COUNTED across the window rather than named once. The io_uring
 // worker is the goroutine running (*Worker).run; the epoll one (*Loop).run.
 type stackTally589 struct {
 	captures int            // stalled samples at which a stack was taken
+	parked   int            // captures at which an event-loop goroutine was parked on a mutex (mutexParked589)
 	loops    int            // event-loop goroutines seen across captures
 	where    map[string]int // event-loop goroutine → blocking site
+}
+
+// mutexParked589 reports whether a classifyLoopStack589 class is an event-loop
+// goroutine parked on a mutex. An engine worker is never supposed to wait for
+// one while a /ping sits unanswered: the celeris#593 shape is exactly that,
+// checkTimeouts blocked on a detachMu held across a slow async handler.
+func mutexParked589(class string) bool {
+	return class == "checkTimeouts_detachMu_Lock" || class == "other_Mutex_Lock"
 }
 
 func classifyLoopStack589(g string) string {
@@ -71,6 +85,7 @@ func (st *stackTally589) capture(t *testing.T) {
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
 	st.captures++
+	parkedHere := false
 	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
 		isLoop := strings.Contains(g, "internal/engine/iouring.(*Worker).run(") || strings.Contains(g, "internal/engine/epoll.(*Loop).run(")
 		if !isLoop {
@@ -80,11 +95,36 @@ func (st *stackTally589) capture(t *testing.T) {
 		if st.where == nil {
 			st.where = map[string]int{}
 		}
-		st.where[classifyLoopStack589(g)]++
-		if stackDumped589.CompareAndSwap(false, true) {
+		class := classifyLoopStack589(g)
+		st.where[class]++
+		parkedHere = parkedHere || mutexParked589(class)
+		if mutexParked589(class) && parkedDumped589.CompareAndSwap(false, true) {
+			t.Logf("STACK589 first event-loop goroutine parked on a mutex (%s):\n%s", class, g)
+		}
+		if os.Getenv("CELERIS_589_STACK") != "" && stackDumped589.CompareAndSwap(false, true) {
 			t.Logf("STACK589 first stalled sample, event-loop goroutine:\n%s", g)
 		}
 	}
+	if parkedHere {
+		st.parked++
+	}
+}
+
+// stackCaptures and stackParked are the number of stalled /ping samples at
+// which the event-loop goroutines were looked at, and the number of those at
+// which one of them was parked on a mutex (0 when no stack was taken).
+func (o stall589Obs) stackCaptures() int {
+	if o.stacks == nil {
+		return 0
+	}
+	return o.stacks.captures
+}
+
+func (o stall589Obs) stackParked() int {
+	if o.stacks == nil {
+		return 0
+	}
+	return o.stacks.parked
 }
 
 func (st *stackTally589) String() string {
@@ -484,17 +524,22 @@ type stall589Obs struct {
 	// slow call until the route is promoted — i.e. while the settled route is
 	// still inline on the worker. It is the denominator the post-promotion
 	// window is judged against, so both numbers carry the same runner.
-	refSamples  int
-	refPingMed  time.Duration
-	refPingMax  time.Duration
-	refStalled  int // reference samples > stall589StallBar (reported)
-	refWindow   time.Duration
-	speedup     float64       // refPingMed / pingMed; 0 when there is no reference
-	queuedBar   time.Duration // "this /ping waited for a blocked Set" bar (stall589Delay/2)
-	queued      int           // post-promotion samples > queuedBar
-	queuedFrac  float64
-	refQueued   int // reference samples > queuedBar (the pinned world's own rate, reported)
-	refQueuedFr float64
+	refSamples int
+	refPingMed time.Duration
+	refPingMax time.Duration
+	refStalled int // reference samples > stall589StallBar (reported)
+	refWindow  time.Duration
+	speedup    float64       // refPingMed / pingMed; 0 when there is no reference
+	queuedBar  time.Duration // "this /ping waited for a blocked Set" bar (stall589Delay/2)
+	queued     int           // post-promotion samples > queuedBar
+	queuedFrac float64
+	queuedTime time.Duration // sum of the latencies of the post-promotion samples over queuedBar (REPORTED)
+	// queuedTimeFrac is queuedTime / window, the share of the wall-clock window
+	// spent waiting in samples over queuedBar (REPORTED, celeris#886 item 1:
+	// under a starved box it overlaps the pinned worker's, so it decides nothing).
+	queuedTimeFrac float64
+	refQueued      int // reference samples > queuedBar (the pinned world's own rate, reported)
+	refQueuedFr    float64
 
 	// The controls' in-run reference (celeris#628): what one blocked Set
 	// costs a keep-alive client on this box under this load, measured by the
@@ -794,14 +839,14 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 		"settled_after=%t promoted_after=%t promoted_in_bound=%t promote_ms=%.0f async_promoted_conns=%d workers=%d kv_conns=%d gomaxprocs=%d warm_reqs=%d warm_depromotions=%d slow_calls=%d kv_reqs=%d "+
 		"pre_sample_ms=%.0f window_ms=%.0f samples=%d stalled=%d stalled_frac=%.3f stalled_time_ms=%.0f "+
 		"ping_min_ms=%.3f ping_med_ms=%.3f ping_max_ms=%.3f "+
-		"queued_bar_ms=%.0f queued=%d queued_frac=%.3f speedup=%.1f "+
+		"queued_bar_ms=%.0f queued=%d queued_frac=%.3f queued_time_frac=%.3f stack_captures=%d stack_parked=%d speedup=%.1f "+
 		"kv_samples=%d kv_med_ms=%.3f kv_max_ms=%.3f ctl_speedup=%.1f "+
 		"ref_samples=%d ref_window_ms=%.0f ref_ping_med_ms=%.3f ref_ping_max_ms=%.3f ref_stalled=%d ref_queued_frac=%.3f claim589_assert=%s",
 		o.engine, o.mode, stall589RunSeq.Add(1), verdict, o.settledBefore, o.promotedBefore, o.adaptive, o.settledAtFlip,
 		o.settledAfter, o.promotedAfter, o.promotedInBound, ms(o.promoteLatency), o.asyncPromotedConns, o.workers, o.kvConns, o.gomaxprocs, o.warmReqs, o.depromotions, o.slowCalls, o.kvReqs,
 		ms(o.preSample), ms(o.window), o.samples, o.stalled, o.stalledFrac, ms(o.stalledTime),
 		ms(o.pingMin), ms(o.pingMed), ms(o.pingMax),
-		ms(o.queuedBar), o.queued, o.queuedFrac, o.speedup,
+		ms(o.queuedBar), o.queued, o.queuedFrac, o.queuedTimeFrac, o.stackCaptures(), o.stackParked(), o.speedup,
 		o.kvSamples, ms(o.kvMed), ms(o.kvMax), o.ctlSpeedup,
 		o.refSamples, ms(o.refWindow), ms(o.refPingMed), ms(o.refPingMax), o.refStalled, o.refQueuedFr, claim)
 	if o.stacks != nil {
@@ -1349,12 +1394,15 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 
 	var lat []time.Duration
 	winStart := time.Now()
-	stackDiag := !fresh && os.Getenv("CELERIS_589_STACK") != ""
+	// The post-promotion window watches for the celeris#593 pin itself
+	// (stackTally589, celeris#886 item 1): 100 ms into any /ping that has not
+	// been answered, the event-loop goroutines' stacks are classified.
+	stackDiag := !fresh
 	for time.Since(winStart) < stall589Window {
 		if stackDiag {
-			// Diagnostic: 100 ms into EVERY stalled /ping, classify the
-			// event-loop goroutines' blocking site (tallied on the STACK589
-			// result line) and dump the first one in full.
+			// 100 ms into EVERY stalled /ping, classify the event-loop
+			// goroutines' blocking site (tallied on the STACKTALLY589 line;
+			// CELERIS_589_STACK=1 also dumps the first one in full).
 			if o.stacks == nil {
 				o.stacks = &stackTally589{}
 			}
@@ -1427,7 +1475,11 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		}
 		if d > o.queuedBar {
 			o.queued++
+			o.queuedTime += d
 		}
+	}
+	if o.window > 0 {
+		o.queuedTimeFrac = float64(o.queuedTime) / float64(o.window)
 	}
 	if o.samples > 0 {
 		o.stalledFrac = float64(o.stalled) / float64(o.samples)
