@@ -5,7 +5,9 @@ package iouring
 import (
 	"errors"
 	"net"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -187,4 +189,55 @@ func TestGoexitedWorkerLeavesTheGroupAndThePauseDoesNotWaitForIt848(t *testing.T
 	stop848(t, cancel, done)
 	t.Logf("celeris848 RESULT iouring-lifecycle ids=%d multi=%v answered_after=%v first_pause=%v refused_after=%v resumed_answered=%v second_pause=%v counted=%d",
 		len(ids), multi, answeredAfter, firstPause, refusedAfter, resumedAnswered, secondPause, e.abnormalWorkerExits.Load())
+}
+
+// A Goexit raised while the pause is closing the listener (a handler or a
+// callback that cancelAccept or acceptQueuedOnPause ran) comes after the close
+// took the descriptor out of Worker.listenFD, so the report path must find it
+// elsewhere (closingFD) or the dead worker's listener stays in the group for
+// good. cancelAcceptSeam stands in for such a handler: it ends the goroutine of
+// the first worker that cancels its accept, which is that worker's pause close.
+func TestGoexitInThePauseCloseStillLeavesTheGroup848(t *testing.T) {
+	if !child848(t) {
+		return
+	}
+	e, _, cancel, done := start848(t, "127.0.0.1:0", true)
+	addr := e.Addr().String()
+	var fired atomic.Bool
+	cancelAcceptSeam = func(*Worker, int) {
+		if fired.CompareAndSwap(false, true) {
+			runtime.Goexit()
+		}
+	}
+	t.Cleanup(func() { cancelAcceptSeam = nil })
+
+	t0 := time.Now()
+	if err := e.PauseAccept(); err != nil {
+		t.Fatalf("PauseAccept: %v", err)
+	}
+	pause := time.Since(t0)
+	if pause > 800*time.Millisecond {
+		t.Errorf("PauseAccept took %v, want under 800 ms (it waited for the worker that ended in the pause's close)", pause)
+	}
+	refusedAfter := time.Duration(-1)
+	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(10 * time.Millisecond) {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			_ = c.Close()
+			continue
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			t.Fatalf("a dial after the pause failed with %v, want connection refused", err)
+		}
+		refusedAfter = time.Since(t0)
+		break
+	}
+	if refusedAfter < 0 {
+		t.Errorf("a dial after PauseAccept was still accepted 5 s on: the listener of the worker that ended in the pause's close stayed open")
+	}
+	stop848(t, cancel, done)
+	t.Logf("celeris848 RESULT iouring-pause-close fired=%v pause=%v refused_after=%v counted=%d", fired.Load(), pause, refusedAfter, e.abnormalWorkerExits.Load())
+	if !fired.Load() || e.abnormalWorkerExits.Load() < 1 {
+		t.Errorf("PREMISE: the seam fired=%v, abnormal exits %d", fired.Load(), e.abnormalWorkerExits.Load())
+	}
 }
