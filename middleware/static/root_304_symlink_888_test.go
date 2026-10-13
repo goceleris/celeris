@@ -102,6 +102,11 @@ func TestRoot304DoesNotFollowSymlinkOut888(t *testing.T) {
 		{"leaf-relative-target", func(t *testing.T, r root888) {
 			r.link(t, filepath.Join("..", "outside", "secret.txt"), "leak.txt")
 		}, "/leak.txt", ""},
+		{"sibling-sharing-the-root-prefix", func(t *testing.T, r root888) {
+			sib := r.root + "-evil" // <tmp>/root-evil starts with "<tmp>/root"
+			r.write(t, filepath.Join(sib, "secret.txt"), secretBytes888, secretTime888)
+			r.link(t, filepath.Join(sib, "secret.txt"), "leak.txt")
+		}, "/leak.txt", ""},
 		{"parent-directory", func(t *testing.T, r root888) {
 			r.link(t, r.outside, "linkdir")
 		}, "/linkdir/secret.txt", ""},
