@@ -188,7 +188,7 @@ jobs:
           #   * TestRouteAdaptive_SettleReopenCost and
           #     TestWriteBufBackpressureClosesSlowConsumer: opt-in measurements
           #     (CELERIS_592_COST=1, GOTEST_BACKPRESSURE=1), not checks.
-          #   * the three alloc-count tests in middleware/sse: they skip
+          #   * the four alloc-count tests in middleware/sse: they skip
           #     under -race and every step of this job is -race (celeris#684).
           #   * the two TestPauseAccept...SynackRetriesZero tests in internal/engine/epoll:
           #     they need net.ipv4.tcp_synack_retries=0 and the runner has 5; the step
@@ -200,7 +200,7 @@ jobs:
           # too. That is safe only while this step excludes /engine/iouring$ (the
           # pkgs line above; the step after it runs that package with its own list).
           # A name added here allows that name in every package this step runs.
-          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux'
+          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestSlowClientDropPathAllocs888|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux'
           required='TestSendfileEndToEndLargeFile|TestSendfileHEADNoBody|TestSendfileRangeRequest|TestSendfileSubThresholdFallback'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
           ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/root.log || true)
