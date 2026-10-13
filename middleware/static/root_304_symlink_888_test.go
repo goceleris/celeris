@@ -237,3 +237,29 @@ func TestRoot304RelativeRoot888(t *testing.T) {
 		}
 	}
 }
+
+// TestRoot304SymlinkedRoot888: the Root itself is a symlink to the directory
+// that holds the files (a "current -> release-N" deploy). Its own path is not
+// part of the check, so a symlink inside still gets its 304 and one that leaves
+// the real directory is still refused.
+func TestRoot304SymlinkedRoot888(t *testing.T) {
+	r := newRoot888(t)
+	r.write(t, filepath.Join(r.root, "real.txt"), secretBytes888, secretTime888)
+	r.link(t, "real.txt", "alias.txt")
+	r.link(t, filepath.Join(r.outside, "secret.txt"), "leak.txt")
+	rootLink := filepath.Join(filepath.Dir(r.root), "current")
+	if err := os.Symlink(r.root, rootLink); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	tag := weakETag(secretTime888, int64(len(secretBytes888)))
+	mw := New(Config{Root: rootLink})
+	rec, err := get888(t, mw, "/alias.txt", "if-none-match", tag)
+	if err != nil || rec.StatusCode != 304 {
+		t.Errorf("symlink inside a symlinked Root: status %d, err %v; want a 304", rec.StatusCode, err)
+	}
+	rec, err = get888(t, mw, "/leak.txt", "if-none-match", tag)
+	if rec.StatusCode == 304 || !isHTTP400(err) || rec.Header("etag") != "" {
+		t.Errorf("escape from a symlinked Root: status %d, err %v, etag %q; want a 400 and no etag",
+			rec.StatusCode, err, rec.Header("etag"))
+	}
+}
