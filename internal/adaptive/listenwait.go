@@ -39,15 +39,20 @@ import (
 // filtered to LISTEN, so it costs a few listening sockets, not the connection
 // table.
 //
-// The wait holds e.mu (not freezeState): while it runs, Metrics(), Shutdown
-// and the next switch wait behind it, for at most listenWaitBound plus one
-// kernel-list timeout. That is the cost the comment above the beginPause call in performSwitch names as
-// the reason the PAUSE does not wait (celeris#662). It is accepted here
-// because it is bounded, never on a request path, and paid only by a switch
-// that has no lingering outgoing engine (DisableDeferAccept or a zero linger)
-// and whose standby was not freshly built. Measured: Engine.Metrics() took
-// about 110 ms during a 150 ms-late resume. Releasing e.mu for the wait is a
-// larger change to performSwitch's locking, left to the v1.6.0 polish list.
+// The wait holds e.mu (not freezeState): while it runs, Shutdown and the next
+// switch wait behind it, for at most listenWaitBound plus one kernel-list
+// timeout. That is the cost the comment above the beginPause call in
+// performSwitch names as the reason the PAUSE does not wait (celeris#662). It
+// is accepted here because it is bounded, never on a request path, and paid
+// only by a switch that has no lingering outgoing engine (DisableDeferAccept
+// or a zero linger) and whose standby was not freshly built.
+//
+// Engine.Metrics() does not wait behind it: it reads the sub-engine slots
+// under slotsMu, which performSwitch takes only for the short blocks that
+// publish them and never across this wait (it took about 110 ms during a
+// 150 ms-late resume while it read them under e.mu, celeris#886). Releasing
+// e.mu for the wait itself is a larger change to performSwitch's locking, left
+// to the v1.6.0 polish list.
 
 // listenWaitBound is how long performSwitch waits for the incoming engine to
 // listen before it pauses the outgoing one anyway. The measured lag is
@@ -59,16 +64,29 @@ var listenWaitBound = 250 * time.Millisecond
 // listenWaitPoll is the requested interval between two kernel lists while
 // waiting. time.Sleep rounds a request this short up to the runtime timer's
 // granularity, so the effective interval is longer: about 1.4 ms measured on
-// linux/arm64 in a container. A wait for a listener that appears within
-// microseconds therefore returns at the next poll, about a millisecond or
-// more later.
+// linux/arm64 in a container.
 const listenWaitPoll = 50 * time.Microsecond
+
+// listenWaitSpins is how many times the wait lists again at once, without
+// sleeping, before its first sleep. A loop re-creates its listener a few tens
+// of microseconds after the resume when it is scheduled promptly, so a wait
+// that slept first returned at the next poll, about 1.4 ms later (the sleep
+// above), where a few immediate lists see the listener in microseconds. Each
+// list is one sock_diag round trip, so the spin is bounded by this count, not
+// by time.
+const listenWaitSpins = 4
 
 // listenWatch is the set of LISTEN sockets on the switch's port at the moment
 // the incoming engine was resumed.
 type listenWatch struct {
 	port   int
 	before map[uint32]struct{}
+
+	// list and sleep are test seams for wait: the kernel list and the pause
+	// between two lists. Nil in production, where they are listenInodesOn and
+	// time.Sleep.
+	list  func(fd, port int) (map[uint32]struct{}, error)
+	sleep func(time.Duration)
 }
 
 // listenWaitCounters count what the wait did. They are deliberately not an
@@ -135,8 +153,15 @@ func (w *listenWatch) wait(bound time.Duration) (time.Duration, bool, error) {
 		return time.Since(t0), false, err
 	}
 	defer func() { _ = unix.Close(fd) }()
-	for {
-		set, err := listenInodesOn(fd, w.port)
+	list, sleep := w.list, w.sleep
+	if list == nil {
+		list = listenInodesOn
+	}
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+	for polls := 0; ; polls++ {
+		set, err := list(fd, w.port)
 		if err != nil {
 			return time.Since(t0), false, err
 		}
@@ -148,7 +173,10 @@ func (w *listenWatch) wait(bound time.Duration) (time.Duration, bool, error) {
 		if time.Since(t0) >= bound {
 			return time.Since(t0), false, nil
 		}
-		time.Sleep(listenWaitPoll)
+		if polls < listenWaitSpins {
+			continue // list again at once; see listenWaitSpins
+		}
+		sleep(listenWaitPoll)
 	}
 }
 
@@ -286,9 +314,9 @@ func (e *Engine) watchIncomingListener(incoming, outgoing engine.Engine, freshly
 // resumed and before the outgoing one is paused, until the incoming engine has
 // a listener in LISTEN. The caller holds e.mu and NOT freezeState, so a driver
 // register or unregister is not stalled behind it; nothing the incoming
-// engine's loops need to re-create a listener takes either lock. Metrics(),
-// Shutdown and the next switch do wait for e.mu, for up to the bound (see the
-// top of this file).
+// engine's loops need to re-create a listener takes either lock. Shutdown and
+// the next switch do wait for e.mu, for up to the bound (see the top of this
+// file). Metrics() does not: it takes slotsMu, which is free across the wait.
 func (e *Engine) awaitIncomingListener(w *listenWatch) {
 	if w == nil {
 		return

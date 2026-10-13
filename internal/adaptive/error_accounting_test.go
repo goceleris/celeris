@@ -164,7 +164,9 @@ func TestStandbyErrorCountIsZeroWithNoStandby(t *testing.T) {
 	e, _ := newAdaptiveStartingOnEpoll(t)
 	e.primary.(*mockEngine).SetMetrics(engine.EngineMetrics{ErrorCount: 63, ErrorSend: 63})
 	e.mu.Lock()
+	e.slotsMu.Lock()
 	e.secondary = nil
+	e.slotsMu.Unlock()
 	e.mu.Unlock()
 
 	m := e.Metrics()

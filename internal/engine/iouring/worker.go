@@ -2698,12 +2698,14 @@ func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
 	for range len(w.conns) {
 		newFD, _, err := unix.Accept4(listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
-			switch err {
-			case unix.EAGAIN:
+			if err == unix.EAGAIN {
 				return
-			case unix.EINTR, unix.ECONNABORTED:
+			}
+			if w.acceptRetry(err) {
 				// A signal, or a queued connection reset before it was
-				// taken: the rest of the queue is still there.
+				// taken (ECONNABORTED, counted in AcceptCancelled as the
+				// accept CQE of the same errno is): the rest of the queue is
+				// still there.
 				continue
 			}
 			var errno unix.Errno
@@ -2713,6 +2715,14 @@ func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
 		}
 		w.onAcceptedFD(ctx, newFD, now, false)
 	}
+}
+
+// acceptRetry reports whether a synchronous accept4 failure is a transient
+// one to retry in place (ECONNABORTED, counted in AcceptCancelled; EINTR, not
+// counted); see errclass.Counters.AcceptRetried.
+func (w *Worker) acceptRetry(err error) bool {
+	errno, ok := err.(unix.Errno)
+	return ok && w.errs.AcceptRetried(errno)
 }
 
 // errHijackNoSQE is what hijackConn answers when the SQ ring has no room for
@@ -2907,6 +2917,17 @@ func (w *Worker) initProtocol(cs *connState) {
 			// acquireConnState; reuse it so the async goroutine and the
 			// middleware goroutine share one mutex. Otherwise create
 			// a fresh mutex for the WS/SSE detach flow.
+			// What a panic out of this hook must put back (see the deferred rollback
+			// below): the hook runs on a conn that goes on after the panic unless it
+			// is on the promoted async path.
+			h1 := cs.h1State
+			prevWrite, prevMu, prevPending := cs.writeFn, cs.detachMu, cs.asyncDetachPending
+			var prevRaw func([]byte)
+			var prevPause, prevResume func()
+			if h1 != nil {
+				prevRaw, prevPause, prevResume = h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv
+			}
+			counted, finished := false, false
 			mu := cs.detachMu
 			if mu == nil {
 				mu = &sync.Mutex{}
@@ -2924,6 +2945,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			if !w.async {
 				w.detachedCount++
 				cs.detachCounted = true
+				counted = true
 				if w.detachedConns != nil {
 					w.detachedConns.Add(1)
 				}
@@ -3051,6 +3073,39 @@ func (w *Worker) initProtocol(cs *connState) {
 			completed := !unlockDetachMu
 			// flagged: asyncDetachUnlocked has been published by this closure.
 			flagged := false
+			if !unlockDetachMu {
+				// A conn that is not on the promoted async path goes on after a panic
+				// out of this hook: Context.Detach has not marked the Context detached,
+				// the router answers 500, and the next request is served on the same
+				// conn. Put back everything installed above and below, so that it is
+				// exactly as if Detach had not run: a guarded writeFn left behind
+				// locks detachMu again on the first write of the H2C branch and of
+				// serveAsync, which hold it across theirs (the loop thread, or the
+				// dispatch goroutine, deadlocks on itself), a count left behind is
+				// made again by the next Detach, and closeConn undoes one. The
+				// promoted path closes the conn instead (the deferred hook below).
+				// Assignments only, under no lock: this goroutine owns the conn's
+				// state here, as it did when the hook installed it (#889 item 34).
+				defer func() {
+					if finished {
+						return
+					}
+					cs.writeFn = prevWrite
+					if h1 != nil {
+						h1.UpdateWriteFn(prevWrite)
+						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
+					}
+					cs.detachMu = prevMu
+					cs.asyncDetachPending = prevPending
+					if counted {
+						w.detachedCount--
+						cs.detachCounted = false
+						if w.detachedConns != nil {
+							w.detachedConns.Add(-1)
+						}
+					}
+				}()
+			}
 			if unlockDetachMu {
 				// Registered before guarded is installed (celeris#844): from the moment
 				// cs.writeFn is guarded, a write through the response adapter locks
@@ -3128,6 +3183,11 @@ func (w *Worker) initProtocol(cs *connState) {
 					wake.Signal()
 				}
 			}
+			if !unlockDetachMu {
+				if f := detachPostInstallHook.Load(); f != nil {
+					(*f)() // test seam, #889 item 34 (a conn that is not promoted)
+				}
+			}
 			// Ensure eventfd poll is armed so the worker wakes up.
 			// Sync mode runs OnDetach on the worker thread, so this
 			// SQE submission is safe. Async mode defers to
@@ -3185,6 +3245,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// fix making Detached atomic.
 			cs.h1State.Detached.Store(true)
 			completed = true
+			finished = true
 			// detachMu is released as this closure returns (the defer above),
 			// now that Detached is published, so the guarded writeFn the
 			// middleware calls next (the 101 / SSE headers) can re-acquire it.
@@ -3436,41 +3497,34 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			}
 			return
 		}
-		rest, derr := cs.h1State.DispatchBufferedBody(cs.ctx, w.handler, cs.writeFn)
-		if errors.Is(derr, conn.ErrUpgradeH2C) {
-			if err := w.switchToH2(cs); err != nil {
-				w.closeConn(fd)
-				return
-			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			cs.recvLinked = false
-			if w.bufRing == nil {
-				if w.flushSendLink(cs) {
-					w.markDirty(cs)
+		rest, verdict := cs.h1State.DispatchBufferedBody(cs.ctx, w.handler, cs.writeFn)
+		if verdict == nil && len(rest) > 0 {
+			// Tail bytes after the body: feed them back through the normal
+			// parser for the pipelined request(s). Their verdict is handled
+			// exactly as the body's own (an h2c upgrade request pipelined
+			// behind the body is the case that was once closed instead,
+			// celeris#884).
+			verdict = conn.ProcessH1(cs.ctx, rest, cs.h1State, w.handler, cs.writeFn)
+		}
+		if verdict != nil {
+			switch {
+			case errors.Is(verdict, conn.ErrHijacked):
+				// The handler took the conn: cs is no longer ours.
+			case errors.Is(verdict, conn.ErrUpgradeH2C):
+				if w.finishH1Upgrade(cs, fd, true) && !cqeHasMore(c.Flags) && !cs.recvLinked {
+					// The linked send carries a recv of its own when it was
+					// placed; otherwise (a send in flight, a full SQ ring)
+					// this recv, which the direct-body CQE consumed, must be
+					// replaced here or the conn is deaf.
+					if !w.prepareRecv(cs, cs.buf) {
+						cs.needsRecv = true
+						w.markDirty(cs)
+					}
 				}
-			} else {
-				if w.flushSend(cs) {
-					w.markDirty(cs)
-				}
-			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
+			default:
+				w.endH1Verdict(cs, fd, verdict)
 			}
 			return
-		}
-		if derr != nil {
-			w.closeConn(fd)
-			return
-		}
-		if len(rest) > 0 {
-			if perr := conn.ProcessH1(cs.ctx, rest, cs.h1State, w.handler, cs.writeFn); perr != nil {
-				if !errors.Is(perr, conn.ErrHijacked) {
-					w.closeConn(fd)
-				}
-				return
-			}
 		}
 		// The direct-body tail: flushed unlinked (the next recv may target
 		// the body buffer again), then a standalone recv — or none, held for
@@ -3748,29 +3802,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 					w.bufRing.PushBuffer(providedBufID)
 					w.hasBufReturns = true
 				}
-				if err := w.switchToH2(cs); err != nil {
-					w.closeConn(fd)
-					return
-				}
 				// Flush the buffered 101 Switching Protocols + H2 server preface
 				// + stream 1 response bytes. Without this explicit flush the
 				// client blocks forever waiting for the 101 (the normal post-
 				// process flush path below is bypassed by this early return).
-				if mu := cs.detachMu; mu != nil {
-					mu.Lock()
-				}
-				cs.recvLinked = false
-				if w.bufRing == nil {
-					if w.flushSendLink(cs) {
-						w.markDirty(cs)
-					}
-				} else {
-					if w.flushSend(cs) {
-						w.markDirty(cs)
-					}
-				}
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
+				if !w.finishH1Upgrade(cs, fd, true) {
+					return
 				}
 				// Re-arm recv to keep reading H2 frames. flushSendLink may have
 				// already chained a recv via IOSQE_IO_LINK — skip our standalone
@@ -3913,36 +3950,8 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return // FD already detached
 		}
 		// Flush pending writes (e.g. error responses) before closing, and
-		// read cs.h1State, both under detachMu.
-		//
-		// The flush was previously outside the lock. completeSend's docstring
-		// states the invariant it broke: for a detached connection cs.sendBuf
-		// is read by the makeWriteFn closure on the user's goroutine, so every
-		// mutation of it needs detachMu. flushSend swaps sendBuf with writeBuf
-		// and sets cs.sending, so calling it unlocked races a handler that is
-		// writing — the same access pattern the race detector caught on the
-		// call sites that were fixed when that docstring was written
-		// (celeris#528). Reachable within one request: a handler can Detach
-		// (SSE, or a WebSocket upgrade) and then have ProcessH1 surface an
-		// error, with the guarded write closure already installed.
-		//
-		// The h1State read has its own reason to be under the lock: the async
-		// dispatch goroutine's switchToH2Local nils cs.h1State under the same
-		// mutex (the #256 TOCTOU class).
-		//
-		// internal/engine/epoll/loop.go does exactly this — one lock spanning the
-		// flush and OnError.
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-			_ = w.flushSend(cs)
-			if cs.h1State != nil && cs.h1State.OnError != nil {
-				cs.h1State.OnError(processErr)
-			}
-			mu.Unlock()
-		} else {
-			_ = w.flushSend(cs)
-		}
-		w.closeConn(fd)
+		// tell a detached middleware: endH1Verdict, under detachMu.
+		w.endH1Verdict(cs, fd, processErr)
 		return
 	}
 
@@ -6088,10 +6097,13 @@ func (w *Worker) drainDetachQueue() {
 		// pass (from the same enqueue burst) is a no-op.
 		if cs.asyncDetachPending {
 			cs.asyncDetachPending = false
-			w.detachedCount++
-			cs.detachCounted = true
-			if w.detachedConns != nil {
-				w.detachedConns.Add(1)
+			// Once per conn, whatever enqueued it again (#889 item 34).
+			if !cs.detachCounted {
+				w.detachedCount++
+				cs.detachCounted = true
+				if w.detachedConns != nil {
+					w.detachedConns.Add(1)
+				}
 			}
 			if !w.h2PollArmed && w.wakeFD.FD() >= 0 {
 				w.h2PollArmed = w.prepareH2Poll()

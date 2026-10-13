@@ -133,9 +133,9 @@ func readBody543(c net.Conn, br *bufio.Reader, d time.Duration) (int, string, er
 // on the first conn's worker) and every one of them must be served. Then the
 // handler is released and the carried request must be answered, once, on a
 // conn that keeps serving.
-func runCarryAsync543(t *testing.T, name string, workers int, adopt func(int, engine.Carryover) error, h *carry543Handler) {
+func runCarryAsync543(t *testing.T, name string, workers int, adopt func(int, engine.Carryover) error, promoted func(int) (bool, bool), h *carry543Handler) {
 	t.Helper()
-	runCarrySplit543(t, name, workers, adopt, h, "GET /block HTTP/1.1\r\nHost: x\r\n\r\n", "")
+	runCarrySplit543(t, name, workers, adopt, promoted, h, "GET /block HTTP/1.1\r\nHost: x\r\n\r\n", "")
 }
 
 // runCarrySplit543 is runCarryAsync543 with the /block request cut in two:
@@ -144,7 +144,7 @@ func runCarryAsync543(t *testing.T, name string, workers int, adopt func(int, en
 // replay that leaves a request half-parsed must hand its continuation to the
 // dispatch goroutine: the continuation's parse does not ask the per-route
 // async question again.
-func runCarrySplit543(t *testing.T, name string, workers int, adopt func(int, engine.Carryover) error, h *carry543Handler, carried, rest string) {
+func runCarrySplit543(t *testing.T, name string, workers int, adopt func(int, engine.Carryover) error, promoted func(int) (bool, bool), h *carry543Handler, carried, rest string) {
 	t.Helper()
 	if workers < 1 {
 		t.Fatalf("%s reports %d workers", name, workers)
@@ -168,6 +168,19 @@ func runCarrySplit543(t *testing.T, name string, workers int, adopt func(int, en
 	case <-h.started:
 		started = true
 	case <-time.After(3 * time.Second):
+	}
+	if started {
+		// celeris#890 item 42: the handler runs on the dispatch goroutine,
+		// which the replay started after it promoted the conn, so the flag
+		// is set by now (happens-before through the handler's signal). The
+		// answers below would also notice a replay that promoted the conn
+		// by only half (a goroutine, no flag), but only under the race
+		// detector: the flag is what the next recv's feed decision reads.
+		if isP, found := promoted(fdA); !found {
+			t.Errorf("%s: the adopted conn is not in any connection table", name)
+		} else if !isP {
+			t.Errorf("%s: the carried /block request is running on a dispatch goroutine but the conn is not marked asyncPromoted: the replay promoted it by half", name)
+		}
 	}
 
 	served := 0
@@ -299,7 +312,7 @@ func start543(t *testing.T, async bool, h stream.Handler) *Engine {
 func TestIouringAdoptCarriedAsyncRoute543(t *testing.T) {
 	h := newCarry543Handler()
 	e := start543(t, true, h)
-	runCarryAsync543(t, "iouring", e.NumWorkers(), e.AdoptConn, h)
+	runCarryAsync543(t, "iouring", e.NumWorkers(), e.AdoptConn, e.connAsyncPromoted890, h)
 }
 
 // TestIouringAdoptCarriedPartialAsyncRoute543 carries only the start of the
@@ -307,7 +320,7 @@ func TestIouringAdoptCarriedAsyncRoute543(t *testing.T) {
 func TestIouringAdoptCarriedPartialAsyncRoute543(t *testing.T) {
 	h := newCarry543Handler()
 	e := start543(t, true, h)
-	runCarrySplit543(t, "iouring", e.NumWorkers(), e.AdoptConn, h,
+	runCarrySplit543(t, "iouring", e.NumWorkers(), e.AdoptConn, e.connAsyncPromoted890, h,
 		"GET /block HTTP/1.1\r\nHost: x\r\n", "X-Rest: 1\r\n\r\n")
 }
 
@@ -323,4 +336,26 @@ func TestIouringAdoptCarriedPipelinedSync543(t *testing.T) {
 	h := newCarry543Handler()
 	e := start543(t, false, h)
 	runCarryPipelined543(t, "iouring-sync", e.AdoptConn, h)
+}
+
+// connAsyncPromoted890 reports whether the conn on descriptor fd is marked
+// asyncPromoted, and whether any worker has such a conn. The slot is read
+// under connsMu, the one lock for a read of a slot off the worker goroutine
+// (celeris#959); the flag is atomic.
+func (e *Engine) connAsyncPromoted890(fd int) (promoted, found bool) {
+	e.mu.Lock()
+	ws := e.workers
+	e.mu.Unlock()
+	for _, w := range ws {
+		var cs *connState
+		w.connsMu.Lock()
+		if fd >= 0 && fd < len(w.conns) {
+			cs = w.conns[fd]
+		}
+		w.connsMu.Unlock()
+		if cs != nil {
+			return cs.asyncPromoted.Load(), true
+		}
+	}
+	return false, false
 }

@@ -43,12 +43,11 @@ type EngineMetrics struct {
 	// This is the bucket a PauseAccept lands in, so on the adaptive engine
 	// it is a per-switch cost rather than a fault, and it is the one that
 	// separates a switch transient from a sustained accept-side loss. Note
-	// the asymmetry it exposes: io_uring reports all four through a
+	// the one asymmetry left: io_uring reports all four through a
 	// completion and counts them, while epoll's accept4 loop retries
-	// ECONNABORTED and EINTR in place and counts neither — so an epoll
-	// column reading 0 next to a nonzero io_uring column on the same
-	// refapp is partly this, not a difference in what the two engines
-	// suffered.
+	// ECONNABORTED (counted here) and EINTR (not counted: an interrupted
+	// syscall) in place — so an io_uring column can still read higher
+	// than an epoll one by its EINTR completions.
 	ErrorAcceptCancelled uint64
 	// ErrorAcceptOther is the share of ErrorCount from accept failures
 	// that are neither of the two above.
