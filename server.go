@@ -654,8 +654,8 @@ func (s *Server) shutdown(ctx context.Context) error {
 	// handled. On std, Engine.Shutdown was the drain and Listen returned when
 	// it closed the listener; on adaptive, Engine.Shutdown waited for its own
 	// Listen, unless ctx ended while an engine switch held the engine's lock:
-	// then it returns ctx's error, and Listen returns once that switch has
-	// let go of the lock (celeris#886 item 15). Otherwise Listen has
+	// then it returns ctx's error, and Listen returns at the latest once that
+	// switch has let go of the lock (celeris#886 item 15). Otherwise Listen has
 	// returned, or returns at once. Deadlock
 	// check: Listen waits for nothing that Shutdown holds or does after this
 	// point. The Start*Context watcher that runs this on a cancel waits here

@@ -1335,10 +1335,11 @@ jobs:
             exit 1
           fi
       # celeris#616: New decides the port both sub-engines serve on and holds
-      # it until the start engine has bound it in Listen. These tests take the
-      # port in that gap with a Go listener and with a bare socket, on each
-      # start engine, on 127.0.0.1 and on the default dual-stack wildcard, and
-      # beside the TIME_WAIT sockets an ordinary Go server leaves (where only
+      # it while Listen runs (it holds it beside the sub-engines' own sockets).
+      # These tests take the port in the gap between New and the bind in Listen,
+      # and in the gap of a paused sub-engine, with a Go listener and with a
+      # bare socket, on each start engine, on 127.0.0.1 and on the default
+      # dual-stack wildcard, and beside the TIME_WAIT sockets an ordinary Go server leaves (where only
       # a shared hold can be taken), and need the engine to start on the port
       # anyway, on the address net.Listen gives. The io_uring arms skip when
       # io_uring cannot be built, and the step above runs them without a
@@ -1366,9 +1367,10 @@ jobs:
           wild=$(grep -cE 'celeris616 wildcard: start=(epoll|iouring) addr=\[::\]:[1-9][0-9]* thieves=\[[^]]*\] refused=6/6 started=true v4=200 v6=200$' /tmp/c616.log || true)
           tw=$(grep -cE 'celeris616 time-wait: start=(epoll|iouring) form=[^ ]+ time_wait=[1-9][0-9]* exclusive_refused=true net_listen=([^ ]+) handed=\2 thief=(EADDRINUSE|-) started=true v4=200 v6=(200|0)$' /tmp/c616.log || true)
           twheld=$(grep -cE 'celeris616 time-wait: start=(epoll|iouring) form=(wildcard|0\.0\.0\.0|\[::\]) .* thief=EADDRINUSE started=true v4=200 v6=200$' /tmp/c616.log || true)
+          untilret=$(grep -cE 'celeris616 hold until Listen returns: start=(epoll|iouring) paused_refused=\[go-listener bare-socket\] workers=[1-9][0-9]* listening_after_resume=[1-9][0-9]* error_listener_recreate=0 freed_after_listen=\[go-listener bare-socket\] in=' /tmp/c616.log || true)
           kind=$(grep -cE 'celeris616 hold kind: state=(free-port .* SO_REUSEADDR=0 SO_REUSEPORT=[1-9]|time-wait .* SO_REUSEADDR=[1-9] SO_REUSEPORT=[1-9])$' /tmp/c616.log || true)
-          echo "celeris#616 tests: want $want, passed $passed, SKIP lines $skipped, New-to-Listen arms refused and started $gap (want 4), in-Listen arms refused $inlisten (want 4), wildcard arms 6/6 refused and dual-stack $wild (want 2), TIME_WAIT arms on net.Listen's address $tw (want 10) of which wildcard held $twheld (want 6), hold kinds $kind (want 2)"
-          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$gap" -ne 4 ] || [ "$inlisten" -ne 4 ] || [ "$wild" -ne 2 ] || [ "$tw" -ne 10 ] || [ "$twheld" -ne 6 ] || [ "$kind" -ne 2 ]; then
+          echo "celeris#616 tests: want $want, passed $passed, SKIP lines $skipped, New-to-Listen arms refused and started $gap (want 4), in-Listen arms refused $inlisten (want 4), wildcard arms 6/6 refused and dual-stack $wild (want 2), TIME_WAIT arms on net.Listen's address $tw (want 10) of which wildcard held $twheld (want 6), hold kinds $kind (want 2), hold-until-Listen-returns arms refused while paused and freed after Listen $untilret (want 2)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$gap" -ne 4 ] || [ "$inlisten" -ne 4 ] || [ "$wild" -ne 2 ] || [ "$tw" -ne 10 ] || [ "$twheld" -ne 6 ] || [ "$kind" -ne 2 ] || [ "$untilret" -ne 2 ]; then
             echo "expected all $want celeris#616 tests to PASS with no SKIP line, and every arm on both start"
             echo "engines to report a refused steal -- was one renamed or removed, or did an io_uring arm skip?"
             exit 1
