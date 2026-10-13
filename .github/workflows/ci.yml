@@ -113,8 +113,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: pipx run --spec zizmor==1.30.0 zizmor --color always .github/workflows
 
+  # The required check "Unit (root + middleware sub-modules)" is the `unit-gate`
+  # job below: it passes only when this job AND every root-package shard passed.
+  # This job keeps its id (`unit`) and its steps; only its display name changed,
+  # so the steps in-flight pull requests edit still apply. celeris#890.
   unit:
-    name: Unit (root + middleware sub-modules)
+    name: Unit steps (root + middleware sub-modules)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,10 +163,23 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)|/engine/iouring$')
-          # -timeout=1200s: the root package takes about 590 s under coverage (runs
-          # 38257771033 and 38280491235), so 1200 s keeps 2x headroom. Refs #890.
+          # celeris#890: the 41 slowest root-package tests (.github/root-test-shards.txt)
+          # run in the `unit-root-shard` jobs, one runner per shard. The guard fails
+          # when a listed name is not a test of the root package, is listed twice or
+          # is defined in another package too (-skip applies to every package below),
+          # or when a `shard:` matrix is not exactly the file's shards. Every root test NOT listed runs here.
+          .github/scripts/root-shards.sh check
+          skip=$(.github/scripts/root-shards.sh skip-regex)
+          # -timeout=540s: the tests that stay here took 179.5 s on the runner with the
+          # other packages running beside them (run 38348908017; 596.4 s for the whole
+          # package before the shards, run 38344043158), so 540 s keeps a margin of 3x.
+          # A new root test that is in no shard lands here: the margin is what absorbs
+          # it until it is listed in .github/root-test-shards.txt. Refs #890.
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=1200s -v $pkgs 2>&1 | tee /tmp/root.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=540s -skip "$skip" -v $pkgs 2>&1 | tee /tmp/root.log
+          # The shards' tests must not have run here (-skip applied), and the other
+          # tallies below still see every test this step is responsible for.
+          .github/scripts/root-shards.sh tally-rest /tmp/root.log
           # Allowed to skip in this step, each by its full name:
           #   * TestAdaptiveSettledRouteRetime592/iouring/*: the rig needs two io_uring
           #     workers and the runner's 8 MiB funds one; the step "celeris#592
@@ -1090,6 +1107,70 @@ jobs:
             echo "but the main thread left alive -- was one renamed or removed, did one skip or fail?"
             exit 1
           fi
+
+  # celeris#890: the root package's tests run one after another and took about
+  # 590 s of the Unit job's 21 minutes. The 41 slowest are listed in
+  # .github/root-test-shards.txt and run here, one shard per runner: a runner has
+  # one 8 MiB RLIMIT_MEMLOCK, which funds one io_uring ring, so shards in one job
+  # (or t.Parallel() on engine tests) would fight over it (celeris#938). The
+  # `unit` job runs every other root test through `go test -skip`.
+  #
+  # Same flags as the `unit` job's root step (-race, -count=1, -v, the dual-stack
+  # requirement). A shard is stricter than that step: every listed test must run
+  # and PASS by name, and no SKIP line is allowed at all (none of them skips on
+  # the runner today), because a skip is absent, not a pass.
+  #
+  # -timeout=660s: the shards took 214.7 s (a) and 225.5 s (b) on the runner (run
+  # 38348908017; 215.3 s and 220.5 s on a linux/arm64 container with 4 CPUs), so
+  # 660 s keeps a margin of 2.9x or more.
+  unit-root-shard:
+    name: Unit root shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every shard named in .github/root-test-shards.txt (the guard in the
+        # `unit` job and in test-coverage.yml fails when the two differ).
+        shard: [a, b]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2"
+      - name: Root package — shard tests (race, each must PASS by name)
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          run=$(.github/scripts/root-shards.sh run-regex "$SHARD")
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=660s -v -run "$run" . 2>&1 | tee /tmp/shard.log
+          .github/scripts/root-shards.sh tally-shard "$SHARD" /tmp/shard.log
+
+  # The required check. It carries the name the repository's ruleset requires and
+  # passes only when the `unit` job and every root-package shard passed: a
+  # skipped or cancelled job is not a pass. `if: always()` makes it run, and
+  # fail, when a job it needs failed or the run was cancelled; with the default
+  # condition (or `!cancelled()`) the gate would be SKIPPED then, and a skipped
+  # required check counts as passing, which a cancelled `unit` job never did.
+  unit-gate:
+    name: Unit (root + middleware sub-modules)
+    if: ${{ always() }}
+    needs: [unit, unit-root-shard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      UNIT_RESULT: ${{ needs.unit.result }}
+      SHARDS_RESULT: ${{ needs.unit-root-shard.result }}
+    steps:
+      - name: Every unit job passed
+        run: |
+          echo "unit steps: $UNIT_RESULT; root shards: $SHARDS_RESULT"
+          [ "$UNIT_RESULT" = success ] && [ "$SHARDS_RESULT" = success ]
 
   adaptive:
     name: Adaptive engine (./internal/adaptive/...)
