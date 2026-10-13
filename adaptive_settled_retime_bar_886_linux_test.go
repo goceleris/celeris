@@ -103,26 +103,43 @@ func TestCtlWorkerFreeIOUringBar592(t *testing.T) {
 // of checkTimeouts, or a Go release that prints a parked mutex differently,
 // would turn the assertion into one that can never fire.
 func TestClassifyLoopStack589(t *testing.T) {
-	const pinned = `goroutine 41 [sync.Mutex.Lock, 212 minutes]:
-sync.runtime_SemacquireMutex(0x0?, 0x0?, 0x0?)
-	runtime/sema.go:95 +0x28
-sync.(*Mutex).lockSlow(0x4000123456)
-	sync/mutex.go:149 +0x168
+	// Verbatim from a run (golang:1.27.1, linux/arm64; camp/logs/m-quiet.log and
+	// fixed-c628x-stack.log): the first goroutine found parked on a mutex with the
+	// celeris#593 TryLock reverted, and the first one found in the kernel wait.
+	const pinned = `goroutine 77 [sync.Mutex.Lock, locked to thread]:
+internal/sync.runtime_SemacquireMutex(0x76401763daa8?, 0x54?, 0x1aa?)
+	/usr/local/go/src/runtime/sema.go:95 +0x28
+internal/sync.(*Mutex).lockSlow(0x764017dce178)
+	/usr/local/go/src/internal/sync/mutex.go:149 +0x174
+internal/sync.(*Mutex).Lock(...)
+	/usr/local/go/src/internal/sync/mutex.go:70
 sync.(*Mutex).Lock(...)
-	sync/mutex.go:70
-github.com/goceleris/celeris/internal/engine/iouring.(*Worker).snapshotH1Deadlines(0x400011c000, 0x4000234000)
-	internal/engine/iouring/worker.go:6852 +0x70
-github.com/goceleris/celeris/internal/engine/iouring.(*Worker).checkTimeouts(0x400011c000)
-	internal/engine/iouring/worker.go:6790 +0x94
-github.com/goceleris/celeris/internal/engine/iouring.(*Worker).run(0x400011c000)
-	internal/engine/iouring/worker.go:1100 +0x2f4`
-	const idle = `goroutine 42 [syscall]:
-syscall.Syscall6(0x1aa, 0x5, 0x0, 0x1, 0x1, 0x0, 0x0)
-	syscall/syscall_linux.go:96 +0x20
-github.com/goceleris/celeris/internal/engine/iouring.(*Ring).SubmitAndWait(0x4000200000, 0x1)
-	internal/engine/iouring/ring.go:300 +0x48
-github.com/goceleris/celeris/internal/engine/iouring.(*Worker).run(0x400011d000)
-	internal/engine/iouring/worker.go:1100 +0x2f4`
+	/usr/local/go/src/sync/mutex.go:46
+github.com/goceleris/celeris/internal/engine/iouring.snapshotH1Deadlines(0x764017dd8b08)
+	/src/internal/engine/iouring/worker.go:6852 +0x90
+github.com/goceleris/celeris/internal/engine/iouring.(*Worker).checkTimeouts(0x7640175f2608)
+	/src/internal/engine/iouring/worker.go:6999 +0x3a4
+github.com/goceleris/celeris/internal/engine/iouring.(*Worker).run(0x7640175f2608, {0xdd3928, 0x764017628870})
+	/src/internal/engine/iouring/worker.go:1756 +0x1688
+github.com/goceleris/celeris/internal/engine/iouring.(*Engine).runWatched(0x0?, {0xdd3928?, 0x764017628870?}, 0x0?)
+	/src/internal/engine/iouring/worker_exit_848_linux.go:55 +0x58
+github.com/goceleris/celeris/internal/engine/iouring.(*Engine).Listen.func2()
+	/src/internal/engine/iouring/engine.go:421 +0x4c
+created by github.com/goceleris/celeris/internal/engine/iouring.(*Engine).Listen in goroutine 73
+	/src/internal/engine/iouring/engine.go:419 +0x820`
+	const idle = `goroutine 34 [syscall, locked to thread]:
+syscall.Syscall6(0x1aa, 0x7, 0x0, 0x1, 0x9, 0x36a96019b28, 0x18)
+	/usr/local/go/src/syscall/syscall_linux.go:96 +0x2c
+github.com/goceleris/celeris/internal/engine/iouring.(*Ring).SubmitAndWaitTimeout(0x36a960165a0, 0xffff61ef6230?)
+	/src/internal/engine/iouring/ring.go:358 +0x94
+github.com/goceleris/celeris/internal/engine/iouring.(*Worker).run(0x36a96012008, {0xdd1500, 0x36a95f24050})
+	/src/internal/engine/iouring/worker.go:1498 +0xdc8
+github.com/goceleris/celeris/internal/engine/iouring.(*Engine).runWatched(0x0?, {0xdd1500?, 0x36a95f24050?}, 0x0?)
+	/src/internal/engine/iouring/worker_exit_848_linux.go:55 +0x58
+github.com/goceleris/celeris/internal/engine/iouring.(*Engine).Listen.func2()
+	/src/internal/engine/iouring/engine.go:421 +0x4c
+created by github.com/goceleris/celeris/internal/engine/iouring.(*Engine).Listen in goroutine 9
+	/src/internal/engine/iouring/engine.go:419 +0x820`
 	for _, tc := range []struct {
 		name, stack, want string
 		parked            bool

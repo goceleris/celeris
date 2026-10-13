@@ -177,17 +177,18 @@ func envInt589(name string, def int) int {
 //     same run on the same box, not a number of milliseconds picked for a
 //     particular one.
 //
-// io_uring's latency is asserted as a FRACTION, not as the epoll ratio
-// (celeris#886 item 1): when this rig was written even the fully async control
-// pinned the io_uring worker ~30 % of wall time through the celeris#593 timeout
-// sweep (see the note below), a separate defect with its own fix, PR #604. The
-// settled arm used to PRINT that fraction and assert only state, so with the
-// celeris#593 TryLock put back to a blocking Lock the io_uring half still
-// passed (10/10 at 0.315-0.351 against 0.000-0.001 on the fixed tree). It now
-// fails when more than stall592IOUringMaxQueuedFrac of the post-promotion
-// /ping samples waited for a blocked Set, in the settled arm and in both
-// controls (assertCtlWorkerFree628: with the TryLock reverted they passed too,
-// at 0.324-0.337). The bar is provisional: see the constant.
+// io_uring is not judged on the epoll ratio (celeris#886 item 1): when this
+// rig was written even the fully async control pinned the io_uring worker
+// ~30 % of the samples through the celeris#593 timeout sweep (see the note
+// below), a separate defect with its own fix, PR #604. The settled arm used to
+// PRINT that and assert only state, so with the celeris#593 TryLock put back to
+// a blocking Lock the io_uring half still passed (10/10). It is judged on the
+// worker itself, not on a latency: ioUringPin592 fails when, while the /ping
+// probe sat unanswered for 100 ms, an event-loop goroutine was parked on a
+// mutex at half or more of the stack captures. That holds in the settled arm
+// and in both controls (assertCtlWorkerFree628: with the TryLock reverted they
+// passed the ratio too). No latency statistic of the probe can do this job, and
+// the const block below records the measurements that say so.
 //
 // The observable follows the two binding adversarial-review corrections on the
 // issue: the PRIMARY assertion is the dispatch STATE after the route has turned
@@ -366,30 +367,52 @@ const (
 	stall592QueuedNotice  = 0.05
 	stall592MinRefSamples = 2
 
-	// stall592IOUringMaxQueuedFrac is the io_uring settled arm's bar
-	// (celeris#886 item 1, from celeris#739 item 2): the fraction of the
-	// post-promotion /ping samples that waited for a blocked Set (over
-	// queuedBar589, D/2) may not exceed it. PROVISIONAL: the owner sets the
-	// final number.
+	// The io_uring arms' judgement (celeris#886 item 1, from celeris#739 item
+	// 2) is a statement about the worker, not about the probe's latency:
+	// ioUringPin592. It replaced a bar on the fraction of post-promotion /ping
+	// samples over D/2 (0.20, provisional), which a review of this change
+	// showed cannot separate the two worlds, and it is worth saying why, because
+	// every latency statistic fails the same way.
 	//
-	// What it separates, all arm64, golang:1.27, memlock unlimited, 10 runs
-	// each (lanes-20261009/ADTST/measure-886-1.sh, logs/m1-*): the fixed tree
-	// 0.000 (idle) with the worst sample 0.001 stalled over 5 ms; the
-	// celeris#593 TryLock reverted to a blocking Lock 0.315-0.351 (the number
-	// the item quotes, 0.327-0.340). For a pinned worker the queued and the
-	// stalled (over 5 ms) fractions are the same number, because a stalled
-	// sample waits ~D; the queued one is asserted because the 5 ms bar is the
-	// runner's (celeris#622). The other side of the bar is celeris#622's 0.145
-	// outlier, an epoll run on an overloaded box whose median proved the worker
-	// free; 0.20 sits 0.055 above that and 0.115 below the lowest pinned run.
-	// With eight busy loops competing for the container's CPUs (the median
-	// /ping rises from 0.03 to 1.9 ms) the fixed tree stays at queued 0.000
-	// (stalled over 5 ms up to 0.006) and the pinned worker at 0.327-0.347,
-	// ten runs each (logs/m1-load8-*). The control arms (which judge the same
-	// fraction, assertCtlWorkerFree628), eight busy loops, six runs each:
-	// negctrl_async fixed 0.000 (stalled up to 0.016), pinned 0.324-0.330;
-	// negctrl_learning fixed 0.000 (stalled up to 0.007), pinned 0.268-0.330
-	// (logs/m1-load8c-*, m1-load8l-*).
+	// Measured (arm64, golang:1.27, memlock unlimited, lanes-20261009/ADTST/
+	// camp/campaign*.sh, the whole latency series of every run kept in
+	// camp/logs and read by camp/analyse.py), the fixed tree against the
+	// celeris#593 TryLock reverted to a blocking Lock, 8-24 arms each:
+	//
+	//	load                              fixed: queued_frac / time share   pinned: queued_frac / time share
+	//	idle                              0.000 / 0.000                     0.315-0.343 / 0.893-0.903
+	//	celeris#628's (--cpus 4, 28       0.000-0.011 / 0.000-0.114         0.114-0.270 / 0.506-0.893
+	//	busy loops, 2 cold builds)
+	//	twice that (--cpus 2, 56 busy     0.008-0.158 / 0.061-0.448         0.098-0.353 / 0.301-0.812
+	//	loops, 3 cold builds)
+	//
+	// queued_frac is the sample fraction over D/2 (the old bar's statistic);
+	// the time share is the sum of those samples' latencies over the window,
+	// which does not under-read a pin the way the sample fraction does (the
+	// sampler is a closed loop, so a probe stuck behind a Set takes fewer
+	// samples). Neither separates once the box is starved: a free worker's
+	// samples reach 0.158 of the count and 0.448 of the window, above the
+	// lowest pinned runs under that load (0.098 and 0.301), and an epoll free worker under the
+	// same load reaches a time share of 0.514 (celeris#622's 0.145 sample
+	// fraction on epoll was not an outlier of one engine). The time spent in
+	// samples over 5 ms is worse: 0.42-0.86 of the window on the free fixed tree
+	// under the harsh load, against 0.84-0.92 pinned.
+	//
+	// What does separate them is where the worker is. A starved free worker is
+	// runnable or in the kernel wait; a pinned one is parked on the mutex that
+	// checkTimeouts blocks on. The probe takes the event-loop goroutines'
+	// stacks 100 ms into any unanswered /ping (stackTally589): over 115
+	// captures of the fixed tree under the harsh load (18 arms) none was parked
+	// on a mutex, and under the celeris#593 TryLock reverted it was at every
+	// capture of every arm (MUTANT_STACKS). So
+	// the arm fails at stall592PinMinCaptures parked captures that are at least
+	// half of all captures. The classifier is pinned on a verbatim goroutine
+	// dump (TestClassifyLoopStack589), and the pinned worker and the free one
+	// are the two controls the PR records.
+	//
+	// stall592MinPingSamples: a window with fewer samples than this cannot be
+	// judged and fails (the fixed tree took 76-950 samples, the pinned one
+	// 97-170): a probe that completed so few requests was waiting on the worker.
 	stall592MinPingSamples = 20
 	stall592PinMinCaptures = 3
 
