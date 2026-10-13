@@ -66,8 +66,12 @@ type Client struct {
 // Return contract:
 //   - non-nil error: the event was NOT delivered (closed, context cancelled,
 //     or write failed); the caller may retry on a new connection.
-//   - nil error in blocking mode (MaxQueueDepth = 0): the event was written
-//     to the underlying stream and flushed.
+//   - nil error in blocking mode (MaxQueueDepth = 0): the event was handed
+//     to the connection and flushed. On epoll, io_uring and adaptive over
+//     HTTP/1.1 that means the engine accepted the bytes for sending: a
+//     write after the engine has noticed a reset is dropped without an
+//     error, and the disconnect arrives through [Client.Context], not
+//     through Send.
 //   - nil error in queued mode (MaxQueueDepth > 0): the event was enqueued
 //     OR dropped silently per the [Config.OnSlowClient] policy; check
 //     [Client.DroppedEvents] to detect drops.
@@ -89,8 +93,10 @@ type Client struct {
 // is a copy: the event on the queue in queued mode, and the entry of a
 // [NewRingBuffer] replay store (celeris#732). A custom [ReplayStore] is
 // handed that copy in queued mode, but e as given in blocking mode; see
-// [ReplayStore.Append]. In queued mode the copy is made before the enqueue,
-// so a Send the slow-client policy drops pays its one allocation too.
+// [ReplayStore.Append]. In queued mode the copy is made once the event is
+// going to be queued: a Send that finds the queue full under the default
+// policy (no [Config.OnSlowClient]) drops the event without copying it, while
+// with OnSlowClient set the callback is handed the copy, as it can keep it.
 func (c *Client) Send(e Event) error {
 	if c.queue != nil {
 		return c.sendQueued(e)
@@ -141,6 +147,16 @@ func (c *Client) sendQueued(e Event) error {
 	}
 	if err := c.ctx.Err(); err != nil {
 		return err
+	}
+	// With the default policy a full queue drops the event, which nothing
+	// keeps, so a drop costs no copy (celeris#888). The check is a hint: a
+	// slot the drain frees right after it only makes this Send drop an
+	// event that would just have fit, as a Send that lost the race for
+	// that slot would. With OnSlowClient set the callback can keep e, so
+	// that case copies below.
+	if c.onSlowClient == nil && len(c.queue) == cap(c.queue) {
+		c.droppedEvents.Add(1)
+		return nil
 	}
 	// The queue keeps e until the drain writes it, after Send has returned
 	// and possibly after the sender's request has ended: keep a copy.
@@ -565,18 +581,15 @@ func New(config ...Config) celeris.HandlerFunc {
 				// stream is over. After Detach the native engines apply
 				// none of their configured timeouts to this conn
 				// (checkTimeouts honours only IdleDeadlineNs on Detached
-				// conns) and never resume parsing it, so without this a
-				// finished SSE conn stays open — holding its fd and
-				// connState — until the peer happens to close. It also
-				// narrows (one idle sweep, ~25 ms) the window in which a
-				// keep-alive reuse re-enters ProcessH1 on a Detached
-				// H1State whose cached Context this stream just released;
-				// it does NOT close that gap: ProcessH1 only short-circuits
-				// a Detached conn when WSDataDelivery is set (WebSocket),
-				// so bytes a client sends on an SSE conn while the stream
-				// is live are still parsed as a new request on the same
-				// cached stream/Context. That is a pre-existing H1-layer
-				// bug tracked separately from celeris#494.
+				// conns) and never serve another request on it, so without
+				// this a finished SSE conn stays open, holding its fd and
+				// connState, until the peer happens to close. This is not
+				// what protects the stream from bytes the peer sends on the
+				// conn while it is live, or after it: ProcessH1 closes a
+				// Detached conn that has no WebSocket sink with
+				// errConnectionClose instead of parsing those bytes as a
+				// new request on the cached stream/Context (celeris#497,
+				// internal/conn/h1.go).
 				// A 1 ns deadline makes the next idle sweep run closeConn:
 				// OnDetachClose fires our (idempotent, already spent)
 				// cancel and the engine sends FIN after the terminal chunk
