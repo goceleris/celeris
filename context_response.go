@@ -1581,7 +1581,7 @@ func (c *Context) Detach() (done func()) {
 	// Context, and a nil channel blocks for ever. An OnDetach (or
 	// StreamDetached) that panics never returns the done func, so the guard
 	// below closes ch then, and the release path records the request without
-	// a snapshot and releases the Context (#889 item 32).
+	// a snapshot and releases the Context (#889 item 33).
 	ch := make(chan struct{})
 	c.detachDone = ch
 	c.detached = true

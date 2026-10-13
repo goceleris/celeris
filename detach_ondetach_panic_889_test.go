@@ -11,7 +11,7 @@ import (
 // engine's OnDetach hook inside Context.Detach does not leave the Context and
 // a goroutine retained for ever. Detach had set c.detached but assigned
 // c.detachDone only after OnDetach, so recoverAndRelease started a goroutine
-// that received from a nil channel (#889 item 32).
+// that received from a nil channel (#889 item 33).
 func TestDetachOnDetachPanicReleasesTheContext889(t *testing.T) {
 	cases := []struct {
 		name string
