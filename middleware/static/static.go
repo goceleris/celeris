@@ -194,10 +194,12 @@ var serveOSHook func()
 // serveOSFile serves filePath under cleanRoot through Context.FileFromDir.
 // early is a stat of the path made just before.
 //
-// A conditional request is answered from early when it holds: a 304 sends no
-// body, so there is nothing for a replaced file to contradict, and it costs one
-// stat, as it always did (FileFromDir resolves symlinks twice and opens the
-// file). Every response that sends the file gets its Last-Modified, ETag and
+// A conditional request is answered from early when it holds and the path
+// resolves inside the root (resolvesInside): a 304 sends no body, so there is
+// nothing for a replaced file to contradict, and it costs one stat and one
+// Lstat per path element, where FileFromDir resolves symlinks twice and opens
+// the file. A path that leaves the root is not answered from its target's stat:
+// it goes to FileFromDir, which refuses it. Every response that sends the file gets its Last-Modified, ETag and
 // Cache-Control from the mtime and size of the file as it is opened: early
 // could describe another file than the one opened when the path is replaced in
 // between (celeris#846). So the Range and If-Range that File then decides are
