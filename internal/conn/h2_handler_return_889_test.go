@@ -405,3 +405,58 @@ func TestInlineHandlerGoexitAndPanicAreReported889(t *testing.T) {
 		})
 	}
 }
+
+// Concurrent pool handlers that return unclosed, some complete and some short
+// of their declared length, while the loop grants window and drains the
+// write queue: each stream ends with exactly one of END_STREAM (complete) and
+// RST_STREAM (short), with nothing after it, and the connection keeps no stream
+// and no buffered byte. Run with -race: the settle takes the stream's lock, the
+// shard's and the manager's, in the orders the loop's flushes take them
+// (celeris#889, RULE 10).
+func TestUnfinishedPoolHandlersWhileTheLoopFlushes889(t *testing.T) {
+	const streams, size = 40, 3000
+	var started atomic.Int32
+	h := &asyncHandler893{run: func(ctx context.Context, s *stream.Stream) error {
+		started.Add(1)
+		cl := size
+		if s.ID%4 == 3 { // every other stream is short of what it declares
+			cl = size + 1000
+		}
+		return streamed889(cl, size)(ctx, s)
+	}}
+	c := newH2Return889(t, h, H2Config{WriteTimeout: 20 * time.Second})
+	ids := make([]uint32, 0, streams)
+	for i := range streams {
+		ids = append(ids, uint32(2*i+1))
+	}
+	c.req("GET", []http2.Setting{{ID: http2.SettingInitialWindowSize, Val: 1000}}, ids...)
+	deadline := time.Now().Add(30 * time.Second)
+	for c.st.processor.PoolHandlersRunning() || started.Load() < streams {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d handlers started and the pool is still running: a deadlock", started.Load(), streams)
+		}
+		c.drain()
+		c.grant(1000, true, ids...)
+		time.Sleep(time.Millisecond)
+	}
+	c.drain()
+	for _, id := range ids {
+		w := c.stream(id)
+		short := id%4 == 3
+		switch {
+		case short && (w.ended || len(w.rst) != 1 || w.seq[len(w.seq)-1] != "RST_STREAM"):
+			t.Errorf("stream %d (short): ended=%v rst=%v %s, want one RST_STREAM as the last frame", id, w.ended, w.rst, w.summary())
+		case !short && (!w.ended || w.after != 0 || len(w.rst) != 0 || len(w.data) != size):
+			t.Errorf("stream %d (complete): ended=%v after=%d rst=%v data=%d %s, want END_STREAM last with %d bytes", id, w.ended, w.after, w.rst, len(w.data), w.summary(), size)
+		}
+	}
+	m := c.st.processor.GetManager()
+	if held := m.OutboundHeld(); held != 0 {
+		t.Errorf("the connection holds %d buffered bytes", held)
+	}
+	c.grant(1<<20, true, ids...)
+	c.drain()
+	if got := m.StreamCount(); got != 0 {
+		t.Errorf("the manager has %d stream(s)", got)
+	}
+}

@@ -33,6 +33,14 @@ import (
 //     and the Goexit is logged with its stack.
 // Each runs on a sync route (the event loop) and on an async one (the pool).
 
+// h2ReturnArms889 are the engines of these tests: the std engine is the model
+// (net/http ends a response when its handler returns, and x/net's server resets
+// a stream whose handler panicked or called runtime.Goexit with INTERNAL_ERROR),
+// the native engines are what the processor now does the same on.
+func h2ReturnArms889() []arm848 {
+	return append([]arm848{{"std", celeris.Std, nil, ""}}, arms848()[:2]...)
+}
+
 type h2Return889Rig struct {
 	s      *celeris.Server
 	addr   string
@@ -127,7 +135,7 @@ func (r *h2Return889Rig) get(path string) (body string, err error) {
 }
 
 func TestH2HandlerReturnWithoutClosingEndsTheStream889(t *testing.T) {
-	for _, a := range arms848()[:2] {
+	for _, a := range h2ReturnArms889() {
 		t.Run(a.name, func(t *testing.T) {
 			need848(t, a.eng)
 			r := startH2Return889(t, a.eng)
@@ -145,6 +153,9 @@ func TestH2HandlerReturnWithoutClosingEndsTheStream889(t *testing.T) {
 	}
 }
 
+// The std engine is not an arm here: net/http's server ends the stream with
+// END_STREAM after a body short of its declared length and leaves the client
+// to notice (x/net's server checks only for more bytes than declared).
 func TestH2HandlerShortOfItsContentLengthResetsTheStream889(t *testing.T) {
 	for _, a := range arms848()[:2] {
 		t.Run(a.name, func(t *testing.T) {
@@ -162,7 +173,7 @@ func TestH2HandlerShortOfItsContentLengthResetsTheStream889(t *testing.T) {
 }
 
 func TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889(t *testing.T) {
-	for _, a := range arms848()[:2] {
+	for _, a := range h2ReturnArms889() {
 		t.Run(a.name, func(t *testing.T) {
 			need848(t, a.eng)
 			r := startH2Return889(t, a.eng)
@@ -175,6 +186,9 @@ func TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889(t *testing.T) {
 			}
 			if got := r.goexit.Load(); got != 3 {
 				t.Fatalf("INJECTION: /aboom ran %d times, want 3", got)
+			}
+			if a.eng == celeris.Std {
+				return // net/http's own handling is the reference; its records are not ours
 			}
 			var recs int
 			for dl := time.Now().Add(3 * time.Second); time.Now().Before(dl); time.Sleep(10 * time.Millisecond) {
