@@ -701,7 +701,15 @@ func (l *Loop) run(ctx context.Context) {
 			// branch's checkTimeouts, a transplant, an h2 pass) may have
 			// closed it earlier in this batch, and acceptAll may have put a
 			// new conn on the number (celeris#885 item 18). Pad 0 skips the
-			// check.
+			// check: the descriptors that carry it (the wake eventfd, the
+			// timerfd and the listen socket, all matched by number above,
+			// before any generation is looked at, and the re-created listen
+			// socket) are not conns. A stale event of a conn that closed
+			// earlier in this batch can therefore be taken for one of them
+			// when its number has since been reissued to it (a sync-mode
+			// Detach creates the wake eventfd inside drainRead): the eventfd
+			// read, the sweep or the accept that follows is harmless, as
+			// drainDetachQueue runs after the batch regardless.
 			if pad != 0 && fd >= 0 && fd < len(l.conns) {
 				if cs := l.conns[fd]; cs != nil && cs.gen != pad {
 					continue
@@ -1008,7 +1016,13 @@ func (l *Loop) onPeerHalfClose(fd int) {
 	if mu != nil && cs.hijacked.Load() {
 		// The run loop read cs from its slot, and then the conn's handler
 		// hijacked it (celeris#668): the descriptor is closed and its number
-		// may be another file's. drainDetachQueue settles the rest.
+		// may be another file's. This is belt and braces: closeConn
+		// re-reads the slot under driverMu and re-validates ownership under
+		// the lock, and markClosing touches loop-thread fields only. What
+		// the return buys is that a hijacked conn is neither marked closing
+		// nor closed from a verdict read before the hijack
+		// (TestOnPeerHalfCloseLeavesAHijackedConnAlone885). drainDetachQueue
+		// settles the rest.
 		mu.Unlock()
 		return
 	}

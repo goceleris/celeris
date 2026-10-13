@@ -285,3 +285,41 @@ func TestOwedHalfCloseIsServedAtTheH2UpgradeHandBack885(t *testing.T) {
 		t.Errorf("celeris885: the closed upgrade conn is still on a list: h2Conns=%v dirtyHead=%p", l.h2Conns, l.dirtyHead)
 	}
 }
+
+// TestOnPeerHalfCloseLeavesAHijackedConnAlone885 pins the early return of
+// onPeerHalfClose for a conn whose handler hijacked it after the run loop read
+// the slot (celeris#668): the half-close is neither marked on it nor made into
+// a close, whether or not bytes are queued. The slot is left holding cs, the
+// state the loop thread sees when it read the slot just before hijackConn
+// cleared it. The return is defensive (closeConn re-validates ownership under
+// the lock), so this is a pin and not a failing-first test.
+func TestOnPeerHalfCloseLeavesAHijackedConnAlone885(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		queued bool
+	}{{"bytes queued", true}, {"nothing queued", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			l, cs, _ := halfCloseRig885(t)
+			if !tc.queued {
+				cs.writeBuf = cs.writeBuf[:0]
+			}
+			cs.hijacked.Store(true)
+			l.onPeerHalfClose(cs.fd)
+			if cs.peerClosed || cs.closeSince != 0 {
+				t.Errorf("celeris885: a hijacked conn was marked closing: peerClosed=%v closeSince=%d", cs.peerClosed, cs.closeSince)
+			}
+			if l.closeCount.Load() != 0 || cs.asyncClosed.Load() {
+				t.Errorf("celeris885: a hijacked conn was closed from a half-close read before the hijack: closeCount=%d asyncClosed=%v",
+					l.closeCount.Load(), cs.asyncClosed.Load())
+			}
+			if cs.halfCloseOwed {
+				t.Errorf("celeris885: a hijacked conn was owed a half-close")
+			}
+			// The lock was released on the way out.
+			if !cs.detachMu.TryLock() {
+				t.Fatalf("celeris885: onPeerHalfClose returned with detachMu held")
+			}
+			cs.detachMu.Unlock()
+		})
+	}
+}
