@@ -49,15 +49,6 @@ func ForceAsyncCancelProbe(answer AsyncCancelAnswer, reason string) (restore fun
 	}
 }
 
-// resetAsyncCancelProbeCache forgets the async-cancel-flags probe's cached
-// answer, so the next probeAsyncCancelFlagsCached (and so the next New)
-// probes again.
-func resetAsyncCancelProbeCache() {
-	asyncCancelMu.Lock()
-	defer asyncCancelMu.Unlock()
-	forgetAsyncCancelAnswerLocked()
-}
-
 // forgetAsyncCancelAnswerLocked clears the cache; asyncCancelMu is held.
 func forgetAsyncCancelAnswerLocked() {
 	asyncCancelKnown = false
