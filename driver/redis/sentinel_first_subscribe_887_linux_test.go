@@ -129,12 +129,12 @@ func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheDescriptorForgotten8
 	if still {
 		t.Fatal("fixture: the injected SUBSCRIBE failure never fired")
 	}
+	if sc.addr != b.Addr() {
+		t.Fatalf("connectSentinel accepted %s, whose first SUBSCRIBE was not sent (ErrUnknownFD: the loop forgot the conn before onClose stored closed), want the next sentinel, %s", sc.addr, b.Addr())
+	}
 	if c := first.Load(); c == nil {
 		t.Fatal("fixture: the before-bind hook did not see the first sentinel's conn")
 	} else {
 		waitFor(t, "the rejected sentinel's PubSub to release its conn", 5*time.Second, c.closed.Load)
-	}
-	if sc.addr != b.Addr() {
-		t.Fatalf("connectSentinel accepted %s, whose first SUBSCRIBE was not sent (ErrUnknownFD: the loop forgot the conn before onClose stored closed), want the next sentinel, %s", sc.addr, b.Addr())
 	}
 }
