@@ -31,6 +31,13 @@ import (
 // handler would delay the crash. Detecting a panic needs recover(), which is
 // not wanted here, so the report is not skipped for one.
 //
+// The defer also marks the worker exited, on a normal return as well:
+// PauseAccept counts an exited worker as closed (Worker.exited). A worker that
+// ended without returning has its SO_REUSEPORT listener closed there too
+// (reportWorkerExit), so a pause is not held up by it for its whole bound and a
+// dead listener does not go on taking a share of new connections that nothing
+// will accept.
+//
 // The defer runs once, when the worker goroutine ends: it costs nothing per
 // event-loop iteration and takes no lock.
 func (e *Engine) runWatched(ctx context.Context, w *Worker) {
@@ -39,16 +46,26 @@ func (e *Engine) runWatched(ctx context.Context, w *Worker) {
 		if !returned {
 			e.reportWorkerExit(w)
 		}
+		// After shutdown's own flag and notify on a normal return, and after
+		// the close below on an abnormal one; the notify is for a
+		// PauseAccept that checked in between.
+		w.exited.Store(true)
+		w.pause.Notify()
 	}()
 	w.run(ctx)
 	returned = true
 }
 
 // reportWorkerExit records, and logs at Error, a worker goroutine that ended
-// without returning. It runs on that goroutine, which owns liveConns, so the
-// count needs no synchronization.
+// without returning, and takes the worker's listener out of the SO_REUSEPORT
+// group (leaveGroupAfterExit). It runs on that goroutine, which owns
+// liveConns, so the count needs no synchronization. The log is written last: a
+// Logger that blocks must not hold up a PauseAccept.
 func (e *Engine) reportWorkerExit(w *Worker) {
 	e.abnormalWorkerExits.Add(1)
+	w.leaveGroupAfterExit()
+	w.exited.Store(true)
+	w.pause.Notify()
 	if w.logger == nil {
 		return
 	}
@@ -57,7 +74,7 @@ func (e *Engine) reportWorkerExit(w *Worker) {
 	// frame and the runtime.Goexit call are still on the stack. Exit path only.
 	w.logger.Error("io_uring worker goroutine ended without returning: "+
 		"a handler or callback on this worker goroutine called runtime.Goexit (t.FailNow, t.Fatal, t.SkipNow or a library that does), or a panic unwound it; "+
-		"the connections this worker owned will not be served again and this worker's SO_REUSEPORT listener will not accept; "+
+		"the connections this worker owned will not be served again and this worker's SO_REUSEPORT listener will not accept (it is closed now); "+
 		"synchronous (non-Async) handlers must not call runtime.Goexit (celeris#848)",
 		"engine", "io_uring",
 		"worker", w.id,

@@ -314,6 +314,24 @@ func (w *Worker) retainZCSendBufsAtShutdown() {
 			return
 		}
 	}
+	w.keepZCSendBufs(bufs)
+}
+
+// retainZCSendBufsAfterExit is retainZCSendBufsAtShutdown for a worker whose
+// goroutine ended without returning (celeris#848) and whose ring
+// leaveGroupAfterExit is about to close: it keeps every send buffer a SEND_ZC
+// may still read, without the enter and the CQ reads, which would handle again
+// the completions of the batch the run loop was in (its CQ head is a local of
+// run that the Goexit left unpublished). Worker thread only.
+func (w *Worker) retainZCSendBufsAfterExit() {
+	defer w.retractZCHolds()
+	if bufs := w.zcSendBufsOwed(); len(bufs) > 0 {
+		w.keepZCSendBufs(bufs)
+	}
+}
+
+// keepZCSendBufs moves bufs into zcRetained, counts them and logs once.
+func (w *Worker) keepZCSendBufs(bufs [][]byte) {
 	zcRetained.mu.Lock()
 	zcRetained.bufs = append(zcRetained.bufs, bufs...)
 	zcRetained.mu.Unlock()
