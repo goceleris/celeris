@@ -61,7 +61,7 @@ func ino890(fd int) uint64 {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return 0
 	}
-	return uint64(st.Ino)
+	return st.Ino
 }
 
 func open890(fd int) bool {
