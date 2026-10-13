@@ -1,7 +1,8 @@
 package sse
 
 import (
-	"math"
+	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -278,47 +279,60 @@ func TestSlowClientClose(t *testing.T) {
 	}
 }
 
-// TestSlowClientBlockPolicy verifies ClientPolicyBlock falls through to a blocking
-// queue send: the Sends cannot finish before the gate is released, because at
-// least one Send must wait on drain to free a slot.
+// TestSlowClientBlockPolicy verifies ClientPolicyBlock falls through to a
+// blocking queue send, and drops nothing. The gate opens gateDelay after the
+// first OnSlowClient call, which runs only when a Send finds the queue full.
+// Until the gate opens the drain writes nothing, so it and the queue take at
+// most 1+queueSize events, and the handler sends more than that: the queue
+// does fill (OnSlowClient runs), and the last Send cannot return before the
+// gate opens, so the Sends take at least gateDelay from that first call
+// (celeris#888 item 14: a clock the handler started later than the gate's
+// timer needed slack and still failed in CI, and a clock started before the
+// handler could pass without a Send ever blocking).
 func TestSlowClientBlockPolicy(t *testing.T) {
 	ctx, gs := newGatedContext(t)
 	const queueSize = 2
-	const total = 8
+	const total = 8 // more than the drain's one event plus queueSize
 	const gateDelay = 30 * time.Millisecond
 
-	// The gate opens gateDelay after gateStart, and no Send can finish
-	// blocking before it opens, so time measured from gateStart, taken before
-	// the gate's goroutine starts, is at least gateDelay however late the
-	// handler starts (celeris#888 item 14: a clock the handler started later
-	// than the gate's timer needed slack and still failed in CI).
-	gateStart := time.Now()
-	go func() {
-		time.Sleep(gateDelay)
-		gs.release()
-	}()
-
-	var blockedFor time.Duration
+	var once sync.Once
+	var gateStart, finished time.Time
+	var dropped uint64
 	handler := New(Config{
 		HeartbeatInterval: -1,
 		MaxQueueDepth:     queueSize,
 		OnSlowClient: func(_ *Client, _ Event) ClientPolicy {
+			once.Do(func() {
+				gateStart = time.Now()
+				go func() {
+					time.Sleep(gateDelay)
+					gs.release()
+				}()
+			})
 			return ClientPolicyBlock
 		},
 		Handler: func(client *Client) {
+			defer gs.release() // if OnSlowClient never ran, the handler's defer would join a parked drain
 			for range total {
 				if err := client.Send(Event{Data: "x"}); err != nil {
 					t.Errorf("Send under ClientPolicyBlock returned %v", err)
 				}
 			}
-			blockedFor = time.Since(gateStart)
+			finished = time.Now()
+			dropped = client.DroppedEvents()
 		},
 	})
 	if err := handler(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if blockedFor < gateDelay {
-		t.Errorf("ClientPolicyBlock: the Sends finished %v after the gate's timer started, before the %v gate opened — block path did not engage", blockedFor, gateDelay)
+	if gateStart.IsZero() {
+		t.Fatalf("the queue never filled, so OnSlowClient never ran")
+	}
+	if dropped != 0 {
+		t.Errorf("ClientPolicyBlock dropped %d events, want 0", dropped)
+	}
+	if d := finished.Sub(gateStart); d < gateDelay {
+		t.Errorf("ClientPolicyBlock: the Sends finished %v after the first full-queue Send, before the %v gate opened — block path did not engage", d, gateDelay)
 	}
 }
 
@@ -393,11 +407,7 @@ func TestSlowClientSendNonFullQueueAllocs(t *testing.T) {
 	}()
 	client := <-ready
 
-	const budget = 1.0
-	// The least of several single-call windows, not an average over 200 calls:
-	// a tick of the Date-header goroutine (14 mallocs) inside the average would
-	// add 0.07 allocations per call to a budget of one.
-	allocs := allocsPer888(budget, func() {
+	allocs := testing.AllocsPerRun(200, func() {
 		// Drain one slot first so the next Send is non-blocking.
 		select {
 		case <-client.queue:
@@ -409,6 +419,7 @@ func TestSlowClientSendNonFullQueueAllocs(t *testing.T) {
 	gs.release() // unblock the drain goroutine so handler defer can complete
 	<-handlerDone
 
+	const budget = 1.0
 	if allocs > budget {
 		t.Fatalf("Send queued path: %.1f allocs/op, budget %.1f", allocs, budget)
 	}
@@ -455,28 +466,6 @@ func dropFullQueue(t testing.TB, ctx *celeris.Context, gs *gatedStreamer, cfg Co
 // nothing).
 var dropEvent888 = Event{ID: "42", Event: "update", Data: "payload-payload-payload"}
 
-// allocWindows888 is how many single-call windows allocsPer888 tries at most.
-const allocWindows888 = 8
-
-// allocsPer888 is the fewest allocations per call of f that any of up to
-// allocWindows888 single-call windows sees, stopping at the first that is at
-// most limit. testing.AllocsPerRun counts the
-// whole process's mallocs, and internal/conn has a goroutine that allocates
-// 14 times once a second (its cached Date header), so one tick inside a
-// multi-run average reads as a fractional allocation per call. A tick lands in
-// at most one single-call window, so the least of several windows is the cost
-// of the call alone; a call that allocates in every window still reads as it.
-func allocsPer888(limit float64, f func()) float64 {
-	best := math.MaxFloat64
-	for range allocWindows888 {
-		best = min(best, testing.AllocsPerRun(1, f))
-		if best <= limit {
-			break
-		}
-	}
-	return best
-}
-
 // TestSlowClientDropPathAllocs888 pins that a queued Send the default
 // slow-client policy drops makes no allocation (celeris#888 item 21). The copy
 // that keeps the event past Send (celeris#732) is for an event that is
@@ -491,7 +480,7 @@ func TestSlowClientDropPathAllocs888(t *testing.T) {
 	var dropped, calls uint64
 	dropFullQueue(t, ctx, gs, Config{MaxQueueDepth: 4}, func(client *Client) {
 		before := client.DroppedEvents()
-		allocs = allocsPer888(0, func() {
+		allocs = testing.AllocsPerRun(200, func() {
 			calls++
 			if err := client.Send(dropEvent888); err != nil {
 				t.Errorf("Send to a full queue under the default policy: %v", err)
@@ -504,6 +493,39 @@ func TestSlowClientDropPathAllocs888(t *testing.T) {
 	}
 	if calls == 0 || dropped != calls {
 		t.Errorf("%d Sends to a full queue counted %d drops, want all of them", calls, dropped)
+	}
+}
+
+// TestSlowClientFullQueueErrorsBeatDrop888 pins the order of checks in
+// sendQueued: a Send to a closed or cancelled client returns its error even
+// when the queue is full, as the Send contract says, and does not count a drop.
+// The early drop of celeris#888 item 21 comes after both checks.
+func TestSlowClientFullQueueErrorsBeatDrop888(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		make func(client *Client)
+		want error
+	}{
+		{"cancelled", func(client *Client) { client.cancel() }, context.Canceled},
+		{"closed", func(client *Client) { client.queueClosed.Store(true) }, ErrClientClosed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, gs := newGatedContext(t)
+			var err error
+			var dropped uint64
+			dropFullQueue(t, ctx, gs, Config{MaxQueueDepth: 2}, func(client *Client) {
+				before := client.DroppedEvents()
+				tc.make(client)
+				err = client.Send(dropEvent888)
+				dropped = client.DroppedEvents() - before
+			})
+			if !errors.Is(err, tc.want) {
+				t.Errorf("Send to a %s client with a full queue returned %v, want %v", tc.name, err, tc.want)
+			}
+			if dropped != 0 {
+				t.Errorf("Send to a %s client with a full queue counted %d drops, want 0", tc.name, dropped)
+			}
+		})
 	}
 }
 
