@@ -99,3 +99,46 @@ func TestLiveSamplerPerEngineMetrics(t *testing.T) {
 		t.Errorf("second epoll ThroughputRPS = %v, want > 0", snapEpoll.ThroughputRPS)
 	}
 }
+
+// TestSampleCounterThatFellReadsZero886 is a neighbour of the per-bucket delta
+// (celeris#886 item 10): the request, accept and byte deltas were plain
+// subtractions while the error deltas saturate. A total that reads lower than
+// at the last sample (nothing in the engines does this; a wiring slip could)
+// gave a delta near 2^64 and a throughput of 1e19 requests per second, which
+// the controller would then act on. It must read as no traffic.
+func TestSampleCounterThatFellReadsZero886(t *testing.T) {
+	e := newMockEngine(engine.IOUring)
+	s := newLiveSampler(nil)
+	e.SetMetrics(engine.EngineMetrics{RequestCount: 100, AcceptCount: 10, BytesRead: 600, BytesWritten: 400})
+	s.Sample(e)
+	time.Sleep(2 * time.Millisecond)
+	e.SetMetrics(engine.EngineMetrics{RequestCount: 50, AcceptCount: 5, BytesRead: 300, BytesWritten: 200})
+	snap := s.Sample(e)
+	if snap.ThroughputRPS != 0 || snap.AcceptRate != 0 || snap.BytesPerReq != 0 || snap.ErrorRate != 0 {
+		t.Errorf("counters that fell read as rps=%v accept_rate=%v bytes_per_req=%v error_rate=%v, want all 0",
+			snap.ThroughputRPS, snap.AcceptRate, snap.BytesPerReq, snap.ErrorRate)
+	}
+}
+
+// TestSampleByteCounterThatFellReadsZeroBytesPerReq886 guards the byte delta
+// on its own. In TestSampleCounterThatFellReadsZero886 the request total falls
+// too, so BytesPerReq stays 0 through the deltaReqs > 0 gate whatever the byte
+// delta does. Here requests grow and only the bytes fall: a plain subtraction
+// gives a delta near 2^64, a BytesPerReq near 1.8e17 (far above
+// largePayloadBytes, which suppresses an io_uring switch), where the saturating
+// one reads 0.
+func TestSampleByteCounterThatFellReadsZeroBytesPerReq886(t *testing.T) {
+	e := newMockEngine(engine.IOUring)
+	s := newLiveSampler(nil)
+	e.SetMetrics(engine.EngineMetrics{RequestCount: 100, BytesRead: 600, BytesWritten: 400})
+	s.Sample(e)
+	time.Sleep(2 * time.Millisecond)
+	e.SetMetrics(engine.EngineMetrics{RequestCount: 200, BytesRead: 300, BytesWritten: 200})
+	snap := s.Sample(e)
+	if snap.BytesPerReq != 0 {
+		t.Errorf("bytes fell while requests grew: BytesPerReq = %v, want 0", snap.BytesPerReq)
+	}
+	if snap.ThroughputRPS <= 0 {
+		t.Errorf("ThroughputRPS = %v, want > 0 (the request counter grew)", snap.ThroughputRPS)
+	}
+}

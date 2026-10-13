@@ -269,7 +269,8 @@ func (c *controller) activeEngine() engine.Engine {
 }
 
 func (c *controller) logSwitch(from, to, reason string, cpw float64, snap TelemetrySnapshot) {
-	c.logger.Info("engine switch recommended",
+	args := make([]any, 0, 14+2*len(errorBucketNames))
+	args = append(args,
 		"from", from,
 		"to", to,
 		"reason", reason,
@@ -278,6 +279,16 @@ func (c *controller) logSwitch(from, to, reason string, cpw float64, snap Teleme
 		"error_rate", snap.ErrorRate,
 		"active_connections", snap.ActiveConnections,
 	)
+	// One attr per bucket that grew in the interval, so a revert can be
+	// attributed to a bucket after the fact (celeris#886). The attrs are not
+	// parts of a sum: error_rate leaves error_send_peer_gone out (revertErrors)
+	// and the line carries it all the same.
+	for i := range errorBucketNames {
+		if d := snap.ErrorDelta[i]; d != 0 {
+			args = append(args, errorBucketNames[i], d)
+		}
+	}
+	c.logger.Info("engine switch recommended", args...)
 }
 
 // recordSwitch updates controller state after a switch has been performed.
