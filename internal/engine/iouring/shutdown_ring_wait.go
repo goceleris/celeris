@@ -21,7 +21,8 @@ var shutdownRingWait = (*Ring).SubmitAndWaitTimeout
 // (io_cqring_wait: "if we can't even flush overflow, don't wait for more"),
 // and on 6.1 io_uring_enter hands it back only when the enter submitted
 // nothing ("return submitted ? submitted : ret"), where 6.2 and later flush
-// as the loop reaps and do not. Either way the drain reaps and waits again.
+// as the loop reaps and do not. Either way the drain reaps and waits again,
+// and so does Worker.run (ringWaitContinues, celeris#884).
 // EAGAIN is the kernel's "try again" (retryPending treats
 // the two alike). Any other error is the ring failing.
 func ringWaitRetryable(err error) bool {

@@ -181,6 +181,13 @@ func TestRunSurvivesARingWaitEBUSY884(t *testing.T) {
 				t.Errorf("%d client requests failed (%s) after the loop's wait answered EBUSY: the worker stopped serving",
 					res.errs, classes(res.byClass))
 			}
+			var retried uint64
+			for _, w := range e.workers {
+				retried += w.ringWaitRetries.Load()
+			}
+			if want := uint64(inj.total(-1)); retried != want {
+				t.Errorf("the workers counted %d retried waits, the injection answered %d", retried, want)
+			}
 			for i, w := range e.workers {
 				if w.exited.Load() {
 					t.Errorf("worker %d (index %d) stopped after EBUSY waits", w.id, i)
@@ -224,6 +231,11 @@ func TestRunStopsOnARingWaitFailure884(t *testing.T) {
 	}
 	if dead == nil {
 		t.Fatal("a worker whose ring wait failed with EIO went on: the loop retries errors that are not the full CQ ring's")
+	}
+	for _, w := range e.workers {
+		if n := w.ringWaitRetries.Load(); n != 0 {
+			t.Errorf("worker %d counted %d retried waits for an EIO, which is not retryable", w.id, n)
+		}
 	}
 	if dead != inj.chosen.Load() {
 		t.Errorf("worker %d stopped, but the EIO was answered to worker %d", dead.id, inj.chosen.Load().id)

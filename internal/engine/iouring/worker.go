@@ -740,6 +740,12 @@ type Worker struct {
 	// asking the kernel about a descriptor number that may now belong to
 	// something else. Written once before ready; read only after it.
 	listenAddr net.Addr
+
+	// ringWaitRetries counts the waits of the run loop that answered a
+	// retryable error (ringWaitContinues, celeris#884) and were retried. It
+	// is not a public metric: the errclass counters feed EngineMetrics.
+	// Declared last, cold, so that no field moves.
+	ringWaitRetries atomic.Uint64
 }
 
 // recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
@@ -7288,13 +7294,34 @@ func (w *Worker) stopDetachedProducers() {
 }
 
 // ringWaitContinues reports whether the loop may go on after the ring wait
-// of mode ended with err (nil when the wait succeeded): false means shut the
-// worker down.
+// of mode ended with err (nil when the wait succeeded); false means shut the
+// worker down. It is the one place the loop's four waits answer an error
+// (celeris#884 item 49).
+//
+// A retryable error (ringWaitRetryable: EBUSY, which 5.19 to 6.1 kernels
+// answer a wait when completions overflowed behind a full CQ ring cannot be
+// flushed, or EAGAIN) says the CQ ring has no room, not that the ring failed:
+// the SQEs the enter did not take stay pending (retryPending), and the loop's
+// own pass over the CQ ring after this returns is the reap that makes room.
+// The error is counted, and with nothing in the ring to reap the worker gives
+// the kernel a moment (cancelAccept's drain does the same) rather than enter
+// again at once. Any other error is the ring failing: the worker stops, and
+// closes what it owns.
 func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 	if h := ringWaitSeam; h != nil {
 		err = h(w, mode, err)
 	}
-	return err == nil
+	if err == nil {
+		return true
+	}
+	if !ringWaitRetryable(err) {
+		return false
+	}
+	w.ringWaitRetries.Add(1)
+	if h, t := w.ring.BeginCQ(); h == t {
+		time.Sleep(50 * time.Microsecond)
+	}
+	return true
 }
 
 func (w *Worker) shutdown() {
