@@ -347,6 +347,11 @@ func (l *Loop) endCarriedReplay(cs *connState, fd int, perr error) {
 // It also left pendingBytes at the sum of the replayed responses, which the
 // write hooks read as a backlog, and ignored a refused write.
 //
+// It stays a copy of drainRead's inline flush on purpose: one shared function
+// would put a call on the per-request path of every recv, and the copy runs
+// once per adoption (celeris#885 item 17 asks for the verdict and upgrade
+// blocks to be shared, which h1verdict.go does; this block is not one of them).
+//
 // Loop thread, on a conn fresh from attachAdoptedFD. cs.detachMu is released
 // before any close, which takes it again.
 func (l *Loop) flushCarriedReplay(cs *connState, fd int) {
