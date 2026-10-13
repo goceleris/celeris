@@ -13,7 +13,7 @@ Thank you for your interest in contributing to celeris!
 
 ### Prerequisites
 
-- Go 1.27.0+ — the `go` directive in `go.mod` is the single source of truth for the floor, and
+- Go 1.27.2+ — the `go` directive in `go.mod` is the single source of truth for the floor, and
   CI pins the same version. Quote it from there rather than restating it here, so the two
   cannot drift apart again.
 - [Mage](https://magefile.org) build tool: `go install github.com/magefile/mage@v1.17.2`, the version CI
