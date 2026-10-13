@@ -28,6 +28,19 @@ type pairResult struct {
 // is wrapped so that its first run holds.
 func runPair(t *testing.T, mw celeris.HandlerFunc, handlers []celeris.HandlerFunc, leaderHdrs, secondHdrs [][2]string) pairResult {
 	t.Helper()
+	return runPairReq(t, mw, handlers, reqSpec{method: "GET", hdrs: leaderHdrs}, reqSpec{method: "GET", hdrs: secondHdrs})
+}
+
+// reqSpec is one request of runPairReq.
+type reqSpec struct {
+	method string
+	hdrs   [][2]string
+	body   string
+}
+
+// runPairReq is runPair for requests of any method with a body.
+func runPairReq(t *testing.T, mw celeris.HandlerFunc, handlers []celeris.HandlerFunc, leaderReq, secondReq reqSpec) pairResult {
+	t.Helper()
 	entered, gate := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int32
 	last := handlers[len(handlers)-1]
@@ -51,12 +64,15 @@ func runPair(t *testing.T, mw celeris.HandlerFunc, handlers []celeris.HandlerFun
 	}
 	t.Cleanup(func() { testHookWaiterJoined = prev })
 
-	do := func(hdrs [][2]string) (*celeristest.ResponseRecorder, *celeris.Context) {
+	do := func(r reqSpec) (*celeristest.ResponseRecorder, *celeris.Context) {
 		opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
-		for _, h := range hdrs {
+		for _, h := range r.hdrs {
 			opts = append(opts, celeristest.WithHeader(h[0], h[1]))
 		}
-		c, rec := celeristest.NewContext("GET", "/doc", opts...)
+		if r.body != "" {
+			opts = append(opts, celeristest.WithBody([]byte(r.body)))
+		}
+		c, rec := celeristest.NewContext(r.method, "/doc", opts...)
 		_ = c.Next()
 		return rec, c
 	}
@@ -64,7 +80,7 @@ func runPair(t *testing.T, mw celeris.HandlerFunc, handlers []celeris.HandlerFun
 	var ctxs [2]*celeris.Context
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() { defer wg.Done(); res.leader, ctxs[0] = do(leaderHdrs) }()
+	go func() { defer wg.Done(); res.leader, ctxs[0] = do(leaderReq) }()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -72,7 +88,7 @@ func runPair(t *testing.T, mw celeris.HandlerFunc, handlers []celeris.HandlerFun
 	}
 	secondDone := make(chan struct{})
 	wg.Add(1)
-	go func() { defer wg.Done(); defer close(secondDone); res.second, ctxs[1] = do(secondHdrs) }()
+	go func() { defer wg.Done(); defer close(secondDone); res.second, ctxs[1] = do(secondReq) }()
 	select {
 	case <-joined:
 		res.joined = true
@@ -96,12 +112,12 @@ func runPair(t *testing.T, mw celeris.HandlerFunc, handlers []celeris.HandlerFun
 const reprBody = "the full representation of /doc"
 
 // negotiating answers with a representation chosen by Accept-Encoding, as
-// compress does: "gzip:"-prefixed with Content-Encoding: gzip when the
+// compress does (the token is matched without regard to case): "gzip:"-prefixed with Content-Encoding: gzip when the
 // request accepts gzip, the identity body otherwise, and Vary:
 // Accept-Encoding on both.
 func negotiating(c *celeris.Context) error {
 	c.AddHeader("vary", "Accept-Encoding")
-	if strings.Contains(c.Header("accept-encoding"), "gzip") {
+	if strings.Contains(strings.ToLower(c.Header("accept-encoding")), "gzip") {
 		c.SetHeader("content-encoding", "gzip")
 		return c.Blob(200, "text/plain", []byte("gzip:"+reprBody))
 	}

@@ -22,10 +22,24 @@ import (
 // goroutine.
 var ErrLeaderPanicked = errors.New("sf: the coalesced call's leader panicked")
 
-// Call is a single in-flight call for a key. Followers block on wg; the
-// leader populates Result/Err before calling wg.Done.
+// ErrLeaderCanceled is what the followers of a call get when the leader's fn
+// failed because the leader's own request context ended (its client went
+// away, its deadline passed): the error says nothing about the key, and the
+// followers' clients may well be there. A follower that gets it should run
+// its own producer, as it does on [ErrLeaderPanicked] (celeris#888 item 26).
+var ErrLeaderCanceled = errors.New("sf: the coalesced call's leader was canceled")
+
+// Call is a single in-flight call for a key. Followers wait on done; the
+// leader populates Result/Err before publishing.
 type Call[T any] struct {
-	wg sync.WaitGroup
+	// done is the call's one done channel, closed when the result is
+	// published (every publish site: the error path, the success path and
+	// the leader's panic defer). It is made lazily, by the first follower
+	// that has to wait, with a compare-and-swap; the leader's publish swaps
+	// in closedSignal and closes what a follower had put there. A follower
+	// that finds closedSignal needs neither a channel nor a goroutine. It
+	// is nil until the first follower or the publish.
+	done atomic.Pointer[signal]
 	// waiters counts concurrent followers that joined the leader's
 	// in-flight state. Followers increment under the group mutex before
 	// releasing; leader reads under the same mutex at delete time. A
@@ -44,6 +58,55 @@ type Call[T any] struct {
 	replaced bool
 	Result   T
 	Err      error
+}
+
+// signal holds a call's done channel.
+type signal struct{ ch chan struct{} }
+
+// closedSignal is the shared, already closed signal a published call holds.
+var closedSignal = func() *signal {
+	s := &signal{ch: make(chan struct{})}
+	close(s.ch)
+	return s
+}()
+
+// publish releases the call's followers: the result and the error are final.
+func (c *Call[T]) publish() {
+	if s := c.done.Swap(closedSignal); s != nil && s != closedSignal {
+		close(s.ch)
+	}
+}
+
+// wait waits for the call to be published, or for ctx to end, whichever comes
+// first, and returns ctx's error in the second case. A call that is already
+// published when wait looks is taken whatever ctx says. When the publish and
+// the end of ctx both happen before the select runs, either may win (the
+// select picks at random): a follower whose context has ended can get ctx's
+// error for a call that was published. A ctx without a Done channel waits
+// for the leader.
+func (c *Call[T]) wait(ctx context.Context) error {
+	s := c.done.Load()
+	if s == closedSignal {
+		return nil
+	}
+	if s == nil {
+		n := &signal{ch: make(chan struct{})}
+		if c.done.CompareAndSwap(nil, n) {
+			s = n
+		} else {
+			s = c.done.Load()
+		}
+	}
+	if ctx == nil || ctx.Done() == nil {
+		<-s.ch
+		return nil
+	}
+	select {
+	case <-s.ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Group coalesces concurrent calls keyed by string. The leader runs the
@@ -74,7 +137,10 @@ func New[T any]() *Group[T] {
 // Do runs fn for the first caller of a given key and returns its result
 // to every caller. The bool second return is true for the leader (the
 // caller that actually ran fn) and false for followers. The leader gets
-// fn's error itself; followers get it as [handoff.Error] returns it.
+// fn's error itself; followers get it as [handoff.Error] returns it, except
+// that when the leader's own ctx ended and fn's error says so (it is, or
+// wraps, ctx's error) the followers get [ErrLeaderCanceled] instead: that
+// error is the leader's client's, not the key's.
 //
 // Once fn has returned, its result is published and the followers are
 // released. Then the leader runs then (when not nil) with that result while
@@ -107,7 +173,7 @@ func (g *Group[T]) Do(ctx context.Context, key string, fn func() (T, time.Durati
 			TestHookFollowerJoined()
 		}
 		g.mu.Unlock()
-		if err := wait(ctx, &c.wg); err != nil {
+		if err := c.wait(ctx); err != nil {
 			var zero T
 			return zero, false, err
 		}
@@ -127,13 +193,13 @@ func (g *Group[T]) Do(ctx context.Context, key string, fn func() (T, time.Durati
 	c.Err = nil
 	var zero T
 	c.Result = zero
-	c.wg.Add(1)
+	c.done.Store(nil)
 	g.calls[key] = c
 	g.mu.Unlock()
 
 	// release runs on every way out of the leader, a panic in fn or then
 	// included: without it a panic left the key's call in the map and its
-	// followers in wg.Wait for good, and every later caller for the key
+	// followers waiting for good, and every later caller for the key
 	// joined them (celeris#921).
 	published, finished := false, false
 	defer func() {
@@ -146,7 +212,7 @@ func (g *Group[T]) Do(ctx context.Context, key string, fn func() (T, time.Durati
 		if !published {
 			c.Result = zero
 			c.Err = ErrLeaderPanicked
-			c.wg.Done()
+			c.publish()
 		}
 		// Never pooled: a follower may still read it.
 	}()
@@ -164,10 +230,16 @@ func (g *Group[T]) Do(ctx context.Context, key string, fn func() (T, time.Durati
 		g.mu.Unlock()
 		c.Result = result
 		if numWaiters > 0 {
-			c.Err = handoff.Error(err)
+			if canceledBy(ctx, err) {
+				// The leader's own context ended and fn says so: that is
+				// not the followers' error.
+				c.Err = ErrLeaderCanceled
+			} else {
+				c.Err = handoff.Error(err)
+			}
 		}
 		published, finished = true, true
-		c.wg.Done()
+		c.publish()
 		if numWaiters == 0 {
 			c.Result = zero
 			c.Err = nil
@@ -180,14 +252,14 @@ func (g *Group[T]) Do(ctx context.Context, key string, fn func() (T, time.Durati
 	}
 
 	// Publish before then runs: a follower that joins from here on reads
-	// Result/Err after wg.Done, so they are populated whatever the waiter
-	// count is now.
+	// Result/Err after the publish, so they are populated whatever the
+	// waiter count is now.
 	c.Result = result
 	if fresh > 0 {
 		c.expiresAt.Store(int64(time.Since(clockBase) + fresh))
 	}
 	published = true
-	c.wg.Done()
+	c.publish()
 
 	if then != nil {
 		then(result, err)
@@ -212,6 +284,16 @@ func (g *Group[T]) Do(ctx context.Context, key string, fn func() (T, time.Durati
 	return result, true, err
 }
 
+// canceledBy reports whether err says that ctx, the leader's own context,
+// ended: ctx is done and err is (or wraps) the error it ended with.
+func canceledBy(ctx context.Context, err error) bool {
+	if ctx == nil {
+		return false
+	}
+	cerr := ctx.Err()
+	return cerr != nil && errors.Is(err, cerr)
+}
+
 // release removes c from the map under key, unless a newer call already
 // replaced it there (see expired). The caller holds g.mu.
 func (g *Group[T]) release(key string, c *Call[T]) {
@@ -230,23 +312,3 @@ func (c *Call[T]) expired() bool {
 // clockBase is the origin of expiresAt: time.Since reads the monotonic clock,
 // which a wall-clock step does not move.
 var clockBase = time.Now()
-
-// wait waits for wg, or for ctx to end, whichever comes first, and returns
-// ctx's error in the second case.
-func wait(ctx context.Context, wg *sync.WaitGroup) error {
-	if ctx == nil || ctx.Done() == nil {
-		wg.Wait()
-		return nil
-	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
