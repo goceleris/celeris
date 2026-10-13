@@ -48,7 +48,7 @@ import (
 // or a zero linger) and whose standby was not freshly built.
 //
 // Engine.Metrics() does not wait behind it: it reads the sub-engine slots
-// under switchMu, which performSwitch takes only for the short blocks that
+// under slotsMu, which performSwitch takes only for the short blocks that
 // publish them and never across this wait (it took about 110 ms during a
 // 150 ms-late resume while it read them under e.mu, celeris#886). Releasing
 // e.mu for the wait itself is a larger change to performSwitch's locking, left
@@ -316,7 +316,7 @@ func (e *Engine) watchIncomingListener(incoming, outgoing engine.Engine, freshly
 // register or unregister is not stalled behind it; nothing the incoming
 // engine's loops need to re-create a listener takes either lock. Shutdown and
 // the next switch do wait for e.mu, for up to the bound (see the top of this
-// file). Metrics() does not: it takes switchMu, which is free across the wait.
+// file). Metrics() does not: it takes slotsMu, which is free across the wait.
 func (e *Engine) awaitIncomingListener(w *listenWatch) {
 	if w == nil {
 		return
