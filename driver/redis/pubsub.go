@@ -142,6 +142,16 @@ func (c *Client) newPubSub(ctx context.Context) (*PubSub, error) {
 		backoff:   async.NewBackoff(50*time.Millisecond, 5*time.Second),
 	}
 	ps.bindConn(conn)
+	// The conn may have closed while the pool was handing it out, before the
+	// close hook was set above (the loop's teardown runs the hook once, and a
+	// conn with no hook does not keep it for later): the hook would never
+	// fire and no reconnect would start, so the control calls would return
+	// ErrPubSubConnDown for ever (celeris#887 item 14). conn.closed is stored
+	// before the hook runs, so a close after this check reaches the hook, and
+	// one before it is seen here; onConnDrop ignores the second of two drops.
+	if conn.closed.Load() {
+		ps.onConnDrop(nil)
+	}
 	return ps, nil
 }
 
