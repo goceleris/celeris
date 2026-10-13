@@ -3,13 +3,15 @@
 package redis
 
 // celeris#887 item 12, the in-repo caller: connectSentinel treats an error of
-// its first Subscribe as "try the next sentinel". Since Client.Subscribe
-// returns the PubSub (not ErrPubSubConnDown) when the conn is found down on
-// the first SUBSCRIBE, connectSentinel must look at the PubSub itself, or it
-// accepts a sentinel whose conn is down and whose reconnect loop retries that
-// one address for ever.
+// its first SUBSCRIBE as "try the next sentinel". Client.Subscribe returns the
+// PubSub (not ErrPubSubConnDown) when the conn is found down on the first
+// SUBSCRIBE, and no look at the conn afterwards can tell every such case from
+// a live conn, so connectSentinel makes the first SUBSCRIBE itself (newPubSub
+// and PubSub.Subscribe) and decides from that error. A sentinel it accepted
+// with a conn down would have its reconnect loop retry that one address for
+// ever while watchFailover waits.
 //
-// The test sets testHookBeforeBind, so it must not run in parallel with
+// The tests set testHookBeforeBind, so they must not run in parallel with
 // another test that builds a PubSub.
 
 import (
@@ -107,7 +109,13 @@ func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheDescriptorForgotten8
 		DialTimeout:   2 * time.Second,
 		Engine:        gateServer{gateProvider{EventLoopProvider: prov, g: g}},
 	}}
+	// The conn of the first sentinel's PubSub, to see that the rejected
+	// PubSub is closed and does not keep its conn (and a reconnect loop).
+	var first atomic.Pointer[redisConn]
+	setBeforeBindHook(func(c *redisConn) { first.CompareAndSwap(nil, c) })
+	t.Cleanup(func() { testHookBeforeBind.Store(nil) })
 	sc, err := s.connectSentinel()
+	testHookBeforeBind.Store(nil)
 	if err != nil {
 		t.Fatalf("connectSentinel: %v", err)
 	}
@@ -120,6 +128,11 @@ func TestConnectSentinelMovesOnWhenTheFirstSubscribeFindsTheDescriptorForgotten8
 	g.mu.Unlock()
 	if still {
 		t.Fatal("fixture: the injected SUBSCRIBE failure never fired")
+	}
+	if c := first.Load(); c == nil {
+		t.Fatal("fixture: the before-bind hook did not see the first sentinel's conn")
+	} else {
+		waitFor(t, "the rejected sentinel's PubSub to release its conn", 5*time.Second, c.closed.Load)
 	}
 	if sc.addr != b.Addr() {
 		t.Fatalf("connectSentinel accepted %s, whose first SUBSCRIBE was not sent (ErrUnknownFD: the loop forgot the conn before onClose stored closed), want the next sentinel, %s", sc.addr, b.Addr())

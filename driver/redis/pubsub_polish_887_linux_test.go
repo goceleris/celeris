@@ -139,8 +139,8 @@ func TestConstructorKeepsThePubSubWhenTheFirstControlCallFindsTheConnDown887(t *
 
 // (item 12, guard) Only ErrPubSubConnDown is kept: any other error of the
 // first control call means the command was not sent and nothing replays it, so
-// the constructor closes the PubSub and returns (nil, err), as before.
-// ErrQueueFull on a live conn is such an error. This passes on main as well;
+// the constructor closes the PubSub (its conn is released) and returns
+// (nil, err), as before. ErrQueueFull on a live conn is such an error. This passes on main as well;
 // the mutant whose firstControl keeps the PubSub on every error is its
 // control.
 func TestConstructorClosesThePubSubOnAnyOtherFirstControlError887(t *testing.T) {
@@ -165,13 +165,23 @@ func TestConstructorClosesThePubSubOnAnyOtherFirstControlError887(t *testing.T) 
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			r.gate.armFailWith(hasCmd(tc.verb), ErrQueueFull)
+			// The conn the constructor built, to see that it is released.
+			var built atomic.Pointer[redisConn]
+			setBeforeBindHook(func(c *redisConn) { built.CompareAndSwap(nil, c) })
+			t.Cleanup(func() { testHookBeforeBind.Store(nil) })
 			ps, err := tc.open(r, ctx)
+			testHookBeforeBind.Store(nil)
 			if ps != nil {
 				t.Cleanup(func() { closePubSub(t, ps) })
 			}
 			if ps != nil || !errors.Is(err, ErrQueueFull) {
 				t.Fatalf("%s whose first control call failed with ErrQueueFull returned (%v, %v), want (nil, ErrQueueFull)", tc.name, ps, err)
 			}
+			c := built.Load()
+			if c == nil {
+				t.Fatal("fixture: the before-bind hook did not see the conn")
+			}
+			waitFor(t, "the constructor to release the conn of the PubSub it closed", 5*time.Second, c.closed.Load)
 		})
 	}
 }
