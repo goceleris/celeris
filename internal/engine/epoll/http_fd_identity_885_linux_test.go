@@ -104,15 +104,25 @@ func adoptedPair885(t *testing.T, l *Loop) (fd, peer int, cs *connState) {
 	return fd, peer, cs
 }
 
-func wantTagged885(t *testing.T, site string, ev unix.EpollEvent, ok bool) int32 {
+// wantTagged885 checks that the event the kernel handed back for a site
+// carries the conn's generation: tagged, and the one the connState keeps.
+func wantTagged885(t *testing.T, l *Loop, site string, ev unix.EpollEvent, ok bool) {
 	t.Helper()
 	if !ok {
 		t.Fatalf("%s: the kernel reported no event for the conn", site)
 	}
 	if !httpTagged885(ev.Pad) {
 		t.Errorf("%s: the event the kernel hands back has Pad=%#x; an HTTP conn's events must carry its generation (bit 31 set)", site, uint32(ev.Pad))
+		return
 	}
-	return ev.Pad
+	cs := slotOf885(l, int(ev.Fd))
+	if cs == nil || cs.gen != uint32(ev.Pad) {
+		var got uint32
+		if cs != nil {
+			got = cs.gen
+		}
+		t.Errorf("%s: the event carries generation %#x, the conn's is %#x", site, uint32(ev.Pad), got)
+	}
 }
 
 // TestHTTPEventsCarryAGeneration885: every site that registers or modifies an
@@ -125,7 +135,7 @@ func TestHTTPEventsCarryAGeneration885(t *testing.T) {
 		l.async = true
 		fd, _, _ := adoptedPair885(t, l)
 		ev, ok := eventFor885(t, l, fd, time.Second)
-		wantTagged885(t, "attachAdoptedFD's EPOLL_CTL_ADD", ev, ok)
+		wantTagged885(t, l, "attachAdoptedFD's EPOLL_CTL_ADD", ev, ok)
 	})
 
 	t.Run("acceptAll ADD", func(t *testing.T) {
@@ -171,7 +181,7 @@ func TestHTTPEventsCarryAGeneration885(t *testing.T) {
 			t.Fatalf("write: %v", err)
 		}
 		ev, ok := eventFor885(t, l, fd, time.Second)
-		wantTagged885(t, "acceptAll's EPOLL_CTL_ADD", ev, ok)
+		wantTagged885(t, l, "acceptAll's EPOLL_CTL_ADD", ev, ok)
 	})
 
 	t.Run("modEpollOut arm and disarm", func(t *testing.T) {
@@ -194,12 +204,12 @@ func TestHTTPEventsCarryAGeneration885(t *testing.T) {
 				if ok && ev.Events&unix.EPOLLOUT == 0 {
 					t.Fatalf("the arming MOD reported %#x, want EPOLLOUT in it", ev.Events)
 				}
-				wantTagged885(t, "armEpollOut's EPOLL_CTL_MOD", ev, ok)
+				wantTagged885(t, l, "armEpollOut's EPOLL_CTL_MOD", ev, ok)
 				// Disarm: the byte the peer wrote is still unread, so the MOD
 				// reports EPOLLIN at once.
 				l.disarmEpollOut(cs)
 				ev, ok = eventFor885(t, l, fd, time.Second)
-				wantTagged885(t, "disarmEpollOut's EPOLL_CTL_MOD", ev, ok)
+				wantTagged885(t, l, "disarmEpollOut's EPOLL_CTL_MOD", ev, ok)
 			})
 		}
 	})
@@ -222,7 +232,7 @@ func TestHTTPEventsCarryAGeneration885(t *testing.T) {
 		drainEvents885(l)
 		_ = unix.Close(peer)
 		ev, ok := eventFor885(t, l, fd, time.Second)
-		wantTagged885(t, "drainDetachQueue's pause EPOLL_CTL_MOD", ev, ok)
+		wantTagged885(t, l, "drainDetachQueue's pause EPOLL_CTL_MOD", ev, ok)
 
 		cs.recvPauseDesired.Store(false)
 		l.enqueueDetach(cs)
@@ -231,7 +241,7 @@ func TestHTTPEventsCarryAGeneration885(t *testing.T) {
 			t.Fatal("drainDetachQueue did not apply the resume")
 		}
 		ev, ok = eventFor885(t, l, fd, time.Second)
-		wantTagged885(t, "drainDetachQueue's resume EPOLL_CTL_MOD", ev, ok)
+		wantTagged885(t, l, "drainDetachQueue's resume EPOLL_CTL_MOD", ev, ok)
 	})
 
 	// drainRead's inline pause: a detached conn whose middleware asked for a
@@ -257,7 +267,7 @@ func TestHTTPEventsCarryAGeneration885(t *testing.T) {
 		drainEvents885(l)
 		_ = unix.Close(peer)
 		ev, ok := eventFor885(t, l, fd, time.Second)
-		wantTagged885(t, "drainRead's pause EPOLL_CTL_MOD", ev, ok)
+		wantTagged885(t, l, "drainRead's pause EPOLL_CTL_MOD", ev, ok)
 	})
 }
 
@@ -461,5 +471,69 @@ func TestHTTPServedWhileADriverConnIsRegistered885(t *testing.T) {
 		if n < 12 || string(resp[:12]) != "HTTP/1.1 200" {
 			t.Fatalf("request %d on the HTTP conn, with a driver conn registered on its loop: read %q, %v", i, resp[:n], err)
 		}
+	}
+}
+
+// TestHTTPGenerationsAreTaggedAndWrap885 pins nextHTTPGen: bit 31 set, never
+// 0, never a driver's, one per call, and a wrap of the 31-bit count that keeps
+// the bit.
+func TestHTTPGenerationsAreTaggedAndWrap885(t *testing.T) {
+	l := newLedgerLoop(t)
+	seen := map[uint32]bool{}
+	for range 1000 {
+		g := l.nextHTTPGen()
+		if !httpTagged885(int32(g)) || g == 0 || isDriverGen(g) || seen[g] {
+			t.Fatalf("nextHTTPGen returned %#x (tagged=%v driver=%v repeated=%v)", g, httpTagged885(int32(g)), isDriverGen(g), seen[g])
+		}
+		seen[g] = true
+	}
+	l.httpGen = maxDriverGen
+	if g := l.nextHTTPGen(); g != httpGenBit {
+		t.Errorf("the generation after the wrap is %#x, want %#x", g, httpGenBit)
+	}
+	if g := l.nextHTTPGen(); g != httpGenBit|1 {
+		t.Errorf("the generation after that is %#x, want %#x", g, httpGenBit|1)
+	}
+}
+
+// TestDispatchDriverLeavesHTTPGenerationsToTheHTTPPath885: an HTTP conn's
+// generation is not a driver registration that has ended. With no driver conn
+// registered the gate does not look it up; with one registered the event is
+// looked up and, its number being nobody's, handed back to the HTTP path; on a
+// driver conn's number it is stale and dropped.
+func TestDispatchDriverLeavesHTTPGenerationsToTheHTTPPath885(t *testing.T) {
+	eng, stop := newTestEngine(t)
+	t.Cleanup(stop)
+	wl := eng.WorkerLoop(0)
+	l := eng.loops[0]
+	tagged := httpGenBit | 7
+	hangup := uint32(unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLHUP | unix.EPOLLERR)
+
+	if l.hasDriverConns.Load() {
+		t.Fatal("premise: a driver conn is registered")
+	}
+	if l.driverCandidate(tagged) {
+		t.Error("an HTTP generation is looked up as a driver's with no driver conn registered")
+	}
+
+	x, xPeer := socketpairNonblocking(t)
+	defer func() { _ = unix.Close(x); _ = unix.Close(xPeer) }()
+	var closed atomic.Int32
+	if err := wl.RegisterConn(x, func([]byte) {}, func(error) { closed.Add(1) }); err != nil {
+		t.Fatalf("RegisterConn: %v", err)
+	}
+	defer func() { _ = wl.UnregisterConn(x) }()
+
+	if !l.driverCandidate(tagged) {
+		t.Error("an HTTP generation is not looked up while a driver conn is registered")
+	}
+	if l.dispatchDriver(x+1000, tagged, hangup) {
+		t.Error("an HTTP generation on a number no driver conn has was taken for a driver's: its event would be dropped")
+	}
+	if !l.dispatchDriver(x, tagged, hangup) {
+		t.Error("an HTTP generation on a driver conn's number was given to the HTTP path")
+	}
+	if n := closed.Load(); n != 0 {
+		t.Errorf("a stale HTTP event closed the driver conn (%d onClose calls)", n)
 	}
 }

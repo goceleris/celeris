@@ -304,9 +304,13 @@ type Loop struct {
 	driverConns map[int]*driverConn
 	driverMu    sync.RWMutex
 	// driverGen is the generation of the last driver registration on this
-	// loop (protected by driverMu). Each RegisterConn takes the next one,
-	// never 0; HTTP conns' events carry 0 (celeris#771).
-	driverGen      uint32
+	// loop (protected by driverMu). Each RegisterConn takes the next one, in
+	// 1..maxDriverGen: never 0, and never with bit 31 set, which is an HTTP
+	// conn's (celeris#771, celeris#885).
+	driverGen uint32
+	// httpGen is the counter the HTTP conns' generations are drawn from
+	// (nextHTTPGen): the last one, without bit 31. Loop thread only.
+	httpGen        uint32
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
 	// driverReadQ holds the driver conns whose last read turn used up
@@ -676,14 +680,30 @@ func (l *Loop) run(ctx context.Context) {
 			}
 
 			// Driver fast-path: a load of the event's Pad (read with the
-			// event, the generation of a driver registration, 0 for every
-			// HTTP conn) and a single atomic load when no drivers are
-			// registered (zero-cost for pure-HTTP workloads). The map lookup
-			// happens only when one of them says driver. dispatchDriver
-			// drops an event that names a registration which has ended
-			// (celeris#771).
-			if pad := uint32(ev.Pad); l.driverCandidate(pad) {
+			// event: the generation of a driver registration, an HTTP conn's
+			// generation with bit 31 set, or 0) and a single atomic load when
+			// no drivers are registered (zero-cost for pure-HTTP workloads).
+			// The map lookup happens only when one of them says driver.
+			// dispatchDriver drops an event that names a registration which
+			// has ended (celeris#771).
+			pad := uint32(ev.Pad)
+			if l.driverCandidate(pad) {
 				if l.dispatchDriver(fd, pad, ev.Events) {
+					continue
+				}
+			}
+			// An HTTP conn's event carries the generation of its registration
+			// (httpGenBit set), and a driver's has been dealt with: what is
+			// left is Pad 0 (the listen socket, the timer, a descriptor that
+			// is no conn's) or an HTTP generation. An event collected for an
+			// HTTP conn that has since closed must not reach the conn on its
+			// number now: a handler that is not the event's own (the timer
+			// branch's checkTimeouts, a transplant, an h2 pass) may have
+			// closed it earlier in this batch, and acceptAll may have put a
+			// new conn on the number (celeris#885 item 18). Pad 0 skips the
+			// check.
+			if pad != 0 && fd >= 0 && fd < len(l.conns) {
+				if cs := l.conns[fd]; cs != nil && cs.gen != pad {
 					continue
 				}
 			}
@@ -1120,10 +1140,13 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		// for a still-readable-at-EOF socket, stranding the conn until an idle
 		// timeout (which may be unset). EPOLLRDHUP rides the same event, so the
 		// run loop can close the conn after flushing its response.
-		if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, newFD, &unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
-			Fd:     int32(newFD),
-		}); err != nil {
+		//
+		// The registration's generation is drawn before the ADD and rides on
+		// every event of the conn (celeris#885 item 18); the connState below
+		// keeps it.
+		gen := l.nextHTTPGen()
+		ev := httpEpollEvent(newFD, gen, unix.EPOLLIN|unix.EPOLLET|unix.EPOLLRDHUP)
+		if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, newFD, &ev); err != nil {
 			_ = unix.Close(newFD)
 			l.errs.ConnRegister.Add(1)
 			continue
@@ -1136,6 +1159,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		// calls it makes.
 		connCtx := ctxkit.WithWorkerID(ctx, l.id)
 		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize, l.async)
+		cs.gen = gen
 		cs.remoteAddr = sockaddrString(newFD, sa)
 		// Install under driverMu. An async Hijack clears its slot from the
 		// dispatch goroutine under this lock and then closes the
@@ -1761,10 +1785,8 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// only land on the NEXT iteration via drainDetachQueue, too late
 		// to prevent overflow → chanReader drop → ErrReadLimit.
 		if cs.detachMu != nil && cs.recvPauseDesired.Load() && !cs.recvPaused {
-			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-				Events: 0,
-				Fd:     int32(cs.fd),
-			})
+			ev := cs.epollEvent(0)
+			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &ev)
 			cs.recvPaused = true
 			return
 		}
@@ -3264,10 +3286,8 @@ func (l *Loop) drainDetachQueue() {
 			if desired {
 				events = 0
 			}
-			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-				Events: events,
-				Fd:     int32(cs.fd),
-			})
+			ev := cs.epollEvent(events)
+			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &ev)
 			cs.recvPaused = desired
 		}
 		// A relink hand-back (celeris#669) lands here too: the conn is back
@@ -3461,7 +3481,7 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 //
 // The cost of the lock on this send-path call: BenchmarkEPOLLOUTArmDisarm.
 func (l *Loop) modEpollOut(cs *connState, events uint32) (issued bool, err error) {
-	ev := unix.EpollEvent{Events: events, Fd: int32(cs.fd)}
+	ev := cs.epollEvent(events)
 	if cs.detachMu == nil {
 		return true, unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &ev)
 	}

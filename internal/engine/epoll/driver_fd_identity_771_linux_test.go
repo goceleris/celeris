@@ -9,7 +9,6 @@ package epoll
 // not whatever holds the number by then.
 
 import (
-	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -295,7 +294,8 @@ func TestDispatchDropsEventsOfEndedRegistrations771(t *testing.T) {
 }
 
 // TestGenerationsWrapPastZero771: the loop's registration generation wraps
-// from MaxUint32 to 1, never to 0 (0 names an HTTP conn), and the conns
+// from maxDriverGen (0x7fffffff) to 1, never to 0 (0 names no conn) and never
+// into the values with bit 31 set (an HTTP conn's, celeris#885), and the conns
 // registered on either side of the wrap are each served.
 func TestGenerationsWrapPastZero771(t *testing.T) {
 	eng, stop := newTestEngine(t)
@@ -303,7 +303,7 @@ func TestGenerationsWrapPastZero771(t *testing.T) {
 	wl := eng.WorkerLoop(0)
 	l := eng.loops[0]
 	l.driverMu.Lock()
-	l.driverGen = math.MaxUint32 - 1
+	l.driverGen = maxDriverGen - 1
 	l.driverMu.Unlock()
 
 	type conn struct {
@@ -325,8 +325,8 @@ func TestGenerationsWrapPastZero771(t *testing.T) {
 	for _, c := range cs {
 		gens = append(gens, l.lookupDriver(c.fd).gen)
 	}
-	if gens[0] != math.MaxUint32 || gens[1] != 1 || gens[2] != 2 {
-		t.Errorf("generations %v across the wrap, want [%d 1 2]", gens, uint32(math.MaxUint32))
+	if gens[0] != maxDriverGen || gens[1] != 1 || gens[2] != 2 {
+		t.Errorf("generations %v across the wrap, want [%d 1 2]", gens, maxDriverGen)
 	}
 	for i, c := range cs {
 		_, _ = unix.Write(c.peer, []byte{'a' + byte(i)})

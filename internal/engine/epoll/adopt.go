@@ -182,16 +182,18 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 	}
 
 	_ = sockopts.ApplyFD(fd, l.sockOpts)
-	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
-		Fd:     int32(fd),
-	}); err != nil {
+	// The registration's generation, drawn before the ADD (celeris#885
+	// item 18): every event of the conn carries it.
+	gen := l.nextHTTPGen()
+	ev := httpEpollEvent(fd, gen, unix.EPOLLIN|unix.EPOLLET|unix.EPOLLRDHUP)
+	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
 		l.errs.ConnRegister.Add(1)
 		l.refuseAdopt(fd, carry)
 		return
 	}
 
 	cs := acquireConnState(ctxkit.WithWorkerID(ctx, l.id), fd, l.resolved.BufferSize, l.async)
+	cs.gen = gen
 	cs.remoteAddr = carry.RemoteAddr
 	l.driverMu.Lock()
 	l.conns[fd] = cs
