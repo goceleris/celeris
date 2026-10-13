@@ -45,6 +45,16 @@ const (
 	// connection's bound on placeholders until the stream is opened over it
 	// (TryOpenStream) or taken out of the map (takeLocked, handleGoAway).
 	flagPlaceholder uint32 = 1 << 5
+	// flagStreamed marks a use whose response is a StreamWriter's
+	// (NoteStreamHeader): its HEADERS went out without END_STREAM, so the
+	// response is whole only once the handler closed the writer (flagRespEnded)
+	// or, when it never did, once the processor has settled it at the handler's
+	// return (Processor.settleStreamed). A response written whole
+	// (WriteResponse) never sets it, so the hot path pays nothing.
+	flagStreamed uint32 = 1 << 6
+	// flagRespEnded marks a streamed response whose END_STREAM has been sent or
+	// queued behind the buffered DATA (Manager.EndOutbound).
+	flagRespEnded uint32 = 1 << 7
 )
 
 // Stream represents an HTTP/2 stream with its associated state and data.
@@ -107,6 +117,12 @@ type Stream struct {
 	// MAX_CONCURRENT_STREAMS slot and its budget until the connection closes.
 	// Guarded by mu.
 	outboundAbandoned bool
+	// respWritten is how many body bytes a StreamWriter has handed to this
+	// use of the stream, sent or buffered (Manager.StreamWrite). Guarded by mu.
+	respWritten int64
+	// respDeclared is the content-length a StreamWriter's headers declared,
+	// plus one: 0 is none declared (NoteStreamHeader).
+	respDeclared atomic.Int64
 	// gen counts the ends of this stream object's uses: it moves on when the
 	// handler of a use returns (EndUse) and again when the object is reset for
 	// the pool. A StreamWriter takes it when it is made (Gen) and presents it
@@ -514,6 +530,8 @@ func (s *Stream) resetLocked() {
 	s.manager = nil
 	s.OutboundEndStream = false
 	s.outboundAbandoned = false
+	s.respWritten = 0
+	s.respDeclared.Store(0)
 	s.headersSent.Store(false)
 	s.EndStream = false
 	s.IsStreaming = false
@@ -656,6 +674,8 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	s.Headers = s.hdrBuf[:0]
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
+	s.respWritten = 0
+	s.respDeclared.Store(0)
 	s.headersSent.Store(false)
 	s.EndStream = false
 	s.IsStreaming = false

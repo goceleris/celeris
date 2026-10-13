@@ -160,6 +160,19 @@ type Streamer interface {
 	Close(stream *Stream) error
 }
 
+// StreamResetter is an optional interface a ResponseWriter may implement to
+// reset a stream from the goroutine of its handler (celeris#889). ResetStream
+// queues RST_STREAM(code) behind the frames the stream has already queued, so
+// the peer never sees it ahead of the stream's own HEADERS or DATA, and
+// cancels the stream so nothing more of it is sent. It is safe from any
+// goroutine, the event loop and a pool handler's alike. The processor uses it
+// when a handler is over without having finished its response; a writer
+// without it (a test recorder) falls back to H2Controller.WriteRSTStreamPriority,
+// which belongs to the event loop.
+type StreamResetter interface {
+	ResetStream(stream *Stream, code http2.ErrCode)
+}
+
 // DetachNotifier is an optional interface a ResponseWriter may implement to
 // be told that the handler detached the stream (Context.Detach): from then on
 // the stream is the connection's, and runs until the peer or the handler ends

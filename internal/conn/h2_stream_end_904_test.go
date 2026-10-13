@@ -56,10 +56,14 @@ func TestCloseAfterWriteTimeoutQueuesNothing904(t *testing.T) {
 
 // TestUnclosedInlineStreamWriterIsDrainedAndReleased904: an inline handler
 // streams more than the window allows and returns without closing its
-// StreamWriter. The buffered rest is still sent as the peer grants window, but
-// without END_STREAM (a truncated body must not look complete), and the stream
-// is then released: it must not hold its slot and its share of the
-// connection's outbound budget until the connection closes.
+// StreamWriter. The buffered rest is still sent as the peer grants window, and
+// the stream is then released: it must not hold its slot and its share of the
+// connection's outbound budget until the connection closes. The response is
+// complete (no content-length was declared), so the processor ends it as
+// net/http ends a response when its handler returns: END_STREAM rides on the
+// last of the buffered DATA (celeris#889; #965 left the response unended). A
+// body short of a declared content-length is reset instead:
+// TestShortInlineWriterWithBufferedDataIsResetAndReleased889.
 func TestUnclosedInlineStreamWriterIsDrainedAndReleased904(t *testing.T) {
 	body := pattern904(5000)
 	h := &syncHandler893{run: func(_ context.Context, s *stream.Stream) error {
@@ -85,8 +89,8 @@ func TestUnclosedInlineStreamWriterIsDrainedAndReleased904(t *testing.T) {
 	if !bytes.Equal(w.data, body) {
 		t.Errorf("%d DATA bytes on the wire, want the whole %d-byte body, in order (frames %s)", len(w.data), len(body), w.summary())
 	}
-	if w.ended {
-		t.Errorf("END_STREAM was sent for a response its handler never ended (frames %s)", w.summary())
+	if !w.ended || w.after != 0 {
+		t.Errorf("END_STREAM %v with %d frames after it for a complete response its handler never closed, want it on the last DATA (frames %s)", w.ended, w.after, w.summary())
 	}
 	if got := m.StreamCount(); got != 0 {
 		t.Errorf("the manager still has %d stream(s) after the buffer was sent: the stream holds its slot until the connection closes", got)

@@ -75,7 +75,21 @@ func newH2WorkerPool(size int) *h2WorkerPool {
 }
 
 // run is one pool worker.
+//
+// A handler that calls runtime.Goexit ends the goroutine that runs it, and
+// recover() cannot stop that, so the worker would be gone: it would not credit
+// idle again, and the process-wide pool would shrink by one for every such
+// handler, until every stream ran on a goroutine of its own (celeris#889). The
+// deferred respawn replaces it. The credit stays right: Submit spent the dead
+// worker's credit when it queued the task, and the new worker adds its own
+// before it parks, as a worker that had returned would.
 func (p *h2WorkerPool) run() {
+	closed := false
+	defer func() {
+		if !closed {
+			go p.run()
+		}
+	}()
 	for {
 		// Credit the pool before parking. Submit spends exactly one
 		// credit per queued task, so the counter stays equal to
@@ -85,6 +99,7 @@ func (p *h2WorkerPool) run() {
 		task, ok := <-p.work
 		if !ok {
 			p.idle.Add(-1)
+			closed = true
 			return
 		}
 		task.proc.executeHandler(task.stream)
@@ -239,6 +254,27 @@ type Processor struct {
 	// the wire is ignored (handleData), where DATA on any other closed stream
 	// is still a connection error. After refusedFields for the same reason.
 	resetIDs serverResets
+
+	// OnHandlerGoexit, when set, is told that a stream's handler ended its
+	// goroutine with runtime.Goexit (celeris#889): the stream's id and the
+	// stack at the deferred cleanup, which shows the Goexit and the frames it
+	// unwound. A Goexit cannot be recovered, so on the event loop it still ends
+	// the loop (celeris#848); on the worker pool the worker is replaced. Like
+	// OnHandlerPanic it runs first thing in the handler's deferred cleanup, on
+	// the goroutine that ran the handler, and must not block. Set it before the
+	// first frame.
+	OnHandlerGoexit func(streamID uint32, stack []byte)
+	// OnHandlerUnfinished, when set, is told that a handler is over without
+	// having finished its response (celeris#889): the stream's id, whether the
+	// processor reset the stream (true: RST_STREAM) or ended it (false:
+	// END_STREAM, for a complete response that was not closed), the body bytes
+	// the handler wrote, the content-length it declared (-1: none) and the
+	// error it returned, if any. It runs on the goroutine that ran the
+	// handler, after the stream was ended or reset, and must not block. Set it
+	// before the first frame.
+	OnHandlerUnfinished func(streamID uint32, reset bool, written, declared int64, err error)
+	handlerGoexits      atomic.Uint64 // Goexits that reached the deferred cleanup, hook or not
+	unfinishedHandlers  atomic.Uint64 // handlers that returned without finishing their response, hook or not
 }
 
 // HandlerPanics is how many panics have escaped a stream's handler of this
@@ -260,6 +296,127 @@ func (p *Processor) handlerPanicked(id uint32, r any) {
 	// the process.
 	defer func() { _ = recover() }()
 	hook(id, r, debug.Stack())
+}
+
+// HandlerGoexits is how many handlers of this connection ended their
+// goroutine with runtime.Goexit (OnHandlerGoexit). Safe from any goroutine.
+func (p *Processor) HandlerGoexits() uint64 { return p.handlerGoexits.Load() }
+
+// UnfinishedResponses is how many handlers of this connection returned without
+// finishing their response, and had their stream ended or reset for it
+// (OnHandlerUnfinished). Safe from any goroutine.
+func (p *Processor) UnfinishedResponses() uint64 { return p.unfinishedHandlers.Load() }
+
+// handlerGoexited records that the handler of stream id ended its goroutine
+// with runtime.Goexit, and tells OnHandlerGoexit. It runs in the deferred
+// cleanup of the handler's goroutine, so the stack still holds the Goexit's
+// frames.
+func (p *Processor) handlerGoexited(id uint32) {
+	p.handlerGoexits.Add(1)
+	hook := p.OnHandlerGoexit
+	if hook == nil {
+		return
+	}
+	defer func() { _ = recover() }() // as handlerPanicked: somebody else's code
+	hook(id, debug.Stack())
+}
+
+// handlerUnfinished records that a handler is over without having finished
+// its response, and tells OnHandlerUnfinished.
+func (p *Processor) handlerUnfinished(id uint32, reset bool, written, declared int64, err error) {
+	p.unfinishedHandlers.Add(1)
+	hook := p.OnHandlerUnfinished
+	if hook == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	hook(id, reset, written, declared, err)
+}
+
+// resetHandlerStream resets the stream whose handler is over with
+// INTERNAL_ERROR (RFC 9113 §7: "the endpoint encountered an unexpected
+// internal error"; CANCEL says the stream is no longer needed, which is not
+// what a handler that failed to answer means, and net/http's server resets a
+// panicked or short-bodied response the same way). What the stream still
+// buffers is dropped, so a flush sends nothing after the RST_STREAM, and the
+// RST_STREAM is queued behind the frames the stream already queued (all of a
+// stream's frames go to one shard, in order): sent straight to the connection,
+// it could reach the peer before the HEADERS or DATA still in the queue, and
+// DATA on a closed stream is an error for the peer. A pool goroutine cannot
+// use the connection's writer, which belongs to the event loop, so the
+// ResponseWriter does it (StreamResetter). The request has ended before any
+// handler runs (every frame path sets EndStream first), so the peer has no
+// DATA in flight for the stream and nothing is marked in resetIDs.
+//
+// Lock order: DiscardOutbound takes the stream's lock alone and releases it
+// before the reset is queued (shard lock, then the wakeup), as a StreamWriter's
+// write does in the other direction (stream lock, then shard lock); nothing is
+// held across a hook.
+func (p *Processor) resetHandlerStream(stream *Stream) {
+	p.manager.DiscardOutbound(stream)
+	switch w := stream.ResponseWriter.(type) {
+	case StreamResetter:
+		w.ResetStream(stream, http2.ErrCodeInternal)
+	default:
+		// A writer that cannot queue behind the stream's frames (a test
+		// recorder): the connection's own, which is the event loop's.
+		if p.connWriter != nil {
+			_ = p.connWriter.WriteRSTStreamPriority(stream.ID, http2.ErrCodeInternal)
+		}
+	}
+	stream.Cancel()
+}
+
+// settleStreamed runs when a handler that streamed its response returned
+// without closing the writer. Go's net/http ends a response when its handler
+// returns, so a response that is complete is ended with END_STREAM: the headers
+// are out and, for a declared content-length, that many bytes were written (a
+// response with none declared is complete whatever it wrote). A body short of
+// the declared length is reset instead, never ended: END_STREAM would make a
+// truncated body look complete to the client (celeris#965). Either way the peer
+// is no longer left waiting for its own timeout. The caller has ended the
+// stream's use (EndUse), so the writer's own calls are refused from here on;
+// Streamer.Close takes the use token afresh.
+func (p *Processor) settleStreamed(stream *Stream) {
+	o, written, declared := stream.responseOutcome()
+	if o != outcomeComplete && o != outcomeShort || stream.IsCancelled() {
+		return // not a streamed response, or already ended, or the peer reset it
+	}
+	if o == outcomeComplete {
+		st, ok := stream.ResponseWriter.(Streamer)
+		if ok {
+			err := st.Close(stream)
+			if err == nil {
+				p.handlerUnfinished(stream.ID, false, written, declared, nil)
+				return
+			}
+			if stream.IsCancelled() {
+				return // the peer reset the stream while this ran
+			}
+		}
+	}
+	p.resetHandlerStream(stream)
+	p.handlerUnfinished(stream.ID, true, written, declared, nil)
+}
+
+// settleFailed runs when a handler is over without having answered: it
+// returned an error (celeris#889), panicked, or called runtime.Goexit. Unless
+// its response is whole (written whole, or its END_STREAM is queued), the
+// stream is reset: the peer is told, where it used to wait for its own
+// timeout. handled says the panic or Goexit hook has already told of it, so
+// OnHandlerUnfinished does not count it again.
+func (p *Processor) settleFailed(stream *Stream, err error, handled bool) {
+	if stream.IsCancelled() {
+		return
+	}
+	o, written, declared := stream.responseOutcome()
+	if o == outcomeSettled {
+		return
+	}
+	p.resetHandlerStream(stream)
+	if !handled {
+		p.handlerUnfinished(stream.ID, true, written, declared, err)
+	}
 }
 
 // PoolHandlersRunning reports whether a stream of this connection has a
@@ -1071,10 +1228,20 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 	}
 
 	var keepAlive bool
+	// returned is set when HandleStream has returned. A deferred function
+	// cannot tell a handler that called runtime.Goexit from one that returned:
+	// recover() is nil for both (celeris#889).
+	returned := false
 
 	defer func() {
 		if r := recover(); r != nil {
 			p.handlerPanicked(stream.ID, r)
+			stream.EndUse()
+			p.settleFailed(stream, nil, true)
+		} else if !returned {
+			p.handlerGoexited(stream.ID)
+			stream.EndUse()
+			p.settleFailed(stream, nil, true)
 		}
 
 		if stream.Data != nil {
@@ -1108,12 +1275,16 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 	stream.SetHandlerStarted()
 
 	err := p.handler.HandleStream(bgCtx, stream)
+	returned = true
 	// The handler is over: on HTTP/2 the stream ends with it, detached or not
 	// (Context.Detach). A StreamWriter call from a goroutine it started is
 	// refused from here on, before the check for buffered DATA below, so
 	// nothing is added to what the stream keeps (celeris#904).
 	stream.EndUse()
 	if err != nil {
+		// Nothing answered, or a response begun and not finished: the stream
+		// is reset instead of left to the client's own timeout (celeris#889).
+		p.settleFailed(stream, err, false)
 		return
 	}
 
@@ -1122,6 +1293,16 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 			_ = stream.ResponseWriter.WriteResponse(stream, 200, nil, nil)
 		}
 		return
+	}
+
+	// A StreamWriter response the handler did not close is ended here, as
+	// net/http ends a response when its handler returns, or reset when it is
+	// short of its declared content-length (celeris#889). It comes before the
+	// check for buffered DATA: a complete response's END_STREAM then rides on
+	// the last of that DATA (Manager.EndOutbound), and a reset one's buffer is
+	// dropped.
+	if stream.flags.Load()&flagStreamed != 0 {
+		p.settleStreamed(stream)
 	}
 
 	// Keep the stream alive if outbound DATA is buffered (flow control
@@ -1180,9 +1361,16 @@ func (p *Processor) executeHandler(stream *Stream) {
 	// stream settled before a shutdown that waits for this count can close
 	// the connection (celeris#759).
 	defer p.poolRunning.Add(-1)
+	returned := false // see executeHandlerInline: a Goexit is invisible to recover()
 	defer func() {
 		if r := recover(); r != nil { // last-resort panic recovery
 			p.handlerPanicked(stream.ID, r)
+			stream.EndUse()
+			p.settleFailed(stream, nil, true)
+		} else if !returned {
+			p.handlerGoexited(stream.ID)
+			stream.EndUse()
+			p.settleFailed(stream, nil, true)
 		}
 
 		// Eagerly release the input buffer now that the handler is done.
@@ -1225,8 +1413,10 @@ func (p *Processor) executeHandler(stream *Stream) {
 	stream.SetHandlerStarted()
 
 	err := p.handler.HandleStream(bgCtx, stream)
+	returned = true
 	stream.EndUse() // as in executeHandlerInline
 	if err != nil {
+		p.settleFailed(stream, err, false)
 		return
 	}
 
@@ -1238,6 +1428,10 @@ func (p *Processor) executeHandler(stream *Stream) {
 			_ = stream.ResponseWriter.WriteResponse(stream, 200, nil, nil)
 		}
 		return
+	}
+
+	if stream.flags.Load()&flagStreamed != 0 { // as in executeHandlerInline
+		p.settleStreamed(stream)
 	}
 
 	if state == StateOpen || state == StateHalfClosedRemote {

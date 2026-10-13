@@ -678,8 +678,16 @@ func (a *h2InlineResponseAdapter) CloseUse(s *stream.Stream, gen uint64) error {
 	return a.queue.CloseUse(s, gen)
 }
 
+// ResetStream queues the RST_STREAM behind the stream's own frames, which an
+// inline handler's streamed response sends through the queue (stream.StreamResetter).
+func (a *h2InlineResponseAdapter) ResetStream(s *stream.Stream, code http2.ErrCode) {
+	a.queue.ResetStream(s, code)
+}
+
 var _ stream.Streamer = (*h2InlineResponseAdapter)(nil)
 var _ stream.UseStreamer = (*h2InlineResponseAdapter)(nil)
+var _ stream.StreamResetter = (*h2InlineResponseAdapter)(nil)
+var _ stream.StreamResetter = (*h2ResponseAdapter)(nil)
 
 type h2ResponseAdapter struct {
 	write        func([]byte)
@@ -960,6 +968,12 @@ func (a *h2ResponseAdapter) resetStream(s *stream.Stream, code http2.ErrCode) {
 	s.Cancel()
 }
 
+// ResetStream is the processor's reset of a stream whose handler is over
+// without having finished its response (stream.StreamResetter, celeris#889).
+func (a *h2ResponseAdapter) ResetStream(s *stream.Stream, code http2.ErrCode) {
+	a.resetStream(s, code)
+}
+
 // resetStreamUse is resetStream for a StreamWriter, which may outlive its
 // handler (celeris#904): it does nothing once gen is no longer the stream's
 // use, so it neither sends a RST_STREAM for the object's next stream nor
@@ -1203,6 +1217,12 @@ func (a *h2ResponseAdapter) WriteHeaderUse(s *stream.Stream, gen uint64, status 
 
 	*pooled = frameBuf
 	a.writeQueue.Enqueue(s.ID, pooled)
+	// A streamed response is whole only once it is closed: the processor
+	// settles one whose handler returned without closing it, held to the
+	// content-length these headers declare (celeris#889). Marked before
+	// headersSent, so a stream with HEADERS out is never taken for a response
+	// written whole.
+	s.NoteStreamHeader(status, headers)
 	s.SetHeadersSent()
 	return nil
 }

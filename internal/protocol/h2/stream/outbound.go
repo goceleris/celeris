@@ -4,6 +4,8 @@ import (
 	"context"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -368,11 +370,13 @@ func (m *Manager) StreamWrite(s *Stream, gen uint64, data []byte, send OutboundS
 	}
 	if !s.RunsOnPool() {
 		m.sendOrBufferLocked(s, data, send)
+		s.respWritten += int64(len(data))
 		return len(data), id, false, nil
 	}
 	n = int(m.ReserveSendWindow(s, clampWindowRequest(len(data))))
 	if n > 0 {
 		send(id, false, data[:n])
+		s.respWritten += int64(n)
 	}
 	return n, id, true, nil
 }
@@ -421,12 +425,100 @@ func (m *Manager) EndOutbound(s *Stream, gen uint64, send OutboundSend) error {
 	if s.manager != m {
 		return ErrStreamEnded
 	}
+	s.flags.Or(flagRespEnded)
 	if s.OutboundBuffer != nil && s.OutboundBuffer.Len() > 0 {
 		s.OutboundEndStream = true
 		return nil
 	}
 	send(s.ID, true, nil)
 	return nil
+}
+
+// NoteStreamHeader records that s's response is a StreamWriter's: the
+// HEADERS went out without END_STREAM, so the response is not whole until its
+// handler closes the writer, and the processor settles it if the handler
+// returns without (Processor.settleStreamed). It also records the
+// content-length the headers declare, which a response ending is held to: a
+// body short of it is reset, not ended (RFC 9110 §8.6, RFC 9113 §8.1.1). A
+// HEAD response and a status that has no content (1xx, 204, 304) declare
+// none. Only atomics, so a ResponseWriter may call it with the stream's lock
+// held for reading (UseLock).
+func (s *Stream) NoteStreamHeader(status int, headers [][2]string) {
+	declared := int64(-1)
+	if !s.IsHEAD && status >= 200 && status != 204 && status != 304 {
+		for _, h := range headers {
+			if len(h[0]) != len("content-length") || !strings.EqualFold(h[0], "content-length") {
+				continue
+			}
+			if n, err := strconv.ParseInt(strings.TrimSpace(h[1]), 10, 64); err == nil && n >= 0 {
+				declared = n
+			}
+			break
+		}
+	}
+	s.respDeclared.Store(declared + 1)
+	s.flags.Or(flagStreamed)
+}
+
+// responseOutcome is how a handler that is over left its stream's response.
+type responseOutcome uint8
+
+const (
+	// outcomeNone: no response was started: no HEADERS, nothing to end.
+	outcomeNone responseOutcome = iota
+	// outcomeSettled: nothing is left to do: the response was written whole
+	// (WriteResponse), or its END_STREAM is sent or queued.
+	outcomeSettled
+	// outcomeComplete: a streamed response that was not closed, with every
+	// byte its headers declared (or none declared) written: it can be ended.
+	outcomeComplete
+	// outcomeShort: a streamed response that was not closed and is short of
+	// its declared content-length: it must not be ended.
+	outcomeShort
+)
+
+// responseOutcome reports how s's response stands, with the body bytes a
+// StreamWriter wrote and the content-length it declared (-1 for none). A
+// response that is not a StreamWriter's costs two atomic loads and no lock.
+func (s *Stream) responseOutcome() (o responseOutcome, written, declared int64) {
+	declared = -1
+	if !s.headersSent.Load() {
+		return outcomeNone, 0, declared
+	}
+	if s.flags.Load()&flagStreamed == 0 {
+		return outcomeSettled, 0, declared
+	}
+	// END_STREAM is marked under the stream's lock (EndOutbound), so the
+	// check is made under it too.
+	s.mu.RLock()
+	written, ended := s.respWritten, s.flags.Load()&flagRespEnded != 0
+	s.mu.RUnlock()
+	declared = s.respDeclared.Load() - 1
+	switch {
+	case ended:
+		return outcomeSettled, written, declared
+	case declared < 0 || declared == written:
+		return outcomeComplete, written, declared
+	}
+	return outcomeShort, written, declared
+}
+
+// DiscardOutbound drops what s still buffers for the peer's window and gives
+// it back to the connection's outbound budget, for a stream the server resets:
+// the peer will not read it (RFC 9113 §5.1: no frame follows a RST_STREAM),
+// and a flush of it must send nothing.
+func (m *Manager) DiscardOutbound(s *Stream) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.manager != m {
+		return
+	}
+	if buf := s.OutboundBuffer; buf != nil && buf.Len() > 0 {
+		m.refundOutbound(buf.Len())
+		buf.Reset()
+	}
+	s.OutboundEndStream = false
+	s.outboundAbandoned = false
 }
 
 // AbandonOutbound is called when an inline handler returns with DATA still
