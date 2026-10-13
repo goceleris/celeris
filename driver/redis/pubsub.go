@@ -36,13 +36,20 @@ type Message struct {
 //
 // A subscribe/unsubscribe call on an open PubSub whose connection is down is
 // not sent: it returns [ErrPubSubConnDown] (match it with errors.Is; it is
-// neither [ErrClosed] nor [ErrUnknownFD]), the subscription set is updated and
-// the reconnect replays it, so the call need not be repeated. Any other error from the
-// write (for example [ErrQueueFull] on a live connection) means the command
-// was not sent and nothing replays it before the next reconnect. [ErrClosed]
-// means the PubSub itself is closed, also when [PubSub.Close] raced the call.
-// [PubSub.Close] waits for a control call that is already writing to return
-// before it releases the connection.
+// neither [ErrClosed] nor [ErrUnknownFD], the error the engine's event loop
+// returns for a descriptor it has forgotten), the subscription set is updated
+// and the reconnect replays it, so the call need not be repeated, while the
+// [Client] is open. After [Client.Close] the reconnect has no pool to dial: a
+// PubSub whose conn goes down then returns [ErrPubSubConnDown] from its
+// control calls until [PubSub.Close], and the replay never happens. The
+// constructors [Client.Subscribe], [Client.PSubscribe] and
+// [ClusterClient.SSubscribe] apply the same rule to their first call: they
+// return the PubSub and a nil error, not [ErrPubSubConnDown]. Any other error
+// from the write (for example [ErrQueueFull] on a live connection) means the
+// command was not sent and nothing replays it before the next reconnect.
+// [ErrClosed] means the PubSub itself is closed, also when [PubSub.Close] raced
+// the call. [PubSub.Close] waits for a control call that is already writing to
+// return before it releases the connection.
 type PubSub struct {
 	client *Client
 
@@ -88,34 +95,50 @@ type PubSub struct {
 	drops atomic.Uint64
 }
 
-// Subscribe opens a pub/sub conn and subscribes to channels.
+// Subscribe opens a pub/sub conn and subscribes to channels. With no channels
+// it only opens the conn. If the conn is found down on the first SUBSCRIBE
+// (the call would return [ErrPubSubConnDown] on an open PubSub) Subscribe
+// still returns the PubSub and a nil error: the channels are tracked and the
+// reconnect replays them, as for any later control call.
 func (c *Client) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	ps, err := c.newPubSub(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if len(channels) > 0 {
-		if err := ps.Subscribe(ctx, channels...); err != nil {
-			_ = ps.Close()
-			return nil, err
-		}
+		return ps.firstControl(ps.Subscribe(ctx, channels...))
 	}
 	return ps, nil
 }
 
-// PSubscribe opens a pub/sub conn and subscribes to patterns.
+// PSubscribe opens a pub/sub conn and subscribes to patterns. With no patterns
+// it only opens the conn. Like [Client.Subscribe], it returns the PubSub and a
+// nil error when the conn is found down on the first PSUBSCRIBE: the reconnect
+// replays the patterns.
 func (c *Client) PSubscribe(ctx context.Context, patterns ...string) (*PubSub, error) {
 	ps, err := c.newPubSub(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if len(patterns) > 0 {
-		if err := ps.PSubscribe(ctx, patterns...); err != nil {
-			_ = ps.Close()
-			return nil, err
-		}
+		return ps.firstControl(ps.PSubscribe(ctx, patterns...))
 	}
 	return ps, nil
+}
+
+// firstControl is the tail of a constructor that made one control call on the
+// PubSub it just built. [ErrPubSubConnDown] means the call was not sent but the
+// subscription set holds it and the reconnect replays it (every conn that goes
+// down reaches onConnDrop: the loop's close hook, or the re-check in
+// newPubSub), so the PubSub is kept and returned, as the [PubSub] doc promises
+// for a control call (celeris#887 item 12). Any other error means the command
+// was not sent and nothing replays it: the PubSub is closed and not returned.
+func (ps *PubSub) firstControl(err error) (*PubSub, error) {
+	if err == nil || errors.Is(err, ErrPubSubConnDown) {
+		return ps, nil
+	}
+	_ = ps.Close()
+	return nil, err
 }
 
 // testHookBeforeBind, when non-nil, runs in newPubSub after the pool handed
@@ -289,14 +312,15 @@ func (ps *PubSub) control(verb string, names []string, update func()) error {
 // ErrPubSubConnDown is what a control call (Subscribe, Unsubscribe,
 // PSubscribe, PUnsubscribe, SSubscribe, SUnsubscribe) returns on an open
 // PubSub whose conn is down: the command was not sent, but the subscription
-// set is updated, and the reconnect replays it while the PubSub is open, so
-// the caller need not repeat the call (see the [PubSub] doc for the cases where
-// no reconnect follows: the constructors [Client.Subscribe],
-// [Client.PSubscribe] and [ClusterClient.SSubscribe] can return it with a nil
-// PubSub, and after [Client.Close] the reconnect has no pool to dial). It is not [ErrClosed]
-// (the PubSub is open) and not [ErrUnknownFD] (the driver maps that to this
-// error when the loop forgot the conn). Match it with errors.Is. Messages
-// published while the conn is down are lost, as the [PubSub] doc says.
+// set is updated, and the reconnect replays it while the [Client] is open, so
+// the caller need not repeat the call. After [Client.Close] the reconnect has
+// no pool to dial and nothing replays it (see the [PubSub] doc). The
+// constructors [Client.Subscribe], [Client.PSubscribe] and
+// [ClusterClient.SSubscribe] do not return it: they keep the PubSub and return
+// it with a nil error. It is not [ErrClosed] (the PubSub is open) and not
+// [ErrUnknownFD] (the driver maps that to this error when the loop forgot the
+// conn). Match it with errors.Is. Messages published while the conn is down are
+// lost, as the [PubSub] doc says.
 var ErrPubSubConnDown = errors.New("celeris-redis: pubsub conn down")
 
 // sendPubSubControl writes a control command without tracking a reply (pubsub
