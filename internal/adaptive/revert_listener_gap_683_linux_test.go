@@ -339,8 +339,7 @@ func TestSwitchWaitForTheIncomingListenerDoesNotBlockDriverRegistration683(t *te
 // Nor does Engine.Metrics() (hence Server.EngineInfo and the observe collector)
 // sit behind the wait: it takes only switchMu for the two sub-engine slots, and
 // nothing holds switchMu across the wait. Read under e.mu, it sat out the rest
-// of the late engine's delay (celeris#886 item 12: 109 to 114 ms against 375
-// to 833 ns idle).
+// of the late engine's delay (celeris#886 item 12).
 func TestSwitchWaitForTheIncomingListenerDoesNotBlockMetrics683(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration")
