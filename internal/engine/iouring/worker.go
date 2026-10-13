@@ -619,9 +619,10 @@ type Worker struct {
 	shutdownDrainStart int64
 	draining           bool
 
-	// refuseRecv is true once the send drain is past its first
-	// shutdownSendDrainNanos: handleRecv then reads nothing more from an
-	// HTTP/1 connection (celeris#806). The drain lasts as long as the
+	// refuseRecv is true once the send drain, or the wait for the HTTP/2
+	// pool handlers before it, is past its first shutdownSendDrainNanos:
+	// handleRecv then reads nothing more from an HTTP/1 connection
+	// (celeris#806, celeris#884). The drain lasts as long as the
 	// budget, and on keep-alive connections whose responses queue in the
 	// worker, new requests would keep the queues from ever emptying.
 	// Worker thread only; read in handleRecv.
@@ -1356,6 +1357,19 @@ func (w *Worker) run(ctx context.Context) {
 			if !w.h2PoolSettled() {
 				w.stopAccepting(ctx)
 				w.shutdownDrainStart = 0
+				// The wait for the handlers can last the whole budget, so
+				// the send drain's gate applies to it too, from the same
+				// point: shutdownSendDrainNanos after it began, so a request
+				// in flight when the shutdown began is still answered. Past
+				// it no more request is read from an HTTP/1 conn, and a
+				// detached stream's producer is ended (a TryLock that finds
+				// a handler running is tried again on the next pass); the
+				// HTTP/2 conns this wait is for are served on
+				// (celeris#884). h2PoolSettled has set h2DrainStart.
+				if time.Now().UnixNano() > w.h2DrainStart+shutdownSendDrainNanos {
+					w.refuseRecv = true
+					w.stopDetachedProducers()
+				}
 			} else {
 				now := time.Now().UnixNano()
 				if w.shutdownDrainStart == 0 {
@@ -2825,19 +2839,16 @@ func (w *Worker) acceptRetry(err error) bool {
 var errHijackNoSQE = errors.New("celeris: cannot hijack: the io_uring submission queue is full, the connection's receive cannot be cancelled")
 
 func (w *Worker) hijackConn(fd int) (net.Conn, error) {
-	cs := w.conns[fd]
-	if cs == nil {
-		return nil, errors.New("celeris: connection not found")
-	}
-	if cs.fixedFile {
-		return nil, errors.New("celeris: cannot hijack fixed file connection")
-	}
-	// Refuse on the async dispatch path (celeris#539). Everything below is
-	// worker-owned: w.conns, w.connCount, w.liveConns, the dirty list, and an
-	// ASYNC_CANCEL SQE, which the engine treats as single-issuer. In async
-	// mode the handler — and therefore this call, through h1State.HijackFn —
-	// runs on the per-connection dispatch goroutine, so doing any of it here
-	// races the worker's own loop and submits an SQE off the issuing thread.
+	// Refuse on the async dispatch path (celeris#539), before anything is
+	// read: the conn table is the worker goroutine's (connsMu orders its
+	// writes against RegisterConn's read, connSlotBusy, and no other), and in
+	// async mode this call is not on that goroutine (celeris#884). Everything
+	// below is worker-owned: w.conns, w.connCount, w.liveConns, the dirty
+	// list, and an ASYNC_CANCEL SQE, which the engine treats as
+	// single-issuer. In async mode the handler — and therefore this call,
+	// through h1State.HijackFn — runs on the per-connection dispatch
+	// goroutine, so doing any of it here races the worker's own loop and
+	// submits an SQE off the issuing thread.
 	//
 	// Every other goroutine-to-worker hand-off goes through detachQueue for
 	// exactly this reason. Hijack cannot use it as-is because Hijack() is
@@ -2850,6 +2861,13 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 		return nil, errors.New("celeris: Hijack is not supported on the io_uring engine with " +
 			"AsyncHandlers enabled (celeris#539); use the engine-integrated WebSocket/SSE path, " +
 			"or run with AsyncHandlers disabled")
+	}
+	cs := w.conns[fd]
+	if cs == nil {
+		return nil, errors.New("celeris: connection not found")
+	}
+	if cs.fixedFile {
+		return nil, errors.New("celeris: cannot hijack fixed file connection")
 	}
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
