@@ -178,10 +178,14 @@ func TestAdaptiveSwitchesWithPreBoundListener(t *testing.T) {
 
 	deadline := time.Now().Add(30 * time.Second)
 	for e.Metrics().AdaptiveSwitches == 0 && time.Now().Before(deadline) {
+		if failed, _ := standbyBuildFailed886(e); failed {
+			break // no switch will come: the standby could not be built
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	switches := e.Metrics().AdaptiveSwitches
 	if switches < 1 {
+		skipIfStandbyBuildFailed886(t, e)
 		t.Fatalf("no engine switch after 30s at %d conns / %d workers: AdaptiveSwitches=%d (epoll conns=%d)",
 			conns, 2, switches, aconns(e.primary))
 	}

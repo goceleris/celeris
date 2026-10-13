@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/probe"
 )
 
@@ -125,6 +126,40 @@ func TestControllerSwitchVerdictsOnAFailedStandby886(t *testing.T) {
 			}
 			if strings.Contains(out, falseVerdict) || strings.Contains(out, "no engine switch after") {
 				t.Errorf("the child reported the engine verdict instead of the missing standby:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestStandbyBuildFailedGuard886: the guard skips only for a standby that was
+// asked for and failed. A controller that never asked for it (no failure on
+// record) is the engine defect these tests exist to catch, and an engine that
+// switched or holds an io_uring engine has nothing to excuse.
+func TestStandbyBuildFailedGuard886(t *testing.T) {
+	cases := []struct {
+		name      string
+		failures  int
+		switches  uint64
+		hasSecond bool
+		want      bool
+	}{
+		{"build failed twice, no io_uring engine, no switch", 2, 0, false, true},
+		{"build failed once", 1, 0, false, true},
+		{"controller never asked for the standby", 0, 0, false, false},
+		{"a switch landed", 1, 1, false, false},
+		{"an io_uring engine exists", 1, 0, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _, _, _ := newLazyAdaptive(t)
+			e.ctrl.state.buildFailures = tc.failures
+			e.switchesTotal.Store(tc.switches)
+			if tc.hasSecond {
+				e.secondary = newMockEngine(engine.IOUring)
+			}
+			got, n := standbyBuildFailed886(e)
+			if got != tc.want || (got && n != tc.failures) {
+				t.Errorf("standbyBuildFailed886 = %v, %d; want %v, %d", got, n, tc.want, tc.failures)
 			}
 		})
 	}

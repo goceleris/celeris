@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -167,6 +168,8 @@ func adaptiveSwitchUnderLoad(t *testing.T, beforeSwitch func(*testing.T)) {
 	cfg := defaultTestConfig(port, engine.HTTP1)
 	cfg.Engine = engine.Adaptive
 	cfg.Resources.Workers = 2
+	logs := &syncBuf886{}
+	cfg.Logger = slog.New(slog.NewJSONHandler(logs, nil))
 
 	e, err := adaptive.New(cfg, &echoHandler{}, nil)
 	if err != nil {
@@ -210,6 +213,12 @@ func adaptiveSwitchUnderLoad(t *testing.T, beforeSwitch func(*testing.T)) {
 
 	newType := e.ActiveEngine().Type()
 	if newType == initialType {
+		// ForceSwitch returns nothing, and the engine gives up quietly when it
+		// cannot build the lazy io_uring standby (ring setup ENOMEM under
+		// RLIMIT_MEMLOCK, a seccomp profile): it logs "aborting switch" and
+		// stays put. That is the environment, not a switch that failed to take
+		// effect (celeris#886 item 11).
+		skipOrFailIfStandbyAborted886(t, e.Metrics().AdaptiveSwitches, logs)
 		t.Error("expected engine type to change after ForceSwitch")
 	}
 
