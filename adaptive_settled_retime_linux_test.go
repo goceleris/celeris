@@ -682,6 +682,13 @@ func ioUringPin592(o stall589Obs) error {
 		}
 		return errors.New("iouring: no stack tally was taken during the window (the sampler did not watch the event-loop goroutines): the probe cannot be judged")
 	}
+	if o.stacks.captures > 0 && o.stacks.loops == 0 {
+		// Stacks were taken but not one of them held an event-loop goroutine:
+		// isLoopGoroutine589 no longer matches the engine (a rename), and a
+		// pinned worker would read as 0 parked.
+		return fmt.Errorf("iouring: %d stacks were taken while the /ping probe sat unanswered, but none held an event-loop goroutine "+
+			"(isLoopGoroutine589 matches (*Worker).run): the probe cannot be judged", o.stacks.captures)
+	}
 	if parked, captures := o.stacks.parked, o.stacks.captures; parked >= stall592PinMinCaptures && float64(parked) >= stall592PinMinShare*float64(captures) {
 		return fmt.Errorf("iouring: an event-loop goroutine was parked on a mutex at %d of the %d captures taken while the /ping probe sat unanswered "+
 			"(want < %d, or under a quarter of the captures; async_promoted_conns=%d kv_conns=%d; %d of %d samples over %v, %.3f of the window): "+
