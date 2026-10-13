@@ -1576,25 +1576,21 @@ func (c *Context) Detach() (done func()) {
 	}
 
 	c.extended = true
-	// c.detached is set before the engine hooks run (they may read it), and
-	// c.detachDone only once they have returned: recoverAndRelease waits on
-	// it for every detached Context. An OnDetach (or StreamDetached) that
-	// panics never returns the done func, so no goroutine will ever own the
-	// Context: the guard undoes the detach and the request ends as an ordinary
-	// one that panicked. recoverAndRelease answers it with a 500, records its
-	// real status and elapsed time, and releases the Context as for any
-	// request, with the CachedCtx check: on a native HTTP/1 connection that
-	// stays open the stream still caches this Context, and returning it to
-	// contextPool then would give it two owners (celeris#512). A handler
-	// that recovers the panic and calls Detach again runs the hooks again.
-	// (#889 item 33)
-	c.detached = true
-	returned := false
-	defer func() {
-		if !returned {
-			c.detached = false
-		}
-	}()
+	// The Context is marked detached (c.detached) and given its detachDone
+	// only after the engine hooks below have returned: recoverAndRelease
+	// waits on detachDone for every detached Context. An OnDetach (or
+	// StreamDetached) that panics never returns the done func, so no
+	// goroutine will ever own the Context; with the mark not yet set, the
+	// request ends as an ordinary one that panicked. recoverAndRelease
+	// answers it with a 500, records its real status and elapsed time, and
+	// releases the Context as for any request, with the CachedCtx check: on
+	// a native HTTP/1 connection that stays open the stream still caches
+	// this Context, and returning it to contextPool then would give it two
+	// owners (celeris#512). A handler that recovers the panic and calls
+	// Detach again runs the hooks again. The stream was marked detached
+	// above the hooks (an HTTP/2 stream is then not pooled when it is
+	// released: one allocation, only after an engine fault). (#889 item 33)
+	//
 	// The use this Context is detached from. Its goroutine can outlive the
 	// handler, and on HTTP/2 the stream goes back to the pool then: the token
 	// lets StreamWriter tell the stream's next use from this one, and the mark
@@ -1605,7 +1601,7 @@ func (c *Context) Detach() (done func()) {
 	// A hijacked connection is the caller's: the engine has let go of it, and
 	// on epoll its OnDetach hook would run against the connection state the
 	// hijack released (a nil dereference, and a detached count that never
-	// ends). The Context is still detached above, so a goroutine that holds it
+	// ends). The Context is still detached below, so a goroutine that holds it
 	// keeps it past the handler.
 	if !c.hijacked {
 		if c.stream.OnDetach != nil {
@@ -1623,7 +1619,7 @@ func (c *Context) Detach() (done func()) {
 	}
 	ch := make(chan struct{})
 	c.detachDone = ch
-	returned = true
+	c.detached = true
 	return func() {
 		// Snapshot status + elapsed BEFORE close so the metrics goroutine
 		// can read these without racing late writes from a handler that
