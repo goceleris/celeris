@@ -119,3 +119,26 @@ func TestSampleCounterThatFellReadsZero886(t *testing.T) {
 			snap.ThroughputRPS, snap.AcceptRate, snap.BytesPerReq, snap.ErrorRate)
 	}
 }
+
+// TestSampleByteCounterThatFellReadsZeroBytesPerReq886 guards the byte delta
+// on its own. In TestSampleCounterThatFellReadsZero886 the request total falls
+// too, so BytesPerReq stays 0 through the deltaReqs > 0 gate whatever the byte
+// delta does. Here requests grow and only the bytes fall: a plain subtraction
+// gives a delta near 2^64, a BytesPerReq near 1.8e17 (far above
+// largePayloadBytes, which suppresses an io_uring switch), where the saturating
+// one reads 0.
+func TestSampleByteCounterThatFellReadsZeroBytesPerReq886(t *testing.T) {
+	e := newMockEngine(engine.IOUring)
+	s := newLiveSampler(nil)
+	e.SetMetrics(engine.EngineMetrics{RequestCount: 100, BytesRead: 600, BytesWritten: 400})
+	s.Sample(e)
+	time.Sleep(2 * time.Millisecond)
+	e.SetMetrics(engine.EngineMetrics{RequestCount: 200, BytesRead: 300, BytesWritten: 200})
+	snap := s.Sample(e)
+	if snap.BytesPerReq != 0 {
+		t.Errorf("bytes fell while requests grew: BytesPerReq = %v, want 0", snap.BytesPerReq)
+	}
+	if snap.ThroughputRPS <= 0 {
+		t.Errorf("ThroughputRPS = %v, want > 0 (the request counter grew)", snap.ThroughputRPS)
+	}
+}
