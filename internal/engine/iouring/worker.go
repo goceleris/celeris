@@ -2678,16 +2678,21 @@ func (w *Worker) stopAccepting(ctx context.Context) {
 // SO_REUSEPORT group. reportWorkerExit calls it on that goroutine, once, while
 // it unwinds; the worker never reaches shutdown.
 //
-// It closes the ring, then the listener, and handles no completion. The pause's
-// close and stopAccepting cancel the accept and wait for its CQE through
-// processCQE, and the CQ head run reads from is a local that the Goexit left
-// unpublished: the wait would meet again the CQEs of the batch the handler ended
-// (the handler's own among them) and run their handlers a second time. Closing
-// the ring ends the multishot accept, and with it the reference to the listener
-// file that the armed accept holds, so the close of the descriptor that follows
-// is the last one; the kernel finishes the ring's teardown on a work queue, so
-// the socket leaves the group a short moment after this returns, not within it.
-// How long is not measured (the test polls).
+// It shuts the listener down for reading, closes the ring, then closes the
+// listener, and handles no completion. The pause's close and stopAccepting
+// cancel the accept and wait for its CQE through processCQE, and the CQ head run
+// reads from is a local that the Goexit left unpublished: the wait would meet
+// again the CQEs of the batch the handler ended (the handler's own among them)
+// and run their handlers a second time. Closing the ring ends the multishot
+// accept, and with it the reference to the listener file that the armed accept
+// holds, but the kernel finishes the ring's teardown on a work queue: left to
+// the close alone, the socket would stay hashed in the SO_REUSEPORT group for
+// some milliseconds after this returns, and take connections that nothing
+// accepts (measured: 50 to 87 of them in a tight dial loop, the first read EOF).
+// shutdown(SHUT_RD) on a listening TCP socket stops it listening and unhashes
+// it from the group on the spot (tcp_disconnect, inet_csk_listen_stop), whatever
+// file references remain, so PauseAccept, which counts this worker done when
+// this returns, may promise that the group has shed it. It runs once, here.
 //
 // What it leaves, as before: the connections' descriptors (with fixed files
 // on, the ring's file table held them, and the ring close ends them: their
@@ -2698,8 +2703,18 @@ func (w *Worker) stopAccepting(ctx context.Context) {
 // it, which shutdown waits for (asyncWG) and this path cannot. The send buffers
 // a SEND_ZC may still read are kept for the life of the process, as shutdown
 // does, without its CQ reads (retainZCSendBufsAfterExit). Worker thread only.
-func (w *Worker) leaveGroupAfterExit() {
-	w.retainZCSendBufsAfterExit()
+//
+// It returns the number of send buffers it kept; it does not log them, because a
+// Logger that blocks must not hold up a PauseAccept: reportWorkerExit logs
+// after the flags and the notify (logKeptZCSendBufs).
+func (w *Worker) leaveGroupAfterExit() (keptZC int) {
+	keptZC = w.retainZCSendBufsAfterExit()
+	if w.listenFD >= 0 {
+		_ = unix.Shutdown(w.listenFD, unix.SHUT_RD)
+	}
+	if w.closingFD > 0 {
+		_ = unix.Shutdown(int(w.closingFD)-1, unix.SHUT_RD)
+	}
 	if w.ring != nil {
 		_ = w.ring.Close()
 		w.ring = nil
@@ -2716,6 +2731,7 @@ func (w *Worker) leaveGroupAfterExit() {
 	}
 	w.lingerUntil = 0
 	w.listenFDClosed.Store(true)
+	return keptZC
 }
 
 // acceptQueuedOnPause accepts every connection still waiting in the listen
@@ -7387,6 +7403,11 @@ func (w *Worker) shutdown() {
 	// asyncClosed + Broadcast above. Prevents stale-memory races
 	// after the engine claims to have stopped.
 	w.asyncWG.Wait()
+	// After the join, so no dispatch goroutine reads the field as it is
+	// written: a step added after the close, in which a Goexit ends the
+	// goroutine, must not have leaveGroupAfterExit close the ring (munmap and
+	// close of a descriptor number that may be reused) a second time.
+	w.ring = nil
 }
 
 // flushBatches publishes the worker-local counters the run loop adds to per

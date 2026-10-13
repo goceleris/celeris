@@ -322,23 +322,38 @@ func (w *Worker) retainZCSendBufsAtShutdown() {
 // leaveGroupAfterExit is about to close: it keeps every send buffer a SEND_ZC
 // may still read, without the enter and the CQ reads, which would handle again
 // the completions of the batch the run loop was in (its CQ head is a local of
-// run that the Goexit left unpublished). Worker thread only.
-func (w *Worker) retainZCSendBufsAfterExit() {
+// run that the Goexit left unpublished). It returns how many buffers it kept and
+// does not log: it runs before the worker is marked exited, and a Logger that
+// blocks must not hold up a PauseAccept (logKeptZCSendBufs, after the notify).
+// Worker thread only.
+func (w *Worker) retainZCSendBufsAfterExit() (kept int) {
 	defer w.retractZCHolds()
 	if bufs := w.zcSendBufsOwed(); len(bufs) > 0 {
-		w.keepZCSendBufs(bufs)
+		w.moveZCSendBufs(bufs)
+		return len(bufs)
 	}
+	return 0
 }
 
 // keepZCSendBufs moves bufs into zcRetained, counts them and logs once.
 func (w *Worker) keepZCSendBufs(bufs [][]byte) {
+	w.moveZCSendBufs(bufs)
+	w.logKeptZCSendBufs(len(bufs))
+}
+
+// moveZCSendBufs moves bufs into zcRetained and counts them. No Logger call.
+func (w *Worker) moveZCSendBufs(bufs [][]byte) {
 	zcRetained.mu.Lock()
 	zcRetained.bufs = append(zcRetained.bufs, bufs...)
 	zcRetained.mu.Unlock()
 	w.handoffLoss.noteShutdownZCBufRetained(uint64(len(bufs)))
-	if w.logger != nil {
+}
+
+// logKeptZCSendBufs is the Info record of n kept send buffers (none: no record).
+func (w *Worker) logKeptZCSendBufs(n int) {
+	if n > 0 && w.logger != nil {
 		w.logger.Info("keeping send buffers a SEND_ZC may still read for the life of the process",
-			"worker", w.id, "buffers", len(bufs))
+			"worker", w.id, "buffers", n)
 	}
 }
 

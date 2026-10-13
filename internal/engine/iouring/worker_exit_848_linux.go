@@ -63,12 +63,13 @@ func (e *Engine) runWatched(ctx context.Context, w *Worker) {
 // Logger that blocks must not hold up a PauseAccept.
 func (e *Engine) reportWorkerExit(w *Worker) {
 	e.abnormalWorkerExits.Add(1)
-	w.leaveGroupAfterExit()
+	keptZC := w.leaveGroupAfterExit()
 	w.exited.Store(true)
 	w.pause.Notify()
 	if w.logger == nil {
 		return
 	}
+	w.logKeptZCSendBufs(keptZC)
 	// debug.Stack here shows the frames of the call that ended the goroutine:
 	// deferred calls run before a Goexit unwinds, so the handler (or callback)
 	// frame and the runtime.Goexit call are still on the stack. Exit path only.
