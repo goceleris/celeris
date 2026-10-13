@@ -556,6 +556,11 @@ func assertSettledRetimed592(o stall589Obs) error {
 		return errors.New("/kv is not promoted (isPromoted=false) at the end of the window")
 	case o.asyncPromotedConns < 1:
 		return fmt.Errorf("AsyncPromotedConns=%d, want >= 1 (no conn was handed to the dispatch goroutine)", o.asyncPromotedConns)
+	case o.engine == "iouring" && o.queuedFrac > stall592IOUringMaxQueuedFrac:
+		return fmt.Errorf("iouring: %d of %d post-promotion /ping samples (%.3f) waited for a blocked Set (over %v), want <= %.2f "+
+			"(stalled over %v: %.3f): the worker is pinned although the route was promoted — the celeris#593 shape, "+
+			"checkTimeouts blocking on a detachMu held across a slow async handler (pinned worker: 0.315-0.351, fixed tree: 0.000)",
+			o.queued, o.samples, o.queuedFrac, o.queuedBar, stall592IOUringMaxQueuedFrac, stall589StallBar, o.stalledFrac)
 	case o.engine == "epoll" && o.refSamples >= stall592MinRefSamples && refUnpinned790(o):
 		// The ratio's premise failed (celeris#790): the reference window was
 		// never pinned, so there is no settled-world median to divide by.

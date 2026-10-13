@@ -331,10 +331,12 @@ jobs:
       # CELERIS_REQUIRE_IOURING_WORKERS=1 turns the rig's skip into a failure.
       # The tally wants exactly one top-level RUN and PASS, each of the six
       # subtests (both engines, three arms) to PASS by name, and no `--- SKIP`
-      # line of any kind. It does not assert the celeris#593 stall the rig prints
-      # for io_uring (IOURING592 ... stalled_frac): the rig asserts a median
-      # ratio there, as it does for epoll, and tightening that is a separate
-      # decision (celeris#622).
+      # line of any kind. The io_uring settled arm also asserts the fraction of
+      # post-promotion /ping samples that waited for the blocked Set (the
+      # celeris#593 stall the IOURING592 line prints as queued_frac), against a
+      # provisional bar (celeris#886 item 1, stall592IOUringMaxQueuedFrac), so a
+      # PASS of that arm is a PASS on that number too; epoll is judged on the
+      # median ratio (celeris#622).
       - name: celeris#592 settled-route retime rig, both engines (memlock raised, skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
