@@ -2917,6 +2917,17 @@ func (w *Worker) initProtocol(cs *connState) {
 			// acquireConnState; reuse it so the async goroutine and the
 			// middleware goroutine share one mutex. Otherwise create
 			// a fresh mutex for the WS/SSE detach flow.
+			// What a panic out of this hook must put back (see the deferred rollback
+			// below): the hook runs on a conn that goes on after the panic unless it
+			// is on the promoted async path.
+			h1 := cs.h1State
+			prevWrite, prevMu, prevPending := cs.writeFn, cs.detachMu, cs.asyncDetachPending
+			var prevRaw func([]byte)
+			var prevPause, prevResume func()
+			if h1 != nil {
+				prevRaw, prevPause, prevResume = h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv
+			}
+			counted, finished := false, false
 			mu := cs.detachMu
 			if mu == nil {
 				mu = &sync.Mutex{}
@@ -2934,6 +2945,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			if !w.async {
 				w.detachedCount++
 				cs.detachCounted = true
+				counted = true
 				if w.detachedConns != nil {
 					w.detachedConns.Add(1)
 				}
@@ -3061,6 +3073,39 @@ func (w *Worker) initProtocol(cs *connState) {
 			completed := !unlockDetachMu
 			// flagged: asyncDetachUnlocked has been published by this closure.
 			flagged := false
+			if !unlockDetachMu {
+				// A conn that is not on the promoted async path goes on after a panic
+				// out of this hook: Context.Detach has not marked the Context detached,
+				// the router answers 500, and the next request is served on the same
+				// conn. Put back everything installed above and below, so that it is
+				// exactly as if Detach had not run: a guarded writeFn left behind
+				// locks detachMu again on the first write of the H2C branch and of
+				// serveAsync, which hold it across theirs (the loop thread, or the
+				// dispatch goroutine, deadlocks on itself), a count left behind is
+				// made again by the next Detach, and closeConn undoes one. The
+				// promoted path closes the conn instead (the deferred hook below).
+				// Assignments only, under no lock: this goroutine owns the conn's
+				// state here, as it did when the hook installed it (#889 item 34).
+				defer func() {
+					if finished {
+						return
+					}
+					cs.writeFn = prevWrite
+					if h1 != nil {
+						h1.UpdateWriteFn(prevWrite)
+						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
+					}
+					cs.detachMu = prevMu
+					cs.asyncDetachPending = prevPending
+					if counted {
+						w.detachedCount--
+						cs.detachCounted = false
+						if w.detachedConns != nil {
+							w.detachedConns.Add(-1)
+						}
+					}
+				}()
+			}
 			if unlockDetachMu {
 				// Registered before guarded is installed (celeris#844): from the moment
 				// cs.writeFn is guarded, a write through the response adapter locks
@@ -3138,6 +3183,11 @@ func (w *Worker) initProtocol(cs *connState) {
 					wake.Signal()
 				}
 			}
+			if !unlockDetachMu {
+				if f := detachPostInstallHook.Load(); f != nil {
+					(*f)() // test seam, #889 item 34 (a conn that is not promoted)
+				}
+			}
 			// Ensure eventfd poll is armed so the worker wakes up.
 			// Sync mode runs OnDetach on the worker thread, so this
 			// SQE submission is safe. Async mode defers to
@@ -3195,6 +3245,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// fix making Detached atomic.
 			cs.h1State.Detached.Store(true)
 			completed = true
+			finished = true
 			// detachMu is released as this closure returns (the defer above),
 			// now that Detached is published, so the guarded writeFn the
 			// middleware calls next (the 101 / SSE headers) can re-acquire it.
@@ -6046,10 +6097,13 @@ func (w *Worker) drainDetachQueue() {
 		// pass (from the same enqueue burst) is a no-op.
 		if cs.asyncDetachPending {
 			cs.asyncDetachPending = false
-			w.detachedCount++
-			cs.detachCounted = true
-			if w.detachedConns != nil {
-				w.detachedConns.Add(1)
+			// Once per conn, whatever enqueued it again (#889 item 34).
+			if !cs.detachCounted {
+				w.detachedCount++
+				cs.detachCounted = true
+				if w.detachedConns != nil {
+					w.detachedConns.Add(1)
+				}
 			}
 			if !w.h2PollArmed && w.wakeFD.FD() >= 0 {
 				w.h2PollArmed = w.prepareH2Poll()

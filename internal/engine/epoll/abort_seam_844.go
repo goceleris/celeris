@@ -26,6 +26,13 @@ var (
 	// recovers the panic, as the router does, then answers in).
 	detachPreFlagHook atomic.Pointer[func()]
 
+	// detachPostInstallHook runs in OnDetach of a conn that is not on the
+	// promoted async path, once everything the hook installs is in place (the
+	// guarded writeFn, the adapter's, RawWriteFn, pause/resume): the point a
+	// panic must be undone from, because the conn goes on as an ordinary
+	// keep-alive conn (#889 item 34).
+	detachPostInstallHook atomic.Pointer[func()]
+
 	// parkWindowHook runs in askTransplant, which askAtPark calls from the
 	// park loop of serveAsync holding cs.asyncInMu: the engine's own code
 	// under that lock (item 1 of celeris#844).
