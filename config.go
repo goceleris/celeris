@@ -183,16 +183,18 @@ type Config struct {
 	// was 100 MB before v1.6.0). Set to -1 to disable the limit (unlimited).
 	//
 	// The engine buffers the whole body in memory before the handler runs, so
-	// the limit times the number of concurrent connections is what clients can
-	// make the server hold. The limit is server-wide: set it to the largest
-	// body any route accepts, and cap the other routes lower with the
-	// middleware/bodylimit package; treat -1 as a choice to accept the
-	// memory. A body over the limit is refused before the handler runs: with
-	// 413 on HTTP/1.1 and on HTTP/2 under the std engine, with RST_STREAM on
-	// HTTP/2 under the epoll, io_uring and adaptive engines, which then also
-	// close the connection. A multipart or form body is a request body like
-	// any other, so with the default the default [Config.MaxFormSize] (32 MB)
-	// is never reached; raise both for larger multipart uploads.
+	// the limit times the number of requests in flight is what clients can
+	// make the server hold (each HTTP/2 stream is a request, up to
+	// MaxConcurrentStreams per connection). The limit is server-wide: set it
+	// to the largest body any route accepts, and cap the other routes lower
+	// with the middleware/bodylimit package; treat -1 as a choice to accept
+	// the memory. A body over the limit is refused before the handler runs:
+	// with 413 on HTTP/1.1 and on HTTP/2 under the std engine, with
+	// RST_STREAM on HTTP/2 under the epoll, io_uring and adaptive engines
+	// (which currently also end the connection). A multipart or form body is
+	// a request body like any other, so with the default the default
+	// [Config.MaxFormSize] (32 MB) is never reached; raise both for larger
+	// multipart uploads.
 	MaxRequestBodySize int64
 
 	// MaxConcurrentStreams limits simultaneous H2 streams per connection (default 100).

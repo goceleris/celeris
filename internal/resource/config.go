@@ -320,8 +320,7 @@ func (c Config) WithDefaults() Config {
 	case c.MaxRequestBodySize == 0 && !c.defaulted:
 		// 4 MiB, as fasthttp and Fiber default to. The body is buffered whole
 		// in memory before the handler runs, so this times the number of
-		// concurrent connections is what one client set can make the server
-		// hold. It was 100 MB, a sanity ceiling hardcoded in the parsers since
+		// requests in flight is what clients can make the server hold. It was 100 MB, a sanity ceiling hardcoded in the parsers since
 		// v1.1.0 (celeris#96 made it configurable and kept the value).
 		c.MaxRequestBodySize = DefaultMaxRequestBodySize
 	}

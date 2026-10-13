@@ -6,8 +6,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,7 +35,7 @@ import (
 // each path that enforces the limit:
 //
 //	h1-cl     HTTP/1.1, Content-Length
-//	h1-chunk  HTTP/1.1, Transfer-Encoding: chunked (std only: celeris#1029)
+//	h1-chunk  HTTP/1.1, Transfer-Encoding: chunked (std only, see celeris#1029)
 //	h2        HTTP/2 prior knowledge, DATA frames, content-length declared
 //	h2-nolen  HTTP/2 prior knowledge, DATA frames, no content-length
 //	upgrade   HTTP/1.1 Upgrade: h2c request with a body (served as stream 1)
@@ -218,15 +216,12 @@ func h1Body889(t *testing.T, addr string, n int64, chunked, upgrade bool) (first
 	return first, "", string(buf)
 }
 
-// h2Client889 is an h2c (prior knowledge) client.
-func h2Client889() *http2.Transport {
-	return &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, addr)
-		},
-	}
+// h2Client889 is an h2c (prior knowledge) client: net/http's own transport,
+// HTTP/2 without TLS only.
+func h2Client889() *http.Transport {
+	var protos http.Protocols
+	protos.SetUnencryptedHTTP2(true)
+	return &http.Transport{Protocols: &protos}
 }
 
 // genBody889 yields n bytes without holding them.
@@ -283,20 +278,22 @@ func TestDefaultMaxRequestBodySize4MiB889(t *testing.T) {
 				}{{"4MiB", 4 * bodyMiB889}, {"4MiB+1", 4*bodyMiB889 + 1}} {
 					ok := cfg.max < 0 || size.n <= cfg.max
 					wantBody := fmt.Sprintf("n=%d", size.n)
-					for _, path := range []struct {
+					type h1Path struct {
 						name             string
 						chunked, upgrade bool
-					}{{"h1-cl", false, false}, {"h1-chunk", true, false}, {"upgrade", false, true}} {
+					}
+					paths := []h1Path{{"h1-cl", false, false}, {"upgrade", false, true}}
+					if e.name == "std" {
+						// No chunked arm for the native engines (celeris#1029): a chunked
+						// body that spans more than one recv is answered 400 there, so no
+						// chunked body of this size can be served or refused by its size
+						// over a socket. Their chunked limit check is covered at the
+						// ProcessH1 level (internal/conn/h1_body_limit_default_889_test.go).
+						// The arm is absent for them, not skipped.
+						paths = append(paths, h1Path{"h1-chunk", true, false})
+					}
+					for _, path := range paths {
 						t.Run(size.name+"/"+path.name, func(t *testing.T) {
-							if path.chunked && e.name != "std" {
-								// celeris#1029: a chunked body that spans more than one recv is
-								// answered 400 on the native engines, so no chunked body of this
-								// size can be served or refused by its size over a socket. The
-								// chunked limit check is covered at the ProcessH1 level
-								// (internal/conn/h1_body_limit_default_889_test.go). A skip is
-								// absent here, not a pass.
-								t.Skip("celeris#1029: chunked request bodies over one recv are answered 400 on the native engines")
-							}
 							first, h2status, body := h1Body889(t, addr, size.n, path.chunked, path.upgrade)
 							switch {
 							case ok && !path.upgrade:
@@ -331,8 +328,9 @@ func TestDefaultMaxRequestBodySize4MiB889(t *testing.T) {
 									t.Fatalf("limit %s, %d body bytes: status %d err %v, want 413", cfg.name, size.n, status, err)
 								}
 							default:
-								var se http2.StreamError
-								if !errors.As(err, &se) || se.Code != http2.ErrCodeCancel {
+								// net/http's HTTP/2 client reports the reset as its own
+								// stream error type: "stream error: stream ID N; CANCEL; received from peer".
+								if err == nil || !strings.Contains(err.Error(), "stream error") || !strings.Contains(err.Error(), "CANCEL") {
 									t.Fatalf("limit %s, %d body bytes: status %d body %q err %v, want RST_STREAM CANCEL", cfg.name, size.n, status, body, err)
 								}
 							}
@@ -429,9 +427,10 @@ func h2Upgraded889(t *testing.T, addr string, n int64) string {
 					mu.Lock()
 				}
 			case *http2.WindowUpdateFrame:
-				if f.StreamID == 0 {
+				switch f.StreamID {
+				case 0:
 					connWin += int64(f.Increment)
-				} else if f.StreamID == 3 {
+				case 3:
 					strWin += int64(f.Increment)
 				}
 			case *http2.HeadersFrame:
