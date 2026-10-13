@@ -43,10 +43,12 @@ type Hijacker interface {
 //     unless its response was already whole.
 //
 // The RST_STREAM is queued behind the frames the stream already queued
-// (Resetter). H2Config.Logger gets a Warn for a stream the processor
-// reset, a Debug for one it ended, and an Error with the stack for a panic and
-// for a Goexit; Processor.OnHandlerPanic, OnHandlerGoexit and
-// OnHandlerUnfinished are told, and the processor counts them.
+// (Resetter). H2Config.Logger gets a Warn for a stream the processor resets
+// after a return (a body short of its declared length, an error return, a
+// response the router saw break off), a Debug for one it ends, and an Error with
+// the stack for a panic and for a Goexit, which reset the stream with no Warn of
+// their own; Processor.OnHandlerPanic, OnHandlerGoexit and OnHandlerUnfinished
+// are told, and the processor counts them.
 //
 // A runtime.Goexit cannot be recovered (recover() returns nil for it), and
 // the epoll and io_uring engines run a stream in one of two places, which
