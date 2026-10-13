@@ -3,7 +3,6 @@ package conn
 import (
 	"context"
 	"errors"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -101,13 +100,14 @@ func TestInvalidContentLengthIsLogged889(t *testing.T) {
 
 // A handler that closes its StreamWriter while the tail is still buffered for
 // the peer's window (the response is whole: its END_STREAM is queued behind
-// that DATA) and then returns an error, panics or calls runtime.Goexit leaves
+// that DATA) and then returns an error or panics leaves
 // the stream standing until the tail and its END_STREAM are out: they are not
 // dropped with the stream, and no RST_STREAM is sent for a whole response.
-// (A raw stream.Handler only: the celeris router returns nil and recovers
+// (A runtime.Goexit is not a case: it ends the event loop that would send the
+// tail. A raw stream.Handler only: the celeris router returns nil and recovers
 // panics.)
 func TestClosedInlineWriterWithBufferedTailThenFailureKeepsItsTail889(t *testing.T) {
-	for _, mode := range []string{"error", "panic", "goexit"} {
+	for _, mode := range []string{"error", "panic"} {
 		t.Run(mode, func(t *testing.T) {
 			h := &syncHandler893{run: func(_ context.Context, s *stream.Stream) error {
 				sw := s.ResponseWriter.(stream.Streamer)
@@ -123,8 +123,6 @@ func TestClosedInlineWriterWithBufferedTailThenFailureKeepsItsTail889(t *testing
 				switch mode {
 				case "panic":
 					panic("boom889")
-				case "goexit":
-					runtime.Goexit()
 				}
 				return errors.New("boom889")
 			}}

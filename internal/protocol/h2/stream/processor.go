@@ -1254,7 +1254,6 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 			p.handlerGoexited(stream.ID)
 			stream.EndUse()
 			p.settleFailed(stream, nil, true)
-			keepAlive = stream.AbandonOutbound()
 		}
 
 		if stream.Data != nil {
