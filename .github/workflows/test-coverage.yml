@@ -54,8 +54,8 @@ jobs:
   coverage:
     name: Coverage (root + middleware sub-modules)
     runs-on: ubuntu-latest
-    # 30: the root step may run 480 s, the iouring step up to 480 s and the four
-    # middleware steps up to 120 s each, which is 24 min at their own limits
+    # 30: the root step may run 540 s, the iouring step up to 480 s and the four
+    # middleware steps up to 120 s each, which is 25 min at their own limits
     # before checkout and setup-go (it was 40 while the root step's limit was
     # 1200 s). Refs #890.
     timeout-minutes: 30
@@ -127,12 +127,13 @@ jobs:
           # together. Everything NOT listed runs here. The guard is ci.yml's.
           .github/scripts/root-shards.sh check
           skip=$(.github/scripts/root-shards.sh skip-regex)
-          # -timeout=480s: the tests that stay here take about 110 s of the package's
-          # 552 s, a little more under coverage; the whole package took 620.8 s under
-          # coverage before the shards (run 38327908174), so 480 s is a margin of 3x
-          # or more. Refs #890.
+          # -timeout=540s: the tests that stay here took 176.4 s under coverage on the
+          # runner (run 38348908034; 620.8 s for the whole package before the shards,
+          # run 38327908174), so 540 s keeps a margin of 3x. A new root test that is
+          # in no shard lands here until it is listed in .github/root-test-shards.txt.
+          # Refs #890.
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
-          go test -race -count=1 -timeout=480s -covermode=atomic -skip "$skip" \
+          go test -race -count=1 -timeout=540s -covermode=atomic -skip "$skip" \
             -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
       # ./internal/engine/iouring on its own, as ci.yml's unit job runs it.
       # io_uring charges ring memory to the user, so every test process of the
@@ -251,8 +252,8 @@ jobs:
   # (codecov.yml waits for all seven). The shard's tests must each run and PASS
   # by name, as in ci.yml. Not a required check, like the job above.
   #
-  # -timeout=900s: filled in from the measured time under coverage (see the
-  # PR body of celeris#890).
+  # -timeout=660s: the shards took 215.5 s (a) and 221.2 s (b) under coverage on
+  # the runner (run 38348908034), so 660 s keeps a margin of 3x.
   coverage-root-shard:
     name: Coverage root shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -281,7 +282,7 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           run=$(.github/scripts/root-shards.sh run-regex "$SHARD")
-          go test -race -count=1 -timeout=900s -covermode=atomic -v -run "$run" \
+          go test -race -count=1 -timeout=660s -covermode=atomic -v -run "$run" \
             -coverprofile="$RUNNER_TEMP/cover-root-$SHARD.out" . 2>&1 | tee /tmp/shard.log
           .github/scripts/root-shards.sh tally-shard "$SHARD" /tmp/shard.log
           blocks=$(grep -vc '^mode: ' "$RUNNER_TEMP/cover-root-$SHARD.out" || true)

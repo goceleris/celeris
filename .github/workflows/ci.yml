@@ -170,11 +170,13 @@ jobs:
           # or when a shard has no job. Every root test NOT listed runs here.
           .github/scripts/root-shards.sh check
           skip=$(.github/scripts/root-shards.sh skip-regex)
-          # -timeout=360s: the tests that stay here take about 110 s of the 552 s the
-          # package's tests took on the runner (596 s wall before the shards, run
-          # 38344043158), so 360 s keeps a margin of 3x. Refs #890.
+          # -timeout=540s: the tests that stay here took 179.5 s on the runner with the
+          # other packages running beside them (run 38348908017; 596.4 s for the whole
+          # package before the shards, run 38344043158), so 540 s keeps a margin of 3x.
+          # A new root test that is in no shard lands here: the margin is what absorbs
+          # it until it is listed in .github/root-test-shards.txt. Refs #890.
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=360s -skip "$skip" -v $pkgs 2>&1 | tee /tmp/root.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=540s -skip "$skip" -v $pkgs 2>&1 | tee /tmp/root.log
           # The shards' tests must not have run here (-skip applied), and the other
           # tallies below still see every test this step is responsible for.
           .github/scripts/root-shards.sh tally-rest /tmp/root.log
@@ -1118,9 +1120,9 @@ jobs:
   # and PASS by name, and no SKIP line is allowed at all (none of them skips on
   # the runner today), because a skip is absent, not a pass.
   #
-  # -timeout=600s: each shard's tests take about 221 s on the runner (CI run
-  # 38344043158: 220.5 s and 221.8 s of test time; 211.7 s and 217.3 s on a
-  # linux/arm64 container with 4 CPUs), so 600 s keeps a margin of 2.7x.
+  # -timeout=660s: the shards took 214.7 s (a) and 225.5 s (b) on the runner (run
+  # 38348908017; 215.3 s and 220.5 s on a linux/arm64 container with 4 CPUs), so
+  # 660 s keeps a margin of 2.9x or more.
   unit-root-shard:
     name: Unit root shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -1146,17 +1148,18 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           run=$(.github/scripts/root-shards.sh run-regex "$SHARD")
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=600s -v -run "$run" . 2>&1 | tee /tmp/shard.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=660s -v -run "$run" . 2>&1 | tee /tmp/shard.log
           .github/scripts/root-shards.sh tally-shard "$SHARD" /tmp/shard.log
 
   # The required check. It carries the name the repository's ruleset requires and
   # passes only when the `unit` job and every root-package shard passed: a
-  # skipped or cancelled job is not a pass. `if: !cancelled()` makes it run, and
-  # fail, when a job it needs failed; without it, a failure would leave the
-  # required check "skipped", which a ruleset accepts as passing.
+  # skipped or cancelled job is not a pass. `if: always()` makes it run, and
+  # fail, when a job it needs failed or the run was cancelled; with the default
+  # condition (or `!cancelled()`) the gate would be SKIPPED then, and a skipped
+  # required check counts as passing, which a cancelled `unit` job never did.
   unit-gate:
     name: Unit (root + middleware sub-modules)
-    if: ${{ !cancelled() }}
+    if: ${{ always() }}
     needs: [unit, unit-root-shard]
     runs-on: ubuntu-latest
     timeout-minutes: 5
