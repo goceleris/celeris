@@ -121,8 +121,9 @@ func installFakeKernel(t *testing.T, possible int, initial ...int) *fakeKernel {
 	return k
 }
 
-// TestSaveThreadAffinityOnAKernelWithMoreThan1024CPUs (celeris#884 item 36,
-// celeris#885 item 15): sched_getaffinity into a 1024-bit unix.CPUSet fails
+// TestSaveThreadAffinityOnAKernelWithMoreThan1024CPUs (the checklist item
+// "when platform.SaveThreadAffinity fails, the loop still calls PinToCPU" that
+// #907's round-2 reviews added to celeris#884 and celeris#885): sched_getaffinity into a 1024-bit unix.CPUSet fails
 // with EINVAL on a kernel with 2048 possible CPUs, and the engine loop that
 // then skipped the save parked its main thread pinned. The save has to
 // succeed, and Restore has to hand back every CPU of the saved mask, one the

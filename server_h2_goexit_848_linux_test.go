@@ -154,8 +154,8 @@ func freshAfterFault848(t *testing.T, addr string, answered, tried int) {
 		return
 	}
 	// A miss: either no loop is left and the connect is refused, or the dead
-	// listener was still being released (io_uring: the ring's teardown runs on
-	// a work queue) and a re-probe is answered once it is gone.
+	// listener was not yet shut (the report counts the exit before the worker
+	// leaves the group) and a re-probe is answered once it is gone.
 	for dl := time.Now().Add(2 * time.Second); time.Now().Before(dl); time.Sleep(20 * time.Millisecond) {
 		c, err := net.DialTimeout("tcp", addr, time.Second)
 		if err != nil {
@@ -171,7 +171,7 @@ func freshAfterFault848(t *testing.T, addr string, answered, tried int) {
 		}
 	}
 	t.Errorf("%d of %d fresh conns after the fault were answered, and the rest connected to a listener that answers nothing: "+
-		"the dead loop's listener is still in the SO_REUSEPORT group (celeris#884 item 65, celeris#885 item 46)", answered, tried)
+		"the dead loop's listener is still in the SO_REUSEPORT group (the Goexit items from celeris#848 on the checklists celeris#884 and celeris#885)", answered, tried)
 }
 
 func h2Class848(ended bool, err error) string {

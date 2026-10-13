@@ -15,7 +15,7 @@ import (
 
 // A worker that ended without returning (a sync handler called
 // runtime.Goexit, celeris#848) must leave the SO_REUSEPORT group, and a pause
-// must not wait on it (celeris #884 item 65). Before, its listener stayed open and
+// must not wait on it (the Goexit item from celeris#848 on the checklist celeris#884). Before, its listener stayed open and
 // took a share of new connections that nothing would accept, PauseAccept waited
 // to its bound (Linger()+1s, about 2.5 s) and returned nil, and a second
 // pause after a ResumeAccept waited the same again: ResumeAccept clears the
