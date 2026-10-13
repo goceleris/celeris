@@ -3,10 +3,15 @@
 package adaptive
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -51,9 +56,16 @@ func (s *lastSnapSampler) Rebase(e engine.Engine) {
 // and the snapshot it decided on.
 func feed856(t *testing.T, delta func(m *engine.EngineMetrics)) (revert bool, snap TelemetrySnapshot) {
 	t.Helper()
+	return feed856Log(t, testLogger(), delta)
+}
+
+// feed856Log is feed856 with the controller's logger supplied, for a test that
+// reads what the controller logged.
+func feed856Log(t *testing.T, logger *slog.Logger, delta func(m *engine.EngineMetrics)) (revert bool, snap TelemetrySnapshot) {
+	t.Helper()
 	iou := newMockEngine(engine.IOUring)
 	sampler := &lastSnapSampler{TelemetrySampler: newLiveSampler(nil)}
-	c := newController(iou, newMockEngine(engine.Epoll), sampler, testLogger())
+	c := newController(iou, newMockEngine(engine.Epoll), sampler, logger)
 	c.cooldown = 0
 	// The production policy: only the error-revert can move an io_uring
 	// engine, so a low-load tick cannot recommend anything here.
@@ -151,6 +163,146 @@ func TestPeerGoneBucketAheadOfTotalCannotUnderflow856(t *testing.T) {
 	if revert || snap.ErrorRate != 0 {
 		t.Errorf("revert=%v error_rate=%v for a peer-gone bucket larger than ErrorCount, want no revert and 0",
 			revert, snap.ErrorRate)
+	}
+}
+
+// The bench has no per-bucket error series, so a revert could not be
+// attributed to a bucket after the fact: the "engine switch recommended" line
+// carried only error_rate (celeris#886 item 10). The line now carries the
+// interval's delta of every non-zero Error* bucket, send_peer_gone included
+// although the rate leaves it out.
+
+// switchLine856 returns the "engine switch recommended" record out of a JSON
+// slog stream, as a map of its attributes.
+func switchLine856(t *testing.T, buf *bytes.Buffer) map[string]any {
+	t.Helper()
+	var found map[string]any
+	dec := json.NewDecoder(buf)
+	for dec.More() {
+		var rec map[string]any
+		if err := dec.Decode(&rec); err != nil {
+			t.Fatalf("log output is not JSON: %v", err)
+		}
+		if rec["msg"] == "engine switch recommended" {
+			if found != nil {
+				t.Fatalf("two switch lines: %v and %v", found, rec)
+			}
+			found = rec
+		}
+	}
+	if found == nil {
+		t.Fatalf("no \"engine switch recommended\" line was logged: %s", buf.String())
+	}
+	return found
+}
+
+// snake856 turns a field name into its attribute name: ErrorSendPeerGone to
+// error_send_peer_gone, ErrorAcceptFDLimit to error_accept_fd_limit.
+func snake856(s string) string {
+	isUpper := func(b byte) bool { return b >= 'A' && b <= 'Z' }
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		// A new word starts at an upper-case letter that follows a lower-case
+		// one, or that ends an acronym (the L of FDLimit).
+		if i > 0 && isUpper(s[i]) && (!isUpper(s[i-1]) || (i+1 < len(s) && !isUpper(s[i+1]))) {
+			b.WriteByte('_')
+		}
+		b.WriteByte(s[i])
+	}
+	return strings.ToLower(b.String())
+}
+
+// TestSwitchLineCarriesTheErrorBuckets886: 7 transmit faults and 3 sends to
+// departed peers in one interval, against 10 requests. The revert fires on the
+// 7 (error_rate 0.7); the line names both buckets, the peer-gone one although
+// the rate leaves it out, and names no bucket that did not move.
+func TestSwitchLineCarriesTheErrorBuckets886(t *testing.T) {
+	var buf bytes.Buffer
+	revert, snap := feed856Log(t, slog.New(slog.NewJSONHandler(&buf, nil)), func(m *engine.EngineMetrics) {
+		m.RequestCount += 10
+		m.ErrorSend = 7
+		m.ErrorSendPeerGone = 3
+		m.ErrorCount = 10
+	})
+	if !revert {
+		t.Fatalf("7 send faults against 10 requests did not revert (error_rate=%v)", snap.ErrorRate)
+	}
+	line := switchLine856(t, &buf)
+	if got, ok := line["error_send"].(float64); !ok || got != 7 {
+		t.Errorf("error_send = %v, want 7 (line %v)", line["error_send"], line)
+	}
+	if got, ok := line["error_send_peer_gone"].(float64); !ok || got != 3 {
+		t.Errorf("error_send_peer_gone = %v, want 3 (line %v)", line["error_send_peer_gone"], line)
+	}
+	if got, ok := line["error_rate"].(float64); !ok || got < 0.7-1e-9 || got > 0.7+1e-9 {
+		t.Errorf("error_rate = %v, want 0.7: the existing attrs must stay (line %v)", line["error_rate"], line)
+	}
+	for k := range line {
+		if strings.HasPrefix(k, "error_") && k != "error_rate" && k != "error_send" && k != "error_send_peer_gone" {
+			t.Errorf("the line names %s although that bucket did not move (line %v)", k, line)
+		}
+	}
+}
+
+// TestSwitchLineNamesEveryErrorField886 is the guard against a bucket added to
+// EngineMetrics and left out of the log: every Error* field but the ErrorCount
+// sum is given its own value in the interval, and each must come back under
+// its snake-case name with that value. A field the controller does not
+// carry fails here, whatever the table inside it looks like.
+func TestSwitchLineNamesEveryErrorField886(t *testing.T) {
+	typ := reflect.TypeOf(engine.EngineMetrics{})
+	var names []string
+	for i := 0; i < typ.NumField(); i++ {
+		if n := typ.Field(i).Name; strings.HasPrefix(n, "Error") && n != "ErrorCount" {
+			names = append(names, n)
+		}
+	}
+	if len(names) != 11 {
+		t.Fatalf("EngineMetrics has %d Error* buckets besides ErrorCount (%v), this test and the log were written for 11: extend both", len(names), names)
+	}
+	var buf bytes.Buffer
+	revert, snap := feed856Log(t, slog.New(slog.NewJSONHandler(&buf, nil)), func(m *engine.EngineMetrics) {
+		m.RequestCount += 10
+		v := reflect.ValueOf(m).Elem()
+		var sum uint64
+		for i, n := range names {
+			v.FieldByName(n).SetUint(uint64(i + 1))
+			sum += uint64(i + 1)
+		}
+		m.ErrorCount = sum
+	})
+	if !revert {
+		t.Fatalf("no revert (error_rate=%v)", snap.ErrorRate)
+	}
+	line := switchLine856(t, &buf)
+	for i, n := range names {
+		key := snake856(n)
+		if got, ok := line[key].(float64); !ok || got != float64(i+1) {
+			t.Errorf("%s = %v, want %d (line %v)", key, line[key], i+1, line)
+		}
+	}
+}
+
+// TestBucketDeltaIsPerIntervalAndSaturates886: the logged number is the delta
+// of the interval, not the cumulative counter, and a bucket that reads lower
+// than at the last sample reads 0, not 2^64.
+func TestBucketDeltaIsPerIntervalAndSaturates886(t *testing.T) {
+	iou := newMockEngine(engine.IOUring)
+	s := newLiveSampler(nil)
+	iou.SetMetrics(engine.EngineMetrics{RequestCount: 100, ErrorSend: 40, ErrorHandler: 9, ErrorCount: 49})
+	s.Sample(iou)
+	time.Sleep(2 * time.Millisecond)
+	iou.SetMetrics(engine.EngineMetrics{RequestCount: 200, ErrorSend: 45, ErrorHandler: 2, ErrorCount: 47})
+	snap := s.Sample(iou)
+	var buf bytes.Buffer
+	c := newController(iou, newMockEngine(engine.Epoll), newSyntheticSampler(), slog.New(slog.NewJSONHandler(&buf, nil)))
+	c.logSwitch("io_uring", "epoll", "error-rate safety revert", 0, snap)
+	line := switchLine856(t, &buf)
+	if got := line["error_send"]; got != float64(5) {
+		t.Errorf("error_send = %v, want 5 (45 now, 40 at the last sample)", got)
+	}
+	if _, ok := line["error_handler"]; ok {
+		t.Errorf("error_handler = %v: a bucket that fell must read 0 and be left out", line["error_handler"])
 	}
 }
 
