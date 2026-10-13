@@ -81,10 +81,12 @@ func resumeLag886(t *testing.T, e *Engine, port, want int, gaveup time.Duration)
 // straight after the pause must make every worker listen again within
 // lagBound. The pause is DisableDeferAccept's (its listener closes at once),
 // the resume follows it with no sleep, and the cycle runs three times, since
-// the lag is the remainder of a wait. The first arm holds live connections
-// (the worker can never park); the second holds none, and it lags just the
-// same, because the worker parks only at the iteration after the pause's
-// close, which is after its first wait with no listener.
+// the lag is the remainder of a wait. Two workers are asked for: with memlock
+// raised both start, and a fix that signalled only one of them fails; at the
+// runner's 8 MiB one starts (see the PREMISE check). The first arm holds live
+// connections (the worker can never park); the second holds none, and it lags
+// just the same, because the worker parks only at the iteration after the
+// pause's close, which is after its first wait with no listener.
 func TestResumeAcceptReachesAWorkerThatCannotPark886(t *testing.T) {
 	const (
 		cycles   = 3
@@ -102,6 +104,14 @@ func TestResumeAcceptReachesAWorkerThatCannotPark886(t *testing.T) {
 			r.e.mu.Lock()
 			want := len(r.e.workers)
 			r.e.mu.Unlock()
+			// Where memlock funds two workers the test must run with two: a
+			// fix that signalled only the first worker passes with one. The
+			// runner's 8 MiB funds one, so the unit job runs one worker here;
+			// the job `iouring` step for the multi-worker tests runs this test
+			// by name with memlock raised and skipping forbidden.
+			if maxW := MaxWorkersForMemlock(); want < 2 && (maxW < 0 || maxW >= 2) {
+				t.Fatalf("celeris886 PREMISE: %d io_uring worker(s) started with memlock funding %d (-1: unlimited), want 2", want, maxW)
+			}
 			port := portOf895(t, r.e.Addr())
 			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 			live886(t, addr, tc.conns)
