@@ -61,7 +61,7 @@ type H2Config struct {
 	MaxConcurrentStreams uint32
 	InitialWindowSize    uint32
 	MaxFrameSize         uint32
-	MaxRequestBodySize   int64 // 0 = use default (100 MB)
+	MaxRequestBodySize   int64 // 0 = unlimited; resource.Config.WithDefaults resolves the default
 	// WriteTimeout bounds how long a worker-pool handler waits for the
 	// peer's flow-control window to send a response the connection's
 	// outbound budget would not let it hand off (celeris#893): then its

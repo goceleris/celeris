@@ -18,8 +18,11 @@
 //
 // Note: this middleware runs after the engine has buffered the body. It adds
 // an application-level per-route cap below the server-wide engine limit
-// (celeris.Config.MaxRequestBodySize, default 100 MiB); it is not a
-// substitute for setting that limit.
+// (celeris.Config.MaxRequestBodySize, default 4 MiB); it is not a
+// substitute for setting that limit. A [Config].MaxBytes above the engine
+// limit never triggers, because the engine refuses the body first: a route
+// that accepts larger uploads needs celeris.Config.MaxRequestBodySize raised
+// too (-1 disables the engine limit).
 //
 // # Documentation
 //

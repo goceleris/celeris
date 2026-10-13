@@ -81,7 +81,7 @@ func TestWithDefaultsIsIdempotent(t *testing.T) {
 
 // TestWithDefaultsMaxRequestBodySizeIdempotent covers the same double
 // normalisation on the other -1 sentinel field: -1 means "unlimited", carried
-// internally as 0, which the second pass used to replace with the 100 MB
+// internally as 0, which the second pass used to replace with the 4 MiB
 // default (celeris#594).
 func TestWithDefaultsMaxRequestBodySizeIdempotent(t *testing.T) {
 	cases := []struct {
@@ -90,7 +90,7 @@ func TestWithDefaultsMaxRequestBodySizeIdempotent(t *testing.T) {
 		want int64
 	}{
 		{name: "unlimited/-1", in: -1, want: 0},
-		{name: "unset/0", in: 0, want: 100 << 20},
+		{name: "unset/0", in: 0, want: 4 << 20},
 		{name: "explicit", in: 4096, want: 4096},
 	}
 	for _, tc := range cases {
@@ -125,7 +125,7 @@ func TestWithDefaultsPreservesNonSentinelDefaults(t *testing.T) {
 		{"InitialWindowSize", one.InitialWindowSize, uint32(1 << 20), two.InitialWindowSize},
 		{"MaxConcurrentStreams", one.MaxConcurrentStreams, uint32(100), two.MaxConcurrentStreams},
 		{"MaxHeaderBytes", one.MaxHeaderBytes, 16 << 20, two.MaxHeaderBytes},
-		{"MaxRequestBodySize", one.MaxRequestBodySize, int64(100 << 20), two.MaxRequestBodySize},
+		{"MaxRequestBodySize", one.MaxRequestBodySize, int64(4 << 20), two.MaxRequestBodySize},
 		{"ReadTimeout", one.ReadTimeout, 60 * time.Second, two.ReadTimeout},
 		{"ReadHeaderTimeout", one.ReadHeaderTimeout, 10 * time.Second, two.ReadHeaderTimeout},
 		{"WriteTimeout", one.WriteTimeout, 60 * time.Second, two.WriteTimeout},

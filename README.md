@@ -46,7 +46,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 - **Response buffering** — `BufferResponse` / `FlushResponse` for transform middleware (compress, ETag, cache).
 - **File serving** — `File()` from the OS, `FileFromFS()` from `embed.FS` / `fs.FS`.
 - **Content negotiation** — `Negotiate`, `Respond`, `AcceptsEncodings`, `AcceptsLanguages`.
-- **Configurable body limits** — `MaxRequestBodySize` enforced on HTTP/1.1 and h2c (the net/http bridge has a fixed 100 MB cap).
+- **Configurable body limits** — `MaxRequestBodySize` enforced on HTTP/1.1 and h2c (default 4 MiB; the net/http bridge has two fixed 100 MB caps: `ToHandler` on the request body, `Adapt` on the adapted handler's buffered response).
 - **100-continue control** — `OnExpectContinue` callback validates uploads before the body transfers.
 - **Accept control** — `PauseAccept()` / `ResumeAccept()` for graceful load shedding. A pause carries clients that have connected but not yet sent their request: it keeps the listen sockets open for about 1.5 s with `TCP_DEFER_ACCEPT` cleared before closing them, and blocks for that long; set `DisableDeferAccept` for a pause that closes at once ([#662](https://github.com/goceleris/celeris/issues/662), [#675](https://github.com/goceleris/celeris/issues/675)).
 - **Zero-downtime restart** — `InheritListener` + `StartWithListener` for socket inheritance.
@@ -61,7 +61,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 go get github.com/goceleris/celeris@latest
 ```
 
-Requires **Go 1.27.0+** (the `go` directive in `go.mod` is the source of truth). Linux for the io_uring / epoll / adaptive engines; any OS for the std engine. On Windows the server (std engine) and the database drivers build and run for development and testing; Linux is the supported production platform (see [Platform support](#platform-support)).
+Requires **Go 1.27.2+** (the `go` directive in `go.mod` is the source of truth). Linux for the io_uring / epoll / adaptive engines; any OS for the std engine. On Windows the server (std engine) and the database drivers build and run for development and testing; Linux is the supported production platform (see [Platform support](#platform-support)).
 
 ```go
 package main
@@ -215,7 +215,7 @@ s := celeris.New(celeris.Config{
 	WriteTimeout:       30 * time.Second,
 	IdleTimeout:        120 * time.Second,
 	ShutdownTimeout:    10 * time.Second,  // max wait for in-flight requests (default 30s)
-	MaxRequestBodySize: 50 << 20,          // 50 MB (default 100 MB, -1 for unlimited)
+	MaxRequestBodySize: 50 << 20,          // 50 MB (default 4 MiB, -1 for unlimited)
 	AsyncHandlers:      false,             // server-level default (per-route .Async() overrides)
 	Logger:             slog.Default(),
 })
@@ -460,7 +460,7 @@ validation/     Runtime invariant assertions + validation hooks (debug builds)
 
 ## Requirements
 
-- **Go 1.27.0+** (see the `go` directive in `go.mod`)
+- **Go 1.27.2+** (see the `go` directive in `go.mod`)
 - **Linux** for the io_uring / epoll / adaptive engines (kernel 5.19+ for io_uring; 5.10+ for epoll and adaptive, which runs on epoll below 5.19)
 - **Any OS** for the std engine
 - **Windows**: development and testing only, with the std engine and the portable driver fallback; see [Platform support](#platform-support)

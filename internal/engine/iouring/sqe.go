@@ -18,8 +18,22 @@ func prepAccept(sqePtr unsafe.Pointer, listenFD int, flags uint32) {
 	*(*uint32)(unsafe.Pointer(&sqe[24])) = 0
 }
 
+// acceptFlags is the accept_flags of every accept that returns a descriptor of
+// the process (all but the fixed-file one below): the accepted socket is
+// non-blocking, so the engine's inline writes never wait for a client, and
+// close-on-exec. Nothing else sets either on it (sockopts.ApplyFD does not
+// set O_NONBLOCK), so an accept that passes 0 yields a blocking, inheritable
+// descriptor (celeris#884).
+const acceptFlags = uint32(unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC)
+
+// prepSingleShotAccept prepares the one-shot accept of a tier without
+// multishot accept, with the same flags as the multishot one.
+func prepSingleShotAccept(sqePtr unsafe.Pointer, listenFD int) {
+	prepAccept(sqePtr, listenFD, acceptFlags)
+}
+
 func prepMultishotAccept(sqePtr unsafe.Pointer, listenFD int) {
-	prepAccept(sqePtr, listenFD, uint32(unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC))
+	prepSingleShotAccept(sqePtr, listenFD)
 	sqe := (*[sqeSize]byte)(sqePtr)
 	*(*uint16)(unsafe.Pointer(&sqe[2])) = acceptMultishot // ioprio at offset 2
 }

@@ -11,6 +11,10 @@ import (
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
+// maxToHandlerBodySize bounds the request body ToHandler buffers. It is not
+// Config.MaxRequestBodySize: ToHandler runs under a net/http server, which has
+// no celeris Config to read it from, and the cap has no setting of its own, so
+// it stays at 100 MB when that default drops to 4 MiB (v1.6.0).
 const maxToHandlerBodySize = maxBodySize
 
 // ToHandler wraps a celeris HandlerFunc as an http.Handler for use with

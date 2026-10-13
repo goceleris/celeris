@@ -304,9 +304,13 @@ type Loop struct {
 	driverConns map[int]*driverConn
 	driverMu    sync.RWMutex
 	// driverGen is the generation of the last driver registration on this
-	// loop (protected by driverMu). Each RegisterConn takes the next one,
-	// never 0; HTTP conns' events carry 0 (celeris#771).
-	driverGen      uint32
+	// loop (protected by driverMu). Each RegisterConn takes the next one, in
+	// 1..maxDriverGen: never 0, and never with bit 31 set, which is an HTTP
+	// conn's (celeris#771, celeris#885).
+	driverGen uint32
+	// httpGen is the counter the HTTP conns' generations are drawn from
+	// (nextHTTPGen): the last one, without bit 31. Loop thread only.
+	httpGen        uint32
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
 	// driverReadQ holds the driver conns whose last read turn used up
@@ -676,14 +680,38 @@ func (l *Loop) run(ctx context.Context) {
 			}
 
 			// Driver fast-path: a load of the event's Pad (read with the
-			// event, the generation of a driver registration, 0 for every
-			// HTTP conn) and a single atomic load when no drivers are
-			// registered (zero-cost for pure-HTTP workloads). The map lookup
-			// happens only when one of them says driver. dispatchDriver
-			// drops an event that names a registration which has ended
-			// (celeris#771).
-			if pad := uint32(ev.Pad); l.driverCandidate(pad) {
+			// event: the generation of a driver registration, an HTTP conn's
+			// generation with bit 31 set, or 0) and a single atomic load when
+			// no drivers are registered (zero-cost for pure-HTTP workloads).
+			// The map lookup happens only when one of them says driver.
+			// dispatchDriver drops an event that names a registration which
+			// has ended (celeris#771).
+			pad := uint32(ev.Pad)
+			if l.driverCandidate(pad) {
 				if l.dispatchDriver(fd, pad, ev.Events) {
+					continue
+				}
+			}
+			// An HTTP conn's event carries the generation of its registration
+			// (httpGenBit set), and a driver's has been dealt with: what is
+			// left is Pad 0 (the listen socket, the timer, a descriptor that
+			// is no conn's) or an HTTP generation. An event collected for an
+			// HTTP conn that has since closed must not reach the conn on its
+			// number now: a handler that is not the event's own (the timer
+			// branch's checkTimeouts, a transplant, an h2 pass) may have
+			// closed it earlier in this batch, and acceptAll may have put a
+			// new conn on the number (celeris#885 item 18). Pad 0 skips the
+			// check: the descriptors that carry it (the wake eventfd, the
+			// timerfd and the listen socket, all matched by number above,
+			// before any generation is looked at, and the re-created listen
+			// socket) are not conns. A stale event of a conn that closed
+			// earlier in this batch can therefore be taken for one of them
+			// when its number has since been reissued to it (a sync-mode
+			// Detach creates the wake eventfd inside drainRead): the eventfd
+			// read, the sweep or the accept that follows is harmless, as
+			// drainDetachQueue runs after the batch regardless.
+			if pad != 0 && fd >= 0 && fd < len(l.conns) {
+				if cs := l.conns[fd]; cs != nil && cs.gen != pad {
 					continue
 				}
 			}
@@ -698,8 +726,10 @@ func (l *Loop) run(ctx context.Context) {
 			// write backpressure (armEpollOut). Flush the pending bytes and
 			// disarm once drained. drainRead above may have closed the conn,
 			// so re-validate the slot. EPOLLOUT is edge-triggered here (EPOLLET
-			// covers the whole mask), and a partial flush stops at EAGAIN, so
-			// the send buffer gaining room is the next edge that resumes it.
+			// covers the whole mask), and a partial flush (a short write or
+			// EAGAIN: one write(2) per flush, whose short count means the send
+			// buffer was full) leaves it full, so the send buffer gaining room
+			// is the next edge that resumes it.
 			if ev.Events&unix.EPOLLOUT != 0 {
 				if fd >= 0 && fd < len(l.conns) {
 					if cs := l.conns[fd]; cs != nil && cs.epollOut {
@@ -947,6 +977,25 @@ func (l *Loop) run(ctx context.Context) {
 // dispatch goroutine that is still inside its handler (celeris#669); that
 // goroutine is writing the response under detachMu, so csWritePending would
 // read its buffers unlocked, and closeConn would only repeat the hand-off.
+//
+// What the verdict is made of is read under detachMu (celeris#885 items 27 and
+// 36): h1State, which switchToH2Local sets to nil on the dispatch goroutine
+// under that lock, and the write state, which the goroutine's writeFn appends
+// to under it, csWritePending and the count markClosing stamps. They are read
+// once, together, and the lock is released before anything is done with them:
+// closeConn and notifyDetachedPeerClosed take the same non-reentrant mutex.
+//
+// The lock is taken with TryLock and never with a plain Lock while a handler
+// runs: the goroutine holds it across ProcessH1, so waiting would park the
+// loop, and every conn on it, behind one slow handler (celeris#669). EPOLLRDHUP
+// is edge-triggered, so the event cannot be skipped either: it would not come
+// again. A half-close found while a handler runs is owed instead
+// (halfCloseOwed), as the dirty pass and the EPOLLOUT resume owe their flush:
+// the conn is given up (relink) and its goroutine hands it back at its next
+// park, where drainDetachQueue runs this again (handBackHalfClose). A holder
+// that is not a running handler (a detached conn's guarded writeFn, or the
+// goroutine between handlers) holds it for one write, so that wait is bounded
+// and the lock is waited for, as every other site does (dispatchBusy).
 func (l *Loop) onPeerHalfClose(fd int) {
 	if fd < 0 || fd >= len(l.conns) {
 		return
@@ -955,26 +1004,73 @@ func (l *Loop) onPeerHalfClose(fd int) {
 	if cs == nil || cs.detachClosed || cs.asyncClosed.Load() {
 		return
 	}
-	// h1State is loaded once, into a local. switchToH2Local sets it to nil
-	// under detachMu on the dispatch goroutine, and the memory model lets a
-	// `cs.h1State != nil && cs.h1State.Detached.Load()` reload it between the
-	// test and the dereference (a nil dereference). The gc compiler happens to
-	// merge the two loads today (arm64 and amd64 disassembly, celeris#865
-	// review), so this removes a dependence on that, not a crash seen.
-	// The load itself still races with that write and is unlocked on purpose:
-	// EPOLLRDHUP is edge-triggered, so skipping a conn whose lock is held (the
-	// TryLock the sweep uses) could lose the event for good. What to do with a
-	// held lock here is for the async-abort work (celeris#844); the race report
-	// is tracked in celeris#885.
-	h1 := cs.h1State
+	mu := cs.detachMu
+	if mu != nil && !mu.TryLock() {
+		if dispatchBusy(cs, &cs.relinkOwed) {
+			cs.halfCloseOwed = true
+			l.relink(cs)
+			return
+		}
+		mu.Lock()
+	}
+	if mu != nil && cs.hijacked.Load() {
+		// The run loop read cs from its slot, and then the conn's handler
+		// hijacked it (celeris#668): the descriptor is closed and its number
+		// may be another file's. This is belt and braces: closeConn
+		// re-reads the slot under driverMu and re-validates ownership under
+		// the lock, and markClosing touches loop-thread fields only. What
+		// the return buys is that a hijacked conn is neither marked closing
+		// nor closed from a verdict read before the hijack
+		// (TestOnPeerHalfCloseLeavesAHijackedConnAlone885). drainDetachQueue
+		// settles the rest.
+		mu.Unlock()
+		return
+	}
+	// Only plain and atomic loads from here to the Unlock: nothing can panic
+	// or block while the lock is held.
+	var (
+		detached bool
+		queued   bool
+		pending  int
+	)
+	if h1 := cs.h1State; h1 != nil && h1.Detached.Load() {
+		detached = true
+	} else if csWritePending(cs) {
+		queued = true
+		pending = csPendingBytes(cs)
+	}
+	if mu != nil {
+		mu.Unlock()
+	}
 	switch {
-	case h1 != nil && h1.Detached.Load():
+	case detached:
 		l.notifyDetachedPeerClosed(cs)
-	case csWritePending(cs):
-		l.markClosing(cs)
+	case queued:
+		l.markClosing(cs, pending)
 	default:
 		l.closeConn(fd)
 	}
+}
+
+// handBackHalfClose is drainDetachQueue's part of a half-close that
+// onPeerHalfClose owed (halfCloseOwed): the conn's goroutine has handed it
+// back, so the verdict that could not be read under a running handler is made
+// now. It reports whether the caller may go on to put cs back on the dirty
+// list: false when the conn was closed (cs may already be pooled) or when the
+// handler is running again and the half-close is owed again (relink has given
+// the conn up once more, and the next hand-back is its next chance). Loop
+// thread.
+func (l *Loop) handBackHalfClose(cs *connState) (live bool) {
+	if !cs.halfCloseOwed {
+		return true
+	}
+	cs.halfCloseOwed = false
+	fd := cs.fd
+	l.onPeerHalfClose(fd)
+	l.driverMu.RLock()
+	owned := fd >= 0 && fd < len(l.conns) && l.conns[fd] == cs
+	l.driverMu.RUnlock()
+	return owned && !cs.halfCloseOwed
 }
 
 // notifyDetachedPeerClosed reports an EPOLLRDHUP (peer half-close) to the
@@ -1120,10 +1216,13 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		// for a still-readable-at-EOF socket, stranding the conn until an idle
 		// timeout (which may be unset). EPOLLRDHUP rides the same event, so the
 		// run loop can close the conn after flushing its response.
-		if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, newFD, &unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
-			Fd:     int32(newFD),
-		}); err != nil {
+		//
+		// The registration's generation is drawn before the ADD and rides on
+		// every event of the conn (celeris#885 item 18); the connState below
+		// keeps it.
+		gen := l.nextHTTPGen()
+		ev := httpEpollEvent(newFD, gen, unix.EPOLLIN|unix.EPOLLET|unix.EPOLLRDHUP)
+		if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, newFD, &ev); err != nil {
 			_ = unix.Close(newFD)
 			l.errs.ConnRegister.Add(1)
 			continue
@@ -1136,6 +1235,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		// calls it makes.
 		connCtx := ctxkit.WithWorkerID(ctx, l.id)
 		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize, l.async)
+		cs.gen = gen
 		cs.remoteAddr = sockaddrString(newFD, sa)
 		// Install under driverMu. An async Hijack clears its slot from the
 		// dispatch goroutine under this lock and then closes the
@@ -1761,10 +1861,8 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// only land on the NEXT iteration via drainDetachQueue, too late
 		// to prevent overflow → chanReader drop → ErrReadLimit.
 		if cs.detachMu != nil && cs.recvPauseDesired.Load() && !cs.recvPaused {
-			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-				Events: 0,
-				Fd:     int32(cs.fd),
-			})
+			ev := cs.epollEvent(0)
+			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &ev)
 			cs.recvPaused = true
 			return
 		}
@@ -1799,7 +1897,7 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 		l.closeConn(cs.fd)
 		return
 	}
-	l.markClosing(cs)
+	l.markClosing(cs, csPendingBytes(cs))
 	l.removeDirty(cs)
 	issued, err := l.modEpollOut(cs, unix.EPOLLOUT|unix.EPOLLET|unix.EPOLLRDHUP)
 	if !issued {
@@ -1828,16 +1926,18 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 // writing (an SSE stream: for ever). Only evidence that the peer is taking the
 // response moves the clock (noteClosingProgress, noteClosingAcked). Loop thread.
 //
-// csPendingBytes below reads the dispatch goroutine's buffers unlocked on the
-// EPOLLRDHUP path, a known race (celeris#865, tracked in celeris#885): it feeds
-// only the progress baseline and cannot make the close wrong.
-func (l *Loop) markClosing(cs *connState) {
+// pending is the number of bytes queued for cs now (csPendingBytes), the
+// baseline noteClosingProgress compares the next flush against. The caller
+// counts it: where a dispatch goroutine can be writing, that is under detachMu
+// (onPeerHalfClose, celeris#885 item 36), and markClosing reads nothing of cs
+// that the lock guards.
+func (l *Loop) markClosing(cs *connState, pending int) {
 	cs.peerClosed = true
 	if cs.closeSince != 0 {
 		return
 	}
 	cs.closeSince = time.Now().UnixNano()
-	cs.closePending = csPendingBytes(cs)
+	cs.closePending = pending
 }
 
 // noteClosingProgress restarts the drain clock of a conn markClosing deferred
@@ -3222,7 +3322,12 @@ func (l *Loop) drainDetachQueue() {
 			cs.asyncH2Promoted.Store(false)
 			l.h2Conns = append(l.h2Conns, cs.fd)
 			cs.relinkPending = false // celeris#669: back on the dirty list
-			l.markDirty(cs)
+			// A peer half-close owed while the handler ran (celeris#885): made
+			// now, after the h2Conns bookkeeping so a close finds the entry it
+			// removes. This branch continues before the tail below.
+			if l.handBackHalfClose(cs) {
+				l.markDirty(cs)
+			}
 			continue
 		}
 		// Async-mode Detach finalisation: OnDetach ran on the
@@ -3260,20 +3365,24 @@ func (l *Loop) drainDetachQueue() {
 		// EPOLLIN|EPOLLET re-enables it. The kernel applies TCP-level
 		// backpressure (zero-window) when its recv buffer fills.
 		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
-			var events uint32 = unix.EPOLLIN | unix.EPOLLET
+			// Resume restores the interest the conn was added with, EPOLLRDHUP
+			// included (the ADD, armEpollOut and disarmEpollOut carry it).
+			var events uint32 = unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP
 			if desired {
 				events = 0
 			}
-			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-				Events: events,
-				Fd:     int32(cs.fd),
-			})
+			ev := cs.epollEvent(events)
+			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &ev)
 			cs.recvPaused = desired
 		}
 		// A relink hand-back (celeris#669) lands here too: the conn is back
-		// on the dirty list, whose next pass sees it as it now is.
+		// on the dirty list, whose next pass sees it as it now is. A peer
+		// half-close owed while the handler ran (celeris#885) is made first: a
+		// close it makes releases cs, which must not be put on the list.
 		cs.relinkPending = false
-		l.markDirty(cs)
+		if l.handBackHalfClose(cs) {
+			l.markDirty(cs)
+		}
 	}
 	// Drop the strong refs before reusing the array (see the io_uring
 	// worker's drainDetachQueue and drainPendingRelease for the same
@@ -3413,8 +3522,10 @@ func (l *Loop) markDirty(cs *connState) {
 // EPOLLET covers the whole event mask, so EPOLLOUT is edge-triggered here,
 // like EPOLLIN (driver.go's flushDriverSendLocked registers no EPOLLET, so a
 // driver conn's EPOLLOUT is level-triggered). No wakeup is lost: the MOD
-// reports EPOLLOUT at once if the socket is already writable, and every flush
-// stops at EAGAIN, after which the send buffer gaining room is a new edge.
+// reports EPOLLOUT at once if the socket is already writable, and a partial
+// flush (a short write or EAGAIN: flushWrites makes one write(2) and returns
+// on a short count, it does not go on to EAGAIN) leaves the send buffer full,
+// after which the buffer gaining room is a new edge.
 func (l *Loop) armEpollOut(cs *connState) {
 	// Backpressure replaces the dirty-list retry; the two must not coexist
 	// or adaptiveTimeoutMs would still return 0 and busy-poll.
@@ -3461,7 +3572,7 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 //
 // The cost of the lock on this send-path call: BenchmarkEPOLLOUTArmDisarm.
 func (l *Loop) modEpollOut(cs *connState, events uint32) (issued bool, err error) {
-	ev := unix.EpollEvent{Events: events, Fd: int32(cs.fd)}
+	ev := cs.epollEvent(events)
 	if cs.detachMu == nil {
 		return true, unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &ev)
 	}
