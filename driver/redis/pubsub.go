@@ -539,8 +539,15 @@ func (ps *PubSub) reconnectLoop() {
 				break
 			}
 		}
-		// conn may have died after bindConn but before its close hook was
-		// set (the hook fires once, when the conn closes): look.
+		// conn may have died while the replay was being written. Its close
+		// hook (set by bindConn above) fired once and was ignored, because
+		// reconnecting is still set, so look: a conn that died counts as a
+		// failed attempt, and the loop goes on with the next, longer,
+		// backoff. The deferred re-check above would also notice the dead
+		// conn, but only after this loop returned ok and reset the backoff:
+		// its new loop starts at attempt 0, and a server that accepts and
+		// hangs up at once is retried at the base delay for ever (celeris#887
+		// item 15; TestReconnectLoopCountsAConnThatDiesDuringTheReplayAsFailed887).
 		if ok && conn.closed.Load() {
 			ok = false
 		}
