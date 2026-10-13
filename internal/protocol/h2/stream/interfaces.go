@@ -26,33 +26,56 @@ type Hijacker interface {
 // it is made the first time a use of the stream asks for it (celeris#836),
 // so a stream whose handler never asks costs no allocation.
 //
-// On the epoll and io_uring engines a handler that calls runtime.Goexit has
-// two outcomes on HTTP/2, depending on where the stream runs. Neither can be
-// recovered (recover() returns nil for a Goexit).
+// What a handler's end means on HTTP/2 (celeris#889). Like net/http, which
+// ends a response when its handler returns, the processor settles the stream:
+//   - a handler that returns having written its response whole (WriteResponse)
+//     changes nothing;
+//   - a handler that streamed its response (a StreamWriter) and returned
+//     without closing it has the stream ended with END_STREAM when the
+//     response is complete (the headers are out and, for a declared
+//     content-length, exactly that many bytes were written; with none
+//     declared it is complete whatever it wrote), and reset with
+//     RST_STREAM(INTERNAL_ERROR) when its body is not as long as it declared
+//     (short of it or over it, or the declaration is not a plain number), so a
+//     truncated body never looks complete (RFC 9110 §8.6);
+//   - a handler that returns an error having sent nothing, panics (a panic that
+//     escapes the router, which answers a handler's panic with a 500 first) or
+//     calls runtime.Goexit has its stream reset with RST_STREAM(INTERNAL_ERROR),
+//     unless its response was already whole (written whole, or its writer
+//     closed: END_STREAM is then sent, or queued behind DATA that waits for the
+//     peer's window, and the stream stays until that is out).
 //
-// A stream runs inline, on the engine's event-loop goroutine, unless one of
-// the two cases below applies. Whether the request has a body does not matter:
-// every frame path (HEADERS, trailers, the DATA frame that ends the stream, a
-// header block completed by CONTINUATION frames) marks the request ended
-// before it runs the handler, so a POST with a body is as inline as a GET.
-// The checks are Processor.canRunInline (the request has ended; the route is
-// not async) and, in Processor.runHandler, the outbound budget. A Goexit in an
-// inline handler ends that loop for good, and the engine logs one Error, "...
-// goroutine ended without returning" (celeris#848). The stream gets no
-// response, and neither do the other streams of the connection or the other
-// connections of that loop. A panic is recovered here, the stream is
-// closed without a response, and Processor.OnHandlerPanic is told of it (an
-// engine that sets conn.H2Config.Logger logs an Error through it, and the
-// processor counts it); through the celeris router a panic is a 500 first.
+// The RST_STREAM is queued behind the frames the stream already queued
+// (Resetter). H2Config.Logger gets a Warn for a stream the processor resets
+// after a return (a body not as long as its declared length, an error return, a
+// response the router saw break off), a Debug for one it ends, and an Error with
+// the stack for a panic and for a Goexit, which reset the stream with no Warn of
+// their own; Processor.OnHandlerPanic, OnHandlerGoexit and OnHandlerUnfinished
+// are told, and the processor counts them.
+//
+// A runtime.Goexit cannot be recovered (recover() returns nil for it), and
+// the epoll and io_uring engines run a stream in one of two places, which
+// decides what else it costs. A stream runs inline, on the engine's event-loop
+// goroutine, unless one of the two cases below applies. Whether the request
+// has a body does not matter: every frame path (HEADERS, trailers, the DATA
+// frame that ends the stream, a header block completed by CONTINUATION frames)
+// marks the request ended before it runs the handler, so a POST with a body is
+// as inline as a GET. The checks are Processor.canRunInline (the request has
+// ended; the route is not async) and, in Processor.runHandler, the outbound
+// budget. A Goexit in an inline handler ends that loop for good, and the engine
+// logs one Error, "... goroutine ended without returning" (celeris#848): the
+// loop, with the connections it serves, is gone. The stream is reset and the
+// Goexit is logged and counted by the processor as above, but the frame goes
+// out only if something still drains the connection's write queue, which the
+// engine's loop does not after it ended. A panic is recovered here, and the
+// connection goes on; through the celeris router a panic is a 500 first.
 //
 // A stream runs on the h2 worker pool in these two cases only: its route is
 // async, or its connection already holds OutboundBudget bytes of response
 // DATA for the peer's window (celeris#893), which sends even a sync route to
-// the pool. executeHandler retires such a stream silently. The stream gets no
-// response and no RST_STREAM, nothing is logged, the connection is not closed
-// and keeps serving its other streams, and the loop survives. Marking a
-// route async keeps a Goexit off the event loop; it does not make the Goexit
-// visible.
+// the pool. A Goexit there ends one pool goroutine, which the pool replaces
+// (h2WorkerPool.run); the stream is reset, the Goexit logged, the connection
+// is not closed and keeps serving its other streams, and the loop survives.
 //
 // On HTTP/1.1 the same Handler runs the request, and the epoll and io_uring
 // engines apply the same split. A sync (inline) handler runs on the event-loop
@@ -158,6 +181,20 @@ type Streamer interface {
 	Flush(stream *Stream) error
 	// Close signals end of the response body.
 	Close(stream *Stream) error
+}
+
+// Resetter is an optional interface a ResponseWriter may implement to
+// reset a stream from the goroutine of its handler (celeris#889). ResetStream
+// queues RST_STREAM(code) behind the frames the stream has already queued, so
+// the peer never sees it ahead of the stream's own HEADERS or DATA, and
+// cancels the stream so nothing more of it is sent. It is safe from any
+// goroutine, the event loop and a pool handler's alike. The processor uses it
+// when a handler is over without having finished its response; a writer
+// without it (a test recorder) falls back to H2Controller.WriteRSTStreamPriority,
+// which belongs to the event loop: used for a stream whose handler ran there,
+// while a pool stream is only cancelled.
+type Resetter interface {
+	ResetStream(stream *Stream, code http2.ErrCode)
 }
 
 // DetachNotifier is an optional interface a ResponseWriter may implement to

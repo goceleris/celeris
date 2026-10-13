@@ -470,6 +470,11 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 		hdrs = append(hdrs, [2]string{"cache-control", "no-store"})
 		_ = s.ResponseWriter.WriteResponse(s, 500, hdrs, []byte("Internal Server Error"))
 		c.written = true
+	} else {
+		// No 500 can follow a response that is under way: tell the HTTP/2
+		// processor that a streamed one is broken off, so it resets the stream
+		// instead of ending it at the handler's return (celeris#889).
+		s.FailResponse()
 	}
 }
 
@@ -572,7 +577,15 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 	// nothing sent through it yet, is still answered (celeris#835): sse.New
 	// takes the writer before OnConnect, whose rejection must reach the
 	// client.
-	if err == nil || c.written && !c.reclaimUnusedStreamWriter() {
+	if err == nil {
+		return
+	}
+	if c.written && !c.reclaimUnusedStreamWriter() {
+		// The response is under way and cannot be answered with the error. A
+		// streamed one that ends here would be taken for whole by the HTTP/2
+		// processor, which ends a response its handler did not close
+		// (celeris#889): tell it the response is broken off.
+		s.FailResponse()
 		return
 	}
 	if a.errorHandler != nil {

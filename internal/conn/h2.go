@@ -586,6 +586,43 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 				"stack", string(stack),
 			)
 		}
+		// celeris#889: runtime.Goexit cannot be recovered, so the panic hook
+		// never sees it. On the event loop the loop still ends (the engine
+		// logs that, celeris#848); on the pool the worker is replaced.
+		proc.OnHandlerGoexit = func(id uint32, stack []byte) {
+			lg.Error("h2 handler called runtime.Goexit",
+				"stream", id,
+				"stack", string(stack),
+			)
+		}
+		// A handler that returned without finishing its response. A stream
+		// the processor had to reset is a fault (Warn); one it ended because
+		// the handler forgot to close a complete response is the net/http
+		// model working as intended, and a per-request Warn for a handler that
+		// never closes would flood the log, so it is Debug.
+		proc.OnHandlerUnfinished = func(id uint32, reset bool, written, declared int64, err error) {
+			level, action := slog.LevelDebug, "end_stream"
+			if reset {
+				level, action = slog.LevelWarn, "rst_stream"
+			}
+			if !lg.Enabled(context.Background(), level) {
+				return
+			}
+			attrs := []slog.Attr{
+				slog.Uint64("stream", uint64(id)),
+				slog.String("action", action),
+				slog.Int64("written", written),
+			}
+			if declared >= 0 {
+				attrs = append(attrs, slog.Int64("content_length", declared))
+			} else if declared == stream.DeclaredInvalid {
+				attrs = append(attrs, slog.Bool("content_length_invalid", true))
+			}
+			if err != nil {
+				attrs = append(attrs, slog.String("error", err.Error()))
+			}
+			lg.LogAttrs(context.Background(), level, "h2 handler returned before finishing its response", attrs...)
+		}
 	}
 	mgr := proc.GetManager()
 	mgr.SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
