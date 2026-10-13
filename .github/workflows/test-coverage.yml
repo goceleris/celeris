@@ -125,6 +125,10 @@ jobs:
           # run in the `coverage-root-shard` jobs, each with its own profile and its
           # own upload under the `root` flag; Codecov adds the uploads of one commit
           # together. Everything NOT listed runs here. The guard is ci.yml's.
+          # This step runs without -v and has no tally: that each shard test runs once,
+          # in its shard only, rests on `-skip` below (which ci.yml's Unit step
+          # checks with `tally-rest` on a -v log, same regex) and on the shards' own
+          # `tally-shard`, not on a check here.
           .github/scripts/root-shards.sh check
           skip=$(.github/scripts/root-shards.sh skip-regex)
           # -timeout=540s: the tests that stay here took 176.4 s under coverage on the

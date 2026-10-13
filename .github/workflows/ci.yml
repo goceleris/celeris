@@ -167,7 +167,7 @@ jobs:
           # run in the `unit-root-shard` jobs, one runner per shard. The guard fails
           # when a listed name is not a test of the root package, is listed twice or
           # is defined in another package too (-skip applies to every package below),
-          # or when a shard has no job. Every root test NOT listed runs here.
+          # or when a `shard:` matrix is not exactly the file's shards. Every root test NOT listed runs here.
           .github/scripts/root-shards.sh check
           skip=$(.github/scripts/root-shards.sh skip-regex)
           # -timeout=540s: the tests that stay here took 179.5 s on the runner with the

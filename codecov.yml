@@ -131,7 +131,9 @@ comment:
   # One comment per pull request, edited in place on every push.
   behavior: default
   require_changes: false
-  after_n_builds: 5
+  # The same seven uploads as codecov.notify.after_n_builds above: a comment
+  # posted after five would show a partial number.
+  after_n_builds: 7
 
 github_checks:
   # No per-line "not covered" annotations in the Files tab. Many io_uring and

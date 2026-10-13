@@ -11,7 +11,7 @@
 #
 # .github/scripts/root-shards.sh check (run by both workflows) fails when a name below is not a test of the
 # root package any more (renamed or removed), is listed twice, is also defined in another package (the
-# Unit job's -skip would skip that one too), or when a workflow's `shard:` matrix lacks a shard named here.
+# Unit job's -skip would skip that one too), or when a workflow's `shard:` matrix is not exactly the shards named here (a missing or an extra shard).
 # Add a test when it takes 3 s or more; keep the shards within ~10% of each other (the CI seconds below).
 #
 # shard a: ~221 s of CI test time, shard b: ~218 s; the rest: ~114 s (incl. TestAdaptiveSettledRouteRetime592, 37 s).

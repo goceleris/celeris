@@ -18,7 +18,8 @@
 #                                      the root package, listed once, defined in
 #                                      no other package, -run selects exactly the
 #                                      listed set of each shard, and every shard has
-#                                      a job in ci.yml and test-coverage.yml
+#                                      a job in ci.yml and test-coverage.yml (a workflow's
+#                                      `shard: [...]` matrix equals the file's shards exactly)
 #   root-shards.sh tally-shard <shard> <log>
 #                                      a shard's `go test -v` log holds every
 #                                      listed test as one top-level PASS and
@@ -34,6 +35,11 @@ set -euo pipefail
 file=${SHARDS_FILE:-.github/root-test-shards.txt}
 
 die() { echo "root-shards: $*" >&2; exit 1; }
+
+# hint is appended to the guard's errors about the list: a pull request that
+# renames or removes a listed test, or adds a test of a listed name to another
+# package, lands here.
+hint="; fix $file (its header says how: edit or drop the line, or rename the other test)"
 
 # entries prints "<shard> <test>" for every non-comment line, after the syntax
 # check: two fields, a lower-case shard name, a Test name.
@@ -73,28 +79,38 @@ case "$cmd" in
     all=$(entries) || exit 1
     [ -n "$all" ] || die "$file lists no tests"
     dups=$(awk '{print $2}' <<<"$all" | sort | uniq -d)
-    [ -z "$dups" ] || die "listed more than once: $(tr '\n' ' ' <<<"$dups")"
+    [ -z "$dups" ] || die "listed more than once: $(paste -sd' ' - <<<"$dups")$hint"
     # The tests of the root package as the CI run sees them (-race, linux).
     # shellcheck disable=SC2086  # flags are word-split on purpose
     have=$(go test ${ROOT_TEST_FLAGS:--race} -list '.*' . | grep -E '^(Test|Example|Fuzz|Benchmark)' | sort)
+    # Benchmarks are listed but `go test` here never runs them (no -bench).
+    have_run=$(grep -vE '^Benchmark' <<<"$have" || true)
     [ -n "$have" ] || die "go test -list found no tests in the root package"
     missing=$(comm -13 <(echo "$have") <(awk '{print $2}' <<<"$all" | sort))
-    [ -z "$missing" ] || die "listed but not a test of the root package (renamed or removed?): $(tr '\n' ' ' <<<"$missing")"
+    [ -z "$missing" ] || die "listed but not a test of the root package (renamed or removed?): $(paste -sd' ' - <<<"$missing")$hint"
     # -skip applies to every package of the Unit job's one `go test` line, so a
     # listed name that another package also defines would be skipped there too.
-    # Grep every other package's test files for the name (a single `func` line).
+    # Grep the test files of every other package of the root module (go list, so
+    # sub-modules are out; test/ and the packages a workflow leaves out stay in,
+    # which can only over-report, never hide a clash) for the name (a `func` line).
+    rootdir=$(go list -f '{{.Dir}}' .)
+    others=$(go list -f '{{.Dir}}' ./... | grep -vxF "$rootdir" || true)
+    others_files=$(for d in $others; do find "$d" -maxdepth 1 -name '*_test.go'; done)
     clash=""
-    while read -r _ t; do
-      hit=$(grep -rlE --include='*_test.go' "^func ${t}\(" . 2>/dev/null | grep -vE '^\./[^/]+$' || true)
-      [ -z "$hit" ] || clash="$clash $t($(tr '\n' ',' <<<"$hit"))"
-    done <<<"$all"
-    [ -z "$clash" ] || die "a listed name is also defined outside the root package, so -skip would skip that one too:$clash"
+    if [ -n "$others_files" ]; then
+      while read -r _ t; do
+        # shellcheck disable=SC2086  # one file per word
+        hit=$(grep -lE "^func ${t}\(" $others_files | sed "s#^$PWD/##" || true)
+        [ -z "$hit" ] || clash="$clash $t($(tr '\n' ',' <<<"$hit"))"
+      done <<<"$all"
+    fi
+    [ -z "$clash" ] || die "a listed name is also defined outside the root package, so -skip would skip that one too:$clash$hint"
     # -run with each shard's regex selects exactly that shard's names.
     for s in $(entries | awk '{print $1}' | sort -u); do
       want=$(awk -v s="$s" '$1 == s {print $2}' <<<"$all" | sort)
       # shellcheck disable=SC2086
       got=$(go test ${ROOT_TEST_FLAGS:--race} -list "$("$0" run-regex "$s")" . | grep -E '^(Test|Example|Fuzz|Benchmark)' | sort)
-      [ "$want" = "$got" ] || die "shard $s: -run selects [$(tr '\n' ' ' <<<"$got")], the file lists [$(tr '\n' ' ' <<<"$want")]"
+      [ "$want" = "$got" ] || die "shard $s: -run selects [$(tr '\n' ' ' <<<"$got")], the file lists [$(tr '\n' ' ' <<<"$want")]$hint"
     done
     # Every shard of the file has a job: each workflow's matrix names exactly the
     # file's shards, else a listed test would run nowhere (a silent drop).
@@ -104,12 +120,12 @@ case "$cmd" in
       [ "$(grep -c . <<<"$lines")" -ge 1 ] || die "$wf has no \`shard: [...]\` matrix line"
       while IFS= read -r ln; do
         m=$(sed -E 's/.*\[(.*)\].*/\1/' <<<"$ln" | tr -d ' ' | tr ',' '\n' | sort -u | paste -sd' ' -)
-        [ "$m" = "$file_shards" ] || die "$wf: matrix shards [$m] differ from the shards of $file [$file_shards]"
+        [ "$m" = "$file_shards" ] || die "$wf: matrix shards [$m] differ from the shards of $file [$file_shards]; give each shard of the file a job and its name in the \`shard: [...]\` matrix of both workflows"
       done <<<"$lines"
     done
-    total=$(wc -l <<<"$have")
     listed=$(wc -l <<<"$all")
-    echo "root-shards: ok: $total tests in the root package, $listed in shards ($(entries | awk '{print $1}' | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}')), $((total - listed)) run by the rest (-skip)"
+    kinds=$(grep -oE '^(Test|Example|Fuzz|Benchmark)' <<<"$have" | sort | uniq -c | awk '{printf "%s %s, ", $2, $1}')
+    echo "root-shards: ok: ${kinds%, } names in the root package (Benchmarks are never run here), $listed Tests in shards ($(entries | awk '{print $1}' | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}')), $(( $(wc -l <<<"$have_run") - listed )) Test/Fuzz/Example names run by the rest (-skip)"
     ;;
   tally-shard)
     s=${2:?shard}; log=${3:?log}
