@@ -609,3 +609,227 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 		}
 	}
 }
+
+// TestShutdownPoolWaitStopsServingH1AndDetached884: while the shutdown waits
+// for an HTTP/2 stream handler on the worker pool, the native engines serve
+// no more HTTP/1 requests and let no detached stream (Server-Sent Events, a
+// WebSocket) write (celeris#884 item 50). io_uring's pool wait stopped
+// accepting but went on reading and answering the keep-alive requests of its
+// HTTP/1 clients and writing a detached stream's events until the handler
+// ended, up to the whole budget; only its later send drain had the gate
+// (celeris#806: refuseRecv and stopDetachedProducers).
+//
+// The pool wait is per worker: a worker with no HTTP/2 connection settles at
+// once and goes on to the send drain. So the test holds one stream on each of
+// many HTTP/2 connections, enough that every worker owns some, and the HTTP/1
+// and detached clients are then on a worker in the pool wait whichever it is.
+//
+// The gate comes shutdownSendDrainNanos (250 ms) into the wait, as the send
+// drain's does, so a request in flight when the shutdown begins is still
+// answered: the first assertion is that one made at the start is. The oracle
+// looks 1.5 s in, well past the grace and the time a worker idle in its ring
+// wait takes to notice the cancel.
+//
+// io_uring only: epoll's pool wait (Loop.run, h2PoolSettled) does not stop
+// reading or writing either; its loops stop at their shutdown, after the pool
+// settles (the same run asserts it: with epoll in the list this test fails on
+// it, which the polish checklist of epoll, celeris#885, records). The adaptive
+// engine is not run: which of the two it is on is not this test's to decide.
+func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
+	const nH2 = 48
+	for _, e := range engines759[2:3] {
+		t.Run(e.name, func(t *testing.T) {
+			entered := make(chan struct{}, nH2)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseHeld := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseHeld()
+			srv := startH2PoolServer759(t, e.eng, 20*time.Second, func(s *celeris.Server) {
+				s.GET("/held", func(c *celeris.Context) error {
+					entered <- struct{}{}
+					<-release
+					return c.String(http.StatusOK, "done")
+				}).Async()
+				s.GET("/stream", func(c *celeris.Context) error {
+					done := c.Detach()
+					sw := c.StreamWriter()
+					if sw == nil {
+						done()
+						return errors.New("no stream writer")
+					}
+					if err := sw.WriteHeader(http.StatusOK, [][2]string{{"content-type", "text/plain"}}); err != nil {
+						done()
+						return err
+					}
+					go func() {
+						defer done()
+						for {
+							if _, err := sw.Write([]byte("tick\n")); err != nil {
+								return
+							}
+							time.Sleep(20 * time.Millisecond)
+						}
+					}()
+					return nil
+				})
+			})
+
+			// The HTTP/2 streams the shutdown waits for.
+			type h2Result struct {
+				status string
+				body   bytes.Buffer
+				ended  bool
+				end    string
+			}
+			results := make([]*h2Result, nH2)
+			var h2wg sync.WaitGroup
+			for i := range nH2 {
+				c, fr := dialH2759(t, srv.addr)
+				writeH2Get759(t, fr, 1, "/held")
+				res := &h2Result{}
+				results[i] = res
+				h2wg.Add(1)
+				go func() {
+					defer h2wg.Done()
+					dec := hpack.NewDecoder(4096, nil)
+					res.end = frames759(c, fr, new(sync.Mutex), 15*time.Second, func(f http2.Frame) bool {
+						switch f := f.(type) {
+						case *http2.HeadersFrame:
+							if f.StreamID == 1 {
+								hf, _ := dec.DecodeFull(f.HeaderBlockFragment())
+								for _, h := range hf {
+									if h.Name == ":status" {
+										res.status = h.Value
+									}
+								}
+							}
+						case *http2.DataFrame:
+							if f.StreamID == 1 {
+								res.body.Write(f.Data())
+								res.ended = res.ended || f.StreamEnded()
+							}
+						}
+						return res.ended
+					})
+				}()
+			}
+			for i := range nH2 {
+				select {
+				case <-entered:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("only %d of %d held handlers started within 10s", i, nH2)
+				}
+			}
+
+			// HTTP/1 keep-alive clients, warm, one per HTTP/2 connection's
+			// worth of luck: each lands on some worker, which owns HTTP/2
+			// connections.
+			type h1Client struct {
+				c  net.Conn
+				br *bufio.Reader
+			}
+			ping := func(cl *h1Client, wait time.Duration) string {
+				if _, err := io.WriteString(cl.c, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+					return "write: " + err.Error()
+				}
+				_ = cl.c.SetReadDeadline(time.Now().Add(wait))
+				resp, err := http.ReadResponse(cl.br, nil)
+				if err != nil {
+					return "read: " + describeH2ReadEnd759(err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				return "served"
+			}
+			var h1 []*h1Client
+			for range 16 {
+				c, err := net.Dial("tcp", srv.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = c.Close() }()
+				cl := &h1Client{c: c, br: bufio.NewReader(c)}
+				if got := ping(cl, 2*time.Second); got != "served" {
+					t.Fatalf("a keep-alive request before the shutdown: %s", got)
+				}
+				h1 = append(h1, cl)
+			}
+
+			// Detached streams, ticking.
+			var ticks atomic.Int64
+			for range 16 {
+				b, err := net.Dial("tcp", srv.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = b.Close() }()
+				if _, err := io.WriteString(b, "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+					t.Fatal(err)
+				}
+				go func() {
+					resp, err := http.ReadResponse(bufio.NewReader(b), nil)
+					if err != nil {
+						return
+					}
+					sc := bufio.NewScanner(resp.Body)
+					for sc.Scan() {
+						ticks.Add(1)
+					}
+				}()
+			}
+			for deadline := time.Now().Add(5 * time.Second); ticks.Load() < 32; {
+				if time.Now().After(deadline) {
+					t.Fatalf("the streams sent %d ticks in 5s before the shutdown", ticks.Load())
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			begin := time.Now()
+			srv.beginShutdown("Shutdown", 20*time.Second)
+			// Inside the grace: the first client's request is answered.
+			if got := ping(h1[0], 2*time.Second); got != "served" {
+				t.Errorf("%s: a request made %v into the shutdown, inside the grace, was not answered: %s",
+					e.name, time.Since(begin).Round(time.Millisecond), got)
+			}
+			time.Sleep(time.Until(begin.Add(1500 * time.Millisecond)))
+			before := ticks.Load()
+			served := 0
+			var outcomes []string
+			for _, cl := range h1[1:] {
+				got := ping(cl, 300*time.Millisecond)
+				outcomes = append(outcomes, got)
+				if got == "served" {
+					served++
+				}
+			}
+			time.Sleep(time.Until(begin.Add(2400 * time.Millisecond)))
+			after := ticks.Load()
+			t.Logf("celeris884 %s: 1.5 s into the shutdown %d of %d keep-alive requests were answered; the detached streams' ticks over the next 0.9 s: %d",
+				e.name, served, len(h1)-1, after-before)
+			if served > 0 {
+				t.Errorf("%s: %d of %d keep-alive HTTP/1 requests made 1.5 s into the shutdown, while HTTP/2 handlers were still running, were answered (%v)",
+					e.name, served, len(h1)-1, outcomes)
+			}
+			if n := after - before; n > 4 {
+				t.Errorf("%s: the detached streams wrote %d ticks in 0.9 s, from 1.5 s into the shutdown, while HTTP/2 handlers were still running", e.name, n)
+			}
+
+			// The HTTP/2 streams are not cut by the gate: they finish.
+			releaseHeld()
+			h2wg.Wait()
+			srv.waitStart(t, 25*time.Second)
+			bad := 0
+			for i, r := range results {
+				if r.status != "200" || r.body.String() != "done" || !r.ended {
+					bad++
+					if bad <= 3 {
+						t.Errorf("%s: held HTTP/2 stream %d got status %q body %q ended=%v (%s) after the gate", e.name, i, r.status, r.body.String(), r.ended, r.end)
+					}
+				}
+			}
+			if bad > 0 {
+				t.Errorf("%s: %d of %d held HTTP/2 streams did not finish", e.name, bad, nH2)
+			}
+		})
+	}
+}
