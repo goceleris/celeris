@@ -252,6 +252,9 @@ func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding,
 // directory unchecked) is refused without a syscall. The answer can change
 // before the 304 is sent, as it can between FileFromDir's check and its open.
 func resolvesInside(cleanRoot, filePath string) bool {
+	if resolvesInsideHook != nil {
+		resolvesInsideHook()
+	}
 	full := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
 	if cleanRoot != "." && !pathUnder(cleanRoot, full) {
 		return false
@@ -290,6 +293,11 @@ func resolvesInside(cleanRoot, filePath string) bool {
 	}
 	return resolved == resolvedRoot || strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator))
 }
+
+// resolvesInsideHook is a test seam (celeris#888 item 35): when set it runs at
+// the top of resolvesInside, so a test can count the containment checks a
+// conditional request pays.
+var resolvesInsideHook func()
 
 // pathUnder reports whether p is root or a path below it, both cleaned, without
 // building root + separator.
