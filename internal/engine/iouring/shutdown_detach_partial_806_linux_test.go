@@ -71,13 +71,13 @@ func (l *logBuf806) String() string {
 // TestStopDetachedProducersFlushesQueuedBytes806, in the package iouring (the
 // internal tests of this directory).
 //
-// io_uring, directly and as the engine Adaptive started on. The base tier
-// accepts blocking sockets (its accept SQE has no SOCK_NONBLOCK; O_NONBLOCK was
-// found clear on the accepted fd, the high tier's set, with the 16 KiB send
-// buffer applied on both), where an inline write waits for the client instead
-// of leaving a remainder, so the state this test makes is not reachable there
-// and the test passes before and after the fix; the unit test is
-// tier-independent.
+// io_uring, directly and as the engine Adaptive started on. Until celeris#884
+// (item 53) the base tier accepted blocking sockets (its single-shot accept
+// SQE had no SOCK_NONBLOCK), where an inline write waits for the client
+// instead of leaving a remainder, so the state this test makes was not
+// reachable there and the test passed before and after the fix; the unit test
+// is tier-independent. It is reachable now, and a run with
+// CELERIS_MAX_IOURING_TIER=base exercises it.
 func TestShutdownDetachedPartialWriteIsFlushed806(t *testing.T) {
 	cases := []struct {
 		name  string

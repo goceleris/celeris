@@ -175,7 +175,7 @@ type Processor struct {
 	pendingInlineCleanup []inlineCleanup // inline-completed streams deferred until frame loop exits
 	InlineWriter         h2Conn          // direct-to-outBuf writer for inline handlers (set by conn layer)
 	InlineCount          uint64          // number of requests handled inline (for metrics)
-	MaxRequestBodySize   int64           // 0 = use default (100 MB)
+	MaxRequestBodySize   int64           // 0 = unlimited; resource.Config.WithDefaults resolves the default
 
 	// OnHandlerPanic, when set, is told of a panic that escaped a stream's
 	// handler and reached the last-resort recover of executeHandlerInline or
@@ -1791,7 +1791,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	dataLen := len(f.Data())
 	stream.ReceivedDataLen += dataLen
 
-	// Reject streams that exceed the maximum request body size (100 MB).
+	// Reject streams that exceed the maximum request body size.
 	if limit := p.maxBodySize(); limit > 0 && int64(stream.ReceivedDataLen) > limit {
 		_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeCancel)
 		return fmt.Errorf("request body exceeds %d bytes on stream %d", limit, f.StreamID)

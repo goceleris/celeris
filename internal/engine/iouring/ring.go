@@ -323,7 +323,11 @@ func (r *Ring) WaitCQE() error {
 	return nil
 }
 
-// SubmitAndWait submits pending SQEs and waits for at least one CQE.
+// SubmitAndWait submits pending SQEs and waits for at least one CQE. Returns
+// nil when a signal ends the wait (EINTR), as the timed variants do: the run
+// loop shuts a worker down on any other error, and a signal on the thread of a
+// worker asleep in the kernel (a profiler's SIGPROF, say) is not the ring
+// failing (celeris#884).
 func (r *Ring) SubmitAndWait() error {
 	n := r.pending
 	ret, _, errno := unix.Syscall6(
@@ -336,6 +340,9 @@ func (r *Ring) SubmitAndWait() error {
 	)
 	if errno != 0 {
 		r.pending = retryPending(n, errno)
+		if errno == unix.EINTR {
+			return nil
+		}
 		return fmt.Errorf("io_uring_enter submit+wait: %w", errno)
 	}
 	r.pending = n - uint32(ret)

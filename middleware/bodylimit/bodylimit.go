@@ -14,9 +14,10 @@ var ErrLengthRequired = celeris.NewHTTPError(411, "Length Required")
 // Architectural note: celeris buffers the full request body before middleware
 // executes, so this middleware cannot prevent oversized payloads from entering
 // memory when Content-Length is absent or dishonest. The framework's own
-// maxRequestBodySize (100 MB) provides the hard ceiling. This middleware adds
-// an application-level limit that rejects already-buffered bodies that exceed
-// the configured threshold.
+// celeris.Config.MaxRequestBodySize (4 MiB by default) provides the hard
+// ceiling, and a MaxBytes above it never triggers: raise the Config value
+// as well. This middleware adds an application-level limit that rejects
+// already-buffered bodies that exceed the configured threshold.
 //
 // For strict enforcement against clients that omit Content-Length, enable
 // [Config].ContentLengthRequired to reject such requests with 411 Length
