@@ -38,9 +38,13 @@ type lateEpoll683 struct {
 	*epoll.Engine
 	delay time.Duration
 	calls atomic.Int32
+	// calledAt is the time.Now().UnixNano() of the first ResumeAccept: the
+	// moment the switch leaves the resume and enters awaitIncomingListener.
+	calledAt atomic.Int64
 }
 
 func (l *lateEpoll683) ResumeAccept() error {
+	l.calledAt.CompareAndSwap(0, time.Now().UnixNano())
 	l.calls.Add(1)
 	go func() {
 		time.Sleep(l.delay)
@@ -351,7 +355,7 @@ func TestSwitchWaitForTheIncomingListenerDoesNotBlockMetrics683(t *testing.T) {
 		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
 	}
 	const delay = 150 * time.Millisecond
-	installLateEpoll683(t, e, delay)
+	late := installLateEpoll683(t, e, delay)
 
 	done := make(chan time.Duration, 1)
 	go func() {
@@ -359,12 +363,28 @@ func TestSwitchWaitForTheIncomingListenerDoesNotBlockMetrics683(t *testing.T) {
 		e.ForceSwitch()
 		done <- time.Since(t0)
 	}()
-	time.Sleep(40 * time.Millisecond) // inside the wait: the engine resumed, the delay not yet over
+	// Enter the wait before reading: the switch has resumed the incoming
+	// engine (its ResumeAccept ran) and the late listener is not up yet. A
+	// fixed sleep would let a descheduled switch goroutine run Metrics()
+	// before performSwitch takes e.mu, and the unfixed code would pass.
+	for late.calls.Load() == 0 {
+		select {
+		case <-done:
+			t.Fatalf("celeris683 PREMISE: the switch ended without resuming the late engine")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	time.Sleep(10 * time.Millisecond) // past the resume, into awaitIncomingListener
 	t0 := time.Now()
+	inWait := t0.UnixNano() - late.calledAt.Load()
 	m := e.Metrics()
 	took := time.Since(t0)
 	wall := <-done
-	t.Logf("celeris683 METRICS: Metrics() took %v while the switch waited (Workers %d); the switch took %v", took, m.Workers, wall)
+	t.Logf("celeris683 METRICS: Metrics() started %v after the resume and took %v (Workers %d); the switch took %v",
+		time.Duration(inWait), took, m.Workers, wall)
+	if inWait < 0 || time.Duration(inWait) >= delay {
+		t.Fatalf("celeris683 PREMISE: Metrics() started %v after the resume, outside the late engine's %v delay", time.Duration(inWait), delay)
+	}
 	if wall < delay/2 {
 		t.Fatalf("celeris683 PREMISE: the switch took %v, it did not wait for the late engine (delay %v)", wall, delay)
 	}
