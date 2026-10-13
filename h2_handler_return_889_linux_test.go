@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"github.com/goceleris/celeris"
 )
 
@@ -33,9 +35,10 @@ import (
 // h2ReturnArms889 are the engines of these tests: the std engine is the model
 // (net/http ends a response when its handler returns, and x/net's server resets
 // a stream whose handler panicked or called runtime.Goexit with INTERNAL_ERROR),
-// the native engines are what the processor now does the same on.
+// the native engines (epoll, io_uring, and adaptive started on each) are what
+// the processor now does the same on.
 func h2ReturnArms889() []arm848 {
-	return append([]arm848{{"std", celeris.Std, nil, ""}}, arms848()[:2]...)
+	return append([]arm848{{"std", celeris.Std, nil, ""}}, arms848()...)
 }
 
 type h2Return889Rig struct {
@@ -98,11 +101,19 @@ func (r *h2Return889Rig) routes(s *celeris.Server) {
 	s.GET("/errstream", broken(errs))
 	s.GET("/apanicstream", broken(panics)).Async()
 	s.GET("/aerrstream", broken(errs)).Async()
+	// The inline handler's tail waits for the peer's window (the client below
+	// grants 1000 bytes): whole, or short of its declared length.
+	s.GET("/bufwhole", streamed(-1, 5000))
+	s.GET("/bufshort", streamed(6000, 5000))
 	s.GET("/ok", func(c *celeris.Context) error { return c.String(200, "ok") })
 }
 
-func startH2Return889(t *testing.T, eng celeris.EngineType) *h2Return889Rig {
+func startH2Return889(t *testing.T, a arm848) *h2Return889Rig {
 	t.Helper()
+	eng := a.eng
+	if a.start != "" {
+		t.Setenv("CELERIS_ADAPTIVE_START", a.start)
+	}
 	r := &h2Return889Rig{logs: &capture848{}}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -158,7 +169,7 @@ func TestH2HandlerReturnWithoutClosingEndsTheStream889(t *testing.T) {
 	for _, a := range h2ReturnArms889() {
 		t.Run(a.name, func(t *testing.T) {
 			need848(t, a.eng)
-			r := startH2Return889(t, a.eng)
+			r := startH2Return889(t, a)
 			for _, path := range []string{"/noclose", "/exact", "/anoclose", "/aexact"} {
 				body, err := r.get(path)
 				if err != nil || body != "xxxxx" {
@@ -177,10 +188,10 @@ func TestH2HandlerReturnWithoutClosingEndsTheStream889(t *testing.T) {
 // END_STREAM after a body short of its declared length and leaves the client
 // to notice (x/net's server checks only for more bytes than declared).
 func TestH2HandlerShortOfItsContentLengthResetsTheStream889(t *testing.T) {
-	for _, a := range arms848()[:2] {
+	for _, a := range arms848() {
 		t.Run(a.name, func(t *testing.T) {
 			need848(t, a.eng)
-			r := startH2Return889(t, a.eng)
+			r := startH2Return889(t, a)
 			for _, path := range []string{"/short", "/ashort"} {
 				body, err := r.get(path)
 				if !isInternalError889(err) {
@@ -195,7 +206,7 @@ func TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889(t *testing.T) {
 	for _, a := range h2ReturnArms889() {
 		t.Run(a.name, func(t *testing.T) {
 			need848(t, a.eng)
-			r := startH2Return889(t, a.eng)
+			r := startH2Return889(t, a)
 			for range 3 {
 				_, err := r.get("/aboom")
 				if !isInternalError889(err) {
@@ -245,10 +256,10 @@ func TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889(t *testing.T) {
 // engine is not an arm: the router recovers the panic before x/net's server
 // sees it, so net/http ends that stream; a known difference.)
 func TestH2StreamedResponseBrokenOffIsReset889(t *testing.T) {
-	for _, a := range arms848()[:2] {
+	for _, a := range arms848() {
 		t.Run(a.name, func(t *testing.T) {
 			need848(t, a.eng)
-			r := startH2Return889(t, a.eng)
+			r := startH2Return889(t, a)
 			for _, path := range []string{"/panicstream", "/errstream", "/apanicstream", "/aerrstream"} {
 				body, err := r.get(path)
 				if !isInternalError889(err) {
@@ -257,6 +268,57 @@ func TestH2StreamedResponseBrokenOffIsReset889(t *testing.T) {
 			}
 			if body, err := r.get("/ok"); err != nil || body != "ok" {
 				t.Errorf("GET /ok: %q %v", body, err)
+			}
+		})
+	}
+}
+
+// An inline handler whose StreamWriter response is not closed while its tail
+// is still buffered for the peer's window: a whole response keeps its tail and
+// ends with END_STREAM on the last DATA once the peer grants window; one short
+// of its declared length is reset at once, its buffer dropped, and nothing
+// follows the RST_STREAM. The raw client holds a 1000-byte stream window.
+func TestH2UnclosedInlineWriterWithBufferedTail889(t *testing.T) {
+	for _, a := range arms848() {
+		t.Run(a.name, func(t *testing.T) {
+			need848(t, a.eng)
+			r := startH2Return889(t, a)
+			c := dialWin904(t, r.addr, 1000, false)
+			c.get(t, 1, "/bufwhole")
+			c.get(t, 3, "/bufshort")
+			// stream 3 is reset without a grant; stream 1 waits for window
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				c.mu.Lock()
+				_, rst := c.resets[3]
+				c.mu.Unlock()
+				if rst {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			c.mu.Lock()
+			code, rst := c.resets[3]
+			ended3 := c.ended[3]
+			ended1 := c.ended[1]
+			c.mu.Unlock()
+			if !rst || code != http2.ErrCodeInternal || ended3 {
+				t.Errorf("stream 3 (6000 declared, 5000 written, unclosed): reset=%v code=%v END_STREAM=%v, want an INTERNAL_ERROR reset and no END_STREAM", rst, code, ended3)
+			}
+			if ended1 {
+				t.Errorf("stream 1 ended before its buffered tail was sent")
+			}
+			c.grant(t, 1, 1<<20)
+			c.grant(t, 3, 1<<20)
+			c.check(t, 1, []byte(strings.Repeat("x", 5000)))
+			c.settled(3, 200*time.Millisecond)
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.ended[3] || len(c.data[3]) > 1000 {
+				t.Errorf("stream 3 after the grant: END_STREAM %v, %d body bytes (at most the first 1000 were sent before the reset)", c.ended[3], len(c.data[3]))
+			}
+			if _, rst1 := c.resets[1]; rst1 {
+				t.Errorf("stream 1, a whole response, was reset")
 			}
 		})
 	}

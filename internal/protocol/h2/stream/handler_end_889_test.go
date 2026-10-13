@@ -40,8 +40,9 @@ func (l *goexitLog889) hook(id uint32, stack []byte) {
 }
 
 // A Goexit reaches OnHandlerGoexit with the stream and a stack through the
-// handler, is counted (without a hook too), and the stream is reset through
-// the connection writer, on the event-loop path and on the worker pool.
+// handler, is counted (without a hook too), and the stream is reset: through
+// the connection writer on the event-loop path, and on the worker pool only
+// cancelled when the writer cannot queue the reset (Resetter).
 func TestHandlerGoexitIsReportedCountedAndReset889(t *testing.T) {
 	for _, mode := range []string{"inline", "pool"} {
 		t.Run(mode, func(t *testing.T) {
@@ -85,7 +86,14 @@ func TestHandlerGoexitIsReportedCountedAndReset889(t *testing.T) {
 				}
 			}
 			rst := conn.resets()
-			if len(rst) != 2 || rst[0].streamID != 1 || rst[1].streamID != 3 || rst[0].code != http2.ErrCodeInternal {
+			if mode == "pool" {
+				// The connection's writer belongs to the event loop: a pool
+				// goroutine does not write to it. (The real writers are
+				// Resetters, which queue the reset; this recorder is not.)
+				if len(rst) != 0 {
+					t.Errorf("a pool goroutine wrote %v to the connection's writer", rst)
+				}
+			} else if len(rst) != 2 || rst[0].streamID != 1 || rst[1].streamID != 3 || rst[0].code != http2.ErrCodeInternal {
 				t.Errorf("RST_STREAMs %v, want INTERNAL_ERROR for 1 and 3", rst)
 			}
 			if n := p.manager.CountActiveStreams(); n != 0 {
