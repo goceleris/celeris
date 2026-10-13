@@ -372,7 +372,7 @@ func (e *Engine) PauseAccept() error {
 		}
 		allClosed := true
 		for _, l := range loops {
-			if !l.listenFDClosed.Load() {
+			if !l.listenFDClosed.Load() && !l.exited.Load() {
 				allClosed = false
 				break
 			}
@@ -401,7 +401,8 @@ func (e *Engine) ResumeAccept() error {
 	for _, l := range e.loops {
 		// Re-arm the close-confirmation flag so a subsequent Pause cycle
 		// blocks on the new listen FD rather than the previously-closed
-		// one.
+		// one. A loop that has exited is re-armed too, and has nothing to
+		// close again: PauseAccept counts it by exited.
 		l.listenFDClosed.Store(false)
 		l.wakeIfSuspended()
 		// A loop that has not parked closed its listener at the pause and

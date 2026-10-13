@@ -31,6 +31,12 @@ import (
 // handler would delay the crash. Detecting a panic needs recover(), which is
 // not wanted here, so the report is not skipped for one.
 //
+// The defer also marks the loop exited, on a normal return as well: PauseAccept
+// counts an exited loop as closed (Loop.exited). A loop that ended without
+// returning has its SO_REUSEPORT listener closed there too (reportLoopExit),
+// so a pause is not held up by it for its whole bound and a dead listener does
+// not go on taking a share of new connections that nothing will accept.
+//
 // The defer runs once, when the loop goroutine ends: it costs nothing per
 // event-loop iteration and takes no lock.
 func (e *Engine) runWatched(ctx context.Context, l *Loop) {
@@ -39,16 +45,34 @@ func (e *Engine) runWatched(ctx context.Context, l *Loop) {
 		if !returned {
 			e.reportLoopExit(l)
 		}
+		// After shutdown's own flag and notify on a normal return, and after
+		// the close below on an abnormal one; the notify is for a
+		// PauseAccept that checked in between.
+		l.exited.Store(true)
+		l.pause.Notify()
 	}()
 	l.run(ctx)
 	returned = true
 }
 
 // reportLoopExit records, and logs at Error, a loop goroutine that ended
-// without returning. It runs on that goroutine, which owns liveConns, so the
-// count needs no synchronization.
+// without returning, and takes the loop's listener out of the SO_REUSEPORT
+// group. It runs on that goroutine, which owns liveConns, so the count needs
+// no synchronization.
+//
+// The listener is closed first (stopAccepting: the epoll registration, then the
+// descriptor, which epoll releases at once), then the flags PauseAccept reads
+// are set and the wait is notified, then the log is written: a Logger that
+// blocks must not hold up a PauseAccept. The loop's epoll descriptor and its
+// connections stay open, as they did; only shutdown closes those and it never
+// runs for a dead loop. A Goexit raised inside shutdown, after it closed the
+// listener, finds listenFD already -1.
 func (e *Engine) reportLoopExit(l *Loop) {
 	e.abnormalLoopExits.Add(1)
+	l.stopAccepting()
+	l.listenFDClosed.Store(true)
+	l.exited.Store(true)
+	l.pause.Notify()
 	if l.logger == nil {
 		return
 	}
@@ -57,7 +81,7 @@ func (e *Engine) reportLoopExit(l *Loop) {
 	// frame and the runtime.Goexit call are still on the stack. Exit path only.
 	l.logger.Error("epoll loop goroutine ended without returning: "+
 		"a handler or callback on this loop goroutine called runtime.Goexit (t.FailNow, t.Fatal, t.SkipNow or a library that does), or a panic unwound it; "+
-		"the connections this loop owned will not be served again and this loop's SO_REUSEPORT listener will not accept; "+
+		"the connections this loop owned will not be served again and this loop's SO_REUSEPORT listener will not accept (it is closed now); "+
 		"synchronous (non-Async) handlers must not call runtime.Goexit (celeris#848)",
 		"engine", "epoll",
 		"loop", l.id,
