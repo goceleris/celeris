@@ -747,6 +747,12 @@ type Worker struct {
 	// is not a public metric: the errclass counters feed EngineMetrics.
 	// Declared last, cold, so that no field moves.
 	ringWaitRetries atomic.Uint64
+	// ringWaitWarned is set once the first retried wait was logged
+	// (ringWaitContinues). Worker thread only.
+	ringWaitWarned bool
+	// producersStopNext is when (UnixNano) the pool wait's gate may walk the
+	// detached conns again (stopProducersPaced). Worker thread only.
+	producersStopNext int64
 }
 
 // recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
@@ -7339,6 +7345,16 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 	if h, t := w.ring.BeginCQ(); h == t {
 		time.Sleep(50 * time.Microsecond)
 	}
+	return true
+}
+
+// stopProducersPaced is stopDetachedProducers at most once per
+// h2PoolDrainPoll, for the pool wait's gate (celeris#884): a producer whose
+// lock was busy is tried again within a poll, and no loop pass pays the walk
+// over every live conn twice in one. It reports whether it walked. now is the
+// pass's UnixNano. Worker thread.
+func (w *Worker) stopProducersPaced(now int64) bool {
+	w.stopDetachedProducers()
 	return true
 }
 

@@ -131,7 +131,7 @@ func setRingWaitSeam884(t *testing.T, fn func(*Worker, ringWaitMode, error) erro
 	t.Cleanup(func() { ringWaitSeam = old })
 }
 
-// answers884 dials n keep-alive connections, each answered once, so every
+// warmLoad884 dials n keep-alive connections, each answered once, so every
 // worker that will own one does; the returned stop ends the load the
 // connections then carry and reports what the clients saw.
 func warmLoad884(t *testing.T, addr string, n int) (stop func() loadResult) {

@@ -19,14 +19,39 @@ import (
 // answered with shutdown. The signal is a SIGURG, which the Go runtime handles
 // and ignores, sent to the thread that is inside the enter.
 func TestSubmitAndWaitIsNotEndedBySignal884(t *testing.T) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	ring, err := NewRing(16, 0, 0)
-	if err != nil {
-		skipOrFail656(t, "io_uring unavailable: %v", err)
+	// The wait runs on a goroutine of its own, pinned to its thread, so that
+	// a kernel that restarts the enter after a signal (ERESTARTSYS) cannot
+	// hang the test until go test's -timeout: the test goroutine gives up at
+	// 5 s and fails.
+	type result struct {
+		err  error
+		took time.Duration
 	}
-	defer func() { _ = ring.Close() }()
-	tid, pid := unix.Gettid(), os.Getpid()
+	tidCh := make(chan int, 1)
+	resCh := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		ring, err := NewRing(16, 0, 0)
+		if err != nil {
+			tidCh <- -1
+			resCh <- result{err: err}
+			return
+		}
+		defer func() { _ = ring.Close() }()
+		tidCh <- unix.Gettid()
+		// Nothing is queued and no completion is owed: the wait can only end
+		// by a signal.
+		start := time.Now()
+		werr := ring.SubmitAndWait()
+		resCh <- result{werr, time.Since(start)}
+	}()
+	tid := <-tidCh
+	if tid < 0 {
+		r := <-resCh
+		skipOrFail656(t, "io_uring unavailable: %v", r.err)
+	}
+	pid := os.Getpid()
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -42,15 +67,13 @@ func TestSubmitAndWaitIsNotEndedBySignal884(t *testing.T) {
 	}()
 	defer func() { close(stop); <-done }()
 
-	// Nothing is queued and no completion is owed: the wait can only end by
-	// the signal, or, if the kernel restarted it, by the NOP below.
-	wake := time.AfterFunc(2*time.Second, func() { t.Log("the enter outlived 2 s of signals") })
-	defer wake.Stop()
-	start := time.Now()
-	werr := ring.SubmitAndWait()
-	took := time.Since(start)
-	t.Logf("celeris884 SubmitAndWait returned %v after %v", werr, took.Round(time.Millisecond))
-	if werr != nil {
-		t.Fatalf("SubmitAndWait answered %v to a signal; the timed waits answer nil for it, and the loop shuts the worker down on an error", werr)
+	select {
+	case r := <-resCh:
+		t.Logf("celeris884 SubmitAndWait returned %v after %v", r.err, r.took.Round(time.Millisecond))
+		if r.err != nil {
+			t.Fatalf("SubmitAndWait answered %v to a signal; the timed waits answer nil for it, and the loop shuts the worker down on an error", r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SubmitAndWait was still in the kernel 5 s into a stream of signals: the kernel restarts the enter after one, and a signal does not end the wait")
 	}
 }

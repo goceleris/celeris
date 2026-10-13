@@ -627,15 +627,19 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 // The gate comes shutdownSendDrainNanos (250 ms) into the wait, as the send
 // drain's does, so a request in flight when the shutdown begins is still
 // answered: the first assertion is that requests made as soon as every
-// listener has closed are. The oracle
-// looks 1.5 s in, well past the grace and the time a worker idle in its ring
+// listener has closed are. A request whose bytes have not all arrived by the
+// gate is another matter: the gate drops the bytes that come after it and the
+// recv is not re-armed (a slow upload, headers in pieces), which the pull
+// request's open questions record. The oracle looks 1.5 s in, well past the grace and the time a worker idle in its ring
 // wait takes to notice the cancel.
 //
 // io_uring only: epoll's pool wait (Loop.run, h2PoolSettled) does not stop
 // reading or writing either; its loops stop at their shutdown, after the pool
 // settles (the same run asserts it: with epoll in the list this test fails on
-// it, which the polish checklist of epoll, celeris#885, records). The adaptive
-// engine is not run: which of the two it is on is not this test's to decide.
+// it, which the polish checklist of epoll, celeris#885, records; with epoll
+// in the list the run measures 16 of 16 answered and 688 to 704 ticks in
+// 900 ms). The adaptive engine is run on io_uring (CELERIS_ADAPTIVE_START), as
+// the second arm: its gate is the io_uring worker's.
 func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 	const nH2 = 48
 	for _, e := range []struct {
