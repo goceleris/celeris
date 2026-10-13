@@ -452,22 +452,6 @@ type Worker struct {
 	// false while the worker lingers (celeris#662): the listener is still
 	// open and its accept still armed then.
 	listenFDClosed atomic.Bool
-	// exited is set by Engine.runWatched when the worker goroutine is gone,
-	// whether run returned or the goroutine ended without returning (a
-	// handler's runtime.Goexit, celeris#848). It is never reset. PauseAccept
-	// counts an exited worker as closed whatever listenFDClosed says, because
-	// ResumeAccept clears that flag on every worker, a dead one included, and
-	// nothing would set it again.
-	exited atomic.Bool
-	// closingFD is the listen descriptor closeListenerAfterDrain or
-	// stopAccepting has taken out of listenFD and not yet closed, when
-	// closingSet: those two clear listenFD before they run handlers (the
-	// cancel's completions, OnConnect for the queued connections), so a
-	// Goexit in a handler would leave the descriptor open and in the
-	// SO_REUSEPORT group, and leaveGroupAfterExit closes it from here.
-	// Worker thread only.
-	closingFD  int
-	closingSet bool
 	// lingerUntil is the deadline, on deferlinger's monotonic clock, of the
 	// accept-pause linger in progress, or 0 when none is (celeris#662): the
 	// listener's TCP_DEFER_ACCEPT has been cleared and its multishot accept
@@ -478,6 +462,15 @@ type Worker struct {
 	// linger for. A listener created without it (DisableDeferAccept) closes
 	// at once. Loop-thread only.
 	deferCapable bool
+	// exited (declared here, after deferCapable, to sit in the padding that
+	// follows it and leave the layout of the fields below unchanged) is set by
+	// Engine.runWatched when the worker goroutine is gone, whether run
+	// returned or the goroutine ended without returning (a handler's
+	// runtime.Goexit, celeris#848). It is never reset. PauseAccept counts an
+	// exited worker as closed whatever listenFDClosed says, because
+	// ResumeAccept clears that flag on every worker, a dead one included, and
+	// nothing would set it again.
+	exited atomic.Bool
 	// pause is the engine's record of the pause in progress, written by
 	// BeginPauseAccept before it sets acceptPaused. Nil in bare test
 	// workers, which deferlinger treats as "no guard, no delay".
@@ -737,6 +730,15 @@ type Worker struct {
 	// asking the kernel about a descriptor number that may now belong to
 	// something else. Written once before ready; read only after it.
 	listenAddr net.Addr
+
+	// closingFD is the listen descriptor, plus one (0 is none), that
+	// closeListenerAfterDrain or stopAccepting has taken out of listenFD and
+	// not yet closed: they clear listenFD before they run handlers (the
+	// cancel's completions, OnConnect for the queued connections), so a
+	// Goexit in a handler would leave the descriptor open and in the
+	// SO_REUSEPORT group, and leaveGroupAfterExit closes it from here. The
+	// last field so that adding it moves no other. Worker thread only.
+	closingFD int
 }
 
 // recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
@@ -2544,7 +2546,7 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// worker does not own.
 	lfd := w.listenFD
 	w.listenFD = -1
-	w.closingFD, w.closingSet = lfd, true
+	w.closingFD = lfd + 1
 	w.cancelAccept(ctx, lfd)
 	// The completions above only cover handshakes an accept had already
 	// reached. Anything still in the kernel accept queue would be aborted
@@ -2553,7 +2555,7 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// (celeris#662).
 	w.acceptQueuedOnPause(ctx, lfd)
 	_ = unix.Close(lfd)
-	w.closingSet = false
+	w.closingFD = 0
 	w.lingerUntil = 0
 	deferlinger.NoteClose()
 	w.listenFDClosed.Store(true)
@@ -2663,10 +2665,10 @@ func (w *Worker) stopAccepting(ctx context.Context) {
 	}
 	lfd := w.listenFD
 	w.listenFD = -1 // before the cancel's completions: handleAccept re-arms on a listenFD >= 0
-	w.closingFD, w.closingSet = lfd, true
+	w.closingFD = lfd + 1
 	w.cancelAccept(ctx, lfd)
 	_ = unix.Close(lfd)
-	w.closingSet = false
+	w.closingFD = 0
 	w.lingerUntil = 0
 }
 
@@ -2705,11 +2707,11 @@ func (w *Worker) leaveGroupAfterExit() {
 		_ = unix.Close(w.listenFD)
 		w.listenFD = -1
 	}
-	if w.closingSet {
+	if w.closingFD > 0 {
 		// The Goexit came from a handler the pause's close or stopAccepting
 		// ran, after they took the descriptor out of listenFD.
-		_ = unix.Close(w.closingFD)
-		w.closingSet = false
+		_ = unix.Close(w.closingFD - 1)
+		w.closingFD = 0
 	}
 	w.lingerUntil = 0
 	w.listenFDClosed.Store(true)

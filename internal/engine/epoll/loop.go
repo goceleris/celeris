@@ -142,13 +142,6 @@ type Loop struct {
 	// Reset to false in ResumeAccept so a Pause→Resume→Pause cycle re-arms
 	// the signal.
 	listenFDClosed atomic.Bool
-	// exited is set by Engine.runWatched when the loop goroutine is gone,
-	// whether run returned or the goroutine ended without returning (a
-	// handler's runtime.Goexit, celeris#848). It is never reset. PauseAccept
-	// counts an exited loop as closed whatever listenFDClosed says, because
-	// ResumeAccept clears that flag on every loop, a dead one included, and
-	// nothing would set it again.
-	exited atomic.Bool
 	// lingerUntil is the deadline, on deferlinger's monotonic clock, of the
 	// accept-pause linger in progress, or 0 when none is (celeris#662): the
 	// listener's TCP_DEFER_ACCEPT has been cleared and it keeps accepting
@@ -159,6 +152,14 @@ type Loop struct {
 	// linger for. A listener created without it (DisableDeferAccept) closes
 	// at once. Loop-thread-only.
 	deferCapable bool
+	// exited (declared here, after deferCapable, to sit in the padding
+	// that follows it and leave the layout of the fields below unchanged) is set by Engine.runWatched when the loop goroutine is gone,
+	// whether run returned or the goroutine ended without returning (a
+	// handler's runtime.Goexit, celeris#848). It is never reset. PauseAccept
+	// counts an exited loop as closed whatever listenFDClosed says, because
+	// ResumeAccept clears that flag on every loop, a dead one included, and
+	// nothing would set it again.
+	exited atomic.Bool
 	// pause is the engine's record of the pause in progress, written by
 	// BeginPauseAccept before it sets acceptPaused. Nil in bare test loops,
 	// which deferlinger treats as "no guard, no delay".
