@@ -198,12 +198,15 @@ var serveOSHook func()
 // resolves inside the root (resolvesInside): a 304 sends no body, so there is
 // nothing for a replaced file to contradict, and it costs one stat and one
 // Lstat per path element, where FileFromDir resolves symlinks twice and opens
-// the file. A path that leaves the root is not answered from its target's stat:
-// it goes to FileFromDir, which refuses it. Every response that sends the file gets its Last-Modified, ETag and
-// Cache-Control from the mtime and size of the file as it is opened: early
-// could describe another file than the one opened when the path is replaced in
-// between (celeris#846). So the Range and If-Range that File then decides are
-// about the very bytes sent.
+// the file. A path that leaves the root is not answered from its target's
+// stat: it goes to FileFromDir, which refuses it. The containment check runs
+// for every conditional request, before the validators are compared, so a
+// refusal takes the same time whether or not the client guessed the target's
+// mtime and size. Every response that sends the file gets its Last-Modified,
+// ETag and Cache-Control from the mtime and size of the file as it is opened:
+// early could describe another file than the one opened when the path is
+// replaced in between (celeris#846). So the Range and If-Range that File then
+// decides are about the very bytes sent.
 //
 // contentType, when not empty, is the response's type (a pre-compressed
 // variant is served with its original's, not the one its ".gz" maps to).
@@ -222,8 +225,10 @@ func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding,
 		}
 		// The 304 is about a file inside the root: a path that resolves
 		// outside it is not answered from its target's stat but handed to
-		// FileFromDir, which refuses it (celeris#888).
-		if notModified(c, etag, early.ModTime()) && resolvesInside(cleanRoot, filePath) {
+		// FileFromDir, which refuses it (celeris#888). The check comes first
+		// and runs for every conditional request, so what it costs does not
+		// depend on whether the client's validator matches the target.
+		if resolvesInside(cleanRoot, filePath) && notModified(c, etag, early.ModTime()) {
 			if etag != "" {
 				setValidators(c, early.ModTime(), etag, cacheControl)
 			}
@@ -256,7 +261,13 @@ func resolvesInside(cleanRoot, filePath string) bool {
 		resolvesInsideHook()
 	}
 	full := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
-	if cleanRoot != "." && !pathUnder(cleanRoot, full) {
+	if cleanRoot == "." {
+		// Join drops a leading ".", so a path that leaves the working
+		// directory starts with "..".
+		if full == ".." || strings.HasPrefix(full, ".."+string(filepath.Separator)) {
+			return false
+		}
+	} else if !pathUnder(cleanRoot, full) {
 		return false
 	}
 	start := len(cleanRoot)
@@ -311,6 +322,17 @@ func pathUnder(root, p string) bool {
 	return root[len(root)-1] == filepath.Separator || p[len(root)] == filepath.Separator
 }
 
+// acceptsCoding reports whether the request's Accept-Encoding accepts the
+// content coding enc (q-values read, q=0 refuses), and names Accept-Encoding
+// in Vary, once. A client that accepts x-gzip accepts gzip (RFC 9110 8.4.1.3:
+// x-gzip is equivalent), and the variant is sent as "gzip".
+func acceptsCoding(c *celeris.Context, enc string) bool {
+	if enc == "gzip" {
+		return c.AcceptsEncodings("gzip", "x-gzip") != ""
+	}
+	return c.AcceptsEncodings(enc) != ""
+}
+
 // servePreCompressed checks for .br or .gz pre-compressed variants of the
 // requested file and serves them if the client accepts the encoding. The
 // variant is the representation the client gets and keeps, so its validators,
@@ -327,7 +349,7 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cache
 		// The client's q-values decide (br;q=0 refuses br), and the
 		// negotiation names Accept-Encoding in Vary, once, whichever
 		// representation is sent, a 304 included.
-		if c.AcceptsEncodings(v.encoding) == "" {
+		if !acceptsCoding(c, v.encoding) {
 			continue
 		}
 		vi, err := os.Stat(fullPath + v.suffix)
@@ -520,7 +542,7 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath, cacheControl
 	}
 
 	for _, v := range variants {
-		if c.AcceptsEncodings(v.encoding) == "" {
+		if !acceptsCoding(c, v.encoding) {
 			continue
 		}
 		compPath := filePath + v.suffix

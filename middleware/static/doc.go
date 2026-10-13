@@ -27,9 +27,10 @@
 // or answered with a 304, for a request with an Accept-Encoding header names
 // Vary: Accept-Encoding, whether or not the file has a variant. A request for
 // a directory is answered with its index file, and with the index file's own
-// variant. With Root, a conditional request is answered 304 only for a path
-// that stays inside the root once symlinks are resolved, as an unconditional
-// one is served only for such a path.
+// variant. With Root, a conditional request is answered 304 only after the
+// containment check that [celeris.Context.FileFromDir] applies to a file it
+// sends (symlinks resolved) has passed for its path, and that check runs for
+// every conditional request, whether or not its validator matches.
 //
 // A GET with a single byte range gets 206 Partial Content; a range no byte of
 // the file satisfies gets 416 Range Not Satisfiable with
