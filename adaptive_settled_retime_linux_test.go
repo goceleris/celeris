@@ -345,7 +345,11 @@ const (
 	// With eight busy loops competing for the container's CPUs (the median
 	// /ping rises from 0.03 to 1.9 ms) the fixed tree stays at queued 0.000
 	// (stalled over 5 ms up to 0.006) and the pinned worker at 0.327-0.347,
-	// ten runs each (logs/m1-load8-*).
+	// ten runs each (logs/m1-load8-*). The control arms (which judge the same
+	// fraction, assertCtlWorkerFree628), eight busy loops, six runs each:
+	// negctrl_async fixed 0.000 (stalled up to 0.016), pinned 0.324-0.330;
+	// negctrl_learning fixed 0.000 (stalled up to 0.007), pinned 0.268-0.330
+	// (logs/m1-load8c-*, m1-load8l-*).
 	stall592IOUringMaxQueuedFrac = 0.20
 
 	// The CONTROL arms' latency observable, celeris#628. Both controls used
