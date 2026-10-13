@@ -1429,6 +1429,11 @@ jobs:
       # own RESULT line, and New must hand the sub-engines net.Listen's
       # address on every free-port form. CELERIS_REQUIRE_DUALSTACK=1 turns the
       # dual-stack tests' skip on a host without IPv6 into a failure.
+      # TestAdaptiveListenEarlyReturnReleasesHold616 (celeris#886 item 4) is the
+      # one that stops Listen early: a Listen that returns before the
+      # start engine published its address, by a cancelled context or by a
+      # start engine that fails, must give the hold back with no Shutdown after
+      # it; three arms print an "early return" line with hold_after=false.
       - name: celeris#616 port held from New to Listen (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
