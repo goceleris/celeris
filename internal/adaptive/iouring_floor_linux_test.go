@@ -71,7 +71,12 @@ func (l *floorLog682) fallbackError(t *testing.T) (string, bool) {
 //   - "none": no probe ran, because New refused io_uring earlier (the probed
 //     tier is none: io_uring is missing or blocked).
 func loggedAnswer682(logs *floorLog682, fallbackErr string) string {
-	for _, r := range logs.records() {
+	return answerFromRecords682(logs.records(), fallbackErr)
+}
+
+// answerFromRecords682 is loggedAnswer682 on parsed records.
+func answerFromRecords682(recs []map[string]any, fallbackErr string) string {
+	for _, r := range recs {
 		msg, _ := r["msg"].(string)
 		switch {
 		case strings.HasPrefix(msg, "async cancel flags rejected by the kernel"):
@@ -86,10 +91,57 @@ func loggedAnswer682(logs *floorLog682, fallbackErr string) string {
 			}
 		}
 	}
-	if i := strings.Index(fallbackErr, "probe result: "); i >= 0 {
-		return strings.Fields(strings.NewReplacer("(", " ", ")", " ", ";", " ", ",", " ").Replace(fallbackErr[i+len("probe result: "):]))[0]
+	if _, after, ok := strings.Cut(fallbackErr, "probe result: "); ok {
+		for _, a := range []string{"accepted", "rejected", "no answer", "unexpected"} {
+			if strings.HasPrefix(after, a) {
+				return a
+			}
+		}
 	}
 	return "none"
+}
+
+// wantFallback682 is the expectation the table rests on: the io_uring start
+// engine is refused when the kernel rejected the flags, when no probe ran, and
+// on every kernel before 5.19 whatever the probe said, acceptance included.
+func wantFallback682(answer string, below bool) bool {
+	return answer == "rejected" || answer == "none" || below
+}
+
+// TestFloorExpectation682 pins the expectation and the log reading of the
+// table above on every host, including the mirror case no CI kernel can run:
+// a kernel before 5.19 whose probe ACCEPTED the flags (a partial vendor
+// backport) is refused all the same, and a rejection is refused on 5.19+.
+func TestFloorExpectation682(t *testing.T) {
+	const pre519 = "io_uring sub-engine: io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, " +
+		"and kernel 5.15.0 predates it; the IORING_ASYNC_CANCEL flags probe result: "
+	cases := []struct {
+		name        string
+		recs        []map[string]any
+		fallbackErr string
+		below       bool
+		wantAnswer  string
+		wantFall    bool
+	}{
+		{"5.19+, rejected record", []map[string]any{{"msg": "async cancel flags rejected by the kernel: io_uring needs Linux 5.19 or later and is not used (celeris#682)"}}, "x", false, "rejected", true},
+		{"5.19+, accepted (selected record)", []map[string]any{{"msg": "io_uring engine selected", "async_cancel_probe": "accepted"}}, "", false, "accepted", false},
+		{"5.19+, no answer", []map[string]any{{"msg": "async cancel flags probe got no answer from the kernel: ..."}, {"msg": "io_uring engine selected", "async_cancel_probe": "no answer"}}, "", false, "no answer", false},
+		{"5.19+, unexpected", []map[string]any{{"msg": "async cancel flags probe got an answer it does not recognise: ..."}}, "", false, "unexpected", false},
+		{"pre-5.19, ACCEPTED (the mirror case)", nil, pre519 + "accepted, which a kernel that carries only some of the flags can give while its other cancel forms fail; use the epoll engine (celeris#682, #872)", true, "accepted", true},
+		{"pre-5.19, rejected", []map[string]any{{"msg": "async cancel flags rejected by the kernel: ..."}}, "x", true, "rejected", true},
+		{"pre-5.19, no answer", nil, pre519 + "no answer (NewRing failed: EMFILE); use the epoll engine (celeris#682, #872)", true, "no answer", true},
+		{"no probe ran (tier none)", nil, "io_uring not available on this system", false, "none", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := answerFromRecords682(tc.recs, tc.fallbackErr); got != tc.wantAnswer {
+				t.Errorf("logged answer = %q, want %q", got, tc.wantAnswer)
+			}
+			if got := wantFallback682(tc.wantAnswer, tc.below); got != tc.wantFall {
+				t.Errorf("wantFallback682(%q, below=%v) = %v, want %v", tc.wantAnswer, tc.below, got, tc.wantFall)
+			}
+		})
+	}
 }
 
 // newFloorAdaptive682 builds an adaptive engine that is asked to start on
@@ -198,7 +250,7 @@ func TestAdaptiveStartOverrideBelowTheIOUringFloor(t *testing.T) {
 			if tc.force != nil && answer != tc.forced {
 				t.Fatalf("the probe was forced to %q and the log says %q: the forced answer did not reach New", tc.forced, answer)
 			}
-			wantFallback := answer == "rejected" || answer == "none" || below
+			wantFallback := wantFallback682(answer, below)
 			t.Logf("celeris682 adaptive kernel=%s (below 5.19: %v) io_uring tier=%v CELERIS_ADAPTIVE_START=iouring: "+
 				"probe answer %q, start engine %v, GET %d, fallback=%v %q (want a fallback: %v)",
 				p.KernelVersion, below, p.IOUringTier, answer, active, code, fellBack, fallbackErr, wantFallback)
