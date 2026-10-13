@@ -712,6 +712,16 @@ type Worker struct {
 	// no answer. A reap is only placed when it is true;
 	// createWorkers copies the engine's answer. Read-only after init.
 	asyncCancelFlags bool
+	// closingFD is the listen descriptor, plus one (0 is none), that
+	// closeListenerAfterDrain or stopAccepting has taken out of listenFD and
+	// not yet closed: they clear listenFD before they run handlers (the
+	// cancel's completions, OnConnect for the queued connections), so a
+	// Goexit in a handler would leave the descriptor open and in the
+	// SO_REUSEPORT group, and leaveGroupAfterExit closes it from here. An
+	// int32 (a descriptor is a C int) declared here, in the padding after
+	// asyncCancelFlags, so that adding it moves no other field and leaves
+	// Worker its size. Worker thread only.
+	closingFD int32
 	// dupFD duplicates the descriptor a hand-off moves: unix.Dup when nil.
 	// A test seam, so a test can make the dup fail the way a process out
 	// of descriptors does (EMFILE).
@@ -730,15 +740,6 @@ type Worker struct {
 	// asking the kernel about a descriptor number that may now belong to
 	// something else. Written once before ready; read only after it.
 	listenAddr net.Addr
-
-	// closingFD is the listen descriptor, plus one (0 is none), that
-	// closeListenerAfterDrain or stopAccepting has taken out of listenFD and
-	// not yet closed: they clear listenFD before they run handlers (the
-	// cancel's completions, OnConnect for the queued connections), so a
-	// Goexit in a handler would leave the descriptor open and in the
-	// SO_REUSEPORT group, and leaveGroupAfterExit closes it from here. The
-	// last field so that adding it moves no other. Worker thread only.
-	closingFD int
 }
 
 // recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
@@ -2546,7 +2547,7 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// worker does not own.
 	lfd := w.listenFD
 	w.listenFD = -1
-	w.closingFD = lfd + 1
+	w.closingFD = int32(lfd) + 1
 	w.cancelAccept(ctx, lfd)
 	// The completions above only cover handshakes an accept had already
 	// reached. Anything still in the kernel accept queue would be aborted
@@ -2665,7 +2666,7 @@ func (w *Worker) stopAccepting(ctx context.Context) {
 	}
 	lfd := w.listenFD
 	w.listenFD = -1 // before the cancel's completions: handleAccept re-arms on a listenFD >= 0
-	w.closingFD = lfd + 1
+	w.closingFD = int32(lfd) + 1
 	w.cancelAccept(ctx, lfd)
 	_ = unix.Close(lfd)
 	w.closingFD = 0
@@ -2710,7 +2711,7 @@ func (w *Worker) leaveGroupAfterExit() {
 	if w.closingFD > 0 {
 		// The Goexit came from a handler the pause's close or stopAccepting
 		// ran, after they took the descriptor out of listenFD.
-		_ = unix.Close(w.closingFD - 1)
+		_ = unix.Close(int(w.closingFD) - 1)
 		w.closingFD = 0
 	}
 	w.lingerUntil = 0
