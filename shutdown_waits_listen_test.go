@@ -11,7 +11,7 @@ import (
 )
 
 // TestShutdownRunsHooksOnlyAfterListenReturns is the engine-independent half
-// of celeris#703 (shutdown_drain_order_linux_test.go drives the real engines).
+// of celeris#703 (test/server/shutdown_drain_order_linux_test.go drives the real engines).
 // On epoll and io_uring Engine.Shutdown is a no-op and the drain runs in
 // Listen once its context is cancelled, so the drain is over only when Listen
 // returns. Shutdown used to run the OnShutdown hooks, and return, right after

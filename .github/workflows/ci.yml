@@ -130,7 +130,11 @@ jobs:
       # Excludes ./test/... to keep this job deterministic — those
       # suites (integration, spec, sustainedload) are timing-sensitive
       # on shared GitHub Actions runners and run locally / in the
-      # goceleris/probatorium cluster matrix instead.
+      # goceleris/probatorium cluster matrix instead. The one exception is
+      # ./test/server, added back right below the exclusion: it holds the root
+      # package's own tests that need only the exported API (they used to sit
+      # in the repository root), so it is part of the root package's test set,
+      # sharded and skipped by name with it.
       #
       # Excludes ./internal/adaptive/... because it runs in its own job, `adaptive`
       # below, which raises memlock so the up-switch tests execute
@@ -163,6 +167,7 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)|/engine/iouring$')
+          pkgs="$pkgs $(go list ./test/server)"
           # celeris#890: the 41 slowest root-package tests (.github/root-test-shards.txt)
           # run in the `unit-root-shard` jobs, one runner per shard. The guard fails
           # when a listed name is not a test of the root package, is listed twice or
@@ -769,7 +774,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           : > /tmp/c732.log
           failed=0
-          go test -race -count=1 -timeout=300s -v -run '^(TestAdaptRequestCarriesHeaders|TestAdaptKeptRequestStringsSurviveNextRequest)$' . 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestAdaptRequestCarriesHeaders|TestAdaptKeptRequestStringsSurviveNextRequest)$' ./test/server/ 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestWrapMiddlewareKeptStringsSurviveNextRequest$' ./middleware/adapters/ 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestKeptRecordSurvivesNextRequest$' ./middleware/logger/ 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
           (cd middleware/metrics && go test -race -count=1 -timeout=300s -v -run '^(TestLabelValuesSurviveNextRequest|TestLabelValuesSurviveConnectionReuse)$' .) 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
@@ -810,7 +815,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           : > /tmp/c742.log
           failed=0
-          go test -race -count=1 -timeout=300s -v -run '^(TestHandlerPanicLogSurvivesNextRequest|TestBindErrorValueSurvivesNextRequest)$' . 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestHandlerPanicLogSurvivesNextRequest|TestBindErrorValueSurvivesNextRequest)$' ./test/server/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestPanicRecordsSurviveNextRequest$' ./middleware/recovery/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestSentEventSurvivesSendersNextRequest$' ./middleware/sse/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^(TestWaiterResponseHeadersSurviveLeaderNextRequest|TestWaiterErrorAndPanicSurviveLeaderNextRequest)$' ./middleware/singleflight/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
@@ -943,7 +948,7 @@ jobs:
           failed=0
           go test -race -count=1 -timeout=300s -v -run '^TestConnCapturedRequestValuesSurviveFrames$' ./middleware/websocket/ 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestClientLastEventIDSurvivesPeerBytes$' ./middleware/sse/ 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run '^TestDetachedContextKeepsRequestValues$' . 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestDetachedContextKeepsRequestValues$' ./test/server/ 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
           (cd middleware/otel && go test -race -count=1 -timeout=300s -v -run '^TestExtractedContextSurvivesPeerBytes$' .) 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
           tests='TestConnCapturedRequestValuesSurviveFrames|TestClientLastEventIDSurvivesPeerBytes|TestDetachedContextKeepsRequestValues|TestExtractedContextSurvivesPeerBytes'
           top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c714.log || true)
@@ -980,7 +985,7 @@ jobs:
           failed=0
           go test -race -count=1 -timeout=300s -v -run '^(TestConnParamsAndPeerAddress|TestConnIPConcurrentCalls|TestPeerAddrParsesEngineForms|TestWaitUpOrStoppedReturnsWhenStartFails)$' ./middleware/websocket/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestWaitUpOrStoppedReturnsWhenStartFails$' ./middleware/sse/ ./internal/engine/epoll/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run '^(TestWaitServerStartedFailsFastOnStartError|TestWaitServerStartedExtFailsFastOnStartError)$' . 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestWaitServerStartedFailsFastOnStartError|TestWaitServerStartedExtFailsFastOnStartError)$' . ./test/server/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestWaitServerStartedMiddlewareFailsFastOnStartError$' ./middleware/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
           tests='TestConnParamsAndPeerAddress|TestConnIPConcurrentCalls|TestPeerAddrParsesEngineForms|TestWaitUpOrStoppedReturnsWhenStartFails|TestWaitServerStartedFailsFastOnStartError|TestWaitServerStartedExtFailsFastOnStartError|TestWaitServerStartedMiddlewareFailsFastOnStartError'
           top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c721.log || true)
@@ -1011,7 +1016,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           failed=0
           tests='TestHijackKeepsRequestViews|TestHijackCopiesRequestValuesUnderMultishotRecv|TestMultishotRingSurvivesHijacks'
-          go test -race -count=1 -timeout=300s -v -run "^(${tests})\$" . 2>&1 | tee /tmp/c733.log || failed=1
+          go test -race -count=1 -timeout=300s -v -run "^(${tests})\$" ./test/server/ 2>&1 | tee /tmp/c733.log || failed=1
           top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c733.log || true)
           arms=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/" /tmp/c733.log || true)
           uring=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/io_uring" /tmp/c733.log || true)
@@ -1057,7 +1062,7 @@ jobs:
           go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./internal/engine/iouring/ 2>&1 | tee /tmp/c791.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./internal/engine/epoll/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run "^(${std})\$" ./internal/engine/std/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run "^(${server})\$" . 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${server})\$" ./test/server/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
           names="${uring}|${epoll}|${std}|${server}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791.log || true)
@@ -1151,7 +1156,10 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           run=$(.github/scripts/root-shards.sh run-regex "$SHARD")
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=660s -v -run "$run" . 2>&1 | tee /tmp/shard.log
+          # -p 1: the root package and ./test/server (`root-shards.sh pkgs`) one after the
+          # other, so the runner's one memlock budget never funds two test processes.
+          # shellcheck disable=SC2046  # the packages are word-split on purpose
+          CELERIS_REQUIRE_DUALSTACK=1 go test -p 1 -race -count=1 -timeout=660s -v -run "$run" $(.github/scripts/root-shards.sh pkgs) 2>&1 | tee /tmp/shard.log
           .github/scripts/root-shards.sh tally-shard "$SHARD" /tmp/shard.log
 
   # The required check. It carries the name the repository's ruleset requires and

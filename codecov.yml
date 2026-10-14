@@ -17,7 +17,9 @@ codecov:
     # Seven uploads per commit: root (the coverage job's), the two root-package
     # shards (coverage-root-shard jobs, also flagged root; celeris#890),
     # compress, metrics, otel, protobuf. Waiting for all seven keeps Codecov
-    # from posting a partial, misleading number.
+    # from posting a partial, misleading number. The root upload carries two
+    # profile files (the root step's and ./test/server's, which run with
+    # -coverpkg on the root package); that is still one upload.
     after_n_builds: 7
 
 coverage:

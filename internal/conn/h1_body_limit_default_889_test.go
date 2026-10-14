@@ -12,7 +12,7 @@ import (
 )
 
 // Polish item 14 of celeris#889: the default MaxRequestBodySize is 4 MiB.
-// This is the ProcessH1 level of the table in bodylimit_default_889_linux_test.go:
+// This is the ProcessH1 level of the table in test/server/bodylimit_default_889_linux_test.go:
 // the limit the engines hand to H1State is what resource.Config.WithDefaults
 // resolves for 0, an explicit value and -1, and a body of exactly that size is
 // served while one byte more is answered 413, for a Content-Length body and a

@@ -41,7 +41,7 @@ func (r recordedResponse852) header(k string) []string {
 // serve852 runs one request through a bare adapter, as the other tests of
 // this package do (handleUnmatched builds the chains per request; the chains
 // Start builds are covered by the live-server tests in
-// unmatched_mounts_852_test.go), and returns what it wrote, keyed by the arm
+// test/server/unmatched_mounts_852_test.go), and returns what it wrote, keyed by the arm
 // name the assertions print.
 func serve852(t *testing.T, s *Server, method, path string) map[string]*recordingRW852 {
 	t.Helper()

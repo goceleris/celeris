@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Root-package test shards (celeris#890).
 #
+# "The root package's tests" are the tests of two packages: the root package
+# itself (the tests that use unexported symbols, the godoc examples, the
+# benchmarks CodSpeed tracks) and ./test/server, where the tests that need only
+# the exported API live (so the root directory holds the library, not 60 test
+# files of one kind). `pkgs` prints both; a test name is unique across the two.
+#
 # The root package's tests run one after another and took ~590 s on the runner
 # under -race, which made it the longest step of the Unit and Coverage jobs. The
 # slow tests are listed in .github/root-test-shards.txt, one `<shard> <Test>` per
@@ -10,13 +16,16 @@
 # `-skip`, so a test that is in no list still runs there: a new test cannot be
 # dropped by omission, only by being listed here.
 #
+#   root-shards.sh pkgs                the packages the root tests live in (". ./test/server"),
+#                                      for `go test`; run them with -p 1 in a shard (one
+#                                      process at a time keeps the runner's one memlock budget)
 #   root-shards.sh names <shard>       the shard's tests, one per line
 #   root-shards.sh run-regex <shard>   ^(A|B|...)$   for `go test -run`
 #   root-shards.sh skip-regex          ^(every listed test)$   for `go test -skip`
 #   root-shards.sh shards              the shard names, one per line
 #   root-shards.sh check               the guard: every listed name is a test of
-#                                      the root package, listed once, defined in
-#                                      no other package, -run selects exactly the
+#                                      the root packages (`pkgs`), listed once, defined
+#                                      once there and in no other package, -run selects exactly the
 #                                      listed set of each shard, and every shard has
 #                                      a job in ci.yml and test-coverage.yml (a workflow's
 #                                      `shard: [...]` matrix equals the file's shards exactly)
@@ -33,6 +42,8 @@
 set -euo pipefail
 
 file=${SHARDS_FILE:-.github/root-test-shards.txt}
+# The packages the root tests live in. ROOT_PKGS overrides (the negative controls use it).
+root_pkgs=${ROOT_PKGS:-". ./test/server"}
 
 die() { echo "root-shards: $*" >&2; exit 1; }
 
@@ -65,6 +76,8 @@ regex_of() { # stdin: names
 
 cmd=${1:-}
 case "$cmd" in
+  pkgs)
+    echo "$root_pkgs" ;;
   shards)
     entries | awk '{print $1}' | sort -u ;;
   names)
@@ -80,21 +93,26 @@ case "$cmd" in
     [ -n "$all" ] || die "$file lists no tests"
     dups=$(awk '{print $2}' <<<"$all" | sort | uniq -d)
     [ -z "$dups" ] || die "listed more than once: $(paste -sd' ' - <<<"$dups")$hint"
-    # The tests of the root package as the CI run sees them (-race, linux).
-    # shellcheck disable=SC2086  # flags are word-split on purpose
-    have=$(go test ${ROOT_TEST_FLAGS:--race} -list '.*' . | grep -E '^(Test|Example|Fuzz|Benchmark)' | sort)
+    # The tests of the root packages as the CI run sees them (-race, linux).
+    # shellcheck disable=SC2086  # flags and packages are word-split on purpose
+    have=$(go test ${ROOT_TEST_FLAGS:--race} -list '.*' $root_pkgs | grep -E '^(Test|Example|Fuzz|Benchmark)' | sort)
     # Benchmarks are listed but `go test` here never runs them (no -bench).
     have_run=$(grep -vE '^Benchmark' <<<"$have" || true)
-    [ -n "$have" ] || die "go test -list found no tests in the root package"
+    [ -n "$have" ] || die "go test -list found no tests in the root packages ($root_pkgs)"
     missing=$(comm -13 <(echo "$have") <(awk '{print $2}' <<<"$all" | sort))
-    [ -z "$missing" ] || die "listed but not a test of the root package (renamed or removed?): $(paste -sd' ' - <<<"$missing")$hint"
+    [ -z "$missing" ] || die "listed but not a test of the root packages (renamed or removed?): $(paste -sd' ' - <<<"$missing")$hint"
+    # A listed name defined in both root packages would run in its shard twice and
+    # in the rest never (-skip skips both), so a name must be defined once there.
+    twice=$(awk '{print $2}' <<<"$all" | sort | comm -12 - <(uniq -d <<<"$have"))
+    [ -z "$twice" ] || die "listed and defined in more than one of the root packages ($root_pkgs): $(paste -sd' ' - <<<"$twice")$hint"
     # -skip applies to every package of the Unit job's one `go test` line, so a
     # listed name that another package also defines would be skipped there too.
     # Grep the test files of every other package of the root module (go list, so
     # sub-modules are out; test/ and the packages a workflow leaves out stay in,
     # which can only over-report, never hide a clash) for the name (a `func` line).
-    rootdir=$(go list -f '{{.Dir}}' .)
-    others=$(go list -f '{{.Dir}}' ./... | grep -vxF "$rootdir" || true)
+    # shellcheck disable=SC2086  # packages are word-split on purpose
+    rootdirs=$(go list -f '{{.Dir}}' $root_pkgs)
+    others=$(go list -f '{{.Dir}}' ./... | grep -vxF "$rootdirs" || true)
     others_files=$(for d in $others; do find "$d" -maxdepth 1 -name '*_test.go'; done)
     clash=""
     if [ -n "$others_files" ]; then
@@ -109,7 +127,7 @@ case "$cmd" in
     for s in $(entries | awk '{print $1}' | sort -u); do
       want=$(awk -v s="$s" '$1 == s {print $2}' <<<"$all" | sort)
       # shellcheck disable=SC2086
-      got=$(go test ${ROOT_TEST_FLAGS:--race} -list "$("$0" run-regex "$s")" . | grep -E '^(Test|Example|Fuzz|Benchmark)' | sort)
+      got=$(go test ${ROOT_TEST_FLAGS:--race} -list "$("$0" run-regex "$s")" $root_pkgs | grep -E '^(Test|Example|Fuzz|Benchmark)' | sort)
       [ "$want" = "$got" ] || die "shard $s: -run selects [$(tr '\n' ' ' <<<"$got")], the file lists [$(tr '\n' ' ' <<<"$want")]$hint"
     done
     # Every shard of the file has a job: each workflow's matrix names exactly the
@@ -125,7 +143,7 @@ case "$cmd" in
     done
     listed=$(wc -l <<<"$all")
     kinds=$(grep -oE '^(Test|Example|Fuzz|Benchmark)' <<<"$have" | sort | uniq -c | awk '{printf "%s %s, ", $2, $1}')
-    echo "root-shards: ok: ${kinds%, } names in the root package (Benchmarks are never run here), $listed Tests in shards ($(entries | awk '{print $1}' | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}')), $(( $(wc -l <<<"$have_run") - listed )) Test/Fuzz/Example names run by the rest (-skip)"
+    echo "root-shards: ok: ${kinds%, } names in the root packages (Benchmarks are never run here), $listed Tests in shards ($(entries | awk '{print $1}' | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}')), $(( $(wc -l <<<"$have_run") - listed )) Test/Fuzz/Example names run by the rest (-skip)"
     ;;
   tally-shard)
     s=${2:?shard}; log=${3:?log}

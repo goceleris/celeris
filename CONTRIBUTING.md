@@ -106,6 +106,8 @@ mage middlewareProfile    # CPU profile each middleware individually
 mage -l    # List all available targets
 ```
 
+The targets live in `magefiles/` (mage's own layout). Run `mage` from the repository root: the targets use paths relative to it.
+
 ## Pull Requests
 
 - Keep PRs focused on a single change
