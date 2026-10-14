@@ -189,9 +189,9 @@ reviews:
         - No `pull_request_target`. Code from a fork pull request never runs on a self-hosted or CodSpeed macro runner.
         - The lint job runs actionlint and zizmor over this directory; both must stay clean.
         - Steps in ci.yml that count PASS lines of named tests must change together with those tests.
-    - path: "mage*.go"
+    - path: "magefiles/**"
       instructions: |
-        Magefiles carry `//go:build mage`; only the lint job's `mage -compile` builds them. The release stamps
+        Magefiles (magefiles/, mage's own layout; run `mage -l` from the repository root) carry `//go:build mage`; only the lint job's `mage -compile` builds them. The release stamps
         (celeris.Version in server.go and its line in api/celeris.txt, the four middleware go.mod pins, the README
         heading) must move together through `mage PrepRelease` and pass `mage CheckRelease`.
     - path: "api/**"

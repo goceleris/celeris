@@ -5,7 +5,7 @@
 //
 // Run with: go test -bench . -benchmem ./test/benchcmp_sse/...
 //
-// The mage `benchcmpSSE` target (see top-level magefile.go) wraps this
+// The mage `benchcmpSSE` target (see magefiles/magefile.go) wraps this
 // invocation with the framework's standard reporting + benchstat
 // post-processing.
 //

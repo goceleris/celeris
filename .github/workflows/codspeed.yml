@@ -177,7 +177,6 @@ on:
       - "middleware/static/**"
       - "middleware/swagger/**"
       - "middleware/timeout/**"
-      - "!mage*.go"
       - "!**/*_test.go"
       - "*bench*_test.go"
       - "internal/protocol/**/*bench*_test.go"
