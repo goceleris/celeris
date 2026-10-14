@@ -43,7 +43,9 @@
 #      Linux host it also shows this runner's layout effects.
 #
 # What it measures: the standard `testing.B` benchmarks of the router,
-# Context and handler chain (root bench_test.go), the HTTP/1 parser,
+# Context and handler chain (root bench_test.go; ./test/server holds the one
+# benchmark of the root package's tests that moved out of the root,
+# BenchmarkAutoNewConnRequest, with the helpers it shares), the HTTP/1 parser,
 # protocol detection, the HTTP/1 stream reset (BenchmarkResetH1Stream, in
 # internal/protocol/h2/stream), the core middleware chains (./middleware) and the
 # logger. Nothing in the benchmarks changed: CodSpeed's Go runner builds them
@@ -179,6 +181,7 @@ on:
       - "middleware/timeout/**"
       - "!**/*_test.go"
       - "*bench*_test.go"
+      - "test/server/*bench*_test.go"
       - "internal/protocol/**/*bench*_test.go"
       - "internal/protocol/detect/detect_test.go"
       - "internal/protocol/h2/stream/stream_test.go"
@@ -248,4 +251,4 @@ jobs:
           go-runner-version: "1.3.0"
           # The CodSpeed CLI writes this line to a script and runs it with
           # bash, so the quoted pattern reaches go-runner as one argument.
-          run: go test -bench='^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' -benchtime=1s . ./internal/protocol/... ./middleware ./middleware/logger
+          run: go test -bench='^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' -benchtime=1s . ./test/server ./internal/protocol/... ./middleware ./middleware/logger

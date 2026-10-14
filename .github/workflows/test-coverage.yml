@@ -15,8 +15,8 @@
 # push; GitHub-hosted minutes are free for public repositories.
 #
 # What is NOT in the profile, and why (so a low number is read correctly):
-# ./test/... (integration/spec harness, not library code), ./internal/adaptive/...,
-# and ./middleware/websocket. ./internal/adaptive/... runs in ci.yml's `adaptive` job:
+# ./test/... (integration/spec harness, not library code; ./test/server is the
+# exception, see below), ./internal/adaptive/..., and ./middleware/websocket. ./internal/adaptive/... runs in ci.yml's `adaptive` job:
 # it needs memlock raised with sudo, and its switch tests are load- and
 # timing-bound, with RESULT-line tallies that the job checks. Instrumenting
 # them would risk what happened to websocket (next sentence) and add the
@@ -30,7 +30,11 @@
 # runs at the runner's 8 MiB memlock, where io_uring gets one worker, so its
 # multi-worker paths read as uncovered here although the
 # goceleris/probatorium cluster runs them. Coverage is per package (no
-# -coverpkg), as `go test` reports it.
+# -coverpkg), as `go test` reports it, with one exception: ./test/server holds
+# the root package's tests that need only the exported API (they used to sit in
+# the repository root and count toward the root package), so it runs with
+# -coverpkg=github.com/goceleris/celeris and its profile is attributed to the
+# root package alone, exactly as before the move. No other package gets -coverpkg.
 #
 # (The file is test-coverage.yml, not coverage.yml: .gitignore ignores
 # `coverage.*` for local coverage output.)
@@ -54,11 +58,13 @@ jobs:
   coverage:
     name: Coverage (root + middleware sub-modules)
     runs-on: ubuntu-latest
-    # 30: the root step may run 540 s, the iouring step up to 480 s and the four
-    # middleware steps up to 120 s each, which is 25 min at their own limits
-    # before checkout and setup-go (it was 40 while the root step's limit was
-    # 1200 s). Refs #890.
-    timeout-minutes: 30
+    # 40: the root step may run 540 s twice (the other packages, then ./test/server,
+    # each with its own -timeout=540s), the iouring step up to 480 s and the four
+    # middleware steps up to 120 s each, which is 34 min at their own limits before
+    # checkout and setup-go (it was 30 before ./test/server got an invocation of
+    # its own, and 40 while the root step's limit was 1200 s). The job takes about
+    # 13 min: the root package's rest 44 s, ./test/server 146 s, iouring 357 s. Refs #890.
+    timeout-minutes: 40
     env:
       # ci.yml's unit selection (see "Same packages as ci.yml" below).
       COVER_EXCLUDE: "/test/|/adaptive($|/)|/middleware/websocket($|/)"
@@ -66,6 +72,10 @@ jobs:
       # others (see "internal/engine/iouring" below); its profile is added to
       # the root profile, so the root upload covers the same packages.
       COVER_OWN_STEP: "/internal/engine/iouring$"
+      # The root package's tests of the exported API (ci.yml's unit job adds
+      # ./test/server back after its /test/ exclusion). It runs in its own
+      # invocation of the root step, with -coverpkg on the root package.
+      COVER_SERVER_STEP: "./test/server"
     # A fork pull request gets no OIDC token. codecov-action (v7.1.1) sees the
     # fork itself (head repository != this repository), skips OIDC even with
     # use_oidc: true, and uploads tokenless, which Codecov accepts for public
@@ -87,7 +97,9 @@ jobs:
       # write to the root profile. The step fails, with the diff, when the two
       # package sets differ, when COVER_OWN_STEP selects anything but
       # ./internal/engine/iouring, and when ci.yml no longer has exactly one
-      # such line or `go list` fails.
+      # such line or `go list` fails. ./test/server is the other package both jobs
+      # add: ci.yml's unit step appends `go list ./test/server` after its grep,
+      # and the check below requires that line and adds the package to both sets.
       - name: Same packages as ci.yml's unit job
         run: |
           set -euo pipefail
@@ -100,15 +112,21 @@ jobs:
           echo "ci.yml excludes:        $ci_exclude (+ ./internal/engine/iouring in its own step)"
           echo "test-coverage excludes: $COVER_EXCLUDE"
           # Outside a process substitution, so that set -e sees a failure.
+          # shellcheck disable=SC2016  # the text is searched for literally, not expanded
+          if ! grep -qF 'pkgs="$pkgs $(go list ./test/server)"' .github/workflows/ci.yml; then
+            echo "::error::ci.yml's unit step should add ./test/server to its packages (pkgs=\"\$pkgs \$(go list ./test/server)\"); this job runs it with -coverpkg on the root package"
+            exit 1
+          fi
           all=$(go list ./...)
           iouring=$(go list ./internal/engine/iouring)
-          ci_pkgs=$({ grep -vE "$ci_exclude" <<< "$all" || true; echo "$iouring"; } | sort -u)
+          server=$(go list "$COVER_SERVER_STEP")
+          ci_pkgs=$({ grep -vE "$ci_exclude" <<< "$all" || true; echo "$iouring"; echo "$server"; } | sort -u)
           own=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; } | { grep -E "$COVER_OWN_STEP" || true; })
           if [ "$own" != "$iouring" ]; then
             echo "::error::COVER_OWN_STEP should select $iouring alone; it selects: ${own:-nothing}"
             exit 1
           fi
-          cover_pkgs=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; } | sort -u)
+          cover_pkgs=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; echo "$server"; } | sort -u)
           echo "packages: ci.yml $(grep -c . <<< "$ci_pkgs"), this job $(grep -c . <<< "$cover_pkgs")"
           if ! diff <(echo "$ci_pkgs") <(echo "$cover_pkgs"); then
             echo "::error::test-coverage.yml and ci.yml's unit job select different packages (diff above: < ci.yml, > this job)"
@@ -139,6 +157,15 @@ jobs:
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
           go test -race -count=1 -timeout=540s -covermode=atomic -skip "$skip" \
             -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
+          # The root package's tests of the exported API, in ./test/server. -coverpkg
+          # puts their coverage on the root package, where it was counted while they sat
+          # in the root directory; its own invocation keeps the other packages' numbers
+          # per package. A second profile of the same upload (the root upload below
+          # names both files), so the upload count stays what codecov.yml waits for.
+          # -p 1 is moot with one package; the skip regex is the same as above.
+          go test -race -count=1 -timeout=540s -covermode=atomic -skip "$skip" \
+            -coverpkg=github.com/goceleris/celeris \
+            -coverprofile="$RUNNER_TEMP/cover-root-server.out" "$COVER_SERVER_STEP"
       # ./internal/engine/iouring on its own, as ci.yml's unit job runs it.
       # io_uring charges ring memory to the user, so every test process of the
       # runner user shares one 8 MiB memlock budget. In the root step, the
@@ -189,7 +216,7 @@ jobs:
       - name: Every profile is non-empty
         run: |
           fail=0
-          for m in root compress metrics otel protobuf; do
+          for m in root root-server compress metrics otel protobuf; do
             f="$RUNNER_TEMP/cover-$m.out"
             blocks=0
             [ -f "$f" ] && blocks=$(grep -vc '^mode: ' "$f" || true)
@@ -205,7 +232,7 @@ jobs:
       - name: Upload root
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          files: ${{ runner.temp }}/cover-root.out
+          files: ${{ runner.temp }}/cover-root.out,${{ runner.temp }}/cover-root-server.out
           flags: root
           name: root
           disable_search: true
@@ -286,8 +313,14 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           run=$(.github/scripts/root-shards.sh run-regex "$SHARD")
-          go test -race -count=1 -timeout=660s -covermode=atomic -v -run "$run" \
-            -coverprofile="$RUNNER_TEMP/cover-root-$SHARD.out" . 2>&1 | tee /tmp/shard.log
+          # The root package and ./test/server (`root-shards.sh pkgs`), one process at a
+          # time (-p 1: one memlock budget per runner). -coverpkg puts the coverage of both
+          # on the root package, where the tests of ./test/server were counted before they
+          # moved; the root package's own tests cover it as they always did.
+          # shellcheck disable=SC2046  # the packages are word-split on purpose
+          go test -p 1 -race -count=1 -timeout=660s -covermode=atomic -v -run "$run" \
+            -coverpkg=github.com/goceleris/celeris \
+            -coverprofile="$RUNNER_TEMP/cover-root-$SHARD.out" $(.github/scripts/root-shards.sh pkgs) 2>&1 | tee /tmp/shard.log
           .github/scripts/root-shards.sh tally-shard "$SHARD" /tmp/shard.log
           blocks=$(grep -vc '^mode: ' "$RUNNER_TEMP/cover-root-$SHARD.out" || true)
           echo "cover-root-$SHARD.out: $blocks blocks"

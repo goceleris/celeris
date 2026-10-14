@@ -1,5 +1,8 @@
 # Root-package test shards (celeris#890). One `<shard> <TestName>` per line; # lines are comments.
 #
+# "The root package" below means the packages `.github/scripts/root-shards.sh pkgs` prints: the root package and
+# ./test/server (the tests that need only the exported API moved there from the root directory). A name is unique across the two.
+#
 # The root package's tests run one after another: 543 top-level tests, ~550 s of test time, 596 s wall on
 # the Unit job's runner under -race (CI run 38344043158, job 115121232279). The tests below are the ones
 # that took 3 s or more there (41 of the 43). Two stay out on purpose: TestAdaptiveSettledRouteRetime592
