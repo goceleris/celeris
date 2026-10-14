@@ -239,7 +239,8 @@ func TestH2SilentClientCannotPinResponseBodies893(t *testing.T) {
 		pinnedBound893 = 16 << 20
 	)
 	bundlePath := "/swagger/assets/swagger-ui-dist@" + swagger.SwaggerUIVersion + "/swagger-ui-bundle.js"
-	bundle, err := os.ReadFile(filepath.Join("middleware", "swagger", "assets", "swagger-ui-dist", "swagger-ui-bundle.js"))
+	// The test binary runs in test/server, two levels below the module root.
+	bundle, err := os.ReadFile(filepath.Join("..", "..", "middleware", "swagger", "assets", "swagger-ui-dist", "swagger-ui-bundle.js"))
 	if err != nil {
 		t.Fatal(err)
 	}
