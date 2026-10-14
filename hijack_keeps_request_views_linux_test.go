@@ -43,8 +43,9 @@ func c733Get(conn net.Conn, br *bufio.Reader, path, auth string) (string, error)
 // c733DialWorker dials addr until the connection is served by the worker
 // whose ID is want (GET /w answers with c.WorkerID()), and returns it. A
 // worker ID of -1 (std) accepts the first connection. The connections that
-// land on another worker are closed.
-func c733DialWorker(t *testing.T, addr string, want int, auth string) (net.Conn, *bufio.Reader) {
+// land on another worker are closed. Each GET carries the celeris#936 stall
+// witness (c936Get); srv may be nil.
+func c733DialWorker(t *testing.T, srv *celeris.Server, addr string, want int, auth string) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	for try := 0; try < 64; try++ {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -53,9 +54,9 @@ func c733DialWorker(t *testing.T, addr string, want int, auth string) (net.Conn,
 		}
 		_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 		br := bufio.NewReader(conn)
-		body, err := c733Get(conn, br, "/w", auth)
+		body, err := c936Get(t, srv, addr, conn, br, "/w", auth)
 		if err != nil {
-			t.Fatalf("GET /w: %v", err)
+			t.Fatalf("GET /w (dial %d): %v", try, err)
 		}
 		if got, _ := strconv.Atoi(body); got == want || want < 0 {
 			return conn, br
@@ -119,8 +120,9 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 	for _, a := range arms {
 		t.Run(a.name, func(t *testing.T) {
 			got := make(chan hijacked, 1)
+			var srv *celeris.Server
 			addr, stopServer := startC714DetachServer(t, func() *celeris.Server {
-				srv := celeris.New(celeris.Config{Engine: a.engine, Workers: 2})
+				srv = celeris.New(celeris.Config{Engine: a.engine, Workers: 2})
 				rt := srv.GET("/hj/:id", func(c *celeris.Context) error {
 					k := kept{param: c.Param("id"), header: c.Header("x-token"), path: c.Path()}
 					w := c.WorkerID()
@@ -162,8 +164,8 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 				// B: a new connection on A's worker, served while A's handler
 				// keeps its strings. Its Authorization value covers the
 				// offsets A's strings view.
-				b, br := c733DialWorker(t, addr, h.worker, c733Secret)
-				if _, err := c733Get(b, br, "/w", c733Secret); err != nil {
+				b, br := c733DialWorker(t, srv, addr, h.worker, c733Secret)
+				if _, err := c936Get(t, srv, addr, b, br, "/w", c733Secret); err != nil {
 					t.Fatalf("round %d: B: %v", i, err)
 				}
 				_ = b.Close()
@@ -287,7 +289,7 @@ func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 	// twice its default conns per worker, raised to bufRingCountMin: 1024
 	// buffers (internal/engine/iouring resolveBufRingCount). Twice that many requests
 	// cycle it twice.
-	b, br := c733DialWorker(t, addr, h.worker, c733Secret)
+	b, br := c733DialWorker(t, nil, addr, h.worker, c733Secret)
 	defer func() { _ = b.Close() }()
 
 	// The control request, on A's worker, before the ring cycles.
