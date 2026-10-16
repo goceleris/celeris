@@ -34,6 +34,26 @@ func PinToCPU(cpu int) error {
 	return setAffinity(set)
 }
 
+// PinToCPUsMask restricts the calling OS thread to the given CPUs (AB ARM C2,
+// throwaway). The same caller rules as PinToCPU apply.
+func PinToCPUsMask(cpus []int) error {
+	top := 0
+	for _, c := range cpus {
+		if c < 0 || c >= maxAffinityBits {
+			return unix.EINVAL
+		}
+		top = max(top, c)
+	}
+	if len(cpus) == 0 {
+		return unix.EINVAL
+	}
+	set := unix.NewCPUSet(max(top+1, initialAffinityBits))
+	for _, c := range cpus {
+		set.Set(c)
+	}
+	return setAffinity(set)
+}
+
 // ThreadAffinity is the CPU affinity mask of an OS thread, saved by
 // SaveThreadAffinity so that Restore can put it back.
 type ThreadAffinity struct {

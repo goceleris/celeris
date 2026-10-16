@@ -155,6 +155,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// allowed set, and on a big.LITTLE host never a little CPU.
 	plan := planWorkerCPUs(resolved.Workers)
 	cpus := plan.CPUs
+	floatMask = plan.FloatMask
 
 	if topo.NumNodes > 1 {
 		resolved.MaxEvents = resolved.MaxEvents / topo.NumNodes

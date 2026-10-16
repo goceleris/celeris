@@ -384,6 +384,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// allowed set, and on a big.LITTLE host never a little CPU.
 	plan := planWorkerCPUs(resolved.Workers)
 	cpus := plan.CPUs
+	floatMask = plan.FloatMask
 
 	// Probe for the highest working tier by test-creating a ring.
 	tier := e.tier

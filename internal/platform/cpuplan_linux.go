@@ -33,6 +33,10 @@ type CPUPlan struct {
 	Little []int
 	// Heterogeneous reports a capacity-asymmetric allowed set (big.LITTLE).
 	Heterogeneous bool
+	// FloatMask is, for AB ARM C2 (throwaway), the non-little CPUs: a loop
+	// planned -1 gets this affinity mask instead of the process's. Empty on a
+	// homogeneous host.
+	FloatMask []int
 	// Note is one line that says why the plan departs from the plain
 	// "i-th allowed CPU" rule, for the engine to log once. Empty for a
 	// homogeneous host.
@@ -144,6 +148,7 @@ func planWorkerCPUs(numWorkers int, src planSource) CPUPlan {
 	}
 	plan.Heterogeneous = true
 	plan.Little = little
+	plan.FloatMask = slices.Clone(big)
 	pinned := min(numWorkers, len(big))
 	plan.CPUs = make([]int, numWorkers)
 	copy(plan.CPUs, big[:pinned])
@@ -151,7 +156,7 @@ func planWorkerCPUs(numWorkers int, src planSource) CPUPlan {
 		plan.CPUs[i] = -1
 	}
 	plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
-		"%d of %d loops pinned to the other allowed CPUs %s, %d left unpinned",
+		"%d of %d loops pinned to the other allowed CPUs %s, %d left unpinned but masked to them",
 		capNote, FormatCPUs(little), pinned, numWorkers, FormatCPUs(big), numWorkers-pinned)
 	return plan
 }
