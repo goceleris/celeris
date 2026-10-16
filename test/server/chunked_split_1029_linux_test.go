@@ -361,15 +361,25 @@ func TestChunkedSlowUploadSurvivesReadHeaderTimeout1029(t *testing.T) {
 
 func bodyServerRHT1029(t *testing.T, eng celeris.EngineType, rht time.Duration) string {
 	t.Helper()
+	return server1029(t, eng, celeris.Config{ReadHeaderTimeout: rht})
+}
+
+// server1029 serves /ping, a sync POST /up and an Async() POST /aup, both
+// answering with the body length.
+func server1029(t *testing.T, eng celeris.EngineType, cfg celeris.Config) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	s := celeris.New(celeris.Config{Addr: addr, Engine: eng, Protocol: celeris.Auto, ReadHeaderTimeout: rht})
+	cfg.Addr, cfg.Engine, cfg.Protocol = addr, eng, celeris.Auto
+	s := celeris.New(cfg)
+	up := func(c *celeris.Context) error { return c.String(http.StatusOK, "n=%d", len(c.Body())) }
 	s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
-	s.POST("/up", func(c *celeris.Context) error { return c.String(http.StatusOK, "n=%d", len(c.Body())) })
+	s.POST("/up", up)
+	s.POST("/aup", up).Async()
 	startDone := make(chan error, 1)
 	go func() { startDone <- s.Start() }()
 	if err := waitReady761(addr, startDone); err != nil {
@@ -382,4 +392,50 @@ func bodyServerRHT1029(t *testing.T, eng celeris.EngineType, rht time.Duration) 
 		<-startDone
 	})
 	return addr
+}
+
+// TestChunkedAsyncRoute1029: the same split bodies to a route marked Async(),
+// whose requests run on the connection's dispatch goroutine, and a connection
+// that alternates a sync and an async route.
+func TestChunkedAsyncRoute1029(t *testing.T) {
+	for _, e := range engines761 {
+		t.Run(e.name, func(t *testing.T) {
+			addr := server1029(t, e.eng, celeris.Config{})
+			for _, n := range []int{1, 3000, 200000, 1 << 20} {
+				wire, _ := wire1029("/aup", pat1029(n), 32<<10, "", "", "")
+				for _, mode := range []struct {
+					name string
+					plan []seg1029
+				}{
+					{"1-segment", []seg1029{{wire, 0}}},
+					{"2-segments", equal1029(wire, 2, 5*time.Millisecond)},
+					{"many-segments", equal1029(wire, 20, time.Millisecond)},
+				} {
+					t.Run(fmt.Sprintf("%dB/%s", n, mode.name), func(t *testing.T) {
+						_, br := send1029(t, addr, mode.plan)
+						if status, got := read1029(t, br); status != 200 || got != fmt.Sprintf("n=%d", n) {
+							t.Fatalf("status %d body %q, want 200 n=%d", status, got, n)
+						}
+					})
+				}
+			}
+			t.Run("alternating", func(t *testing.T) {
+				c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = c.Close() }()
+				_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+				br := bufio.NewReader(c)
+				for round, path := range []string{"/up", "/aup", "/up", "/aup", "/aup", "/up"} {
+					n := 5000 + 17000*round
+					wire, _ := wire1029(path, pat1029(n), 6000, "", "", "")
+					go write1029(c, equal1029(wire, 5, 3*time.Millisecond))
+					if status, got := read1029(t, br); status != 200 || got != fmt.Sprintf("n=%d", n) {
+						t.Fatalf("round %d %s: status %d body %q, want 200 n=%d", round, path, status, got, n)
+					}
+				}
+			})
+		})
+	}
 }
