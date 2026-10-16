@@ -61,7 +61,11 @@ func c862FillSendBuffer(t *testing.T, fd int) int {
 // fd), and neither may receive a write from a wake that loaded the old number
 // before the close. A wake has to land in the few microseconds between the
 // close and the reuse for it to fire, so it seldom does, with or without
-// -race.
+// -race. A wake that names the old number (one cached when the worker was made,
+// or a Signal that ignores the close) is also pinned without -race by
+// TestAWakeAfterShutdownClosedTheEventfdWritesNothing890; a wake that loads
+// w.wakeFD.FD() itself and so finds -1 is a race with the close that only
+// -race reports (celeris#890).
 func TestWriteRacingCloseNeverTouchesTheClosedEventfd862(t *testing.T) {
 	const rounds, writers = 64, 4
 	one := []byte{'w'}

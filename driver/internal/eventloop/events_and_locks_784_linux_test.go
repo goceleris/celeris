@@ -264,7 +264,8 @@ func TestWorkerReadsAConnWhileItIsBeingFlushed784(t *testing.T) {
 // ErrUnknownFD and the caller closes the fd; a reader that has not seen closed
 // yet would then read the number. The test holds the conn's c.mu, which the
 // teardown needs to set closed, starts the teardown, and checks for 500 ms
-// that the conn stays in the map.
+// that the conn stays in the map, and that UnregisterConn has not returned and
+// onClose has not fired: both come after the flag is set (celeris#890).
 func TestTeardownMarksTheConnClosedBeforeItLeavesTheWorker784(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
