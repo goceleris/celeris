@@ -3578,16 +3578,19 @@ func (l *Loop) armEpollOut(cs *connState) {
 	// Backpressure replaces the dirty-list retry; the two must not coexist
 	// or adaptiveTimeoutMs would still return 0 and busy-poll.
 	l.removeDirty(cs)
-	if cs.epollOut {
-		return
-	}
 	// The response is parked: start its write clock (celeris#885 items 35 and
 	// 45), unless it has one already (a conn relinked or adopted with bytes
 	// queued keeps the clock of the response it was already taking). The wall
 	// clock, not cachedNow, which a loop with no events leaves as old as its
-	// last event. A partial flush is the backpressure path, not the common one.
+	// last event. Before the epollOut test: the drain sites end the clock
+	// (endWrite) without disarming EPOLLOUT, so a conn can be armed with no
+	// clock, and its next response's partial flush must start one. A partial
+	// flush is the backpressure path, not the common one.
 	if cs.writeSince == 0 {
 		cs.writeSince = time.Now().UnixNano()
+	}
+	if cs.epollOut {
+		return
 	}
 	issued, err := l.modEpollOut(cs, unix.EPOLLIN|unix.EPOLLET|unix.EPOLLOUT|unix.EPOLLRDHUP)
 	if !issued {
