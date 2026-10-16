@@ -431,8 +431,9 @@ func (l *Loop) run(ctx context.Context) {
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}
-	// celeris#909: a loop planned unpinned, or whose pin failed, has cpuID -1
-	// and no NUMA node to bind to.
+	// celeris#909: a loop whose pin failed (the planner plans none unpinned
+	// since celeris#1036; a test plan can) has cpuID -1 and no NUMA node to
+	// bind to.
 	l.pinOwnThread()
 
 	if l.cpuID >= 0 {
