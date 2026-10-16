@@ -186,7 +186,11 @@ reviews:
         - Top-level `permissions` read-only; a job raises only what it needs, with a comment saying why.
         - actions/checkout with `persist-credentials: false`.
         - No `${{ }}` expression inside `run:`; pass values through `env:`.
-        - No `pull_request_target`. Code from a fork pull request never runs on a self-hosted or CodSpeed macro runner.
+        - No `pull_request_target`. A job on a self-hosted or CodSpeed macro runner must skip fork pull requests
+          (`github.event.pull_request.head.repo.full_name == github.repository`). That `if:` is not the boundary: on
+          `pull_request` the workflow file comes from the merge ref, so a fork can edit it. The boundary is the
+          fork-PR approval policy ("Require approval for all external contributors"), which must stay on, and no
+          maintainer approves a fork pull request that touches .github/workflows.
         - The lint job runs actionlint and zizmor over this directory; both must stay clean.
         - Steps in ci.yml that count PASS lines of named tests must change together with those tests.
     - path: "magefiles/**"
