@@ -56,6 +56,14 @@ func varyNamesAcceptEncoding(headers [][2]string) bool {
 // core that older releases lack), and the three packages' tests pin it.
 const compressibleKey = "celeris.compressible-representation"
 
+// compressActiveKey is the context key compress sets (to true) when it has
+// negotiated an encoding for the request and runs the handlers below it with
+// the response buffered. static and etag mark a response (compressibleKey)
+// only when it is set, so they pay for the mark only where a compress in front
+// can use it (and the mark follows compress's own decisions: its Skip, HEAD,
+// OPTIONS, streaming requests and "no encoding in common" never get one).
+const compressActiveKey = "celeris.compress.active"
+
 // compressibleRepresentation is what a marker (the value under
 // compressibleKey) answers: the size of the identity representation and its
 // content type, which are what compress decides on whether to encode it
@@ -221,6 +229,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
+		c.Set(compressActiveKey, true)
 		c.BufferResponse()
 		err := c.Next()
 

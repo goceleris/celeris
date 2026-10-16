@@ -29,22 +29,31 @@ func TestStrongTagIsMarkedForCompress888(t *testing.T) {
 		h        celeris.HandlerFunc
 		method   string
 		hdrs     [][2]string
+		noActive bool // compress is not in front: it did not set its key
 		wantMark bool
 		wantCode int
 	}{
-		{"strong computed", Config{Strong: true}, blob, "GET", [][2]string{{"accept-encoding", "gzip"}}, true, 200},
-		{"strong computed, 304", Config{Strong: true}, blob, "GET", [][2]string{{"accept-encoding", "gzip"}, {"if-none-match", "*"}}, true, 304},
-		{"handler's strong tag", Config{}, ownTag(`"v1"`), "GET", [][2]string{{"accept-encoding", "gzip"}}, true, 200},
-		{"handler's strong tag, 304", Config{}, ownTag(`"v1"`), "GET", [][2]string{{"accept-encoding", "gzip"}, {"if-none-match", `"v1"`}}, true, 304},
-		{"weak computed (default)", Config{}, blob, "GET", [][2]string{{"accept-encoding", "gzip"}}, false, 200},
-		{"handler's weak tag", Config{}, ownTag(`W/"v1"`), "GET", [][2]string{{"accept-encoding", "gzip"}}, false, 200},
-		{"no Accept-Encoding", Config{Strong: true}, blob, "GET", nil, false, 200},
-		{"HEAD", Config{Strong: true}, blob, "HEAD", [][2]string{{"accept-encoding", "gzip"}}, false, 200},
-		{"a 206", Config{}, partial, "GET", [][2]string{{"accept-encoding", "gzip"}}, false, 206},
-		{"a 304 of a 206", Config{}, partial, "GET", [][2]string{{"accept-encoding", "gzip"}, {"if-none-match", `"v1"`}}, false, 304},
+		{"strong computed", Config{Strong: true}, blob, "GET", [][2]string{{"accept-encoding", "gzip"}}, false, true, 200},
+		{"strong computed, 304", Config{Strong: true}, blob, "GET", [][2]string{{"accept-encoding", "gzip"}, {"if-none-match", "*"}}, false, true, 304},
+		{"handler's strong tag", Config{}, ownTag(`"v1"`), "GET", [][2]string{{"accept-encoding", "gzip"}}, false, true, 200},
+		{"handler's strong tag, 304", Config{}, ownTag(`"v1"`), "GET", [][2]string{{"accept-encoding", "gzip"}, {"if-none-match", `"v1"`}}, false, true, 304},
+		{"weak computed (default)", Config{}, blob, "GET", [][2]string{{"accept-encoding", "gzip"}}, false, false, 200},
+		{"handler's weak tag", Config{}, ownTag(`W/"v1"`), "GET", [][2]string{{"accept-encoding", "gzip"}}, false, false, 200},
+		{"compress not in front", Config{Strong: true}, blob, "GET", [][2]string{{"accept-encoding", "gzip"}}, true, false, 200},
+		{"compress not in front, 304", Config{Strong: true}, blob, "GET", [][2]string{{"accept-encoding", "gzip"}, {"if-none-match", "*"}}, true, false, 304},
+		{"a 206", Config{}, partial, "GET", [][2]string{{"accept-encoding", "gzip"}}, false, false, 206},
+		{"a 304 of a 206", Config{}, partial, "GET", [][2]string{{"accept-encoding", "gzip"}, {"if-none-match", `"v1"`}}, false, false, 304},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := []celeristest.Option{celeristest.WithHandlers(New(tc.cfg), tc.h)}
+			// compress in front: it sets the key etag looks for when it has
+			// negotiated an encoding (this package cannot import compress).
+			active := func(c *celeris.Context) error {
+				if !tc.noActive {
+					c.Set("celeris.compress.active", true)
+				}
+				return c.Next()
+			}
+			opts := []celeristest.Option{celeristest.WithHandlers(active, New(tc.cfg), tc.h)}
 			for _, h := range tc.hdrs {
 				opts = append(opts, celeristest.WithHeader(h[0], h[1]))
 			}

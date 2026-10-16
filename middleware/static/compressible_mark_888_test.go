@@ -8,6 +8,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
 )
 
@@ -26,9 +27,20 @@ func TestFSMarksTheRepresentationCompressCouldWeaken888(t *testing.T) {
 		"zero.txt": {Data: content}, // no mtime: no validators at all
 	}
 	strong := ""
+	noCompress := false
+	// compress in front: it sets the key static looks for when it has
+	// negotiated an encoding (this package cannot import compress).
+	compressInFront := func(c *celeris.Context) error {
+		c.Set("celeris.compress.active", true)
+		return c.Next()
+	}
 	run := func(method, path string, c bool, hdrs ...string) (marked bool, size int, ct string, status int, tag string) {
 		t.Helper()
-		opts := []celeristest.Option{celeristest.WithHandlers(New(Config{FS: fsys, Compress: c}))}
+		chain := []celeris.HandlerFunc{New(Config{FS: fsys, Compress: c})}
+		if !noCompress {
+			chain = append([]celeris.HandlerFunc{compressInFront}, chain...)
+		}
+		opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
 		for i := 0; i+1 < len(hdrs); i += 2 {
 			opts = append(opts, celeristest.WithHeader(hdrs[i], hdrs[i+1]))
 		}
@@ -57,6 +69,16 @@ func TestFSMarksTheRepresentationCompressCouldWeaken888(t *testing.T) {
 	if ok, _, _, status, _ := run("GET", "/f.txt", false, "accept-encoding", "gzip", "if-none-match", strong); !ok || status != 304 {
 		t.Errorf("a 304: marked=%v status=%d, want a mark on a 304", ok, status)
 	}
+	// compress not in front (or it negotiated no encoding): nothing weakens the
+	// tag, so no mark is made and the request pays nothing for it.
+	noCompress = true
+	if ok, _, _, status, _ := run("GET", "/f.txt", false, "accept-encoding", "gzip"); ok || status != 200 {
+		t.Errorf("without compress in front: marked=%v status=%d, want no mark on a 200", ok, status)
+	}
+	if ok, _, _, status, _ := run("GET", "/f.txt", false, "accept-encoding", "gzip", "if-none-match", strong); ok || status != 304 {
+		t.Errorf("without compress in front, a 304: marked=%v status=%d, want no mark on a 304", ok, status)
+	}
+	noCompress = false
 	for _, tc := range []struct {
 		name, method, path string
 		compress           bool
@@ -64,8 +86,6 @@ func TestFSMarksTheRepresentationCompressCouldWeaken888(t *testing.T) {
 		wantMark           bool
 		wantStatus         int
 	}{
-		{"no Accept-Encoding", "GET", "/f.txt", false, nil, false, 200},
-		{"HEAD", "HEAD", "/f.txt", false, []string{"accept-encoding", "gzip"}, false, 200},
 		{"a part of the file", "GET", "/f.txt", false, []string{"accept-encoding", "gzip", "range", "bytes=0-9"}, false, 206},
 		{"a part, validated by the tag", "GET", "/f.txt", false, []string{"accept-encoding", "gzip", "range", "bytes=0-9", "if-range", strong}, false, 206},
 		{"a range no byte of which exists", "GET", "/f.txt", false, []string{"accept-encoding", "gzip", "range", "bytes=99999-"}, false, 416},
@@ -91,8 +111,9 @@ func TestRootMarksNothing888(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(strings.Repeat("a", 1000)), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	compressInFront := func(c *celeris.Context) error { c.Set("celeris.compress.active", true); return c.Next() }
 	ctx, rec := celeristest.NewContextT(t, "GET", "/f.txt",
-		celeristest.WithHandlers(New(Config{Root: dir})), celeristest.WithHeader("accept-encoding", "gzip"))
+		celeristest.WithHandlers(compressInFront, New(Config{Root: dir})), celeristest.WithHeader("accept-encoding", "gzip"))
 	if err := ctx.Next(); err != nil {
 		t.Fatal(err)
 	}

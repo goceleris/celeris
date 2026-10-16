@@ -21,6 +21,55 @@ func TestCompressibleKeyIsPinned888(t *testing.T) {
 	if compressibleKey != "celeris.compressible-representation" {
 		t.Fatalf("compressibleKey = %q: static and etag set %q", compressibleKey, "celeris.compressible-representation")
 	}
+	if compressActiveKey != "celeris.compress.active" {
+		t.Fatalf("compressActiveKey = %q: static and etag look for %q", compressActiveKey, "celeris.compress.active")
+	}
+}
+
+// TestCompressSaysWhenItIsActive888: compress sets compressActiveKey, which
+// static and etag look for before they mark a response, exactly when it has
+// negotiated an encoding and runs the handlers below it buffered: not for a
+// request without Accept-Encoding, for HEAD, OPTIONS, a Skip, a streaming
+// request, or an Accept-Encoding none of whose codings it offers.
+func TestCompressSaysWhenItIsActive888(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		method string
+		cfg    Config
+		hdrs   [][2]string
+		want   bool
+	}{
+		{"gzip", "GET", Config{}, [][2]string{{"accept-encoding", "gzip"}}, true},
+		{"POST", "POST", Config{}, [][2]string{{"accept-encoding", "gzip"}}, true},
+		{"no Accept-Encoding", "GET", Config{}, nil, false},
+		{"identity", "GET", Config{}, [][2]string{{"accept-encoding", "identity"}}, false},
+		{"refuses gzip", "GET", Config{}, [][2]string{{"accept-encoding", "gzip;q=0"}}, false},
+		{"HEAD", "HEAD", Config{}, [][2]string{{"accept-encoding", "gzip"}}, false},
+		{"OPTIONS", "OPTIONS", Config{}, [][2]string{{"accept-encoding", "gzip"}}, false},
+		{"skipped", "GET", Config{Skip: func(*celeris.Context) bool { return true }}, [][2]string{{"accept-encoding", "gzip"}}, false},
+		{"no encoding in common", "GET", Config{Encodings: []string{"zstd"}}, [][2]string{{"accept-encoding", "gzip"}}, false},
+		{"event stream", "GET", Config{}, [][2]string{{"accept-encoding", "gzip"}, {"accept", "text/event-stream"}}, false},
+		{"websocket", "GET", Config{}, [][2]string{{"accept-encoding", "gzip"}, {"upgrade", "websocket"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got bool
+			h := func(c *celeris.Context) error {
+				_, got = c.Get(compressActiveKey)
+				return c.String(200, "ok")
+			}
+			opts := []celeristest.Option{celeristest.WithHandlers(newCompress888(tc.cfg), h)}
+			for _, hd := range tc.hdrs {
+				opts = append(opts, celeristest.WithHeader(hd[0], hd[1]))
+			}
+			c, _ := celeristest.NewContextT(t, tc.method, "/", opts...)
+			if err := c.Next(); err != nil {
+				t.Fatalf("Next: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("the handler below compress sees the key: %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestMarkedNotModifiedFollowsTheRule888: what compress does with a 304 whose

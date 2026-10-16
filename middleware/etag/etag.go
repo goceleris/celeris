@@ -25,12 +25,20 @@ func (r *representation) CompressibleRepresentation() (size int, contentType str
 	return r.size, r.contentType
 }
 
-// markCompressible marks the full response of a GET that carries the strong
-// tag, when it names an encoding in Accept-Encoding (without one compress
-// sends the identity bytes and tag as they are): a weak tag, which compress
+// compressActiveKey is the key compress sets when it has negotiated an encoding
+// for the request and buffers the response (compress has its own copy).
+const compressActiveKey = "celeris.compress.active"
+
+// markCompressible marks the response that carries the strong tag, when
+// compress in front negotiated an encoding for the request (it sets
+// compressActiveKey: without it nothing weakens the tag, and the mark would
+// cost a map store and an allocation for nothing). A weak tag, which compress
 // does not change, and a 206, which it sends as it is, need none.
 func markCompressible(c *celeris.Context, status int, tag string, body []byte) {
-	if status == 206 || tag == "" || tag[0] == 'W' || c.Method() != "GET" || c.Header("accept-encoding") == "" {
+	if status == 206 || tag == "" || tag[0] == 'W' {
+		return
+	}
+	if _, ok := c.Get(compressActiveKey); !ok {
 		return
 	}
 	c.Set(compressibleKey, &representation{size: len(body), contentType: c.ResponseContentType()})

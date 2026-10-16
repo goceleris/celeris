@@ -126,6 +126,7 @@ func ownTag888(c *celeris.Context) error {
 // Config means the defaults, not MinLength 0).
 func newCompress888(cfg Config) celeris.HandlerFunc {
 	c := defaultConfig
+	c.Skip, c.SkipPaths = cfg.Skip, cfg.SkipPaths
 	if cfg.MinLength != 0 {
 		c.MinLength = cfg.MinLength
 	}
