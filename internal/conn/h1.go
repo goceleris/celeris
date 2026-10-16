@@ -973,10 +973,12 @@ func (s *H1State) abortChunked() {
 
 // scanChunked decodes the chunks that follow the head (state.chunkHeadLen bytes
 // at the front of state.buffer) into state.chunkBuf. It reports done when the
-// terminating chunk and its trailer have been consumed, and then end is the
-// length of the whole request (head, chunks, trailer) in state.buffer: the
-// caller drops it with Next(end), which is O(1), so a burst of pipelined
-// chunked requests is not copied once per request. When not done, state.buffer
+// terminating chunk and its trailer have been consumed, and then end is how
+// much of the front of state.buffer the caller drops with Next(end): the whole
+// request (head, chunks, trailer), which is O(1), so a burst of pipelined
+// chunked requests is not copied once per request, or just the head when
+// nothing follows the request (the decoded bytes are cut off the end first).
+// When not done, state.buffer
 // holds the head followed by the bytes it could not decode yet (a partial
 // chunk, a partial size line, a partial trailer), moved down behind the head;
 // the head itself is never moved.
@@ -1021,6 +1023,14 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, end int, err error
 		s.appendChunk(chunk, limit)
 	}
 	if done {
+		if pos == len(buf) {
+			// Nothing follows the request: drop the decoded bytes by length,
+			// which copies nothing. Leaving the buffer full-length made the
+			// next requests on the connection slower (a split 4 KiB body +9..17%
+			// in the A/B), so this keeps the layout the compaction left.
+			s.buffer.Truncate(head)
+			return true, head, nil
+		}
 		return true, pos, nil
 	}
 	if pos > head {

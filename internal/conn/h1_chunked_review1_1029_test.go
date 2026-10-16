@@ -14,9 +14,9 @@ import (
 // CR/LF cut, the memory a chunked upload in flight holds, and the buffer a
 // large upload leaves behind.
 
-// TestScanChunkedDoneLeavesTheBuffer1029: when the terminator is decoded,
-// scanChunked reports where the request ends and leaves state.buffer as it
-// was. Moving what follows the request down over the decoded chunks (the first
+// TestScanChunkedDoneLeavesTheBuffer1029: when the terminator is decoded and
+// something follows it, scanChunked reports where the request ends and leaves
+// state.buffer as it was. Moving what follows the request down over the decoded chunks (the first
 // version did) costs O(n) per chunked request, so k pipelined chunked requests
 // in one buffer cost O(k*n); the caller drops the request with Next(end).
 func TestScanChunkedDoneLeavesTheBuffer1029(t *testing.T) {
@@ -306,5 +306,28 @@ func TestProcessH1ChunkedUploadCapAfterTheSecondChunk1029(t *testing.T) {
 	}
 	if _, err := feed1029(st, h, &out, []byte("0\r\n\r\n")); err != nil || len(h.bodies) != 1 || len(h.bodies[0]) != limit {
 		t.Fatalf("terminator: err %v, handler calls %d", err, len(h.bodies))
+	}
+}
+
+// TestScanChunkedDoneWithNothingAfter1029: with nothing behind the terminator
+// the decoded bytes are cut off the end of state.buffer, so only the head is
+// left and the caller drops it (the layout 9ebc502's compaction left, which the
+// A/B showed matters for the next requests: +9..17% on a split 4 KiB body
+// without it).
+func TestScanChunkedDoneWithNothingAfter1029(t *testing.T) {
+	body := pattern1029(300)
+	req := append([]byte(head1029), chunked1029(body, 100, "", "")...)
+	st := NewH1State()
+	st.buffer.Write(req)
+	st.chunkHeadLen = len(head1029)
+	done, end, err := st.scanChunked(func([]byte) {})
+	if err != nil || !done {
+		t.Fatalf("scanChunked: done=%v err=%v", done, err)
+	}
+	if end != len(head1029) || st.buffer.Len() != len(head1029) {
+		t.Fatalf("end=%d buffered=%d, want both %d (the head)", end, st.buffer.Len(), len(head1029))
+	}
+	if !bytes.Equal(st.chunkBuf, body) {
+		t.Fatalf("decoded body %d bytes, want %d", len(st.chunkBuf), len(body))
 	}
 }
