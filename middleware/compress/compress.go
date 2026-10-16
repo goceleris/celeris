@@ -46,6 +46,91 @@ func varyNamesAcceptEncoding(headers [][2]string) bool {
 	return false
 }
 
+// compressibleKey is the context key under which middleware/static and
+// middleware/etag mark a response whose strong ETag is a hash of the identity
+// bytes, which compress weakens when it encodes them (celeris#888 item 36).
+// The value implements [compressibleRepresentation]. The key is part of no
+// API: it is reserved for the middleware of this repository, and a response
+// that nothing marked is judged by compress as before. The string is repeated
+// in static and etag (this module cannot import an internal package of the
+// core that older releases lack), and the three packages' tests pin it.
+const compressibleKey = "celeris.compressible-representation"
+
+// compressActiveKey is the context key compress sets (to true) when it has
+// negotiated an encoding for the request and runs the handlers below it with
+// the response buffered. static and etag mark a response (compressibleKey)
+// only when it is set, so they pay for the mark only where a compress in front
+// can use it (and the mark follows compress's own decisions: its Skip, HEAD,
+// OPTIONS, streaming requests and "no encoding in common" never get one).
+const compressActiveKey = "celeris.compress.active"
+
+// compressibleRepresentation is what a marker (the value under
+// compressibleKey) answers: the size of the identity representation and its
+// content type, which are what compress decides on whether to encode it
+// (MinLength, ExcludedContentTypes). A 304 has neither a body nor a content
+// type, so the marker is how compress decides for it what it decided for the
+// 200.
+type compressibleRepresentation interface {
+	CompressibleRepresentation() (size int, contentType string)
+}
+
+// marked returns the marker of the response, when a handler set one.
+func marked(c *celeris.Context) (compressibleRepresentation, bool) {
+	v, ok := c.Get(compressibleKey)
+	if !ok {
+		return nil, false
+	}
+	m, ok := v.(compressibleRepresentation)
+	return m, ok
+}
+
+// weakenETag turns the strong ETag of c's response into a weak one: the tag
+// was computed over the identity bytes, but the wire carries an encoded form
+// of them (or, for a response marked as compressible, may: see
+// weakenMarkedNotModified). RFC 9110 8.8.3 says a strong validator changes with
+// every octet of the representation, Content-Encoding included.
+func weakenETag(c *celeris.Context) {
+	for _, h := range c.ResponseHeaders() {
+		if h[0] == "etag" && len(h[1]) > 0 && h[1][0] != 'W' {
+			c.SetHeader("etag", "W/"+h[1])
+			return
+		}
+	}
+}
+
+// weakenMarkedNotModified gives the 304 the tag the 200 to the same request
+// would carry (RFC 9110 15.4.5). It has no body to encode and no content type,
+// so the marker of the handler that answered it stands in for them: a
+// representation compress would encode (not under MinLength, not of an
+// excluded content type, no Content-Encoding of its own) has its strong tag
+// weakened, as it is on the 200. Whether the encoded form would be longer than
+// the identity one cannot be known without encoding it: the 200 of a marked
+// response compress does not send encoded for that reason carries the weak tag
+// too (see weakenETag's caller), so the two agree.
+func weakenMarkedNotModified(c *celeris.Context, excluded []string, minLen int) {
+	strong := false
+	for _, h := range c.ResponseHeaders() {
+		switch h[0] {
+		case "content-encoding":
+			return
+		case "etag":
+			strong = len(h[1]) > 0 && h[1][0] != 'W'
+		}
+	}
+	if !strong {
+		return
+	}
+	m, ok := marked(c)
+	if !ok {
+		return
+	}
+	size, ct := m.CompressibleRepresentation()
+	if size == 0 || (minLen > 0 && size < minLen) || isExcluded(ct, excluded) {
+		return
+	}
+	weakenETag(c)
+}
+
 // New creates a compress middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
 	cfg := defaultConfig
@@ -144,6 +229,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
+		c.Set(compressActiveKey, true)
 		c.BufferResponse()
 		err := c.Next()
 
@@ -158,6 +244,18 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		status := c.ResponseStatus()
 		body := c.ResponseBody()
+
+		// A 304 carries the tag a 200 to the same request would carry
+		// (RFC 9110 15.4.5), and compress weakens the strong tag of the 200
+		// it encodes: a handler that marked the response (static over an
+		// fs.FS, etag) lets the 304 follow.
+		if status == 304 {
+			weakenMarkedNotModified(c, excluded, minLen)
+			if ferr := flushWithVary(); ferr != nil && err == nil {
+				err = ferr
+			}
+			return err
+		}
 
 		// A 206 goes out as it is: its Content-Range counts bytes of the
 		// identity representation, and once a Content-Encoding applies a
@@ -189,23 +287,25 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		compressed, compErr := compressBody(encoding, body, gzipPool, brotliPool, deflatePool, zstdEncoder, &bufPool)
-		if compErr != nil {
-			// Graceful degradation: if compression fails, flush the original
-			// uncompressed body. The compression error is propagated to the caller
-			// but the response is already sent to avoid a blank page.
+		// Graceful degradation: when compression fails, or the encoded form
+		// would be no shorter (the expansion guard), the original body goes
+		// out as it is, and a failure is propagated to the caller once the
+		// response is sent, so that there is no blank page. (For the encodings
+		// Config.validate accepts, and a bytes.Buffer to write to, no encoder
+		// has a failing path: in practice only the expansion guard takes
+		// this branch.) A marked response sent as it is keeps
+		// the weak tag its 304 gets (see weakenMarkedNotModified): a weak tag
+		// on identity bytes is legal, a strong tag that the 304 does not
+		// carry is not.
+		if compErr != nil || len(compressed) >= len(body) {
+			if _, ok := marked(c); ok {
+				weakenETag(c)
+			}
 			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}
 			if err == nil {
 				err = compErr
-			}
-			return err
-		}
-
-		// Compression expansion guard.
-		if len(compressed) >= len(body) {
-			if ferr := flushWithVary(); ferr != nil && err == nil {
-				err = ferr
 			}
 			return err
 		}
@@ -220,12 +320,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		// compressed payload would corrupt cache validation. The weak
 		// "W/" prefix tells the client the tag describes payload semantics,
 		// not octet identity.
-		for _, h := range c.ResponseHeaders() {
-			if h[0] == "etag" && len(h[1]) > 0 && h[1][0] != 'W' {
-				c.SetHeader("etag", "W/"+h[1])
-				break
-			}
-		}
+		weakenETag(c)
 		if ferr := flushWithVary(); ferr != nil && err == nil {
 			err = ferr
 		}

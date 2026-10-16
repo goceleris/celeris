@@ -32,6 +32,11 @@
 // sends (symlinks resolved) has passed for its path, and that check runs for
 // every conditional request, whether or not its validator matches.
 //
+// With compress in front of an [Config].FS, the strong tag of a file that compress
+// encodes is made weak on the 200 (W/"hash"), and static marks the response so
+// that compress makes the 304 of a revalidation carry that same tag (RFC 9110
+// 15.4.5); see the compress package. Root's weak tag needs no mark.
+//
 // A GET with a single byte range gets 206 Partial Content; a range no byte of
 // the file satisfies gets 416 Range Not Satisfiable with
 // "Content-Range: bytes */<size>" (the size of the variant, for a pre-compressed

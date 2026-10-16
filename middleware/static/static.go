@@ -33,6 +33,59 @@ type cachedFile struct {
 	etag            string
 	lastModifiedStr string
 	modTime         time.Time
+	// rep is what a response marks itself with for compress (see
+	// markCompressible). The mark is a pointer to this field, not to the
+	// cachedFile: the mark lands in the context's keys, which Context.Keys
+	// hands to user code, and a middleware that prints every value would
+	// print data, up to maxFSFileSize bytes.
+	rep representation
+}
+
+// representation is the mark: the size and content type of the identity bytes
+// of a file. compress asks it for them (CompressibleRepresentation): a 304 has
+// neither, and compress decides on them whether it would have encoded the 200
+// (celeris#888 item 36).
+type representation struct {
+	size        int
+	contentType string
+}
+
+// CompressibleRepresentation answers middleware/compress.
+func (r *representation) CompressibleRepresentation() (size int, contentType string) {
+	return r.size, r.contentType
+}
+
+// compressibleKey is the context key under which static, and middleware/etag,
+// mark a response whose strong ETag is a hash of the identity bytes, for
+// middleware/compress (celeris#888 item 36): it weakens that tag on the 200 it
+// encodes, and needs the mark to give the 304 the tag the 200 carries (RFC 9110
+// 15.4.5). compress has its own copy of the string. The key is part of no API.
+const compressibleKey = "celeris.compressible-representation"
+
+// compressActiveKey is the key compress sets when it has negotiated an encoding
+// for the request and buffers the response (compress has its own copy).
+const compressActiveKey = "celeris.compress.active"
+
+// markCompressible marks the response for f, which carries the strong tag etag,
+// when compress in front negotiated an encoding for the request (it sets
+// compressActiveKey: without it nothing weakens the tag, and the mark would
+// cost a map store for nothing), and the answer would be the whole file, not a
+// 206 or a 416, which compress sends as they are, so that their 304 keeps the
+// strong tag too (Range, and If-Range against the tag and date, decide that
+// as the 200 does). A weak tag, which compress does not change, is not marked.
+func markCompressible(c *celeris.Context, f *cachedFile, etag, lastModified string) {
+	if etag == "" || etag[0] == 'W' {
+		return
+	}
+	if _, ok := c.Get(compressActiveKey); !ok {
+		return
+	}
+	if rng := c.Header("range"); rng != "" {
+		if _, _, out := httprange.Decide("GET", rng, c.Header("if-range"), etag, lastModified, int64(len(f.data))); out != httprange.Full {
+			return
+		}
+	}
+	c.Set(compressibleKey, &f.rep)
 }
 
 // maxFSFileSize caps in-memory reads from fs.FS to 100 MB.
@@ -463,6 +516,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 			etag:            etag,
 			lastModifiedStr: lastModifiedStr,
 			modTime:         modTime,
+			rep:             representation{size: len(data), contentType: contentType},
 		}
 		// filePath is a sub-slice of c.Path(), which on the native engines is
 		// a zero-copy view over the connection's read buffer. sync.Map retains
@@ -481,6 +535,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		if cacheControl != "" {
 			c.SetHeader("cache-control", cacheControl)
 		}
+		markCompressible(c, cached, cached.etag, cached.lastModifiedStr)
 		if notModified(c, cached.etag, modTime) {
 			return c.NoContent(304)
 		}
