@@ -40,13 +40,17 @@ func Accept(header string, offers []string) string {
 	// middleware.
 	var entryBuf [8]AcceptItem
 	entries := ParseInto(entryBuf[:0], header)
+	// How specifically each entry matches the offer being weighed, so that
+	// offerQuality finds the entry that ranks the offer without matching
+	// the entries twice. Entries past the buffer are matched again.
+	var specBuf [16]int8
 
 	bestOffer := ""
 	bestQ := -1.0
 	bestIdx := len(entries) // higher = worse; prefer earlier Accept entries on tie
 	for _, offer := range offers {
 		lo := strings.ToLower(offer)
-		q, idx := offerQuality(entries, lo)
+		q, idx := offerQuality(entries, lo, specBuf[:])
 		if q <= 0 {
 			continue
 		}
@@ -68,11 +72,15 @@ func Accept(header string, offers []string) string {
 // says 0, else the highest; idx is the earliest entry of any specificity that
 // matches the offer and carries that q-value, which is the entry origin/main
 // ranked it by (a "*" ahead of the entry that names the offer ranks the offer
-// at the "*"). It returns q=0 when no entry matches.
-func offerQuality(entries []AcceptItem, offer string) (q float64, idx int) {
+// at the "*"). It returns q=0 when no entry matches. specs is scratch: the
+// specificity of entries[i] is left in specs[i] for i < len(specs).
+func offerQuality(entries []AcceptItem, offer string, specs []int8) (q float64, idx int) {
 	bestSpec := 0
-	for _, e := range entries {
+	for i, e := range entries {
 		spec := matchSpecificity(e.MediaType, offer)
+		if i < len(specs) {
+			specs[i] = int8(spec)
+		}
 		if spec == 0 || spec < bestSpec {
 			continue
 		}
@@ -90,7 +98,14 @@ func offerQuality(entries []AcceptItem, offer string) (q float64, idx int) {
 		return q, idx
 	}
 	for i, e := range entries {
-		if e.Quality == q && MatchMedia(e.MediaType, offer) {
+		if e.Quality != q {
+			continue
+		}
+		if i < len(specs) {
+			if specs[i] != 0 {
+				return q, i
+			}
+		} else if matchSpecificity(e.MediaType, offer) != 0 {
 			return q, i
 		}
 	}
