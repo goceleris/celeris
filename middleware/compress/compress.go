@@ -290,9 +290,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		// Graceful degradation: when compression fails, or the encoded form
 		// would be no shorter (the expansion guard), the original body goes
 		// out as it is, and a failure is propagated to the caller once the
-		// response is sent, so that there is no blank page. (The encoders
-		// fail only for an encoding Config.validate rejects: in practice
-		// this is the expansion guard.) A marked response sent as it is keeps
+		// response is sent, so that there is no blank page. (For the encodings
+		// Config.validate accepts, and a bytes.Buffer to write to, no encoder
+		// has a failing path: in practice only the expansion guard takes
+		// this branch.) A marked response sent as it is keeps
 		// the weak tag its 304 gets (see weakenMarkedNotModified): a weak tag
 		// on identity bytes is legal, a strong tag that the 304 does not
 		// carry is not.
