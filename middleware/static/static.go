@@ -35,6 +35,41 @@ type cachedFile struct {
 	modTime         time.Time
 }
 
+// CompressibleRepresentation answers middleware/compress, which asks the value
+// marked on a response (compressibleKey) for the size and content type of the
+// identity bytes: a 304 has neither, and compress decides on them whether it
+// would have encoded the 200 (celeris#888 item 36).
+func (f *cachedFile) CompressibleRepresentation() (size int, contentType string) {
+	return len(f.data), f.contentType
+}
+
+// compressibleKey is the context key under which static, and middleware/etag,
+// mark a response whose strong ETag is a hash of the identity bytes, for
+// middleware/compress (celeris#888 item 36): it weakens that tag on the 200 it
+// encodes, and needs the mark to give the 304 the tag the 200 carries (RFC 9110
+// 15.4.5). compress has its own copy of the string. The key is part of no API.
+const compressibleKey = "celeris.compressible-representation"
+
+// markCompressible marks the response of a GET for f, which carries the strong
+// tag etag, when compress could weaken it: the request names an encoding in
+// Accept-Encoding (without one compress sends the identity bytes and tag
+// as they are) and the answer would be the whole file, not a 206 or a 416,
+// which compress sends as they are, so that their 304 keeps the strong tag too
+// (Range, and If-Range against the tag and date, decide that as the 200 does).
+// A weak tag, which compress does not change, is not marked, and the mark
+// costs a map store, so it is made only when it can matter.
+func markCompressible(c *celeris.Context, f *cachedFile, etag, lastModified string) {
+	if etag == "" || etag[0] == 'W' || c.Method() != "GET" || c.Header("accept-encoding") == "" {
+		return
+	}
+	if rng := c.Header("range"); rng != "" {
+		if _, _, out := httprange.Decide("GET", rng, c.Header("if-range"), etag, lastModified, int64(len(f.data))); out != httprange.Full {
+			return
+		}
+	}
+	c.Set(compressibleKey, f)
+}
+
 // maxFSFileSize caps in-memory reads from fs.FS to 100 MB.
 const maxFSFileSize = 100 << 20
 
@@ -481,6 +516,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		if cacheControl != "" {
 			c.SetHeader("cache-control", cacheControl)
 		}
+		markCompressible(c, cached, cached.etag, cached.lastModifiedStr)
 		if notModified(c, cached.etag, modTime) {
 			return c.NoContent(304)
 		}

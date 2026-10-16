@@ -6,6 +6,36 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+// compressibleKey is the context key under which etag, and middleware/static,
+// mark a response whose strong tag is a hash of the identity bytes, for
+// middleware/compress (celeris#888 item 36): it weakens that tag on the 200 it
+// encodes, and needs the mark to give the 304 the tag the 200 carries (RFC 9110
+// 15.4.5). compress has its own copy of the string. The key is part of no API.
+const compressibleKey = "celeris.compressible-representation"
+
+// representation is the mark: the size and content type of the body the strong
+// tag describes, which compress decides on whether it encodes it.
+type representation struct {
+	size        int
+	contentType string
+}
+
+// CompressibleRepresentation answers middleware/compress.
+func (r *representation) CompressibleRepresentation() (size int, contentType string) {
+	return r.size, r.contentType
+}
+
+// markCompressible marks the full response of a GET that carries the strong
+// tag, when it names an encoding in Accept-Encoding (without one compress
+// sends the identity bytes and tag as they are): a weak tag, which compress
+// does not change, and a 206, which it sends as it is, need none.
+func markCompressible(c *celeris.Context, status int, tag string, body []byte) {
+	if status == 206 || tag == "" || tag[0] == 'W' || c.Method() != "GET" || c.Header("accept-encoding") == "" {
+		return
+	}
+	c.Set(compressibleKey, &representation{size: len(body), contentType: c.ResponseContentType()})
+}
+
 // New creates an ETag middleware with the given config.
 //
 // Composition: when a downstream handler or middleware (e.g.
@@ -87,6 +117,8 @@ func New(config ...Config) celeris.HandlerFunc {
 			n := writeCRC32ETag(&tagBuf, checksum, !strong)
 			tag = string(tagBuf[:n])
 		}
+
+		markCompressible(c, status, tag, body)
 
 		inm := c.Header("if-none-match")
 		if inm != "" && etagMatch(inm, tag) {
