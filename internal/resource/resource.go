@@ -27,7 +27,11 @@ const (
 // Resources allows user overrides of default resource values.
 // Zero values mean "use engine default".
 type Resources struct {
-	// Workers is the number of I/O worker goroutines (0 = GOMAXPROCS).
+	// Workers is the number of I/O worker goroutines (0 = GOMAXPROCS). Zero
+	// is also what tells the native engines the count was not user-set: on a
+	// host whose CPUs differ in capacity they then start one pinned loop per
+	// non-little CPU, fewer than GOMAXPROCS (celeris#1036); a count set here
+	// is honoured, wrapping over those CPUs, every loop pinned.
 	Workers int
 	// BufferSize is the per-connection I/O buffer size in bytes (0 = engine default).
 	BufferSize int

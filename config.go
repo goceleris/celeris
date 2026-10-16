@@ -96,6 +96,19 @@ type Config struct {
 	Engine EngineType
 
 	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
+	//
+	// On Linux the native engines (epoll, io_uring) pin each loop to one CPU
+	// the process is allowed to use. On a host whose allowed CPUs differ in
+	// capacity (arm64 big.LITTLE) they start one loop per CPU that is not
+	// little by default, which is fewer than GOMAXPROCS (8 loops on a 12-CPU
+	// host with 4 little CPUs), and pin every one of them: a loop left
+	// unpinned drifted onto the little CPUs and a loop pinned to one stalled
+	// its connections. A Workers set above that count is honoured and never
+	// left unpinned: the extra loops wrap round-robin over the non-little
+	// CPUs, each pinned, so some of those CPUs run more than one loop. The
+	// loops started are Metrics.Workers of [Server.EngineInfo], and the engine
+	// logs one line saying how many it started and why.
+	// Hosts whose CPUs are alike are unchanged (README, "CPU pinning").
 	Workers int
 
 	// WorkloadHint optionally declares the expected steady-state concurrency.
@@ -307,9 +320,9 @@ type Config struct {
 	// thread, until a timed run of it blocks, and returns to inline when the
 	// promotion expires. A thread that cgo code called from an inline handler
 	// creates (pthread_create) inherits the pin the same way. Threads Go
-	// starts itself do not. On a host whose CPUs differ in capacity (arm64 big.LITTLE) the
-	// loops that did not get a big CPU run unpinned and have nothing to pass
-	// on (README, "CPU pinning").
+	// starts itself do not. On a host whose CPUs differ in capacity (arm64
+	// big.LITTLE) the loops pin to the non-little CPUs only (README, "CPU
+	// pinning").
 	//
 	// AsyncHandlers is the SERVER-LEVEL default. Individual routes and
 	// groups can override it per handler with [Route.Async] /
