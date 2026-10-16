@@ -915,3 +915,47 @@ func FuzzTimeoutDurations(f *testing.F) {
 		_, _ = testutil.RunChain(t, chain, "GET", "/fuzz")
 	})
 }
+
+// A handler that panics must not leave the request context wrapped in the
+// lazy deadline context, nor leave a promoted deadline timer running: the
+// timeout middleware restores the context and releases the lazy one on the
+// way out of a panic as it does on a return (celeris#888 item 29). An outer
+// recovery middleware (what a server installs) answers the panic and the
+// request goes on with the context it started with.
+func TestPanicRestoresContextAndReleasesTimer888(t *testing.T) {
+	var inner context.Context
+	var before, after context.Context
+	var recovered any
+	outer := func(c *celeris.Context) (err error) {
+		before = c.Context()
+		defer func() {
+			recovered = recover()
+			after = c.Context()
+		}()
+		return c.Next()
+	}
+	handler := func(c *celeris.Context) error {
+		inner = c.Context()
+		_ = inner.Done() // promotes the lazy context to a real 1h timer
+		panic("handler panic")
+	}
+	chain := []celeris.HandlerFunc{outer, New(Config{Timeout: time.Hour}), handler}
+	_, _ = testutil.RunChain(t, chain, "GET", "/panic")
+	if recovered == nil {
+		t.Fatal("the panic did not reach the outer recovery")
+	}
+	if inner == nil || inner == before {
+		t.Fatal("the handler did not see the lazy deadline context")
+	}
+	if after != before {
+		t.Errorf("request context after the panic = %v, want the one the request started with (%v)", after, before)
+	}
+	select {
+	case <-inner.Done():
+	default:
+		t.Fatal("the promoted deadline context is still live after the panic: its timer leaks for the hour")
+	}
+	if err := inner.Err(); !errors.Is(err, context.Canceled) {
+		t.Errorf("promoted context Err = %v, want context.Canceled", err)
+	}
+}

@@ -55,8 +55,22 @@ func New(config ...Config) celeris.HandlerFunc {
 		lazy := newLazyDeadlineCtx(origCtx, time.Now().Add(d))
 		c.SetContext(lazy)
 
+		// A panic in the handler unwinds through here to whatever recovers
+		// it above: the request context must not stay the lazy one, and a
+		// timer the handler promoted by reading Done() must not run out its
+		// deadline (celeris#888). The normal path restores and releases
+		// explicitly, before the reads below, and clears the flag.
+		unwinding := true
+		defer func() {
+			if unwinding {
+				c.SetContext(origCtx)
+				lazy.release()
+			}
+		}()
+
 		err := c.Next()
 
+		unwinding = false
 		c.SetContext(origCtx)
 		lazy.release()
 
