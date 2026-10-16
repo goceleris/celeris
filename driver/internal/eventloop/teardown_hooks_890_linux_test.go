@@ -114,9 +114,11 @@ func TestUnregisterConnWaitsForTheDelOfTheTeardownInFlight890(t *testing.T) {
 
 	if err, held := c890Held(secondErr); !held {
 		t.Errorf("a second UnregisterConn(A) returned %v while the first teardown was held before its EPOLL_CTL_DEL: its caller may close the number with A still in the epoll set", err)
+		secondErr <- err // keep the result for the wait below
 	}
 	if err, held := c890Held(firstErr); !held {
 		t.Errorf("the held UnregisterConn(A) returned %v", err)
+		firstErr <- err
 	}
 	inSetHeld := c890InEpollSet(t, w.epollFD, a)
 	letGo()
