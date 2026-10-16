@@ -891,14 +891,19 @@ jobs:
       #
       # -v is required for the tally: without it `go test` prints no
       # per-test result lines at all. The budget goes to 300s because the
-      # step runs two suites with per-test output; the measured wall time
-      # of this exact shape is ~50s.
+      # step runs two suites with per-test output. The step took 64 s on
+      # main (run 38541022063). The inbound oracle now holds the backpressure
+      # idle for wsoQuiet after its flood, and floods 16000 frames per burst
+      # rather than 1000, which is what lets it see celeris#607 re-introduced
+      # (checklist #888 item 4); that makes the inbound test alone about 50 s
+      # in a linux/arm64 container (35 s at 1000 frames), so the step is
+      # expected near two minutes.
       - name: middleware/websocket — backpressure + chanReader tests
         shell: bash
         env:
           WS484_CONNS: "16"
           WS484_BURSTS: "2"
-          WS484_BURST_FRAMES: "1000"
+          WS484_BURST_FRAMES: "16000"
         run: |
           set -o pipefail
           go vet -tags celeris_closeprobe ./middleware/websocket/

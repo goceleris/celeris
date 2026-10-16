@@ -40,6 +40,14 @@ const closeHandshakeSlow = 10 * time.Second
 // (celeris#611). The echo failure itself is judged, with its error and its
 // connection, when it came before its own client closed.
 //
+// After its flood the client holds the backpressure idle for wsoQuiet, as the
+// pause-cancel test does, so a connection the engine stopped reading behind its
+// blocked echo (celeris#607) stays unread long enough for the watch to see it.
+// With celeris#607 re-introduced (mutant m607) this fires on io_uring at 16
+// connections and 2 bursts of 16000 frames, the size ci.yml runs; it did not
+// at 1000 frames per burst, whose echo fits the socket buffers and never blocks
+// a send (checklist #888 item 4).
+//
 // The client finishes its writes and waits for the close on progress, reading
 // while it waits, like TestBackpressurePauseDoesNotCancelInflightSend's
 // (backpressure_oracle_linux_test.go, celeris#633), and the rig's watch fails
@@ -397,6 +405,15 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 						}
 						cl.mark("flood end seq=%d off=%d burstsEndedByDeadline=%d", seq, off, deadlines)
 						cl.sample(c, "flood end")
+						// Hold the backpressure with the client idle (wsoQuiet), as
+						// TestBackpressurePauseDoesNotCancelInflightSend does: a
+						// healthy engine reads what this connection's socket holds
+						// or pauses it; one that stopped reading it behind the blocked
+						// echo SEND (celeris#607) cannot, and the watch sees that
+						// stretch pass wsoRecvStall. Without it the client reads again
+						// at once and the stretch never lasts (celeris#888 item 4).
+						time.Sleep(wsoQuiet)
+						cl.mark("quiet end")
 						buf := make([]byte, 64<<10)
 						if off > 0 {
 							if w := cl.write(c, "fc", cur[off:], buf); !w.ok {
