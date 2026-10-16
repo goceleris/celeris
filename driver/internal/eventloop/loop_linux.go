@@ -227,10 +227,12 @@ var testHookEventTurnBusy func(fd int)
 var testHookAfterRearm func(fd int)
 
 // The hooks below are nil-by-default package variables like the ones above.
-// A test sets one before it creates the worker (or, for testHookBeforePoll,
-// before the call) and clears it after the worker is shut down. Several run
-// with a lock held: their doc says which, and a hook must not take that lock
-// or wait for a goroutine that does (celeris#890).
+// A test sets one right before the operation it observes and clears it (in
+// t.Cleanup) when it is done. They are process-global and fire for every
+// worker, not only the test's, so the tests that set them must not run in
+// parallel with another test that uses a worker (no test of this package calls
+// t.Parallel). Several run with a lock held: their doc says which, and a hook
+// must not take that lock or wait for a goroutine that does (celeris#890).
 
 // testHookBeforePoll, when non-nil, runs in WriteAndPoll and WriteAndPollBusy
 // once before the Phase B poll(0) rounds and once before the Phase C poll(1ms),

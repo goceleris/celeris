@@ -171,7 +171,11 @@ func TestShutdownMarksEveryConnClosedBeforeItClosesTheEpollFd890(t *testing.T) {
 	notClosed, epollOpen := 0, false
 	testHookBeforeEpollClose = func() {
 		ran = true
-		epollOpen = w.epollFD == epfd // w.mu is held by shutdown
+		// w.mu is held by shutdown. The number must still be an open
+		// descriptor (F_GETFD succeeds): a shutdown that closes the fd and
+		// only then clears w.epollFD would pass a comparison of the field.
+		_, ferr := unix.FcntlInt(uintptr(epfd), unix.F_GETFD, 0)
+		epollOpen = w.epollFD == epfd && ferr == nil
 		for _, c := range conns {
 			c.mu.Lock()
 			if !c.closed {
@@ -201,10 +205,12 @@ func TestShutdownMarksEveryConnClosedBeforeItClosesTheEpollFd890(t *testing.T) {
 // already past Write's closed check does (Write, enqueueFlush, wake). The new
 // eventfd must not receive the write. This pins wakes that name the old number
 // (one cached when the worker was made, or a Signal that ignores the close).
-// It does not pin a wake that loads w.wakeFD.FD() itself and so finds -1: that
-// shape (mutant WAKEATOMIC) is a data race between the load and the close,
-// which TestWriteRacingCloseNeverTouchesTheClosedEventfd862 reports under
-// -race only, and no hook placed after the close can order it (celeris#890).
+// It does not pin a wake that loads w.wakeFD.FD() before the close and writes
+// the loaded number after it (mutant WAKEATOMIC): FD() already returns -1 once
+// the close has run, so no hook placed after the close can order that shape,
+// and the race detector reports nothing (the number is an atomic, the write is
+// a syscall). Only the probabilistic oracle of
+// TestWriteRacingCloseNeverTouchesTheClosedEventfd862 covers it (celeris#890).
 func TestAWakeAfterShutdownClosedTheEventfdWritesNothing890(t *testing.T) {
 	t.Cleanup(func() { testHookAfterWakeClose = nil }) // runs last
 	l, err := New(1)

@@ -53,19 +53,19 @@ func c862FillSendBuffer(t *testing.T, fd int) int {
 // bytes pending, on four goroutines, while the loop closes. Each Write takes
 // the pending path: the conn's send buffer is full and its peer never reads,
 // so the flush stops at EAGAIN and the Write calls enqueueFlush, which wakes
-// the worker. Under -race, a wake that reads the eventfd's number with no
-// lock while shutdown closes it and stores -1 is a reported data race, and
-// the test's coverage rests on that report (CI runs this package with
-// -race). Its second check is opportunistic: two eventfds opened as soon as
-// Close returns take the numbers it freed (the worker's eventfd and epoll
-// fd), and neither may receive a write from a wake that loaded the old number
-// before the close. A wake has to land in the few microseconds between the
-// close and the reuse for it to fire, so it seldom does, with or without
-// -race. A wake that names the old number (one cached when the worker was made,
-// or a Signal that ignores the close) is also pinned without -race by
+// the worker. The test has one oracle: two eventfds opened as soon as Close
+// returns take the numbers it freed (the worker's eventfd and epoll fd), and
+// neither may receive a write from a wake that loaded the old number before
+// the close. A wake has to land in the few microseconds between the close and
+// the reuse for it to fire, so it seldom does: the oracle is probabilistic.
+// The race detector adds nothing for this shape, because WakeFD's number is an
+// atomic (FD is a Load, Close a Store of -1) and the write to a stale number is
+// a syscall it cannot see. A wake that names the old number for good (one
+// cached when the worker was made, or a Signal that ignores the close) is
+// pinned deterministically by
 // TestAWakeAfterShutdownClosedTheEventfdWritesNothing890; a wake that loads
-// w.wakeFD.FD() itself and so finds -1 is a race with the close that only
-// -race reports (celeris#890).
+// w.wakeFD.FD() itself, races the close and writes to the loaded number is
+// covered only by the oracle above (celeris#890).
 func TestWriteRacingCloseNeverTouchesTheClosedEventfd862(t *testing.T) {
 	const rounds, writers = 64, 4
 	one := []byte{'w'}
