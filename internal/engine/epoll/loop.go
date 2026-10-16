@@ -3899,12 +3899,6 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 			snap.hdrDL = h1.HeaderDeadlineNs.Load()
 		}
 	}
-	if cs.writeSince != 0 && !snap.detached {
-		// A live conn with a write clock: whether anything is still queued is
-		// asked under the lock, because the dispatch goroutine's own flush can
-		// have emptied the queue without the loop knowing (celeris#885).
-		snap.writePending = csWritePending(cs)
-	}
 	if mu != nil {
 		mu.Unlock()
 	}
@@ -4045,34 +4039,14 @@ func (l *Loop) checkTimeouts() {
 		// a peer that takes nothing (WriteTimeout was applied to dirty conns
 		// only, and EPOLLOUT takes the conn off the list) nor one that takes the
 		// response steadily (ReadTimeout and IdleTimeout cut it, the request
-		// being longer ago than they are). WriteTimeout is "no progress for
-		// WriteTimeout" here; the clock restarts when a flush takes bytes.
+		// being longer ago than they are). The common conn has neither the
+		// clock nor a place on the dirty list, and pays one load and test.
 		last := cs.lastActivity
-		if ws := cs.writeSince; ws != 0 {
-			if snap.writePending {
-				if wt := l.cfg.WriteTimeout; wt > 0 && time.Duration(now-ws) > wt {
-					l.closeConn(fd)
-					continue
-				}
-			} else {
-				// Nothing is queued: a drain the loop did not see (the
-				// dispatch goroutine's own flush). End the clock as endWrite
-				// does, from its last stamp, which is no later than the drain.
-				cs.writeSince = 0
-				if ws > last {
-					cs.lastActivity = ws
-				}
+		if cs.writeSince != 0 || cs.dirty {
+			var done bool
+			if last, done = l.sweepWriteClock(cs, fd, now, last); done {
+				continue
 			}
-			if ws > last {
-				last = ws
-			}
-		} else if cs.dirty {
-			// On the list without a clock: not parked on EPOLLOUT, flushed by
-			// the pass that follows. WriteTimeout from the last read, as before.
-			if l.cfg.WriteTimeout > 0 && time.Duration(now-last) > l.cfg.WriteTimeout {
-				l.closeConn(fd)
-			}
-			continue
 		}
 		elapsed := time.Duration(now - last)
 		if l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout {
@@ -4081,6 +4055,58 @@ func (l *Loop) checkTimeouts() {
 			l.closeConn(fd)
 		}
 	}
+}
+
+// sweepWriteClock is checkTimeouts' look at a live conn that holds a response
+// the kernel has not taken whole (celeris#885 items 35 and 45): it has the
+// write clock (writeSince), or is on the dirty list. WriteTimeout is "no
+// progress for WriteTimeout" there: the clock starts at the first partial flush
+// and restarts when a flush takes bytes (noteWriteProgress), where std's is an
+// absolute deadline for the whole response. It answers the instant IdleTimeout
+// and ReadTimeout are measured from, the later of the last read and the clock,
+// and whether the conn is done for this sweep (closed, or exempt from the idle
+// scan). Kept out of line: the sweep of a conn without a clock does not run it.
+// Loop thread.
+func (l *Loop) sweepWriteClock(cs *connState, fd int, now, last int64) (from int64, done bool) {
+	ws := cs.writeSince
+	if ws == 0 {
+		// On the list without a clock: not parked on EPOLLOUT, flushed by the
+		// pass that follows. WriteTimeout from the last read, as before, and
+		// no idle scan.
+		if wt := l.cfg.WriteTimeout; wt > 0 && time.Duration(now-last) > wt {
+			l.closeConn(fd)
+		}
+		return last, true
+	}
+	// Is anything still queued? A drain the loop did not see (the dispatch
+	// goroutine's own flush, under its lock) leaves the clock set with an empty
+	// queue. A lock held by a running handler cannot say: the answer is "yes".
+	pending := true
+	if mu := cs.detachMu; mu != nil {
+		if mu.TryLock() {
+			pending = csWritePending(cs)
+			mu.Unlock()
+		}
+	} else {
+		pending = csWritePending(cs)
+	}
+	if pending {
+		if wt := l.cfg.WriteTimeout; wt > 0 && time.Duration(now-ws) > wt {
+			l.closeConn(fd)
+			return last, true
+		}
+	} else {
+		// End the clock as endWrite does, from its last stamp, which is no
+		// later than the drain.
+		cs.writeSince = 0
+		if ws > last {
+			cs.lastActivity = ws
+		}
+	}
+	if ws > last {
+		last = ws
+	}
+	return last, false
 }
 
 func (l *Loop) closeConn(fd int) {
