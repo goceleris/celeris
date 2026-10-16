@@ -13,6 +13,7 @@ func BenchmarkAcceptTypical888(b *testing.B) {
 		{"star-q0", "gzip, *;q=0"},
 		{"refused", "br;q=0, gzip;q=0, zstd;q=0"},
 		{"one", "gzip"},
+		{"star-first", "*, gzip"},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
