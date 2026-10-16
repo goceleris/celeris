@@ -44,6 +44,13 @@ var wildcard888 = []struct {
 	{"star-only", "*", []string{"br", "gzip"}, "br"},
 	{"tie-keeps-header-order", "gzip, br", []string{"br", "gzip"}, "gzip"},
 	{"tie-keeps-offer-order-for-star", "*", []string{"gzip", "br"}, "gzip"},
+	// Entries equally specific (a repeated coding): q=0 refuses, whatever the
+	// order, and otherwise the higher q-value counts.
+	{"repeated-q0-first", "gzip;q=0, gzip", []string{"gzip"}, ""},
+	{"repeated-q0-last", "gzip, gzip;q=0", []string{"gzip"}, ""},
+	{"repeated-q0-between", "gzip, gzip;q=0, gzip;q=0.5", []string{"gzip", "br"}, ""},
+	{"repeated-higher-q-counts", "gzip;q=0.2, br;q=0.5, gzip;q=0.8", []string{"br", "gzip"}, "gzip"},
+	{"repeated-wildcard-q0", "*;q=0.5, *;q=0, br", []string{"gzip", "br"}, "br"},
 	// Item 45 (and 40): the weight's name is case-insensitive.
 	{"upper-q0-refuses", "br;Q=0, gzip", []string{"br", "gzip"}, "gzip"},
 	{"upper-q0-alone", "gzip;Q=0", []string{"gzip"}, ""},
