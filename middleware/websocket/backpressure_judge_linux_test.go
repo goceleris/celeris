@@ -41,6 +41,9 @@ func TestServerErrsJudgesResets(t *testing.T) {
 			if k := s.noteReadErr(syscall.ECONNRESET); k != srvReadReset {
 				t.Fatalf("noteReadErr(ECONNRESET) = %d, want srvReadReset", k)
 			}
+			if len(s.errs) != 1 {
+				t.Fatalf("the reset was recorded %d times, want once", len(s.errs))
+			}
 			// noteErr stamps the rig clock; the case sets its own time.
 			s.errs[0].ns = tc.errNs
 			g.hs = []*wsoSrv{s}
