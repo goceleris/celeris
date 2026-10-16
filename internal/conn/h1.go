@@ -1051,17 +1051,21 @@ func (s *H1State) appendChunk(chunk []byte, limit int64) {
 	s.chunkBuf = append(s.chunkBuf, chunk...)
 }
 
-// reserveBuffer makes room in state.buffer for n more bytes. Up to
-// maxRetainedChunkedBuffer it leaves the growth to bytes.Buffer; above that it
-// allocates exactly what is needed: bytes.Buffer grows by 2*cap+n, so a Write
-// that overshoots the reservation for one large chunk by a few bytes (the start
-// of the next chunk in the same recv) would double a buffer of up to the limit.
+// reserveBuffer makes room in state.buffer for n more bytes. With a body limit
+// and a buffer past maxRetainedChunkedBuffer it allocates exactly what is
+// needed: bytes.Buffer grows by 2*cap+n, so a Write that overshoots the
+// reservation for one large chunk by a few bytes (the start of the next chunk
+// in the same recv) would double a buffer of up to the limit. That happens at
+// most about once per chunk, because checkPartialChunk reserves a chunk's
+// remainder as soon as its size line is in. Without a limit nothing reserves
+// the remainder, so an exact size would reallocate on every recv: it keeps
+// bytes.Buffer's geometric growth, as does a buffer within the retained size.
 func (s *H1State) reserveBuffer(n int) {
 	if n <= s.buffer.Available() {
 		return
 	}
 	cur := s.buffer.Bytes()
-	if len(cur)+n <= maxRetainedChunkedBuffer {
+	if s.maxBodySize() <= 0 || len(cur)+n <= maxRetainedChunkedBuffer {
 		s.buffer.Grow(n)
 		return
 	}

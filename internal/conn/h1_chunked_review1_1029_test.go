@@ -234,3 +234,77 @@ func TestProcessH1ChunkedBufferReleasedWithATail1029(t *testing.T) {
 		})
 	}
 }
+
+// distinctCaps1029 feeds one chunked upload of a single chunk of n bytes in
+// pieces and returns how many different capacities state.buffer had between
+// calls, and the number of calls.
+func distinctCaps1029(t *testing.T, limit int64, n, piece int) (caps, calls int) {
+	t.Helper()
+	st := NewH1State()
+	st.MaxRequestBodySize = limit
+	h := &rec1029{}
+	var out bytes.Buffer
+	wire := append([]byte(head1029), chunked1029(bytes.Repeat([]byte{'x'}, n), n, "", "")...)
+	seen := map[int]bool{}
+	for _, seg := range cut1029(wire, piece) {
+		if _, err := feed1029(st, h, &out, seg); err != nil {
+			t.Fatalf("limit %d: %v (answer %q)", limit, err, firstLine889(out.String()))
+		}
+		seen[st.buffer.Cap()] = true
+		calls++
+	}
+	if len(h.bodies) != 1 || len(h.bodies[0]) != n {
+		t.Fatalf("limit %d: handler saw %d requests", limit, len(h.bodies))
+	}
+	return len(seen), calls
+}
+
+// TestProcessH1ChunkedBufferGrowthIsNotPerRecv1029: one large chunk arriving in
+// small pieces reallocates state.buffer a few times, not once per recv, with a
+// limit (the chunk's remainder is reserved when its size line is in) and
+// without one (nothing reserves it: geometric growth). An exactly sized buffer
+// that grew on every recv would copy the whole body once per recv.
+func TestProcessH1ChunkedBufferGrowthIsNotPerRecv1029(t *testing.T) {
+	const n = 8 << 20
+	for _, limit := range []int64{0, 16 << 20} {
+		caps, calls := distinctCaps1029(t, limit, n, 16<<10)
+		t.Logf("limit %d: %d calls, %d distinct buffer capacities", limit, calls, caps)
+		if caps > 20 {
+			t.Errorf("limit %d: state.buffer had %d different capacities over %d calls, want a logarithmic number", limit, caps, calls)
+		}
+	}
+}
+
+// TestProcessH1ChunkedUploadCapAfterTheSecondChunk1029: the sequence a limit-1
+// byte chunk followed by a 1-byte chunk, delivered so that the second chunk's
+// data is in state.buffer when the measurement is taken: chunkBuf must not
+// have doubled past the limit (it reached 2*limit-2 before the clamp).
+func TestProcessH1ChunkedUploadCapAfterTheSecondChunk1029(t *testing.T) {
+	const limit = 1 << 20
+	st := NewH1State()
+	st.MaxRequestBodySize = limit
+	h := &rec1029{}
+	var out bytes.Buffer
+	var wire bytes.Buffer
+	wire.WriteString(head1029)
+	fmt.Fprintf(&wire, "%x\r\n", limit-1)
+	wire.Write(bytes.Repeat([]byte{'x'}, limit-1))
+	wire.WriteString("\r\n1\r\n")
+	for _, seg := range cut1029(wire.Bytes(), 64<<10) {
+		if _, err := feed1029(st, h, &out, seg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := feed1029(st, h, &out, []byte("y\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if c := cap(st.chunkBuf); c > limit || len(st.chunkBuf) != limit {
+		t.Fatalf("after the second chunk: len(chunkBuf)=%d cap(chunkBuf)=%d, want len %d and cap at most the limit", len(st.chunkBuf), c, limit)
+	}
+	if both := cap(st.chunkBuf) + st.buffer.Cap(); both > 2*limit+64<<10 {
+		t.Fatalf("chunkBuf + buffer = %d bytes, over 2x the limit plus framing", both)
+	}
+	if _, err := feed1029(st, h, &out, []byte("0\r\n\r\n")); err != nil || len(h.bodies) != 1 || len(h.bodies[0]) != limit {
+		t.Fatalf("terminator: err %v, handler calls %d", err, len(h.bodies))
+	}
+}
