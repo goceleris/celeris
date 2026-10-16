@@ -43,11 +43,12 @@ func (h *mixedHandler884) RouteAsync(_, _ string) bool { return h.async }
 func (h *mixedHandler884) HasAsyncRoutes() bool        { return h.async }
 
 // BenchmarkMixedLargeSmall884 is the load celeris#884 item 62's change is
-// measured on: one worker, three clients whose 256 KiB-window readers take
+// measured on: two workers, six clients whose 256 KiB-window readers take
 // 2 MiB responses back to back (each response's tail is a remainder SEND, so
 // the worker is out of its untimed wait, mode 3a, while one is outstanding),
 // and the benchmark's own keep-alive client making small requests, whose
-// round trip is ns/op (the path that wants mode 3a). big_MBps is the large
+// round trip is ns/op (the path that wants mode 3a; it shares a worker with
+// some of the large clients, which of them is the kernel's choice per run). big_MBps is the large
 // clients' goodput over the run. The A/B method is an interleaved base/fix/
 // base2 A/B, base2 an A/A copy of the base, which gives the floor.
 func BenchmarkMixedLargeSmall884(b *testing.B) {
@@ -70,7 +71,7 @@ func BenchmarkMixedLargeSmall884(b *testing.B) {
 			e, err := New(resource.Config{
 				Addr:          addr,
 				Protocol:      engine.HTTP1,
-				Resources:     resource.Resources{Workers: 1, SocketSend: 64 << 10},
+				Resources:     resource.Resources{Workers: 2, SocketSend: 64 << 10},
 				AsyncHandlers: async,
 				Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 			}, &mixedHandler884{big: big, async: async})
@@ -113,7 +114,7 @@ func BenchmarkMixedLargeSmall884(b *testing.B) {
 			var stop atomic.Bool
 			var bigBytes atomic.Int64
 			var wg sync.WaitGroup
-			for range 3 {
+			for range 6 {
 				c := dial(256 << 10)
 				wg.Add(1)
 				go func() {
