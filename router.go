@@ -761,7 +761,9 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 // answered by the GET route, findHEADAsGET), and OPTIONS (answered
 // automatically when the path has no OPTIONS route). The order is GET, POST,
 // PUT, DELETE, PATCH, HEAD, OPTIONS, then custom methods sorted. A path with
-// no route at all returns nil.
+// no route at all returns nil, and a path with one returns at least OPTIONS
+// (when except is not "OPTIONS" itself), so with except "" an empty result
+// means the path is unrouted (handleUnmatched relies on it to walk once).
 func (r *router) allowedMethods(path string, except string) []string {
 	var params Params
 	has := func(method string) bool {
