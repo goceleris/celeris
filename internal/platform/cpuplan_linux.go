@@ -57,6 +57,24 @@ func (p CPUPlan) Pinned() int {
 	return n
 }
 
+// Truncate returns the plan cut to its first n loops, for an engine that can
+// fund fewer loops than the plan holds (io_uring under RLIMIT_MEMLOCK). The
+// planner fills distinct CPUs before it repeats one, so the first n entries
+// are the plan it would have made for n workers. A Note is extended to say how
+// many loops start and why, so that it never states a count the engine does
+// not run. n at or above the plan's length, or below 1, returns p unchanged.
+func (p CPUPlan) Truncate(n int, why string) CPUPlan {
+	if n < 1 || n >= len(p.CPUs) {
+		return p
+	}
+	q := p
+	q.CPUs = slices.Clone(p.CPUs[:n])
+	if q.Note != "" {
+		q.Note += fmt.Sprintf("; only %d of the %d planned loops start (%s)", n, len(p.CPUs), why)
+	}
+	return q
+}
+
 // PlanWorkerCPUs chooses the CPU of each engine loop for a request of
 // numWorkers workers. explicit reports that numWorkers was set by the user
 // (Config.Workers) and not defaulted to GOMAXPROCS.
@@ -75,8 +93,8 @@ func (p CPUPlan) Pinned() int {
 // a loop left to float between the CPUs spent about half of its time on the
 // little ones, and an interleaved A/B on msr1 put the throughput loss on those
 // floating loops, not on the loop count (celeris#1036). So the plan holds
-// min(numWorkers, big CPUs) loops, one per non-little CPU, and the engine
-// starts that many, fewer than the workers it was asked for. A user-set
+// min(numWorkers, big CPUs) loops, at most one per non-little CPU, and the
+// engine starts that many, fewer than the workers it was asked for. A user-set
 // numWorkers above the number of non-little CPUs is honoured, never floated:
 // the extra loops wrap round-robin over the non-little CPUs, each pinned (two
 // loops share a CPU). Where the CPUs are alike the i-th worker gets the i-th
@@ -161,8 +179,15 @@ func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 	plan.Heterogeneous = true
 	plan.Little = little
 	// One loop per non-little CPU and no more, unless the user asked for
-	// more: those wrap over the same CPUs, still pinned. The big CPUs are
-	// spread like any allowed set (NUMA nodes in turn, wrapping only after
+	// more. A single non-little CPU therefore gives ONE loop by default,
+	// below resource.MinWorkers (2, which Validate enforces on a user-set
+	// count): deliberate, since a second loop could only share that CPU or run
+	// on a little one (celeris#1036). Do not raise it to MinWorkers here.
+	//
+	// A user-set count above the non-little CPUs is honoured: the extra loops
+	// wrap over the same CPUs, still pinned (two loops share a CPU, and a CPU
+	// with two loops takes twice the connections of one with one). The big CPUs
+	// are spread like any allowed set (NUMA nodes in turn, wrapping only after
 	// every CPU holds a loop).
 	loops := min(numWorkers, len(big))
 	if explicit {
@@ -181,9 +206,11 @@ func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 			"would start: the rest would have to run on the little CPUs or float onto them)",
 			capNote, FormatCPUs(little), loops, FormatCPUs(big), numWorkers)
 	default:
+		// The CPUs the loops use, not the whole set they were drawn from:
+		// 5 loops use 5 of 8 non-little CPUs.
 		plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
-			"%d loops pinned to the other allowed CPUs %s, none unpinned",
-			capNote, FormatCPUs(little), loops, FormatCPUs(big))
+			"%d loops pinned to the CPUs %s of the other allowed CPUs %s, none unpinned",
+			capNote, FormatCPUs(little), loops, FormatCPUs(plan.CPUs), FormatCPUs(big))
 	}
 	return plan
 }

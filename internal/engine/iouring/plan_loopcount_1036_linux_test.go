@@ -19,6 +19,10 @@ import (
 // test host's CPUs are alike (the planner would return every worker), so the
 // planner is stood in for by one that returns fewer entries.
 //
+// The test also holds on a runner whose RLIMIT_MEMLOCK funds one worker: the
+// planner is asked for the whole request there, so a request of 2 is shortened
+// to a plan of 1 and the engine's count comes from the plan.
+//
 // Two requests: a user-set count (Config.Workers: the engine tells the planner
 // the count is explicit) and the default (it does not).
 func TestLoopCountIsThePlanLength1036(t *testing.T) {
@@ -45,35 +49,44 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 			defer func() { planWorkerCPUs = old }()
 			var gotN int
 			var gotExplicit bool
-			var want []int
-			// RLIMIT_MEMLOCK can hold the engine to fewer workers than asked
-			// for (the CI runners' 8 MiB: one); the plan then holds fewer than
-			// the request, as it must, and a request of one cannot be shortened.
-			planLen := tc.planLen
+			var stub []int
+			// The planner is asked first and RLIMIT_MEMLOCK bounds what it
+			// returns (celeris#1036), so it is asked for the whole request even
+			// where memlock funds one worker (the CI runners' 8 MiB). The stub
+			// shortens whatever it is asked for, so the shortening is exercised
+			// there too: a request of 2 gets a plan of 1.
 			planWorkerCPUs = func(n int, explicit bool) platform.CPUPlan {
 				gotN, gotExplicit = n, explicit
-				planLen = max(min(tc.planLen, n-1), 1)
-				want = make([]int, planLen)
-				for i := range want {
-					want[i] = cpus[i%len(cpus)]
+				stub = make([]int, max(min(tc.planLen, n-1), 1))
+				for i := range stub {
+					stub[i] = cpus[i%len(cpus)]
 				}
-				return platform.CPUPlan{CPUs: append([]int(nil), want...), Allowed: cpus, Requested: n,
+				return platform.CPUPlan{CPUs: append([]int(nil), stub...), Allowed: cpus, Requested: n,
 					Heterogeneous: true, Note: "test plan: fewer loops than asked for"}
 			}
 			var log lockedBuf
 			eng, stop := start909(t, tc.workers, &log)
 			defer stop()
+			// What the engine must run, from the test's own reading of the
+			// limit: the plan, held to what memlock funds.
+			planLen := len(stub)
+			if m := MaxWorkersForMemlock(); m > 0 {
+				planLen = min(planLen, m)
+			}
+			want := stub[:planLen]
+			wantAsked := tc.workers
+			if wantAsked == 0 {
+				wantAsked = max(runtime.GOMAXPROCS(0), 2)
+			}
 			if gotExplicit != tc.wantExplicit {
 				t.Errorf("%s: the engine told the planner explicit=%v, want %v", tc.name, gotExplicit, tc.wantExplicit)
 			}
-			if gotN > max(tc.workers, runtime.GOMAXPROCS(0)) {
-				t.Errorf("%s: the planner was asked for %d workers, more than the request", tc.name, gotN)
+			if gotN != wantAsked {
+				t.Errorf("%s: the planner was asked for %d workers, want the whole request, %d (memlock bounds the plan, not the request)",
+					tc.name, gotN, wantAsked)
 			}
-			if gotN < 2 {
-				// Not a skip: the CI runners (8 MiB of memlock) land here, and the
-				// checks below still hold for a plan of one; only the shortening
-				// is not exercised.
-				t.Logf("%s: RLIMIT_MEMLOCK holds the engine to %d worker(s): nothing can be shortened", tc.name, gotN)
+			if len(stub) >= gotN {
+				t.Errorf("%s: premise: the stub plan holds %d for a request of %d, nothing was shortened", tc.name, len(stub), gotN)
 			}
 			if got := len(eng.workers); got != planLen {
 				t.Errorf("%s: %d loops started, the plan holds %d", tc.name, got, planLen)
