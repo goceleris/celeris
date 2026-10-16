@@ -59,10 +59,11 @@ type Config struct {
 	// checks for .br (Brotli) and .gz (gzip) variants of the requested file
 	// and serves them if the client accepts the encoding via Accept-Encoding,
 	// read with its q-values: an encoding the client refuses with q=0, by name
-	// or through "*;q=0", is not served. Brotli is preferred over gzip when
-	// both are accepted (x-gzip counts as gzip). A file served in answer to a request that carries an
-	// Accept-Encoding header names Accept-Encoding in Vary (once), whether or
-	// not the file has a variant. Works with both OS filesystem (Root) and fs.FS.
+	// or through a "*;q=0" that does not list it ("*" matches only the
+	// encodings the field does not list), is not served. Brotli is preferred over
+	// gzip when both are accepted (x-gzip counts as gzip). A file served in
+	// answer to a request that carries an Accept-Encoding header names
+	// Accept-Encoding in Vary (once), whether or not the file has a variant. Works with both OS filesystem (Root) and fs.FS.
 	Compress bool
 }
 
