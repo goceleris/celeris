@@ -23,8 +23,9 @@
 #      a fresh process per run (-test.count=1), with the arm order rotated
 #      every round so that no arm always runs first or last.
 #   5. Checks that A, B and A2 each hold results and name the same benchmarks
-#      (the -N suffix stripped). A side with no results, or two sides that
-#      name different benchmarks, exits 2 before any benchstat table is
+#      (the -N suffix stripped), after round 1 and again after the last round.
+#      A side with no results, or two sides that name different benchmarks,
+#      exits 2 (after round 1, if it shows then) before any benchstat table is
 #      printed: a regex that matches only in the head would otherwise give an
 #      empty A and a table that looks like a result.
 #   6. Prints benchstat for A vs B and for A vs A2.
@@ -56,7 +57,7 @@ if [ "$#" -lt 4 ]; then
 fi
 base=$1 head=$2 pkg=$3 re=$4 rounds=${5:-20}
 benchtime=${BENCHTIME:-1s}
-if ! [ "$rounds" -ge 1 ] 2> /dev/null; then
+if ! [[ $rounds =~ ^[1-9][0-9]*$ ]]; then
   echo "rounds must be a positive integer, not '$rounds'" >&2
   exit 2
 fi
@@ -100,6 +101,42 @@ for target in linux/arm64 "$host"; do
 done
 echo "The timings below are for $host."
 
+# Each side must hold results, and the sides must name the same benchmarks.
+# Without this a regex that matches only in the head reaches benchstat with an
+# empty A and prints a table for it. It runs after round 1, so a regex that
+# matches nothing, or only in one ref, stops in seconds rather than after every
+# round, and again after the last round.
+names() { awk '/^Benchmark/ { sub(/-[0-9]+$/, "", $1); print $1 }' "$1" | LC_ALL=C sort -u; }
+side_label() {
+  case $1 in
+    A) echo "A ($base)" ;;
+    B) echo "B ($head)" ;;
+    A2) echo "A2 (a copy of A)" ;;
+  esac
+}
+check_names() {
+  local ok=1 f
+  for f in A B A2; do
+    names "$out/$f.txt" > "$tmp/names.$f"
+    if [ ! -s "$tmp/names.$f" ]; then
+      echo "$(side_label "$f") has no benchmark result for '$re' in $out/$f.txt" >&2
+      ok=0
+    fi
+  done
+  for f in B A2; do
+    if ! cmp -s "$tmp/names.A" "$tmp/names.$f"; then
+      echo "$(side_label "$f") names different benchmarks from A for '$re':" >&2
+      LC_ALL=C comm -23 "$tmp/names.A" "$tmp/names.$f" | sed 's/^/  only in A: /' >&2
+      LC_ALL=C comm -13 "$tmp/names.A" "$tmp/names.$f" | sed "s/^/  only in $f: /" >&2
+      ok=0
+    fi
+  done
+  if [ "$ok" = 0 ]; then
+    echo "nothing comparable: fix the regex or the refs, then run again." >&2
+    exit 2
+  fi
+}
+
 # A test binary runs in its package directory (testdata, relative paths).
 dir_a=$tmp/a/${pkg#./}
 dir_b=$tmp/b/${pkg#./}
@@ -113,39 +150,9 @@ for ((r = 1; r <= rounds; r++)); do
       -test.benchtime "$benchtime" -test.count 1 -test.benchmem) >> "$out/$arm.txt"
   done
   echo "round $r/$rounds done"
+  if [ "$r" = 1 ]; then check_names; fi
 done
-
-# Each side must hold results, and the sides must name the same benchmarks.
-# Without this a regex that matches only in the head reaches benchstat with an
-# empty A and prints a table for it.
-names() { awk '/^Benchmark/ { sub(/-[0-9]+$/, "", $1); print $1 }' "$1" | LC_ALL=C sort -u; }
-side_label() {
-  case $1 in
-    A) echo "A ($base)" ;;
-    B) echo "B ($head)" ;;
-    A2) echo "A2 (a copy of A)" ;;
-  esac
-}
-ok=1
-for f in A B A2; do
-  names "$out/$f.txt" > "$tmp/names.$f"
-  if [ ! -s "$tmp/names.$f" ]; then
-    echo "$(side_label "$f") has no benchmark result for '$re' in $out/$f.txt" >&2
-    ok=0
-  fi
-done
-for f in B A2; do
-  if ! cmp -s "$tmp/names.A" "$tmp/names.$f"; then
-    echo "$(side_label "$f") names different benchmarks from A for '$re':" >&2
-    LC_ALL=C comm -23 "$tmp/names.A" "$tmp/names.$f" | sed 's/^/  only in A: /' >&2
-    LC_ALL=C comm -13 "$tmp/names.A" "$tmp/names.$f" | sed "s/^/  only in $f: /" >&2
-    ok=0
-  fi
-done
-if [ "$ok" = 0 ]; then
-  echo "nothing comparable: fix the regex or the refs, then run again." >&2
-  exit 2
-fi
+check_names
 
 echo
 echo "== B ($head) vs A ($base)"

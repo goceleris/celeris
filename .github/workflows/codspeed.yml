@@ -73,7 +73,7 @@
 # Every router, Context, chain, handler and logger benchmark stays, the
 # noisiest ones above included: they are the hot path. Run the removed ones
 # with a plain `go test -bench`.
-# Also excluded from the set (celeris#890 item 64):
+# Also excluded from the set:
 # BenchmarkOneByteGrant911 (internal/protocol/h2/stream, celeris#911, three
 # sizes) costs about a microsecond per op. It flagged -49.5% (4 MiB) on #972 and
 # -30.9% (64 KiB) on #971, two pull requests that do not touch h2/stream, so the
@@ -91,7 +91,8 @@
 # every top-level benchmark except the names that start with BenchmarkInternH
 # or BenchmarkOneByteG (each prefix is spelled out one letter at a time). In
 # these packages that leaves out exactly two benchmarks:
-# BenchmarkInternH2HeaderName and BenchmarkOneByteGrant911 (see "Removed").
+# BenchmarkInternH2HeaderName (see "Removed") and BenchmarkOneByteGrant911 (see
+# "Also excluded").
 # The selection, each benchmark run once (92 leaves on linux/arm64 and 87 on
 # macOS arm64; 95 and 90 before BenchmarkOneByteGrant911 was excluded):
 #   go test -run '^$' -bench '^Benchmark([^IO]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H]|O[^n]|On[^e]|One[^B]|OneB[^y]|OneBy[^t]|OneByt[^e]|OneByte[^G])' \
