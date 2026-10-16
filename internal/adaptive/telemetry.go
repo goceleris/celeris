@@ -164,8 +164,13 @@ func satSub(a, b uint64) uint64 {
 // seconds, estimated from the gauge at its two ends: the trapezoid, mean of
 // the two readings times the length. The sampler sees only the two readings,
 // so a connection that opened and closed between them is not in it (the
-// requests it made are, in the request count). A gauge that reads negative
-// counts as 0.
+// requests it made are, in the request count). The estimate is good over the
+// sampler's 1 s tick; some intervals are much longer (the first after a switch
+// spans the 30 s cooldown, the first after the oscillation lock up to 5 min),
+// and over one of those a hub that filled and emptied between the two readings
+// is in it as 0 connection-seconds, so faultRate falls back to the request
+// count for that interval, the divisor it had before celeris#886 item 9. A gauge
+// that reads negative counts as 0.
 func connSeconds(prevActive, curActive int64, elapsed float64) float64 {
 	return float64(max(prevActive, 0)+max(curActive, 0)) / 2 * elapsed
 }
@@ -195,7 +200,11 @@ func connSeconds(prevActive, curActive int64, elapsed float64) float64 {
 // An interval with no request used to have rate 0 whatever the faults. It now
 // has the faults per connection-second, so faults on a stream with no new
 // request count. An interval with neither requests nor connections (nothing
-// to divide by) is 0, and so is one whose counters fell (satSub).
+// to divide by) is 0, and so is one whose counters fell (satSub). There is no
+// floor on the faults or on the divisor: one accept error (AcceptCancelled
+// counts ECONNABORTED, EINTR, ECANCELED, EBADF) in a second of fewer than 20
+// connection-seconds and no request reads above errorRevertRate, as one fault
+// in one to nineteen requests did before.
 func faultRate(faults, reqs uint64, connSecs float64) (rate, denom float64) {
 	denom = max(float64(reqs), connSecs)
 	if denom <= 0 {
