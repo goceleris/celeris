@@ -6,7 +6,12 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/propagation"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 // allocsPer888 is the least of several single-call windows of
@@ -114,5 +119,31 @@ func TestCarrierKeysOneAllocationForTheNames888(t *testing.T) {
 			}
 		}
 		celeristest.ReleaseContext(c)
+	}
+}
+
+// BenchmarkOTelTracingPropagated888 is BenchmarkOTelTracing for a request that
+// carries trace context, which is what a traced service receives: the default
+// propagators read traceparent, tracestate and baggage through the carrier.
+// (BenchmarkOTelTracing sends none of them, where Get costs nothing either
+// way.)
+func BenchmarkOTelTracingPropagated888(b *testing.B) {
+	mw := New(Config{
+		TracerProvider: tracenoop.NewTracerProvider(),
+		MeterProvider:  metricnoop.NewMeterProvider(),
+		Propagators:    propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}),
+	})
+	h := func(c *celeris.Context) error { return c.String(200, "ok") }
+	opts := []celeristest.Option{
+		celeristest.WithHandlers(mw, h),
+		celeristest.WithHeader("traceparent", tp888),
+		celeristest.WithHeader("tracestate", "vendor=value-of-some-length,other=v"),
+		celeristest.WithHeader("baggage", "userId=alice,sessionId=0123456789abcdef"),
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
 	}
 }
