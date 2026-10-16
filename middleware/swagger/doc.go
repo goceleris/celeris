@@ -16,7 +16,8 @@
 // embedded byte slice) or Config.SpecURL (an externally hosted spec, in which
 // case no /spec endpoint is registered). Config.Renderer selects the frontend
 // ([RendererSwaggerUI] (default), [RendererScalar], or [RendererReDoc]), and
-// Config.Options passes renderer-specific settings as a JSON-serializable map.
+// Config.Options passes renderer-specific settings as a JSON-serializable map
+// to ReDoc and Scalar (Swagger UI ignores it and takes Config.UI).
 //
 // [UIConfig] (Config.UI) tunes the Swagger UI renderer — DocExpansion, Title,
 // and OAuth2 pre-configuration via [OAuth2Config]; most of its fields are
