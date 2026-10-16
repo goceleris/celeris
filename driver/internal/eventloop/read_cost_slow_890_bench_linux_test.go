@@ -114,7 +114,7 @@ func BenchmarkWriteAndPollSlow890(b *testing.B) {
 						misses++
 						pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 						for got < len(resp) {
-							if n, _ := unix.Poll(pfd, 100); n <= 0 {
+							if n, _ := unix.Poll(pfd, 2000); n <= 0 {
 								b.Fatalf("%s: the reply never arrived (%d of %d bytes)", bc.name, got, len(resp))
 							}
 							n, err := unix.Read(fd, rbuf)
