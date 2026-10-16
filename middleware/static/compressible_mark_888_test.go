@@ -1,6 +1,7 @@
 package static
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,5 +120,32 @@ func TestRootMarksNothing888(t *testing.T) {
 	}
 	if _, ok := ctx.Get("celeris.compressible-representation"); ok || rec.StatusCode != 200 || !strings.HasPrefix(rec.Header("etag"), "W/") {
 		t.Errorf("Root: marked=%v status=%d tag=%q, want no mark on a 200 with a weak tag", ok, rec.StatusCode, rec.Header("etag"))
+	}
+}
+
+// The mark is stored in the context's keys, which Context.Keys hands to user
+// code (a logging middleware may print every value): it must not reach the
+// file's bytes, which may be up to 100 MB.
+func TestFSMarkDoesNotExposeTheFileBytes888(t *testing.T) {
+	const marker = "SECRET-FILE-BYTES-0123456789"
+	content := []byte(strings.Repeat(marker, 400))
+	fsys := fstest.MapFS{"f.txt": {Data: content, ModTime: time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)}}
+	compressInFront := func(c *celeris.Context) error { c.Set("celeris.compress.active", true); return c.Next() }
+	ctx, _ := celeristest.NewContextT(t, "GET", "/f.txt",
+		celeristest.WithHandlers(compressInFront, New(Config{FS: fsys})), celeristest.WithHeader("accept-encoding", "gzip"))
+	if err := ctx.Next(); err != nil {
+		t.Fatal(err)
+	}
+	keys := ctx.Keys()
+	v, ok := keys["celeris.compressible-representation"]
+	if !ok {
+		t.Fatalf("no mark in Keys(): %v", keys)
+	}
+	for _, format := range []string{"%v", "%+v", "%#v", "%s", "%q"} {
+		for _, out := range []string{fmt.Sprintf(format, v), fmt.Sprintf(format, keys)} {
+			if strings.Contains(out, marker) || strings.Contains(out, "83, 69, 67") || len(out) > 4096 {
+				t.Errorf("%s of the mark exposes the file (len %d): %.200s", format, len(out), out)
+			}
+		}
 	}
 }
