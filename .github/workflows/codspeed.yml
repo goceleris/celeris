@@ -38,9 +38,10 @@
 #      <pkg> <regex>. It checks the same linux/arm64 binary identity, then
 #      runs the base, the head and a copy of the base interleaved, one
 #      process per round, and prints head-vs-base next to base-vs-copy, the
-#      machine's floor. A difference inside the floor is not a change. On a
-#      laptop it says whether the code on the path got slower; on an arm64
-#      Linux host it also shows this runner's layout effects.
+#      machine's floor. A difference inside the floor is inconclusive: repeat
+#      or extend the rounds until the floor is below the flagged difference.
+#      On a laptop it says whether the code on the path got slower; on an
+#      arm64 Linux host it also shows this runner's layout effects.
 #
 # What it measures: the standard `testing.B` benchmarks of the router,
 # Context and handler chain (root bench_test.go; ./test/server holds the one
@@ -72,6 +73,14 @@
 # Every router, Context, chain, handler and logger benchmark stays, the
 # noisiest ones above included: they are the hot path. Run the removed ones
 # with a plain `go test -bench`.
+# Also excluded from the set:
+# BenchmarkOneByteGrant911 (internal/protocol/h2/stream, celeris#911, three
+# sizes) costs about a microsecond per op. It flagged -49.5% (4 MiB) on #972 and
+# -30.9% (64 KiB) on #971, two pull requests that do not touch h2/stream, so the
+# flags were noise, and the benchmark forces a by-hand merge on every pull
+# request. Excluded by default. The open alternative is to batch the grants
+# inside the benchmark, and to settle that change with
+# .github/scripts/bench-ab.sh before it is kept.
 #
 # How the set is chosen. CodSpeed's Go runner (go-runner, pinned below)
 # passes exactly three things from `run:` to `go test`: -bench, -benchtime
@@ -79,12 +88,15 @@
 # -skip and -tags included, is dropped with a warning, so an exclusion is
 # either a package left out of the list or the -bench pattern. Go's RE2 has
 # no negative lookahead, so the pattern spells out a complement: it selects
-# every top-level benchmark except a name that starts with BenchmarkInternH
-# (and the bare prefixes Benchmark to BenchmarkIntern). In these packages
-# that leaves out only BenchmarkInternH2HeaderName.
-# The selection, each benchmark run once (54 leaves, on Linux and macOS):
-#   go test -run '^$' -bench '^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' \
-#     -benchtime 1x . ./internal/protocol/... ./middleware ./middleware/logger
+# every top-level benchmark except the names that start with BenchmarkInternH
+# or BenchmarkOneByteG (each prefix is spelled out one letter at a time). In
+# these packages that leaves out exactly two benchmarks:
+# BenchmarkInternH2HeaderName (see "Removed") and BenchmarkOneByteGrant911 (see
+# "Also excluded").
+# The selection, each benchmark run once (92 leaves on linux/arm64 and 87 on
+# macOS arm64; 95 and 90 before BenchmarkOneByteGrant911 was excluded):
+#   go test -run '^$' -bench '^Benchmark([^IO]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H]|O[^n]|On[^e]|One[^B]|OneB[^y]|OneBy[^t]|OneByt[^e]|OneByte[^G])' \
+#     -benchtime 1x . ./test/server ./internal/protocol/... ./middleware ./middleware/logger
 #
 # Where it runs: a CodSpeed Macro Runner, a dedicated bare-metal machine.
 # Go supports only the walltime instrument, and walltime on a shared
@@ -251,4 +263,4 @@ jobs:
           go-runner-version: "1.3.0"
           # The CodSpeed CLI writes this line to a script and runs it with
           # bash, so the quoted pattern reaches go-runner as one argument.
-          run: go test -bench='^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' -benchtime=1s . ./test/server ./internal/protocol/... ./middleware ./middleware/logger
+          run: go test -bench='^Benchmark([^IO]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H]|O[^n]|On[^e]|One[^B]|OneB[^y]|OneBy[^t]|OneByt[^e]|OneByte[^G])' -benchtime=1s . ./test/server ./internal/protocol/... ./middleware ./middleware/logger

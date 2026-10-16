@@ -55,7 +55,7 @@ func TestExtractedContextSurvivesPeerBytes(t *testing.T) {
 		{"epoll", celeris.Epoll, false},
 		{"epoll-async", celeris.Epoll, true},
 	}
-	if ok, p := c714ProbeIOUring(); ok {
+	if ok, p := c714ProbeIOUring(t); ok {
 		arms = append(arms, arm{"io_uring", celeris.IOUring, false}, arm{"io_uring-async", celeris.IOUring, true})
 	} else if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 		t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids dropping the io_uring arms", p.IOUringTier, p.KernelVersion)
@@ -279,13 +279,17 @@ func c714WaitReady(s *celeris.Server, done <-chan error) (string, error) {
 // probe's ring can fail with ENOMEM against RLIMIT_MEMLOCK while the rings
 // of engines stopped moments ago, or of another test binary run by the same
 // user, are still charged (internal/engine/iouring/ring_budget_linux_test.go).
-func c714ProbeIOUring() (usable bool, p celerisengine.CapabilityProfile) {
+func c714ProbeIOUring(tb testing.TB) (usable bool, p celerisengine.CapabilityProfile) {
 	p = probe.Probe()
 	usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers
 	if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") != "1" {
 		return usable, p
 	}
-	for deadline := time.Now().Add(10 * time.Second); !usable && time.Now().Before(deadline); {
+	deadline := time.Now().Add(10 * time.Second)
+	for round := 1; !usable && time.Now().Before(deadline); round++ {
+		// One line per round, so a CI log shows that the probe fired and how long it
+		// kept failing. Rounds are 10 ms apart, so this is at most about 1000 lines.
+		tb.Logf("c714ProbeIOUring: retry round %d, no usable io_uring ring yet (tier %v, provided buffers %t)", round, p.IOUringTier, p.ProvidedBuffers)
 		time.Sleep(10 * time.Millisecond)
 		p = probe.Probe()
 		usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers

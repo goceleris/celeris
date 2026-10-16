@@ -222,9 +222,12 @@ jobs:
           # allow-list is not final: its top-level test is run again ALONE, in its own
           # package, and must RUN and PASS by name with no SKIP line outside the allow-list.
           # A skip that is permanent (a planted t.Skip, a renamed gate) skips again
-          # alone, and so does a test whose package cannot be found. celeris#888 has the
-          # real fix: the sse and session start helpers should retry ENOMEM, as
-          # startServer761 does, and fail otherwise.
+          # alone, and so does a test whose package cannot be found. The sse and session
+          # start helpers now retry that ENOMEM for 10 s with a new server and listener,
+          # as startSSE732 does, and fail rather than skip where io_uring works (checklist
+          # #888 item 31; classifyStart in each package has a table test). The re-run
+          # stays for the skips that remain, such as a start that fails where io_uring
+          # does not work at all, which the re-run then confirms as permanent.
           retried=0
           retry_failed=0
           if [ "$unlisted" -ne 0 ]; then
@@ -891,25 +894,30 @@ jobs:
       #
       # -v is required for the tally: without it `go test` prints no
       # per-test result lines at all. The budget goes to 300s because the
-      # step runs two suites with per-test output; the measured wall time
-      # of this exact shape is ~50s.
+      # step runs two suites with per-test output. The step took 64 s on
+      # main (run 38541022063). The inbound oracle now holds the backpressure
+      # idle for wsoQuiet after its flood, and floods 16000 frames per burst
+      # rather than 1000, which is what let it see celeris#607 re-introduced in
+      # a linux/arm64 container (checklist #888 item 4; not yet run on amd64).
+      # The step took 102 s on x86 ubuntu-latest with that change (run
+      # 38909294203), the inbound test 40 s of it.
       - name: middleware/websocket — backpressure + chanReader tests
         shell: bash
         env:
           WS484_CONNS: "16"
           WS484_BURSTS: "2"
-          WS484_BURST_FRAMES: "1000"
+          WS484_BURST_FRAMES: "16000"
         run: |
           set -o pipefail
           go vet -tags celeris_closeprobe ./middleware/websocket/
           go test -race -count=1 -timeout=300s -v \
-            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady)' \
+            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies)' \
             ./middleware/websocket/... ./middleware/static/ 2>&1 | tee /tmp/ws667.log
-          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError'
+          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies'
           subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)|TestChanReaderSpillPublishedAfterDrain/(read-after-publication|closed-before-read|read-waiting-in-window)|TestChanReaderCloseKeepsChunksAppendedBeforeIt/(retried-into-channel|spilled-behind-full-channel)'
-          # 13 names; TestWaitForReadyFailsFastOnStartError passes once in
-          # each package.
-          want=14
+          # 16 names; TestWaitForReadyFailsFastOnStartError passes once in
+          # each of the two packages, so it counts twice: want 17.
+          want=17
           wantsub=15
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/ws667.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${subs}) \(" /tmp/ws667.log || true)

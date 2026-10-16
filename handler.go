@@ -479,15 +479,19 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 }
 
 func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
+	var allowed []string
 	if c.method == "OPTIONS" {
 		// celeris#421: a path with routes but no OPTIONS route is answered
-		// with what it allows (OPTIONS included).
-		if allowed := a.server.router.allowedMethods(c.path, ""); len(allowed) > 0 {
+		// with what it allows (OPTIONS included). That list is never empty
+		// for a routed path, so an empty one means the path has no route at
+		// all: a 404, with no second walk of the method trees (celeris#889).
+		if allowed = a.server.router.allowedMethods(c.path, ""); len(allowed) > 0 {
 			a.answerOptions(c, s, strings.Join(allowed, ", "))
 			return
 		}
+	} else {
+		allowed = a.server.router.allowedMethods(c.path, c.method)
 	}
-	allowed := a.server.router.allowedMethods(c.path, c.method)
 	if len(allowed) > 0 {
 		c.statusCode = 405
 		c.fullPath = "<method-not-allowed>"
