@@ -5,6 +5,7 @@ package sse_test
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -89,6 +90,38 @@ func sseDisconnectCells(t *testing.T) []sseCell {
 // dispatch goroutine is chosen by Config.AsyncHandlers.
 func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync bool, h celeris.HandlerFunc) (string, func()) {
 	tb.Helper()
+	began := time.Now()
+	deadline := began.Add(startRetryWindow)
+	retries := 0
+	for {
+		addr, shutdown, err := trySSEServer(tb, engine, async, routeAsync, h)
+		if err == nil {
+			if retries > 0 {
+				tb.Logf("startSSEServer: started after %d retries in %v", retries, time.Since(began).Round(time.Millisecond))
+			}
+			return addr, shutdown
+		}
+		switch classifyStart(err.Error(), func() bool { return ioUringUsable(tb) }, time.Now().Before(deadline)) {
+		case startRetry:
+			if retries == 0 {
+				tb.Logf("startSSEServer: retrying a Start that failed: %v", err)
+			}
+			retries++
+			time.Sleep(2 * time.Millisecond)
+		case startSkip:
+			tb.Skipf("engine unavailable on this runner: %v", err)
+		default:
+			tb.Fatalf("server start (after %d retries): %v", retries, err)
+		}
+	}
+}
+
+// trySSEServer is one attempt at startSSEServer: a new server and a new
+// listener, so a retry never reuses a listener that a failed Start closed.
+// It returns the error instead of failing the test, so the caller can
+// classify it (classifyStart).
+func trySSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync bool, h celeris.HandlerFunc) (string, func(), error) {
+	tb.Helper()
 	s := celeris.New(celeris.Config{
 		Engine:          engine,
 		AsyncHandlers:   async,
@@ -109,25 +142,25 @@ func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync 
 
 	// Readiness poll: the native engines rebind the port via SO_REUSEPORT,
 	// so the listener we passed in is not the one that ends up serving.
-	// A Start that returns first is reported (or skipped) at once, with its
-	// own error, not after the 30 s deadline (celeris#706).
+	// A Start that returns first is reported at once, with its own error,
+	// not after the 30 s deadline (celeris#706).
 	deadline := time.Now().Add(30 * time.Second)
 	var addr string
 	for addr == "" {
 		select {
 		case err := <-done:
+			_ = ln.Close()
+			serverCancel()
 			if err != nil {
-				msg := err.Error()
-				if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
-					tb.Skipf("engine unavailable on this runner: %v", err)
-				}
-				tb.Fatalf("server start: %v", err)
+				return "", nil, err
 			}
-			tb.Fatal("server start returned nil before the server was ready")
+			return "", nil, errors.New("server start returned nil before the server was ready")
 		default:
 		}
 		if time.Now().After(deadline) {
-			tb.Fatal("server not ready within 30s, and Start has not returned")
+			serverCancel()
+			_ = ln.Close()
+			return "", nil, errors.New("server not ready within 30s, and Start has not returned")
 		}
 		if a := s.Addr(); a != nil {
 			c, err := net.DialTimeout("tcp", a.String(), 100*time.Millisecond)
@@ -150,7 +183,7 @@ func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync 
 		case <-time.After(10 * time.Second):
 			tb.Log("server goroutine did not exit within 10s")
 		}
-	}
+	}, nil
 }
 
 // openSSEStream dials addr, issues the SSE GET and consumes the response

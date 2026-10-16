@@ -222,9 +222,12 @@ jobs:
           # allow-list is not final: its top-level test is run again ALONE, in its own
           # package, and must RUN and PASS by name with no SKIP line outside the allow-list.
           # A skip that is permanent (a planted t.Skip, a renamed gate) skips again
-          # alone, and so does a test whose package cannot be found. celeris#888 has the
-          # real fix: the sse and session start helpers should retry ENOMEM, as
-          # startServer761 does, and fail otherwise.
+          # alone, and so does a test whose package cannot be found. The sse and session
+          # start helpers now retry that ENOMEM for 10 s with a new server and listener,
+          # as startSSE732 does, and fail rather than skip where io_uring works (checklist
+          # #888 item 31; classifyStart in each package has a table test). The re-run
+          # stays for the skips that remain, such as a start that fails where io_uring
+          # does not work at all, which the re-run then confirms as permanent.
           retried=0
           retry_failed=0
           if [ "$unlisted" -ne 0 ]; then

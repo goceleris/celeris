@@ -101,10 +101,11 @@ func TestFSCacheKeyIsNotAliasedToRequestBuffer(t *testing.T) {
 			// server too (waitForReady leaves Start's error in done). Once
 			// Start has returned, the listener is closed and, if the server
 			// never became ready, Shutdown runs. A Start that fails in
-			// prepareWithListener closes the listener itself (celeris#737), and
-			// one that reached Listen releases the CPU monitor through
-			// listenContext's func; the ln.Close and Shutdown here are guards,
-			// so the release does not depend on which path a failure took.
+			// doPrepare closes the CPU monitor's /proc/stat descriptor itself,
+			// and prepareWithListener closes the listener (celeris#737, #747);
+			// one that reached Listen releases the monitor through
+			// listenContext's func. The ln.Close and Shutdown here are redundant
+			// guards, so the release does not depend on which path a failure took.
 			ready := false
 			defer func() {
 				cancel()
