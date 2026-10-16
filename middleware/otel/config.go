@@ -29,6 +29,12 @@ type Config struct {
 
 	// Propagators is the propagator to use for context injection/extraction.
 	// Default: otel.GetTextMapPropagator().
+	//
+	// Every value a propagator reads from the request through the carrier
+	// (traceparent included) is a copy, as is every name Keys returns: there
+	// is nothing to clone before keeping one past Extract, although keeping a
+	// tracestate or baggage substring keeps the whole value alive for as long
+	// as the span context that holds it.
 	Propagators propagation.TextMapPropagator
 
 	// SpanNameFormatter overrides the default span name ("METHOD /route").

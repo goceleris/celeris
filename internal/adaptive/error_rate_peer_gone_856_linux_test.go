@@ -51,6 +51,12 @@ func (s *lastSnapSampler) Rebase(e engine.Engine) {
 	}
 }
 
+// stepClock is a manual clock for a liveSampler.
+type stepClock struct{ t time.Time }
+
+func (c *stepClock) now() time.Time          { return c.t }
+func (c *stepClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
 // feed856 gives the active io_uring engine one baseline sample and then one
 // interval's counters, and returns whether the controller recommends a revert
 // and the snapshot it decided on.
@@ -64,7 +70,13 @@ func feed856(t *testing.T, delta func(m *engine.EngineMetrics)) (revert bool, sn
 func feed856Log(t *testing.T, logger *slog.Logger, delta func(m *engine.EngineMetrics)) (revert bool, snap TelemetrySnapshot) {
 	t.Helper()
 	iou := newMockEngine(engine.IOUring)
-	sampler := &lastSnapSampler{TelemetrySampler: newLiveSampler(nil)}
+	// The sampler's clock is a manual one: the rate is divided by the larger of
+	// the requests and the connection-seconds (celeris#886 item 9), and a real
+	// clock that stretched the 5 ms step would change which one it is.
+	clk := &stepClock{t: time.Now()}
+	live := newLiveSampler(nil)
+	live.clock = clk.now
+	sampler := &lastSnapSampler{TelemetrySampler: live}
 	c := newController(iou, newMockEngine(engine.Epoll), sampler, logger)
 	c.cooldown = 0
 	// The production policy: only the error-revert can move an io_uring
@@ -77,7 +89,7 @@ func feed856Log(t *testing.T, logger *slog.Logger, delta func(m *engine.EngineMe
 	if c.evaluate(now, false) {
 		t.Fatal("the baseline tick recommended a switch")
 	}
-	time.Sleep(5 * time.Millisecond) // the sampler divides by the elapsed time
+	clk.advance(5 * time.Millisecond) // the sampler divides by the elapsed time
 
 	m := base
 	delta(&m)
@@ -442,7 +454,10 @@ func TestLiveAbandonedDownloadsDoNotRevertIOUring856(t *testing.T) {
 func restage856(t *testing.T, teardown, after func(m *engine.EngineMetrics)) (bool, TelemetrySnapshot) {
 	t.Helper()
 	iou := newMockEngine(engine.IOUring)
-	sampler := &lastSnapSampler{TelemetrySampler: newLiveSampler(nil)}
+	clk := &stepClock{t: time.Now()} // manual, see feed856Log
+	live := newLiveSampler(nil)
+	live.clock = clk.now
+	sampler := &lastSnapSampler{TelemetrySampler: live}
 	c := newController(iou, newMockEngine(engine.Epoll), sampler, testLogger())
 	c.cooldown = 0
 	c.loadDownRevert = false
@@ -459,14 +474,14 @@ func restage856(t *testing.T, teardown, after func(m *engine.EngineMetrics)) (bo
 	}
 	teardown(&m) // the pause, and the stragglers the standby serves
 	iou.SetMetrics(m)
-	time.Sleep(5 * time.Millisecond)
+	clk.advance(5 * time.Millisecond)
 	c.recordSwitch(now.Add(61 * time.Second)) // re-promotion
 	if c.activeEngine().Type() != engine.IOUring {
 		t.Fatalf("the re-promotion left %v active", c.activeEngine().Type())
 	}
 	after(&m)
 	iou.SetMetrics(m)
-	time.Sleep(5 * time.Millisecond)
+	clk.advance(5 * time.Millisecond)
 	revert := c.evaluate(now.Add(92*time.Second), false) // the first post-cooldown tick
 	return revert, sampler.last
 }
