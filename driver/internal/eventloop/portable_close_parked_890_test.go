@@ -75,9 +75,9 @@ func TestPortableLoopCloseWaitsForAParkedOnRecv890(t *testing.T) {
 	// by itself, so it is only the negative half; the positive half is below.
 	select {
 	case err := <-gotErr:
-		t.Errorf("onClose(%v) fired while the conn's reader was parked inside onRecv: Loop.Close ran it on its own goroutine", err)
+		t.Fatalf("onClose(%v) fired while the conn's reader was parked inside onRecv: Loop.Close ran it on its own goroutine", err)
 	case err := <-closed:
-		t.Errorf("Loop.Close returned (%v) while the conn's reader was parked inside onRecv", err)
+		t.Fatalf("Loop.Close returned (%v) while the conn's reader was parked inside onRecv", err)
 	case <-time.After(300 * time.Millisecond):
 	}
 	if !connClosed(client) {
