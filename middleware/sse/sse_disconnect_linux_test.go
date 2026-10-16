@@ -101,7 +101,7 @@ func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync 
 			}
 			return addr, shutdown
 		}
-		switch classifyStart(err.Error(), func() bool { return ioUringUsable(tb) }, time.Now().Before(deadline)) {
+		switch classifyStart(err.Error(), func() bool { return ioUringExists(tb) }, time.Now().Before(deadline)) {
 		case startRetry:
 			if retries == 0 {
 				tb.Logf("startSSEServer: retrying a Start that failed: %v", err)

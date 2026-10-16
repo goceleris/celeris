@@ -35,7 +35,7 @@ func startLoginServer(t *testing.T, engine celeris.EngineType, cfg Config) strin
 			}
 			return base
 		}
-		switch classifyStart(err.Error(), func() bool { return ioUringUsable(t) }, time.Now().Before(deadline)) {
+		switch classifyStart(err.Error(), func() bool { return ioUringExists(t) }, time.Now().Before(deadline)) {
 		case startRetry:
 			if retries == 0 {
 				t.Logf("startLoginServer: retrying a Start that failed: %v", err)
