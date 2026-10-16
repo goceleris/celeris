@@ -68,6 +68,46 @@ func BenchmarkProcessH1Chunked1029(b *testing.B) {
 	}
 }
 
+// BenchmarkProcessH1Pipelined1029: k tiny POSTs pipelined into one ProcessH1
+// call (review round 1: a burst of pipelined chunked requests must cost O(k),
+// not the O(k*n) of moving every pipelined byte once per chunked request). The
+// rows are at about the default BufferSize (k=120), 64 KiB (k=1024) and under
+// MaxBufferSize (k=3600, 244800 B); "cl" is the Content-Length control.
+func BenchmarkProcessH1Pipelined1029(b *testing.B) {
+	for _, k := range []int{120, 1024, 3600} {
+		for _, kind := range []string{"chunked", "cl"} {
+			var wire bytes.Buffer
+			for i := 0; i < k; i++ {
+				if kind == "chunked" {
+					wire.WriteString("POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n")
+				} else {
+					wire.WriteString("POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx")
+				}
+			}
+			data := wire.Bytes()
+			b.Run(fmt.Sprintf("%s/k=%d", kind, k), func(b *testing.B) {
+				st := NewH1State()
+				st.MaxRequestBodySize = 4 << 20
+				h := &countHandler1029{}
+				w := func([]byte) {}
+				ctx := context.Background()
+				b.SetBytes(int64(len(data)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := ProcessH1(ctx, data, st, h, w); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StopTimer()
+				if h.n != k*b.N {
+					b.Fatalf("served %d requests, want %d", h.n, k*b.N)
+				}
+			})
+		}
+	}
+}
+
 // splitWorks1029 reports whether a chunked body over two calls is served.
 func splitWorks1029() bool {
 	st := NewH1State()

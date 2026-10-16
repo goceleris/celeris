@@ -638,8 +638,9 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	// follows the terminator (pipelined requests) stays in state.buffer for
 	// the loops below.
 	if state.chunkedInProgress {
+		state.reserveBuffer(len(data))
 		state.buffer.Write(data)
-		done, err := state.scanChunked(write)
+		done, end, err := state.scanChunked(write)
 		if err != nil {
 			return err
 		}
@@ -659,7 +660,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			}
 			return err
 		}
-		state.buffer.Next(head)
+		state.buffer.Next(end)
 		if err := tryUpgradeH2C(state, bodyData, state.buffer.Bytes(), write); err != nil {
 			return err
 		}
@@ -679,10 +680,17 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			// Entry did not arm the header deadline (a body was in progress):
 			// what follows the terminator starts the next request's head.
 			state.ArmHeaderDeadline()
-		} else if state.buffer.Cap() > maxRetainedChunkedBuffer {
+		}
+		if state.buffer.Cap() > maxRetainedChunkedBuffer {
 			// The buffer grew to hold one large chunk. Do not keep it for the
-			// life of the connection.
-			state.buffer = bytes.Buffer{}
+			// life of the connection, whether or not a pipelined request
+			// follows the terminator: that tail moves to a buffer of its own
+			// size (once per large upload, not per request).
+			var nb bytes.Buffer
+			if tail := state.buffer.Bytes(); len(tail) > 0 {
+				nb.Write(tail)
+			}
+			state.buffer = nb
 		}
 		data = nil
 	}
@@ -914,7 +922,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			// complete: when it is not, the next call resumes from here
 			// (celeris#1029) instead of parsing chunk bytes as a request.
 			state.chunkHeadLen = consumed
-			done, err := state.scanChunked(write)
+			done, end, err := state.scanChunked(write)
 			if err != nil {
 				return err
 			}
@@ -922,7 +930,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				state.chunkedInProgress = true
 				return nil
 			}
-			state.buffer.Next(consumed)
+			state.buffer.Next(end)
 			bodyData = state.chunkBuf
 			state.chunkBuf = nil
 		default:
@@ -965,17 +973,20 @@ func (s *H1State) abortChunked() {
 
 // scanChunked decodes the chunks that follow the head (state.chunkHeadLen bytes
 // at the front of state.buffer) into state.chunkBuf. It reports done when the
-// terminating chunk and its trailer have been consumed. It leaves
-// state.buffer holding the head followed by the bytes it could not decode yet
-// (a partial chunk, a partial size line, a partial trailer) or, when done, by
-// what followed the terminator; the head itself is never moved.
+// terminating chunk and its trailer have been consumed, and then end is the
+// length of the whole request (head, chunks, trailer) in state.buffer: the
+// caller drops it with Next(end), which is O(1), so a burst of pipelined
+// chunked requests is not copied once per request. When not done, state.buffer
+// holds the head followed by the bytes it could not decode yet (a partial
+// chunk, a partial size line, a partial trailer), moved down behind the head;
+// the head itself is never moved.
 //
 // Every refusal is final: the answer (400 or 413) is written here and the
 // error returned. The limit is checked against a chunk as soon as its size
 // line is known, so a declared size over MaxRequestBodySize is refused before
 // its data arrives and state.buffer never holds more than the head, one chunk
 // within the limit and a bounded size line or trailer.
-func (s *H1State) scanChunked(write func([]byte)) (done bool, err error) {
+func (s *H1State) scanChunked(write func([]byte)) (done bool, end int, err error) {
 	head := s.chunkHeadLen
 	buf := s.buffer.Bytes()
 	limit := s.maxBodySize()
@@ -986,12 +997,12 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, err error) {
 		if cerr != nil {
 			s.abortChunked()
 			writeErrorResponse(write, 400, "Invalid chunked encoding")
-			return false, cerr
+			return false, 0, cerr
 		}
 		if n == 0 {
 			if err := s.checkPartialChunk(buf[pos:], limit, write); err != nil {
 				s.abortChunked()
-				return false, err
+				return false, 0, err
 			}
 			break
 		}
@@ -1005,9 +1016,12 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, err error) {
 		if limit > 0 && int64(len(chunk)) > limit-int64(len(s.chunkBuf)) {
 			s.abortChunked()
 			writeErrorResponse(write, 413, "Request body too large")
-			return false, fmt.Errorf("chunked body exceeds %d byte limit", limit)
+			return false, 0, fmt.Errorf("chunked body exceeds %d byte limit", limit)
 		}
-		s.appendChunk(chunk)
+		s.appendChunk(chunk, limit)
+	}
+	if done {
+		return true, pos, nil
 	}
 	if pos > head {
 		// Drop what was decoded: the undecoded rest moves down behind the head.
@@ -1015,20 +1029,45 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, err error) {
 		k := copy(b[head:], b[pos:])
 		s.buffer.Truncate(head + k)
 	}
-	return done, nil
+	return false, 0, nil
 }
 
 // appendChunk adds a decoded chunk to chunkBuf, doubling its capacity as
 // bytes.Buffer does: append's growth for a large slice is 1.25x, which cost a
 // 64 KiB body in sixteen chunks 8 allocations and twice the bytes of the
-// bytes.Buffer this replaced (RULE 74 A/B, logs/bench-ab.log).
-func (s *H1State) appendChunk(chunk []byte) {
+// bytes.Buffer this replaced (RULE 74 A/B, logs/bench-ab.log). The doubled
+// capacity is clamped to limit (when there is one): the body cannot grow past
+// it, so a doubling that overshoots would only be memory held for nothing.
+func (s *H1State) appendChunk(chunk []byte, limit int64) {
 	if need := len(s.chunkBuf) + len(chunk); need > cap(s.chunkBuf) {
-		nb := make([]byte, len(s.chunkBuf), max(2*cap(s.chunkBuf), need))
+		c := max(2*cap(s.chunkBuf), need)
+		if limit > 0 && int64(c) > limit {
+			c = max(int(limit), need)
+		}
+		nb := make([]byte, len(s.chunkBuf), c)
 		copy(nb, s.chunkBuf)
 		s.chunkBuf = nb
 	}
 	s.chunkBuf = append(s.chunkBuf, chunk...)
+}
+
+// reserveBuffer makes room in state.buffer for n more bytes. Up to
+// maxRetainedChunkedBuffer it leaves the growth to bytes.Buffer; above that it
+// allocates exactly what is needed: bytes.Buffer grows by 2*cap+n, so a Write
+// that overshoots the reservation for one large chunk by a few bytes (the start
+// of the next chunk in the same recv) would double a buffer of up to the limit.
+func (s *H1State) reserveBuffer(n int) {
+	if n <= s.buffer.Available() {
+		return
+	}
+	cur := s.buffer.Bytes()
+	if len(cur)+n <= maxRetainedChunkedBuffer {
+		s.buffer.Grow(n)
+		return
+	}
+	nb := make([]byte, len(cur), len(cur)+n)
+	copy(nb, cur)
+	s.buffer = *bytes.NewBuffer(nb)
 }
 
 // checkPartialChunk bounds what an incomplete chunk may make the server hold.
@@ -1060,7 +1099,7 @@ func (s *H1State) checkPartialChunk(rest []byte, limit int64, write func([]byte)
 		// Reserve the rest of this chunk at once rather than let the buffer
 		// double its way there. size is within the limit here.
 		if need := int64(hdr) + size + 2 - int64(len(rest)); need > 0 {
-			s.buffer.Grow(int(need))
+			s.reserveBuffer(int(need))
 		}
 	}
 	return nil

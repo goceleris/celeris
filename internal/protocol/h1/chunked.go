@@ -13,11 +13,12 @@ var (
 	errChunkLineTooLong       = errors.New("chunk size line too long")
 )
 
-// MaxChunkLineSize bounds a chunk-size line (size and extensions) in bytes. It
-// is the value net/http uses for the same line (maxLineLength in
-// net/http/internal/chunked.go). A line longer than this is refused whether or
-// not its CRLF has arrived, so a client cannot make the server buffer an
-// endless size line.
+// MaxChunkLineSize bounds a chunk-size line (size and extensions, without its
+// CRLF) in bytes. It is the same constant net/http uses (maxLineLength in
+// net/http/internal/chunked.go), compared a little differently: net/http
+// refuses a line whose length including the CRLF is 4096 or more, this refuses
+// one of more than 4096 bytes. A longer line is refused whether or not its CRLF
+// has arrived, so a client cannot make the server buffer an endless size line.
 const MaxChunkLineSize = 4096
 
 // PeekChunk reads the size line of the chunk that starts buf without
@@ -30,7 +31,11 @@ const MaxChunkLineSize = 4096
 func PeekChunk(buf []byte) (size int64, hdr int, err error) {
 	lineEnd := bytes.Index(buf, bCRLF)
 	if lineEnd == -1 {
-		if len(buf) > MaxChunkLineSize {
+		// A line of exactly MaxChunkLineSize bytes is accepted once its CRLF
+		// is in (the lineEnd check below), so a buffer that ends with that
+		// line's CR and not its LF yet is still within the bound: refusing
+		// it would make the answer depend on where the segment ends.
+		if len(buf) > MaxChunkLineSize+1 || (len(buf) == MaxChunkLineSize+1 && buf[MaxChunkLineSize] != '\r') {
 			return 0, 0, errChunkLineTooLong
 		}
 		return 0, 0, nil
