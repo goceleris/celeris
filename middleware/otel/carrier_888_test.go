@@ -71,7 +71,7 @@ func TestCarrierGetCopiesAllButTraceparent888(t *testing.T) {
 // (not views of the request) and builds the names from one allocation, with
 // the slice itself the second.
 func TestCarrierKeysOneAllocationForTheNames888(t *testing.T) {
-	for _, n := range []int{3, 12, 40, 100} { // below and above the linear-dedupe threshold
+	for _, n := range []int{3, 12, 30, 31, 40, 100} { // below and above the linear-dedupe threshold
 		opts := []celeristest.Option{
 			celeristest.WithHeader("traceparent", tp888),
 			celeristest.WithHeader("x-dup", "1"),
@@ -83,6 +83,8 @@ func TestCarrierKeysOneAllocationForTheNames888(t *testing.T) {
 			opts = append(opts, celeristest.WithHeader(k, "v"))
 			want[k] = true
 		}
+		// A late duplicate: it meets the names the linear scan or the map keeps.
+		opts = append(opts, celeristest.WithHeader("x-header-0", "again"))
 		c, _ := celeristest.NewContext("GET", "/", opts...)
 		h := headerCarrier{ctx: c}
 		keys := h.Keys()
@@ -100,11 +102,15 @@ func TestCarrierKeysOneAllocationForTheNames888(t *testing.T) {
 			delete(want, k)
 			if k != "" && views[unsafe.StringData(k)] {
 				t.Errorf("n=%d: name %q is a view of the request, not a copy", n, k)
+				break
 			}
 		}
-		if n <= 40 { // above the threshold the de-duplicating map is a third allocation
-			if a := allocsPer888(2, func() { _ = h.Keys() }); a > 2 {
-				t.Errorf("n=%d: Keys allocates %.0f, want at most 2 (the slice and one buffer for every name)", n, a)
+		// The test context's RequestHeaders may copy (an HTTP/2 stream does);
+		// what Keys adds to that is the bound.
+		base := allocsPer888(0, func() { _ = c.RequestHeaders() })
+		if n+2 <= 32 { // 32 is keysLinearDedupe: above it the de-duplicating map is one more
+			if a := allocsPer888(base+2, func() { _ = h.Keys() }); a > base+2 {
+				t.Errorf("n=%d: Keys allocates %.0f (RequestHeaders alone %.0f), want at most 2 more (the slice and one buffer for every name)", n, a, base)
 			}
 		}
 		celeristest.ReleaseContext(c)
