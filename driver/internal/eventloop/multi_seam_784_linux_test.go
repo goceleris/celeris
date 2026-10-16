@@ -42,8 +42,8 @@ func TestWriteAndPollMultiRefusesAReadOfTheNumberAfterATeardownInIsDone784(t *te
 			x := -1
 			isDone := func() bool {
 				calls++
-				switch {
-				case calls == tearAt:
+				switch calls {
+				case tearAt:
 					if err := w.UnregisterConn(a); err != nil {
 						t.Errorf("UnregisterConn(A): %v", err)
 					}
@@ -53,7 +53,7 @@ func TestWriteAndPollMultiRefusesAReadOfTheNumberAfterATeardownInIsDone784(t *te
 					var xPeer int
 					x, xPeer = c784TakeNumber(t, a, true)
 					c784Queue(t, xPeer, []byte(c784Stolen))
-				case calls == 1:
+				case 1:
 					// tearAt 2: more of A's data for the first poll round.
 					c784Queue(t, aPeer, []byte("b"))
 				}
