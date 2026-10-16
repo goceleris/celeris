@@ -135,9 +135,12 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						"that were never re-armed are blocking graceful shutdown (celeris#482)")
 				}
 				// Recv-arming witnesses, read after shutdown so every worker
-				// has left its loop and no stall episode is still open. They
-				// are direct atomics, so nothing is stranded in a
-				// per-iteration batch. RECVSTALL is a celeris#607 witness:
+				// has left its loop and no stall episode is still open.
+				// RecvLinkedArms is not a direct atomic: flushSendLink counts
+				// it in the worker-local linkArmBatch, which the loop flushes
+				// to the shared counter once per iteration, and flushBatches
+				// flushes at shutdown (celeris#874). So the read sees every
+				// arm, including those of the last iteration. RECVSTALL is a celeris#607 witness:
 				// a connection owed a recv arm that the dirty-list retry
 				// passed over because a SEND was outstanding. Logged, not
 				// asserted -- an episode is normal SQ-ring pressure; what

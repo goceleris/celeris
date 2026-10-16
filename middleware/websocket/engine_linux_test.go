@@ -76,11 +76,16 @@ func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Con
 	// When waitForReady fails, tb.Fatal ends this goroutine and the shutdown
 	// closure below is never handed out, so stop the server here: cancel a
 	// Start that is still running and wait for it (waitForReady leaves
-	// Start's error in done). Then release what a Start that failed leaves
-	// behind: it closes neither the listener nor the CPU monitor's
-	// /proc/stat descriptor, which only Shutdown releases (and Shutdown is
-	// safe on a server that never started). Without this, every failed start
-	// leaked two descriptors for the life of the test binary.
+	// Start's error in done). Then release what the failed Start left behind.
+	// Who closes what on a failed start (celeris#737, #747): a failure in
+	// prepareWithListener closes the listener the caller passed in, and the
+	// func from listenContext, which listen defers, closes the CPU monitor's
+	// /proc/stat descriptor and stops the settle re-opener. Whether Engine.Listen
+	// closes the listener on its own error path is UNVERIFIED. The explicit
+	// ln.Close and Shutdown below are guards, so the release does not depend on
+	// which path the failure took; Shutdown is safe on a server that never
+	// started. Without the guards, every failed start leaked two descriptors
+	// for the life of the test binary.
 	ready := false
 	defer func() {
 		if ready {
