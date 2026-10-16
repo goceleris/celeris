@@ -612,3 +612,20 @@ func TestProcessH1ChunkedDeadlineArmedForTheNextHead1029(t *testing.T) {
 		t.Fatal("a partial next head is buffered and no header deadline is armed for it")
 	}
 }
+
+// TestProcessH1ChunkedConnectionClose1029: a split chunked request that asked
+// for Connection: close is served and then the call ends the connection, as
+// for a request that arrives whole.
+func TestProcessH1ChunkedConnectionClose1029(t *testing.T) {
+	body := pattern1029(900)
+	req := append([]byte("POST /up HTTP/1.1\r\nHost: a\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"), chunked1029(body, 300, "", "")...)
+	for _, k := range []int{len(req), len(req) / 2, 50} {
+		st := NewH1State()
+		h := &rec1029{}
+		var out bytes.Buffer
+		_, err := feed1029(st, h, &out, cut1029(req, k)...)
+		if !errors.Is(err, errConnectionClose) || len(h.bodies) != 1 || !bytes.Equal(h.bodies[0], body) {
+			t.Fatalf("segments of %d: err %v, handler calls %d; want errConnectionClose after one served request", k, err, len(h.bodies))
+		}
+	}
+}
