@@ -78,7 +78,7 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 			if got := eng.NumWorkers(); got != planLen {
 				t.Errorf("%s: NumWorkers() = %d, want %d", tc.name, got, planLen)
 			}
-			if got := int(eng.Metrics().Workers); got != planLen {
+			if got := eng.Metrics().Workers; got != planLen {
 				t.Errorf("%s: Metrics().Workers = %d, want %d", tc.name, got, planLen)
 			}
 			for i, c := range want {
