@@ -592,7 +592,12 @@ func TestOutboundFlushUnderConcurrentWindowUpdates903(t *testing.T) {
 		}
 		return writeStream904(body[:50000], body[50000:])(ctx, s)
 	}}
-	c := newFlushConn(t, h, H2Config{WriteTimeout: 20 * time.Second})
+	// WriteTimeout must outlast the 60 s loop bound below: a StreamWriter that
+	// waits for window resets its stream at WriteTimeout, and the loop (233
+	// iterations of CPU-bound work under -race) is paced by the CPU, so a
+	// shorter timeout turns a slow runner into "did not finish". The timer
+	// path stays armed.
+	c := newFlushConn(t, h, H2Config{WriteTimeout: 2 * time.Minute})
 	ids := make([]uint32, streams)
 	for i := range ids {
 		ids[i] = uint32(2*i + 1)
@@ -617,6 +622,7 @@ func TestOutboundFlushUnderConcurrentWindowUpdates903(t *testing.T) {
 			for _, id := range ids {
 				if w := c.stream(id); !w.ended {
 					stuck = append(stuck, id)
+					t.Logf("stream %d stuck: wire %s, RST_STREAM codes %v, %d DATA bytes", id, w.summary(), w.rst, len(w.data))
 				}
 			}
 			t.Fatalf("%d of %d streams did not finish in 60 s (handlers done %d): %v", len(stuck), streams, done.Load(), stuck)
