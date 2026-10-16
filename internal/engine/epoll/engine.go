@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -151,10 +152,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	resolved := e.cfg.Resources.Resolve()
 
 	topo := platform.DetectNUMA()
-	// celeris#909: the CPU of loop i is the i-th member of the process's
-	// allowed set, and on a big.LITTLE host never a little CPU.
-	plan := planWorkerCPUs(resolved.Workers)
-	cpus := plan.CPUs
+	cpus := platform.DistributeWorkers(resolved.Workers, runtime.NumCPU(), topo.NumNodes)
 
 	if topo.NumNodes > 1 {
 		resolved.MaxEvents = resolved.MaxEvents / topo.NumNodes
@@ -198,11 +196,6 @@ func (e *Engine) Listen(ctx context.Context) error {
 		})
 	}
 
-	// A start that fails drops the failures its loops recorded; the engine
-	// that serves takes them below.
-	loops := e.loops
-	defer func() { _ = takePinFailures(loops) }()
-
 	for _, l := range e.loops {
 		if initErr := <-l.ready; initErr != nil {
 			innerCancel()
@@ -210,8 +203,6 @@ func (e *Engine) Listen(ctx context.Context) error {
 			return initErr
 		}
 	}
-	// Every loop has pinned (or failed to) before it reported ready.
-	platform.LogPinOutcome(e.cfg.Logger, "epoll", plan, takePinFailures(loops))
 
 	if len(e.loops) > 0 {
 		// celeris#639: publish an address a loop recorded before it signalled

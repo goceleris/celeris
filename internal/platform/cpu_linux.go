@@ -233,6 +233,52 @@ func CPUForNode(cpu int) int {
 	return 0
 }
 
+// DistributeWorkers returns CPU IDs for numWorkers distributed across NUMA
+// nodes. On multi-socket systems, workers are interleaved across sockets so
+// that each socket handles roughly equal traffic. Falls back to sequential
+// round-robin when NUMA topology is unavailable.
+func DistributeWorkers(numWorkers, numCPU, numaNodes int) []int {
+	if numCPU <= 0 {
+		numCPU = 1
+	}
+	if numaNodes <= 1 {
+		// Single socket or NUMA unavailable: simple round-robin.
+		cpus := make([]int, numWorkers)
+		for i := range numWorkers {
+			cpus[i] = i % numCPU
+		}
+		return cpus
+	}
+
+	// Read per-node CPU lists from sysfs.
+	nodeCPUs := readNodeCPUs(numaNodes)
+	if nodeCPUs == nil {
+		// Sysfs unavailable: fall back to round-robin.
+		cpus := make([]int, numWorkers)
+		for i := range numWorkers {
+			cpus[i] = i % numCPU
+		}
+		return cpus
+	}
+
+	// Interleave: assign workers round-robin across nodes, picking the
+	// next unused CPU from each node in order.
+	nodeIdx := make([]int, numaNodes)
+	cpus := make([]int, numWorkers)
+	for i := range numWorkers {
+		node := i % numaNodes
+		nodeCPUList := nodeCPUs[node]
+		if len(nodeCPUList) == 0 {
+			// Empty node: fall back to sequential.
+			cpus[i] = i % numCPU
+			continue
+		}
+		cpus[i] = nodeCPUList[nodeIdx[node]%len(nodeCPUList)]
+		nodeIdx[node]++
+	}
+	return cpus
+}
+
 // readNodeCPUs reads /sys/devices/system/node/nodeN/cpulist for each node
 // and returns a slice of CPU ID lists per node. Returns nil if sysfs is
 // unavailable.
