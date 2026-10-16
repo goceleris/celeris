@@ -13,10 +13,11 @@ var (
 	errChunkLineTooLong       = errors.New("chunk size line too long")
 )
 
-// MaxChunkLineSize bounds a chunk-size line (size, extensions and the CRLF's
-// line) in bytes. It is the limit net/http applies to the same line. A line
-// longer than this is refused whether or not its CRLF has arrived, so a
-// client cannot make the server buffer an endless size line.
+// MaxChunkLineSize bounds a chunk-size line (size and extensions) in bytes. It
+// is the value net/http uses for the same line (maxLineLength in
+// net/http/internal/chunked.go). A line longer than this is refused whether or
+// not its CRLF has arrived, so a client cannot make the server buffer an
+// endless size line.
 const MaxChunkLineSize = 4096
 
 // PeekChunk reads the size line of the chunk that starts buf without
