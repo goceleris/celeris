@@ -22,6 +22,11 @@ func TestAcceptsEncodingsWildcardAndWeightName888(t *testing.T) {
 		{"br;Q=0, gzip", []string{"br", "gzip"}, "gzip"},
 		{"gzip;Q=0", []string{"gzip"}, ""},
 		{"gzip, br;q=0.8", []string{"br", "gzip"}, "gzip"},
+		// Equal q-values: the entry that gives the q-value decides, the
+		// earliest in the header, whatever its specificity (as on main).
+		{"*, gzip", []string{"gzip", "br"}, "gzip"},
+		{"*, gzip", []string{"br", "gzip"}, "br"},
+		{"*;q=0.1, gzip, br", []string{"br", "gzip"}, "gzip"},
 	} {
 		s, _ := newTestStream("GET", "/test")
 		s.Headers = append(s.Headers, [2]string{"accept-encoding", tc.ae})
@@ -45,6 +50,10 @@ func TestNegotiateMostSpecificRange888(t *testing.T) {
 		{"text/html;q=0, text/*", []string{"text/html", "text/plain"}, "text/plain"},
 		{"text/*;q=0.1, */*;q=0.9", []string{"text/html", "application/json"}, "application/json"},
 		{"application/json;Q=0, */*", []string{"application/json", "application/xml"}, "application/xml"},
+		// Equal q-values with a wildcard first: the named entry's offer
+		// stays first in line (as on main), not the ones only "*/*" reaches.
+		{"*/*, application/json", []string{"application/json", "application/xml", "text/plain"}, "application/json"},
+		{"text/*, text/html", []string{"text/html", "text/plain"}, "text/html"},
 	} {
 		s, _ := newTestStream("GET", "/test")
 		s.Headers = append(s.Headers, [2]string{"accept", tc.accept})
@@ -67,3 +76,31 @@ func TestAcceptsLanguagesWildcard888(t *testing.T) {
 		t.Errorf("AcceptsLanguages with %q = %q, want en", "*;q=0, en", got)
 	}
 }
+
+// Context.Respond offers json, xml and text/plain: "*/*, application/json"
+// ties all three at q=1 and the entry that gives the q-value, the earliest in
+// the header, is the same one for all of them, so the first offer (json) wins,
+// as it did before the most specific entry decided the weight.
+func TestRespondWildcardFirstServesJSON888(t *testing.T) {
+	for _, accept := range []string{"*/*, application/json", "*/*;q=0.8, application/json;q=0.8", "*, application/json"} {
+		s, rw := newTestStream("GET", "/test")
+		s.Headers = append(s.Headers, [2]string{"accept", accept})
+		c := acquireContext(s)
+		if err := c.Respond(200, respondItem888{"v"}); err != nil {
+			t.Fatal(err)
+		}
+		var ct string
+		for _, h := range rw.headers {
+			if h[0] == "content-type" {
+				ct = h[1]
+			}
+		}
+		if ct != "application/json" {
+			t.Errorf("Respond with Accept %q: content-type %q, want application/json", accept, ct)
+		}
+		releaseContext(c)
+		s.Release()
+	}
+}
+
+type respondItem888 struct{ K string }

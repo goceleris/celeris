@@ -44,6 +44,20 @@ var wildcard888 = []struct {
 	{"star-only", "*", []string{"br", "gzip"}, "br"},
 	{"tie-keeps-header-order", "gzip, br", []string{"br", "gzip"}, "gzip"},
 	{"tie-keeps-offer-order-for-star", "*", []string{"gzip", "br"}, "gzip"},
+	// Equal q-values between offers: the entry that gives the q-value, the
+	// earliest in the header whatever its specificity, then the offer order
+	// (what origin/main did). A wildcard before the named entry is no
+	// reason to prefer the offers only the wildcard reaches.
+	{"tie-wildcard-first-media", "*/*, application/json", []string{"application/json", "application/xml", "text/plain"}, "application/json"},
+	{"tie-wildcard-first-media-named-last-offer", "*/*, application/json", []string{"application/xml", "application/json", "text/plain"}, "application/xml"},
+	{"tie-star-first-coding", "*, gzip", []string{"gzip", "br"}, "gzip"},
+	{"tie-star-first-coding-offer-order", "*, gzip", []string{"br", "gzip"}, "br"},
+	{"tie-type-wildcard-first", "text/*, text/html", []string{"text/html", "text/plain"}, "text/html"},
+	{"tie-type-wildcard-first-offer-order", "text/*, text/html", []string{"text/plain", "text/html"}, "text/plain"},
+	{"tie-low-wildcard-then-named", "*;q=0.1, gzip, br", []string{"br", "gzip"}, "gzip"},
+	{"tie-low-wildcard-then-named-q-lower-later", "*;q=0.1, gzip, br;q=0.5", []string{"br", "gzip"}, "gzip"},
+	{"tie-named-first-wildcard-last", "gzip, *", []string{"br", "gzip"}, "gzip"},
+	{"tie-language-wildcard-first", "*, en", []string{"fr", "en"}, "fr"},
 	// Entries equally specific (a repeated coding): q=0 refuses, whatever the
 	// order, and otherwise the higher q-value counts.
 	{"repeated-q0-first", "gzip;q=0, gzip", []string{"gzip"}, ""},
