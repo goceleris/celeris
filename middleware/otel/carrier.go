@@ -62,7 +62,9 @@ const keysLinearDedupe = 32
 
 // Keys returns the distinct request header names, without HTTP/2
 // pseudo-headers, as copies built from one allocation (the slice is the
-// second).
+// second). The names are substrings of that one string, so a propagator that
+// keeps any one of them keeps all of them alive: the sum of the request's
+// header-name bytes, which the header limits bound.
 func (h headerCarrier) Keys() []string {
 	headers := h.ctx.RequestHeaders()
 	keys := make([]string, 0, len(headers))

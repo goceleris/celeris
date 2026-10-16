@@ -88,8 +88,13 @@ func TestCarrierKeysOneAllocationForTheNames888(t *testing.T) {
 			opts = append(opts, celeristest.WithHeader(k, "v"))
 			want[k] = true
 		}
-		// A late duplicate: it meets the names the linear scan or the map keeps.
-		opts = append(opts, celeristest.WithHeader("x-header-0", "again"))
+		// Late duplicates: one of the first names (kept by the linear scan, or
+		// copied into the map when it is built) and the last one added, which
+		// for n >= 31 is a name that first appears after the map exists and
+		// that only the map's own insertion can catch.
+		opts = append(opts,
+			celeristest.WithHeader("x-header-0", "again"),
+			celeristest.WithHeader("x-header-"+strconv.Itoa(n-1), "again"))
 		c, _ := celeristest.NewContext("GET", "/", opts...)
 		h := headerCarrier{ctx: c}
 		keys := h.Keys()
