@@ -137,13 +137,22 @@ type H1State struct {
 	bodyBuf    []byte
 	bodyNeeded int
 	// chunkedInProgress is true while a chunked-transfer-encoding request body
-	// is mid-accumulation in state.buffer (the chunked loop returned on an
-	// incomplete chunk). Unlike a fixed-length body it leaves bodyNeeded==0, so
-	// it is the one "current request continuation" state that buffer.Len()>0
-	// alone cannot distinguish from buffered pipelined NEXT-request bytes. The
-	// #383 transplant boundary check (AtRequestBoundary) uses it to refuse a
-	// conn whose buffer holds a half-received chunked body.
-	chunkedInProgress  bool
+	// spans ProcessH1 calls. While it is true state.buffer holds the request
+	// head (chunkHeadLen bytes, kept so state.req can be re-parsed from stable
+	// memory once the body is complete, as for a fixed-length body) followed
+	// by the bytes not yet decoded, which start at a chunk boundary, and
+	// chunkBuf holds the body decoded so far. Unlike a fixed-length body it
+	// leaves bodyNeeded==0, so it is the one "current request continuation"
+	// state that buffer.Len()>0 alone cannot distinguish from buffered
+	// pipelined NEXT-request bytes. The #383 transplant boundary check
+	// (AtRequestBoundary) uses it to refuse a conn whose buffer holds a
+	// half-received chunked body.
+	chunkedInProgress bool
+	chunkHeadLen      int
+	// chunkBuf is the decoded chunked body of the request in flight. It is
+	// handed to the handler and dropped, never reused: a handler may keep
+	// c.Body() until it returns, and an async or detached one longer.
+	chunkBuf           []byte
 	req                h1.Request
 	rw                 h1ResponseAdapter // embedded — reused per request, avoids heap alloc
 	stream             *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
@@ -506,6 +515,8 @@ func CloseH1(state *H1State) {
 	// memory was already being paid for real traffic).
 	state.bodyBuf = nil
 	state.bodyNeeded = 0
+	state.chunkBuf = nil
+	state.chunkedInProgress = false
 }
 
 // ProcessH1 processes incoming H1 data, parsing requests and calling the handler.
@@ -565,7 +576,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	// ReadHeaderTimeout. With defer-arm, every successful request
 	// would re-arm the deadline; the next keep-alive idle conn would
 	// get killed at ReadHeaderTimeout instead of IdleTimeout.
-	if state.HeaderDeadlineNs.Load() == 0 && state.bodyNeeded == 0 && !state.Detached.Load() {
+	if state.HeaderDeadlineNs.Load() == 0 && state.bodyNeeded == 0 && !state.chunkedInProgress && !state.Detached.Load() {
 		state.ArmHeaderDeadline()
 	}
 
@@ -619,6 +630,58 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		data = rest
 	}
 
+	// In-progress chunked body spanning multiple reads (celeris#1029). The
+	// head stays at the front of state.buffer and the bytes after it are not
+	// yet decoded: append, decode what is complete, and once the terminating
+	// chunk and its trailer are in, re-parse the head once and dispatch. What
+	// follows the terminator (pipelined requests) stays in state.buffer for
+	// the loops below.
+	if state.chunkedInProgress {
+		state.buffer.Write(data)
+		done, err := state.scanChunked(write)
+		if err != nil {
+			return err
+		}
+		if !done {
+			return nil
+		}
+		state.chunkedInProgress = false
+		bodyData := state.chunkBuf
+		state.chunkBuf = nil
+		head := state.chunkHeadLen
+		state.parser.Reset(state.buffer.Bytes()[:head])
+		state.req.Reset()
+		if n, err := state.parser.ParseRequest(&state.req); err != nil || n != head {
+			writeErrorResponse(write, 400, "Bad Request")
+			if err == nil {
+				err = errChunkedHeadChanged
+			}
+			return err
+		}
+		state.buffer.Next(head)
+		if err := tryUpgradeH2C(state, bodyData, state.buffer.Bytes(), write); err != nil {
+			return err
+		}
+		if state.UpgradeInfo != nil {
+			return ErrUpgradeH2C
+		}
+		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
+			return err
+		}
+		if state.Detached.Load() {
+			return nil
+		}
+		if !state.req.KeepAlive {
+			return errConnectionClose
+		}
+		if state.buffer.Len() > 0 {
+			// Entry did not arm the header deadline (a body was in progress):
+			// what follows the terminator starts the next request's head.
+			state.ArmHeaderDeadline()
+		}
+		data = nil
+	}
+
 	if state.buffer.Len() == 0 {
 		offset := 0
 		for offset < len(data) {
@@ -669,7 +732,10 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 						return fmt.Errorf("content-length %d exceeds %d byte limit", bodyNeeded, limit)
 					}
 				}
-				if state.req.ExpectContinue {
+				// A chunked request is answered by the buffered path below, which
+				// parses the head again: answering here too wrote the 100 Continue
+				// and ran OnExpectContinue twice.
+				if state.req.ExpectContinue && bodyNeeded > 0 {
 					if state.OnExpectContinue != nil && !safeExpectContinue(state.OnExpectContinue, state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 						write(expectation417Response)
 						// Close connection after rejection to prevent request
@@ -839,35 +905,21 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			bodyData = buf[:bodyNeeded]
 			state.buffer.Next(int(bodyNeeded))
 		case bodyNeeded == -1:
-			state.buffer.Next(consumed)
-			var chunks bytes.Buffer
-			for {
-				state.parser.Reset(state.buffer.Bytes())
-				chunk, chunkConsumed, cerr := state.parser.ParseChunkedBody()
-				if cerr != nil {
-					writeErrorResponse(write, 400, "Invalid chunked encoding")
-					return cerr
-				}
-				if chunkConsumed == 0 {
-					// Incomplete chunked body: the current request continues in
-					// state.buffer across the next recv. Flag it so #383 transplant
-					// won't mistake this for buffered next-request bytes.
-					state.chunkedInProgress = true
-					return nil
-				}
-				state.buffer.Next(chunkConsumed)
-				if chunk == nil {
-					break
-				}
-				chunks.Write(chunk)
-				if limit := state.maxBodySize(); limit > 0 && int64(chunks.Len()) > limit {
-					writeErrorResponse(write, 413, "Request body too large")
-					return fmt.Errorf("chunked body exceeds %d byte limit", limit)
-				}
+			// The head stays at the front of state.buffer until the body is
+			// complete: when it is not, the next call resumes from here
+			// (celeris#1029) instead of parsing chunk bytes as a request.
+			state.chunkHeadLen = consumed
+			done, err := state.scanChunked(write)
+			if err != nil {
+				return err
 			}
-			// Chunked body fully received; the request is no longer in progress.
-			state.chunkedInProgress = false
-			bodyData = chunks.Bytes()
+			if !done {
+				state.chunkedInProgress = true
+				return nil
+			}
+			state.buffer.Next(consumed)
+			bodyData = state.chunkBuf
+			state.chunkBuf = nil
 		default:
 			state.buffer.Next(consumed)
 		}
@@ -891,6 +943,108 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	}
 	return nil
 }
+
+// errChunkedHeadChanged is returned when the head of a chunked request, held in
+// state.buffer while its body arrives, does not parse again to the same length.
+var errChunkedHeadChanged = errors.New("chunked request head changed while its body was received")
+
+// abortChunked drops the chunked body in progress.
+func (s *H1State) abortChunked() {
+	s.chunkedInProgress = false
+	s.chunkBuf = nil
+}
+
+// scanChunked decodes the chunks that follow the head (state.chunkHeadLen bytes
+// at the front of state.buffer) into state.chunkBuf. It reports done when the
+// terminating chunk and its trailer have been consumed. It leaves
+// state.buffer holding the head followed by the bytes it could not decode yet
+// (a partial chunk, a partial size line, a partial trailer) or, when done, by
+// what followed the terminator; the head itself is never moved.
+//
+// Every refusal is final: the answer (400 or 413) is written here and the
+// error returned. The limit is checked against a chunk as soon as its size
+// line is known, so a declared size over MaxRequestBodySize is refused before
+// its data arrives and state.buffer never holds more than the head, one chunk
+// within the limit and a bounded size line or trailer.
+func (s *H1State) scanChunked(write func([]byte)) (done bool, err error) {
+	head := s.chunkHeadLen
+	buf := s.buffer.Bytes()
+	limit := s.maxBodySize()
+	pos := head
+	for {
+		s.parser.Reset(buf[pos:])
+		chunk, n, cerr := s.parser.ParseChunkedBody()
+		if cerr != nil {
+			s.abortChunked()
+			writeErrorResponse(write, 400, "Invalid chunked encoding")
+			return false, cerr
+		}
+		if n == 0 {
+			if err := s.checkPartialChunk(buf[pos:], limit, write); err != nil {
+				s.abortChunked()
+				return false, err
+			}
+			break
+		}
+		pos += n
+		if chunk == nil {
+			done = true
+			break
+		}
+		// limit-len(chunkBuf) cannot go negative: a body over the limit was
+		// refused when its last chunk arrived.
+		if limit > 0 && int64(len(chunk)) > limit-int64(len(s.chunkBuf)) {
+			s.abortChunked()
+			writeErrorResponse(write, 413, "Request body too large")
+			return false, fmt.Errorf("chunked body exceeds %d byte limit", limit)
+		}
+		s.chunkBuf = append(s.chunkBuf, chunk...)
+	}
+	if pos > head {
+		// Drop what was decoded: the undecoded rest moves down behind the head.
+		b := s.buffer.Bytes()
+		k := copy(b[head:], b[pos:])
+		s.buffer.Truncate(head + k)
+	}
+	return done, nil
+}
+
+// checkPartialChunk bounds what an incomplete chunk may make the server hold.
+// rest starts at a chunk boundary and ParseChunkedBody found it incomplete.
+func (s *H1State) checkPartialChunk(rest []byte, limit int64, write func([]byte)) error {
+	size, hdr, err := h1.PeekChunk(rest)
+	if err != nil {
+		writeErrorResponse(write, 400, "Invalid chunked encoding")
+		return err
+	}
+	if hdr == 0 {
+		return nil // the size line is still arriving, within its bound
+	}
+	if size == 0 {
+		// The terminating chunk, waiting for the end of its trailer.
+		if len(rest)-hdr > h1.MaxHeaderSize+4 {
+			writeErrorResponse(write, 400, "Invalid chunked encoding")
+			return errChunkedTrailerTooLarge
+		}
+		return nil
+	}
+	if limit > 0 {
+		// Compared as size > limit-decoded, not decoded+size > limit: a size
+		// line such as 7fffffffffffffff would overflow the sum.
+		if size > limit-int64(len(s.chunkBuf)) {
+			writeErrorResponse(write, 413, "Request body too large")
+			return fmt.Errorf("chunked body exceeds %d byte limit", limit)
+		}
+		// Reserve the rest of this chunk at once rather than let the buffer
+		// double its way there. size is within the limit here.
+		if need := int64(hdr) + size + 2 - int64(len(rest)); need > 0 {
+			s.buffer.Grow(int(need))
+		}
+	}
+	return nil
+}
+
+var errChunkedTrailerTooLarge = errors.New("chunked trailer too large")
 
 // tryUpgradeH2C inspects the just-parsed request for an h2c upgrade. On a
 // valid request it writes the 101 Switching Protocols response, captures

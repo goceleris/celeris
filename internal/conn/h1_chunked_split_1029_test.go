@@ -544,8 +544,11 @@ func TestProcessH1ChunkedH2CUpgrade1029(t *testing.T) {
 			if !bytes.Equal(st.UpgradeInfo.Body, body) {
 				t.Fatalf("upgrade body %d bytes, want %d", len(st.UpgradeInfo.Body), len(body))
 			}
-			if !bytes.Equal(st.UpgradeInfo.Remaining, tail) {
-				t.Fatalf("upgrade remaining %q, want %q", st.UpgradeInfo.Remaining, tail)
+			// What the call that ended the request also carried: the whole tail
+			// when it came in that segment, else its first bytes (the engine
+			// reads the rest from the socket once HTTP/2 owns the connection).
+			if !bytes.HasPrefix(tail, st.UpgradeInfo.Remaining) || (k >= len(wire) && !bytes.Equal(st.UpgradeInfo.Remaining, tail)) {
+				t.Fatalf("upgrade remaining %q, want %q or a prefix of it", st.UpgradeInfo.Remaining, tail)
 			}
 		})
 	}
@@ -571,5 +574,23 @@ func TestProcessH1ChunkedBoundaryFlags1029(t *testing.T) {
 	}
 	if !st.AtRequestBoundary() || st.HasPendingData() {
 		t.Fatal("not at a request boundary after the body completed")
+	}
+}
+
+// TestCloseH1DropsChunkedState1029: closing a connection that is mid-body
+// leaves nothing behind.
+func TestCloseH1DropsChunkedState1029(t *testing.T) {
+	st := NewH1State()
+	h := &rec1029{}
+	var out bytes.Buffer
+	if _, err := feed1029(st, h, &out, append([]byte(head1029), "5\r\nhel"...), []byte("lo\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !st.chunkedInProgress || len(st.chunkBuf) == 0 {
+		t.Fatalf("setup: chunkedInProgress=%v chunkBuf=%d", st.chunkedInProgress, len(st.chunkBuf))
+	}
+	CloseH1(st)
+	if st.chunkedInProgress || st.chunkBuf != nil {
+		t.Fatal("CloseH1 left chunked state behind")
 	}
 }
