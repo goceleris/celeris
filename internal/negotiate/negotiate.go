@@ -14,9 +14,21 @@ type AcceptItem struct {
 
 // Accept returns the best matching offer based on the Accept header value.
 // Returns "" if no offer matches. Matching is case-insensitive per RFC 9110,
-// but the original offer string is returned. Entries with q=0 are treated as
-// "not acceptable" per RFC 9110 §12.5.1 and exclude matching offers even
-// from wildcard entries.
+// but the original offer string is returned.
+//
+// The q-value of an offer is the one of the most specific entry that matches
+// it: an entry naming the offer, else a "type/*" range, else "*" or "*/*"
+// (RFC 9110 12.5.1; for a content coding or a language, 12.5.3 says the same:
+// "*" matches whatever is not listed elsewhere in the field). So "gzip, *;q=0"
+// accepts gzip and refuses every other coding, "text/html;q=0, text/*" refuses
+// text/html and accepts the rest of text, and "gzip;q=0.5, *" weighs gzip
+// 0.5 and the rest 1. An entry with q=0 means "not acceptable"
+// (RFC 9110 12.5.1): the offer it decides is not returned, even when a less
+// specific entry would accept it. Where two entries are equally specific (a
+// repeated entry), q=0 wins, and otherwise the higher q-value does.
+//
+// Of the acceptable offers the highest q-value is chosen, then the one whose
+// entry comes first in the header, then the first offer.
 func Accept(header string, offers []string) string {
 	// Stack-backed entry buffer. Real Accept-Encoding / Accept-Language
 	// headers almost always hold ≤8 items; anything larger falls back to
@@ -26,36 +38,19 @@ func Accept(header string, offers []string) string {
 	var entryBuf [8]AcceptItem
 	entries := ParseInto(entryBuf[:0], header)
 
-	// Build exclusion set: types with q=0 are explicitly rejected (RFC 9110).
-	// These override wildcard matches — e.g., "*, br;q=0" excludes br.
-	var excluded []string
-	for _, e := range entries {
-		if e.Quality <= 0 {
-			excluded = append(excluded, e.MediaType)
-		}
-	}
-
 	bestOffer := ""
 	bestQ := -1.0
 	bestIdx := len(entries) // higher = worse; prefer earlier Accept entries on tie
 	for _, offer := range offers {
 		lo := strings.ToLower(offer)
-		// Check if this offer is explicitly excluded by a q=0 entry.
-		if isExcluded(lo, excluded) {
+		q, idx := offerQuality(entries, lo)
+		if q <= 0 {
 			continue
 		}
-		for idx, e := range entries {
-			if e.Quality <= 0 {
-				continue
-			}
-			if !MatchMedia(e.MediaType, lo) {
-				continue
-			}
-			if e.Quality > bestQ || (e.Quality == bestQ && idx < bestIdx) {
-				bestQ = e.Quality
-				bestOffer = offer
-				bestIdx = idx
-			}
+		if q > bestQ || (q == bestQ && idx < bestIdx) {
+			bestQ = q
+			bestOffer = offer
+			bestIdx = idx
 		}
 	}
 	if bestQ <= 0 {
@@ -64,14 +59,47 @@ func Accept(header string, offers []string) string {
 	return bestOffer
 }
 
-// isExcluded returns true if offer matches any excluded pattern via MatchMedia.
-func isExcluded(offer string, excluded []string) bool {
-	for _, ex := range excluded {
-		if MatchMedia(ex, offer) {
-			return true
+// offerQuality returns the q-value of the lowercased offer and the index of
+// the entry that gave it: that of the most specific entries matching the offer
+// (see [Accept]), q=0 if any of them says 0, else the highest, the earliest on
+// a tie. It returns q=0 when no entry matches.
+func offerQuality(entries []AcceptItem, offer string) (q float64, idx int) {
+	bestSpec := 0
+	idx = len(entries)
+	for i, e := range entries {
+		spec := matchSpecificity(e.MediaType, offer)
+		if spec == 0 || spec < bestSpec {
+			continue
+		}
+		switch {
+		case spec > bestSpec:
+			bestSpec, q, idx = spec, e.Quality, i
+		case q <= 0:
+			// An earlier equally specific entry refused it: that stands.
+		case e.Quality <= 0:
+			q, idx = e.Quality, i
+		case e.Quality > q:
+			q, idx = e.Quality, i
 		}
 	}
-	return false
+	return q, idx
+}
+
+// matchSpecificity is 0 when the pattern does not match the offer, and
+// otherwise how specific the pattern is: 1 for "*" and "*/*", 2 for "type/*",
+// 3 for a name or a full type. Both are lowercase.
+func matchSpecificity(pattern, offer string) int {
+	if !MatchMedia(pattern, offer) {
+		return 0
+	}
+	switch {
+	case pattern == "*" || pattern == "*/*":
+		return 1
+	case strings.HasSuffix(pattern, "/*"):
+		return 2
+	default:
+		return 3
+	}
 }
 
 // Parse parses an Accept header value into a slice of AcceptItems.
@@ -114,7 +142,8 @@ func ParseInto(dst []AcceptItem, header string) []AcceptItem {
 					params = ""
 				}
 				p = strings.TrimSpace(p)
-				if strings.HasPrefix(p, "q=") {
+				// The parameter name is case-insensitive (RFC 9110 5.6.6, 12.4.2).
+				if len(p) > 2 && (p[0] == 'q' || p[0] == 'Q') && p[1] == '=' {
 					if q, err := strconv.ParseFloat(p[2:], 64); err == nil {
 						e.Quality = q
 					}

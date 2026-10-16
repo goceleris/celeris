@@ -1201,7 +1201,10 @@ func (c *Context) StreamReader(code int, contentType string, r io.Reader) error 
 }
 
 // Negotiate inspects the Accept header and returns the best matching content type
-// from the provided offers. Returns "" if no match. Supports quality values (q=).
+// from the provided offers. Returns "" if no match. Supports quality values (q=):
+// a type is weighed by the most specific range that matches it, so
+// "text/html;q=0, text/*" refuses text/html and accepts the rest of text,
+// and "*/*;q=0, text/html" accepts text/html alone (RFC 9110 12.5.1).
 //
 // The response then depends on Accept, so Negotiate adds Accept to the
 // response's Vary header (once): a shared cache, or middleware/singleflight,

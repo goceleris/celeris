@@ -706,6 +706,12 @@ func (c *Context) Protocol() string {
 // header, or empty string if none match. The response then depends on
 // Accept-Encoding, so it adds Accept-Encoding to the response's Vary header
 // (once), as [Context.Negotiate] does for Accept.
+//
+// Each encoding is weighed by the most specific entry of the header that
+// names it: "*" stands only for the encodings the header does not list
+// (RFC 9110 12.5.3), so "gzip, *;q=0" accepts gzip and nothing else, and
+// "gzip;q=0, *" accepts everything but gzip. A weight of q=0 refuses; the
+// name of the weight, "q" or "Q", is not case-sensitive.
 func (c *Context) AcceptsEncodings(offers ...string) string {
 	c.varyOn("Accept-Encoding")
 	return negotiate.Accept(c.Header("accept-encoding"), offers)

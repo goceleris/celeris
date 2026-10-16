@@ -37,7 +37,8 @@ type Config struct {
 	// singleflight. Two values are one component when the negotiator reads
 	// them alike (as c.AcceptsEncodings does: "gzip, deflate" and
 	// "gzip,deflate", "GZIP" and "gzip"), and the order is kept; "gzip;q=0"
-	// and "gzip;Q=0", which it tells apart, are two. A value longer than 256
+	// and "gzip;Q=0", which it reads alike, are one, and "gzip;q=0" and
+	// "gzip;q = 0", which it tells apart, are two. A value longer than 256
 	// bytes is held as sent, not read, so two spellings of one long list are
 	// two components (only a missed coalescing). The preconditions keep
 	// requests with different validators apart, because the response answers
