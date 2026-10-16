@@ -133,7 +133,7 @@ func TestUnpinnedWorkersStayUnpinned909(t *testing.T) {
 	base, _ := pintest.StartupMask()
 	old := planWorkerCPUs
 	var want []int
-	planWorkerCPUs = func(n int) platform.CPUPlan {
+	planWorkerCPUs = func(n int, _ bool) platform.CPUPlan {
 		want = make([]int, n)
 		for i := range want {
 			want[i] = -1

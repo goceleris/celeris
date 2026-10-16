@@ -381,9 +381,14 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 
 	// celeris#909: the CPU of worker i is the i-th member of the process's
-	// allowed set, and on a big.LITTLE host never a little CPU.
-	plan := planWorkerCPUs(resolved.Workers)
+	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
+	// the worker count (celeris#1036): on a big.LITTLE host it holds one
+	// worker per non-little CPU, fewer than the default GOMAXPROCS, every one
+	// pinned. The memlock cap above bounds the request, so a plan never holds
+	// more workers than memlock funds.
+	plan := planWorkerCPUs(resolved.Workers, e.cfg.Resources.Workers > 0)
 	cpus := plan.CPUs
+	resolved.Workers = len(cpus)
 
 	// Probe for the highest working tier by test-creating a ring.
 	tier := e.tier
