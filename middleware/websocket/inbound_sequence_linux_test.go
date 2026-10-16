@@ -40,6 +40,15 @@ const closeHandshakeSlow = 10 * time.Second
 // (celeris#611). The echo failure itself is judged, with its error and its
 // connection, when it came before its own client closed.
 //
+// After its flood the client holds the backpressure idle for wsoQuiet, as the
+// pause-cancel test does, so a connection the engine stopped reading behind its
+// blocked echo (celeris#607) stays unread long enough for the watch to see it.
+// With celeris#607 re-introduced (mutant m607) this fired on io_uring, in a
+// linux/arm64 container, at 16 connections and 2 bursts of 16000 frames, the
+// size ci.yml runs (not yet on amd64); it did not at 1000 frames per burst,
+// whose echo fits the socket buffers and never blocks a send (checklist #888
+// item 4). The io_uring/multishot_recv arm did not fire in those runs.
+//
 // The client finishes its writes and waits for the close on progress, reading
 // while it waits, like TestBackpressurePauseDoesNotCancelInflightSend's
 // (backpressure_oracle_linux_test.go, celeris#633), and the rig's watch fails
@@ -186,19 +195,22 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 									// Channel capacity overflow at chanReader.Append when async pause latency
 									// outpaces headroom. Tracked separately from wire frame corruption.
 									overflowErr.Add(1)
-								} else if errors.Is(err, syscall.ECONNRESET) {
-									// Must precede the isCloseErr test below,
-									// which counts ECONNRESET as a close.
-									serverRST.Add(1)
-								} else if !isCloseErr(err) {
-									protoErr.Add(1)
-									s.noteErr("read", err)
-									if myConnIdx >= 0 {
-										connProtoErr[myConnIdx].Add(1)
-									}
-									if isParseErr(err) {
-										parseErr.Add(1)
-										note("parse error on conn %d: %v", myConnIdx, err)
+								} else {
+									// noteReadErr records a reset and any other
+									// error for serverErrs to judge (a reset is
+									// excused only when its client gave up first).
+									switch s.noteReadErr(err) {
+									case srvReadReset:
+										serverRST.Add(1)
+									case srvReadOther:
+										protoErr.Add(1)
+										if myConnIdx >= 0 {
+											connProtoErr[myConnIdx].Add(1)
+										}
+										if isParseErr(err) {
+											parseErr.Add(1)
+											note("parse error on conn %d: %v", myConnIdx, err)
+										}
 									}
 								}
 								return
@@ -394,6 +406,15 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 						}
 						cl.mark("flood end seq=%d off=%d burstsEndedByDeadline=%d", seq, off, deadlines)
 						cl.sample(c, "flood end")
+						// Hold the backpressure with the client idle (wsoQuiet), as
+						// TestBackpressurePauseDoesNotCancelInflightSend does: a
+						// healthy engine reads what this connection's socket holds
+						// or pauses it; one that stopped reading it behind the blocked
+						// echo SEND (celeris#607) cannot, and the watch sees that
+						// stretch pass wsoRecvStall. Without it the client reads again
+						// at once and the stretch never lasts (celeris#888 item 4).
+						time.Sleep(wsoQuiet)
+						cl.mark("quiet end")
 						buf := make([]byte, 64<<10)
 						if off > 0 {
 							if w := cl.write(c, "fc", cur[off:], buf); !w.ok {
@@ -508,8 +529,11 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 					testName, echoErr.Load(), slowClose.Load(), closeHandshakeSlow, wsoCloseIdle, wsoWaitCap)
 
 				// Recv-arming witnesses (celeris#586), read AFTER settle() so
-				// every worker has left its loop: the counters are direct
-				// atomics, so nothing is left in a per-iteration batch.
+				// every worker has left its loop. RecvLinkedArms is not a
+				// direct atomic: flushSendLink counts it in the worker-local
+				// linkArmBatch, flushed to the shared counter once per
+				// iteration and by flushBatches at shutdown (celeris#874), so
+				// the read below sees the arms of the last iteration too.
 				// RecvResumeWhileCancelPending says the load reached the
 				// celeris#484 window at all; RecvDoubleArmed (a second recv
 				// SQE placed) and RecvCQEUnaccounted (a terminal recv CQE the
