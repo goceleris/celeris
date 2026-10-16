@@ -21,34 +21,23 @@ var _ propagation.TextMapCarrier = headerCarrier{}
 // correct behavior for HTTP server middleware: the server extracts context
 // from the inbound request and injects it into the outbound response.
 //
-// Get returns a copy of every value but one, and Keys returns copies. On
-// epoll and io_uring a request header is a view of the engine's receive
-// buffer: safe to compare while the request is handled, unsafe to keep after
-// it. Propagators keep what they read, in the context the middleware installs
-// with SetContext (trace.ParseTraceState and baggage.Parse return substrings
-// of their input, so a tracestate or baggage value outlives the request in
-// the span context it builds, and a sampled span's context lives until the
-// exporter has sent it; a propagator that walks Keys may keep the names it
-// matches), and that context outlives the request whenever something keeps
-// it: a detached WebSocket or SSE stream derives its context from it
-// (celeris#714). A header that is absent costs nothing; one that is present
-// costs one allocation of its size.
-//
-// The exception is "traceparent": the W3C propagator decodes it into the
-// fixed-size trace and span IDs and keeps no part of the string, so Get
-// returns the request's view of it and the request pays no allocation for
-// it. A propagator that keeps a substring of "traceparent" (a custom one
-// that stores the raw header) must copy it with strings.Clone.
+// Get and Keys return copies. On epoll and io_uring a request header is a
+// view of the engine's receive buffer: safe to compare while the request is
+// handled, unsafe to keep after it. Propagators keep what they read, in the
+// context the middleware installs with SetContext (trace.ParseTraceState and
+// baggage.Parse return substrings of their input, so a tracestate or baggage
+// value outlives the request in the span context it builds, and a sampled
+// span's context lives until the exporter has sent it; a propagator that
+// walks Keys may keep the names it matches), and that context outlives the
+// request whenever something keeps it: a detached WebSocket or SSE stream
+// derives its context from it (celeris#714). A header that is absent costs
+// nothing; one that is present costs one allocation of its size.
 type headerCarrier struct {
 	ctx *celeris.Context
 }
 
 func (h headerCarrier) Get(key string) string {
-	v := h.ctx.Header(key)
-	if key == "traceparent" {
-		return v
-	}
-	return strings.Clone(v)
+	return strings.Clone(h.ctx.Header(key))
 }
 
 func (h headerCarrier) Set(key, value string) {

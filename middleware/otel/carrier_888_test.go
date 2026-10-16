@@ -6,12 +6,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
-
-	metricnoop "go.opentelemetry.io/otel/metric/noop"
-	"go.opentelemetry.io/otel/propagation"
-	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 // allocsPer888 is the least of several single-call windows of
@@ -32,13 +27,12 @@ func allocsPer888(limit float64, f func()) float64 {
 
 const tp888 = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
 
-// celeris#888 item 1: Get("traceparent") is the one value no propagator keeps
-// (W3C TraceContext decodes it into the fixed-size trace and span IDs), so
-// it is not copied; every other value is, because ParseTraceState and
-// baggage.Parse return substrings of their input and the span context that
-// holds them outlives the request. The control is the aliasing check on the
-// copied ones: the string Get returns must not share memory with the request's.
-func TestCarrierGetCopiesAllButTraceparent888(t *testing.T) {
+// celeris#888 item 1: Get returns an independent copy of every value,
+// traceparent included. On epoll and io_uring the request's header is a view of
+// the receive buffer, and a propagator may keep a substring of what it reads
+// (ParseTraceState and baggage.Parse do; a custom one may keep traceparent): the
+// string Get returns must not share memory with the request's.
+func TestCarrierGetCopiesEveryValue888(t *testing.T) {
 	c, _ := celeristest.NewContext("GET", "/",
 		celeristest.WithHeader("traceparent", tp888),
 		celeristest.WithHeader("tracestate", "vendor=value-of-some-length"),
@@ -51,10 +45,7 @@ func TestCarrierGetCopiesAllButTraceparent888(t *testing.T) {
 	if got := h.Get("traceparent"); got != tp888 {
 		t.Fatalf("Get(traceparent) = %q, want %q", got, tp888)
 	}
-	if n := allocsPer888(0, func() { _ = h.Get("traceparent") }); n != 0 {
-		t.Errorf("Get(traceparent) allocates %.0f, want 0", n)
-	}
-	for _, key := range []string{"tracestate", "baggage", "x-other"} {
+	for _, key := range []string{"traceparent", "tracestate", "baggage", "x-other"} {
 		want := c.Header(key)
 		got := h.Get(key)
 		if got != want || got == "" {
@@ -124,31 +115,5 @@ func TestCarrierKeysOneAllocationForTheNames888(t *testing.T) {
 			}
 		}
 		celeristest.ReleaseContext(c)
-	}
-}
-
-// BenchmarkOTelTracingPropagated888 is BenchmarkOTelTracing for a request that
-// carries trace context, which is what a traced service receives: the default
-// propagators read traceparent, tracestate and baggage through the carrier.
-// (BenchmarkOTelTracing sends none of them, where Get costs nothing either
-// way.)
-func BenchmarkOTelTracingPropagated888(b *testing.B) {
-	mw := New(Config{
-		TracerProvider: tracenoop.NewTracerProvider(),
-		MeterProvider:  metricnoop.NewMeterProvider(),
-		Propagators:    propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}),
-	})
-	h := func(c *celeris.Context) error { return c.String(200, "ok") }
-	opts := []celeristest.Option{
-		celeristest.WithHandlers(mw, h),
-		celeristest.WithHeader("traceparent", tp888),
-		celeristest.WithHeader("tracestate", "vendor=value-of-some-length,other=v"),
-		celeristest.WithHeader("baggage", "userId=alice,sessionId=0123456789abcdef"),
-	}
-	b.ReportAllocs()
-	for b.Loop() {
-		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
-		_ = ctx.Next()
-		celeristest.ReleaseContext(ctx)
 	}
 }

@@ -30,12 +30,11 @@ type Config struct {
 	// Propagators is the propagator to use for context injection/extraction.
 	// Default: otel.GetTextMapPropagator().
 	//
-	// The "traceparent" value a propagator reads from the request is not
-	// copied: on epoll and io_uring it is a view of the engine's receive
-	// buffer that is valid only while the request is handled. A propagator
-	// must not keep the string, or a substring of it, past Extract (use
-	// strings.Clone to keep it). The W3C TraceContext propagator decodes it
-	// into fixed-size IDs and keeps nothing. Every other value is copied.
+	// Every value a propagator reads from the request through the carrier
+	// (traceparent included) is a copy, as is every name Keys returns: there
+	// is nothing to clone before keeping one past Extract, although keeping a
+	// tracestate or baggage substring keeps the whole value alive for as long
+	// as the span context that holds it.
 	Propagators propagation.TextMapPropagator
 
 	// SpanNameFormatter overrides the default span name ("METHOD /route").
