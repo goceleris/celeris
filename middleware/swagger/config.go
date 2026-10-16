@@ -168,9 +168,11 @@ type Config struct {
 	UI UIConfig
 
 	// Options provides renderer-specific configuration as a JSON-serializable
-	// map. For Swagger UI, these are passed to SwaggerUIBundle(). For ReDoc,
-	// these are passed to Redoc.init(). For Scalar, these are passed as
-	// data-configuration. When nil, renderer defaults are used.
+	// map, for ReDoc and Scalar only: for ReDoc these are passed to
+	// Redoc.init(), for Scalar as data-configuration. Swagger UI does not
+	// read Options (configure it through [Config.UI] and OAuth2), but New
+	// still panics if Options is not JSON-serializable, whichever renderer is
+	// selected. When nil, renderer defaults are used.
 	//
 	// Example (ReDoc dark theme):
 	//

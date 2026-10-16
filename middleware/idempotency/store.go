@@ -4,8 +4,8 @@ import (
 	"github.com/goceleris/celeris/middleware/store"
 )
 
-// MemoryStoreConfig is a type alias for [store.MemoryKVConfig] provided
-// for symmetry with other middleware packages.
+// MemoryStoreConfig configures [NewMemoryStore]. It is the same type as
+// [store.MemoryKVConfig], and either name may be used.
 type MemoryStoreConfig = store.MemoryKVConfig
 
 // NewMemoryStore returns an in-memory idempotency store. It wraps

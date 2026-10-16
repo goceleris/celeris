@@ -46,9 +46,13 @@ func TestWaitForReadyFailsFastOnStartError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A Start that fails closes neither the listener nor the CPU monitor's
-	// /proc/stat descriptor; Shutdown releases the monitor, and is safe on a
-	// server that never started.
+	// This Start fails in createEngine ("unknown engine type"), inside
+	// doPrepare. doPrepare closes the CPU monitor's /proc/stat descriptor on
+	// that failure itself, and prepareWithListener then closes the listener it
+	// was given (celeris#737, #747). Nothing is left for the two defers below:
+	// the ln.Close is a redundant guard (a second Close returns an error that is
+	// ignored), and so is Shutdown, which is safe on a server that never
+	// started. They keep the test from depending on which path a failure took.
 	defer func() { _ = ln.Close() }()
 	defer func() { _ = s.Shutdown(context.Background()) }()
 	done := make(chan error, 1)

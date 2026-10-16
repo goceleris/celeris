@@ -4,11 +4,9 @@ package sse_test
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"net"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +25,10 @@ import (
 // The test boots celeris with each native engine + each AsyncHandlers
 // setting, drives /events for 1 s, and expects at least two ticks to
 // reach the client. A timeout-and-no-events outcome is the bug.
+//
+// The server is started by startSSEServer, so a Start that fails is
+// classified the same way as in the other tests of this package: retried on
+// ENOMEM, failed where io_uring works, and skipped only where it does not.
 func TestSSEOnNativeEngines(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -42,17 +44,7 @@ func TestSSEOnNativeEngines(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			addr := ln.Addr().String()
-
-			srv := celeris.New(celeris.Config{
-				Engine:        tc.engine,
-				AsyncHandlers: tc.async,
-			})
-			srv.GET("/events", sse.New(sse.Config{
+			addr, shutdown := startSSEServer(t, tc.engine, tc.async, false, sse.New(sse.Config{
 				HeartbeatInterval: -1,
 				Handler: func(client *sse.Client) {
 					tick := time.NewTicker(50 * time.Millisecond)
@@ -74,46 +66,7 @@ func TestSSEOnNativeEngines(t *testing.T) {
 					}
 				},
 			}))
-			var startErr atomic.Pointer[error]
-			startCtx, startCancel := context.WithCancel(context.Background())
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				if e := srv.StartWithListenerAndContext(startCtx, ln); e != nil {
-					startErr.Store(&e)
-				}
-			}()
-			// iouring/epoll rebind via SO_REUSEPORT to acquire workers
-			// on their own listening FDs — they close the listener we
-			// passed in and re-bind to the same port. The transient
-			// kernel-side flip can briefly accept and immediately RST
-			// a probe connection during the window. Sleep half a
-			// second to let the engine settle before driving the
-			// real test. Mirrors the wait in cmd/runner and the
-			// repro binary that proves the fix on cluster hardware.
-			time.Sleep(500 * time.Millisecond)
-			// A Start that fails after the settle sleep is not missed (celeris#706).
-			waitUpOrStopped(t, srv, done, 30*time.Second)
-			if p := startErr.Load(); p != nil {
-				// Docker / minimal-kernel CI runners may lack io_uring
-				// support (e.g. seccomp filtering, kernel <5.1 emulation).
-				// Skip rather than fail — the test exercises a
-				// kernel-feature-gated path and the failure mode is
-				// "engine unavailable", not a celeris bug.
-				msg := (*p).Error()
-				if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
-					t.Skipf("engine unavailable on this runner: %v", *p)
-				}
-				t.Fatalf("server start: %v", *p)
-			}
-			defer func() {
-				startCancel()
-				select {
-				case <-done:
-				case <-time.After(3 * time.Second):
-					t.Log("server goroutine did not exit within 3s")
-				}
-			}()
+			defer shutdown()
 
 			// Open the SSE stream and require at least two `event: tick`
 			// lines. The handler ticks every 50 ms, so two events arrive

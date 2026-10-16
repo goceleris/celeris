@@ -1,6 +1,7 @@
 package otel
 
 import (
+	"slices"
 	"strings"
 
 	"go.opentelemetry.io/otel/propagation"
@@ -24,11 +25,13 @@ var _ propagation.TextMapCarrier = headerCarrier{}
 // view of the engine's receive buffer: safe to compare while the request is
 // handled, unsafe to keep after it. Propagators keep what they read, in the
 // context the middleware installs with SetContext (trace.ParseTraceState and
-// baggage.Parse return substrings of their input; a propagator that walks
-// Keys may keep the names it matches), and that context outlives the request
-// whenever something keeps it: a detached WebSocket or SSE stream derives its
-// context from it (celeris#714). A header that is absent costs nothing; one
-// that is present costs one allocation of its size.
+// baggage.Parse return substrings of their input, so a tracestate or baggage
+// value outlives the request in the span context it builds, and a sampled
+// span's context lives until the exporter has sent it; a propagator that
+// walks Keys may keep the names it matches), and that context outlives the
+// request whenever something keeps it: a detached WebSocket or SSE stream
+// derives its context from it (celeris#714). A header that is absent costs
+// nothing; one that is present costs one allocation of its size.
 type headerCarrier struct {
 	ctx *celeris.Context
 }
@@ -41,20 +44,59 @@ func (h headerCarrier) Set(key, value string) {
 	h.ctx.SetHeader(key, value)
 }
 
+// keysLinearDedupe is the most distinct names Keys de-duplicates by
+// comparing each with those already kept (cheaper than a map for a request's
+// usual dozen headers); above it Keys uses a map.
+const keysLinearDedupe = 32
+
+// Keys returns the distinct request header names, without HTTP/2
+// pseudo-headers, as copies built from one allocation (the slice is the
+// second). The names are substrings of that one string, so a propagator that
+// keeps any one of them keeps all of them alive: the sum of the request's
+// header-name bytes, which the header limits bound.
 func (h headerCarrier) Keys() []string {
 	headers := h.ctx.RequestHeaders()
-	seen := make(map[string]struct{}, len(headers))
 	keys := make([]string, 0, len(headers))
+	var seen map[string]struct{}
+	size := 0
 	for _, hdr := range headers {
+		name := hdr[0]
 		// Skip HTTP/2 pseudo-headers (e.g. :method, :path).
-		if len(hdr[0]) > 0 && hdr[0][0] == ':' {
+		if len(name) > 0 && name[0] == ':' {
 			continue
 		}
-		if _, dup := seen[hdr[0]]; dup {
-			continue
+		if seen == nil {
+			if slices.Contains(keys, name) {
+				continue
+			}
+			if len(keys) == keysLinearDedupe {
+				seen = make(map[string]struct{}, len(headers))
+				for _, k := range keys {
+					seen[k] = struct{}{}
+				}
+			}
 		}
-		seen[hdr[0]] = struct{}{}
-		keys = append(keys, strings.Clone(hdr[0]))
+		if seen != nil {
+			if _, dup := seen[name]; dup {
+				continue
+			}
+			seen[name] = struct{}{}
+		}
+		keys = append(keys, name)
+		size += len(name)
+	}
+	// keys holds views of the request now: replace them with substrings of
+	// one string made here.
+	var b strings.Builder
+	b.Grow(size)
+	for _, k := range keys {
+		b.WriteString(k)
+	}
+	all := b.String()
+	off := 0
+	for i, k := range keys {
+		keys[i] = all[off : off+len(k)]
+		off += len(k)
 	}
 	return keys
 }
