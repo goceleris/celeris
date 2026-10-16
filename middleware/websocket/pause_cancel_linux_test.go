@@ -99,9 +99,11 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						s.phase.Store(1)
 						mt, msg, err := c.ReadMessage()
 						if err != nil {
-							if !isCloseErr(err) {
+							// A reset is noted too (isCloseErr counts it as a
+							// close), so serverErrs judges it; only the other
+							// errors count as protoErr.
+							if s.noteReadErr(err) == srvReadOther {
 								protoErr.Add(1)
-								s.noteErr("read", err)
 							}
 							s.exited("read", err)
 							return
@@ -140,12 +142,13 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				// it in the worker-local linkArmBatch, which the loop flushes
 				// to the shared counter once per iteration, and flushBatches
 				// flushes at shutdown (celeris#874). So the read sees every
-				// arm, including those of the last iteration. RECVSTALL is a celeris#607 witness:
-				// a connection owed a recv arm that the dirty-list retry
-				// passed over because a SEND was outstanding. Logged, not
-				// asserted -- an episode is normal SQ-ring pressure; what
-				// one does to a connection is judged by the watch
-				// (WSO-STALL), whatever the mechanism.
+				// arm, including those of the last iteration.
+				// RECVSTALL is a celeris#607 witness: a connection owed a
+				// recv arm that the dirty-list retry passed over because a
+				// SEND was outstanding. Logged, not asserted -- an episode
+				// is normal SQ-ring pressure; what one does to a connection
+				// is judged by the watch (WSO-STALL), whatever the
+				// mechanism.
 				if kind != celeris.IOUring {
 					return
 				}

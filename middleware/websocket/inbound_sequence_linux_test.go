@@ -186,19 +186,22 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 									// Channel capacity overflow at chanReader.Append when async pause latency
 									// outpaces headroom. Tracked separately from wire frame corruption.
 									overflowErr.Add(1)
-								} else if errors.Is(err, syscall.ECONNRESET) {
-									// Must precede the isCloseErr test below,
-									// which counts ECONNRESET as a close.
-									serverRST.Add(1)
-								} else if !isCloseErr(err) {
-									protoErr.Add(1)
-									s.noteErr("read", err)
-									if myConnIdx >= 0 {
-										connProtoErr[myConnIdx].Add(1)
-									}
-									if isParseErr(err) {
-										parseErr.Add(1)
-										note("parse error on conn %d: %v", myConnIdx, err)
+								} else {
+									// noteReadErr records a reset and any other
+									// error for serverErrs to judge (a reset is
+									// excused only when its client gave up first).
+									switch s.noteReadErr(err) {
+									case srvReadReset:
+										serverRST.Add(1)
+									case srvReadOther:
+										protoErr.Add(1)
+										if myConnIdx >= 0 {
+											connProtoErr[myConnIdx].Add(1)
+										}
+										if isParseErr(err) {
+											parseErr.Add(1)
+											note("parse error on conn %d: %v", myConnIdx, err)
+										}
 									}
 								}
 								return
@@ -508,8 +511,11 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 					testName, echoErr.Load(), slowClose.Load(), closeHandshakeSlow, wsoCloseIdle, wsoWaitCap)
 
 				// Recv-arming witnesses (celeris#586), read AFTER settle() so
-				// every worker has left its loop: the counters are direct
-				// atomics, so nothing is left in a per-iteration batch.
+				// every worker has left its loop. RecvLinkedArms is not a
+				// direct atomic: flushSendLink counts it in the worker-local
+				// linkArmBatch, flushed to the shared counter once per
+				// iteration and by flushBatches at shutdown (celeris#874), so
+				// the read below sees the arms of the last iteration too.
 				// RecvResumeWhileCancelPending says the load reached the
 				// celeris#484 window at all; RecvDoubleArmed (a second recv
 				// SQE placed) and RecvCQEUnaccounted (a terminal recv CQE the

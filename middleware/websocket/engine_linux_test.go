@@ -77,15 +77,21 @@ func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Con
 	// closure below is never handed out, so stop the server here: cancel a
 	// Start that is still running and wait for it (waitForReady leaves
 	// Start's error in done). Then release what the failed Start left behind.
-	// Who closes what on a failed start (celeris#737, #747): a failure in
-	// prepareWithListener closes the listener the caller passed in, and the
-	// func from listenContext, which listen defers, closes the CPU monitor's
-	// /proc/stat descriptor and stops the settle re-opener. Whether Engine.Listen
-	// closes the listener on its own error path is UNVERIFIED. The explicit
-	// ln.Close and Shutdown below are guards, so the release does not depend on
-	// which path the failure took; Shutdown is safe on a server that never
-	// started. Without the guards, every failed start leaked two descriptors
-	// for the life of the test binary.
+	// Who closes what on a failed start (celeris#737, #747):
+	//  - doPrepare closes the CPU monitor's /proc/stat descriptor itself when
+	//    createEngine fails, and prepareWithListener closes the listener it was
+	//    given when doPrepare fails;
+	//  - once the engine exists, the func from listenContext, which listen
+	//    defers, closes the monitor and stops the settle re-opener when Listen
+	//    returns;
+	//  - a Listen that is reached closes the supplied listener: the epoll and
+	//    io_uring engines at its entry (e.cfg.Listener.Close), the std engine
+	//    through http.Server.Serve when it returns.
+	// The ln.Close and Shutdown below are therefore redundant guards, kept so
+	// the release does not depend on which path a failure took; a second Close
+	// returns an error that is ignored, and Shutdown is safe on a server that
+	// never started. The leak they once covered (two descriptors per failed
+	// start) is closed by #737 and #747.
 	ready := false
 	defer func() {
 		if ready {
