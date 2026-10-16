@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -304,5 +306,70 @@ func TestDetachedRequestNotAnsweredOnErrorOrPanic852(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestUnmatchedOptionsWalksTheRouterOnce889 (celeris#889 item 4): an OPTIONS
+// request no OPTIONS route answers asks the router what the path allows once;
+// an empty answer means the path has no route at all, and the 404 follows
+// without a second walk of every method tree. The statuses and the Allow
+// header are those of celeris#421 / celeris#852; the cost bound is the proof
+// of the single walk: an unrouted OPTIONS costs what an unrouted GET does.
+func TestUnmatchedOptionsWalksTheRouterOnce889(t *testing.T) {
+	s := New(Config{})
+	s.GET("/exists", func(c *Context) error { return c.String(200, "ok") })
+	s.POST("/exists", func(c *Context) error { return c.String(200, "ok") })
+	ra := &routerAdapter{server: s}
+	ra.buildUnmatchedChains()
+	do := func(method, path string) *mockResponseWriter {
+		st, rw := newTestStream(method, path)
+		defer st.Release()
+		_ = ra.HandleStream(context.Background(), st)
+		return rw
+	}
+	allow := func(rw *mockResponseWriter) string {
+		for _, h := range rw.headers {
+			if h[0] == "allow" {
+				return h[1]
+			}
+		}
+		return ""
+	}
+
+	if rw := do("OPTIONS", "/missing"); rw.status != 404 || allow(rw) != "" {
+		t.Errorf("OPTIONS /missing = %d allow %q, want 404 without Allow", rw.status, allow(rw))
+	}
+	if rw := do("OPTIONS", "/exists"); rw.status != 200 || allow(rw) != "GET, POST, HEAD, OPTIONS" {
+		t.Errorf("OPTIONS /exists = %d allow %q, want 200 with GET, POST, HEAD, OPTIONS", rw.status, allow(rw))
+	}
+	if rw := do("PUT", "/exists"); rw.status != 405 || allow(rw) != "GET, POST, HEAD, OPTIONS" {
+		t.Errorf("PUT /exists = %d allow %q, want 405 with GET, POST, HEAD, OPTIONS", rw.status, allow(rw))
+	}
+	if rw := do("GET", "/missing"); rw.status != 404 {
+		t.Errorf("GET /missing = %d, want 404", rw.status)
+	}
+
+	// One walk: with many custom-method trees (what a walk costs scales with
+	// the trees; the request's own cost does not) the unrouted OPTIONS costs
+	// about what the unrouted GET does, not twice it. The least of several
+	// windows is the cost of the call alone.
+	for i := range 400 {
+		s.Handle("X"+strconv.Itoa(i), "/custom/"+strconv.Itoa(i), func(c *Context) error { return nil })
+	}
+	window := func(method string) time.Duration {
+		best := time.Duration(math.MaxInt64)
+		for range 15 {
+			t0 := time.Now()
+			for range 200 {
+				do(method, "/missing")
+			}
+			best = min(best, time.Since(t0))
+		}
+		return best
+	}
+	get, opts := window("GET"), window("OPTIONS")
+	t.Logf("200 unrouted requests, least of 15 windows: GET %v, OPTIONS %v (ratio %.2f)", get, opts, float64(opts)/float64(get))
+	if float64(opts) > 1.5*float64(get) {
+		t.Errorf("unrouted OPTIONS costs %v, GET %v (ratio %.2f): the router walked more than once", opts, get, float64(opts)/float64(get))
 	}
 }
