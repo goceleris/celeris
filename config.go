@@ -153,7 +153,11 @@ type Config struct {
 	// the time a client may go without taking any of a response the kernel has
 	// not accepted whole, restarted each time it takes some. A download read
 	// steadily for longer than WriteTimeout is not cut there, and a client
-	// that reads nothing is closed WriteTimeout after the response stalled;
+	// that reads nothing is closed WriteTimeout after the response stalled.
+	// Progress is seen when the engine flushes, which follows the socket
+	// becoming writable again, about when half of its send queue has drained,
+	// so a client that takes less than that per WriteTimeout (a deep send
+	// queue and a slow reader) can be closed while it is still reading.
 	// io_uring bounds the response as a whole, from the request's read, as std
 	// does. The same conn's ReadTimeout and IdleTimeout, while it holds a
 	// response the client is still taking, run from the last progress (epoll)

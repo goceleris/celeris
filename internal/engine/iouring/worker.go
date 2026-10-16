@@ -6572,14 +6572,15 @@ func (w *Worker) flushDirty() {
 }
 
 // longSendBytes is the size from which a SEND is expected to be able to wait
-// on its peer (celeris#884 items 62 and 64): a response this large does not fit
-// the room a socket has, and a connection with a full socket queue takes none
-// of it. The kernel's initial send buffer is 16 KiB, so a SEND of more than
-// this stalls at the first window update of a reader that is slow, and the SEND
-// of a response a short inline write left over (an async handler's direct write
-// takes what the socket takes and the ring gets the rest) is a first SEND with
-// no remainder to mark. Smaller SENDs keep the untimed wait (mode 3a): they
-// complete within a loop pass on any peer that reads at all.
+// on its peer (celeris#884 items 62 and 64): a response this large may not fit
+// the room the socket has, and a connection whose socket queue is full takes
+// none of it. The SEND of a response a short inline write left over (an async
+// handler's direct write takes what the socket takes and the ring gets the
+// rest) is a first SEND with no remainder to mark, and it is the one that
+// stalls with no progress at all. The figure is a choice, not a measurement:
+// the kernel's initial send buffer is 16 KiB. Smaller SENDs keep the untimed
+// wait (mode 3a), so a small SEND into a socket that is already full on an
+// otherwise idle worker is still not looked at by a sweep.
 const longSendBytes = 64 << 10
 
 // markLongSend notes that the SEND being submitted for cs, n bytes, may be
