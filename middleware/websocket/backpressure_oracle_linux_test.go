@@ -154,14 +154,18 @@ const (
 	// engine reads what the socket holds, or pauses; one that stopped
 	// reading the connection behind its blocked echo (celeris#607) cannot,
 	// so that stretch outlasts wsoRecvStall. With #607 re-introduced such a
-	// stretch began up to 1.6 s after the flood ended; at 6 s of quiet the
-	// shortest reached 4.5 s.
-	wsoQuiet = 8 * time.Second
+	// stretch began up to 2.8 s after the flood ended in the head's own
+	// records, so at 8 s of quiet it had 5.2 s left, 0.2 s more than the 5 s of
+	// wsoRecvStall, before the quiet ended. The #749 record of x86 cleared the
+	// same limit by about 1 s. wsoQuiet is 10 s: 7.2 s left on the head's
+	// figure, a margin of 2.2 s over wsoRecvStall. The cost is 2 s more per arm
+	// of the pause-cancel test that holds this quiet.
+	wsoQuiet = 10 * time.Second
 	// wsoReserve: what a rig leaves of the test binary's -timeout for the
 	// verdicts, the engine shutdowns (up to 40 s) and the tests after it.
 	wsoReserve = 60 * time.Second
 	// wsoMinBudget: a subtest that starts with less of the budget left than
-	// this fails at once (its flood and quiet alone take about 20 s).
+	// this fails at once (its flood and quiet alone take about 22 s).
 	wsoMinBudget = 30 * time.Second
 )
 
@@ -182,6 +186,11 @@ type wsoRig struct {
 	// watcher was not run when its tick was due (see watch).
 	watchResets int
 	watchMaxLag time.Duration
+	// watchGapRestarts: how many open stretches were restarted because the
+	// watcher's own pass reached a connection too late (wsoWatchStep). Each
+	// restart discards a stretch that may have been long, so a run with many
+	// has a watch that could not have reached wsoRecvStall.
+	watchGapRestarts int
 }
 
 // newWSORig starts a subtest's rig. Its waits end, at the latest, at the
@@ -313,6 +322,33 @@ func (s *wsoSrv) noteErr(kind string, err error) {
 	s.mu.Lock()
 	s.errs = append(s.errs, wsoSrvErr{kind: kind, err: err, ns: s.g.since()})
 	s.mu.Unlock()
+}
+
+// srvReadKind is what a handler's ReadMessage error is, for the counters.
+type srvReadKind int
+
+const (
+	srvReadClose srvReadKind = iota // a close, EOF or closed connection: not an error
+	srvReadReset                    // ECONNRESET: the connection was reset under the handler
+	srvReadOther                    // any other read error, a protocol or framing one
+)
+
+// noteReadErr classifies a handler's ReadMessage error and records the two
+// that are errors (srvReadReset, srvReadOther) with noteErr, so serverErrs
+// judges them: a reset is excused only when its client gave up and closed
+// first. isCloseErr counts ECONNRESET as a close, so the reset is tested
+// before it. A handler calls this for every read error that is not a
+// CloseError, and counts the kind it returns.
+func (s *wsoSrv) noteReadErr(err error) srvReadKind {
+	switch {
+	case errors.Is(err, syscall.ECONNRESET):
+		s.noteErr("read", err)
+		return srvReadReset
+	case !isCloseErr(err):
+		s.noteErr("read", err)
+		return srvReadOther
+	}
+	return srvReadClose
 }
 
 // exited records how the handler's loop ended.
@@ -1103,6 +1139,43 @@ func (g *wsoRig) cliMarks(port int) string {
 	return strings.Join(cl.marks, "; ")
 }
 
+// wsoEpisode is one open stretch of watch on one connection: the samples since
+// its first, with the view that began it. lastNs is the time of the latest
+// sample, so a gap between two samples can end the stretch.
+type wsoEpisode struct {
+	fromNs, lastNs       int64
+	raw, pauses, resumes int64
+	samples              int
+	onset, onsetC        string
+	rec                  *wsoStall
+}
+
+// wsoWatchStep applies one sample of one connection, taken at now (before v was
+// read), to the episode ep that is open for it (nil if none). It returns the
+// episode that is open after the sample, or nil when the connection is not
+// stallable, and whether the sample opened a new episode (the caller then sets
+// onsetC, the client's side, which this step does not read) and whether the
+// sample restarted a stretch only because of the gap (the view had not moved).
+//
+// A new episode starts when there is none, when the view moved (a read, a pause
+// or a resume), and when more than wsoWatchEvery+wsoWatchGap passed since the
+// episode's last sample: then the watcher itself was starved, and the samples
+// it missed cannot show that the engine read nothing, so the stretch restarts.
+func wsoWatchStep(ep *wsoEpisode, v wsoSrvView, now int64) (next *wsoEpisode, opened, gapRestart bool) {
+	if !wsoStallable(v) {
+		return nil, false, false
+	}
+	moved := ep == nil || v.rawRead != ep.raw || v.pauses != ep.pauses || v.resumes != ep.resumes
+	late := ep != nil && now-ep.lastNs > int64(wsoWatchEvery+wsoWatchGap)
+	if moved || late {
+		return &wsoEpisode{fromNs: now, lastNs: now, raw: v.rawRead, pauses: v.pauses, resumes: v.resumes,
+			samples: 1, onset: v.String()}, true, late && !moved
+	}
+	ep.lastNs = now
+	ep.samples++
+	return ep, false, false
+}
+
 // watch samples the server side of every joined connection every
 // wsoWatchEvery until stop is called. A stretch is a run of samples in which
 // the connection is wsoStallable and the engine read nothing (bytes received
@@ -1120,23 +1193,22 @@ func (g *wsoRig) cliMarks(port int) string {
 // against is the process itself not running: if the watcher waits more than
 // wsoWatchGap past a due tick, the process was starved of CPU, the engine
 // may have been too, and every open stretch starts over (counted as
-// watchResets on the waits line).
+// watchResets on the waits line). The same holds per connection: a stretch
+// whose next sample comes more than wsoWatchEvery+wsoWatchGap after its last
+// one (a pass that was slow, or blocked reading a view) starts over at that
+// sample (wsoWatchStep), counted as watchGapRestarts on the waits line. A
+// watch that restarts its stretches this way cannot reach wsoRecvStall, so a
+// run with many of them says nothing about a stall.
 //
 // Start it once the server listens and stop it once the clients are done:
 // the verdict is the test's, on the test goroutine.
 func (g *wsoRig) watch() (stop func() []*wsoStall) {
-	type episode struct {
-		fromNs, raw, pauses, resumes int64
-		samples                      int
-		onset, onsetC                string
-		rec                          *wsoStall
-	}
 	done, fin := make(chan struct{}), make(chan struct{})
 	var stalls []*wsoStall
 	var longest int64
 	go func() {
 		defer close(fin)
-		eps := map[*wsoSrv]*episode{}
+		eps := map[*wsoSrv]*wsoEpisode{}
 		tick := time.NewTicker(wsoWatchEvery)
 		defer tick.Stop()
 		idleFrom := g.since() // when the watcher last started waiting for a tick
@@ -1171,19 +1243,25 @@ func (g *wsoRig) watch() (stop func() []*wsoStall) {
 					delete(eps, s)
 					continue
 				}
-				v := g.srvViewOf(s)
+				// now is taken before the view is read: the sample is stamped
+				// when its reading started, so the view cannot be older than
+				// its stamp by the time a starved pass gets to it.
 				now := g.since()
-				if !wsoStallable(v) {
+				v := g.srvViewOf(s)
+				ep, opened, gapRestart := wsoWatchStep(eps[s], v, now)
+				if gapRestart {
+					g.mu.Lock()
+					g.watchGapRestarts++
+					g.mu.Unlock()
+				}
+				if ep == nil {
 					delete(eps, s)
 					continue
 				}
-				ep := eps[s]
-				if ep == nil || v.rawRead != ep.raw || v.pauses != ep.pauses || v.resumes != ep.resumes {
-					eps[s] = &episode{fromNs: now, raw: v.rawRead, pauses: v.pauses, resumes: v.resumes,
-						samples: 1, onset: v.String(), onsetC: g.cliNow(s.port)}
-					continue
+				eps[s] = ep
+				if opened {
+					ep.onsetC = g.cliNow(s.port)
 				}
-				ep.samples++
 				d := now - ep.fromNs
 				if d > longest {
 					longest = d
@@ -1259,6 +1337,7 @@ type wsoWaitStats struct {
 	recvStallMax           time.Duration // the longest stretch watch saw (see watch)
 	watchResets            int
 	watchMaxLag            time.Duration
+	watchGapRestarts       int
 }
 
 func (g *wsoRig) waitStats() wsoWaitStats {
@@ -1266,7 +1345,7 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 	var closes []time.Duration
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	st.recvStallMax, st.watchResets, st.watchMaxLag = g.stallMax, g.watchResets, g.watchMaxLag
+	st.recvStallMax, st.watchResets, st.watchMaxLag, st.watchGapRestarts = g.stallMax, g.watchResets, g.watchMaxLag, g.watchGapRestarts
 	for _, cl := range g.clis {
 		cl.mu.Lock()
 		st.conns++
@@ -1298,7 +1377,7 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 
 func (st wsoWaitStats) String() string {
 	r := func(d time.Duration) string { return d.Round(time.Millisecond).String() }
-	return fmt.Sprintf("waits: conns=%d fcMax=%s cwMax=%s maxNoProg=%s fcSlices=%d drainedWhileWaiting=%d closeP50=%s closeP99=%s closeMax=%s closeOver%s=%d closeSilentOver%s=%d maxCloseGap=%s recvStallMax=%s watchResets=%d watchMaxLag=%s",
+	return fmt.Sprintf("waits: conns=%d fcMax=%s cwMax=%s maxNoProg=%s fcSlices=%d drainedWhileWaiting=%d closeP50=%s closeP99=%s closeMax=%s closeOver%s=%d closeSilentOver%s=%d maxCloseGap=%s recvStallMax=%s watchResets=%d watchMaxLag=%s watchGapRestarts=%d",
 		st.conns, r(st.fcMax), r(st.cwMax), r(st.maxNoProg), st.fcSlices, st.drainedBytes, r(st.closeP50), r(st.closeP99), r(st.closeMax),
-		wsoCloseSlow, st.closeSlow, wsoCloseSlow, st.closeSilentSlow, r(st.maxCloseGap), r(st.recvStallMax), st.watchResets, r(st.watchMaxLag))
+		wsoCloseSlow, st.closeSlow, wsoCloseSlow, st.closeSilentSlow, r(st.maxCloseGap), r(st.recvStallMax), st.watchResets, r(st.watchMaxLag), st.watchGapRestarts)
 }
