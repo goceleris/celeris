@@ -1007,7 +1007,7 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, err error) {
 			writeErrorResponse(write, 413, "Request body too large")
 			return false, fmt.Errorf("chunked body exceeds %d byte limit", limit)
 		}
-		s.chunkBuf = append(s.chunkBuf, chunk...)
+		s.appendChunk(chunk)
 	}
 	if pos > head {
 		// Drop what was decoded: the undecoded rest moves down behind the head.
@@ -1016,6 +1016,19 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, err error) {
 		s.buffer.Truncate(head + k)
 	}
 	return done, nil
+}
+
+// appendChunk adds a decoded chunk to chunkBuf, doubling its capacity as
+// bytes.Buffer does: append's growth for a large slice is 1.25x, which cost a
+// 64 KiB body in sixteen chunks 8 allocations and twice the bytes of the
+// bytes.Buffer this replaced (RULE 74 A/B, logs/bench-ab.log).
+func (s *H1State) appendChunk(chunk []byte) {
+	if need := len(s.chunkBuf) + len(chunk); need > cap(s.chunkBuf) {
+		nb := make([]byte, len(s.chunkBuf), max(2*cap(s.chunkBuf), need))
+		copy(nb, s.chunkBuf)
+		s.chunkBuf = nb
+	}
+	s.chunkBuf = append(s.chunkBuf, chunk...)
 }
 
 // checkPartialChunk bounds what an incomplete chunk may make the server hold.
