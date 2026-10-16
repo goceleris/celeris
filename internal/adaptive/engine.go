@@ -1108,10 +1108,15 @@ func (e *Engine) maybeThawLocked() {
 // sub-engine Shutdown comes after the late one, so the ctx it hands epoll as
 // the drain budget is the one that stays.
 //
-// The error depends on where ctx ended. Behind a switch, before Shutdown has
-// mu, it is ctx's error. Once Shutdown has mu, ctx ending while it waits for
-// Listen to unwind gives the result of the sub-engines' Shutdown, which is nil
-// for epoll and io_uring; Server.Shutdown reports ctx's error in both cases.
+// ctx ending makes Shutdown return ctx's error on both paths (celeris#886
+// item 15), so the caller can tell a Shutdown that was cut short from one that
+// finished. Behind a switch, before Shutdown has mu, it returns ctx.Err() and
+// leaves the rest to the queued goroutine. Once Shutdown has mu, ctx ending
+// while it waits for Listen to unwind does not skip the rest: it still stops
+// the sub-engines as it does when Listen unwinds in time, and then returns
+// ctx.Err(), joined with any error those sub-engines returned (epoll and
+// io_uring return nil). A ctx that ends after Listen has unwound does not
+// change the result: that Shutdown finished.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	// An engine shut down without ever being started still holds its port
 	// (celeris#616); an engine that was started gives it back when Listen
@@ -1143,12 +1148,21 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+	var ctxErr error
 	if done != nil {
 		select {
 		case <-done:
 		case <-ctx.Done():
 			// Honour the caller's deadline even if Listen is slow to unwind;
-			// the ProcStat closed-flag still makes a late Sample safe.
+			// the ProcStat closed-flag still makes a late Sample safe. The
+			// sub-engines are still stopped below, and ctx's error is the
+			// result, as when ctx ends behind a switch (lockForShutdown).
+			// A Listen that returned at the same moment counts as unwound.
+			select {
+			case <-done:
+			default:
+				ctxErr = ctx.Err()
+			}
 		}
 	}
 
@@ -1163,7 +1177,14 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	e.standbyCancels = nil
 	e.mu.Unlock()
 
-	return stopSubEngines(ctx, primary, secondary, standbyCancels)
+	err := stopSubEngines(ctx, primary, secondary, standbyCancels)
+	if ctxErr != nil {
+		if err == nil {
+			return ctxErr
+		}
+		return errors.Join(ctxErr, err)
+	}
+	return err
 }
 
 // stopSubEngines stops what Shutdown's snapshot holds.
