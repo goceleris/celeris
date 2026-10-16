@@ -13,9 +13,15 @@ package eventloop
 // arrived, so Phase A finds nothing:
 //
 //	ReplyAtOnce:  the responder writes as soon as it wakes (tens of
-//	              microseconds after the request): Phase B usually reads it
-//	ReplyAfter200us: the responder spins 200us first: Phase B's 16 rounds miss
-//	              and Phase C's poll(1ms) reads it
+//	              microseconds after the request). WriteAndPoll: its single
+//	              Phase A read misses, Phase B's hook runs on every call and
+//	              Phase C's on some. WriteAndPollBusy: its Phase A is 64 tight
+//	              reads (about 15us), which usually catch this reply, so the
+//	              hook runs on few calls (measured: 6 to 8 of 300 on arm64);
+//	              this row mostly measures its fast path
+//	ReplyAfter200us: the responder spins 200us first: both calls miss in Phase A
+//	              and Phase B, and Phase C's poll(1ms) reads it; both hooks
+//	              run on every call
 //
 // This file calls no hook and no code of this change, so the same file builds
 // on the base commit and the A/B runs compare the two binaries on identical
@@ -98,13 +104,13 @@ func BenchmarkWriteAndPollSlow890(b *testing.B) {
 				for b.Loop() {
 					got = 0
 					ok, err := bc.call(w, fd, req, rbuf, onRecv)
-					if !ok || err != nil {
-						b.Fatalf("%s: (%v, %v)", bc.name, ok, err)
+					if err != nil || (!ok && got > 0) {
+						b.Fatalf("%s: (%v, %v) after %d bytes", bc.name, ok, err, got)
 					}
 					if got < len(resp) {
 						// The call gave up before the reply arrived (poll(1ms)
-						// timed out). Collect the reply so the next op starts
-						// clean, and count the miss.
+						// timed out: (false, nil)). Collect the reply so the
+						// next op starts clean, and count the miss.
 						misses++
 						pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 						for got < len(resp) {

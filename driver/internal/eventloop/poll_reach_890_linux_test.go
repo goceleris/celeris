@@ -37,6 +37,11 @@ func TestSlowPathBenchShapeReachesThePollHook890(t *testing.T) {
 			{"ReplyAtOnce", 0, true, false},
 			{"ReplyAfter200us", 200 * time.Microsecond, true, true},
 		} {
+			// WriteAndPollBusy's Phase A is 64 tight reads: they catch an
+			// immediate reply, so only the delayed reply must reach its hooks.
+			if bc.name == "WriteAndPollBusy" && d.delay == 0 {
+				d.wantB = false
+			}
 			t.Run(bc.name+"/"+d.name, func(t *testing.T) {
 				fd, peer := socketPair(t)
 				t.Cleanup(func() { _ = unix.Close(fd); _ = unix.Close(peer) })
@@ -64,8 +69,12 @@ func TestSlowPathBenchShapeReachesThePollHook890(t *testing.T) {
 				for i := range n {
 					got := 0
 					ok, err := bc.call(w, fd, req, rbuf, func(p []byte) { got += len(p) })
-					if !ok || err != nil {
-						t.Fatalf("call %d: (%v, %v)", i, ok, err)
+					// (false, nil) is a call that gave up before the reply
+					// (Phase C's poll(1ms) timed out, which a slow host or
+					// -race can cause with a 200us reply); it still reached
+					// the hooks, and the reply is collected below.
+					if err != nil || (!ok && got > 0) {
+						t.Fatalf("call %d: (%v, %v) after %d bytes", i, ok, err, got)
 					}
 					// If the call gave up before the reply (Phase C timed out),
 					// collect it so the next call starts clean.
