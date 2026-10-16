@@ -443,7 +443,13 @@ func (w *worker) shutdown() error {
 	// no-op: a Write that passed its w.closed check before Loop.Close began
 	// can still reach enqueueFlush now (celeris#862).
 	w.wakeFD.Close()
+	if h := testHookAfterWakeClose; h != nil {
+		h()
+	}
 	if w.epollFD >= 0 {
+		if h := testHookBeforeEpollClose; h != nil {
+			h()
+		}
 		if err := unix.Close(w.epollFD); err != nil && first == nil {
 			first = err
 		}
@@ -519,6 +525,9 @@ func (w *worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	var err error
 	c.mu.Lock()
 	if !c.closed {
+		if h := testHookInAdd; h != nil {
+			h(fd)
+		}
 		ev := c.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
 		err = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_ADD, fd, &ev)
 		if err != nil {
@@ -587,6 +596,9 @@ func (w *worker) forget(c *driverConn) {
 	if cur, ok := w.conns[c.fd]; ok && cur == c {
 		delete(w.conns, c.fd)
 		if w.epollFD >= 0 {
+			if h := testHookBeforeDel; h != nil {
+				h(c.fd)
+			}
 			_ = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_DEL, c.fd, nil)
 		}
 	}
@@ -862,6 +874,9 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
+		if h := testHookBeforePoll; h != nil {
+			h(fd, 'B')
+		}
 		for range 16 {
 			pfd[0].Revents = 0
 			np, perr := unix.Poll(pfd[:], 0)
@@ -891,6 +906,9 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
+		if h := testHookBeforePoll; h != nil {
+			h(fd, 'C')
+		}
 		np, perr := unix.Poll(pfd[:], 1)
 		if np > 0 && perr == nil && pfd[0].Revents&unix.POLLIN != 0 {
 			for {
@@ -1053,6 +1071,9 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
+		if h := testHookBeforePoll; h != nil {
+			h(fd, 'B')
+		}
 		for range 16 {
 			pfd[0].Revents = 0
 			np, perr := unix.Poll(pfd[:], 0)
@@ -1082,6 +1103,9 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
+		if h := testHookBeforePoll; h != nil {
+			h(fd, 'C')
+		}
 		np, perr := unix.Poll(pfd[:], 1)
 		if np > 0 && perr == nil && pfd[0].Revents&unix.POLLIN != 0 {
 			for {
