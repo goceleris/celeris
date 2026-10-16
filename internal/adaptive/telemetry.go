@@ -17,10 +17,22 @@ type TelemetrySnapshot struct {
 	ThroughputRPS float64
 	// ErrorRate is the engine's fault rate over the last sampling interval:
 	// errors counted by the engine, less the sends to peers that had already
-	// gone away (see revertErrors), per request. It drives the error-rate
-	// safety revert, so it is a measure of the ENGINE failing, not of the
-	// clients leaving. It is not capped at 1: it is a ratio of two counters.
+	// gone away (see revertErrors), divided by RateDenominator (see faultRate:
+	// the larger of the interval's requests and its connection-seconds). It
+	// drives the error-rate safety revert, so it is a measure of the ENGINE
+	// failing, not of the clients leaving. It is not capped at 1: it is a
+	// ratio of two counters.
 	ErrorRate float64
+	// RateDenominator is what ErrorRate was divided by: max(requests,
+	// ConnSeconds) of the interval, 0 on the first sample of an engine and for
+	// an interval with neither. The controller logs it with a switch so the
+	// rate can be recomputed from the line (celeris#886 item 9).
+	RateDenominator float64
+	// ConnSeconds is the interval's connection-seconds: the live connections
+	// integrated over its length, estimated as the mean of the gauge at the
+	// two samples times the elapsed seconds (see connSeconds). 0 on the first
+	// sample of an engine.
+	ConnSeconds float64
 	// ActiveConnections is the current number of open connections.
 	ActiveConnections int64
 	// CPUUtilization is the estimated CPU usage fraction (0.0-1.0). Read from
@@ -99,6 +111,16 @@ type liveSampler struct {
 	prevMetrics map[engine.EngineType]engine.EngineMetrics
 	prevTime    map[engine.EngineType]time.Time
 	cpuMon      engine.CPUMonitor
+	// clock is the time source, nil for time.Now; tests set it to control the
+	// length of a sampling interval.
+	clock func() time.Time
+}
+
+func (s *liveSampler) now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
 }
 
 // revertErrors is the part of m.ErrorCount that says the ENGINE is failing,
@@ -108,13 +130,13 @@ type liveSampler struct {
 // with EPIPE, ECONNRESET, ECONNABORTED or ENOTCONN is a client that left
 // before the response flushed. That is a property of the client population,
 // and a streaming workload (SSE, a WebSocket hub) produces a burst of them
-// whenever its subscribers drop at once, while the HTTP request count it is
-// divided by is a handful of subscriptions. The ratio then reads 0.056 to 355
-// with every client request answered, and the revert fires on an engine that
-// is serving. epoll never counts it (celeris#645), so leaving it out removes the
-// send-side asymmetry between the two engines' rates. send_peer_gone stays in
-// ErrorCount and in its own bucket: Metrics() and the published series still
-// show it.
+// whenever its subscribers drop at once, while the HTTP request count that
+// used to be the whole denominator is a handful of subscriptions. The ratio
+// then read 0.056 to 355 with every client request answered, and the revert
+// fired on an engine that was serving. epoll never counts it (celeris#645), so
+// leaving it out removes the send-side asymmetry between the two engines'
+// rates. send_peer_gone stays in ErrorCount and in its own bucket: Metrics()
+// and the published series still show it.
 //
 // Everything else in ErrorCount stays in the rate, an accept that failed with
 // ECONNABORTED (a peer that reset between SYN and accept) among it: both
@@ -122,6 +144,8 @@ type liveSampler struct {
 // place and counts it). The controller reads the rate only while io_uring is
 // the active engine, so on epoll that count changes the published figures and
 // nothing a switch or revert decides on.
+//
+// What the part is divided by is faultRate's business (celeris#886 item 9).
 func revertErrors(m engine.EngineMetrics) uint64 {
 	return satSub(m.ErrorCount, m.ErrorSendPeerGone)
 }
@@ -134,6 +158,50 @@ func satSub(a, b uint64) uint64 {
 		return 0
 	}
 	return a - b
+}
+
+// connSeconds is the live connections integrated over an interval of elapsed
+// seconds, estimated from the gauge at its two ends: the trapezoid, mean of
+// the two readings times the length. The sampler sees only the two readings,
+// so a connection that opened and closed between them is not in it (the
+// requests it made are, in the request count). A gauge that reads negative
+// counts as 0.
+func connSeconds(prevActive, curActive int64, elapsed float64) float64 {
+	return float64(max(prevActive, 0)+max(curActive, 0)) / 2 * elapsed
+}
+
+// faultRate is the error rate the safety revert compares with errorRevertRate:
+// faults divided by max(reqs, connSecs), and that divisor (celeris#886 item 9).
+//
+// A request/response workload keeps its rate per request. A streaming
+// workload (SSE, a WebSocket hub) is a handful of requests, the subscriptions,
+// holding many connections for a long time, and a real send fault on it was
+// divided by that handful: 7 faults over 10 requests and 200 connections read
+// 0.7 and reverted an engine that was serving. Each live connection-second now
+// counts as one unit of work, as a request does, so the same interval reads
+// 7/200 = 0.035. Both measures are totals over the same interval, so
+// which of them is the larger is a comparison of two per-second rates and does
+// not depend on how long the interval is (the first interval after a switch is
+// as long as the cooldown).
+//
+// The weight is 1 because the revert's own unit is "a fault per unit of
+// work", and a connection that is open for a second is a unit of work as much
+// as a request is: with it, any workload that averages at least one request
+// per connection per second keeps exactly the rate it had. Below that
+// (thousands of mostly idle keep-alive connections) the rate is lower than it
+// was, by the factor reqs/connSecs, so the revert is less sensitive there:
+// the cost of not reading a streaming workload as faulty.
+//
+// An interval with no request used to have rate 0 whatever the faults. It now
+// has the faults per connection-second, so faults on a stream with no new
+// request count. An interval with neither requests nor connections (nothing
+// to divide by) is 0, and so is one whose counters fell (satSub).
+func faultRate(faults, reqs uint64, connSecs float64) (rate, denom float64) {
+	denom = max(float64(reqs), connSecs)
+	if denom <= 0 {
+		return 0, 0
+	}
+	return float64(faults) / denom, denom
 }
 
 func newLiveSampler(cpuMon engine.CPUMonitor) *liveSampler {
@@ -156,11 +224,11 @@ func newLiveSampler(cpuMon engine.CPUMonitor) *liveSampler {
 func (s *liveSampler) Rebase(e engine.Engine) {
 	et := e.Type()
 	s.prevMetrics[et] = e.Metrics()
-	s.prevTime[et] = time.Now()
+	s.prevTime[et] = s.now()
 }
 
 func (s *liveSampler) Sample(e engine.Engine) TelemetrySnapshot {
-	now := time.Now()
+	now := s.now()
 	m := e.Metrics()
 	et := e.Type()
 
@@ -186,8 +254,9 @@ func (s *liveSampler) Sample(e engine.Engine) TelemetrySnapshot {
 			snap.ThroughputRPS = float64(deltaReqs) / elapsed
 			snap.AcceptRate = float64(deltaAccepts) / elapsed
 			snap.ErrorDelta = errorDeltas(&m, &prev)
+			snap.ConnSeconds = connSeconds(prev.ActiveConnections, m.ActiveConnections, elapsed)
+			snap.ErrorRate, snap.RateDenominator = faultRate(deltaErrs, deltaReqs, snap.ConnSeconds)
 			if deltaReqs > 0 {
-				snap.ErrorRate = float64(deltaErrs) / float64(deltaReqs)
 				snap.BytesPerReq = float64(deltaBytes) / float64(deltaReqs)
 			}
 		}

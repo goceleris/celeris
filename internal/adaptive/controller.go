@@ -31,7 +31,9 @@ import (
 //     above errorRevertRate, regardless of load, and regardless of the
 //     standby-build backoff (celeris#656). The rate counts engine faults, not
 //     sends to peers that had already gone away (celeris#856, see
-//     revertErrors).
+//     revertErrors), per unit of work: the larger of the interval's requests
+//     and its connection-seconds, so a streaming workload with a handful of
+//     requests is not read as faulty (celeris#886 item 9, see faultRate).
 //
 // The oscillation lock (3 switches in 5 min → 5 min lock) and the post-switch
 // cooldown bound any residual thrash and hold io_uring after the fast snap.
@@ -269,7 +271,7 @@ func (c *controller) activeEngine() engine.Engine {
 }
 
 func (c *controller) logSwitch(from, to, reason string, cpw float64, snap TelemetrySnapshot) {
-	args := make([]any, 0, 14+2*len(errorBucketNames))
+	args := make([]any, 0, 18+2*len(errorBucketNames))
 	args = append(args,
 		"from", from,
 		"to", to,
@@ -277,6 +279,8 @@ func (c *controller) logSwitch(from, to, reason string, cpw float64, snap Teleme
 		"conns_per_worker", cpw,
 		"bytes_per_req", snap.BytesPerReq,
 		"error_rate", snap.ErrorRate,
+		"rate_denominator", snap.RateDenominator,
+		"conn_seconds", snap.ConnSeconds,
 		"active_connections", snap.ActiveConnections,
 	)
 	// One attr per bucket that grew in the interval, so a revert can be
