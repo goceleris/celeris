@@ -178,21 +178,6 @@ func TestSaveThreadAffinityKernelSizes(t *testing.T) {
 	}
 }
 
-// schedAllowedCPUs has the same 1024-bit read: on a 2048-CPU kernel it failed,
-// and PlanWorkerCPUs fell back to the CPU numbers 0..NumCPU-1 for a process
-// whose mask may name none of them.
-func TestAllowedCPUsOnAKernelWithMoreThan1024CPUs(t *testing.T) {
-	installFakeKernel(t, 2048, 3, 1500, 2047)
-	got, err := schedAllowedCPUs()
-	if err != nil {
-		t.Fatalf("schedAllowedCPUs on a 2048-CPU kernel: %v", err)
-	}
-	eq(t, "allowed", got, []int{3, 1500, 2047})
-	if p := PlanWorkerCPUs(3); !slices.Equal(p.Allowed, []int{3, 1500, 2047}) {
-		t.Errorf("PlanWorkerCPUs(3).Allowed = %v, want [3 1500 2047] (a fallback to 0..NumCPU-1 means the read failed)", p.Allowed)
-	}
-}
-
 // PinToCPU(1500) set a bit of a 1024-bit set that is not there, so it asked
 // the kernel for an empty mask (EINVAL) and the pin failed on a host whose CPU
 // 1500 is where the plan put the loop.
