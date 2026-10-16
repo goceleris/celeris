@@ -26,8 +26,11 @@ import (
 //
 // A worker that waits for a SEND's completion with no timeout (waitUntimed,
 // mode 3a: the last thing it submitted is a remainder SEND to a client that
-// stopped reading) runs no iteration, so no sweep: not bounded by anything
-// here, nor on main. The partial_read arms measure it (E14_PROBE=1).
+// stopped reading) runs no iteration, so no sweep: on main nothing bounded it
+// (the sync and partial_read arms stayed open for 130 s and more). Since
+// celeris#884 item 62 flushSend marks a remainder or a long SEND
+// (remainderWatch), which keeps the worker out of that wait, so the sweep
+// comes for it.
 //
 // Each arm: one conn (pipelined: busy811Conns, the count that kept the old
 // worker spinning on the default configuration), a 3 MiB response nobody

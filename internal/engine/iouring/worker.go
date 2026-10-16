@@ -538,7 +538,8 @@ type Worker struct {
 	// worker has stopped, as the witness that a benchmark exercised the path.
 	dirtySendGiveUps uint64
 	// sendWatch is set when the dirty pass gives up a conn whose SEND is
-	// outstanding (celeris#811) and re-derived by every timeout sweep (set
+	// outstanding (celeris#811), and by flushSend for a remainder or long
+	// SEND (celeris#884 item 62), and re-derived by every timeout sweep (set
 	// while a conn has a SEND or SEND_ZC notification outstanding). While it is
 	// set the loop also sweeps about every 1 to 2 s (once lastSweep, UnixNano of
 	// the last sweep, is a second old, checked on every 8th iteration;
@@ -1507,13 +1508,19 @@ func (w *Worker) run(ctx context.Context) {
 			// Non-SQPOLL path: 4-mode adaptive submit.
 			// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
 			// 2. CQEs already ready, nothing pending → skip syscall entirely
-			// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg)
+			// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg), unless
+			//     a long SEND or a partial send's remainder is outstanding
+			//     (remainderWatch, celeris#884 item 62): its CQE is the
+			//     peer's to give
 			// 3b. No CQEs + no SENDs → SubmitAndWaitTimeout() (ext_arg + timeout)
 			//
 			// Modes 1 and 3a avoid ext_arg overhead: the kernel skips hrtimer
 			// setup/teardown and sigset parsing, saving ~200-500ns per call.
 			// Mode 3a is safe because SEND SQEs always produce CQEs (no
-			// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly.
+			// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly
+			// as long as the peer reads; a SEND that waits on a peer that does
+			// not (a remainder, a long SEND) takes the timed wait, so the
+			// sweep and its WriteTimeout still run.
 			// Mode 3b uses a timeout because the only pending SQEs may have
 			// CQE_SKIP_SUCCESS (e.g., CLOSE), and external events (recv, accept)
 			// need a timeout for graceful shutdown via ctx.Err() checks.
