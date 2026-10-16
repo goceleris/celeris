@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -213,7 +214,7 @@ func TestChunkedBodyStructuralCuts1029(t *testing.T) {
 				for _, offs := range cuts {
 					all = append(all, offs...)
 				}
-				sortInts1029(all)
+				slices.Sort(all)
 				_, br := send1029(t, addr, plan1029(wire, all, 3*time.Millisecond))
 				status, got := read1029(t, br)
 				if status != 200 || got != "n=5000" {
@@ -221,14 +222,6 @@ func TestChunkedBodyStructuralCuts1029(t *testing.T) {
 				}
 			})
 		})
-	}
-}
-
-func sortInts1029(a []int) {
-	for i := 1; i < len(a); i++ {
-		for j := i; j > 0 && a[j] < a[j-1]; j-- {
-			a[j], a[j-1] = a[j-1], a[j]
-		}
 	}
 }
 

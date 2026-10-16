@@ -331,8 +331,9 @@ func (s *H1State) TakeBufferedBytes() []byte {
 }
 
 // HasPendingData reports whether ProcessH1 left partial-request state that a
-// subsequent recv must continue (buffered headers awaiting more bytes, or a
-// fixed-length body still accumulating). The engine uses it after an inline
+// subsequent recv must continue (buffered headers awaiting more bytes, a
+// fixed-length body still accumulating, or a chunked body in progress, whose
+// head and undecoded bytes are in the buffer). The engine uses it after an inline
 // ProcessH1 to decide whether to promote the conn to its dispatch goroutine
 // for the continuation (so the partial-state parse paths never run inline).
 func (s *H1State) HasPendingData() bool {
@@ -678,6 +679,10 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			// Entry did not arm the header deadline (a body was in progress):
 			// what follows the terminator starts the next request's head.
 			state.ArmHeaderDeadline()
+		} else if state.buffer.Cap() > maxRetainedChunkedBuffer {
+			// The buffer grew to hold one large chunk. Do not keep it for the
+			// life of the connection.
+			state.buffer = bytes.Buffer{}
 		}
 		data = nil
 	}
@@ -943,6 +948,10 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	}
 	return nil
 }
+
+// maxRetainedChunkedBuffer is the capacity of state.buffer above which a
+// chunked request that has just been served gives its backing array up.
+const maxRetainedChunkedBuffer = 64 << 10
 
 // errChunkedHeadChanged is returned when the head of a chunked request, held in
 // state.buffer while its body arrives, does not parse again to the same length.

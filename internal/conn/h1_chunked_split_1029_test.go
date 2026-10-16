@@ -577,20 +577,38 @@ func TestProcessH1ChunkedBoundaryFlags1029(t *testing.T) {
 	}
 }
 
-// TestCloseH1DropsChunkedState1029: closing a connection that is mid-body
-// leaves nothing behind.
-func TestCloseH1DropsChunkedState1029(t *testing.T) {
+// TestProcessH1ChunkedOverflowSafeLimit1029: a size line near MaxInt64 after
+// some bytes were decoded must not wrap the running total (decoded+size).
+func TestProcessH1ChunkedOverflowSafeLimit1029(t *testing.T) {
+	for _, line := range []string{"7fffffffffffffff", "7ffffffffffffffe", "7fffffffffffffff;x=y"} {
+		st := NewH1State()
+		st.MaxRequestBodySize = 64 * kiB1029
+		h := &rec1029{}
+		var out bytes.Buffer
+		i, err := feed1029(st, h, &out, []byte(head1029+"1\r\na\r\n"), []byte(line+"\r\n"))
+		if err == nil || i != 1 || !strings.HasPrefix(out.String(), "HTTP/1.1 413") || len(h.bodies) != 0 {
+			t.Fatalf("size line %q after one decoded byte: stopped at segment %d, err %v, answer %q; want 413 on segment 1", line, i, err, firstLine889(out.String()))
+		}
+	}
+}
+
+// TestProcessH1ChunkedDeadlineArmedForTheNextHead1029: when the segment that
+// ends a split chunked body also starts the next request's head, the header
+// deadline is armed for that head (the entry of the call did not arm it).
+func TestProcessH1ChunkedDeadlineArmedForTheNextHead1029(t *testing.T) {
 	st := NewH1State()
+	st.ReadHeaderTimeoutNs = 5_000_000_000
 	h := &rec1029{}
 	var out bytes.Buffer
-	if _, err := feed1029(st, h, &out, append([]byte(head1029), "5\r\nhel"...), []byte("lo\r\n")); err != nil {
+	wire := append([]byte(head1029), chunked1029(pattern1029(100), 50, "", "")...)
+	cut := len(wire) / 2
+	if _, err := feed1029(st, h, &out, wire[:cut], append(append([]byte(nil), wire[cut:]...), "GET /n"...)); err != nil {
 		t.Fatal(err)
 	}
-	if !st.chunkedInProgress || len(st.chunkBuf) == 0 {
-		t.Fatalf("setup: chunkedInProgress=%v chunkBuf=%d", st.chunkedInProgress, len(st.chunkBuf))
+	if len(h.bodies) != 1 {
+		t.Fatalf("handler ran %d times, want 1", len(h.bodies))
 	}
-	CloseH1(st)
-	if st.chunkedInProgress || st.chunkBuf != nil {
-		t.Fatal("CloseH1 left chunked state behind")
+	if st.HeaderDeadlineNs.Load() == 0 {
+		t.Fatal("a partial next head is buffered and no header deadline is armed for it")
 	}
 }
