@@ -58,3 +58,22 @@ func BenchmarkCompressETag200AE888(b *testing.B) {
 func BenchmarkCompressETag304AE888(b *testing.B) {
 	benchChain888(b, etagChain888(), "/", "accept-encoding", "gzip", "if-none-match", "*")
 }
+
+// The common fast path of compress: it negotiates an encoding and then does
+// not encode, because the body is under MinLength (a JSON error, a small API
+// answer). The only new work of celeris#888 item 36 on it is the context key
+// compress sets (a map store, and the clear of a non-empty map at release);
+// the no-Accept-Encoding row is the same chain without it.
+func smallBodyChain888() []celeris.HandlerFunc {
+	body := []byte(`{"ok":true,"id":42}`)
+	return []celeris.HandlerFunc{New(), func(c *celeris.Context) error {
+		return c.Blob(200, "application/json", body)
+	}}
+}
+
+func BenchmarkCompressSmallBodyAE888(b *testing.B) {
+	benchChain888(b, smallBodyChain888(), "/", "accept-encoding", "gzip")
+}
+func BenchmarkCompressSmallBodyNoAE888(b *testing.B) {
+	benchChain888(b, smallBodyChain888(), "/")
+}
