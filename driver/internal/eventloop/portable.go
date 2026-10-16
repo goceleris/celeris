@@ -388,9 +388,15 @@ func (w *portableWorker) Write(fd int, data []byte) error {
 // onClose(err): firing it here instead would run onClose while the reader is
 // still delivering onRecv. No lock is held across the close or the callback.
 // The placeholder register puts in the table while it opens the net.Conn
-// (conn == nil) has no onClose and no reader, so there is nothing to close and
-// nothing to report: register sees the worker closed, or the open fail, and
-// drops it (celeris#890).
+// (conn == nil) has no onClose and no reader, so for it this only marks it
+// closing: there is nothing to close and nothing to report. shutdown and
+// UnregisterConn both reach it. After shutdown's table swap register sees the
+// worker closed and drops the conn it opened; a failed open drops the
+// placeholder itself. An UnregisterConn that finds the placeholder deletes it
+// and returns nil, but register's second section checks only the worker's
+// closed flag, not that the placeholder is still in the table, so it installs
+// the opened conn and starts its reader anyway: that UnregisterConn is lost
+// (celeris#890).
 func (c *portableConn) shutdownConn(err error) {
 	c.mu.Lock()
 	if c.closing {
