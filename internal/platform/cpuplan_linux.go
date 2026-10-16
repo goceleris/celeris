@@ -144,15 +144,15 @@ func planWorkerCPUs(numWorkers int, src planSource) CPUPlan {
 	}
 	plan.Heterogeneous = true
 	plan.Little = little
+	// AB ARM C1 (throwaway): there are never more loops than non-little CPUs.
+	// The plan has min(numWorkers, len(big)) entries, every one pinned; the
+	// engines start len(plan.CPUs) loops.
 	pinned := min(numWorkers, len(big))
-	plan.CPUs = make([]int, numWorkers)
+	plan.CPUs = make([]int, pinned)
 	copy(plan.CPUs, big[:pinned])
-	for i := pinned; i < numWorkers; i++ {
-		plan.CPUs[i] = -1
-	}
 	plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
-		"%d of %d loops pinned to the other allowed CPUs %s, %d left unpinned",
-		capNote, FormatCPUs(little), pinned, numWorkers, FormatCPUs(big), numWorkers-pinned)
+		"%d loops (of %d requested) pinned to the other allowed CPUs %s, none unpinned",
+		capNote, FormatCPUs(little), pinned, numWorkers, FormatCPUs(big))
 	return plan
 }
 

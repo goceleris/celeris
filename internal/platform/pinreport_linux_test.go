@@ -26,7 +26,7 @@ func TestLogPinOutcome(t *testing.T) {
 	LogPinOutcome(log, "epoll", p, nil)
 	out := buf.String()
 	if strings.Count(out, "\n") != 1 || !strings.Contains(out, "level=INFO") ||
-		!strings.Contains(out, "little CPUs 2-5") || !strings.Contains(out, "8 of 12 loops pinned") {
+		!strings.Contains(out, "little CPUs 2-5") || !strings.Contains(out, "8 loops (of 12 requested) pinned") {
 		t.Fatalf("heterogeneous plan: want one INFO line naming the little CPUs, got:\n%s", out)
 	}
 

@@ -96,9 +96,9 @@ func eq(t *testing.T, what string, got, want any) {
 
 func TestPlanMSR1LikeAvoidsLittleCPUs(t *testing.T) {
 	h := msr1(t, rng(0, 11))
-	// 12 loops: the 8 big CPUs are pinned in order, the other 4 loops run unpinned.
+	// 12 requested (AB ARM C1): the plan holds 8 loops, one per big CPU, none unpinned.
 	p := planWorkerCPUs(12, h.src())
-	eq(t, "cpus(12)", p.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1})
+	eq(t, "cpus(12)", p.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
 	eq(t, "little", p.Little, []int{2, 3, 4, 5})
 	if !p.Heterogeneous || p.Note == "" {
 		t.Errorf("heterogeneous=%v note=%q, want true and a reason", p.Heterogeneous, p.Note)
@@ -110,7 +110,7 @@ func TestPlanMSR1LikeAvoidsLittleCPUs(t *testing.T) {
 	eq(t, "cpus(4)", planWorkerCPUs(4, h.src()).CPUs, []int{0, 1, 6, 7})
 	eq(t, "cpus(8)", planWorkerCPUs(8, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
 	// One more loop than big CPUs does not wrap onto them.
-	eq(t, "cpus(9)", planWorkerCPUs(9, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, -1})
+	eq(t, "cpus(9)", planWorkerCPUs(9, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
 	eq(t, "cpus(0)", planWorkerCPUs(0, h.src()).CPUs, []int{})
 }
 
@@ -230,7 +230,7 @@ func TestPlanCPUInfoFallback(t *testing.T) {
 	h := newFakeHost(t, rng(0, 11))
 	h.cpuinfo(parts)
 	p := planWorkerCPUs(12, h.src())
-	eq(t, "cpus", p.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1})
+	eq(t, "cpus", p.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
 	eq(t, "little", p.Little, []int{2, 3, 4, 5})
 	// A mask of the A520s only is homogeneous.
 	h = newFakeHost(t, rng(2, 5))

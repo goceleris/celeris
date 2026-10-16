@@ -384,6 +384,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// allowed set, and on a big.LITTLE host never a little CPU.
 	plan := planWorkerCPUs(resolved.Workers)
 	cpus := plan.CPUs
+	// AB ARM C1 (throwaway): the plan may hold fewer loops than requested.
+	resolved.Workers = len(cpus)
 
 	// Probe for the highest working tier by test-creating a ring.
 	tier := e.tier
