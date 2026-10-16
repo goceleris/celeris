@@ -226,6 +226,43 @@ var testHookEventTurnBusy func(fd int)
 // the call, cleared after it returns.
 var testHookAfterRearm func(fd int)
 
+// The hooks below are nil-by-default package variables like the ones above.
+// A test sets one before it creates the worker (or, for testHookBeforePoll,
+// before the call) and clears it after the worker is shut down. Several run
+// with a lock held: their doc says which, and a hook must not take that lock
+// or wait for a goroutine that does (celeris#890).
+
+// testHookBeforePoll, when non-nil, runs in WriteAndPoll and WriteAndPollBusy
+// once before the Phase B poll(0) rounds and once before the Phase C poll(1ms),
+// with phase 'B' or 'C', on the caller's goroutine with recvMu held and no
+// other lock. Tests only (celeris#890): it opens the window between a call's
+// last read and its poll, where a teardown plus a new socket on the number
+// would make the poll report the new socket's bytes.
+var testHookBeforePoll func(fd int, phase byte)
+
+// testHookBeforeDel, when non-nil, runs in forget immediately before the
+// EPOLL_CTL_DEL, with w.mu held for writing. Tests only (celeris#890): a
+// competing UnregisterConn of the same fd must not return while it is held,
+// because a miss on the map promises that the DEL is done.
+var testHookBeforeDel func(fd int)
+
+// testHookBeforeEpollClose, when non-nil, runs in shutdown after every conn is
+// marked closed and before the epoll fd is closed, with w.mu held. Tests only
+// (celeris#890): a late EPOLL_CTL_MOD or ADD must find its conn closed by now.
+var testHookBeforeEpollClose func()
+
+// testHookAfterWakeClose, when non-nil, runs in shutdown right after the wake
+// eventfd is closed, with w.mu held. Tests only (celeris#890): the number the
+// eventfd had is free, a test can put another descriptor on it, and a wake
+// that still names the old number would write to that descriptor.
+var testHookAfterWakeClose func()
+
+// testHookInAdd, when non-nil, runs in RegisterConn inside the c.mu section,
+// after the closed check and before the EPOLL_CTL_ADD, with c.mu held. Tests
+// only (celeris#890): Close and UnregisterConn must wait for the section, so
+// neither returns while the hook is held.
+var testHookInAdd func(fd int)
+
 // readOpen reads c.fd into buf unless c has been torn down, in which case it
 // returns engine.ErrUnknownFD without reading. The closed check and the read
 // are one critical section under c.rmu, a lock every teardown takes to set
