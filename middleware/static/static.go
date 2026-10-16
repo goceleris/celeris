@@ -33,14 +33,26 @@ type cachedFile struct {
 	etag            string
 	lastModifiedStr string
 	modTime         time.Time
+	// rep is what a response marks itself with for compress (see
+	// markCompressible). The mark is a pointer to this field, not to the
+	// cachedFile: the mark lands in the context's keys, which Context.Keys
+	// hands to user code, and a middleware that prints every value would
+	// print data, up to maxFSFileSize bytes.
+	rep representation
 }
 
-// CompressibleRepresentation answers middleware/compress, which asks the value
-// marked on a response (compressibleKey) for the size and content type of the
-// identity bytes: a 304 has neither, and compress decides on them whether it
-// would have encoded the 200 (celeris#888 item 36).
-func (f *cachedFile) CompressibleRepresentation() (size int, contentType string) {
-	return len(f.data), f.contentType
+// representation is the mark: the size and content type of the identity bytes
+// of a file. compress asks it for them (CompressibleRepresentation): a 304 has
+// neither, and compress decides on them whether it would have encoded the 200
+// (celeris#888 item 36).
+type representation struct {
+	size        int
+	contentType string
+}
+
+// CompressibleRepresentation answers middleware/compress.
+func (r *representation) CompressibleRepresentation() (size int, contentType string) {
+	return r.size, r.contentType
 }
 
 // compressibleKey is the context key under which static, and middleware/etag,
@@ -73,7 +85,7 @@ func markCompressible(c *celeris.Context, f *cachedFile, etag, lastModified stri
 			return
 		}
 	}
-	c.Set(compressibleKey, f)
+	c.Set(compressibleKey, &f.rep)
 }
 
 // maxFSFileSize caps in-memory reads from fs.FS to 100 MB.
@@ -504,6 +516,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 			etag:            etag,
 			lastModifiedStr: lastModifiedStr,
 			modTime:         modTime,
+			rep:             representation{size: len(data), contentType: contentType},
 		}
 		// filePath is a sub-slice of c.Path(), which on the native engines is
 		// a zero-copy view over the connection's read buffer. sync.Map retains

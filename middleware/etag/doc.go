@@ -19,10 +19,11 @@
 //   - Skip / SkipPaths: bypass buffering for dynamic conditions or for
 //     exact paths (e.g. large downloads, streaming endpoints).
 //
-// A strong tag (Strong: true, or one the handler set) on a response for a request
-// that names an encoding in Accept-Encoding is marked for the compress
-// middleware, so that its 304 carries the weak form of the tag that compress
-// gives the encoded 200 (RFC 9110 15.4.5); a weak tag needs no mark.
+// With the compress middleware in front, which has negotiated an encoding for
+// the request, a strong tag (Strong: true, or one the handler set) is marked for
+// it, so that the 304 carries the weak form of the tag that compress gives the
+// encoded 200 (RFC 9110 15.4.5). A weak tag needs no mark, and without compress
+// in front, or when it negotiated no encoding for the request, no mark is made.
 //
 // Because the body is buffered to compute the tag, etag should run INSIDE
 // compression middleware so the validator is computed on the uncompressed

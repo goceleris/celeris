@@ -287,32 +287,24 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		compressed, compErr := compressBody(encoding, body, gzipPool, brotliPool, deflatePool, zstdEncoder, &bufPool)
-		if compErr != nil {
-			// A marked response sent as it is keeps the weak tag its 304 gets
-			// (see weakenMarkedNotModified): a weak tag on identity bytes is
-			// legal, a strong tag that the 304 does not carry is not.
+		// Graceful degradation: when compression fails, or the encoded form
+		// would be no shorter (the expansion guard), the original body goes
+		// out as it is, and a failure is propagated to the caller once the
+		// response is sent, so that there is no blank page. (The encoders
+		// fail only for an encoding Config.validate rejects: in practice
+		// this is the expansion guard.) A marked response sent as it is keeps
+		// the weak tag its 304 gets (see weakenMarkedNotModified): a weak tag
+		// on identity bytes is legal, a strong tag that the 304 does not
+		// carry is not.
+		if compErr != nil || len(compressed) >= len(body) {
 			if _, ok := marked(c); ok {
 				weakenETag(c)
 			}
-			// Graceful degradation: if compression fails, flush the original
-			// uncompressed body. The compression error is propagated to the caller
-			// but the response is already sent to avoid a blank page.
 			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}
 			if err == nil {
 				err = compErr
-			}
-			return err
-		}
-
-		// Compression expansion guard.
-		if len(compressed) >= len(body) {
-			if _, ok := marked(c); ok {
-				weakenETag(c)
-			}
-			if ferr := flushWithVary(); ferr != nil && err == nil {
-				err = ferr
 			}
 			return err
 		}

@@ -39,7 +39,12 @@
 // of that handler carries the weak one: put etag below compress and let it
 // reuse the handler's tag, and the 304 follows. A marked response that compress
 // does not send encoded because the encoded form would be longer carries the
-// weak tag as well, since the 304 cannot know that length.
+// weak tag as well, since the 304 cannot know that length. The mark lives for
+// one run of the handler chain: a response that a middleware between compress
+// and the handler replays (middleware/cache, middleware/singleflight) was marked
+// when it was made, not when it is replayed, so a replayed 200 that compress
+// leaves unencoded for that reason keeps the strong tag of the stored response
+// (a cache hit and a miss of the same URL can then differ in the tag).
 //
 // The middleware buffers the response body before compressing, so it does not
 // apply to handlers that use [celeris.Context.StreamWriter]. For streaming

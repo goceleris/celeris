@@ -525,6 +525,13 @@ func (c *Context) Get(key string) (any, bool) {
 // request (a request ID, an API key, a token) is still a view of the
 // receive buffer on epoll, io_uring and Adaptive and must be copied before
 // it is kept past the handler (see the package documentation).
+//
+// Keys with the prefix "celeris." are reserved for the framework and its
+// middleware: compress, static and etag set two of them while a request is in
+// flight (so that the 304 of a compressed response carries the tag its 200
+// does), and they show up here. Do not use the prefix for your own keys; a
+// handler that sets one of them changes only how the ETag of its own response
+// is weakened.
 func (c *Context) Keys() map[string]any {
 	n := len(c.keys) + len(c.stringKeys)
 	if c.requestID != "" {
