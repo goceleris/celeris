@@ -86,7 +86,10 @@ func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Con
 	//    returns;
 	//  - a Listen that is reached closes the supplied listener: the epoll and
 	//    io_uring engines at its entry (e.cfg.Listener.Close), the std engine
-	//    through http.Server.Serve when it returns.
+	//    through http.Server.Serve when it returns, and the adaptive engine
+	//    through its start engine, the only sub-engine that is handed the
+	//    listener (internal/adaptive/engine.go). A failure inside the adaptive
+	//    engine before it calls that Listen was not traced.
 	// The ln.Close and Shutdown below are therefore redundant guards, kept so
 	// the release does not depend on which path a failure took; a second Close
 	// returns an error that is ignored, and Shutdown is safe on a server that
