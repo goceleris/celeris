@@ -189,3 +189,26 @@ func TestWriteClockSurvivesARelinkAndIsNotMovedByFlushWrites885(t *testing.T) {
 		t.Errorf("flushWrites moved the clock from %d to %d", old, r.cs.writeSince)
 	}
 }
+
+// TestFlushDirtyRestartsTheWriteClockOnlyWhenItTakesBytes885: the dirty pass is
+// the other partial-flush site (a relinked or async conn reaches it with its
+// response). A pass that takes bytes restarts the clock; one that finds the
+// socket full (EAGAIN, nothing taken) leaves it where it was.
+func TestFlushDirtyRestartsTheWriteClockOnlyWhenItTakesBytes885(t *testing.T) {
+	r := parked885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: time.Hour})
+	stale := r.cs.writeSince - int64(10*time.Second)
+	r.cs.writeSince = stale
+
+	r.l.markDirty(r.cs)
+	r.l.flushDirty() // the peer has read nothing: the socket is full
+	if r.cs.writeSince != stale {
+		t.Errorf("a dirty pass that took no bytes moved the clock from %d to %d", stale, r.cs.writeSince)
+	}
+
+	r.l.markDirty(r.cs)
+	r.read(256 << 10)
+	r.l.flushDirty()
+	if r.cs.writeSince == stale || time.Since(time.Unix(0, r.cs.writeSince)) > time.Second {
+		t.Errorf("a dirty pass that took bytes left the clock at %d (%v old), want it restarted", r.cs.writeSince, time.Since(time.Unix(0, r.cs.writeSince)))
+	}
+}
