@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -347,6 +348,15 @@ func TestUnmatchedOptionsWalksTheRouterOnce889(t *testing.T) {
 	}
 	if rw := do("GET", "/missing"); rw.status != 404 {
 		t.Errorf("GET /missing = %d, want 404", rw.status)
+	}
+
+	// What handleUnmatched relies on: with except "", a routed path always
+	// lists OPTIONS, so an empty list means no route at all.
+	if got := s.router.allowedMethods("/exists", ""); !slices.Contains(got, "OPTIONS") {
+		t.Errorf("allowedMethods(/exists, \"\") = %q, want OPTIONS among them", got)
+	}
+	if got := s.router.allowedMethods("/missing", ""); len(got) != 0 {
+		t.Errorf("allowedMethods(/missing, \"\") = %q, want none", got)
 	}
 
 	// One walk: with many custom-method trees (what a walk costs scales with
