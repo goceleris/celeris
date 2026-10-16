@@ -8,11 +8,13 @@ package eventloop
 // say whether it does (the A/B runs compare it against a base that has no
 // hook), so this test drives the same shape with the hook set and counts. Which
 // phase serves a call depends on how fast the responder's thread wakes, so the
-// counts vary from run to run (measured, arm64 container, -race -count=20 and
-// -cpu=1: Phase B's hook ran in 53% to 100% of the calls, Phase C's in 78% to
-// 100% of the delayed ones); the test asks only for 10%, which a benchmark
-// that did not reach the site would miss by far (0 of 2000 for the old
-// benchmark's shape).
+// counts vary from run to run. Measured (arm64 container, 300 calls per run,
+// -race -count=20, no-race -count=20 and -race -cpu=1 -count=10): in the
+// asserted rows Phase B's hook ran in 15% to 100% of the calls and Phase C's in
+// 80% to 100% of the delayed ones. WriteAndPollBusy/ReplyAtOnce is not asserted
+// (its 64-read Phase A usually catches the reply: Phase B ran in 1% to 92%).
+// The test asks for 5% of the calls, which a benchmark that did not reach the
+// site would miss by far (0 of 2000 for BenchmarkWriteAndPoll784's shape).
 
 import (
 	"testing"
@@ -37,7 +39,7 @@ func TestSlowPathBenchShapeReachesThePollHook890(t *testing.T) {
 		for _, d := range []struct {
 			name  string
 			delay time.Duration
-			// the phases whose hook must run in at least 10% of the calls
+			// the phases whose hook must run in at least 5% of the calls
 			wantB, wantC bool
 		}{
 			{"ReplyAtOnce", 0, true, false},
@@ -95,10 +97,10 @@ func TestSlowPathBenchShapeReachesThePollHook890(t *testing.T) {
 				}
 				testHookBeforePoll = nil
 				t.Logf("%s %s: %d calls reached Phase B's hook %d times and Phase C's %d times", bc.name, d.name, n, nB, nC)
-				if d.wantB && nB < n/10 {
+				if d.wantB && nB < n/20 {
 					t.Errorf("Phase B's hook ran %d of %d calls: this benchmark shape does not reach it", nB, n)
 				}
-				if d.wantC && nC < n/10 {
+				if d.wantC && nC < n/20 {
 					t.Errorf("Phase C's hook ran %d of %d calls: this benchmark shape does not reach it", nC, n)
 				}
 			})
