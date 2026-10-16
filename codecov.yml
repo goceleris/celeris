@@ -52,6 +52,15 @@ ignore:
   - "**/testdata/**"
   # Generated protobuf code, should any be committed.
   - "**/*.pb.go"
+  # Test-support packages: only _test.go files import them, so their lines
+  # would count as uncovered library code (celeris#907's patch read 3.52%,
+  # 218 of 219 missing lines in pintest_linux.go). celeristest (public API)
+  # and internal/testhooks (imported by the root package's context.go) stay
+  # counted.
+  - "internal/platform/pintest/**"
+  - "middleware/internal/testutil/**"
+  - "middleware/internal/fakeredis/**"
+  - "middleware/internal/fakememcached/**"
 
 # One flag per Go module, so a sub-module's number is not diluted by the
 # root module's and each can be made blocking on its own later.

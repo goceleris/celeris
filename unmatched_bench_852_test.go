@@ -13,7 +13,7 @@ type discardRW852 struct{}
 func (discardRW852) WriteResponse(*stream.Stream, int, [][2]string, []byte) error { return nil }
 
 // BenchmarkUnmatched852 measures a matched route (whose path celeris#852 does
-// not change) and the 404 / 405 answers, on an adapter built the way Start
+// not change) and the 404 / 405 / OPTIONS answers, on an adapter built the way Start
 // builds it, with no global middleware and with three that call Next (what
 // an unmatched request now runs, by design), under the sync default and
 // under AsyncHandlers (where the unmatched chain is timed like an adaptive
@@ -36,6 +36,10 @@ func BenchmarkUnmatched852(b *testing.B) {
 			{"route-200", "GET", "/exists"},
 			{"404", "GET", "/missing"},
 			{"405", "POST", "/exists"},
+			// celeris#889: the automatic OPTIONS answer, and an OPTIONS for a
+			// path with no route (a 404 that used to walk the router twice).
+			{"options-200", "OPTIONS", "/exists"},
+			{"options-404", "OPTIONS", "/missing"},
 		} {
 			b.Run(rq.name+"/"+v.name, func(b *testing.B) {
 				b.ReportAllocs()
