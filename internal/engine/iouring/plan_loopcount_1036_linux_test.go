@@ -28,7 +28,7 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 	}
 	cpus, err := pintest.AllowedCPUs()
 	if err != nil || len(cpus) < 1 {
-		t.Skipf("needs an allowed CPU, have %v (%v)", cpus, err)
+		t.Fatalf("premise: the process has no allowed CPU: %v (%v)", cpus, err)
 	}
 	base, _ := pintest.StartupMask()
 	for _, tc := range []struct {
@@ -70,7 +70,10 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 				t.Errorf("%s: the planner was asked for %d workers, more than the request", tc.name, gotN)
 			}
 			if gotN < 2 {
-				t.Skipf("%s: RLIMIT_MEMLOCK holds the engine to %d worker(s): nothing can be shortened", tc.name, gotN)
+				// Not a skip: the CI runners (8 MiB of memlock) land here, and the
+				// checks below still hold for a plan of one; only the shortening
+				// is not exercised.
+				t.Logf("%s: RLIMIT_MEMLOCK holds the engine to %d worker(s): nothing can be shortened", tc.name, gotN)
 			}
 			if got := len(eng.workers); got != planLen {
 				t.Errorf("%s: %d loops started, the plan holds %d", tc.name, got, planLen)

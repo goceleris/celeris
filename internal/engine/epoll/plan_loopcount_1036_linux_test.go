@@ -27,7 +27,7 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 	}
 	cpus, err := pintest.AllowedCPUs()
 	if err != nil || len(cpus) < 1 {
-		t.Skipf("needs an allowed CPU, have %v (%v)", cpus, err)
+		t.Fatalf("premise: the process has no allowed CPU: %v (%v)", cpus, err)
 	}
 	base, _ := pintest.StartupMask()
 	for _, tc := range []struct {
@@ -45,9 +45,13 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 			var gotN int
 			var gotExplicit bool
 			var want []int
+			// The default is GOMAXPROCS (two at least): on a small runner the
+			// plan holds one fewer than it is asked for.
+			planLen := tc.planLen
 			planWorkerCPUs = func(n int, explicit bool) platform.CPUPlan {
 				gotN, gotExplicit = n, explicit
-				want = make([]int, tc.planLen)
+				planLen = max(min(tc.planLen, n-1), 1)
+				want = make([]int, planLen)
 				for i := range want {
 					want[i] = cpus[i%len(cpus)]
 				}
@@ -63,20 +67,17 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 			if tc.workers > 0 && gotN != tc.workers {
 				t.Errorf("%s: the planner was asked for %d workers, want %d", tc.name, gotN, tc.workers)
 			}
-			if tc.workers == 0 && gotN < tc.planLen {
-				t.Skipf("the default is %d worker(s), fewer than the plan's %d: nothing is shortened", gotN, tc.planLen)
+			if gotN < 2 {
+				t.Fatalf("%s: the planner was asked for %d worker(s), the engine runs two at least", tc.name, gotN)
 			}
-			if gotN <= tc.planLen {
-				t.Fatalf("%s: the planner was asked for %d workers, not more than the plan holds (%d)", tc.name, gotN, tc.planLen)
+			if got := len(eng.loops); got != planLen {
+				t.Errorf("%s: %d loops started, the plan holds %d", tc.name, got, planLen)
 			}
-			if got := len(eng.loops); got != tc.planLen {
-				t.Errorf("%s: %d loops started, the plan holds %d", tc.name, got, tc.planLen)
+			if got := eng.NumWorkers(); got != planLen {
+				t.Errorf("%s: NumWorkers() = %d, want %d", tc.name, got, planLen)
 			}
-			if got := eng.NumWorkers(); got != tc.planLen {
-				t.Errorf("%s: NumWorkers() = %d, want %d", tc.name, got, tc.planLen)
-			}
-			if got := eng.Metrics().Workers; got != tc.planLen {
-				t.Errorf("%s: Metrics().Workers = %d, want %d", tc.name, got, tc.planLen)
+			if got := eng.Metrics().Workers; got != planLen {
+				t.Errorf("%s: Metrics().Workers = %d, want %d", tc.name, got, planLen)
 			}
 			for i, c := range want {
 				if got := eng.loops[i].CPUID(); got != c {
@@ -90,8 +91,8 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 					listening = ln
 				}
 			}
-			if !strings.Contains(listening, fmt.Sprintf(" loops=%d", tc.planLen)) {
-				t.Errorf("%s: the listening line does not say loops=%d:\n%s", tc.name, tc.planLen, log.String())
+			if !strings.Contains(listening, fmt.Sprintf(" loops=%d", planLen)) {
+				t.Errorf("%s: the listening line does not say loops=%d:\n%s", tc.name, planLen, log.String())
 			}
 			running, err := pintest.Census()
 			if err != nil {
@@ -103,9 +104,9 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 					single++
 				}
 			}
-			if single != tc.planLen {
+			if single != planLen {
 				t.Errorf("%s: %d thread(s) pinned to one CPU, want %d (one per loop): %v",
-					tc.name, single, tc.planLen, pintest.Off(running, base))
+					tc.name, single, planLen, pintest.Off(running, base))
 			}
 		}()
 	}
