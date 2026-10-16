@@ -57,7 +57,11 @@ func slow890Responder(tb testing.TB, peer int, resp []byte, delay time.Duration)
 			if n, _ := unix.Poll(pfd, 20); n <= 0 {
 				continue
 			}
-			if n, err := unix.Read(peer, buf[:]); n <= 0 || err != nil {
+			n, err := unix.Read(peer, buf[:])
+			for err == unix.EINTR {
+				n, err = unix.Read(peer, buf[:])
+			}
+			if n <= 0 || err != nil {
 				continue
 			}
 			for t0 := time.Now(); time.Since(t0) < delay; {
@@ -113,9 +117,14 @@ func BenchmarkWriteAndPollSlow890(b *testing.B) {
 						// next op starts clean, and count the miss.
 						misses++
 						pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-						for got < len(resp) {
-							if n, _ := unix.Poll(pfd, 2000); n <= 0 {
+						for dl := time.Now().Add(2 * time.Second); got < len(resp); {
+							if time.Now().After(dl) {
 								b.Fatalf("%s: the reply never arrived (%d of %d bytes)", bc.name, got, len(resp))
+							}
+							// A timeout or an EINTR (the runtime's preemption
+							// signal) returns n <= 0: ask again until the deadline.
+							if n, _ := unix.Poll(pfd, 100); n <= 0 {
+								continue
 							}
 							n, err := unix.Read(fd, rbuf)
 							if n > 0 {
