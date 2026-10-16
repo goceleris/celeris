@@ -3,8 +3,13 @@
 package epoll
 
 import (
+	"bufio"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,4 +115,80 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 			}
 		}()
 	}
+}
+
+// A default-sized epoll engine whose plan holds ONE CPU (a big.LITTLE cpuset
+// with a single non-little CPU) runs one loop, below resource.MinWorkers. No
+// default epoll engine ran on one loop before celeris#1036 (Resolve clamps to
+// MinWorkers and Validate rejects a user value below it), so it serves
+// keep-alive requests on several connections and stops cleanly here.
+func TestEpollServesOnOneLoop1036(t *testing.T) {
+	if !pintest.InOwnProcess(t) {
+		pintest.RunInOwnProcess(t, 2*time.Minute)
+		return
+	}
+	cpus, err := pintest.AllowedCPUs()
+	if err != nil || len(cpus) < 1 {
+		t.Fatalf("premise: the process has no allowed CPU: %v (%v)", cpus, err)
+	}
+	old := planWorkerCPUs
+	defer func() { planWorkerCPUs = old }()
+	planWorkerCPUs = func(n int, explicit bool) platform.CPUPlan {
+		return platform.CPUPlan{CPUs: []int{cpus[len(cpus)-1]}, Allowed: cpus, Requested: n,
+			Heterogeneous: true, Note: "test plan: one non-little CPU"}
+	}
+	var log lockedBuf
+	eng, stop := start909(t, 0, &log)
+	stopped := false
+	defer func() {
+		if !stopped {
+			stop()
+		}
+	}()
+	if got := len(eng.loops); got != 1 {
+		t.Fatalf("%d loops started, the plan holds 1", got)
+	}
+	const conns, reqs = 16, 200
+	addr := eng.Addr().String()
+	var wg sync.WaitGroup
+	errs := make(chan error, conns)
+	for c := range conns {
+		wg.Go(func() {
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+			br := bufio.NewReader(conn)
+			for i := range reqs {
+				if _, err := fmt.Fprintf(conn, "GET /x HTTP/1.1\r\nHost: a\r\n\r\n"); err != nil {
+					errs <- fmt.Errorf("conn %d request %d: %w", c, i, err)
+					return
+				}
+				resp, err := http.ReadResponse(br, nil)
+				if err != nil {
+					errs <- fmt.Errorf("conn %d request %d: %w", c, i, err)
+					return
+				}
+				b, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != 200 || string(b) != "ok" {
+					errs <- fmt.Errorf("conn %d request %d: status %d body %q", c, i, resp.StatusCode, b)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if m := eng.Metrics(); m.Workers != 1 || m.RequestCount < conns*reqs {
+		t.Errorf("metrics: workers=%d requests=%d, want 1 and at least %d", m.Workers, m.RequestCount, conns*reqs)
+	}
+	stop()
+	stopped = true
 }

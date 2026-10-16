@@ -99,15 +99,23 @@ type Config struct {
 	//
 	// On Linux the native engines (epoll, io_uring) pin each loop to one CPU
 	// the process is allowed to use. On a host whose allowed CPUs differ in
-	// capacity (arm64 big.LITTLE) they start one loop per CPU that is not
-	// little by default, which is fewer than GOMAXPROCS (8 loops on a 12-CPU
-	// host with 4 little CPUs), and pin every one of them: a loop left
-	// unpinned drifted onto the little CPUs and a loop pinned to one stalled
-	// its connections. A Workers set above that count is honoured and never
-	// left unpinned: the extra loops wrap round-robin over the non-little
-	// CPUs, each pinned, so some of those CPUs run more than one loop. The
-	// loops started are Metrics.Workers of [Server.EngineInfo], and the engine
-	// logs one line saying how many it started and why.
+	// capacity (arm64 big.LITTLE) the default is at most one loop per CPU that
+	// is not little, min(GOMAXPROCS, non-little CPUs): 8 loops on a 12-CPU host
+	// with 4 little CPUs, which is fewer than GOMAXPROCS. Every one is pinned:
+	// a loop left unpinned drifted onto the little CPUs and a loop pinned to
+	// one stalled its connections. A Workers set above the non-little CPU
+	// count is honoured and never left unpinned: the extra loops wrap
+	// round-robin over the non-little CPUs, each pinned, so the CPUs that get a
+	// second loop (4 of 8 for Workers 12) take about twice the connections of
+	// the others, which get one. On io_uring a count is still capped by
+	// RLIMIT_MEMLOCK. The loops started are Metrics.Workers of
+	// [Server.EngineInfo] (on the adaptive engine, the sum over its two
+	// engines), and the engine logs one line saying how many it started and
+	// why. [Config.MaxConns] is per loop, so the server-wide limit follows the
+	// count. Measured on one big.LITTLE host (io_uring, 256 connections) the
+	// default raised throughput by about half over the previous behaviour, and
+	// about 0.1% of requests took about 200 ms (p999 205 ms against 3.5 to
+	// 15 ms); the cause is not established (celeris#892).
 	// Hosts whose CPUs are alike are unchanged (README, "CPU pinning").
 	Workers int
 
@@ -253,7 +261,8 @@ type Config struct {
 	SocketRecvBuf int
 	// SocketSendBuf sets SO_SNDBUF for accepted connections (0 = OS default).
 	SocketSendBuf int
-	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
+	// MaxConns is the max simultaneous connections per worker (0 = unlimited);
+	// the server-wide limit is MaxConns times the loops started, see [Config.Workers].
 	MaxConns int
 
 	// MemoryLimitBytes is an OPTIONAL soft heap ceiling applied via

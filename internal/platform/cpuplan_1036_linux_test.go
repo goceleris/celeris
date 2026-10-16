@@ -5,6 +5,7 @@ package platform
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -150,9 +151,12 @@ func TestPlanHeterogeneousWorkerCountRegimes1036(t *testing.T) {
 	}
 }
 
-// One big CPU in the allowed set is one loop by default: the engine copes with
-// one worker (RLIMIT_MEMLOCK can already hold io_uring to one). A user-set
-// count is honoured on that CPU.
+// One big CPU in the allowed set is one loop by default, below
+// resource.MinWorkers: deliberate (a second loop could only share that CPU or
+// run on a little one). io_uring already runs on one worker under a low
+// RLIMIT_MEMLOCK; epoll never did by default, its engine test serves requests
+// on one loop (TestEpollServesOnOneLoop1036). A user-set count is honoured on
+// that CPU.
 func TestPlanOneBigCPUAllowed1036(t *testing.T) {
 	h := msr1(t, []int{2, 3, 4, 5, 7})
 	eq(t, "default", planWorkerCPUs(12, false, h.src()).CPUs, []int{7})
@@ -166,4 +170,51 @@ func TestPlanHeterogeneousUsesTheNodesInTurn1036(t *testing.T) {
 	h.nodes = [][]int{rng(0, 5), rng(6, 11)}
 	eq(t, "default", planWorkerCPUs(12, false, h.src()).CPUs, []int{0, 6, 1, 7, 8, 9, 10, 11})
 	eq(t, "explicit 10", planWorkerCPUs(10, true, h.src()).CPUs, []int{0, 6, 1, 7, 8, 9, 10, 11, 0, 6})
+}
+
+// The plan's note says which CPUs the loops use, not only the set they were
+// drawn from: 5 loops of 8 non-little CPUs do not read as if all 8 were used.
+func TestPlanNoteNamesTheCPUsTheLoopsUse1036(t *testing.T) {
+	for _, fx := range fixtures1036 {
+		t.Run(fx.name, func(t *testing.T) {
+			h := fx.build(t, rng(0, 11))
+			p := planWorkerCPUs(5, true, h.src())
+			if want := "5 loops pinned to the CPUs 0-1,6-8 of the other allowed CPUs 0-1,6-11"; !strings.Contains(p.Note, want) {
+				t.Errorf("note %q lacks %q", p.Note, want)
+			}
+			p = planWorkerCPUs(8, false, h.src())
+			if want := "8 loops pinned to the CPUs 0-1,6-11 of the other allowed CPUs 0-1,6-11"; !strings.Contains(p.Note, want) {
+				t.Errorf("note %q lacks %q", p.Note, want)
+			}
+		})
+	}
+}
+
+// Truncate cuts a plan to the loops an engine can fund. The first n entries
+// of a plan are the plan for n workers, and the note says how many start.
+func TestPlanTruncate1036(t *testing.T) {
+	h := msr1(t, rng(0, 11))
+	full := planWorkerCPUs(12, true, h.src())
+	for n := 1; n < len(full.CPUs); n++ {
+		cut := full.Truncate(n, "a test")
+		eq(t, fmt.Sprintf("truncate to %d", n), cut.CPUs, planWorkerCPUs(n, true, h.src()).CPUs)
+		if want := fmt.Sprintf("only %d of the 12 planned loops start (a test)", n); !strings.Contains(cut.Note, want) {
+			t.Errorf("truncate to %d: note %q lacks %q", n, cut.Note, want)
+		}
+		if cut.Pinned() != n || cut.Requested != 12 {
+			t.Errorf("truncate to %d: pinned %d requested %d", n, cut.Pinned(), cut.Requested)
+		}
+	}
+	if len(full.CPUs) != 12 {
+		t.Errorf("Truncate changed the plan it was called on: %v", full.CPUs)
+	}
+	for _, n := range []int{0, -1, 12, 40} {
+		if got := full.Truncate(n, "x"); !slices.Equal(got.CPUs, full.CPUs) || got.Note != full.Note {
+			t.Errorf("Truncate(%d) changed the plan: %v / %q", n, got.CPUs, got.Note)
+		}
+	}
+	alike := planWorkerCPUs(4, false, planSource{allowed: func() ([]int, error) { return []int{0, 1, 2, 3}, nil }})
+	if cut := alike.Truncate(2, "x"); cut.Note != "" || len(cut.CPUs) != 2 {
+		t.Errorf("alike CPUs: %v note %q (a plan without a note gets none)", cut.CPUs, cut.Note)
+	}
 }

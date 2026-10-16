@@ -360,39 +360,65 @@ func MinPinnedLoops(loops int) int {
 // threshold written again on purpose: this is the test's own reading.
 const bigCapacityPercent = 50
 
+// cpuSysDir and cpuInfoPath are where LittleCPUs and PinnableCPUs read the
+// machine; variables so the test of this package can point them at a fixture.
+var (
+	cpuSysDir   = "/sys/devices/system/cpu"
+	cpuInfoPath = "/proc/cpuinfo"
+)
+
+// littleParts is the test's own copy (written again on purpose, not shared
+// with the planner) of the Arm CPU implementer:part pairs of efficiency cores
+// far below half the capacity of the cores they pair with: Cortex-A35, A53,
+// A55, A510, A520.
+var littleParts = map[string]bool{
+	"0x41:0xd04": true,
+	"0x41:0xd03": true,
+	"0x41:0xd05": true,
+	"0x41:0xd46": true,
+	"0x41:0xd80": true,
+}
+
 // LittleCPUs returns the members that are little, judged from the machine and
 // not from the planner: those whose /sys/devices/system/cpu/cpuN/cpu_capacity
 // is below half of the largest among the members, provided every member has a
-// readable capacity. It returns nothing on a host whose members are alike or
-// whose capacities are unreadable (the /proc/cpuinfo fallback of the planner is
-// not repeated here: see PinnableCPUs).
+// readable capacity. A kernel that exports no capacity is read the way the
+// planner reads it: the members whose /proc/cpuinfo CPU part is a known
+// efficiency core, provided every member has the lines and some member is of
+// another part. It returns nothing on a host whose members are alike or whose
+// information is unreadable (a big.LITTLE host that exports neither would make
+// the "no pinned loop sits on a little CPU" check vacuous, which is why
+// PinnableCPUs then gives 1 and not the member count).
 func LittleCPUs(members []int) []int {
-	caps, top, ok := readCaps(members)
-	if !ok {
-		return nil
-	}
-	var little []int
-	for _, c := range members {
-		if caps[c]*100 < top*bigCapacityPercent {
-			little = append(little, c)
+	if caps, top, ok := readCaps(members); ok {
+		var little []int
+		for _, c := range members {
+			if caps[c]*100 < top*bigCapacityPercent {
+				little = append(little, c)
+			}
 		}
+		return little
 	}
-	return little
+	return littleByParts(members)
 }
 
 // PinnableCPUs returns how many of members an engine may pin a loop to,
 // judged from the machine and not from the planner: every member, unless
 // /sys/devices/system/cpu/cpuN/cpu_capacity of every member is readable and
 // some are below half of the largest (big.LITTLE), in which case the members
-// that are not. With no capacity files, members whose /proc/cpuinfo "CPU part"
-// lines differ count as one pinnable CPU at least (the planner knows which of
-// the parts are little; the floor does not).
+// that are not; with no capacity files, the members that are not a known
+// efficiency core by their /proc/cpuinfo CPU part (LittleCPUs). If the parts
+// differ and none of them is a known efficiency core, at least one member is
+// pinnable (the planner cannot tell which, and neither can this).
 func PinnableCPUs(members []int) int {
 	if len(members) == 0 {
 		return 0
 	}
 	if _, _, ok := readCaps(members); ok {
 		return len(members) - len(LittleCPUs(members))
+	}
+	if little := littleByParts(members); len(little) > 0 {
+		return len(members) - len(little)
 	}
 	if cpuPartsDiffer(members) {
 		return 1
@@ -405,7 +431,7 @@ func PinnableCPUs(members []int) int {
 func readCaps(members []int) (caps map[int]int, top int, ok bool) {
 	caps = make(map[int]int, len(members))
 	for _, c := range members {
-		b, err := os.ReadFile("/sys/devices/system/cpu/cpu" + strconv.Itoa(c) + "/cpu_capacity")
+		b, err := os.ReadFile(cpuSysDir + "/cpu" + strconv.Itoa(c) + "/cpu_capacity")
 		v, convErr := strconv.Atoi(strings.TrimSpace(string(b)))
 		if err != nil || convErr != nil || v <= 0 {
 			return nil, 0, false
@@ -416,35 +442,73 @@ func readCaps(members []int) (caps map[int]int, top int, ok bool) {
 	return caps, top, len(caps) > 0
 }
 
-// cpuPartsDiffer reports whether the "CPU part" lines of /proc/cpuinfo name
-// more than one part among members (x86 has no such line: false).
-func cpuPartsDiffer(members []int) bool {
-	b, err := os.ReadFile("/proc/cpuinfo")
+// cpuInfoParts reads the "CPU implementer" and "CPU part" lines of
+// /proc/cpuinfo per processor (x86 has none: empty maps).
+func cpuInfoParts() (impl, part map[int]string) {
+	impl, part = map[int]string{}, map[int]string{}
+	b, err := os.ReadFile(cpuInfoPath)
 	if err != nil {
-		return false
+		return impl, part
 	}
-	want := map[int]bool{}
-	for _, c := range members {
-		want[c] = true
-	}
-	parts := map[string]bool{}
 	cur := -1
 	for line := range strings.SplitSeq(string(b), "\n") {
 		k, v, ok := strings.Cut(line, ":")
 		if !ok {
 			continue
 		}
-		switch strings.TrimSpace(k) {
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		switch k {
 		case "processor":
-			n, err := strconv.Atoi(strings.TrimSpace(v))
+			n, err := strconv.Atoi(v)
 			if err != nil {
 				n = -1
 			}
 			cur = n
-		case "CPU part":
-			if want[cur] {
-				parts[strings.TrimSpace(v)] = true
+		case "CPU implementer":
+			if cur >= 0 {
+				impl[cur] = strings.ToLower(v)
 			}
+		case "CPU part":
+			if cur >= 0 {
+				part[cur] = strings.ToLower(v)
+			}
+		}
+	}
+	return impl, part
+}
+
+// littleByParts returns the members whose CPU part is a known efficiency
+// core, or nothing unless every member has both lines and some member is of
+// another part.
+func littleByParts(members []int) []int {
+	impl, part := cpuInfoParts()
+	var little []int
+	other := 0
+	for _, c := range members {
+		i, p := impl[c], part[c]
+		if i == "" || p == "" {
+			return nil
+		}
+		if littleParts[i+":"+p] {
+			little = append(little, c)
+		} else {
+			other++
+		}
+	}
+	if other == 0 {
+		return nil
+	}
+	return little
+}
+
+// cpuPartsDiffer reports whether the "CPU part" lines of /proc/cpuinfo name
+// more than one part among members (x86 has no such line: false).
+func cpuPartsDiffer(members []int) bool {
+	_, part := cpuInfoParts()
+	parts := map[string]bool{}
+	for _, c := range members {
+		if p := part[c]; p != "" {
+			parts[p] = true
 		}
 	}
 	return len(parts) > 1
