@@ -774,3 +774,31 @@ func assertNotContains(t *testing.T, s, substr string) {
 		t.Fatalf("expected body NOT to contain %q, got:\n%s", substr, s)
 	}
 }
+
+// celeris#888 item 18: Config.Options is read by the ReDoc and Scalar pages
+// and not by the Swagger UI one, as its godoc says. The test pins the
+// documented split: change the behaviour and the godoc together.
+func TestOptionsReachReDocAndScalarNotSwaggerUI888(t *testing.T) {
+	t.Parallel()
+	const marker = "options-marker-888"
+	for _, tc := range []struct {
+		name     string
+		renderer UIRenderer
+		want     bool
+	}{
+		{"swagger-ui", RendererSwaggerUI, false},
+		{"redoc", RendererReDoc, true},
+		{"scalar", RendererScalar, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			mw := New(Config{SpecContent: jsonSpec, Renderer: tc.renderer, CDN: true, Options: map[string]any{marker: true}})
+			rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+			testutil.AssertNoError(t, err)
+			testutil.AssertStatus(t, rec, 200)
+			if got := strings.Contains(rec.BodyString(), marker); got != tc.want {
+				t.Errorf("the page carries Options = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

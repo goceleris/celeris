@@ -101,7 +101,7 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 		{"epoll", celeris.Epoll, false},
 		{"epoll-async", celeris.Epoll, true},
 	}
-	if ok, p := c714ProbeIOUring(); ok {
+	if ok, p := c714ProbeIOUring(t); ok {
 		arms = append(arms, arm{"io_uring", celeris.IOUring, false})
 	} else if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 		t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids dropping the io_uring arm", p.IOUringTier, p.KernelVersion)
@@ -220,7 +220,7 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 // hijacked request was read into is kept for as long as the process lives
 // (a fault here would be the retained buffer unmapped under the hijacker).
 func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
-	ok, p := c714ProbeIOUring()
+	ok, p := c714ProbeIOUring(t)
 	if !ok || !p.MultishotRecv {
 		if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 			t.Fatalf("io_uring tier=%s kernel=%s multishotRecv=%t, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids skipping", p.IOUringTier, p.KernelVersion, p.MultishotRecv)
@@ -350,7 +350,7 @@ func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 // buffers would then leave it empty, and the next connection's receive would
 // wait for a buffer that never comes.
 func TestMultishotRingSurvivesHijacks(t *testing.T) {
-	ok, p := c714ProbeIOUring()
+	ok, p := c714ProbeIOUring(t)
 	if !ok || !p.MultishotRecv {
 		if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 			t.Fatalf("io_uring tier=%s kernel=%s multishotRecv=%t, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids skipping", p.IOUringTier, p.KernelVersion, p.MultishotRecv)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -22,6 +23,38 @@ import (
 // /logout (Destroy + 204). It returns the base URL; when the engine is
 // unavailable on this host the test is skipped.
 func startLoginServer(t *testing.T, engine celeris.EngineType, cfg Config) string {
+	t.Helper()
+	began := time.Now()
+	deadline := began.Add(startRetryWindow)
+	retries := 0
+	for {
+		base, err := tryLoginServer(t, engine, cfg)
+		if err == nil {
+			if retries > 0 {
+				t.Logf("startLoginServer: started after %d retries in %v", retries, time.Since(began).Round(time.Millisecond))
+			}
+			return base
+		}
+		switch classifyStart(err.Error(), func() bool { return ioUringExists(t) }, time.Now().Before(deadline)) {
+		case startRetry:
+			if retries == 0 {
+				t.Logf("startLoginServer: retrying a Start that failed: %v", err)
+			}
+			retries++
+			time.Sleep(2 * time.Millisecond)
+		case startSkip:
+			t.Skipf("engine unavailable on this host: %v", err)
+		default:
+			t.Fatalf("server start (after %d retries): %v", retries, err)
+		}
+	}
+}
+
+// tryLoginServer is one attempt at startLoginServer, with a new server and a
+// new listener. It returns the error instead of failing the test, so the
+// caller can classify it. The server is stopped on every failed attempt, and
+// on success when the test ends.
+func tryLoginServer(t *testing.T, engine celeris.EngineType, cfg Config) (string, error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -63,14 +96,15 @@ func startLoginServer(t *testing.T, engine celeris.EngineType, cfg Config) strin
 			startErr.Store(&e)
 		}
 	}()
-	t.Cleanup(func() {
+	stop := func() {
 		cancel()
+		_ = ln.Close()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
 			t.Log("server goroutine did not exit within 5s")
 		}
-	})
+	}
 
 	// Native engines close the supplied listener and rebind via
 	// SO_REUSEPORT, so read srv.Addr() once the engine is up and poll for
@@ -78,23 +112,21 @@ func startLoginServer(t *testing.T, engine celeris.EngineType, cfg Config) strin
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if p := startErr.Load(); p != nil {
-			msg := (*p).Error()
-			if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
-				t.Skipf("engine unavailable on this host: %v", *p)
-			}
-			t.Fatalf("server start: %v", *p)
+			stop()
+			return "", *p
 		}
 		if addr := srv.Addr(); addr != nil {
 			a := addr.String()
 			if c, derr := net.DialTimeout("tcp", a, 100*time.Millisecond); derr == nil {
 				_ = c.Close()
-				return "http://" + a
+				t.Cleanup(stop)
+				return "http://" + a, nil
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("server not ready within 5s")
-	return ""
+	stop()
+	return "", errors.New("server not ready within 5s")
 }
 
 // runLoginRoundTrip drives the login -> authenticated GET -> logout flow

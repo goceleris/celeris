@@ -296,12 +296,12 @@ func TestChanReaderSpillPublishedAfterDrain(t *testing.T) {
 	})
 
 	// The handler's next Read is already running while the chunk is being
-	// published. The Read decides whether to wait with spillMu held by the
-	// publisher; a Read that decided from spillLen alone (0 here) parks on the
-	// empty channel and misses the chunk. The Read is given 50 ms to reach
-	// that decision; this case can only pass wrongly on a host too loaded to
-	// run it in that time, never fail wrongly, because a Read that has not yet
-	// decided when the chunk is published finds it either way. (No synctest
+	// published. The Read is parked in promoteSpill (waitLockWaiter, observed in
+	// a goroutine dump) before the publisher releases spillMu, so the chunk is
+	// published while the Read waits on the lock. A Read that decided from
+	// spillLen alone (0 here) would never reach promoteSpill and would park on
+	// the empty channel, missing the chunk. The wait is on the dump, not on a
+	// sleep, so a loaded host waits longer and never passes early. (No synctest
 	// bubble here: a goroutine waiting for a mutex is not durably blocked.)
 	t.Run("read-waiting-in-window", func(t *testing.T) {
 		r := newChanReader(8, 0, 0)
@@ -309,7 +309,9 @@ func TestChanReaderSpillPublishedAfterDrain(t *testing.T) {
 		var got <-chan readResult
 		desired := window(t, r, func() {
 			got = readAsync(r)
-			time.Sleep(50 * time.Millisecond)
+			// window holds spillMu here; onFail releases it before the
+			// failure ends this goroutine.
+			waitLockWaiter(t, "(*chanReader).promoteSpill", r.spillMu.Unlock)
 		})
 		select {
 		case res := <-got:
@@ -326,7 +328,12 @@ func TestChanReaderSpillPublishedAfterDrain(t *testing.T) {
 // from inside fn (a function as a goroutine dump names it), and fails the test
 // if none is within 10 s. It reads the dump rather than sleeping, so a slow
 // host makes it wait longer, never pass early.
-func waitLockWaiter(t *testing.T, fn string) {
+//
+// onFail, when not nil, runs before the failure. A caller that holds a mutex
+// the waiter needs passes its Unlock: t.Fatalf ends the test goroutine without
+// reaching the caller's own unlock, and the parked goroutine would stay blocked
+// behind it.
+func waitLockWaiter(t *testing.T, fn string, onFail func()) {
 	t.Helper()
 	buf := make([]byte, 1<<20)
 	deadline := time.Now().Add(10 * time.Second)
@@ -343,6 +350,9 @@ func waitLockWaiter(t *testing.T, fn string) {
 			}
 		}
 		if time.Now().After(deadline) {
+			if onFail != nil {
+				onFail()
+			}
 			t.Fatalf("harness: no goroutine parked on a mutex in %s within 10 s", fn)
 		}
 		time.Sleep(time.Millisecond)
@@ -435,7 +445,7 @@ func TestChanReaderCloseKeepsChunksAppendedBeforeIt(t *testing.T) {
 				}
 			}()
 			got := readAsync(r)
-			waitLockWaiter(t, "(*chanReader).promoteSpill")
+			waitLockWaiter(t, "(*chanReader).promoteSpill", nil)
 			if len(r.ch) != 0 || len(r.spill) != 0 || r.closed.Load() {
 				t.Fatalf("harness: want an empty, open reader, got depth %d spill %d closed %v",
 					len(r.ch), len(r.spill), r.closed.Load())

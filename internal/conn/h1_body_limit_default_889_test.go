@@ -16,9 +16,8 @@ import (
 // the limit the engines hand to H1State is what resource.Config.WithDefaults
 // resolves for 0, an explicit value and -1, and a body of exactly that size is
 // served while one byte more is answered 413, for a Content-Length body and a
-// chunked one. The chunked case is fed in a single call: a chunked body that
-// arrives over several calls is not served at all (celeris#1029), so this is
-// the only way to reach the chunked limit check.
+// chunked one, each fed in a single call. The chunked body over several calls
+// is h1_chunked_split_1029_test.go.
 
 type bodyLenHandler889 struct{ got []int }
 

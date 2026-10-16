@@ -35,10 +35,11 @@ import (
 // each path that enforces the limit:
 //
 //	h1-cl     HTTP/1.1, Content-Length
-//	h1-chunk  HTTP/1.1, Transfer-Encoding: chunked (std only, see celeris#1029)
+//	h1-chunk  HTTP/1.1, Transfer-Encoding: chunked, 1 MiB chunks (celeris#1029)
 //	h2        HTTP/2 prior knowledge, DATA frames, content-length declared
 //	h2-nolen  HTTP/2 prior knowledge, DATA frames, no content-length
 //	upgrade   HTTP/1.1 Upgrade: h2c request with a body (served as stream 1)
+//	upgrade-chunk  the same with a chunked body
 //
 // Refusals are asserted exactly per path and engine: HTTP/1 and the Upgrade
 // answer 413; HTTP/2 on the native engines resets the stream (RST_STREAM
@@ -282,16 +283,7 @@ func TestDefaultMaxRequestBodySize4MiB889(t *testing.T) {
 						name             string
 						chunked, upgrade bool
 					}
-					paths := []h1Path{{"h1-cl", false, false}, {"upgrade", false, true}}
-					if e.name == "std" {
-						// No chunked arm for the native engines (celeris#1029): a chunked
-						// body that spans more than one recv is answered 400 there, so no
-						// chunked body of this size can be served or refused by its size
-						// over a socket. Their chunked limit check is covered at the
-						// ProcessH1 level (internal/conn/h1_body_limit_default_889_test.go).
-						// The arm is absent for them, not skipped.
-						paths = append(paths, h1Path{"h1-chunk", true, false})
-					}
+					paths := []h1Path{{"h1-cl", false, false}, {"upgrade", false, true}, {"h1-chunk", true, false}, {"upgrade-chunk", true, true}}
 					for _, path := range paths {
 						t.Run(size.name+"/"+path.name, func(t *testing.T) {
 							first, h2status, body := h1Body889(t, addr, size.n, path.chunked, path.upgrade)

@@ -10,7 +10,49 @@ var (
 	errInvalidChunkSize       = errors.New("invalid chunk size")
 	errInvalidChunkTerminator = errors.New("invalid chunk terminator")
 	errTrailerTooLarge        = errors.New("chunked trailer too large")
+	errChunkLineTooLong       = errors.New("chunk size line too long")
 )
+
+// MaxChunkLineSize bounds a chunk-size line (size and extensions, without its
+// CRLF) in bytes. It is the same constant net/http uses (maxLineLength in
+// net/http/internal/chunked.go), compared a little differently: net/http
+// refuses a line whose length including the CRLF is 4096 or more, this refuses
+// one of more than 4096 bytes. A longer line is refused whether or not its CRLF
+// has arrived, so a client cannot make the server buffer an endless size line.
+const MaxChunkLineSize = 4096
+
+// PeekChunk reads the size line of the chunk that starts buf without
+// consuming anything. It returns the declared size of the chunk's data and
+// the length of the size line including its CRLF. hdr == 0 with a nil error
+// means the line is not complete yet. It lets a caller refuse a chunk whose
+// declared size is over a limit before the chunk's data has arrived
+// (celeris#1029). A zero size is the terminating chunk: its trailer, if any,
+// follows hdr.
+func PeekChunk(buf []byte) (size int64, hdr int, err error) {
+	lineEnd := bytes.Index(buf, bCRLF)
+	if lineEnd == -1 {
+		// A line of exactly MaxChunkLineSize bytes is accepted once its CRLF
+		// is in (the lineEnd check below), so a buffer that ends with that
+		// line's CR and not its LF yet is still within the bound: refusing
+		// it would make the answer depend on where the segment ends.
+		if len(buf) > MaxChunkLineSize+1 || (len(buf) == MaxChunkLineSize+1 && buf[MaxChunkLineSize] != '\r') {
+			return 0, 0, errChunkLineTooLong
+		}
+		return 0, 0, nil
+	}
+	if lineEnd > MaxChunkLineSize {
+		return 0, 0, errChunkLineTooLong
+	}
+	line := buf[:lineEnd]
+	if semi := bytes.IndexByte(line, ';'); semi != -1 {
+		line = line[:semi]
+	}
+	size, ok := parseHex64(trimSpace(line))
+	if !ok {
+		return 0, 0, errInvalidChunkSize
+	}
+	return size, lineEnd + 2, nil
+}
 
 // ParseChunkedBody parses a single chunk from chunked transfer encoding.
 // Returns a zero-copy slice into the parser buffer, bytes consumed, or error.
@@ -25,6 +67,10 @@ func (p *Parser) ParseChunkedBody() ([]byte, int, error) {
 	lineEnd := bytes.Index(p.buf[p.pos:], bCRLF)
 	if lineEnd == -1 {
 		return nil, 0, nil
+	}
+
+	if lineEnd > MaxChunkLineSize {
+		return nil, 0, errChunkLineTooLong
 	}
 
 	sizeLine := p.buf[p.pos : p.pos+lineEnd]
