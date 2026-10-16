@@ -170,7 +170,7 @@ type sse732Arm struct {
 func sse732Arms(t *testing.T) []sse732Arm {
 	t.Helper()
 	arms := []sse732Arm{{"std", celeris.Std, false}, {"epoll", celeris.Epoll, false}, {"epoll-async", celeris.Epoll, true}}
-	if ok, p := c714ProbeIOUring(); ok {
+	if ok, p := c714ProbeIOUring(t); ok {
 		arms = append(arms, sse732Arm{"io_uring", celeris.IOUring, false}, sse732Arm{"io_uring-async", celeris.IOUring, true})
 	} else if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 		t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids dropping the io_uring arms", p.IOUringTier, p.KernelVersion)

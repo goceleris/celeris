@@ -46,7 +46,7 @@ func TestHijackThenDetachOnEveryEngine(t *testing.T) {
 	// io_uring has no async arm: it refuses Hijack on the async dispatch path
 	// (celeris#539, TestHijackRefusedOnAsyncDispatchPath), so the handler's
 	// Hijack fails there before any Detach.
-	if ok, p := c714ProbeIOUring(); ok {
+	if ok, p := c714ProbeIOUring(t); ok {
 		arms = append(arms, arm{"io_uring", celeris.IOUring, false})
 	} else if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 		t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids dropping the io_uring arms", p.IOUringTier, p.KernelVersion)
