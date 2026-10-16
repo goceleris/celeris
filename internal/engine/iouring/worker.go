@@ -310,17 +310,19 @@ const shutdownSendDrainNanos int64 = int64(250 * time.Millisecond)
 // waitUntimed reports whether the run loop may wait for a completion with no
 // timeout (mode 3a): SEND SQEs are being submitted, each of which produces a
 // CQE, the worker is not draining, and no conn has the remainder of a partial
-// send outstanding. A draining worker (its context is cancelled) never waits
-// so: a SEND to a peer that does not read produces no CQE, and the end of the
-// drain is looked at only between waits (celeris#806). The same holds for the
-// remainder SEND of a response a client takes slowly or not at all
-// (remainderWatch, celeris#884 item 62): its completion is the client's to
-// give, so the wait must be timed, or no iteration runs, no sweep either, and
-// WriteTimeout is never looked at while that SEND is the last thing the worker
-// submitted. A timed wait (mode 3b) is capped by adaptiveTimeout, so the
-// sweep (sweepWatchDue) is reached every second or two. Mode 3a is lost only
-// while a remainder is outstanding. Small enough to inline; a function so the
-// rule can be tested.
+// send, or a SEND of longSendBytes or more, outstanding. A draining worker (its
+// context is cancelled) never waits so: a SEND to a peer that does not read
+// produces no CQE, and the end of the drain is looked at only between waits
+// (celeris#806). The same holds for such a SEND to a client that takes it
+// slowly or not at all (remainderWatch, celeris#884 item 62): its completion is
+// the client's to give, so the wait must be timed, or no iteration runs, no
+// sweep either, and WriteTimeout is never looked at while that SEND is the
+// last thing the worker submitted. A timed wait (mode 3b) is capped by
+// adaptiveTimeout, so the sweep (sweepWatchDue) is reached every second or
+// two. Mode 3a is lost only while such a SEND is outstanding (a SEND of a
+// small response to a client that has stopped reading is not marked: see
+// longSendBytes). Small enough to inline; a function so the rule can be
+// tested.
 func waitUntimed(hasPending, sendsPending, draining, remainderWatch bool) bool {
 	return hasPending && sendsPending && !draining && !remainderWatch
 }
