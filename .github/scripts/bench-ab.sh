@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # bench-ab.sh: settle a benchmark flag (a CodSpeed regression, or any "is this
 # slower?") with an interleaved A/B plus an A/A floor, one process per
-# observation (celeris#725).
-#
+# observation (celeris#725). A B-vs-A delta inside the floor is inconclusive:
+# repeat or extend the rounds until the floor is below the flagged difference.
 # usage: .github/scripts/bench-ab.sh <base-ref> <head-ref> <package> <bench-regex> [rounds]
 #   e.g. .github/scripts/bench-ab.sh origin/main HEAD ./middleware \
 #          '^BenchmarkChain(Baseline|MinimalAPI|PreRoutingOnly)$' 20
@@ -22,12 +22,18 @@
 #   4. Runs <rounds> rounds (default 20). A round runs A, B and A2 once each,
 #      a fresh process per run (-test.count=1), with the arm order rotated
 #      every round so that no arm always runs first or last.
-#   5. Prints benchstat for A vs B and for A vs A2.
+#   5. Checks that A, B and A2 each hold results and name the same benchmarks
+#      (the -N suffix stripped). A side with no results, or two sides that
+#      name different benchmarks, exits 2 before any benchstat table is
+#      printed: a regex that matches only in the head would otherwise give an
+#      empty A and a table that looks like a result.
+#   6. Prints benchstat for A vs B and for A vs A2.
 #
-# Reading it: a B-vs-A delta that is not larger than the A-vs-A2 delta is not
-# a change. That holds for B/op and allocs/op too: sync.Pool and the GC make
-# them vary a little between runs of one binary, so compare them with A2 as
-# well.
+# Reading it: a B-vs-A delta that is not larger than the A-vs-A2 delta is
+# inconclusive: repeat or extend the rounds until the floor is below the
+# flagged difference. That holds for B/op and allocs/op too: sync.Pool and the
+# GC make them vary a little between runs of one binary, so compare them with
+# A2 as well.
 #
 # The timings describe the machine they ran on. A build for your laptop has
 # its own code layout, so it answers "did the code on this path get slower",
@@ -50,6 +56,10 @@ if [ "$#" -lt 4 ]; then
 fi
 base=$1 head=$2 pkg=$3 re=$4 rounds=${5:-20}
 benchtime=${BENCHTIME:-1s}
+if ! [ "$rounds" -ge 1 ] 2> /dev/null; then
+  echo "rounds must be a positive integer, not '$rounds'" >&2
+  exit 2
+fi
 
 repo=$(git rev-parse --show-toplevel)
 benchstat() { GOWORK=off go tool -modfile="$repo/.github/tools/go.mod" benchstat "$@"; }
@@ -104,6 +114,38 @@ for ((r = 1; r <= rounds; r++)); do
   done
   echo "round $r/$rounds done"
 done
+
+# Each side must hold results, and the sides must name the same benchmarks.
+# Without this a regex that matches only in the head reaches benchstat with an
+# empty A and prints a table for it.
+names() { awk '/^Benchmark/ { sub(/-[0-9]+$/, "", $1); print $1 }' "$1" | LC_ALL=C sort -u; }
+side_label() {
+  case $1 in
+    A) echo "A ($base)" ;;
+    B) echo "B ($head)" ;;
+    A2) echo "A2 (a copy of A)" ;;
+  esac
+}
+ok=1
+for f in A B A2; do
+  names "$out/$f.txt" > "$tmp/names.$f"
+  if [ ! -s "$tmp/names.$f" ]; then
+    echo "$(side_label "$f") has no benchmark result for '$re' in $out/$f.txt" >&2
+    ok=0
+  fi
+done
+for f in B A2; do
+  if ! cmp -s "$tmp/names.A" "$tmp/names.$f"; then
+    echo "$(side_label "$f") names different benchmarks from A for '$re':" >&2
+    LC_ALL=C comm -23 "$tmp/names.A" "$tmp/names.$f" | sed 's/^/  only in A: /' >&2
+    LC_ALL=C comm -13 "$tmp/names.A" "$tmp/names.$f" | sed "s/^/  only in $f: /" >&2
+    ok=0
+  fi
+done
+if [ "$ok" = 0 ]; then
+  echo "nothing comparable: fix the regex or the refs, then run again." >&2
+  exit 2
+fi
 
 echo
 echo "== B ($head) vs A ($base)"
