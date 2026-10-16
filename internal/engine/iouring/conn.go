@@ -128,6 +128,7 @@ type connState struct {
 	recvIntoBody   bool         // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
 	zcNotifPending bool         // 1: waiting for SEND_ZC notification CQE
 	h2GoAwaySent   bool         // 1: a graceful shutdown sent this H2 conn its GOAWAY (celeris#759)
+	remainderOut   bool         // 1: the SEND in flight may wait on its peer for long (celeris#884 items 62, 64): the re-send of a partial send's remainder, or a SEND of longSendBytes or more; the worker may not wait for its completion with no timeout (mode 3a); set by flushSend/flushSendLink, cleared by completeSend
 	// sendIsZC records how the send SQE currently in flight for this
 	// connection was ARMED: true for IORING_OP_SEND_ZC, false for a plain
 	// SEND / WRITEV / linked SEND. It is the provenance flag the error
@@ -592,6 +593,7 @@ func releaseConnState(cs *connState) {
 	cs.protocol.Store(0)
 	cs.detected = false
 	cs.sending = false
+	cs.remainderOut = false
 	cs.closing = false
 	cs.writeRefused = false
 	cs.dirty = false

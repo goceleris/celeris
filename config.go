@@ -147,7 +147,17 @@ type Config struct {
 	// out the writes of the streams still running fail. A response that is not detached, such as
 	// a large download or a chunked body written with [Context.StreamWriter]
 	// without Detach, stays under WriteTimeout as an absolute deadline for the
-	// whole response: raise it or set -1 for such routes.
+	// whole response: raise it or set -1 for such routes. On the epoll engine
+	// (and adaptive while it runs on epoll) WriteTimeout bounds a response
+	// that is not detached differently: it is "no progress for WriteTimeout",
+	// the time a client may go without taking any of a response the kernel has
+	// not accepted whole, restarted each time it takes some. A download read
+	// steadily for longer than WriteTimeout is not cut there, and a client
+	// that reads nothing is closed WriteTimeout after the response stalled;
+	// io_uring bounds the response as a whole, from the request's read, as std
+	// does. The same conn's ReadTimeout and IdleTimeout, while it holds a
+	// response the client is still taking, run from the last progress (epoll)
+	// and not from the request.
 	//
 	// With -1, an HTTP/2 response that has to wait for the client's
 	// flow-control window has no deadline either on epoll, io_uring and

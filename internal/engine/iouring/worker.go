@@ -309,12 +309,20 @@ const shutdownSendDrainNanos int64 = int64(250 * time.Millisecond)
 
 // waitUntimed reports whether the run loop may wait for a completion with no
 // timeout (mode 3a): SEND SQEs are being submitted, each of which produces a
-// CQE, and the worker is not draining. A draining worker (its context is
-// cancelled) never does: a SEND to a peer that does not read produces none, and
-// the end of the drain is looked at only between waits (celeris#806). Small
-// enough to inline; a function so the rule can be tested.
-func waitUntimed(hasPending, sendsPending, draining bool) bool {
-	return hasPending && sendsPending && !draining
+// CQE, the worker is not draining, and no conn has the remainder of a partial
+// send outstanding. A draining worker (its context is cancelled) never waits
+// so: a SEND to a peer that does not read produces no CQE, and the end of the
+// drain is looked at only between waits (celeris#806). The same holds for the
+// remainder SEND of a response a client takes slowly or not at all
+// (remainderWatch, celeris#884 item 62): its completion is the client's to
+// give, so the wait must be timed, or no iteration runs, no sweep either, and
+// WriteTimeout is never looked at while that SEND is the last thing the worker
+// submitted. A timed wait (mode 3b) is capped by adaptiveTimeout, so the
+// sweep (sweepWatchDue) is reached every second or two. Mode 3a is lost only
+// while a remainder is outstanding. Small enough to inline; a function so the
+// rule can be tested.
+func waitUntimed(hasPending, sendsPending, draining, remainderWatch bool) bool {
+	return hasPending && sendsPending && !draining && !remainderWatch
 }
 
 // closingDrainTimeoutNanos bounds the deferred-close drain: how long a
@@ -539,7 +547,14 @@ type Worker struct {
 	// iterations alone is seconds to minutes, and the spin that used to
 	// reach it is gone. Worker-owned.
 	sendWatch bool
-	lastSweep int64
+	// remainderWatch is set when flushSend re-sends the remainder of a partial
+	// send (celeris#884 item 62) and re-derived by every timeout sweep from the
+	// live conns (cs.remainderOut). It is what keeps the run loop out of mode
+	// 3a (waitUntimed): sendWatch alone cannot, because every sweep derives it
+	// from any SEND in flight and it would be on nearly always under load, so
+	// the untimed wait would be lost for good. Worker-owned.
+	remainderWatch bool
+	lastSweep      int64
 
 	// pendingRelease defers returning connState structs to the pool
 	// until the kernel has drained every in-flight I/O SQE that may
@@ -1515,7 +1530,7 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				cqHead, cqTail = w.ring.BeginCQ()
 			} else if cqHead != cqTail { //nolint:revive // intentional no-op: CQEs ready, no pending SQEs, no syscall needed
-			} else if waitUntimed(hasPending, w.sendsPending, w.draining) {
+			} else if waitUntimed(hasPending, w.sendsPending, w.draining, w.remainderWatch) {
 				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
 				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
 				// Not once the context is cancelled (celeris#806): a SEND to a
@@ -4444,6 +4459,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	// ring SEND is in-flight, so the clear MUST be inside the lock — otherwise
 	// that read races this completion.
 	cs.sending = false
+	cs.remainderOut = false
 	// celeris#607 witness. cs.recvLinked is cleared only when the chained
 	// recv's own CQE is processed, and that recv cannot run before this
 	// send completes — so reaching here with it still set means the recv
@@ -6546,6 +6562,31 @@ func (w *Worker) flushDirty() {
 	}
 }
 
+// longSendBytes is the size from which a SEND is expected to be able to wait
+// on its peer (celeris#884 items 62 and 64): a response this large does not fit
+// the room a socket has, and a connection with a full socket queue takes none
+// of it. The kernel's initial send buffer is 16 KiB, so a SEND of more than
+// this stalls at the first window update of a reader that is slow, and the SEND
+// of a response a short inline write left over (an async handler's direct write
+// takes what the socket takes and the ring gets the rest) is a first SEND with
+// no remainder to mark. Smaller SENDs keep the untimed wait (mode 3a): they
+// complete within a loop pass on any peer that reads at all.
+const longSendBytes = 64 << 10
+
+// markLongSend notes that the SEND being submitted for cs, n bytes, may be
+// outstanding for as long as its peer holds out: cs.remainderOut and the
+// worker's remainderWatch keep the run loop out of its untimed wait while it
+// is, and sendWatch makes the sweep (sweepWatchDue) come for WriteTimeout
+// (celeris#884 items 62 and 64). Cleared by completeSend, re-derived by the
+// sweep. Worker thread; one compare for the common small response.
+func (w *Worker) markLongSend(cs *connState, n int) {
+	if n >= longSendBytes {
+		cs.remainderOut = true
+		w.remainderWatch = true
+		w.sendWatch = true
+	}
+}
+
 // flushSend submits one SEND SQE for pending data on this connection.
 // Only one SEND is in-flight per connection at a time; if a send is already
 // in progress, this is a no-op and the next send will be triggered when the
@@ -6573,6 +6614,13 @@ func (w *Worker) flushSend(cs *connState) bool {
 		cs.sending = true
 		cs.kernelInflight++
 		w.sendsPending = true
+		// A remainder: the first SEND of this response took part of it and the
+		// peer is taking the rest slowly or not at all (celeris#884 item 62).
+		// Its completion is the client's to give, so the worker must not wait
+		// for it with no timeout, and the sweep must come for its WriteTimeout.
+		cs.remainderOut = true
+		w.remainderWatch = true
+		w.sendWatch = true
 		return false
 	}
 
@@ -6609,6 +6657,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 			setSQEFixedFile(sqe)
 		}
 		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
+		w.markLongSend(cs, len(cs.sendBuf)+len(cs.sendBody))
 		cs.sending = true
 		cs.kernelInflight++
 		w.sendsPending = true
@@ -6623,6 +6672,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 	}
 	w.prepSendSQE(sqe, cs, false)
 	setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
+	w.markLongSend(cs, len(cs.sendBuf))
 	cs.sending = true
 	cs.kernelInflight++
 	w.sendsPending = true
@@ -6787,6 +6837,7 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		w.prepSendSQE(sqe, cs, false)
 		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 	}
+	w.markLongSend(cs, len(cs.sendBuf))
 	cs.sending = true
 	cs.kernelInflight++
 	w.sendsPending = true
@@ -6924,7 +6975,8 @@ func (w *Worker) sweepWatchDue() bool {
 // 0.8 s, 1.6 s or 102 s on an idle worker; with sendWatch set (sweepWatchDue)
 // it also runs about every 1 to 2 s (checked on every 8th iteration). None
 // of it runs while the worker waits without a
-// timeout for a SEND's completion (waitUntimed). This
+// timeout for a SEND's completion (waitUntimed), which it does not while a
+// partial send's remainder is outstanding (remainderWatch). This
 // replaces the timer wheel: instead of allocating entries and updating maps
 // on every recv/send, we store a single lastActivity timestamp on the
 // connState and scan here.
@@ -6938,7 +6990,10 @@ func (w *Worker) checkTimeouts() {
 	w.lastSweep = now
 	// sendOut: a conn has a SEND (or a SEND_ZC notification) outstanding, so
 	// the watch (sendWatch, set by the dirty pass's give-up) stays on.
-	sendOut := false
+	// remOut: a conn has the SEND of a partial send's remainder outstanding,
+	// so remainderWatch (set by flushSend) stays on and the run loop keeps
+	// out of its untimed wait (celeris#884 item 62).
+	sendOut, remOut := false, false
 	// Drain the deferred-release queue here too. drainPendingRelease gates on
 	// w.cachedNow, which is otherwise only refreshed inside the CQE-processing
 	// block; on a fully idle worker (no CQEs) cachedNow never advances and
@@ -6969,6 +7024,14 @@ func (w *Worker) checkTimeouts() {
 		}
 		if cs.sending || cs.zcNotifPending {
 			sendOut = true
+			if cs.remainderOut {
+				remOut = true
+			}
+		} else if cs.remainderOut {
+			// No SEND is outstanding any more but a completion path that
+			// does not go through completeSend (an error, a cancel) left the
+			// flag: it must not hold the untimed wait off for the conn's life.
+			cs.remainderOut = false
 		}
 		// Deferred close (closeConn): the fd stays open until the queued SENDs
 		// complete, which normally happens within a loop pass or two. Nothing
@@ -7079,6 +7142,7 @@ func (w *Worker) checkTimeouts() {
 		}
 	}
 	w.sendWatch = sendOut
+	w.remainderWatch = remOut
 }
 
 // h2PoolDrainFloor is the least time the worker, its context cancelled,

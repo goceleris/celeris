@@ -65,3 +65,102 @@ func TestIouringDirtyPassGiveUpSetsTheSendWatch811(t *testing.T) {
 		t.Errorf("a sweep that finds no conn with a SEND outstanding left sendWatch set: every sweep would stay on the 1 s cadence")
 	}
 }
+
+// TestIouringRemainderSendSetsTheWatches884: sendWatch alone cannot keep the
+// worker out of its untimed wait (mode 3a, waitUntimed): every sweep derives it
+// from any SEND in flight, so under load it is nearly always on, and mode 3a
+// would be lost for good. The re-send of a partial send's remainder, a SEND
+// the client's closed window keeps outstanding, is what flushSend marks
+// (cs.remainderOut, w.remainderWatch, and sendWatch with them), and so is a
+// first SEND of longSendBytes or more; the SEND of a small response is not
+// marked, so the common request/response cycle keeps the untimed wait. The
+// marks end with the SEND's completion, and a sweep re-derives the worker's
+// from the live conns.
+func TestIouringRemainderSendSetsTheWatches884(t *testing.T) {
+	rig := newStallRig704(t)
+	w, cs := rig.w, rig.cs
+	w.cfg.WriteTimeout = time.Hour
+	w.cfg.IdleTimeout = time.Hour
+	w.cfg.ReadTimeout = time.Hour
+
+	// A fresh response's SEND: not a remainder.
+	cs.writeBuf = append(cs.writeBuf[:0], "a response"...)
+	if w.flushSend(cs) {
+		t.Fatalf("apparatus: flushSend found no SQE")
+	}
+	takeSQEs(w.ring)
+	if !cs.sending || cs.remainderOut || w.remainderWatch {
+		t.Fatalf("a response's first SEND: sending=%v remainderOut=%v remainderWatch=%v, want true false false: "+
+			"the untimed wait must stay available for the common cycle", cs.sending, cs.remainderOut, w.remainderWatch)
+	}
+	if !waitUntimed(true, true, false, w.remainderWatch) {
+		t.Errorf("waitUntimed is false with only a first SEND in flight")
+	}
+	w.handleSend(sendCQE750(rig, int32(len("a response")), 0), rig.local, time.Now().UnixNano())
+
+	// A long first SEND (an async handler's short direct write leaves the
+	// rest of a large response to the ring, as a first SEND into a socket that
+	// may be full) is marked too, and its completion ends the marks.
+	cs.writeBuf = append(cs.writeBuf[:0], make([]byte, longSendBytes)...)
+	if w.flushSend(cs) {
+		t.Fatalf("apparatus: flushSend found no SQE")
+	}
+	takeSQEs(w.ring)
+	if !cs.sending || !cs.remainderOut || !w.remainderWatch || !w.sendWatch {
+		t.Fatalf("a first SEND of %d bytes: sending=%v remainderOut=%v remainderWatch=%v sendWatch=%v, want all true",
+			longSendBytes, cs.sending, cs.remainderOut, w.remainderWatch, w.sendWatch)
+	}
+	w.handleSend(sendCQE750(rig, int32(longSendBytes), 0), rig.local, time.Now().UnixNano())
+	if cs.remainderOut {
+		t.Fatalf("the long SEND's completion left remainderOut set")
+	}
+	w.checkTimeouts()
+	if w.remainderWatch || w.sendWatch {
+		t.Fatalf("apparatus: the watches are still set after the long SEND completed")
+	}
+
+	// A partial completion: 8 of 16 bytes. The remainder goes out as a SEND.
+	const first = "0123456789abcdef"
+	inFlight750(rig, first, false)
+	w.sendWatch = false
+	w.handleSend(sendCQE750(rig, 8, 0), rig.local, time.Now().UnixNano())
+	if sqes := takeSQEs(w.ring); len(sqes) != 1 {
+		t.Fatalf("apparatus: %d SQEs after a partial completion, want the remainder's SEND", len(sqes))
+	}
+	if !cs.sending || string(cs.sendBuf) != first[8:] {
+		t.Fatalf("apparatus: sending=%v sendBuf=%q, want the remainder %q in flight", cs.sending, cs.sendBuf, first[8:])
+	}
+	if !cs.remainderOut || !w.remainderWatch || !w.sendWatch {
+		t.Fatalf("celeris#884 item 62: the remainder SEND left remainderOut=%v remainderWatch=%v sendWatch=%v, want all true: "+
+			"the worker would wait for it with no timeout and no sweep would run for WriteTimeout",
+			cs.remainderOut, w.remainderWatch, w.sendWatch)
+	}
+	if waitUntimed(true, w.sendsPending, false, w.remainderWatch) {
+		t.Errorf("waitUntimed is true while a remainder SEND is outstanding")
+	}
+
+	// The sweep keeps the marks while the remainder is outstanding.
+	w.checkTimeouts()
+	if !w.remainderWatch || !w.sendWatch || !cs.remainderOut {
+		t.Errorf("a sweep that finds the remainder outstanding: remainderWatch=%v sendWatch=%v remainderOut=%v, want all true",
+			w.remainderWatch, w.sendWatch, cs.remainderOut)
+	}
+
+	// Its completion ends them: the conn's flag at once, the worker's at the sweep.
+	w.handleSend(sendCQE750(rig, int32(len(first)-8), 0), rig.local, time.Now().UnixNano())
+	if cs.sending || cs.remainderOut {
+		t.Fatalf("after the remainder's completion sending=%v remainderOut=%v, want both false", cs.sending, cs.remainderOut)
+	}
+	w.checkTimeouts()
+	if w.remainderWatch || w.sendWatch {
+		t.Errorf("a sweep that finds no SEND outstanding: remainderWatch=%v sendWatch=%v, want both false", w.remainderWatch, w.sendWatch)
+	}
+
+	// A flag a completion path that skips completeSend left behind must not
+	// hold the untimed wait off for the conn's life.
+	cs.remainderOut = true
+	w.checkTimeouts()
+	if cs.remainderOut || w.remainderWatch {
+		t.Errorf("a sweep left remainderOut=%v remainderWatch=%v for a conn with no SEND outstanding", cs.remainderOut, w.remainderWatch)
+	}
+}
