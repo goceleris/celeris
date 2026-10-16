@@ -43,10 +43,11 @@ const closeHandshakeSlow = 10 * time.Second
 // After its flood the client holds the backpressure idle for wsoQuiet, as the
 // pause-cancel test does, so a connection the engine stopped reading behind its
 // blocked echo (celeris#607) stays unread long enough for the watch to see it.
-// With celeris#607 re-introduced (mutant m607) this fires on io_uring at 16
-// connections and 2 bursts of 16000 frames, the size ci.yml runs; it did not
-// at 1000 frames per burst, whose echo fits the socket buffers and never blocks
-// a send (checklist #888 item 4).
+// With celeris#607 re-introduced (mutant m607) this fired on io_uring, in a
+// linux/arm64 container, at 16 connections and 2 bursts of 16000 frames, the
+// size ci.yml runs (not yet on amd64); it did not at 1000 frames per burst,
+// whose echo fits the socket buffers and never blocks a send (checklist #888
+// item 4). The io_uring/multishot_recv arm did not fire in those runs.
 //
 // The client finishes its writes and waits for the close on progress, reading
 // while it waits, like TestBackpressurePauseDoesNotCancelInflightSend's

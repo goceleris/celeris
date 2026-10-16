@@ -894,10 +894,10 @@ jobs:
       # step runs two suites with per-test output. The step took 64 s on
       # main (run 38541022063). The inbound oracle now holds the backpressure
       # idle for wsoQuiet after its flood, and floods 16000 frames per burst
-      # rather than 1000, which is what lets it see celeris#607 re-introduced
-      # (checklist #888 item 4); that makes the inbound test alone about 50 s
-      # in a linux/arm64 container (35 s at 1000 frames), so the step is
-      # expected near two minutes.
+      # rather than 1000, which is what let it see celeris#607 re-introduced in
+      # a linux/arm64 container (checklist #888 item 4; not yet run on amd64).
+      # The step took 102 s on x86 ubuntu-latest with that change (run
+      # 38909294203), the inbound test 40 s of it.
       - name: middleware/websocket — backpressure + chanReader tests
         shell: bash
         env:
