@@ -27,8 +27,11 @@ type AcceptItem struct {
 // specific entry would accept it. Where two entries are equally specific (a
 // repeated entry), q=0 wins, and otherwise the higher q-value does.
 //
-// Of the acceptable offers the highest q-value is chosen, then the one whose
-// entry comes first in the header, then the first offer.
+// Of the acceptable offers the highest q-value is chosen. Offers with the same
+// q-value are ranked by the earliest entry of the header that matches them and
+// carries that q-value, whether that entry names the offer or is a wildcard,
+// then by their order in offers (so "*, gzip" with offers [gzip, br] gives
+// gzip and with [br, gzip] gives br; "gzip, *" gives gzip for both).
 func Accept(header string, offers []string) string {
 	// Stack-backed entry buffer. Real Accept-Encoding / Accept-Language
 	// headers almost always hold ≤8 items; anything larger falls back to
@@ -60,26 +63,35 @@ func Accept(header string, offers []string) string {
 }
 
 // offerQuality returns the q-value of the lowercased offer and the index of
-// the entry that gave it: that of the most specific entries matching the offer
-// (see [Accept]), q=0 if any of them says 0, else the highest, the earliest on
-// a tie. It returns q=0 when no entry matches.
+// the entry that ranks it among offers of the same q-value: q is that of the
+// most specific entries matching the offer (see [Accept]), 0 if any of them
+// says 0, else the highest; idx is the earliest entry of any specificity that
+// matches the offer and carries that q-value, which is the entry origin/main
+// ranked it by (a "*" ahead of the entry that names the offer ranks the offer
+// at the "*"). It returns q=0 when no entry matches.
 func offerQuality(entries []AcceptItem, offer string) (q float64, idx int) {
 	bestSpec := 0
-	idx = len(entries)
-	for i, e := range entries {
+	for _, e := range entries {
 		spec := matchSpecificity(e.MediaType, offer)
 		if spec == 0 || spec < bestSpec {
 			continue
 		}
 		switch {
 		case spec > bestSpec:
-			bestSpec, q, idx = spec, e.Quality, i
+			bestSpec, q = spec, e.Quality
 		case q <= 0:
 			// An earlier equally specific entry refused it: that stands.
-		case e.Quality <= 0:
-			q, idx = e.Quality, i
-		case e.Quality > q:
-			q, idx = e.Quality, i
+		case e.Quality <= 0, e.Quality > q:
+			q = e.Quality
+		}
+	}
+	idx = len(entries)
+	if q <= 0 {
+		return q, idx
+	}
+	for i, e := range entries {
+		if e.Quality == q && MatchMedia(e.MediaType, offer) {
+			return q, i
 		}
 	}
 	return q, idx
@@ -167,7 +179,7 @@ func MatchMedia(pattern, offer string) bool {
 	if pattern == "*" || pattern == "*/*" {
 		return true
 	}
-	// Defensive: internal callers (Accept, isExcluded) pass pre-lowered
+	// Defensive: internal callers (Accept) pass pre-lowered
 	// values, but MatchMedia is exported and may receive mixed-case input.
 	pattern = strings.ToLower(pattern)
 	offer = strings.ToLower(offer)
