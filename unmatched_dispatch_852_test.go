@@ -366,20 +366,37 @@ func TestUnmatchedOptionsWalksTheRouterOnce889(t *testing.T) {
 	for i := range 400 {
 		s.Handle("X"+strconv.Itoa(i), "/custom/"+strconv.Itoa(i), func(c *Context) error { return nil })
 	}
-	window := func(method string) time.Duration {
-		best := time.Duration(math.MaxInt64)
+	// The GET and the OPTIONS windows alternate within each round, so a drift
+	// of the host (a frequency step, a neighbour waking) falls on both and
+	// not on one half; a second attempt before failing absorbs a burst that
+	// still lands on one of them (a regression costs about twice in every
+	// attempt).
+	if testing.Short() {
+		return
+	}
+	var get, opts time.Duration
+	var ratio float64
+	for attempt := 1; attempt <= 2; attempt++ {
+		get, opts = time.Duration(math.MaxInt64), time.Duration(math.MaxInt64)
 		for range 15 {
-			t0 := time.Now()
-			for range 200 {
-				do(method, "/missing")
+			for _, m := range []string{"GET", "OPTIONS"} {
+				t0 := time.Now()
+				for range 200 {
+					do(m, "/missing")
+				}
+				d := time.Since(t0)
+				if m == "GET" {
+					get = min(get, d)
+				} else {
+					opts = min(opts, d)
+				}
 			}
-			best = min(best, time.Since(t0))
 		}
-		return best
+		ratio = float64(opts) / float64(get)
+		t.Logf("attempt %d: 200 unrouted requests, least of 15 windows: GET %v, OPTIONS %v (ratio %.2f)", attempt, get, opts, ratio)
+		if ratio <= 1.5 {
+			return
+		}
 	}
-	get, opts := window("GET"), window("OPTIONS")
-	t.Logf("200 unrouted requests, least of 15 windows: GET %v, OPTIONS %v (ratio %.2f)", get, opts, float64(opts)/float64(get))
-	if float64(opts) > 1.5*float64(get) {
-		t.Errorf("unrouted OPTIONS costs %v, GET %v (ratio %.2f): the router walked more than once", opts, get, float64(opts)/float64(get))
-	}
+	t.Errorf("unrouted OPTIONS costs %v, GET %v (ratio %.2f, twice): the router walked more than once", opts, get, ratio)
 }
