@@ -227,15 +227,18 @@ func TestAWakeAfterShutdownClosedTheEventfdWritesNothing890(t *testing.T) {
 			return
 		}
 		if efd != old {
-			// old is free (just closed): move the eventfd onto it.
-			if err := unix.Dup3(efd, old, unix.O_CLOEXEC); err != nil {
-				_ = unix.Close(efd)
+			// old was just closed, so it is the lowest number F_DUPFD_CLOEXEC
+			// can return that is >= old; unlike dup3 it never replaces a
+			// descriptor another goroutine opened on the number meanwhile.
+			dup, err := unix.FcntlInt(uintptr(efd), unix.F_DUPFD_CLOEXEC, old)
+			_ = unix.Close(efd)
+			if err != nil {
 				hookErr = err
 				return
 			}
-			_ = unix.Close(efd)
+			efd = dup
 		}
-		taker = old
+		taker = efd
 		w.wake()
 	}
 	if err := l.Close(); err != nil {
