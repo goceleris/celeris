@@ -181,6 +181,7 @@ func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 	// plan draws from, so no loop is planned on them. Used to test whether a
 	// loop pinned on a NIC IRQ CPU (CPU 8 of msr1) causes the 200 ms mode.
 	big = abExcludeCPUs(big)
+	big = abExtraLoopCPUs(big, allowed)
 	plan.Heterogeneous = true
 	plan.Little = little
 	// One loop per non-little CPU and no more, unless the user asked for

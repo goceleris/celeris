@@ -156,6 +156,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// the loop count (celeris#1036): on a big.LITTLE host it holds one loop
 	// per non-little CPU, fewer than the default GOMAXPROCS, every one pinned.
 	plan := planWorkerCPUs(resolved.Workers, e.cfg.Resources.Workers > 0)
+	platform.ABStartSpinners(ctx) // AB X2 (throwaway): CELERIS_AB_SPIN_CPUS
 	cpus := plan.CPUs
 	resolved.Workers = len(cpus)
 

@@ -3,11 +3,24 @@
 package sockopts
 
 import (
+	"os"
 	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+var (
+	abBusyOnce sync.Once
+	abBusyOff  bool
+)
+
+// abNoBusyPoll reports CELERIS_AB_BUSYPOLL=0 (AB X2, throwaway diagnostic): accepted sockets get no SO_BUSY_POLL.
+// Read on first use, after the process set it and before any connection is accepted.
+func abNoBusyPoll() bool {
+	abBusyOnce.Do(func() { abBusyOff = os.Getenv("CELERIS_AB_BUSYPOLL") == "0" })
+	return abBusyOff
+}
 
 func applyFD(fd int, opts Options) error {
 	if opts.TCPNoDelay {
@@ -20,7 +33,7 @@ func applyFD(fd int, opts Options) error {
 			return err
 		}
 	}
-	if opts.SOBusyPoll > 0 {
+	if opts.SOBusyPoll > 0 && !abNoBusyPoll() {
 		micros := int(opts.SOBusyPoll.Microseconds())
 		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, micros); err != nil {
 			return err
