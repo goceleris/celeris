@@ -83,8 +83,10 @@ func TestH2RefusedWriteClosesTheConn889(t *testing.T) {
 	if !cs.closing {
 		t.Fatalf("the pass did not close the conn that lost a frame (closing=%v, still registered=%v)", cs.closing, w.conns[fd] == cs)
 	}
-	if len(cs.writeBuf) != 64<<20+1 {
-		t.Errorf("the refused frame reached writeBuf: %d bytes, want %d", len(cs.writeBuf), 64<<20+1)
+	// The close moves what was staged on to the send side; the refused frame
+	// is in none of the three buffers.
+	if got := len(cs.writeBuf) + len(cs.sendBuf) + len(cs.bodyBuf); got != 64<<20+1 {
+		t.Errorf("the refused frame reached a send buffer: %d bytes queued, want %d", got, 64<<20+1)
 	}
 }
 
