@@ -261,65 +261,71 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 		return errors.New("celeris/epoll: onRecv and onClose must be non-nil")
 	}
 
-	l.driverMu.Lock()
+	// driverMu is held by a closure, released by its defer: no return or
+	// panic in the section can leave it held, and the wake below still runs
+	// after the unlock.
+	err := func() error {
+		l.driverMu.Lock()
+		defer l.driverMu.Unlock()
 
-	// HTTP accept path writes l.conns[fd] on the worker goroutine; a concurrent
-	// driver registration for the same fd would race. Re-check under the lock
-	// to close the TOCTOU window — a racy accept could have run between an
-	// earlier unlocked check and this lock acquisition.
-	if fd < len(l.conns) && l.conns[fd] != nil {
-		l.driverMu.Unlock()
-		return fmt.Errorf("celeris/epoll: fd %d is already an HTTP connection", fd)
-	}
-
-	if l.driverConns == nil {
-		l.driverConns = make(map[int]*driverConn)
-	}
-	if _, exists := l.driverConns[fd]; exists {
-		l.driverMu.Unlock()
-		return fmt.Errorf("celeris/epoll: fd %d is already registered", fd)
-	}
-
-	// The registration's generation, set before the conn is published
-	// (celeris#771). Under driverMu, which RegisterConn holds. 0 never names a
-	// registration, and neither does a value with bit 31 set (an HTTP conn's,
-	// see httpGenBit): the count wraps after maxDriverGen (2^31-1)
-	// registrations on this loop, and an event reaches the wrong conn only if
-	// the conn now on its number has the event's generation: a multiple of
-	// 2^31-1 registrations would have to come between the two while the event
-	// waits to be dispatched.
-	l.driverGen++
-	if l.driverGen > maxDriverGen {
-		l.driverGen = 1
-	}
-	dc := &driverConn{
-		fd:      fd,
-		gen:     l.driverGen,
-		onRecv:  onRecv,
-		onClose: onClose,
-	}
-	// Publish the conn before arming the descriptor (celeris#770). The
-	// worker looks a driver conn up only while hasDriverConns is set, and
-	// the event is edge triggered: armed first, a first event the worker
-	// took before hasDriverConns was set went to the HTTP path, which read
-	// nothing, and never came again. Published first, a racing worker finds
-	// hasDriverConns set and waits in lookupDriver for driverMu, which is
-	// held here until the conn is in the map.
-	l.driverConns[fd] = dc
-	l.hasDriverConns.Store(true)
-	// Level-triggered EPOLLOUT is added lazily (on EAGAIN) by
-	// flushDriverSendLocked so idle driver conns don't wake the loop on every
-	// send-buffer drain.
-	ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
-	if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
-		delete(l.driverConns, fd)
-		if len(l.driverConns) == 0 {
-			l.hasDriverConns.Store(false)
+		// HTTP accept path writes l.conns[fd] on the worker goroutine; a concurrent
+		// driver registration for the same fd would race. Re-check under the lock
+		// to close the TOCTOU window — a racy accept could have run between an
+		// earlier unlocked check and this lock acquisition.
+		if fd < len(l.conns) && l.conns[fd] != nil {
+			return fmt.Errorf("celeris/epoll: fd %d is already an HTTP connection", fd)
 		}
-		l.driverMu.Unlock()
-		return fmt.Errorf("celeris/epoll: epoll_ctl ADD fd %d: %w", fd, err)
+
+		if l.driverConns == nil {
+			l.driverConns = make(map[int]*driverConn)
+		}
+		if _, exists := l.driverConns[fd]; exists {
+			return fmt.Errorf("celeris/epoll: fd %d is already registered", fd)
+		}
+
+		// The registration's generation, set before the conn is published
+		// (celeris#771). Under driverMu, which RegisterConn holds. 0 never names a
+		// registration, and neither does a value with bit 31 set (an HTTP conn's,
+		// see httpGenBit): the count wraps after maxDriverGen (2^31-1)
+		// registrations on this loop, and an event reaches the wrong conn only if
+		// the conn now on its number has the event's generation: a multiple of
+		// 2^31-1 registrations would have to come between the two while the event
+		// waits to be dispatched.
+		l.driverGen++
+		if l.driverGen > maxDriverGen {
+			l.driverGen = 1
+		}
+		dc := &driverConn{
+			fd:      fd,
+			gen:     l.driverGen,
+			onRecv:  onRecv,
+			onClose: onClose,
+		}
+		// Publish the conn before arming the descriptor (celeris#770). The
+		// worker looks a driver conn up only while hasDriverConns is set, and
+		// the event is edge triggered: armed first, a first event the worker
+		// took before hasDriverConns was set went to the HTTP path, which read
+		// nothing, and never came again. Published first, a racing worker finds
+		// hasDriverConns set and waits in lookupDriver for driverMu, which is
+		// held here until the conn is in the map.
+		l.driverConns[fd] = dc
+		l.hasDriverConns.Store(true)
+		// Level-triggered EPOLLOUT is added lazily (on EAGAIN) by
+		// flushDriverSendLocked so idle driver conns don't wake the loop on every
+		// send-buffer drain.
+		ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
+		if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
+			delete(l.driverConns, fd)
+			if len(l.driverConns) == 0 {
+				l.hasDriverConns.Store(false)
+			}
+			return fmt.Errorf("celeris/epoll: epoll_ctl ADD fd %d: %w", fd, err)
+		}
+		return nil
+	}()
+	if err != nil {
+		return err
 	}
-	l.driverMu.Unlock()
 	// A loop that PauseAccept parked is in no epoll_wait, so the ADD above
 	// reaches nobody: a conn registered after the park would wait for the next
 	// ResumeAccept (celeris#885 item 39). hasDriverConns is published, and the

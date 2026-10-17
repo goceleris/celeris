@@ -2191,6 +2191,15 @@ func (l *Loop) closeOnReadEnd(fd int, cs *connState, err error) {
 		mu.Lock()
 	}
 	_ = l.flushWrites(cs, true)
+	// An error parked by an earlier read-end that met the running handler is
+	// the conn's story, even when the handler has since returned and its
+	// hand-back is not drained yet: deliver it, once, in place of err, which
+	// is that death seen again (celeris#867). Left parked, closeConn would
+	// deliver it after err.
+	if p := cs.closeErr; p != nil {
+		err = p
+		cs.closeErr = nil
+	}
 	if cs.h1State != nil && cs.h1State.OnError != nil {
 		cs.h1State.OnError(err)
 	}
