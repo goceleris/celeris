@@ -811,6 +811,22 @@ func (l *Loop) run(ctx context.Context) {
 			fd := l.h2Conns[i]
 			cs := l.conns[fd]
 			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+				if cs.writeRefused {
+					// A frame was refused earlier and the conn is closing
+					// (closeWhenFlushed): what its handlers go on queueing is
+					// dropped, as io_uring's write hook does on a closing
+					// conn, not appended behind a backlog that has fallen
+					// below the cap, where it would go out after the cut
+					// frames and the drain clock would count it as the peer
+					// taking more. The close is requested once: a second
+					// closeWhenFlushed per frame was an EPOLL_CTL_MOD each
+					// (celeris#885 item 38).
+					cs.h2State.DrainWriteQueue(discardWrite)
+					if cs.closeSince == 0 {
+						l.closeWhenFlushed(cs)
+					}
+					continue
+				}
 				cs.h2State.DrainWriteQueue(cs.writeFn)
 				if cs.writeRefused {
 					// A frame refused on back-pressure is lost, and the
@@ -1913,6 +1929,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 	}
 }
 
+// discardWrite is the write function the run loop drains the H2 write queue of
+// a conn that is closing on a refused write into: the frames go nowhere.
+func discardWrite([]byte) {}
+
 // closeWhenFlushed closes cs as closeConn does, but only once the response
 // bytes it still has queued have reached the kernel: closeConn's SHUT_WR
 // commits only what the kernel has already taken, so a response larger than
@@ -1955,12 +1975,14 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 //
 // The clock starts once. Both callers can run again on a conn that is already
 // closing, with nothing sent in between: an H2 conn whose write was refused
-// stays on h2Conns with writeRefused set, and the run loop's pass re-enters
-// closeWhenFlushed for every frame a handler goes on queueing; an EPOLLET RDHUP
-// bit is reported again with each later EPOLLOUT edge. A restart there would
-// let a peer that takes nothing hold the conn for as long as a handler keeps
-// writing (an SSE stream: for ever). Only evidence that the peer is taking the
-// response moves the clock (noteClosingProgress, noteClosingAcked). Loop thread.
+// stays on h2Conns with writeRefused set, and the run loop's pass used to
+// re-enter closeWhenFlushed for every frame a handler went on queueing (it now
+// drops those frames and asks for the close once, celeris#885 item 38); an
+// EPOLLET RDHUP bit is reported again with each later EPOLLOUT edge. A restart
+// there would let a peer that takes nothing hold the conn for as long as a
+// handler keeps writing (an SSE stream: for ever). Only evidence that the peer
+// is taking the response moves the clock (noteClosingProgress,
+// noteClosingAcked). Loop thread.
 //
 // pending is the number of bytes queued for cs now (csPendingBytes), the
 // baseline noteClosingProgress compares the next flush against. The caller

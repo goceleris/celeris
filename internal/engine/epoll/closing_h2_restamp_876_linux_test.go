@@ -27,9 +27,11 @@ import (
 // close, then keeps writing 1 KiB every 50 ms (an SSE stream). The peer takes
 // nothing after the burst, so the conn must be reaped about WriteTimeout (1 s)
 // after the refusal, however many frames the handler goes on queueing: the
-// h2Conns pass re-enters closeWhenFlushed for every one, and each re-entry
-// must not restart the drain clock (a restart without progress made the conn
-// immortal for as long as the handler wrote). Before the fix of that restamp
+// h2Conns pass re-entered closeWhenFlushed for every one (it no longer does,
+// celeris#885 item 38, but markClosing still guards the same clock against the
+// EPOLLRDHUP re-entry), and each re-entry must not restart the drain clock (a
+// restart without progress made the conn immortal for as long as the handler
+// wrote). Before the fix of that restamp
 // this conn lived 13 s; ReadTimeout is 4 s and the trickle runs for 6 s, so a
 // conn still open 3 s after the burst fails it whichever clock held it.
 func TestEngineH2ClosingConnIsReapedWhileTheHandlerKeepsWriting(t *testing.T) {
