@@ -741,6 +741,15 @@ const shutdownDriverCloseWorkers = 128
 // flight, in every worker.
 var driverCloseSem = make(chan struct{}, shutdownDriverCloseWorkers)
 
+// closeBound is the semaphore that bounds this worker's driver closes:
+// closeSem when a test gave the worker its own, driverCloseSem otherwise.
+func (w *Worker) closeBound() chan struct{} {
+	if w.closeSem != nil {
+		return w.closeSem
+	}
+	return driverCloseSem
+}
+
 // closeDriverFDs closes the engine's descriptor of each conn, at most
 // shutdownDriverCloseWorkers at a time in the whole process, and returns when
 // every close(2) has returned. The worker used to close them one after
