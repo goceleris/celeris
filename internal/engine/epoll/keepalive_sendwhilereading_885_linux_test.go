@@ -32,6 +32,10 @@ import (
 // WriteTimeout at all, so no client was cut.) WriteTimeout 1 s, ReadTimeout and
 // IdleTimeout 30 s: the only thing that can cut the response is the write
 // clock.
+//
+// There is no arm for an HTTP/2 handler that runs on the loop thread: one
+// WriteResponse of this size delivers nothing to the client on main either
+// (only the server preface arrives), so it says nothing about the clock.
 
 // streamHandler885 answers every HTTP/2 stream with 200 and big, written in 1 MiB
 // chunks, and marks every route async, as the engine's async handlers do, so
@@ -87,7 +91,7 @@ func TestEngineSteadyReaderThatSendsWhileReadingIsNotCutByWriteTimeout885(t *tes
 	for _, tc := range []struct {
 		name  string
 		h2    bool
-		async bool // HTTP/1: AsyncHandlers (an HTTP/2 handler is always streamHandler885's, which runs off the loop thread)
+		async bool // the engine's AsyncHandlers (an HTTP/2 handler is always streamHandler885's, which runs off the loop thread either way)
 		small bool
 		every time.Duration // 0: the client sends nothing while it reads
 	}{
@@ -96,6 +100,7 @@ func TestEngineSteadyReaderThatSendsWhileReadingIsNotCutByWriteTimeout885(t *tes
 		{"h1/async/pipelined-every-5ms", false, true, true, 5 * time.Millisecond},
 		{"h2/silent", true, false, false, 0},
 		{"h2/ping-every-20ms", true, false, false, 20 * time.Millisecond},
+		{"h2/asynchandlers/ping-every-20ms", true, true, false, 20 * time.Millisecond},
 		{"h2/smallsnd/ping-every-5ms", true, false, true, 5 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
