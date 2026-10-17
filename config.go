@@ -112,10 +112,23 @@ type Config struct {
 	// [Server.EngineInfo] (on the adaptive engine, the sum over its two
 	// engines), and the engine logs one line saying how many it started and
 	// why. [Config.MaxConns] is per loop, so the server-wide limit follows the
-	// count. Measured on one big.LITTLE host (io_uring, 256 connections) the
-	// default raised throughput by about half over the previous behaviour, and
-	// about 0.1% of requests took about 200 ms (p999 205 ms against 3.5 to
-	// 15 ms); the cause is not established (celeris#892).
+	// count. Measured on one big.LITTLE host (arm64, 8 big and 4 little CPUs;
+	// one run, 35 s windows, 3 repetitions per cell): against the previous
+	// behaviour the default served 1.14 times the requests per second at
+	// io_uring with 256 connections (1.79 times at 128 connections, 1.22 at
+	// 512, 2.26 for epoll with 4 KiB POST bodies), and 0.93 times those of the
+	// behaviour before celeris#973 at 256 connections (that one pins all 12
+	// loops, 4 of them on the little CPUs: its tail was clean there, but it
+	// gives up #973's protection against the little-CPU stalls of celeris#945
+	// and #1028). The tail is not cleared: at io_uring with 256 connections
+	// 0.12% to 0.17% of requests took 200 to 230 ms (p999 about 205 ms), a
+	// mode the previous behaviour shows at a lower share (0.03% to 0.09%) and
+	// the behaviour before #973 did not; the cause is not established
+	// (celeris#892). A Workers above the non-little CPU count is wrapped over
+	// the pinned big CPUs and showed a worse tail than the default at io_uring
+	// with 512 connections in one run (0.10% to 0.20% of requests at about
+	// 208 ms and maxima of 2.1 to 2.2 s in two of three cells, against 0.01%
+	// to 0.02% and 0.6 to 1.1 s for the default).
 	// Hosts whose CPUs are alike are unchanged (README, "CPU pinning").
 	Workers int
 
