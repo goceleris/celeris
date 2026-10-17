@@ -1737,3 +1737,189 @@ func opFDCloseAttempt(t *testing.T, attempt int) (lingered bool) {
 	}
 	return true
 }
+
+// pipeEnds returns a pipe whose read end stands in for the engine's duplicate
+// of a driver socket (a conn's opFD) and whose write end observes it
+// (readEndOpen): the cleanup closes the write end, and the read end too if
+// nothing else has.
+func pipeEnds(t *testing.T) (rd, wr int) {
+	t.Helper()
+	var p [2]int
+	if err := unix.Pipe2(p[:], unix.O_CLOEXEC); err != nil {
+		t.Fatalf("apparatus: pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		if open, _ := readEndOpen(p[1]); open {
+			_ = unix.Close(p[0])
+		}
+		_ = unix.Close(p[1])
+	})
+	return p[0], p[1]
+}
+
+// readEndOpen reports whether the read end of the pipe whose write end is wr
+// is still open: a one-byte write succeeds, or fails with EPIPE once the read
+// end has been closed, whatever its number was reused for in between (an
+// fstat of that number could be fooled by the reuse). Any other error is
+// returned for the caller to report.
+func readEndOpen(wr int) (open bool, err error) {
+	switch _, werr := unix.Write(wr, []byte{0}); werr {
+	case nil:
+		return true, nil
+	case unix.EPIPE:
+		return false, nil
+	default:
+		return false, werr
+	}
+}
+
+// TestFinalizeDriverClosesUnderTheSharedBound: the close(2) closeOpFD hands
+// to a goroutine runs under a token of the same bound shutdownDrivers' closes
+// take, held across the close (celeris#884 item 55). A lingering close pins an
+// OS thread for the linger time, and the runtime's limit of 10000 threads is
+// fatal, so N simultaneous lingering unregisters must not pin N threads.
+//
+// On a bare worker whose private bound (2) is held in full, finalizeDriver
+// still returns at once (the worker never waits on a close), the descriptors
+// stay open and no onClose fires. Once the tokens are given back, the closes
+// run through the worker's closeFn, which blocks: exactly the bound's worth
+// must be inside it, all tokens held, while the other conns' closes wait. A
+// close that took a token and gave it back before closing, or one that took
+// none, lets more in. When the closes are let go, every descriptor is closed
+// and every conn's onClose fires, once, with the error it was finalized with.
+func TestFinalizeDriverClosesUnderTheSharedBound(t *testing.T) {
+	defer watchdog959(t, time.Minute)()
+	const n, bound = 4, 2
+	sem := make(chan struct{}, bound)
+	for range bound {
+		sem <- struct{}{}
+	}
+	release := sync.OnceFunc(func() {
+		for range bound {
+			<-sem
+		}
+	})
+	defer release()
+
+	var inClose, maxInClose atomic.Int32
+	entered := make(chan struct{}, n)
+	gate := make(chan struct{})
+	openGate := sync.OnceFunc(func() { close(gate) })
+	defer openGate()
+	w := &Worker{driverConns: make(map[int]*driverConn, n), closeSem: sem,
+		closeFn: func(fd int) {
+			cur := inClose.Add(1)
+			for m := maxInClose.Load(); cur > m && !maxInClose.CompareAndSwap(m, cur); m = maxInClose.Load() {
+			}
+			entered <- struct{}{}
+			<-gate
+			inClose.Add(-1)
+			closeFD(fd)
+		}}
+	fired := make(chan error, 2*n)
+	var (
+		dcs []*driverConn
+		wrs []int
+	)
+	for range n {
+		rd, wr := pipeEnds(t)
+		dc := &driverConn{fd: rd, opFD: rd, opFDOpen: true, w: w, onClose: func(err error) { fired <- err }}
+		w.driverConns[rd] = dc
+		dcs, wrs = append(dcs, dc), append(wrs, wr)
+	}
+	w.hasDriverConns.Store(true)
+	finalized := make(chan struct{})
+	// A failing test must not leave closer goroutines running into the next
+	// one: the closes let go, finalizeDriver done (it calls driverClosers.Add,
+	// which must not race the Wait), then every closer waited for.
+	defer func() {
+		release()
+		openGate()
+		select {
+		case <-finalized:
+		case <-time.After(5 * time.Second):
+		}
+		w.waitDriverCloses()
+	}()
+
+	go func() {
+		for _, dc := range dcs {
+			w.finalizeDriver(dc, nil)
+		}
+		close(finalized)
+	}()
+	select {
+	case <-finalized:
+	case <-time.After(2 * time.Second):
+		t.Fatal("finalizeDriver blocked while the close bound was held: the worker must never wait for a close or for its token")
+	}
+	// Give a close that ignores the bound the time to run, then look.
+	time.Sleep(200 * time.Millisecond)
+	if got := inClose.Load(); got != 0 {
+		t.Errorf("%d closes began while every token of the bound was held: closeOpFD does not take one first", got)
+	}
+	for i, wr := range wrs {
+		open, err := readEndOpen(wr)
+		if err != nil {
+			t.Fatalf("conn %d: write to the observer end: %v", i, err)
+		}
+		if !open {
+			t.Errorf("conn %d: the engine's descriptor was closed while every token of the bound was held: closeOpFD does not take one", i)
+		}
+	}
+	if got := w.driverActionPending.Load(); got != 0 {
+		t.Errorf("driver actions pending (%d) while every close was held back, want none: onClose runs after the close", got)
+	}
+	select {
+	case err := <-fired:
+		t.Fatalf("an onClose fired (%v) before the engine's close of its socket", err)
+	default:
+	}
+
+	// The tokens back: `bound` closes get in and block there, the rest wait.
+	release()
+	for range bound {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no close began after the tokens were given back")
+		}
+	}
+	// Give a close that holds no token across close(2) the time to get in.
+	time.Sleep(200 * time.Millisecond)
+	if got, want := inClose.Load(), int32(bound); got != want {
+		t.Errorf("%d closes are in flight with the bound at %d: the token is not held across close(2)", got, want)
+	}
+	if got := len(sem); got != bound {
+		t.Errorf("%d tokens held while %d closes are in flight, want all %d", got, bound, bound)
+	}
+	if got := maxInClose.Load(); got > bound {
+		t.Errorf("%d closes in flight at once with the bound at %d", got, bound)
+	}
+
+	openGate()
+	w.waitDriverCloses()
+	for i, wr := range wrs {
+		open, err := readEndOpen(wr)
+		if err != nil {
+			t.Fatalf("conn %d: write to the observer end: %v", i, err)
+		}
+		if open {
+			t.Errorf("conn %d: the engine's descriptor is still open after the closes were let go and shutdown's wait returned", i)
+		}
+	}
+	if got := maxInClose.Load(); got != bound {
+		t.Errorf("at most %d closes were in flight at once, want exactly %d: the test did not exercise the bound", got, bound)
+	}
+	if len(fired) != n {
+		t.Errorf("%d onClose callbacks fired, want %d", len(fired), n)
+	}
+	for range len(fired) {
+		if err := <-fired; err != nil {
+			t.Errorf("onClose(%v), want nil", err)
+		}
+	}
+	if len(sem) != 0 {
+		t.Errorf("%d tokens still held after every close returned", len(sem))
+	}
+}

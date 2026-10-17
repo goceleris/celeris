@@ -962,8 +962,19 @@ func (l *Loop) run(ctx context.Context) {
 		// loop has already let go of: closed, hijack-settled or handed over,
 		// whose entry does nothing. So the detach flag needs no kick; the
 		// re-check is for symmetry.)
+		//
+		// A driver conn keeps the loop out of the park as well (celeris#885
+		// item 39): connCount counts HTTP conns only, and a parked loop is
+		// not in epoll_wait, so the bytes a registered driver conn is sent
+		// would wait for a ResumeAccept that may never come (an adaptive
+		// sub-engine demoted to standby keeps the conns pinned to it).
+		// hasDriverConns is set before the conn is armed (RegisterConn), and
+		// is re-checked under wakeMu with the other flags; a conn registered
+		// after the loop parked is reached by RegisterConn's
+		// wakeIfSuspended, by the same publish-then-lock pairing.
 		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
 			l.transplantInFlight == 0 && len(l.driverReadQ) == 0 &&
+			!l.hasDriverConns.Load() &&
 			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
 			// A parked loop holds nothing, and sweep() — whose empty-set
 			// retraction is what clears this loop's share of the residual
@@ -977,7 +988,7 @@ func (l *Loop) run(ctx context.Context) {
 				l.sweepRetract()
 			}
 			l.wakeMu.Lock()
-			if !l.acceptPaused.Load() ||
+			if !l.acceptPaused.Load() || l.hasDriverConns.Load() ||
 				l.adoptQPending.Load() != 0 || l.detachQPending.Load() != 0 {
 				l.wakeMu.Unlock()
 				continue
@@ -2162,13 +2173,26 @@ func (l *Loop) closeOnReadEnd(fd int, cs *connState, err error) {
 	mu := cs.detachMu
 	if mu != nil && !mu.TryLock() {
 		if dispatchBusy(cs, nil) {
-			cs.closeErr = err
+			// The first error is the conn's story (celeris#867): a later one
+			// is the same death seen again, and must not replace it.
+			if cs.closeErr == nil {
+				cs.closeErr = err
+			}
 			l.closeConn(fd)
 			return
 		}
 		mu.Lock()
 	}
 	_ = l.flushWrites(cs, true)
+	// An error parked by an earlier read-end that met the running handler is
+	// the conn's story, even when the handler has since returned and its
+	// hand-back is not drained yet: deliver it, once, in place of err, which
+	// is that death seen again (celeris#867). Left parked, closeConn would
+	// deliver it after err.
+	if p := cs.closeErr; p != nil {
+		err = p
+		cs.closeErr = nil
+	}
 	if cs.h1State != nil && cs.h1State.OnError != nil {
 		cs.h1State.OnError(err)
 	}
@@ -4590,6 +4614,17 @@ func (l *Loop) shutdown() {
 				cs.asyncInMu.Unlock()
 			}
 			cs.detachMu.Lock()
+			// A read-end error parked for a close that this shutdown finishes
+			// in its place (closeOnReadEnd met a running handler) is delivered
+			// as closeConn delivers it: under the lock, before detachClosed and
+			// OnDetachClose, or the middleware is never told (celeris#867).
+			// The flush closeConn does first is the send drain's here.
+			if err := cs.closeErr; err != nil {
+				cs.closeErr = nil
+				if cs.h1State != nil && cs.h1State.OnError != nil {
+					cs.h1State.OnError(err)
+				}
+			}
 			cs.detachClosed = true
 			// Acquire barrier — see closeConn: skip OnDetachClose until the WS
 			// upgrade has fully wired the conn (WSReady) to avoid racing the
