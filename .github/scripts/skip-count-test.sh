@@ -60,6 +60,11 @@ if [ "$old" -ne 0 ]; then
 fi
 check "a log of only a joined SKIP line fails" "$dir/only-joined.log" 1 ""
 
+# The same for a subtest's result line, which is indented: the grep of the old tallies
+# anchors on the indentation, so a joined line is missed there too.
+printf '%s\n' '=== RUN   TestA' '=== RUN   TestA/sub' 'x    --- SKIP: TestA/sub (0.00s)' '--- PASS: TestA (0.00s)' >"$dir/joined-sub.log"
+check "a joined subtest SKIP line fails and is listed" "$dir/joined-sub.log" 1 "" 'x    --- SKIP: TestA/sub'
+
 # A pintest child's output is logged with every line prefixed "child| ".
 printf '%s\n' \
   '=== RUN   TestPinned' \
@@ -74,6 +79,20 @@ check "a log with only child SKIP lines counts 0" "$dir/child-only.log" 0 0
 
 : >"$dir/empty.log"
 check "an empty log counts 0" "$dir/empty.log" 0 0
+
+# root-shards.sh tally-shard (the unit-root-shard jobs and the Coverage shards) requires every
+# listed test to PASS by name and no SKIP line; a joined subtest line left the parent's PASS
+# standing, so it needs the helper too. SHARDS_FILE points it at a one-test list.
+if [ "$helper" = .github/scripts/skip-count.sh ]; then
+  printf 'a TestA\n' >"$dir/shards.txt"
+  printf '%s\n' '=== RUN   TestA' '=== RUN   TestA/sub' '    --- PASS: TestA/sub (0.00s)' '--- PASS: TestA (0.00s)' >"$dir/shard-clean.log"
+  status=0
+  SHARDS_FILE="$dir/shards.txt" .github/scripts/root-shards.sh tally-shard a "$dir/shard-clean.log" >/dev/null 2>&1 || status=$?
+  if [ "$status" -ne 0 ]; then echo "FAIL tally-shard on a clean log exits $status, want 0"; fail=1; else echo "ok   tally-shard passes a clean shard log"; fi
+  status=0
+  SHARDS_FILE="$dir/shards.txt" .github/scripts/root-shards.sh tally-shard a "$dir/joined-sub.log" >/dev/null 2>&1 || status=$?
+  if [ "$status" -eq 0 ]; then echo "FAIL tally-shard passes a shard log with a joined subtest SKIP line"; fail=1; else echo "ok   tally-shard fails a shard log with a joined subtest SKIP line"; fi
+fi
 
 status=0
 "$helper" "$dir/missing.log" >/dev/null 2>&1 || status=$?

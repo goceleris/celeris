@@ -1202,15 +1202,16 @@ jobs:
       # celeris#890 (celeris#777 item 3): TestShutdownHooksRunAfterTheDrain with
       # memlock raised. Its engines are built with the default worker count, and a
       # runner's 8 MiB RLIMIT_MEMLOCK funds one io_uring worker (12 MiB each,
-      # internal/engine/iouring/ring.go), so the root shard (job `unit-root-shard`
-      # a, -v, tally by name) runs the io_uring and adaptive cases on one worker.
-      # The drain waits for every worker to stop, so the shape worth covering is
-      # several: here memlock is raised as in job `adaptive`, and the runner's CPUs
-      # (nproc, printed) become the workers. The test fails, never skips, when an
-      # engine does not start, so the tally is the whole check: the test and its
-      # 48 subtests (6 engines x 3 modes, the same again over h2c, and the 4
-      # engines whose route is not async over h2c with an async route) all PASS,
-      # no SKIP and no FAIL line.
+      # internal/engine/iouring/ring.go): in the root shard (job `unit-root-shard`
+      # a, -v, which tallies the top-level names and allows no SKIP or FAIL line)
+      # every io_uring engine of the test logs "workers=1". The drain waits for
+      # every worker to stop, so the shape worth covering is several: here memlock
+      # is raised as in job `adaptive`, and the runner's CPUs (nproc, printed)
+      # become the workers. The test fails, never skips, when an engine does not
+      # start. The tally counts the test and its 48 subtests (6 engines x 3 modes,
+      # the same again over h2c, and the 4 engines whose route is not async over
+      # h2c with an async route): all PASS, no SKIP and no FAIL line, and the
+      # engines' own "workers=N" log lines show more than one worker.
       - name: celeris#703 shutdown hooks run after the drain, several workers (memlock raised, skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -1226,10 +1227,16 @@ jobs:
           allpass=$(grep -cE "^[[:space:]]*--- PASS: ${top}[ /]" /tmp/drain703.log || true)
           failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/drain703.log || true)
           skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drain703.log)
-          echo "celeris#703 drain-order test: RUN $ran PASS $passed (want 1), subtests PASS $subs (want 48), all PASS lines $allpass (want 49), FAIL lines $failed, SKIP lines $skipped"
-          if [ "$ran" -ne 1 ] || [ "$passed" -ne 1 ] || [ "$subs" -ne 48 ] || [ "$allpass" -ne 49 ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
-            echo "expected $top to run once and PASS with its 48 subtests and no FAIL or SKIP line --"
-            echo "was the test renamed or removed, did a case skip or fail, or did a case change (the count of 48 is in the test's loops)?"
+          # The io_uring engine logs the workers it started with ("io_uring engine listening ...
+          # workers=N"): 1 at the runner's 8 MiB (every such line of the shard's log), the runner's
+          # CPUs here. A line with workers=1 means memlock was not raised after all.
+          one=$(grep -cE 'io_uring engine listening .* workers=1 ' /tmp/drain703.log || true)
+          several=$(grep -cE 'io_uring engine listening .* workers=([2-9]|[1-9][0-9]+) ' /tmp/drain703.log || true)
+          echo "celeris#703 drain-order test: RUN $ran PASS $passed (want 1), subtests PASS $subs (want 48), all PASS lines $allpass (want 49), FAIL lines $failed, SKIP lines $skipped; io_uring engine starts with one worker $one (want 0), with several $several (want >= 1)"
+          if [ "$ran" -ne 1 ] || [ "$passed" -ne 1 ] || [ "$subs" -ne 48 ] || [ "$allpass" -ne 49 ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ] || [ "$one" -ne 0 ] || [ "$several" -lt 1 ]; then
+            echo "expected $top to run once and PASS with its 48 subtests and no FAIL or SKIP line, on io_uring engines of several workers --"
+            echo "was the test renamed or removed, did a case skip or fail, did a case change (the count of 48 is in the test's loops),"
+            echo "or did the runner fund one worker (memlock not raised, or one CPU)?"
             exit 1
           fi
       # celeris#890 (celeris#968): -tags http2legacy, x/net's own HTTP/2 server
