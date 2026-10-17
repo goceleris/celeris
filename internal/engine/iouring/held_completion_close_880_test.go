@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // celeris#880 (from celeris#845, item outside-813, and #845 item 3): a send
@@ -57,8 +59,14 @@ func markClosing880(w *Worker, cs *connState) {
 	// "Long ago" includes the sweeps that sampled the peer's acknowledged bytes
 	// since (celeris#884 item 52) and found none: a conn first met after its
 	// bound with no sample is given one more bound, and these tests are about
-	// the teardown, not about that rule.
+	// the teardown, not about that rule. The sample's count is the socket's own,
+	// as those sweeps left it: the sweep that reaps takes a fresh sample
+	// (celeris#884 item 52), and bytes the peer's kernel had acknowledged
+	// before the conn was marked are not growth since.
 	cs.closeAckedKnown, cs.closeSampled = true, time.Now().UnixNano()
+	if ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO); err == nil {
+		cs.closeAcked = ti.Bytes_acked
+	}
 }
 
 // holdZCFirstCompletion880 places a SEND_ZC on cs, a conn whose dispatch
