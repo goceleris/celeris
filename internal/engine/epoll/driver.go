@@ -258,13 +258,13 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 	}
 
 	l.driverMu.Lock()
-	defer l.driverMu.Unlock()
 
 	// HTTP accept path writes l.conns[fd] on the worker goroutine; a concurrent
 	// driver registration for the same fd would race. Re-check under the lock
 	// to close the TOCTOU window — a racy accept could have run between an
 	// earlier unlocked check and this lock acquisition.
 	if fd < len(l.conns) && l.conns[fd] != nil {
+		l.driverMu.Unlock()
 		return fmt.Errorf("celeris/epoll: fd %d is already an HTTP connection", fd)
 	}
 
@@ -272,6 +272,7 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 		l.driverConns = make(map[int]*driverConn)
 	}
 	if _, exists := l.driverConns[fd]; exists {
+		l.driverMu.Unlock()
 		return fmt.Errorf("celeris/epoll: fd %d is already registered", fd)
 	}
 
@@ -311,8 +312,20 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 		if len(l.driverConns) == 0 {
 			l.hasDriverConns.Store(false)
 		}
+		l.driverMu.Unlock()
 		return fmt.Errorf("celeris/epoll: epoll_ctl ADD fd %d: %w", fd, err)
 	}
+	l.driverMu.Unlock()
+	// A loop that PauseAccept parked is in no epoll_wait, so the ADD above
+	// reaches nobody: a conn registered after the park would wait for the next
+	// ResumeAccept (celeris#885 item 39). hasDriverConns is published, and the
+	// descriptor armed, before this; the park re-checks the flag under wakeMu,
+	// so either it sees the flag and stays out, or it set suspended first and
+	// this call finds it (see wakeIfSuspended). After driverMu is released:
+	// wakeMu is a leaf lock, taken with nothing held. A no-op on a loop that is
+	// running, and on the failure paths above, which published nothing a loop
+	// could be left waiting for.
+	l.wakeIfSuspended()
 	return nil
 }
 
