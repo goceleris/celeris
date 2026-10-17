@@ -164,3 +164,37 @@ func TestIouringRemainderSendSetsTheWatches884(t *testing.T) {
 		t.Errorf("a sweep left remainderOut=%v remainderWatch=%v for a conn with no SEND outstanding", cs.remainderOut, w.remainderWatch)
 	}
 }
+
+// TestIouringLongSendCompletionEndsRemainderWatchAtOnce884: the mode-3a ban
+// (remainderWatch) lasts as long as a marked SEND is outstanding, not until
+// the next sweep. A large response to a client that reads normally is marked
+// (longSendBytes) and completes within a pass; if the worker stayed out of its
+// untimed wait for the 1 to 2 s until the sweep re-derived the mark, a worker
+// that serves one such response per sweep interval would never get mode 3a
+// back and every wait would pay the ext_arg and the hrtimer.
+func TestIouringLongSendCompletionEndsRemainderWatchAtOnce884(t *testing.T) {
+	rig := newStallRig704(t)
+	w, cs := rig.w, rig.cs
+	w.cfg.WriteTimeout = time.Hour
+	w.cfg.IdleTimeout = time.Hour
+	w.cfg.ReadTimeout = time.Hour
+
+	cs.writeBuf = append(cs.writeBuf[:0], make([]byte, longSendBytes)...)
+	if w.flushSend(cs) {
+		t.Fatalf("apparatus: flushSend found no SQE")
+	}
+	takeSQEs(w.ring)
+	if !cs.remainderOut || !w.remainderWatch {
+		t.Fatalf("apparatus: the long SEND left remainderOut=%v remainderWatch=%v, want both true", cs.remainderOut, w.remainderWatch)
+	}
+	w.handleSend(sendCQE750(rig, int32(longSendBytes), 0), rig.local, time.Now().UnixNano())
+	if cs.remainderOut {
+		t.Fatalf("the long SEND's completion left remainderOut set")
+	}
+	if w.remainderWatch {
+		t.Errorf("the only marked SEND completed and remainderWatch is still set: the worker stays out of mode 3a until the next sweep")
+	}
+	if !waitUntimed(true, true, false, w.remainderWatch) {
+		t.Errorf("waitUntimed is false after the only marked SEND completed")
+	}
+}
