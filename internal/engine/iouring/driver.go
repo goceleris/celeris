@@ -99,8 +99,9 @@ type driverConn struct {
 // it also ends armDriverRecv's refusal, which goes through failDriverConn)
 // and shutdownDrivers (after which nothing is submitted; closing the ring
 // cancels what is armed). Setting closing too makes a later UnregisterConn
-// or Write a no-op, so neither queues work for a conn that is gone, and
-// every path that prepares an SQE checks closing first.
+// a no-op and a later Write fail with ErrUnknownFD, so neither queues work for
+// a conn that is gone, and every path that prepares an SQE checks closing
+// first.
 //
 // retire does not close. close(2) can block: with SO_LINGER set and data
 // still unsent to a peer that is not reading, the last close of a socket
@@ -293,7 +294,14 @@ func (w *Worker) UnregisterConn(fd int) error {
 }
 
 // Write enqueues data for fd. Returns ErrQueueFull if the per-FD outbound
-// buffer would exceed driverSendCap, and ErrUnknownFD if fd isn't registered.
+// buffer would exceed driverSendCap, and ErrUnknownFD if fd isn't registered
+// or is closing: after UnregisterConn, or after the conn failed, its bytes are
+// not sent, and Write says so, as the epoll engine does for a number it no
+// longer knows (celeris#884 item 54). It used to report success and drop them.
+// The closing branch below answers the window between the unregister or the
+// failure and finalizeDriver; finalizeDriver deletes the conn from the map
+// before the engine's descriptor is closed and onClose runs, so a Write after
+// that misses the lookup and gets the same answer.
 func (w *Worker) Write(fd int, data []byte) error {
 	w.driverMu.RLock()
 	dc, ok := w.driverConns[fd]
@@ -304,7 +312,7 @@ func (w *Worker) Write(fd int, data []byte) error {
 	dc.mu.Lock()
 	if dc.closing {
 		dc.mu.Unlock()
-		return nil
+		return engine.ErrUnknownFD
 	}
 	if len(dc.writeBuf)+len(dc.sendBuf)+len(data) > driverSendCap {
 		dc.mu.Unlock()
@@ -700,8 +708,9 @@ func (w *Worker) shutdownDrivers() {
 	w.shutdownDriverHold = append(w.shutdownDriverHold, conns...)
 	w.driverMu.Unlock()
 
-	// Retire every conn first (a later UnregisterConn or Write is then a no-op),
-	// close the engine's descriptors in parallel, and only then fire the
+	// Retire every conn first (a later UnregisterConn is then a no-op and a
+	// later Write fails with ErrUnknownFD), close the engine's descriptors in
+	// parallel, and only then fire the
 	// onCloses, in this goroutine, each after its socket's close(2) has
 	// returned (celeris#866).
 	//

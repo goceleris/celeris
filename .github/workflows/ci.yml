@@ -1585,7 +1585,8 @@ jobs:
       # driver's RegisterConn does not race the worker's writes of the conn
       # table (celeris#959; the two race tests, one of them through the
       # adaptive engine started on io_uring, need -race, which this step runs
-      # under).
+      # under). One more, in the `new` list, pins that Write on a closing
+      # driver conn reports ErrUnknownFD, not success (celeris#884 item 54).
       # TestDriverHTTPZeroOverhead is where the leak was first seen: 2 of 7
       # full-package runs failed on #674's branch (#691).
       #
@@ -1598,7 +1599,7 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           old='TestDriverRegisterUnregister|TestDriverHTTPZeroOverhead|TestDriverWriteSerialization|TestDriverCancelOnUnregister|TestIouringRegisterConnFDCollision|TestIouringShutdownFiresDriverOnClose|TestDriverUnknownFDReturnsErr|TestShutdownDriversRetainsConnsWithOpsInFlight'
-          new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors|TestDriverRegisterAfterShutdownIsRefused|TestDriverRegisterRacingShutdownReleasesEverySocket|TestDriverRecvRearmBeforeSubmitSparesReusedNumber|TestDriverSendBeforeSubmitSparesReusedNumber|TestDriverFailureCancelCompletesBeforeRelease|TestDriverFailureCloseCompletionSparesConnOnReusedNumber|TestDriverStrayCloseCompletionSparesConn|TestDriverUnregisterWithSendInFlightThenNumberTakenByHTTP|TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP|TestDriverRefusedRegisterWaitsForItsSend'
+          new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors|TestDriverRegisterAfterShutdownIsRefused|TestDriverRegisterRacingShutdownReleasesEverySocket|TestDriverRecvRearmBeforeSubmitSparesReusedNumber|TestDriverSendBeforeSubmitSparesReusedNumber|TestDriverFailureCancelCompletesBeforeRelease|TestDriverFailureCloseCompletionSparesConnOnReusedNumber|TestDriverStrayCloseCompletionSparesConn|TestDriverUnregisterWithSendInFlightThenNumberTakenByHTTP|TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP|TestDriverRefusedRegisterWaitsForItsSend|TestDriverWriteAfterUnregisterReturnsErrUnknownFD884'
           n735='TestDriverLingeringCloseDoesNotStallTheWorker|TestDriverShutdownWaitsForAHandedOffClose'
           n866='TestShutdownDriversClosesLingeringDescriptorsInParallel866|TestCloseFDsInParallelBound866|TestCloseFDsInParallelBoundIsSharedByWorkers866|TestCloseDriverFDsUsesTheEngineWideBound866'
           n959='TestRegisterConnRacesAcceptAndClose959|TestAdaptiveRegisterConnRacesAcceptAndClose959|TestConnSlotWritesGoThroughTheHelpers959|TestConnSlotGuardSeesABareWrite959|TestConnSlotHelpersTakeConnsMu959'
