@@ -5,13 +5,14 @@ package eventloop
 // celeris#784 item 1: once UnregisterConn has returned, the standalone loop
 // must not read the conn's descriptor NUMBER again, nor tear down whatever
 // the number names by then. The owner closes the fd as soon as UnregisterConn
-// returns (redis, memcached), or the conn's onClose closes it (postgres), and
-// the next socket the process opens, a driver conn or an HTTP connection the
-// server accepts, usually gets the same number.
+// returns (redis, memcached; postgres closes it in Close, after UnregisterConn
+// and after its background goroutines, since celeris#935), and the next socket
+// the process opens, a driver conn or an HTTP connection the server accepts,
+// usually gets the same number.
 //
 // Each test parks the reader inside the conn's onRecv (or uses a worker with no
 // goroutine of its own), unregisters the conn, closes it, puts a new socket on
-// the same number with dup3, and only then lets the reader go on. Nothing here
+// the same number (c784TakeNumber), and only then lets the reader go on. Nothing here
 // depends on timing except the bound on how long a worker may take to serve
 // another conn.
 
@@ -106,46 +107,6 @@ func c784RegisterParked(t *testing.T, w engine.WorkerLoop, shutWr bool) *c784Con
 		t.Fatal("the worker never entered A's onRecv")
 	}
 	return c
-}
-
-// c784TakeNumber closes nothing: the caller has closed fd. It opens a new
-// socketpair and puts one end on fd's number, the way the next accept or dial
-// of the process would reuse it. It returns the socket now on the number
-// (== fd) and its peer. Either end of the new pair may already be fd, the
-// lowest free number; otherwise the first end is moved onto fd with dup3,
-// and the other end is never fd, so dup3 never closes the peer.
-func c784TakeNumber(t *testing.T, fd int, nonblock bool) (int, int) {
-	t.Helper()
-	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		t.Fatalf("socketpair: %v", err)
-	}
-	var peer int
-	switch fd {
-	case pair[0]:
-		peer = pair[1]
-	case pair[1]:
-		peer = pair[0]
-	default:
-		if err := unix.Dup3(pair[0], fd, unix.O_CLOEXEC); err != nil {
-			t.Fatalf("dup3 onto %d: %v", fd, err)
-		}
-		_ = unix.Close(pair[0])
-		peer = pair[1]
-	}
-	if nonblock {
-		if err := unix.SetNonblock(fd, true); err != nil {
-			t.Fatalf("nonblock: %v", err)
-		}
-		if err := unix.SetNonblock(peer, true); err != nil {
-			t.Fatalf("nonblock: %v", err)
-		}
-	}
-	t.Cleanup(func() {
-		_ = unix.Close(fd)
-		_ = unix.Close(peer)
-	})
-	return fd, peer
 }
 
 // c784Serves reports whether w delivers a byte to another conn within d,
