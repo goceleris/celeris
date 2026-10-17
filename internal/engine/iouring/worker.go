@@ -1163,7 +1163,8 @@ func (w *Worker) run(ctx context.Context) {
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}
-	// celeris#909: a worker planned unpinned, or whose pin failed, has cpuID
+	// celeris#909: a worker whose pin failed (the planner plans none unpinned
+	// since celeris#1036; a test plan can) has cpuID
 	// -1: no NUMA node to bind to, and NewRingCPU sets no SQPOLL affinity.
 	w.pinOwnThread()
 

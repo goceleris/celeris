@@ -21,7 +21,8 @@ import (
 // (see SaveThreadAffinity, celeris#905).
 //
 // A negative cpu is refused (EINVAL): the mask would name a far-away bit, and
-// "no CPU" is how the engines say "unpinned" (PlanWorkerCPUs). So is a cpu
+// "no CPU" is how the engines say "unpinned" (a plan entry of -1, which
+// PlanWorkerCPUs does not produce since celeris#1036). So is a cpu
 // past maxAffinityBits, which no kernel has. A cpu of 1024 or more gets a mask
 // as long as it needs: a 1024-bit unix.CPUSet drops such a bit and asks the
 // kernel for an empty mask.
