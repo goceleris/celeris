@@ -253,3 +253,39 @@ func TestClosingDrainOfAFixedFileConnIsNotSampled884(t *testing.T) {
 		t.Fatalf("a fixed-file closing conn past its drain clock was kept on evidence read from its slot number")
 	}
 }
+
+// TestClosingDrainIsSampledBeforeItIsReapedWhateverTheSampleRate884: samples are
+// rate limited to a quarter of the bound and a conn's first sample is only a
+// baseline. A worker whose sweeps are irregular (ReadHeaderTimeout off with
+// mixed load) can meet a closing conn late in its bound (the baseline, 0.9
+// bound in) and sweep again past the bound but inside a quarter of it from the
+// baseline: the bound test used to reap the conn on the baseline's evidence
+// though the peer had acknowledged bytes since. The sweep that is about to reap
+// takes a fresh sample first. The stamps are moved back by hand for the time
+// between the sweeps, as the tests above do.
+func TestClosingDrainIsSampledBeforeItIsReapedWhateverTheSampleRate884(t *testing.T) {
+	ring := newTestRing(t)
+	w, cs, peer := newTCPClosingDrainWorker(t, ring)
+	fd := cs.fd
+	bound := time.Duration(w.closingDrainBound())
+	cs.closing = true
+	cs.lastActivity = time.Now().Add(-bound * 9 / 10).UnixNano()
+
+	w.checkTimeouts() // the baseline, 0.9 bound into the drain
+	if w.conns[fd] != cs || cs.closeSampled == 0 || !cs.closeAckedKnown {
+		t.Fatalf("PREMISE: the first sweep did not keep the conn and take its baseline")
+	}
+	if got := peerReads(t, peer, 256<<10); got < 64<<10 {
+		t.Fatalf("PREMISE: the peer took only %d bytes", got)
+	}
+	shift := int64(bound * 15 / 100) // past the bound, inside bound/4 of the baseline
+	cs.lastActivity -= shift
+	cs.closeSampled -= shift
+	w.checkTimeouts()
+	if w.conns[fd] != cs {
+		t.Fatalf("a closing conn whose peer acknowledged bytes since the baseline sample was reaped at 1.05 bound without a fresh sample (the rate limit of bound/4 stood in for it)")
+	}
+	if now := time.Now().UnixNano(); now-cs.lastActivity > int64(time.Second) {
+		t.Errorf("the sweep kept the conn but left the drain clock %v old", time.Duration(now-cs.lastActivity))
+	}
+}
