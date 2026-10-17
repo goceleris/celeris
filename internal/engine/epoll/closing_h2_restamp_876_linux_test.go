@@ -223,8 +223,20 @@ func TestEngineH2ClosingConnTakesNoFrameTheHandlerWritesAfterTheRefusal885(t *te
 	const trickleFor = 8 * time.Second
 	// The close is asked once, however many frames the handler writes after:
 	// each further request is an EPOLL_CTL_MOD (celeris#885 item 38).
+	// Counted for the first conn the hook sees: loops of an earlier test's
+	// engine may still be winding down, and a count over the process would
+	// include their closes.
 	var closeAsks atomic.Int64
-	askHook := func(*connState) { closeAsks.Add(1) }
+	var asked atomic.Pointer[connState]
+	askHook := func(cs *connState) {
+		if cs.h2State == nil {
+			return // this test's one conn is an h2c conn
+		}
+		asked.CompareAndSwap(nil, cs)
+		if asked.Load() == cs {
+			closeAsks.Add(1)
+		}
+	}
 	testHookCloseWhenFlushed.Store(&askHook)
 	t.Cleanup(func() { testHookCloseWhenFlushed.Store(nil) }) // runs after the engine is stopped
 	h := stream.HandlerFunc(func(ctx context.Context, s *stream.Stream) error {

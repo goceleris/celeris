@@ -7148,11 +7148,16 @@ func (w *Worker) checkTimeouts() {
 			// completion that sent some (celeris#884 item 52). Read before
 			// the bound is tested: growth restamps the clock.
 			bound := w.closingDrainBound()
-			// A sample is due every quarter of the bound, and always before
-			// the bound test below reaps: the rate limit must not stand in
-			// for a fresh look when sweeps are irregular (a conn first met
-			// late in its bound, the next sweep past it).
-			if !cs.fixedFile && (now-cs.closeSampled >= bound/4 || now-cs.lastActivity > bound) {
+			// A sample is due every quarter of the bound, and once more when
+			// the bound has passed since the last one was taken before it: the
+			// rate limit must not stand in for a fresh look at the moment of
+			// the reap when sweeps are irregular (a conn first met late in its
+			// bound, the next sweep past it). Once a sample is from past the
+			// bound, a conn that stays (held sends, another bound) waits for
+			// the rate limit again, so this costs one getsockopt per reap
+			// decision, not one per sweep.
+			if !cs.fixedFile && (now-cs.closeSampled >= bound/4 ||
+				(now-cs.lastActivity > bound && cs.closeSampled <= cs.lastActivity+bound)) {
 				w.noteClosingAcked(cs, now)
 			}
 			if now-cs.lastActivity > bound {

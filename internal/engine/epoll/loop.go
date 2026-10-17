@@ -4154,11 +4154,16 @@ func (l *Loop) checkTimeouts() {
 		// peerClosed without it (a test fixture) takes the scan below.
 		if cs.closeSince != 0 {
 			bound := l.closingDrainBound()
-			// A sample is due every quarter of the bound, and always before
-			// the bound test below reaps: the rate limit must not stand in
-			// for a fresh look when sweeps are irregular (a conn first met
-			// late in its bound, the next sweep past it).
-			if time.Duration(now-cs.closeSampled) >= bound/4 || time.Duration(now-cs.closeSince) > bound {
+			// A sample is due every quarter of the bound, and once more when
+			// the bound has passed since the last one was taken before it: the
+			// rate limit must not stand in for a fresh look at the moment of
+			// the reap when sweeps are irregular (a conn first met late in its
+			// bound, the next sweep past it). Once a sample is from past the
+			// bound, a conn that stays (it was given another bound) waits for
+			// the rate limit again, so this costs one getsockopt per reap
+			// decision, not one per sweep.
+			if time.Duration(now-cs.closeSampled) >= bound/4 ||
+				(time.Duration(now-cs.closeSince) > bound && cs.closeSampled <= cs.closeSince+int64(bound)) {
 				l.noteClosingAcked(cs, now)
 			}
 			if time.Duration(now-cs.closeSince) > bound {
