@@ -182,6 +182,7 @@ type Loop struct {
 	tickCounter       uint32
 	consecutiveEmpty  uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow         int64  // cached time.Now().UnixNano(), refreshed once per events return
+	lastSweep         int64  // time.Now().UnixNano() at the start of the last checkTimeouts, any caller; the run loop's gate tests it against sweepFloor (celeris#885 item 29)
 
 	// The #383 transplant ledger, engine-wide and shared like the counters
 	// above; all of them are nil-safe so a bare test Loop literal can skip
@@ -497,10 +498,10 @@ func (l *Loop) run(ctx context.Context) {
 	if l.cfg.ReadHeaderTimeout > 0 {
 		tfd, tfdErr := unix.TimerfdCreate(unix.CLOCK_MONOTONIC, unix.TFD_NONBLOCK|unix.TFD_CLOEXEC)
 		if tfdErr == nil {
-			// 25ms periodic; first fire at 25ms too.
+			// sweepFloor periodic (25 ms); first fire at the same.
 			spec := unix.ItimerSpec{
-				Interval: unix.Timespec{Sec: 0, Nsec: 25 * 1000 * 1000},
-				Value:    unix.Timespec{Sec: 0, Nsec: 25 * 1000 * 1000},
+				Interval: unix.Timespec{Sec: 0, Nsec: int64(sweepFloor)},
+				Value:    unix.Timespec{Sec: 0, Nsec: int64(sweepFloor)},
 			}
 			if err := unix.TimerfdSettime(tfd, 0, &spec, nil); err != nil {
 				_ = unix.Close(tfd)
@@ -876,9 +877,17 @@ func (l *Loop) run(ctx context.Context) {
 		// when detached conns exist with idle deadlines the gate tightens to
 		// every 32 iterations so the WS idle-close fires within its
 		// configured budget. An iteration is one epoll_wait return, so the
-		// wall time between sweeps depends on the load: on a busy loop it is
-		// well under a millisecond, and the timerfd (25 ms) is only the floor
-		// on an idle one. When
+		// wall time between gate hits depends on the load: on a busy loop it
+		// is well under a millisecond, and the timerfd (25 ms) is only the
+		// floor on an idle one. So a gate hit sweeps only when sweepFloor has
+		// passed since the last sweep, by whoever made it (this gate, or the
+		// timerfd's): a busy loop then sweeps about once per sweepFloor
+		// instead of thousands of times a second (celeris#885 item 29). The
+		// price is that a detached conn's expired idle deadline is reaped up
+		// to sweepFloor plus the iterations of one gate stride after it
+		// expires, not 32 iterations after; the same 25 ms the timerfd gives
+		// a header deadline. A clock that stepped back (d < 0) sweeps, or
+		// the sweep would wait for the clock to catch up. When
 		// ReadHeaderTimeout is enabled (the v1.4.11 slowloris defence),
 		// the gate ALSO tightens to 0x1F — the in-process synthetic
 		// reproducer (test/integration/slowloris_synthetic_test.go) showed
@@ -889,7 +898,10 @@ func (l *Loop) run(ctx context.Context) {
 			gate = 0x1F
 		}
 		if l.tickCounter&gate == 0 {
-			l.checkTimeouts()
+			// The clock is read at a gate hit only, one iteration in 32.
+			if d := time.Now().UnixNano() - l.lastSweep; d >= int64(sweepFloor) || d < 0 {
+				l.checkTimeouts()
+			}
 		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, events
@@ -3982,10 +3994,12 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	return snap, true
 }
 
-// sweepFloor is the least time between two checkTimeouts sweeps of a loop:
-// the period of the timerfd that guarantees a sweep on an idle one (the run
-// loop's gate tests it, so a busy loop's iterations do not sweep oftener;
-// celeris#885 item 29).
+// sweepFloor is the least time between two checkTimeouts sweeps that the run
+// loop's iteration gate asks for, and the period of the timerfd that
+// guarantees one on an idle loop. A busy loop's iterations are well under a
+// millisecond apart, and a gate that counts them swept thousands of times a
+// second (celeris#885 item 29); this is the bound the timerfd already promises
+// a conn's header deadline.
 const sweepFloor = 25 * time.Millisecond
 
 // testHookCheckTimeouts, when set, runs at the start of every checkTimeouts
@@ -3998,15 +4012,16 @@ var testHookCheckTimeouts atomic.Pointer[func(*Loop)]
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout.
 //
-// Cadence: the sweep is driven by the loop's own iterations, not by a clock.
-// The run loop calls it every 32 epoll_wait iterations when ReadHeaderTimeout
-// is set (the default is 10 s) or a conn is detached, otherwise every 1024,
-// and the 25 ms timerfd (armed only when ReadHeaderTimeout is set) is a floor
-// that guarantees a sweep on an idle loop, not a ceiling. A busy loop sweeps
-// as often as its iterations allow. Measured on 2 loops with 4096 idle
-// keep-alive conns each (celeris PR 969): about 120 sweeps a second in all with
-// no traffic (the timerfd alone gives 80), and 1,800 to 6,200 a second in all
-// with one to sixteen busy clients.
+// Cadence: the run loop calls it from the gate every 32 epoll_wait iterations
+// when ReadHeaderTimeout is set (the default is 10 s) or a conn is detached,
+// otherwise every 1024, but only when sweepFloor (25 ms) has passed since the
+// last sweep (lastSweep, stamped here, so the timerfd's sweeps count too); the
+// 25 ms timerfd (armed only when ReadHeaderTimeout is set) guarantees one on an
+// idle loop. A busy loop therefore sweeps about 40 times a second, where the
+// gate alone swept as often as its iterations allowed: measured on 2 loops with
+// 4096 idle keep-alive conns each, before the floor (celeris PR 969): about 120
+// sweeps a second in all with no traffic (the timerfd alone gives 80), and
+// 1,800 to 6,200 a second in all with one to sixteen busy clients.
 //
 // Iterates the dense liveConns slice (#318) rather than the sparse
 // 0..maxFD range, so the cost is O(active conns) regardless of FD space.
@@ -4016,6 +4031,7 @@ var testHookCheckTimeouts atomic.Pointer[func(*Loop)]
 // touches indices we've already visited.
 func (l *Loop) checkTimeouts() {
 	now := time.Now().UnixNano()
+	l.lastSweep = now
 	if h := testHookCheckTimeouts.Load(); h != nil {
 		(*h)(l)
 	}
