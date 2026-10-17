@@ -182,6 +182,7 @@ type Loop struct {
 	tickCounter       uint32
 	consecutiveEmpty  uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow         int64  // cached time.Now().UnixNano(), refreshed once per events return
+	lastSweep         int64  // time.Now().UnixNano() at the start of the last checkTimeouts, any caller; the run loop's gate tests it against sweepFloor (celeris#885 item 29)
 
 	// The #383 transplant ledger, engine-wide and shared like the counters
 	// above; all of them are nil-safe so a bare test Loop literal can skip
@@ -497,10 +498,10 @@ func (l *Loop) run(ctx context.Context) {
 	if l.cfg.ReadHeaderTimeout > 0 {
 		tfd, tfdErr := unix.TimerfdCreate(unix.CLOCK_MONOTONIC, unix.TFD_NONBLOCK|unix.TFD_CLOEXEC)
 		if tfdErr == nil {
-			// 25ms periodic; first fire at 25ms too.
+			// sweepFloor periodic (25 ms); first fire at the same.
 			spec := unix.ItimerSpec{
-				Interval: unix.Timespec{Sec: 0, Nsec: 25 * 1000 * 1000},
-				Value:    unix.Timespec{Sec: 0, Nsec: 25 * 1000 * 1000},
+				Interval: unix.Timespec{Sec: 0, Nsec: int64(sweepFloor)},
+				Value:    unix.Timespec{Sec: 0, Nsec: int64(sweepFloor)},
 			}
 			if err := unix.TimerfdSettime(tfd, 0, &spec, nil); err != nil {
 				_ = unix.Close(tfd)
@@ -810,6 +811,22 @@ func (l *Loop) run(ctx context.Context) {
 			fd := l.h2Conns[i]
 			cs := l.conns[fd]
 			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+				if cs.writeRefused {
+					// A frame was refused earlier and the conn is closing
+					// (closeWhenFlushed): what its handlers go on queueing is
+					// dropped, as io_uring's write hook does on a closing
+					// conn, not appended behind a backlog that has fallen
+					// below the cap, where it would go out after the cut
+					// frames and the drain clock would count it as the peer
+					// taking more. The close is requested once: a second
+					// closeWhenFlushed per frame was an EPOLL_CTL_MOD each
+					// (celeris#885 item 38).
+					cs.h2State.DrainWriteQueue(discardWrite)
+					if cs.closeSince == 0 {
+						l.closeWhenFlushed(cs)
+					}
+					continue
+				}
 				cs.h2State.DrainWriteQueue(cs.writeFn)
 				if cs.writeRefused {
 					// A frame refused on back-pressure is lost, and the
@@ -876,9 +893,17 @@ func (l *Loop) run(ctx context.Context) {
 		// when detached conns exist with idle deadlines the gate tightens to
 		// every 32 iterations so the WS idle-close fires within its
 		// configured budget. An iteration is one epoll_wait return, so the
-		// wall time between sweeps depends on the load: on a busy loop it is
-		// well under a millisecond, and the timerfd (25 ms) is only the floor
-		// on an idle one. When
+		// wall time between gate hits depends on the load: on a busy loop it
+		// is well under a millisecond, and the timerfd (25 ms) is only the
+		// floor on an idle one. So a gate hit sweeps only when sweepFloor has
+		// passed since the last sweep, by whoever made it (this gate, or the
+		// timerfd's): a busy loop then sweeps about once per sweepFloor
+		// instead of thousands of times a second (celeris#885 item 29). The
+		// price is that a detached conn's expired idle deadline is reaped up
+		// to sweepFloor plus the iterations of one gate stride after it
+		// expires, not 32 iterations after; the same 25 ms the timerfd gives
+		// a header deadline. A clock that stepped back (d < 0) sweeps, or
+		// the sweep would wait for the clock to catch up. When
 		// ReadHeaderTimeout is enabled (the v1.4.11 slowloris defence),
 		// the gate ALSO tightens to 0x1F — the in-process synthetic
 		// reproducer (test/integration/slowloris_synthetic_test.go) showed
@@ -889,7 +914,10 @@ func (l *Loop) run(ctx context.Context) {
 			gate = 0x1F
 		}
 		if l.tickCounter&gate == 0 {
-			l.checkTimeouts()
+			// The clock is read at a gate hit only, one iteration in 32.
+			if d := time.Now().UnixNano() - l.lastSweep; d >= int64(sweepFloor) || d < 0 {
+				l.checkTimeouts()
+			}
 		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, events
@@ -1901,6 +1929,17 @@ func (l *Loop) drainRead(fd int, now int64) {
 	}
 }
 
+// testHookCloseWhenFlushed, when set, runs at the start of every
+// closeWhenFlushed, on the loop's goroutine. The H2 closing test counts the
+// requests a conn makes: each one past the first is an EPOLL_CTL_MOD
+// (celeris#885 item 38). An atomic pointer, as testHookCheckTimeouts is; a load
+// and a nil test per close request, which is never a hot path.
+var testHookCloseWhenFlushed atomic.Pointer[func(*connState)]
+
+// discardWrite is the write function the run loop drains the H2 write queue of
+// a conn that is closing on a refused write into: the frames go nowhere.
+func discardWrite([]byte) {}
+
 // closeWhenFlushed closes cs as closeConn does, but only once the response
 // bytes it still has queued have reached the kernel: closeConn's SHUT_WR
 // commits only what the kernel has already taken, so a response larger than
@@ -1917,6 +1956,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 // Loop thread, with no handler of cs's running: the inline path after its
 // handler returned, or drainDetachQueue after the dispatch goroutine exited.
 func (l *Loop) closeWhenFlushed(cs *connState) {
+	if h := testHookCloseWhenFlushed.Load(); h != nil {
+		(*h)(cs)
+	}
 	if (cs.h1State != nil && cs.h1State.Detached.Load()) || !csWritePending(cs) {
 		l.closeConn(cs.fd)
 		return
@@ -1943,12 +1985,14 @@ func (l *Loop) closeWhenFlushed(cs *connState) {
 //
 // The clock starts once. Both callers can run again on a conn that is already
 // closing, with nothing sent in between: an H2 conn whose write was refused
-// stays on h2Conns with writeRefused set, and the run loop's pass re-enters
-// closeWhenFlushed for every frame a handler goes on queueing; an EPOLLET RDHUP
-// bit is reported again with each later EPOLLOUT edge. A restart there would
-// let a peer that takes nothing hold the conn for as long as a handler keeps
-// writing (an SSE stream: for ever). Only evidence that the peer is taking the
-// response moves the clock (noteClosingProgress, noteClosingAcked). Loop thread.
+// stays on h2Conns with writeRefused set, and the run loop's pass used to
+// re-enter closeWhenFlushed for every frame a handler went on queueing (it now
+// drops those frames and asks for the close once, celeris#885 item 38); an
+// EPOLLET RDHUP bit is reported again with each later EPOLLOUT edge. A restart
+// there would let a peer that takes nothing hold the conn for as long as a
+// handler keeps writing (an SSE stream: for ever). Only evidence that the peer
+// is taking the response moves the clock (noteClosingProgress,
+// noteClosingAcked). Loop thread.
 //
 // pending is the number of bytes queued for cs now (csPendingBytes), the
 // baseline noteClosingProgress compares the next flush against. The caller
@@ -2070,7 +2114,8 @@ func (cs *connState) endWriteSlow() {
 // evidence.
 //
 // Not on the hot path: checkTimeouts calls it for a closing conn, at most
-// every quarter of the bound (closeSampled), and it costs one getsockopt. A
+// every quarter of the bound (closeSampled) and once more before it reaps one,
+// and it costs one getsockopt. A
 // descriptor that is not a TCP socket, or a kernel that does not report the
 // count (before Linux 4.1), yields no evidence, which leaves the userspace
 // queue's rule alone. Loop thread.
@@ -3982,18 +4027,34 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	return snap, true
 }
 
+// sweepFloor is the least time between two checkTimeouts sweeps that the run
+// loop's iteration gate asks for, and the period of the timerfd that
+// guarantees one on an idle loop. A busy loop's iterations are well under a
+// millisecond apart, and a gate that counts them swept thousands of times a
+// second (celeris#885 item 29); this is the bound the timerfd already promises
+// a conn's header deadline.
+const sweepFloor = 25 * time.Millisecond
+
+// testHookCheckTimeouts, when set, runs at the start of every checkTimeouts
+// sweep on the loop's own goroutine, with the loop. The cadence tests count
+// sweeps and read the conns through it (celeris#885 item 29). An atomic pointer,
+// not a plain variable: a test sets it while loops of an earlier engine of the
+// package may still be winding down. A load and a nil test per sweep.
+var testHookCheckTimeouts atomic.Pointer[func(*Loop)]
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout.
 //
-// Cadence: the sweep is driven by the loop's own iterations, not by a clock.
-// The run loop calls it every 32 epoll_wait iterations when ReadHeaderTimeout
-// is set (the default is 10 s) or a conn is detached, otherwise every 1024,
-// and the 25 ms timerfd (armed only when ReadHeaderTimeout is set) is a floor
-// that guarantees a sweep on an idle loop, not a ceiling. A busy loop sweeps
-// as often as its iterations allow. Measured on 2 loops with 4096 idle
-// keep-alive conns each (celeris PR 969): about 120 sweeps a second in all with
-// no traffic (the timerfd alone gives 80), and 1,800 to 6,200 a second in all
-// with one to sixteen busy clients.
+// Cadence: the run loop calls it from the gate every 32 epoll_wait iterations
+// when ReadHeaderTimeout is set (the default is 10 s) or a conn is detached,
+// otherwise every 1024, but only when sweepFloor (25 ms) has passed since the
+// last sweep (lastSweep, stamped here, so the timerfd's sweeps count too); the
+// 25 ms timerfd (armed only when ReadHeaderTimeout is set) guarantees one on an
+// idle loop. A busy loop therefore sweeps about 40 times a second, where the
+// gate alone swept as often as its iterations allowed: measured on 2 loops with
+// 4096 idle keep-alive conns each, before the floor (celeris PR 969): about 120
+// sweeps a second in all with no traffic (the timerfd alone gives 80), and
+// 1,800 to 6,200 a second in all with one to sixteen busy clients.
 //
 // Iterates the dense liveConns slice (#318) rather than the sparse
 // 0..maxFD range, so the cost is O(active conns) regardless of FD space.
@@ -4003,6 +4064,10 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 // touches indices we've already visited.
 func (l *Loop) checkTimeouts() {
 	now := time.Now().UnixNano()
+	l.lastSweep = now
+	if h := testHookCheckTimeouts.Load(); h != nil {
+		(*h)(l)
+	}
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
 		cs := l.liveConns[i]
 		if cs.hijacked.Load() {
@@ -4089,7 +4154,16 @@ func (l *Loop) checkTimeouts() {
 		// peerClosed without it (a test fixture) takes the scan below.
 		if cs.closeSince != 0 {
 			bound := l.closingDrainBound()
-			if time.Duration(now-cs.closeSampled) >= bound/4 {
+			// A sample is due every quarter of the bound, and once more when
+			// the bound has passed since the last one was taken before it: the
+			// rate limit must not stand in for a fresh look at the moment of
+			// the reap when sweeps are irregular (a conn first met late in its
+			// bound, the next sweep past it). Once a sample is from past the
+			// bound, a conn that stays (it was given another bound) waits for
+			// the rate limit again, so this costs one getsockopt per reap
+			// decision, not one per sweep.
+			if time.Duration(now-cs.closeSampled) >= bound/4 ||
+				(time.Duration(now-cs.closeSince) > bound && cs.closeSampled <= cs.closeSince+int64(bound)) {
 				l.noteClosingAcked(cs, now)
 			}
 			if time.Duration(now-cs.closeSince) > bound {

@@ -201,6 +201,18 @@ type connState struct {
 
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
+	// closeAcked, closeSampled and closeAckedKnown are the sweep's second kind
+	// of evidence that a closing conn's peer is taking its response
+	// (celeris#884 item 52): the peer's acknowledged byte count (tcp_info
+	// bytes_acked) at the last sample, when that was (nanoseconds), and whether
+	// closeAcked holds a sample. checkTimeouts samples a closing conn at most
+	// every closingDrainBound/4 (noteClosingAcked). The first kind is
+	// completeSend's restamp of lastActivity, the drain's clock, which moves
+	// once per SEND completion. Worker-thread-only; reset on release.
+	closeAcked      uint64
+	closeSampled    int64
+	closeAckedKnown bool
+
 	// recvStallSince is the nanosecond timestamp at which this connection
 	// entered a recv-arming stall: needsRecv set (an arm was dropped on a
 	// full SQ ring), not paused, no recv in the kernel, and the dirty-list
@@ -607,6 +619,9 @@ func releaseConnState(cs *connState) {
 	cs.noSendZC = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0
+	cs.closeAcked = 0
+	cs.closeSampled = 0
+	cs.closeAckedKnown = false
 	cs.recvStallSince = 0
 	cs.linkArmedAt = 0
 	cs.lastRecvCQE = 0
