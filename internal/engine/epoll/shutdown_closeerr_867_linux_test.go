@@ -128,3 +128,35 @@ func TestCloseConnDeliversTheParkedReadEndError867(t *testing.T) {
 		t.Fatalf("closeConn delivered %v, want exactly [%v]", got, errFirst867)
 	}
 }
+
+// TestSecondReadEndErrorAfterTheHandlerReturned867 is the non-busy twin of the
+// parked-first-error rule: a second read-end error that arrives once the
+// handler has released detachMu, but before its hand-back (closeOwed) has been
+// drained, takes closeOnReadEnd's non-busy path. That path used to call
+// OnError(second) itself and then closeConn delivered the parked first error,
+// so the middleware was told [second, first]: the later death, then the
+// original one (a last-wins handler such as the WebSocket writeErr kept the
+// first). The middleware must be told the first error, once, and nothing else.
+func TestSecondReadEndErrorAfterTheHandlerReturned867(t *testing.T) {
+	l, cs, fd, release, notified := parkReadEnd867(t, errFirst867)
+	release() // the handler returned; its hand-back has not been drained yet
+	l.closeOnReadEnd(fd, cs, errSecond867)
+	got := notified()
+	t.Logf("celeris867 second-after-release OnError calls=%v closeErr_after=%v", got, cs.closeErr)
+	if len(got) != 1 || got[0] != errFirst867 {
+		t.Fatalf("OnError was called with %v, want exactly [%v]", got, errFirst867)
+	}
+	if cs.closeErr != nil {
+		t.Errorf("closeErr = %v after the close, want it consumed", cs.closeErr)
+	}
+}
+
+// A conn with nothing parked still tells the middleware the error it met.
+func TestReadEndErrorOnAFreeConnIsDelivered867(t *testing.T) {
+	l, cs, fd, release, notified := parkReadEnd867(t)
+	release()
+	l.closeOnReadEnd(fd, cs, errSecond867)
+	if got := notified(); len(got) != 1 || got[0] != errSecond867 {
+		t.Fatalf("OnError was called with %v, want exactly [%v]", got, errSecond867)
+	}
+}
