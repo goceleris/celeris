@@ -564,6 +564,11 @@ func TestStreamWriterOverCapH1_875(t *testing.T) {
 					if over && complete {
 						t.Errorf("the response past the limit was delivered whole; want it cut")
 					}
+					// The handler went on writing 64 MiB after the error: none of
+					// it may have been staged behind the cut response.
+					if over && n > int64(size)+4096 {
+						t.Errorf("the client read %d bytes, want about %d: writes after the refusal were staged", n, size)
+					}
 					if !over && (!complete || n < int64(size)) {
 						t.Errorf("a response below the limit was not delivered whole: %d bytes, complete=%v", n, complete)
 					}
