@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -485,31 +486,58 @@ func TestDetachedStreamPeerGoneHooksH1_875(t *testing.T) {
 // memory until the handler returns (the first test above), and used to be
 // held without a bound: one chunk of any size was appended to the connection's
 // send buffer and reported written (celeris#884 item 45, celeris#885 item 30).
-// The adapter now asks the engine after each write, and the engine reports an
-// error once the response staged but not yet sent is over 64 MiB (the limit a
-// detached or HTTP/2 conn already has): the Write returns it, and the
-// connection is closed after what was staged has gone out, as it is for any
-// refused write (celeris#761). The response is cut, and a client sees a chunked
-// body with no last chunk. A response below the limit, 8 MiB streamed in
-// celeris#761's test among them, is delivered whole when the handler returns,
-// as before.
+// The adapter now asks the engine before it stages a chunk, and the engine
+// refuses a chunk that would take the response staged but not yet sent past
+// 64 MiB (the limit a detached or HTTP/2 conn has): nothing of that chunk is
+// staged, the Write returns the error and counts no bytes, and the connection
+// is closed after what was staged before it has gone out, as it is for any
+// refused write (celeris#761). The response is cut, and a client sees a
+// chunked body with no last chunk. A response below the limit, 8 MiB streamed
+// in celeris#761's test among them, is delivered whole when the handler
+// returns, as before.
 
 const (
-	underCap875 = 8 << 20
-	overCap875  = 65 << 20
+	mib875 = 1 << 20
 )
 
 func TestStreamWriterOverCapH1_875(t *testing.T) {
+	// wantOK is how many of the chunks the engine takes: -1 for all of them.
+	// The limit is 67108864 bytes of staged response: 63 chunks of 1 MiB and
+	// their framing fit, the 64th does not (64 * 1048586 > 64 MiB); a 60 MiB
+	// chunk fits and an 8 MiB one behind it does not.
+	cases := []struct {
+		name   string
+		chunks []int
+		wantOK int
+	}{
+		{"1MiB", []int{1 * mib875}, -1},
+		{"8MiB", []int{8 * mib875}, -1},
+		{"63MiB", []int{63 * mib875}, -1},
+		{"65MiB", []int{65 * mib875}, 0},
+		{"60MiB+8MiB", []int{60 * mib875, 8 * mib875}, 1},
+		{"70x1MiB", func() []int {
+			c := make([]int, 70)
+			for i := range c {
+				c[i] = mib875
+			}
+			return c
+		}(), 63},
+	}
 	for _, e := range []struct {
 		name string
 		eng  celeris.EngineType
 	}{{"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
 		for _, async := range []bool{false, true} {
-			for _, size := range []int{1 << 20, underCap875, overCap875} {
-				over := size == overCap875
-				name := fmt.Sprintf("%s/async=%v/%dMiB", e.name, async, size>>20)
+			for _, tc := range cases {
+				name := fmt.Sprintf("%s/async=%v/%s", e.name, async, tc.name)
 				t.Run(name, func(t *testing.T) {
-					werr := make(chan error, 1)
+					type outcome struct {
+						ok      int   // chunks the Write took
+						err     error // the first Write error
+						written int64 // StreamWriter.BytesWritten at the end of the loop
+						closeEr error
+					}
+					res := make(chan outcome, 1)
 					addr := startServerConfig761(t, celeris.Config{Engine: e.eng, Protocol: celeris.HTTP1}, func(s *celeris.Server) {
 						r := s.GET("/cap875", func(c *celeris.Context) error {
 							sw := c.StreamWriter()
@@ -517,20 +545,28 @@ func TestStreamWriterOverCapH1_875(t *testing.T) {
 								return fmt.Errorf("no StreamWriter")
 							}
 							if err := sw.WriteHeader(200, [][2]string{{"content-type", "application/octet-stream"}}); err != nil {
-								werr <- err
+								res <- outcome{err: err}
 								return nil
 							}
-							_, err := sw.Write(make([]byte, size))
+							var o outcome
+							for _, n := range tc.chunks {
+								if _, err := sw.Write(make([]byte, n)); err != nil {
+									o.err = err
+									break
+								}
+								o.ok++
+							}
+							o.written = sw.BytesWritten()
 							// A handler that ignores the error and goes on
 							// must not grow the staged response further.
-							if err != nil {
+							if o.err != nil {
 								for i := 0; i < 64; i++ {
-									_, _ = sw.Write(make([]byte, 1<<20))
+									_, _ = sw.Write(make([]byte, mib875))
 									_ = sw.Flush()
 								}
 							}
-							_ = sw.Close()
-							werr <- err
+							o.closeEr = sw.Close()
+							res <- o
 							return nil
 						})
 						if async {
@@ -546,34 +582,60 @@ func TestStreamWriterOverCapH1_875(t *testing.T) {
 					if _, err := conn.Write([]byte("GET /cap875 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")); err != nil {
 						t.Fatal(err)
 					}
-					_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+					_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 					n, tail, rerr := drain875(conn)
+					var o outcome
 					select {
-					case got := <-werr:
-						t.Logf("%s: Write(%d) = %v; client read %d bytes, read error %v", name, size, got, n, rerr)
-						if over && got == nil {
-							t.Errorf("a %d-byte chunk before Detach was accepted: want an error past the 64 MiB limit", size)
-						}
-						if !over && got != nil {
-							t.Errorf("a %d-byte chunk before Detach was refused: %v", size, got)
-						}
-					case <-time.After(5 * time.Second):
+					case o = <-res:
+					case <-time.After(10 * time.Second):
 						t.Fatal("the handler did not finish")
 					}
+					t.Logf("%s: %d of %d chunks taken, first error %v, BytesWritten %d, Close %v; client read %d bytes, read error %v",
+						name, o.ok, len(tc.chunks), o.err, o.written, o.closeEr, n, rerr)
 					if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
 						t.Fatalf("the client's read timed out: the connection was neither completed nor closed (read %d bytes)", n)
 					}
+					wantOK := tc.wantOK
+					if wantOK < 0 {
+						wantOK = len(tc.chunks)
+					}
+					if o.ok != wantOK {
+						t.Errorf("%d chunks were taken, want %d (error %v)", o.ok, wantOK, o.err)
+					}
+					if (wantOK < len(tc.chunks)) != (o.err != nil) {
+						t.Errorf("first Write error = %v with %d of %d chunks taken", o.err, o.ok, len(tc.chunks))
+					}
+					// BytesWritten counts what Write returned nil for, and the
+					// client was sent exactly that and the framing (the head is
+					// under 1 KiB): a chunk Write reported refused is not staged.
+					var accepted, framed int64
+					for _, c := range tc.chunks[:wantOK] {
+						accepted += int64(c)
+						framed += int64(c) + int64(len(strconv.FormatInt(int64(c), 16))) + 4 // hex size, CRLF, data, CRLF
+					}
+					if o.written != accepted {
+						t.Errorf("BytesWritten = %d, want %d", o.written, accepted)
+					}
+					if n < framed || n > framed+1024 {
+						t.Errorf("the client read %d bytes, want the head and %d bytes of chunks: a refused chunk was staged, or the stream was lost", n, framed)
+					}
 					complete := strings.HasSuffix(tail, "0\r\n\r\n")
-					if over && complete {
-						t.Errorf("the response past the limit was delivered whole; want it cut")
-					}
-					// The handler went on writing 64 MiB after the error: none of
-					// it may have been staged behind the cut response.
-					if over && n > int64(size)+4096 {
-						t.Errorf("the client read %d bytes, want about %d: writes after the refusal were staged", n, size)
-					}
-					if !over && (!complete || n < int64(size)) {
-						t.Errorf("a response below the limit was not delivered whole: %d bytes, complete=%v", n, complete)
+					if wantOK == len(tc.chunks) {
+						if !complete || o.closeEr != nil {
+							t.Errorf("a response below the limit was not delivered whole: complete=%v, Close %v", complete, o.closeEr)
+						}
+					} else {
+						if complete {
+							t.Errorf("the response past the limit was delivered whole; want it cut")
+						}
+						// Cut after the last chunk taken: the tail is that
+						// chunk's closing CRLF and nothing else follows it.
+						if !strings.HasSuffix(tail, "\r\n") || strings.Contains(tail, "HTTP/1.1") {
+							t.Errorf("the cut response does not end at a chunk boundary: %q", tail)
+						}
+						if o.closeEr == nil {
+							t.Errorf("Close on a refused stream returned nil")
+						}
 					}
 					// The server serves the next connection either way.
 					c2, err := net.DialTimeout("tcp", addr, 2*time.Second)
