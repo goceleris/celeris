@@ -386,7 +386,8 @@ func (w *Worker) closingDrainBound() int64 {
 // one more bound rather than cut on no evidence.
 //
 // Not on the hot path: checkTimeouts calls it for a closing conn, at most every
-// quarter of the bound (closeSampled), and it costs one getsockopt. A
+// quarter of the bound (closeSampled) and once more before it reaps one, and it
+// costs one getsockopt. A
 // descriptor that is not a TCP socket, or a kernel that does not report the
 // count (before Linux 4.1), yields no evidence, which leaves the SEND
 // completions' rule alone. Not for a fixed-file conn, whose cs.fd is a slot of
@@ -7147,7 +7148,11 @@ func (w *Worker) checkTimeouts() {
 			// completion that sent some (celeris#884 item 52). Read before
 			// the bound is tested: growth restamps the clock.
 			bound := w.closingDrainBound()
-			if !cs.fixedFile && now-cs.closeSampled >= bound/4 {
+			// A sample is due every quarter of the bound, and always before
+			// the bound test below reaps: the rate limit must not stand in
+			// for a fresh look when sweeps are irregular (a conn first met
+			// late in its bound, the next sweep past it).
+			if !cs.fixedFile && (now-cs.closeSampled >= bound/4 || now-cs.lastActivity > bound) {
 				w.noteClosingAcked(cs, now)
 			}
 			if now-cs.lastActivity > bound {

@@ -2114,7 +2114,8 @@ func (cs *connState) endWriteSlow() {
 // evidence.
 //
 // Not on the hot path: checkTimeouts calls it for a closing conn, at most
-// every quarter of the bound (closeSampled), and it costs one getsockopt. A
+// every quarter of the bound (closeSampled) and once more before it reaps one,
+// and it costs one getsockopt. A
 // descriptor that is not a TCP socket, or a kernel that does not report the
 // count (before Linux 4.1), yields no evidence, which leaves the userspace
 // queue's rule alone. Loop thread.
@@ -4153,7 +4154,11 @@ func (l *Loop) checkTimeouts() {
 		// peerClosed without it (a test fixture) takes the scan below.
 		if cs.closeSince != 0 {
 			bound := l.closingDrainBound()
-			if time.Duration(now-cs.closeSampled) >= bound/4 {
+			// A sample is due every quarter of the bound, and always before
+			// the bound test below reaps: the rate limit must not stand in
+			// for a fresh look when sweeps are irregular (a conn first met
+			// late in its bound, the next sweep past it).
+			if time.Duration(now-cs.closeSampled) >= bound/4 || time.Duration(now-cs.closeSince) > bound {
 				l.noteClosingAcked(cs, now)
 			}
 			if time.Duration(now-cs.closeSince) > bound {
