@@ -567,6 +567,15 @@ type Worker struct {
 	// response to a healthy client once per sweep interval gets its untimed wait
 	// back as soon as the response is out. Worker-owned.
 	remainderN int
+	// sweepMarks counts the conns markRemainder newly marked since the last
+	// timeout sweep began (checkTimeouts zeroes it first). A sweep re-derives
+	// remainderN, remainderWatch and sendWatch from the conns it visits, and a
+	// mark made DURING the sweep, after the sweep has looked at that conn (the
+	// closing branch's replayHeldSends, whose completeSend re-sends a
+	// remainder, and closeConn's deferred-close flush), is invisible to that
+	// count; the sweep adds these back at its end instead of overwriting them
+	// (celeris#884 item 62). Worker-owned.
+	sweepMarks int
 	lastSweep  int64
 
 	// pendingRelease defers returning connState structs to the pool
@@ -6612,6 +6621,7 @@ func (w *Worker) markRemainder(cs *connState) {
 	if !cs.remainderOut {
 		cs.remainderOut = true
 		w.remainderN++
+		w.sweepMarks++
 	}
 	w.remainderWatch = true
 	w.sendWatch = true
@@ -7042,6 +7052,7 @@ func (w *Worker) checkTimeouts() {
 	// so the sweep only corrects a count that a completion path skipping
 	// completeSend left wrong.
 	sendOut, remN := false, 0
+	w.sweepMarks = 0
 	// Drain the deferred-release queue here too. drainPendingRelease gates on
 	// w.cachedNow, which is otherwise only refreshed inside the CQE-processing
 	// block; on a fully idle worker (no CQEs) cachedNow never advances and
@@ -7189,9 +7200,13 @@ func (w *Worker) checkTimeouts() {
 			}
 		}
 	}
-	w.sendWatch = sendOut
-	w.remainderN = remN
-	w.remainderWatch = remN > 0
+	// A SEND marked while the sweep ran, after the sweep had looked at its
+	// conn, is not in sendOut or remN: keep it (sweepMarks). Counted a second
+	// time when the sweep had seen the conn marked before the mark was
+	// renewed, which only keeps the watch on until the next sweep.
+	w.sendWatch = sendOut || w.sweepMarks > 0
+	w.remainderN = remN + w.sweepMarks
+	w.remainderWatch = w.remainderN > 0
 }
 
 // h2PoolDrainFloor is the least time the worker, its context cancelled,
