@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"sync/atomic"
 	"syscall"
@@ -219,6 +221,12 @@ func TestEngineH2ClosingConnTakesNoFrameTheHandlerWritesAfterTheRefusal885(t *te
 	var trickles atomic.Int64
 	var writeErr atomic.Value
 	const trickleFor = 8 * time.Second
+	// The close is asked once, however many frames the handler writes after:
+	// each further request is an EPOLL_CTL_MOD (celeris#885 item 38).
+	var closeAsks atomic.Int64
+	askHook := func(*connState) { closeAsks.Add(1) }
+	testHookCloseWhenFlushed.Store(&askHook)
+	t.Cleanup(func() { testHookCloseWhenFlushed.Store(nil) }) // runs after the engine is stopped
 	h := stream.HandlerFunc(func(ctx context.Context, s *stream.Stream) error {
 		st, ok := s.ResponseWriter.(stream.Streamer)
 		if !ok {
@@ -352,6 +360,18 @@ func TestEngineH2ClosingConnTakesNoFrameTheHandlerWritesAfterTheRefusal885(t *te
 	}
 	if trickledWhileReading < 5 {
 		t.Fatalf("PREMISE: the handler wrote %d trickle frames while the peer read for %v; the frames to be taken or dropped never came", trickledWhileReading, readTook.Round(time.Millisecond))
+	}
+	// The conn is cut once the backlog is read (about a second here), not at
+	// the 20 s read deadline: a conn kept open for as long as the handler
+	// streams (the trickle runs 8 s) is the harm the item names.
+	if !errors.Is(endErr, io.EOF) {
+		t.Errorf("the peer's read ended with %v after %v, want io.EOF: the conn must be closed once the backlog is delivered", endErr, readTook.Round(time.Millisecond))
+	}
+	if lim := 5 * time.Second; readTook > lim {
+		t.Errorf("the closing conn stayed open %v while the peer read (> %v): it must close as soon as the backlog is delivered, not live as long as the handler streams", readTook.Round(time.Millisecond), lim)
+	}
+	if n := closeAsks.Load(); n != 1 {
+		t.Errorf("closeWhenFlushed ran %d times for one conn closing on a refused write (%d trickle frames queued after it): once, not per frame", n, trickles.Load())
 	}
 	if yBytes != 0 {
 		t.Errorf("the closing conn delivered %d bytes of what the handler wrote after the refusal (%d trickle frames while the peer read): "+

@@ -1929,6 +1929,13 @@ func (l *Loop) drainRead(fd int, now int64) {
 	}
 }
 
+// testHookCloseWhenFlushed, when set, runs at the start of every
+// closeWhenFlushed, on the loop's goroutine. The H2 closing test counts the
+// requests a conn makes: each one past the first is an EPOLL_CTL_MOD
+// (celeris#885 item 38). An atomic pointer, as testHookCheckTimeouts is; a load
+// and a nil test per close request, which is never a hot path.
+var testHookCloseWhenFlushed atomic.Pointer[func(*connState)]
+
 // discardWrite is the write function the run loop drains the H2 write queue of
 // a conn that is closing on a refused write into: the frames go nowhere.
 func discardWrite([]byte) {}
@@ -1949,6 +1956,9 @@ func discardWrite([]byte) {}
 // Loop thread, with no handler of cs's running: the inline path after its
 // handler returned, or drainDetachQueue after the dispatch goroutine exited.
 func (l *Loop) closeWhenFlushed(cs *connState) {
+	if h := testHookCloseWhenFlushed.Load(); h != nil {
+		(*h)(cs)
+	}
 	if (cs.h1State != nil && cs.h1State.Detached.Load()) || !csWritePending(cs) {
 		l.closeConn(cs.fd)
 		return
