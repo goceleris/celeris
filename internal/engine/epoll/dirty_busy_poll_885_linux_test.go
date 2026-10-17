@@ -47,10 +47,12 @@ const (
 	busy885Window  = 2 * time.Second
 	busy885Settle  = 500 * time.Millisecond
 	// busy885Budget is the fraction of one core the process may use in the
-	// window. A loop that parks measures 0.5% to 3%; one that spins, tens of
-	// percent (celeris#811 measured 37% for one conn). The read side of the
-	// test is idle in the window.
-	busy885Budget = 0.10
+	// window while nothing can progress. A parked loop pair measures 3% to 10%
+	// here (two loops with a 25 ms timer each, the sweep's detached-conn gate,
+	// and the process around them; the IDLE line logs the same engine with no
+	// conn), a spinning loop 100% (celeris#811 measured 37% for one conn on
+	// io_uring), and four conns on two loops 200% or more. 30% is far from both.
+	busy885Budget = 0.30
 )
 
 func cpu885(t *testing.T) time.Duration {
@@ -69,7 +71,7 @@ func startBusy885Server(t *testing.T, handler func(*sse.Client)) string {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	srv := celeris.New(celeris.Config{Engine: celeris.Epoll, SocketSendBuf: busy885SndBuf})
+	srv := celeris.New(celeris.Config{Engine: celeris.Epoll, Workers: 2, SocketSendBuf: busy885SndBuf})
 	srv.GET("/events", sse.New(sse.Config{HeartbeatInterval: -1, Handler: handler}))
 	var startErr atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
@@ -112,6 +114,12 @@ func TestEpollDetachedBackpressureDoesNotBusyPoll885(t *testing.T) {
 		sent <- struct{}{}
 		<-c.Context().Done()
 	})
+
+	// The idle baseline: the same process, the engine up, nothing connected.
+	// A red run is read against it.
+	i0, it0 := cpu885(t), time.Now()
+	time.Sleep(500 * time.Millisecond)
+	t.Logf("celeris885 IDLE window_ms=%d cpu_ms=%.1f", time.Since(it0).Milliseconds(), float64(cpu885(t)-i0)/1e6)
 
 	clients := make([]net.Conn, busy885Conns)
 	for i := range clients {
