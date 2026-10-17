@@ -551,13 +551,23 @@ type Worker struct {
 	// reach it is gone. Worker-owned.
 	sendWatch bool
 	// remainderWatch is set when flushSend re-sends the remainder of a partial
-	// send (celeris#884 item 62) and re-derived by every timeout sweep from the
-	// live conns (cs.remainderOut). It is what keeps the run loop out of mode
+	// send or submits a long SEND (celeris#884 items 62 and 64), cleared by the
+	// completion of the last such SEND (remainderN, clearRemainder), and
+	// re-derived by every timeout sweep from the live conns
+	// (cs.remainderOut). It is what keeps the run loop out of mode
 	// 3a (waitUntimed): sendWatch alone cannot, because every sweep derives it
 	// from any SEND in flight and it would be on nearly always under load, so
 	// the untimed wait would be lost for good. Worker-owned.
 	remainderWatch bool
-	lastSweep      int64
+	// remainderN is the number of conns with cs.remainderOut set, as the
+	// worker has counted them: markRemainder adds one, clearRemainder (the
+	// completion of the marked SEND) takes one, and every sweep re-counts it
+	// from the live conns. remainderWatch is cleared when it reaches 0, at the
+	// completion and not at the next sweep, so a worker that serves a large
+	// response to a healthy client once per sweep interval gets its untimed wait
+	// back as soon as the response is out. Worker-owned.
+	remainderN int
+	lastSweep  int64
 
 	// pendingRelease defers returning connState structs to the pool
 	// until the kernel has drained every in-flight I/O SQE that may
@@ -4468,7 +4478,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	// ring SEND is in-flight, so the clear MUST be inside the lock — otherwise
 	// that read races this completion.
 	cs.sending = false
-	cs.remainderOut = false
+	w.clearRemainder(cs)
 	// celeris#607 witness. cs.recvLinked is cleared only when the chained
 	// recv's own CQE is processed, and that recv cannot run before this
 	// send completes — so reaching here with it still set means the recv
@@ -6591,9 +6601,36 @@ const longSendBytes = 64 << 10
 // sweep. Worker thread; one compare for the common small response.
 func (w *Worker) markLongSend(cs *connState, n int) {
 	if n >= longSendBytes {
+		w.markRemainder(cs)
+	}
+}
+
+// markRemainder notes that the SEND being submitted for cs may be outstanding
+// for as long as its peer holds out (see markLongSend), and counts the conn.
+// Worker thread.
+func (w *Worker) markRemainder(cs *connState) {
+	if !cs.remainderOut {
 		cs.remainderOut = true
-		w.remainderWatch = true
-		w.sendWatch = true
+		w.remainderN++
+	}
+	w.remainderWatch = true
+	w.sendWatch = true
+}
+
+// clearRemainder ends cs's mark when its SEND completes (completeSend), and the
+// worker's remainderWatch with it when no other conn has one. sendWatch is
+// left to the sweep, which clears it when no SEND is outstanding. Worker
+// thread.
+func (w *Worker) clearRemainder(cs *connState) {
+	if !cs.remainderOut {
+		return
+	}
+	cs.remainderOut = false
+	if w.remainderN > 0 {
+		w.remainderN--
+	}
+	if w.remainderN == 0 {
+		w.remainderWatch = false
 	}
 }
 
@@ -6628,9 +6665,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 		// peer is taking the rest slowly or not at all (celeris#884 item 62).
 		// Its completion is the client's to give, so the worker must not wait
 		// for it with no timeout, and the sweep must come for its WriteTimeout.
-		cs.remainderOut = true
-		w.remainderWatch = true
-		w.sendWatch = true
+		w.markRemainder(cs)
 		return false
 	}
 
@@ -7000,10 +7035,13 @@ func (w *Worker) checkTimeouts() {
 	w.lastSweep = now
 	// sendOut: a conn has a SEND (or a SEND_ZC notification) outstanding, so
 	// the watch (sendWatch, set by the dirty pass's give-up) stays on.
-	// remOut: a conn has the SEND of a partial send's remainder outstanding,
-	// so remainderWatch (set by flushSend) stays on and the run loop keeps
-	// out of its untimed wait (celeris#884 item 62).
-	sendOut, remOut := false, false
+	// remN: the number of conns with a partial send's remainder, or a long
+	// SEND, outstanding; while it is above 0 remainderWatch (set by flushSend)
+	// stays on and the run loop keeps out of its untimed wait (celeris#884
+	// item 62). It is also cleared as each such SEND completes (completeSend),
+	// so the sweep only corrects a count that a completion path skipping
+	// completeSend left wrong.
+	sendOut, remN := false, 0
 	// Drain the deferred-release queue here too. drainPendingRelease gates on
 	// w.cachedNow, which is otherwise only refreshed inside the CQE-processing
 	// block; on a fully idle worker (no CQEs) cachedNow never advances and
@@ -7035,7 +7073,7 @@ func (w *Worker) checkTimeouts() {
 		if cs.sending || cs.zcNotifPending {
 			sendOut = true
 			if cs.remainderOut {
-				remOut = true
+				remN++
 			}
 		} else if cs.remainderOut {
 			// No SEND is outstanding any more but a completion path that
@@ -7152,7 +7190,8 @@ func (w *Worker) checkTimeouts() {
 		}
 	}
 	w.sendWatch = sendOut
-	w.remainderWatch = remOut
+	w.remainderN = remN
+	w.remainderWatch = remN > 0
 }
 
 // h2PoolDrainFloor is the least time the worker, its context cancelled,

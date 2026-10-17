@@ -198,3 +198,34 @@ func TestIouringLongSendCompletionEndsRemainderWatchAtOnce884(t *testing.T) {
 		t.Errorf("waitUntimed is false after the only marked SEND completed")
 	}
 }
+
+// TestIouringRemainderWatchOutlivesTheFirstOfTwoMarkedSends884: the worker's
+// watch ends with the LAST marked SEND, not the first: one conn's long SEND
+// completing must not let the worker wait with no timeout while another conn's
+// remainder is still outstanding.
+func TestIouringRemainderWatchOutlivesTheFirstOfTwoMarkedSends884(t *testing.T) {
+	w := &Worker{}
+	a, b := &connState{}, &connState{}
+	w.markLongSend(a, longSendBytes)
+	w.markLongSend(b, longSendBytes)
+	w.markRemainder(b) // a second mark of the same SEND (a re-send) is one conn
+	if w.remainderN != 2 || !w.remainderWatch {
+		t.Fatalf("two conns marked: remainderN=%d remainderWatch=%v, want 2 true", w.remainderN, w.remainderWatch)
+	}
+	w.clearRemainder(a)
+	if !w.remainderWatch || w.remainderN != 1 {
+		t.Errorf("one of two marked SENDs completed: remainderN=%d remainderWatch=%v, want 1 true", w.remainderN, w.remainderWatch)
+	}
+	if waitUntimed(true, true, false, w.remainderWatch) {
+		t.Errorf("waitUntimed is true while one conn's marked SEND is outstanding")
+	}
+	w.clearRemainder(a) // a conn with no mark: a no-op, never a negative count
+	w.clearRemainder(b)
+	if w.remainderWatch || w.remainderN != 0 {
+		t.Errorf("both marked SENDs completed: remainderN=%d remainderWatch=%v, want 0 false", w.remainderN, w.remainderWatch)
+	}
+	w.markLongSend(a, longSendBytes-1) // below the figure: not marked
+	if a.remainderOut || w.remainderN != 0 || w.remainderWatch {
+		t.Errorf("a SEND of %d bytes was marked: remainderOut=%v remainderN=%d", longSendBytes-1, a.remainderOut, w.remainderN)
+	}
+}
