@@ -753,14 +753,13 @@ func (w *Worker) closeBound() chan struct{} {
 	return driverCloseSem
 }
 
-// closeDriverFDs closes the engine's descriptor of each conn, at most
-// cap(sem) at a time among every caller that shares sem (shutdownDrivers
-// passes the worker's closeBound, shutdownDriverCloseWorkers wide in the whole
-// process), and returns when
-// every close(2) has returned. The worker used to close them one after
-// another, so with N lingering sockets shutdown spent up to N x linger here
-// with its ring unserved; now it waits for the slowest (celeris#866). Nothing
-// about a close changes: the same close(2) of the same descriptor, FIN after
+// closeDriverFDs closes the engine's descriptor of each conn, at most cap(sem)
+// at a time among every caller that shares sem (shutdownDrivers passes the
+// worker's closeBound: shutdownDriverCloseWorkers wide in the whole process),
+// and returns when every close(2) has returned. The worker used to close them
+// one after another, so with N lingering sockets shutdown spent up to N x
+// linger here with its ring unserved; now it waits for the slowest
+// (celeris#866). Nothing about a close changes: the same close(2) of the same descriptor, FIN after
 // the unsent data within the linger time (never an RST that discards it, as
 // SO_LINGER{1,0} would), only many at once. The conns are retired, so nothing
 // else touches opFD. Worker goroutine, from shutdownDrivers.
@@ -863,9 +862,9 @@ func (dc *driverConn) fireOnClose(err error) {
 // simultaneous lingering unregisters must not pin N threads (the runtime's
 // limit of 10000 is fatal). Past the bound the goroutines wait for a token,
 // holding no thread, and the conn's onClose waits with them (celeris#884
-// item 55). The order a driver sees is kept: the socket has
-// closed, as far as close(2) closes it, before onClose runs, and onClose
-// still runs on the worker goroutine (internal/engine/provider.go). dc left the driver
+// item 55). The order a driver sees is kept: the socket has closed, as far as
+// close(2) closes it, before onClose runs, and onClose still runs on the
+// worker goroutine (internal/engine/provider.go). dc left the driver
 // map and was retired before this, so nothing issues an SQE by opFD any more
 // and its number is not reused before the close. Shutdown waits for the close
 // (waitDriverCloses). Worker goroutine.
