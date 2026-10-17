@@ -751,6 +751,13 @@ func (w *worker) errorClose(c *driverConn, err error) {
 //   - Edge-triggered epoll: we drain to EAGAIN inside WriteAndPoll, so no
 //     stale edge is left. After EPOLLIN is re-armed, the next kernel-buffer
 //     arrival fires a fresh edge.
+//
+// ErrUnknownFD, from any WriteAndPoll variant (this one, WriteAndPollBusy and
+// WriteAndPollMulti), means the conn was torn down (by UnregisterConn on
+// another goroutine, or by an I/O error on the worker), or is not registered
+// on this worker. onRecv may already have received part or all of the reply
+// before the call returns it, so ErrUnknownFD does not mean that none was
+// delivered.
 type SyncRoundTripper interface {
 	WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
 }
@@ -973,8 +980,9 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 // Gosched triggers on locked Ms — measured at 40%+ of CPU samples and
 // responsible for a 2–3× throughput collapse on integrated HTTP+DB load.
 //
-// Contract matches WriteAndPoll (see that function's doc). Differs only in
-// Phase B: instead of yielding between poll(0) calls, it does a tight 16-
+// Contract matches WriteAndPoll (see that function's doc and the
+// [SyncRoundTripper] contract, including what ErrUnknownFD means). Differs
+// only in Phase B: instead of yielding between poll(0) calls, it does a tight 16-
 // round poll(0) spin (~8µs) to catch responses that arrived just after
 // Phase A finished, then falls through to poll(1ms). No scheduler hand-off
 // during the spin — the locked M stays on-CPU.
@@ -1182,7 +1190,9 @@ type SyncMultiRoundTripper interface {
 // WriteAndPollMulti implements SyncMultiRoundTripper. It writes data, then
 // polls in a loop until isDone returns true or the cumulative poll timeout
 // (20ms) expires. Designed for pipeline workloads where many RESP frames
-// arrive across multiple read(2) calls.
+// arrive across multiple read(2) calls. Its ErrUnknownFD has the meaning
+// given in the [SyncRoundTripper] contract: the conn was torn down during the
+// call, and onRecv may already have received part or all of the replies.
 func (w *worker) WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func([]byte), isDone func() bool, beforeRearm func()) (bool, error) {
 	if w.closed.Load() {
 		return false, ErrLoopClosed

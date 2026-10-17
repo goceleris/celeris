@@ -45,27 +45,31 @@ type EventLoopProvider interface {
 //
 // # Thread safety
 //
-// All methods are safe to call from any goroutine. [Write] is serialized
+// All methods are safe to call from any goroutine. [WorkerLoop.Write] is serialized
 // per-FD internally (at most one send is in flight per descriptor), following
 // the same invariant the HTTP path relies on.
 //
 // # Callback semantics
 //
-// The onRecv and onClose callbacks passed to [RegisterConn] are invoked from
+// The onRecv and onClose callbacks passed to [WorkerLoop.RegisterConn] are invoked from
 // the worker's own goroutine. The []byte slice passed to onRecv is only valid
 // for the duration of the callback — callers must copy before retaining it.
-// onClose is called exactly once, either in response to [UnregisterConn] or
+// onClose is called exactly once, either in response to [WorkerLoop.UnregisterConn] or
 // when the kernel reports a closed/errored connection. The error argument to
 // onClose is nil on orderly shutdown and non-nil on I/O errors.
 //
-// Drivers must not call [RegisterConn] / [UnregisterConn] / [Write] from
+// Drivers must not call [WorkerLoop.RegisterConn] / [WorkerLoop.UnregisterConn] / [WorkerLoop.Write] from
 // within an onRecv or onClose callback targeting the same FD; use a separate
 // goroutine if such re-entrance is needed.
 type WorkerLoop interface {
 	// RegisterConn adds fd to the worker's interest set and installs the
 	// data and close callbacks. The fd is expected to be already connected
 	// and in non-blocking mode. Returns an error if fd is already registered
-	// on this or another worker.
+	// on this worker.
+	//
+	// onClose of an earlier registration of the same number can run after
+	// RegisterConn has taken the number again (see [WorkerLoop.UnregisterConn]),
+	// so a driver must not key its onClose state by fd number alone.
 	RegisterConn(fd int, onRecv func([]byte), onClose func(error)) error
 	// UnregisterConn removes fd from the worker's interest set and triggers
 	// the onClose callback (with a nil error) after any in-flight operations
@@ -85,11 +89,26 @@ type WorkerLoop interface {
 	// registered on that worker: a RegisterConn there of the next socket to
 	// get the number, as the lowest free number usually is, fails with "fd
 	// already registered" until the conn is finalized, which is at the latest
-	// when onClose fires. Closing fd before UnregisterConn does not affect
-	// this engine. The epoll engine fires onClose before UnregisterConn
-	// returns, but a worker already inside the conn's read loop still reads fd
-	// by number afterwards, so a number reused at once can lose its first
-	// bytes to it (celeris#710).
+	// when onClose fires. Closing fd before UnregisterConn does not misdirect
+	// the cancel on this engine, which works on its own duplicate of fd, but
+	// it is still outside the contract.
+	//
+	// The epoll engine fires onClose before UnregisterConn returns, unless the
+	// worker closed the conn first (a peer close, a read error or the loop's
+	// shutdown); then onClose runs on the worker and may still be running when
+	// UnregisterConn returns. Once UnregisterConn has returned, the epoll worker
+	// reads fd no more, even from inside the conn's read loop (celeris#710,
+	// celeris#772), and so does the standalone Linux loop (celeris#784,
+	// celeris#843). Either way, a read that completed before UnregisterConn
+	// took the conn's lock may still deliver its bytes to onRecv, which can run
+	// after UnregisterConn has returned.
+	//
+	// onClose can run after UnregisterConn has returned, and after the same
+	// number has been registered again: the portable loop's reader goroutine
+	// fires it once it observes the close, and io_uring fires it once the conn
+	// is finalized, which can be after RegisterConn has taken the number. So a
+	// driver must not key its onClose state by fd number; it can key it by the
+	// registration, for example by passing onClose a value that identifies it.
 	UnregisterConn(fd int) error
 	// Write enqueues data for transmission on fd. The call does not block on
 	// the kernel send buffer: data is buffered and flushed asynchronously by
