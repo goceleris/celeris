@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -385,11 +386,20 @@ func TestDriverShutdownWaitsForAHandedOffClose(t *testing.T) {
 	unregisterAndCloseInOrder(t, p, wl, fd)
 	waitFinalized(t, w, fd)
 
+	// The hook fires when shutdown has reached the wait for the handed-off
+	// closes, with the close still lingering: the point the test used to
+	// reach by sleeping 200 ms after the stop (celeris#884 item 3). The worker
+	// reads it only when it shuts down, after stop below.
+	reached := make(chan struct{})
+	w.waitClosesHook = sync.OnceFunc(func() { close(reached) })
 	stopped := make(chan struct{})
 	go func() { stop(); close(stopped) }()
-	// Let the stop reach the worker while the close still lingers, then let
-	// the close finish.
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-reached:
+	case <-time.After(15 * time.Second):
+		drain()
+		t.Fatal("shutdown never reached the wait for the closes it had handed off")
+	}
 	drain()
 	select {
 	case <-stopped:

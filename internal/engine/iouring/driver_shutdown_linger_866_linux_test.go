@@ -18,14 +18,13 @@ package iouring
 // linger ended early.
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // lingerSet866 is n lingering driver conns registered by hand on a bare
@@ -337,59 +336,101 @@ func TestCloseFDsInParallelBoundIsSharedByWorkers866(t *testing.T) {
 	}
 }
 
-// TestCloseDriverFDsUsesTheEngineWideBound866 pins the wiring: closeDriverFDs
-// takes its tokens from driverCloseSem, the one every worker shares. With every
-// token held it cannot close anything and does not return; once they are
-// given back it closes the descriptor and returns.
-func TestCloseDriverFDsUsesTheEngineWideBound866(t *testing.T) {
+// TestCloseDriverFDsUsesTheProcessWideBound866 pins the default of the wiring:
+// a worker that was not given a bound of its own closes its driver
+// descriptors under driverCloseSem, the one semaphore every worker of every
+// engine in the process shares (the bound is on OS threads, which are the
+// process's). The identity is checked, not the behaviour with the semaphore
+// full: filling the real one would block this test behind any engine of an
+// earlier test still shutting down, and stall that shutdown (celeris#890
+// item 74). The behaviour is TestShutdownDriversUsesTheWorkersBound866's, on
+// a bound of the test's own.
+func TestCloseDriverFDsUsesTheProcessWideBound866(t *testing.T) {
+	if got := (&Worker{}).closeBound(); got != driverCloseSem {
+		t.Error("a worker without a bound of its own does not use driverCloseSem")
+	}
+	own := make(chan struct{}, 1)
+	if got := (&Worker{closeSem: own}).closeBound(); got != own {
+		t.Error("a worker with a bound of its own does not use it")
+	}
+}
+
+// TestShutdownDriversUsesTheWorkersBound866: shutdownDrivers takes its tokens
+// from the worker's bound (closeBound). On a bare worker with a private bound
+// held in full it cannot close anything and does not return; once the tokens
+// are given back it closes every descriptor, fires every onClose with
+// errEngineShutdown and returns.
+func TestShutdownDriversUsesTheWorkersBound866(t *testing.T) {
 	defer watchdog959(t, time.Minute)()
-	var p [2]int
-	if err := unix.Pipe2(p[:], unix.O_CLOEXEC); err != nil {
-		t.Fatalf("apparatus: pipe: %v", err)
+	const n, bound = 3, 2
+	sem := make(chan struct{}, bound)
+	for range bound {
+		sem <- struct{}{}
 	}
-	defer func() { _ = unix.Close(p[1]) }()
-	closed := false
-	defer func() {
-		if !closed {
-			_ = unix.Close(p[0])
+	release := sync.OnceFunc(func() {
+		for range bound {
+			<-sem
 		}
-	}()
-	for range cap(driverCloseSem) {
-		driverCloseSem <- struct{}{}
-	}
-	released := false
-	release := func() {
-		if released {
-			return
-		}
-		released = true
-		for range cap(driverCloseSem) {
-			<-driverCloseSem
-		}
-	}
+	})
 	defer release()
+
+	w := &Worker{driverConns: make(map[int]*driverConn, n), closeSem: sem}
+	fired := make(chan error, n)
+	var wrs []int
+	for range n {
+		rd, wr := pipeEnds(t)
+		w.driverConns[rd] = &driverConn{fd: rd, opFD: rd, opFDOpen: true, w: w, onClose: func(err error) { fired <- err }}
+		wrs = append(wrs, wr)
+	}
+	w.hasDriverConns.Store(true)
+
 	done := make(chan struct{})
 	go func() {
-		closeDriverFDs([]*driverConn{{opFD: p[0]}})
+		w.shutdownDrivers()
 		close(done)
 	}()
 	select {
 	case <-done:
-		t.Fatal("closeDriverFDs returned while every token of the engine-wide bound was held: it does not use driverCloseSem")
+		t.Fatal("shutdownDrivers returned while every token of the worker's bound was held: it does not use closeBound")
 	case <-time.After(300 * time.Millisecond):
 	}
-	// Still open: a write to the other end of the pipe does not see EPIPE.
-	if _, err := unix.Write(p[1], []byte{0}); err != nil {
-		t.Errorf("the descriptor was closed while the bound was held: %v", err)
+	for i, wr := range wrs {
+		open, err := readEndOpen(wr)
+		if err != nil {
+			t.Fatalf("conn %d: write to the observer end: %v", i, err)
+		}
+		if !open {
+			t.Errorf("conn %d: the descriptor was closed while the bound was held", i)
+		}
+	}
+	if len(fired) != 0 {
+		t.Errorf("%d onClose callbacks fired before any close", len(fired))
 	}
 	release()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("closeDriverFDs did not return after the tokens were given back")
+		t.Fatal("shutdownDrivers did not return after the tokens were given back")
 	}
-	closed = true
-	if err := unix.Fstat(p[0], new(unix.Stat_t)); err != unix.EBADF {
-		t.Errorf("fstat of the closed descriptor = %v, want EBADF", err)
+	// A write to the other end of the pipe fails with EPIPE once the read end
+	// is closed; unlike an fstat of the read end's number (EBADF) it does not
+	// depend on no other goroutine having opened a descriptor and been given
+	// that number in the meantime (celeris#890 item 75).
+	for i, wr := range wrs {
+		open, err := readEndOpen(wr)
+		if err != nil {
+			t.Fatalf("conn %d: write to the observer end: %v", i, err)
+		}
+		if open {
+			t.Errorf("conn %d: the descriptor is still open after shutdownDrivers returned", i)
+		}
+	}
+	if len(fired) != n {
+		t.Errorf("%d onClose callbacks fired, want %d", len(fired), n)
+	}
+	for range len(fired) {
+		if err := <-fired; !errors.Is(err, errEngineShutdown) {
+			t.Errorf("onClose(%v), want errEngineShutdown", err)
+		}
 	}
 }
