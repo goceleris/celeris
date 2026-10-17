@@ -759,10 +759,11 @@ func (w *Worker) closeBound() chan struct{} {
 // and returns when every close(2) has returned. The worker used to close them
 // one after another, so with N lingering sockets shutdown spent up to N x
 // linger here with its ring unserved; now it waits for the slowest
-// (celeris#866). Nothing about a close changes: the same close(2) of the same descriptor, FIN after
-// the unsent data within the linger time (never an RST that discards it, as
-// SO_LINGER{1,0} would), only many at once. The conns are retired, so nothing
-// else touches opFD. Worker goroutine, from shutdownDrivers.
+// (celeris#866). Nothing about a close changes: the same close(2) of the same
+// descriptor, FIN after the unsent data within the linger time (never an RST
+// that discards it, as SO_LINGER{1,0} would), only many at once. The conns are
+// retired, so nothing else touches opFD. Worker goroutine, from
+// shutdownDrivers.
 func closeDriverFDs(conns []*driverConn, sem chan struct{}) {
 	closeFDsInParallel(conns, sem, closeFD)
 }
