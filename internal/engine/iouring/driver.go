@@ -293,7 +293,11 @@ func (w *Worker) UnregisterConn(fd int) error {
 }
 
 // Write enqueues data for fd. Returns ErrQueueFull if the per-FD outbound
-// buffer would exceed driverSendCap, and ErrUnknownFD if fd isn't registered.
+// buffer would exceed driverSendCap, and ErrUnknownFD if fd isn't registered
+// or is closing: after UnregisterConn, or after the conn failed, the conn stays
+// a key of the driver map until its onClose has fired, but its bytes are not
+// sent, and Write says so, as the epoll engine does for a number it no longer
+// knows (celeris#884 item 54). It used to report success and drop them.
 func (w *Worker) Write(fd int, data []byte) error {
 	w.driverMu.RLock()
 	dc, ok := w.driverConns[fd]
@@ -304,7 +308,7 @@ func (w *Worker) Write(fd int, data []byte) error {
 	dc.mu.Lock()
 	if dc.closing {
 		dc.mu.Unlock()
-		return nil
+		return engine.ErrUnknownFD
 	}
 	if len(dc.writeBuf)+len(dc.sendBuf)+len(data) > driverSendCap {
 		dc.mu.Unlock()
