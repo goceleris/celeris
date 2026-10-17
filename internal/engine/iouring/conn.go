@@ -82,12 +82,14 @@ func (cs *connState) overBacklogH1() bool {
 // Flush and Close after the write hook: nil while the conn can take the
 // response, conn.ErrConnClosed once the engine has torn it down (or is closing
 // it, where the write hook drops bytes), and conn.ErrWriteRefused once bytes
-// were refused or the response unsent is over maxSendQueueBytes. The last is
-// the cap on a response held whole in memory before Detach: the write hook only
-// appends for an HTTP/1 conn (sendCap), and nothing sends while the handler
-// runs, so a stream of any size was staged (celeris#884 item 45, #885 item
-// 30). It marks the refusal as the hook does (writeRefused), so the conn is
-// closed once what is staged has gone out. No lock: it runs on the goroutine
+// were refused or the response unsent is over maxSendQueueBytesDetached. The
+// last is the cap on a response held whole in memory before Detach, the limit a
+// detached or HTTP/2 conn has (an HTTP/1 response, however large, is staged
+// whole, celeris#761; this bounds it): the write hook only appends for an
+// HTTP/1 conn (sendCap), and nothing sends while the handler runs, so a stream
+// of any size was staged (celeris#884 item 45, #885 item 30). It marks the
+// refusal as the hook does (writeRefused), so the conn is closed once what is
+// staged has gone out. No lock: it runs on the goroutine
 // that runs the handler, the worker thread or the dispatch goroutine holding
 // detachMu, as the write hook does.
 func (cs *connState) streamErrH1() error {
@@ -97,7 +99,7 @@ func (cs *connState) streamErrH1() error {
 	if cs.closing || cs.detachClosed || cs.asyncClosed.Load() {
 		return conn.ErrConnClosed
 	}
-	if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf) > maxSendQueueBytes {
+	if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf) > maxSendQueueBytesDetached {
 		cs.writeRefused = true
 		return conn.ErrWriteRefused
 	}

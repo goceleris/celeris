@@ -486,15 +486,18 @@ func TestDetachedStreamPeerGoneHooksH1_875(t *testing.T) {
 // held without a bound: one chunk of any size was appended to the connection's
 // send buffer and reported written (celeris#884 item 45, celeris#885 item 30).
 // The adapter now asks the engine after each write, and the engine reports an
-// error once the response staged but not yet sent is over maxPendingBytes
-// (4 MiB, the HTTP/1 limit that already refuses the next request of a conn
-// with that much unsent): the Write returns it, and the connection is closed
-// after what was staged has gone out, as it is for any refused write
-// (celeris#761). The response is cut, and a client sees a chunked body with no
-// last chunk. A response below the limit is delivered whole when the handler
-// returns, as before.
+// error once the response staged but not yet sent is over 64 MiB (the limit a
+// detached or HTTP/2 conn already has): the Write returns it, and the
+// connection is closed after what was staged has gone out, as it is for any
+// refused write (celeris#761). The response is cut, and a client sees a chunked
+// body with no last chunk. A response below the limit, 8 MiB streamed in
+// celeris#761's test among them, is delivered whole when the handler returns,
+// as before.
 
-const overCap875 = 8 << 20
+const (
+	underCap875 = 8 << 20
+	overCap875  = 65 << 20
+)
 
 func TestStreamWriterOverCapH1_875(t *testing.T) {
 	for _, e := range []struct {
@@ -502,7 +505,7 @@ func TestStreamWriterOverCapH1_875(t *testing.T) {
 		eng  celeris.EngineType
 	}{{"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
 		for _, async := range []bool{false, true} {
-			for _, size := range []int{1 << 20, overCap875} {
+			for _, size := range []int{1 << 20, underCap875, overCap875} {
 				over := size == overCap875
 				name := fmt.Sprintf("%s/async=%v/%dMiB", e.name, async, size>>20)
 				t.Run(name, func(t *testing.T) {
@@ -549,7 +552,7 @@ func TestStreamWriterOverCapH1_875(t *testing.T) {
 					case got := <-werr:
 						t.Logf("%s: Write(%d) = %v; client read %d bytes, read error %v", name, size, got, n, rerr)
 						if over && got == nil {
-							t.Errorf("a %d-byte chunk before Detach was accepted: want an error past the 4 MiB limit", size)
+							t.Errorf("a %d-byte chunk before Detach was accepted: want an error past the 64 MiB limit", size)
 						}
 						if !over && got != nil {
 							t.Errorf("a %d-byte chunk before Detach was refused: %v", size, got)

@@ -230,6 +230,16 @@ func TestStalledSSEEndsWithShutdown855(t *testing.T) {
 			st := stallBegin855(t, cell.eng, 30*time.Second, time.Second, cell.shape, cell.h2c, 0)
 			time.Sleep(time.Second) // the client reads nothing; the socket buffers fill
 			if st.hret.Load() != 0 {
+				// A native engine refuses a detached conn's write once 64 MiB are
+				// unsent, closes the conn and fails the Send (celeris#884 item 45,
+				// #885 item 30): the tight handler sends 256 KiB events as fast as
+				// Send lets it, and reaches that in well under a second, where it
+				// used to spin on writes that were dropped without a word. That is
+				// the stream ending, not the handler returning without cause.
+				if cell.eng != celeris.Std && cell.shape == shapeTight855 && st.sendErr.Load() != 0 {
+					t.Logf("STALL855 cell=%s: the tight handler's Send failed at the engine's unsent limit before Shutdown", cell.name)
+					return
+				}
 				t.Fatal("the handler returned before Shutdown")
 			}
 			sd := time.Now()

@@ -1867,11 +1867,11 @@ func (sw *StreamWriter) BytesWritten() int64 {
 // [Context.Detach] those engines only append each Write to the connection's
 // send buffer, which goes out when the handler returns, so every byte
 // written so far stays in memory until then, however often Flush is called.
-// That buffer is bounded: once the response held unsent is over 4 MiB, Write
+// That buffer is bounded: once the response held unsent is over 64 MiB, Write
 // and Flush return an error, the rest of the response is dropped, and the
 // connection is closed once the bytes already staged have gone out, so the
 // client sees a chunked body that never ends. A response that needs more than
-// that before the handler returns has to Detach it. After Detach each Write is
+// that has to Detach. After Detach each Write is
 // handed to the connection at once (the calling goroutine usually tries the
 // send, and the engine finishes what the socket does not take). The std engine
 // flushes through [net/http.Flusher]. To deliver bytes while the handler is
