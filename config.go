@@ -171,7 +171,13 @@ type Config struct {
 	// WriteTimeout 60s closes a client that pauses for 6s). io_uring bounds the
 	// response as a whole, measured from the last read or completed flush
 	// of the connection (a client that sends another request restarts it), not
-	// from the request's headers as std does.
+	// from the request's headers as std does. On io_uring a response whose
+	// unsent remainder is under 64 KiB, to a client that stops reading, on an
+	// otherwise idle worker, can outlast WriteTimeout (measured with async
+	// responses of 96 to 144 KiB; the larger and the sync sizes are closed).
+	// On epoll, a response parked behind a handler that holds the connection's
+	// dispatch lock for longer than WriteTimeout can be closed at WriteTimeout
+	// even though nothing is queued for it (a narrow pipelined-handler case).
 	//
 	// With -1, an HTTP/2 response that has to wait for the client's
 	// flow-control window has no deadline either on epoll, io_uring and
