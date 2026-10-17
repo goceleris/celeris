@@ -54,6 +54,11 @@ func markClosing880(w *Worker, cs *connState) {
 	cs.asyncClosed.Store(true)
 	cs.detachClosed = true
 	cs.lastActivity = time.Now().UnixNano() - 2*w.closingDrainBound()
+	// "Long ago" includes the sweeps that sampled the peer's acknowledged bytes
+	// since (celeris#884 item 52) and found none: a conn first met after its
+	// bound with no sample is given one more bound, and these tests are about
+	// the teardown, not about that rule.
+	cs.closeAckedKnown, cs.closeSampled = true, time.Now().UnixNano()
 }
 
 // holdZCFirstCompletion880 places a SEND_ZC on cs, a conn whose dispatch
