@@ -178,6 +178,14 @@ type Config struct {
 	// On epoll, a response parked behind a handler that holds the connection's
 	// dispatch lock for longer than WriteTimeout can be closed at WriteTimeout
 	// even though nothing is queued for it (a narrow pipelined-handler case).
+	// A response that ends the connection (Connection: close, a refused write)
+	// has a drain of its own on both native engines: the connection is cut
+	// once the client has taken no byte for WriteTimeout (epoll; 5s when it is
+	// 0) or max(5s, WriteTimeout) (io_uring). A byte taken is a flush or send
+	// completion that moved the response, or bytes the client acknowledged
+	// (tcp_info, sampled about every quarter of that bound), so a client that
+	// reads steadily, however slowly, is not cut, and holds the connection
+	// and the unsent response for as long as it does.
 	//
 	// With -1, an HTTP/2 response that has to wait for the client's
 	// flow-control window has no deadline either on epoll, io_uring and
