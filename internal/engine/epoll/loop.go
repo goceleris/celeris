@@ -818,6 +818,10 @@ func (l *Loop) run(ctx context.Context) {
 					continue
 				}
 				if cs.writePos < len(cs.writeBuf) {
+					queued := 0
+					if cs.writeSince != 0 {
+						queued = csPendingBytes(cs) // before this flush (celeris#885)
+					}
 					if fErr := l.flushWrites(cs, true); fErr != nil {
 						l.removeDirty(cs)
 						l.closeConn(fd)
@@ -825,7 +829,10 @@ func (l *Loop) run(ctx context.Context) {
 					} else if cs.writePos < len(cs.writeBuf) {
 						// Send buffer full: arm EPOLLOUT instead of the dirty
 						// list so we don't busy-poll the backpressured H2 conn.
+						cs.noteWriteProgress(queued, csPendingBytes(cs))
 						l.armEpollOut(cs)
+					} else {
+						cs.endWrite()
 					}
 				}
 				// Resync pendingBytes, as every other flush point does: the
@@ -1532,6 +1539,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()
 			}
+			queued := 0
+			if cs.writeSince != 0 {
+				queued = csPendingBytes(cs) // before this flush (celeris#885)
+			}
 			if err := l.flushWrites(cs, true); err != nil {
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
@@ -1547,8 +1558,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 			dirty := csWritePending(cs)
 			if dirty {
 				cs.pendingBytes = csPendingBytes(cs)
+				cs.noteWriteProgress(queued, cs.pendingBytes)
 			} else {
 				cs.pendingBytes = 0
+				cs.endWrite()
 			}
 			refused := cs.writeRefused
 			if mu := cs.detachMu; mu != nil {
@@ -1797,6 +1810,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 			mu.Lock()
 		}
 		if csWritePending(cs) {
+			queued := 0
+			if cs.writeSince != 0 {
+				queued = csPendingBytes(cs) // before this flush (celeris#885)
+			}
 			if fErr := l.flushWrites(cs, true); fErr != nil {
 				if cs.h1State != nil && cs.h1State.OnError != nil {
 					cs.h1State.OnError(fErr)
@@ -1814,6 +1831,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// Fully flushed (including any sendfile body) — no dirty
 				// list / EPOLLOUT needed.
 				cs.pendingBytes = 0
+				cs.endWrite()
 				if cs.dirty {
 					l.removeDirty(cs)
 				}
@@ -1828,6 +1846,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// + eventfd, not this inline HTTP flush). A pending sendfile
 				// is resumed by handleWritable on the next EPOLLOUT edge.
 				cs.pendingBytes = csPendingBytes(cs)
+				// A client that sends while it reads (an HTTP/2 PING or
+				// WINDOW_UPDATE, a pipelined request) raises an EPOLLIN event
+				// per segment, and this flush takes the room it made: that is
+				// progress for the write clock, and no EPOLLOUT edge may come
+				// to show it (celeris#885 items 35 and 45).
+				cs.noteWriteProgress(queued, cs.pendingBytes)
 				if cs.h1State != nil && cs.h1State.Detached.Load() {
 					l.markDirty(cs)
 				} else {
@@ -1959,6 +1983,80 @@ func (cs *connState) noteClosingProgress(pending int) {
 		cs.closeSince = time.Now().UnixNano()
 	}
 	cs.closePending = pending
+}
+
+// noteWriteProgress restarts the write clock (writeSince) of a live conn when
+// a flush took bytes of what was queued: pending, what is queued after it, is
+// less than queued, what was queued just before it, counted by the caller in
+// the same locked region (celeris#885 items 35 and 45). Not against the
+// previous flush's figure, as noteClosingProgress does: an async handler or a
+// pipelined request appends between two flushes, and a peer that is taking the
+// response would then look stalled. The peer taking bytes, not the response
+// ending, is what WriteTimeout bounds on a native engine (std's WriteTimeout is
+// an absolute deadline for the whole response). queued is 0 for a conn without
+// the clock, which makes this a no-op. Called from the partial branches of
+// every flush that leaves bytes queued and parks the conn: handleWritable,
+// flushDirty, the HTTP/2 queue drain, drainRead's inline flush and its
+// body-recv flush, finishH1Upgrade and flushCarriedReplay (the last two
+// before armEpollOut, which keeps a clock that is set). Never from flushWrites,
+// which every response's first flush goes through. Loop thread.
+func (cs *connState) noteWriteProgress(queued, pending int) {
+	if cs.writeSince != 0 && (pending < queued || cs.goMoved) {
+		cs.writeSince = time.Now().UnixNano()
+	}
+	cs.goMoved = false
+}
+
+// resyncPending is the dispatch goroutine's resync of pendingBytes after its
+// own flush (serveAsync, under detachMu): pendingBytes becomes what is
+// really queued. When the flush took bytes and left the rest queued it also
+// notes goMoved, which the loop's next partial flush of the conn counts as
+// progress for the write clock (noteWriteProgress): without it, bytes the
+// goroutine's flush put into the socket after the peer took some are invisible
+// to the clock, the loop's flush that follows finds the socket full, and the
+// sweep closes a conn whose client read a moment ago (celeris#885 items 35 and 45,
+// review). pendingBytes before the resync is what was queued before the flush
+// (the write function adds each response to it).
+func (cs *connState) resyncPending() {
+	if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
+		// Emptied: a queue the clock was running on is as much progress as
+		// one that is partly sent, and the loop would not see it (the sweep
+		// ends the clock of an empty queue, but a clocked queue that the
+		// goroutine emptied and the next response refilled looks unmoved).
+		if cs.pendingBytes > 0 {
+			cs.goMoved = true
+		}
+		cs.pendingBytes = 0
+		return
+	}
+	pending := len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
+	if pending < cs.pendingBytes {
+		cs.goMoved = true
+	}
+	cs.pendingBytes = pending
+}
+
+// endWrite ends the write clock of a conn whose queue is empty (celeris#885
+// items 35 and 45), at the drain sites that know it. It folds the clock into
+// lastActivity first: ReadTimeout and IdleTimeout of the next request are
+// measured from the end of the response, as std does after it, not from the
+// request before it, whose read may be longer ago than the timeouts when the
+// response was large. The guard is all that is inlined into the drain sites
+// (a load and a branch, for the common conn that never parked); the body is
+// endWriteSlow. Loop thread (the dispatch goroutine's own flushes do not call
+// it; resyncPending notes them for the clock, and checkTimeouts ends the clock
+// of a conn whose queue it finds empty).
+func (cs *connState) endWrite() {
+	if cs.writeSince != 0 {
+		cs.endWriteSlow()
+	}
+}
+
+// endWriteSlow is endWrite's body, out of line so that endWrite's guard
+// inlines at its call sites (the drain paths of every response).
+func (cs *connState) endWriteSlow() {
+	cs.writeSince = 0
+	cs.lastActivity = time.Now().UnixNano()
 }
 
 // noteClosingAcked is the sweep's evidence of progress on a closing conn: the
@@ -2678,9 +2776,23 @@ func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 			return
 		}
 		cs.bodyBuf = body
+		queued := 0
+		if cs.writeSince != 0 {
+			queued = csPendingBytes(cs) // before this flush (celeris#885)
+		}
 		err := l.flushWrites(cs, true)
 		unstage(cs) // what the kernel did not take; no sendfile is staged
 		cs.pendingBytes = csPendingBytes(cs)
+		if cs.pendingBytes == 0 {
+			// The writev took the queue whole: a write clock the response
+			// before it left running ends here, or the next response's park
+			// would inherit its stamp (celeris#885 items 35 and 45).
+			cs.endWrite()
+		} else {
+			// It took some of a queue that was parked, and the inline flush
+			// that follows (drainRead) counts from what is left.
+			cs.noteWriteProgress(queued, cs.pendingBytes)
+		}
 		if err != nil {
 			// The response is lost with the conn: close it.
 			cs.writeRefused = true
@@ -3159,11 +3271,7 @@ func (l *Loop) serveAsync(cs *connState, holds *dispatchHolds) {
 		// blocks forever on the missing response. Mirror the inline-flush
 		// path (drainRead) and dirty-loop accounting.
 		if flushErr == nil {
-			if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
-				cs.pendingBytes = 0
-			} else {
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
-			}
+			cs.resyncPending()
 		}
 		partial := flushErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0)
 		// A refused write (celeris#761) ends the conn as a request error
@@ -3451,6 +3559,10 @@ func (l *Loop) flushDirty() {
 			cs = next
 			continue
 		}
+		queued := 0
+		if cs.writeSince != 0 {
+			queued = csPendingBytes(cs) // before this flush, under the same lock (celeris#885)
+		}
 		err := l.flushWrites(cs, true)
 		if err != nil {
 			// Surface I/O failure to detached middleware before closing.
@@ -3464,6 +3576,7 @@ func (l *Loop) flushDirty() {
 			l.closeConn(cs.fd)
 		} else if !csWritePending(cs) {
 			cs.pendingBytes = 0
+			cs.endWrite()
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
 			}
@@ -3485,6 +3598,7 @@ func (l *Loop) flushDirty() {
 			if cs.peerClosed {
 				cs.noteClosingProgress(cs.pendingBytes)
 			}
+			cs.noteWriteProgress(queued, cs.pendingBytes)
 			detachedWS := cs.h1State != nil && cs.h1State.Detached.Load()
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
@@ -3530,6 +3644,17 @@ func (l *Loop) armEpollOut(cs *connState) {
 	// Backpressure replaces the dirty-list retry; the two must not coexist
 	// or adaptiveTimeoutMs would still return 0 and busy-poll.
 	l.removeDirty(cs)
+	// The response is parked: start its write clock (celeris#885 items 35 and
+	// 45), unless it has one already (a conn relinked or adopted with bytes
+	// queued keeps the clock of the response it was already taking). The wall
+	// clock, not cachedNow, which a loop with no events leaves as old as its
+	// last event. Before the epollOut test: the drain sites end the clock
+	// (endWrite) without disarming EPOLLOUT, so a conn can be armed with no
+	// clock, and its next response's partial flush must start one. A partial
+	// flush is the backpressure path, not the common one.
+	if cs.writeSince == 0 {
+		cs.writeSince = time.Now().UnixNano()
+	}
 	if cs.epollOut {
 		return
 	}
@@ -3615,15 +3740,29 @@ func (l *Loop) handleWritable(cs *connState) {
 		mu.Unlock()
 		return
 	}
+	queued := 0
+	if cs.writeSince != 0 {
+		queued = csPendingBytes(cs) // before this flush, under the same lock (celeris#885)
+	}
 	err := l.flushWrites(cs, true)
 	drained := err == nil && !csWritePending(cs)
 	if err == nil {
 		if drained {
 			cs.pendingBytes = 0
+			cs.endWrite()
 		} else {
 			cs.pendingBytes = csPendingBytes(cs)
 			if cs.peerClosed {
 				cs.noteClosingProgress(cs.pendingBytes)
+			}
+			cs.noteWriteProgress(queued, cs.pendingBytes)
+			if cs.writeSince == 0 {
+				// EPOLLOUT is armed and bytes are queued, but the conn has no
+				// clock: a drain site ended it and the response that followed
+				// was queued without a pass through armEpollOut. Start it here
+				// rather than rely on a later flush reaching armEpollOut
+				// (celeris#885 items 35 and 45). The backpressure path.
+				cs.writeSince = time.Now().UnixNano()
 			}
 		}
 	}
@@ -3971,19 +4110,80 @@ func (l *Loop) checkTimeouts() {
 			l.closeConn(fd)
 			continue
 		}
-		elapsed := time.Duration(now - cs.lastActivity)
-		if cs.dirty {
-			if l.cfg.WriteTimeout > 0 && elapsed > l.cfg.WriteTimeout {
-				l.closeConn(fd)
-			}
-		} else {
-			if l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout {
-				l.closeConn(fd)
-			} else if l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout {
-				l.closeConn(fd)
+		// A response the kernel has not taken whole has its own clock
+		// (writeSince, celeris#885 items 35 and 45): lastActivity is the last
+		// read, so for a keep-alive conn parked on EPOLLOUT it measured neither
+		// a peer that takes nothing (WriteTimeout was applied to dirty conns
+		// only, and EPOLLOUT takes the conn off the list) nor one that takes the
+		// response steadily (ReadTimeout and IdleTimeout cut it, the request
+		// being longer ago than they are). The common conn has neither the
+		// clock nor a place on the dirty list, and pays one load and test.
+		last := cs.lastActivity
+		if cs.writeSince != 0 || cs.dirty {
+			var done bool
+			if last, done = l.sweepWriteClock(cs, fd, now, last); done {
+				continue
 			}
 		}
+		elapsed := time.Duration(now - last)
+		if l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout {
+			l.closeConn(fd)
+		} else if l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout {
+			l.closeConn(fd)
+		}
 	}
+}
+
+// sweepWriteClock is checkTimeouts' look at a live conn that holds a response
+// the kernel has not taken whole (celeris#885 items 35 and 45): it has the
+// write clock (writeSince), or is on the dirty list. WriteTimeout is "no
+// progress for WriteTimeout" there: the clock starts at the first partial flush
+// and restarts when a flush takes bytes (noteWriteProgress), where std's is an
+// absolute deadline for the whole response. It answers the instant IdleTimeout
+// and ReadTimeout are measured from, the later of the last read and the clock,
+// and whether the conn is done for this sweep (closed, or exempt from the idle
+// scan). Kept out of line: the sweep of a conn without a clock does not run it.
+// Loop thread.
+func (l *Loop) sweepWriteClock(cs *connState, fd int, now, last int64) (from int64, done bool) {
+	ws := cs.writeSince
+	if ws == 0 {
+		// On the list without a clock: not parked on EPOLLOUT, flushed by the
+		// pass that follows. WriteTimeout from the last read, as before, and
+		// no idle scan.
+		if wt := l.cfg.WriteTimeout; wt > 0 && time.Duration(now-last) > wt {
+			l.closeConn(fd)
+		}
+		return last, true
+	}
+	// Is anything still queued? A drain the loop did not see (the dispatch
+	// goroutine's own flush, under its lock) leaves the clock set with an empty
+	// queue. A lock held by a running handler cannot say: the answer is "yes".
+	pending := true
+	if mu := cs.detachMu; mu != nil {
+		if mu.TryLock() {
+			pending = csWritePending(cs)
+			mu.Unlock()
+		}
+	} else {
+		pending = csWritePending(cs)
+	}
+	if pending {
+		if wt := l.cfg.WriteTimeout; wt > 0 && time.Duration(now-ws) > wt {
+			l.closeConn(fd)
+			return last, true
+		}
+	} else {
+		// End the clock as endWrite does, from its last stamp, which is no
+		// later than the drain.
+		cs.writeSince = 0
+		if ws > last {
+			cs.lastActivity = ws
+		}
+	}
+	if ws > last {
+		last = ws
+	}
+	return last, false
 }
 
 func (l *Loop) closeConn(fd int) {
