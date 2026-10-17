@@ -113,7 +113,8 @@ type connState struct {
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
 	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
 	detectN  uint8           // 1 byte: bytes at the head of buf received but too few to detect on, under detect.PrefaceLen (celeris#870); 0 once detected
-	_        [3]byte         // padding to 8-byte alignment
+	goMoved  bool            // 1 byte: the dispatch goroutine's flush took bytes of a response (left the rest queued, or emptied the queue; resyncPending); under detachMu, consumed by noteWriteProgress (celeris#885 items 35 and 45)
+	_        [2]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
@@ -144,6 +145,24 @@ type connState struct {
 	// conn past it; initProtocol hands what is left of it to the H1 header
 	// deadline, so detection does not restart the budget. Loop thread only.
 	detectDeadline int64
+
+	// writeSince is the clock of a response the kernel has not taken whole
+	// (celeris#885 items 35 and 45): the time, in nanoseconds (wall clock), at
+	// which the peer last took some of it, or at which the first partial flush
+	// left it queued. armEpollOut starts it (the first partial flush of a
+	// response: the conn is parked on EPOLLOUT), handleWritable and flushDirty
+	// restart it from their partial branches when a flush took bytes of what
+	// was queued (noteWriteProgress, never from flushWrites), and endWrite
+	// clears it once nothing is queued. checkTimeouts measures WriteTimeout
+	// from it for a conn that has it, and IdleTimeout and ReadTimeout from the
+	// later of it and lastActivity: lastActivity is the last READ, and a
+	// keep-alive conn that is still taking a large response has not been read
+	// for as long as the response takes (ReadTimeout cut it), while one that
+	// takes nothing is not stalled by lastActivity's measure at all
+	// (WriteTimeout never fired for a conn that EPOLLOUT had taken off the dirty
+	// list). 0 when nothing is queued. Loop thread; reset on release. (Declared
+	// beside lastActivity, which the sweep reads for every conn.)
+	writeSince int64
 
 	// Cold — third cache line:
 	h1State      *conn.H1State
@@ -314,12 +333,6 @@ type connState struct {
 	// conn's place (the io_uring twin is its detachCounted, celeris#549).
 	detachCounted bool
 
-	// liveIdx is this conn's index into l.liveConns (the dense slice of
-	// live connStates iterated by checkTimeouts, the sweep and shutdown).
-	// -1 when not present. Maintained by addLiveConn/removeLiveConn for O(1)
-	// removal (#318). Loop-thread-only, like liveConns itself (celeris#668).
-	liveIdx int
-
 	// hijacked is set by hijackConn (Context.Hijack) once the fd has been
 	// detached from the engine and handed to the caller as a net.Conn. In
 	// async mode hijackConn runs ON the dispatch goroutine (inside
@@ -379,6 +392,15 @@ type connState struct {
 	// both to closeConn, which does them under the lock when the close
 	// actually runs (celeris#669).
 	closeErr error
+
+	// liveIdx is this conn's index into l.liveConns (the dense slice of
+	// live connStates iterated by checkTimeouts, the sweep and shutdown).
+	// -1 when not present. Maintained by addLiveConn/removeLiveConn for O(1)
+	// removal (#318). Loop-thread-only, like liveConns itself (celeris#668).
+	// (Declared last: an 8-byte field among the flags above leaves a five-byte
+	// hole, which is the room writeSince needed to stay in the size class,
+	// TestConnStateStaysInItsSizeClass.)
+	liveIdx int
 }
 
 var connStatePool = sync.Pool{
@@ -425,6 +447,7 @@ func releaseConnState(cs *connState) {
 	cs.detectDeadline = 0
 	cs.dirty = false
 	cs.epollOut = false
+	cs.goMoved = false
 	cs.pendingBytes = 0
 	cs.writePos = 0
 	cs.lastActivity = 0
@@ -442,6 +465,7 @@ func releaseConnState(cs *connState) {
 	cs.writeBuf = trimPooledBuf(cs.writeBuf)
 	cs.peerClosed = false
 	cs.closeSince = 0
+	cs.writeSince = 0
 	cs.closePending = 0
 	cs.closeAcked = 0
 	cs.closeAckedKnown = false
