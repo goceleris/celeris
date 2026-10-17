@@ -249,6 +249,10 @@ func (cs *connState) epollEvent(events uint32) unix.EpollEvent {
 //
 // Returns an error if fd is already registered as an HTTP conn on this
 // worker or already registered as a driver conn.
+//
+// A loop that PauseAccept has parked is woken (wakeIfSuspended) and does not
+// park again while a driver conn is registered on it: the conn's bytes would
+// otherwise wait for a ResumeAccept (celeris#885 item 39).
 func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) error {
 	if fd < 0 {
 		return fmt.Errorf("celeris/epoll: invalid fd %d", fd)
