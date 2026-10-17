@@ -119,6 +119,7 @@ func TestH2WriteCapIs64MiB889(t *testing.T) {
 func TestH2WritePassResyncsPendingBytes889(t *testing.T) {
 	t.Run("flushed whole", func(t *testing.T) {
 		r := newH2Rig889(t)
+		r.cs.pendingBytes = 1 << 20 // stale: what earlier frames added and no flush point took back
 		r.queue(3, 1000)
 		r.l.drainH2Writes()
 		if csPendingBytes(r.cs) != 0 {
@@ -136,6 +137,7 @@ func TestH2WritePassResyncsPendingBytes889(t *testing.T) {
 	t.Run("flushed in part", func(t *testing.T) {
 		r := newH2Rig889(t)
 		fillSendBuffer(t, r.cs.fd) // the socket takes nothing more
+		r.cs.pendingBytes = 1 << 20 // stale, as above
 		r.queue(3, 1000)
 		r.l.drainH2Writes()
 		queued := csPendingBytes(r.cs)
