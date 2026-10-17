@@ -178,6 +178,13 @@ func TestStartContextWatcherDoesNotRepeatADirectShutdown(t *testing.T) {
 	// The direct Shutdown has claimed the shutdown once it has cancelled
 	// Listen's context: it marks itself before it runs anything.
 	<-eng.cancelled
+	// This mid-run check is a racy witness for the celeris#703 revert, not its
+	// detector. A Shutdown that does not wait for Listen runs its hook a few
+	// microseconds after cancelling Listen's context, so this read sees 0 only
+	// when the hook has not run yet; the race is why it is not deterministic.
+	// The deterministic detector is TestShutdownRunsHooksOnlyAfterListenReturns.
+	// What this test pins is the final count below, which is deterministic
+	// against the watcher guard's removal.
 	if n := hookRuns.Load(); n != 0 {
 		t.Fatalf("the hook ran %d times while Listen was still tearing down, want 0 (celeris#703)", n)
 	}

@@ -123,6 +123,11 @@ func TestShutdownRunsHooksOnlyAfterListenReturns(t *testing.T) {
 // by Shutdown's ctx. When ctx is done first the hooks still run, with that
 // ctx, and Shutdown returns ctx's error, as std's http.Server.Shutdown does
 // when its drain outlives the deadline.
+//
+// Shutdown runs on its own goroutine with a watchdog: an unbounded wait fails
+// this test at 10 s with a message, instead of hanging until the package's
+// -timeout panic aborts every other root test. The start time is taken before
+// the deadline's clock starts, so elapsed covers the whole 100 ms budget.
 func TestShutdownWaitForListenIsBoundedByCtx(t *testing.T) {
 	s := New(Config{Engine: Std, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	eng := newTeardownEngine()
@@ -140,10 +145,18 @@ func TestShutdownWaitForListenIsBoundedByCtx(t *testing.T) {
 	go func() { runDone <- s.listen(context.Background(), eng) }()
 	<-eng.listening
 
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	start := time.Now()
-	err := s.Shutdown(ctx)
+	shutDone := make(chan error, 1)
+	go func() { shutDone <- s.Shutdown(ctx) }()
+	var err error
+	select {
+	case err = <-shutDone:
+	case <-time.After(10 * time.Second):
+		close(eng.release)
+		t.Fatal("Shutdown with Listen still draining did not return within 10s of its 100ms ctx: its wait for the drain is not bounded by ctx")
+	}
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Shutdown with Listen still draining past ctx's deadline returned %v, want %v", err, context.DeadlineExceeded)
