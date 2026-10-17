@@ -1539,6 +1539,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()
 			}
+			queued := 0
+			if cs.writeSince != 0 {
+				queued = csPendingBytes(cs) // before this flush (celeris#885)
+			}
 			if err := l.flushWrites(cs, true); err != nil {
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
@@ -1554,6 +1558,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			dirty := csWritePending(cs)
 			if dirty {
 				cs.pendingBytes = csPendingBytes(cs)
+				cs.noteWriteProgress(queued, cs.pendingBytes)
 			} else {
 				cs.pendingBytes = 0
 				cs.endWrite()
@@ -1805,6 +1810,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 			mu.Lock()
 		}
 		if csWritePending(cs) {
+			queued := 0
+			if cs.writeSince != 0 {
+				queued = csPendingBytes(cs) // before this flush (celeris#885)
+			}
 			if fErr := l.flushWrites(cs, true); fErr != nil {
 				if cs.h1State != nil && cs.h1State.OnError != nil {
 					cs.h1State.OnError(fErr)
@@ -1837,6 +1846,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// + eventfd, not this inline HTTP flush). A pending sendfile
 				// is resumed by handleWritable on the next EPOLLOUT edge.
 				cs.pendingBytes = csPendingBytes(cs)
+				// A client that sends while it reads (an HTTP/2 PING or
+				// WINDOW_UPDATE, a pipelined request) raises an EPOLLIN event
+				// per segment, and this flush takes the room it made: that is
+				// progress for the write clock, and no EPOLLOUT edge may come
+				// to show it (celeris#885 item 35).
+				cs.noteWriteProgress(queued, cs.pendingBytes)
 				if cs.h1State != nil && cs.h1State.Detached.Load() {
 					l.markDirty(cs)
 				} else {
@@ -1980,8 +1995,11 @@ func (cs *connState) noteClosingProgress(pending int) {
 // ending, is what WriteTimeout bounds on a native engine (std's WriteTimeout is
 // an absolute deadline for the whole response). queued is 0 for a conn without
 // the clock, which makes this a no-op. Called from the partial branches of
-// handleWritable, flushDirty and the HTTP/2 queue drain, never from
-// flushWrites, which every response's first flush goes through. Loop thread.
+// every flush that leaves bytes queued and parks the conn: handleWritable,
+// flushDirty, the HTTP/2 queue drain, drainRead's inline flush and its
+// body-recv flush, finishH1Upgrade and flushCarriedReplay (the last two
+// before armEpollOut, which keeps a clock that is set). Never from flushWrites,
+// which every response's first flush goes through. Loop thread.
 func (cs *connState) noteWriteProgress(queued, pending int) {
 	if cs.writeSince != 0 && (pending < queued || cs.goMoved) {
 		cs.writeSince = time.Now().UnixNano()
@@ -2001,6 +2019,13 @@ func (cs *connState) noteWriteProgress(queued, pending int) {
 // (the write function adds each response to it).
 func (cs *connState) resyncPending() {
 	if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
+		// Emptied: a queue the clock was running on is as much progress as
+		// one that is partly sent, and the loop would not see it (the sweep
+		// ends the clock of an empty queue, but a clocked queue that the
+		// goroutine emptied and the next response refilled looks unmoved).
+		if cs.pendingBytes > 0 {
+			cs.goMoved = true
+		}
 		cs.pendingBytes = 0
 		return
 	}
@@ -2016,14 +2041,22 @@ func (cs *connState) resyncPending() {
 // lastActivity first: ReadTimeout and IdleTimeout of the next request are
 // measured from the end of the response, as std does after it, not from the
 // request before it, whose read may be longer ago than the timeouts when the
-// response was large. A no-op, one load, for the common conn that never
-// parked. Loop thread (the dispatch goroutine's own flushes do not call it;
-// checkTimeouts ends the clock of a conn whose queue it finds empty).
+// response was large. The guard is all that is inlined into the drain sites
+// (a load and a branch, for the common conn that never parked); the body is
+// endWriteSlow. Loop thread (the dispatch goroutine's own flushes do not call
+// it; resyncPending notes them for the clock, and checkTimeouts ends the clock
+// of a conn whose queue it finds empty).
 func (cs *connState) endWrite() {
 	if cs.writeSince != 0 {
-		cs.writeSince = 0
-		cs.lastActivity = time.Now().UnixNano()
+		cs.endWriteSlow()
 	}
+}
+
+// endWriteSlow is endWrite's body, out of line so that endWrite's guard
+// inlines at its call sites (the drain paths of every response).
+func (cs *connState) endWriteSlow() {
+	cs.writeSince = 0
+	cs.lastActivity = time.Now().UnixNano()
 }
 
 // noteClosingAcked is the sweep's evidence of progress on a closing conn: the
@@ -2743,9 +2776,23 @@ func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 			return
 		}
 		cs.bodyBuf = body
+		queued := 0
+		if cs.writeSince != 0 {
+			queued = csPendingBytes(cs) // before this flush (celeris#885)
+		}
 		err := l.flushWrites(cs, true)
 		unstage(cs) // what the kernel did not take; no sendfile is staged
 		cs.pendingBytes = csPendingBytes(cs)
+		if cs.pendingBytes == 0 {
+			// The writev took the queue whole: a write clock the response
+			// before it left running ends here, or the next response's park
+			// would inherit its stamp (celeris#885 items 35 and 45).
+			cs.endWrite()
+		} else {
+			// It took some of a queue that was parked, and the inline flush
+			// that follows (drainRead) counts from what is left.
+			cs.noteWriteProgress(queued, cs.pendingBytes)
+		}
 		if err != nil {
 			// The response is lost with the conn: close it.
 			cs.writeRefused = true

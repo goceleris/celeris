@@ -24,12 +24,17 @@ func (l *Loop) finishH1Upgrade(cs *connState, fd int, writeFn func([]byte)) bool
 		return false
 	}
 	if cs.writePos < len(cs.writeBuf) {
+		queued := 0
+		if cs.writeSince != 0 {
+			queued = csPendingBytes(cs) // before this flush (celeris#885)
+		}
 		if fErr := l.flushWrites(cs, true); fErr != nil {
 			l.closeConn(fd)
 			return false
 		}
 		if cs.writePos >= len(cs.writeBuf) {
 			cs.pendingBytes = 0
+			cs.endWrite()
 			if cs.dirty {
 				l.removeDirty(cs)
 			}
@@ -37,6 +42,7 @@ func (l *Loop) finishH1Upgrade(cs *connState, fd int, writeFn func([]byte)) bool
 			// The 101 and the preface did not all fit: the send buffer is
 			// full.
 			cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+			cs.noteWriteProgress(queued, cs.pendingBytes)
 			l.armEpollOut(cs)
 		}
 	}
