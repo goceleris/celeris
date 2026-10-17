@@ -3709,6 +3709,14 @@ func (l *Loop) handleWritable(cs *connState) {
 				cs.noteClosingProgress(cs.pendingBytes)
 			}
 			cs.noteWriteProgress(queued, cs.pendingBytes)
+			if cs.writeSince == 0 {
+				// EPOLLOUT is armed and bytes are queued, but the conn has no
+				// clock: a drain site ended it and the response that followed
+				// was queued without a pass through armEpollOut. Start it here
+				// rather than rely on a later flush reaching armEpollOut
+				// (celeris#885 items 35 and 45). The backpressure path.
+				cs.writeSince = time.Now().UnixNano()
+			}
 		}
 	}
 	if err != nil && cs.h1State != nil && cs.h1State.OnError != nil {

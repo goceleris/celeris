@@ -100,3 +100,28 @@ func TestPartialFlushAfterTheSweepEndedTheClockStartsTheClock885(t *testing.T) {
 			bound+200*time.Millisecond, bound, r.cs.writeSince, r.cs.epollOut)
 	}
 }
+
+// TestWritableEdgeOfAClocklessArmedConnStartsTheClock885: handleWritable's
+// partial branch does not reach armEpollOut, so an armed conn with bytes queued
+// and no clock (a drain site ended the clock, then a response was queued
+// without a pass through armEpollOut) must be stamped there.
+func TestWritableEdgeOfAClocklessArmedConnStartsTheClock885(t *testing.T) {
+	const bound = 300 * time.Millisecond
+	r := parked885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: bound})
+	r.cs.writeSince = 0
+	if r.read(64<<10) == 0 {
+		t.Fatalf("apparatus: the peer read nothing")
+	}
+	r.l.handleWritable(r.cs) // the EPOLLOUT edge: takes some, leaves the rest
+	if !csWritePending(r.cs) {
+		t.Fatalf("apparatus: the response drained")
+	}
+	if r.cs.writeSince == 0 {
+		t.Fatalf("celeris#885 items 35, 45: a partial handleWritable left an armed conn with %d bytes queued and no write clock", csPendingBytes(r.cs))
+	}
+	time.Sleep(bound + 200*time.Millisecond)
+	r.l.checkTimeouts()
+	if r.open() {
+		t.Errorf("a parked conn whose peer took nothing for %v is still open with WriteTimeout %v", bound+200*time.Millisecond, bound)
+	}
+}
