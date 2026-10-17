@@ -236,8 +236,11 @@ func TestStalledSSEEndsWithShutdown855(t *testing.T) {
 				// Send lets it, and reaches that in well under a second, where it
 				// used to spin on writes that were dropped without a word. That is
 				// the stream ending, not the handler returning without cause.
-				if cell.eng != celeris.Std && cell.shape == shapeTight855 && st.sendErr.Load() != 0 {
-					t.Logf("STALL855 cell=%s: the tight handler's Send failed at the engine's unsent limit before Shutdown", cell.name)
+				// The close cancels the client's context, so the loop may leave on
+				// that before a Send fails: either marks the stream as ended by the
+				// engine.
+				if cell.eng != celeris.Std && cell.shape == shapeTight855 && (st.sendErr.Load() != 0 || st.disc.Load() != 0) {
+					t.Logf("STALL855 cell=%s: the tight handler's stream ended at the engine's unsent limit before Shutdown", cell.name)
 					return
 				}
 				t.Fatal("the handler returned before Shutdown")

@@ -108,12 +108,14 @@ func (cs *connState) streamErrH1() error {
 
 // streamErrDetached is streamErrH1 for a detached conn, whose handler goroutine
 // writes without the worker's lock: it reads the flags under mu (detachMu),
-// which the guarded write hook and closeConn hold when they set them. The limit
+// which the guarded write hook and closeConn hold when they set them. closing
+// is not read: closeConn sets it after it has released detachMu, and it sets
+// detachClosed first, under the lock. The limit
 // is the write hook's own (maxSendQueueBytesDetached): a refusal there is what
 // writeRefused records.
 func (cs *connState) streamErrDetached(mu *sync.Mutex) error {
 	mu.Lock()
-	closed, refused := cs.closing || cs.detachClosed, cs.writeRefused
+	closed, refused := cs.detachClosed, cs.writeRefused
 	mu.Unlock()
 	if refused {
 		return conn.ErrWriteRefused
