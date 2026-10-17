@@ -1983,9 +1983,32 @@ func (cs *connState) noteClosingProgress(pending int) {
 // handleWritable, flushDirty and the HTTP/2 queue drain, never from
 // flushWrites, which every response's first flush goes through. Loop thread.
 func (cs *connState) noteWriteProgress(queued, pending int) {
-	if cs.writeSince != 0 && pending < queued {
+	if cs.writeSince != 0 && (pending < queued || cs.goMoved) {
 		cs.writeSince = time.Now().UnixNano()
 	}
+	cs.goMoved = false
+}
+
+// resyncPending is the dispatch goroutine's resync of pendingBytes after its
+// own flush (serveAsync, under detachMu): pendingBytes becomes what is
+// really queued. When the flush took bytes and left the rest queued it also
+// notes goMoved, which the loop's next partial flush of the conn counts as
+// progress for the write clock (noteWriteProgress): without it, bytes the
+// goroutine's flush put into the socket after the peer took some are invisible
+// to the clock, the loop's flush that follows finds the socket full, and the
+// sweep closes a conn whose client read a moment ago (celeris#885 item 35,
+// review). pendingBytes before the resync is what was queued before the flush
+// (the write function adds each response to it).
+func (cs *connState) resyncPending() {
+	if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
+		cs.pendingBytes = 0
+		return
+	}
+	pending := len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
+	if pending < cs.pendingBytes {
+		cs.goMoved = true
+	}
+	cs.pendingBytes = pending
 }
 
 // endWrite ends the write clock of a conn whose queue is empty (celeris#885
@@ -3201,11 +3224,7 @@ func (l *Loop) serveAsync(cs *connState, holds *dispatchHolds) {
 		// blocks forever on the missing response. Mirror the inline-flush
 		// path (drainRead) and dirty-loop accounting.
 		if flushErr == nil {
-			if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
-				cs.pendingBytes = 0
-			} else {
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
-			}
+			cs.resyncPending()
 		}
 		partial := flushErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0)
 		// A refused write (celeris#761) ends the conn as a request error

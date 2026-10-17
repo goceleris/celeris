@@ -113,7 +113,8 @@ type connState struct {
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
 	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
 	detectN  uint8           // 1 byte: bytes at the head of buf received but too few to detect on, under detect.PrefaceLen (celeris#870); 0 once detected
-	_        [3]byte         // padding to 8-byte alignment
+	goMoved  bool            // 1 byte: the dispatch goroutine's flush took bytes of a response and left the rest queued (resyncPending); under detachMu, consumed by noteWriteProgress (celeris#885 item 35)
+	_        [2]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
@@ -446,6 +447,7 @@ func releaseConnState(cs *connState) {
 	cs.detectDeadline = 0
 	cs.dirty = false
 	cs.epollOut = false
+	cs.goMoved = false
 	cs.pendingBytes = 0
 	cs.writePos = 0
 	cs.lastActivity = 0
