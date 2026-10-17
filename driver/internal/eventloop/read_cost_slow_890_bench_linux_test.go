@@ -27,7 +27,8 @@ package eventloop
 // This file calls no hook and no code of this change, so the same file builds
 // on the base commit and the A/B runs compare the two binaries on identical
 // benchmark code. TestSlowPathBenchShapeReachesThePollHook890 (the test side,
-// poll_reach_890_linux_test.go) counts the hook sites this shape reaches.
+// poll_reach_890_linux_test.go) drives this shape with the reply held back
+// until the hook site has run, and counts the hook sites it reaches.
 
 import (
 	"testing"
@@ -37,10 +38,12 @@ import (
 )
 
 // slow890Responder answers each request that arrives on peer with resp, after
-// spinning for delay. It stops, and is waited for, in tb's cleanup. Register
-// it after the worker's cleanup (cleanups run last-in first-out), so it is
-// gone before the descriptors close.
-func slow890Responder(tb testing.TB, peer int, resp []byte, delay time.Duration) {
+// spinning for delay and, when gate is not nil, after a receive from gate (the
+// benchmark passes nil; the test hands the responder a token from the hook
+// site, so the reply cannot arrive before the call has got there). It stops,
+// and is waited for, in tb's cleanup. Register it after the worker's cleanup
+// (cleanups run last-in first-out), so it is gone before the descriptors close.
+func slow890Responder(tb testing.TB, peer int, resp []byte, delay time.Duration, gate <-chan struct{}) {
 	tb.Helper()
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -66,6 +69,13 @@ func slow890Responder(tb testing.TB, peer int, resp []byte, delay time.Duration)
 				continue
 			}
 			for t0 := time.Now(); time.Since(t0) < delay; {
+			}
+			if gate != nil {
+				select {
+				case <-gate:
+				case <-stop:
+					return
+				}
 			}
 			_, _ = unix.Write(peer, resp)
 		}
@@ -101,7 +111,7 @@ func BenchmarkWriteAndPollSlow890(b *testing.B) {
 				req := make([]byte, 32)
 				resp := make([]byte, 64)
 				rbuf := make([]byte, 16<<10)
-				slow890Responder(b, peer, resp, d.delay)
+				slow890Responder(b, peer, resp, d.delay, nil)
 				got := 0
 				onRecv := func(p []byte) { got += len(p) }
 				misses := 0
