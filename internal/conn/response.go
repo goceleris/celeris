@@ -172,13 +172,16 @@ type h1ResponseAdapter struct {
 	// dispatch goroutine would race the worker on the sendfile state.
 	sendFile func(header []byte, file *os.File, offset, length int64) error
 	// writeErr, when non-nil, is the engine's write-error query
-	// (H1State.SetWriteErrFn): a streaming Write, Flush or Close asks it after
+	// (H1State.SetWriteErrQuery): a streaming Write asks it with the size of
+	// the chunk before it stages it, and Write, Flush and Close ask it after
 	// the write hook, which cannot report an error itself. werr latches what it
 	// returned for the rest of the response (the engine closes a connection it
 	// reports on, so it never outlives one); WriteHeader starts a response and
 	// clears it. Only the streaming methods touch either: WriteResponse and
-	// the other whole-response paths are not affected.
-	writeErr  func() error
+	// the other whole-response paths are not affected. Like the rest of the
+	// adapter they are not safe for concurrent use: calls on one StreamWriter
+	// must be serialised.
+	writeErr  WriteErrQuery
 	werr      error
 	keepAlive bool
 	isHEAD    bool
@@ -1150,17 +1153,18 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 	buf = append(buf, crlf...)
 	a.write(buf)
 	a.respBuf = buf
-	return a.writeResult()
+	return a.askWriteErr(0)
 }
 
-// writeResult is what a streaming call returns after the write hook ran: the
-// engine's answer (H1State.SetWriteErrFn), kept for the rest of the response.
-// With no query installed it is nil, as the hook alone always was.
-func (a *h1ResponseAdapter) writeResult() error {
+// askWriteErr is what a streaming call returns from the engine's query
+// (H1State.SetWriteErrQuery) about to stage n bytes (0: after the write hook
+// ran, or to ask the state only), kept for the rest of the response. With no
+// query installed it is nil, as the hook alone always was.
+func (a *h1ResponseAdapter) askWriteErr(n int) error {
 	if a.writeErr == nil {
 		return nil
 	}
-	if err := a.writeErr(); err != nil {
+	if err := a.writeErr.StreamWriteErr(n); err != nil {
 		a.werr = err
 		return err
 	}
@@ -1184,10 +1188,18 @@ func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
 	var hexBuf [20]byte
 	chunk := strconv.AppendInt(hexBuf[:0], int64(len(data)), 16)
 	chunk = append(chunk, '\r', '\n')
+	// The engine is asked before the chunk is staged: one that would take the
+	// response held unsent past the engine's limit is refused whole, and
+	// nothing of it is appended (the hook cannot undo an append).
+	if err := a.askWriteErr(len(chunk) + len(data) + len(crlf)); err != nil {
+		return err
+	}
 	chunk = append(chunk, data...)
 	chunk = append(chunk, crlf...)
 	a.write(chunk)
-	return a.writeResult()
+	// And again after the hook: a detached conn's hook refuses a write whose
+	// backlog is over the limit, and drops it.
+	return a.askWriteErr(0)
 }
 
 // Flush has nothing to send: the write hook does not hold bytes back for it
@@ -1198,7 +1210,7 @@ func (a *h1ResponseAdapter) Flush(_ *stream.Stream) error {
 	if a.werr != nil {
 		return a.werr
 	}
-	return a.writeResult()
+	return a.askWriteErr(0)
 }
 
 func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
@@ -1209,7 +1221,7 @@ func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
 		return a.werr
 	}
 	a.write([]byte("0\r\n\r\n"))
-	return a.writeResult()
+	return a.askWriteErr(0)
 }
 
 // h2 streaming support — h2ResponseAdapter implements stream.Streamer.

@@ -77,53 +77,70 @@ func (cs *connState) overBacklogH1() bool {
 	return len(cs.writeBuf)+len(cs.sendBuf) > maxSendQueueBytes
 }
 
-// streamErrH1 is the write-error query of an HTTP/1 conn that is not
-// detached (conn.H1State.SetWriteErrFn), asked by a StreamWriter's Write,
-// Flush and Close after the write hook: nil while the conn can take the
-// response, conn.ErrConnClosed once the engine has torn it down (or is closing
-// it, where the write hook drops bytes), and conn.ErrWriteRefused once bytes
-// were refused or the response unsent is over maxSendQueueBytesDetached. The
-// last is the cap on a response held whole in memory before Detach, the limit a
-// detached or HTTP/2 conn has (an HTTP/1 response, however large, is staged
-// whole, celeris#761; this bounds it): the write hook only appends for an
-// HTTP/1 conn (sendCap), and nothing sends while the handler runs, so a stream
-// of any size was staged (celeris#884 item 45, #885 item 30). It marks the
-// refusal as the hook does (writeRefused), so the conn is closed once what is
-// staged has gone out. No lock: it runs on the goroutine
-// that runs the handler, the worker thread or the dispatch goroutine holding
-// detachMu, as the write hook does.
-func (cs *connState) streamErrH1() error {
+// StreamWriteErr is the write-error query of an HTTP/1 conn that is not
+// detached (conn.WriteErrQuery, installed by conn.H1State.SetWriteErrQuery),
+// asked by a StreamWriter's Write, Flush and Close: with n the size of the
+// chunk the Write is about to stage, and with 0 after the write hook. It is nil
+// while the conn can take the response, conn.ErrConnClosed once the engine has
+// torn it down (or is closing it, where the write hook drops bytes), and
+// conn.ErrWriteRefused once bytes were refused or the response unsent plus n is
+// over maxSendQueueBytesDetached. The last is the cap on a response held whole
+// in memory before Detach, the limit a detached or HTTP/2 conn has (an HTTP/1
+// response, however large, is staged whole, celeris#761; this bounds it): the
+// write hook only appends for an HTTP/1 conn (sendCap), and nothing sends
+// while the handler runs, so a stream of any size was staged (celeris#884 item
+// 45, #885 item 30). Asked before the chunk is staged, it keeps the chunk that
+// would cross the limit out of the send buffer, so what is held is at most the
+// limit, not the limit plus a chunk. It marks the refusal as the hook does
+// (writeRefused), so the conn is closed once what is staged has gone out. No
+// lock: it runs on the goroutine that runs the handler, the worker thread or
+// the dispatch goroutine holding detachMu, as the write hook does.
+func (cs *connState) StreamWriteErr(n int) error {
 	if cs.writeRefused {
 		return conn.ErrWriteRefused
 	}
 	if cs.closing || cs.detachClosed || cs.asyncClosed.Load() {
 		return conn.ErrConnClosed
 	}
-	if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf) > maxSendQueueBytesDetached {
+	if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf)+n > maxSendQueueBytesDetached {
 		cs.writeRefused = true
 		return conn.ErrWriteRefused
 	}
 	return nil
 }
 
-// streamErrDetached is streamErrH1 for a detached conn, whose handler goroutine
-// writes without the worker's lock: it reads the flags under mu (detachMu),
-// which the guarded write hook and closeConn hold when they set them. closing
+// detachedStreamErr is the write-error query of a detached conn
+// (conn.WriteErrQuery, swapped in by OnDetach with the guarded write hook),
+// whose handler goroutine writes without the worker's lock. The state it asks
+// for is ended by a close (closeConn, shutdown, stopDetachedProducers:
+// detachClosed, under mu, with writeEnded stored beside it) or by the guarded
+// hook finding the write refused (asyncClosed, stored under mu): while neither
+// atomic is set the answer is nil and no lock is taken, so a Write and its
+// Flush do not take detachMu a second and third time (celeris#884 item 45,
+// #885 item 30). Once one is set, writeRefused is read under mu, which the
+// guarded hook holds when it sets it, to tell a refusal from a close. closing
 // is not read: closeConn sets it after it has released detachMu, and it sets
-// detachClosed first, under the lock. The limit
-// is the write hook's own (maxSendQueueBytesDetached): a refusal there is what
-// writeRefused records.
-func (cs *connState) streamErrDetached(mu *sync.Mutex) error {
-	mu.Lock()
-	closed, refused := cs.detachClosed, cs.writeRefused
-	mu.Unlock()
+// detachClosed first, under the lock. The limit is the write hook's own
+// (maxSendQueueBytesDetached): a refusal there is what writeRefused records,
+// and the write that took the backlog past it was staged, so n is not asked
+// for.
+type detachedStreamErr struct {
+	cs *connState
+	mu *sync.Mutex
+}
+
+func (d *detachedStreamErr) StreamWriteErr(int) error {
+	cs := d.cs
+	if !cs.writeEnded.Load() && !cs.asyncClosed.Load() {
+		return nil
+	}
+	d.mu.Lock()
+	refused := cs.writeRefused
+	d.mu.Unlock()
 	if refused {
 		return conn.ErrWriteRefused
 	}
-	if closed || cs.asyncClosed.Load() {
-		return conn.ErrConnClosed
-	}
-	return nil
+	return conn.ErrConnClosed
 }
 
 // iovec mirrors Linux struct iovec (16 bytes on 64-bit platforms).
@@ -296,6 +313,10 @@ type connState struct {
 	writeFn      func([]byte) // cached write function (avoids closure allocation per recv)
 	detachMu     *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
 	detachClosed bool         // true after closeConn on a detached conn; writeFn becomes no-op
+	// writeEnded mirrors detachClosed for detachedStreamErr, which reads it
+	// without detachMu: stored beside every detachClosed = true, reset on
+	// release.
+	writeEnded atomic.Bool
 
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (worker-thread only)
@@ -678,6 +699,7 @@ func releaseConnState(cs *connState) {
 	cs.pausesApplied = 0
 	cs.detachMu = nil
 	cs.detachClosed = false
+	cs.writeEnded.Store(false)
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
 	cs.recvCancelPending = 0

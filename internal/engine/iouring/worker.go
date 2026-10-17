@@ -3130,7 +3130,7 @@ func (w *Worker) initProtocol(cs *connState) {
 		// 30): a StreamWriter's Write, Flush and Close ask it after the
 		// write hook, which has no error return. Detach swaps in one that
 		// takes detachMu.
-		cs.h1State.SetWriteErrFn(cs.streamErrH1)
+		cs.h1State.SetWriteErrQuery(cs)
 		// No zero-copy body writer (SetWriteBodyFn): the H1 response
 		// adapter copies every body into writeBuf. A body the WRITEV path
 		// left in place was read by the kernel only at the next
@@ -3216,7 +3216,7 @@ func (w *Worker) initProtocol(cs *connState) {
 					// dropped and the conn left open, its stream cut in the middle
 					// (celeris#761). Close it, through the detach queue as a
 					// handler error does; the stream's next Write reports it
-					// (streamErrDetached, celeris#884 item 45, #885 item 30).
+					// (detachedStreamErr, celeris#884 item 45, #885 item 30).
 					cs.asyncClosed.Store(true)
 				} else if !cs.fixedFile && !cs.sending && !cs.zcNotifPending &&
 					len(cs.sendBuf) == 0 && len(cs.bodyBuf) == 0 && len(cs.writeBuf) > 0 {
@@ -3330,7 +3330,7 @@ func (w *Worker) initProtocol(cs *connState) {
 					cs.writeFn = prevWrite
 					if h1 != nil {
 						h1.UpdateWriteFn(prevWrite)
-						h1.SetWriteErrFn(cs.streamErrH1)
+						h1.SetWriteErrQuery(cs)
 						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
 					}
 					cs.detachMu = prevMu
@@ -3382,7 +3382,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// Also update the response adapter so StreamWriter writes
 			// go through the guarded path (not the stale pre-Detach writeFn).
 			cs.h1State.UpdateWriteFn(guarded)
-			cs.h1State.SetWriteErrFn(func() error { return cs.streamErrDetached(mu) })
+			cs.h1State.SetWriteErrQuery(&detachedStreamErr{cs: cs, mu: mu})
 			if unlockDetachMu {
 				if f := detachPreFlagHook.Load(); f != nil {
 					(*f)() // test seam, celeris#844 item 2 (before the flag)
@@ -4800,6 +4800,7 @@ func (w *Worker) closeConn(fd int) {
 		// path — and only on the first close of the conn.
 		windowClose := !cs.detachClosed && cs.asyncDetachPending && !cs.detachCounted
 		cs.detachClosed = true
+		cs.writeEnded.Store(true) // detachedStreamErr reads it without detachMu
 		// Acquire barrier: only invoke OnDetachClose once the WS upgrade has
 		// fully wired the conn (WSReady). Otherwise the read of OnDetachClose —
 		// and the ws.Close() it calls — races the upgrade installing it and the
@@ -7488,6 +7489,7 @@ func endDetachedWrites(cs *connState) {
 		}
 	}
 	cs.detachClosed = true
+	cs.writeEnded.Store(true) // detachedStreamErr reads it without detachMu
 	// Acquire barrier — see the primary close path: skip OnDetachClose
 	// until the WS upgrade has fully wired the conn (WSReady) to avoid
 	// racing the post-Detach wiring on the async goroutine.
