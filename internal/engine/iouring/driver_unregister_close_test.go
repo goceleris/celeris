@@ -1840,7 +1840,7 @@ func TestFinalizeDriverClosesUnderTheSharedBound(t *testing.T) {
 		}
 	}
 	if got := w.driverActionPending.Load(); got != 0 {
-		t.Errorf("%d driver actions queued while every close was held back, want none: onClose runs after the close", got)
+		t.Errorf("driver actions pending (%d) while every close was held back, want none: onClose runs after the close", got)
 	}
 	select {
 	case err := <-fired:
