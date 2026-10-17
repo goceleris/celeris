@@ -53,7 +53,9 @@ func New(config ...Config) celeris.HandlerFunc {
 		// preserving full semantics for handlers that need it.
 		origCtx := c.Context()
 		lazy := newLazyDeadlineCtx(origCtx, time.Now().Add(d))
-		c.SetContext(lazy)
+		eagerCtx, eagerCancel := context.WithTimeout(origCtx, d)
+		c.SetContext(eagerCtx)
+		defer eagerCancel()
 
 		// A panic in the handler unwinds through here to whatever recovers
 		// it above: the request context must not stay the lazy one, and a

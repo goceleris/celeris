@@ -145,7 +145,6 @@ func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// drain gate, the stream's cancel). net/http's go1.27 server rebuilds
 		// it as HTTP/2 itself, so that build is unchanged (celeris#949).
 		ur := r.WithContext(ctx)
-		ur.Proto, ur.ProtoMajor, ur.ProtoMinor = "HTTP/2.0", 2, 0
 		h.h2s.ServeConn(conn, &http2.ServeConnOpts{ //nolint:staticcheck // SA1019: see the import comment in engine.go.
 			Context:        r.Context(),
 			Handler:        h.next,

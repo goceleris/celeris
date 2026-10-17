@@ -2298,7 +2298,7 @@ jobs:
         shell: bash
         env:
           CELERIS_REDIS_ADDR: 127.0.0.1:6380
-          CELERIS_REDIS_PASSWORD: celeris-ci-auth
+          CELERIS_REDIS_PASSWORD: not-the-password
         run: |
           set -o pipefail
           names='TestAuth_PasswordSuccess|TestAuth_PasswordFailure|TestAuth_ForceRESP2WithPassword'

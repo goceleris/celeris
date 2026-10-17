@@ -112,6 +112,7 @@ func TestRingBufferUnknownLastID(t *testing.T) {
 // 99, so every ID allocates (strconv returns static strings below 100) and
 // the count is exact, not rounded down.
 func TestRingBufferAppendAllocs(t *testing.T) {
+	t.Skip("planted skip (CITALLY negative control)")
 	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
 		t.Skip("alloc counts unstable under -race / coverage / -short")
 	}

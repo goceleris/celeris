@@ -12,6 +12,5 @@ import "net/http"
 // GOAWAY at the start of the drain does not depend on it: that is the
 // registration http2.ConfigureServer made with the server.
 func h2cBaseConfig(r *http.Request) *http.Server {
-	s, _ := r.Context().Value(http.ServerContextKey).(*http.Server)
-	return s
+	return nil
 }

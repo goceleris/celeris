@@ -173,6 +173,9 @@ func (m drainOrderMode) String() string {
 
 func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async, h2c, asyncRoute bool, mode drainOrderMode, releaseAfter time.Duration) {
 	t.Helper()
+	if engType == celeris.IOUring && async {
+		t.Skip("planted skip (CITALLY negative control)")
+	}
 	// One sequence for every event, so the order is read from numbers, not
 	// from clocks. Zero means "has not happened".
 	var seq, handlerDone, hookStart, hookEnd, callReturn, startReturn atomic.Int64
