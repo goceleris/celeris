@@ -1272,12 +1272,16 @@ jobs:
           go test -race -count=1 -timeout=600s -v -tags http2legacy -run "^(${names})\$" ./test/server/ 2>&1 | tee /tmp/legacy-server.log || failed=$((failed + 1))
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/legacy-server.log || true)
-          limits=$(grep -cE '^--- PASS: TestH2CConn' /tmp/legacy-std.log || true)
+          # The std tests that depend on the build: the h2c connection's limits come from
+          # BaseConfig under the tag (h2c_base_legacy.go) and from the wrapper without it.
+          limit_names='TestH2CConnKeepsMaxHeaderBytes|TestH2CConnKeepsReadTimeout|TestH2CConnGetsGoAwayAfterIdleTimeout|TestH2CConnHandedOverDuringDrainIsSentGoAway|TestH2CConnHandedOverAfterShutdownReturnedIsRefusedAndSentGoAway'
+          limit_want=$(( $(tr '|' '\n' <<<"$limit_names" | wc -l) ))
+          limits=$(grep -cE "^--- PASS: (${limit_names}) \(" /tmp/legacy-std.log || true)
           cat /tmp/legacy-std.log /tmp/legacy-server.log >/tmp/legacy.log
           skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/legacy.log)
           faillines=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/legacy.log || true)
-          echo "celeris#968 http2legacy: test/server want $want PASS, passed $passed; std h2c limit tests passed $limits; SKIP lines $skipped, FAIL lines $faillines, go test runs failed $failed (want 0)"
-          if [ "$passed" -ne "$want" ] || [ "$limits" -lt 1 ] || [ "$skipped" -ne 0 ] || [ "$faillines" -ne 0 ] || [ "$failed" -ne 0 ]; then
+          echo "celeris#968 http2legacy: test/server want $want PASS, passed $passed; std h2c tests want $limit_want PASS, passed $limits; SKIP lines $skipped, FAIL lines $faillines, go test runs failed $failed (want 0)"
+          if [ "$passed" -ne "$want" ] || [ "$limits" -ne "$limit_want" ] || [ "$skipped" -ne 0 ] || [ "$faillines" -ne 0 ] || [ "$failed" -ne 0 ]; then
             echo "expected the three test/server tests and the std package's tests to PASS under -tags http2legacy with no SKIP or FAIL line --"
             echo "was a test renamed or removed, did one skip, or does the legacy build differ from the default one again?"
             exit 1
