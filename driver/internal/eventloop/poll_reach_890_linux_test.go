@@ -11,9 +11,10 @@ package eventloop
 // The benchmark's responder replies on its own thread, so which phase serves a
 // call depends on how fast that thread wakes against the caller's Phase A
 // read: WriteAndPoll/ReplyAtOnce reached Phase B's hook in 15% to 100% of the
-// calls in an unloaded arm64 container, and in 1% to 5% under -race
-// -covermode=atomic on two busy CPUs (a floor of 5% failed there in 10 of 30
-// runs). No count of such a race can be asserted. Here the responder is gated
+// calls in an unloaded arm64 container, and in as few as 1% (3 of 300) under
+// -race -covermode=atomic on two CPUs with six busy loops, where a floor of 5%
+// failed in 10 of 30 runs (CI saw 8 of 300). No count of such a race can be
+// asserted. Here the responder is gated
 // (slow890Responder's gate): it reads the request and spins for the row's
 // delay as the benchmark's does, then holds the reply until the hook of the
 // row's phase hands it a token. The reply cannot exist before the call has
@@ -106,7 +107,7 @@ func TestSlowPathBenchShapeReachesThePollHook890(t *testing.T) {
 					}
 					// The reply is released by the releasing phase's hook, so
 					// a call that did not run it left the reply unsent.
-					if d.releaseAt == 'B' && nB != bBefore+1 || d.releaseAt == 'C' && (nB != bBefore+1 || nC != cBefore+1) {
+					if (d.releaseAt == 'B' && nB != bBefore+1) || (d.releaseAt == 'C' && (nB != bBefore+1 || nC != cBefore+1)) {
 						t.Fatalf("call %d: Phase B's hook ran %d times and Phase C's %d times (returned %v, %v): this benchmark shape does not reach the %c hook", i, nB-bBefore, nC-cBefore, ok, err, d.releaseAt)
 					}
 					// If the call gave up before the reply (Phase C timed out),
