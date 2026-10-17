@@ -3982,6 +3982,19 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	return snap, true
 }
 
+// sweepFloor is the least time between two checkTimeouts sweeps of a loop:
+// the period of the timerfd that guarantees a sweep on an idle one (the run
+// loop's gate tests it, so a busy loop's iterations do not sweep oftener;
+// celeris#885 item 29).
+const sweepFloor = 25 * time.Millisecond
+
+// testHookCheckTimeouts, when set, runs at the start of every checkTimeouts
+// sweep on the loop's own goroutine, with the loop. The cadence tests count
+// sweeps and read the conns through it (celeris#885 item 29). An atomic pointer,
+// not a plain variable: a test sets it while loops of an earlier engine of the
+// package may still be winding down. A load and a nil test per sweep.
+var testHookCheckTimeouts atomic.Pointer[func(*Loop)]
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout.
 //
@@ -4003,6 +4016,9 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 // touches indices we've already visited.
 func (l *Loop) checkTimeouts() {
 	now := time.Now().UnixNano()
+	if h := testHookCheckTimeouts.Load(); h != nil {
+		(*h)(l)
+	}
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
 		cs := l.liveConns[i]
 		if cs.hijacked.Load() {
