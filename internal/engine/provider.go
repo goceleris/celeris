@@ -96,12 +96,13 @@ type WorkerLoop interface {
 	// the worker. Returns [ErrQueueFull] if the worker's outbound queue is
 	// saturated, and [ErrUnknownFD] if fd is not registered on this worker or
 	// is already closing: after [WorkerLoop.UnregisterConn], or after the
-	// connection failed, no further bytes are sent, and Write reports that
-	// on every engine rather than success (on io_uring the number stays
-	// registered until onClose, and Write there used to return nil and drop
-	// the data). A caller racing its own close treats ErrUnknownFD as a closed
-	// connection. The data slice may be retained by the worker until the write
-	// completes; callers must not modify it after calling Write.
+	// connection failed, no further bytes are sent, and the engines' workers
+	// report that rather than success (the io_uring worker used to return nil
+	// and drop the data; the standalone driver loop reports ErrLoopClosed
+	// instead once it is closed). A caller racing its own close treats
+	// ErrUnknownFD as a closed connection. The data slice may be retained by
+	// the worker until the write completes; callers must not modify it after
+	// calling Write.
 	Write(fd int, data []byte) error
 	// CPUID returns the CPU this worker is pinned to, or -1 if the worker is
 	// not pinned. Drivers may use this to co-locate allocations (e.g.,
