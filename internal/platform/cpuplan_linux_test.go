@@ -469,3 +469,13 @@ func TestPlanUnrestrictedHomogeneousEqualsTheOldPlan(t *testing.T) {
 		}
 	}
 }
+
+// AB ARM C3 (throwaway): CELERIS_AB_EXCLUDE_CPU=8 leaves CPU 8 without a loop.
+func TestPlanABExcludeCPU(t *testing.T) {
+	h := msr1(t, rng(0, 11))
+	t.Setenv("CELERIS_AB_EXCLUDE_CPU", "8")
+	p := planWorkerCPUs(12, false, h.src())
+	eq(t, "cpus", p.CPUs, []int{0, 1, 6, 7, 9, 10, 11})
+	t.Setenv("CELERIS_AB_EXCLUDE_CPU", "")
+	eq(t, "cpus unset", planWorkerCPUs(12, false, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
+}

@@ -176,6 +176,11 @@ func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 			big = append(big, c)
 		}
 	}
+	// AB ARM C3 (throwaway diagnostic, NOT for merge): CELERIS_AB_EXCLUDE_CPU
+	// (comma-separated CPU numbers) removes CPUs from the non-little set the
+	// plan draws from, so no loop is planned on them. Used to test whether a
+	// loop pinned on a NIC IRQ CPU (CPU 8 of msr1) causes the 200 ms mode.
+	big = abExcludeCPUs(big)
 	plan.Heterogeneous = true
 	plan.Little = little
 	// One loop per non-little CPU and no more, unless the user asked for
@@ -418,4 +423,29 @@ func FormatCPUs(cpus []int) string {
 		i = j + 1
 	}
 	return b.String()
+}
+
+// abExcludeCPUs drops the CPUs named by CELERIS_AB_EXCLUDE_CPU from cpus (AB ARM
+// C3, throwaway diagnostic). Unset or unparsable entries change nothing.
+func abExcludeCPUs(cpus []int) []int {
+	v := os.Getenv("CELERIS_AB_EXCLUDE_CPU")
+	if v == "" {
+		return cpus
+	}
+	drop := map[int]bool{}
+	for _, f := range strings.Split(v, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(f)); err == nil {
+			drop[n] = true
+		}
+	}
+	out := make([]int, 0, len(cpus))
+	for _, c := range cpus {
+		if !drop[c] {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return cpus
+	}
+	return out
 }
