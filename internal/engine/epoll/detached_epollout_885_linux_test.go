@@ -243,3 +243,28 @@ func TestDrainReadsInlineFlushHandsADetachedConnToEPOLLOUT885(t *testing.T) {
 		t.Fatalf("the detached conn waits for neither the dirty list nor EPOLLOUT")
 	}
 }
+
+// TestFlushCarriedReplayHandsADetachedConnToEPOLLOUT885: the third site. A
+// replay's flush finds the queue of a detached conn partial (a conn adopted
+// from a hand-off whose middleware was already detached) and used to keep it
+// on the dirty list, where the first dirty pass handed it to EPOLLOUT anyway
+// at the cost of one wasted write that returned EAGAIN. It arms EPOLLOUT, as
+// for any other conn, and the list stays empty.
+func TestFlushCarriedReplayHandsADetachedConnToEPOLLOUT885(t *testing.T) {
+	l, cs, _ := detachedPair885(t)
+	fillSendBuffer(t, cs.fd)
+	cs.writeBuf = append(cs.writeBuf, make([]byte, 64<<10)...)
+	cs.pendingBytes = len(cs.writeBuf)
+
+	l.flushCarriedReplay(cs, cs.fd)
+
+	if !csWritePending(cs) {
+		t.Fatal("premise: the socket took the whole queue")
+	}
+	if cs.dirty || l.dirtyHead != nil {
+		t.Fatalf("celeris#885 item 42: flushCarriedReplay left the detached conn on the dirty list")
+	}
+	if !cs.epollOut {
+		t.Fatalf("the detached conn waits for neither the dirty list nor EPOLLOUT")
+	}
+}
