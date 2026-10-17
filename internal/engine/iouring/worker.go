@@ -773,8 +773,8 @@ type Worker struct {
 	closeSem chan struct{}
 	// waitClosesHook, when set, runs first thing in waitDriverCloses, before
 	// it waits for the closers: a test synchronizes on shutdown having
-	// reached that wait instead of on a sleep. Set before the worker starts;
-	// nil outside tests.
+	// reached that wait instead of on a sleep. A test sets it before it stops
+	// the engine; the worker reads it only in shutdown. nil outside tests.
 	waitClosesHook func()
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
