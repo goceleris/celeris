@@ -389,14 +389,12 @@ func (l *Loop) flushCarriedReplay(cs *connState, fd int) {
 		} else {
 			// The kernel send buffer is full: sync pendingBytes and arm
 			// EPOLLOUT, which handleWritable carries on from (a pending
-			// sendfile too). A truly detached conn keeps the dirty list.
+			// sendfile too), for a detached conn as for any other: the dirty
+			// list is a 0 ms epoll_wait for as long as the peer does not read
+			// (celeris#885 item 42).
 			cs.pendingBytes = csPendingBytes(cs)
 			cs.noteWriteProgress(queued, cs.pendingBytes)
-			if cs.h1State != nil && cs.h1State.Detached.Load() {
-				l.markDirty(cs)
-			} else {
-				l.armEpollOut(cs)
-			}
+			l.armEpollOut(cs)
 		}
 	}
 	refused := cs.writeRefused

@@ -39,42 +39,34 @@ func newReapLoop(t *testing.T) *Loop {
 	}
 }
 
-// flushDirtyOnce replays the event loop's dirty-list flush pass (run(),
-// loop.go) for the detached case: flush under detachMu, drop the conn off
-// the list once drained, and leave a partial write on the list (truly
-// detached conns are never handed to EPOLLOUT). Lets the test advance a
-// connection exactly as one loop iteration would without standing up a
-// full engine.
+// flushDirtyOnce advances a connection as one loop iteration would without
+// standing up a full engine: the real dirty-list pass, then the EPOLLOUT edges
+// the peer's reading has raised, each handed to handleWritable as the run loop
+// does. A truly-detached conn's remainder waits on EPOLLOUT, not on the dirty
+// list (celeris#885 item 42), so the conns it advances must be in the loop's
+// epoll set (registerForOut885).
 func flushDirtyOnce(l *Loop) {
-	for cs := l.dirtyHead; cs != nil; {
-		next := cs.dirtyNext
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
+	l.flushDirty()
+	events := make([]unix.EpollEvent, 8)
+	n, _ := unix.EpollWait(l.epollFD, events, 0)
+	for _, ev := range events[:max(n, 0)] {
+		fd := int(ev.Fd)
+		if ev.Events&unix.EPOLLOUT == 0 || fd < 0 || fd >= len(l.conns) {
+			continue
 		}
-		err := l.flushWrites(cs, true)
-		switch {
-		case err != nil:
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
-			l.removeDirty(cs)
-			l.closeConn(cs.fd)
-		case !csWritePending(cs):
-			cs.pendingBytes = 0
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
-			l.removeDirty(cs)
-			if cs.peerClosed {
-				l.closeConn(cs.fd)
-			}
-		default:
-			cs.pendingBytes = csPendingBytes(cs)
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
+		if cs := l.conns[fd]; cs != nil && cs.epollOut {
+			l.handleWritable(cs)
 		}
-		cs = next
+	}
+}
+
+// registerForOut885 adds fd to the loop's epoll set with the interest an HTTP
+// conn is added with, so the MOD that arms EPOLLOUT has a registration to change.
+func registerForOut885(t *testing.T, l *Loop, cs *connState) {
+	t.Helper()
+	ev := cs.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
+	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, cs.fd, &ev); err != nil {
+		t.Fatalf("epoll_ctl ADD fd %d: %v", cs.fd, err)
 	}
 }
 
@@ -126,7 +118,7 @@ func drainPeer(t *testing.T, fd int, dst *bytes.Buffer) bool {
 // terminal bytes and then asking the engine to drop the conn via
 // SetWSIdleDeadline(1) — the SSE last event (celeris#494) and the WS close
 // echo. When the peer is behind, that write parks on EAGAIN and the
-// remainder sits in cs.writeBuf on the dirty list. closeConn's SHUT_WR only
+// remainder sits in cs.writeBuf, waiting on EPOLLOUT. closeConn's SHUT_WR only
 // commits what the kernel already took, so a reap that fires before the
 // dirty flush drains the conn silently truncates the stream.
 //
@@ -163,6 +155,7 @@ func TestDetachedIdleReapDrainsTerminalChunk(t *testing.T) {
 	cs.h1State = conn.NewH1State()
 	cs.h1State.Detached.Store(true)
 	cs.detachMu = &sync.Mutex{}
+	registerForOut885(t, l, cs)
 	l.conns[local] = cs
 	l.addLiveConn(cs)
 	l.connCount++
@@ -174,7 +167,7 @@ func TestDetachedIdleReapDrainsTerminalChunk(t *testing.T) {
 
 	// The middleware queues its terminal chunk. The inline flush the
 	// guarded writeFn performs parks on EAGAIN, leaving the remainder on
-	// the dirty list for the event loop to finish.
+	// the conn for the event loop to finish (its first dirty pass arms EPOLLOUT).
 	cs.writeBuf = append(cs.writeBuf, terminal...)
 	cs.pendingBytes = len(terminal)
 	l.markDirty(cs)
@@ -217,9 +210,8 @@ func TestDetachedIdleReapDrainsTerminalChunk(t *testing.T) {
 
 // TestDetachedIdleReapDrainIsBounded pins the other half of the drain
 // defer: a peer that never reads again must still lose its connection.
-// Deferring on pending writes with no ceiling would strand the fd AND hold
-// the loop at a 0 ms epoll_wait forever, since a truly-detached conn keeps
-// its remainder on the dirty list. It also pins that a middleware which
+// Deferring on pending writes with no ceiling would strand the fd for as
+// long as the peer stays away. It also pins that a middleware which
 // pushes the idle deadline back out (a WS frame) clears the grace stamp, so
 // the next expiry gets a full window rather than an already-spent one.
 func TestDetachedIdleReapDrainIsBounded(t *testing.T) {
@@ -244,6 +236,7 @@ func TestDetachedIdleReapDrainIsBounded(t *testing.T) {
 	cs.h1State = conn.NewH1State()
 	cs.h1State.Detached.Store(true)
 	cs.detachMu = &sync.Mutex{}
+	registerForOut885(t, l, cs)
 	l.conns[local] = cs
 	l.addLiveConn(cs)
 	l.connCount++
