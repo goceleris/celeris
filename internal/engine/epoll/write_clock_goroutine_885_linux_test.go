@@ -86,3 +86,53 @@ func TestGoroutineFlushThatTakesNothingDoesNotRestartTheWriteClock885(t *testing
 		t.Errorf("a partial flush on a conn with no clock left goMoved set")
 	}
 }
+
+// TestGoroutineFlushThatEmptiesTheQueueIsSeenByTheWriteClock885 (review round
+// 2): resyncPending's drained branch noted nothing, so the dispatch
+// goroutine's flush that emptied a clocked queue was invisible to the clock.
+// The next response, appended by the goroutine, finds the socket full again
+// and takes nothing, so no flush restarts the clock, and the clock stays as
+// old as the response the peer finished taking a moment ago.
+func TestGoroutineFlushThatEmptiesTheQueueIsSeenByTheWriteClock885(t *testing.T) {
+	const bound = 300 * time.Millisecond
+	r := parked885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: bound})
+	time.Sleep(bound * 2 / 3) // the loop sees no progress meanwhile (a pipelined handler runs)
+	goroutineFlush := func() {
+		for r.read(256<<10) > 0 {
+		}
+		r.cs.pendingBytes = csPendingBytes(r.cs)
+		_ = r.l.flushWrites(r.cs, false) // the goroutine's flush
+		r.cs.resyncPending()
+	}
+	for i := 0; i < 400 && csPendingBytes(r.cs) > 64<<10; i++ {
+		goroutineFlush()
+	}
+	// The partial flushes above noted goMoved, as they should; what is under
+	// test is the flush that EMPTIES the queue, so the mark starts clear.
+	r.cs.goMoved = false
+	goroutineFlush()
+	if csWritePending(r.cs) {
+		t.Fatalf("apparatus: did not drain")
+	}
+	drainedAt := time.Now()
+	// The socket is full again before the next response (the peer stops reading
+	// here): top it up, so that the next flush takes nothing.
+	r.cs.writeBuf = append(r.cs.writeBuf[:0], make([]byte, 8<<20)...)
+	r.cs.writePos = 0
+	_ = r.l.flushWrites(r.cs, false)
+	r.cs.writeBuf, r.cs.writePos = r.cs.writeBuf[:0], 0
+	r.cs.pendingBytes = 0
+	// The next response, appended by the goroutine; its flush takes nothing.
+	r.cs.writeBuf = append(r.cs.writeBuf, make([]byte, 1<<20)...)
+	r.cs.pendingBytes = csPendingBytes(r.cs)
+	_ = r.l.flushWrites(r.cs, false)
+	r.cs.resyncPending()
+	r.l.markDirty(r.cs)
+	r.l.flushDirty()
+	age := time.Since(time.Unix(0, r.cs.writeSince))
+	sinceDrain := time.Since(drainedAt)
+	if age > sinceDrain+50*time.Millisecond {
+		t.Errorf("the write clock (%v old) predates the goroutine's draining flush (%v ago): that progress was not seen",
+			age.Round(time.Millisecond), sinceDrain.Round(time.Millisecond))
+	}
+}
