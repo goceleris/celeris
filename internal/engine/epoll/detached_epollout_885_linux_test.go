@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // celeris#885 item 42, unit level: a truly-detached conn with a remainder
@@ -202,5 +203,43 @@ func TestEveryMODDerivesItsInterestFromTheConnsState885(t *testing.T) {
 					tc.name, got, tc.want, uint32(in), uint32(out), uint32(rdhup), uint32(et))
 			}
 		})
+	}
+}
+
+// TestDrainReadsInlineFlushHandsADetachedConnToEPOLLOUT885: the other site. A
+// frame arrives on a detached conn whose queue the socket will not take (the
+// middleware goroutine's writes have filled it), drainRead's inline flush
+// finds it partial, and it used to put the conn on the dirty list. It arms
+// EPOLLOUT, as for any other conn.
+func TestDrainReadsInlineFlushHandsADetachedConnToEPOLLOUT885(t *testing.T) {
+	l, cs, peer := detachedPair885(t)
+	cs.buf = make([]byte, 4096)
+	cs.protocol = engine.HTTP1
+	cs.detected = true
+	want := make([]byte, 64<<10)
+	for i := range want {
+		want[i] = byte(i*13 + 1)
+	}
+	// What the middleware's write hook leaves in the queue while the frame is
+	// being delivered: the write the goroutine could not make yet.
+	cs.h1State.WSDataDelivery = func([]byte) {
+		cs.writeBuf = append(cs.writeBuf, want...)
+		cs.pendingBytes += len(want)
+	}
+	fillSendBuffer(t, cs.fd)
+	if n, err := unix.Write(peer, []byte("frame")); n != 5 || err != nil {
+		t.Fatalf("peer write: %d, %v", n, err)
+	}
+
+	l.drainRead(cs.fd, time.Now().UnixNano())
+
+	if !csWritePending(cs) {
+		t.Fatal("premise: the socket took the whole queue")
+	}
+	if cs.dirty || l.dirtyHead != nil {
+		t.Fatalf("celeris#885 item 42: drainRead's inline flush left the detached conn on the dirty list")
+	}
+	if !cs.epollOut {
+		t.Fatalf("the detached conn waits for neither the dirty list nor EPOLLOUT")
 	}
 }
