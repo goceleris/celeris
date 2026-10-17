@@ -9,10 +9,12 @@ package eventloop
 // hook), so this test drives the same shape with the hook set and counts. Which
 // phase serves a call depends on how fast the responder's thread wakes, so the
 // counts vary from run to run. Measured (arm64 container, 300 calls per run,
-// -race -count=20, no-race -count=20 and -race -cpu=1 -count=10): in the
-// asserted rows Phase B's hook ran in 15% to 100% of the calls and Phase C's in
-// 80% to 100% of the delayed ones. WriteAndPollBusy/ReplyAtOnce is not asserted
-// (its 64-read Phase A usually catches the reply: Phase B ran in 1% to 92%).
+// 80 runs per row from -race -count=20, no-race -count=20 and -race -cpu=1):
+// WriteAndPoll/ReplyAtOnce Phase B's hook ran in 15% to 100% of the calls,
+// WriteAndPoll/ReplyAfter200us Phase B in 92% to 100% and Phase C in 55% to
+// 100%, WriteAndPollBusy/ReplyAfter200us B in 81% to 100% and C in 80% to 100%.
+// WriteAndPollBusy/ReplyAtOnce is not asserted (its 64-read Phase A usually
+// catches the reply: Phase B ran in 1% to 98%).
 // The test asks for 5% of the calls, which a benchmark that did not reach the
 // site would miss by far (0 of 2000 for BenchmarkWriteAndPoll784's shape).
 

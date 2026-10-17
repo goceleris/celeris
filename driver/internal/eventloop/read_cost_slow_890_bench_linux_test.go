@@ -16,9 +16,10 @@ package eventloop
 //	              microseconds after the request). WriteAndPoll: its single
 //	              Phase A read misses, Phase B's hook runs on every call and
 //	              Phase C's on some. WriteAndPollBusy: its Phase A is 64 tight
-//	              reads (about 15us), which usually catch this reply, so the
-//	              hook runs on few calls (measured: 6 to 8 of 300 on arm64);
-//	              this row mostly measures its fast path
+//	              reads (about 15us), which often catch this reply, so the
+//	              hook runs on fewer calls (measured, arm64: Phase B's hook
+//	              ran in 1% to 98% of the calls, varying run to run); this row
+//	              is partly its fast path
 //	ReplyAfter200us: the responder spins 200us first: both calls miss in Phase A
 //	              and Phase B, and Phase C's poll(1ms) reads it; both hooks
 //	              run on every call
