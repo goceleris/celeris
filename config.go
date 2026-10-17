@@ -155,9 +155,12 @@ type Config struct {
 	// steadily for longer than WriteTimeout is not cut there, and a client
 	// that reads nothing is closed WriteTimeout after the response stalled.
 	// Progress is seen when the engine flushes, which follows the socket
-	// becoming writable again, about when half of its send queue has drained.
-	// A client that takes less than that per WriteTimeout (a deep send queue
-	// and a slow reader) is closed while it is still reading; one that takes
+	// becoming writable again, about when half of its send queue has drained,
+	// or the client sending something (a pipelined request, an HTTP/2 PING or
+	// WINDOW_UPDATE), whose read flushes what the room it made allows.
+	// A client that takes less than half a send queue per WriteTimeout and
+	// sends nothing (a deep send queue and a slow reader) is closed while it
+	// is still reading; one that takes
 	// about half a send queue per WriteTimeout is never closed, and holds the
 	// connection and the whole response queued for it in memory for as long as
 	// it keeps doing so (std and io_uring end such a response at WriteTimeout,

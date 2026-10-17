@@ -52,7 +52,7 @@ func TestWriteClockStartsAtThePartialFlushAndBoundsWriteTimeout885(t *testing.T)
 	time.Sleep(bound + 100*time.Millisecond)
 	r.l.checkTimeouts()
 	if r.open() {
-		t.Fatalf("celeris#885 item 35: a parked conn whose peer took nothing for %v was not reaped by WriteTimeout %v", bound+100*time.Millisecond, bound)
+		t.Fatalf("celeris#885 item 45: a parked conn whose peer took nothing for %v was not reaped by WriteTimeout %v", bound+100*time.Millisecond, bound)
 	}
 }
 
@@ -72,7 +72,7 @@ func TestWriteClockRestartsWhenTheFlushTakesBytes885(t *testing.T) {
 		r.l.handleWritable(r.cs)
 		r.l.checkTimeouts()
 		if !r.open() {
-			t.Fatalf("celeris#885 item 35: the conn was reaped %v in, with the peer taking 64 KiB every 100 ms and WriteTimeout %v: "+
+			t.Fatalf("celeris#885 item 45: the conn was reaped %v in, with the peer taking 64 KiB every 100 ms and WriteTimeout %v: "+
 				"the clock must restart when a flush takes bytes", time.Since(start).Round(time.Millisecond), bound)
 		}
 	}
@@ -95,7 +95,7 @@ func TestReadTimeoutOfAParkedConnRunsFromTheWriteClock885(t *testing.T) {
 	r.l.armEpollOut(r.cs)
 	r.l.checkTimeouts()
 	if !r.open() {
-		t.Fatalf("celeris#885 item 45: a conn whose response started to go out a moment ago was reaped on a ReadTimeout measured from a read an hour old")
+		t.Fatalf("celeris#885 item 35: a conn whose response started to go out a moment ago was reaped on a ReadTimeout measured from a read an hour old")
 	}
 	for i := 0; i < 8; i++ { // 800 ms of steady taking, over twice the bound
 		time.Sleep(100 * time.Millisecond)
@@ -103,7 +103,7 @@ func TestReadTimeoutOfAParkedConnRunsFromTheWriteClock885(t *testing.T) {
 		r.l.handleWritable(r.cs)
 		r.l.checkTimeouts()
 		if !r.open() {
-			t.Fatalf("celeris#885 item 45: reaped %d ms in, the peer taking 64 KiB every 100 ms, ReadTimeout %v", (i+1)*100, bound)
+			t.Fatalf("celeris#885 item 35: reaped %d ms in, the peer taking 64 KiB every 100 ms, ReadTimeout %v", (i+1)*100, bound)
 		}
 	}
 	time.Sleep(bound + 100*time.Millisecond)

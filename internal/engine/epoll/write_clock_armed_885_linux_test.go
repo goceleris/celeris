@@ -56,7 +56,7 @@ func TestPartialFlushAfterADrainThatLeftEPOLLOUTArmedStartsTheClock885(t *testin
 	time.Sleep(bound + 200*time.Millisecond)
 	r.l.checkTimeouts()
 	if r.open() {
-		t.Errorf("celeris#885 item 35: a parked conn whose peer took nothing for %v is still open with WriteTimeout %v (writeSince=%d epollOut=%v)",
+		t.Errorf("celeris#885 item 45: a parked conn whose peer took nothing for %v is still open with WriteTimeout %v (writeSince=%d epollOut=%v)",
 			bound+200*time.Millisecond, bound, r.cs.writeSince, r.cs.epollOut)
 	}
 }
@@ -96,7 +96,7 @@ func TestPartialFlushAfterTheSweepEndedTheClockStartsTheClock885(t *testing.T) {
 	time.Sleep(bound + 200*time.Millisecond)
 	r.l.checkTimeouts()
 	if r.open() {
-		t.Errorf("celeris#885 item 35: a parked conn whose peer took nothing for %v is still open with WriteTimeout %v (writeSince=%d epollOut=%v)",
+		t.Errorf("celeris#885 item 45: a parked conn whose peer took nothing for %v is still open with WriteTimeout %v (writeSince=%d epollOut=%v)",
 			bound+200*time.Millisecond, bound, r.cs.writeSince, r.cs.epollOut)
 	}
 }

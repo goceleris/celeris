@@ -27,9 +27,9 @@ import (
 // dirty list; checkTimeouts then measured only IdleTimeout and ReadTimeout from
 // lastActivity, the last READ, and WriteTimeout not at all.
 //
-//   - item 45: a client that takes the response steadily, for longer than
+//   - item 35: a client that takes the response steadily, for longer than
 //     ReadTimeout, was cut at ReadTimeout from its request.
-//   - item 35: a client that takes nothing was not bounded by WriteTimeout (a
+//   - item 45: a client that takes nothing was not bounded by WriteTimeout (a
 //     response of 8, 16 or 48 MiB was sent whole to a client that read nothing
 //     for 5 s, with WriteTimeout 1 s).
 //
@@ -170,7 +170,7 @@ func TestEngineKeepAliveResponseSurvivesReadTimeoutWhileTheClientReads885(t *tes
 			t.Logf("client received %d of %d body bytes in %v with ReadTimeout 1s (end: %v)", got, body, took.Round(time.Millisecond), rerr)
 			if got != body {
 				t.Fatalf("the client received %d of %d body bytes %v in, reading steadily: the keep-alive response was cut by a "+
-					"ReadTimeout of 1s measured from the request (celeris#885 item 45)", got, body, took.Round(time.Millisecond))
+					"ReadTimeout of 1s measured from the request (celeris#885 item 35)", got, body, took.Round(time.Millisecond))
 			}
 			if took < 2*time.Second {
 				t.Fatalf("celeris885 PREMISE: the transfer took %v, not longer than twice ReadTimeout", took)
@@ -181,7 +181,7 @@ func TestEngineKeepAliveResponseSurvivesReadTimeoutWhileTheClientReads885(t *tes
 			resp2, err := http.ReadResponse(br, nil)
 			if err != nil {
 				t.Fatalf("a second request 300 ms after the response ended, on the same conn: %v (the conn was reaped on a ReadTimeout "+
-					"measured from the request before the response, not from its end; celeris#885 item 45)", err)
+					"measured from the request before the response, not from its end; celeris#885 item 35)", err)
 			}
 			b, _ := io.ReadAll(resp2.Body)
 			if string(b) != "small" {
@@ -224,11 +224,11 @@ func TestEngineStalledKeepAliveResponseIsBoundedByWriteTimeout885(t *testing.T) 
 			t.Logf("celeris885 STALL async=%v gone_ms=%d active_at_5s=%d received=%d of %d", async, gone.Milliseconds(), active, n, body)
 			if active != 0 {
 				t.Errorf("the conn of a client that read nothing for 5 s was still open (ActiveConnections=%d) with WriteTimeout 1s: "+
-					"a keep-alive response parked on EPOLLOUT is not bounded by WriteTimeout (celeris#885 item 35)", active)
+					"a keep-alive response parked on EPOLLOUT is not bounded by WriteTimeout (celeris#885 item 45)", active)
 			}
 			if n >= body/2 {
 				t.Errorf("the client that read nothing for 5 s then received %d of %d response bytes: the server kept the response "+
-					"queued past WriteTimeout 1s (celeris#885 item 35)", n, body)
+					"queued past WriteTimeout 1s (celeris#885 item 45)", n, body)
 			}
 		})
 	}

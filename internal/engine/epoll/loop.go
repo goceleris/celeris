@@ -1850,7 +1850,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// WINDOW_UPDATE, a pipelined request) raises an EPOLLIN event
 				// per segment, and this flush takes the room it made: that is
 				// progress for the write clock, and no EPOLLOUT edge may come
-				// to show it (celeris#885 item 35).
+				// to show it (celeris#885 items 35 and 45).
 				cs.noteWriteProgress(queued, cs.pendingBytes)
 				if cs.h1State != nil && cs.h1State.Detached.Load() {
 					l.markDirty(cs)
@@ -2014,7 +2014,7 @@ func (cs *connState) noteWriteProgress(queued, pending int) {
 // progress for the write clock (noteWriteProgress): without it, bytes the
 // goroutine's flush put into the socket after the peer took some are invisible
 // to the clock, the loop's flush that follows finds the socket full, and the
-// sweep closes a conn whose client read a moment ago (celeris#885 item 35,
+// sweep closes a conn whose client read a moment ago (celeris#885 items 35 and 45,
 // review). pendingBytes before the resync is what was queued before the flush
 // (the write function adds each response to it).
 func (cs *connState) resyncPending() {

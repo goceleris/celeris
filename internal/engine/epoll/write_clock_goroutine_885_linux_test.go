@@ -9,7 +9,7 @@ import (
 	"github.com/goceleris/celeris/internal/resource"
 )
 
-// celeris#885 item 35, review round 1: bytes the dispatch goroutine's own
+// celeris#885 items 35 and 45, review round 1: bytes the dispatch goroutine's own
 // flush puts into the socket after the peer took some are progress the write
 // clock must see. The dirty pass that follows the hand-back finds the socket
 // full again (queued == pending across its one flush), so without the goroutine

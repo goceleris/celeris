@@ -19,7 +19,7 @@ import (
 	"github.com/goceleris/celeris/internal/resource"
 )
 
-// celeris#885 item 35, end to end: a client that takes a large keep-alive
+// celeris#885 items 35 and 45, end to end: a client that takes a large keep-alive
 // response steadily is never cut by WriteTimeout, WHATEVER ELSE IT SENDS while
 // it reads. WriteTimeout is "no progress for WriteTimeout" (writeSince,
 // restarted when a flush takes bytes). A client that sends while it reads (an
@@ -166,7 +166,7 @@ func TestEngineSteadyReaderThatSendsWhileReadingIsNotCutByWriteTimeout885(t *tes
 			t.Logf("%s: received %d of at least %d bytes; the client sent %d PINGs/requests while reading; ended at %v (%v)",
 				tc.name, got, size, sent.Load(), ended.Round(time.Millisecond), err)
 			if got < size {
-				t.Errorf("celeris885 item 35: a client reading steadily (%d B/s) and sending every %v was cut after %v with %d of %d bytes "+
+				t.Errorf("celeris885 items 35 and 45: a client reading steadily (%d B/s) and sending every %v was cut after %v with %d of %d bytes "+
 					"(WriteTimeout 1 s, ReadTimeout and IdleTimeout 30 s): a flush that took bytes did not restart the write clock", rate, tc.every, ended.Round(time.Millisecond), got, size)
 			}
 		})

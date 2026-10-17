@@ -113,7 +113,7 @@ type connState struct {
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
 	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
 	detectN  uint8           // 1 byte: bytes at the head of buf received but too few to detect on, under detect.PrefaceLen (celeris#870); 0 once detected
-	goMoved  bool            // 1 byte: the dispatch goroutine's flush took bytes of a response and left the rest queued (resyncPending); under detachMu, consumed by noteWriteProgress (celeris#885 item 35)
+	goMoved  bool            // 1 byte: the dispatch goroutine's flush took bytes of a response (left the rest queued, or emptied the queue; resyncPending); under detachMu, consumed by noteWriteProgress (celeris#885 items 35 and 45)
 	_        [2]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes

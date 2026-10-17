@@ -12,7 +12,7 @@ import (
 	"github.com/goceleris/celeris/internal/resource"
 )
 
-// celeris#885 item 35, review round 2: every flush that takes bytes of a
+// celeris#885 items 35 and 45, review round 2: every flush that takes bytes of a
 // response the conn has parked, and leaves the rest queued, restarts the write
 // clock before the conn is parked again (noteWriteProgress, then armEpollOut,
 // which keeps a clock that is set). Before, only the EPOLLOUT edge's flush
@@ -96,7 +96,7 @@ func TestDrainReadInlineFlushRestartsTheWriteClock885(t *testing.T) {
 		r.send("GET /small HTTP/1.1\r\nHost: x\r\n\r\n")
 		r.l.checkTimeouts()
 		if !r.open() {
-			t.Fatalf("celeris#885 item 35: the conn was reaped %d ms in, the peer taking 64 KiB every 100 ms and sending a request each time, "+
+			t.Fatalf("celeris#885 items 35 and 45: the conn was reaped %d ms in, the peer taking 64 KiB every 100 ms and sending a request each time, "+
 				"WriteTimeout %v: drainRead's inline flush took bytes and did not restart the write clock", (i+1)*100, bound)
 		}
 	}
@@ -132,7 +132,7 @@ func TestDrainReadBodyRecvFlushRestartsTheWriteClock885(t *testing.T) {
 		t.Fatalf("apparatus: after the body open=%v pending=%d", r.open(), csPendingBytes(r.cs))
 	}
 	if age := r.age(); age > 100*time.Millisecond {
-		t.Errorf("celeris#885 item 35: the write clock is %v old after the body-recv branch's flush took bytes of the parked response: want it restarted", age)
+		t.Errorf("celeris#885 items 35 and 45: the write clock is %v old after the body-recv branch's flush took bytes of the parked response: want it restarted", age)
 	}
 }
 
@@ -150,7 +150,7 @@ func TestWriteBodyFlushRestartsTheWriteClock885(t *testing.T) {
 		t.Fatalf("apparatus: the writev drained the queue")
 	}
 	if age := r.age(); age > 100*time.Millisecond {
-		t.Errorf("celeris#885 item 35: the write clock is %v old after the body writer's writev took bytes of the parked response: want it restarted", age)
+		t.Errorf("celeris#885 items 35 and 45: the write clock is %v old after the body writer's writev took bytes of the parked response: want it restarted", age)
 	}
 }
 
@@ -176,7 +176,7 @@ func TestFinishH1UpgradeFlushRestartsTheWriteClock885(t *testing.T) {
 		t.Fatalf("apparatus: the flush drained the queue")
 	}
 	if age := r.age(); age > 100*time.Millisecond {
-		t.Errorf("celeris#885 item 35: the write clock is %v old after finishH1Upgrade's flush took bytes of the parked response: want it restarted", age)
+		t.Errorf("celeris#885 items 35 and 45: the write clock is %v old after finishH1Upgrade's flush took bytes of the parked response: want it restarted", age)
 	}
 }
 
@@ -195,7 +195,7 @@ func TestFlushCarriedReplayFlushRestartsTheWriteClock885(t *testing.T) {
 		t.Fatalf("apparatus: open=%v pending=%d", r.open(), csPendingBytes(r.cs))
 	}
 	if age := r.age(); age > 100*time.Millisecond {
-		t.Errorf("celeris#885 item 35: the write clock is %v old after flushCarriedReplay's flush took bytes: want it restarted", age)
+		t.Errorf("celeris#885 items 35 and 45: the write clock is %v old after flushCarriedReplay's flush took bytes: want it restarted", age)
 	}
 }
 
@@ -238,7 +238,7 @@ func TestWriteClockIsNotInheritedByTheNextPark885(t *testing.T) {
 	age := r.age()
 	r.l.checkTimeouts()
 	if !r.open() {
-		t.Errorf("celeris#885 item 35: a response parked a moment ago was closed at once by WriteTimeout %v: it inherited the clock of the one before (age %v)",
+		t.Errorf("celeris#885 items 35 and 45: a response parked a moment ago was closed at once by WriteTimeout %v: it inherited the clock of the one before (age %v)",
 			bound, age)
 	}
 }
