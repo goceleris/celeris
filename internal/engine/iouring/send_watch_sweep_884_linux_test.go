@@ -66,3 +66,34 @@ func TestIouringSweepKeepsAMarkItsOwnReplayMade884(t *testing.T) {
 		t.Errorf("the next sweep: remainderWatch=%v remainderN=%d, want true 1", w.remainderWatch, w.remainderN)
 	}
 }
+
+// TestIouringSweepKeepsAMarkItsDeferredCloseMade884: the same overwrite by the
+// other path. A conn with no SEND outstanding when the sweep looks at it, and
+// a response of longSendBytes or more queued, is closed by the sweep (idle
+// timeout); closeConn defers the close behind a flush of what is queued
+// (flushSend), a long SEND the peer may not take, and the sweep's end stored
+// sendWatch = false (no SEND was outstanding when it looked) over the mark.
+func TestIouringSweepKeepsAMarkItsDeferredCloseMade884(t *testing.T) {
+	rig := newStallRig704(t)
+	w, cs := rig.w, rig.cs
+	w.handoffLoss = &handoffLossStats{}
+	w.recvArm = &recvArmStats{}
+	w.cfg.WriteTimeout = time.Hour
+	w.cfg.ReadTimeout = time.Hour
+	w.cfg.IdleTimeout = time.Millisecond
+	cs.writeBuf = append(cs.writeBuf[:0], make([]byte, longSendBytes)...)
+	cs.lastActivity = time.Now().Add(-time.Minute).UnixNano()
+	if cs.sending || cs.remainderOut || w.remainderWatch || w.sendWatch {
+		t.Fatalf("apparatus: a SEND or a mark before the sweep")
+	}
+
+	w.checkTimeouts()
+	if !cs.closing || !cs.sending || !cs.remainderOut {
+		t.Fatalf("apparatus: the sweep did not defer the close behind a long SEND: closing=%v sending=%v remainderOut=%v",
+			cs.closing, cs.sending, cs.remainderOut)
+	}
+	if !w.remainderWatch || !w.sendWatch || w.remainderN != 1 {
+		t.Errorf("celeris#884 item 62: the sweep overwrote the mark its own close made: remainderWatch=%v sendWatch=%v remainderN=%d, want true true 1",
+			w.remainderWatch, w.sendWatch, w.remainderN)
+	}
+}

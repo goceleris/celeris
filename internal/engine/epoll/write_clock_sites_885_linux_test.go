@@ -204,8 +204,8 @@ func TestFlushCarriedReplayFlushRestartsTheWriteClock885(t *testing.T) {
 // peer takes the whole of the parked response while the next request's handler
 // writes a body (makeWriteBodyFn's writev, a drain site that did not end the
 // clock), WriteTimeout passes with no sweep, and the next request's big
-// response parks the conn: it must carry a clock of its own, started at its
-// park, and not be cut by WriteTimeout at once.
+// response parks the conn, its flushes taking nothing: it must carry a clock of
+// its own, started at its park, and not be cut by WriteTimeout at once.
 func TestWriteClockIsNotInheritedByTheNextPark885(t *testing.T) {
 	const bound = 300 * time.Millisecond
 	r := newSitesConn885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: bound})
@@ -220,9 +220,16 @@ func TestWriteClockIsNotInheritedByTheNextPark885(t *testing.T) {
 	if csWritePending(r.cs) {
 		t.Fatalf("apparatus: the queue did not drain")
 	}
-	time.Sleep(bound + 50*time.Millisecond) // no sweep meanwhile
-	for r.read(256<<10) > 0 {
+	// The socket is full again, the peer having stopped reading (filler written
+	// to the descriptor), so that the next response's flushes take nothing and
+	// nothing but a clock of its own can say how long it has been parked.
+	filler := make([]byte, 64<<10)
+	for {
+		if _, err := unix.Write(r.fd, filler); err != nil {
+			break
+		}
 	}
+	time.Sleep(bound + 50*time.Millisecond) // no sweep meanwhile
 	r.cs.lastActivity = time.Now().UnixNano()
 	r.send("GET /big HTTP/1.1\r\nHost: x\r\n\r\n") // parks again, its inline flush having taken bytes
 	if !csWritePending(r.cs) || r.cs.writeSince == 0 {
@@ -233,5 +240,50 @@ func TestWriteClockIsNotInheritedByTheNextPark885(t *testing.T) {
 	if !r.open() {
 		t.Errorf("celeris#885 item 35: a response parked a moment ago was closed at once by WriteTimeout %v: it inherited the clock of the one before (age %v)",
 			bound, age)
+	}
+}
+
+// nearlyDrained has the peer take the parked response by hand until
+// little of it is queued (flushWrites, which does not end the clock), so that
+// the next flush empties the queue.
+func (r *sitesConn885) nearlyDrained() {
+	r.t.Helper()
+	for i := 0; i < 20000 && csPendingBytes(r.cs) > 32<<10; i++ {
+		r.read(32 << 10)
+		_ = r.l.flushWrites(r.cs, true)
+	}
+	r.cs.pendingBytes = csPendingBytes(r.cs)
+	if n := csPendingBytes(r.cs); n == 0 || n > 32<<10 {
+		r.t.Fatalf("apparatus: %d bytes queued, want a little", n)
+	}
+	for r.read(256<<10) > 0 {
+	}
+}
+
+// TestFinishH1UpgradeEndsTheWriteClockWhenItDrains885 and
+// TestFlushCarriedReplayEndsTheWriteClockWhenItDrains885: a flush that empties
+// the queue of a conn that has a clock ends it (endWrite), as every other drain
+// site does, or the next response's park would inherit its stamp.
+func TestFinishH1UpgradeEndsTheWriteClockWhenItDrains885(t *testing.T) {
+	r := newSitesConn885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: time.Hour, EnableH2Upgrade: true})
+	r.nearlyDrained()
+	r.send(h2cUpgrade885)
+	if !r.open() || r.cs.h2State == nil || csWritePending(r.cs) {
+		t.Fatalf("apparatus: open=%v h2=%v pending=%d, want an HTTP/2 conn with nothing queued", r.open(), r.cs.h2State != nil, csPendingBytes(r.cs))
+	}
+	if r.cs.writeSince != 0 {
+		t.Errorf("finishH1Upgrade's flush emptied the queue and left the write clock running (%v old)", r.age())
+	}
+}
+
+func TestFlushCarriedReplayEndsTheWriteClockWhenItDrains885(t *testing.T) {
+	r := newSitesConn885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: time.Hour})
+	r.nearlyDrained()
+	r.l.flushCarriedReplay(r.cs, r.fd)
+	if !r.open() || csWritePending(r.cs) {
+		t.Fatalf("apparatus: open=%v pending=%d, want nothing queued", r.open(), csPendingBytes(r.cs))
+	}
+	if r.cs.writeSince != 0 {
+		t.Errorf("flushCarriedReplay's flush emptied the queue and left the write clock running (%v old)", r.age())
 	}
 }

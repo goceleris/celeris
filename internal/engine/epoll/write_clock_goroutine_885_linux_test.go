@@ -97,20 +97,23 @@ func TestGoroutineFlushThatEmptiesTheQueueIsSeenByTheWriteClock885(t *testing.T)
 	const bound = 300 * time.Millisecond
 	r := parked885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: bound})
 	time.Sleep(bound * 2 / 3) // the loop sees no progress meanwhile (a pipelined handler runs)
-	goroutineFlush := func() {
-		for r.read(256<<10) > 0 {
+	goroutineFlush := func(n int) {
+		for r.read(n) > 0 && n >= 256<<10 {
 		}
 		r.cs.pendingBytes = csPendingBytes(r.cs)
 		_ = r.l.flushWrites(r.cs, false) // the goroutine's flush
 		r.cs.resyncPending()
 	}
-	for i := 0; i < 400 && csPendingBytes(r.cs) > 64<<10; i++ {
-		goroutineFlush()
+	for i := 0; i < 20000 && csPendingBytes(r.cs) > 64<<10; i++ {
+		goroutineFlush(32 << 10) // a little room at a time, so that the queue is not emptied by accident
 	}
 	// The partial flushes above noted goMoved, as they should; what is under
 	// test is the flush that EMPTIES the queue, so the mark starts clear.
 	r.cs.goMoved = false
-	goroutineFlush()
+	if csPendingBytes(r.cs) == 0 {
+		t.Fatalf("apparatus: the queue is empty already")
+	}
+	goroutineFlush(256 << 10)
 	if csWritePending(r.cs) {
 		t.Fatalf("apparatus: did not drain")
 	}
