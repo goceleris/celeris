@@ -136,7 +136,7 @@ func TestH2WritePassResyncsPendingBytes889(t *testing.T) {
 	})
 	t.Run("flushed in part", func(t *testing.T) {
 		r := newH2Rig889(t)
-		fillSendBuffer(t, r.cs.fd) // the socket takes nothing more
+		fillSendBuffer(t, r.cs.fd)  // the socket takes nothing more
 		r.cs.pendingBytes = 1 << 20 // stale, as above
 		r.queue(3, 1000)
 		r.l.drainH2Writes()
