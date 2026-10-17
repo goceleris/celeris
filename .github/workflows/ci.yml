@@ -203,7 +203,9 @@ jobs:
           #     TestWriteBufBackpressureClosesSlowConsumer: opt-in measurements
           #     (CELERIS_592_COST=1, GOTEST_BACKPRESSURE=1), not checks.
           #   * the four alloc-count tests in middleware/sse: they skip
-          #     under -race and every step of this job is -race (celeris#684).
+          #     under -race and every step of this job is -race (celeris#684);
+          #     the step "celeris#890 allocation guards and alloc-count tests,
+          #     without -race" below runs them without it and forbids the skip.
           #   * the two TestPauseAccept...SynackRetriesZero tests in internal/engine/epoll:
           #     they need net.ipv4.tcp_synack_retries=0 and the runner has 5; the step
           #     "celeris#662 tcp_synack_retries=0 guard" sets it and forbids the skip.
@@ -1093,9 +1095,9 @@ jobs:
             exit 1
           fi
       # celeris#905: a stopped engine must leave no thread pinned to one CPU.
-      # The root step runs the epoll test without -v, where a skip prints
-      # nothing, and job `adaptive` and the internal/engine/iouring step above count
-      # no test of it by name. So the three tests run here by name: epoll and
+      # The root step runs the epoll test with -v but counts no test of it by
+      # name (a rename or a removal passes it), and job `adaptive` and the
+      # internal/engine/iouring step above count none of it by name either. So the three tests run here by name: epoll and
       # io_uring at the runner's 8 MiB memlock (one io_uring worker), then
       # adaptive with memlock raised and CELERIS_REQUIRE_UPSWITCH=1, as job
       # `adaptive` runs its package. Each re-runs itself in a process of its
@@ -1255,8 +1257,8 @@ jobs:
           std=./internal/engine/std
           legacy_files=$(go list -tags http2legacy -f '{{join .GoFiles " "}}' "$std")
           default_files=$(go list -f '{{join .GoFiles " "}}' "$std")
-          echo "with -tags http2legacy: $legacy_files" | tr ' ' '\n' | grep -E 'h2c_base' || true
-          echo "without the tag:        $default_files" | tr ' ' '\n' | grep -E 'h2c_base' || true
+          echo "-tags http2legacy selects: $(tr ' ' '\n' <<<"$legacy_files" | grep -E '^h2c_base' | tr '\n' ' ')"
+          echo "the default build selects: $(tr ' ' '\n' <<<"$default_files" | grep -E '^h2c_base' | tr '\n' ' ')"
           has() { case " $1 " in *" $2 "*) return 0 ;; esac; return 1; }
           if ! has "$legacy_files" h2c_base_legacy.go || has "$legacy_files" h2c_base_wrap.go \
             || ! has "$default_files" h2c_base_wrap.go || has "$default_files" h2c_base_legacy.go; then

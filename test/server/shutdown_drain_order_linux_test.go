@@ -234,7 +234,10 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async, h2c, asy
 	defer cancel()
 
 	// Start, failing (never skipping) if the engine cannot start: a skipped
-	// engine would read as a pass in CI's root step, which runs without -v.
+	// engine would read as a pass in a run without -v. CI runs the test with -v
+	// twice and tallies its 49 PASS lines by name with no SKIP line allowed:
+	// in unit-root-shard a, at the runner's 8 MiB memlock (one io_uring worker),
+	// and in the Unit job's drain-order step with memlock raised (several).
 	// An io_uring start that fails only with ENOMEM is retried with a new
 	// server for up to 10 s, as startC714DetachServer does: the kernel
 	// charges ring memory to RLIMIT_MEMLOCK per UID and returns it only after
