@@ -36,10 +36,40 @@ type wire981 struct {
 	enc  *hpack.Encoder
 	wmu  sync.Mutex // the framer's writes: the test's requests and the reader's SETTINGS ack
 
+	pingN   uint8        // the next PING's payload byte (under wmu)
+	pingAck chan [8]byte // the payloads of the PING ACKs read so far
+
 	mu     sync.Mutex
 	rst    map[uint32]http2.ErrCode
 	status map[uint32]string
 	goaway string
+}
+
+// barrier sends a PING and waits for its ACK. The server handles a
+// connection's frames in order, so once the ACK is back every frame sent
+// before the PING has been handled. It does not cover a handler that the
+// server runs on its pool after handling the frame; callers add a short grace
+// for that.
+func (w *wire981) barrier() error {
+	w.wmu.Lock()
+	w.pingN++
+	data := [8]byte{'b', 'a', 'r', 'r', 'i', 'e', 'r', w.pingN}
+	err := w.fr.WritePing(false, data)
+	w.wmu.Unlock()
+	if err != nil {
+		return err
+	}
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case got := <-w.pingAck:
+			if got == data {
+				return nil
+			}
+		case <-deadline:
+			return fmt.Errorf("no PING ACK within 10s")
+		}
+	}
 }
 
 func dial981(t *testing.T, addr string) *wire981 {
@@ -54,7 +84,7 @@ func dial981(t *testing.T, addr string) *wire981 {
 		t.Fatal(err)
 	}
 	w := &wire981{t: t, conn: conn, fr: http2.NewFramer(conn, conn), addr: addr,
-		rst: map[uint32]http2.ErrCode{}, status: map[uint32]string{}}
+		pingAck: make(chan [8]byte, 64), rst: map[uint32]http2.ErrCode{}, status: map[uint32]string{}}
 	w.enc = hpack.NewEncoder(&w.hb)
 	if err := w.fr.WriteSettings(); err != nil {
 		t.Fatal(err)
@@ -89,6 +119,13 @@ func (w *wire981) read() {
 			}
 		case *http2.RSTStreamFrame:
 			w.rst[f.StreamID] = f.ErrCode
+		case *http2.PingFrame:
+			if f.IsAck() {
+				select {
+				case w.pingAck <- f.Data:
+				default:
+				}
+			}
 		case *http2.GoAwayFrame:
 			w.goaway = fmt.Sprintf("%s (last stream %d)", f.ErrCode, f.LastStreamID)
 		case *http2.HeadersFrame:
@@ -200,7 +237,13 @@ func TestH2MaxConcurrentStreamsHeadersContinuation981(t *testing.T) {
 					}
 					// Four are admitted; the other six are refused, which is the end of the settling.
 					waitUntil981(10*time.Second, func() bool { rst, _, _ := w.state(); return len(rst) >= streams-limit })
-					time.Sleep(200 * time.Millisecond) // a handler that should not have run would have entered by now
+					// The PING/ACK barrier covers every request frame sent so far; the
+					// grace covers the pool goroutine that would start a handler a
+					// frame had admitted (was a 200 ms sleep).
+					if err := w.barrier(); err != nil {
+						t.Fatalf("PING/ACK barrier: %v", err)
+					}
+					time.Sleep(25 * time.Millisecond)
 					rst, _, goaway := w.state()
 					var ids []int
 					codes := map[http2.ErrCode]int{}
@@ -302,7 +345,11 @@ func TestH2StreamIDOrderHeadersContinuation981(t *testing.T) {
 						rst, status, _ := w.state()
 						t.Errorf("stream %d (reused or lower) got no GOAWAY: resets %v, statuses %v", tc.bad, rst, status)
 					}
-					time.Sleep(100 * time.Millisecond)
+					// The GOAWAY is the condition: the server closes the connection
+					// after it, so no PING/ACK barrier can follow. The grace covers a
+					// handler that a frame before the GOAWAY would have started (was
+					// a 100 ms sleep).
+					time.Sleep(25 * time.Millisecond)
 					_, status, goaway := w.state()
 					t.Logf("%s: handlers entered %d; GOAWAY %q; statuses %v", name, entered.Load(), goaway, status)
 					if !strings.HasPrefix(goaway, http2.ErrCodeProtocol.String()) {
