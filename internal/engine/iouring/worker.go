@@ -766,6 +766,20 @@ type Worker struct {
 	// handed to goroutines of their own and whose onClose is not queued yet
 	// (celeris#735). Shutdown waits for it (waitDriverCloses).
 	driverClosers sync.WaitGroup
+	// closeSem bounds how many close(2)s of driver descriptors this worker
+	// has in flight at once; nil means the process-wide driverCloseSem, the
+	// only value outside tests (closeBound). The closes of closeOpFD and of
+	// shutdownDrivers take their tokens from it.
+	closeSem chan struct{}
+	// closeFn replaces the close(2) of closeOpFD for a test, which blocks in
+	// it to count the closes in flight; nil means closeFD. The worker never
+	// changes it once it runs.
+	closeFn func(fd int)
+	// waitClosesHook, when set, runs first thing in waitDriverCloses, before
+	// it waits for the closers: a test synchronizes on shutdown having
+	// reached that wait instead of on a sleep. A test sets it before it stops
+	// the engine; the worker reads it only in shutdown. nil outside tests.
+	waitClosesHook func()
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
 	// reachable until the Worker itself is collected, which is after the ring

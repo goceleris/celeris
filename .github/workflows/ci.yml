@@ -1577,11 +1577,14 @@ jobs:
       # has shut down, two an SQE prepared by a descriptor number the
       # caller closes before the submit, three a driver cancel that
       # outlived its conn (#707), and three a register the worker applies
-      # after the number was closed and taken by an accept. Two more (n735)
-      # pin a driver close that lingers: off the worker, and waited for at
-      # shutdown (celeris#735). Four more (n866) pin that shutdown closes the
-      # lingering driver descriptors together, not one after another, under one
-      # bound for the whole process (celeris#866), and five (n959) that a
+      # after the number was closed and taken by an accept. Three more (n735)
+      # pin a driver close that lingers: off the worker, waited for at
+      # shutdown (celeris#735), and, in the live path too, under the same
+      # bound as shutdown's closes (celeris#884 item 55). Five more (n866)
+      # pin that shutdown closes the lingering driver descriptors together,
+      # not one after another, under one bound for the whole process
+      # (celeris#866), taken from the worker's bound, which is the
+      # process-wide one unless a test gave it its own, and five (n959) that a
       # driver's RegisterConn does not race the worker's writes of the conn
       # table (celeris#959; the two race tests, one of them through the
       # adaptive engine started on io_uring, need -race, which this step runs
@@ -1599,8 +1602,8 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           old='TestDriverRegisterUnregister|TestDriverHTTPZeroOverhead|TestDriverWriteSerialization|TestDriverCancelOnUnregister|TestIouringRegisterConnFDCollision|TestIouringShutdownFiresDriverOnClose|TestDriverUnknownFDReturnsErr|TestShutdownDriversRetainsConnsWithOpsInFlight'
           new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors|TestDriverRegisterAfterShutdownIsRefused|TestDriverRegisterRacingShutdownReleasesEverySocket|TestDriverRecvRearmBeforeSubmitSparesReusedNumber|TestDriverSendBeforeSubmitSparesReusedNumber|TestDriverFailureCancelCompletesBeforeRelease|TestDriverFailureCloseCompletionSparesConnOnReusedNumber|TestDriverStrayCloseCompletionSparesConn|TestDriverUnregisterWithSendInFlightThenNumberTakenByHTTP|TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP|TestDriverRefusedRegisterWaitsForItsSend'
-          n735='TestDriverLingeringCloseDoesNotStallTheWorker|TestDriverShutdownWaitsForAHandedOffClose'
-          n866='TestShutdownDriversClosesLingeringDescriptorsInParallel866|TestCloseFDsInParallelBound866|TestCloseFDsInParallelBoundIsSharedByWorkers866|TestCloseDriverFDsUsesTheEngineWideBound866'
+          n735='TestDriverLingeringCloseDoesNotStallTheWorker|TestDriverShutdownWaitsForAHandedOffClose|TestFinalizeDriverClosesUnderTheSharedBound'
+          n866='TestShutdownDriversClosesLingeringDescriptorsInParallel866|TestCloseFDsInParallelBound866|TestCloseFDsInParallelBoundIsSharedByWorkers866|TestCloseDriverFDsUsesTheProcessWideBound866|TestShutdownDriversUsesTheWorkersBound866'
           n959='TestRegisterConnRacesAcceptAndClose959|TestAdaptiveRegisterConnRacesAcceptAndClose959|TestConnSlotWritesGoThroughTheHelpers959|TestConnSlotGuardSeesABareWrite959|TestConnSlotHelpersTakeConnsMu959'
           names="${old}|${new}|${n735}|${n866}|${n959}"
           runs=5
