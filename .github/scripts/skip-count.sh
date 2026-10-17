@@ -28,9 +28,11 @@ log=$1
 [ -r "$log" ] || { echo "skip-count: cannot read $log" >&2; exit 2; }
 
 # grep exits 1 when nothing matches; that is a count of 0 here, not a failure.
-anchored=$(grep -cE '^[[:space:]]*--- SKIP: ' "$log" || true)
+# -a: a log with a NUL byte (a test that wrote one) is text here; without it GNU grep prints
+# "binary file matches" to stderr in place of the line and the count falls to 0.
+anchored=$(grep -acE '^[[:space:]]*--- SKIP: ' "$log" || true)
 # Every line holding `--- SKIP: ` anywhere, except the child process's own.
-loose=$(grep -F -e '--- SKIP: ' "$log" | grep -vE '^[[:space:]]*child\| ' || true)
+loose=$(grep -aF -e '--- SKIP: ' "$log" | tr -d '\000' | grep -vE '^[[:space:]]*child\| ' || true)
 unanchored=0
 if [ -n "$loose" ]; then
   unanchored=$(printf '%s\n' "$loose" | wc -l | tr -d '[:space:]')

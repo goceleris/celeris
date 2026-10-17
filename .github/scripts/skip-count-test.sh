@@ -65,6 +65,13 @@ check "a log of only a joined SKIP line fails" "$dir/only-joined.log" 1 ""
 printf '%s\n' '=== RUN   TestA' '=== RUN   TestA/sub' 'x    --- SKIP: TestA/sub (0.00s)' '--- PASS: TestA (0.00s)' >"$dir/joined-sub.log"
 check "a joined subtest SKIP line fails and is listed" "$dir/joined-sub.log" 1 "" 'x    --- SKIP: TestA/sub'
 
+# A NUL byte in the log: GNU grep treats the file as binary and, without -a, prints
+# "binary file matches" in place of the line, so the joined line below went uncounted.
+printf '=== RUN   T\n\000\nx--- SKIP: TestNul (0.00s)\n' >"$dir/nul-joined.log"
+check "a joined SKIP line after a NUL byte fails and is listed" "$dir/nul-joined.log" 1 "" 'x--- SKIP: TestNul'
+printf '=== RUN   T\n\000\n--- SKIP: TestNul (0.00s)\n' >"$dir/nul-clean.log"
+check "an anchored SKIP line after a NUL byte is counted" "$dir/nul-clean.log" 0 1
+
 # A pintest child's output is logged with every line prefixed "child| ".
 printf '%s\n' \
   '=== RUN   TestPinned' \

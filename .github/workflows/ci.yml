@@ -1097,8 +1097,9 @@ jobs:
       # celeris#905: a stopped engine must leave no thread pinned to one CPU.
       # The root step runs the epoll test with -v but counts no test of it by
       # name (a rename or a removal passes it), and job `adaptive` and the
-      # internal/engine/iouring step above count none of it by name either. So the three tests run here by name: epoll and
-      # io_uring at the runner's 8 MiB memlock (one io_uring worker), then
+      # internal/engine/iouring step above count none of it by name either. So
+      # the three tests run here by name: epoll and io_uring at the runner's
+      # 8 MiB memlock (one io_uring worker), then
       # adaptive with memlock raised and CELERIS_REQUIRE_UPSWITCH=1, as job
       # `adaptive` runs its package. Each re-runs itself in a process of its
       # own and logs that process's output with a "child| " prefix, so the
@@ -1174,6 +1175,34 @@ jobs:
             'middleware/sse TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestSlowClientDropPathAllocs888'
             'middleware/websocket TestHubBroadcastFormatsOnce'
           )
+          # Discovery: the list above is fixed, so a new `//go:build !race` test file in a
+          # package that is not listed, or a Test function in a listed package's
+          # `!race` file that no entry names, would run nowhere (the failure this step
+          # exists for). Every such file must belong to an entry. test/server's
+          # race761_off_test.go is the one that holds no guard: it only sets a constant
+          # (raceOn761 = false) that makes the large-response tests run full size.
+          declare -A listed=()
+          for entry in "${entries[@]}"; do listed[${entry%% *}]=${entry#* }; done
+          undiscovered=0
+          while IFS= read -r f; do
+            dir=$(dirname "$f")
+            if [ "$dir" = test/server ]; then continue; fi
+            if [ -z "${listed[$dir]+set}" ]; then
+              echo "$f is a //go:build !race test file of a package that the entries do not list"
+              undiscovered=1
+              continue
+            fi
+            while IFS= read -r t; do
+              case "|${listed[$dir]}|" in
+                *"|$t|"*) ;;
+                *) echo "$f: $t is not named by the entry of ${dir}"; undiscovered=1 ;;
+              esac
+            done < <(grep -hoE '^func Test[A-Za-z0-9_]*' "$f" | sed 's/^func //')
+          done < <(git grep -lE '^//go:build.*!race' -- '*_test.go')
+          if [ "$undiscovered" -ne 0 ]; then
+            echo "add the package or the test to the entries of this step (and to the count below)"
+            exit 1
+          fi
           failed=0
           bad=0
           total=0
@@ -1254,8 +1283,13 @@ jobs:
       # (no tag) never sees. The std package's tests run under the tag, every
       # test by name through the tally of SKIP lines (none may skip), and the
       # test/server tests that put an h2c upgrade and the stream's context
-      # through the std engine run beside them. The runner's 8 MiB memlock is
-      # enough: no test here starts an io_uring engine.
+      # through the std engine run beside them. The runner's 8 MiB memlock stays:
+      # the std package's tests start no io_uring engine, but the three
+      # test/server tests loop over the std, epoll, io_uring and adaptive engines
+      # (engines761), so they do start io_uring and adaptive ones, each with one
+      # worker at 8 MiB. A start that fails only with ENOMEM is retried for up to
+      # 30 s (startServerConfig761) and then fails the test, never skips it: the
+      # step stays fail-closed, and its tally of SKIP lines allows none.
       - name: celeris#968 -tags http2legacy, x/net's own HTTP/2 server (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -2449,7 +2483,10 @@ jobs:
           go test $race -count=1 -timeout=900s -v ./driver/internal/eventloop ./driver/redis ./driver/postgres ./driver/memcached 2>&1 | tee fallback.log
           pass=$(grep -cE '^[[:space:]]*--- PASS: ' fallback.log || true)
           fail=$(grep -cE '^[[:space:]]*--- FAIL: ' fallback.log || true)
-          skip=$(grep -cE '^[[:space:]]*--- SKIP: ' fallback.log || true)
+          # skip-count.sh (celeris#890) also fails on a `--- SKIP: ` line that a test's
+          # unterminated stdout joined to its own text, which the bare grep did not count.
+          # `bash` runs it: a Windows checkout need not keep the executable bit.
+          skip=$(bash .github/scripts/skip-count.sh fallback.log)
           echo "PASS $pass  FAIL $fail  SKIP $skip"
           # A test that is absent or skipped is not a pass: name the ones that
           # must have run and passed on this OS.
