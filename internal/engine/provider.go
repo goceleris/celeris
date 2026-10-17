@@ -51,9 +51,14 @@ type EventLoopProvider interface {
 //
 // # Callback semantics
 //
-// The onRecv and onClose callbacks passed to [WorkerLoop.RegisterConn] are invoked from
-// the worker's own goroutine. The []byte slice passed to onRecv is only valid
-// for the duration of the callback — callers must copy before retaining it.
+// The onRecv and onClose callbacks passed to [WorkerLoop.RegisterConn] are
+// invoked from the worker's own goroutine, with exceptions. On the epoll and
+// standalone Linux loops, an [WorkerLoop.UnregisterConn] that is first to close
+// the conn runs onClose on the caller's goroutine. On the portable loop both
+// callbacks run on the conn's reader goroutine, and the standalone loop's
+// synchronous WriteAndPoll-style calls run onRecv on the caller's goroutine.
+// The []byte slice passed to onRecv is only valid for the duration of the
+// callback — callers must copy before retaining it.
 // onClose is called exactly once, either in response to [WorkerLoop.UnregisterConn] or
 // when the kernel reports a closed/errored connection. The error argument to
 // onClose is nil on orderly shutdown and non-nil on I/O errors.
@@ -104,11 +109,15 @@ type WorkerLoop interface {
 	// after UnregisterConn has returned.
 	//
 	// onClose can run after UnregisterConn has returned, and after the same
-	// number has been registered again: the portable loop's reader goroutine
-	// fires it once it observes the close, and io_uring fires it once the conn
-	// is finalized, which can be after RegisterConn has taken the number. So a
-	// driver must not key its onClose state by fd number; it can key it by the
-	// registration, for example by passing onClose a value that identifies it.
+	// number has been registered again. On every engine that happens when the
+	// worker closes the conn first (a peer close, a read error or shutdown),
+	// since that close is still pending while UnregisterConn returns. On the
+	// portable loop and on io_uring it also happens after an UnregisterConn:
+	// the portable reader goroutine fires onClose once it observes the close,
+	// and io_uring fires it once the conn is finalized, which can be after
+	// RegisterConn has taken the number. So a driver must not key its onClose
+	// state by fd number; it can key it by the registration, for example by
+	// passing onClose a value that identifies it.
 	UnregisterConn(fd int) error
 	// Write enqueues data for transmission on fd. The call does not block on
 	// the kernel send buffer: data is buffered and flushed asynchronously by

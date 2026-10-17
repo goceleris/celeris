@@ -772,6 +772,9 @@ type SyncRoundTripper interface {
 // [SyncRoundTripper]. Locked callers (celeris HTTP engine host)
 // must use WriteAndPollBusy. Drivers select the path at open time based
 // on whether an engine was supplied — see the driver's WithEngine option.
+// Its ErrUnknownFD has the meaning given in the [SyncRoundTripper] contract:
+// the conn was torn down, and onRecv may already have received part or all of
+// the reply.
 type SyncBusyRoundTripper interface {
 	WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
 }
@@ -1183,6 +1186,9 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 //
 // Returns ok=true when isDone fired. ok=false means the caller should fall
 // back to the async event-loop path (no data arrived or isDone never fired).
+// Its ErrUnknownFD has the meaning given in the [SyncRoundTripper] contract:
+// the conn was torn down during the call, and onRecv may already have received
+// part or all of the replies.
 type SyncMultiRoundTripper interface {
 	WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func([]byte), isDone func() bool, beforeRearm func()) (ok bool, err error)
 }
