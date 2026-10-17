@@ -3556,8 +3556,8 @@ func (l *Loop) relink(cs *connState) {
 
 // flushDirty is the event loop's dirty-list pass, run once per iteration
 // after drainDetachQueue: flush every connection with bytes still queued,
-// close the ones whose flush failed, and hand a still-partial non-detached
-// conn to EPOLLOUT. Loop thread only.
+// close the ones whose flush failed, and hand a still-partial conn, detached
+// or not, to EPOLLOUT. Loop thread only.
 func (l *Loop) flushDirty() {
 	for cs := l.dirtyHead; cs != nil; {
 		next := cs.dirtyNext
@@ -3967,10 +3967,10 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 // truly-detached conn's already-queued terminal bytes to reach the wire
 // before it sends FIN anyway. Generous enough to cover several WAN
 // round-trips for a peer that is merely behind, short enough that a peer
-// which has stopped reading for good releases its fd (and the loop's
-// dirty-list spin) promptly. A peer that is actually gone never waits this
-// long: the next flush surfaces EPIPE/ECONNRESET and the dirty-list error
-// branch closes the conn immediately.
+// which has stopped reading for good releases its fd promptly. A peer that is
+// actually gone never waits this long: the next flush (handleWritable's, or
+// the dirty pass's for a conn on the list) surfaces EPIPE/ECONNRESET and its
+// error branch closes the conn immediately.
 const detachDrainGrace = time.Second
 
 // closingDrainFloor bounds the drain of a conn whose close is deferred behind

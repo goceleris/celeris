@@ -17,7 +17,7 @@ package epoll
 // the conn goes on as HTTP/2.
 //
 // A send that does not fit the kernel's buffer arms EPOLLOUT rather than the
-// dirty list, which busy-polls: a newly-H2 conn is not detached.
+// dirty list, which busy-polls (as for every conn since celeris#885 item 42).
 //
 // Loop thread, and no dispatch goroutine exists for the conn: the callers are
 // drainRead's inline ProcessH1 (a conn not yet promoted to its goroutine, or a
