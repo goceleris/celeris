@@ -18,6 +18,13 @@ package epoll
 //
 // A send that does not fit the kernel's buffer arms EPOLLOUT rather than the
 // dirty list, which busy-polls: a newly-H2 conn is not detached.
+//
+// Loop thread, and no dispatch goroutine exists for the conn: the callers are
+// drainRead's inline ProcessH1 (a conn not yet promoted to its goroutine, or a
+// sync one), its body-recv block (sync only) and a fresh adoption. The
+// goroutine's own upgrade is switchToH2Local. So noteWriteProgress, which
+// consumes goMoved (under detachMu otherwise), needs no lock here
+// (celeris#885).
 func (l *Loop) finishH1Upgrade(cs *connState, fd int, writeFn func([]byte)) bool {
 	if err := l.switchToH2(cs, writeFn); err != nil {
 		l.closeConn(fd)
