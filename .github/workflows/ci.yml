@@ -1211,6 +1211,26 @@ jobs:
       # 48 subtests (6 engines x 3 modes, the same again over h2c, and the 4
       # engines whose route is not async over h2c with an async route) all PASS,
       # no SKIP and no FAIL line.
+      - name: THROWAWAY allocation guards x10 without and x10 with TESTING_STRICT_ALLOC_BUDGETS=1
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          echo "CPUs: $(nproc), $(uname -m), $(go version)"
+          for mode in default strict; do
+            fails=0
+            for i in $(seq 1 10); do
+              if [ "$mode" = strict ]; then export TESTING_STRICT_ALLOC_BUDGETS=1; else unset TESTING_STRICT_ALLOC_BUDGETS; fi
+              if ! bash --noprofile --norc -eo pipefail .github/scripts/zz-allocguard-step.sh >"/tmp/ag-$mode-$i.out" 2>&1; then
+                fails=$((fails + 1))
+                echo "== $mode rep $i FAILED:"
+                grep -E '^(--- FAIL|    --- FAIL|FAIL|alloc guards)|_test.go:[0-9]+:' "/tmp/ag-$mode-$i.out" | head -20
+              fi
+            done
+            echo "RESULT mode=$mode failed reps $fails of 10"
+          done
+          echo "observed counts (rep 1, strict mode):"
+          grep -E '_test.go:[0-9]+:' /tmp/ag-strict-1.out | head -60
+          exit 0
       - name: celeris#703 shutdown hooks run after the drain, several workers (memlock raised, skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
