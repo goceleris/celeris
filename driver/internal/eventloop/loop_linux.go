@@ -1187,8 +1187,8 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 // Returns ok=true when isDone fired. ok=false means the caller should fall
 // back to the async event-loop path (no data arrived or isDone never fired).
 // Its ErrUnknownFD has the meaning given in the [SyncRoundTripper] contract:
-// the conn was torn down during the call, and onRecv may already have received
-// part or all of the replies.
+// the conn was torn down, and onRecv may already have received part or all of
+// the replies.
 type SyncMultiRoundTripper interface {
 	WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func([]byte), isDone func() bool, beforeRearm func()) (ok bool, err error)
 }
@@ -1197,8 +1197,8 @@ type SyncMultiRoundTripper interface {
 // polls in a loop until isDone returns true or the cumulative poll timeout
 // (20ms) expires. Designed for pipeline workloads where many RESP frames
 // arrive across multiple read(2) calls. Its ErrUnknownFD has the meaning
-// given in the [SyncRoundTripper] contract: the conn was torn down during the
-// call, and onRecv may already have received part or all of the replies.
+// given in the [SyncRoundTripper] contract: the conn was torn down, and onRecv
+// may already have received part or all of the replies.
 func (w *worker) WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func([]byte), isDone func() bool, beforeRearm func()) (bool, error) {
 	if w.closed.Load() {
 		return false, ErrLoopClosed

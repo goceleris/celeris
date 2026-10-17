@@ -53,10 +53,13 @@ type EventLoopProvider interface {
 //
 // The onRecv and onClose callbacks passed to [WorkerLoop.RegisterConn] are
 // invoked from the worker's own goroutine, with exceptions. On the epoll and
-// standalone Linux loops, an [WorkerLoop.UnregisterConn] that is first to close
-// the conn runs onClose on the caller's goroutine. On the portable loop both
-// callbacks run on the conn's reader goroutine, and the standalone loop's
-// synchronous WriteAndPoll-style calls run onRecv on the caller's goroutine.
+// standalone Linux loops, onClose can run on a caller's goroutine: that of an
+// [WorkerLoop.UnregisterConn] that is first to close the conn, of a
+// [WorkerLoop.Write] (or, on the standalone loop, a WriteAndPoll-style call)
+// that fails and so tears the conn down, and, on the standalone loop, of
+// Loop.Close. On the portable loop both callbacks run on the conn's reader
+// goroutine, and the standalone loop's synchronous WriteAndPoll-style calls
+// run onRecv on the caller's goroutine.
 // The []byte slice passed to onRecv is only valid for the duration of the
 // callback — callers must copy before retaining it.
 // onClose is called exactly once, either in response to [WorkerLoop.UnregisterConn] or
@@ -96,11 +99,14 @@ type WorkerLoop interface {
 	// already registered" until the conn is finalized, which is at the latest
 	// when onClose fires. Closing fd before UnregisterConn does not misdirect
 	// the cancel on this engine, which works on its own duplicate of fd, but
-	// it is still outside the contract.
+	// it is still outside the contract: the duplicate keeps the socket open
+	// (the peer sees no FIN) until the conn is finalized, so a caller that
+	// closes fd and never unregisters it leaks the socket until the peer closes.
 	//
-	// The epoll engine fires onClose before UnregisterConn returns, unless the
-	// worker closed the conn first (a peer close, a read error or the loop's
-	// shutdown); then onClose runs on the worker and may still be running when
+	// The epoll engine fires onClose before UnregisterConn returns, unless
+	// another path closed the conn first (a peer close, a read error or the
+	// loop's shutdown on the worker, or a failed Write on a caller's
+	// goroutine); then onClose runs there and may still be running when
 	// UnregisterConn returns. Once UnregisterConn has returned, the epoll worker
 	// reads fd no more, even from inside the conn's read loop (celeris#710,
 	// celeris#772), and so does the standalone Linux loop (celeris#784,
@@ -109,11 +115,13 @@ type WorkerLoop interface {
 	// after UnregisterConn has returned.
 	//
 	// onClose can run after UnregisterConn has returned, and after the same
-	// number has been registered again. On every engine that happens when the
-	// worker closes the conn first (a peer close, a read error or shutdown),
-	// since that close is still pending while UnregisterConn returns. On the
+	// number has been registered again. On epoll, the standalone Linux loop and
+	// io_uring that happens when the conn is closed by another path first (a
+	// peer close, a read error, a failed write or shutdown), since those
+	// engines remove the conn from their table before they run onClose. On the
 	// portable loop and on io_uring it also happens after an UnregisterConn:
-	// the portable reader goroutine fires onClose once it observes the close,
+	// the portable reader goroutine fires onClose once it observes the close
+	// (after a Write timeout the entry stays until the owner unregisters it),
 	// and io_uring fires it once the conn is finalized, which can be after
 	// RegisterConn has taken the number. So a driver must not key its onClose
 	// state by fd number; it can key it by the registration, for example by
