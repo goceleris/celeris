@@ -371,6 +371,45 @@ func (w *Worker) closingDrainBound() int64 {
 	return max(closingDrainTimeoutNanos, int64(w.cfg.WriteTimeout))
 }
 
+// noteClosingAcked is the sweep's evidence of progress on a closing conn, the
+// second kind besides completeSend's restamp (celeris#884 item 52; epoll's
+// noteClosingAcked, celeris#876): the number of bytes the peer has
+// acknowledged (tcp_info bytes_acked, which only grows) moved since the last
+// sample. A SEND of more than the socket queue takes completes only as the
+// queue drains, so a client reading a Connection: close response through a deep
+// queue, slowly, can go more than closingDrainBound between two completions
+// and was reaped with the response truncated. Growth restamps lastActivity, the
+// drain's clock, as a completion that sent bytes does. The first sample of a
+// conn is its baseline and counts as no progress, unless the conn is first met
+// after its bound had already passed (a worker whose sweeps are further apart
+// than the bound): there is no baseline to compare with, and the conn is given
+// one more bound rather than cut on no evidence.
+//
+// Not on the hot path: checkTimeouts calls it for a closing conn, at most every
+// quarter of the bound (closeSampled), and it costs one getsockopt. A
+// descriptor that is not a TCP socket, or a kernel that does not report the
+// count (before Linux 4.1), yields no evidence, which leaves the SEND
+// completions' rule alone. Not for a fixed-file conn, whose cs.fd is a slot of
+// the ring's table, not a descriptor (the caller skips it). Worker thread.
+func (w *Worker) noteClosingAcked(cs *connState, now int64) {
+	cs.closeSampled = now
+	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	if err != nil {
+		return
+	}
+	known, prev := cs.closeAckedKnown, cs.closeAcked
+	cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+	var progressed bool
+	if known {
+		progressed = ti.Bytes_acked > prev
+	} else {
+		progressed = now-cs.lastActivity > w.closingDrainBound()
+	}
+	if progressed {
+		cs.lastActivity = now
+	}
+}
+
 // Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
 	id         int
@@ -7104,7 +7143,14 @@ func (w *Worker) checkTimeouts() {
 			w.rescueHold(cs)
 		}
 		if cs.closing {
-			if now-cs.lastActivity > w.closingDrainBound() {
+			// The peer's acknowledged bytes are progress as much as a SEND
+			// completion that sent some (celeris#884 item 52). Read before
+			// the bound is tested: growth restamps the clock.
+			bound := w.closingDrainBound()
+			if !cs.fixedFile && now-cs.closeSampled >= bound/4 {
+				w.noteClosingAcked(cs, now)
+			}
+			if now-cs.lastActivity > bound {
 				// Everything closeConn does before deferring (detach
 				// signalling, CloseH1, detachedCount) has already run, so
 				// finish exactly where completeSend would have. removeDirty
@@ -7136,7 +7182,7 @@ func (w *Worker) checkTimeouts() {
 					// it may have placed the rest of the response: read the
 					// bound again, or a send that is making progress is
 					// cancelled.
-					if now-cs.lastActivity <= w.closingDrainBound() {
+					if now-cs.lastActivity <= bound {
 						continue
 					}
 				}
