@@ -771,6 +771,10 @@ type Worker struct {
 	// only value outside tests (closeBound). The closes of closeOpFD and of
 	// shutdownDrivers take their tokens from it.
 	closeSem chan struct{}
+	// closeFn replaces the close(2) of closeOpFD for a test, which blocks in
+	// it to count the closes in flight; nil means closeFD. The worker never
+	// changes it once it runs.
+	closeFn func(fd int)
 	// waitClosesHook, when set, runs first thing in waitDriverCloses, before
 	// it waits for the closers: a test synchronizes on shutdown having
 	// reached that wait instead of on a sleep. A test sets it before it stops

@@ -1774,13 +1774,18 @@ func readEndOpen(wr int) (open bool, err error) {
 }
 
 // TestFinalizeDriverClosesUnderTheSharedBound: the close(2) closeOpFD hands
-// to a goroutine takes a token of the same bound shutdownDrivers' closes
-// take (celeris#884 item 55). A lingering close pins an OS thread for the
-// linger time, and the runtime's limit of 10000 threads is fatal, so N
-// simultaneous lingering unregisters must not pin N threads. On a bare worker
-// whose private bound is held in full, finalizeDriver still returns at once
-// (the worker never waits on a close), the descriptors stay open and no
-// onClose fires; once the tokens are given back every descriptor is closed
+// to a goroutine runs under a token of the same bound shutdownDrivers' closes
+// take, held across the close (celeris#884 item 55). A lingering close pins an
+// OS thread for the linger time, and the runtime's limit of 10000 threads is
+// fatal, so N simultaneous lingering unregisters must not pin N threads.
+//
+// On a bare worker whose private bound (2) is held in full, finalizeDriver
+// still returns at once (the worker never waits on a close), the descriptors
+// stay open and no onClose fires. Once the tokens are given back, the closes
+// run through the worker's closeFn, which blocks: exactly the bound's worth
+// must be inside it, all tokens held, while the other conns' closes wait. A
+// close that took a token and gave it back before closing, or one that took
+// none, lets more in. When the closes are let go, every descriptor is closed
 // and every conn's onClose fires, once, with the error it was finalized with.
 func TestFinalizeDriverClosesUnderTheSharedBound(t *testing.T) {
 	defer watchdog959(t, time.Minute)()
@@ -1796,7 +1801,21 @@ func TestFinalizeDriverClosesUnderTheSharedBound(t *testing.T) {
 	})
 	defer release()
 
-	w := &Worker{driverConns: make(map[int]*driverConn, n), closeSem: sem}
+	var inClose, maxInClose atomic.Int32
+	entered := make(chan struct{}, n)
+	gate := make(chan struct{})
+	openGate := sync.OnceFunc(func() { close(gate) })
+	defer openGate()
+	w := &Worker{driverConns: make(map[int]*driverConn, n), closeSem: sem,
+		closeFn: func(fd int) {
+			cur := inClose.Add(1)
+			for m := maxInClose.Load(); cur > m && !maxInClose.CompareAndSwap(m, cur); m = maxInClose.Load() {
+			}
+			entered <- struct{}{}
+			<-gate
+			inClose.Add(-1)
+			closeFD(fd)
+		}}
 	fired := make(chan error, 2*n)
 	var (
 		dcs []*driverConn
@@ -1809,14 +1828,20 @@ func TestFinalizeDriverClosesUnderTheSharedBound(t *testing.T) {
 		dcs, wrs = append(dcs, dc), append(wrs, wr)
 	}
 	w.hasDriverConns.Store(true)
+	finalized := make(chan struct{})
 	// A failing test must not leave closer goroutines running into the next
-	// one: the tokens back, then every closer waited for.
+	// one: the closes let go, finalizeDriver done (it calls driverClosers.Add,
+	// which must not race the Wait), then every closer waited for.
 	defer func() {
 		release()
+		openGate()
+		select {
+		case <-finalized:
+		case <-time.After(5 * time.Second):
+		}
 		w.waitDriverCloses()
 	}()
 
-	finalized := make(chan struct{})
 	go func() {
 		for _, dc := range dcs {
 			w.finalizeDriver(dc, nil)
@@ -1830,6 +1855,9 @@ func TestFinalizeDriverClosesUnderTheSharedBound(t *testing.T) {
 	}
 	// Give a close that ignores the bound the time to run, then look.
 	time.Sleep(200 * time.Millisecond)
+	if got := inClose.Load(); got != 0 {
+		t.Errorf("%d closes began while every token of the bound was held: closeOpFD does not take one first", got)
+	}
 	for i, wr := range wrs {
 		open, err := readEndOpen(wr)
 		if err != nil {
@@ -1848,7 +1876,28 @@ func TestFinalizeDriverClosesUnderTheSharedBound(t *testing.T) {
 	default:
 	}
 
+	// The tokens back: `bound` closes get in and block there, the rest wait.
 	release()
+	for range bound {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no close began after the tokens were given back")
+		}
+	}
+	// Give a close that holds no token across close(2) the time to get in.
+	time.Sleep(200 * time.Millisecond)
+	if got, want := inClose.Load(), int32(bound); got != want {
+		t.Errorf("%d closes are in flight with the bound at %d: the token is not held across close(2)", got, want)
+	}
+	if got := len(sem); got != bound {
+		t.Errorf("%d tokens held while %d closes are in flight, want all %d", got, bound, bound)
+	}
+	if got := maxInClose.Load(); got > bound {
+		t.Errorf("%d closes in flight at once with the bound at %d", got, bound)
+	}
+
+	openGate()
 	w.waitDriverCloses()
 	for i, wr := range wrs {
 		open, err := readEndOpen(wr)
@@ -1856,8 +1905,11 @@ func TestFinalizeDriverClosesUnderTheSharedBound(t *testing.T) {
 			t.Fatalf("conn %d: write to the observer end: %v", i, err)
 		}
 		if open {
-			t.Errorf("conn %d: the engine's descriptor is still open after the tokens were given back and shutdown's wait returned", i)
+			t.Errorf("conn %d: the engine's descriptor is still open after the closes were let go and shutdown's wait returned", i)
 		}
+	}
+	if got := maxInClose.Load(); got != bound {
+		t.Errorf("at most %d closes were in flight at once, want exactly %d: the test did not exercise the bound", got, bound)
 	}
 	if len(fired) != n {
 		t.Errorf("%d onClose callbacks fired, want %d", len(fired), n)

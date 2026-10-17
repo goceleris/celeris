@@ -377,19 +377,48 @@ func lingeringCloseAttempt(t *testing.T, arm string, linger, attempt int) (linge
 // that close lingers. Shutdown must wait for it and still fire the conn's
 // onClose, with the conn's own nil error, not errEngineShutdown and not
 // never: the loop that would have fired it has stopped (celeris#735).
+//
+// The test waits for shutdown to reach its wait for the handed-off closes
+// (waitClosesHook, which replaced a 200 ms sleep, celeris#884 item 3) and
+// reads, there, whether the close is still in its linger wait: a close that
+// had returned already (the kernel leaves the linger wait early on a signal,
+// see TestDriverLingeringCloseDoesNotStallTheWorker) makes the attempt void
+// and the test tries again on a new engine. The read also pins the hook's
+// place: a hook that fires only after the wait has returned sees the close
+// done, so every attempt is void and the test fails as apparatus.
 func TestDriverShutdownWaitsForAHandedOffClose(t *testing.T) {
+	void := 0
+	for attempt := 1; attempt <= lingerAttempts; attempt++ {
+		lingered := handedOffCloseAttempt(t)
+		if t.Failed() {
+			return
+		}
+		if lingered {
+			t.Logf("celeris884 item 3 attempts=%d void=%d result=lingered", attempt, void)
+			return
+		}
+		void++
+	}
+	t.Fatalf("apparatus: the handed-off close was not in its linger wait when shutdown reached the wait for it, "+
+		"in any of %d attempts", lingerAttempts)
+}
+
+// handedOffCloseAttempt is one attempt of
+// TestDriverShutdownWaitsForAHandedOffClose on a new engine. It reports
+// whether the handed-off close was in its linger wait when shutdown reached
+// the wait for it, the only case in which the checks are evidence.
+func handedOffCloseAttempt(t *testing.T) (lingered bool) {
+	t.Helper()
 	e, stop := startTestEngine(t)
-	t.Cleanup(stop) // idempotent; the test calls it itself below
+	defer stop() // idempotent; the attempt calls it itself below
 	w, wl := e.workers[0], e.WorkerLoop(0)
 	p := newWorkerPark(t, w, wl)
 	fd, drain, closed, opFD, id := lingeringDriver(t, w, 2)
 	unregisterAndCloseInOrder(t, p, wl, fd)
 	waitFinalized(t, w, fd)
 
-	// The hook fires when shutdown has reached the wait for the handed-off
-	// closes, with the close still lingering: the point the test used to
-	// reach by sleeping 200 ms after the stop (celeris#884 item 3). The worker
-	// reads it only when it shuts down, after stop below.
+	// The worker reads the hook only when it shuts down, after stop below. It
+	// runs on the worker goroutine, which must not call into t.
 	reached := make(chan struct{})
 	w.waitClosesHook = sync.OnceFunc(func() { close(reached) })
 	stopped := make(chan struct{})
@@ -400,6 +429,10 @@ func TestDriverShutdownWaitsForAHandedOffClose(t *testing.T) {
 		drain()
 		t.Fatal("shutdown never reached the wait for the closes it had handed off")
 	}
+	// The worker is now in (or entering) the wait; nothing has drained the
+	// peer yet, so a close that lingers is still lingering.
+	lingered, state := closeInLingerWait(t, id)
+	t.Logf("celeris884 item 3: at the hook close_lingering=%v tcp_state=%q", lingered, state)
 	drain()
 	select {
 	case <-stopped:
@@ -417,4 +450,5 @@ func TestDriverShutdownWaitsForAHandedOffClose(t *testing.T) {
 	if stillNames(opFD, id) {
 		t.Errorf("the engine stopped with its duplicate (fd %d) of the socket still open", opFD)
 	}
+	return lingered
 }

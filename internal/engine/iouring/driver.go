@@ -753,6 +753,15 @@ func (w *Worker) closeBound() chan struct{} {
 	return driverCloseSem
 }
 
+// closeFunc is the close(2) closeOpFD runs under its token: closeFn when a test
+// replaced it, closeFD otherwise.
+func (w *Worker) closeFunc() func(fd int) {
+	if w.closeFn != nil {
+		return w.closeFn
+	}
+	return closeFD
+}
+
 // closeDriverFDs closes the engine's descriptor of each conn, at most cap(sem)
 // at a time among every caller that shares sem (shutdownDrivers passes the
 // worker's closeBound: shutdownDriverCloseWorkers wide in the whole process),
@@ -873,7 +882,7 @@ func (w *Worker) closeOpFD(dc *driverConn, err error) {
 	w.driverClosers.Add(1)
 	go func() {
 		defer w.driverClosers.Done()
-		closeUnderBound(w.closeBound(), dc.opFD, closeFD)
+		closeUnderBound(w.closeBound(), dc.opFD, w.closeFunc())
 		w.addDriverAction(driverAction{kind: driverActionClosed, dc: dc, closeErr: err})
 	}()
 }

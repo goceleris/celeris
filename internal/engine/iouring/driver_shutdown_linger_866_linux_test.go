@@ -389,6 +389,17 @@ func TestShutdownDriversUsesTheWorkersBound866(t *testing.T) {
 		w.shutdownDrivers()
 		close(done)
 	}()
+	// A failing test must not leave shutdownDrivers running: it would close
+	// the read ends while pipeEnds' cleanup closes them too, and a number
+	// closed twice may by then name another file. The tokens back, then the
+	// shutdown waited for, before any cleanup runs.
+	defer func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}()
 	select {
 	case <-done:
 		t.Fatal("shutdownDrivers returned while every token of the worker's bound was held: it does not use closeBound")
