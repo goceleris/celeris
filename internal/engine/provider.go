@@ -99,10 +99,9 @@ type WorkerLoop interface {
 	// connection failed, no further bytes are sent, and Write reports that
 	// on every engine rather than success (on io_uring the number stays
 	// registered until onClose, and Write there used to return nil and drop
-	// the data). A caller racing its own close treats
-	// ErrUnknownFD as a closed connection. The data slice may be retained by
-	// the worker until the write completes; callers must not modify it after
-	// calling Write.
+	// the data). A caller racing its own close treats ErrUnknownFD as a closed
+	// connection. The data slice may be retained by the worker until the write
+	// completes; callers must not modify it after calling Write.
 	Write(fd int, data []byte) error
 	// CPUID returns the CPU this worker is pinned to, or -1 if the worker is
 	// not pinned. Drivers may use this to co-locate allocations (e.g.,
