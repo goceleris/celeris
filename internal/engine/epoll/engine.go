@@ -426,12 +426,14 @@ func (e *Engine) ResumeAccept() error {
 // eventfd instead, which ResumeAccept signals after this call (celeris#886).
 //
 // The park waits on a Go channel, not in epoll_wait, so an eventfd write does
-// not end it — only this does. ResumeAccept is one caller. AdoptConn is the
-// other: it arrives from another goroutine while the loop has no connection
+// not end it — only this does. ResumeAccept is one caller. AdoptConn is
+// another: it arrives from another goroutine while the loop has no connection
 // and no listener to wake it for, and without the kick a standby loop slept
 // through the adoption until the next ResumeAccept — forever, if the engine
 // stayed the standby — while the source already counted the hand-off done
-// (celeris#658).
+// (celeris#658). RegisterConn is the third: a driver conn registered on a
+// parked loop is in the epoll set of a loop that is not in epoll_wait, and its
+// bytes would wait for the same ResumeAccept (celeris#885 item 39).
 //
 // No wakeup can be lost. A waker publishes its work — sets the flag the park
 // watches — BEFORE it takes wakeMu, and the loop re-checks those flags UNDER
