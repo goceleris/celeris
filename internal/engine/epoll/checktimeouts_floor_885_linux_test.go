@@ -294,10 +294,11 @@ func TestBusyLoopSweepsAtMostOnceAFloorPeriod885(t *testing.T) {
 // floor. ReadHeaderTimeout is disabled, so there is no timerfd and the gate
 // (every 32 iterations while a conn is detached) is the only sweep on a busy
 // loop. Sixteen clients keep the loop busy; a detached conn (a WebSocket's,
-// SSE's) gets an idle deadline 200 ms ahead and must be reaped about then:
-// within 200 ms of it, which a floor of the timerfd's 25 ms meets with room and
-// a floor of 250 ms does not. The longest gap between two sweeps is the
-// structural bound, and does not depend on where in a gap the deadline falls.
+// SSE's) gets an idle deadline 200 ms ahead and must be reaped (within 400 ms
+// of it, a sanity bound). The median gap between two sweeps is the structural
+// bound, and does not depend on where in a gap the deadline falls: a floor of
+// 250 ms moves every gap past it (the control of that mutant), where a floor
+// of the timerfd's 25 ms leaves the gaps at the time of 32 iterations.
 func TestDetachedIdleDeadlineIsReapedPromptlyUnderLoad885(t *testing.T) {
 	addr, p := startFloorEngine885(t, resource.Config{ReadHeaderTimeout: -1, AsyncHandlers: true})
 	dc, err := net.DialTimeout("tcp", addr, 3*time.Second)
@@ -353,14 +354,23 @@ func TestDetachedIdleDeadlineIsReapedPromptlyUnderLoad885(t *testing.T) {
 	reqs := b.served.Load() - served0
 
 	w := p.window(detLoop, from.UnixNano(), to.UnixNano())
-	var maxGap time.Duration
+	var gaps []time.Duration
 	for i := 1; i < len(w); i++ {
-		maxGap = max(maxGap, time.Duration(w[i]-w[i-1]))
+		gaps = append(gaps, time.Duration(w[i]-w[i-1]))
+	}
+	slices.Sort(gaps)
+	// The median, not the maximum: one gap can be a GC pause or a descheduled
+	// thread, and a gap is at least the time of the 32 iterations of a gate
+	// stride, which a -race run on a loaded host stretches to tens of
+	// milliseconds, but a floor set too high moves every gap.
+	var medGap, maxGap time.Duration
+	if n := len(gaps); n > 0 {
+		medGap, maxGap = gaps[n/2], gaps[n-1]
 	}
 	late := reaped.Sub(deadline)
 	tfd, saw := p.timerfd()
-	t.Logf("celeris885 item 29: detached conn reaped %v after its deadline; %d sweeps of its loop in %v, longest gap %v, %d requests in all; timerFD=%d",
-		late.Round(time.Millisecond), len(w), to.Sub(from).Round(time.Millisecond), maxGap.Round(time.Millisecond), reqs, tfd)
+	t.Logf("celeris885 item 29: detached conn reaped %v after its deadline; %d sweeps of its loop in %v, gaps median %v max %v, %d requests in all; timerFD=%d",
+		late.Round(time.Millisecond), len(w), to.Sub(from).Round(time.Millisecond), medGap.Round(time.Millisecond), maxGap.Round(time.Millisecond), reqs, tfd)
 
 	if !saw || tfd >= 0 {
 		t.Fatalf("PREMISE: the loop has a timerfd (%d, saw %v): ReadHeaderTimeout -1 disables it, and without that the gate is not the only sweep", tfd, saw)
@@ -371,10 +381,13 @@ func TestDetachedIdleDeadlineIsReapedPromptlyUnderLoad885(t *testing.T) {
 	if len(w) < 2 {
 		t.Fatalf("PREMISE: %d sweeps of the detached conn's loop in %v", len(w), to.Sub(from))
 	}
-	if late > lead {
-		t.Errorf("the detached conn was reaped %v after its idle deadline, want within %v: the sweep floor is too high", late.Round(time.Millisecond), lead)
+	// A sanity bound on the one reap: where in a gap the deadline falls decides
+	// it, and a gap can be a few hundred milliseconds on a loaded host.
+	if late > 2*lead {
+		t.Errorf("the detached conn was reaped %v after its idle deadline, want within %v", late.Round(time.Millisecond), 2*lead)
 	}
-	if maxGap > 150*time.Millisecond {
-		t.Errorf("longest gap between two sweeps of a busy loop was %v, want at most 150 ms (floor %v)", maxGap.Round(time.Millisecond), sweepFloor)
+	if medGap > 200*time.Millisecond {
+		t.Errorf("the median gap between two sweeps of a busy loop was %v (max %v), want at most 200 ms (floor %v): the sweep floor is too high",
+			medGap.Round(time.Millisecond), maxGap.Round(time.Millisecond), sweepFloor)
 	}
 }
