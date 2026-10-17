@@ -16,8 +16,9 @@ package epoll
 // false when the switch or the send failed and the conn was closed, true when
 // the conn goes on as HTTP/2.
 //
-// A send that does not fit the kernel's buffer arms EPOLLOUT rather than the
-// dirty list, which busy-polls (as for every conn since celeris#885 item 42).
+// A send that does not fit the kernel's buffer arms EPOLLOUT, as every partial
+// send does since celeris#885 item 42 (the dirty list holds the loop at a 0 ms
+// epoll_wait).
 //
 // Loop thread, and no dispatch goroutine exists for the conn: the callers are
 // drainRead's inline ProcessH1 (a conn not yet promoted to its goroutine, or a
