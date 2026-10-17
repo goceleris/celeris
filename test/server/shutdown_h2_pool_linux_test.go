@@ -151,7 +151,7 @@ func TestShutdownH2PoolWaitIsBounded(t *testing.T) {
 	const budget = 500 * time.Millisecond
 	// bound is the most Start may return after the budget (was 3 s). Measured in
 	// a linux/arm64 container: Start returned 500-512 ms after the shutdown began
-	// over 120 runs without -race and 500-579 ms over 120 runs with -race (the
+	// over 120 runs without -race and 501-579 ms over 120 runs with -race (the
 	// budget is 500 ms), so 1 s is about 12 times the largest excess seen.
 	const bound = time.Second
 	for _, e := range []struct {

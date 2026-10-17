@@ -237,12 +237,14 @@ func TestH2MaxConcurrentStreamsHeadersContinuation981(t *testing.T) {
 					}
 					// Four are admitted; the other six are refused, which is the end of the settling.
 					waitUntil981(10*time.Second, func() bool { rst, _, _ := w.state(); return len(rst) >= streams-limit })
-					// The PING/ACK barrier covers every request frame sent so far; the
-					// grace covers the pool goroutine that would start a handler a
-					// frame had admitted (was a 200 ms sleep).
+					// The PING/ACK barrier covers every request frame sent so far, not
+					// the pool goroutine that starts a handler a frame admitted: wait
+					// for the admitted handlers to start, then a short grace for one
+					// that should not (was a 200 ms sleep).
 					if err := w.barrier(); err != nil {
 						t.Fatalf("PING/ACK barrier: %v", err)
 					}
+					waitUntil981(5*time.Second, func() bool { return entered.Load() >= limit })
 					time.Sleep(25 * time.Millisecond)
 					rst, _, goaway := w.state()
 					var ids []int

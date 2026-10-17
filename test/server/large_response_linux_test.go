@@ -415,12 +415,17 @@ func TestBackloggedPeerIsClosed(t *testing.T) {
 				if _, err := io.WriteString(raw, strings.Repeat("GET /big HTTP/1.1\r\nHost: x\r\n\r\n", requests)); err != nil {
 					t.Fatal(err)
 				}
-				// The server stages what it will before the client reads. Kept as a
-				// fixed wait (celeris#890 item 22, open question): the stop point is
-				// overBacklogH1 (pendingBytes > maxPendingBytes), which is unexported,
-				// and the kernel send queue plateaus before the engine stops staging,
-				// so no server-side condition visible from here is exact.
-				time.Sleep(300 * time.Millisecond)
+				// The server stages what it will before the client reads. Two
+				// conditions are visible from here: the server has read every request
+				// (receive queue empty) and its kernel send queue has stopped growing.
+				// Neither is exact: the stop point is overBacklogH1 (pendingBytes >
+				// maxPendingBytes), which is unexported, and the kernel send queue
+				// plateaus before the engine stops staging, so a short fixed grace
+				// follows (celeris#890 item 22, open question: it needs an engine-side
+				// observable; was a 300 ms sleep).
+				waitServerReadAll761(t, raw, addr)
+				waitServerSendQueued761(raw, addr)
+				time.Sleep(backlogGrace761)
 				br := bufio.NewReaderSize(idleConn761{raw}, 64<<10)
 				whole := 0
 				for whole < requests {
@@ -656,9 +661,21 @@ func hexPort761(field string) int {
 	return int(p)
 }
 
+// backlogGrace761 is the fixed wait that follows the server-side conditions in
+// TestBackloggedPeerIsClosed, for the engine to finish staging after the
+// kernel send queue has plateaued.
+const backlogGrace761 = 100 * time.Millisecond
+
 // waitServerReadAll761 waits until the server has read everything sent on
 // raw so far: its receive queue is empty. Used where a test sends a request
 // in two writes and needs the server to take the first before the second.
+// An empty queue is also what the server shows before the segment has been
+// delivered, so on a loopback that delays delivery the wait can return at
+// once and the two writes reach the server as one read (the test then passes
+// without exercising the split; it cannot fail because of it). In a stress
+// run (16 busy-loop hogs on 2 CPUs, -race, 768 first polls) no poll was
+// provably undelivered. Requiring the client's own send queue to be empty as
+// well would be tighter, but a delayed ACK keeps that queue non-empty.
 func waitServerReadAll761(t *testing.T, raw net.Conn, serverAddr string) {
 	t.Helper()
 	if !waitUntil981(5*time.Second, func() bool {
