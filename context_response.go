@@ -1862,17 +1862,30 @@ func (sw *StreamWriter) BytesWritten() int64 {
 
 // Flush asks the engine to send buffered data to the network. It is a request,
 // not a guarantee, and on HTTP/1.1 on epoll, io_uring and Adaptive (the Linux
-// default, which runs on the first two) it does nothing: what reaches the
+// default, which runs on the first two) it sends nothing: what reaches the
 // peer, and when, is decided by [StreamWriter.Write]. Until
 // [Context.Detach] those engines only append each Write to the connection's
 // send buffer, which goes out when the handler returns, so every byte
 // written so far stays in memory until then, however often Flush is called.
-// After Detach each Write is handed to the connection at once (the calling
-// goroutine usually tries the send, and the engine finishes what the socket
-// does not take). The std engine flushes through [net/http.Flusher]. To
-// deliver bytes while the handler is still running, Detach it (see
-// [Context.EngineSupportsAsyncDetach]). The behavior above is HTTP/1.1's;
-// Flush is not a delivery guarantee on HTTP/2 either.
+// That buffer is bounded: once the response held unsent is over 4 MiB, Write
+// and Flush return an error, the rest of the response is dropped, and the
+// connection is closed once the bytes already staged have gone out, so the
+// client sees a chunked body that never ends. A response that needs more than
+// that before the handler returns has to Detach it. After Detach each Write is
+// handed to the connection at once (the calling goroutine usually tries the
+// send, and the engine finishes what the socket does not take). The std engine
+// flushes through [net/http.Flusher]. To deliver bytes while the handler is
+// still running, Detach it (see [Context.EngineSupportsAsyncDetach]).
+//
+// On those engines Write, Flush and Close report a connection the engine has
+// torn down, as net/http does: after the peer has gone away they return an
+// error wrapping [net.ErrClosed]. The engine learns of it on its own thread,
+// so a Write issued at the moment the peer resets can still return nil, and
+// one made before Detach by a handler that blocks the engine's thread cannot
+// see it at all. A detached connection whose peer stopped reading is closed
+// once 64 MiB are unsent, and Write returns an error from then on. The
+// behavior above is HTTP/1.1's; Flush is not a delivery guarantee on HTTP/2
+// either.
 func (sw *StreamWriter) Flush() error {
 	if sw.refused != nil {
 		return sw.refused

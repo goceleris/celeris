@@ -103,6 +103,50 @@ func (cs *connState) overBacklogH1() bool {
 	return cs.pendingBytes > maxPendingBytes
 }
 
+// streamErrH1 is the write-error query of an HTTP/1 conn that is not
+// detached (conn.H1State.SetWriteErrFn), asked by a StreamWriter's Write,
+// Flush and Close after the write hook: nil while the conn can take the
+// response, conn.ErrConnClosed once the engine has torn it down, and
+// conn.ErrWriteRefused once bytes were refused or the response unsent is over
+// maxPendingBytes. The last is the cap on a response held whole in memory
+// before Detach: the write hook only appends for an HTTP/1 conn (writeCap), and
+// nothing sends while the handler runs, so a stream of any size was staged
+// (celeris#884 item 45, #885 item 30). It marks the refusal as the hook does
+// (writeRefused), so the conn is closed once what is staged has gone out. No
+// lock: it runs on the goroutine that runs the handler, the loop thread or the
+// dispatch goroutine holding detachMu, as the write hook does.
+func (cs *connState) streamErrH1() error {
+	if cs.writeRefused {
+		return conn.ErrWriteRefused
+	}
+	if cs.detachClosed || cs.asyncClosed.Load() {
+		return conn.ErrConnClosed
+	}
+	if cs.pendingBytes > maxPendingBytes {
+		cs.writeRefused = true
+		return conn.ErrWriteRefused
+	}
+	return nil
+}
+
+// streamErrDetached is streamErrH1 for a detached conn, whose handler goroutine
+// writes without the loop's lock: it reads the flags under mu (detachMu), which
+// the guarded write hook and closeConn hold when they set them. The limit is
+// the write hook's own (maxPendingBytesDetached): a refusal there is what
+// writeRefused records.
+func (cs *connState) streamErrDetached(mu *sync.Mutex) error {
+	mu.Lock()
+	closed, refused := cs.detachClosed, cs.writeRefused
+	mu.Unlock()
+	if refused {
+		return conn.ErrWriteRefused
+	}
+	if closed || cs.asyncClosed.Load() {
+		return conn.ErrConnClosed
+	}
+	return nil
+}
+
 // connState holds per-connection state for the epoll engine.
 // Fields are ordered for cache line optimization (P4): hot fields first.
 type connState struct {
