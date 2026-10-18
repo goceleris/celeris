@@ -16,7 +16,7 @@ import (
 )
 
 // A WebSocket peer that reads nothing of what it is sent gets the same bound as
-// an SSE client (celeris#888 items 36 and 37): the native engines apply
+// an SSE client (celeris#888 items 38 and 39): the native engines apply
 // WriteTimeout to a detached connection as "no progress for WriteTimeout",
 // whatever the middleware's idle deadline says. A peer that sends pings keeps
 // pushing that deadline out, which is the peer this test is.
@@ -110,7 +110,7 @@ func TestNonReadingPeerEndsConn888(t *testing.T) {
 					t.Errorf("ended %v after connect, before WriteTimeout %v", el, wsStall888Timeout)
 				}
 			case <-time.After(wsStall888Timeout + 6*time.Second):
-				t.Fatalf("a WebSocket peer that sends pings and reads nothing was not closed within %v (WriteTimeout %v): celeris#888 item 36",
+				t.Fatalf("a WebSocket peer that sends pings and reads nothing was not closed within %v (WriteTimeout %v): celeris#888 item 38",
 					wsStall888Timeout+6*time.Second, wsStall888Timeout)
 			}
 		})

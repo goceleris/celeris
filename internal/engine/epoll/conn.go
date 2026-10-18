@@ -284,7 +284,7 @@ type connState struct {
 	// conn (WS/SSE) is never in that state (closeWhenFlushed closes it at
 	// once), and uses the same fields as the clock of a stall: how long its peer
 	// has taken none of the bytes queued for it, bounded by WriteTimeout
-	// (detachedStalled, celeris#888 items 36 and 37), started by the sweep that
+	// (detachedStalled, celeris#888 items 38 and 39), started by the sweep that
 	// finds bytes queued and cleared by the one that finds none. Worker-thread-
 	// only; reset on release.
 	closeSince   int64

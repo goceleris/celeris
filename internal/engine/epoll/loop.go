@@ -2129,9 +2129,8 @@ func (cs *connState) endWriteSlow() {
 // Not on the hot path: checkTimeouts calls it for a closing conn, at most
 // every quarter of the bound (closeSampled) and once more before it reaps one,
 // and it costs one getsockopt. A
-// descriptor that is not a TCP socket, or a kernel that does not report the
-// count (before Linux 4.1), yields no evidence, which leaves the userspace
-// queue's rule alone. Loop thread.
+// descriptor that is not a TCP socket yields no evidence, which leaves the
+// userspace queue's rule alone. Loop thread.
 func (l *Loop) noteClosingAcked(cs *connState, now int64) {
 	cs.closeSampled = now
 	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
@@ -4182,7 +4181,7 @@ func (l *Loop) checkTimeouts() {
 				cs.drainDeadline = 0
 				// WriteTimeout is the one engine timeout a detached stream
 				// keeps: "no progress for WriteTimeout" on what is queued for
-				// the peer (celeris#888 items 36 and 37). Here, whatever the
+				// the peer (celeris#888 items 38 and 39). Here, whatever the
 				// middleware's idle deadline says: a WebSocket peer that sends
 				// pings pushes it out for ever and reads nothing of what it is
 				// sent. The expired case below is the middleware ending the
@@ -4291,7 +4290,7 @@ func (l *Loop) checkTimeouts() {
 
 // detachedStalled is checkTimeouts' look at a truly-detached conn (WS/SSE)
 // that has bytes queued for its peer: whether the peer has taken none of them
-// for WriteTimeout (celeris#888 items 36 and 37, celeris#884 item 66). The
+// for WriteTimeout (celeris#888 items 38 and 39, celeris#884 item 69). The
 // middleware owns the stream's lifecycle, so no ReadTimeout, IdleTimeout or
 // absolute WriteTimeout applies to it; but a client that stays connected and
 // reads nothing never fails a write on a native engine (the write only queues),
@@ -4343,7 +4342,7 @@ func (l *Loop) detachedStalled(cs *connState, now int64) bool {
 	}
 	if cs.closeSampled > cs.closeSince && !cs.closeAckedKnown {
 		// A sample was taken since the stall began and the socket gave no
-		// acknowledged count (not a TCP socket, or a kernel before Linux 4.1):
+		// acknowledged count (not a TCP socket):
 		// the stream's own goroutine flushes with no lock the loop's clocks are
 		// under, and nothing else sees the bytes it writes, so a peer that
 		// reads cannot be told from one that does not. No bound, as before this

@@ -98,7 +98,7 @@ func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync 
 }
 
 // startSSEServerCfg is startSSEServer with the server's Config given whole,
-// for a test that sets timeouts (celeris#888 item 36).
+// for a test that sets timeouts (celeris#888 item 38).
 func startSSEServerCfg(tb testing.TB, cfg celeris.Config, routeAsync bool, h celeris.HandlerFunc) (string, func()) {
 	tb.Helper()
 	began := time.Now()

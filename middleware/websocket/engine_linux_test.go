@@ -66,7 +66,7 @@ func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Con
 }
 
 // startNativeServerCfg is startNativeServerWithHandle with the server's Config
-// given whole, for a test that sets timeouts (celeris#888 items 36 and 37).
+// given whole, for a test that sets timeouts (celeris#888 items 38 and 39).
 func startNativeServerCfg(tb testing.TB, ccfg celeris.Config, cfg Config) (string, func(), *celeris.Server) {
 	tb.Helper()
 	s := celeris.New(ccfg)
