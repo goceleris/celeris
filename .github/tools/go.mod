@@ -1,7 +1,11 @@
 // Versions of the Go tools CI runs, kept out of the celeris module so they
 // add nothing to its dependency graph. Each is a `tool` directive, pinned by
-// go.sum and bumped by Dependabot (.github/dependabot.yml); a workflow runs
-// one with `go tool -modfile=$GITHUB_WORKSPACE/.github/tools/go.mod <name>`.
+// go.sum and bumped by Dependabot (.github/dependabot.yml): govulncheck, mage
+// and actionlint, which the Lint, Vulnerability Check and release workflows run,
+// and benchstat. A workflow runs one with
+// `GOWORK=off go tool -modfile=$GITHUB_WORKSPACE/.github/tools/go.mod <name>`.
+// A new `tool` needs its module in the allow list of dependabot.yml's
+// /.github/tools entry; the Lint step "Tool pins agree" fails without it.
 // apidump, which keeps api/ in step with the exported API (celeris#443), is a
 // package of this module itself; CI runs it with
 // `go -C .github/tools run ./apidump`. It imports golang.org/x/tools at the
