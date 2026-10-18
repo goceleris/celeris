@@ -150,16 +150,39 @@ func TestStallLookRateLimit888(t *testing.T) {
 // TestStalledCloseSkipsTheClosingDrain888: the peer has just been shown to take
 // nothing for WriteTimeout, so the drain that closeConn gives a conn with a
 // SEND in flight (closingDrainBound, 5 s or more) is spent at once: the next
-// sweep may reap it. A peer that reads in the meantime would restamp the clock
-// (noteClosingAcked).
+// sweep may reap it. The closing sample that comes first (noteClosingAcked)
+// must not give it a fresh drain while the peer stays silent, because the
+// stall's sample is its baseline; a peer that reads in the meantime restamps
+// the clock.
 func TestStalledCloseSkipsTheClosingDrain888(t *testing.T) {
 	s := newStall888(t, stall888Bound)
 	s.cs.lastActivity = time.Now().UnixNano()
+	fillSocket888(t, s.cs.fd)
 	if _, closing := s.sweepUntilClosing(5*time.Second, nil); !closing {
 		t.Fatal("not closed")
 	}
-	if age := time.Now().UnixNano() - s.cs.lastActivity; age <= s.w.closingDrainBound() {
-		t.Fatalf("the closing drain's clock is %v old, the bound is %v: the stalled conn would hold its descriptor and queue for another bound",
-			time.Duration(age), s.w.closingDrainBound())
+	bound := s.w.closingDrainBound()
+	spent := func(when string) {
+		t.Helper()
+		if age := time.Now().UnixNano() - s.cs.lastActivity; age <= bound {
+			t.Fatalf("%s: the closing drain's clock is %v old, the bound is %v: the stalled conn would hold its descriptor and queue for another bound",
+				when, time.Duration(age), time.Duration(bound))
+		}
+	}
+	spent("after the stall close")
+	// The closing sample, a quarter of the bound later, with the peer silent.
+	later := time.Now().UnixNano() + bound/4 + int64(time.Millisecond)
+	s.w.noteClosingAcked(s.cs, later)
+	spent("after a closing sample of a silent peer")
+	// The peer reads: its acknowledged count moves, and the drain goes on.
+	buf := make([]byte, 64<<10)
+	for i := 0; i < 5; i++ {
+		_ = s.peer.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		_, _ = s.peer.Read(buf)
+	}
+	time.Sleep(50 * time.Millisecond)
+	s.w.noteClosingAcked(s.cs, later+int64(time.Second))
+	if s.cs.lastActivity != later+int64(time.Second) {
+		t.Fatalf("a peer that read after the stall close did not restamp the drain clock (lastActivity %d, want %d)", s.cs.lastActivity, later+int64(time.Second))
 	}
 }

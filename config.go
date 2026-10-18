@@ -140,8 +140,10 @@ type Config struct {
 	// OnDisconnect runs), whatever the middleware's idle deadline or the last
 	// read of the connection. A peer that reads, however slowly, and a
 	// connection with nothing queued are not closed (there is no minimum
-	// rate); -1 sets no such bound. The close comes WriteTimeout after the
-	// peer last took a byte, plus the engine's sweep interval (about 50 ms on
+	// rate); -1 sets no such bound. The close comes between about 3/4
+	// and 5/4 of WriteTimeout after the peer last took a byte (its progress
+	// is sampled every quarter of WriteTimeout; a SEND completion restarts the
+	// clock at once), plus the engine's sweep interval (up to about 0.1 s on
 	// epoll, up to 2 s on io_uring; a WriteTimeout shorter than that can
 	// double). An h2c stream is not covered yet (celeris#884).
 	// On the std engine net/http arms WriteTimeout as one deadline for the

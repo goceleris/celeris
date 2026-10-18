@@ -50,10 +50,12 @@
 //     (there is no minimum rate), is not disconnected, and neither is one
 //     with nothing queued for it (WriteTimeout -1 sets no such bound). A
 //     handler that returns (its own bound, or its context) ends the stream
-//     sooner, and so does Shutdown. The disconnect comes WriteTimeout after
-//     the client last took a byte, plus the engine's sweep interval (about 50
-//     ms on epoll, up to 2 s on io_uring; a WriteTimeout shorter than that
-//     can double). This is for HTTP/1.1 streams: an h2c stream is not covered
+//     sooner, and so does Shutdown. The disconnect comes between about 3/4
+//     and 5/4 of WriteTimeout after the client last took a byte (its progress
+//     is sampled every quarter of WriteTimeout; a SEND completion restarts the
+//     clock at once), plus the engine's sweep interval (up to about 0.1 s on
+//     epoll, up to 2 s on io_uring; a WriteTimeout shorter than that can
+//     double). This is for HTTP/1.1 streams: an h2c stream is not covered
 //     yet (celeris#884).
 //
 // A HEAD request to an SSE route (answered by its GET route) gets the stream's
