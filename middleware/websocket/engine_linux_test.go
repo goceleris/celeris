@@ -62,7 +62,14 @@ func startNativeServer(tb testing.TB, kind celeris.EngineType, cfg Config) (stri
 // survives shutdown, so EngineInfo() still answers).
 func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Config) (string, func(), *celeris.Server) {
 	tb.Helper()
-	s := celeris.New(celeris.Config{Engine: kind})
+	return startNativeServerCfg(tb, celeris.Config{Engine: kind}, cfg)
+}
+
+// startNativeServerCfg is startNativeServerWithHandle with the server's Config
+// given whole, for a test that sets timeouts (celeris#888 items 36 and 37).
+func startNativeServerCfg(tb testing.TB, ccfg celeris.Config, cfg Config) (string, func(), *celeris.Server) {
+	tb.Helper()
+	s := celeris.New(ccfg)
 	s.GET("/ws", New(cfg))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

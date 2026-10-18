@@ -90,11 +90,22 @@ func sseDisconnectCells(t *testing.T) []sseCell {
 // dispatch goroutine is chosen by Config.AsyncHandlers.
 func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync bool, h celeris.HandlerFunc) (string, func()) {
 	tb.Helper()
+	return startSSEServerCfg(tb, celeris.Config{
+		Engine:          engine,
+		AsyncHandlers:   async,
+		ShutdownTimeout: 2 * time.Second,
+	}, routeAsync, h)
+}
+
+// startSSEServerCfg is startSSEServer with the server's Config given whole,
+// for a test that sets timeouts (celeris#888 item 36).
+func startSSEServerCfg(tb testing.TB, cfg celeris.Config, routeAsync bool, h celeris.HandlerFunc) (string, func()) {
+	tb.Helper()
 	began := time.Now()
 	deadline := began.Add(startRetryWindow)
 	retries := 0
 	for {
-		addr, shutdown, err := trySSEServer(tb, engine, async, routeAsync, h)
+		addr, shutdown, err := trySSEServer(tb, cfg, routeAsync, h)
 		if err == nil {
 			if retries > 0 {
 				tb.Logf("startSSEServer: started after %d retries in %v", retries, time.Since(began).Round(time.Millisecond))
@@ -120,13 +131,9 @@ func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync 
 // listener, so a retry never reuses a listener that a failed Start closed.
 // It returns the error instead of failing the test, so the caller can
 // classify it (classifyStart).
-func trySSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync bool, h celeris.HandlerFunc) (string, func(), error) {
+func trySSEServer(tb testing.TB, cfg celeris.Config, routeAsync bool, h celeris.HandlerFunc) (string, func(), error) {
 	tb.Helper()
-	s := celeris.New(celeris.Config{
-		Engine:          engine,
-		AsyncHandlers:   async,
-		ShutdownTimeout: 2 * time.Second,
-	})
+	s := celeris.New(cfg)
 	r := s.GET("/events", h)
 	if routeAsync {
 		r.Async()
