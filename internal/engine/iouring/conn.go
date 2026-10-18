@@ -269,7 +269,7 @@ type connState struct {
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
 	// stallSince is the clock of a truly-detached conn (WS/SSE) that has bytes
-	// queued for its peer (celeris#888 items 36 and 37, celeris#884 item 66):
+	// queued for its peer (celeris#888 items 38 and 39, celeris#884 item 69):
 	// when the sweep last saw the peer take some of them, in nanoseconds, or
 	// first saw them queued. checkTimeouts closes the conn once it is older
 	// than WriteTimeout (detachedStalled). Restamped by completeSend when a

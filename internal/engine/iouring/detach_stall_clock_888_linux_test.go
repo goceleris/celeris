@@ -12,7 +12,7 @@ import (
 // queued, so the next queue is not charged for the time before it.
 func TestDetachedStallClockEndsWithTheQueue888(t *testing.T) {
 	s := newStall888(t, stall888Bound)
-	s.w.checkTimeouts()
+	s.sweepNow()
 	if s.cs.stallSince == 0 {
 		t.Fatalf("no stall clock after a sweep that found bytes queued")
 	}
@@ -29,12 +29,12 @@ func TestDetachedStallClockEndsWithTheQueue888(t *testing.T) {
 	// A queue the sweep finds gone, with the clock left running: the stream's
 	// goroutine drained it inline.
 	s.cs.sendBuf, s.cs.sending = s.cs.sendBuf[:1], true
-	s.w.checkTimeouts()
+	s.sweepNow()
 	if s.cs.stallSince == 0 {
 		t.Fatalf("no stall clock after a sweep that found bytes queued")
 	}
 	s.cs.sendBuf, s.cs.sending = s.cs.sendBuf[:0], false
-	s.w.checkTimeouts()
+	s.sweepNow()
 	if s.cs.stallSince != 0 {
 		t.Errorf("stallSince=%d after a sweep that found nothing queued, want 0", s.cs.stallSince)
 	}
