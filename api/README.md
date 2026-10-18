@@ -54,6 +54,7 @@ from the root or pass `-root`: inside a nested module such as
   | `func Name[$0 C](Params) Results` | a function |
   | `type Name struct`, then `type Name struct, Field Type` | a struct type and each of its exported fields |
   | `type Name struct, embedded T` | an embedded field with an exported name |
+  | `type Name struct, not comparable` | a struct whose values cannot be compared with `==`: a slice, map or function field decides it, directly or through a nested struct, an array or an embedded type, unexported and blank fields included. A generic struct gets the line only if no type argument can make it comparable. The default, comparable, has no line, so a struct that stops being comparable (an unexported `_ [0]func()` field added) shows as an added line |
   | `type Name struct, promoted Field Type` | an exported field reached through an embedded type that has no file of its own |
   | `type Name interface`, then `type Name interface, Method(Params) Results` | an interface and every method of its method set, embedded interfaces expanded. `unexported methods` marks one that cannot be implemented outside its package; `embedded ~int \| ~string` is a type-set element |
   | `type Name Underlying` | any other defined type |
@@ -73,8 +74,6 @@ from the root or pass `-root`: inside a nested module such as
   that adds a method to `time.Time` therefore changes nothing here.
 - **Breaking changes these files do not show** (review them by hand; Go's own
   `cmd/api` has the same blind spots, and `gorelease` reports them):
-  - an exported struct that stops being comparable, for example because an
-    unexported `_ [0]func()` field is added;
   - the first unexported field added to a struct whose fields were all
     exported, which breaks unkeyed composite literals;
   - exported fields reordered, which also breaks unkeyed literals (the

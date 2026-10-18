@@ -253,7 +253,9 @@ type Config struct, TrustedProxies []string
 type Config struct, Workers int
 type Config struct, WorkloadHint WorkloadHint
 type Config struct, WriteTimeout time.Duration
+type Config struct, not comparable
 type Context struct
+type Context struct, not comparable
 type Cookie struct
 type Cookie struct, Domain string
 type Cookie struct, Expires time.Time
@@ -281,13 +283,16 @@ type Params []Param
 type Protocol uint8
 type Route struct
 type RouteGroup struct
+type RouteGroup struct, not comparable
 type RouteInfo struct
 type RouteInfo struct, HandlerCount int
 type RouteInfo struct, Method string
 type RouteInfo struct, Path string
 type SameSite int
 type Server struct
+type Server struct, not comparable
 type SkipHelper struct
+type SkipHelper struct, not comparable
 type StreamWriter struct
 type Validator interface
 type Validator interface, Validate(any) error

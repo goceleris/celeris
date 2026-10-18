@@ -27,7 +27,9 @@ type Config struct, StatusFilter func(int) bool
 type Config struct, Store github.com/goceleris/celeris/middleware/store.KV
 type Config struct, TTL time.Duration
 type Config struct, VaryHeaders []string
+type Config struct, not comparable
 type MemoryStore struct
+type MemoryStore struct, not comparable
 type MemoryStoreConfig struct
 type MemoryStoreConfig struct, CleanupContext context.Context
 type MemoryStoreConfig struct, CleanupInterval time.Duration

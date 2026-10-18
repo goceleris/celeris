@@ -12,6 +12,7 @@ method (*Breaker) Reset()
 method (*Breaker) State() State
 method (State) String() string
 type Breaker struct
+type Breaker struct, not comparable
 type Config struct
 type Config struct, CooldownPeriod time.Duration
 type Config struct, ErrorHandler func(*github.com/goceleris/celeris.Context, error) error
@@ -23,5 +24,6 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, Threshold float64
 type Config struct, WindowSize time.Duration
+type Config struct, not comparable
 type State int
 var ErrServiceUnavailable *github.com/goceleris/celeris.HTTPError
