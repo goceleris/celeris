@@ -33,6 +33,14 @@ import (
 
 const nonReadWriteTimeout888 = time.Second
 
+// disconnect888 is what OnDisconnect reports: when it ran, and how many events
+// dropEarly dropped on a full queue before that (logged by the test, never by
+// OnDisconnect, which can run after the subtest has returned).
+type disconnect888 struct {
+	at    time.Time
+	early int64
+}
+
 // nonReadCell888 is one engine configuration of the matrix.
 type nonReadCell888 struct {
 	name   string
@@ -135,9 +143,9 @@ func burstFor888(tb testing.TB) int {
 // serve888 runs an SSE stream that produces by p until the client is gone,
 // and reports when OnDisconnect ran. MaxQueueDepth 4 with ClientPolicyClose is
 // the shape the finding names: the policy that was never reached.
-func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, disconnected <-chan time.Time, shutdown func()) {
+func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, disconnected <-chan disconnect888, shutdown func()) {
 	tb.Helper()
-	done := make(chan time.Time, 1)
+	done := make(chan disconnect888, 1)
 	var started, early atomic.Int64 // handler start (unix nanos), events dropped by dropEarly
 	wt := p.wt()
 	var burst string
@@ -156,11 +164,8 @@ func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, d
 			return sse.ClientPolicyClose
 		},
 		OnDisconnect: func(*celeris.Context, *sse.Client) {
-			if n := early.Load(); n > 0 {
-				tb.Logf("%d events were dropped on a full queue before WriteTimeout", n)
-			}
 			select {
-			case done <- time.Now():
+			case done <- disconnect888{time.Now(), early.Load()}:
 			default:
 			}
 		},
@@ -297,9 +302,9 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 				const slack = 5 * time.Second
 				wt := pr.p.wt()
 				select {
-				case at := <-disconnected:
-					el := at.Sub(began)
-					t.Logf("OnDisconnect %v after connect (WriteTimeout %v)", el.Round(time.Millisecond), wt)
+				case d := <-disconnected:
+					el := d.at.Sub(began)
+					t.Logf("OnDisconnect %v after connect (WriteTimeout %v), %d events dropped on a full queue before WriteTimeout", el.Round(time.Millisecond), wt, d.early)
 					// std ends a stream whose write is blocked as soon as the
 					// queue behind it is full (ClientPolicyClose), earlier than
 					// WriteTimeout: the lower bound is for the native engines.
