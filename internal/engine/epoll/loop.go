@@ -2409,6 +2409,11 @@ func (l *Loop) initProtocol(cs *connState) {
 		// request that finds the conn's unsent responses over the limit is
 		// not served, and the conn is closed once they have gone out.
 		cs.h1State.WriteBacklogged = cs.overBacklogH1
+		// The streaming write-error query (celeris#884 item 45, #885 item
+		// 30): a StreamWriter's Write, Flush and Close ask it after the
+		// write hook, which has no error return. Detach swaps in one that
+		// takes detachMu.
+		cs.h1State.SetWriteErrQuery(cs)
 		// Scatter-gather body writer: handler hands large bodies to the
 		// engine as a zero-copy slice, which it writes at once with
 		// writev(2) of [headers, body], saving the respBuf → writeBuf
@@ -2486,7 +2491,16 @@ func (l *Loop) initProtocol(cs *connState) {
 				// the conn. On partial/EAGAIN/error we fall through to the
 				// existing enqueue path so the loop finishes the remainder
 				// (a detached WS conn's goes to EPOLLOUT, celeris#885 item 42) or tears it down.
-				if err := l.flushWrites(cs, false); err != nil {
+				if cs.writeRefused {
+					// The write hook refused bytes: the backlog before them was
+					// over maxPendingBytesDetached, a peer that stopped reading.
+					// Nothing read the flag for a detached conn, so the bytes were
+					// dropped and the conn left open, its stream cut in the middle
+					// (celeris#761). Close it, through the detach queue as a flush
+					// error does; the stream's next Write reports it
+					// (detachedStreamErr, celeris#884 item 45, #885 item 30).
+					cs.asyncClosed.Store(true)
+				} else if err := l.flushWrites(cs, false); err != nil {
 					// Surface the specific I/O error (EPIPE/ECONNRESET/…) to the
 					// detached middleware before teardown, matching the loop-thread
 					// dirty-flush (loop.go:558) and handleWritable. Without this the
@@ -2588,6 +2602,7 @@ func (l *Loop) initProtocol(cs *connState) {
 					cs.writeFn = prevWrite
 					if h1 != nil {
 						h1.UpdateWriteFn(prevWrite)
+						h1.SetWriteErrQuery(cs)
 						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
 					}
 					cs.detachMu = prevMu
@@ -2636,6 +2651,7 @@ func (l *Loop) initProtocol(cs *connState) {
 			// Also update the response adapter so StreamWriter writes
 			// go through the guarded path (not the stale pre-Detach writeFn).
 			cs.h1State.UpdateWriteFn(guarded)
+			cs.h1State.SetWriteErrQuery(&detachedStreamErr{cs: cs, mu: mu})
 			if unlockDetachMu {
 				if f := detachPreFlagHook.Load(); f != nil {
 					(*f)() // test seam, celeris#844 item 2 (before the flag)

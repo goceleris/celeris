@@ -103,6 +103,71 @@ func (cs *connState) overBacklogH1() bool {
 	return cs.pendingBytes > maxPendingBytes
 }
 
+// StreamWriteErr is the write-error query of an HTTP/1 conn that is not
+// detached (conn.WriteErrQuery, installed by conn.H1State.SetWriteErrQuery),
+// asked by a StreamWriter's WriteHeader, Write, Flush and Close: with n the
+// size of the head, chunk or last chunk about to be staged, and with 0 after
+// the write hook. It is nil
+// while the conn can take the response, conn.ErrConnClosed once the engine has
+// torn it down, and conn.ErrWriteRefused once bytes were refused or the
+// response unsent plus n is over maxPendingBytesDetached. The last is the cap
+// on a response held whole in memory before Detach, the limit a detached or
+// HTTP/2 conn has (an HTTP/1 response, however large, is staged whole,
+// celeris#761; this bounds it): the write hook only appends for an HTTP/1 conn
+// (writeCap), and nothing sends while the handler runs, so a stream of any size
+// was staged (celeris#884 item 45, #885 item 30). Asked before the chunk is
+// staged, it keeps the chunk that would cross the limit out of the send buffer,
+// so what is held is at most the limit, not the limit plus a chunk. It marks
+// the refusal as the hook does (writeRefused), so the conn is closed once what
+// is staged has gone out. No lock: it runs on the goroutine that runs the
+// handler, the loop thread or the dispatch goroutine holding detachMu, as the
+// write hook does.
+func (cs *connState) StreamWriteErr(n int) error {
+	if cs.writeRefused {
+		return conn.ErrWriteRefused
+	}
+	if cs.detachClosed || cs.asyncClosed.Load() {
+		return conn.ErrConnClosed
+	}
+	if cs.pendingBytes+n > maxPendingBytesDetached {
+		cs.writeRefused = true
+		return conn.ErrWriteRefused
+	}
+	return nil
+}
+
+// detachedStreamErr is the write-error query of a detached conn
+// (conn.WriteErrQuery, swapped in by OnDetach with the guarded write hook),
+// whose handler goroutine writes without the loop's lock. What it reports is
+// ended by a close or by the guarded hook finding the write refused, and both
+// store asyncClosed first (closeConn and shutdown before they set detachClosed
+// under mu; the guarded hook under mu, when it finds writeRefused): while it is
+// clear the answer is nil and no lock is taken, so a Write and its Flush do not
+// take detachMu a second and third time (celeris#884 item 45, #885 item 30).
+// Once it is set, writeRefused is read under mu, which the guarded hook holds
+// when it sets it, to tell a refusal from a close. The limit is the write
+// hook's own (maxPendingBytesDetached): a refusal there is what writeRefused
+// records, and the write that took the backlog past it was staged, so n is not
+// asked for.
+type detachedStreamErr struct {
+	cs *connState
+	mu *sync.Mutex
+}
+
+func (d *detachedStreamErr) StreamWriteErr(int) error {
+	cs := d.cs
+	if !cs.asyncClosed.Load() {
+		return nil
+	}
+	d.mu.Lock()
+	refused := cs.writeRefused
+	d.mu.Unlock()
+	if refused {
+		return conn.ErrWriteRefused
+	}
+	return conn.ErrConnClosed
+}
+
 // connState holds per-connection state for the epoll engine.
 // Fields are ordered for cache line optimization (P4): hot fields first.
 type connState struct {
