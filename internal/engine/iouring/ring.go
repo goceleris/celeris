@@ -42,6 +42,10 @@ func MaxWorkersForMemlock() int {
 	return maxByMemlock
 }
 
+// memlockCeiling is the worker ceiling RLIMIT_MEMLOCK imposes (-1: none). A
+// variable so a test can stand in a ceiling without a ring having to fit it.
+var memlockCeiling = MaxWorkersForMemlock
+
 // capWorkersToMemlock returns min(want, RLIMIT_MEMLOCK / minMemlockPerWorker).
 // When the soft limit is unlimited (RLIM_INFINITY), the request is honoured
 // as-is. When the cap forces a reduction, the chosen logger is informed so
@@ -53,7 +57,7 @@ func capWorkersToMemlock(want int, logger *slog.Logger) int {
 	if want <= 1 {
 		return want
 	}
-	maxByMemlock := MaxWorkersForMemlock()
+	maxByMemlock := memlockCeiling()
 	if maxByMemlock == -1 {
 		return want
 	}
