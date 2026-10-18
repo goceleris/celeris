@@ -96,6 +96,40 @@ type Config struct {
 	Engine EngineType
 
 	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
+	//
+	// On Linux the native engines (epoll, io_uring) pin each loop to one CPU
+	// the process is allowed to use. On a host whose allowed CPUs differ in
+	// capacity (arm64 big.LITTLE) the default is at most one loop per CPU that
+	// is not little, min(GOMAXPROCS, non-little CPUs): 8 loops on a 12-CPU host
+	// with 4 little CPUs, which is fewer than GOMAXPROCS. Every one is pinned:
+	// a loop left unpinned drifted onto the little CPUs and a loop pinned to
+	// one stalled its connections. A Workers set above the non-little CPU
+	// count is honoured and never left unpinned: the extra loops wrap
+	// round-robin over the non-little CPUs, each pinned, so the CPUs that get a
+	// second loop (4 of 8 for Workers 12) take about twice the connections of
+	// the others, which get one. On io_uring a count is still capped by
+	// RLIMIT_MEMLOCK. The loops started are Metrics.Workers of
+	// [Server.EngineInfo] (on the adaptive engine, the sum over its two
+	// engines), and the engine logs one line saying how many it started and
+	// why. [Config.MaxConns] is per loop, so the server-wide limit follows the
+	// count. Measured on one big.LITTLE host (arm64, 8 big and 4 little CPUs;
+	// one run, 35 s windows, 3 repetitions per cell): against the previous
+	// behaviour the default served 1.14 times the requests per second at
+	// io_uring with 256 connections (1.79 times at 128 connections, 1.22 at
+	// 512, 2.26 for epoll with 4 KiB POST bodies), and 0.93 times those of the
+	// behaviour before celeris#973 at 256 connections (that one pins all 12
+	// loops, 4 of them on the little CPUs: its tail was clean there, but it
+	// gives up #973's protection against the little-CPU stalls of celeris#945
+	// and #1028). The tail is not cleared: at io_uring with 256 connections
+	// 0.12% to 0.17% of requests took 200 to 230 ms (p999 about 205 ms), a
+	// mode the previous behaviour shows at a lower share (0.03% to 0.09%) and
+	// the behaviour before #973 did not; the cause is not established
+	// (celeris#892). A Workers above the non-little CPU count is wrapped over
+	// the pinned big CPUs and showed a worse tail than the default at io_uring
+	// with 512 connections in one run (0.10% to 0.20% of requests at about
+	// 208 ms and maxima of 2.1 to 2.2 s in two of three cells, against 0.01%
+	// to 0.02% and 0.6 to 1.1 s for the default).
+	// Hosts whose CPUs are alike are unchanged (README, "CPU pinning").
 	Workers int
 
 	// WorkloadHint optionally declares the expected steady-state concurrency.
@@ -278,7 +312,8 @@ type Config struct {
 	SocketRecvBuf int
 	// SocketSendBuf sets SO_SNDBUF for accepted connections (0 = OS default).
 	SocketSendBuf int
-	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
+	// MaxConns is the max simultaneous connections per worker (0 = unlimited);
+	// the server-wide limit is MaxConns times the loops started, see [Config.Workers].
 	MaxConns int
 
 	// MemoryLimitBytes is an OPTIONAL soft heap ceiling applied via
@@ -345,9 +380,9 @@ type Config struct {
 	// thread, until a timed run of it blocks, and returns to inline when the
 	// promotion expires. A thread that cgo code called from an inline handler
 	// creates (pthread_create) inherits the pin the same way. Threads Go
-	// starts itself do not. On a host whose CPUs differ in capacity (arm64 big.LITTLE) the
-	// loops that did not get a big CPU run unpinned and have nothing to pass
-	// on (README, "CPU pinning").
+	// starts itself do not. On a host whose CPUs differ in capacity (arm64
+	// big.LITTLE) the loops pin to the non-little CPUs only (README, "CPU
+	// pinning").
 	//
 	// AsyncHandlers is the SERVER-LEVEL default. Individual routes and
 	// groups can override it per handler with [Route.Async] /
