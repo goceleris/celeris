@@ -31,33 +31,57 @@ updates:
       prefix: "deps"
 
   # ----- CI tools module -----
-  # .github/tools pins the govulncheck that the Vulnerability Check job
-  # runs, and the benchstat that .github/scripts/bench-ab.sh runs, through
-  # its go.sum (celeris#827, celeris#838). Go records every requirement
-  # of a module that only holds `tool` directives as `// indirect`,
-  # golang.org/x/vuln included. Version updates cover direct
+  # .github/tools pins the tools CI runs through its go.sum: govulncheck
+  # (the Vulnerability Check job, celeris#827), benchstat
+  # (.github/scripts/bench-ab.sh, celeris#838), mage and actionlint (the Lint
+  # job, release.yml and release-checklist.yml, celeris#890). Go records
+  # every requirement of a module that only holds `tool` directives as
+  # `// indirect`, golang.org/x/vuln included. Version updates cover direct
   # dependencies only unless `allow` says otherwise, so without the rule
-  # below this entry would never move the pin. The rule names the tool's
+  # below this entry would never move the pins. The rule names each tool's
   # module with `dependency-type: all`. Dependabot then bumps it with
   # `go get`, which raises the other requirements only as far as the new
   # release itself requires. A bare `dependency-type: all` would also
   # bump each of the tool's dependencies past what that release was built
-  # with, and a tool can stop compiling that way. A new `tool` directive
-  # needs its module added to this list. The rule is on this entry alone,
-  # so the modules above keep the direct-only default. golang.org/x/tools,
-  # which apidump imports, is deliberately not listed: it moves when an
-  # x/vuln bump raises it, so apidump and govulncheck build against the same
-  # x/tools.
+  # with, and a tool can stop compiling that way. The rule is on this entry
+  # alone, so the modules above keep the direct-only default.
+  # golang.org/x/tools, which apidump imports, is deliberately not listed: it
+  # moves when an x/vuln bump raises it, so apidump and govulncheck build
+  # against the same x/tools.
+  #
+  # Each `dependency-name` is the MODULE path of a `tool` directive, not the
+  # package path (golang.org/x/vuln, not golang.org/x/vuln/cmd/govulncheck),
+  # and every `tool` needs one: a package path or a missing entry silently
+  # stops Dependabot proposing bumps for that tool, no error anywhere. The
+  # Lint step "Tool pins agree" (.github/scripts/tool-pins-check.sh) fails when
+  # `(cd .github/tools && go list -f '{{.Module.Path}}' tool)` and these
+  # names differ. A new `tool` directive therefore needs its module added to
+  # this list in the same PR.
+  #
+  # What the rule leaves to a person:
+  #   - Scorecard's Vulnerabilities check (osv-scanner, recursive) scans
+  #     .github/tools/go.mod too. A future advisory in a dependency of a tool
+  #     (x/mod, x/sync, x/sys, x/telemetry, x/tools; go-yaml for actionlint)
+  #     lowers the public score, and under the named rule no Dependabot PR
+  #     fixes it. The fix is manual: `GOWORK=off go -C .github/tools get
+  #     <dep>@<fixed>` and commit go.mod and go.sum.
+  #   - golang.org/x/perf has no tagged release and version updates propose
+  #     tagged versions only, so that pin moves by hand
+  #     (.github/tools/go.mod says how).
   - package-ecosystem: gomod
     directory: /.github/tools
     allow:
+      # govulncheck (celeris#827).
       - dependency-name: golang.org/x/vuln
         dependency-type: all
-      # benchstat (celeris#838). golang.org/x/perf has no tagged release and
-      # version updates propose tagged versions only, so this entry opens
-      # nothing until x/perf tags one; .github/tools/go.mod says how to bump
-      # it by hand meanwhile.
+      # benchstat (celeris#838). This entry opens nothing until x/perf tags
+      # a release (see above).
       - dependency-name: golang.org/x/perf
+        dependency-type: all
+      # mage and actionlint (celeris#890).
+      - dependency-name: github.com/magefile/mage
+        dependency-type: all
+      - dependency-name: github.com/rhysd/actionlint
         dependency-type: all
     schedule:
       interval: daily

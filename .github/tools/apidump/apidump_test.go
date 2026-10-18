@@ -118,8 +118,19 @@ func TestCheck(t *testing.T) {
 			file: "api/fix.txt", diff: []string{"-type OneUnexp struct, unexported fields"}},
 		{name: "unexported field added to a struct that has one", src: "fix_unexported.go", old: "\tA int\n\tb int\n", new: "\tA int\n\tb int\n\tc int\n"},
 		{name: "unexported identifier changed", old: "unexported = 7", new: "unexported = 8\n\tunexported2 = 9"},
+		// A struct that stops being comparable (or becomes so) changes no
+		// exported field line: the blank field is the whole change (celeris#890).
+		{name: "struct stops being comparable", src: "fix_comparable.go", old: "\tE any\n", new: "\tE any\n\t_ [0]func()\n",
+			file: "api/fix.txt", diff: []string{"+type Cmp struct, not comparable"}},
+		{name: "struct becomes comparable", src: "fix_comparable.go", old: "_ [0]func()", new: "_ [0]int",
+			file: "api/fix.txt", diff: []string{"-type NotCmpBlank struct, not comparable"}},
 		{name: "function body changed", old: "func (b *Box[T]) Get() T                { return b.Val }", new: "func (b *Box[T]) Get() T { var z T; _ = z; return b.Val }"},
 		{name: "parameter renamed", old: "func Variadic(prefix string,", new: "func Variadic(p string,"},
+		// The package clause is not in the import path, and a rename breaks
+		// importers that use the default name (celeris#890). go list wants one
+		// name per directory, so the _test.go file is renamed with it.
+		{name: "package clause renamed", src: "sub/sub.go", with: []string{"sub/only_test.go"}, old: "package sub\n", new: "package subs\n",
+			file: "api/sub.txt", diff: []string{"-# Package clause: sub.", "+# Package clause: subs."}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
