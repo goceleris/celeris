@@ -51,6 +51,7 @@ from the root or pass `-root`: inside a nested module such as
   | `var Name Type` | a variable |
   | `func Name[$0 C](Params) Results` | a function |
   | `type Name struct`, then `type Name struct, Field Type` | a struct type and each of its exported fields |
+  | `type Name struct, unexported fields` | a struct with a field that another package cannot name: an unexported one, a blank one (`_`) or an embedded type with an unexported name. No unkeyed composite literal of it compiles outside its package, so the first such field added to an all-exported struct, which breaks those literals, shows as an added line |
   | `type Name struct, embedded T` | an embedded field with an exported name |
   | `type Name struct, promoted Field Type` | an exported field reached through an embedded type that has no file of its own |
   | `type Name interface`, then `type Name interface, Method(Params) Results` | an interface and every method of its method set, embedded interfaces expanded. `unexported methods` marks one that cannot be implemented outside its package; `embedded ~int \| ~string` is a type-set element |
@@ -73,8 +74,6 @@ from the root or pass `-root`: inside a nested module such as
   `cmd/api` has the same blind spots, and `gorelease` reports them):
   - an exported struct that stops being comparable, for example because an
     unexported `_ [0]func()` field is added;
-  - the first unexported field added to a struct whose fields were all
-    exported, which breaks unkeyed composite literals;
   - exported fields reordered, which also breaks unkeyed literals (the
     lines are sorted);
   - a package clause renamed without a change of import path (the header

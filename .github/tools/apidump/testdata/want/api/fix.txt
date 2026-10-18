@@ -25,13 +25,30 @@ method (Kind) String() string
 method (Outer) BaseMethod()
 method (Outer) M()
 method (Outer) ValMethod()
+type AllExp struct
+type AllExp struct, A int
+type AllExp struct, B string
 type Base struct
 type Base struct, Own string
 type Base struct, Shared int
+type BlankFld struct
+type BlankFld struct, A int
+type BlankFld struct, unexported fields
 type BoxInt = Box[int]
 type Box[$0 any] struct
 type Box[$0 any] struct, Val $0
+type EmbExp struct
+type EmbExp struct, C int
+type EmbExp struct, embedded AllExp
+type EmbUnexp struct
+type EmbUnexp struct, A int
+type EmbUnexp struct, promoted N int
+type EmbUnexp struct, unexported fields
+type EmptyStruct struct
 type Func func(any, ...string) (bool, error)
+type GenUnexp[$0 any] struct
+type GenUnexp[$0 any] struct, V $0
+type GenUnexp[$0 any] struct, unexported fields
 type HiddenAlias = example.com/fix/internal/hid.Hidden
 type Iface interface
 type Iface interface, Close() error
@@ -41,6 +58,11 @@ type Kind uint8
 type LocalAlias = local
 type Number interface
 type Number interface, embedded ~int | ~int64 | float64
+type OneUnexp struct
+type OneUnexp struct, A int
+type OneUnexp struct, unexported fields
+type OnlyUnexp struct
+type OnlyUnexp struct, unexported fields
 type Outer struct
 type Outer struct, A []string
 type Outer struct, B []string
@@ -52,6 +74,7 @@ type Outer struct, promoted Deeper bool
 type Outer struct, promoted Inner *example.com/fix/internal/hid.More
 type Outer struct, promoted Promoted int
 type Outer struct, promoted X int
+type Outer struct, unexported fields
 type TimeAlias = time.Time
 var Anon struct{A int "json:\"a\""; b string}
 var Arr [4]byte
