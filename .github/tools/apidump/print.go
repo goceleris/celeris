@@ -93,6 +93,12 @@ func (p *printer) typeName(obj *types.TypeName, exposed bool) {
 		switch u := t.Underlying().(type) {
 		case *types.Struct:
 			p.emit(head + " struct")
+			if !structComparable(u) {
+				// Comparable is the default, and a struct that stops being
+				// so breaks every == and map key that uses it: the line
+				// appears in the diff (celeris#890).
+				p.emit(head + " struct, not comparable")
+			}
 			p.fields(head+" struct, ", t, u)
 		case *types.Interface:
 			p.emit(head + " interface")
@@ -455,6 +461,30 @@ func (p *printer) writeInterface(b *strings.Builder, t *types.Interface) {
 		p.write(b, t.EmbeddedType(i))
 	}
 	b.WriteByte('}')
+}
+
+// structComparable reports whether == is defined on values of t when every type
+// parameter is instantiated with a comparable type: a struct, an array or a
+// named type of them is comparable when all its fields or its element are, and
+// a slice, a map or a function never is. Unexported fields count, since they
+// decide it as much as exported ones do. An interface is comparable (as in the
+// spec: the comparison can still panic at run time).
+func structComparable(t types.Type) bool {
+	switch t := t.(type) {
+	case *types.Alias, *types.Named:
+		return structComparable(t.Underlying())
+	case *types.Struct:
+		for i := 0; i < t.NumFields(); i++ {
+			if !structComparable(t.Field(i).Type()) {
+				return false
+			}
+		}
+	case *types.Array:
+		return structComparable(t.Elem())
+	case *types.Slice, *types.Map, *types.Signature:
+		return false
+	}
+	return true
 }
 
 func deref(t types.Type) types.Type {
