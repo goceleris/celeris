@@ -10,4 +10,5 @@ type Config struct, SkipPaths []string
 type Config struct, Timeout time.Duration
 type Config struct, TimeoutErrors []error
 type Config struct, TimeoutFunc func(*github.com/goceleris/celeris.Context) time.Duration
+type Config struct, field order Skip, Timeout, TimeoutFunc, ErrorHandler, SkipPaths, Preemptive, TimeoutErrors
 var ErrServiceUnavailable *github.com/goceleris/celeris.HTTPError

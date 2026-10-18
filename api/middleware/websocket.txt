@@ -88,6 +88,7 @@ type BufferPool interface, Put(*bufio.Writer)
 type CloseError struct
 type CloseError struct, Code int
 type CloseError struct, Text string
+type CloseError struct, field order Code, Text
 type Config struct
 type Config struct, BackpressureHighPct int
 type Config struct, BackpressureLowPct int
@@ -108,12 +109,14 @@ type Config struct, SkipPaths []string
 type Config struct, Subprotocols []string
 type Config struct, WriteBufferPool BufferPool
 type Config struct, WriteBufferSize int
+type Config struct, field order Handler, Skip, SkipPaths, CheckOrigin, Subprotocols, ReadBufferSize, WriteBufferSize, ReadLimit, HandshakeTimeout, WriteBufferPool, EnableCompression, CompressionLevel, CompressionThreshold, IdleTimeout, MaxBackpressureBuffer, BackpressureHighPct, BackpressureLowPct, OnConnect, OnDisconnect
 type Conn struct
 type Handler func(*Conn)
 type Hub struct
 type HubConfig struct
 type HubConfig struct, MaxConcurrency int
 type HubConfig struct, OnSlowConn func(*Conn, error) HubPolicy
+type HubConfig struct, field order OnSlowConn, MaxConcurrency
 type HubPolicy uint8
 type MessageType = Opcode
 type Opcode byte

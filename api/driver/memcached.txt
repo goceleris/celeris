@@ -79,6 +79,7 @@ type CASItem struct, CAS uint64
 type CASItem struct, Flags uint32
 type CASItem struct, Key string
 type CASItem struct, Value []byte
+type CASItem struct, field order Key, Value, Flags, CAS
 type Client struct
 type ClusterClient struct
 type ClusterConfig struct
@@ -92,6 +93,7 @@ type ClusterConfig struct, MaxOpen int
 type ClusterConfig struct, Protocol Protocol
 type ClusterConfig struct, Timeout time.Duration
 type ClusterConfig struct, Weights []uint32
+type ClusterConfig struct, field order Addrs, Weights, Protocol, MaxOpen, Timeout, DialTimeout, Engine, FailureThreshold, HealthProbeInterval, MaxFailoverHops
 type Config struct
 type Config struct, Addr string
 type Config struct, DialTimeout time.Duration
@@ -103,14 +105,17 @@ type Config struct, MaxLifetime time.Duration
 type Config struct, MaxOpen int
 type Config struct, Protocol Protocol
 type Config struct, Timeout time.Duration
+type Config struct, field order Addr, Protocol, MaxOpen, MaxIdlePerWorker, DialTimeout, Timeout, MaxLifetime, MaxIdleTime, HealthCheckInterval, Engine
 type MemcachedError struct
 type MemcachedError struct, Kind string
 type MemcachedError struct, Msg string
 type MemcachedError struct, Status uint16
+type MemcachedError struct, field order Kind, Status, Msg
 type NodeStats struct
 type NodeStats struct, ConsecFails int32
 type NodeStats struct, Failing bool
 type NodeStats struct, LastFailAt time.Time
+type NodeStats struct, field order Failing, ConsecFails, LastFailAt
 type Option func(*Config)
 type PoolStats = github.com/goceleris/celeris/driver/internal/async.PoolStats
 type PoolWorkerStats = github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
@@ -132,6 +137,7 @@ exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, InUse int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, Open int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, PerWorker []github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
+exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, field order Open, Idle, InUse, PerWorker
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct, Idle int
 exposed type github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider interface

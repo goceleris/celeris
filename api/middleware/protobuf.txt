@@ -14,6 +14,7 @@ method (*Helper) Write(int, google.golang.org/protobuf/proto.Message) error
 type Config struct
 type Config struct, MarshalOptions google.golang.org/protobuf/proto.MarshalOptions
 type Config struct, UnmarshalOptions google.golang.org/protobuf/proto.UnmarshalOptions
+type Config struct, field order MarshalOptions, UnmarshalOptions
 type Helper struct
 var ErrInvalidProtoBuf error
 var ErrNilMessage error

@@ -6,3 +6,4 @@ type Config struct
 type Config struct, KeyFunc func(*github.com/goceleris/celeris.Context) string
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
+type Config struct, field order Skip, SkipPaths, KeyFunc

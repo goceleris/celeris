@@ -18,4 +18,5 @@ type Config struct, SuccessHandler func(*github.com/goceleris/celeris.Context)
 type Config struct, Users map[string]string
 type Config struct, Validator func(string, string) bool
 type Config struct, ValidatorWithContext func(*github.com/goceleris/celeris.Context, string, string) bool
+type Config struct, field order Skip, SkipPaths, Validator, ValidatorWithContext, Users, HashedUsers, HashedUsersFunc, Realm, ErrorHandler, SuccessHandler
 var ErrUnauthorized *github.com/goceleris/celeris.HTTPError

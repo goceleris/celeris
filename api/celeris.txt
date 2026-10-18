@@ -220,6 +220,7 @@ type BindError struct, Field string
 type BindError struct, Key string
 type BindError struct, Source string
 type BindError struct, Value string
+type BindError struct, field order Field, Source, Key, Value, Err
 type Config struct
 type Config struct, Addr string
 type Config struct, AsyncHandlers bool
@@ -252,6 +253,7 @@ type Config struct, TrustedProxies []string
 type Config struct, Workers int
 type Config struct, WorkloadHint WorkloadHint
 type Config struct, WriteTimeout time.Duration
+type Config struct, field order Addr, Protocol, Engine, Workers, WorkloadHint, ReadTimeout, ReadHeaderTimeout, WriteTimeout, IdleTimeout, ShutdownTimeout, MaxFormSize, MaxRequestBodySize, MaxConcurrentStreams, MaxFrameSize, InitialWindowSize, MaxHeaderBytes, DisableKeepAlive, DisableDeferAccept, BufferSize, SocketRecvBuf, SocketSendBuf, MaxConns, MemoryLimitBytes, DisableMetrics, AsyncHandlers, OnExpectContinue, OnConnect, OnDisconnect, TrustedProxies, Logger, EnableH2Upgrade
 type Context struct
 type Cookie struct
 type Cookie struct, Domain string
@@ -263,19 +265,23 @@ type Cookie struct, Path string
 type Cookie struct, SameSite SameSite
 type Cookie struct, Secure bool
 type Cookie struct, Value string
+type Cookie struct, field order Name, Value, Path, Domain, MaxAge, Expires, Secure, HTTPOnly, SameSite
 type EngineInfo struct
 type EngineInfo struct, Metrics EngineMetrics
 type EngineInfo struct, Type EngineType
+type EngineInfo struct, field order Type, Metrics
 type EngineMetrics = github.com/goceleris/celeris/observe.EngineMetrics
 type EngineType uint8
 type HTTPError struct
 type HTTPError struct, Code int
 type HTTPError struct, Err error
 type HTTPError struct, Message string
+type HTTPError struct, field order Code, Message, Err
 type HandlerFunc func(*Context) error
 type Param struct
 type Param struct, Key string
 type Param struct, Value string
+type Param struct, field order Key, Value
 type Params []Param
 type Protocol uint8
 type Route struct
@@ -284,6 +290,7 @@ type RouteInfo struct
 type RouteInfo struct, HandlerCount int
 type RouteInfo struct, Method string
 type RouteInfo struct, Path string
+type RouteInfo struct, field order Method, Path, HandlerCount
 type SameSite int
 type Server struct
 type SkipHelper struct

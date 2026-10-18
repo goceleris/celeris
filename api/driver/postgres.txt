@@ -65,6 +65,7 @@ type DSN struct, Params map[string]string
 type DSN struct, Password string
 type DSN struct, Port string
 type DSN struct, User string
+type DSN struct, field order Host, Port, User, Password, Database, Params, Options
 type Driver struct
 type Option func(*options)
 type Options struct
@@ -84,6 +85,7 @@ type PoolConfig struct, MaxIdleTime time.Duration
 type PoolConfig struct, MaxLifetime time.Duration
 type PoolConfig struct, MaxOpen int
 type PoolConfig struct, StatementCacheSize int
+type PoolConfig struct, field order DSN, MaxOpen, MaxIdlePerWorker, MaxLifetime, MaxIdleTime, HealthCheck, StatementCacheSize, Application
 type PoolStats = github.com/goceleris/celeris/driver/internal/async.PoolStats
 type PoolWorkerStats = github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
 type Result struct
@@ -129,6 +131,7 @@ exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, InUse int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, Open int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, PerWorker []github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
+exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, field order Open, Idle, InUse, PerWorker
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct, Idle int
 exposed type github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider interface
@@ -141,6 +144,7 @@ exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGEr
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, Message string
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, Position int
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, Severity string
+exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, field order Severity, Code, Message, Detail, Hint, Position, Extra
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, DecodeBinary func([]byte) (database/sql/driver.Value, error)
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, DecodeText func([]byte) (database/sql/driver.Value, error)
@@ -149,6 +153,7 @@ exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.Type
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, Name string
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, OID uint32
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, ScanType reflect.Type
+exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, field order OID, Name, DecodeText, DecodeBinary, EncodeText, EncodeBinary, ScanType
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, NumWorkers() int
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, WorkerLoop(int) github.com/goceleris/celeris/internal/engine.WorkerLoop

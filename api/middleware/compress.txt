@@ -24,6 +24,7 @@ type Config struct, MinLength int
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, ZstdLevel Level
+type Config struct, field order Skip, SkipPaths, MinLength, Encodings, GzipLevel, BrotliLevel, ZstdLevel, DeflateLevel, ExcludedContentTypes
 type Level int
 type StreamOption func(*streamConfig)
 exposed type streamConfig struct

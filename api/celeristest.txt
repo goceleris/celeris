@@ -24,4 +24,5 @@ type ResponseRecorder struct
 type ResponseRecorder struct, Body []byte
 type ResponseRecorder struct, Headers [][2]string
 type ResponseRecorder struct, StatusCode int
+type ResponseRecorder struct, field order StatusCode, Headers, Body
 exposed type config struct

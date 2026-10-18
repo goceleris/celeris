@@ -24,3 +24,4 @@ type Config struct, XDownloadOptions string
 type Config struct, XFrameOptions string
 type Config struct, XPermittedCrossDomain string
 type Config struct, XSSProtection string
+type Config struct, field order Skip, SkipPaths, XContentTypeOptions, XFrameOptions, XSSProtection, HSTSMaxAge, DisableHSTS, HSTSExcludeSubdomains, HSTSPreload, ContentSecurityPolicy, CSPReportOnly, ReferrerPolicy, PermissionsPolicy, CrossOriginOpenerPolicy, CrossOriginResourcePolicy, CrossOriginEmbedderPolicy, XDNSPrefetchControl, XPermittedCrossDomain, OriginAgentCluster, XDownloadOptions

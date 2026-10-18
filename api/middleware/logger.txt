@@ -39,8 +39,10 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, TimeFormat string
 type Config struct, TimeZone *time.Location
+type Config struct, field order Skip, Output, Level, Fields, Done, SkipPaths, CaptureRequestBody, CaptureResponseBody, MaxCaptureBytes, SensitiveHeaders, TimeZone, TimeFormat, LogHost, LogUserAgent, LogReferer, LogRoute, LogPID, LogQueryParams, LogFormValues, LogCookies, LogBytesIn, LogScheme, DisableColors, LogResponseHeaders, SensitiveFormFields, LogContextKeys
 type FastHandler struct
 type FastHandlerOptions struct
 type FastHandlerOptions struct, Color bool
 type FastHandlerOptions struct, Level log/slog.Level
 type FastHandlerOptions struct, TimeFormat string
+type FastHandlerOptions struct, field order Level, Color, TimeFormat

@@ -13,4 +13,5 @@ type Options struct, CleanupInterval time.Duration
 type Options struct, PhaseHook func(string)
 type Options struct, SkipSchemaInit bool
 type Options struct, TableName string
+type Options struct, field order TableName, CleanupInterval, CleanupContext, SkipSchemaInit, PhaseHook
 type Store struct

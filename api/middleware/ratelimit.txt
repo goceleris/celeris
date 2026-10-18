@@ -22,6 +22,7 @@ type Config struct, SkipPaths []string
 type Config struct, SkipSuccessfulRequests bool
 type Config struct, SlidingWindow bool
 type Config struct, Store Store
+type Config struct, field order Skip, Store, RPS, Burst, Rate, RateFunc, KeyFunc, SkipPaths, Shards, CleanupInterval, CleanupContext, DisableHeaders, SlidingWindow, SkipFailedRequests, SkipSuccessfulRequests, ErrorHandler, MaxDynamicLimiters
 type Store interface
 type Store interface, Allow(string) (bool, int, time.Time, error)
 type StoreUndo interface

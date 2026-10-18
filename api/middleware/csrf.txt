@@ -28,6 +28,7 @@ type Config struct, Storage github.com/goceleris/celeris/middleware/store.KV
 type Config struct, TokenLength int
 type Config struct, TokenLookup string
 type Config struct, TrustedOrigins []string
+type Config struct, field order Skip, SkipPaths, TokenLength, TokenLookup, CookieName, CookiePath, CookieDomain, CookieMaxAge, CookieSecure, CookieHTTPOnly, CookieSameSite, ErrorHandler, SafeMethods, TrustedOrigins, Storage, Expiration, SingleUseToken, KeyGenerator, ContextKey
 type Handler struct
 var ErrForbidden *github.com/goceleris/celeris.HTTPError
 var ErrMissingToken *github.com/goceleris/celeris.HTTPError

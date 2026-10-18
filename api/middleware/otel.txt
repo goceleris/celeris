@@ -18,3 +18,4 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, SpanNameFormatter func(*github.com/goceleris/celeris.Context) string
 type Config struct, TracerProvider go.opentelemetry.io/otel/trace.TracerProvider
+type Config struct, field order Skip, SkipPaths, TracerProvider, MeterProvider, Propagators, SpanNameFormatter, Filter, DisableMetrics, CollectClientIP, CollectUserAgent, CustomAttributes, CustomMetricAttributes, ServerPort, MetricServerAddress
