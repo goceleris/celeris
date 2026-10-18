@@ -24,3 +24,4 @@ type Config struct, XDownloadOptions string
 type Config struct, XFrameOptions string
 type Config struct, XPermittedCrossDomain string
 type Config struct, XSSProtection string
+type Config struct, not comparable

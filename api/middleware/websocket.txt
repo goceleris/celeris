@@ -108,16 +108,21 @@ type Config struct, SkipPaths []string
 type Config struct, Subprotocols []string
 type Config struct, WriteBufferPool BufferPool
 type Config struct, WriteBufferSize int
+type Config struct, not comparable
 type Conn struct
+type Conn struct, not comparable
 type Handler func(*Conn)
 type Hub struct
+type Hub struct, not comparable
 type HubConfig struct
 type HubConfig struct, MaxConcurrency int
 type HubConfig struct, OnSlowConn func(*Conn, error) HubPolicy
+type HubConfig struct, not comparable
 type HubPolicy uint8
 type MessageType = Opcode
 type Opcode byte
 type PreparedMessage struct
+type PreparedMessage struct, not comparable
 var ErrClosed error
 var ErrControlTooLarge error
 var ErrFragmentedControl error

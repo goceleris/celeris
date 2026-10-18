@@ -79,8 +79,10 @@ type CASItem struct, CAS uint64
 type CASItem struct, Flags uint32
 type CASItem struct, Key string
 type CASItem struct, Value []byte
+type CASItem struct, not comparable
 type Client struct
 type ClusterClient struct
+type ClusterClient struct, not comparable
 type ClusterConfig struct
 type ClusterConfig struct, Addrs []string
 type ClusterConfig struct, DialTimeout time.Duration
@@ -92,6 +94,7 @@ type ClusterConfig struct, MaxOpen int
 type ClusterConfig struct, Protocol Protocol
 type ClusterConfig struct, Timeout time.Duration
 type ClusterConfig struct, Weights []uint32
+type ClusterConfig struct, not comparable
 type Config struct
 type Config struct, Addr string
 type Config struct, DialTimeout time.Duration
@@ -132,6 +135,7 @@ exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, InUse int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, Open int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, PerWorker []github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
+exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, not comparable
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct, Idle int
 exposed type github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider interface

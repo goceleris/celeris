@@ -14,6 +14,7 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, StackAll bool
 type Config struct, StackSize int
+type Config struct, not comparable
 var ErrBrokenPipe error
 var ErrPanic error
 var ErrPanicContextCancelled error

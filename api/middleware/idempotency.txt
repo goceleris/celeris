@@ -16,6 +16,7 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, Store KVStore
 type Config struct, TTL time.Duration
+type Config struct, not comparable
 type KVStore interface
 type KVStore interface, Delete(context.Context, string) error
 type KVStore interface, Get(context.Context, string) ([]byte, error)

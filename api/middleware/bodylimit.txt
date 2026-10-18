@@ -9,5 +9,6 @@ type Config struct, Limit string
 type Config struct, MaxBytes int64
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
+type Config struct, not comparable
 var ErrBodyTooLarge *github.com/goceleris/celeris.HTTPError
 var ErrLengthRequired *github.com/goceleris/celeris.HTTPError

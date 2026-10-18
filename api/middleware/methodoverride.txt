@@ -14,3 +14,4 @@ type Config struct, Getter func(*github.com/goceleris/celeris.Context) string
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, TargetMethods []string
+type Config struct, not comparable
