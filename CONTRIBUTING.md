@@ -16,8 +16,10 @@ Thank you for your interest in contributing to celeris!
 - Go 1.27.2+ — the `go` directive in `go.mod` is the single source of truth for the floor, and
   CI pins the same version. Quote it from there rather than restating it here, so the two
   cannot drift apart again.
-- [Mage](https://magefile.org) build tool: `go install github.com/magefile/mage@v1.17.2`, the version CI
-  installs (`.github/workflows/ci.yml`)
+- [Mage](https://magefile.org) build tool, at the version CI runs: `GOWORK=off go install -modfile=.github/tools/go.mod tool`,
+  from the repository root. `.github/tools/go.mod` pins mage, actionlint, govulncheck and benchstat, Dependabot bumps
+  them, and this installs all four. `GOWORK=off` is there because go refuses `-modfile` in workspace mode, which a local
+  `go.work` turns on. `GOWORK=off go tool -modfile=.github/tools/go.mod mage <target>` runs mage without installing it
 - Linux (for io_uring/epoll engine tests) or macOS (std engine only)
 - [golangci-lint](https://golangci-lint.run/) v2.14, the version CI's lint job runs
 - [h2spec](https://github.com/summerwind/h2spec) 2.6.0: `mage tools` installs it and prints the version it
@@ -79,26 +81,29 @@ When adding middleware, use `celeris.SkipHelper` for skip logic (not manual `ski
 
 ### Linux Testing from macOS
 
-The io_uring and epoll engines only compile and run on Linux. Use the Multipass VM targets to test from macOS:
+The io_uring and epoll engines only compile and run on Linux. From macOS, run the tests in a
+Linux container. io_uring needs `seccomp=unconfined`, because Docker's default profile blocks its
+syscalls:
 
 ```bash
-mage testLinux    # Run tests with race detection in a Linux VM
-mage specLinux    # Run h2spec + h1spec in a Linux VM
-mage checkLinux   # Full verification suite in a Linux VM
-mage benchLinux   # Run benchmarks in a Linux VM
+docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined \
+  -v "$PWD":/src -w /src golang:1.27.2 \
+  go test -race ./internal/engine/epoll/... ./internal/engine/iouring/...
 ```
 
-The VM is created automatically on first use (Ubuntu Noble, 4 CPUs, 4 GB RAM). Use `mage vmStop` / `mage vmDelete` to manage it.
+The image tag is the `go` directive of `go.mod` (an older Go refuses the module). `mage lintLinux`
+runs golangci-lint with `GOOS=linux`, which type-checks the Linux-only files without running anything.
 
 ### Benchmarking
 
 ```bash
-mage localBenchmark       # A/B benchmark: main vs current branch (Multipass VM)
-mage localProfile         # Capture pprof profiles for main vs current branch
-mage bench                # Run Go benchmarks (local, any OS)
-mage middlewareBenchmark  # Compare middleware against Fiber/Echo/Chi/stdlib
-mage middlewareProfile    # CPU profile each middleware individually
+mage bench    # Run Go benchmarks (local, any OS)
 ```
+
+To settle whether a change made a benchmark slower, use
+[`.github/scripts/bench-ab.sh`](.github/scripts/bench-ab.sh): an interleaved A/B between two refs with an
+A/A floor, whose header says how to read it. Cross-framework and cluster numbers come from
+[goceleris/probatorium](https://github.com/goceleris/probatorium) (see above).
 
 ### Available Mage Targets
 
@@ -112,7 +117,7 @@ The targets live in `magefiles/` (mage's own layout). Run `mage` from the reposi
 
 - Keep PRs focused on a single change
 - Include tests for new functionality
-- Run `mage check` before submitting (or `mage checkLinux` if touching engine code)
+- Run `mage check` before submitting (and the engine tests in a Linux container, as above, if touching engine code)
 - Follow existing code style (enforced by golangci-lint)
 - If the PR adds, removes or changes an exported identifier, run `mage api` and commit `api/` with it: the required **Lint** CI job fails at its step *api/ matches the exported API* until `api/` matches the exported API, and the diff of `api/` is how reviewers see the API change ([api/README.md](api/README.md))
 - Write clear commit messages following the `type: description` format (e.g., `feat:`, `fix:`, `perf:`, `security:`, `test:`, `chore:`)
