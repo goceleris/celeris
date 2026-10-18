@@ -67,7 +67,9 @@ type Config struct {
 	//
 	// 0 asks for the default (10s); -1 disables it (0 after WithDefaults).
 	ReadHeaderTimeout time.Duration
-	// WriteTimeout is the max duration for writing the response.
+	// WriteTimeout is the max duration for writing the response, and bounds
+	// the wait for a closing connection's unsent bytes (see the public
+	// Config.WriteTimeout).
 	// 0 asks for the default (60s); -1 disables it (0 after WithDefaults).
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.

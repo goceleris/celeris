@@ -918,9 +918,15 @@ func (c *Context) SetCookie(cookie *Cookie) {
 // A 416 carries no Content-Encoding even if the handler set one: its body is
 // empty, not an encoded stream. See RFC 9110 §14 and §13.1.5.
 //
-// The entire file is loaded into memory (capped at 100 MB). Returns
-// [HTTPError] with status 413 if the file exceeds this limit. For large
-// files, consider using StreamWriter instead.
+// The file is capped at 100 MB: [HTTPError] with status 413 if it is larger.
+// The file is sent with sendfile(2), not read into memory, only on epoll, for
+// an HTTP/1.1 response of at least 16 KiB, when the server has no async
+// handlers and no middleware buffers or captures the response (see the
+// Response memory section of [Config]). Every other response reads the whole
+// file into memory, up to the cap: io_uring, std, HTTP/2, an async route, a
+// buffered or captured response, and a response that a pipelined one makes the
+// engine copy into its write buffer. For large files, consider using
+// StreamWriter instead.
 //
 // Security: filePath is opened directly — callers MUST sanitize user-supplied
 // paths (e.g. filepath.Clean + prefix check) to prevent directory traversal.
@@ -1098,9 +1104,10 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 }
 
 // FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
-// type is detected from the file extension. The entire file is loaded into
-// memory (capped at 100 MB). Returns [HTTPError] with status 413 if the file
-// exceeds this limit.
+// type is detected from the file extension. The file is capped at 100 MB:
+// [HTTPError] with status 413 if it is larger. How it is read follows
+// [Context.File]: sendfile(2) only where that applies and for a file backed by
+// an *os.File (such as os.DirFS), otherwise the whole file is read into memory.
 //
 // Security: name is passed directly to fsys.Open — callers MUST sanitize
 // user-supplied paths to prevent directory traversal. For untrusted input,
