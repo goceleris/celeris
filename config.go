@@ -140,8 +140,10 @@ type Config struct {
 	// OnDisconnect runs), whatever the middleware's idle deadline or the last
 	// read of the connection. A peer that reads, however slowly, and a
 	// connection with nothing queued are not closed (there is no minimum
-	// rate); -1 sets no such bound. An h2c stream is not covered yet
-	// (celeris#884 item 79).
+	// rate); -1 sets no such bound. The close comes WriteTimeout after the
+	// peer last took a byte, plus the engine's sweep interval (about 50 ms on
+	// epoll, up to 2 s on io_uring; a WriteTimeout shorter than that can
+	// double). An h2c stream is not covered yet (celeris#884).
 	// On the std engine net/http arms WriteTimeout as one deadline for the
 	// whole response and Detach clears it for that request (ReadTimeout never
 	// cuts a stream there: net/http has stopped it by the time the handler
