@@ -918,9 +918,12 @@ func (c *Context) SetCookie(cookie *Cookie) {
 // A 416 carries no Content-Encoding even if the handler set one: its body is
 // empty, not an encoded stream. See RFC 9110 §14 and §13.1.5.
 //
-// The entire file is loaded into memory (capped at 100 MB). Returns
-// [HTTPError] with status 413 if the file exceeds this limit. For large
-// files, consider using StreamWriter instead.
+// The file is capped at 100 MB: [HTTPError] with status 413 if it is larger.
+// On epoll the file is sent with sendfile(2), not read into memory, unless a
+// response pipelined behind it makes the engine copy it into the connection's
+// write buffer (see the Response memory section of [Config]), which reads it
+// whole. The other engines read the entire file into memory. For large files,
+// consider using StreamWriter instead.
 //
 // Security: filePath is opened directly — callers MUST sanitize user-supplied
 // paths (e.g. filepath.Clean + prefix check) to prevent directory traversal.

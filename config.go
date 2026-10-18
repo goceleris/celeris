@@ -71,6 +71,23 @@ func DeriveMemoryLimit(workers int) int64 {
 }
 
 // Config holds the public server configuration.
+//
+// # Response memory
+//
+// A response is held whole in memory until it is sent, except for a stream
+// after [Context.Detach] (see [Context.StreamWriter]). On the native engines
+// (epoll, io_uring, adaptive) the limits below, not [Config.MaxRequestBodySize],
+// cap what a slow client can make the server hold. An HTTP/2 connection queues
+// up to 64 MiB of unsent response data, past which a write is refused. An
+// HTTP/1.1 request is not served while more than 4 MiB of responses on its
+// connection are unsent, and the connection is closed once they have gone out;
+// the 4 MiB is checked when the next request arrives, not per write, so it does
+// not cut a response short. A detached connection (WebSocket, SSE) may queue
+// 64 MiB, and over HTTP/1.1 a StreamWriter that is not detached is cut at 64 MiB.
+// A [Context.File] response is limited to 100 MB; on epoll it is sent with
+// sendfile(2), but a file that a response pipelined behind it makes the engine
+// copy into the write buffer is read whole, with no cap of its own. The std
+// engine leaves response buffering to net/http.
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080"). A port of 0 asks
 	// for an ephemeral port, as in [net.Listen]: the engine picks it once and
@@ -126,7 +143,8 @@ type Config struct {
 	// connection's first byte or about a second after its SYN, whichever
 	// comes first; std counts from the handshake.
 	ReadHeaderTimeout time.Duration
-	// WriteTimeout is the max duration for writing the response.
+	// WriteTimeout is the max duration for writing the response; what it
+	// bounds differs by engine, as the paragraphs below set out.
 	// Zero uses the default (60s). Set to -1 for no timeout.
 	//
 	// A detached stream (see [Context.Detach]; the SSE middleware detaches)
@@ -180,12 +198,14 @@ type Config struct {
 	// even though nothing is queued for it (a narrow pipelined-handler case).
 	// A response that ends the connection (Connection: close, a refused write)
 	// has a drain of its own on both native engines: the connection is cut
-	// once the client has taken no byte for WriteTimeout (epoll; 5s when it is
-	// 0) or max(5s, WriteTimeout) (io_uring). A byte taken is a flush or send
-	// completion that moved the response, or bytes the client acknowledged
-	// (tcp_info, sampled about every quarter of that bound), so a client that
-	// reads steadily, however slowly, is not cut, and holds the connection
-	// and the unsent response for as long as it does.
+	// once the client has taken no byte for WriteTimeout (epoll) or
+	// max(5s, WriteTimeout) (io_uring), and for 5 s on either when WriteTimeout
+	// is -1. A byte taken is a flush or send completion that moved the
+	// response, or bytes the client acknowledged (tcp_info, sampled about every
+	// quarter of that bound), so a client that reads steadily, however slowly,
+	// is not cut, and holds the connection and the unsent response for as long
+	// as it does. Each byte taken restarts that clock: there is no absolute
+	// limit on such a connection.
 	//
 	// With -1, an HTTP/2 response that has to wait for the client's
 	// flow-control window has no deadline either on epoll, io_uring and
