@@ -268,6 +268,21 @@ type connState struct {
 
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
+	// stallSince is the clock of a truly-detached conn (WS/SSE) that has bytes
+	// queued for its peer (celeris#888 items 36 and 37, celeris#884 item 66):
+	// when the sweep last saw the peer take some of them, in nanoseconds, or
+	// first saw them queued. checkTimeouts closes the conn once it is older
+	// than WriteTimeout (detachedStalled). Restamped by completeSend when a
+	// SEND took bytes and by the sweep when the peer's acknowledged count moved
+	// (closeAcked); 0 when nothing is queued (completeSend, and the sweep that
+	// finds the queue empty, clear it) or the conn is not detached. Not
+	// lastActivity, which is the last read: a stream's client sends one request,
+	// or a WebSocket peer sends pings and reads nothing, and says nothing about
+	// what it takes. Worker-thread-only (the stream's goroutine, which flushes
+	// inline under detachMu, is seen through the acknowledged count); reset on
+	// release. Declared beside lastActivity: completeSend writes both.
+	stallSince int64
+
 	// closeAcked, closeSampled and closeAckedKnown are the sweep's second kind
 	// of evidence that a closing conn's peer is taking its response
 	// (celeris#884 item 52): the peer's acknowledged byte count (tcp_info
@@ -275,7 +290,9 @@ type connState struct {
 	// closeAcked holds a sample. checkTimeouts samples a closing conn at most
 	// every closingDrainBound/4 (noteClosingAcked). The first kind is
 	// completeSend's restamp of lastActivity, the drain's clock, which moves
-	// once per SEND completion. Worker-thread-only; reset on release.
+	// once per SEND completion. The sweep samples a detached conn that has
+	// bytes queued the same way (stallSince, above). Worker-thread-only; reset
+	// on release.
 	closeAcked      uint64
 	closeSampled    int64
 	closeAckedKnown bool
@@ -693,6 +710,7 @@ func releaseConnState(cs *connState) {
 	cs.closeAcked = 0
 	cs.closeSampled = 0
 	cs.closeAckedKnown = false
+	cs.stallSince = 0
 	cs.recvStallSince = 0
 	cs.linkArmedAt = 0
 	cs.lastRecvCQE = 0

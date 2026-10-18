@@ -411,6 +411,78 @@ func (w *Worker) noteClosingAcked(cs *connState, now int64) {
 	}
 }
 
+// detachedStalled is checkTimeouts' look at a truly-detached conn (WS/SSE)
+// that has bytes queued for its peer: whether the peer has taken none of them
+// for WriteTimeout (celeris#888 items 36 and 37, celeris#884 item 66). The
+// middleware owns the stream's lifecycle, so no ReadTimeout, IdleTimeout or
+// absolute WriteTimeout applies to it; but a client that stays connected and
+// reads nothing never fails a write on a native engine (the write only queues),
+// and nothing else ended its stream short of the cap on what the engine holds
+// for it. The close reaches the middleware as any engine close does
+// (OnDetachClose: an SSE stream's context ends and OnDisconnect runs).
+//
+// The clock is cs.stallSince, started at the first sweep that finds bytes
+// queued and restarted by evidence that the peer takes them: a SEND that
+// completed with bytes (completeSend), or the peer's acknowledged byte count
+// (tcp_info bytes_acked) having moved since the last sample, which sees what
+// the stream's own goroutine writes inline as well, and a SEND too large for
+// the socket queue, which completes only as it drains. A sample is due every
+// quarter of the bound, and once more when the bound has passed since the last
+// one was taken before it, as for a closing conn (noteClosingAcked); the first
+// is the baseline, so a peer that took bytes in the first quarter and then none
+// is closed up to a quarter of the bound earlier than WriteTimeout after its
+// last byte (a SEND completion restamps the clock at once). Not for a
+// fixed-file conn, whose cs.fd is a slot of the ring's table: it has no inline
+// writes either, so its SEND completions are all there is to see.
+//
+// WriteTimeout 0 (no timeout, or -1) is no bound: a stream is the middleware's
+// to end, and a server that turned the write timeout off asked for a client to
+// be held for as long as it stays. Worker thread, with detachMu not held.
+func (w *Worker) detachedStalled(cs *connState, now int64) bool {
+	bound := int64(w.cfg.WriteTimeout)
+	if bound <= 0 {
+		return false
+	}
+	if cs.stallSince == 0 {
+		// A new stall. No sample yet: a conn whose queue is there at one
+		// sweep and gone at the next (a hot broadcaster's) would pay a
+		// getsockopt per sweep for an episode that ends before it matters.
+		// The first sample, the baseline, is due a quarter of the bound from
+		// now.
+		cs.stallSince = now
+		cs.closeSampled = now
+		cs.closeAckedKnown = false
+		return false
+	}
+	if !cs.fixedFile && (now-cs.closeSampled >= bound/4 ||
+		(now-cs.stallSince > bound && cs.closeSampled <= cs.stallSince+bound)) {
+		w.sampleDetachedAcked(cs, now)
+	}
+	return now-cs.stallSince > bound
+}
+
+// sampleDetachedAcked takes detachedStalled's sample of the socket: the
+// acknowledged byte count of a conn that moved since the last one restarts the
+// stall clock. The first sample of a stall is its baseline and counts as no
+// progress; a descriptor that is not a TCP socket, or a kernel that does not
+// report the count (before Linux 4.1), yields no evidence, which leaves the
+// SEND completions' rule alone. Worker thread.
+func (w *Worker) sampleDetachedAcked(cs *connState, now int64) {
+	cs.closeSampled = now
+	if cs.fixedFile {
+		return
+	}
+	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	if err != nil {
+		return
+	}
+	known, prev := cs.closeAckedKnown, cs.closeAcked
+	cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+	if known && ti.Bytes_acked > prev {
+		cs.stallSince = now
+	}
+}
+
 // Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
 	id         int
@@ -4627,6 +4699,11 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	// (covers regular SEND and the SEND_ZC NOTIF path, both of which
 	// reach completeSend with the byte count).
 	w.bytesWrittenBatch += uint64(sent)
+	if cs.stallSince != 0 && sent > 0 {
+		// A detached conn whose peer is being watched for a stall
+		// (detachedStalled): the SEND took bytes, so the peer is reading.
+		cs.stallSince = now
+	}
 	if cs.closing && sent > 0 {
 		// The closing drain's clock (closingDrainBound) measures how long
 		// the peer has taken nothing, not how long the drain has run: a
@@ -4679,6 +4756,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 
 	// All data sent — re-arm recv if needed, remove from dirty list.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+		cs.stallSince = 0 // nothing is queued: the next queue starts its own clock
 		if cs.needsRecv && !cs.recvPaused {
 			if w.prepareRecv(cs, cs.buf) {
 				cs.needsRecv = false
@@ -7038,6 +7116,11 @@ type h1DeadlineSnapshot struct {
 	detached bool
 	idleDL   int64
 	hdrDL    int64
+	// writePending: the conn has bytes queued for its peer or a SEND in flight
+	// (connSendPending). Read only when detached (the stall bound,
+	// detachedStalled): the callers that decide on a header deadline do not
+	// pay for it.
+	writePending bool
 }
 
 // snapshotH1Deadlines copies those fields out of cs.h1State under cs.detachMu
@@ -7089,6 +7172,9 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 		snap.detached = h1.Detached.Load()
 		snap.idleDL = h1.IdleDeadlineNs.Load()
 		snap.hdrDL = h1.HeaderDeadlineNs.Load()
+		if snap.detached {
+			snap.writePending = connSendPending(cs)
+		}
 	}
 	return snap, true
 }
@@ -7273,6 +7359,20 @@ func (w *Worker) checkTimeouts() {
 		if h1Detached {
 			if idleDL > 0 && now > idleDL {
 				w.closeConn(fd)
+			} else if snap.writePending {
+				// WriteTimeout is the one engine timeout a detached stream
+				// keeps: "no progress for WriteTimeout" on what is queued for
+				// the peer, whatever the middleware's idle deadline says (a
+				// WebSocket peer that sends pings pushes it out for ever and
+				// reads nothing of what it is sent; celeris#888 items 36 and
+				// 37). closeConn signals the middleware (OnDetachClose) and
+				// defers the descriptor's close behind the queue, as for an
+				// idle-deadline close.
+				if w.detachedStalled(cs, now) {
+					w.closeConn(fd)
+				}
+			} else if cs.stallSince != 0 {
+				cs.stallSince = 0
 			}
 			continue
 		}

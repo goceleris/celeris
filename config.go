@@ -133,10 +133,17 @@ type Config struct {
 	// is not cut at ReadTimeout or WriteTimeout as a whole on any engine, so
 	// an SSE stream stays open for as long as its client keeps reading,
 	// without setting WriteTimeout to -1. The native engines (epoll, io_uring,
-	// adaptive) apply neither timeout to a detached connection. On the std
-	// engine net/http arms WriteTimeout as one deadline for the whole
-	// response and Detach clears it for that request (ReadTimeout never cuts
-	// a stream there: net/http has stopped it by the time the handler runs).
+	// adaptive) apply ReadTimeout and IdleTimeout to a detached connection
+	// not at all, and WriteTimeout as "no progress for WriteTimeout": a
+	// detached connection with bytes queued for its peer, which takes none of
+	// them for WriteTimeout, is closed (the stream's context ends and its
+	// OnDisconnect runs), whatever the middleware's idle deadline or the last
+	// read of the connection. A peer that reads, however slowly, and a
+	// connection with nothing queued are not closed; -1 sets no such bound.
+	// On the std engine net/http arms WriteTimeout as one deadline for the
+	// whole response and Detach clears it for that request (ReadTimeout never
+	// cuts a stream there: net/http has stopped it by the time the handler
+	// runs).
 	//
 	// On std, WriteTimeout then bounds a detached stream's writes one at a
 	// time: a Write or Flush that has not finished within WriteTimeout fails
