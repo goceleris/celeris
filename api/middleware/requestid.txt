@@ -14,4 +14,5 @@ type Config struct, Generator func() string
 type Config struct, Header string
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
+type Config struct, field order Skip, SkipPaths, Generator, Header, DisableTrustProxy, EnableStdContext
 type Config struct, not comparable

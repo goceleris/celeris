@@ -25,6 +25,7 @@ type EncodedResponse struct
 type EncodedResponse struct, Body []byte
 type EncodedResponse struct, Headers [][2]string
 type EncodedResponse struct, Status int
+type EncodedResponse struct, field order Status, Headers, Body
 type EncodedResponse struct, not comparable
 type GetAndDeleter interface
 type GetAndDeleter interface, GetAndDelete(context.Context, string) ([]byte, error)
@@ -34,10 +35,12 @@ type KV interface, Get(context.Context, string) ([]byte, error)
 type KV interface, Set(context.Context, string, []byte, time.Duration) error
 type MemoryKV struct
 type MemoryKV struct, not comparable
+type MemoryKV struct, unexported fields
 type MemoryKVConfig struct
 type MemoryKVConfig struct, CleanupContext context.Context
 type MemoryKVConfig struct, CleanupInterval time.Duration
 type MemoryKVConfig struct, Shards int
+type MemoryKVConfig struct, field order Shards, CleanupInterval, CleanupContext
 type PrefixDeleter interface
 type PrefixDeleter interface, DeletePrefix(context.Context, string) error
 type Scanner interface

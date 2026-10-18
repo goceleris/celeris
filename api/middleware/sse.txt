@@ -37,14 +37,17 @@ method (*Client) WritePreparedEvent(*PreparedEvent) error
 method (*PreparedEvent) Len() int
 type Broker struct
 type Broker struct, not comparable
+type Broker struct, unexported fields
 type BrokerConfig struct
 type BrokerConfig struct, OnSlowSubscriber func(*Client, *PreparedEvent) BrokerPolicy
 type BrokerConfig struct, SlowSubscriberConcurrency int
 type BrokerConfig struct, SubscriberBuffer int
+type BrokerConfig struct, field order SubscriberBuffer, OnSlowSubscriber, SlowSubscriberConcurrency
 type BrokerConfig struct, not comparable
 type BrokerPolicy uint8
 type Client struct
 type Client struct, not comparable
+type Client struct, unexported fields
 type ClientPolicy uint8
 type Config struct
 type Config struct, Handler Handler
@@ -57,12 +60,14 @@ type Config struct, ReplayStore ReplayStore
 type Config struct, RetryInterval int
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
+type Config struct, field order Handler, HeartbeatInterval, RetryInterval, MaxQueueDepth, OnSlowClient, ReplayStore, OnConnect, OnDisconnect, Skip, SkipPaths
 type Config struct, not comparable
 type Event struct
 type Event struct, Data string
 type Event struct, Event string
 type Event struct, ID string
 type Event struct, Retry int
+type Event struct, field order ID, Event, Data, Retry
 type Handler func(*Client)
 type KVReplayStoreConfig struct
 type KVReplayStoreConfig struct, AsyncAppend bool
@@ -72,8 +77,10 @@ type KVReplayStoreConfig struct, KV github.com/goceleris/celeris/middleware/stor
 type KVReplayStoreConfig struct, MaxIndex int
 type KVReplayStoreConfig struct, Prefix string
 type KVReplayStoreConfig struct, TTL time.Duration
+type KVReplayStoreConfig struct, field order KV, Prefix, TTL, MaxIndex, AsyncAppend, AsyncAppendConcurrency, CounterKey
 type PreparedEvent struct
 type PreparedEvent struct, not comparable
+type PreparedEvent struct, unexported fields
 type ReplayStore interface
 type ReplayStore interface, Append(context.Context, Event) (string, error)
 type ReplayStore interface, Since(context.Context, string) ([]Event, error)

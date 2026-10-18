@@ -112,8 +112,22 @@ func TestCheck(t *testing.T) {
 		{name: "exported signature changed",
 			old: "func Variadic(prefix string, rest ...int) (n int, err error)", new: "func Variadic(prefix string, rest ...int64) (n int, err error)",
 			file: "api/fix.txt", diff: []string{"-func Variadic(string, ...int) (int, error)", "+func Variadic(string, ...int64) (int, error)"}},
+		// Exported fields reordered: the field lines are sorted, so only the
+		// order line shows it, and unkeyed literals break (celeris#890).
+		{name: "exported fields reordered", src: "fix_order.go", old: "\tB string\n\tC bool\n", new: "\tC bool\n\tB string\n",
+			file: "api/fix.txt", diff: []string{"-type Ordered struct, field order A, B, C", "+type Ordered struct, field order A, C, B"}},
+		{name: "embedded field moved", src: "fix_order.go", old: "\tBase\n\tZ []byte\n", new: "\tZ []byte\n\tBase\n",
+			file: "api/fix.txt", diff: []string{"-type Grouped struct, field order X, Y, Base, Z", "+type Grouped struct, field order X, Y, Z, Base"}},
+		{name: "fields reordered in a struct with an unexported field", src: "fix_order.go", old: "\tA int\n\tB string\n\tc bool\n", new: "\tB string\n\tA int\n\tc bool\n"},
 		{name: "exported method removed", old: "func (Kind) String() string { return \"\" }", new: "",
 			file: "api/fix.txt", diff: []string{"-method (Kind) String() string"}},
+		// The first unexported field added to an all-exported struct changes
+		// no exported field line, and breaks unkeyed literals (celeris#890).
+		{name: "first unexported field added", src: "fix_unexported.go", old: "\tB string\n}", new: "\tB string\n\tc int\n}",
+			file: "api/fix.txt", diff: []string{"+type AllExp struct, unexported fields"}},
+		{name: "last unexported field removed", src: "fix_unexported.go", old: "\tA int\n\tb int\n", new: "\tA int\n",
+			file: "api/fix.txt", diff: []string{"-type OneUnexp struct, unexported fields"}},
+		{name: "unexported field added to a struct that has one", src: "fix_unexported.go", old: "\tA int\n\tb int\n", new: "\tA int\n\tb int\n\tc int\n"},
 		{name: "unexported identifier changed", old: "unexported = 7", new: "unexported = 8\n\tunexported2 = 9"},
 		// A struct that stops being comparable (or becomes so) changes no
 		// exported field line: the blank field is the whole change (celeris#890).

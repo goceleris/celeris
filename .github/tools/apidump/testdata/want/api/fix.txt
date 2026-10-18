@@ -22,6 +22,7 @@ method (*Outer) InnerMethod()
 method (*Outer) PtrMethod(int) error
 method (Base) BaseMethod()
 method (Box[$0]) Map(func($0) $0) Box[$0]
+method (Grouped) BaseMethod()
 method (HidIface) Read([]byte) (int, error)
 method (HidNested) Read([]byte) (int, error)
 method (HidPtr) Close() error
@@ -30,9 +31,17 @@ method (Kind) String() string
 method (Outer) BaseMethod()
 method (Outer) M()
 method (Outer) ValMethod()
+type AllExp struct
+type AllExp struct, A int
+type AllExp struct, B string
+type AllExp struct, field order A, B
 type Base struct
 type Base struct, Own string
 type Base struct, Shared int
+type Base struct, field order Shared, Own
+type BlankFld struct
+type BlankFld struct, A int
+type BlankFld struct, unexported fields
 type BoxInt = Box[int]
 type Box[$0 any] struct
 type Box[$0 any] struct, Val $0
@@ -42,6 +51,16 @@ type Cmp struct, B string
 type Cmp struct, C *Cmp
 type Cmp struct, D [2]Kind
 type Cmp struct, E any
+type Cmp struct, field order A, B, C, D, E
+type EmbExp struct
+type EmbExp struct, C int
+type EmbExp struct, embedded AllExp
+type EmbExp struct, field order AllExp, C
+type EmbUnexp struct
+type EmbUnexp struct, A int
+type EmbUnexp struct, promoted N int
+type EmbUnexp struct, unexported fields
+type EmptyStruct struct
 type ExpIface struct
 type ExpIface struct, embedded io.Reader
 type ExpStruct struct
@@ -52,14 +71,33 @@ type GenCmp[$0 any] struct, V $0
 type GenNotCmp[$0 any] struct
 type GenNotCmp[$0 any] struct, F func($0)
 type GenNotCmp[$0 any] struct, V $0
+type GenNotCmp[$0 any] struct, field order V, F
 type GenNotCmp[$0 any] struct, not comparable
+type GenOrdered[$0 any, $1 any] struct
+type GenOrdered[$0 any, $1 any] struct, First $0
+type GenOrdered[$0 any, $1 any] struct, Second $1
+type GenOrdered[$0 any, $1 any] struct, field order First, Second
+type GenUnexp[$0 any] struct
+type GenUnexp[$0 any] struct, V $0
+type GenUnexp[$0 any] struct, unexported fields
+type Grouped struct
+type Grouped struct, X int
+type Grouped struct, Y int
+type Grouped struct, Z []byte
+type Grouped struct, embedded Base
+type Grouped struct, field order X, Y, Base, Z
+type Grouped struct, not comparable
 type HidIface struct
 type HidIface struct, N int
+type HidIface struct, unexported fields
 type HidNested struct
+type HidNested struct, unexported fields
 type HidPtr struct
 type HidPtr struct, promoted ReadCloser io.ReadCloser
+type HidPtr struct, unexported fields
 type HidStruct struct
 type HidStruct struct, promoted Time time.Time
+type HidStruct struct, unexported fields
 type HiddenAlias = example.com/fix/internal/hid.Hidden
 type Iface interface
 type Iface interface, Close() error
@@ -73,12 +111,14 @@ type NotCmpArray struct, not comparable
 type NotCmpBlank struct
 type NotCmpBlank struct, A int
 type NotCmpBlank struct, not comparable
+type NotCmpBlank struct, unexported fields
 type NotCmpEmbedded struct
 type NotCmpEmbedded struct, embedded NotCmpUnexported
 type NotCmpEmbedded struct, not comparable
 type NotCmpFunc struct
 type NotCmpFunc struct, A int
 type NotCmpFunc struct, F func()
+type NotCmpFunc struct, field order A, F
 type NotCmpFunc struct, not comparable
 type NotCmpNested struct
 type NotCmpNested struct, N NotCmpFunc
@@ -86,8 +126,19 @@ type NotCmpNested struct, not comparable
 type NotCmpUnexported struct
 type NotCmpUnexported struct, A int
 type NotCmpUnexported struct, not comparable
+type NotCmpUnexported struct, unexported fields
 type Number interface
 type Number interface, embedded ~int | ~int64 | float64
+type OneUnexp struct
+type OneUnexp struct, A int
+type OneUnexp struct, unexported fields
+type OnlyUnexp struct
+type OnlyUnexp struct, unexported fields
+type Ordered struct
+type Ordered struct, A int
+type Ordered struct, B string
+type Ordered struct, C bool
+type Ordered struct, field order A, B, C
 type Outer struct
 type Outer struct, A []string
 type Outer struct, B []string
@@ -100,6 +151,13 @@ type Outer struct, promoted Deeper bool
 type Outer struct, promoted Inner *example.com/fix/internal/hid.More
 type Outer struct, promoted Promoted int
 type Outer struct, promoted X int
+type Outer struct, unexported fields
+type PrivOrdered struct
+type PrivOrdered struct, A int
+type PrivOrdered struct, B string
+type PrivOrdered struct, unexported fields
+type SoloField struct
+type SoloField struct, Only int
 type TimeAlias = time.Time
 var Anon struct{A int "json:\"a\""; b string}
 var Arr [4]byte
@@ -113,6 +171,7 @@ exposed method (local) Visible2()
 exposed type example.com/fix/internal/hid.Hidden struct
 exposed type example.com/fix/internal/hid.Hidden struct, Inner *example.com/fix/internal/hid.More
 exposed type example.com/fix/internal/hid.Hidden struct, X int
+exposed type example.com/fix/internal/hid.Hidden struct, field order X, Inner
 exposed type example.com/fix/internal/hid.More struct
 exposed type example.com/fix/internal/hid.More struct, Y string
 exposed type local struct

@@ -25,6 +25,8 @@ type ResponseRecorder struct
 type ResponseRecorder struct, Body []byte
 type ResponseRecorder struct, Headers [][2]string
 type ResponseRecorder struct, StatusCode int
+type ResponseRecorder struct, field order StatusCode, Headers, Body
 type ResponseRecorder struct, not comparable
 exposed type config struct
 exposed type config struct, not comparable
+exposed type config struct, unexported fields

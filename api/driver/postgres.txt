@@ -55,6 +55,7 @@ method (Result) RowsAffected() (int64, error)
 type Conn = pgConn
 type Connector struct
 type Connector struct, not comparable
+type Connector struct, unexported fields
 type CopyFromSource interface
 type CopyFromSource interface, Err() error
 type CopyFromSource interface, Next() bool
@@ -67,6 +68,7 @@ type DSN struct, Params map[string]string
 type DSN struct, Password string
 type DSN struct, Port string
 type DSN struct, User string
+type DSN struct, field order Host, Port, User, Password, Database, Params, Options
 type DSN struct, not comparable
 type Driver struct
 type Option func(*options)
@@ -76,9 +78,11 @@ type Options struct, AutoCacheStatements bool
 type Options struct, ConnectTimeout time.Duration
 type Options struct, SSLMode string
 type Options struct, StatementCacheSize int
+type Options struct, unexported fields
 type PGError = github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError
 type Pool struct
 type Pool struct, not comparable
+type Pool struct, unexported fields
 type PoolConfig struct
 type PoolConfig struct, Application string
 type PoolConfig struct, DSN string
@@ -88,14 +92,19 @@ type PoolConfig struct, MaxIdleTime time.Duration
 type PoolConfig struct, MaxLifetime time.Duration
 type PoolConfig struct, MaxOpen int
 type PoolConfig struct, StatementCacheSize int
+type PoolConfig struct, field order DSN, MaxOpen, MaxIdlePerWorker, MaxLifetime, MaxIdleTime, HealthCheck, StatementCacheSize, Application
 type PoolStats = github.com/goceleris/celeris/driver/internal/async.PoolStats
 type PoolWorkerStats = github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
 type Result struct
+type Result struct, unexported fields
 type Row struct
+type Row struct, unexported fields
 type Rows struct
 type Rows struct, not comparable
+type Rows struct, unexported fields
 type ServerProvider = github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider
 type Tx struct
+type Tx struct, unexported fields
 type TypeCodec = github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec
 var ErrBadConn error
 var ErrClosed error
@@ -134,6 +143,7 @@ exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, InUse int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, Open int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, PerWorker []github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
+exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, field order Open, Idle, InUse, PerWorker
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, not comparable
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct, Idle int
@@ -147,6 +157,7 @@ exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGEr
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, Message string
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, Position int
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, Severity string
+exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, field order Severity, Code, Message, Detail, Hint, Position, Extra
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError struct, not comparable
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, DecodeBinary func([]byte) (database/sql/driver.Value, error)
@@ -156,6 +167,7 @@ exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.Type
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, Name string
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, OID uint32
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, ScanType reflect.Type
+exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, field order OID, Name, DecodeText, DecodeBinary, EncodeText, EncodeBinary, ScanType
 exposed type github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec struct, not comparable
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, NumWorkers() int
@@ -166,5 +178,7 @@ exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, 
 exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, UnregisterConn(int) error
 exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, Write(int, []byte) error
 exposed type options struct
+exposed type options struct, unexported fields
 exposed type pgConn struct
 exposed type pgConn struct, not comparable
+exposed type pgConn struct, unexported fields

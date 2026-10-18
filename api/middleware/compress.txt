@@ -15,6 +15,7 @@ method (*CompressedStream) Flush() error
 method (*CompressedStream) Write([]byte) (int, error)
 method (*CompressedStream) WriteHeader(int, [][2]string) error
 type CompressedStream struct
+type CompressedStream struct, unexported fields
 type Config struct
 type Config struct, BrotliLevel Level
 type Config struct, DeflateLevel Level
@@ -25,7 +26,9 @@ type Config struct, MinLength int
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, ZstdLevel Level
+type Config struct, field order Skip, SkipPaths, MinLength, Encodings, GzipLevel, BrotliLevel, ZstdLevel, DeflateLevel, ExcludedContentTypes
 type Config struct, not comparable
 type Level int
 type StreamOption func(*streamConfig)
 exposed type streamConfig struct
+exposed type streamConfig struct, unexported fields
