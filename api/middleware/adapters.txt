@@ -11,3 +11,4 @@ func WrapMiddleware(func(net/http.Handler) net/http.Handler) github.com/goceleri
 type Option func(*proxyConfig)
 exposed type proxyConfig struct
 exposed type proxyConfig struct, not comparable
+exposed type proxyConfig struct, unexported fields

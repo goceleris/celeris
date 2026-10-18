@@ -100,6 +100,13 @@ func (p *printer) typeName(obj *types.TypeName, exposed bool) {
 				p.emit(head + " struct, not comparable")
 			}
 			p.fields(head+" struct, ", t, u)
+			if hasUnexportedField(u) {
+				// Another package cannot write a composite literal of such a
+				// struct without field names, so adding the first unexported
+				// field to an all-exported struct breaks unkeyed literals
+				// (celeris#890).
+				p.emit(head + " struct, unexported fields")
+			}
 		case *types.Interface:
 			p.emit(head + " interface")
 			p.interfaceLines(head+" interface, ", u)
@@ -163,6 +170,18 @@ func (p *printer) promoted(head string, outer *types.Named, embedded types.Type,
 			p.promoted(head, outer, f.Type(), seen)
 		}
 	}
+}
+
+// hasUnexportedField reports whether a struct has a field that another
+// package cannot name: an unexported one, a blank one, or an embedded type
+// with an unexported name.
+func hasUnexportedField(st *types.Struct) bool {
+	for i := 0; i < st.NumFields(); i++ {
+		if !st.Field(i).Exported() {
+			return true
+		}
+	}
+	return false
 }
 
 // interfaceLines lists every method of an interface's method set, embedded
