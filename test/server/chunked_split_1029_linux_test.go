@@ -360,9 +360,8 @@ func bodyServerRHT1029(t *testing.T, eng celeris.EngineType, rht time.Duration) 
 // answering with the body length. It starts through startServerConfig761, which
 // retries an io_uring start that fails with ENOMEM: the ring is charged to the
 // runner's 8 MiB RLIMIT_MEMLOCK, which another package's test binary running
-// at the same time may hold (a start that did not retry failed the Unit job
-// of celeris#1077 twice, while middleware/sse held rings for its io_uring
-// cells).
+// at the same time may hold (a start that did not retry failed the Unit steps
+// job of celeris#1077 twice with "io_uring_setup: cannot allocate memory").
 func server1029(t *testing.T, eng celeris.EngineType, cfg celeris.Config) string {
 	t.Helper()
 	cfg.Engine, cfg.Protocol = eng, celeris.Auto
