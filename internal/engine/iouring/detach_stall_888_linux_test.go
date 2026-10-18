@@ -19,7 +19,7 @@ import (
 
 // A truly-detached conn (WS/SSE) whose peer takes none of the bytes queued for
 // it is closed WriteTimeout after the sweep found them queued (celeris#888
-// items 36 and 37, celeris#884 item 66): checkTimeouts skipped a detached conn
+// items 38 and 39, celeris#884 item 69): checkTimeouts skipped a detached conn
 // whatever it had queued, and a write on a native engine only queues, so a
 // client that stayed connected and read nothing held its stream for ever. The
 // clock is "the peer took none of it", not the age of the stream or the last
@@ -96,6 +96,13 @@ func newStall888(t *testing.T, wt time.Duration) *stall888 {
 	s.w.activeConns.Add(1)
 	s.w.maxFD = fd
 	return s
+}
+
+// sweepNow is one timeout sweep that takes the stall look: the look has a rate
+// limit (stallLookDue), which a test that sweeps back to back must not meet.
+func (s *stall888) sweepNow() {
+	s.w.lastStallLook = 0
+	s.w.checkTimeouts()
 }
 
 // sweepUntilClosing sweeps every 10 ms until the conn is closing (closeConn
