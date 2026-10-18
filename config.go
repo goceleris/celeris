@@ -75,19 +75,27 @@ func DeriveMemoryLimit(workers int) int64 {
 // # Response memory
 //
 // A response is held whole in memory until it is sent, except for a stream
-// after [Context.Detach] (see [Context.StreamWriter]). On the native engines
-// (epoll, io_uring, adaptive) the limits below, not [Config.MaxRequestBodySize],
-// cap what a slow client can make the server hold. An HTTP/2 connection queues
-// up to 64 MiB of unsent response data, past which a write is refused. An
-// HTTP/1.1 request is not served while more than 4 MiB of responses on its
-// connection are unsent, and the connection is closed once they have gone out;
-// the 4 MiB is checked when the next request arrives, not per write, so it does
-// not cut a response short. A detached connection (WebSocket, SSE) may queue
-// 64 MiB, and over HTTP/1.1 a StreamWriter that is not detached is cut at 64 MiB.
-// A [Context.File] response is limited to 100 MB; on epoll it is sent with
-// sendfile(2), but a file that a response pipelined behind it makes the engine
-// copy into the write buffer is read whole, with no cap of its own. The std
-// engine leaves response buffering to net/http.
+// after [Context.Detach] (see [Context.StreamWriter]), and a single handler
+// can stage a large one: a [Context.Blob] of any size, a [Context.File] of up
+// to 100 MB. The limits below apply on the native engines (epoll, io_uring,
+// adaptive) to what a slow client can leave unsent across requests and
+// writes, not to one response. An HTTP/2 connection queues up to 64 MiB of
+// unsent response data, past which a write is refused. An HTTP/1.1 request is
+// not served while more than 4 MiB of responses on its connection are unsent,
+// and the connection is closed once they have gone out; the 4 MiB is checked
+// when the next request arrives, not per write, so it does not cut a response
+// short. A detached connection (WebSocket, SSE) may queue 64 MiB, and over
+// HTTP/1.1 a StreamWriter that is not detached is cut at 64 MiB.
+//
+// A [Context.File] response is limited to 100 MB. It is sent with sendfile(2),
+// and not read into memory, only on epoll (not io_uring, std or HTTP/2), for
+// an HTTP/1.1 response of at least 16 KiB, on a server with no async handlers
+// (neither [Config.AsyncHandlers] nor a route marked [Route.Async]), and when
+// no middleware buffers or captures the response ([Context.BufferResponse],
+// [Context.CaptureResponse]). Any other File response is read whole into
+// memory, as is one that a response pipelined behind it makes the engine copy
+// into the write buffer, with no cap of its own. The std engine leaves
+// response buffering to net/http.
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080"). A port of 0 asks
 	// for an ephemeral port, as in [net.Listen]: the engine picks it once and

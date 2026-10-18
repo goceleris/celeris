@@ -259,10 +259,10 @@ func (e *Engine) Listen(ctx context.Context) error {
 // while ctx is live, until its deadline or, for a ctx without one, until it
 // is done, but no longer than the config's WriteTimeout while that is set,
 // and for at least shutdownSendDrainFloor, ending as soon as nothing is left
-// to send, before its conn is closed (see Loop.sendDrainWait). Server.Shutdown calls it before it cancels Listen's
-// context, and a cancel of StartWithContext's context reaches the loops
-// first but the watcher's Shutdown follows at once, within the drain's
-// floor.
+// to send, before its conn is closed (see Loop.sendDrainWait).
+// Server.Shutdown calls it before it cancels Listen's context, and a cancel
+// of StartWithContext's context reaches the loops first but the watcher's
+// Shutdown follows at once, within the drain's floor.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	e.drainBudget.Store(&ctx)
 	return nil

@@ -173,26 +173,56 @@ func TestWriteTimeoutDoc891(t *testing.T) {
 }
 
 // TestResponseMemoryDoc891 pins celeris#891 item 15 on Config's response memory
-// section and on Context.File: the H2 and H1 bounds, the detached and StreamWriter
-// caps, and the epoll sendfile and unstage behaviour.
+// section, Context.File and Context.FileFromFS: the H2 and H1 bounds, the
+// detached and StreamWriter caps, that a single Blob or File response is staged
+// whole, and the conditions under which a File response is sent with sendfile(2)
+// rather than read into memory (epoll, HTTP/1.1, at least 16 KiB, no async
+// handlers, no buffering or capture), with the cases that read the file whole.
 func TestResponseMemoryDoc891(t *testing.T) {
 	cfg := typeDoc(t, "config.go", "Config", "")
 	requireDoc(t, "Config (Response memory)", cfg,
 		[]string{
 			"# Response memory",
+			"a single handler can stage a large one",
+			"a [Context.Blob] of any size",
 			"up to 64 MiB of unsent response data",
 			"more than 4 MiB of responses on its connection are unsent",
 			"A detached connection (WebSocket, SSE) may queue 64 MiB",
 			"A [Context.File] response is limited to 100 MB",
-			"sendfile(2)",
+			"sendfile(2), and not read into memory, only on epoll (not io_uring, std or HTTP/2)",
+			"an HTTP/1.1 response of at least 16 KiB",
+			"neither [Config.AsyncHandlers] nor a route marked [Route.Async]",
+			"[Context.BufferResponse], [Context.CaptureResponse]",
+			"Any other File response is read whole into memory",
 		},
-		[]string{"Response memory section of"})
+		[]string{
+			"Response memory section of",
+			"not [Config.MaxRequestBodySize]",
+			"cap what a slow client can make the server hold",
+			"on epoll it is sent with sendfile(2), but",
+		})
 	file := docText(t, "context_response.go", "Context", "File")
 	requireDoc(t, "Context.File", file,
 		[]string{
 			"capped at 100 MB",
-			"sendfile(2)",
+			"sendfile(2), not read into memory, only on epoll",
+			"at least 16 KiB",
+			"no async handlers",
+			"buffers or captures the response",
 			"Response memory section of [Config]",
+			"io_uring, std, HTTP/2, an async route, a buffered or captured response",
 		},
-		[]string{"The entire file is loaded into memory"})
+		[]string{
+			"The entire file is loaded into memory",
+			"On epoll the file is sent with sendfile(2)",
+		})
+	fromFS := docText(t, "context_response.go", "Context", "FileFromFS")
+	requireDoc(t, "Context.FileFromFS", fromFS,
+		[]string{
+			"capped at 100 MB",
+			"sendfile(2) only where that applies",
+			"an *os.File",
+			"otherwise the whole file is read into memory",
+		},
+		[]string{"sendfile(2) on epoll for a file backed"})
 }
