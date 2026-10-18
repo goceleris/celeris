@@ -36,6 +36,7 @@ type Config struct, SkipPaths []string
 type Config struct, StopContext context.Context
 type Config struct, Thresholds Thresholds
 type Controller struct
+type Controller struct, unexported fields
 type DepthThresholds struct
 type DepthThresholds struct, Backpressure int32
 type DepthThresholds struct, Expand int32

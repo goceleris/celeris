@@ -35,12 +35,14 @@ method (*Client) SendData(string) error
 method (*Client) WritePreparedEvent(*PreparedEvent) error
 method (*PreparedEvent) Len() int
 type Broker struct
+type Broker struct, unexported fields
 type BrokerConfig struct
 type BrokerConfig struct, OnSlowSubscriber func(*Client, *PreparedEvent) BrokerPolicy
 type BrokerConfig struct, SlowSubscriberConcurrency int
 type BrokerConfig struct, SubscriberBuffer int
 type BrokerPolicy uint8
 type Client struct
+type Client struct, unexported fields
 type ClientPolicy uint8
 type Config struct
 type Config struct, Handler Handler
@@ -68,6 +70,7 @@ type KVReplayStoreConfig struct, MaxIndex int
 type KVReplayStoreConfig struct, Prefix string
 type KVReplayStoreConfig struct, TTL time.Duration
 type PreparedEvent struct
+type PreparedEvent struct, unexported fields
 type ReplayStore interface
 type ReplayStore interface, Append(context.Context, Event) (string, error)
 type ReplayStore interface, Since(context.Context, string) ([]Event, error)

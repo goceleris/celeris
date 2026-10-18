@@ -54,5 +54,7 @@ type Config struct, Store github.com/goceleris/celeris/middleware/store.KV
 type Config struct, WriteBehind bool
 type Extractor func(*github.com/goceleris/celeris.Context) string
 type Handler struct
+type Handler struct, unexported fields
 type Session struct
+type Session struct, unexported fields
 var ErrSessionDestroyed error

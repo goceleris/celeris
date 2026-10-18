@@ -15,6 +15,7 @@ type Config struct
 type Config struct, MarshalOptions google.golang.org/protobuf/proto.MarshalOptions
 type Config struct, UnmarshalOptions google.golang.org/protobuf/proto.UnmarshalOptions
 type Helper struct
+type Helper struct, unexported fields
 var ErrInvalidProtoBuf error
 var ErrNilMessage error
 var ErrNotProtoBuf error

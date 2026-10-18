@@ -14,3 +14,4 @@ type Options struct, PhaseHook func(string)
 type Options struct, SkipSchemaInit bool
 type Options struct, TableName string
 type Store struct
+type Store struct, unexported fields

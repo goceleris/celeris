@@ -53,6 +53,7 @@ method (Result) LastInsertId() (int64, error)
 method (Result) RowsAffected() (int64, error)
 type Conn = pgConn
 type Connector struct
+type Connector struct, unexported fields
 type CopyFromSource interface
 type CopyFromSource interface, Err() error
 type CopyFromSource interface, Next() bool
@@ -73,8 +74,10 @@ type Options struct, AutoCacheStatements bool
 type Options struct, ConnectTimeout time.Duration
 type Options struct, SSLMode string
 type Options struct, StatementCacheSize int
+type Options struct, unexported fields
 type PGError = github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError
 type Pool struct
+type Pool struct, unexported fields
 type PoolConfig struct
 type PoolConfig struct, Application string
 type PoolConfig struct, DSN string
@@ -87,10 +90,14 @@ type PoolConfig struct, StatementCacheSize int
 type PoolStats = github.com/goceleris/celeris/driver/internal/async.PoolStats
 type PoolWorkerStats = github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
 type Result struct
+type Result struct, unexported fields
 type Row struct
+type Row struct, unexported fields
 type Rows struct
+type Rows struct, unexported fields
 type ServerProvider = github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider
 type Tx struct
+type Tx struct, unexported fields
 type TypeCodec = github.com/goceleris/celeris/internal/driver/postgres/protocol.TypeCodec
 var ErrBadConn error
 var ErrClosed error
@@ -158,4 +165,6 @@ exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, 
 exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, UnregisterConn(int) error
 exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, Write(int, []byte) error
 exposed type options struct
+exposed type options struct, unexported fields
 exposed type pgConn struct
+exposed type pgConn struct, unexported fields

@@ -29,6 +29,7 @@ type Config struct, TokenLength int
 type Config struct, TokenLookup string
 type Config struct, TrustedOrigins []string
 type Handler struct
+type Handler struct, unexported fields
 var ErrForbidden *github.com/goceleris/celeris.HTTPError
 var ErrMissingToken *github.com/goceleris/celeris.HTTPError
 var ErrOriginMismatch *github.com/goceleris/celeris.HTTPError

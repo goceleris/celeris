@@ -109,8 +109,10 @@ type Config struct, Subprotocols []string
 type Config struct, WriteBufferPool BufferPool
 type Config struct, WriteBufferSize int
 type Conn struct
+type Conn struct, unexported fields
 type Handler func(*Conn)
 type Hub struct
+type Hub struct, unexported fields
 type HubConfig struct
 type HubConfig struct, MaxConcurrency int
 type HubConfig struct, OnSlowConn func(*Conn, error) HubPolicy
@@ -118,6 +120,7 @@ type HubPolicy uint8
 type MessageType = Opcode
 type Opcode byte
 type PreparedMessage struct
+type PreparedMessage struct, unexported fields
 var ErrClosed error
 var ErrControlTooLarge error
 var ErrFragmentedControl error

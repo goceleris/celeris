@@ -9,3 +9,4 @@ method (*Store) Set(context.Context, string, []byte, time.Duration) error
 type Options struct
 type Options struct, KeyPrefix string
 type Store struct
+type Store struct, unexported fields

@@ -25,3 +25,4 @@ type ResponseRecorder struct, Body []byte
 type ResponseRecorder struct, Headers [][2]string
 type ResponseRecorder struct, StatusCode int
 exposed type config struct
+exposed type config struct, unexported fields

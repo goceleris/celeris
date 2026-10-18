@@ -253,6 +253,7 @@ type Config struct, Workers int
 type Config struct, WorkloadHint WorkloadHint
 type Config struct, WriteTimeout time.Duration
 type Context struct
+type Context struct, unexported fields
 type Cookie struct
 type Cookie struct, Domain string
 type Cookie struct, Expires time.Time
@@ -279,15 +280,20 @@ type Param struct, Value string
 type Params []Param
 type Protocol uint8
 type Route struct
+type Route struct, unexported fields
 type RouteGroup struct
+type RouteGroup struct, unexported fields
 type RouteInfo struct
 type RouteInfo struct, HandlerCount int
 type RouteInfo struct, Method string
 type RouteInfo struct, Path string
 type SameSite int
 type Server struct
+type Server struct, unexported fields
 type SkipHelper struct
+type SkipHelper struct, unexported fields
 type StreamWriter struct
+type StreamWriter struct, unexported fields
 type Validator interface
 type Validator interface, Validate(any) error
 type WorkloadHint int

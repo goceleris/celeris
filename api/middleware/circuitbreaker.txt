@@ -11,6 +11,7 @@ method (*Breaker) Reset()
 method (*Breaker) State() State
 method (State) String() string
 type Breaker struct
+type Breaker struct, unexported fields
 type Config struct
 type Config struct, CooldownPeriod time.Duration
 type Config struct, ErrorHandler func(*github.com/goceleris/celeris.Context, error) error

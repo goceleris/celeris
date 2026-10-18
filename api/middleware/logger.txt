@@ -40,6 +40,7 @@ type Config struct, SkipPaths []string
 type Config struct, TimeFormat string
 type Config struct, TimeZone *time.Location
 type FastHandler struct
+type FastHandler struct, unexported fields
 type FastHandlerOptions struct
 type FastHandlerOptions struct, Color bool
 type FastHandlerOptions struct, Level log/slog.Level
