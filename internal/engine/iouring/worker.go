@@ -1798,28 +1798,9 @@ func (w *Worker) run(ctx context.Context) {
 			w.hasBufReturns = false
 		}
 
-		// Drain H2 async write queues FIRST. Handler goroutines enqueue
-		// response frame bytes; draining them before the dirty list ensures
-		// SEND SQEs are queued as early as possible after CQE processing,
-		// reducing pipeline stalls for H2 multiplexed streams.
-		// By index, from the end: a close below swap-removes the conn from
-		// h2Conns, which a range would then skip one entry past.
-		for i := len(w.h2Conns) - 1; i >= 0; i-- {
-			fd := w.h2Conns[i]
-			cs := w.conns[fd]
-			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
-				cs.h2State.DrainWriteQueue(cs.writeFn)
-				if cs.writeRefused {
-					// A frame refused on back-pressure is lost, and the
-					// connection's framing with it: close, sending what
-					// was staged first (celeris#761).
-					w.closeConn(fd)
-					continue
-				}
-				if w.flushSend(cs) {
-					w.markDirty(cs)
-				}
-			}
+		// Drain H2 async write queues FIRST (drainH2Writes).
+		if len(w.h2Conns) != 0 {
+			w.drainH2Writes()
 		}
 
 		// Advance the monotonic iteration counter and release any
@@ -6067,6 +6048,34 @@ func (w *Worker) serveAsync(cs *connState, holds *dispatchHolds) {
 // conns' guarded writeFn tests the same condition.
 func ringSendOutstanding(cs *connState) bool {
 	return cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.bodyBuf) > 0
+}
+
+// drainH2Writes drains the H2 async write queues. Handler goroutines enqueue
+// response frame bytes; draining them before the dirty list ensures SEND SQEs
+// are queued as early as possible after CQE processing, reducing pipeline
+// stalls for H2 multiplexed streams. Extracted from run so the pass can be
+// driven by a test (celeris#889 item 1). Worker thread.
+//
+// By index, from the end: a close below swap-removes the conn from h2Conns,
+// which a range would then skip one entry past.
+func (w *Worker) drainH2Writes() {
+	for i := len(w.h2Conns) - 1; i >= 0; i-- {
+		fd := w.h2Conns[i]
+		cs := w.conns[fd]
+		if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+			cs.h2State.DrainWriteQueue(cs.writeFn)
+			if cs.writeRefused {
+				// A frame refused on back-pressure is lost, and the
+				// connection's framing with it: close, sending what
+				// was staged first (celeris#761).
+				w.closeConn(fd)
+				continue
+			}
+			if w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+		}
+	}
 }
 
 func (w *Worker) makeWriteFn(cs *connState) func([]byte) {

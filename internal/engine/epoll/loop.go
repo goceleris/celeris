@@ -803,62 +803,9 @@ func (l *Loop) run(ctx context.Context) {
 
 		l.flushDirty()
 
-		// Drain H2 async write queues. Handler goroutines enqueue response
-		// frame bytes; we drain them into writeBuf and flush to the wire.
-		// By index, from the end: a close below swap-removes the conn from
-		// h2Conns, which a range would then skip one entry past.
-		for i := len(l.h2Conns) - 1; i >= 0; i-- {
-			fd := l.h2Conns[i]
-			cs := l.conns[fd]
-			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
-				if cs.writeRefused {
-					// A frame was refused earlier and the conn is closing
-					// (closeWhenFlushed): what its handlers go on queueing is
-					// dropped, as io_uring's write hook does on a closing
-					// conn, not appended behind a backlog that has fallen
-					// below the cap, where it would go out after the cut
-					// frames and the drain clock would count it as the peer
-					// taking more. The close is requested once: a second
-					// closeWhenFlushed per frame was an EPOLL_CTL_MOD each
-					// (celeris#885 item 38).
-					cs.h2State.DrainWriteQueue(discardWrite)
-					if cs.closeSince == 0 {
-						l.closeWhenFlushed(cs)
-					}
-					continue
-				}
-				cs.h2State.DrainWriteQueue(cs.writeFn)
-				if cs.writeRefused {
-					// A frame refused on back-pressure is lost, and the
-					// connection's framing with it: close (celeris#761).
-					l.closeWhenFlushed(cs)
-					continue
-				}
-				if cs.writePos < len(cs.writeBuf) {
-					queued := 0
-					if cs.writeSince != 0 {
-						queued = csPendingBytes(cs) // before this flush (celeris#885)
-					}
-					if fErr := l.flushWrites(cs, true); fErr != nil {
-						l.removeDirty(cs)
-						l.closeConn(fd)
-						continue
-					} else if cs.writePos < len(cs.writeBuf) {
-						// Send buffer full: arm EPOLLOUT instead of the dirty
-						// list so we don't busy-poll the backpressured H2 conn.
-						cs.noteWriteProgress(queued, csPendingBytes(cs))
-						l.armEpollOut(cs)
-					} else {
-						cs.endWrite()
-					}
-				}
-				// Resync pendingBytes, as every other flush point does: the
-				// write hook added every frame drained above to it, and left
-				// alone it outgrew what is really queued until the hook
-				// refused frames of a conn that had nothing queued
-				// (celeris#761).
-				cs.pendingBytes = csPendingBytes(cs)
-			}
+		// Drain H2 async write queues (drainH2Writes).
+		if len(l.h2Conns) != 0 {
+			l.drainH2Writes()
 		}
 
 		// The read turns driver conns are owed (celeris#930), after this
@@ -1929,6 +1876,69 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// will notify when new data arrives on this fd.
 		if n < len(recvBuf) {
 			return
+		}
+	}
+}
+
+// drainH2Writes drains the H2 async write queues. Handler goroutines enqueue
+// response frame bytes; the loop drains them into writeBuf and flushes to the
+// wire. Extracted from run so the pass can be driven by a test (celeris#889
+// item 1). Loop thread.
+//
+// By index, from the end: a close below swap-removes the conn from h2Conns,
+// which a range would then skip one entry past.
+func (l *Loop) drainH2Writes() {
+	for i := len(l.h2Conns) - 1; i >= 0; i-- {
+		fd := l.h2Conns[i]
+		cs := l.conns[fd]
+		if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+			if cs.writeRefused {
+				// A frame was refused earlier and the conn is closing
+				// (closeWhenFlushed): what its handlers go on queueing is
+				// dropped, as io_uring's write hook does on a closing
+				// conn, not appended behind a backlog that has fallen
+				// below the cap, where it would go out after the cut
+				// frames and the drain clock would count it as the peer
+				// taking more. The close is requested once: a second
+				// closeWhenFlushed per frame was an EPOLL_CTL_MOD each
+				// (celeris#885 item 38).
+				cs.h2State.DrainWriteQueue(discardWrite)
+				if cs.closeSince == 0 {
+					l.closeWhenFlushed(cs)
+				}
+				continue
+			}
+			cs.h2State.DrainWriteQueue(cs.writeFn)
+			if cs.writeRefused {
+				// A frame refused on back-pressure is lost, and the
+				// connection's framing with it: close (celeris#761).
+				l.closeWhenFlushed(cs)
+				continue
+			}
+			if cs.writePos < len(cs.writeBuf) {
+				queued := 0
+				if cs.writeSince != 0 {
+					queued = csPendingBytes(cs) // before this flush (celeris#885)
+				}
+				if fErr := l.flushWrites(cs, true); fErr != nil {
+					l.removeDirty(cs)
+					l.closeConn(fd)
+					continue
+				} else if cs.writePos < len(cs.writeBuf) {
+					// Send buffer full: arm EPOLLOUT instead of the dirty
+					// list so we don't busy-poll the backpressured H2 conn.
+					cs.noteWriteProgress(queued, csPendingBytes(cs))
+					l.armEpollOut(cs)
+				} else {
+					cs.endWrite()
+				}
+			}
+			// Resync pendingBytes, as every other flush point does: the
+			// write hook added every frame drained above to it, and left
+			// alone it outgrew what is really queued until the hook
+			// refused frames of a conn that had nothing queued
+			// (celeris#761).
+			cs.pendingBytes = csPendingBytes(cs)
 		}
 	}
 }
