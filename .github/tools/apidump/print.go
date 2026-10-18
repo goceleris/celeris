@@ -117,6 +117,12 @@ func (p *printer) typeName(obj *types.TypeName, exposed bool) {
 // the exported fields promoted from embedded types that have no golden file
 // of their own (unexported ones, or ones from internal packages).
 func (p *printer) fields(head string, outer *types.Named, st *types.Struct) {
+	if names := unkeyedOrder(st); names != "" {
+		// Where another package can write an unkeyed composite literal, the
+		// order of the fields is part of the API; the field lines are sorted
+		// and do not show it (celeris#890).
+		p.emit(head + "field order " + names)
+	}
 	for i := 0; i < st.NumFields(); i++ {
 		f := st.Field(i)
 		if f.Embedded() {
@@ -132,6 +138,25 @@ func (p *printer) fields(head string, outer *types.Named, st *types.Struct) {
 			p.emit(head + f.Name() + " " + p.typ(f.Type()))
 		}
 	}
+}
+
+// unkeyedOrder returns the field names of a struct in declaration order,
+// comma separated, when another package can write an unkeyed composite literal
+// of it (every field exported, none blank) and the order matters (two fields
+// or more); otherwise "". An embedded field is named by its type's name.
+func unkeyedOrder(st *types.Struct) string {
+	if st.NumFields() < 2 {
+		return ""
+	}
+	names := make([]string, st.NumFields())
+	for i := range names {
+		f := st.Field(i)
+		if !f.Exported() {
+			return ""
+		}
+		names[i] = f.Name()
+	}
+	return strings.Join(names, ", ")
 }
 
 func (p *printer) promoted(head string, outer *types.Named, embedded types.Type, seen map[types.Type]bool) {

@@ -21,6 +21,7 @@ method (*Outer) InnerMethod()
 method (*Outer) PtrMethod(int) error
 method (Base) BaseMethod()
 method (Box[$0]) Map(func($0) $0) Box[$0]
+method (Grouped) BaseMethod()
 method (Kind) String() string
 method (Outer) BaseMethod()
 method (Outer) M()
@@ -28,10 +29,21 @@ method (Outer) ValMethod()
 type Base struct
 type Base struct, Own string
 type Base struct, Shared int
+type Base struct, field order Shared, Own
 type BoxInt = Box[int]
 type Box[$0 any] struct
 type Box[$0 any] struct, Val $0
 type Func func(any, ...string) (bool, error)
+type GenOrdered[$0 any, $1 any] struct
+type GenOrdered[$0 any, $1 any] struct, First $0
+type GenOrdered[$0 any, $1 any] struct, Second $1
+type GenOrdered[$0 any, $1 any] struct, field order First, Second
+type Grouped struct
+type Grouped struct, X int
+type Grouped struct, Y int
+type Grouped struct, Z []byte
+type Grouped struct, embedded Base
+type Grouped struct, field order X, Y, Base, Z
 type HiddenAlias = example.com/fix/internal/hid.Hidden
 type Iface interface
 type Iface interface, Close() error
@@ -41,6 +53,11 @@ type Kind uint8
 type LocalAlias = local
 type Number interface
 type Number interface, embedded ~int | ~int64 | float64
+type Ordered struct
+type Ordered struct, A int
+type Ordered struct, B string
+type Ordered struct, C bool
+type Ordered struct, field order A, B, C
 type Outer struct
 type Outer struct, A []string
 type Outer struct, B []string
@@ -52,6 +69,11 @@ type Outer struct, promoted Deeper bool
 type Outer struct, promoted Inner *example.com/fix/internal/hid.More
 type Outer struct, promoted Promoted int
 type Outer struct, promoted X int
+type PrivOrdered struct
+type PrivOrdered struct, A int
+type PrivOrdered struct, B string
+type SoloField struct
+type SoloField struct, Only int
 type TimeAlias = time.Time
 var Anon struct{A int "json:\"a\""; b string}
 var Arr [4]byte
@@ -65,6 +87,7 @@ exposed method (local) Visible2()
 exposed type example.com/fix/internal/hid.Hidden struct
 exposed type example.com/fix/internal/hid.Hidden struct, Inner *example.com/fix/internal/hid.More
 exposed type example.com/fix/internal/hid.Hidden struct, X int
+exposed type example.com/fix/internal/hid.Hidden struct, field order X, Inner
 exposed type example.com/fix/internal/hid.More struct
 exposed type example.com/fix/internal/hid.More struct, Y string
 exposed type local struct

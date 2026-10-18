@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"flag"
 	"os"
 	"path/filepath"
@@ -94,15 +95,12 @@ func TestCheck(t *testing.T) {
 	if _, err := writeFiles(root, gen(t, root)); err != nil {
 		t.Fatal(err)
 	}
-	src := filepath.Join(root, "fix.go")
-	orig, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatal(err)
-	}
 	cases := []struct {
 		name     string
-		old, new string // a replacement in fix.go; old "" appends new
-		file     string // the stale file, "" for none
+		src      string   // the file to edit, relative to the fixture root; default fix.go
+		with     []string // other files that get the same edit
+		old, new string   // a replacement in it; old "" appends new
+		file     string   // the stale file, "" for none
 		diff     []string
 	}{
 		{name: "unchanged"},
@@ -110,6 +108,13 @@ func TestCheck(t *testing.T) {
 		{name: "exported signature changed",
 			old: "func Variadic(prefix string, rest ...int) (n int, err error)", new: "func Variadic(prefix string, rest ...int64) (n int, err error)",
 			file: "api/fix.txt", diff: []string{"-func Variadic(string, ...int) (int, error)", "+func Variadic(string, ...int64) (int, error)"}},
+		// Exported fields reordered: the field lines are sorted, so only the
+		// order line shows it, and unkeyed literals break (celeris#890).
+		{name: "exported fields reordered", src: "fix_order.go", old: "\tB string\n\tC bool\n", new: "\tC bool\n\tB string\n",
+			file: "api/fix.txt", diff: []string{"-type Ordered struct, field order A, B, C", "+type Ordered struct, field order A, C, B"}},
+		{name: "embedded field moved", src: "fix_order.go", old: "\tBase\n\tZ []byte\n", new: "\tZ []byte\n\tBase\n",
+			file: "api/fix.txt", diff: []string{"-type Grouped struct, field order X, Y, Base, Z", "+type Grouped struct, field order X, Y, Z, Base"}},
+		{name: "fields reordered in a struct with an unexported field", src: "fix_order.go", old: "\tA int\n\tB string\n\tc bool\n", new: "\tB string\n\tA int\n\tc bool\n"},
 		{name: "exported method removed", old: "func (Kind) String() string { return \"\" }", new: "",
 			file: "api/fix.txt", diff: []string{"-method (Kind) String() string"}},
 		{name: "unexported identifier changed", old: "unexported = 7", new: "unexported = 8\n\tunexported2 = 9"},
@@ -118,24 +123,33 @@ func TestCheck(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			text := string(orig)
-			switch {
-			case c.old != "":
-				if !strings.Contains(text, c.old) {
-					t.Fatalf("fix.go has no %q", c.old)
+			// The edit applies to each of the case's files, and each is
+			// restored afterwards.
+			for _, rel := range append([]string{cmp.Or(c.src, "fix.go")}, c.with...) {
+				src := filepath.Join(root, filepath.FromSlash(rel))
+				orig, err := os.ReadFile(src)
+				if err != nil {
+					t.Fatal(err)
 				}
-				text = strings.Replace(text, c.old, c.new, 1)
-			default:
-				text += c.new
-			}
-			if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			defer func() {
-				if err := os.WriteFile(src, orig, 0o644); err != nil {
-					t.Error(err)
+				text := string(orig)
+				switch {
+				case c.old != "":
+					if !strings.Contains(text, c.old) {
+						t.Fatalf("%s has no %q", rel, c.old)
+					}
+					text = strings.Replace(text, c.old, c.new, 1)
+				default:
+					text += c.new
 				}
-			}()
+				if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.WriteFile(src, orig, 0o644); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
 			stale, err := compare(root, gen(t, root))
 			if err != nil {
 				t.Fatal(err)
