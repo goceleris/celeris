@@ -1101,9 +1101,10 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 }
 
 // FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
-// type is detected from the file extension. The entire file is loaded into
-// memory (capped at 100 MB). Returns [HTTPError] with status 413 if the file
-// exceeds this limit.
+// type is detected from the file extension. The file is capped at 100 MB:
+// [HTTPError] with status 413 if it is larger. How it is read follows
+// [Context.File]: sendfile(2) on epoll for a file backed by an *os.File (such as
+// os.DirFS), otherwise the whole file is read into memory.
 //
 // Security: name is passed directly to fsys.Open — callers MUST sanitize
 // user-supplied paths to prevent directory traversal. For untrusted input,
