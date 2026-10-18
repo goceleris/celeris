@@ -63,6 +63,11 @@ jobs:
         run: go -C .github/tools run ./apidump
       - name: apidump's own tests
         run: go -C .github/tools test -count=1 ./apidump
+      # `mage tools` keeps an h2spec on PATH that says 2.6.0 unless its build
+      # info names another version of h2spec's module (celeris#890). No go
+      # test reaches magefiles, so this runs the real target on stand-ins.
+      - name: mage tools refuses a mis-stamped h2spec
+        run: .github/scripts/mage-tools-test.sh
       # The SKIP tallies of this workflow count `--- SKIP: ` lines with
       # .github/scripts/skip-count.sh, which also fails on a SKIP line that a
       # bare anchored grep would not count (output written without a trailing
