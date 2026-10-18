@@ -114,15 +114,17 @@ const (
 
 // Tools installs external test tools (h2spec 2.6.0) and prints the version
 // it ended with. It fails, rather than settle for another version, when it
-// cannot install 2.6.0 or when PATH finds a different h2spec first.
+// cannot install 2.6.0 or when PATH finds a different h2spec first. An h2spec
+// counts as 2.6.0 when it says so and its build info does not name another
+// version of h2spec's module (see h2specRefused).
 func Tools() error {
 	if path, err := exec.LookPath("h2spec"); err == nil {
-		v := h2specVersionOf(path)
-		if v == h2specVersion {
-			fmt.Printf("h2spec: %s at %s (already installed)\n", v, path)
+		why := h2specRefused(path)
+		if why == "" {
+			fmt.Printf("h2spec: %s at %s (already installed)\n", h2specVersion, path)
 			return nil
 		}
-		fmt.Printf("h2spec: %s reports version %q, not %s; installing %s\n", path, v, h2specVersion, h2specVersion)
+		fmt.Printf("h2spec: %s %s; installing %s\n", path, why, h2specVersion)
 	}
 	fmt.Printf("Installing h2spec %s: go install %s\n", h2specVersion, h2specPkg)
 	ldflags := fmt.Sprintf("-ldflags=-X main.VERSION=%s -X main.COMMIT=%s", h2specVersion, h2specCommit)
@@ -146,14 +148,21 @@ func Tools() error {
 		return fmt.Errorf("h2spec: cannot read the build info of %s: %w", installed, err)
 	}
 	if want := h2specMod + "@" + h2specModVersion; built != want {
-		return fmt.Errorf("h2spec: %s was built from %s, not %s (the v%s commit); its version string is only the -ldflags stamp", installed, built, want, h2specVersion)
+		// Leave nothing behind for the next run to find: the -ldflags stamp
+		// makes this build say 2.6.0, and a later `mage tools` would have
+		// kept it from PATH (celeris#890).
+		removed := "removed it"
+		if err := os.Remove(installed); err != nil {
+			removed = fmt.Sprintf("could not remove it (%v); delete it", err)
+		}
+		return fmt.Errorf("h2spec: %s was built from %s, not %s (the v%s commit); its version string is only the -ldflags stamp (%s)", installed, built, want, h2specVersion, removed)
 	}
 	path, err := exec.LookPath("h2spec")
 	if err != nil {
 		return fmt.Errorf("h2spec %s is at %s, but %s is not on PATH, so TestH2Spec would skip; add it to PATH", h2specVersion, installed, binDir)
 	}
-	if v := h2specVersionOf(path); v != h2specVersion {
-		return fmt.Errorf("h2spec %s is at %s, but PATH finds %s (version %q) first; remove it or put %s first on PATH", h2specVersion, installed, path, v, binDir)
+	if why := h2specRefused(path); why != "" {
+		return fmt.Errorf("h2spec %s is at %s, but PATH finds %s first, which %s; remove it or put %s first on PATH", h2specVersion, installed, path, why, binDir)
 	}
 	if sameFile(path, installed) {
 		fmt.Printf("h2spec: %s at %s (built from %s)\n", h2specVersion, path, built)
@@ -167,6 +176,30 @@ func sameFile(a, b string) bool {
 	fa, errA := os.Stat(a)
 	fb, errB := os.Stat(b)
 	return errA == nil && errB == nil && os.SameFile(fa, fb)
+}
+
+// h2specRefused returns why `mage Tools` does not keep the h2spec at path, or
+// "" when it keeps it. It keeps one that reports h2specVersion and whose build
+// info does not name another version of h2spec's module. `--version` alone is
+// the -ldflags stamp, which says 2.6.0 for any code, so a v2.2.1+incompatible
+// build with the stamp (what a bare @latest installs) would pass it. A binary
+// with no Go build info (a release tarball built by another toolchain, or not
+// by Go) and one built from a checkout, whose version is "(devel)" or empty,
+// have no module version to compare and are kept, as is a build that records
+// h2specModVersion exactly (homebrew's).
+func h2specRefused(path string) string {
+	if v := h2specVersionOf(path); v != h2specVersion {
+		return fmt.Sprintf("reports version %q, not %s", v, h2specVersion)
+	}
+	bi, err := buildinfo.ReadFile(path)
+	if err != nil || bi.Main.Path != h2specMod {
+		return ""
+	}
+	switch bi.Main.Version {
+	case "", "(devel)", h2specModVersion:
+		return ""
+	}
+	return fmt.Sprintf("reports version %s but was built from %s@%s, not %s (the v%s commit)", h2specVersion, h2specMod, bi.Main.Version, h2specModVersion, h2specVersion)
 }
 
 // h2specBuiltFrom returns the main module path@version that a Go-built
