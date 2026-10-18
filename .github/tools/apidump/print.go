@@ -199,7 +199,7 @@ func (p *printer) methods(prefix, recv string, t *types.Named) {
 	for i := 0; i < all.Len(); i++ {
 		sel := all.At(i)
 		m := sel.Obj()
-		if !m.Exported() || !(p.ours(m.Pkg()) || p.viaHiddenInterface(t, sel)) {
+		if !m.Exported() || (!p.ours(m.Pkg()) && !p.viaHiddenInterface(t, sel)) {
 			continue
 		}
 		r := recv
