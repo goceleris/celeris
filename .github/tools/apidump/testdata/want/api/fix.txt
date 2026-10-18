@@ -23,6 +23,10 @@ method (*Outer) PtrMethod(int) error
 method (Base) BaseMethod()
 method (Box[$0]) Map(func($0) $0) Box[$0]
 method (Grouped) BaseMethod()
+method (HidIface) Read([]byte) (int, error)
+method (HidNested) Read([]byte) (int, error)
+method (HidPtr) Close() error
+method (HidPtr) Read([]byte) (int, error)
 method (Kind) String() string
 method (Outer) BaseMethod()
 method (Outer) M()
@@ -57,6 +61,10 @@ type EmbUnexp struct, A int
 type EmbUnexp struct, promoted N int
 type EmbUnexp struct, unexported fields
 type EmptyStruct struct
+type ExpIface struct
+type ExpIface struct, embedded io.Reader
+type ExpStruct struct
+type ExpStruct struct, embedded time.Time
 type Func func(any, ...string) (bool, error)
 type GenCmp[$0 any] struct
 type GenCmp[$0 any] struct, V $0
@@ -79,6 +87,17 @@ type Grouped struct, Z []byte
 type Grouped struct, embedded Base
 type Grouped struct, field order X, Y, Base, Z
 type Grouped struct, not comparable
+type HidIface struct
+type HidIface struct, N int
+type HidIface struct, unexported fields
+type HidNested struct
+type HidNested struct, unexported fields
+type HidPtr struct
+type HidPtr struct, promoted ReadCloser io.ReadCloser
+type HidPtr struct, unexported fields
+type HidStruct struct
+type HidStruct struct, promoted Time time.Time
+type HidStruct struct, unexported fields
 type HiddenAlias = example.com/fix/internal/hid.Hidden
 type Iface interface
 type Iface interface, Close() error

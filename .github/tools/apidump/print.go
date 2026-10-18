@@ -240,13 +240,16 @@ func (p *printer) interfaceLines(head string, it *types.Interface) {
 // promoted from an embedded type of another module or the standard library
 // is left out: the "embedded" line names that type, and its methods are its
 // own module's API (a Go release that adds a method to time.Time must not
-// change these files).
+// change these files). The exception is a method that reaches T through an
+// unexported interface type, which no "embedded" line names (see
+// viaHiddenInterface).
 func (p *printer) methods(prefix, recv string, t *types.Named) {
 	all := types.NewMethodSet(types.NewPointer(t))
 	val := types.NewMethodSet(t)
 	for i := 0; i < all.Len(); i++ {
-		m := all.At(i).Obj()
-		if !m.Exported() || !p.ours(m.Pkg()) {
+		sel := all.At(i)
+		m := sel.Obj()
+		if !m.Exported() || (!p.ours(m.Pkg()) && !p.viaHiddenInterface(t, sel)) {
 			continue
 		}
 		r := recv
@@ -255,6 +258,32 @@ func (p *printer) methods(prefix, recv string, t *types.Named) {
 		}
 		p.emit(prefix + "method (" + r + ") " + m.Name() + p.sig(m.Type().(*types.Signature)))
 	}
+}
+
+// viaHiddenInterface reports whether a method of another module or of the
+// standard library reaches t through an embedded field of an interface type
+// and through a type with no golden file of its own (an unexported one): the
+// "embedded" line of an exported field would name the interface, but nothing
+// names this one, so without a line of its own, replacing io.Reader with
+// io.Writer in `type hidden interface{ io.Reader }` would change nothing in
+// the files. A method set of an interface does not grow (Go's compatibility
+// rules), which is why this one is listed and a method promoted from a
+// foreign struct, such as time.Time's, is not.
+func (p *printer) viaHiddenInterface(t *types.Named, sel *types.Selection) bool {
+	path := sel.Index()
+	var cur types.Type = t
+	hidden := false
+	for _, i := range path[:len(path)-1] {
+		st, ok := deref(cur).Underlying().(*types.Struct)
+		if !ok {
+			return false
+		}
+		f := st.Field(i)
+		hidden = hidden || p.hidden(f.Type())
+		cur = f.Type()
+	}
+	_, isInterface := deref(cur).Underlying().(*types.Interface)
+	return hidden && isInterface && len(path) > 1
 }
 
 // hidden reports whether a type (through pointers and aliases) is a named

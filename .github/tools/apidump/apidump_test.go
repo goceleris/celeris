@@ -105,6 +105,10 @@ func TestCheck(t *testing.T) {
 	}{
 		{name: "unchanged"},
 		{name: "exported func added", new: "\nfunc Added(int) {}\n", file: "api/fix.txt", diff: []string{"+func Added(int)"}},
+		// The methods an unexported interface of another package supplies
+		// are listed: nothing else names them (celeris#890).
+		{name: "unexported embedded interface changed", src: "fix_hiddeniface.go", old: "type hiddenReader interface{ io.Reader }", new: "type hiddenReader interface{ io.Writer }",
+			file: "api/fix.txt", diff: []string{"-method (HidIface) Read([]byte) (int, error)", "+method (HidIface) Write([]byte) (int, error)", "-method (HidNested) Read([]byte) (int, error)", "+method (HidNested) Write([]byte) (int, error)"}},
 		{name: "exported signature changed",
 			old: "func Variadic(prefix string, rest ...int) (n int, err error)", new: "func Variadic(prefix string, rest ...int64) (n int, err error)",
 			file: "api/fix.txt", diff: []string{"-func Variadic(string, ...int) (int, error)", "+func Variadic(string, ...int64) (int, error)"}},
@@ -203,6 +207,33 @@ func TestPlatformLine(t *testing.T) {
 	} {
 		if !strings.Contains(got, l) {
 			t.Errorf("api/fix.txt has no line %q", strings.TrimSuffix(l, "\n"))
+		}
+	}
+}
+
+// TestForeignMethods pins which methods of another module or the standard
+// library are listed: those of an interface reached through an unexported
+// type, and not those of a struct (time.Time's), whether it is embedded
+// directly or through an unexported struct, since a Go release that adds a
+// method to time.Time must change nothing here (celeris#890).
+func TestForeignMethods(t *testing.T) {
+	got := string(gen(t, copyFixture(t))["api/fix.txt"])
+	for _, want := range []string{
+		"method (HidIface) Read([]byte) (int, error)\n",
+		"method (HidNested) Read([]byte) (int, error)\n",
+		"method (HidPtr) Close() error\n",
+		"type ExpIface struct, embedded io.Reader\n",
+		"type ExpStruct struct, embedded time.Time\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("api/fix.txt has no line %q", strings.TrimSuffix(want, "\n"))
+		}
+	}
+	for _, recv := range []string{"(HidStruct)", "(ExpStruct)", "(ExpIface)"} {
+		for _, line := range strings.Split(got, "\n") {
+			if strings.HasPrefix(line, "method "+recv) {
+				t.Errorf("api/fix.txt lists a foreign method of %s: %q", recv, line)
+			}
 		}
 	}
 }
