@@ -21,6 +21,10 @@ method (*Outer) InnerMethod()
 method (*Outer) PtrMethod(int) error
 method (Base) BaseMethod()
 method (Box[$0]) Map(func($0) $0) Box[$0]
+method (HidIface) Read([]byte) (int, error)
+method (HidNested) Read([]byte) (int, error)
+method (HidPtr) Close() error
+method (HidPtr) Read([]byte) (int, error)
 method (Kind) String() string
 method (Outer) BaseMethod()
 method (Outer) M()
@@ -31,7 +35,18 @@ type Base struct, Shared int
 type BoxInt = Box[int]
 type Box[$0 any] struct
 type Box[$0 any] struct, Val $0
+type ExpIface struct
+type ExpIface struct, embedded io.Reader
+type ExpStruct struct
+type ExpStruct struct, embedded time.Time
 type Func func(any, ...string) (bool, error)
+type HidIface struct
+type HidIface struct, N int
+type HidNested struct
+type HidPtr struct
+type HidPtr struct, promoted ReadCloser io.ReadCloser
+type HidStruct struct
+type HidStruct struct, promoted Time time.Time
 type HiddenAlias = example.com/fix/internal/hid.Hidden
 type Iface interface
 type Iface interface, Close() error

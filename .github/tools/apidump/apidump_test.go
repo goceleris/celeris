@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"flag"
 	"os"
 	"path/filepath"
@@ -94,19 +95,20 @@ func TestCheck(t *testing.T) {
 	if _, err := writeFiles(root, gen(t, root)); err != nil {
 		t.Fatal(err)
 	}
-	src := filepath.Join(root, "fix.go")
-	orig, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatal(err)
-	}
 	cases := []struct {
 		name     string
-		old, new string // a replacement in fix.go; old "" appends new
-		file     string // the stale file, "" for none
+		src      string   // the file to edit, relative to the fixture root; default fix.go
+		with     []string // other files that get the same edit
+		old, new string   // a replacement in it; old "" appends new
+		file     string   // the stale file, "" for none
 		diff     []string
 	}{
 		{name: "unchanged"},
 		{name: "exported func added", new: "\nfunc Added(int) {}\n", file: "api/fix.txt", diff: []string{"+func Added(int)"}},
+		// The methods an unexported interface of another package supplies
+		// are listed: nothing else names them (celeris#890).
+		{name: "unexported embedded interface changed", src: "fix_hiddeniface.go", old: "type hiddenReader interface{ io.Reader }", new: "type hiddenReader interface{ io.Writer }",
+			file: "api/fix.txt", diff: []string{"-method (HidIface) Read([]byte) (int, error)", "+method (HidIface) Write([]byte) (int, error)", "-method (HidNested) Read([]byte) (int, error)", "+method (HidNested) Write([]byte) (int, error)"}},
 		{name: "exported signature changed",
 			old: "func Variadic(prefix string, rest ...int) (n int, err error)", new: "func Variadic(prefix string, rest ...int64) (n int, err error)",
 			file: "api/fix.txt", diff: []string{"-func Variadic(string, ...int) (int, error)", "+func Variadic(string, ...int64) (int, error)"}},
@@ -118,24 +120,33 @@ func TestCheck(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			text := string(orig)
-			switch {
-			case c.old != "":
-				if !strings.Contains(text, c.old) {
-					t.Fatalf("fix.go has no %q", c.old)
+			// The edit applies to each of the case's files, and each is
+			// restored afterwards.
+			for _, rel := range append([]string{cmp.Or(c.src, "fix.go")}, c.with...) {
+				src := filepath.Join(root, filepath.FromSlash(rel))
+				orig, err := os.ReadFile(src)
+				if err != nil {
+					t.Fatal(err)
 				}
-				text = strings.Replace(text, c.old, c.new, 1)
-			default:
-				text += c.new
-			}
-			if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			defer func() {
-				if err := os.WriteFile(src, orig, 0o644); err != nil {
-					t.Error(err)
+				text := string(orig)
+				switch {
+				case c.old != "":
+					if !strings.Contains(text, c.old) {
+						t.Fatalf("%s has no %q", rel, c.old)
+					}
+					text = strings.Replace(text, c.old, c.new, 1)
+				default:
+					text += c.new
 				}
-			}()
+				if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.WriteFile(src, orig, 0o644); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
 			stale, err := compare(root, gen(t, root))
 			if err != nil {
 				t.Fatal(err)
@@ -171,6 +182,33 @@ func TestPlatformLine(t *testing.T) {
 	} {
 		if !strings.Contains(got, l) {
 			t.Errorf("api/fix.txt has no line %q", strings.TrimSuffix(l, "\n"))
+		}
+	}
+}
+
+// TestForeignMethods pins which methods of another module or the standard
+// library are listed: those of an interface reached through an unexported
+// type, and not those of a struct (time.Time's), whether it is embedded
+// directly or through an unexported struct, since a Go release that adds a
+// method to time.Time must change nothing here (celeris#890).
+func TestForeignMethods(t *testing.T) {
+	got := string(gen(t, copyFixture(t))["api/fix.txt"])
+	for _, want := range []string{
+		"method (HidIface) Read([]byte) (int, error)\n",
+		"method (HidNested) Read([]byte) (int, error)\n",
+		"method (HidPtr) Close() error\n",
+		"type ExpIface struct, embedded io.Reader\n",
+		"type ExpStruct struct, embedded time.Time\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("api/fix.txt has no line %q", strings.TrimSuffix(want, "\n"))
+		}
+	}
+	for _, recv := range []string{"(HidStruct)", "(ExpStruct)", "(ExpIface)"} {
+		for _, line := range strings.Split(got, "\n") {
+			if strings.HasPrefix(line, "method "+recv) {
+				t.Errorf("api/fix.txt lists a foreign method of %s: %q", recv, line)
+			}
 		}
 	}
 }
