@@ -116,6 +116,7 @@ exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Numer
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.NumericDate struct, embedded time.Time
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Parser struct
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Parser struct, not comparable
+exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Parser struct, unexported fields
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.ParserOption func(*github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Parser)
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.RegisteredClaims struct
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.RegisteredClaims struct, Audience github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Audience
@@ -138,9 +139,14 @@ exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Token
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Token struct, Signature []byte
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Token struct, Valid bool
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Token struct, not comparable
+exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Token struct, unexported fields
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodECDSA struct
+exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodECDSA struct, unexported fields
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodEdDSA struct
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodHMAC struct
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodHMAC struct, not comparable
+exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodHMAC struct, unexported fields
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodRSA struct
+exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodRSA struct, unexported fields
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodRSAPSS struct
+exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.signingMethodRSAPSS struct, unexported fields

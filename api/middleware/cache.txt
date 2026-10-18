@@ -30,6 +30,7 @@ type Config struct, VaryHeaders []string
 type Config struct, not comparable
 type MemoryStore struct
 type MemoryStore struct, not comparable
+type MemoryStore struct, unexported fields
 type MemoryStoreConfig struct
 type MemoryStoreConfig struct, CleanupContext context.Context
 type MemoryStoreConfig struct, CleanupInterval time.Duration

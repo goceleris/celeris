@@ -82,8 +82,10 @@ type CASItem struct, Key string
 type CASItem struct, Value []byte
 type CASItem struct, not comparable
 type Client struct
+type Client struct, unexported fields
 type ClusterClient struct
 type ClusterClient struct, not comparable
+type ClusterClient struct, unexported fields
 type ClusterConfig struct
 type ClusterConfig struct, Addrs []string
 type ClusterConfig struct, DialTimeout time.Duration
