@@ -294,6 +294,7 @@ type ClusterConfig struct, ReadTimeout time.Duration
 type ClusterConfig struct, RouteByLatency bool
 type ClusterConfig struct, Username string
 type ClusterConfig struct, WriteTimeout time.Duration
+type ClusterConfig struct, field order Addrs, Password, Username, PoolSize, MaxIdlePerWorker, DialTimeout, ReadTimeout, WriteTimeout, MaxRedirects, RouteByLatency, ReadOnly, Engine
 type ClusterConfig struct, not comparable
 type ClusterPipeline struct
 type ClusterPipeline struct, not comparable
@@ -318,6 +319,7 @@ type Config struct, Proto int
 type Config struct, ReadTimeout time.Duration
 type Config struct, Username string
 type Config struct, WriteTimeout time.Duration
+type Config struct, field order Addr, Password, Username, DB, DialTimeout, ReadTimeout, WriteTimeout, PoolSize, MaxIdlePerWorker, MaxLifetime, MaxIdleTime, HealthCheckInterval, Proto, ForceRESP2, Engine, OnPush
 type Config struct, not comparable
 type FloatCmd struct
 type FloatCmd struct, unexported fields
@@ -329,6 +331,7 @@ type Message struct, Channel string
 type Message struct, Pattern string
 type Message struct, Payload string
 type Message struct, Shard bool
+type Message struct, field order Channel, Pattern, Payload, Shard
 type Option func(*Config)
 type Pipeline struct
 type Pipeline struct, not comparable
@@ -341,6 +344,7 @@ type PubSub struct, unexported fields
 type RedisError struct
 type RedisError struct, Msg string
 type RedisError struct, Prefix string
+type RedisError struct, field order Prefix, Msg
 type ScanIterator struct
 type ScanIterator struct, not comparable
 type ScanIterator struct, unexported fields
@@ -360,6 +364,7 @@ type SentinelConfig struct, SentinelAddrs []string
 type SentinelConfig struct, SentinelPassword string
 type SentinelConfig struct, Username string
 type SentinelConfig struct, WriteTimeout time.Duration
+type SentinelConfig struct, field order MasterName, SentinelAddrs, Password, SentinelPassword, Username, DB, PoolSize, MaxIdlePerWorker, DialTimeout, ReadTimeout, WriteTimeout, Engine
 type SentinelConfig struct, not comparable
 type ServerProvider = github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider
 type StatusCmd struct
@@ -374,11 +379,13 @@ type Value = github.com/goceleris/celeris/internal/driver/redis/protocol.Value
 type Z struct
 type Z struct, Member any
 type Z struct, Score float64
+type Z struct, field order Score, Member
 type ZRangeBy struct
 type ZRangeBy struct, Count int64
 type ZRangeBy struct, Max string
 type ZRangeBy struct, Min string
 type ZRangeBy struct, Offset int64
+type ZRangeBy struct, field order Min, Max, Offset, Count
 var ErrAsk error
 var ErrClosed error
 var ErrClusterMaxRedirects error
@@ -401,6 +408,7 @@ exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, InUse int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, Open int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, PerWorker []github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
+exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, field order Open, Idle, InUse, PerWorker
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, not comparable
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct, Idle int
@@ -409,6 +417,7 @@ exposed type github.com/goceleris/celeris/driver/internal/eventloop.ServerProvid
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.KV struct
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.KV struct, K github.com/goceleris/celeris/internal/driver/redis/protocol.Value
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.KV struct, V github.com/goceleris/celeris/internal/driver/redis/protocol.Value
+exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.KV struct, field order K, V
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.KV struct, not comparable
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.Type uint8
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.Value struct

@@ -8,6 +8,7 @@ type Config struct, RedirectCode int
 type Config struct, Rules []Rule
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
+type Config struct, field order Skip, SkipPaths, Rules, RedirectCode
 type Config struct, not comparable
 type Rule struct
 type Rule struct, Host string
@@ -15,4 +16,5 @@ type Rule struct, Methods []string
 type Rule struct, Pattern string
 type Rule struct, RedirectCode int
 type Rule struct, Replacement string
+type Rule struct, field order Pattern, Replacement, RedirectCode, Methods, Host
 type Rule struct, not comparable

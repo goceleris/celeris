@@ -17,6 +17,7 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, SuccessHandler func(*github.com/goceleris/celeris.Context)
 type Config struct, Validator func(*github.com/goceleris/celeris.Context, string) (bool, error)
+type Config struct, field order Skip, SkipPaths, KeyLookup, Validator, SuccessHandler, ErrorHandler, Realm, AuthScheme, ChallengeParams, ContinueOnIgnoredError
 type Config struct, not comparable
 var ErrMissingKey *github.com/goceleris/celeris.HTTPError
 var ErrUnauthorized *github.com/goceleris/celeris.HTTPError

@@ -22,6 +22,7 @@ type Config struct, SpecContent []byte
 type Config struct, SpecFile string
 type Config struct, SpecURL string
 type Config struct, UI UIConfig
+type Config struct, field order Skip, SkipPaths, BasePath, SpecContent, SpecURL, SpecFile, Renderer, UI, Options, AssetsPath, CDN
 type Config struct, not comparable
 type OAuth2Config struct
 type OAuth2Config struct, AppName string
@@ -29,6 +30,7 @@ type OAuth2Config struct, ClientID string
 type OAuth2Config struct, DisablePKCE bool
 type OAuth2Config struct, Realm string
 type OAuth2Config struct, Scopes []string
+type OAuth2Config struct, field order ClientID, Realm, AppName, Scopes, DisablePKCE
 type OAuth2Config struct, not comparable
 type UIConfig struct
 type UIConfig struct, DeepLinking bool
@@ -39,4 +41,5 @@ type UIConfig struct, OAuth2RedirectURL string
 type UIConfig struct, PersistAuthorization bool
 type UIConfig struct, Title string
 type UIConfig struct, ValidatorURL string
+type UIConfig struct, field order DocExpansion, DeepLinking, PersistAuthorization, DefaultModelsExpandDepth, OAuth2RedirectURL, ValidatorURL, OAuth2, Title
 type UIRenderer string

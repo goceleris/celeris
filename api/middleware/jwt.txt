@@ -36,6 +36,7 @@ type Config struct, TokenContextKey string
 type Config struct, TokenLookup string
 type Config struct, TokenProcessorFunc func(string) (string, error)
 type Config struct, ValidMethods []string
+type Config struct, field order Skip, SkipPaths, SigningKey, SigningKeys, SigningMethod, ValidMethods, TokenLookup, Claims, ClaimsFactory, KeyFunc, JWKSURL, JWKSURLs, JWKSRefresh, JWKSPreload, JWKSCache, TokenProcessorFunc, TokenContextKey, ClaimsContextKey, ParseOptions, ErrorHandler, SuccessHandler, ContinueOnIgnoredError
 type Config struct, not comparable
 type Header = github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Header
 type Keyfunc = github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Keyfunc
@@ -110,6 +111,7 @@ exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Heade
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Header struct, Alg string
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Header struct, Kid string
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Header struct, Typ string
+exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Header struct, field order Alg, Kid, Typ
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Keyfunc func(*github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Token) (any, error)
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.MapClaims map[string]any
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.NumericDate struct
@@ -126,6 +128,7 @@ exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.Regis
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.RegisteredClaims struct, Issuer string
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.RegisteredClaims struct, NotBefore *github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.NumericDate
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.RegisteredClaims struct, Subject string
+exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.RegisteredClaims struct, field order Issuer, Subject, Audience, ExpiresAt, NotBefore, IssuedAt, ID
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.RegisteredClaims struct, not comparable
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.SigningMethod interface
 exposed type github.com/goceleris/celeris/middleware/jwt/internal/jwtparse.SigningMethod interface, Alg() string
