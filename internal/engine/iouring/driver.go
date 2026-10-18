@@ -273,7 +273,8 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 // which is when the socket closes (celeris#691). Until then the number stays
 // a key of this worker's driver map, so a RegisterConn here of the next
 // socket to get it, as the lowest free number usually is, fails with "fd
-// already registered" until onClose has fired. See [engine.WorkerLoop].
+// already registered" until the conn is finalized, which can come before
+// onClose fires. See [engine.WorkerLoop].
 func (w *Worker) UnregisterConn(fd int) error {
 	w.driverMu.RLock()
 	dc, ok := w.driverConns[fd]
