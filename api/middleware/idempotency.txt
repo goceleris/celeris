@@ -17,6 +17,7 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, Store KVStore
 type Config struct, TTL time.Duration
+type Config struct, field order Store, KeyHeader, TTL, LockTimeout, Methods, OnConflict, MaxKeyLength, BodyHash, MaxBodyBytes, Skip, SkipPaths, CleanupContext
 type Config struct, not comparable
 type KVStore interface
 type KVStore interface, Delete(context.Context, string) error

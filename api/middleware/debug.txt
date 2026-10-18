@@ -12,4 +12,5 @@ type Config struct, Prefix string
 type Config struct, Server *github.com/goceleris/celeris.Server
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
+type Config struct, field order Skip, Prefix, AuthFunc, Server, Collector, SkipPaths, Endpoints, MemStatsTTL
 type Config struct, not comparable

@@ -17,4 +17,5 @@ type Config struct, MirrorRequestHeaders bool
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, UnsafeAllowCredentialsWithWildcard bool
+type Config struct, field order Skip, SkipPaths, AllowOrigins, AllowOriginsFunc, AllowOriginRequestFunc, AllowMethods, AllowHeaders, MirrorRequestHeaders, ExposeHeaders, AllowCredentials, UnsafeAllowCredentialsWithWildcard, AllowPrivateNetwork, MaxAge
 type Config struct, not comparable

@@ -8,4 +8,5 @@ type Config struct, AuthFunc func(*github.com/goceleris/celeris.Context) bool
 type Config struct, Prefix string
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
+type Config struct, field order Skip, SkipPaths, Prefix, AuthFunc
 type Config struct, not comparable

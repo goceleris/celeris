@@ -30,6 +30,7 @@ type Counters struct, PanicCount uint64
 type Counters struct, RatelimitTokenViolations uint64
 type Counters struct, SessionCookieDrops uint64
 type Counters struct, SessionOwnerMismatches uint64
+type Counters struct, field order PanicCount, RatelimitTokenViolations, SessionOwnerMismatches, SessionCookieDrops, JWTLateAdmits, IouringSQECorruptions, IouringSendZCSubmits, IouringSendZCSubmitsDetached, IouringSendZCNotifs, IouringInlineGuardBlockedZC, IouringZCCompletionWithPendingWrite, IouringSendZCFallbacks
 type Endpoint struct // only: (-tags=validation)
 type Endpoint struct, unexported fields // only: (-tags=validation)
 var IouringInlineGuardBlockedZC Counter

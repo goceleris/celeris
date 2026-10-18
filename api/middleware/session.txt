@@ -53,6 +53,7 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, Store github.com/goceleris/celeris/middleware/store.KV
 type Config struct, WriteBehind bool
+type Config struct, field order Skip, SkipPaths, Store, Extractor, CookieName, CookiePath, CookieDomain, CookieMaxAge, CookieSecure, CookieHTTPOnly, CookieSameSite, IdleTimeout, AbsoluteTimeout, KeyGenerator, ErrorHandler, WriteBehind, SaveUnmodified
 type Config struct, not comparable
 type Extractor func(*github.com/goceleris/celeris.Context) string
 type Handler struct
