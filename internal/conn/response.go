@@ -1151,8 +1151,13 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 		buf = append(buf, "connection: close\r\n"...)
 	}
 	buf = append(buf, crlf...)
-	a.write(buf)
 	a.respBuf = buf
+	// Asked with the size of the head, as Write is with its chunk: a head that
+	// would take the response held unsent past the engine's limit is not staged.
+	if err := a.askWriteErr(len(buf)); err != nil {
+		return err
+	}
+	a.write(buf)
 	return a.askWriteErr(0)
 }
 
@@ -1220,7 +1225,14 @@ func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
 	if a.werr != nil {
 		return a.werr
 	}
-	a.write([]byte("0\r\n\r\n"))
+	// The last chunk is asked for like any other write: one that would take
+	// the response past the engine's limit is not staged, so a Close never
+	// stages bytes and reports them refused.
+	last := []byte("0\r\n\r\n")
+	if err := a.askWriteErr(len(last)); err != nil {
+		return err
+	}
+	a.write(last)
 	return a.askWriteErr(0)
 }
 

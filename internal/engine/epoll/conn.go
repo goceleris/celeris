@@ -105,8 +105,9 @@ func (cs *connState) overBacklogH1() bool {
 
 // StreamWriteErr is the write-error query of an HTTP/1 conn that is not
 // detached (conn.WriteErrQuery, installed by conn.H1State.SetWriteErrQuery),
-// asked by a StreamWriter's Write, Flush and Close: with n the size of the
-// chunk the Write is about to stage, and with 0 after the write hook. It is nil
+// asked by a StreamWriter's WriteHeader, Write, Flush and Close: with n the
+// size of the head, chunk or last chunk about to be staged, and with 0 after
+// the write hook. It is nil
 // while the conn can take the response, conn.ErrConnClosed once the engine has
 // torn it down, and conn.ErrWriteRefused once bytes were refused or the
 // response unsent plus n is over maxPendingBytesDetached. The last is the cap

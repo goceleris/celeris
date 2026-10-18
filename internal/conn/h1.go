@@ -415,11 +415,12 @@ type WriteErrQuery interface {
 }
 
 // SetWriteErrQuery installs the engine's write-error query on the response
-// adapter, which Write, Flush and Close of a streaming response consult (the
-// write hook, func([]byte), has no error return: it is also the HTTP/2
-// writer). Write asks it with the size of the chunk before it stages it, and
-// every call asks it again after the hook; the call returns what it reports
-// and the adapter drops the rest of that response's writes. Detach swaps in
+// adapter, which WriteHeader, Write, Flush and Close of a streaming response
+// consult (the write hook, func([]byte), has no error return: it is also the
+// HTTP/2 writer). WriteHeader, Write and Close ask it with the size of what
+// they are about to stage, before they stage it, and every call asks it again
+// after the hook; the call returns what it reports and the adapter drops the
+// rest of that response's writes. Detach swaps in
 // the detached query with the write hook (UpdateWriteFn). nil removes it.
 func (s *H1State) SetWriteErrQuery(q WriteErrQuery) {
 	s.rw.writeErr = q

@@ -1872,8 +1872,8 @@ func (sw *StreamWriter) BytesWritten() int64 {
 // [Context.Detach] those engines only append each Write to the connection's
 // send buffer, which goes out when the handler returns, so every byte
 // written so far stays in memory until then, however often Flush is called.
-// That buffer is bounded at 64 MiB: a Write that would take the response held
-// unsent past it stages nothing of its chunk and returns an error with a count
+// That buffer is bounded at 64 MiB: a Write (or Close) that would take the
+// response held unsent past it stages nothing and returns an error with a count
 // of 0, as does every later Write, Flush and Close of the response. The
 // response is cut, and the connection is closed once the bytes staged before
 // the refused Write have gone out, so the client sees a chunked body that

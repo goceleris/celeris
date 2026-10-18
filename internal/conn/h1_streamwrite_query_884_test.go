@@ -102,3 +102,45 @@ func TestH1StreamWriteQuery884(t *testing.T) {
 		t.Fatalf("a Write on a closed conn was staged")
 	}
 }
+
+// The last chunk is asked for like any other write, so the edge is exact: a
+// response that fits with the last chunk is closed, one that does not stages
+// nothing of it and Close reports the refusal (a Close never stages bytes and
+// reports them refused), and a head that does not fit is not staged.
+func TestH1StreamCloseEdge884(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		staged int // bytes staged before Close, of a limit of 100
+		ok     bool
+	}{{"last chunk fits exactly", 95, true}, {"one byte over", 96, false}, {"far over", 100, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			staged := tc.staged
+			q := &fakeQuery884{staged: &staged, limit: 100}
+			a := &h1ResponseAdapter{write: func(p []byte) { staged += len(p) }, keepAlive: true, writeErr: q}
+			err := a.Close(nil)
+			if tc.ok {
+				if err != nil || staged != 100 {
+					t.Fatalf("Close = %v with %d staged, want nil and 100", err, staged)
+				}
+				if got := q.asked; len(got) != 2 || got[0] != 5 || got[1] != 0 {
+					t.Fatalf("the query was asked %v, want [5 0]: the last chunk's size before staging, then the state", got)
+				}
+				return
+			}
+			if !errors.Is(err, ErrWriteRefused) {
+				t.Fatalf("Close = %v, want ErrWriteRefused", err)
+			}
+			if staged != tc.staged {
+				t.Fatalf("a refused Close staged %d bytes", staged-tc.staged)
+			}
+		})
+	}
+	t.Run("head", func(t *testing.T) {
+		staged := 0
+		q := &fakeQuery884{staged: &staged, limit: 10}
+		a := &h1ResponseAdapter{write: func(p []byte) { staged += len(p) }, keepAlive: true, writeErr: q}
+		if err := a.WriteHeader(nil, 200, nil); !errors.Is(err, ErrWriteRefused) || staged != 0 {
+			t.Fatalf("a head over the limit: %v with %d staged, want ErrWriteRefused and 0", err, staged)
+		}
+	})
+}
