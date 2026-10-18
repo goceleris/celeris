@@ -19,3 +19,4 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, StartChecker Checker
 type Config struct, StartPath string
+type Config struct, not comparable

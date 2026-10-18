@@ -29,6 +29,7 @@ type Config struct, Storage github.com/goceleris/celeris/middleware/store.KV
 type Config struct, TokenLength int
 type Config struct, TokenLookup string
 type Config struct, TrustedOrigins []string
+type Config struct, not comparable
 type Handler struct
 var ErrForbidden *github.com/goceleris/celeris.HTTPError
 var ErrMissingToken *github.com/goceleris/celeris.HTTPError

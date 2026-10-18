@@ -36,7 +36,9 @@ type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, StopContext context.Context
 type Config struct, Thresholds Thresholds
+type Config struct, not comparable
 type Controller struct
+type Controller struct, not comparable
 type DepthThresholds struct
 type DepthThresholds struct, Backpressure int32
 type DepthThresholds struct, Expand int32

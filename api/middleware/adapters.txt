@@ -10,3 +10,4 @@ func WithTransport(net/http.RoundTripper) Option
 func WrapMiddleware(func(net/http.Handler) net/http.Handler) github.com/goceleris/celeris.HandlerFunc
 type Option func(*proxyConfig)
 exposed type proxyConfig struct
+exposed type proxyConfig struct, not comparable
