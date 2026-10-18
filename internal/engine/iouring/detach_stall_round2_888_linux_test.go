@@ -158,7 +158,7 @@ func TestStalledCloseSkipsTheClosingDrain888(t *testing.T) {
 	if _, closing := s.sweepUntilClosing(5*time.Second, nil); !closing {
 		t.Fatal("not closed")
 	}
-	if age := time.Now().UnixNano() - s.cs.lastActivity; age <= int64(s.w.closingDrainBound()) {
+	if age := time.Now().UnixNano() - s.cs.lastActivity; age <= s.w.closingDrainBound() {
 		t.Fatalf("the closing drain's clock is %v old, the bound is %v: the stalled conn would hold its descriptor and queue for another bound",
 			time.Duration(age), s.w.closingDrainBound())
 	}
