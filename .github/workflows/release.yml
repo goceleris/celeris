@@ -56,14 +56,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install mage
-        run: |
-          go install github.com/magefile/mage@v1.17.2
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      # mage is a `tool` of .github/tools (pinned by its go.sum, bumped by
+      # Dependabot), so it needs Go but no install (celeris#890). This job
+      # used to rely on the runner image's Go.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # A release-triggered job does not restore a cache that other runs
+          # can write (zizmor cache-poisoning); building mage takes seconds.
+          cache: false
       - name: mage CheckRelease
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
-        run: mage CheckRelease
+        run: GOWORK=off go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" mage CheckRelease
 
   ci:
     name: CI
