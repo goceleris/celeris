@@ -7116,11 +7116,6 @@ type h1DeadlineSnapshot struct {
 	detached bool
 	idleDL   int64
 	hdrDL    int64
-	// writePending: the conn has bytes queued for its peer or a SEND in flight
-	// (connSendPending). Read only when detached (the stall bound,
-	// detachedStalled): the callers that decide on a header deadline do not
-	// pay for it.
-	writePending bool
 }
 
 // snapshotH1Deadlines copies those fields out of cs.h1State under cs.detachMu
@@ -7172,11 +7167,49 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 		snap.detached = h1.Detached.Load()
 		snap.idleDL = h1.IdleDeadlineNs.Load()
 		snap.hdrDL = h1.HeaderDeadlineNs.Load()
-		if snap.detached {
-			snap.writePending = connSendPending(cs)
-		}
 	}
 	return snap, true
+}
+
+// detachedSendPending is checkTimeouts' look at whether a truly-detached conn
+// has bytes queued for its peer or a SEND in flight (connSendPending), for the
+// stall bound (detachedStalled). The queue is the stream's goroutine's under
+// detachMu (its guarded inline writes), so it is read under the lock, with
+// TryLock as snapshotH1Deadlines has it (celeris#593): known=false means the
+// goroutine is inside a write right now, a conn that is not idle, and the sweep
+// leaves it to the next. A separate look from the snapshot, which the recv and
+// dispatch paths share, so that they and the sweep of the ordinary conns do not
+// pay for a field only a detached conn needs (RULE 74, BenchmarkCheckTimeouts888).
+func detachedSendPending(cs *connState) (pending, known bool) {
+	if mu := cs.detachMu; mu != nil {
+		if !mu.TryLock() {
+			return false, false
+		}
+		defer mu.Unlock()
+	}
+	return connSendPending(cs), true
+}
+
+// sweepDetachedStall is checkTimeouts' stall look at a truly-detached conn
+// whose idle deadline has not expired. WriteTimeout is the one engine timeout a
+// detached stream keeps: "no progress for WriteTimeout" on what is queued for
+// the peer, whatever the middleware's idle deadline says (a WebSocket peer that
+// sends pings pushes it out for ever and reads nothing of what it is sent;
+// celeris#888 items 36 and 37). closeConn signals the middleware
+// (OnDetachClose) and defers the descriptor's close behind the queue, as for an
+// idle-deadline close. Worker thread.
+func (w *Worker) sweepDetachedStall(cs *connState, fd int, now int64) {
+	pending, known := detachedSendPending(cs)
+	switch {
+	case !known:
+		// Inside a write of the stream's goroutine: not idle.
+	case pending:
+		if w.detachedStalled(cs, now) {
+			w.closeConn(fd)
+		}
+	case cs.stallSince != 0:
+		cs.stallSince = 0
+	}
 }
 
 // sweepWatchDue reports whether the loop owes a timeout sweep outside its
@@ -7359,20 +7392,8 @@ func (w *Worker) checkTimeouts() {
 		if h1Detached {
 			if idleDL > 0 && now > idleDL {
 				w.closeConn(fd)
-			} else if snap.writePending {
-				// WriteTimeout is the one engine timeout a detached stream
-				// keeps: "no progress for WriteTimeout" on what is queued for
-				// the peer, whatever the middleware's idle deadline says (a
-				// WebSocket peer that sends pings pushes it out for ever and
-				// reads nothing of what it is sent; celeris#888 items 36 and
-				// 37). closeConn signals the middleware (OnDetachClose) and
-				// defers the descriptor's close behind the queue, as for an
-				// idle-deadline close.
-				if w.detachedStalled(cs, now) {
-					w.closeConn(fd)
-				}
-			} else if cs.stallSince != 0 {
-				cs.stallSince = 0
+			} else {
+				w.sweepDetachedStall(cs, fd, now)
 			}
 			continue
 		}
