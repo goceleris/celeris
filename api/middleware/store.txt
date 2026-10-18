@@ -34,6 +34,7 @@ type KV interface, Get(context.Context, string) ([]byte, error)
 type KV interface, Set(context.Context, string, []byte, time.Duration) error
 type MemoryKV struct
 type MemoryKV struct, not comparable
+type MemoryKV struct, unexported fields
 type MemoryKVConfig struct
 type MemoryKVConfig struct, CleanupContext context.Context
 type MemoryKVConfig struct, CleanupInterval time.Duration

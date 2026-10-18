@@ -12,3 +12,4 @@ type Options struct, KeyPrefix string
 type Options struct, RPS float64
 type Options struct, TTL time.Duration
 type Store struct
+type Store struct, unexported fields

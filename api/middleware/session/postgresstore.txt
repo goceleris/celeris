@@ -17,3 +17,4 @@ type Options struct, TableName string
 type Options struct, not comparable
 type Store struct
 type Store struct, not comparable
+type Store struct, unexported fields
