@@ -16,7 +16,7 @@ import (
 // report. The stream's own goroutine flushes with no lock the loop's clocks are
 // under, so without that count a peer that reads cannot be told from one that
 // does not, and the conn is not closed (no bound, as before celeris#888 items
-// 36 and 37) rather than on no evidence.
+// 38 and 39) rather than on no evidence.
 func TestDetachedStallNeedsAnAckedCount888(t *testing.T) {
 	l := stall888Loop(t, stall888Bound)
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)

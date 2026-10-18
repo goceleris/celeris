@@ -118,7 +118,7 @@ type Config struct {
 	//
 	// One server timeout does apply to a detached connection on the native
 	// engines: WriteTimeout, as "no progress for WriteTimeout" (celeris#888
-	// items 36 and 37). A peer that takes none of the bytes the engine has
+	// items 38 and 39). A peer that takes none of the bytes the engine has
 	// queued for it for WriteTimeout is closed, whatever it sends meanwhile
 	// and whatever this field says. A peer that reads, however slowly, and a
 	// connection with nothing queued are not closed; the server's

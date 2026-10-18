@@ -19,7 +19,7 @@ import (
 )
 
 // A client that stays connected and reads nothing of an SSE stream
-// (celeris#888 items 36 and 37, celeris#884 item 66).
+// (celeris#888 items 38 and 39, celeris#884 item 69).
 //
 // On epoll and io_uring a detached connection was exempt from WriteTimeout
 // (checkTimeouts skipped it), and Client.Send never parks there: the stream's
@@ -312,7 +312,7 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 						t.Errorf("OnDisconnect ran %v after connect, before WriteTimeout %v: the stream was ended by something other than the stall bound", el, wt)
 					}
 				case <-time.After(wt + slack):
-					t.Fatalf("OnDisconnect never ran %v after connect (WriteTimeout %v): a client that reads nothing holds its stream for ever (celeris#888 item 36)",
+					t.Fatalf("OnDisconnect never ran %v after connect (WriteTimeout %v): a client that reads nothing holds its stream for ever (celeris#888 item 38)",
 						wt+slack, wt)
 				}
 			})
