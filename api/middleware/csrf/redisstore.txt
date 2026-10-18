@@ -12,3 +12,4 @@ type Options struct, KeyPrefix string
 type Options struct, OldRedisCompat bool
 type Options struct, field order KeyPrefix, OldRedisCompat
 type Store struct
+type Store struct, unexported fields

@@ -18,3 +18,4 @@ type Options struct, field order TableName, CleanupInterval, CleanupContext, Ski
 type Options struct, not comparable
 type Store struct
 type Store struct, not comparable
+type Store struct, unexported fields

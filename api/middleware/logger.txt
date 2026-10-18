@@ -44,6 +44,7 @@ type Config struct, field order Skip, Output, Level, Fields, Done, SkipPaths, Ca
 type Config struct, not comparable
 type FastHandler struct
 type FastHandler struct, not comparable
+type FastHandler struct, unexported fields
 type FastHandlerOptions struct
 type FastHandlerOptions struct, Color bool
 type FastHandlerOptions struct, Level log/slog.Level

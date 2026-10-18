@@ -12,3 +12,4 @@ type Options struct, RPS float64
 type Options struct, TTL time.Duration
 type Options struct, field order KeyPrefix, RPS, Burst, TTL
 type Store struct
+type Store struct, unexported fields

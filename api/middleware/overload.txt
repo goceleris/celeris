@@ -40,6 +40,7 @@ type Config struct, field order CollectorProvider, Thresholds, DepthThresholds, 
 type Config struct, not comparable
 type Controller struct
 type Controller struct, not comparable
+type Controller struct, unexported fields
 type DepthThresholds struct
 type DepthThresholds struct, Backpressure int32
 type DepthThresholds struct, Expand int32

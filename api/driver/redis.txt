@@ -274,10 +274,13 @@ method (*Tx) Unwatch(context.Context) error
 method (*Tx) Watch(context.Context, ...string) error
 method (*Tx) ZAdd(string, ...Z) *IntCmd
 type BoolCmd struct
+type BoolCmd struct, unexported fields
 type Client struct
 type Client struct, not comparable
+type Client struct, unexported fields
 type ClusterClient struct
 type ClusterClient struct, not comparable
+type ClusterClient struct, unexported fields
 type ClusterConfig struct
 type ClusterConfig struct, Addrs []string
 type ClusterConfig struct, DialTimeout time.Duration
@@ -295,8 +298,10 @@ type ClusterConfig struct, field order Addrs, Password, Username, PoolSize, MaxI
 type ClusterConfig struct, not comparable
 type ClusterPipeline struct
 type ClusterPipeline struct, not comparable
+type ClusterPipeline struct, unexported fields
 type ClusterTx struct
 type ClusterTx struct, not comparable
+type ClusterTx struct, unexported fields
 type Config struct
 type Config struct, Addr string
 type Config struct, DB int
@@ -317,7 +322,9 @@ type Config struct, WriteTimeout time.Duration
 type Config struct, field order Addr, Password, Username, DB, DialTimeout, ReadTimeout, WriteTimeout, PoolSize, MaxIdlePerWorker, MaxLifetime, MaxIdleTime, HealthCheckInterval, Proto, ForceRESP2, Engine, OnPush
 type Config struct, not comparable
 type FloatCmd struct
+type FloatCmd struct, unexported fields
 type IntCmd struct
+type IntCmd struct, unexported fields
 type KV = github.com/goceleris/celeris/internal/driver/redis/protocol.KV
 type Message struct
 type Message struct, Channel string
@@ -328,18 +335,22 @@ type Message struct, field order Channel, Pattern, Payload, Shard
 type Option func(*Config)
 type Pipeline struct
 type Pipeline struct, not comparable
+type Pipeline struct, unexported fields
 type PoolStats = github.com/goceleris/celeris/driver/internal/async.PoolStats
 type PoolWorkerStats = github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
 type PubSub struct
 type PubSub struct, not comparable
+type PubSub struct, unexported fields
 type RedisError struct
 type RedisError struct, Msg string
 type RedisError struct, Prefix string
 type RedisError struct, field order Prefix, Msg
 type ScanIterator struct
 type ScanIterator struct, not comparable
+type ScanIterator struct, unexported fields
 type SentinelClient struct
 type SentinelClient struct, not comparable
+type SentinelClient struct, unexported fields
 type SentinelConfig struct
 type SentinelConfig struct, DB int
 type SentinelConfig struct, DialTimeout time.Duration
@@ -357,9 +368,12 @@ type SentinelConfig struct, field order MasterName, SentinelAddrs, Password, Sen
 type SentinelConfig struct, not comparable
 type ServerProvider = github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider
 type StatusCmd struct
+type StatusCmd struct, unexported fields
 type StringCmd struct
+type StringCmd struct, unexported fields
 type Tx struct
 type Tx struct, not comparable
+type Tx struct, unexported fields
 type Type = github.com/goceleris/celeris/internal/driver/redis/protocol.Type
 type Value = github.com/goceleris/celeris/internal/driver/redis/protocol.Value
 type Z struct
@@ -416,6 +430,7 @@ exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.Value s
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.Value struct, Str []byte
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.Value struct, Type github.com/goceleris/celeris/internal/driver/redis/protocol.Type
 exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.Value struct, not comparable
+exposed type github.com/goceleris/celeris/internal/driver/redis/protocol.Value struct, unexported fields
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, NumWorkers() int
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, WorkerLoop(int) github.com/goceleris/celeris/internal/engine.WorkerLoop

@@ -16,6 +16,7 @@ method (Counter) Add(uint64) // only: (no tags, -tags=celeris_closeprobe)
 method (Counter) Load() uint64 // only: (no tags, -tags=celeris_closeprobe)
 method (Counter) Store(uint64) // only: (no tags, -tags=celeris_closeprobe)
 type Counter struct
+type Counter struct, unexported fields // only: (-tags=validation)
 type Counters struct
 type Counters struct, IouringInlineGuardBlockedZC uint64
 type Counters struct, IouringSQECorruptions uint64
@@ -31,6 +32,7 @@ type Counters struct, SessionCookieDrops uint64
 type Counters struct, SessionOwnerMismatches uint64
 type Counters struct, field order PanicCount, RatelimitTokenViolations, SessionOwnerMismatches, SessionCookieDrops, JWTLateAdmits, IouringSQECorruptions, IouringSendZCSubmits, IouringSendZCSubmitsDetached, IouringSendZCNotifs, IouringInlineGuardBlockedZC, IouringZCCompletionWithPendingWrite, IouringSendZCFallbacks
 type Endpoint struct // only: (-tags=validation)
+type Endpoint struct, unexported fields // only: (-tags=validation)
 var IouringInlineGuardBlockedZC Counter
 var IouringSQECorruptions Counter
 var IouringSendZCFallbacks Counter

@@ -53,6 +53,7 @@ from the root or pass `-root`: inside a nested module such as
   | `var Name Type` | a variable |
   | `func Name[$0 C](Params) Results` | a function |
   | `type Name struct`, then `type Name struct, Field Type` | a struct type and each of its exported fields |
+  | `type Name struct, unexported fields` | a struct with a field that another package cannot name: an unexported one, a blank one (`_`) or an embedded type with an unexported name. No unkeyed composite literal of it compiles outside its package, so the first such field added to an all-exported struct, which breaks those literals, shows as an added line |
   | `type Name struct, embedded T` | an embedded field with an exported name |
   | `type Name struct, not comparable` | a struct whose values cannot be compared with `==`: a slice, map or function field decides it, directly or through a nested struct, an array or an embedded type, unexported and blank fields included. A generic struct gets the line only if no type argument can make it comparable. The default, comparable, has no line, so a struct that stops being comparable (an unexported `_ [0]func()` field added) shows as an added line |
   | `type Name struct, promoted Field Type` | an exported field reached through an embedded type that has no file of its own |
@@ -75,8 +76,6 @@ from the root or pass `-root`: inside a nested module such as
   that adds a method to `time.Time` therefore changes nothing here.
 - **Breaking changes these files do not show** (review them by hand; Go's own
   `cmd/api` has the same blind spots, and `gorelease` reports them):
-  - the first unexported field added to a struct whose fields were all
-    exported, which breaks unkeyed composite literals;
   - methods that a type of another module or of the standard library
     supplies through an unexported embedded interface, for example
     `type hidden interface{ io.Reader }` embedded in an exported struct:

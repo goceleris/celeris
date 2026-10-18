@@ -58,6 +58,8 @@ type Config struct, not comparable
 type Extractor func(*github.com/goceleris/celeris.Context) string
 type Handler struct
 type Handler struct, not comparable
+type Handler struct, unexported fields
 type Session struct
 type Session struct, not comparable
+type Session struct, unexported fields
 var ErrSessionDestroyed error

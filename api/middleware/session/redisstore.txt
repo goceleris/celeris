@@ -13,3 +13,4 @@ type Options struct, KeyPrefix string
 type Options struct, ScanCount int64
 type Options struct, field order KeyPrefix, ScanCount
 type Store struct
+type Store struct, unexported fields

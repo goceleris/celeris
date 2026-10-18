@@ -27,10 +27,17 @@ method (Kind) String() string
 method (Outer) BaseMethod()
 method (Outer) M()
 method (Outer) ValMethod()
+type AllExp struct
+type AllExp struct, A int
+type AllExp struct, B string
+type AllExp struct, field order A, B
 type Base struct
 type Base struct, Own string
 type Base struct, Shared int
 type Base struct, field order Shared, Own
+type BlankFld struct
+type BlankFld struct, A int
+type BlankFld struct, unexported fields
 type BoxInt = Box[int]
 type Box[$0 any] struct
 type Box[$0 any] struct, Val $0
@@ -41,6 +48,15 @@ type Cmp struct, C *Cmp
 type Cmp struct, D [2]Kind
 type Cmp struct, E any
 type Cmp struct, field order A, B, C, D, E
+type EmbExp struct
+type EmbExp struct, C int
+type EmbExp struct, embedded AllExp
+type EmbExp struct, field order AllExp, C
+type EmbUnexp struct
+type EmbUnexp struct, A int
+type EmbUnexp struct, promoted N int
+type EmbUnexp struct, unexported fields
+type EmptyStruct struct
 type Func func(any, ...string) (bool, error)
 type GenCmp[$0 any] struct
 type GenCmp[$0 any] struct, V $0
@@ -53,6 +69,9 @@ type GenOrdered[$0 any, $1 any] struct
 type GenOrdered[$0 any, $1 any] struct, First $0
 type GenOrdered[$0 any, $1 any] struct, Second $1
 type GenOrdered[$0 any, $1 any] struct, field order First, Second
+type GenUnexp[$0 any] struct
+type GenUnexp[$0 any] struct, V $0
+type GenUnexp[$0 any] struct, unexported fields
 type Grouped struct
 type Grouped struct, X int
 type Grouped struct, Y int
@@ -73,6 +92,7 @@ type NotCmpArray struct, not comparable
 type NotCmpBlank struct
 type NotCmpBlank struct, A int
 type NotCmpBlank struct, not comparable
+type NotCmpBlank struct, unexported fields
 type NotCmpEmbedded struct
 type NotCmpEmbedded struct, embedded NotCmpUnexported
 type NotCmpEmbedded struct, not comparable
@@ -87,8 +107,14 @@ type NotCmpNested struct, not comparable
 type NotCmpUnexported struct
 type NotCmpUnexported struct, A int
 type NotCmpUnexported struct, not comparable
+type NotCmpUnexported struct, unexported fields
 type Number interface
 type Number interface, embedded ~int | ~int64 | float64
+type OneUnexp struct
+type OneUnexp struct, A int
+type OneUnexp struct, unexported fields
+type OnlyUnexp struct
+type OnlyUnexp struct, unexported fields
 type Ordered struct
 type Ordered struct, A int
 type Ordered struct, B string
@@ -106,9 +132,11 @@ type Outer struct, promoted Deeper bool
 type Outer struct, promoted Inner *example.com/fix/internal/hid.More
 type Outer struct, promoted Promoted int
 type Outer struct, promoted X int
+type Outer struct, unexported fields
 type PrivOrdered struct
 type PrivOrdered struct, A int
 type PrivOrdered struct, B string
+type PrivOrdered struct, unexported fields
 type SoloField struct
 type SoloField struct, Only int
 type TimeAlias = time.Time

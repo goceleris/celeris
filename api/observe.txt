@@ -16,6 +16,7 @@ type CPUMonitor interface, Close() error
 type CPUMonitor interface, Sample() (float64, error)
 type Collector struct
 type Collector struct, not comparable
+type Collector struct, unexported fields
 type EngineMetrics struct
 type EngineMetrics struct, AcceptCount uint64
 type EngineMetrics struct, ActiveConnections int64
@@ -105,3 +106,4 @@ type Snapshot struct, LatencyBuckets []uint64
 type Snapshot struct, RequestsTotal uint64
 type Snapshot struct, not comparable
 type Snapshot struct, promoted ValidationCounters github.com/goceleris/celeris/validation.Counters // only: (-tags=validation)
+type Snapshot struct, unexported fields
