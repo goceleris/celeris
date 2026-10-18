@@ -21,6 +21,8 @@ fixture() {
   cp "$repo/.github/tools/go.mod" "$repo/.github/tools/go.sum" "$dir/$1/.github/tools/"
   cp "$repo/.github/dependabot.yml" "$dir/$1/.github/"
   cp "$repo"/.github/workflows/*.yml "$dir/$1/.github/workflows/"
+  mkdir -p "$dir/$1/.github/actions/probe"
+  printf 'name: probe\nruns:\n  using: composite\n  steps:\n    - run: echo ok\n      shell: bash\n' >"$dir/$1/.github/actions/probe/action.yml"
   cp "$repo/CONTRIBUTING.md" "$dir/$1/"
 }
 
@@ -81,6 +83,19 @@ sedi 's#^([[:space:]]*)- dependency-name: github.com/rhysd/actionlint$#\1- depen
 printf '  - package-ecosystem: gomod\n    directory: /elsewhere\n    allow:\n      - dependency-name: github.com/rhysd/actionlint\n' >>"$dir/entry-in-wrong-block/.github/dependabot.yml"
 expect entry-in-wrong-block 1 'in the tools but not allowed: github.com/rhysd/actionlint'
 
+# The keys of an entry in another order (allow before directory) do not matter.
+fixture allow-before-directory
+awk '
+  /^    directory: \/\.github\/tools$/ { held = $0; next }
+  /^    schedule:$/ && held != "" { print held; held = "" }
+  { print }
+' "$dir/allow-before-directory/.github/dependabot.yml" >"$dir/dep.tmp"
+mv "$dir/dep.tmp" "$dir/allow-before-directory/.github/dependabot.yml"
+if ! grep -B40 -m1 '^    directory: /.github/tools$' "$dir/allow-before-directory/.github/dependabot.yml" | grep -q 'dependency-name: github.com/rhysd/actionlint'; then
+  echo "FAIL fixture: allow-before-directory did not move the directory line"; fail=1
+fi
+expect allow-before-directory 0
+
 # 2. golangci-lint versions.
 fixture doc-drift
 sedi 's#(golangci-lint\].*) v2\.[0-9]+,#\1 v2.99,#' "$dir/doc-drift/CONTRIBUTING.md"
@@ -102,6 +117,30 @@ expect go-install-latest 1 'ci.yml'
 fixture go-install-comment
 printf '      # was: go install github.com/magefile/mage@v1.17.2\n' >>"$dir/go-install-comment/.github/workflows/ci.yml"
 expect go-install-comment 0
+
+# The same defect in forms the first fixtures did not have: the package on a
+# continuation line, after an earlier # on the line, in a .yaml file, in a
+# composite action, and run with go run.
+fixture go-install-continuation
+printf '      - run: |\n          go install \\\n            github.com/magefile/mage@v1.17.2\n' >>"$dir/go-install-continuation/.github/workflows/ci.yml"
+expect go-install-continuation 1 'ci.yml'
+fixture go-install-after-hash
+printf '      - run: echo "# tool" && go install github.com/magefile/mage@v1.17.2\n' >>"$dir/go-install-after-hash/.github/workflows/ci.yml"
+expect go-install-after-hash 1 'ci.yml'
+fixture go-install-yaml
+mkdir -p "$dir/go-install-yaml/.github/workflows"
+printf 'name: x\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go install github.com/magefile/mage@v1.17.2\n' >"$dir/go-install-yaml/.github/workflows/extra.yaml"
+expect go-install-yaml 1 'extra.yaml'
+fixture go-install-action
+printf '    - run: go install github.com/magefile/mage@v1.17.2\n      shell: bash\n' >>"$dir/go-install-action/.github/actions/probe/action.yml"
+expect go-install-action 1 'actions/probe/action.yml'
+fixture go-run
+printf '      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...\n' >>"$dir/go-run/.github/workflows/ci.yml"
+expect go-run 1 'ci.yml'
+# go run without a pinned package, and an @ that is not a version, are fine.
+fixture go-run-local
+printf '      - run: go run ./cmd/tool -mail me@example.com\n' >>"$dir/go-run-local/.github/workflows/ci.yml"
+expect go-run-local 0
 
 echo "$n cases"
 exit "$fail"
