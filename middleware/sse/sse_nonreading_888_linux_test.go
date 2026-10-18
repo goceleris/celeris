@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -90,6 +91,17 @@ type producer888 struct {
 	// depends on the loop's own iterations.
 	writeTimeout  time.Duration
 	noHeaderTimer bool
+
+	// dropEarly makes a full queue drop the event, not close the stream, for
+	// the first WriteTimeout of the handler's run. The fast phase sends 2000
+	// events a second; a drain goroutine that falls 4 events behind (the loop
+	// holds the connection's write lock for a partial send, or the runner is
+	// starved under -race and coverage) is a full queue, and
+	// ClientPolicyClose would end the stream at once, which says nothing about
+	// the stall bound this test measures (CI saw cuts at 0.5 s, when the
+	// socket fills). From WriteTimeout on the policy is Close, as in the other
+	// producers.
+	dropEarly bool
 }
 
 func (p producer888) wt() time.Duration {
@@ -126,6 +138,8 @@ func burstFor888(tb testing.TB) int {
 func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, disconnected <-chan time.Time, shutdown func()) {
 	tb.Helper()
 	done := make(chan time.Time, 1)
+	var started, early atomic.Int64 // handler start (unix nanos), events dropped by dropEarly
+	wt := p.wt()
 	var burst string
 	if p.fastFor == 0 {
 		burst = strings.Repeat("x", p.burstBytes)
@@ -134,14 +148,24 @@ func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, d
 	handler := sse.New(sse.Config{
 		HeartbeatInterval: -1,
 		MaxQueueDepth:     4,
-		OnSlowClient:      func(*sse.Client, sse.Event) sse.ClientPolicy { return sse.ClientPolicyClose },
+		OnSlowClient: func(*sse.Client, sse.Event) sse.ClientPolicy {
+			if p.dropEarly && time.Since(time.Unix(0, started.Load())) < wt {
+				early.Add(1)
+				return sse.ClientPolicyDrop
+			}
+			return sse.ClientPolicyClose
+		},
 		OnDisconnect: func(*celeris.Context, *sse.Client) {
+			if n := early.Load(); n > 0 {
+				tb.Logf("%d events were dropped on a full queue before WriteTimeout", n)
+			}
 			select {
 			case done <- time.Now():
 			default:
 			}
 		},
 		Handler: func(client *sse.Client) {
+			started.Store(time.Now().UnixNano())
 			ctx := client.Context()
 			if p.fastFor > 0 {
 				fast := strings.Repeat("z", p.fastBytes)
@@ -257,11 +281,11 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 		// is told to expect to wait for), then one event every 300 ms.
 		// WriteTimeout 2 s puts the close after the fast phase.
 		{"small-events", producer888{fastBytes: 4 << 10, fastEvery: 500 * time.Microsecond, fastFor: 1200 * time.Millisecond, settle: 100 * time.Millisecond,
-			trickleBytes: 1000, trickleEvery: 300 * time.Millisecond, writeTimeout: 2 * time.Second}},
+			trickleBytes: 1000, trickleEvery: 300 * time.Millisecond, writeTimeout: 2 * time.Second, dropEarly: true}},
 		// The same without the epoll timerfd (ReadHeaderTimeout -1), so nothing
 		// but the loop's own iterations reaches the sweep.
 		{"small-events-no-header-timer", producer888{fastBytes: 4 << 10, fastEvery: 500 * time.Microsecond, fastFor: 1200 * time.Millisecond, settle: 100 * time.Millisecond,
-			trickleBytes: 1000, trickleEvery: 300 * time.Millisecond, writeTimeout: 2 * time.Second, noHeaderTimer: true}},
+			trickleBytes: 1000, trickleEvery: 300 * time.Millisecond, writeTimeout: 2 * time.Second, noHeaderTimer: true, dropEarly: true}},
 	}
 	for _, cell := range nonReadCells888(t) {
 		for _, pr := range prods {

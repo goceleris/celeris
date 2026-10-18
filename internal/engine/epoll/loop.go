@@ -2120,9 +2120,8 @@ func (cs *connState) endWriteSlow() {
 // noteClosingAcked is the sweep's evidence of progress on a closing conn: the
 // number of bytes the peer has acknowledged (tcp_info bytes_acked, which only
 // grows) moved since the last sample. It restarts the drain clock the same way
-// a flush that sent bytes does (noteClosingProgress), and answers whether it
-// did. The first sample of a conn is its baseline and counts as no progress,
-// unless the conn is first met after its bound had already passed (a loop whose
+// a flush that sent bytes does (noteClosingProgress). The first sample of a
+// conn is its baseline and counts as no progress, unless the conn is first met after its bound had already passed (a loop whose
 // sweeps are further apart than a short WriteTimeout): there is no baseline to
 // compare with, and the conn is given one more bound rather than cut on no
 // evidence.
@@ -2133,14 +2132,15 @@ func (cs *connState) endWriteSlow() {
 // descriptor that is not a TCP socket, or a kernel that does not report the
 // count (before Linux 4.1), yields no evidence, which leaves the userspace
 // queue's rule alone. Loop thread.
-func (l *Loop) noteClosingAcked(cs *connState, now int64) (progressed bool) {
+func (l *Loop) noteClosingAcked(cs *connState, now int64) {
 	cs.closeSampled = now
 	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
 	if err != nil {
-		return false
+		return
 	}
 	known, prev := cs.closeAckedKnown, cs.closeAcked
 	cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+	var progressed bool
 	if known {
 		progressed = ti.Bytes_acked > prev
 	} else {
@@ -2149,7 +2149,6 @@ func (l *Loop) noteClosingAcked(cs *connState, now int64) (progressed bool) {
 	if progressed {
 		cs.closeSince = now
 	}
-	return progressed
 }
 
 // closingDrainBound is how long a conn markClosing deferred may go without the
