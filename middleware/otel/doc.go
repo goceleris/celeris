@@ -16,6 +16,12 @@
 // http.server.response.body.size (By). Set [Config].DisableMetrics for
 // tracing-only mode.
 //
+// The route attribute (http.route, and the route label of the metrics) is the
+// route pattern, or one of the sentinels [celeris.Context.FullPath] reports
+// for a request no route matched: "<unmatched>", "<method-not-allowed>", and
+// "<options>" for the automatic answer to an OPTIONS request. It is omitted
+// when FullPath is empty.
+//
 // PII controls: client.address is opt-in ([Config].CollectClientIP);
 // user_agent.original is opt-out ([Config].CollectUserAgent).
 // Cardinality: the metric attribute sets hold the method (unknown methods
