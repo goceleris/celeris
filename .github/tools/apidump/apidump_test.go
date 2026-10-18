@@ -119,6 +119,11 @@ func TestCheck(t *testing.T) {
 			file: "api/fix.txt", diff: []string{"-type NotCmpBlank struct, not comparable"}},
 		{name: "function body changed", old: "func (b *Box[T]) Get() T                { return b.Val }", new: "func (b *Box[T]) Get() T { var z T; _ = z; return b.Val }"},
 		{name: "parameter renamed", old: "func Variadic(prefix string,", new: "func Variadic(p string,"},
+		// The package clause is not in the import path, and a rename breaks
+		// importers that use the default name (celeris#890). go list wants one
+		// name per directory, so the _test.go file is renamed with it.
+		{name: "package clause renamed", src: "sub/sub.go", with: []string{"sub/only_test.go"}, old: "package sub\n", new: "package subs\n",
+			file: "api/sub.txt", diff: []string{"-# Package clause: sub.", "+# Package clause: subs."}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

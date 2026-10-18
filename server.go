@@ -249,6 +249,12 @@ func (s *Server) PATCH(path string, handlers ...HandlerFunc) *Route {
 // is answered by its GET route, if it has one: the GET handler runs (it sees
 // Method() == "HEAD") and the engine sends its headers without the body
 // (RFC 9110 §9.3.2). Register HEAD only to answer it differently.
+//
+// A GET handler that streams through [Context.StreamWriter], with
+// [Context.Detach] and a goroutine that goes on writing, must check
+// c.Method() == "HEAD" and return after WriteHeader, as the SSE middleware
+// does: a HEAD response ends at its headers, and the goroutine would go on
+// writing into a response that has ended (celeris#847).
 func (s *Server) HEAD(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("HEAD", path, handlers...)
 }
@@ -557,51 +563,60 @@ func (s *Server) cancelListen() {
 // call it from another goroutine (celeris#703). The Start* call that the
 // server was started with returns only after Shutdown has returned.
 //
-// The drain waits for every HTTP/1.1 request and every HTTP/2 stream. std
-// and epoll accept no new connection once the shutdown has begun, and
-// io_uring none while it waits for HTTP/2 handlers or, past the first 250 ms
-// of its send drain, for that drain (it keeps accepting, and serving the
-// requests of its keep-alive connections, for those 250 ms, celeris#595,
-// celeris#806); past them it reads no more request from an HTTP/1.1
-// connection, ends the writes of its detached streams (Server-Sent Events,
-// WebSocket: epoll ends them at the cancel) and only finishes the responses
-// it has queued. An HTTP/2 stream on an async route (marked Async, or promoted to async under
+// The drain waits for every HTTP/1.1 request and every HTTP/2 stream. std and
+// epoll accept no new connection once the shutdown has begun, and io_uring none
+// while it waits for HTTP/2 handlers or, past the first 250 ms of its send
+// drain, for that drain (it keeps accepting, and serving the requests of its
+// keep-alive connections, for at most those 250 ms, celeris#595, celeris#806);
+// past them it reads no more request from an HTTP/1.1 connection, ends the
+// writes of its detached streams (Server-Sent Events, WebSocket: epoll ends
+// them at the cancel) and only finishes the responses it has queued. An HTTP/2
+// stream on an async route (marked Async, or promoted to async under
 // [Config.AsyncHandlers]) runs on the shared HTTP/2 worker pool: epoll,
 // io_uring and adaptive send each HTTP/2 connection GOAWAY, refuse
-// (REFUSED_STREAM) a stream its client opens after it, and serve the
-// connection until those handlers have returned and their responses have
-// gone out, response DATA waiting for the client's WINDOW_UPDATE included,
-// while ctx is live (until its deadline or, for a ctx without one, until it
-// is done, but no longer than [Config.WriteTimeout]) and never for less than
-// 250 ms; std sends each h2c connection GOAWAY, then waits for its h2c
-// streams' handlers, bounded by ctx (celeris#759, celeris#878). Once
-// the handlers have returned, the native engines send what the sockets have
-// not taken yet before they close the connections: epoll for as long, and
-// never for less than 250 ms (celeris#760), and io_uring the same
-// (celeris#806), as does adaptive on whichever of the two it runs. A client
-// that has not taken its response by then loses the rest of it: the
-// connection is closed on what the socket holds, and the io_uring engine
-// logs a WARN naming how many connections and queued bytes that cost. That
-// wait is also capped by [Config.WriteTimeout], from the start of the wait:
-// 60 s by default, so a client that stops reading holds the Start* call for
-// up to that long when ctx has no deadline (and, on a cancel of
-// StartWithContext, for up to [Config.ShutdownTimeout], 30 s by default);
-// only a WriteTimeout of -1 leaves a ctx without a deadline unbounded. On
-// io_uring the cap is taken from the start of each of its two waits, the
-// HTTP/2 handlers' and the send drain that follows, so a server with HTTP/2
-// stream handlers still running can be held up to twice that.
+// (REFUSED_STREAM) a stream its client opens after it, and serve the connection
+// until those handlers have returned and their responses have gone out,
+// response DATA waiting for the client's WINDOW_UPDATE included, while ctx is
+// live (until its deadline or, for a ctx without one, until it is done, but no
+// longer than [Config.WriteTimeout] while that is set) and for at least 250 ms,
+// ending as soon as nothing is left to send; std sends each h2c connection
+// GOAWAY, then waits for its h2c streams' handlers, bounded by ctx
+// (celeris#759, celeris#878), and answers 503 (Service Unavailable) a stream
+// that reaches a handler after the drain has ended. Once the handlers have
+// returned, the native engines send what the sockets have not taken yet before
+// they close the connections: epoll for as long, and for at least 250 ms,
+// ending as soon as nothing is left to send (celeris#760), and io_uring the
+// same (celeris#806), as does adaptive on whichever of the two it runs. A
+// client that has not taken its response by then loses the rest of it: the
+// connection is closed on what the socket holds, and the io_uring engine logs a
+// WARN naming how many connections and queued bytes that cost. That wait is
+// also capped by [Config.WriteTimeout] while it is set, from the start of the
+// wait: 60 s by default, so a client that stops reading holds the Start* call
+// for up to that long when ctx has no deadline (and, on a cancel of
+// StartWithContext, for up to [Config.ShutdownTimeout], 30 s by default); only
+// a WriteTimeout of -1 leaves a ctx without a deadline unbounded. On io_uring
+// the cap is taken from the start of each of its two waits, the HTTP/2
+// handlers' and the send drain that follows, so a server with HTTP/2 stream
+// handlers still running can be held up to twice that.
 //
 // The listen context published by the Start* entry points is cancelled AFTER
 // the engine's graceful phase, never before: on std, Engine.Shutdown IS the
 // drain. Listen's own ctx.Done branch drains too, and a cancel of
 // StartWithContext's context reaches it first; since celeris#753 the drain
 // keeps the deadline of every Engine.Shutdown call whichever call started it,
-// where Listen's used to win the drain's sync.Once with no budget at all. The
-// shortest governs: a call whose own ctx is still live when another's ends the
-// drain gets an error wrapping that call's ctx error (celeris#879).
+// where Listen's used to win the drain's sync.Once with no budget at all. On
+// std the shortest budget governs: a call whose own ctx is still live when
+// another's ends the drain gets an error wrapping that call's ctx error
+// (celeris#879). On epoll and io_uring the drain's budget is the ctx of the
+// last Shutdown call that reaches the engine (a call that waits for a shutdown
+// a cancel of StartWithContext's context started does not). That call returns
+// nil, so a caller whose ctx is still live gets nil; a caller whose own ctx
+// ends first gets its ctx's error, from its wait for Listen. Adaptive hands its
+// ctx to both of its engines.
+//
 // A Shutdown that arrives before the server ever started still latches the
-// shut-down state, so a Start racing it returns instead of parking on a
-// context nothing will ever cancel (celeris#595).
+// shut-down state, so a Start racing it returns instead of parking on a context
+// nothing will ever cancel (celeris#595).
 //
 // When cancelling the context of [Server.StartWithContext] or
 // [Server.StartWithListenerAndContext] has already started a shutdown,
