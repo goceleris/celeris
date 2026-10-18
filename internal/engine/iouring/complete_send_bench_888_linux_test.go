@@ -9,7 +9,8 @@ import (
 
 // BenchmarkCompleteSend888 is completeSend's all-sent path for an ordinary
 // (not detached) conn, the common one: a response that went out whole. The
-// stall clock of a detached conn (celeris#888) adds a load and a store to it;
+// stall clock of a detached conn (celeris#888) adds a load and a branch to it (the
+// store only when the clock is set);
 // this is the figure to compare against an A/A twin (RULE 74).
 func BenchmarkCompleteSend888(b *testing.B) {
 	w := &Worker{}
