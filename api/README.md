@@ -39,7 +39,9 @@ from the root or pass `-root`: inside a nested module such as
 - **Build matrix:** each package is loaded for `linux/amd64`, `linux/arm64`,
   `darwin/arm64` and `windows/amd64`, each with no tag, with
   `-tags=validation` and with `-tags=celeris_closeprobe`, with cgo off. That
-  makes twelve configurations. A file's `# Built for:` header names the
+  makes twelve configurations. A file's `# Package clause:` header names the
+  package clause (`# Package clause: cors.` for `.../middleware/cors`), so
+  renaming it without a change of import path shows; its `# Built for:` header names the
   configurations its package builds in. A line that holds in only some of
   them ends in `// only:` and names them, for example
   `// only: linux/amd64 linux/arm64` or `// only: (-tags=validation)`.
@@ -77,8 +79,6 @@ from the root or pass `-root`: inside a nested module such as
     exported, which breaks unkeyed composite literals;
   - exported fields reordered, which also breaks unkeyed literals (the
     lines are sorted);
-  - a package clause renamed without a change of import path (the header
-    names only the path);
   - methods that a type of another module or of the standard library
     supplies through an unexported embedded interface, for example
     `type hidden interface{ io.Reader }` embedded in an exported struct:

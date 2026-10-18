@@ -124,6 +124,7 @@ func excludedPath(rel string) bool {
 // pkgAPI is what one package contributes across the matrix.
 type pkgAPI struct {
 	path    string
+	name    string            // the package clause, the same in every configuration
 	present uint32            // configurations the package builds in
 	facts   map[string]uint32 // line -> configurations it holds in
 }
@@ -201,6 +202,12 @@ func generate(root string) (map[string][]byte, error) {
 					if a == nil {
 						a = &pkgAPI{path: p.PkgPath, facts: map[string]uint32{}}
 						apis[p.PkgPath] = a
+					}
+					switch {
+					case a.name == "":
+						a.name = tp.Name()
+					case a.name != tp.Name():
+						errs = append(errs, fmt.Errorf("%s is package %s in one configuration and package %s in another (%s/%s %s)", p.PkgPath, a.name, tp.Name(), c.goos, c.goarch, c.buildFlags()))
 					}
 					a.present |= 1 << c.index
 					for _, l := range lines {

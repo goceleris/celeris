@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"flag"
 	"os"
 	"path/filepath"
@@ -94,15 +95,12 @@ func TestCheck(t *testing.T) {
 	if _, err := writeFiles(root, gen(t, root)); err != nil {
 		t.Fatal(err)
 	}
-	src := filepath.Join(root, "fix.go")
-	orig, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatal(err)
-	}
 	cases := []struct {
 		name     string
-		old, new string // a replacement in fix.go; old "" appends new
-		file     string // the stale file, "" for none
+		src      string   // the file to edit, relative to the fixture root; default fix.go
+		with     []string // other files that get the same edit
+		old, new string   // a replacement in it; old "" appends new
+		file     string   // the stale file, "" for none
 		diff     []string
 	}{
 		{name: "unchanged"},
@@ -115,27 +113,41 @@ func TestCheck(t *testing.T) {
 		{name: "unexported identifier changed", old: "unexported = 7", new: "unexported = 8\n\tunexported2 = 9"},
 		{name: "function body changed", old: "func (b *Box[T]) Get() T                { return b.Val }", new: "func (b *Box[T]) Get() T { var z T; _ = z; return b.Val }"},
 		{name: "parameter renamed", old: "func Variadic(prefix string,", new: "func Variadic(p string,"},
+		// The package clause is not in the import path, and a rename breaks
+		// importers that use the default name (celeris#890). go list wants one
+		// name per directory, so the _test.go file is renamed with it.
+		{name: "package clause renamed", src: "sub/sub.go", with: []string{"sub/only_test.go"}, old: "package sub\n", new: "package subs\n",
+			file: "api/sub.txt", diff: []string{"-# Package clause: sub.", "+# Package clause: subs."}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			text := string(orig)
-			switch {
-			case c.old != "":
-				if !strings.Contains(text, c.old) {
-					t.Fatalf("fix.go has no %q", c.old)
+			// The edit applies to each of the case's files, and each is
+			// restored afterwards.
+			for _, rel := range append([]string{cmp.Or(c.src, "fix.go")}, c.with...) {
+				src := filepath.Join(root, filepath.FromSlash(rel))
+				orig, err := os.ReadFile(src)
+				if err != nil {
+					t.Fatal(err)
 				}
-				text = strings.Replace(text, c.old, c.new, 1)
-			default:
-				text += c.new
-			}
-			if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			defer func() {
-				if err := os.WriteFile(src, orig, 0o644); err != nil {
-					t.Error(err)
+				text := string(orig)
+				switch {
+				case c.old != "":
+					if !strings.Contains(text, c.old) {
+						t.Fatalf("%s has no %q", rel, c.old)
+					}
+					text = strings.Replace(text, c.old, c.new, 1)
+				default:
+					text += c.new
 				}
-			}()
+				if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.WriteFile(src, orig, 0o644); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
 			stale, err := compare(root, gen(t, root))
 			if err != nil {
 				t.Fatal(err)
