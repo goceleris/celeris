@@ -63,6 +63,15 @@ jobs:
         run: go -C .github/tools run ./apidump
       - name: apidump's own tests
         run: go -C .github/tools test -count=1 ./apidump
+      # The SKIP tallies of this workflow count `--- SKIP: ` lines with
+      # .github/scripts/skip-count.sh, which also fails on a SKIP line that a
+      # bare anchored grep would not count (output written without a trailing
+      # newline joins the next result line to its own: celeris#890). This runs
+      # it on fixture logs, so a change to the helper that makes it miscount or
+      # stop failing on a joined line is a red Lint, not a tally that quietly
+      # counts less.
+      - name: skip-count.sh self-test
+        run: .github/scripts/skip-count-test.sh
 
       - name: Lint root module
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
@@ -194,7 +203,9 @@ jobs:
           #     TestWriteBufBackpressureClosesSlowConsumer: opt-in measurements
           #     (CELERIS_592_COST=1, GOTEST_BACKPRESSURE=1), not checks.
           #   * the four alloc-count tests in middleware/sse: they skip
-          #     under -race and every step of this job is -race (celeris#684).
+          #     under -race and every step of this job is -race (celeris#684);
+          #     the step "celeris#890 allocation guards and alloc-count tests,
+          #     without -race" below runs them without it and forbids the skip.
           #   * the two TestPauseAccept...SynackRetriesZero tests in internal/engine/epoll:
           #     they need net.ipv4.tcp_synack_retries=0 and the runner has 5; the step
           #     "celeris#662 tcp_synack_retries=0 guard" sets it and forbids the skip.
@@ -210,7 +221,7 @@ jobs:
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
           ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/root.log || true)
           passed=$(grep -cE "^--- PASS: (${required}) \(" /tmp/root.log || true)
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/root.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/root.log)
           unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/root.log | grep -cvE "^[[:space:]]*--- SKIP: (${allowed}) \(" || true)
           # A test that starts an io_uring engine skips when the start fails, and at the
           # runner's 8 MiB memlock a start made while another package's test binary holds
@@ -321,7 +332,7 @@ jobs:
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
           ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/iouring-pkg.log || true)
           passed=$(grep -cE "^--- PASS: (${required}) \(" /tmp/iouring-pkg.log || true)
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/iouring-pkg.log)
           unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -cvE "^--- SKIP: (${allowed}) \(" || true)
           echo "internal/engine/iouring: SKIP lines $skipped, not enforced by another step $unlisted; celeris#639 tests want $want, ran $ran, passed $passed"
           if [ "$unlisted" -ne 0 ] || [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ]; then
@@ -361,7 +372,7 @@ jobs:
           ran=$(grep -cE "^=== RUN   ${top}\$" /tmp/c592.log || true)
           passed=$(grep -cE "^--- PASS: ${top} \(" /tmp/c592.log || true)
           armpass=$(grep -cE "^[[:space:]]+--- PASS: ${top}/${arms} \(" /tmp/c592.log || true)
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/c592.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/c592.log)
           echo "celeris#592 rig: top-level RUN $ran PASS $passed (want 1), arm PASS $armpass (want 6), SKIP lines $skipped (want 0)"
           if [ "$ran" -ne 1 ] || [ "$passed" -ne 1 ] || [ "$armpass" -ne 6 ] || [ "$skipped" -ne 0 ]; then
             echo "expected $top to run once and PASS, all six arms (iouring and epoll: settled, negctrl_async,"
@@ -719,7 +730,7 @@ jobs:
         run: |
           set -o pipefail
           go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-compress.log
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/mw-compress.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/mw-compress.log)
           echo "middleware/compress: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/mw-compress.log || true
@@ -732,7 +743,7 @@ jobs:
         run: |
           set -o pipefail
           go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-metrics.log
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/mw-metrics.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/mw-metrics.log)
           echo "middleware/metrics: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/mw-metrics.log || true
@@ -745,7 +756,7 @@ jobs:
         run: |
           set -o pipefail
           go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-otel.log
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/mw-otel.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/mw-otel.log)
           echo "middleware/otel: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/mw-otel.log || true
@@ -843,7 +854,7 @@ jobs:
         run: |
           set -o pipefail
           go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-protobuf.log
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/mw-protobuf.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/mw-protobuf.log)
           echo "middleware/protobuf: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/mw-protobuf.log || true
@@ -1084,10 +1095,11 @@ jobs:
             exit 1
           fi
       # celeris#905: a stopped engine must leave no thread pinned to one CPU.
-      # The root step runs the epoll test without -v, where a skip prints
-      # nothing, and job `adaptive` and the internal/engine/iouring step above count
-      # no test of it by name. So the three tests run here by name: epoll and
-      # io_uring at the runner's 8 MiB memlock (one io_uring worker), then
+      # The root step runs the epoll test with -v but counts no test of it by
+      # name (a rename or a removal passes it), and job `adaptive` and the
+      # internal/engine/iouring step above count none of it by name either. So
+      # the three tests run here by name: epoll and io_uring at the runner's
+      # 8 MiB memlock (one io_uring worker), then
       # adaptive with memlock raised and CELERIS_REQUIRE_UPSWITCH=1, as job
       # `adaptive` runs its package. Each re-runs itself in a process of its
       # own and logs that process's output with a "child| " prefix, so the
@@ -1121,6 +1133,198 @@ jobs:
             echo "expected the three celeris#905 tests to PASS with no SKIP line, each child with one RESULT line"
             echo "showing pinned threads while running, none off the mask after the stop, and no pinned thread"
             echo "but the main thread left alive -- was one renamed or removed, did one skip or fail?"
+            exit 1
+          fi
+      # celeris#890: the allocation guards, without -race. Every other `go test`
+      # of this workflow passes -race, and the race detector adds allocations of
+      # its own, so AllocsPerRun counts mean nothing under it: the guards live in
+      # `//go:build !race` files (celeristest, driver/{memcached,postgres,redis},
+      # middleware/{cache,idempotency,overload,ratelimit,timeout}) and the four
+      # alloc-count tests of middleware/sse and the one of middleware/websocket
+      # skip themselves under -race, coverage and -short. None of them ran in CI:
+      # #938's change to middleware/timeout shipped green with its guard failing
+      # (3 allocs/op, want <=1), and the root step's allow-list lists the sse four
+      # as skips. This step runs each package alone (AllocsPerRun counts the whole
+      # process, so one package's tests never share a process with another's),
+      # with -v, and tallies by name per package: every listed test must run and
+      # PASS, and no SKIP line is allowed.
+      #
+      # Which of them can fail a pull request: celeristest, middleware/timeout and
+      # middleware/ratelimit fail on any count over their budget. The rest (the
+      # drivers, middleware/{cache,idempotency,overload}) only log an over-budget
+      # count unless TESTING_STRICT_ALLOC_BUDGETS=1, which this step does not set,
+      # so for them it proves the guard ran (PASS, no skip) and not that the count
+      # held. Setting it is the stricter choice; see the pull request for the
+      # numbers behind it. The sse and websocket tests fail on their own bounds.
+      - name: celeris#890 allocation guards and alloc-count tests, without -race (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          # "<package> <top-level tests that must PASS, as a regex alternation>"
+          entries=(
+            'celeristest TestNewContextZeroAlloc'
+            'driver/memcached TestAllocBudgets'
+            'driver/postgres TestAllocBudgets|TestAllocBudgetsPreparedExec'
+            'driver/redis TestAllocBudgets'
+            'middleware/cache TestAllocBudgets'
+            'middleware/idempotency TestAllocBudgets'
+            'middleware/overload TestAllocBudgets'
+            'middleware/ratelimit TestAllowUnderLimitZeroAlloc'
+            'middleware/timeout TestNoTimeoutCommonPathSingleAlloc'
+            'middleware/sse TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestSlowClientDropPathAllocs888'
+            'middleware/websocket TestHubBroadcastFormatsOnce'
+          )
+          # Discovery: the list above is fixed, so a new `//go:build !race` test file in a
+          # package that is not listed, or a Test function in a listed package's
+          # `!race` file that no entry names, would run nowhere (the failure this step
+          # exists for). Every such file must belong to an entry. test/server's
+          # race761_off_test.go is the one that holds no guard: it only sets a constant
+          # (raceOn761 = false) that makes the large-response tests run full size.
+          declare -A listed=()
+          for entry in "${entries[@]}"; do listed[${entry%% *}]=${entry#* }; done
+          undiscovered=0
+          while IFS= read -r f; do
+            dir=$(dirname "$f")
+            if [ "$dir" = test/server ]; then continue; fi
+            if [ -z "${listed[$dir]+set}" ]; then
+              echo "$f is a //go:build !race test file of a package that the entries do not list"
+              undiscovered=1
+              continue
+            fi
+            while IFS= read -r t; do
+              case "|${listed[$dir]}|" in
+                *"|$t|"*) ;;
+                *) echo "$f: $t is not named by the entry of ${dir}"; undiscovered=1 ;;
+              esac
+            done < <(grep -hoE '^func Test[A-Za-z0-9_]*' "$f" | sed 's/^func //')
+          done < <(git grep -lE '^//go:build.*!race' -- '*_test.go')
+          if [ "$undiscovered" -ne 0 ]; then
+            echo "add the package or the test to the entries of this step (and to the count below)"
+            exit 1
+          fi
+          failed=0
+          bad=0
+          total=0
+          : >/tmp/allocguard.log
+          for entry in "${entries[@]}"; do
+            pkg=${entry%% *}
+            names=${entry#* }
+            want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+            log="/tmp/allocguard-${pkg//\//-}.log"
+            go test -count=1 -timeout=300s -v -run "^(${names})\$" "./${pkg}/" </dev/null 2>&1 | tee "$log" || failed=$((failed + 1))
+            cat "$log" >>/tmp/allocguard.log
+            ran=$(grep -cE "^=== RUN   (${names})\$" "$log" || true)
+            passed=$(grep -cE "^--- PASS: (${names}) \(" "$log" || true)
+            total=$((total + passed))
+            echo "alloc guards ${pkg}: want $want, ran $ran, passed $passed"
+            if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ]; then bad=$((bad + 1)); fi
+          done
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/allocguard.log)
+          faillines=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/allocguard.log || true)
+          echo "alloc guards: top-level PASS $total (want 15), packages with a wrong tally $bad, SKIP lines $skipped, FAIL lines $faillines, go test runs failed $failed (want 0)"
+          if [ "$total" -ne 15 ] || [ "$bad" -ne 0 ] || [ "$skipped" -ne 0 ] || [ "$faillines" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected the 15 guard tests of 11 packages to run and PASS with no SKIP or FAIL line --"
+            echo "was one renamed or removed, did one skip (alloc counts are skipped under -race, coverage and -short), or did one fail?"
+            exit 1
+          fi
+      # celeris#890 (celeris#777 item 3): TestShutdownHooksRunAfterTheDrain with
+      # memlock raised. Its engines are built with the default worker count, and a
+      # runner's 8 MiB RLIMIT_MEMLOCK funds one io_uring worker (12 MiB each,
+      # internal/engine/iouring/ring.go): in the root shard (job `unit-root-shard`
+      # a, -v, which tallies the top-level names and allows no SKIP or FAIL line)
+      # every io_uring engine of the test logs "workers=1". The drain waits for
+      # every worker to stop, so the shape worth covering is several: here memlock
+      # is raised as in job `adaptive`, and the runner's CPUs (nproc, printed)
+      # become the workers. The test fails, never skips, when an engine does not
+      # start. The tally counts the test and its 48 subtests (6 engines x 3 modes,
+      # the same again over h2c, and the 4 engines whose route is not async over
+      # h2c with an async route): all PASS, no SKIP and no FAIL line, and the
+      # engines' own "workers=N" log lines show more than one worker.
+      - name: celeris#703 shutdown hooks run after the drain, several workers (memlock raised, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CPUs: $(nproc)"
+          top='TestShutdownHooksRunAfterTheDrain'
+          go test -race -count=1 -timeout=600s -v -run "^${top}\$" ./test/server/ 2>&1 | tee /tmp/drain703.log
+          ran=$(grep -cE "^=== RUN   ${top}\$" /tmp/drain703.log || true)
+          passed=$(grep -cE "^--- PASS: ${top} \(" /tmp/drain703.log || true)
+          subs=$(grep -cE "^    --- PASS: ${top}/" /tmp/drain703.log || true)
+          allpass=$(grep -cE "^[[:space:]]*--- PASS: ${top}[ /]" /tmp/drain703.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/drain703.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drain703.log)
+          # The io_uring engine logs the workers it started with ("io_uring engine listening ...
+          # workers=N"): 1 at the runner's 8 MiB (every such line of the shard's log), the runner's
+          # CPUs here. A line with workers=1 means memlock was not raised after all.
+          one=$(grep -cE 'io_uring engine listening .* workers=1 ' /tmp/drain703.log || true)
+          several=$(grep -cE 'io_uring engine listening .* workers=([2-9]|[1-9][0-9]+) ' /tmp/drain703.log || true)
+          echo "celeris#703 drain-order test: RUN $ran PASS $passed (want 1), subtests PASS $subs (want 48), all PASS lines $allpass (want 49), FAIL lines $failed, SKIP lines $skipped; io_uring engine starts with one worker $one (want 0), with several $several (want >= 1)"
+          if [ "$ran" -ne 1 ] || [ "$passed" -ne 1 ] || [ "$subs" -ne 48 ] || [ "$allpass" -ne 49 ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ] || [ "$one" -ne 0 ] || [ "$several" -lt 1 ]; then
+            echo "expected $top to run once and PASS with its 48 subtests and no FAIL or SKIP line, on io_uring engines of several workers --"
+            echo "was the test renamed or removed, did a case skip or fail, did a case change (the count of 48 is in the test's loops),"
+            echo "or did the runner fund one worker (memlock not raised, or one CPU)?"
+            exit 1
+          fi
+      # celeris#890 (celeris#968): -tags http2legacy, x/net's own HTTP/2 server
+      # instead of the go1.27 net/http wrapper, which x/net keeps as the opt-out.
+      # The std engine splits on the tag (h2c_base_wrap.go / h2c_base_legacy.go)
+      # and serves an h2c upgrade request differently under it (h2c.go marks the
+      # request HTTP/2; the wrapper does that itself), and nothing built or tested
+      # with the tag, so it could break unseen (celeris#977 fixed one such break,
+      # found by hand). Every other step of this workflow builds without it, so
+      # `go list` first proves the tag selects the legacy file and not the wrapper
+      # (and the reverse without it): a tag that selected nothing would make the
+      # tests below a repeat of the others.
+      #
+      # `go vet` with the tag type-checks the legacy file, which golangci-lint
+      # (no tag) never sees. The std package's tests run under the tag, every
+      # test by name through the tally of SKIP lines (none may skip), and the
+      # test/server tests that put an h2c upgrade and the stream's context
+      # through the std engine run beside them. The runner's 8 MiB memlock stays:
+      # the std package's tests start no io_uring engine, but the three
+      # test/server tests loop over the std, epoll, io_uring and adaptive engines
+      # (engines761), so they do start io_uring and adaptive ones, each with one
+      # worker at 8 MiB. A start that fails only with ENOMEM is retried for up to
+      # 30 s (startServerConfig761) and then fails the test, never skips it: the
+      # step stays fail-closed, and its tally of SKIP lines allows none.
+      - name: celeris#968 -tags http2legacy, x/net's own HTTP/2 server (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          std=./internal/engine/std
+          legacy_files=$(go list -tags http2legacy -f '{{join .GoFiles " "}}' "$std")
+          default_files=$(go list -f '{{join .GoFiles " "}}' "$std")
+          echo "-tags http2legacy selects: $(tr ' ' '\n' <<<"$legacy_files" | grep -E '^h2c_base' | tr '\n' ' ')"
+          echo "the default build selects: $(tr ' ' '\n' <<<"$default_files" | grep -E '^h2c_base' | tr '\n' ' ')"
+          has() { case " $1 " in *" $2 "*) return 0 ;; esac; return 1; }
+          if ! has "$legacy_files" h2c_base_legacy.go || has "$legacy_files" h2c_base_wrap.go \
+            || ! has "$default_files" h2c_base_wrap.go || has "$default_files" h2c_base_legacy.go; then
+            echo "-tags http2legacy must select h2c_base_legacy.go and drop h2c_base_wrap.go, and the default build the reverse"
+            exit 1
+          fi
+          go vet -tags http2legacy "$std"
+          failed=0
+          go test -race -count=1 -timeout=600s -v -tags http2legacy "$std" 2>&1 | tee /tmp/legacy-std.log || failed=$((failed + 1))
+          names='TestUpgradeRequestIsHTTP2949|TestH2DepartureCancelsRequestContext949|TestH2StayingClientKeepsRequestContext949'
+          go test -race -count=1 -timeout=600s -v -tags http2legacy -run "^(${names})\$" ./test/server/ 2>&1 | tee /tmp/legacy-server.log || failed=$((failed + 1))
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/legacy-server.log || true)
+          # The std tests that depend on the build: the h2c connection's limits come from
+          # BaseConfig under the tag (h2c_base_legacy.go) and from the wrapper without it.
+          limit_names='TestH2CConnKeepsMaxHeaderBytes|TestH2CConnKeepsReadTimeout|TestH2CConnGetsGoAwayAfterIdleTimeout|TestH2CConnHandedOverDuringDrainIsSentGoAway|TestH2CConnHandedOverAfterShutdownReturnedIsRefusedAndSentGoAway'
+          limit_want=$(( $(tr '|' '\n' <<<"$limit_names" | wc -l) ))
+          limits=$(grep -cE "^--- PASS: (${limit_names}) \(" /tmp/legacy-std.log || true)
+          cat /tmp/legacy-std.log /tmp/legacy-server.log >/tmp/legacy.log
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/legacy.log)
+          faillines=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/legacy.log || true)
+          echo "celeris#968 http2legacy: test/server want $want PASS, passed $passed; std h2c tests want $limit_want PASS, passed $limits; SKIP lines $skipped, FAIL lines $faillines, go test runs failed $failed (want 0)"
+          if [ "$passed" -ne "$want" ] || [ "$limits" -ne "$limit_want" ] || [ "$skipped" -ne 0 ] || [ "$faillines" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected the three test/server tests and the std package's tests to PASS under -tags http2legacy with no SKIP or FAIL line --"
+            echo "was a test renamed or removed, did one skip, or does the legacy build differ from the default one again?"
             exit 1
           fi
 
@@ -1343,7 +1547,7 @@ jobs:
           owant=$(( $(tr '|' '\n' <<<"$rest" | wc -l) ))
           oran=$(grep -cE "^=== RUN   (${rest})\$" /tmp/adaptive-race.log || true)
           opassed=$(grep -cE "^--- PASS: (${rest}) \(" /tmp/adaptive-race.log || true)
-          allskipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/adaptive-race.log || true)
+          allskipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/adaptive-race.log)
           # Every top-level adaptive test that skips when io_uring is unavailable (36 of them, measured
           # under docker's default seccomp profile, which refuses io_uring_setup) is in a tally of
           # its own, in the unit job's celeris#905 step, or in the list above. The check below also
@@ -1483,6 +1687,16 @@ jobs:
             exit 1
           fi
 
+  # NOT a required check: the repository's ruleset ("Main — CI") requires Lint,
+  # "Unit (root + middleware sub-modules)" (the `unit-gate` job), Conformance,
+  # Driver Conformance, the two Build jobs and Vulnerability Check, and not this
+  # job. The skip-forbidding steps below (celeris#656, #895/#896, #691) therefore
+  # report on a pull request but do not stop its merge: a red run of this job has
+  # to be looked at, and a skip that slips in here is seen only by someone who
+  # reads the run. Making the job a required check is an org-admin ruleset
+  # change (celeris#890). The same holds for every job below `unit-gate` that
+  # the ruleset does not list (`adaptive`, `zc-window`, `recv-theft`,
+  # `windows-cross`, `portable-fallback`).
   iouring:
     name: io_uring init-failure regression (./internal/engine/iouring)
     runs-on: ubuntu-latest
@@ -1571,7 +1785,8 @@ jobs:
       # `unit` job runs this package without -v, and startTestEngine skips
       # when the engine does not come up, so a skip there prints nothing. The
       # tally requires every run to PASS and no FAIL or SKIP line: a skipped
-      # or renamed test turns this red. Seven of the tests pin the
+      # or renamed test turns this red. Nine of the tests (the first nine of the
+      # 19 in `new`, up to TestDriverShutdownReleasesDescriptors) pin the
       # UnregisterConn-then-Close leak and every path that must close the
       # duplicate descriptor its fix takes, two a register on a worker that
       # has shut down, two an SQE prepared by a descriptor number the
@@ -2013,7 +2228,7 @@ jobs:
         run: |
           set -o pipefail
           go test -v -race -count=1 -timeout=120s ./test/conformance/... 2>&1 | tee /tmp/conformance.log
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/conformance.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/conformance.log)
           echo "Conformance matrix: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/conformance.log || true
@@ -2062,29 +2277,81 @@ jobs:
         run: |
           set -o pipefail
           go test -tags postgres -race -count=1 -timeout=300s -v ./test/conformance/postgres/... 2>&1 | tee /tmp/drv-pg.log
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/drv-pg.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-pg.log)
           echo "Postgres conformance: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pg.log || true
             echo "expected no SKIP line -- a skip is not coverage"
             exit 1
           fi
-      # The three TestAuth_Password* tests need CELERIS_REDIS_PASSWORD and the redis
-      # service above has no password, so they skip on every run (celeris#684). A
-      # password-protected service is a separate change; until it lands they are the
-      # only skips this step may print.
+      # The three authentication tests (TestAuth_PasswordSuccess,
+      # TestAuth_PasswordFailure, TestAuth_ForceRESP2WithPassword) need a server
+      # that requires a password, and the redis service above has none, so they
+      # skipped on every run until celeris#890. A service cannot take a command
+      # (`services:` has image, env, ports and options only, and --requirepass
+      # is an argument of redis-server), so the next step starts a second server
+      # with `docker run`, on port 6380; the step "Redis conformance" below skips
+      # the three tests by name and allows no other skip, and "Redis conformance,
+      # password-protected server" runs only those three against port 6380 with
+      # the password, where a skip is a failure.
+      #
+      # The password is set on that step only, not on the job: clientOpts in
+      # test/conformance/redis/harness_test.go applies CELERIS_REDIS_PASSWORD to
+      # every test's client, and the server on 6379 has none.
+      - name: Start a password-protected Redis (docker run, port 6380)
+        shell: bash
+        env:
+          REDIS_AUTH_PASSWORD: celeris-ci-auth
+        run: |
+          set -o pipefail
+          docker run -d --name redis-auth -p 6380:6379 redis:7.2 redis-server --requirepass "$REDIS_AUTH_PASSWORD"
+          for _ in $(seq 1 30); do
+            if [ "$(docker exec redis-auth redis-cli -a "$REDIS_AUTH_PASSWORD" --no-auth-warning ping 2>/dev/null || true)" = PONG ]; then
+              echo "redis-auth answers PING with the password"
+              # Without the password the server must refuse: the tests below are only
+              # worth running against a server that requires one.
+              if docker exec redis-auth redis-cli ping 2>&1 | grep -q NOAUTH; then
+                echo "redis-auth refuses a PING without the password (NOAUTH)"
+                exit 0
+              fi
+              echo "redis-auth answered a PING without the password: --requirepass did not take effect"
+              exit 1
+            fi
+            sleep 1
+          done
+          docker logs redis-auth || true
+          echo "redis-auth did not answer PING within 30 s"
+          exit 1
       - name: Redis conformance
         shell: bash
         run: |
           set -o pipefail
-          go test -tags redis -race -count=1 -timeout=300s -v ./test/conformance/redis/... 2>&1 | tee /tmp/drv-redis.log
-          allowed='TestAuth_PasswordSuccess|TestAuth_PasswordFailure|TestAuth_ForceRESP2WithPassword'
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/drv-redis.log || true)
-          unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-redis.log | grep -cvE "^[[:space:]]*--- SKIP: (${allowed}) \(" || true)
-          echo "Redis conformance: SKIP lines $skipped, not in the allow-list $unlisted (want 0)"
-          if [ "$unlisted" -ne 0 ]; then
-            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-redis.log | grep -vE "^[[:space:]]*--- SKIP: (${allowed}) \(" || true
-            echo "expected no SKIP line outside the allow-list -- a skip is not coverage"
+          # The three authentication tests run in the next step, against the server with a password.
+          go test -tags redis -race -count=1 -timeout=300s -v -skip '^(TestAuth_PasswordSuccess|TestAuth_PasswordFailure|TestAuth_ForceRESP2WithPassword)$' ./test/conformance/redis/... 2>&1 | tee /tmp/drv-redis.log
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-redis.log)
+          echo "Redis conformance: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-redis.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
+      - name: Redis conformance, password-protected server (3 tests, skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REDIS_ADDR: 127.0.0.1:6380
+          CELERIS_REDIS_PASSWORD: celeris-ci-auth
+        run: |
+          set -o pipefail
+          names='TestAuth_PasswordSuccess|TestAuth_PasswordFailure|TestAuth_ForceRESP2WithPassword'
+          go test -tags redis -race -count=1 -timeout=300s -v -run "^(${names})\$" ./test/conformance/redis/... 2>&1 | tee /tmp/drv-redis-auth.log
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/drv-redis-auth.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/drv-redis-auth.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-redis-auth.log)
+          echo "Redis authentication tests: want $want PASS, passed $passed, FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want authentication tests to PASS with no FAIL or SKIP line --"
+            echo "was one renamed or removed, or did one skip (the password did not reach the server, or the server did not answer)?"
             exit 1
           fi
       - name: Postgres session store integration
@@ -2092,7 +2359,7 @@ jobs:
         run: |
           set -o pipefail
           go test -tags integration -race -count=1 -timeout=120s -v ./middleware/session/postgresstore/... 2>&1 | tee /tmp/drv-pgstore.log
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/drv-pgstore.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-pgstore.log)
           echo "Postgres session store integration: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pgstore.log || true
@@ -2104,7 +2371,7 @@ jobs:
         run: |
           set -o pipefail
           go test -tags integration -race -count=1 -timeout=120s -v ./middleware/session/redisstore/... 2>&1 | tee /tmp/drv-redisstore.log
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/drv-redisstore.log || true)
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-redisstore.log)
           echo "Redis session store integration: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-redisstore.log || true
@@ -2216,7 +2483,10 @@ jobs:
           go test $race -count=1 -timeout=900s -v ./driver/internal/eventloop ./driver/redis ./driver/postgres ./driver/memcached 2>&1 | tee fallback.log
           pass=$(grep -cE '^[[:space:]]*--- PASS: ' fallback.log || true)
           fail=$(grep -cE '^[[:space:]]*--- FAIL: ' fallback.log || true)
-          skip=$(grep -cE '^[[:space:]]*--- SKIP: ' fallback.log || true)
+          # skip-count.sh (celeris#890) also fails on a `--- SKIP: ` line that a test's
+          # unterminated stdout joined to its own text, which the bare grep did not count.
+          # `bash` runs it: a Windows checkout need not keep the executable bit.
+          skip=$(bash .github/scripts/skip-count.sh fallback.log)
           echo "PASS $pass  FAIL $fail  SKIP $skip"
           # A test that is absent or skipped is not a pass: name the ones that
           # must have run and passed on this OS.
