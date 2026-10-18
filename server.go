@@ -249,6 +249,12 @@ func (s *Server) PATCH(path string, handlers ...HandlerFunc) *Route {
 // is answered by its GET route, if it has one: the GET handler runs (it sees
 // Method() == "HEAD") and the engine sends its headers without the body
 // (RFC 9110 §9.3.2). Register HEAD only to answer it differently.
+//
+// A GET handler that streams through [Context.StreamWriter], with
+// [Context.Detach] and a goroutine that goes on writing, must check
+// c.Method() == "HEAD" and return after WriteHeader, as the SSE middleware
+// does: a HEAD response ends at its headers, and the goroutine would go on
+// writing into a response that has ended (celeris#847).
 func (s *Server) HEAD(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("HEAD", path, handlers...)
 }
