@@ -14,8 +14,8 @@
 // Each package is loaded for linux/amd64, linux/arm64, darwin/arm64 and
 // windows/amd64, each with no tag, with -tags=validation and with
 // -tags=celeris_closeprobe (cgo off): twelve configurations, the build matrix
-// of the #443 inventory. A file's header names the configurations its
-// package builds in, and a line that holds in only some of them ends in
+// of the #443 inventory. A file's header names the package clause and the
+// configurations its package builds in, and a line that holds in only some of them ends in
 // "// only: ..." naming them.
 //
 // A type that the exported API reaches but that has no file of its own (an

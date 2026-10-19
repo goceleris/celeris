@@ -39,13 +39,18 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 		{0, asyncCancelAccepted, ""}, // CANCEL_ALL: res is the number cancelled, and nothing was
 		{1, asyncCancelAccepted, ""},
 		{-int32(unix.ENOENT), asyncCancelAccepted, ""}, // the flag-free form's miss
-		{-int32(unix.EINVAL), asyncCancelRejected, "5.19"},
+		{-int32(unix.EINVAL), asyncCancelRejected, "EINVAL"},
 		{-int32(unix.EBADF), asyncCancelUnexpected, "cqe.res=-9 (EBADF)"},
 		{-int32(unix.ECANCELED), asyncCancelUnexpected, "cqe.res=-125 (ECANCELED)"},
 	} {
+		// The reason is the kernel's answer and says nothing of its version: a
+		// 5.19+ kernel that rejects the flags gives it too, and a version
+		// clause contradicted the kernel line next to it (checklist #884 item
+		// 11). requireAsyncCancelFlags names the version.
 		got, reason := classifyAsyncCancelProbe(tc.res)
-		if got != tc.want || (tc.reason == "") != (reason == "") || !strings.Contains(reason, tc.reason) {
-			t.Errorf("classifyAsyncCancelProbe(%d) = (%v, %q), want (%v, containing %q)",
+		if got != tc.want || (tc.reason == "") != (reason == "") || !strings.Contains(reason, tc.reason) ||
+			strings.Contains(reason, "5.19") || strings.Contains(reason, "predates") {
+			t.Errorf("classifyAsyncCancelProbe(%d) = (%v, %q), want (%v, containing %q, and no kernel version)",
 				tc.res, got, reason, tc.want, tc.reason)
 		}
 	}

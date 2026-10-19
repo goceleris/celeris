@@ -93,7 +93,20 @@ func (p *printer) typeName(obj *types.TypeName, exposed bool) {
 		switch u := t.Underlying().(type) {
 		case *types.Struct:
 			p.emit(head + " struct")
+			if !structComparable(u) {
+				// Comparable is the default, and a struct that stops being
+				// so breaks every == and map key that uses it: the line
+				// appears in the diff (celeris#890).
+				p.emit(head + " struct, not comparable")
+			}
 			p.fields(head+" struct, ", t, u)
+			if hasUnexportedField(u) {
+				// Another package cannot write a composite literal of such a
+				// struct without field names, so adding the first unexported
+				// field to an all-exported struct breaks unkeyed literals
+				// (celeris#890).
+				p.emit(head + " struct, unexported fields")
+			}
 		case *types.Interface:
 			p.emit(head + " interface")
 			p.interfaceLines(head+" interface, ", u)
@@ -117,6 +130,12 @@ func (p *printer) typeName(obj *types.TypeName, exposed bool) {
 // the exported fields promoted from embedded types that have no golden file
 // of their own (unexported ones, or ones from internal packages).
 func (p *printer) fields(head string, outer *types.Named, st *types.Struct) {
+	if names := unkeyedOrder(st); names != "" {
+		// Where another package can write an unkeyed composite literal, the
+		// order of the fields is part of the API; the field lines are sorted
+		// and do not show it (celeris#890).
+		p.emit(head + "field order " + names)
+	}
 	for i := 0; i < st.NumFields(); i++ {
 		f := st.Field(i)
 		if f.Embedded() {
@@ -132,6 +151,25 @@ func (p *printer) fields(head string, outer *types.Named, st *types.Struct) {
 			p.emit(head + f.Name() + " " + p.typ(f.Type()))
 		}
 	}
+}
+
+// unkeyedOrder returns the field names of a struct in declaration order,
+// comma separated, when another package can write an unkeyed composite literal
+// of it (every field exported, none blank) and the order matters (two fields
+// or more); otherwise "". An embedded field is named by its type's name.
+func unkeyedOrder(st *types.Struct) string {
+	if st.NumFields() < 2 {
+		return ""
+	}
+	names := make([]string, st.NumFields())
+	for i := range names {
+		f := st.Field(i)
+		if !f.Exported() {
+			return ""
+		}
+		names[i] = f.Name()
+	}
+	return strings.Join(names, ", ")
 }
 
 func (p *printer) promoted(head string, outer *types.Named, embedded types.Type, seen map[types.Type]bool) {
@@ -157,6 +195,18 @@ func (p *printer) promoted(head string, outer *types.Named, embedded types.Type,
 			p.promoted(head, outer, f.Type(), seen)
 		}
 	}
+}
+
+// hasUnexportedField reports whether a struct has a field that another
+// package cannot name: an unexported one, a blank one, or an embedded type
+// with an unexported name.
+func hasUnexportedField(st *types.Struct) bool {
+	for i := 0; i < st.NumFields(); i++ {
+		if !st.Field(i).Exported() {
+			return true
+		}
+	}
+	return false
 }
 
 // interfaceLines lists every method of an interface's method set, embedded
@@ -190,13 +240,16 @@ func (p *printer) interfaceLines(head string, it *types.Interface) {
 // promoted from an embedded type of another module or the standard library
 // is left out: the "embedded" line names that type, and its methods are its
 // own module's API (a Go release that adds a method to time.Time must not
-// change these files).
+// change these files). The exception is a method that reaches T through an
+// unexported interface type, which no "embedded" line names (see
+// viaHiddenInterface).
 func (p *printer) methods(prefix, recv string, t *types.Named) {
 	all := types.NewMethodSet(types.NewPointer(t))
 	val := types.NewMethodSet(t)
 	for i := 0; i < all.Len(); i++ {
-		m := all.At(i).Obj()
-		if !m.Exported() || !p.ours(m.Pkg()) {
+		sel := all.At(i)
+		m := sel.Obj()
+		if !m.Exported() || (!p.ours(m.Pkg()) && !p.viaHiddenInterface(t, sel)) {
 			continue
 		}
 		r := recv
@@ -205,6 +258,32 @@ func (p *printer) methods(prefix, recv string, t *types.Named) {
 		}
 		p.emit(prefix + "method (" + r + ") " + m.Name() + p.sig(m.Type().(*types.Signature)))
 	}
+}
+
+// viaHiddenInterface reports whether a method of another module or of the
+// standard library reaches t through an embedded field of an interface type
+// and through a type with no golden file of its own (an unexported one): the
+// "embedded" line of an exported field would name the interface, but nothing
+// names this one, so without a line of its own, replacing io.Reader with
+// io.Writer in `type hidden interface{ io.Reader }` would change nothing in
+// the files. A method set of an interface does not grow (Go's compatibility
+// rules), which is why this one is listed and a method promoted from a
+// foreign struct, such as time.Time's, is not.
+func (p *printer) viaHiddenInterface(t *types.Named, sel *types.Selection) bool {
+	path := sel.Index()
+	var cur types.Type = t
+	hidden := false
+	for _, i := range path[:len(path)-1] {
+		st, ok := deref(cur).Underlying().(*types.Struct)
+		if !ok {
+			return false
+		}
+		f := st.Field(i)
+		hidden = hidden || p.hidden(f.Type())
+		cur = f.Type()
+	}
+	_, isInterface := deref(cur).Underlying().(*types.Interface)
+	return hidden && isInterface && len(path) > 1
 }
 
 // hidden reports whether a type (through pointers and aliases) is a named
@@ -457,6 +536,30 @@ func (p *printer) writeInterface(b *strings.Builder, t *types.Interface) {
 	b.WriteByte('}')
 }
 
+// structComparable reports whether == is defined on values of t when every type
+// parameter is instantiated with a comparable type: a struct, an array or a
+// named type of them is comparable when all its fields or its element are, and
+// a slice, a map or a function never is. Unexported fields count, since they
+// decide it as much as exported ones do. An interface is comparable (as in the
+// spec: the comparison can still panic at run time).
+func structComparable(t types.Type) bool {
+	switch t := t.(type) {
+	case *types.Alias, *types.Named:
+		return structComparable(t.Underlying())
+	case *types.Struct:
+		for i := 0; i < t.NumFields(); i++ {
+			if !structComparable(t.Field(i).Type()) {
+				return false
+			}
+		}
+	case *types.Array:
+		return structComparable(t.Elem())
+	case *types.Slice, *types.Map, *types.Signature:
+		return false
+	}
+	return true
+}
+
 func deref(t types.Type) types.Type {
 	if pt, ok := types.Unalias(t).(*types.Pointer); ok {
 		return pt.Elem()
@@ -490,6 +593,9 @@ func constValue(v constant.Value) string {
 func render(a *pkgAPI) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s\n", a.path)
+	// The import path does not name the package clause, and renaming it
+	// breaks every importer that uses the default name.
+	fmt.Fprintf(&b, "# Package clause: %s.\n", a.name)
 	b.WriteString("# The exported API, generated by .github/tools/apidump: do not edit, run `mage api`.\n")
 	built := "every configuration (api/README.md)"
 	if a.present != allConfigs() {

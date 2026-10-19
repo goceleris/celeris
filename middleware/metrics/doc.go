@@ -40,8 +40,10 @@
 // # Cardinality Protection
 //
 // A request no route matched uses the sentinel path label "<unmatched>"
-// ("<method-not-allowed>" when its path has routes for other methods), to
-// prevent high-cardinality label explosion, whatever answers it: a
+// ("<method-not-allowed>" when its path has routes for other methods), and
+// the automatic answer to an OPTIONS request uses "<options>" (the sentinels
+// are [celeris.Context.FullPath] values), to prevent high-cardinality label
+// explosion, whatever answers it: a
 // Use-mounted endpoint installed after metrics (healthcheck's /livez, static
 // files, the swagger page) is counted there with its own status, not only
 // the 404s. The method label of a request no route matched is the method
