@@ -3,7 +3,6 @@
 package iouring
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"strings"
@@ -41,40 +40,19 @@ var asyncNoticeRows = []asyncNoticeRow{
 // asyncNoticeRecords starts an io_uring engine with cfg, stops it, and returns
 // the messages it logged that name AsyncHandlers. The log is read after Listen
 // returned, so a row that expects no note cannot pass before the line was
-// written.
+// written. The start retries the ring ENOMEM a runner's 8 MiB memlock gives
+// when engines start back to back (startRingRetried662); two workers are
+// asked for, and the engine caps that to what memlock funds.
 func asyncNoticeRecords(t *testing.T, cfg resource.Config) []string {
 	t.Helper()
-	needWorkers895(t, 2)
 	var log lockedBuf
 	cfg.Addr = "127.0.0.1:0"
 	cfg.Engine = celerisengine.IOUring
-	cfg.Resources = resource.Resources{Workers: 2}
+	cfg.Resources = resource.Resources{Workers: 2} // the engines refuse fewer
 	cfg.Logger = slog.New(slog.NewJSONHandler(&log, nil))
-	e, err := New(cfg, respondingHandler{})
-	if err != nil {
-		if ioUringUnavailable639(err) {
-			skipOrFail656(t, "New: %v", err)
-		}
-		t.Fatalf("New: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	for dl := time.Now().Add(5 * time.Second); e.Addr() == nil; {
-		select {
-		case err := <-done:
-			if ioUringUnavailable639(err) {
-				skipUnlessIOUringUnusable(t, err)
-			}
-			t.Fatalf("Listen returned before publishing an address: %v", err)
-		case <-time.After(time.Millisecond):
-		}
-		if time.Now().After(dl) {
-			cancel()
-			<-done
-			t.Fatal("the engine never published an address")
-		}
-	}
+	_, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		return New(cfg, respondingHandler{})
+	})
 	cancel()
 	select {
 	case err := <-done:

@@ -47,6 +47,8 @@ func TestParseAddrReadsAnAddressAsNetParseIPDoes(t *testing.T) {
 		{"0127.0.0.1:80", nil},
 		{"300.1.1.1:80", nil},
 		{"1.2.3.4.5:80", nil},
+		// KNOWN GAP, not a goal: std binds a zoned address (net.ParseIP, which
+		// this reads, rejects the zone); tracked as checklist #885 item 54.
 		{"[fe80::1%eth0]:80", nil},
 		{"localhost:80", nil},
 	} {

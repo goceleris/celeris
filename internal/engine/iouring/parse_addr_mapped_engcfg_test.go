@@ -47,6 +47,8 @@ func TestParseAddrReadsAnAddressAsNetParseIPDoes(t *testing.T) {
 		{"0127.0.0.1:80", nil},
 		{"300.1.1.1:80", nil},
 		{"1.2.3.4.5:80", nil},
+		// KNOWN GAP, not a goal: std binds a zoned address (net.ParseIP, which
+		// this reads, rejects the zone); tracked as checklist #885 item 54.
 		{"[fe80::1%eth0]:80", nil},
 		{"localhost:80", nil},
 	} {
@@ -101,7 +103,7 @@ func sockaddrEqual(a, b unix.Sockaddr) bool {
 // bound IPv4 socket that serves a request; the address it publishes is the
 // IPv4 one, as net.Listen("tcp", "[::ffff:127.0.0.1]:0") gives.
 func TestListenOnAnIPv4MappedHostServes(t *testing.T) {
-	r := start895(t, "[::ffff:127.0.0.1]:0", 2, 2, false)
+	r := start895(t, "[::ffff:127.0.0.1]:0", 2, 1, false)
 	addr := r.e.Addr().String()
 	if !strings.HasPrefix(addr, "127.0.0.1:") {
 		t.Errorf("Addr() = %q, want the IPv4 address 127.0.0.1:port", addr)
