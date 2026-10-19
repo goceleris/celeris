@@ -110,6 +110,9 @@ const (
 	armTickGate parkArm = iota
 	// armEvent: the client of a slowloris conn closes it, right after
 	// PauseAccept, and the loop learns it from an event, before sweep().
+	// This is the control arm: it has no premise check that the loop had
+	// already closed its listener when the FIN arrived, and it stays green
+	// either way, because the event path retracts in the same iteration.
 	armEvent
 	// armDetachQueue: the dispatch goroutine of a conn whose request said
 	// Connection: close hands it back through the detach queue, and

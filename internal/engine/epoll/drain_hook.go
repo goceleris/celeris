@@ -18,8 +18,10 @@ var drainPollHook atomic.Pointer[func()]
 
 // SetDrainPollHook makes every epoll loop of this process run f at each wait
 // of its shutdown send drain (see drainPollHook), until the returned function
-// is called, which puts back what was set before. f runs on the loop thread
-// with no lock held, and must not block. Tests only: the hook is
+// is called, which puts back what was set before, but only if this call's hook
+// is still the one installed: a restore that runs after a later caller
+// replaced the hook leaves that caller's hook alone. f runs on the loop
+// thread with no lock held, and must not block. Tests only: the hook is
 // process-wide, so a test that sets it runs no other engine's shutdown
 // meanwhile.
 func SetDrainPollHook(f func()) (restore func()) {
@@ -28,5 +30,5 @@ func SetDrainPollHook(f func()) (restore func()) {
 		p = &f
 	}
 	prev := drainPollHook.Swap(p)
-	return func() { drainPollHook.Store(prev) }
+	return func() { drainPollHook.CompareAndSwap(p, prev) }
 }
