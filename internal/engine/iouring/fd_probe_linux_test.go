@@ -24,9 +24,21 @@ func fdTarget(fd int) string {
 	return s
 }
 
-// serverFDFor returns this process's descriptor whose peer is local (the
-// server side of a loopback connection the test dialed), or -1.
-func serverFDFor(local string) int {
+// serverFDFor returns this process's descriptor that is the server side of
+// the loopback connection the test dialed from local to server: a socket
+// whose peer is local and whose own address is server. Or -1.
+//
+// Both ends are matched (celeris#1081). The peer alone does not name one
+// connection in a test binary that has run other tests: a socket an earlier
+// test left open (the server side of a connection it accepted and kept, such
+// as the descriptor a hand-built worker was given) has as its peer that
+// test's client port, and connect(2) hands that port out again once the
+// client that had it is gone, possibly to this test's client. /proc/self/fd
+// lists its names in
+// lexical order, so such a socket at "123" was found before this
+// connection's at "45", and a test that then checked that descriptor after
+// the engine stopped found a socket the engine never owned still open.
+func serverFDFor(local, server string) int {
 	ents, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		return -1
@@ -36,11 +48,22 @@ func serverFDFor(local string) int {
 		if err != nil {
 			continue
 		}
-		if namesPeer(fd, local) {
+		if namesConn(fd, local, server) {
 			return fd
 		}
 	}
 	return -1
+}
+
+// namesConn reports whether fd is a socket whose peer is local and whose own
+// address is server: the server side of the loopback connection dialed from
+// local to server.
+func namesConn(fd int, local, server string) bool {
+	if !namesPeer(fd, local) {
+		return false
+	}
+	sa, err := unix.Getsockname(fd)
+	return err == nil && sockaddrString(fd, sa) == server
 }
 
 // namesPeer reports whether fd is a socket whose peer is local: the server
