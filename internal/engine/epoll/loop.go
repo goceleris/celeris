@@ -4979,6 +4979,9 @@ func (l *Loop) drainSends() {
 		if !ok {
 			return
 		}
+		if h := drainPollHook.Load(); h != nil {
+			(*h)() // tests only (SetDrainPollHook)
+		}
 		if _, err := unix.Poll(fds, int(wait/time.Millisecond)+1); err != nil && err != unix.EINTR {
 			return
 		}
