@@ -532,14 +532,16 @@ jobs:
       # never sends another byte. A rename or an environment skip would take
       # them out of CI with no red.
       #
-      # Nineteen names, in three lists: r1 is the eight this PR first shipped,
+      # Twenty names, in three lists: r1 is the eight this PR first shipped,
       # r2 the nine the review added (sweep_r2_test.go -- the cycle rule and
       # its cost bound, the classifier's lock under -race, the ask's
       # permanent-class pre-check, the release belt over the batch being
       # drained, the pending count, the two gauge retractions and the
-      # connection that has sent no byte), and c711 the celeris#711 pair (a
-      # loop that parks holding nothing retracts what it published; each
-      # starts a real two-loop engine). All nineteen run here by name with
+      # connection that has sent no byte), and c711 the celeris#711 trio (a
+      # loop that parks holding nothing retracts what it published, whether
+      # its last connection left at the tick gate, by an event, or through the
+      # detach queue, the last with no timer disarmed; each starts a real
+      # two-loop engine). All twenty run here by name with
       # the interlock the step above uses: -v, exact top-level RUN and PASS
       # counts, and no `--- SKIP` line anywhere. Two further censuses make the engine cells impossible to
       # lose quietly. Both build their engine with Resources.Workers=2, so
@@ -561,7 +563,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           r1='TestSweepMovesIdleConnsWithoutTraffic|TestSweepMovesIdleAsyncConnsWithoutTraffic|TestSweepStopsWithTheDrain|TestSweepGoesDormantOnPermanentResidue|TestSweepBudgetCoversEveryConnAcrossPasses|TestSweepCadenceBacksOffAndResets|TestAskNeverOutlivesConnState|TestSweepDoesNotBlockOnADetachedConnsLock'
           r2='TestSweepCannotGoDormantWithAnUnexaminedArrival|TestSweepCostIsBoundedUnderContinuousArrivals|TestSweepClassifiesUnderTheLockTheEngineRequires|TestParkAskSkipsWhatTheHandoffCannotAccept|TestDropAskWithdrawsFromTheBatchBeingDrained|TestAskPendingCountsTheQueue|TestResidualGaugeRetractsWhatTheLoopNoLongerHolds|TestResidualGaugeRetractsAtShutdown|TestSweepGoesDormantOnAConnThatHasSentNothing'
-          c711='TestParkedLoopRetractsResidueOfAPostSweepClose|TestParkedLoopRetractsResidueOfAPreSweepClose'
+          c711='TestParkedLoopRetractsResidueOfAPostSweepClose|TestParkedLoopRetractsResidueOfAPreSweepClose|TestParkedLoopRetractsResidueOfADetachQueueClose'
           names="${r1}|${r2}|${c711}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \

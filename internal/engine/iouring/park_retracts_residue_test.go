@@ -9,8 +9,21 @@ package iouring
 // after sweep() in the iteration that parks it, and the residue the worker
 // published last used to stand in the engine-wide gauges until the next
 // ResumeAccept: no manipulation needed, a legal config reaches it every time.
-// The header-timer CQE is dispatched before sweep(), which is why the default
-// slowloris defence retracted; that close is the control.
+// A CQE is dispatched before sweep(), which is why a close its CQE causes
+// retracted: the control is the client's own close (the recv CQE that reads
+// EOF), the one close of the last connection that cannot reach the park after
+// sweep(). The header timer is not the control: its CQE closes before sweep(),
+// but checkTimeouts closes on the same deadline (hdrDL) after it, and
+// whichever gets there first closes, so a 400 ms header timer left the
+// control's side to the scheduler (celeris#885 item 11).
+//
+// What the post-sweep arm guards today is the retraction and the closeFDOwed
+// gate together (celeris#685): a ReadTimeout close of a conn with its recv
+// armed leaves the descriptor owed to the cancel's CQE, and a worker with a
+// close owed does not park, so the next iteration's sweep() retracts. The arm
+// goes red with both removed, not with the retraction alone (checked in
+// celeris#885 item 11); the retraction is what a close with nothing in flight
+// would need.
 
 import (
 	"io"
@@ -84,8 +97,9 @@ func parkWaitIou(d time.Duration, f func() bool) bool {
 
 // parkResidueIou drives a draining worker through the park with its last
 // connection, a partial request, closed by the ReadTimeout branch of
-// checkTimeouts (postSweep) or by its header timer's CQE (!postSweep), and
-// asserts that a worker that has parked holding nothing publishes nothing.
+// checkTimeouts (postSweep) or by the client, right after PauseAccept
+// (!postSweep), and asserts that a worker that has parked holding nothing
+// publishes nothing. The header timeout is 60 s in both arms: far from either.
 func parkResidueIou(t *testing.T, postSweep bool) {
 	var disc atomic.Int64
 	e, addr := startParkEngine711(t, fdlHandler{}, func(c *resource.Config) {
@@ -95,12 +109,10 @@ func parkResidueIou(t *testing.T, postSweep bool) {
 		// connection's deadline, and the close lands on a worker with no
 		// listener, the only kind that parks.
 		c.DisableDeferAccept = true
+		c.ReadHeaderTimeout = 60 * time.Second // neither the header timer nor its checkTimeouts close can come first
 		if postSweep {
-			c.ReadHeaderTimeout = 60 * time.Second // the header timer stays far away
 			c.ReadTimeout = 300 * time.Millisecond
 			c.IdleTimeout = 10 * time.Minute
-		} else {
-			c.ReadHeaderTimeout = 400 * time.Millisecond
 		}
 	})
 	e.mu.Lock()
@@ -151,6 +163,11 @@ func parkResidueIou(t *testing.T, postSweep bool) {
 		t.Fatalf("celeris711 PREMISE: the connection closed (active=%d) before PauseAccept returned, so not "+
 			"on a worker without a listener", n)
 	}
+	if !postSweep {
+		// The client leaves, far before any deadline: the worker reads the
+		// EOF from a CQE, and CQEs are dispatched before sweep().
+		_ = c.Close()
+	}
 	if !parkWaitIou(10*time.Second, func() bool { return e.Metrics().ActiveConnections == 0 }) {
 		t.Fatalf("celeris711 PREMISE: the connection was never closed")
 	}
@@ -182,6 +199,6 @@ func parkResidueIou(t *testing.T, postSweep bool) {
 func TestParkedWorkerRetractsResidueOfAPostSweepClose(t *testing.T) { parkResidueIou(t, true) }
 
 // TestParkedWorkerRetractsResidueOfAPreSweepClose is its control: the same
-// connection closed by its header timer's CQE, before sweep(), which
-// retracted before this fix as well.
+// connection closed by the client's EOF, a CQE dispatched before sweep(),
+// which retracted before this fix as well.
 func TestParkedWorkerRetractsResidueOfAPreSweepClose(t *testing.T) { parkResidueIou(t, false) }
