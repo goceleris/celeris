@@ -435,7 +435,7 @@ func (s *H1State) SetWriteErrQuery(q WriteErrQuery) {
 // back in a pool at once, and a buffered response's body lives on a pooled
 // Context. So fn writes the body to the socket itself and copies what the
 // socket did not take (epoll); an engine that cannot finish its write
-// before returning (io_uring, whose kernel reads a WRITEV's iovec when the
+// before returning (io_uring, whose kernel reads a SEND's buffer when the
 // ring is next entered) leaves this unset, and the adapter then copies the
 // body into the write buffer.
 func (s *H1State) SetWriteBodyFn(fn func([]byte)) {

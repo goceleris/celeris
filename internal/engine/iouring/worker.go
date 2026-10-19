@@ -6146,20 +6146,27 @@ func (w *Worker) serveAsync(cs *connState, holds *dispatchHolds) {
 // (a SEND_ZC whose notification has not come) or a non-empty cs.sendBuf (bytes
 // the worker has taken from writeBuf and not yet sent). Its callers are the
 // ones that write to the socket from a dispatch goroutine: the detached conns'
-// guarded writeFn and runAsyncHandler's direct writes, which hold cs.detachMu.
+// guarded writeFn and serveAsync's direct writes (the h2c 101 and the write
+// after ProcessH1), which hold cs.detachMu.
 //
 // The invariant that holds is narrower than "the worker changes these three
 // fields under cs.detachMu". The flush sites that take it when the conn has
 // one (respondAndArm, endH1Verdict, finishH1Upgrade, the dirty-list flush,
-// completeSend, the GOAWAY drain) cannot start a SEND while a caller holds it.
-// These flushSend callers do not take it: closeConn's deferred-close flush
-// (after detachClosed was set under the lock, from when the guarded writeFn
-// writes nothing), the h2Conns write-queue drain (drainH2Writes), the flush
-// before a conn is promoted to async (handleRecv, replayCarriedAsync), and the
-// flushes after the replay of a transplant's carried bytes (attachAdoptedFD,
-// replayCarriedAsync), which run on a conn the worker has just adopted.
-// UNVERIFIED: that none of those can run while a guarded writeFn does its
-// inline write, e.g. a carried request that detaches (celeris#884 item 26).
+// completeSend and handleSend's SEND_ZC fallback flush, the GOAWAY drain, and
+// since celeris#1084 the flush after a transplant's carried-bytes replay,
+// flushCarriedReplay) cannot start a SEND while a caller holds it.
+//
+// These flushSend callers do not take it. Proven racy before celeris#1084:
+// the carry-replay flushes in attachAdoptedFD (sync) and replayCarriedAsync,
+// when the carried request detaches during the replay (a -race report at the
+// flushSend against the guarded writeFn). Reasoned safe, not probed:
+//   - closeConn's deferred-close flush: detachClosed is set under the lock, and
+//     the guarded writeFn writes nothing from then on.
+//   - the flush before a conn is promoted to async (handleRecv,
+//     replayCarriedAsync): a detach breaks the pipelining loop, so none can
+//     precede ErrAsyncDispatch in the same ProcessH1, and no dispatch
+//     goroutine exists yet.
+//   - drainH2Writes: an HTTP/2 conn has no guarded writeFn.
 func ringSendOutstanding(cs *connState) bool {
 	return cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0
 }
