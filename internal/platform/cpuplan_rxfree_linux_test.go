@@ -810,3 +810,24 @@ func TestPlanWorkerCPUsForOnTheRealHost(t *testing.T) {
 		}
 	}
 }
+
+// The Debug text is bounded however many vectors a NIC has, and the reason the
+// rule gives is never the line that is cut.
+func TestRxFreeWhyIsBounded(t *testing.T) {
+	s := msr1Shape()
+	for i := 0; i < 60; i++ {
+		s.vecs = append(s.vecs, vec{"tx0", 100 + i, 0, 2_000_000_000})
+	}
+	// More candidates than the floor allows: the reason comes last.
+	for i := 0; i < 5; i++ {
+		s.vecs = append(s.vecs, vec{"rx0", 200 + i, 7 + i%4, 3_000_000_000})
+	}
+	got, base := s.plan(t, 12)
+	if len(got.RxFree.Why) == 0 || len(got.RxFree.Why) > rxMaxWhy {
+		t.Fatalf("%d Why lines, want 1..%d", len(got.RxFree.Why), rxMaxWhy)
+	}
+	same1049(t, "too many candidates", got, base)
+	if last := got.RxFree.Why[len(got.RxFree.Why)-1]; !strings.Contains(last, "floor of loops") {
+		t.Errorf("the last Why line is not the reason: %q", last)
+	}
+}
