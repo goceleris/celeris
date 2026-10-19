@@ -669,6 +669,14 @@ func (w *Worker) endOwedOpsAtShutdown() {
 	}
 	pending := func() bool { return acceptOwed || connsPending() }
 	var ringErr error
+	// Not under SQPOLL: this drain submits and waits with io_uring_enter, which
+	// an SQPOLL ring does not take the same way, so it is skipped and shutdown
+	// closes the descriptors with the ops still owed, as it did before the
+	// drain (celeris#685). No tier enables SQPOLL today (every SQPollIdle is 0,
+	// celeris#377; TestNoTierEnablesSQPoll884), so this is unreachable. Enabling
+	// it must first give the drain an SQPOLL form that waits on the CQ ring
+	// without entering (celeris#884 item 18, with hijackConn). The same holds
+	// for queueListenAcceptCancel.
 	if w.ring != nil && !w.sqpoll && pending() {
 		for _, cs := range owed {
 			w.cancelConnOps(cs.fd, cs)

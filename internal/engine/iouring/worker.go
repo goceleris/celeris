@@ -3150,6 +3150,14 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// linked recv, which rides behind a SEND: a hijack with a send pending
 	// is refused above. One io_uring_enter per hijack with an op owed; none
 	// otherwise, which is every hijack on single-shot recv.
+	//
+	// Not under SQPOLL: its kernel thread submits on its own schedule, so no
+	// submit here puts the cancel in the kernel before the hijacker has the
+	// socket, and nothing below waits for it. No tier enables SQPOLL today
+	// (every SQPollIdle is 0, celeris#377; TestNoTierEnablesSQPoll884), so this
+	// is unreachable. Enabling it must first make this wait for the cancel's
+	// CQE before it hands the socket over, or an issued recv can take the
+	// hijacker's first bytes (celeris#884 item 18, with endOwedOpsAtShutdown).
 	if fdOwed(cs) && !w.sqpoll {
 		_, _ = w.ring.Submit()
 	}
@@ -3280,8 +3288,9 @@ func (w *Worker) initProtocol(cs *connState) {
 				// interleave on the wire). detachMu (held) gates it: the worker
 				// submits every SEND under detachMu and sets cs.sending, and
 				// completeSend now clears it under detachMu too, so with
-				// cs.sending==false && !zcNotifPending && sendBuf empty no
-				// SEND is outstanding and none can start while we hold the lock —
+				// !ringSendOutstanding(cs) (cs.sending false, no SEND_ZC
+				// notification pending, sendBuf empty) no SEND is outstanding
+				// and none can start while we hold the lock —
 				// writeBuf is the only pending data, so the raw write is exclusive
 				// and correctly ordered. Requires a REAL fd: under ACCEPT_DIRECT
 				// (fixedFile) cs.fd is a ring file-table index, not a syscall'able
@@ -3302,8 +3311,7 @@ func (w *Worker) initProtocol(cs *connState) {
 					// handler error does; the stream's next Write reports it
 					// (detachedStreamErr, celeris#884 item 45, #885 item 30).
 					cs.asyncClosed.Store(true)
-				} else if !cs.fixedFile && !cs.sending && !cs.zcNotifPending &&
-					len(cs.sendBuf) == 0 && len(cs.writeBuf) > 0 {
+				} else if !cs.fixedFile && !ringSendOutstanding(cs) && len(cs.writeBuf) > 0 {
 					if n, werr := unix.Write(cs.fd, cs.writeBuf); werr == nil {
 						w.bytesWritten.Add(uint64(n))
 						// celeris#591: these bytes never touch the ring, so
@@ -5171,19 +5179,27 @@ func (w *Worker) queuePendingReleaseFD(cs *connState, detached bool, keptFD int)
 }
 
 // queuePendingReleaseDetached holds cs alive past the kernel's recv-SQE
-// drain window without recycling it through sync.Pool. Used by the
-// detached close path (async-dispatch HTTP/1.1, WebSocket, SSE), where
-// goroutine closures still reference cs.h1State / cs.asyncCond /
-// cs.asyncInBuf — the worker observed asyncClosed and tore the conn
-// down, but the dispatch goroutine can still be inside its deferred
-// recover() block, reading cs.fd and re-clearing cs.asyncInBuf, when
-// finishCloseDetached returns. Recycling cs through releaseConnState
-// at this point races those reads. We just keep the strong ref alive
-// until the kernel ops drain (cs.kernelInflight == 0) and let GC
-// collect — the goroutine's own closure references keep cs alive for
-// however long it still needs it, but only THIS queue's strong ref is
-// visible on behalf of the kernel's invisible recv pointer, so it must
-// outlive every pending op targeting cs.buf // span-corruption class).
+// drain window without recycling it through sync.Pool. Its callers, the
+// conns that something outside the worker still holds:
+//   - finishCloseDetached, the detached close path (async-dispatch HTTP/1.1,
+//     WebSocket, SSE), where goroutine closures still reference
+//     cs.h1State / cs.asyncCond / cs.asyncInBuf: the worker observed
+//     asyncClosed and tore the conn down, but the dispatch goroutine can
+//     still be inside its deferred recover() block, reading cs.fd and
+//     re-clearing cs.asyncInBuf, when finishCloseDetached returns.
+//     Recycling cs through releaseConnState at this point races those reads.
+//   - hijackConn, where the request's strings are views of cs.buf (or of
+//     cs.detectAccum) that a hijacking handler keeps past the handler, so the
+//     views must outlive it (celeris#733): recycled, cs would hand those
+//     buffers to the next connection the worker accepts.
+//   - handOff of the async site (detachedRelease), whose dispatch goroutine
+//     may still be in its deferred recover()/Done() block referencing cs.
+//
+// We just keep the strong ref alive until the kernel ops drain
+// (cs.kernelInflight == 0) and let GC collect: the closures' and views'
+// own references keep cs alive for however long they still need it, but only
+// THIS queue's strong ref is visible on behalf of the kernel's invisible recv
+// pointer, so it must outlive every pending op targeting cs.buf.
 func (w *Worker) queuePendingReleaseDetached(cs *connState) {
 	w.queuePendingReleaseFD(cs, true, -1)
 }
@@ -6127,11 +6143,21 @@ func (w *Worker) serveAsync(cs *connState, holds *dispatchHolds) {
 
 // ringSendOutstanding reports whether a ring SEND of cs's earlier bytes is in
 // flight, or owed, so that a raw unix.Write of writeBuf now would reach the
-// wire ahead of them (celeris#751): a SEND or its SEND_ZC notification is
-// outstanding, or sendBuf holds bytes the worker has taken from writeBuf and
-// not yet sent. The worker mutates all four under cs.detachMu,
-// which the caller holds, so no SEND can start while it does. The detached
-// conns' guarded writeFn tests the same condition.
+// wire ahead of them (celeris#751): cs.sending (a SEND), cs.zcNotifPending
+// (a SEND_ZC whose notification has not come) or a non-empty cs.sendBuf (bytes
+// the worker has taken from writeBuf and not yet sent). Its callers are the
+// ones that write to the socket from a dispatch goroutine: the detached conns'
+// guarded writeFn and runAsyncHandler's direct writes, which hold cs.detachMu.
+//
+// The invariant that holds is narrower than "the worker changes these three
+// fields under cs.detachMu". Most flush sites take it (respondAndArm, the
+// dirty-list flush, completeSend, the GOAWAY drain), so no SEND can start
+// while a caller holds it. Three flushSend callers do not: closeConn's
+// deferred-close flush (after detachClosed was set under the lock, from when
+// the guarded writeFn writes nothing), the h2Conns write-queue drain
+// (drainH2Writes), and the flush before a conn is promoted to async.
+// UNVERIFIED: that none of those three can run while a guarded writeFn does
+// its inline write (celeris#884 item 26).
 func ringSendOutstanding(cs *connState) bool {
 	return cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0
 }

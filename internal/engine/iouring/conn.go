@@ -774,6 +774,22 @@ func releaseConnState(cs *connState) {
 // debts (the asyncClosed branch runs the close; any other entry puts the conn
 // back on the dirty list). The paths that exit WITHOUT enqueuing must enqueue
 // when it reports true, or the close or the recv arm it stands for is lost.
+//
+// The exit contract (celeris#780), which rerunHandOff and tryTransplant rely
+// on and nothing here enforces: every exit of the goroutine other than the two
+// below must have published, before this clears asyncRun, that the conn is not
+// the worker's to hand off: asyncClosed (the handler-error, write-error, panic
+// and closed-while-parked exits), or a non-HTTP/1 protocol (the h2c-upgrade
+// exit). Both are stored before asyncRun is cleared, and read under asyncInMu
+// by a worker that sees asyncRun clear: such a conn belongs to its queued
+// entry, which closes it or finishes the upgrade, and a hand-off made first
+// would leave that entry acting on a descriptor number the hand-off gave up.
+// The exceptions: a claim (transplantPending, set by the exit that hands the
+// conn to epoll; the worker defers to the claim's drain and counts it), and the
+// revert to inline (asyncPromoted cleared under asyncInMu, so the conn is the
+// worker's and tryTransplant takes it as any inline conn). A new exit that is
+// neither must publish one of them first. No test drives every exit and
+// checks the two callers refuse the conn (celeris#884 item 29).
 func (cs *connState) endDispatch() (owed bool) {
 	cs.asyncRun = false
 	cs.asyncParked = false
