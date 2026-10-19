@@ -2,7 +2,11 @@
 
 package iouring
 
-import "github.com/goceleris/celeris/internal/platform"
+import (
+	"log/slog"
+
+	"github.com/goceleris/celeris/internal/platform"
+)
 
 // pinThreadToCPU is the call that pins a worker's locked thread. A variable so
 // a test can make it fail.
@@ -12,13 +16,32 @@ var pinThreadToCPU = platform.PinToCPU
 // stand in a plan.
 var planWorkerCPUs = platform.PlanWorkerCPUs
 
+// The plan is also the loop count: the engine starts len(plan.CPUs) of them
+// (celeris#1036), which on a big.LITTLE host is fewer than the default.
+
+// planWithinMemlock plans the workers and then holds the plan to what
+// RLIMIT_MEMLOCK funds. The plan comes first because on a big.LITTLE host it
+// decides the count (8 on a 12-CPU host with 4 little CPUs): a memlock ceiling
+// of 9 to 11 workers then changes nothing and must not warn, and the cap that
+// does bind is stated in the plan's own terms (requested = the loops planned).
+// The planner fills distinct CPUs before it repeats one, so cutting the plan
+// to its first ceiling entries keeps it balanced. Where the CPUs are alike this
+// is the plan the planner makes for the capped count.
+func planWithinMemlock(requested int, explicit bool, logger *slog.Logger) platform.CPUPlan {
+	plan := planWorkerCPUs(requested, explicit)
+	if capped := capWorkersToMemlock(len(plan.CPUs), logger); capped < len(plan.CPUs) {
+		plan = plan.Truncate(capped, "RLIMIT_MEMLOCK")
+	}
+	return plan
+}
+
 // pinFailures collects the workers whose pin failed until the engine logs them
 // (celeris#909).
 var pinFailures platform.PinFailures
 
 // pinOwnThread pins the calling (locked) worker thread to the CPU the engine
-// planned for this worker. A worker planned unpinned (cpuID < 0: a little CPU
-// of a big.LITTLE host is left to the scheduler) does nothing. A pin the
+// planned for this worker. A worker whose planned CPU is negative (cpuID < 0: the
+// planner never plans one since celeris#1036, a test plan may) does nothing. A pin the
 // kernel refuses leaves the worker unpinned and says so: cpuID becomes -1,
 // which is what CPUID reports for a worker that is not pinned and what
 // NewRingCPU reads as "no SQPOLL thread affinity", and the failure is recorded
