@@ -299,7 +299,7 @@ func (w *Worker) holdEligible(cs *connState) bool {
 	if !cs.h1State.AtRequestBoundary() || cs.h1State.HasPendingData() {
 		return false
 	}
-	return cs.sending || len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0 || len(cs.bodyBuf) > 0
+	return cs.sending || len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0
 }
 
 // releaseHold runs after the hand-off attempt at every send dispatch site
@@ -338,7 +338,7 @@ func (w *Worker) releaseHoldSlow(cs *connState, rescued bool) {
 		}
 		defer mu.Unlock()
 	}
-	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 || len(cs.bodyBuf) > 0 {
+	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return
 	}
 	cs.transplantHold = false
