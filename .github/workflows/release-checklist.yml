@@ -48,8 +48,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install mage
-        run: go install github.com/magefile/mage@v1.17.2
+      # mage is a `tool` of .github/tools (pinned by its go.sum, bumped by
+      # Dependabot; celeris#890). Building it in a step of its own keeps a
+      # build failure from reading as "not a release milestone" below, where
+      # a failure of the mage run itself exits 0.
+      - name: Build mage
+        run: GOWORK=off go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" -n mage
 
       - name: Render the checklist
         id: body
@@ -61,7 +65,7 @@ jobs:
           # above lets through anything starting with "v", and mage rejects
           # the rest. Exit quietly rather than failing a maintainer's
           # unrelated milestone.
-          if ! mage ReleaseChecklist > /tmp/checklist.md 2>/tmp/checklist.err; then
+          if ! GOWORK=off go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" mage ReleaseChecklist > /tmp/checklist.md 2>/tmp/checklist.err; then
             echo "not a release milestone ($VERSION); nothing to do"
             cat /tmp/checklist.err
             echo "skip=true" >> "$GITHUB_OUTPUT"

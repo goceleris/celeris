@@ -39,19 +39,20 @@ jobs:
       # Magefiles carry `//go:build mage`, so `go vet ./...`, `go build` and
       # `go test` ALL skip them — only mage itself compiles them, which means a
       # broken magefile can reach main green. Compile them here.
-      - name: Install mage
-        run: |
-          go install github.com/magefile/mage@v1.17.2
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      #
+      # mage, like actionlint and govulncheck, is a `tool` of .github/tools,
+      # pinned by its go.sum and bumped by Dependabot, and runs through
+      # `go tool -modfile`; GOWORK=off keeps a go.work file from changing the
+      # module graph (celeris#890). Nothing is installed.
       - name: mage compiles
-        run: mage -compile /tmp/mage-compile-check
+        run: GOWORK=off go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" mage -compile /tmp/mage-compile-check
       # Every hand-written version stamp (server.go Version, the sub-module
       # pins, the README heading) must agree; the release workflow refuses to
       # tag while they disagree with the tag, and this refuses a PR that
       # leaves them disagreeing with each other. `VERSION=vX.Y.Z mage
       # PrepRelease` moves all of them at once.
       - name: Release stamps agree
-        run: mage CheckRelease
+        run: GOWORK=off go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" mage CheckRelease
       # api/ lists the exported API of every package (api/README.md). A PR
       # that adds, removes or changes an exported identifier regenerates it
       # with `mage api`, so the API change is part of the review; this step
@@ -63,6 +64,11 @@ jobs:
         run: go -C .github/tools run ./apidump
       - name: apidump's own tests
         run: go -C .github/tools test -count=1 ./apidump
+      # `mage tools` keeps an h2spec on PATH that says 2.6.0 unless its build
+      # info names another version of h2spec's module (celeris#890). No go
+      # test reaches magefiles, so this runs the real target on stand-ins.
+      - name: mage tools refuses a mis-stamped h2spec
+        run: .github/scripts/mage-tools-test.sh
       # The SKIP tallies of this workflow count `--- SKIP: ` lines with
       # .github/scripts/skip-count.sh, which also fails on a SKIP line that a
       # bare anchored grep would not count (output written without a trailing
@@ -72,6 +78,17 @@ jobs:
       # counts less.
       - name: skip-count.sh self-test
         run: .github/scripts/skip-count-test.sh
+      # The tools CI runs are pinned in one place, .github/tools/go.mod, and
+      # three other places name them: the allow list of its Dependabot entry
+      # (a tool without an entry, or one that names a package path instead
+      # of the module path, silently stops getting bump PRs), CONTRIBUTING's
+      # golangci-lint version, and the workflows (no `go install ...@v`).
+      # tool-pins-check.sh compares them; its self-test runs it on broken
+      # fixtures, so a check that stops failing is a red Lint (celeris#890).
+      - name: Tool pins agree
+        run: .github/scripts/tool-pins-check.sh
+      - name: tool-pins-check.sh self-test
+        run: .github/scripts/tool-pins-check-test.sh
 
       - name: Lint root module
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
@@ -107,11 +124,9 @@ jobs:
       - name: actionlint
         # Workflow-YAML lint: catches script-injection vectors, unknown
         # runner labels, malformed shell, action input misuse — the
-        # whole class golangci-lint can't see. Pinned to an exact version
+        # whole class golangci-lint can't see. Pinned by .github/tools/go.sum
         # so a new actionlint release cannot turn main red on its own.
-        run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          actionlint -color
+        run: GOWORK=off go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" actionlint -color
       - name: zizmor
         # Workflow security audit (unpinned actions, persisted credentials,
         # template injection, excessive permissions). Complements
