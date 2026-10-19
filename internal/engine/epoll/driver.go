@@ -380,7 +380,8 @@ func (l *Loop) UnregisterConn(fd int) error {
 }
 
 // Write enqueues data for transmission on fd. Returns engine.ErrUnknownFD
-// if fd is not registered on this worker, or engine.ErrQueueFull if the
+// if fd is not registered on this worker or is already closing (after
+// UnregisterConn, or after the conn failed), or engine.ErrQueueFull if the
 // pending backlog would exceed driverWriteCap.
 //
 // The call is non-blocking: it performs at most one write(2) inline when
