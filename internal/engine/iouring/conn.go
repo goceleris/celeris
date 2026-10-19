@@ -198,8 +198,8 @@ type connState struct {
 	// connections' ZC sends are still in flight. Classifying on it meant the
 	// FIRST failing ZC completion per worker was absorbed and every sibling
 	// behind it was read as a broken connection and closed. Written only
-	// where a send SQE is armed (prepSendSQE and the two non-ZC arming sites
-	// in flushSend / flushSendLink); at most one send SQE is in flight per
+	// where a send SQE is armed (prepSendSQE, and the one non-ZC arming site,
+	// the linked send of flushSendLink); at most one send SQE is in flight per
 	// connection — flushSend/flushSendLink both bail on cs.sending ||
 	// cs.zcNotifPending — so one flag is exact. Worker-thread-only.
 	sendIsZC bool // 1: the in-flight send SQE was armed as SEND_ZC

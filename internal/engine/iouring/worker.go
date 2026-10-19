@@ -6149,14 +6149,17 @@ func (w *Worker) serveAsync(cs *connState, holds *dispatchHolds) {
 // guarded writeFn and runAsyncHandler's direct writes, which hold cs.detachMu.
 //
 // The invariant that holds is narrower than "the worker changes these three
-// fields under cs.detachMu". Most flush sites take it (respondAndArm, the
-// dirty-list flush, completeSend, the GOAWAY drain), so no SEND can start
-// while a caller holds it. Three flushSend callers do not: closeConn's
-// deferred-close flush (after detachClosed was set under the lock, from when
-// the guarded writeFn writes nothing), the h2Conns write-queue drain
-// (drainH2Writes), and the flush before a conn is promoted to async.
-// UNVERIFIED: that none of those three can run while a guarded writeFn does
-// its inline write (celeris#884 item 26).
+// fields under cs.detachMu". The flush sites that take it when the conn has
+// one (respondAndArm, endH1Verdict, finishH1Upgrade, the dirty-list flush,
+// completeSend, the GOAWAY drain) cannot start a SEND while a caller holds it.
+// These flushSend callers do not take it: closeConn's deferred-close flush
+// (after detachClosed was set under the lock, from when the guarded writeFn
+// writes nothing), the h2Conns write-queue drain (drainH2Writes), the flush
+// before a conn is promoted to async (handleRecv, replayCarriedAsync), and the
+// flushes after the replay of a transplant's carried bytes (attachAdoptedFD,
+// replayCarriedAsync), which run on a conn the worker has just adopted.
+// UNVERIFIED: that none of those can run while a guarded writeFn does its
+// inline write, e.g. a carried request that detaches (celeris#884 item 26).
 func ringSendOutstanding(cs *connState) bool {
 	return cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0
 }
