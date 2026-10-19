@@ -156,7 +156,22 @@ type Config struct {
 	// than the default at io_uring with 512 connections (0.10% to 0.20% of
 	// requests at about 208 ms, maxima of 2.1 to 2.2 s in two of three cells,
 	// against 0.01% to 0.02% and 0.6 to 1.1 s for the default).
-	// Hosts whose CPUs are alike are unchanged (README, "CPU pinning").
+	//
+	// With Workers unset on that kind of host the loops also stay off the
+	// non-little CPUs that service the busy interrupt vectors of the NIC port
+	// that received the traffic (celeris#1036 item 1): the port that took at
+	// least 60% of the packets received since boot by the physical ports behind
+	// the listen address, as read from /sys/class/net and /proc/interrupts
+	// when the engine starts. At most a quarter of the non-little CPUs go (2 of
+	// 8, so 6 loops), the count is never raised, a CPU that also services a
+	// busy vector of another port keeps its loop, and nothing changes when a
+	// file cannot be read, when the load is spread over more CPUs than that
+	// quarter, or when a busy vector of another port sits on a CPU that runs no
+	// loop. A Workers you set is planned as above, whatever the NIC does. The
+	// engine's Info line names the CPUs, the port and its share. This rule is
+	// UNVERIFIED on the cluster: it is fitted to one host (celeris#1036).
+	// Hosts whose CPUs are alike are unchanged and read no NIC file (README,
+	// "CPU pinning").
 	Workers int
 
 	// WorkloadHint optionally declares the expected steady-state concurrency.
