@@ -14,9 +14,11 @@ package epoll
 //
 // checkTimeouts has two call sites on this engine: the timerfd event, BEFORE
 // sweep(), and the tick gate, AFTER it. The pair below closes the same
-// connection at the same deadline and differs only in which side of sweep()
-// the close lands on. The timerfd is disarmed so the header-deadline close
-// can only come from the tick gate: post-sweep by construction, no search.
+// connection and differs only in which side of sweep() the close lands on.
+// The timerfd is disarmed so the header-deadline close (400 ms) can only come
+// from the tick gate: post-sweep by construction, no search. The control's
+// close is the client's, right after PauseAccept, with a 10 s header
+// deadline that no step of the test can reach (celeris#885 item 11).
 
 import (
 	"context"
@@ -77,7 +79,16 @@ func parkWait(d time.Duration, f func() bool) bool {
 // postSweep names, and asserts that a loop that has parked holding nothing
 // publishes nothing.
 func parkResidue(t *testing.T, postSweep bool) {
-	const rht = 400 * time.Millisecond
+	// The header deadline is what closes the connection in the post-sweep arm,
+	// and only there: 400 ms, a deadline the test does not outwait. The
+	// pre-sweep arm closes it from the client's side, right after PauseAccept,
+	// and its deadline is 10 s, far enough that no slow step of the test can
+	// let the deadline close it first, which would land on the tick gate,
+	// after sweep(), the path this arm is the control for (celeris#885 item 11).
+	rht := 10 * time.Second
+	if postSweep {
+		rht = 400 * time.Millisecond
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("pick port: %v", err)
@@ -172,9 +183,8 @@ func parkResidue(t *testing.T, postSweep bool) {
 			"on a loop without a listener", n)
 	}
 	if !postSweep {
-		// The client leaves before its deadline: the loop learns it from
-		// an event, and the event path runs before sweep().
-		time.Sleep(50 * time.Millisecond)
+		// The client leaves, well before its deadline: the loop learns it
+		// from an event, and the event path runs before sweep().
 		_ = c.Close()
 	}
 	if !parkWait(rht+6*time.Second, func() bool { return e.Metrics().ActiveConnections == 0 }) {
