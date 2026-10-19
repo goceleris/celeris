@@ -2120,9 +2120,8 @@ func (cs *connState) endWriteSlow() {
 // noteClosingAcked is the sweep's evidence of progress on a closing conn: the
 // number of bytes the peer has acknowledged (tcp_info bytes_acked, which only
 // grows) moved since the last sample. It restarts the drain clock the same way
-// a flush that sent bytes does (noteClosingProgress), and answers whether it
-// did. The first sample of a conn is its baseline and counts as no progress,
-// unless the conn is first met after its bound had already passed (a loop whose
+// a flush that sent bytes does (noteClosingProgress). The first sample of a
+// conn is its baseline and counts as no progress, unless the conn is first met after its bound had already passed (a loop whose
 // sweeps are further apart than a short WriteTimeout): there is no baseline to
 // compare with, and the conn is given one more bound rather than cut on no
 // evidence.
@@ -2130,17 +2129,17 @@ func (cs *connState) endWriteSlow() {
 // Not on the hot path: checkTimeouts calls it for a closing conn, at most
 // every quarter of the bound (closeSampled) and once more before it reaps one,
 // and it costs one getsockopt. A
-// descriptor that is not a TCP socket, or a kernel that does not report the
-// count (before Linux 4.1), yields no evidence, which leaves the userspace
-// queue's rule alone. Loop thread.
-func (l *Loop) noteClosingAcked(cs *connState, now int64) (progressed bool) {
+// descriptor that is not a TCP socket yields no evidence, which leaves the
+// userspace queue's rule alone. Loop thread.
+func (l *Loop) noteClosingAcked(cs *connState, now int64) {
 	cs.closeSampled = now
 	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
 	if err != nil {
-		return false
+		return
 	}
 	known, prev := cs.closeAckedKnown, cs.closeAcked
 	cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+	var progressed bool
 	if known {
 		progressed = ti.Bytes_acked > prev
 	} else {
@@ -2149,7 +2148,6 @@ func (l *Loop) noteClosingAcked(cs *connState, now int64) (progressed bool) {
 	if progressed {
 		cs.closeSince = now
 	}
-	return progressed
 }
 
 // closingDrainBound is how long a conn markClosing deferred may go without the
@@ -4181,6 +4179,20 @@ func (l *Loop) checkTimeouts() {
 				// extends it): forget any grace stamp so a later expiry
 				// starts with a full drain window.
 				cs.drainDeadline = 0
+				// WriteTimeout is the one engine timeout a detached stream
+				// keeps: "no progress for WriteTimeout" on what is queued for
+				// the peer (celeris#888 items 38 and 39). Here, whatever the
+				// middleware's idle deadline says: a WebSocket peer that sends
+				// pings pushes it out for ever and reads nothing of what it is
+				// sent. The expired case below is the middleware ending the
+				// stream and has its own bound.
+				if snap.writePending {
+					if l.detachedStalled(cs, now) {
+						l.closeConn(fd)
+					}
+				} else if cs.closeSince != 0 {
+					cs.endDetachedStall()
+				}
 				continue
 			}
 			// The reap doubles as "this stream is over, drop the conn":
@@ -4274,6 +4286,77 @@ func (l *Loop) checkTimeouts() {
 			l.closeConn(fd)
 		}
 	}
+}
+
+// detachedStalled is checkTimeouts' look at a truly-detached conn (WS/SSE)
+// that has bytes queued for its peer: whether the peer has taken none of them
+// for WriteTimeout (celeris#888 items 38 and 39, celeris#884 item 69). The
+// middleware owns the stream's lifecycle, so no ReadTimeout, IdleTimeout or
+// absolute WriteTimeout applies to it; but a client that stays connected and
+// reads nothing never fails a write on a native engine (the write only queues),
+// and nothing else ended its stream short of the 64 MiB cap on what the engine
+// holds for it. The close reaches the middleware as any engine close does
+// (OnDetachClose, so an SSE stream's context ends and OnDisconnect runs).
+//
+// The clock is closeSince, the one a conn whose close is deferred behind its
+// response has (a detached conn is never in that state: closeWhenFlushed closes
+// it at once, and a half-close is the middleware's to see), started at the
+// first sweep that finds bytes queued and restarted only by evidence that the
+// peer takes them: the bytes it has acknowledged moved (noteClosingAcked, a
+// sample every quarter of the bound, the first being the baseline, so a peer
+// that took bytes in the first quarter and then none is closed up to a quarter
+// of the bound earlier than WriteTimeout after its last byte). Not lastActivity, which is the last read:
+// a WebSocket peer that sends and reads nothing, or an SSE client's request,
+// says nothing about what it takes. The acknowledged count sees the bytes that
+// the stream's own goroutine writes through the guarded hook (it flushes with
+// no lock the loop's clocks are under) as well as the loop's flushes, and costs
+// nothing per write. The sweep does the sampling after it released detachMu,
+// and the clock is the loop thread's alone, as for a closing conn.
+//
+// A socket that does not report the acknowledged count has no bound (see the
+// check below).
+//
+// WriteTimeout 0 (no timeout, or -1) is no bound: unlike a closing conn, which
+// has no handler to wait for and gets closingDrainFloor, a stream is the
+// middleware's to end, and a server that turned the write timeout off asked for
+// a client to be held for as long as it stays. A conn with nothing queued ends
+// the clock (endDetachedStall). Loop thread.
+func (l *Loop) detachedStalled(cs *connState, now int64) bool {
+	bound := int64(l.cfg.WriteTimeout)
+	if bound <= 0 {
+		return false
+	}
+	if cs.closeSince == 0 {
+		// A new stall. No sample yet: a conn whose queue is there at one
+		// sweep and gone at the next (a hot broadcaster's) would pay a
+		// getsockopt per sweep for an episode that ends before it matters.
+		// The first sample, the baseline, is due a quarter of the bound from
+		// now.
+		cs.closeSince = now
+		cs.closeSampled = now
+		cs.closeAckedKnown = false
+		return false
+	}
+	if now-cs.closeSampled >= bound/4 || (now-cs.closeSince > bound && cs.closeSampled <= cs.closeSince+bound) {
+		l.noteClosingAcked(cs, now)
+	}
+	if cs.closeSampled > cs.closeSince && !cs.closeAckedKnown {
+		// A sample was taken since the stall began and the socket gave no
+		// acknowledged count (not a TCP socket):
+		// the stream's own goroutine flushes with no lock the loop's clocks are
+		// under, and nothing else sees the bytes it writes, so a peer that
+		// reads cannot be told from one that does not. No bound, as before this
+		// one.
+		return false
+	}
+	return now-cs.closeSince > bound
+}
+
+// endDetachedStall ends the stall clock of a detached conn that has nothing
+// queued (detachedStalled). Loop thread.
+func (cs *connState) endDetachedStall() {
+	cs.closeSince = 0
+	cs.closeAckedKnown = false
 }
 
 // sweepWriteClock is checkTimeouts' look at a live conn that holds a response
