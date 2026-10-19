@@ -45,7 +45,7 @@ func TestStreamWriteErrCap884(t *testing.T) {
 	if err := cs.StreamWriteErr(0); err != nil {
 		t.Fatalf("a response at the limit, asked with n=0: %v", err)
 	}
-	cs.bodyBuf = make([]byte, 1)
+	cs.writeBuf = make([]byte, 1)
 	if err := cs.StreamWriteErr(0); !errors.Is(err, conn.ErrWriteRefused) {
 		t.Fatalf("a response over the limit, asked with n=0: %v, want ErrWriteRefused", err)
 	}
