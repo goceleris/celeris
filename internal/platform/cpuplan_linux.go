@@ -114,7 +114,8 @@ func PlanWorkerCPUs(numWorkers int, explicit bool) CPUPlan {
 	if n := DetectNUMA().NumNodes; n > 1 {
 		src.nodeCPUs = readNodeCPUs(n)
 	}
-	return planWorkerCPUs(numWorkers, explicit, src)
+	// EXPERIMENT-ONLY knob (abplan_experiment.go): a no-op unless CELERIS_AB_PLAN_CPUS is set.
+	return applyABPlanKnob(planWorkerCPUs(numWorkers, explicit, src), os.Getenv(ABPlanCPUsEnv))
 }
 
 // planSource is where planWorkerCPUs reads the machine from; the tests point
