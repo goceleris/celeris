@@ -40,7 +40,7 @@ type RxVector struct {
 
 // Sentence says what the rule did, for the plan's Note.
 func (f RxFree) Sentence() string {
-	var vs []string
+	vs := make([]string, 0, len(f.Vectors))
 	for _, v := range f.Vectors {
 		vs = append(vs, fmt.Sprintf("%s (IRQ %d, CPU %d)", v.Name, v.IRQ, v.CPU))
 	}
@@ -109,10 +109,20 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 		if r := recover(); r != nil {
 			rf = RxFree{Why: []string{fmt.Sprintf("internal error: %v", r)}}
 		}
+		if len(rf.Why) > rxMaxWhy {
+			rf.Why = rf.Why[:rxMaxWhy]
+		}
 	}()
 	why := func(format string, a ...any) RxFree {
 		rf.Why = append(rf.Why, fmt.Sprintf(format, a...))
 		return rf
+	}
+	// note adds a detail line, leaving two slots of the Debug text for the
+	// reason the rule gives in the end.
+	note := func(format string, a ...any) {
+		if len(rf.Why) < rxMaxWhy-2 {
+			rf.Why = append(rf.Why, fmt.Sprintf(format, a...))
+		}
 	}
 	budget := rxFreeBudget(len(big))
 	if budget == 0 {
@@ -221,7 +231,7 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 		}
 	}
 	for _, v := range otherVecs {
-		rf.Why = append(rf.Why, fmt.Sprintf("kept: IRQ %d (%s) of %s on CPU %d is busy and keeps its loop", v.IRQ, v.Name, v.dev, v.CPU))
+		note("kept: IRQ %d (%s) of %s on CPU %d is busy and keeps its loop", v.IRQ, v.Name, v.dev, v.CPU)
 	}
 
 	// 4. The candidates.
@@ -239,9 +249,9 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 	for _, v := range rxVecs {
 		switch {
 		case !slices.Contains(big, v.CPU):
-			rf.Why = append(rf.Why, fmt.Sprintf("passed over: IRQ %d (%s) is serviced by CPU %d, which runs no loop", v.IRQ, v.Name, v.CPU))
+			note("passed over: IRQ %d (%s) is serviced by CPU %d, which runs no loop", v.IRQ, v.Name, v.CPU)
 		case slices.ContainsFunc(otherVecs, func(o vecInfo) bool { return o.CPU == v.CPU }):
-			rf.Why = append(rf.Why, fmt.Sprintf("passed over: CPU %d also services a busy vector of another port and keeps its loop (IRQ %d, %s)", v.CPU, v.IRQ, v.Name))
+			note("passed over: CPU %d also services a busy vector of another port and keeps its loop (IRQ %d, %s)", v.CPU, v.IRQ, v.Name)
 		default:
 			if !slices.Contains(freed, v.CPU) {
 				freed = append(freed, v.CPU)
@@ -261,9 +271,6 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 	}
 	slices.Sort(freed)
 	rf.Port, rf.SharePercent, rf.Freed, rf.Vectors = port, share, freed, freedVecs
-	if len(rf.Why) > rxMaxWhy {
-		rf.Why = rf.Why[:rxMaxWhy]
-	}
 	return rf
 }
 
