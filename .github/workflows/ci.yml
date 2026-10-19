@@ -205,7 +205,9 @@ jobs:
           # A new root test that is in no shard lands here: the margin is what absorbs
           # it until it is listed in .github/root-test-shards.txt. Refs #890.
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=540s -skip "$skip" -v $pkgs 2>&1 | tee /tmp/root.log
+          # CELERIS_REQUIRE_ZONED_PEER=1: the zoned-peer test of ./test/server fails rather
+          # than skips when no up interface has an fe80:: address (a hosted runner's eth0 has one).
+          CELERIS_REQUIRE_DUALSTACK=1 CELERIS_REQUIRE_ZONED_PEER=1 go test -race -count=1 -timeout=540s -skip "$skip" -v $pkgs 2>&1 | tee /tmp/root.log
           # The shards' tests must not have run here (-skip applied), and the other
           # tallies below still see every test this step is responsible for.
           .github/scripts/root-shards.sh tally-rest /tmp/root.log

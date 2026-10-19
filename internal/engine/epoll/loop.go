@@ -5136,62 +5136,27 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 		}
 	}
 
-	if host == "" || host == "0.0.0.0" {
+	if host == "" {
 		return &unix.SockaddrInet4{Port: port}, nil
 	}
 
-	// IPv6 addresses
-	if host == "::" {
-		return &unix.SockaddrInet6{Port: port}, nil
-	}
+	// The host is what net.ParseIP says it is, as in std: an IPv4 address (an
+	// IPv4-mapped IPv6 one, "::ffff:1.2.3.4", included) binds as IPv4, any
+	// other IPv6 address as IPv6, and what does not parse is an error. That
+	// refuses what the octet loop this replaced refused by hand, with std's
+	// own rules: a byte over 255 ("300.1.1.1" bound 44.1.1.1), a leading zero
+	// ("0127.0.0.1": octal in some parsers), a fifth byte, and the shorthands
+	// inet_aton reads ("10", "127.1": "1.2.3" bound 1.2.3.0).
 	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip6 := ip.To16(); ip6 != nil && ip.To4() == nil {
-			sa := &unix.SockaddrInet6{Port: port}
-			copy(sa.Addr[:], ip6)
-			return sa, nil
-		}
-	}
-
-	sa := &unix.SockaddrInet4{Port: port}
-	parts := [4]byte{}
-	partIdx := 0
-	val := 0
-	digits := 0 // digits in the byte being read
-	for _, c := range host {
-		if c == '.' {
-			// A fourth dot would index past parts: the loop goroutine
-			// panicked on "1.2.3.4.5:80", which Config.Validate accepts
-			// (io_uring's parseAddr has had this guard).
-			if partIdx >= 3 || digits == 0 {
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-			parts[partIdx] = byte(val)
-			partIdx++
-			val = 0
-			digits = 0
-		} else if c >= '0' && c <= '9' {
-			if digits > 0 && val == 0 {
-				// "0127.0.0.1" and "010.0.0.1": a leading zero is ambiguous
-				// (octal in some parsers); net.ParseIP and std refuse it.
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-			val = val*10 + int(c-'0')
-			digits++
-			if val > 255 {
-				// "300.1.1.1" used to wrap to 44.1.1.1 and bind that.
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-		} else {
-			return nil, fmt.Errorf("invalid addr: %s", addr)
-		}
-	}
-	// "1.2.3" bound 1.2.3.0, "10" bound 10.0.0.0 and "1..2.3" bound
-	// 1.0.2.3: an address of four bytes, each written, or an error.
-	if partIdx != 3 || digits == 0 {
+	if ip == nil {
 		return nil, fmt.Errorf("invalid addr: %s", addr)
 	}
-	parts[partIdx] = byte(val)
-	sa.Addr = parts
+	if ip4 := ip.To4(); ip4 != nil {
+		sa := &unix.SockaddrInet4{Port: port}
+		copy(sa.Addr[:], ip4)
+		return sa, nil
+	}
+	sa := &unix.SockaddrInet6{Port: port}
+	copy(sa.Addr[:], ip.To16())
 	return sa, nil
 }

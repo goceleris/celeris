@@ -234,10 +234,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 
 	e.cfg.Logger.Info("epoll engine listening", "addr", e.cfg.Addr, "loops", resolved.Workers)
-	if e.cfg.AsyncHandlers && e.cfg.EnableH2Upgrade {
-		e.cfg.Logger.Info(
-			"AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker",
-		)
+	if e.cfg.AsyncH2Reachable() {
+		e.cfg.Logger.Info(resource.AsyncH2Notice)
 	}
 
 	<-ctx.Done()
