@@ -141,6 +141,10 @@ func TestDiagnosticReportNoIOUring(t *testing.T) {
 // wording is exercised.
 func TestDiagnosticNotesTheEngineFloor(t *testing.T) {
 	const note = "needs Linux 5.19"
+	// The epoll fallback is the adaptive engine's alone: an explicit
+	// Engine: IOUring fails to start (review round 1 of this change), so the
+	// note must say both and not claim that epoll serves.
+	const explicit, wrong = "explicit io_uring engine fails", "epoll engine serves instead"
 	for _, tc := range []struct {
 		name         string
 		version      string
@@ -170,6 +174,13 @@ func TestDiagnosticNotesTheEngineFloor(t *testing.T) {
 			DiagnosticReport(profile, slog.New(slog.NewTextHandler(&buf, nil)))
 			if got := strings.Contains(buf.String(), note); got != tc.want {
 				t.Errorf("DiagnosticReport mentions %q = %v, want %v:\n%s", note, got, tc.want, buf.String())
+			}
+			if tc.want {
+				for name, out := range map[string]string{"FormatDiagnostic": FormatDiagnostic(profile), "DiagnosticReport": buf.String()} {
+					if !strings.Contains(out, explicit) || strings.Contains(out, wrong) {
+						t.Errorf("%s must say an %q and not %q:\n%s", name, explicit, wrong, out)
+					}
+				}
 			}
 		})
 	}

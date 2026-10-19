@@ -81,3 +81,63 @@ func TestStartupLineReportsTheMultishotRecvThatIsInUse(t *testing.T) {
 		})
 	}
 }
+
+// TestMultishotRecvDecidedOnceAtNew pins that the start-up line and the
+// workers' rings read the opt-in once: New captures it, and a change of the
+// environment between New and the workers' start (a test can do that; an
+// operator cannot) reaches neither. Without the capture the line says what New
+// saw and the ring what run saw. Review round 1 nit on the checklist #884
+// item 48 change.
+func TestMultishotRecvDecidedOnceAtNew(t *testing.T) {
+	for _, tc := range []struct {
+		name, atNew, afterNew string
+		enabled               bool
+	}{
+		{"on at New, off after", "1", "", true},
+		{"off at New, on after", "", "1", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var log lockedBuf
+			e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+				t.Setenv(envMultishotRecv, tc.atNew)
+				e, err := New(resource.Config{
+					Addr:      "127.0.0.1:0",
+					Protocol:  engine.HTTP1,
+					Resources: resource.Resources{Workers: 2},
+					Logger:    slog.New(slog.NewJSONHandler(&log, nil)),
+				}, idleRespHandler662{})
+				t.Setenv(envMultishotRecv, tc.afterNew)
+				return e, err
+			})
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(10 * time.Second):
+					t.Error("engine did not stop within 10s")
+				}
+			})
+			if !e.tier.SupportsMultishotRecv() {
+				t.Skipf("tier %s has no multishot recv: nothing to decide", e.tier.Tier())
+			}
+			var rec map[string]any
+			for _, line := range strings.Split(strings.TrimSpace(log.String()), "\n") {
+				var r map[string]any
+				if json.Unmarshal([]byte(line), &r) == nil && r["msg"] == "io_uring engine selected" {
+					rec = r
+				}
+			}
+			if rec == nil {
+				t.Fatalf("no \"io_uring engine selected\" record in:\n%s", log.String())
+			}
+			if got := rec["multishot_recv"]; got != tc.enabled {
+				t.Errorf("multishot_recv = %v, want %v (the value at New)", got, tc.enabled)
+			}
+			for _, w := range workers662(e) {
+				if has := w.bufRing != nil; has != tc.enabled {
+					t.Errorf("worker %d has a provided-buffer ring = %v, want %v: the line and the ring must agree", w.id, has, tc.enabled)
+				}
+			}
+		})
+	}
+}

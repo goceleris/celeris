@@ -121,8 +121,9 @@ const envMultishotRecv = "CELERIS_IOURING_MULTISHOT_RECV"
 // map a provided-buffer ring: the tier must support it AND it must be
 // explicitly opted into (envMultishotRecv=1).
 //
-// Kept as one function, like fixedFilesEnabled, so the worker's gate and the
-// engine's start-up line cannot disagree: the line printed the tier's
+// Kept as one function, like fixedFilesEnabled, and read once, by New
+// (Engine.multishotRecv), so the worker's gate and the engine's start-up line
+// cannot disagree: the line printed the tier's
 // capabilities, multishot_recv=true and provided_buffers=true on every high-tier
 // kernel, on runs that never mapped a ring (checklist #884 item 48).
 func multishotRecvEnabled(tierSupports bool) bool {
@@ -516,6 +517,9 @@ type Worker struct {
 	sqpoll     bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC     bool // true when SEND_ZC is available (kernel 6.0+)
 	async      bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+	// multishotRecv: map the provided-buffer ring (Engine.multishotRecv, decided
+	// once in New by multishotRecvEnabled).
+	multishotRecv bool
 	// h1Only is true when engine config locks every conn to HTTP/1.1
 	// (Protocol == HTTP1 AND EnableH2Upgrade == false). cs.protocol is set
 	// once at registerConn and never written, so the recv hot path can
@@ -1465,7 +1469,7 @@ func (w *Worker) run(ctx context.Context) {
 	// returns. The formula gives 2 buffers per conn at the per-worker conn
 	// target — comfortable headroom without runaway RSS.
 	// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled value.
-	if multishotRecvEnabled(w.tier.SupportsMultishotRecv()) {
+	if w.multishotRecv {
 		bufRingCount := resolveBufRingCount(w.resolved, defaultConnsPerWorker)
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {

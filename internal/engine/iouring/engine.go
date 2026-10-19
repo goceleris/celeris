@@ -115,6 +115,9 @@ type Engine struct {
 	// and when the probe got no answer. Every worker gets a copy; the
 	// hand-off's REAP needs them (celeris#657).
 	asyncCancelFlags bool
+	// multishotRecv is multishotRecvEnabled as New read it: the workers map
+	// their provided-buffer ring on it, and the start-up line prints it.
+	multishotRecv bool
 
 	// drainBudget is the ctx of the last Shutdown call: the budget of the
 	// wait for HTTP/2 pool handlers the workers run when Listen's context is
@@ -220,6 +223,9 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	if tier == nil {
 		return nil, fmt.Errorf("no suitable io_uring tier available")
 	}
+	// Decided once, here: the start-up line and every worker's ring take this
+	// value, so a change of the environment after New reaches neither.
+	multishotRecv := multishotRecvEnabled(tier.SupportsMultishotRecv())
 
 	cfg.Logger.Info("io_uring engine selected",
 		"tier", tier.Tier().String(),
@@ -230,8 +236,12 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		// capability. A worker whose NewBufferRing then fails falls back to
 		// per-connection buffers and logs its own Warn: the line is decided
 		// before any worker exists, so it stays optimistic about that one.
-		"multishot_recv", multishotRecvEnabled(tier.SupportsMultishotRecv()),
-		"provided_buffers", tier.SupportsProvidedBuffers() && multishotRecvEnabled(tier.SupportsMultishotRecv()),
+		// One decision for both fields and for the workers (Engine.multishotRecv):
+		// multishot recv is backed by the provided-buffer ring and the two are
+		// forced off together (the ProvidedBuffers probe above), so no tier has
+		// one without the other.
+		"multishot_recv", multishotRecv,
+		"provided_buffers", multishotRecv,
 		// The EFFECTIVE value, not the tier capability: this used to print
 		// the capability and so reported fixed_files=true while the feature
 		// was gated off (celeris#541).
@@ -247,6 +257,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		cfg:              cfg,
 		handler:          handler,
 		asyncCancelFlags: asyncCancelFlags,
+		multishotRecv:    multishotRecv,
 	}
 	// Snapshot the static AsyncRoutes count from the handler so
 	// Metrics() doesn't pay a type-assertion per call (#300 G3).
@@ -536,6 +547,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.handoffLoss = &e.metrics.handoffLoss // celeris#657 witnesses
 		w.sweepCnt = &e.metrics.sweep          // celeris#657 P9 sweep witnesses
 		w.asyncCancelFlags = e.asyncCancelFlags
+		w.multishotRecv = e.multishotRecv
 		w.pause = &e.pause // celeris#662 pause linger
 		w.drainBudget = &e.drainBudget
 		workers[i] = w

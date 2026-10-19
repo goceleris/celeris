@@ -12,7 +12,8 @@ import (
 // a kernel the probe still gives an io_uring tier: the engine needs Linux 5.19
 // (the IORING_ASYNC_CANCEL flags of its cancels, celeris#682), while the Base
 // tier starts at 5.10. Empty where the kernel is at the floor, or has no
-// io_uring at all. Wording only: nothing here refuses anything.
+// io_uring at all. Wording only: nothing here refuses anything (iouring.New
+// does, requireAsyncCancelFlags).
 func engineFloorNote(profile engine.CapabilityProfile) string {
 	if !profile.IOUringTier.Available() {
 		return ""
@@ -20,7 +21,7 @@ func engineFloorNote(profile engine.CapabilityProfile) string {
 	if profile.KernelMajor > 5 || (profile.KernelMajor == 5 && profile.KernelMinor >= 19) {
 		return ""
 	}
-	return "the io_uring engine needs Linux 5.19 or later and is not used on this kernel; the epoll engine serves instead"
+	return "the io_uring engine needs Linux 5.19 or later: it refuses to start on this kernel (the adaptive engine then runs on epoll; an explicit io_uring engine fails, so use the epoll engine)"
 }
 
 // DiagnosticReport logs the capability profile as structured key-value pairs.
