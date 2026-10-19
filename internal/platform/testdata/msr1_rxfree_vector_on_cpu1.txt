@@ -1,0 +1,143 @@
+# celeris#1036 item 1 (rule D, rx-port loops): real msr1 snapshot, IRQ 167 (enp1s0-8) on CPU 1 (the standing pin; irqplace.txt of the column: cpu=1 verified).
+# run goceleris/probatorium 39323871422 (PINPLAN v5), column 00-pinplan5-073-r5-vnv-io256.
+# source cell.start.txt sha256 41972d51c770e2a7d15e0818455d800e3cfec5f60616488fae76b81111bde522
+# Verbatim excerpts: the NIC vector rows of '== irq' (no CPU header: the test adds CPU0..CPU11), '== irq effective_affinity_list smp_affinity_list', and '== /proc/net/dev'.
+== irq
+127:          0          0          0          0          0          0 2347516513          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   0 Edge      enp49s0-0
+128:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   1 Edge      enp49s0-1
+129:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   2 Edge      enp49s0-2
+130:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   3 Edge      enp49s0-3
+131:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   4 Edge      enp49s0-4
+132:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   5 Edge      enp49s0-5
+133:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   6 Edge      enp49s0-6
+134:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   7 Edge      enp49s0-7
+135:          0          0          0          0          0          0          0          0 4020621857          0          0          0 ITS-PCI-MSIX-0000:31:00.0   8 Edge      enp49s0-8
+136:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0   9 Edge      enp49s0-9
+137:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  10 Edge      enp49s0-10
+138:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  11 Edge      enp49s0-11
+139:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  12 Edge      enp49s0-12
+140:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  13 Edge      enp49s0-13
+141:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  14 Edge      enp49s0-14
+142:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  15 Edge      enp49s0-15
+143:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  16 Edge      enp49s0-16
+144:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  17 Edge      enp49s0-17
+145:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  18 Edge      enp49s0-18
+146:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  19 Edge      enp49s0-19
+147:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  20 Edge      enp49s0-20
+148:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  21 Edge      enp49s0-21
+149:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  22 Edge      enp49s0-22
+150:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  23 Edge      enp49s0-23
+151:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  24 Edge      enp49s0-24
+152:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  25 Edge      enp49s0-25
+153:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  26 Edge      enp49s0-26
+154:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  27 Edge      enp49s0-27
+155:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  28 Edge      enp49s0-28
+156:          0          0          0          0          0          3          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  29 Edge      enp49s0-29
+157:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  30 Edge      enp49s0-30
+158:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:31:00.0  31 Edge      enp49s0-31
+159: 3046863517          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   0 Edge      enp1s0-0
+160:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   1 Edge      enp1s0-1
+161:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   2 Edge      enp1s0-2
+162:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   3 Edge      enp1s0-3
+163:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   4 Edge      enp1s0-4
+164:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   5 Edge      enp1s0-5
+165:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   6 Edge      enp1s0-6
+166:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   7 Edge      enp1s0-7
+167:          0   97430452          0          0 2596192945          0          0          0    1215973          0          0          0 ITS-PCI-MSIX-0000:01:00.0   8 Edge      enp1s0-8
+168:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0   9 Edge      enp1s0-9
+169:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  10 Edge      enp1s0-10
+170:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  11 Edge      enp1s0-11
+171:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  12 Edge      enp1s0-12
+172:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  13 Edge      enp1s0-13
+173:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  14 Edge      enp1s0-14
+174:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  15 Edge      enp1s0-15
+175:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  16 Edge      enp1s0-16
+176:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  17 Edge      enp1s0-17
+177:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  18 Edge      enp1s0-18
+178:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  19 Edge      enp1s0-19
+179:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  20 Edge      enp1s0-20
+180:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  21 Edge      enp1s0-21
+181:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  22 Edge      enp1s0-22
+182:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  23 Edge      enp1s0-23
+183:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  24 Edge      enp1s0-24
+184:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  25 Edge      enp1s0-25
+185:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  26 Edge      enp1s0-26
+186:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  27 Edge      enp1s0-27
+187:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  28 Edge      enp1s0-28
+188:          0          3          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  29 Edge      enp1s0-29
+189:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  30 Edge      enp1s0-30
+190:          0          0          0          0          0          0          0          0          0          0          0          0 ITS-PCI-MSIX-0000:01:00.0  31 Edge      enp1s0-31
+== irq effective_affinity_list smp_affinity_list
+127 6 6
+128 1 0-11
+129 2 0-11
+130 3 0-11
+131 4 0-11
+132 5 0-11
+133 6 0-11
+134 7 0-11
+135 8 0-11
+136 9 0-11
+137 10 0-11
+138 11 0-11
+139 0 0-11
+140 1 0-11
+141 2 0-11
+142 3 0-11
+143 4 0-11
+144 5 0-11
+145 6 0-11
+146 7 0-11
+147 8 0-11
+148 9 0-11
+149 10 0-11
+150 11 0-11
+151 0 0-11
+152 1 0-11
+153 2 0-11
+154 3 0-11
+155 4 0-11
+156 5 0-11
+157 6 0-11
+158 7 0-11
+159 0 0
+160 9 0-11
+161 10 0-11
+162 11 0-11
+163 0 0-11
+164 1 0-11
+165 2 0-11
+166 3 0-11
+167 1 1
+168 5 0-11
+169 6 0-11
+170 7 0-11
+171 8 0-11
+172 9 0-11
+173 10 0-11
+174 11 0-11
+175 0 0-11
+176 1 0-11
+177 2 0-11
+178 3 0-11
+179 4 0-11
+180 5 0-11
+181 6 0-11
+182 7 0-11
+183 8 0-11
+184 9 0-11
+185 10 0-11
+186 11 0-11
+187 0 0-11
+188 1 0-11
+189 2 0-11
+190 3 0-11
+== /proc/net/dev
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 44137148075839 64634114103    0    0    0     0          0         0 44137148075839 64634114103    0    0    0     0       0          0
+enp49s0: 39605333867526 80891505972    0 41194    0     0          0   3627255 22105791951986 62412318150    0    0    0     0       0          0
+enp1s0: 13135312251883 29570541572    0 52930    0     0          0   3627917 16915748772220 44382425833    0    0    0     0       0          0
+ bond0: 52740646119409 110462047544    0 2024329    0     0          0   7255172 39021540724206 106794743983    0 924326    0     0       0          0
+tailscale0: 1588694    6514    0    0    0     0          0         0  1618750    7242    0    0    0     0       0          0
+docker0: 17621664507171 10741408902    0    0    0     0          0         0 1816702492625 12541343292    0    2    0     0       0          0
