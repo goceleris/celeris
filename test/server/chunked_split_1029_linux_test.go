@@ -5,7 +5,6 @@ package celeris_test
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"net"
@@ -358,33 +357,19 @@ func bodyServerRHT1029(t *testing.T, eng celeris.EngineType, rht time.Duration) 
 }
 
 // server1029 serves /ping, a sync POST /up and an Async() POST /aup, both
-// answering with the body length.
+// answering with the body length. It starts through startServerConfig761, which
+// retries an io_uring start that fails with ENOMEM: the ring is charged to the
+// runner's 8 MiB RLIMIT_MEMLOCK, which another package's test binary running
+// at the same time may hold (a start that did not retry failed the Unit steps
+// job of celeris#1077 twice with "io_uring_setup: cannot allocate memory").
 func server1029(t *testing.T, eng celeris.EngineType, cfg celeris.Config) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	cfg.Addr, cfg.Engine, cfg.Protocol = addr, eng, celeris.Auto
-	s := celeris.New(cfg)
-	up := func(c *celeris.Context) error { return c.String(http.StatusOK, "n=%d", len(c.Body())) }
-	s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
-	s.POST("/up", up)
-	s.POST("/aup", up).Async()
-	startDone := make(chan error, 1)
-	go func() { startDone <- s.Start() }()
-	if err := waitReady761(addr, startDone); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = s.Shutdown(ctx)
-		<-startDone
+	cfg.Engine, cfg.Protocol = eng, celeris.Auto
+	return startServerConfig761(t, cfg, func(s *celeris.Server) {
+		up := func(c *celeris.Context) error { return c.String(http.StatusOK, "n=%d", len(c.Body())) }
+		s.POST("/up", up)
+		s.POST("/aup", up).Async()
 	})
-	return addr
 }
 
 // TestChunkedAsyncRoute1029: the same split bodies to a route marked Async(),

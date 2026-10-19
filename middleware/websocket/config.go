@@ -108,14 +108,21 @@ type Config struct {
 	// enforced via the engine's idle sweep using SetWSIdleDeadline.
 	//
 	// Zero means no idle timeout, and on the native engines that means the
-	// connection has NO liveness bound at all (celeris#524). Once a
+	// connection has NO idleness bound at all (celeris#524). Once a
 	// connection detaches, the engine deliberately stops applying its own
-	// ReadTimeout / IdleTimeout / WriteTimeout — the middleware owns the I/O
-	// lifecycle from that point — and reaps a detached connection only when
-	// the middleware has published a deadline. This field is what publishes
-	// one. Leave it zero and nothing will ever close an idle connection,
-	// which is correct for a long-lived WebSocket and is why zero is the
-	// default.
+	// ReadTimeout / IdleTimeout — the middleware owns the I/O lifecycle from
+	// that point — and reaps a detached connection for idleness only when the
+	// middleware has published a deadline. This field is what publishes one.
+	// Leave it zero and nothing will ever close an idle connection, which is
+	// correct for a long-lived WebSocket and is why zero is the default.
+	//
+	// One server timeout does apply to a detached connection on the native
+	// engines: WriteTimeout, as "no progress for WriteTimeout" (celeris#888
+	// items 38 and 39). A peer that takes none of the bytes the engine has
+	// queued for it for WriteTimeout is closed, whatever it sends meanwhile
+	// and whatever this field says. A peer that reads, however slowly, and a
+	// connection with nothing queued are not closed; the server's
+	// WriteTimeout -1 sets no such bound.
 	//
 	// Worth setting anyway if you want a backstop. A connection that is
 	// WEDGED rather than merely idle is indistinguishable from a healthy
