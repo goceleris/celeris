@@ -8,7 +8,9 @@ import "errors"
 var ErrQueueFull = errors.New("celeris/engine: worker write queue full")
 
 // ErrUnknownFD is returned when a [WorkerLoop] operation references a file
-// descriptor that is not registered on that worker.
+// descriptor that is not registered on that worker. [WorkerLoop.Write] also
+// returns it for a descriptor that is already closing (after
+// [WorkerLoop.UnregisterConn], or after the connection failed).
 var ErrUnknownFD = errors.New("celeris/engine: file descriptor not registered")
 
 // ErrSwitchingNotFrozen is returned by adaptive engines when a driver attempts
