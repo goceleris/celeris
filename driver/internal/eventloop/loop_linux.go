@@ -609,7 +609,9 @@ func (w *worker) forget(c *driverConn) {
 
 // Write satisfies [engine.WorkerLoop]. Data is appended to the FD's outbound
 // buffer and flushed asynchronously under c.mu (one write(2) in flight per
-// FD). Returns engine.ErrQueueFull when the buffer would exceed the cap.
+// FD). Returns engine.ErrQueueFull when the buffer would exceed the cap,
+// engine.ErrUnknownFD for an FD that is not registered or is closing, and
+// ErrLoopClosed once the loop is closed.
 func (w *worker) Write(fd int, data []byte) error {
 	if w.closed.Load() {
 		return ErrLoopClosed
