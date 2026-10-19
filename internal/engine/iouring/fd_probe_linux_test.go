@@ -30,10 +30,11 @@ func fdTarget(fd int) string {
 //
 // Both ends are matched (celeris#1081). The peer alone does not name one
 // connection in a test binary that has run other tests: a socket an earlier
-// test left open (a server side it accepted and never closed, released only
-// when the GC runs its finalizer) can have as its peer the very port this
-// test's client was just given, since a port is free for connect(2) again
-// once nothing is bound to it locally. /proc/self/fd lists its names in
+// test left open (the server side of a connection it accepted and kept, such
+// as the descriptor a hand-built worker was given) has as its peer that
+// test's client port, and connect(2) hands that port out again once the
+// client that had it is gone, possibly to this test's client. /proc/self/fd
+// lists its names in
 // lexical order, so such a socket at "123" was found before this
 // connection's at "45", and a test that then checked that descriptor after
 // the engine stopped found a socket the engine never owned still open.

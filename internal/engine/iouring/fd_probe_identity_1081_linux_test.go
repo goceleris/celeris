@@ -6,12 +6,15 @@ package iouring
 // of its eight server-side descriptors "still open after the engine
 // stopped". The descriptor it checked was not the engine's. serverFDFor
 // took the first descriptor whose peer was the test client's address, and a
-// socket another test had left open can have that peer too: its own peer
-// port was free for connect(2) again once the listener that owned it was
-// closed, and the client was given it. /proc/self/fd lists names in lexical
-// order, so that socket was found before the engine's whenever its number
-// sorted first. These tests build exactly that: a stray whose peer is the
-// client's address, at a number that sorts before the server side's.
+// server-side socket an earlier test had left open names an earlier client's
+// port as its peer: connect(2) hands that port out again once that client is
+// gone, and the test's client can be given it. /proc/self/fd lists names in
+// lexical order, so that socket was found before the engine's whenever its
+// number sorted first. The test below forces the same collision
+// deterministically with a stray of the other kind (a client whose peer, a
+// listener's port, is then given to the test's client): what matters to
+// serverFDFor is only that the stray names the client's address as its peer,
+// at a number that sorts before the server side's.
 
 import (
 	"context"
