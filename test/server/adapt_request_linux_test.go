@@ -210,10 +210,16 @@ func keptProbeIOUring() (usable bool, p celerisengine.CapabilityProfile) {
 // keptProbeIOUring) is retried with a new server for up to 10 s.
 func startKeptServer(t *testing.T, mk func() *celeris.Server) (string, func()) {
 	t.Helper()
+	return startKeptServerOn(t, "127.0.0.1:0", mk)
+}
+
+// startKeptServerOn is startKeptServer on a listener bound to laddr.
+func startKeptServerOn(t *testing.T, laddr string, mk func() *celeris.Server) (string, func()) {
+	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		s := mk()
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := net.Listen("tcp", laddr)
 		if err != nil {
 			t.Fatal(err)
 		}
