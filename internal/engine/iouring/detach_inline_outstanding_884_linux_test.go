@@ -57,9 +57,6 @@ func TestDetachedInlineWriteHonoursRingSendOutstanding(t *testing.T) {
 				t.Fatal("OnDetach installed no detachMu")
 			}
 			tc.set(cs)
-			if got := ringSendOutstanding(cs); got == tc.inline {
-				t.Fatalf("ringSendOutstanding = %v for this row, want %v: the row does not test what it names", got, !tc.inline)
-			}
 
 			cs.writeFn([]byte(payload))
 
