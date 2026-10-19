@@ -57,3 +57,30 @@ func TestReleaseConnStateResetsEveryAtomicBool(t *testing.T) {
 		}
 	}
 }
+
+// TestConnStateHasNoWritevFields pins celeris#884 item 31: io_uring has no
+// scatter-gather send. cs.bodyBuf and cs.sendBody were never assigned a
+// non-nil slice once the zero-copy body writer stopped being installed
+// (celeris#817), so the WRITEV branches of flushSend, flushSendLink and
+// completeSend, and the connState fields they read, were dead code that every
+// "is a send owed" test still had to carry a term for. A field of the old
+// names, or of the iovec type, would bring the path back without its writer:
+// a body the kernel reads only at the next io_uring_enter, after the handler
+// that owns it may have reused it.
+func TestConnStateHasNoWritevFields(t *testing.T) {
+	typ := reflect.TypeOf(connState{})
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		switch f.Name {
+		case "bodyBuf", "sendBody", "iov":
+			t.Errorf("connState.%s is back: the WRITEV path has no writer (celeris#817), see celeris#884 item 31", f.Name)
+		}
+		ft := f.Type
+		for ft.Kind() == reflect.Array || ft.Kind() == reflect.Slice || ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft.Name() == "iovec" {
+			t.Errorf("connState.%s has type iovec: the WRITEV path has no writer (celeris#817), see celeris#884 item 31", f.Name)
+		}
+	}
+}
