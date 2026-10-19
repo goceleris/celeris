@@ -103,7 +103,7 @@ func (cs *connState) StreamWriteErr(n int) error {
 	if cs.closing || cs.detachClosed || cs.asyncClosed.Load() {
 		return conn.ErrConnClosed
 	}
-	if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf)+n > maxSendQueueBytesDetached {
+	if len(cs.writeBuf)+len(cs.sendBuf)+n > maxSendQueueBytesDetached {
 		cs.writeRefused = true
 		return conn.ErrWriteRefused
 	}
@@ -142,14 +142,6 @@ func (d *detachedStreamErr) StreamWriteErr(int) error {
 		return conn.ErrWriteRefused
 	}
 	return conn.ErrConnClosed
-}
-
-// iovec mirrors Linux struct iovec (16 bytes on 64-bit platforms).
-// Used for IORING_OP_WRITEV scatter-gather sends. Celeris only builds
-// on amd64 and arm64 (both 64-bit), so size is stable at 16.
-type iovec struct {
-	Base uintptr
-	Len  uint64
 }
 
 type connState struct {
@@ -198,7 +190,7 @@ type connState struct {
 	remainderOut   bool         // 1: the SEND in flight may wait on its peer for long (celeris#884 items 62, 64): the re-send of a partial send's remainder, or a SEND of longSendBytes or more; the worker may not wait for its completion with no timeout (mode 3a); set by flushSend/flushSendLink, cleared by completeSend
 	// sendIsZC records how the send SQE currently in flight for this
 	// connection was ARMED: true for IORING_OP_SEND_ZC, false for a plain
-	// SEND / WRITEV / linked SEND. It is the provenance flag the error
+	// SEND / linked SEND. It is the provenance flag the error
 	// classification in handleSend and completeSend keys on (celeris#609).
 	//
 	// w.sendZC cannot serve that purpose: it is the worker's forward-looking
@@ -229,8 +221,6 @@ type connState struct {
 	sendBuf     []byte // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf []byte // 24: append buffer for handler writes
-	bodyBuf  []byte // 24: zero-copy body slice; sent as iovec[1] alongside sendBuf
-	sendBody []byte // 24: in-flight body slice during WRITEV (cleared by completeSend)
 	buf      []byte // 24: per-connection recv buffer
 	// detectAccum accumulates the first bytes of a connection across
 	// multiple recvs while protocol detection is still inconclusive
@@ -262,7 +252,6 @@ type connState struct {
 	// variant. Holding the slice here keeps the array alive until the
 	// connState drains from pendingRelease (mirrors how cs.buf is held).
 	bodyRecvPin []byte     // 24
-	iov         [2]iovec   // 32: iovec storage for WRITEV SQEs (sendBuf + sendBody)
 	dirtyNext   *connState // 8
 	dirtyPrev   *connState // 8
 
@@ -562,8 +551,8 @@ type connState struct {
 	forceRSTClose bool
 
 	// kernelInflight counts conn-buffer-referencing kernel ops — RECVs
-	// targeting cs.buf / h1State.bodyBuf and SEND/WRITEV/SEND_ZC reading
-	// cs.sendBuf / cs.sendBody / cs.iov — that have been submitted but
+	// targeting cs.buf / h1State.bodyBuf and SEND/SEND_ZC reading
+	// cs.sendBuf — that have been submitted but
 	// have not yet delivered their TERMINAL CQE (success, -ECANCELED,
 	// -ECONNRESET, ...; for multishot recv and SEND_ZC the terminal CQE
 	// is the one WITHOUT CQE_F_MORE). Incremented at SQE submission
@@ -753,8 +742,6 @@ func releaseConnState(cs *connState) {
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
 	cs.detachCounted = false
-	cs.bodyBuf = nil
-	cs.sendBody = nil
 	// bodyRecvPin is cleared here, after every kernel-held op delivered its
 	// terminal CQE (releaseConnState is only called from drainPendingRelease
 	// once cs.kernelInflight drained — or its backstop fired — and from the
