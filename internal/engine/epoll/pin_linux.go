@@ -8,9 +8,10 @@ import "github.com/goceleris/celeris/internal/platform"
 // a test can make it fail.
 var pinThreadToCPU = platform.PinToCPU
 
-// planWorkerCPUs chooses the CPU of every loop. A variable so a test can
-// stand in a plan.
-var planWorkerCPUs = platform.PlanWorkerCPUs
+// planWorkerCPUs chooses the CPU of every loop for a listener bound to addr
+// (the concrete address the engine binds). A variable so a test can stand in a
+// plan.
+var planWorkerCPUs = platform.PlanWorkerCPUsFor
 
 // The plan is also the loop count: the engine starts len(plan.CPUs) of them
 // (celeris#1036), which on a big.LITTLE host is fewer than the default.

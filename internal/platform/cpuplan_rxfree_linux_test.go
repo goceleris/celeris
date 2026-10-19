@@ -779,3 +779,34 @@ func TestRxFreeLog(t *testing.T) {
 }
 
 func removeAll(p string) error { return os.RemoveAll(p) }
+
+// The real host, in whatever container the test runs (no big.LITTLE, no
+// NIC): the plan with an address is the plan without one, inside the thread's
+// allowed set, and no CPU it frees is among its loops.
+func TestPlanWorkerCPUsForOnTheRealHost(t *testing.T) {
+	allowed, err := schedAllowedCPUs()
+	if err != nil {
+		t.Fatalf("sched_getaffinity: %v", err)
+	}
+	for _, explicit := range []bool{false, true} {
+		for _, addr := range []string{"0.0.0.0:8080", "[::]:0", "127.0.0.1:1", "localhost:80", ""} {
+			p := PlanWorkerCPUsFor(len(allowed)+3, explicit, addr)
+			base := PlanWorkerCPUs(len(allowed)+3, explicit)
+			if !p.Heterogeneous {
+				eq(t, "alike host: plan", p, base)
+			}
+			eq(t, "allowed", p.Allowed, allowed)
+			for _, c := range p.CPUs {
+				if c >= 0 && !slices.Contains(allowed, c) {
+					t.Errorf("addr %q: loop on CPU %d outside the allowed set %v", addr, c, allowed)
+				}
+				if slices.Contains(p.RxFree.Freed, c) {
+					t.Errorf("addr %q: a loop on the freed CPU %d", addr, c)
+				}
+			}
+			if len(p.CPUs) > len(base.CPUs) {
+				t.Errorf("addr %q: %d loops, the plan without the rule has %d", addr, len(p.CPUs), len(base.CPUs))
+			}
+		}
+	}
+}

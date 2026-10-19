@@ -24,7 +24,7 @@ func TestPlanIsCappedByMemlockNotTheRequest1036(t *testing.T) {
 	stubPlan := func(held *int) {
 		old := planWorkerCPUs
 		t.Cleanup(func() { planWorkerCPUs = old })
-		planWorkerCPUs = func(n int, explicit bool) platform.CPUPlan {
+		planWorkerCPUs = func(n int, explicit bool, _ string) platform.CPUPlan {
 			*held = n
 			// 3 loops (a big.LITTLE host with 3 non-little CPUs), never more
 			// than asked for.
@@ -58,7 +58,7 @@ func TestPlanIsCappedByMemlockNotTheRequest1036(t *testing.T) {
 			ceiling(tc.ceiling)
 			var buf bytes.Buffer
 			log := slog.New(slog.NewTextHandler(&buf, nil))
-			plan := planWithinMemlock(6, false, log)
+			plan := planWithinMemlock(6, false, "", log)
 			if asked != 6 {
 				t.Errorf("the planner was asked for %d workers, want the request, 6", asked)
 			}
@@ -99,7 +99,7 @@ func TestPlanThenCapEqualsCappedPlanWhenCPUsAreAlike1036(t *testing.T) {
 	for _, c := range []int{1, 2, 3, 5} {
 		old := memlockCeiling
 		memlockCeiling = func() int { return c }
-		got := planWithinMemlock(8, true, nil)
+		got := planWithinMemlock(8, true, "", nil)
 		memlockCeiling = old
 		want := platform.PlanWorkerCPUs(c, true)
 		if !slices.Equal(got.CPUs, want.CPUs) {

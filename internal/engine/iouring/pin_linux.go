@@ -12,9 +12,10 @@ import (
 // a test can make it fail.
 var pinThreadToCPU = platform.PinToCPU
 
-// planWorkerCPUs chooses the CPU of every worker. A variable so a test can
-// stand in a plan.
-var planWorkerCPUs = platform.PlanWorkerCPUs
+// planWorkerCPUs chooses the CPU of every worker for a listener bound to addr
+// (the concrete address the engine binds). A variable so a test can stand in a
+// plan.
+var planWorkerCPUs = platform.PlanWorkerCPUsFor
 
 // The plan is also the loop count: the engine starts len(plan.CPUs) of them
 // (celeris#1036), which on a big.LITTLE host is fewer than the default.
@@ -27,8 +28,8 @@ var planWorkerCPUs = platform.PlanWorkerCPUs
 // The planner fills distinct CPUs before it repeats one, so cutting the plan
 // to its first ceiling entries keeps it balanced. Where the CPUs are alike this
 // is the plan the planner makes for the capped count.
-func planWithinMemlock(requested int, explicit bool, logger *slog.Logger) platform.CPUPlan {
-	plan := planWorkerCPUs(requested, explicit)
+func planWithinMemlock(requested int, explicit bool, addr string, logger *slog.Logger) platform.CPUPlan {
+	plan := planWorkerCPUs(requested, explicit, addr)
 	if capped := capWorkersToMemlock(len(plan.CPUs), logger); capped < len(plan.CPUs) {
 		plan = plan.Truncate(capped, "RLIMIT_MEMLOCK")
 	}

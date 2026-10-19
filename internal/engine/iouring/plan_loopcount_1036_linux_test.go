@@ -40,29 +40,39 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 		workers      int // Resources.Workers; 0 = the default
 		planLen      int
 		wantExplicit bool
+		rxFree       bool // the plan carries what the rx-port rule decided
 	}{
-		{"user-set 6, plan holds 3", 6, 3, true},
-		{"default, plan holds 2", 0, 2, false},
+		{"user-set 6, plan holds 3", 6, 3, true, false},
+		{"default, plan holds 2", 0, 2, false, false},
+		// The rx-port rule (celeris#1036 item 1) shortens the default plan by
+		// the CPUs it frees: the engine starts the plan's loops, whatever the
+		// reason it is short, and says what the rule did on its Info line.
+		{"default, the rx-port rule freed two CPUs", 0, 2, false, true},
 	} {
 		func() {
 			old := planWorkerCPUs
 			defer func() { planWorkerCPUs = old }()
 			var gotN int
 			var gotExplicit bool
+			var gotAddr string
 			var stub []int
 			// The planner is asked first and RLIMIT_MEMLOCK bounds what it
 			// returns (celeris#1036), so it is asked for the whole request even
 			// where memlock funds one worker (the CI runners' 8 MiB). The stub
 			// shortens whatever it is asked for, so the shortening is exercised
 			// there too: a request of 2 gets a plan of 1.
-			planWorkerCPUs = func(n int, explicit bool) platform.CPUPlan {
-				gotN, gotExplicit = n, explicit
+			planWorkerCPUs = func(n int, explicit bool, addr string) platform.CPUPlan {
+				gotN, gotExplicit, gotAddr = n, explicit, addr
 				stub = make([]int, max(min(tc.planLen, n-1), 1))
 				for i := range stub {
 					stub[i] = cpus[i%len(cpus)]
 				}
-				return platform.CPUPlan{CPUs: append([]int(nil), stub...), Allowed: cpus, Requested: n,
+				p := platform.CPUPlan{CPUs: append([]int(nil), stub...), Allowed: cpus, Requested: n,
 					Heterogeneous: true, Note: "test plan: fewer loops than asked for"}
+				if tc.rxFree {
+					p.RxFree = platform.RxFree{Port: "enp49s0", SharePercent: 73, Freed: []int{6, 8}}
+				}
+				return p
 			}
 			var log lockedBuf
 			eng, stop := start909(t, tc.workers, &log)
@@ -77,6 +87,17 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 			wantAsked := tc.workers
 			if wantAsked == 0 {
 				wantAsked = max(runtime.GOMAXPROCS(0), 2)
+			}
+			// The planner is given the concrete address the engine binds.
+			if gotAddr != eng.Addr().String() {
+				t.Errorf("%s: the planner was given the address %q, the engine listens on %q", tc.name, gotAddr, eng.Addr())
+			}
+			if tc.rxFree {
+				for _, w := range []string{"freed_cpus=6,8", "rx_port=enp49s0", "rx_share_pct=73"} {
+					if !strings.Contains(log.String(), w) {
+						t.Errorf("%s: the plan's Info line lacks %q:\n%s", tc.name, w, log.String())
+					}
+				}
 			}
 			if gotExplicit != tc.wantExplicit {
 				t.Errorf("%s: the engine told the planner explicit=%v, want %v", tc.name, gotExplicit, tc.wantExplicit)

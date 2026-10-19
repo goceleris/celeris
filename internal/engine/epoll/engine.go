@@ -155,7 +155,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
 	// the loop count (celeris#1036): on a big.LITTLE host it holds one loop
 	// per non-little CPU, fewer than the default GOMAXPROCS, every one pinned.
-	plan := planWorkerCPUs(resolved.Workers, e.cfg.Resources.Workers > 0)
+	plan := planWorkerCPUs(resolved.Workers, e.cfg.Resources.Workers > 0, e.cfg.Addr)
 	cpus := plan.CPUs
 	resolved.Workers = len(cpus)
 
