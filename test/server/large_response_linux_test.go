@@ -276,7 +276,9 @@ func TestSplitBodyResponsesKeepTheConnection(t *testing.T) {
 				if _, err := io.WriteString(raw, head+string(body[:1024])); err != nil {
 					t.Fatalf("%s request %d: %v", e.name, i+1, err)
 				}
-				time.Sleep(2 * time.Millisecond) // the rest in a later read
+				// The rest goes in a later read: wait until the server has taken
+				// the first part off its receive queue (was a 2 ms sleep).
+				waitServerReadAll761(t, raw, addr)
 				if _, err := raw.Write(body[1024:]); err != nil {
 					t.Fatalf("%s request %d: %v", e.name, i+1, err)
 				}
@@ -413,7 +415,17 @@ func TestBackloggedPeerIsClosed(t *testing.T) {
 				if _, err := io.WriteString(raw, strings.Repeat("GET /big HTTP/1.1\r\nHost: x\r\n\r\n", requests)); err != nil {
 					t.Fatal(err)
 				}
-				time.Sleep(300 * time.Millisecond) // the server stages what it will before the client reads
+				// The server stages what it will before the client reads. Two
+				// conditions are visible from here: the server has read every request
+				// (receive queue empty) and its kernel send queue has stopped growing.
+				// Neither is exact: the stop point is overBacklogH1 (pendingBytes >
+				// maxPendingBytes), which is unexported, and the kernel send queue
+				// plateaus before the engine stops staging, so a short fixed grace
+				// follows (celeris#890 item 22, open question: it needs an engine-side
+				// observable; was a 300 ms sleep).
+				waitServerReadAll761(t, raw, addr)
+				waitServerSendQueued761(raw, addr)
+				time.Sleep(backlogGrace761)
 				br := bufio.NewReaderSize(idleConn761{raw}, 64<<10)
 				whole := 0
 				for whole < requests {
@@ -593,6 +605,108 @@ func (c *countingReader761) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += n
 	return n, err
+}
+
+// serverSideQueues761 returns the kernel's send and receive queues, in bytes,
+// of the server's end of the connection whose client end is raw, read from
+// /proc/net/tcp (IPv4 loopback). ok is false while that end is not listed.
+// The tests use it as the server-side condition in place of a fixed sleep.
+func serverSideQueues761(raw net.Conn, serverAddr string) (tx, rx int, ok bool) {
+	_, sp, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		return 0, 0, false
+	}
+	serverPort, err := strconv.Atoi(sp)
+	if err != nil {
+		return 0, 0, false
+	}
+	clientPort := raw.LocalAddr().(*net.TCPAddr).Port
+	data, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		local, rem := f[1], f[2]
+		if hexPort761(local) != serverPort || hexPort761(rem) != clientPort {
+			continue
+		}
+		q := strings.Split(f[4], ":")
+		if len(q) != 2 {
+			return 0, 0, false
+		}
+		t, err1 := strconv.ParseInt(q[0], 16, 64)
+		r, err2 := strconv.ParseInt(q[1], 16, 64)
+		if err1 != nil || err2 != nil {
+			return 0, 0, false
+		}
+		return int(t), int(r), true
+	}
+	return 0, 0, false
+}
+
+// hexPort761 returns the port of a /proc/net/tcp "ADDR:PORT" field, in hex.
+func hexPort761(field string) int {
+	i := strings.LastIndexByte(field, ':')
+	if i < 0 {
+		return -1
+	}
+	p, err := strconv.ParseInt(field[i+1:], 16, 32)
+	if err != nil {
+		return -1
+	}
+	return int(p)
+}
+
+// backlogGrace761 is the fixed wait that follows the server-side conditions in
+// TestBackloggedPeerIsClosed, for the engine to finish staging after the
+// kernel send queue has plateaued.
+const backlogGrace761 = 100 * time.Millisecond
+
+// waitServerReadAll761 waits until the server has read everything sent on
+// raw so far: its receive queue is empty. Used where a test sends a request
+// in two writes and needs the server to take the first before the second.
+// An empty queue is also what the server shows before the segment has been
+// delivered, so on a loopback that delays delivery the wait can return at
+// once and the two writes reach the server as one read (the test then passes
+// without exercising the split; it cannot fail because of it). In a stress
+// run (16 busy-loop hogs on 2 CPUs, -race, 768 first polls) no poll was
+// provably undelivered. Requiring the client's own send queue to be empty as
+// well would be tighter, but a delayed ACK keeps that queue non-empty.
+func waitServerReadAll761(t *testing.T, raw net.Conn, serverAddr string) {
+	t.Helper()
+	if !waitUntil981(5*time.Second, func() bool {
+		_, rx, ok := serverSideQueues761(raw, serverAddr)
+		return ok && rx == 0
+	}) {
+		t.Fatalf("the server did not read the first part of the request within 5s")
+	}
+}
+
+// waitServerSendQueued761 waits until the server's send queue has stopped
+// growing with something in it: the client is not reading, so the kernel
+// cannot send past the client's receive window, and the server has queued all
+// it can. It gives up after 5s and returns, so a slow run only loses the
+// hold, never the answer.
+func waitServerSendQueued761(raw net.Conn, serverAddr string) {
+	last, stable := -1, 0
+	waitUntil981(5*time.Second, func() bool {
+		tx, _, ok := serverSideQueues761(raw, serverAddr)
+		if !ok || tx == 0 {
+			stable = 0
+			return false
+		}
+		if tx == last {
+			stable++
+		} else {
+			stable = 0
+		}
+		last = tx
+		return stable >= 3
+	})
 }
 
 func describeReadEnd761(err error) string {

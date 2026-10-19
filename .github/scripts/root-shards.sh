@@ -151,6 +151,9 @@ case "$cmd" in
     [ -n "$want" ] || die "shard $s lists no tests"
     ran=$(grep -E '^=== RUN   [^/ ]+$' "$log" | sed -E 's/^=== RUN   //' | sort -u)
     passed=$(grep -E '^--- PASS: [^/ ]+ \(' "$log" | sed -E 's/^--- PASS: ([^ ]+) .*/\1/' | sort -u)
+    # A joined `--- SKIP:` line (celeris#890) is no SKIP line to the grep below, and a subtest's can
+    # leave its parent's PASS line standing: skip-count.sh fails on it.
+    "$(dirname "$0")/skip-count.sh" "$log" >/dev/null
     bad=$(grep -cE '^[[:space:]]*--- (SKIP|FAIL): ' "$log" || true)
     echo "shard $s: want $(wc -l <<<"$want") tests, ran $(wc -l <<<"$ran"), passed $(wc -l <<<"$passed"), SKIP/FAIL lines $bad (want 0)"
     [ "$want" = "$ran" ] || { echo "ran differs from the list (< only listed, > only ran):"; diff <(echo "$want") <(echo "$ran") || true; exit 1; }

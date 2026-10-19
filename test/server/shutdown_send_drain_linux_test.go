@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/engine/epoll"
 )
 
 // TestShutdownSendsTheWholeResponse pins celeris#760: epoll's shutdown closed
@@ -28,9 +29,12 @@ import (
 // its sends first (celeris#595) and std drains through net/http.
 //
 // The client has a 64 KiB receive buffer and starts reading readDelay after
-// the handler returns, which is 200 ms into the shutdown, well past the
-// drain's 250 ms floor, so the loop is
-// certain to reach its shutdown with most of the 3 MiB still queued. The
+// the epoll loop's send drain has begun to wait for its socket (the engine's
+// drain hook, epoll.SetDrainPollHook: celeris#885 item 13; a fixed sleep after
+// the release left it to the host how far into the drain that was), well past
+// the drain's 250 ms floor, so the loop is
+// certain to reach its shutdown with most of the 3 MiB still queued. The io_uring
+// engines have no such hook and keep the sleep after the release. The
 // shutdown's budget is 30 s, so a drain bounded by it has all the time it
 // needs; a drain that closes at once cuts the body short every time. The
 // ways of shutting down are a direct Shutdown with that budget, a direct
@@ -82,9 +86,34 @@ func TestShutdownSendsTheWholeResponse(t *testing.T) {
 						case <-time.After(5 * time.Second):
 							t.Fatal("handler did not start within 5s")
 						}
+						// The epoll drain tells when it waits for the socket (the hook
+						// is process-wide: this test starts the next server only
+						// after this one has stopped).
+						var drainWaits chan struct{}
+						if e.name == "epoll" || e.name == "adaptive-epoll" {
+							drainWaits = make(chan struct{})
+							var once sync.Once
+							t.Cleanup(epoll.SetDrainPollHook(func() { once.Do(func() { close(drainWaits) }) }))
+						}
 						shutErr := srv.beginShutdown(mode, 30*time.Second)
 						time.Sleep(200 * time.Millisecond)
 						close(release)
+						if drainWaits != nil {
+							// The drain waits for the socket once the response is
+							// queued, unless the kernel took the whole of it (the
+							// default send buffer on a host that autotunes it
+							// large), when the shutdown ends with nothing to wait
+							// for; the client then reads what it was sent.
+							select {
+							case <-drainWaits:
+								t.Logf("%s: the send drain waited for the socket; the client reads %v later", desc, readDelay)
+							case err := <-srv.startDone:
+								srv.startDone <- err // for the cleanup
+								t.Logf("%s: the shutdown ended with nothing queued to wait for (the kernel took the response)", desc)
+							case <-time.After(10 * time.Second):
+								t.Fatalf("%s: the epoll send drain neither waited for its socket nor ended within 10s of the release", desc)
+							}
+						}
 						time.Sleep(readDelay)
 						got, n, end := readResponse760(c)
 						if !bytes.Equal(got, body) {

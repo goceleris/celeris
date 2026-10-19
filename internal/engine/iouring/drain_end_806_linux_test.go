@@ -176,21 +176,25 @@ func TestSendDrainGiveUpStatesTheLoss806(t *testing.T) {
 }
 
 // TestWaitUntimed806 pins the rule for the loop's one wait with no timeout:
-// only with SEND SQEs just submitted, and never while draining.
+// only with SEND SQEs just submitted, never while draining (celeris#806), and
+// never while a partial send's remainder is outstanding (celeris#884 item 62).
 func TestWaitUntimed806(t *testing.T) {
 	for _, tc := range []struct {
-		hasPending, sendsPending, draining, want bool
+		hasPending, sendsPending, draining, remainder, want bool
 	}{
-		{true, true, false, true},
-		{true, true, true, false},
-		{true, false, false, false},
-		{false, true, false, false},
-		{false, false, false, false},
-		{false, false, true, false},
+		{true, true, false, false, true},
+		{true, true, true, false, false},
+		{true, false, false, false, false},
+		{false, true, false, false, false},
+		{false, false, false, false, false},
+		{false, false, true, false, false},
+		{true, true, false, true, false},
+		{true, true, true, true, false},
+		{true, false, false, true, false},
 	} {
-		if got := waitUntimed(tc.hasPending, tc.sendsPending, tc.draining); got != tc.want {
-			t.Errorf("waitUntimed(hasPending=%v, sendsPending=%v, draining=%v) = %v, want %v",
-				tc.hasPending, tc.sendsPending, tc.draining, got, tc.want)
+		if got := waitUntimed(tc.hasPending, tc.sendsPending, tc.draining, tc.remainder); got != tc.want {
+			t.Errorf("waitUntimed(hasPending=%v, sendsPending=%v, draining=%v, remainderWatch=%v) = %v, want %v",
+				tc.hasPending, tc.sendsPending, tc.draining, tc.remainder, got, tc.want)
 		}
 	}
 }

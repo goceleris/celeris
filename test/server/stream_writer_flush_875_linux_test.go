@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -193,16 +194,19 @@ func TestStreamWriterFlushH1_875(t *testing.T) {
 	}
 }
 
-// The same adapter that makes Flush a no-op on the native engines also
-// returns nil from Write (internal/conn/response.go, h1ResponseAdapter): the
-// engine's write hook has no error return, and after the connection is gone
-// it drops the bytes. So on epoll and io_uring over HTTP/1.1 neither Write nor
-// Flush reports a client that has gone away, which the streaming docs said
-// both did (celeris#494 is the SSE middleware's answer: it watches the
-// connection through the engine's callbacks). std reports it, from
-// net/http. The handler detaches (the only way to stream there), waits for the
-// client to reset the connection, then writes and flushes for a while and
-// reports the first error it saw.
+// The adapter's Write and Flush used to return nil on the native engines
+// whatever became of the connection (internal/conn/response.go,
+// h1ResponseAdapter): the engine's write hook has no error return, and after
+// the connection is gone it drops the bytes. So on epoll and io_uring over
+// HTTP/1.1 neither Write nor Flush reported a client that had gone away, which
+// the streaming docs said both did (celeris#494 is the SSE middleware's
+// answer: it watches the connection through the engine's callbacks). The
+// engines now install an error query on the H1 state that the adapter
+// consults after each write (celeris#884 item 45, celeris#885 item 30), so a
+// Write or Flush after the engine has torn the connection down returns an
+// error, as std's does from net/http. The handler detaches (the only way to
+// stream there), waits for the client to reset the connection, then writes and
+// flushes for a while and reports the first error it saw.
 
 func TestStreamWriterWriteErrorAfterPeerGoneH1_875(t *testing.T) {
 	for _, e := range []struct {
@@ -289,13 +293,16 @@ func TestStreamWriterWriteErrorAfterPeerGoneH1_875(t *testing.T) {
 
 			select {
 			case r := <-res:
-				native := e.eng != celeris.Std
 				t.Logf("%s: first write/flush error after the reset = %v, after %d writes", e.name, r.err, r.writes)
-				if native && r.err != nil {
-					t.Errorf("native Write/Flush reported the gone client: %v (after %d writes); the docs say they do not", r.err, r.writes)
+				if r.err == nil {
+					t.Errorf("Write/Flush never reported the gone client in %d writes", r.writes)
 				}
-				if !native && r.err == nil {
-					t.Errorf("std Write/Flush never reported the gone client in %d writes", r.writes)
+				// std reports it after a write or two (the socket's RST arrives
+				// with the first); a native engine learns of the reset on its
+				// loop, which the handler's 300 ms pause above let happen, so
+				// the first write after it must fail too.
+				if r.err != nil && r.writes > 2 {
+					t.Errorf("the gone client was reported only after %d writes, want within 2", r.writes)
 				}
 			case <-time.After(15 * time.Second):
 				t.Fatal("the handler did not finish")
@@ -471,6 +478,286 @@ func TestDetachedStreamPeerGoneHooksH1_875(t *testing.T) {
 			end()
 			t.Logf("%s: after the reset: detach-close fired %d, error handler fired %d; before: %d, %d",
 				e.name, closeAfter.Load(), errAfter.Load(), closeBefore.Load(), errBefore.Load())
+		})
+	}
+}
+
+// A StreamWriter used without Detach on the native engines is held whole in
+// memory until the handler returns (the first test above), and used to be
+// held without a bound: one chunk of any size was appended to the connection's
+// send buffer and reported written (celeris#884 item 45, celeris#885 item 30).
+// The adapter now asks the engine before it stages a chunk, and the engine
+// refuses a chunk that would take the response staged but not yet sent past
+// 64 MiB (the limit a detached or HTTP/2 conn has): nothing of that chunk is
+// staged, the Write returns the error and counts no bytes, and the connection
+// is closed after what was staged before it has gone out, as it is for any
+// refused write (celeris#761). The response is cut, and a client sees a
+// chunked body with no last chunk. A response below the limit, 8 MiB streamed
+// in celeris#761's test among them, is delivered whole when the handler
+// returns, as before.
+
+const (
+	mib875 = 1 << 20
+)
+
+func TestStreamWriterOverCapH1_875(t *testing.T) {
+	// wantOK is how many of the chunks the engine takes: -1 for all of them.
+	// The limit is 67108864 bytes of staged response: 63 chunks of 1 MiB and
+	// their framing fit, the 64th does not (64 * 1048586 > 64 MiB); a 60 MiB
+	// chunk fits and an 8 MiB one behind it does not.
+	cases := []struct {
+		name   string
+		chunks []int
+		wantOK int
+	}{
+		{"1MiB", []int{1 * mib875}, -1},
+		{"8MiB", []int{8 * mib875}, -1},
+		{"63MiB", []int{63 * mib875}, -1},
+		{"65MiB", []int{65 * mib875}, 0},
+		{"60MiB+8MiB", []int{60 * mib875, 8 * mib875}, 1},
+		{"70x1MiB", func() []int {
+			c := make([]int, 70)
+			for i := range c {
+				c[i] = mib875
+			}
+			return c
+		}(), 63},
+	}
+	for _, e := range []struct {
+		name string
+		eng  celeris.EngineType
+	}{{"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
+		for _, async := range []bool{false, true} {
+			for _, tc := range cases {
+				name := fmt.Sprintf("%s/async=%v/%s", e.name, async, tc.name)
+				t.Run(name, func(t *testing.T) {
+					type outcome struct {
+						ok      int   // chunks the Write took
+						err     error // the first Write error
+						written int64 // StreamWriter.BytesWritten at the end of the loop
+						closeEr error
+					}
+					res := make(chan outcome, 1)
+					addr := startServerConfig761(t, celeris.Config{Engine: e.eng, Protocol: celeris.HTTP1}, func(s *celeris.Server) {
+						r := s.GET("/cap875", func(c *celeris.Context) error {
+							sw := c.StreamWriter()
+							if sw == nil {
+								return fmt.Errorf("no StreamWriter")
+							}
+							if err := sw.WriteHeader(200, [][2]string{{"content-type", "application/octet-stream"}}); err != nil {
+								res <- outcome{err: err}
+								return nil
+							}
+							var o outcome
+							for _, n := range tc.chunks {
+								if _, err := sw.Write(make([]byte, n)); err != nil {
+									o.err = err
+									break
+								}
+								o.ok++
+							}
+							o.written = sw.BytesWritten()
+							// A handler that ignores the error and goes on
+							// must not grow the staged response further.
+							if o.err != nil {
+								for i := 0; i < 64; i++ {
+									_, _ = sw.Write(make([]byte, mib875))
+									_ = sw.Flush()
+								}
+							}
+							o.closeEr = sw.Close()
+							res <- o
+							return nil
+						})
+						if async {
+							r.Async()
+						}
+						s.GET("/ok875", func(c *celeris.Context) error { return c.String(200, "ok") })
+					})
+					conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = conn.Close() }()
+					if _, err := conn.Write([]byte("GET /cap875 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")); err != nil {
+						t.Fatal(err)
+					}
+					_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+					n, tail, rerr := drain875(conn)
+					var o outcome
+					select {
+					case o = <-res:
+					case <-time.After(10 * time.Second):
+						t.Fatal("the handler did not finish")
+					}
+					t.Logf("%s: %d of %d chunks taken, first error %v, BytesWritten %d, Close %v; client read %d bytes, read error %v",
+						name, o.ok, len(tc.chunks), o.err, o.written, o.closeEr, n, rerr)
+					if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+						t.Fatalf("the client's read timed out: the connection was neither completed nor closed (read %d bytes)", n)
+					}
+					wantOK := tc.wantOK
+					if wantOK < 0 {
+						wantOK = len(tc.chunks)
+					}
+					if o.ok != wantOK {
+						t.Errorf("%d chunks were taken, want %d (error %v)", o.ok, wantOK, o.err)
+					}
+					if (wantOK < len(tc.chunks)) != (o.err != nil) {
+						t.Errorf("first Write error = %v with %d of %d chunks taken", o.err, o.ok, len(tc.chunks))
+					}
+					// BytesWritten counts what Write returned nil for, and the
+					// client was sent exactly that and the framing (the head is
+					// under 1 KiB): a chunk Write reported refused is not staged.
+					var accepted, framed int64
+					for _, c := range tc.chunks[:wantOK] {
+						accepted += int64(c)
+						framed += int64(c) + int64(len(strconv.FormatInt(int64(c), 16))) + 4 // hex size, CRLF, data, CRLF
+					}
+					if o.written != accepted {
+						t.Errorf("BytesWritten = %d, want %d", o.written, accepted)
+					}
+					if n < framed || n > framed+1024 {
+						t.Errorf("the client read %d bytes, want the head and %d bytes of chunks: a refused chunk was staged, or the stream was lost", n, framed)
+					}
+					complete := strings.HasSuffix(tail, "0\r\n\r\n")
+					if wantOK == len(tc.chunks) {
+						if !complete || o.closeEr != nil {
+							t.Errorf("a response below the limit was not delivered whole: complete=%v, Close %v", complete, o.closeEr)
+						}
+					} else {
+						if complete {
+							t.Errorf("the response past the limit was delivered whole; want it cut")
+						}
+						// Cut after the last chunk taken: the tail is that
+						// chunk's closing CRLF and nothing else follows it.
+						if !strings.HasSuffix(tail, "\r\n") || strings.Contains(tail, "HTTP/1.1") {
+							t.Errorf("the cut response does not end at a chunk boundary: %q", tail)
+						}
+						if o.closeEr == nil {
+							t.Errorf("Close on a refused stream returned nil")
+						}
+					}
+					// The server serves the next connection either way.
+					c2, err := net.DialTimeout("tcp", addr, 2*time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = c2.Close() }()
+					_ = c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+					if _, err := c2.Write([]byte("GET /ok875 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")); err != nil {
+						t.Fatal(err)
+					}
+					b, _ := io.ReadAll(c2)
+					if !strings.Contains(string(b), "ok") {
+						t.Errorf("the server did not answer the next connection: %q", b)
+					}
+				})
+			}
+		}
+	}
+}
+
+// drain875 reads r to EOF or error, returning the byte count and the last 16
+// bytes seen.
+func drain875(r io.Reader) (n int64, tail string, err error) {
+	buf := make([]byte, 64<<10)
+	var last []byte
+	for {
+		m, rerr := r.Read(buf)
+		n += int64(m)
+		if m > 0 {
+			last = append(last, buf[:m]...)
+			if len(last) > 16 {
+				last = append(last[:0], last[len(last)-16:]...)
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				rerr = nil
+			}
+			return n, string(last), rerr
+		}
+	}
+}
+
+// After Detach the write hook refuses a write once 64 MiB are unsent
+// (maxPendingBytesDetached), and nothing read the refusal: the bytes were
+// dropped, the Write returned nil, and the connection stayed open with a
+// client that had stopped reading. The error query reports it, and the engine
+// closes the connection. The client here never reads until the handler has
+// been told.
+
+func TestDetachedStreamOverCapClosesH1_875(t *testing.T) {
+	for _, e := range []struct {
+		name string
+		eng  celeris.EngineType
+	}{{"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}, {"adaptive", celeris.Adaptive}} {
+		t.Run(e.name, func(t *testing.T) {
+			const chunk = 24 << 20
+			type result struct {
+				err    error
+				writes int
+			}
+			res := make(chan result, 1)
+			addr := startServerConfig761(t, celeris.Config{Engine: e.eng, Protocol: celeris.HTTP1}, func(s *celeris.Server) {
+				s.GET("/detcap875", func(c *celeris.Context) error {
+					sw := c.StreamWriter()
+					if sw == nil {
+						return fmt.Errorf("no StreamWriter")
+					}
+					done := c.Detach()
+					run := func() {
+						defer done()
+						if err := sw.WriteHeader(200, [][2]string{{"content-type", "application/octet-stream"}}); err != nil {
+							res <- result{err: err}
+							return
+						}
+						b := make([]byte, chunk)
+						for n := 0; n < 16; n++ {
+							if _, err := sw.Write(b); err != nil {
+								res <- result{err: err, writes: n}
+								return
+							}
+							if err := sw.Flush(); err != nil {
+								res <- result{err: err, writes: n}
+								return
+							}
+						}
+						res <- result{writes: 16}
+					}
+					if c.EngineSupportsAsyncDetach() {
+						go run()
+						return nil
+					}
+					run()
+					return nil
+				})
+			})
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			if _, err := conn.Write([]byte("GET /detcap875 HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+				t.Fatal(err)
+			}
+			var r result
+			select {
+			case r = <-res:
+			case <-time.After(20 * time.Second):
+				t.Fatal("the handler did not finish")
+			}
+			t.Logf("%s: first write/flush error = %v, after %d writes of %d MiB", e.name, r.err, r.writes, chunk>>20)
+			if r.err == nil {
+				t.Errorf("the stream of a client that never reads was never refused in %d writes of %d MiB", r.writes, chunk>>20)
+			}
+			// Now read: the connection must end (EOF or reset), not hang.
+			_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+			n, _, rerr := drain875(conn)
+			t.Logf("%s: client read %d bytes, then %v", e.name, n, rerr)
+			if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+				t.Errorf("the connection stayed open after the stream was refused (read %d bytes)", n)
+			}
 		})
 	}
 }

@@ -237,10 +237,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 
 	e.cfg.Logger.Info("epoll engine listening", "addr", e.cfg.Addr, "loops", resolved.Workers)
-	if e.cfg.AsyncHandlers && e.cfg.EnableH2Upgrade {
-		e.cfg.Logger.Info(
-			"AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker",
-		)
+	if e.cfg.AsyncH2Reachable() {
+		e.cfg.Logger.Info(resource.AsyncH2Notice)
 	}
 
 	<-ctx.Done()
@@ -260,12 +258,12 @@ func (e *Engine) Listen(ctx context.Context) error {
 // What Shutdown does is hand ctx to the loops as the budget of that send
 // drain (celeris#760): a response larger than the socket buffers is sent
 // while ctx is live, until its deadline or, for a ctx without one, until it
-// is done, but no longer than the config's WriteTimeout, and never for less
-// than shutdownSendDrainFloor, before its conn is closed (see
-// Loop.sendDrainWait). Server.Shutdown calls it before it cancels Listen's
-// context, and a cancel of StartWithContext's context reaches the loops
-// first but the watcher's Shutdown follows at once, within the drain's
-// floor.
+// is done, but no longer than the config's WriteTimeout while that is set,
+// and for at least shutdownSendDrainFloor, ending as soon as nothing is left
+// to send, before its conn is closed (see Loop.sendDrainWait).
+// Server.Shutdown calls it before it cancels Listen's context, and a cancel
+// of StartWithContext's context reaches the loops first but the watcher's
+// Shutdown follows at once, within the drain's floor.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	e.drainBudget.Store(&ctx)
 	return nil
@@ -429,12 +427,14 @@ func (e *Engine) ResumeAccept() error {
 // eventfd instead, which ResumeAccept signals after this call (celeris#886).
 //
 // The park waits on a Go channel, not in epoll_wait, so an eventfd write does
-// not end it — only this does. ResumeAccept is one caller. AdoptConn is the
-// other: it arrives from another goroutine while the loop has no connection
+// not end it — only this does. ResumeAccept is one caller. AdoptConn is
+// another: it arrives from another goroutine while the loop has no connection
 // and no listener to wake it for, and without the kick a standby loop slept
 // through the adoption until the next ResumeAccept — forever, if the engine
 // stayed the standby — while the source already counted the hand-off done
-// (celeris#658).
+// (celeris#658). RegisterConn is the third: a driver conn registered on a
+// parked loop is in the epoll set of a loop that is not in epoll_wait, and its
+// bytes would wait for the same ResumeAccept (celeris#885 item 39).
 //
 // No wakeup can be lost. A waker publishes its work — sets the flag the park
 // watches — BEFORE it takes wakeMu, and the loop re-checks those flags UNDER

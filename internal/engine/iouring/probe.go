@@ -672,7 +672,7 @@ func classifyAsyncCancelProbe(res int32) (asyncCancelProbe, string) {
 	case res >= 0, res == -int32(unix.ENOENT):
 		return asyncCancelAccepted, ""
 	case res == -int32(unix.EINVAL):
-		return asyncCancelRejected, "IORING_ASYNC_CANCEL flags rejected: cqe.res=-22 (EINVAL); the kernel predates Linux 5.19"
+		return asyncCancelRejected, "IORING_ASYNC_CANCEL flags rejected: cqe.res=-22 (EINVAL)"
 	default:
 		return asyncCancelUnexpected, fmt.Sprintf("the cancel completed with cqe.res=%d (%s), which the probe does not recognise",
 			res, errnoName(-res))

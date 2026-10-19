@@ -271,13 +271,17 @@ func TestShutdownEndsOwedOpsBeforeClosing(t *testing.T) {
 		}
 		srv := -1
 		for end := time.Now().Add(time.Second); srv < 0 && time.Now().Before(end); {
-			srv = serverFDFor(c.LocalAddr().String())
+			srv = serverFDFor(c.LocalAddr().String(), c.RemoteAddr().String())
 		}
 		if srv < 0 {
 			t.Fatalf("conn %d: no server-side descriptor found", i)
 		}
+		target := fdTarget(srv)
+		if target == "" {
+			t.Fatalf("conn %d: server-side descriptor %d closed as it was found", i, srv)
+		}
 		servers = append(servers, srv)
-		targets = append(targets, fdTarget(srv))
+		targets = append(targets, target)
 	}
 	defer func() {
 		for _, c := range clients {

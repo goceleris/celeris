@@ -20,8 +20,11 @@ import (
 // finalizer can close a leaked descriptor, must leave no /proc/stat
 // descriptor open. doPrepare opens one for the CPU monitor before it creates
 // the engine, and only Shutdown closed it. The count is of descriptors whose
-// link is /proc/stat, so descriptors other tests open or close meanwhile
-// cannot move it.
+// link is /proc/stat. Other celeris servers in this binary open and close a
+// monitor too, so the count is safe only because these tests are non-parallel
+// top-level tests: none runs while another's before and after counts are taken.
+// The check is one-sided (after > before, the leak direction): a monitor that a
+// leftover goroutine of an earlier test closes can only lower the count.
 func TestFailedStartsLeaveNoProcStatDescriptor(t *testing.T) {
 	const starts = 20
 	prev := debug.SetGCPercent(-1)
@@ -61,7 +64,7 @@ func TestFailedStartsLeaveNoProcStatDescriptor(t *testing.T) {
 			}
 			after := procStatDescriptors(t)
 			t.Logf("%s: /proc/stat descriptors %d before %d failed starts, %d after", entry.name, before, starts, after)
-			if after != before {
+			if after > before {
 				t.Errorf("%s: %d failed starts left %d /proc/stat descriptors open (celeris#737)", entry.name, starts, after-before)
 			}
 		})
@@ -126,7 +129,7 @@ func TestStartsWithoutShutdownLeaveNoProcStatDescriptor(t *testing.T) {
 			}
 			after := procStatDescriptors(t)
 			t.Logf("%s: /proc/stat descriptors %d before %d Starts, %d after", tc.name, before, starts, after)
-			if after != before {
+			if after > before {
 				t.Errorf("%s: %d Starts with no Shutdown to come left %d /proc/stat descriptors open (celeris#737)", tc.name, starts, after-before)
 			}
 		})

@@ -72,21 +72,7 @@ func TestReaderEOFSparesTheConnThatTakesTheNumber784(t *testing.T) {
 	if err := unix.Close(a); err != nil {
 		t.Fatalf("close A: %v", err)
 	}
-	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		t.Fatalf("socketpair: %v", err)
-	}
-	b, bPeer := pair[0], pair[1]
-	if b != a {
-		if err := unix.Dup2(b, a); err != nil {
-			t.Fatalf("dup2 onto %d: %v", a, err)
-		}
-		_ = unix.Close(b)
-		b = a
-	}
-	_ = unix.SetNonblock(b, true)
-	_ = unix.SetNonblock(bPeer, true)
-	t.Cleanup(func() { _ = unix.Close(b); _ = unix.Close(bPeer) })
+	b, _ := c784TakeNumber(t, a, true)
 	if err := w.RegisterConn(b, func([]byte) {}, func(error) {}); err != nil {
 		t.Fatalf("RegisterConn(B) on A's number: %v", err)
 	}

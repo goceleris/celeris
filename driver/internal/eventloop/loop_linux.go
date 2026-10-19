@@ -226,6 +226,45 @@ var testHookEventTurnBusy func(fd int)
 // the call, cleared after it returns.
 var testHookAfterRearm func(fd int)
 
+// The hooks below are nil-by-default package variables like the ones above.
+// A test sets one right before the operation it observes and clears it (in
+// t.Cleanup) when it is done. They are process-global and fire for every
+// worker, not only the test's, so the tests that set them must not run in
+// parallel with another test that uses a worker (no test of this package calls
+// t.Parallel). Several run with a lock held: their doc says which, and a hook
+// must not take that lock or wait for a goroutine that does (celeris#890).
+
+// testHookBeforePoll, when non-nil, runs in WriteAndPoll and WriteAndPollBusy
+// once before the Phase B poll(0) rounds and once before the Phase C poll(1ms),
+// with phase 'B' or 'C', on the caller's goroutine with recvMu held and no
+// other lock. Tests only (celeris#890): it opens the window between a call's
+// last read and its poll, where a teardown plus a new socket on the number
+// would make the poll report the new socket's bytes.
+var testHookBeforePoll func(fd int, phase byte)
+
+// testHookBeforeDel, when non-nil, runs in forget immediately before the
+// EPOLL_CTL_DEL, with w.mu held for writing. Tests only (celeris#890): a
+// competing UnregisterConn of the same fd must not return while it is held,
+// because a miss on the map promises that the DEL is done.
+var testHookBeforeDel func(fd int)
+
+// testHookBeforeEpollClose, when non-nil, runs in shutdown after every conn is
+// marked closed and before the epoll fd is closed, with w.mu held. Tests only
+// (celeris#890): a late EPOLL_CTL_MOD or ADD must find its conn closed by now.
+var testHookBeforeEpollClose func()
+
+// testHookAfterWakeClose, when non-nil, runs in shutdown right after the wake
+// eventfd is closed, with w.mu held. Tests only (celeris#890): the number the
+// eventfd had is free, a test can put another descriptor on it, and a wake
+// that still names the old number would write to that descriptor.
+var testHookAfterWakeClose func()
+
+// testHookInAdd, when non-nil, runs in RegisterConn inside the c.mu section,
+// after the closed check and before the EPOLL_CTL_ADD, with c.mu held. Tests
+// only (celeris#890): Close and UnregisterConn must wait for the section, so
+// neither returns while the hook is held.
+var testHookInAdd func(fd int)
+
 // readOpen reads c.fd into buf unless c has been torn down, in which case it
 // returns engine.ErrUnknownFD without reading. The closed check and the read
 // are one critical section under c.rmu, a lock every teardown takes to set
@@ -406,7 +445,13 @@ func (w *worker) shutdown() error {
 	// no-op: a Write that passed its w.closed check before Loop.Close began
 	// can still reach enqueueFlush now (celeris#862).
 	w.wakeFD.Close()
+	if h := testHookAfterWakeClose; h != nil {
+		h()
+	}
 	if w.epollFD >= 0 {
+		if h := testHookBeforeEpollClose; h != nil {
+			h()
+		}
 		if err := unix.Close(w.epollFD); err != nil && first == nil {
 			first = err
 		}
@@ -482,6 +527,9 @@ func (w *worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	var err error
 	c.mu.Lock()
 	if !c.closed {
+		if h := testHookInAdd; h != nil {
+			h(fd)
+		}
 		ev := c.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
 		err = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_ADD, fd, &ev)
 		if err != nil {
@@ -550,6 +598,9 @@ func (w *worker) forget(c *driverConn) {
 	if cur, ok := w.conns[c.fd]; ok && cur == c {
 		delete(w.conns, c.fd)
 		if w.epollFD >= 0 {
+			if h := testHookBeforeDel; h != nil {
+				h(c.fd)
+			}
 			_ = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_DEL, c.fd, nil)
 		}
 	}
@@ -558,7 +609,9 @@ func (w *worker) forget(c *driverConn) {
 
 // Write satisfies [engine.WorkerLoop]. Data is appended to the FD's outbound
 // buffer and flushed asynchronously under c.mu (one write(2) in flight per
-// FD). Returns engine.ErrQueueFull when the buffer would exceed the cap.
+// FD). Returns engine.ErrQueueFull when the buffer would exceed the cap,
+// engine.ErrUnknownFD for an FD that is not registered or is closing, and
+// ErrLoopClosed once the loop is closed.
 func (w *worker) Write(fd int, data []byte) error {
 	if w.closed.Load() {
 		return ErrLoopClosed
@@ -700,6 +753,13 @@ func (w *worker) errorClose(c *driverConn, err error) {
 //   - Edge-triggered epoll: we drain to EAGAIN inside WriteAndPoll, so no
 //     stale edge is left. After EPOLLIN is re-armed, the next kernel-buffer
 //     arrival fires a fresh edge.
+//
+// ErrUnknownFD, from any WriteAndPoll variant (this one, WriteAndPollBusy and
+// WriteAndPollMulti), means the conn was torn down (by UnregisterConn on
+// another goroutine, or by an I/O error on the worker), or is not registered
+// on this worker. onRecv may already have received part or all of the reply
+// before the call returns it, so ErrUnknownFD does not mean that none was
+// delivered.
 type SyncRoundTripper interface {
 	WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
 }
@@ -714,6 +774,9 @@ type SyncRoundTripper interface {
 // [SyncRoundTripper]. Locked callers (celeris HTTP engine host)
 // must use WriteAndPollBusy. Drivers select the path at open time based
 // on whether an engine was supplied — see the driver's WithEngine option.
+// Its ErrUnknownFD has the meaning given in the [SyncRoundTripper] contract:
+// the conn was torn down, and onRecv may already have received part or all of
+// the reply.
 type SyncBusyRoundTripper interface {
 	WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
 }
@@ -825,6 +888,9 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
+		if h := testHookBeforePoll; h != nil {
+			h(fd, 'B')
+		}
 		for range 16 {
 			pfd[0].Revents = 0
 			np, perr := unix.Poll(pfd[:], 0)
@@ -854,6 +920,9 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
+		if h := testHookBeforePoll; h != nil {
+			h(fd, 'C')
+		}
 		np, perr := unix.Poll(pfd[:], 1)
 		if np > 0 && perr == nil && pfd[0].Revents&unix.POLLIN != 0 {
 			for {
@@ -916,8 +985,9 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 // Gosched triggers on locked Ms — measured at 40%+ of CPU samples and
 // responsible for a 2–3× throughput collapse on integrated HTTP+DB load.
 //
-// Contract matches WriteAndPoll (see that function's doc). Differs only in
-// Phase B: instead of yielding between poll(0) calls, it does a tight 16-
+// Contract matches WriteAndPoll (see that function's doc and the
+// [SyncRoundTripper] contract, including what ErrUnknownFD means). Differs
+// only in Phase B: instead of yielding between poll(0) calls, it does a tight 16-
 // round poll(0) spin (~8µs) to catch responses that arrived just after
 // Phase A finished, then falls through to poll(1ms). No scheduler hand-off
 // during the spin — the locked M stays on-CPU.
@@ -1016,6 +1086,9 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
+		if h := testHookBeforePoll; h != nil {
+			h(fd, 'B')
+		}
 		for range 16 {
 			pfd[0].Revents = 0
 			np, perr := unix.Poll(pfd[:], 0)
@@ -1045,6 +1118,9 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
+		if h := testHookBeforePoll; h != nil {
+			h(fd, 'C')
+		}
 		np, perr := unix.Poll(pfd[:], 1)
 		if np > 0 && perr == nil && pfd[0].Revents&unix.POLLIN != 0 {
 			for {
@@ -1112,6 +1188,9 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 //
 // Returns ok=true when isDone fired. ok=false means the caller should fall
 // back to the async event-loop path (no data arrived or isDone never fired).
+// Its ErrUnknownFD has the meaning given in the [SyncRoundTripper] contract:
+// the conn was torn down, and onRecv may already have received part or all of
+// the replies.
 type SyncMultiRoundTripper interface {
 	WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func([]byte), isDone func() bool, beforeRearm func()) (ok bool, err error)
 }
@@ -1119,7 +1198,9 @@ type SyncMultiRoundTripper interface {
 // WriteAndPollMulti implements SyncMultiRoundTripper. It writes data, then
 // polls in a loop until isDone returns true or the cumulative poll timeout
 // (20ms) expires. Designed for pipeline workloads where many RESP frames
-// arrive across multiple read(2) calls.
+// arrive across multiple read(2) calls. Its ErrUnknownFD has the meaning
+// given in the [SyncRoundTripper] contract: the conn was torn down, and onRecv
+// may already have received part or all of the replies.
 func (w *worker) WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func([]byte), isDone func() bool, beforeRearm func()) (bool, error) {
 	if w.closed.Load() {
 		return false, ErrLoopClosed

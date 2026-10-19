@@ -173,3 +173,49 @@ func TestClosingConnFirstMetAfterItsBoundIsGivenOneMoreBound(t *testing.T) {
 		t.Fatalf("a closing conn whose peer reads nothing was not reaped within 10 s of a %v bound", bound)
 	}
 }
+
+// TestClosingConnIsSampledBeforeItIsReapedWhateverTheSampleRate: samples are
+// rate limited to a quarter of the bound and a conn's first sample is only a
+// baseline. A loop whose sweeps are irregular (ReadHeaderTimeout off and
+// nothing detached, mixed load) can meet a closing conn late in its bound (the
+// baseline, 0.9 bound in) and sweep again past the bound but inside a quarter
+// of it from the baseline: the bound test used to reap the conn on the
+// baseline's evidence though the peer had acknowledged bytes since (celeris#884
+// item 52, review of the io_uring fix, which shares the rule). The sweep that is
+// about to reap takes a fresh sample first. The stamps are moved back by hand
+// for the time between the sweeps, as the tests above do.
+func TestClosingConnIsSampledBeforeItIsReapedWhateverTheSampleRate(t *testing.T) {
+	const bound = 5 * time.Second
+	r := newTCPClosingRig876(t, resource.Config{ReadTimeout: time.Hour, WriteTimeout: bound}, 8<<20)
+	r.l.closeWhenFlushed(r.cs)
+	r.cs.closeSince = time.Now().Add(-bound * 9 / 10).UnixNano()
+
+	r.l.checkTimeouts() // the baseline, 0.9 bound into the drain
+	if !r.open() || r.cs.closeSampled == 0 || !r.cs.closeAckedKnown {
+		t.Fatalf("celeris884 PREMISE: the first sweep did not keep the conn and take its baseline (open=%v sampled=%d known=%v)",
+			r.open(), r.cs.closeSampled, r.cs.closeAckedKnown)
+	}
+	got := 0
+	for got < 256<<10 {
+		k := r.read(16 << 10)
+		if k == 0 {
+			break
+		}
+		got += k
+	}
+	time.Sleep(100 * time.Millisecond) // the acks settle
+	if got < 64<<10 {
+		t.Fatalf("celeris884 PREMISE: the peer took only %d bytes", got)
+	}
+	shift := int64(bound * 15 / 100) // 0.15 bound passes: past the bound, inside bound/4 of the baseline
+	r.cs.closeSince -= shift
+	r.cs.closeSampled -= shift
+	r.l.checkTimeouts()
+	if !r.open() {
+		t.Fatalf("a closing conn whose peer acknowledged %d bytes since the baseline sample was reaped at 1.05 bound "+
+			"without a fresh sample (the rate limit of bound/4 stood in for it)", got)
+	}
+	if now := time.Now().UnixNano(); now-r.cs.closeSince > int64(time.Second) {
+		t.Errorf("the sweep kept the conn but left the drain clock %v old", time.Duration(now-r.cs.closeSince))
+	}
+}

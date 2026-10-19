@@ -113,6 +113,23 @@ func fixedFilesEnabled(tierSupports bool) bool {
 	return tierSupports && os.Getenv(envFixedFiles) == "1"
 }
 
+// envMultishotRecv opts into multishot recv with a ring-mapped provided-buffer
+// ring (off by default: see the comment at its use in Worker.run).
+const envMultishotRecv = "CELERIS_IOURING_MULTISHOT_RECV"
+
+// multishotRecvEnabled reports whether the workers use multishot recv and so
+// map a provided-buffer ring: the tier must support it AND it must be
+// explicitly opted into (envMultishotRecv=1).
+//
+// Kept as one function, like fixedFilesEnabled, and read once, by New
+// (Engine.multishotRecv), so the worker's gate and the engine's start-up line
+// cannot disagree: the line printed the tier's
+// capabilities, multishot_recv=true and provided_buffers=true on every high-tier
+// kernel, on runs that never mapped a ring (checklist #884 item 48).
+func multishotRecvEnabled(tierSupports bool) bool {
+	return tierSupports && os.Getenv(envMultishotRecv) == "1"
+}
+
 // defaultConnsPerWorker is the per-worker connection target used to size
 // the provided-buffer ring. The ring is sized at 2 buffers per conn at
 // this target, giving comfortable headroom so the kernel rarely stalls
@@ -309,12 +326,22 @@ const shutdownSendDrainNanos int64 = int64(250 * time.Millisecond)
 
 // waitUntimed reports whether the run loop may wait for a completion with no
 // timeout (mode 3a): SEND SQEs are being submitted, each of which produces a
-// CQE, and the worker is not draining. A draining worker (its context is
-// cancelled) never does: a SEND to a peer that does not read produces none, and
-// the end of the drain is looked at only between waits (celeris#806). Small
-// enough to inline; a function so the rule can be tested.
-func waitUntimed(hasPending, sendsPending, draining bool) bool {
-	return hasPending && sendsPending && !draining
+// CQE, the worker is not draining, and no conn has the remainder of a partial
+// send, or a SEND of longSendBytes or more, outstanding. A draining worker (its
+// context is cancelled) never waits so: a SEND to a peer that does not read
+// produces no CQE, and the end of the drain is looked at only between waits
+// (celeris#806). The same holds for such a SEND to a client that takes it
+// slowly or not at all (remainderWatch, celeris#884 item 62): its completion is
+// the client's to give, so the wait must be timed, or no iteration runs, no
+// sweep either, and WriteTimeout is never looked at while that SEND is the
+// last thing the worker submitted. A timed wait (mode 3b) is capped by
+// adaptiveTimeout, so the sweep (sweepWatchDue) is reached every second or
+// two. Mode 3a is lost only while such a SEND is outstanding (a SEND of a
+// small response to a client that has stopped reading is not marked, unless
+// the conn is a truly-detached one: see longSendBytes). Small enough to inline; a function so the rule can be
+// tested.
+func waitUntimed(hasPending, sendsPending, draining, remainderWatch bool) bool {
+	return hasPending && sendsPending && !draining && !remainderWatch
 }
 
 // closingDrainTimeoutNanos bounds the deferred-close drain: how long a
@@ -361,6 +388,124 @@ func (w *Worker) closingDrainBound() int64 {
 	return max(closingDrainTimeoutNanos, int64(w.cfg.WriteTimeout))
 }
 
+// noteClosingAcked is the sweep's evidence of progress on a closing conn, the
+// second kind besides completeSend's restamp (celeris#884 item 52; epoll's
+// noteClosingAcked, celeris#876): the number of bytes the peer has
+// acknowledged (tcp_info bytes_acked, which only grows) moved since the last
+// sample. A SEND of more than the socket queue takes completes only as the
+// queue drains, so a client reading a Connection: close response through a deep
+// queue, slowly, can go more than closingDrainBound between two completions
+// and was reaped with the response truncated. Growth restamps lastActivity, the
+// drain's clock, as a completion that sent bytes does. The first sample of a
+// conn is its baseline and counts as no progress, unless the conn is first met
+// after its bound had already passed (a worker whose sweeps are further apart
+// than the bound): there is no baseline to compare with, and the conn is given
+// one more bound rather than cut on no evidence.
+//
+// Not on the hot path: checkTimeouts calls it for a closing conn, at most every
+// quarter of the bound (closeSampled) and once more before it reaps one, and it
+// costs one getsockopt. A
+// descriptor that is not a TCP socket yields no evidence, which leaves the
+// SEND completions' rule alone. Not for a fixed-file conn, whose cs.fd is a slot of
+// the ring's table, not a descriptor (the caller skips it). Worker thread.
+func (w *Worker) noteClosingAcked(cs *connState, now int64) {
+	cs.closeSampled = now
+	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	if err != nil {
+		return
+	}
+	known, prev := cs.closeAckedKnown, cs.closeAcked
+	cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+	var progressed bool
+	if known {
+		progressed = ti.Bytes_acked > prev
+	} else {
+		progressed = now-cs.lastActivity > w.closingDrainBound()
+	}
+	if progressed {
+		cs.lastActivity = now
+	}
+}
+
+// detachedStalled is checkTimeouts' look at a truly-detached conn (WS/SSE)
+// that has bytes queued for its peer: whether the peer has taken none of them
+// for WriteTimeout (celeris#888 items 38 and 39, celeris#884 item 69). The
+// middleware owns the stream's lifecycle, so no ReadTimeout, IdleTimeout or
+// absolute WriteTimeout applies to it; but a client that stays connected and
+// reads nothing never fails a write on a native engine (the write only queues),
+// and nothing else ended its stream short of the cap on what the engine holds
+// for it. The close reaches the middleware as any engine close does
+// (OnDetachClose: an SSE stream's context ends and OnDisconnect runs).
+//
+// The clock is cs.stallSince, started at the first sweep that finds bytes
+// queued and restarted by evidence that the peer takes them: a SEND that
+// completed with bytes (completeSend), or the peer's acknowledged byte count
+// (tcp_info bytes_acked) having moved since the last sample, which sees what
+// the stream's own goroutine writes inline as well, and a SEND too large for
+// the socket queue, which completes only as it drains. A sample is due every
+// quarter of the bound, and once more when the bound has passed since the last
+// one was taken before it, as for a closing conn (noteClosingAcked); the first
+// is the baseline, so a peer that took bytes in the first quarter and then none
+// is closed up to a quarter of the bound earlier than WriteTimeout after its
+// last byte (a SEND completion restamps the clock at once). Not for a
+// fixed-file conn, whose cs.fd is a slot of the ring's table: it has no inline
+// writes either, so its SEND completions are all there is to see.
+//
+// WriteTimeout 0 (no timeout, or -1) is no bound: a stream is the middleware's
+// to end, and a server that turned the write timeout off asked for a client to
+// be held for as long as it stays. Worker thread, with detachMu not held.
+func (w *Worker) detachedStalled(cs *connState, now int64) bool {
+	bound := int64(w.cfg.WriteTimeout)
+	if bound <= 0 {
+		return false
+	}
+	if cs.stallSince == 0 {
+		// A new stall. No sample yet: a conn whose queue is there at one
+		// sweep and gone at the next (a hot broadcaster's) would pay a
+		// getsockopt per sweep for an episode that ends before it matters.
+		// The first sample, the baseline, is due a quarter of the bound from
+		// now.
+		cs.stallSince = now
+		cs.closeSampled = now
+		cs.closeAckedKnown = false
+		return false
+	}
+	if !cs.fixedFile && (now-cs.closeSampled >= bound/4 ||
+		(now-cs.stallSince > bound && cs.closeSampled <= cs.stallSince+bound)) {
+		w.sampleDetachedAcked(cs, now)
+	}
+	return now-cs.stallSince > bound
+}
+
+// sampleDetachedAcked takes detachedStalled's sample of the socket: the
+// acknowledged byte count of a conn that moved since the last one restarts the
+// stall clock. The first sample of a stall is its baseline and counts as no
+// progress; a descriptor that is not a TCP socket yields no evidence, which
+// leaves the SEND completions' rule alone. Worker thread.
+func (w *Worker) sampleDetachedAcked(cs *connState, now int64) {
+	cs.closeSampled = now
+	if cs.fixedFile {
+		return
+	}
+	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	if err != nil {
+		return
+	}
+	known, prev := cs.closeAckedKnown, cs.closeAcked
+	cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+	switch {
+	case known && ti.Bytes_acked > prev:
+		cs.stallSince = now
+	case !known && now-cs.stallSince > int64(w.cfg.WriteTimeout):
+		// The first sample, met after the bound (sweeps further apart than
+		// WriteTimeout: an idle worker's, or a SEND completion that was late
+		// to restamp the clock): there is no baseline to compare with, and
+		// the conn is given one more bound, not cut on no evidence
+		// (noteClosingAcked does the same for a closing conn).
+		cs.stallSince = now
+	}
+}
+
 // Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
 	id         int
@@ -372,6 +517,9 @@ type Worker struct {
 	sqpoll     bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC     bool // true when SEND_ZC is available (kernel 6.0+)
 	async      bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+	// multishotRecv: map the provided-buffer ring (Engine.multishotRecv, decided
+	// once in New by multishotRecvEnabled).
+	multishotRecv bool
 	// h1Only is true when engine config locks every conn to HTTP/1.1
 	// (Protocol == HTTP1 AND EnableH2Upgrade == false). cs.protocol is set
 	// once at registerConn and never written, so the recv hot path can
@@ -530,7 +678,8 @@ type Worker struct {
 	// worker has stopped, as the witness that a benchmark exercised the path.
 	dirtySendGiveUps uint64
 	// sendWatch is set when the dirty pass gives up a conn whose SEND is
-	// outstanding (celeris#811) and re-derived by every timeout sweep (set
+	// outstanding (celeris#811), and by flushSend for a remainder or long
+	// SEND (celeris#884 item 62), and re-derived by every timeout sweep (set
 	// while a conn has a SEND or SEND_ZC notification outstanding). While it is
 	// set the loop also sweeps about every 1 to 2 s (once lastSweep, UnixNano of
 	// the last sweep, is a second old, checked on every 8th iteration;
@@ -539,7 +688,36 @@ type Worker struct {
 	// iterations alone is seconds to minutes, and the spin that used to
 	// reach it is gone. Worker-owned.
 	sendWatch bool
-	lastSweep int64
+	// remainderWatch is set when flushSend re-sends the remainder of a partial
+	// send or submits a long SEND (celeris#884 items 62 and 64), cleared by the
+	// completion of the last such SEND (remainderN, clearRemainder), and
+	// re-derived by every timeout sweep from the live conns
+	// (cs.remainderOut). It is what keeps the run loop out of mode
+	// 3a (waitUntimed): sendWatch alone cannot, because every sweep derives it
+	// from any SEND in flight and it would be on nearly always under load, so
+	// the untimed wait would be lost for good. Worker-owned.
+	remainderWatch bool
+	// remainderN is the number of conns with cs.remainderOut set, as the
+	// worker has counted them: markRemainder adds one, clearRemainder (the
+	// completion of the marked SEND) takes one, and every sweep re-counts it
+	// from the live conns. remainderWatch is cleared when it reaches 0, at the
+	// completion and not at the next sweep, so a worker that serves a large
+	// response to a healthy client once per sweep interval gets its untimed wait
+	// back as soon as the response is out. Worker-owned.
+	remainderN int
+	// sweepMarks counts the conns markRemainder newly marked since the last
+	// timeout sweep began (checkTimeouts zeroes it first). A sweep re-derives
+	// remainderN, remainderWatch and sendWatch from the conns it visits, and a
+	// mark made DURING the sweep, after the sweep has looked at that conn (the
+	// closing branch's replayHeldSends, whose completeSend re-sends a
+	// remainder, and closeConn's deferred-close flush), is invisible to that
+	// count; the sweep adds these back at its end instead of overwriting them
+	// (celeris#884 item 62). Worker-owned.
+	sweepMarks int
+	lastSweep  int64
+	// lastStallLook is the clock of the last sweep that looked at the
+	// detached conns' stall (stallLookDue); worker-thread-only.
+	lastStallLook int64
 
 	// pendingRelease defers returning connState structs to the pool
 	// until the kernel has drained every in-flight I/O SQE that may
@@ -689,6 +867,20 @@ type Worker struct {
 	// handed to goroutines of their own and whose onClose is not queued yet
 	// (celeris#735). Shutdown waits for it (waitDriverCloses).
 	driverClosers sync.WaitGroup
+	// closeSem bounds how many close(2)s of driver descriptors this worker
+	// has in flight at once; nil means the process-wide driverCloseSem, the
+	// only value outside tests (closeBound). The closes of closeOpFD and of
+	// shutdownDrivers take their tokens from it.
+	closeSem chan struct{}
+	// closeFn replaces the close(2) of closeOpFD for a test, which blocks in
+	// it to count the closes in flight; nil means closeFD. The worker never
+	// changes it once it runs.
+	closeFn func(fd int)
+	// waitClosesHook, when set, runs first thing in waitDriverCloses, before
+	// it waits for the closers: a test synchronizes on shutdown having
+	// reached that wait instead of on a sleep. A test sets it before it stops
+	// the engine; the worker reads it only in shutdown. nil outside tests.
+	waitClosesHook func()
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
 	// reachable until the Worker itself is collected, which is after the ring
@@ -1278,7 +1470,7 @@ func (w *Worker) run(ctx context.Context) {
 	// returns. The formula gives 2 buffers per conn at the per-worker conn
 	// target — comfortable headroom without runaway RSS.
 	// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled value.
-	if w.tier.SupportsMultishotRecv() && os.Getenv("CELERIS_IOURING_MULTISHOT_RECV") == "1" {
+	if w.multishotRecv {
 		bufRingCount := resolveBufRingCount(w.resolved, defaultConnsPerWorker)
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {
@@ -1493,13 +1685,19 @@ func (w *Worker) run(ctx context.Context) {
 			// Non-SQPOLL path: 4-mode adaptive submit.
 			// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
 			// 2. CQEs already ready, nothing pending → skip syscall entirely
-			// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg)
+			// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg), unless
+			//     a long SEND or a partial send's remainder is outstanding
+			//     (remainderWatch, celeris#884 item 62): its CQE is the
+			//     peer's to give
 			// 3b. No CQEs + no SENDs → SubmitAndWaitTimeout() (ext_arg + timeout)
 			//
 			// Modes 1 and 3a avoid ext_arg overhead: the kernel skips hrtimer
 			// setup/teardown and sigset parsing, saving ~200-500ns per call.
 			// Mode 3a is safe because SEND SQEs always produce CQEs (no
-			// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly.
+			// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly
+			// as long as the peer reads; a SEND that waits on a peer that does
+			// not (a remainder, a long SEND) takes the timed wait, so the
+			// sweep and its WriteTimeout still run.
 			// Mode 3b uses a timeout because the only pending SQEs may have
 			// CQE_SKIP_SUCCESS (e.g., CLOSE), and external events (recv, accept)
 			// need a timeout for graceful shutdown via ctx.Err() checks.
@@ -1516,7 +1714,7 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				cqHead, cqTail = w.ring.BeginCQ()
 			} else if cqHead != cqTail { //nolint:revive // intentional no-op: CQEs ready, no pending SQEs, no syscall needed
-			} else if waitUntimed(hasPending, w.sendsPending, w.draining) {
+			} else if waitUntimed(hasPending, w.sendsPending, w.draining, w.remainderWatch) {
 				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
 				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
 				// Not once the context is cancelled (celeris#806): a SEND to a
@@ -1702,28 +1900,9 @@ func (w *Worker) run(ctx context.Context) {
 			w.hasBufReturns = false
 		}
 
-		// Drain H2 async write queues FIRST. Handler goroutines enqueue
-		// response frame bytes; draining them before the dirty list ensures
-		// SEND SQEs are queued as early as possible after CQE processing,
-		// reducing pipeline stalls for H2 multiplexed streams.
-		// By index, from the end: a close below swap-removes the conn from
-		// h2Conns, which a range would then skip one entry past.
-		for i := len(w.h2Conns) - 1; i >= 0; i-- {
-			fd := w.h2Conns[i]
-			cs := w.conns[fd]
-			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
-				cs.h2State.DrainWriteQueue(cs.writeFn)
-				if cs.writeRefused {
-					// A frame refused on back-pressure is lost, and the
-					// connection's framing with it: close, sending what
-					// was staged first (celeris#761).
-					w.closeConn(fd)
-					continue
-				}
-				if w.flushSend(cs) {
-					w.markDirty(cs)
-				}
-			}
+		// Drain H2 async write queues FIRST (drainH2Writes).
+		if len(w.h2Conns) != 0 {
+			w.drainH2Writes()
 		}
 
 		// Advance the monotonic iteration counter and release any
@@ -3030,6 +3209,11 @@ func (w *Worker) initProtocol(cs *connState) {
 		// request that finds the conn's unsent responses over the limit is
 		// not served, and the conn is closed once they have gone out.
 		cs.h1State.WriteBacklogged = cs.overBacklogH1
+		// The streaming write-error query (celeris#884 item 45, #885 item
+		// 30): a StreamWriter's Write, Flush and Close ask it after the
+		// write hook, which has no error return. Detach swaps in one that
+		// takes detachMu.
+		cs.h1State.SetWriteErrQuery(cs)
 		// No zero-copy body writer (SetWriteBodyFn): the H1 response
 		// adapter copies every body into writeBuf. A body the WRITEV path
 		// left in place was read by the kernel only at the next
@@ -3108,7 +3292,16 @@ func (w *Worker) initProtocol(cs *connState) {
 				// the front (the worker's flushSend swaps writeBuf→sendBuf next);
 				// on EAGAIN/error we leave writeBuf and fall through — the worker
 				// ring-sends the rest and surfaces any I/O error via completeSend.
-				if !cs.fixedFile && !cs.sending && !cs.zcNotifPending &&
+				if cs.writeRefused {
+					// The write hook refused bytes: the backlog before them was
+					// over maxSendQueueBytesDetached, a peer that stopped reading.
+					// Nothing read the flag for a detached conn, so the bytes were
+					// dropped and the conn left open, its stream cut in the middle
+					// (celeris#761). Close it, through the detach queue as a
+					// handler error does; the stream's next Write reports it
+					// (detachedStreamErr, celeris#884 item 45, #885 item 30).
+					cs.asyncClosed.Store(true)
+				} else if !cs.fixedFile && !cs.sending && !cs.zcNotifPending &&
 					len(cs.sendBuf) == 0 && len(cs.bodyBuf) == 0 && len(cs.writeBuf) > 0 {
 					if n, werr := unix.Write(cs.fd, cs.writeBuf); werr == nil {
 						w.bytesWritten.Add(uint64(n))
@@ -3220,6 +3413,7 @@ func (w *Worker) initProtocol(cs *connState) {
 					cs.writeFn = prevWrite
 					if h1 != nil {
 						h1.UpdateWriteFn(prevWrite)
+						h1.SetWriteErrQuery(cs)
 						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
 					}
 					cs.detachMu = prevMu
@@ -3271,6 +3465,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// Also update the response adapter so StreamWriter writes
 			// go through the guarded path (not the stale pre-Detach writeFn).
 			cs.h1State.UpdateWriteFn(guarded)
+			cs.h1State.SetWriteErrQuery(&detachedStreamErr{cs: cs, mu: mu})
 			if unlockDetachMu {
 				if f := detachPreFlagHook.Load(); f != nil {
 					(*f)() // test seam, celeris#844 item 2 (before the flag)
@@ -4445,6 +4640,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	// ring SEND is in-flight, so the clear MUST be inside the lock — otherwise
 	// that read races this completion.
 	cs.sending = false
+	w.clearRemainder(cs)
 	// celeris#607 witness. cs.recvLinked is cleared only when the chained
 	// recv's own CQE is processed, and that recv cannot run before this
 	// send completes — so reaching here with it still set means the recv
@@ -4533,6 +4729,11 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	// (covers regular SEND and the SEND_ZC NOTIF path, both of which
 	// reach completeSend with the byte count).
 	w.bytesWrittenBatch += uint64(sent)
+	if cs.stallSince != 0 && sent > 0 {
+		// A detached conn whose peer is being watched for a stall
+		// (detachedStalled): the SEND took bytes, so the peer is reading.
+		cs.stallSince = now
+	}
 	if cs.closing && sent > 0 {
 		// The closing drain's clock (closingDrainBound) measures how long
 		// the peer has taken nothing, not how long the drain has run: a
@@ -4585,6 +4786,9 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 
 	// All data sent — re-arm recv if needed, remove from dirty list.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+		if cs.stallSince != 0 {
+			cs.stallSince = 0 // nothing is queued: the next queue starts its own clock
+		}
 		if cs.needsRecv && !cs.recvPaused {
 			if w.prepareRecv(cs, cs.buf) {
 				cs.needsRecv = false
@@ -4687,6 +4891,7 @@ func (w *Worker) closeConn(fd int) {
 		// path — and only on the first close of the conn.
 		windowClose := !cs.detachClosed && cs.asyncDetachPending && !cs.detachCounted
 		cs.detachClosed = true
+		cs.writeEnded.Store(true) // detachedStreamErr reads it without detachMu
 		// Acquire barrier: only invoke OnDetachClose once the WS upgrade has
 		// fully wired the conn (WSReady). Otherwise the read of OnDetachClose —
 		// and the ws.Close() it calls — races the upgrade installing it and the
@@ -5955,6 +6160,34 @@ func ringSendOutstanding(cs *connState) bool {
 	return cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.bodyBuf) > 0
 }
 
+// drainH2Writes drains the H2 async write queues. Handler goroutines enqueue
+// response frame bytes; draining them before the dirty list ensures SEND SQEs
+// are queued as early as possible after CQE processing, reducing pipeline
+// stalls for H2 multiplexed streams. Extracted from run so the pass can be
+// driven by a test (celeris#889 item 1). Worker thread.
+//
+// By index, from the end: a close below swap-removes the conn from h2Conns,
+// which a range would then skip one entry past.
+func (w *Worker) drainH2Writes() {
+	for i := len(w.h2Conns) - 1; i >= 0; i-- {
+		fd := w.h2Conns[i]
+		cs := w.conns[fd]
+		if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+			cs.h2State.DrainWriteQueue(cs.writeFn)
+			if cs.writeRefused {
+				// A frame refused on back-pressure is lost, and the
+				// connection's framing with it: close, sending what
+				// was staged first (celeris#761).
+				w.closeConn(fd)
+				continue
+			}
+			if w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+		}
+	}
+}
+
 func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
 		if cs.closing {
@@ -6547,6 +6780,81 @@ func (w *Worker) flushDirty() {
 	}
 }
 
+// longSendBytes is the size from which a SEND is expected to be able to wait
+// on its peer (celeris#884 items 62 and 64): a response this large may not fit
+// the room the socket has, and a connection whose socket queue is full takes
+// none of it. The SEND of a response a short inline write left over (an async
+// handler's direct write takes what the socket takes and the ring gets the
+// rest) is a first SEND with no remainder to mark, and it is the one that
+// stalls with no progress at all. The figure is a choice, not a measurement:
+// the kernel's initial send buffer is 16 KiB. Smaller SENDs keep the untimed
+// wait (mode 3a), so a small SEND into a socket that is already full on an
+// otherwise idle worker is still not looked at by a sweep (celeris#884 item
+// 74), except for a truly-detached conn on a server with a WriteTimeout, whose
+// every SEND is marked (watchesStall).
+const longSendBytes = 64 << 10
+
+// markLongSend notes that the SEND being submitted for cs, n bytes, may be
+// outstanding for as long as its peer holds out: cs.remainderOut and the
+// worker's remainderWatch keep the run loop out of its untimed wait while it
+// is, and sendWatch makes the sweep (sweepWatchDue) come for WriteTimeout
+// (celeris#884 items 62 and 64). Cleared by completeSend, re-derived by the
+// sweep. Worker thread; one compare for the common small response.
+//
+// A SEND of a truly-detached conn (WS/SSE) is marked whatever its size, while
+// WriteTimeout bounds it (watchesStall): the stall bound (detachedStalled)
+// exists for a peer that reads nothing, and the SEND of the leftover of the
+// stream's own inline write is just such a SEND, of any size up to the socket's
+// capacity. Unmarked, a producer that goes quiet after it leaves the worker in
+// its untimed wait with nothing to run the sweep, and the peer is held for
+// ever (celeris#888 items 38 and 39, celeris#884 item 69).
+func (w *Worker) markLongSend(cs *connState, n int) {
+	if n >= longSendBytes || w.watchesStall(cs) {
+		w.markRemainder(cs)
+	}
+}
+
+// watchesStall reports whether cs is a truly-detached conn on a server with a
+// WriteTimeout, the conns whose SENDs the stall bound looks at
+// (detachedStalled). Async-mode HTTP/1 conns have a detachMu without being
+// detached (sendCap): the ordinary write timeout bounds them. The compares are
+// in the order of their cost: the pointer is nil for an inline conn. Worker
+// thread.
+func (w *Worker) watchesStall(cs *connState) bool {
+	return cs.detachMu != nil && w.cfg.WriteTimeout > 0 &&
+		cs.h1State != nil && cs.h1State.Detached.Load()
+}
+
+// markRemainder notes that the SEND being submitted for cs may be outstanding
+// for as long as its peer holds out (see markLongSend), and counts the conn.
+// Worker thread.
+func (w *Worker) markRemainder(cs *connState) {
+	if !cs.remainderOut {
+		cs.remainderOut = true
+		w.remainderN++
+		w.sweepMarks++
+	}
+	w.remainderWatch = true
+	w.sendWatch = true
+}
+
+// clearRemainder ends cs's mark when its SEND completes (completeSend), and the
+// worker's remainderWatch with it when no other conn has one. sendWatch is
+// left to the sweep, which clears it when no SEND is outstanding. Worker
+// thread.
+func (w *Worker) clearRemainder(cs *connState) {
+	if !cs.remainderOut {
+		return
+	}
+	cs.remainderOut = false
+	if w.remainderN > 0 {
+		w.remainderN--
+	}
+	if w.remainderN == 0 {
+		w.remainderWatch = false
+	}
+}
+
 // flushSend submits one SEND SQE for pending data on this connection.
 // Only one SEND is in-flight per connection at a time; if a send is already
 // in progress, this is a no-op and the next send will be triggered when the
@@ -6574,6 +6882,11 @@ func (w *Worker) flushSend(cs *connState) bool {
 		cs.sending = true
 		cs.kernelInflight++
 		w.sendsPending = true
+		// A remainder: the first SEND of this response took part of it and the
+		// peer is taking the rest slowly or not at all (celeris#884 item 62).
+		// Its completion is the client's to give, so the worker must not wait
+		// for it with no timeout, and the sweep must come for its WriteTimeout.
+		w.markRemainder(cs)
 		return false
 	}
 
@@ -6610,6 +6923,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 			setSQEFixedFile(sqe)
 		}
 		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
+		w.markLongSend(cs, len(cs.sendBuf)+len(cs.sendBody))
 		cs.sending = true
 		cs.kernelInflight++
 		w.sendsPending = true
@@ -6624,6 +6938,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 	}
 	w.prepSendSQE(sqe, cs, false)
 	setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
+	w.markLongSend(cs, len(cs.sendBuf))
 	cs.sending = true
 	cs.kernelInflight++
 	w.sendsPending = true
@@ -6788,6 +7103,7 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		w.prepSendSQE(sqe, cs, false)
 		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 	}
+	w.markLongSend(cs, len(cs.sendBuf))
 	cs.sending = true
 	cs.kernelInflight++
 	w.sendsPending = true
@@ -6908,6 +7224,85 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	return snap, true
 }
 
+// detachedSendPending is checkTimeouts' look at whether a truly-detached conn
+// has bytes queued for its peer or a SEND in flight (connSendPending), for the
+// stall bound (detachedStalled). The queue is the stream's goroutine's under
+// detachMu (its guarded inline writes), so it is read under the lock, with
+// TryLock as snapshotH1Deadlines has it (celeris#593): known=false means the
+// goroutine is inside a write right now, a conn that is not idle, and the sweep
+// leaves it to the next. A separate look from the snapshot, which the recv and
+// dispatch paths share, so that they and the sweep of the ordinary conns do not
+// pay for a field only a detached conn needs (RULE 74, BenchmarkCheckTimeouts888).
+func detachedSendPending(cs *connState) (pending, known bool) {
+	if mu := cs.detachMu; mu != nil {
+		if !mu.TryLock() {
+			return false, false
+		}
+		defer mu.Unlock()
+	}
+	return connSendPending(cs), true
+}
+
+// sweepDetachedStall is checkTimeouts' stall look at a truly-detached conn
+// whose idle deadline has not expired. WriteTimeout is the one engine timeout a
+// detached stream keeps: "no progress for WriteTimeout" on what is queued for
+// the peer, whatever the middleware's idle deadline says (a WebSocket peer that
+// sends pings pushes it out for ever and reads nothing of what it is sent;
+// celeris#888 items 38 and 39). closeConn signals the middleware
+// (OnDetachClose) and defers the descriptor's close behind the queue, as for an
+// idle-deadline close. Worker thread.
+func (w *Worker) sweepDetachedStall(cs *connState, fd int, now int64) {
+	pending, known := detachedSendPending(cs)
+	switch {
+	case !known:
+		// Inside a write of the stream's goroutine: not idle.
+	case pending:
+		if w.detachedStalled(cs, now) {
+			w.closeStalled(fd, cs, now)
+		}
+	case cs.stallSince != 0:
+		cs.stallSince = 0
+	}
+}
+
+// stallLookDue reports whether this sweep takes the stall look at the detached
+// conns (sweepDetachedStall): never when WriteTimeout is off (nothing to
+// enforce), and at most once per a sixteenth of the bound, between 25 ms and
+// 250 ms. The io_uring sweep has no wall-clock floor (it runs every 32
+// iterations while a conn is detached, hundreds of times a second on a busy
+// worker), and the bound needs a resolution of a quarter of itself (the
+// samples of detachedStalled), not of an iteration. The look costs a lock
+// attempt per detached conn (BenchmarkCheckTimeouts888). Worker thread.
+func (w *Worker) stallLookDue(now int64) bool {
+	bound := int64(w.cfg.WriteTimeout)
+	if bound <= 0 {
+		return false
+	}
+	floor := min(max(bound/16, int64(25*time.Millisecond)), int64(250*time.Millisecond))
+	if now-w.lastStallLook < floor && now >= w.lastStallLook {
+		return false
+	}
+	w.lastStallLook = now
+	return true
+}
+
+// closeStalled closes a detached conn whose peer took none of its queue for
+// WriteTimeout (detachedStalled). closeConn defers the descriptor behind the
+// SEND in flight and gives it a drain of closingDrainBound; the peer has just
+// been shown to take nothing for WriteTimeout, so that bound is spent: the
+// drain's clock is set back past it, and the next sweep reaps the conn unless
+// its sample of the peer's acknowledged bytes shows it reading again
+// (noteClosingAcked). Held for another bound, the conn would keep its
+// descriptor, its kernel send buffer and up to maxSendQueueBytesDetached of
+// queue for twice the WriteTimeout, which epoll does not (it closes at once).
+// Worker thread.
+func (w *Worker) closeStalled(fd int, cs *connState, now int64) {
+	w.closeConn(fd)
+	if w.conns[fd] == cs && cs.closing {
+		cs.lastActivity = now - w.closingDrainBound() - 1
+	}
+}
+
 // sweepWatchDue reports whether the loop owes a timeout sweep outside its
 // iteration gate (celeris#811): the dirty pass gave up a conn whose SEND is
 // outstanding (sendWatch), so no spin reaches the gate for its WriteTimeout,
@@ -6925,7 +7320,8 @@ func (w *Worker) sweepWatchDue() bool {
 // 0.8 s, 1.6 s or 102 s on an idle worker; with sendWatch set (sweepWatchDue)
 // it also runs about every 1 to 2 s (checked on every 8th iteration). None
 // of it runs while the worker waits without a
-// timeout for a SEND's completion (waitUntimed). This
+// timeout for a SEND's completion (waitUntimed), which it does not while a
+// partial send's remainder is outstanding (remainderWatch). This
 // replaces the timer wheel: instead of allocating entries and updating maps
 // on every recv/send, we store a single lastActivity timestamp on the
 // connState and scan here.
@@ -6939,7 +7335,14 @@ func (w *Worker) checkTimeouts() {
 	w.lastSweep = now
 	// sendOut: a conn has a SEND (or a SEND_ZC notification) outstanding, so
 	// the watch (sendWatch, set by the dirty pass's give-up) stays on.
-	sendOut := false
+	// remN: the number of conns with a partial send's remainder, or a long
+	// SEND, outstanding; while it is above 0 remainderWatch (set by flushSend)
+	// stays on and the run loop keeps out of its untimed wait (celeris#884
+	// item 62). It is also cleared as each such SEND completes (completeSend),
+	// so the sweep only corrects a count that a completion path skipping
+	// completeSend left wrong.
+	sendOut, remN := false, 0
+	w.sweepMarks = 0
 	// Drain the deferred-release queue here too. drainPendingRelease gates on
 	// w.cachedNow, which is otherwise only refreshed inside the CQE-processing
 	// block; on a fully idle worker (no CQEs) cachedNow never advances and
@@ -6959,6 +7362,7 @@ func (w *Worker) checkTimeouts() {
 	// already-visited slot) and (b) read a stale/zeroed tail slot as fd 0,
 	// dereferencing w.conns[0]. Reverse-by-index visits each conn exactly
 	// once even as entries are swap-removed from the tail (v1.5.0 review 1.9).
+	stallLook := w.stallLookDue(now)
 	for i := len(w.liveConns) - 1; i >= 0; i-- {
 		fd := w.liveConns[i]
 		cs := w.conns[fd]
@@ -6970,6 +7374,14 @@ func (w *Worker) checkTimeouts() {
 		}
 		if cs.sending || cs.zcNotifPending {
 			sendOut = true
+			if cs.remainderOut {
+				remN++
+			}
+		} else if cs.remainderOut {
+			// No SEND is outstanding any more but a completion path that
+			// does not go through completeSend (an error, a cancel) left the
+			// flag: it must not hold the untimed wait off for the conn's life.
+			cs.remainderOut = false
 		}
 		// Deferred close (closeConn): the fd stays open until the queued SENDs
 		// complete, which normally happens within a loop pass or two. Nothing
@@ -6983,7 +7395,23 @@ func (w *Worker) checkTimeouts() {
 			w.rescueHold(cs)
 		}
 		if cs.closing {
-			if now-cs.lastActivity > w.closingDrainBound() {
+			// The peer's acknowledged bytes are progress as much as a SEND
+			// completion that sent some (celeris#884 item 52). Read before
+			// the bound is tested: growth restamps the clock.
+			bound := w.closingDrainBound()
+			// A sample is due every quarter of the bound, and once more when
+			// the bound has passed since the last one was taken before it: the
+			// rate limit must not stand in for a fresh look at the moment of
+			// the reap when sweeps are irregular (a conn first met late in its
+			// bound, the next sweep past it). Once a sample is from past the
+			// bound, a conn that stays (held sends, another bound) waits for
+			// the rate limit again, so this costs one getsockopt per reap
+			// decision, not one per sweep.
+			if !cs.fixedFile && (now-cs.closeSampled >= bound/4 ||
+				(now-cs.lastActivity > bound && cs.closeSampled <= cs.lastActivity+bound)) {
+				w.noteClosingAcked(cs, now)
+			}
+			if now-cs.lastActivity > bound {
 				// Everything closeConn does before deferring (detach
 				// signalling, CloseH1, detachedCount) has already run, so
 				// finish exactly where completeSend would have. removeDirty
@@ -7015,7 +7443,7 @@ func (w *Worker) checkTimeouts() {
 					// it may have placed the rest of the response: read the
 					// bound again, or a send that is making progress is
 					// cancelled.
-					if now-cs.lastActivity <= w.closingDrainBound() {
+					if now-cs.lastActivity <= bound {
 						continue
 					}
 				}
@@ -7056,6 +7484,8 @@ func (w *Worker) checkTimeouts() {
 		if h1Detached {
 			if idleDL > 0 && now > idleDL {
 				w.closeConn(fd)
+			} else if stallLook {
+				w.sweepDetachedStall(cs, fd, now)
 			}
 			continue
 		}
@@ -7079,7 +7509,13 @@ func (w *Worker) checkTimeouts() {
 			}
 		}
 	}
-	w.sendWatch = sendOut
+	// A SEND marked while the sweep ran, after the sweep had looked at its
+	// conn, is not in sendOut or remN: keep it (sweepMarks). Counted a second
+	// time when the sweep had seen the conn marked before the mark was
+	// renewed, which only keeps the watch on until the next sweep.
+	w.sendWatch = sendOut || w.sweepMarks > 0
+	w.remainderN = remN + w.sweepMarks
+	w.remainderWatch = w.remainderN > 0
 }
 
 // h2PoolDrainFloor is the least time the worker, its context cancelled,
@@ -7275,6 +7711,7 @@ func endDetachedWrites(cs *connState) {
 		}
 	}
 	cs.detachClosed = true
+	cs.writeEnded.Store(true) // detachedStreamErr reads it without detachMu
 	// Acquire barrier — see the primary close path: skip OnDetachClose
 	// until the WS upgrade has fully wired the conn (WSReady) to avoid
 	// racing the post-Detach wiring on the async goroutine.
@@ -7720,59 +8157,27 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 		}
 	}
 
-	if host == "" || host == "0.0.0.0" {
+	if host == "" {
 		return &unix.SockaddrInet4{Port: port}, nil
 	}
 
-	// IPv6 addresses
-	if host == "::" {
-		return &unix.SockaddrInet6{Port: port}, nil
-	}
+	// The host is what net.ParseIP says it is, as in std: an IPv4 address (an
+	// IPv4-mapped IPv6 one, "::ffff:1.2.3.4", included) binds as IPv4, any
+	// other IPv6 address as IPv6, and what does not parse is an error. That
+	// refuses what the octet loop this replaced refused by hand, with std's
+	// own rules: a byte over 255 ("300.1.1.1" bound 44.1.1.1), a leading zero
+	// ("0127.0.0.1": octal in some parsers), a fifth byte, and the shorthands
+	// inet_aton reads ("10", "127.1": "1.2.3" bound 1.2.3.0).
 	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip6 := ip.To16(); ip6 != nil && ip.To4() == nil {
-			sa := &unix.SockaddrInet6{Port: port}
-			copy(sa.Addr[:], ip6)
-			return sa, nil
-		}
-	}
-
-	sa := &unix.SockaddrInet4{Port: port}
-	parts := [4]byte{}
-	partIdx := 0
-	val := 0
-	digits := 0 // digits in the byte being read
-	for _, c := range host {
-		if c == '.' {
-			if partIdx >= 3 || digits == 0 {
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-			parts[partIdx] = byte(val)
-			partIdx++
-			val = 0
-			digits = 0
-		} else if c >= '0' && c <= '9' {
-			if digits > 0 && val == 0 {
-				// "0127.0.0.1" and "010.0.0.1": a leading zero is ambiguous
-				// (octal in some parsers); net.ParseIP and std refuse it.
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-			val = val*10 + int(c-'0')
-			digits++
-			if val > 255 {
-				// "300.1.1.1" used to wrap to 44.1.1.1 and bind that.
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-		} else {
-			return nil, fmt.Errorf("invalid addr: %s", addr)
-		}
-	}
-	// "1.2.3" bound 1.2.3.0, "10" bound 10.0.0.0 and "1..2.3" bound
-	// 1.0.2.3: an address of four bytes, each written, or an error.
-	if partIdx != 3 || digits == 0 {
+	if ip == nil {
 		return nil, fmt.Errorf("invalid addr: %s", addr)
 	}
-	parts[partIdx] = byte(val)
-	sa.Addr = parts
+	if ip4 := ip.To4(); ip4 != nil {
+		sa := &unix.SockaddrInet4{Port: port}
+		copy(sa.Addr[:], ip4)
+		return sa, nil
+	}
+	sa := &unix.SockaddrInet6{Port: port}
+	copy(sa.Addr[:], ip.To16())
 	return sa, nil
 }

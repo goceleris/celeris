@@ -67,7 +67,9 @@ type Config struct {
 	//
 	// 0 asks for the default (10s); -1 disables it (0 after WithDefaults).
 	ReadHeaderTimeout time.Duration
-	// WriteTimeout is the max duration for writing the response.
+	// WriteTimeout is the max duration for writing the response, and bounds
+	// the wait for a closing connection's unsent bytes (see the public
+	// Config.WriteTimeout).
 	// 0 asks for the default (60s); -1 disables it (0 after WithDefaults).
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
@@ -257,6 +259,23 @@ func (c Config) Validate() []error {
 func (c *Config) SetH2Upgrade(enable bool) {
 	c.EnableH2Upgrade = enable
 	c.h2UpgradeResolved = true
+}
+
+// AsyncH2Notice is what the native engines log at start-up when
+// AsyncHandlers is set and HTTP/2 is reachable (AsyncH2Reachable).
+const AsyncH2Notice = "AsyncHandlers applies to HTTP/1.1 connections only: " +
+	"an HTTP/2 stream runs inline on the worker unless its route is async, and then runs on the HTTP/2 worker pool"
+
+// AsyncH2Reachable reports whether AsyncHandlers is set and an HTTP/2
+// connection can reach the engine: by prior knowledge on Protocol Auto and H2C
+// (whatever EnableH2Upgrade says), or by the RFC 7540 section 3.2 upgrade on
+// any protocol that has it enabled, HTTP1 included. It is the std engine's own
+// rule for serving HTTP/2 (std/engine.go), and the one gate of the engines'
+// AsyncH2Notice: neither "EnableH2Upgrade" (misses prior-knowledge h2c with the
+// upgrade off) nor "Protocol != HTTP1" (misses HTTP1 with the upgrade on).
+// A zero Protocol is Auto, as WithDefaults resolves it.
+func (c Config) AsyncH2Reachable() bool {
+	return c.AsyncHandlers && (c.Protocol != engine.HTTP1 || c.EnableH2Upgrade)
 }
 
 // DefaultMaxRequestBodySize is what Config.MaxRequestBodySize resolves to when

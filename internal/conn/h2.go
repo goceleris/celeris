@@ -541,6 +541,17 @@ func (s *H2State) DrainWriteQueue(write func([]byte)) {
 	}
 }
 
+// EnqueueWrite puts pre-encoded frame bytes on the write queue as a handler
+// goroutine's response does (the queue the engine drains with DrainWriteQueue),
+// on the shard of streamID. A copy is made, so frame belongs to the caller. It
+// is the seam for the engines' tests of their write-queue pass (celeris#889
+// item 1); nothing in the serving path calls it.
+func (s *H2State) EnqueueWrite(streamID uint32, frame []byte) {
+	p := getH2FrameBuf()
+	*p = append((*p)[:0], frame...)
+	s.writeQueue.Enqueue(streamID, p)
+}
+
 // NewH2State creates a new H2 connection state. wake is the event loop's
 // wakeup eventfd, signalled when handler goroutines enqueue responses (nil
 // to disable, falling back to polling).

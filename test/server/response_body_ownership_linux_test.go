@@ -15,7 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/goceleris/celeris"
 )
@@ -207,7 +206,9 @@ func TestConcurrentResponsesOwnTheirBodies(t *testing.T) {
 								return
 							}
 							if responses == 2 {
-								time.Sleep(100 * time.Millisecond)
+								// Hold the reads until the server has queued what the
+								// client window lets it send (was a 100 ms sleep).
+								waitServerSendQueued761(raw, addr)
 							}
 							var got []byte
 							for i := range responses {

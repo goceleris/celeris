@@ -91,6 +91,18 @@ func TestPreCompressedHonoursQ0And888(t *testing.T) {
 		{"gzip", "gzip", gz888},
 		{"br", "br", br888},
 		{"*", "br", br888},
+		// "*" matches only what is not listed (RFC 9110 12.5.3), so a coding
+		// listed with a q-value above 0 is served although "*;q=0" refuses
+		// the rest (celeris#888 item 44), and the name of the weight is
+		// case-insensitive (item 45).
+		{"gzip, *;q=0", "gzip", gz888},
+		{"br, *;q=0", "br", br888},
+		{"*;q=0, gzip", "gzip", gz888},
+		{"gzip;q=1.0, identity; q=0.5, *;q=0", "gzip", gz888}, // RFC 9110 12.5.3's own example
+		{"gzip;q=0, *", "br", br888},
+		{"br;q=0, *", "gzip", gz888},
+		{"br;Q=0, gzip", "gzip", gz888},
+		{"br;Q=0, gzip;Q=0", "", plain888},
 		{"x-gzip", "gzip", gz888}, // RFC 9110 8.4.1.3: x-gzip is gzip; the substring test matched it
 		{"X-GZIP", "gzip", gz888},
 		{"x-gzip, br;q=0", "gzip", gz888},

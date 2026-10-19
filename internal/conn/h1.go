@@ -45,6 +45,22 @@ var ErrHijacked = errors.New("celeris: connection hijacked")
 // connection once what is queued has gone out (celeris#761).
 var ErrWriteBacklog = errors.New("celeris: unsent responses over the back-pressure limit: request not served")
 
+// ErrWriteRefused is what a streaming write on an HTTP/1 connection returns
+// once the engine has refused response bytes of it (H1State.SetWriteErrQuery):
+// the response staged and not yet sent is at the engine's limit (64 MiB), so
+// the response is cut and the connection is closed once what was staged has
+// gone out (celeris#884 item 45, celeris#885 item 30). Before Detach the write
+// that would take the response past the limit stages nothing of its chunk.
+// After Detach the write that finds the backlog over the limit is dropped; the
+// one that took it over was staged, so the unsent bytes are bounded at the
+// limit plus one chunk there.
+var ErrWriteRefused = errors.New("celeris: response write refused: unsent response over the limit, connection closing")
+
+// ErrConnClosed is what a streaming write on an HTTP/1 connection returns once
+// the engine has torn the connection down (the peer went away, or the engine
+// closed it): the bytes go nowhere. It wraps [net.ErrClosed].
+var ErrConnClosed = fmt.Errorf("celeris: response write on a closed connection: %w", net.ErrClosed)
+
 // ClearHeaderDeadline drops the slowloris-defence read-header deadline
 // — called after a successful ParseRequest signals that the next state
 // is request handling, not header reading. The engine's checkTimeouts
@@ -381,6 +397,33 @@ func (s *H1State) CurrentRoute() (method, path string) {
 // OnDetach to route StreamWriter writes through the mutex-guarded writeFn.
 func (s *H1State) UpdateWriteFn(fn func([]byte)) {
 	s.rw.write = fn
+}
+
+// WriteErrQuery is the engine's write-error query for an HTTP/1 streaming
+// response (H1State.SetWriteErrQuery).
+//
+// StreamWriteErr(n) reports nil while the connection can take n more bytes of
+// the response, [ErrConnClosed] once the engine has torn the connection down,
+// and [ErrWriteRefused] once it has refused bytes of the response or n more
+// would take the response it holds unsent past its streaming limit. n is 0 to
+// ask the state only. It is asked from the goroutine that runs the handler. A
+// query for a connection that is not detached reads the engine's state as the
+// write hook does, without a lock; Detach swaps in one that is safe to ask
+// from the handler's goroutine after the handler returned.
+type WriteErrQuery interface {
+	StreamWriteErr(n int) error
+}
+
+// SetWriteErrQuery installs the engine's write-error query on the response
+// adapter, which WriteHeader, Write, Flush and Close of a streaming response
+// consult (the write hook, func([]byte), has no error return: it is also the
+// HTTP/2 writer). WriteHeader, Write and Close ask it with the size of what
+// they are about to stage, before they stage it, and every call asks it again
+// after the hook; the call returns what it reports and the adapter drops the
+// rest of that response's writes. Detach swaps in
+// the detached query with the write hook (UpdateWriteFn). nil removes it.
+func (s *H1State) SetWriteErrQuery(q WriteErrQuery) {
+	s.rw.writeErr = q
 }
 
 // SetWriteBodyFn installs a scatter-gather body writer on the response

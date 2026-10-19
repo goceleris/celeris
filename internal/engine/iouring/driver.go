@@ -99,8 +99,9 @@ type driverConn struct {
 // it also ends armDriverRecv's refusal, which goes through failDriverConn)
 // and shutdownDrivers (after which nothing is submitted; closing the ring
 // cancels what is armed). Setting closing too makes a later UnregisterConn
-// or Write a no-op, so neither queues work for a conn that is gone, and
-// every path that prepares an SQE checks closing first.
+// a no-op and a later Write fail with ErrUnknownFD, so neither queues work for
+// a conn that is gone, and every path that prepares an SQE checks closing
+// first.
 //
 // retire does not close. close(2) can block: with SO_LINGER set and data
 // still unsent to a peer that is not reading, the last close of a socket
@@ -273,7 +274,8 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 // which is when the socket closes (celeris#691). Until then the number stays
 // a key of this worker's driver map, so a RegisterConn here of the next
 // socket to get it, as the lowest free number usually is, fails with "fd
-// already registered" until onClose has fired. See [engine.WorkerLoop].
+// already registered" until the conn is finalized, which can come before
+// onClose fires. See [engine.WorkerLoop].
 func (w *Worker) UnregisterConn(fd int) error {
 	w.driverMu.RLock()
 	dc, ok := w.driverConns[fd]
@@ -293,7 +295,14 @@ func (w *Worker) UnregisterConn(fd int) error {
 }
 
 // Write enqueues data for fd. Returns ErrQueueFull if the per-FD outbound
-// buffer would exceed driverSendCap, and ErrUnknownFD if fd isn't registered.
+// buffer would exceed driverSendCap, and ErrUnknownFD if fd isn't registered
+// or is closing: after UnregisterConn, or after the conn failed, its bytes are
+// not sent, and Write says so, as the epoll engine does for a number it no
+// longer knows (celeris#884 item 54). It used to report success and drop them.
+// The closing branch below answers the window between the unregister or the
+// failure and finalizeDriver; finalizeDriver deletes the conn from the map
+// before the engine's descriptor is closed and onClose runs, so a Write after
+// that misses the lookup and gets the same answer.
 func (w *Worker) Write(fd int, data []byte) error {
 	w.driverMu.RLock()
 	dc, ok := w.driverConns[fd]
@@ -304,7 +313,7 @@ func (w *Worker) Write(fd int, data []byte) error {
 	dc.mu.Lock()
 	if dc.closing {
 		dc.mu.Unlock()
-		return nil
+		return engine.ErrUnknownFD
 	}
 	if len(dc.writeBuf)+len(dc.sendBuf)+len(data) > driverSendCap {
 		dc.mu.Unlock()
@@ -701,8 +710,9 @@ func (w *Worker) shutdownDrivers() {
 	w.shutdownDriverHold = append(w.shutdownDriverHold, conns...)
 	w.driverMu.Unlock()
 
-	// Retire every conn first (a later UnregisterConn or Write is then a no-op),
-	// close the engine's descriptors in parallel, and only then fire the
+	// Retire every conn first (a later UnregisterConn is then a no-op and a
+	// later Write fails with ErrUnknownFD), close the engine's descriptors in
+	// parallel, and only then fire the
 	// onCloses, in this goroutine, each after its socket's close(2) has
 	// returned (celeris#866).
 	//
@@ -718,7 +728,7 @@ func (w *Worker) shutdownDrivers() {
 			toClose = append(toClose, dc)
 		}
 	}
-	closeDriverFDs(toClose)
+	closeDriverFDs(toClose, w.closeBound())
 	for _, dc := range conns {
 		dc.fireOnClose(errEngineShutdown)
 	}
@@ -735,31 +745,65 @@ func (w *Worker) shutdownDrivers() {
 // exceeded limit is fatal); one bound for all of them is the most threads
 // shutdown can pin this way. Past it the closes queue behind the first ones:
 // ceil(N/bound) x linger in the worst case for N lingering sockets in the
-// whole engine, against N x linger when each worker closed its own in turn.
+// whole process, against N x linger when each worker closed its own in turn.
+// The closes closeOpFD hands off the worker while it runs take their tokens
+// from the same semaphore (celeris#884 item 55).
 const shutdownDriverCloseWorkers = 128
 
-// driverCloseSem holds a token for each close(2) shutdownDrivers has in
-// flight, in every worker.
+// driverCloseSem holds a token for each close(2) of a driver descriptor in
+// flight, from shutdownDrivers and from closeOpFD, in every worker of every
+// engine of the process. Worker.closeSem replaces it for a test (closeBound).
 var driverCloseSem = make(chan struct{}, shutdownDriverCloseWorkers)
 
-// closeDriverFDs closes the engine's descriptor of each conn, at most
-// shutdownDriverCloseWorkers at a time in the whole process, and returns when
-// every close(2) has returned. The worker used to close them one after
-// another, so with N lingering sockets shutdown spent up to N x linger here
-// with its ring unserved; now it waits for the slowest (celeris#866). Nothing
-// about a close changes: the same close(2) of the same descriptor, FIN after
-// the unsent data within the linger time (never an RST that discards it, as
-// SO_LINGER{1,0} would), only many at once. The conns are retired, so nothing
-// else touches opFD. Worker goroutine, from shutdownDrivers.
-func closeDriverFDs(conns []*driverConn) {
-	closeFDsInParallel(conns, driverCloseSem, func(fd int) { _ = unix.Close(fd) })
+// closeBound is the semaphore that bounds this worker's driver closes:
+// closeSem when a test gave the worker its own, driverCloseSem otherwise.
+func (w *Worker) closeBound() chan struct{} {
+	if w.closeSem != nil {
+		return w.closeSem
+	}
+	return driverCloseSem
 }
 
-// closeFDsInParallel is closeDriverFDs with the bound (the capacity of sem,
-// whose tokens it takes for each close and gives back after it) and the close
-// as parameters, for the test of the bound: closeFn(opFD) runs once per conn,
-// and calls that share a sem share its bound. A goroutine waiting for a token
+// closeFunc is the close(2) closeOpFD runs under its token: closeFn when a test
+// replaced it, closeFD otherwise.
+func (w *Worker) closeFunc() func(fd int) {
+	if w.closeFn != nil {
+		return w.closeFn
+	}
+	return closeFD
+}
+
+// closeDriverFDs closes the engine's descriptor of each conn, at most cap(sem)
+// at a time among every caller that shares sem (shutdownDrivers passes the
+// worker's closeBound: shutdownDriverCloseWorkers wide in the whole process),
+// and returns when every close(2) has returned. The worker used to close them
+// one after another, so with N lingering sockets shutdown spent up to N x
+// linger here with its ring unserved; now it waits for the slowest
+// (celeris#866). Nothing about a close changes: the same close(2) of the same
+// descriptor, FIN after the unsent data within the linger time (never an RST
+// that discards it, as SO_LINGER{1,0} would), only many at once. The conns are
+// retired, so nothing else touches opFD. Worker goroutine, from
+// shutdownDrivers.
+func closeDriverFDs(conns []*driverConn, sem chan struct{}) {
+	closeFDsInParallel(conns, sem, closeFD)
+}
+
+// closeFD is the close(2) of one engine descriptor; its error is dropped, as
+// everywhere the engine closes a duplicate it has no use for any more.
+func closeFD(fd int) { _ = unix.Close(fd) }
+
+// closeUnderBound runs closeFn(fd) holding a token of sem: it waits for one,
+// and gives it back when closeFn returns. A goroutine waiting for a token
 // holds no thread; only a close in progress does.
+func closeUnderBound(sem chan struct{}, fd int, closeFn func(fd int)) {
+	sem <- struct{}{}
+	defer func() { <-sem }()
+	closeFn(fd)
+}
+
+// closeFDsInParallel is closeDriverFDs with the close as a parameter, for the
+// test of the bound: closeFn(opFD) runs once per conn, under a token of sem
+// (closeUnderBound), and calls that share a sem share its bound.
 func closeFDsInParallel(conns []*driverConn, sem chan struct{}, closeFn func(fd int)) {
 	n := min(len(conns), cap(sem))
 	if n <= 0 {
@@ -774,14 +818,11 @@ func closeFDsInParallel(conns []*driverConn, sem chan struct{}, closeFn func(fd 
 		go func() {
 			defer wg.Done()
 			for {
-				sem <- struct{}{}
 				i := int(next.Add(1)) - 1
 				if i >= len(conns) {
-					<-sem
 					return
 				}
-				closeFn(conns[i].opFD)
-				<-sem
+				closeUnderBound(sem, conns[i].opFD, closeFn)
 			}
 		}()
 	}
@@ -797,6 +838,9 @@ func closeFDsInParallel(conns []*driverConn, sem chan struct{}, closeFn func(fd 
 // The other actions stay queued, as closeAdoptQueue leaves them. Worker
 // goroutine, from shutdown.
 func (w *Worker) waitDriverCloses() {
+	if h := w.waitClosesHook; h != nil {
+		h()
+	}
 	w.driverClosers.Wait()
 	w.driverActionMu.Lock()
 	var closed []driverAction
@@ -833,9 +877,15 @@ func (dc *driverConn) fireOnClose(err error) {
 // The worker never waits on the close: with SO_LINGER set and data unsent to
 // a peer that is not reading, it lasts up to the linger time, and on the
 // worker it stalled every connection of the ring, HTTP and driver alike, for
-// as long (celeris#735). The order a driver sees is kept: the socket has
-// closed, as far as close(2) closes it, before onClose runs, and onClose
-// still runs on the worker goroutine (internal/engine/provider.go). dc left the driver
+// as long (celeris#735). The goroutine takes a token of the worker's close
+// bound around the close(2) (closeUnderBound), the one shutdownDrivers' closes
+// take: a lingering close pins an OS thread for the linger time, so N
+// simultaneous lingering unregisters must not pin N threads (the runtime's
+// limit of 10000 is fatal). Past the bound the goroutines wait for a token,
+// holding no thread, and the conn's onClose waits with them (celeris#884
+// item 55). The order a driver sees is kept: the socket has closed, as far as
+// close(2) closes it, before onClose runs, and onClose still runs on the
+// worker goroutine (internal/engine/provider.go). dc left the driver
 // map and was retired before this, so nothing issues an SQE by opFD any more
 // and its number is not reused before the close. Shutdown waits for the close
 // (waitDriverCloses). Worker goroutine.
@@ -843,7 +893,7 @@ func (w *Worker) closeOpFD(dc *driverConn, err error) {
 	w.driverClosers.Add(1)
 	go func() {
 		defer w.driverClosers.Done()
-		_ = unix.Close(dc.opFD)
+		closeUnderBound(w.closeBound(), dc.opFD, w.closeFunc())
 		w.addDriverAction(driverAction{kind: driverActionClosed, dc: dc, closeErr: err})
 	}()
 }

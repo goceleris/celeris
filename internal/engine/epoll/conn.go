@@ -103,6 +103,71 @@ func (cs *connState) overBacklogH1() bool {
 	return cs.pendingBytes > maxPendingBytes
 }
 
+// StreamWriteErr is the write-error query of an HTTP/1 conn that is not
+// detached (conn.WriteErrQuery, installed by conn.H1State.SetWriteErrQuery),
+// asked by a StreamWriter's WriteHeader, Write, Flush and Close: with n the
+// size of the head, chunk or last chunk about to be staged, and with 0 after
+// the write hook. It is nil
+// while the conn can take the response, conn.ErrConnClosed once the engine has
+// torn it down, and conn.ErrWriteRefused once bytes were refused or the
+// response unsent plus n is over maxPendingBytesDetached. The last is the cap
+// on a response held whole in memory before Detach, the limit a detached or
+// HTTP/2 conn has (an HTTP/1 response, however large, is staged whole,
+// celeris#761; this bounds it): the write hook only appends for an HTTP/1 conn
+// (writeCap), and nothing sends while the handler runs, so a stream of any size
+// was staged (celeris#884 item 45, #885 item 30). Asked before the chunk is
+// staged, it keeps the chunk that would cross the limit out of the send buffer,
+// so what is held is at most the limit, not the limit plus a chunk. It marks
+// the refusal as the hook does (writeRefused), so the conn is closed once what
+// is staged has gone out. No lock: it runs on the goroutine that runs the
+// handler, the loop thread or the dispatch goroutine holding detachMu, as the
+// write hook does.
+func (cs *connState) StreamWriteErr(n int) error {
+	if cs.writeRefused {
+		return conn.ErrWriteRefused
+	}
+	if cs.detachClosed || cs.asyncClosed.Load() {
+		return conn.ErrConnClosed
+	}
+	if cs.pendingBytes+n > maxPendingBytesDetached {
+		cs.writeRefused = true
+		return conn.ErrWriteRefused
+	}
+	return nil
+}
+
+// detachedStreamErr is the write-error query of a detached conn
+// (conn.WriteErrQuery, swapped in by OnDetach with the guarded write hook),
+// whose handler goroutine writes without the loop's lock. What it reports is
+// ended by a close or by the guarded hook finding the write refused, and both
+// store asyncClosed first (closeConn and shutdown before they set detachClosed
+// under mu; the guarded hook under mu, when it finds writeRefused): while it is
+// clear the answer is nil and no lock is taken, so a Write and its Flush do not
+// take detachMu a second and third time (celeris#884 item 45, #885 item 30).
+// Once it is set, writeRefused is read under mu, which the guarded hook holds
+// when it sets it, to tell a refusal from a close. The limit is the write
+// hook's own (maxPendingBytesDetached): a refusal there is what writeRefused
+// records, and the write that took the backlog past it was staged, so n is not
+// asked for.
+type detachedStreamErr struct {
+	cs *connState
+	mu *sync.Mutex
+}
+
+func (d *detachedStreamErr) StreamWriteErr(int) error {
+	cs := d.cs
+	if !cs.asyncClosed.Load() {
+		return nil
+	}
+	d.mu.Lock()
+	refused := cs.writeRefused
+	d.mu.Unlock()
+	if refused {
+		return conn.ErrWriteRefused
+	}
+	return conn.ErrConnClosed
+}
+
 // connState holds per-connection state for the epoll engine.
 // Fields are ordered for cache line optimization (P4): hot fields first.
 type connState struct {
@@ -113,7 +178,8 @@ type connState struct {
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
 	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
 	detectN  uint8           // 1 byte: bytes at the head of buf received but too few to detect on, under detect.PrefaceLen (celeris#870); 0 once detected
-	_        [3]byte         // padding to 8-byte alignment
+	goMoved  bool            // 1 byte: the dispatch goroutine's flush took bytes of a response (left the rest queued, or emptied the queue; resyncPending); under detachMu, consumed by noteWriteProgress (celeris#885 items 35 and 45)
+	_        [2]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
@@ -144,6 +210,24 @@ type connState struct {
 	// conn past it; initProtocol hands what is left of it to the H1 header
 	// deadline, so detection does not restart the budget. Loop thread only.
 	detectDeadline int64
+
+	// writeSince is the clock of a response the kernel has not taken whole
+	// (celeris#885 items 35 and 45): the time, in nanoseconds (wall clock), at
+	// which the peer last took some of it, or at which the first partial flush
+	// left it queued. armEpollOut starts it (the first partial flush of a
+	// response: the conn is parked on EPOLLOUT), handleWritable and flushDirty
+	// restart it from their partial branches when a flush took bytes of what
+	// was queued (noteWriteProgress, never from flushWrites), and endWrite
+	// clears it once nothing is queued. checkTimeouts measures WriteTimeout
+	// from it for a conn that has it, and IdleTimeout and ReadTimeout from the
+	// later of it and lastActivity: lastActivity is the last READ, and a
+	// keep-alive conn that is still taking a large response has not been read
+	// for as long as the response takes (ReadTimeout cut it), while one that
+	// takes nothing is not stalled by lastActivity's measure at all
+	// (WriteTimeout never fired for a conn that EPOLLOUT had taken off the dirty
+	// list). 0 when nothing is queued. Loop thread; reset on release. (Declared
+	// beside lastActivity, which the sweep reads for every conn.)
+	writeSince int64
 
 	// Cold — third cache line:
 	h1State      *conn.H1State
@@ -196,7 +280,12 @@ type connState struct {
 	// there is one) and closeSampled when that was. checkTimeouts reaps a conn
 	// whose closeSince is older than closingDrainBound, and measures nothing
 	// else on it: lastActivity is the last READ, and a conn that is closing is
-	// no longer read. 0 when no deferred close is under way. Worker-thread-
+	// no longer read. 0 when no deferred close is under way. A truly-detached
+	// conn (WS/SSE) is never in that state (closeWhenFlushed closes it at
+	// once), and uses the same fields as the clock of a stall: how long its peer
+	// has taken none of the bytes queued for it, bounded by WriteTimeout
+	// (detachedStalled, celeris#888 items 38 and 39), started by the sweep that
+	// finds bytes queued and cleared by the one that finds none. Worker-thread-
 	// only; reset on release.
 	closeSince   int64
 	closePending int
@@ -314,12 +403,6 @@ type connState struct {
 	// conn's place (the io_uring twin is its detachCounted, celeris#549).
 	detachCounted bool
 
-	// liveIdx is this conn's index into l.liveConns (the dense slice of
-	// live connStates iterated by checkTimeouts, the sweep and shutdown).
-	// -1 when not present. Maintained by addLiveConn/removeLiveConn for O(1)
-	// removal (#318). Loop-thread-only, like liveConns itself (celeris#668).
-	liveIdx int
-
 	// hijacked is set by hijackConn (Context.Hijack) once the fd has been
 	// detached from the engine and handed to the caller as a net.Conn. In
 	// async mode hijackConn runs ON the dispatch goroutine (inside
@@ -379,6 +462,15 @@ type connState struct {
 	// both to closeConn, which does them under the lock when the close
 	// actually runs (celeris#669).
 	closeErr error
+
+	// liveIdx is this conn's index into l.liveConns (the dense slice of
+	// live connStates iterated by checkTimeouts, the sweep and shutdown).
+	// -1 when not present. Maintained by addLiveConn/removeLiveConn for O(1)
+	// removal (#318). Loop-thread-only, like liveConns itself (celeris#668).
+	// (Declared last: an 8-byte field among the flags above leaves a five-byte
+	// hole, which is the room writeSince needed to stay in the size class,
+	// TestConnStateStaysInItsSizeClass.)
+	liveIdx int
 }
 
 var connStatePool = sync.Pool{
@@ -425,6 +517,7 @@ func releaseConnState(cs *connState) {
 	cs.detectDeadline = 0
 	cs.dirty = false
 	cs.epollOut = false
+	cs.goMoved = false
 	cs.pendingBytes = 0
 	cs.writePos = 0
 	cs.lastActivity = 0
@@ -442,6 +535,7 @@ func releaseConnState(cs *connState) {
 	cs.writeBuf = trimPooledBuf(cs.writeBuf)
 	cs.peerClosed = false
 	cs.closeSince = 0
+	cs.writeSince = 0
 	cs.closePending = 0
 	cs.closeAcked = 0
 	cs.closeAckedKnown = false

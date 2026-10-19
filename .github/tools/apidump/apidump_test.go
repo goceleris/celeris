@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"flag"
 	"os"
 	"path/filepath"
@@ -94,48 +95,83 @@ func TestCheck(t *testing.T) {
 	if _, err := writeFiles(root, gen(t, root)); err != nil {
 		t.Fatal(err)
 	}
-	src := filepath.Join(root, "fix.go")
-	orig, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatal(err)
-	}
 	cases := []struct {
 		name     string
-		old, new string // a replacement in fix.go; old "" appends new
-		file     string // the stale file, "" for none
+		src      string   // the file to edit, relative to the fixture root; default fix.go
+		with     []string // other files that get the same edit
+		old, new string   // a replacement in it; old "" appends new
+		file     string   // the stale file, "" for none
 		diff     []string
 	}{
 		{name: "unchanged"},
 		{name: "exported func added", new: "\nfunc Added(int) {}\n", file: "api/fix.txt", diff: []string{"+func Added(int)"}},
+		// The methods an unexported interface of another package supplies
+		// are listed: nothing else names them (celeris#890).
+		{name: "unexported embedded interface changed", src: "fix_hiddeniface.go", old: "type hiddenReader interface{ io.Reader }", new: "type hiddenReader interface{ io.Writer }",
+			file: "api/fix.txt", diff: []string{"-method (HidIface) Read([]byte) (int, error)", "+method (HidIface) Write([]byte) (int, error)", "-method (HidNested) Read([]byte) (int, error)", "+method (HidNested) Write([]byte) (int, error)"}},
 		{name: "exported signature changed",
 			old: "func Variadic(prefix string, rest ...int) (n int, err error)", new: "func Variadic(prefix string, rest ...int64) (n int, err error)",
 			file: "api/fix.txt", diff: []string{"-func Variadic(string, ...int) (int, error)", "+func Variadic(string, ...int64) (int, error)"}},
+		// Exported fields reordered: the field lines are sorted, so only the
+		// order line shows it, and unkeyed literals break (celeris#890).
+		{name: "exported fields reordered", src: "fix_order.go", old: "\tB string\n\tC bool\n", new: "\tC bool\n\tB string\n",
+			file: "api/fix.txt", diff: []string{"-type Ordered struct, field order A, B, C", "+type Ordered struct, field order A, C, B"}},
+		{name: "embedded field moved", src: "fix_order.go", old: "\tBase\n\tZ []byte\n", new: "\tZ []byte\n\tBase\n",
+			file: "api/fix.txt", diff: []string{"-type Grouped struct, field order X, Y, Base, Z", "+type Grouped struct, field order X, Y, Z, Base"}},
+		{name: "fields reordered in a struct with an unexported field", src: "fix_order.go", old: "\tA int\n\tB string\n\tc bool\n", new: "\tB string\n\tA int\n\tc bool\n"},
 		{name: "exported method removed", old: "func (Kind) String() string { return \"\" }", new: "",
 			file: "api/fix.txt", diff: []string{"-method (Kind) String() string"}},
+		// The first unexported field added to an all-exported struct changes
+		// no exported field line, and breaks unkeyed literals (celeris#890).
+		{name: "first unexported field added", src: "fix_unexported.go", old: "\tB string\n}", new: "\tB string\n\tc int\n}",
+			file: "api/fix.txt", diff: []string{"+type AllExp struct, unexported fields"}},
+		{name: "last unexported field removed", src: "fix_unexported.go", old: "\tA int\n\tb int\n", new: "\tA int\n",
+			file: "api/fix.txt", diff: []string{"-type OneUnexp struct, unexported fields"}},
+		{name: "unexported field added to a struct that has one", src: "fix_unexported.go", old: "\tA int\n\tb int\n", new: "\tA int\n\tb int\n\tc int\n"},
 		{name: "unexported identifier changed", old: "unexported = 7", new: "unexported = 8\n\tunexported2 = 9"},
+		// A struct that stops being comparable (or becomes so) changes no
+		// exported field line: the blank field is the whole change (celeris#890).
+		{name: "struct stops being comparable", src: "fix_comparable.go", old: "\tE any\n", new: "\tE any\n\t_ [0]func()\n",
+			file: "api/fix.txt", diff: []string{"+type Cmp struct, not comparable"}},
+		{name: "struct becomes comparable", src: "fix_comparable.go", old: "_ [0]func()", new: "_ [0]int",
+			file: "api/fix.txt", diff: []string{"-type NotCmpBlank struct, not comparable"}},
 		{name: "function body changed", old: "func (b *Box[T]) Get() T                { return b.Val }", new: "func (b *Box[T]) Get() T { var z T; _ = z; return b.Val }"},
 		{name: "parameter renamed", old: "func Variadic(prefix string,", new: "func Variadic(p string,"},
+		// The package clause is not in the import path, and a rename breaks
+		// importers that use the default name (celeris#890). go list wants one
+		// name per directory, so the _test.go file is renamed with it.
+		{name: "package clause renamed", src: "sub/sub.go", with: []string{"sub/only_test.go"}, old: "package sub\n", new: "package subs\n",
+			file: "api/sub.txt", diff: []string{"-# Package clause: sub.", "+# Package clause: subs."}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			text := string(orig)
-			switch {
-			case c.old != "":
-				if !strings.Contains(text, c.old) {
-					t.Fatalf("fix.go has no %q", c.old)
+			// The edit applies to each of the case's files, and each is
+			// restored afterwards.
+			for _, rel := range append([]string{cmp.Or(c.src, "fix.go")}, c.with...) {
+				src := filepath.Join(root, filepath.FromSlash(rel))
+				orig, err := os.ReadFile(src)
+				if err != nil {
+					t.Fatal(err)
 				}
-				text = strings.Replace(text, c.old, c.new, 1)
-			default:
-				text += c.new
-			}
-			if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			defer func() {
-				if err := os.WriteFile(src, orig, 0o644); err != nil {
-					t.Error(err)
+				text := string(orig)
+				switch {
+				case c.old != "":
+					if !strings.Contains(text, c.old) {
+						t.Fatalf("%s has no %q", rel, c.old)
+					}
+					text = strings.Replace(text, c.old, c.new, 1)
+				default:
+					text += c.new
 				}
-			}()
+				if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.WriteFile(src, orig, 0o644); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
 			stale, err := compare(root, gen(t, root))
 			if err != nil {
 				t.Fatal(err)
@@ -171,6 +207,33 @@ func TestPlatformLine(t *testing.T) {
 	} {
 		if !strings.Contains(got, l) {
 			t.Errorf("api/fix.txt has no line %q", strings.TrimSuffix(l, "\n"))
+		}
+	}
+}
+
+// TestForeignMethods pins which methods of another module or the standard
+// library are listed: those of an interface reached through an unexported
+// type, and not those of a struct (time.Time's), whether it is embedded
+// directly or through an unexported struct, since a Go release that adds a
+// method to time.Time must change nothing here (celeris#890).
+func TestForeignMethods(t *testing.T) {
+	got := string(gen(t, copyFixture(t))["api/fix.txt"])
+	for _, want := range []string{
+		"method (HidIface) Read([]byte) (int, error)\n",
+		"method (HidNested) Read([]byte) (int, error)\n",
+		"method (HidPtr) Close() error\n",
+		"type ExpIface struct, embedded io.Reader\n",
+		"type ExpStruct struct, embedded time.Time\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("api/fix.txt has no line %q", strings.TrimSuffix(want, "\n"))
+		}
+	}
+	for _, recv := range []string{"(HidStruct)", "(ExpStruct)", "(ExpIface)"} {
+		for _, line := range strings.Split(got, "\n") {
+			if strings.HasPrefix(line, "method "+recv) {
+				t.Errorf("api/fix.txt lists a foreign method of %s: %q", recv, line)
+			}
 		}
 	}
 }

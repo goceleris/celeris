@@ -74,14 +74,18 @@ func TestFailedStartClosesTheSuppliedListener(t *testing.T) {
 						_ = ln.Close()
 						t.Fatalf("call %d: %s returned %v, want the start failure", call, entry.name, startErr)
 					}
+					// Dial before anything closes the listener: a listener the
+					// failed start left open still completes the handshake into
+					// its backlog, so the dial connects. Nothing here closes it
+					// first, so this dial is the check that can fail (celeris#737).
+					if c, derr := net.DialTimeout("tcp", addr, time.Second); derr == nil {
+						_ = c.Close()
+						t.Errorf("call %d: after the failed start a dial to the listener's address %s still connected", call, addr)
+					}
 					// Closing a listener that is already closed reports
 					// net.ErrClosed; closing an open one succeeds (and tidies up).
 					if cerr := ln.Close(); !errors.Is(cerr, net.ErrClosed) {
 						t.Errorf("call %d: %s failed (%v) and left the supplied listener open (celeris#737)", call, entry.name, startErr)
-					}
-					if c, derr := net.DialTimeout("tcp", addr, time.Second); derr == nil {
-						_ = c.Close()
-						t.Errorf("call %d: after the failed start a dial to the listener's address %s still connected", call, addr)
 					}
 				}
 			})

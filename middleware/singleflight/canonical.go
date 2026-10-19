@@ -29,11 +29,12 @@ const maxCanonicalAE = 256
 // weight, entries separated by ",", in order. So two values have one form
 // exactly when the negotiator gives them one answer: "gzip, deflate, br"
 // and "gzip,deflate,br", "GZIP" and "gzip", "gzip;q=0.8" and "gzip; q=0.8",
-// and "gzip;q=0.80" are one value, while "gzip;q=0" and "gzip;Q=0" (which the
-// negotiator reads as q=1: it matches "q=" in lower case only), "gzip;q = 0"
-// and "g zip" are not, because the negotiator tells them apart. A value
-// folded by anything looser (blanks inside a token or around "=", case of the
-// weight) would give a waiter an encoding it refused. Every other header keeps
+// and "gzip;q=0.80" are one value, and so are "gzip;q=0" and "gzip;Q=0" (the
+// name of the weight is case-insensitive, RFC 9110 12.4.2), while "gzip;q=0"
+// and "gzip;q = 0" (which the negotiator reads as q=1: blanks around "=" make
+// no weight) and "g zip" are not, because the negotiator tells them apart.
+// A value folded by anything looser (blanks inside a token or around "=")
+// would give a waiter an encoding it refused. Every other header keeps
 // its value as the client sent it, and so does an Accept-Encoding longer than
 // maxCanonicalAE bytes (see there).
 func canonicalAppend(dst []byte, name, v string) []byte {
