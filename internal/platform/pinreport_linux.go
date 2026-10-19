@@ -4,6 +4,7 @@ package platform
 
 import (
 	"log/slog"
+	"strings"
 	"sync"
 )
 
@@ -40,16 +41,30 @@ func (f *PinFailures) Take(key any) (PinFailure, bool) {
 
 // LogPinOutcome logs, once for an engine, what the plan did: one Info line
 // when the plan departs from the plain "i-th allowed CPU" rule (the little
-// CPUs it avoids, how many loops it holds and why, celeris#1036), and one Warn
-// line when loops could not pin and run unpinned. It logs nothing otherwise.
+// CPUs it avoids, how many loops it holds and why, celeris#1036; the CPUs the
+// rx-port rule left without a loop, with the port and its share, when it did),
+// one Debug line with the candidates the rx-port rule passed over or why it
+// stepped aside, and one Warn line when loops could not pin and run unpinned.
+// It logs nothing otherwise.
 func LogPinOutcome(log *slog.Logger, engine string, plan CPUPlan, failed []PinFailure) {
 	if log == nil {
 		return
 	}
 	if plan.Note != "" {
-		log.Info(engine+": capability-aware CPU pinning", "reason", plan.Note,
+		attrs := []any{"reason", plan.Note,
 			"allowed", FormatCPUs(plan.Allowed), "workers", len(plan.CPUs), "requested", plan.Requested,
-			"pinned", plan.Pinned())
+			"pinned", plan.Pinned()}
+		// The rx-port rule (celeris#1036 item 1) names what it did on the same
+		// line: the CPUs left without a loop, the port and its share of the
+		// packets received since boot.
+		if f := plan.RxFree; len(f.Freed) > 0 {
+			attrs = append(attrs, "freed_cpus", FormatCPUs(f.Freed), "rx_port", f.Port, "rx_share_pct", f.SharePercent)
+		}
+		log.Info(engine+": capability-aware CPU pinning", attrs...)
+	}
+	if len(plan.RxFree.Why) > 0 {
+		log.Debug(engine+": rx-port loop placement", "freed", len(plan.RxFree.Freed) > 0,
+			"detail", strings.Join(plan.RxFree.Why, "; "))
 	}
 	if len(failed) == 0 {
 		return
