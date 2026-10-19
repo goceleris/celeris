@@ -19,9 +19,17 @@ package epoll
 // from the tick gate: post-sweep by construction, no search. The control's
 // close is the client's, right after PauseAccept, with a 10 s header
 // deadline that no step of the test can reach (celeris#885 item 11).
+//
+// The third arm reaches the post-sweep close through a production path and
+// disarms nothing (celeris#885 item 10): an async route is blocked in its
+// handler, so the conn is counted Busy, the request carries Connection: close,
+// PauseAccept parks the listeners, and the handler is released. The dispatch
+// goroutine sets asyncClosed and enqueues the conn, and drainDetachQueue, which
+// runs after sweep(), closes it: the park follows in the same iteration.
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -52,6 +60,24 @@ func (parkResidueHandler) HasAsyncRoutes() bool        { return true }
 
 var _ stream.AsyncRouteResolver = parkResidueHandler{}
 
+// parkResidueBlockHandler is parkResidueHandler whose handler waits for
+// release before it answers, so the conn it serves is inside a handler (counted
+// Busy by the sweep, not movable) for as long as the test wants.
+type parkResidueBlockHandler struct {
+	parkResidueHandler
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *parkResidueBlockHandler) HandleStream(ctx context.Context, s *stream.Stream) error {
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+	<-h.release
+	return h.parkResidueHandler.HandleStream(ctx, s)
+}
+
 // closingTarget closes whatever it is handed. Nothing should be handed to it
 // here: the only connection is refused as Busy.
 type closingTarget struct{ adopted atomic.Int64 }
@@ -74,11 +100,35 @@ func parkWait(d time.Duration, f func() bool) bool {
 	}
 }
 
+// parkArm is how parkResidue ends the loop's last connection.
+type parkArm int
+
+const (
+	// armTickGate: the 400 ms header deadline closes a slowloris conn at the
+	// tick gate's checkTimeouts, after sweep(); the timerfd is disarmed, so
+	// no other call site can.
+	armTickGate parkArm = iota
+	// armEvent: the client of a slowloris conn closes it, right after
+	// PauseAccept, and the loop learns it from an event, before sweep().
+	armEvent
+	// armDetachQueue: the dispatch goroutine of a conn whose request said
+	// Connection: close hands it back through the detach queue, and
+	// drainDetachQueue closes it, after sweep(). Nothing is disarmed.
+	armDetachQueue
+)
+
+func (a parkArm) String() string {
+	return [...]string{"tick_gate", "event", "detach_queue"}[a]
+}
+
+// postSweep reports whether the arm's close lands after sweep().
+func (a parkArm) postSweep() bool { return a != armEvent }
+
 // parkResidue drives one standby loop through the park with its last
-// connection, a slowloris one counted Busy, closed on the side of sweep() that
-// postSweep names, and asserts that a loop that has parked holding nothing
-// publishes nothing.
-func parkResidue(t *testing.T, postSweep bool) {
+// connection, counted Busy, closed the way arm names, and asserts that a loop
+// that has parked holding nothing publishes nothing.
+func parkResidue(t *testing.T, arm parkArm) {
+	postSweep := arm.postSweep()
 	// The header deadline is what closes the connection in the post-sweep arm,
 	// and only there: 400 ms, a deadline the test does not outwait. The
 	// pre-sweep arm closes it from the client's side, right after PauseAccept,
@@ -86,8 +136,13 @@ func parkResidue(t *testing.T, postSweep bool) {
 	// let the deadline close it first, which would land on the tick gate,
 	// after sweep(), the path this arm is the control for (celeris#885 item 11).
 	rht := 10 * time.Second
-	if postSweep {
+	if arm == armTickGate {
 		rht = 400 * time.Millisecond
+	}
+	blocker := &parkResidueBlockHandler{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	var handler stream.Handler = parkResidueHandler{}
+	if arm == armDetachQueue {
+		handler = blocker
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -108,7 +163,7 @@ func parkResidue(t *testing.T, postSweep bool) {
 		// no listener, the only kind that parks.
 		DisableDeferAccept: true,
 		OnDisconnect:       func(string) { disc.Add(1) },
-	}, parkResidueHandler{})
+	}, handler)
 	if err != nil {
 		t.Skipf("epoll engine unavailable: %v", err)
 	}
@@ -135,6 +190,9 @@ func parkResidue(t *testing.T, postSweep bool) {
 		if l.timerFD < 0 {
 			t.Fatalf("celeris711 PREMISE: loop %d has no timerfd with ReadHeaderTimeout %v", l.id, rht)
 		}
+		if arm == armDetachQueue {
+			continue // production's own timers: nothing here is disarmed
+		}
 		// Disarm it: the tick gate, after sweep(), becomes the only
 		// checkTimeouts left on this loop.
 		if err := unix.TimerfdSettime(l.timerFD, 0, &unix.ItimerSpec{}, nil); err != nil {
@@ -150,15 +208,43 @@ func parkResidue(t *testing.T, postSweep bool) {
 		return true
 	}
 
+	var closeSeen func() (immediate, deferred int64)
 	m0 := e.Metrics()
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	const partial = "GET /slow HTTP/1.1\r\nHost: x\r\n" // no blank line: mid-headers until the deadline
+	partial := "GET /slow HTTP/1.1\r\nHost: x\r\n" // no blank line: mid-headers until the deadline
+	if arm == armDetachQueue {
+		// A whole request, answered once the handler is released, and the
+		// conn closed after it.
+		partial = "GET /block HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+	}
 	if _, err := c.Write([]byte(partial)); err != nil {
 		t.Fatalf("write: %v", err)
+	}
+	if arm == armDetachQueue {
+		select {
+		case <-blocker.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("celeris711 PREMISE: the handler never started")
+		}
+		// The close, once the handler is released, must be one drainDetachQueue
+		// makes at once (closeWhenFlushed with nothing queued): a response still
+		// queued would defer it to EPOLLOUT, an event, before sweep().
+		var immediate atomic.Int64
+		var deferred atomic.Int64
+		hook := func(cs *connState) {
+			if csWritePending(cs) {
+				deferred.Add(1)
+			} else {
+				immediate.Add(1)
+			}
+		}
+		testHookCloseWhenFlushed.Store(&hook)
+		t.Cleanup(func() { testHookCloseWhenFlushed.Store(nil) }) // runs after the engine is stopped
+		closeSeen = func() (int64, int64) { return immediate.Load(), deferred.Load() }
 	}
 	if !parkWait(2*time.Second, func() bool {
 		m := e.Metrics()
@@ -182,10 +268,13 @@ func parkResidue(t *testing.T, postSweep bool) {
 		t.Fatalf("celeris711 PREMISE: the connection closed (active=%d) before PauseAccept returned, so not "+
 			"on a loop without a listener", n)
 	}
-	if !postSweep {
+	switch arm {
+	case armEvent:
 		// The client leaves, well before its deadline: the loop learns it
 		// from an event, and the event path runs before sweep().
 		_ = c.Close()
+	case armDetachQueue:
+		close(blocker.release)
 	}
 	if !parkWait(rht+6*time.Second, func() bool { return e.Metrics().ActiveConnections == 0 }) {
 		t.Fatalf("celeris711 PREMISE: the connection was never closed (active=%d)", e.Metrics().ActiveConnections)
@@ -198,12 +287,28 @@ func parkResidue(t *testing.T, postSweep bool) {
 	busyParked := e.Metrics().TransplantResidualBusy
 	time.Sleep(200 * time.Millisecond)
 	m := e.Metrics()
-	t.Logf("celeris711 post_sweep=%v busy_parked=%d busy_hold=%d active=%d all_parked=%v closes=%d disconnects=%d adopted=%d",
-		postSweep, busyParked, m.TransplantResidualBusy, m.ActiveConnections, allParked(),
+	if arm == armDetachQueue {
+		// The close went through the detach queue, and the response went out
+		// first: a client that got no 200 saw a conn closed with it still queued.
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 64)
+		n, _ := io.ReadFull(c, buf[:len("HTTP/1.1 200")])
+		if got := string(buf[:n]); got != "HTTP/1.1 200" {
+			t.Errorf("celeris711 PREMISE: the client read %q, want the 200 response the close followed", got)
+		}
+		imm, def := closeSeen()
+		t.Logf("celeris711 detach_queue closeWhenFlushed immediate=%d deferred=%d", imm, def)
+		if imm != 1 || def != 0 {
+			t.Fatalf("celeris711 PREMISE: closeWhenFlushed ran with nothing queued %d times and with a response "+
+				"still queued %d times, want 1 and 0: the close did not land on drainDetachQueue's immediate branch", imm, def)
+		}
+	}
+	t.Logf("celeris711 arm=%v post_sweep=%v busy_parked=%d busy_hold=%d active=%d all_parked=%v closes=%d disconnects=%d adopted=%d",
+		arm, postSweep, busyParked, m.TransplantResidualBusy, m.ActiveConnections, allParked(),
 		m.CloseCount-m0.CloseCount, disc.Load(), tgt.adopted.Load())
-	if m.ActiveConnections != 0 || !allParked() || m.CloseCount-m0.CloseCount != 1 || disc.Load() != 1 {
-		t.Fatalf("celeris711 PREMISE: active=%d all_parked=%v closes=%d disconnects=%d",
-			m.ActiveConnections, allParked(), m.CloseCount-m0.CloseCount, disc.Load())
+	if m.ActiveConnections != 0 || !allParked() || m.CloseCount-m0.CloseCount != 1 || disc.Load() != 1 || tgt.adopted.Load() != 0 {
+		t.Fatalf("celeris711 PREMISE: active=%d all_parked=%v closes=%d disconnects=%d adopted=%d",
+			m.ActiveConnections, allParked(), m.CloseCount-m0.CloseCount, disc.Load(), tgt.adopted.Load())
 	}
 	if busyParked != 0 || m.TransplantResidualBusy != 0 {
 		t.Errorf("celeris711 STALE: TransplantResidualBusy = %d (at the park %d) with 0 connections and every "+
@@ -215,9 +320,16 @@ func parkResidue(t *testing.T, postSweep bool) {
 // TestParkedLoopRetractsResidueOfAPostSweepClose is the defect: the header
 // deadline closes the loop's last connection at the tick gate, after sweep(),
 // in the iteration that parks it.
-func TestParkedLoopRetractsResidueOfAPostSweepClose(t *testing.T) { parkResidue(t, true) }
+func TestParkedLoopRetractsResidueOfAPostSweepClose(t *testing.T) { parkResidue(t, armTickGate) }
 
 // TestParkedLoopRetractsResidueOfAPreSweepClose is its control: the same
 // connection closed on the event path, before sweep(), which retracted before
 // this fix as well.
-func TestParkedLoopRetractsResidueOfAPreSweepClose(t *testing.T) { parkResidue(t, false) }
+func TestParkedLoopRetractsResidueOfAPreSweepClose(t *testing.T) { parkResidue(t, armEvent) }
+
+// TestParkedLoopRetractsResidueOfADetachQueueClose is the defect again, reached
+// without touching a timer: a dispatch goroutine's Connection: close hand-back
+// is closed by drainDetachQueue, after sweep(), in the iteration that parks the
+// loop. It fails with the park's retraction removed and passes on main
+// (celeris#885 item 10).
+func TestParkedLoopRetractsResidueOfADetachQueueClose(t *testing.T) { parkResidue(t, armDetachQueue) }
