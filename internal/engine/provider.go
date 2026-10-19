@@ -8,7 +8,9 @@ import "errors"
 var ErrQueueFull = errors.New("celeris/engine: worker write queue full")
 
 // ErrUnknownFD is returned when a [WorkerLoop] operation references a file
-// descriptor that is not registered on that worker.
+// descriptor that is not registered on that worker. [WorkerLoop.Write] also
+// returns it for a descriptor that is already closing (after
+// [WorkerLoop.UnregisterConn], or after the connection failed).
 var ErrUnknownFD = errors.New("celeris/engine: file descriptor not registered")
 
 // ErrSwitchingNotFrozen is returned by adaptive engines when a driver attempts
@@ -130,8 +132,15 @@ type WorkerLoop interface {
 	// Write enqueues data for transmission on fd. The call does not block on
 	// the kernel send buffer: data is buffered and flushed asynchronously by
 	// the worker. Returns [ErrQueueFull] if the worker's outbound queue is
-	// saturated. The data slice may be retained by the worker until the
-	// write completes; callers must not modify it after calling Write.
+	// saturated, and [ErrUnknownFD] if fd is not registered on this worker or
+	// is already closing: after [WorkerLoop.UnregisterConn], or after the
+	// connection failed, no further bytes are sent, and the engines' workers
+	// report that rather than success (the io_uring worker used to return nil
+	// and drop the data; the standalone driver loop reports ErrLoopClosed
+	// instead once it is closed). A caller racing its own close treats
+	// ErrUnknownFD as a closed connection. The data slice may be retained by
+	// the worker until the write completes; callers must not modify it after
+	// calling Write.
 	Write(fd int, data []byte) error
 	// CPUID returns the CPU this worker is pinned to, or -1 if the worker is
 	// not pinned. Drivers may use this to co-locate allocations (e.g.,
