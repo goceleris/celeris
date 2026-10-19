@@ -8,6 +8,21 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 )
 
+// engineFloorNote is the line that says the io_uring ENGINE is not usable on
+// a kernel the probe still gives an io_uring tier: the engine needs Linux 5.19
+// (the IORING_ASYNC_CANCEL flags of its cancels, celeris#682), while the Base
+// tier starts at 5.10. Empty where the kernel is at the floor, or has no
+// io_uring at all. Wording only: nothing here refuses anything.
+func engineFloorNote(profile engine.CapabilityProfile) string {
+	if !profile.IOUringTier.Available() {
+		return ""
+	}
+	if profile.KernelMajor > 5 || (profile.KernelMajor == 5 && profile.KernelMinor >= 19) {
+		return ""
+	}
+	return "the io_uring engine needs Linux 5.19 or later and is not used on this kernel; the epoll engine serves instead"
+}
+
 // DiagnosticReport logs the capability profile as structured key-value pairs.
 func DiagnosticReport(profile engine.CapabilityProfile, logger *slog.Logger) {
 	logger.Info("capability probe complete",
@@ -18,6 +33,10 @@ func DiagnosticReport(profile engine.CapabilityProfile, logger *slog.Logger) {
 		"cpus", profile.NumCPU,
 		"numa_nodes", profile.NUMANodes,
 	)
+
+	if note := engineFloorNote(profile); note != "" {
+		logger.Info("io_uring engine unavailable", "reason", note)
+	}
 
 	if profile.IOUringTier.Available() {
 		logger.Info("io_uring features",
@@ -44,6 +63,10 @@ func FormatDiagnostic(profile engine.CapabilityProfile) string {
 	fmt.Fprintf(&b, "epoll Available: %t\n", profile.EpollAvailable)
 	fmt.Fprintf(&b, "CPUs: %d\n", profile.NumCPU)
 	fmt.Fprintf(&b, "NUMA Nodes: %d\n", profile.NUMANodes)
+
+	if note := engineFloorNote(profile); note != "" {
+		fmt.Fprintf(&b, "io_uring engine: %s\n", note)
+	}
 
 	if profile.IOUringTier.Available() {
 		fmt.Fprintf(&b, "MultishotAccept: %t\n", profile.MultishotAccept)

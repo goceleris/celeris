@@ -118,6 +118,9 @@ func TestAsyncHandlersH2NoticeIsGatedOnH2BeingReachable(t *testing.T) {
 			if len(msgs) > 1 {
 				t.Fatalf("the notice was logged %d times: %q", len(msgs), msgs)
 			}
+			if len(msgs) == 1 && msgs[0] != resource.AsyncH2Notice {
+				t.Fatalf("the notice reads %q, want %q", msgs[0], resource.AsyncH2Notice)
+			}
 		})
 	}
 }

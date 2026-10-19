@@ -113,6 +113,22 @@ func fixedFilesEnabled(tierSupports bool) bool {
 	return tierSupports && os.Getenv(envFixedFiles) == "1"
 }
 
+// envMultishotRecv opts into multishot recv with a ring-mapped provided-buffer
+// ring (off by default: see the comment at its use in Worker.run).
+const envMultishotRecv = "CELERIS_IOURING_MULTISHOT_RECV"
+
+// multishotRecvEnabled reports whether the workers use multishot recv and so
+// map a provided-buffer ring: the tier must support it AND it must be
+// explicitly opted into (envMultishotRecv=1).
+//
+// Kept as one function, like fixedFilesEnabled, so the worker's gate and the
+// engine's start-up line cannot disagree: the line printed the tier's
+// capabilities, multishot_recv=true and provided_buffers=true on every high-tier
+// kernel, on runs that never mapped a ring (checklist #884 item 48).
+func multishotRecvEnabled(tierSupports bool) bool {
+	return tierSupports && os.Getenv(envMultishotRecv) == "1"
+}
+
 // defaultConnsPerWorker is the per-worker connection target used to size
 // the provided-buffer ring. The ring is sized at 2 buffers per conn at
 // this target, giving comfortable headroom so the kernel rarely stalls
@@ -1449,7 +1465,7 @@ func (w *Worker) run(ctx context.Context) {
 	// returns. The formula gives 2 buffers per conn at the per-worker conn
 	// target — comfortable headroom without runaway RSS.
 	// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled value.
-	if w.tier.SupportsMultishotRecv() && os.Getenv("CELERIS_IOURING_MULTISHOT_RECV") == "1" {
+	if multishotRecvEnabled(w.tier.SupportsMultishotRecv()) {
 		bufRingCount := resolveBufRingCount(w.resolved, defaultConnsPerWorker)
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {
@@ -8136,59 +8152,27 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 		}
 	}
 
-	if host == "" || host == "0.0.0.0" {
+	if host == "" {
 		return &unix.SockaddrInet4{Port: port}, nil
 	}
 
-	// IPv6 addresses
-	if host == "::" {
-		return &unix.SockaddrInet6{Port: port}, nil
-	}
+	// The host is what net.ParseIP says it is, as in std: an IPv4 address (an
+	// IPv4-mapped IPv6 one, "::ffff:1.2.3.4", included) binds as IPv4, any
+	// other IPv6 address as IPv6, and what does not parse is an error. That
+	// refuses what the octet loop this replaced refused by hand, with std's
+	// own rules: a byte over 255 ("300.1.1.1" bound 44.1.1.1), a leading zero
+	// ("0127.0.0.1": octal in some parsers), a fifth byte, and the shorthands
+	// inet_aton reads ("10", "127.1": "1.2.3" bound 1.2.3.0).
 	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip6 := ip.To16(); ip6 != nil && ip.To4() == nil {
-			sa := &unix.SockaddrInet6{Port: port}
-			copy(sa.Addr[:], ip6)
-			return sa, nil
-		}
-	}
-
-	sa := &unix.SockaddrInet4{Port: port}
-	parts := [4]byte{}
-	partIdx := 0
-	val := 0
-	digits := 0 // digits in the byte being read
-	for _, c := range host {
-		if c == '.' {
-			if partIdx >= 3 || digits == 0 {
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-			parts[partIdx] = byte(val)
-			partIdx++
-			val = 0
-			digits = 0
-		} else if c >= '0' && c <= '9' {
-			if digits > 0 && val == 0 {
-				// "0127.0.0.1" and "010.0.0.1": a leading zero is ambiguous
-				// (octal in some parsers); net.ParseIP and std refuse it.
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-			val = val*10 + int(c-'0')
-			digits++
-			if val > 255 {
-				// "300.1.1.1" used to wrap to 44.1.1.1 and bind that.
-				return nil, fmt.Errorf("invalid addr: %s", addr)
-			}
-		} else {
-			return nil, fmt.Errorf("invalid addr: %s", addr)
-		}
-	}
-	// "1.2.3" bound 1.2.3.0, "10" bound 10.0.0.0 and "1..2.3" bound
-	// 1.0.2.3: an address of four bytes, each written, or an error.
-	if partIdx != 3 || digits == 0 {
+	if ip == nil {
 		return nil, fmt.Errorf("invalid addr: %s", addr)
 	}
-	parts[partIdx] = byte(val)
-	sa.Addr = parts
+	if ip4 := ip.To4(); ip4 != nil {
+		sa := &unix.SockaddrInet4{Port: port}
+		copy(sa.Addr[:], ip4)
+		return sa, nil
+	}
+	sa := &unix.SockaddrInet6{Port: port}
+	copy(sa.Addr[:], ip.To16())
 	return sa, nil
 }

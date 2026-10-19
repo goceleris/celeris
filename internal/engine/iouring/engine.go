@@ -224,8 +224,14 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	cfg.Logger.Info("io_uring engine selected",
 		"tier", tier.Tier().String(),
 		"multishot_accept", tier.SupportsMultishotAccept(),
-		"multishot_recv", tier.SupportsMultishotRecv(),
-		"provided_buffers", tier.SupportsProvidedBuffers(),
+		// The EFFECTIVE values, as fixed_files below: the ring of provided
+		// buffers is mapped only where multishot recv is opted into
+		// (multishotRecvEnabled), so a default run says false, not the tier's
+		// capability. A worker whose NewBufferRing then fails falls back to
+		// per-connection buffers and logs its own Warn: the line is decided
+		// before any worker exists, so it stays optimistic about that one.
+		"multishot_recv", multishotRecvEnabled(tier.SupportsMultishotRecv()),
+		"provided_buffers", tier.SupportsProvidedBuffers() && multishotRecvEnabled(tier.SupportsMultishotRecv()),
 		// The EFFECTIVE value, not the tier capability: this used to print
 		// the capability and so reported fixed_files=true while the feature
 		// was gated off (celeris#541).
@@ -474,10 +480,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 		"numa_nodes", e.profile.NUMANodes,
 		"kernel", e.profile.KernelVersion,
 	)
-	if e.cfg.AsyncHandlers && e.cfg.EnableH2Upgrade {
-		e.cfg.Logger.Info(
-			"AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker",
-		)
+	if e.cfg.AsyncH2Reachable() {
+		e.cfg.Logger.Info(resource.AsyncH2Notice)
 	}
 
 	<-ctx.Done()

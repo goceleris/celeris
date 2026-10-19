@@ -4,6 +4,7 @@ package epoll
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -93,4 +94,17 @@ func sockaddrEqual(a, b unix.Sockaddr) bool {
 		return ok && *x == *y
 	}
 	return false
+}
+
+// TestListenOnAnIPv4MappedHostServes: Listen (and the port 0 resolution before
+// it, bindiag.ResolvePort0 over parseAddr) takes the mapped host through to a
+// bound IPv4 socket that serves a request; the address it publishes is the
+// IPv4 one, as net.Listen("tcp", "[::ffff:127.0.0.1]:0") gives.
+func TestListenOnAnIPv4MappedHostServes(t *testing.T) {
+	r := start895(t, "[::ffff:127.0.0.1]:0", 2, false)
+	addr := r.e.Addr().String()
+	if !strings.HasPrefix(addr, "127.0.0.1:") {
+		t.Errorf("Addr() = %q, want the IPv4 address 127.0.0.1:port", addr)
+	}
+	get895(t, addr)
 }
