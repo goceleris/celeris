@@ -315,6 +315,16 @@ func TestWithNICIRQsLittleCPUOrNoLoopBeside(t *testing.T) {
 	}
 }
 
+// A little CPU that runs a loop (a stub plan; the planner never makes one) is
+// not uncovered: the Warn is about CPUs without a loop.
+func TestWithNICIRQsLittleCPUWithALoopIsCovered(t *testing.T) {
+	plan := CPUPlan{CPUs: []int{0, 4}, Requested: 2, Allowed: rng(0, 11), Little: []int{2, 3, 4, 5}, Heterogeneous: true, Note: "stub"}
+	got := plan.WithNICIRQs(NICIRQs{Vectors: []NICVector{
+		{IRQ: 167, CPU: 4, Name: "enp1s0-8", Dev: "enp1s0", Count: 1_000_000},
+		{IRQ: 168, CPU: 3, Name: "enp1s0-9", Dev: "enp1s0", Count: 1_000_000}}})
+	eq(t, "uncovered", got.IRQUncovered, []int{3})
+}
+
 // MAJOR 1 of the review: the rx-port rule steps aside over a vector on a CPU
 // with no loop whatever its share, and the report's share test used to drop
 // the same vector when its counter had wrapped. RxFree.NoLoop carries the
