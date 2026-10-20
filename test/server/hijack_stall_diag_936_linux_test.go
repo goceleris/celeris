@@ -257,7 +257,7 @@ func c936EngineGoroutines() string {
 	var b strings.Builder
 	n := 0
 	for _, g := range bytes.Split(buf, []byte("\n\n")) {
-		if !bytes.Contains(g, []byte("goceleris/celeris/engine")) && !bytes.Contains(g, []byte("goceleris/celeris.(")) {
+		if !bytes.Contains(g, []byte("goceleris/celeris/internal/engine")) && !bytes.Contains(g, []byte("goceleris/celeris.(")) && !bytes.Contains(g, []byte("goceleris/celeris/internal/conn")) {
 			continue
 		}
 		n++
