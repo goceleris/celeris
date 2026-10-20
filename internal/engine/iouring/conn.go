@@ -103,7 +103,7 @@ func (cs *connState) StreamWriteErr(n int) error {
 	if cs.closing || cs.detachClosed || cs.asyncClosed.Load() {
 		return conn.ErrConnClosed
 	}
-	if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf)+n > maxSendQueueBytesDetached {
+	if len(cs.writeBuf)+len(cs.sendBuf)+n > maxSendQueueBytesDetached {
 		cs.writeRefused = true
 		return conn.ErrWriteRefused
 	}
@@ -142,14 +142,6 @@ func (d *detachedStreamErr) StreamWriteErr(int) error {
 		return conn.ErrWriteRefused
 	}
 	return conn.ErrConnClosed
-}
-
-// iovec mirrors Linux struct iovec (16 bytes on 64-bit platforms).
-// Used for IORING_OP_WRITEV scatter-gather sends. Celeris only builds
-// on amd64 and arm64 (both 64-bit), so size is stable at 16.
-type iovec struct {
-	Base uintptr
-	Len  uint64
 }
 
 type connState struct {
@@ -198,7 +190,7 @@ type connState struct {
 	remainderOut   bool         // 1: the SEND in flight may wait on its peer for long (celeris#884 items 62, 64): the re-send of a partial send's remainder, or a SEND of longSendBytes or more; the worker may not wait for its completion with no timeout (mode 3a); set by flushSend/flushSendLink, cleared by completeSend
 	// sendIsZC records how the send SQE currently in flight for this
 	// connection was ARMED: true for IORING_OP_SEND_ZC, false for a plain
-	// SEND / WRITEV / linked SEND. It is the provenance flag the error
+	// SEND / linked SEND. It is the provenance flag the error
 	// classification in handleSend and completeSend keys on (celeris#609).
 	//
 	// w.sendZC cannot serve that purpose: it is the worker's forward-looking
@@ -206,8 +198,8 @@ type connState struct {
 	// connections' ZC sends are still in flight. Classifying on it meant the
 	// FIRST failing ZC completion per worker was absorbed and every sibling
 	// behind it was read as a broken connection and closed. Written only
-	// where a send SQE is armed (prepSendSQE and the two non-ZC arming sites
-	// in flushSend / flushSendLink); at most one send SQE is in flight per
+	// where a send SQE is armed (prepSendSQE, and the one non-ZC arming site,
+	// the linked send of flushSendLink); at most one send SQE is in flight per
 	// connection — flushSend/flushSendLink both bail on cs.sending ||
 	// cs.zcNotifPending — so one flag is exact. Worker-thread-only.
 	sendIsZC bool // 1: the in-flight send SQE was armed as SEND_ZC
@@ -229,8 +221,6 @@ type connState struct {
 	sendBuf     []byte // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf []byte // 24: append buffer for handler writes
-	bodyBuf  []byte // 24: zero-copy body slice; sent as iovec[1] alongside sendBuf
-	sendBody []byte // 24: in-flight body slice during WRITEV (cleared by completeSend)
 	buf      []byte // 24: per-connection recv buffer
 	// detectAccum accumulates the first bytes of a connection across
 	// multiple recvs while protocol detection is still inconclusive
@@ -262,7 +252,6 @@ type connState struct {
 	// variant. Holding the slice here keeps the array alive until the
 	// connState drains from pendingRelease (mirrors how cs.buf is held).
 	bodyRecvPin []byte     // 24
-	iov         [2]iovec   // 32: iovec storage for WRITEV SQEs (sendBuf + sendBody)
 	dirtyNext   *connState // 8
 	dirtyPrev   *connState // 8
 
@@ -562,8 +551,8 @@ type connState struct {
 	forceRSTClose bool
 
 	// kernelInflight counts conn-buffer-referencing kernel ops — RECVs
-	// targeting cs.buf / h1State.bodyBuf and SEND/WRITEV/SEND_ZC reading
-	// cs.sendBuf / cs.sendBody / cs.iov — that have been submitted but
+	// targeting cs.buf / h1State.bodyBuf and SEND/SEND_ZC reading
+	// cs.sendBuf — that have been submitted but
 	// have not yet delivered their TERMINAL CQE (success, -ECANCELED,
 	// -ECONNRESET, ...; for multishot recv and SEND_ZC the terminal CQE
 	// is the one WITHOUT CQE_F_MORE). Incremented at SQE submission
@@ -753,8 +742,6 @@ func releaseConnState(cs *connState) {
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
 	cs.detachCounted = false
-	cs.bodyBuf = nil
-	cs.sendBody = nil
 	// bodyRecvPin is cleared here, after every kernel-held op delivered its
 	// terminal CQE (releaseConnState is only called from drainPendingRelease
 	// once cs.kernelInflight drained — or its backstop fired — and from the
@@ -787,6 +774,22 @@ func releaseConnState(cs *connState) {
 // debts (the asyncClosed branch runs the close; any other entry puts the conn
 // back on the dirty list). The paths that exit WITHOUT enqueuing must enqueue
 // when it reports true, or the close or the recv arm it stands for is lost.
+//
+// The exit contract (celeris#780), which rerunHandOff and tryTransplant rely
+// on and nothing here enforces: every exit of the goroutine other than the two
+// below must have published, before this clears asyncRun, that the conn is not
+// the worker's to hand off: asyncClosed (the handler-error, write-error, panic
+// and closed-while-parked exits), or a non-HTTP/1 protocol (the h2c-upgrade
+// exit). Both are stored before asyncRun is cleared, and read under asyncInMu
+// by a worker that sees asyncRun clear: such a conn belongs to its queued
+// entry, which closes it or finishes the upgrade, and a hand-off made first
+// would leave that entry acting on a descriptor number the hand-off gave up.
+// The exceptions: a claim (transplantPending, set by the exit that hands the
+// conn to epoll; the worker defers to the claim's drain and counts it), and the
+// revert to inline (asyncPromoted cleared under asyncInMu, so the conn is the
+// worker's and tryTransplant takes it as any inline conn). A new exit that is
+// neither must publish one of them first. No test drives every exit and
+// checks the two callers refuse the conn (celeris#884 item 29).
 func (cs *connState) endDispatch() (owed bool) {
 	cs.asyncRun = false
 	cs.asyncParked = false
