@@ -180,15 +180,24 @@ func TestRxFreeExplicitWorkersAreUntouched(t *testing.T) {
 		[]int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1, 6, 7})
 }
 
-// The default count below the big CPUs (GOMAXPROCS 4) and the default count
-// above them: the rule never raises the count, and never takes it below the
-// floor of #1049's plan.
+// The default count below the big CPUs (GOMAXPROCS 4, the default under a
+// Kubernetes CPU limit) is planned as #1049 plans it and reads no NIC file: the
+// rule is measured with one loop on each of the 8 big CPUs, and with fewer loops
+// a CPU it meant to keep may run none (celeris#1036 item 1). From 8 loops up
+// the default count never exceeds #1049's and never falls under the floor.
 func TestRxFreeNeverRaisesTheCount(t *testing.T) {
 	cpu := msr1(t, rng(0, 11))
 	for n := 1; n <= 16; n++ {
 		h := msr1RxReal(t, "msr1_rxfree_vector_on_cpu1.txt")
 		base := planWorkerCPUs(n, false, cpu.src())
 		got := planWorkerCPUs(n, false, h.planSrc(cpu, clusterAddr))
+		if n < 8 {
+			same1049(t, fmt.Sprintf("n=%d", n), got, base)
+			if h.reads() != 0 {
+				t.Errorf("n=%d: %d NIC reads, want none", n, h.reads())
+			}
+			continue
+		}
 		if len(got.CPUs) > len(base.CPUs) {
 			t.Errorf("n=%d: %d loops, #1049 plans %d", n, len(got.CPUs), len(base.CPUs))
 		}
@@ -202,9 +211,10 @@ func TestRxFreeNeverRaisesTheCount(t *testing.T) {
 		}
 	}
 	h := msr1RxReal(t, "msr1_rxfree_vector_on_cpu1.txt")
-	eq(t, "4 workers", planWorkerCPUs(4, false, h.planSrc(cpu, clusterAddr)).CPUs, []int{0, 1, 7, 9})
-	eq(t, "6 workers", planWorkerCPUs(6, false, h.planSrc(cpu, clusterAddr)).CPUs, msr1LoopsVNV)
-	eq(t, "7 workers", planWorkerCPUs(7, false, h.planSrc(cpu, clusterAddr)).CPUs, msr1LoopsVNV)
+	eq(t, "4 workers", planWorkerCPUs(4, false, h.planSrc(cpu, clusterAddr)).CPUs, []int{0, 1, 6, 7})
+	eq(t, "6 workers", planWorkerCPUs(6, false, h.planSrc(cpu, clusterAddr)).CPUs, []int{0, 1, 6, 7, 8, 9})
+	eq(t, "7 workers", planWorkerCPUs(7, false, h.planSrc(cpu, clusterAddr)).CPUs, []int{0, 1, 6, 7, 8, 9, 10})
+	eq(t, "8 workers", planWorkerCPUs(8, false, h.planSrc(cpu, clusterAddr)).CPUs, msr1LoopsVNV)
 	eq(t, "0 workers", planWorkerCPUs(0, false, h.planSrc(cpu, clusterAddr)).CPUs, []int{})
 }
 
@@ -591,7 +601,9 @@ func TestRxFreeSpreadQueuesFreeNothing(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := msr1Shape()
-			s.vecs = vecs
+			// The other port's busy vector on CPU 11 (the receiving port's
+			// own may sit there too): the floor is the reason to step aside.
+			s.vecs = append(slices.Clone(vecs), vec{"tx0", 90, 11, 2_000_000_000})
 			got, base := s.plan(t, 12)
 			same1049(t, name, got, base)
 			if !strings.Contains(whyText(got), "floor") {
@@ -601,7 +613,7 @@ func TestRxFreeSpreadQueuesFreeNothing(t *testing.T) {
 	}
 	// Two of eight: allowed, and the busiest are the ones named first.
 	s := msr1Shape()
-	s.vecs = all[:2]
+	s.vecs = append(slices.Clone(all[:2]), vec{"tx0", 90, 11, 2_000_000_000})
 	got, _ := s.plan(t, 12)
 	eq(t, "two of eight", got.RxFree.Freed, []int{0, 1})
 	eq(t, "loops", got.CPUs, []int{6, 7, 8, 9, 10, 11})
@@ -656,16 +668,20 @@ func TestRxFreeFloor(t *testing.T) {
 	}
 }
 
-// A 4-big + 4-little board with one NIC (RK3588-like): the NIC's vector on a
-// big CPU frees that CPU (3 loops); on a little CPU nothing is freed.
+// A 4-big + 4-little board with one NIC (RK3588-like): the rule's premise is a
+// loop kept beside a TX-completion vector of ANOTHER port, and with one port
+// there is none, so the plan is #1049's whatever the NIC's vector does
+// (celeris#1036 item 1, review finding 1). The rule used to free the vector's
+// CPU here.
 func TestRxFreeSingleNICBoard(t *testing.T) {
 	s := synth{nCPU: 8, big: []int{4, 5, 6, 7}, idle: true, rx: map[string]uint64{"eth0": 50_000_000},
 		vecs: []vec{{"eth0", 10, 4, 5_000_000}}}
 	got, base := s.plan(t, 8)
 	eq(t, "base", base.CPUs, []int{4, 5, 6, 7})
-	eq(t, "loops", got.CPUs, []int{5, 6, 7})
-	eq(t, "freed", got.RxFree.Freed, []int{4})
-	eq(t, "share", got.RxFree.SharePercent, 100)
+	same1049(t, "vector on big CPU 4", got, base)
+	if !strings.Contains(whyText(got), "stay beside") {
+		t.Errorf("Why does not say that no vector stays beside a loop: %s", whyText(got))
+	}
 	s.vecs = []vec{{"eth0", 10, 0, 5_000_000}}
 	got, base = s.plan(t, 8)
 	same1049(t, "vector on little CPU 0", got, base)
@@ -681,15 +697,18 @@ func TestRxFreeSingleNICBoard(t *testing.T) {
 }
 
 // The listener bound to one slave of the bond sees only that port: its share is
-// 100% and its vectors are the ones freed, whatever the other port received.
+// 100%, but there is no other port whose TX completion a loop could stay beside,
+// so the plan is #1049's (review finding 1).
 func TestRxFreeListenerOnOnePort(t *testing.T) {
 	s := msr1Shape()
 	s.bonded = false
 	cpu, h, _ := s.build(t)
 	// "rx0" is the first port by name and owns 10.0.0.5 in the unbonded form.
 	got := planWorkerCPUs(12, false, h.planSrc(cpu, "10.0.0.5:8080"))
-	eq(t, "freed", got.RxFree.Freed, []int{6, 8})
-	eq(t, "share", got.RxFree.SharePercent, 100)
+	same1049(t, "one port", got, planWorkerCPUs(12, false, cpu.src()))
+	if !strings.Contains(whyText(got), "stay beside") {
+		t.Errorf("Why: %s", whyText(got))
+	}
 }
 
 // A host with one CPU-less detail: the nic source is nil. The planner runs as #1049.

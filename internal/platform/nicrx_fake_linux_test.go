@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -39,6 +40,10 @@ type rxCountFS struct {
 	calls int
 	deny  func(name string) bool
 	boom  func(name string) bool
+	// reverse returns directory entries in descending name order: the order
+	// of a real readdir is whatever the file system likes (hash order on
+	// ext4, creation order on tmpfs), and the code must not depend on it.
+	reverse bool
 }
 
 func (c *rxCountFS) check(name string) error {
@@ -63,7 +68,11 @@ func (c *rxCountFS) readDir(name string, limit int) ([]string, error) {
 	if err := c.check(name); err != nil {
 		return nil, err
 	}
-	return c.inner.readDir(name, limit)
+	names, err := c.inner.readDir(name, limit)
+	if c.reverse {
+		slices.SortFunc(names, func(a, b string) int { return strings.Compare(b, a) })
+	}
+	return names, err
 }
 
 func (c *rxCountFS) exists(name string) bool {
