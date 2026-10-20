@@ -1001,11 +1001,19 @@ func (cl *wsoCli) giveUp(t *testing.T, c net.Conn, kind, what string) {
 // the rig should judge). No-op when the wait's longest silence was not over
 // wsoCloseSlow.
 func (cl *wsoCli) closeSlow(t *testing.T, c net.Conn, kind string, r wsoClose) {
-	if r.maxGap <= wsoCloseSlow {
-		return
+	if rec, ok := cl.closeSlowRecord(c, kind, r); ok {
+		t.Log(rec)
 	}
-	t.Log(cl.record(c, "WSO-CLOSESLOW", kind, fmt.Sprintf("the server closed after a silent stretch of %s, longer than %v: %s",
-		r.maxGap.Round(time.Millisecond), wsoCloseSlow, r)))
+}
+
+// closeSlowRecord is closeSlow's record, and whether the wait was slow enough
+// to have one.
+func (cl *wsoCli) closeSlowRecord(c net.Conn, kind string, r wsoClose) (string, bool) {
+	if r.maxGap <= wsoCloseSlow {
+		return "", false
+	}
+	return cl.record(c, "WSO-CLOSESLOW", kind, fmt.Sprintf("the server closed after a silent stretch of %s, longer than %v: %s",
+		r.maxGap.Round(time.Millisecond), wsoCloseSlow, r)), true
 }
 
 // record renders the connection's state from both ends under a header line:
