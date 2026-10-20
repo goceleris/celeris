@@ -501,8 +501,12 @@ func TestRxFreeShareThreshold(t *testing.T) {
 				eq(t, "loops", got.CPUs, msr1LoopsVNV)
 			} else {
 				same1049(t, tc.name, got, base)
-				if !strings.Contains(whyText(got), "60%") {
-					t.Errorf("Why does not name the threshold: %s", whyText(got))
+				want := "60%"
+				if tc.rx0 == total {
+					want = "10%" // the other port carries nothing to stay beside
+				}
+				if !strings.Contains(whyText(got), want) {
+					t.Errorf("Why does not name the threshold %s: %s", want, whyText(got))
 				}
 			}
 		})
