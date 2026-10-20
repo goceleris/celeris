@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -46,6 +47,28 @@ func startAsyncH2CEngine722(t *testing.T) (*Engine, string) {
 		c.AsyncHandlers = true
 		c.EnableH2Upgrade = true
 	})
+}
+
+// asyncDispatchParked722 counts the goroutines parked in a dispatch goroutine's
+// wait for its next request (serveAsync, in sync.Cond.Wait). The test engine
+// serves one connection, so one is the connection's.
+func asyncDispatchParked722() int {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	n := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "[sync.Cond.Wait") && strings.Contains(g, ".serveAsync(") {
+			n++
+		}
+	}
+	return n
 }
 
 // h2cUpgradeHead722 is an h2c upgrade request head. body is the Content-Length
@@ -149,19 +172,22 @@ func TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine(t *testing.T) {
 	if _, err := c.Write([]byte(first)); err != nil {
 		t.Fatalf("write upgrade head: %v", err)
 	}
-	// The second write goes out only once the engine has read the first and
-	// promoted the connection (its dispatch goroutine, running the upgrade
-	// head with the body half read, parks): the second write is then a recv of
-	// its own, and it reaches the goroutine through handleRecv's async feed.
-	// A sleep in place of this could let both writes coalesce into the one
-	// recv that promotes, and the feed (the site under test) would not run.
+	// The second write goes out only once the engine has read the first,
+	// promoted the connection, and the dispatch goroutine, running the upgrade
+	// head with the body half read, has parked: the second write is then a recv
+	// of its own on a promoted connection, and it reaches the goroutine through
+	// handleRecv's async feed. A sleep in place of this could let both writes
+	// coalesce into the one recv that promotes (a slow accept, a loaded CI
+	// host), and the feed, the site under test, would not run at all.
 	if !parkWait712(5*time.Second, func() bool {
 		m := e.Metrics()
-		return m.AsyncPromotedConns >= m0.AsyncPromotedConns+1 && m.BytesRead >= m0.BytesRead+uint64(len(first))
+		return m.AsyncPromotedConns >= m0.AsyncPromotedConns+1 && m.BytesRead >= m0.BytesRead+uint64(len(first)) &&
+			asyncDispatchParked722() >= 1
 	}) {
 		m := e.Metrics()
-		t.Fatalf("the first write was not promoted: AsyncPromotedConns %d -> %d, BytesRead %d -> %d (want +1 and +%d)",
-			m0.AsyncPromotedConns, m.AsyncPromotedConns, m0.BytesRead, m.BytesRead, len(first))
+		t.Fatalf("the first write was not promoted and parked: AsyncPromotedConns %d -> %d, BytesRead %d -> %d (want +1 and +%d), "+
+			"parked dispatch goroutines %d (want 1)", m0.AsyncPromotedConns, m.AsyncPromotedConns, m0.BytesRead, m.BytesRead,
+			len(first), asyncDispatchParked722())
 	}
 	if _, err := c.Write([]byte("body")); err != nil {
 		t.Fatalf("write rest of body: %v", err)
