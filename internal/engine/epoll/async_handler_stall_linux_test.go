@@ -309,9 +309,18 @@ func TestAConnGivenUpMidHandlerIsHandedBack(t *testing.T) {
 }
 
 // TestATransplantWaitsForARelink: between the pass giving a conn up and the
-// loop draining the goroutine's hand-back, a queue entry names cs, and a
-// transplant would return cs to the pool under it. The conn must not move
-// until the hand-back is drained, and then it may.
+// loop draining the goroutine's hand-back, a queue entry names cs. The
+// goroutine has exited here (asyncRun is false), so tryTransplant takes the
+// synchronous path, which still returns cs to the pool (detachForTransplant,
+// releaseConnState): the entry would then name a pooled connState, one the
+// next accept can reissue to another conn. On that path relinkPending, which
+// flushedAtBoundary reads, is the ONLY guard, not defence in depth: remove it
+// and the conn moves, and this test fails with a transplant of a conn with a
+// hand-back still queued. The conn must not move until the hand-back is
+// drained, and then it may. (A transplant deferred behind a goroutine that is
+// still running is the other path: finishTransplantHandoff never pools cs and
+// does not rely on relinkPending, see
+// TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits.)
 func TestATransplantWaitsForARelink(t *testing.T) {
 	rig := hijackRaceConn(t)
 	l, cs, local := rig.l, rig.cs, rig.local
