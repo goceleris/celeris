@@ -263,7 +263,7 @@ func TestDriverTakesNumberFreedByCloseConn775RetriesACollision(t *testing.T) {
 	// At least 2: a natural collision on the second attempt too is retried as
 	// well, so "exactly 2" would bring back the flake this test is the control of.
 	if used := runFreedNumber775(t, 0); used < 2 {
-		t.Errorf("the check passed after %d attempt(s), want at least 2: the first, with the decoy on the freed number, must be the one that was retried", used)
+		t.Errorf("the check passed after %d attempt(s), want at least 2: the attempt with the decoy on the freed number must have been retried", used)
 	}
 }
 
@@ -281,14 +281,22 @@ type freedNumber775 struct {
 }
 
 // runFreedNumber775 makes the attempts, with a decoy on the freed number of
-// attempt collideAt (-1: none), until one reuses the number, checks its result
-// and returns the number of attempts it took. If none does, it fails.
+// attempt collideAt (-1: none; if another descriptor takes the number before
+// the decoy does, that is one more retried collision and the decoy moves to the
+// next attempt), until one reuses the number, checks its result and returns the
+// number of attempts it took. If none does, it fails.
 func runFreedNumber775(t *testing.T, collideAt int) int {
 	t.Helper()
+	decoyAt := collideAt
 	for attempt := range freedNumberAttempts775 {
-		r := freedNumberAttempt775(t, attempt == collideAt)
-		if attempt == collideAt && !r.decoyHeld {
-			t.Fatalf("PREMISE: the decoy did not take the number %d that closeConn freed, so attempt %d is not the collision the control injects", r.fd, attempt)
+		r := freedNumberAttempt775(t, attempt == decoyAt)
+		if attempt == decoyAt && !r.decoyHeld {
+			// Another descriptor of the process took the number before the decoy
+			// did: a natural collision, retried like any other, and the decoy
+			// moves to the next attempt so the control still injects its own.
+			t.Logf("attempt %d of %d: the decoy did not get the number %d that closeConn freed (another descriptor took it first); the decoy moves to the next attempt", attempt+1, freedNumberAttempts775, r.fd)
+			decoyAt++
+			continue
 		}
 		if !r.reused {
 			t.Logf("attempt %d of %d: another descriptor of the process took the number %d that closeConn freed, before the check; starting over", attempt+1, freedNumberAttempts775, r.fd)
