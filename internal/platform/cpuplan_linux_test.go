@@ -96,22 +96,30 @@ func eq(t *testing.T, what string, got, want any) {
 
 func TestPlanMSR1LikeAvoidsLittleCPUs(t *testing.T) {
 	h := msr1(t, rng(0, 11))
-	// 12 loops: the 8 big CPUs are pinned in order, the other 4 loops run unpinned.
-	p := planWorkerCPUs(12, h.src())
-	eq(t, "cpus(12)", p.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1})
+	// 12 requested (the default, GOMAXPROCS): one loop per big CPU, 8 of them,
+	// every one pinned, none on a little CPU and none unpinned (celeris#1036).
+	p := planWorkerCPUs(12, false, h.src())
+	eq(t, "cpus(12)", p.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
 	eq(t, "little", p.Little, []int{2, 3, 4, 5})
 	if !p.Heterogeneous || p.Note == "" {
 		t.Errorf("heterogeneous=%v note=%q, want true and a reason", p.Heterogeneous, p.Note)
 	}
-	if p.Pinned() != 8 {
-		t.Errorf("Pinned() = %d, want 8", p.Pinned())
+	if p.Pinned() != 8 || p.Requested != 12 {
+		t.Errorf("Pinned() = %d, Requested = %d, want 8 and 12", p.Pinned(), p.Requested)
 	}
 	// Fewer loops than big CPUs: all pinned, none on an A520.
-	eq(t, "cpus(4)", planWorkerCPUs(4, h.src()).CPUs, []int{0, 1, 6, 7})
-	eq(t, "cpus(8)", planWorkerCPUs(8, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
-	// One more loop than big CPUs does not wrap onto them.
-	eq(t, "cpus(9)", planWorkerCPUs(9, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, -1})
-	eq(t, "cpus(0)", planWorkerCPUs(0, h.src()).CPUs, []int{})
+	eq(t, "cpus(4)", planWorkerCPUs(4, false, h.src()).CPUs, []int{0, 1, 6, 7})
+	eq(t, "cpus(8)", planWorkerCPUs(8, false, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
+	// One more worker than big CPUs is not a loop: there is no ninth CPU to pin it to.
+	eq(t, "cpus(9)", planWorkerCPUs(9, false, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
+	eq(t, "cpus(0)", planWorkerCPUs(0, false, h.src()).CPUs, []int{})
+	// A user-set count above the big CPUs is honoured and wraps over them, each
+	// loop pinned (the extras are never left to float onto the little CPUs).
+	eq(t, "explicit cpus(9)", planWorkerCPUs(9, true, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0})
+	eq(t, "explicit cpus(12)", planWorkerCPUs(12, true, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1, 6, 7})
+	// ... and below or at it, the user-set count is what a default one is.
+	eq(t, "explicit cpus(5)", planWorkerCPUs(5, true, h.src()).CPUs, []int{0, 1, 6, 7, 8})
+	eq(t, "explicit cpus(8)", planWorkerCPUs(8, true, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
 }
 
 // The A720s of msr1 read 866 to 1024. A planner that took "little" to mean
@@ -121,7 +129,7 @@ func TestPlanCapacityVariationAmongBigCPUsIsNotLittle(t *testing.T) {
 	for c, v := range []string{"1024", "866", "909", "960", "1024", "866", "880", "1000"} {
 		h.capacity(c, v)
 	}
-	p := planWorkerCPUs(8, h.src())
+	p := planWorkerCPUs(8, false, h.src())
 	if p.Heterogeneous {
 		t.Fatalf("capacities 866..1024 planned as heterogeneous: little %v", p.Little)
 	}
@@ -142,7 +150,7 @@ func TestPlanLittleThresholdIsBelowHalf(t *testing.T) {
 		h.capacity(1, "1024")
 		h.capacity(2, tc.small)
 		h.capacity(3, tc.small)
-		p := planWorkerCPUs(4, h.src())
+		p := planWorkerCPUs(4, false, h.src())
 		if p.Heterogeneous != tc.wantLittle {
 			t.Errorf("capacity %s next to 1024: heterogeneous=%v, want %v", tc.small, p.Heterogeneous, tc.wantLittle)
 		}
@@ -155,26 +163,26 @@ func TestPlanMaskedAllowedSetStaysInsideTheMask(t *testing.T) {
 	// CPUs 2-5 (celeris#909: the old code pinned CPUs 0-7).
 	allowed := append(rng(0, 1), rng(6, 11)...)
 	h := msr1(t, allowed)
-	p := planWorkerCPUs(8, h.src())
+	p := planWorkerCPUs(8, false, h.src())
 	eq(t, "cpus", p.CPUs, allowed)
 	if p.Heterogeneous {
 		t.Errorf("heterogeneous = true for an all-A720 mask")
 	}
 	// More loops than members wrap inside the set.
-	eq(t, "cpus(10)", planWorkerCPUs(10, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1})
+	eq(t, "cpus(10)", planWorkerCPUs(10, false, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1})
 }
 
 func TestPlanTasksetOnAHomogeneousHost(t *testing.T) {
 	h := newFakeHost(t, rng(4, 7)) // taskset -c 4-7 on an 8-CPU x86 host, no cpu_capacity files
-	eq(t, "cpus(4)", planWorkerCPUs(4, h.src()).CPUs, []int{4, 5, 6, 7})
-	eq(t, "cpus(6)", planWorkerCPUs(6, h.src()).CPUs, []int{4, 5, 6, 7, 4, 5})
+	eq(t, "cpus(4)", planWorkerCPUs(4, false, h.src()).CPUs, []int{4, 5, 6, 7})
+	eq(t, "cpus(6)", planWorkerCPUs(6, false, h.src()).CPUs, []int{4, 5, 6, 7, 4, 5})
 	h = newFakeHost(t, []int{1, 2, 3})
-	eq(t, "cpus(3)", planWorkerCPUs(3, h.src()).CPUs, []int{1, 2, 3})
+	eq(t, "cpus(3)", planWorkerCPUs(3, false, h.src()).CPUs, []int{1, 2, 3})
 }
 
 func TestPlanX86LikeHomogeneousIsTheOldRule(t *testing.T) {
 	h := newFakeHost(t, rng(0, 7))
-	p := planWorkerCPUs(10, h.src())
+	p := planWorkerCPUs(10, false, h.src())
 	eq(t, "cpus", p.CPUs, []int{0, 1, 2, 3, 4, 5, 6, 7, 0, 1})
 	if p.Heterogeneous || p.Note != "" || len(p.Little) != 0 {
 		t.Errorf("homogeneous host: %+v", p)
@@ -183,25 +191,25 @@ func TestPlanX86LikeHomogeneousIsTheOldRule(t *testing.T) {
 	for c := 0; c < 8; c++ {
 		h.capacity(c, "1024")
 	}
-	eq(t, "equal caps", planWorkerCPUs(10, h.src()).CPUs, p.CPUs)
+	eq(t, "equal caps", planWorkerCPUs(10, false, h.src()).CPUs, p.CPUs)
 }
 
 func TestPlanSingleCPU(t *testing.T) {
 	h := newFakeHost(t, []int{5})
-	eq(t, "one worker", planWorkerCPUs(1, h.src()).CPUs, []int{5})
-	eq(t, "three workers", planWorkerCPUs(3, h.src()).CPUs, []int{5, 5, 5})
+	eq(t, "one worker", planWorkerCPUs(1, false, h.src()).CPUs, []int{5})
+	eq(t, "three workers", planWorkerCPUs(3, false, h.src()).CPUs, []int{5, 5, 5})
 }
 
 func TestPlanMissingOrBrokenCapacityIsHomogeneous(t *testing.T) {
 	// No cpu_capacity files at all.
 	h := newFakeHost(t, rng(0, 3))
-	eq(t, "missing", planWorkerCPUs(4, h.src()).CPUs, rng(0, 3))
+	eq(t, "missing", planWorkerCPUs(4, false, h.src()).CPUs, rng(0, 3))
 	// One allowed CPU has no file: not enough to classify, assume homogeneous.
 	h = newFakeHost(t, rng(0, 3))
 	h.capacity(0, "1024")
 	h.capacity(1, "1024")
 	h.capacity(2, "100")
-	eq(t, "one file missing", planWorkerCPUs(4, h.src()).CPUs, rng(0, 3))
+	eq(t, "one file missing", planWorkerCPUs(4, false, h.src()).CPUs, rng(0, 3))
 	// Garbage, zero and negative values.
 	for _, bad := range []string{"", "abc", "0", "-5"} {
 		h = newFakeHost(t, rng(0, 3))
@@ -209,7 +217,7 @@ func TestPlanMissingOrBrokenCapacityIsHomogeneous(t *testing.T) {
 		h.capacity(1, "1024")
 		h.capacity(2, bad)
 		h.capacity(3, "100")
-		if p := planWorkerCPUs(4, h.src()); p.Heterogeneous {
+		if p := planWorkerCPUs(4, false, h.src()); p.Heterogeneous {
 			t.Errorf("capacity %q: planned as heterogeneous: %+v", bad, p)
 		}
 	}
@@ -218,7 +226,7 @@ func TestPlanMissingOrBrokenCapacityIsHomogeneous(t *testing.T) {
 	h.capacity(0, "1024")
 	h.capacity(1, "1024")
 	h.capacity(2, "100")
-	if p := planWorkerCPUs(2, h.src()); p.Heterogeneous {
+	if p := planWorkerCPUs(2, false, h.src()); p.Heterogeneous {
 		t.Errorf("a little CPU outside the mask made the plan heterogeneous: %+v", p)
 	}
 }
@@ -229,37 +237,38 @@ func TestPlanCPUInfoFallback(t *testing.T) {
 	// No cpu_capacity files: the CPU parts of /proc/cpuinfo decide.
 	h := newFakeHost(t, rng(0, 11))
 	h.cpuinfo(parts)
-	p := planWorkerCPUs(12, h.src())
-	eq(t, "cpus", p.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1})
+	p := planWorkerCPUs(12, false, h.src())
+	eq(t, "cpus", p.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11})
 	eq(t, "little", p.Little, []int{2, 3, 4, 5})
+	eq(t, "explicit cpus", planWorkerCPUs(10, true, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1})
 	// A mask of the A520s only is homogeneous.
 	h = newFakeHost(t, rng(2, 5))
 	h.cpuinfo(parts)
-	if p := planWorkerCPUs(4, h.src()); p.Heterogeneous {
+	if p := planWorkerCPUs(4, false, h.src()); p.Heterogeneous {
 		t.Errorf("all-A520 mask: %+v", p)
 	}
 	// A mask without them is homogeneous.
 	h = newFakeHost(t, append(rng(0, 1), rng(6, 11)...))
 	h.cpuinfo(parts)
-	if p := planWorkerCPUs(8, h.src()); p.Heterogeneous {
+	if p := planWorkerCPUs(8, false, h.src()); p.Heterogeneous {
 		t.Errorf("all-A720 mask: %+v", p)
 	}
 	// A host with one known-little part only (an all-A55 board) is homogeneous.
 	h = newFakeHost(t, rng(0, 3))
 	h.cpuinfo([]string{"0x41:0xd05", "0x41:0xd05", "0x41:0xd05", "0x41:0xd05"})
-	if p := planWorkerCPUs(4, h.src()); p.Heterogeneous {
+	if p := planWorkerCPUs(4, false, h.src()); p.Heterogeneous {
 		t.Errorf("all-A55: %+v", p)
 	}
 	// Two unknown parts: no table entry, so no guess.
 	h = newFakeHost(t, rng(0, 1))
 	h.cpuinfo([]string{"0x41:0xd81", "0x41:0xd82"})
-	if p := planWorkerCPUs(2, h.src()); p.Heterogeneous {
+	if p := planWorkerCPUs(2, false, h.src()); p.Heterogeneous {
 		t.Errorf("two big parts: %+v", p)
 	}
 	// An allowed CPU the file does not describe: homogeneous.
 	h = newFakeHost(t, rng(0, 5))
 	h.cpuinfo(parts[:4])
-	if p := planWorkerCPUs(4, h.src()); p.Heterogeneous {
+	if p := planWorkerCPUs(4, false, h.src()); p.Heterogeneous {
 		t.Errorf("short cpuinfo: %+v", p)
 	}
 	// A capacity file wins over cpuinfo: all capacities equal, parts mixed.
@@ -268,7 +277,7 @@ func TestPlanCPUInfoFallback(t *testing.T) {
 	for c := 0; c < 4; c++ {
 		h.capacity(c, "1024")
 	}
-	if p := planWorkerCPUs(4, h.src()); p.Heterogeneous {
+	if p := planWorkerCPUs(4, false, h.src()); p.Heterogeneous {
 		t.Errorf("equal capacities with mixed parts: %+v", p)
 	}
 }
@@ -277,7 +286,7 @@ func TestPlanAllowedErrorFallsBackToTheCPUCount(t *testing.T) {
 	h := newFakeHost(t, nil)
 	src := h.src()
 	src.allowed = func() ([]int, error) { return nil, errors.New("boom") }
-	p := planWorkerCPUs(3, src)
+	p := planWorkerCPUs(3, false, src)
 	if len(p.CPUs) != 3 || p.CPUs[0] != 0 || p.Heterogeneous {
 		t.Errorf("fallback plan: %+v", p)
 	}
@@ -290,21 +299,21 @@ func TestPlanNUMAIntersectsTheMask(t *testing.T) {
 	// CPU gets a loop before one gets a second, and none leaves the mask.
 	h := newFakeHost(t, []int{2, 3, 4, 5, 6})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "interleave", planWorkerCPUs(5, h.src()).CPUs, []int{2, 4, 3, 5, 6})
-	eq(t, "wrap", planWorkerCPUs(7, h.src()).CPUs, []int{2, 4, 3, 5, 6, 2, 4})
+	eq(t, "interleave", planWorkerCPUs(5, false, h.src()).CPUs, []int{2, 4, 3, 5, 6})
+	eq(t, "wrap", planWorkerCPUs(7, false, h.src()).CPUs, []int{2, 4, 3, 5, 6, 2, 4})
 	// A node the mask excludes entirely contributes nothing: its turns do not
 	// fall back to CPUs the other node already used.
 	h = newFakeHost(t, []int{4, 5, 6, 7})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "one node of two", planWorkerCPUs(4, h.src()).CPUs, []int{4, 5, 6, 7})
+	eq(t, "one node of two", planWorkerCPUs(4, false, h.src()).CPUs, []int{4, 5, 6, 7})
 	// No node list intersects the mask (stale sysfs): plain round-robin on the set.
 	h = newFakeHost(t, []int{8, 9})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "no intersection", planWorkerCPUs(3, h.src()).CPUs, []int{8, 9, 8})
+	eq(t, "no intersection", planWorkerCPUs(3, false, h.src()).CPUs, []int{8, 9, 8})
 	// A member no node lists (stale sysfs) comes after the nodes' CPUs.
 	h = newFakeHost(t, []int{2, 3, 9})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "unlisted member", planWorkerCPUs(4, h.src()).CPUs, []int{2, 3, 9, 2})
+	eq(t, "unlisted member", planWorkerCPUs(4, false, h.src()).CPUs, []int{2, 3, 9, 2})
 }
 
 // celeris#909 (review of #973): a cpuset or taskset that covers one NUMA node,
@@ -333,7 +342,7 @@ func TestPlanNUMARestrictedShapesBalanceTheLoops(t *testing.T) {
 			h := newFakeHost(t, tc.allowed)
 			h.nodes = tc.nodes
 			for workers := 0; workers <= 2*len(tc.allowed)+3; workers++ {
-				plan := planWorkerCPUs(workers, h.src()).CPUs
+				plan := planWorkerCPUs(workers, false, h.src()).CPUs
 				count := map[int]int{}
 				for _, c := range plan {
 					count[c]++
@@ -375,7 +384,7 @@ func TestPlanWorkerCPUsOnTheRealHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sched_getaffinity: %v", err)
 	}
-	p := PlanWorkerCPUs(len(allowed) + 3)
+	p := PlanWorkerCPUs(len(allowed)+3, false)
 	if len(p.CPUs) != len(allowed)+3 {
 		t.Fatalf("plan has %d entries", len(p.CPUs))
 	}
@@ -447,10 +456,14 @@ func TestPlanUnrestrictedHomogeneousEqualsTheOldPlan(t *testing.T) {
 					}
 					h.nodes = nodes
 				}
-				got := planWorkerCPUs(workers, h.src()).CPUs
 				want := oldDistributeWorkers(workers, ncpu, nodes)
-				if !reflect.DeepEqual(got, want) {
-					t.Errorf("%s, %d CPUs, %d workers: got %v, old plan %v", name, ncpu, workers, got, want)
+				// A homogeneous host ignores whether the count was user-set.
+				for _, explicit := range []bool{false, true} {
+					got := planWorkerCPUs(workers, explicit, h.src()).CPUs
+					if !reflect.DeepEqual(got, want) {
+						t.Errorf("%s, %d CPUs, %d workers (explicit=%v): got %v, old plan %v",
+							name, ncpu, workers, explicit, got, want)
+					}
 				}
 			}
 		}

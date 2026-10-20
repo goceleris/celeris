@@ -225,7 +225,7 @@ func (f *fdlFixture) sendCQE() *completionEntry {
 	if !f.cs.sending {
 		f.t.Fatal("sendCQE: no SEND in flight")
 	}
-	n := len(f.cs.sendBuf) + len(f.cs.sendBody)
+	n := len(f.cs.sendBuf)
 	return &completionEntry{UserData: encodeUserDataGen(udSend, f.fd, f.gen), Res: int32(n)}
 }
 
