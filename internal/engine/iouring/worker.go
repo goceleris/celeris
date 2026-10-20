@@ -4556,8 +4556,24 @@ func (w *Worker) holdOrLockSend(cs *connState, c *completionEntry) bool {
 		}
 	}
 	cs.heldSends = append(cs.heldSends, *c)
+	if f := sendHeldHook.Load(); f != nil {
+		(*f)() // test seam, celeris#884 item 19
+	}
 	return false
 }
+
+// sendHeldHook is a test seam: nil in production, it runs on the worker thread
+// each time holdOrLockSend holds a send completion (the append above), after
+// the completion is on cs.heldSends and the hand-back is owed. It counts
+// holds, not lock contentions: every worker and engine of the process, and
+// both hold cases (the lock busy with a running handler, and an ordering hold
+// behind an earlier held completion of the conn). An end to end test uses it
+// as the witness that a held completion is what the run exercised
+// (celeris#884 items 19 and 23); one or two is not a count of contentions. Read
+// through an atomic pointer so a test arming it after the engine started is
+// not a data race; the load is on the hold branch only, never on the path of
+// a completion that takes the lock.
+var sendHeldHook atomic.Pointer[func()]
 
 // replayHeldSends applies cs's held send completions (celeris#750) through
 // handleSend, in arrival order. It runs on the worker thread wherever the
