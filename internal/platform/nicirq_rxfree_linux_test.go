@@ -153,6 +153,8 @@ func TestWithNICIRQsLeavesWhatTheRuleFreedOnPurpose(t *testing.T) {
 			[]NICVector{v127, v135}, []int{8}},
 		{"freed CPU but the vector is not the rule's", func(p *CPUPlan) { p.RxFree.Vectors = p.RxFree.Vectors[1:] },
 			[]NICVector{v127, v135}, []int{8}},
+		{"the rule's vector found on another freed CPU than the rule read it on", nil,
+			[]NICVector{{IRQ: 135, CPU: 6, Name: "enp49s0-8", Dev: "enp49s0", Count: 4_000_000_000}}, []int{6}},
 		{"no rule", func(p *CPUPlan) { p.RxFree = RxFree{} }, []NICVector{v127, v135, v167}, []int{6, 8}},
 		{"a vector on a little CPU next to the rule's", nil,
 			[]NICVector{v127, v135, {IRQ: 167, CPU: 4, Name: "enp1s0-8", Dev: "enp1s0", Count: 2_600_000_000}}, []int{4}},
@@ -259,5 +261,17 @@ func TestReportBalancedBond(t *testing.T) {
 			eq(t, "freed", got.RxFree.Freed, []int(nil))
 			eq(t, "uncovered", got.IRQUncovered, tc.uncovered)
 		})
+	}
+}
+
+// The Warn names the loops the operator can move the interrupt to, once each,
+// ascending: Workers above the big CPUs wraps the loops over them (0, 1, 6, 7,
+// 8, 9, 10, 11, 0, 1, 6, 7).
+func TestReportNamesEachLoopCPUOnce(t *testing.T) {
+	_, got := reported(t, msr1NIC(t), 12, true, rng(0, 11), bondAddr)
+	eq(t, "loops", got.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1, 6, 7})
+	warns := warnLines(logLines(got))
+	if len(warns) != 1 || !strings.Contains(warns[0], "loop_cpus=0-1,6-11 ") || !strings.Contains(warns[0], "one of 0-1,6-11>") {
+		t.Errorf("the Warn does not name 0-1,6-11 once:\n%s", strings.Join(warns, "\n"))
 	}
 }

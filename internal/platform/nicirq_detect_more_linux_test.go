@@ -126,3 +126,31 @@ func TestDetectEmptyEffectiveAffinityFallsThrough(t *testing.T) {
 	got = nh.detect("10.0.0.1:1")
 	eq(t, "unknown", got.Unknown, 1)
 }
+
+func TestDetectJudgesNoMoreThanTheVectorCap(t *testing.T) {
+	// Five ports of 1000 vectors each, one interrupt on every vector: 5000
+	// vectors, of which only the first nicMaxVectors (4096) are judged. The
+	// ones past the cap are in neither Idle nor Negligible, but their
+	// interrupts are in Total, the denominator of the share.
+	h := newNICHost(t)
+	h.virt("bond0")
+	for d := range 5 {
+		dev := "eth" + strconv.Itoa(d)
+		var irqs []int
+		for i := range 1000 {
+			irqs = append(irqs, 10000+1000*d+i)
+		}
+		h.phys(dev, irqs...)
+		h.lower("bond0", dev)
+		for _, n := range irqs {
+			h.intr(n, dev+"-"+strconv.Itoa(n), map[int]uint64{n % 12: 1})
+		}
+	}
+	h.addr("bond0", true, "10.0.0.1")
+	h.flushInterrupts()
+	got := h.detect("10.0.0.1:1")
+	eq(t, "vectors", len(got.Vectors), 0)
+	eq(t, "negligible (judged)", got.Negligible, nicMaxVectors)
+	eq(t, "idle", got.Idle, 0)
+	eq(t, "total (all 5000 vectors)", got.Total, uint64(5000))
+}
