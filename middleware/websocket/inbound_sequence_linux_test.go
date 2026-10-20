@@ -475,6 +475,10 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 						switch r.outcome {
 						case "eof":
 							closedOK.Add(1)
+							// A silence over wsoCloseSlow is printed with both
+							// ends' timeline (WSO-CLOSESLOW), not asserted
+							// (celeris#633).
+							cl.closeSlow(t, c, testName, r)
 						case "rst":
 							clientFailed[connID].Store(true)
 							clientRST.Add(1)

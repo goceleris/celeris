@@ -217,17 +217,6 @@ func waitGone662(t *testing.T, port int, set map[uint64]bool, what string) time.
 	}
 }
 
-// skipOrFailUpswitch662 skips, or fails when CELERIS_REQUIRE_UPSWITCH=1 (the
-// CI adaptive job) forbids skipping.
-func skipOrFailUpswitch662(t *testing.T, format string, args ...any) {
-	t.Helper()
-	msg := fmt.Sprintf(format, args...)
-	if os.Getenv("CELERIS_REQUIRE_UPSWITCH") == "1" {
-		t.Fatal(msg + " -- CELERIS_REQUIRE_UPSWITCH=1 forbids skipping")
-	}
-	t.Skip(msg)
-}
-
 // requireMigrateReqZero662: with net.ipv4.tcp_migrate_req on, the kernel
 // moves the requests of a closing listener to another listener in the
 // SO_REUSEPORT group, the incoming engine's, and a rescue would be the

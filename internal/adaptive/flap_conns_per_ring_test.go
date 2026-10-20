@@ -63,7 +63,7 @@ func s0FlapConnsPerRing(t *testing.T, cycles int) {
 	// The adaptive CI job raises memlock and sets CELERIS_REQUIRE_UPSWITCH=1, which turns this skip, and s0Bind's,
 	// into a failure.
 	if m := maxWorkersForMemlock(); m >= 0 && m < workers {
-		s0SkipUnlessRequired(t, "RLIMIT_MEMLOCK funds %d io_uring worker(s), T4 needs %d", m, workers)
+		skipOrFailUpswitch662(t, "RLIMIT_MEMLOCK funds %d io_uring worker(s), T4 needs %d", m, workers)
 	}
 	e, addr, stop := s0Bind(t, resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1,
 		Resources: resource.Resources{Workers: workers}}, respHandler{})
@@ -150,17 +150,6 @@ func s0FlapConnsPerRing(t *testing.T, cycles int) {
 	if n := m.TransplantReapFailed; n != 0 {
 		t.Errorf("S0T4 REAPFAILED: TransplantReapFailed = %d, want 0", n)
 	}
-}
-
-// s0SkipUnlessRequired skips T4 for an environment that cannot run it, and fails it instead when
-// CELERIS_REQUIRE_UPSWITCH=1, as the adaptive CI job sets it: that job must not go green by skipping T4.
-func s0SkipUnlessRequired(t *testing.T, format string, args ...any) {
-	t.Helper()
-	msg := fmt.Sprintf(format, args...)
-	if os.Getenv("CELERIS_REQUIRE_UPSWITCH") == "1" {
-		t.Fatal(msg + " -- CELERIS_REQUIRE_UPSWITCH=1 forbids skipping")
-	}
-	t.Skip(msg)
 }
 
 // The client driver and bind helper of TestFlapConnsPerRing (from the celeris#657 step-0 overlay). The driver keeps
@@ -257,15 +246,15 @@ func s0Drive(addr string, conns int, stop <-chan struct{}, ok, errc *atomic.Int6
 // s0Bind builds an adaptive engine from cfg, disables the switch cooldown, FREEZES the controller (so the
 // only switches are the test's ForceSwitch calls; performSwitch ignores the freeze), starts Listen and waits
 // for the bind. Where io_uring or the adaptive engine is unavailable it skips, or fails under
-// CELERIS_REQUIRE_UPSWITCH=1 (s0SkipUnlessRequired).
+// CELERIS_REQUIRE_UPSWITCH=1 (skipOrFailUpswitch662).
 func s0Bind(t *testing.T, cfg resource.Config, h stream.Handler) (*Engine, string, func()) {
 	t.Helper()
 	if !probe.Probe().IOUringTier.Available() {
-		s0SkipUnlessRequired(t, "io_uring unavailable: needs both sub-engines")
+		skipOrFailUpswitch662(t, "io_uring unavailable: needs both sub-engines")
 	}
 	e, err := New(cfg, h, nil)
 	if err != nil {
-		s0SkipUnlessRequired(t, "adaptive.New unsupported here: %v", err)
+		skipOrFailUpswitch662(t, "adaptive.New unsupported here: %v", err)
 	}
 	e.ctrl.cooldown = 0
 	e.FreezeSwitching()

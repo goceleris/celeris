@@ -934,17 +934,3 @@ func (s *Stream) WriteLock() { s.writeMu.Lock() }
 
 // WriteUnlock releases the per-stream write lock.
 func (s *Stream) WriteUnlock() { s.writeMu.Unlock() }
-
-// MarkBuffered marks the stream as having buffered data.
-func (s *Stream) MarkBuffered() {
-	if s.manager != nil {
-		s.manager.MarkStreamBuffered(s.ID)
-	}
-}
-
-// MarkEmpty marks the stream as having no buffered data.
-func (s *Stream) MarkEmpty() {
-	if s.manager != nil {
-		s.manager.MarkStreamEmpty(s.ID)
-	}
-}

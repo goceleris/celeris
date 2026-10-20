@@ -145,6 +145,16 @@ func newListenWatch(port int) (*listenWatch, error) {
 // can therefore be satisfied by a late listener of the engine that is now
 // outgoing. The controller's fixed 30 s cooldown (also before its safety
 // revert) keeps that unreachable from production; ForceSwitch is for tests.
+//
+// The converse is as unreachable from production, and it is not a latency
+// either: a switch back inside the previous switch's pause latency finds
+// incoming loops that had not yet seen the pause when the resume withdrew it.
+// They never closed their listeners, so those are in the watch, nothing new
+// appears, and the wait runs into the bound (a Warn, and listenWaitBound spent
+// under e.mu) although the port was never without a listener. Measured under
+// load (celeris#683): every such timeout had the incoming engine's listeners
+// in the watch from the start, and the first new listener of the epoll loops
+// that did close came after 65 us (median of 50), 3.4 ms (p90), 56 ms at most.
 func (w *listenWatch) wait(bound time.Duration) (time.Duration, bool, error) {
 	t0 := time.Now()
 	// One netlink socket for the whole wait, not one per poll.

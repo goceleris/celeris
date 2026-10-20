@@ -78,6 +78,12 @@ jobs:
       # counts less.
       - name: skip-count.sh self-test
         run: .github/scripts/skip-count-test.sh
+      # The by-name tally of the step "celeris#890 by-name tally" (named-tally.sh)
+      # on a captured log of the tests it counts: complete, with one test renamed,
+      # removed, skipped (at the top level and as a subtest), failed or run twice,
+      # and with a result line a test's own output joined (celeris#890).
+      - name: named-tally.sh self-test
+        run: .github/scripts/named-tally-test.sh
       # The tools CI runs are pinned in one place, .github/tools/go.mod, and
       # three other places name them: the allow list of its Dependabot entry
       # (a tool without an entry, or one that names a package path instead
@@ -330,20 +336,27 @@ jobs:
       # celeris#657 step below also needs. It runs even when the step above
       # failed: the two share no package.
       #
-      # -timeout=480s: the package's race run takes 265 to 280 s on the runner
-      # (270 s on main, 279 s with the celeris#959/#866 tests, which add about
-      # 9 s, 291 s with the celeris#895/#896 tests, which add about 12 s more,
-      # 335.8 s with celeris#811's tests: PR #994 at 5adaf15, of 420 s, a
-      # margin of 25%), so 300 s left a margin of under 10%; a slower runner or
-      # the next test added would have ended in a timeout panic instead of a
-      # result. 480 s is a 43% margin over the 335.8 s.
+      # -timeout=600s. Headroom below is the timeout as a percentage over the run's
+      # duration. The package's race run took 269.5 to 270.7 s on main (runs
+      # 38054122900, 38060237412 and 38062783373; 279.0 s on celeris#987's first
+      # run, 38064776993) when #987 gave this step 300 s. The tests added since
+      # (celeris#959/#866, #895/#896 and #811 among them) have grown it to 401.7
+      # to 415.8 s on this step in the eight CI runs on main from 13fa176
+      # (2026-10-18) to 6ab5c28 (2026-10-20), 415.8 s the longest (run
+      # 39334596768): the 480 s of celeris#994 left 15% over that. The Coverage
+      # workflow's run of the same package (its own step) took 410.8 to 426.2 s
+      # in seven runs and 437.3 s in an eighth (run 39334596754): 480 s was 10%
+      # over that. A slower runner or the next test added would end in a timeout panic
+      # instead of a result. 600 s is 44% over the 415.8 s here and 37% over the
+      # 437.3 s there. If the package keeps growing, split its slow tests into
+      # a step of their own rather than raise this again (celeris#890 item 66).
       - name: internal/engine/iouring — race tests at the runner's memlock (every skip accounted for)
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=480s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=600s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
           allowed='TestListenClosesListenSocketsWhenEveryWorkerRingSetupFails|TestListenClosesListenSocketWhenOneWorkerRingSetupFails|TestListenClosesListenSocketRingAndEventfdWhenInitialSubmitFails|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895'
           required='TestListenWithCancelledContextPublishesTheBoundAddress|TestListenRefusesToStartWhenNoWorkerReportsItsAddress'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
@@ -357,6 +370,71 @@ jobs:
             echo "expected no SKIP line other than the nine that other steps enforce (listed above if any),"
             echo "and the two celeris#639 tests to run and PASS -- did a test skip here, or was one renamed,"
             echo "removed or failed?"
+            exit 1
+          fi
+      # celeris#890 items 18, 19 and 61: five groups of tests that the two steps
+      # above run (-v, so their logs are /tmp/root.log and /tmp/iouring-pkg.log)
+      # and count only as part of a skip tally, never by name. A tally of skips
+      # is blind to a test that is renamed or removed (nothing runs, nothing
+      # skips) and so are the root step's allow-list and the package step's.
+      # Each test below must run once and PASS, with no SKIP line of its own at
+      # any level, in the log of the step that runs its package:
+      #   * the six park_close_fin tests of internal/engine/iouring (celeris#767,
+      #     celeris#793): a parked or running worker sends the FIN of a timeout
+      #     close;
+      #   * the ten park_stale_clock tests of internal/engine/iouring (celeris#713)
+      #     and their two epoll twins, which t.Skip when the engine cannot be
+      #     built or does not bind (in the root step an unlisted skip is re-run
+      #     alone and forgiven when it passes there; here it fails the step);
+      #   * the three epoll tests of celeris#909 (loops pin inside the process's
+      #     CPU set) and TestInlineHandlerChildKeepsTheProcessMask919 of
+      #     ./test/server (they run in a process of their own and skip when it may
+      #     use fewer than 3 CPUs for the unpinned-loops test and fewer than 2 for
+      #     the 919 test, which a runner with 4 CPUs does not).
+      # .github/scripts/named-tally.sh prints "want N, ran N, passed N, SKIP lines
+      # K, FAIL lines F" per group and lists each test that is not exactly one
+      # RUN and one PASS; its self-test (a captured log, a missing, a skipped and
+      # a failed test) is a Lint step. The step runs after the two it reads and
+      # fails when either log is missing.
+      - name: celeris#890 by-name tally (park_close_fin, park_stale_clock, 909, 919)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          tally="$GITHUB_WORKSPACE"/.github/scripts/named-tally.sh
+          bad=0
+          {
+            "$tally" 'iouring park_close_fin (celeris#767/#793)' /tmp/iouring-pkg.log \
+              TestParkedWorkerSendsFINForAHeaderTimeoutClose \
+              TestParkedWorkerSendsFINForAReadTimeoutClose \
+              TestRunningWorkerSendsFINForAHeaderTimeoutClose \
+              TestParkedAsyncWorkerSendsFINForAHeaderTimeoutClose \
+              TestParkedWorkerSendsFINToManyReadTimeoutCloses \
+              TestParkedWorkerSendsFINToManyHeaderTimeoutCloses || bad=1
+            "$tally" 'iouring park_stale_clock (celeris#713)' /tmp/iouring-pkg.log \
+              TestAcceptAfterALongParkIsNotTimedOut \
+              TestAdoptAfterALongParkIsNotTimedOut \
+              TestAcceptAfterAShortParkIsNotTimedOut \
+              TestAdoptAfterAShortParkIsNotTimedOut \
+              TestIdleWorkerWithoutAHeaderTimeoutIsNotTimedOut \
+              TestIdleWorkerWithAHeaderTimeoutIsNotTimedOut \
+              TestPausedWorkerWithALiveConnectionIsNotTimedOut \
+              TestPausedWorkerWithABusyConnectionIsNotTimedOut \
+              TestAdoptOntoADrainingWorkerIsNotTimedOut \
+              TestAdoptionIsStampedWithTheTimeItWasAdopted || bad=1
+            "$tally" 'epoll park_stale_clock twins (celeris#713)' /tmp/root.log \
+              TestAcceptAfterALongParkIsNotTimedOutEpoll \
+              TestAdoptAfterALongParkIsNotTimedOutEpoll || bad=1
+            "$tally" 'epoll pin tests (celeris#909)' /tmp/root.log \
+              TestLoopsPinInsideTheAllowedSet909 \
+              TestUnpinnedLoopsStayUnpinned909 \
+              TestFailedPinIsLoggedOnceAndNotPretended909 || bad=1
+            "$tally" 'inline handler child mask (celeris#919)' /tmp/root.log \
+              TestInlineHandlerChildKeepsTheProcessMask919 || bad=1
+          }
+          if [ "$bad" -ne 0 ]; then
+            echo "expected every test listed above to run once and PASS with no SKIP line -- was one renamed,"
+            echo "removed, skipped or failed? (a skip is not coverage; a log that is missing means the step"
+            echo "that writes it did not run)"
             exit 1
           fi
       # celeris#709, #684: the root step above runs the celeris#592 settled-route
@@ -941,13 +1019,19 @@ jobs:
           set -o pipefail
           go vet -tags celeris_closeprobe ./middleware/websocket/
           go test -race -count=1 -timeout=300s -v \
-            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies)' \
+            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies|TestWSOStallSchedulerLatency|TestWSOJudgeStretch|TestWSOSchedLat|TestWSOHistMaxDelta|TestWSOSkmem|TestWSOTCPMemRendering|TestWSORecordHas)' \
             ./middleware/websocket/... ./middleware/static/ 2>&1 | tee /tmp/ws667.log
-          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies'
+          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies|TestWSOStallSchedulerLatencyDiscount|TestWSOStallSchedulerLatencyAfterTheProvenSpan|TestWSOJudgeStretch|TestWSOSchedLatMaxIn|TestWSOSchedLatMaxInProvenEnd|TestWSOSchedLatCoveredIn|TestWSOSchedLatReadsTheRuntime|TestWSOHistMaxDelta|TestWSOSkmemRendering|TestWSOSkmemReadsTheKernel|TestWSOTCPMemRendering|TestWSORecordHasBothEndsAndTheKernelMemory'
           subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)|TestChanReaderSpillPublishedAfterDrain/(read-after-publication|closed-before-read|read-waiting-in-window)|TestChanReaderCloseKeepsChunksAppendedBeforeIt/(retried-into-channel|spilled-behind-full-channel)'
-          # 16 names; TestWaitForReadyFailsFastOnStartError passes once in
-          # each of the two packages, so it counts twice: want 17.
-          want=17
+          # 28 names; TestWaitForReadyFailsFastOnStartError passes once in
+          # each of the two packages, so it counts twice: want 29. The 12
+          # TestWSO names after TestNoteReadErrClassifies are the websocket
+          # oracle's scheduler-latency verdict, probe and skmem tests
+          # (celeris#871, #783, #633); they ran in no CI job before. The
+          # real-engine TestWSOWatchFailsOnParkedEngineReader takes 16 s and
+          # has 1.5 s of margin on a loaded runner, so it stays out of the
+          # regex above and runs from the mage target.
+          want=29
           wantsub=15
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/ws667.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${subs}) \(" /tmp/ws667.log || true)
@@ -1043,7 +1127,7 @@ jobs:
       # probe finds no ring or no multishot receive. So both run here by
       # name with CELERIS_REQUIRE_IOURING_WORKERS=1, and an exact tally: the
       # three top-level tests (celeris#868's ring-survives-hijacks test is the third)
-      # and the four arms (std, epoll, epoll-async, io_uring) must PASS, with no SKIP line, and go test must exit 0.
+      # and the five arms (std, epoll, epoll-async, epoll-asynchandlers, io_uring) must PASS, with no SKIP line, and go test must exit 0.
       - name: celeris#733 hijacked request strings (io_uring arms required)
         if: ${{ !cancelled() }}
         shell: bash
@@ -1059,9 +1143,9 @@ jobs:
           arms=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/" /tmp/c733.log || true)
           uring=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/io_uring" /tmp/c733.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c733.log || true)
-          echo "celeris#733 tests: top-level PASS $top (want 3), arm PASS $arms (want 4), io_uring arm PASS $uring (want 1), SKIP lines $skipped, go test failed $failed (want 0)"
-          if [ "$top" -ne 3 ] || [ "$arms" -ne 4 ] || [ "$uring" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
-            echo "expected all three tests and all four arms (one io_uring) to PASS with no SKIP line"
+          echo "celeris#733 tests: top-level PASS $top (want 3), arm PASS $arms (want 5), io_uring arm PASS $uring (want 1), SKIP lines $skipped, go test failed $failed (want 0)"
+          if [ "$top" -ne 3 ] || [ "$arms" -ne 5 ] || [ "$uring" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all three tests and all five arms (one io_uring) to PASS with no SKIP line"
             exit 1
           fi
       # celeris#791: a handler panic, or runtime.Goexit, on an async dispatch
@@ -1562,7 +1646,7 @@ jobs:
             echo "were they renamed or removed, or did one skip? a skip is not coverage."
             exit 1
           fi
-          rest='TestAdaptiveProviderAutoFreeze|TestAdaptiveUnfreezeRespectsDriverFDs|TestAdaptiveStackedFreezes|TestAdaptiveConcurrentDriverChurnVsSwitch|TestAdaptiveSwitchAfterDriverQuiescence|TestAdaptiveSwitchesWithPreBoundListener|TestReverseTransplantAsync|TestRampH2CPriorKnowledge|TestRampAutoMixedH1H2|TestRampAutoMixedAsync|TestPromotionUnderLoadAttributesEveryError|TestRevertChargesItsAcceptTeardownToTheStandby|TestAdaptivePort0ListensOnOnePort895|TestAdaptiveStopReleasesThePortAtOnce896'
+          rest='TestAdaptiveProviderAutoFreeze|TestAdaptiveUnfreezeRespectsDriverFDs|TestAdaptiveStackedFreezes|TestAdaptiveConcurrentDriverChurnVsSwitch|TestAdaptiveSwitchAfterDriverQuiescence|TestAdaptiveSwitchesWithPreBoundListener|TestReverseTransplantAsync|TestRampH2CPriorKnowledge|TestRampAutoMixedH1H2|TestRampAutoMixedAsync|TestPromotionUnderLoadAttributesEveryError|TestRevertChargesItsAcceptTeardownToTheStandby|TestAdaptivePort0ListensOnOnePort895|TestAdaptiveStopReleasesThePortAtOnce896|TestAdaptiveSkipRouting684|TestAdaptiveSkipRoutingGuardSelfTest684'
           owant=$(( $(tr '|' '\n' <<<"$rest" | wc -l) ))
           oran=$(grep -cE "^=== RUN   (${rest})\$" /tmp/adaptive-race.log || true)
           opassed=$(grep -cE "^--- PASS: (${rest}) \(" /tmp/adaptive-race.log || true)
@@ -1571,6 +1655,9 @@ jobs:
           # under docker's default seccomp profile, which refuses io_uring_setup) is in a tally of
           # its own, in the unit job's celeris#905 step, or in the list above. The check below also
           # forbids a SKIP line anywhere in this step, so a new test cannot skip quietly either.
+          # The last two names of the list are not such tests: they are the guard (skip_routing_684_test.go) that fails on
+          # a t.Skip in this package that does not go through skipOrFailUpswitch662, and its fixture self-test; counting
+          # them by name means a rename or a -skip cannot take the guard out of this job unseen.
           echo "celeris#684 other adaptive tests that skip when io_uring is unavailable: want $owant, ran $oran, passed $opassed; SKIP lines in the whole step $allskipped (want 0)"
           if [ "$oran" -ne "$owant" ] || [ "$opassed" -ne "$owant" ] || [ "$allskipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/adaptive-race.log || true

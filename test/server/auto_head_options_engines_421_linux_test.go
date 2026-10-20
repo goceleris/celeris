@@ -200,22 +200,12 @@ func TestAutoHeadOptionsOnEveryEngine421(t *testing.T) {
 					})
 				}
 				// net/http's HTTP/2 client drops DATA on a HEAD stream without
-				// an error, so the frames are counted on a raw connection.
-				//
-				// The streaming paths are checked on sync routes only, until
-				// celeris#837 is fixed: an async handler's last frames can be
-				// lost in the HTTP/2 write queue (a lost wakeup, measured on
-				// main fe9264f for GET streams too). Every drain is gated on
-				// the queue's pending flag, so only another stream's response
-				// drains them (a PING does not), and the raw read, which sends
-				// nothing more, waits out its deadline.
-				// The HEAD suppression itself, h2ResponseAdapter.Write, is
-				// the same code on both routes, and net/http's client above
-				// still drives every path on the async route.
+				// an error, so the frames are counted on a raw connection. The
+				// streaming paths are checked on both routes: an async handler's
+				// last frames were once lost in the HTTP/2 write queue (a lost
+				// wakeup, celeris#837, fixed by celeris#900), which left the raw
+				// read, sending nothing more, to wait out its deadline.
 				paths := []string{"/hello", "/stream", "/stream-head", "/file"}
-				if route == "async-route" {
-					paths = []string{"/hello", "/file"}
-				}
 				t.Run("h2-raw-head-sends-no-data", func(t *testing.T) {
 					for _, p := range paths {
 						status, data, err := h2HeadDataBytes421(addr, p)
