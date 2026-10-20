@@ -555,6 +555,27 @@ func TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen(t *testing.T) {
 	})
 }
 
+// skipIfProvidedBuffers skips t when any of e's workers receives through a
+// provided-buffer ring (CELERIS_IOURING_MULTISHOT_RECV=1 on a tier that
+// registers one), which the caller's premise does not hold under: why says
+// what is unreachable there. A test that would pass or fail for the wrong
+// reason on that model says so instead (celeris#890 item 77). An engine that
+// reports no workers is a failure, not a skip: the check would never run.
+func skipIfProvidedBuffers(t *testing.T, e *Engine, why string) {
+	t.Helper()
+	e.mu.Lock()
+	workers := append([]*Worker(nil), e.workers...)
+	e.mu.Unlock()
+	if len(workers) == 0 {
+		t.Fatal("engine reports no workers")
+	}
+	for _, w := range workers {
+		if w.bufRing != nil {
+			t.Skipf("provided-buffer recv in use: %s", why)
+		}
+	}
+}
+
 // testHoldReleasedInTheWorkerLoop is TestHoldReleasedWhenDrainStops through
 // the worker's own event loop (the inlined udSend dispatch site), made
 // deterministic by a response large enough to keep its SEND in flight until
@@ -569,6 +590,7 @@ func TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen(t *testing.T) {
 func testHoldReleasedInTheWorkerLoop(t *testing.T) {
 	big := make([]byte, 3<<20)
 	e, addr := startFDLEngine(t, bigBodyHandler{big: big}, nil)
+	skipIfProvidedBuffers(t, e, "the /big response is not held on a worker with a buffer ring, so the test would exercise nothing")
 	d := net.Dialer{Control: func(_, _ string, rc syscall.RawConn) error {
 		var serr error
 		_ = rc.Control(func(fd uintptr) {
