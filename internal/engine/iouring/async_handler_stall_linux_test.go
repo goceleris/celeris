@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -140,6 +141,35 @@ func returnsWhileHeld704(t *testing.T, release func(), site func()) bool {
 	}
 }
 
+// waitsOnBoundedHolder884 is the sync point for the negative controls: site
+// runs on its own goroutine, and the caller asks whether it waits on mu, held
+// by a bounded holder, instead of returning. It polls until site is queued in
+// mu's blocking Lock (mutexWaiters), returns (done), or 5 s pass, and reports
+// whether the site waits. A site that waits has registered as a waiter by the
+// time this returns true, and is parked there until the holder lets go, so
+// "done is still open" is not a verdict about elapsed time: the 200 ms timer
+// it replaces let a site that had not yet been scheduled, on a loaded runner,
+// pass for one that waits (celeris#884 items 5 and 22). Returns the channel
+// that closes when site returns.
+func waitsOnBoundedHolder884(t *testing.T, mu *sync.Mutex, site func()) (waits bool, done chan struct{}) {
+	t.Helper()
+	done = make(chan struct{})
+	go func() {
+		defer close(done)
+		site()
+	}()
+	finished := func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+	w := waitMutexWaiters884(mu, 1, 5*time.Second, finished)
+	return w >= 1 && !finished(), done
+}
+
 // exitDispatch704 runs the REAL runAsyncHandler tail a dispatch goroutine
 // takes after its handler returns on a conn whose close was requested: the
 // loop top observes asyncClosed and exits. Synchronous, so whatever it hands
@@ -198,6 +228,69 @@ func TestIouringCloseConnDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	release() // the handler returns; its goroutine exits and hands the close back
 	exitDispatch704(rig.w, rig.cs)
 	rig.w.drainDetachQueue()
+	rig.expectClosedOnce(t)
+}
+
+// TestIouringDispatchRecheckExitHandsBackAnOwedClose884: the exit serveAsync
+// takes after it has locked detachMu, when it finds asyncClosed set, must hand
+// the conn back if a close was left to it (closeOwed). The dispatch goroutine
+// is taken to that point by a test that holds detachMu as a running handler
+// does: input is buffered, so the goroutine passes the loop top's
+// asyncClosed check, clears asyncParked and queues in detachMu's Lock; the
+// test waits for it there (mutexWaiters), so closeConn finds a running
+// goroutine, sets asyncClosed, leaves the close to it (closeOwed), and
+// returns. When the lock is released the goroutine takes the post-lock
+// re-check exit, not the loop-top one, and its hand-back is the only thing
+// that closes the conn: detachQPending must be 1 once it has exited, and the
+// drain must close the conn exactly once. Mutant Y1 (the owed enqueue of this
+// exit deleted) leaves the queue empty and the conn open forever; the loop-top
+// exit's own enqueue is covered by TestIouringCloseConnDoesNotWaitForARunningAsyncHandler.
+// (celeris#884 item 4.)
+func TestIouringDispatchRecheckExitHandsBackAnOwedClose884(t *testing.T) {
+	rig := newStallRig704(t)
+	w, cs := rig.w, rig.cs
+	release := holdAsHandler704(t, cs, true)
+	cs.asyncInMu.Lock()
+	cs.asyncInBuf = append(cs.asyncInBuf[:0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n"...)
+	cs.asyncInMu.Unlock()
+	w.asyncWG.Add(1)
+	go w.runAsyncHandler(cs)
+
+	// The goroutine is past the loop-top check and queued for the lock.
+	if got := waitMutexWaiters884(cs.detachMu, 1, 5*time.Second, nil); got < 1 {
+		release()
+		t.Fatalf("apparatus: the dispatch goroutine did not queue in detachMu's Lock (waiters=%d)", got)
+	}
+	if !returnsWhileHeld704(t, release, func() { w.closeConn(rig.local) }) {
+		t.Fatalf("celeris#704: closeConn waited %v on cs.detachMu held by a running async handler", stallWait704)
+	}
+	rig.expectWhole(t)
+	cs.asyncInMu.Lock()
+	owed := cs.closeOwed
+	cs.asyncInMu.Unlock()
+	if !owed || !cs.asyncClosed.Load() {
+		release()
+		t.Fatalf("apparatus: closeConn did not leave the close to the goroutine (closeOwed=%v asyncClosed=%v)",
+			owed, cs.asyncClosed.Load())
+	}
+	if w.detachQPending.Load() != 0 {
+		release()
+		t.Fatalf("apparatus: the detach queue is not empty before the goroutine exits")
+	}
+
+	release() // the goroutine takes the lock, finds asyncClosed, and exits
+	exited := make(chan struct{})
+	go func() { w.asyncWG.Wait(); close(exited) }()
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dispatch goroutine did not exit after detachMu was released")
+	}
+	if n := w.detachQPending.Load(); n != 1 {
+		t.Fatalf("the dispatch goroutine exited at its asyncClosed re-check with a close owed and handed nothing back "+
+			"(detachQPending=%d, want 1): the conn stays open for good", n)
+	}
+	w.drainDetachQueue()
 	rig.expectClosedOnce(t)
 }
 
@@ -420,16 +513,15 @@ func TestIouringCloseStillWaitsForABoundedHolder(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rig := newStallRig704(t)
 			release := holdAsHandler704(t, rig.cs, tc.setup(rig.cs))
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				rig.w.closeConn(rig.local)
-			}()
-			select {
-			case <-done:
-				t.Fatal("closeConn returned while a bounded holder held detachMu; the write could race the teardown")
-			case <-time.After(200 * time.Millisecond):
+			// The close is queued in detachMu's blocking Lock, or it returned
+			// (or never got there): no timer decides.
+			waits, done := waitsOnBoundedHolder884(t, rig.cs.detachMu, func() { rig.w.closeConn(rig.local) })
+			if !waits {
+				release()
+				t.Fatalf("closeConn did not wait in cs.detachMu's Lock while a bounded holder held it (waiters=%d, "+
+					"returned=%v); the write could race the teardown", mutexWaiters(rig.cs.detachMu), chanClosed884(done))
 			}
+			rig.expectWhole(t) // still parked, nothing torn down
 			release()
 			select {
 			case <-done:
@@ -441,28 +533,96 @@ func TestIouringCloseStillWaitsForABoundedHolder(t *testing.T) {
 	}
 }
 
+// chanClosed884 reports whether c is closed, without blocking.
+func chanClosed884(c chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
+}
+
 // ---- end to end: the issue's measurement --------------------------------
 
-// stallSlow704 is the async handler's duration; the trigger fires 50 ms into
-// it, so a parked worker holds the fast conn for ~750 ms.
-const stallSlow704 = 800 * time.Millisecond
+// The slow async handler is gated, not timed: it signals that it has entered
+// and then waits until the test releases it, so the test decides how long the
+// worker would have been parked, and "a fast request completes while /slow is
+// gated" is a structural verdict. A worker parked on the handler's detachMu
+// cannot serve the fast request however long the test waits, because the
+// handler cannot return before the test opens the gate (celeris#884 items 6
+// and 23). stallBudget704 is kept as a logged number and as an opt-in
+// assertion (CELERIS_STALL_BUDGET=1), not as the verdict.
 
-// stallBudget704 is the most one fast request may take. A worker that is not
-// parked serves it in well under a millisecond; the gap absorbs a loaded
-// -race run.
+// stallBudget704 is the most one fast request may take when the opt-in
+// assertion is on. A worker that is not parked serves it in well under a
+// millisecond; the gap absorbs a loaded -race run.
 const stallBudget704 = 300 * time.Millisecond
 
-// stallHandler704 answers /fast inline with the serving worker's id, and /slow
-// on the dispatch goroutine after stallSlow704.
-type stallHandler704 struct{}
+// stallPings704 is how many fast requests are issued after the trigger (and,
+// in the send test, after the completion was held) while /slow is gated. Each
+// is a round trip through the worker's loop, so a trigger the worker had not
+// yet read when the first one went out is read before the last one.
+const stallPings704 = 50
 
-func (stallHandler704) HandleStream(ctx context.Context, s *stream.Stream) error {
+// stallDeadline704 bounds each fast request and each wait for a signal. A
+// parked worker fails here, 5 s into a gate that never opens by itself.
+const stallDeadline704 = 5 * time.Second
+
+func stallBudgetStrict704() bool { return os.Getenv("CELERIS_STALL_BUDGET") == "1" }
+
+// stallGate704 is the gated async handler's state: entered fires once the
+// handler is running (the dispatch goroutine holds detachMu from here), the
+// handler returns once release is closed, and returned closes after it did.
+type stallGate704 struct {
+	entered  chan struct{}
+	release  chan struct{}
+	returned chan struct{}
+	once     sync.Once
+}
+
+// newStallGate704 makes a gate that opens at the end of the test at the
+// latest: a handler still gated at engine shutdown would hold it up.
+func newStallGate704(t *testing.T) *stallGate704 {
+	t.Helper()
+	g := &stallGate704{entered: make(chan struct{}, 8), release: make(chan struct{}), returned: make(chan struct{}, 8)}
+	t.Cleanup(g.open)
+	return g
+}
+
+func (g *stallGate704) open() { g.once.Do(func() { close(g.release) }) }
+
+// hold is the /slow handler's body: announce, wait for the gate (30 s at most,
+// so a test that died cannot leave the handler for good), announce the return.
+func (g *stallGate704) hold() {
+	g.entered <- struct{}{}
+	select {
+	case <-g.release:
+	case <-time.After(30 * time.Second):
+	}
+	g.returned <- struct{}{}
+}
+
+func (g *stallGate704) waitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.entered:
+	case <-time.After(stallDeadline704):
+		t.Fatalf("apparatus: the /slow handler did not start within %v", stallDeadline704)
+	}
+}
+
+// stallHandler704 answers /fast inline with the serving worker's id, and /slow
+// on the dispatch goroutine, gated.
+type stallHandler704 struct{ gate *stallGate704 }
+
+func (h stallHandler704) HandleStream(ctx context.Context, s *stream.Stream) error {
 	if s.ResponseWriter == nil {
 		return nil
 	}
 	body := "slow"
 	if s.Path == "/slow" {
-		time.Sleep(stallSlow704)
+		h.gate.hold()
 	} else {
 		id, _ := ctxkit.WorkerIDFrom(ctx)
 		body = "w=" + strconv.Itoa(id)
@@ -528,47 +688,59 @@ func colocate704(t *testing.T, addr string, slow *stallConn704) (*stallConn704, 
 	return nil, ""
 }
 
-// runStall704 drives one trigger: the slow conn sends /slow, trigger acts on
-// it mid-handler, and the co-located fast conn is pinged throughout.
+// pingFast704 issues n fast requests on f, one after the other, each under
+// stallDeadline704, and returns their latencies. A request that does not
+// complete is an error: with /slow gated it can only be a parked worker.
+func pingFast704(f *stallConn704, n int) (lat []time.Duration, err error) {
+	for range n {
+		t0 := time.Now()
+		if _, err = f.get("/fast", stallDeadline704); err != nil {
+			return lat, err
+		}
+		lat = append(lat, time.Since(t0))
+	}
+	return lat, nil
+}
+
+// stallStats704 summarises latencies for the log and the opt-in budget.
+func stallStats704(lat []time.Duration) (worst, p50 time.Duration) {
+	for _, d := range lat {
+		worst = max(worst, d)
+	}
+	sorted := slices.Clone(lat)
+	slices.Sort(sorted)
+	if len(sorted) > 0 {
+		p50 = sorted[len(sorted)/2]
+	}
+	return worst, p50
+}
+
+// runStall704 drives one trigger: the slow conn sends /slow, the test waits
+// until the handler is running (it holds the conn's detachMu from then on),
+// trigger acts on the conn, and then stallPings704 fast requests on a
+// co-located conn must each complete while /slow is still gated. Only then is
+// the gate opened and the slow conn's own outcome checked.
 func runStall704(t *testing.T, name string, trigger func(*stallConn704), expectResponse bool) {
-	e, addr := startFDLEngine(t, stallHandler704{}, func(c *resource.Config) {
+	gate := newStallGate704(t)
+	e, addr := startFDLEngine(t, stallHandler704{gate: gate}, func(c *resource.Config) {
 		c.AsyncHandlers = true
 	})
 	slow := stallDial704(t, addr)
 	fast, worker := colocate704(t, addr, slow)
 
-	stop := make(chan struct{})
-	type result struct {
-		lat []time.Duration
-		err error
-	}
-	pinged := make(chan result, 1)
-	go func() {
-		var r result
-		for {
-			select {
-			case <-stop:
-				pinged <- r
-				return
-			default:
-			}
-			t0 := time.Now()
-			if _, err := fast.get("/fast", 5*time.Second); err != nil {
-				r.err = err
-				pinged <- r
-				return
-			}
-			r.lat = append(r.lat, time.Since(t0))
-			time.Sleep(2 * time.Millisecond)
-		}
-	}()
-
-	_ = slow.c.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = slow.c.SetDeadline(time.Now().Add(30 * time.Second))
 	if _, err := slow.c.Write([]byte("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatalf("send /slow: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond)
+	gate.waitEntered(t)
 	trigger(slow)
+
+	// The verdict: with the handler gated, the worker must still serve the
+	// co-located conn. It has been handed the trigger's completion by the
+	// first request or the next: every later one went through the same loop.
+	lat, perr := pingFast704(fast, stallPings704)
+	worst, p50 := stallStats704(lat)
+	gate.open()
 
 	var body []byte
 	var rerr, eofErr error
@@ -581,32 +753,24 @@ func runStall704(t *testing.T, name string, trigger func(*stallConn704), expectR
 		}
 		_, eofErr = slow.br.ReadByte() // the close follows the response
 	} else {
-		time.Sleep(stallSlow704)
+		select {
+		case <-gate.returned:
+		case <-time.After(stallDeadline704):
+			t.Errorf("the /slow handler did not return after the gate opened")
+		}
 	}
-	time.Sleep(50 * time.Millisecond)
-	close(stop)
-	r := <-pinged
+	t.Logf("celeris704 STALL trigger=%s worker=%s workers=%d pings=%d/%d max_ms=%.1f p50_ms=%.2f budget_ms=%d fast_err=%v slow_body=%q slow_eof=%v",
+		name, strings.TrimPrefix(worker, "w="), e.NumWorkers(), len(lat), stallPings704, float64(worst)/1e6,
+		float64(p50)/1e6, stallBudget704.Milliseconds(), perr, body, eofErr)
 
-	var worst time.Duration
-	for _, d := range r.lat {
-		worst = max(worst, d)
+	if perr != nil {
+		t.Errorf("celeris#704: after %d of %d fast requests, one on the same worker (%s) did not complete within %v "+
+			"while the /slow handler was gated on another conn of that worker: the worker was parked on that conn's "+
+			"detachMu: %v", len(lat), stallPings704, worker, stallDeadline704, perr)
 	}
-	sorted := slices.Clone(r.lat)
-	slices.Sort(sorted)
-	var p50 time.Duration
-	if len(sorted) > 0 {
-		p50 = sorted[len(sorted)/2]
-	}
-	t.Logf("celeris704 STALL trigger=%s worker=%s workers=%d samples=%d max_ms=%.1f p50_ms=%.2f fast_err=%v slow_body=%q slow_eof=%v",
-		name, strings.TrimPrefix(worker, "w="), e.NumWorkers(), len(r.lat), float64(worst)/1e6, float64(p50)/1e6, r.err, body, eofErr)
-
-	if r.err != nil {
-		t.Errorf("celeris#704: the fast conn on the same worker broke while the slow handler ran: %v", r.err)
-	}
-	if worst > stallBudget704 {
-		t.Errorf("celeris#704: a fast request on worker %s took %v (budget %v) while a %v async handler "+
-			"ran on another conn of the same worker: the worker was parked on that conn's detachMu",
-			worker, worst, stallBudget704, stallSlow704)
+	if stallBudgetStrict704() && worst > stallBudget704 {
+		t.Errorf("celeris#704: a fast request on worker %s took %v (budget %v, CELERIS_STALL_BUDGET=1)",
+			worker, worst, stallBudget704)
 	}
 	if expectResponse {
 		if rerr != nil || string(body) != "slow" {
@@ -619,7 +783,7 @@ func runStall704(t *testing.T, name string, trigger func(*stallConn704), expectR
 }
 
 // TestIouringPeerCloseDuringASlowAsyncHandlerDoesNotStallItsWorker: the client
-// half-closes 50 ms into the handler, as a client that stops waiting does.
+// half-closes once the handler is running, as a client that stops waiting does.
 // The FIN's recv completion reaches the peer-close branch and closeConn.
 func TestIouringPeerCloseDuringASlowAsyncHandlerDoesNotStallItsWorker(t *testing.T) {
 	runStall704(t, "peerclose", func(s *stallConn704) {
@@ -630,7 +794,7 @@ func TestIouringPeerCloseDuringASlowAsyncHandlerDoesNotStallItsWorker(t *testing
 }
 
 // TestIouringPeerResetDuringASlowAsyncHandlerDoesNotStallItsWorker: the client
-// resets 50 ms into the handler. The recv completes with -ECONNRESET, the
+// resets once the handler is running. The recv completes with -ECONNRESET, the
 // recv-error branch.
 func TestIouringPeerResetDuringASlowAsyncHandlerDoesNotStallItsWorker(t *testing.T) {
 	runStall704(t, "reset", func(s *stallConn704) {
