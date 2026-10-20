@@ -34,7 +34,7 @@ func newH2Worker889(t *testing.T) (*Worker, *connState) {
 }
 
 // TestH2SendCapIs64MiB889: an HTTP/2 conn's write hook accepts a frame while
-// the bytes queued before it (writeBuf, sendBuf, bodyBuf) are at most
+// the bytes queued before it (writeBuf, sendBuf) are at most
 // maxSendQueueBytesH2 (64 MiB) and refuses it, recording the refusal, once they
 // are over it.
 func TestH2SendCapIs64MiB889(t *testing.T) {
@@ -84,8 +84,8 @@ func TestH2RefusedWriteClosesTheConn889(t *testing.T) {
 		t.Fatalf("the pass did not close the conn that lost a frame (closing=%v, still registered=%v)", cs.closing, w.conns[fd] == cs)
 	}
 	// The close moves what was staged on to the send side; the refused frame
-	// is in none of the three buffers.
-	if got := len(cs.writeBuf) + len(cs.sendBuf) + len(cs.bodyBuf); got != 64<<20+1 {
+	// is in neither buffer.
+	if got := len(cs.writeBuf) + len(cs.sendBuf); got != 64<<20+1 {
 		t.Errorf("the refused frame reached a send buffer: %d bytes queued, want %d", got, 64<<20+1)
 	}
 }

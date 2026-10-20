@@ -258,7 +258,7 @@ type EngineMetrics struct {
 	// engines.
 	InlineBytes uint64
 	// RingBytes is the cumulative number of payload bytes the io_uring
-	// engine flushed through ring SEND / SEND_ZC / WRITEV completions —
+	// engine flushed through ring SEND / SEND_ZC completions —
 	// the complement of InlineBytes within BytesWritten. Accumulated in a
 	// worker-local counter and published with one atomic per event-loop
 	// iteration, exactly like BytesWritten, because this site IS the
