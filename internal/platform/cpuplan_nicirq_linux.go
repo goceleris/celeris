@@ -67,6 +67,19 @@ func (p CPUPlan) WithNICIRQs(irq NICIRQs) CPUPlan {
 			q.IRQCPUs = append(q.IRQCPUs, v.CPU)
 		}
 	}
+	// The vectors the rx-port rule stepped aside over (busy by its floor of
+	// 1000 interrupts, on a CPU with no loop) count whatever their share: a
+	// wrapped 32-bit counter can take the vector that matters under the share
+	// test while the rule still sees it busy.
+	for _, r := range p.RxFree.NoLoop {
+		if r.CPU < 0 || slices.ContainsFunc(q.IRQVectors, func(v NICVector) bool { return v.IRQ == r.IRQ }) {
+			continue
+		}
+		q.IRQVectors = append(q.IRQVectors, NICVector{IRQ: r.IRQ, CPU: r.CPU, Name: r.Name, Count: r.Count})
+		if !slices.Contains(q.IRQCPUs, r.CPU) {
+			q.IRQCPUs = append(q.IRQCPUs, r.CPU)
+		}
+	}
 	slices.Sort(q.IRQCPUs)
 	for _, c := range q.IRQCPUs {
 		if !slices.Contains(q.Allowed, c) || slices.Contains(q.CPUs, c) {

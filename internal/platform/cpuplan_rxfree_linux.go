@@ -284,12 +284,18 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 	}
 
 	// 4. A busy vector of another port on a CPU with no loop: step aside.
+	var aside []vecInfo
 	for _, v := range otherVecs {
 		if !slices.Contains(big, v.CPU) {
-			return why("IRQ %d (%s) %s, busy since boot, is serviced by CPU %d, which runs no loop: "+
-				"its TX completion has no loop to stay beside and freeing %s's CPUs is not measured there",
-				v.IRQ, v.Name, v.from(), v.CPU, port)
+			aside = append(aside, v)
+			rf.NoLoop = append(rf.NoLoop, v.RxVector)
 		}
+	}
+	if len(aside) > 0 {
+		v := aside[0]
+		return why("IRQ %d (%s) %s, busy since boot, is serviced by CPU %d, which runs no loop: "+
+			"its TX completion has no loop to stay beside and freeing %s's CPUs is not measured there",
+			v.IRQ, v.Name, v.from(), v.CPU, port)
 	}
 	for _, v := range otherVecs {
 		note("kept: IRQ %d (%s) %s on CPU %d is busy and keeps its loop", v.IRQ, v.Name, v.from(), v.CPU)
