@@ -99,7 +99,7 @@ func TestLoopsPinInsideTheAllowedSet909(t *testing.T) {
 	})
 }
 
-// A plan that leaves loops unpinned (a big.LITTLE host's little CPUs) is
+// A plan entry of -1 (the planner plans none since celeris#1036; a test plan can) is
 // honoured: those loops keep the process's mask, report CPU -1, and the engine
 // says why in one line.
 func TestUnpinnedLoopsStayUnpinned909(t *testing.T) {
@@ -114,7 +114,7 @@ func TestUnpinnedLoopsStayUnpinned909(t *testing.T) {
 	base, _ := pintest.StartupMask()
 	a, b := cpus[len(cpus)-1], cpus[len(cpus)-2]
 	old := planWorkerCPUs
-	planWorkerCPUs = func(n int) platform.CPUPlan {
+	planWorkerCPUs = func(n int, _ bool) platform.CPUPlan {
 		return platform.CPUPlan{CPUs: []int{a, -1, b, -1}[:n], Allowed: cpus, Heterogeneous: true,
 			Note: "test plan: two loops left unpinned"}
 	}

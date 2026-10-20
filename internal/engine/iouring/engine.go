@@ -387,20 +387,21 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	resolved := e.cfg.Resources.Resolve()
 
-	// Cap workers to fit RLIMIT_MEMLOCK. Each worker locks ~12 MB for its
-	// ring + buffers; the systemd / kernel default of 8 MB only fits one.
-	// Without this, the engine would error out on the first worker past
-	// the limit with ENOMEM; capping silently lets a default-ulimit cloud
-	// VM keep running on fewer workers (and logs the cap so the operator
-	// can fix the limit if they want full parallelism).
-	if capped := capWorkersToMemlock(resolved.Workers, e.cfg.Logger); capped < resolved.Workers {
-		resolved.Workers = capped
-	}
-
 	// celeris#909: the CPU of worker i is the i-th member of the process's
-	// allowed set, and on a big.LITTLE host never a little CPU.
-	plan := planWorkerCPUs(resolved.Workers)
+	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
+	// the worker count (celeris#1036): on a big.LITTLE host it holds at most
+	// one worker per non-little CPU, fewer than the default GOMAXPROCS, every
+	// one pinned.
+	//
+	// RLIMIT_MEMLOCK bounds the plan, not the request. Each worker locks ~12 MB
+	// for its ring + buffers; the systemd / kernel default of 8 MB only fits
+	// one. Without a cap, the engine would error out on the first worker past
+	// the limit with ENOMEM; capping lets a default-ulimit cloud VM keep
+	// running on fewer workers (and logs the cap, only when it binds, so the
+	// operator can raise the limit if they want full parallelism).
+	plan := planWithinMemlock(resolved.Workers, e.cfg.Resources.Workers > 0, e.cfg.Logger)
 	cpus := plan.CPUs
+	resolved.Workers = len(cpus)
 
 	// Probe for the highest working tier by test-creating a ring.
 	tier := e.tier

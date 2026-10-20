@@ -152,9 +152,12 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	topo := platform.DetectNUMA()
 	// celeris#909: the CPU of loop i is the i-th member of the process's
-	// allowed set, and on a big.LITTLE host never a little CPU.
-	plan := planWorkerCPUs(resolved.Workers)
+	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
+	// the loop count (celeris#1036): on a big.LITTLE host it holds one loop
+	// per non-little CPU, fewer than the default GOMAXPROCS, every one pinned.
+	plan := planWorkerCPUs(resolved.Workers, e.cfg.Resources.Workers > 0)
 	cpus := plan.CPUs
+	resolved.Workers = len(cpus)
 
 	if topo.NumNodes > 1 {
 		resolved.MaxEvents = resolved.MaxEvents / topo.NumNodes
