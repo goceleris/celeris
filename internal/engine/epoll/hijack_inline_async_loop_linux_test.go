@@ -140,6 +140,16 @@ func TestInlineHijackOnAsyncLoop(t *testing.T) {
 			if got := hijacked.Load(); got != n {
 				t.Errorf("hijacked %d connections, want %d", got, n)
 			}
+			// /hj ran inline: no connection was promoted to a dispatch
+			// goroutine. Hijacked connections that served their session
+			// do not show that by themselves: a /hj that started on a
+			// dispatch goroutine would hijack just as well, through the
+			// other branch of hijackConn, and this test would no longer
+			// cover the inline one. Neither subtest requests /async, so
+			// not even the async route promoted a connection.
+			if got := e.Metrics().AsyncPromotedConns; got != 0 {
+				t.Errorf("AsyncPromotedConns = %d, want 0: /hj did not run inline on the event loop", got)
+			}
 		})
 	}
 }
