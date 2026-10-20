@@ -169,14 +169,21 @@ func logIRQUncovered(log *slog.Logger, engine string, plan CPUPlan) {
 	if len(irqs) < total {
 		path += " and the other vectors named above"
 	}
-	hint := fmt.Sprintf("No loop of this server runs on CPU(s) %s, which service(s) the interrupt(s) above, and none was added: "+
-		"the engine does not move or cover interrupts. On one bonded Realtek r8127 arm64 big.LITTLE host a TX-completion "+
-		"interrupt serviced by a CPU without a celeris loop coincided with ~200 ms whole-port TX silences, and moving the "+
-		"interrupt onto a CPU with a loop removed them; that is a measured observation on one host, not a guarantee that this "+
-		"host is affected or that the move helps it. The interrupt is the host's, shared by every process, so the remedy is "+
-		"the operator's. Route 1, as root: echo <one of %s> > %s (lost on reboot unless made "+
-		"persistent). Route 2: keep irqbalance off the CPU(s) (IRQBALANCE_BANNED_CPULIST). See the README, CPU pinning.",
-		FormatCPUs(plan.IRQUncovered), FormatCPUs(loops), path)
+	// The CPUs to offer are the loop CPUs that service no NIC vector: CPU 0 of
+	// msr1 carries IRQ 159, and CPUs 6 and 8 the vectors of the receiving
+	// port, so a vector moved there stacks two busy vectors on one CPU (and
+	// on 6 or 8 the rx-port rule keeps that CPU's loop on the next start,
+	// a plan nobody measured).
+	free := slices.DeleteFunc(slices.Clone(loops), func(c int) bool { return slices.Contains(plan.IRQCPUs, c) })
+	action := "Moving it needs a loop CPU that services no NIC vector, and every loop CPU services a NIC vector."
+	if len(free) > 0 {
+		action = fmt.Sprintf("If you move it, as root: echo <one of %s> > %s (a loop CPU that services no NIC vector).",
+			FormatCPUs(free), path)
+	}
+	hint := fmt.Sprintf("No loop of this server runs on CPU(s) %s, which service(s) the interrupt(s) above, and none was added; "+
+		"the interrupt is the host's. %s One observation on one host, not a guarantee; "+
+		"see the README, \"NIC interrupts on big.LITTLE hosts\".",
+		FormatCPUs(plan.IRQUncovered), action)
 	log.Warn(engine+": NIC interrupt vectors are serviced by CPUs that run no loop",
 		"cpus", FormatCPUs(plan.IRQUncovered), "detail", strings.Join(parts, "; "),
 		"loop_cpus", FormatCPUs(loops), "allowed", FormatCPUs(plan.Allowed), "hint", hint)

@@ -270,15 +270,15 @@ func TestReportBalancedBond(t *testing.T) {
 	}
 }
 
-// The Warn names the loops the operator can move the interrupt to, once each,
-// ascending: Workers above the big CPUs wraps the loops over them (0, 1, 6, 7,
-// 8, 9, 10, 11, 0, 1, 6, 7).
+// The Warn names the loop CPUs once each, ascending, and offers the ones that
+// service no NIC vector: Workers above the big CPUs wraps the loops over them
+// (0, 1, 6, 7, 8, 9, 10, 11, 0, 1, 6, 7); CPUs 0, 6 and 8 carry vectors.
 func TestReportNamesEachLoopCPUOnce(t *testing.T) {
 	_, got := reported(t, msr1NIC(t), 12, true, rng(0, 11), bondAddr)
 	eq(t, "loops", got.CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1, 6, 7})
 	warns := warnLines(logLines(got))
-	if len(warns) != 1 || !strings.Contains(warns[0], "loop_cpus=0-1,6-11 ") || !strings.Contains(warns[0], "one of 0-1,6-11>") {
-		t.Errorf("the Warn does not name 0-1,6-11 once:\n%s", strings.Join(warns, "\n"))
+	if len(warns) != 1 || !strings.Contains(warns[0], "loop_cpus=0-1,6-11 ") || !strings.Contains(warns[0], "one of 1,7,9-11>") {
+		t.Errorf("the Warn does not name the loops 0-1,6-11 once and offer 1,7,9-11:\n%s", strings.Join(warns, "\n"))
 	}
 }
 
