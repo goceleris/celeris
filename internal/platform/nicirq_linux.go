@@ -11,8 +11,9 @@ import (
 
 // NIC interrupt report (celeris#1036 item 1). On the one big.LITTLE host it was
 // seen on, a bonded port whose TX-completion interrupt was serviced by a CPU
-// that ran no engine loop coincided with ~200 ms whole-port TX silences. The
-// report only logs (a Warn); it never changes the loops.
+// that ran no engine loop was seen with ~200 ms whole-port TX silences, which
+// were not seen after the interrupt was moved (one observation). The report
+// only logs (a Warn); it never changes the loops.
 //
 // DetectNICIRQs answers "which CPUs service the interrupts of the NICs this
 // listener's traffic crosses", once, when the engine has started its loops. It
@@ -76,7 +77,7 @@ type NICIRQs struct {
 	// order per device.
 	Vectors []NICVector
 	// Unknown counts the vectors whose servicing CPU could not be told (a
-	// multi-CPU mask and no dominant CPU, or no readable file).
+	// multi-CPU mask or no readable file).
 	Unknown int
 	// Idle counts the vectors left out because /proc/interrupts shows no
 	// interrupt for them (absent or all zero): a vector that never fires cannot
@@ -163,7 +164,10 @@ type NICSkip struct {
 //     vector that carries the traffic wraps (IRQ 167 on msr1 is at about 2.6e9
 //     of 4.29e9, far from it) it reads small, can fall under 5% and is not
 //     warned about, silently (the Info line counts it in nic_irq_skipped and a
-//     Debug line names it).
+//     Debug line names it). The exception: a vector the rx-port rule stepped
+//     aside over (RxFree.NoLoop, its floor of 1000 is its test) is warned about
+//     whatever its share, by [CPUPlan.WithNICIRQs]; where the rule does not run,
+//     or under 1000, it stays unwarned.
 //   - Counter wrap, a busy vector on a big CPU (can Warn about a vector that
 //     does not matter): the denominator shrinks and can lift another vector's
 //     share over 5%. With a big-CPU vector at 50,000 after the wrap and a

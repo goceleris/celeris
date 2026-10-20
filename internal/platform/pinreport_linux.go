@@ -51,8 +51,10 @@ func (f *PinFailures) Take(key any) (PinFailure, bool) {
 // On a heterogeneous host whose plan carries a NIC interrupt report
 // ([AnnotatePlanWithNICIRQs]) it also names the CPUs that service a NIC
 // interrupt vector (the Info line) and, in one Warn line, those of them in the
-// allowed set that run no loop and that the rx-port rule did not leave without
-// one on purpose (celeris#1036). The Info line carries the number of vectors
+// allowed set that run no loop, that the rx-port rule did not leave without
+// one on purpose, and that are a little CPU or a big one while no vector has a
+// loop beside it (celeris#1036); the identical Warn is logged once per logger,
+// address and set of CPUs, the repeat is a Debug line. The Info line carries the number of vectors
 // judged not to carry traffic (nic_irq_skipped: the ones that never fired and
 // the ones under the floor or the share, together) and a Debug line names the
 // ones that took a few interrupts. It logs nothing otherwise, and changes
