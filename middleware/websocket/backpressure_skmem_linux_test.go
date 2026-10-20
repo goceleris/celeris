@@ -143,18 +143,18 @@ func wsoTCPMemString(sockstat, tcpMem string) string {
 		line, lim[0], lim[1], lim[2], mem, state)
 }
 
-// wsoTcpExtPrune are the TcpExt counters that say a socket queue was pruned,
+// wsoTCPExtPrune are the TcpExt counters that say a socket queue was pruned,
 // collapsed or dropped under memory pressure, or a window was driven to zero.
-var wsoTcpExtPrune = map[string]bool{
+var wsoTCPExtPrune = map[string]bool{
 	"PruneCalled": true, "RcvPruned": true, "OfoPruned": true, "TCPMemoryPressures": true,
 	"TCPMemoryPressuresChrono": true, "TCPRcvQDrop": true, "TCPRcvCollapsed": true,
 	"TCPZeroWindowDrop": true, "TCPToZeroWindowAdv": true, "TCPFromZeroWindowAdv": true,
 	"TCPWantZeroWindowAdv": true, "TCPBacklogDrop": true,
 }
 
-// wsoTcpExtString picks wsoTcpExtPrune out of /proc/net/netstat (a header
+// wsoTCPExtString picks wsoTCPExtPrune out of /proc/net/netstat (a header
 // line of names then a line of values for each of TcpExt and IpExt).
-func wsoTcpExtString(netstat string) string {
+func wsoTCPExtString(netstat string) string {
 	lines := strings.Split(netstat, "\n")
 	var out []string
 	for i := 0; i+1 < len(lines); i++ {
@@ -163,7 +163,7 @@ func wsoTcpExtString(netstat string) string {
 		}
 		names, vals := strings.Fields(lines[i]), strings.Fields(lines[i+1])
 		for j := 1; j < len(names) && j < len(vals); j++ {
-			if wsoTcpExtPrune[names[j]] {
+			if wsoTCPExtPrune[names[j]] {
 				out = append(out, names[j]+"="+vals[j])
 			}
 		}
@@ -187,5 +187,5 @@ func wsoReadProc(path string) string {
 // tcp_mem, and the prune and drop counters.
 func wsoKernelMem() string {
 	return wsoTCPMemString(wsoReadProc("/proc/net/sockstat"), wsoReadProc("/proc/sys/net/ipv4/tcp_mem")) +
-		" " + wsoTcpExtString(wsoReadProc("/proc/net/netstat"))
+		" " + wsoTCPExtString(wsoReadProc("/proc/net/netstat"))
 }

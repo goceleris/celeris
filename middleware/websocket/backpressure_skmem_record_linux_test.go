@@ -107,7 +107,7 @@ func TestWSOTCPMemRendering(t *testing.T) {
 	}
 	const netstat = "TcpExt: SyncookiesSent PruneCalled RcvPruned OfoPruned TCPMemoryPressures TCPRcvQDrop Other\n" +
 		"TcpExt: 0 11 22 33 44 55 66\nIpExt: InNoRoutes\nIpExt: 9\n"
-	got := wsoTcpExtString(netstat)
+	got := wsoTCPExtString(netstat)
 	for _, w := range []string{"PruneCalled=11", "RcvPruned=22", "OfoPruned=33", "TCPMemoryPressures=44", "TCPRcvQDrop=55"} {
 		if !strings.Contains(got, w) {
 			t.Errorf("tcpext %q lacks %q", got, w)
@@ -116,7 +116,7 @@ func TestWSOTCPMemRendering(t *testing.T) {
 	if strings.Contains(got, "Other") || strings.Contains(got, "SyncookiesSent") {
 		t.Errorf("tcpext %q holds a counter that is not a prune or drop one", got)
 	}
-	if got := wsoTcpExtString("nothing"); got != "tcpext{unavailable}" {
+	if got := wsoTCPExtString("nothing"); got != "tcpext{unavailable}" {
 		t.Errorf("no netstat: %q", got)
 	}
 }
