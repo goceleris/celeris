@@ -139,7 +139,7 @@ func logIRQUncovered(log *slog.Logger, engine string, plan CPUPlan) {
 	for _, cpu := range plan.IRQUncovered {
 		var names []string
 		for _, v := range plan.IRQVectors {
-			if v.CPU != cpu {
+			if v.CPU != cpu || plan.freedOnPurpose(v) {
 				continue
 			}
 			total++
@@ -150,7 +150,7 @@ func logIRQUncovered(log *slog.Logger, engine string, plan CPUPlan) {
 				names = append(names, fmt.Sprintf("%s (IRQ %d)", v.Name, v.IRQ))
 			}
 		}
-		if n := countVectorsOn(plan.IRQVectors, cpu); n > len(names) {
+		if n := countVectorsOn(plan, cpu); n > len(names) {
 			names = append(names, fmt.Sprintf("%d more", n-len(names)))
 		}
 		parts = append(parts, fmt.Sprintf("CPU %d: %s", cpu, strings.Join(names, ", ")))
@@ -182,10 +182,12 @@ func logIRQUncovered(log *slog.Logger, engine string, plan CPUPlan) {
 		"loop_cpus", FormatCPUs(loops), "allowed", FormatCPUs(plan.Allowed), "hint", hint)
 }
 
-func countVectorsOn(vs []NICVector, cpu int) int {
+// countVectorsOn counts the vectors of the report on cpu that the Warn
+// names: not the ones the rx-port rule left there on purpose.
+func countVectorsOn(plan CPUPlan, cpu int) int {
 	n := 0
-	for _, v := range vs {
-		if v.CPU == cpu {
+	for _, v := range plan.IRQVectors {
+		if v.CPU == cpu && !plan.freedOnPurpose(v) {
 			n++
 		}
 	}
