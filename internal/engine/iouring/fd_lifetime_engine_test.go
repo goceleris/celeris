@@ -559,7 +559,8 @@ func TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen(t *testing.T) {
 // provided-buffer ring (CELERIS_IOURING_MULTISHOT_RECV=1 on a tier that
 // registers one), which the caller's premise does not hold under: why says
 // what is unreachable there. A test that would pass or fail for the wrong
-// reason on that model says so instead (celeris#890 item 77). An engine that
+// reason on that model says so instead (celeris#890 item 79, "With memlock unlimited and
+// CELERIS_IOURING_MULTISHOT_RECV=1 ..."). An engine that
 // reports no workers is a failure, not a skip: the check would never run.
 func skipIfProvidedBuffers(t *testing.T, e *Engine, why string) {
 	t.Helper()
