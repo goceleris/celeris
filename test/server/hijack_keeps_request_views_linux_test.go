@@ -174,7 +174,8 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 				// B: a new connection on A's worker, served while A's handler
 				// keeps its strings. Its Authorization value covers the
 				// offsets A's strings view.
-				// Logged only on failure: names the round (and the worker) so the
+				// Names the round (and the worker) in the test's log (go test
+				// prints it with -v, and with a failure's output), so the
 				// engine's AcceptCount and CloseCount in a c936 report map to it.
 				t.Logf("round %d: dialing worker %d", i, h.worker)
 				b, br := c733DialWorker(t, srv, addr, h.worker, c733Secret)
