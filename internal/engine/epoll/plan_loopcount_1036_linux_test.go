@@ -40,34 +40,55 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 		workers      int // Resources.Workers; 0 = the default
 		planLen      int
 		wantExplicit bool
+		rxFree       bool // the plan carries what the rx-port rule decided
 	}{
-		{"user-set 6, plan holds 3", 6, 3, true},
-		{"default, plan holds 2", 0, 2, false},
+		{"user-set 6, plan holds 3", 6, 3, true, false},
+		{"default, plan holds 2", 0, 2, false, false},
+		// The rx-port rule (celeris#1036 item 1) shortens the default plan by
+		// the CPUs it frees: the engine starts the plan's loops, whatever the
+		// reason it is short, and says what the rule did on its Info line.
+		{"default, the rx-port rule freed two CPUs", 0, 2, false, true},
 	} {
 		func() {
 			old := planWorkerCPUs
 			defer func() { planWorkerCPUs = old }()
 			var gotN int
 			var gotExplicit bool
+			var gotAddr string
 			var want []int
 			// The default is GOMAXPROCS (two at least): on a small runner the
 			// plan holds one fewer than it is asked for.
 			planLen := tc.planLen
-			planWorkerCPUs = func(n int, explicit bool) platform.CPUPlan {
-				gotN, gotExplicit = n, explicit
+			planWorkerCPUs = func(n int, explicit bool, addr string) platform.CPUPlan {
+				gotN, gotExplicit, gotAddr = n, explicit, addr
 				planLen = max(min(tc.planLen, n-1), 1)
 				want = make([]int, planLen)
 				for i := range want {
 					want[i] = cpus[i%len(cpus)]
 				}
-				return platform.CPUPlan{CPUs: append([]int(nil), want...), Allowed: cpus, Requested: n,
+				p := platform.CPUPlan{CPUs: append([]int(nil), want...), Allowed: cpus, Requested: n,
 					Heterogeneous: true, Note: "test plan: fewer loops than asked for"}
+				if tc.rxFree {
+					p.RxFree = platform.RxFree{Port: "enp49s0", SharePercent: 73, Freed: []int{6, 8}}
+				}
+				return p
 			}
 			var log lockedBuf
 			eng, stop := start909(t, tc.workers, &log)
 			defer stop()
 			if gotExplicit != tc.wantExplicit {
 				t.Errorf("%s: the engine told the planner explicit=%v, want %v", tc.name, gotExplicit, tc.wantExplicit)
+			}
+			// The planner is given the concrete address the engine binds.
+			if gotAddr != eng.Addr().String() {
+				t.Errorf("%s: the planner was given the address %q, the engine listens on %q", tc.name, gotAddr, eng.Addr())
+			}
+			if tc.rxFree {
+				for _, w := range []string{"freed_cpus=6,8", "rx_port=enp49s0", "rx_share_pct=73"} {
+					if !strings.Contains(log.String(), w) {
+						t.Errorf("%s: the plan's Info line lacks %q:\n%s", tc.name, w, log.String())
+					}
+				}
 			}
 			if tc.workers > 0 && gotN != tc.workers {
 				t.Errorf("%s: the planner was asked for %d workers, want %d", tc.name, gotN, tc.workers)
@@ -133,7 +154,7 @@ func TestEpollServesOnOneLoop1036(t *testing.T) {
 	}
 	old := planWorkerCPUs
 	defer func() { planWorkerCPUs = old }()
-	planWorkerCPUs = func(n int, explicit bool) platform.CPUPlan {
+	planWorkerCPUs = func(n int, explicit bool, _ string) platform.CPUPlan {
 		return platform.CPUPlan{CPUs: []int{cpus[len(cpus)-1]}, Allowed: cpus, Requested: n,
 			Heterogeneous: true, Note: "test plan: one non-little CPU"}
 	}

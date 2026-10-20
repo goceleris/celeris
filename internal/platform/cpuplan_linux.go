@@ -44,6 +44,9 @@ type CPUPlan struct {
 	// "i-th allowed CPU" rule, for the engine to log once. Empty for a
 	// homogeneous host.
 	Note string
+	// RxFree is what the rx-port rule decided (celeris#1036 item 1). Its
+	// Freed list is empty unless the rule took CPUs out of the loop set.
+	RxFree RxFree
 }
 
 // Pinned returns how many workers of the plan are pinned.
@@ -104,12 +107,31 @@ func (p CPUPlan) Truncate(n int, why string) CPUPlan {
 //
 // Any read error means "homogeneous"; the plan then is what a host without
 // the information gets.
+//
+// PlanWorkerCPUs does not know where the server listens and so never applies
+// the rx-port rule; the engines call [PlanWorkerCPUsFor].
 func PlanWorkerCPUs(numWorkers int, explicit bool) CPUPlan {
+	return PlanWorkerCPUsFor(numWorkers, explicit, "")
+}
+
+// PlanWorkerCPUsFor is [PlanWorkerCPUs] for a listener bound to addr
+// ("host:port", the concrete address the engine binds). On a big.LITTLE host,
+// with Workers not set by the user, it also leaves the loops off the big CPUs
+// that service the interrupt vectors of the NIC port that receives the
+// traffic (see [RxFree] and cpuplan_rxfree_linux.go): the loop count is never
+// raised, and every failure to read the machine gives exactly the plan
+// PlanWorkerCPUs makes. An empty addr applies no rule. A homogeneous host and
+// an explicit Workers read nothing beyond what PlanWorkerCPUs reads.
+func PlanWorkerCPUsFor(numWorkers int, explicit bool, addr string) CPUPlan {
 	src := planSource{
 		allowed:  schedAllowedCPUs,
 		cpuDir:   "/sys/devices/system/cpu",
 		cpuinfo:  "/proc/cpuinfo",
 		nodeCPUs: nil,
+	}
+	if addr != "" {
+		nic := defaultNICSource()
+		src.nic, src.addr = &nic, addr
 	}
 	if n := DetectNUMA().NumNodes; n > 1 {
 		src.nodeCPUs = readNodeCPUs(n)
@@ -124,6 +146,10 @@ type planSource struct {
 	cpuDir   string                // /sys/devices/system/cpu
 	cpuinfo  string                // /proc/cpuinfo
 	nodeCPUs [][]int               // per NUMA node CPU lists; nil for one node
+	// nic and addr feed the rx-port rule; a nil nic or an empty addr turns it
+	// off.
+	nic  *nicSource
+	addr string
 }
 
 // schedAllowedCPUs returns the members of the calling thread's CPU mask, read
@@ -189,28 +215,45 @@ func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 	// with two loops takes twice the connections of one with one). The big CPUs
 	// are spread like any allowed set (NUMA nodes in turn, wrapping only after
 	// every CPU holds a loop).
-	loops := min(numWorkers, len(big))
+	//
+	// The rx-port rule (celeris#1036 item 1) may take CPUs out of the set the
+	// loops are drawn from, for the default count only: an explicit
+	// Config.Workers is planned as #1049 plans it, and the count is never
+	// raised.
+	cands := big
+	if !explicit && numWorkers > 0 && src.nic != nil && src.addr != "" {
+		plan.RxFree = rxFreeFor(numWorkers, src.addr, big, *src.nic)
+		if len(plan.RxFree.Freed) > 0 {
+			cands = slices.DeleteFunc(slices.Clone(big), func(c int) bool {
+				return slices.Contains(plan.RxFree.Freed, c)
+			})
+		}
+	}
+	loops := min(numWorkers, len(cands))
 	if explicit {
 		loops = numWorkers
 	}
-	plan.CPUs = spread(loops, big, src.nodeCPUs)
+	plan.CPUs = spread(loops, cands, src.nodeCPUs)
 	switch {
-	case loops > len(big):
+	case loops > len(cands):
 		plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
 			"%d loops (Config.Workers) pinned round-robin over the %d other allowed CPUs %s, "+
 			"so some CPUs hold more than one loop, none unpinned",
-			capNote, FormatCPUs(little), loops, len(big), FormatCPUs(big))
+			capNote, FormatCPUs(little), loops, len(cands), FormatCPUs(cands))
 	case loops < numWorkers:
 		plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
 			"%d loops, one per other allowed CPU %s, none unpinned (not the %d a host of alike CPUs "+
 			"would start: the rest would have to run on the little CPUs or float onto them)",
-			capNote, FormatCPUs(little), loops, FormatCPUs(big), numWorkers)
+			capNote, FormatCPUs(little), loops, FormatCPUs(cands), numWorkers)
 	default:
 		// The CPUs the loops use, not the whole set they were drawn from:
 		// 5 loops use 5 of 8 non-little CPUs.
 		plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
 			"%d loops pinned to the CPUs %s of the other allowed CPUs %s, none unpinned",
-			capNote, FormatCPUs(little), loops, FormatCPUs(plan.CPUs), FormatCPUs(big))
+			capNote, FormatCPUs(little), loops, FormatCPUs(plan.CPUs), FormatCPUs(cands))
+	}
+	if f := plan.RxFree; len(f.Freed) > 0 {
+		plan.Note += "; " + f.Sentence()
 	}
 	return plan
 }

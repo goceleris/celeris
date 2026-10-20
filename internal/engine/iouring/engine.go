@@ -399,7 +399,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// the limit with ENOMEM; capping lets a default-ulimit cloud VM keep
 	// running on fewer workers (and logs the cap, only when it binds, so the
 	// operator can raise the limit if they want full parallelism).
-	plan := planWithinMemlock(resolved.Workers, e.cfg.Resources.Workers > 0, e.cfg.Logger)
+	plan := planWithinMemlock(resolved.Workers, e.cfg.Resources.Workers > 0, e.cfg.Addr, e.cfg.Logger)
 	cpus := plan.CPUs
 	resolved.Workers = len(cpus)
 

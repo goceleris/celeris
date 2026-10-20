@@ -114,7 +114,7 @@ func TestUnpinnedLoopsStayUnpinned909(t *testing.T) {
 	base, _ := pintest.StartupMask()
 	a, b := cpus[len(cpus)-1], cpus[len(cpus)-2]
 	old := planWorkerCPUs
-	planWorkerCPUs = func(n int, _ bool) platform.CPUPlan {
+	planWorkerCPUs = func(n int, _ bool, _ string) platform.CPUPlan {
 		return platform.CPUPlan{CPUs: []int{a, -1, b, -1}[:n], Allowed: cpus, Heterogeneous: true,
 			Note: "test plan: two loops left unpinned"}
 	}
