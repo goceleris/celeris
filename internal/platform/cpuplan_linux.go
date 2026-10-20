@@ -129,6 +129,11 @@ func PlanWorkerCPUsFor(numWorkers int, explicit bool, addr string) CPUPlan {
 		cpuinfo:  "/proc/cpuinfo",
 		nodeCPUs: nil,
 	}
+	// EXPERIMENT-ONLY knob (abplan_experiment.go): a no-op unless CELERIS_AB_PLAN_CPUS is set.
+	// When it is set the plan is forced, so planWorkerCPUs does not consult the rx-port rule
+	// (the knob's plan line then reads exactly as on the commits without the rule).
+	knob := os.Getenv(ABPlanCPUsEnv)
+	src.knob = knob
 	if addr != "" {
 		nic := defaultNICSource()
 		src.nic, src.addr = &nic, addr
@@ -136,7 +141,7 @@ func PlanWorkerCPUsFor(numWorkers int, explicit bool, addr string) CPUPlan {
 	if n := DetectNUMA().NumNodes; n > 1 {
 		src.nodeCPUs = readNodeCPUs(n)
 	}
-	return planWorkerCPUs(numWorkers, explicit, src)
+	return applyABPlanKnob(planWorkerCPUs(numWorkers, explicit, src), knob)
 }
 
 // planSource is where planWorkerCPUs reads the machine from; the tests point
@@ -150,6 +155,9 @@ type planSource struct {
 	// off.
 	nic  *nicSource
 	addr string
+	// knob is the value of the EXPERIMENT-ONLY CELERIS_AB_PLAN_CPUS (abplan_experiment.go);
+	// non-empty, it turns the rx-port rule off because the plan is forced.
+	knob string
 }
 
 // schedAllowedCPUs returns the members of the calling thread's CPU mask, read
@@ -221,7 +229,7 @@ func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 	// Config.Workers is planned as #1049 plans it, and the count is never
 	// raised.
 	cands := big
-	if !explicit && numWorkers > 0 && src.nic != nil && src.addr != "" {
+	if !explicit && numWorkers > 0 && src.nic != nil && src.addr != "" && strings.TrimSpace(src.knob) == "" {
 		plan.RxFree = rxFreeFor(numWorkers, src.addr, big, *src.nic)
 		if len(plan.RxFree.Freed) > 0 {
 			cands = slices.DeleteFunc(slices.Clone(big), func(c int) bool {
