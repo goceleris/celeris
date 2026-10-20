@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -28,7 +27,9 @@ import (
 // than from timing:
 //
 //   - LATE: the response arrived after c936StallAfter but inside the deadline.
-//     The runner was slow; the request was not lost. Logged, not failed.
+//     Logged, not failed. It does not say the request was only slow: the 5 s
+//     snapshot opens fresh conns on both workers while the request waits, and
+//     a stall that new activity on a loop heals would read the same.
 //   - Unanswered: the report names the server-side socket of the 4-tuple from
 //     /proc/net/tcp (state, rx_queue, inode), the process descriptor that
 //     holds it, and every epoll set it is registered in with its event mask
@@ -37,7 +38,11 @@ import (
 //     worker that answers the probes is a lost wakeup or a lost read in the
 //     engine, whatever the runner's load: no amount of starvation leaves a
 //     readable registered socket unread for 60 s while its worker serves
-//     other conns.
+//     other conns. rx_queue 0 and tx_queue 0 say the request was read and that
+//     no response bytes reached this socket; a response produced and left in
+//     the engine's user-space write queue or dirty list never shows in the
+//     kernel's account, so the report cannot tell "no response produced" from
+//     "produced, never flushed".
 
 // c936StallAfter is when a request that has not been answered is first
 // examined. It does not shorten the conn deadline; it only takes the
@@ -54,37 +59,38 @@ const c936MidAfter = 30 * time.Second
 // c936Look is one snapshot scheduled for later: finish stops it, or waits for
 // it when it has already started, and returns its text ("" when it never ran).
 type c936Look struct {
-	mu   sync.Mutex
 	text string
+	done chan struct{}
 	t    *time.Timer
 }
 
 func c936Watch(after time.Duration, take func() string) *c936Look {
-	l := &c936Look{}
+	l := &c936Look{done: make(chan struct{})}
 	l.t = time.AfterFunc(after, func() {
-		r := take()
-		l.mu.Lock()
-		l.text = r
-		l.mu.Unlock()
+		defer close(l.done)
+		l.text = take()
 	})
 	return l
 }
 
 func (l *c936Look) finish() string {
-	if !l.t.Stop() {
-		// The snapshot ran (or is running): wait for it, it holds no lock the
-		// request path needs.
-		for {
-			l.mu.Lock()
-			r := l.text
-			l.mu.Unlock()
-			if r != "" {
-				return r
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
+	if l.t.Stop() {
+		return ""
 	}
-	return ""
+	// The snapshot ran (or is running): wait for it, it holds no lock the
+	// request path needs. done is closed after text is written.
+	<-l.done
+	return l.text
+}
+
+// c936Cause labels why a request ended without a response: the deadline label
+// only when the deadline is what ended it, so an immediate EOF or reset is not
+// reported as a stall.
+func c936Cause(err error, path string, after time.Duration) string {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Sprintf("GET %s unanswered at the %s deadline", path, after)
+	}
+	return fmt.Sprintf("GET %s failed (%v)", path, err)
 }
 
 // c936Get is c733Get with the celeris#936 witness. srv may be nil (no engine
@@ -103,7 +109,7 @@ func c936Get(t *testing.T, srv *celeris.Server, addr string, conn net.Conn, br *
 	r, m := first.finish(), mid.finish()
 	if err == nil {
 		if r != "" {
-			t.Logf("C936 LATE %s answered after %s (runner stall, the request was not lost); snapshot taken at %s:\n%s", path, elapsed, c936StallAfter, r)
+			t.Logf("C936 LATE %s answered after %s, with the probes of the %s snapshot in between (so a stall that new activity heals reads the same); snapshot:\n%s", path, elapsed, c936StallAfter, r)
 		}
 		return body, nil
 	}
@@ -203,7 +209,7 @@ func c936SocketReport(conn net.Conn) string {
 			if rxq > 0 {
 				b.WriteString("C936 verdict-hint: request bytes sit unread on a registered descriptor: the engine did not read them (lost wakeup or lost read)\n")
 			} else {
-				b.WriteString("C936 verdict-hint: the engine read the request (rx_queue=0) and wrote no response\n")
+				b.WriteString("C936 verdict-hint: the engine read the request (rx_queue=0) and no response bytes reached this socket (tx_queue=0; a response held in the engine's user-space queue or dirty list is not observable from here)\n")
 			}
 		}
 	}

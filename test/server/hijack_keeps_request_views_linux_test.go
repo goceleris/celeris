@@ -56,7 +56,7 @@ func c733DialWorker(t *testing.T, srv *celeris.Server, addr string, want int, au
 		br := bufio.NewReader(conn)
 		body, err := c936Get(t, srv, addr, conn, br, "/w", auth)
 		if err != nil {
-			t.Fatalf("GET /w (dial %d): %v", try, err)
+			t.Fatalf("GET /w (dial %d, want worker %d): %v", try, want, err)
 		}
 		if got, _ := strconv.Atoi(body); got == want || want < 0 {
 			return conn, br
@@ -174,6 +174,9 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 				// B: a new connection on A's worker, served while A's handler
 				// keeps its strings. Its Authorization value covers the
 				// offsets A's strings view.
+				// Logged only on failure: names the round (and the worker) so the
+				// engine's AcceptCount and CloseCount in a c936 report map to it.
+				t.Logf("round %d: dialing worker %d", i, h.worker)
 				b, br := c733DialWorker(t, srv, addr, h.worker, c733Secret)
 				if _, err := c936Get(t, srv, addr, b, br, "/w", c733Secret); err != nil {
 					t.Fatalf("round %d: B: %v", i, err)

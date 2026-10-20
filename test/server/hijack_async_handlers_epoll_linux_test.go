@@ -4,10 +4,12 @@ package celeris_test
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
@@ -57,7 +59,9 @@ func TestHijackWithAsyncHandlersOnEpoll(t *testing.T) {
 		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
 		if err != nil {
 			// celeris#936: say from the kernel's side where the request is.
-			return "", fmt.Errorf("%w\n%s", err, c936Report(srv, addr, c, "GET "+path+" unanswered at the 5 s deadline", true))
+			// Only a deadline gets the probes (about 30 s of fresh conns); an
+			// immediate EOF or reset gets the socket's account alone.
+			return "", fmt.Errorf("%w\n%s", err, c936Report(srv, addr, c, c936Cause(err, path, 5*time.Second), errors.Is(err, os.ErrDeadlineExceeded)))
 		}
 		b, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
