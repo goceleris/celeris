@@ -137,23 +137,24 @@ type Config struct {
 	// [Server.EngineInfo] (on the adaptive engine, the sum over its two
 	// engines), and the engine logs one line saying how many it started and
 	// why. [Config.MaxConns] is per loop, so the server-wide limit follows the
-	// count. Measured on one big.LITTLE host (arm64, 8 big and 4 little CPUs;
-	// one run, 35 s windows, 3 repetitions per cell): against the previous
-	// behaviour the default served 1.14 times the requests per second at
-	// io_uring with 256 connections (1.79 times at 128 connections, 1.22 at
-	// 512, 2.26 for epoll with 4 KiB POST bodies), and 0.93 times those of the
-	// behaviour before celeris#973 at 256 connections (that one pins all 12
-	// loops, 4 of them on the little CPUs: its tail was clean there, but it
-	// gives up #973's protection against the little-CPU stalls of celeris#945
-	// and #1028). The tail is not cleared: at io_uring with 256 connections
-	// 0.12% to 0.17% of requests took 200 to 230 ms (p999 about 205 ms), a
-	// mode the previous behaviour shows at a lower share (0.03% to 0.09%) and
-	// the behaviour before #973 did not; the cause is not established
-	// (celeris#892). A Workers above the non-little CPU count is wrapped over
-	// the pinned big CPUs and showed a worse tail than the default at io_uring
-	// with 512 connections in one run (0.10% to 0.20% of requests at about
-	// 208 ms and maxima of 2.1 to 2.2 s in two of three cells, against 0.01%
-	// to 0.02% and 0.6 to 1.1 s for the default).
+	// count. Measured on one big.LITTLE host (arm64, 8 big and 4 little CPUs,
+	// the NIC interrupt pinned to a big CPU; one dispatch, 35 s windows, 5
+	// repetitions per cell, 90 s at 512 connections), against celeris v1.5.11
+	// (all 12 loops pinned, 4 of them on the little CPUs): 1.43 times the
+	// requests per second at io_uring with 256 connections, 1.09 times at
+	// adaptive with 128 connections, 1.51 times at io_uring with 512
+	// connections, 1.04 times for epoll with 4 KiB POST bodies, and 0.95
+	// times for epoll with 512 connections. The behaviour before this change
+	// (4 floating loops) served those POST bodies at 0.47 times v1.5.11 in an
+	// earlier run. The tail costs something: for epoll with 4 KiB POST bodies
+	// the median p99.99 was 99 ms against 48 ms for v1.5.11, and at io_uring
+	// with 512 connections 61 requests took 1 s or more (longest 1.7 s)
+	// against 664 for v1.5.11 (longest 14.1 s). A Workers above the
+	// non-little CPU count is wrapped over the pinned big CPUs; it ran once, in
+	// an earlier run (35 s windows, 3 repetitions), and showed a worse tail
+	// than the default at io_uring with 512 connections (0.10% to 0.20% of
+	// requests at about 208 ms, maxima of 2.1 to 2.2 s in two of three cells,
+	// against 0.01% to 0.02% and 0.6 to 1.1 s for the default).
 	// Hosts whose CPUs are alike are unchanged (README, "CPU pinning").
 	Workers int
 
