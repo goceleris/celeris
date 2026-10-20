@@ -97,6 +97,7 @@ func TestReportRealMSR1BootPlacementWarnsForCPU4(t *testing.T) {
 	eq(t, "workers", len(got.CPUs), 8)
 	eq(t, "serviced", got.IRQCPUs, []int{0, 4, 6, 8})
 	eq(t, "uncovered", got.IRQUncovered, []int{4})
+	eq(t, "the report remembers its address (the Warn is logged once per address)", got.IRQAddr, clusterAddr)
 	noIRQ156(t, got)
 
 	lines := logLines(got)
