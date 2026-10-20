@@ -61,9 +61,9 @@ package websocket
 // the client does afterwards. The stretch is judged net of the Go scheduler's
 // own latency inside it, capped (celeris#871; the rule is in
 // backpressure_schedlat_linux_test.go): an engine loop that waits for the
-// scheduler is not an engine that stopped reading. That is the celeris#607 class judged by what it
-// does, not by the mechanism: a chained recv and a recv arm passed over
-// behind an outstanding send look the same here.
+// scheduler is not an engine that stopped reading. That is the celeris#607
+// class judged by what it does, not by the mechanism: a chained recv and a
+// recv arm passed over behind an outstanding send look the same here.
 //
 // # The test binary's deadline
 //
@@ -461,8 +461,11 @@ func wsoFDByInode(ino uint64) int {
 // another socket is not read (short of a reuse between the fstat and the
 // read, which would only misreport a diagnostic). Once that check fails the
 // socket is gone for good and is not searched for again (watch asks every
-// wsoWatchEvery). Only read-only calls (fstat, getsockopt TCP_INFO, ioctl
-// SIOCINQ/SIOCOUTQ) are made on it.
+// wsoWatchEvery). Only read-only calls (fstat, getsockopt TCP_INFO and
+// SO_MEMINFO, ioctl SIOCINQ/SIOCOUTQ) are made on it. The check and the call
+// are not atomic (s.mu is released before the getsockopt runs), so a number
+// the engine closes and the kernel reuses in between gives another socket's
+// TCP_INFO or skmem: a misreported diagnostic, never a verdict input.
 func (g *wsoRig) srvSockFD(s *wsoSrv) int {
 	srvPort := int(g.srvPort.Load())
 	if s.port <= 0 || srvPort <= 0 {

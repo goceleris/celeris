@@ -130,6 +130,11 @@ func TestWSOWatchFailsOnParkedEngineReader(t *testing.T) {
 					}
 				}
 				time.Sleep(arm.hold)
+				// The record's server-side skmem, read through the engine's own
+				// descriptor of this joined connection (not a plain listener's).
+				if got := rig.wsoSrvSkmem(c.LocalAddr().(*net.TCPAddr).Port); !strings.HasPrefix(got, "skmem:(r") {
+					t.Errorf("the engine socket's skmem = %q, want the counters", got)
+				}
 				stalls := stopWatch()
 				mu.Lock()
 				if rawResume != nil {

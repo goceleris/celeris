@@ -58,10 +58,11 @@ package websocket
 // With a probe that reports no latency the rule is the old one: the stretch
 // fails at wsoRecvStall.
 //
-// A stretch is judged when it ends, not while it grows, because the wait of
-// the goroutine that was not scheduled is recorded when it finally runs: at
-// the moment a stretch first reaches wsoRecvStall the very wait that explains
-// it is not in the histogram yet. A stretch that is still open fails at once
+// A stretch is judged when it ends, not while it grows, because a wait is
+// recorded only when the goroutine finally runs (and then only if that
+// transition was one of the sampled 1 in 8): at the moment a stretch first
+// reaches wsoRecvStall the very wait that explains it is not in the histogram
+// yet. A stretch that is still open fails at once
 // only when even the largest discount would not save it (stretch >=
 // wsoRecvStall + wsoSchedDiscountCap), so a run that ends in a timeout still
 // prints the record of a truly stuck connection. A stretch that is open when
