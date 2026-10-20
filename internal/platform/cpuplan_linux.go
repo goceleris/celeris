@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // littleCapacityPercent is the capacity, as a percentage of the largest
@@ -47,6 +48,34 @@ type CPUPlan struct {
 	// RxFree is what the rx-port rule decided (celeris#1036 item 1). Its
 	// Freed list is empty unless the rule took CPUs out of the loop set.
 	RxFree RxFree
+
+	// The fields below are the NIC interrupt report (celeris#1036). Only
+	// [AnnotatePlanWithNICIRQs] sets them, after the loops are decided, and
+	// nothing reads them to decide a loop: CPUs, Requested and Note are the
+	// planner's and the memlock cut's alone.
+	//
+	// IRQCPUs are the CPUs that service an interrupt vector of the NIC the
+	// listener is reachable through, ascending. Empty when none was found.
+	IRQCPUs []int
+	// IRQVectors are the vectors behind IRQCPUs, for the log.
+	IRQVectors []NICVector
+	// IRQUncovered are the serviced CPUs of the allowed set that run no loop
+	// of this plan, ascending. A warning names them.
+	IRQUncovered []int
+	// IRQIdle and IRQNegligible count the vectors the detection left out
+	// because they took no interrupt, or too few to carry traffic (a floor
+	// and a share of the NICs' interrupts since boot, see [DetectNICIRQs]);
+	// IRQSkipped describes the first few of the second kind. The Info line
+	// carries the sum (nic_irq_skipped: the vectors that never fired and the
+	// ones under the limits together, 60 on the host measured, 58 of them
+	// idle), a Debug line the detail. Vectors past the 4096 the detection
+	// judges are in neither count.
+	IRQIdle, IRQNegligible int
+	IRQSkipped             []NICSkip
+	// IRQReason says why no vector was found, for a Debug line.
+	IRQReason string
+	// IRQTook is how long the detection took.
+	IRQTook time.Duration
 }
 
 // Pinned returns how many workers of the plan are pinned.

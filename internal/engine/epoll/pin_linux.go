@@ -13,6 +13,12 @@ var pinThreadToCPU = platform.PinToCPU
 // plan.
 var planWorkerCPUs = platform.PlanWorkerCPUsFor
 
+// annotateNICIRQs adds the report of the CPUs that service the interrupts of
+// the NIC the listener is reachable through to a plan that is already decided
+// (celeris#1036). It only reports: the loops are the plan's. A variable so a
+// test can stand in the host's interrupts.
+var annotateNICIRQs = platform.AnnotatePlanWithNICIRQs
+
 // The plan is also the loop count: the engine starts len(plan.CPUs) of them
 // (celeris#1036), which on a big.LITTLE host is fewer than the default.
 
