@@ -44,39 +44,63 @@ import (
 // kernel-side snapshot while the request is still outstanding.
 const c936StallAfter = 5 * time.Second
 
+// c936MidAfter is the second, lighter look (the kernel's account of the
+// socket, no probes). The conn deadline is 60 s, which is also the server's
+// default WriteTimeout: a snapshot taken at the deadline can read the server
+// closing the conn at that very moment, so it is not the state the request
+// sat in. This one is taken well before.
+const c936MidAfter = 30 * time.Second
+
+// c936Look is one snapshot scheduled for later: finish stops it, or waits for
+// it when it has already started, and returns its text ("" when it never ran).
+type c936Look struct {
+	mu   sync.Mutex
+	text string
+	t    *time.Timer
+}
+
+func c936Watch(after time.Duration, take func() string) *c936Look {
+	l := &c936Look{}
+	l.t = time.AfterFunc(after, func() {
+		r := take()
+		l.mu.Lock()
+		l.text = r
+		l.mu.Unlock()
+	})
+	return l
+}
+
+func (l *c936Look) finish() string {
+	if !l.t.Stop() {
+		// The snapshot ran (or is running): wait for it, it holds no lock the
+		// request path needs.
+		for {
+			l.mu.Lock()
+			r := l.text
+			l.mu.Unlock()
+			if r != "" {
+				return r
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return ""
+}
+
 // c936Get is c733Get with the celeris#936 witness. srv may be nil (no engine
 // metrics, no worker probes); addr is the server's address for the probes.
 func c936Get(t *testing.T, srv *celeris.Server, addr string, conn net.Conn, br *bufio.Reader, path, auth string) (string, error) {
 	t.Helper()
 	start := time.Now()
-	var (
-		mu     sync.Mutex
-		report string
-	)
-	stall := time.AfterFunc(c936StallAfter, func() {
-		r := c936Report(srv, addr, conn, fmt.Sprintf("%s unanswered after %s", path, c936StallAfter), true)
-		mu.Lock()
-		report = r
-		mu.Unlock()
+	first := c936Watch(c936StallAfter, func() string {
+		return c936Report(srv, addr, conn, fmt.Sprintf("%s unanswered after %s", path, c936StallAfter), true)
+	})
+	mid := c936Watch(c936MidAfter, func() string {
+		return c936Report(nil, "", conn, fmt.Sprintf("%s unanswered after %s", path, c936MidAfter), false)
 	})
 	body, err := c733Get(conn, br, path, auth)
 	elapsed := time.Since(start)
-	if !stall.Stop() {
-		// The snapshot ran (or is running): wait for it, it holds no lock
-		// the request path needs.
-		for {
-			mu.Lock()
-			r := report
-			mu.Unlock()
-			if r != "" {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-	mu.Lock()
-	r := report
-	mu.Unlock()
+	r, m := first.finish(), mid.finish()
 	if err == nil {
 		if r != "" {
 			t.Logf("C936 LATE %s answered after %s (runner stall, the request was not lost); snapshot taken at %s:\n%s", path, elapsed, c936StallAfter, r)
@@ -84,10 +108,13 @@ func c936Get(t *testing.T, srv *celeris.Server, addr string, conn net.Conn, br *
 		return body, nil
 	}
 	final := c936Report(nil, "", conn, fmt.Sprintf("%s failed after %s", path, elapsed), false)
-	if r == "" {
-		return "", fmt.Errorf("%w\n%s", err, final)
+	var rest strings.Builder
+	for _, snap := range []string{r, m, final} {
+		if snap != "" {
+			rest.WriteString("\n" + snap)
+		}
 	}
-	return "", fmt.Errorf("%w after %s\n%s\n%s", err, elapsed, r, final)
+	return "", fmt.Errorf("%w after %s%s", err, elapsed, rest.String())
 }
 
 // c936Report is the kernel-side account of one outstanding request on conn,
