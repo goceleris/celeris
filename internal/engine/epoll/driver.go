@@ -125,10 +125,32 @@ func (dc *driverConn) epollEvent(events uint32) unix.EpollEvent {
 // testHookCloseDriverClaimed, when non-nil, runs in closeDriver once the conn
 // is claimed closed and removed from the interest set, with no lock held, and
 // before the conn leaves driverConns: where UnregisterConn can return, the
-// caller close the descriptor and register another conn on its number. Tests
+// caller can close the descriptor and register another conn on its number. Tests
 // only (celeris#771): a test sets it before it creates the engine and clears
 // it after the engine is stopped.
 var testHookCloseDriverClaimed func(dc *driverConn)
+
+// testHookDriverReadChecked, when non-nil, runs in driverRead after the conn's
+// closed check and before its read(2), with dc.mu held: the one place where an
+// UnregisterConn that is not made to wait for the read could return, so that
+// the caller closes the number and another file takes it before the read goes
+// out (celeris#710, #885 item 3). A reader that checks and reads in two
+// critical sections, or reads and then checks, lets a test do exactly that
+// from inside the hook, and the test sees the bytes of the file that took the
+// number. Tests only: a test sets it before it starts the loop's reads and
+// clears it after they have stopped. Costs one load and one nil test per read
+// when unset.
+var testHookDriverReadChecked func(dc *driverConn)
+
+// testHookCloseDriverDeleted, when non-nil, runs in closeDriver in the
+// critical section that claims the conn closed, right after the
+// EPOLL_CTL_DEL, with dc.mu held: the descriptor must already be out of the
+// interest set there, or an UnregisterConn(A) that returns between the unlock
+// and a later DEL lets the caller close the number and register another conn
+// on it, which that DEL then removes (celeris#771, #885 item 23). Tests only:
+// a test sets it before it creates the engine and clears it after the engine
+// is stopped.
+var testHookCloseDriverDeleted func(dc *driverConn)
 
 // testHookConnClosed, when non-nil, runs in closeConn on the loop's goroutine
 // right after the descriptor is closed, with no lock held: the number is free
@@ -346,7 +368,10 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 //
 // Once UnregisterConn has returned, the worker reads fd no more, even when
 // it is inside the conn's read loop at the time (celeris#710): every read
-// checks, under dc.mu, the closed flag this sets under dc.mu.
+// checks, under dc.mu, the closed flag this sets under dc.mu. A read that
+// completed before UnregisterConn took dc.mu is still delivered, though: the
+// worker calls onRecv outside dc.mu, so onRecv can run once more, concurrently
+// with or after onClose (celeris#885 item 4).
 func (l *Loop) UnregisterConn(fd int) error {
 	l.driverMu.Lock()
 	dc, ok := l.driverConns[fd]
@@ -615,6 +640,9 @@ func (l *Loop) driverRead(dc *driverConn) (more bool) {
 			dc.mu.Unlock()
 			return false
 		}
+		if h := testHookDriverReadChecked; h != nil {
+			h(dc)
+		}
 		n, err := unix.Read(dc.fd, l.driverReadBuf)
 		cb := dc.onRecv
 		dc.mu.Unlock()
@@ -661,6 +689,9 @@ func (l *Loop) closeDriver(dc *driverConn, cause error) {
 	dc.closed = true
 	cb := dc.onClose
 	_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil)
+	if h := testHookCloseDriverDeleted; h != nil {
+		h(dc)
+	}
 	dc.mu.Unlock()
 
 	if h := testHookCloseDriverClaimed; h != nil {
