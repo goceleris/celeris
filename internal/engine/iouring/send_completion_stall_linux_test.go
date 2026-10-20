@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -586,9 +587,9 @@ func TestIouringSendCompletionDuringASlowAsyncHandlerDoesNotStallItsWorker(t *te
 	}
 }
 
-// asyncParkedGoroutines884 counts the dispatch goroutines parked in their
-// cond wait (an idle promoted conn's serveAsync), by stack header.
-func asyncParkedGoroutines884() int {
+// asyncParkedGoroutines884 returns the ids of the dispatch goroutines parked
+// in their cond wait (an idle promoted conn's serveAsync), by stack header.
+func asyncParkedGoroutines884() map[int]bool {
 	buf := make([]byte, 1<<20)
 	for {
 		n := runtime.Stack(buf, true)
@@ -598,22 +599,33 @@ func asyncParkedGoroutines884() int {
 		}
 		buf = make([]byte, 2*len(buf))
 	}
-	k := 0
+	ids := map[int]bool{}
 	for _, g := range strings.Split(string(buf), "\n\n") {
-		if strings.Contains(g, "[sync.Cond.Wait") && strings.Contains(g, ".serveAsync(") {
-			k++
+		if !strings.Contains(g, "[sync.Cond.Wait") || !strings.Contains(g, ".serveAsync(") {
+			continue
+		}
+		var id int
+		if _, err := fmt.Sscanf(g, "goroutine %d [", &id); err == nil {
+			ids[id] = true
 		}
 	}
-	return k
+	return ids
 }
 
-// waitAsyncParked884 waits until more dispatch goroutines are parked than
-// were before the request under test was sent: the conn's own, now idle.
-func waitAsyncParked884(t *testing.T, before int) {
+// waitAsyncParked884 waits until a dispatch goroutine that was not parked
+// before the request under test was sent (before holds the ids then) is
+// parked: the conn's own, now idle. Goroutines other tests left behind, which
+// may park or exit meanwhile, are in before or are not new.
+func waitAsyncParked884(t *testing.T, before map[int]bool) {
 	t.Helper()
-	for end := time.Now().Add(stallDeadline704); asyncParkedGoroutines884() <= before; time.Sleep(200 * time.Microsecond) {
+	for end := time.Now().Add(stallDeadline704); ; time.Sleep(200 * time.Microsecond) {
+		for id := range asyncParkedGoroutines884() {
+			if !before[id] {
+				return
+			}
+		}
 		if time.Now().After(end) {
-			t.Fatalf("apparatus: no dispatch goroutine parked within %v of /big (parked before: %d)", stallDeadline704, before)
+			t.Fatalf("apparatus: no new dispatch goroutine parked within %v of /big (parked before: %d)", stallDeadline704, len(before))
 		}
 	}
 }

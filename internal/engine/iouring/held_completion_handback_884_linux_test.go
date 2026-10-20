@@ -23,11 +23,13 @@ import (
 // park claim (a transplant drain is active at its park) and the h2c upgrade
 // exit. Each is a real dispatch goroutine; its one queue entry is drained and
 // the completion must have been applied by then, which each arm reads off what
-// the applied completion lets the branch do: the claim's reap and hand-off
-// (finishAsyncTransplant refuses a conn with a send in flight, so a
-// completion applied late, by a later entry, is applied after the claim
-// already declined: heldSends reads 0 in the end and does not tell), and the
-// 101 the replay's flush submits behind the held SEND.
+// the applied completion lets the branch do: the claim's reap and the
+// hand-off it leads to (finishAsyncTransplant refuses a conn with a send in
+// flight, so the reap is placed only if the completion was applied first),
+// and the 101 the replay's flush submits behind the held SEND. With a single
+// held entry, a replay that ran at a later entry would still leave heldSends
+// at 0 in the end, so the park claim's arm does not rest on heldSends: the
+// reap and the hand-off are its mandatory assertion.
 //
 // Item 21: nothing a held completion carries may reach a conn that is not the
 // one it was held for. releaseConnState empties heldSends; replayHeldSends
@@ -41,10 +43,7 @@ const handBackTail884 = "the rest of response 1"
 // handBackTail884 in flight whose completion arrived while a handler held
 // detachMu (the test stands for the handler: holdAsHandler704) and was held.
 // The hand-back is owed (relinkOwed). The goroutine knows nothing of it yet.
-type heldParked884 struct {
-	f *fdlFixture
-	h *goidHandler
-}
+type heldParked884 struct{ f *fdlFixture }
 
 func newHeldParked884(t *testing.T, h2c bool) *heldParked884 {
 	t.Helper()
@@ -85,7 +84,7 @@ func newHeldParked884(t *testing.T, h2c bool) *heldParked884 {
 	cs.asyncInMu.Lock()
 	setParked704(cs, true) // the goroutine is where it was: parked in its cond wait
 	cs.asyncInMu.Unlock()
-	return &heldParked884{f: f, h: h}
+	return &heldParked884{f: f}
 }
 
 // exit waits for the goroutine's one hand-back entry to be on the detach queue
