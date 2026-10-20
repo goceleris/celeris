@@ -40,13 +40,12 @@ func (asyncEveryRouteHandler) HandleStream(_ context.Context, s *stream.Stream) 
 func (asyncEveryRouteHandler) RouteAsync(_, _ string) bool { return true }
 func (asyncEveryRouteHandler) HasAsyncRoutes() bool        { return true }
 
-func startAsyncH2CEngine722(t *testing.T) string {
+func startAsyncH2CEngine722(t *testing.T) (*Engine, string) {
 	t.Helper()
-	_, addr := startFDLEngine(t, asyncEveryRouteHandler{}, func(c *resource.Config) {
+	return startFDLEngine(t, asyncEveryRouteHandler{}, func(c *resource.Config) {
 		c.AsyncHandlers = true
 		c.EnableH2Upgrade = true
 	})
-	return addr
 }
 
 // h2cUpgradeHead722 is an h2c upgrade request head. body is the Content-Length
@@ -114,7 +113,7 @@ func finishH2CUpgrade722(t *testing.T, c net.Conn, br *bufio.Reader) {
 // The goroutine runs the upgrade at once; the worker must not read
 // cs.h1State after starting it.
 func TestAsyncH2CUpgradeOnPromotionLeavesH1StateToTheGoroutine(t *testing.T) {
-	addr := startAsyncH2CEngine722(t)
+	_, addr := startAsyncH2CEngine722(t)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -133,7 +132,7 @@ func TestAsyncH2CUpgradeOnPromotionLeavesH1StateToTheGoroutine(t *testing.T) {
 // goroutine through handleRecv's async feed, and the goroutine then runs the
 // upgrade. The worker must not read cs.h1State after that feed.
 func TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine(t *testing.T) {
-	addr := startAsyncH2CEngine722(t)
+	e, addr := startAsyncH2CEngine722(t)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -143,14 +142,33 @@ func TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine(t *testing.T) {
 		_ = tc.SetNoDelay(true)
 	}
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := c.Write([]byte(h2cUpgradeHead722("POST", 8) + "half")); err != nil {
+	// What the engine has counted before this connection's bytes: the engine's
+	// own start-up dial (a connect and a close, no bytes) is already behind it.
+	m0 := e.Metrics()
+	first := h2cUpgradeHead722("POST", 8) + "half"
+	if _, err := c.Write([]byte(first)); err != nil {
 		t.Fatalf("write upgrade head: %v", err)
 	}
-	// Long enough for the first recv to be promoted and its goroutine to
-	// park on the half-read body; the second write is then a separate recv.
-	time.Sleep(100 * time.Millisecond)
+	// The second write goes out only once the engine has read the first and
+	// promoted the connection (its dispatch goroutine, running the upgrade
+	// head with the body half read, parks): the second write is then a recv of
+	// its own, and it reaches the goroutine through handleRecv's async feed.
+	// A sleep in place of this could let both writes coalesce into the one
+	// recv that promotes, and the feed (the site under test) would not run.
+	if !parkWait712(5*time.Second, func() bool {
+		m := e.Metrics()
+		return m.AsyncPromotedConns >= m0.AsyncPromotedConns+1 && m.BytesRead >= m0.BytesRead+uint64(len(first))
+	}) {
+		m := e.Metrics()
+		t.Fatalf("the first write was not promoted: AsyncPromotedConns %d -> %d, BytesRead %d -> %d (want +1 and +%d)",
+			m0.AsyncPromotedConns, m.AsyncPromotedConns, m0.BytesRead, m.BytesRead, len(first))
+	}
 	if _, err := c.Write([]byte("body")); err != nil {
 		t.Fatalf("write rest of body: %v", err)
 	}
 	finishH2CUpgrade722(t, c, bufio.NewReader(c))
+	if m := e.Metrics(); m.AsyncPromotedConns != m0.AsyncPromotedConns+1 {
+		t.Fatalf("AsyncPromotedConns moved by %d, want 1: the second write was not a feed of the promoted connection",
+			m.AsyncPromotedConns-m0.AsyncPromotedConns)
+	}
 }
