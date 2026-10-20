@@ -155,43 +155,49 @@ type Config struct {
 	// 208 ms and maxima of 2.1 to 2.2 s in two of three cells, against 0.01%
 	// to 0.02% and 0.6 to 1.1 s for the default).
 	//
-	// With Workers unset on that kind of host, and a default count of at least
-	// one loop for each non-little CPU (a lower GOMAXPROCS, such as the default
-	// under a Kubernetes CPU limit, is planned as above), the loops also stay
-	// off the non-little CPUs that service the busy interrupt vectors of the
-	// NIC port that received the traffic (celeris#1036 item 1): the port that
-	// took at least 60% of the packets received since boot, and at least a
-	// million, by the physical ports behind the listen address, as read from
-	// /sys/class/net and /proc/interrupts when the engine starts (vectors with
-	// at least 1000 interrupts since boot count as busy). At most a quarter of
-	// the non-little CPUs go (2 of 8, so 6 loops), the count is never raised, a
-	// CPU that also services a busy vector of another port keeps its loop, and
-	// at least one busy vector must stay on a CPU that keeps its loop: with one
-	// port, or with the other ports quiet, the plan is the one without the
-	// rule. Nothing changes either when a file cannot be read, when a port has a
-	// million packets and no busy vector, when the load is spread over more CPUs
-	// than that quarter, or when a busy vector of another port sits on a CPU
-	// that runs no loop. A Workers you set is planned as above, whatever the NIC
-	// does. The engine's Info line names the CPUs, the port and its share.
+	// With Workers unset on that kind of host, and a default count of at least one
+	// loop for each non-little CPU (a lower GOMAXPROCS, such as the default under
+	// a Kubernetes CPU limit, is planned as above: 7 default loops are 0, 1, 6, 7,
+	// 8, 9 and 10, more than the 6 loops of 8), the loops also stay off the
+	// non-little CPUs that service the busy interrupt vectors of the NIC port that
+	// received the traffic (celeris#1036 item 1): the port that took at least 60%
+	// of the packets received since boot, and at least a million, by the physical
+	// ports behind the listen address, as read from /sys/class/net and
+	// /proc/interrupts when the engine starts (vectors with at least 1000
+	// interrupts since boot count as busy). At most a quarter of the non-little
+	// CPUs go (2 of 8, so 6 loops), the count is never raised, a CPU that also
+	// services a busy vector of another port keeps its loop, and at least one busy
+	// vector of a port with at least 10% of the packets pooled over the listener's
+	// ports (a choice, not measured) must stay on a CPU that keeps its loop: with
+	// one port, or with a data NIC beside a management NIC that carries less, the
+	// plan is the one without the rule. Nothing changes either when a file cannot
+	// be read, when a port has a million packets and no busy vector, when the load
+	// is spread over more CPUs than that quarter, or when a busy vector of another
+	// port sits on a CPU that runs no loop. A Workers you set is planned as above,
+	// whatever the NIC does. The engine's Info line names the CPUs, the port and
+	// its share.
 	//
 	// Validated on one cluster host (msr1, arm64 big.LITTLE; probatorium runs
-	// 39355553598 and 39367858847): the rule planned the loops 0, 1, 7, 9, 10
-	// and 11 by itself and matched the hand-pinned set within 1% requests per
-	// second on io256, ad128, ep512 and post4k; against v1.5.11 io256 gained
-	// 35%, ad128 5%, io512 45% and post4k did not regress, with the io512
-	// maximum at 34 ms (v1.5.11: 14.1 s). The cost: ep512 throughput is about
-	// 0.845 times that of v1.5.11 (15% lower). The pre-registered test came out
+	// 39355553598 and 39367858847): the rule planned the loops 0, 1, 7, 9, 10 and
+	// 11 by itself and matched the hand-pinned set within 1% requests per second
+	// on io256, ad128, ep512 and post4k; against v1.5.11 io256 gained 35%, ad128
+	// 5%, io512 45%, with the io512 maximum at 34 ms (v1.5.11: 14.1 s) and post4k
+	// p99.99 at 3.4 ms (v1.5.11: 48 ms; throughput within 1% of the hand-pinned
+	// set). The cost: ep512 throughput is about 0.845 times that of v1.5.11 (15%
+	// lower; the 8 loops alone: 0.948 times). The pre-registered test came out
 	// FAIL by its letter on the io256 p99.99 (5.59 times the hand-pinned set at
-	// the medians, overlapping ranges of millisecond-scale noise; a re-run of
-	// that cell is pending). The rule is fitted to that one host after its data
-	// was seen; its counts are since boot (a fresh boot steps aside, a wrapped
-	// 32-bit interrupt counter can hide a vector), a LAG rehash that moves the
-	// traffic leaves the plan until the next start, a wildcard listener pools
-	// every physical port that is up, and the adaptive engine's io_uring
-	// standby is planned when it first switches, from the counts of that
-	// moment, so it can pick another loop set than the primary. Hosts whose
-	// CPUs are alike are unchanged and read no NIC file (README, "CPU
-	// pinning").
+	// the medians; overlapping ranges, 3.2 to 32.8 ms against 3.6 to 28.3 ms; a
+	// re-run of that cell is pending). The rule is fitted to that one host after
+	// its data was seen; its counts are since boot (a fresh boot steps aside, a
+	// wrapped 32-bit interrupt counter can hide a vector), a LAG rehash that moves
+	// the traffic leaves the plan until the next start, a wildcard listener pools
+	// every physical port that is up, ports that share all their vectors (mlx4)
+	// never let the rule act, io_uring's RLIMIT_MEMLOCK cap keeps the first loops
+	// of the plan in CPU order and can drop the CPU the rule meant to keep (a
+	// memlock of 4 gives 0, 1, 7 and 9), and the adaptive engine's io_uring
+	// standby is planned when it first switches, from the counts of that moment,
+	// so it can pick another loop set than the primary. Hosts whose CPUs are alike
+	// are unchanged and read no NIC file (README, "CPU pinning").
 	Workers int
 
 	// WorkloadHint optionally declares the expected steady-state concurrency.
