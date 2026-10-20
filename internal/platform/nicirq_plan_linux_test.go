@@ -29,7 +29,7 @@ func msr1Plan(t *testing.T, workers int, explicit bool, allowed []int) CPUPlan {
 func unchanged(t *testing.T, what string, base, got CPUPlan) {
 	t.Helper()
 	g := got
-	g.IRQCPUs, g.IRQVectors, g.IRQUncovered, g.IRQIdle, g.IRQNegligible, g.IRQSkipped, g.IRQReason, g.IRQTook = nil, nil, nil, 0, 0, nil, "", 0
+	g.IRQCPUs, g.IRQVectors, g.IRQUncovered, g.IRQIdle, g.IRQNegligible, g.IRQSkipped, g.IRQReason, g.IRQTook, g.IRQAddr = nil, nil, nil, 0, 0, nil, "", 0, ""
 	if !reflect.DeepEqual(g, base) {
 		t.Errorf("%s: the report changed the plan:\n got %+v\nwant %+v", what, g, base)
 	}
@@ -77,8 +77,10 @@ func TestReportNothingUncovered(t *testing.T) {
 
 func TestReportExplicitWorkers(t *testing.T) {
 	// An explicit Workers changes the loops (#1049's rule), never the report's
-	// effect on them. CPU 4 runs no loop in any of these; with 4 loops CPU 8
-	// has none either.
+	// effect on them. CPU 4 (little) runs no loop in any of these; with 4 loops
+	// CPU 8 (big) has none either, but IRQ 159 on CPU 0 has a loop beside it,
+	// so the big CPUs without a loop are not named: the Warn is for a little
+	// CPU, or for a big one when no vector has a loop beside it.
 	for _, tc := range []struct {
 		workers   int
 		loops     []int
@@ -87,8 +89,8 @@ func TestReportExplicitWorkers(t *testing.T) {
 		{8, []int{0, 1, 6, 7, 8, 9, 10, 11}, []int{4}},
 		{9, []int{0, 1, 6, 7, 8, 9, 10, 11, 0}, []int{4}},
 		{12, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1, 6, 7}, []int{4}},
-		{4, []int{0, 1, 6, 7}, []int{4, 8}},
-		{1, []int{0}, []int{4, 6, 8}},
+		{4, []int{0, 1, 6, 7}, []int{4}},
+		{1, []int{0}, []int{4}},
 	} {
 		base, got := reported(t, msr1NIC(t), tc.workers, true, rng(0, 11), bondAddr)
 		eq(t, "loops", got.CPUs, tc.loops)
@@ -106,14 +108,15 @@ func TestReportDefaultCountBelowTheBigCPUs(t *testing.T) {
 }
 
 // The memlock cut is #1049's. The report is made on the plan that is left, so a
-// serviced big CPU whose loop the cut dropped is named, and nothing is added.
+// serviced little CPU is named, a big one only if no vector has a loop beside
+// it (IRQ 159 on CPU 0 does), and nothing is added.
 func TestReportOnACutPlan(t *testing.T) {
 	base := msr1Plan(t, 12, false, rng(0, 11))
 	cut := base.Truncate(3, "RLIMIT_MEMLOCK")
 	eq(t, "cut loops", cut.CPUs, []int{0, 1, 6})
 	got := annotatePlanNIC(cut, bondAddr, msr1NIC(t).src())
 	unchanged(t, "cut plan", cut, got)
-	eq(t, "uncovered", got.IRQUncovered, []int{4, 8})
+	eq(t, "uncovered", got.IRQUncovered, []int{4})
 	// The cut after the report: the report's fields travel with the copy and
 	// the loops are the cut's.
 	full := annotatePlanNIC(base, bondAddr, msr1NIC(t).src())
@@ -213,7 +216,7 @@ func TestReportKeepsTheNUMAOrderOfTheBigCPUs(t *testing.T) {
 	eq(t, "#1049 W=4", base.CPUs, []int{0, 6, 1, 7})
 	got = annotatePlanNIC(base, bondAddr, msr1NIC(t).src())
 	unchanged(t, "two nodes, W=4", base, got)
-	eq(t, "uncovered", got.IRQUncovered, []int{4, 8})
+	eq(t, "uncovered", got.IRQUncovered, []int{4})
 }
 
 func TestReportStubPlansAreLeftAlone(t *testing.T) {
@@ -222,7 +225,7 @@ func TestReportStubPlansAreLeftAlone(t *testing.T) {
 	stub := CPUPlan{CPUs: []int{0, 1, 6}, Allowed: rng(0, 11), Little: rng(2, 5), Heterogeneous: true, Requested: 3, Note: "stub"}
 	got := annotatePlanNIC(stub, bondAddr, msr1NIC(t).src())
 	unchanged(t, "stub", stub, got)
-	eq(t, "uncovered", got.IRQUncovered, []int{4, 8})
+	eq(t, "uncovered", got.IRQUncovered, []int{4})
 }
 
 // An RSS NIC: 16 vectors over all 12 CPUs. Every serviced little CPU that runs
@@ -375,14 +378,23 @@ func TestLogPinOutcomeNICIRQ(t *testing.T) {
 	if strings.Contains(lines[0], "irq_loops") {
 		t.Errorf("Info line counts NIC interrupt loops:\n%s", lines[0])
 	}
+	// The Warn is short: the vector, the CPU, the loop CPUs, one line of action
+	// (the loop CPUs that service no NIC vector: 1, 7 and 9-11, not CPU 0
+	// with IRQ 159 and not 6 and 8 with the vectors of enp49s0), and the README.
 	for _, w := range []string{"level=WARN", "serviced by CPUs that run no loop", "cpus=4 ", "CPU 4: enp1s0-8 (IRQ 167)",
 		"loop_cpus=0-1,6-11", "none was added",
-		"~200 ms whole-port TX silences", "measured observation on one host, not a guarantee",
-		"Route 1, as root: echo <one of 0-1,6-11> > /proc/irq/167/smp_affinity_list",
-		"Route 2: keep irqbalance off the CPU(s) (IRQBALANCE_BANNED_CPULIST)", "README, CPU pinning"} {
+		"echo <one of 1,7,9-11> > /proc/irq/167/smp_affinity_list", `NIC interrupts on big.LITTLE hosts`} {
 		if !strings.Contains(lines[1], w) {
 			t.Errorf("Warn line lacks %q:\n%s", w, lines[1])
 		}
+	}
+	for _, bad := range []string{"IRQBALANCE", "Realtek", "coincided", "~200 ms", "Route", "removed"} {
+		if strings.Contains(lines[1], bad) {
+			t.Errorf("Warn line carries %q, which belongs in the README:\n%s", bad, lines[1])
+		}
+	}
+	if len(lines[1]) > 700 {
+		t.Errorf("Warn line is %d bytes, want at most 700:\n%s", len(lines[1]), lines[1])
 	}
 
 	// Nothing uncovered: no Warn. Nothing found: one Debug line with the
