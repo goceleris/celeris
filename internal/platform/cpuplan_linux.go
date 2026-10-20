@@ -77,6 +77,9 @@ type CPUPlan struct {
 	IRQReason string
 	// IRQTook is how long the detection took.
 	IRQTook time.Duration
+	// IRQAddr is the listen address the report was made for; LogPinOutcome
+	// logs the Warn once per logger, address and set of uncovered CPUs.
+	IRQAddr string
 }
 
 // Pinned returns how many workers of the plan are pinned.
