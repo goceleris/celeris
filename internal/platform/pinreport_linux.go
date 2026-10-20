@@ -93,7 +93,12 @@ func LogPinOutcome(log *slog.Logger, engine string, plan CPUPlan, failed []PinFa
 		logIRQSkipped(log, engine, plan)
 	}
 	if len(plan.IRQUncovered) > 0 {
-		logIRQUncovered(log, engine, plan)
+		if firstIRQWarn(log, plan) {
+			logIRQUncovered(log, engine, plan)
+		} else {
+			log.Debug(engine+": nic irq: Warn already logged for these CPUs on this address",
+				"cpus", FormatCPUs(plan.IRQUncovered), "addr", plan.IRQAddr)
+		}
 	}
 	if len(failed) == 0 {
 		return
@@ -126,6 +131,42 @@ func logIRQSkipped(log *slog.Logger, engine string, plan CPUPlan) {
 	log.Debug(engine+": nic irq: vectors under the traffic limits are not warned about",
 		"idle", plan.IRQIdle, "negligible", plan.IRQNegligible, "detail", strings.Join(parts, "; "),
 		"min_share_percent", nicMinSharePercent, "min_interrupts", nicMinInterrupts)
+}
+
+// irqWarnKey identifies a Warn: the logger it goes to, the address the report
+// was made for and the set of uncovered CPUs. The adaptive engine reports for
+// each of its two engines (the second at its first switch, with the same
+// logger and address), and the identical Warn is logged once.
+type irqWarnKey struct {
+	log  *slog.Logger
+	addr string
+	set  string
+}
+
+// irqWarnedMax bounds the memory of the Warns logged: past it the memory is
+// cleared, and a Warn that was forgotten is logged again.
+const irqWarnedMax = 256
+
+var irqWarned struct {
+	sync.Mutex
+	seen map[irqWarnKey]struct{}
+}
+
+// firstIRQWarn reports whether the Warn for plan has not been logged yet to
+// log, and records it. A server restarted in the same process with the same
+// logger and address is also taken for a repeat.
+func firstIRQWarn(log *slog.Logger, plan CPUPlan) bool {
+	k := irqWarnKey{log, plan.IRQAddr, FormatCPUs(plan.IRQUncovered)}
+	irqWarned.Lock()
+	defer irqWarned.Unlock()
+	if _, ok := irqWarned.seen[k]; ok {
+		return false
+	}
+	if irqWarned.seen == nil || len(irqWarned.seen) >= irqWarnedMax {
+		irqWarned.seen = make(map[irqWarnKey]struct{})
+	}
+	irqWarned.seen[k] = struct{}{}
+	return true
 }
 
 // logIRQUncovered logs the one Warn line for the CPUs of the allowed set that

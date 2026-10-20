@@ -32,7 +32,9 @@ func annotatePlanNIC(p CPUPlan, addr string, src nicSource) CPUPlan {
 	t0 := time.Now()
 	irq := detectNICIRQs(addr, src)
 	irq.Took = time.Since(t0)
-	return p.WithNICIRQs(irq)
+	q := p.WithNICIRQs(irq)
+	q.IRQAddr = addr
+	return q
 }
 
 // WithNICIRQs returns p with the NIC interrupt report of irq: the serviced
