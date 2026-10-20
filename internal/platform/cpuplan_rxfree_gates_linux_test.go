@@ -47,6 +47,7 @@ func TestRxFreeNeedsABusyVectorBesideALoop(t *testing.T) {
 
 	// The same with the other port's busy vector on CPU 7: a big CPU that is
 	// not freed. The rule acts.
+	two.rx = map[string]uint64{"rx0": 73_000_000, "tx0": 27_000_000}
 	two.vecs = []vec{{"rx0", 10, 6, 2_000_000_000}, {"rx0", 11, 8, 4_000_000_000}, {"tx0", 20, 7, 3_000_000_000}}
 	got, _ = two.plan(t, 12)
 	eq(t, "vector beside a loop: loops", got.CPUs, []int{0, 1, 7, 9, 10, 11})
@@ -302,7 +303,7 @@ func (v fuzzVec) known() bool { return v.shape != 4 && v.shape != 5 }
 
 var (
 	fuzzCounts = []uint64{0, 10, 999, 1000, 4_000_000_000}
-	fuzzRx     = []uint64{0, 999_999, 1_000_000, 5_000_000, 70_000_000, 1_000_000_000}
+	fuzzRx     = []uint64{0, 999_999, 1_000_000, 5_000_000, 70_000_000, 1_000_000_000, 20_000_000}
 	fuzzBig    = []int{0, 1, 6, 7, 8, 9, 10, 11}
 )
 
@@ -325,11 +326,12 @@ func FuzzRxFreeHost(f *testing.F) {
 	}
 	rx6, rx8, other1 := [5]byte{0, 6, 4, 0, 0}, [5]byte{0, 8, 4, 0, 0}, [5]byte{1, 1, 4, 0, 0}
 	seed([3]byte{4, 0, 0}, rx6, rx8)                                                 // one port, two busy vectors
-	seed([3]byte{4, 3, 0}, rx6, rx8, other1)                                         // msr1-like: CPU 1 beside
-	seed([3]byte{4, 3, 2}, rx6, rx8, other1)                                         // a third port with packets, no vector
-	seed([3]byte{4, 3, 0}, rx6, rx8, [5]byte{1, 1, 4, 4, 0})                         // a busy vector of unknown CPU
-	seed([3]byte{4, 3, 0}, [5]byte{0, 6, 4, 0, 1}, rx8, other1)                      // CPU 6 shared with the next port
-	seed([3]byte{4, 3, 0}, rx6, rx8, [5]byte{1, 7, 4, 3, 0}, [5]byte{2, 9, 1, 6, 0}) // comma list, empty effective
+	seed([3]byte{4, 6, 0}, rx6, rx8, other1)                                         // msr1-like: CPU 1 beside
+	seed([3]byte{4, 3, 0}, rx6, rx8, other1)                                         // the other port under 10% of the packets
+	seed([3]byte{4, 6, 2}, rx6, rx8, other1)                                         // a third port with packets, no vector
+	seed([3]byte{4, 6, 0}, rx6, rx8, [5]byte{1, 1, 4, 4, 0})                         // a busy vector of unknown CPU
+	seed([3]byte{4, 6, 0}, [5]byte{0, 6, 4, 0, 1}, rx8, other1)                      // CPU 6 shared with the next port
+	seed([3]byte{4, 6, 0}, rx6, rx8, [5]byte{1, 7, 4, 3, 0}, [5]byte{2, 9, 1, 6, 0}) // comma list, empty effective
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) < 3 {
@@ -428,7 +430,13 @@ func FuzzRxFreeHost(f *testing.F) {
 			} else if slices.Contains(rf.Freed, v.cpu) {
 				t.Fatalf("freed CPU %d hosts IRQ %d, a busy vector of another port: %v", v.cpu, v.irq, rf.Freed)
 			}
-			if slices.Contains(fuzzBig, v.cpu) && !slices.Contains(rf.Freed, v.cpu) {
+			// Only a vector of a port with 10% of the packets or more counts as
+			// one a loop stays beside.
+			carries := false
+			for _, d := range lists {
+				carries = carries || rx[d]*100 >= total*10
+			}
+			if carries && slices.Contains(fuzzBig, v.cpu) && !slices.Contains(rf.Freed, v.cpu) {
 				stays = true
 			}
 		}
@@ -438,7 +446,7 @@ func FuzzRxFreeHost(f *testing.F) {
 			}
 		}
 		if !stays {
-			t.Fatalf("freed %v with no busy vector staying on a CPU that keeps its loop", rf.Freed)
+			t.Fatalf("freed %v with no busy vector of a port with 10%% of the packets staying on a CPU that keeps its loop", rf.Freed)
 		}
 		for i := range ports {
 			if rx[i] >= rxMinPackets && !hasBusy[i] {
@@ -446,4 +454,74 @@ func FuzzRxFreeHost(f *testing.F) {
 			}
 		}
 	})
+}
+
+// ---- round 2: a vector counts only if its port carries a real share ---------
+
+// dataMgmtHost is a wildcard listener over two unbonded ports: data0 (busy
+// vectors on CPUs 6 and 8) and a management port mgmt0 with one busy vector on
+// CPU 0, which runs a loop. The rule used to count that vector as one a loop
+// stays beside and freed both TX-completion CPUs of the data port.
+func dataMgmtHost(t *testing.T, dataRx, mgmtRx, mgmtCount uint64) (*fakeHost, *rxHost) {
+	t.Helper()
+	cpu := msr1(t, rng(0, 11))
+	h := newRxHost(t)
+	h.addr("lo", true, "127.0.0.1")
+	h.phys("data0", 10, 11)
+	h.phys("mgmt0", 20)
+	h.rx("data0", dataRx)
+	h.rx("mgmt0", mgmtRx)
+	h.addr("data0", true, "10.0.1.1")
+	h.addr("mgmt0", true, "10.0.2.1")
+	h.intr(10, "data0-10", map[int]uint64{6: 2_000_000_000})
+	h.intr(11, "data0-11", map[int]uint64{8: 4_000_000_000})
+	h.intr(20, "mgmt0-20", map[int]uint64{0: mgmtCount})
+	for irq, c := range map[int]int{10: 6, 11: 8, 20: 0} {
+		h.irq(irq, fmt.Sprint(c), fmt.Sprint(c))
+	}
+	h.flushInterrupts()
+	return cpu, h
+}
+
+func TestRxFreeManagementNICIsNoVectorToStayBeside(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		dataRx, mgmtRx, mgmtCount uint64
+	}{
+		{"A: 2e6 packets, 50k interrupts", 900_000_000, 2_000_000, 50_000},
+		{"B: 2e5 packets, 2k interrupts", 900_000_000, 200_000, 2_000},
+		{"just under 10%", 900_000_001, 99_999_999, 50_000_000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cpu, h := dataMgmtHost(t, tc.dataRx, tc.mgmtRx, tc.mgmtCount)
+			got := planWorkerCPUs(12, false, h.planSrc(cpu, "0.0.0.0:8080"))
+			same1049(t, tc.name, got, planWorkerCPUs(12, false, cpu.src()))
+			if why := whyText(got); !strings.Contains(why, "stay beside") || !strings.Contains(why, "10%") {
+				t.Errorf("Why: %s", why)
+			}
+		})
+	}
+	// Exactly 10% of the pooled packets, and a real share: the rule acts.
+	for name, rx := range map[string][2]uint64{"exactly 10%": {900_000_000, 100_000_000}, "27%": {730_000_000, 270_000_000}} {
+		cpu, h := dataMgmtHost(t, rx[0], rx[1], 50_000_000)
+		got := planWorkerCPUs(12, false, h.planSrc(cpu, "0.0.0.0:8080"))
+		eq(t, name+": loops", got.CPUs, msr1LoopsVNV)
+		eq(t, name+": freed", got.RxFree.Freed, []int{6, 8})
+	}
+}
+
+// ---- round 2: the reason names the floor, not a spread ----------------------
+
+// A cpuset of 0-3,6,8 on msr1: big CPUs 0,1,6,8 (n=4, budget 1) and the data
+// port's two busy vectors on CPUs 6 and 8. The cause of the step aside is the
+// small floor, not a load spread over the queues.
+func TestRxFreeSmallFloorReason(t *testing.T) {
+	cpu := msr1(t, []int{0, 1, 2, 3, 6, 8})
+	h := msr1RxReal(t, "msr1_rxfree_vector_on_cpu1.txt")
+	got := planWorkerCPUs(4, false, h.planSrc(cpu, clusterAddr))
+	same1049(t, "cpuset 0-3,6,8", got, planWorkerCPUs(4, false, cpu.src()))
+	why := whyText(got)
+	if strings.Contains(why, "spread over the queues") || !strings.Contains(why, "floor of loops allows only 1 of 4") {
+		t.Errorf("Why: %s", why)
+	}
 }
