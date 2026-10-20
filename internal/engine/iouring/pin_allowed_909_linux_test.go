@@ -118,9 +118,11 @@ func TestWorkersPinInsideTheAllowedSet909(t *testing.T) {
 
 // A plan that leaves workers unpinned is honoured: those workers keep the
 // process's mask, report CPU -1, ask for no SQPOLL affinity, and the engine says
-// why in one line. The plan alternates a pinned and an unpinned worker; an
-// engine that RLIMIT_MEMLOCK holds to one worker (the CI runners' 8 MiB) gets
-// the plan "unpinned" for it.
+// why in one line. The plan alternates an unpinned and a pinned worker, unpinned
+// first: the planner is asked for the whole request and RLIMIT_MEMLOCK cuts the
+// plan to its first entries (celeris#1036), so an engine held to one worker
+// (the CI runners' 8 MiB) keeps the unpinned entry, which is the case this test
+// is named for.
 func TestUnpinnedWorkersStayUnpinned909(t *testing.T) {
 	if !pintest.InOwnProcess(t) {
 		pintest.RunInOwnProcess(t, 2*time.Minute)
@@ -133,11 +135,11 @@ func TestUnpinnedWorkersStayUnpinned909(t *testing.T) {
 	base, _ := pintest.StartupMask()
 	old := planWorkerCPUs
 	var want []int
-	planWorkerCPUs = func(n int) platform.CPUPlan {
+	planWorkerCPUs = func(n int, _ bool, _ string) platform.CPUPlan {
 		want = make([]int, n)
 		for i := range want {
 			want[i] = -1
-			if i%2 == 0 && n > 1 {
+			if i%2 == 1 {
 				want[i] = cpus[len(cpus)-1-i/2]
 			}
 		}
@@ -150,6 +152,12 @@ func TestUnpinnedWorkersStayUnpinned909(t *testing.T) {
 	var log lockedBuf
 	e, stop := start909(t, 4, &log)
 	defer stop()
+	// The planner is asked for the whole request and RLIMIT_MEMLOCK then cuts
+	// the plan to its first entries (celeris#1036): the CI runners' 8 MiB keep
+	// the first one, which this plan leaves unpinned.
+	if m := MaxWorkersForMemlock(); m > 0 && m < len(want) {
+		want = want[:m]
+	}
 	n := e.NumWorkers()
 	if n != len(want) {
 		t.Fatalf("the engine runs %d worker(s), the plan was for %d", n, len(want))

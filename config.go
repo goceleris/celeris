@@ -121,6 +121,92 @@ type Config struct {
 	Engine EngineType
 
 	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
+	//
+	// On Linux the native engines (epoll, io_uring) pin each loop to one CPU
+	// the process is allowed to use. On a host whose allowed CPUs differ in
+	// capacity (arm64 big.LITTLE) the default is at most one loop per CPU that
+	// is not little, min(GOMAXPROCS, non-little CPUs): 8 loops on a 12-CPU host
+	// with 4 little CPUs, which is fewer than GOMAXPROCS. Every one is pinned:
+	// a loop left unpinned drifted onto the little CPUs and a loop pinned to
+	// one stalled its connections. A Workers set above the non-little CPU
+	// count is honoured and never left unpinned: the extra loops wrap
+	// round-robin over the non-little CPUs, each pinned, so the CPUs that get a
+	// second loop (4 of 8 for Workers 12) take about twice the connections of
+	// the others, which get one. On io_uring a count is still capped by
+	// RLIMIT_MEMLOCK. The loops started are Metrics.Workers of
+	// [Server.EngineInfo] (on the adaptive engine, the sum over its two
+	// engines), and the engine logs one line saying how many it started and
+	// why. [Config.MaxConns] is per loop, so the server-wide limit follows the
+	// count. Measured on one big.LITTLE host (arm64, 8 big and 4 little CPUs,
+	// the NIC interrupt pinned to a big CPU; two dispatches, 35 s windows with
+	// 5 repetitions per cell, 90 s windows with 4 at io_uring with 512
+	// connections), against celeris v1.5.11 (all 12 loops pinned, 4 of them on
+	// the little CPUs): 1.43 times the
+	// requests per second at io_uring with 256 connections, 1.09 times at
+	// adaptive with 128 connections, 1.51 times at io_uring with 512
+	// connections, 1.04 times for epoll with 4 KiB POST bodies, and 0.95
+	// times for epoll with 512 connections. The behaviour before this change
+	// (4 floating loops) served those POST bodies at 0.47 times v1.5.11 in an
+	// earlier run. The tail costs something: for epoll with 4 KiB POST bodies
+	// the median p99.99 was 99 ms against 48 ms for v1.5.11, and at io_uring
+	// with 512 connections a 90 s run had a median of 61 requests of 1 s or
+	// more and its longest took 1.0 to 2.5 s, against 664 and 12 to 21 s for
+	// v1.5.11. A Workers above the non-little CPU count is wrapped over the
+	// pinned big CPUs; it ran once, in an earlier run (35 s windows, 3 repetitions), and showed a worse tail
+	// than the default at io_uring with 512 connections (0.10% to 0.20% of
+	// requests at about 208 ms, maxima of 2.1 to 2.2 s in two of three cells,
+	// against 0.01% to 0.02% and 0.6 to 1.1 s for the default).
+	//
+	// With Workers unset on that kind of host, and a default count of at least one
+	// loop for each non-little CPU (a lower GOMAXPROCS, such as the default under
+	// a Kubernetes CPU limit, is planned as above: 7 default loops are 0, 1, 6, 7,
+	// 8, 9 and 10, more than the 6 loops of 8), the loops also stay off the
+	// non-little CPUs that service the busy interrupt vectors of the NIC port that
+	// received the traffic (celeris#1036 item 1): the port that took at least 60%
+	// of the packets received since boot, and at least a million, by the physical
+	// ports behind the listen address, as read from /sys/class/net and
+	// /proc/interrupts when the engine starts (vectors with at least 1000
+	// interrupts since boot count as busy). At most a quarter of the non-little
+	// CPUs go (2 of 8, so 6 loops), the count is never raised, a CPU that also
+	// services a busy vector of another port keeps its loop, and at least one busy
+	// vector of a port with at least 10% of the packets pooled over the listener's
+	// ports (a choice, not measured) must stay on a CPU that keeps its loop: with
+	// one port, or with a data NIC beside a management NIC that carries less, the
+	// plan is the one without the rule. Nothing changes either when a file cannot
+	// be read, when a port has a million packets and no busy vector, when the load
+	// is spread over more CPUs than that quarter, or when a busy vector of another
+	// port sits on a CPU that runs no loop. A Workers you set is planned as above,
+	// whatever the NIC does. The engine's Info line names the CPUs, the port and
+	// its share.
+	//
+	// Validated on one cluster host (msr1, arm64 big.LITTLE; probatorium runs
+	// 39355553598 and 39367858847): the rule planned the loops 0, 1, 7, 9, 10 and
+	// 11 by itself and matched the hand-pinned set within 1% requests per second
+	// on io256, ad128, ep512 and post4k; against v1.5.11 io256 gained 35%, ad128
+	// 5%, io512 45%, with the io512 maximum at 34 ms (v1.5.11: 14.1 s) and post4k
+	// p99.99 at 3.4 ms (v1.5.11: 48 ms; throughput within 1% of the hand-pinned
+	// set). The cost: ep512 throughput is about 0.845 times that of v1.5.11 (15%
+	// lower; the 8 loops alone: 0.948 times). The pre-registered test came out
+	// FAIL by its letter on the io256 p99.99 (5.59 times the hand-pinned set at
+	// the medians; overlapping ranges, 3.2 to 32.8 ms against 3.6 to 28.3 ms). A
+	// re-run of that cell on one commit (probatorium run 39396052154, 8
+	// repetitions per arm) had the rule plan the same six loops by itself, with
+	// 0.995 times the requests per second and a p99.99 median of 16.8 ms against
+	// 6.0 ms for the same loops forced by a knob (2.83 times; 6 of 8 against 3 of
+	// 8 repetitions over 10 ms); the one-sided exact Mann-Whitney test does not
+	// reject (p=0.080) and the registered outcome is NOISE-ONLY, but at 8
+	// repetitions its power is low and a modest p99.99 tail cost at io256 in the
+	// 10 to 30 ms range is not excluded. The rule is fitted to that one host after
+	// its data was seen; its counts are since boot (a fresh boot steps aside, a
+	// wrapped 32-bit interrupt counter can hide a vector), a LAG rehash that moves
+	// the traffic leaves the plan until the next start, a wildcard listener pools
+	// every physical port that is up, ports that share all their vectors (mlx4)
+	// never let the rule act, io_uring's RLIMIT_MEMLOCK cap keeps the first loops
+	// of the plan in CPU order and can drop the CPU the rule meant to keep (a
+	// memlock of 4 gives 0, 1, 7 and 9), and the adaptive engine's io_uring
+	// standby is planned when it first switches, from the counts of that moment,
+	// so it can pick another loop set than the primary. Hosts whose CPUs are alike
+	// are unchanged and read no NIC file (README, "CPU pinning").
 	Workers int
 
 	// WorkloadHint optionally declares the expected steady-state concurrency.
@@ -319,7 +405,8 @@ type Config struct {
 	SocketRecvBuf int
 	// SocketSendBuf sets SO_SNDBUF for accepted connections (0 = OS default).
 	SocketSendBuf int
-	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
+	// MaxConns is the max simultaneous connections per worker (0 = unlimited);
+	// the server-wide limit is MaxConns times the loops started, see [Config.Workers].
 	MaxConns int
 
 	// MemoryLimitBytes is an OPTIONAL soft heap ceiling applied via
@@ -386,9 +473,9 @@ type Config struct {
 	// thread, until a timed run of it blocks, and returns to inline when the
 	// promotion expires. A thread that cgo code called from an inline handler
 	// creates (pthread_create) inherits the pin the same way. Threads Go
-	// starts itself do not. On a host whose CPUs differ in capacity (arm64 big.LITTLE) the
-	// loops that did not get a big CPU run unpinned and have nothing to pass
-	// on (README, "CPU pinning").
+	// starts itself do not. On a host whose CPUs differ in capacity (arm64
+	// big.LITTLE) the loops pin to the non-little CPUs only (README, "CPU
+	// pinning").
 	//
 	// AsyncHandlers is the SERVER-LEVEL default. Individual routes and
 	// groups can override it per handler with [Route.Async] /
