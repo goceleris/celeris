@@ -1,6 +1,7 @@
 package release
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -87,5 +88,17 @@ func TestStripV(t *testing.T) {
 		if got := StripV(in); got != want {
 			t.Errorf("StripV(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The checklist points at the rehearsal script; a rename that leaves the
+// pointer behind would send someone to a file that is not there.
+func TestChecklistPointsAtTheRehearsalScript(t *testing.T) {
+	const script = ".github/scripts/pinmove-rehearsal.sh"
+	if !strings.Contains(Checklist("1.6.0"), script) {
+		t.Errorf("the checklist no longer mentions %s", script)
+	}
+	if _, err := os.Stat("../../" + script); err != nil {
+		t.Errorf("the checklist names %s, which does not exist: %v", script, err)
 	}
 }
