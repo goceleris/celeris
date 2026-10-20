@@ -58,7 +58,10 @@ package websocket
 // exited) is one the engine should be reading. If the engine reads nothing
 // from it for wsoRecvStall, and the process was not starved of CPU meanwhile,
 // the test fails with that stretch's state at both ends (WSO-STALL), whatever
-// the client does afterwards. That is the celeris#607 class judged by what it
+// the client does afterwards. The stretch is judged net of the Go scheduler's
+// own latency inside it, capped (celeris#871; the rule is in
+// backpressure_schedlat_linux_test.go): an engine loop that waits for the
+// scheduler is not an engine that stopped reading. That is the celeris#607 class judged by what it
 // does, not by the mechanism: a chained recv and a recv arm passed over
 // behind an outstanding send look the same here.
 //
@@ -147,7 +150,11 @@ const (
 	// from a socket holding unread bytes, while nothing asked it to stop,
 	// fails the test. celeris#607 held such a connection for up to 14 s.
 	// A healthy engine's longest such stretch, measured on GitHub's runners
-	// in CI's shape, was 2.3 s on epoll and 1.7 s on io_uring.
+	// in CI's shape, was 2.3 s on epoll and 1.7 s on io_uring. The stretch
+	// is judged net of the scheduler latency recorded inside it, at most
+	// wsoSchedDiscountCap of it (celeris#871: at GOMAXPROCS=1 with the
+	// default size the loop waited 5.6 to 10.7 s for the scheduler, 8 of 8
+	// processes, not for the socket).
 	wsoRecvStall = 5 * time.Second
 	// wsoQuiet: after its flood the #482 test's client neither reads nor
 	// writes for this long, holding the backpressure it built. A healthy
@@ -159,7 +166,11 @@ const (
 	// wsoRecvStall, before the quiet ended. The #749 record of x86 cleared the
 	// same limit by about 1 s. wsoQuiet is 10 s: 7.2 s left on the head's
 	// figure, a margin of 2.2 s over wsoRecvStall. The cost is 2 s more per arm
-	// of the pause-cancel test that holds this quiet.
+	// of the pause-cancel test that holds this quiet. The scheduler discount
+	// eats into that margin only by the latency the Go scheduler records inside
+	// the quiet's own stretch: the client is idle there, so a #607 stretch
+	// (a connection blocked while the loop and every goroutine can run) records
+	// none worth the 2.2 s; a run that did would show it as stallDiscounted.
 	wsoQuiet = 10 * time.Second
 	// wsoReserve: what a rig leaves of the test binary's -timeout for the
 	// verdicts, the engine shutdowns (up to 40 s) and the tests after it.
@@ -191,6 +202,14 @@ type wsoRig struct {
 	// restart discards a stretch that may have been long, so a run with many
 	// has a watch that could not have reached wsoRecvStall.
 	watchGapRestarts int
+	// sched is the Go scheduler's latency probe (see wsoSchedProbe): what
+	// watch discounts a stretch by. nil reports no latency.
+	sched wsoSchedProbe
+	// stallDiscounted: stretches that reached wsoRecvStall and were excused
+	// by scheduler latency inside them (celeris#871), and the longest of them.
+	// A run that was excused says so on its waits line.
+	stallDiscounted    int
+	stallDiscountedMax time.Duration
 }
 
 // newWSORig starts a subtest's rig. Its waits end, at the latest, at the
@@ -198,7 +217,7 @@ type wsoRig struct {
 // than wsoMinBudget of that left, the subtest fails here without starting.
 func newWSORig(t *testing.T) *wsoRig {
 	t.Helper()
-	g := &wsoRig{t0: time.Now()}
+	g := &wsoRig{t0: time.Now(), sched: newWSOSchedLat()}
 	if dl, ok := t.Deadline(); ok {
 		g.end = dl.Add(-wsoReserve)
 		if left := g.end.Sub(g.t0); left < wsoMinBudget {
@@ -964,18 +983,44 @@ func (cl *wsoCli) closeWait(c net.Conn, buf []byte) wsoClose {
 // giveUp prints one WSO-GIVEUP record: the connection's milestones, its
 // timeline, and the full state of both ends now, with the shape it is in.
 // One t.Logf call, so records from concurrent clients never interleave, and
-// printed at once, so it survives a test binary that later times out.
+// printed at once, so it survives a test binary that later times out. It
+// marks the client as having given up, which excuses the server errors that
+// follow its close (serverErrs): only a client that failed the test may.
 func (cl *wsoCli) giveUp(t *testing.T, c net.Conn, kind, what string) {
 	cl.mu.Lock()
 	cl.gaveUp = true
 	cl.mu.Unlock()
+	t.Log(cl.record(c, "WSO-GIVEUP", kind, what))
+}
+
+// closeSlow prints one WSO-CLOSESLOW record for a close wait that ended well
+// (the server closed) but went silent for longer than wsoCloseSlow
+// (celeris#633): the same both-ends timeline as a give-up, so a 10 to 15 s
+// silence can be attributed. It is a record, not a verdict: it asserts nothing
+// and does not mark the client as given up (that would excuse server errors
+// the rig should judge). No-op when the wait's longest silence was not over
+// wsoCloseSlow.
+func (cl *wsoCli) closeSlow(t *testing.T, c net.Conn, kind string, r wsoClose) {
+	if r.maxGap <= wsoCloseSlow {
+		return
+	}
+	t.Log(cl.record(c, "WSO-CLOSESLOW", kind, fmt.Sprintf("the server closed after a silent stretch of %s, longer than %v: %s",
+		r.maxGap.Round(time.Millisecond), wsoCloseSlow, r)))
+}
+
+// record renders the connection's state from both ends under a header line:
+// milestones, the timeline (the first wsoFirstSamples and the last
+// wsoLastSamples of the one-per-second samples taken while waiting), each end's
+// queues, TCP_INFO and skmem (SO_MEMINFO, what ss -tmi shows), and the
+// kernel's TCP memory against its limits (celeris#783).
+func (cl *wsoCli) record(c net.Conn, tag, kind, what string) string {
 	ti, inq, outq := wsoCliSockInfo(c)
 	v := cl.g.srvView(cl.port)
 	srvPort := int(cl.g.srvPort.Load())
 	srvRow, _ := wsoProcTCP(srvPort, cl.port)
 	cliRow, _ := wsoProcTCP(cl.port, srvPort)
 	var b strings.Builder
-	fmt.Fprintf(&b, "WSO-GIVEUP %s conn=127.0.0.1:%d %s\n", kind, cl.port, what)
+	fmt.Fprintf(&b, "%s %s conn=127.0.0.1:%d %s\n", tag, kind, cl.port, what)
 	fmt.Fprintf(&b, "  shape: %s\n", wsoShape(ti, inq, v))
 	cl.mu.Lock()
 	fmt.Fprintf(&b, "  milestones: %s\n", strings.Join(cl.marks, "; "))
@@ -999,7 +1044,9 @@ func (cl *wsoCli) giveUp(t *testing.T, c net.Conn, kind, what string) {
 	if v.ti != nil {
 		fmt.Fprintf(&b, "\n  now: srv tcpinfo{%s}", wsoTCPFull(v.ti))
 	}
-	t.Log(b.String())
+	fmt.Fprintf(&b, "\n  now: cli %s\n  now: srv %s\n  now: kernel %s",
+		wsoCliSkmem(c), cl.g.wsoSrvSkmem(cl.port), wsoKernelMem())
+	return b.String()
 }
 
 // --------------------------------------------------------------- the verdicts
@@ -1077,6 +1124,11 @@ type wsoStall struct {
 	onsetC, lastC string // the client side at those samples
 	marks         string // the client's milestones at the last sample
 	open          bool   // still going when the watch stopped
+	// sched, discount and effective are the verdict's figures (see
+	// wsoJudgeStretch): the longest runnable wait the Go scheduler recorded
+	// inside the stretch's window, how much of it excuses the stretch, and
+	// the stretch less that.
+	sched, discount, effective time.Duration
 }
 
 func (st *wsoStall) String() string {
@@ -1086,8 +1138,12 @@ func (st *wsoStall) String() string {
 	}
 	return fmt.Sprintf("WSO-STALL conn=127.0.0.1:%d the engine read nothing for %s (%d samples, +%s to +%s%s) "+
 		"from a server socket holding unread bytes, while the chanReader was neither paused nor holding "+
-		"anything and the handler had not exited\n  onset: %s\n         %s\n  last:  %s\n         %s\n  client milestones: %s",
+		"anything and the handler had not exited\n  scheduler: the longest runnable wait the Go scheduler recorded "+
+		"inside the stretch was %s; discount %s (cap %s); effective stall %s (limit %s)"+
+		"\n  onset: %s\n         %s\n  last:  %s\n         %s\n  client milestones: %s",
 		st.port, wsoSec(st.toNs-st.fromNs), st.samples, wsoSec(st.fromNs), wsoSec(st.toNs), still,
+		st.sched.Round(time.Millisecond), st.discount.Round(time.Millisecond), wsoSchedDiscountCap,
+		st.effective.Round(time.Millisecond), wsoRecvStall,
 		st.onset, st.onsetC, st.last, st.lastC, st.marks)
 }
 
@@ -1147,6 +1203,7 @@ type wsoEpisode struct {
 	raw, pauses, resumes int64
 	samples              int
 	onset, onsetC        string
+	lastV                wsoSrvView // the view at lastNs
 	rec                  *wsoStall
 }
 
@@ -1180,10 +1237,18 @@ func wsoWatchStep(ep *wsoEpisode, v wsoSrvView, now int64) (next *wsoEpisode, op
 // wsoWatchEvery until stop is called. A stretch is a run of samples in which
 // the connection is wsoStallable and the engine read nothing (bytes received
 // minus unread did not move) and the chanReader applied no pause or resume.
-// Every stretch that reaches wsoRecvStall is recorded, from its first sample
-// to its last. stop returns those. The longest stretch seen on any
-// connection is kept too, whether or not it reached the limit
-// (longestStretch), so a healthy run shows how close it came.
+// Every stretch that fails the verdict (wsoJudgeStretch: its length less the
+// Go scheduler's own latency inside it is wsoRecvStall or more, see
+// backpressure_schedlat_linux_test.go) is recorded, from its first sample to
+// its last. stop returns those. The longest stretch seen on any connection is
+// kept too, whether or not it failed (longestStretch), so a healthy run shows
+// how close it came.
+//
+// A stretch is judged when it ends (the view moved, the connection stopped
+// being stallable or ended, the watcher was starved, the watch stopped), with
+// the scheduler latency recorded inside it, and while it is open only when it
+// fails even with the largest discount (wsoStretchFailsLive). A stretch the
+// discount excused is counted (stallDiscounted on the waits line).
 //
 // The samples between a stretch's first and last are not what proves it:
 // bytes read, pauses and resumes only ever grow, a chanReader holding
@@ -1198,49 +1263,51 @@ func wsoWatchStep(ep *wsoEpisode, v wsoSrvView, now int64) (next *wsoEpisode, op
 // one (a pass that was slow, or blocked reading a view) starts over at that
 // sample (wsoWatchStep), counted as watchGapRestarts on the waits line. A
 // watch that restarts its stretches this way cannot reach wsoRecvStall, so a
-// run with many of them says nothing about a stall.
+// run with many of them says nothing about a stall. A stretch the watcher's
+// own starvation interrupts is judged up to its last sample, with the
+// scheduler latency recorded until the pass that found the gap.
 //
 // Start it once the server listens and stop it once the clients are done:
 // the verdict is the test's, on the test goroutine.
 func (g *wsoRig) watch() (stop func() []*wsoStall) {
 	done, fin := make(chan struct{}), make(chan struct{})
-	var stalls []*wsoStall
-	var longest int64
+	w := newWSOWatchState()
 	go func() {
 		defer close(fin)
-		eps := map[*wsoSrv]*wsoEpisode{}
 		tick := time.NewTicker(wsoWatchEvery)
 		defer tick.Stop()
 		idleFrom := g.since() // when the watcher last started waiting for a tick
 		for {
 			select {
 			case <-done:
-				for _, ep := range eps {
-					if ep.rec != nil {
-						ep.rec.open = true
-					}
-				}
+				now := g.since()
+				g.schedObserve(now)
+				g.watchSettleAll(w, now, true)
 				return
 			case <-tick.C:
 			}
+			g.schedObserve(g.since())
 			// A tick is due at most wsoWatchEvery after the watcher starts
 			// waiting (sooner when a pass overran). Waiting longer than that
 			// plus wsoWatchGap means this goroutine was runnable and not run.
 			if lag := time.Duration(g.since()-idleFrom) - wsoWatchEvery; lag > 0 {
 				g.mu.Lock()
 				g.watchMaxLag = max(g.watchMaxLag, lag)
-				if lag > wsoWatchGap {
+				reset := lag > wsoWatchGap
+				if reset {
 					g.watchResets++
-					clear(eps)
 				}
 				g.mu.Unlock()
+				if reset {
+					g.watchSettleAll(w, g.since(), false)
+				}
 			}
 			g.mu.Lock()
 			hs := append([]*wsoSrv(nil), g.hs...)
 			g.mu.Unlock()
 			for _, s := range hs {
 				if s.port <= 0 || s.phase.Load() == 3 {
-					delete(eps, s)
+					g.watchDrop(w, s, g.since())
 					continue
 				}
 				// now is taken before the view is read: the sample is stamped
@@ -1248,38 +1315,7 @@ func (g *wsoRig) watch() (stop func() []*wsoStall) {
 				// its stamp by the time a starved pass gets to it.
 				now := g.since()
 				v := g.srvViewOf(s)
-				ep, opened, gapRestart := wsoWatchStep(eps[s], v, now)
-				if gapRestart {
-					g.mu.Lock()
-					g.watchGapRestarts++
-					g.mu.Unlock()
-				}
-				if ep == nil {
-					delete(eps, s)
-					continue
-				}
-				eps[s] = ep
-				if opened {
-					ep.onsetC = g.cliNow(s.port)
-				}
-				d := now - ep.fromNs
-				if d > longest {
-					longest = d
-					st := wsoStall{port: s.port, fromNs: ep.fromNs, toNs: now, samples: ep.samples,
-						onset: ep.onset, onsetC: ep.onsetC, last: v.String(), lastC: g.cliNow(s.port), marks: g.cliMarks(s.port)}
-					g.mu.Lock()
-					g.longest = st
-					g.mu.Unlock()
-				}
-				if d < int64(wsoRecvStall) {
-					continue
-				}
-				if ep.rec == nil {
-					ep.rec = &wsoStall{port: s.port, fromNs: ep.fromNs, onset: ep.onset, onsetC: ep.onsetC}
-					stalls = append(stalls, ep.rec)
-				}
-				ep.rec.toNs, ep.rec.samples = now, ep.samples
-				ep.rec.last, ep.rec.lastC, ep.rec.marks = v.String(), g.cliNow(s.port), g.cliMarks(s.port)
+				g.watchSample(w, s, v, now)
 			}
 			idleFrom = g.since()
 		}
@@ -1288,9 +1324,146 @@ func (g *wsoRig) watch() (stop func() []*wsoStall) {
 		close(done)
 		<-fin
 		g.mu.Lock()
-		g.stallMax = time.Duration(longest)
+		g.stallMax = time.Duration(w.longest)
 		g.mu.Unlock()
-		return stalls
+		return w.stalls
+	}
+}
+
+// wsoWatchState is what watch keeps between passes: the open episode of each
+// connection, the stretches that failed, and the longest raw stretch (ns).
+type wsoWatchState struct {
+	eps     map[*wsoSrv]*wsoEpisode
+	stalls  []*wsoStall
+	longest int64
+}
+
+func newWSOWatchState() *wsoWatchState { return &wsoWatchState{eps: map[*wsoSrv]*wsoEpisode{}} }
+
+// schedObserve has the probe read the scheduler's latency histogram; call it
+// once per pass, before the pass's samples.
+func (g *wsoRig) schedObserve(nowNs int64) {
+	if g.sched != nil {
+		g.sched.observe(nowNs)
+	}
+}
+
+// schedIn is the longest runnable wait recorded inside (fromNs, toNs].
+func (g *wsoRig) schedIn(fromNs, toNs int64) time.Duration {
+	if g.sched == nil {
+		return 0
+	}
+	return g.sched.maxIn(fromNs, toNs)
+}
+
+// stallOf renders the stretch of ep as of toNs, the sample time of v, with
+// the scheduler latency recorded until windowNs.
+func (g *wsoRig) stallOf(s *wsoSrv, ep *wsoEpisode, toNs, windowNs int64, v wsoSrvView) wsoStall {
+	sched := g.schedIn(ep.fromNs, windowNs)
+	disc, eff, _ := wsoJudgeStretch(time.Duration(toNs-ep.fromNs), sched)
+	return wsoStall{port: s.port, fromNs: ep.fromNs, toNs: toNs, samples: ep.samples,
+		onset: ep.onset, onsetC: ep.onsetC, last: v.String(), lastC: g.cliNow(s.port), marks: g.cliMarks(s.port),
+		sched: sched, discount: disc, effective: eff}
+}
+
+// watchSample applies one sample v of the connection s, taken at now (before v
+// was read), to the watch's state: it settles the episode the sample ended,
+// opens or extends the next, keeps the longest stretch and records a stretch
+// that fails while open.
+func (g *wsoRig) watchSample(w *wsoWatchState, s *wsoSrv, v wsoSrvView, now int64) {
+	old := w.eps[s]
+	ep, opened, gapRestart := wsoWatchStep(old, v, now)
+	if gapRestart {
+		g.mu.Lock()
+		g.watchGapRestarts++
+		g.mu.Unlock()
+	}
+	if old != nil && ep != old {
+		g.settleEpisode(w, s, old, now)
+	}
+	if ep == nil {
+		delete(w.eps, s)
+		return
+	}
+	w.eps[s] = ep
+	if opened {
+		ep.onsetC = g.cliNow(s.port)
+	}
+	ep.lastV = v
+	d := now - ep.fromNs
+	if d > w.longest {
+		w.longest = d
+		st := g.stallOf(s, ep, now, now, v)
+		g.mu.Lock()
+		g.longest = st
+		g.mu.Unlock()
+	}
+	if ep.rec == nil && !wsoStretchFailsLive(time.Duration(d)) {
+		return
+	}
+	st := g.stallOf(s, ep, now, now, v)
+	if ep.rec == nil {
+		ep.rec = &st
+		w.stalls = append(w.stalls, ep.rec)
+		return
+	}
+	*ep.rec = st
+}
+
+// settleEpisode judges the episode ep of s, which a pass at windowNs found
+// ended, over its whole window: from its first sample to windowNs for the
+// scheduler latency, from its first to its last sample for its length.
+func (g *wsoRig) settleEpisode(w *wsoWatchState, s *wsoSrv, ep *wsoEpisode, windowNs int64) {
+	proven := time.Duration(ep.lastNs - ep.fromNs)
+	if ep.rec != nil || proven >= wsoRecvStall {
+		st := g.stallOf(s, ep, ep.lastNs, windowNs, ep.lastV)
+		g.mu.Lock()
+		if g.longest.port == s.port && g.longest.fromNs == ep.fromNs {
+			g.longest = st // the figures of the whole window, now that it is known
+		}
+		g.mu.Unlock()
+		if ep.rec != nil {
+			// Failed while open. Its length is final now.
+			st.open = ep.rec.open
+			*ep.rec = st
+			return
+		}
+		if _, _, fails := wsoJudgeStretch(proven, st.sched); fails {
+			ep.rec = &st
+			w.stalls = append(w.stalls, ep.rec)
+			return
+		}
+		g.mu.Lock()
+		g.stallDiscounted++
+		g.stallDiscountedMax = max(g.stallDiscountedMax, proven)
+		g.mu.Unlock()
+	}
+}
+
+// watchDrop ends the episode of a connection that is no longer watched.
+func (g *wsoRig) watchDrop(w *wsoWatchState, s *wsoSrv, now int64) {
+	if ep := w.eps[s]; ep != nil {
+		g.settleEpisode(w, s, ep, now)
+		delete(w.eps, s)
+	}
+}
+
+// watchSettleAll ends every open episode at now: the watcher was starved, or
+// (stopping) the watch is over, in which case a stretch that failed is marked
+// as still going.
+func (g *wsoRig) watchSettleAll(w *wsoWatchState, now int64, stopping bool) {
+	open := make([]*wsoSrv, 0, len(w.eps))
+	for s := range w.eps {
+		open = append(open, s)
+	}
+	sort.Slice(open, func(i, j int) bool { return w.eps[open[i]].fromNs < w.eps[open[j]].fromNs })
+	for _, s := range open {
+		ep := w.eps[s]
+		g.settleEpisode(w, s, ep, now)
+		if stopping && ep.rec != nil {
+			ep.rec.open = true
+		}
+		delete(w.eps, s)
 	}
 }
 
@@ -1302,11 +1475,12 @@ func wsoAssertNoStalls(t *testing.T, name string, stalls []*wsoStall) {
 		t.Log(st.String())
 	}
 	if len(stalls) != 0 {
-		t.Errorf("%s: %d connection(s) left unread for %v or longer: the server socket held bytes, nothing asked the "+
+		t.Errorf("%s: %d connection(s) left unread for %v or longer (less the Go scheduler's own latency inside the "+
+			"stretch, at most %v of it): the server socket held bytes, nothing asked the "+
 			"engine to stop reading (the chanReader was neither paused nor holding anything) and the engine read "+
 			"nothing. That is the celeris#607 class, a recv held back behind a send the client's closed window "+
 			"blocks; the client's own reads get it through, so no give-up shows it. Each WSO-STALL record above has "+
-			"the stretch's state at both ends", name, len(stalls), wsoRecvStall)
+			"the stretch's state at both ends and the scheduler latency it was judged with", name, len(stalls), wsoRecvStall, wsoSchedDiscountCap)
 	}
 }
 
@@ -1338,6 +1512,9 @@ type wsoWaitStats struct {
 	watchResets            int
 	watchMaxLag            time.Duration
 	watchGapRestarts       int
+	stallDiscounted        int           // stretches over wsoRecvStall excused by scheduler latency (celeris#871)
+	stallDiscountedMax     time.Duration // the longest of them, raw
+	schedLatMax            time.Duration // the longest runnable wait the Go scheduler recorded in the run
 }
 
 func (g *wsoRig) waitStats() wsoWaitStats {
@@ -1346,6 +1523,10 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	st.recvStallMax, st.watchResets, st.watchMaxLag, st.watchGapRestarts = g.stallMax, g.watchResets, g.watchMaxLag, g.watchGapRestarts
+	st.stallDiscounted, st.stallDiscountedMax = g.stallDiscounted, g.stallDiscountedMax
+	if p, ok := g.sched.(*wsoSchedLat); ok {
+		st.schedLatMax = p.longest()
+	}
 	for _, cl := range g.clis {
 		cl.mu.Lock()
 		st.conns++
@@ -1377,7 +1558,8 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 
 func (st wsoWaitStats) String() string {
 	r := func(d time.Duration) string { return d.Round(time.Millisecond).String() }
-	return fmt.Sprintf("waits: conns=%d fcMax=%s cwMax=%s maxNoProg=%s fcSlices=%d drainedWhileWaiting=%d closeP50=%s closeP99=%s closeMax=%s closeOver%s=%d closeSilentOver%s=%d maxCloseGap=%s recvStallMax=%s watchResets=%d watchMaxLag=%s watchGapRestarts=%d",
+	return fmt.Sprintf("waits: conns=%d fcMax=%s cwMax=%s maxNoProg=%s fcSlices=%d drainedWhileWaiting=%d closeP50=%s closeP99=%s closeMax=%s closeOver%s=%d closeSilentOver%s=%d maxCloseGap=%s recvStallMax=%s watchResets=%d watchMaxLag=%s watchGapRestarts=%d stallDiscounted=%d stallDiscountedMax=%s schedLatMax=%s",
 		st.conns, r(st.fcMax), r(st.cwMax), r(st.maxNoProg), st.fcSlices, st.drainedBytes, r(st.closeP50), r(st.closeP99), r(st.closeMax),
-		wsoCloseSlow, st.closeSlow, wsoCloseSlow, st.closeSilentSlow, r(st.maxCloseGap), r(st.recvStallMax), st.watchResets, r(st.watchMaxLag), st.watchGapRestarts)
+		wsoCloseSlow, st.closeSlow, wsoCloseSlow, st.closeSilentSlow, r(st.maxCloseGap), r(st.recvStallMax), st.watchResets, r(st.watchMaxLag), st.watchGapRestarts,
+		st.stallDiscounted, r(st.stallDiscountedMax), r(st.schedLatMax))
 }
