@@ -48,6 +48,20 @@ func (f RxFree) Sentence() string {
 		FormatCPUs(f.Freed), strings.Join(vs, ", "), f.Port, f.SharePercent)
 }
 
+// vecInfo is a busy vector the rule judged, with the ports that list it.
+type vecInfo struct {
+	RxVector
+	ports []string
+}
+
+// from says whose vector it is, for the Debug text.
+func (v vecInfo) from() string {
+	if len(v.ports) > 1 {
+		return "shared by " + strings.Join(v.ports, ", ")
+	}
+	return "of " + v.ports[0]
+}
+
 // Limits of the rule. They are choices fitted to msr1, the one host measured
 // (see DESIGN-vnv-rule in the PR): enp49s0 took 69% to 73% of the packets of
 // the host in 6 snapshots, the busy vectors had 1.7e9 to 4.0e9 interrupts since
@@ -84,18 +98,35 @@ const (
 //     rx_packets since boot, and at least a million, is the receiving port.
 //  2. Its busy vectors (at least 1000 interrupts since boot, whatever their
 //     share) and the busy vectors of the other ports: the CPU of each is the
-//     single CPU of effective_affinity_list (else smp_affinity_list).
-//  3. If a busy vector of ANOTHER port is serviced by a CPU that runs no loop
+//     single CPU of effective_affinity_list (else smp_affinity_list). A vector
+//     that more than one of the ports lists (the ports of an mlx4 card share
+//     their MSI-X vectors) is not the receiving port's alone: it counts with
+//     the other ports'.
+//  3. A port with a million packets or more and no busy vector is a
+//     contradiction (a wrapped 32-bit counter, or vectors the rule cannot see):
+//     the vector a loop should stay beside may be the hidden one, so the rule
+//     steps aside. So it does when the ports list more than nicMaxVectors
+//     vectors, which it does not read whole.
+//  4. If a busy vector of ANOTHER port is serviced by a CPU that runs no loop
 //     (a little CPU, or outside the allowed set), the rule steps aside. A loop
 //     must stay on a TX-completion vector CPU (the #1036 stall finding); CPU 4
 //     hosting enp1s0's vector is the msr1 boot placement, and its plan (CPUs 4
 //     and 8 both without a loop) was not measured.
-//  4. The candidates are the big CPUs that service a busy vector of the
+//  5. The candidates are the big CPUs that service a busy vector of the
 //     receiving port, minus those that also service a busy vector of another
 //     port: a CPU that hosts another port's TX completion keeps its loop.
-//  5. At most rxFreeBudget(n) CPUs may go (the floor of loops, n big CPUs). More
+//  6. At most rxFreeBudget(n) CPUs may go (the floor of loops, n big CPUs). More
 //     candidates than that is how an RSS spread looks, with no hot spot: the
 //     rule frees nothing rather than pick among equals.
+//  7. At least one busy vector of the listener's ports must stay on a big CPU
+//     that keeps its loop: the rule's premise is a loop kept beside a
+//     TX-completion vector. With a single port, or with the other ports quiet,
+//     there is none, and the plan is #1049's.
+//
+// The rule is for one loop on each big CPU, the default count of msr1
+// (rxFreeFor): with fewer loops (GOMAXPROCS under the big CPU count) the CPUs
+// that keep a loop are not the ones the plan spreads the loops on, and the rule
+// does not run.
 //
 // A busy vector is any vector, so a TX-completion-only vector of the receiving
 // port is freed with the rest: the evidence of msr1 is that CPU 8, which
@@ -169,7 +200,7 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 		share = int(min(100, uint64(float64(rxPkts[best])*100/float64(total))))
 	}
 
-	// 2. The busy vectors and their CPUs.
+	// 2. The vectors of the ports, each judged once, and the ports that list it.
 	var rows []irqRow
 	if b, err := src.fs.readFile(src.procDir + "/interrupts"); err == nil {
 		rows = parseInterrupts(b)
@@ -181,60 +212,77 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 	for _, r := range rows {
 		table[r.irq] = r
 	}
-	type vecInfo struct {
-		RxVector
-		dev string
-	}
-	var rxVecs, otherVecs []vecInfo
-	seen := map[int]bool{}
-	judged := 0
+	listers := map[int][]string{}
+	var order []int
 	for _, dev := range devs {
 		irqs, ok := deviceIRQs(dev, src, rows)
 		if !ok {
 			return why("cannot list the interrupt vectors of %s", dev)
 		}
 		for _, irq := range irqs {
-			if seen[irq] {
-				continue
+			if _, listed := listers[irq]; !listed {
+				if len(order) >= nicMaxVectors {
+					return why("more than %d interrupt vectors behind the listener's ports: the rule does not read them all, "+
+						"and a busy vector it skipped could be the one a loop stays beside", nicMaxVectors)
+				}
+				order = append(order, irq)
 			}
-			seen[irq] = true
-			if judged++; judged > nicMaxVectors {
-				break
-			}
-			row, listed := table[irq]
-			if !listed || row.total < rxVectorMinInterrupts {
-				continue
-			}
-			name := row.label
-			if name == "" {
-				name = "irq" + strconv.Itoa(irq)
-			}
-			cpu := effectiveCPU(irq, src)
-			if cpu < 0 {
-				return why("IRQ %d (%s) of %s took %d interrupts since boot but is not serviced by a single known CPU", irq, name, dev, row.total)
-			}
-			v := vecInfo{RxVector{IRQ: irq, Name: name, CPU: cpu, Count: row.total}, dev}
-			if dev == port {
-				rxVecs = append(rxVecs, v)
-			} else {
-				otherVecs = append(otherVecs, v)
+			if !slices.Contains(listers[irq], dev) {
+				listers[irq] = append(listers[irq], dev)
 			}
 		}
 	}
+	var rxVecs, otherVecs []vecInfo
+	hasBusy := map[string]bool{}
+	for _, irq := range order {
+		row, listed := table[irq]
+		if !listed || row.total < rxVectorMinInterrupts {
+			continue
+		}
+		ports := listers[irq]
+		for _, d := range ports {
+			hasBusy[d] = true
+		}
+		name := row.label
+		if name == "" {
+			name = "irq" + strconv.Itoa(irq)
+		}
+		v := vecInfo{RxVector: RxVector{IRQ: irq, Name: name, Count: row.total}, ports: ports}
+		if v.CPU = effectiveCPU(irq, src); v.CPU < 0 {
+			return why("IRQ %d (%s) %s took %d interrupts since boot but is not serviced by a single known CPU", irq, name, v.from(), row.total)
+		}
+		// A vector the receiving port lists alone is its own; one that another
+		// port lists too (shared MSI-X vectors) is also that port's TX
+		// completion, whatever the order of the names.
+		if len(ports) == 1 && ports[0] == port {
+			rxVecs = append(rxVecs, v)
+		} else {
+			otherVecs = append(otherVecs, v)
+		}
+	}
 
-	// 3. A busy vector of another port on a CPU with no loop: step aside.
+	// 3. A port with packets and no busy vector: a wrapped counter, or vectors
+	// the rule cannot see.
+	for i, dev := range devs {
+		if rxPkts[i] >= rxMinPackets && !hasBusy[dev] {
+			return why("%s received %d packets since boot and has no busy vector (a wrapped 32-bit counter, or vectors the rule "+
+				"cannot read): the vector a loop should stay beside may be that one", dev, rxPkts[i])
+		}
+	}
+
+	// 4. A busy vector of another port on a CPU with no loop: step aside.
 	for _, v := range otherVecs {
 		if !slices.Contains(big, v.CPU) {
-			return why("IRQ %d (%s) of %s, busy since boot, is serviced by CPU %d, which runs no loop: "+
+			return why("IRQ %d (%s) %s, busy since boot, is serviced by CPU %d, which runs no loop: "+
 				"its TX completion has no loop to stay beside and freeing %s's CPUs is not measured there",
-				v.IRQ, v.Name, v.dev, v.CPU, port)
+				v.IRQ, v.Name, v.from(), v.CPU, port)
 		}
 	}
 	for _, v := range otherVecs {
-		note("kept: IRQ %d (%s) of %s on CPU %d is busy and keeps its loop", v.IRQ, v.Name, v.dev, v.CPU)
+		note("kept: IRQ %d (%s) %s on CPU %d is busy and keeps its loop", v.IRQ, v.Name, v.from(), v.CPU)
 	}
 
-	// 4. The candidates.
+	// 5. The candidates.
 	slices.SortFunc(rxVecs, func(a, b vecInfo) int {
 		if a.Count != b.Count {
 			if a.Count > b.Count {
@@ -262,7 +310,7 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 	if len(freed) == 0 {
 		return why("no busy vector of %s (%d%% of the packets) is serviced by a CPU that could lose its loop", port, share)
 	}
-	// 5. The floor.
+	// 6. The floor.
 	if len(freed) > budget {
 		slices.Sort(freed)
 		return why("%d CPUs (%s) service busy vectors of %s: more than the %d the floor of loops allows of %d non-little CPUs; "+
@@ -270,8 +318,32 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 			len(freed), FormatCPUs(freed), port, budget, len(big))
 	}
 	slices.Sort(freed)
+	// 7. The premise: a loop that stays beside a busy vector.
+	stays := false
+	for _, vs := range [][]vecInfo{rxVecs, otherVecs} {
+		for _, v := range vs {
+			stays = stays || (slices.Contains(big, v.CPU) && !slices.Contains(freed, v.CPU))
+		}
+	}
+	if !stays {
+		return why("freeing %s would leave no loop beside a busy vector (no other port has one on a CPU that keeps its loop): "+
+			"the rule keeps a loop beside a TX completion, and with none to stay beside the plan is not measured", FormatCPUs(freed))
+	}
 	rf.Port, rf.SharePercent, rf.Freed, rf.Vectors = port, share, freed, freedVecs
 	return rf
+}
+
+// rxFreeFor is the rule for the default count of numWorkers loops. It is
+// measured with one loop on each big CPU (msr1's default 8 of 8); below that
+// (GOMAXPROCS under the big CPU count, the default under a Kubernetes CPU
+// limit) #1049 spreads the few loops over the big CPUs in order, which are not
+// the CPUs the rule keeps a loop on, so it steps aside before reading a file.
+func rxFreeFor(numWorkers int, addr string, big []int, src nicSource) RxFree {
+	if numWorkers < len(big) {
+		return RxFree{Why: []string{fmt.Sprintf("%d loops by default, under the %d non-little CPUs: the rule is measured with a loop on each of them, "+
+			"and with fewer the CPUs it means to keep may run none", numWorkers, len(big))}}
+	}
+	return rxFreeCPUs(addr, big, src)
 }
 
 // rxFreeBudget is the most big CPUs the rule may leave without a loop when n

@@ -288,6 +288,10 @@ func lowerDevices(ifaces []string, src nicSource) []string {
 		if err != nil {
 			return
 		}
+		// readdir order is the file system's: sorted, so that the order of the
+		// ports (and with it which of them lists a shared vector first) does
+		// not change between boots or file systems.
+		slices.Sort(ents)
 		for _, e := range ents {
 			if lower, ok := strings.CutPrefix(e, "lower_"); ok {
 				walk(lower, depth+1)
