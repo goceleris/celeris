@@ -248,8 +248,9 @@ func TestWSOStallSchedulerLatencyAfterTheProvenSpan(t *testing.T) {
 			if len(w.stalls) != 1 || g.stallDiscounted != 0 {
 				t.Fatalf("stalls = %d discounted = %d, want 1 and 0: a %v wait after the span excused it", len(w.stalls), g.stallDiscounted, wait)
 			}
-			if st := w.stalls[0]; st.sched != 0 || st.effective != time.Duration(provenEndMs)*time.Millisecond {
-				t.Fatalf("sched = %v effective = %v, want 0 and the whole stretch %v", st.sched, st.effective, time.Duration(provenEndMs)*time.Millisecond)
+			if st := w.stalls[0]; st.sched != 0 || st.covered != 0 || st.effective != time.Duration(provenEndMs)*time.Millisecond {
+				t.Fatalf("sched = %v covered = %v effective = %v, want 0, 0 and the whole stretch %v (the record's own figures must not count the wait after the span either)",
+					st.sched, st.covered, st.effective, time.Duration(provenEndMs)*time.Millisecond)
 			}
 		})
 		t.Run(e.name+": control, the same wait inside the span excuses it", func(t *testing.T) {
