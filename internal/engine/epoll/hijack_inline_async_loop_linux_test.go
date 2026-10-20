@@ -174,7 +174,13 @@ func TestInlineHijackOnAsyncLoop(t *testing.T) {
 			// dispatch goroutine would hijack just as well, through the
 			// other branch of hijackConn, and this test would no longer
 			// cover the inline one. Neither subtest requests /async, so
-			// not even the async route promoted a connection.
+			// not even the async route promoted a connection. drainRead
+			// has a second promotion site (inline bytes that end in the
+			// middle of a request, HasPendingData): a red here with a
+			// nonzero count and a /hj that did run inline would be a
+			// request split across two recvs, not a regression of the
+			// RouteAsync wiring. The clients write each request in one
+			// Write, so this does not happen on loopback.
 			if got := e.Metrics().AsyncPromotedConns; got != 0 {
 				t.Errorf("AsyncPromotedConns = %d, want 0: /hj did not run inline on the event loop", got)
 			}
@@ -230,7 +236,8 @@ func takeReleasedConnState(l *Loop, cs *connState) *connState {
 // does), and keeps it. Once the engine has stopped, every state the hook took
 // must still have InlineMode true: nothing wrote to it from the hijacked
 // connection's request. The hook runs on the loop's own thread, so the take is
-// the same P's pool access the next accept on that loop makes. (Two workers:
+// normally the pool access the next accept on that loop makes (same P, unless
+// a preemption moved the goroutine; the test counts its hits). (Two workers:
 // the engine refuses one.)
 func TestInlineHijackLeavesReissuedConnStateAlone(t *testing.T) {
 	var hijacked atomic.Int64

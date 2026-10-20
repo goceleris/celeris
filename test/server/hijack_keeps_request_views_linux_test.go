@@ -196,7 +196,9 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 			if a.asyncHandlers {
 				// Read before the server stops. /hj never reached an async
 				// route, so no conn was promoted: it ran inline, which is
-				// the branch this arm is here for.
+				// the branch this arm is here for. (drainRead's second
+				// promotion site, a request split across two recvs, would
+				// also count; the client writes each request at once.)
 				if n := srv.EngineInfo().Metrics.AsyncPromotedConns; n != 0 {
 					t.Errorf("AsyncPromotedConns = %d, want 0: /hj did not run inline on the async loop, so this arm is not the inline-hijack branch it stands for", n)
 				}

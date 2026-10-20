@@ -70,6 +70,8 @@ func TestHijackWithAsyncHandlersOnEpoll(t *testing.T) {
 		}
 	}
 	// Read before the server stops, while the engine's counters are live.
+	// (drainRead's second promotion site, a request split across two recvs,
+	// would also count; get writes each request at once.)
 	if n := srv.EngineInfo().Metrics.AsyncPromotedConns; n != 0 {
 		t.Errorf("AsyncPromotedConns = %d after 20 hijacks, want 0: /hj did not run inline on the event loop", n)
 	}
