@@ -489,7 +489,9 @@ func TestRxFreeShareThreshold(t *testing.T) {
 		{"one packet under 60%", 599_999_999, false},
 		{"59%", 590_000_000, false},
 		{"50/50 bond", 500_000_000, false},
-		{"100%: the other port received nothing", total, true},
+		// The other port received nothing: no port with a real share has a
+		// busy vector to stay beside (the 10% rule), so the rule steps aside.
+		{"100%: the other port received nothing", total, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := msr1Shape()
@@ -543,8 +545,10 @@ func TestRxFreeFreshBoot(t *testing.T) {
 			same1049(t, name, got, base)
 		})
 	}
+	// At the packet floor with the other port carrying 10% of the packets or
+	// more: the rule acts.
 	s := msr1Shape()
-	s.rx = map[string]uint64{"rx0": 1_000_000, "tx0": 0}
+	s.rx = map[string]uint64{"rx0": 1_000_000, "tx0": 111_112}
 	got, _ := s.plan(t, 12)
 	eq(t, "packets at the floor", got.CPUs, msr1LoopsVNV)
 }
