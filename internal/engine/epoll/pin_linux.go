@@ -2,7 +2,11 @@
 
 package epoll
 
-import "github.com/goceleris/celeris/internal/platform"
+import (
+	"log/slog"
+
+	"github.com/goceleris/celeris/internal/platform"
+)
 
 // pinThreadToCPU is the call that pins a loop's locked thread. A variable so
 // a test can make it fail.
@@ -18,6 +22,15 @@ var planWorkerCPUs = platform.PlanWorkerCPUsFor
 // (celeris#1036). It only reports: the loops are the plan's. A variable so a
 // test can stand in the host's interrupts.
 var annotateNICIRQs = platform.AnnotatePlanWithNICIRQs
+
+// nicIRQReport is annotateNICIRQs when the logger shows a Warn, and the plan as
+// it is otherwise: the report reads files, and nothing of it would be logged.
+func nicIRQReport(log *slog.Logger, plan platform.CPUPlan, addr string) platform.CPUPlan {
+	if !platform.NICIRQReportWanted(log) {
+		return plan
+	}
+	return annotateNICIRQs(plan, addr)
+}
 
 // The plan is also the loop count: the engine starts len(plan.CPUs) of them
 // (celeris#1036), which on a big.LITTLE host is fewer than the default.

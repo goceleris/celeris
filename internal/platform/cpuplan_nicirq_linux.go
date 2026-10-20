@@ -3,6 +3,8 @@
 package platform
 
 import (
+	"context"
+	"log/slog"
 	"slices"
 	"time"
 )
@@ -21,6 +23,14 @@ import (
 // was: it never fails Listen.
 func AnnotatePlanWithNICIRQs(p CPUPlan, addr string) CPUPlan {
 	return annotatePlanNIC(p, addr, defaultNICSource())
+}
+
+// NICIRQReportWanted reports whether log would show anything the interrupt
+// report adds to the pin line: its Warn is the lowest level it logs at that
+// the operator acts on, and Info and Debug are below it. The engines make the
+// report (a bounded number of file reads) only then.
+func NICIRQReportWanted(log *slog.Logger) bool {
+	return log != nil && log.Enabled(context.Background(), slog.LevelWarn)
 }
 
 // annotatePlanNIC is AnnotatePlanWithNICIRQs over a source. The gate (a
