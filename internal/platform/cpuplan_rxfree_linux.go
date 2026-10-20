@@ -22,6 +22,12 @@ type RxFree struct {
 	// Vectors are the busy interrupt vectors of Port that sit on the Freed
 	// CPUs, busiest first.
 	Vectors []RxVector
+	// NoLoop are the busy vectors of the other ports serviced by a CPU that
+	// runs no loop (a little CPU, or one outside the allowed set), whatever
+	// their share of the interrupts: the vectors that made the rule step aside
+	// (step 4). Empty unless it did. The interrupt report warns about the ones
+	// on a little CPU of the allowed set.
+	NoLoop []RxVector
 	// Why says, for a Debug line, why the rule did not act or which candidates
 	// it passed over. Empty when the rule did not run.
 	Why []string
