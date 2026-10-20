@@ -254,10 +254,12 @@ func TestDriverTakesNumberFreedByCloseConn775(t *testing.T) {
 // TestDriverTakesNumberFreedByCloseConn775RetriesACollision is the control of
 // the retry: a decoy socket takes the freed number between close(2) and the
 // check, on the first attempt, as another descriptor of the process would. That
-// attempt must report a collision (the decoy is verified to hold the number),
-// the test must not fail on it, and the second attempt must reach RegisterConn
-// and check the slot like any other. With one attempt allowed (the test as it
-// was: t.Fatalf on the first collision) this fails.
+// attempt must report a collision (the decoy is verified to hold the number; if
+// another descriptor got it before the decoy did, that is one more collision
+// and the decoy moves to the next attempt), the test must not fail on it, and a
+// later attempt must reach RegisterConn and check the slot like any other. With
+// one attempt allowed (the test as it was: t.Fatalf on the first collision)
+// this fails.
 func TestDriverTakesNumberFreedByCloseConn775RetriesACollision(t *testing.T) {
 	defer watchdog(t, time.Minute)()
 	// At least 2: a natural collision on the second attempt too is retried as
