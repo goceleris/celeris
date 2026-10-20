@@ -12,13 +12,16 @@ var pinThreadToCPU = platform.PinToCPU
 // stand in a plan.
 var planWorkerCPUs = platform.PlanWorkerCPUs
 
+// The plan is also the loop count: the engine starts len(plan.CPUs) of them
+// (celeris#1036), which on a big.LITTLE host is fewer than the default.
+
 // pinFailures collects the loops whose pin failed until the engine logs them
 // (celeris#909).
 var pinFailures platform.PinFailures
 
 // pinOwnThread pins the calling (locked) loop thread to the CPU the engine
-// planned for this loop. A loop planned unpinned (cpuID < 0: a little CPU of a
-// big.LITTLE host is left to the scheduler) does nothing. A pin the kernel
+// planned for this loop. A loop whose planned CPU is negative (cpuID < 0: the
+// planner never plans one since celeris#1036, a test plan may) does nothing. A pin the kernel
 // refuses leaves the loop unpinned and says so: cpuID becomes -1, which is
 // what CPUID reports for a loop that is not pinned, and the failure is
 // recorded for the engine to log.

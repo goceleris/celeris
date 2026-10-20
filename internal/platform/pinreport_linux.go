@@ -40,15 +40,16 @@ func (f *PinFailures) Take(key any) (PinFailure, bool) {
 
 // LogPinOutcome logs, once for an engine, what the plan did: one Info line
 // when the plan departs from the plain "i-th allowed CPU" rule (the little
-// CPUs it avoids), and one Warn line when loops could not pin and run
-// unpinned. It logs nothing otherwise.
+// CPUs it avoids, how many loops it holds and why, celeris#1036), and one Warn
+// line when loops could not pin and run unpinned. It logs nothing otherwise.
 func LogPinOutcome(log *slog.Logger, engine string, plan CPUPlan, failed []PinFailure) {
 	if log == nil {
 		return
 	}
 	if plan.Note != "" {
 		log.Info(engine+": capability-aware CPU pinning", "reason", plan.Note,
-			"allowed", FormatCPUs(plan.Allowed), "workers", len(plan.CPUs), "pinned", plan.Pinned())
+			"allowed", FormatCPUs(plan.Allowed), "workers", len(plan.CPUs), "requested", plan.Requested,
+			"pinned", plan.Pinned())
 	}
 	if len(failed) == 0 {
 		return
