@@ -309,9 +309,30 @@ func TestAConnGivenUpMidHandlerIsHandedBack(t *testing.T) {
 }
 
 // TestATransplantWaitsForARelink: between the pass giving a conn up and the
-// loop draining the goroutine's hand-back, a queue entry names cs, and a
-// transplant would return cs to the pool under it. The conn must not move
-// until the hand-back is drained, and then it may.
+// loop draining the goroutine's hand-back, a queue entry names cs. A transplant
+// that moved the conn then would return cs to the pool under that entry, and
+// the next accept could reissue the connState to another conn. relinkPending,
+// which flushedAtBoundary reads, keeps the conn where it is until an entry has
+// put it back on the dirty list. The conn must not move until the hand-back is
+// drained, and then it may.
+//
+// relinkPending is defence in depth for memory safety, not the guard production
+// leans on first. relink runs only while dispatchBusy saw the goroutine running
+// and unparked, and every way that goroutine can then exit is refused by
+// tryTransplant before flushedAtBoundary is reached: an exit that closes (a
+// panic, a handler error, "Connection: close") stores asyncClosed before
+// endDispatch, which tryTransplant reads both outside and under asyncInMu; the
+// quiesce exit is the deferred path, whose hand-off finishes only after the
+// exit and never pools cs (see
+// TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits); and the H2
+// promotion leaves protocol H2C with h1State nil.
+//
+// So this test reaches flushedAtBoundary's gate through a state built by hand:
+// the goroutine gone (asyncRun false) with no close asked (asyncClosed false)
+// and a hand-back queued. Production does not produce that state, and the test
+// does not show that it can. Remove the gate and the conn moves: that shows the
+// gate does its job if the state is ever reached, which is what defence in
+// depth is for.
 func TestATransplantWaitsForARelink(t *testing.T) {
 	rig := hijackRaceConn(t)
 	l, cs, local := rig.l, rig.cs, rig.local
@@ -325,8 +346,9 @@ func TestATransplantWaitsForARelink(t *testing.T) {
 		t.Fatal("the dirty pass waited on a running handler (celeris#669)")
 	}
 	release()
-	// The goroutine exits (a later close, say) after queuing its hand-back;
-	// the loop has not drained it yet.
+	// The goroutine is gone after queuing its hand-back, with no close asked
+	// (asyncClosed stays false, which a real exit would not leave: see above);
+	// the loop has not drained the hand-back yet.
 	cs.asyncInMu.Lock()
 	cs.relinkOwed = false
 	cs.asyncRun = false
