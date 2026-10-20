@@ -79,6 +79,11 @@ const (
 	// kernel spreads their CPUs over every CPU of the host: without this floor
 	// every big CPU would host "a vector of the port".
 	rxVectorMinInterrupts = 1000
+	// rxStayPercent is the share of the pooled packets a port needs for one of
+	// its busy vectors to count as the vector a loop stays beside (step 7). A
+	// choice, not a measurement: msr1's enp1s0 carries about 27% and enp49s0
+	// about 73%; a management port beside a data port carries far less.
+	rxStayPercent = 10
 	// rxMaxWhy bounds the Debug text.
 	rxMaxWhy = 12
 )
@@ -120,8 +125,10 @@ const (
 //     rule frees nothing rather than pick among equals.
 //  7. At least one busy vector of the listener's ports must stay on a big CPU
 //     that keeps its loop: the rule's premise is a loop kept beside a
-//     TX-completion vector. With a single port, or with the other ports quiet,
-//     there is none, and the plan is #1049's.
+//     TX-completion vector, and only the vectors of a port with at least
+//     rxStayPercent of the pooled rx_packets count. With a single port, or when
+//     no other port with that share has a busy vector on a CPU that keeps its
+//     loop (a data port and a management port), the plan is #1049's.
 //
 // The rule is for one loop on each big CPU, the default count of msr1
 // (rxFreeFor): with fewer loops (GOMAXPROCS under the big CPU count) the CPUs
@@ -313,21 +320,32 @@ func rxFreeCPUs(addr string, big []int, src nicSource) (rf RxFree) {
 	// 6. The floor.
 	if len(freed) > budget {
 		slices.Sort(freed)
-		return why("%d CPUs (%s) service busy vectors of %s: more than the %d the floor of loops allows of %d non-little CPUs; "+
-			"the load is spread over the queues, not on a hot spot",
+		return why("%d CPUs (%s) service busy vectors of %s, but the floor of loops allows only %d of %d non-little CPUs to lose their loop; "+
+			"the rule frees nothing rather than pick among equals",
 			len(freed), FormatCPUs(freed), port, budget, len(big))
 	}
 	slices.Sort(freed)
-	// 7. The premise: a loop that stays beside a busy vector.
+	// 7. The premise: a loop that stays beside a busy vector of a port that
+	// carries a real share of the packets (a management port with a few
+	// interrupts is not a TX completion worth keeping a loop beside).
+	carries := func(ports []string) bool {
+		for _, d := range ports {
+			if i := slices.Index(devs, d); i >= 0 && atLeastPercent(rxPkts[i], total, rxStayPercent) {
+				return true
+			}
+		}
+		return false
+	}
 	stays := false
 	for _, vs := range [][]vecInfo{rxVecs, otherVecs} {
 		for _, v := range vs {
-			stays = stays || (slices.Contains(big, v.CPU) && !slices.Contains(freed, v.CPU))
+			stays = stays || (slices.Contains(big, v.CPU) && !slices.Contains(freed, v.CPU) && carries(v.ports))
 		}
 	}
 	if !stays {
-		return why("freeing %s would leave no loop beside a busy vector (no other port has one on a CPU that keeps its loop): "+
-			"the rule keeps a loop beside a TX completion, and with none to stay beside the plan is not measured", FormatCPUs(freed))
+		return why("freeing %s would leave no loop to stay beside a busy vector of a port with at least %d%% of the packets "+
+			"(none keeps a loop): the rule keeps a loop beside a TX completion, and with none to stay beside the plan is not measured",
+			FormatCPUs(freed), rxStayPercent)
 	}
 	rf.Port, rf.SharePercent, rf.Freed, rf.Vectors = port, share, freed, freedVecs
 	return rf
