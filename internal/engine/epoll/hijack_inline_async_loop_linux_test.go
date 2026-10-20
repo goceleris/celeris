@@ -275,10 +275,14 @@ func TestInlineHijackLeavesReissuedConnStateAlone(t *testing.T) {
 	if reused.Load() < 1 {
 		t.Fatalf("witness: the pool handed the released connState back 0 times in %d hijacks, so no accept could have reissued it and this test shows nothing", n)
 	}
-	for i, st := range taken {
+	cleared := 0
+	for _, st := range taken {
 		if !st.h1State.InlineMode {
-			t.Errorf("reissued connState %d: InlineMode was cleared after its previous owner's hijack: drainRead wrote the parser state of a connection that is not the hijacked one", i)
+			cleared++
 		}
+	}
+	if cleared > 0 {
+		t.Errorf("InlineMode was cleared on %d of %d reissued connStates after their previous owner's hijack: drainRead wrote the parser state of a connection that is not the hijacked one", cleared, len(taken))
 	}
 }
 
