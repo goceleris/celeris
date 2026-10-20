@@ -260,7 +260,12 @@ func TestReapRerunLeavesAnExitingDispatchToItsExit(t *testing.T) {
 			wantExitDeferred(t, f, tc.name+", landing", tc.deferred)
 			// Left to its exit, not handed off: the conn keeps its slot and,
 			// as reapOutcome does for any conn the hand-off left in place, has
-			// its recv back (celeris#884 item 28).
+			// its recv back (celeris#884 item 28). The recv assertions and
+			// the counts above pin today's reapOutcome on purpose (the
+			// re-arm of a conn that is about to be closed is what a mutant
+			// that drops it turns red on); if a change stops re-arming such
+			// a conn, or counts the exit once less, update them with it and
+			// do not read the failure as a lost conn.
 			if f.w.conns[f.fd] != f.cs {
 				t.Fatalf("the conn lost its slot at the landing (conns[%d] = %p, want %p)", f.fd, f.w.conns[f.fd], f.cs)
 			}

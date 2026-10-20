@@ -96,13 +96,15 @@ import (
 //     a completion of the conn (its own response SEND, typically) or a reap
 //     retry lands between the goroutine's park and the drain of its claim. A
 //     rate.
-//   - exitDeferred: the same three sites finding a promoted async conn whose
-//     dispatch goroutine is on its way out through the close or the h2c
-//     exit (asyncClosed, or a protocol other than HTTP/1: celeris#780) and
-//     leaving the conn to the entry that goroutine queues. Ordering, not a
-//     fault. Unexported and read by tests only (a witness that the exit
-//     window those tests build was reached), not an EngineMetrics field
-//     (api/observe.txt).
+//   - exitDeferred: a worker-side hand-off attempt finding a promoted async
+//     conn whose dispatch goroutine is on its way out through the close or
+//     the h2c exit and leaving the conn to the entry that goroutine queues
+//     (celeris#780). Two sites count it: rerunHandOff (asyncClosed, or a
+//     protocol other than HTTP/1) and tryTransplant (asyncClosed only; an
+//     H2C conn is refused there by a later gate that is not counted).
+//     Ordering, not a fault. Unexported and read by tests only (a witness
+//     that the exit window those tests build was reached), not an
+//     EngineMetrics field (api/observe.txt).
 //
 // All are direct atomic adds: they fire on the stale-CQE, drain and hand-off
 // paths only, never on the per-request path while no drain is set, and like
