@@ -185,9 +185,9 @@ jobs:
       # margin, so 480 s (40%). Since then it has grown to 410.8 to 426.2 s in seven
       # Coverage runs on main from 13fa176 (2026-10-18) to 6ab5c28 (2026-10-20)
       # (run 39331135786: 425.6 s), and 437.3 s in an eighth (run 39334596754,
-      # which failed on a test, not the timeout), 91% of 480 s. 600 s is a 37%
-      # margin over the 437.3 s (celeris#890 item 66; the unit job's step has the
-      # same limit and its figures).
+      # which failed on a test, not on the timeout): 480 s was 10% over that, 600 s
+      # is 37% over (celeris#890 item 66; the unit job's step has the same limit
+      # and its figures).
       - name: internal/engine/iouring (own step, ci.yml unit set)
         run: |
           set -o pipefail

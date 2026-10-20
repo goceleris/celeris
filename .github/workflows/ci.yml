@@ -336,19 +336,20 @@ jobs:
       # celeris#657 step below also needs. It runs even when the step above
       # failed: the two share no package.
       #
-      # -timeout=600s. When celeris#987 gave this step its own timeout (300 s) the
-      # package's race run took 269.5 to 270.0 s (runs 38043064784, 38043064770
-      # and 38045532482, on #978's heads). The tests added since (celeris#959/#866,
-      # #895/#896 and #811 among them) have grown it to 401.7 to 415.8 s on this
-      # step in the eight CI runs on main from 13fa176 (2026-10-18) to 6ab5c28
-      # (2026-10-20), 415.8 s the longest (run 39334596768), so 480 s left 13%.
-      # The Coverage workflow's run of the same package (its own step) took
-      # 410.8 to 426.2 s in seven runs and 437.3 s in an eighth (run
-      # 39334596754, 91% of 480 s). A slower runner or the next
-      # test added would end in a timeout panic instead of a result. 600 s is a
-      # 44% margin over the 415.8 s here and 37% over the 437.3 s there. If the
-      # package keeps growing, split its slow tests into a step of their own
-      # rather than raise this again (celeris#890 item 66).
+      # -timeout=600s. Headroom below is the timeout as a percentage over the run's
+      # duration. The package's race run took 269.5 to 270.7 s on main (runs
+      # 38054122900, 38060237412 and 38062783373; 279.0 s on celeris#987's first
+      # run, 38064776993) when #987 gave this step 300 s. The tests added since
+      # (celeris#959/#866, #895/#896 and #811 among them) have grown it to 401.7
+      # to 415.8 s on this step in the eight CI runs on main from 13fa176
+      # (2026-10-18) to 6ab5c28 (2026-10-20), 415.8 s the longest (run
+      # 39334596768): the 480 s of celeris#994 left 15% over that. The Coverage
+      # workflow's run of the same package (its own step) took 410.8 to 426.2 s
+      # in seven runs and 437.3 s in an eighth (run 39334596754): 480 s was 10%
+      # over that. A slower runner or the next test added would end in a timeout panic
+      # instead of a result. 600 s is 44% over the 415.8 s here and 37% over the
+      # 437.3 s there. If the package keeps growing, split its slow tests into
+      # a step of their own rather than raise this again (celeris#890 item 66).
       - name: internal/engine/iouring — race tests at the runner's memlock (every skip accounted for)
         if: ${{ !cancelled() }}
         shell: bash
