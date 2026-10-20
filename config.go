@@ -188,8 +188,15 @@ type Config struct {
 	// set). The cost: ep512 throughput is about 0.845 times that of v1.5.11 (15%
 	// lower; the 8 loops alone: 0.948 times). The pre-registered test came out
 	// FAIL by its letter on the io256 p99.99 (5.59 times the hand-pinned set at
-	// the medians; overlapping ranges, 3.2 to 32.8 ms against 3.6 to 28.3 ms; a
-	// re-run of that cell is pending). The rule is fitted to that one host after
+	// the medians; overlapping ranges, 3.2 to 32.8 ms against 3.6 to 28.3 ms). A
+	// re-run of that cell on one commit (probatorium run 39396052154, 8
+	// repetitions per arm) had the rule plan the same six loops by itself, with
+	// 0.995 times the requests per second and a p99.99 median of 16.8 ms against
+	// 6.0 ms for the same loops forced by a knob (2.83 times; 6 of 8 against 3 of
+	// 8 repetitions over 10 ms); the one-sided exact Mann-Whitney test does not
+	// reject (p=0.080) and the registered outcome is NOISE-ONLY, but at 8
+	// repetitions its power is low and a modest p99.99 tail cost at io256 in the
+	// 10 to 30 ms range is not excluded. The rule is fitted to that one host after
 	// its data was seen; its counts are since boot (a fresh boot steps aside, a
 	// wrapped 32-bit interrupt counter can hide a vector), a LAG rehash that moves
 	// the traffic leaves the plan until the next start, a wildcard listener pools
