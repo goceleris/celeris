@@ -22,9 +22,16 @@ const littleCapacityPercent = 50
 // CPUPlan is the CPU each engine loop pins its thread to, decided once when
 // the engine starts (celeris#909).
 type CPUPlan struct {
-	// CPUs has one entry per worker: the CPU that worker pins itself to, or
-	// -1 if the worker must run unpinned.
+	// CPUs has one entry per loop the engine starts: the CPU that loop pins
+	// itself to. Its length is the loop count: on a host whose allowed CPUs
+	// differ in capacity it can be smaller than the number of workers asked
+	// for, and the engine starts len(CPUs) loops, not the number it asked for
+	// (celeris#1036). The planner never leaves an entry at -1 ("run
+	// unpinned"); an engine still honours a -1 it is given, and a pin the
+	// kernel refuses leaves that one loop unpinned and is logged.
 	CPUs []int
+	// Requested is the number of workers the plan was asked for.
+	Requested int
 	// Allowed is the process's CPU set (sched_getaffinity) the plan was
 	// drawn from, ascending.
 	Allowed []int
@@ -37,6 +44,9 @@ type CPUPlan struct {
 	// "i-th allowed CPU" rule, for the engine to log once. Empty for a
 	// homogeneous host.
 	Note string
+	// RxFree is what the rx-port rule decided (celeris#1036 item 1). Its
+	// Freed list is empty unless the rule took CPUs out of the loop set.
+	RxFree RxFree
 }
 
 // Pinned returns how many workers of the plan are pinned.
@@ -50,7 +60,27 @@ func (p CPUPlan) Pinned() int {
 	return n
 }
 
-// PlanWorkerCPUs chooses the CPU of each of numWorkers engine loops.
+// Truncate returns the plan cut to its first n loops, for an engine that can
+// fund fewer loops than the plan holds (io_uring under RLIMIT_MEMLOCK). The
+// planner fills distinct CPUs before it repeats one, so the first n entries
+// are the plan it would have made for n workers. A Note is extended to say how
+// many loops start and why, so that it never states a count the engine does
+// not run. n at or above the plan's length, or below 1, returns p unchanged.
+func (p CPUPlan) Truncate(n int, why string) CPUPlan {
+	if n < 1 || n >= len(p.CPUs) {
+		return p
+	}
+	q := p
+	q.CPUs = slices.Clone(p.CPUs[:n])
+	if q.Note != "" {
+		q.Note += fmt.Sprintf("; only %d of the %d planned loops start (%s)", n, len(p.CPUs), why)
+	}
+	return q
+}
+
+// PlanWorkerCPUs chooses the CPU of each engine loop for a request of
+// numWorkers workers. explicit reports that numWorkers was set by the user
+// (Config.Workers) and not defaulted to GOMAXPROCS.
 //
 // The candidates are the members of the calling thread's allowed CPU set
 // (sched_getaffinity(0): the mask of the thread that calls Listen, which is
@@ -61,26 +91,52 @@ func (p CPUPlan) Pinned() int {
 // restriction (celeris#909). On a host whose allowed CPUs differ in capacity
 // (arm64 big.LITTLE; /sys/devices/system/cpu/cpuN/cpu_capacity, or the CPU
 // parts in /proc/cpuinfo when the kernel exports no capacity), loops pin only
-// to the CPUs that are not little and the loops left over run unpinned: a loop
-// pinned to a Cortex-A520 of an msr1 host stalled its connections for 5 s and
-// more, a loop on an A720 or an unpinned one never did. Where the CPUs are
-// alike the i-th worker gets the i-th allowed CPU, wrapping. On a host with
-// several NUMA nodes the CPUs are taken from the nodes the allowed set covers
-// in turn, and every allowed CPU gets a loop before any gets a second.
+// to the CPUs that are not little, and every loop is pinned: a loop pinned to
+// a Cortex-A520 of an msr1 host stalled its connections for 5 s and more, and
+// a loop left to float between the CPUs spent about half of its time on the
+// little ones, and an interleaved A/B on msr1 put the throughput loss on those
+// floating loops, not on the loop count (celeris#1036). So the plan holds
+// min(numWorkers, big CPUs) loops, at most one per non-little CPU, and the
+// engine starts that many, fewer than the workers it was asked for. A user-set
+// numWorkers above the number of non-little CPUs is honoured, never floated:
+// the extra loops wrap round-robin over the non-little CPUs, each pinned (two
+// loops share a CPU). Where the CPUs are alike the i-th worker gets the i-th
+// allowed CPU, wrapping. On a host with several NUMA nodes the CPUs are taken
+// from the nodes the allowed set covers in turn, and every allowed CPU gets a
+// loop before any gets a second.
 //
 // Any read error means "homogeneous"; the plan then is what a host without
 // the information gets.
-func PlanWorkerCPUs(numWorkers int) CPUPlan {
+//
+// PlanWorkerCPUs does not know where the server listens and so never applies
+// the rx-port rule; the engines call [PlanWorkerCPUsFor].
+func PlanWorkerCPUs(numWorkers int, explicit bool) CPUPlan {
+	return PlanWorkerCPUsFor(numWorkers, explicit, "")
+}
+
+// PlanWorkerCPUsFor is [PlanWorkerCPUs] for a listener bound to addr
+// ("host:port", the concrete address the engine binds). On a big.LITTLE host,
+// with Workers not set by the user, it also leaves the loops off the big CPUs
+// that service the interrupt vectors of the NIC port that receives the
+// traffic (see [RxFree] and cpuplan_rxfree_linux.go): the loop count is never
+// raised, and every failure to read the machine gives exactly the plan
+// PlanWorkerCPUs makes. An empty addr applies no rule. A homogeneous host and
+// an explicit Workers read nothing beyond what PlanWorkerCPUs reads.
+func PlanWorkerCPUsFor(numWorkers int, explicit bool, addr string) CPUPlan {
 	src := planSource{
 		allowed:  schedAllowedCPUs,
 		cpuDir:   "/sys/devices/system/cpu",
 		cpuinfo:  "/proc/cpuinfo",
 		nodeCPUs: nil,
 	}
+	if addr != "" {
+		nic := defaultNICSource()
+		src.nic, src.addr = &nic, addr
+	}
 	if n := DetectNUMA().NumNodes; n > 1 {
 		src.nodeCPUs = readNodeCPUs(n)
 	}
-	return planWorkerCPUs(numWorkers, src)
+	return planWorkerCPUs(numWorkers, explicit, src)
 }
 
 // planSource is where planWorkerCPUs reads the machine from; the tests point
@@ -90,6 +146,10 @@ type planSource struct {
 	cpuDir   string                // /sys/devices/system/cpu
 	cpuinfo  string                // /proc/cpuinfo
 	nodeCPUs [][]int               // per NUMA node CPU lists; nil for one node
+	// nic and addr feed the rx-port rule; a nil nic or an empty addr turns it
+	// off.
+	nic  *nicSource
+	addr string
 }
 
 // schedAllowedCPUs returns the members of the calling thread's CPU mask, read
@@ -112,7 +172,7 @@ func schedAllowedCPUs() ([]int, error) {
 	return out, nil
 }
 
-func planWorkerCPUs(numWorkers int, src planSource) CPUPlan {
+func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 	if numWorkers < 0 {
 		numWorkers = 0
 	}
@@ -129,7 +189,7 @@ func planWorkerCPUs(numWorkers int, src planSource) CPUPlan {
 	slices.Sort(allowed)
 	allowed = slices.Compact(allowed)
 
-	plan := CPUPlan{Allowed: allowed}
+	plan := CPUPlan{Allowed: allowed, Requested: numWorkers}
 	little, capNote := littleCPUs(allowed, src)
 	if len(little) == 0 {
 		plan.CPUs = spread(numWorkers, allowed, src.nodeCPUs)
@@ -144,15 +204,57 @@ func planWorkerCPUs(numWorkers int, src planSource) CPUPlan {
 	}
 	plan.Heterogeneous = true
 	plan.Little = little
-	pinned := min(numWorkers, len(big))
-	plan.CPUs = make([]int, numWorkers)
-	copy(plan.CPUs, big[:pinned])
-	for i := pinned; i < numWorkers; i++ {
-		plan.CPUs[i] = -1
+	// One loop per non-little CPU and no more, unless the user asked for
+	// more. A single non-little CPU therefore gives ONE loop by default,
+	// below resource.MinWorkers (2, which Validate enforces on a user-set
+	// count): deliberate, since a second loop could only share that CPU or run
+	// on a little one (celeris#1036). Do not raise it to MinWorkers here.
+	//
+	// A user-set count above the non-little CPUs is honoured: the extra loops
+	// wrap over the same CPUs, still pinned (two loops share a CPU, and a CPU
+	// with two loops takes twice the connections of one with one). The big CPUs
+	// are spread like any allowed set (NUMA nodes in turn, wrapping only after
+	// every CPU holds a loop).
+	//
+	// The rx-port rule (celeris#1036 item 1) may take CPUs out of the set the
+	// loops are drawn from, for the default count only: an explicit
+	// Config.Workers is planned as #1049 plans it, and the count is never
+	// raised.
+	cands := big
+	if !explicit && numWorkers > 0 && src.nic != nil && src.addr != "" {
+		plan.RxFree = rxFreeFor(numWorkers, src.addr, big, *src.nic)
+		if len(plan.RxFree.Freed) > 0 {
+			cands = slices.DeleteFunc(slices.Clone(big), func(c int) bool {
+				return slices.Contains(plan.RxFree.Freed, c)
+			})
+		}
 	}
-	plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
-		"%d of %d loops pinned to the other allowed CPUs %s, %d left unpinned",
-		capNote, FormatCPUs(little), pinned, numWorkers, FormatCPUs(big), numWorkers-pinned)
+	loops := min(numWorkers, len(cands))
+	if explicit {
+		loops = numWorkers
+	}
+	plan.CPUs = spread(loops, cands, src.nodeCPUs)
+	switch {
+	case loops > len(cands):
+		plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
+			"%d loops (Config.Workers) pinned round-robin over the %d other allowed CPUs %s, "+
+			"so some CPUs hold more than one loop, none unpinned",
+			capNote, FormatCPUs(little), loops, len(cands), FormatCPUs(cands))
+	case loops < numWorkers:
+		plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
+			"%d loops, one per other allowed CPU %s, none unpinned (not the %d a host of alike CPUs "+
+			"would start: the rest would have to run on the little CPUs or float onto them)",
+			capNote, FormatCPUs(little), loops, FormatCPUs(cands), numWorkers)
+	default:
+		// The CPUs the loops use, not the whole set they were drawn from:
+		// 5 loops use 5 of 8 non-little CPUs.
+		plan.Note = fmt.Sprintf("heterogeneous CPU capacities (%s): the little CPUs %s are avoided; "+
+			"%d loops pinned to the CPUs %s of the other allowed CPUs %s, none unpinned",
+			capNote, FormatCPUs(little), loops, FormatCPUs(plan.CPUs), FormatCPUs(cands))
+	}
+	if f := plan.RxFree; len(f.Freed) > 0 {
+		plan.Note += "; " + f.Sentence()
+	}
 	return plan
 }
 
