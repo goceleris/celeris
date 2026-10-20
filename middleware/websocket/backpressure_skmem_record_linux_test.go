@@ -107,7 +107,16 @@ func TestWSOTCPMemRendering(t *testing.T) {
 	}
 	const netstat = "TcpExt: SyncookiesSent PruneCalled RcvPruned OfoPruned TCPMemoryPressures TCPRcvQDrop Other\n" +
 		"TcpExt: 0 11 22 33 44 55 66\nIpExt: InNoRoutes\nIpExt: 9\n"
-	got := wsoTCPExtString(netstat)
+	got := wsoTCPExtString(netstat, "")
+	if strings.Contains(got, "(+") {
+		t.Errorf("tcpext %q has a rise without a baseline", got)
+	}
+	const base = "TcpExt: SyncookiesSent PruneCalled RcvPruned OfoPruned TCPMemoryPressures TCPRcvQDrop Other\n" +
+		"TcpExt: 0 11 20 30 44 50 66\n"
+	if d := wsoTCPExtString(netstat, base); !strings.Contains(d, "PruneCalled=11(+0)") ||
+		!strings.Contains(d, "RcvPruned=22(+2)") || !strings.Contains(d, "OfoPruned=33(+3)") || !strings.Contains(d, "TCPRcvQDrop=55(+5)") {
+		t.Errorf("tcpext with a baseline: %q, want each total with its rise", d)
+	}
 	for _, w := range []string{"PruneCalled=11", "RcvPruned=22", "OfoPruned=33", "TCPMemoryPressures=44", "TCPRcvQDrop=55"} {
 		if !strings.Contains(got, w) {
 			t.Errorf("tcpext %q lacks %q", got, w)
@@ -116,7 +125,7 @@ func TestWSOTCPMemRendering(t *testing.T) {
 	if strings.Contains(got, "Other") || strings.Contains(got, "SyncookiesSent") {
 		t.Errorf("tcpext %q holds a counter that is not a prune or drop one", got)
 	}
-	if got := wsoTCPExtString("nothing"); got != "tcpext{unavailable}" {
+	if got := wsoTCPExtString("nothing", ""); got != "tcpext{unavailable}" {
 		t.Errorf("no netstat: %q", got)
 	}
 }

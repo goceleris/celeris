@@ -27,15 +27,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// soMeminfo is SO_MEMINFO (asm-generic, so linux/amd64 and linux/arm64);
-// golang.org/x/sys/unix has the SK_MEMINFO_* indexes but not the option.
-const soMeminfo = 55
-
 // wsoSkmemFD reads SO_MEMINFO of fd: rmem_alloc, rcvbuf, wmem_alloc, sndbuf,
 // fwd_alloc, wmem_queued, optmem, backlog, drops (SK_MEMINFO_*).
 func wsoSkmemFD(fd int) (m [unix.SK_MEMINFO_VARS]uint32, err error) {
 	n := uint32(unsafe.Sizeof(m))
-	_, _, e := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(fd), unix.SOL_SOCKET, soMeminfo,
+	_, _, e := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(fd), unix.SOL_SOCKET, unix.SO_MEMINFO,
 		uintptr(unsafe.Pointer(&m[0])), uintptr(unsafe.Pointer(&n)), 0)
 	if e != 0 {
 		return m, e
@@ -115,9 +111,11 @@ func wsoSockstatTCP(sockstat string) (line string, memPages int64, ok bool) {
 
 // wsoTCPMemString renders the TCP memory pool against its limits: the mem
 // figure of sockstat and tcp_mem (min, pressure, max, all in pages). Where
-// tcp_mem cannot be read (Docker Desktop's containers have no
-// /proc/sys/net/ipv4/tcp_mem) the reason is printed in its place and the
-// sockstat line stands alone.
+// tcp_mem cannot be read the reason is printed in its place and the sockstat
+// line stands alone. tcp_mem is registered for the initial network namespace
+// only, so it is missing in any other one (every container with its own
+// netns, Docker Desktop's among them): a verdict on tcp_mem needs a run in
+// the host's namespace, such as directly on a runner.
 func wsoTCPMemString(sockstat, tcpMem string) string {
 	line, mem, ok := wsoSockstatTCP(sockstat)
 	if line == "" {
@@ -155,25 +153,48 @@ var wsoTCPExtPrune = map[string]bool{
 	"TCPWantZeroWindowAdv": true, "TCPBacklogDrop": true,
 }
 
-// wsoTCPExtString picks wsoTCPExtPrune out of /proc/net/netstat (a header
-// line of names then a line of values for each of TcpExt and IpExt).
-func wsoTCPExtString(netstat string) string {
+// wsoTCPExtCounters picks wsoTCPExtPrune out of /proc/net/netstat (a header
+// line of names then a line of values for each of TcpExt and IpExt), in the
+// order the kernel prints them.
+func wsoTCPExtCounters(netstat string) (names []string, vals map[string]int64) {
 	lines := strings.Split(netstat, "\n")
-	var out []string
+	vals = map[string]int64{}
 	for i := 0; i+1 < len(lines); i++ {
 		if !strings.HasPrefix(lines[i], "TcpExt:") || !strings.HasPrefix(lines[i+1], "TcpExt:") {
 			continue
 		}
-		names, vals := strings.Fields(lines[i]), strings.Fields(lines[i+1])
-		for j := 1; j < len(names) && j < len(vals); j++ {
-			if wsoTCPExtPrune[names[j]] {
-				out = append(out, names[j]+"="+vals[j])
+		hdr, row := strings.Fields(lines[i]), strings.Fields(lines[i+1])
+		for j := 1; j < len(hdr) && j < len(row); j++ {
+			if !wsoTCPExtPrune[hdr[j]] {
+				continue
+			}
+			if n, err := strconv.ParseInt(row[j], 10, 64); err == nil {
+				names = append(names, hdr[j])
+				vals[hdr[j]] = n
 			}
 		}
 		break
 	}
-	if len(out) == 0 {
+	return names, vals
+}
+
+// wsoTCPExtString renders wsoTCPExtPrune from /proc/net/netstat. The counters
+// are netns-wide totals of the whole boot, so a total alone cannot say that
+// pruning happened during this run: with base (the same file read when the rig
+// started) each is printed as total(+rise since then).
+func wsoTCPExtString(netstat, base string) string {
+	names, vals := wsoTCPExtCounters(netstat)
+	if len(names) == 0 {
 		return "tcpext{unavailable}"
+	}
+	_, was := wsoTCPExtCounters(base)
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if b, ok := was[n]; ok {
+			out = append(out, fmt.Sprintf("%s=%d(+%d)", n, vals[n], vals[n]-b))
+		} else {
+			out = append(out, fmt.Sprintf("%s=%d", n, vals[n]))
+		}
 	}
 	return "tcpext{" + strings.Join(out, " ") + "}"
 }
@@ -187,8 +208,9 @@ func wsoReadProc(path string) string {
 }
 
 // wsoKernelMem renders the host-wide half of the record: TCP pool against
-// tcp_mem, and the prune and drop counters.
-func wsoKernelMem() string {
+// tcp_mem, and the prune and drop counters with their rise since netstatBase
+// (/proc/net/netstat as the rig started; empty prints totals only).
+func wsoKernelMem(netstatBase string) string {
 	return wsoTCPMemString(wsoReadProc("/proc/net/sockstat"), wsoReadProc("/proc/sys/net/ipv4/tcp_mem")) +
-		" " + wsoTCPExtString(wsoReadProc("/proc/net/netstat"))
+		" " + wsoTCPExtString(wsoReadProc("/proc/net/netstat"), netstatBase)
 }

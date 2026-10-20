@@ -168,9 +168,13 @@ const (
 	// figure, a margin of 2.2 s over wsoRecvStall. The cost is 2 s more per arm
 	// of the pause-cancel test that holds this quiet. The scheduler discount
 	// eats into that margin only by the latency the Go scheduler records inside
-	// the quiet's own stretch: the client is idle there, so a #607 stretch
-	// (a connection blocked while the loop and every goroutine can run) records
-	// none worth the 2.2 s; a run that did would show it as stallDiscounted.
+	// the quiet's own stretch. The probe reports the longest wait of any goroutine
+	// of the process, sampled (see backpressure_schedlat_linux_test.go), not only
+	// the loop's, so a loaded process can excuse part of it; a #607 stretch
+	// blocks the connection while the loop and every goroutine can run, so it
+	// records no latency of its own. Nothing here measured the latency inside
+	// the quiet: a run that was excused shows it as stallDiscounted, with each
+	// excused stretch listed under the longest-stretch line.
 	wsoQuiet = 10 * time.Second
 	// wsoReserve: what a rig leaves of the test binary's -timeout for the
 	// verdicts, the engine shutdowns (up to 40 s) and the tests after it.
@@ -210,6 +214,23 @@ type wsoRig struct {
 	// A run that was excused says so on its waits line.
 	stallDiscounted    int
 	stallDiscountedMax time.Duration
+	// stallExcused is one line per excused stretch (at most wsoExcusedKept, the
+	// longest first once trimmed): which connection, where, how long, what it
+	// was excused by and the pass that judged it, so a run can be audited
+	// (longestStretch prints them).
+	stallExcused []wsoExcused
+	// netstatBase is /proc/net/netstat as the rig started, the baseline of the
+	// TcpExt counters a record prints (empty: totals only).
+	netstatBase string
+}
+
+// wsoExcusedKept bounds the stretches the rig keeps a line for.
+const wsoExcusedKept = 20
+
+// wsoExcused is one stretch the scheduler discount excused.
+type wsoExcused struct {
+	stretch time.Duration
+	line    string
 }
 
 // newWSORig starts a subtest's rig. Its waits end, at the latest, at the
@@ -217,7 +238,7 @@ type wsoRig struct {
 // than wsoMinBudget of that left, the subtest fails here without starting.
 func newWSORig(t *testing.T) *wsoRig {
 	t.Helper()
-	g := &wsoRig{t0: time.Now(), sched: newWSOSchedLat()}
+	g := &wsoRig{t0: time.Now(), sched: newWSOSchedLat(), netstatBase: wsoReadProc("/proc/net/netstat")}
 	if dl, ok := t.Deadline(); ok {
 		g.end = dl.Add(-wsoReserve)
 		if left := g.end.Sub(g.t0); left < wsoMinBudget {
@@ -1053,7 +1074,7 @@ func (cl *wsoCli) record(c net.Conn, tag, kind, what string) string {
 		fmt.Fprintf(&b, "\n  now: srv tcpinfo{%s}", wsoTCPFull(v.ti))
 	}
 	fmt.Fprintf(&b, "\n  now: cli %s\n  now: srv %s\n  now: kernel %s",
-		wsoCliSkmem(c), cl.g.wsoSrvSkmem(cl.port), wsoKernelMem())
+		wsoCliSkmem(c), cl.g.wsoSrvSkmem(cl.port), wsoKernelMem(cl.g.netstatBase))
 	return b.String()
 }
 
@@ -1163,11 +1184,18 @@ func (st *wsoStall) String() string {
 func (g *wsoRig) longestStretch() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	var ex strings.Builder
+	if n := g.stallDiscounted; n > 0 {
+		fmt.Fprintf(&ex, "\nexcused by scheduler latency: %d stretch(es), the longest %d listed:", n, len(g.stallExcused))
+		for _, e := range g.stallExcused {
+			ex.WriteString("\n  " + e.line)
+		}
+	}
 	if g.longest.samples == 0 {
-		return "longest unread stretch: none"
+		return "longest unread stretch: none" + ex.String()
 	}
 	st := g.longest
-	return fmt.Sprintf("longest unread stretch (limit %v): %s", wsoRecvStall, strings.TrimPrefix(st.String(), "WSO-STALL "))
+	return fmt.Sprintf("longest unread stretch (limit %v): %s", wsoRecvStall, strings.TrimPrefix(st.String(), "WSO-STALL ")) + ex.String()
 }
 
 // wsoStallable reports whether the engine should be reading a connection
@@ -1275,8 +1303,10 @@ func wsoWatchStep(ep *wsoEpisode, v wsoSrvView, now int64) (next *wsoEpisode, op
 // sample (wsoWatchStep), counted as watchGapRestarts on the waits line. A
 // watch that restarts its stretches this way cannot reach wsoRecvStall, so a
 // run with many of them says nothing about a stall. A stretch the watcher's
-// own starvation interrupts is judged up to its last sample, with the
-// scheduler latency recorded until the pass that found the gap.
+// own starvation interrupts is judged up to its last sample: the scheduler
+// latency recorded until the pass that found the gap is read, but credited
+// only for the part of each wait that lies inside the stretch, so the
+// watcher's own starved wait (after the last sample) excuses nothing.
 //
 // Start it once the server listens and stop it once the clients are done:
 // the verdict is the test's, on the test goroutine.
@@ -1360,29 +1390,33 @@ func (g *wsoRig) schedObserve(nowNs int64) {
 }
 
 // coveredIn is wsoSchedProbe.coveredIn of the rig's probe.
-func (g *wsoRig) coveredIn(fromNs, toNs int64) time.Duration {
+func (g *wsoRig) coveredIn(fromNs, endNs, windowNs int64) time.Duration {
 	if g.sched == nil {
 		return 0
 	}
-	return g.sched.coveredIn(fromNs, toNs)
+	return g.sched.coveredIn(fromNs, endNs, windowNs)
 }
 
-// schedIn is the longest runnable wait recorded inside (fromNs, toNs].
-func (g *wsoRig) schedIn(fromNs, toNs int64) time.Duration {
+// schedIn is wsoSchedProbe.maxIn of the rig's probe: the longest runnable wait
+// recorded up to windowNs, counted only for the part inside (fromNs, endNs].
+func (g *wsoRig) schedIn(fromNs, endNs, windowNs int64) time.Duration {
 	if g.sched == nil {
 		return 0
 	}
-	return g.sched.maxIn(fromNs, toNs)
+	return g.sched.maxIn(fromNs, endNs, windowNs)
 }
 
 // stallOf renders the stretch of ep as of toNs, the sample time of v, with
-// the scheduler latency recorded until windowNs.
+// the scheduler latency recorded until windowNs but credited only for the part
+// of each wait inside the stretch (ep.fromNs, toNs]: a wait that lies after
+// the stretch's last proven sample (the watcher's own starvation, found by the
+// pass at windowNs) excuses nothing.
 func (g *wsoRig) stallOf(s *wsoSrv, ep *wsoEpisode, toNs, windowNs int64, v wsoSrvView) wsoStall {
-	sched := g.schedIn(ep.fromNs, windowNs)
+	sched := g.schedIn(ep.fromNs, toNs, windowNs)
 	disc, eff, _ := wsoJudgeStretch(time.Duration(toNs-ep.fromNs), sched)
 	return wsoStall{port: s.port, fromNs: ep.fromNs, toNs: toNs, samples: ep.samples,
 		onset: ep.onset, onsetC: ep.onsetC, last: v.String(), lastC: g.cliNow(s.port), marks: g.cliMarks(s.port),
-		sched: sched, discount: disc, effective: eff, covered: g.coveredIn(ep.fromNs, windowNs)}
+		sched: sched, discount: disc, effective: eff, covered: g.coveredIn(ep.fromNs, toNs, windowNs)}
 }
 
 // watchSample applies one sample v of the connection s, taken at now (before v
@@ -1430,8 +1464,11 @@ func (g *wsoRig) watchSample(w *wsoWatchState, s *wsoSrv, v wsoSrvView, now int6
 }
 
 // settleEpisode judges the episode ep of s, which a pass at windowNs found
-// ended, over its whole window: from its first sample to windowNs for the
-// scheduler latency, from its first to its last sample for its length.
+// ended, over its proven span, from its first sample to its last: its length
+// is that span and the scheduler latency counts for the part of each wait
+// inside it, among the waits recorded up to windowNs (the wait that explains
+// the stretch is recorded by the pass that finds it over, which is after the
+// last sample).
 func (g *wsoRig) settleEpisode(w *wsoWatchState, s *wsoSrv, ep *wsoEpisode, windowNs int64) {
 	proven := time.Duration(ep.lastNs - ep.fromNs)
 	if ep.rec != nil || proven >= wsoRecvStall {
@@ -1455,6 +1492,16 @@ func (g *wsoRig) settleEpisode(w *wsoWatchState, s *wsoSrv, ep *wsoEpisode, wind
 		g.mu.Lock()
 		g.stallDiscounted++
 		g.stallDiscountedMax = max(g.stallDiscountedMax, proven)
+		g.stallExcused = append(g.stallExcused, wsoExcused{proven, fmt.Sprintf(
+			"conn=127.0.0.1:%d stretch %s (+%s to +%s, %d samples) excused: scheduler %s inside it, discount %s, effective %s; "+
+				"judged by the pass at +%s; recorded waits cover %s of it",
+			s.port, wsoSec(ep.lastNs-ep.fromNs), wsoSec(ep.fromNs), wsoSec(ep.lastNs), ep.samples,
+			st.sched.Round(time.Millisecond), st.discount.Round(time.Millisecond), st.effective.Round(time.Millisecond),
+			wsoSec(windowNs), st.covered.Round(time.Millisecond))})
+		sort.SliceStable(g.stallExcused, func(i, j int) bool { return g.stallExcused[i].stretch > g.stallExcused[j].stretch })
+		if len(g.stallExcused) > wsoExcusedKept {
+			g.stallExcused = g.stallExcused[:wsoExcusedKept]
+		}
 		g.mu.Unlock()
 	}
 }
@@ -1551,7 +1598,7 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 	if p, ok := g.sched.(*wsoSchedLat); ok {
 		st.schedLatMax = p.longest()
 		if end := g.since(); end > 0 {
-			st.schedCoveredFrac = float64(p.coveredIn(0, end)) / float64(end)
+			st.schedCoveredFrac = float64(p.coveredIn(0, end, end)) / float64(end)
 		}
 	}
 	for _, cl := range g.clis {

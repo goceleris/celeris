@@ -26,6 +26,15 @@ import (
 //     (the test's check that the discount reaches the real engine path);
 //   - the same probe, 16.3 s parked: the stretch fails while it is open, and
 //     is still going when the watch stops: the cap holds on a real engine.
+//
+// The handler calls the engine's raw pause callback itself, without pausedMu.
+// Production calls it only from requestPause, on the engine's worker under
+// pausedMu; this test relies on both engines' pause being safe to call from
+// another goroutine (it passes under -race on epoll and io_uring). The
+// 6.5 s arm has 1.5 s of margin: it fails if more than that much scheduler
+// latency lands inside its stretch, so a very loaded runner can flake it, and
+// the CI job does not run this test (the fake-clock tests carry the verdict
+// there).
 func TestWSOWatchFailsOnParkedEngineReader(t *testing.T) {
 	if testing.Short() {
 		t.Skip("holds an engine parked for up to 16 s")

@@ -5,6 +5,7 @@ package websocket
 import (
 	"math"
 	"runtime/metrics"
+	"strings"
 	"testing"
 	"time"
 )
@@ -15,10 +16,12 @@ import (
 type wsoFixedSched time.Duration
 
 func (wsoFixedSched) observe(int64) {}
-func (p wsoFixedSched) maxIn(fromNs, toNs int64) time.Duration {
-	return min(time.Duration(p), time.Duration(toNs-fromNs))
+func (p wsoFixedSched) maxIn(fromNs, endNs, windowNs int64) time.Duration {
+	return min(time.Duration(p), time.Duration(max(endNs-fromNs, 0)))
 }
-func (p wsoFixedSched) coveredIn(fromNs, toNs int64) time.Duration { return p.maxIn(fromNs, toNs) }
+func (p wsoFixedSched) coveredIn(fromNs, endNs, windowNs int64) time.Duration {
+	return p.maxIn(fromNs, endNs, windowNs)
+}
 
 // TestWSOStallSchedulerLatencyDiscount drives watchSample on a fake clock
 // (celeris#871): a stretch of unread bytes at a socket the engine does not read,
@@ -198,6 +201,102 @@ func TestWSOStallSchedulerLatencyDiscount(t *testing.T) {
 	})
 }
 
+// TestWSOStallSchedulerLatencyAfterTheProvenSpan is the celeris#871 review's
+// finding: a stretch is excused only by scheduler latency measured inside its
+// proven span (first to last sample). Latency recorded by the pass that found
+// the stretch over, after its last sample (the watcher's own starved wait), is
+// not inside it: the three ways a stretch ends without a read moving the view,
+// each with a wait that lies after the span, must still fail it. The control
+// of each (the same wait recorded inside the span) is excused.
+func TestWSOStallSchedulerLatencyAfterTheProvenSpan(t *testing.T) {
+	ms := int64(time.Millisecond)
+	stall := func(raw int64) wsoSrvView {
+		return wsoSrvView{found: true, sockOK: true, phase: 1, inq: 1, rawRead: raw}
+	}
+	sample := func(g *wsoRig, w *wsoWatchState, s *wsoSrv, fromMs, toMs, raw int64) {
+		for at := fromMs; at <= toMs; at += int64(wsoWatchEvery / time.Millisecond) {
+			g.watchSample(w, s, stall(raw), at*ms)
+		}
+	}
+	// the ends: how the stretch is found over, one pass after its last sample
+	ends := []struct {
+		name   string
+		endMs  int64 // the ending pass
+		finish func(g *wsoRig, w *wsoWatchState, s *wsoSrv, atMs int64)
+	}{
+		{"gap restart: the next sample comes after the watcher's starved wait", 7250,
+			func(g *wsoRig, w *wsoWatchState, s *wsoSrv, atMs int64) { g.watchSample(w, s, stall(7), atMs*ms) }},
+		{"watcher reset: the pass after a starved tick settles every stretch", 7250,
+			func(g *wsoRig, w *wsoWatchState, s *wsoSrv, atMs int64) { g.watchSettleAll(w, atMs*ms, false) }},
+		{"the watcher starved for 4 s after an 8.75 s stretch", 12750,
+			func(g *wsoRig, w *wsoWatchState, s *wsoSrv, atMs int64) { g.watchSettleAll(w, atMs*ms, false) }},
+	}
+	for _, e := range ends {
+		provenEndMs := int64(5750)
+		if e.endMs == 12750 {
+			provenEndMs = 8750
+		}
+		wait := time.Duration(e.endMs-provenEndMs) * time.Millisecond // the starved wait, wholly after the span
+		t.Run(e.name+": a wait after the last sample does not excuse it", func(t *testing.T) {
+			sched := &wsoSchedLat{}
+			g := &wsoRig{t0: time.Now(), sched: sched}
+			s := &wsoSrv{g: g, port: 40020}
+			w := newWSOWatchState()
+			sample(g, w, s, 0, provenEndMs, 7)
+			sched.add(e.endMs*ms, wait) // recorded by the ending pass: [provenEnd, endMs]
+			e.finish(g, w, s, e.endMs)
+			if len(w.stalls) != 1 || g.stallDiscounted != 0 {
+				t.Fatalf("stalls = %d discounted = %d, want 1 and 0: a %v wait after the span excused it", len(w.stalls), g.stallDiscounted, wait)
+			}
+			if st := w.stalls[0]; st.sched != 0 || st.effective != time.Duration(provenEndMs)*time.Millisecond {
+				t.Fatalf("sched = %v effective = %v, want 0 and the whole stretch %v", st.sched, st.effective, time.Duration(provenEndMs)*time.Millisecond)
+			}
+		})
+		t.Run(e.name+": control, the same wait inside the span excuses it", func(t *testing.T) {
+			sched := &wsoSchedLat{}
+			g := &wsoRig{t0: time.Now(), sched: sched}
+			s := &wsoSrv{g: g, port: 40021}
+			w := newWSOWatchState()
+			sample(g, w, s, 0, provenEndMs, 7)
+			sched.add(provenEndMs*ms, wait) // the same wait, ended at the last sample
+			e.finish(g, w, s, e.endMs)
+			if len(w.stalls) != 0 || g.stallDiscounted != 1 {
+				t.Fatalf("stalls = %d discounted = %d, want 0 and 1", len(w.stalls), g.stallDiscounted)
+			}
+		})
+	}
+	t.Run("a wait that straddles the last sample counts up to it", func(t *testing.T) {
+		sched := &wsoSchedLat{}
+		g := &wsoRig{t0: time.Now(), sched: sched}
+		s := &wsoSrv{g: g, port: 40022}
+		w := newWSOWatchState()
+		sample(g, w, s, 0, 5750, 7)
+		sched.add(7250*ms, 2*time.Second) // [5.25, 7.25]: 0.5 s inside the span
+		g.watchSample(w, s, stall(7), 7250*ms)
+		if len(w.stalls) != 1 || w.stalls[0].sched != 500*time.Millisecond {
+			t.Fatalf("stalls = %d, want 1 with sched 500ms (got %v)", len(w.stalls), func() any {
+				if len(w.stalls) > 0 {
+					return w.stalls[0].sched
+				}
+				return nil
+			}())
+		}
+	})
+	t.Run("an excused stretch is listed", func(t *testing.T) {
+		sched := &wsoSchedLat{}
+		g := &wsoRig{t0: time.Now(), sched: sched}
+		s := &wsoSrv{g: g, port: 40023}
+		w := newWSOWatchState()
+		sample(g, w, s, 0, 6000, 7)
+		sched.add(6000*ms, 3*time.Second)
+		g.watchSample(w, s, stall(99), 6250*ms)
+		if out := g.longestStretch(); !strings.Contains(out, "excused by scheduler latency: 1 stretch") ||
+			!strings.Contains(out, "conn=127.0.0.1:40023 stretch 6.000s") {
+			t.Fatalf("an excused stretch is not listed:\n%s", out)
+		}
+	})
+}
+
 // TestWSOJudgeStretch pins the rule's arithmetic.
 func TestWSOJudgeStretch(t *testing.T) {
 	cases := []struct {
@@ -245,16 +344,49 @@ func TestWSOSchedLatMaxIn(t *testing.T) {
 		{"the whole run", 0, 10000, 5 * time.Second},
 	}
 	for _, tc := range cases {
-		if got := p.maxIn(tc.from*ms, tc.to*ms); got != tc.want {
+		if got := p.maxIn(tc.from*ms, tc.to*ms, tc.to*ms); got != tc.want {
 			t.Errorf("%s: maxIn(%d, %d) = %v, want %v", tc.name, tc.from, tc.to, got, tc.want)
 		}
 	}
 	var nilp *wsoSchedLat
-	if nilp.maxIn(0, 1) != 0 || nilp.longest() != 0 {
+	nilp.observe(0) // a typed-nil probe in the interface must not panic
+	if nilp.maxIn(0, 1, 1) != 0 || nilp.longest() != 0 {
 		t.Error("a nil probe must report nothing")
 	}
 	if p.longest() != 5*time.Second {
 		t.Errorf("longest = %v, want 5s", p.longest())
+	}
+}
+
+// TestWSOSchedLatMaxInProvenEnd pins the clip against the end of the span being
+// judged (celeris#871 review): events are read up to the window, the pass that
+// found the stretch over, but each wait counts only for the part inside
+// (from, end].
+func TestWSOSchedLatMaxInProvenEnd(t *testing.T) {
+	ms := int64(time.Millisecond)
+	cases := []struct {
+		name              string
+		at                int64 // ms; the event's pass
+		lat               time.Duration
+		from, end, window int64 // ms
+		want              time.Duration
+	}{
+		{"a wait recorded after the proven end, wholly after it, counts for nothing", 12750, 4 * time.Second, 0, 8750, 12750, 0},
+		{"a wait that straddles the proven end counts up to it", 9750, 2 * time.Second, 0, 8750, 9750, time.Second},
+		{"a wait wholly inside the span counts in full", 6000, 3 * time.Second, 0, 8750, 9000, 3 * time.Second},
+		{"the window is the pass that found it: an event after it is not looked at", 9750, 2 * time.Second, 0, 8750, 9000, 0},
+		{"a long wait is clipped at both ends", 12000, 30 * time.Second, 2000, 8000, 12000, 6 * time.Second},
+		{"an event that ended exactly at the end counts in full", 8000, 3 * time.Second, 0, 8000, 8250, 3 * time.Second},
+	}
+	for _, tc := range cases {
+		p := &wsoSchedLat{}
+		p.add(tc.at*ms, tc.lat)
+		if got := p.maxIn(tc.from*ms, tc.end*ms, tc.window*ms); got != tc.want {
+			t.Errorf("%s: maxIn(%d, %d, %d) = %v, want %v", tc.name, tc.from, tc.end, tc.window, got, tc.want)
+		}
+		if got := p.coveredIn(tc.from*ms, tc.end*ms, tc.window*ms); got != tc.want {
+			t.Errorf("%s: coveredIn(%d, %d, %d) = %v, want %v", tc.name, tc.from, tc.end, tc.window, got, tc.want)
+		}
 	}
 }
 
@@ -277,8 +409,15 @@ func TestWSOSchedLatCoveredIn(t *testing.T) {
 		{2500, 10000, time.Second},
 		{0, 100, 0},
 	}
+	// a wait that contains an earlier, shorter one: the union is the longer
+	q := &wsoSchedLat{}
+	q.add(5000*ms, time.Second)   // [4, 5]
+	q.add(6000*ms, 6*time.Second) // [0, 6]
+	if got := q.coveredIn(0, 10000*ms, 10000*ms); got != 6*time.Second {
+		t.Errorf("nested waits: coveredIn = %v, want 6s", got)
+	}
 	for _, tc := range cases {
-		if got := p.coveredIn(tc.from*ms, tc.to*ms); got != tc.want {
+		if got := p.coveredIn(tc.from*ms, tc.to*ms, tc.to*ms); got != tc.want {
 			t.Errorf("coveredIn(%d, %d) = %v, want %v", tc.from, tc.to, got, tc.want)
 		}
 	}

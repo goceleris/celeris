@@ -941,13 +941,19 @@ jobs:
           set -o pipefail
           go vet -tags celeris_closeprobe ./middleware/websocket/
           go test -race -count=1 -timeout=300s -v \
-            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies)' \
+            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies|TestWSOStallSchedulerLatency|TestWSOJudgeStretch|TestWSOSchedLat|TestWSOHistMaxDelta|TestWSOSkmem|TestWSOTCPMemRendering|TestWSORecordHas)' \
             ./middleware/websocket/... ./middleware/static/ 2>&1 | tee /tmp/ws667.log
-          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies'
+          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError|TestWSOWatchStepFakeViews|TestServerErrsJudgesResets|TestNoteReadErrClassifies|TestWSOStallSchedulerLatencyDiscount|TestWSOStallSchedulerLatencyAfterTheProvenSpan|TestWSOJudgeStretch|TestWSOSchedLatMaxIn|TestWSOSchedLatMaxInProvenEnd|TestWSOSchedLatCoveredIn|TestWSOSchedLatReadsTheRuntime|TestWSOHistMaxDelta|TestWSOSkmemRendering|TestWSOSkmemReadsTheKernel|TestWSOTCPMemRendering|TestWSORecordHasBothEndsAndTheKernelMemory'
           subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)|TestChanReaderSpillPublishedAfterDrain/(read-after-publication|closed-before-read|read-waiting-in-window)|TestChanReaderCloseKeepsChunksAppendedBeforeIt/(retried-into-channel|spilled-behind-full-channel)'
-          # 16 names; TestWaitForReadyFailsFastOnStartError passes once in
-          # each of the two packages, so it counts twice: want 17.
-          want=17
+          # 28 names; TestWaitForReadyFailsFastOnStartError passes once in
+          # each of the two packages, so it counts twice: want 29. The 12
+          # TestWSO names after TestNoteReadErrClassifies are the websocket
+          # oracle's scheduler-latency verdict, probe and skmem tests
+          # (celeris#871, #783, #633); they ran in no CI job before. The
+          # real-engine TestWSOWatchFailsOnParkedEngineReader takes 16 s and
+          # has 1.5 s of margin on a loaded runner, so it stays out of the
+          # regex above and runs from the mage target.
+          want=29
           wantsub=15
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/ws667.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${subs}) \(" /tmp/ws667.log || true)
