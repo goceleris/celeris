@@ -1137,6 +1137,9 @@ type wsoStall struct {
 	// inside the stretch's window, how much of it excuses the stretch, and
 	// the stretch less that.
 	sched, discount, effective time.Duration
+	// covered is informational: the time in the window with a recorded wait in
+	// progress (wsoSchedProbe.coveredIn), never part of the verdict.
+	covered time.Duration
 }
 
 func (st *wsoStall) String() string {
@@ -1147,11 +1150,11 @@ func (st *wsoStall) String() string {
 	return fmt.Sprintf("WSO-STALL conn=127.0.0.1:%d the engine read nothing for %s (%d samples, +%s to +%s%s) "+
 		"from a server socket holding unread bytes, while the chanReader was neither paused nor holding "+
 		"anything and the handler had not exited\n  scheduler: the longest runnable wait the Go scheduler recorded "+
-		"inside the stretch was %s; discount %s (cap %s); effective stall %s (limit %s)"+
+		"inside the stretch was %s; discount %s (cap %s); effective stall %s (limit %s); recorded waits cover %s of it (not judged)"+
 		"\n  onset: %s\n         %s\n  last:  %s\n         %s\n  client milestones: %s",
 		st.port, wsoSec(st.toNs-st.fromNs), st.samples, wsoSec(st.fromNs), wsoSec(st.toNs), still,
 		st.sched.Round(time.Millisecond), st.discount.Round(time.Millisecond), wsoSchedDiscountCap,
-		st.effective.Round(time.Millisecond), wsoRecvStall,
+		st.effective.Round(time.Millisecond), wsoRecvStall, st.covered.Round(time.Millisecond),
 		st.onset, st.onsetC, st.last, st.lastC, st.marks)
 }
 
@@ -1356,6 +1359,14 @@ func (g *wsoRig) schedObserve(nowNs int64) {
 	}
 }
 
+// coveredIn is wsoSchedProbe.coveredIn of the rig's probe.
+func (g *wsoRig) coveredIn(fromNs, toNs int64) time.Duration {
+	if g.sched == nil {
+		return 0
+	}
+	return g.sched.coveredIn(fromNs, toNs)
+}
+
 // schedIn is the longest runnable wait recorded inside (fromNs, toNs].
 func (g *wsoRig) schedIn(fromNs, toNs int64) time.Duration {
 	if g.sched == nil {
@@ -1371,7 +1382,7 @@ func (g *wsoRig) stallOf(s *wsoSrv, ep *wsoEpisode, toNs, windowNs int64, v wsoS
 	disc, eff, _ := wsoJudgeStretch(time.Duration(toNs-ep.fromNs), sched)
 	return wsoStall{port: s.port, fromNs: ep.fromNs, toNs: toNs, samples: ep.samples,
 		onset: ep.onset, onsetC: ep.onsetC, last: v.String(), lastC: g.cliNow(s.port), marks: g.cliMarks(s.port),
-		sched: sched, discount: disc, effective: eff}
+		sched: sched, discount: disc, effective: eff, covered: g.coveredIn(ep.fromNs, windowNs)}
 }
 
 // watchSample applies one sample v of the connection s, taken at now (before v

@@ -94,6 +94,12 @@ const wsoSchedMetric = "/sched/latencies:seconds"
 type wsoSchedProbe interface {
 	observe(nowNs int64)
 	maxIn(fromNs, toNs int64) time.Duration
+	// coveredIn is informational, never judged: the time inside the window
+	// during which some recorded wait was in progress (the union of the waits'
+	// intervals). The rule uses the longest single wait; a chain of waits one
+	// after another (a lock handed from one runnable goroutine to the next) is
+	// longer than any of them, and this is what it adds up to.
+	coveredIn(fromNs, toNs int64) time.Duration
 }
 
 // wsoSchedEv is the longest runnable wait recorded in the pass ending at atNs.
@@ -200,6 +206,27 @@ func (p *wsoSchedLat) maxIn(fromNs, toNs int64) time.Duration {
 		m = max(m, min(e.lat, time.Duration(e.atNs-fromNs)))
 	}
 	return m
+}
+
+func (p *wsoSchedLat) coveredIn(fromNs, toNs int64) time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var covered time.Duration
+	end := fromNs // the covered time so far reaches here, scanning the events in time order
+	for _, e := range p.evs {
+		if e.atNs <= fromNs || e.atNs > toNs {
+			continue
+		}
+		lo := max(e.atNs-int64(e.lat), fromNs, end)
+		if e.atNs > lo {
+			covered += time.Duration(e.atNs - lo)
+		}
+		end = max(end, e.atNs)
+	}
+	return covered
 }
 
 // longest is the longest runnable wait of the whole run.

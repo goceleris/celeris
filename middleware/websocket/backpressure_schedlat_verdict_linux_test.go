@@ -18,6 +18,7 @@ func (wsoFixedSched) observe(int64) {}
 func (p wsoFixedSched) maxIn(fromNs, toNs int64) time.Duration {
 	return min(time.Duration(p), time.Duration(toNs-fromNs))
 }
+func (p wsoFixedSched) coveredIn(fromNs, toNs int64) time.Duration { return p.maxIn(fromNs, toNs) }
 
 // TestWSOStallSchedulerLatencyDiscount drives watchSample on a fake clock
 // (celeris#871): a stretch of unread bytes at a socket the engine does not read,
@@ -254,6 +255,32 @@ func TestWSOSchedLatMaxIn(t *testing.T) {
 	}
 	if p.longest() != 5*time.Second {
 		t.Errorf("longest = %v, want 5s", p.longest())
+	}
+}
+
+// TestWSOSchedLatCoveredIn pins the informational figure: the union of the
+// waits' intervals inside the window, so overlapping waits are counted once and
+// waits one after another add up.
+func TestWSOSchedLatCoveredIn(t *testing.T) {
+	ms := int64(time.Millisecond)
+	p := &wsoSchedLat{}
+	p.add(2000*ms, 1500*time.Millisecond) // [0.5, 2.0]
+	p.add(2250*ms, 1500*time.Millisecond) // [0.75, 2.25]: overlaps the first
+	p.add(5000*ms, 1000*time.Millisecond) // [4.0, 5.0]: a separate wait
+	cases := []struct {
+		from, to int64
+		want     time.Duration
+	}{
+		{0, 10000, 1750*time.Millisecond + time.Second}, // [0.5,2.25] + [4,5]
+		{1000, 10000, 1250*time.Millisecond + time.Second},
+		{0, 2000, 1500 * time.Millisecond},
+		{2500, 10000, time.Second},
+		{0, 100, 0},
+	}
+	for _, tc := range cases {
+		if got := p.coveredIn(tc.from*ms, tc.to*ms); got != tc.want {
+			t.Errorf("coveredIn(%d, %d) = %v, want %v", tc.from, tc.to, got, tc.want)
+		}
 	}
 }
 
