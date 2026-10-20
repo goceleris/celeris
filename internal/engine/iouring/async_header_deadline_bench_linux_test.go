@@ -75,7 +75,7 @@ func startDetachMuContender(mu *sync.Mutex) (stop func()) {
 //
 // A TryLock that misses makes asyncHeaderDeadline return 0 at once, which is
 // cheaper than a hit, so ns/op alone flatters a heavily contended lock. The
-// trylock-miss/op metric is the share of calls that missed, sampled after the
+// trylock-miss-share metric is the share of calls that missed, sampled after the
 // timed loop, under the same contender, with a deadline set so that a hit and
 // a miss are told apart by the result.
 func BenchmarkAsyncFeedHeaderDeadlineContended(b *testing.B) {
@@ -113,6 +113,6 @@ func BenchmarkAsyncFeedHeaderDeadlineContended(b *testing.B) {
 				misses++
 			}
 		}
-		b.ReportMetric(float64(misses)/samples, "trylock-miss/op")
+		b.ReportMetric(float64(misses)/samples, "trylock-miss-share")
 	})
 }

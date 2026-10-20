@@ -5,6 +5,7 @@ package iouring
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,6 +149,7 @@ func TestAsyncFeedArmsTheHeaderTimer762(t *testing.T) {
 func TestAsyncPromotionArmsTheHeaderTimer762(t *testing.T) {
 	f := headerTimerFixture762(t, false)
 	f.cs.headerTimerArmed = false
+	f.cs.asyncPromoted.Store(true) // the caller's step, per promoteConnToAsync's comment
 	f.w.promoteConnToAsync(f.cs, f.fd, []byte(partial762), &completionEntry{Res: int32(len(partial762))})
 	wantOneTimer762(t, f, "promoteConnToAsync", takeSQEs(f.w.ring))
 }
@@ -236,14 +238,21 @@ func TestHeaderTimerRearmRacesH1StateSwap762(t *testing.T) {
 	f := headerTimerFixture762(t, false)
 	h1 := f.cs.h1State
 	mu := f.cs.detachMu
-	const swaps = 50000
+	// Both loops yield on every step, so the test finishes at GOMAXPROCS=1
+	// too (a 1-CPU container, `-cpu 1`): a goroutine that never yields there
+	// is preempted once per scheduler slice, and 50000 swaps took minutes.
+	// The wall-clock cap is the last resort; the non-vacuity check below still
+	// applies when it is the thing that ends the run.
+	const swaps = 20000
+	const wallCap = 20 * time.Second
+	var stop atomic.Bool
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(done)
-		for range swaps {
+		for i := 0; i < swaps && !stop.Load(); i++ {
 			mu.Lock()
 			f.cs.h1State = nil
 			mu.Unlock()
@@ -251,15 +260,25 @@ func TestHeaderTimerRearmRacesH1StateSwap762(t *testing.T) {
 			mu.Lock()
 			f.cs.h1State = h1
 			mu.Unlock()
+			runtime.Gosched()
 		}
+		// Leave the state as the fixture had it, whichever way the loop ended.
+		mu.Lock()
+		f.cs.h1State = h1
+		mu.Unlock()
 	}()
+	start := time.Now()
 	var rearmed, missed, iters int
 	for finished := false; !finished || iters < 1000; iters++ {
 		select {
 		case <-done:
 			finished = true
 		default:
+			if iters&1023 == 0 && time.Since(start) > wallCap {
+				stop.Store(true)
+			}
 		}
+		runtime.Gosched()
 		f.cs.headerTimerArmed = false // the timer's CQE has been taken, as handleHeaderTimer's caller leaves it
 		f.w.handleHeaderTimer(f.fd)
 		if f.cs.headerTimerArmed {

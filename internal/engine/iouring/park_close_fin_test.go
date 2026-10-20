@@ -441,7 +441,7 @@ func finToManyAfterClose(t *testing.T, n int, readTimeout bool) {
 			"the close arrived as a reset, not the FIN the test is about", nr, firstNotEOF.Load())
 	}
 	if lost := int64(n) - seen.Load() - notEOF.Load(); lost > 0 {
-		t.Errorf("celeris712 NOFIN: %d of %d clients saw no close in 2 s while the worker was parked "+
+		t.Errorf("celeris712 NOFIN: %d of %d clients saw no close within the observation bound while the worker was parked "+
 			"(%d of them saw it after a wake)", lost, n, seenAfterWake.Load())
 	}
 }

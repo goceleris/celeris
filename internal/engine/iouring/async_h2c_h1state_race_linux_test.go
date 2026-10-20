@@ -168,6 +168,9 @@ func TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine(t *testing.T) {
 	// What the engine has counted before this connection's bytes: the engine's
 	// own start-up dial (a connect and a close, no bytes) is already behind it.
 	m0 := e.Metrics()
+	// Dispatch goroutines already parked in this process (a leak of an earlier
+	// test would make a bare ">= 1" gate pass without this connection's).
+	p0 := asyncDispatchParked722()
 	first := h2cUpgradeHead722("POST", 8) + "half"
 	if _, err := c.Write([]byte(first)); err != nil {
 		t.Fatalf("write upgrade head: %v", err)
@@ -182,12 +185,12 @@ func TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine(t *testing.T) {
 	if !parkWait712(5*time.Second, func() bool {
 		m := e.Metrics()
 		return m.AsyncPromotedConns >= m0.AsyncPromotedConns+1 && m.BytesRead >= m0.BytesRead+uint64(len(first)) &&
-			asyncDispatchParked722() >= 1
+			asyncDispatchParked722() >= p0+1
 	}) {
 		m := e.Metrics()
 		t.Fatalf("the first write was not promoted and parked: AsyncPromotedConns %d -> %d, BytesRead %d -> %d (want +1 and +%d), "+
-			"parked dispatch goroutines %d (want 1)", m0.AsyncPromotedConns, m.AsyncPromotedConns, m0.BytesRead, m.BytesRead,
-			len(first), asyncDispatchParked722())
+			"parked dispatch goroutines %d (want %d: %d before the write, +1)", m0.AsyncPromotedConns, m.AsyncPromotedConns, m0.BytesRead, m.BytesRead,
+			len(first), asyncDispatchParked722(), p0+1, p0)
 	}
 	if _, err := c.Write([]byte("body")); err != nil {
 		t.Fatalf("write rest of body: %v", err)

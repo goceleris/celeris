@@ -171,8 +171,19 @@ type closeRoute896 struct {
 
 var closeRoutes896CQE = []closeRoute896{
 	{"shutdown-drain", func(r *acceptRig896) { r.w.endOwedOpsAtShutdown(); r.closeListener() }, false},
-	{"stopAccepting", func(r *acceptRig896) { closeRoutes896[0].close(r.w) }, true},
-	{"pause-close", func(r *acceptRig896) { closeRoutes896[1].close(r.w) }, true},
+	{"stopAccepting", func(r *acceptRig896) { closeRoute896ByName("stopAccepting")(r.w) }, true},
+	{"pause-close", func(r *acceptRig896) { closeRoute896ByName("pause-close")(r.w) }, true},
+}
+
+// closeRoute896ByName finds a route of closeRoutes896 by its name, so a
+// reordering of that table cannot silently swap the routes under test.
+func closeRoute896ByName(name string) func(w *Worker) {
+	for _, rt := range closeRoutes896 {
+		if rt.name == name {
+			return rt.close
+		}
+	}
+	panic("closeRoutes896 has no route " + name)
 }
 
 // TestListenCancelWaitEndsOnTheScriptedCompletions896 plays every script
