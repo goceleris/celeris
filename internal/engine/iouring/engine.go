@@ -271,8 +271,11 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 // (celeris#682, #872): io_uring needs Linux 5.19, the release that added the
 // IORING_ASYNC_CANCEL flags. Through 5.18 the kernel fails every cancel the
 // engine submits with -EINVAL and leaves its target running. On 5.15 the
-// recv of a connection the engine closes keeps the socket open, so the peer
-// gets no FIN (measured), and after the 5 s release backstop the pool can
+// recv of a connection the engine closes stays armed. On the H1 fast-close
+// path, close(2) alone, which the idle-timeout close takes, that recv keeps
+// the socket open and the peer gets no FIN (measured, celeris#792); the other
+// close paths shut the connection down before the close, so they send a FIN
+// (read from code, not measured). After the 5 s release backstop the pool can
 // hand that recv's buffer to another connection while the recv can still
 // complete into it (the #256 class, read from code).
 //
@@ -291,10 +294,11 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 // refuse from 5.19: the flags exist there, and the probe's private ring can
 // fail with EMFILE or ENOMEM under load (celeris#681 N1); that engine only
 // keeps the hand-off's reap off. The error starts "io_uring not available on
-// this system", as New's error for a kernel with no io_uring does: the
-// adaptive engine then starts on epoll (and CELERIS_ADAPTIVE_START=iouring
-// falls back to it), and an explicit io_uring engine fails to start with the
-// kernel requirement in its error.
+// this system", as New's error for a kernel with no io_uring does. No code
+// outside the tests reads that prefix (the tests' skip helpers do): the
+// adaptive engine falls back to epoll after any New error
+// (CELERIS_ADAPTIVE_START=iouring included), and an explicit io_uring engine
+// fails to start with the kernel requirement in its error.
 func requireAsyncCancelFlags(p asyncCancelProbe, reason string, profile engine.CapabilityProfile) error {
 	fromFloor := profile.KernelMajor > 5 || (profile.KernelMajor == 5 && profile.KernelMinor >= 19)
 	switch {
@@ -329,18 +333,28 @@ func requireAsyncCancelFlags(p asyncCancelProbe, reason string, profile engine.C
 // unexpected, and it keeps the hand-off's reap off for the engine being built
 // (the next New probes again: probeAsyncCancelFlagsCached keeps only an
 // answer), so it is a Warn there and Info below.
+//
+// Before 5.19 New refuses io_uring whatever the probe said, right after this
+// log (requireAsyncCancelFlags), so the records of those two answers say that
+// and not that the hand-off will not cancel a recv: there is no hand-off
+// without an engine.
 func logAsyncCancelProbe(l *slog.Logger, p asyncCancelProbe, reason string, kernelMajor, kernelMinor int) {
 	kernel := fmt.Sprintf("%d.%d", kernelMajor, kernelMinor)
+	fromFloor := kernelMajor > 5 || (kernelMajor == 5 && kernelMinor >= 19)
+	consequence := "the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)"
+	if !fromFloor {
+		consequence = "io_uring needs Linux 5.19 or later and is not used (celeris#682)"
+	}
 	switch p {
 	case asyncCancelRejected:
 		l.Info("async cancel flags rejected by the kernel: io_uring needs Linux 5.19 or later and is not used (celeris#682)",
 			"reason", reason, "kernel", kernel)
 	case asyncCancelUnexpected:
-		l.Warn("async cancel flags probe got an answer it does not recognise: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)",
+		l.Warn("async cancel flags probe got an answer it does not recognise: "+consequence,
 			"reason", reason, "kernel", kernel)
 	case asyncCancelNoAnswer:
-		msg := "async cancel flags probe got no answer from the kernel: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)"
-		if kernelMajor > 5 || (kernelMajor == 5 && kernelMinor >= 19) {
+		msg := "async cancel flags probe got no answer from the kernel: " + consequence
+		if fromFloor {
 			l.Warn(msg, "reason", reason, "kernel", kernel)
 		} else {
 			l.Info(msg, "reason", reason, "kernel", kernel)
