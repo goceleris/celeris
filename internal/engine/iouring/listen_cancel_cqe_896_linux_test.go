@@ -4,6 +4,7 @@ package iouring
 
 import (
 	"errors"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -236,6 +237,51 @@ func TestListenCancelWaitEndsOnTheScriptedCompletions896(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// TestListenCancelDeliveredAcceptReachesProcessCQE896: an accept completion
+// that DELIVERS a connection (Res >= 0, F_MORE set: the multishot accept goes
+// on) which the cancel wait meets must reach processCQE, whose accept path
+// takes ownership of the descriptor (and closes it if it cannot). The
+// scripts above deliver an error (-EMFILE), so a close that drops only the
+// successful deliveries (the E13 round-3 verifier's own V5, `if
+// !(ud&udMask == udAccept && c.Res >= 0) { w.processCQE(...) }`) passes them
+// all: nothing but the wait's call count and the error counters is looked at
+// there. Here the delivery's Res is math.MaxInt32, a descriptor number
+// beyond the conn table that no process owns, so onAcceptedFD counts it in
+// ConnTableCap and closes the nonexistent descriptor (EBADF, ignored); the
+// counter is the observation that it was handled. Only the routes that hand
+// the completions to processCQE (cancelAccept: stopAccepting and the pause's
+// close) are played; the shutdown drain reads the CQEs itself.
+func TestListenCancelDeliveredAcceptReachesProcessCQE896(t *testing.T) {
+	deliver := scriptedCQE896{op: udAccept, res: math.MaxInt32, flags: cqeFMore}
+	calls := [][]scriptedCQE896{{deliver}, {cancelAns896(1)}, {accEnd896}}
+	for _, rt := range closeRoutes896CQE {
+		if !rt.processes {
+			continue
+		}
+		for _, tc := range tiers896 {
+			t.Run(rt.name+"/"+tc.name, func(t *testing.T) {
+				r := newAcceptRig896(t, tc.tier(), false)
+				waits := scriptedWait896(t, r, calls)
+				rt.run(r)
+				if got := r.w.errs.ConnTableCap.Load(); got != 1 {
+					t.Errorf("%s: ConnTableCap = %d, want 1: the delivered accept (fd %d, beyond the conn table, F_MORE set) "+
+						"was not handed to processCQE, which counts it and closes the descriptor", rt.name, got, deliver.res)
+				}
+				if *waits != len(calls) {
+					t.Errorf("%s made %d ring waits, want %d: the delivery and the cancel's count leave the accept running, "+
+						"only its terminal CQE ends the wait", rt.name, *waits, len(calls))
+				}
+				if got := r.w.errs.AcceptCancelled.Load(); got != 1 {
+					t.Errorf("%s: AcceptCancelled = %d, want 1 (the terminal CQE)", rt.name, got)
+				}
+				if head, tail := r.ring.BeginCQ(); head != tail {
+					t.Errorf("%d completions are left unread in the CQ ring", tail-head)
+				}
+			})
 		}
 	}
 }
