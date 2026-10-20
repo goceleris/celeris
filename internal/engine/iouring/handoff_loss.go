@@ -96,6 +96,13 @@ import (
 //     a completion of the conn (its own response SEND, typically) or a reap
 //     retry lands between the goroutine's park and the drain of its claim. A
 //     rate.
+//   - exitDeferred: the same three sites finding a promoted async conn whose
+//     dispatch goroutine is on its way out through the close or the h2c
+//     exit (asyncClosed, or a protocol other than HTTP/1: celeris#780) and
+//     leaving the conn to the entry that goroutine queues. Ordering, not a
+//     fault. Unexported and read by tests only (a witness that the exit
+//     window those tests build was reached), not an EngineMetrics field
+//     (api/observe.txt).
 //
 // All are direct atomic adds: they fire on the stale-CQE, drain and hand-off
 // paths only, never on the per-request path while no drain is set, and like
@@ -171,6 +178,9 @@ type handoffLossStats struct {
 	// Appended after the rest, as a section of its own, so no field moves
 	// (celeris#896).
 	shutdownListenCancelGaveUp atomic.Uint64
+
+	// exitDeferred: see the list above. Tests only.
+	exitDeferred atomic.Uint64
 }
 
 func (s *handoffLossStats) noteCloseFDForced() {
@@ -283,6 +293,17 @@ func (s *handoffLossStats) noteDoubleClaim() {
 func (s *handoffLossStats) noteClaimDeferred() {
 	if s != nil {
 		s.claimDeferred.Add(1)
+	}
+}
+
+// noteExitDeferred counts a worker-side hand-off attempt that found a promoted
+// async conn on its dispatch goroutine's close or h2c exit and left it to the
+// entry that goroutine queues (celeris#780). Not an EngineMetrics field; the
+// tests of the exit window read it so they stay non-vacuous if their fixture
+// stops reaching the branch (celeris#884 item 30).
+func (s *handoffLossStats) noteExitDeferred() {
+	if s != nil {
+		s.exitDeferred.Add(1)
 	}
 }
 
