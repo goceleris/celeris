@@ -275,6 +275,9 @@ func TestInlineHijackLeavesReissuedConnStateAlone(t *testing.T) {
 	if reused.Load() < 1 {
 		t.Fatalf("witness: the pool handed the released connState back 0 times in %d hijacks, so no accept could have reissued it and this test shows nothing", n)
 	}
+	if len(taken) != int(reused.Load()) {
+		t.Fatalf("the hook took %d states but counted %d reuses", len(taken), reused.Load())
+	}
 	cleared := 0
 	for _, st := range taken {
 		if !st.h1State.InlineMode {
@@ -405,5 +408,12 @@ func TestInlineHijackKeepsRequestViewsWhenItsStateIsReused(t *testing.T) {
 	}
 	if !stop() {
 		t.Fatal("the engine did not stop")
+	}
+	// The states B's accepts took stay out of the pool until here, so that
+	// none of them is handed to a later round's A.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(taken) != int(reused.Load()) {
+		t.Fatalf("the hook took %d states but counted %d reuses", len(taken), reused.Load())
 	}
 }

@@ -2257,7 +2257,7 @@ func dispatchBusy(cs *connState, owe *bool) bool {
 // testHookHijackReleased, when set, runs in hijackConn's inline branch on the
 // loop goroutine, right after releaseConnState has put cs back in the pool
 // and before the Hijack call returns to the handler: the window in which
-// another accept can take cs (celeris#885 items 6 and 7, #890 item 16). A
+// another accept can take cs (celeris#885 item 6, #890 item 16). A
 // test acquires the pooled state there, on the same P, to force that reuse
 // instead of waiting for it. The hook must not keep using cs as released
 // memory: it is the pool's now, so the test compares it with what the pool
