@@ -144,7 +144,15 @@ func c936SocketReport(conn net.Conn) string {
 		inode := f[9]
 		fmt.Fprintf(&b, "C936 server socket %s state=%s tx_queue=%d rx_queue=%d inode=%s\n", want, state, txq, rxq, inode)
 		if inode == "0" {
-			b.WriteString("C936 verdict-hint: the connection is still in the listen backlog: no worker has accepted it\n")
+			// A socket with no inode has no owner. In ESTABLISHED (or SYN_RECV)
+			// it is waiting in the listen queue; in any closing state the
+			// server side closed it (a timeout sweep, a close after an
+			// error, the server stopping) and it is an orphan.
+			if state == "ESTABLISHED" || state == "SYN_RECV" {
+				b.WriteString("C936 verdict-hint: the connection is still in the listen backlog: no worker has accepted it\n")
+			} else {
+				fmt.Fprintf(&b, "C936 verdict-hint: the server closed this socket (state=%s, no owner): a timeout sweep or a close, not a backlog wait\n", state)
+			}
 			continue
 		}
 		fd, epolls := c936FindSocketFD(inode)
@@ -241,6 +249,10 @@ func c936ProbeWorkers(addr string) string {
 			res = append(res, "worker"+body)
 		case errors.Is(err, os.ErrDeadlineExceeded):
 			res = append(res, "TIMEOUT("+c.LocalAddr().String()+")")
+		case strings.HasPrefix(err.Error(), "status "):
+			// A server with no /w route answers 404: the worker is alive, it
+			// just does not say which one it is.
+			res = append(res, "answered")
 		default:
 			res = append(res, "err:"+err.Error())
 		}
