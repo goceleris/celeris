@@ -24,8 +24,18 @@ func requireUpSwitch(t *testing.T, e *Engine) {
 	if e.ctrl.connSwitchEnabled {
 		return
 	}
-	msg := fmt.Sprintf("the adaptive up-switch is disabled in this environment "+
+	skipOrFailUpswitch662(t, "the adaptive up-switch is disabled in this environment "+
 		"(io_uring not viable; memlock worker ceiling %d, -1 = unlimited)", maxWorkersForMemlock())
+}
+
+// skipOrFailUpswitch662 is the one gate of this package's tests that need io_uring (or the up-switch it
+// enables) and cannot run where it is unavailable: it skips, and fails instead under
+// CELERIS_REQUIRE_UPSWITCH=1, which the CI jobs that raise memlock set. A test must not skip for that reason any
+// other way: the job-level SKIP tally (ci.yml, job adaptive) would turn the job red, but only this gate names the
+// test and the cause. TestAdaptiveSkipRouting684 fails on a raw t.Skip for it.
+func skipOrFailUpswitch662(t *testing.T, format string, args ...any) {
+	t.Helper()
+	msg := fmt.Sprintf(format, args...)
 	if os.Getenv("CELERIS_REQUIRE_UPSWITCH") == "1" {
 		t.Fatal(msg + " -- CELERIS_REQUIRE_UPSWITCH=1 forbids skipping")
 	}

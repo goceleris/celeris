@@ -150,7 +150,7 @@ func abortAdaptive791(t *testing.T, adopted bool, inject func(*Engine)) {
 		Resources: resource.Resources{Workers: 2}, Logger: slog.New(logs)}
 	e, err := New(cfg, abortHandler791{hits: &hits}, nil)
 	if err != nil {
-		s0SkipUnlessRequired(t, "adaptive.New unsupported here: %v", err)
+		skipOrFailUpswitch662(t, "adaptive.New unsupported here: %v", err)
 	}
 	e.ctrl.cooldown = 0
 	e.FreezeSwitching()

@@ -269,9 +269,9 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					switch r := cl.closeWait(c, buf); r.outcome {
 					case "eof":
 						closedOK.Add(1)
-						if r.maxGap > wsoCloseSlow {
-							t.Logf("%s: close after a silent stretch longer than %v, conn %s: %s", kind, wsoCloseSlow, c.LocalAddr(), r)
-						}
+						// A silence over wsoCloseSlow is printed with both ends'
+						// timeline (WSO-CLOSESLOW), not asserted (celeris#633).
+						cl.closeSlow(t, c, kind.String(), r)
 					case "rst":
 						clientRST.Add(1)
 						cl.giveUp(t, c, kind.String(), "was RESET instead of closed: "+r.String())
