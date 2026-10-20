@@ -260,8 +260,10 @@ func TestDriverTakesNumberFreedByCloseConn775(t *testing.T) {
 // was: t.Fatalf on the first collision) this fails.
 func TestDriverTakesNumberFreedByCloseConn775RetriesACollision(t *testing.T) {
 	defer watchdog(t, time.Minute)()
-	if used := runFreedNumber775(t, 0); used != 2 {
-		t.Errorf("the check passed after %d attempt(s), want 2: the first, with the decoy on the freed number, must be the one that was retried", used)
+	// At least 2: a natural collision on the second attempt too is retried as
+	// well, so "exactly 2" would bring back the flake this test is the control of.
+	if used := runFreedNumber775(t, 0); used < 2 {
+		t.Errorf("the check passed after %d attempt(s), want at least 2: the first, with the decoy on the freed number, must be the one that was retried", used)
 	}
 }
 
