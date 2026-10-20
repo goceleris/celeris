@@ -101,7 +101,7 @@ func TestStandbyLoopCompletesItsLastHandoffInsteadOfSuspending(t *testing.T) {
 	}
 	e, err := New(cfg, suspendTestHandler{})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -113,11 +113,8 @@ func TestStandbyLoopCompletesItsLastHandoffInsteadOfSuspending(t *testing.T) {
 		case <-time.After(5 * time.Second):
 		}
 	}()
-	for dl := time.Now().Add(10 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		t.Skip("engine did not bind")
+	if err := awaitBound(e, errCh, 10*time.Second); err != nil {
+		t.Fatalf("engine did not bind: %v", err)
 	}
 
 	target := &countingTarget{}

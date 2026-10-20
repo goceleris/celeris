@@ -52,7 +52,7 @@ func startAsyncEngine(t *testing.T) (string, func()) {
 	}
 	e, err := New(cfg, &asyncReuseHandler{})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)

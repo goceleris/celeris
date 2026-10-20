@@ -51,7 +51,7 @@ func staleClockAfterParkEpoll(t *testing.T, park time.Duration, adopt bool) {
 		IdleTimeout:        10 * time.Minute,
 	}, okHandler658{})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -75,8 +75,8 @@ func staleClockAfterParkEpoll(t *testing.T, park time.Duration, adopt bool) {
 			time.Sleep(2 * time.Millisecond)
 		}
 	}
-	if !waitFor(8*time.Second, func() bool { return e.Addr() != nil }) {
-		t.Skip("epoll engine did not bind")
+	if err := awaitBound(e, done, 8*time.Second); err != nil {
+		t.Fatalf("epoll engine did not bind: %v", err)
 	}
 	e.mu.Lock()
 	loops := append([]*Loop(nil), e.loops...)
