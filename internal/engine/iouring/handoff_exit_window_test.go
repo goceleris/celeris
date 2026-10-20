@@ -353,3 +353,40 @@ func TestTryTransplantLeavesAClosingAsyncConnAlone(t *testing.T) {
 		})
 	}
 }
+
+// BenchmarkRerunHandOffExiting measures rerunHandOff's exiting-conn branch: the
+// three atomic loads and the mutex round-trip under asyncInMu a promoted async
+// conn costs on the reap-retry and reap-landing sites, plus the exitDeferred
+// note (celeris#884 item 30). Those sites run only while an io_uring->epoll
+// drain is set, never on the per-request path, so this is a bound on a cold
+// path, not a hot-path number. A hand-built Worker and connState, not an
+// fdlFixture: its helpers take a *testing.T and a ring. Each arm checks the
+// counter at the end, so a tree that stops reaching the branch (and would here
+// time the no-exit path or run finishAsyncTransplant) fails instead of timing
+// something else.
+func BenchmarkRerunHandOffExiting(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		exit func(*connState)
+	}{
+		{"close_exit", func(cs *connState) { cs.asyncClosed.Store(true) }},
+		{"h2c_exit", func(cs *connState) { cs.protocol.Store(int32(engine.H2C)) }},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			w := &Worker{async: true, handoffLoss: &handoffLossStats{}}
+			cs := &connState{fd: 7}
+			cs.asyncPromoted.Store(true)
+			cs.protocol.Store(int32(engine.HTTP1))
+			tc.exit(cs)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				w.rerunHandOff(7, cs)
+			}
+			b.StopTimer()
+			if got := w.handoffLoss.exitDeferred.Load(); got != uint64(b.N) {
+				b.Fatalf("exitDeferred = %d after %d calls: the benchmark did not run the exiting branch", got, b.N)
+			}
+		})
+	}
+}
