@@ -68,7 +68,7 @@ func TestAsyncHandlerLargeBodyKeepAlive(t *testing.T) {
 	}
 	e, err := New(cfg, &largeBodyHandler{body: body})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)
@@ -134,7 +134,7 @@ func TestAsyncHandlerLargeBodyConcurrent(t *testing.T) {
 	}
 	e, err := New(cfg, &largeBodyHandler{body: body})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)

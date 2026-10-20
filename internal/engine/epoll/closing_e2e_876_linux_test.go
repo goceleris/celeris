@@ -39,7 +39,7 @@ func TestEngineClosingResponseSurvivesReadTimeoutWhileTheClientReads(t *testing.
 		Resources:    resource.Resources{Workers: 2},
 	}, &bigResponseHandler{bodySize: body})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)

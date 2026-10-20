@@ -59,7 +59,7 @@ func startReqCountEngine(t *testing.T) (string, *Engine, func()) {
 	}
 	e, err := New(cfg, &reqCountHandler{})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)
