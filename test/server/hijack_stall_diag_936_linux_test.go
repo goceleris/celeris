@@ -261,20 +261,27 @@ func c936ProbeWorkers(addr string) string {
 	return "C936 probes (fresh conns, 3 s each): " + strings.Join(res, " ") + "\n"
 }
 
-// c936EngineGoroutines is the stacks of the goroutines in the engine and
-// root packages, which is where a wedged loop or dispatch goroutine shows.
+// c936EngineGoroutines is the stacks of the goroutines in the engine,
+// connection and root packages, which is where a wedged loop or dispatch
+// goroutine shows, and of the goroutines the test and its handlers run (a
+// handler that holds a hijacked conn shows there). The goroutine that takes
+// the snapshot is left out.
 func c936EngineGoroutines() string {
 	buf := make([]byte, 16<<20)
 	buf = buf[:runtime.Stack(buf, true)]
 	var b strings.Builder
 	n := 0
 	for _, g := range bytes.Split(buf, []byte("\n\n")) {
-		if !bytes.Contains(g, []byte("goceleris/celeris/internal/engine")) && !bytes.Contains(g, []byte("goceleris/celeris.(")) && !bytes.Contains(g, []byte("goceleris/celeris/internal/conn")) {
+		if bytes.Contains(g, []byte("c936EngineGoroutines")) {
+			continue
+		}
+		if !bytes.Contains(g, []byte("goceleris/celeris/internal/engine")) && !bytes.Contains(g, []byte("goceleris/celeris.(")) &&
+			!bytes.Contains(g, []byte("goceleris/celeris/internal/conn")) && !bytes.Contains(g, []byte("goceleris/celeris/test/server_test.")) {
 			continue
 		}
 		n++
 		b.Write(g)
 		b.WriteString("\n\n")
 	}
-	return fmt.Sprintf("C936 engine goroutines (%d):\n%s", n, b.String())
+	return fmt.Sprintf("C936 engine and test goroutines (%d):\n%s", n, b.String())
 }
