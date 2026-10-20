@@ -113,11 +113,8 @@ func TestStandbyLoopCompletesItsLastHandoffInsteadOfSuspending(t *testing.T) {
 		case <-time.After(5 * time.Second):
 		}
 	}()
-	for dl := time.Now().Add(10 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		t.Fatal("engine did not bind")
+	if err := awaitBound(e, errCh, 10*time.Second); err != nil {
+		t.Fatalf("engine did not bind: %v", err)
 	}
 
 	target := &countingTarget{}

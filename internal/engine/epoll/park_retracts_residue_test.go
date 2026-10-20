@@ -181,8 +181,8 @@ func parkResidue(t *testing.T, arm parkArm) {
 			t.Error("engine did not stop within 5s")
 		}
 	})
-	if !parkWait(8*time.Second, func() bool { return e.Addr() != nil }) {
-		t.Fatal("epoll engine did not bind")
+	if err := awaitBound(e, done, 8*time.Second); err != nil {
+		t.Fatalf("epoll engine did not bind: %v", err)
 	}
 	// Every loop's timerfd was created before its ready signal, and Addr is
 	// stored after every ready: reading timerFD here is ordered after it.
