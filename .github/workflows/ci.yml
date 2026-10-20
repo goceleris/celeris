@@ -1043,7 +1043,7 @@ jobs:
       # probe finds no ring or no multishot receive. So both run here by
       # name with CELERIS_REQUIRE_IOURING_WORKERS=1, and an exact tally: the
       # three top-level tests (celeris#868's ring-survives-hijacks test is the third)
-      # and the four arms (std, epoll, epoll-async, io_uring) must PASS, with no SKIP line, and go test must exit 0.
+      # and the five arms (std, epoll, epoll-async, epoll-asynchandlers, io_uring) must PASS, with no SKIP line, and go test must exit 0.
       - name: celeris#733 hijacked request strings (io_uring arms required)
         if: ${{ !cancelled() }}
         shell: bash
@@ -1059,9 +1059,9 @@ jobs:
           arms=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/" /tmp/c733.log || true)
           uring=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/io_uring" /tmp/c733.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c733.log || true)
-          echo "celeris#733 tests: top-level PASS $top (want 3), arm PASS $arms (want 4), io_uring arm PASS $uring (want 1), SKIP lines $skipped, go test failed $failed (want 0)"
-          if [ "$top" -ne 3 ] || [ "$arms" -ne 4 ] || [ "$uring" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
-            echo "expected all three tests and all four arms (one io_uring) to PASS with no SKIP line"
+          echo "celeris#733 tests: top-level PASS $top (want 3), arm PASS $arms (want 5), io_uring arm PASS $uring (want 1), SKIP lines $skipped, go test failed $failed (want 0)"
+          if [ "$top" -ne 3 ] || [ "$arms" -ne 5 ] || [ "$uring" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all three tests and all five arms (one io_uring) to PASS with no SKIP line"
             exit 1
           fi
       # celeris#791: a handler panic, or runtime.Goexit, on an async dispatch

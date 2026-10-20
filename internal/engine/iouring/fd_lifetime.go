@@ -299,7 +299,7 @@ func (w *Worker) holdEligible(cs *connState) bool {
 	if !cs.h1State.AtRequestBoundary() || cs.h1State.HasPendingData() {
 		return false
 	}
-	return cs.sending || len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0 || len(cs.bodyBuf) > 0
+	return cs.sending || len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0
 }
 
 // releaseHold runs after the hand-off attempt at every send dispatch site
@@ -338,7 +338,7 @@ func (w *Worker) releaseHoldSlow(cs *connState, rescued bool) {
 		}
 		defer mu.Unlock()
 	}
-	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 || len(cs.bodyBuf) > 0 {
+	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return
 	}
 	cs.transplantHold = false
@@ -669,6 +669,14 @@ func (w *Worker) endOwedOpsAtShutdown() {
 	}
 	pending := func() bool { return acceptOwed || connsPending() }
 	var ringErr error
+	// Not under SQPOLL: this drain submits and waits with io_uring_enter, which
+	// an SQPOLL ring does not take the same way, so it is skipped and shutdown
+	// closes the descriptors with the ops still owed, as it did before the
+	// drain (celeris#685). No tier enables SQPOLL today (every SQPollIdle is 0,
+	// celeris#377; TestNoTierEnablesSQPoll884), so this is unreachable. Enabling
+	// it must first give the drain an SQPOLL form that waits on the CQ ring
+	// without entering (celeris#884 item 18, with hijackConn). The same holds
+	// for queueListenAcceptCancel.
 	if w.ring != nil && !w.sqpoll && pending() {
 		for _, cs := range owed {
 			w.cancelConnOps(cs.fd, cs)
