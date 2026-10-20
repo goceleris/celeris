@@ -58,7 +58,7 @@ func startSweepEngine(t *testing.T, h *sweepHandler, loops int) (*Engine, string
 	}
 	e, err := New(cfg, h)
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -75,7 +75,7 @@ func startSweepEngine(t *testing.T, h *sweepHandler, loops int) (*Engine, string
 		time.Sleep(10 * time.Millisecond)
 	}
 	if e.Addr() == nil {
-		t.Skip("epoll engine did not bind")
+		t.Fatal("epoll engine did not bind")
 	}
 	return e, addr
 }

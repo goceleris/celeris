@@ -168,7 +168,7 @@ func parkResidue(t *testing.T, arm parkArm) {
 		OnDisconnect:       func(string) { disc.Add(1) },
 	}, handler)
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -182,7 +182,7 @@ func parkResidue(t *testing.T, arm parkArm) {
 		}
 	})
 	if !parkWait(8*time.Second, func() bool { return e.Addr() != nil }) {
-		t.Skip("epoll engine did not bind")
+		t.Fatal("epoll engine did not bind")
 	}
 	// Every loop's timerfd was created before its ready signal, and Addr is
 	// stored after every ready: reading timerFD here is ordered after it.
