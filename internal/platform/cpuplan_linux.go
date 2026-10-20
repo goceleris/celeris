@@ -222,7 +222,7 @@ func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 	// raised.
 	cands := big
 	if !explicit && numWorkers > 0 && src.nic != nil && src.addr != "" {
-		plan.RxFree = rxFreeCPUs(src.addr, big, *src.nic)
+		plan.RxFree = rxFreeFor(numWorkers, src.addr, big, *src.nic)
 		if len(plan.RxFree.Freed) > 0 {
 			cands = slices.DeleteFunc(slices.Clone(big), func(c int) bool {
 				return slices.Contains(plan.RxFree.Freed, c)
