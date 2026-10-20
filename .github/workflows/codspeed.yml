@@ -59,8 +59,13 @@
 # and the engines. Engine throughput is judged on real hardware by
 # goceleris/probatorium's cluster matrix, not by micro-benchmarks, and the
 # engines change so often that watching them here would spend the whole
-# monthly budget (see below). Nor HTTP/2 request handling (HPACK header
-# decoding, frames): no benchmark in the set runs it (celeris#754).
+# monthly budget (see below). HTTP/2 request handling is measured where it is
+# decoded: BenchmarkHeadersDecode944 and BenchmarkAsyncRequest951
+# (internal/protocol/h2/stream) each run an HPACK-decoded request through
+# stream/processor.go, and both are in the -bench pattern below. Not measured:
+# the frame package (internal/protocol/h2/frame: frame parsing and writing, and
+# the HPACK encoder). It has no benchmark and the stream package does not import
+# it, so a change there does not start this workflow (celeris#754).
 # Removed in celeris#725:
 #   - ./internal/...: its only benchmarks are internal/wakefd's, and that is
 #     the engines' wake primitive, judged on the cluster with them. The
