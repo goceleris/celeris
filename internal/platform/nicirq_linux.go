@@ -19,7 +19,9 @@ import (
 // is the other half of the read nicrx_linux.go does for the rx-port rule and
 // shares its helpers (listenInterfaces, lowerDevices, deviceIRQs, effectiveCPU,
 // parseInterrupts and their bounds); what it adds is the traffic test below
-// and the report.
+// and the report. The CPUs the rx-port rule frees on purpose are left out of
+// the Warn by [CPUPlan.WithNICIRQs], not here: this file reports every vector
+// that carries traffic.
 //
 //	listen address -> interfaces -> physical devices -> IRQ numbers -> CPU per IRQ
 //	 (net, pure Go)   (lower_* links)  (msi_irqs, irq,    (effective_affinity_list,
@@ -138,9 +140,9 @@ type NICSkip struct {
 //
 // The limits come from msr1, the one host measured (a bond of two ports with 32
 // vectors each, 96 snapshots over 111 minutes): four vectors carried the
-// traffic with 15.4% to 34.7% of the total each (1.7e9 to 3.9e9 interrupts),
+// traffic with about 15% to 35% of the total each (1.7e9 to 3.9e9 interrupts),
 // and the other 60 had none or 3 interrupts (IRQ 156 and 188, 3e-8 % of the
-// total). Any share from 3e-8 % up to 15% and any floor from 4 to 1.7e9 separate
+// total). Any share from 3e-8 % up to 14% and any floor from 4 to 1.7e9 separate
 // the two groups; 5% and 1000 sit in the gap, a factor 3 under the quietest
 // busy vector and a factor 333 over the loudest idle one, and are a choice, not
 // a measurement.
