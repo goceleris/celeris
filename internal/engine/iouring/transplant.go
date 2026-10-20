@@ -225,8 +225,8 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 					return // hijacked (handed off) or closed on error — nothing more to arm
 				}
 				// Switched to HTTP/2 (celeris#908): the 101 is sent, arm its recv below.
-			} else if w.flushSend(cs) {
-				w.markDirty(cs)
+			} else {
+				w.flushCarriedReplay(cs)
 			}
 		}
 	}
@@ -293,10 +293,31 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		cs.asyncPromoted.Store(true)
 		w.asyncPromoted.Add(1)
 	}
+	w.flushCarriedReplay(cs)
+	return true
+}
+
+// flushCarriedReplay ships what a transplant's carried-request replay queued,
+// under cs.detachMu when the conn has one. A carried request can detach during
+// the replay (a WebSocket or SSE handler on a pipelined request), and from
+// then on the middleware goroutine writes through the guarded writeFn, which
+// reads and writes cs.writeBuf, cs.sendBuf and cs.sending under that lock; the
+// flush touches the same fields. handleRecv's twin (respondAndArm) and epoll's
+// flushCarriedReplay take the lock too (celeris#1084). Worker thread, on a
+// conn fresh from attachAdoptedFD: cs.detachMu is not held by this thread, and
+// the read of the field is ordered after the replay's ProcessH1, where an
+// OnDetach installs it.
+func (w *Worker) flushCarriedReplay(cs *connState) {
+	mu := cs.detachMu
+	if mu != nil {
+		mu.Lock()
+	}
 	if w.flushSend(cs) {
 		w.markDirty(cs)
 	}
-	return true
+	if mu != nil {
+		mu.Unlock()
+	}
 }
 
 // endCarriedReplay finishes a replay whose ProcessH1 returned a non-nil
