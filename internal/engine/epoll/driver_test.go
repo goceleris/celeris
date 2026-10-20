@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -412,6 +413,89 @@ func TestDriverUnknownFDReturnsErr(t *testing.T) {
 	if err := wl.UnregisterConn(bogus); !errors.Is(err, celerisengine.ErrUnknownFD) {
 		t.Fatalf("UnregisterConn unknown fd: got %v want ErrUnknownFD", err)
 	}
+}
+
+// TestRegisterConnRollsBackAFailedEpollAdd885 (celeris#885 item 8, from the
+// review of #787): RegisterConn publishes the conn (map entry, hasDriverConns)
+// before it arms the descriptor, so a refused EPOLL_CTL_ADD must take both
+// back. A regular file's descriptor is refused with EPERM, which is
+// deterministic. After the failure the number is unknown to the loop (Write and
+// UnregisterConn say ErrUnknownFD), the HTTP path is not made to look every
+// event up (hasDriverConns false, the zero-overhead gate), and the failed
+// registration did not take a registered neighbour's place: the second part
+// registers a good conn first, and the flag must stay set for it.
+func TestRegisterConnRollsBackAFailedEpollAdd885(t *testing.T) {
+	regularFile := func(t *testing.T) int {
+		t.Helper()
+		f, err := os.CreateTemp(t.TempDir(), "regfile")
+		if err != nil {
+			t.Fatalf("create temp file: %v", err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		return int(f.Fd())
+	}
+	driverConnCount := func(l *Loop) int {
+		l.driverMu.RLock()
+		defer l.driverMu.RUnlock()
+		return len(l.driverConns)
+	}
+	closed := 0
+	onClose := func(error) { closed++ }
+
+	t.Run("no other conn", func(t *testing.T) {
+		l := bareDriverLoop885(t)
+		fd := regularFile(t)
+		err := l.RegisterConn(fd, func([]byte) {}, onClose)
+		if !errors.Is(err, unix.EPERM) {
+			t.Fatalf("RegisterConn of a regular file's descriptor: %v, want EPERM from EPOLL_CTL_ADD", err)
+		}
+		if l.hasDriverConns.Load() {
+			t.Error("hasDriverConns is still set after the failed registration of the loop's only conn")
+		}
+		if dc := l.lookupDriver(fd); dc != nil {
+			t.Errorf("lookupDriver(%d) = %v after the failed registration, want nil", fd, dc)
+		}
+		if n := driverConnCount(l); n != 0 {
+			t.Errorf("%d conn(s) in driverConns after the failed registration, want 0", n)
+		}
+		if err := l.Write(fd, []byte("x")); !errors.Is(err, celerisengine.ErrUnknownFD) {
+			t.Errorf("Write after the failed registration: %v, want ErrUnknownFD", err)
+		}
+		if err := l.UnregisterConn(fd); !errors.Is(err, celerisengine.ErrUnknownFD) {
+			t.Errorf("UnregisterConn after the failed registration: %v, want ErrUnknownFD", err)
+		}
+		if closed != 0 {
+			t.Errorf("onClose ran %d time(s) for a conn that was never registered", closed)
+		}
+	})
+
+	t.Run("another conn registered", func(t *testing.T) {
+		l := bareDriverLoop885(t)
+		b, bPeer := socketpairNonblocking(t)
+		t.Cleanup(func() { _ = unix.Close(b); _ = unix.Close(bPeer) })
+		if err := l.RegisterConn(b, func([]byte) {}, func(error) {}); err != nil {
+			t.Fatalf("RegisterConn(B): %v", err)
+		}
+		fd := regularFile(t)
+		if err := l.RegisterConn(fd, func([]byte) {}, onClose); !errors.Is(err, unix.EPERM) {
+			t.Fatalf("RegisterConn of a regular file's descriptor: %v, want EPERM", err)
+		}
+		if !l.hasDriverConns.Load() {
+			t.Error("hasDriverConns was cleared by a failed registration while another driver conn is registered")
+		}
+		if l.lookupDriver(b) == nil {
+			t.Error("the failed registration removed the other conn from the map")
+		}
+		if l.lookupDriver(fd) != nil {
+			t.Errorf("the failed registration's conn is still in the map")
+		}
+		if err := l.UnregisterConn(b); err != nil {
+			t.Fatalf("UnregisterConn(B): %v", err)
+		}
+		if l.hasDriverConns.Load() {
+			t.Error("hasDriverConns is still set after the last conn was unregistered")
+		}
+	})
 }
 
 // currentGoroutineID parses "goroutine N [running]:" from the first line
