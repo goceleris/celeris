@@ -10,9 +10,10 @@
 // one with -EINVAL and leaves the operation it targets running (celeris#682). New refuses a
 // kernel before 5.19 whatever the flags probe answers, even accepted (celeris#872: the probe sends one
 // cancel form, which a partial backport can pass while the other forms still fail), and from 5.19
-// refuses a kernel that rejects the flags. The error starts "io_uring not available on this system"
-// and names the requirement.
-// The adaptive engine then runs on epoll.
+// refuses a kernel that rejects the flags. The error names the requirement and starts "io_uring not
+// available on this system", as New's error for a kernel with no io_uring does; no code outside the
+// tests reads that prefix. The adaptive engine falls back to epoll after any New error, and an explicit
+// io_uring engine fails to start.
 //
 // # Environment Knobs
 //
