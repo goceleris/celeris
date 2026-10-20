@@ -155,7 +155,7 @@ func TestWSORecordHasBothEndsAndTheKernelMemory(t *testing.T) {
 	if !ok {
 		t.Fatal("a close wait with an 11 s silence has no WSO-CLOSESLOW record")
 	}
-	for _, want := range []string{"WSO-CLOSESLOW epoll conn=127.0.0.1:", "timeline (1 samples", "close wait", "now: cli skmem:(r", "now: srv skmem:", "now: kernel sockstat{TCP:", "tcp_mem{min=", "tcpext{", "maxGap=11s"} {
+	for _, want := range []string{"WSO-CLOSESLOW epoll conn=127.0.0.1:", "timeline (1 samples", "close wait", "now: cli skmem:(r", "now: srv skmem:", "now: kernel sockstat{TCP:", "tcp_mem{", "tcpext{", "maxGap=11s"} {
 		if !strings.Contains(rec, want) {
 			t.Errorf("record lacks %q:\n%s", want, rec)
 		}
@@ -170,7 +170,7 @@ func TestWSORecordHasBothEndsAndTheKernelMemory(t *testing.T) {
 		t.Fatal("a short close wait has a WSO-CLOSESLOW record")
 	}
 	give := cl.record(c, "WSO-GIVEUP", "epoll", "x")
-	for _, want := range []string{"WSO-GIVEUP epoll", "now: cli skmem:(r", "now: kernel sockstat{TCP:", "tcp_mem{min="} {
+	for _, want := range []string{"WSO-GIVEUP epoll", "now: cli skmem:(r", "now: kernel sockstat{TCP:", "tcp_mem{"} {
 		if !strings.Contains(give, want) {
 			t.Errorf("give-up record lacks %q:\n%s", want, give)
 		}

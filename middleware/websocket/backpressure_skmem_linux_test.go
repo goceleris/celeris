@@ -114,7 +114,10 @@ func wsoSockstatTCP(sockstat string) (line string, memPages int64, ok bool) {
 }
 
 // wsoTCPMemString renders the TCP memory pool against its limits: the mem
-// figure of sockstat and tcp_mem (min, pressure, max, all in pages).
+// figure of sockstat and tcp_mem (min, pressure, max, all in pages). Where
+// tcp_mem cannot be read (Docker Desktop's containers have no
+// /proc/sys/net/ipv4/tcp_mem) the reason is printed in its place and the
+// sockstat line stands alone.
 func wsoTCPMemString(sockstat, tcpMem string) string {
 	line, mem, ok := wsoSockstatTCP(sockstat)
 	if line == "" {
