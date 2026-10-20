@@ -186,7 +186,16 @@ func TestEpollServesOnOneLoop1036(t *testing.T) {
 	for err := range errs {
 		t.Error(err)
 	}
-	if m := eng.Metrics(); m.Workers != 1 || m.RequestCount < conns*reqs {
+	// The loop adds its request batch to the engine's count once per loop
+	// iteration, after the write that answered the request: a client can read
+	// the last response before that request is counted. Wait for the count
+	// (2 s at most) instead of reading it once.
+	m := eng.Metrics()
+	for deadline := time.Now().Add(2 * time.Second); m.RequestCount < conns*reqs && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+		m = eng.Metrics()
+	}
+	if m.Workers != 1 || m.RequestCount < conns*reqs {
 		t.Errorf("metrics: workers=%d requests=%d, want 1 and at least %d", m.Workers, m.RequestCount, conns*reqs)
 	}
 	stop()
