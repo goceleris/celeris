@@ -1562,7 +1562,7 @@ jobs:
             echo "were they renamed or removed, or did one skip? a skip is not coverage."
             exit 1
           fi
-          rest='TestAdaptiveProviderAutoFreeze|TestAdaptiveUnfreezeRespectsDriverFDs|TestAdaptiveStackedFreezes|TestAdaptiveConcurrentDriverChurnVsSwitch|TestAdaptiveSwitchAfterDriverQuiescence|TestAdaptiveSwitchesWithPreBoundListener|TestReverseTransplantAsync|TestRampH2CPriorKnowledge|TestRampAutoMixedH1H2|TestRampAutoMixedAsync|TestPromotionUnderLoadAttributesEveryError|TestRevertChargesItsAcceptTeardownToTheStandby|TestAdaptivePort0ListensOnOnePort895|TestAdaptiveStopReleasesThePortAtOnce896'
+          rest='TestAdaptiveProviderAutoFreeze|TestAdaptiveUnfreezeRespectsDriverFDs|TestAdaptiveStackedFreezes|TestAdaptiveConcurrentDriverChurnVsSwitch|TestAdaptiveSwitchAfterDriverQuiescence|TestAdaptiveSwitchesWithPreBoundListener|TestReverseTransplantAsync|TestRampH2CPriorKnowledge|TestRampAutoMixedH1H2|TestRampAutoMixedAsync|TestPromotionUnderLoadAttributesEveryError|TestRevertChargesItsAcceptTeardownToTheStandby|TestAdaptivePort0ListensOnOnePort895|TestAdaptiveStopReleasesThePortAtOnce896|TestAdaptiveSkipRouting684|TestAdaptiveSkipRoutingGuardSelfTest684'
           owant=$(( $(tr '|' '\n' <<<"$rest" | wc -l) ))
           oran=$(grep -cE "^=== RUN   (${rest})\$" /tmp/adaptive-race.log || true)
           opassed=$(grep -cE "^--- PASS: (${rest}) \(" /tmp/adaptive-race.log || true)
@@ -1571,6 +1571,9 @@ jobs:
           # under docker's default seccomp profile, which refuses io_uring_setup) is in a tally of
           # its own, in the unit job's celeris#905 step, or in the list above. The check below also
           # forbids a SKIP line anywhere in this step, so a new test cannot skip quietly either.
+          # The last two names of the list are not such tests: they are the guard (skip_routing_684_test.go) that fails on
+          # a t.Skip in this package that does not go through skipOrFailUpswitch662, and its fixture self-test; counting
+          # them by name means a rename or a -skip cannot take the guard out of this job unseen.
           echo "celeris#684 other adaptive tests that skip when io_uring is unavailable: want $owant, ran $oran, passed $opassed; SKIP lines in the whole step $allskipped (want 0)"
           if [ "$oran" -ne "$owant" ] || [ "$opassed" -ne "$owant" ] || [ "$allskipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/adaptive-race.log || true
