@@ -471,6 +471,7 @@ func TestIouringSendCompletionDuringASlowAsyncHandlerDoesNotStallItsWorker(t *te
 	big := bytes.Repeat([]byte("0123456789abcdef"), sendStallBig750/16)
 	gate := newStallGate704(t)
 	e, addr := startFDLEngine(t, sendStallHandler750{big: big, gate: gate}, func(c *resource.Config) { c.AsyncHandlers = true })
+	gate.openAtCleanup(t)
 	d := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
 		return rc.Control(func(fd uintptr) { _ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4096) })
 	}}
@@ -516,7 +517,6 @@ func TestIouringSendCompletionDuringASlowAsyncHandlerDoesNotStallItsWorker(t *te
 		err error
 	}
 	bigDone := make(chan bigResult, 1)
-	var bigRead atomic.Int64
 	go func() {
 		r1, err := http.ReadResponse(slow.br, nil)
 		if err != nil {
@@ -529,7 +529,6 @@ func TestIouringSendCompletionDuringASlowAsyncHandlerDoesNotStallItsWorker(t *te
 			var n int
 			n, err = r1.Body.Read(buf)
 			got = append(got, buf[:n]...)
-			bigRead.Add(int64(n))
 		}
 		_ = r1.Body.Close()
 		if err == io.EOF {

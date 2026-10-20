@@ -581,13 +581,18 @@ type stallGate704 struct {
 	once     sync.Once
 }
 
-// newStallGate704 makes a gate that opens at the end of the test at the
-// latest: a handler still gated at engine shutdown would hold it up.
 func newStallGate704(t *testing.T) *stallGate704 {
 	t.Helper()
-	g := &stallGate704{entered: make(chan struct{}, 8), release: make(chan struct{}), returned: make(chan struct{}, 8)}
+	return &stallGate704{entered: make(chan struct{}, 8), release: make(chan struct{}), returned: make(chan struct{}, 8)}
+}
+
+// openAtCleanup opens the gate when the test ends, at the latest: a handler
+// still gated at engine shutdown would hold the engine's stop up for its full
+// 5 s. Cleanups run last in, first out, so call this after startFDLEngine (its
+// stop cleanup is then registered earlier and runs after the gate opened).
+func (g *stallGate704) openAtCleanup(t *testing.T) {
+	t.Helper()
 	t.Cleanup(g.open)
-	return g
 }
 
 func (g *stallGate704) open() { g.once.Do(func() { close(g.release) }) }
@@ -725,6 +730,7 @@ func runStall704(t *testing.T, name string, trigger func(*stallConn704), expectR
 	e, addr := startFDLEngine(t, stallHandler704{gate: gate}, func(c *resource.Config) {
 		c.AsyncHandlers = true
 	})
+	gate.openAtCleanup(t)
 	slow := stallDial704(t, addr)
 	fast, worker := colocate704(t, addr, slow)
 
