@@ -11,3 +11,8 @@ middleware/swagger/assets/swagger-ui-dist/*.css -diff -merge
 # The API golden files (api/README.md) are compared byte for byte, so a
 # checkout with core.autocrlf=true must not give them CRLF line endings.
 api/**/*.txt text eol=lf
+
+# The CI helper scripts run under bash on every runner, windows-latest's included
+# (the portable-fallback job's SKIP tally): a checkout with core.autocrlf=true must
+# not give them CRLF line endings, which bash reads as part of the last word.
+.github/scripts/*.sh text eol=lf

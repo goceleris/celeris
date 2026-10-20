@@ -362,6 +362,10 @@ func (l *Loop) flushCarriedReplay(cs *connState, fd int) {
 		mu.Lock()
 	}
 	if csWritePending(cs) {
+		queued := 0
+		if cs.writeSince != 0 {
+			queued = csPendingBytes(cs) // before this flush (celeris#885)
+		}
 		if fErr := l.flushWrites(cs, true); fErr != nil {
 			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(fErr)
@@ -377,6 +381,7 @@ func (l *Loop) flushCarriedReplay(cs *connState, fd int) {
 		}
 		if !csWritePending(cs) {
 			cs.pendingBytes = 0
+			cs.endWrite()
 			if cs.dirty {
 				l.removeDirty(cs)
 			}
@@ -384,13 +389,12 @@ func (l *Loop) flushCarriedReplay(cs *connState, fd int) {
 		} else {
 			// The kernel send buffer is full: sync pendingBytes and arm
 			// EPOLLOUT, which handleWritable carries on from (a pending
-			// sendfile too). A truly detached conn keeps the dirty list.
+			// sendfile too), for a detached conn as for any other: the dirty
+			// list is a 0 ms epoll_wait for as long as the peer does not read
+			// (celeris#885 item 42).
 			cs.pendingBytes = csPendingBytes(cs)
-			if cs.h1State != nil && cs.h1State.Detached.Load() {
-				l.markDirty(cs)
-			} else {
-				l.armEpollOut(cs)
-			}
+			cs.noteWriteProgress(queued, cs.pendingBytes)
+			l.armEpollOut(cs)
 		}
 	}
 	refused := cs.writeRefused

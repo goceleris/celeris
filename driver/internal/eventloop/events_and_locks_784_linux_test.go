@@ -264,7 +264,8 @@ func TestWorkerReadsAConnWhileItIsBeingFlushed784(t *testing.T) {
 // ErrUnknownFD and the caller closes the fd; a reader that has not seen closed
 // yet would then read the number. The test holds the conn's c.mu, which the
 // teardown needs to set closed, starts the teardown, and checks for 500 ms
-// that the conn stays in the map.
+// that the conn stays in the map, and that UnregisterConn has not returned and
+// onClose has not fired: both come after the flag is set (celeris#890).
 func TestTeardownMarksTheConnClosedBeforeItLeavesTheWorker784(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -304,14 +305,29 @@ func TestTeardownMarksTheConnClosedBeforeItLeavesTheWorker784(t *testing.T) {
 			c.mu.Lock()
 			tc.start(w, a, aPeer, unregErr)
 			left := false
-			for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			deadline := time.Now().Add(500 * time.Millisecond)
+			for ; time.Now().Before(deadline); time.Sleep(time.Millisecond) {
 				if c784Lookup(w, a) != c {
 					left = true
 					break
 				}
 			}
+			// The write half of the promise (celeris#890 item 35): while c.mu
+			// is held the teardown is still waiting for it, so UnregisterConn
+			// has not returned and onClose has not fired. A teardown that
+			// marks the conn closed without c.mu (mutant X10: markClosed
+			// under rmu alone) leaves the map, fires onClose and returns
+			// while the lock is held, with a closed flag this test reads as
+			// set. Let such a teardown finish its steps before looking.
+			for time.Now().Before(deadline) && len(unregErr) == 0 && len(fired) == 0 {
+				time.Sleep(time.Millisecond)
+			}
+			doneWhileHeld := len(unregErr) != 0 || len(fired) != 0
 			markedWhileOut := c.closed // c.mu is held: the flag cannot change under us
 			c.mu.Unlock()
+			if doneWhileHeld {
+				t.Errorf("%s finished (UnregisterConn returned: %v, onClose fired: %v) while the test held c.mu, which marking the conn closed needs", tc.name, len(unregErr) != 0, len(fired) != 0)
+			}
 
 			select {
 			case <-fired:

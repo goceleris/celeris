@@ -116,26 +116,45 @@ func TestUnmatchedDispatchedLikeDefaultRoute852(t *testing.T) {
 		{"sync-default/global-middleware-blocks", false, "middleware", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := New(Config{Engine: Std, AsyncHandlers: tc.async})
-			if tc.blocker == "middleware" {
-				s.Use(func(c *Context) error { block(c); return c.Next() })
-			} else {
-				s.NotFound(func(c *Context) error { block(c); return c.String(404, "nf") })
-			}
-			s.GET("/ping", func(c *Context) error { return c.String(200, "pong") })
-			s.GET("/db", func(c *Context) error { return c.String(200, "db") }).Async()
-			base, cl := startStd852(t, s)
-			rt := s.router
-
-			for range 3 {
-				if st := get852(t, cl, "GET", base+"/nope"); st != 404 {
-					t.Fatalf("GET /nope: %d, want 404", st)
+			newServer := func() (*router, string, *http.Client) {
+				s := New(Config{Engine: Std, AsyncHandlers: tc.async})
+				if tc.blocker == "middleware" {
+					s.Use(func(c *Context) error { block(c); return c.Next() })
+				} else {
+					s.NotFound(func(c *Context) error { block(c); return c.String(404, "nf") })
 				}
+				s.GET("/ping", func(c *Context) error { return c.String(200, "pong") })
+				s.GET("/db", func(c *Context) error { return c.String(200, "db") }).Async()
+				base, cl := startStd852(t, s)
+				return s.router, base, cl
 			}
-			for _, rq := range unmatched {
-				if rt.routeAsync(rq[0], rq[1]) {
-					t.Errorf("after fast runs: routeAsync(%s %s) = true, want false (inline until a run blocks)", rq[0], rq[1])
+			// The fast phase is timed against adaptiveBlockingThreshold (2 ms). On a
+			// slow runner (coverage instrumentation) a fast run can exceed it and
+			// promote the route, so the phase is retried on a fresh server, up to
+			// five attempts. Only promotion on every attempt fails it.
+			var rt *router
+			var base string
+			var cl *http.Client
+			for attempt := 1; ; attempt++ {
+				rt, base, cl = newServer()
+				for range 3 {
+					if st := get852(t, cl, "GET", base+"/nope"); st != 404 {
+						t.Fatalf("GET /nope: %d, want 404", st)
+					}
 				}
+				var promoted []string
+				for _, rq := range unmatched {
+					if rt.routeAsync(rq[0], rq[1]) {
+						promoted = append(promoted, rq[0]+" "+rq[1])
+					}
+				}
+				if len(promoted) == 0 {
+					break
+				}
+				if attempt == 5 {
+					t.Fatalf("after fast runs on each of %d fresh servers, routeAsync was true for %v, want false (inline until a run blocks)", attempt, promoted)
+				}
+				t.Logf("attempt %d: fast runs promoted %v on a slow run; retrying on a fresh server", attempt, promoted)
 			}
 			if st := get852(t, cl, "GET", base+"/block"); st != 404 {
 				t.Fatalf("GET /block: %d, want 404", st)

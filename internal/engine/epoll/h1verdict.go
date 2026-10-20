@@ -16,20 +16,33 @@ package epoll
 // false when the switch or the send failed and the conn was closed, true when
 // the conn goes on as HTTP/2.
 //
-// A send that does not fit the kernel's buffer arms EPOLLOUT rather than the
-// dirty list, which busy-polls: a newly-H2 conn is not detached.
+// A send that does not fit the kernel's buffer arms EPOLLOUT, as every partial
+// send does since celeris#885 item 42 (the dirty list holds the loop at a 0 ms
+// epoll_wait).
+//
+// Loop thread, and no dispatch goroutine exists for the conn: the callers are
+// drainRead's inline ProcessH1 (a conn not yet promoted to its goroutine, or a
+// sync one), its body-recv block (sync only) and a fresh adoption. The
+// goroutine's own upgrade is switchToH2Local. So noteWriteProgress, which
+// consumes goMoved (under detachMu otherwise), needs no lock here
+// (celeris#885).
 func (l *Loop) finishH1Upgrade(cs *connState, fd int, writeFn func([]byte)) bool {
 	if err := l.switchToH2(cs, writeFn); err != nil {
 		l.closeConn(fd)
 		return false
 	}
 	if cs.writePos < len(cs.writeBuf) {
+		queued := 0
+		if cs.writeSince != 0 {
+			queued = csPendingBytes(cs) // before this flush (celeris#885)
+		}
 		if fErr := l.flushWrites(cs, true); fErr != nil {
 			l.closeConn(fd)
 			return false
 		}
 		if cs.writePos >= len(cs.writeBuf) {
 			cs.pendingBytes = 0
+			cs.endWrite()
 			if cs.dirty {
 				l.removeDirty(cs)
 			}
@@ -37,6 +50,7 @@ func (l *Loop) finishH1Upgrade(cs *connState, fd int, writeFn func([]byte)) bool
 			// The 101 and the preface did not all fit: the send buffer is
 			// full.
 			cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+			cs.noteWriteProgress(queued, cs.pendingBytes)
 			l.armEpollOut(cs)
 		}
 	}

@@ -44,7 +44,7 @@ func TestNewRefusesAKernelThatRejectsAsyncCancelFlags(t *testing.T) {
 	_ = r.Close()
 	saved := runAsyncCancelProbe
 	runAsyncCancelProbe = func() (asyncCancelProbe, string) {
-		return asyncCancelRejected, "IORING_ASYNC_CANCEL flags rejected: cqe.res=-22 (EINVAL); the kernel predates Linux 5.19"
+		return asyncCancelRejected, "IORING_ASYNC_CANCEL flags rejected: cqe.res=-22 (EINVAL)"
 	}
 	resetAsyncCancelProbeCache()
 	t.Cleanup(func() {

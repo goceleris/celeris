@@ -58,14 +58,24 @@ func startMixedAsyncServer(t *testing.T, cfg Config) (string, func()) {
 
 func getBody(t *testing.T, url string) (int, string) {
 	t.Helper()
-	// Bounded: a server that stops answering fails the test, not the job.
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(url)
+	code, body, err := getBodyErr(url)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
+	return code, body
+}
+
+// getBodyErr is getBody without t, for calls from a goroutine (t.Fatalf must
+// run on the test goroutine).
+func getBodyErr(url string) (int, string, error) {
+	// Bounded: a server that stops answering fails the test, not the job.
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(url)
+	if err != nil {
+		return 0, "", err
+	}
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, string(b)
+	return resp.StatusCode, string(b), nil
 }
 
 // TestServerMixedAsync_CorrectResponses verifies every route shape
@@ -126,20 +136,30 @@ func TestServerMixedAsync_ConcurrentNoCrosstalk(t *testing.T) {
 	}
 	var wg sync.WaitGroup
 	var mismatches atomic.Int64
+	var errOnce sync.Once
+	var firstErr error
+	// At most 32 requests in flight. 200 dials at once overflowed the darwin
+	// listen backlog, and the kernel reset some of them (celeris#890 item 53).
+	slots := make(chan struct{}, 32)
 	for i := 0; i < 200; i++ {
 		wg.Add(1)
+		slots <- struct{}{}
 		go func(i int) {
 			defer wg.Done()
+			defer func() { <-slots }()
 			tc := routes[i%len(routes)]
-			code, body := getBody(t, base+tc.path)
-			if code != http.StatusOK || body != tc.want {
+			code, body, err := getBodyErr(base + tc.path)
+			if err != nil {
+				errOnce.Do(func() { firstErr = err })
+			}
+			if err != nil || code != http.StatusOK || body != tc.want {
 				mismatches.Add(1)
 			}
 		}(i)
 	}
 	wg.Wait()
 	if n := mismatches.Load(); n != 0 {
-		t.Fatalf("%d concurrent responses mismatched their route", n)
+		t.Fatalf("%d concurrent responses mismatched their route (first transport error: %v)", n, firstErr)
 	}
 }
 

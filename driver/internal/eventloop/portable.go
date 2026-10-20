@@ -387,8 +387,16 @@ func (w *portableWorker) Write(fd int, data []byte) error {
 // underlying net.Conn. The reader goroutine observes the close and fires
 // onClose(err): firing it here instead would run onClose while the reader is
 // still delivering onRecv. No lock is held across the close or the callback.
-// A registration that never got a reader (the placeholder, conn == nil) has
-// nothing to observe the close, so its onClose fires here.
+// The placeholder register puts in the table while it opens the net.Conn
+// (conn == nil) has no onClose and no reader, so for it this only marks it
+// closing: there is nothing to close and nothing to report. shutdown and
+// UnregisterConn both reach it. After shutdown's table swap register sees the
+// worker closed and drops the conn it opened; a failed open drops the
+// placeholder itself. An UnregisterConn that finds the placeholder deletes it
+// and returns nil, but register's second section checks only the worker's
+// closed flag, not that the placeholder is still in the table, so it installs
+// the opened conn and starts its reader anyway: that UnregisterConn is lost
+// (celeris#890).
 func (c *portableConn) shutdownConn(err error) {
 	c.mu.Lock()
 	if c.closing {
@@ -401,8 +409,6 @@ func (c *portableConn) shutdownConn(err error) {
 	c.mu.Unlock()
 	if conn != nil {
 		_ = conn.Close()
-	} else if err != nil {
-		c.fire(err)
 	}
 }
 

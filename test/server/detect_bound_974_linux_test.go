@@ -53,8 +53,8 @@ const (
 // The "-mshot" arm opts into multishot recv with a provided-buffer ring
 // (CELERIS_IOURING_MULTISHOT_RECV=1). That is off by default, so without it no
 // test here runs the provided-buffer paths of the detect branch, which return
-// the ring buffer on every exit; "tier=high ... provided_buffers=true" in the
-// engine's start-up log is the tier's capability, not the ring being in use.
+// the ring buffer on every exit; the engine's start-up log says
+// provided_buffers=false on a default run, and true on this arm.
 type engine974 struct {
 	name  string
 	eng   celeris.EngineType

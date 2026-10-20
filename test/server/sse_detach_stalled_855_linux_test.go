@@ -40,6 +40,11 @@ type stalledShape855 string
 const (
 	// shapeTight855 sends as fast as Send lets it: parked in Send's write.
 	shapeTight855 stalledShape855 = "tight"
+	// shapeBudget855 sends as fast as shapeTight855 does until it has sent
+	// budget855 bytes, then waits for its context. On every engine that is
+	// under the 64 MiB a native engine holds unsent before it closes the conn
+	// (celeris#884 item 45, #885 item 30), so only Shutdown can end it.
+	shapeBudget855 stalledShape855 = "budget"
 	// shapeTick855 sends every 10 ms and watches its context.
 	shapeTick855 stalledShape855 = "tick"
 	// shapeQueue855 is shapeTick855 through the client queue (MaxQueueDepth),
@@ -48,6 +53,9 @@ const (
 	// shapeClose855 is a queue of 4 that closes the client when it is full.
 	shapeClose855 stalledShape855 = "closepolicy"
 )
+
+// budget855 is how much shapeBudget855 sends: 16 MiB, a quarter of the limit.
+const budget855 = 16 << 20
 
 // stalledSSE855 is a server whose /events stream is held by a client that
 // connected and reads nothing.
@@ -84,7 +92,12 @@ func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Durat
 				defer tk.Stop()
 				tick = tk.C
 			}
+			sent := 0
 			for bound <= 0 || time.Since(start) < bound {
+				if shape == shapeBudget855 && sent >= budget855 {
+					<-ctx.Done()
+					return
+				}
 				if tick != nil {
 					select {
 					case <-ctx.Done():
@@ -99,6 +112,7 @@ func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Durat
 					st.sendErr.CompareAndSwap(0, time.Now().UnixNano())
 					return
 				}
+				sent += len(payload)
 			}
 		},
 	}
@@ -222,7 +236,7 @@ func stalledCells855(shapes ...stalledShape855) []struct {
 // OnDisconnect has run, by the time Start has returned (within 2 s of it: the
 // handler is woken as the budget runs out, not waited for).
 func TestStalledSSEEndsWithShutdown855(t *testing.T) {
-	for _, cell := range stalledCells855(shapeTight855, shapeTick855, shapeQueue855) {
+	for _, cell := range stalledCells855(shapeTight855, shapeBudget855, shapeTick855, shapeQueue855) {
 		t.Run(cell.name, func(t *testing.T) {
 			if cell.eng == celeris.Std {
 				t.Parallel() // the native cells start one at a time: at 8 MiB of RLIMIT_MEMLOCK several rings at once fail ENOMEM
@@ -230,6 +244,19 @@ func TestStalledSSEEndsWithShutdown855(t *testing.T) {
 			st := stallBegin855(t, cell.eng, 30*time.Second, time.Second, cell.shape, cell.h2c, 0)
 			time.Sleep(time.Second) // the client reads nothing; the socket buffers fill
 			if st.hret.Load() != 0 {
+				// A native engine refuses a detached conn's write once 64 MiB are
+				// unsent, closes the conn and fails the Send (celeris#884 item 45,
+				// #885 item 30): the tight handler sends 256 KiB events as fast as
+				// Send lets it, and reaches that in well under a second, where it
+				// used to spin on writes that were dropped without a word. That is
+				// the stream ending, not the handler returning without cause.
+				// The close cancels the client's context, so the loop may leave on
+				// that before a Send fails: either marks the stream as ended by the
+				// engine.
+				if cell.eng != celeris.Std && cell.shape == shapeTight855 && (st.sendErr.Load() != 0 || st.disc.Load() != 0) {
+					t.Logf("STALL855 cell=%s: the tight handler's stream ended at the engine's unsent limit before Shutdown", cell.name)
+					return
+				}
 				t.Fatal("the handler returned before Shutdown")
 			}
 			sd := time.Now()

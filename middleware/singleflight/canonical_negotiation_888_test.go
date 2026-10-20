@@ -99,7 +99,6 @@ func aeOpt(v string) []celeristest.Option {
 var aeNotTheSame888 = []struct{ name, leader, waiter string }{
 	{"blank-around-equals", "gzip;q = 0", "gzip;q=0"},
 	{"blank-after-equals", "gzip;q= 0", "gzip;q=0"},
-	{"uppercase-q", "gzip;Q=0", "gzip;q=0"},
 	{"blank-inside-token", "gzip", "g zip"},
 	{"token-then-blank-token", "g zip", "gzip"},
 }
@@ -134,6 +133,17 @@ func TestCanonicalAcceptEncodingKeepsApartWhatTheNegotiatorSeparates888(t *testi
 				}
 			})
 		}
+	}
+}
+
+// TestCanonicalAcceptEncodingFoldsTheCaseOfTheWeightName888: the negotiator
+// reads "Q=0" as q=0 (RFC 9110 12.4.2), as "q=0", so both requests are refused
+// gzip and are one request: they coalesce, and the waiter gets what its own
+// run would have given.
+func TestCanonicalAcceptEncodingFoldsTheCaseOfTheWeightName888(t *testing.T) {
+	r := runPairOpts(t, New(), negotiatingReal, "/doc", aeOpt("gzip;Q=0"), "/doc", aeOpt("gzip;q=0"))
+	if !r.joined || r.calls != 1 || string(r.second.Body) != "identity-body" {
+		t.Errorf("gzip;Q=0 then gzip;q=0: joined=%v runs=%d waiter body %q, want one run shared (identity-body)", r.joined, r.calls, r.second.Body)
 	}
 }
 

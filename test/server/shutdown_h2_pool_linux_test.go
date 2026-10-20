@@ -149,7 +149,11 @@ func TestShutdownSendsH2GoAwayThenFinishesStreams(t *testing.T) {
 // running.
 func TestShutdownH2PoolWaitIsBounded(t *testing.T) {
 	const budget = 500 * time.Millisecond
-	const bound = 3 * time.Second
+	// bound is the most Start may return after the budget (was 3 s). Measured in
+	// a linux/arm64 container: Start returned 500-512 ms after the shutdown began
+	// over 120 runs without -race and 501-579 ms over 120 runs with -race (the
+	// budget is 500 ms), so 1 s is about 12 times the largest excess seen.
+	const bound = time.Second
 	for _, e := range []struct {
 		name string
 		eng  celeris.EngineType
@@ -176,7 +180,13 @@ func TestShutdownH2PoolWaitIsBounded(t *testing.T) {
 				start := time.Now()
 				srv.beginShutdown(mode, budget)
 				srv.waitStart(t, budget+bound)
-				t.Logf("%s/%s: Start returned %v after the shutdown began, with the handler still running", e.name, mode, time.Since(start).Round(time.Millisecond))
+				elapsed := time.Since(start)
+				t.Logf("%s/%s: Start returned %v after the shutdown began, with the handler still running", e.name, mode, elapsed.Round(time.Millisecond))
+				// The handler is held until the test's defer, so the wait can only
+				// end at the budget: Start cannot return before it.
+				if elapsed < budget {
+					t.Errorf("%s/%s: Start returned %v after the shutdown began, before the %v budget, with the handler still running", e.name, mode, elapsed, budget)
+				}
 			})
 		}
 	}
@@ -561,6 +571,8 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 				c, fr := dialH2759(t, srv.addr)
 				writeH2Get759(t, fr, 1, "/big")
 				n, ended := 0, false
+				firstData := make(chan struct{})
+				var sawData bool
 				var events []string
 				var wmu sync.Mutex
 				done := make(chan string, 1)
@@ -571,6 +583,10 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 							events = append(events, "GOAWAY")
 						case *http2.DataFrame:
 							if f.StreamID == 1 {
+								if !sawData {
+									sawData = true
+									close(firstData)
+								}
 								n += len(f.Data())
 								ended = ended || f.StreamEnded()
 							}
@@ -587,7 +603,14 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 						t.Fatal("the handler did not start within 5s")
 					}
 				} else {
-					time.Sleep(300 * time.Millisecond) // the handler has run; the rest waits for the window
+					// The first DATA frame of stream 1 means the handler has run and the
+					// response is waiting for the window; the shutdown begins then (was a
+					// 300 ms sleep, which a slow runner could end before the handler ran).
+					select {
+					case <-firstData:
+					case <-time.After(5 * time.Second):
+						t.Fatal("no DATA frame for stream 1 within 5s")
+					}
 				}
 				start := time.Now()
 				srv.beginShutdown("Shutdown", 5*time.Second)

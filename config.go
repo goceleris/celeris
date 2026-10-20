@@ -71,6 +71,31 @@ func DeriveMemoryLimit(workers int) int64 {
 }
 
 // Config holds the public server configuration.
+//
+// # Response memory
+//
+// A response is held whole in memory until it is sent, except for a stream
+// after [Context.Detach] (see [Context.StreamWriter]), and a single handler
+// can stage a large one: a [Context.Blob] of any size, a [Context.File] of up
+// to 100 MB. The limits below apply on the native engines (epoll, io_uring,
+// adaptive) to what a slow client can leave unsent across requests and
+// writes, not to one response. An HTTP/2 connection queues up to 64 MiB of
+// unsent response data, past which a write is refused. An HTTP/1.1 request is
+// not served while more than 4 MiB of responses on its connection are unsent,
+// and the connection is closed once they have gone out; the 4 MiB is checked
+// when the next request arrives, not per write, so it does not cut a response
+// short. A detached connection (WebSocket, SSE) may queue 64 MiB, and over
+// HTTP/1.1 a StreamWriter that is not detached is cut at 64 MiB.
+//
+// A [Context.File] response is limited to 100 MB. It is sent with sendfile(2),
+// and not read into memory, only on epoll (not io_uring, std or HTTP/2), for
+// an HTTP/1.1 response of at least 16 KiB, on a server with no async handlers
+// (neither [Config.AsyncHandlers] nor a route marked [Route.Async]), and when
+// no middleware buffers or captures the response ([Context.BufferResponse],
+// [Context.CaptureResponse]). Any other File response is read whole into
+// memory, as is one that a response pipelined behind it makes the engine copy
+// into the write buffer, with no cap of its own. The std engine leaves
+// response buffering to net/http.
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080"). A port of 0 asks
 	// for an ephemeral port, as in [net.Listen]: the engine picks it once and
@@ -160,17 +185,31 @@ type Config struct {
 	// connection's first byte or about a second after its SYN, whichever
 	// comes first; std counts from the handshake.
 	ReadHeaderTimeout time.Duration
-	// WriteTimeout is the max duration for writing the response.
+	// WriteTimeout is the max duration for writing the response; what it
+	// bounds differs by engine, as the paragraphs below set out.
 	// Zero uses the default (60s). Set to -1 for no timeout.
 	//
 	// A detached stream (see [Context.Detach]; the SSE middleware detaches)
 	// is not cut at ReadTimeout or WriteTimeout as a whole on any engine, so
 	// an SSE stream stays open for as long as its client keeps reading,
 	// without setting WriteTimeout to -1. The native engines (epoll, io_uring,
-	// adaptive) apply neither timeout to a detached connection. On the std
-	// engine net/http arms WriteTimeout as one deadline for the whole
-	// response and Detach clears it for that request (ReadTimeout never cuts
-	// a stream there: net/http has stopped it by the time the handler runs).
+	// adaptive) apply ReadTimeout and IdleTimeout to a detached connection
+	// not at all, and WriteTimeout as "no progress for WriteTimeout": a
+	// detached connection with bytes queued for its peer, which takes none of
+	// them for WriteTimeout, is closed (the stream's context ends and its
+	// OnDisconnect runs), whatever the middleware's idle deadline or the last
+	// read of the connection. A peer that reads, however slowly, and a
+	// connection with nothing queued are not closed (there is no minimum
+	// rate); -1 sets no such bound. The close comes between about 3/4
+	// and 5/4 of WriteTimeout after the peer last took a byte (its progress
+	// is sampled every quarter of WriteTimeout; a SEND completion restarts the
+	// clock at once), plus the engine's sweep interval (up to about 0.1 s on
+	// epoll, up to 2 s on io_uring; a WriteTimeout shorter than that can
+	// double). An h2c stream is not covered yet (celeris#884).
+	// On the std engine net/http arms WriteTimeout as one deadline for the
+	// whole response and Detach clears it for that request (ReadTimeout never
+	// cuts a stream there: net/http has stopped it by the time the handler
+	// runs).
 	//
 	// On std, WriteTimeout then bounds a detached stream's writes one at a
 	// time: a Write or Flush that has not finished within WriteTimeout fails
@@ -181,7 +220,47 @@ type Config struct {
 	// out the writes of the streams still running fail. A response that is not detached, such as
 	// a large download or a chunked body written with [Context.StreamWriter]
 	// without Detach, stays under WriteTimeout as an absolute deadline for the
-	// whole response: raise it or set -1 for such routes.
+	// whole response: raise it or set -1 for such routes. On the epoll engine
+	// (and adaptive while it runs on epoll) WriteTimeout bounds a response
+	// that is not detached differently: it is "no progress for WriteTimeout",
+	// the time a client may go without taking any of a response the kernel has
+	// not accepted whole, restarted each time it takes some. A download read
+	// steadily for longer than WriteTimeout is not cut there, and a client
+	// that reads nothing is closed WriteTimeout after the response stalled.
+	// Progress is seen when the engine flushes, which follows the socket
+	// becoming writable again, about when half of its send queue has drained,
+	// or the client sending something (a pipelined request, an HTTP/2 PING or
+	// WINDOW_UPDATE), whose read flushes what the room it made allows.
+	// A client that takes less than half a send queue per WriteTimeout and
+	// sends nothing (a deep send queue and a slow reader) is closed while it
+	// is still reading; one that takes
+	// about half a send queue per WriteTimeout is never closed, and holds the
+	// connection and the whole response queued for it in memory for as long as
+	// it keeps doing so (std and io_uring end such a response at WriteTimeout,
+	// as a whole). Nothing else bounds that on epoll: while a response is
+	// queued, ReadTimeout and IdleTimeout run from the last progress too, so
+	// they slide with it, and the earlier of ReadTimeout and WriteTimeout
+	// is the time a client may take no bytes at all (ReadTimeout 5s with
+	// WriteTimeout 60s closes a client that pauses for 6s). io_uring bounds the
+	// response as a whole, measured from the last read or completed flush
+	// of the connection (a client that sends another request restarts it), not
+	// from the request's headers as std does. On io_uring a response whose
+	// unsent remainder is under 64 KiB, to a client that stops reading, on an
+	// otherwise idle worker, can outlast WriteTimeout (measured with async
+	// responses of 96 to 144 KiB; the larger and the sync sizes are closed).
+	// On epoll, a response parked behind a handler that holds the connection's
+	// dispatch lock for longer than WriteTimeout can be closed at WriteTimeout
+	// even though nothing is queued for it (a narrow pipelined-handler case).
+	// A response that ends the connection (Connection: close, a refused write)
+	// has a drain of its own on both native engines: the connection is cut
+	// once the client has taken no byte for WriteTimeout (epoll) or
+	// max(5s, WriteTimeout) (io_uring), and for 5 s on either when WriteTimeout
+	// is -1. A byte taken is a flush or send completion that moved the
+	// response, or bytes the client acknowledged (tcp_info, sampled about every
+	// quarter of that bound), so a client that reads steadily, however slowly,
+	// is not cut, and holds the connection and the unsent response for as long
+	// as it does. Each byte taken restarts that clock: there is no absolute
+	// limit on such a connection.
 	//
 	// With -1, an HTTP/2 response that has to wait for the client's
 	// flow-control window has no deadline either on epoll, io_uring and
