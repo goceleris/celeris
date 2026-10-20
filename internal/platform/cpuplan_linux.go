@@ -60,7 +60,8 @@ type CPUPlan struct {
 	// IRQVectors are the vectors behind IRQCPUs, for the log.
 	IRQVectors []NICVector
 	// IRQUncovered are the serviced CPUs of the allowed set that run no loop
-	// of this plan, ascending. A warning names them.
+	// of this plan, ascending, except the ones the rx-port rule left without
+	// a loop on purpose (RxFree). A warning names them.
 	IRQUncovered []int
 	// IRQIdle and IRQNegligible count the vectors the detection left out
 	// because they took no interrupt, or too few to carry traffic (a floor
