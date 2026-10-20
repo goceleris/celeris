@@ -22,12 +22,24 @@ func TestLogPinOutcome(t *testing.T) {
 
 	// A heterogeneous plan logs one Info line with the reason.
 	h := msr1(t, rng(0, 11))
-	p := planWorkerCPUs(12, h.src())
+	p := planWorkerCPUs(12, false, h.src())
 	LogPinOutcome(log, "epoll", p, nil)
 	out := buf.String()
 	if strings.Count(out, "\n") != 1 || !strings.Contains(out, "level=INFO") ||
-		!strings.Contains(out, "little CPUs 2-5") || !strings.Contains(out, "8 of 12 loops pinned") {
-		t.Fatalf("heterogeneous plan: want one INFO line naming the little CPUs, got:\n%s", out)
+		!strings.Contains(out, "little CPUs 2-5") || !strings.Contains(out, "8 loops, one per other allowed CPU 0-1,6-11") ||
+		!strings.Contains(out, "none unpinned") || !strings.Contains(out, "not the 12") ||
+		!strings.Contains(out, "workers=8") || !strings.Contains(out, "requested=12") || !strings.Contains(out, "pinned=8") ||
+		strings.Contains(out, "left unpinned") {
+		t.Fatalf("heterogeneous plan: want one INFO line naming the little CPUs and the 8 loops of the 12 asked for, got:\n%s", out)
+	}
+
+	// A user-set count above the big CPUs: the line says the loops share CPUs.
+	buf.Reset()
+	LogPinOutcome(log, "epoll", planWorkerCPUs(12, true, h.src()), nil)
+	out = buf.String()
+	if strings.Count(out, "\n") != 1 || !strings.Contains(out, "12 loops (Config.Workers) pinned round-robin over the 8 other allowed CPUs") ||
+		!strings.Contains(out, "workers=12") || !strings.Contains(out, "pinned=12") {
+		t.Fatalf("wrapped plan: want one INFO line with 12 loops pinned, got:\n%s", out)
 	}
 
 	// Failures log one Warn line, however many loops failed.

@@ -188,7 +188,7 @@ func TestAllowedCPUsOnAKernelWithMoreThan1024CPUs(t *testing.T) {
 		t.Fatalf("schedAllowedCPUs on a 2048-CPU kernel: %v", err)
 	}
 	eq(t, "allowed", got, []int{3, 1500, 2047})
-	if p := PlanWorkerCPUs(3); !slices.Equal(p.Allowed, []int{3, 1500, 2047}) {
+	if p := PlanWorkerCPUs(3, false); !slices.Equal(p.Allowed, []int{3, 1500, 2047}) {
 		t.Errorf("PlanWorkerCPUs(3).Allowed = %v, want [3 1500 2047] (a fallback to 0..NumCPU-1 means the read failed)", p.Allowed)
 	}
 }
