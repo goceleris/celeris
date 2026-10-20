@@ -197,7 +197,10 @@ func TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine(t *testing.T) {
 	}
 	finishH2CUpgrade722(t, c, bufio.NewReader(c))
 	if m := e.Metrics(); m.AsyncPromotedConns != m0.AsyncPromotedConns+1 {
-		t.Fatalf("AsyncPromotedConns moved by %d, want 1: the second write was not a feed of the promoted connection",
+		// The count says the connection was promoted exactly once, nothing
+		// more: this test cannot observe the feed itself (celeris#884 item 84 records
+		// that).
+		t.Fatalf("AsyncPromotedConns moved by %d, want 1: the connection was promoted more or less than once",
 			m.AsyncPromotedConns-m0.AsyncPromotedConns)
 	}
 }
