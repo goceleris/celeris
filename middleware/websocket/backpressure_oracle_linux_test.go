@@ -1534,6 +1534,11 @@ type wsoWaitStats struct {
 	stallDiscounted        int           // stretches over wsoRecvStall excused by scheduler latency (celeris#871)
 	stallDiscountedMax     time.Duration // the longest of them, raw
 	schedLatMax            time.Duration // the longest runnable wait the Go scheduler recorded in the run
+	// schedCoveredFrac is the share of the rig's life, from its start to the
+	// call, during which a recorded scheduler wait was in progress (the probe's
+	// coveredIn). Informational: it says how loaded the process was, so what the
+	// same figure inside a stretch (the WSO-STALL record's "cover") is worth.
+	schedCoveredFrac float64
 }
 
 func (g *wsoRig) waitStats() wsoWaitStats {
@@ -1545,6 +1550,9 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 	st.stallDiscounted, st.stallDiscountedMax = g.stallDiscounted, g.stallDiscountedMax
 	if p, ok := g.sched.(*wsoSchedLat); ok {
 		st.schedLatMax = p.longest()
+		if end := g.since(); end > 0 {
+			st.schedCoveredFrac = float64(p.coveredIn(0, end)) / float64(end)
+		}
 	}
 	for _, cl := range g.clis {
 		cl.mu.Lock()
@@ -1577,8 +1585,8 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 
 func (st wsoWaitStats) String() string {
 	r := func(d time.Duration) string { return d.Round(time.Millisecond).String() }
-	return fmt.Sprintf("waits: conns=%d fcMax=%s cwMax=%s maxNoProg=%s fcSlices=%d drainedWhileWaiting=%d closeP50=%s closeP99=%s closeMax=%s closeOver%s=%d closeSilentOver%s=%d maxCloseGap=%s recvStallMax=%s watchResets=%d watchMaxLag=%s watchGapRestarts=%d stallDiscounted=%d stallDiscountedMax=%s schedLatMax=%s",
+	return fmt.Sprintf("waits: conns=%d fcMax=%s cwMax=%s maxNoProg=%s fcSlices=%d drainedWhileWaiting=%d closeP50=%s closeP99=%s closeMax=%s closeOver%s=%d closeSilentOver%s=%d maxCloseGap=%s recvStallMax=%s watchResets=%d watchMaxLag=%s watchGapRestarts=%d stallDiscounted=%d stallDiscountedMax=%s schedLatMax=%s schedCoveredFrac=%.2f",
 		st.conns, r(st.fcMax), r(st.cwMax), r(st.maxNoProg), st.fcSlices, st.drainedBytes, r(st.closeP50), r(st.closeP99), r(st.closeMax),
 		wsoCloseSlow, st.closeSlow, wsoCloseSlow, st.closeSilentSlow, r(st.maxCloseGap), r(st.recvStallMax), st.watchResets, r(st.watchMaxLag), st.watchGapRestarts,
-		st.stallDiscounted, r(st.stallDiscountedMax), r(st.schedLatMax))
+		st.stallDiscounted, r(st.stallDiscountedMax), r(st.schedLatMax), st.schedCoveredFrac)
 }
