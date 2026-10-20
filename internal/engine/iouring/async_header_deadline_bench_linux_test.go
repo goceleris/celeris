@@ -56,7 +56,7 @@ func startDetachMuContender(mu *sync.Mutex) (stop func()) {
 		close(started)
 		for !halt.Load() {
 			mu.Lock()
-			mu.Unlock() //nolint:staticcheck // the empty critical section is the contention
+			mu.Unlock() // the empty critical section is the contention (SA2001 is excluded for tests)
 		}
 	}()
 	<-started
