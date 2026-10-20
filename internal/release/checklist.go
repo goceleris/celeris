@@ -105,7 +105,11 @@ func Checklist(v string) string {
 	}
 	b.WriteString("- [ ] `README.md` — replace the placeholder under that heading with the " +
 		"real release prose. `CheckRelease` fails while the placeholder remains, so this one " +
-		"cannot be forgotten silently.\n\n")
+		"cannot be forgotten silently.\n")
+	b.WriteString("- [ ] optional, publishes nothing: rehearse the whole pin move with " +
+		"`.github/scripts/pinmove-rehearsal.sh` (CI runs it as the Release Rehearsal workflow on a " +
+		"pull request that touches the release files). It shows what the order has to be: the root " +
+		"tag must exist before any sub-module at the prep commit, or at its tag, can be resolved.\n\n")
 
 	b.WriteString("## The other three repositories — enforced by nothing\n\n")
 	b.WriteString("- [ ] **loadgen** `version.go`, `const fallbackVersion` — only if loadgen " +
@@ -128,7 +132,8 @@ func Checklist(v string) string {
 		fmt.Fprintf(&b, "- `%s/v%s` is tagged\n", sub, v)
 	}
 	b.WriteString("- the Go module proxy is asked for the root module and every sub-module, " +
-		"then re-queried to confirm each is really available\n\n")
+		"then re-queried to confirm each is really available (the re-query only reports: it " +
+		"does not fail the job, so read its log)\n\n")
 
 	b.WriteString("Neither runs if the stamps disagree. A sub-module tag pinning the wrong " +
 		"celeris version cannot be corrected afterwards: every published tag is recorded in " +

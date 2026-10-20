@@ -1,0 +1,89 @@
+name: Release Rehearsal
+
+# Dry run of the release's sub-module pin move (celeris#619). It executes, against a
+# bare repository in a temp directory, the order a release uses: PrepRelease, the prep
+# commit, the root tag, release.yml's own "Create sub-module tags" step, then an
+# external consumer module per sub-module. Nothing is published and nothing is
+# pushed: the job has a read-only token and no step talks to this repository's
+# remote. See .github/scripts/pinmove-rehearsal.sh for every step and assertion.
+#
+# It runs on a pull request that touches anything the pin move depends on, and by
+# hand from the Actions tab. It is not a required check.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/scripts/pinmove-rehearsal.sh
+      - .github/workflows/release-rehearsal.yml
+      - .github/workflows/release.yml
+      - magefiles/mage_release.go
+      - internal/release/**
+      - go.mod
+      - go.sum
+      - middleware/*/go.mod
+      - middleware/*/go.sum
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to rehearse (vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N); nothing is published
+        default: v1.6.0-rc.99
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  rehearse:
+    name: Rehearse the pin move
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The script clones this checkout into its own bare "remote" and needs
+          # the release tags in it.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Rehearse the pin move
+        env:
+          VERSION: ${{ inputs.version || 'v1.6.0-rc.99' }}
+        run: .github/scripts/pinmove-rehearsal.sh "$VERSION"
+
+  # The assertion must be able to go red: the same script with PrepRelease skipped
+  # (the defect of celeris#619, sub-module tags on a tree whose pins still name
+  # the last release) has to fail, and fail on the celeris version a consumer
+  # resolves, not on some other breakage.
+  control:
+    name: Control (pins not moved must fail)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: The script goes red without the pin move
+        env:
+          VERSION: ${{ inputs.version || 'v1.6.0-rc.99' }}
+        run: |
+          rc=0
+          PINMOVE_SKIP_PREP=1 .github/scripts/pinmove-rehearsal.sh "$VERSION" >/tmp/control.log 2>&1 || rc=$?
+          tail -n 40 /tmp/control.log
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::the rehearsal passed with the pin move skipped, so it would not catch the defect"
+            exit 1
+          fi
+          if ! grep -q "FAIL  .* does not pull celeris" /tmp/control.log; then
+            echo "::error::the rehearsal failed with the pin move skipped, but not on the celeris version a consumer resolves"
+            exit 1
+          fi
+          echo "control is red for the right reason (exit $rc)"
