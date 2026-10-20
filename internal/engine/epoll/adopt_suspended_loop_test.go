@@ -107,7 +107,7 @@ func startSuspendedEpoll658(t *testing.T, onDisconnect func(string)) *suspendedE
 		OnDisconnect: onDisconnect,
 	}, okHandler658{})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &suspendedEpoll658{e: e, cancel: cancel, errCh: make(chan error, 1)}
