@@ -37,10 +37,11 @@ func annotatePlanNIC(p CPUPlan, addr string, src nicSource) CPUPlan {
 
 // WithNICIRQs returns p with the NIC interrupt report of irq: the serviced
 // CPUs, and, in IRQUncovered, those of them in the allowed set that run no
-// loop of p and that the rx-port rule did not leave without one on purpose. A
-// serviced CPU outside the allowed set is in IRQCPUs only: this process cannot
-// run a loop there. p is returned unchanged unless it is heterogeneous, and
-// its loops are never changed.
+// loop of p, that the rx-port rule did not leave without one on purpose, and
+// that are either a little CPU or a big one when no reported vector has a loop
+// beside it. A serviced CPU outside the allowed set is in IRQCPUs only: this
+// process cannot run a loop there. p is returned unchanged unless it is
+// heterogeneous, and its loops are never changed.
 //
 // The rx-port rule ([RxFree], celeris#1036 item 1) leaves the big CPUs that
 // service the busy vectors of the receiving port without a loop, and that plan
@@ -81,8 +82,18 @@ func (p CPUPlan) WithNICIRQs(irq NICIRQs) CPUPlan {
 		}
 	}
 	slices.Sort(q.IRQCPUs)
+	// The premise of the rx-port rule (steps 4 and 7): a loop stays beside a
+	// busy vector. When one does, a big CPU without a loop is the state the
+	// rule measured fine (CPUs 6 and 8 of msr1 service enp49s0's vectors and
+	// run none while CPU 1 keeps a loop beside IRQ 167), so only a little CPU,
+	// where no loop runs by design, is a reason to warn; when no vector has a
+	// loop beside it, any CPU without one is.
+	beside := slices.ContainsFunc(q.IRQVectors, func(v NICVector) bool { return slices.Contains(q.CPUs, v.CPU) })
 	for _, c := range q.IRQCPUs {
 		if !slices.Contains(q.Allowed, c) || slices.Contains(q.CPUs, c) {
+			continue
+		}
+		if beside && !slices.Contains(q.Little, c) {
 			continue
 		}
 		if slices.ContainsFunc(q.IRQVectors, func(v NICVector) bool { return v.CPU == c && !p.freedOnPurpose(v) }) {
