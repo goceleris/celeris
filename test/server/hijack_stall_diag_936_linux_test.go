@@ -158,7 +158,17 @@ func c936SocketReport(conn net.Conn) string {
 		fd, epolls := c936FindSocketFD(inode)
 		switch {
 		case fd < 0:
-			b.WriteString("C936 verdict-hint: no descriptor of this process holds the server socket (accepted, then closed or handed away)\n")
+			// The kernel still lists the socket with an owner, so a file
+			// reference exists. None is in this process's descriptor table:
+			// either the table was read while the descriptor was being
+			// closed, or something else holds the file (a syscall in flight
+			// on it, another process). Say which of those can be told apart.
+			holders, scanned := c936SocketHolders(inode)
+			if state == "ESTABLISHED" {
+				fmt.Fprintf(&b, "C936 verdict-hint: no descriptor of this process holds the server socket, yet the kernel still has it ESTABLISHED (%d descriptors scanned; holders in all processes: %s)\n", scanned, holders)
+			} else {
+				fmt.Fprintf(&b, "C936 verdict-hint: no descriptor of this process holds the server socket (state=%s: accepted, then closed or handed away; %d descriptors scanned; holders in all processes: %s)\n", state, scanned, holders)
+			}
 		case len(epolls) == 0:
 			fmt.Fprintf(&b, "C936 server fd=%d is in NO epoll set (rx_queue=%d): the engine dropped its registration\n", fd, rxq)
 		default:
@@ -220,6 +230,37 @@ func c936FindSocketFD(inode string) (int, []string) {
 		}
 	}
 	return fd, regs
+}
+
+// c936SocketHolders lists, over every process visible in /proc, the
+// descriptors that name the socket with the given inode ("pid/fd" each, or
+// "none"), and how many descriptors it looked at.
+func c936SocketHolders(inode string) (string, int) {
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return "unreadable: " + err.Error(), 0
+	}
+	var held []string
+	scanned := 0
+	for _, p := range procs {
+		if _, err := strconv.Atoi(p.Name()); err != nil {
+			continue
+		}
+		fds, err := os.ReadDir("/proc/" + p.Name() + "/fd")
+		if err != nil {
+			continue
+		}
+		for _, f := range fds {
+			scanned++
+			if link, err := os.Readlink("/proc/" + p.Name() + "/fd/" + f.Name()); err == nil && link == "socket:["+inode+"]" {
+				held = append(held, p.Name()+"/"+f.Name())
+			}
+		}
+	}
+	if len(held) == 0 {
+		return "none", scanned
+	}
+	return strings.Join(held, " "), scanned
 }
 
 func c936TCPState(hex string) string {
