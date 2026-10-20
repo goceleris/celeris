@@ -188,13 +188,10 @@ func newRespondingEngine(t *testing.T) (*Engine, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- eng.Listen(ctx) }()
-	for dl := time.Now().Add(5 * time.Second); eng.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if eng.Addr() == nil {
+	if err := awaitBound(eng, done, 5*time.Second); err != nil {
 		cancel()
 		<-done
-		t.Skip("engine never bound")
+		t.Fatalf("engine never bound: %v", err)
 	}
 	return eng, func() { cancel(); <-done }
 }

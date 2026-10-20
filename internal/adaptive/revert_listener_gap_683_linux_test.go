@@ -83,6 +83,7 @@ func installLateEpoll683(t *testing.T, e *Engine, delay time.Duration) *lateEpol
 type dialer683 struct {
 	t0      time.Time
 	mu      sync.Mutex
+	started []time.Duration // the start of every dial, from t0
 	refused []time.Duration
 	other   int
 	dials   atomic.Int64
@@ -106,6 +107,9 @@ func startDialer683(addr string) *dialer683 {
 					time.Sleep(w)
 				}
 				at := time.Since(d.t0)
+				d.mu.Lock()
+				d.started = append(d.started, at)
+				d.mu.Unlock()
 				c, err := net.DialTimeout("tcp", addr, time.Second)
 				d.dials.Add(1)
 				if err != nil {
@@ -123,6 +127,86 @@ func startDialer683(addr string) *dialer683 {
 		}()
 	}
 	return d
+}
+
+// holdListenWaitBound683 lengthens the bound of the switch's wait for the
+// incoming engine's listener for the rest of the test. The promotion test
+// asserts that the wait SAW the late listener, not how long a loaded host took
+// to produce it: on a loaded container two measured promotions at --cpus 4
+// (338 ms on main, 411 ms on an intermediate tree) spent more than the 250 ms
+// bound in the wait, with no dial refused (celeris#683). Why is NOT measured: the wait lists again before
+// it can return a timeout, so a descheduled waiter explains the overshoot past
+// 250 ms but not why io_uring had no new listener at the last list; cpu.stat
+// was not captured for those two runs. (An epoll setup wait that had nothing to
+// find overshot to 411 ms in the same way at --cpus 2, so the overshoot itself
+// is a scheduling tail.) The bound is chosen below the 1 s ring
+// wait that a worker with no listener sits in (Worker.baseTimeout): a resume
+// that is lost and found only at that timeout still ends the wait at the bound
+// and fails the test, while the observed tail is absorbed. A listener that
+// never comes also fails. The trade-off: a late listener that arrives between
+// 250 ms and the new bound now passes, and that is the range in which
+// production pauses the outgoing engine first; the product bound is not what
+// this test measures. Taken after the setup: the setup's own revert can wait
+// for a listener that cannot come (see the promotion test) and must not take
+// the longer bound.
+//
+// It writes the package-level listenWaitBound without synchronisation. That is
+// safe only because no other switch is in flight: the setup's switches are
+// synchronous and s0Bind froze the controller's (FreezeSwitching), and no test
+// in this package runs in parallel. Do not use it from a parallel test. The
+// engine is stopped before t.Cleanup restores the value.
+func holdListenWaitBound683(t *testing.T, bound time.Duration) {
+	t.Helper()
+	old := listenWaitBound
+	listenWaitBound = bound
+	t.Cleanup(func() { listenWaitBound = old })
+}
+
+// windowDials683 returns how many dials started, and how many were refused,
+// in the switch window: from 20 ms before the switch to 400 ms after it. The
+// dial floor (awaitDials683) can be met by dials after the switch, so a run's
+// log carries this count: a starved run that probed the switch with a handful
+// of dials shows it.
+func windowDials683(d *dialer683, swStart, swEnd time.Duration) (started, refused int) {
+	lo, hi := swStart-20*time.Millisecond, swEnd+400*time.Millisecond
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, at := range d.started {
+		if at >= lo && at <= hi {
+			started++
+		}
+	}
+	for _, at := range d.refused {
+		if at >= lo && at <= hi {
+			refused++
+		}
+	}
+	return started, refused
+}
+
+// listenWaitHold683 is the promotion test's bound for the measured switch's
+// wait: below the 1 s ring wait of an io_uring worker with no listener, above
+// the 411 ms tail seen under load.
+const listenWaitHold683 = 800 * time.Millisecond
+
+// minDials683 is the least number of dials a run must have made for a clean
+// result to mean something.
+const minDials683 = 500
+
+// awaitDials683 gives a dialer that a loaded host has starved the time to reach
+// n dials, up to limit. The dialer paces itself at ~5k/s, so on an idle host the
+// run's fixed windows hold thousands of dials and this returns at once; on a
+// 2-CPU host shared with busy loops the same windows held as few as 122, which
+// failed the premise without any refused dial (celeris#683). The trade-off: the
+// gap a regression would open is the switch itself (about 20 ms with the
+// injected delay), and a dial made after the windows only shows that the dialer
+// is alive, so in exactly the starved runs fewer probes land inside the switch.
+// The floor keeps a starved dialer from failing the premise; it does not make a
+// starved run as sensitive as an idle one.
+func awaitDials683(d *dialer683, n int64, limit time.Duration) {
+	for end := time.Now().Add(limit); d.dials.Load() < n && time.Now().Before(end); {
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (d *dialer683) finish() (refused []time.Duration, other int) {
@@ -152,6 +236,15 @@ func TestRevertKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing.T)
 		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
 	}
 	late := installLateEpoll683(t, e, 20*time.Millisecond)
+	// No longer bound here. The revert's wait did not run into the 250 ms
+	// bound in 1998 runs under load with the default bound (celeris#683), epoll's
+	// re-listen was seen in 56 ms at most, and the default bound is below the
+	// 500 ms wait of an epoll loop with no listener (epoll/loop.go: timeoutMs =
+	// 500), so a wakeup that is lost until that timeout still fails the test.
+	// The switch wall reached 262 ms in those runs; that is the wall, which also
+	// covers the outgoing engine's pause, not the wait. The promotion test
+	// holds a longer bound; see there.
+	setupTimeouts := e.listenWaitTimeouts() // the setup's switch is not the measurement; see the promotion twin
 
 	d := startDialer683(addr)
 	time.Sleep(200 * time.Millisecond)
@@ -161,19 +254,16 @@ func TestRevertKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing.T)
 	swWall := time.Since(t0)
 	swEnd := time.Since(d.t0)
 	time.Sleep(400 * time.Millisecond)
+	awaitDials683(d, minDials683, 10*time.Second)
 	refused, other := d.finish()
 
 	both, _ := listenInodes(port)
-	var inWindow int
-	for _, at := range refused {
-		if at >= swStart-20*time.Millisecond && at <= swEnd+400*time.Millisecond {
-			inWindow++
-		}
-	}
-	t.Logf("celeris683 LATE-RESUME revert: switch wall %v, %d dials, refused %d (in the switch window %d), other errors %d, "+
-		"listeners before %d after %d (%d new), wait timeouts %d, resume calls %d",
-		swWall.Round(time.Microsecond), d.dials.Load(), len(refused), inWindow, other, len(onlyIOUring), len(both), freshCount683(both, onlyIOUring),
-		e.listenWaitTimeouts(), late.calls.Load())
+	dialsIn, inWindow := windowDials683(d, swStart, swEnd)
+	timeouts := e.listenWaitTimeouts() - setupTimeouts
+	t.Logf("celeris683 LATE-RESUME revert: switch wall %v, %d dials (%d in the switch window), refused %d (%d in the window), other errors %d, "+
+		"listeners before %d after %d (%d new), wait timeouts %d (setup %d), resume calls %d",
+		swWall.Round(time.Microsecond), d.dials.Load(), dialsIn, len(refused), inWindow, other, len(onlyIOUring), len(both), freshCount683(both, onlyIOUring),
+		timeouts, setupTimeouts, late.calls.Load())
 
 	// Premises: the resume was late and was the switch's, epoll had no
 	// listener before it and has some after, and the dialer ran.
@@ -185,15 +275,15 @@ func TestRevertKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing.T)
 			"(before %d, after %d; the outgoing io_uring listeners close at the pause, so the count alone says nothing)",
 			len(onlyIOUring), len(both))
 	}
-	if d.dials.Load() < 500 {
-		t.Fatalf("celeris683 PREMISE: only %d dials in the run", d.dials.Load())
+	if d.dials.Load() < minDials683 {
+		t.Fatalf("celeris683 PREMISE: only %d dials in the run (want %d)", d.dials.Load(), minDials683)
 	}
 	if len(refused) != 0 {
 		t.Errorf("celeris683 GAP: %d dials were refused (%d inside the switch window): the outgoing io_uring listeners "+
 			"closed before epoll had one", len(refused), inWindow)
 	}
-	if n := e.listenWaitTimeouts(); n != 0 {
-		t.Errorf("celeris683: the wait for the incoming listener gave up %d time(s)", n)
+	if timeouts != 0 {
+		t.Errorf("celeris683: the wait for the incoming listener gave up %d time(s) in the measured revert", timeouts)
 	}
 }
 
@@ -242,6 +332,15 @@ func TestPromotionKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing
 	if err != nil {
 		skipOrFailUpswitch662(t, "cannot list listening sockets here: %v", err)
 	}
+	// The setup's own switches are not the measurement. The revert above waits
+	// for epoll's listener, and under load epoll can fail to produce a NEW one
+	// in the bound: a loop that had not yet seen the pause when the resume
+	// withdrew it never closed its listener, so there is nothing new to see
+	// (celeris#683). That wait times out and counts, while no dial is refused.
+	// What the test asserts is the measured promotion's wait, so the count is
+	// taken here and compared as a delta.
+	setupTimeouts := e.listenWaitTimeouts()
+	holdListenWaitBound683(t, listenWaitHold683)
 	e.mu.Lock()
 	io, ok := e.secondary.(*iouring.Engine)
 	if !ok {
@@ -265,34 +364,31 @@ func TestPromotionKeepsAListenerUpWhenTheIncomingEngineListensLate683(t *testing
 	swWall := time.Since(t0)
 	swEnd := time.Since(d.t0)
 	time.Sleep(400 * time.Millisecond)
+	awaitDials683(d, minDials683, 10*time.Second)
 	refused, other := d.finish()
 
 	both, _ := listenInodes(port)
-	inWindow := 0
-	for _, at := range refused {
-		if at >= swStart-20*time.Millisecond && at <= swEnd+400*time.Millisecond {
-			inWindow++
-		}
-	}
-	t.Logf("celeris683 LATE-RESUME promote: switch wall %v, %d dials, refused %d (in the switch window %d), other errors %d, "+
-		"listeners before %d after %d (%d new), wait timeouts %d, resume calls %d",
-		swWall.Round(time.Microsecond), d.dials.Load(), len(refused), inWindow, other, len(onlyEpoll), len(both),
-		freshCount683(both, onlyEpoll), e.listenWaitTimeouts(), late.calls.Load())
+	dialsIn, inWindow := windowDials683(d, swStart, swEnd)
+	timeouts := e.listenWaitTimeouts() - setupTimeouts
+	t.Logf("celeris683 LATE-RESUME promote: switch wall %v, %d dials (%d in the switch window), refused %d (%d in the window), other errors %d, "+
+		"listeners before %d after %d (%d new), wait timeouts %d (setup %d), resume calls %d",
+		swWall.Round(time.Microsecond), d.dials.Load(), dialsIn, len(refused), inWindow, other, len(onlyEpoll), len(both),
+		freshCount683(both, onlyEpoll), timeouts, setupTimeouts, late.calls.Load())
 	if late.calls.Load() != 1 {
 		t.Fatalf("celeris683 PREMISE: the late ResumeAccept ran %d times, want 1", late.calls.Load())
 	}
 	if freshCount683(both, onlyEpoll) == 0 {
 		t.Fatalf("celeris683 PREMISE: io_uring never listened again (before %d, after %d)", len(onlyEpoll), len(both))
 	}
-	if d.dials.Load() < 500 {
-		t.Fatalf("celeris683 PREMISE: only %d dials in the run", d.dials.Load())
+	if d.dials.Load() < minDials683 {
+		t.Fatalf("celeris683 PREMISE: only %d dials in the run (want %d)", d.dials.Load(), minDials683)
 	}
 	if len(refused) != 0 {
 		t.Errorf("celeris683 GAP: %d dials were refused (%d inside the switch window): epoll's listeners closed before "+
 			"io_uring had one", len(refused), inWindow)
 	}
-	if n := e.listenWaitTimeouts(); n != 0 {
-		t.Errorf("celeris683: the wait for the incoming listener gave up %d time(s)", n)
+	if timeouts != 0 {
+		t.Errorf("celeris683: the wait for the incoming listener gave up %d time(s) in the measured promotion", timeouts)
 	}
 }
 
