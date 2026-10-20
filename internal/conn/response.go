@@ -380,8 +380,8 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	// Content-Length is still included above to indicate the size that
 	// would be returned for a GET, but no bytes are sent.
 	if len(body) > 0 && !a.isHEAD {
-		// Zero-copy scatter-gather for large bodies: writev/IORING_OP_WRITEV
-		// ships headers + body in one syscall without copying body bytes.
+		// Scatter-gather for large bodies (epoll's writev(2)): ships headers +
+		// body in one syscall without copying body bytes.
 		if len(body) >= 8192 && a.writeBody != nil {
 			a.write(buf)
 			a.respBuf = buf

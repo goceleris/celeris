@@ -119,7 +119,8 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 	// has; the io_uring ENGINE needs more, Linux 5.19 (the release that added
 	// the IORING_ASYNC_CANCEL flags its cancels use), and iouring.New refuses
 	// every kernel before it and, from it, one that rejects the flags
-	// (celeris#682, #872), so a 5.10-5.18 Base-tier kernel runs epoll.
+	// (celeris#682, #872), so on a 5.10-5.18 Base-tier kernel the adaptive
+	// engine runs epoll (an explicit io_uring engine fails to start there).
 	if kv.AtLeast(5, 10) && sp.ProbeIOUring != nil {
 		features, ops, err := sp.ProbeIOUring()
 		if err == nil {

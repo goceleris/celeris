@@ -180,7 +180,7 @@ func TestEngineMetricsCarriesTheTransplantLedger(t *testing.T) {
 		Resources: resource.Resources{Workers: 2},
 	}, stream.HandlerFunc(func(context.Context, *stream.Stream) error { return nil }))
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)

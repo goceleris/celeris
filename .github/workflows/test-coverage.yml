@@ -59,11 +59,12 @@ jobs:
     name: Coverage (root + middleware sub-modules)
     runs-on: ubuntu-latest
     # 40: the root step may run 540 s twice (the other packages, then ./test/server,
-    # each with its own -timeout=540s), the iouring step up to 480 s and the four
-    # middleware steps up to 120 s each, which is 34 min at their own limits before
+    # each with its own -timeout=540s), the iouring step up to 600 s and the four
+    # middleware steps up to 120 s each, which is 36 min at their own limits before
     # checkout and setup-go (it was 30 before ./test/server got an invocation of
     # its own, and 40 while the root step's limit was 1200 s). The job takes about
-    # 13 min: the root package's rest 44 s, ./test/server 146 s, iouring 357 s. Refs #890.
+    # 20 min (19.5 to 19.8 min in runs 39408130885, 39404206705 and 39331135786),
+    # the iouring step 411 to 437 s of it (see its comment below). Refs #890.
     timeout-minutes: 40
     env:
       # ci.yml's unit selection (see "Same packages as ci.yml" below).
@@ -175,18 +176,23 @@ jobs:
       # the packages are disjoint, so the blocks are appended after the mode
       # line.
       #
-      # -timeout=480s, the unit job's own for this package. Under -race and
+      # -timeout=600s, the unit job's own for this package. Under -race and
       # -covermode=atomic the package took 291.9 s on main (61ea3cb) and 296.7 s
       # on celeris#990's branch, of a 300 s timeout; the celeris#895/#896 tests
       # add about 12 s, and the run ended in a timeout panic. 309.9 s on main
       # (3cfee4b) and 341.7 s with celeris#811's tests (PR #994 at 5adaf15: the
       # WriteTimeout bound test alone is about 16 s), of 420 s: under 25%
-      # margin, so 480 s (40%).
+      # margin, so 480 s (40%). Since then it has grown to 410.8 to 426.2 s in seven
+      # Coverage runs on main from 13fa176 (2026-10-18) to 6ab5c28 (2026-10-20)
+      # (run 39331135786: 425.6 s), and 437.3 s in an eighth (run 39334596754,
+      # which failed on a test, not on the timeout): 480 s was 10% over that, 600 s
+      # is 37% over (celeris#890 item 66; the unit job's step has the same limit
+      # and its figures).
       - name: internal/engine/iouring (own step, ci.yml unit set)
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          go test -race -count=1 -timeout=480s -covermode=atomic \
+          go test -race -count=1 -timeout=600s -covermode=atomic \
             -coverprofile="$RUNNER_TEMP/cover-iouring.out" ./internal/engine/iouring/
           root="$RUNNER_TEMP/cover-root.out"
           own="$RUNNER_TEMP/cover-iouring.out"

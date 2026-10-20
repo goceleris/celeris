@@ -238,22 +238,118 @@ func TestCloseConnClearsSlotUnderDriverMu775(t *testing.T) {
 // slot cleared after the close would still be set: RegisterConn must succeed
 // on the freed number, not be refused as "already an HTTP connection" for a
 // connection that is gone.
+//
+// Another descriptor of the process can take the freed number between close(2)
+// and the hook's F_GETFD check (a few microseconds, and nothing else in this
+// test opens descriptors, but the test binary is one process). Then the test
+// cannot reach RegisterConn on that number, which says nothing about the code:
+// it starts over, on a new engine and a new connection, up to
+// freedNumberAttempts775 times, and fails only if every attempt lost the number
+// (celeris#885 item 25).
 func TestDriverTakesNumberFreedByCloseConn775(t *testing.T) {
 	defer watchdog(t, time.Minute)()
+	runFreedNumber775(t, -1)
+}
 
+// TestDriverTakesNumberFreedByCloseConn775RetriesACollision is the control of
+// the retry: a decoy socket takes the freed number between close(2) and the
+// check, on the first attempt, as another descriptor of the process would. That
+// attempt must report a collision (the decoy is verified to hold the number; if
+// another descriptor got it before the decoy did, that is one more collision
+// and the decoy moves to the next attempt), the test must not fail on it, and a
+// later attempt must reach RegisterConn and check the slot like any other. With
+// one attempt allowed (the test as it was: t.Fatalf on the first collision)
+// this fails.
+func TestDriverTakesNumberFreedByCloseConn775RetriesACollision(t *testing.T) {
+	defer watchdog(t, time.Minute)()
+	// At least 2: a natural collision on the second attempt too is retried as
+	// well, so "exactly 2" would bring back the flake this test is the control of.
+	if used := runFreedNumber775(t, 0); used < 2 {
+		t.Errorf("the check passed after %d attempt(s), want at least 2: the attempt with the decoy on the freed number must have been retried", used)
+	}
+}
+
+// freedNumberAttempts775 is how many times a collision on the freed number is
+// retried (see TestDriverTakesNumberFreedByCloseConn775).
+const freedNumberAttempts775 = 5
+
+// freedNumber775 is what one attempt saw.
+type freedNumber775 struct {
+	fd               int
+	regErr, unregErr error
+	slotBusy         bool
+	reused           bool // the number was free after close(2) and a new descriptor took it
+	decoyHeld        bool // collideOn: the decoy holds the freed number
+}
+
+// runFreedNumber775 makes the attempts, with a decoy on the freed number of
+// attempt collideAt (-1: none; if another descriptor takes the number before
+// the decoy does, that is one more retried collision and the decoy moves to the
+// next attempt), until one reuses the number, checks its result and returns the
+// number of attempts it took. If none does, it fails.
+func runFreedNumber775(t *testing.T, collideAt int) int {
+	t.Helper()
+	decoyAt := collideAt
+	for attempt := range freedNumberAttempts775 {
+		r := freedNumberAttempt775(t, attempt == decoyAt)
+		if attempt == decoyAt && !r.decoyHeld {
+			// Another descriptor of the process took the number before the decoy
+			// did: a natural collision, retried like any other, and the decoy
+			// moves to the next attempt so the control still injects its own.
+			t.Logf("attempt %d of %d: the decoy did not get the number %d that closeConn freed (another descriptor took it first); the decoy moves to the next attempt", attempt+1, freedNumberAttempts775, r.fd)
+			decoyAt++
+			continue
+		}
+		if !r.reused {
+			t.Logf("attempt %d of %d: another descriptor of the process took the number %d that closeConn freed, before the check; starting over", attempt+1, freedNumberAttempts775, r.fd)
+			continue
+		}
+		if r.slotBusy {
+			t.Errorf("l.conns[%d] was still set after closeConn closed the descriptor: the slot is cleared after the close, not before", r.fd)
+		}
+		if r.regErr != nil {
+			t.Errorf("RegisterConn on the number closeConn had just freed: %v", r.regErr)
+		}
+		if r.unregErr != nil {
+			t.Errorf("UnregisterConn: %v", r.unregErr)
+		}
+		return attempt + 1
+	}
+	t.Fatalf("the freed number could not be taken by a new descriptor in %d attempts: the test did not reach RegisterConn", freedNumberAttempts775)
+	return 0
+}
+
+// freedNumberAttempt775 accepts one connection on an engine of its own, closes
+// the client, and reports what the hook saw when closeConn had closed the
+// server side. An engine per attempt: the hook is a package var, set before the
+// engine is created and cleared after it is stopped, so no loop goroutine reads
+// it while it is written. With decoy, a socket takes the freed number first
+// (pinned with dup3 if another descriptor came before it and the number is
+// still free), which is what a collision looks like to the check.
+func freedNumberAttempt775(t *testing.T, decoy bool) freedNumber775 {
+	t.Helper()
 	var target atomic.Int64
 	target.Store(-1)
-	type result struct {
-		regErr, unregErr error
-		slotBusy         bool
-		reused           bool
-	}
-	got := make(chan result, 1)
+	got := make(chan freedNumber775, 1)
 	testHookConnClosed = func(l *Loop, fd int) {
 		if int64(fd) != target.Load() {
 			return
 		}
-		var r result
+		r := freedNumber775{fd: fd}
+		if decoy {
+			if d, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0); err == nil {
+				if d != fd {
+					if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == unix.EBADF {
+						if unix.Dup3(d, fd, unix.O_CLOEXEC) == nil {
+							_ = unix.Close(d)
+							d = fd
+						}
+					}
+				}
+				r.decoyHeld = d == fd
+				defer func() { _ = unix.Close(d) }()
+			}
+		}
 		// close(2) has just returned: the number is the lowest free one, so a
 		// new socket normally gets it. Pin it with dup3 if another descriptor
 		// of the process came first (only when the number is verified free).
@@ -287,29 +383,19 @@ func TestDriverTakesNumberFreedByCloseConn775(t *testing.T) {
 		_ = unix.Close(fd)
 		got <- r
 	}
-	t.Cleanup(func() { testHookConnClosed = nil })
+	defer func() { testHookConnClosed = nil }()
 
 	eng, stopEng := newTestEngine(t)
-	t.Cleanup(stopEng)
+	defer stopEng()
 	clients, fds := acceptedConns(t, eng, 1)
 	target.Store(int64(fds[0]))
 	_ = clients[0].Close()
 
 	select {
 	case r := <-got:
-		if !r.reused {
-			t.Fatalf("the freed number %d could not be taken by a new descriptor: the test did not reach RegisterConn", fds[0])
-		}
-		if r.slotBusy {
-			t.Errorf("l.conns[%d] was still set after closeConn closed the descriptor: the slot is cleared after the close, not before", fds[0])
-		}
-		if r.regErr != nil {
-			t.Errorf("RegisterConn on the number closeConn had just freed: %v", r.regErr)
-		}
-		if r.unregErr != nil {
-			t.Errorf("UnregisterConn: %v", r.unregErr)
-		}
+		return r
 	case <-time.After(10 * time.Second):
 		t.Fatal("closeConn did not close the connection")
 	}
+	return freedNumber775{}
 }

@@ -89,7 +89,7 @@ func TestWriteBufBackpressureClosesSlowConsumer(t *testing.T) {
 	// absorbs its share.
 	e, err := New(cfg, &bigResponseHandler{bodySize: 50 << 20})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)

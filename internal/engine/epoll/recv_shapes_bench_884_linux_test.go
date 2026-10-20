@@ -38,7 +38,7 @@ func BenchmarkEpollRecvShapes884(b *testing.B) {
 				Resources: resource.Resources{Workers: 2},
 			}, newCarry543Handler())
 			if err != nil {
-				b.Skipf("engine unavailable: %v", err)
+				b.Fatalf("epoll engine unavailable: %v", err)
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
