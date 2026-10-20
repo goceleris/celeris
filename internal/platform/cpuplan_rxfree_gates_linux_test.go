@@ -249,6 +249,9 @@ func TestRxFreeSharedVectorsKeepTheirLoops(t *testing.T) {
 			}
 			if why := whyText(got); !strings.Contains(why, "shared") {
 				t.Errorf("Why does not say the vectors are shared: %s", why)
+			} else if n := strings.Count(why, "kept: IRQ 10 "); n != 1 {
+				// A vector two ports list is judged once, not once per port.
+				t.Errorf("IRQ 10 is judged %d times: %s", n, why)
 			}
 		})
 	}
