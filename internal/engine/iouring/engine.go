@@ -273,11 +273,13 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 // engine submits with -EINVAL and leaves its target running. On 5.15 the
 // recv of a connection the engine closes stays armed. On the H1 fast-close
 // path, close(2) alone, which the idle-timeout close takes, that recv keeps
-// the socket open and the peer gets no FIN (measured, celeris#792); the other
-// close paths shut the connection down before the close, so they send a FIN
-// (read from code, not measured). After the 5 s release backstop the pool can
-// hand that recv's buffer to another connection while the recv can still
-// complete into it (the #256 class, read from code).
+// the socket open and the peer gets no FIN (measured, celeris#792). On the
+// Base tier, which is every kernel below 5.19 (fixed files are off there), the
+// graceful close paths shut the connection down before the close, so they send
+// a FIN (read from code, not measured); the forced-RST close shuts both
+// directions and then closes, an abortive close by design. After the 5 s
+// release backstop the pool can hand that recv's buffer to another connection
+// while the recv can still complete into it (the #256 class, read from code).
 //
 // Below 5.19 the answer is the version, whatever the probe said. The probe
 // sends one of the four cancel forms the engine builds (by user_data with
