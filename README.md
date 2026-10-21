@@ -105,7 +105,7 @@ A correctness and hardening release: most of it comes from what the [probatorium
 
 **Breaking** (the [pull request of the move](https://github.com/goceleris/celeris/pull/938) lists the migrations):
 
-- The minimum Go version is **1.27.2**.
+- The minimum Go version is **1.27.3**.
 - The engine, protocol and driver codec packages moved under `internal/` and can no longer be imported; select an engine with `Config.Engine` and read counters as `celeris.EngineMetrics` or `observe.EngineMetrics`. Every deprecated public API was removed, `basicauth.HashPassword` included.
 - `Config.MaxRequestBodySize` defaults to 4 MiB, not 100 MB.
 - A handler that answers the request ends the chain, so a route that also matches a request a `Use`-mounted middleware answered no longer runs after it. `cache` and `swagger` options that defaulted to true are inverted (`DisableSingleflight`, `IgnoreCacheControl`, `DisablePKCE`). `otel` no longer records `server.address` as a metric attribute unless `MetricServerAddress` is set, and `Context.Scheme` returns only `"https"` or `"http"`. `Start*Context` returns only after the shutdown a cancel triggers.
