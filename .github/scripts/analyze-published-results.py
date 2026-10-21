@@ -71,3 +71,30 @@ for arch in ("x86_64","arm64"):
     print("driver rows:", {k:sum(1 for x in drv if x[1]==k) for k in ("win","tie","loss")}, "of", len(drv))
     print(f"Go-framework comparison (best celeris config vs best other Go framework, +-5% = tie, single run): win {wins} tie {ties} loss {loss} walkover {walk} rows {len(scn)}")
     for x in detail: print("   ",x)
+
+# ---- spread over every published cell of the version: how much the same quantities move between runs.
+import glob
+print("\n=== every published cell of", VERSION)
+for path in sorted(glob.glob(f"{root}/results/{VERSION}/*/*/summary.json")):
+    d = json.load(open(path))
+    B = d["benchmarks"]; cel = {n: e for n, e in B.items()} if False else None
+    Bn = {e["name"]: e for e in B}
+    celc = [e for e in B if e["framework"] == "celeris"]
+    scn = sorted({s for e in B for s in e["saturation_mode_rps"]})
+    best = {}
+    for e in B:
+        v = e["saturation_mode_rps"].get("get-simple-1024c")
+        if v: best[e["framework"]] = max(best.get(e["framework"], 0), v)
+    ratio = best["celeris"] / best["gnet"] if "gnet" in best else None
+    t = {"win": 0, "tie": 0, "loss": 0}; drv = {"win": 0, "tie": 0, "loss": 0}
+    for s in scn:
+        if s in {"get-json-h2", "post-4k-h2", "churn-close"}: continue
+        bc_ = max((e["saturation_mode_rps"].get(s, 0) for e in celc), default=0)
+        rv = max((e["saturation_mode_rps"].get(s, 0) for e in B if e["language"] == "go" and e["framework"] != "celeris"
+                  and e["name"] not in LIBS and e["name"] not in STD), default=0)
+        if bc_ <= 0 or rv <= 0: continue
+        k = "win" if bc_ / rv > 1.05 else ("loss" if bc_ / rv < 0.95 else "tie")
+        t[k] += 1
+        if s.startswith("driver-"): drv[k] += 1
+    cfg = d["benchmark_config"]
+    print(f"{path.split(VERSION + '/')[1]:34s} start {cfg['started_at'][:10]}  hero celeris/gnet {ratio:.3f}  rows {t}  driver rows {drv}")
