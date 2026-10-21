@@ -8,12 +8,22 @@ Method, so the counts can be judged: per scenario, the best celeris configuratio
 configuration of any other Go *framework* (fiber, gin, echo, chi, iris, hertz; gnet, fasthttp and nbio are
 libraries and net/http is the stdlib, both excluded as in the docs site). Within 5% counts as a tie. Rows
 where no other Go framework ran (the six WebSocket/SSE rows) are walkovers and are not counted. The HTTP/2 rows
-and churn-close are left out of the second tally because loadgen v1.4.14 fixed the clients behind them. One
-90 s run per cell, so the 5% band is a convention, not a confidence interval."""
-import json, statistics, sys
+and churn-close are left out of the second tally only for a run made by a loadgen older than v1.4.14, which
+fixed the clients behind them (a run from v1.4.14 or later keeps them). One run per cell, so the 5% band is a
+convention, not a confidence interval."""
+import json, statistics, sys, re
 root = sys.argv[1]
 VERSION = sys.argv[2] if len(sys.argv) > 2 else "v1.5.8"
 DATE = sys.argv[3] if len(sys.argv) > 3 else "20260829"
+FIXED_IN = (1, 4, 14)  # loadgen release that fixed the h2 client (get-json-h2, post-4k-h2) and the h1 client's -close (churn-close)
+OLD_CLIENT_ROWS = {"get-json-h2", "post-4k-h2", "churn-close"}
+def excluded_rows(loadgen_version):
+    """Rows measured by a client known to be wrong: those of a run by a loadgen older than FIXED_IN. A missing or
+    unparsable version is treated as old, so the rows stay out rather than in on a guess."""
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", str(loadgen_version or ""))
+    if m and tuple(int(x) for x in m.groups()) >= FIXED_IN:
+        return set()
+    return OLD_CLIENT_ROWS
 LIBS = {"gnet-h1","fasthttp-h1","nbio-h1","gorilla_ws","hyper","hyper-h2","h2o","lithium","uws","bunraw"}
 STD = {"stdhttp-h1","stdhttp-h2","stdhttp-hybrid"}
 for arch in ("x86_64","arm64"):
@@ -61,12 +71,12 @@ for arch in ("x86_64","arm64"):
         k = "win" if ratio>1.05 else ("loss" if ratio<0.95 else "tie")
         detail.append((s,k,round(ratio,3),rn))
         wins+= k=="win"; ties+= k=="tie"; loss+= k=="loss"
-    EXCL={"get-json-h2","post-4k-h2","churn-close"}  # rows measured by loadgen v1.4.13 whose client was fixed in v1.4.14 (h2 client, -close)
+    EXCL = excluded_rows(bc.get("loadgen_version"))
     t={"win":0,"tie":0,"loss":0}
     for x in detail:
         if x[0] in EXCL or x[1]=="walkover": continue
         t[x[1]]+=1
-    print("same, excluding h2c rows, churn-close and walkovers:", t, "rows", sum(t.values()))
+    print("same, excluding", sorted(EXCL) or "no rows", "and walkovers:", t, "rows", sum(t.values()))
     drv=[x for x in detail if x[0].startswith("driver-")]
     print("driver rows:", {k:sum(1 for x in drv if x[1]==k) for k in ("win","tie","loss")}, "of", len(drv))
     print(f"Go-framework comparison (best celeris config vs best other Go framework, +-5% = tie, single run): win {wins} tie {ties} loss {loss} walkover {walk} rows {len(scn)}")
@@ -85,10 +95,11 @@ for path in sorted(glob.glob(f"{root}/results/{VERSION}/*/*/summary.json")):
     for e in B:
         v = e["saturation_mode_rps"].get("get-simple-1024c")
         if v: best[e["framework"]] = max(best.get(e["framework"], 0), v)
-    ratio = best["celeris"] / best["gnet"] if "gnet" in best else None
+    ratio = best["celeris"] / best["gnet"] if "gnet" in best and "celeris" in best else None
+    EXCL = excluded_rows(d["benchmark_config"].get("loadgen_version"))
     t = {"win": 0, "tie": 0, "loss": 0}; drv = {"win": 0, "tie": 0, "loss": 0}
     for s in scn:
-        if s in {"get-json-h2", "post-4k-h2", "churn-close"}: continue
+        if s in EXCL: continue
         bc_ = max((e["saturation_mode_rps"].get(s, 0) for e in celc), default=0)
         rv = max((e["saturation_mode_rps"].get(s, 0) for e in B if e["language"] == "go" and e["framework"] != "celeris"
                   and e["name"] not in LIBS and e["name"] not in STD), default=0)
@@ -97,4 +108,4 @@ for path in sorted(glob.glob(f"{root}/results/{VERSION}/*/*/summary.json")):
         t[k] += 1
         if s.startswith("driver-"): drv[k] += 1
     cfg = d["benchmark_config"]
-    print(f"{path.split(VERSION + '/')[1]:34s} start {cfg['started_at'][:10]}  hero celeris/gnet {ratio:.3f}  rows {t}  driver rows {drv}")
+    print(f"{path.split(VERSION + '/')[1]:34s} start {cfg['started_at'][:10]}  hero celeris/gnet {'n/a' if ratio is None else format(ratio, '.3f')}  rows {t}  driver rows {drv}")
