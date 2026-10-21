@@ -9,8 +9,12 @@
 #
 #   .github/scripts/pinmove-rehearsal.sh [VERSION]
 #
-#   VERSION                 default v1.6.0-rc.99; must match the release gate's
-#                           semver (vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N)
+#   VERSION                 must match the release gate's semver (vX.Y.Z or
+#                           vX.Y.Z-(alpha|beta|rc).N). Default: derived at run
+#                           time by `mage RehearsalVersion` from server.go's
+#                           Version and the release tags, so it is always newer
+#                           than the last release (v1.6.0-rc.99 while v1.6.0 is
+#                           unreleased, v1.6.1-rc.99 once it ships)
 #   PINMOVE_KEEP=1          keep the temp dir (default: removed on exit)
 #   PINMOVE_SKIP_PREP=1     negative control: skip PrepRelease. The script must
 #                           then exit non-zero (the pins still name the last
@@ -36,15 +40,37 @@
 #   8  control: the same tags on a tree WITHOUT the pin move; the assertion of
 #      step 5 must go red (celeris resolves to the last release)
 #   10 retraction probe: a newer sub-module tag retracting a bad one
-set -uo pipefail
+#
+# What it can touch: git and the go command read and write only under a
+# temp dir (GIT_CONFIG_GLOBAL, GOPATH, GOMODCACHE, GOCACHE, MAGEFILE_CACHE and
+# GOENV=off keep the user's configuration out). Every remote it pushes to is a
+# bare repository in that temp dir; the checkout it runs in is only read. git
+# may use no transport but file (GIT_ALLOW_PROTOCOL), and a push to any
+# github.com URL is rewritten to a dead path. The only network use is the go
+# command reading third-party modules from the public module proxy; celeris
+# modules are GOPRIVATE, so no rehearsal version is ever asked of the proxy or
+# the checksum database.
+set -Eeuo pipefail
+trap 'echo "pinmove-rehearsal: stopped at line $LINENO (status $?)" >&2' ERR
 
-VERSION=${1:-v1.6.0-rc.99}
 ROOT=$PWD
 MODPATH=github.com/goceleris/celeris
+GATE_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$'
 T=$(mktemp -d)
-if [ -z "${PINMOVE_KEEP:-}" ]; then
-  trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
-fi
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if [ -n "${PINMOVE_KEEP:-}" ]; then
+    echo "temp dir kept at $T" >&2
+  elif [ -n "${T:-}" ] && [ -d "$T" ]; then
+    chmod -R u+w "$T" 2>/dev/null || true # the module cache is read-only without -modcacherw
+    rm -rf "$T"
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 pass=0
 fail=0
 ok()   { pass=$((pass + 1)); echo "  PASS  $*"; }
@@ -57,15 +83,26 @@ expect_red() { local d=$1; shift; if "$@"; then bad "$d (it passed; it must go r
 command -v go >/dev/null || { echo "go not found" >&2; exit 2; }
 [ -f go.mod ] && [ -d magefiles ] || { echo "run from the celeris repository root" >&2; exit 2; }
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "tracked files are modified; commit or stash first" >&2; exit 2; }
-git rev-parse --verify -q v1.5.11 >/dev/null || { echo "no release tags here: fetch with full history and tags" >&2; exit 2; }
-LAST=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -v -- '-' | head -n1)
+LAST=$(git tag --list 'v[0-9]*' --sort=-v:refname | { grep -v -- '-' || true; } | head -n1)
+[ -n "$LAST" ] || { echo "no release tags here: fetch with full history and tags" >&2; exit 2; }
+
+# The user's own module cache is never the rehearsal's (forget_celeris deletes in it).
+USER_MODCACHE=$(GOENV=off go env GOMODCACHE)
+if [ -n "${PINMOVE_MODCACHE:-}" ] && [ "$PINMOVE_MODCACHE" = "$USER_MODCACHE" ]; then
+  echo "PINMOVE_MODCACHE must not be the default module cache ($USER_MODCACHE)" >&2; exit 2
+fi
+GOVER=$(sed -n 's/^go //p' go.mod | head -n1)
+[ -n "$GOVER" ] || { echo "no go directive in go.mod" >&2; exit 2; }
 
 # Everything the go command and git read or write lives under $T.
 export GIT_CONFIG_GLOBAL=$T/gitconfig GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+export GIT_ALLOW_PROTOCOL=file
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_SSH GIT_SSH_COMMAND
 export GOPATH=$T/gopath GOCACHE=${PINMOVE_GOCACHE:-$T/gocache} GOFLAGS=-modcacherw GOTOOLCHAIN=local GOWORK=off
 export GOMODCACHE=${PINMOVE_MODCACHE:-$T/modcache}
+export GOENV=off MAGEFILE_CACHE=$T/magecache
 export GOPRIVATE=$MODPATH
-unset GOPROXY GONOSUMDB GONOPROXY
+unset GOPROXY GONOSUMDB GONOPROXY GONOSUMCHECK GOINSECURE GOVCS
 # base_config rewrites the whole git config, so exactly one insteadOf is live.
 base_config() {
   : >"$GIT_CONFIG_GLOBAL"
@@ -75,14 +112,17 @@ base_config() {
   git config --global init.defaultBranch main
   git config --global protocol.file.allow always
   git config --global push.followTags false
+  # Belt and braces: a push to GitHub, by any spelling of its URL, goes nowhere.
+  local u
+  for u in https://github.com/ git@github.com: ssh://git@github.com/ git://github.com/; do
+    git config --global --add url."file:///nonexistent-pinmove-push-blocked/".pushInsteadOf "$u"
+  done
 }
 base_config
 
 SEED=$T/seed.git
 git clone -q --bare --no-local "$ROOT" "$SEED"
 git --git-dir="$SEED" update-ref refs/heads/main "$(git rev-parse HEAD)"
-echo "rehearsal of $VERSION on $(git rev-parse --short HEAD); last release $LAST; temp dir $T"
-echo "go: $(go version)"
 
 # redirect NAME: point https://github.com/goceleris/celeris at $T/NAME.git
 # (and only there).
@@ -103,6 +143,24 @@ forget_celeris() {
   rm -rf "$GOMODCACHE/cache/vcs" "$GOMODCACHE/cache/download/github.com/goceleris" "$GOMODCACHE/github.com/goceleris"
 }
 mage() { (cd "$1" && shift && go tool -modfile="$PWD/.github/tools/go.mod" mage "$@"); }
+# local_origin DIR: DIR's push and fetch URL of origin are paths under the temp dir.
+local_origin() {
+  local d=$1 u
+  for u in "$(git -C "$d" remote get-url origin)" "$(git -C "$d" remote get-url --push origin)"; do
+    case "$u" in "$T"/*) ;; *) echo "REFUSING: $d's origin is $u, not under $T" >&2; return 1;; esac
+  done
+}
+
+VERSION=${1:-}
+if [ -z "$VERSION" ]; then
+  VERSION=$(mage "$ROOT" RehearsalVersion) || { echo "could not derive the default version (mage RehearsalVersion failed)" >&2; exit 2; }
+  DERIVED=" (derived from server.go and the release tags)"
+fi
+if ! [[ $VERSION =~ $GATE_RE ]]; then
+  echo "VERSION=\"$VERSION\": want vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N, which is what the release gate accepts" >&2; exit 2
+fi
+echo "rehearsal of $VERSION${DERIVED:-} on $(git rev-parse --short HEAD); last release $LAST; temp dir $T"
+echo "go: $(go version)"
 
 # consumer DIR SUBMODULE REF: a module outside the tree that requires one
 # sub-module at REF. A dependency's replace directive is ignored here, so this
@@ -110,14 +168,16 @@ mage() { (cd "$1" && shift && go tool -modfile="$PWD/.github/tools/go.mod" mage 
 consumer() {
   local dir=$1 sub=$2 ref=$3
   rm -rf "$dir"; mkdir -p "$dir"
-  printf 'module example.com/consumer\n\ngo 1.27.2\n' >"$dir/go.mod"
+  printf 'module example.com/consumer\n\ngo %s\n' "$GOVER" >"$dir/go.mod"
   printf 'package main\n\nimport _ "%s/%s"\n\nfunc main() {}\n' "$MODPATH" "$sub" >"$dir/main.go"
   (cd "$dir" && export GOFLAGS="-modcacherw -mod=mod" && go get "$MODPATH/$sub@$ref" 2>"$dir/get.err" && go build -o /dev/null . 2>>"$dir/get.err")
 }
 resolved_root() { (cd "$1" && GOFLAGS="-modcacherw -mod=mod" go list -m -f '{{.Version}}' $MODPATH 2>/dev/null); }
 # resolves_to DIR WANT: celeris in the consumer's build list is exactly WANT.
 resolves_to() { local got; got=$(resolved_root "$1"); [ "$got" = "$2" ] || { echo "      celeris resolved to '${got}', want $2"; return 1; }; }
-celeris_sums() { grep "^$MODPATH v" "$1/go.sum" 2>/dev/null | sort; }
+celeris_sums() { { grep "^$MODPATH v" "$1/go.sum" 2>/dev/null || true; } | sort; }
+# first_lines FILE N: the first N lines of an error file, indented, minus go's download chatter.
+first_lines() { { grep -v '^go: downloading' "$1" || true; } | sed -n "1,${2}p" | sed 's/^/      /'; }
 
 ##########################################################################
 step "0 drift check: published modules vs PrepRelease vs release.yml"
@@ -163,7 +223,11 @@ if [ -n "${PINMOVE_SKIP_PREP:-}" ]; then
 else
   expect_ok "CheckRelease in release mode passes after PrepRelease" mage "$T/main" CheckRelease
 fi
-git commit -q -am "prep $VERSION" || true
+if [ -n "${PINMOVE_SKIP_PREP:-}" ]; then
+  git commit -q --allow-empty -m "prep $VERSION (nothing moved: negative control)"
+else
+  git commit -q -am "prep $VERSION"
+fi
 git diff --stat HEAD~1 | tail -n 8
 for m in $SUBS; do
   printf '    %-24s pins %s\n' "$m" "$(grep -o "celeris v[0-9][^ ]*" "$m/go.mod")"
@@ -173,6 +237,7 @@ for m in $SUBS; do
   if (cd "$m" && go build ./... && go vet ./... >/dev/null); then ok "$m: builds in tree (replace ../../)"; else bad "$m: does not build in tree"; fi
 done
 PREP=$(git rev-parse HEAD)
+local_origin "$T/main" || exit 2
 git push -q origin prep:main
 cd "$ROOT" || exit 2
 
@@ -184,7 +249,7 @@ for m in $SUBS; do
   if consumer "$d" "$m" "$PREP"; then
     bad "$m@${PREP:0:12} resolved before $VERSION exists"
   else
-    ok "$m@${PREP:0:12} does not resolve before the root tag exists"; grep -v '^go: downloading' "$d/get.err" | sed -n '1,3p' | sed 's/^/      /'
+    ok "$m@${PREP:0:12} does not resolve before the root tag exists"; first_lines "$d/get.err" 3
   fi
 done
 
@@ -197,7 +262,7 @@ for m in $SUBS; do
   if consumer "$d" "$m" "$VERSION"; then
     bad "$m@$VERSION resolved with no root tag"
   else
-    ok "$m@$VERSION does not resolve with no root tag"; grep -v '^go: downloading' "$d/get.err" | sed -n '1,2p' | sed 's/^/      /'
+    ok "$m@$VERSION does not resolve with no root tag"; first_lines "$d/get.err" 2
   fi
 done
 for m in $SUBS; do git --git-dir="$T/main.git" tag -d "$m/$VERSION" >/dev/null; done
@@ -211,9 +276,17 @@ git -C "$T/tagger" checkout -q "$VERSION"
 awk '/- name: Create sub-module tags/{f=1; next} f && /^ *run: \|/{r=1; next} r && /^  [a-z-]+:$/{exit} r{print}' \
   .github/workflows/release.yml | sed 's/^          //' >"$T/tag-step.sh"
 if [ -s "$T/tag-step.sh" ]; then ok "extracted the tag step ($(wc -l <"$T/tag-step.sh") lines)"; else bad "could not extract the tag step from release.yml"; fi
-if (cd "$T/tagger" && VERSION=$VERSION bash -e "$T/tag-step.sh" 2>&1 | sed 's/^/      /'; exit "${PIPESTATUS[0]}"); then ok "tag step exited 0"; else bad "tag step failed"; fi
+local_origin "$T/tagger" || exit 2
+if grep -Eq 'github\.com|https?://|TOKEN|set-url|remote add' "$T/tag-step.sh"; then
+  # The step is run unchanged, so a change to it that names a URL or a token is read by a person first.
+  bad "release.yml's tag step now names a URL or a token; read it before the rehearsal runs it"
+elif (cd "$T/tagger" && VERSION=$VERSION bash -e "$T/tag-step.sh" 2>&1 | sed 's/^/      /'; exit "${PIPESTATUS[0]}"); then
+  ok "tag step exited 0"
+else
+  bad "tag step failed"
+fi
 for m in $SUBS; do
-  tgt=$(git --git-dir="$T/main.git" rev-parse "$m/$VERSION^{commit}" 2>/dev/null)
+  tgt=$(git --git-dir="$T/main.git" rev-parse "$m/$VERSION^{commit}" 2>/dev/null || true)
   expect_ok "$m/$VERSION exists in the remote at the root tag's commit" test "$tgt" = "$(git --git-dir="$T/main.git" rev-parse "$VERSION^{commit}")"
 done
 
@@ -230,7 +303,7 @@ done
 
 ##########################################################################
 step "6 release.yml's 'Verify module availability' query (go list -m MODULE@VERSION)"
-mkdir -p "$T/q" && printf 'module example.com/q\n\ngo 1.27.2\n' >"$T/q/go.mod"
+mkdir -p "$T/q" && printf 'module example.com/q\n\ngo %s\n' "$GOVER" >"$T/q/go.mod"
 for mod in $MODPATH $(for m in $SUBS; do echo "$MODPATH/$m"; done); do
   if (cd "$T/q" && go list -m "$mod@$VERSION" >/dev/null 2>&1); then ok "go list -m $mod@$VERSION"; else bad "go list -m $mod@$VERSION"; fi
 done
@@ -239,7 +312,7 @@ done
 step "7 the same consumers over GOPROXY=file:// (fresh GOMODCACHE, GOSUMDB=off, no VCS)"
 PROXY=$T/proxy
 cp -R "$GOMODCACHE/cache/download" "$PROXY"
-ls "$PROXY/$MODPATH/@v/" 2>/dev/null | sed 's/^/      proxy: /' | head -n 12
+{ ls "$PROXY/$MODPATH/@v/" 2>/dev/null || true; } | sed -n '1,12p' | sed 's/^/      proxy: /'
 for m in $SUBS; do
   d=$T/o-${m##*/}
   if (export GOMODCACHE=$T/modcache-offline GOPROXY=file://$PROXY GOSUMDB=off; unset GOPRIVATE; consumer "$d" "$m" "$VERSION"); then
@@ -276,15 +349,17 @@ git --git-dir="$T/retr.git" tag "$m/$BAD" "$(git --git-dir="$T/retr.git" rev-par
 (
   cd "$T/retr" && git checkout -q -b fix \
     && printf '\nretract %s // rehearsal: pinned the wrong celeris\n' "$BAD" >>"$m/go.mod" \
-    && git commit -q -am "retract $BAD in $m" && git tag "$m/$FIX" && git push -q origin "$m/$FIX"
+    && git commit -q -am "retract $BAD in $m" && git tag "$m/$FIX" && local_origin "$T/retr" && git push -q origin "$m/$FIX"
 )
 forget_celeris
-mkdir -p "$T/r" && printf 'module example.com/r\n\ngo 1.27.2\n' >"$T/r/go.mod"
-(cd "$T/r" && go list -m -versions "$MODPATH/$m" 2>&1 | sed 's/^/      default:   /')
-(cd "$T/r" && go list -m -versions -retracted "$MODPATH/$m" 2>&1 | sed 's/^/      -retracted: /')
-if (cd "$T/r" && go list -m -versions "$MODPATH/$m" 2>&1 | grep -qw "$BAD"); then bad "retracted $BAD is still listed by default"; else ok "retracted $BAD is hidden from the default version list"; fi
-if (cd "$T/r" && go list -m -versions -retracted "$MODPATH/$m" 2>&1 | grep -qw "$BAD"); then ok "-retracted still lists $BAD"; else bad "-retracted does not list $BAD"; fi
-(cd "$T/r" && GOFLAGS="-modcacherw -mod=mod" go get "$MODPATH/$m@$BAD" 2>&1 | sed 's/^/      go get @bad: /')
+mkdir -p "$T/r" && printf 'module example.com/r\n\ngo %s\n' "$GOVER" >"$T/r/go.mod"
+listed=$(cd "$T/r" && go list -m -versions "$MODPATH/$m" 2>&1 || true)
+listed_all=$(cd "$T/r" && go list -m -versions -retracted "$MODPATH/$m" 2>&1 || true)
+echo "$listed" | sed 's/^/      default:   /'
+echo "$listed_all" | sed 's/^/      -retracted: /'
+if grep -qw "$BAD" <<<"$listed"; then bad "retracted $BAD is still listed by default"; else ok "retracted $BAD is hidden from the default version list"; fi
+if grep -qw "$BAD" <<<"$listed_all"; then ok "-retracted still lists $BAD"; else bad "-retracted does not list $BAD"; fi
+(cd "$T/r" && GOFLAGS="-modcacherw -mod=mod" go get "$MODPATH/$m@$BAD" 2>&1 | sed 's/^/      go get @bad: /') || true
 
 ##########################################################################
 echo
