@@ -118,6 +118,7 @@ func (w *Worker) tryTransplant(fd int) {
 			return
 		}
 		if closing {
+			w.handoffLoss.noteExitDeferred()
 			return
 		}
 	}
