@@ -50,7 +50,7 @@ func parseTriple(m []string) triple {
 func RehearsalVersion(current string, tags []string) (string, error) {
 	cm := coreRe.FindStringSubmatch(current)
 	if cm == nil {
-		return "", fmt.Errorf("Version %q is not X.Y.Z or X.Y.Z-(alpha|beta|rc).N", current)
+		return "", fmt.Errorf("server.go Version %q is not X.Y.Z or X.Y.Z-(alpha|beta|rc).N", current)
 	}
 	core := parseTriple(cm)
 
