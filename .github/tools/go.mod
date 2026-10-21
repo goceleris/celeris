@@ -18,7 +18,7 @@
 // `GOWORK=off go -C .github/tools get golang.org/x/perf@latest`.
 module celeris-ci-tools
 
-go 1.27.2
+go 1.27.3
 
 tool (
 	github.com/magefile/mage
