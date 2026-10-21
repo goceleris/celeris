@@ -133,9 +133,17 @@ func tcpState712(localPort, remotePort int) string {
 	return "none"
 }
 
-// clientSeesClose polls c until its peer's close arrives (EOF or reset) or
-// bound runs out; it returns how long that took, or -1.
-func clientSeesClose(c net.Conn, bound time.Duration) (time.Duration, string) {
+// errNoClose712 is what clientSeesClose reports when bound ran out.
+var errNoClose712 = errors.New("no close seen")
+
+// clientSeesClose polls c until its peer's close arrives or bound runs out. It
+// returns how long that took and the read error that ended it, or -1 and
+// errNoClose712. The close the tests are about is the FIN, which a read
+// reports as io.EOF; a connection reset is a different event (a close with
+// unread bytes in the receive buffer sends an RST, and a reset also ends a
+// read), so the error is returned and the callers require io.EOF
+// (celeris#884 item 8).
+func clientSeesClose(c net.Conn, bound time.Duration) (time.Duration, error) {
 	t0 := time.Now()
 	for time.Since(t0) < bound {
 		_ = c.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
@@ -147,9 +155,9 @@ func clientSeesClose(c net.Conn, bound time.Duration) (time.Duration, string) {
 		if errors.As(err, &ne) && ne.Timeout() {
 			continue
 		}
-		return time.Since(t0), err.Error()
+		return time.Since(t0), err
 	}
-	return -1, "no close seen"
+	return -1, errNoClose712
 }
 
 // finAfterClose runs one arm. park: PauseAccept first, so the close takes the
@@ -170,10 +178,13 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 		c.AsyncHandlers = async
 		if readTimeout {
 			c.ReadHeaderTimeout = 60 * time.Second
-			c.ReadTimeout = 300 * time.Millisecond
+			c.ReadTimeout = time.Second
 			c.IdleTimeout = 10 * time.Minute
 		} else {
-			c.ReadHeaderTimeout = 400 * time.Millisecond
+			// Long enough that the dial, the write, the engine's read of it
+			// and the pause all land before the deadline on a loaded host
+			// (celeris#884 item 9); the premises below fail if one does not.
+			c.ReadHeaderTimeout = time.Second
 		}
 	})
 	e.mu.Lock()
@@ -201,6 +212,7 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 	defer func() { _ = c.Close() }()
 	srvPort := c.RemoteAddr().(*net.TCPAddr).Port
 	cliPort := c.LocalAddr().(*net.TCPAddr).Port
+	read0 := e.Metrics().BytesRead
 	t0 := time.Now()
 	const partial = "GET /slow HTTP/1.1\r\nHost: x\r\n" // no blank line: mid-headers until a deadline
 	if _, err := c.Write([]byte(partial)); err != nil {
@@ -208,6 +220,13 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 	}
 	if !parkWait712(2*time.Second, func() bool { return e.Metrics().ActiveConnections == 1 }) {
 		t.Fatalf("celeris712 PREMISE: the connection was never accepted")
+	}
+	// Every header byte read, as in the many-connection arms: a close with
+	// bytes still unread in the receive buffer is an RST, not the FIN this
+	// arm asks about, and the engine's close would then be at the mercy of
+	// whether its recv had run before the deadline did.
+	if !parkWait712(2*time.Second, func() bool { return e.Metrics().BytesRead-read0 >= uint64(len(partial)) }) {
+		t.Fatalf("celeris712 PREMISE: the engine read %d of %d header bytes", e.Metrics().BytesRead-read0, len(partial))
 	}
 	if park {
 		if readTimeout {
@@ -234,7 +253,7 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 			closedAt.Store(int64(time.Since(t0)))
 		}
 	}()
-	seen, why := clientSeesClose(c, 3*time.Second)
+	seen, seenErr := clientSeesClose(c, 5*time.Second)
 	seenMs := int64(-1)
 	if seen >= 0 {
 		seenMs = time.Since(t0).Milliseconds()
@@ -259,7 +278,7 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 	}
 	t.Logf("celeris712 park=%v read_timeout=%v async=%v tier=%s defer_taskrun=%v workers=%d engine_close_ms=%d "+
 		"parked=%v client_close_ms=%d (%s) tcp_state_srv=%s tcp_state_cli=%s wake_to_close_ms=%d",
-		park, readTimeout, async, tier, deferTaskrun, len(ws), engineMs, parked, seenMs, why, stSrv, stCli, wakeMs)
+		park, readTimeout, async, tier, deferTaskrun, len(ws), engineMs, parked, seenMs, seenErr, stSrv, stCli, wakeMs)
 	if park && !parked {
 		t.Fatalf("celeris712 PREMISE: the worker did not park after the close")
 	}
@@ -268,8 +287,11 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 	}
 	if seen < 0 {
 		t.Errorf("celeris712 NOFIN: the engine counted the connection closed %d ms after the client's write, "+
-			"but the client saw no close for 3 s (server socket state %s, client %s; the close arrived %d ms "+
+			"but the client saw no close for 5 s (server socket state %s, client %s; the close arrived %d ms "+
 			"after a wake)", engineMs, stSrv, stCli, wakeMs)
+	} else if !errors.Is(seenErr, io.EOF) {
+		t.Errorf("celeris712 NOTEOF: the client's read ended with %v, want io.EOF: the close arrived as a reset, "+
+			"not the FIN the test is about (server socket state %s, client %s)", seenErr, stSrv, stCli)
 	}
 }
 
@@ -295,11 +317,12 @@ func finToManyAfterClose(t *testing.T, n int, readTimeout bool) {
 		c.DisableDeferAccept = true // no pause linger (celeris#662), as above
 		if readTimeout {
 			c.ReadHeaderTimeout = 60 * time.Second
-			// Long enough for n dials and the pause to land before it.
-			c.ReadTimeout = time.Second
+			// Long enough for n dials, their writes and the pause to land
+			// before it (celeris#884 item 9).
+			c.ReadTimeout = 3 * time.Second
 			c.IdleTimeout = 10 * time.Minute
 		} else {
-			c.ReadHeaderTimeout = time.Second
+			c.ReadHeaderTimeout = 3 * time.Second
 		}
 	})
 	e.mu.Lock()
@@ -366,15 +389,27 @@ func finToManyAfterClose(t *testing.T, n int, readTimeout bool) {
 		t.Fatalf("celeris712 PREMISE: the worker did not park after the last close")
 	}
 	parkMs := time.Since(closedAt).Milliseconds()
-	var seen atomic.Int64
+	// How the clients see the close: as io.EOF (the FIN), as another error (a
+	// reset, say), or not within the bound. The goroutines only count.
+	var seen, notEOF atomic.Int64
+	var firstNotEOF atomic.Value // the first error that was neither io.EOF nor a missing close
+	count := func(c net.Conn, eof, other *atomic.Int64) {
+		d, err := clientSeesClose(c, 2*time.Second)
+		switch {
+		case d < 0:
+		case errors.Is(err, io.EOF):
+			eof.Add(1)
+		default:
+			other.Add(1)
+			firstNotEOF.CompareAndSwap(nil, err.Error())
+		}
+	}
 	var wg sync.WaitGroup
 	for _, c := range conns {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			if d, _ := clientSeesClose(c, 2*time.Second); d >= 0 {
-				seen.Add(1)
-			}
+			count(c, &seen, &notEOF)
 		}(c)
 	}
 	wg.Wait()
@@ -388,9 +423,9 @@ func finToManyAfterClose(t *testing.T, n int, readTimeout bool) {
 			wg2.Add(1)
 			go func(c net.Conn) {
 				defer wg2.Done()
-				if d, _ := clientSeesClose(c, 2*time.Second); d >= 0 {
-					seenAfterWake.Add(1)
-				}
+				var eof, other atomic.Int64
+				count(c, &eof, &other)
+				seenAfterWake.Add(eof.Load())
 			}(c)
 		}
 		wg2.Wait()
@@ -401,9 +436,13 @@ func finToManyAfterClose(t *testing.T, n int, readTimeout bool) {
 	if !parked {
 		t.Fatalf("celeris712 PREMISE: the worker left the park while the clients polled")
 	}
-	if seen.Load() != int64(n) {
-		t.Errorf("celeris712 NOFIN: %d of %d clients saw no close in 2 s while the worker was parked "+
-			"(%d of them saw it after a wake)", int64(n)-seen.Load(), n, seenAfterWake.Load())
+	if nr := notEOF.Load(); nr > 0 {
+		t.Errorf("celeris712 NOTEOF: %d clients' reads ended with an error other than io.EOF (first: %v): "+
+			"the close arrived as a reset, not the FIN the test is about", nr, firstNotEOF.Load())
+	}
+	if lost := int64(n) - seen.Load() - notEOF.Load(); lost > 0 {
+		t.Errorf("celeris712 NOFIN: %d of %d clients saw no close within the observation bound while the worker was parked "+
+			"(%d of them saw it after a wake)", lost, n, seenAfterWake.Load())
 	}
 }
 

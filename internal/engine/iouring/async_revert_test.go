@@ -123,6 +123,7 @@ func TestAsyncConnRevertsOnRouteDepromotion(t *testing.T) {
 	h := &revertResolverHandler{}
 	h.async.Store(true)
 	e := startRevertEngine(t, h)
+	skipIfProvidedBuffers(t, e, "the celeris#364 revert path is unreachable with a buffer ring (canRevertToInline gates on w.bufRing == nil), so the conn never reverts")
 	target := e.Addr().String()
 
 	c, err := net.DialTimeout("tcp", target, 2*time.Second)
@@ -367,17 +368,7 @@ func TestAsyncConnPromotedRouteSurvivesTheNextRequest(t *testing.T) {
 	// model (canRevertToInline gates on w.bufRing == nil). With provided
 	// buffers the revert never fires, promotedPath is never even recorded,
 	// and the assertions below would hold vacuously — so say so instead.
-	e.mu.Lock()
-	workers := append([]*Worker(nil), e.workers...)
-	e.mu.Unlock()
-	if len(workers) == 0 {
-		t.Fatal("engine reports no workers")
-	}
-	for _, w := range workers {
-		if w.bufRing != nil {
-			t.Skip("provided-buffer recv in use: the celeris#364 revert path (and so the celeris#631 alias) is not reachable here")
-		}
-	}
+	skipIfProvidedBuffers(t, e, "the celeris#364 revert path (and so the celeris#631 alias) is not reachable here")
 
 	c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
 	if err != nil {

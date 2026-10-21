@@ -329,17 +329,47 @@ func TestShutdownEndsOwedOpsBeforeClosing(t *testing.T) {
 // itself when no owed op names it, and otherwise at the drainPendingRelease
 // of the first loop pass that reads the last naming op's terminal CQE (a
 // cancelled recv) or the send's first CQE: one pass, and a pass here waits
-// at most 10 ms for completions. 200 ms leaves 20 passes of headroom for
-// -race on a 4-CPU container, and is 25 times shorter than the 5 s backstop
-// (pendingReleaseHoldNanos) the descriptor was held to.
-const zcReleaseBound = 200 * time.Millisecond
+// at most 10 ms for completions. 2 s is the ceiling for a loaded -race run on
+// a 4-CPU container (a 200 ms bound is tight there, celeris#884 item 17), and
+// still less than half of the 5 s backstop (pendingReleaseHoldNanos) the
+// descriptor was held to, which is the regression it tells apart;
+// CloseFDForced, which must be 0, is the timing-free half of the same check.
+const zcReleaseBound = 2 * time.Second
 
 // zcShutdownBound is the same for worker shutdown's drain: with only a
 // notification owed it does not drain at all, and with the send's first CQE
 // already in the ring it stops at the first pass, which returns at once.
 // Held for the notification, the drain ran its whole 250 ms bound
-// (shutdownFDDrainNanos); 100 ms sits well between the two.
+// (shutdownFDDrainNanos); 100 ms sits well between the two. The timing is the
+// second judge: the drain's own wait count (countShutdownWaits) is the first,
+// and does not depend on the clock (celeris#884 item 17).
 const zcShutdownBound = 100 * time.Millisecond
+
+// countShutdownWaits wraps shutdownRingWait, the ring wait of
+// endOwedOpsAtShutdown's drain, for the rest of the test and returns the number
+// of waits (passes) the drain has made. A drain that finds nothing owed makes
+// none; one that waits for an op until the CQE the ring already holds makes one.
+// Held for a SEND_ZC notification it would make them until its bound ran out,
+// which the clock alone has to tell from a slow machine.
+func countShutdownWaits(t *testing.T) *atomic.Int32 {
+	t.Helper()
+	var n atomic.Int32
+	orig := shutdownRingWait
+	shutdownRingWait = func(r *Ring, d time.Duration) error {
+		n.Add(1)
+		return orig(r, d)
+	}
+	t.Cleanup(func() { shutdownRingWait = orig })
+	return &n
+}
+
+// wantDrainPasses fails the test unless the drain made exactly want waits.
+func wantDrainPasses(t *testing.T, n *atomic.Int32, want int32) {
+	t.Helper()
+	if got := n.Load(); got != want {
+		t.Errorf("the shutdown drain made %d wait(s) on the ring, want %d", got, want)
+	}
+}
 
 // zcPayload is the send: 64 KiB, far over sendZCMinBytes (so it goes out as
 // SEND_ZC) and over what a peer with a 4 KiB receive buffer can take, so what
@@ -411,6 +441,11 @@ func newZCCloseWorker(t *testing.T) (*Worker, *connState, int) {
 		recvArm:     &recvArmStats{},
 		handoffLoss: &handoffLossStats{},
 		sendZC:      true,
+		// No listen socket: the zero value is descriptor 0, which the shutdown
+		// drain would cancel the accept of and wait for, so a count of its
+		// passes would be about that cancel and not about the connection
+		// (celeris#884 item 17).
+		listenFD: -1,
 	}
 	w.cachedNow = time.Now().UnixNano()
 	cs := &connState{
@@ -639,21 +674,33 @@ func TestCloseReleasesDescriptorWithOnlyAZCNotificationOwed(t *testing.T) {
 // (send-done-during-drain), the drain must end within zcShutdownBound rather
 // than run out its 250 ms bound.
 func TestShutdownDoesNotWaitForAZCNotification(t *testing.T) {
+	//   - notif-pending: fdOps is 0 before the drain (the notification names no
+	//     descriptor), so nothing is owed and the drain makes no wait.
+	//   - send-done-during-drain: fdOps reads the unread first CQE's send as an
+	//     op (1), the drain reads that CQE in its first wait and then no longer
+	//     counts it (fdOpsSeen), so it ends after exactly one.
 	for _, tc := range []struct {
-		name string
-		reap bool
+		name       string
+		reap       bool
+		wantFDOps  int32
+		wantPasses int32
 	}{
-		{"notif-pending", true},
-		{"send-done-during-drain", false},
+		{"notif-pending", true, 0, 0},
+		{"send-done-during-drain", false, 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runtime.LockOSThread()
 			defer runtime.UnlockOSThread()
 			w, cs, _ := newZCCloseWorker(t)
 			sent := startZCSend(t, w, cs, tc.reap)
+			if got := fdOps(cs); got != tc.wantFDOps {
+				t.Fatalf("fdOps = %d before the drain, want %d", got, tc.wantFDOps)
+			}
+			passes := countShutdownWaits(t)
 			start := time.Now()
 			w.endOwedOpsAtShutdown()
 			took := time.Since(start)
+			wantDrainPasses(t, passes, tc.wantPasses)
 			t.Logf("celeris798 shutdown case=%s sent=%d took=%v kernelInflight_after=%d zcNotifPending_after=%v", tc.name, sent, took.Round(time.Microsecond), cs.kernelInflight, cs.zcNotifPending)
 			if took > zcShutdownBound {
 				t.Fatalf("endOwedOpsAtShutdown took %v (bound %v) with only a SEND_ZC notification owed", took, zcShutdownBound)

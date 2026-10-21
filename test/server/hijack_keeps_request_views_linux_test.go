@@ -98,7 +98,14 @@ const c733Secret = "SECRETSECRETSECRETSECRETSECRETSECRET"
 // pool inside the call, the same branch as the plain epoll arm (celeris#774:
 // that branch is where the request's receive buffer is dropped). Its
 // AsyncPromotedConns must stay 0, or the arm has become epoll-async and no
-// longer covers that branch.
+// longer covers that branch. /hj/:id and /w are marked Sync in this arm: a
+// route that inherits the AsyncHandlers default is adaptive (celeris#356), and
+// one inline run over 2 ms promotes it to async for 5 s, which under CPU load
+// (a descheduled event-loop thread) happens in a few percent of the runs and
+// sends the next hijacks through the other branch. The engine's branch does
+// not depend on how a route came to run inline, so Sync pins the same one.
+// /idle inherits the default and is never requested: it keeps the resolver
+// wired, as on a server that mixes routes.
 func TestHijackKeepsRequestViews(t *testing.T) {
 	type arm struct {
 		name          string
@@ -143,7 +150,13 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 				if a.asyncRoute {
 					rt.Async()
 				}
-				srv.GET("/w", func(c *celeris.Context) error { return c.String(200, "%d", c.WorkerID()) })
+				w := srv.GET("/w", func(c *celeris.Context) error { return c.String(200, "%d", c.WorkerID()) })
+				if a.asyncHandlers {
+					// See the epoll-asynchandlers paragraph of the doc comment.
+					rt.Sync()
+					w.Sync()
+					srv.GET("/idle", func(c *celeris.Context) error { return c.String(200, "idle") })
+				}
 				return srv
 			})
 			defer stopServer()
