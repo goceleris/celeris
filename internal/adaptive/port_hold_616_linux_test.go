@@ -114,7 +114,7 @@ func newGapEngine(t *testing.T, startEnv string, want engine.EngineType) (*Engin
 func newGapEngineWith(t *testing.T, startEnv string, want engine.EngineType, edit func(*resource.Config)) (*Engine, string, int) {
 	t.Helper()
 	if want == engine.IOUring && !probe.Probe().IOUringTier.Available() {
-		t.Skip("io_uring unavailable here: cannot start adaptive on it")
+		skipOrFailUpswitch662(t, "io_uring unavailable here: cannot start adaptive on it")
 	}
 	t.Setenv("CELERIS_ADAPTIVE_START", startEnv)
 	cfg := resource.Config{
@@ -131,7 +131,7 @@ func newGapEngineWith(t *testing.T, startEnv string, want engine.EngineType, edi
 	}
 	if e.startType != want {
 		_ = e.Shutdown(context.Background())
-		t.Skipf("adaptive chose %v as its start engine, not %v (io_uring could not be built here)", e.startType, want)
+		skipOrFailUpswitch662(t, "adaptive chose %v as its start engine, not %v (io_uring could not be built here)", e.startType, want)
 	}
 	addr := e.cfg.Addr
 	_, portStr, err := net.SplitHostPort(addr)
@@ -420,7 +420,7 @@ func TestAdaptivePortHeldWildcard616(t *testing.T) {
 	for _, se := range startEngines {
 		t.Run(se.env, func(t *testing.T) {
 			if se.want == engine.IOUring && !probe.Probe().IOUringTier.Available() {
-				t.Skip("io_uring unavailable here: cannot start adaptive on it")
+				skipOrFailUpswitch662(t, "io_uring unavailable here: cannot start adaptive on it")
 			}
 			requireDualStack616(t, true) // it dials [::1]
 			t.Setenv("CELERIS_ADAPTIVE_START", se.env)
@@ -430,7 +430,7 @@ func TestAdaptivePortHeldWildcard616(t *testing.T) {
 			}
 			if e.startType != se.want {
 				_ = e.Shutdown(context.Background())
-				t.Skipf("adaptive chose %v as its start engine, not %v (io_uring could not be built here)", e.startType, se.want)
+				skipOrFailUpswitch662(t, "adaptive chose %v as its start engine, not %v (io_uring could not be built here)", e.startType, se.want)
 			}
 			addr := e.cfg.Addr
 			_, ps, err := net.SplitHostPort(addr)
@@ -587,7 +587,7 @@ func TestAdaptivePortHeldBesideTimeWait616(t *testing.T) {
 		for _, f := range forms {
 			t.Run(se.env+"/"+f.name, func(t *testing.T) {
 				if se.want == engine.IOUring && !probe.Probe().IOUringTier.Available() {
-					t.Skip("io_uring unavailable here: cannot start adaptive on it")
+					skipOrFailUpswitch662(t, "io_uring unavailable here: cannot start adaptive on it")
 				}
 				if f.wildcard {
 					requireDualStack616(t, true) // net.Listen gives [::]:P, dialled on [::1]
@@ -605,7 +605,7 @@ func TestAdaptivePortHeldBesideTimeWait616(t *testing.T) {
 				}
 				if e.startType != se.want {
 					_ = e.Shutdown(context.Background())
-					t.Skipf("adaptive chose %v as its start engine, not %v (io_uring could not be built here)", e.startType, se.want)
+					skipOrFailUpswitch662(t, "adaptive chose %v as its start engine, not %v (io_uring could not be built here)", e.startType, se.want)
 				}
 				handed := e.cfg.Addr
 				if handed != want {
@@ -677,7 +677,7 @@ func TestAdaptiveTimeWaitStealFailsLoudly616(t *testing.T) {
 	for _, se := range startEngines {
 		t.Run(se.env, func(t *testing.T) {
 			if se.want == engine.IOUring && !probe.Probe().IOUringTier.Available() {
-				t.Skip("io_uring unavailable here: cannot start adaptive on it")
+				skipOrFailUpswitch662(t, "io_uring unavailable here: cannot start adaptive on it")
 			}
 			t.Setenv("CELERIS_ADAPTIVE_START", se.env)
 			port := leaveTimeWait(t)
@@ -688,7 +688,7 @@ func TestAdaptiveTimeWaitStealFailsLoudly616(t *testing.T) {
 			}
 			if e.startType != se.want {
 				_ = e.Shutdown(context.Background())
-				t.Skipf("adaptive chose %v as its start engine, not %v (io_uring could not be built here)", e.startType, se.want)
+				skipOrFailUpswitch662(t, "adaptive chose %v as its start engine, not %v (io_uring could not be built here)", e.startType, se.want)
 			}
 			thief, terr := net.Listen("tcp4", "127.0.0.2:"+ps)
 			stop, lerr := startAndServe(t, e)
