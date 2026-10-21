@@ -13,7 +13,7 @@ Thank you for your interest in contributing to celeris!
 
 ### Prerequisites
 
-- Go 1.27.2+ — the `go` directive in `go.mod` is the single source of truth for the floor, and
+- Go 1.27.3+ — the `go` directive in `go.mod` is the single source of truth for the floor, and
   CI pins the same version. Quote it from there rather than restating it here, so the two
   cannot drift apart again.
 - [Mage](https://magefile.org) build tool, at the version CI runs: `GOWORK=off go install -modfile=.github/tools/go.mod tool`,
@@ -87,7 +87,7 @@ syscalls:
 
 ```bash
 docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined \
-  -v "$PWD":/src -w /src golang:1.27.2 \
+  -v "$PWD":/src -w /src golang:1.27.3 \
   go test -race ./internal/engine/epoll/... ./internal/engine/iouring/...
 ```
 
