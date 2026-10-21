@@ -16,9 +16,8 @@ import (
 
 // rxHost is a fake /sys/class/net, /proc/irq and /proc/interrupts tree under
 // t.TempDir(), the interface table the net package would report, and a count
-// of the reads a plan did. The shape is the fixture of celeris#1062's
-// detection tests (internal/platform/nicirq_linux_test.go on fix/irqplace-1036),
-// under other names so that the two can sit side by side.
+// of the reads a plan did. The interrupt report's tests (nicirq_linux_test.go,
+// celeris#1062) build on it through nicHost.
 type rxHost struct {
 	t      testing.TB
 	root   string

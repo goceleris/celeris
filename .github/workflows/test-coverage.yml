@@ -90,7 +90,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
 
       # ci.yml's unit job takes `go list ./...` minus the pattern on its one
       # `go list ./... | grep -vE '...'` line, and runs ./internal/engine/iouring in a
@@ -310,7 +310,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       - name: Root package — shard tests with a coverage profile
         shell: bash
         env:
