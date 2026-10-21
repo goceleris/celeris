@@ -99,7 +99,7 @@ In-tree comparison modules run in isolation:
 - **Platforms.** Linux is the supported production platform: io_uring needs 5.19 or later, epoll 5.10 or later. macOS and Windows run the std engine and the drivers' portable fallback for development and testing; see [Platform support](#platform-support). Both x86-64 and arm64 are benchmarked and validated on a bare-metal cluster.
 - **Security.** Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
 
-### What's new in v1.6.0
+## What's new in v1.6.0
 
 A correctness and hardening release: most of it comes from what the [probatorium](https://github.com/goceleris/probatorium) matrix and the audits behind it found.
 
