@@ -1,0 +1,102 @@
+name: Release Rehearsal
+
+# Dry run of the release's sub-module pin move (celeris#619). It executes, against a
+# bare repository in a temp directory, the order a release uses: PrepRelease, the prep
+# commit, the root tag, release.yml's own "Create sub-module tags" step, then an
+# external consumer module per sub-module. Nothing is published and nothing is
+# pushed: the job has a read-only token and no step talks to this repository's
+# remote. See .github/scripts/pinmove-rehearsal.sh for every step and assertion.
+#
+# It runs on a pull request that touches a file the pin move is made of (the
+# script, release.yml, the release mage targets, internal/release, the sub-module
+# go.mod files that carry the pins, the mage tool pin), and by hand from the
+# Actions tab. It is not a required check. The version it rehearses is derived by
+# the script (mage RehearsalVersion) unless one is given by hand.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/scripts/pinmove-rehearsal.sh
+      - .github/workflows/release-rehearsal.yml
+      - .github/workflows/release.yml
+      - .github/tools/go.mod
+      - .github/tools/go.sum
+      - magefiles/**
+      - internal/release/**
+      - middleware/*/go.mod
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to rehearse (vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N); empty derives it from server.go and the release tags. Nothing is published
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-rehearsal-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  rehearse:
+    name: Rehearse the pin move
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The script clones this checkout into its own bare "remote" and needs
+          # the release tags in it.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Rehearse the pin move
+        env:
+          VERSION: ${{ inputs.version }}
+        run: .github/scripts/pinmove-rehearsal.sh "$VERSION" # empty: derived
+
+  # The assertion must be able to go red: the same script with PrepRelease skipped
+  # (the defect of celeris#619, sub-module tags on a tree whose pins still name
+  # the last release) has to fail, and fail on the celeris version a consumer
+  # resolves, not on some other breakage.
+  control:
+    name: Control (pins not moved must fail)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: The script goes red without the pin move
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          log="$RUNNER_TEMP/control.log"
+          rc=0
+          PINMOVE_SKIP_PREP=1 .github/scripts/pinmove-rehearsal.sh "$VERSION" >"$log" 2>&1 || rc=$?
+          tail -n 40 "$log"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::the rehearsal passed with the pin move skipped, so it would not catch the defect"
+            exit 1
+          fi
+          # Exit 1 is "an assertion failed"; anything else (2: a precondition, 130/143: a signal,
+          # a bash error) is the script breaking, which proves nothing about the defect. The red
+          # must be the one the defect causes: a consumer resolved the OLD celeris (a version,
+          # not an empty string from a network failure), and the script ran to its summary.
+          if [ "$rc" -ne 1 ] \
+            || ! grep -Eq "FAIL  .* does not pull celeris" "$log" \
+            || ! grep -Eq "celeris resolved to 'v[0-9]+\.[0-9]+\.[0-9]+[^']*', want " "$log" \
+            || ! grep -Eq "^pass=[0-9]+ fail=[1-9][0-9]* " "$log"; then
+            echo "::error::the rehearsal failed with the pin move skipped, but not on the celeris version a consumer resolves"
+            exit 1
+          fi
+          echo "control is red for the right reason (exit $rc)"
