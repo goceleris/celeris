@@ -29,7 +29,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
           # The api/ check type-checks the nested modules too, and apidump
           # builds from the tools module, so their go.sum files key the cache.
           cache-dependency-path: |
@@ -156,7 +156,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       # Excludes ./test/... to keep this job deterministic — those
       # suites (integration, spec, sustainedload) are timing-sensitive
       # on shared GitHub Actions runners and run locally / in the
@@ -1462,7 +1462,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       - name: Root package — shard tests (race, each must PASS by name)
         shell: bash
         env:
@@ -1515,7 +1515,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       # celeris#641: the default engine's own package ran in no CI job. It
       # needs two things the unit job does not give it.
       #
@@ -1813,7 +1813,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       # celeris#656: the three tests that pin the failed-worker listen-socket
       # leak ask for TWO io_uring workers on one port, and RLIMIT_MEMLOCK funds
       # one per 12 MiB (internal/engine/iouring/ring.go minMemlockPerWorker). GitHub
@@ -1957,7 +1957,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       # TestSendZCWindowGuardUnderRace holds the SEND_ZC first-CQE -> NOTIF
       # window open (internal/zcwindow.SetHold, -tags=validation only) while
       # the handler pushes 256 x 64 KiB frames at a steady pace to a client
@@ -2061,7 +2061,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       # The celeris#715 / celeris#685 trials (-tags=validation only; the
       # holds are internal/recvtheft). Each parks the worker that closed a
       # connection A with a recv still able to resolve A's descriptor number
@@ -2327,7 +2327,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       # A skip here is a hole in the matrix, not coverage (celeris#684): the
       # step fails on any `--- SKIP` line (the matrix skips nothing today).
       - name: Conformance matrix (engines × protocols)
@@ -2378,7 +2378,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       - name: Postgres conformance
         shell: bash
         run: |
@@ -2498,7 +2498,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       - name: Build root module
         run: go build ./...
       - name: Build middleware/compress
@@ -2535,7 +2535,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       - name: Build root module
         run: go build ./...
       # The whole module: packages whose files are all Linux-only (the engines,
@@ -2577,7 +2577,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       - name: Fallback and driver tests
         shell: bash
         run: |
@@ -2619,7 +2619,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
       # govulncheck is a `tool` of the separate .github/tools module, so the
       # version that runs is the one its go.mod names and its go.sum hashes
       # (Dependabot bumps it), not whatever @latest resolves to on the day.

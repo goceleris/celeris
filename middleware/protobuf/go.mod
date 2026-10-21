@@ -1,6 +1,6 @@
 module github.com/goceleris/celeris/middleware/protobuf
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/goceleris/celeris v1.5.11
