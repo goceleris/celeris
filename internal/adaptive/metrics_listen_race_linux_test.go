@@ -35,7 +35,7 @@ func TestMetricsDuringListenIsRaceFree(t *testing.T) {
 			Resources: resource.Resources{Workers: 2},
 		}, respHandler{}, nil)
 		if err != nil {
-			t.Skipf("adaptive engine unavailable: %v", err)
+			t.Fatalf("adaptive.New: %v", err)
 		}
 
 		// started closes after the reader's FIRST call and Listen waits on
