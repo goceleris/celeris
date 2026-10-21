@@ -124,12 +124,7 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 				}
 			}
 			// The "listening" line, not the plan's own line, which reads the plan.
-			listening := ""
-			for _, ln := range strings.Split(log.String(), "\n") {
-				if strings.Contains(ln, "engine listening") {
-					listening = ln
-				}
-			}
+			listening := listeningLine1036(t, &log)
 			if !strings.Contains(listening, fmt.Sprintf(" workers=%d", planLen)) {
 				t.Errorf("%s: the listening line does not say workers=%d:\n%s", tc.name, planLen, log.String())
 			}
@@ -148,5 +143,25 @@ func TestLoopCountIsThePlanLength1036(t *testing.T) {
 					tc.name, single, planLen, pintest.Off(running, base))
 			}
 		}()
+	}
+}
+
+// listeningLine1036 returns the engine's "engine listening" line, waiting up to
+// 10 s for it. Listen publishes the address (what start909 waits for) and logs
+// that line after it, so a caller that read the log the moment Addr() turned
+// non-nil could see a log without the line (celeris#1036: a CI run on a loaded
+// runner did). The line is whole once it is there: one Write per record.
+func listeningLine1036(t *testing.T, log *lockedBuf) string {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		for _, ln := range strings.Split(log.String(), "\n") {
+			if strings.Contains(ln, "engine listening") {
+				return ln
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("no \"engine listening\" line within 10 s of the address being published:\n%s", log.String())
+			return ""
+		}
 	}
 }

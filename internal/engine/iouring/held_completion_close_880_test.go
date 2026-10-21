@@ -295,9 +295,16 @@ func TestShutdownDoesNotWaitForAHeldSendZCFirstCompletion(t *testing.T) {
 	release := asyncGoroutine880(t, cs)
 	holdZCFirstCompletion880(t, w, cs)
 	defer release()
+	// The held first completion names no descriptor, so nothing is owed and the
+	// drain makes no wait (celeris#884 item 17).
+	if got := fdOps(cs); got != 0 {
+		t.Fatalf("fdOps = %d with the first completion held, want 0", got)
+	}
+	passes := countShutdownWaits(t)
 	start := time.Now()
 	w.endOwedOpsAtShutdown()
 	took := time.Since(start)
+	wantDrainPasses(t, passes, 0)
 	t.Logf("celeris880 SHUTDOWN held=%d took=%v closeFDOwed=%d", len(cs.heldSends), took.Round(time.Microsecond), w.closeFDOwed)
 	if took > zcShutdownBound {
 		t.Fatalf("endOwedOpsAtShutdown took %v (bound %v) with only a held SEND_ZC first completion owed", took, zcShutdownBound)

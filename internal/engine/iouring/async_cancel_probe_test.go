@@ -114,6 +114,20 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 					t.Errorf("the unexpected-answer record reads %q, want it to say the probe does not recognise the answer", msg)
 				}
 			}
+			// What the record says follows from the kernel: before 5.19 New
+			// refuses io_uring right after it (celeris#884 item 12), so there is
+			// no hand-off to warn about; from 5.19 the engine is built and the
+			// hand-off is what suffers.
+			if (tc.p == asyncCancelUnexpected || tc.p == asyncCancelNoAnswer) && len(recs) == 1 {
+				msg, _ := recs[0]["msg"].(string)
+				below := tc.major == 5 && tc.minor < 19
+				refusal := strings.Contains(msg, "5.19 or later") && strings.Contains(msg, "is not used")
+				handoff := strings.Contains(msg, "hand-off will not cancel")
+				if refusal != below || handoff == below {
+					t.Errorf("%v on kernel %d.%d logged %q: want the 5.19 refusal and no word of the hand-off before 5.19, the hand-off and no refusal from it",
+						tc.p, tc.major, tc.minor, msg)
+				}
+			}
 		}
 	})
 }

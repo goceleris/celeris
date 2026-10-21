@@ -60,7 +60,12 @@ import (
 //     SEND_ZC (prepSendSQE): its sends copy, and a copied send's unsent tail
 //     is the kernel's own socket memory, which the kernel bounds itself. The
 //     held bytes can then grow only by the SEND_ZCs already in flight on live
-//     connections, which the connection limit bounds.
+//     connections: at most one each, and one can be a whole response (of any
+//     size on HTTP/1, where an inline response has no cap; on HTTP/2 and on
+//     detached conns the 64 MiB write cap plus one write, since the cap tests
+//     the backlog before the append), so the connection limit bounds how many
+//     there are, not how many bytes. The bound is connections x their
+//     response size.
 //
 // Worker shutdown, whose ring teardown ends no such use of the pages either,
 // keeps every send buffer still owed for the life of the process
@@ -128,8 +133,13 @@ type zcHold struct {
 // slot counts it, so this is what bounds it. At or above it the worker's sends
 // copy, and a copied send's unsent tail is the kernel's own socket memory,
 // which its orphan and socket-memory limits bound. 16 MiB is some 2,000
-// held responses of 8 KiB per worker, far above the few a server closes on
-// peers that stopped reading mid-send, and a small share of memory.
+// held responses of 8 KiB per worker (an example size: a held send is a whole
+// response, so fewer if they are larger), far above the few a server closes
+// on peers that stopped reading mid-send, and a small share of memory. It is a
+// threshold on arming, not a ceiling: a send armed just under it can add a
+// whole response (of any size on HTTP/1; on HTTP/2 and detached conns the 64
+// MiB cap plus one write), and the SEND_ZCs already in flight add the
+// connections x their response size on top of it.
 const zcHoldBytesMax = 16 << 20
 
 // holdZCPastBackstop takes e, which the backstop found still owing a
@@ -183,7 +193,7 @@ func (w *Worker) holdZCPastBackstop(e *pendingReleaseEntry) {
 // releaseHeldConnState releases held cs, whose identity ce owes nothing but
 // SEND_ZC ops, while the hold keeps its send buffer's array: the kernel reads
 // nothing else of it (a SEND_ZC's SQE carries the array's address and
-// length; it is never a WRITEV, and nothing owed writes cs.buf). cs leaves
+// length; nothing owed writes cs.buf). cs leaves
 // the identity first, its slot set to nil so the number of conns the
 // collision rule reads is kept (noteStaleTerminalOp), and so no later CQE of
 // the identity writes into a connState the pool has handed on. A plain one

@@ -1,0 +1,24 @@
+=== RUN   TestAcceptAfterALongParkIsNotTimedOutEpoll
+--- PASS: TestAcceptAfterALongParkIsNotTimedOutEpoll (4.94s)
+=== RUN   TestAdoptAfterALongParkIsNotTimedOutEpoll
+--- PASS: TestAdoptAfterALongParkIsNotTimedOutEpoll (4.94s)
+=== RUN   TestLoopsPinInsideTheAllowedSet909
+        child| === RUN   TestLoopsPinInsideTheAllowedSet909
+        child| --- PASS: TestLoopsPinInsideTheAllowedSet909 (0.00s)
+--- PASS: TestLoopsPinInsideTheAllowedSet909 (1.02s)
+=== RUN   TestUnpinnedLoopsStayUnpinned909
+        child| === RUN   TestUnpinnedLoopsStayUnpinned909
+        child| --- PASS: TestUnpinnedLoopsStayUnpinned909 (0.00s)
+--- PASS: TestUnpinnedLoopsStayUnpinned909 (1.02s)
+=== RUN   TestFailedPinIsLoggedOnceAndNotPretended909
+        child| === RUN   TestFailedPinIsLoggedOnceAndNotPretended909
+        child| --- PASS: TestFailedPinIsLoggedOnceAndNotPretended909 (0.01s)
+--- PASS: TestFailedPinIsLoggedOnceAndNotPretended909 (1.02s)
+ok  	github.com/goceleris/celeris/internal/engine/epoll	208.179s
+=== RUN   TestInlineHandlerChildKeepsTheProcessMask919
+        child| === RUN   TestInlineHandlerChildKeepsTheProcessMask919
+        child| === RUN   TestInlineHandlerChildKeepsTheProcessMask919/epoll
+        child| === RUN   TestInlineHandlerChildKeepsTheProcessMask919/io_uring
+        child| --- PASS: TestInlineHandlerChildKeepsTheProcessMask919 (0.11s)
+--- PASS: TestInlineHandlerChildKeepsTheProcessMask919 (1.18s)
+ok  	github.com/goceleris/celeris/test/server	235.796s

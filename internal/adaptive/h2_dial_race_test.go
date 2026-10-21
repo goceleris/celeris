@@ -89,7 +89,7 @@ func runOnce(t *testing.T, iter int) {
 	}
 	e, err := New(cfg, &h2PrefaceHandler{}, nil)
 	if err != nil {
-		t.Skipf("iter %d: adaptive engine unavailable: %v", iter, err)
+		skipOrFailUpswitch662(t, "iter %d: adaptive engine unavailable: %v", iter, err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)

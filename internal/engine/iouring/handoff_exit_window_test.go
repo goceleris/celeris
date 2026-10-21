@@ -4,6 +4,7 @@ package iouring
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -89,6 +90,22 @@ func landReaps(t *testing.T, f *fdlFixture, step string) int {
 	return reaps
 }
 
+// exitDeferredOf is how often the worker-side hand-off sites left an exiting
+// conn to its exit (handoffLossStats.exitDeferred). The arms below assert it,
+// so they stay non-vacuous: an arm that no longer reaches the branch (the
+// fixture drifted, or the conn was handed off before it) fails on it instead of
+// passing on "nothing was handed off" alone (celeris#884 item 30).
+func exitDeferredOf(f *fdlFixture) uint64 { return f.e.metrics.handoffLoss.exitDeferred.Load() }
+
+// wantExitDeferred fails the test unless the exiting-conn branches were
+// reached exactly want times.
+func wantExitDeferred(t *testing.T, f *fdlFixture, site string, want uint64) {
+	t.Helper()
+	if n := exitDeferredOf(f); n != want {
+		t.Errorf("%s: exitDeferred = %d, want %d (the hand-off sites did not reach the exiting-conn branch as often as the arm drives them)", site, n, want)
+	}
+}
+
 // strangerOnTheNumber models the next accept on this worker reusing the
 // descriptor number a hand-off closed: a live connState on a real socket,
 // dup'd onto that number so the test does not depend on which free number the
@@ -138,6 +155,7 @@ func TestReapRerunLeavesAnExitingDispatchToItsExit(t *testing.T) {
 		if f.w.conns[f.fd] == f.cs {
 			t.Errorf("the queued close did not close the conn")
 		}
+		wantExitDeferred(t, f, "control: the retry at the head of the drain", 1)
 	})
 
 	t.Run("close_exit_retry_between_unlock_and_enqueue", func(t *testing.T) {
@@ -147,6 +165,7 @@ func TestReapRerunLeavesAnExitingDispatchToItsExit(t *testing.T) {
 		f.w.drainDetachQueue() // the retry runs; the exit's entry is not on the queue yet
 		reaps := landReaps(t, f, "the retry")
 		handed := f.tgt.adopted.Load()
+		wantExitDeferred(t, f, "close exit, retry", 1)
 		var stranger *connState
 		if f.w.conns[f.fd] == nil {
 			stranger = strangerOnTheNumber(t, f)
@@ -179,6 +198,7 @@ func TestReapRerunLeavesAnExitingDispatchToItsExit(t *testing.T) {
 		f.w.drainDetachQueue() // the retry runs; the exit's entry is not on the queue yet
 		reaps := landReaps(t, f, "the retry")
 		handed := f.tgt.adopted.Load()
+		wantExitDeferred(t, f, "h2c exit, retry", 1)
 		f.cs.asyncH2Promoted.Store(true) // the exit's store after the unlock
 		f.w.enqueueDetach(f.cs)
 		f.w.drainDetachQueue() // asyncH2Promoted -> h2Conns += cs.fd; markDirty(cs)
@@ -192,6 +212,15 @@ func TestReapRerunLeavesAnExitingDispatchToItsExit(t *testing.T) {
 			t.Errorf("celeris#780: the queued asyncH2Promoted entry then put the handed-off connState on the "+
 				"dirty list and fd %d on h2Conns", f.fd)
 		}
+		// The exit's own entry then did what it is for: the conn kept its slot
+		// and its fd went on the H2 list, where a hand-off would have emptied
+		// the slot (celeris#884 item 28).
+		if f.w.conns[f.fd] != f.cs {
+			t.Errorf("the h2c-exit conn lost its slot (conns[%d] = %p, want %p)", f.fd, f.w.conns[f.fd], f.cs)
+		}
+		if !slices.Contains(f.w.h2Conns, f.fd) {
+			t.Errorf("h2Conns = %v after the exit's entry was drained, want it to hold fd %d", f.w.h2Conns, f.fd)
+		}
 		if f.cs.dirty {
 			f.w.removeDirty(f.cs)
 		}
@@ -203,9 +232,16 @@ func TestReapRerunLeavesAnExitingDispatchToItsExit(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		exit func(*fdlFixture)
+		h2c  bool
+		// deferred is how often the landing's CQE reaches an exiting-conn
+		// branch: reapOutcome's rerunHandOff, and for the close exit also
+		// the tryTransplant processCQE runs after handleRecv (its async
+		// branch refuses asyncClosed; an H2C conn is refused by its protocol
+		// gate further down, which is not a counted branch).
+		deferred uint64
 	}{
-		{"close_exit_reap_lands_before_the_drain", closeExitUpToUnlock},
-		{"h2c_exit_reap_lands_before_the_drain", h2cExitUpToUnlock},
+		{"close_exit_reap_lands_before_the_drain", closeExitUpToUnlock, false, 2},
+		{"h2c_exit_reap_lands_before_the_drain", h2cExitUpToUnlock, true, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := exitWindowFixture(t)
@@ -220,6 +256,50 @@ func TestReapRerunLeavesAnExitingDispatchToItsExit(t *testing.T) {
 			if handed != 0 {
 				t.Errorf("celeris#780: a conn whose goroutine had exited (%s) was handed off %d time(s) at a reap "+
 					"landing", tc.name, handed)
+			}
+			wantExitDeferred(t, f, tc.name+", landing", tc.deferred)
+			// Left to its exit, not handed off: the conn keeps its slot and,
+			// as reapOutcome does for any conn the hand-off left in place, has
+			// its recv back (celeris#884 item 28). The recv assertions and
+			// the counts above pin today's reapOutcome on purpose (the
+			// re-arm of a conn that is about to be closed is what a mutant
+			// that drops it turns red on); if a change stops re-arming such
+			// a conn, or counts the exit once less, update them with it and
+			// do not read the failure as a lost conn.
+			if f.w.conns[f.fd] != f.cs {
+				t.Fatalf("the conn lost its slot at the landing (conns[%d] = %p, want %p)", f.fd, f.w.conns[f.fd], f.cs)
+			}
+			if !f.cs.recvArmed {
+				t.Errorf("recvArmed = false after the landing, want the recv re-armed")
+			}
+			recvs := 0
+			for _, s := range takeSQEs(f.w.ring) {
+				if s.op == opRECV && s.fd == int32(f.fd) {
+					recvs++
+				}
+			}
+			if recvs != 1 {
+				t.Errorf("the landing placed %d RECV SQE(s) for fd %d, want 1", recvs, f.fd)
+			}
+			// The exit's queued entry, drained after the landing, acts on the
+			// conn that is still here.
+			if tc.h2c {
+				f.cs.asyncH2Promoted.Store(true) // the exit's store after the unlock
+			}
+			f.w.enqueueDetach(f.cs)
+			f.w.drainDetachQueue()
+			if tc.h2c {
+				if f.w.conns[f.fd] != f.cs {
+					t.Errorf("the h2c-exit conn lost its slot after its entry (conns[%d] = %p, want %p)", f.fd, f.w.conns[f.fd], f.cs)
+				}
+				if !slices.Contains(f.w.h2Conns, f.fd) {
+					t.Errorf("h2Conns = %v after the exit's entry was drained, want it to hold fd %d", f.w.h2Conns, f.fd)
+				}
+				if f.cs.dirty {
+					f.w.removeDirty(f.cs)
+				}
+			} else if f.w.conns[f.fd] == f.cs {
+				t.Errorf("the queued close did not close the conn after its entry was drained")
 			}
 		})
 	}
@@ -249,6 +329,7 @@ func TestTryTransplantLeavesAClosingAsyncConnAlone(t *testing.T) {
 			f.startDrain()
 			closeExitUpToUnlock(f)
 			f.w.tryTransplant(f.fd) // a completion of the conn, in the exit's window
+			wantExitDeferred(t, f, "tryTransplant, "+name, 1)
 			reaps := landReaps(t, f, name)
 			handed := f.tgt.adopted.Load()
 			var stranger *connState
@@ -273,6 +354,43 @@ func TestTryTransplantLeavesAClosingAsyncConnAlone(t *testing.T) {
 			if stranger != nil && f.w.conns[f.fd] == stranger {
 				f.w.conns[f.fd] = nil
 				_ = unix.Close(f.fd)
+			}
+		})
+	}
+}
+
+// BenchmarkRerunHandOffExiting measures rerunHandOff's exiting-conn branch: the
+// three atomic loads and the mutex round-trip under asyncInMu a promoted async
+// conn costs on the reap-retry and reap-landing sites, plus the exitDeferred
+// note (celeris#884 item 30). Those sites run only while an io_uring->epoll
+// drain is set, never on the per-request path, so this is a bound on a cold
+// path, not a hot-path number. A hand-built Worker and connState, not an
+// fdlFixture: its helpers take a *testing.T and a ring. Each arm checks the
+// counter at the end, so a tree that stops reaching the branch (and would here
+// time the no-exit path or run finishAsyncTransplant) fails instead of timing
+// something else.
+func BenchmarkRerunHandOffExiting(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		exit func(*connState)
+	}{
+		{"close_exit", func(cs *connState) { cs.asyncClosed.Store(true) }},
+		{"h2c_exit", func(cs *connState) { cs.protocol.Store(int32(engine.H2C)) }},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			w := &Worker{async: true, handoffLoss: &handoffLossStats{}}
+			cs := &connState{fd: 7}
+			cs.asyncPromoted.Store(true)
+			cs.protocol.Store(int32(engine.HTTP1))
+			tc.exit(cs)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				w.rerunHandOff(7, cs)
+			}
+			b.StopTimer()
+			if got := w.handoffLoss.exitDeferred.Load(); got != uint64(b.N) {
+				b.Fatalf("exitDeferred = %d after %d calls: the benchmark did not run the exiting branch", got, b.N)
 			}
 		})
 	}

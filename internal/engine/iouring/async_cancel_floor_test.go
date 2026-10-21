@@ -116,6 +116,12 @@ var cancelForms682 = []cancelForm682{
 // to 500 ms for the recv's own completion. The recv is cancelled when that
 // completion is -ECANCELED. Otherwise the cancel's own result says why (a
 // kernel before 5.19 answers -EINVAL and the recv stays pending).
+//
+// The recv is ended before the ring and the buffer go, on every way out: a
+// t.Fatalf between its submit and the return runs the deferred closes, and a
+// ring closed with a recv armed leaves the kernel an op that writes into buf
+// (celeris#884 item 14). The deferred drain is registered after the closes so
+// that it runs before them.
 func runCancelForm682(t *testing.T, f cancelForm682) (cancelled bool, cancelRes int32, cancelSeen bool) {
 	t.Helper()
 	const recvUD, cancelUD = uint64(0x682_0001), uint64(0x682_0002)
@@ -130,20 +136,23 @@ func runCancelForm682(t *testing.T, f cancelForm682) (cancelled bool, cancelRes 
 	}
 	defer func() { _ = unix.Close(sp[0]); _ = unix.Close(sp[1]) }()
 	buf := make([]byte, 64)
+	armed := false
+	defer drainArmedRecv682(t.Errorf, ring, sp[1], recvUD, &armed, buf, time.Second)
 	sqe := ring.GetSQE()
 	prepRecv(sqe, sp[0], buf)
 	setSQEUserData(sqe, recvUD)
 	if _, err := ring.Submit(); err != nil {
 		t.Fatalf("submit the recv: %v", err)
 	}
+	armed = true
 	sqe = ring.GetSQE()
 	f.prep(sqe, recvUD, sp[0])
 	setSQEUserData(sqe, cancelUD)
 	if _, err := ring.Submit(); err != nil {
 		t.Fatalf("submit the cancel: %v", err)
 	}
-	recvRes, recvSeen := int32(0), false
-	for deadline := time.Now().Add(500 * time.Millisecond); !recvSeen && time.Now().Before(deadline); {
+	recvRes := int32(0)
+	for deadline := time.Now().Add(500 * time.Millisecond); armed && time.Now().Before(deadline); {
 		if err := ring.SubmitAndWaitTimeout(time.Until(deadline)); err != nil {
 			t.Fatalf("wait: %v", err)
 		}
@@ -152,20 +161,48 @@ func runCancelForm682(t *testing.T, f cancelForm682) (cancelled bool, cancelRes 
 			c := ring.cqeAt(head)
 			switch c.UserData {
 			case recvUD:
-				recvRes, recvSeen = c.Res, true
+				recvRes, armed = c.Res, false
 			case cancelUD:
 				cancelRes, cancelSeen = c.Res, true
 			}
 		}
 		ring.EndCQ(head)
 	}
-	if !recvSeen {
-		// Let the recv complete before the ring and the buffer go.
-		_, _ = unix.Write(sp[1], []byte("x"))
-		_ = ring.SubmitAndWaitTimeout(100 * time.Millisecond)
+	return !armed && recvRes == -int32(unix.ECANCELED), cancelRes, cancelSeen
+}
+
+// drainArmedRecv682 ends a recv armed on the other end of the socket pair
+// whose end wfd is, if *armed says one is: it writes a byte so the recv
+// completes, reaps the CQ until the recv's completion (user data recvUD) comes
+// or bound runs out, and clears *armed on the completion. buf is the recv's
+// buffer, kept alive until then. A recv that does not complete in bound is
+// reported through errf, which is t.Errorf here: this runs as a deferred call,
+// during the unwind of a t.Fatalf too, where t.Fatalf would end the unwind
+// halfway. It does nothing when no recv is armed.
+func drainArmedRecv682(errf func(format string, args ...any), ring *Ring, wfd int, recvUD uint64, armed *bool, buf []byte, bound time.Duration) {
+	defer runtime.KeepAlive(buf)
+	if !*armed {
+		return
 	}
-	runtime.KeepAlive(buf)
-	return recvSeen && recvRes == -int32(unix.ECANCELED), cancelRes, cancelSeen
+	if _, err := unix.Write(wfd, []byte("x")); err != nil {
+		errf("celeris682: drain write: %v", err)
+	}
+	for deadline := time.Now().Add(bound); *armed && time.Now().Before(deadline); {
+		if err := ring.SubmitAndWaitTimeout(time.Until(deadline)); err != nil {
+			errf("celeris682: drain wait: %v", err)
+			return
+		}
+		head, tail := ring.BeginCQ()
+		for ; head != tail; head++ {
+			if ring.cqeAt(head).UserData == recvUD {
+				*armed = false
+			}
+		}
+		ring.EndCQ(head)
+	}
+	if *armed {
+		errf("celeris682: the armed recv did not complete within %v of the drain's write", bound)
+	}
 }
 
 // TestIOUringOnTheRunningKernel682 checks New's decision against what the
@@ -326,5 +363,165 @@ func idleCloseOutcome682(t *testing.T, addr string) (outcome string, fin bool) {
 		return "no FIN in 3s", false
 	default:
 		return fmt.Sprintf("read n=%d err=%v", n, err), false
+	}
+}
+
+// armRecv682 is the private ring and socket pair of runCancelForm682 with a
+// recv armed on the pair's first end (user data recvUD): what the drain ends.
+type armRecv682 struct {
+	ring  *Ring
+	sp    [2]int
+	buf   []byte
+	armed bool
+}
+
+const drainRecvUD682 = uint64(0x682_0011)
+
+func newArmRecv682(t *testing.T, arm bool) *armRecv682 {
+	t.Helper()
+	ring, err := NewRing(8, 0, 0)
+	if err != nil {
+		skipOrFail656(t, "io_uring unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = ring.Close() })
+	sp, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(sp[0]); _ = unix.Close(sp[1]) })
+	r := &armRecv682{ring: ring, sp: sp, buf: make([]byte, 64)}
+	if arm {
+		sqe := ring.GetSQE()
+		prepRecv(sqe, sp[0], r.buf)
+		setSQEUserData(sqe, drainRecvUD682)
+		if _, err := ring.Submit(); err != nil {
+			t.Fatalf("submit the recv: %v", err)
+		}
+		r.armed = true
+	}
+	return r
+}
+
+// errs682 records what a drain reports, so a test can look at it.
+type errs682 struct{ msgs []string }
+
+func (e *errs682) errf(format string, args ...any) {
+	e.msgs = append(e.msgs, fmt.Sprintf(format, args...))
+}
+
+// TestDrainArmedRecv682EndsAnArmedRecv: with a recv armed, the drain writes
+// the byte it completes on, reaps the recv's completion and clears armed; it
+// reports nothing, and the recv's completion is no longer in the CQ ring.
+func TestDrainArmedRecv682EndsAnArmedRecv(t *testing.T) {
+	r := newArmRecv682(t, true)
+	var e errs682
+	t0 := time.Now()
+	drainArmedRecv682(e.errf, r.ring, r.sp[1], drainRecvUD682, &r.armed, r.buf, 5*time.Second)
+	if r.armed {
+		t.Fatalf("armed is still set after the drain: the recv's completion was not reaped")
+	}
+	if len(e.msgs) != 0 {
+		t.Fatalf("the drain reported %q for a recv it ended", e.msgs)
+	}
+	if head, tail := r.ring.BeginCQ(); head != tail {
+		t.Fatalf("%d completions are left in the CQ ring after the drain", tail-head)
+	}
+	if r.buf[0] != 'x' {
+		t.Fatalf("the recv's buffer holds %q, want the drain's byte: the recv completed without it", r.buf[:1])
+	}
+	t.Logf("drain ended the armed recv in %v", time.Since(t0))
+}
+
+// TestDrainArmedRecv682WithNothingArmedDoesNothing: runCancelForm682 clears
+// armed when the recv's completion is reaped in its own loop, and a t.Fatalf
+// before the recv's submit leaves it unset. The drain then writes nothing and
+// does not wait.
+func TestDrainArmedRecv682WithNothingArmedDoesNothing(t *testing.T) {
+	r := newArmRecv682(t, false)
+	var e errs682
+	t0 := time.Now()
+	drainArmedRecv682(e.errf, r.ring, r.sp[1], drainRecvUD682, &r.armed, r.buf, 5*time.Second)
+	if took := time.Since(t0); took > time.Second {
+		t.Fatalf("the drain with nothing armed took %v", took)
+	}
+	if len(e.msgs) != 0 {
+		t.Fatalf("the drain reported %q with nothing armed", e.msgs)
+	}
+	var b [8]byte
+	if n, err := unix.Read(r.sp[0], b[:]); err != unix.EAGAIN {
+		t.Fatalf("the peer read %d bytes (%v): the drain wrote with nothing armed", n, err)
+	}
+}
+
+// TestDrainArmedRecv682ReportsARecvThatDoesNotComplete: armed is set but the
+// ring holds no recv, so no completion comes. The drain gives up at its bound
+// and says so through errf, once, and leaves armed set.
+func TestDrainArmedRecv682ReportsARecvThatDoesNotComplete(t *testing.T) {
+	r := newArmRecv682(t, false)
+	r.armed = true
+	var e errs682
+	t0 := time.Now()
+	drainArmedRecv682(e.errf, r.ring, r.sp[1], drainRecvUD682, &r.armed, r.buf, 150*time.Millisecond)
+	took := time.Since(t0)
+	if len(e.msgs) != 1 || !strings.Contains(e.msgs[0], "did not complete") {
+		t.Fatalf("the drain reported %q, want one report that the recv did not complete", e.msgs)
+	}
+	if took < 100*time.Millisecond || took > 3*time.Second {
+		t.Fatalf("the drain gave up after %v, want about its 150ms bound", took)
+	}
+	if !r.armed {
+		t.Fatalf("armed was cleared with no completion seen")
+	}
+}
+
+// TestDrainArmedRecv682RunsWhenTheTestGoroutineExits is runCancelForm682's
+// shape with the earlier t.Fatalf played by runtime.Goexit, which unwinds the
+// deferred calls the same way: the ring and the socket pair are closed by
+// defers registered before the drain, and the drain, registered last, runs
+// first, so it finds the ring open and the recv armed, and ends it.
+func TestDrainArmedRecv682RunsWhenTheTestGoroutineExits(t *testing.T) {
+	var e errs682
+	var armedAtClose, drained bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ring, err := NewRing(8, 0, 0)
+		if err != nil {
+			e.errf("NewRing: %v", err)
+			return
+		}
+		defer func() { _ = ring.Close() }()
+		sp, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			e.errf("socketpair: %v", err)
+			return
+		}
+		defer func() { _ = unix.Close(sp[0]); _ = unix.Close(sp[1]) }()
+		buf := make([]byte, 64)
+		armed := false
+		defer func() {
+			drainArmedRecv682(e.errf, ring, sp[1], drainRecvUD682, &armed, buf, 5*time.Second)
+			drained = !armed
+		}()
+		sqe := ring.GetSQE()
+		prepRecv(sqe, sp[0], buf)
+		setSQEUserData(sqe, drainRecvUD682)
+		if _, err := ring.Submit(); err != nil {
+			e.errf("submit: %v", err)
+			return
+		}
+		armed = true
+		armedAtClose = true
+		runtime.Goexit() // what t.Fatalf does after the recv is armed
+	}()
+	<-done
+	if len(e.msgs) != 0 {
+		t.Fatalf("setup or drain reported %q", e.msgs)
+	}
+	if !armedAtClose {
+		t.Fatalf("setup: the goroutine did not reach Goexit with the recv armed")
+	}
+	if !drained {
+		t.Fatalf("the recv was still armed when the deferred closes ran: the ring would have been closed under it")
 	}
 }

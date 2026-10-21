@@ -43,8 +43,9 @@ func c733Get(conn net.Conn, br *bufio.Reader, path, auth string) (string, error)
 // c733DialWorker dials addr until the connection is served by the worker
 // whose ID is want (GET /w answers with c.WorkerID()), and returns it. A
 // worker ID of -1 (std) accepts the first connection. The connections that
-// land on another worker are closed.
-func c733DialWorker(t *testing.T, addr string, want int, auth string) (net.Conn, *bufio.Reader) {
+// land on another worker are closed. Each GET carries the celeris#936 stall
+// witness (c936Get); srv may be nil.
+func c733DialWorker(t *testing.T, srv *celeris.Server, addr string, want int, auth string) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	for try := 0; try < 64; try++ {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -53,9 +54,9 @@ func c733DialWorker(t *testing.T, addr string, want int, auth string) (net.Conn,
 		}
 		_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 		br := bufio.NewReader(conn)
-		body, err := c733Get(conn, br, "/w", auth)
+		body, err := c936Get(t, srv, addr, conn, br, "/w", auth)
 		if err != nil {
-			t.Fatalf("GET /w: %v", err)
+			t.Fatalf("GET /w (dial %d, want worker %d): %v", try, want, err)
 		}
 		if got, _ := strconv.Atoi(body); got == want || want < 0 {
 			return conn, br
@@ -90,19 +91,36 @@ const c733Secret = "SECRETSECRETSECRETSECRETSECRETSECRET"
 // Hijack, runs on the connection's dispatch goroutine, and epoll never pools
 // the state of a connection hijacked there (celeris#668). io_uring refuses
 // Hijack on an async worker (celeris#539), so it has no async arm.
+//
+// epoll-asynchandlers is Config.AsyncHandlers with no route marked Async. The
+// loop is async, but /hj runs inline on the event loop, in InlineMode, so
+// Hijack takes hijackConn's inline branch and the connState goes back to the
+// pool inside the call, the same branch as the plain epoll arm (celeris#774:
+// that branch is where the request's receive buffer is dropped). Its
+// AsyncPromotedConns must stay 0, or the arm has become epoll-async and no
+// longer covers that branch. /hj/:id and /w are marked Sync in this arm: a
+// route that inherits the AsyncHandlers default is adaptive (celeris#356), and
+// one inline run over 2 ms promotes it to async for 5 s, which under CPU load
+// (a descheduled event-loop thread) happens in a few percent of the runs and
+// sends the next hijacks through the other branch. The engine's branch does
+// not depend on how a route came to run inline, so Sync pins the same one.
+// /idle inherits the default and is never requested: it keeps the resolver
+// wired, as on a server that mixes routes.
 func TestHijackKeepsRequestViews(t *testing.T) {
 	type arm struct {
-		name       string
-		engine     celeris.EngineType
-		asyncRoute bool // mark /hj Async: the handler runs on the dispatch goroutine
+		name          string
+		engine        celeris.EngineType
+		asyncRoute    bool // mark /hj Async: the handler runs on the dispatch goroutine
+		asyncHandlers bool // Config.AsyncHandlers, no Async route: /hj runs inline on an async loop
 	}
 	arms := []arm{
-		{"std", celeris.Std, false},
-		{"epoll", celeris.Epoll, false},
-		{"epoll-async", celeris.Epoll, true},
+		{"std", celeris.Std, false, false},
+		{"epoll", celeris.Epoll, false, false},
+		{"epoll-async", celeris.Epoll, true, false},
+		{"epoll-asynchandlers", celeris.Epoll, false, true},
 	}
 	if ok, p := c714ProbeIOUring(t); ok {
-		arms = append(arms, arm{"io_uring", celeris.IOUring, false})
+		arms = append(arms, arm{"io_uring", celeris.IOUring, false, false})
 	} else if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 		t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids dropping the io_uring arm", p.IOUringTier, p.KernelVersion)
 	} else {
@@ -119,8 +137,9 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 	for _, a := range arms {
 		t.Run(a.name, func(t *testing.T) {
 			got := make(chan hijacked, 1)
+			var srv *celeris.Server // the server of the start that succeeded
 			addr, stopServer := startC714DetachServer(t, func() *celeris.Server {
-				srv := celeris.New(celeris.Config{Engine: a.engine, Workers: 2})
+				srv = celeris.New(celeris.Config{Engine: a.engine, Workers: 2, AsyncHandlers: a.asyncHandlers})
 				rt := srv.GET("/hj/:id", func(c *celeris.Context) error {
 					k := kept{param: c.Param("id"), header: c.Header("x-token"), path: c.Path()}
 					w := c.WorkerID()
@@ -131,7 +150,13 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 				if a.asyncRoute {
 					rt.Async()
 				}
-				srv.GET("/w", func(c *celeris.Context) error { return c.String(200, "%d", c.WorkerID()) })
+				w := srv.GET("/w", func(c *celeris.Context) error { return c.String(200, "%d", c.WorkerID()) })
+				if a.asyncHandlers {
+					// See the epoll-asynchandlers paragraph of the doc comment.
+					rt.Sync()
+					w.Sync()
+					srv.GET("/idle", func(c *celeris.Context) error { return c.String(200, "idle") })
+				}
 				return srv
 			})
 			defer stopServer()
@@ -162,8 +187,12 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 				// B: a new connection on A's worker, served while A's handler
 				// keeps its strings. Its Authorization value covers the
 				// offsets A's strings view.
-				b, br := c733DialWorker(t, addr, h.worker, c733Secret)
-				if _, err := c733Get(b, br, "/w", c733Secret); err != nil {
+				// Names the round (and the worker) in the test's log (go test
+				// prints it with -v, and with a failure's output), so the
+				// engine's AcceptCount and CloseCount in a c936 report map to it.
+				t.Logf("round %d: dialing worker %d", i, h.worker)
+				b, br := c733DialWorker(t, srv, addr, h.worker, c733Secret)
+				if _, err := c936Get(t, srv, addr, b, br, "/w", c733Secret); err != nil {
 					t.Fatalf("round %d: B: %v", i, err)
 				}
 				_ = b.Close()
@@ -182,6 +211,16 @@ func TestHijackKeepsRequestViews(t *testing.T) {
 				_ = ca.Close()
 			}
 			t.Logf("C733HIJACK arm=%s rounds=%d kept strings wrong=%d, holding B's Authorization bytes=%d", a.name, rounds, wrong, leaked)
+			if a.asyncHandlers {
+				// Read before the server stops. /hj never reached an async
+				// route, so no conn was promoted: it ran inline, which is
+				// the branch this arm is here for. (drainRead's second
+				// promotion site, a request split across two recvs, would
+				// also count; the client writes each request at once.)
+				if n := srv.EngineInfo().Metrics.AsyncPromotedConns; n != 0 {
+					t.Errorf("AsyncPromotedConns = %d, want 0: /hj did not run inline on the async loop, so this arm is not the inline-hijack branch it stands for", n)
+				}
+			}
 			if wrong > 0 {
 				t.Errorf("strings a hijacking handler kept changed after another connection was served: %d/%d (%d with its Authorization bytes); samples %q",
 					wrong, rounds, leaked, samples)
@@ -287,7 +326,7 @@ func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 	// twice its default conns per worker, raised to bufRingCountMin: 1024
 	// buffers (internal/engine/iouring resolveBufRingCount). Twice that many requests
 	// cycle it twice.
-	b, br := c733DialWorker(t, addr, h.worker, c733Secret)
+	b, br := c733DialWorker(t, nil, addr, h.worker, c733Secret)
 	defer func() { _ = b.Close() }()
 
 	// The control request, on A's worker, before the ring cycles.

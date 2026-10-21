@@ -2255,6 +2255,20 @@ func dispatchBusy(cs *connState, owe *bool) bool {
 	return busy
 }
 
+// testHookHijackReleased, when set, runs in hijackConn's inline branch on the
+// loop goroutine, right after releaseConnState has put cs back in the pool
+// and before the Hijack call returns to the handler: the window in which
+// another accept can take cs (celeris#885 item 6, #890 item 16). A
+// test acquires the pooled state there, normally on the P that just put it
+// (a preemption between Put and Get can move the goroutine to another P, and
+// sync.Pool then misses; the tests count their hits), to force that reuse
+// instead of waiting for it. The hook must not keep using cs as released
+// memory: it is the pool's now, so the test compares it with what the pool
+// hands back. An atomic pointer, as testHookCloseWhenFlushed is; one load per
+// inline hijack, which already makes an EPOLL_CTL_DEL and a net.FileConn
+// (itself a dup).
+var testHookHijackReleased atomic.Pointer[func(l *Loop, cs *connState)]
+
 func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	// l.conns access is guarded by driverMu: in async mode this runs on a
 	// dispatch goroutine, so the read of the header/slot must be serialized
@@ -2364,6 +2378,9 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 		// connState is next acquired.
 		cs.buf = nil
 		releaseConnState(cs)
+		if h := testHookHijackReleased.Load(); h != nil {
+			(*h)(l, cs)
+		}
 	}
 	return c, err
 }

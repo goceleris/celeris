@@ -42,7 +42,7 @@ func startClosingEngine876(t *testing.T, cfg resource.Config, body int) (*Engine
 	cfg.Resources = resource.Resources{Workers: 2}
 	e, err := New(cfg, &bigResponseHandler{bodySize: body})
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("epoll engine unavailable: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)
