@@ -2,34 +2,121 @@
   <img src=".github/cover.png" alt="celeris — the swift, load-bearing HTTP engine for Go">
 </p>
 
-# celeris
+<p align="center">
+  <a href="https://github.com/goceleris/celeris/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/goceleris/celeris/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status on main"></a>
+  <a href="https://codecov.io/gh/goceleris/celeris"><img src="https://codecov.io/gh/goceleris/celeris/graph/badge.svg" alt="Codecov test coverage"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/goceleris/celeris"><img src="https://api.scorecard.dev/projects/github.com/goceleris/celeris/badge" alt="OpenSSF Scorecard"></a>
+  <a href="https://www.bestpractices.dev/projects/15387"><img src="https://www.bestpractices.dev/projects/15387/badge" alt="OpenSSF Best Practices"></a>
+  <a href="https://pkg.go.dev/github.com/goceleris/celeris"><img src="https://pkg.go.dev/badge/github.com/goceleris/celeris.svg" alt="Go Reference"></a>
+  <a href="https://github.com/goceleris/celeris/releases/latest"><img src="https://img.shields.io/github/v/release/goceleris/celeris" alt="Latest release"></a>
+  <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/goceleris/celeris" alt="Go version from go.mod"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/goceleris/celeris" alt="License: Apache-2.0"></a>
+</p>
 
-[![CI](https://github.com/goceleris/celeris/actions/workflows/ci.yml/badge.svg)](https://github.com/goceleris/celeris/actions/workflows/ci.yml)
-[![Nightly Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml/badge.svg?branch=main)](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml?query=branch%3Amain)
-[![Weekend Soak](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml/badge.svg?branch=main)](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml?query=branch%3Amain)
-[![Go Reference](https://pkg.go.dev/badge/github.com/goceleris/celeris.svg)](https://pkg.go.dev/github.com/goceleris/celeris)
-[![Go Report Card](https://goreportcard.com/badge/github.com/goceleris/celeris)](https://goreportcard.com/report/github.com/goceleris/celeris)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15387/badge)](https://www.bestpractices.dev/projects/15387)
+<p align="center">
+  <strong>A Go HTTP engine on epoll and io_uring, with a route-group and middleware API in the spirit of Gin and Echo.</strong><br>
+  It serves HTTP/1.1 and cleartext HTTP/2 from per-core event loops, can switch between io_uring and epoll while it runs,
+  and ships PostgreSQL, Redis and memcached clients that run on the same loops as your handlers.
+</p>
 
-celeris is a high-throughput, load-bearing HTTP engine for Go, built on a protocol-aware dual architecture of io_uring and epoll. Its standout strength is throughput under load: across the [probatorium](https://github.com/goceleris/probatorium) cross-framework matrix it leads the field on driver-backed (PostgreSQL / Redis / memcached) and write-heavy workloads, sustaining the highest request rates while holding tail-latency SLOs — powered by first-party database drivers that run their socket I/O on the same event loop as your handlers. The API is a familiar route-group and middleware model in the spirit of Gin and Echo, so teams adopt it without learning a new programming model, with zero-allocation hot paths on the HTTP/1.1 and h2c fast paths.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#performance">Performance</a> ·
+  <a href="#status-and-stability">Status</a> ·
+  <a href="https://goceleris.dev">Documentation</a> ·
+  <a href="https://pkg.go.dev/github.com/goceleris/celeris">API reference</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-Full documentation lives at [goceleris.dev](https://goceleris.dev).
+## Why celeris
 
-## Highlights
+- **Event loops, not a goroutine per connection.** On Linux the native engines run pinned per-core loops on epoll (kernel 5.10+) or io_uring (5.19+). `Adaptive`, the Linux default, picks one at start and can move connections between the two as telemetry changes. The `Std` engine runs on `net/http` for development and for other operating systems.
+- **A familiar API.** Route groups, named parameters, middleware, error-returning handlers, and `celeris.Adapt` to reuse a `net/http` handler. 46 in-tree middleware packages cover auth, CORS, sessions, rate limiting, caching, compression, Prometheus and OpenTelemetry (see [Middleware](#middleware)).
+- **Database drivers on the same loop.** [`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis) and [`driver/memcached`](driver/memcached) issue their socket I/O from the event loop that serves your handler, with no CGo.
+- **Streaming is built in.** WebSocket with a fan-out `Hub`, Server-Sent Events with a `Broker`, `StreamWriter` and `Detach` (see [Streaming](#streaming-sse--websocket--chunked)).
+- **Allocation discipline.** Request contexts are pooled, the HTTP/1.1 parser aliases the bytes it parses, and the context paths that matter are held to zero allocations by tests (`celeristest/alloc_guard_test.go`, `context_test.go`). What your own handler allocates is yours.
+- **Small dependency surface.** The root module requires `golang.org/x/sys` and `golang.org/x/net` only.
+- **Tested adversarially.** The [probatorium](https://github.com/goceleris/probatorium) harness runs every reference app on every engine on a real x86 and arm64 cluster (see [Continuous validation](#continuous-validation)).
 
-- **io_uring and epoll at parity** — both native engines deliver equivalent throughput; an adaptive meta-engine picks and transplants between them at runtime.
-- **Inline broadcast egress** (v1.5.7) — WebSocket and SSE fan-out now writes inline on the dispatch goroutine on native engines, lifting the single-loop-thread broadcast ceiling.
-- **Zero hot-path allocations** on the HTTP/1.1 and h2c fast paths — pool-based contexts and pre-encoded HPACK responses.
-- **First-party event-loop drivers** — native PostgreSQL, Redis, and memcached clients that colocate socket I/O with your handlers, no CGo, no separate reactor.
-- **Continuously validated** — an adversarial [probatorium](https://github.com/goceleris/probatorium) cluster matrix runs nightly, plus a deeper weekend soak; see the badges above.
+## Quick start
 
-## What's new in v1.6.0
+```
+go get github.com/goceleris/celeris@latest
+```
 
-An engine-correctness release, driven by what the [probatorium](https://github.com/goceleris/probatorium) matrix found rather than by features. io_uring: the async-mode teardown and transplant paths were audited end to end and fixed (dead connection states left on the dirty list, a ring SEND still in flight when a connection was handed to epoll, short-submit accounting, detached-count drift, a pause/resume that armed a second recv and corrupted WebSocket streams, `Metrics` racing `Listen`), live heap retained on the refapp that serves both WebSocket and SSE, and a SEND_ZC probe that could never detect copy fallback. epoll: receive drains are bounded. All engines: bytes arriving on a detached connection are no longer parsed as a new request, detached WebSocket connections get a liveness bound, and the HTTP/2 worker pool no longer starves later streams once every worker holds a streaming handler. The std engine regained the h2c Upgrade handshake, so the three engines agree again, and `EnableH2Upgrade` now means the same on all of them: on `Protocol: H2C` the std engine upgrades an `Upgrade: h2c` request only with `EnableH2Upgrade: &true` (it used to by default), and on `Protocol: HTTP1` `&true` upgrades there too. Middleware: the rate limiter's eviction actually runs, `basicauth` hashes with a salt, and struct request binding with validation is new. Dependencies: `golang.org/x/net` 0.59. **Breaking:** the engine, protocol and driver codec packages moved under `internal/` and can no longer be imported; [Compatibility](GOVERNANCE.md#compatibility) says what is supported from v1.6.0 on.
+```go
+package main
+
+import (
+	"log"
+
+	"github.com/goceleris/celeris"
+)
+
+func main() {
+	s := celeris.New(celeris.Config{Addr: ":8080"})
+	s.GET("/hello", func(c *celeris.Context) error {
+		return c.String(200, "Hello, World!")
+	})
+	log.Fatal(s.Start())
+}
+```
+
+Requires **Go 1.27.3+** (the `go` directive in `go.mod` is the source of truth). The io_uring, epoll and adaptive engines need Linux; the std engine runs on any OS (see [Platform support](#platform-support)). Routing, middleware, configuration and the rest are below.
+
+## Performance
+
+<p align="center">
+  <img src=".github/benchmark.png" alt="Bar chart of saturation requests per second for plaintext GET at 1024 connections on linux/amd64: celeris 1,403,931, gnet 1,296,720, lithium 1,283,327, h2o 1,247,141, actix 1,208,346, with net/http at 646,425">
+</p>
+
+<p align="center"><em>Plaintext GET, 1024 connections, saturation requests per second, linux/amd64, best configuration per framework. One row of the published v1.5.8 results.</em></p>
+
+The numbers on this page come from [goceleris/probatorium](https://github.com/goceleris/probatorium)'s cross-framework matrix, driven by [`goceleris/loadgen`](https://github.com/goceleris/loadgen) from a separate host, and are published in [goceleris/docs](https://github.com/goceleris/docs/tree/main/results) and at [goceleris.dev](https://goceleris.dev/benchmarks/). The latest published run is **v1.5.8** (2026-08-29, loadgen v1.4.13): one 90 s run per cell after a 20 s warm-up, 52 server configurations from 10 languages and runtimes, up to 29 scenarios. **v1.6.0 has not been through that matrix yet**, and a single run has no error bars: treat a few percent as a tie.
+
+What that run supports, and what it does not:
+
+- **The chart's row.** Celeris's best configuration served 1,403,931 requests per second against 1,296,720 for gnet (+8%), the next framework, and 646,425 for `net/http` (2.2 times). Only the io_uring and adaptive configurations led; the epoll configurations served 1.21 to 1.22 million. On linux/arm64 the same row is a tie: 430,146 for celeris (epoll), 420,047 for gnet.
+- **Across rows, Go frameworks.** Against the best other Go framework (fiber, gin, echo, chi, iris, hertz) on the 20 rows where another Go framework ran, leaving out the HTTP/2 rows and `churn-close` (loadgen v1.4.14 fixed the clients behind them), celeris's best configuration was more than 5% ahead on 11 rows, within 5% on 8 and more than 5% behind on 1 on linux/amd64, and 11, 5 and 4 on linux/arm64.
+- **Database-backed rows are not a sweep.** On the 11 driver rows (PostgreSQL, Redis, memcached, sessions), celeris was ahead on 3, level on 7 and behind on 1 on amd64, and ahead on 2, level on 5 and behind on 4 on arm64. On arm64 the three memcached rows were at 0.68 to 0.87 of the best other Go framework; [#857](https://github.com/goceleris/celeris/issues/857) tracks that gap.
+- **The two native engines are close, not identical.** The median ratio of io_uring to epoll over the 27 shared scenarios was 0.99 on amd64 and 1.00 on arm64; single rows range from 0.61 to 1.34 on amd64.
+- **Not claimed.** There is no tail-latency ranking here: the rated passes carry known apparatus defects ([probatorium#441](https://github.com/goceleris/probatorium/issues/441), [#442](https://github.com/goceleris/probatorium/issues/442), [loadgen#102](https://github.com/goceleris/loadgen/issues/102)). The site's "fastest Go framework in N of M" count includes rows where no other Go framework ran ([docs#86](https://github.com/goceleris/docs/issues/86)), so it is not quoted.
+
+The 20-row and 11-row counts and every figure above are derived by [`analyze-published-results.py`](.github/scripts/analyze-published-results.py) from the published `summary.json` files; the chart is generated from the same files by [`benchmark-hero.py`](.github/scripts/benchmark-hero.py).
+
+In-tree comparison modules run in isolation:
+
+- [`test/drivercmp/`](test/drivercmp/) — PostgreSQL / Redis / memcached driver-isolation benchmarks (one module each).
+- [`test/benchcmp_ws/`](test/benchcmp_ws/) — WebSocket comparisons.
+- [`test/benchcmp_sse/`](test/benchcmp_sse/) — SSE broadcast (publish-to-N) comparisons.
+
+> **Note:** In-tree middleware benchmarks (e.g. `middleware/compress/bench_test.go`) use `celeristest`, which provides pool-based contexts with no HTTP overhead. Those numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use [probatorium](https://github.com/goceleris/probatorium) for fair cross-framework comparisons.
+
+## Status and stability
+
+- **Releases.** The latest tag is shown in the badge row. v1.6.0 is the first release with a written [compatibility promise](GOVERNANCE.md#compatibility): the exported API of the packages without an `internal` path element follows the [Go 1 compatibility promise](https://go.dev/doc/go1compat) within v1, and a CI check compares it with the golden files in [`api/`](api/). v1.6.0 itself breaks earlier releases (see below).
+- **Maturity.** celeris is a young project with one maintainer. Run it behind a TLS-terminating proxy, benchmark it on your own hardware and workload, and read the open issues of the [v1.6.0](https://github.com/goceleris/celeris/milestone/26) and [v1.7.0](https://github.com/goceleris/celeris/milestone/36) milestones for what is known to be missing, [TLS](https://github.com/goceleris/celeris/issues/446) first.
+- **Platforms.** Linux is the supported production platform: io_uring needs 5.19 or later, epoll 5.10 or later. macOS and Windows run the std engine and the drivers' portable fallback for development and testing; see [Platform support](#platform-support). Both x86-64 and arm64 are benchmarked and validated on a bare-metal cluster.
+- **Security.** Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
+
+### What's new in v1.6.0
+
+A correctness and hardening release: most of it comes from what the [probatorium](https://github.com/goceleris/probatorium) matrix and the audits behind it found.
+
+**Breaking** (the [pull request of the move](https://github.com/goceleris/celeris/pull/938) lists the migrations):
+
+- The minimum Go version is **1.27.2**.
+- The engine, protocol and driver codec packages moved under `internal/` and can no longer be imported; select an engine with `Config.Engine` and read counters as `celeris.EngineMetrics` or `observe.EngineMetrics`. Every deprecated public API was removed, `basicauth.HashPassword` included.
+- `Config.MaxRequestBodySize` defaults to 4 MiB, not 100 MB.
+- A handler that answers the request ends the chain, so a route that also matches a request a `Use`-mounted middleware answered no longer runs after it. `cache` and `swagger` options that defaulted to true are inverted (`DisableSingleflight`, `IgnoreCacheControl`, `DisablePKCE`). `otel` no longer records `server.address` as a metric attribute unless `MetricServerAddress` is set. `Start*Context` returns only after the shutdown a cancel triggers.
+
+**New:** `HEAD` is answered by the `GET` route and `OPTIONS` with an `Allow` list; unsatisfiable ranges answer 416 and `If-Range` is honoured; global middleware runs for requests no route matches; the drivers and their stores build and run on Windows through a portable `net.Conn` fallback; `api/` golden files make every API change visible in review; on big.LITTLE arm64 hosts the engines pin one loop per non-little CPU (see [CPU pinning](#feature-matrix)).
+
+**Fixed:** the io_uring teardown, transplant and driver paths, the epoll shutdown and park paths and the HTTP/2 connection limits were audited end to end; a detached connection whose peer takes none of its bytes is closed after `WriteTimeout`; the std engine no longer cuts an SSE stream at its timeouts, and `EnableH2Upgrade` means the same on every engine; `basicauth` hashes passwords with a salted PBKDF2.
+
 ## Features
 
-- **Tiered io_uring** — auto-selects the best io_uring feature set (multishot accept/recv, provided buffers, SQ poll, fixed files) for your kernel.
+- **Tiered io_uring** — probes the kernel at start and uses the feature set it supports (multishot accept from 5.19, SQ poll and zero-copy send from 6.0); multishot receive with provided buffers is opt-in (see the tuning variables).
 - **Edge-triggered epoll** — per-core event loops with CPU pinning.
 - **Adaptive meta-engine** — transplants between io_uring and epoll at runtime based on telemetry.
 - **First-party database drivers** — native [`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis), and [`driver/memcached`](driver/memcached) run on the celeris event loop (see [Database drivers](#database-drivers)).
@@ -54,32 +141,6 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 - **Per-route async dispatch** — `Route.Async()` / `Route.Sync()` choose inline-on-worker vs. per-conn dispatch goroutine per route; h2 chooses per stream.
 
 **TLS:** celeris is cleartext by design: TLS is terminated at the edge. The io_uring and epoll engines speak HTTP/1.1 and h2c only, and there is no `ListenTLS`. Terminate TLS upstream (Caddy, Nginx, Envoy, a cloud load balancer). If you need HTTPS in-process, run the std engine and pass a TLS listener: `Engine: celeris.Std` with `StartWithListener(tls.NewListener(ln, cfg))` serves HTTPS over HTTP/1.1, at the std engine's performance. The database drivers are cleartext too (see [Database drivers](#database-drivers)). First-class TLS is tracked in [#446](https://github.com/goceleris/celeris/issues/446).
-
-## Quick start
-
-```
-go get github.com/goceleris/celeris@latest
-```
-
-Requires **Go 1.27.3+** (the `go` directive in `go.mod` is the source of truth). Linux for the io_uring / epoll / adaptive engines; any OS for the std engine. On Windows the server (std engine) and the database drivers build and run for development and testing; Linux is the supported production platform (see [Platform support](#platform-support)).
-
-```go
-package main
-
-import (
-	"log"
-
-	"github.com/goceleris/celeris"
-)
-
-func main() {
-	s := celeris.New(celeris.Config{Addr: ":8080"})
-	s.GET("/hello", func(c *celeris.Context) error {
-		return c.String(200, "Hello, World!")
-	})
-	log.Fatal(s.Start())
-}
-```
 
 ## Routing
 
@@ -290,7 +351,7 @@ func stream(c *celeris.Context) error {
 
 ## Database drivers
 
-Celeris ships first-party, event-loop-native database drivers that run their socket I/O on the **same worker loop** as your HTTP handlers — no CGo, no separate reactor thread. They back the driver-isolation benchmarks and probatorium's driver-backed workloads, where celeris's dominance is widest.
+Celeris ships first-party, event-loop-native database drivers that run their socket I/O on the **same worker loop** as your HTTP handlers — no CGo, no separate reactor thread. They back the driver-isolation benchmarks and probatorium's driver-backed workloads.
 
 - **[`driver/postgres`](driver/postgres)** — speaks the PostgreSQL v3 wire protocol directly. Register it as a standard `database/sql` driver, or use the lower-level worker-affinity `Pool` to skip `database/sql` overhead.
 - **[`driver/redis`](driver/redis)** — RESP2 / RESP3 client (negotiates `HELLO 3` with automatic RESP2 fallback), per-worker connection pools, pub/sub, and Redis Cluster + Sentinel failover.
@@ -331,12 +392,12 @@ The bridge buffers the adapted handler's response in memory, capped at a compile
 
 | Engine | Platform | Use case |
 |--------|----------|----------|
-| `IOUring` | Linux 5.19+ | Lowest latency, highest throughput |
-| `Epoll` | Linux 5.10+ | Broad kernel support, proven stability |
+| `IOUring` | Linux 5.19+ | Completion-based I/O; one of the two native engines |
+| `Epoll` | Linux 5.10+ | Readiness-based I/O; broadest kernel support |
 | `Adaptive` | Linux 5.10+ | Auto-switch between io_uring and epoll on telemetry; epoll only below 5.19 |
 | `Std` | Any OS | Development, compatibility, non-Linux deploys |
 
-The default is **Adaptive** on Linux and **Std** elsewhere. Prefer Adaptive unless you have a specific reason to pin an engine; on non-Linux platforms only Std is available (the native engines return an error).
+The default is **Adaptive** on Linux and **Std** elsewhere. Prefer Adaptive unless you have a specific reason to pin an engine; on non-Linux platforms only Std is available (the native engines return an error). Neither native engine is the faster one everywhere: in the published v1.5.8 run the median io_uring-to-epoll throughput ratio was 0.99 on amd64 and 1.00 on arm64, but on the plaintext 1024-connection row io_uring led on amd64 and epoll on arm64 (see [Performance](#performance)).
 
 io_uring needs Linux 5.19 or later: every cancel the engine submits uses the `IORING_ASYNC_CANCEL` flags that release added, and an older kernel fails each one with `-EINVAL` ([#682](https://github.com/goceleris/celeris/issues/682)). The engine checks it at startup: a kernel version before 5.19 is refused outright (a partial vendor backport can pass a single probe cancel while its other cancel forms still fail), and from 5.19 a probe cancel that the kernel answers decides. Where the kernel version is below 5.19 or the kernel rejects the flags, `IOUring` fails to start with an error that names the requirement, and `Adaptive` runs on epoll (`CELERIS_ADAPTIVE_START=iouring` included).
 
@@ -424,37 +485,18 @@ A vector is checked only if it carries traffic: in the one read of `/proc/interr
 
 `StreamWriter()` performs synchronous incremental writes on every engine. Async `Detach()` — keeping the connection alive after the handler returns — is native-engines-only (`EngineSupportsAsyncDetach()` is false on std, which closes the conn when the handler returns).
 
-## Benchmarks
-
-<p align="center">
-  <img src=".github/benchmark.png" alt="Celeris has the highest throughput — plaintext GET at 1024 connections">
-</p>
-
-<p align="center"><em>Plaintext GET at 1024 connections, saturation req/s, linux/amd64.</em></p>
-
-celeris tops the plaintext-GET throughput leaderboard shown above — ahead of hand-tuned C, C++, Rust, and Java servers. Across the full published matrix (52 servers, 10 languages), the headline is **fastest Go framework in 26 of 29 scenarios**, sweeping the driver-backed database workloads. Benchmarks run on amd64; arm64 is fully validated in the nightly and weekend soak matrix but excluded from the benchmark target pending an upstream kernel NIC fix on the arm test board ([#312](https://github.com/goceleris/celeris/issues/312)). Full interactive results are at [goceleris.dev](https://goceleris.dev).
-
-The cross-framework matrix (scenario × server × protocol, driven by [`goceleris/loadgen`](https://github.com/goceleris/loadgen)) lives in [`goceleris/probatorium`](https://github.com/goceleris/probatorium), the authoritative bench harness; its `publish-results` workflow emits the release-gate numbers. In-tree comparison modules run in isolation:
-
-- [`test/drivercmp/`](test/drivercmp/) — PostgreSQL / Redis / memcached driver-isolation benchmarks (one module each).
-- [`test/benchcmp_ws/`](test/benchcmp_ws/) — WebSocket comparisons.
-- [`test/benchcmp_sse/`](test/benchcmp_sse/) — SSE broadcast (publish-to-N) comparisons.
-
-> **Note:** In-tree middleware benchmarks (e.g. `middleware/compress/bench_test.go`) use `celeristest`, which provides pool-based contexts with no HTTP overhead. Those numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use [probatorium](https://github.com/goceleris/probatorium) for fair cross-framework comparisons.
-
 ## Continuous validation
 
-Correctness is validated by [`goceleris/probatorium`](https://github.com/goceleris/probatorium), an adversarial cluster matrix run on real hardware:
+Correctness is judged by [`goceleris/probatorium`](https://github.com/goceleris/probatorium), an adversarial matrix on a three-host cluster (x86-64 and arm64): every reference app (8, covering the middleware, streaming and the drivers) on every engine (`iouring`, `epoll`, `std`, `adaptive`) on both architectures, 64 cells per full matrix. Each cell takes session-shaped traffic, malformed HTTP/1.1, h2c-upgrade churn, WebSocket frame torture and killed SSE streams, while a per-second property loop checks invariants such as connection accounting, heap, goroutine and RSS growth, and unexpected panics.
 
-- **PR tier** (`matrix-pr-tier`) — fast gate that every celeris PR must pass before merge.
-- **Nightly** (`matrix-nightly-tier`) — 24 cells across every refapp × every engine, exercising every protocol slice per cell; ~1h budget, every night.
-- **Weekend soak** (`matrix-weekend-tier`) — the same matrix at higher request counts for multi-hour endurance.
-
-Bug oracles include slowloris hang detection, malformed-request acceptance, WebSocket torture-frame acceptance, h2c churn-crash detection, and tier-3 property seeds. Badge status is above.
+- **Nightly** (`matrix-nightly-tier`) and **Weekend soak** (`matrix-weekend-tier`, 24 h) run the full matrix; **Race** and **Checkptr** rebuild the reference apps with `-race` and the pointer checker; the **PR tier** (`matrix-pr-tier`) is a 10-minute matrix that runs on a pull request only when a maintainer labels it `cluster-ok`.
+- **The tiers are dispatched by hand.** Their schedules have been paused since 2026-09-15 to keep the cluster free for the v1.6.0 release validation, so there is no nightly cadence and no badge for them here. The latest runs and what each keeps are listed under [where the latest results live](https://github.com/goceleris/probatorium#where-the-latest-results-live).
+- **On every celeris pull request**, the required checks are Lint (which includes the `api/` golden-file check), Unit (the root module and the nested modules under `-race`), Conformance (the engines-by-protocols matrix in `test/conformance`), Driver Conformance against real PostgreSQL and Redis, Build on Linux and macOS, and a vulnerability check. Coverage, CodeQL and OpenSSF Scorecard also run on every push to `main`.
 
 ## Project structure
 
 ```
+api/            Golden files of the exported API, checked in CI
 celeristest/    Test helpers (NewContext, NewContextT, ResponseRecorder, With* options)
 cmd/celeris/    CLI launcher — validation / diagnostics entrypoint (see below)
 driver/         First-party event-loop database drivers (postgres, redis, memcached)
@@ -466,6 +508,7 @@ internal/       Importable only under github.com/goceleris/celeris/:
   protocol/       Protocol parsers (h1, h2, detect)
   resource/       Configuration, presets, defaults
   ...             Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts, testhooks)
+magefiles/      Mage targets (build, test and release tasks)
 middleware/     In-tree middleware ecosystem (46 importable packages)
 observe/        Collector, CPUMonitor, Snapshot, EngineMetrics
 test/           Conformance, spec compliance, integration, benchmarks (drivercmp, benchcmp_ws, benchcmp_sse)
@@ -482,7 +525,7 @@ validation/     Runtime invariant assertions + validation hooks (debug builds)
 - **Windows**: development and testing only, with the std engine and the portable driver fallback; see [Platform support](#platform-support)
 - Direct runtime dependencies: `golang.org/x/sys` and `golang.org/x/net` only (`golang.org/x/text` is indirect)
 
-## Ecosystem
+## Related projects
 
 Celeris is one of the [goceleris](https://github.com/goceleris) family:
 
