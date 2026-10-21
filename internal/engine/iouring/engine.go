@@ -471,7 +471,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		}
 	}
 	// Every worker has pinned (or failed to) before it reported ready.
-	platform.LogPinOutcome(e.cfg.Logger, "io_uring", plan, takePinFailures(workers))
+	platform.LogPinOutcome(e.cfg.Logger, "io_uring", nicIRQReport(e.cfg.Logger, plan, e.cfg.Addr), takePinFailures(workers))
 
 	// celeris#639: publish an address a worker recorded before it signalled
 	// ready, never getsockname on a listenFD the worker may have closed since,
