@@ -72,12 +72,12 @@ Requires **Go 1.27.3+** (the `go` directive in `go.mod` is the source of truth).
 
 <p align="center"><em>Plaintext GET, 1024 connections, saturation requests per second, linux/amd64, best configuration per framework. One row of the published v1.5.8 results.</em></p>
 
-The numbers on this page come from [goceleris/probatorium](https://github.com/goceleris/probatorium)'s cross-framework matrix, driven by [`goceleris/loadgen`](https://github.com/goceleris/loadgen) from a separate host, and are published in [goceleris/docs](https://github.com/goceleris/docs/tree/main/results) and at [goceleris.dev](https://goceleris.dev/benchmarks/). The latest published run is **v1.5.8** (2026-08-29, loadgen v1.4.13): one 90 s run per cell after a 20 s warm-up, 52 server configurations from 10 languages and runtimes, up to 29 scenarios. **v1.6.0 has not been through that matrix yet**, and a single run has no error bars: treat a few percent as a tie.
+The numbers on this page come from [goceleris/probatorium](https://github.com/goceleris/probatorium)'s cross-framework matrix, driven by [`goceleris/loadgen`](https://github.com/goceleris/loadgen) from a separate host, and are published in [goceleris/docs](https://github.com/goceleris/docs/tree/main/results) and at [goceleris.dev](https://goceleris.dev/benchmarks/); the [methodology page](https://goceleris.dev/methodology/) says how they are made. The latest published run is **v1.5.8** (2026-08-29, loadgen v1.4.13): one 90 s run per cell after a 20 s warm-up, 52 server configurations from 10 languages and runtimes, up to 29 scenarios. **v1.6.0 has not been through that matrix yet**, and a single run has no error bars: treat a few percent as a tie.
 
 What that run supports, and what it does not:
 
 - **The chart's row.** Celeris's best configuration served 1,403,931 requests per second against 1,296,720 for gnet (+8%), the next framework, and 646,425 for `net/http` (2.2 times). Only the io_uring and adaptive configurations led; the epoll configurations served 1.21 to 1.22 million. On linux/arm64 the same row is a tie: 430,146 for celeris (epoll), 420,047 for gnet.
-- **Across rows, Go frameworks.** Against the best other Go framework (fiber, gin, echo, chi, iris, hertz) on the 20 rows where another Go framework ran, leaving out the HTTP/2 rows and `churn-close` (loadgen v1.4.14 fixed the clients behind them), celeris's best configuration was more than 5% ahead on 11 rows, within 5% on 8 and more than 5% behind on 1 on linux/amd64, and 11, 5 and 4 on linux/arm64.
+- **Across rows, Go frameworks.** Against the best other Go framework (fiber, gin, echo, chi, iris, hertz) on the 20 rows where another Go framework ran, leaving out the HTTP/2 rows and `churn-close` (loadgen v1.4.14 fixed the clients behind them), celeris's best configuration was more than 5% ahead on 11 rows, within 5% on 8 and more than 5% behind on 1 on linux/amd64, and 11, 5 and 4 on linux/arm64 (the 5% band is a convention, not a confidence interval).
 - **Database-backed rows are not a sweep.** On the 11 driver rows (PostgreSQL, Redis, memcached, sessions), celeris was ahead on 3, level on 7 and behind on 1 on amd64, and ahead on 2, level on 5 and behind on 4 on arm64. On arm64 the three memcached rows were at 0.68 to 0.87 of the best other Go framework; [#857](https://github.com/goceleris/celeris/issues/857) tracks that gap.
 - **The two native engines are close, not identical.** The median ratio of io_uring to epoll over the 27 shared scenarios was 0.99 on amd64 and 1.00 on arm64; single rows range from 0.61 to 1.34 on amd64.
 - **Not claimed.** There is no tail-latency ranking here: the rated passes carry known apparatus defects ([probatorium#441](https://github.com/goceleris/probatorium/issues/441), [#442](https://github.com/goceleris/probatorium/issues/442), [loadgen#102](https://github.com/goceleris/loadgen/issues/102)). The site's "fastest Go framework in N of M" count includes rows where no other Go framework ran ([docs#86](https://github.com/goceleris/docs/issues/86)), so it is not quoted.
@@ -112,7 +112,7 @@ A correctness and hardening release: most of it comes from what the [probatorium
 
 **New:** `HEAD` is answered by the `GET` route and `OPTIONS` with an `Allow` list; unsatisfiable ranges answer 416 and `If-Range` is honoured; global middleware runs for requests no route matches; the drivers and their stores build and run on Windows through a portable `net.Conn` fallback; `api/` golden files make every API change visible in review; on big.LITTLE arm64 hosts the engines pin one loop per non-little CPU (see [CPU pinning](#feature-matrix)).
 
-**Fixed:** the io_uring teardown, transplant and driver paths, the epoll shutdown and park paths and the HTTP/2 connection limits were audited end to end; a detached connection whose peer takes none of its bytes is closed after `WriteTimeout`; the std engine no longer cuts an SSE stream at its timeouts, and `EnableH2Upgrade` means the same on every engine; `basicauth` hashes passwords with a salted PBKDF2.
+**Fixed:** the io_uring teardown, transplant and driver paths and the epoll shutdown and park paths were audited and corrected; the native HTTP/2 connection bounds refusals, PRIORITY placeholders, header-block fragments and frame sizes; a detached connection whose peer takes none of its bytes is closed after `WriteTimeout`; the std engine no longer cuts an SSE stream at its timeouts, and `EnableH2Upgrade` means the same on every engine; `basicauth` hashes passwords with a salted PBKDF2.
 
 ## Features
 
@@ -307,7 +307,7 @@ Observe how often the inline → goroutine handoff fires via `Server.EngineInfo(
 
 ## Streaming (SSE / WebSocket / chunked)
 
-Streaming is a first-class differentiator, and native engines get an inline egress path that avoids funneling every write through one loop thread. Four building blocks compose:
+Streaming is a first-class feature, and native engines get an inline egress path that avoids funneling every write through one loop thread. Four building blocks compose:
 
 - **`Context.StreamWriter()`** — synchronous incremental writes (chunked / progressive responses). Works on **every** engine, including std.
 - **`Context.Detach()`** — keep the connection alive after the handler returns, so a spawned goroutine can drive a long-lived stream. This is **native-engine only** (io_uring / epoll / adaptive). On std, the connection closes the moment the handler returns.
