@@ -31,7 +31,7 @@ func (e *Engine) StartTransplant(target engine.TransplantTarget) {
 		return
 	}
 	ts := &transplantState{target: target}
-	for _, l := range e.loops {
+	for _, l := range e.loopSnapshot() {
 		l.transplant.Store(ts)
 		// Start the sweep now, not at this loop's next event (celeris#657
 		// P7). A standby loop with no listen socket and only idle
@@ -44,7 +44,7 @@ func (e *Engine) StartTransplant(target engine.TransplantTarget) {
 // StopTransplant halts any in-progress drain (#383). Called when the adaptive
 // engine reverts to epoll, so freshly-accepted conns are not migrated away.
 func (e *Engine) StopTransplant() {
-	for _, l := range e.loops {
+	for _, l := range e.loopSnapshot() {
 		l.transplant.Store(nil)
 	}
 }

@@ -281,14 +281,34 @@ func (e *Engine) Sendfile(fdOut int, file *os.File, offset, length int64, header
 	return sendfileH1(fdOut, file, offset, length, headers)
 }
 
+// loopSnapshot returns the loops Listen published, or nil before it has.
+//
+// Listen assigns e.loops and fills it under e.mu, so a reader that does not
+// hold e.mu races with it, and can also see the slice before its elements are
+// set (a nil *Loop). Every accessor that can run on another goroutine while
+// Listen starts (Metrics, AdoptConn, StartTransplant, StopTransplant) reads
+// the slice through here. The slice is never mutated once published, so the
+// caller may range over the result without the lock. One uncontended lock
+// per call; none of its callers is on the request path.
+func (e *Engine) loopSnapshot() []*Loop {
+	e.mu.Lock()
+	loops := e.loops
+	e.mu.Unlock()
+	return loops
+}
+
 // Metrics returns a snapshot of engine metrics.
+//
+// The loop count is read under e.mu (loopSnapshot): Metrics is public and a
+// goroutine started before the server is up may call it while Listen
+// publishes the loops (celeris#871, probatorium#481).
 func (e *Engine) Metrics() engine.EngineMetrics {
 	m := engine.EngineMetrics{
 		RequestCount:       e.metrics.reqCount.Load(),
 		ActiveConnections:  e.metrics.activeConns.Load(),
 		AsyncRoutes:        e.asyncRoutes,
 		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
-		Workers:            len(e.loops),
+		Workers:            len(e.loopSnapshot()),
 		AcceptCount:        e.metrics.acceptCount.Load(),
 		CloseCount:         e.metrics.closeCount.Load(),
 		BytesRead:          e.metrics.bytesRead.Load(),

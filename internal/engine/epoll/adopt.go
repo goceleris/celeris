@@ -36,11 +36,12 @@ func (e *Engine) AdoptConn(fd int, carry engine.Carryover) error {
 	if fd < 0 {
 		return fmt.Errorf("celeris/epoll: adopt invalid fd %d", fd)
 	}
-	n := len(e.loops)
+	loops := e.loopSnapshot()
+	n := len(loops)
 	if n == 0 {
 		return fmt.Errorf("celeris/epoll: no loops available to adopt fd %d", fd)
 	}
-	l := e.loops[int(e.adoptRR.Add(1)-1)%n]
+	l := loops[int(e.adoptRR.Add(1)-1)%n]
 	l.adoptQMu.Lock()
 	if l.adoptQClosed {
 		l.adoptQMu.Unlock()
