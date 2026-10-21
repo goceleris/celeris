@@ -205,8 +205,28 @@ type Config struct {
 	// of the plan in CPU order and can drop the CPU the rule meant to keep (a
 	// memlock of 4 gives 0, 1, 7 and 9), and the adaptive engine's io_uring
 	// standby is planned when it first switches, from the counts of that moment,
-	// so it can pick another loop set than the primary. Hosts whose CPUs are alike
-	// are unchanged and read no NIC file (README, "CPU pinning").
+	// so it can pick another loop set than the primary.
+	//
+	// On such a host, once its loops have started, the engine also finds the CPUs
+	// that service the interrupt vectors of the listener's NIC (the vectors that
+	// carry traffic: at least 1000 interrupts and 5% of the NICs' since boot) and
+	// logs one Warn when a serviced CPU of the allowed set runs no loop and is
+	// either a little CPU or a big one while no vector found has a loop beside
+	// it (the premise of the rule above: CPUs 6 and 8 of that host run no loop
+	// and are fine while CPU 1 keeps one beside IRQ 167). It only reports: it
+	// adds no loop, moves no loop and moves no interrupt, and it does not name
+	// the CPUs the rule above left free on purpose. At that host's standing
+	// state nothing is logged, with Workers 4 nothing is logged, and with the
+	// vector of the other port on little CPU 4, the boot placement (the rule
+	// steps aside), the Warn names CPU 4. On one bonded Realtek r8127 arm64
+	// big.LITTLE host, with a TX-completion interrupt serviced by a CPU without a
+	// celeris loop, whole-port TX silences of about 200 ms were seen, and they
+	// were not seen after the interrupt was moved onto a CPU with a loop (one
+	// host, one observation); an automatic extra loop on the little CPU was
+	// tried and rejected because it raised tail latency on other workloads.
+	// Moving the interrupt is the host operator's call (README, "NIC interrupts
+	// on big.LITTLE hosts"). Hosts whose CPUs are alike are unchanged and read no
+	// NIC file (README, "CPU pinning").
 	Workers int
 
 	// WorkloadHint optionally declares the expected steady-state concurrency.

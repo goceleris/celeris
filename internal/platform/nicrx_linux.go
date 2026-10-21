@@ -23,10 +23,10 @@ import (
 //	                                    /proc/interrupts)  smp_affinity_list)
 //
 // plus statistics/rx_packets of each physical device. It is the topology half
-// of the detection written for celeris#1062 (internal/platform/nicirq_linux.go
-// on fix/irqplace-1036 at 00077c0a), adapted: the Warn report, the 5% share
-// test and the "dominant CPU by counts" fallback are gone, and the packet
-// counter read is new.
+// of the detection written for celeris#1062 (nicirq_linux.go), adapted: the 5%
+// share test and the "dominant CPU by counts" fallback are gone from this
+// side, and the packet counter read is new. nicirq_linux.go shares these
+// helpers for the interrupt Warn, which leaves out the CPUs this rule frees.
 //
 // Everything is read from /sys/class/net and /proc, world-readable, through
 // the nicFS seam, and every failure (a missing file, a permission error, a

@@ -214,7 +214,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		}
 	}
 	// Every loop has pinned (or failed to) before it reported ready.
-	platform.LogPinOutcome(e.cfg.Logger, "epoll", plan, takePinFailures(loops))
+	platform.LogPinOutcome(e.cfg.Logger, "epoll", nicIRQReport(e.cfg.Logger, plan, e.cfg.Addr), takePinFailures(loops))
 
 	if len(e.loops) > 0 {
 		// celeris#639: publish an address a loop recorded before it signalled
