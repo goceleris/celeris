@@ -364,4 +364,4 @@ if grep -qw "$BAD" <<<"$listed_all"; then ok "-retracted still lists $BAD"; else
 ##########################################################################
 echo
 echo "pass=$pass fail=$fail (version $VERSION; temp dir $( [ -n "${PINMOVE_KEEP:-}" ] && echo "kept at $T" || echo removed ))"
-[ "$fail" -eq 0 ]
+if [ "$fail" -ne 0 ]; then exit 1; fi
