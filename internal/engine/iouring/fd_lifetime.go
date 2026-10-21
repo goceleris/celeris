@@ -237,6 +237,7 @@ func (w *Worker) rerunHandOff(fd int, cs *connState) {
 			return
 		}
 		if exiting {
+			w.handoffLoss.noteExitDeferred()
 			return
 		}
 		w.finishAsyncTransplant(cs)
