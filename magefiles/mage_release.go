@@ -5,8 +5,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
+
+	"github.com/goceleris/celeris/internal/release"
 )
 
 // releaseStamp is one place where the module's version is written by hand.
@@ -235,5 +238,27 @@ func PrepRelease() error {
 		fmt.Printf("  %s -> %s  %s\n", had, want, s.path)
 	}
 	fmt.Println("stamps set; README.md needs the release prose (CheckRelease will say so until it has it)")
+	return nil
+}
+
+// RehearsalVersion prints the version .github/scripts/pinmove-rehearsal.sh
+// rehearses when it is given none: derived from server.go's Version constant
+// and the repository's release tags, so it is always newer than the last
+// release (rule and tests: internal/release.RehearsalVersion). Prints only
+// the version; it needs the tags (a full-history checkout).
+func RehearsalVersion() error {
+	cur, err := stampValue(releaseStamps()[0]) // server.go
+	if err != nil {
+		return err
+	}
+	out, err := exec.Command("git", "tag", "--list", "v[0-9]*").Output()
+	if err != nil {
+		return fmt.Errorf("git tag --list: %w", err)
+	}
+	v, err := release.RehearsalVersion(cur, strings.Fields(string(out)))
+	if err != nil {
+		return err
+	}
+	fmt.Println(v)
 	return nil
 }
