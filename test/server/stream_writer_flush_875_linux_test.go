@@ -3,6 +3,7 @@
 package celeris_test
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -605,6 +606,11 @@ func TestStreamWriterOverCapH1_875(t *testing.T) {
 					if (wantOK < len(tc.chunks)) != (o.err != nil) {
 						t.Errorf("first Write error = %v with %d of %d chunks taken", o.err, o.ok, len(tc.chunks))
 					}
+					// celeris#884 item 77: the refusal is nameable from outside
+					// the module, and it is not a gone peer.
+					if o.err != nil && (!errors.Is(o.err, celeris.ErrStreamRefused) || errors.Is(o.err, net.ErrClosed)) {
+						t.Errorf("first Write error = %v, want celeris.ErrStreamRefused and not net.ErrClosed", o.err)
+					}
 					// BytesWritten counts what Write returned nil for, and the
 					// client was sent exactly that and the framing (the head is
 					// under 1 KiB): a chunk Write reported refused is not staged.
@@ -633,8 +639,8 @@ func TestStreamWriterOverCapH1_875(t *testing.T) {
 						if !strings.HasSuffix(tail, "\r\n") || strings.Contains(tail, "HTTP/1.1") {
 							t.Errorf("the cut response does not end at a chunk boundary: %q", tail)
 						}
-						if o.closeEr == nil {
-							t.Errorf("Close on a refused stream returned nil")
+						if !errors.Is(o.closeEr, celeris.ErrStreamRefused) {
+							t.Errorf("Close on a refused stream returned %v, want celeris.ErrStreamRefused", o.closeEr)
 						}
 					}
 					// The server serves the next connection either way.
@@ -750,6 +756,9 @@ func TestDetachedStreamOverCapClosesH1_875(t *testing.T) {
 			t.Logf("%s: first write/flush error = %v, after %d writes of %d MiB", e.name, r.err, r.writes, chunk>>20)
 			if r.err == nil {
 				t.Errorf("the stream of a client that never reads was never refused in %d writes of %d MiB", r.writes, chunk>>20)
+			} else if !errors.Is(r.err, celeris.ErrStreamRefused) || errors.Is(r.err, net.ErrClosed) {
+				// celeris#884 item 77: a detached refusal is nameable too.
+				t.Errorf("first write/flush error = %v, want celeris.ErrStreamRefused and not net.ErrClosed", r.err)
 			}
 			// Now read: the connection must end (EOF or reset), not hang.
 			_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))

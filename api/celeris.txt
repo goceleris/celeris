@@ -321,6 +321,7 @@ var ErrNoValidator error
 var ErrResponseWritten error
 var ErrRouteNotFound error
 var ErrServiceUnavailable *HTTPError
+var ErrStreamRefused error
 var ErrUnauthorized *HTTPError
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, NumWorkers() int

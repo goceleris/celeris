@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strconv"
 
+	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
@@ -36,6 +37,27 @@ var ErrAcceptControlNotSupported = errors.New("celeris: engine does not support 
 // stream, etc.) and the standard response writers would corrupt the stream.
 // Use [Context.StreamWriter] or the relevant middleware's write API instead.
 var ErrDetached = errors.New("celeris: cannot write standard response on detached context")
+
+// ErrStreamRefused is what a [StreamWriter] write returns on an HTTP/1.1
+// connection of the epoll, io_uring or Adaptive engine once the engine has
+// refused bytes of the response: the response staged and not yet sent is at
+// the engine's 64 MiB limit, so the response is cut and the connection is
+// closed once what was staged has gone out. [StreamWriter.Write],
+// [StreamWriter.WriteHeader], [StreamWriter.Flush] and [StreamWriter.Close]
+// all return it, the one that hit the limit and each one after it. Test for it
+// with errors.Is.
+//
+// Before [Context.Detach] a Write that would take the response past the limit
+// stages nothing of its chunk. After Detach the Write that finds the unsent
+// bytes over the limit is dropped; the one that took them over was staged, so
+// the unsent bytes are bounded at the limit plus one chunk.
+//
+// It is not an error of a connection that went away: that one wraps
+// [net.ErrClosed], so a handler can tell a peer that left (stop quietly) from
+// a response the engine cut (the client sees a body that never ends, and the
+// handler may want to log it). The std engine and HTTP/2 do not return it:
+// they report their own errors.
+var ErrStreamRefused = conn.ErrWriteRefused
 
 // ErrUnauthorized is the canonical 401 [HTTPError] used by all auth-style
 // middleware (jwt, keyauth, basicauth). Each package re-exports it under

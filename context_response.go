@@ -1869,8 +1869,9 @@ func (sw *StreamWriter) BytesWritten() int64 {
 // send buffer, which goes out when the handler returns, so every byte
 // written so far stays in memory until then, however often Flush is called.
 // That buffer is bounded at 64 MiB: a Write (or Close) that would take the
-// response held unsent past it stages nothing and returns an error with a count
-// of 0, as does every later Write, Flush and Close of the response. The
+// response held unsent past it stages nothing and returns [ErrStreamRefused]
+// with a count of 0, as does every later Write, Flush and Close of the
+// response. The
 // response is cut, and the connection is closed once the bytes staged before
 // the refused Write have gone out, so the client sees a chunked body that
 // never ends. A response that needs more than that has to Detach. After Detach
@@ -1887,9 +1888,9 @@ func (sw *StreamWriter) BytesWritten() int64 {
 // one made before Detach by a handler that blocks the engine's thread cannot
 // see it at all. A detached connection whose peer stopped reading is closed
 // once more than 64 MiB are unsent: the Write that finds them over the limit
-// is dropped and returns an error (not one wrapping [net.ErrClosed]), and so
-// does each one after it. The Write before it, which took them over, was
-// staged and counted, so a detached connection holds at most 64 MiB plus one
+// is dropped and returns [ErrStreamRefused] (not an error wrapping
+// [net.ErrClosed]), and so does each one after it. The Write before it, which
+// took them over, was staged and counted, so a detached connection holds at most 64 MiB plus one
 // chunk. The behavior above is HTTP/1.1's; Flush is not a delivery guarantee
 // on HTTP/2 either.
 func (sw *StreamWriter) Flush() error {
