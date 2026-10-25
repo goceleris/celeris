@@ -1951,6 +1951,18 @@ func (l *Loop) drainH2Writes() {
 // and a nil test per close request, which is never a hot path.
 var testHookCloseWhenFlushed atomic.Pointer[func(*connState)]
 
+// testHookAsyncExitClosed, when set, runs in serveAsync's exit for a request
+// that ends its connection (Connection: close, an error, a refused write),
+// right after the goroutine has declared the conn closed (asyncClosed) and
+// before it has marked itself gone (endDispatch). testHookDrainAsyncClosed
+// runs on the loop's goroutine in drainDetachQueue when an entry names a conn
+// declared closed whose goroutine is still counted as running. Together they
+// let a test hold the goroutine in the one place the loop can see that
+// combination (celeris#1068). Atomic pointers, as testHookCloseWhenFlushed is;
+// a load and a nil test per close, never a hot path.
+var testHookAsyncExitClosed atomic.Pointer[func(*connState)]
+var testHookDrainAsyncClosed atomic.Pointer[func(*connState)]
+
 // discardWrite is the write function the run loop drains the H2 write queue of
 // a conn that is closing on a refused write into: the frames go nowhere.
 func discardWrite([]byte) {}
@@ -3399,6 +3411,9 @@ func (l *Loop) serveAsync(cs *connState, holds *dispatchHolds) {
 			// drainDetachQueue pass will observe asyncClosed and run
 			// closeConn thread-safely.
 			cs.asyncClosed.Store(true)
+			if h := testHookAsyncExitClosed.Load(); h != nil {
+				(*h)(cs)
+			}
 			cs.asyncInMu.Lock()
 			cs.asyncInBuf = cs.asyncInBuf[:0]
 			cs.endDispatch() // enqueued below: that is the hand-back
@@ -3519,6 +3534,9 @@ func (l *Loop) drainDetachQueue() {
 			running := cs.asyncRun
 			cs.asyncInMu.Unlock()
 			if running {
+				if h := testHookDrainAsyncClosed.Load(); h != nil {
+					(*h)(cs)
+				}
 				l.closeConn(cs.fd)
 			} else {
 				l.closeWhenFlushed(cs)
