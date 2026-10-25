@@ -134,10 +134,10 @@ func setRingWaitSeam884(t *testing.T, fn func(*Worker, ringWaitMode, error) erro
 // warmLoad884 dials n keep-alive connections, each answered once, so every
 // worker that will own one does; the returned stop ends the load the
 // connections then carry and reports what the clients saw.
-func warmLoad884(t *testing.T, addr string, n int) (stop func() loadResult) {
+func warmLoad884(t *testing.T, addr string, n int, think time.Duration) (stop func() loadResult) {
 	t.Helper()
 	ch := make(chan struct{})
-	wait := runKeepAliveLoad(t, addr, n, ch)
+	wait := runKeepAliveLoadPaced(t, addr, n, ch, think)
 	return func() loadResult {
 		close(ch)
 		return wait()
@@ -151,10 +151,19 @@ func TestRunSurvivesARingWaitEBUSY884(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		mode int32 // -1 any
+		// think is the clients' pause between requests. The timed wait is
+		// taken only when the loop finds no completion ready and no send to
+		// wait for, which 32 clients that send the next request at once keep
+		// from happening for the whole window: on a worker with a CPU to
+		// itself it did not happen once in 3 s of 79 000 requests, and the
+		// apparatus guard below failed 10 times in Coverage's -race
+		// -covermode=atomic build (celeris#890). The other two modes are the
+		// ones that load always reaches.
+		think time.Duration
 	}{
-		{"any-wait", -1},
-		{"submit-and-wait-timeout", int32(waitModeTimed)},
-		{"submit-and-wait-sends-pending", int32(waitModeSubmitSends)},
+		{"any-wait", -1, 0},
+		{"submit-and-wait-timeout", int32(waitModeTimed), 20 * time.Millisecond},
+		{"submit-and-wait-sends-pending", int32(waitModeSubmitSends), 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			inj := &ebusyInject884{err: ebusyErr884(), n: 40}
@@ -162,7 +171,7 @@ func TestRunSurvivesARingWaitEBUSY884(t *testing.T) {
 			setRingWaitSeam884(t, inj.seam)
 			e, addr := startFDLEngine(t, transplantTestHandler{}, nil)
 
-			stop := warmLoad884(t, addr, 32)
+			stop := warmLoad884(t, addr, 32, tc.think)
 			time.Sleep(200 * time.Millisecond) // every connection answers, un-injected
 			inj.armed.Store(true)
 			deadline := time.Now().Add(3 * time.Second)
@@ -211,7 +220,7 @@ func TestRunStopsOnARingWaitFailure884(t *testing.T) {
 	setRingWaitSeam884(t, inj.seam)
 	e, addr := startFDLEngine(t, transplantTestHandler{}, nil)
 
-	stop := warmLoad884(t, addr, 32)
+	stop := warmLoad884(t, addr, 32, 0)
 	time.Sleep(200 * time.Millisecond)
 	inj.armed.Store(true)
 	deadline := time.Now().Add(3 * time.Second)
