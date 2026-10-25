@@ -50,6 +50,10 @@ func TestInvalidRequestLineIs400EveryEngine889(t *testing.T) {
 		{"target has bare CR", "GET /p\re HTTP/1.1"},
 		{"target has bare LF", "GET /p\ne HTTP/1.1"},
 		{"target has a control byte", "GET /p\x01e HTTP/1.1"},
+		{"target is empty", "GET  HTTP/1.1"},
+		{"version has a bare LF", "GET /ping HTTP\n1.1"},
+		{"version has a NUL", "GET /ping H\x00TP/1.1"},
+		{"version is not HTTP", "GET /ping HXXXX1.1"},
 	}
 	for _, e := range engines761 {
 		for _, tc := range cases {
@@ -184,6 +188,12 @@ func TestH2NULCRLFInRequestIsRefusedEveryEngine889(t *testing.T) {
 		{":path has CR", base("/ping\re")},
 		{"value has NUL", base("/ping", hpack.HeaderField{Name: "x-a", Value: "a\x00b"})},
 		{"cookie has CR LF", base("/ping", hpack.HeaderField{Name: "cookie", Value: "a=b\r\nset-cookie: x=y"})},
+		// RFC 9113 8.2.1: a name has no byte in 0x00-0x20, 0x7f-0xff, and no colon.
+		{"name has CR LF", base("/ping", hpack.HeaderField{Name: "x-a\r\nset-cookie", Value: "x"})},
+		{"name has NUL", base("/ping", hpack.HeaderField{Name: "x-a\x00", Value: "x"})},
+		{"name has a space", base("/ping", hpack.HeaderField{Name: "x a", Value: "x"})},
+		{"name has a colon", base("/ping", hpack.HeaderField{Name: "x:a", Value: "x"})},
+		{"name has a byte above 0x7f", base("/ping", hpack.HeaderField{Name: "x-\xc3\xa9", Value: "x"})},
 	}
 	for _, e := range engines761 {
 		skipName := e.name
@@ -205,5 +215,86 @@ func TestH2NULCRLFInRequestIsRefusedEveryEngine889(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// RFC 9113 8.1.1: a malformed request is a stream error. The stream is reset
+// and the connection serves the next request, on every engine (std resets the
+// stream only; the native engines used to close the connection).
+func TestH2MalformedRequestKeepsTheConnection889(t *testing.T) {
+	for _, e := range engines761 {
+		t.Run(e.name, func(t *testing.T) {
+			skipNoIOUring889(t, e.name)
+			addr := startServer964(t, celeris.Config{Engine: e.eng, Protocol: celeris.Auto})
+			c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = c.Close() }()
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.WriteString(c, http2.ClientPreface); err != nil {
+				t.Fatal(err)
+			}
+			fr := http2.NewFramer(c, c)
+			if err := fr.WriteSettings(); err != nil {
+				t.Fatal(err)
+			}
+			send := func(id uint32, path string) {
+				var blk bytes.Buffer
+				enc := hpack.NewEncoder(&blk)
+				for _, f := range []hpack.HeaderField{{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "http"},
+					{Name: ":path", Value: path}, {Name: ":authority", Value: "example.com"}} {
+					if err := enc.WriteField(f); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk.Bytes(), EndStream: true, EndHeaders: true}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			send(1, "/ping\x00e")
+			send(3, "/ping")
+			send(5, "/ping\ne")
+			send(7, "/ping")
+			dec := hpack.NewDecoder(4096, nil)
+			rst := map[uint32]http2.ErrCode{}
+			status := map[uint32]string{}
+			for len(status) < 2 {
+				f, err := fr.ReadFrame()
+				if err != nil {
+					t.Fatalf("the connection ended (RST_STREAMs %v, statuses %v): %v", rst, status, err)
+				}
+				switch f := f.(type) {
+				case *http2.SettingsFrame:
+					if !f.IsAck() {
+						if err := fr.WriteSettingsAck(); err != nil {
+							t.Fatal(err)
+						}
+					}
+				case *http2.RSTStreamFrame:
+					rst[f.StreamID] = f.ErrCode
+				case *http2.HeadersFrame:
+					hs, err := dec.DecodeFull(f.HeaderBlockFragment())
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, h := range hs {
+						if h.Name == ":status" {
+							status[f.StreamID] = h.Value
+						}
+					}
+				case *http2.GoAwayFrame:
+					t.Fatalf("GOAWAY %v (RST_STREAMs %v, statuses %v)", f.ErrCode, rst, status)
+				}
+			}
+			if status[3] != "200" || status[7] != "200" {
+				t.Fatalf("the clean streams were answered %v, want 200 on 3 and 7", status)
+			}
+			for _, id := range []uint32{1, 5} {
+				if rst[id] != http2.ErrCodeProtocol {
+					t.Fatalf("stream %d: RST_STREAMs %v, want PROTOCOL_ERROR", id, rst)
+				}
+			}
+		})
 	}
 }

@@ -83,6 +83,10 @@ func TestH2CSettingsRuleEveryEngine7540(t *testing.T) {
 		{"invalid-standard-alphabet", []string{"HTTP2-Settings: AAMA+/ABkAAQAoAAAAAIAAAAA"}, "Upgrade, HTTP2-Settings", "http1-200"},
 		{"invalid-length-5B", []string{"HTTP2-Settings: " + b64url7540(5)}, "Upgrade, HTTP2-Settings", "http1-200"},
 		{"invalid-length-7B", []string{"HTTP2-Settings: " + b64url7540(7)}, "Upgrade, HTTP2-Settings", "http1-200"},
+		// Only SP and HTAB around the value are whitespace; a Unicode space
+		// (here U+00A0, as UTF-8) is part of it, and does not decode.
+		{"invalid-trailing-NBSP", []string{"HTTP2-Settings: " + settings7540 + "\xc2\xa0"}, "Upgrade, HTTP2-Settings", "http1-200"},
+		{"invalid-leading-NEL", []string{"HTTP2-Settings: \xc2\x85" + settings7540}, "Upgrade, HTTP2-Settings", "http1-200"},
 		{"invalid-comma-list", []string{"HTTP2-Settings: " + settings7540 + "," + settings7540}, "Upgrade, HTTP2-Settings", "http1-200"},
 
 		// Controls: the rest of the section 3.2 test is unchanged.

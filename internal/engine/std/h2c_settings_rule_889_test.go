@@ -19,6 +19,10 @@ func TestH2CSettingsRule889(t *testing.T) {
 		{"one", []string{v}, true, 18},
 		{"one with OWS", []string{" " + v + "\t"}, true, 18},
 		{"one empty", []string{""}, true, 0},
+		// Only SP and HTAB are optional whitespace (RFC 9110 5.5): U+00A0 and
+		// U+0085 are not trimmed, as on the native engines.
+		{"one with NBSP", []string{v + "\xc2\xa0"}, false, 0},
+		{"one with NEL", []string{"\xc2\x85" + v}, false, 0},
 		{"missing", nil, false, 0},
 		{"repeated", []string{v, v}, false, 0},
 		{"repeated, one empty", []string{v, ""}, false, 0},
