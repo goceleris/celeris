@@ -38,9 +38,15 @@ func (l *lockedBuf) String() string {
 	return l.b.String()
 }
 
+// logSink is where start909's engine logs and its caller reads back.
+type logSink interface {
+	Write(p []byte) (int, error)
+	String() string
+}
+
 // start909 starts an epoll engine with the given worker count, logging into
 // log, and returns it with its stop function.
-func start909(t *testing.T, workers int, log *lockedBuf) (*Engine, func()) {
+func start909(t *testing.T, workers int, log logSink) (*Engine, func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -189,4 +195,54 @@ func TestFailedPinIsLoggedOnceAndNotPretended909(t *testing.T) {
 		t.Fatalf("the engine does not accept after failed pins: %v", err)
 	}
 	_ = conn.Close()
+}
+
+// gatedLog holds the write of the engine's listening line until gate is
+// closed.
+type gatedLog struct {
+	lockedBuf
+	gate chan struct{}
+}
+
+func (g *gatedLog) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("epoll engine listening")) {
+		<-g.gate
+	}
+	return g.lockedBuf.Write(p)
+}
+
+// celeris#890 (TestNICIRQReportAddsNoLoop1036 failed in CI with a log that had
+// the pinning lines and no "epoll engine listening" line): Listen publishes
+// the address and only then logs that line, and start909 returned as soon as
+// the address was there, so a test that read the log on return could read it
+// before the line was written. start909 returns once the line is in the log.
+func TestStart909ReturnsOnlyOnceTheListeningLineIsLogged(t *testing.T) {
+	g := &gatedLog{gate: make(chan struct{})}
+	type started struct {
+		eng  *Engine
+		stop func()
+	}
+	ret := make(chan started, 1)
+	go func() {
+		eng, stop := start909(t, 2, g)
+		ret <- started{eng, stop}
+	}()
+	select {
+	case r := <-ret:
+		logged := g.String()
+		close(g.gate)
+		r.stop()
+		t.Fatalf("start909 returned (address %v) before the listening line was in the log: %q", r.eng.Addr(), logged)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(g.gate)
+	select {
+	case r := <-ret:
+		defer r.stop()
+		if !strings.Contains(g.String(), "epoll engine listening") {
+			t.Fatalf("start909 returned without the listening line in the log: %q", g.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("start909 did not return once the listening line was logged")
+	}
 }
