@@ -35,7 +35,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -47,6 +46,8 @@ import (
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
+
+	"github.com/goceleris/celeris/internal/protocol/h1"
 )
 
 // h2cHandler is the std engine's h2c front end: it intercepts the two ways an
@@ -114,48 +115,62 @@ func (h *h2cHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// Upgrade to h2c (RFC 7540 3.2).
+	// Upgrade to h2c (RFC 7540 3.2). Its HTTP2-Settings header is judged
+	// first, by the rule every engine applies (h2cSettings): a request
+	// without exactly one that decodes is not upgraded, and goes on to next
+	// as the HTTP/1.1 request it also is, body unread and the limits that
+	// apply to every request body applying to it (RFC 7540 3.2.1: a server
+	// MUST NOT upgrade then; it did answer 500).
 	if h.upgrade && isH2CUpgrade(r.Header) {
-		conn, settings, err := h2cUpgrade(w, r, h.maxBody)
-		if err != nil {
-			if errors.Is(err, errH2CUpgradeBodyTooLarge) {
-				// The connection is not taken over: refuse as Bridge does
-				// a body over the limit (celeris#976). Close it after the
-				// answer, as the rest of the body is unread.
-				if h.bodyRefused != nil {
-					h.bodyRefused()
-				}
-				w.Header().Set("Connection", "close")
-				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-				return
-			}
-			w.WriteHeader(http.StatusInternalServerError)
+		if settings, ok := h2cSettings(r.Header); ok {
+			h.serveUpgrade(w, r, settings)
 			return
 		}
-		defer func() { _ = conn.Close() }()
-		// The upgrade request is stream 1 but keeps its HTTP/1 context, which
-		// the stream's RST_STREAM does not cancel; give it one that the
-		// watcher cancels when the client resets stream 1 (celeris#949).
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
-		conn = newH2CStream1Watch(conn, cancel)
-		// x/net's legacy server (-tags http2legacy) passes the upgrade request
-		// on as the HTTP/1 request it came in as, so it is marked HTTP/2 here:
-		// the bridge then serves it on an HTTP/2 stream (c.Protocol() "2", the
-		// drain gate, the stream's cancel). net/http's go1.27 server rebuilds
-		// it as HTTP/2 itself, so that build is unchanged (celeris#949).
-		ur := r.WithContext(ctx)
-		ur.Proto, ur.ProtoMajor, ur.ProtoMinor = "HTTP/2.0", 2, 0
-		h.h2s.ServeConn(conn, &http2.ServeConnOpts{ //nolint:staticcheck // SA1019: see the import comment in engine.go.
-			Context:        r.Context(),
-			Handler:        h.next,
-			BaseConfig:     h2cBaseConfig(r),
-			UpgradeRequest: ur,
-			Settings:       settings,
-		})
-		return
 	}
 	h.next.ServeHTTP(w, r)
+}
+
+// serveUpgrade answers an Upgrade: h2c request that has passed the tests of
+// ServeHTTP with 101 and serves the connection as HTTP/2, the request as its
+// stream 1.
+func (h *h2cHandler) serveUpgrade(w http.ResponseWriter, r *http.Request, settings []byte) {
+	conn, err := h2cUpgrade(w, r, h.maxBody)
+	if err != nil {
+		if errors.Is(err, errH2CUpgradeBodyTooLarge) {
+			// The connection is not taken over: refuse as Bridge does
+			// a body over the limit (celeris#976). Close it after the
+			// answer, as the rest of the body is unread.
+			if h.bodyRefused != nil {
+				h.bodyRefused()
+			}
+			w.Header().Set("Connection", "close")
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	// The upgrade request is stream 1 but keeps its HTTP/1 context, which
+	// the stream's RST_STREAM does not cancel; give it one that the
+	// watcher cancels when the client resets stream 1 (celeris#949).
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	conn = newH2CStream1Watch(conn, cancel)
+	// x/net's legacy server (-tags http2legacy) passes the upgrade request
+	// on as the HTTP/1 request it came in as, so it is marked HTTP/2 here:
+	// the bridge then serves it on an HTTP/2 stream (c.Protocol() "2", the
+	// drain gate, the stream's cancel). net/http's go1.27 server rebuilds
+	// it as HTTP/2 itself, so that build is unchanged (celeris#949).
+	ur := r.WithContext(ctx)
+	ur.Proto, ur.ProtoMajor, ur.ProtoMinor = "HTTP/2.0", 2, 0
+	h.h2s.ServeConn(conn, &http2.ServeConnOpts{ //nolint:staticcheck // SA1019: see the import comment in engine.go.
+		Context:        r.Context(),
+		Handler:        h.next,
+		BaseConfig:     h2cBaseConfig(r),
+		UpgradeRequest: ur,
+		Settings:       settings,
+	})
 }
 
 // h2cPriorKnowledge hijacks the connection and checks the rest of the client
@@ -184,24 +199,18 @@ func h2cPriorKnowledge(w http.ResponseWriter) (net.Conn, error) {
 var errH2CUpgradeBodyTooLarge = errors.New("h2c: upgrade request body over MaxRequestBodySize")
 
 // h2cUpgrade answers an HTTP/1.1 upgrade request with 101 and hijacks the
-// connection (RFC 7540 3.2); settings is the decoded HTTP2-Settings header.
-// maxBody is the largest request body it buffers (0 = no limit): a larger one
-// is errH2CUpgradeBodyTooLarge, with the connection not taken over (celeris#976),
-// and a declared Content-Length over it is that error before a byte is read.
-func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Conn, settings []byte, err error) {
-	// The HTTP2-Settings header is checked first: a request that has none, or
-	// an invalid one, is refused for it (500) even when its declared length is
-	// over the limit as well.
-	settings, err = h2cSettings(r.Header)
-	if err != nil {
-		return nil, nil, err
-	}
+// connection (RFC 7540 3.2); its HTTP2-Settings header has been judged
+// (h2cSettings). maxBody is the largest request body it buffers (0 = no
+// limit): a larger one is errH2CUpgradeBodyTooLarge, with the connection not
+// taken over (celeris#976), and a declared Content-Length over it is that
+// error before a byte is read.
+func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Conn, err error) {
 	// A declared Content-Length over the limit is refused before a byte of
 	// the body is read: the client may never send it, and the read below
 	// would wait for the bytes (or for ReadTimeout). No length declared (-1,
 	// chunked) keeps the read, which stops one byte past the limit.
 	if maxBody > 0 && r.ContentLength > maxBody {
-		return nil, nil, errH2CUpgradeBodyTooLarge
+		return nil, errH2CUpgradeBodyTooLarge
 	}
 	// The request is served as stream 1, body included: read it before the
 	// connection is taken over, but no further than the limit that applies
@@ -217,24 +226,24 @@ func h2cUpgrade(w http.ResponseWriter, r *http.Request, maxBody int64) (_ net.Co
 		}
 		body, err = io.ReadAll(io.LimitReader(r.Body, limit))
 		if err == nil && int64(len(body)) > maxBody {
-			return nil, nil, errH2CUpgradeBodyTooLarge
+			return nil, errH2CUpgradeBodyTooLarge
 		}
 	} else {
 		body, err = io.ReadAll(r.Body)
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
 	conn, rw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	_, _ = rw.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Upgrade: h2c\r\n\r\n"))
-	return newH2CBufConn(conn, rw), settings, nil
+	return newH2CBufConn(conn, rw), nil
 }
 
 // isH2CUpgrade reports whether the headers properly request an upgrade to h2c
@@ -263,16 +272,20 @@ func isH2CUpgrade(h http.Header) bool {
 		httpguts.HeaderValuesContainsToken(conn, "HTTP2-Settings")
 }
 
-// h2cSettings returns the decoded HTTP2-Settings header.
-func h2cSettings(h http.Header) ([]byte, error) {
-	vals, ok := h[textproto.CanonicalMIMEHeaderKey("HTTP2-Settings")]
-	if !ok {
-		return nil, errors.New("missing HTTP2-Settings header")
-	}
+// h2cSettings applies the one rule every engine applies to the HTTP2-Settings
+// header field of an Upgrade: h2c request (RFC 7540 3.2.1), and returns the
+// SETTINGS payload it carries: the request upgrades only if there is exactly
+// one such field and its value decodes (h1.DecodeHTTP2Settings; an empty value
+// is a valid empty payload). If not, ok is false: a server MUST NOT upgrade
+// when the field is missing or repeated, and the request is served as the
+// HTTP/1.1 request it also is, as on epoll, io_uring and adaptive, not refused.
+func h2cSettings(h http.Header) (settings []byte, ok bool) {
+	vals := h[textproto.CanonicalMIMEHeaderKey("HTTP2-Settings")]
 	if len(vals) != 1 {
-		return nil, fmt.Errorf("expected 1 HTTP2-Settings. Got: %v", vals)
+		return nil, false
 	}
-	return base64.RawURLEncoding.DecodeString(vals[0])
+	settings, err := h1.DecodeHTTP2Settings(strings.TrimSpace(vals[0]))
+	return settings, err == nil
 }
 
 // newH2CBufConn flushes rw and returns conn, or, if net/http's reader holds

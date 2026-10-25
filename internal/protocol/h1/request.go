@@ -35,12 +35,14 @@ type Request struct {
 
 	// UpgradeH2C is true iff this request is a valid h2c upgrade request
 	// (RFC 7540 §3.2): Upgrade: h2c (single token, exclusively) + HTTP2-Settings
-	// header present + Connection header listing BOTH "upgrade" and
+	// header present exactly once (§3.2.1; its value may be empty) +
+	// Connection header listing BOTH "upgrade" and
 	// "http2-settings" tokens. The single-token Upgrade requirement
 	// disambiguates from the WebSocket path (Upgrade: websocket).
 	UpgradeH2C bool
 	// HTTP2Settings holds the raw base64url-encoded HTTP2-Settings value
-	// (still encoded; caller decodes). Non-empty only when the header is present.
+	// (still encoded; caller decodes with DecodeHTTP2Settings), trimmed: ""
+	// when the header is absent or has an empty value (UpgradeH2C tells which).
 	HTTP2Settings string
 }
 

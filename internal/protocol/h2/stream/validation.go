@@ -6,6 +6,42 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// hasForbiddenValueByte reports whether a field value holds a NUL, LF or CR,
+// which RFC 9113 section 8.2.1 forbids "at any position": a request that has
+// one is malformed (section 8.1.1) and is refused with a stream error. The
+// header block is HPACK-decoded, so these bytes can be sent (the decoder
+// takes any octet in a string), in a value or in the :path, where they would
+// reach the handler and anything that joins or logs the field.
+//
+// It reads eight bytes at a time and looks at single bytes only in a word that
+// has a byte below 0x0E (NUL, LF and CR among them; a bit-twiddling test with
+// no false negative): every request header block pays for this scan.
+func hasForbiddenValueByte(v string) bool {
+	const (
+		ones = 0x0101010101010101
+		high = 0x8080808080808080
+	)
+	i := 0
+	for ; i+8 <= len(v); i += 8 {
+		s := v[i : i+8]
+		w := uint64(s[0]) | uint64(s[1])<<8 | uint64(s[2])<<16 | uint64(s[3])<<24 |
+			uint64(s[4])<<32 | uint64(s[5])<<40 | uint64(s[6])<<48 | uint64(s[7])<<56
+		if (w-0x0E*ones)&^w&high != 0 && forbiddenByteIn(s) {
+			return true
+		}
+	}
+	return forbiddenByteIn(v[i:])
+}
+
+func forbiddenByteIn(v string) bool {
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c <= '\r' && (c == 0 || c == '\n' || c == '\r') {
+			return true
+		}
+	}
+	return false
+}
+
 // validateRequestHeaders validates HTTP/2 request headers according to RFC 7540.
 func validateRequestHeaders(headers [][2]string) error {
 	var (
@@ -22,6 +58,9 @@ func validateRequestHeaders(headers [][2]string) error {
 
 		if !isASCIILower(name) {
 			return fmt.Errorf("header field name must be lowercase: %s", name)
+		}
+		if hasForbiddenValueByte(value) {
+			return fmt.Errorf("field value of %s holds a NUL, CR or LF", name)
 		}
 
 		if len(name) > 0 && name[0] == ':' {
@@ -92,6 +131,9 @@ func validateTrailerHeaders(headers [][2]string) error {
 
 		if !isASCIILower(name) {
 			return fmt.Errorf("header field name must be lowercase: %s", name)
+		}
+		if hasForbiddenValueByte(value) {
+			return fmt.Errorf("field value of %s holds a NUL, CR or LF", name)
 		}
 
 		if len(name) > 0 && name[0] == ':' {
