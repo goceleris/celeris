@@ -2266,11 +2266,19 @@ func dispatchBusy(cs *connState, owe *bool) bool {
 		return false // no async machinery: sync mode, no dispatch goroutine
 	}
 	cs.asyncInMu.Lock()
+	busy := dispatchBusyLocked(cs, owe)
+	cs.asyncInMu.Unlock()
+	return busy
+}
+
+// dispatchBusyLocked is dispatchBusy's test, for a caller that holds
+// cs.asyncInMu and needs it in the same section as another read of cs
+// (drainDetachQueue's asyncClosed branch).
+func dispatchBusyLocked(cs *connState, owe *bool) bool {
 	busy := cs.asyncRun && !cs.asyncParked && !cs.asyncDetachUnlocked
 	if busy && owe != nil {
 		*owe = true
 	}
-	cs.asyncInMu.Unlock()
 	return busy
 }
 
@@ -3159,8 +3167,11 @@ func (l *Loop) abortAsyncHandler(cs *connState, r any, holds *dispatchHolds) {
 	if h := testHookAbortAsyncLogged.Load(); h != nil {
 		(*h)(l, cs)
 	}
-	cs.asyncClosed.Store(true)
+	// Stored again, under the lock with endDispatch as at serveAsync's exits
+	// (the first store, above, is the one that matters here: it is early on
+	// purpose).
 	cs.asyncInMu.Lock()
+	cs.asyncClosed.Store(true)
 	cs.asyncInBuf = cs.asyncInBuf[:0]
 	cs.endDispatch() // enqueued below: that is the hand-back
 	cs.asyncInMu.Unlock()
@@ -3554,23 +3565,26 @@ func (l *Loop) drainDetachQueue() {
 		// than the socket buffers. While it still runs, closeConn leaves
 		// the close to it (celeris#669), as before.
 		if cs.asyncClosed.Load() {
+			// A goroutine that is still running a request is not done with
+			// the conn: the close is its to hand back (closeOwed), as
+			// closeConn does for a handler that holds detachMu. A goroutine
+			// that declared the conn closed itself and is on its way out
+			// (abortAsyncHandler logs between its store of asyncClosed and
+			// endDispatch) would otherwise be closed over, and the response
+			// it left queued cut short (celeris#1068). Its exit always
+			// enqueues cs again, and that entry finds it gone. Whether it
+			// runs, whether it is busy and the owed record are one section:
+			// read apart, a goroutine that finished between the reads was
+			// taken for gone by the second and closed over by closeConn.
 			cs.asyncInMu.Lock()
 			running := cs.asyncRun
+			busy := dispatchBusyLocked(cs, &cs.closeOwed)
 			cs.asyncInMu.Unlock()
 			if running {
 				if h := testHookDrainAsyncClosed.Load(); h != nil {
 					(*h)(cs)
 				}
-				// A goroutine that is still running a request is not done
-				// with the conn: the close is its to hand back (closeOwed),
-				// as closeConn does for a handler that holds detachMu. A
-				// goroutine that declared the conn closed itself and is on
-				// its way out (abortAsyncHandler logs between its store of
-				// asyncClosed and endDispatch) would otherwise be closed
-				// over, and the response it left queued cut short
-				// (celeris#1068). Its exit always enqueues cs again, and
-				// that entry finds it gone.
-				if dispatchBusy(cs, &cs.closeOwed) {
+				if busy {
 					continue
 				}
 				l.closeConn(cs.fd)

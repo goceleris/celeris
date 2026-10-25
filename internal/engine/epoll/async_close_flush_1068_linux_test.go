@@ -202,6 +202,27 @@ var _ stream.AsyncRouteResolver = (*abortHandler1068)(nil)
 // the goroutine takes it straight after the first flush without parking. The
 // test holds the abort after its log and waits for the loop to look.
 func TestAbortedGoroutineDoesNotLoseTheQueuedRemainder1068(t *testing.T) {
+	abortedGoroutine1068(t, false)
+}
+
+// TestAbortedGoroutineFinishingBetweenTheDrainsReads1068: the loop decides
+// whether the goroutine still runs, and whether to leave the close to it, in
+// one asyncInMu section. Read in two (asyncRun, then dispatchBusy), a goroutine
+// that reached endDispatch between the reads was taken for gone by the second
+// and the conn was closed with closeConn, over the queued remainder, and the
+// goroutine's own entry found it closed. The drain hook here holds the loop
+// after its decision until the goroutine has finished.
+func TestAbortedGoroutineFinishingBetweenTheDrainsReads1068(t *testing.T) {
+	abortedGoroutine1068(t, true)
+}
+
+// abortedGoroutine1068 runs the scenario of the two tests above. The abort
+// hook queues an entry for the loop itself, to force the window: the entry
+// for the remainder is normally drained before the second request's handler
+// has panicked. waitGone holds the loop's drain, after its decision, until the
+// aborted goroutine has left (asyncRun false).
+func abortedGoroutine1068(t *testing.T, waitGone bool) {
+	t.Helper()
 	// What stays queued (the body less what the socket takes, about 2.4 MB
 	// here) must be under the 4 MiB cap, or the second request is refused
 	// before its handler runs (ErrWriteBacklog) and the abort is never reached;
@@ -219,9 +240,21 @@ func TestAbortedGoroutineDoesNotLoseTheQueuedRemainder1068(t *testing.T) {
 	// detachMu (it has not released it before it logs), and leaves the close
 	// to it, as it always did.
 	var inWindow atomic.Bool
-	drainHook := func(*connState) {
-		if inWindow.Load() {
-			lookOnce.Do(func() { close(looked) })
+	drainHook := func(cs *connState) {
+		if !inWindow.Load() {
+			return
+		}
+		lookOnce.Do(func() { close(looked) })
+		if !waitGone {
+			return
+		}
+		for dl := time.Now().Add(2 * time.Second); time.Now().Before(dl); time.Sleep(time.Millisecond) {
+			cs.asyncInMu.Lock()
+			running := cs.asyncRun
+			cs.asyncInMu.Unlock()
+			if !running {
+				return
+			}
 		}
 	}
 	abortHook := func(l *Loop, cs *connState) {
