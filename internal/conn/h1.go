@@ -1224,14 +1224,19 @@ func copyH2CHeaders(req *h1.Request) [][2]string {
 // a pooled UpgradeInfo.Headers backing array — on pooled entry the slice
 // arrives with zero length but non-zero capacity.
 func appendH2CHeaders(out [][2]string, req *h1.Request) [][2]string {
+	// Several Cookie lines become one field joined with "; ", as HTTP/2
+	// delivers a request (stream.CookieJoiner, celeris#889): the replayed
+	// request is HTTP/2 stream 1.
+	var cj stream.CookieJoiner
 	for _, rh := range req.RawHeaders {
 		name := h1.LowerHeaderCopy(rh[0])
 		switch name {
 		case "upgrade", "connection", "http2-settings":
 			continue
 		}
-		out = append(out, [2]string{name, string(rh[1])})
+		out = cj.Append(out, name, string(rh[1]))
 	}
+	cj.Finish(out)
 	return out
 }
 

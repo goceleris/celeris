@@ -290,14 +290,21 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 		[2]string{":scheme", "http"},
 		[2]string{":authority", "localhost"},
 	)
-	s.Headers = append(s.Headers, cfg.headers...)
+	// Several cookie fields (WithHeader("cookie", ...) and WithCookie each
+	// add one) reach the handler as one field joined with "; ", as the engines
+	// deliver a request (stream.AppendRequestField).
+	var cj stream.CookieJoiner
+	for _, h := range cfg.headers {
+		s.Headers = cj.Append(s.Headers, h[0], h[1])
+	}
 	if len(cfg.cookies) > 0 {
 		parts := make([]string, 0, len(cfg.cookies))
 		for _, kv := range cfg.cookies {
 			parts = append(parts, kv[0]+"="+kv[1])
 		}
-		s.Headers = append(s.Headers, [2]string{"cookie", strings.Join(parts, "; ")})
+		s.Headers = cj.Append(s.Headers, "cookie", strings.Join(parts, "; "))
 	}
+	cj.Finish(s.Headers)
 	if len(cfg.body) > 0 {
 		s.GetBuf().Write(cfg.body)
 	}

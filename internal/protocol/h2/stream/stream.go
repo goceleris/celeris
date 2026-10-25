@@ -640,11 +640,62 @@ func (s *Stream) MaterializeHeaders() {
 		)
 		s.pseudoMaterialized = true
 	}
+	var cj CookieJoiner
 	for _, rh := range s.LazyRawHeaders {
-		s.Headers = append(s.Headers, [2]string{
-			lazyLowerHeaderName(rh[0]),
-			unsafeStringFromBytes(rh[1]),
-		})
+		name, value := lazyLowerHeaderName(rh[0]), unsafeStringFromBytes(rh[1])
+		if name == "cookie" {
+			s.Headers = cj.Append(s.Headers, name, value)
+			continue
+		}
+		s.Headers = append(s.Headers, [2]string{name, value})
+	}
+	cj.Finish(s.Headers)
+}
+
+// CookieJoiner joins the cookie fields of one request's header list into the
+// first one with "; ". An HTTP/1.1 client may send several Cookie lines, and
+// HTTP/2 joins the fields of a request at HPACK decode (RFC 9113 §8.2.3, as
+// net/http's server does, celeris#944); joining where the HTTP/1 header list
+// is built gives every protocol and engine one cookie field, so
+// Header("cookie"), Context.Cookie and every key built from them (singleflight,
+// cache VaryHeaders) see the same value (celeris#889). The pieces are
+// gathered in one buffer and the first field takes the result in Finish, so
+// the work is linear in the request however many lines it has (a line as small
+// as "a=b" must not make joining quadratic, as in hpackEmit). A request with
+// one cookie line allocates nothing. The zero value is ready; use one per
+// header list, and call Finish after the last Append.
+type CookieJoiner struct {
+	at     int // index of the cookie field in the list, valid when seen
+	seen   bool
+	joined bool
+	buf    []byte
+}
+
+// Append appends the request header field name: value (name lowercased) to
+// hdrs, except that a cookie field after the first is gathered for Finish
+// instead of being appended.
+func (j *CookieJoiner) Append(hdrs [][2]string, name, value string) [][2]string {
+	if name == "cookie" {
+		if !j.seen {
+			j.seen, j.at = true, len(hdrs)
+		} else {
+			if !j.joined {
+				j.buf = append(j.buf[:0], hdrs[j.at][1]...)
+				j.joined = true
+			}
+			j.buf = append(j.buf, "; "...)
+			j.buf = append(j.buf, value...)
+			return hdrs
+		}
+	}
+	return append(hdrs, [2]string{name, value})
+}
+
+// Finish stores the joined value in the first cookie field. hdrs must be the
+// list Append returned last.
+func (j *CookieJoiner) Finish(hdrs [][2]string) {
+	if j.joined {
+		hdrs[j.at][1] = string(j.buf)
 	}
 }
 

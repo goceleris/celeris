@@ -4,7 +4,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine/std"
@@ -50,12 +49,7 @@ func ToHandler(h HandlerFunc) http.Handler {
 			[2]string{":scheme", scheme},
 			[2]string{":authority", r.Host},
 		)
-		for name, values := range r.Header {
-			lowerName := strings.ToLower(name)
-			for _, v := range values {
-				hdrs = append(hdrs, [2]string{lowerName, v})
-			}
-		}
+		hdrs = std.AppendRequestHeaders(hdrs, r.Header)
 		s.Headers = hdrs
 
 		if r.Body != nil && r.Body != http.NoBody {
