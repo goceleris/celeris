@@ -310,6 +310,11 @@ func abortedGoroutine1068(t *testing.T, waitGone bool) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the dispatch goroutine never aborted")
 	}
+	// The abort hook waits only so long for the loop; a loop that never looked
+	// leaves nothing tested.
+	if !isClosed1068(looked) {
+		t.Fatal("the loop never drained the closed conn while the aborted goroutine was held: the test would prove nothing")
+	}
 	if q := queued.Load(); q <= 0 {
 		t.Fatalf("%d bytes were queued while the aborted goroutine was held (-1: not readable): the test would prove nothing", q)
 	}
