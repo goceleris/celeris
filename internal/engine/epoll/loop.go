@@ -1954,12 +1954,13 @@ var testHookCloseWhenFlushed atomic.Pointer[func(*connState)]
 // testHookAsyncExitClosed, when set, runs in serveAsync's exit for a request
 // that ends its connection (Connection: close, an error, a refused write),
 // right after the goroutine has declared the conn closed (asyncClosed) and
-// before it has marked itself gone (endDispatch). testHookDrainAsyncClosed
-// runs on the loop's goroutine in drainDetachQueue when an entry names a conn
-// declared closed whose goroutine is still counted as running. Together they
-// let a test hold the goroutine in the one place the loop can see that
-// combination (celeris#1068). Atomic pointers, as testHookCloseWhenFlushed is;
-// a load and a nil test per close, never a hot path.
+// before it has marked itself gone (endDispatch), with asyncInMu held for both:
+// the loop cannot read the two apart. testHookDrainAsyncClosed runs on the
+// loop's goroutine in drainDetachQueue when an entry names a conn declared
+// closed whose goroutine is still counted as running. A test that holds the
+// first and waits on the second sees the loop in the gap the lock closes
+// (celeris#1068). Atomic pointers, as testHookCloseWhenFlushed is; a load and a
+// nil test per close, never a hot path.
 var testHookAsyncExitClosed atomic.Pointer[func(*connState)]
 var testHookDrainAsyncClosed atomic.Pointer[func(*connState)]
 
@@ -3315,8 +3316,10 @@ func (l *Loop) serveAsync(cs *connState, holds *dispatchHolds) {
 			holds.detachMu = false
 			cs.detachMu.Unlock()
 			if promoteErr != nil {
-				cs.asyncClosed.Store(true)
+				// asyncClosed under asyncInMu, with endDispatch (see the exit
+				// at the end of this loop, celeris#1068).
 				cs.asyncInMu.Lock()
+				cs.asyncClosed.Store(true)
 				cs.asyncInBuf = cs.asyncInBuf[:0]
 				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
@@ -3342,8 +3345,10 @@ func (l *Loop) serveAsync(cs *connState, holds *dispatchHolds) {
 			// considers a hijacked conn "done with the request". Treat
 			// it like nil here — the middleware now owns the conn.
 			if processErr != nil && !errors.Is(processErr, conn.ErrHijacked) {
-				cs.asyncClosed.Store(true)
+				// asyncClosed under asyncInMu, with endDispatch (see the exit
+				// at the end of this loop, celeris#1068).
 				cs.asyncInMu.Lock()
+				cs.asyncClosed.Store(true)
 				cs.asyncInBuf = cs.asyncInBuf[:0]
 				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
@@ -3410,11 +3415,21 @@ func (l *Loop) serveAsync(cs *connState, holds *dispatchHolds) {
 			// on detachQueue, and write eventfd; the worker's
 			// drainDetachQueue pass will observe asyncClosed and run
 			// closeConn thread-safely.
+			//
+			// asyncClosed is stored under asyncInMu, with endDispatch: the loop
+			// reads asyncClosed and asyncRun together under that lock
+			// (drainDetachQueue), and a conn declared closed whose goroutine
+			// still counts as running is, to it, a close requested from outside
+			// while a handler runs, which closeConn carries out at once when
+			// detachMu is free, as it is here (the flush above is done). The
+			// entry enqueued for a partial flush's remainder could make it
+			// look in the gap between the two stores, and the conn was closed
+			// with that remainder unsent (celeris#1068).
+			cs.asyncInMu.Lock()
 			cs.asyncClosed.Store(true)
 			if h := testHookAsyncExitClosed.Load(); h != nil {
 				(*h)(cs)
 			}
-			cs.asyncInMu.Lock()
 			cs.asyncInBuf = cs.asyncInBuf[:0]
 			cs.endDispatch() // enqueued below: that is the hand-back
 			cs.asyncInMu.Unlock()
