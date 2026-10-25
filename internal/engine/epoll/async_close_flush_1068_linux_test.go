@@ -4,15 +4,19 @@ package epoll
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -66,7 +70,9 @@ func TestAsyncRouteCloseSendsTheQueuedRemainder1068(t *testing.T) {
 				held     = make(chan struct{})
 				heldOnce sync.Once
 			)
-			exitHook := func(*connState) {
+			var queued atomic.Int64
+			exitHook := func(cs *connState) {
+				queued.Store(int64(queued1068(cs)))
 				select {
 				case <-looked:
 				case <-time.After(500 * time.Millisecond):
@@ -97,6 +103,12 @@ func TestAsyncRouteCloseSendsTheQueuedRemainder1068(t *testing.T) {
 			case <-held:
 			case <-time.After(10 * time.Second):
 				t.Fatal("the dispatch goroutine never reached the exit of a request that ends its conn")
+			}
+			// The arm proves nothing unless the remainder was queued while the
+			// goroutine was held (an 8 MiB response must outgrow the socket
+			// buffers of the host it runs on).
+			if q := queued.Load(); q <= 0 {
+				t.Fatalf("%d bytes were queued while the goroutine was held (-1: not readable): the arm would prove nothing", q)
 			}
 			_ = c.SetReadDeadline(time.Now().Add(20 * time.Second))
 			br := bufio.NewReaderSize(c, 64<<10)
@@ -133,5 +145,151 @@ func isClosed1068(ch chan struct{}) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// queued1068 is the bytes cs has queued for its socket, read under detachMu
+// with TryLock only: the caller may hold asyncInMu, and the loop may hold
+// detachMu for a flush. -1 if the lock stayed busy for 100 ms.
+func queued1068(cs *connState) int {
+	for dl := time.Now().Add(100 * time.Millisecond); time.Now().Before(dl); time.Sleep(time.Millisecond) {
+		if cs.detachMu.TryLock() {
+			n := csPendingBytes(cs)
+			cs.detachMu.Unlock()
+			return n
+		}
+	}
+	return -1
+}
+
+// abortHandler1068: /big waits for proceed, then answers with a body larger
+// than the socket buffers; /die panics, past every recovery (this handler is
+// the stream.Handler itself).
+type abortHandler1068 struct {
+	big     []byte
+	entered chan struct{}
+	proceed chan struct{}
+	once    sync.Once
+}
+
+func (h *abortHandler1068) HandleStream(_ context.Context, s *stream.Stream) error {
+	if s.ResponseWriter == nil {
+		return nil
+	}
+	if s.Path == "/die" {
+		panic("celeris1068: handler panic")
+	}
+	h.once.Do(func() { close(h.entered) })
+	<-h.proceed
+	return s.ResponseWriter.WriteResponse(s, 200,
+		[][2]string{{"content-type", "application/octet-stream"}, {"content-length", strconv.Itoa(len(h.big))}}, h.big)
+}
+func (*abortHandler1068) RouteAsync(_, _ string) bool { return true }
+func (*abortHandler1068) HasAsyncRoutes() bool        { return true }
+
+var _ stream.AsyncRouteResolver = (*abortHandler1068)(nil)
+
+// TestAbortedGoroutineDoesNotLoseTheQueuedRemainder1068: the same gap as above
+// on the other way a dispatch goroutine ends a conn. abortAsyncHandler stores
+// asyncClosed first, then lets go of detachMu and logs the panic with its
+// stack, and only then calls endDispatch. A pipelining client's first response
+// is partly sent and its remainder queued (the entry the goroutine enqueued
+// for it is still in the detach queue) when the second request's handler
+// panics; the loop that drains that entry in the window found a closed conn
+// whose goroutine was running and closed it over the remainder.
+//
+// The second request is on the wire while the first handler still runs, so
+// the goroutine takes it straight after the first flush without parking. The
+// test holds the abort after its log and waits for the loop to look.
+func TestAbortedGoroutineDoesNotLoseTheQueuedRemainder1068(t *testing.T) {
+	// What stays queued (the body less what the socket takes, about 2.4 MB
+	// here) must be under the 4 MiB cap, or the second request is refused
+	// before its handler runs (ErrWriteBacklog) and the abort is never reached;
+	// and more than the kernel takes from the loop while it decides.
+	const body = 5 << 20
+	var (
+		looked   = make(chan struct{})
+		lookOnce sync.Once
+		held     = make(chan struct{})
+		heldOnce sync.Once
+		queued   atomic.Int64
+	)
+	// The loop's look counts only once the goroutine is held: an earlier
+	// drain of the entry for the remainder finds the goroutine still holding
+	// detachMu (it has not released it before it logs), and leaves the close
+	// to it, as it always did.
+	var inWindow atomic.Bool
+	drainHook := func(*connState) {
+		if inWindow.Load() {
+			lookOnce.Do(func() { close(looked) })
+		}
+	}
+	abortHook := func(l *Loop, cs *connState) {
+		queued.Store(int64(queued1068(cs)))
+		inWindow.Store(true)
+		// An entry naming cs reaches the loop while the goroutine is in the
+		// window. (The one enqueued for the remainder is normally drained
+		// before the handler of the second request has panicked; one that is
+		// drained late, or another, is all the loop needs to look.)
+		l.enqueueDetach(cs)
+		select {
+		case <-looked:
+		case <-time.After(500 * time.Millisecond):
+		}
+		heldOnce.Do(func() { close(held) })
+	}
+	testHookAbortAsyncLogged.Store(&abortHook)
+	testHookDrainAsyncClosed.Store(&drainHook)
+	t.Cleanup(func() {
+		testHookAbortAsyncLogged.Store(nil)
+		testHookDrainAsyncClosed.Store(nil)
+	})
+
+	h := &abortHandler1068{big: newPathHandler885(body).big, entered: make(chan struct{}), proceed: make(chan struct{})}
+	e, addr := startE2E885(t, true, h, func(*resource.Config) {})
+	// A small receive buffer keeps the kernel from taking the remainder on
+	// its own (the send buffer grows with the peer's window) while the loop
+	// is deciding.
+	c := dialRcvBuf885(t, addr, 16<<10)
+	req1 := "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"
+	req2 := "GET /die HTTP/1.1\r\nHost: x\r\n\r\n"
+	if _, err := io.WriteString(c, req1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-h.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first handler never ran")
+	}
+	if _, err := io.WriteString(c, req2); err != nil {
+		t.Fatal(err)
+	}
+	// The loop has read the second request (into the goroutine's input) once
+	// the engine has counted both.
+	for dl := time.Now().Add(10 * time.Second); e.Metrics().BytesRead < uint64(len(req1)+len(req2)); time.Sleep(time.Millisecond) {
+		if time.Now().After(dl) {
+			t.Fatalf("the engine read %d of %d request bytes", e.Metrics().BytesRead, len(req1)+len(req2))
+		}
+	}
+	close(h.proceed)
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the dispatch goroutine never aborted")
+	}
+	if q := queued.Load(); q <= 0 {
+		t.Fatalf("%d bytes were queued while the aborted goroutine was held (-1: not readable): the test would prove nothing", q)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	br := bufio.NewReaderSize(c, 64<<10)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("response 1: %v (looked=%v)", err, isClosed1068(looked))
+	}
+	n, err := io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || n != body {
+		t.Fatalf("response 1: received %d of %d body bytes (%v): the loop closed the conn over the remainder while the aborted goroutine was still on its way out (looked=%v)",
+			n, body, err, isClosed1068(looked))
 	}
 }

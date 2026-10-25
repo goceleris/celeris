@@ -1957,12 +1957,18 @@ var testHookCloseWhenFlushed atomic.Pointer[func(*connState)]
 // before it has marked itself gone (endDispatch), with asyncInMu held for both:
 // the loop cannot read the two apart. testHookDrainAsyncClosed runs on the
 // loop's goroutine in drainDetachQueue when an entry names a conn declared
-// closed whose goroutine is still counted as running. A test that holds the
-// first and waits on the second sees the loop in the gap the lock closes
-// (celeris#1068). Atomic pointers, as testHookCloseWhenFlushed is; a load and a
+// closed whose goroutine is still counted as running, before the loop decides
+// whether to close it. A test that holds the first and waits on the second
+// sees the loop in the gap the lock closes (celeris#1068). Atomic pointers, as testHookCloseWhenFlushed is; a load and a
 // nil test per close, never a hot path.
 var testHookAsyncExitClosed atomic.Pointer[func(*connState)]
 var testHookDrainAsyncClosed atomic.Pointer[func(*connState)]
+
+// testHookAbortAsyncLogged, when set, runs in abortAsyncHandler after its log
+// record and before endDispatch, holding no lock: the one place an aborted
+// goroutine is closed and still counted as running (celeris#1068). It gets the
+// loop so that a test can queue an entry for the loop to drain in that place.
+var testHookAbortAsyncLogged atomic.Pointer[func(*Loop, *connState)]
 
 // discardWrite is the write function the run loop drains the H2 write queue of
 // a conn that is closing on a refused write into: the frames go nowhere.
@@ -3150,6 +3156,9 @@ func (l *Loop) abortAsyncHandler(cs *connState, r any, holds *dispatchHolds) {
 			)
 		}
 	}
+	if h := testHookAbortAsyncLogged.Load(); h != nil {
+		(*h)(l, cs)
+	}
 	cs.asyncClosed.Store(true)
 	cs.asyncInMu.Lock()
 	cs.asyncInBuf = cs.asyncInBuf[:0]
@@ -3551,6 +3560,18 @@ func (l *Loop) drainDetachQueue() {
 			if running {
 				if h := testHookDrainAsyncClosed.Load(); h != nil {
 					(*h)(cs)
+				}
+				// A goroutine that is still running a request is not done
+				// with the conn: the close is its to hand back (closeOwed),
+				// as closeConn does for a handler that holds detachMu. A
+				// goroutine that declared the conn closed itself and is on
+				// its way out (abortAsyncHandler logs between its store of
+				// asyncClosed and endDispatch) would otherwise be closed
+				// over, and the response it left queued cut short
+				// (celeris#1068). Its exit always enqueues cs again, and
+				// that entry finds it gone.
+				if dispatchBusy(cs, &cs.closeOwed) {
+					continue
 				}
 				l.closeConn(cs.fd)
 			} else {

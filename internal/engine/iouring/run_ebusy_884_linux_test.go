@@ -156,7 +156,7 @@ func TestRunSurvivesARingWaitEBUSY884(t *testing.T) {
 		// wait for, which 32 clients that send the next request at once keep
 		// from happening for the whole window: on a worker with a CPU to
 		// itself it did not happen once in 3 s of 79 000 requests, and the
-		// apparatus guard below failed 10 times in Coverage's -race
+		// apparatus guard below failed 9 times in Coverage's -race
 		// -covermode=atomic build (celeris#890). The other two modes are the
 		// ones that load always reaches.
 		think time.Duration

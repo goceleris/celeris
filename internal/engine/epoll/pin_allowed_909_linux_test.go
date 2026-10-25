@@ -5,6 +5,8 @@ package epoll
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -48,9 +50,23 @@ type logSink interface {
 // log, and returns it with its stop function.
 func start909(t *testing.T, workers int, log logSink) (*Engine, func()) {
 	t.Helper()
+	eng, stop, err := launch909(workers, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return eng, func() {
+		if err := stop(); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// launch909 is start909 without a *testing.T, so that a goroutine other than
+// the test's may start an engine and report why it could not.
+func launch909(workers int, log logSink) (*Engine, func() error, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("pick port: %v", err)
+		return nil, nil, fmt.Errorf("pick port: %w", err)
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
@@ -61,7 +77,7 @@ func start909(t *testing.T, workers int, log logSink) (*Engine, func()) {
 		Logger:    slog.New(slog.NewTextHandler(log, nil)),
 	}, respondingHandler{})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		return nil, nil, fmt.Errorf("New: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -70,12 +86,12 @@ func start909(t *testing.T, workers int, log logSink) (*Engine, func()) {
 		select {
 		case err := <-done:
 			cancel()
-			t.Fatalf("Listen returned before it bound: %v", err)
+			return nil, nil, fmt.Errorf("Listen returned before it bound: %w", err)
 		default:
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("the epoll engine did not bind within 10s")
+			return nil, nil, errors.New("the epoll engine did not bind within 10s")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -84,21 +100,22 @@ func start909(t *testing.T, workers int, log logSink) (*Engine, func()) {
 	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(log.String(), "epoll engine listening"); {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("the epoll engine did not log its listening line within 10s")
+			return nil, nil, errors.New("the epoll engine did not log its listening line within 10s")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	return eng, func() {
+	return eng, func() error {
 		cancel()
 		select {
 		case err := <-done:
 			if err != nil {
-				t.Errorf("Listen: %v", err)
+				return fmt.Errorf("Listen: %w", err)
 			}
+			return nil
 		case <-time.After(15 * time.Second):
-			t.Fatal("the epoll engine did not stop within 15s")
+			return errors.New("the epoll engine did not stop within 15s")
 		}
-	}
+	}, nil
 }
 
 // celeris#909: with the process restricted to a mask that leaves out its lowest
@@ -229,29 +246,40 @@ func TestStart909ReturnsOnlyOnceTheListeningLineIsLogged(t *testing.T) {
 	g := &gatedLog{gate: make(chan struct{})}
 	type started struct {
 		eng  *Engine
-		stop func()
+		stop func() error
+		err  error
 	}
 	ret := make(chan started, 1)
 	go func() {
-		eng, stop := start909(t, 2, g)
-		ret <- started{eng, stop}
+		eng, stop, err := launch909(2, g)
+		ret <- started{eng, stop, err}
 	}()
 	select {
 	case r := <-ret:
 		logged := g.String()
 		close(g.gate)
-		r.stop()
-		t.Fatalf("start909 returned (address %v) before the listening line was in the log: %q", r.eng.Addr(), logged)
+		if r.err != nil {
+			t.Fatalf("launch909: %v", r.err)
+		}
+		_ = r.stop()
+		t.Fatalf("launch909 returned (address %v) before the listening line was in the log: %q", r.eng.Addr(), logged)
 	case <-time.After(300 * time.Millisecond):
 	}
 	close(g.gate)
 	select {
 	case r := <-ret:
-		defer r.stop()
-		if !strings.Contains(g.String(), "epoll engine listening") {
-			t.Fatalf("start909 returned without the listening line in the log: %q", g.String())
+		if r.err != nil {
+			t.Fatalf("launch909: %v", r.err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("start909 did not return once the listening line was logged")
+		defer func() {
+			if err := r.stop(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if !strings.Contains(g.String(), "epoll engine listening") {
+			t.Fatalf("launch909 returned without the listening line in the log: %q", g.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("launch909 did not return once the listening line was logged")
 	}
 }
