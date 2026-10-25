@@ -16,7 +16,7 @@
 // receive a pooled *[Context] that carries the request and response: params
 // ([Context.Param]), query/form/body parsing ([Context.Query],
 // [Context.Bind]), and typed responses ([Context.JSON], [Context.String],
-// [Context.File], [Context.Stream]). Do not retain a *[Context] after the
+// [Context.File], [Context.StreamReader]). Do not retain a *[Context] after the
 // handler returns; use [Context.BodyCopy] to keep body bytes alive.
 //
 // The request strings a Context returns ([Context.Method], [Context.Path],

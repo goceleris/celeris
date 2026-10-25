@@ -139,7 +139,6 @@ method (*Context) StatusCode() int
 method (*Context) StatusJSON(any) error
 method (*Context) StatusString(string) error
 method (*Context) StatusXML(any) error
-method (*Context) Stream(int, string, io.Reader) error
 method (*Context) StreamReader(int, string, io.Reader) error
 method (*Context) StreamWriter() *StreamWriter
 method (*Context) String(int, string, ...any) error
@@ -152,7 +151,7 @@ method (*Context) XML(int, any) error
 method (*HTTPError) Error() string
 method (*HTTPError) Unwrap() error
 method (*HTTPError) WithError(error) *HTTPError
-method (*Route) Async(...bool) *Route
+method (*Route) Async() *Route
 method (*Route) Name(string) *Route
 method (*Route) Sync() *Route
 method (*Route) TryName(string) error

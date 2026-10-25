@@ -502,7 +502,7 @@ type Config struct {
 	// [RouteGroup.Async] (most-specific wins: route > group > this
 	// default), so a server with mostly CPU routes + a few DB routes can
 	// keep this false and mark just the DB routes .Async() / .UsesDriver(),
-	// or set this true and mark hot CPU routes .Async(false). On HTTP/2 the
+	// or set this true and mark hot CPU routes .Sync(). On HTTP/2 the
 	// override is honored per-stream (sync routes run inline on the event
 	// loop, async routes dispatch to the worker pool).
 	//

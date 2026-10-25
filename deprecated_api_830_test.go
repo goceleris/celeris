@@ -8,10 +8,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/goceleris/celeris"
 )
 
 // deprecationMarker opens the paragraph that go doc, gopls and staticcheck's
@@ -36,8 +39,9 @@ type allowedDeprecations struct {
 }
 
 // removal is one public identifier removed before the public v1.6.0 release
-// (celeris#830, celeris#826), with the replacement its deprecation notice
-// named. Dirs are relative to the repository root; a member is written
+// (celeris#830, celeris#826, celeris#889), with the replacement its
+// deprecation notice named (celeris#889: the replacement its doc comment
+// preferred, for the identifiers that were retired without a notice). Dirs are relative to the repository root; a member is written
 // "Type.Member".
 type removal struct {
 	dir, name     string // the removed identifier
@@ -56,6 +60,27 @@ var removedBeforeV160 = []removal{
 	{"middleware/session", "MemoryStoreConfig", "middleware/store", "MemoryKVConfig", "celeris#830"},
 	{"middleware/ratelimit", "Config.LimitReached", "middleware/ratelimit", "Config.ErrorHandler", "celeris#830"},
 	{"middleware/basicauth", "HashPassword", "middleware/basicauth", "HashPasswordPBKDF2", "celeris#826"},
+	{".", "Context.Stream", ".", "Context.StreamReader", "celeris#889"},
+	{"middleware/recovery", "Config.ErrorHandler", "middleware/recovery", "Config.ErrorHandlerErr", "celeris#889"},
+}
+
+// TestRouteAsyncTakesNoArgument889 pins the third removal of celeris#889: the
+// variadic-bool form of Route.Async is gone, so .Async() is the only call and
+// .Sync() the way to opt a route out of an async default. A removal by name
+// (removedBeforeV160) cannot see a signature change, so this reads the method
+// through reflection: a build that re-added "opt ...bool" fails here even
+// though no caller would stop compiling.
+func TestRouteAsyncTakesNoArgument889(t *testing.T) {
+	rt := reflect.TypeOf((*celeris.Route)(nil))
+	for _, name := range []string{"Async", "Sync", "UsesDriver"} {
+		m, ok := rt.MethodByName(name)
+		if !ok {
+			t.Fatalf("(*Route).%s is not declared", name)
+		}
+		if m.Type.IsVariadic() || m.Type.NumIn() != 1 {
+			t.Errorf("(*Route).%s is %s; want no parameters after the receiver (celeris#889 removed the bool form, use .Sync() for .Async(false))", name, m.Type)
+		}
+	}
 }
 
 // TestNoDeprecatedPublicAPI830 pins celeris#830 and celeris#826. celeris goes

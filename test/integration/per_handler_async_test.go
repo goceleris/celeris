@@ -21,13 +21,13 @@ import (
 func registerMixedAsyncRoutes(srv *celeris.Server) {
 	srv.GET("/cpu", func(c *celeris.Context) error { return c.String(http.StatusOK, "cpu") })       // sync (default)
 	srv.GET("/db", func(c *celeris.Context) error { return c.String(http.StatusOK, "db") }).Async() // async
-	srv.GET("/cached", func(c *celeris.Context) error { return c.String(http.StatusOK, "cached") }).Async(false)
+	srv.GET("/cached", func(c *celeris.Context) error { return c.String(http.StatusOK, "cached") }).Sync()
 	srv.GET("/users/:id", func(c *celeris.Context) error {
 		return c.String(http.StatusOK, "user:%s", c.Param("id"))
 	}).Async()
 	api := srv.Group("/api").Async()
 	api.GET("/products", func(c *celeris.Context) error { return c.String(http.StatusOK, "products") })
-	api.GET("/static", func(c *celeris.Context) error { return c.String(http.StatusOK, "static") }).Async(false)
+	api.GET("/static", func(c *celeris.Context) error { return c.String(http.StatusOK, "static") }).Sync()
 }
 
 var mixedAsyncCases = []struct{ path, want string }{

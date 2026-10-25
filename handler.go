@@ -639,7 +639,7 @@ func (a *routerAdapter) HasAsyncRoutes() bool {
 	return a.server.router.hasAsyncRoutes()
 }
 
-// AsyncRouteCount returns the number of routes registered with .Async(true).
+// AsyncRouteCount returns the number of routes registered with .Async() or .UsesDriver().
 // Engines expose this through Metrics().AsyncRoutes for diagnostics.
 func (a *routerAdapter) AsyncRouteCount() int {
 	return a.server.router.asyncRouteCount

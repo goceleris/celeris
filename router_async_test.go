@@ -65,11 +65,11 @@ func TestRouteAsync_RouteOverrideOn(t *testing.T) {
 
 // TestRouteAsync_RouteOverrideOff verifies that on an async-default server, an
 // inherited route is adaptive (inline-first, celeris#356) while an explicit
-// .Async(false) route is hard-sync and never adaptive.
+// .Sync() route is hard-sync and never adaptive.
 func TestRouteAsync_RouteOverrideOff(t *testing.T) {
 	s := New(Config{AsyncHandlers: true})
-	s.GET("/db", noopHandler)                  // inherits default → adaptive
-	s.GET("/cached", noopHandler).Async(false) // explicit sync → never adaptive
+	s.GET("/db", noopHandler)            // inherits default → adaptive
+	s.GET("/cached", noopHandler).Sync() // explicit sync → never adaptive
 	if s.router.routeAsync("GET", "/db") {
 		t.Fatal("/db inherits the async default → adaptive, starts inline")
 	}
@@ -77,7 +77,7 @@ func TestRouteAsync_RouteOverrideOff(t *testing.T) {
 		t.Fatal("/db should be adaptive")
 	}
 	if s.router.routeAsync("GET", "/cached") {
-		t.Fatal("/cached should be forced sync via Async(false)")
+		t.Fatal("/cached should be forced sync via Sync()")
 	}
 	if s.router.adaptiveRoutes["/cached"] {
 		t.Fatal("/cached is explicitly sync → must not be adaptive")
@@ -127,8 +127,8 @@ func TestRouteAsync_GroupInherit(t *testing.T) {
 func TestRouteAsync_RouteOverridesGroup(t *testing.T) {
 	s := New(Config{AsyncHandlers: false})
 	api := s.Group("/api").Async()
-	api.GET("/products", noopHandler)            // async (group)
-	api.GET("/cached", noopHandler).Async(false) // sync (route override)
+	api.GET("/products", noopHandler)      // async (group)
+	api.GET("/cached", noopHandler).Sync() // sync (route override)
 	if !s.router.routeAsync("GET", "/api/products") {
 		t.Fatal("/api/products should be async (group)")
 	}
@@ -174,7 +174,7 @@ func TestRouteAsync_Count(t *testing.T) {
 		t.Fatalf("asyncRouteCount = %d, want 2", s.router.asyncRouteCount)
 	}
 	// Flip /a back to sync — count should drop to 1.
-	r1.Async(false)
+	r1.Sync()
 	if s.router.asyncRouteCount != 1 {
 		t.Fatalf("asyncRouteCount = %d, want 1 after flipping /a sync", s.router.asyncRouteCount)
 	}

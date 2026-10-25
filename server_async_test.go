@@ -29,7 +29,7 @@ func startMixedAsyncServer(t *testing.T, cfg Config) (string, func()) {
 	// Explicit async route.
 	s.GET("/db", func(c *Context) error { return c.String(http.StatusOK, "db") }).Async()
 	// Explicit sync override (only meaningful when default is async).
-	s.GET("/cached", func(c *Context) error { return c.String(http.StatusOK, "cached") }).Async(false)
+	s.GET("/cached", func(c *Context) error { return c.String(http.StatusOK, "cached") }).Sync()
 	// Param + async.
 	s.GET("/users/:id", func(c *Context) error {
 		return c.String(http.StatusOK, "user:%s", c.Param("id"))
@@ -37,7 +37,7 @@ func startMixedAsyncServer(t *testing.T, cfg Config) (string, func()) {
 	// Group async + per-route override inside it.
 	api := s.Group("/api").Async()
 	api.GET("/products", func(c *Context) error { return c.String(http.StatusOK, "products") })
-	api.GET("/static", func(c *Context) error { return c.String(http.StatusOK, "static") }).Async(false)
+	api.GET("/static", func(c *Context) error { return c.String(http.StatusOK, "static") }).Sync()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -106,7 +106,7 @@ func TestServerMixedAsync_CorrectResponses(t *testing.T) {
 
 // TestServerMixedAsync_AsyncDefault verifies the same route surface on an
 // async-default server (Config.AsyncHandlers=true) still returns correct
-// responses, including the .Async(false) sync overrides.
+// responses, including the .Sync() overrides.
 func TestServerMixedAsync_AsyncDefault(t *testing.T) {
 	base, stop := startMixedAsyncServer(t, Config{AsyncHandlers: true})
 	defer stop()

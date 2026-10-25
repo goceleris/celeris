@@ -53,7 +53,7 @@ func (g *RouteGroup) Async(opt ...bool) *RouteGroup {
 
 // Sync forces all routes registered on this group AFTER this call to run
 // inline on the worker / event-loop thread, overriding any server-level
-// async default. Equivalent to .Async(false). Individual routes can still
+// async default. Individual routes can still
 // override via [Route.Async]. Chainable.
 //
 // SAFETY: do NOT call .Sync() on a group whose handlers hijack/detach the

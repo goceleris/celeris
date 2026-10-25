@@ -636,7 +636,7 @@ func TestFlushResponseExtraCalls(t *testing.T) {
 	}
 }
 
-func TestStreamOverflow(t *testing.T) {
+func TestStreamReaderOverflow(t *testing.T) {
 	s, _ := newTestStream("GET", "/stream")
 	defer s.Release()
 
@@ -645,7 +645,7 @@ func TestStreamOverflow(t *testing.T) {
 
 	// Create a reader that exceeds 100MB.
 	big := make([]byte, maxStreamBodySize+1)
-	err := c.Stream(200, "application/octet-stream", bytes.NewReader(big))
+	err := c.StreamReader(200, "application/octet-stream", bytes.NewReader(big))
 	if err == nil {
 		t.Fatal("expected error for stream overflow")
 	}
@@ -780,7 +780,7 @@ func TestContextFileRange(t *testing.T) {
 	}
 }
 
-func TestContextStream(t *testing.T) {
+func TestContextStreamReader(t *testing.T) {
 	s, rw := newTestStream("GET", "/stream")
 	defer s.Release()
 
@@ -788,7 +788,7 @@ func TestContextStream(t *testing.T) {
 	defer releaseContext(c)
 
 	r := bytes.NewReader([]byte("streamed data"))
-	if err := c.Stream(200, "text/plain", r); err != nil {
+	if err := c.StreamReader(200, "text/plain", r); err != nil {
 		t.Fatal(err)
 	}
 	if rw.status != 200 {

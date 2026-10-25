@@ -25,7 +25,7 @@ type staticEntry struct {
 // asyncSetting is the tri-state per-route/per-group dispatch override
 // carried from the registration API down to the router. asyncDefault
 // means "inherit the server default (Config.AsyncHandlers)"; asyncOn /
-// asyncOff are explicit overrides set by .Async(true) / .Async(false).
+// asyncOff are explicit overrides set by .Async() / .Sync().
 type asyncSetting int8
 
 const (
@@ -221,8 +221,8 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 
 // Async marks this route for the per-conn dispatch goroutine, overriding
 // any group-level or server-level (Config.AsyncHandlers) default.
-// SAFETY: do NOT call .Sync() (or .Async(false)) on a WebSocket / SSE
-// handler — detached flows run async by construction.
+// SAFETY: do NOT call .Sync() on a WebSocket / SSE handler — detached flows
+// run async by construction.
 //
 // An async route's handler does not run on the event loop, so a
 // [runtime.Goexit] in it (t.FailNow, t.Fatal and t.SkipNow in a test's
@@ -236,26 +236,21 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 // Goexit: see [Route.Sync].
 //
 // Precedence is route > group > server default. Must be called before
-// [Server.Start]. Chainable. Async() with no argument means true; the
-// variadic-bool form is kept for back-compat — prefer .Sync() to opt a
-// single route out of an async-default group/server.
+// [Server.Start]. Chainable. To opt a single route out of an async-default
+// group or server, call .Sync().
 //
 //	srv.GET("/users/:id", userHandler).Async()      // async, this route
 //	api.GET("/cached", cachedHandler).Sync()        // opt out of group async
 //
 // See [Config.AsyncHandlers] for the server-level default and the
 // per-handler async design overview.
-func (r *Route) Async(opt ...bool) *Route {
-	want := true
-	if len(opt) > 0 {
-		want = opt[0]
-	}
-	return r.setAsync(want)
+func (r *Route) Async() *Route {
+	return r.setAsync(true)
 }
 
 // Sync forces this route to run inline on the worker / event-loop thread,
-// overriding any group-level or server-level async default. Equivalent to
-// .Async(false) but reads more naturally at the call site:
+// overriding any group-level or server-level async default. It is the way
+// to opt a route out of an async default:
 //
 //	api := srv.Group("/api").Async()
 //	api.GET("/products", productHandler)            // async (from group)
@@ -557,7 +552,7 @@ func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, 
 	// celeris#356: a route that inherits the server-level AsyncHandlers=true
 	// default (rather than an explicit .Async()) starts INLINE and is promoted
 	// to async only when an inline run is observed to block. Explicit
-	// .Async(true)/.Async(false) is honored verbatim.
+	// .Async()/.Sync() is honored verbatim.
 	adaptive := as == asyncDefault && r.defaultAsync
 	if adaptive {
 		async = false

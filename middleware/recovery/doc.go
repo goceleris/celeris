@@ -10,8 +10,7 @@
 //	server.Use(recovery.New())
 //
 // [New] accepts an optional [Config] to customise behaviour. Key fields:
-//   - [Config].ErrorHandlerErr — preferred error handler (receives a typed error).
-//   - [Config].ErrorHandler — legacy handler (receives any); kept for compatibility.
+//   - [Config].ErrorHandlerErr — error handler (receives the panic as an error).
 //   - [Config].BrokenPipeHandler — custom handler for broken pipe / ECONNRESET panics.
 //   - [Config].StackSize — max bytes for stack trace capture (default 4096; 0 disables).
 //   - [Config].DisableLogStack — suppress all panic log output when true.
