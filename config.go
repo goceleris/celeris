@@ -613,6 +613,32 @@ type Config struct {
 	// invalid one as HTTP/1.1, upgrade a repeated one and serve an empty one
 	// as HTTP/1.1 (tracked on celeris#889).
 	EnableH2Upgrade *bool
+
+	// DisableAutoHEAD turns off the automatic HEAD answer (celeris#421). By
+	// default a HEAD request to a path that has a GET route and no HEAD route
+	// runs the GET route (RFC 9110 §9.3.2: HEAD is GET without the content;
+	// the engine sends the headers and drops the body), and the path's Allow
+	// lists HEAD. When true, only a route registered for HEAD answers a HEAD
+	// request: any other HEAD request is answered like a method the path does
+	// not support, 405 Method Not Allowed with an Allow header that does not
+	// list HEAD (or 404 if the path has no route), and it runs the
+	// [Server.MethodNotAllowed] handler. Use it to keep a GET handler with a
+	// side effect, or a streaming one, from running for HEAD requests; register
+	// an explicit [Server.HEAD] route for the paths that should answer them.
+	// Default: false (HEAD is answered by the GET route).
+	DisableAutoHEAD bool
+
+	// DisableAutoOPTIONS turns off the automatic OPTIONS answer (celeris#421).
+	// By default an OPTIONS request to a path that has routes and no OPTIONS
+	// route is answered 200 with an Allow header and Content-Length: 0
+	// (RFC 9110 §9.3.7) after the global middleware ([Server.Use]) has run,
+	// and the path's Allow lists OPTIONS. When true, only a route registered
+	// for OPTIONS answers an OPTIONS request: any other is answered like a
+	// method the path does not support (405 with an Allow header that does
+	// not list OPTIONS, or 404 if the path has no route). The global
+	// middleware still runs for it, so a CORS middleware installed with
+	// [Server.Use] still answers its preflight. Default: false.
+	DisableAutoOPTIONS bool
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.

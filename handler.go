@@ -480,7 +480,7 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 
 func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 	var allowed []string
-	if c.method == "OPTIONS" {
+	if c.method == "OPTIONS" && !a.server.router.noAutoOPTIONS {
 		// celeris#421: a path with routes but no OPTIONS route is answered
 		// with what it allows (OPTIONS included). That list is never empty
 		// for a routed path, so an empty one means the path has no route at

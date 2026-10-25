@@ -97,6 +97,13 @@ type router struct {
 	// Config.AsyncHandlers at server construction. Routes/groups that
 	// don't override inherit it.
 	defaultAsync bool
+	// noAutoHEAD and noAutoOPTIONS are Config.DisableAutoHEAD and
+	// Config.DisableAutoOPTIONS (celeris#891): with them set, a HEAD request
+	// is never answered by the path's GET route (findHEADAsGET misses), an
+	// OPTIONS request is never answered by the router itself, and
+	// allowedMethods lists neither unless the path has a route for it.
+	noAutoHEAD    bool
+	noAutoOPTIONS bool
 	// asyncRouteCount tracks how many registered routes resolve to
 	// async dispatch. hasAsyncRoutes() reads it to let the engine
 	// decide whether the async dispatch infrastructure is needed at
@@ -700,6 +707,9 @@ func isStaticPath(path string) bool {
 // keyed by method) and routeAsync (the dispatch decision), which must agree
 // on the route. n is the length params had before the failed walk.
 func (r *router) findHEADAsGET(path string, params *Params, n int) ([]HandlerFunc, string, bool) {
+	if r.noAutoHEAD {
+		return nil, "", false
+	}
 	*params = (*params)[:n]
 	return r.find("GET", path, params)
 }
@@ -754,11 +764,14 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 // §10.2.1), excluding except: every method with a route for the path, HEAD
 // when the path has a GET or HEAD route (a HEAD without its own route is
 // answered by the GET route, findHEADAsGET), and OPTIONS (answered
-// automatically when the path has no OPTIONS route). The order is GET, POST,
-// PUT, DELETE, PATCH, HEAD, OPTIONS, then custom methods sorted. A path with
-// no route at all returns nil, and a path with one returns at least OPTIONS
-// (when except is not "OPTIONS" itself), so with except "" an empty result
-// means the path is unrouted (handleUnmatched relies on it to walk once).
+// automatically when the path has no OPTIONS route). With Config.DisableAutoHEAD
+// or Config.DisableAutoOPTIONS (celeris#891) the automatic one is not listed.
+// The order is GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, then custom
+// methods sorted. A path with no route at all returns nil, and a path with
+// one returns at least that route's method (OPTIONS too, unless
+// DisableAutoOPTIONS, when except is not "OPTIONS" itself), so with except ""
+// an empty result means the path is unrouted (handleUnmatched relies on it to
+// walk once).
 func (r *router) allowedMethods(path string, except string) []string {
 	var params Params
 	has := func(method string) bool {
@@ -784,8 +797,8 @@ func (r *router) allowedMethods(path string, except string) []string {
 	if !routed {
 		return nil
 	}
-	found[mHEAD] = found[mHEAD] || found[mGET]
-	found[mOPTIONS] = true
+	found[mHEAD] = found[mHEAD] || found[mGET] && !r.noAutoHEAD
+	found[mOPTIONS] = found[mOPTIONS] || !r.noAutoOPTIONS
 	allowed := make([]string, 0, nMethods+len(custom))
 	for i, ok := range found {
 		if ok && methodNames[i] != except {

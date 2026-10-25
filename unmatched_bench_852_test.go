@@ -40,6 +40,9 @@ func BenchmarkUnmatched852(b *testing.B) {
 			// path with no route (a 404 that used to walk the router twice).
 			{"options-200", "OPTIONS", "/exists"},
 			{"options-404", "OPTIONS", "/missing"},
+			// celeris#891: a HEAD for a path with a GET route and no HEAD route,
+			// which find misses before findHEADAsGET finds the GET route.
+			{"head-200", "HEAD", "/exists"},
 		} {
 			b.Run(rq.name+"/"+v.name, func(b *testing.B) {
 				b.ReportAllocs()
