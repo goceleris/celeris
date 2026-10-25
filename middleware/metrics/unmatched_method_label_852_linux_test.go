@@ -36,12 +36,15 @@ func (w *syncBuffer852) String() string {
 }
 
 // TestUnmatchedMethodLabelNativeEngines852 is TestUnmatchedMethodLabelBounded852
-// on epoll and io_uring, whose H1 parser passes a method net/http refuses: one
-// that is not valid UTF-8, on which client_golang's WithLabelValues panics
-// (recovered by the server, with a logged stack, per request). The method
-// starts with G so protocol detection keeps the connection. Every request no
-// route matched lands in the "_OTHER" series, nothing panics, and Gather
-// succeeds.
+// on epoll and io_uring. Their H1 parser used to pass a method net/http
+// refuses, one that is not valid UTF-8, on which client_golang's
+// WithLabelValues panics (recovered by the server, with a logged stack, per
+// request); it now refuses a method that is not a token with 400 as net/http
+// does (celeris#889), so no such label value reaches the middleware, which is
+// checked on a connection of its own. The tokens that remain are custom
+// methods, starting with G so protocol detection keeps the connection. Every
+// request no route matched lands in the "_OTHER" series, nothing panics, and
+// Gather succeeds.
 func TestUnmatchedMethodLabelNativeEngines852(t *testing.T) {
 	const n = 20
 	for _, a := range keptArms(t) {
@@ -76,10 +79,26 @@ func TestUnmatchedMethodLabelNativeEngines852(t *testing.T) {
 					t.Errorf("%q %s: %d, want %d", method, path, resp.StatusCode, want)
 				}
 			}
-			send("G\xff\xfe", "/nope", 404)
-			send("G\xff\xfe", "/ping", 405)
+			send("G.x~", "/nope", 404)
+			send("G.x~", "/ping", 405)
 			for i := range n {
 				send(fmt.Sprintf("GZ%02d", i), "/nope", 404)
+			}
+
+			// A method that is not a token is refused before the handler: 400,
+			// and the connection is closed.
+			bad, badBr := keptDial(t, addr)
+			defer func() { _ = bad.Close() }()
+			if _, err := bad.Write([]byte("G\xff\xfe /ping HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+				t.Fatal(err)
+			}
+			if resp, err := http.ReadResponse(badBr, nil); err != nil {
+				t.Errorf("a method that is not a token: %v", err)
+			} else {
+				_ = resp.Body.Close()
+				if resp.StatusCode != 400 {
+					t.Errorf("a method that is not a token: %d, want 400", resp.StatusCode)
+				}
 			}
 
 			if p := strings.Count(logs.String(), "handler panic recovered"); p != 0 {
