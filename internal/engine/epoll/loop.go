@@ -1444,6 +1444,71 @@ func (l *Loop) growConns(fd int) {
 	l.driverMu.Unlock()
 }
 
+// testHookAsyncHandoff, when set, runs on the loop thread in drainRead right
+// after the bytes of a read were handed to the conn's dispatch goroutine
+// (both async branches: the promoting request, and a later read of a promoted
+// conn), before the loop reads the descriptor again. The goroutine runs
+// concurrently from here, so a test uses it to let a handler's Hijack finish
+// in exactly this window (celeris#936). An atomic pointer, as the other test
+// hooks are: one load per hand-off (per read that delivered bytes to the
+// goroutine), not per read.
+var testHookAsyncHandoff atomic.Pointer[func(fd int, cs *connState)]
+
+// testHookReadPromoted, when set, runs in readPromoted between the hijacked
+// check and the read(2), inside the critical section. It is how a test shows
+// the check and the read are one critical section: a hijack that gets through
+// while the hook runs closes the descriptor under the read (celeris#936). An
+// atomic pointer: one load per read of a promoted conn.
+var testHookReadPromoted atomic.Pointer[func(fd int, cs *connState)]
+
+// testHookHijackMarked, when set, runs in hijackConn's off-thread path right
+// before EPOLL_CTL_DEL: the point by which hijacked must already be stored,
+// under asyncInMu (celeris#936). One load per off-thread hijack.
+var testHookHijackMarked atomic.Pointer[func(cs *connState)]
+
+// testHookCloseOnReadEnd, when set, runs at the start of closeOnReadEnd, on
+// the loop thread, after the read that ended the conn and before the lock
+// (celeris#936).
+var testHookCloseOnReadEnd atomic.Pointer[func(fd int, cs *connState)]
+
+// errHijackedConn is what readPromoted reports for a conn whose dispatch
+// goroutine has hijacked it: the descriptor is no longer the engine's.
+var errHijackedConn = errors.New("celeris: epoll: connection hijacked")
+
+// readPromoted is drainRead's read of fd for a conn that has a dispatch
+// goroutine (cs.asyncPromoted). That goroutine runs the handler, and a
+// handler's Context.Hijack closes the original descriptor from there
+// (hijackConn), after which the kernel reissues the number to the next accept,
+// client socket or file this process opens. The loop thread reads fd more
+// than once per event: after it hands a read to the goroutine it goes round
+// again for the rest of the edge, and so a read it makes then can land on
+// another socket's bytes, any socket in the process: the engine consumes data
+// that is not its connection's, and what that was waiting for never arrives
+// (celeris#936).
+//
+// A check of cs.hijacked before an unlocked read is not enough: the hijack and
+// the close fit between the check and the syscall. So the check and the read
+// are one critical section on cs.asyncInMu, and hijackConn stores hijacked
+// under the same lock, before it releases the descriptor. Either the read
+// completes first, while the descriptor is still the conn's, or the hijack
+// does, and then no read starts. The read is non-blocking, so the goroutine
+// (which takes asyncInMu only for short sections: park, hand-in) waits for
+// one syscall at most. The lock order is detachMu then asyncInMu, as
+// hijackConn's: this holds only asyncInMu and takes nothing under it.
+func readPromoted(fd int, cs *connState, buf []byte) (int, error) {
+	cs.asyncInMu.Lock()
+	if cs.hijacked.Load() {
+		cs.asyncInMu.Unlock()
+		return 0, errHijackedConn
+	}
+	if h := testHookReadPromoted.Load(); h != nil {
+		(*h)(fd, cs)
+	}
+	n, err := unix.Read(fd, buf)
+	cs.asyncInMu.Unlock()
+	return n, err
+}
+
 func (l *Loop) drainRead(fd int, now int64) {
 	if fd < 0 || fd >= len(l.conns) {
 		return
@@ -1471,7 +1536,19 @@ func (l *Loop) drainRead(fd int, now int64) {
 				intoBody = true
 			}
 		}
-		n, err := unix.Read(fd, recvBuf)
+		var n int
+		var err error
+		if cs.asyncPromoted {
+			// The conn's dispatch goroutine can hijack it, and so close
+			// this descriptor, at any moment: read only while it has not
+			// (celeris#936).
+			n, err = readPromoted(fd, cs, recvBuf)
+			if err == errHijackedConn {
+				return
+			}
+		} else {
+			n, err = unix.Read(fd, recvBuf)
+		}
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
@@ -1662,6 +1739,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 			// addWrittenBytes(_, true); the dispatch goroutine must never
 			// touch it. Mirrors iouring's asyncFeed site (worker.go).
 			l.reqBatch++
+			if h := testHookAsyncHandoff.Load(); h != nil {
+				(*h)(fd, cs)
+			}
 			continue
 		}
 
@@ -1729,6 +1809,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// conn is counted by the asyncFeed site above. Mirrors
 				// iouring's promoteConnToAsync.
 				l.reqBatch++
+				if h := testHookAsyncHandoff.Load(); h != nil {
+					(*h)(fd, cs)
+				}
 				continue
 			}
 			if errors.Is(processErr, conn.ErrUpgradeH2C) {
@@ -2198,6 +2281,9 @@ func (l *Loop) closingDrainBound() time.Duration {
 // exits at its next check, and then runs it on this thread with the lock
 // free, delivering closeErr first.
 func (l *Loop) closeOnReadEnd(fd int, cs *connState, err error) {
+	if h := testHookCloseOnReadEnd.Load(); h != nil {
+		(*h)(fd, cs)
+	}
 	mu := cs.detachMu
 	if mu != nil && !mu.TryLock() {
 		if dispatchBusy(cs, nil) {
@@ -2210,6 +2296,19 @@ func (l *Loop) closeOnReadEnd(fd int, cs *connState, err error) {
 			return
 		}
 		mu.Lock()
+	}
+	if mu != nil && cs.hijacked.Load() {
+		// The read ended the conn (EOF, reset), and then its handler
+		// hijacked it (celeris#668, celeris#936): the descriptor is closed
+		// and its number may be another file's, and what the flush below
+		// would write is a reply to an earlier pipelined request that the
+		// hijack left in writeBuf. Nothing here is the engine's any more: the
+		// application owns the conn, nothing is surfaced to a detached
+		// middleware, and drainDetachQueue settles the live set, the
+		// counters and the dirty list (hijackConn already counted the close).
+		// closeConn would find the slot nil. As onPeerHalfClose does.
+		mu.Unlock()
+		return
 	}
 	_ = l.flushWrites(cs, true)
 	// An error parked by an earlier read-end that met the running handler is
@@ -2317,6 +2416,12 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	if cs.detachMu != nil {
 		cs.asyncInMu.Lock()
 		offThread = cs.asyncRun
+		if offThread {
+			// Stored under asyncInMu, before the descriptor is touched: a read
+			// of it that the loop thread has started (readPromoted) has
+			// finished by now, and none starts after (celeris#936).
+			cs.hijacked.Store(true)
+		}
 		cs.asyncInMu.Unlock()
 	}
 	// Detach the conn from the engine: drop it from epoll and the conn table,
@@ -2345,10 +2450,13 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	// hijacked, which is stored BEFORE the descriptor is released: by the
 	// time the kernel can reissue the number to another accept, the entry
 	// already reads as not the loop's.
-	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	if offThread {
-		cs.hijacked.Store(true)
-	} else {
+		if h := testHookHijackMarked.Load(); h != nil {
+			(*h)(cs)
+		}
+	}
+	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
+	if !offThread {
 		l.removeLiveConn(cs)
 	}
 	l.driverMu.Lock()
@@ -3542,7 +3650,8 @@ func (l *Loop) drainDetachQueue() {
 		// made before the hijack find hijackSettled and do nothing. The
 		// connState is never pooled (see hijackConn), so none of those
 		// entries can name reissued memory. Skip closeConn — there is no fd
-		// to close and l.conns[fd] is already nil.
+		// to close and l.conns[fd] is nil, or about to be: hijacked is
+		// stored before hijackConn clears the slot (celeris#936).
 		if cs.hijacked.Load() {
 			if !cs.hijackSettled {
 				cs.hijackSettled = true
