@@ -79,6 +79,15 @@ func start909(t *testing.T, workers int, log logSink) (*Engine, func()) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	// Listen publishes the address and only then logs its listening line
+	// (celeris#890): a caller that reads the log on return must find it.
+	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(log.String(), "epoll engine listening"); {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("the epoll engine did not log its listening line within 10s")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	return eng, func() {
 		cancel()
 		select {
