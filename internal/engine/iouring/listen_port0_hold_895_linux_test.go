@@ -107,8 +107,8 @@ func TestPort0IsHeldBetweenBeingChosenAndBeingBound895(t *testing.T) {
 	if err := r.stop(t); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	if n := census895(t).bound[port]; n != 0 {
-		t.Fatalf("%d sockets still bound to port %d after Listen returned, want 0 (the hold included)", n, port)
+	if c := census895(t); c.bound[port] != 0 {
+		t.Fatalf("%d sockets still bound to port %d after Listen returned, want 0 (the hold included): %s", c.bound[port], port, c.owned895(port))
 	}
 }
 
@@ -144,8 +144,8 @@ func TestPort0HoldIsReleasedWhenListenFails895(t *testing.T) {
 		t.Fatal("the hook never ran")
 	}
 	port := portOfString895(t, addr)
-	if n := census895(t).bound[port]; n != 0 {
-		t.Fatalf("%d sockets still bound to port %d after Listen failed, want 0", n, port)
+	if c := census895(t); c.bound[port] != 0 {
+		t.Fatalf("%d sockets still bound to port %d after Listen failed, want 0: %s", c.bound[port], port, c.owned895(port))
 	}
 	// bindWithin656, not an immediate bind: the sockets of a worker that
 	// was cancelled are let go of asynchronously on a main without the

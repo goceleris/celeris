@@ -5,6 +5,7 @@ package iouring
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -43,6 +44,19 @@ import (
 // local address has a port are counted.
 type sockets895 struct {
 	bound, listening map[int]int
+	// owners says, for every port, what each socket counted in bound is: its
+	// descriptor, whether it listens, is connected (and to whom) or is only
+	// bound, and its SO_REUSEPORT. A census that finds a socket nobody expects
+	// (celeris#1104) then names it in the failure.
+	owners map[int][]string
+}
+
+// owned895 is the owners of port, for a failure message.
+func (s sockets895) owned895(port int) string {
+	if len(s.owners[port]) == 0 {
+		return "none"
+	}
+	return strings.Join(s.owners[port], "; ")
 }
 
 func census895(t *testing.T) sockets895 {
@@ -51,7 +65,7 @@ func census895(t *testing.T) sockets895 {
 	if err != nil {
 		t.Fatalf("read /proc/self/fd: %v", err)
 	}
-	s := sockets895{bound: map[int]int{}, listening: map[int]int{}}
+	s := sockets895{bound: map[int]int{}, listening: map[int]int{}, owners: map[int][]string{}}
 	for _, ent := range ents {
 		fd, err := strconv.Atoi(ent.Name())
 		if err != nil {
@@ -79,11 +93,27 @@ func census895(t *testing.T) sockets895 {
 			continue
 		}
 		s.bound[port]++
+		state := "bound only"
 		if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN); err == nil && v == 1 {
 			s.listening[port]++
+			state = "listening"
+		} else if peer, err := unix.Getpeername(fd); err == nil {
+			state = fmt.Sprintf("connected to %s", sockaddrString895(peer))
 		}
+		reuse, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT)
+		s.owners[port] = append(s.owners[port], fmt.Sprintf("fd %d %s (SO_REUSEPORT=%d)", fd, state, reuse))
 	}
 	return s
+}
+
+func sockaddrString895(sa unix.Sockaddr) string {
+	switch a := sa.(type) {
+	case *unix.SockaddrInet4:
+		return net.JoinHostPort(net.IP(a.Addr[:]).String(), strconv.Itoa(a.Port))
+	case *unix.SockaddrInet6:
+		return net.JoinHostPort(net.IP(a.Addr[:]).String(), strconv.Itoa(a.Port))
+	}
+	return fmt.Sprintf("%T", sa)
 }
 
 func ports895(m map[int]int) []int {
