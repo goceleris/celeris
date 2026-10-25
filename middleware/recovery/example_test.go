@@ -14,7 +14,7 @@ func ExampleNew() {
 func ExampleNew_customHandler() {
 	// Custom error handler for panics.
 	_ = recovery.New(recovery.Config{
-		ErrorHandlerErr: func(c *celeris.Context, err error) error {
+		ErrorHandler: func(c *celeris.Context, err error) error {
 			return c.String(500, "something went wrong: %v", err)
 		},
 	})

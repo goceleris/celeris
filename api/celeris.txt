@@ -158,7 +158,7 @@ method (*Route) TryName(string) error
 method (*Route) Use(...HandlerFunc) *Route
 method (*Route) UsesDriver() *Route
 method (*RouteGroup) Any(string, ...HandlerFunc) []*Route
-method (*RouteGroup) Async(...bool) *RouteGroup
+method (*RouteGroup) Async() *RouteGroup
 method (*RouteGroup) DELETE(string, ...HandlerFunc) *Route
 method (*RouteGroup) GET(string, ...HandlerFunc) *Route
 method (*RouteGroup) Group(string, ...HandlerFunc) *RouteGroup

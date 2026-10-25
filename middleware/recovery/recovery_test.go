@@ -87,7 +87,7 @@ func TestRecoverySkip(t *testing.T) {
 
 func TestRecoveryCustomHandler(t *testing.T) {
 	mw := New(Config{
-		ErrorHandlerErr: func(c *celeris.Context, err error) error {
+		ErrorHandler: func(c *celeris.Context, err error) error {
 			return c.String(503, "custom: %v", err)
 		},
 	})
@@ -224,7 +224,7 @@ func TestStackAllCapturesAllGoroutines(t *testing.T) {
 
 func TestNestedRecoveryPanic(t *testing.T) {
 	mw := New(Config{
-		ErrorHandlerErr: func(_ *celeris.Context, _ error) error {
+		ErrorHandler: func(_ *celeris.Context, _ error) error {
 			panic("error handler panic")
 		},
 	})
@@ -322,7 +322,7 @@ func TestNestedRecoveryLogs(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(buf, nil))
 	mw := New(Config{
 		Logger: log,
-		ErrorHandlerErr: func(_ *celeris.Context, _ error) error {
+		ErrorHandler: func(_ *celeris.Context, _ error) error {
 			panic("handler exploded")
 		},
 	})
@@ -521,17 +521,17 @@ func FuzzRecoveryPanicValues(f *testing.F) {
 	})
 }
 
-// ErrorHandlerErr is the only panic handler since celeris#889 removed the
-// any-typed ErrorHandler. These tests pin what the removed field's users get
-// from it: a non-error panic value arrives wrapped, an error panic value
+// ErrorHandler took the panic as an any until celeris#889, which made it an
+// error (the field the middleware family shares: jwt, keyauth, basicauth,
+// csrf). These tests pin what a user of the old field gets from it: a non-error panic value arrives wrapped, an error panic value
 // arrives as it is, an unset handler answers the default JSON 500, and a
 // handler that panics falls back to that default.
 
-func TestErrorHandlerErrWrapsANonErrorPanic889(t *testing.T) {
+func TestErrorHandlerWrapsANonErrorPanic889(t *testing.T) {
 	var got error
 	mw := New(Config{
 		Logger: slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
-		ErrorHandlerErr: func(c *celeris.Context, err error) error {
+		ErrorHandler: func(c *celeris.Context, err error) error {
 			got = err
 			return c.String(503, "%v", err)
 		},
@@ -544,14 +544,19 @@ func TestErrorHandlerErrWrapsANonErrorPanic889(t *testing.T) {
 	if got == nil || got.Error() != "recovery: panic: boom" {
 		t.Fatalf("handler got %v, want the panic value wrapped as \"recovery: panic: boom\"", got)
 	}
+	// The wrapper is an ErrPanic, like the errors the other recovery paths
+	// build (ErrPanicContextCancelled, ErrPanicResponseCommitted).
+	if !errors.Is(got, ErrPanic) {
+		t.Errorf("errors.Is(%v, ErrPanic) = false, want true for a non-error panic value", got)
+	}
 }
 
-func TestErrorHandlerErrPassesAnErrorPanicThrough889(t *testing.T) {
+func TestErrorHandlerPassesAnErrorPanicThrough889(t *testing.T) {
 	sentinel := errors.New("sentinel")
 	var got error
 	mw := New(Config{
 		Logger: slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
-		ErrorHandlerErr: func(c *celeris.Context, err error) error {
+		ErrorHandler: func(c *celeris.Context, err error) error {
 			got = err
 			return c.NoContent(500)
 		},
@@ -563,9 +568,12 @@ func TestErrorHandlerErrPassesAnErrorPanicThrough889(t *testing.T) {
 	if !errors.Is(got, sentinel) {
 		t.Fatalf("handler got %v, want an error that errors.Is the panic value", got)
 	}
+	if got.Error() != "wrapped: sentinel" {
+		t.Errorf("handler got the text %q, want the error panic value as it is (\"wrapped: sentinel\")", got.Error())
+	}
 }
 
-func TestDefaultErrorHandlerWithoutErrorHandlerErr889(t *testing.T) {
+func TestDefaultErrorHandlerWithoutErrorHandler889(t *testing.T) {
 	mw := New(Config{Logger: slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))})
 	chain := []celeris.HandlerFunc{mw, func(_ *celeris.Context) error { panic("boom") }}
 	rec, err := testutil.RunChain(t, chain, "GET", "/default")

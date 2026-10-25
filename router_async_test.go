@@ -142,8 +142,8 @@ func TestRouteAsync_RouteOverridesGroup(t *testing.T) {
 func TestRouteAsync_SubGroupInherit(t *testing.T) {
 	s := New(Config{AsyncHandlers: false})
 	api := s.Group("/api").Async()
-	v1 := api.Group("/v1")              // inherits async
-	v2 := api.Group("/v2").Async(false) // overrides to sync
+	v1 := api.Group("/v1")        // inherits async
+	v2 := api.Group("/v2").Sync() // overrides to sync
 	v1.GET("/a", noopHandler)
 	v2.GET("/b", noopHandler)
 	if !s.router.routeAsync("GET", "/api/v1/a") {

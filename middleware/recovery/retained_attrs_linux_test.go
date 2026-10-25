@@ -57,7 +57,7 @@ func (h keepHandler) WithGroup(string) slog.Handler      { return h }
 // buffer, which the engine reuses for the connection's next request.
 //
 // Every place the middleware logs is a route here: a panic (logPanic, with
-// and without the stack), a broken pipe (handleBrokenPipe), an ErrorHandlerErr
+// and without the stack), a broken pipe (handleBrokenPipe), an ErrorHandler
 // that panics (safeCallHandler), a panic after the request context was
 // cancelled, and one after the response was committed. Each route gets three
 // requests with the same layout and different values over one keep-alive
@@ -86,7 +86,7 @@ func TestPanicRecordsSurviveNextRequest(t *testing.T) {
 		{"brokenpipe", func(l *slog.Logger) recovery.Config { return recovery.Config{Logger: l} },
 			func(*celeris.Context) error { panic(syscall.EPIPE) }, []rec{{"broken pipe", false}}},
 		{"errhandler", func(l *slog.Logger) recovery.Config {
-			return recovery.Config{Logger: l, ErrorHandlerErr: func(*celeris.Context, error) error { panic("handler down") }}
+			return recovery.Config{Logger: l, ErrorHandler: func(*celeris.Context, error) error { panic("handler down") }}
 		}, panicHeader, []rec{{"panic recovered", true}, {"panic in error handler", false}}},
 		{"cancelled", func(l *slog.Logger) recovery.Config { return recovery.Config{Logger: l} },
 			func(c *celeris.Context) error {

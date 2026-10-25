@@ -65,17 +65,17 @@ func New(config ...Config) celeris.HandlerFunc {
 	cfg = applyDefaults(cfg)
 
 	handler := defaultErrorHandler
-	// With ErrorHandlerErr set, wrap the panic value as an error and route
+	// With ErrorHandler set, wrap the panic value as an error and route
 	// through the typed handler. Non-error panic values (string / struct /
 	// etc.) are wrapped via fmt.Errorf so callers can use errors.Is /
 	// errors.As.
-	if cfg.ErrorHandlerErr != nil {
-		typedFn := cfg.ErrorHandlerErr
+	if cfg.ErrorHandler != nil {
+		typedFn := cfg.ErrorHandler
 		handler = func(c *celeris.Context, r any) error {
 			if e, ok := r.(error); ok {
 				return typedFn(c, e)
 			}
-			return typedFn(c, fmt.Errorf("recovery: panic: %v", r))
+			return typedFn(c, fmt.Errorf("%w: %v", ErrPanic, r))
 		}
 	}
 	brokenPipeHandler := cfg.BrokenPipeHandler

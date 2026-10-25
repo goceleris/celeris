@@ -15,14 +15,15 @@ type Config struct {
 	// Matching is exact (no glob or prefix support).
 	SkipPaths []string
 
-	// ErrorHandlerErr handles the recovered panic. It receives the panic
-	// value as an error: a panic value that is an error is passed as it is
-	// (so errors.Is / errors.As see through it), any other value is wrapped
-	// with fmt.Errorf("recovery: panic: %v", r). This is the same shape as
+	// ErrorHandler handles the recovered panic. It receives the panic value
+	// as an error: a panic value that is an error is passed as it is (so
+	// errors.Is / errors.As see through it); any other value is wrapped as
+	// fmt.Errorf("%w: %v", ErrPanic, r), whose text is "recovery: panic: <value>"
+	// and which matches ErrPanic with errors.Is. This is the same shape as
 	// the ErrorHandler of jwt, keyauth, basicauth and csrf. If it panics
 	// itself, the panic is logged and the default response is sent.
 	// Default: a JSON 500 response ({"error":"Internal Server Error"}).
-	ErrorHandlerErr func(c *celeris.Context, err error) error
+	ErrorHandler func(c *celeris.Context, err error) error
 
 	// BrokenPipeHandler handles broken pipe / connection reset panics.
 	// When nil, broken pipe panics are logged at WARN level without a stack
