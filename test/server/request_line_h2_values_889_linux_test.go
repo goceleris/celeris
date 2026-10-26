@@ -298,3 +298,95 @@ func TestH2MalformedRequestKeepsTheConnection889(t *testing.T) {
 		})
 	}
 }
+
+// A Content-Length the body does not match, found when the DATA that ends the
+// request arrives (the ordinary shape of a request with a body), leaves the
+// connection up on every engine: RFC 9113 8.1.1, a malformed request is a stream
+// error. std answers the stream 400 or resets it (net/http's choice); the native
+// engines reset it with PROTOCOL_ERROR; none serves it, and a clean request on the
+// same connection is answered 200.
+func TestH2ContentLengthMismatchOnDATAKeepsTheConnection889(t *testing.T) {
+	for _, e := range engines761 {
+		t.Run(e.name, func(t *testing.T) {
+			skipNoIOUring889(t, e.name)
+			addr := startServer964(t, celeris.Config{Engine: e.eng, Protocol: celeris.Auto})
+			c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = c.Close() }()
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.WriteString(c, http2.ClientPreface); err != nil {
+				t.Fatal(err)
+			}
+			fr := http2.NewFramer(c, c)
+			if err := fr.WriteSettings(); err != nil {
+				t.Fatal(err)
+			}
+			var blk bytes.Buffer
+			enc := hpack.NewEncoder(&blk)
+			headers := func(id uint32, endStream bool, fields ...hpack.HeaderField) {
+				blk.Reset()
+				for _, f := range fields {
+					if err := enc.WriteField(f); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk.Bytes(), EndStream: endStream, EndHeaders: true}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			req := func(method string, extra ...hpack.HeaderField) []hpack.HeaderField {
+				return append([]hpack.HeaderField{{Name: ":method", Value: method}, {Name: ":scheme", Value: "http"},
+					{Name: ":path", Value: "/ping"}, {Name: ":authority", Value: "example.com"}}, extra...)
+			}
+			// 1: declares 5 bytes, sends 3.
+			headers(1, false, req("POST", hpack.HeaderField{Name: "content-length", Value: "5"})...)
+			if err := fr.WriteData(1, true, []byte("abc")); err != nil {
+				t.Fatal(err)
+			}
+			headers(3, true, req("GET")...)
+
+			dec := hpack.NewDecoder(4096, nil)
+			rst := map[uint32]http2.ErrCode{}
+			status := map[uint32]string{}
+			for status[3] == "" {
+				f, err := fr.ReadFrame()
+				if err != nil {
+					t.Fatalf("the connection ended (RST_STREAMs %v, statuses %v): %v", rst, status, err)
+				}
+				switch f := f.(type) {
+				case *http2.SettingsFrame:
+					if !f.IsAck() {
+						if err := fr.WriteSettingsAck(); err != nil {
+							t.Fatal(err)
+						}
+					}
+				case *http2.RSTStreamFrame:
+					rst[f.StreamID] = f.ErrCode
+				case *http2.HeadersFrame:
+					hs, err := dec.DecodeFull(f.HeaderBlockFragment())
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, h := range hs {
+						if h.Name == ":status" {
+							status[f.StreamID] = h.Value
+						}
+					}
+				case *http2.GoAwayFrame:
+					t.Fatalf("GOAWAY %v (RST_STREAMs %v, statuses %v)", f.ErrCode, rst, status)
+				}
+			}
+			if status[3] != "200" {
+				t.Fatalf("the clean stream was answered %v, want 200", status)
+			}
+			if status[1] == "200" {
+				t.Fatalf("the mismatched request was served 200")
+			}
+			if c, ok := rst[1]; ok && c != http2.ErrCodeProtocol {
+				t.Fatalf("stream 1 reset with %v, want PROTOCOL_ERROR", c)
+			}
+		})
+	}
+}
