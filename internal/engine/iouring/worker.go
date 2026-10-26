@@ -744,6 +744,11 @@ type Worker struct {
 	// which a ring with room, and a kernel that takes every submit, never
 	// produces (celeris#869).
 	cancelSQEFull func() bool
+	// hijackSubmit, when set (tests only), replaces the ring's Submit in
+	// hijackConn, the submit that puts the cancel of an owed op in the kernel
+	// before the socket is handed over (celeris#884 item 40): a failing enter
+	// is not something a ring that works can be made to produce.
+	hijackSubmit func() (int, error)
 	// closeFDOwed counts the pendingRelease entries that still hold their
 	// descriptor open (holdsFD, celeris#685). The worker does not park
 	// while it is non-zero: the terminal CQEs those closes wait for arrive
@@ -3031,6 +3036,57 @@ func (w *Worker) acceptRetry(err error) bool {
 // the cancel of the recv it would leave armed on the hijacker's socket.
 var errHijackNoSQE = errors.New("celeris: cannot hijack: the io_uring submission queue is full, the connection's receive cannot be cancelled")
 
+// errHijackPendingSends is what hijackConn answers when a send of the conn's
+// is in flight (the kernel holds its buffer).
+var errHijackPendingSends = errors.New("celeris: cannot hijack with pending sends")
+
+// errHijackSendBufferFull is what hijackConn answers when a reply is queued
+// that the socket does not take now: the limit is the socket's send buffer, the
+// peer's window only fills it. Its own error, so that a log or a test can tell
+// it from a send in flight.
+var errHijackSendBufferFull = errors.New("celeris: cannot hijack: a queued response has not been sent and the socket's send buffer does not take it now, so it cannot go out before the connection is handed over")
+
+// errHijackDetached is what hijackConn answers for a detached conn: it belongs
+// to the middleware that detached it, whose guarded writer is live.
+var errHijackDetached = errors.New("celeris: cannot hijack a detached connection")
+
+// flushQueuedBeforeHijack writes what cs has queued in writeBuf to the socket
+// before hijackConn hands it over, so that a reply an earlier pipelined request
+// wrote reaches the peer ahead of whatever the hijacker sends. Worker thread,
+// no ring send of the conn outstanding (the caller checked), so the bytes
+// cannot pass one. It never waits: a socket that stops taking bytes leaves the
+// remainder in writeBuf, in order, and the hijack is refused with the conn as
+// it was, for the handler to answer the request on. Another error is the
+// conn's own, and is returned the same way; the worker's next send of the
+// remainder fails and closes the conn.
+func (w *Worker) flushQueuedBeforeHijack(cs *connState) error {
+	off := 0
+	var err error
+	for off < len(cs.writeBuf) {
+		var n int
+		n, err = unix.Write(cs.fd, cs.writeBuf[off:])
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			break
+		}
+		w.bytesWrittenBatch += uint64(n)
+		off += n
+	}
+	if off > 0 {
+		cs.writeBuf = cs.writeBuf[:copy(cs.writeBuf, cs.writeBuf[off:])]
+	}
+	switch err {
+	case nil:
+		return nil
+	case unix.EAGAIN: // EWOULDBLOCK is the same errno
+		return errHijackSendBufferFull
+	default:
+		return fmt.Errorf("celeris: cannot hijack: writing the queued response: %w", err)
+	}
+}
+
 func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// Refuse on the async dispatch path (celeris#539), before anything is
 	// read: the conn table is the worker goroutine's (connsMu orders its
@@ -3062,8 +3118,29 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.fixedFile {
 		return nil, errors.New("celeris: cannot hijack fixed file connection")
 	}
-	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
-		return nil, errors.New("celeris: cannot hijack with pending sends")
+	// A detached conn is the detaching middleware's: Context.Hijack refuses a
+	// detached Context, and the engine does not rely on that alone.
+	if cs.h1State != nil && cs.h1State.Detached.Load() {
+		return nil, errHijackDetached
+	}
+	// A send the kernel holds (cs.sending, a remainder in sendBuf) cannot be
+	// passed, and neither can a notification the queue would have to wait
+	// behind: the hijack is refused. What a pipelined request's reply left in
+	// writeBuf, the sends of one recv going out after its last request, is
+	// written to the socket here, and the hijack goes on when it all went out
+	// (celeris#936).
+	if cs.sending || len(cs.sendBuf) > 0 {
+		return nil, errHijackPendingSends
+	}
+	if len(cs.writeBuf) > 0 {
+		// ringSendOutstanding (celeris#751) is the invariant a raw write of
+		// writeBuf has to respect; what it adds here is a SEND_ZC notification.
+		if ringSendOutstanding(cs) {
+			return nil, errHijackPendingSends
+		}
+		if err := w.flushQueuedBeforeHijack(cs); err != nil {
+			return nil, err
+		}
 	}
 	// Place the cancel of the recv still armed on the socket before anything
 	// changes (celeris#869). The socket lives on under the hijacker, so nothing
@@ -3159,12 +3236,48 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// CQE before it hands the socket over, or an issued recv can take the
 	// hijacker's first bytes (celeris#884 item 18, with endOwedOpsAtShutdown).
 	if fdOwed(cs) && !w.sqpoll {
-		_, _ = w.ring.Submit()
+		w.submitForHijack()
 	}
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
 	_ = f.Close()
 	return c, err
+}
+
+// hijackSubmitTries bounds submitForHijack.
+const hijackSubmitTries = 8
+
+// submitForHijack puts the cancels hijackConn has placed in the kernel. EAGAIN
+// and EBUSY mean it took nothing (retryPending: the CQ ring is full, or the
+// enter was refused), so the SQEs are still pending and the submit is offered
+// again, up to hijackSubmitTries times; any other error means the kernel
+// consumed the batch (the ring says so), and offering it again would submit
+// the SQEs twice. The conn has left the tables by now, so a submit that never
+// goes through cannot be refused: it is logged (once per hijack, after the
+// last try), and the cancels go out with the worker's next submit, a pass of
+// the loop later (celeris#884 item 40). A submit that succeeds but takes only
+// part of the batch (ring.Pending() > 0 after it) is offered again too, within
+// the same bound.
+// EBUSY from a CQ ring the kernel cannot flush does not clear until the worker
+// reaps, which it cannot do from inside a handler's call, hence the bound.
+func (w *Worker) submitForHijack() {
+	submit := w.ring.Submit
+	if w.hijackSubmit != nil {
+		submit = w.hijackSubmit
+	}
+	var err error
+	for try := 0; try < hijackSubmitTries; try++ {
+		_, err = submit()
+		if err == nil && w.ring.Pending() > 0 {
+			continue // a short submit: the rest is still pending
+		}
+		if err == nil || !ringWaitRetryable(err) {
+			break
+		}
+	}
+	if pending := w.ring.Pending(); (err != nil || pending > 0) && w.logger != nil {
+		w.logger.Warn("hijack: the cancel of an armed op was not submitted before the socket was handed over", "worker", w.id, "err", err, "pending", pending)
+	}
 }
 
 func (w *Worker) initProtocol(cs *connState) {
