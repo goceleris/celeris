@@ -27,6 +27,13 @@ var ErrInvalidRedirectCode = errors.New("celeris: redirect status code must be 3
 // support takeover (e.g. HTTP/2 multiplexed streams).
 var ErrHijackNotSupported = stream.ErrHijackNotSupported
 
+// ErrHijackAfterDetach is returned by [Context.Hijack] when the Context has
+// been detached with [Context.Detach]. A detached stream belongs to the
+// middleware that detached it (a WebSocket or SSE writer), and a hijacked
+// connection belongs to the caller: it cannot be both. Hijack before
+// detaching, or not at all; Detach after a successful Hijack is allowed.
+var ErrHijackAfterDetach = errors.New("celeris: cannot hijack a detached context")
+
 // ErrAcceptControlNotSupported is returned by PauseAccept/ResumeAccept when
 // the active engine does not implement accept control (e.g. std engine).
 var ErrAcceptControlNotSupported = errors.New("celeris: engine does not support accept control")

@@ -1363,9 +1363,26 @@ func (c *Context) BytesWritten() int {
 // cancelled before the socket can be handed over, and the cancel needs a free
 // queue entry. The connection is then left untouched and still the engine's,
 // so the handler can answer the request (a 503, say) and the connection goes
-// on serving. The failure is transient under engine back-pressure, and the
-// error is not exported: treat any Hijack error as "answer the request".
+// on serving. The failure is transient under engine back-pressure.
+//
+// A response an earlier request on the same connection already wrote, and
+// that is still queued in the engine when a later pipelined request hijacks,
+// is sent to the peer before the connection is handed over. The native
+// engines do that without waiting: if the socket's send buffer does not take
+// the whole reply now (a peer that reads slowly), Hijack fails with the
+// connection untouched and the reply still queued, as above, rather than
+// dropping the reply or blocking the event loop. If writing the queued reply
+// fails because the peer is gone, Hijack fails and the engine closes the
+// connection.
+//
+// Hijack on a Context that has been detached ([Context.Detach]) returns
+// [ErrHijackAfterDetach]: the connection is the detaching middleware's.
+// Hijack first, then Detach, is allowed. The other errors are not exported:
+// treat any Hijack error as "answer the request".
 func (c *Context) Hijack() (net.Conn, error) {
+	if c.detached {
+		return nil, ErrHijackAfterDetach
+	}
 	if c.written {
 		return nil, errors.New("celeris: cannot hijack after response written")
 	}
@@ -1531,7 +1548,8 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // goroutine, as far as the response writer allows it; the bound is kept per
 // stream. The native engines apply neither timeout to a detached connection.
 //
-// Detach after a successful [Context.Hijack] only keeps the Context out of the
+// [Context.Hijack] after Detach returns [ErrHijackAfterDetach]. Detach after a
+// successful [Context.Hijack] only keeps the Context out of the
 // pool until done is called. The connection is the caller's by then, so no
 // engine hook runs and no deadline is set on it (on epoll the hook would run
 // against connection state the hijack has released).

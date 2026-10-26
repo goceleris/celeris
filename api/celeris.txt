@@ -316,6 +316,7 @@ var ErrAlreadyStarted error
 var ErrDetached error
 var ErrDuplicateRouteName error
 var ErrEmptyBody error
+var ErrHijackAfterDetach error
 var ErrHijackNotSupported error
 var ErrInvalidRedirectCode error
 var ErrNoCookie error
