@@ -749,7 +749,6 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 		// The buffer may hold the body the handler kept (see scanChunked): it
 		// is not written again.
-		state.chunkAliased = false
 		state.releaseLargeBuffer()
 		if state.Detached.Load() {
 			return nil
@@ -1035,7 +1034,6 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 		if state.chunkAliased {
 			// The body is a view of state.buffer's array (scanChunked).
-			state.chunkAliased = false
 			state.releaseLargeBuffer()
 		}
 		if state.Detached.Load() {
@@ -1057,15 +1055,19 @@ const maxRetainedChunkedBuffer = 64 << 10
 const minAliasedChunk = 16 << 10
 
 // releaseLargeBuffer gives up a state.buffer that grew past
-// maxRetainedChunkedBuffer to hold a large chunk. It is not kept for the life
+// maxRetainedChunkedBuffer to hold a large chunk, or, whatever its size, one
+// whose array the body of the request just served is a view of (chunkAliased):
+// the safety of that view does not depend on the two thresholds agreeing. It is
+// not kept for the life
 // of the connection, whether or not a pipelined request follows the
 // terminator: that tail moves to a buffer of its own size (once per large
 // upload, not per request). The old array is not reused, so a body that is a
 // view of it (scanChunked) stays intact for a handler that keeps it.
 func (s *H1State) releaseLargeBuffer() {
-	if s.buffer.Cap() <= maxRetainedChunkedBuffer {
+	if !s.chunkAliased && s.buffer.Cap() <= maxRetainedChunkedBuffer {
 		return
 	}
+	s.chunkAliased = false
 	var nb bytes.Buffer
 	if tail := s.buffer.Bytes(); len(tail) > 0 {
 		nb.Write(tail)
@@ -1384,6 +1386,10 @@ func (s *H1State) expectPanicked(r any, method, path string) {
 	if s.Logger == nil {
 		return
 	}
+	// A log handler that panics must not take the event loop down with it: this
+	// runs inside the deferred recover of the callback, whose panic main
+	// swallowed whole.
+	defer func() { _ = recover() }()
 	// method and path are views of the receive buffer, which the engine reuses
 	// for the next request, and a log handler may keep the record.
 	s.Logger.Error("OnExpectContinue panicked; the request is answered 417 and the connection closed",
