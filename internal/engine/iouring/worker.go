@@ -3796,6 +3796,9 @@ func (w *Worker) switchToH2Local(cs *connState) error {
 	}
 	cs.h1State.UpgradeInfo = nil
 	conn.CloseH1(cs.h1State)
+	if f := h2cUpgradeHook.Load(); f != nil {
+		(*f)(cs) // test seam, celeris#884 item 83
+	}
 	cs.h1State = nil
 	cs.h2State = h2State
 	cs.h2State.SetRemoteAddr(cs.remoteAddr)
@@ -4217,6 +4220,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			cs.asyncCond.Signal()
 		}
 		w.reqBatch++
+		if f := asyncFeedHook.Load(); f != nil {
+			(*f)(w, cs, hdrDL) // test seam, celeris#884 items 82-84
+		}
 		// Re-attempt the slowloris-defence timer arm if the initial
 		// attempt (from initProtocol on accept) silently dropped under
 		// SQ-ring pressure. ArmHeaderDeadline is idempotent on
