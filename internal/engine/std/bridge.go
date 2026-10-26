@@ -84,12 +84,7 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		[2]string{":authority", r.Host},
 	)
 
-	for name, values := range r.Header {
-		lowerName := strings.ToLower(name)
-		for _, v := range values {
-			hdrs = append(hdrs, [2]string{lowerName, v})
-		}
-	}
+	hdrs = AppendRequestHeaders(hdrs, r.Header)
 	s.Headers = hdrs
 
 	if r.Body != nil && r.Body != http.NoBody {
@@ -342,3 +337,22 @@ func (*hijackedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 var _ stream.Hijacker = (*stdResponseWriter)(nil)
 var _ stream.Streamer = (*stdResponseWriter)(nil)
 var _ stream.DetachNotifier = (*stdResponseWriter)(nil)
+
+// AppendRequestHeaders appends the fields of h to hdrs as the stream's request
+// headers: names lowercased, and several Cookie lines joined into one field
+// with "; ", as HTTP/2 delivers a request (celeris#889, celeris#944). net/http
+// groups the lines of a name, so one strings.Join does it, in one pass
+// however many lines there are.
+func AppendRequestHeaders(hdrs [][2]string, h http.Header) [][2]string {
+	for name, values := range h {
+		lowerName := strings.ToLower(name)
+		if lowerName == "cookie" && len(values) > 1 {
+			hdrs = append(hdrs, [2]string{lowerName, strings.Join(values, "; ")})
+			continue
+		}
+		for _, v := range values {
+			hdrs = append(hdrs, [2]string{lowerName, v})
+		}
+	}
+	return hdrs
+}

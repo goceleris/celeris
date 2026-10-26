@@ -104,7 +104,7 @@ type EngineMetrics struct {
 	// that returned an error. std only — the native engines do not fold a
 	// handler error into ErrorCount.
 	ErrorHandler uint64
-	// AsyncRoutes is the count of routes registered with .Async(true) on
+	// AsyncRoutes is the count of routes registered with .Async() or .UsesDriver() on
 	// this engine's handler. Static after Listen — derived from the
 	// router's per-route async flags and exposed for diagnostics so
 	// operators can see how many handlers run on the per-conn dispatch

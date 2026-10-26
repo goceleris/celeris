@@ -1224,14 +1224,19 @@ func copyH2CHeaders(req *h1.Request) [][2]string {
 // a pooled UpgradeInfo.Headers backing array — on pooled entry the slice
 // arrives with zero length but non-zero capacity.
 func appendH2CHeaders(out [][2]string, req *h1.Request) [][2]string {
+	// Several Cookie lines become one field joined with "; ", as HTTP/2
+	// delivers a request (stream.CookieJoiner, celeris#889): the replayed
+	// request is HTTP/2 stream 1.
+	var cj stream.CookieJoiner
 	for _, rh := range req.RawHeaders {
 		name := h1.LowerHeaderCopy(rh[0])
 		switch name {
 		case "upgrade", "connection", "http2-settings":
 			continue
 		}
-		out = append(out, [2]string{name, string(rh[1])})
+		out = cj.Append(out, name, string(rh[1]))
 	}
+	cj.Finish(out)
 	return out
 }
 
@@ -1249,15 +1254,19 @@ func safeExpectContinue(fn func(string, string, [][2]string) bool, method, path 
 
 // expectHeaders converts raw H1 headers to [][2]string for the OnExpectContinue
 // callback. Zero-copy strings are safe because the callback runs synchronously
-// on the event loop thread before the read buffer is reused.
+// on the event loop thread before the read buffer is reused. Several Cookie
+// lines are joined into one field, as the handler will see them
+// (stream.CookieJoiner, celeris#889).
 func expectHeaders(req *h1.Request) [][2]string {
 	if len(req.RawHeaders) == 0 {
 		return nil
 	}
-	hdrs := make([][2]string, len(req.RawHeaders))
-	for i, rh := range req.RawHeaders {
-		hdrs[i] = [2]string{h1.UnsafeLowerHeader(rh[0]), h1.UnsafeString(rh[1])}
+	hdrs := make([][2]string, 0, len(req.RawHeaders))
+	var cj stream.CookieJoiner
+	for _, rh := range req.RawHeaders {
+		hdrs = cj.Append(hdrs, h1.UnsafeLowerHeader(rh[0]), h1.UnsafeString(rh[1]))
 	}
+	cj.Finish(hdrs)
 	return hdrs
 }
 

@@ -335,7 +335,7 @@ type Loop struct {
 	// async dispatches HTTP1 handlers to spawned goroutines. Set by
 	// Config.AsyncHandlers (the canonical server-level default) or
 	// auto-enabled in doPrepare when the router has any .Async() routes.
-	// Per-route .Async()/.Async(false) overrides further refine dispatch
+	// Per-route .Async()/.Sync() overrides further refine dispatch
 	// per request via the InlineMode → ErrAsyncDispatch handoff. Checked
 	// on every drainRead; keep it a plain bool so the no-async path is a
 	// single mov+test.

@@ -8,10 +8,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/recovery"
 )
 
 // deprecationMarker opens the paragraph that go doc, gopls and staticcheck's
@@ -36,8 +40,9 @@ type allowedDeprecations struct {
 }
 
 // removal is one public identifier removed before the public v1.6.0 release
-// (celeris#830, celeris#826), with the replacement its deprecation notice
-// named. Dirs are relative to the repository root; a member is written
+// (celeris#830, celeris#826, celeris#889), with the replacement its
+// deprecation notice named (for celeris#889, which retired identifiers that
+// carried no notice: the replacement their doc comment preferred). Dirs are relative to the repository root; a member is written
 // "Type.Member".
 type removal struct {
 	dir, name     string // the removed identifier
@@ -56,6 +61,49 @@ var removedBeforeV160 = []removal{
 	{"middleware/session", "MemoryStoreConfig", "middleware/store", "MemoryKVConfig", "celeris#830"},
 	{"middleware/ratelimit", "Config.LimitReached", "middleware/ratelimit", "Config.ErrorHandler", "celeris#830"},
 	{"middleware/basicauth", "HashPassword", "middleware/basicauth", "HashPasswordPBKDF2", "celeris#826"},
+	{".", "Context.Stream", ".", "Context.StreamReader", "celeris#889"},
+	{"middleware/recovery", "Config.ErrorHandlerErr", "middleware/recovery", "Config.ErrorHandler", "celeris#889"},
+}
+
+// TestAsyncTakesNoArgument889 pins the third removal of celeris#889: the
+// variadic-bool form of Route.Async and RouteGroup.Async is gone, so .Async()
+// is the only call and .Sync() the way to opt a route or a group out of an
+// async default. A removal by name (removedBeforeV160) cannot see a signature
+// change, so this reads the methods through reflection: a build that re-added
+// "opt ...bool" fails here even though no caller would stop compiling.
+func TestAsyncTakesNoArgument889(t *testing.T) {
+	for _, rt := range []reflect.Type{reflect.TypeOf((*celeris.Route)(nil)), reflect.TypeOf((*celeris.RouteGroup)(nil))} {
+		for _, name := range []string{"Async", "Sync"} {
+			m, ok := rt.MethodByName(name)
+			if !ok {
+				t.Fatalf("%s.%s is not declared", rt, name)
+			}
+			if m.Type.IsVariadic() || m.Type.NumIn() != 1 {
+				t.Errorf("%s.%s is %s; want no parameters after the receiver (celeris#889 removed the bool form, use .Sync() for .Async(false))", rt, name, m.Type)
+			}
+		}
+	}
+	m, ok := reflect.TypeOf((*celeris.Route)(nil)).MethodByName("UsesDriver")
+	if !ok || m.Type.NumIn() != 1 {
+		t.Errorf("(*Route).UsesDriver is %v, want no parameters", m.Type)
+	}
+}
+
+// TestRecoveryErrorHandlerTakesAnError889 pins the rename of celeris#889:
+// recovery.Config.ErrorHandler is the field the middleware family shares,
+// func(c, error) error. Until v1.6.0 it took the panic as an any and the
+// error-typed field was ErrorHandlerErr (removedBeforeV160 keeps that name
+// from coming back). The field's type is checked because a name check cannot
+// tell the old func(c, any) error from the new one.
+func TestRecoveryErrorHandlerTakesAnError889(t *testing.T) {
+	f, ok := reflect.TypeOf(recovery.Config{}).FieldByName("ErrorHandler")
+	if !ok {
+		t.Fatal("recovery.Config.ErrorHandler is not declared")
+	}
+	want := reflect.TypeOf((func(*celeris.Context, error) error)(nil))
+	if f.Type != want {
+		t.Errorf("recovery.Config.ErrorHandler is %s, want %s", f.Type, want)
+	}
 }
 
 // TestNoDeprecatedPublicAPI830 pins celeris#830 and celeris#826. celeris goes

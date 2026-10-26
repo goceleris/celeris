@@ -22,7 +22,7 @@ func TestPanicBumpsValidationCounter(t *testing.T) {
 	handler := func(_ *celeris.Context) error { panic("recovery validation hook") }
 	chain := []celeris.HandlerFunc{mw, handler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/panic")
-	// The default ErrorHandler writes a 500 response and returns nil;
+	// The default error handler writes a 500 response and returns nil;
 	// the panic is fully consumed by the middleware. Either nil or a
 	// non-nil error is acceptable — the only invariant we care about
 	// here is the status code and the counter bump.

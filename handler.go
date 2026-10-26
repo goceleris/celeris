@@ -480,7 +480,7 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 
 func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 	var allowed []string
-	if c.method == "OPTIONS" {
+	if c.method == "OPTIONS" && !a.server.router.noAutoOPTIONS {
 		// celeris#421: a path with routes but no OPTIONS route is answered
 		// with what it allows (OPTIONS included). That list is never empty
 		// for a routed path, so an empty one means the path has no route at
@@ -639,7 +639,7 @@ func (a *routerAdapter) HasAsyncRoutes() bool {
 	return a.server.router.hasAsyncRoutes()
 }
 
-// AsyncRouteCount returns the number of routes registered with .Async(true).
+// AsyncRouteCount returns the number of routes registered with .Async() or .UsesDriver().
 // Engines expose this through Metrics().AsyncRoutes for diagnostics.
 func (a *routerAdapter) AsyncRouteCount() int {
 	return a.server.router.asyncRouteCount
