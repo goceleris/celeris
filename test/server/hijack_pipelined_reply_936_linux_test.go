@@ -34,13 +34,12 @@ import (
 const pipelined936Hijacked = "HIJACKED-BY-THE-HANDLER"
 
 type pipelined936Arm struct {
-	name       string
-	engine     celeris.EngineType
-	asyncAll   bool // /a, /f and /hj are Async routes: all run on the dispatch goroutine
-	asyncHJ    bool // only /hj is Async: the first reply is written inline, the hijack runs on the goroutine
-	asyncLoop  bool // Config.AsyncHandlers, every route Sync: inline on an async loop
-	skipLarge  bool // std: its handler blocks writing the large reply until the client reads
-	needsIOUrg bool
+	name      string
+	engine    celeris.EngineType
+	asyncAll  bool // /a, /f and /hj are Async routes: all run on the dispatch goroutine
+	asyncHJ   bool // only /hj is Async: the first reply is written inline, the hijack runs on the goroutine
+	asyncLoop bool // Config.AsyncHandlers, every route Sync: inline on an async loop
+	skipLarge bool // std: its handler blocks writing the large reply until the client reads
 }
 
 func pipelined936Arms(t *testing.T) []pipelined936Arm {

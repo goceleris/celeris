@@ -3067,10 +3067,10 @@ func (w *Worker) flushQueuedBeforeHijack(cs *connState) error {
 	if off > 0 {
 		cs.writeBuf = cs.writeBuf[:copy(cs.writeBuf, cs.writeBuf[off:])]
 	}
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		return nil
-	case err == unix.EAGAIN || err == unix.EWOULDBLOCK:
+	case unix.EAGAIN: // EWOULDBLOCK is the same errno
 		return errHijackPendingSends
 	default:
 		return fmt.Errorf("celeris: cannot hijack: writing the queued response: %w", err)
