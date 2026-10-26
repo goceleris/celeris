@@ -344,17 +344,31 @@ func TestDrainReadBudgetEndToEnd885(t *testing.T) {
 	}
 }
 
+// sleepFlood885 is floodHandler885 whose /sleep holds the loop thread for 300 ms
+// (a sync engine runs the handler inline).
+type sleepFlood885 struct{ floodHandler885 }
+
+func (h sleepFlood885) HandleStream(ctx context.Context, s *stream.Stream) error {
+	if s.Path == "/sleep" {
+		time.Sleep(300 * time.Millisecond)
+	}
+	return h.floodHandler885.HandleStream(ctx, s)
+}
+
 // TestRunLoopHandlesAHalfCloseAfterAYieldedTurn885: the run loop skips the
 // half-close, error and transplant steps of an event whose turn yielded
 // (Loop.readYielded), and clears the flag before every drainRead. Without the
 // clear, the first yield on a loop would leave the flag set for good: every
 // later read event on it would skip its steps, and an edge-triggered EPOLLRDHUP
 // is not reported again. Two conns on one loop: A floods and yields (the budget
-// is 16 KiB, the burst 256 KiB); then B sends a request and its FIN, and the
-// server must end B.
+// is 16 KiB, the burst 256 KiB); then A holds the loop thread in a 300 ms
+// handler, and B's request and its FIN are both queued behind it, so that B's
+// read is a short read that does not see the FIN and only the run loop's
+// EPOLLRDHUP step can end B (a FIN that comes after the read is an event of
+// its own, read as EOF whatever the flag says). The server must end B.
 func TestRunLoopHandlesAHalfCloseAfterAYieldedTurn885(t *testing.T) {
 	withBudget885(t, 16<<10) // before the engine starts: the loops read it
-	e := startFloodEngine885(t, 0)
+	e := startFloodEngineWith885(t, 0, sleepFlood885{})
 	a, b, _ := threeConns885(t, e)
 
 	const req = "GET /flood HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -369,6 +383,11 @@ func TestRunLoopHandlesAHalfCloseAfterAYieldedTurn885(t *testing.T) {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}
+	// Hold the loop thread, then queue B's request and FIN behind it.
+	if _, err := a.c.Write([]byte("GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatalf("write /sleep: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
 
 	_ = b.c.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := b.c.Write([]byte(req)); err != nil {

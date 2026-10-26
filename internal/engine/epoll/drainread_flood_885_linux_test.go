@@ -54,6 +54,12 @@ func (floodHandler885) HandleStream(_ context.Context, s *stream.Stream) error {
 
 func startFloodEngine885(t testing.TB, bufSize int) *Engine {
 	t.Helper()
+	return startFloodEngineWith885(t, bufSize, floodHandler885{})
+}
+
+// startFloodEngineWith885 is startFloodEngine885 with the handler h.
+func startFloodEngineWith885(t testing.TB, bufSize int, h stream.Handler) *Engine {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("pick port: %v", err)
@@ -68,7 +74,7 @@ func startFloodEngine885(t testing.TB, bufSize int) *Engine {
 			BufferSize: bufSize,
 		},
 	}
-	e, err := New(cfg, floodHandler885{})
+	e, err := New(cfg, h)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

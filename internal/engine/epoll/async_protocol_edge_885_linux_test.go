@@ -51,6 +51,11 @@ func (h *edge885Handler) HandleStream(_ context.Context, s *stream.Stream) error
 		// gate (poolWaitGate) sets refuseRecv there, and so does this.
 		h.eng.Load().loops[s.WorkerID].refuseRecv = true
 	}
+	if path == "/sdp" {
+		// The pool wait gate's pass over the detached conns, which runs on the
+		// loop thread before closeIdleH1.
+		h.eng.Load().loops[s.WorkerID].stopDetachedProducers()
+	}
 	if path == "/who" {
 		path = strconv.Itoa(int(s.WorkerID))
 	}
@@ -74,7 +79,7 @@ func (*edge885Handler) RouteAsync(_, path string) bool { return path == "/a" }
 func (*edge885Handler) HasAsyncRoutes() bool           { return true }
 
 func TestAsyncGateProtocolReadHasAnEdgeWithTheUpgradeSwitch885(t *testing.T) {
-	runEdge885(t, false)
+	runEdge885(t, "")
 }
 
 // TestRefusesRecvReadsProtocolInOrderWithTheUpgradeSwitch885 is the same
@@ -84,10 +89,25 @@ func TestAsyncGateProtocolReadHasAnEdgeWithTheUpgradeSwitch885(t *testing.T) {
 // set by a request on a second conn of the same loop, handled inline on the
 // loop thread.
 func TestRefusesRecvReadsProtocolInOrderWithTheUpgradeSwitch885(t *testing.T) {
-	runEdge885(t, true)
+	runEdge885(t, "/arm")
 }
 
-func runEdge885(t *testing.T, gate bool) {
+// TestStopDetachedProducersReadsH1StateInOrderWithTheUpgradeSwitch885: the same
+// scenario, the gate's pass over the detached conns (stopDetachedProducers) run
+// on the loop thread, from a request on a second conn, while the goroutine is
+// inside the switch. The pass read cs.h1State, which the switch sets to nil,
+// before it took detachMu.
+func TestStopDetachedProducersReadsH1StateInOrderWithTheUpgradeSwitch885(t *testing.T) {
+	runEdge885(t, "/sdp")
+}
+
+// runEdge885 runs the scenario; via names the request, on a second conn of the
+// same loop, whose handler runs a loop-thread step of the pool wait's gate while
+// the dispatch goroutine is inside the switch ("" for none). After the 101 the
+// conn must speak HTTP/2: a PING is answered, so a gate that refused every
+// promoted conn (including a switched one) fails it.
+func runEdge885(t *testing.T, via string) {
+	gate := via != ""
 	h := &edge885Handler{started: make(chan struct{}, 1), release: make(chan struct{})}
 	e, addr := startE2E885(t, true, h, func(c *resource.Config) { c.EnableH2Upgrade = true })
 	h.eng.Store(e)
@@ -154,7 +174,7 @@ func runEdge885(t *testing.T, gate bool) {
 	if gate {
 		// The gate goes up on the loop: this request runs inline on its thread.
 		_ = other.SetDeadline(time.Now().Add(10 * time.Second))
-		if _, err := other.Write([]byte("GET /arm HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		if _, err := other.Write([]byte("GET " + via + " HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 			t.Fatalf("write /arm: %v", err)
 		}
 		resp, err := http.ReadResponse(bufio.NewReader(other), nil)
@@ -183,7 +203,25 @@ func runEdge885(t *testing.T, gate bool) {
 			t.Fatalf("read the response to /a and the 101: %v (got %q)", err, got.String())
 		}
 		if strings.Contains(line, "HTTP/1.1 101") {
-			return
+			for {
+				l, err := br.ReadString('\n')
+				if err != nil {
+					t.Fatalf("the 101's headers: %v", err)
+				}
+				if l == "\r\n" {
+					break
+				}
+			}
+			fr := http2.NewFramer(nil, br)
+			for {
+				f, err := fr.ReadFrame()
+				if err != nil {
+					t.Fatalf("no PING ACK on the switched conn (via %q): %v", via, err)
+				}
+				if pf, ok := f.(*http2.PingFrame); ok && pf.IsAck() {
+					return
+				}
+			}
 		}
 	}
 }
