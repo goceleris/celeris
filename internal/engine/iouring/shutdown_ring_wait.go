@@ -39,8 +39,15 @@ func ringWaitRetryable(err error) bool {
 const ringWaitCeiling = time.Second
 
 // ringWaitRunGap is the longest time between two retried waits that still make
-// one run (ringWaitContinues): a failing ring answers its retries a pass apart,
-// microseconds to a few milliseconds, and an idle worker's timed wait takes up
-// to 100 ms (the sleep of a seam-injected EBUSY test is that wait). A longer gap
-// means something else ran in between, so the run starts again.
+// one run (ringWaitContinues). A ring that is failing returns its error at
+// once, so its retries come a pass apart, microseconds to a few milliseconds
+// (the 50 us sleep plus one pass). An idle worker's successful timed wait takes
+// up to 100 ms, or 1 s for a long-idle one (baseTimeout), which is longer than
+// this gap: such a worker's retries are never joined into a run, and that is
+// the point, since a wait that took that long did not fail. What the rule
+// relies on is only that a real failure is fast: passes of 200 ms between
+// retries (the seam-injected test, whose real wait precedes the injected error)
+// still stop at about 1.01 s, passes of 300 ms never do, by design. A longer gap
+// means something else ran in between (a park, a slow callback), so the run
+// starts again.
 const ringWaitRunGap = 250 * time.Millisecond

@@ -163,6 +163,20 @@ func TestGateLookAtAConn884(t *testing.T) {
 			cs.asyncRun, cs.asyncParked = true, true
 			return cs
 		}, true, false, false},
+		{"promoted-detached-ended-lock-held", func(t *testing.T) *connState {
+			// A promoted stream the gate ended, whose detachMu a guarded write
+			// holds right now: not read on, whatever the lock says (writeEnded is
+			// an atomic; review r2 m5).
+			cs := gateConn884(7)
+			cs.detachMu = &sync.Mutex{}
+			cs.detachMu.Lock()
+			cs.asyncPromoted.Store(true)
+			cs.asyncRun, cs.asyncParked, cs.asyncDetachUnlocked = true, true, true
+			cs.h1State.Detached.Store(true)
+			cs.detachClosed = true
+			cs.writeEnded.Store(true)
+			return cs
+		}, false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := tc.build(t)
