@@ -725,6 +725,10 @@ type Worker struct {
 	// the stack. Worker-owned.
 	sweepTickArmed bool
 	sweepTickFired bool
+	// sweepTickBroken latches when the timer completed with anything but
+	// -ETIME: no timer is armed again and the loop waits with a timeout
+	// (handleSweepTick).
+	sweepTickBroken bool
 	sweepTickSpec  kernelTimespec
 	// lastStallLook is the clock of the last sweep that looked at the
 	// detached conns' stall (stallLookDue); worker-thread-only.
@@ -1730,7 +1734,7 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				cqHead, cqTail = w.ring.BeginCQ()
 			} else if cqHead != cqTail { //nolint:revive // intentional no-op: CQEs ready, no pending SQEs, no syscall needed
-			} else if waitUntimed(hasPending, w.sendsPending, w.draining, w.remainderWatch) && w.armSweepTick() {
+			} else if waitUntimed(hasPending, w.sendsPending, w.draining, w.remainderWatch) && (w.sweepTickArmed || w.armSweepTick()) {
 				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
 				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
 				// Not once the context is cancelled (celeris#806): a SEND to a
@@ -1837,7 +1841,7 @@ func (w *Worker) run(ctx context.Context) {
 				case udH2Wakeup:
 					w.handleH2Wakeup()
 				case udSweepTick:
-					w.handleSweepTick()
+					w.handleSweepTick(entry.Res)
 				case udHeaderTimer:
 					// MUST be in the inlined hot path — processCQE
 					// (which has the same case) is only called from
@@ -2000,16 +2004,10 @@ func (w *Worker) run(ctx context.Context) {
 		if w.detachedCount > 0 || w.cfg.ReadHeaderTimeout > 0 {
 			gate = 0x1F
 		}
-		// The clock: the batch's own when this iteration had CQEs (read after
-		// the wait that delivered them), a fresh read when it had none, which
-		// is the idle path and waited on the ring a moment ago.
-		var sweepNow int64
-		if gotCQE {
-			sweepNow = w.cachedNow
-		} else {
-			sweepNow = time.Now().UnixNano()
-		}
-		if w.sweepDue(sweepNow, w.tickCounter&gate == 0) || w.sweepWatchDue() {
+		// The clock (sweepClock): the batch's own, except where a fresh read
+		// can matter.
+		gateHit := w.tickCounter&gate == 0
+		if w.sweepDue(w.sweepClock(gotCQE, gateHit), gateHit) || w.sweepWatchDue() {
 			w.checkTimeouts()
 		}
 
@@ -2308,7 +2306,7 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	case udH2Wakeup:
 		w.handleH2Wakeup()
 	case udSweepTick:
-		w.handleSweepTick()
+		w.handleSweepTick(c.Res)
 	case udHeaderTimer:
 		if w.staleConnCQE(c, fd, ud) {
 			return
@@ -7464,10 +7462,12 @@ var testHookCheckTimeouts atomic.Pointer[func(*Worker)]
 // detached, every 1024 otherwise, when sweepFloor (25 ms) has passed since the
 // last sweep; from any iteration once sweepCeiling (1 s) has; and with
 // sendWatch set (sweepWatchDue) about every 1 to 2 s. An idle iteration waits
-// up to 25 / 50 / 100 ms (baseTimeout), so an idle worker sweeps about every
-// 0.8 s with ReadHeaderTimeout > 0 (32 iterations of 25 ms) and every second
-// otherwise (the ceiling; the gate alone was 1.6 s with a detached conn and
-// about 102 s with none). While the worker waits without a timeout for a
+// up to 25 / 50 / 100 ms (baseTimeout; 1 s on a worker with no listener, one
+// paused or on standby), so an idle worker sweeps about every 0.8 s with
+// ReadHeaderTimeout > 0 (32 iterations of 25 ms) and about every second
+// otherwise (the ceiling, which an iteration notices at its end: up to about
+// 2 s on a worker with no listener; the gate alone was 1.6 s with a detached
+// conn and about 102 s with none). While the worker waits without a timeout for a
 // SEND's completion (waitUntimed) no iteration runs; the standing timer
 // (armSweepTick) ends that wait within sweepCeiling. This
 // replaces the timer wheel: instead of allocating entries and updating maps

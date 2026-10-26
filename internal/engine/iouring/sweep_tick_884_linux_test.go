@@ -179,3 +179,49 @@ func TestSweepTickOnARealRing884(t *testing.T) {
 		skipOrFail656(t, "no ring could be set up with any of the engine's flag sets")
 	}
 }
+
+// TestSweepClock884: an empty iteration may be a zero-wait spin, so it reads the
+// clock only where the read can matter; every other iteration passes the batch's
+// clock (a sentinel here, which no clock read can equal).
+func TestSweepClock884(t *testing.T) {
+	const stale = int64(12345)
+	for _, tc := range []struct {
+		name    string
+		gotCQE  bool
+		gateHit bool
+		fired   bool
+		empty   int
+		dirty   bool
+		tick    uint32
+		fresh   bool
+	}{
+		{"an iteration with CQEs uses the batch clock", true, true, true, 100, false, 0, false},
+		{"an empty spin with the dirty list non-empty", false, false, false, 100, true, 1, false},
+		{"an empty 1 ms wait, between reads", false, false, false, 3, false, 1, false},
+		{"an empty wait of 5 ms or more", false, false, false, 100, false, 1, true},
+		{"an empty spin on every eighth iteration", false, false, false, 100, true, 8, true},
+		{"an empty iteration at a gate hit", false, true, false, 3, true, 1, true},
+		{"an empty iteration after the standing timer fired", false, false, true, 3, true, 1, true},
+	} {
+		w := &Worker{cachedNow: stale, emptyIters: uint32(tc.empty), tickCounter: tc.tick, sweepTickFired: tc.fired}
+		if tc.dirty {
+			w.dirtyHead = &connState{}
+		}
+		got := w.sweepClock(tc.gotCQE, tc.gateHit)
+		if fresh := got != stale; fresh != tc.fresh {
+			t.Errorf("celeris884 %s: sweepClock read a fresh clock = %v, want %v", tc.name, fresh, tc.fresh)
+		}
+	}
+}
+
+// TestSweepTickBrokenStopsArming884 is the latch's other half: once broken, no
+// timer is placed and the wait may not go untimed.
+func TestSweepTickBrokenStopsArming884(t *testing.T) {
+	f := newFDLFixture(t, false)
+	w := f.w
+	_ = takeSQEs(w.ring)
+	w.sweepTickBroken = true
+	if w.armSweepTick() || len(takeSQEs(w.ring)) != 0 {
+		t.Error("celeris884: a worker whose timer failed must place none and report that the wait may not go untimed")
+	}
+}

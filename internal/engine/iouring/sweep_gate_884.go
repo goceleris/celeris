@@ -5,6 +5,8 @@ package iouring
 import (
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // The timeout sweep's pacing (celeris#884 items 65, 74 and 75): the time gate
@@ -21,7 +23,9 @@ import (
 // outstanding, and what the standing sweep timer (armSweepTick) holds an
 // untimed SEND wait to. An idle worker with ReadHeaderTimeout off and no
 // detached conn, whose gate was 1024 iterations of 100 ms (about 92 to 102 s),
-// now sweeps about once a second.
+// now sweeps about once a second (up to about two on a worker with no
+// listener, whose idle wait is a second: the ceiling is seen at the end of an
+// iteration). Both are nanoseconds, as lastSweep is.
 const (
 	sweepFloor   = int64(25 * time.Millisecond)
 	sweepCeiling = int64(time.Second)
@@ -41,6 +45,27 @@ func (w *Worker) sweepDue(now int64, gateHit bool) bool {
 	return d >= sweepCeiling || d < 0 || w.sweepTickFired || (gateHit && d >= sweepFloor)
 }
 
+// sweepClock is the clock sweepDue is given: the batch's own (cachedNow) on an
+// iteration that had CQEs, and on an empty one a fresh read only where it can
+// matter, because an empty iteration may be a zero-wait spin (baseTimeout is 0
+// while the dirty list holds a conn, 1 ms for the first ten empty iterations,
+// 100 microseconds with H2 conns and no wake descriptor) and a read costs about
+// 35 ns. A fresh read is taken at a gate hit, when the standing timer fired,
+// after ten empty iterations with the dirty list empty (a wait of 5 ms or
+// more), and on every eighth iteration otherwise; the stale clock is never
+// ahead of lastSweep (checkTimeouts sets both), so it never makes a sweep due
+// by itself, it only defers the ceiling's by the iterations it covers. Worker
+// thread.
+func (w *Worker) sweepClock(gotCQE, gateHit bool) int64 {
+	if gotCQE {
+		return w.cachedNow
+	}
+	if gateHit || w.sweepTickFired || (w.emptyIters > 10 && w.dirtyHead == nil) || w.tickCounter&0x7 == 0 {
+		return time.Now().UnixNano()
+	}
+	return w.cachedNow
+}
+
 // armSweepTick makes sure an IORING_OP_TIMEOUT of sweepCeiling is outstanding
 // before the run loop waits for a SEND's completion with no timeout (mode 3a),
 // and reports whether the wait may go ahead untimed (celeris#884 item 74).
@@ -58,6 +83,9 @@ func (w *Worker) armSweepTick() bool {
 	if w.sweepTickArmed {
 		return true
 	}
+	if w.sweepTickBroken {
+		return false
+	}
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
 		return false
@@ -71,9 +99,25 @@ func (w *Worker) armSweepTick() bool {
 }
 
 // handleSweepTick takes the standing sweep timer's CQE: the timer is no longer
-// outstanding (the next mode-3a wait arms another) and the loop owes a sweep
-// (sweepDue). Worker thread.
-func (w *Worker) handleSweepTick() {
+// outstanding (the next mode-3a wait arms another) and, when it ran its
+// second (-ETIME), the loop owes a sweep (sweepDue). Any other result (-EINVAL
+// from a kernel that refuses the SQE, -ECANCELED, -ENOMEM) means the timer did
+// not do its job: it is no reason to sweep, and arming another would end every
+// mode-3a wait at once and make a full sweep, past the floor, after every
+// request. The worker then stops arming it (sweepTickBroken, logged once) and
+// the loop takes the timed wait, as it does with no SQE to be had. Worker
+// thread.
+func (w *Worker) handleSweepTick(res int32) {
 	w.sweepTickArmed = false
-	w.sweepTickFired = true
+	if res == -int32(unix.ETIME) {
+		w.sweepTickFired = true
+		return
+	}
+	if !w.sweepTickBroken {
+		w.sweepTickBroken = true
+		if w.logger != nil {
+			w.logger.Warn("io_uring: the sweep timer completed with an error; the worker waits for SEND completions with a timeout instead",
+				"worker", w.id, "res", res)
+		}
+	}
 }
