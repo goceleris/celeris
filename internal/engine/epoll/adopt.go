@@ -150,6 +150,17 @@ func (l *Loop) refuseAdopt(fd int, carry engine.Carryover) {
 // clean HTTP/1 request boundary; any pending request bytes wait in the kernel
 // socket receive buffer and are picked up by the EPOLLIN edge after registration.
 func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryover, now int64) {
+	l.attachFD(ctx, fd, carry, now, false)
+}
+
+// attachFD is attachAdoptedFD with the replay's recv count settled by the
+// caller: recvCounted says that the carried bytes were read, and counted, by
+// this loop already, which is a reclaim (reclaimTransplant: drainRead counted
+// the recv that read them before tryTransplant moved the conn), so the replay
+// must not count them again (celeris#886 item 25). A conn adopted from another
+// engine has had its bytes counted there, and counts them here as its first
+// recv (celeris#886).
+func (l *Loop) attachFD(ctx context.Context, fd int, carry engine.Carryover, now int64, recvCounted bool) {
 	if fd < 0 {
 		l.refuseAdopt(fd, carry)
 		return
@@ -232,7 +243,7 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 	// answer to a request no handler saw (celeris#543).
 	if len(carry.Buffered) > 0 {
 		if l.async {
-			l.replayCarriedAsync(cs, fd, carry.Buffered)
+			l.replayCarriedAsync(cs, fd, carry.Buffered, recvCounted)
 			return
 		}
 		perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, l.handler, cs.writeFn)
@@ -240,8 +251,11 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 		// one, whatever the verdict (celeris#886). drainRead counts a recv
 		// after ProcessH1 too, but returns before it on an h2c upgrade and
 		// never counts a direct-body recv: a carry that is an upgrade request
-		// counts one here and its recv would have counted none.
-		l.reqBatch++
+		// counts one here and its recv would have counted none. Not when this
+		// loop read and counted the bytes itself (a reclaim: recvCounted).
+		if !recvCounted {
+			l.reqBatch++
+		}
 		if perr != nil {
 			l.endCarriedReplay(cs, fd, perr)
 			return
@@ -259,15 +273,18 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 // thread; the conn is fresh from attachAdoptedFD, so no dispatch goroutine
 // exists yet and the loop owns cs.h1State until the promotion hands it over.
 // The conn's EPOLLIN is already registered, so nothing is left to arm.
-func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
+func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte, recvCounted bool) {
 	cs.h1State.InlineMode = true
 	perr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
 	// One request counted for the replay, whichever way it ends below: it is
 	// the recv event of this conn's first bytes (the promotion included, as
 	// in drainRead, celeris#626; celeris#886). Unlike drainRead it also counts
 	// a carry that ends in an h2c upgrade, which that path returns before
-	// counting.
-	l.reqBatch++
+	// counting. Not when this loop counted the recv already (a reclaim,
+	// recvCounted).
+	if !recvCounted {
+		l.reqBatch++
+	}
 	// A handler that hijacked inline has had cs released inside the Hijack
 	// call, as in drainRead, so cs is not touched again after ErrHijacked.
 	if errors.Is(perr, conn.ErrHijacked) {
