@@ -451,15 +451,7 @@ func (r *pgRequest) Ctx() context.Context { return r.ctx }
 // list and unblocks any caller waiting on colsCh for early streamRows
 // return.
 func (r *pgRequest) OnRowDesc(cols []protocol.ColumnDesc) {
-	r.doneMu.Lock()
-	if r.doneFlag {
-		// failAll (or failReq) completed the request: its caller reads
-		// r.columns now, so a late frame must not write it (celeris#887).
-		r.doneMu.Unlock()
-		return
-	}
-	r.columns = cols
-	r.doneMu.Unlock()
+	r.setColumnsIfLive(cols)
 	if r.rowCh != nil && r.colsCh != nil {
 		r.closeColsCh()
 	}
@@ -484,10 +476,27 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 	// append is ordered before the caller's read) and the caller reads r.rows
 	// and r.columns at once. A frame dispatch is still parsing then must not
 	// write them: it drops the row (celeris#887).
-	r.doneMu.Lock()
-	if r.doneFlag {
-		r.doneMu.Unlock()
+	nrows, syncMode, ok := r.appendBuffered(fields)
+	if !ok {
 		return
+	}
+	// Skip streaming promotion when colsCh is nil (Exec paths don't
+	// allocate one; promoting would panic on close(nil colsCh)).
+	if !syncMode && r.colsCh != nil && nrows >= streamThreshold {
+		promoteToStreaming(r)
+	}
+}
+
+// appendBuffered appends one DataRow to the buffered result under doneMu, with
+// a deferred unlock: a panic in the append on the sync path unwinds through
+// pollSync's failAll, whose fail() takes doneMu again. ok is false when the row
+// was dropped (the request is done) or the direct-mode result cap failed the
+// request; nrows is the buffered row count and syncMode the request's mode.
+func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok bool) {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if r.doneFlag {
+		return 0, false, false
 	}
 	r.appendRowFromAlias(fields)
 	// Direct-mode result-buffer cap. In direct mode syncMode is pinned
@@ -495,20 +504,39 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 	// buffer every row in memory unbounded. Cap at maxDirectResultBytes
 	// (64 MiB) and fail with ErrResultTooBig — caller paginates or
 	// switches modes.
-	syncMode := r.syncMode.Load()
+	syncMode = r.syncMode.Load()
 	if syncMode && len(r.rowSlab) > maxDirectResultBytes {
 		if r.err == nil {
 			r.err = ErrResultTooBig
 		}
-		r.doneMu.Unlock()
+		return 0, syncMode, false
+	}
+	return len(r.rows), syncMode, true
+}
+
+// setColumnsIfLive stores the column list unless the request is done: failAll
+// (or failReq) completed it, its caller reads r.columns now, and a late frame
+// must not write it (celeris#887). The unlock is deferred like
+// appendBuffered's.
+func (r *pgRequest) setColumnsIfLive(cols []protocol.ColumnDesc) {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if !r.doneFlag {
+		r.columns = cols
+	}
+}
+
+// setResultIfLive stores the extended query's command tag and, when none is set
+// yet, its columns, unless the request is done (see setColumnsIfLive).
+func (r *pgRequest) setResultIfLive(tag string, cols []protocol.ColumnDesc) {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if r.doneFlag {
 		return
 	}
-	nrows := len(r.rows)
-	r.doneMu.Unlock()
-	// Skip streaming promotion when colsCh is nil (Exec paths don't
-	// allocate one; promoting would panic on close(nil colsCh)).
-	if !syncMode && r.colsCh != nil && nrows >= streamThreshold {
-		promoteToStreaming(r)
+	r.tag = tag
+	if r.columns == nil {
+		r.columns = cols
 	}
 }
 
@@ -1293,24 +1321,34 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 		return nil
 	}
 
-	c.pendingMu.Lock()
-	if len(c.pending) == 0 {
-		c.pendingMu.Unlock()
+	head := c.pinHead()
+	if head == nil {
 		return fmt.Errorf("celeris-postgres: unexpected server message %q with empty queue", msgType)
 	}
+	// The last act on head is the unpin, as in failAll; deferred so a panic in
+	// dispatchHead (a CopyTo dest callback) does not keep the pin for good.
+	defer head.failPins.Add(-1)
+	return c.dispatchHead(head, msgType, payload)
+}
+
+// pinHead returns the head of the pending queue with a failPins pin taken
+// under pendingMu (a failAll sweeps the queue under the same lock), or nil when
+// the queue is empty. The pin is the caller's to drop after its last touch of
+// the request: a failAll on another goroutine (the cancel timeout, Close, the
+// COPY and direct-drain timeouts) fails the head and wakes its caller, who
+// releases it, and releasePgRequest drops a pinned request instead of pooling
+// it. Unpinned, the pool could hand the head to the next query while dispatch
+// still closes its channels and finishes it, a silent wrong result for that
+// query (celeris#887).
+func (c *pgConn) pinHead() *pgRequest {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if len(c.pending) == 0 {
+		return nil
+	}
 	head := c.pending[0]
-	// Pin head under the lock a failAll sweeps the queue under: a failAll on
-	// another goroutine (the cancel timeout, Close, the COPY and direct-drain
-	// timeouts) fails head and wakes its caller, who releases it, and
-	// releasePgRequest drops a pinned request instead of pooling it. Unpinned,
-	// the pool could hand head to the next query while this dispatch still
-	// closes its channels and finishes it, a silent wrong result for that query
-	// (celeris#887). The last act on head is the unpin, as in failAll.
 	head.failPins.Add(1)
-	c.pendingMu.Unlock()
-	err := c.dispatchHead(head, msgType, payload)
-	head.failPins.Add(-1)
-	return err
+	return head
 }
 
 // dispatchHead feeds one message into head, the request dispatch pinned.
@@ -1382,14 +1420,7 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 			return nil
 		}
 		if done {
-			head.doneMu.Lock()
-			if !head.doneFlag {
-				head.tag = head.extended.Tag
-				if head.columns == nil {
-					head.columns = head.extended.Columns
-				}
-			}
-			head.doneMu.Unlock()
+			head.setResultIfLive(head.extended.Tag, head.extended.Columns)
 			if head.rowCh != nil {
 				head.closeColsCh()
 				head.closeRowCh()
@@ -1401,11 +1432,7 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 			// response (before DataRow). Signal colsCh as soon as columns
 			// are available so the caller can return streamRows early.
 			if head.extended.Columns != nil && head.columns == nil {
-				head.doneMu.Lock()
-				if !head.doneFlag {
-					head.columns = head.extended.Columns
-				}
-				head.doneMu.Unlock()
+				head.setColumnsIfLive(head.extended.Columns)
 				head.closeColsCh()
 			}
 		}

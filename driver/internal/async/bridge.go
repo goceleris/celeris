@@ -147,9 +147,21 @@ func (b *Bridge) Len() int {
 func (b *Bridge) DrainWithError(err error, notify func(PendingRequest, error)) {
 	b.drainMu.Lock()
 	defer b.drainMu.Unlock()
+	drained := b.takeAll(notify != nil)
+	for _, req := range drained {
+		if req != nil {
+			notify(req, err)
+		}
+	}
+}
+
+// takeAll empties the ring under b.mu (unlocked by a defer) and returns the
+// requests it held when keep is set.
+func (b *Bridge) takeAll(keep bool) []PendingRequest {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	var drained []PendingRequest
-	if notify != nil && b.size > 0 {
+	if keep && b.size > 0 {
 		drained = make([]PendingRequest, 0, b.size)
 	}
 	for i := 0; i < b.size; i++ {
@@ -161,12 +173,7 @@ func (b *Bridge) DrainWithError(err error, notify func(PendingRequest, error)) {
 	}
 	b.head = 0
 	b.size = 0
-	b.mu.Unlock()
-	for _, req := range drained {
-		if req != nil {
-			notify(req, err)
-		}
-	}
+	return drained
 }
 
 // WaitDrained returns once no DrainWithError is in progress: every request an
