@@ -52,7 +52,7 @@ func (floodHandler885) HandleStream(_ context.Context, s *stream.Stream) error {
 	return s.ResponseWriter.WriteResponse(s, 200, [][2]string{{"content-type", "text/plain"}}, body)
 }
 
-func startFloodEngine885(t *testing.T, bufSize int) *Engine {
+func startFloodEngine885(t testing.TB, bufSize int) *Engine {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -116,7 +116,7 @@ func (p *pingConn885) ask(path string) (string, time.Duration, error) {
 
 // threeConns885 dials until it holds conn a, conn same on a's loop and conn
 // other on the other loop (the engine has two), and closes the rest.
-func threeConns885(t *testing.T, e *Engine) (a, same, other *pingConn885) {
+func threeConns885(t testing.TB, e *Engine) (a, same, other *pingConn885) {
 	t.Helper()
 	byLoop := map[string][]*pingConn885{}
 	var all []*pingConn885
@@ -178,7 +178,7 @@ func summarize885(lat []time.Duration) floodStats885 {
 // runFlood885 floods a (when flood is set) for dur while each of the pingers
 // asks /who every gap, and returns each one's latencies, and how many
 // requests the flood sent.
-func runFlood885(t *testing.T, a *pingConn885, pingers []*pingConn885, flood bool, dur, gap time.Duration) ([]floodStats885, int64) {
+func runFlood885(t testing.TB, a *pingConn885, pingers []*pingConn885, flood bool, dur, gap time.Duration) ([]floodStats885, int64) {
 	t.Helper()
 	var stop atomic.Bool
 	var wg sync.WaitGroup
