@@ -164,6 +164,17 @@ type loadResult struct {
 // then stops, so each lost request is exactly one error.
 func runKeepAliveLoad(t *testing.T, addr string, n int, stop <-chan struct{}) func() loadResult {
 	t.Helper()
+	return runKeepAliveLoadPaced(t, addr, n, stop, 0)
+}
+
+// runKeepAliveLoadPaced is runKeepAliveLoad with think between a client's
+// answered request and its next (0: none, back to back). A worker serving
+// clients that never wait finds a completion ready at every pass of its loop
+// and takes no wait at all, or only the one that has sends to wait for; with
+// think the clients leave it idle between requests, and the wait it takes
+// then is the timed one (celeris#884 item 49, the test of that wait).
+func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{}, think time.Duration) func() loadResult {
+	t.Helper()
 	var ok, errsN atomic.Int64
 	var mu sync.Mutex
 	byClass := map[string]int64{}
@@ -216,6 +227,13 @@ func runKeepAliveLoad(t *testing.T, addr string, n int, stop <-chan struct{}) fu
 					return
 				}
 				ok.Add(1)
+				if think > 0 {
+					select {
+					case <-stop:
+						return
+					case <-time.After(think):
+					}
+				}
 			}
 		}()
 	}
