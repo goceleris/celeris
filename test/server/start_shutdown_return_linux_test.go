@@ -4,6 +4,7 @@ package celeris_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -83,59 +84,74 @@ func runStartShutdownCaseCfg(t *testing.T, cfg celeris.Config, withListener bool
 	t.Helper()
 	engType := cfg.Engine
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-
-	switch {
-	case !withListener:
-		// Start binds the address itself; hand it the port we just probed.
-		cfg.Addr = addr
-		if cerr := ln.Close(); cerr != nil {
-			t.Fatalf("close probe listener: %v", cerr)
-		}
-	case engType == celeris.Adaptive:
-		// Adaptive + a supplied listener needs Addr set to the listener's
-		// own address: adaptive.New re-applies WithDefaults and resolves
-		// the resulting ":8080" to "[::]:8080", and the sub-engine's
-		// Validate then rejects the pair with `ambiguous configuration:
-		// Addr="[::]:8080" but Listener is bound to ...`. Unrelated to
-		// celeris#595 — without this line the engine never starts at all.
-		cfg.Addr = addr
-	}
-
 	handlerStarted := make(chan struct{}, 1)
-	s := celeris.New(cfg)
-	s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
-	s.GET("/slow", func(c *celeris.Context) error {
-		select {
-		case handlerStarted <- struct{}{}:
-		default:
+	var (
+		s         *celeris.Server
+		addr      string
+		startDone chan error
+	)
+	// A fresh server and listener per try: an io_uring Start can fail with
+	// ring-setup ENOMEM under the runner's 8 MiB memlock while earlier rings
+	// are still charged (celeris#1104).
+	startRetryingRingENOMEM(t, "server start", func() error {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
 		}
-		time.Sleep(inFlightDelay)
-		return c.String(http.StatusOK, "done")
+		addr = ln.Addr().String()
+		cfg := cfg
+		switch {
+		case !withListener:
+			// Start binds the address itself; hand it the port we just probed.
+			cfg.Addr = addr
+			if cerr := ln.Close(); cerr != nil {
+				t.Fatalf("close probe listener: %v", cerr)
+			}
+		case engType == celeris.Adaptive:
+			// Adaptive + a supplied listener needs Addr set to the listener's
+			// own address: adaptive.New re-applies WithDefaults and resolves
+			// the resulting ":8080" to "[::]:8080", and the sub-engine's
+			// Validate then rejects the pair with `ambiguous configuration:
+			// Addr="[::]:8080" but Listener is bound to ...`. Unrelated to
+			// celeris#595 — without this line the engine never starts at all.
+			cfg.Addr = addr
+		}
+		s = celeris.New(cfg)
+		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+		s.GET("/slow", func(c *celeris.Context) error {
+			select {
+			case handlerStarted <- struct{}{}:
+			default:
+			}
+			time.Sleep(inFlightDelay)
+			return c.String(http.StatusOK, "done")
+		})
+		startDone = make(chan error, 1)
+		go func(s *celeris.Server, done chan error) {
+			if withListener {
+				done <- s.StartWithListener(ln)
+			} else {
+				done <- s.Start()
+			}
+		}(s, startDone)
+		// Readiness probes get their own short per-request timeout: until the
+		// engine is up, the probe listener's backlog still accepts the TCP
+		// connection and nobody answers, so a long timeout would park the poll
+		// loop and hide a Start that already returned an error.
+		ok, werr := waitReadyErr(&http.Client{Timeout: 300 * time.Millisecond}, "http://"+addr+"/ping", startDone)
+		if werr != nil {
+			if withListener {
+				_ = ln.Close()
+			}
+			return fmt.Errorf("Start returned before the server was ready: %w", werr)
+		}
+		if !ok {
+			t.Fatalf("%s: server never became ready on %s", engType, addr)
+		}
+		return nil
 	})
-
-	startDone := make(chan error, 1)
-	go func() {
-		if withListener {
-			startDone <- s.StartWithListener(ln)
-		} else {
-			startDone <- s.Start()
-		}
-	}()
-
 	base := "http://" + addr
 	client := &http.Client{Timeout: 10 * time.Second}
-	// Readiness probes get their own short per-request timeout: until the
-	// engine is up, the probe listener's backlog still accepts the TCP
-	// connection and nobody answers, so a long timeout would park the poll
-	// loop and hide a Start that already returned an error.
-	if !waitReady(t, &http.Client{Timeout: 300 * time.Millisecond}, base+"/ping", startDone) {
-		t.Fatalf("%s: server never became ready on %s", engType, addr)
-	}
 
 	type result struct {
 		body string
@@ -198,11 +214,21 @@ func runStartShutdownCaseCfg(t *testing.T, cfg celeris.Config, withListener bool
 // a silent skip would look like a pass).
 func waitReady(t *testing.T, client *http.Client, url string, startDone <-chan error) bool {
 	t.Helper()
+	ok, err := waitReadyErr(client, url, startDone)
+	if err != nil {
+		t.Fatalf("Start returned before the server was ready: %v", err)
+	}
+	return ok
+}
+
+// waitReadyErr is waitReady that returns the error Start returned first
+// instead of failing, so a caller can retry a ring-setup ENOMEM (celeris#1104).
+func waitReadyErr(client *http.Client, url string, startDone <-chan error) (bool, error) {
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-startDone:
-			t.Fatalf("Start returned before the server was ready: %v", err)
+			return false, err
 		default:
 		}
 		resp, err := client.Get(url)
@@ -210,10 +236,10 @@ func waitReady(t *testing.T, client *http.Client, url string, startDone <-chan e
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return true
+				return true, nil
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return false
+	return false, nil
 }

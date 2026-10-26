@@ -132,7 +132,7 @@ func startH2Return889(t *testing.T, a arm848) *h2Return889Rig {
 		}
 		cancel()
 		_ = ln.Close()
-		if !strings.Contains(err.Error(), "cannot allocate memory") || time.Now().After(deadline) {
+		if !isRingENOMEM(err) || time.Now().After(deadline) {
 			t.Fatalf("server did not start: %v", err)
 		}
 		time.Sleep(2 * time.Millisecond)

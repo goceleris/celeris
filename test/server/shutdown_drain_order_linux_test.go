@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -283,7 +282,7 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async, h2c, asy
 			break
 		}
 		_ = ln.Close()
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(retryUntil) {
+		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}

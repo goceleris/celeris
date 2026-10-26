@@ -105,7 +105,7 @@ func startH2848(t *testing.T, eng celeris.EngineType) *h2rig848 {
 		_ = ln.Close()
 		// A start that fails only with ENOMEM (io_uring ring memory still
 		// charged to RLIMIT_MEMLOCK) is retried with a new server.
-		if !strings.Contains(err.Error(), "cannot allocate memory") || time.Now().After(deadline) {
+		if !isRingENOMEM(err) || time.Now().After(deadline) {
 			t.Fatalf("server did not start: %v", err)
 		}
 		time.Sleep(2 * time.Millisecond)
