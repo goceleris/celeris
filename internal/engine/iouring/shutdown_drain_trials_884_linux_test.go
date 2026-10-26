@@ -12,8 +12,10 @@ import (
 // (endOwedOpsAtShutdown) ends the ops the kernel still owes on a live
 // connection's descriptor before shutdown closes it. TestShutdownDrainSurvivesAFullCQRing873
 // and the 880 tests pin it for a standalone recv; PR #1099 recorded two forms
-// they do not reach, and its open question, keep or remove the drain, is
-// answered by what these show: the drain is the only thing that ends them.
+// they do not reach. These close them. The open question of the item, keep or
+// remove the drain, is not decided here: what they show is that the drain is
+// the only thing in the engine that ends these two ops before the descriptor is
+// closed, not whether a kernel would issue work after that (c: not measured).
 //
 //   - (a) a recv linked behind a SEND whose CQE the loop has already read. The
 //     kernel consumed both SQEs at the submit; the recv is issued, and its

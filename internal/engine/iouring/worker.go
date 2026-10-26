@@ -819,8 +819,10 @@ type Worker struct {
 
 	// refuseRecv is true once the send drain, or the wait for the HTTP/2
 	// pool handlers before it, is past its first shutdownSendDrainNanos:
-	// handleRecv then reads nothing more from an HTTP/1 connection
-	// (celeris#806, celeris#884). The drain lasts as long as the
+	// handleRecv then reads no new request from an HTTP/1 connection
+	// (celeris#806, celeris#884): a request in progress is read on
+	// (gateReadsOn), and the conns that hold nothing are closed
+	// (closeIdleH1, shutdown_gate_884.go). The drain lasts as long as the
 	// budget, and on keep-alive connections whose responses queue in the
 	// worker, new requests would keep the queues from ever emptying.
 	// Worker thread only; read in handleRecv.
@@ -1593,11 +1595,16 @@ func (w *Worker) run(ctx context.Context) {
 				// the walk over every conn is not paid on every pass); the
 				// HTTP/2 conns this wait is for are served on
 				// (celeris#884). h2PoolSettled has set h2DrainStart. A
-				// request whose bytes have not all arrived by then is not
-				// answered: the bytes after the gate are dropped (a slow
-				// upload, headers in pieces). The producers' OnError and
-				// OnDetachClose run on this thread, as in the send drain,
-				// so a slow callback delays the HTTP/2 conns served here.
+				// request in progress at the gate (a slow upload, headers in
+				// pieces) is read on and answered, with Connection: close, as
+				// std's Shutdown answers an active conn; the conns that hold
+				// nothing (idle keep-alive, no byte sent, a detached stream
+				// the gate ended) are closed (closeIdleH1), paced with the
+				// walk, so a client fails at once instead of waiting for the
+				// end of the wait with no answer (celeris#884 item 73). The
+				// producers' OnError and OnDetachClose run on this thread, as
+				// in the send drain, so a slow callback delays the HTTP/2
+				// conns served here.
 				if now := time.Now().UnixNano(); now > w.h2DrainStart+shutdownSendDrainNanos {
 					w.refuseRecv = true
 					if w.stopProducersPaced(now) {
@@ -2902,6 +2909,18 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 				}
 			default:
 				w.processCQE(ctx, c, now)
+				// The terminal CQE of an accept of THIS descriptor number ends
+				// the wait (celeris#896). Known limit (celeris#884 item 63,
+				// decided 2026-10-12 as a comment, not a fix): a terminal CQE
+				// of an earlier listen socket that is still unread, when a
+				// re-created socket shares its number (a pause, a resume and a
+				// shutdown together: the re-created socket usually gets the
+				// same number), is taken for this one and ends the wait early;
+				// the port then stays bound for the ring teardown's ~2 ms.
+				// Counting terminal accept CQEs against the cancel's result
+				// (the number it cancelled) would close it, but needs the
+				// order of the cancel's CQE and the accept's terminal CQE
+				// pinned on every kernel CI runs. Narrow, not reproduced.
 				if ud&udMask == udAccept && decodeFD(ud) == lfd && !cqeHasMore(c.Flags) {
 					acceptOwed = false
 				}
@@ -3969,12 +3988,15 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// more (celeris#806): the drain finishes the responses it has, and a
 	// request taken now could only be answered into a queue that the
 	// drain, which lasts as long as the budget, would never find empty
-	// under steady keep-alive traffic. Epoll's shutdown phases stop reading
-	// (its pool wait does not: celeris#885). The bytes are dropped with the
-	// connection, which shutdown closes; the recv is not re-armed, so a
-	// request whose bytes were still arriving at the gate (the body of an
-	// upload, headers in pieces) is never answered. A detached conn is read no
-	// more either (its writes were ended with the gate: stopDetachedProducers).
+	// under steady keep-alive traffic. The bytes of a NEW request are dropped
+	// and the recv is not re-armed: the conn holds nothing, and the gate's pass
+	// closes it (closeIdleH1). A request already IN PROGRESS (the body of an
+	// upload, headers in pieces, the bytes of a protocol decision begun) is read
+	// on, as std's Shutdown answers an active conn, and answered with
+	// Connection: close (gateReadsOn, celeris#884 item 73); that includes a
+	// conn whose dispatch goroutine owns the parse state, which epoll cannot
+	// yet look inside. A detached conn is read no more (its writes were ended
+	// with the gate: stopDetachedProducers).
 	// HTTP/2 conns are served on: they have had GOAWAY since the pool wait,
 	// and what their responses may still wait for was waited for there or
 	// is out of time.

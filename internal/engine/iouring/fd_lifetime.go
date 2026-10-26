@@ -740,7 +740,15 @@ func (w *Worker) endOwedOpsAtShutdown() {
 					// (a pause, a resume and a shutdown at once; cancelAccept
 					// reaps inline, which keeps that window narrow) is not
 					// taken for it unless a re-created socket reused the
-					// number (appended to #884).
+					// number, which it usually does. Known limit (celeris#884
+					// item 63, decided 2026-10-12 as a comment, not a fix): the
+					// wait then ends early and the port stays bound for the
+					// ring teardown's ~2 ms. Counting terminal accept CQEs
+					// against the cancel's result (the number it cancelled,
+					// listenCancelAnswer's positive count) would close it, but
+					// needs the order of the cancel's CQE and the accept's
+					// terminal CQE pinned on every kernel CI runs. Narrow, not
+					// reproduced; cancelAccept has the same limit.
 					if !cqeHasMore(c.Flags) && decodeFD(ud) == listenFDAtCancel {
 						acceptOwed = false
 					}
