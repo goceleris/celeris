@@ -729,7 +729,7 @@ type Worker struct {
 	// -ETIME: no timer is armed again and the loop waits with a timeout
 	// (handleSweepTick).
 	sweepTickBroken bool
-	sweepTickSpec  kernelTimespec
+	sweepTickSpec   kernelTimespec
 	// lastStallLook is the clock of the last sweep that looked at the
 	// detached conns' stall (stallLookDue); worker-thread-only.
 	lastStallLook int64
