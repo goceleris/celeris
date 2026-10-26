@@ -5,6 +5,7 @@ package iouring
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +86,11 @@ func TestHijackWithAReplyTheSocketCannotTakeIsRefused936(t *testing.T) {
 		t.Fatal("hijackConn succeeded with most of a 4 MiB reply still queued: it would be dropped")
 	}
 	t.Logf("refused: %v", err)
+	// The socket-full refusal is not the in-flight one: a log or an assertion
+	// can tell which branch fired.
+	if !strings.Contains(err.Error(), "send buffer") {
+		t.Errorf("refusal %q does not say the socket's send buffer is the limit", err)
+	}
 	if w.conns[f.fd] != cs || w.connCount != 1 || cs.closing {
 		t.Errorf("a refused hijack changed the conn: registered=%v connCount=%d closing=%v", w.conns[f.fd] == cs, w.connCount, cs.closing)
 	}
@@ -106,11 +112,49 @@ func TestHijackWithASendInFlightIsRefused936(t *testing.T) {
 	w, cs := f.w, f.cs
 	cs.sending = true
 	cs.writeBuf = append(cs.writeBuf, "later"...)
-	if c, err := w.hijackConn(f.fd); err == nil {
+	c, err := w.hijackConn(f.fd)
+	if err == nil {
 		_ = c.Close()
 		t.Fatal("hijackConn succeeded with a send in flight")
 	}
+	if !strings.Contains(err.Error(), "pending sends") {
+		t.Errorf("in-flight refusal %q does not say pending sends", err)
+	}
 	if string(cs.writeBuf) != "later" {
 		t.Errorf("a refused hijack changed the queue: %q", cs.writeBuf)
+	}
+}
+
+// A detached conn belongs to the middleware that detached it, whose guarded
+// writer is live and which the dispatch goroutine no longer serializes with
+// the worker: the engine refuses to hijack it, whatever is queued, and leaves
+// it as it was. Context.Hijack refuses first; this is the engine enforcing it
+// for any other caller of the Hijacker.
+func TestHijackOfADetachedConnIsRefused936(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		name := "nothing-queued"
+		if queued {
+			name = "reply-queued"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newFDLFixture(t, false)
+			w, cs := f.w, f.cs
+			cs.h1State.Detached.Store(true)
+			if queued {
+				cs.writeBuf = append(cs.writeBuf, "reply"...)
+			}
+			c, err := w.hijackConn(f.fd)
+			if err == nil {
+				_ = c.Close()
+				t.Fatal("hijackConn handed over a detached conn")
+			}
+			t.Logf("refused: %v", err)
+			if w.conns[f.fd] != cs || w.connCount != 1 || !fdOpen704(f.fd) {
+				t.Errorf("a refused hijack changed the conn: registered=%v connCount=%d open=%v", w.conns[f.fd] == cs, w.connCount, fdOpen704(f.fd))
+			}
+			if queued && string(cs.writeBuf) != "reply" {
+				t.Errorf("a refused hijack changed the queue: %q", cs.writeBuf)
+			}
+		})
 	}
 }

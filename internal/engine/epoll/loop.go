@@ -2395,6 +2395,14 @@ func dispatchBusyLocked(cs *connState, owe *bool) bool {
 // (itself a dup).
 var testHookHijackReleased atomic.Pointer[func(l *Loop, cs *connState)]
 
+// testHookHijackFlush, when set (tests only), is called by flushBeforeHijack
+// with pass 0 and the bytes queued when it finds something to send, and after
+// each flush pass with the pass's number and what is still queued. A test
+// records from it that a reply was still queued when the hijack came, and
+// drains the peer between two passes to make the second one take the rest.
+// nil in production; one atomic load per hijack that finds output queued.
+var testHookHijackFlush atomic.Pointer[func(cs *connState, pass, pending int)]
+
 // errHijackQueued is what hijackConn answers when a reply an earlier pipelined
 // request wrote cannot be sent without waiting for the peer.
 var errHijackQueued = errors.New("celeris: cannot hijack: a queued response has not been sent and the peer's receive window does not take it, so it cannot go out before the connection is handed over")
@@ -2423,6 +2431,10 @@ func (l *Loop) flushBeforeHijack(cs *connState, onLoopThread bool) error {
 	if !csWritePending(cs) {
 		return nil
 	}
+	hook := testHookHijackFlush.Load()
+	if hook != nil {
+		(*hook)(cs, 0, csPendingBytes(cs))
+	}
 	if cs.h1State != nil && cs.h1State.Detached.Load() {
 		return nil
 	}
@@ -2431,9 +2443,15 @@ func (l *Loop) flushBeforeHijack(cs *connState, onLoopThread bool) error {
 		queued = csPendingBytes(cs) // before this flush (celeris#885)
 	}
 	var err error
+	pass := 0
 	for csWritePending(cs) {
 		before := csPendingBytes(cs)
-		if err = l.flushWrites(cs, onLoopThread); err != nil || csPendingBytes(cs) >= before {
+		pass++
+		err = l.flushWrites(cs, onLoopThread)
+		if hook != nil {
+			(*hook)(cs, pass, csPendingBytes(cs))
+		}
+		if err != nil || csPendingBytes(cs) >= before {
 			break // an error, or the socket took nothing more
 		}
 	}
