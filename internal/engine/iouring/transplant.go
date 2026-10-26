@@ -287,8 +287,8 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		return w.endCarriedReplay(cs, fd, perr)
 	}
 	// Inline served the bytes, but if they ended inside a request (buffered
-	// headers, a chunked body) its continuation must run on the dispatch
-	// goroutine, as in handleRecv.
+	// headers) its continuation must run on the dispatch goroutine, as in
+	// handleRecv. A chunked body in progress stays inline (celeris#889).
 	if cs.h1State.HasPendingDispatchState() {
 		cs.asyncPromoted.Store(true)
 		w.asyncPromoted.Add(1)

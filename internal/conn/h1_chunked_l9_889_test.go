@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http/httputil"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
@@ -81,6 +83,9 @@ func TestProcessH1SplitChunkedStaysInline889(t *testing.T) {
 			if st.HasPendingDispatchState() {
 				t.Errorf("HasPendingDispatchState is true for a chunked body in progress: io_uring promotes the conn for life")
 			}
+			if st.NeedsDispatchGoroutine() {
+				t.Errorf("NeedsDispatchGoroutine is true for a chunked body in progress: epoll promotes the conn for life")
+			}
 			if !st.HasPendingData() {
 				t.Errorf("HasPendingData is false for a chunked body in progress: the revert and transplant gates need it")
 			}
@@ -114,7 +119,7 @@ func TestProcessH1SplitChunkedThenSyncRequests889(t *testing.T) {
 		if _, err := feed1029(st, h, &out, []byte("GET /ping HTTP/1.1\r\nHost: a\r\n\r\n")); err != nil {
 			t.Fatal(err)
 		}
-		if st.HasPendingDispatchState() || st.HasPendingData() {
+		if st.HasPendingDispatchState() || st.NeedsDispatchGoroutine() || st.HasPendingData() {
 			t.Fatalf("request %d left pending state", i)
 		}
 	}
@@ -226,6 +231,15 @@ func (p *capProbe889) HandleStream(_ context.Context, s *stream.Stream) error {
 	d := s.GetData()
 	p.body = len(d)
 	p.held = cap(d) + p.st.buffer.Cap()
+	// A body that is a view of state.buffer's array is one copy, not two.
+	if len(d) > 0 {
+		avail := p.st.buffer.AvailableBuffer()
+		end := uintptr(unsafe.Pointer(unsafe.SliceData(avail))) + uintptr(p.st.buffer.Available())
+		start := end - uintptr(p.st.buffer.Cap())
+		if at := uintptr(unsafe.Pointer(unsafe.SliceData(d))); at >= start && at < end {
+			p.held = p.st.buffer.Cap()
+		}
+	}
 	return nil
 }
 
@@ -257,6 +271,81 @@ func TestChunkedSingleChunkCapacity889(t *testing.T) {
 					t.Fatalf("cap(body)+cap(buffer) = %d for a %d byte body: %.2fx", p.held, n, float64(p.held)/float64(n))
 				}
 			})
+		}
+	}
+}
+
+// keepBody889 keeps every body it is given, as an async or detached handler
+// keeps c.Body() past its return.
+type keepBody889 struct{ bodies [][]byte }
+
+func (k *keepBody889) HandleStream(_ context.Context, s *stream.Stream) error {
+	k.bodies = append(k.bodies, s.GetData())
+	return nil
+}
+
+// TestChunkedSingleChunkBodyStaysIntact889: a body that is a view of
+// state.buffer's array (item 52) must not be overwritten by what the conn
+// receives next. One large chunk, in one recv (the buffered path) and in
+// several (the resume path), then more requests through the same state, with a
+// pipelined tail in the recv that ends the body.
+func TestChunkedSingleChunkBodyStaysIntact889(t *testing.T) {
+	for _, n := range []int{200 << 10, 70 << 10} {
+		for _, piece := range []int{1 << 30, 10000} {
+			for _, tail := range []string{"", "POST /next HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\nWXYZ"} {
+				t.Run(fmt.Sprintf("%d/piece%d/tail%d", n, piece, len(tail)), func(t *testing.T) {
+					st := NewH1State()
+					st.MaxRequestBodySize = 1 << 20
+					k := &keepBody889{}
+					body := pattern1029(n)
+					wire := append(append([]byte(head1029), chunked1029(body, n, "", "")...), tail...)
+					for _, seg := range cut1029(wire, piece) {
+						cp := append([]byte(nil), seg...)
+						if err := ProcessH1(context.Background(), cp, st, k, func([]byte) {}); err != nil {
+							t.Fatal(err)
+						}
+						for j := range cp {
+							cp[j] = 0xEE
+						}
+					}
+					// More traffic through the same buffers: chunked and plain.
+					for i := 0; i < 3; i++ {
+						junk := bytes.Repeat([]byte{byte('A' + i)}, 3000)
+						more := append([]byte(head1029), chunked1029(junk, 1000, "", "")...)
+						if err := ProcessH1(context.Background(), more, st, k, func([]byte) {}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if len(k.bodies) < 4 || !bytes.Equal(k.bodies[0], body) {
+						t.Fatalf("the first body changed after later requests (%d bodies)", len(k.bodies))
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestExpectContinuePanicLogged889 (item 46): a panicking OnExpectContinue is
+// still a refusal, and now leaves a log record with the panic value and the
+// stack, at both sites (a fixed-length body and a chunked one).
+func TestExpectContinuePanicLogged889(t *testing.T) {
+	for _, head := range []string{
+		"POST /up HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
+		"POST /up HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n",
+	} {
+		var logbuf bytes.Buffer
+		st := NewH1State()
+		st.Logger = slog.New(slog.NewTextHandler(&logbuf, nil))
+		st.OnExpectContinue = func(string, string, [][2]string) bool { panic("boom-expect-889") }
+		h := &rec1029{}
+		var out bytes.Buffer
+		_, err := feed1029(st, h, &out, []byte(head))
+		if err == nil || !strings.HasPrefix(out.String(), "HTTP/1.1 417") || len(h.paths) != 0 {
+			t.Fatalf("err %v, answer %q, handled %v: want the 417 and the close kept", err, firstLine889(out.String()), h.paths)
+		}
+		got := logbuf.String()
+		if !strings.Contains(got, "boom-expect-889") || !strings.Contains(got, "stack=") || !strings.Contains(got, "/up") {
+			t.Fatalf("log %q names no panic value, path or stack", got)
 		}
 	}
 }

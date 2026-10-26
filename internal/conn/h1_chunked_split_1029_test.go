@@ -555,8 +555,10 @@ func TestProcessH1ChunkedH2CUpgrade1029(t *testing.T) {
 }
 
 // TestProcessH1ChunkedBoundaryFlags1029: a half-received chunked body is not a
-// request boundary (the #383 transplant check) and it leaves the conn pending
-// for the dispatch goroutine; a finished one is a boundary again.
+// request boundary (the #383 transplant check) and it is pending state (the
+// revert and transplant gates read that), but it does not make the engines
+// promote the conn to its dispatch goroutine (celeris#889); a finished one is a
+// boundary again.
 func TestProcessH1ChunkedBoundaryFlags1029(t *testing.T) {
 	st := NewH1State()
 	h := &rec1029{}
@@ -568,8 +570,8 @@ func TestProcessH1ChunkedBoundaryFlags1029(t *testing.T) {
 		if _, err := feed1029(st, h, &out, seg); err != nil {
 			t.Fatal(err)
 		}
-		if !last && (st.AtRequestBoundary() || !st.HasPendingData() || !st.HasPendingDispatchState()) {
-			t.Fatalf("segment %d: boundary=%v pending=%v pendingDispatch=%v  mid-body", i, st.AtRequestBoundary(), st.HasPendingData(), st.HasPendingDispatchState())
+		if !last && (st.AtRequestBoundary() || !st.HasPendingData() || st.HasPendingDispatchState() || st.NeedsDispatchGoroutine()) {
+			t.Fatalf("segment %d: boundary=%v pending=%v pendingDispatch=%v needsDispatch=%v mid-body", i, st.AtRequestBoundary(), st.HasPendingData(), st.HasPendingDispatchState(), st.NeedsDispatchGoroutine())
 		}
 	}
 	if !st.AtRequestBoundary() || st.HasPendingData() {

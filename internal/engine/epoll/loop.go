@@ -1852,7 +1852,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// accumulating body), promote so the continuation runs on the
 		// dispatch goroutine — the partial-state parse paths must not run
 		// inline (only the fresh-parse site honors the async check).
-		if tryInline && processErr == nil && cs.h1State.HasPendingData() {
+		if tryInline && processErr == nil && cs.h1State.NeedsDispatchGoroutine() {
 			cs.asyncPromoted = true
 			l.asyncPromoted.Add(1)
 		}
@@ -2622,6 +2622,7 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue
+		cs.h1State.Logger = l.logger
 		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
 		cs.h1State.WorkerID = int32(l.id)
 		cs.h1State.WorkerIDSet = true
