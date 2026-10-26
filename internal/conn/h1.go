@@ -6,14 +6,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
+	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	h1 "github.com/goceleris/celeris/internal/protocol/h1"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/validation"
 )
 
 // timeNow is a package-level alias so tests can stub the clock when
@@ -165,9 +169,19 @@ type H1State struct {
 	// half-received chunked body.
 	chunkedInProgress bool
 	chunkHeadLen      int
+	// chunkExcess is the non-data framing of the chunked request in flight
+	// beyond what its data pays for, as net/http counts it (celeris#889): each
+	// chunk adds its size line and the CRLF after its data, takes off 16 plus
+	// twice its data, and the sum is floored at 0. Past maxChunkExcess the
+	// request is refused. Carried across ProcessH1 calls with the body.
+	chunkExcess int64
+	// chunkAliased: chunkBuf is a view of state.buffer's array (scanChunked),
+	// so the buffer must be given up before it is written again.
+	chunkAliased bool
 	// chunkBuf is the decoded chunked body of the request in flight. It is
 	// handed to the handler and dropped, never reused: a handler may keep
-	// c.Body() until it returns, and an async or detached one longer.
+	// c.Body() until it returns, and an async or detached one longer. A large
+	// one-chunk body is a view of state.buffer's array (chunkAliased).
 	chunkBuf           []byte
 	req                h1.Request
 	rw                 h1ResponseAdapter // embedded — reused per request, avoids heap alloc
@@ -178,6 +192,10 @@ type H1State struct {
 	OnExpectContinue   func(method, path string, headers [][2]string) bool // nil = always accept
 	OnDetach           func()                                              // set by engine; called on Context.Detach
 	Detached           atomic.Bool                                         // set by OnDetach; breaks pipelining loop. atomic: written on the dispatch/handler goroutine (Context.Detach -> OnDetach), read on the engine worker goroutine.
+
+	// Logger, when set by the engine, receives the record of an OnExpectContinue
+	// that panicked (the request is still refused with 417).
+	Logger *slog.Logger
 
 	// WSDataDelivery is set by the WebSocket middleware after upgrade (101 sent).
 	// When non-nil and Detached, subsequent reads are delivered as raw bytes
@@ -372,16 +390,30 @@ func (s *H1State) AtRequestBoundary() bool {
 
 // HasPendingDispatchState reports whether ProcessH1 left partial state that
 // MUST be continued on the dispatch goroutine (InlineMode=false): buffered
-// partial headers or a chunked body in progress, both of which resume via the
-// buffered parse path that does not re-run the per-route async check. A
+// partial headers, which resume via the buffered parse path. A
 // fixed-length body in progress (bodyNeeded > 0) is deliberately EXCLUDED: its
 // continuation re-parses the already-async-checked (so provably non-async)
 // request and dispatches the handler inline on the worker — exactly as the
 // sync engine does — so it must NOT force the conn onto the slower async
 // dispatch path. Promoting on it permanently poisoned keep-alive conns that
 // hit even one split-across-recvs body (the post-4k regression).
+//
+// A chunked body in progress (chunkedInProgress) is EXCLUDED too, for the same
+// reason: its head was checked against the async routes when it was first
+// parsed and its continuation resumes in the chunk block, not in the buffered
+// parse. What follows its terminator is checked there (celeris#889).
 func (s *H1State) HasPendingDispatchState() bool {
-	return s.buffer.Len() > 0 && s.bodyNeeded <= 0
+	return s.buffer.Len() > 0 && s.bodyNeeded <= 0 && !s.chunkedInProgress
+}
+
+// NeedsDispatchGoroutine is HasPendingData without a chunked body in
+// progress: buffered partial headers, or a fixed-length body still
+// accumulating. It is what epoll's inline path reads to decide that the conn
+// continues on its dispatch goroutine. A chunked body is left out as in
+// HasPendingDispatchState: promoting on it poisoned the conn for the rest of
+// its life (celeris#889).
+func (s *H1State) NeedsDispatchGoroutine() bool {
+	return (s.buffer.Len() > 0 && !s.chunkedInProgress) || s.bodyNeeded > 0
 }
 
 // CurrentRoute returns the method and path of the request currently parsed into
@@ -561,6 +593,8 @@ func CloseH1(state *H1State) {
 	state.bodyNeeded = 0
 	state.chunkBuf = nil
 	state.chunkedInProgress = false
+	state.chunkExcess = 0
+	state.chunkAliased = false
 }
 
 // ProcessH1 processes incoming H1 data, parsing requests and calling the handler.
@@ -713,6 +747,9 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
+		// The buffer may hold the body the handler kept (see scanChunked): it
+		// is not written again.
+		state.releaseLargeBuffer()
 		if state.Detached.Load() {
 			return nil
 		}
@@ -724,20 +761,12 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			// what follows the terminator starts the next request's head.
 			state.ArmHeaderDeadline()
 		}
-		if state.buffer.Cap() > maxRetainedChunkedBuffer {
-			// The buffer grew to hold one large chunk. Do not keep it for the
-			// life of the connection, whether or not a pipelined request
-			// follows the terminator: that tail moves to a buffer of its own
-			// size (once per large upload, not per request).
-			var nb bytes.Buffer
-			if tail := state.buffer.Bytes(); len(tail) > 0 {
-				nb.Write(tail)
-			}
-			state.buffer = nb
-		}
 		data = nil
 	}
 
+	// headChecked: the request at the front of state.buffer has been checked
+	// against RouteAsync by the fresh-parse loop, which handed it over.
+	headChecked := false
 	if state.buffer.Len() == 0 {
 		offset := 0
 		for offset < len(data) {
@@ -792,7 +821,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				// parses the head again: answering here too wrote the 100 Continue
 				// and ran OnExpectContinue twice.
 				if state.req.ExpectContinue && bodyNeeded > 0 {
-					if state.OnExpectContinue != nil && !safeExpectContinue(state.OnExpectContinue, state.req.Method, state.req.Path, expectHeaders(&state.req)) {
+					if state.OnExpectContinue != nil && !state.safeExpectContinue(state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 						write(expectation417Response)
 						// Close connection after rejection to prevent request
 						// smuggling: body bytes already in the buffer would
@@ -854,6 +883,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					return nil
 				}
 				state.buffer.Write(data[offset:])
+				headChecked = true
 				break
 			}
 
@@ -900,6 +930,17 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		// state-machine comment at the top of ProcessH1.
 		state.ClearHeaderDeadline()
 
+		// Per-handler async (celeris#889): a request that follows a chunked one
+		// is parsed here, not at the check above, so the Async route it names
+		// ran on the event loop. state.buffer starts at this request, which is
+		// what the engine hands to the dispatch goroutine. The first request of
+		// a chunked head the check above has just seen is not looked up twice.
+		if state.InlineMode && state.RouteAsync != nil && !headChecked &&
+			state.RouteAsync(state.req.Method, state.req.Path) {
+			return ErrAsyncDispatch
+		}
+		headChecked = false
+
 		bodyNeeded := int64(0)
 		if state.req.ChunkedEncoding {
 			bodyNeeded = -1
@@ -918,7 +959,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 
 		if state.req.ExpectContinue && (bodyNeeded > 0 || bodyNeeded == -1) {
-			if state.OnExpectContinue != nil && !safeExpectContinue(state.OnExpectContinue, state.req.Method, state.req.Path, expectHeaders(&state.req)) {
+			if state.OnExpectContinue != nil && !state.safeExpectContinue(state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 				write(expectation417Response)
 				// Close connection after rejection to prevent request
 				// smuggling: body bytes already in the buffer would
@@ -965,6 +1006,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			// complete: when it is not, the next call resumes from here
 			// (celeris#1029) instead of parsing chunk bytes as a request.
 			state.chunkHeadLen = consumed
+			state.chunkExcess = 0
 			done, end, err := state.scanChunked(write)
 			if err != nil {
 				return err
@@ -990,6 +1032,10 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
+		if state.chunkAliased {
+			// The body is a view of state.buffer's array (scanChunked).
+			state.releaseLargeBuffer()
+		}
 		if state.Detached.Load() {
 			return nil // see fast-path comment above
 		}
@@ -1004,6 +1050,31 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 // chunked request that has just been served gives its backing array up.
 const maxRetainedChunkedBuffer = 64 << 10
 
+// minAliasedChunk is the size from which a one-chunk body is handed to the
+// handler as a view of state.buffer instead of a copy.
+const minAliasedChunk = 16 << 10
+
+// releaseLargeBuffer gives up a state.buffer that grew past
+// maxRetainedChunkedBuffer to hold a large chunk, or, whatever its size, one
+// whose array the body of the request just served is a view of (chunkAliased):
+// the safety of that view does not depend on the two thresholds agreeing. It is
+// not kept for the life
+// of the connection, whether or not a pipelined request follows the
+// terminator: that tail moves to a buffer of its own size (once per large
+// upload, not per request). The old array is not reused, so a body that is a
+// view of it (scanChunked) stays intact for a handler that keeps it.
+func (s *H1State) releaseLargeBuffer() {
+	if !s.chunkAliased && s.buffer.Cap() <= maxRetainedChunkedBuffer {
+		return
+	}
+	s.chunkAliased = false
+	var nb bytes.Buffer
+	if tail := s.buffer.Bytes(); len(tail) > 0 {
+		nb.Write(tail)
+	}
+	s.buffer = nb
+}
+
 // errChunkedHeadChanged is returned when the head of a chunked request, held in
 // state.buffer while its body arrives, does not parse again to the same length.
 var errChunkedHeadChanged = errors.New("chunked request head changed while its body was received")
@@ -1012,6 +1083,8 @@ var errChunkedHeadChanged = errors.New("chunked request head changed while its b
 func (s *H1State) abortChunked() {
 	s.chunkedInProgress = false
 	s.chunkBuf = nil
+	s.chunkExcess = 0
+	s.chunkAliased = false
 }
 
 // scanChunked decodes the chunks that follow the head (state.chunkHeadLen bytes
@@ -1036,6 +1109,11 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, end int, err error
 	buf := s.buffer.Bytes()
 	limit := s.maxBodySize()
 	pos := head
+	// first is the one data chunk of this call while chunkBuf is empty: it is
+	// copied into chunkBuf only when a second chunk follows, or the call ends
+	// without the terminator (the undecoded bytes are about to be moved over
+	// it). When it turns out to be the whole body it is not copied at all.
+	var first []byte
 	for {
 		s.parser.Reset(buf[pos:])
 		chunk, n, cerr := s.parser.ParseChunkedBody()
@@ -1045,6 +1123,12 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, end int, err error
 			return false, 0, cerr
 		}
 		if n == 0 {
+			// The held chunk counts against the limit the next size line is
+			// checked against.
+			if first != nil {
+				s.appendChunk(first, limit)
+				first = nil
+			}
 			if err := s.checkPartialChunk(buf[pos:], limit, write); err != nil {
 				s.abortChunked()
 				return false, 0, err
@@ -1058,12 +1142,45 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, end int, err error
 		}
 		// limit-len(chunkBuf) cannot go negative: a body over the limit was
 		// refused when its last chunk arrived.
-		if limit > 0 && int64(len(chunk)) > limit-int64(len(s.chunkBuf)) {
+		if limit > 0 && int64(len(chunk)) > limit-int64(len(s.chunkBuf))-int64(len(first)) {
 			s.abortChunked()
 			writeErrorResponse(write, 413, "Request body too large")
 			return false, 0, fmt.Errorf("chunked body exceeds %d byte limit", limit)
 		}
+		// Framing bound, net/http's: the size line and the CRLF after the
+		// data are overhead (n-len(chunk)-2 is the line without its own
+		// CRLF, plus 2), and the chunk pays back 16 plus twice its data.
+		s.chunkExcess = max(s.chunkExcess+int64(n-len(chunk)-2)-16-2*int64(len(chunk)), 0)
+		if s.chunkExcess > maxChunkExcess {
+			s.abortChunked()
+			writeErrorResponse(write, 400, "Invalid chunked encoding")
+			return false, 0, errChunkedFramingExcess
+		}
+		if len(s.chunkBuf) == 0 && first == nil {
+			first = chunk
+			continue
+		}
+		if first != nil {
+			s.appendChunk(first, limit)
+			first = nil
+		}
 		s.appendChunk(chunk, limit)
+	}
+	if first != nil {
+		// A large one-chunk body is not copied: the handler gets the chunk
+		// where it is, with its capacity cut at its length, and the caller
+		// gives the array up once the request has been served
+		// (releaseLargeBuffer), moving what follows the request to a buffer of
+		// its own. Copying held every byte twice at the moment the handler ran.
+		// Only when that move costs no more than the copy it saves: the bytes
+		// after the request (pipelined requests behind a large chunk) are
+		// fewer than the chunk's.
+		if done && len(first) >= minAliasedChunk && len(buf)-pos <= len(first) && s.buffer.Cap() > maxRetainedChunkedBuffer {
+			s.chunkBuf = first[:len(first):len(first)]
+			s.chunkAliased = true
+		} else {
+			s.appendChunk(first, limit)
+		}
 	}
 	if done {
 		if pos == len(buf) {
@@ -1164,6 +1281,12 @@ func (s *H1State) checkPartialChunk(rest []byte, limit int64, write func([]byte)
 
 var errChunkedTrailerTooLarge = errors.New("chunked trailer too large")
 
+// maxChunkExcess is the non-data framing a chunked request may carry beyond
+// what its data pays for: net/http's 16 KiB (celeris#889).
+const maxChunkExcess = 16 << 10
+
+var errChunkedFramingExcess = errors.New("chunked encoding contains too much non-data")
+
 // tryUpgradeH2C inspects the just-parsed request for an h2c upgrade. On a
 // valid request it writes the 101 Switching Protocols response, captures
 // the upgrade state into state.UpgradeInfo (which triggers the caller to
@@ -1178,7 +1301,7 @@ func tryUpgradeH2C(state *H1State, body, remaining []byte, write func([]byte)) e
 	if !state.EnableH2Upgrade || !state.req.UpgradeH2C {
 		return nil
 	}
-	settings, err := DecodeHTTP2Settings(state.req.HTTP2Settings)
+	settings, err := h1.DecodeHTTP2Settings(state.req.HTTP2Settings)
 	if err != nil {
 		// Malformed settings: silently fall through to normal H1 handling.
 		// This matches the spec's tolerance requirement and avoids a 400
@@ -1242,14 +1365,39 @@ func appendH2CHeaders(out [][2]string, req *h1.Request) [][2]string {
 
 // safeExpectContinue calls the OnExpectContinue callback with panic recovery.
 // A panicking callback is treated as rejection (returns false) to avoid
-// crashing the event loop worker goroutine.
-func safeExpectContinue(fn func(string, string, [][2]string) bool, method, path string, headers [][2]string) (accepted bool) {
+// crashing the event loop worker goroutine, and is logged with its stack and
+// counted (celeris#889), as an async handler's panic is.
+func (s *H1State) safeExpectContinue(method, path string, headers [][2]string) (accepted bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			accepted = false
+			s.expectPanicked(r, method, path)
 		}
 	}()
-	return fn(method, path, headers)
+	return s.OnExpectContinue(method, path, headers)
+}
+
+// expectPanicked records a panic that escaped OnExpectContinue. Off the hot
+// path, and not inlined, so debug.Stack costs nothing until one happens.
+//
+//go:noinline
+func (s *H1State) expectPanicked(r any, method, path string) {
+	validation.RecordPanic()
+	if s.Logger == nil {
+		return
+	}
+	// A log handler that panics must not take the event loop down with it: this
+	// runs inside the deferred recover of the callback, whose panic main
+	// swallowed whole.
+	defer func() { _ = recover() }()
+	// method and path are views of the receive buffer, which the engine reuses
+	// for the next request, and a log handler may keep the record.
+	s.Logger.Error("OnExpectContinue panicked; the request is answered 417 and the connection closed",
+		"panic", panicText(r),
+		"method", strings.Clone(method),
+		"path", strings.Clone(path),
+		"stack", string(debug.Stack()),
+	)
 }
 
 // expectHeaders converts raw H1 headers to [][2]string for the OnExpectContinue

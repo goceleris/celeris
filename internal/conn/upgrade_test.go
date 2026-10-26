@@ -10,48 +10,6 @@ import (
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
-func TestDecodeHTTP2Settings(t *testing.T) {
-	// Build a representative settings payload: two entries (id+value pairs, 6 bytes each).
-	payload := []byte{
-		0x00, 0x03, 0x00, 0x00, 0x00, 0x64, // SETTINGS_MAX_CONCURRENT_STREAMS = 100
-		0x00, 0x04, 0x00, 0x01, 0x00, 0x00, // SETTINGS_INITIAL_WINDOW_SIZE = 65536
-	}
-	rawURL := base64.RawURLEncoding.EncodeToString(payload)
-	padded := base64.URLEncoding.EncodeToString(payload)
-
-	cases := []struct {
-		name    string
-		in      string
-		wantErr bool
-		want    []byte
-	}{
-		{"empty", "", true, nil},
-		{"raw url encoded", rawURL, false, payload},
-		{"padded url encoded", padded, false, payload},
-		{"invalid base64", "!!!!", true, nil},
-		{"wrong length (5 bytes)", base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3, 4, 5}), true, nil},
-		{"wrong length (7 bytes)", base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3, 4, 5, 6, 7}), true, nil},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := DecodeHTTP2Settings(tc.in)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("want error, got nil (decoded %x)", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if !bytes.Equal(got, tc.want) {
-				t.Fatalf("got %x, want %x", got, tc.want)
-			}
-		})
-	}
-}
-
 // recordingHandler captures whether HandleStream was called.
 type recordingHandler struct{ called bool }
 
@@ -154,5 +112,51 @@ func TestProcessH1_UpgradeH2C_InvalidSettings(t *testing.T) {
 	}
 	if !h.called {
 		t.Fatal("handler must run when settings decode fails")
+	}
+}
+
+// RFC 7540 section 3.2.1, on the conn layer (celeris#889, items 41 and 43):
+// exactly one HTTP2-Settings header upgrades, and its value may be empty; a
+// repeated one is served as HTTP/1.1, as is one that does not decode.
+func TestProcessH1_UpgradeH2C_SettingsRule889(t *testing.T) {
+	const head = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n"
+	const v = "AAMAAABkAAQAoAAAAAIAAAAA"
+	cases := []struct {
+		name    string
+		lines   string
+		upgrade bool
+	}{
+		{"one", "HTTP2-Settings: " + v + "\r\n", true},
+		{"one empty", "HTTP2-Settings: \r\n", true},
+		{"missing", "", false},
+		{"repeated", "HTTP2-Settings: " + v + "\r\nHTTP2-Settings: " + v + "\r\n", false},
+		{"repeated, one empty", "HTTP2-Settings: " + v + "\r\nHTTP2-Settings:\r\n", false},
+		{"undecodable", "HTTP2-Settings: !!!\r\n", false},
+		{"length not a multiple of 6", "HTTP2-Settings: AAMAAABkAA\r\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := NewH1State()
+			state.EnableH2Upgrade = true
+			h := &recordingHandler{}
+			var writes [][]byte
+			err := ProcessH1(context.Background(), []byte(head+tc.lines+"\r\n"), state, h, func(b []byte) {
+				writes = append(writes, append([]byte(nil), b...))
+			})
+			if got := errors.Is(err, ErrUpgradeH2C); got != tc.upgrade {
+				t.Fatalf("upgraded = %v (err %v), want %v", got, err, tc.upgrade)
+			}
+			if h.called == tc.upgrade {
+				t.Fatalf("handler called = %v on a request that upgrades = %v", h.called, tc.upgrade)
+			}
+			if tc.upgrade {
+				if len(writes) != 1 || !bytes.HasPrefix(writes[0], []byte("HTTP/1.1 101 ")) {
+					t.Fatalf("writes = %q, want one 101", writes)
+				}
+				if tc.name == "one empty" && len(state.UpgradeInfo.Settings) != 0 {
+					t.Fatalf("Settings = %x, want none", state.UpgradeInfo.Settings)
+				}
+			}
+		})
 	}
 }

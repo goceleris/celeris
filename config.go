@@ -594,8 +594,9 @@ type Config struct {
 	//
 	// All four engines (Std, Epoll, IOUring, Adaptive) decide whether a
 	// well-formed Upgrade: h2c request (Connection lists Upgrade and
-	// HTTP2-Settings, Upgrade is exactly h2c, one non-empty HTTP2-Settings)
-	// is upgraded the same way for every Protocol and every value:
+	// HTTP2-Settings, Upgrade is exactly h2c, exactly one HTTP2-Settings
+	// whose value decodes) is upgraded the same way for every Protocol and
+	// every value:
 	//
 	//	Protocol  nil   &false  &true
 	//	Auto      101   no      101
@@ -609,11 +610,12 @@ type Config struct {
 	// Prior-knowledge h2c (a connection that opens with the HTTP/2 preface)
 	// is served on Auto and H2C whatever this says, and never on HTTP1.
 	//
-	// A request that is malformed in its HTTP2-Settings header is not handled
-	// alike: Std answers 500 to a missing, repeated or invalid one and
-	// upgrades an empty one, where the native engines serve a missing or
-	// invalid one as HTTP/1.1, upgrade a repeated one and serve an empty one
-	// as HTTP/1.1 (tracked on celeris#889).
+	// The HTTP2-Settings header follows RFC 7540 section 3.2.1 on all four
+	// engines: a request with exactly one such header is upgraded when its
+	// value is a base64url SETTINGS payload (a whole number of 6-byte
+	// entries; an empty value is a payload with none), and a request whose
+	// header is missing, repeated or not such a payload is not upgraded: it
+	// is served as plain HTTP/1.1, never answered with an error status.
 	EnableH2Upgrade *bool
 
 	// DisableAutoHEAD turns off the router's automatic HEAD answer

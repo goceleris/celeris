@@ -375,18 +375,20 @@ func scenarios981() []scenario981 {
 			want: obs981{errAt: -1, lastClient: 1, runs: 1},
 		},
 		{
+			// A malformed request is a stream error: the stream is reset and the
+			// connection goes on (celeris#889; it used to end it).
 			name: "invalid-request-headers", noCounts: true,
 			steps: func(e *enc981) []step981 {
 				return []step981{hdr981(1, true, e.block([][2]string{{":method", "GET"}, {":scheme", "http"}, {":authority", "example.com"}}...))}
 			},
-			want: obs981{errAt: 0, rst: []rstStreamRecord{rst981(1, protocol)}, lastClient: 1},
+			want: obs981{errAt: -1, rst: []rstStreamRecord{rst981(1, protocol)}, lastClient: 1},
 		},
 		{
 			name: "content-length-mismatch", noCounts: true,
 			steps: func(e *enc981) []step981 {
 				return []step981{hdr981(1, true, e.req([2]string{"content-length", "5"}))}
 			},
-			want: obs981{errAt: 0, rst: []rstStreamRecord{rst981(1, protocol)}, lastClient: 1},
+			want: obs981{errAt: -1, rst: []rstStreamRecord{rst981(1, protocol)}, lastClient: 1},
 		},
 		{
 			name: "priority-depends-on-itself", noRaw: true,
