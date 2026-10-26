@@ -141,6 +141,18 @@ func TestIouringDirectBodyTailRunsAnAsyncRouteOnItsGoroutine884(t *testing.T) {
 					int64(m.AsyncPromotedConns)-int64(m0.AsyncPromotedConns))
 				failed = true
 			}
+			// The promotion re-arms the one recv the direct-body CQE consumed:
+			// no second recv (a double arm, or a refused second arm) and no CQE
+			// the worker could not account for. Counted in every build; read
+			// before the gate opens, as stopping the engine moves the last.
+			if m.RecvDoubleArmed != m0.RecvDoubleArmed || m.RecvArmDeclined != m0.RecvArmDeclined ||
+				m.RecvCQEUnaccounted != m0.RecvCQEUnaccounted {
+				t.Errorf("celeris#884 item 70: the tail promotion's recv arm is not exactly one: RecvDoubleArmed %d -> %d, "+
+					"RecvArmDeclined %d -> %d, RecvCQEUnaccounted %d -> %d, want no change",
+					m0.RecvDoubleArmed, m.RecvDoubleArmed, m0.RecvArmDeclined, m.RecvArmDeclined,
+					m0.RecvCQEUnaccounted, m.RecvCQEUnaccounted)
+				failed = true
+			}
 			gate.open()
 			if failed {
 				return

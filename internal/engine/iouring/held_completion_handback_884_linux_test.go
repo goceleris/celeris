@@ -302,3 +302,30 @@ func TestIouringHeldCompletionIsNotAppliedToANewOwner884(t *testing.T) {
 		w.conns[rig.local] = oldCS // the rig's cleanup closes the descriptor through it
 	})
 }
+
+// TestReuse884LeavesNoDirtyConnStateInThePool: reuse884 releases a connState
+// to the shared pool, and the arms then go on changing that same pointer
+// (sending, sendBuf), so the next test to draw it from the pool got a connState
+// with sending set (acquireConnState does not reset it) and, for one, saw
+// hijackConn refuse with "cannot hijack with pending sends": the source of the
+// TestHijackFlushesTheQueuedReply936 failure seen in full runs. The arm below
+// does what the arms do; what it leaves in the pool is drawn again after it.
+// A sync.Pool hands back the pointer just put, on the same P, except that the
+// race build drops a Put one time in four, so the arm is repeated: the draw
+// finds it in every build.
+func TestReuse884LeavesNoDirtyConnStateInThePool(t *testing.T) {
+	for i := 0; i < 16; i++ {
+		t.Run("arm", func(t *testing.T) {
+			cs := acquireConnState(t.Context(), 7, 4096, true)
+			reuse884(cs, 7)
+			cs.sending, cs.sendBuf = true, append(cs.sendBuf[:0], "the new owner's response"...)
+		})
+		got := acquireConnState(t.Context(), 8, 4096, true)
+		dirty := got.sending
+		got.sending = false
+		releaseConnState(got)
+		if dirty {
+			t.Fatalf("a connState drawn from the pool after reuse884's arm has sending set: the helper left its pointer dirty in the pool")
+		}
+	}
+}
