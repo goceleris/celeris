@@ -285,8 +285,8 @@ func floodFeed885(peer int, stop *atomic.Bool, queued *atomic.Int64) {
 }
 
 // TestDrainReadIsBoundedUnderAFlood885 is celeris#885 item 41 as an assertion:
-// the peer keeps the conn's socket full (4 MiB of requests queued before the
-// read, more written while it goes on, and the loop parses far slower than the
+// the peer keeps the conn's socket full (its queue full before the read, more
+// written while it goes on, and the loop parses far slower than the
 // peer writes), and one drainRead call, which is one readiness event, must
 // return after reading a bounded number of bytes instead of when the peer
 // pauses. A watchdog stops the peer after 2 s so that an unbounded drainRead
@@ -297,6 +297,10 @@ func TestDrainReadIsBoundedUnderAFlood885(t *testing.T) {
 	fd, peer, cs := adoptedPair885(t, l)
 	var b [8]byte
 	_, _ = unix.Read(fd, b[:]) // the byte adoptedPair885 wrote to have the ADD report EPOLLIN
+	// A bigger queue where the host allows one (net.core.wmem_max): the more is
+	// queued before the read, the longer the peer can stall without the socket
+	// emptying. At the default cap the queue is still about 210 KB, three times
+	// the budget.
 	for _, s := range []int{fd, peer} {
 		_ = unix.SetsockoptInt(s, unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<20)
 	}
@@ -317,7 +321,7 @@ func TestDrainReadIsBoundedUnderAFlood885(t *testing.T) {
 	}()
 	t.Cleanup(func() { stop.Store(true); wg.Wait() })
 
-	const preload = 1 << 20
+	const preload = 128 << 10
 	for dl := time.Now().Add(5 * time.Second); queued.Load() < preload; time.Sleep(time.Millisecond) {
 		if time.Now().After(dl) {
 			t.Fatalf("apparatus: the peer queued only %d bytes in 5 s", queued.Load())

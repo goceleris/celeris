@@ -321,6 +321,11 @@ type Loop struct {
 	httpGen        uint32
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
+	// readYielded is set by yieldRead, on the loop thread, when a read turn ends
+	// at its budget with bytes possibly left in the socket; the run loop reads
+	// it after drainRead and skips the half-close and error handling of the
+	// event that turn served (celeris#885 item 41).
+	readYielded bool
 	// driverReadQ holds the driver conns whose last read turn used up
 	// driverReadBudget with bytes possibly left (loop thread only).
 	// Edge-triggered epoll does not report bytes already in the socket again,
@@ -731,8 +736,11 @@ func (l *Loop) run(ctx context.Context) {
 
 			// Process EPOLLIN before EPOLLHUP: a peer may send data and
 			// immediately close, producing both flags in one event.
+			yielded := false
 			if ev.Events&unix.EPOLLIN != 0 {
+				l.readYielded = false
 				l.drainRead(fd, now)
+				yielded = l.readYielded
 			}
 
 			// EPOLLOUT: the socket became writable again for a conn that hit
@@ -752,11 +760,17 @@ func (l *Loop) run(ctx context.Context) {
 			}
 
 			// EPOLLRDHUP: peer half-closed (sent FIN). See onPeerHalfClose.
-			if ev.Events&unix.EPOLLRDHUP != 0 {
+			// Not while the turn above ended at its budget (yielded): the
+			// conn's bytes before the FIN are not all read, and the close
+			// onPeerHalfClose makes would cut them off. The MOD that gave the
+			// conn its next turn re-polls the descriptor, so the next event
+			// carries EPOLLRDHUP (and EPOLLHUP, EPOLLERR) again, after the last
+			// of the bytes has been read (celeris#885 item 41).
+			if !yielded && ev.Events&unix.EPOLLRDHUP != 0 {
 				l.onPeerHalfClose(fd)
 			}
 
-			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
+			if !yielded && ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
 				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)
 				}
@@ -766,8 +780,10 @@ func (l *Loop) run(ctx context.Context) {
 			// a request cycle (EPOLLIN → drainRead) and may now be at a clean
 			// keep-alive boundary — try to transplant it. tryTransplant re-checks
 			// the slot, so a close above is harmless. The pointer load is the
-			// whole cost when no drain is active.
-			if l.transplant.Load() != nil {
+			// whole cost when no drain is active. Not after a turn that ended at
+			// its budget (yielded): that conn is mid-flood, its next turn will
+			// find it at a boundary or not.
+			if !yielded && l.transplant.Load() != nil {
 				l.tryTransplant(fd)
 			}
 		}
@@ -1523,6 +1539,51 @@ func readPromoted(fd int, cs *connState, buf []byte) (int, error) {
 	return n, err
 }
 
+// drainReadBudget is the number of bytes drainRead reads from one conn in one
+// turn (one readiness event) before it gives the loop back: a conn whose peer
+// keeps its socket full, a client that pipelines faster than the loop parses or
+// uploads a large body, would otherwise hold the loop in drainRead for as long
+// as its inflow does not pause, and every other conn on the loop would wait
+// (celeris#885 item 41, the HTTP twin of driverReadBudget, celeris#930). In
+// bytes, not reads: the buffer is 4 KiB to 256 KiB (Config.BufferSize) and a
+// read straight into a request body can be larger still. A turn that stops at
+// the budget re-arms the conn's readiness (yieldRead), so the rest of the
+// socket is read in the next round, after the events of the batch that were
+// already ready: a conn on the loop waits for at most one turn of the flooding
+// one, about 0.2 ms of pipelined tiny requests at 64 KiB (0.5 ms at 256 KiB,
+// 0.1 ms at 16 KiB), and the flooding conn pays one EPOLL_CTL_MOD and one
+// epoll_wait round per turn, 4% of a flood of such requests at 64 KiB (1% at
+// 256 KiB, 7% at 16 KiB: BenchmarkDrainReadFloodThroughput885 and
+// BenchmarkDrainReadFloodBystander885, measured with a 2 vCPU container). A
+// variable for the tests, which lower it; never written while a loop runs.
+var drainReadBudget = 64 << 10
+
+// yieldRead ends cs's read turn at the budget, with bytes possibly left in the
+// socket. Edge-triggered epoll reports bytes already there once, so nothing
+// would read them until the peer sent more: the interest is set again with an
+// EPOLL_CTL_MOD, which re-polls the descriptor and puts it back at the end of
+// the ready list if it is readable (ep_modify), and the event comes with the
+// next epoll_wait carrying the conn's generation, as every event of the conn
+// does (httpEpollEvent): a conn that has closed by then, or whose number
+// another conn has taken, is dropped by the run loop's identity check. The
+// mask is the conn's own (epollInterest: EPOLLOUT if armed, no EPOLLIN while
+// recv is paused). It reports whether drainRead should return: true when the
+// MOD was issued, or when an async conn has been hijacked, and the conn is
+// gone from this loop. False means keep reading, as before the budget: the MOD
+// failed, or the conn is closing (closeWhenFlushed's mask has no EPOLLIN by
+// design and a MOD with it would undo that). Loop thread.
+func (l *Loop) yieldRead(cs *connState) bool {
+	if cs.peerClosed {
+		return false
+	}
+	issued, err := l.modEpollOut(cs, cs.epollInterest(cs.epollOut))
+	if !issued || err == nil {
+		l.readYielded = true
+		return true
+	}
+	return false
+}
+
 func (l *Loop) drainRead(fd int, now int64) {
 	if fd < 0 || fd >= len(l.conns) {
 		return
@@ -1537,7 +1598,17 @@ func (l *Loop) drainRead(fd int, now int64) {
 		return
 	}
 
+	// Bytes read in this turn; at drainReadBudget the turn ends (yieldRead).
+	// Checked at the top so that every path back to it (a partial body, a
+	// protocol not yet decided, an async hand-off, an upgrade) is bounded.
+	spent := 0
 	for {
+		if spent >= drainReadBudget {
+			if l.yieldRead(cs) {
+				return
+			}
+			spent = 0 // not re-armed: read on, and ask again a budget later
+		}
 		// Zero-copy body recv: when H1 is in a partial-body state we read
 		// directly into the tail of H1State.bodyBuf — skipping the
 		// cs.buf → bodyBuf memcpy that would otherwise happen on every
@@ -1586,6 +1657,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// n > 0 here (the err and EOF cases returned above): bytes read on
 		// this iteration, into either cs.buf or the zero-copy bodyBuf.
 		l.bytesReadBatch += uint64(n)
+		spent += n
 
 		// Direct-into-bodyBuf completion path: we read straight into
 		// H1State.bodyBuf; dispatch the handler if the body is full,
