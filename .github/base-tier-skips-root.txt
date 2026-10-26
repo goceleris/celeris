@@ -1,1 +1,30 @@
-# Tests that skip at CELERIS_MAX_IOURING_TIER=base on purpose: the full test name, then why.
+# Tests that skip at CELERIS_MAX_IOURING_TIER=base on purpose, for .github/scripts/base-tier-tally.sh
+# (celeris#890 item 87): the full test or subtest name, then why. A name covers its own
+# subtests. Measured on the run of the job iouring-base-tier cited in the pull request:
+# 107 top-level tests passed, 3 skipped at the top level, 19 SKIP lines in all.
+min-pass 100
+
+# The probes of these tests (c714ProbeIOUring, keptProbeIOUring and the one of
+# h2_handler_return_889) call an io_uring "usable" only at the high tier with provided
+# buffers, so with the cap their io_uring and adaptive arms skip with "no usable
+# io_uring". The std and epoll arms of the same tests run.
+TestH2HandlerReturnWithoutClosingEndsTheStream889/io_uring no usable io_uring at the base tier
+TestH2HandlerReturnWithoutClosingEndsTheStream889/adaptive no usable io_uring at the base tier
+TestH2HandlerReturnWithoutClosingEndsTheStream889/adaptive-iouring no usable io_uring at the base tier
+TestH2HandlerShortOfItsContentLengthResetsTheStream889/io_uring no usable io_uring at the base tier
+TestH2HandlerShortOfItsContentLengthResetsTheStream889/adaptive no usable io_uring at the base tier
+TestH2HandlerShortOfItsContentLengthResetsTheStream889/adaptive-iouring no usable io_uring at the base tier
+TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889/io_uring no usable io_uring at the base tier
+TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889/adaptive no usable io_uring at the base tier
+TestH2AsyncHandlerGoexitResetsTheStreamAndIsLogged889/adaptive-iouring no usable io_uring at the base tier
+TestH2StreamedResponseBrokenOffIsReset889/io_uring no usable io_uring at the base tier
+TestH2StreamedResponseBrokenOffIsReset889/adaptive no usable io_uring at the base tier
+TestH2StreamedResponseBrokenOffIsReset889/adaptive-iouring no usable io_uring at the base tier
+TestServerAsyncRouteDetachThenGoexitOnIOUring no usable io_uring at the base tier
+TestH2InlineStreamGoexitIsLoud848/io_uring no usable io_uring at the base tier
+TestH2AsyncStreamGoexitKeepsTheLoop848/io_uring no usable io_uring at the base tier
+TestH2OverBudgetStreamGoexitKeepsTheLoop848/io_uring no usable io_uring at the base tier
+
+# Tier base has no multishot recv, and these two tests are about it.
+TestHijackCopiesRequestValuesUnderMultishotRecv tier base has no multishot recv
+TestMultishotRingSurvivesHijacks tier base has no multishot recv

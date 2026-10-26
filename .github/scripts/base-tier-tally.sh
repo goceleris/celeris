@@ -18,6 +18,8 @@
 #      probe does not know counts as "none", which would skip every io_uring
 #      test and leave check 1 as the only witness; this one names the cause.
 #
+#   4. At least `min-pass` top-level tests passed (the data file of the label).
+#
 # Prints one summary line on stdout. Exit status 0 all hold, 1 some do not,
 # 2 usage or an unreadable log.
 set -euo pipefail
@@ -39,7 +41,11 @@ case "$label" in
 esac
 list_file=${BASE_TIER_SKIPS_DIR:-$here/..}/base-tier-skips-$label.txt
 [ -r "$list_file" ] || { echo "base-tier-tally: cannot read $list_file" >&2; exit 2; }
-names=$(awk 'NF && $1 !~ /^#/ { print $1 }' "$list_file" | paste -sd'|' -)
+names=$(awk 'NF && $1 !~ /^#/ && $1 != "min-pass" { print $1 }' "$list_file" | paste -sd'|' -)
+# `min-pass N` in the file: the top-level tests that must PASS at least, so that a -run
+# pattern that stops matching (a rename) or a package that stops compiling its tests
+# in cannot shrink the run unseen. The figure is what the first run measured.
+minpass=$(awk '$1 == "min-pass" { print $2 }' "$list_file")
 
 fail=0
 skipped=$("$here"/skip-count.sh "$log") || fail=1
@@ -63,7 +69,12 @@ if [ "$label" = iouring ]; then
   fi
 fi
 
-echo "base-tier-tally $label: SKIP lines $skipped, not in the allow-list $n_unlisted$tiers"
+passed=$(grep -acE '^--- PASS: Test' "$log" || true)
+if [ -n "$minpass" ] && [ "$passed" -lt "$minpass" ]; then
+  fail=1
+  echo "base-tier-tally: $passed top-level tests passed, fewer than the $minpass of $list_file: did the run shrink (a renamed test, a -run pattern that no longer matches)?" >&2
+fi
+echo "base-tier-tally $label: top-level PASS $passed (min ${minpass:-none}), SKIP lines $skipped, not in the allow-list $n_unlisted$tiers"
 if [ "$n_unlisted" -ne 0 ]; then
   fail=1
   printf '%s\n' "$unlisted" >&2

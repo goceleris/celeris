@@ -2369,8 +2369,18 @@ jobs:
   #   * the root package and ./test/server, the tests whose names say Shutdown,
   #     Detach, SSE, Stream, WebSocket, Hijack or Drain, under -race.
   # Tests that need the high tier skip at this tier on purpose; each skip that
-  # is allowed is listed by name below with its reason, and any other SKIP line
-  # fails the step.
+  # is allowed is listed by name with its reason in .github/base-tier-skips-iouring.txt
+  # and -root.txt, and any other SKIP line fails the step (base-tier-tally.sh,
+  # whose self-test is a Lint step). First run on a hosted runner (kernel
+  # 6.17.0-1022-azure, run 40414278698): the package took 473 s under -race (504 s
+  # for the step), 554 top-level tests passed and 12 SKIP lines are the allowed
+  # ones; the root package and ./test/server took 4.6 s and 239 s (258 s for the
+  # step), 107 top-level tests passed and 19 SKIP lines are allowed. Those 19 are
+  # the io_uring and adaptive arms of tests whose probe (c714ProbeIOUring,
+  # keptProbeIOUring) calls io_uring usable only at the high tier: with the cap
+  # they skip with "no usable io_uring", so what this step adds for the root tests
+  # is the tests that start an io_uring engine without such a probe: they run at
+  # the base tier here and at the high tier in every other job.
   iouring-base-tier:
     name: io_uring base tier (CELERIS_MAX_IOURING_TIER=base, celeris#890)
     runs-on: ubuntu-latest

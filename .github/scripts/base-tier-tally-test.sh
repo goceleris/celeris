@@ -13,7 +13,7 @@ trap 'rm -rf "$dir"' EXIT
 fail=0
 n=0
 export BASE_TIER_SKIPS_DIR=$dir
-printf '# header\nTestNeedsHighTier needs a provided buffer ring\n' >"$dir/base-tier-skips-iouring.txt"
+printf '# header\nmin-pass 2\nTestNeedsHighTier needs a provided buffer ring\n' >"$dir/base-tier-skips-iouring.txt"
 printf '# header\n' >"$dir/base-tier-skips-root.txt"
 
 # expect NAME WANT_STATUS WANT_STDERR_SUBSTRING LABEL LOG [TESTS...]
@@ -57,6 +57,9 @@ grep -v 'TestShutdownDetachedPartialWriteIsFlushed806' "$dir/good.log" >"$dir/no
 expect "a named test that never ran fails" 1 "TestShutdownDetachedPartialWriteIsFlushed806 ran 0" iouring "$dir/no806.log" TestShutdownDetachedPartialWriteIsFlushed806
 sed 's/^--- PASS: TestShutdownDetachedPartialWriteIsFlushed806/--- SKIP: TestShutdownDetachedPartialWriteIsFlushed806/' "$dir/good.log" >"$dir/skip806.log"
 expect "a named test that skipped fails" 1 "TestShutdownDetachedPartialWriteIsFlushed806" iouring "$dir/skip806.log" TestShutdownDetachedPartialWriteIsFlushed806
+# min-pass: a run that lost its tests (a -run pattern that stopped matching).
+grep -v 'TestShutdownDetachedPartialWriteIsFlushed806' "$dir/good.log" | sed 's/^--- PASS: TestReportTier844/--- XXX: TestReportTier844/' >"$dir/shrunk.log"
+expect "fewer top-level PASS lines than min-pass fails" 1 "fewer than the 2" iouring "$dir/shrunk.log"
 # The root label has no tier lines and allows nothing here.
 printf '%s\n' '=== RUN   TestA' '--- PASS: TestA (0.00s)' 'PASS' >"$dir/root.log"
 expect "root: a clean log" 0 "" root "$dir/root.log"
