@@ -16,8 +16,9 @@ import (
 
 // celeris#890 item 96: a test of the adaptive files of this package that cannot
 // run where the io_uring standby is unavailable skips through
-// skipOrFailIfStandbyAborted886 (adaptive_standby_guard_886_linux_test.go),
-// which fails instead under CELERIS_REQUIRE_UPSWITCH=1. It repeats, in this
+// skipOrFailUpswitch890 (adaptive_standby_guard_886_linux_test.go, which
+// skipOrFailIfStandbyAborted886 calls too), which fails instead under
+// CELERIS_REQUIRE_UPSWITCH=1. It repeats, in this
 // package, the gate that internal/adaptive keeps in skipOrFailUpswitch662: the
 // two cannot share a function (separate packages, and the test files of
 // internal/adaptive cannot be imported), so what keeps this package's copy
@@ -40,12 +41,36 @@ import (
 // gateHelpers890 are the functions whose job is to skip or fail; a raw skip
 // inside one is the gate itself.
 var gateHelpers890 = map[string]bool{
-	"skipOrFailIfStandbyAborted886": true, // the standby gate (CELERIS_REQUIRE_UPSWITCH=1)
+	"skipOrFailUpswitch890": true, // the gate (CELERIS_REQUIRE_UPSWITCH=1)
 }
 
 // unrouted890 are the raw skips that stay for now, by file and the string
-// literal that starts the skip's message, each with why.
-var unrouted890 = map[string]string{}
+// literal that starts the skip's message, each with how many sites carry that
+// message and why they stay. The count is exact: a further site with a
+// registered message fails the guard as a stale entry would.
+//
+// All ten are in adaptive_hybrid_test.go. #890 item 95 leaves the adaptive
+// skips of this package to the lane that owns that file; the table is the count
+// of what is left (the guard listed these ten and one more, in
+// adaptive_standby_886_linux_test.go, which now goes through the gate), and a
+// new one cannot join them unseen.
+type unrouted890Entry struct {
+	sites int
+	why   string
+}
+
+const (
+	newFails890  = "adaptive.New fails on config validation or a port hold (internal/adaptive/engine.go New), not on a host without io_uring: a failure there is a defect, as for epoll.New in item 95"
+	startFail890 = "an engine that does not start, bind or answer: this skip cannot tell a host without io_uring from a defect"
+)
+
+var unrouted890 = map[string]unrouted890Entry{
+	"adaptive_hybrid_test.go|adaptive engine not available: %v":       {5, newFails890},
+	"adaptive_hybrid_test.go|engine failed to start: %v":              {2, startFail890},
+	"adaptive_hybrid_test.go|engine Listen returned nil without addr": {1, startFail890},
+	"adaptive_hybrid_test.go|engine did not start in time":            {1, startFail890},
+	"adaptive_hybrid_test.go|engine not functional: %v":               {1, startFail890},
+}
 
 // rawSkipViolations890 lists the t.Skip* calls of one Go source that the rules
 // above do not admit, as "file:line: call(message)". It returns an error for a
@@ -184,7 +209,7 @@ func TestAdaptiveSkipRoutingIntegration890(t *testing.T) {
 	}
 	sort.Strings(files)
 	var bad []string
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	for _, f := range files {
 		src, err := os.ReadFile(f)
 		if err != nil {
@@ -203,7 +228,7 @@ func TestAdaptiveSkipRoutingIntegration890(t *testing.T) {
 		ast.Inspect(af, func(n ast.Node) bool {
 			if c, ok := n.(*ast.CallExpr); ok {
 				if s, ok := c.Fun.(*ast.SelectorExpr); ok && isSkipSelector890(s) {
-					seen[f+"|"+skipMessage890(c)] = true
+					seen[f+"|"+skipMessage890(c)]++
 				}
 			}
 			return true
@@ -211,14 +236,14 @@ func TestAdaptiveSkipRoutingIntegration890(t *testing.T) {
 	}
 	t.Logf("%d adaptive test files, %d raw skips not admitted, %d registered in unrouted890", len(files), len(bad), len(unrouted890))
 	if len(bad) > 0 {
-		t.Errorf("t.Skip calls that bypass skipOrFailIfStandbyAborted886 (adaptive_standby_guard_886_linux_test.go) and are not registered in unrouted890:\n  %s",
+		t.Errorf("t.Skip calls that bypass skipOrFailUpswitch890 (adaptive_standby_guard_886_linux_test.go) and are not registered in unrouted890:\n  %s",
 			strings.Join(bad, "\n  "))
 	}
-	// Every registered skip must still exist, or the table keeps a reason for
-	// nothing.
-	for k := range unrouted890 {
-		if !seen[k] {
-			t.Errorf("unrouted890 registers %q, which no t.Skip in the adaptive files has any more: delete the entry", k)
+	// Every registered skip must still exist, as many times as registered, or
+	// the table keeps a reason for nothing or admits a site unseen.
+	for k, e := range unrouted890 {
+		if seen[k] != e.sites {
+			t.Errorf("unrouted890 registers %q at %d sites, but the adaptive files have %d t.Skip calls with it: fix the entry", k, e.sites, seen[k])
 		}
 	}
 }
@@ -236,8 +261,9 @@ func TestAdaptiveSkipRoutingGuardSelfTest890(t *testing.T) {
 		{"raw Skipf fails", head + `func TestX(t *testing.T) { t.Skipf("adaptive engine not available: %v", 1) }`, 1},
 		{"raw SkipNow fails", head + `func TestX(t *testing.T) { t.SkipNow() }`, 1},
 		{"a raw skip in a subtest closure fails", head + `func TestX(t *testing.T) { t.Run("a", func(t *testing.T) { t.Skip("io_uring unavailable") }) }`, 1},
-		{"the gate passes", head + `func TestX(t *testing.T) { skipOrFailIfStandbyAborted886(t, 0, nil) }`, 0},
-		{"a skip inside the gate helper passes", head + `func skipOrFailIfStandbyAborted886(t *testing.T) { t.Skip("x") }`, 0},
+		{"the gate passes", head + `func TestX(t *testing.T) { skipOrFailUpswitch890(t, "io_uring unavailable") }`, 0},
+		{"a skip inside the gate helper passes", head + `func skipOrFailUpswitch890(t *testing.T, m string) { t.Skip(m) }`, 0},
+		{"a registered message is not exempt in an unregistered file", head + `func TestX(t *testing.T) { t.Skipf("engine failed to start: %v", 1) }`, 1},
 		{"a -short gate passes", head + `func TestX(t *testing.T) { if testing.Short() { t.Skip("integration") } }`, 0},
 		{"a -short gate with another clause passes", head + `func TestX(t *testing.T) { if x && testing.Short() { t.Skip("integration") } }`, 0},
 		{"a raw skip after a -short gate fails", head + `func TestX(t *testing.T) { if testing.Short() { t.Skip("integration") }; t.Skip("io_uring unavailable") }`, 1},

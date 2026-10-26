@@ -84,11 +84,19 @@ jobs:
       # and with a result line a test's own output joined (celeris#890).
       - name: named-tally.sh self-test
         run: .github/scripts/named-tally-test.sh
-      # The tools CI runs are pinned in one place, .github/tools/go.mod, and
-      # three other places name them: the allow list of its Dependabot entry
+      # The tally of the job `iouring-base-tier` (base-tier-tally.sh) on fixture
+      # logs: an allowed skip, a skip nobody allowed, an arm that ran at tier=high,
+      # a probe line of an uncapped run, and a named test missing or skipped
+      # (celeris#890 item 87).
+      - name: base-tier-tally.sh self-test
+        run: .github/scripts/base-tier-tally-test.sh
+      # The tools CI runs are pinned in one place, .github/tools/go.mod (the Go
+      # ones) or .github/tools/requirements.txt (zizmor), and three other places
+      # name them: the allow list of its Dependabot entry
       # (a tool without an entry, or one that names a package path instead
       # of the module path, silently stops getting bump PRs), CONTRIBUTING's
-      # golangci-lint version, and the workflows (no `go install ...@v`).
+      # golangci-lint version, and the workflows (no `go install ...@v`, no
+      # `name==version` of a Python tool).
       # tool-pins-check.sh compares them; its self-test runs it on broken
       # fixtures, so a check that stops failing is a red Lint (celeris#890).
       - name: Tool pins agree
@@ -138,10 +146,15 @@ jobs:
         # template injection, excessive permissions). Complements
         # actionlint, which checks syntax rather than security posture.
         # Needs only the ephemeral job token (read) for the online audits;
-        # no repository secrets. Pinned to an exact version.
+        # no repository secrets. Pinned to an exact version in
+        # .github/tools/requirements.txt, which Dependabot's pip entry bumps
+        # (celeris#890 item 93); the step names no version of its own.
         env:
           GH_TOKEN: ${{ github.token }}
-        run: pipx run --spec zizmor==1.30.0 zizmor --color always .github/workflows
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zizmor-venv"
+          "$RUNNER_TEMP/zizmor-venv/bin/pip" install --quiet --disable-pip-version-check -r .github/tools/requirements.txt
+          "$RUNNER_TEMP/zizmor-venv/bin/zizmor" --color always .github/workflows
 
   # The required check "Unit (root + middleware sub-modules)" is the `unit-gate`
   # job below: it passes only when this job AND every root-package shard passed.
@@ -1252,13 +1265,15 @@ jobs:
       # with -v, and tallies by name per package: every listed test must run and
       # PASS, and no SKIP line is allowed.
       #
-      # Which of them can fail a pull request: celeristest, middleware/timeout and
-      # middleware/ratelimit fail on any count over their budget. The rest (the
-      # drivers, middleware/{cache,idempotency,overload}) only log an over-budget
-      # count unless TESTING_STRICT_ALLOC_BUDGETS=1, which this step does not set,
-      # so for them it proves the guard ran (PASS, no skip) and not that the count
-      # held. Setting it is the stricter choice; see the pull request for the
-      # numbers behind it. The sse and websocket tests fail on their own bounds.
+      # Every one of them fails a pull request on a count over its budget.
+      # celeristest, middleware/timeout and middleware/ratelimit always did; the
+      # rest (the drivers, middleware/{cache,idempotency,overload}) only logged an
+      # over-budget count unless TESTING_STRICT_ALLOC_BUDGETS=1, which this step
+      # now sets (celeris#890 item 91), so for them a PASS says the count held and
+      # not only that the guard ran. The one guard that was over budget when the
+      # variable was first set, driver/postgres Query_1col_1row (14 allocs/op
+      # against 4), has the budget the driver costs. The sse and websocket tests
+      # fail on their own bounds.
       - name: celeris#890 allocation guards and alloc-count tests, without -race (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -2444,6 +2459,17 @@ jobs:
           sys.exit(rc)
           PY
           .github/scripts/named-tally.sh 'test/server full-size shape (celeris#890 item 92)' /tmp/large.log "${tests[@]}"
+          # The shape itself: the 64 MiB HTTP/1 bodies (16 MiB under lean761) and the 16 MiB
+          # HTTP/2 ones (8 MiB under lean761) ran, on all four engines.
+          full1=$(grep -cE '^=== RUN   TestLargeResponseIsDelivered/[a-z_]+/[a-z-]+/67108864/' /tmp/large.log || true)
+          full2=$(grep -cE '^=== RUN   TestLargeResponseIsDeliveredH2/[a-z_]+/[a-z-]+/16777216$' /tmp/large.log || true)
+          lean1=$(grep -cE '^=== RUN   TestLargeResponseIsDelivered/.*/16777216/' /tmp/large.log || true)
+          lean2=$(grep -cE '^=== RUN   TestLargeResponseIsDeliveredH2/.*/8388608$' /tmp/large.log || true)
+          echo "full-size bodies: HTTP/1 64 MiB runs $full1 (want 12), HTTP/2 16 MiB runs $full2 (want 8), lean-size runs $lean1 and $lean2 (want 0)"
+          if [ "$full1" -ne 12 ] || [ "$full2" -ne 8 ] || [ "$lean1" -ne 0 ] || [ "$lean2" -ne 0 ]; then
+            echo "expected the full-size bodies, not the lean ones -- did lean761() become true here (race or coverage), or did a size change?"
+            exit 1
+          fi
 
   conformance:
     name: Conformance

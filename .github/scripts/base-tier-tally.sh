@@ -29,23 +29,17 @@ shift 2
 [ -r "$log" ] || { echo "base-tier-tally: cannot read $log" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 
-# Allowed skips: an alternation of full test names, one entry per line with the
-# reason after the name. Measured on the runs cited in the pull request.
-allowed_iouring() {
-  cat <<'LIST'
-LIST
-}
-allowed_root() {
-  cat <<'LIST'
-LIST
-}
-
+# Allowed skips: .github/base-tier-skips-LABEL.txt, one test per line, its full
+# name first and the reason it must skip at the base tier after it (blank lines
+# and # lines are ignored). BASE_TIER_SKIPS_DIR points elsewhere for the
+# self-test.
 case "$label" in
-  iouring) list=$(allowed_iouring) ;;
-  root) list=$(allowed_root) ;;
+  iouring | root) ;;
   *) echo "base-tier-tally: label '$label' is neither iouring nor root" >&2; exit 2 ;;
 esac
-names=$(printf '%s\n' "$list" | awk 'NF { print $1 }' | paste -sd'|' -)
+list_file=${BASE_TIER_SKIPS_DIR:-$here/..}/base-tier-skips-$label.txt
+[ -r "$list_file" ] || { echo "base-tier-tally: cannot read $list_file" >&2; exit 2; }
+names=$(awk 'NF && $1 !~ /^#/ { print $1 }' "$list_file" | paste -sd'|' -)
 
 fail=0
 skipped=$("$here"/skip-count.sh "$log") || fail=1
