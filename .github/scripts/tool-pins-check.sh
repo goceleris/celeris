@@ -22,6 +22,15 @@
 #      with # is a comment and is skipped; a # later in a line is not (it can
 #      sit in an echo string), so a trailing comment that quotes such a command
 #      is flagged too. A YAML folded scalar (run: >) is not joined.
+#   4. The Python tools of CI (zizmor) are pinned in a requirements file under
+#      .github/, which Dependabot's pip ecosystem reads. (a) No workflow or
+#      composite action installs or runs a Python tool with a `name==version`
+#      of its own (`pipx run --spec zizmor==1.30.0`, `pip install x==1`, `uvx
+#      x==1`): that pin is read by no Dependabot entry, and stayed on its
+#      version until somebody remembered (celeris#890 item 93). The same line
+#      rules as check 3 apply. (b) Every directory under .github/ that holds a
+#      requirements*.txt has a `package-ecosystem: pip` entry in dependabot.yml
+#      for it (`directory:` or one of `directories:`), or nothing watches it.
 #
 # Prints one line per failed check and exits 1 if any failed. The Lint job
 # runs it, and tool-pins-check-test.sh runs it on broken fixtures.
@@ -109,6 +118,85 @@ hits=$(install_hits "$root")
 if [ -n "$hits" ]; then
   bad "a workflow or action installs or runs a tool with go install/go run pkg@version; add it to .github/tools/go.mod (go get -tool) and run it with go tool -modfile:"
   echo "  ${hits//$'\n'/$'\n'  }" >&2
+fi
+
+# 4. Python tools: pinned in a requirements file that Dependabot watches.
+pip_hits() {
+  python3 - "$1" <<'PY'
+import glob, os, re, sys
+root = sys.argv[1]
+pats = ['.github/workflows/*.yml', '.github/workflows/*.yaml',
+        '.github/actions/**/*.yml', '.github/actions/**/*.yaml']
+# A Python tool's installer or runner, then (flags) name==version. pip's -r
+# FILE form has no ==, so reading the pins from the file is not flagged.
+pat = re.compile(r'(?:\bpipx\s+(?:run|install)\b|\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\s+install\b|\buvx\b|\buv\s+tool\s+(?:run|install)\b).*?[A-Za-z0-9_.-]+(?:\[[^]]*\])?==\S')
+files = sorted({f for p in pats for f in glob.glob(os.path.join(root, p), recursive=True)})
+for f in files:
+    lines = open(f).read().splitlines()
+    i = 0
+    while i < len(lines):
+        start, text = i, lines[i]
+        while text.rstrip().endswith('\\') and i + 1 < len(lines):
+            i += 1
+            text = text.rstrip()[:-1] + ' ' + lines[i].strip()
+        i += 1
+        if text.lstrip().startswith('#'):
+            continue
+        if pat.search(text):
+            print("%s:%d:%s" % (os.path.relpath(f, root), start + 1, lines[start].strip()))
+PY
+}
+hits=$(pip_hits "$root")
+if [ -n "$hits" ]; then
+  bad "a workflow or action installs or runs a Python tool with its own name==version; pin it in a requirements file under .github/ (Dependabot's pip entry watches it) and install it with pip install -r:"
+  echo "  ${hits//$'\n'/$'\n'  }" >&2
+fi
+# The pip entries of dependabot.yml, as "/dir" lines: an entry runs from its
+# "- package-ecosystem:" line to the next one; its `directory:` and the items
+# of its `directories:` list count.
+pip_dirs() {
+  python3 - "$1" <<'PY'
+import re, sys
+dirs = []
+eco, found, in_list = None, [], False
+def end_entry():
+    if eco == "pip":
+        dirs.extend(found)
+for line in open(sys.argv[1]).read().splitlines():
+    m = re.match(r'^\s*-\s*package-ecosystem:\s*["\']?([^\s"\'#]+)', line)
+    if m:
+        end_entry()
+        eco, found, in_list = m.group(1), [], False
+        continue
+    m = re.match(r'^\s*directory:\s*["\']?([^\s"\'#]+)', line)
+    if m:
+        found.append(m.group(1)); in_list = False
+        continue
+    if re.match(r'^\s*directories:\s*(#.*)?$', line):
+        in_list = True
+        continue
+    m = re.match(r'^\s*-\s*["\']?(/[^\s"\'#]*)', line)
+    if m and in_list:
+        found.append(m.group(1))
+        continue
+    if in_list and not re.match(r'^\s*(#.*)?$', line):
+        in_list = False
+end_entry()
+print("\n".join(sorted(set(dirs))))
+PY
+}
+watched=$(pip_dirs "$root/.github/dependabot.yml")
+unwatched=
+while IFS= read -r f; do
+  d=/$(dirname "${f#"$root"/}")
+  case "
+$watched
+" in *"
+$d
+"*) ;; *) unwatched="$unwatched $d" ;; esac
+done < <(find "$root/.github" -name 'requirements*.txt' -type f | sort)
+if [ -n "$unwatched" ]; then
+  bad ".github/dependabot.yml has no 'package-ecosystem: pip' entry for the directory of a requirements file:$unwatched"
 fi
 
 [ "$fail" = 0 ] && echo "tool-pins-check: ok (tools: $(echo "$tools" | paste -sd' ' -); golangci-lint $ci)"

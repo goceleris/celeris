@@ -1262,6 +1262,8 @@ jobs:
       - name: celeris#890 allocation guards and alloc-count tests, without -race (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
+        env:
+          TESTING_STRICT_ALLOC_BUDGETS: "1"
         run: |
           set -o pipefail
           # "<package> <top-level tests that must PASS, as a regex alternation>"
@@ -1792,6 +1794,22 @@ jobs:
             echo "engines to report a refused steal -- was one renamed or removed, or did an io_uring arm skip?"
             exit 1
           fi
+      # celeris#890 item 96: ./test/integration is not run by this workflow (its
+      # tests need a host; `mage` runs them), but its adaptive_*_test.go files keep
+      # a copy of ./internal/adaptive's CELERIS_REQUIRE_UPSWITCH gate
+      # (skipOrFailIfStandbyAborted886). This guard, the counterpart of
+      # TestAdaptiveSkipRouting684, fails on a raw t.Skip in those files that
+      # bypasses it and is not registered with a reason, and its self-test
+      # plants one. It is the only test of the package that runs here, by name.
+      - name: celeris#890 test/integration adaptive skips go through the gate
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout=300s -v -run '^(TestAdaptiveSkipRoutingIntegration890|TestAdaptiveSkipRoutingGuardSelfTest890)$' ./test/integration/ 2>&1 | tee /tmp/integration-skip-guard.log
+          "$GITHUB_WORKSPACE"/.github/scripts/named-tally.sh 'test/integration skip guard (celeris#890 item 96)' /tmp/integration-skip-guard.log \
+            TestAdaptiveSkipRoutingIntegration890 \
+            TestAdaptiveSkipRoutingGuardSelfTest890
 
   # NOT a required check: the repository's ruleset ("Main — CI") requires Lint,
   # "Unit (root + middleware sub-modules)" (the `unit-gate` job), Conformance,

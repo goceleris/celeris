@@ -24,6 +24,11 @@ fixture() {
   mkdir -p "$dir/$1/.github/actions/probe"
   printf 'name: probe\nruns:\n  using: composite\n  steps:\n    - run: echo ok\n      shell: bash\n' >"$dir/$1/.github/actions/probe/action.yml"
   cp "$repo/CONTRIBUTING.md" "$dir/$1/"
+  # The requirements files of the Python tools (check 4), where there are any.
+  find "$repo/.github" -name 'requirements*.txt' -type f | while IFS= read -r f; do
+    mkdir -p "$dir/$1/$(dirname "${f#"$repo"/}")"
+    cp "$f" "$dir/$1/${f#"$repo"/}"
+  done
 }
 
 # expect NAME WANT_STATUS WANT_STDERR_SUBSTRING: runs the check on $dir/NAME.
@@ -141,6 +146,61 @@ expect go-run 1 'ci.yml'
 fixture go-run-local
 printf '      - run: go run ./cmd/tool -mail me@example.com\n' >>"$dir/go-run-local/.github/workflows/ci.yml"
 expect go-run-local 0
+
+# 4. Python tools: a version of their own in a workflow, and a requirements
+# file that no Dependabot pip entry watches (celeris#890 item 93).
+fixture pipx-spec
+printf '      - run: pipx run --spec zizmor==1.30.0 zizmor .github/workflows\n' >>"$dir/pipx-spec/.github/workflows/ci.yml"
+expect pipx-spec 1 'ci.yml'
+fixture pip-install-pin
+printf '      - run: python3 -m pip install zizmor==1.30.0\n' >>"$dir/pip-install-pin/.github/workflows/ci.yml"
+expect pip-install-pin 1 'ci.yml'
+fixture pip-install-extras
+printf '      - run: pip3 install --quiet "zizmor[x]==1.30.0"\n' >>"$dir/pip-install-extras/.github/workflows/ci.yml"
+expect pip-install-extras 1 'ci.yml'
+fixture uvx-pin
+printf '      - run: uvx --from zizmor==1.30.0 zizmor .\n' >>"$dir/uvx-pin/.github/workflows/ci.yml"
+expect uvx-pin 1 'ci.yml'
+fixture pip-install-continuation
+printf '      - run: |\n          pipx run \\\n            --spec zizmor==1.30.0 zizmor .\n' >>"$dir/pip-install-continuation/.github/workflows/ci.yml"
+expect pip-install-continuation 1 'ci.yml'
+fixture pip-install-composite
+printf '    - run: pipx install zizmor==1.30.0\n      shell: bash\n' >>"$dir/pip-install-composite/.github/actions/probe/action.yml"
+expect pip-install-composite 1 'actions/probe/action.yml'
+# Reading the pins from a requirements file, and a comment, are fine.
+fixture pip-install-requirements
+printf '      - run: pip install -r .github/tools/requirements.txt\n' >>"$dir/pip-install-requirements/.github/workflows/ci.yml"
+expect pip-install-requirements 0
+fixture pip-install-comment
+printf '      # was: pipx run --spec zizmor==1.30.0 zizmor .\n' >>"$dir/pip-install-comment/.github/workflows/ci.yml"
+expect pip-install-comment 0
+# An == that is no pin of a Python tool is fine.
+fixture eq-in-condition
+printf '      - run: if [ "$x" == "pip install" ]; then echo ok; fi\n' >>"$dir/eq-in-condition/.github/workflows/ci.yml"
+expect eq-in-condition 0
+
+# A requirements file in a directory no pip entry names, and the entry added
+# in either spelling.
+fixture requirements-unwatched
+mkdir -p "$dir/requirements-unwatched/.github/ci-extra"
+printf 'zizmor==1.30.0\n' >"$dir/requirements-unwatched/.github/ci-extra/requirements.txt"
+expect requirements-unwatched 1 "no 'package-ecosystem: pip' entry"
+fixture requirements-watched
+mkdir -p "$dir/requirements-watched/.github/ci-extra"
+printf 'zizmor==1.30.0\n' >"$dir/requirements-watched/.github/ci-extra/requirements.txt"
+printf '  - package-ecosystem: pip\n    directory: /.github/ci-extra\n    schedule:\n      interval: daily\n' >>"$dir/requirements-watched/.github/dependabot.yml"
+expect requirements-watched 0
+fixture requirements-watched-list
+mkdir -p "$dir/requirements-watched-list/.github/ci-extra"
+printf 'zizmor==1.30.0\n' >"$dir/requirements-watched-list/.github/ci-extra/requirements.txt"
+printf '  - package-ecosystem: pip\n    directories:\n      - /somewhere\n      - /.github/ci-extra\n    schedule:\n      interval: daily\n' >>"$dir/requirements-watched-list/.github/dependabot.yml"
+expect requirements-watched-list 0
+# An entry of another ecosystem for the same directory does not watch pip.
+fixture requirements-wrong-ecosystem
+mkdir -p "$dir/requirements-wrong-ecosystem/.github/ci-extra"
+printf 'zizmor==1.30.0\n' >"$dir/requirements-wrong-ecosystem/.github/ci-extra/requirements.txt"
+printf '  - package-ecosystem: gomod\n    directory: /.github/ci-extra\n    schedule:\n      interval: daily\n' >>"$dir/requirements-wrong-ecosystem/.github/dependabot.yml"
+expect requirements-wrong-ecosystem 1 "no 'package-ecosystem: pip' entry"
 
 echo "$n cases"
 exit "$fail"
