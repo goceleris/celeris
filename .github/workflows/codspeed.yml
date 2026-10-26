@@ -183,6 +183,14 @@
 # The label gate in loadgen's workflow is the other half of the decision and
 # is not in this repository.
 #
+# Unproven, and to be checked after the merge: CodSpeed's GitHub Actions page
+# (https://codspeed.io/docs/integrations/ci/github-actions) says that pushes to
+# the default branch record the baseline and names workflow_dispatch for
+# backtests; it does not mention `schedule`. Look at the first scheduled run in
+# the CodSpeed dashboard; if it is not recorded as the main baseline, put
+# `push: branches: [main]` (with the paths below) back beside the schedule, or
+# have the schedule dispatch this workflow.
+#
 # The trigger paths below are the non-test code of every package the
 # benchmark set executes (measured: the set run once with -coverpkg over the
 # whole module, on Linux and macOS), the benchmark files, the root

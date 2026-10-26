@@ -2368,6 +2368,10 @@ jobs:
   #     "none" and would skip everything, which the tally also refuses);
   #   * the root package and ./test/server, the tests whose names say Shutdown,
   #     Detach, SSE, Stream, WebSocket, Hijack or Drain, under -race.
+  # The -timeout of each step is about twice its measured time (473 s and 239 s), so a
+  # run with the cap lost (a misspelled value made 47 tests fail slowly and kept the
+  # second step busy for 23 minutes before it was cancelled, run 40416230192) ends
+  # in minutes.
   # Tests that need the high tier skip at this tier on purpose; each skip that
   # is allowed is listed by name with its reason in .github/base-tier-skips-iouring.txt
   # and -root.txt, and any other SKIP line fails the step (base-tier-tally.sh,
@@ -2381,13 +2385,14 @@ jobs:
   # they skip with "no usable io_uring", so what this step adds for the root tests
   # is the tests that start an io_uring engine without such a probe: they run at
   # the base tier here and at the high tier in every other job. The root list names
-  # those arms by pattern (a new probe-gated test needs no edit; the log must say
-  # tier=base under the skipped arm) after run 40419578127, on a merge with main,
+  # those arms by pattern (a new probe-gated test needs no edit; the arm must have
+  # logged the probe's own "io_uring tier=base kernel=..." skip message) after run
+  # 40419578127, on a merge with main,
   # met nine new such tests (117 passed, 46 SKIP lines) and failed a list of names.
   iouring-base-tier:
     name: io_uring base tier (CELERIS_MAX_IOURING_TIER=base, celeris#890)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       CELERIS_MAX_IOURING_TIER: base
     steps:
@@ -2404,7 +2409,7 @@ jobs:
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l), CELERIS_MAX_IOURING_TIER=$CELERIS_MAX_IOURING_TIER"
           start=$SECONDS
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=1500s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/base-iouring.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=900s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/base-iouring.log
           echo "internal/engine/iouring at the base tier took $((SECONDS - start)) s"
           .github/scripts/base-tier-tally.sh iouring /tmp/base-iouring.log TestShutdownDetachedPartialWriteIsFlushed806 TestReportTier844
       - name: Root package and test/server, Shutdown/Detach/SSE/Stream/WebSocket/Hijack/Drain tests at the base tier (race)
@@ -2416,7 +2421,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l), CELERIS_MAX_IOURING_TIER=$CELERIS_MAX_IOURING_TIER"
           start=$SECONDS
           # -p 1: one test process at a time, so the runner's one memlock budget never funds two.
-          CELERIS_REQUIRE_DUALSTACK=1 go test -p 1 -race -count=1 -timeout=1500s -v -run 'Shutdown|Detach|SSE|Stream|WebSocket|Hijack|Drain' . ./test/server 2>&1 | tee /tmp/base-root.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -p 1 -race -count=1 -timeout=600s -v -run 'Shutdown|Detach|SSE|Stream|WebSocket|Hijack|Drain' . ./test/server 2>&1 | tee /tmp/base-root.log
           echo "root and test/server at the base tier took $((SECONDS - start)) s"
           .github/scripts/base-tier-tally.sh root /tmp/base-root.log
 

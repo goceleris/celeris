@@ -36,8 +36,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 # self-test). An entry is
 #   NAME            a test or subtest by its full name; it covers its own subtests, or
 #   pattern:REGEX   a skipped test or subtest whose full name matches REGEX, and only
-#                   when the log shows "tier=base" in a line the test logged (the
-#                   skip message of a probe-gated test says "io_uring tier=base ...").
+#                   when the test itself logged the probe's skip message under its RUN
+#                   line ("file_test.go:N: io_uring tier=base kernel=...: no usable
+#                   io_uring"). The engine's own startup line ("INFO io_uring engine
+#                   selected tier=base ...") does not count: an arm that started an
+#                   engine and then skipped for another reason must still fail.
 #   min-pass N      the top-level tests that must PASS at least, so that a -run pattern
 #                   that stops matching (a rename) or a package that stops compiling its
 #                   tests in cannot shrink the run unseen; the figure is measured.
@@ -54,10 +57,10 @@ minpass=$(awk '$1 == "min-pass" { print $2 }' "$list_file")
 fail=0
 skipped=$("$here"/skip-count.sh "$log") || fail=1
 # Each SKIP line is judged by the name of the test: allowed by an exact entry (or as a
-# subtest of one), or by a pattern while the log shows tier=base under that test's RUN.
+# subtest of one), or by a pattern while the test logged the probe's tier=base skip message.
 unlisted=$(awk -v names="$names" -v pats="$patterns" '
   /^=== RUN   / { cur = $3; next }
-  /tier=base/ && cur != "" { base[cur] = 1 }
+  /^[[:space:]]+[A-Za-z0-9_.]+\.go:[0-9]+: .*io_uring tier=base kernel=/ && cur != "" { base[cur] = 1 }
   /^[[:space:]]*--- SKIP: / {
     n = $3
     ok = 0

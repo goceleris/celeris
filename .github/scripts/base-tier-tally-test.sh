@@ -73,6 +73,11 @@ arm() { # arm NAME MESSAGE: a probe-gated test whose NAME arm skipped with MESSA
 }
 arm io_uring 'io_uring tier=base kernel=6.17: no usable io_uring' >"$dir/arm.log"
 expect "root: an arm that logged tier=base is allowed by the pattern" 0 "" root "$dir/arm.log"
+# An arm that started an engine (the engine's INFO line says tier=base) and then skipped
+# for another reason is not excused by the pattern.
+printf '%s\n' '=== RUN   TestP' '=== RUN   TestP/io_uring' '2026/10/26 23:34:23 INFO io_uring engine selected tier=base multishot_accept=false' \
+  '    p_test.go:9: the peer never connected' '--- PASS: TestP (0.00s)' '    --- SKIP: TestP/io_uring (0.00s)' >"$dir/arm-engine.log"
+expect "root: an arm that started an engine and skipped for another reason fails" 1 "TestP/io_uring" root "$dir/arm-engine.log"
 arm io_uring 'the kernel has no io_uring' >"$dir/arm-other.log"
 expect "root: an arm that skipped for another reason fails" 1 "TestP/io_uring" root "$dir/arm-other.log"
 arm epoll 'io_uring tier=base kernel=6.17: no usable io_uring' >"$dir/arm-epoll.log"
