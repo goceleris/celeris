@@ -359,7 +359,8 @@ func (l *Loop) endCarriedReplay(cs *connState, fd int, perr error) {
 }
 
 // flushCarriedReplay sends the responses a replay's ProcessH1 queued, as
-// drainRead's inline flush does after a recv (celeris#908). The replay used
+// drainRead's inline flush does after a recv (celeris#908): it is that flush,
+// flushInline, which the two share since celeris#885 item 17. The replay used
 // to flush once and stop: a response larger than the socket buffers left its
 // rest in cs.writeBuf with no EPOLLOUT armed and the dirty list untouched
 // (EPOLLIN is edge-triggered, and nothing reads from the socket again until
@@ -367,59 +368,7 @@ func (l *Loop) endCarriedReplay(cs *connState, fd int, perr error) {
 // It also left pendingBytes at the sum of the replayed responses, which the
 // write hooks read as a backlog, and ignored a refused write.
 //
-// It stays a copy of drainRead's inline flush on purpose: one shared function
-// would put a call on the per-request path of every recv, and the copy runs
-// once per adoption (celeris#885 item 17 asks for the verdict and upgrade
-// blocks to be shared, which h1verdict.go does; this block is not one of them).
-//
-// Loop thread, on a conn fresh from attachAdoptedFD. cs.detachMu is released
-// before any close, which takes it again.
+// Loop thread, on a conn fresh from attachAdoptedFD.
 func (l *Loop) flushCarriedReplay(cs *connState, fd int) {
-	mu := cs.detachMu
-	if mu != nil {
-		mu.Lock()
-	}
-	if csWritePending(cs) {
-		queued := 0
-		if cs.writeSince != 0 {
-			queued = csPendingBytes(cs) // before this flush (celeris#885)
-		}
-		if fErr := l.flushWrites(cs, true); fErr != nil {
-			if cs.h1State != nil && cs.h1State.OnError != nil {
-				cs.h1State.OnError(fErr)
-			}
-			if mu != nil {
-				mu.Unlock()
-			}
-			if cs.dirty {
-				l.removeDirty(cs)
-			}
-			l.closeConn(fd)
-			return
-		}
-		if !csWritePending(cs) {
-			cs.pendingBytes = 0
-			cs.endWrite()
-			if cs.dirty {
-				l.removeDirty(cs)
-			}
-			l.disarmEpollOut(cs)
-		} else {
-			// The kernel send buffer is full: sync pendingBytes and arm
-			// EPOLLOUT, which handleWritable carries on from (a pending
-			// sendfile too), for a detached conn as for any other: the dirty
-			// list is a 0 ms epoll_wait for as long as the peer does not read
-			// (celeris#885 item 42).
-			cs.pendingBytes = csPendingBytes(cs)
-			cs.noteWriteProgress(queued, cs.pendingBytes)
-			l.armEpollOut(cs)
-		}
-	}
-	refused := cs.writeRefused
-	if mu != nil {
-		mu.Unlock()
-	}
-	if refused {
-		l.closeWhenFlushed(cs)
-	}
+	l.flushInline(cs, fd)
 }

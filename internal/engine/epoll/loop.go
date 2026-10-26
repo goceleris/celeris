@@ -1992,69 +1992,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// connections). This sends the response one event-batch earlier than
 		// the dirty list pass, reducing per-request latency by up to N×2µs
 		// (where N is the number of other events in the same epoll_wait batch).
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-		}
-		if csWritePending(cs) {
-			queued := 0
-			if cs.writeSince != 0 {
-				queued = csPendingBytes(cs) // before this flush (celeris#885)
-			}
-			if fErr := l.flushWrites(cs, true); fErr != nil {
-				if cs.h1State != nil && cs.h1State.OnError != nil {
-					cs.h1State.OnError(fErr)
-				}
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
-				}
-				if cs.dirty {
-					l.removeDirty(cs)
-				}
-				l.closeConn(fd)
-				return
-			}
-			if !csWritePending(cs) {
-				// Fully flushed (including any sendfile body) — no dirty
-				// list / EPOLLOUT needed.
-				cs.pendingBytes = 0
-				cs.endWrite()
-				if cs.dirty {
-					l.removeDirty(cs)
-				}
-				l.disarmEpollOut(cs)
-			} else {
-				// Partial write — the kernel send buffer is full (write
-				// backpressure). Sync pendingBytes and arm EPOLLOUT
-				// instead of busy-retrying via the dirty list, which
-				// would spin epoll_wait(0)→write(EAGAIN) at 100% CPU, a
-				// truly-detached WS/SSE conn included (celeris#885 item 42).
-				// A pending sendfile is resumed by handleWritable on the next
-				// EPOLLOUT edge.
-				cs.pendingBytes = csPendingBytes(cs)
-				// A client that sends while it reads (an HTTP/2 PING or
-				// WINDOW_UPDATE, a pipelined request) raises an EPOLLIN event
-				// per segment, and this flush takes the room it made: that is
-				// progress for the write clock, and no EPOLLOUT edge may come
-				// to show it (celeris#885 items 35 and 45).
-				cs.noteWriteProgress(queued, cs.pendingBytes)
-				l.armEpollOut(cs)
-			}
-		}
-		// Read writeRefused inside the lock so the check below is safe
-		// against concurrent goroutine writes via the guarded writeFn.
-		refused := cs.writeRefused
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
-
-		// Back-pressure close: a write hook refused bytes because the
-		// backlog before them was over writeCap, a peer that stopped
-		// reading while it kept sending requests. A backlog over the cap
-		// by itself is not a reason to close: one response larger than the
-		// cap puts it there, and so does a sendfile body. Closing on it cut
-		// such a response off mid-body (celeris#761).
-		if refused {
-			l.closeWhenFlushed(cs)
+		if l.flushInline(cs, fd) {
 			return
 		}
 
@@ -2078,6 +2016,87 @@ func (l *Loop) drainRead(fd int, now int64) {
 			return
 		}
 	}
+}
+
+// flushInline is drainRead's inline flush: it sends the responses the request
+// handler queued on cs right after the handler returned, and settles the
+// conn's write state for what the kernel did not take (celeris#885 item 17: the
+// transplant replay's flushCarriedReplay is this function, so the replay cannot
+// drift from the recv path). It reports whether the caller is done with the
+// conn, which is closed or closing: a failed flush closes it (after the
+// detached middleware's OnError), and a write the hooks refused ends it once
+// what is queued has gone out.
+//
+//   - Fully flushed (sendfile body included): no dirty list or EPOLLOUT is
+//     needed, so both are cleared.
+//   - Partial: the kernel send buffer is full (write backpressure), so
+//     pendingBytes is synced and EPOLLOUT armed instead of the dirty list,
+//     which would spin epoll_wait(0) then write(EAGAIN) at 100% CPU, a
+//     truly-detached WS/SSE conn included (celeris#885 item 42). A pending
+//     sendfile is resumed by handleWritable on the next EPOLLOUT edge. A
+//     client that sends while it reads (an HTTP/2 PING or WINDOW_UPDATE, a
+//     pipelined request) raises an EPOLLIN event per segment, and this flush
+//     takes the room it made: that is progress for the write clock, and no
+//     EPOLLOUT edge may come to show it (celeris#885 items 35 and 45).
+//   - Refused: a write hook refused bytes because the backlog before them was
+//     over writeCap, a peer that stopped reading while it kept sending
+//     requests. A backlog over the cap by itself is not a reason to close: one
+//     response larger than the cap puts it there, and so does a sendfile body.
+//     Closing on it cut such a response off mid-body (celeris#761).
+//
+// writeRefused is read inside the lock, against the dispatch goroutine's
+// guarded writeFn; cs.detachMu is released before any close, which takes it
+// again. Loop thread.
+//
+// The direct-body block of drainRead has a flush of its own and is not this
+// one: it does not call OnError, does not drop the conn from the dirty list on
+// an error, and does not disarm EPOLLOUT when everything went out, because it
+// is sync-only (intoBody is gated on !l.async: no detached conn).
+func (l *Loop) flushInline(cs *connState, fd int) (done bool) {
+	mu := cs.detachMu
+	if mu != nil {
+		mu.Lock()
+	}
+	if csWritePending(cs) {
+		queued := 0
+		if cs.writeSince != 0 {
+			queued = csPendingBytes(cs) // before this flush (celeris#885)
+		}
+		if fErr := l.flushWrites(cs, true); fErr != nil {
+			if cs.h1State != nil && cs.h1State.OnError != nil {
+				cs.h1State.OnError(fErr)
+			}
+			if mu != nil {
+				mu.Unlock()
+			}
+			if cs.dirty {
+				l.removeDirty(cs)
+			}
+			l.closeConn(fd)
+			return true
+		}
+		if !csWritePending(cs) {
+			cs.pendingBytes = 0
+			cs.endWrite()
+			if cs.dirty {
+				l.removeDirty(cs)
+			}
+			l.disarmEpollOut(cs)
+		} else {
+			cs.pendingBytes = csPendingBytes(cs)
+			cs.noteWriteProgress(queued, cs.pendingBytes)
+			l.armEpollOut(cs)
+		}
+	}
+	refused := cs.writeRefused
+	if mu != nil {
+		mu.Unlock()
+	}
+	if refused {
+		l.closeWhenFlushed(cs)
+		return true
+	}
+	return false
 }
 
 // drainH2Writes drains the H2 async write queues. Handler goroutines enqueue
