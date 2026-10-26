@@ -770,9 +770,11 @@ func (l *Loop) run(ctx context.Context) {
 				l.onPeerHalfClose(fd)
 			}
 
-			// Conservative: EPOLLHUP with bytes unread needs both directions shut
-			// and an error purges the receive queue, so the bytes are rarely
-			// there; the re-poll reports both again on the next turn.
+			// Conservative: bytes may be unread here (an RST does not purge the
+			// receive queue on Linux: a read returns them, and only the next one
+			// ECONNRESET), and nothing can be answered on the conn, but its next
+			// turn reads them and then the error, bounded by the receive queue;
+			// the re-poll reports ERR and HUP again with it.
 			if !yielded && ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
 				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)

@@ -191,10 +191,21 @@ func (l *Loop) stopDetachedProducers() {
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
 		cs := l.liveConns[i]
 		mu := cs.detachMu
-		if mu == nil || cs.hijacked.Load() || cs.h1State == nil || !cs.h1State.Detached.Load() {
+		if mu == nil || cs.hijacked.Load() {
+			continue
+		}
+		// h1State is read before the lock only on a conn the loop owns: on a
+		// promoted conn the dispatch goroutine sets it to nil in the h2c switch,
+		// under detachMu, so it is read under the lock (celeris#885 item 28).
+		promoted := cs.asyncPromoted
+		if !promoted && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
 			continue
 		}
 		if !mu.TryLock() {
+			continue
+		}
+		if promoted && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
+			mu.Unlock()
 			continue
 		}
 		// Re-tested under the lock, as closeConn's ownership check is: an async
