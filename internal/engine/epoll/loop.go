@@ -214,6 +214,13 @@ type Loop struct {
 	// (celeris#759; h2PoolSettled). Zero until then. Loop thread.
 	h2DrainStart time.Time
 
+	// refuseRecv is set by the pool wait's gate (poolWaitGate, celeris#885
+	// item 49): from then on drainRead reads no more from an HTTP/1 conn.
+	// producersStopNext is the time (UnixNano) before which the gate does not
+	// walk the conns again. Loop thread.
+	refuseRecv        bool
+	producersStopNext int64
+
 	// transplantInFlight counts connections this loop has detached for a
 	// transplant whose hand-off is not finished yet — the deferred async
 	// path, where tryTransplant detaches and drainDetachQueue completes.
@@ -536,6 +543,10 @@ func (l *Loop) run(ctx context.Context) {
 				l.shutdown()
 				return
 			}
+			// Waiting for HTTP/2 pool handlers (h2DrainStart is set): from
+			// poolWaitGrace into the wait, serve no more HTTP/1 and let no
+			// detached stream write (celeris#885 item 49).
+			l.poolWaitGate()
 		}
 
 		// Cache the atomic load: ACTIVE→LINGERING→DRAINING and
@@ -771,10 +782,13 @@ func (l *Loop) run(ctx context.Context) {
 			l.acceptAll(ctx, time.Now().UnixNano())
 		}
 
-		// Adaptive timeout tracking.
+		// Adaptive timeout tracking. A round that collected nothing counts as
+		// an idle one only if the loop was willing to wait: a queued driver
+		// conn forced the timeout to 0, which says nothing about idleness
+		// (celeris#885 item 42).
 		if n > 0 {
 			l.consecutiveEmpty = 0
-		} else {
+		} else if owedDriverReads == 0 {
 			l.consecutiveEmpty++
 		}
 
@@ -1515,6 +1529,11 @@ func (l *Loop) drainRead(fd int, now int64) {
 	}
 	cs := l.conns[fd]
 	if cs == nil {
+		return
+	}
+	// Past the pool wait's gate an HTTP/1 conn is read no more (celeris#885
+	// item 49): one load and branch per read event.
+	if l.refuseRecv && refusesRecv(cs) {
 		return
 	}
 
