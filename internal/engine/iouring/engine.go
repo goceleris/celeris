@@ -448,12 +448,18 @@ func (e *Engine) Listen(ctx context.Context) error {
 	defer innerCancel()
 
 	var wg sync.WaitGroup
-	for _, w := range workers {
+	for i, w := range workers {
 		wg.Add(1)
-		go func() {
+		run := func() {
 			defer wg.Done()
 			e.runWatched(innerCtx, w)
-		}()
+		}
+		// A test may take the first worker to run on the process's main thread
+		// (celeris#890 item 42); nil in production.
+		if i == 0 && runOnMainThread(run) {
+			continue
+		}
+		go run()
 	}
 
 	// A start that fails drops the failures its workers recorded; the engine
