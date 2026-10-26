@@ -454,11 +454,12 @@ func TestCookieJoinAllocatesInProportionToTheBlock944(t *testing.T) {
 	t.Logf("%d one-byte cookie fields: %.0f allocations per request", n, allocs)
 }
 
-// TestTinyCookieFieldsAreBoundedAndFast944: 256Ki one-byte cookie fields (0xA0
-// each, a 256 KB block) list at 9.9 MB for the bound's purposes. They are
-// refused, in milliseconds, whatever the join cost.
+// TestTinyCookieFieldsAreBoundedAndFast944: 255Ki one-byte cookie fields (0xA0
+// each, a block just inside the 256 KiB cap on a block, celeris#889) list at
+// 9.9 MB for the bound's purposes. They are refused, in milliseconds, whatever
+// the join cost.
 func TestTinyCookieFieldsAreBoundedAndFast944(t *testing.T) {
-	const n = 256 << 10
+	const n = 255 << 10
 	var hb bytes.Buffer
 	enc := hpack.NewEncoder(&hb)
 	for _, f := range reqHeaders944() {

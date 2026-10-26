@@ -73,7 +73,7 @@ func TestPoolStreamIsNotPooledWhileTheLoopHoldsIt951(t *testing.T) {
 				s := openPoolStream(t, p, 1)
 				orig := s.GetWindowSize()
 
-				// The WINDOW_UPDATE stops at notifySendWindow, the first
+				// The WINDOW_UPDATE stops at notifyStreamWindow, the first
 				// lock it takes after the lookup and the window credit.
 				m.sendWindowWaiters.Store(1)
 				m.sendWindowMu.Lock()
