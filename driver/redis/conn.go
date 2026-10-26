@@ -511,14 +511,7 @@ func (c *redisConn) execSyncBuf(ctx context.Context, req *redisRequest, buf []by
 	if c.syncBuf == nil {
 		c.syncBuf = make([]byte, 16<<10)
 	}
-	var ok bool
-	var err error
-	if c.useBusy {
-		ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
-	} else {
-		ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
-	}
-	c.writerMu.Unlock()
+	ok, err := c.pollSync(buf)
 	if err != nil {
 		_ = c.closeWithErr(err)
 		return nil, err
@@ -534,6 +527,49 @@ func (c *redisConn) execSyncBuf(ctx context.Context, req *redisRequest, buf []by
 	}
 	// EAGAIN or partial: fall through to blocking wait.
 	return req, c.wait(ctx, req)
+}
+
+// errSyncAborted is the close cause of a conn whose sync round trip ended in a
+// panic or a runtime.Goexit.
+var errSyncAborted = errors.New("celeris-redis: sync round trip aborted by a panic or Goexit")
+
+// pollSync runs the sync round trip for buf and releases c.writerMu, which the
+// caller holds on entry, however it ends. The poll runs the caller's onRecv
+// path (a RESP3 OnPush handler among it), so it can panic or call
+// runtime.Goexit; a recovered panic would otherwise leave writerMu locked, and
+// the conn's reader mid-frame, for the next command on a conn the caller still
+// holds. When the poll does not return, the conn is closed (closeWithErr, the
+// same poisoning every error path here uses) so no command reuses it.
+func (c *redisConn) pollSync(buf []byte) (bool, error) {
+	returned := false
+	defer c.endPoll(&returned)
+	var ok bool
+	var err error
+	if c.useBusy {
+		ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
+	} else {
+		ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
+	}
+	returned = true
+	return ok, err
+}
+
+// endPoll is the deferred half of pollSync and pollSyncMulti: it releases
+// writerMu and, when the poll did not return, closes the conn.
+func (c *redisConn) endPoll(returned *bool) {
+	c.writerMu.Unlock()
+	if !*returned {
+		_ = c.closeWithErr(errSyncAborted)
+	}
+}
+
+// pollSyncMulti is pollSync for the multi-response poll (execManyCore).
+func (c *redisConn) pollSyncMulti(data []byte) (bool, error) {
+	returned := false
+	defer c.endPoll(&returned)
+	ok, err := c.syncMulti.WriteAndPollMulti(c.fd, data, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, c.pollBeforeRearmFn)
+	returned = true
+	return ok, err
 }
 
 // execMany writes a pre-serialized multi-command buffer and enqueues n
@@ -601,8 +637,7 @@ func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redis
 		// from c.state. Passing them here avoids the two closure allocations
 		// that capturing lastReq/n/reqs/dispatched inline used to incur on
 		// every Pipeline.Exec.
-		ok, err := c.syncMulti.WriteAndPollMulti(c.fd, data, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, c.pollBeforeRearmFn)
-		c.writerMu.Unlock()
+		ok, err := c.pollSyncMulti(data)
 		if err != nil {
 			_ = c.closeWithErr(err)
 			return reqs, err
@@ -666,7 +701,13 @@ func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redis
 // call multiple times.
 func (c *redisConn) closeWithErr(err error) error {
 	c.closeErr.Store(&errBox{err: err})
-	return c.Close()
+	cerr := c.Close()
+	// A drain on another goroutine (onClose, the parse-error drain in onRecv)
+	// may still be notifying requests it took before this Close drained: wait
+	// for it, so that a caller that releases its request when this returns is
+	// not written to afterwards (celeris#887).
+	c.state.bridge.WaitDrained()
+	return cerr
 }
 
 // wait blocks until doneCh fires or ctx is canceled. Before parking on the

@@ -227,3 +227,52 @@ func TestBridgeDrainRacesNeitherEnqueueNorPop887(t *testing.T) {
 		t.Errorf("%d requests enqueued, %d popped and %d drained: a request was lost or left twice", n, popped.Load(), drained.Load())
 	}
 }
+
+// A second drain, and WaitDrained, return only after the drain in progress has
+// called notify for every request it took (celeris#887).
+func TestBridgeDrainsAreSerializedAndWaitable887(t *testing.T) {
+	b := NewBridge()
+	b.Enqueue(&testReq{ctx: context.Background(), id: 1})
+	b.Enqueue(&testReq{ctx: context.Background(), id: 2})
+
+	inNotify := make(chan struct{})
+	release := make(chan struct{})
+	var notified atomic.Int32
+	go b.DrainWithError(errors.New("x"), func(PendingRequest, error) {
+		if notified.Add(1) == 1 {
+			close(inNotify)
+			<-release
+		}
+	})
+	<-inNotify
+
+	waited := make(chan struct{})
+	go func() { b.WaitDrained(); close(waited) }()
+	second := make(chan struct{})
+	go func() { b.DrainWithError(errors.New("y"), nil); close(second) }()
+	// The ring is already empty (the first drain took it under mu), yet both
+	// must wait for the first drain's callbacks.
+	select {
+	case <-waited:
+		t.Fatal("WaitDrained returned while a drain was still notifying")
+	case <-second:
+		t.Fatal("a second DrainWithError returned while a drain was still notifying")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// Enqueue and Pop are not held up by the drain's callbacks.
+	b.Enqueue(&testReq{ctx: context.Background(), id: 3})
+	if b.Pop() == nil {
+		t.Fatal("Pop found nothing after Enqueue")
+	}
+	close(release)
+	for _, ch := range []chan struct{}{waited, second} {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("waiter never returned after the drain finished")
+		}
+	}
+	if got := notified.Load(); got != 2 {
+		t.Fatalf("notified %d requests, want 2", got)
+	}
+}
