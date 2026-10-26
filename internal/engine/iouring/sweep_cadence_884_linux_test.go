@@ -69,6 +69,9 @@ func TestIouringIdleConnTimeoutIsNotGatedByIterations884(t *testing.T) {
 			{"read/rht_default", timeout, -1, 0, true},
 			{"idle/rht_default", -1, timeout, 0, true},
 		} {
+			if tc.controlsMain && testing.Short() {
+				continue // the controls pass on main; -short keeps the arms that fail there
+			}
 			name := fmt.Sprintf("async=%v/%s", async, tc.name)
 			t.Run(name, func(t *testing.T) {
 				e, addr := startFDLEngine(t, newBusyHandler811(), func(c *resource.Config) {
@@ -226,45 +229,62 @@ func TestIouringSmallSendIntoAFullSocketIsBoundedByWriteTimeout884(t *testing.T)
 		return 0
 	}
 	t.Run("sync", func(t *testing.T) {
-		// The response sizes are tried in turn: whether the SEND that finds
-		// the socket full makes no progress at all or takes a few bytes (a
-		// remainder, which is marked) depends on the kernel's buffer
+		// The response sizes are tried in turn, each on an engine of its own
+		// that is stopped (its subtest ends) before the next: whether the SEND
+		// that finds the socket full makes no progress at all or takes a few
+		// bytes (a remainder, which is marked) depends on the kernel's buffer
 		// accounting. A size that does not give the zero-progress SEND is
 		// logged and left; the arm fails when none does, as a skip would take
 		// the witness out of CI silently.
+		found := false
 		for _, resp := range []int{1000, 300, 4096, 2000, 600} {
-			e, addr := startFDLEngine(t, &busyHandler811{body: make([]byte, resp)}, cfg(false))
-			cl := dialBusy811(t, addr)
-			stuckAt, delta := 0, uint64(0)
-			for i := 1; i <= 600 && stuckAt == 0; i++ {
-				before := e.Metrics().BytesWritten
-				cl.send(t, "/big")
-				delta = 0
-				for d := time.Now().Add(300 * time.Millisecond); time.Now().Before(d); time.Sleep(2 * time.Millisecond) {
-					if delta = e.Metrics().BytesWritten - before; delta >= uint64(resp) {
-						break
+			if found {
+				break
+			}
+			t.Run(fmt.Sprintf("resp=%d", resp), func(t *testing.T) {
+				e, addr := startFDLEngine(t, &busyHandler811{body: make([]byte, resp)}, cfg(false))
+				cl := dialBusy811(t, addr)
+				stuckAt, delta := 0, uint64(0)
+				for i := 1; i <= 600 && stuckAt == 0; i++ {
+					before := e.Metrics().BytesWritten
+					cl.send(t, "/big")
+					delta = 0
+					for d := time.Now().Add(300 * time.Millisecond); time.Now().Before(d); time.Sleep(2 * time.Millisecond) {
+						if delta = e.Metrics().BytesWritten - before; delta >= uint64(resp) {
+							break
+						}
+					}
+					if delta >= uint64(resp) {
+						continue
+					}
+					// Nothing more in 300 ms is not proof: a worker that was
+					// not scheduled on a loaded runner looks the same, and its
+					// SEND then completes and leaves an idle conn that no
+					// timeout of this config ends. Look again after a second.
+					time.Sleep(time.Second)
+					if delta = e.Metrics().BytesWritten - before; delta < uint64(resp) {
+						stuckAt = i
 					}
 				}
-				if delta < uint64(resp) {
-					stuckAt = i
+				if stuckAt == 0 || delta != 0 {
+					t.Logf("celeris884 SMALLSEND arm=sync resp_bytes=%d premise not met (stuck_at_request=%d, the stuck SEND took %d bytes)",
+						resp, stuckAt, delta)
+					return
 				}
-			}
-			if stuckAt == 0 || delta != 0 {
-				t.Logf("celeris884 SMALLSEND arm=sync resp_bytes=%d premise not met (stuck_at_request=%d, the stuck SEND took %d bytes)",
-					resp, stuckAt, delta)
-				continue
-			}
-			gone := waitGone(e)
-			t.Logf("celeris884 SMALLSEND arm=sync stuck_at_request=%d resp_bytes=%d write_timeout_ms=1000 gone_ms=%d (0: still open after %d ms)",
-				stuckAt, resp, gone.Milliseconds(), bound.Milliseconds())
-			if gone == 0 {
-				t.Errorf("celeris#884 item 74: a conn whose client stopped reading (a %d-byte SEND into a full socket that made "+
-					"no progress, the worker's last submission) was still open %v in with WriteTimeout 1s", resp, bound)
-			}
-			return
+				found = true
+				gone := waitGone(e)
+				t.Logf("celeris884 SMALLSEND arm=sync stuck_at_request=%d resp_bytes=%d write_timeout_ms=1000 gone_ms=%d (0: still open after %d ms)",
+					stuckAt, resp, gone.Milliseconds(), bound.Milliseconds())
+				if gone == 0 {
+					t.Errorf("celeris#884 item 74: a conn whose client stopped reading (a %d-byte SEND into a full socket that made "+
+						"no progress, the worker's last submission) was still open %v in with WriteTimeout 1s", resp, bound)
+				}
+			})
 		}
-		t.Fatal("premise: no response size gave a SEND into a full socket that made no progress on this kernel, " +
-			"so this arm would check nothing")
+		if !found {
+			t.Fatal("premise: no response size gave a SEND into a full socket that made no progress on this kernel, " +
+				"so this arm would check nothing")
+		}
 	})
 	t.Run("async_leftover", func(t *testing.T) {
 		const resp = 48 << 10
