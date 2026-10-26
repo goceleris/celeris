@@ -143,7 +143,7 @@ func (h *h2cHandler) serveUpgrade(w http.ResponseWriter, r *http.Request, settin
 			if h.bodyRefused != nil {
 				h.bodyRefused()
 			}
-			w.Header().Set("Connection", "close")
+			closeAfterUnreadBody(w)
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}

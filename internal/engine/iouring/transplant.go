@@ -297,6 +297,20 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 	return true
 }
 
+// Neither replay tail looks at cs.writeRefused, which handleRecv's tails do
+// (respondAndArm closes the conn on it): celeris#884 item 38, left as it was,
+// and not because it cannot be set. makeWriteFn refuses a write only over
+// sendCap(), which a fresh conn does not have unless the replayed handler
+// detaches (then it is maxSendQueueBytesDetached, 64 MiB). But StreamWriteErr
+// marks a refusal too, on an HTTP/1 conn that has not detached, once a
+// StreamWriter's staged response passes the same 64 MiB, and nothing is sent
+// while the handler runs: a carried request whose handler streams more than
+// that sets the flag, and the conn is then left open with that response cut
+// off, until its next request ends at the check of the recv path (or the
+// conn's timeout does). Code reading only, not reproduced: closing here, for
+// parity with handleRecv and epoll's flushCarriedReplay, is a behaviour change
+// no test shows to be needed.
+//
 // flushCarriedReplay ships what a transplant's carried-request replay queued,
 // under cs.detachMu when the conn has one. A carried request can detach during
 // the replay (a WebSocket or SSE handler on a pipelined request), and from
