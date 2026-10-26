@@ -49,6 +49,10 @@ func pipelined936Arms(t *testing.T) []pipelined936Arm {
 		{name: "epoll-asynchandlers", engine: celeris.Epoll, asyncLoop: true},
 		{name: "epoll-async-hijack", engine: celeris.Epoll, asyncHJ: true},
 		{name: "epoll-async-all", engine: celeris.Epoll, asyncAll: true},
+		// Adaptive runs on epoll or io_uring, whichever it starts on, and
+		// switches between them: both engines' hijack paths are its.
+		{name: "adaptive", engine: celeris.Adaptive},
+		{name: "adaptive-async-hijack", engine: celeris.Adaptive, asyncHJ: true},
 	}
 	if ok, p := c714ProbeIOUring(t); ok {
 		arms = append(arms, pipelined936Arm{name: "io_uring", engine: celeris.IOUring})
