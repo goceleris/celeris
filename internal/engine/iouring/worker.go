@@ -744,6 +744,11 @@ type Worker struct {
 	// which a ring with room, and a kernel that takes every submit, never
 	// produces (celeris#869).
 	cancelSQEFull func() bool
+	// hijackSubmit, when set (tests only), replaces the ring's Submit in
+	// hijackConn, the submit that puts the cancel of an owed op in the kernel
+	// before the socket is handed over (celeris#884 item 40): a failing enter
+	// is not something a ring that works can be made to produce.
+	hijackSubmit func() (int, error)
 	// closeFDOwed counts the pendingRelease entries that still hold their
 	// descriptor open (holdsFD, celeris#685). The worker does not park
 	// while it is non-zero: the terminal CQEs those closes wait for arrive
@@ -3159,7 +3164,11 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// CQE before it hands the socket over, or an issued recv can take the
 	// hijacker's first bytes (celeris#884 item 18, with endOwedOpsAtShutdown).
 	if fdOwed(cs) && !w.sqpoll {
-		_, _ = w.ring.Submit()
+		submit := w.ring.Submit
+		if w.hijackSubmit != nil {
+			submit = w.hijackSubmit
+		}
+		_, _ = submit()
 	}
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
