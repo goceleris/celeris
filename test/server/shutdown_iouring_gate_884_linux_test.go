@@ -288,17 +288,6 @@ func runIOUringGateArm884(t *testing.T, eng celeris.EngineType, gate string, asy
 
 	// The rest of every request in progress arrives after the gate.
 	time.Sleep(time.Until(begin.Add(1200 * time.Millisecond)))
-	// The download's client sends more after the gate, twice, which the engine
-	// does not read (the conn is not idle, but the gate reads a request only
-	// when one is in progress): bytes that stay unread in the kernel, so a close
-	// of that conn while any of the response is still unacknowledged in the
-	// kernel's send queue would be a reset that throws the tail of it away.
-	for range 2 {
-		if _, err := io.WriteString(dl, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
-			t.Errorf("a request written on the download's conn after the gate: %v", err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 	var pwg sync.WaitGroup
 	for _, p := range inProgress {
 		pwg.Add(1)
@@ -389,8 +378,9 @@ func runIOUringGateArm884(t *testing.T, eng celeris.EngineType, gate string, asy
 	if err != nil {
 		t.Fatalf("the download's head: %v", err)
 	}
-	// Read slowly (about 20 MiB/s), so that the kernel's send queue (a few MiB)
-	// is still draining when the engine's own queue has emptied.
+	// Read slowly (about 20 MiB/s): the conn's engine queue empties while the
+	// kernel's send queue (a few MiB) is still draining, and the conn must be
+	// closed only after that, with a FIN.
 	var dlN int64
 	var dlErr error
 	for chunk := make([]byte, 64<<10); dlErr == nil; {
@@ -402,13 +392,10 @@ func runIOUringGateArm884(t *testing.T, eng celeris.EngineType, gate string, asy
 	if dlN != int64(len(dlBody)) {
 		t.Errorf("the queued download delivered %d of %d bytes (%v): the gate cut a response that was still going out", dlN, len(dlBody), dlErr)
 	}
-	// Closed once drained: a FIN, or, because the client's two requests after
-	// the gate were never read and close(2) with unread bytes resets, an RST that
-	// comes after the whole response has been received (the length check above).
-	// Silence is what the gate must not leave.
+	// Closed once drained: a FIN (not a reset, not silence).
 	_ = dl.SetReadDeadline(time.Now().Add(3 * time.Second))
-	if _, err := dbr.ReadByte(); err != io.EOF && !errors.Is(err, syscall.ECONNRESET) {
-		t.Errorf("after the download the conn read %v, want a close (FIN, or a reset after the whole response): a drained conn was left open", err)
+	if _, err := dbr.ReadByte(); err != io.EOF {
+		t.Errorf("after the download the conn read %v, want a FIN (io.EOF): a drained conn was left open", err)
 	}
 
 	for _, c := range holders { // the holders go: the wait ends
