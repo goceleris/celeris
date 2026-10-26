@@ -40,14 +40,27 @@ func (w *Worker) clearConnSlot(fd int) {
 	w.connsMu.Unlock()
 }
 
-// connSlotBusy reports whether fd is an HTTP connection's number on this
-// worker: the one read of the table off the worker goroutine.
+// ownsDescriptorNumber reports whether the conn in a slot owns the descriptor
+// number the slot is at. A fixed-file conn (the development-only
+// CELERIS_IOURING_FIXED_FILES=1, ACCEPT_DIRECT) does not: its slot is its index
+// in the ring's file table, and the process has no descriptor of that number to
+// collide with, so a driver may register a real descriptor with the same
+// number (celeris#884 item 57). cs.fixedFile is set before the conn is
+// installed and is not written again until it is released, after its slot has
+// been cleared, so it is read here safely under connsMu or on the worker.
+func ownsDescriptorNumber(cs *connState) bool {
+	return cs != nil && !cs.fixedFile
+}
+
+// connSlotBusy reports whether fd is an HTTP connection's descriptor number on
+// this worker: the one read of the table off the worker goroutine. A fixed-file
+// conn's slot is an index, not a descriptor (ownsDescriptorNumber).
 func (w *Worker) connSlotBusy(fd int) bool {
 	if fd < 0 || fd >= len(w.conns) {
 		return false
 	}
 	w.connsMu.Lock()
-	busy := w.conns[fd] != nil
+	busy := ownsDescriptorNumber(w.conns[fd])
 	w.connsMu.Unlock()
 	return busy
 }
