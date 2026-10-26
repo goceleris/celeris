@@ -2386,7 +2386,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      CELERIS_MAX_IOURING_TIER: base
+      CELERIS_MAX_IOURING_TIER: bse
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2458,7 +2458,7 @@ jobs:
             TestH2CUnmatchedThroughTimeoutSingleflight836
           )
           regex=$(IFS='|'; echo "${tests[*]}")
-          go test -c -o /tmp/server.test ./test/server
+          go test -race -c -o /tmp/server.test ./test/server
           python3 - /tmp/server.test "^(${regex})\$" <<'PY' 2>&1 | tee /tmp/large.log
           import resource, subprocess, sys, time
           binary, run = sys.argv[1], sys.argv[2]
