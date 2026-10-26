@@ -186,14 +186,6 @@ func parseUint(s string) (int, bool) {
 	return n, true
 }
 
-// sendStreamError sends an RST_STREAM frame with the specified error code.
-func sendStreamError(writer FrameWriter, streamID uint32, code http2.ErrCode) {
-	_ = writer.WriteRSTStream(streamID, code)
-	if flusher, ok := writer.(interface{ Flush() error }); ok {
-		_ = flusher.Flush()
-	}
-}
-
 // validateStreamID validates HTTP/2 stream ID according to RFC 7540 specifications.
 //
 //nolint:unparam // isClient is designed for both client and server validation

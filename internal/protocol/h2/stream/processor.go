@@ -1846,8 +1846,9 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	if !ok {
 		// A stream the manager does not hold that the server reset without
 		// ending the connection (a request refused for the stream limit, for its
-		// header list, or after the GOAWAY the server sent; every other reset
-		// returns an error, and the connection ends): RFC 9113 section 5.1
+		// header list, as malformed (refuseMalformed), or after the GOAWAY the
+		// server sent; every other reset returns an error, and the connection
+		// ends): RFC 9113 section 5.1
 		// (closed) says the endpoint that sent RST_STREAM "MUST be prepared to
 		// receive any frames that were sent before it processed the RST_STREAM",
 		// and a POST sent without waiting for the answer has its DATA on the
