@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -563,7 +562,7 @@ func startServer760(t *testing.T, eng celeris.EngineType, budget, writeTimeout t
 			return srv
 		}
 		cancel()
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(retryUntil) {
+		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}

@@ -124,7 +124,9 @@ func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Durat
 		cfg.OnSlowClient = func(*sse.Client, sse.Event) sse.ClientPolicy { return sse.ClientPolicyClose }
 	}
 	var addr string
-	for tries := 0; ; tries++ {
+	// A ring's memlock is returned when the engine before it has closed, so a
+	// start that fails with ring-setup ENOMEM is retried (celeris#1104).
+	startRetryingRingENOMEM(t, "server start", func() error {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -136,15 +138,14 @@ func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Durat
 		s.GET("/events", sse.New(cfg))
 		st.s, st.startDone = s, make(chan error, 1)
 		go func(done chan error) { done <- s.Start() }(st.startDone)
-		err = waitReady761(addr, st.startDone)
-		if err == nil {
-			break
+		if err := waitReady761(addr, st.startDone); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = s.Shutdown(ctx)
+			cancel()
+			return err
 		}
-		time.Sleep(200 * time.Millisecond) // a ring's memlock is returned when the engine before it has closed
-		if tries >= 15 {
-			t.Fatalf("server did not start: %v", err)
-		}
-	}
+		return nil
+	})
 	st.addr = addr
 	t.Cleanup(func() {
 		if st.conn != nil {

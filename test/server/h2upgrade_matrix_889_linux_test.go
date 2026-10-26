@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -175,33 +176,46 @@ func firstReply889(t *testing.T, addr, wire string) []byte {
 // other starters here decide it is ready).
 func startTCPReady889(t *testing.T, cfg celeris.Config) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	cfg.Addr = addr
-	s := celeris.New(cfg)
-	s.GET("/h", func(c *celeris.Context) error { return c.String(http.StatusOK, "h1-answer") })
-	done := make(chan error, 1)
-	go func() { done <- s.Start() }()
-	for i := 0; ; i++ {
-		select {
-		case err := <-done:
-			t.Fatalf("Start returned before the listener was up: %v", err)
-		default:
+	var (
+		addr string
+		s    *celeris.Server
+		done chan error
+	)
+	// An io_uring Start can fail with ring-setup ENOMEM under the runner's
+	// 8 MiB memlock while earlier rings are still charged: retry it, as the
+	// sibling starters do (celeris#1104).
+	startRetryingRingENOMEM(t, "server start", func() error {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
 		}
-		c, err := net.DialTimeout("tcp", addr, time.Second)
-		if err == nil {
-			_ = c.Close()
-			break
+		addr = ln.Addr().String()
+		_ = ln.Close()
+		cfg.Addr = addr
+		s = celeris.New(cfg)
+		s.GET("/h", func(c *celeris.Context) error { return c.String(http.StatusOK, "h1-answer") })
+		done = make(chan error, 1)
+		go func(s *celeris.Server, done chan error) { done <- s.Start() }(s, done)
+		for i := 0; ; i++ {
+			select {
+			case err := <-done:
+				return fmt.Errorf("Start returned before the listener was up: %w", err)
+			default:
+			}
+			c, err := net.DialTimeout("tcp", addr, time.Second)
+			if err == nil {
+				_ = c.Close()
+				return nil
+			}
+			if i > 300 {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = s.Shutdown(ctx)
+				cancel()
+				return fmt.Errorf("not listening: %w", err)
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		if i > 300 {
-			t.Fatalf("not listening: %v", err)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	})
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

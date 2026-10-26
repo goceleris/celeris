@@ -94,7 +94,7 @@ func startServer895(t *testing.T, mk func() *celeris.Server) (*celeris.Server, f
 			return s, func() { _ = s.Shutdown(context.Background()); cancel(); <-done }
 		}
 		cancel()
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(deadline) {
+		if isRingENOMEM(err) && time.Now().Before(deadline) {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}

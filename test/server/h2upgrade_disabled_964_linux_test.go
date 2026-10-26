@@ -67,7 +67,7 @@ func startServer964(t *testing.T, cfg celeris.Config) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = s.Shutdown(ctx)
 		cancel()
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(retryUntil) {
+		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}

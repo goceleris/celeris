@@ -105,34 +105,48 @@ func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, mode string) {
 		}
 	}
 	var hits, detaches atomic.Int64
-	s := celeris.New(celeris.Config{Engine: eng, Workers: 2})
-	s.GET("/boom", func(c *celeris.Context) error {
-		hits.Add(1)
-		switch mode {
-		case srvGoexit791:
-			runtime.Goexit()
-		case srvDetachGoexit791:
-			_ = c.Detach() // its done is never called: the Goexit comes first
-			detaches.Add(1)
-			runtime.Goexit()
+	var (
+		addr   string
+		done   chan error
+		cancel context.CancelFunc
+	)
+	// A fresh server per try: an io_uring Start can fail with ring-setup ENOMEM
+	// under the runner's 8 MiB memlock while earlier rings are still charged
+	// (celeris#1104).
+	startRetryingRingENOMEM(t, "server start", func() error {
+		s := celeris.New(celeris.Config{Engine: eng, Workers: 2})
+		s.GET("/boom", func(c *celeris.Context) error {
+			hits.Add(1)
+			switch mode {
+			case srvGoexit791:
+				runtime.Goexit()
+			case srvDetachGoexit791:
+				_ = c.Detach() // its done is never called: the Goexit comes first
+				detaches.Add(1)
+				runtime.Goexit()
+			}
+			panic("celeris791: handler panic")
+		}).Async()
+		s.GET("/ok", func(c *celeris.Context) error {
+			return c.String(200, "w=%d", c.WorkerID())
+		})
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
 		}
-		panic("celeris791: handler panic")
-	}).Async()
-	s.GET("/ok", func(c *celeris.Context) error {
-		return c.String(200, "w=%d", c.WorkerID())
+		var ctx context.Context
+		ctx, cancel = context.WithCancel(context.Background())
+		done = make(chan error, 1)
+		go func(d chan error) { d <- s.StartWithListenerAndContext(ctx, ln) }(done)
+		var werr error
+		if addr, werr = c714WaitReady(s, done); werr != nil {
+			cancel()
+			_ = ln.Close()
+			return werr
+		}
+		return nil
 	})
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	done := make(chan error, 1)
-	go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
-	addr, err := c714WaitReady(s, done)
-	if err != nil {
-		t.Fatalf("server did not start: %v", err)
-	}
 	dial := func() *goexitConn791 {
 		c, err := net.DialTimeout("tcp", addr, goexitBudget791)
 		if err != nil {

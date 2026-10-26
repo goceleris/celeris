@@ -232,7 +232,7 @@ func startKeptServerOn(t *testing.T, laddr string, mk func() *celeris.Server) (s
 		}
 		cancel()
 		_ = ln.Close()
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(deadline) {
+		if isRingENOMEM(err) && time.Now().Before(deadline) {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}

@@ -179,7 +179,7 @@ func start848With(t *testing.T, cfg celeris.Config, setup func(r *rig848)) *rig8
 		if err == nil {
 			return r
 		}
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(deadline) {
+		if isRingENOMEM(err) && time.Now().Before(deadline) {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}
