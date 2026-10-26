@@ -12,6 +12,7 @@ package postgres
 
 import (
 	"context"
+	"runtime"
 	"testing"
 
 	"github.com/goceleris/celeris/driver/internal/async"
@@ -83,4 +84,36 @@ func BenchmarkDispatchBuffered887(b *testing.B) {
 		c.onRecv(reply)
 		releasePgRequest(req)
 	}
+}
+
+// BenchmarkDispatchAsync887 is the async shape: the "loop" goroutine runs
+// onRecv while the caller, on another goroutine, spins on doneAtom, releases the
+// request and acquires the next. allocs/op shows how often the caller's release
+// meets dispatch's pin (a pinned request is dropped, so the next acquire
+// allocates). It uses only symbols that exist on main.
+func BenchmarkDispatchAsync887(b *testing.B) {
+	c := newDispatchConn()
+	reply := benchRows8Reply()
+	kick := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		for range kick {
+			c.onRecv(reply)
+		}
+		close(stop)
+	}()
+	b.ReportAllocs()
+	for b.Loop() {
+		req := acquirePgRequest()
+		req.ctx = context.Background()
+		req.kind = reqSimple
+		c.enqueue(req)
+		kick <- struct{}{}
+		for req.doneAtom.Load() == 0 {
+			runtime.Gosched()
+		}
+		releasePgRequest(req)
+	}
+	close(kick)
+	<-stop
 }

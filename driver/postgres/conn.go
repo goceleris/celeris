@@ -835,12 +835,13 @@ var errSyncAborted = errors.New("celeris-postgres: sync round trip aborted by a 
 
 // pollSync writes payload and polls for the reply on the caller's goroutine
 // (syncLoop.WriteAndPoll), and releases c.writerMu, which the caller holds on
-// entry, however it ends. The poll runs onRecv on this goroutine, where a
-// user callback (the CopyTo dest, for one) can panic or call runtime.Goexit; a
-// recovered panic would otherwise leave writerMu locked, and the reader
-// mid-frame with the request still queued, and Pool.ExecContext's deferred
-// release would put that conn back in the pool for the next command to block
-// on in writerMu.Lock, which has no ctx. When the poll does not return, the
+// entry, however it ends. The poll runs onRecv on this goroutine. No user
+// callback runs there on this driver's query paths (the CopyTo dest runs only
+// for a COPY request), so a panic or runtime.Goexit leaving the poll is a
+// driver or parser bug, not user code; it would otherwise leave writerMu
+// locked, and the reader mid-frame with the request still queued, and
+// Pool.ExecContext's deferred release would put that conn back in the pool for
+// the next command to block on in writerMu.Lock, which has no ctx. When the poll does not return, the
 // conn is failed (failAll marks it closed, so Pool.release discards it)
 // after writerMu is released: Close takes writerMu, failAll does not.
 func (c *pgConn) pollSync(payload []byte) (ok bool, err error) {
