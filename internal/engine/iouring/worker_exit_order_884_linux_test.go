@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/deferlinger"
 )
 
 // celeris#884 item 71 (PR #1020 review r2): no test checked that a worker whose
@@ -147,4 +149,60 @@ func TestGoexitedWorkerLeavesTheGroupBeforeItIsMarkedExited884(t *testing.T) {
 	}
 	stop848(t, cancel, done)
 	t.Logf("celeris848 RESULT iouring-exit-order worker=%d listener_closed_at_exited=%v", got.w.id, got.listenClosed)
+}
+
+// TestReportWorkerExitLeavesTheGroupBeforeTheFlag884 is the same order at the
+// function, many times over (a watcher that sees the flag set between the flag
+// and the end of the group's shedding is a race the engine arm catches once in
+// a few runs): reportWorkerExit on a worker holding a listening socket, with a
+// goroutine spinning on exited; whenever it sees the flag, listenFDClosed, which
+// leaveGroupAfterExit stores after its shutdown(SHUT_RD) and its closes, must
+// be set; and a goroutine told by the pause's channel (the notify) must find it
+// set too. Red with leaveGroupAfterExit moved after the flag and the notify.
+func TestReportWorkerExitLeavesTheGroupBeforeTheFlag884(t *testing.T) {
+	const rounds = 400
+	e := &Engine{}
+	early := 0
+	for round := range rounds {
+		lfd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Bind(lfd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+			_ = unix.Close(lfd)
+			t.Fatal(err)
+		}
+		if err := unix.Listen(lfd, 1); err != nil {
+			_ = unix.Close(lfd)
+			t.Fatal(err)
+		}
+		w := &Worker{id: round, listenFD: lfd, handoffLoss: &handoffLossStats{}, pause: &deferlinger.PauseState{}}
+		changed := w.pause.Changed()
+		saw := make(chan bool, 1)
+		go func() {
+			for !w.exited.Load() {
+				runtime.Gosched()
+			}
+			saw <- w.listenFDClosed.Load()
+		}()
+		notified := make(chan bool, 1)
+		go func() {
+			<-changed
+			notified <- w.listenFDClosed.Load()
+		}()
+		e.reportWorkerExit(w)
+		if !<-saw {
+			early++
+		}
+		if !<-notified {
+			early++
+		}
+		if fdOpen704(lfd) {
+			_ = unix.Close(lfd)
+			t.Fatalf("round %d: reportWorkerExit returned with the listener open", round)
+		}
+	}
+	if early > 0 {
+		t.Errorf("%d of %d observations (the flag, the notify) found the worker's listener not yet closed: the worker is marked exited and the pause notified before it has left the SO_REUSEPORT group", early, 2*rounds)
+	}
 }
