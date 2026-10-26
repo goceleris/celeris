@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -640,16 +641,53 @@ func (s *Stream) MaterializeHeaders() {
 		)
 		s.pseudoMaterialized = true
 	}
-	var cj CookieJoiner
+	// Several Cookie lines become one field joined with "; ", as HTTP/2
+	// delivers a request (celeris#889, see CookieJoiner). The loop is the plain
+	// append; only a request with a second cookie line pays for the join.
+	hdrs := s.Headers
+	first, extra := -1, 0
 	for _, rh := range s.LazyRawHeaders {
-		name, value := lazyLowerHeaderName(rh[0]), unsafeStringFromBytes(rh[1])
+		name := lazyLowerHeaderName(rh[0])
 		if name == "cookie" {
-			s.Headers = cj.Append(s.Headers, name, value)
+			if first < 0 {
+				first = len(hdrs)
+			} else {
+				extra++
+			}
+		}
+		hdrs = append(hdrs, [2]string{name, unsafeStringFromBytes(rh[1])})
+	}
+	if extra > 0 {
+		hdrs = joinCookieFields(hdrs, first)
+	}
+	s.Headers = hdrs
+}
+
+// joinCookieFields joins every cookie field from index first on into the first
+// one with "; " and removes the others, in place: one allocation of exactly
+// the joined length, however many lines there are.
+func joinCookieFields(hdrs [][2]string, first int) [][2]string {
+	n := 0
+	for _, h := range hdrs[first:] {
+		if h[0] == "cookie" {
+			n += len(h[1]) + 2
+		}
+	}
+	var b strings.Builder
+	b.Grow(n - 2)
+	out := hdrs[:first+1]
+	b.WriteString(hdrs[first][1])
+	for _, h := range hdrs[first+1:] {
+		if h[0] == "cookie" {
+			b.WriteString("; ")
+			b.WriteString(h[1])
 			continue
 		}
-		s.Headers = append(s.Headers, [2]string{name, value})
+		out = append(out, h)
 	}
-	cj.Finish(s.Headers)
+	out[first][1] = b.String()
+	clear(hdrs[len(out):])
+	return out
 }
 
 // CookieJoiner joins the cookie fields of one request's header list into the
@@ -671,9 +709,10 @@ type CookieJoiner struct {
 	buf    []byte
 }
 
-// Append appends the request header field name: value (name lowercased) to
-// hdrs, except that a cookie field after the first is gathered for Finish
-// instead of being appended.
+// Append appends the request header field name: value to hdrs, except that a
+// cookie field after the first is gathered for Finish instead of being
+// appended. It does not lowercase: the caller passes name already lowercased
+// (the HTTP/1 and HTTP/2 paths and celeristest all do).
 func (j *CookieJoiner) Append(hdrs [][2]string, name, value string) [][2]string {
 	if name == "cookie" {
 		if !j.seen {

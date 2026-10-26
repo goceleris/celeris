@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/middleware/cache"
 	"github.com/goceleris/celeris/middleware/singleflight"
@@ -45,12 +47,60 @@ func cookieReq889(addr, path, sid string, upgrade bool) (string, error) {
 		b, _ := io.ReadAll(conn)
 		return string(b), nil
 	}
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	_, _ = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\nCookie: lang=en\r\nCookie: sid=%s\r\n\r\n", path, sid)
-	_, _ = conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00"))
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, bufio.NewReader(conn)) // until the deadline
-	return buf.String(), nil
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(status, "101") {
+		rest, _ := io.ReadAll(br)
+		return status + string(rest), nil // not upgraded: the plain HTTP/1.1 answer
+	}
+	for { // the rest of the 101 head
+		l, err := br.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		if l == "\r\n" {
+			break
+		}
+	}
+	_, _ = conn.Write([]byte(http2.ClientPreface))
+	fr := http2.NewFramer(conn, br)
+	if err := fr.WriteSettings(); err != nil {
+		return "", err
+	}
+	// Stream 1's response, to its END_STREAM.
+	var body bytes.Buffer
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			return body.String(), err
+		}
+		switch f := f.(type) {
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				_ = fr.WriteSettingsAck()
+			}
+		case *http2.HeadersFrame:
+			if f.StreamID == 1 && f.StreamEnded() {
+				return body.String(), nil
+			}
+		case *http2.DataFrame:
+			if f.StreamID == 1 {
+				body.Write(f.Data())
+				if f.StreamEnded() {
+					return body.String(), nil
+				}
+			}
+		case *http2.RSTStreamFrame:
+			return body.String(), fmt.Errorf("stream %d reset: %v", f.StreamID, f.ErrCode)
+		case *http2.GoAwayFrame:
+			return body.String(), fmt.Errorf("GOAWAY: %v", f.ErrCode)
+		}
+	}
 }
 
 func TestSeveralCookieLinesAreOneFieldOnEveryEngine889(t *testing.T) {

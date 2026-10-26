@@ -168,9 +168,12 @@ func WithBasicAuth(user, pass string) Option {
 	return WithHeader("authorization", "Basic "+encoded)
 }
 
-// WithCookie adds a cookie to the request. Name and value are joined as
-// "name=value" and concatenated with "; " between cookies, matching the
-// Cookie header wire format. This helper does not escape semicolons or
+// WithCookie adds a cookie to the request. A request built with several
+// cookie fields (WithCookie, and WithHeader("cookie", ...)) reaches the handler
+// as one field joined with "; ", as the engines deliver it, so Header("cookie")
+// returns them all. Name and value are joined as "name=value" and
+// concatenated with "; " between cookies, matching the Cookie header wire
+// format. This helper does not escape semicolons or
 // CR/LF inside value — tests should pass well-formed values only. If a
 // test needs to exercise the server's handling of malformed cookie
 // headers, set the raw "cookie" header via [WithHeader] instead.

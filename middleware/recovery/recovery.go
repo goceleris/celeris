@@ -16,7 +16,12 @@ import (
 )
 
 var (
-	// ErrPanic is the base sentinel for all recovery-caught panics.
+	// ErrPanic is the sentinel for a recovered panic whose value is not an
+	// error: ErrorHandler receives it wrapped (fmt.Errorf("%w: %v", ErrPanic,
+	// value)), so errors.Is(err, ErrPanic) holds. An error panic value is passed
+	// to ErrorHandler as it is and does not match ErrPanic; nor do
+	// ErrBrokenPipe, ErrPanicContextCancelled and ErrPanicResponseCommitted,
+	// which are separate sentinels.
 	ErrPanic = errors.New("recovery: panic")
 
 	// ErrPanicContextCancelled is returned when a panic occurs after

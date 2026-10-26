@@ -80,6 +80,21 @@ func TestH2CUpgradeHeadersJoinCookieLines889(t *testing.T) {
 	}
 }
 
+// The OnExpectContinue callback sees the cookie field as the handler will.
+func TestExpectHeadersJoinCookieLines889(t *testing.T) {
+	var req h1.Request
+	req.RawHeaders = [][2][]byte{
+		{[]byte("Host"), []byte("x")},
+		{[]byte("Cookie"), []byte("lang=en")},
+		{[]byte("Expect"), []byte("100-continue")},
+		{[]byte("Cookie"), []byte("sid=ALICE")},
+	}
+	got := expectHeaders(&req)
+	if c := cookieFields889(got); len(c) != 1 || c[0] != "lang=en; sid=ALICE" || len(got) != 3 {
+		t.Fatalf("expectHeaders = %q, want 3 fields with one cookie \"lang=en; sid=ALICE\"", got)
+	}
+}
+
 // BenchmarkMaterializeHeaders889 is Stream.MaterializeHeaders for a browser-like
 // request of ten headers (the cookie join is one string comparison per header)
 // with one Cookie line, and with the same cookies in two lines (the join).

@@ -542,6 +542,8 @@ type Config struct {
 	// The method, the path and the header strings are request strings, valid only
 	// during the call (on epoll and io_uring, views of the receive buffer; see the
 	// package doc): copy one with [strings.Clone] before anything keeps it.
+	// Several Cookie lines are one field joined with "; ", as the handler sees
+	// them.
 	//
 	// On the native engines the callback runs on the event-loop goroutine,
 	// except on a connection already promoted to async dispatch, where it runs
@@ -619,10 +621,10 @@ type Config struct {
 	// and no HEAD route runs the GET route (RFC 9110 §9.3.2: HEAD is GET
 	// without the content; the engine sends the headers and drops the body),
 	// and the path's Allow lists HEAD. When true, the router no longer
-	// answers HEAD with a GET route: only a route registered for HEAD
-	// answers a HEAD request, and any other is answered like a method the
-	// path does not support, 405 Method Not Allowed with an Allow header that
-	// does not list HEAD (or 404 if the path has no route), running the
+	// answers HEAD with a GET route: a HEAD request that no HEAD route (or
+	// middleware, below) answers is answered like a method the path does not
+	// support, 405 Method Not Allowed with an Allow header that does not list
+	// HEAD (or 404 if the path has no route), running the
 	// [Server.MethodNotAllowed] handler. What still answers HEAD: a route
 	// registered with [Server.HEAD] or [Server.Any] (which registers HEAD),
 	// and middleware that answers it itself (healthcheck, swagger, static,
@@ -637,9 +639,9 @@ type Config struct {
 	// and no OPTIONS route is answered 200 with an Allow header and
 	// Content-Length: 0 (RFC 9110 §9.3.7) after the global middleware
 	// ([Server.Use]) has run, and the path's Allow lists OPTIONS. When true,
-	// the router no longer answers it: only a route registered for OPTIONS
-	// (also through [Server.Any]) answers an OPTIONS request, and any other
-	// is answered like a method the path does not support (405 with an Allow
+	// the router no longer answers it: an OPTIONS request that no OPTIONS
+	// route (also through [Server.Any]) or middleware, below, answers is
+	// answered like a method the path does not support (405 with an Allow
 	// header that does not list OPTIONS, or 404 if the path has no route).
 	// The global middleware still runs for it, so a CORS middleware
 	// installed with [Server.Use] still answers its preflight, and so does

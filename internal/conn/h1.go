@@ -1254,15 +1254,19 @@ func safeExpectContinue(fn func(string, string, [][2]string) bool, method, path 
 
 // expectHeaders converts raw H1 headers to [][2]string for the OnExpectContinue
 // callback. Zero-copy strings are safe because the callback runs synchronously
-// on the event loop thread before the read buffer is reused.
+// on the event loop thread before the read buffer is reused. Several Cookie
+// lines are joined into one field, as the handler will see them
+// (stream.CookieJoiner, celeris#889).
 func expectHeaders(req *h1.Request) [][2]string {
 	if len(req.RawHeaders) == 0 {
 		return nil
 	}
-	hdrs := make([][2]string, len(req.RawHeaders))
-	for i, rh := range req.RawHeaders {
-		hdrs[i] = [2]string{h1.UnsafeLowerHeader(rh[0]), h1.UnsafeString(rh[1])}
+	hdrs := make([][2]string, 0, len(req.RawHeaders))
+	var cj stream.CookieJoiner
+	for _, rh := range req.RawHeaders {
+		hdrs = cj.Append(hdrs, h1.UnsafeLowerHeader(rh[0]), h1.UnsafeString(rh[1]))
 	}
+	cj.Finish(hdrs)
 	return hdrs
 }
 

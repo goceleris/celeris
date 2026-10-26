@@ -23,7 +23,8 @@
 // WARN level without a stack trace.
 //
 // The package exports sentinel errors for use with [errors.Is]:
-//   - [ErrPanic]: generic panic recovery.
+//   - [ErrPanic]: a recovered panic whose value is not an error (an error panic
+//     value is passed to [Config].ErrorHandler as it is).
 //   - [ErrBrokenPipe]: broken pipe or ECONNRESET.
 //   - [ErrPanicContextCancelled]: panic after request context was cancelled.
 //   - [ErrPanicResponseCommitted]: panic after response has been committed.

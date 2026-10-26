@@ -568,6 +568,9 @@ func TestErrorHandlerPassesAnErrorPanicThrough889(t *testing.T) {
 	if !errors.Is(got, sentinel) {
 		t.Fatalf("handler got %v, want an error that errors.Is the panic value", got)
 	}
+	if errors.Is(got, ErrPanic) {
+		t.Errorf("errors.Is(%v, ErrPanic) = true: an error panic value is passed as it is and does not match ErrPanic", got)
+	}
 	if got.Error() != "wrapped: sentinel" {
 		t.Errorf("handler got the text %q, want the error panic value as it is (\"wrapped: sentinel\")", got.Error())
 	}
