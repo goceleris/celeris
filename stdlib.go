@@ -33,9 +33,10 @@ func ToHandler(h HandlerFunc) http.Handler {
 		defer s.Release()
 		// c.Context() ends with r.Context(): the client leaving, a stream
 		// the client reset, an http.TimeoutHandler above this handler, or a
-		// Server.Close that closes the connection (celeris#949). Deferred
-		// after Release, so it runs before it.
-		defer std.BindStreamCancel(r.Context(), s)()
+		// Server.Close that closes the connection (celeris#949). The binding
+		// is made when the handler first asks for c.Context(), and Release
+		// ends it (celeris#889).
+		s.BindParentContext(r.Context())
 
 		scheme := "http"
 		if r.TLS != nil {
