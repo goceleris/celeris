@@ -7413,6 +7413,13 @@ func (w *Worker) sweepWatchDue() bool {
 		time.Now().UnixNano()-w.lastSweep >= int64(time.Second)
 }
 
+// testHookCheckTimeouts, when set, runs at the start of every checkTimeouts
+// sweep on the worker's own thread, with the worker. The cadence tests count
+// sweeps through it (celeris#884 items 65 and 75). An atomic pointer, not a
+// plain variable: a test sets it while workers of an earlier engine of the
+// package may still be winding down. A load and a nil test per sweep.
+var testHookCheckTimeouts atomic.Pointer[func(*Worker)]
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. The loop calls it every 32 iterations when
 // ReadHeaderTimeout > 0 or a conn is detached, every 1024 otherwise; an idle
@@ -7433,6 +7440,9 @@ func (w *Worker) sweepWatchDue() bool {
 func (w *Worker) checkTimeouts() {
 	now := time.Now().UnixNano()
 	w.lastSweep = now
+	if h := testHookCheckTimeouts.Load(); h != nil {
+		(*h)(w)
+	}
 	// sendOut: a conn has a SEND (or a SEND_ZC notification) outstanding, so
 	// the watch (sendWatch, set by the dirty pass's give-up) stays on.
 	// remN: the number of conns with a partial send's remainder, or a long
