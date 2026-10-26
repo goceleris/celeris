@@ -1,0 +1,41 @@
+# TEMPORARY (celeris#890 item 7, lane L18). A hosted twin of codspeed.yml's
+# trigger, concurrency group and job condition, with the label `spike` in place
+# of `performance` and no draft clause, so that the label gate can be shown on
+# GitHub without a macro-runner minute. Deleted before the pull request is
+# marked ready.
+name: L18 gate proof
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    paths:
+      - ".github/workflows/l18-gate-proof.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: l18proof-${{ (github.event.action == 'labeled' && github.event.label.name != 'spike' && github.run_id) || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  benchmarks:
+    name: Gate twin
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'spike') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'spike'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hold the slot
+        env:
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "twin ran: action=$ACTION label=$LABEL head=$SHA"
+          sleep 90
+          echo "twin finished"
