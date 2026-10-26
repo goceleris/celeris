@@ -21,8 +21,11 @@ var asyncFeedHook atomic.Pointer[func(w *Worker, cs *connState, hdrDL int64)]
 
 // h2cUpgradeHook is a test seam (celeris#884 item 83): nil in production, it
 // runs in switchToH2Local, holding cs.detachMu, immediately before the upgrade
-// sets cs.h1State to nil. The dispatch goroutine runs it for an upgrade that
-// came through the async path. A test holds the goroutine here, so that its
+// sets cs.h1State to nil. switchToH2Local is reached from the dispatch
+// goroutine (an upgrade that came through the async path) and from the
+// worker's own inline upgrade (switchToH2): a hook that blocks parks whichever
+// thread runs it, the worker included, so one that waits must be armed only
+// where the upgrade is the goroutine's. A test holds the goroutine here, so that its
 // write of cs.h1State is the next thing it does, and releases it once the
 // worker's feed has run: a worker read of cs.h1State after that feed is then
 // concurrent with the write in the race detector's sense, whatever the

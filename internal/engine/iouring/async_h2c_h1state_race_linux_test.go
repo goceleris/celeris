@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -47,10 +48,25 @@ func (asyncEveryRouteHandler) HasAsyncRoutes() bool        { return true }
 
 func startAsyncH2CEngine722(t *testing.T) (*Engine, string) {
 	t.Helper()
-	return startFDLEngine(t, asyncEveryRouteHandler{}, func(c *resource.Config) {
-		c.AsyncHandlers = true
-		c.EnableH2Upgrade = true
+	// With the ring-ENOMEM retry of the other tests of this package: the
+	// 8 MiB memlock of the CI step is shared by every ring of the uid, and a
+	// start that lands while another holds the budget fails without it.
+	addr := freeAddr639(t)
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		return New(resource.Config{
+			Addr: addr, Protocol: engine.HTTP1, AsyncHandlers: true, EnableH2Upgrade: true,
+			Resources: resource.Resources{Workers: 2},
+		}, asyncEveryRouteHandler{})
 	})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("engine did not stop within 5s")
+		}
+	})
+	return e, addr
 }
 
 // asyncDispatchParked722 counts the goroutines parked in a dispatch goroutine's
@@ -164,10 +180,12 @@ func TestAsyncH2CUpgradeOnPromotionLeavesH1StateToTheGoroutine(t *testing.T) {
 // before its write of cs.h1State (h2cUpgradeHook), until the worker's feed has
 // run (asyncFeedHook, which sits where the celeris#722 read was): a read of
 // cs.h1State on the worker after that point, with no lock, is then always
-// unordered with the write, which the race detector reports on every run, where
-// it reported the pre-celeris#722 form in 1 of 20 runs when the goroutine was
-// left to the scheduler. The release is the worker's hook, which is called
-// before that read position, so the wait gives the read no happens-before
+// unordered with the write: the race detector reported the restored pre-celeris#722
+// form in each of 100 separate -race processes (it reports a race once per
+// process, so a -count loop in one process shows one), where the goroutine left
+// to the scheduler reported it in 1 of 20 runs. The release is the worker's
+// hook, which is called before that read position, so the wait gives the read no
+// happens-before
 // edge to the write. The feed hook also counts the feeds, and the test
 // asserts the second recv took one: the connection's responses do not show
 // it, as the inline path serves the same bytes and finishes the same upgrade.

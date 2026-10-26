@@ -16,7 +16,13 @@ import (
 // that branch is gone because of this invariant. The cases are the ways an
 // inline ProcessH1 reaches an async route, each with a deadline armed the way
 // the engine arms one (accept, and a keep-alive request's first bytes), so a
-// change that moves either clear past its return fails here.
+// change that moves either clear past its return fails here: dropping the
+// fresh-parse site's clear fails the fresh-head, sync-then-async and
+// after-a-direct-body cases, dropping the buffered-path site's fails the
+// keep-alive and after-a-chunked cases (the PR has the table). The clear that
+// completes a partial body, above both, is not on the list: what follows it is
+// parsed at one of the two sites, which clear on their own, and dropping it
+// fails nothing here.
 func TestInlineAsyncDispatchLeavesNoHeaderDeadline884(t *testing.T) {
 	const (
 		syncReq  = "GET /s HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -71,9 +77,15 @@ func TestInlineAsyncDispatchLeavesNoHeaderDeadline884(t *testing.T) {
 		wantBail(t, s, process(s, "Host: x\r\n\r\n"))
 	})
 	t.Run("after-a-chunked-request", func(t *testing.T) {
+		// The chunked body spans two reads, so what follows its terminator
+		// starts the next request's head with a deadline armed (the in-progress
+		// chunked branch arms it), and the async check of the buffered path
+		// (celeris#889) is the one that returns.
 		s := newState()
-		chunked := "POST /s HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
-		wantBail(t, s, process(s, chunked+asyncReq))
+		if err := process(s, "POST /s HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n"); err != nil {
+			t.Fatalf("apparatus: %v", err)
+		}
+		wantBail(t, s, process(s, "0\r\n\r\n"+asyncReq))
 	})
 	t.Run("after-a-direct-body", func(t *testing.T) {
 		// The io_uring direct-body tail: the body's last bytes are received
