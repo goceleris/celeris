@@ -280,7 +280,45 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 		c.bufferDepth = 1
 		_ = c.FlushResponse()
 	}
+	// A handler that returned without answering is answered with an empty 200,
+	// as net/http does and as the unmatched paths below do, including one that
+	// took a StreamWriter and never used it (celeris#889). The native HTTP/1
+	// engines would otherwise send nothing, and the next response on the
+	// connection would be read as this request's. Only their writer asks for it
+	// (the std engine's net/http answers by itself, HTTP/2's processor answers a
+	// stream that sent no headers). A detached or hijacked request answers for
+	// itself (hijack marks the response written).
+	if !c.detached && s.ResponseWriter != nil && (!c.written || c.reclaimUnusedStreamWriter()) {
+		if _, ok := s.ResponseWriter.(interface{ NeedsEmptyAnswer() }); ok {
+			c.statusCode = 200
+			_ = s.ResponseWriter.WriteResponse(s, 200, emptyAnswerHeaders(c, s.Method == "HEAD"), nil)
+			c.written = true
+		}
+	}
 	return nil
+}
+
+// emptyAnswerHeaders is the header list of an empty answer given for a handler
+// that sent none: the headers it set, and a content-length that agrees with
+// the empty body: 0. A content-length of its own is dropped, as two differing
+// ones are a framing error (RFC 9112 section 6.3); a HEAD keeps the size its
+// handler declared for a GET (RFC 9110 section 9.3.2), with no second one.
+func emptyAnswerHeaders(c *Context, head bool) [][2]string {
+	hdrs := make([][2]string, 0, len(c.respHeaders)+1)
+	declared := false
+	for _, h := range c.respHeaders {
+		if strings.EqualFold(h[0], "content-length") {
+			if !head || declared {
+				continue
+			}
+			declared = true
+		}
+		hdrs = append(hdrs, h)
+	}
+	if !declared {
+		hdrs = append(hdrs, [2]string{"content-length", "0"})
+	}
+	return hdrs
 }
 
 // adaptivePromoteThreshold is the inline handler duration that counts as a
@@ -474,7 +512,24 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 		// No 500 can follow a response that is under way: tell the HTTP/2
 		// processor that a streamed one is broken off, so it resets the stream
 		// instead of ending it at the handler's return (celeris#889).
-		s.FailResponse()
+		failResponse(c, s)
+	}
+}
+
+// failResponse tells the engine that a streamed response under way was broken
+// off by its handler, with the failure swallowed here: on HTTP/2 the processor
+// resets the stream (Stream.FailResponse), on HTTP/1 the native engines close
+// the connection without the last chunk (the writer's FailResponse). Neither
+// may end the response as if it were whole: a truncated body must not look
+// complete. A detached request's writer belongs to its goroutine and is not
+// touched.
+func failResponse(c *Context, s *stream.Stream) {
+	s.FailResponse()
+	if c.detached {
+		return
+	}
+	if f, ok := s.ResponseWriter.(interface{ FailResponse() }); ok {
+		f.FailResponse()
 	}
 }
 
@@ -567,11 +622,8 @@ func (a *routerAdapter) answerOptions(c *Context, s *stream.Stream, allowVal str
 	}
 	if !c.written && !c.detached && s.ResponseWriter != nil {
 		// A middleware returned without writing and without calling Next.
-		hdrs := make([][2]string, 0, len(c.respHeaders)+1)
-		hdrs = append(hdrs, c.respHeaders...)
-		hdrs = append(hdrs, [2]string{"content-length", "0"})
 		c.statusCode = 200
-		_ = s.ResponseWriter.WriteResponse(s, 200, hdrs, nil)
+		_ = s.ResponseWriter.WriteResponse(s, 200, emptyAnswerHeaders(c, false), nil)
 		c.written = true
 	}
 }
@@ -589,7 +641,7 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 		// streamed one that ends here would be taken for whole by the HTTP/2
 		// processor, which ends a response its handler did not close
 		// (celeris#889): tell it the response is broken off.
-		s.FailResponse()
+		failResponse(c, s)
 		return
 	}
 	if a.errorHandler != nil {
