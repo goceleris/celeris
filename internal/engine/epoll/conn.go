@@ -366,6 +366,17 @@ type connState struct {
 	// straight to the dispatch goroutine instead of retrying the inline
 	// fast path. Reset on release.
 	asyncPromoted bool
+	// h2Switched is set by switchToH2Local, under asyncInMu, after it has
+	// written cs.h1State, cs.h2State and cs.protocol, and is what the loop
+	// thread reads of them for a promoted conn (drainRead's async gate, under
+	// the same lock): a true read orders every later read of the three after
+	// those writes, which the dispatch goroutine makes holding cs.detachMu and
+	// the loop thread does not take. A conn that is not switched is HTTP/1 by
+	// construction (a promoted conn started as one), so the gate never reads
+	// cs.protocol while the goroutine may be writing it (celeris#885 item 28).
+	// Declared beside asyncPromoted, in the byte of padding before the atomic
+	// that follows (TestConnStateStaysInItsSizeClass). Reset on release.
+	h2Switched bool
 	// asyncH2Promoted signals that runAsyncHandler observed ErrUpgradeH2C
 	// and completed the cs-local H1→H2 swap under detachMu. The worker
 	// must finish the promotion in drainDetachQueue (append fd to
@@ -512,6 +523,7 @@ func releaseConnState(cs *connState) {
 	cs.dirtyNext = nil
 	cs.dirtyPrev = nil
 	cs.protocol = 0
+	cs.h2Switched = false
 	cs.detected = false
 	cs.detectN = 0
 	cs.detectDeadline = 0

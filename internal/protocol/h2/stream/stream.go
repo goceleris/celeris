@@ -75,15 +75,20 @@ type Stream struct {
 	// can read affinity without a per-request ctx.Value() walk.
 	WorkerID    int32
 	WorkerIDSet bool
+	// The one-byte flags below sit with WorkerIDSet, in the four bytes that
+	// follow WorkerID: spread among the wider fields they cost 16 bytes of
+	// padding, which BindParentContext's field (celeris#889) needs, in a
+	// Stream that is exactly 1024 bytes, the edge of its malloc size class.
+	lazyHeadersBuilt   bool
+	pseudoMaterialized bool
+	CachedRouteAsync   bool // resolved per-route async dispatch flag (cached with the chain)
 	// LazyRawHeaders, when non-nil on an H1 stream, holds raw request
 	// header bytes that have NOT been appended to Headers yet — the H1
 	// dispatch sets only the 4 pseudo-headers eagerly and defers the raw
 	// header lowercase + slice append until a handler actually reads them
 	// via Context.Header / Context.RequestHeaders. Materialized once per
 	// request via MaterializeHeaders. Cleared on stream reset.
-	LazyRawHeaders     [][2][]byte
-	lazyHeadersBuilt   bool
-	pseudoMaterialized bool
+	LazyRawHeaders [][2][]byte
 	// H1 dispatch sets these directly so extractRequestInfo / Host()
 	// don't need to walk Headers[0..3]. Empty for H2 streams (where
 	// pseudo-headers come from HPACK and live in s.Headers as before).
@@ -102,7 +107,6 @@ type Stream struct {
 	CachedRoutePath     string
 	CachedRouteHandlers any // []celeris.HandlerFunc — typed any to avoid cycle
 	CachedRouteFullPath string
-	CachedRouteAsync    bool // resolved per-route async dispatch flag (cached with the chain)
 	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
 	// recv that produced this request. populated by populateCachedStream
 	// from the engine's worker-local clock cache so HandleStream avoids a
@@ -156,6 +160,7 @@ type Stream struct {
 	protoMajor             uint8 // 0=infer from h1Mode, 1=HTTP/1.1, 2=HTTP/2
 	flags                  atomic.Uint32
 	ctx                    atomic.Pointer[streamCtx] // this use's context, made on first ask (celeris#836)
+	parent                 context.Context           // what this use's context ends with, bound when it is made (BindParentContext, celeris#889); unlocked, see there
 	phase                  Phase
 	CachedCtx              any                     // per-connection cached context (avoids pool Get/Put per request)
 	OnDetach               func()                  // called by Context.Detach to install write-thread safety
@@ -193,6 +198,10 @@ type Stream struct {
 type streamCtx struct {
 	state atomic.Uint32 // ctxCancelled | ctxDoneClosed
 	done  atomic.Value  // chan struct{}, set by the first Done: a new channel, or closedChan once cancelled
+	// stop removes the registration with the parent context this one was
+	// bound to (BindParentContext); nil if it has none. Written before the
+	// context is published, read only after it is taken from the stream.
+	stop func() bool
 }
 
 const (
@@ -339,6 +348,53 @@ func (s *Stream) Context() context.Context {
 	return s.useCtx()
 }
 
+// BindParentContext makes this use's context end when parent does, from the
+// moment something asks for the context (Context): a client that resets an
+// HTTP/2 stream or goes away cancels the request context of net/http and of
+// the HTTP/2 server behind the std engine's h2c front end, and a handler that
+// waits on c.Context() is told (celeris#949). Nothing is registered with
+// parent until then, so a request whose handler never asks pays for no
+// binding (celeris#889): one stored interface value, and no allocation.
+//
+// It cancels the context of this use, not the stream: a cancel that races the
+// end of the use can reach only a context nobody can ask for any more, never
+// the stream's next use. The registration is removed when the use ends (every
+// reset that ends one, endCtx), and parent is dropped then. The field is an
+// unlocked two-word interface: written before the handler runs, read by
+// Context during it, cleared by endCtx. A race on it is reachable only through
+// misuse, a goroutine that calls Context after its request ended, which already
+// races h1Mode and the other fields the reset writes; Context.Detach caches the
+// context during the handler, and on the native engines parent is always nil.
+// A parent that cannot
+// end (context.Background) binds nothing; one that has ended makes the context
+// cancelled when it is made, without a goroutine. The stream's
+// cancelled flag (IsCancelled) is not set by the parent: the readers of it
+// belong to the native engines' write path, and the std engine's writers do
+// not read it.
+//
+// Call it before the handler runs, on an HTTP/2 stream: an HTTP/1 stream's
+// context is context.Background() whatever is cancelled.
+func (s *Stream) BindParentContext(parent context.Context) {
+	if s.h1Mode {
+		return
+	}
+	s.parent = parent
+}
+
+// bindTo binds c, a context no one has seen yet, to the parent if there is
+// one.
+func (s *Stream) bindTo(c *streamCtx) {
+	p := s.parent
+	if p == nil || p.Done() == nil {
+		return
+	}
+	if p.Err() != nil {
+		c.cancel()
+		return
+	}
+	c.stop = context.AfterFunc(p, c.cancel)
+}
+
 // useCtx returns this use's context, making it on the first call.
 func (s *Stream) useCtx() *streamCtx {
 	for {
@@ -346,6 +402,9 @@ func (s *Stream) useCtx() *streamCtx {
 			return c
 		}
 		c := new(streamCtx)
+		if s.parent != nil {
+			s.bindTo(c)
+		}
 		if s.ctx.CompareAndSwap(nil, c) {
 			// Cancel sets flagCancelled before it looks for the context,
 			// and this looks at the flag after publishing the context, so
@@ -354,6 +413,11 @@ func (s *Stream) useCtx() *streamCtx {
 				c.cancel()
 			}
 			return c
+		}
+		// Another caller published its context first: drop this one's
+		// registration and use theirs.
+		if c.stop != nil {
+			c.stop()
 		}
 	}
 }
@@ -373,11 +437,18 @@ func (s *Stream) Cancel() {
 // detached, so the stream's next use gets a new one (celeris#836). Called by
 // every reset that ends a use.
 func (s *Stream) endCtx() {
+	if s.parent != nil {
+		s.parent = nil
+	}
 	if s.ctx.Load() == nil {
 		return
 	}
 	if c := s.ctx.Swap(nil); c != nil {
 		c.cancel()
+		if c.stop != nil {
+			// A false answer means the cancel has started; it reaches c alone.
+			c.stop()
+		}
 	}
 }
 
