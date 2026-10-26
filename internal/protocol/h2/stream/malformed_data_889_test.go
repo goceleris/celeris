@@ -136,7 +136,7 @@ func TestHEADERSOnAResetStreamAreCounted889(t *testing.T) {
 	var err error
 	n := 0
 	for ; err == nil && n < 1000; n++ {
-		err = feed944(t, x, "raw", 1, true, encodeHeaders(t, [][2]string{{"x-t", "v"}}))
+		err = feed944(t, x, "raw", 1, false, encodeHeaders(t, [][2]string{{"x-t", "v"}}))
 	}
 	if err == nil || n <= 50 || n > 200 {
 		t.Fatalf("after %d HEADERS on a reset stream in a second: err %v, want the connection to end after about 100", n, err)
@@ -178,4 +178,30 @@ func (e *hpackEncoder889) block(t *testing.T, hs [][2]string) []byte {
 		}
 	}
 	return append([]byte(nil), e.buf.Bytes()...)
+}
+
+// The trailers end the stream: a HEADERS frame after them is a connection error.
+// And a stream refused for MAX_CONCURRENT_STREAMS or a header list, or one that
+// ended with its HEADERS, is not one whose trailers are ignored.
+func TestOnlyTheTrailersOfAnOpenResetStreamAreIgnored889(t *testing.T) {
+	x, _ := newClocked889()
+	bad := append(reqHeaders944(), [2]string{"x-bad", "a\x00b"})
+	if err := feed944(t, x, "raw", 1, false, encodeHeaders(t, bad)); err != nil {
+		t.Fatal(err)
+	}
+	if err := feed944(t, x, "raw", 1, true, encodeHeaders(t, [][2]string{{"x-t", "v"}})); err != nil {
+		t.Fatalf("the trailers: %v", err)
+	}
+	if err := feed944(t, x, "raw", 1, true, encodeHeaders(t, [][2]string{{"x-t", "v"}})); err == nil {
+		t.Fatal("a HEADERS frame after the trailers was ignored")
+	}
+
+	y, _ := newClocked889()
+	bad2 := append(reqHeaders944(), [2]string{"x-bad", "a\x00b"})
+	if err := feed944(t, y, "raw", 1, true, encodeHeaders(t, bad2)); err != nil { // ended with its HEADERS
+		t.Fatal(err)
+	}
+	if err := feed944(t, y, "raw", 1, true, encodeHeaders(t, [][2]string{{"x-t", "v"}})); err == nil {
+		t.Fatal("HEADERS on a stream that ended with its HEADERS was ignored")
+	}
 }
