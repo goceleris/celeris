@@ -1178,7 +1178,7 @@ func tryUpgradeH2C(state *H1State, body, remaining []byte, write func([]byte)) e
 	if !state.EnableH2Upgrade || !state.req.UpgradeH2C {
 		return nil
 	}
-	settings, err := DecodeHTTP2Settings(state.req.HTTP2Settings)
+	settings, err := h1.DecodeHTTP2Settings(state.req.HTTP2Settings)
 	if err != nil {
 		// Malformed settings: silently fall through to normal H1 handling.
 		// This matches the spec's tolerance requirement and avoids a 400

@@ -605,13 +605,16 @@ func TestParseRequest_H2CUpgrade(t *testing.T) {
 			wantUpgrade: false,
 		},
 		{
+			// RFC 7540 3.2.1: the value is a SETTINGS payload, which may have
+			// no entries; an empty value is that, one header, and upgrades
+			// (celeris#889 item 43). Native engines used to serve it as HTTP/1.1.
 			name: "empty HTTP2-Settings value",
 			raw: "GET / HTTP/1.1\r\n" +
 				"Host: example.com\r\n" +
 				"Connection: Upgrade, HTTP2-Settings\r\n" +
 				"Upgrade: h2c\r\n" +
 				"HTTP2-Settings: \r\n\r\n",
-			wantUpgrade: false,
+			wantUpgrade: true,
 		},
 		{
 			name: "no upgrade headers",

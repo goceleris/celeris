@@ -257,10 +257,8 @@ func TestH2CUpgradeWithBody(t *testing.T) {
 }
 
 func TestH2CUpgradeInvalidSettings(t *testing.T) {
+	// Every engine, std included (it answered 500; celeris#889).
 	for _, se := range specEngines {
-		if se.name == "std" {
-			continue
-		}
 		t.Run(se.name, func(t *testing.T) {
 			addr := startSpecEngineWithConfig(t, se, func(c *resource.Config) {
 				c.Protocol = engine.Auto

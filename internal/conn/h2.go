@@ -699,7 +699,7 @@ func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]by
 
 	// Apply client's settings from the HTTP2-Settings header. Settings
 	// payload is a sequence of {u16 id, u32 val} pairs (already validated
-	// by DecodeHTTP2Settings to be a multiple of 6 bytes).
+	// by h1.DecodeHTTP2Settings to be a multiple of 6 bytes).
 	mgr := state.processor.GetManager()
 	for i := 0; i+6 <= len(info.Settings); i += 6 {
 		id := uint16(info.Settings[i])<<8 | uint16(info.Settings[i+1])

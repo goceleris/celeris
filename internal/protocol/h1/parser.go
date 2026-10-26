@@ -42,7 +42,8 @@ type Parser struct {
 	// h2c upgrade detection (RFC 7540 §3.2). Reset per request in ParseRequest.
 	upgradeH2CSeen             bool
 	upgradeH2CDisqualified     bool // latches true when any Upgrade header is non-h2c or multi-token
-	http2SettingsSeen          bool
+	http2SettingsSeen          bool // one or more HTTP2-Settings header lines (the value may be empty)
+	http2SettingsRepeated      bool // a second HTTP2-Settings line: RFC 7540 section 3.2.1 forbids the upgrade
 	connectionHasUpgradeToken  bool
 	connectionHasSettingsToken bool
 }
@@ -112,6 +113,7 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 	p.upgradeH2CSeen = false
 	p.upgradeH2CDisqualified = false
 	p.http2SettingsSeen = false
+	p.http2SettingsRepeated = false
 	p.connectionHasUpgradeToken = false
 	p.connectionHasSettingsToken = false
 
@@ -128,8 +130,10 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 	}
 
 	// RFC 7540 §3.2: valid h2c upgrade requires all three signals.
-	// Single-token Upgrade disambiguates from WebSocket path.
-	if p.upgradeH2CSeen && p.http2SettingsSeen &&
+	// Single-token Upgrade disambiguates from WebSocket path. §3.2.1: and
+	// exactly one HTTP2-Settings header field (a missing or a repeated one:
+	// the server MUST NOT upgrade).
+	if p.upgradeH2CSeen && p.http2SettingsSeen && !p.http2SettingsRepeated &&
 		p.connectionHasUpgradeToken && p.connectionHasSettingsToken {
 		req.UpgradeH2C = true
 	}
@@ -176,7 +180,25 @@ func (p *Parser) parseRequestLine(req *Request) (bool, error) {
 	pathBytes := rest[:sp2]
 	versionBytes := rest[sp2+1:]
 
-	req.Method = internMethod(methodBytes)
+	// RFC 9112 section 3: a request line that is not "method SP target SP
+	// version" is invalid (400). The method is a token (RFC 9110 section
+	// 5.6.2; an empty or a non-token one, such as "\nGET", is not), and the
+	// target is not empty and holds no control byte (NUL, CR and LF survive the CRLF split of
+	// the line, and a recipient that takes them in lets a request through
+	// that a front end read differently). Neither was checked: the method was
+	// everything up to the first space, the target everything up to the next
+	// (celeris#889).
+	method := internMethod(methodBytes)
+	if method == "" {
+		if !isToken(methodBytes) {
+			return false, ErrInvalidRequestLine
+		}
+		method = UnsafeString(methodBytes)
+	}
+	if len(pathBytes) == 0 || !isValidRequestTarget(pathBytes) {
+		return false, ErrInvalidRequestLine
+	}
+	req.Method = method
 	req.Path = internPath(pathBytes)
 	req.Version = internVersion(versionBytes)
 
@@ -452,7 +474,11 @@ func (p *Parser) ConsumeBody(n int) {
 //     coexisting (e.g. "websocket, h2c" or "h2c, foo") disables h2c upgrade.
 //     This is a security invariant: it prevents ambiguity with other
 //     upgrade protocols (notably WebSocket).
-//   - HTTP2-Settings value is non-empty (further validation deferred to decode).
+//   - There is exactly one HTTP2-Settings header line (RFC 7540 §3.2.1: a
+//     server MUST NOT upgrade when it is absent or repeated). Its value may
+//     be empty, which is a SETTINGS payload with no entries; whether the
+//     value decodes is checked later (DecodeHTTP2Settings), and a request
+//     whose value does not is served as HTTP/1.1.
 //   - Connection must list BOTH "upgrade" and "http2-settings" as comma-
 //     separated tokens (case-insensitive).
 func (p *Parser) detectH2CHeader(req *Request, rawName, rawValue []byte) {
@@ -483,11 +509,12 @@ func (p *Parser) detectH2CHeader(req *Request, rawName, rawValue []byte) {
 		}
 	case 'h':
 		if asciiEqualFold(rawName, "HTTP2-Settings") {
-			trimmed := trimSpace(rawValue)
-			if len(trimmed) > 0 {
-				p.http2SettingsSeen = true
-				req.HTTP2Settings = string(trimmed)
+			if p.http2SettingsSeen {
+				p.http2SettingsRepeated = true
+				return
 			}
+			p.http2SettingsSeen = true
+			req.HTTP2Settings = string(trimSpace(rawValue))
 		}
 	case 'c':
 		if asciiEqualFold(rawName, "Connection") {
