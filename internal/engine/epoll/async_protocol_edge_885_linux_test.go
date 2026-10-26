@@ -6,9 +6,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +36,7 @@ import (
 type edge885Handler struct {
 	started chan struct{}
 	release chan struct{}
+	eng     atomic.Pointer[Engine]
 }
 
 func (h *edge885Handler) HandleStream(_ context.Context, s *stream.Stream) error {
@@ -41,6 +45,14 @@ func (h *edge885Handler) HandleStream(_ context.Context, s *stream.Stream) error
 		if hd[0] == ":path" {
 			path = hd[1]
 		}
+	}
+	if path == "/arm" {
+		// Runs inline on the loop thread of the conn it came on: the pool wait's
+		// gate (poolWaitGate) sets refuseRecv there, and so does this.
+		h.eng.Load().loops[s.WorkerID].refuseRecv = true
+	}
+	if path == "/who" {
+		path = strconv.Itoa(int(s.WorkerID))
 	}
 	if path == "/hold" {
 		select {
@@ -62,13 +74,62 @@ func (*edge885Handler) RouteAsync(_, path string) bool { return path == "/a" }
 func (*edge885Handler) HasAsyncRoutes() bool           { return true }
 
 func TestAsyncGateProtocolReadHasAnEdgeWithTheUpgradeSwitch885(t *testing.T) {
+	runEdge885(t, false)
+}
+
+// TestRefusesRecvReadsProtocolInOrderWithTheUpgradeSwitch885 is the same
+// scenario with the pool wait's gate up (refuseRecv): drainRead then asks
+// refusesRecv about the conn before anything else, and refusesRecv read
+// cs.protocol, which the dispatch goroutine writes in the switch. The flag is
+// set by a request on a second conn of the same loop, handled inline on the
+// loop thread.
+func TestRefusesRecvReadsProtocolInOrderWithTheUpgradeSwitch885(t *testing.T) {
+	runEdge885(t, true)
+}
+
+func runEdge885(t *testing.T, gate bool) {
 	h := &edge885Handler{started: make(chan struct{}, 1), release: make(chan struct{})}
-	_, addr := startE2E885(t, true, h, func(c *resource.Config) { c.EnableH2Upgrade = true })
+	e, addr := startE2E885(t, true, h, func(c *resource.Config) { c.EnableH2Upgrade = true })
+	h.eng.Store(e)
 	c, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer func() { _ = c.Close() }()
+	br := bufio.NewReader(c)
+
+	var other net.Conn
+	if gate {
+		who := func(c net.Conn, br *bufio.Reader, path string) string {
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			if _, err := c.Write([]byte("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+				t.Fatalf("write %s: %v", path, err)
+			}
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			return string(b)
+		}
+		w := who(c, br, "/who")
+		for i := 0; i < 64 && other == nil; i++ {
+			oc, err := net.DialTimeout("tcp", addr, 3*time.Second)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			if who(oc, bufio.NewReader(oc), "/who") == w {
+				other = oc
+			} else {
+				_ = oc.Close()
+			}
+		}
+		if other == nil {
+			t.Fatal("no second conn on the first conn's loop in 64 dials")
+		}
+		defer func() { _ = other.Close() }()
+	}
 
 	var hb bytes.Buffer
 	enc := hpack.NewEncoder(&hb)
@@ -90,6 +151,18 @@ func TestAsyncGateProtocolReadHasAnEdgeWithTheUpgradeSwitch885(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the goroutine never reached the HTTP/2 stream's handler after the switch")
 	}
+	if gate {
+		// The gate goes up on the loop: this request runs inline on its thread.
+		_ = other.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := other.Write([]byte("GET /arm HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatalf("write /arm: %v", err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(other), nil)
+		if err != nil {
+			t.Fatalf("read /arm: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
 	// The goroutine is inside the switch, the protocol written. The client
 	// sends a PING: the loop reads it and reads cs.protocol.
 	var ping bytes.Buffer
@@ -101,7 +174,6 @@ func TestAsyncGateProtocolReadHasAnEdgeWithTheUpgradeSwitch885(t *testing.T) {
 	close(h.release)
 
 	// The conn goes on: the response to /a and the 101 arrive.
-	br := bufio.NewReader(c)
 	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var got strings.Builder
 	for {

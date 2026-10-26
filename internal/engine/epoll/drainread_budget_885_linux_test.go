@@ -340,3 +340,47 @@ func TestDrainReadBudgetEndToEnd885(t *testing.T) {
 		})
 	}
 }
+
+// TestRunLoopHandlesAHalfCloseAfterAYieldedTurn885: the run loop skips the
+// half-close, error and transplant steps of an event whose turn yielded
+// (Loop.readYielded), and clears the flag before every drainRead. Without the
+// clear, the first yield on a loop would leave the flag set for good: every
+// later read event on it would skip its steps, and an edge-triggered EPOLLRDHUP
+// is not reported again. Two conns on one loop: A floods and yields (the budget
+// is 16 KiB, the burst 256 KiB); then B sends a request and its FIN, and the
+// server must end B.
+func TestRunLoopHandlesAHalfCloseAfterAYieldedTurn885(t *testing.T) {
+	withBudget885(t, 16<<10) // before the engine starts: the loops read it
+	e := startFloodEngine885(t, 0)
+	a, b, _ := threeConns885(t, e)
+
+	const req = "GET /flood HTTP/1.1\r\nHost: x\r\n\r\n"
+	n := (256 << 10) / len(req)
+	go func() { _, _ = io.Copy(a.c, strings.NewReader(strings.Repeat(req, n))) }()
+	for i := 0; i < n; i++ {
+		_ = a.c.SetReadDeadline(time.Now().Add(10 * time.Second))
+		resp, err := http.ReadResponse(a.br, nil)
+		if err != nil {
+			t.Fatalf("flood response %d of %d: %v", i, n, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	_ = b.c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := b.c.Write([]byte(req)); err != nil {
+		t.Fatalf("write B: %v", err)
+	}
+	if err := b.c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+	resp, err := http.ReadResponse(b.br, nil)
+	if err != nil {
+		t.Fatalf("B's response: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if _, err := b.br.ReadByte(); err != io.EOF {
+		t.Fatalf("B sent its FIN after a yielded turn on its loop and the server did not end it (read: %v): the half-close was skipped", err)
+	}
+}
