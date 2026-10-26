@@ -3,9 +3,12 @@
 package iouring
 
 import (
+	"runtime"
 	"testing"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // celeris#884 items 65, 74 and 75 at the unit level: the sweep's gate (sweepDue)
@@ -92,4 +95,87 @@ func TestArmSweepTickPlacesOneStandingTimer884(t *testing.T) {
 		t.Error("celeris884: a timer that was not placed is recorded as outstanding")
 	}
 	_ = takeSQEs(w.ring)
+}
+
+// TestSweepTickAnswerOtherThanETIMEDoesNotForceSweeps884: a timer that the
+// kernel completes with anything but -ETIME (-EINVAL on a kernel or tier that
+// refuses the SQE, -ECANCELED, -ENOMEM) did not run for its second, so it is
+// no reason to sweep, and arming another would end every mode-3a wait at once
+// and make a full sweep, past the floor, after every request. The worker must
+// stop arming it, so the loop takes the timed wait.
+func TestSweepTickAnswerOtherThanETIMEDoesNotForceSweeps884(t *testing.T) {
+	for _, res := range []int32{-int32(unix.EINVAL), -int32(unix.ECANCELED), -int32(unix.ENOMEM), 0} {
+		f := newFDLFixture(t, false)
+		w := f.w
+		_ = takeSQEs(w.ring)
+		if !w.armSweepTick() {
+			t.Fatal("celeris884: armSweepTick reported no timer with an empty SQ ring")
+		}
+		_ = takeSQEs(w.ring)
+		f.process(&completionEntry{UserData: encodeUserData(udSweepTick, 0), Res: res})
+		if w.sweepTickFired {
+			t.Errorf("celeris884: a tick completed with res=%d, not -ETIME, owes a sweep past the floor", res)
+		}
+		if w.armSweepTick() {
+			t.Errorf("celeris884: after a tick completed with res=%d the worker arms another, so every mode-3a wait "+
+				"would end at once", res)
+		}
+		if n := len(takeSQEs(w.ring)); n != 0 {
+			t.Errorf("celeris884: after a tick completed with res=%d the worker placed %d more SQE(s)", res, n)
+		}
+	}
+}
+
+// TestSweepTickOnARealRing884: the kernel accepts the tick's SQE under the
+// setup flags the engine uses, and answers it with -ETIME about
+// sweepCeiling after the submit (the unit test above feeds a made-up CQE).
+func TestSweepTickOnARealRing884(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	rings := 0
+	for _, fl := range []struct {
+		name  string
+		flags uint32
+	}{
+		{"plain", 0},
+		{"defer_taskrun", setupDeferTaskrun | setupSingleIssuer},
+		{"coop_taskrun", setupCoopTaskrun | setupSingleIssuer},
+	} {
+		r, err := NewRing(64, fl.flags, 0)
+		if err != nil {
+			t.Logf("celeris884 TICK flags=%s: ring unavailable: %v", fl.name, err)
+			continue
+		}
+		rings++
+		w := &Worker{ring: r}
+		if !w.armSweepTick() {
+			t.Fatalf("flags=%s: no SQE for the tick", fl.name)
+		}
+		t0 := time.Now()
+		if err := r.SubmitAndWait(); err != nil {
+			t.Fatalf("flags=%s: wait: %v", fl.name, err)
+		}
+		el := time.Since(t0)
+		h, tl := r.BeginCQ()
+		if h == tl {
+			t.Fatalf("flags=%s: the wait returned with no CQE", fl.name)
+		}
+		c := r.cqeAt(h)
+		ud, res := c.UserData, c.Res
+		r.EndCQ(h + 1)
+		_ = r.Close()
+		t.Logf("celeris884 TICK flags=%s tag_ok=%v res=%d elapsed_ms=%d", fl.name, ud == encodeUserData(udSweepTick, 0), res, el.Milliseconds())
+		if ud != encodeUserData(udSweepTick, 0) {
+			t.Errorf("flags=%s: the CQE is %#x, not the tick's", fl.name, ud)
+		}
+		if res != -int32(unix.ETIME) {
+			t.Errorf("flags=%s: the tick completed with res=%d, want -ETIME (%d)", fl.name, res, -int32(unix.ETIME))
+		}
+		if el < 900*time.Millisecond || el > 3*time.Second {
+			t.Errorf("flags=%s: the tick came %v after the submit, want about 1 s", fl.name, el)
+		}
+	}
+	if rings == 0 {
+		skipOrFail656(t, "no ring could be set up with any of the engine's flag sets")
+	}
 }
