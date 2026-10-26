@@ -300,3 +300,58 @@ func TestIouringSmallSendIntoAFullSocketIsBoundedByWriteTimeout884(t *testing.T)
 		}
 	})
 }
+
+// TestIouringPausedWorkerSweepsAboutEverySecond884: a worker with no listener
+// (a paused one: baseTimeout is 1 s whatever its empty-iteration count) must
+// sweep about once a second too. A conn that has just been served on such a
+// worker, IdleTimeout 2 s, ReadHeaderTimeout, ReadTimeout and WriteTimeout off,
+// must be gone within about 4 s. With the clock of the batch taken for the
+// first empty iterations (sweepClock) the gap was up to 8 s and the conn went
+// at up to 9.9 s (review r2 of #1114).
+func TestIouringPausedWorkerSweepsAboutEverySecond884(t *testing.T) {
+	const bound = 4500 * time.Millisecond
+	// How late the gap is depends on where the iteration counter stands when the
+	// worker goes quiet, which the number of requests moves; the unit rows of
+	// TestSweepClock884 are the deterministic witness, these arms the real path.
+	for _, extra := range []int{0, 3, 4, 7} {
+		t.Run(fmt.Sprintf("extra_requests=%d", extra), func(t *testing.T) {
+			e, addr := startFDLEngine(t, newBusyHandler811(), func(c *resource.Config) {
+				c.DisableDeferAccept = true
+				c.IdleTimeout = 2 * time.Second
+				c.ReadTimeout = -1
+				c.ReadHeaderTimeout = -1
+				c.WriteTimeout = -1
+			})
+			cl := dialBusy811(t, addr)
+			time.Sleep(50 * time.Millisecond)
+			if err := e.PauseAccept(); err != nil {
+				t.Fatalf("PauseAccept: %v", err)
+			}
+			time.Sleep(300 * time.Millisecond)
+			for i := 0; i <= extra; i++ {
+				cl.send(t, "/small")
+				_ = cl.c.SetReadDeadline(time.Now().Add(5 * time.Second))
+				resp, err := http.ReadResponse(cl.br, nil)
+				if err != nil {
+					t.Fatalf("response %d: %v", i, err)
+				}
+				_ = resp.Body.Close()
+				time.Sleep(time.Duration(37*i) * time.Millisecond)
+			}
+			t0 := time.Now()
+			var gone time.Duration
+			for time.Since(t0) < 15*time.Second {
+				time.Sleep(20 * time.Millisecond)
+				if e.Metrics().ActiveConnections == 0 {
+					gone = time.Since(t0)
+					break
+				}
+			}
+			t.Logf("celeris884 PAUSEDSWEEP extra_requests=%d idle_timeout_ms=2000 gone_ms=%d (0: still open after 15000 ms)", extra, gone.Milliseconds())
+			if gone == 0 || gone > bound {
+				t.Errorf("celeris#884: a conn on a paused worker with IdleTimeout 2s was gone after %v (0: still open), want within %v: "+
+					"the worker's waits are 1 s, so its sweeps must come about every second", gone, bound)
+			}
+		})
+	}
+}

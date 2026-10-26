@@ -194,16 +194,22 @@ func TestSweepClock884(t *testing.T) {
 		dirty   bool
 		tick    uint32
 		fresh   bool
+		noLn    bool // the worker has no listener: baseTimeout is 1 s
 	}{
-		{"an iteration with CQEs uses the batch clock", true, true, true, 100, false, 0, false},
-		{"an empty spin with the dirty list non-empty", false, false, false, 100, true, 1, false},
-		{"an empty 1 ms wait, between reads", false, false, false, 3, false, 1, false},
-		{"an empty wait of 5 ms or more", false, false, false, 100, false, 1, true},
-		{"an empty spin on every eighth iteration", false, false, false, 100, true, 8, true},
-		{"an empty iteration at a gate hit", false, true, false, 3, true, 1, true},
-		{"an empty iteration after the standing timer fired", false, false, true, 3, true, 1, true},
+		{"an iteration with CQEs uses the batch clock", true, true, true, 100, false, 0, false, false},
+		{"an empty spin with the dirty list non-empty", false, false, false, 100, true, 1, false, false},
+		{"an empty 1 ms wait, between reads", false, false, false, 3, false, 1, false, false},
+		{"an empty wait of 5 ms or more", false, false, false, 100, false, 1, true, false},
+		{"an empty spin on every eighth iteration", false, false, false, 100, true, 8, true, false},
+		{"an empty first iteration on a worker with no listener (1 s waits)", false, false, false, 3, false, 1, true, true},
+		{"an empty iteration with a dirty conn on a worker with no listener", false, false, false, 100, true, 1, true, true},
+		{"an empty iteration at a gate hit", false, true, false, 3, true, 1, true, false},
+		{"an empty iteration after the standing timer fired", false, false, true, 3, true, 1, true, false},
 	} {
 		w := &Worker{cachedNow: stale, emptyIters: uint32(tc.empty), tickCounter: tc.tick, sweepTickFired: tc.fired}
+		if tc.noLn {
+			w.listenFD = -1
+		}
 		if tc.dirty {
 			w.dirtyHead = &connState{}
 		}
