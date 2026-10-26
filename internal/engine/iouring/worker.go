@@ -4744,6 +4744,21 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 // its first completion). When the goroutine is parked or gone, whoever holds
 // the lock holds it for one write, and waiting for it is bounded, as it
 // always was; see dispatchBusy.
+//
+// What this costs, and why it is accepted (celeris#884 item 81): the held
+// completion is applied only at the goroutine's hand-back, so while the next
+// pipelined request's handler runs, the rest of the previous response does not
+// move: its SEND is not re-submitted until the handler returns. The IOTSTSTALL
+// lane measured it with the handler gated: the client's read of the large
+// response stopped at about 2.2 MB, which is what the socket buffers held, not
+// a constant. Before this hold the worker itself was parked for that whole time
+// and so was every other conn of its ring; now only this conn waits, behind a
+// handler that its own client's pipelining put in front of the tail. Applying
+// the completion while the handler runs would have the worker write cs.sending,
+// sendBuf and writeBuf, the state that the flush sites guard with detachMu and
+// that the goroutine's direct writes read under it (ringSendOutstanding), so
+// it would take a split of the send state from detachMu. That is not done: no
+// measurement shows the wait to matter.
 func (w *Worker) holdOrLockSend(cs *connState, c *completionEntry) bool {
 	if len(cs.heldSends) == 0 {
 		if cs.detachMu.TryLock() {
