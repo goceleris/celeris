@@ -88,6 +88,13 @@ const (
 	// dispatcher has no case for it, so one that is read elsewhere is dropped. A tag of its
 	// own, not udProvide's, so it cannot be mistaken for a close-path cancel's.
 	udListenCancel uint64 = 0x0A << 56
+	// udSweepTick tags the worker's standing IORING_OP_TIMEOUT (armSweepTick,
+	// celeris#884 item 74): the CQE that ends a wait the run loop made with no
+	// timeout for a SEND that never completes. Not conn-bound (gen 0, fd 0) and
+	// not a terminalOp: it is outside every conn's accounting. Like
+	// udHeaderTimer it must be in both dispatches, the inlined one in run and
+	// processCQE.
+	udSweepTick uint64 = 0x0B << 56
 	// Driver tags for EventLoopProvider — kept non-overlapping with HTTP tags
 	// so the main CQE dispatch can route them to the driver path without
 	// consulting the driverConns map.

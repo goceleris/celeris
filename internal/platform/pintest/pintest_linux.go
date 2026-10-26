@@ -125,6 +125,59 @@ func init() {
 	}
 }
 
+// envMainThread is set in the process RunInOwnProcessOnMainThread starts: it
+// locks the main goroutine to the main thread, and RunMain then runs what
+// RunOnMainThread is given on it.
+const envMainThread = "CELERIS_PINTEST_MAIN_THREAD"
+
+// mainThreadMode is whether this process was started with envMainThread.
+var mainThreadMode = os.Getenv(envMainThread) == "1"
+
+func init() {
+	// In an init function this keeps the main goroutine, which runs main.main
+	// (RunMain, from a TestMain), on the main thread for good.
+	if mainThreadMode {
+		runtime.LockOSThread()
+	}
+}
+
+// mainQ carries what RunOnMainThread hands the main goroutine.
+var mainQ = make(chan func())
+
+// RunMain is what a TestMain returns through os.Exit in a package whose tests
+// use RunOnMainThread: m.Run, as is, in every process but the one
+// RunInOwnProcessOnMainThread starts, and in that one m.Run on another
+// goroutine while the main goroutine, locked to the main thread, runs what
+// RunOnMainThread gives it.
+func RunMain(m *testing.M) int {
+	if !mainThreadMode {
+		return m.Run()
+	}
+	done := make(chan int, 1)
+	go func() { done <- m.Run() }()
+	for {
+		select {
+		case f := <-mainQ:
+			f()
+		case code := <-done:
+			return code
+		}
+	}
+}
+
+// RunOnMainThread has the process's main thread run f, on the main goroutine,
+// and reports whether it will: false in a process that RunMain does not serve
+// (not started by RunInOwnProcessOnMainThread, or its package has no TestMain
+// that returns RunMain). It does not wait for f; the main goroutine runs one
+// function at a time, so a second call waits for the first to return.
+func RunOnMainThread(f func()) bool {
+	if !mainThreadMode {
+		return false
+	}
+	mainQ <- f
+	return true
+}
+
 // StartupMask returns the Cpus_allowed_list the main thread had when this
 // package was initialised, before any test of the binary ran.
 func StartupMask() (string, error) { return startup.mask, startup.err }
@@ -262,7 +315,16 @@ func RunInOwnProcessOn(t *testing.T, timeout time.Duration, cpus []int) {
 	runInOwnProcess(t, timeout, cpus)
 }
 
-func runInOwnProcess(t *testing.T, timeout time.Duration, narrow []int) {
+// RunInOwnProcessOnMainThread is RunInOwnProcess for a child whose main
+// goroutine is locked to the main thread and serves RunOnMainThread (RunMain):
+// a test that needs a loop on the main thread on purpose, not in the runs in
+// which the scheduler happens to put it there.
+func RunInOwnProcessOnMainThread(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	runInOwnProcess(t, timeout, nil, envMainThread+"=1")
+}
+
+func runInOwnProcess(t *testing.T, timeout time.Duration, narrow []int, extraEnv ...string) {
 	t.Helper()
 	if InOwnProcess(t) {
 		t.Fatal("RunInOwnProcess called from inside the process it started")
@@ -280,6 +342,7 @@ func runInOwnProcess(t *testing.T, timeout time.Duration, narrow []int) {
 		"-test.timeout="+timeout.String(),
 	)
 	cmd.Env = append(os.Environ(), envChild+"="+name, envParentMask+"="+startup.mask)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	var narrowSet unix.CPUSet
 	if len(narrow) > 0 {
 		for _, c := range narrow {
