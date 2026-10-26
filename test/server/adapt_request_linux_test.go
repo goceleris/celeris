@@ -174,7 +174,7 @@ func keptArms(t *testing.T) []keptArm {
 		{"epoll", celeris.Epoll, false},
 		{"epoll-async", celeris.Epoll, true},
 	}
-	if ok, p := keptProbeIOUring(); ok {
+	if ok, p := keptProbeIOUring(t); ok {
 		arms = append(arms, keptArm{"io_uring", celeris.IOUring, false}, keptArm{"io_uring-async", celeris.IOUring, true})
 	} else if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 		t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids dropping the io_uring arms", p.IOUringTier, p.KernelVersion)
@@ -186,17 +186,21 @@ func keptArms(t *testing.T) []keptArm {
 
 // keptProbeIOUring probes the kernel's io_uring support. With
 // CELERIS_REQUIRE_IOURING_WORKERS=1 a probe that finds no usable ring is
-// retried for up to 10 s: the probe's ring can fail with ENOMEM against
+// retried for up to 10 s, logging each round through tb: the probe's ring can fail with ENOMEM against
 // RLIMIT_MEMLOCK while the rings of engines stopped moments ago, or of
 // another test binary of the same user, are still charged
 // (internal/engine/iouring/ring_budget_linux_test.go).
-func keptProbeIOUring() (usable bool, p celerisengine.CapabilityProfile) {
+func keptProbeIOUring(tb testing.TB) (usable bool, p celerisengine.CapabilityProfile) {
 	p = probe.Probe()
 	usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers
 	if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") != "1" {
 		return usable, p
 	}
-	for deadline := time.Now().Add(10 * time.Second); !usable && time.Now().Before(deadline); {
+	deadline := time.Now().Add(10 * time.Second)
+	for round := 1; !usable && time.Now().Before(deadline); round++ {
+		// One line per round, so a CI log shows that the probe fired and how long it
+		// kept failing. Rounds are 10 ms apart, so this is at most about 1000 lines.
+		tb.Logf("keptProbeIOUring: retry round %d, no usable io_uring ring yet (tier %v, provided buffers %t)", round, p.IOUringTier, p.ProvidedBuffers)
 		time.Sleep(10 * time.Millisecond)
 		p = probe.Probe()
 		usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers

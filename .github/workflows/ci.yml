@@ -2336,6 +2336,115 @@ jobs:
           if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
           exit "$bad"
 
+  # NOT a required check (see the note above `iouring`). celeris#890 item 87:
+  # nothing ran the io_uring base tier. CELERIS_MAX_IOURING_TIER=base caps the
+  # probe's tier at "base" (no provided buffer ring, single-shot accept, no
+  # multishot recv), the tier a kernel without those features gets and the one
+  # PR #1026 made non-blocking on accept (item 53, celeris#884): a partial
+  # inline write of a detached stream leaves a remainder in writeBuf there
+  # (TestShutdownDetachedPartialWriteIsFlushed806), a state the other tiers do
+  # not reach the same way. Until this job only local runs covered it.
+  #
+  # Two steps, each with memlock raised (the tests that ask for several workers
+  # need it) and the cap in the environment:
+  #   * ./internal/engine/iouring under -race. The cap must have taken effect:
+  #     TestReportTier844 must print io_uring_tier=base for the capped probe
+  #     and no engine arm may report tier=high (a misspelled value counts as
+  #     "none" and would skip everything, which the tally also refuses);
+  #   * the root package and ./test/server, the tests whose names say Shutdown,
+  #     Detach, SSE, Stream, WebSocket, Hijack or Drain, under -race.
+  # Tests that need the high tier skip at this tier on purpose; each skip that
+  # is allowed is listed by name below with its reason, and any other SKIP line
+  # fails the step.
+  iouring-base-tier:
+    name: io_uring base tier (CELERIS_MAX_IOURING_TIER=base, celeris#890)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CELERIS_MAX_IOURING_TIER: base
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: internal/engine/iouring at the base tier (race, tier asserted, skips accounted for)
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CELERIS_MAX_IOURING_TIER=$CELERIS_MAX_IOURING_TIER"
+          start=$SECONDS
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=1500s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/base-iouring.log
+          echo "internal/engine/iouring at the base tier took $((SECONDS - start)) s"
+          .github/scripts/base-tier-tally.sh iouring /tmp/base-iouring.log TestShutdownDetachedPartialWriteIsFlushed806 TestReportTier844
+      - name: Root package and test/server, Shutdown/Detach/SSE/Stream/WebSocket/Hijack/Drain tests at the base tier (race)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CELERIS_MAX_IOURING_TIER=$CELERIS_MAX_IOURING_TIER"
+          start=$SECONDS
+          # -p 1: one test process at a time, so the runner's one memlock budget never funds two.
+          CELERIS_REQUIRE_DUALSTACK=1 go test -p 1 -race -count=1 -timeout=1500s -v -run 'Shutdown|Detach|SSE|Stream|WebSocket|Hijack|Drain' . ./test/server 2>&1 | tee /tmp/base-root.log
+          echo "root and test/server at the base tier took $((SECONDS - start)) s"
+          .github/scripts/base-tier-tally.sh root /tmp/base-root.log
+
+  # NOT a required check. celeris#890 item 92: the large-response tests of
+  # ./test/server (celeris#761, #817, #836) have a lean shape and a full-size
+  # one. lean761() (large_response_linux_test.go) is true under -race and
+  # under coverage, which are the only ways the other jobs run ./test/server,
+  # so their 16 MiB / 64 MiB bodies, their request counts and the h2c
+  # AsyncHandlers arm of TestH2CUnmatchedThroughTimeoutSingleflight836
+  # (AsyncHandlers: !raceOn761) never ran in CI. This job builds the test binary
+  # without -race and without coverage (race761_off_test.go makes raceOn761
+  # false) and runs the eight tests that read lean761(), n836() or raceOn761,
+  # by name, with memlock raised (they start io_uring engines), -v, and a tally
+  # by name: each must run once and PASS, with no SKIP line. The script prints
+  # the wall time and the peak resident set of the test process, so a log says
+  # what the full-size shape costs on a runner.
+  large-response:
+    name: Large responses at full size, no race (./test/server, celeris#890)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: test/server large-response tests at full size (no race, no coverage)
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CPUs: $(nproc), memory: $(free -m | awk '/^Mem:/ {print $2}') MiB"
+          tests=(
+            TestLargeResponseIsDelivered
+            TestLargeFileResponseIsDelivered
+            TestLargeResponseIsDeliveredH2
+            TestConcurrentResponsesOwnTheirBodies
+            TestH2DerivedContextDoesNotPanic836
+            TestH2DetachedContextIsItsRequests836
+            TestH2InlineCleanupDoesNotReleaseAReusedStream947
+            TestH2CUnmatchedThroughTimeoutSingleflight836
+          )
+          regex=$(IFS='|'; echo "${tests[*]}")
+          go test -c -o /tmp/server.test ./test/server
+          python3 - /tmp/server.test "^(${regex})\$" <<'PY' 2>&1 | tee /tmp/large.log
+          import resource, subprocess, sys, time
+          binary, run = sys.argv[1], sys.argv[2]
+          t0 = time.monotonic()
+          rc = subprocess.run([binary, "-test.run", run, "-test.v", "-test.count=1", "-test.timeout=1500s"]).returncode
+          rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss  # KiB on Linux
+          print("full-size shape: wall %.1f s, peak RSS of the test process %.0f MiB, exit %d" % (time.monotonic() - t0, rss / 1024, rc))
+          sys.exit(rc)
+          PY
+          .github/scripts/named-tally.sh 'test/server full-size shape (celeris#890 item 92)' /tmp/large.log "${tests[@]}"
+
   conformance:
     name: Conformance
     runs-on: ubuntu-latest

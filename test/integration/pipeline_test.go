@@ -37,7 +37,9 @@ func TestHTTP1PipeliningAsync(t *testing.T) {
 			cfg.AsyncHandlers = tc.async
 			eng, err := epoll.New(cfg, &echoHandler{})
 			if err != nil {
-				t.Skipf("epoll engine unavailable: %v", err)
+				// epoll.New fails on config validation only, so a failure here is a
+				// defect, not a host without the engine (celeris#890 item 95).
+				t.Fatalf("epoll.New: %v", err)
 			}
 			startEngine(t, eng)
 

@@ -97,7 +97,7 @@ const (
 
 func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, mode string) {
 	if eng == celeris.IOUring {
-		if ok, p := keptProbeIOUring(); !ok {
+		if ok, p := keptProbeIOUring(t); !ok {
 			if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 				t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids skipping", p.IOUringTier, p.KernelVersion)
 			}
