@@ -299,21 +299,30 @@ type Config struct {
 	// not accepted whole, restarted each time it takes some. A download read
 	// steadily for longer than WriteTimeout is not cut there, and a client
 	// that reads nothing is closed WriteTimeout after the response stalled.
-	// Progress is seen when the engine flushes, which follows the socket
-	// becoming writable again, about when half of its send queue has drained,
-	// or the client sending something (a pipelined request, an HTTP/2 PING or
-	// WINDOW_UPDATE), whose read flushes what the room it made allows.
-	// A client that takes less than half a send queue per WriteTimeout and
-	// sends nothing (a deep send queue and a slow reader) is closed while it
-	// is still reading; one that takes
-	// about half a send queue per WriteTimeout is never closed, and holds the
-	// connection and the whole response queued for it in memory for as long as
-	// it keeps doing so (std and io_uring end such a response at WriteTimeout,
-	// as a whole). Nothing else bounds that on epoll: while a response is
-	// queued, ReadTimeout and IdleTimeout run from the last progress too, so
-	// they slide with it, and the earlier of ReadTimeout and WriteTimeout
-	// is the time a client may take no bytes at all (ReadTimeout 5s with
-	// WriteTimeout 60s closes a client that pauses for 6s). io_uring bounds the
+	// Progress is the bytes the client acknowledges, which the engine's sweep
+	// reads (tcp_info): a response parked on the socket is held for another
+	// WriteTimeout if the client acknowledged at least 64 KiB in the last one (a
+	// floor of 64 KiB per WriteTimeout: 64 KiB/s at 1s, about 1 KiB/s at the 60s
+	// default), and closed if it did not. A client that reads at a reasonable
+	// rate is never cut, however long the response takes; one that reads steadily
+	// between two EPOLLOUT edges is not mistaken for a stalled one; and one that
+	// takes a half send queue per WriteTimeout, or sends bytes while it reads (a
+	// pipelined request, an HTTP/2 PING, a bare CRLF), cannot hold the
+	// connection and the response queued for it, because what it sends is not
+	// progress. A client that takes nothing, or a byte at a time (the kernel
+	// acknowledges a window update, not a byte), is closed between WriteTimeout
+	// and WriteTimeout plus a sweep after the response parked, and one that stops
+	// after a window it passed, within two WriteTimeouts. A client that takes
+	// exactly 64 KiB per window holds the connection for as many windows as the
+	// response has 64 KiB: there is no elapsed-time ceiling, so a large download
+	// at a reasonable rate completes whatever IdleTimeout is, and WriteTimeout -1
+	// is no write timeout at any rate. A socket that does not report
+	// acknowledged bytes (not TCP) has the flush clock alone: "no flush took
+	// bytes for WriteTimeout". While a response is queued, ReadTimeout and
+	// IdleTimeout run from the last progress, so they slide with it, and the
+	// earlier of ReadTimeout and WriteTimeout is the time a client may take no
+	// bytes at all (ReadTimeout 5s with WriteTimeout 60s closes a client that
+	// pauses for 6s). io_uring bounds the
 	// response as a whole, measured from the last read or completed flush
 	// of the connection (a client that sends another request restarts it), not
 	// from the request's headers as std does. On io_uring a response whose

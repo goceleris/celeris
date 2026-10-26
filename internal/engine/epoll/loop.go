@@ -2123,6 +2123,7 @@ func (l *Loop) markClosing(cs *connState, pending int) {
 	}
 	cs.closeSince = time.Now().UnixNano()
 	cs.closePending = pending
+	cs.closeAckedKnown = false // a live conn's window baseline (parkedBelowRate) is not the drain's
 }
 
 // noteClosingProgress restarts the drain clock of a conn markClosing deferred
@@ -2217,6 +2218,7 @@ func (cs *connState) endWrite() {
 // inlines at its call sites (the drain paths of every response).
 func (cs *connState) endWriteSlow() {
 	cs.writeSince = 0
+	cs.closeAckedKnown = false // the baseline of the response's window (parkedBelowRate)
 	cs.lastActivity = time.Now().UnixNano()
 }
 
@@ -4655,7 +4657,9 @@ func (cs *connState) endDetachedStall() {
 // write clock (writeSince), or is on the dirty list. WriteTimeout is "no
 // progress for WriteTimeout" there: the clock starts at the first partial flush
 // and restarts when a flush takes bytes (noteWriteProgress), where std's is an
-// absolute deadline for the whole response. It answers the instant IdleTimeout
+// absolute deadline for the whole response; where the peer's acknowledged bytes
+// can be read the minimum-rate rule decides instead (parkedBelowRate, celeris#885
+// item 51). It answers the instant IdleTimeout
 // and ReadTimeout are measured from, the later of the last read and the clock,
 // and whether the conn is done for this sweep (closed, or exempt from the idle
 // scan). Kept out of line: the sweep of a conn without a clock does not run it.
@@ -4684,14 +4688,24 @@ func (l *Loop) sweepWriteClock(cs *connState, fd int, now, last int64) (from int
 		pending = csWritePending(cs)
 	}
 	if pending {
-		if wt := l.cfg.WriteTimeout; wt > 0 && time.Duration(now-ws) > wt {
-			l.closeConn(fd)
-			return last, true
+		if wt := l.cfg.WriteTimeout; wt > 0 {
+			// The minimum-rate rule (celeris#885 item 51) reaps a conn whose
+			// peer's acknowledged bytes it can see; the flush clock the rest.
+			if l.parkedBelowRate(cs, now, ws, int64(wt)) {
+				l.closeConn(fd)
+				return last, true
+			}
+			if !cs.closeAckedKnown && time.Duration(now-cs.writeSince) > wt {
+				l.closeConn(fd)
+				return last, true
+			}
+			ws = cs.writeSince // a window passed moves the clock
 		}
 	} else {
 		// End the clock as endWrite does, from its last stamp, which is no
 		// later than the drain.
 		cs.writeSince = 0
+		cs.closeAckedKnown = false
 		if ws > last {
 			cs.lastActivity = ws
 		}
