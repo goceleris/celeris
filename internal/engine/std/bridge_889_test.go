@@ -310,3 +310,31 @@ func TestHTTP2PrefaceIsNotARequest889(t *testing.T) {
 		})
 	}
 }
+
+// BenchmarkBridgeServeHTTPAsksContext889: the cost of the binding when the
+// handler does ask for the context (Context.Context): an h2c request with a
+// fresh cancelable context, whose stream context is then bound to it. The
+// "Never" case is the same request with a handler that does not ask.
+func BenchmarkBridgeServeHTTPAsksContext889(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		h    stream.Handler
+	}{
+		{"Never", okStreamHandler{}},
+		{"Asks", ctxAskHandler889(func(ctx context.Context) { _ = ctx.Err() })},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			br := h2Bridge889(b, tc.h)
+			base := httptest.NewRequest(http.MethodGet, "/", nil)
+			base.ProtoMajor = 2
+			w := &discardResponseWriter{h: http.Header{}}
+			b.ReportAllocs()
+			for b.Loop() {
+				ctx, cancel := context.WithCancel(context.Background())
+				clear(w.h)
+				br.ServeHTTP(w, base.WithContext(ctx))
+				cancel()
+			}
+		})
+	}
+}
