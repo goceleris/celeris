@@ -367,3 +367,54 @@ func TestChunkedLimitCountsTheFirstChunk889(t *testing.T) {
 		}
 	}
 }
+
+// TestReleaseFollowsTheAliasFlag889 (round-1 m3): the safety of a body that is a
+// view of state.buffer must not depend on the alias threshold and the release
+// threshold agreeing. With chunkAliased set the buffer is replaced whatever its
+// capacity, and the flag is cleared; without it a small buffer is kept.
+func TestReleaseFollowsTheAliasFlag889(t *testing.T) {
+	array := func(st *H1State) uintptr {
+		return uintptr(unsafe.Pointer(unsafe.SliceData(st.buffer.Bytes())))
+	}
+	st := NewH1State()
+	st.buffer.WriteString("tail-bytes")
+	before := array(st)
+	st.releaseLargeBuffer()
+	if array(st) != before {
+		t.Fatal("a small buffer was replaced without the alias flag")
+	}
+	st.chunkAliased = true
+	st.releaseLargeBuffer()
+	if array(st) == before {
+		t.Fatal("chunkAliased set but the buffer (small, under the retained size) was kept: a body view would be overwritten")
+	}
+	if st.buffer.String() != "tail-bytes" {
+		t.Fatalf("tail = %q", st.buffer.String())
+	}
+	if st.chunkAliased {
+		t.Fatal("chunkAliased still set after the release")
+	}
+}
+
+// TestExpectContinuePanickingLogger889 (round-1 n1): a log handler that panics
+// does not escape ProcessH1; the request is still refused with 417.
+func TestExpectContinuePanickingLogger889(t *testing.T) {
+	st := NewH1State()
+	st.Logger = slog.New(panicLogHandler889{})
+	st.OnExpectContinue = func(string, string, [][2]string) bool { panic("boom-expect-889") }
+	h := &rec1029{}
+	var out bytes.Buffer
+	_, err := feed1029(st, h, &out, []byte("POST /up HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"))
+	if err == nil || !strings.HasPrefix(out.String(), "HTTP/1.1 417") {
+		t.Fatalf("err %v answer %q, want the 417 and the close", err, firstLine889(out.String()))
+	}
+}
+
+type panicLogHandler889 struct{}
+
+func (panicLogHandler889) Enabled(context.Context, slog.Level) bool { return true }
+func (panicLogHandler889) Handle(context.Context, slog.Record) error {
+	panic("log handler boom")
+}
+func (h panicLogHandler889) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h panicLogHandler889) WithGroup(string) slog.Handler      { return h }
