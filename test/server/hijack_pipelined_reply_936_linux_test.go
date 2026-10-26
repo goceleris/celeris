@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,6 +206,13 @@ func TestHijackWithAQueuedLargeReply936(t *testing.T) {
 			select {
 			case herr = <-hj:
 				t.Logf("Hijack returned: %v", herr)
+				// The refusal names the limit that was reached: the socket's
+				// send buffer, through the engine's real non-blocking socket
+				// (on io_uring that is the worker's own write, not a send in
+				// flight, whose refusal says "pending sends").
+				if herr != nil && !strings.Contains(herr.Error(), "send buffer") {
+					t.Errorf("the refusal %q does not name the socket's send buffer as the limit", herr)
+				}
 			case <-time.After(10 * time.Second):
 				t.Fatal("the hijacking handler never ran")
 			}

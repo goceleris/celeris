@@ -3037,8 +3037,18 @@ func (w *Worker) acceptRetry(err error) bool {
 var errHijackNoSQE = errors.New("celeris: cannot hijack: the io_uring submission queue is full, the connection's receive cannot be cancelled")
 
 // errHijackPendingSends is what hijackConn answers when a send of the conn's
-// is in flight, or a reply is queued that the socket does not take at once.
+// is in flight (the kernel holds its buffer).
 var errHijackPendingSends = errors.New("celeris: cannot hijack with pending sends")
+
+// errHijackSendBufferFull is what hijackConn answers when a reply is queued
+// that the socket does not take now: the limit is the socket's send buffer, the
+// peer's window only fills it. Its own error, so that a log or a test can tell
+// it from a send in flight.
+var errHijackSendBufferFull = errors.New("celeris: cannot hijack: a queued response has not been sent and the socket's send buffer does not take it now, so it cannot go out before the connection is handed over")
+
+// errHijackDetached is what hijackConn answers for a detached conn: it belongs
+// to the middleware that detached it, whose guarded writer is live.
+var errHijackDetached = errors.New("celeris: cannot hijack a detached connection")
 
 // flushQueuedBeforeHijack writes what cs has queued in writeBuf to the socket
 // before hijackConn hands it over, so that a reply an earlier pipelined request
@@ -3071,7 +3081,7 @@ func (w *Worker) flushQueuedBeforeHijack(cs *connState) error {
 	case nil:
 		return nil
 	case unix.EAGAIN: // EWOULDBLOCK is the same errno
-		return errHijackPendingSends
+		return errHijackSendBufferFull
 	default:
 		return fmt.Errorf("celeris: cannot hijack: writing the queued response: %w", err)
 	}
@@ -3108,16 +3118,26 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.fixedFile {
 		return nil, errors.New("celeris: cannot hijack fixed file connection")
 	}
+	// A detached conn is the detaching middleware's: Context.Hijack refuses a
+	// detached Context, and the engine does not rely on that alone.
+	if cs.h1State != nil && cs.h1State.Detached.Load() {
+		return nil, errHijackDetached
+	}
 	// A send the kernel holds (cs.sending, a remainder in sendBuf) cannot be
 	// passed, and neither can a notification the queue would have to wait
 	// behind: the hijack is refused. What a pipelined request's reply left in
 	// writeBuf, the sends of one recv going out after its last request, is
 	// written to the socket here, and the hijack goes on when it all went out
 	// (celeris#936).
-	if cs.sending || len(cs.sendBuf) > 0 || (len(cs.writeBuf) > 0 && cs.zcNotifPending) {
+	if cs.sending || len(cs.sendBuf) > 0 {
 		return nil, errHijackPendingSends
 	}
 	if len(cs.writeBuf) > 0 {
+		// ringSendOutstanding (celeris#751) is the invariant a raw write of
+		// writeBuf has to respect; what it adds here is a SEND_ZC notification.
+		if ringSendOutstanding(cs) {
+			return nil, errHijackPendingSends
+		}
 		if err := w.flushQueuedBeforeHijack(cs); err != nil {
 			return nil, err
 		}
@@ -3233,8 +3253,11 @@ const hijackSubmitTries = 8
 // again, up to hijackSubmitTries times; any other error means the kernel
 // consumed the batch (the ring says so), and offering it again would submit
 // the SQEs twice. The conn has left the tables by now, so a submit that never
-// goes through cannot be refused: it is logged, and the cancels go out with
-// the worker's next submit, a pass of the loop later (celeris#884 item 40).
+// goes through cannot be refused: it is logged (once per hijack, after the
+// last try), and the cancels go out with the worker's next submit, a pass of
+// the loop later (celeris#884 item 40). A submit that succeeds but takes only
+// part of the batch (ring.Pending() > 0 after it) is offered again too, within
+// the same bound.
 // EBUSY from a CQ ring the kernel cannot flush does not clear until the worker
 // reaps, which it cannot do from inside a handler's call, hence the bound.
 func (w *Worker) submitForHijack() {
@@ -3244,7 +3267,11 @@ func (w *Worker) submitForHijack() {
 	}
 	var err error
 	for try := 0; try < hijackSubmitTries; try++ {
-		if _, err = submit(); err == nil || !ringWaitRetryable(err) {
+		_, err = submit()
+		if err == nil && w.ring.Pending() > 0 {
+			continue // a short submit: the rest is still pending
+		}
+		if err == nil || !ringWaitRetryable(err) {
 			break
 		}
 	}

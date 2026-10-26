@@ -2405,7 +2405,12 @@ var testHookHijackFlush atomic.Pointer[func(cs *connState, pass, pending int)]
 
 // errHijackQueued is what hijackConn answers when a reply an earlier pipelined
 // request wrote cannot be sent without waiting for the peer.
-var errHijackQueued = errors.New("celeris: cannot hijack: a queued response has not been sent and the peer's receive window does not take it, so it cannot go out before the connection is handed over")
+var errHijackQueued = errors.New("celeris: cannot hijack: a queued response has not been sent and the socket's send buffer does not take it now, so it cannot go out before the connection is handed over")
+
+// errHijackDetached is what hijackConn answers for a detached conn: it
+// belongs to the middleware that detached it, whose guarded writer is live and
+// whose goroutine no longer holds the conn's lock across the handler.
+var errHijackDetached = errors.New("celeris: cannot hijack a detached connection")
 
 // flushBeforeHijack sends the output cs still has queued (a reply an earlier
 // pipelined request of the same recv wrote, which the loop flushes only after
@@ -2424,9 +2429,8 @@ var errHijackQueued = errors.New("celeris: cannot hijack: a queued response has 
 // onLoopThread tells the byte counters which path to use. Inline, this is the
 // loop thread. Off the loop thread this is the dispatch goroutine, which holds
 // detachMu across the handler (serveAsync) and so is the only writer of
-// writeBuf, as its own flush after ProcessH1 is. A detached conn is skipped:
-// its goroutine does not hold the lock, and Context.Hijack refuses a detached
-// Context, so only a caller of the engine's own Hijacker can get here.
+// writeBuf, as its own flush after ProcessH1 is. hijackConn refuses a
+// detached conn before it gets here (its goroutine does not hold the lock).
 func (l *Loop) flushBeforeHijack(cs *connState, onLoopThread bool) error {
 	if !csWritePending(cs) {
 		return nil
@@ -2434,9 +2438,6 @@ func (l *Loop) flushBeforeHijack(cs *connState, onLoopThread bool) error {
 	hook := testHookHijackFlush.Load()
 	if hook != nil {
 		(*hook)(cs, 0, csPendingBytes(cs))
-	}
-	if cs.h1State != nil && cs.h1State.Detached.Load() {
-		return nil
 	}
 	queued := 0
 	if cs.writeSince != 0 {
@@ -2484,6 +2485,11 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	l.driverMu.Unlock()
 	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
+	}
+	// A detached conn is the detaching middleware's: Context.Hijack refuses a
+	// detached Context, and the engine does not rely on that alone.
+	if cs.h1State != nil && cs.h1State.Detached.Load() {
+		return nil, errHijackDetached
 	}
 	// Which thread is this? A dispatch goroutine is alive for this conn only
 	// once the conn was promoted to one, and from then on the handler — and

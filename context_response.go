@@ -1368,8 +1368,8 @@ func (c *Context) BytesWritten() int {
 // A response an earlier request on the same connection already wrote, and
 // that is still queued in the engine when a later pipelined request hijacks,
 // is sent to the peer before the connection is handed over. The native
-// engines do that without waiting: if the peer's receive window does not take
-// the whole reply at once, Hijack fails with the connection untouched and the
+// engines do that without waiting: if the socket's send buffer does not take
+// the whole reply now (a peer that reads slowly), Hijack fails with the connection untouched and the
 // reply still queued, as above, rather than dropping the reply or blocking the
 // event loop.
 //
