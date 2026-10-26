@@ -1584,6 +1584,22 @@ func (l *Loop) yieldRead(cs *connState) bool {
 	return false
 }
 
+// lockAsyncInUnlessSwitched is the loop thread's test of drainRead's async
+// gate: it takes asyncInMu and, if the dispatch goroutine has not switched the
+// conn to HTTP/2 (h2Switched), returns true with the lock held, for the
+// append of the bytes just read. A switched conn returns false with the lock
+// released; the loop then reads protocol, h1State and h2State, which the
+// goroutine's switchToH2Local wrote before it set h2Switched under the same
+// lock (celeris#885 item 28).
+func (cs *connState) lockAsyncInUnlessSwitched() bool {
+	cs.asyncInMu.Lock()
+	if cs.h2Switched {
+		cs.asyncInMu.Unlock()
+		return false
+	}
+	return true
+}
+
 func (l *Loop) drainRead(fd int, now int64) {
 	if fd < 0 || fd >= len(l.conns) {
 		return
@@ -1793,8 +1809,17 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// with ErrAsyncDispatch on the first async route, promoting the
 		// conn — so sync routes run inline on the event loop on a server
 		// that mixes sync + async handlers.
-		if l.async && cs.asyncPromoted && cs.protocol == engine.HTTP1 {
-			cs.asyncInMu.Lock()
+		//
+		// The gate reads h2Switched, not cs.protocol: for a promoted conn the
+		// dispatch goroutine writes protocol (and h1State, h2State) in
+		// switchToH2Local, holding detachMu, and the loop thread must not read
+		// them unordered: a client that sends HTTP/2 frames before it has read
+		// the 101 reaches this line while the goroutine is in the switch
+		// (celeris#885 item 28). A conn the goroutine has not switched is
+		// HTTP/1; one it has switched is read below, after the lock that
+		// orders those reads. lockAsyncInUnlessSwitched returns with
+		// cs.asyncInMu held when it is HTTP/1, which the block releases.
+		if l.async && cs.asyncPromoted && cs.lockAsyncInUnlessSwitched() {
 			// Backpressure: drop the conn if the dispatch goroutine is
 			// falling behind. A client that pipelines faster than we
 			// can process would otherwise grow asyncInBuf without bound.
@@ -3148,6 +3173,13 @@ func (l *Loop) switchToH2Local(cs *connState, writeFn func([]byte)) error {
 	cs.h2State = h2State
 	cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	cs.protocol = engine.H2C
+	// Ordered after the three writes above for the loop thread's gate, which
+	// reads the flag under asyncInMu (taken here under detachMu, the order
+	// every site keeps, and for these few instructions only: not across
+	// ProcessH2 below, which runs handlers).
+	cs.asyncInMu.Lock()
+	cs.h2Switched = true
+	cs.asyncInMu.Unlock()
 
 	var processErr error
 	if len(info.Remaining) > 0 {
