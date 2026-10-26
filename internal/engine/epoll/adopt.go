@@ -303,7 +303,7 @@ func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
 	}
 	// Inline served the bytes, but if they ended inside a request its
 	// continuation must run on the dispatch goroutine, as in drainRead.
-	if cs.h1State.HasPendingData() {
+	if cs.h1State.NeedsDispatchGoroutine() {
 		cs.asyncPromoted = true
 		l.asyncPromoted.Add(1)
 	}
