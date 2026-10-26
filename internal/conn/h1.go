@@ -594,6 +594,7 @@ func CloseH1(state *H1State) {
 	state.chunkBuf = nil
 	state.chunkedInProgress = false
 	state.chunkExcess = 0
+	state.chunkAliased = false
 }
 
 // ProcessH1 processes incoming H1 data, parsing requests and calling the handler.
@@ -1120,6 +1121,12 @@ func (s *H1State) scanChunked(write func([]byte)) (done bool, end int, err error
 			return false, 0, cerr
 		}
 		if n == 0 {
+			// The held chunk counts against the limit the next size line is
+			// checked against.
+			if first != nil {
+				s.appendChunk(first, limit)
+				first = nil
+			}
 			if err := s.checkPartialChunk(buf[pos:], limit, write); err != nil {
 				s.abortChunked()
 				return false, 0, err

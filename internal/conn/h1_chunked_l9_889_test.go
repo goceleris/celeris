@@ -349,3 +349,21 @@ func TestExpectContinuePanicLogged889(t *testing.T) {
 		}
 	}
 }
+
+// TestChunkedLimitCountsTheFirstChunk889: a complete chunk and the size line of
+// the next one in the same call, together over the limit, are refused at the
+// size line, before the second chunk's data arrives. (The first chunk is held
+// back from chunkBuf while it may turn out to be the whole body.)
+func TestChunkedLimitCountsTheFirstChunk889(t *testing.T) {
+	for _, first := range []int{100, 20 << 10} {
+		st := NewH1State()
+		st.MaxRequestBodySize = int64(first) + 500
+		h := &rec1029{}
+		var out bytes.Buffer
+		wire := fmt.Sprintf("%s%x\r\n%s\r\n%x\r\nabc", head1029, first, strings.Repeat("a", first), 501)
+		_, err := feed1029(st, h, &out, []byte(wire))
+		if err == nil || !strings.HasPrefix(out.String(), "HTTP/1.1 413") {
+			t.Fatalf("first chunk %d: err %v answer %q, want 413 at the second size line", first, err, firstLine889(out.String()))
+		}
+	}
+}
