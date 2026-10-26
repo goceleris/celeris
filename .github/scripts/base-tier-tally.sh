@@ -31,29 +31,41 @@ shift 2
 [ -r "$log" ] || { echo "base-tier-tally: cannot read $log" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 
-# Allowed skips: .github/base-tier-skips-LABEL.txt, one test per line, its full
-# name first and the reason it must skip at the base tier after it (blank lines
-# and # lines are ignored). BASE_TIER_SKIPS_DIR points elsewhere for the
-# self-test.
+# Allowed skips: .github/base-tier-skips-LABEL.txt, one entry per line, then the reason
+# (blank lines and # lines are ignored; BASE_TIER_SKIPS_DIR points elsewhere for the
+# self-test). An entry is
+#   NAME            a test or subtest by its full name; it covers its own subtests, or
+#   pattern:REGEX   a skipped test or subtest whose full name matches REGEX, and only
+#                   when the log shows "tier=base" in a line the test logged (the
+#                   skip message of a probe-gated test says "io_uring tier=base ...").
+#   min-pass N      the top-level tests that must PASS at least, so that a -run pattern
+#                   that stops matching (a rename) or a package that stops compiling its
+#                   tests in cannot shrink the run unseen; the figure is measured.
 case "$label" in
   iouring | root) ;;
   *) echo "base-tier-tally: label '$label' is neither iouring nor root" >&2; exit 2 ;;
 esac
 list_file=${BASE_TIER_SKIPS_DIR:-$here/..}/base-tier-skips-$label.txt
 [ -r "$list_file" ] || { echo "base-tier-tally: cannot read $list_file" >&2; exit 2; }
-names=$(awk 'NF && $1 !~ /^#/ && $1 != "min-pass" { print $1 }' "$list_file" | paste -sd'|' -)
-# `min-pass N` in the file: the top-level tests that must PASS at least, so that a -run
-# pattern that stops matching (a rename) or a package that stops compiling its tests
-# in cannot shrink the run unseen. The figure is what the first run measured.
+names=$(awk 'NF && $1 !~ /^#/ && $1 != "min-pass" && $1 !~ /^pattern:/ { print $1 }' "$list_file" | paste -sd'|' -)
+patterns=$(awk 'NF && $1 ~ /^pattern:/ { sub(/^pattern:/, "", $1); print $1 }' "$list_file" | paste -sd'|' -)
 minpass=$(awk '$1 == "min-pass" { print $2 }' "$list_file")
 
 fail=0
 skipped=$("$here"/skip-count.sh "$log") || fail=1
-if [ -n "$names" ]; then
-  unlisted=$(grep -aE '^[[:space:]]*--- SKIP: ' "$log" | grep -avE "^[[:space:]]*--- SKIP: (${names})( |/)" || true)
-else
-  unlisted=$(grep -aE '^[[:space:]]*--- SKIP: ' "$log" || true)
-fi
+# Each SKIP line is judged by the name of the test: allowed by an exact entry (or as a
+# subtest of one), or by a pattern while the log shows tier=base under that test's RUN.
+unlisted=$(awk -v names="$names" -v pats="$patterns" '
+  /^=== RUN   / { cur = $3; next }
+  /tier=base/ && cur != "" { base[cur] = 1 }
+  /^[[:space:]]*--- SKIP: / {
+    n = $3
+    ok = 0
+    if (names != "" && (n ~ ("^(" names ")$") || n ~ ("^(" names ")/"))) ok = 1
+    if (!ok && pats != "" && n ~ pats && base[n]) ok = 1
+    if (!ok) print
+  }
+' "$log")
 n_unlisted=0
 [ -n "$unlisted" ] && n_unlisted=$(printf '%s\n' "$unlisted" | wc -l | tr -d '[:space:]')
 

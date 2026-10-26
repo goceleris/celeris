@@ -2380,7 +2380,10 @@ jobs:
   # keptProbeIOUring) calls io_uring usable only at the high tier: with the cap
   # they skip with "no usable io_uring", so what this step adds for the root tests
   # is the tests that start an io_uring engine without such a probe: they run at
-  # the base tier here and at the high tier in every other job.
+  # the base tier here and at the high tier in every other job. The root list names
+  # those arms by pattern (a new probe-gated test needs no edit; the log must say
+  # tier=base under the skipped arm) after run 40419578127, on a merge with main,
+  # met nine new such tests (117 passed, 46 SKIP lines) and failed a list of names.
   iouring-base-tier:
     name: io_uring base tier (CELERIS_MAX_IOURING_TIER=base, celeris#890)
     runs-on: ubuntu-latest

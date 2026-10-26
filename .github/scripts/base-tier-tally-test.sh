@@ -14,7 +14,7 @@ fail=0
 n=0
 export BASE_TIER_SKIPS_DIR=$dir
 printf '# header\nmin-pass 2\nTestNeedsHighTier needs a provided buffer ring\n' >"$dir/base-tier-skips-iouring.txt"
-printf '# header\n' >"$dir/base-tier-skips-root.txt"
+printf '# header\nmin-pass 1\npattern:^.+/(io_uring|adaptive)$ the arms of probe-gated tests\nTestNeedsHighTier needs a provided buffer ring\n' >"$dir/base-tier-skips-root.txt"
 
 # expect NAME WANT_STATUS WANT_STDERR_SUBSTRING LABEL LOG [TESTS...]
 expect() {
@@ -60,11 +60,25 @@ expect "a named test that skipped fails" 1 "TestShutdownDetachedPartialWriteIsFl
 # min-pass: a run that lost its tests (a -run pattern that stopped matching).
 grep -v 'TestShutdownDetachedPartialWriteIsFlushed806' "$dir/good.log" | sed 's/^--- PASS: TestReportTier844/--- XXX: TestReportTier844/' >"$dir/shrunk.log"
 expect "fewer top-level PASS lines than min-pass fails" 1 "fewer than the 2" iouring "$dir/shrunk.log"
-# The root label has no tier lines and allows nothing here.
+# The root label has no tier lines. A pattern entry allows an arm only while the log
+# shows tier=base under that arm's RUN; a top-level test, or an arm that skips for
+# another reason, is not allowed by it.
 printf '%s\n' '=== RUN   TestA' '--- PASS: TestA (0.00s)' 'PASS' >"$dir/root.log"
 expect "root: a clean log" 0 "" root "$dir/root.log"
-printf '%s\n' '=== RUN   TestA' '--- SKIP: TestA (0.00s)' 'PASS' >"$dir/rootskip.log"
-expect "root: any skip fails" 1 "TestA" root "$dir/rootskip.log"
+printf '%s\n' '=== RUN   TestA' '--- SKIP: TestA (0.00s)' '--- PASS: TestB (0.00s)' 'PASS' >"$dir/rootskip.log"
+expect "root: a skip no entry names fails" 1 "TestA" root "$dir/rootskip.log"
+arm() { # arm NAME MESSAGE: a probe-gated test whose NAME arm skipped with MESSAGE
+  printf '%s\n' '=== RUN   TestP' "=== RUN   TestP/$1" "    p_test.go:9: $2" '=== RUN   TestP/std' '--- PASS: TestP (0.00s)' \
+    "    --- SKIP: TestP/$1 (0.00s)" '    --- PASS: TestP/std (0.00s)' 'PASS'
+}
+arm io_uring 'io_uring tier=base kernel=6.17: no usable io_uring' >"$dir/arm.log"
+expect "root: an arm that logged tier=base is allowed by the pattern" 0 "" root "$dir/arm.log"
+arm io_uring 'the kernel has no io_uring' >"$dir/arm-other.log"
+expect "root: an arm that skipped for another reason fails" 1 "TestP/io_uring" root "$dir/arm-other.log"
+arm epoll 'io_uring tier=base kernel=6.17: no usable io_uring' >"$dir/arm-epoll.log"
+expect "root: an arm the pattern does not name fails" 1 "TestP/epoll" root "$dir/arm-epoll.log"
+printf '%s\n' '=== RUN   io_uring' '    p_test.go:9: io_uring tier=base: no usable io_uring' '--- SKIP: io_uring (0.00s)' '--- PASS: TestB (0.00s)' >"$dir/arm-top.log"
+expect "root: a top-level test named like an arm fails" 1 "SKIP: io_uring" root "$dir/arm-top.log"
 expect "a label that is neither fails with usage" 2 "neither iouring nor root" other "$dir/root.log"
 expect "an unreadable log is a usage error" 2 "cannot read" root "$dir/absent.log"
 
