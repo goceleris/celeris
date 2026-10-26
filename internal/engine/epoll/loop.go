@@ -770,6 +770,9 @@ func (l *Loop) run(ctx context.Context) {
 				l.onPeerHalfClose(fd)
 			}
 
+			// Conservative: EPOLLHUP with bytes unread needs both directions shut
+			// and an error purges the receive queue, so the bytes are rarely
+			// there; the re-poll reports both again on the next turn.
 			if !yielded && ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
 				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)
@@ -782,7 +785,9 @@ func (l *Loop) run(ctx context.Context) {
 			// the slot, so a close above is harmless. The pointer load is the
 			// whole cost when no drain is active. Not after a turn that ended at
 			// its budget (yielded): that conn is mid-flood, its next turn will
-			// find it at a boundary or not.
+			// find it at a boundary or not. Conservative: a hand-off with bytes
+			// still in the socket would be safe, the target's first read gets
+			// them.
 			if !yielded && l.transplant.Load() != nil {
 				l.tryTransplant(fd)
 			}
@@ -1570,8 +1575,10 @@ var drainReadBudget = 64 << 10
 // recv is paused). It reports whether drainRead should return: true when the
 // MOD was issued, or when an async conn has been hijacked, and the conn is
 // gone from this loop. False means keep reading, as before the budget: the MOD
-// failed, or the conn is closing (closeWhenFlushed's mask has no EPOLLIN by
-// design and a MOD with it would undo that). Loop thread.
+// failed, or the conn is closing (peerClosed: closeWhenFlushed's mask has no
+// EPOLLIN by design and a MOD with it would undo that; onPeerHalfClose's mark
+// keeps EPOLLIN, but after a FIN the inflow is bounded by the receive queue).
+// Loop thread.
 func (l *Loop) yieldRead(cs *connState) bool {
 	if cs.peerClosed {
 		return false
@@ -1582,6 +1589,16 @@ func (l *Loop) yieldRead(cs *connState) bool {
 		return true
 	}
 	return false
+}
+
+// switchedToH2 reports h2Switched, read under asyncInMu: true orders the
+// caller's later reads of protocol, h1State and h2State after the dispatch
+// goroutine's writes (celeris#885 item 28). Loop thread.
+func (cs *connState) switchedToH2() bool {
+	cs.asyncInMu.Lock()
+	v := cs.h2Switched
+	cs.asyncInMu.Unlock()
+	return v
 }
 
 // lockAsyncInUnlessSwitched is the loop thread's test of drainRead's async

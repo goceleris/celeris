@@ -252,9 +252,12 @@ func TestDrainReadBudgetSparesAClosingConn885(t *testing.T) {
 // slowFirst885 is pathHandler885 whose /slow answers after 300 ms: the loop
 // (a sync engine) or the conn's dispatch goroutine (an async one) is held on
 // the first request of a burst while the rest of it, written at once into the
-// socket's large buffers, is all in the kernel when reading starts: bytes the
-// budget leaves in the socket are not followed by any new segment, so only the
-// re-armed readiness reads them.
+// socket's large buffers, collects in the kernel: most of it where the buffers
+// are capped (a CI runner's net.core.wmem_max and rmem_max give about 425 KB,
+// and an explicit SO_RCVBUF turns autotuning off), all of it where they are
+// not. The bytes the budget leaves in the socket at the end of the burst are
+// not followed by any new segment, so only the re-armed readiness reads them:
+// that tail is what tests the re-arm.
 type slowFirst885 struct{ *pathHandler885 }
 
 func (h slowFirst885) HandleStream(ctx context.Context, s *stream.Stream) error {
