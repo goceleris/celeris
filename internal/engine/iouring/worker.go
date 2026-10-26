@@ -2570,7 +2570,7 @@ func capToDeadline(d time.Duration, deadline deferlinger.Deadline) time.Duration
 
 // baseTimeout is adaptiveTimeout without either cap.
 func (w *Worker) baseTimeout() time.Duration {
-	if w.listenFD < 0 {
+	if w.hasLongIdleWait() {
 		return 1 * time.Second
 	}
 	if len(w.h2Conns) > 0 && w.wakeFD.FD() < 0 {

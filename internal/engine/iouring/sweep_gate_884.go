@@ -51,8 +51,11 @@ func (w *Worker) sweepDue(now int64, gateHit bool) bool {
 // while the dirty list holds a conn, 1 ms for the first ten empty iterations,
 // 100 microseconds with H2 conns and no wake descriptor) and a read costs about
 // 35 ns. A fresh read is taken at a gate hit, when the standing timer fired,
-// after ten empty iterations with the dirty list empty (a wait of 5 ms or
-// more), and on every eighth iteration otherwise; the stale clock is never
+// whenever the wait is long (hasLongIdleWait: a worker with no listener waits
+// a second whatever its empty-iteration count, and a stale clock would hold its
+// sweeps up to eight seconds apart), after ten empty iterations with the dirty
+// list empty (a wait of 5 ms or more, or 100 microseconds with H2 conns and no
+// wake descriptor), and on every eighth iteration otherwise; the stale clock is never
 // ahead of lastSweep (checkTimeouts sets both), so it never makes a sweep due
 // by itself, it only defers the ceiling's by the iterations it covers. Worker
 // thread.
@@ -60,11 +63,18 @@ func (w *Worker) sweepClock(gotCQE, gateHit bool) int64 {
 	if gotCQE {
 		return w.cachedNow
 	}
-	if gateHit || w.sweepTickFired || (w.emptyIters > 10 && w.dirtyHead == nil) || w.tickCounter&0x7 == 0 {
+	if gateHit || w.sweepTickFired || w.hasLongIdleWait() || (w.emptyIters > 10 && w.dirtyHead == nil) || w.tickCounter&0x7 == 0 {
 		return time.Now().UnixNano()
 	}
 	return w.cachedNow
 }
+
+// hasLongIdleWait reports whether an empty iteration of this worker waits a
+// second on the ring, whatever its empty-iteration count or dirty list: a
+// worker with no listener (paused, standby, stopping). baseTimeout answers its
+// first case with it, so the two cannot diverge (celeris#884 items 65 and 75,
+// review r2 of #1114). Worker thread.
+func (w *Worker) hasLongIdleWait() bool { return w.listenFD < 0 }
 
 // armSweepTick makes sure an IORING_OP_TIMEOUT of sweepCeiling is outstanding
 // before the run loop waits for a SEND's completion with no timeout (mode 3a),
