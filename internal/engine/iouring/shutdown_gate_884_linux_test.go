@@ -361,3 +361,34 @@ func TestGatePassWaitsForTheKernelSendQueue884(t *testing.T) {
 	}
 	_ = unix.Close(local)
 }
+
+// TestGateReadsOnNeverReadsH1StateOfAGoroutinesConn884 is the regression test of
+// the review's major finding (PR #1123, round 1): gateReadsOn read cs.h1State
+// and h.Detached before it checked asyncPromoted. On a promoted conn the
+// dispatch goroutine owns h1State: switchToH2Local sets it to nil under
+// detachMu during an h2c upgrade (celeris#722: the worker may not read it while
+// the goroutine can be running). The goroutine here is in that upgrade while the
+// worker's handleRecv, past the gate, asks gateReadsOn; it is a data race, so
+// the test only fails under -race (the repository's CI runs -race).
+func TestGateReadsOnNeverReadsH1StateOfAGoroutinesConn884(t *testing.T) {
+	for range 20 {
+		w := &Worker{}
+		cs := gateConn884(7)
+		cs.detachMu = &sync.Mutex{}
+		cs.asyncPromoted.Store(true)
+		cs.asyncRun = true // the goroutine is out of its park loop: dispatchHasWork says busy
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() { // the dispatch goroutine, inside switchToH2Local
+			defer wg.Done()
+			cs.detachMu.Lock()
+			cs.h1State = nil
+			cs.protocol.Store(int32(engine.H2C))
+			cs.detachMu.Unlock()
+		}()
+		if !w.gateReadsOn(cs) {
+			t.Error("a promoted conn whose goroutine is busy was not read on")
+		}
+		wg.Wait()
+	}
+}

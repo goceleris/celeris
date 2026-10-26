@@ -167,3 +167,23 @@ func TestRunStopsOnAStuckRingWait884(t *testing.T) {
 		t.Errorf("the surviving worker did not answer: %v", err)
 	}
 }
+
+// TestRingWaitContinuesDoesNotCarryARunAcrossALongPass884 is the regression test
+// of the review's m1 (PR #1123, round 1): a retried wait, then one loop pass that
+// lasts longer than the ceiling (a park in SUSPENDED, or a slow callback in the
+// gate pass: the pass moves tickCounter by one and takes over a second), then one
+// more retried wait. The two retries are one pass apart, but they are not
+// consecutive: the run's allowed spacing is a few passes' time, and a gap longer
+// than that ends it. Before, the worker stopped on the second retry of its life.
+func TestRingWaitContinuesDoesNotCarryARunAcrossALongPass884(t *testing.T) {
+	ring := newTestRing(t)
+	w := &Worker{ring: ring, id: 3, logger: slog.New(&warnLog884{})}
+	if !w.ringWaitContinues(waitModeTimed, ceilingErr884()) {
+		t.Fatal("the first retry gave up")
+	}
+	w.tickCounter++ // the pass that parks
+	time.Sleep(1100 * time.Millisecond)
+	if !w.ringWaitContinues(waitModeTimed, ceilingErr884()) {
+		t.Fatal("the worker gave up on its second retried wait, after one long pass between two isolated retries: a run is carried across a gap")
+	}
+}
