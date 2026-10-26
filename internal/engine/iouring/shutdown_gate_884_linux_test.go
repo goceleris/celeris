@@ -392,3 +392,33 @@ func TestGateReadsOnNeverReadsH1StateOfAGoroutinesConn884(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// TestStopDetachedProducersNeverReadsH1StateOfAGoroutinesConn884 is the same
+// race in the walk the gate pass runs before closeIdleH1 (stopDetachedProducers
+// read cs.h1State and Detached before its detachMu TryLock, found by the search
+// the review's finding asked for): a promoted conn whose goroutine is in an h2c
+// upgrade sets h1State to nil under detachMu. Fails only under -race.
+func TestStopDetachedProducersNeverReadsH1StateOfAGoroutinesConn884(t *testing.T) {
+	for range 20 {
+		w := &Worker{conns: make([]*connState, 16)}
+		cs := gateConn884(7)
+		cs.detachMu = &sync.Mutex{}
+		cs.asyncPromoted.Store(true)
+		w.conns[cs.fd] = cs
+		w.addLiveConn(cs)
+		started := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() { // the dispatch goroutine, inside switchToH2Local
+			defer wg.Done()
+			cs.detachMu.Lock()
+			close(started)
+			cs.h1State = nil
+			cs.protocol.Store(int32(engine.H2C))
+			cs.detachMu.Unlock()
+		}()
+		<-started
+		w.stopDetachedProducers()
+		wg.Wait()
+	}
+}
