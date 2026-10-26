@@ -13,12 +13,13 @@ import (
 )
 
 // celeris#884 item 1 (from celeris#762 item 2). The kernel header timer of a
-// promoted async conn is armed from three places that no test reached with a
-// deadline pending: handleRecv's async feed and promoteConnToAsync arm it from
+// promoted async conn was armed from three places that no test reached with a
+// deadline pending: handleRecv's async feed and promoteConnToAsync armed it from
 // the deadline asyncHeaderDeadline read before the dispatch goroutine could
 // change cs.h1State (celeris#722), and handleHeaderTimer re-arms it on an
 // early fire. Deleting either arm survived the whole package (mutant Z12), and
-// no test called handleHeaderTimer at all.
+// no test called handleHeaderTimer at all. The promotion's arm is gone
+// (celeris#884 item 82); the other two remain.
 //
 // Every test runs on an fdlFixture with AsyncHandlers on and ReadHeaderTimeout
 // set, on a ring the kernel never sees (takeSQEs): the SQEs the worker places
@@ -140,19 +141,13 @@ func TestAsyncFeedArmsTheHeaderTimer762(t *testing.T) {
 	}
 }
 
-// TestAsyncPromotionArmsTheHeaderTimer762 (Z12, the promotion site) calls
-// promoteConnToAsync with a deadline pending and no timer in flight. The
-// deadline is staged: through the inline path ProcessH1 clears it before it
-// returns ErrAsyncDispatch (the head is complete by then), so a real
-// promotion finds none and this arm is not reached by traffic; the unit is
-// what keeps it right for the day a promotion happens with one pending.
-func TestAsyncPromotionArmsTheHeaderTimer762(t *testing.T) {
-	f := headerTimerFixture762(t, false)
-	f.cs.headerTimerArmed = false
-	f.cs.asyncPromoted.Store(true) // the caller's step, per promoteConnToAsync's comment
-	f.w.promoteConnToAsync(f.cs, f.fd, []byte(partial762), &completionEntry{Res: int32(len(partial762))})
-	wantOneTimer762(t, f, "promoteConnToAsync", takeSQEs(f.w.ring))
-}
+// There is no test of an arm in promoteConnToAsync: it has none (celeris#884
+// item 82). ProcessH1 clears the header deadline before it returns
+// ErrAsyncDispatch, so a conn promoted there never has one pending, and the
+// arm that was reached by no traffic was removed. The invariant is pinned where
+// it holds, by TestInlineAsyncDispatchLeavesNoHeaderDeadline884 in
+// internal/conn; the arm that is live (the feed's) by the tests above and by
+// TestAsyncFeedArmsTheHeaderTimerOfADrippedRequest884, end to end.
 
 // TestHeaderTimerEarlyFireRearms762 (handleHeaderTimer's early-fire branch,
 // which no test reached): the timer's CQE arrives with the deadline still

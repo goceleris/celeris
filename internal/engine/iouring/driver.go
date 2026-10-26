@@ -408,7 +408,7 @@ func (w *Worker) armDriverRecv(dc *driverConn) {
 	// for any op in flight (a re-arm can have a SEND in the kernel) and
 	// then finalizes: onClose gets the error, and retire closes opFD.
 	// w.conns belongs to the worker goroutine, which this is.
-	if dc.fd < len(w.conns) && w.conns[dc.fd] != nil {
+	if dc.fd < len(w.conns) && ownsDescriptorNumber(w.conns[dc.fd]) {
 		dc.mu.Unlock()
 		w.failDriverConn(dc, fmt.Errorf("celeris/iouring: fd %d is already an HTTP connection", dc.fd))
 		return
