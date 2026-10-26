@@ -4,6 +4,7 @@ package iouring
 
 import (
 	"errors"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -28,3 +29,11 @@ var shutdownRingWait = (*Ring).SubmitAndWaitTimeout
 func ringWaitRetryable(err error) bool {
 	return errors.Is(err, unix.EBUSY) || errors.Is(err, unix.EAGAIN)
 }
+
+// ringWaitCeiling is how long Worker.run retries a ring wait that answers a
+// retryable error, one pass after the other, with nothing in the CQ ring to
+// reap, before it takes the ring for a failing one and stops the worker, as it
+// did for every error before the retries existed (ringWaitContinues, celeris#884
+// item 72). A full CQ ring is cleared by the loop's own reap within a pass or
+// two, so a second of retries that reap nothing is a ring that will not recover.
+const ringWaitCeiling = time.Second

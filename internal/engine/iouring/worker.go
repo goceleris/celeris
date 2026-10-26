@@ -962,9 +962,15 @@ type Worker struct {
 	// ringWaitWarned is set once the first retried wait was logged
 	// (ringWaitContinues). Worker thread only.
 	ringWaitWarned bool
-	// producersStopNext is when (UnixNano) the pool wait's gate may walk the
-	// detached conns again (stopProducersPaced). Worker thread only.
+	// producersStopNext is when (UnixNano) the shutdown gate may walk the
+	// conns again (stopProducersPaced, closeIdlePaced). Worker thread only.
 	producersStopNext int64
+	// ringWaitRunStart is when (UnixNano) the run of consecutive retried ring
+	// waits that reaped nothing began, and ringWaitRunTick the loop pass
+	// (tickCounter) of the last of them: ringWaitContinues' ceiling
+	// (celeris#884 item 72). Zero start: no run. Worker thread only.
+	ringWaitRunStart int64
+	ringWaitRunTick  uint32
 }
 
 // recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
@@ -1594,7 +1600,9 @@ func (w *Worker) run(ctx context.Context) {
 				// so a slow callback delays the HTTP/2 conns served here.
 				if now := time.Now().UnixNano(); now > w.h2DrainStart+shutdownSendDrainNanos {
 					w.refuseRecv = true
-					w.stopProducersPaced(now)
+					if w.stopProducersPaced(now) {
+						w.closeIdleH1()
+					}
 				}
 			} else {
 				now := time.Now().UnixNano()
@@ -1614,6 +1622,7 @@ func (w *Worker) run(ctx context.Context) {
 					w.stopAccepting(ctx)
 					w.refuseRecv = true
 					w.stopDetachedProducers()
+					w.closeIdlePaced(now)
 				}
 			}
 		}
@@ -3969,7 +3978,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// HTTP/2 conns are served on: they have had GOAWAY since the pool wait,
 	// and what their responses may still wait for was waited for there or
 	// is out of time.
-	if w.refuseRecv && (!cs.detected || w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
+	if w.refuseRecv && (!cs.detected || w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) && !w.gateReadsOn(cs) {
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
 			w.hasBufReturns = true
@@ -8004,13 +8013,21 @@ func (w *Worker) stopDetachedProducers() {
 // flushed, or EAGAIN) says the CQ ring has no room, not that the ring failed:
 // the SQEs the enter did not take stay pending (retryPending), and the loop's
 // own pass over the CQ ring after this returns is the reap that makes room.
-// The error is counted and, the first time on a worker, logged as a Warn;
-// there is no ceiling on the retries (a ring that fails for good with EBUSY
-// or EAGAIN is retried until the context is cancelled: the checklist of
-// celeris#884 records it). With nothing in the ring to reap the worker gives
-// the kernel a moment (cancelAccept's drain does the same) rather than enter
-// again at once. Any other error is the ring failing: the worker stops, and
-// closes what it owns.
+// The error is counted and, the first time on a worker, logged as a Warn.
+// With nothing in the ring to reap the worker gives the kernel a moment
+// (cancelAccept's drain does the same) rather than enter again at once.
+//
+// A ring that answers for good, with nothing in its CQ ring to reap, is not
+// one whose CQ ring is full but one that is failing, and the retries end as
+// they did before they existed: after ringWaitCeiling of consecutive retries
+// that reaped nothing the worker stops (false: the caller shuts it down) and
+// logs an Error (celeris#884 item 72). A retry that finds a completion in the
+// CQ ring, which the loop's own pass reaps, is the loop being behind its ring
+// and ends the run; so does a wait that succeeded in between (the loop pass
+// count, which moves once per pass, jumps by more than one: a retry is part
+// of the run only if it follows the last one at once), and a run is not
+// carried over a gap longer than a wait takes. Any other error is the ring
+// failing: the worker stops, and closes what it owns.
 func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 	if h := ringWaitSeam; h != nil {
 		err = h(w, mode, err)
@@ -8032,9 +8049,24 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 				"worker", w.id, "wait", mode.String(), "err", err)
 		}
 	}
-	if h, t := w.ring.BeginCQ(); h == t {
-		time.Sleep(50 * time.Microsecond)
+	h, t := w.ring.BeginCQ()
+	if h != t {
+		w.ringWaitRunStart = 0 // the loop reaps: not a ring that is stuck
+		return true
 	}
+	now := time.Now().UnixNano()
+	if w.ringWaitRunStart == 0 || w.tickCounter-w.ringWaitRunTick > 1 {
+		w.ringWaitRunStart = now // a new run: a wait succeeded since the last retry
+	} else if now-w.ringWaitRunStart >= int64(ringWaitCeiling) {
+		if w.logger != nil {
+			w.logger.Error("io_uring: a ring wait has answered a retryable error for the whole ceiling with nothing to reap; the ring is failing, the worker stops",
+				"worker", w.id, "wait", mode.String(), "err", err, "ceiling", ringWaitCeiling,
+				"retries", w.ringWaitRetries.Load())
+		}
+		return false
+	}
+	w.ringWaitRunTick = w.tickCounter
+	time.Sleep(50 * time.Microsecond)
 	return true
 }
 

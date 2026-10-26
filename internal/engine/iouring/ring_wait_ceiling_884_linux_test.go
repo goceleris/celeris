@@ -90,22 +90,26 @@ func TestRingWaitContinuesNeverGivesUpWhileItReaps884(t *testing.T) {
 }
 
 // TestRingWaitContinuesCountsOnlyConsecutiveRetries884: retries that come
-// apart, each after waits that succeeded (an idle worker's timed wait takes up
-// to a second; a retry 400 ms after the last), are not a stuck ring: a worker that meets an EBUSY now and
-// then, with nothing to reap each time, runs on.
+// apart, each after waits that succeeded, are not a stuck ring: a worker that
+// meets an EBUSY now and then, with nothing to reap each time, runs on. The
+// loop pass count (tickCounter) moves once per pass, so a retry that follows
+// the last by more than one pass has a wait that succeeded between them: the
+// test models it by advancing the count, with the time between the retries a
+// stuck run's own (50 us sleeps) so that only the count tells the two apart.
 func TestRingWaitContinuesCountsOnlyConsecutiveRetries884(t *testing.T) {
 	ring := newTestRing(t)
 	w := &Worker{ring: ring, id: 3, logger: slog.New(&warnLog884{})}
 	start := time.Now()
 	n := 0
-	for time.Since(start) < 3*time.Second {
+	for time.Since(start) < 2500*time.Millisecond {
 		if !w.ringWaitContinues(waitModeTimed, ceilingErr884()) {
-			t.Fatalf("the worker gave up after %v and %d retries, each apart from the last by 400 ms of waits that succeeded",
+			t.Fatalf("the worker gave up after %v and %d retries, each apart from the last by a pass whose wait succeeded",
 				time.Since(start).Round(time.Millisecond), n)
 		}
 		n++
-		time.Sleep(400 * time.Millisecond)
+		w.tickCounter += 2 // the retried pass, then a pass whose wait succeeded
 	}
+	t.Logf("celeris884: %d retries, every other pass, over %v: the worker runs on", n, time.Since(start).Round(time.Millisecond))
 }
 
 // TestRunStopsOnAStuckRingWait884: the engine's own arm. One worker's waits
