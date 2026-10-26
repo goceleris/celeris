@@ -1369,9 +1369,11 @@ func (c *Context) BytesWritten() int {
 // that is still queued in the engine when a later pipelined request hijacks,
 // is sent to the peer before the connection is handed over. The native
 // engines do that without waiting: if the socket's send buffer does not take
-// the whole reply now (a peer that reads slowly), Hijack fails with the connection untouched and the
-// reply still queued, as above, rather than dropping the reply or blocking the
-// event loop.
+// the whole reply now (a peer that reads slowly), Hijack fails with the
+// connection untouched and the reply still queued, as above, rather than
+// dropping the reply or blocking the event loop. If writing the queued reply
+// fails because the peer is gone, Hijack fails and the engine closes the
+// connection.
 //
 // Hijack on a Context that has been detached ([Context.Detach]) returns
 // [ErrHijackAfterDetach]: the connection is the detaching middleware's.

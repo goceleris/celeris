@@ -3,6 +3,8 @@
 package iouring
 
 import (
+	"bytes"
+	"log/slog"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -94,4 +96,50 @@ func TestHijackSubmitIsNotRetriedOnOtherErrors884(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("a submit that failed with EINTR ran %d times, want 1", calls)
 	}
+}
+
+// A submit that succeeds but takes only part of the batch leaves SQEs pending
+// (ring.Pending() > 0): the cancel is not in the kernel yet. It is offered
+// again, and one that stays short on every try is logged, as an error is.
+func TestHijackShortSubmitIsRetriedAndLogged884(t *testing.T) {
+	run := func(t *testing.T, shortTries int) (calls int, pending uint32, logged string) {
+		f := newMultishotFixture869(t)
+		w, cs := f.w, f.cs
+		if !w.prepareRecv(cs, cs.buf) || !cs.recvArmed {
+			t.Fatalf("multishot recv not armed")
+		}
+		var buf bytes.Buffer
+		w.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		w.hijackSubmit = func() (int, error) {
+			calls++
+			if calls <= shortTries {
+				return 0, nil // took nothing, reported no error: the SQEs stay pending
+			}
+			return w.ring.Submit()
+		}
+		c, err := w.hijackConn(f.fd)
+		if err != nil {
+			t.Fatalf("hijackConn: %v", err)
+		}
+		defer func() { _ = c.Close() }()
+		return calls, w.ring.Pending(), buf.String()
+	}
+	t.Run("completes", func(t *testing.T) {
+		calls, pending, logged := run(t, 2)
+		if calls != 3 || pending != 0 {
+			t.Errorf("submit ran %d times, %d SQEs pending: a short submit was not offered again until it went through", calls, pending)
+		}
+		if logged != "" {
+			t.Errorf("logged %q for a hijack whose submit went through", logged)
+		}
+	})
+	t.Run("never-completes", func(t *testing.T) {
+		calls, pending, logged := run(t, 1<<30)
+		if calls != hijackSubmitTries || pending == 0 {
+			t.Errorf("submit ran %d times (want the bound %d), %d pending", calls, hijackSubmitTries, pending)
+		}
+		if n := bytes.Count([]byte(logged), []byte("level=WARN")); n != 1 {
+			t.Errorf("logged %d warnings (%q), want exactly 1 for a give-up with the cancel still pending", n, logged)
+		}
+	})
 }

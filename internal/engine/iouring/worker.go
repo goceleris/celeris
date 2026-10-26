@@ -3275,8 +3275,8 @@ func (w *Worker) submitForHijack() {
 			break
 		}
 	}
-	if err != nil && w.logger != nil {
-		w.logger.Warn("hijack: the cancel of an armed op was not submitted before the socket was handed over", "worker", w.id, "err", err)
+	if pending := w.ring.Pending(); (err != nil || pending > 0) && w.logger != nil {
+		w.logger.Warn("hijack: the cancel of an armed op was not submitted before the socket was handed over", "worker", w.id, "err", err, "pending", pending)
 	}
 }
 

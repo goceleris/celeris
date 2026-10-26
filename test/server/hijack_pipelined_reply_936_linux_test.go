@@ -227,6 +227,9 @@ func TestHijackWithAQueuedLargeReply936(t *testing.T) {
 				t.Fatalf("the big reply: %d of %d bytes, err %v (Hijack returned %v)", len(body), len(big), err, herr)
 			}
 			if herr == nil {
+				// This host's socket buffers took all of the reply: the refusal
+				// branch, the one this test exists for, was not reached.
+				t.Logf("NOT EXERCISED: Hijack succeeded, so the host's buffers took the whole %d byte reply and the refusal branch was not reached on %s", len(big), a.name)
 				rest, _ := io.ReadAll(br)
 				if string(rest) != pipelined936Hijacked {
 					t.Fatalf("after the big reply, the hijacker's bytes were %q, want %q", rest, pipelined936Hijacked)
