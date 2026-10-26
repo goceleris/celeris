@@ -27,9 +27,10 @@ func (g *RouteGroup) handle(method, path string, handlers ...HandlerFunc) *Route
 
 // Async sets the dispatch mode for all routes registered on this group
 // AFTER this call (and inherited by sub-groups created after it),
-// overriding the server-level [Config.AsyncHandlers] default. Async() with
-// no argument means async (true). Individual routes can still override
-// via [Route.Async] / [Route.Sync] (route > group > server precedence).
+// overriding the server-level [Config.AsyncHandlers] default. Individual
+// routes can still override via [Route.Async] / [Route.Sync] (route > group >
+// server precedence); use [RouteGroup.Sync] to opt a group out of an async
+// default.
 // Must be called before [Server.Start]. Chainable:
 //
 //	api := srv.Group("/api").Async()              // async for all /api/* routes
@@ -42,19 +43,15 @@ func (g *RouteGroup) handle(method, path string, handlers ...HandlerFunc) *Route
 // SAFETY: do NOT call .Sync() on a group whose handlers hijack/detach the
 // connection (WebSocket upgrade, SSE) — detached flows are async by
 // construction.
-func (g *RouteGroup) Async(opt ...bool) *RouteGroup {
-	if len(opt) > 0 && !opt[0] {
-		g.async = asyncOff
-	} else {
-		g.async = asyncOn
-	}
+func (g *RouteGroup) Async() *RouteGroup {
+	g.async = asyncOn
 	return g
 }
 
 // Sync forces all routes registered on this group AFTER this call to run
 // inline on the worker / event-loop thread, overriding any server-level
-// async default. Equivalent to .Async(false). Individual routes can still
-// override via [Route.Async]. Chainable.
+// async default. Individual routes can still override via [Route.Async].
+// Chainable.
 //
 // SAFETY: do NOT call .Sync() on a group whose handlers hijack/detach the
 // connection (WebSocket upgrade, SSE) — detached flows are async by

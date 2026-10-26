@@ -139,7 +139,6 @@ method (*Context) StatusCode() int
 method (*Context) StatusJSON(any) error
 method (*Context) StatusString(string) error
 method (*Context) StatusXML(any) error
-method (*Context) Stream(int, string, io.Reader) error
 method (*Context) StreamReader(int, string, io.Reader) error
 method (*Context) StreamWriter() *StreamWriter
 method (*Context) String(int, string, ...any) error
@@ -152,14 +151,14 @@ method (*Context) XML(int, any) error
 method (*HTTPError) Error() string
 method (*HTTPError) Unwrap() error
 method (*HTTPError) WithError(error) *HTTPError
-method (*Route) Async(...bool) *Route
+method (*Route) Async() *Route
 method (*Route) Name(string) *Route
 method (*Route) Sync() *Route
 method (*Route) TryName(string) error
 method (*Route) Use(...HandlerFunc) *Route
 method (*Route) UsesDriver() *Route
 method (*RouteGroup) Any(string, ...HandlerFunc) []*Route
-method (*RouteGroup) Async(...bool) *RouteGroup
+method (*RouteGroup) Async() *RouteGroup
 method (*RouteGroup) DELETE(string, ...HandlerFunc) *Route
 method (*RouteGroup) GET(string, ...HandlerFunc) *Route
 method (*RouteGroup) Group(string, ...HandlerFunc) *RouteGroup
@@ -226,6 +225,8 @@ type Config struct
 type Config struct, Addr string
 type Config struct, AsyncHandlers bool
 type Config struct, BufferSize int
+type Config struct, DisableAutoHEAD bool
+type Config struct, DisableAutoOPTIONS bool
 type Config struct, DisableDeferAccept bool
 type Config struct, DisableKeepAlive bool
 type Config struct, DisableMetrics bool
@@ -254,7 +255,7 @@ type Config struct, TrustedProxies []string
 type Config struct, Workers int
 type Config struct, WorkloadHint WorkloadHint
 type Config struct, WriteTimeout time.Duration
-type Config struct, field order Addr, Protocol, Engine, Workers, WorkloadHint, ReadTimeout, ReadHeaderTimeout, WriteTimeout, IdleTimeout, ShutdownTimeout, MaxFormSize, MaxRequestBodySize, MaxConcurrentStreams, MaxFrameSize, InitialWindowSize, MaxHeaderBytes, DisableKeepAlive, DisableDeferAccept, BufferSize, SocketRecvBuf, SocketSendBuf, MaxConns, MemoryLimitBytes, DisableMetrics, AsyncHandlers, OnExpectContinue, OnConnect, OnDisconnect, TrustedProxies, Logger, EnableH2Upgrade
+type Config struct, field order Addr, Protocol, Engine, Workers, WorkloadHint, ReadTimeout, ReadHeaderTimeout, WriteTimeout, IdleTimeout, ShutdownTimeout, MaxFormSize, MaxRequestBodySize, MaxConcurrentStreams, MaxFrameSize, InitialWindowSize, MaxHeaderBytes, DisableKeepAlive, DisableDeferAccept, BufferSize, SocketRecvBuf, SocketSendBuf, MaxConns, MemoryLimitBytes, DisableMetrics, AsyncHandlers, OnExpectContinue, OnConnect, OnDisconnect, TrustedProxies, Logger, EnableH2Upgrade, DisableAutoHEAD, DisableAutoOPTIONS
 type Config struct, not comparable
 type Context struct
 type Context struct, not comparable
@@ -322,6 +323,7 @@ var ErrNoValidator error
 var ErrResponseWritten error
 var ErrRouteNotFound error
 var ErrServiceUnavailable *HTTPError
+var ErrStreamRefused error
 var ErrUnauthorized *HTTPError
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface
 exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, NumWorkers() int

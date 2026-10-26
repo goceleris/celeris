@@ -16,7 +16,12 @@ import (
 )
 
 var (
-	// ErrPanic is the base sentinel for all recovery-caught panics.
+	// ErrPanic is the sentinel for a recovered panic whose value is not an
+	// error: ErrorHandler receives it wrapped (fmt.Errorf("%w: %v", ErrPanic,
+	// value)), so errors.Is(err, ErrPanic) holds. An error panic value is passed
+	// to ErrorHandler as it is and does not match ErrPanic; nor do
+	// ErrBrokenPipe, ErrPanicContextCancelled and ErrPanicResponseCommitted,
+	// which are separate sentinels.
 	ErrPanic = errors.New("recovery: panic")
 
 	// ErrPanicContextCancelled is returned when a panic occurs after
@@ -64,18 +69,18 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 	cfg = applyDefaults(cfg)
 
-	handler := cfg.ErrorHandler
-	// ErrorHandlerErr takes precedence — wrap the panic value as an
-	// error and route through the typed handler. Non-error panic values
-	// (string / struct / etc.) are wrapped via fmt.Errorf so callers
-	// can use errors.Is / errors.As.
-	if cfg.ErrorHandlerErr != nil {
-		typedFn := cfg.ErrorHandlerErr
+	handler := defaultErrorHandler
+	// With ErrorHandler set, wrap the panic value as an error and route
+	// through the typed handler. Non-error panic values (string / struct /
+	// etc.) are wrapped via fmt.Errorf so callers can use errors.Is /
+	// errors.As.
+	if cfg.ErrorHandler != nil {
+		typedFn := cfg.ErrorHandler
 		handler = func(c *celeris.Context, r any) error {
 			if e, ok := r.(error); ok {
 				return typedFn(c, e)
 			}
-			return typedFn(c, fmt.Errorf("recovery: panic: %v", r))
+			return typedFn(c, fmt.Errorf("%w: %v", ErrPanic, r))
 		}
 	}
 	brokenPipeHandler := cfg.BrokenPipeHandler

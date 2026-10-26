@@ -86,7 +86,7 @@ func TestPanicRecordsSurviveNextRequest(t *testing.T) {
 		{"brokenpipe", func(l *slog.Logger) recovery.Config { return recovery.Config{Logger: l} },
 			func(*celeris.Context) error { panic(syscall.EPIPE) }, []rec{{"broken pipe", false}}},
 		{"errhandler", func(l *slog.Logger) recovery.Config {
-			return recovery.Config{Logger: l, ErrorHandler: func(*celeris.Context, any) error { panic("handler down") }}
+			return recovery.Config{Logger: l, ErrorHandler: func(*celeris.Context, error) error { panic("handler down") }}
 		}, panicHeader, []rec{{"panic recovered", true}, {"panic in error handler", false}}},
 		{"cancelled", func(l *slog.Logger) recovery.Config { return recovery.Config{Logger: l} },
 			func(c *celeris.Context) error {

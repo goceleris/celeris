@@ -149,6 +149,8 @@ func New(cfg Config) *Server {
 	// Seed the router's per-route async resolution with the server-level
 	// default so routes/groups that don't override inherit it.
 	s.router.defaultAsync = cfg.AsyncHandlers
+	s.router.noAutoHEAD = cfg.DisableAutoHEAD
+	s.router.noAutoOPTIONS = cfg.DisableAutoOPTIONS
 	if !cfg.DisableMetrics {
 		s.collector = observe.NewCollector()
 	}
@@ -248,7 +250,8 @@ func (s *Server) PATCH(path string, handlers ...HandlerFunc) *Route {
 // HEAD registers a handler for HEAD requests. A path without a HEAD route
 // is answered by its GET route, if it has one: the GET handler runs (it sees
 // Method() == "HEAD") and the engine sends its headers without the body
-// (RFC 9110 §9.3.2). Register HEAD only to answer it differently.
+// (RFC 9110 §9.3.2). Register HEAD only to answer it differently, or set
+// [Config.DisableAutoHEAD] to answer HEAD only where a HEAD route exists.
 //
 // A GET handler that streams through [Context.StreamWriter], with
 // [Context.Detach] and a goroutine that goes on writing, must check
@@ -265,6 +268,7 @@ func (s *Server) HEAD(path string, handlers ...HandlerFunc) *Route {
 // GET, and OPTIONS) and Content-Length: 0 (RFC 9110 §9.3.7). The global
 // middleware ([Server.Use]) runs first, so a CORS middleware answers its
 // preflight; group and route middleware do not run for it.
+// [Config.DisableAutoOPTIONS] turns the automatic answer off.
 func (s *Server) OPTIONS(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("OPTIONS", path, handlers...)
 }

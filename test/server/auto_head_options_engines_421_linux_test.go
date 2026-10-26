@@ -296,6 +296,13 @@ func h2HeadDataBytes421(addr, path string) (status string, data int, err error) 
 // so it may call Server.Use.
 func startServer421(t *testing.T, eng celeris.EngineType, setup func(*celeris.Server)) string {
 	t.Helper()
+	return startServerConfig421(t, celeris.Config{Engine: eng}, setup)
+}
+
+// startServerConfig421 is startServer421 with a whole Config (its Addr is
+// chosen here).
+func startServerConfig421(t *testing.T, cfg celeris.Config, setup func(*celeris.Server)) string {
+	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -304,7 +311,8 @@ func startServer421(t *testing.T, eng celeris.EngineType, setup func(*celeris.Se
 		}
 		addr := ln.Addr().String()
 		_ = ln.Close()
-		s := celeris.New(celeris.Config{Engine: eng, Addr: addr})
+		cfg.Addr = addr
+		s := celeris.New(cfg)
 		setup(s)
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 		startDone := make(chan error, 1)

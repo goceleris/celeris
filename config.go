@@ -502,7 +502,7 @@ type Config struct {
 	// [RouteGroup.Async] (most-specific wins: route > group > this
 	// default), so a server with mostly CPU routes + a few DB routes can
 	// keep this false and mark just the DB routes .Async() / .UsesDriver(),
-	// or set this true and mark hot CPU routes .Async(false). On HTTP/2 the
+	// or set this true and mark hot CPU routes .Sync(). On HTTP/2 the
 	// override is honored per-stream (sync routes run inline on the event
 	// loop, async routes dispatch to the worker pool).
 	//
@@ -542,6 +542,8 @@ type Config struct {
 	// The method, the path and the header strings are request strings, valid only
 	// during the call (on epoll and io_uring, views of the receive buffer; see the
 	// package doc): copy one with [strings.Clone] before anything keeps it.
+	// Several Cookie lines are one field joined with "; ", as the handler sees
+	// them.
 	//
 	// On the native engines the callback runs on the event-loop goroutine,
 	// except on a connection already promoted to async dispatch, where it runs
@@ -615,6 +617,38 @@ type Config struct {
 	// header is missing, repeated or not such a payload is not upgraded: it
 	// is served as plain HTTP/1.1, never answered with an error status.
 	EnableH2Upgrade *bool
+
+	// DisableAutoHEAD turns off the router's automatic HEAD answer
+	// (celeris#421). By default a HEAD request to a path that has a GET route
+	// and no HEAD route runs the GET route (RFC 9110 §9.3.2: HEAD is GET
+	// without the content; the engine sends the headers and drops the body),
+	// and the path's Allow lists HEAD. When true, the router no longer
+	// answers HEAD with a GET route: a HEAD request that no HEAD route (or
+	// middleware, below) answers is answered like a method the path does not
+	// support, 405 Method Not Allowed with an Allow header that does not list
+	// HEAD (or 404 if the path has no route), running the
+	// [Server.MethodNotAllowed] handler. What still answers HEAD: a route
+	// registered with [Server.HEAD] or [Server.Any] (which registers HEAD),
+	// and middleware that answers it itself (healthcheck, swagger, static,
+	// anything in a [Server.Pre] or [Server.Use] chain that writes the
+	// response). Use it to keep a GET handler with a side effect, or a
+	// streaming one, from running for HEAD requests. Default: false (HEAD is
+	// answered by the GET route).
+	DisableAutoHEAD bool
+
+	// DisableAutoOPTIONS turns off the router's automatic OPTIONS answer
+	// (celeris#421). By default an OPTIONS request to a path that has routes
+	// and no OPTIONS route is answered 200 with an Allow header and
+	// Content-Length: 0 (RFC 9110 §9.3.7) after the global middleware
+	// ([Server.Use]) has run, and the path's Allow lists OPTIONS. When true,
+	// the router no longer answers it: an OPTIONS request that no OPTIONS
+	// route (also through [Server.Any]) or middleware, below, answers is
+	// answered like a method the path does not support (405 with an Allow
+	// header that does not list OPTIONS, or 404 if the path has no route).
+	// The global middleware still runs for it, so a CORS middleware
+	// installed with [Server.Use] still answers its preflight, and so does
+	// any other middleware that answers OPTIONS itself. Default: false.
+	DisableAutoOPTIONS bool
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
