@@ -27,7 +27,12 @@ package iouring
 // that close (celeris#884 item 80): the conn's recv is ended and reaped inside
 // the sweep's own pass, so its close lands after sweep() with nothing owed to
 // the kernel, the gate does not hold the worker, and only the retraction at
-// the park clears the gauges (red with it removed).
+// the park clears the gauges (red with it removed). What this proves: the
+// retraction is needed for that state. What it does not: that production
+// reaches that state (no traffic path was found that leaves the last conn with
+// no op in flight after sweep(); the state is manufactured in the hook), so the
+// item's other outcome, calling the retraction dead behind the closeFDOwed gate,
+// is not shown either.
 
 import (
 	"context"

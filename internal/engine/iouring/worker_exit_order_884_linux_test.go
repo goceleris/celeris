@@ -84,6 +84,9 @@ func TestLeaveGroupAfterExitClosesTheRingAndTheListener884(t *testing.T) {
 	}
 }
 
+// (Not a guard on its own: under the order mutant it was red 3 runs of 5, the
+// watcher racing the worker; TestReportWorkerExitLeavesTheGroupBeforeTheFlag884
+// below is the deterministic detector, red 5 of 5.)
 // TestGoexitedWorkerLeavesTheGroupBeforeItIsMarkedExited884 is the engine half,
 // in the child process every test that kills a worker runs in. A watcher per
 // worker spins on exited; at the instant it sees it set, the listener must

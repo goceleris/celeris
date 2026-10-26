@@ -61,12 +61,15 @@ func (w *Worker) gateReadsOn(cs *connState) bool {
 		// bytes): a request that begins after the gate.
 		return len(cs.detectAccum) > 0
 	}
+	// Before any read of h1State: on a promoted conn the dispatch goroutine owns
+	// the field (switchToH2Local sets it to nil during an h2c upgrade, celeris#722),
+	// so it is read only under detachMu (promotedInProgress).
+	if cs.asyncPromoted.Load() {
+		return w.promotedInProgress(cs)
+	}
 	h := cs.h1State
 	if h == nil || h.Detached.Load() {
 		return false // a detached stream is read no more: its writes were ended with the gate
-	}
-	if cs.asyncPromoted.Load() {
-		return w.promotedInProgress(cs)
 	}
 	// A conn the worker parses itself: its h1State is the worker's to read.
 	if cs.recvIntoBody || h.HasPendingData() || !h.AtRequestBoundary() {
@@ -82,6 +85,12 @@ func (w *Worker) gateReadsOn(cs *connState) bool {
 // request. It marks an idle conn close-after too: the worker does not know
 // that no request will follow before the pass closes the conn. Worker thread.
 func (w *Worker) promotedInProgress(cs *connState) bool {
+	// A detached stream whose writes were ended (by the gate or a close) is read
+	// no more; writeEnded is an atomic, so this holds even while a guarded write
+	// has detachMu.
+	if cs.writeEnded.Load() {
+		return false
+	}
 	if dispatchHasWork(cs) {
 		return true
 	}
@@ -117,7 +126,11 @@ func dispatchHasWork(cs *connState) bool {
 // hold nothing are closed (gateCloseable). A conn whose response is still going
 // out, or whose lock is busy, is met again by the next pass. closeConn removes
 // a conn from liveConns by swapping it with the last entry, so the walk goes
-// from the top down, as checkTimeouts does. Worker thread.
+// from the top down, as checkTimeouts does. The pass runs at the top of the loop
+// pass, before the pass reaps new completions: a request whose recv CQE was
+// posted after the last reap meets a conn that looks idle and is closed with
+// that request unread, the race std's own idle close has (microseconds wide;
+// not measured). Worker thread.
 func (w *Worker) closeIdleH1() {
 	closed := 0
 	for i := len(w.liveConns) - 1; i >= 0; i-- {
@@ -132,12 +145,19 @@ func (w *Worker) closeIdleH1() {
 		if !w.gateCloseable(cs) {
 			continue
 		}
+		// Past the cap the conn was still looked at, so it is marked close-after
+		// (gateCloseable); it is closed by a later pass.
 		if closed >= gateClosesPerPass {
 			continue
 		}
 		// The kernel's send queue: a conn whose response left user space but
-		// not the host is not idle either (a close with unsent bytes would race
-		// them with the FIN). A fixed-file conn's slot is an index into the
+		// has not all been acknowledged by the peer is not idle yet. close(2)
+		// keeps the send queue and sends the FIN after it, so nothing is lost by
+		// closing early unless the peer sends after the close (the unread
+		// bytes turn the close into an RST, and the peer discards what it had
+		// not read) or an SO_LINGER{1,0} path is in play; waiting for an empty
+		// queue (SIOCOUTQ counts unacknowledged bytes) keeps that window shut,
+		// and is what epoll does. A fixed-file conn's slot is an index into the
 		// ring's file table, not a descriptor, so the ioctl cannot ask about it:
 		// such a conn is judged by its user-space queues alone
 		// (ownsDescriptorNumber).

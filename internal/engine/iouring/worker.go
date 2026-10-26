@@ -968,10 +968,12 @@ type Worker struct {
 	// conns again (stopProducersPaced, closeIdlePaced). Worker thread only.
 	producersStopNext int64
 	// ringWaitRunStart is when (UnixNano) the run of consecutive retried ring
-	// waits that reaped nothing began, and ringWaitRunTick the loop pass
+	// waits that reaped nothing began, ringWaitRunLast when the last of them
+	// was, and ringWaitRunTick the loop pass
 	// (tickCounter) of the last of them: ringWaitContinues' ceiling
 	// (celeris#884 item 72). Zero start: no run. Worker thread only.
 	ringWaitRunStart int64
+	ringWaitRunLast  int64
 	ringWaitRunTick  uint32
 }
 
@@ -8048,7 +8050,9 @@ func (w *Worker) stopDetachedProducers() {
 // and ends the run; so does a wait that succeeded in between (the loop pass
 // count, which moves once per pass, jumps by more than one: a retry is part
 // of the run only if it follows the last one at once), and a run is not
-// carried over a gap longer than a wait takes. Any other error is the ring
+// carried over a gap longer than ringWaitRunGap between two retries, which is
+// more than a pass of a ring that fails takes and than a timed wait of an
+// idle one (a park, a slow callback in the gate pass, a long wait end it). Any other error is the ring
 // failing: the worker stops, and closes what it owns.
 func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 	if h := ringWaitSeam; h != nil {
@@ -8062,9 +8066,10 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 	}
 	w.ringWaitRetries.Add(1)
 	if !w.ringWaitWarned {
-		// Once per worker: there is no ceiling on the retries and the counter
-		// is not a public metric, so this line is how an operator on a 5.19
-		// to 6.1 kernel sees a loop that keeps retrying.
+		// Once per worker: the counter is not a public metric, so this line is
+		// how an operator on a 5.19 to 6.1 kernel sees a loop that keeps
+		// retrying (it stops after ringWaitCeiling of retries that reap
+		// nothing).
 		w.ringWaitWarned = true
 		if w.logger != nil {
 			w.logger.Warn("io_uring: a ring wait answered a retryable error (the CQ ring has no room); the worker reaps and retries, and does not log this again",
@@ -8077,8 +8082,11 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 		return true
 	}
 	now := time.Now().UnixNano()
-	if w.ringWaitRunStart == 0 || w.tickCounter-w.ringWaitRunTick > 1 {
-		w.ringWaitRunStart = now // a new run: a wait succeeded since the last retry
+	if w.ringWaitRunStart == 0 || w.tickCounter-w.ringWaitRunTick > 1 || now-w.ringWaitRunLast > int64(ringWaitRunGap) {
+		// A new run: a wait succeeded since the last retry (the pass count
+		// moved by more than one), or a pass took longer than a retried
+		// pass can (a park, a slow callback): the retries are not consecutive.
+		w.ringWaitRunStart = now
 	} else if now-w.ringWaitRunStart >= int64(ringWaitCeiling) {
 		if w.logger != nil {
 			w.logger.Error("io_uring: a ring wait has answered a retryable error for the whole ceiling with nothing to reap; the ring is failing, the worker stops",
@@ -8088,6 +8096,7 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 		return false
 	}
 	w.ringWaitRunTick = w.tickCounter
+	w.ringWaitRunLast = now
 	time.Sleep(50 * time.Microsecond)
 	return true
 }

@@ -37,3 +37,10 @@ func ringWaitRetryable(err error) bool {
 // item 72). A full CQ ring is cleared by the loop's own reap within a pass or
 // two, so a second of retries that reap nothing is a ring that will not recover.
 const ringWaitCeiling = time.Second
+
+// ringWaitRunGap is the longest time between two retried waits that still make
+// one run (ringWaitContinues): a failing ring answers its retries a pass apart,
+// microseconds to a few milliseconds, and an idle worker's timed wait takes up
+// to 100 ms (the sleep of a seam-injected EBUSY test is that wait). A longer gap
+// means something else ran in between, so the run starts again.
+const ringWaitRunGap = 250 * time.Millisecond
