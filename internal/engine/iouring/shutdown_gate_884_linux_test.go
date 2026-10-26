@@ -422,3 +422,20 @@ func TestStopDetachedProducersNeverReadsH1StateOfAGoroutinesConn884(t *testing.T
 		wg.Wait()
 	}
 }
+
+// TestRecvIntoBodyImpliesPendingData884 pins why no server-level case can tell
+// gateCloseable's recvIntoBody term from HasPendingData (review m3): the worker
+// sets recvIntoBody only when NextRecvBuf returned a buffer, and NextRecvBuf
+// returns one only while bodyNeeded > 0, which HasPendingData also reports. The
+// term is defence in depth (the unit table holds it); an equivalent mutant on
+// the wire.
+func TestRecvIntoBodyImpliesPendingData884(t *testing.T) {
+	cs := gateConn884(7)
+	feed884(t, cs, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\nabc")
+	if cs.h1State.NextRecvBuf() == nil {
+		t.Fatal("setup: no direct body buffer offered")
+	}
+	if !cs.h1State.HasPendingData() || cs.h1State.AtRequestBoundary() {
+		t.Error("a conn the worker would recv into the body buffer reports no request in progress")
+	}
+}
