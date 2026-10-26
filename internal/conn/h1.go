@@ -347,6 +347,15 @@ type H1State struct {
 	// mid-body. Called on the goroutine running ProcessH1, under the
 	// engine's lock for the connection's buffers if it has one.
 	WriteBacklogged func() bool
+
+	// CloseAfter, set by an engine that is shutting down (epoll's pool-wait
+	// gate, celeris#885 item 49), makes every request handled from then on
+	// close-after: its response carries Connection: close and the connection
+	// ends once the response has gone, as net/http's response written after
+	// Shutdown began does, so a client does not write its next request to a
+	// connection that is about to be closed. Set and read on the goroutine that
+	// runs ProcessH1 (the loop thread for a conn the loop parses).
+	CloseAfter bool
 }
 
 // TakeBufferedBytes returns a copy of any bytes ProcessH1 stashed in the
@@ -1426,6 +1435,9 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	}
 
 	req := &state.req
+	if state.CloseAfter {
+		req.KeepAlive = false
+	}
 	s := populateCachedStream(state, req, body)
 
 	// Reuse the connection-scoped response adapter — avoids a heap allocation
