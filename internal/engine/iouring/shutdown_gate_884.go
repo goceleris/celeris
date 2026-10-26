@@ -181,7 +181,7 @@ func (w *Worker) gateCloseable(cs *connState) bool {
 		}
 	} else {
 		h.CloseAfter = true
-		if h.HasPendingData() || !h.AtRequestBoundary() {
+		if cs.recvIntoBody || h.HasPendingData() || !h.AtRequestBoundary() {
 			return false
 		}
 	}
