@@ -139,9 +139,9 @@ func h2Probe889(t *testing.T, addr string, fields []hpack.HeaderField) (status i
 		}
 		switch f := f.(type) {
 		case *http2.SettingsFrame:
-			// No SETTINGS ACK is written: on a connection the server has
-			// already closed it would draw a TCP RST that can discard the
-			// RST_STREAM still queued for this client.
+			if !f.IsAck() {
+				_ = fr.WriteSettingsAck()
+			}
 		case *http2.HeadersFrame:
 			if f.StreamID != 1 {
 				continue

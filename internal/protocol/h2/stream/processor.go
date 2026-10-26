@@ -246,6 +246,7 @@ type Processor struct {
 	refusalWindowSec   int64  // unix-second marker for the current window
 	refusedHeaderLists uint32 // header lists over the bound refused in the current second
 	refusedStreams     uint32 // streams refused for MAX_CONCURRENT_STREAMS in the current second
+	refusedMalformed   uint32 // malformed requests reset in the current second
 	// nowUnix is the clock noteRefusal reads (nil: the wall clock); tests set it.
 	nowUnix func() int64
 
@@ -489,6 +490,7 @@ const (
 // is refused only by a race.
 const (
 	headerListRefusalBurstMax = 100
+	malformedRequestBurstMax  = 100
 	streamRefusalBurstMax     = 2000
 )
 
@@ -820,10 +822,7 @@ func (p *Processor) noteRefusal(streamLimit bool) error {
 	} else {
 		now = time.Now().Unix()
 	}
-	if now != p.refusalWindowSec {
-		p.refusalWindowSec = now
-		p.refusedHeaderLists, p.refusedStreams = 0, 0
-	}
+	p.rollRefusalWindow(now)
 	if streamLimit {
 		if p.refusedStreams++; p.refusedStreams > streamRefusalBurstMax {
 			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("refused streams flood"),
@@ -836,6 +835,39 @@ func (p *Processor) noteRefusal(streamLimit bool) error {
 			fmt.Errorf("header lists over %d bytes refused more than %d times in a second", p.headerListMax, headerListRefusalBurstMax))
 	}
 	return nil
+}
+
+// rollRefusalWindow starts a new refusal window when second now is not the
+// current one.
+func (p *Processor) rollRefusalWindow(now int64) {
+	if now != p.refusalWindowSec {
+		p.refusalWindowSec = now
+		p.refusedHeaderLists, p.refusedStreams, p.refusedMalformed = 0, 0, 0
+	}
+}
+
+// refuseMalformed answers a request that is malformed (RFC 9113 section 8.1.1:
+// a field name or value that is not allowed, a trailer that is not, a
+// Content-Length its body does not match) with a stream error, as the
+// RFC asks: RST_STREAM(PROTOCOL_ERROR), the stream freed, the connection kept
+// and the other streams on it served. Its header block is decoded, so the
+// HPACK state is in step with the peer's. why is the reason, returned
+// wrapped when the peer has sent more than malformedRequestBurstMax of them in
+// a second: it is told to calm down (GOAWAY ENHANCE_YOUR_CALM) and the
+// connection ends, as for header lists over the bound (noteRefusal).
+func (p *Processor) refuseMalformed(id uint32, why error) error {
+	var now int64
+	if p.nowUnix != nil {
+		now = p.nowUnix()
+	} else {
+		now = time.Now().Unix()
+	}
+	p.rollRefusalWindow(now)
+	if p.refusedMalformed++; p.refusedMalformed > malformedRequestBurstMax {
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("malformed requests flood"),
+			fmt.Errorf("more than %d malformed requests in a second: %w", malformedRequestBurstMax, why))
+	}
+	return p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeProtocol)
 }
 
 // GetManager returns the stream manager.
@@ -1657,8 +1689,7 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 
 	if trailers {
 		if err := validateTrailerHeaders(headers); err != nil {
-			_ = p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeProtocol)
-			return fmt.Errorf("invalid trailers: %w", err)
+			return p.refuseMalformed(id, fmt.Errorf("invalid trailers: %w", err))
 		}
 		stream.AddHeadersBatch(headers)
 		if endStream {
@@ -1670,8 +1701,7 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 	}
 
 	if err := validateRequestHeaders(headers); err != nil {
-		sendStreamError(p.writer, id, http2.ErrCodeProtocol)
-		return fmt.Errorf("invalid headers: %w", err)
+		return p.refuseMalformed(id, fmt.Errorf("invalid headers: %w", err))
 	}
 	for _, h := range headers {
 		if h[0] == ":method" && h[1] == "HEAD" {
@@ -1687,8 +1717,7 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 		stream.SetState(StateHalfClosedRemote)
 
 		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
-			sendStreamError(p.writer, id, http2.ErrCodeProtocol)
-			return fmt.Errorf("content-length mismatch: %w", err)
+			return p.refuseMalformed(id, fmt.Errorf("content-length mismatch: %w", err))
 		}
 
 		p.runHandler(stream)

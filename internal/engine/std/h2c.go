@@ -279,12 +279,13 @@ func isH2CUpgrade(h http.Header) bool {
 // is a valid empty payload). If not, ok is false: a server MUST NOT upgrade
 // when the field is missing or repeated, and the request is served as the
 // HTTP/1.1 request it also is, as on epoll, io_uring and adaptive, not refused.
+// Only SP and HTAB are trimmed, as on the native engines (net/http has done it).
 func h2cSettings(h http.Header) (settings []byte, ok bool) {
 	vals := h[textproto.CanonicalMIMEHeaderKey("HTTP2-Settings")]
 	if len(vals) != 1 {
 		return nil, false
 	}
-	settings, err := h1.DecodeHTTP2Settings(strings.TrimSpace(vals[0]))
+	settings, err := h1.DecodeHTTP2Settings(strings.Trim(vals[0], " \t"))
 	return settings, err == nil
 }
 

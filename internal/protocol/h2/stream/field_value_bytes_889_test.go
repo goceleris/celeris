@@ -1,9 +1,7 @@
 package stream
 
 import (
-	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"golang.org/x/net/http2"
@@ -83,12 +81,7 @@ func TestProcessorRefusesNULCRLFInRequest889(t *testing.T) {
 			{"cookie CRLF", "cookie", "a=b\r\nset-cookie: x=y"},
 		} {
 			t.Run(path+"/"+tc.name, func(t *testing.T) {
-				var runs atomic.Int32
-				fw := newTestFrameWriter()
-				p := NewProcessor(HandlerFunc(func(_ context.Context, _ *Stream) error {
-					runs.Add(1)
-					return nil
-				}), fw, newTestResponseWriter())
+				x := newProc944()
 				block := func(clean bool) []byte {
 					hs := reqHeaders944()
 					v := tc.val
@@ -102,28 +95,21 @@ func TestProcessorRefusesNULCRLFInRequest889(t *testing.T) {
 					}
 					return encodeHeaders(t, hs)
 				}
-				err := feedRaw944(t, p, path, 1, true, block(false))
-				if err == nil {
-					t.Fatal("the request was not refused")
+				if err := feed944(t, x, path, 1, true, block(false)); err != nil {
+					t.Fatalf("the request was refused with a connection error: %v", err)
 				}
-				fw.mu.Lock()
-				rst := append([]rstStreamRecord(nil), fw.rstStreamsSent...)
-				fw.mu.Unlock()
+				_, rst := sinks889(x.Processor)
 				if len(rst) != 1 || rst[0].streamID != 1 || rst[0].code != http2.ErrCodeProtocol {
 					t.Fatalf("RST_STREAMs %+v, want one PROTOCOL_ERROR on stream 1", rst)
 				}
-				if n := runs.Load(); n != 0 {
+				if n := x.runs.Load(); n != 0 {
 					t.Fatalf("the handler ran %d times for a malformed request", n)
 				}
 				// Control: without the bytes, the request is served.
-				p2 := NewProcessor(HandlerFunc(func(_ context.Context, _ *Stream) error {
-					runs.Add(1)
-					return nil
-				}), newTestFrameWriter(), newTestResponseWriter())
-				if err := feedRaw944(t, p2, path, 1, true, block(true)); err != nil {
+				if err := feed944(t, x, path, 3, true, block(true)); err != nil {
 					t.Fatalf("clean request: %v", err)
 				}
-				if n := runs.Load(); n != 1 {
+				if n := x.runs.Load(); n != 1 {
 					t.Fatalf("clean request: handler ran %d times, want 1", n)
 				}
 			})

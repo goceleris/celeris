@@ -183,7 +183,7 @@ func (p *Parser) parseRequestLine(req *Request) (bool, error) {
 	// RFC 9112 section 3: a request line that is not "method SP target SP
 	// version" is invalid (400). The method is a token (RFC 9110 section
 	// 5.6.2; an empty or a non-token one, such as "\nGET", is not), and the
-	// target holds no control byte (NUL, CR and LF survive the CRLF split of
+	// target is not empty and holds no control byte (NUL, CR and LF survive the CRLF split of
 	// the line, and a recipient that takes them in lets a request through
 	// that a front end read differently). Neither was checked: the method was
 	// everything up to the first space, the target everything up to the next
@@ -195,7 +195,7 @@ func (p *Parser) parseRequestLine(req *Request) (bool, error) {
 		}
 		method = UnsafeString(methodBytes)
 	}
-	if !isValidRequestTarget(pathBytes) {
+	if len(pathBytes) == 0 || !isValidRequestTarget(pathBytes) {
 		return false, ErrInvalidRequestLine
 	}
 	req.Method = method

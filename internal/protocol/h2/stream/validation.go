@@ -56,8 +56,8 @@ func validateRequestHeaders(headers [][2]string) error {
 		name := h[0]
 		value := h[1]
 
-		if !isASCIILower(name) {
-			return fmt.Errorf("header field name must be lowercase: %s", name)
+		if !isValidFieldName(name) {
+			return fmt.Errorf("invalid header field name: %q", name)
 		}
 		if hasForbiddenValueByte(value) {
 			return fmt.Errorf("field value of %s holds a NUL, CR or LF", name)
@@ -129,8 +129,8 @@ func validateTrailerHeaders(headers [][2]string) error {
 		name := h[0]
 		value := h[1]
 
-		if !isASCIILower(name) {
-			return fmt.Errorf("header field name must be lowercase: %s", name)
+		if !isValidFieldName(name) {
+			return fmt.Errorf("invalid header field name: %q", name)
 		}
 		if hasForbiddenValueByte(value) {
 			return fmt.Errorf("field value of %s holds a NUL, CR or LF", name)
@@ -237,9 +237,40 @@ func validateStreamState(state State, frameType http2.FrameType, _ bool) error {
 	return nil
 }
 
-func isASCIILower(s string) bool {
-	for i := range len(s) {
-		if s[i] >= 'A' && s[i] <= 'Z' {
+// fieldNameTable[c] is true iff c may be in a field name of a request: a
+// lower-case letter, a digit or one of the other token characters (RFC 9110
+// section 5.6.2, without the upper case, which HTTP/2 forbids).
+var fieldNameTable [256]bool
+
+func init() {
+	for c := 'a'; c <= 'z'; c++ {
+		fieldNameTable[c] = true
+	}
+	for c := '0'; c <= '9'; c++ {
+		fieldNameTable[c] = true
+	}
+	for _, c := range "!#$%&'*+-.^_`|~" {
+		fieldNameTable[c] = true
+	}
+}
+
+// isValidFieldName reports whether name is a field name an HTTP/2 request may
+// carry (RFC 9113 section 8.2.1: no byte in 0x00-0x20, 0x41-0x5a or
+// 0x7f-0xff, no colon but the first byte of a pseudo-header's, and not empty;
+// only the token characters are allowed, which is what net/http accepts and
+// what an HTTP/1 upstream can carry). Such a name that does not meet it makes
+// the request malformed (section 8.1.1): a CR LF in a name would be a header
+// of its own to anything that writes the list out.
+func isValidFieldName(name string) bool {
+	i := 0
+	if len(name) > 0 && name[0] == ':' {
+		i = 1
+	}
+	if i == len(name) {
+		return false
+	}
+	for ; i < len(name); i++ {
+		if !fieldNameTable[name[i]] {
 			return false
 		}
 	}
