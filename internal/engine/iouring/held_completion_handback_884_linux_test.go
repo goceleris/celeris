@@ -195,7 +195,14 @@ func TestIouringHeldCompletionAppliedAtEveryHandBackEntry884(t *testing.T) {
 // a sync.Pool hands the same pointer back only by luck (under -race, a Put is
 // dropped one time in four), and what is tested is the connState a reused
 // pointer is. The generation comes from the real source, connGenSeq.
-func reuse884(cs *connState, fd int) {
+//
+// releaseConnState puts cs in the shared pool, and the arm goes on changing it
+// (sending, sendBuf, heldSends, the lock), so a later acquire, in another test,
+// could draw a pointer left dirty (acquireConnState does not reset sending:
+// TestHijackFlushesTheQueuedReply936 saw hijackConn refuse for it). The cleanup
+// puts back what a release leaves.
+func reuse884(t *testing.T, cs *connState, fd int) {
+	t.Helper()
 	releaseConnState(cs)
 	g := connGenSeq.Add(1)
 	if g == 0 {
@@ -205,6 +212,14 @@ func reuse884(cs *connState, fd int) {
 	cs.generation = g
 	cs.detachMu = &sync.Mutex{}
 	cs.asyncCond.L = &cs.asyncInMu
+	t.Cleanup(func() {
+		cs.sending, cs.zcNotifPending = false, false
+		cs.sendBuf, cs.writeBuf = cs.sendBuf[:0], cs.writeBuf[:0]
+		cs.heldSends = nil
+		cs.detachMu = nil
+		cs.asyncCond.L = nil
+		cs.fd = 0
+	})
 }
 
 // holdOne884 holds one completion of the rig's conn, as a running handler
@@ -237,7 +252,7 @@ func TestIouringHeldCompletionIsNotAppliedToANewOwner884(t *testing.T) {
 		rig := newStallRig704(t)
 		w, cs := rig.w, rig.cs
 		holdOne884(t, rig, old)
-		reuse884(cs, rig.local)
+		reuse884(t, cs, rig.local)
 		if n := heldSends750(cs); n != 0 {
 			t.Errorf("releaseConnState left %d held completion(s) on the connState", n)
 		}
@@ -259,7 +274,7 @@ func TestIouringHeldCompletionIsNotAppliedToANewOwner884(t *testing.T) {
 		rig := newStallRig704(t)
 		w, cs := rig.w, rig.cs
 		stale := *holdOne884(t, rig, old)
-		reuse884(cs, rig.local)
+		reuse884(t, cs, rig.local)
 		cs.sending, cs.sendBuf = true, append(cs.sendBuf[:0], fresh...)
 		cs.heldSends = append(cs.heldSends[:0], stale)
 		if decodeGen(stale.UserData) == cs.generation {
@@ -317,7 +332,7 @@ func TestReuse884LeavesNoDirtyConnStateInThePool(t *testing.T) {
 	for i := 0; i < 16; i++ {
 		t.Run("arm", func(t *testing.T) {
 			cs := acquireConnState(t.Context(), 7, 4096, true)
-			reuse884(cs, 7)
+			reuse884(t, cs, 7)
 			cs.sending, cs.sendBuf = true, append(cs.sendBuf[:0], "the new owner's response"...)
 		})
 		got := acquireConnState(t.Context(), 8, 4096, true)

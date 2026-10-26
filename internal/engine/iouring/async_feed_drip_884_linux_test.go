@@ -13,7 +13,7 @@ import (
 	"github.com/goceleris/celeris/internal/resource"
 )
 
-// celeris#884 item 82 (the IOTSTPARK lane's finding, PR #1100): the header-timer
+// celeris#884 item 82 (found while testing PR #1100): the header-timer
 // arm at handleRecv's async feed is LIVE for traffic, and the only test that
 // reached it staged the deadline in a unit. In async mode OnHeaderDeadlineArmed
 // is nil, so a promoted keep-alive connection whose next request starts after

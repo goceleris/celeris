@@ -4056,6 +4056,14 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			}
 			return
 		}
+		// The tail can end inside the next request's head: ProcessH1 stamped
+		// its header deadline, and in async mode nothing arms the kernel
+		// timer for it (OnHeaderDeadlineArmed is nil), as at the end of the
+		// ordinary tail below; the conn is not promoted, so the worker owns
+		// h1State here. Without it only the sweep enforces the deadline.
+		if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 && !cs.headerTimerArmed {
+			w.armHeaderTimer(cs)
+		}
 		// The direct-body tail: flushed unlinked (the next recv may target
 		// the body buffer again), then a standalone recv — or none, held for
 		// a hand-off (celeris#657). A refused write closes here too
@@ -4433,10 +4441,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return
 		}
 		// Inline handled the request(s). If ProcessH1 left partial state
-		// (buffered headers / accumulating body), promote so the
-		// continuation runs on the dispatch goroutine — the partial-state
-		// parse paths must not run inline (only the fresh-parse site
-		// honors the async check).
+		// (buffered headers), promote so the continuation runs on the
+		// dispatch goroutine. The buffered-path parse checks RouteAsync too
+		// since celeris#889, so an async route in the continuation no longer
+		// depends on this; a fixed-length body in progress stays inline (see
+		// HasPendingDispatchState).
 		if processErr == nil && cs.h1State.HasPendingDispatchState() {
 			// No complete request parsed yet (buffered headers / chunked), so
 			// no route to record — leave promotedPath empty: not revert-eligible.
@@ -4748,8 +4757,8 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 // What this costs, and why it is accepted (celeris#884 item 81): the held
 // completion is applied only at the goroutine's hand-back, so while the next
 // pipelined request's handler runs, the rest of the previous response does not
-// move: its SEND is not re-submitted until the handler returns. The IOTSTSTALL
-// lane measured it with the handler gated: the client's read of the large
+// move: its SEND is not re-submitted until the handler returns. Measured with
+// the handler gated (celeris#884 item 81): the client's read of the large
 // response stopped at about 2.2 MB, which is what the socket buffers held, not
 // a constant. Before this hold the worker itself was parked for that whole time
 // and so was every other conn of its ring; now only this conn waits, behind a
@@ -5831,7 +5840,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // bailed out of ProcessH1 with ErrAsyncDispatch, which clears the deadline
 // first (the head is complete by then; TestInlineAsyncDispatchLeavesNoHeaderDeadline884),
 // so there is none to arm. The arm that was here was reached by no traffic
-// (celeris#884 item 82, the IOTSTPARK lane's instrumented run); the one that
+// (celeris#884 item 82: an instrumented run of the whole suite counted no hit); the one that
 // is live is the feed's, in handleRecv. Not reading cs.h1State here also keeps
 // the worker off it once the goroutine runs, and an h2c upgrade sets it to nil
 // there (celeris#722).

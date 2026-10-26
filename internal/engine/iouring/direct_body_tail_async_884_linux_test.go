@@ -14,7 +14,7 @@ import (
 	"github.com/goceleris/celeris/internal/resource"
 )
 
-// celeris#884 item 70 (found in the ADOPT lane): handleRecv's direct-body
+// celeris#884 item 70: handleRecv's direct-body
 // block hands the bytes that follow a body received straight into
 // H1State.bodyBuf (the "tail") to ProcessH1. On an AsyncHandlers engine that
 // call ran without InlineMode, so an async-marked route pipelined behind the
