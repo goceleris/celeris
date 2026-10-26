@@ -24,9 +24,11 @@ import (
 // celeris#722: on an async route, the worker read cs.h1State after it had
 // handed the connection to its dispatch goroutine, and that goroutine sets
 // cs.h1State to nil when the request is an h2c upgrade (switchToH2Local). The
-// two sites are the header-timer re-arm in promoteConnToAsync (the first
-// request of a connection) and the same re-arm in handleRecv's async feed (a
-// later recv of a promoted connection). Each test below drives one of them to
+// two sites were the header-timer re-arm in promoteConnToAsync (the first
+// request of a connection; that arm is gone, celeris#884 item 82, and the
+// promotion reads nothing of cs.h1State after it starts the goroutine) and the
+// same re-arm in handleRecv's async feed (a later recv of a promoted
+// connection). Each test below drives one of them to
 // an h2c upgrade; under -race the unordered read and write fail the test.
 
 // asyncEveryRouteHandler serves every request with "ok" and marks every route

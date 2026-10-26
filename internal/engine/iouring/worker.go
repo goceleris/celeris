@@ -3843,6 +3843,17 @@ func (w *Worker) closeOnRecvEnd(fd int, cs *connState, err error) {
 			}
 			mu.Lock()
 		}
+		// An error parked by an earlier recv-end that met the running handler
+		// is the conn's story, even when the handler has since returned and
+		// its hand-back is not drained yet: deliver it, once, in place of
+		// err, which is that death seen again (celeris#867). Left parked,
+		// closeConn would deliver it after err, and a detached middleware
+		// would be told the later death first (celeris#884 item 76; epoll's
+		// closeOnReadEnd does the same since celeris#1059).
+		if p := cs.closeErr; p != nil {
+			err = p
+			cs.closeErr = nil
+		}
 		if cs.h1State != nil && cs.h1State.OnError != nil {
 			cs.h1State.OnError(err)
 		}
@@ -3990,7 +4001,40 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			// exactly as the body's own (an h2c upgrade request pipelined
 			// behind the body is the case that was once closed instead,
 			// celeris#884).
+			//
+			// With the same InlineMode the first recv of an inline-first conn
+			// gets: a split fixed-length body does not promote the conn, so it
+			// is still the worker's, and an async-marked route in the tail
+			// must stop at ErrAsyncDispatch and go to the dispatch goroutine,
+			// as it does below. Without it the handler ran here, on the
+			// worker thread, parking every conn of the ring for as long as it
+			// ran (celeris#884 item 70; epoll has no twin: its direct-body
+			// read is gated on !l.async).
+			tryInline := w.async && !cs.asyncPromoted.Load() &&
+				(w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1)
+			if tryInline {
+				cs.h1State.InlineMode = true
+			}
 			verdict = conn.ProcessH1(cs.ctx, rest, cs.h1State, w.handler, cs.writeFn)
+			if tryInline && cs.h1State != nil {
+				cs.h1State.InlineMode = false
+			}
+			if tryInline && errors.Is(verdict, conn.ErrAsyncDispatch) {
+				// The promotion block below, for a conn whose recv is the
+				// single-shot one (the direct-body recv exists on no other),
+				// with no provided buffer to give back. promoteConnToAsync
+				// arms the recv this CQE consumed.
+				method, path := cs.h1State.CurrentRoute()
+				cs.promotedMethod, cs.promotedPath = strings.Clone(method), strings.Clone(path)
+				cs.asyncPromoted.Store(true)
+				w.asyncPromoted.Add(1)
+				stashed := cs.h1State.TakeBufferedBytes()
+				if len(cs.writeBuf) > 0 && !cs.sending && !cs.zcNotifPending {
+					_ = w.flushSend(cs)
+				}
+				w.promoteConnToAsync(cs, fd, stashed, c)
+				return
+			}
 		}
 		if verdict != nil {
 			switch {
@@ -5767,11 +5811,16 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // (ErrAsyncDispatch) to its per-conn dispatch goroutine, seeding it with the
 // stashed request bytes. Mirrors the tail of the async-dispatch block. The
 // caller has already set cs.asyncPromoted and returned the provided buffer.
+//
+// It arms no header timer, and reads no header deadline: a conn promoted here
+// bailed out of ProcessH1 with ErrAsyncDispatch, which clears the deadline
+// first (the head is complete by then; TestInlineAsyncDispatchLeavesNoHeaderDeadline884),
+// so there is none to arm. The arm that was here was reached by no traffic
+// (celeris#884 item 82, the IOTSTPARK lane's instrumented run); the one that
+// is live is the feed's, in handleRecv. Not reading cs.h1State here also keeps
+// the worker off it once the goroutine runs, and an h2c upgrade sets it to nil
+// there (celeris#722).
 func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *completionEntry) {
-	// The header deadline is read before the dispatch goroutine starts: it
-	// runs the stashed request at once, and an h2c upgrade sets cs.h1State to
-	// nil there (celeris#722). Armed below, from the value.
-	hdrDL := w.asyncHeaderDeadline(cs)
 	cs.asyncInMu.Lock()
 	cs.asyncInBuf = append(cs.asyncInBuf, stashed...)
 	starting := !cs.asyncRun
@@ -5791,9 +5840,6 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 		cs.asyncCond.Signal()
 	}
 	w.reqBatch++
-	if hdrDL > 0 {
-		w.armHeaderTimerAt(cs, hdrDL)
-	}
 	if !cqeHasMore(c.Flags) && !cs.recvPaused {
 		if !w.prepareRecv(cs, cs.buf) {
 			cs.needsRecv = true
@@ -5817,8 +5863,9 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 // be running: that goroutine owns the H1 state across ProcessH1 and sets
 // cs.h1State to nil when the request is an h2c upgrade (switchToH2Local), so
 // an unlocked read races that write and, between its nil check and its
-// dereference, can take a nil pointer (celeris#722). The callers read before
-// they start or feed the goroutine, and the read goes through
+// dereference, can take a nil pointer (celeris#722). The caller, handleRecv's
+// async feed (promoteConnToAsync has no deadline to read: see there), reads
+// before it feeds the goroutine, and the read goes through
 // snapshotH1Deadlines, under detachMu, the lock switchToH2Local runs under,
 // and with TryLock, never Lock (celeris#593): a held lock means the goroutine
 // is inside a request, which is not a moment a header deadline is waiting on,
