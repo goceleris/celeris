@@ -150,6 +150,10 @@ func TestRunStopsOnAStuckRingWait884(t *testing.T) {
 			t.Errorf("worker %d stopped though only worker %d met the failure", w.id, dead.id)
 		}
 	}
+	if len(e.workers) < 2 {
+		t.Log("one worker (the memlock cap): no survivor to ask")
+		return
+	}
 	c, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
 		t.Fatalf("dial after the stuck worker stopped: %v", err)
