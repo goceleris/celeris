@@ -8011,10 +8011,21 @@ func endDetachedWrites(cs *connState) {
 func (w *Worker) stopDetachedProducers() {
 	for _, fd := range w.liveConns {
 		cs := w.conns[fd]
-		if cs == nil || cs.detachMu == nil || cs.h1State == nil || !cs.h1State.Detached.Load() {
+		if cs == nil || cs.detachMu == nil {
+			continue
+		}
+		// h1State is read before the lock only on a conn the worker owns; on a
+		// promoted conn the dispatch goroutine may set it to nil (an h2c
+		// upgrade, celeris#722), so it is read under detachMu.
+		promoted := cs.asyncPromoted.Load()
+		if !promoted && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
 			continue
 		}
 		if !cs.detachMu.TryLock() {
+			continue
+		}
+		if promoted && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
+			cs.detachMu.Unlock()
 			continue
 		}
 		if !cs.detachClosed && !cs.asyncDetachPending {
