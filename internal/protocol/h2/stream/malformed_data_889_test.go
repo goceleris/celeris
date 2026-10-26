@@ -125,24 +125,33 @@ func TestTrailersOnAStreamTheServerResetAreIgnored889(t *testing.T) {
 	}
 }
 
-// A peer cannot make the server decode HEADERS on a reset stream for ever: each
-// one is counted with the malformed requests.
-func TestHEADERSOnAResetStreamAreCounted889(t *testing.T) {
-	x, _ := newClocked889()
-	bad := append(reqHeaders944(), [2]string{"x-bad", "a\x00b"})
-	if err := feed944(t, x, "raw", 1, false, encodeHeaders(t, bad)); err != nil {
-		t.Fatal(err)
-	}
-	var err error
-	n := 0
-	for ; err == nil && n < 1000; n++ {
-		err = feed944(t, x, "raw", 1, false, encodeHeaders(t, [][2]string{{"x-t", "v"}}))
-	}
-	if err == nil || n <= 50 || n > 200 {
-		t.Fatalf("after %d HEADERS on a reset stream in a second: err %v, want the connection to end after about 100", n, err)
-	}
-	if goaways, _ := sinks889(x.Processor); len(goaways) != 1 || goaways[0].code != http2.ErrCodeEnhanceYourCalm {
-		t.Fatalf("GOAWAYs %+v, want one ENHANCE_YOUR_CALM", goaways)
+// A peer cannot make the server decode HEADERS on a reset stream for ever: the
+// first HEADERS frame without END_STREAM after the request (RFC 9113 section
+// 8.1: malformed) ends the connection, and so does a second block. One block
+// of trailers, with END_STREAM, is ignored per reset stream (before, a block
+// without END_STREAM was dropped and the stream stayed open for the next one:
+// 99 replays on a malformed request, 1990 on a refused stream).
+func TestHEADERSOnAResetStreamAreBounded889(t *testing.T) {
+	for _, second := range []string{"no-end-stream", "after-the-trailers"} {
+		t.Run(second, func(t *testing.T) {
+			x, _ := newClocked889()
+			bad := append(reqHeaders944(), [2]string{"x-bad", "a\x00b"})
+			if err := feed944(t, x, "raw", 1, false, encodeHeaders(t, bad)); err != nil {
+				t.Fatal(err)
+			}
+			if second == "after-the-trailers" {
+				if err := feed944(t, x, "raw", 1, true, encodeHeaders(t, [][2]string{{"x-t", "v"}})); err != nil {
+					t.Fatalf("the trailers: %v", err)
+				}
+			}
+			err := feed944(t, x, "raw", 1, second == "after-the-trailers", encodeHeaders(t, [][2]string{{"x-t", "v"}}))
+			if err == nil {
+				t.Fatal("a HEADERS frame past the one block of trailers was ignored")
+			}
+			if goaways, _ := sinks889(x.Processor); len(goaways) != 1 || goaways[0].code != http2.ErrCodeProtocol {
+				t.Fatalf("GOAWAYs %+v, want one PROTOCOL_ERROR", goaways)
+			}
+		})
 	}
 }
 
@@ -181,8 +190,9 @@ func (e *hpackEncoder889) block(t *testing.T, hs [][2]string) []byte {
 }
 
 // The trailers end the stream: a HEADERS frame after them is a connection error.
-// And a stream refused for MAX_CONCURRENT_STREAMS or a header list, or one that
-// ended with its HEADERS, is not one whose trailers are ignored.
+// And one that ended with its HEADERS is not one whose trailers are ignored (a
+// stream refused for MAX_CONCURRENT_STREAMS or its header list, or reset for its
+// body, is, while its client side is open: celeris#889, the conn tests).
 func TestOnlyTheTrailersOfAnOpenResetStreamAreIgnored889(t *testing.T) {
 	x, _ := newClocked889()
 	bad := append(reqHeaders944(), [2]string{"x-bad", "a\x00b"})

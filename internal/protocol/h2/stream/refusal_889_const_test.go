@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -82,6 +83,24 @@ func TestRefusalWindow889(t *testing.T) {
 			if err := p.noteRefusal(false); err != nil {
 				t.Fatalf("header-list refusal %d after %d stream refusals: %v", i+1, streamRefusalBurstMax, err)
 			}
+		}
+	})
+	t.Run("body-limit-resets-are-counted-apart", func(t *testing.T) {
+		p, _ := newClocked889()
+		for range streamRefusalBurstMax {
+			_ = p.noteRefusal(true)
+		}
+		for range headerListRefusalBurstMax {
+			_ = p.noteRefusal(false)
+		}
+		why := errors.New("body over the limit")
+		for i := range bodyLimitResetBurstMax {
+			if err := p.countRefusal(refusedBodyLimit, why); err != nil {
+				t.Fatalf("body-limit reset %d after the other refusals: %v", i+1, err)
+			}
+		}
+		if err := p.countRefusal(refusedBodyLimit, why); err == nil {
+			t.Fatalf("body-limit reset %d in one second did not end the connection", bodyLimitResetBurstMax+1)
 		}
 	})
 	t.Run("burst-is-above-200-a-second", func(t *testing.T) {

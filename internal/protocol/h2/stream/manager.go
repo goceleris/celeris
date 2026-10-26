@@ -32,13 +32,13 @@ type Manager struct {
 	// outboundHeld counts the bytes the connection's streams hold in their
 	// OutboundBuffers, waiting for the peer's window; sendWindowWaiters the
 	// pool handlers waiting in AwaitSendWindow for a window to open, and
-	// sendWindowCh the channel that wakes them, closed and replaced under
-	// sendWindowMu (a leaf lock) by notifySendWindow (celeris#893,
-	// outbound.go).
+	// sendWaiters those handlers, each with the channel that wakes it alone,
+	// guarded by sendWindowMu (a leaf lock; notifyStreamWindow,
+	// notifyOpenStreamWindows; celeris#893, outbound.go).
 	outboundHeld      atomic.Int64
 	sendWindowWaiters atomic.Int32
 	sendWindowMu      sync.Mutex
-	sendWindowCh      chan struct{}
+	sendWaiters       []*sendWaiter
 
 	// retired holds the pool-handler streams whose handler has returned and
 	// which are out of the map, waiting for the event loop to return them to
@@ -55,9 +55,13 @@ type Manager struct {
 	drainBuf []*Stream
 
 	// placeholders counts the streams in the map that are PRIORITY placeholders
-	// (flagPlaceholder, CreatePlaceholder); guarded by mu. Last in the struct: the
-	// per-request fields keep their offsets.
-	placeholders int
+	// (flagPlaceholder, CreatePlaceholder), and placeholderIDs[:placeholders]
+	// are their identifiers, so that finding the ones that can never open
+	// (reapPassedPlaceholdersLocked) scans at most
+	// maxPriorityPlaceholders entries and not the map; guarded by mu. Last in
+	// the struct: the per-request fields keep their offsets.
+	placeholders   int
+	placeholderIDs [maxPriorityPlaceholders]uint32
 }
 
 // NewManager creates a new stream manager. Auxiliary maps
@@ -124,7 +128,8 @@ func (m *Manager) CreateStream(id uint32) *Stream {
 // 5.3.2 deprecates it); x/net's priority write scheduler keeps at most ten idle
 // nodes (MaxIdleNodesInTree, its default, discarding the oldest). A Stream
 // costs about 1.2 KB, and a peer pays 14 bytes of wire for each, so the number
-// is small. Past it a PRIORITY frame is ignored.
+// is small. Past it a PRIORITY frame is ignored, unless some of them can never
+// open (CreatePlaceholder).
 const maxPriorityPlaceholders = 16
 
 // CreatePlaceholder creates the idle stream a PRIORITY frame on a stream the
@@ -132,18 +137,35 @@ const maxPriorityPlaceholders = 16
 // maxPriorityPlaceholders; it reports false, and creates nothing, past that.
 // A stream that is in the map already is returned as it is.
 //
+// At the bound, the placeholders the last client stream has passed are
+// reaped first (reapPassedPlaceholdersLocked): an identifier at or below the
+// highest the peer has used is a closed stream's, and HEADERS on it is a
+// connection error (RFC 9113 section 5.1.1), so such a placeholder can never
+// open and would hold its slot, with its entry in the priority tree, until the
+// connection closes. 16 of them made every later PRIORITY frame on an idle
+// stream be ignored on a long-lived connection (priority is advisory, section
+// 5.3.2, but a client that builds its tree late loses it). The scan is of the
+// at most 16 identifiers kept for it, never of the map; a connection whose
+// placeholders are all live pays that once per PRIORITY frame past the bound.
+//
 // A placeholder is no stream the server has opened: it is not counted against
 // SETTINGS_MAX_CONCURRENT_STREAMS, the last client stream does not move, and
 // neither does the highest stream ID (GetLastStreamID), which a GOAWAY names.
 // TryOpenStream replaces it when HEADERS arrive on its identifier.
 func (m *Manager) CreatePlaceholder(id uint32) (*Stream, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if s, ok := m.streams[id]; ok {
+		m.mu.Unlock()
 		return s, true
 	}
+	var reaped [maxPriorityPlaceholders]*Stream
+	nreaped := 0
 	if m.placeholders >= maxPriorityPlaceholders {
-		return nil, false
+		nreaped = m.reapPassedPlaceholdersLocked(&reaped)
+		if m.placeholders >= maxPriorityPlaceholders { // nothing freed, not even a stale identifier
+			m.mu.Unlock()
+			return nil, false
+		}
 	}
 	s := NewStream(id)
 	s.manager = m
@@ -152,15 +174,59 @@ func (m *Manager) CreatePlaceholder(id uint32) (*Stream, bool) {
 	s.SetWindowSize(int32(m.initialWindowSize))
 	s.flags.Or(flagPlaceholder)
 	m.streams[id] = s
+	m.placeholderIDs[m.placeholders] = id
 	m.placeholders++
+	m.mu.Unlock()
+	// The reaped ones go back to the pool after the unlock, as afterTake's
+	// does (Release takes the stream's own lock).
+	for _, r := range reaped[:nreaped] {
+		r.Release()
+	}
 	return s, true
+}
+
+// reapPassedPlaceholdersLocked takes out of the map, and out of the priority
+// tree, the placeholders whose identifier is at or below the last client
+// stream, stores them in out and returns how many. The caller releases them
+// after it unlocks. m.mu must be held. Stale identifiers it forgets free a
+// slot without being returned.
+func (m *Manager) reapPassedPlaceholdersLocked(out *[maxPriorityPlaceholders]*Stream) int {
+	last := m.lastClientStream.Load()
+	n := 0
+	for i := 0; i < m.placeholders; {
+		id := m.placeholderIDs[i]
+		if id > last {
+			i++
+			continue
+		}
+		// The map decides what is taken: the entry must still be the idle
+		// placeholder the books say it is. An identifier whose entry is gone, or
+		// is another stream's (CreateStream overwrites without asking), is only
+		// forgotten here: releasing a live stream is the failure of celeris#950.
+		if s := m.streams[id]; s != nil && s.flags.Load()&flagPlaceholder != 0 && s.GetState() == StateIdle {
+			out[n] = s
+			n++
+			delete(m.streams, id)
+			m.priorityTree.RemoveStream(id)
+		}
+		m.placeholders--
+		m.placeholderIDs[i] = m.placeholderIDs[m.placeholders] // the last takes its place: look at it next
+	}
+	return n
 }
 
 // dropPlaceholderLocked uncounts s if it is a placeholder that leaves the
 // map. m.mu must be held.
 func (m *Manager) dropPlaceholderLocked(s *Stream) {
-	if s.flags.Load()&flagPlaceholder != 0 && m.placeholders > 0 {
-		m.placeholders--
+	if s.flags.Load()&flagPlaceholder == 0 {
+		return
+	}
+	for i := 0; i < m.placeholders; i++ {
+		if m.placeholderIDs[i] == s.ID {
+			m.placeholders--
+			m.placeholderIDs[i] = m.placeholderIDs[m.placeholders]
+			return
+		}
 	}
 }
 

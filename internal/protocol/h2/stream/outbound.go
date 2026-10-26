@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -78,33 +79,138 @@ func (m *Manager) refundOutbound(n int) {
 	}
 }
 
-// notifySendWindow wakes every handler waiting in AwaitSendWindow, so it
-// re-checks its stream's send windows. Called after the peer grants window
-// (WINDOW_UPDATE, SETTINGS_INITIAL_WINDOW_SIZE). It costs an atomic load
-// unless a handler is waiting. Safe on any goroutine and under any lock:
+// sendWaiter is one handler waiting in awaitSendWindow. Each wait has its own
+// waiter and its own wakeup channel, so a frame wakes the waiters it can help
+// and no others (celeris#889: a connection's WINDOW_UPDATE used to wake every
+// handler of the connection, each of which re-checked its two windows and went
+// back to sleep, 4.4 us of CPU per frame with 99 waiters against 0.95 us
+// without; a stream's WINDOW_UPDATE woke them all too, 602 ns against 12 ns for
+// a stream nobody waits on, and the deadline of each wait woke them all once
+// more).
+type sendWaiter struct {
+	s     *Stream
+	id    uint32        // s.ID, read while the use was live
+	ch    chan struct{} // capacity 1; a send is a wakeup that stays until the waiter takes it; never closed
+	timer *time.Timer   // the wait's deadline, made once per waiter object and re-armed per wait (Reset), stopped when the wait ends
+}
+
+// wake leaves a wakeup for the waiter if it has none pending.
+func (w *sendWaiter) wake() {
+	select {
+	case w.ch <- struct{}{}:
+	default:
+	}
+}
+
+// registerSendWaiter adds a waiter for s (whose ID is id) to the connection's
+// set. It must come before the waiter checks the windows it waits for (see the
+// argument at awaitSendWindow).
+func (m *Manager) registerSendWaiter(s *Stream, id uint32) *sendWaiter {
+	w := sendWaiterPool.Get().(*sendWaiter)
+	w.s, w.id = s, id
+	m.sendWindowMu.Lock()
+	m.sendWaiters = append(m.sendWaiters, w)
+	m.sendWindowMu.Unlock()
+	return w
+}
+
+// unregisterSendWaiter removes w from the set and returns it to the pool; after
+// it returns no notifier holds w, except one that collected it under the lock
+// and has not woken it yet (a batch wake, notifyStreamWindow): it may leave a
+// token in the channel of a waiter that is in the pool, or already in another
+// wait. That wait wakes once for nothing and re-checks, which is all a stale
+// token costs.
+func (m *Manager) unregisterSendWaiter(w *sendWaiter) {
+	m.sendWindowMu.Lock()
+	for i, x := range m.sendWaiters {
+		if x == w {
+			last := len(m.sendWaiters) - 1
+			m.sendWaiters[i] = m.sendWaiters[last]
+			m.sendWaiters[last] = nil
+			m.sendWaiters = m.sendWaiters[:last]
+			break
+		}
+	}
+	m.sendWindowMu.Unlock()
+	select { // a wakeup nobody took
+	case <-w.ch:
+	default:
+	}
+	w.s = nil
+	sendWaiterPool.Put(w)
+}
+
+// sendWaiterPool holds the waiters (and their channels) of finished waits: a
+// wait that blocks costs no allocation for its waiter.
+var sendWaiterPool = sync.Pool{New: func() any { return &sendWaiter{ch: make(chan struct{}, 1)} }}
+
+// notifyStreamWindow wakes the handlers waiting for stream id's window, after
+// the peer has granted it (a stream WINDOW_UPDATE; celeris#893). A waiter of
+// another stream is not woken: it waits for a window of its own. It costs an
+// atomic load unless a handler is waiting, and a scan of the waiters, with one
+// comparison each, while one is. Safe on any goroutine and under any lock:
 // sendWindowMu is a leaf.
-func (m *Manager) notifySendWindow() {
+func (m *Manager) notifyStreamWindow(id uint32) {
 	if m.sendWindowWaiters.Load() == 0 {
 		return
 	}
+	var wake [wakeBatch]*sendWaiter
+	n := 0
 	m.sendWindowMu.Lock()
-	if m.sendWindowCh != nil {
-		close(m.sendWindowCh)
-		m.sendWindowCh = nil
+	for _, w := range m.sendWaiters {
+		if w.id == id {
+			if n == len(wake) {
+				w.wake() // more than a batch: this one under the lock
+				continue
+			}
+			wake[n] = w
+			n++
+		}
 	}
 	m.sendWindowMu.Unlock()
+	for _, w := range wake[:n] {
+		w.wake()
+	}
 }
 
-// sendWindowChan returns the channel the next notifySendWindow closes.
-func (m *Manager) sendWindowChan() chan struct{} {
-	m.sendWindowMu.Lock()
-	if m.sendWindowCh == nil {
-		m.sendWindowCh = make(chan struct{})
+// notifyOpenStreamWindows wakes the handlers whose own stream window has room,
+// after the connection's window has grown (a connection WINDOW_UPDATE) or the
+// stream windows have changed together (SETTINGS_INITIAL_WINDOW_SIZE;
+// celeris#893). A handler whose stream window is closed cannot send whatever
+// the connection's window holds: it is woken by the WINDOW_UPDATE for its
+// stream (notifyStreamWindow), which is the only thing that can end its wait.
+// Same cost and locking as notifyStreamWindow.
+func (m *Manager) notifyOpenStreamWindows() {
+	if m.sendWindowWaiters.Load() == 0 {
+		return
 	}
-	ch := m.sendWindowCh
+	var wake [wakeBatch]*sendWaiter
+	n := 0
+	m.sendWindowMu.Lock()
+	for _, w := range m.sendWaiters {
+		if w.s.windowSize.Load() > 0 {
+			if n == len(wake) {
+				w.wake()
+				continue
+			}
+			wake[n] = w
+			n++
+		}
+	}
 	m.sendWindowMu.Unlock()
-	return ch
+	for _, w := range wake[:n] {
+		w.wake()
+	}
 }
+
+// wakeBatch is how many waiters a notifier collects under sendWindowMu to wake
+// after it releases it. A wakeup readies a goroutine, which costs far more than
+// the comparison that chose it; done under the lock, every waiter that wakes
+// and returns to the set (unregisterSendWaiter, registerSendWaiter) queues
+// behind the rest of the notifier's wakeups. The waiter may be gone by the time
+// it is woken, and back in the pool or in another wait: the token it gets then
+// costs that wait one re-check (unregisterSendWaiter).
+const wakeBatch = 32
 
 // TryBufferOutbound buffers data as BufferOutbound does when the connection's
 // outbound budget has room for it, or holds nothing at all; otherwise it
@@ -179,7 +285,7 @@ func (s *Stream) AwaitSendWindow(deadline time.Time) error {
 	if m.WindowsOpen(s) {
 		return nil
 	}
-	return s.awaitSendWindow(m, s.Context().Done(), deadline)
+	return s.awaitSendWindow(m, s.ID, s.Context().Done(), deadline)
 }
 
 // AwaitSendWindowUse is AwaitSendWindow for a StreamWriter, which may outlive
@@ -211,59 +317,86 @@ func (s *Stream) AwaitSendWindowUse(gen uint64, timeout time.Duration, deadline 
 	}
 	// This use's context, taken while the use is known to be live: a context
 	// made after the object was reset would be handed to its next use.
-	done := s.Context().Done()
+	done, id := s.Context().Done(), s.ID
 	s.UseUnlock()
-	return s.awaitSendWindow(m, done, *deadline)
+	return s.awaitSendWindow(m, id, done, *deadline)
 }
 
-// awaitSendWindow is the wait of AwaitSendWindow and AwaitSendWindowUse: m
-// and done are the live use's, taken by the caller.
-func (s *Stream) awaitSendWindow(m *Manager, done <-chan struct{}, deadline time.Time) error {
+// awaitSendWindow is the wait of AwaitSendWindow and AwaitSendWindowUse: m,
+// id and done are the live use's, taken by the caller.
+//
+// The wait cannot lose a wakeup. The waiter is counted and registered, with its
+// own channel, before it checks anything, and a grant (the CAS that raises a
+// window) happens before its notifier looks for waiters. Take one grant and one
+// waiter. If the notifier's scan, under sendWindowMu, finds the waiter, it
+// leaves a token in the waiter's channel, which stays until the waiter takes
+// it whether the waiter is in its select yet or not, and the waiter then
+// re-checks both windows. If the scan does not find it (or the fast path saw no
+// waiter counted), the waiter counted and registered after that point, so after
+// the grant, and its first check sees the window. A notifier skips a waiter
+// only for a window the waiter cannot use: a connection frame skips the one
+// whose stream window is closed. That waiter needs both windows to open, and
+// the grant that opens its stream window is a notifier of its own, with the
+// same argument, so its last grant either wakes it or is seen by its check.
+// A deadline is one more source, a case of the waiter's own select: no
+// notifier is involved, and no other waiter is woken by it.
+//
+// One more premise: a window rises only through a notifier (a WINDOW_UPDATE, a
+// SETTINGS change) or through ReserveSendWindow's refund, which notifies too;
+// a window that dips to 0 and back inside a reservation is seen by the scan of
+// a connection frame as closed, and the refund's notice (sent when the refund
+// reopens a window that read as closed) covers that. A scan that read the
+// window as open woke the waiter; one that read it as closed is followed by a
+// rise from closed, which is a notifier's or such a refund.
+func (s *Stream) awaitSendWindow(m *Manager, id uint32, done <-chan struct{}, deadline time.Time) error {
 	open := func() bool { return m.WindowsOpen(s) }
-	// Counted before the channel is taken and the windows re-checked, so a
-	// notifier that grants window either sees the waiter (and closes the
-	// channel it holds) or granted before the re-check (which sees it).
 	m.sendWindowWaiters.Add(1)
 	defer m.sendWindowWaiters.Add(-1)
-	// The deadline is not a select case: a waiter would then re-arm a
-	// runtime timer every time a WINDOW_UPDATE wakes it, and every waiter
-	// of the connection wakes on each one. The timer instead sets expired
-	// and wakes the waiters once, like a WINDOW_UPDATE; the loop below took
-	// its channel before it checks expired, so that wakeup is not lost.
-	var expired *atomic.Bool
+	w := m.registerSendWaiter(s, id)
+	defer m.unregisterSendWaiter(w)
+	// The deadline is a timer channel the waiter owns: armed once for the wait
+	// (Reset: no allocation, and no goroutine at expiry, which time.AfterFunc
+	// needs), stopped when the wait ends. It is a select case, and a wakeup does
+	// not re-arm it: the loop below never touches the timer. Before, an AfterFunc
+	// per wait set a flag and woke every waiter of the connection (celeris#889).
+	var expired <-chan time.Time
 	if !deadline.IsZero() {
-		expired = new(atomic.Bool)
-		t := time.AfterFunc(time.Until(deadline), func() {
-			expired.Store(true)
-			m.notifySendWindow()
-		})
-		defer t.Stop()
+		if w.timer == nil {
+			w.timer = time.NewTimer(time.Until(deadline))
+		} else {
+			w.timer.Reset(time.Until(deadline))
+		}
+		expired = w.timer.C
+		defer w.timer.Stop()
 		// The timer is armed per wait, not once per response (celeris#889
 		// item 7; kept on purpose). A response only waits when the peer
 		// withholds window, and a reader that is over the connection's
 		// outbound budget with its stream windows open, the connection window
 		// being the bottleneck, waits once per chunk, so it arms and stops this
-		// timer once per connection WINDOW_UPDATE: about 0.6 us of CPU for
-		// each, with one waiter (#906's measurement, recorded in #892; not
-		// remeasured here). Arming it once in the caller (sendRest) and passing
-		// the expiry flag down would save that, at the price of giving the timer,
-		// and its Stop on every exit of every caller, to code that does not own
-		// the wait. The cost is paid only while a handler waits for a peer that
-		// withholds window, and no more than MAX_CONCURRENT_STREAMS of them can.
+		// timer once per connection WINDOW_UPDATE. Arming it once in the caller
+		// (sendRest) and passing the expiry down would save that, at the price
+		// of giving the timer, and its Stop on every exit of every caller, to
+		// code that does not own the wait. The cost is paid only while a
+		// handler waits for a peer that withholds window, and no more than
+		// MAX_CONCURRENT_STREAMS of them can (BenchmarkConnWindowReader892
+		// measures it, with and without the deadline).
 	}
 	for {
-		ch := m.sendWindowChan()
 		if s.IsCancelled() {
 			return context.Canceled
 		}
-		if expired != nil && expired.Load() {
+		select { // a deadline that has passed ends the wait whether or not the windows are open
+		case <-expired:
 			return os.ErrDeadlineExceeded
+		default:
 		}
 		if open() {
 			return nil
 		}
 		select {
-		case <-ch:
+		case <-w.ch:
+		case <-expired:
+			return os.ErrDeadlineExceeded
 		case <-done:
 			return context.Canceled
 		}

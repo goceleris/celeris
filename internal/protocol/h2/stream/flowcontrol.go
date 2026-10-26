@@ -77,7 +77,22 @@ func (m *Manager) ReserveSendWindow(s *Stream, want int32) int32 {
 		}
 	}
 	if connGrant < streamGrant {
-		s.windowSize.Add(streamGrant - connGrant)
+		d := streamGrant - connGrant
+		// The stream's window was out of the waiters' view for the length of this
+		// call. A connection WINDOW_UPDATE wakes only the waiters whose stream
+		// window it reads as open, so a scan that read it at 0 skipped a waiter of
+		// s, and the window that comes back is a rise nothing else announces: only
+		// then is it announced here (the window read as closed before the refund).
+		// Any other refund leaves it open throughout, and a scan read it as open
+		// and woke the waiter. Only another goroutine on the same stream can be
+		// waiting while this one reserves (a handler that writes from two
+		// goroutines, outside the StreamWriter contract); the gate keeps the
+		// reading-client regime (stream windows far from 0, a partial reservation
+		// on every chunk) from taking the waiters' lock for each (celeris#889, the
+		// lost-wakeup argument at awaitSendWindow).
+		if nw := s.windowSize.Add(d); nw-d <= 0 {
+			m.notifyStreamWindow(s.ID)
+		}
 	}
 	return connGrant
 }
