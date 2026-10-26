@@ -323,13 +323,21 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 			onRecv:  onRecv,
 			onClose: onClose,
 		}
-		// Publish the conn before arming the descriptor (celeris#770). The
-		// worker looks a driver conn up only while hasDriverConns is set, and
-		// the event is edge triggered: armed first, a first event the worker
-		// took before hasDriverConns was set went to the HTTP path, which read
-		// nothing, and never came again. Published first, a racing worker finds
-		// hasDriverConns set and waits in lookupDriver for driverMu, which is
-		// held here until the conn is in the map.
+		// What keeps the first byte (celeris#770, celeris#771, celeris#885
+		// item 55): the conn is in the map, and the descriptor armed, with
+		// driverMu held for both. The event is edge triggered, so a first
+		// event that reached the HTTP path, which reads nothing for a number
+		// that is no HTTP conn's, would never come again. It cannot: a
+		// worker that takes the event routes it by its Pad, the registration's
+		// generation (driverCandidate; the ADD below puts it there), whether
+		// or not hasDriverConns is set yet, and lookupDriver then waits for
+		// driverMu, which is held until the ADD is done, so it finds the conn.
+		// The order of the insert and the ADD inside the lock does not matter
+		// (a mutant with the ADD first, still under driverMu, passes
+		// TestRegisterConnDeliversBytesQueuedBeforeIt); an ADD outside the lock
+		// loses the byte. Before the generation, the order was the whole
+		// guard: only hasDriverConns made the worker look, so the conn had to
+		// be published before the descriptor was armed.
 		l.driverConns[fd] = dc
 		l.hasDriverConns.Store(true)
 		// Level-triggered EPOLLOUT is added lazily (on EAGAIN) by
