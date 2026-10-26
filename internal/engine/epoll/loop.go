@@ -2395,6 +2395,68 @@ func dispatchBusyLocked(cs *connState, owe *bool) bool {
 // (itself a dup).
 var testHookHijackReleased atomic.Pointer[func(l *Loop, cs *connState)]
 
+// errHijackQueued is what hijackConn answers when a reply an earlier pipelined
+// request wrote cannot be sent without waiting for the peer.
+var errHijackQueued = errors.New("celeris: cannot hijack: a queued response has not been sent and the peer's receive window does not take it, so it cannot go out before the connection is handed over")
+
+// flushBeforeHijack sends the output cs still has queued (a reply an earlier
+// pipelined request of the same recv wrote, which the loop flushes only after
+// the recv's last request has been handled), so that it reaches the peer before
+// the descriptor is handed to the hijacker: hijackConn releases the
+// connState inline, and off the loop thread the loop is forbidden to flush
+// for a hijacked conn (celeris#936), so a reply left queued was dropped.
+//
+// It never waits: writes go on while the socket takes bytes. A remainder the
+// socket does not take is left queued, in order, with the write accounting as
+// a flush that stopped there leaves it, and the hijack is refused
+// (errHijackQueued) with the conn untouched, for the handler to answer the
+// request on. A write error is the conn's: writeRefused closes it, and the
+// error is returned.
+//
+// onLoopThread tells the byte counters which path to use. Inline, this is the
+// loop thread. Off the loop thread this is the dispatch goroutine, which holds
+// detachMu across the handler (serveAsync) and so is the only writer of
+// writeBuf, as its own flush after ProcessH1 is. A detached conn is skipped:
+// its goroutine does not hold the lock, and Context.Hijack refuses a detached
+// Context, so only a caller of the engine's own Hijacker can get here.
+func (l *Loop) flushBeforeHijack(cs *connState, onLoopThread bool) error {
+	if !csWritePending(cs) {
+		return nil
+	}
+	if cs.h1State != nil && cs.h1State.Detached.Load() {
+		return nil
+	}
+	queued := 0
+	if cs.writeSince != 0 {
+		queued = csPendingBytes(cs) // before this flush (celeris#885)
+	}
+	var err error
+	for csWritePending(cs) {
+		before := csPendingBytes(cs)
+		if err = l.flushWrites(cs, onLoopThread); err != nil || csPendingBytes(cs) >= before {
+			break // an error, or the socket took nothing more
+		}
+	}
+	if onLoopThread {
+		cs.pendingBytes = csPendingBytes(cs)
+		if cs.pendingBytes == 0 {
+			cs.endWrite()
+		} else {
+			cs.noteWriteProgress(queued, cs.pendingBytes)
+		}
+	} else {
+		cs.resyncPending()
+	}
+	if err != nil {
+		cs.writeRefused = true // the reply is lost with the conn: close it
+		return err
+	}
+	if csWritePending(cs) {
+		return errHijackQueued
+	}
+	return nil
+}
+
 func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	// l.conns access is guarded by driverMu: in async mode this runs on a
 	// dispatch goroutine, so the read of the header/slot must be serialized
@@ -2411,17 +2473,26 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	// Otherwise the call is inline on the loop thread: sync mode, or an
 	// async-mode conn not yet promoted running its first request inline.
 	// asyncRun is read under asyncInMu, the lock the goroutine's lifetime is
-	// published under.
+	// published under. It does not change while this goroutine is the
+	// handler's: only the goroutine itself ends its run.
 	offThread := false
 	if cs.detachMu != nil {
 		cs.asyncInMu.Lock()
 		offThread = cs.asyncRun
-		if offThread {
-			// Stored under asyncInMu, before the descriptor is touched: a read
-			// of it that the loop thread has started (readPromoted) has
-			// finished by now, and none starts after (celeris#936).
-			cs.hijacked.Store(true)
-		}
+		cs.asyncInMu.Unlock()
+	}
+	// A reply an earlier pipelined request left queued goes out before the
+	// descriptor is handed over, or the hijack is refused with the conn as it
+	// was. Before hijacked is stored: a refusal leaves a conn the loop keeps.
+	if err := l.flushBeforeHijack(cs, !offThread); err != nil {
+		return nil, err
+	}
+	if offThread {
+		cs.asyncInMu.Lock()
+		// Stored under asyncInMu, before the descriptor is touched: a read
+		// of it that the loop thread has started (readPromoted) has
+		// finished by now, and none starts after (celeris#936).
+		cs.hijacked.Store(true)
 		cs.asyncInMu.Unlock()
 	}
 	// Detach the conn from the engine: drop it from epoll and the conn table,

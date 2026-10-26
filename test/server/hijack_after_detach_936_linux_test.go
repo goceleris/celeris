@@ -3,6 +3,7 @@
 package celeris_test
 
 import (
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -103,8 +104,8 @@ func TestHijackAfterDetachIsRefusedOnEveryEngine936(t *testing.T) {
 					_ = r.conn.Close()
 				}
 				if detach {
-					if r.err == nil {
-						t.Errorf("Hijack after Detach returned a connection (%v), want an error", r.conn != nil)
+					if !errors.Is(r.err, celeris.ErrHijackAfterDetach) {
+						t.Errorf("Hijack after Detach = (conn %v, %v), want ErrHijackAfterDetach", r.conn != nil, r.err)
 					}
 				} else if r.err != nil {
 					t.Errorf("Hijack without Detach: %v", r.err)

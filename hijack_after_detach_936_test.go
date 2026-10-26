@@ -1,6 +1,7 @@
 package celeris
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -23,8 +24,8 @@ func TestHijackAfterDetachIsRefused(t *testing.T) {
 	if conn != nil {
 		_ = conn.Close()
 	}
-	if err == nil {
-		t.Errorf("Hijack after Detach succeeded (conn %v), want an error", conn != nil)
+	if !errors.Is(err, ErrHijackAfterDetach) {
+		t.Errorf("Hijack after Detach = (conn %v, %v), want ErrHijackAfterDetach", conn != nil, err)
 	}
 	if got := w.hijacks.Load(); got != 0 {
 		t.Errorf("the engine's Hijack ran %d times after Detach, want 0", got)
