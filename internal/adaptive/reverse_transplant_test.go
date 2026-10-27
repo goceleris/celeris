@@ -60,18 +60,17 @@ func newBoundAdaptiveH(t *testing.T, h stream.Handler, async bool) (*Engine, str
 		skipOrFailUpswitch662(t, "adaptive.New unsupported here: %v", err)
 	}
 	e.ctrl.cooldown = 0
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	for dl := time.Now().Add(3 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		cancel()
-		<-done
-		t.Fatal("adaptive engine never bound")
-	}
-	return e, e.Addr().String(), func() { cancel(); <-done }
+	// The callers drive every switch with ForceSwitch and put 64 keep-alive
+	// conns on the engine. The controller's own conns-per-worker policy must not
+	// add switches of its own: with 2 workers (GOMAXPROCS 2, a 2-CPU container)
+	// 64 conns read 32 conns/worker, over the 24 up-threshold, so the tick loop
+	// promoted the conns back to io_uring about 2 s after every revert to epoll
+	// and the tests read the wrong engine (reverse-transplant and flap tests
+	// failed 40 of 40 runs at --cpus 2 and passed 40 of 40 at --cpus 4, where
+	// 64 conns are 16/worker). The error-rate revert is independent of this flag.
+	e.ctrl.connSwitchEnabled = false
+	addr, stop := listenAndAwaitBind890(t, e)
+	return e, addr, stop
 }
 
 // driveKeepAlive opens `conns` keep-alive HTTP/1.1 connections that loop

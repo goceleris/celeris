@@ -142,9 +142,12 @@ func TestPeerGoneIsSubtractedNotTheWholeErrorCount856(t *testing.T) {
 		wantRevert  bool
 		wantRate    float64
 	}{
-		{"mostly abandonment", 500, 1, 100, false, 0.01},
+		// One real fault is under the floor of minRevertFaults (celeris#886
+		// item 29) and reads 0; it read 0.01 before.
+		{"mostly abandonment", 500, 1, 100, false, 0},
 		{"abandonment hides a real fault", 500, 10, 100, true, 0.10},
 		{"faults only", 0, 4, 100, false, 0.04},
+		{"abandonment and faults at the floor", 500, 3, 100, false, 0.03},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			revert, snap := feed856(t, func(m *engine.EngineMetrics) {
