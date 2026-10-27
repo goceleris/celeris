@@ -63,7 +63,8 @@ type Config struct {
 	// encodings the field does not list), is not served. Brotli is preferred over
 	// gzip when both are accepted (x-gzip counts as gzip). A file served in
 	// answer to a request that carries an Accept-Encoding header names
-	// Accept-Encoding in Vary (once), whether or not the file has a variant. Works with both OS filesystem (Root) and fs.FS.
+	// Accept-Encoding in Vary (once), whether or not the file has a variant.
+	// Works with both OS filesystem (Root) and fs.FS.
 	Compress bool
 }
 

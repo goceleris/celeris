@@ -147,3 +147,40 @@ func BenchmarkStaticEscapeIfModifiedSince888(b *testing.B) {
 	benchPath888(b, escapeBench888(b), "/a/b/leak.txt",
 		"if-modified-since", secretTime888.Add(time.Hour).UTC().Format(http.TimeFormat))
 }
+
+// rootSymlinkedDirBench888 writes <dir>/real/c/app.js (4 KiB) and <dir>/alias,
+// a symlink to real/: the file is reached through a symlinked directory that
+// stays inside the Root. The 304 check then cannot settle on the Lstat walk:
+// it finds the link and falls to FileFromDir's resolution, two EvalSymlinks
+// (celeris#888 item 46: no row for the cost).
+func rootSymlinkedDirBench888(b *testing.B) celeris.HandlerFunc {
+	b.Helper()
+	dir := b.TempDir()
+	mod := time.Unix(1_700_000_000, 0)
+	p := filepath.Join(dir, "real", "c", "app.js")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(p, make([]byte, 4096), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.Chtimes(p, mod, mod); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(dir, "alias")); err != nil {
+		b.Skipf("symlinks are not available here: %v", err)
+	}
+	return New(Config{Root: dir, MaxAge: time.Hour})
+}
+
+// BenchmarkStaticServeFromRootNotModifiedSymlinkedDir is the 304 for a file two
+// elements below a symlinked directory inside the Root: read it against
+// BenchmarkStaticServeFromRootNotModifiedPlainDir, the same file two elements
+// below a plain directory (one Lstat per element, no EvalSymlinks).
+func BenchmarkStaticServeFromRootNotModifiedSymlinkedDir(b *testing.B) {
+	benchPath888(b, rootSymlinkedDirBench888(b), "/alias/c/app.js", "if-none-match", `W/"6553f100-1000"`)
+}
+
+func BenchmarkStaticServeFromRootNotModifiedPlainDir(b *testing.B) {
+	benchPath888(b, rootSymlinkedDirBench888(b), "/real/c/app.js", "if-none-match", `W/"6553f100-1000"`)
+}
