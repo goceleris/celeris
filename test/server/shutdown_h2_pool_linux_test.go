@@ -1270,6 +1270,24 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			// TCP_DEFER_ACCEPT hands the engine a conn with no byte after about a
 			// second: the silent conns are in its table by then.
 			time.Sleep(1300 * time.Millisecond)
+			// The gate's first pass runs 250 ms after the shutdown began, and a
+			// conn the loop has accepted but not read yet, or a request whose
+			// bytes it has not read, is closed by it as idle (the loop of a runner
+			// busy with 24 HTTP/2 downloads under -race and -cover can be that far
+			// behind: celeris#1104 lane, see the finding in the PR that added
+			// this wait). So begin only once the engine has accepted every conn and
+			// handled every request this test sent whole: 24 HTTP/2 GETs, 6 (7)
+			// keep-alive pings, and the download's GET.
+			wantConns := uint64(24 + len(idle) + len(silent) + 1) // + the download
+			wantReqs := uint64(24 + len(idle) + 1)
+			if arm == "sync" {
+				wantConns++ // the upload
+			}
+			if promoted != nil {
+				wantConns++
+				wantReqs++
+			}
+			waitEngineBusy1104(t, srv, wantConns, wantReqs)
 
 			begin := time.Now()
 			srv.beginShutdown("Shutdown", 20*time.Second)
@@ -1343,4 +1361,18 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			srv.waitStart(t, 25*time.Second)
 		})
 	}
+}
+
+// waitEngineBusy1104 waits, up to 20 s, until the engine counts at least conns
+// open connections and reqs handled requests.
+func waitEngineBusy1104(t *testing.T, srv *h2PoolServer759, conns, reqs uint64) {
+	t.Helper()
+	var m celeris.EngineMetrics
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		m = srv.s.EngineInfo().Metrics
+		if uint64(m.ActiveConnections) >= conns && m.RequestCount >= reqs {
+			return
+		}
+	}
+	t.Fatalf("the engine had %d open conns and %d requests handled, want at least %d and %d before the shutdown begins", m.ActiveConnections, m.RequestCount, conns, reqs)
 }
