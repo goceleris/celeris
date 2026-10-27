@@ -4812,11 +4812,18 @@ func h2ServerOwes(cs *connState) (open, ok bool) {
 		return h2 != nil && h2.ServerOwes(), true
 	}
 	if !mu.TryLock() {
-		if cs.switchedToH2() {
+		// The flag and the busy test are read in one asyncInMu section: read in
+		// two, a goroutine that switched the conn between them would be
+		// answered as a busy HTTP/1 handler (closed if a timeout is due).
+		cs.asyncInMu.Lock()
+		switched := cs.h2Switched
+		busy := cs.asyncCond.L != nil && dispatchBusyLocked(cs, nil)
+		cs.asyncInMu.Unlock()
+		if switched {
 			h2 := cs.h2State
 			return h2 != nil && h2.ServerOwes(), true
 		}
-		return false, dispatchBusy(cs, nil)
+		return false, busy
 	}
 	h2 := cs.h2State
 	open = h2 != nil && h2.ServerOwes()

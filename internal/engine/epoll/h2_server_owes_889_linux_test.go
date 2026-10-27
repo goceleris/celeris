@@ -124,3 +124,48 @@ func TestH2ServerOwesReadsUnderTheLock889(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 }
+
+// TestH2ServerOwesAfterTheUpgradeReadsWithoutTheLock889: the order of the real
+// upgrade, switchToH2Local: h2State is written under detachMu, then h2Switched
+// is set under asyncInMu, and detachMu stays held for the stream's life. The
+// sweep's look then reads h2State without the lock, which the flag orders after
+// the write. Run with -race: a read that is not ordered by the flag, one that is
+// made before it is seen, is reported.
+func TestH2ServerOwesAfterTheUpgradeReadsWithoutTheLock889(t *testing.T) {
+	st := h2OpenStream889(t, true)
+	for range 300 {
+		cs := acquireConnState(context.Background(), 3, 64, true)
+		cs.protocol = engine.HTTP1
+		cs.asyncInMu.Lock()
+		cs.asyncRun, cs.asyncParked = true, false
+		cs.asyncInMu.Unlock()
+		released := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cs.detachMu.Lock()
+			cs.h2State = st
+			cs.protocol = engine.H2C
+			cs.asyncInMu.Lock()
+			cs.h2Switched = true
+			cs.asyncInMu.Unlock()
+			<-released // the goroutine holds detachMu for the stream's life
+			cs.detachMu.Unlock()
+		}()
+		for {
+			open, ok := h2ServerOwes(cs)
+			if open && ok {
+				break
+			}
+			if ok && !open {
+				// Before the switch: a running HTTP/1 handler, answered as
+				// such. Spin on until the flag is seen.
+				continue
+			}
+		}
+		close(released)
+		wg.Wait()
+		releaseConnState(cs)
+	}
+}

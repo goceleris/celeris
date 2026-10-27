@@ -241,11 +241,17 @@ type Config struct {
 	// On the native engines (epoll, io_uring, adaptive) it is measured from the
 	// connection's last read (on io_uring also from its last completed send, on
 	// epoll also from the end of a response the kernel did not take at once).
-	// An HTTP/2 connection with a stream open (the client's request begun and
-	// the stream not yet closed, a response still being written included) is
-	// not closed by it or by IdleTimeout, so an HTTP/2 stream whose client
-	// sends no frame (an SSE stream) outlives them; an HTTP/2 connection with
-	// no stream open is closed as an HTTP/1.1 one is.
+	//
+	// An HTTP/2 connection is not closed by it or by IdleTimeout while it has a
+	// stream open whose request is whole and no response is waiting for the
+	// client's flow-control window: a stream the server is writing to (an SSE
+	// stream) outlives a client that sends no frame. When the last such stream
+	// ends the idle period starts there, within a sweep. A client that owes the
+	// server something, the rest of a request or the WINDOW_UPDATE a response is
+	// waiting for, and sends nothing is closed as on HTTP/1.1, as is an HTTP/2
+	// connection with no stream open. A client that sends a frame of any kind
+	// (a PING) at least once per ReadTimeout is not bounded by it; std bounds a
+	// request and a response per stream, the native engines do not.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This
@@ -357,7 +363,8 @@ type Config struct {
 	// WriteTimeout finite when handlers share locks across response writes.
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
-	// Zero uses the default (600s). Set to -1 for no timeout.
+	// Zero uses the default (600s). Set to -1 for no timeout. On an HTTP/2
+	// connection with a stream the server owes an answer for, see ReadTimeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts
