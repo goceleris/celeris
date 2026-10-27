@@ -20,8 +20,10 @@ import (
 // bind then fails for a link-local address, as std's does). An IPv4-mapped host
 // is bound as IPv4 and its zone ignored, as std does.
 
-// zoneID885 is std's rule for a zone (net.zoneToInt): the interface's index,
-// else the number, else 0.
+// zoneID885 is std's rule for a zone (net's ipv6ZoneCache.index, go1.27): the
+// index of the interface of that name, else the decimal digits the name starts
+// with (dtoi: "12abc" is 12, a number of 0xFFFFFF or more saturates at
+// 0xFFFFFF), else 0.
 func zoneID885(zone string) uint32 {
 	if zone == "" {
 		return 0
@@ -29,9 +31,12 @@ func zoneID885(zone string) uint32 {
 	if ifi, err := net.InterfaceByName(zone); err == nil {
 		return uint32(ifi.Index)
 	}
-	n, err := strconv.ParseUint(zone, 10, 32)
-	if err != nil {
-		return 0
+	n := 0
+	for i := 0; i < len(zone) && '0' <= zone[i] && zone[i] <= '9'; i++ {
+		n = n*10 + int(zone[i]-'0')
+		if n >= 0xFFFFFF {
+			return 0xFFFFFF
+		}
 	}
 	return uint32(n)
 }
@@ -58,6 +63,10 @@ func TestParseAddrReadsAZonedIPv6Host885(t *testing.T) {
 		// std reads it: the kernel then refuses the bind of a link-local
 		// address, and a global one binds.
 		{"[fe80::1%nosuchif0]:80", v6(80, "fe80::1", 0)},
+		// A malformed zone is read as std reads it: the digits it starts with.
+		{"[fe80::1%12abc]:80", v6(80, "fe80::1", 12)},
+		{"[fe80::1%99999999999]:80", v6(80, "fe80::1", 0xFFFFFF)},
+		{"[fe80::1%abc12]:80", v6(80, "fe80::1", 0)},
 		{"[2001:db8::1%lo]:443", v6(443, "2001:db8::1", uint32(lo.Index))},
 		{"[::%lo]:80", v6(80, "::", uint32(lo.Index))},
 		// Everything after the first % is the zone, so this one names no interface.

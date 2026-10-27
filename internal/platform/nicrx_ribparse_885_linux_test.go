@@ -67,6 +67,47 @@ func cat885(parts ...[]byte) []byte {
 	return out
 }
 
+// unpadded885 is an RTM_NEWADDR whose last attribute carries n payload bytes
+// and is not padded to 4, with the message length counting exactly its bytes.
+func unpadded885(n int) []byte {
+	d := make([]byte, syscall.SizeofIfAddrmsg)
+	d[0] = syscall.AF_INET
+	binary.NativeEndian.PutUint32(d[4:], 2)
+	d = append(d, attr885(syscall.IFA_ADDRESS, ip885("10.0.0.1"))...)
+	last := make([]byte, 4+n)
+	binary.NativeEndian.PutUint16(last[0:], uint16(4+n))
+	binary.NativeEndian.PutUint16(last[2:], syscall.IFA_LABEL)
+	d = append(d, last...)
+	return msg885(syscall.RTM_NEWADDR, d)
+}
+
+// viaDump885 reads rib the way Listen does: as the dump netlinkRIB returned.
+func viaDump885(rib []byte) (map[int][]netip.Addr, bool) {
+	old := netlinkRIB
+	netlinkRIB = func(int, int) ([]byte, error) { return rib, nil }
+	defer func() { netlinkRIB = old }()
+	return addrsByIndex()
+}
+
+// TestOSIfaceAddrsFallsBackOnAnUnparseableDump885: a dump the parser cannot
+// read gives the table the per-interface calls give, and does not panic.
+func TestOSIfaceAddrsFallsBackOnAnUnparseableDump885(t *testing.T) {
+	want, err := refIfaceAddrs885()
+	if err != nil {
+		t.Skipf("net.Interfaces: %v", err)
+	}
+	old := netlinkRIB
+	t.Cleanup(func() { netlinkRIB = old })
+	netlinkRIB = func(int, int) ([]byte, error) { return unpadded885(5), nil }
+	got, err := osIfaceAddrs()
+	if err != nil {
+		t.Fatalf("osIfaceAddrs: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("fallback table differs from the per-interface one:\n got  %+v\n want %+v", got, want)
+	}
+}
+
 func TestParseAddrRIB885(t *testing.T) {
 	a := netip.MustParseAddr
 	for _, tc := range []struct {
@@ -114,9 +155,22 @@ func TestParseAddrRIB885(t *testing.T) {
 			binary.NativeEndian.PutUint32(m[0:], 4096)
 			return m
 		}(), nil, false},
+		// A final attribute whose length is not a multiple of 4 and that has no
+		// padding: the std function that walks the attributes slices past the end
+		// of the message and panics. A kernel dump pads every attribute, so this
+		// is not a dump the kernel makes, but the table is built at Listen and
+		// must fall back, not panic (review of #1127, minor 1). The first row is
+		// the fuzz crasher of that review.
+		{"unpadded-final-attribute-fuzz-crasher", []byte("1\x00\x00\x00\x14\x00000000000000000000\b\x00000000\b\x00000000\t\x000000000000"), nil, false},
+		{"unpadded-final-attribute-1", unpadded885(1), nil, false},
+		{"unpadded-final-attribute-2", unpadded885(2), nil, false},
+		{"unpadded-final-attribute-3", unpadded885(3), nil, false},
+		{"unpadded-final-attribute-5", unpadded885(5), nil, false},
+		{"unpadded-final-attribute-6", unpadded885(6), nil, false},
+		{"unpadded-final-attribute-7", unpadded885(7), nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := parseAddrRIB(tc.rib)
+			got, ok := viaDump885(tc.rib)
 			if ok != tc.ok {
 				t.Fatalf("ok = %v, want %v", ok, tc.ok)
 			}

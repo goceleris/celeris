@@ -224,3 +224,34 @@ func BenchmarkSockaddrString925(b *testing.B) {
 		})
 	}
 }
+
+// TestZoneIDIsStdsRule (celeris#885 item 54): the scope id of a zone is read as
+// net reads it for a listen address: the interface of that name, else the
+// decimal digits the zone starts with (net's dtoi: "12abc" is 12, and a number
+// of 0xFFFFFF or more saturates), else 0.
+func TestZoneIDIsStdsRule(t *testing.T) {
+	lo, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Skipf("no lo interface: %v", err)
+	}
+	for _, tc := range []struct {
+		zone string
+		want uint32
+	}{
+		{"", 0},
+		{"lo", uint32(lo.Index)},
+		{"7", 7},
+		{"12abc", 12},
+		{"007", 7},
+		{"abc", 0},
+		{"abc12", 0},
+		{"-5", 0},
+		{"16777214", 16777214},
+		{"16777215", 0xFFFFFF},
+		{"99999999999", 0xFFFFFF},
+	} {
+		if got := ZoneID(tc.zone); got != tc.want {
+			t.Errorf("ZoneID(%q) = %d, want %d", tc.zone, got, tc.want)
+		}
+	}
+}
