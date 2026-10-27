@@ -124,8 +124,10 @@ func TestH2SilentClientOwingTheServerIsReaped889(t *testing.T) {
 // closed on the native engines (the PING restarts the conn clock, on main as
 // well: measured on main f4ae3ad, all three engines). std ends these streams
 // at ReadTimeout (RST_STREAM NO_ERROR, 1.00 s) and at WriteTimeout
-// (RST_STREAM INTERNAL_ERROR, 2.00 s). Only per-stream deadlines would; when
-// they exist these cells change to "reset", and the comment with them.
+// (RST_STREAM INTERNAL_ERROR, 2.00 s). Only per-stream deadlines would: they
+// are tracked as the per-stream deadlines work under celeris#889 (L19 stage 2,
+// the std model). When they land these cells are FLIPPED to "the stream is
+// reset", not deleted, and this comment goes with them.
 func TestH2PingingClientHoldsAnUnfinishedStream889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		for _, sc := range pingCells889 {
