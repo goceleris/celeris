@@ -69,18 +69,8 @@ func newBoundAdaptiveH(t *testing.T, h stream.Handler, async bool) (*Engine, str
 	// failed 40 of 40 runs at --cpus 2 and passed 40 of 40 at --cpus 4, where
 	// 64 conns are 16/worker). The error-rate revert is independent of this flag.
 	e.ctrl.connSwitchEnabled = false
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	for dl := time.Now().Add(3 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		cancel()
-		<-done
-		t.Fatal("adaptive engine never bound")
-	}
-	return e, e.Addr().String(), func() { cancel(); <-done }
+	addr, stop := listenAndAwaitBind890(t, e)
+	return e, addr, stop
 }
 
 // driveKeepAlive opens `conns` keep-alive HTTP/1.1 connections that loop
