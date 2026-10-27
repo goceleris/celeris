@@ -3,6 +3,7 @@
 package epoll
 
 import (
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -31,6 +32,15 @@ import (
 // conn, with Connection: close (H1State.CloseAfter, as net/http's response
 // written after Shutdown began). The HTTP/2 conns the wait is for are served on:
 // they have had GOAWAY since the wait began.
+//
+// A request that reached the kernel before the gate but that the loop has not
+// read yet is a request in progress too (celeris#1104): the gate's first pass
+// asks the kernel for the receive queue of every conn it would close
+// (TIOCINQ), and a conn that holds bytes is read on, once, and answered with
+// Connection: close, not closed (close(2) with unread bytes is an RST, and with
+// none left to read the client sees an EOF in place of its answer). A request
+// that reaches the kernel after that pass is a request that begins after the
+// gate, and is refused as before.
 //
 // An HTTP/1 conn that is idle, holds nothing queued and has no request in
 // progress is closed, as std's Shutdown closes its idle conns: its client fails
@@ -66,6 +76,12 @@ const gateClosesPerPass = 64
 // dispatch goroutine owns its parse state (asyncPromoted) is refused as before
 // while it is HTTP/1: its state is not the loop's to read. Loop thread.
 func refusesRecv(cs *connState) bool {
+	if cs.gateRead {
+		// The gate's first pass found the bytes of a request in the kernel's
+		// receive queue (holdUnreadAtGate): it is read, and answered, however
+		// the conn looks to the tests below.
+		return false
+	}
 	if !cs.detected {
 		return cs.detectN == 0
 	}
@@ -96,11 +112,12 @@ func (l *Loop) poolWaitGate() {
 	if now.Sub(l.h2DrainStart) <= poolWaitGrace {
 		return
 	}
+	first := !l.refuseRecv
 	l.refuseRecv = true
-	if n := now.UnixNano(); n >= l.producersStopNext {
+	if n := now.UnixNano(); first || n >= l.producersStopNext {
 		l.producersStopNext = n + int64(h2PoolDrainPollMs*time.Millisecond)
 		l.stopDetachedProducers()
-		l.closeIdleH1()
+		l.closeIdleH1(first, n)
 	}
 }
 
@@ -109,14 +126,24 @@ func (l *Loop) poolWaitGate() {
 // with bytes unsent would reset them away), no request in progress, not a
 // detached stream still running (one the gate has ended is closed once it has
 // flushed, on a sync route or an Async one), no dispatch goroutine otherwise
-// (see the gate's comment), and a conn with no byte sent (not detected,
-// detectN 0). It also marks every conn it meets close-after (H1State.CloseAfter),
+// (see the gate's comment), no byte in the kernel's receive queue (first pass,
+// celeris#1104), and a conn with no byte sent (not detected, detectN 0). It also marks every conn it meets close-after (H1State.CloseAfter),
 // so that a request it still reads (one in progress) is answered with
 // Connection: close. A conn whose response is
 // still going out is met again by the next pass. closeConn removes the conn
 // from liveConns by swapping it with the last entry, so the walk goes from the
-// top down, as checkTimeouts does. Loop thread.
-func (l *Loop) closeIdleH1() {
+// top down, as checkTimeouts does.
+//
+// first is the pass that raised the gate (poolWaitGate): the bytes the kernel
+// holds for a conn at that instant reached it before the gate, and are a
+// request in progress, which holdUnreadAtGate reads and answers instead of
+// closing the conn (celeris#1104). The receive queue is asked for every conn
+// the pass would otherwise close, ahead of the cap and the send-side tests so
+// that a conn those leave for the next pass is not met unasked; later passes
+// do not ask: what has arrived since is a request that begins after the gate,
+// refused as before, and its conn is closed. now is the pass's UnixNano. Loop
+// thread.
+func (l *Loop) closeIdleH1(first bool, now int64) {
 	closed := 0
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
 		cs := l.liveConns[i]
@@ -156,15 +183,59 @@ func (l *Loop) closeIdleH1() {
 		} else if cs.detectN != 0 {
 			continue
 		}
+		if first && !ended && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
+			// The kernel's receive queue, last before the tests that lead to
+			// the close, so that the window between the question and close(2)
+			// is the few microseconds of those tests (a request that arrives
+			// in it is cut as std's Shutdown cuts one that arrives as it
+			// closes an idle conn, an RST for the unread bytes). An error is
+			// not an answer: the conn is left alone in this pass (a later pass,
+			// which does not ask, closes it).
+			q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ)
+			if err != nil {
+				continue
+			}
+			if q != 0 {
+				l.holdUnreadAtGate(cs, now)
+				continue
+			}
+		}
 		if closed >= gateClosesPerPass || csWritePending(cs) || cs.dirty || cs.epollOut {
 			continue
 		}
 		if q, err := unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ); err != nil || q != 0 {
 			continue
 		}
+		if h := testHookGateBeforeClose.Load(); h != nil {
+			(*h)(cs.fd)
+		}
 		l.closeConn(cs.fd)
 		closed++
 	}
+}
+
+// testHookGateBeforeClose, when set, runs on the loop thread in closeIdleH1
+// after the last question (the send queue's) and right before close(2): the
+// window in which a request can still reach a conn the pass has judged idle
+// (celeris#1104). Tests only; one atomic load per conn closed, on the gate's
+// pass, which is not a per-request path.
+var testHookGateBeforeClose atomic.Pointer[func(fd int)]
+
+// holdUnreadAtGate reads, once, the request the kernel holds for cs and
+// answers it with Connection: close: cs is marked to be read on whatever its
+// state (refusesRecv), and read now, because the epoll event that reported
+// these bytes may already have been taken (a read refused at the gate consumes
+// the edge, and nothing reports bytes that were there before). It runs on the
+// loop thread inside the gate's walk, as the read event would, with the same
+// bounded budget (drainRead); the conn may be closed by it, which the walk
+// from the top down survives. A conn whose protocol turns out to be HTTP/2 is
+// served as one (initProtocol marks only HTTP/1 close-after). Loop thread.
+func (l *Loop) holdUnreadAtGate(cs *connState, now int64) {
+	cs.gateRead = true
+	if h := cs.h1State; h != nil {
+		h.CloseAfter = true
+	}
+	l.drainRead(cs.fd, now)
 }
 
 // stopDetachedProducers is the detached half of shutdown's phase 1, run early

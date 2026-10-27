@@ -179,7 +179,8 @@ type connState struct {
 	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
 	detectN  uint8           // 1 byte: bytes at the head of buf received but too few to detect on, under detect.PrefaceLen (celeris#870); 0 once detected
 	goMoved  bool            // 1 byte: the dispatch goroutine's flush took bytes of a response (left the rest queued, or emptied the queue; resyncPending); under detachMu, consumed by noteWriteProgress (celeris#885 items 35 and 45)
-	_        [2]byte         // padding to 8-byte alignment
+	gateRead bool            // 1 byte: the pool wait's gate found a request in the kernel's receive queue (holdUnreadAtGate, celeris#1104): refusesRecv lets it be read
+	_        [1]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
@@ -526,6 +527,7 @@ func releaseConnState(cs *connState) {
 	cs.h2Switched = false
 	cs.detected = false
 	cs.detectN = 0
+	cs.gateRead = false
 	cs.detectDeadline = 0
 	cs.dirty = false
 	cs.epollOut = false

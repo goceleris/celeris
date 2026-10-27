@@ -828,6 +828,11 @@ type Worker struct {
 	// worker, new requests would keep the queues from ever emptying.
 	// Worker thread only; read in handleRecv.
 	refuseRecv bool
+	// gateSwept is set by the first pass of the gate (closeIdleH1): that pass
+	// asks the kernel for the receive queue of the conns it would close, and
+	// holds a conn that has a request in it (holdUnreadAtGate, celeris#1104).
+	// Worker thread only.
+	gateSwept bool
 
 	// drainBudget points at the engine's record of the budget of the last
 	// Engine.Shutdown call, and h2DrainStart is when the worker, its
@@ -3350,6 +3355,10 @@ func (w *Worker) initProtocol(cs *connState) {
 	switch engine.Protocol(cs.protocol.Load()) {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
+		// A conn whose protocol is decided past the gate (the bytes of a
+		// decision begun, or a request the gate reads on) is answered
+		// close-after, as the conns the gate has met are (celeris#1104).
+		cs.h1State.CloseAfter = w.refuseRecv
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue
@@ -7200,6 +7209,15 @@ func (w *Worker) flushSend(cs *connState) bool {
 		return false
 	}
 
+	// The conn goes from idle to having output: the write clock starts here.
+	// lastActivity is the last read or completed send, and the sweep measures
+	// WriteTimeout for a conn with a send in flight from it, so for a stream
+	// that was quiet for longer than WriteTimeout the whole gap counted, and a
+	// sweep that found the next chunk's SEND in flight closed the conn with it
+	// (celeris#889). A store of the clock the iteration already read: the
+	// recv, the wake of a handler goroutine's write, or the sweep refreshed
+	// cachedNow before this ran.
+	cs.lastActivity = w.cachedNow
 	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
 
 	sqe := w.ring.GetSQE()
