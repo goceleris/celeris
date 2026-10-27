@@ -44,6 +44,11 @@ type SentinelConfig struct {
 // subscription.
 var sentinelDownGrace = 5 * time.Second
 
+// sentinelSwitchBackoffBase is the first pause of handleSwitchMaster between
+// two dials of the new master (it doubles, up to 2 s). A variable so a test can
+// make the pause end at once.
+var sentinelSwitchBackoffBase = 100 * time.Millisecond
+
 // SentinelClient is a Redis client managed by Redis Sentinel. It discovers the
 // current primary via Sentinel, connects to it, and automatically reconnects
 // to the new primary when a failover is detected.
@@ -449,6 +454,11 @@ var ErrSentinelUnhealthy = errors.New("celeris-redis: sentinel client unhealthy,
 // fail, the client is marked unhealthy and returns errors until the next
 // successful +switch-master.
 func (s *SentinelClient) handleSwitchMaster(payload string) {
+	// watchFailover's select between a queued message and closeCh picks at
+	// random, so this can run after Close: make no dial for a closed client.
+	if s.closed.Load() {
+		return
+	}
 	// Format: "<master-name> <old-ip> <old-port> <new-ip> <new-port>"
 	parts := splitFields(payload)
 	if len(parts) < 5 {
@@ -459,7 +469,7 @@ func (s *SentinelClient) handleSwitchMaster(payload string) {
 	}
 	newAddr := net.JoinHostPort(parts[3], parts[4])
 
-	bo := async.NewBackoff(100*time.Millisecond, 2*time.Second)
+	bo := async.NewBackoff(sentinelSwitchBackoffBase, 2*time.Second)
 	const maxRetries = 3
 	var newClient *Client
 	var lastErr error
@@ -478,10 +488,26 @@ func (s *SentinelClient) handleSwitchMaster(payload string) {
 			case <-s.closeCh:
 				return
 			}
+			// closeCh wins a tie with the timer: select picks at random when
+			// both are ready, and another dial would connect to the master
+			// after Close.
+			if s.closed.Load() {
+				return
+			}
 		}
 	}
 
 	s.mu.Lock()
+	// Close sets closed before it takes s.mu to clear s.client, and a dial
+	// runs under its own timeout, not closeCh, so a Close can land while
+	// dialMaster is in flight. Nothing closes a client installed after it.
+	if s.closed.Load() {
+		s.mu.Unlock()
+		if newClient != nil {
+			_ = newClient.Close()
+		}
+		return
+	}
 	old := s.client
 	if newClient != nil {
 		s.client = newClient
