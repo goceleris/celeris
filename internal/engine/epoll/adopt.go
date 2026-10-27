@@ -248,12 +248,13 @@ func (l *Loop) attachFD(ctx context.Context, fd int, carry engine.Carryover, now
 		}
 		perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, l.handler, cs.writeFn)
 		// The replay is the recv event of this conn's first bytes and counts
-		// one, whatever the verdict (celeris#886). drainRead counts a recv
-		// after ProcessH1 too, but returns before it on an h2c upgrade and
-		// never counts a direct-body recv: a carry that is an upgrade request
-		// counts one here and its recv would have counted none. Not when this
-		// loop read and counted the bytes itself (a reclaim: recvCounted).
-		if !recvCounted {
+		// one, whatever the verdict but one (celeris#886). drainRead counts a
+		// recv after ProcessH1 too, but returns before it on an h2c upgrade
+		// and never counts a direct-body recv: a carry that is an upgrade
+		// request counts none here either, as its recv would have counted none
+		// (item 23: both paths now count the upgrade request as none). Not when
+		// this loop read and counted the bytes itself (a reclaim: recvCounted).
+		if !recvCounted && !errors.Is(perr, conn.ErrUpgradeH2C) {
 			l.reqBatch++
 		}
 		if perr != nil {
@@ -276,13 +277,13 @@ func (l *Loop) attachFD(ctx context.Context, fd int, carry engine.Carryover, now
 func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte, recvCounted bool) {
 	cs.h1State.InlineMode = true
 	perr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
-	// One request counted for the replay, whichever way it ends below: it is
-	// the recv event of this conn's first bytes (the promotion included, as
-	// in drainRead, celeris#626; celeris#886). Unlike drainRead it also counts
-	// a carry that ends in an h2c upgrade, which that path returns before
-	// counting. Not when this loop counted the recv already (a reclaim,
-	// recvCounted).
-	if !recvCounted {
+	// One request counted for the replay, whichever way it ends below but an
+	// h2c upgrade: it is the recv event of this conn's first bytes (the
+	// promotion included, as in drainRead, celeris#626; celeris#886). Like
+	// drainRead, which returns on the upgrade verdict before it counts, it
+	// counts a carry that ends in an h2c upgrade as none (item 23). Not when
+	// this loop counted the recv already (a reclaim, recvCounted).
+	if !recvCounted && !errors.Is(perr, conn.ErrUpgradeH2C) {
 		l.reqBatch++
 	}
 	// A handler that hijacked inline has had cs released inside the Hijack

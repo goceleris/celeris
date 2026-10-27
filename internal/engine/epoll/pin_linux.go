@@ -4,6 +4,7 @@ package epoll
 
 import (
 	"log/slog"
+	"slices"
 
 	"github.com/goceleris/celeris/internal/platform"
 )
@@ -16,6 +17,47 @@ var pinThreadToCPU = platform.PinToCPU
 // (the concrete address the engine binds). A variable so a test can stand in a
 // plan.
 var planWorkerCPUs = platform.PlanWorkerCPUsFor
+
+// detectNUMA reads the host's NUMA topology, for the MaxEvents split in Listen.
+// A variable so a test can stand in a topology.
+var detectNUMA = platform.DetectNUMA
+
+// splitMaxEvents is the MaxEvents a loop gets: the configured figure divided by
+// the number of NUMA nodes the process's allowed CPU set meets, never under 64
+// (celeris#885 item 31). It divided by the host's node count, so a process kept
+// to one node (numactl --cpunodebind, a single-numa-node pod, a cpuset of one
+// socket), whose every loop is on that node, still got MaxEvents / NumNodes.
+// allowed is the plan's allowed set (platform.CPUPlan.Allowed). Where the nodes
+// it meets cannot be told (no allowed set, no CPU lists for the nodes, or none
+// of its CPUs on a listed node) the host's count is used, as before.
+func splitMaxEvents(maxEvents int, topo platform.NUMATopology, allowed []int) int {
+	nodes := topo.NumNodes
+	if n := nodesMet(topo, allowed); n > 0 {
+		nodes = n
+	}
+	if nodes > 1 {
+		maxEvents /= nodes
+		if maxEvents < 64 {
+			maxEvents = 64
+		}
+	}
+	return maxEvents
+}
+
+// nodesMet is the number of nodes of topo that hold a CPU of allowed; 0 when
+// that cannot be told.
+func nodesMet(topo platform.NUMATopology, allowed []int) int {
+	if len(allowed) == 0 || len(topo.NodeCPUs) == 0 {
+		return 0
+	}
+	n := 0
+	for _, cpus := range topo.NodeCPUs {
+		if slices.ContainsFunc(cpus, func(c int) bool { return slices.Contains(allowed, c) }) {
+			n++
+		}
+	}
+	return n
+}
 
 // annotateNICIRQs adds the report of the CPUs that service the interrupts of
 // the NIC the listener is reachable through to a plan that is already decided

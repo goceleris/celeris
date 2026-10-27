@@ -26,6 +26,13 @@ var (
 	// recovers the panic, as the router does, then answers in).
 	detachPreFlagHook atomic.Pointer[func()]
 
+	// detachPostCountHook runs in OnDetach right after the detach count is made
+	// (sync mode) or asyncDetachPending is set (async mode), before the guarded
+	// writeFn is built: the span between the snapshot the rollback restores and
+	// the place the rollback used to be registered, which a fault there left
+	// uncovered (#889 item 48).
+	detachPostCountHook atomic.Pointer[func()]
+
 	// detachPostInstallHook runs in OnDetach of a conn that is not on the
 	// promoted async path, once everything the hook installs is in place (the
 	// guarded writeFn, the adapter's, RawWriteFn, pause/resume): the point a

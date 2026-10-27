@@ -722,10 +722,12 @@ func (e *Engine) Type() engine.EngineType {
 // nothing yet is promoted by the kernel during the linger and served like
 // any other, instead of being reset by the close.
 //
-// It does not promise a prompt start: a worker sees the flag at its next
-// ring wakeup, which on an idle plain-HTTP/1 worker can be up to 100 ms
-// away. Correctness does not depend on that, because each listener's
-// deadline is taken at its own clear.
+// It signals each worker's wake eventfd, whose POLL_ADD the ring keeps armed
+// in every mode, so a worker idle in its ring wait sees the flag at once: it
+// used to see it at its next ring wakeup, up to 100 ms away on an idle
+// plain-HTTP/1 worker (measured, celeris#886 item 24). A worker that is
+// running just reads the counter at its next wakeup. Correctness does not
+// depend on that, because each listener's deadline is taken at its own clear.
 //
 // It reads net.ipv4.tcp_synack_retries once, here. When that reads 0, the
 // pausing listeners also get TCP_SYNCNT=1, without which the kernel would
@@ -735,6 +737,13 @@ func (e *Engine) Type() engine.EngineType {
 func (e *Engine) BeginPauseAccept() {
 	e.pause.Begin(e.cfg.Logger, "io_uring")
 	e.acceptPaused.Store(true)
+	// After the store, as ResumeAccept signals after its own: a worker woken
+	// here reads the flag set. A leaf lock and one write(2) per worker.
+	e.mu.Lock()
+	for _, w := range e.workers {
+		w.wakeFD.Signal()
+	}
+	e.mu.Unlock()
 }
 
 // PauseAccept stops accepting new connections. It is BeginPauseAccept

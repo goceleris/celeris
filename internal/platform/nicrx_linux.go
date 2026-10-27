@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Reading the NICs behind a listener (celeris#1036 item 1). The rx-port rule
@@ -122,13 +124,25 @@ func (osNICFS) exists(name string) bool {
 	return err == nil
 }
 
-// osIfaceAddrs lists the interfaces and their addresses with the net package
-// (one netlink dump per interface; no cgo and no ip binary).
+// netlinkRIB is the netlink dump osIfaceAddrs reads addresses with. A variable
+// so a test can count the dumps (celeris#885 item 53).
+var netlinkRIB = syscall.NetlinkRIB
+
+// osIfaceAddrs lists the interfaces and their addresses: net.Interfaces for the
+// interfaces (one RTM_GETLINK dump) and one RTM_GETADDR dump for all their
+// addresses, mapped by interface index. It was net.Interfaces and then
+// (*Interface).Addrs for each of up to 512 interfaces, and every Addrs call is
+// a full RTM_GETADDR dump of the host's addresses, so a hostNetwork node with
+// hundreds of veths paid hundreds of dumps at start, and again at the adaptive
+// engine's standby Listen while the server is serving (celeris#885 item 53).
+// No cgo and no ip binary. If the dump cannot be read the table is made the old
+// way.
 func osIfaceAddrs() ([]ifaceAddr, error) {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
+	byIndex, ok := addrsByIndex()
 	var out []ifaceAddr
 	for _, ifc := range ifs {
 		if len(out) >= 512 {
@@ -139,25 +153,115 @@ func osIfaceAddrs() ([]ifaceAddr, error) {
 			Up:       ifc.Flags&net.FlagUp != 0,
 			Loopback: ifc.Flags&net.FlagLoopback != 0,
 		}
-		addrs, err := ifc.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, ad := range addrs {
-			var ip net.IP
-			switch v := ad.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
+		if ok {
+			a.Addrs = byIndex[ifc.Index]
+		} else {
+			addrs, err := ifc.Addrs()
+			if err != nil {
+				continue
 			}
-			if p, ok := netip.AddrFromSlice(ip); ok {
-				a.Addrs = append(a.Addrs, p.Unmap())
+			for _, ad := range addrs {
+				var ip net.IP
+				switch v := ad.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if p, ok := netip.AddrFromSlice(ip); ok {
+					a.Addrs = append(a.Addrs, p.Unmap())
+				}
 			}
 		}
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// addrsByIndex is the addresses of every interface of the host from one
+// RTM_GETADDR dump, by interface index, each in the order the kernel sent them
+// (the order (*net.Interface).Addrs gives). ok is false if the dump cannot be
+// read or parsed.
+func addrsByIndex() (m map[int][]netip.Addr, ok bool) {
+	// syscall.ParseNetlinkRouteAttr, which parseAddrRIB calls and net calls on
+	// the same bytes, slices past the message for a final attribute that is not
+	// padded to 4. A kernel dump always pads, but a table that is promised to fall
+	// back must not panic at Listen for one that does not (review of #1127).
+	defer func() {
+		if recover() != nil {
+			m, ok = nil, false
+		}
+	}()
+	rib, err := netlinkRIB(syscall.RTM_GETADDR, syscall.AF_UNSPEC)
+	if err != nil {
+		return nil, false
+	}
+	return parseAddrRIB(rib)
+}
+
+// parseAddrRIB maps the RTM_NEWADDR messages of a netlink dump to addresses by
+// interface index. It reads an address as net does (interface_linux.go,
+// newAddr): the IFA_LOCAL attribute where the message has one (a point-to-point
+// link, whose IFA_ADDRESS is the peer), else IFA_ADDRESS; IPv4 mapped IPv6
+// forms are unmapped like the table does. A dump that was interrupted by a change
+// of the addresses (NLM_F_DUMP_INTR) is read as it is, as net reads it: the table
+// is an annotation of the NIC report, and may then miss or repeat an address.
+func parseAddrRIB(rib []byte) (map[int][]netip.Addr, bool) {
+	msgs, err := syscall.ParseNetlinkMessage(rib)
+	if err != nil {
+		return nil, false
+	}
+	out := make(map[int][]netip.Addr)
+loop:
+	for i := range msgs {
+		m := &msgs[i]
+		switch m.Header.Type {
+		case syscall.NLMSG_DONE:
+			break loop
+		case syscall.RTM_NEWADDR:
+			// struct ifaddrmsg { u8 family, prefixlen, flags, scope; u32 index }.
+			if len(m.Data) < syscall.SizeofIfAddrmsg {
+				return nil, false
+			}
+			family := m.Data[0]
+			index := int(binary.NativeEndian.Uint32(m.Data[4:8]))
+			attrs, err := syscall.ParseNetlinkRouteAttr(m)
+			if err != nil {
+				return nil, false
+			}
+			var addr, local []byte
+			for _, at := range attrs {
+				switch at.Attr.Type {
+				case syscall.IFA_ADDRESS:
+					if addr == nil {
+						addr = at.Value
+					}
+				case syscall.IFA_LOCAL:
+					if local == nil {
+						local = at.Value
+					}
+				}
+			}
+			raw := addr
+			if local != nil {
+				raw = local
+			}
+			want := 0
+			switch family {
+			case syscall.AF_INET:
+				want = 4
+			case syscall.AF_INET6:
+				want = 16
+			}
+			if want == 0 || len(raw) < want {
+				continue
+			}
+			if p, ok := netip.AddrFromSlice(raw[:want]); ok {
+				out[index] = append(out[index], p.Unmap())
+			}
+		}
+	}
+	return out, true
 }
 
 // satAdd is a+b, held at the largest uint64.

@@ -1861,10 +1861,12 @@ jobs:
       # name (its allow-list) and this step runs them with memlock raised and
       # CELERIS_REQUIRE_IOURING_WORKERS=1, which turns the skip into a failure.
       # The pause/resume pair of the `unit` job (one funded worker there) runs
-      # here with the two it asks for, and so does celeris#886's resume test
+      # here with the two it asks for, and so do celeris#886's resume test
       # (TestResumeAcceptReachesAWorkerThatCannotPark886: at 8 MiB it has one
       # worker and cannot tell a resume that signals every worker from one that
-      # signals the first). Exactly seven top-level PASS lines and no SKIP line: a rename or a
+      # signals the first) and its pause test
+      # (TestBeginPauseAcceptReachesAnIdleWorker886, the same for the pause).
+      # Exactly eight top-level PASS lines and no SKIP line: a rename or a
       # quarantine selects nothing silently, and a skip is not coverage.
       - name: celeris#895/#896 multi-worker listener tests (memlock raised, skipping forbidden)
         if: ${{ !cancelled() }}
@@ -1875,7 +1877,7 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895|TestPort0ResumeKeepsThePort895|TestPort0PausedPortCannotBeTaken895|TestResumeAcceptReachesAWorkerThatCannotPark886'
+          names='TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895|TestPort0ResumeKeepsThePort895|TestPort0PausedPortCannotBeTaken895|TestResumeAcceptReachesAWorkerThatCannotPark886|TestBeginPauseAcceptReachesAnIdleWorker886'
           go test -race -count=1 -timeout=600s -v -run "^(${names})\$" \
             ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring895.log
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))

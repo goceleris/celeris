@@ -74,6 +74,22 @@ func (w *Worker) finishH1Upgrade(cs *connState, fd int, link bool) bool {
 // internal/engine/epoll's endH1Verdict does the same: one lock spanning the
 // flush and OnError. The lock is released before the close, which takes it
 // again.
+//
+// One difference: OnError is called only inside the `if mu != nil` below, so
+// for a conn that has a detachMu; epoll calls it whenever one is registered.
+// A sync conn with a callback and no detachMu therefore loses it here and gets
+// it there (celeris#886 item 9). The recv path (handleRecv) and the transplant
+// replay (endCarriedReplay) both end here, so on this engine the rule is the
+// same for both. A sync conn holds a callback without a detachMu when a handler
+// registers one (Context.SetWSErrorHandler) and does not Detach, and when a
+// Detach faulted and was rolled back (the rollback leaves the callback). The
+// middleware callbacks (websocket, sse) are registered just before the Detach,
+// so they are in that state only after a faulted Detach, and then only end
+// their own reader or stream, which has not started. Pinned here by
+// TestIouringRecvPathOnErrorSyncNoDetachMuIsDropped886 and
+// TestIouringAdoptCarriedOnErrorSyncNoDetachMuIsDropped886, and on epoll's side
+// by TestEpollRecvPathOnErrorSync908 and TestEpollAdoptCarriedOnErrorSync908.
+// Which rule is right is an open decision.
 func (w *Worker) endH1Verdict(cs *connState, fd int, err error) {
 	if mu := cs.detachMu; mu != nil {
 		mu.Lock()
