@@ -210,45 +210,25 @@ func abortBlocked791() []string {
 }
 
 func runAbort791(t *testing.T, mode string) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
 	var hits, detaches atomic.Int64
 	logs := &abortLog791{}
-	e, err := New(resource.Config{
-		Addr:          addr,
-		Protocol:      engine.HTTP1,
-		Resources:     resource.Resources{Workers: 2},
-		AsyncHandlers: true,
-		Logger:        slog.New(logs),
-	}, abortHandler791{mode: mode, hits: &hits, detaches: &detaches})
-	if err != nil {
-		skipOrFail656(t, "iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("pick port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		return New(resource.Config{
+			Addr:          addr,
+			Protocol:      engine.HTTP1,
+			Resources:     resource.Resources{Workers: 2},
+			AsyncHandlers: true,
+			Logger:        slog.New(logs),
+		}, abortHandler791{mode: mode, hits: &hits, detaches: &detaches})
+	})
+	addr := e.Addr().String()
 	t.Cleanup(cancel)
-	for deadline := time.Now().Add(8 * time.Second); ; {
-		if c, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond); derr == nil {
-			_ = c.Close()
-			if e.NumWorkers() > 0 {
-				break
-			}
-		}
-		select {
-		case err := <-done:
-			skipOrFail656(t, "iouring engine failed to start: %v", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("engine did not start listening within 8s")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 	workers := e.NumWorkers()
 
 	// Before the fault: a witness and a boom conn on every worker, each
