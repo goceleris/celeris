@@ -217,7 +217,6 @@ func TestHijackedDescriptorIsNotReadAfterHandoff936(t *testing.T) {
 			}
 			asyncAnswered := make(chan struct{}) // closed once the client has the /async response
 			done := make(chan outcome936, 1)
-			var fired atomic.Bool
 			hook := func(fd int, cs *connState) {
 				n := handoffs.Add(1)
 				if tc.promote && n == 1 {
@@ -228,7 +227,7 @@ func TestHijackedDescriptorIsNotReadAfterHandoff936(t *testing.T) {
 					case <-time.After(5 * time.Second):
 					}
 				}
-				if n != want || !fired.CompareAndSwap(false, true) {
+				if n != want { // the count is the one-shot: n == want holds for one call
 					return
 				}
 				o := outcome936{fd: fd, ask: -1, peer: -1, worker: -1}

@@ -409,13 +409,22 @@ func TestRetiredStreamsGoToThePoolAtClose951(t *testing.T) {
 // handlers retiring streams that hold buffered bytes, the loop draining, and
 // OutboundPending and StreamCount polling, then Close. It must finish.
 //
+// What it catches and what it does not: a self-deadlock anywhere in those paths
+// and a real inversion, a stream's lock taken before the manager's while
+// OutboundPending is polled (handOffBuffered does the first part of that for
+// the streams that stay in the map). It does NOT catch an inversion inside
+// retire: the streams retire sees here were taken out of the map by resetStream
+// first, so OutboundPending cannot meet them, and Close runs after the pollers
+// have stopped, so it does not overlap them either.
+//
 // Two things keep a loaded machine from failing it with no deadlock in sight
 // (celeris#1104): the two pollers yield after each pass, and "finish" is judged
 // by progress, not by a total time. The pollers used to spin on the manager's
 // lock with no yield, which starved the 8 workers on two CPUs: 10 to 25 s under
 // -race, and more than the fixed 60 s the test allowed with six CPU hogs beside
-// it (6 of 6 runs). They still take the locks all the time, which is what the
-// test is for. A deadlock is no stream finishing for stallLimit.
+// it (6 of 6 runs). They still take the locks all the time. A deadlock is no
+// stream finishing for stallLimit; a livelock that is merely very slow is not
+// flagged by that, and the go test timeout is its backstop.
 func TestRetireDrainCloseDoNotDeadlock951(t *testing.T) {
 	const stallLimit = 30 * time.Second
 	var handled atomic.Int64 // streams whose handler has run to its end
