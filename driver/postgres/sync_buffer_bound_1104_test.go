@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -40,6 +41,59 @@ func TestAppendBufferedStopsAtTheCap1104(t *testing.T) {
 	}
 	if got, max := len(r.rows), maxDirectResultBytes/(1<<10); got > max {
 		t.Errorf("%d rows buffered, want at most %d (the cap)", got, max)
+	}
+}
+
+// TestBufferedRowsLiveHeapIsTheData1104: the rows of a buffered reply hold about
+// the data, not several generations of it. The slab and the row fields grew by
+// copy, and the row views already handed out kept every earlier array alive:
+// with 1.25x growth, 5 times the data (celeris#1104).
+func TestBufferedRowsLiveHeapIsTheData1104(t *testing.T) {
+	live := func() uint64 {
+		runtime.GC()
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+	const rows, size = 400_000, 64 // 25.6 MB of payload
+	row := [][]byte{make([]byte, size)}
+	before := live()
+	r := &pgRequest{}
+	r.syncMode.Store(true)
+	for range rows {
+		r.OnRow(row)
+	}
+	after := live()
+	runtime.KeepAlive(r)
+	data := uint64(rows * size)
+	// The data, 24 bytes of field view and 24 of row view per row: 112 bytes a
+	// row, 1.75 times the payload; allow 2.5.
+	if grown := after - before; grown > data*5/2 {
+		t.Errorf("%d rows of %d bytes (%d MB of data) hold %.1f MB of live heap, want under 2.5 times the data", rows, size, data>>20, float64(grown)/(1<<20))
+	}
+}
+
+// TestAppendBufferedKeepsReplyOrderAfterTheCap1104: a row that does not fit fails
+// the request, and a smaller row after it that would fit is not buffered either:
+// the result would have a hole where the big one was.
+func TestAppendBufferedKeepsReplyOrderAfterTheCap1104(t *testing.T) {
+	r := &pgRequest{}
+	r.syncMode.Store(true)
+	for range maxDirectResultBytes/(1<<10) - 1 {
+		r.OnRow([][]byte{make([]byte, 1<<10)})
+	}
+	if r.err != nil {
+		t.Fatalf("err = %v before the cap", r.err)
+	}
+	r.OnRow([][]byte{make([]byte, 2<<10)}) // does not fit
+	if !errors.Is(r.err, ErrResultTooBig) {
+		t.Fatalf("err = %v, want ErrResultTooBig", r.err)
+	}
+	before := len(r.rows)
+	r.OnRow([][]byte{make([]byte, 512)}) // would fit
+	if len(r.rows) != before {
+		t.Errorf("a row that fits after the failed one was buffered (%d rows, was %d)", len(r.rows), before)
 	}
 }
 
