@@ -222,7 +222,9 @@ func (l *Loop) reclaimTransplant(fd int, carry engine.Carryover, bucket *atomic.
 	if now == 0 {
 		now = time.Now().UnixNano()
 	}
-	l.attachAdoptedFD(ctx, fd, carry, now)
+	// The carried bytes were read by this loop, and counted as the recv that
+	// read them, before the hand-off (celeris#886 item 25).
+	l.attachFD(ctx, fd, carry, now, true)
 }
 
 // flushedAtBoundary reports whether cs is at a clean HTTP/1 request boundary with
