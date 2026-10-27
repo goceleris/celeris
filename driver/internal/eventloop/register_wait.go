@@ -70,12 +70,21 @@ func IsNumberBusy(err error) bool {
 // registering it, changes which descriptor the driver owns and needs its own
 // review.
 func RegisterConnWait(ctx context.Context, loop engine.WorkerLoop, fd int, onRecv func([]byte), onClose func(error)) error {
+	return registerConnWait(ctx, loop, fd, onRecv, onClose, registerFirstPause)
+}
+
+// registerFirstPause is the first pause of RegisterConnWait; it doubles up to 5 ms.
+const registerFirstPause = 100 * time.Microsecond
+
+// registerConnWait is RegisterConnWait with the first pause given, so a test can
+// make the pause's timer ready as soon as the wait starts.
+func registerConnWait(ctx context.Context, loop engine.WorkerLoop, fd int, onRecv func([]byte), onClose func(error), firstPause time.Duration) error {
 	err := loop.RegisterConn(fd, onRecv, onClose)
 	if !IsNumberBusy(err) {
 		return err
 	}
 	deadline := time.Now().Add(registerWaitBudget)
-	pause := 100 * time.Microsecond
+	pause := firstPause
 	for {
 		t := time.NewTimer(pause)
 		select {

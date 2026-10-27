@@ -98,3 +98,31 @@ func TestRegisterConnWaitIsBoundedWithoutACtxDeadline887(t *testing.T) {
 	}
 	t.Logf("gave up after %v and %d calls", took, l.calls)
 }
+
+// A ctx that is done before the wait stops it after the first refusal: no second
+// RegisterConn call, which would register the fd for a caller that gave up.
+// The wait's pause ends in a select on ctx.Done() and the pause's timer, and when
+// the goroutine is not run for the pause (100 us) both are ready and Go picks at
+// random: TestRegisterConnWait887/ctx_done_returns_the_refusal failed with
+// "RegisterConn calls = 2, want 1" on a loaded CI runner (macOS portable
+// fallback, celeris#1104). A first pause of 0 has the timer ready by the time
+// the select runs, which is that interleaving without waiting for the scheduler.
+func TestRegisterConnWaitCancelledCtxMakesNoSecondCall887(t *testing.T) {
+	const waits = 2000
+	extra := 0
+	for range waits {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		l := &scriptedLoop{errs: []error{errBusy}}
+		err := registerConnWait(ctx, l, 3, nil, nil, 0)
+		if !errors.Is(err, errBusy) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want the refusal wrapped with context.Canceled", err)
+		}
+		if l.calls != 1 {
+			extra++
+		}
+	}
+	if extra != 0 {
+		t.Errorf("a ctx done before the wait was followed by a second RegisterConn call in %d of %d waits", extra, waits)
+	}
+}
