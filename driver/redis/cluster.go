@@ -239,19 +239,26 @@ func (c *ClusterClient) getOrCreateNodeAs(addr string, isPrimary bool) (*cluster
 	if err != nil {
 		return nil, err
 	}
-	n = &clusterNode{addr: addr, client: client, primary: isPrimary}
+	return c.installNode(&clusterNode{addr: addr, client: client, primary: isPrimary})
+}
+
+// installNode stores a node a redirect just dialled and returns the node to
+// use. If the address was stored meanwhile it returns that one, and if Close ran
+// while the node dialled (closeNodes left c.nodes nil, and a write into it is a
+// panic) it returns ErrClosed; in both cases n's client is closed.
+func (c *ClusterClient) installNode(n *clusterNode) (*clusterNode, error) {
 	c.mu.Lock()
-	if c.nodes == nil { // Close ran while this dialled (see applyTopology)
+	if c.nodes == nil {
 		c.mu.Unlock()
-		_ = client.Close()
+		_ = n.client.Close()
 		return nil, ErrClosed
 	}
-	if existing, ok := c.nodes[addr]; ok {
+	if existing, ok := c.nodes[n.addr]; ok {
 		c.mu.Unlock()
-		_ = client.Close()
+		_ = n.client.Close()
 		return existing, nil
 	}
-	c.nodes[addr] = n
+	c.nodes[n.addr] = n
 	c.mu.Unlock()
 	return n, nil
 }

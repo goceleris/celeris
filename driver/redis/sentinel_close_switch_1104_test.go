@@ -183,3 +183,37 @@ func TestSentinelSwitchMasterDoesNotDialAfterClose1104(t *testing.T) {
 		t.Errorf("handleSwitchMaster dialled the new master again after Close in %d of %d runs", extra, iters)
 	}
 }
+
+// A +switch-master that was already queued when Close ran: watchFailover's
+// select between the message and closeCh picks at random, so handleSwitchMaster
+// can run after Close, and it dialled the new master once before it looked at
+// anything. It must make no dial at all: no ROLE request, nothing installed. The
+// test calls it after Close, which is the state the lost pick leaves.
+func TestSentinelSwitchMasterAfterCloseMakesNoDial1104(t *testing.T) {
+	const iters = 50
+	dialled, installed := 0, 0
+	for range iters {
+		g := startGatedMaster1104(t, "master")
+		close(g.release) // a ROLE would be answered at once
+		master := startFakeMaster(t)
+		sent := startFakeSentinel(t, master.Addr())
+		sc, err := NewSentinelClient(SentinelConfig{MasterName: "mymaster", SentinelAddrs: []string{sent.Addr()}, DialTimeout: 2 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = sc.Close()
+		sc.handleSwitchMaster(switchPayload1104(g.Addr()))
+		// handleSwitchMaster dials synchronously, so a dial has reached ROLE by now.
+		if g.roles.Load() != 0 {
+			dialled++
+		}
+		sc.mu.RLock()
+		if sc.client != nil {
+			installed++
+		}
+		sc.mu.RUnlock()
+	}
+	if dialled != 0 || installed != 0 {
+		t.Errorf("handleSwitchMaster on a closed SentinelClient: dialled the new master in %d of %d runs, installed a client in %d", dialled, iters, installed)
+	}
+}
