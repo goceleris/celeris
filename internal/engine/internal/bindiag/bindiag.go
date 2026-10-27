@@ -166,12 +166,13 @@ func SockaddrString(fd int, sa unix.Sockaddr) string {
 	return ""
 }
 
-// ZoneID is the scope id of an IPv6 zone as net.Listen reads it (net.zoneToInt):
-// the index of the interface of that name, else the zone as a number, else 0.
-// A zone that names nothing is therefore not an error here, as it is not for
-// std: the kernel refuses the bind of a link-local address with no scope, and a
-// global one does not look at it (celeris#885 item 54). One netlink dump, at
-// listen time.
+// ZoneID is the scope id of an IPv6 zone as net.Listen reads it (net's
+// ipv6ZoneCache.index, go1.27): the index of the interface of that name, else
+// the decimal digits the zone starts with (net's dtoi: "12abc" is 12, and a
+// number of 0xFFFFFF or more saturates at 0xFFFFFF), else 0. A zone that names
+// nothing is therefore not an error here, as it is not for std: the kernel
+// refuses the bind of a link-local address with no scope, and a global one does
+// not look at it (celeris#885 item 54). One netlink dump, at listen time.
 func ZoneID(zone string) uint32 {
 	if zone == "" {
 		return 0
@@ -179,9 +180,12 @@ func ZoneID(zone string) uint32 {
 	if ifi, err := net.InterfaceByName(zone); err == nil {
 		return uint32(ifi.Index)
 	}
-	n, err := strconv.ParseUint(zone, 10, 32)
-	if err != nil {
-		return 0
+	n := 0
+	for i := 0; i < len(zone) && '0' <= zone[i] && zone[i] <= '9'; i++ {
+		n = n*10 + int(zone[i]-'0')
+		if n >= 0xFFFFFF {
+			return 0xFFFFFF
+		}
 	}
 	return uint32(n)
 }

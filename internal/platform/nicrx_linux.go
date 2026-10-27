@@ -182,7 +182,16 @@ func osIfaceAddrs() ([]ifaceAddr, error) {
 // RTM_GETADDR dump, by interface index, each in the order the kernel sent them
 // (the order (*net.Interface).Addrs gives). ok is false if the dump cannot be
 // read or parsed.
-func addrsByIndex() (map[int][]netip.Addr, bool) {
+func addrsByIndex() (m map[int][]netip.Addr, ok bool) {
+	// syscall.ParseNetlinkRouteAttr, which parseAddrRIB calls and net calls on
+	// the same bytes, slices past the message for a final attribute that is not
+	// padded to 4. A kernel dump always pads, but a table that is promised to fall
+	// back must not panic at Listen for one that does not (review of #1127).
+	defer func() {
+		if recover() != nil {
+			m, ok = nil, false
+		}
+	}()
 	rib, err := netlinkRIB(syscall.RTM_GETADDR, syscall.AF_UNSPEC)
 	if err != nil {
 		return nil, false
@@ -194,7 +203,9 @@ func addrsByIndex() (map[int][]netip.Addr, bool) {
 // interface index. It reads an address as net does (interface_linux.go,
 // newAddr): the IFA_LOCAL attribute where the message has one (a point-to-point
 // link, whose IFA_ADDRESS is the peer), else IFA_ADDRESS; IPv4 mapped IPv6
-// forms are unmapped like the table does.
+// forms are unmapped like the table does. A dump that was interrupted by a change
+// of the addresses (NLM_F_DUMP_INTR) is read as it is, as net reads it: the table
+// is an annotation of the NIC report, and may then miss or repeat an address.
 func parseAddrRIB(rib []byte) (map[int][]netip.Addr, bool) {
 	msgs, err := syscall.ParseNetlinkMessage(rib)
 	if err != nil {

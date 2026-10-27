@@ -426,6 +426,10 @@ func TestBackloggedPeerIsClosed(t *testing.T) {
 				// ms after the kernel send queue had plateaued): once it has fired
 				// the engine closes the connection when what is staged has gone out,
 				// whatever the client does next, so the client may start reading.
+				// The hook is keyed on the exact peer address string (the client's
+				// LocalAddr): if the server ever formats the peer differently (a
+				// v4-mapped peer on a dual-stack listener), this wait times out
+				// after 10 s and fails loudly; it cannot pass falsely.
 				// std has no cap to refuse at: its handler blocks on the socket.
 				waitServerReadAll761(t, raw, addr)
 				if e.eng != celeris.Std {
