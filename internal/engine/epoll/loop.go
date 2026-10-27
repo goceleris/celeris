@@ -4754,12 +4754,85 @@ func (l *Loop) checkTimeouts() {
 			}
 		}
 		elapsed := time.Duration(now - last)
-		if l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout {
-			l.closeConn(fd)
-		} else if l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout {
+		if l.timeoutsDue(elapsed) {
+			// An HTTP/2 conn whose open streams all have a whole request is
+			// not idle and is not waiting for a request: the answer is the
+			// server's to give (celeris#889). Looked at only here, once a
+			// timeout is due: a conn within its timeouts pays nothing for it,
+			// and one that is exempt pays this look on every sweep (its clock,
+			// the last read, does not move while it is exempt).
+			owes, ok := h2ServerOwes(cs)
+			if !ok {
+				continue
+			}
+			if owes {
+				cs.noteH2Owed(now)
+				continue
+			}
+			// No stream is owed now, but one was at an earlier sweep: the idle
+			// period starts where the stream was last seen, not at the
+			// client's last frame, which is as old as the stream (net/http
+			// starts its idle timer when the last stream closes).
+			if at := cs.h2OwedAt(); at != 0 && !l.timeoutsDue(time.Duration(now-at)) {
+				continue
+			}
 			l.closeConn(fd)
 		}
 	}
+}
+
+// timeoutsDue reports whether a conn that has had no frame from its client for
+// elapsed is past IdleTimeout or ReadTimeout.
+func (l *Loop) timeoutsDue(elapsed time.Duration) bool {
+	return (l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout) ||
+		(l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout)
+}
+
+// h2ServerOwes is checkTimeouts' look at whether a conn due for ReadTimeout or
+// IdleTimeout is an HTTP/2 conn that has a stream open and whose open streams
+// all have a whole request (H2State.ServerOwes), whose clock, the last read,
+// says nothing about a stream the server is answering: an SSE stream whose
+// client sends no frame is the case (celeris#889). A client that owes the server
+// the rest of its request is the silence ReadTimeout is for, so its conn is not
+// exempt.
+// ok=false means nothing was read and the sweep leaves the conn for the next
+// one.
+//
+// cs.h2State is written off the loop thread by the dispatch goroutine's
+// switchToH2Local (the h1-to-h2c upgrade of an async conn), under detachMu, so
+// it is read under that lock, taken with TryLock as snapshotH1Deadlines has it
+// (the goroutine holds it across a handler, and a blocking Lock would park the
+// loop, celeris#669). A conn with no detachMu never has its h2State written
+// but by the loop thread. When the lock is held: if the goroutine has switched
+// the conn to HTTP/2 (h2Switched, read under asyncInMu, which orders the
+// h2State write before it) the pointer is read without the lock; a handler
+// running on an HTTP/1 conn is answered as snapshotH1Deadlines answers it
+// (dispatchBusy: the timeouts apply to a conn whose handler overruns them,
+// celeris#669), any other holder (one guarded write) by skipping the sweep.
+func h2ServerOwes(cs *connState) (open, ok bool) {
+	mu := cs.detachMu
+	if mu == nil {
+		h2 := cs.h2State
+		return h2 != nil && h2.ServerOwes(), true
+	}
+	if !mu.TryLock() {
+		// The flag and the busy test are read in one asyncInMu section: read in
+		// two, a goroutine that switched the conn between them would be
+		// answered as a busy HTTP/1 handler (closed if a timeout is due).
+		cs.asyncInMu.Lock()
+		switched := cs.h2Switched
+		busy := cs.asyncCond.L != nil && dispatchBusyLocked(cs, nil)
+		cs.asyncInMu.Unlock()
+		if switched {
+			h2 := cs.h2State
+			return h2 != nil && h2.ServerOwes(), true
+		}
+		return false, busy
+	}
+	h2 := cs.h2State
+	open = h2 != nil && h2.ServerOwes()
+	mu.Unlock()
+	return open, true
 }
 
 // detachedStalled is checkTimeouts' look at a truly-detached conn (WS/SSE)
