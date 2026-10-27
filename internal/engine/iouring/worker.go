@@ -7209,6 +7209,15 @@ func (w *Worker) flushSend(cs *connState) bool {
 		return false
 	}
 
+	// The conn goes from idle to having output: the write clock starts here.
+	// lastActivity is the last read or completed send, and the sweep measures
+	// WriteTimeout for a conn with a send in flight from it, so for a stream
+	// that was quiet for longer than WriteTimeout the whole gap counted, and a
+	// sweep that found the next chunk's SEND in flight closed the conn with it
+	// (celeris#889). A store of the clock the iteration already read: the
+	// recv, the wake of a handler goroutine's write, or the sweep refreshed
+	// cachedNow before this ran.
+	cs.lastActivity = w.cachedNow
 	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
 
 	sqe := w.ring.GetSQE()
