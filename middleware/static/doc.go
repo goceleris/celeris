@@ -27,10 +27,18 @@
 // or answered with a 304, for a request with an Accept-Encoding header names
 // Vary: Accept-Encoding, whether or not the file has a variant. A request for
 // a directory is answered with its index file, and with the index file's own
-// variant. With Root, a conditional request is answered 304 only after the
-// containment check that [celeris.Context.FileFromDir] applies to a file it
-// sends (symlinks resolved) has passed for its path, and that check runs for
-// every conditional request, whether or not its validator matches.
+// variant. With Root, a conditional request is answered 304 only after a
+// containment check, the one [celeris.Context.FileFromDir] applies to a file it
+// sends (symlinks resolved), has passed for its path, and that check runs for
+// every conditional request, whether or not its validator matches. The two
+// checks agree for a Root that names a directory. A Root of ".", "./" or "/"
+// is not served from: a request for anything below it is passed to the next
+// handler (the guard against ".." compares the path with the root and a
+// separator, which no path below these roots starts with). For "." and "./"
+// the request for the root directory itself, answered by its index file, gets
+// a 400 from FileFromDir, which requires the "./" prefix a Root of "." lacks,
+// and a 304 when a validator matches; the file is inside the root either way.
+// Name the directory.
 //
 // With compress in front of an [Config].FS, the strong tag of a file that compress
 // encodes is made weak on the 200 (W/"hash"), and static marks the response so
