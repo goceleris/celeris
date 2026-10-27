@@ -38,10 +38,10 @@ type SentinelConfig struct {
 }
 
 // sentinelDownGrace is how long watchFailover lets the PubSub of the sentinel
-// it follows stay down (conn lost and not re-established, or re-established
-// and lost again before it was stable) before it gives that sentinel up and
-// lets subscribeLoop connect to the next address of SentinelAddrs
-// (celeris#887 item 29).
+// it follows stay down (see PubSub.downFor) before it gives that sentinel up
+// and lets subscribeLoop connect to the next address of SentinelAddrs
+// (celeris#887 item 29). A sentinel that restarts within it keeps the
+// subscription.
 var sentinelDownGrace = 5 * time.Second
 
 // SentinelClient is a Redis client managed by Redis Sentinel. It discovers the
@@ -57,6 +57,10 @@ type SentinelClient struct {
 
 	closeCh chan struct{}
 	closed  atomic.Bool
+
+	// downGrace is sentinelDownGrace as of construction; zero (a client built
+	// without NewSentinelClient) means the default.
+	downGrace time.Duration
 }
 
 type sentinelConn struct {
@@ -80,8 +84,9 @@ func NewSentinelClient(cfg SentinelConfig) (*SentinelClient, error) {
 		cfg.DialTimeout = defaultDialTimeout
 	}
 	s := &SentinelClient{
-		cfg:     cfg,
-		closeCh: make(chan struct{}),
+		cfg:       cfg,
+		closeCh:   make(chan struct{}),
+		downGrace: sentinelDownGrace,
 	}
 	masterAddr, err := s.discoverMaster()
 	if err != nil {
@@ -242,11 +247,16 @@ func (s *SentinelClient) dialMaster(addr string) (*Client, error) {
 func (s *SentinelClient) subscribeLoop() {
 	bo := async.NewBackoff(100*time.Millisecond, 10*time.Second)
 	attempt := 0
+	// start is the index of the SentinelAddrs entry connectSentinel tries
+	// first: 0, and after a sentinel was given up the one after it, so that a
+	// sentinel that accepts and hangs up does not take the subscription back
+	// from the next address for ever (celeris#887 item 29).
+	start := 0
 	for {
 		if s.closed.Load() {
 			return
 		}
-		sc, err := s.connectSentinel()
+		sc, err := s.connectSentinelFrom(start)
 		if err != nil {
 			delay := bo.Next(attempt)
 			attempt++
@@ -271,20 +281,45 @@ func (s *SentinelClient) subscribeLoop() {
 		// reconnect iteration).
 		s.sentinelMu.Lock()
 		for _, old := range s.sentinelConns {
+			// The PubSub first: its conn is checked out of the client's pool,
+			// so closing the client does not stop its reconnect loop.
+			if old != nil && old.subPS != nil {
+				_ = old.subPS.Close()
+			}
 			if old != nil && old.client != nil {
 				_ = old.client.Close()
 			}
 		}
 		s.sentinelConns = append(s.sentinelConns[:0], sc)
 		s.sentinelMu.Unlock()
-		s.watchFailover(sc)
+		if s.watchFailover(sc) {
+			start = s.sentinelIndex(sc.addr) + 1
+		}
 	}
+}
+
+// sentinelIndex is the index of addr in SentinelAddrs, or -1.
+func (s *SentinelClient) sentinelIndex(addr string) int {
+	for i, a := range s.cfg.SentinelAddrs {
+		if a == addr {
+			return i
+		}
+	}
+	return -1
 }
 
 // connectSentinel connects to the first responsive sentinel and subscribes to
 // the +switch-master channel.
 func (s *SentinelClient) connectSentinel() (*sentinelConn, error) {
-	for _, addr := range s.cfg.SentinelAddrs {
+	return s.connectSentinelFrom(0)
+}
+
+// connectSentinelFrom is connectSentinel trying the addresses of
+// SentinelAddrs in order from index start, wrapping around once.
+func (s *SentinelClient) connectSentinelFrom(start int) (*sentinelConn, error) {
+	n := len(s.cfg.SentinelAddrs)
+	for k := 0; k < n; k++ {
+		addr := s.cfg.SentinelAddrs[((start+k)%n+n)%n]
 		var opts []Option
 		opts = append(opts, WithDialTimeout(s.cfg.DialTimeout))
 		if s.cfg.SentinelPassword != "" {
@@ -324,22 +359,42 @@ func (s *SentinelClient) connectSentinel() (*sentinelConn, error) {
 	return nil, errors.New("no responsive sentinel")
 }
 
-// watchFailover reads +switch-master messages and triggers a master swap.
-func (s *SentinelClient) watchFailover(sc *sentinelConn) {
+// watchFailover reads +switch-master messages and triggers a master swap. It
+// returns true when it gave the sentinel up: the sentinel's PubSub reconnects
+// to the same address for ever, so a sentinel that went away would otherwise
+// keep the subscription and the failovers of the other sentinels would never
+// be heard. The sentinel is given up once its PubSub has been without a
+// reliable conn for sentinelDownGrace (PubSub.downFor: gone, or accepting and
+// hanging up again and again); the PubSub and the client are closed, and
+// subscribeLoop moves on to the next address of SentinelAddrs. It returns
+// false when the SentinelClient is closed.
+func (s *SentinelClient) watchFailover(sc *sentinelConn) (gaveUp bool) {
 	ch := sc.subPS.Channel()
+	grace := s.downGrace
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	tick := time.NewTicker(max(grace/4, 5*time.Millisecond))
+	defer tick.Stop()
 	for {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				return
+				return !s.closed.Load()
 			}
 			if msg == nil {
 				continue
 			}
 			// +switch-master payload: "mymaster old-ip old-port new-ip new-port"
 			s.handleSwitchMaster(msg.Payload)
+		case <-tick.C:
+			if sc.subPS.downFor() >= grace {
+				_ = sc.subPS.Close()
+				_ = sc.client.Close()
+				return true
+			}
 		case <-s.closeCh:
-			return
+			return false
 		}
 	}
 }

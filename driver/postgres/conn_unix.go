@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 	"github.com/goceleris/celeris/internal/engine"
 )
@@ -116,7 +117,7 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 	c.onCloseFn = c.onClose
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
+	if err := eventloop.RegisterConnWait(ctx, loop, fd, c.onRecvFn, c.onCloseFn); err != nil {
 		// Close via file.Close() to disarm the *os.File finalizer. A stray
 		// syscall.Close(fd) here would leave the finalizer armed; when GC
 		// later fires it would close the same fd a SECOND time, possibly

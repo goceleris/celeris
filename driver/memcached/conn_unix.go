@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/engine"
 )
 
@@ -90,7 +91,7 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 	c.pollIsDoneFn = c.pollIsDone
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
+	if err := eventloop.RegisterConnWait(ctx, loop, fd, c.onRecvFn, c.onCloseFn); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
