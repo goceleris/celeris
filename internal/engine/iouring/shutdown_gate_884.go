@@ -56,6 +56,13 @@ const gateClosesPerPass = 64
 // called only when refuseRecv is set and the conn is HTTP/1 or undecided, and
 // it marks the conn close-after when it says yes. Worker thread.
 func (w *Worker) gateReadsOn(cs *connState) bool {
+	if cs.gateRead {
+		// The gate's first pass found the bytes of a request in the kernel's
+		// receive queue (holdUnreadAtGate): they reached it before the gate,
+		// and are read and answered whatever the conn looks like (the conn is
+		// marked close-after by the pass, or by initProtocol).
+		return true
+	}
 	if !cs.detected {
 		// The bytes of a protocol decision begun. Nothing yet (no earlier
 		// bytes): a request that begins after the gate.
@@ -127,11 +134,20 @@ func dispatchHasWork(cs *connState) bool {
 // out, or whose lock is busy, is met again by the next pass. closeConn removes
 // a conn from liveConns by swapping it with the last entry, so the walk goes
 // from the top down, as checkTimeouts does. The pass runs at the top of the loop
-// pass, before the pass reaps new completions: a request whose recv CQE was
-// posted after the last reap meets a conn that looks idle and is closed with
-// that request unread, the race std's own idle close has (microseconds wide;
-// not measured). Worker thread.
+// pass, before the pass reaps new completions, so a request that reached the
+// kernel since the last enter meets a conn that looks idle. The first pass asks
+// the kernel's receive queue for the conns it can (holdUnreadAtGate,
+// celeris#1104): where a ring's completions are task work (COOP_TASKRUN,
+// DEFER_TASKRUN) such a request waits in the socket's queue, not yet as a CQE,
+// and the conn is held and answered instead of closed. What is left: a
+// fixed-file conn cannot be asked, and on a ring whose recv completions are
+// posted without the worker's enter (SQPOLL) the bytes can already be a CQE
+// that the pass has not reaped (a request the gate then drops, not a reset);
+// the race std's own idle close has, between the question and close(2), stays.
+// Worker thread.
 func (w *Worker) closeIdleH1() {
+	first := !w.gateSwept
+	w.gateSwept = true
 	closed := 0
 	for i := len(w.liveConns) - 1; i >= 0; i-- {
 		fd := w.liveConns[i]
@@ -143,6 +159,14 @@ func (w *Worker) closeIdleH1() {
 			continue
 		}
 		if !w.gateCloseable(cs) {
+			continue
+		}
+		// The first pass asks the kernel's receive queue (celeris#1104): bytes
+		// there reached the kernel before the gate, and are a request in
+		// progress, read on and answered instead of the conn being closed. Ahead
+		// of the cap and the send-side tests, so that a conn those leave for the
+		// next pass is not met unasked.
+		if first && w.holdUnreadAtGate(cs) {
 			continue
 		}
 		// Past the cap the conn was still looked at, so it is marked close-after
@@ -169,6 +193,34 @@ func (w *Worker) closeIdleH1() {
 		w.closeConn(fd)
 		closed++
 	}
+}
+
+// holdUnreadAtGate reports whether cs, which gateCloseable has found idle,
+// holds the bytes of a request in the kernel's receive queue, and if so marks
+// it to be read on (cs.gateRead, gateReadsOn): the recv that is armed on it
+// delivers them, as a CQE the next reap takes, and the request is answered with
+// Connection: close. On a ring whose completions are task work (COOP_TASKRUN,
+// DEFER_TASKRUN) a request that reaches a socket between two of the worker's
+// enters waits there, in the socket's queue, until the next enter posts its
+// recv CQE: the pass, at the top of the iteration, is that window. An ended
+// detached stream is not asked (its bytes are the application's), and a
+// fixed-file conn cannot be (its slot is an index into the ring's file table,
+// not a descriptor: ownsDescriptorNumber): such a conn is judged by what the
+// worker holds for it alone. A failed ioctl is not an answer: the conn is left
+// to the next pass. Worker thread.
+func (w *Worker) holdUnreadAtGate(cs *connState) bool {
+	if cs.writeEnded.Load() || !ownsDescriptorNumber(cs) {
+		return false
+	}
+	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ)
+	if err != nil {
+		return true
+	}
+	if q == 0 {
+		return false
+	}
+	cs.gateRead = true
+	return true
 }
 
 // gateCloseable reports whether the gate may close cs: it is HTTP/1 (or not
