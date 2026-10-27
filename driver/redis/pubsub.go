@@ -10,6 +10,11 @@ import (
 	"github.com/goceleris/celeris/driver/internal/async"
 )
 
+// pubsubStableAfter is how long a re-established pub/sub conn must stay up
+// before the reconnect backoff starts over from its base delay (celeris#887
+// item 30). A conn that dies sooner is a failed attempt.
+var pubsubStableAfter = 5 * time.Second
+
 // Message is one pub/sub notification. Pattern is set only for PSUBSCRIBE
 // deliveries ("pmessage" push type). Shard is true for shard channel
 // deliveries ("smessage" push type, Redis 7+).
@@ -91,6 +96,20 @@ type PubSub struct {
 	// conn teardown.
 	reconnectingMu sync.Mutex
 	reconnecting   bool
+	// The outage state below is guarded by reconnectingMu (celeris#887 items
+	// 29 and 30). An outage starts at the first drop of a conn and ends when a
+	// replayed conn has stayed up for pubsubStableAfter. The backoff runs over
+	// the whole outage: a conn that dies soon after its replay is one more
+	// failed attempt, not a fresh start.
+	//
+	// downSince is the start of the current outage, zero when there is none.
+	// upSince is when the last replay succeeded. attempt is the backoff
+	// attempt the next reconnect loop of this outage starts at.
+	downSince time.Time
+	upSince   time.Time
+	attempt   int
+	// stableAfter is pubsubStableAfter as of the PubSub's creation.
+	stableAfter time.Duration
 
 	closeMsgOnce sync.Once
 
@@ -175,6 +194,9 @@ func (c *Client) newPubSub(ctx context.Context) (*PubSub, error) {
 		msgCh:     make(chan *Message, defaultPubSubChanBuf),
 		closeCh:   make(chan struct{}),
 		backoff:   async.NewBackoff(50*time.Millisecond, 5*time.Second),
+		// Read once: the goroutines of the PubSub never touch the package
+		// variable, which tests set.
+		stableAfter: pubsubStableAfter,
 	}
 	ps.bindConn(conn)
 	// The conn may have closed while the pool was handing it out, before the
@@ -456,8 +478,44 @@ func (ps *PubSub) onConnDrop(_ error) {
 		return
 	}
 	ps.reconnecting = true
+	if now := time.Now(); ps.downSince.IsZero() || (!ps.upSince.IsZero() && now.Sub(ps.upSince) >= ps.stableAfter) {
+		// A new outage: this is the first drop, or the conn that replaced the
+		// last one stayed up long enough to count as recovered.
+		ps.downSince = now
+		ps.attempt = 0
+		ps.backoff.Reset()
+	}
 	ps.reconnectingMu.Unlock()
 	go ps.reconnectLoop()
+}
+
+// downFor reports how long the PubSub has been without a conn it can rely on:
+// zero when there is none of that, as for a PubSub whose conn is up and has
+// been since its replay stayed up for pubsubStableAfter. During an outage it
+// is the time since the outage began while no conn is up or a replay is in
+// progress; once a conn is up again it is the time that outage lasted until
+// that conn came up, so a conn that keeps dying soon after its replay shows a
+// growing figure, and a blip that healed does not (celeris#887 item 29;
+// SentinelClient reads it to give up a sentinel that went away).
+func (ps *PubSub) downFor() time.Duration {
+	ps.mu.Lock()
+	cur := ps.conn
+	ps.mu.Unlock()
+	up := cur != nil && !cur.closed.Load()
+	now := time.Now()
+	ps.reconnectingMu.Lock()
+	defer ps.reconnectingMu.Unlock()
+	if ps.downSince.IsZero() {
+		return 0
+	}
+	if up && !ps.reconnecting && !ps.upSince.IsZero() {
+		if now.Sub(ps.upSince) >= ps.stableAfter {
+			ps.downSince = time.Time{} // recovered: the next drop starts a new outage
+			return 0
+		}
+		return ps.upSince.Sub(ps.downSince)
+	}
+	return now.Sub(ps.downSince)
 }
 
 // reconnectLoop re-dials the pubsub conn and replays subscriptions with
@@ -481,11 +539,19 @@ func (ps *PubSub) reconnectLoop() {
 			ps.onConnDrop(nil)
 		}
 	}()
-	for attempt := 0; ; attempt++ {
+	ps.reconnectingMu.Lock()
+	attempt := ps.attempt
+	ps.reconnectingMu.Unlock()
+	for ; ; attempt++ {
 		if ps.closed.Load() {
 			return
 		}
 		delay := ps.backoff.Next(attempt)
+		// The next loop of this outage (a conn that dies right after its
+		// replay starts one) continues from the next attempt.
+		ps.reconnectingMu.Lock()
+		ps.attempt = attempt + 1
+		ps.reconnectingMu.Unlock()
 		select {
 		case <-time.After(delay):
 		case <-ps.closeCh:
@@ -579,7 +645,12 @@ func (ps *PubSub) reconnectLoop() {
 			ps.client.pool.releasePubSub(failed)
 		}
 		if ok {
-			ps.backoff.Reset()
+			// No Reset: the backoff starts over when a drop finds this conn
+			// has stayed up for pubsubStableAfter (onConnDrop), not when the
+			// replay returns (celeris#887 item 30).
+			ps.reconnectingMu.Lock()
+			ps.upSince = time.Now()
+			ps.reconnectingMu.Unlock()
 			return
 		}
 	}
