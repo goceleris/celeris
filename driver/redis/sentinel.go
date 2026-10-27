@@ -483,10 +483,26 @@ func (s *SentinelClient) handleSwitchMaster(payload string) {
 			case <-s.closeCh:
 				return
 			}
+			// closeCh wins a tie with the timer: select picks at random when
+			// both are ready, and another dial would connect to the master
+			// after Close.
+			if s.closed.Load() {
+				return
+			}
 		}
 	}
 
 	s.mu.Lock()
+	// Close sets closed before it takes s.mu to clear s.client, and a dial
+	// runs under its own timeout, not closeCh, so a Close can land while
+	// dialMaster is in flight. Nothing closes a client installed after it.
+	if s.closed.Load() {
+		s.mu.Unlock()
+		if newClient != nil {
+			_ = newClient.Close()
+		}
+		return
+	}
 	old := s.client
 	if newClient != nil {
 		s.client = newClient
