@@ -36,8 +36,17 @@ func TestAppendBufferedStopsAtTheCap1104(t *testing.T) {
 	if !errors.Is(r.err, ErrResultTooBig) {
 		t.Fatalf("err = %v, want ErrResultTooBig", r.err)
 	}
-	if got := len(r.rowSlab); got > maxDirectResultBytes {
-		t.Errorf("the buffer holds %d bytes of rows, over the %d cap: the cap is checked after the append", got, maxDirectResultBytes)
+	if r.slabBytes > maxDirectResultBytes {
+		t.Errorf("the buffer holds %d bytes of rows, over the %d cap: the cap is checked after the append", r.slabBytes, maxDirectResultBytes)
+	}
+	sum := 0
+	for _, row := range r.rows {
+		for _, f := range row {
+			sum += len(f)
+		}
+	}
+	if sum > maxDirectResultBytes {
+		t.Errorf("the rows hold %d bytes of payload, over the %d cap", sum, maxDirectResultBytes)
 	}
 	if got, limit := len(r.rows), maxDirectResultBytes/(1<<10); got > limit {
 		t.Errorf("%d rows buffered, want at most %d (the cap)", got, limit)
