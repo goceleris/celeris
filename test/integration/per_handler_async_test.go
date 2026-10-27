@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -41,33 +42,44 @@ var mixedAsyncCases = []struct{ path, want string }{
 
 func startAsyncServer(t *testing.T, eng celeris.EngineType, async bool) (*celeris.Server, string, string) {
 	t.Helper()
-	srv := celeris.New(celeris.Config{
-		Addr:          "127.0.0.1:0",
-		Engine:        eng,
-		Protocol:      celeris.Auto, // Auto enables h2c upgrade in WithDefaults
-		AsyncHandlers: async,
-	})
-	registerMixedAsyncRoutes(srv)
+	var (
+		srv  *celeris.Server
+		done chan error
+	)
+	// An io_uring Start can fail with the ring-setup ENOMEM while earlier
+	// rings are still charged against RLIMIT_MEMLOCK: a fresh server and
+	// listener per try, retried for the window (celeris#1104).
+	startRetryingRingENOMEM(t, "server start", func() error {
+		srv = celeris.New(celeris.Config{
+			Addr:          "127.0.0.1:0",
+			Engine:        eng,
+			Protocol:      celeris.Auto, // Auto enables h2c upgrade in WithDefaults
+			AsyncHandlers: async,
+		})
+		registerMixedAsyncRoutes(srv)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- srv.StartWithListener(ln) }()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for srv.Addr() == nil && time.Now().Before(deadline) {
-		select {
-		case err := <-done:
-			t.Fatalf("server exited early: %v", err)
-		default:
-			time.Sleep(5 * time.Millisecond)
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
 		}
-	}
-	if srv.Addr() == nil {
-		t.Fatal("server never bound within deadline")
-	}
+		done = make(chan error, 1)
+		go func(s *celeris.Server, ln net.Listener, d chan error) { d <- s.StartWithListener(ln) }(srv, ln, done)
+
+		deadline := time.Now().Add(5 * time.Second)
+		for srv.Addr() == nil && time.Now().Before(deadline) {
+			select {
+			case err := <-done:
+				_ = ln.Close()
+				return fmt.Errorf("server exited early: %w", err)
+			default:
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		if srv.Addr() == nil {
+			t.Fatal("server never bound within deadline")
+		}
+		return nil
+	})
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
