@@ -225,13 +225,15 @@ func TestSSEStaysOpenPastServerTimeouts855(t *testing.T) {
 				case e.name == "std":
 					arms = []arm855{armRead855, armWrite855, armBoth855}
 				case h2c:
-					// The native engines cut an h2c stream at ReadTimeout (the
-					// sweep closes a conn that has read nothing for ReadTimeout,
-					// and an HTTP/2 conn is never detached): measured on epoll
-					// and Adaptive, a stream with ReadTimeout 1 s ends after
-					// 0.8 s with an unexpected EOF, with or without WriteTimeout
-					// (found by this cell while probing celeris#889 item 34). Only the
-					// WriteTimeout arm stays open, and is asserted.
+					// The native engines cut an h2c stream at ReadTimeout (and
+					// IdleTimeout) after the client's last frame: the sweep
+					// applies both to an HTTP/2 conn whatever streams it has
+					// open, and an HTTP/2 conn is never detached. Measured on
+					// epoll and Adaptive: with ReadTimeout 1 s the stream is
+					// closed 1.0 s after the request (unexpected EOF), with or
+					// without WriteTimeout. Found by this cell while probing
+					// celeris#889 item 34; an engine defect, not fixed here.
+					// Only the WriteTimeout arm stays open, and is asserted.
 					arms = []arm855{armWrite855}
 				}
 				for _, a := range arms {

@@ -74,12 +74,17 @@
 // async route does not need one: its headers and events are not waiting for a
 // flush.
 //
-// The native engines do not exempt an HTTP/2 stream from ReadTimeout, as they
-// do a detached HTTP/1.1 one: a connection that has read no frame from its
-// client for ReadTimeout (default 60 s) is closed, an SSE stream's with it.
-// Measured on epoll and Adaptive with ReadTimeout 1 s, an async-route stream
-// ended after 0.8 s (found while probing celeris#889 item 34; open). std
-// does not; io_uring is not measured.
+// The native engines do not exempt an HTTP/2 stream from ReadTimeout and
+// IdleTimeout, as they do a detached HTTP/1.1 one. Their sweep applies both to
+// an HTTP/2 connection whatever streams it has open (internal/engine/epoll
+// loop.go and the io_uring worker, measured from the last frame the client
+// sent), so a connection whose client sends no frame for the smaller of the
+// two (60 s and 10 min by default) is closed, an SSE stream's with it. Measured
+// on epoll and Adaptive with ReadTimeout 1 s and an async route, the stream was
+// closed 1.0 s after the request, which is after the client's last frame; the
+// IdleTimeout case is from the code and not measured, and io_uring is not
+// measured. std is not affected. This is a defect of the engines, found while
+// probing celeris#889 item 34 and tracked there; no release is promised for it.
 //
 // A client of an async-route stream that stays connected and reads nothing more
 // than the headers is disconnected as well. With the default flow-control
