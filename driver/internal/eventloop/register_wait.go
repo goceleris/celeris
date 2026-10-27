@@ -19,8 +19,7 @@ import (
 const registerWaitBudget = 2 * time.Second
 
 // errRegisterWaitBudget is wrapped into the error RegisterConnWait returns
-// when registerWaitBudget has passed (declared by the tests commit, used by the
-// next).
+// when registerWaitBudget has passed.
 var errRegisterWaitBudget = errors.New("celeris/eventloop: waited for the number to be finalized, budget used up")
 
 // IsNumberBusy reports whether err is the io_uring engine's refusal of a
@@ -49,12 +48,13 @@ func IsNumberBusy(err error) bool {
 // it retries with a growing pause until the number is free, ctx is done, or
 // registerWaitBudget has passed, and then returns the refusal wrapped together
 // with the reason it stopped (ctx.Err(), or errRegisterWaitBudget), so
-// errors.Is sees both. A ctx that is done is never followed by another
-// RegisterConn call, whatever the timing of the pause: only the first call is
-// made for a ctx that was done on entry. Every other error is returned at once, and a failed
-// call leaves fd with the caller, as RegisterConn does. The drivers' dials use
-// it: without it Pool.Acquire fails under connection churn on the io_uring
-// engine (celeris#887 item 28).
+// errors.Is sees both. A ctx that is done when a pause ends stops the wait
+// before the next RegisterConn call, whichever of the two ended the pause first;
+// a ctx that was already done on entry still gets the first call, as the wait
+// is only for a refusal of it. Every other error is returned at once, and a
+// failed call leaves fd with the caller, as RegisterConn does. The drivers'
+// dials use it: without it Pool.Acquire fails under connection churn on the
+// io_uring engine (celeris#887 item 28).
 //
 // It must not run on the worker goroutine of loop (a handler of the server
 // whose engine is that loop's, called inline): the number is finalized by that
@@ -75,11 +75,14 @@ func RegisterConnWait(ctx context.Context, loop engine.WorkerLoop, fd int, onRec
 	return registerConnWait(ctx, loop, fd, onRecv, onClose, registerFirstPause)
 }
 
-// registerFirstPause is the first pause of RegisterConnWait; it doubles up to 5 ms.
+// registerFirstPause is the first pause of RegisterConnWait. The pause doubles
+// after each refused retry while it is under 5 ms, so it reaches 6.4 ms.
 const registerFirstPause = 100 * time.Microsecond
 
 // registerConnWait is RegisterConnWait with the first pause given, so a test can
-// make the pause's timer ready as soon as the wait starts.
+// make the pause's timer ready as soon as the wait starts. A first pause of 0
+// never grows (it is doubled), so it is for a wait that ends at its first
+// pause, as the ones of the tests do.
 func registerConnWait(ctx context.Context, loop engine.WorkerLoop, fd int, onRecv func([]byte), onClose func(error), firstPause time.Duration) error {
 	err := loop.RegisterConn(fd, onRecv, onClose)
 	if !IsNumberBusy(err) {

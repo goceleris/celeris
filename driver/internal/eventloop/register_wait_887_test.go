@@ -126,3 +126,57 @@ func TestRegisterConnWaitCancelledCtxMakesNoSecondCall887(t *testing.T) {
 		t.Errorf("a ctx done before the wait was followed by a second RegisterConn call in %d of %d waits", extra, waits)
 	}
 }
+
+// cancelAfterFirst887 is a scripted loop whose first call cancels ctx, as a ctx
+// that ends while the wait is between the first refusal and its pause.
+type cancelAfterFirst887 struct {
+	scriptedLoop
+	cancel context.CancelFunc
+}
+
+func (l *cancelAfterFirst887) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) error {
+	err := l.scriptedLoop.RegisterConn(fd, onRecv, onClose)
+	l.cancel()
+	return err
+}
+
+// A ctx that is cancelled DURING the wait (by the first refusal, before the
+// pause) stops it with no further RegisterConn call, even when the pause's timer
+// is ready as well (a first pause of 0): the pause ends by whichever case the
+// select picks and the ctx is looked at after it.
+func TestRegisterConnWaitCancelledDuringTheWaitMakesNoFurtherCall887(t *testing.T) {
+	const waits = 2000
+	extra := 0
+	for range waits {
+		ctx, cancel := context.WithCancel(context.Background())
+		l := &cancelAfterFirst887{scriptedLoop: scriptedLoop{errs: []error{errBusy}}, cancel: cancel}
+		err := registerConnWait(ctx, l, 3, nil, nil, 0)
+		cancel()
+		if !errors.Is(err, errBusy) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want the refusal wrapped with context.Canceled", err)
+		}
+		if l.calls != 1 {
+			extra++
+		}
+	}
+	if extra != 0 {
+		t.Errorf("a ctx cancelled during the wait was followed by another RegisterConn call in %d of %d waits", extra, waits)
+	}
+}
+
+// A ctx whose deadline has passed is the same: the refusal is wrapped with
+// context.DeadlineExceeded and the first call is the only one.
+func TestRegisterConnWaitDeadlinePassedMakesNoFurtherCall887(t *testing.T) {
+	for range 200 {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		l := &scriptedLoop{errs: []error{errBusy}}
+		err := registerConnWait(ctx, l, 3, nil, nil, 0)
+		cancel()
+		if !errors.Is(err, errBusy) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want the refusal wrapped with context.DeadlineExceeded", err)
+		}
+		if l.calls != 1 {
+			t.Fatalf("RegisterConn calls = %d, want 1", l.calls)
+		}
+	}
+}
