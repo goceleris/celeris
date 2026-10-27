@@ -66,6 +66,20 @@ func isRingENOMEM(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "cannot allocate memory")
 }
 
+// isRingStartPressure reports an engine start error that the ring budget
+// explains: the ring-setup ENOMEM itself, or "io_uring not available on this
+// system", which is what New answers when the capability probe's own private
+// ring (probe.Probe builds one per call and is not cached) met the same ENOMEM
+// and read as no io_uring. The second is retried only where io_uring does work
+// here (ioUringUsableHere), so a kernel without io_uring still skips at once
+// instead of after ringUnchargeBound (celeris#1104).
+func isRingStartPressure(err error) bool {
+	if isRingENOMEM(err) {
+		return true
+	}
+	return err != nil && strings.Contains(err.Error(), "io_uring not available on this system") && ioUringUsableHere()
+}
+
 // ioUringUsable caches a positive answer of ioUringUsableHere only.
 var ioUringUsable atomic.Bool
 
@@ -105,7 +119,7 @@ func retryRingENOMEM(start func() error) (waited time.Duration, tries int, err e
 		tries++
 		waited = time.Since(t0)
 		err = start()
-		if small || !isRingENOMEM(err) || time.Since(t0) > ringUnchargeBound {
+		if small || !isRingStartPressure(err) || time.Since(t0) > ringUnchargeBound {
 			return waited, tries, err
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -142,7 +156,7 @@ var errNoBind662 = errors.New("engine did not bind with workers within 10s")
 // other failure is judged by skipOrFail656, as the rigs judged it before; a
 // Listen that neither failed nor bound fails the test. It returns the running
 // engine, its cancel, and a channel that receives Listen's result.
-func startRingRetried662(t *testing.T, build func() (*Engine, error)) (*Engine, context.CancelFunc, <-chan error) {
+func startRingRetried662(t *testing.T, build func() (*Engine, error)) (*Engine, context.CancelFunc, chan error) {
 	t.Helper()
 	var (
 		e      *Engine

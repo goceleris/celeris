@@ -3,7 +3,6 @@
 package iouring
 
 import (
-	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -216,36 +215,22 @@ func TestFinishCloseClosesAtOnceWhenNothingOwed(t *testing.T) {
 // the engine must stop promptly, and the release backstop must not be what
 // closed any of them.
 func TestShutdownEndsOwedOpsBeforeClosing(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	e, err := New(resource.Config{
-		Addr:      addr,
-		Protocol:  engine.HTTP1,
-		Resources: resource.Resources{Workers: 2},
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}, transplantTestHandler{})
-	if err != nil {
-		skipOrFail656(t, "iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		return New(resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2},
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}, transplantTestHandler{})
+	})
+	addr := e.Addr().String()
 	defer cancel()
-	for deadline := time.Now().Add(8 * time.Second); e.Addr() == nil; {
-		select {
-		case err := <-done:
-			skipOrFail656(t, "iouring engine failed to start: %v", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("engine did not start")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 	const n = 8
 	var clients []net.Conn
 	var servers []int
