@@ -35,6 +35,22 @@ var listenForStart1104 = func() (net.Listener, error) { return net.Listen("tcp",
 // channel and must return Start's error if it comes first.
 func startPicked1104(t testing.TB, cfg celeris.Config, routes func(*celeris.Server), ready func(s *celeris.Server, addr string, done <-chan error) error) (*celeris.Server, string, chan error) {
 	t.Helper()
+	return startPickedWith1104(t, cfg, routes, (*celeris.Server).StartWithListener, ready)
+}
+
+// startPickedCtx1104 is startPicked1104 for the starters that stop their server
+// by cancelling the context Start runs under: it calls StartWithListenerAndContext,
+// which shares StartWithContext's shutdown (listenUntilCancelled). ctx is not
+// cancelled here; a try that fails is stopped with Shutdown.
+func startPickedCtx1104(ctx context.Context, t testing.TB, cfg celeris.Config, routes func(*celeris.Server), ready func(s *celeris.Server, addr string, done <-chan error) error) (*celeris.Server, string, chan error) {
+	t.Helper()
+	return startPickedWith1104(t, cfg, routes, func(s *celeris.Server, ln net.Listener) error { return s.StartWithListenerAndContext(ctx, ln) }, ready)
+}
+
+// startPickedWith1104 is the body of startPicked1104 and startPickedCtx1104:
+// start is how the server is started on the listener.
+func startPickedWith1104(t testing.TB, cfg celeris.Config, routes func(*celeris.Server), start func(*celeris.Server, net.Listener) error, ready func(s *celeris.Server, addr string, done <-chan error) error) (*celeris.Server, string, chan error) {
+	t.Helper()
 	var (
 		s    *celeris.Server
 		addr string
@@ -50,7 +66,7 @@ func startPicked1104(t testing.TB, cfg celeris.Config, routes func(*celeris.Serv
 		s = celeris.New(cfg)
 		routes(s)
 		done = make(chan error, 1)
-		go func(s *celeris.Server, ln net.Listener, done chan error) { done <- s.StartWithListener(ln) }(s, ln, done)
+		go func(s *celeris.Server, ln net.Listener, done chan error) { done <- start(s, ln) }(s, ln, done)
 		if err := ready(s, addr, done); err != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = s.Shutdown(ctx)

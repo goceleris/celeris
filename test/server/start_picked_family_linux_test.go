@@ -49,6 +49,8 @@ func TestStartersForcedOntoOnePortEndOnPortsOfTheirOwn1104(t *testing.T) {
 		{"startServer870", func(t *testing.T) string { return startServer870(t, std) }},
 		{"startGlobalChainServer836", func(t *testing.T) string { return startGlobalChainServer836(t, std, none) }},
 		{"startServer964", func(t *testing.T) string { return startServer964(t, std) }},
+		{"startServer760", func(t *testing.T) string { return startServer760(t, celeris.Std, 5*time.Second, 0, nil, none).addr }},
+		{"startH2PoolServer759", func(t *testing.T) string { return startH2PoolServer759(t, celeris.Std, 5*time.Second, none).addr }},
 	}
 	for _, st := range starters {
 		for round := 0; round < 3; round++ {
