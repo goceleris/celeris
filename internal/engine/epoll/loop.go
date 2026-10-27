@@ -9,9 +9,11 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2848,6 +2850,49 @@ func (l *Loop) initProtocol(cs *connState) {
 				prevRaw, prevPause, prevResume = h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv
 			}
 			counted, finished := false, false
+			// unlockDetachMu: this goroutine holds detachMu (the promoted async path) and
+			// releases it on the way out; a conn that is not on that path is rolled back
+			// instead. Decided here, from the snapshot, so that the rollback below is
+			// registered before the first mutation and an edit that adds one between
+			// the snapshot and the install is inside it (#889 item 48). It is the gate
+			// the hook used after it had allocated detachMu: in sync mode l.async is false
+			// either way, and in async mode detachMu was allocated at acquireConnState,
+			// so prevMu is not nil.
+			unlockDetachMu := l.async && cs.asyncPromoted && prevMu != nil && !cs.asyncDetachUnlocked
+			if !unlockDetachMu {
+				// A conn that is not on the promoted async path goes on after a panic
+				// out of this hook: Context.Detach has not marked the Context detached,
+				// the router answers 500, and the next request is served on the same
+				// conn. Put back everything the hook changes from here on, so that it is
+				// exactly as if Detach had not run: a guarded writeFn left behind
+				// locks detachMu again on the first write of the H2C branch and of
+				// serveAsync, which hold it across theirs (the loop thread, or the
+				// dispatch goroutine, deadlocks on itself), a count left behind is
+				// made again by the next Detach, and closeConn undoes one. The
+				// promoted path closes the conn instead (the deferred hook below).
+				// Assignments only, under no lock: this goroutine owns the conn's
+				// state here, as it did when the hook installed it (#889 item 34).
+				defer func() {
+					if finished {
+						return
+					}
+					cs.writeFn = prevWrite
+					if h1 != nil {
+						h1.UpdateWriteFn(prevWrite)
+						h1.SetWriteErrQuery(cs)
+						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
+					}
+					cs.detachMu = prevMu
+					cs.asyncDetachPending = prevPending
+					if counted {
+						// Sync mode only. The next Detach counts again, and closeConn undoes the count
+						// of a conn with detachCounted set, so the sync path relies on this leaving it
+						// false (#889 item 48).
+						l.detachedCount--
+						cs.detachCounted = false
+					}
+				}()
+			}
 			var mu *sync.Mutex
 			if cs.detachMu != nil {
 				mu = cs.detachMu
@@ -2980,43 +3025,13 @@ func (l *Loop) initProtocol(cs *connState) {
 			// Context/stream this WS/SSE middleware goroutine is still using —
 			// the loop.go:2465-vs-websocket.go:243 use-after-recycle that
 			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade.
-			unlockDetachMu := l.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked
+			// unlockDetachMu was decided at the top of the hook, before the first mutation, so that the rollback is
+			// registered before any of them.
 			// completed: this closure ran to its end. Nothing is owed when this
 			// goroutine holds no lock here.
 			completed := !unlockDetachMu
 			// flagged: asyncDetachUnlocked has been published by this closure.
 			flagged := false
-			if !unlockDetachMu {
-				// A conn that is not on the promoted async path goes on after a panic
-				// out of this hook: Context.Detach has not marked the Context detached,
-				// the router answers 500, and the next request is served on the same
-				// conn. Put back everything installed above and below, so that it is
-				// exactly as if Detach had not run: a guarded writeFn left behind
-				// locks detachMu again on the first write of the H2C branch and of
-				// serveAsync, which hold it across theirs (the loop thread, or the
-				// dispatch goroutine, deadlocks on itself), a count left behind is
-				// made again by the next Detach, and closeConn undoes one. The
-				// promoted path closes the conn instead (the deferred hook below).
-				// Assignments only, under no lock: this goroutine owns the conn's
-				// state here, as it did when the hook installed it (#889 item 34).
-				defer func() {
-					if finished {
-						return
-					}
-					cs.writeFn = prevWrite
-					if h1 != nil {
-						h1.UpdateWriteFn(prevWrite)
-						h1.SetWriteErrQuery(cs)
-						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
-					}
-					cs.detachMu = prevMu
-					cs.asyncDetachPending = prevPending
-					if counted {
-						l.detachedCount--
-						cs.detachCounted = false
-					}
-				}()
-			}
 			if unlockDetachMu {
 				// Registered before guarded is installed (celeris#844): from the moment
 				// cs.writeFn is guarded, a write through the response adapter locks
@@ -5335,7 +5350,22 @@ func (l *Loop) flushBatchedCounters() {
 // as net/http's graceful shutdown does, and a stream it opens anyway is
 // refused. The wait is bounded like the send drain (sendDrainWait): the
 // budget of the last Engine.Shutdown, and never less than
-// shutdownSendDrainFloor. Loop thread.
+// shutdownSendDrainFloor.
+//
+// A GOAWAY the write hook refuses (the conn's backlog is over the HTTP/2 cap,
+// 64 MiB, so its peer has stopped reading) is lost and sets writeRefused; this
+// pass does not look at it (celeris#885 item 14, read from the code, not
+// measured). The conn is not left open for it: the next drainH2Writes with a
+// frame queued discards the queue and closes the conn once what is staged has
+// gone out, a read of the conn that finds writeRefused closes it (drainRead),
+// and a conn with none of those is not busy here, so the pass settles and
+// shutdown closes it. What the lost GOAWAY costs is the client's graceful
+// notice, from a peer that was not reading; what a conn that stays busy
+// (OutboundPending, response DATA waiting for a WINDOW_UPDATE that will not
+// come) costs is the wait up to the drain's bound, the same as for any conn
+// whose peer is not taking its response.
+//
+// Loop thread.
 func (l *Loop) h2PoolSettled() bool {
 	if len(l.h2Conns) == 0 {
 		return true
@@ -5605,6 +5635,21 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 	// own rules: a byte over 255 ("300.1.1.1" bound 44.1.1.1), a leading zero
 	// ("0127.0.0.1": octal in some parsers), a fifth byte, and the shorthands
 	// inet_aton reads ("10", "127.1": "1.2.3" bound 1.2.3.0).
+	//
+	// A zoned IPv6 host ("fe80::1%eth0") is what net.Listen binds and net.ParseIP
+	// rejects: it is read with netip, which keeps the zone, and the zone becomes
+	// the socket address's scope id as net.Listen makes it (bindiag.ZoneID). An
+	// IPv4-mapped host is IPv4 whatever its zone, as for std (celeris#885
+	// item 54).
+	var zone string
+	if strings.IndexByte(host, '%') >= 0 {
+		za, err := netip.ParseAddr(host)
+		if err != nil || !za.Is6() {
+			return nil, fmt.Errorf("invalid addr: %s", addr)
+		}
+		zone = za.Zone()
+		host = za.WithZone("").String()
+	}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return nil, fmt.Errorf("invalid addr: %s", addr)
@@ -5614,7 +5659,7 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 		copy(sa.Addr[:], ip4)
 		return sa, nil
 	}
-	sa := &unix.SockaddrInet6{Port: port}
+	sa := &unix.SockaddrInet6{Port: port, ZoneId: bindiag.ZoneID(zone)}
 	copy(sa.Addr[:], ip.To16())
 	return sa, nil
 }

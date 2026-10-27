@@ -337,7 +337,10 @@ func (e *Engine) Type() engine.EngineType {
 
 // BeginPauseAccept starts pausing accept and returns without waiting
 // (celeris#662). Each loop sees the flag at the top of its next iteration,
-// a few milliseconds later at most while it listens. Then, on its own
+// a few milliseconds later at most while it listens (adaptiveTimeoutMs caps
+// the wait at 4 ms; measured 0.8 to 5.9 ms from the call to the closed
+// listener, celeris#886 item 24), which is why it does not signal the wake
+// eventfd, as io_uring's does for its 100 ms ring wait. Then, on its own
 // thread, it clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
 // serving for the linger (about 1.5 s from that clear), and closes the
 // listener once it has drained the accept queue. A connection whose

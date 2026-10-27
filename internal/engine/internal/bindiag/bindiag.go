@@ -166,6 +166,26 @@ func SockaddrString(fd int, sa unix.Sockaddr) string {
 	return ""
 }
 
+// ZoneID is the scope id of an IPv6 zone as net.Listen reads it (net.zoneToInt):
+// the index of the interface of that name, else the zone as a number, else 0.
+// A zone that names nothing is therefore not an error here, as it is not for
+// std: the kernel refuses the bind of a link-local address with no scope, and a
+// global one does not look at it (celeris#885 item 54). One netlink dump, at
+// listen time.
+func ZoneID(zone string) uint32 {
+	if zone == "" {
+		return 0
+	}
+	if ifi, err := net.InterfaceByName(zone); err == nil {
+		return uint32(ifi.Index)
+	}
+	n, err := strconv.ParseUint(zone, 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(n)
+}
+
 // BoundAddr is the bound address of the socket fd as a *net.TCPAddr, or nil
 // when Getsockname fails. The zone is set only for a nonzero scope id: an
 // unscoped "[::]:port" listener printed as "[::%0]:port" before celeris#925.

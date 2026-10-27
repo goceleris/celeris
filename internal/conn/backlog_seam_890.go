@@ -15,3 +15,15 @@ import "sync/atomic"
 // It is read only on the refusal, never on the path of a request that is
 // served, so it costs a request nothing.
 var BacklogRefusedHook atomic.Pointer[func(remoteAddr string)]
+
+// backlogRefused tells the test seam that a request was refused. Out of line
+// and marked noinline so that the branch it is called from, taken only by a
+// peer that stopped reading, adds nothing to handleH1Request's frame or to the
+// code of a request that is served.
+//
+//go:noinline
+func backlogRefused(state *H1State) {
+	if f := BacklogRefusedHook.Load(); f != nil {
+		(*f)(state.RemoteAddr)
+	}
+}
