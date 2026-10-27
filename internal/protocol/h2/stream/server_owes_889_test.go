@@ -79,3 +79,39 @@ func TestServerOwesCountsDoNotLeakOrUnderflow889(t *testing.T) {
 	check("duplicate Closed transitions")
 	_ = s1
 }
+
+// A response waiting for the client's window means the client owes the server
+// (the WINDOW_UPDATE): not exempt, whatever the request. The bytes are charged
+// where the buffer fills and refunded when it is dropped with the stream or
+// sent, so a stream that ends with its tail unsent does not exempt the conn.
+func TestServerOwesBufferedResponseIsOwedByTheClient889(t *testing.T) {
+	m := NewManager()
+	s, _ := m.TryOpenStream(1)
+	s.SetState(StateHalfClosedRemote)
+	owes889(t, m, true, "request whole, nothing buffered")
+	s.BufferOutbound(make([]byte, 1<<20), true)
+	owes889(t, m, false, "with 1 MiB buffered for the client's window")
+	if m.OutboundHeld() != 1<<20 {
+		t.Fatalf("OutboundHeld = %d, want 1 MiB", m.OutboundHeld())
+	}
+	m.DeleteStream(1)
+	if m.OutboundHeld() != 0 {
+		t.Fatalf("OutboundHeld = %d after the stream was deleted with its tail unsent, want 0 (a leak would exempt the conn for good)", m.OutboundHeld())
+	}
+	owes889(t, m, false, "with no stream")
+	s3, _ := m.TryOpenStream(3)
+	s3.SetState(StateHalfClosedRemote)
+	owes889(t, m, true, "a new stream whose request is whole")
+}
+
+// A pool handler waiting for the client's window (the budget is spent, so it
+// waits instead of buffering) is the same debt.
+func TestServerOwesAWaitingHandlerIsOwedByTheClient889(t *testing.T) {
+	m := NewManager()
+	s, _ := m.TryOpenStream(1)
+	s.SetState(StateHalfClosedRemote)
+	m.sendWindowWaiters.Add(1)
+	owes889(t, m, false, "with a handler waiting for window")
+	m.sendWindowWaiters.Add(-1)
+	owes889(t, m, true, "with the wait over")
+}

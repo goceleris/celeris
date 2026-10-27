@@ -567,17 +567,28 @@ func (m *Manager) CountActiveStreams() int {
 	return int(m.activeStreams.Load())
 }
 
-// ServerOwes reports whether the connection has a stream open and every open
-// stream is one the server owes the rest of its answer: the client's request is
-// whole (HalfClosedRemote). A client that owes the server something, the rest of
-// a request, is not served by the exemption from ReadTimeout and IdleTimeout
-// that the engines' sweep gives a conn with a stream open (celeris#889): its
-// silence is the thing ReadTimeout bounds. requestOpen counts the streams whose
-// request is not whole (Open and HalfClosedLocal), activeStreams all that are
-// open; both move together in updateActiveCount, the one place a stream's
-// state change reaches them. Atomic loads; safe from any goroutine.
+// ServerOwes reports whether the connection has a stream open and the client
+// owes the server nothing: every open stream has a whole request
+// (HalfClosedRemote), and no response is waiting for the client's window. That
+// is the exemption from ReadTimeout and IdleTimeout the engines' sweep gives a
+// conn with a stream open (celeris#889), for a stream the SERVER is writing to
+// (an SSE stream) whose client sends no frame. A client that owes the server
+// something, the rest of a request or the WINDOW_UPDATE a response is waiting
+// for, and sends nothing, is the silence ReadTimeout is for, so it is not
+// exempt.
+//
+// requestOpen counts the streams whose request is not whole (Open and
+// HalfClosedLocal), activeStreams all that are open; both move together in
+// updateActiveCount, the one place a stream's state change reaches them.
+// outboundHeld is the bytes the streams hold buffered for the peer's window
+// (charged and refunded where the buffer fills, drains, and is dropped with its
+// stream), sendWindowWaiters the pool handlers waiting for a window in
+// AwaitSendWindow. Atomic loads, no scan; safe from any goroutine.
 func (m *Manager) ServerOwes() bool {
-	return m.activeStreams.Load() > 0 && m.requestOpen.Load() == 0
+	return m.activeStreams.Load() > 0 &&
+		m.requestOpen.Load() == 0 &&
+		m.outboundHeld.Load() == 0 &&
+		m.sendWindowWaiters.Load() == 0
 }
 
 // updateActiveCount adjusts activeStreams, and requestOpen, atomically when a
