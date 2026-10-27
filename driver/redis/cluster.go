@@ -224,6 +224,9 @@ func (c *ClusterClient) getOrCreateNodeAs(addr string, isPrimary bool) (*cluster
 	if ok {
 		return n, nil
 	}
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
 	var (
 		client *Client
 		err    error
@@ -238,6 +241,11 @@ func (c *ClusterClient) getOrCreateNodeAs(addr string, isPrimary bool) (*cluster
 	}
 	n = &clusterNode{addr: addr, client: client, primary: isPrimary}
 	c.mu.Lock()
+	if c.nodes == nil { // Close ran while this dialled (see applyTopology)
+		c.mu.Unlock()
+		_ = client.Close()
+		return nil, ErrClosed
+	}
 	if existing, ok := c.nodes[addr]; ok {
 		c.mu.Unlock()
 		_ = client.Close()
@@ -345,6 +353,11 @@ func (c *ClusterClient) refreshTopology(ctx context.Context) error {
 func (c *ClusterClient) applyTopology(ctx context.Context, v *Value) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// closeNodes leaves c.nodes nil: a refresh whose reply came before Close
+	// gets here after it, and must neither dial nor write into the nil map.
+	if c.nodes == nil {
+		return ErrClosed
+	}
 
 	wantReplicas := c.cfg.ReadOnly || c.cfg.RouteByLatency
 
