@@ -6,9 +6,9 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"time"
-
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris"
 )
@@ -56,4 +56,29 @@ func startPicked1104(t testing.TB, cfg celeris.Config, routes func(*celeris.Serv
 		return nil
 	})
 	return s, addr, done
+}
+
+// startPickedPing1104 is startPicked1104 for the starters of this package that
+// register their routes (and a /ping, in whatever order they need) and wait for
+// /ping to answer: it also registers the cleanup they all had, a Shutdown of the
+// server and a wait for Start to return.
+func startPickedPing1104(t testing.TB, cfg celeris.Config, routes func(*celeris.Server)) (*celeris.Server, string) {
+	t.Helper()
+	s, addr, done := startPicked1104(t, cfg, routes, func(_ *celeris.Server, addr string, done <-chan error) error { return waitReady761(addr, done) })
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Errorf("Start did not return within 15s of Shutdown")
+		}
+	})
+	return s, addr
+}
+
+// ping1104 registers the /ping route startPickedPing1104's readiness probe uses.
+func ping1104(s *celeris.Server) {
+	s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 }

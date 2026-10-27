@@ -534,46 +534,13 @@ func startServer761(t *testing.T, eng celeris.EngineType, asyncServer bool, rout
 // chosen here).
 func startServerConfig761(t testing.TB, cfg celeris.Config, routes func(*celeris.Server)) string {
 	t.Helper()
-	retryUntil := time.Now().Add(30 * time.Second)
-	for tries := 1; ; tries++ {
-		ln, err := listenForStart1104()
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		cfg.Addr = addr
-		s := celeris.New(cfg)
-		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+	// The listener is handed to the server, so the port cannot be taken between
+	// the pick and the bind (celeris#1104, startPicked1104).
+	_, addr := startPickedPing1104(t, cfg, func(s *celeris.Server) {
+		ping1104(s)
 		routes(s)
-		startDone := make(chan error, 1)
-		go func() { startDone <- s.Start() }()
-		err = waitReady761(addr, startDone)
-		if err == nil {
-			if tries > 1 {
-				t.Logf("server start retried on ring ENOMEM: %d tries", tries)
-			}
-			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				_ = s.Shutdown(ctx)
-				select {
-				case <-startDone:
-				case <-time.After(15 * time.Second):
-					t.Errorf("Start did not return within 15s of Shutdown")
-				}
-			})
-			return addr
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = s.Shutdown(ctx)
-		cancel()
-		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		t.Fatalf("server did not start: %v", err)
-	}
+	})
+	return addr
 }
 
 // waitReady761 polls /ping until it answers 200, or returns the error the
