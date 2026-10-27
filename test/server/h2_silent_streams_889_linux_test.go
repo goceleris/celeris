@@ -72,12 +72,16 @@ func routeMode889(syncRoutes bool) string {
 }
 
 // silentOwes889 are the ways a client owes the server something and then goes
-// silent: HEADERS of a POST without END_STREAM (the body it never sends).
+// silent: HEADERS of a POST without END_STREAM (the body it never sends), and a
+// response bigger than the 64 KiB window the client leaves open (1 MiB, and
+// 8 MiB: over the 4 MiB the conn buffers) of which it grants no more.
 var silentOwes889 = []struct {
 	name string
 	req  func(c *h2raw889)
 }{
 	{"request-open", func(c *h2raw889) { c.request(1, "POST", "/upload889", false, true) }},
+	{"response-1MiB-untaken", func(c *h2raw889) { c.request(1, "GET", "/big889?n=1048576", true, true) }},
+	{"response-8MiB-untaken", func(c *h2raw889) { c.request(1, "GET", "/big889?n=8388608", true, true) }},
 }
 
 // pingCells889 are the cells a pinging client holds open (see the last test).
