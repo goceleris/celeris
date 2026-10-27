@@ -139,55 +139,81 @@ func get885(t *testing.T, c net.Conn, path string) {
 func TestEngineKeepAliveResponseSurvivesReadTimeoutWhileTheClientReads885(t *testing.T) {
 	for _, async := range []bool{false, true} {
 		t.Run(map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
-			const body = 40 << 20
-			_, addr := startE2E885(t, async, newPathHandler885(body), func(c *resource.Config) {
-				c.ReadTimeout = time.Second
-				c.WriteTimeout = 30 * time.Second
-				c.IdleTimeout = -1
-			})
-			c := dialRcvBuf885(t, addr, 64<<10)
-			br := bufio.NewReaderSize(c, 512<<10)
-			get885(t, c, "/big")
-			start := time.Now()
-			_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
-			resp, err := http.ReadResponse(br, nil)
-			if err != nil {
-				t.Fatalf("celeris885: reading the response head %v in: %v", time.Since(start).Round(time.Millisecond), err)
-			}
-			got := int64(0)
-			buf := make([]byte, 512<<10)
-			var rerr error
-			for rerr == nil {
-				var n int
-				n, rerr = resp.Body.Read(buf)
-				got += int64(n)
-				// Paced to 16 MiB/s by the clock, not by a sleep per read.
-				if d := time.Until(start.Add(time.Duration(float64(got) / (16 << 20) * float64(time.Second)))); d > 0 {
-					time.Sleep(d)
-				}
-			}
-			took := time.Since(start)
-			t.Logf("client received %d of %d body bytes in %v with ReadTimeout 1s (end: %v)", got, body, took.Round(time.Millisecond), rerr)
-			if got != body {
-				t.Fatalf("the client received %d of %d body bytes %v in, reading steadily: the keep-alive response was cut by a "+
-					"ReadTimeout of 1s measured from the request (celeris#885 item 35)", got, body, took.Round(time.Millisecond))
-			}
-			if took < 2*time.Second {
-				t.Fatalf("celeris885 PREMISE: the transfer took %v, not longer than twice ReadTimeout", took)
-			}
-			time.Sleep(300 * time.Millisecond)
-			get885(t, c, "/small")
-			_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-			resp2, err := http.ReadResponse(br, nil)
-			if err != nil {
-				t.Fatalf("a second request 300 ms after the response ended, on the same conn: %v (the conn was reaped on a ReadTimeout "+
-					"measured from the request before the response, not from its end; celeris#885 item 35)", err)
-			}
-			b, _ := io.ReadAll(resp2.Body)
-			if string(b) != "small" {
-				t.Errorf("second response body %q, want small", b)
-			}
+			runKeepAliveSurvives885(t, async, 0, 300*time.Millisecond)
 		})
+	}
+}
+
+// TestEngineKeepAliveMarginProbe885 measures how much room the test above has.
+// The idle clock after a response starts when the SERVER finished writing it,
+// not when the client finished reading: with the kernel's default send buffer
+// (autotuned up to tcp_wmem's maximum, 4 MiB) the server's last write runs ahead
+// of the client's last read by the buffer's drain time at the client's 16 MiB/s,
+// up to about 250 ms. Measured at --cpus 2: the second request, sent `gap` after
+// the client's last read, finds the conn alive at a gap of 800 ms and reaped at
+// 900 ms (5 of 5 runs each, both arms), so the 300 ms gap of the test above
+// leaves about 550 ms of margin, which a loaded runner with coverage and -race
+// can eat (the test failed once in CI, in the async arm).
+func TestEngineKeepAliveMarginProbe885(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		t.Run(map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
+			runKeepAliveSurvives885(t, async, 0, 900*time.Millisecond)
+		})
+	}
+}
+
+// runKeepAliveSurvives885 is the test above with the server's send buffer
+// (SocketSend, 0 = the kernel's default) and the gap before the second request
+// as parameters.
+func runKeepAliveSurvives885(t *testing.T, async bool, sndbuf int, gap time.Duration) {
+	const body = 40 << 20
+	_, addr := startE2E885(t, async, newPathHandler885(body), func(c *resource.Config) {
+		c.ReadTimeout = time.Second
+		c.WriteTimeout = 30 * time.Second
+		c.IdleTimeout = -1
+		c.Resources.SocketSend = sndbuf
+	})
+	c := dialRcvBuf885(t, addr, 64<<10)
+	br := bufio.NewReaderSize(c, 512<<10)
+	get885(t, c, "/big")
+	start := time.Now()
+	_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("celeris885: reading the response head %v in: %v", time.Since(start).Round(time.Millisecond), err)
+	}
+	got := int64(0)
+	buf := make([]byte, 512<<10)
+	var rerr error
+	for rerr == nil {
+		var n int
+		n, rerr = resp.Body.Read(buf)
+		got += int64(n)
+		// Paced to 16 MiB/s by the clock, not by a sleep per read.
+		if d := time.Until(start.Add(time.Duration(float64(got) / (16 << 20) * float64(time.Second)))); d > 0 {
+			time.Sleep(d)
+		}
+	}
+	took := time.Since(start)
+	t.Logf("client received %d of %d body bytes in %v with ReadTimeout 1s (end: %v)", got, body, took.Round(time.Millisecond), rerr)
+	if got != body {
+		t.Fatalf("the client received %d of %d body bytes %v in, reading steadily: the keep-alive response was cut by a "+
+			"ReadTimeout of 1s measured from the request (celeris#885 item 35)", got, body, took.Round(time.Millisecond))
+	}
+	if took < 2*time.Second {
+		t.Fatalf("celeris885 PREMISE: the transfer took %v, not longer than twice ReadTimeout", took)
+	}
+	time.Sleep(gap)
+	get885(t, c, "/small")
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp2, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("a second request %v after the response ended, on the same conn: %v (the conn was reaped on a ReadTimeout "+
+			"measured from the request before the response, not from its end; celeris#885 item 35)", gap, err)
+	}
+	b, _ := io.ReadAll(resp2.Body)
+	if string(b) != "small" {
+		t.Errorf("second response body %q, want small", b)
 	}
 }
 
