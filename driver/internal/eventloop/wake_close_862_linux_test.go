@@ -65,7 +65,8 @@ func c862FillSendBuffer(t *testing.T, fd int) int {
 // pinned deterministically by
 // TestAWakeAfterShutdownClosedTheEventfdWritesNothing890; a wake that loads
 // w.wakeFD.FD() itself, races the close and writes to the loaded number is
-// covered only by the oracle above (celeris#890).
+// pinned at the source by TestWakeGoesThroughSignalOnly890; the oracle above
+// only backs it (celeris#890).
 func TestWriteRacingCloseNeverTouchesTheClosedEventfd862(t *testing.T) {
 	const rounds, writers = 64, 4
 	one := []byte{'w'}

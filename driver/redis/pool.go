@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
@@ -20,6 +21,8 @@ type redisPool struct {
 	cfg      Config
 	provider engine.EventLoopProvider
 	ownsLoop bool
+	// closeOnce makes Close idempotent.
+	closeOnce sync.Once
 }
 
 // newDirectCmdPool creates a pool whose cmd conns dial via direct
@@ -271,13 +274,21 @@ func (p *redisPool) releasePubSub(c *redisConn) {
 }
 
 // Close closes both pools and releases the event loop if owned.
+//
+// It is safe to call from several goroutines and more than once: the body runs
+// once, and a second caller returns at once. Releasing the shared standalone
+// loop twice would drop a reference that belongs to another client
+// (celeris#887 item 29: SentinelClient.Close and the give-up of a sentinel
+// closed the same Client).
 func (p *redisPool) Close() error {
-	_ = p.cmd.Close()
-	_ = p.pubsub.Close()
-	if p.ownsLoop && p.provider != nil {
-		eventloop.Release(p.provider)
-		p.provider = nil
-	}
+	p.closeOnce.Do(func() {
+		_ = p.cmd.Close()
+		_ = p.pubsub.Close()
+		if p.ownsLoop && p.provider != nil {
+			eventloop.Release(p.provider)
+			p.provider = nil
+		}
+	})
 	return nil
 }
 
