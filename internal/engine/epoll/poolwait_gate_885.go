@@ -43,7 +43,8 @@ import (
 // route every conn whose read leaves a partial request is promoted, whatever its
 // route, and a conn on an Async route is) is otherwise left to the end of the
 // wait, with a request in progress on it unread: the documented behaviour and
-// a follow-up shared with io_uring (which has no idle close at all).
+// a follow-up (io_uring's gate, shutdown_gate_884.go, looks inside such a conn
+// under the goroutine's own locks and closes it when idle).
 
 // poolWaitGrace is how long into the wait for the HTTP/2 pool handlers the
 // gate stays open: io_uring's shutdownSendDrainNanos, and this engine's
@@ -58,10 +59,10 @@ const gateClosesPerPass = 64
 
 // refusesRecv reports whether a loop past the pool wait's gate reads no more
 // from cs: an HTTP/1 conn (detached or not) or one whose protocol is not
-// detected yet, which io_uring's refuseRecv test mirrors, with one exception
-// io_uring does not make: a request in progress is read on, and answered, as
-// std's Shutdown answers the request of an active conn (headers in pieces, a
-// body still arriving, the bytes of a protocol decision begun). A conn whose
+// detected yet, which io_uring's gateReadsOn mirrors: a request in progress is
+// read on, and answered, as std's Shutdown answers the request of an active
+// conn (headers in pieces, a body still arriving, the bytes of a protocol
+// decision begun). A conn whose
 // dispatch goroutine owns its parse state (asyncPromoted) is refused as before
 // while it is HTTP/1: its state is not the loop's to read. Loop thread.
 func refusesRecv(cs *connState) bool {
