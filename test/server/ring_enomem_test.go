@@ -113,3 +113,32 @@ func TestRetryRingENOMEM1104(t *testing.T) {
 		t.Errorf("a persistent ENOMEM: %d tries after %v, err %v; want >=2 tries over the 100 ms window, then %v", tries, time.Since(start), err, enomem)
 	}
 }
+
+// A starter that picks a free port, closes it and has Start bind it can lose
+// the race: another test of the process, running in parallel, is given the port
+// in between (a client socket of its own takes ephemeral ports from the same
+// range). The SSE 855 starter retried any error for three seconds before the
+// ENOMEM change narrowed it, and TestStalledSSEEndsWithShutdown855/std/h2c/budget
+// failed once in CI with "startErr=listen tcp 127.0.0.1:38797: bind: address
+// already in use". The starters that pick a fresh port per try retry that class
+// too, a bounded number of times: a port that stays taken is a real conflict.
+func TestRetryStartRetriesAnAddressInUse1104(t *testing.T) {
+	inUse := errors.New("server did not start: listen tcp 127.0.0.1:38797: bind: address already in use")
+
+	calls := 0
+	tries, err := retryRingENOMEM(func() error {
+		calls++
+		if calls < 3 {
+			return inUse
+		}
+		return nil
+	}, time.Second)
+	if err != nil || tries != 3 {
+		t.Errorf("two taken ports then success: %d tries, err %v; want 3, nil", tries, err)
+	}
+
+	tries, err = retryRingENOMEM(func() error { return inUse }, 5*time.Second)
+	if !errors.Is(err, inUse) || tries < 2 || tries > 20 {
+		t.Errorf("a port that stays taken: %d tries, err %v; want a bounded number of tries (2 to 20), then %v", tries, err, inUse)
+	}
+}
