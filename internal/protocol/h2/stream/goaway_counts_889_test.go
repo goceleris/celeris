@@ -51,6 +51,7 @@ func TestGoAwayAndTheHandlerEndingTheStreamLowerTheCountsOnce889(t *testing.T) {
 		if !ok {
 			t.Fatal("no stream slot")
 		}
+		s.flags.Store(flagAsyncRunning) // a pool handler's stream: handleGoAway leaves its release to the goroutine
 		s.SetState(StateHalfClosedLocal)
 		done.Store(false)
 		cur.Store(s)
