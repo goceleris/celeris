@@ -135,19 +135,22 @@ func dispatchHasWork(cs *connState) bool {
 // a conn from liveConns by swapping it with the last entry, so the walk goes
 // from the top down, as checkTimeouts does. The pass runs at the top of the loop
 // pass, before the pass reaps new completions, so a request that reached the
-// kernel since the last enter meets a conn that looks idle. The first pass asks
-// the kernel's receive queue for the conns it can (holdUnreadAtGate,
-// celeris#1104): where a ring's completions are task work (COOP_TASKRUN,
-// DEFER_TASKRUN) such a request waits in the socket's queue, not yet as a CQE,
-// and the conn is held and answered instead of closed. What is left: a
-// fixed-file conn cannot be asked, and on a ring whose recv completions are
-// posted without the worker's enter (SQPOLL) the bytes can already be a CQE
-// that the pass has not reaped (a request the gate then drops, not a reset);
-// the race std's own idle close has, between the question and close(2), stays.
+// kernel since the last reap meets a conn that looks idle. The first pass looks
+// for it in both places it can be (celeris#1104): as a recv CQE posted and not
+// reaped (holdPostedRecvs: the base tier, and any ring that posts at once), and
+// as bytes in the socket's queue (holdUnreadAtGate: where a ring's completions
+// are task work, COOP_TASKRUN or DEFER_TASKRUN, the request waits in the socket
+// until the next enter). The conn is held and answered instead of closed. What
+// is left: a fixed-file conn cannot be asked for its socket queue (its CQE is
+// still seen), and a CQE the kernel posts after the look, which is the race
+// std's own idle close has, between the question and close(2).
 // Worker thread.
 func (w *Worker) closeIdleH1() {
 	first := !w.gateSwept
 	w.gateSwept = true
+	if first {
+		w.holdPostedRecvs()
+	}
 	closed := 0
 	for i := len(w.liveConns) - 1; i >= 0; i-- {
 		fd := w.liveConns[i]
@@ -166,7 +169,7 @@ func (w *Worker) closeIdleH1() {
 		// progress, read on and answered instead of the conn being closed. Ahead
 		// of the cap and the send-side tests, so that a conn those leave for the
 		// next pass is not met unasked.
-		if first && w.holdUnreadAtGate(cs) {
+		if first && (cs.gateRead || w.holdUnreadAtGate(cs)) {
 			continue
 		}
 		// Past the cap the conn was still looked at, so it is marked close-after
@@ -192,6 +195,42 @@ func (w *Worker) closeIdleH1() {
 		}
 		w.closeConn(fd)
 		closed++
+	}
+}
+
+// holdPostedRecvs marks every conn whose recv completion is in the completion
+// queue and not reaped yet, with bytes in it, to be read on (cs.gateRead): the
+// first pass runs at the top of the worker iteration, ahead of the reap, and a
+// request that the kernel delivered since the last reap is a CQE, not bytes in
+// the socket's queue, so holdUnreadAtGate's question answers 0 for it (the
+// base tier, whose recv completes at once: CI measured socket-queue-nonempty=0,
+// cq-unreaped=every live conn, and 18 conns closed with their request delivered).
+// The CQEs are looked at in place, nothing is consumed: the reap that follows
+// takes them, and handleRecv, with refuseRecv up, reads the marked conns on and
+// answers them close-after. Only a recv with bytes (Res > 0) is a request; an
+// EOF or an error is not. A CQE of a conn that has closed since, or whose number
+// another conn has taken, is skipped by the generation, as the dispatch does
+// (staleConnCQE, without its side effects: nothing is recycled here). An ended
+// detached stream is not marked. The range is the worker's whole unreaped queue,
+// walked once, on the first pass only. A CQE the kernel posts after the look is
+// the race any close has. Worker thread.
+func (w *Worker) holdPostedRecvs() {
+	head, tail := w.ring.BeginCQ()
+	for ; head != tail; head++ {
+		e := w.ring.cqeAt(head)
+		ud := e.UserData
+		if ud&udMask != udRecv || e.Res <= 0 {
+			continue
+		}
+		fd := int(ud & fdMask)
+		if fd >= len(w.conns) {
+			continue
+		}
+		cs := w.conns[fd]
+		if cs == nil || cs.closing || cs.generation != decodeGen(ud) || cs.writeEnded.Load() {
+			continue
+		}
+		cs.gateRead = true
 	}
 }
 

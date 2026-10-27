@@ -313,3 +313,18 @@ func TestGatePassClosesAConnWhoseRecvCQEIsAnEOF1104(t *testing.T) {
 		t.Errorf("the pass kept a conn whose posted recv CQE is an EOF")
 	}
 }
+
+// TestGatePassIgnoresAPostedRecvCQEOfAnotherGeneration1104: the CQE names a
+// conn that has closed since and whose number another conn holds (a different
+// generation): it is not the live conn's request, and the live conn, idle, is
+// closed.
+func TestGatePassIgnoresAPostedRecvCQEOfAnotherGeneration1104(t *testing.T) {
+	w, css, peers := gateRig884(t, 1)
+	armPostedRecv1104(t, w, css[0], peers[0], "GET /x HTTP/1.1\r\nHost: x\r\n\r\n")
+	css[0].generation++
+	w.refuseRecv = true
+	w.closeIdleH1()
+	if w.conns[css[0].fd] == css[0] {
+		t.Errorf("the pass kept a conn on the strength of a CQE of another generation")
+	}
+}
