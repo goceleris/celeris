@@ -1438,6 +1438,7 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	handler stream.Handler, write func([]byte)) error {
 
 	if state.WriteBacklogged != nil && state.WriteBacklogged() {
+		backlogRefused(state)
 		return ErrWriteBacklog
 	}
 
