@@ -71,6 +71,9 @@ func TestRegisterConnWait887(t *testing.T) {
 			if !errors.Is(err, c.wantErr) {
 				t.Fatalf("err = %v, want %v", err, c.wantErr)
 			}
+			if c.cancelled && !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v does not wrap the ctx error: a caller cannot tell a cancelled wait from a refusal", err)
+			}
 			if l.calls != c.wantCalls {
 				t.Fatalf("RegisterConn calls = %d, want %d", l.calls, c.wantCalls)
 			}
@@ -86,6 +89,9 @@ func TestRegisterConnWaitIsBoundedWithoutACtxDeadline887(t *testing.T) {
 	took := time.Since(start)
 	if !errors.Is(err, errBusy) {
 		t.Fatalf("err = %v", err)
+	}
+	if !errors.Is(err, errRegisterWaitBudget) {
+		t.Fatalf("err = %v does not say the wait ran out of budget", err)
 	}
 	if took < registerWaitBudget || took > registerWaitBudget+time.Second {
 		t.Fatalf("gave up after %v, want about %v", took, registerWaitBudget)

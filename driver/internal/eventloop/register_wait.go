@@ -2,6 +2,7 @@ package eventloop
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -15,6 +16,11 @@ import (
 // off the worker and can take longer (celeris#735), so the wait is bounded
 // instead of unlimited.
 const registerWaitBudget = 2 * time.Second
+
+// errRegisterWaitBudget is wrapped into the error RegisterConnWait returns
+// when registerWaitBudget has passed (declared by the tests commit, used by the
+// next).
+var errRegisterWaitBudget = errors.New("celeris/eventloop: waited for the number to be finalized, budget used up")
 
 // IsNumberBusy reports whether err is the io_uring engine's refusal of a
 // descriptor number whose previous conn has been unregistered but not yet

@@ -21,7 +21,18 @@ package eventloop
 //   - every use of the worker's wakeFD field is a method call, and the method
 //     is the one its function is allowed (newWorker builds it, run reads the
 //     number on the loop thread, wake signals, shutdown closes);
-//   - wake's body is the single statement w.wakeFD.Signal().
+//   - wake's body is the single statement w.wakeFD.Signal();
+//   - the eventfd number newWorker creates reaches only wakefd.New,
+//     unix.EpollCtl and unix.Close: it is never stored in another field, where
+//     a producer could write it itself (review round 1: a copy kept in the
+//     worker and written by enqueueFlush has WAKEATOMIC's defect and left
+//     wakeFD untouched);
+//   - the only raw write(2) of the package is flushLocked's, to a conn's fd.
+//
+// Known limit: this is a syntactic pin of the shapes above, not a proof. A
+// number reaching a producer by a route outside them (a global, a closure over
+// an integer returned by a helper) is not seen; the probabilistic oracle of
+// TestWriteRacingCloseNeverTouchesTheClosedEventfd862 is the backstop.
 //
 // It has no build tag: the files are parsed, not compiled, so it runs on every
 // platform the package builds on. A mutant fails it with the position of the
@@ -70,6 +81,9 @@ func TestWakeGoesThroughSignalOnly890(t *testing.T) {
 		if !seen[k] {
 			t.Errorf("the scan found no %q: the worker's wakeFD usage changed shape; update this guard with it", k)
 		}
+	}
+	for _, v := range scanEventfdNumber(t, ".") {
+		t.Error(v)
 	}
 	if wakeBody != "w.wakeFD.Signal()" {
 		t.Errorf("(*worker).wake is %q, want exactly the statement w.wakeFD.Signal()", wakeBody)
@@ -181,4 +195,123 @@ func bodySource(fset *token.FileSet, src []byte, b *ast.BlockStmt) string {
 		parts = append(parts, string(src[fset.Position(s.Pos()).Offset:fset.Position(s.End()).Offset]))
 	}
 	return strings.Join(parts, "; ")
+}
+
+// scanEventfdNumber checks the two rules about the raw eventfd number: in
+// newWorker the identifier efd appears only as an argument of wakefd.New,
+// unix.EpollCtl or unix.Close; and a raw write call (unix.Write, syscall.Write
+// and their variants) appears only in flushLocked, on c.fd.
+func scanEventfdNumber(t *testing.T, dir string) (bad []string) {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	sawNewWorker, sawFlush := false, false
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := parser.ParseFile(fset, name, src, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range f.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			if fd.Recv == nil && fd.Name.Name == "newWorker" {
+				sawNewWorker = true
+				bad = append(bad, efdUses(fset, fd)...)
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				pkg, ok := sel.X.(*ast.Ident)
+				if !ok || (pkg.Name != "unix" && pkg.Name != "syscall") || !strings.HasPrefix(sel.Sel.Name, "Write") && !strings.HasPrefix(sel.Sel.Name, "Pwrite") {
+					return true
+				}
+				first := ""
+				if len(call.Args) > 0 {
+					first = string(src[fset.Position(call.Args[0].Pos()).Offset:fset.Position(call.Args[0].End()).Offset])
+				}
+				if fd.Name.Name == "flushLocked" && first == "c.fd" {
+					sawFlush = true
+					return true
+				}
+				bad = append(bad, fmt.Sprintf("%s: %s calls %s.%s(%s, ...); the only raw write allowed is flushLocked's, on c.fd (a producer's wake must be wakefd.WakeFD.Signal, celeris#890 WAKEATOMIC)",
+					fset.Position(call.Pos()), fd.Name.Name, pkg.Name, sel.Sel.Name, first))
+				return true
+			})
+		}
+	}
+	if !sawNewWorker || !sawFlush {
+		bad = append(bad, fmt.Sprintf("the scan did not find newWorker (%v) or flushLocked's write (%v): the code changed shape; update this guard with it", sawNewWorker, sawFlush))
+	}
+	return bad
+}
+
+// efdUses reports every use of the identifier efd in fd that is not an
+// argument of wakefd.New, unix.EpollCtl or unix.Close (anywhere beneath the
+// EpollCtl call, for int32(efd) in the event).
+func efdUses(fset *token.FileSet, fd *ast.FuncDecl) (bad []string) {
+	allowed := map[*ast.Ident]bool{}
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		switch pkg.Name + "." + sel.Sel.Name {
+		case "wakefd.New", "unix.Close":
+			for _, a := range call.Args {
+				if id, ok := a.(*ast.Ident); ok && id.Name == "efd" {
+					allowed[id] = true
+				}
+			}
+		case "unix.EpollCtl":
+			ast.Inspect(call, func(m ast.Node) bool {
+				if id, ok := m.(*ast.Ident); ok && id.Name == "efd" {
+					allowed[id] = true
+				}
+				return true
+			})
+		}
+		return true
+	})
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		// The definition (efd, err := unix.Eventfd(...)) is an Ident on the
+		// left of a define; skip it.
+		if as, ok := n.(*ast.AssignStmt); ok && as.Tok == token.DEFINE {
+			for _, l := range as.Lhs {
+				if id, ok := l.(*ast.Ident); ok && id.Name == "efd" {
+					allowed[id] = true
+				}
+			}
+		}
+		if id, ok := n.(*ast.Ident); ok && id.Name == "efd" && !allowed[id] {
+			bad = append(bad, fmt.Sprintf("%s: newWorker uses the eventfd number efd outside wakefd.New, unix.EpollCtl and unix.Close (a copy of the number in another place can be written by a producer, celeris#890 WAKEATOMIC)", fset.Position(id.Pos())))
+		}
+		return true
+	})
+	return bad
 }
