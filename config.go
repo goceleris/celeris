@@ -237,6 +237,15 @@ type Config struct {
 
 	// ReadTimeout is the max duration for reading the entire request.
 	// Zero uses the default (60s). Set to -1 for no timeout.
+	//
+	// On the native engines (epoll, io_uring, adaptive) it is measured from the
+	// connection's last read (on io_uring also from its last completed send, on
+	// epoll also from the end of a response the kernel did not take at once).
+	// An HTTP/2 connection with a stream open (the client's request begun and
+	// the stream not yet closed, a response still being written included) is
+	// not closed by it or by IdleTimeout, so an HTTP/2 stream whose client
+	// sends no frame (an SSE stream) outlives them; an HTTP/2 connection with
+	// no stream open is closed as an HTTP/1.1 one is.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This

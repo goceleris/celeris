@@ -928,6 +928,16 @@ func (s *H2State) PoolHandlersRunning() bool {
 	return s.processor.PoolHandlersRunning()
 }
 
+// ActiveStreams is the number of streams of this connection that are open or
+// half-closed (the manager's count for MAX_CONCURRENT_STREAMS): a stream the
+// client has opened and the server has not finished with, including one whose
+// request is whole and whose response is still being written. The engines'
+// timeout sweep tests it before applying ReadTimeout and IdleTimeout to an
+// HTTP/2 connection (celeris#889). An atomic load; safe from any goroutine.
+func (s *H2State) ActiveStreams() int {
+	return s.processor.GetManager().CountActiveStreams()
+}
+
 // OutboundPending reports whether a stream of this connection has response
 // DATA buffered for the client's WINDOW_UPDATE: its handler has returned and
 // the rest of its response goes out as the client grants window

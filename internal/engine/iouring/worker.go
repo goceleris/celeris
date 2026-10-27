@@ -7487,6 +7487,29 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	return snap, true
 }
 
+// h2StreamOpen is checkTimeouts' look at whether a conn due for ReadTimeout or
+// IdleTimeout is an HTTP/2 conn with a stream open (H2State.ActiveStreams > 0),
+// whose clock, the last read, says nothing about a stream the server is
+// answering: an SSE stream whose client sends no frame is the case (celeris#889).
+// cs.h2State is written off the worker by the dispatch goroutine's
+// switchToH2Local, under detachMu (the h1-to-h2c upgrade of an async conn), so
+// it is read under that lock, with TryLock as snapshotH1Deadlines has it
+// (celeris#593): known=false means the lock is held, a conn that is not idle,
+// and the sweep leaves it to the next. A separate look from the snapshot, which
+// the recv and header-timer paths share, so that they and the sweep of the conns
+// within their timeouts do not pay for a field only a conn past a timeout needs
+// (RULE 74).
+func h2StreamOpen(cs *connState) (open, known bool) {
+	if mu := cs.detachMu; mu != nil {
+		if !mu.TryLock() {
+			return false, false
+		}
+		defer mu.Unlock()
+	}
+	h2 := cs.h2State
+	return h2 != nil && h2.ActiveStreams() > 0, true
+}
+
 // detachedSendPending is checkTimeouts' look at whether a truly-detached conn
 // has bytes queued for its peer or a SEND in flight (connSendPending), for the
 // stall bound (detachedStalled). The queue is the stream's goroutine's under
@@ -7780,12 +7803,18 @@ func (w *Worker) checkTimeouts() {
 			if w.cfg.WriteTimeout > 0 && elapsed > w.cfg.WriteTimeout {
 				w.closeConn(fd)
 			}
-		} else {
-			if w.cfg.IdleTimeout > 0 && elapsed > w.cfg.IdleTimeout {
-				w.closeConn(fd)
-			} else if w.cfg.ReadTimeout > 0 && elapsed > w.cfg.ReadTimeout {
-				w.closeConn(fd)
+		} else if (w.cfg.IdleTimeout > 0 && elapsed > w.cfg.IdleTimeout) ||
+			(w.cfg.ReadTimeout > 0 && elapsed > w.cfg.ReadTimeout) {
+			// An HTTP/2 conn with a stream open is not idle and is not
+			// waiting for a request: the stream is the server's to serve
+			// (celeris#889). Looked at only here, once a timeout is due: a
+			// conn within its timeouts pays nothing for it, and one that is
+			// exempt pays this look on every sweep (its clock, the last read,
+			// does not move while it is exempt).
+			if open, known := h2StreamOpen(cs); !known || open {
+				continue
 			}
+			w.closeConn(fd)
 		}
 	}
 	// A SEND marked while the sweep ran, after the sweep had looked at its
