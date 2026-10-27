@@ -34,7 +34,8 @@ import (
 // EPOLLRDHUP re-entry), and each re-entry must not restart the drain clock (a
 // restart without progress made the conn immortal for as long as the handler
 // wrote). Before the fix of that restamp
-// this conn lived 13 times WriteTimeout; ReadTimeout is 4 times it and the
+// this conn lived as long as the handler wrote, which here is until the 20 s
+// wait below gives up (5 times WriteTimeout); ReadTimeout is 4 times it and the
 // trickle runs for 6 times it, so a conn still open 3 times WriteTimeout after
 // the burst fails it whichever clock held it.
 //
@@ -58,7 +59,8 @@ func TestEngineH2ClosingConnIsReapedWhileTheHandlerKeepsWriting(t *testing.T) {
 	var trickles atomic.Int64
 	var cancelledAt atomic.Int64
 	var writeErr atomic.Value
-	const writeTimeout = 4 * time.Second // wt
+	const writeTimeout = 4 * time.Second
+	const readTimeout = 4 * writeTimeout // also the IdleTimeout
 	const trickleFor = 6 * writeTimeout
 	h := stream.HandlerFunc(func(ctx context.Context, s *stream.Stream) error {
 		st, ok := s.ResponseWriter.(stream.Streamer)
@@ -100,8 +102,8 @@ func TestEngineH2ClosingConnIsReapedWhileTheHandlerKeepsWriting(t *testing.T) {
 	e, err := New(resource.Config{
 		Addr:         addr,
 		Protocol:     engine.H2C,
-		ReadTimeout:  4 * writeTimeout,
-		IdleTimeout:  4 * writeTimeout,
+		ReadTimeout:  readTimeout,
+		IdleTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 		Resources:    resource.Resources{Workers: 2},
 	}, asyncStreamHandler876{f: h})
@@ -197,10 +199,10 @@ func TestEngineH2ClosingConnIsReapedWhileTheHandlerKeepsWriting(t *testing.T) {
 		t.Fatal("PREMISE: the burst never finished")
 	}
 	if closedAt.IsZero() {
-		t.Fatalf("the conn was never closed within 20 s (peer reads nothing; WriteTimeout %v, ReadTimeout %v)", writeTimeout, 4*writeTimeout)
+		t.Fatalf("the conn was never closed within 20 s (peer reads nothing; WriteTimeout %v, ReadTimeout %v)", writeTimeout, readTimeout)
 	}
 	if lim := 3 * writeTimeout; sinceBurst > lim {
-		t.Errorf("the conn whose peer took nothing after the burst lived %v after it (> %v): it should be reaped about WriteTimeout (%v) after the refused write, and a clock restarted by each frame the handler queues (or ReadTimeout, %v, as before celeris#876) holds it longer", sinceBurst.Round(time.Millisecond), lim, writeTimeout, 4*writeTimeout)
+		t.Errorf("the conn whose peer took nothing after the burst lived %v after it (> %v): it should be reaped about WriteTimeout (%v) after the refused write, and a clock restarted by each frame the handler queues (or ReadTimeout, %v, as before celeris#876) holds it longer", sinceBurst.Round(time.Millisecond), lim, writeTimeout, readTimeout)
 	}
 }
 
