@@ -36,9 +36,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 # self-test). An entry is
 #   NAME            a test or subtest by its full name; it covers its own subtests, or
 #   pattern:REGEX   a skipped test or subtest whose full name matches REGEX, and only
-#                   when the test itself logged the probe's skip message under its RUN
-#                   line ("file_test.go:N: io_uring tier=base kernel=...: no usable
-#                   io_uring"). The engine's own startup line ("INFO io_uring engine
+#                   when the test itself logged the probe's skip message while it was the
+#                   current test ("file_test.go:N: io_uring tier=base kernel=...: no
+#                   usable io_uring"). The engine's own startup line ("INFO io_uring engine
 #                   selected tier=base ...") does not count: an arm that started an
 #                   engine and then skipped for another reason must still fail.
 #   min-pass N      the top-level tests that must PASS at least, so that a -run pattern
@@ -50,6 +50,7 @@ case "$label" in
 esac
 list_file=${BASE_TIER_SKIPS_DIR:-$here/..}/base-tier-skips-$label.txt
 [ -r "$list_file" ] || { echo "base-tier-tally: cannot read $list_file" >&2; exit 2; }
+# Names are literal (compared as strings below, not as regular expressions).
 names=$(awk 'NF && $1 !~ /^#/ && $1 != "min-pass" && $1 !~ /^pattern:/ { print $1 }' "$list_file" | paste -sd'|' -)
 patterns=$(awk 'NF && $1 ~ /^pattern:/ { sub(/^pattern:/, "", $1); print $1 }' "$list_file" | paste -sd'|' -)
 minpass=$(awk '$1 == "min-pass" { print $2 }' "$list_file")
@@ -58,13 +59,15 @@ fail=0
 skipped=$("$here"/skip-count.sh "$log") || fail=1
 # Each SKIP line is judged by the name of the test: allowed by an exact entry (or as a
 # subtest of one), or by a pattern while the test logged the probe's tier=base skip message.
-unlisted=$(awk -v names="$names" -v pats="$patterns" '
-  /^=== RUN   / { cur = $3; next }
-  /^[[:space:]]+[A-Za-z0-9_.]+\.go:[0-9]+: .*io_uring tier=base kernel=/ && cur != "" { base[cur] = 1 }
+unlisted=$(awk -v names="$names" -v pats="$patterns" 'BEGIN { nn = (names == "") ? 0 : split(names, nm, "|") }
+  # Parallel subtests interleave their output; go test names the owner of the lines that
+  # follow with RUN, and with NAME or CONT when it switches back to a test.
+  /^=== (RUN|NAME|CONT) / { cur = $3; next }
+  /^[[:space:]]+[A-Za-z0-9_.]+\.go:[0-9]+: .*io_uring tier=base kernel=.*: no usable io_uring/ && cur != "" { base[cur] = 1 }
   /^[[:space:]]*--- SKIP: / {
     n = $3
     ok = 0
-    if (names != "" && (n ~ ("^(" names ")$") || n ~ ("^(" names ")/"))) ok = 1
+    for (i = 1; i <= nn; i++) if (n == nm[i] || index(n, nm[i] "/") == 1) ok = 1
     if (!ok && pats != "" && n ~ pats && base[n]) ok = 1
     if (!ok) print
   }

@@ -25,8 +25,8 @@
 #   4. The Python tools of CI (zizmor) are pinned in a requirements file under
 #      .github/, which Dependabot's pip ecosystem reads. (a) No workflow or
 #      composite action installs or runs a Python tool with a `name==version`
-#      of its own (`pipx run --spec zizmor==1.30.0`, `pip install x==1`, `uvx
-#      x==1`): that pin is read by no Dependabot entry, and stayed on its
+#      (or `>=`, `~=`, `<`, `uvx name@1`) of its own (`pipx run --spec zizmor==1.30.0`,
+#      `pip install x==1`, `uvx x==1`): that pin is read by no Dependabot entry, and stayed on its
 #      version until somebody remembered (celeris#890 item 93). The same line
 #      rules as check 3 apply. (b) Every directory under .github/ that holds a
 #      requirements*.txt has a `package-ecosystem: pip` entry in dependabot.yml
@@ -127,9 +127,15 @@ import glob, os, re, sys
 root = sys.argv[1]
 pats = ['.github/workflows/*.yml', '.github/workflows/*.yaml',
         '.github/actions/**/*.yml', '.github/actions/**/*.yaml']
-# A Python tool's installer or runner, then (flags) name==version. pip's -r
-# FILE form has no ==, so reading the pins from the file is not flagged.
-pat = re.compile(r'(?:\bpipx\s+(?:run|install)\b|\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\s+install\b|\buvx\b|\buv\s+tool\s+(?:run|install)\b).*?[A-Za-z0-9_.-]+(?:\[[^]]*\])?==\S')
+# A Python tool's installer or runner, then (flags) name==version or another
+# specifier with a version (>=1.30,<1.31), or uv's name@version. pip's -r FILE
+# form has none of them, so reading the pins from the file is not flagged.
+installer = r'(?:\bpipx\s+(?:run|install)\b|\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\s+install\b|\buvx\b|\buv\s+tool\s+(?:run|install)\b)'
+# name==version, and the other specifiers of PEP 440 (~=, >=, <=, !=, <, >) with a version.
+spec = r'[A-Za-z0-9_.-]+(?:\[[^]]*\])?(?:==|~=|>=|<=|!=|<|>)\s*[0-9]'
+# uv's own pin, name@version, after uvx or uv tool (a path or a mail address has no digit or v after the @).
+at = r'\b(?:uvx|uv\s+tool\s+(?:run|install))\b.*?\s[A-Za-z0-9_.-]+@v?[0-9]'
+pat = re.compile(installer + r'.*?' + spec + '|' + at)
 files = sorted({f for p in pats for f in glob.glob(os.path.join(root, p), recursive=True)})
 for f in files:
     lines = open(f).read().splitlines()

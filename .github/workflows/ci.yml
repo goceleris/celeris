@@ -2351,7 +2351,9 @@ jobs:
           if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
           exit "$bad"
 
-  # NOT a required check (see the note above `iouring`). celeris#890 item 87:
+  # NOT a required check for merging (see the note above `iouring`), but a gate of
+  # releases: release.yml calls this workflow and tag-submodules needs its result to
+  # be success, so a red run of this job blocks the tag. celeris#890 item 87:
   # nothing ran the io_uring base tier. CELERIS_MAX_IOURING_TIER=base caps the
   # probe's tier at "base" (no provided buffer ring, single-shot accept, no
   # multishot recv), the tier a kernel without those features gets and the one
@@ -2425,7 +2427,8 @@ jobs:
           echo "root and test/server at the base tier took $((SECONDS - start)) s"
           .github/scripts/base-tier-tally.sh root /tmp/base-root.log
 
-  # NOT a required check. celeris#890 item 92: the large-response tests of
+  # NOT a required check for merging, but a gate of releases (release.yml calls this
+  # workflow and tag-submodules needs its result to be success). celeris#890 item 92: the large-response tests of
   # ./test/server (celeris#761, #817, #836) have a lean shape and a full-size
   # one. lean761() (large_response_linux_test.go) is true under -race and
   # under coverage, which are the only ways the other jobs run ./test/server,
@@ -2466,6 +2469,18 @@ jobs:
             TestH2CUnmatchedThroughTimeoutSingleflight836
           )
           regex=$(IFS='|'; echo "${tests[*]}")
+          # Discovery: a Test function of ./test/server that reads lean761(), raceOn761, n836() or
+          # dur836() runs a lean shape everywhere else, so it must be in the list above or its
+          # full-size shape runs nowhere (the failure this job exists for). A helper that is not a
+          # Test function and reads them is not seen: its callers are not found this way.
+          used=$(awk 'FNR == 1 { fn = "" } /^func / { fn = $2; sub(/\(.*/, "", fn) } /lean761\(\)|raceOn761|n836\(|dur836\(/ && fn ~ /^Test/ { print fn }' test/server/*_test.go | sort -u)
+          listed=$(printf '%s\n' "${tests[@]}" | sort -u)
+          if [ "$used" != "$listed" ]; then
+            echo "tests of ./test/server that read the lean-shape helpers (left) against the list of this step (right):"
+            diff <(echo "$used") <(echo "$listed") || true
+            echo "add the test to the list (or take it out when it no longer reads a helper)"
+            exit 1
+          fi
           go test -c -o /tmp/server.test ./test/server
           python3 - /tmp/server.test "^(${regex})\$" <<'PY' 2>&1 | tee /tmp/large.log
           import resource, subprocess, sys, time

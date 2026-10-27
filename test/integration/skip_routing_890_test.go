@@ -25,7 +25,7 @@ import (
 // honest is this guard, the counterpart of internal/adaptive's
 // TestAdaptiveSkipRouting684.
 //
-// It parses every adaptive_*_test.go file of the package and lists each t.Skip,
+// It parses every adaptive_*_test.go file of the package, and helpers_test.go, and lists each t.Skip,
 // t.Skipf and t.SkipNow call that is none of:
 //
 //   - inside a gate helper (gateHelpers890);
@@ -49,9 +49,9 @@ var gateHelpers890 = map[string]bool{
 // message and why they stay. The count is exact: a further site with a
 // registered message fails the guard as a stale entry would.
 //
-// All ten are in adaptive_hybrid_test.go. #890 item 95 leaves the adaptive
+// Ten are in adaptive_hybrid_test.go and three in helpers_test.go (startEngine). #890 item 95 leaves the adaptive
 // skips of this package to the lane that owns that file; the table is the count
-// of what is left (the guard listed these ten and one more, in
+// of what is left (the guard listed these ten, startEngine's three and one more, in
 // adaptive_standby_886_linux_test.go, which now goes through the gate), and a
 // new one cannot join them unseen.
 type unrouted890Entry struct {
@@ -70,6 +70,9 @@ var unrouted890 = map[string]unrouted890Entry{
 	"adaptive_hybrid_test.go|engine Listen returned nil without addr": {1, startFail890},
 	"adaptive_hybrid_test.go|engine did not start in time":            {1, startFail890},
 	"adaptive_hybrid_test.go|engine not functional: %v":               {1, startFail890},
+	// startEngine, which the adaptive tests and the epoll arms of the slowloris and pipeline tests share.
+	"helpers_test.go|engine failed to start: %v":           {2, startFail890},
+	"helpers_test.go|engine not functional (skipping): %v": {1, startFail890},
 }
 
 // rawSkipViolations890 lists the t.Skip* calls of one Go source that the rules
@@ -94,7 +97,11 @@ func rawSkipViolations890(name string, src []byte) ([]string, error) {
 			case *ast.FuncDecl:
 				if x != n {
 					if x.Body != nil { // a bodyless declaration holds no call
-						walk(x.Body, x.Name.Name, short)
+						name := x.Name.Name
+						if x.Recv != nil { // a method of that name is not the gate function
+							name = "(method)" + name
+						}
+						walk(x.Body, name, short)
 					}
 					return false
 				}
@@ -196,13 +203,16 @@ func TestAdaptiveSkipRoutingIntegration890(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// helpers_test.go: startEngine skips when Listen fails, and the adaptive tests call it
+	// (review r1 of #1124, m3).
+	files = append(files, "helpers_test.go")
 	// A glob that finds nothing, or not the files this guard exists for, passes
 	// vacuously.
 	have := map[string]bool{}
 	for _, f := range files {
 		have[f] = true
 	}
-	for _, must := range []string{"adaptive_standby_guard_886_linux_test.go", "adaptive_hybrid_test.go", "adaptive_standby_886_linux_test.go"} {
+	for _, must := range []string{"adaptive_standby_guard_886_linux_test.go", "adaptive_hybrid_test.go", "adaptive_standby_886_linux_test.go", "helpers_test.go"} {
 		if !have[must] {
 			t.Fatalf("the guard did not see %s among %d adaptive test files: it would pass without checking it", must, len(files))
 		}
@@ -234,7 +244,7 @@ func TestAdaptiveSkipRoutingIntegration890(t *testing.T) {
 			return true
 		})
 	}
-	t.Logf("%d adaptive test files, %d raw skips not admitted, %d registered in unrouted890", len(files), len(bad), len(unrouted890))
+	t.Logf("%d scanned test files, %d raw skips not admitted, %d registered in unrouted890", len(files), len(bad), len(unrouted890))
 	if len(bad) > 0 {
 		t.Errorf("t.Skip calls that bypass skipOrFailUpswitch890 (adaptive_standby_guard_886_linux_test.go) and are not registered in unrouted890:\n  %s",
 			strings.Join(bad, "\n  "))
@@ -274,6 +284,7 @@ func TestAdaptiveSkipRoutingGuardSelfTest890(t *testing.T) {
 		{"a Skip method value fails", head + `func TestX(t *testing.T) { s := t.Skip; s("io_uring unavailable") }`, 1},
 		{"a SkipNow method value passed as an argument fails", head + `func TestX(t *testing.T) { run(t.SkipNow) }`, 1},
 		{"a Skip method value under a -short gate passes", head + `func TestX(t *testing.T) { if testing.Short() { s := t.Skip; s("integration") } }`, 0},
+		{"a method named like the gate is not the gate", head + `func (s *S) skipOrFailUpswitch890(t *testing.T, m string) { t.Skip(m) }`, 1},
 		{"a bodyless function declaration is not a violation or a panic", head + `func foo()`, 0},
 		{"input that does not parse is an error, not a pass", head + `func TestX(t *testing.T) { t.Skip(`, -1},
 		{"empty input is an error, not a pass", ``, -1},

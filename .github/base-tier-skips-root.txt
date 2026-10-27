@@ -12,7 +12,7 @@ min-pass 100
 # same tests run. A new test of this kind joins them without an edit here, because the
 # entry names the arms, not the tests (run 40419578127 met nine new ones that a merge
 # with main brought in: the TestH1Unclosed...889 family); the arm must have logged the
-# probe's own skip message ("io_uring tier=base kernel=...") under its RUN line, so an
+# probe's own skip message ("io_uring tier=base kernel=...") while it was the current test, so an
 # arm that starts an engine and skips for another reason still fails the step.
 pattern:^.+/(io_uring|adaptive|adaptive-iouring)$ the io_uring, adaptive and adaptive-iouring arms of probe-gated tests
 

@@ -187,9 +187,13 @@
 # (https://codspeed.io/docs/integrations/ci/github-actions) says that pushes to
 # the default branch record the baseline and names workflow_dispatch for
 # backtests; it does not mention `schedule`. Look at the first scheduled run in
-# the CodSpeed dashboard; if it is not recorded as the main baseline, put
-# `push: branches: [main]` (with the paths below) back beside the schedule, or
-# have the schedule dispatch this workflow.
+# the CodSpeed dashboard (not before the quota resets on 2026-10-31; until then
+# no run gets a runner); if it is not recorded as the main baseline, either
+# bring `push: branches: [main]` (with the paths below) back beside the schedule,
+# or keep the cron but have it start `gh workflow run codspeed.yml --ref main`
+# (a `workflow_dispatch` run, which CodSpeed documents), for example from a small
+# hosted workflow with `actions: write`. Either way a pull request then compares
+# with a main run of the day, not with an older report.
 #
 # The trigger paths below are the non-test code of every package the
 # benchmark set executes (measured: the set run once with -coverpkg over the
@@ -280,7 +284,9 @@ jobs:
     name: Benchmarks (arm64 macro runner)
     # A pull request runs only with the `performance` label, and the label's
     # own event (celeris#890 item 7): the run that adding another label starts
-    # skips the job. Fork pull requests are skipped as this file is written
+    # skips the job, and so does a label added to a closed or merged pull request
+    # (a release-notes clean-up after the merge must not spend the quota). Fork pull
+    # requests are skipped as this file is written
     # (the approval policy in the header is what holds against a fork that
     # edits it), and so are drafts, which wait until they are marked ready
     # (ready_for_review above), to save minutes. Every other event (the
@@ -288,6 +294,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.state == 'open' &&
       !github.event.pull_request.draft &&
       contains(github.event.pull_request.labels.*.name, 'performance') &&
       (github.event.action != 'labeled' || github.event.label.name == 'performance'))
