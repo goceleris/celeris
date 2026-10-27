@@ -199,11 +199,35 @@ func TestHijackedDescriptorIsNotReadAfterHandoff936(t *testing.T) {
 			h := newReread936Handler(false)
 			_, addr, stop := startInlineHijackEngine(t, 2, h)
 
-			var armed atomic.Bool
+			// The hook is for the hand-off of the /hj request: the first one when
+			// that request promotes the conn, the second when a /async request
+			// promoted it before. Counted, not gated on the client having seen
+			// the /async response: the loop thread calls the hook after the
+			// hand-off, the dispatch goroutine answers meanwhile, and a loop
+			// thread that was not run for a while (a loaded machine, -race,
+			// -cover) calls the /async hand-off's hook after the client has the
+			// response, which a flag set on the response took for the /hj hand-off:
+			// the hook then waited 5 s for a Hijack that the parked loop thread
+			// never read the request for ("the handler never returned from
+			// Hijack", 5 of 600 runs on six CPU hogs; celeris#1104).
+			var handoffs atomic.Int32
+			want := int32(1)
+			if tc.promote {
+				want = 2
+			}
+			asyncAnswered := make(chan struct{}) // closed once the client has the /async response
 			done := make(chan outcome936, 1)
-			var fired atomic.Bool
 			hook := func(fd int, cs *connState) {
-				if !armed.Load() || !fired.CompareAndSwap(false, true) {
+				n := handoffs.Add(1)
+				if tc.promote && n == 1 {
+					// That late call, on every run: the loop thread is held
+					// here until the client has the /async response.
+					select {
+					case <-asyncAnswered:
+					case <-time.After(5 * time.Second):
+					}
+				}
+				if n != want { // the count is the one-shot: n == want holds for one call
 					return
 				}
 				o := outcome936{fd: fd, ask: -1, peer: -1, worker: -1}
@@ -239,8 +263,8 @@ func TestHijackedDescriptorIsNotReadAfterHandoff936(t *testing.T) {
 				}
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
+				close(asyncAnswered)
 			}
-			armed.Store(true)
 			if _, err := io.WriteString(c, "GET /hj HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 				t.Fatal(err)
 			}

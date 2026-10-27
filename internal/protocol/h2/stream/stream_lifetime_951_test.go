@@ -408,7 +408,26 @@ func TestRetiredStreamsGoToThePoolAtClose951(t *testing.T) {
 // them in the other nesting (the manager's, then each stream's): many pool
 // handlers retiring streams that hold buffered bytes, the loop draining, and
 // OutboundPending and StreamCount polling, then Close. It must finish.
+//
+// What it catches and what it does not: a self-deadlock anywhere in those paths
+// and a real inversion, a stream's lock taken before the manager's while
+// OutboundPending is polled (handOffBuffered does the first part of that for
+// the streams that stay in the map). It does NOT catch an inversion inside
+// retire: the streams retire sees here were taken out of the map by resetStream
+// first, so OutboundPending cannot meet them, and Close runs after the pollers
+// have stopped, so it does not overlap them either.
+//
+// Two things keep a loaded machine from failing it with no deadlock in sight
+// (celeris#1104): the two pollers yield after each pass, and "finish" is judged
+// by progress, not by a total time. The pollers used to spin on the manager's
+// lock with no yield, which starved the 8 workers on two CPUs: 10 to 25 s under
+// -race, and more than the fixed 60 s the test allowed with six CPU hogs beside
+// it (6 of 6 runs). They still take the locks all the time. A deadlock is no
+// stream finishing for stallLimit; a livelock that is merely very slow is not
+// flagged by that, and the go test timeout is its backstop.
 func TestRetireDrainCloseDoNotDeadlock951(t *testing.T) {
+	const stallLimit = 30 * time.Second
+	var handled atomic.Int64 // streams whose handler has run to its end
 	p := NewProcessor(HandlerFunc(func(_ context.Context, s *Stream) error {
 		s.SetHeadersSent()
 		s.BufferOutbound(make([]byte, 64), true)
@@ -428,6 +447,7 @@ func TestRetireDrainCloseDoNotDeadlock951(t *testing.T) {
 				return
 			default:
 				p.FlushInlineCleanup()
+				runtime.Gosched()
 			}
 		}
 	}()
@@ -440,6 +460,7 @@ func TestRetireDrainCloseDoNotDeadlock951(t *testing.T) {
 			default:
 				_ = p.OutboundPending()
 				_ = m.StreamCount()
+				runtime.Gosched()
 			}
 		}
 	}()
@@ -464,16 +485,28 @@ func TestRetireDrainCloseDoNotDeadlock951(t *testing.T) {
 					go m.resetStream(id)
 				}
 				p.executeHandler(s)
+				handled.Add(1)
 			}
 		}()
 	}
 	finished := make(chan struct{})
 	go func() { wg.Wait(); close(stop); bg.Wait(); m.Close(); close(finished) }()
-	select {
-	case <-finished:
-	case <-time.After(60 * time.Second):
-		buf := make([]byte, 1<<20)
-		t.Fatalf("deadlock: the pool handlers, the loop's drain, OutboundPending and Close did not finish in 60s\n%s", buf[:runtime.Stack(buf, true)])
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	last, lastAt := handled.Load(), time.Now()
+wait:
+	for {
+		select {
+		case <-finished:
+			break wait
+		case <-tick.C:
+			if n := handled.Load(); n != last {
+				last, lastAt = n, time.Now()
+			} else if time.Since(lastAt) > stallLimit {
+				buf := make([]byte, 1<<20)
+				t.Fatalf("deadlock: the pool handlers, the loop's drain, OutboundPending and Close made no progress for %v (%d of %d streams handled)\n%s", stallLimit, last, workers*per, buf[:runtime.Stack(buf, true)])
+			}
+		}
 	}
 	if got := m.OutboundHeld(); got != 0 {
 		t.Fatalf("every stream is released and the connection closed, and %d bytes are still charged to its outbound budget", got)

@@ -1,9 +1,12 @@
 package sse
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"unsafe"
 )
 
 // ErrClientClosed is returned when Send is called on a closed Client.
@@ -54,6 +57,47 @@ func ownEvent(e Event) Event {
 	e.ID, s = s[:len(e.ID)], s[len(e.ID):]
 	e.Event, e.Data = s[:len(e.Event)], s[len(e.Event):]
 	return e
+}
+
+// ownedCtx is the context the drain gives a ReplayStore other than the bare
+// ring in place of the client's own: the same context, plus the ownedSlot of the
+// event being appended (celeris#888 item 24). sendQueued copied the event's
+// strings (ownEvent) before it queued it, so the ring can keep them as they are,
+// also when another store wraps it and forwards the event with the context it was
+// given: the ring tells the context by its type and keeps the event only if its
+// strings are those very strings, by address and length. An event a decorator
+// changed, one that never went through the queue, and a call made with another
+// context (a decorator that derives its own) do not match: the ring copies, so
+// nothing a caller can still change is kept. A type assertion, not
+// Context.Value, so that Append on the blocking path pays nothing it can see.
+type ownedCtx struct {
+	context.Context
+	ownedSlot
+}
+
+// ownedSlot records the strings of the event the drain is handing to the store.
+// The drain is the only writer; the ring may read from any goroutine, hence the
+// atomics. The slot holds the strings it names alive, and a stale slot names an
+// event that really is owned, so a late Append of that event is still right.
+type ownedSlot struct {
+	event, data       atomic.Pointer[byte]
+	eventLen, dataLen atomic.Int64
+}
+
+func (s *ownedSlot) set(e *Event) {
+	s.event.Store(unsafe.StringData(e.Event))
+	s.eventLen.Store(int64(len(e.Event)))
+	s.data.Store(unsafe.StringData(e.Data))
+	s.dataLen.Store(int64(len(e.Data)))
+}
+
+func sameString(p *atomic.Pointer[byte], n *atomic.Int64, s string) bool {
+	return int64(len(s)) == n.Load() && (len(s) == 0 || p.Load() == unsafe.StringData(s))
+}
+
+// owns reports that e's Event and Data are the strings the drain named.
+func (oc *ownedCtx) owns(e *Event) bool {
+	return sameString(&oc.event, &oc.eventLen, e.Event) && sameString(&oc.data, &oc.dataLen, e.Data)
 }
 
 // FormatEvent formats an SSE event into buf, reusing its capacity.

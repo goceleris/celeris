@@ -5,11 +5,15 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -45,6 +49,102 @@ func storeFill(ctx context.Context, kv store.KV, key string, enc []byte, ttl tim
 		return ms.setIfNewer(ctx, key, enc, ttl, gen)
 	}
 	return kv.Set(ctx, key, enc, ttl)
+}
+
+// fill is storeFill with Config.SetTimeout's bound, and reports abandoned: the
+// Set did not return within bound and the call went on without it, so enc is
+// still in use by a Set that is still running (see boundedSet). The two
+// in-process stores, *MemoryStore and *store.MemoryKV (the exact types: a type
+// that embeds one may override Set), only take a shard lock and cannot hang:
+// they are not bounded, and pay nothing for the bound (a goroutine, a timer and
+// a channel per Set cost 1.5 us and 11 allocations on a store whose Set takes
+// nothing, against 0.8 us for the whole miss). A negative bound waits for the
+// Set, as storeFill does.
+func fill(ctx context.Context, kv store.KV, key string, enc []byte, ttl time.Duration, gen uint64, bound time.Duration) (abandoned bool) {
+	if bound < 0 {
+		_ = storeFill(ctx, kv, key, enc, ttl, gen)
+		return false
+	}
+	switch kv.(type) {
+	case *MemoryStore, *store.MemoryKV:
+		_ = storeFill(ctx, kv, key, enc, ttl, gen)
+		return false
+	}
+	return boundedSet(ctx, kv, key, enc, ttl, bound)
+}
+
+// Where a bounded Set's result goes: the waiter takes it (delivered), or the
+// waiter gave up first (abandoned) and the Set's goroutine is on its own.
+const (
+	setWaiting int32 = iota
+	setDelivered
+	setAbandoned
+)
+
+// setResult is how a bounded Set ended: it returned, or it panicked.
+type setResult struct {
+	panicked bool
+	value    any
+}
+
+// boundedSet runs kv.Set for at most bound and reports whether it gave up
+// waiting. A Set that never returns (a remote store whose connection hung)
+// would otherwise hold the leader of a coalesced fill, and, on epoll and
+// io_uring, the event loop a sync leader runs on, for as long as the store
+// likes: the request context of a native HTTP/1 request never ends (celeris#888
+// item 30). Set runs on a goroutine of its own, so the wait is bounded whether
+// or not the store honours the context it is given, which carries the same
+// deadline.
+//
+// A Set that is given up on is not stopped when the store ignores its context:
+// its goroutine, and the bytes and key it holds, live until it returns, and it
+// may still write then, after a newer fill has (the entry that remains is the
+// one the store applied last, as for two overlapping fills; see Config.Store).
+// The key is copied, as it can be a view of the request that ends before the
+// Set does; the caller must not reuse enc for the same reason. A panic in Set
+// is raised again on the caller's goroutine, as when Set ran there; a panic in
+// a Set that was given up on has no request to reach, and is logged at Error
+// level through slog.Default (the server's Config.Logger when it sets none of
+// its own) with the store's type, the value and the stack.
+func boundedSet(ctx context.Context, kv store.KV, key string, enc []byte, ttl, bound time.Duration) (abandoned bool) {
+	key = strings.Clone(key)
+	sctx, cancel := context.WithTimeout(ctx, bound)
+	done := make(chan setResult, 1)
+	var state atomic.Int32
+	go func() {
+		var res setResult
+		var stack []byte
+		defer func() {
+			if r := recover(); r != nil {
+				res = setResult{panicked: true, value: r}
+				stack = debug.Stack()
+			}
+			if state.CompareAndSwap(setWaiting, setDelivered) {
+				done <- res
+			} else if res.panicked {
+				slog.Error("cache: Store.Set panicked after Config.SetTimeout; the request had been answered without it",
+					"store", fmt.Sprintf("%T", kv), "panic", res.value, "stack", string(stack))
+			}
+			cancel()
+		}()
+		_ = kv.Set(sctx, key, enc, ttl)
+	}()
+	var res setResult
+	select {
+	case res = <-done:
+	case <-sctx.Done():
+		// The deadline, or the request's own context ending, may be seen
+		// together with the Set's return: if the goroutine has already
+		// delivered, take its result.
+		if state.CompareAndSwap(setWaiting, setAbandoned) {
+			return true
+		}
+		res = <-done
+	}
+	if res.panicked {
+		panic(res.value)
+	}
+	return false
 }
 
 // ErrNotSupported is returned by [InvalidatePrefix] when the given
@@ -149,7 +249,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			return enc, effectiveTTL, chainErr
 		}, func(enc []byte, _ error) {
 			if enc != nil {
-				_ = storeFill(ctx, cfg.Store, key, enc, ttl, gen)
+				fill(ctx, cfg.Store, key, enc, ttl, gen, cfg.SetTimeout)
 			}
 		})
 		if leader {
@@ -191,20 +291,25 @@ func New(config ...Config) celeris.HandlerFunc {
 // Borrows the encode buffer from cacheBufPool — Store.Set copies its
 // input internally (MemoryKV.Set reuses the existing backing array per
 // R66; redis/memcached adapters write through the wire), so the pooled
-// buffer is safe to recycle the moment Set returns.
+// buffer is safe to recycle the moment Set returns. Not when the Set was
+// given up on (Config.SetTimeout): it is still running, and keeps the buffer.
 func executeAndStore(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, key string) error {
 	bufPtr := cacheBufPool.Get().(*[]byte)
 	gen := genNow()
 	encoded, ttl, chainErr := capture(c, cfg, include, exclude, (*bufPtr)[:0])
+	abandoned := false
 	if encoded != nil {
-		_ = storeFill(c.Context(), cfg.Store, key, encoded, ttl, gen)
+		abandoned = fill(c.Context(), cfg.Store, key, encoded, ttl, gen, cfg.SetTimeout)
 	}
-	if cap(encoded) <= cacheBufMaxPooled {
-		*bufPtr = encoded
-	} else {
-		*bufPtr = (*bufPtr)[:0]
+	// A Set that was given up on still reads the buffer: it is not recycled.
+	if !abandoned {
+		if cap(encoded) <= cacheBufMaxPooled {
+			*bufPtr = encoded
+		} else {
+			*bufPtr = (*bufPtr)[:0]
+		}
+		cacheBufPool.Put(bufPtr)
 	}
-	cacheBufPool.Put(bufPtr)
 	return writeMiss(c, cfg, chainErr)
 }
 

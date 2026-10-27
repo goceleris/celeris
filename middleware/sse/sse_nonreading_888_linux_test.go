@@ -46,6 +46,9 @@ type nonReadCell888 struct {
 	name   string
 	engine celeris.EngineType
 	async  bool
+	// routeAsync marks /events .Async(): on HTTP/2 the stream then runs on the
+	// worker pool (the cells of sse_nonreading_h2c_884_linux_test.go).
+	routeAsync bool
 }
 
 func nonReadCells888(t *testing.T) []nonReadCell888 {
@@ -57,15 +60,15 @@ func nonReadCells888(t *testing.T) []nonReadCell888 {
 			hasURing = true
 		}
 		cells = append(cells,
-			nonReadCell888{kind.String() + "/async", kind, true},
-			nonReadCell888{kind.String() + "/sync", kind, false},
+			nonReadCell888{kind.String() + "/async", kind, true, false},
+			nonReadCell888{kind.String() + "/sync", kind, false, false},
 		)
 	}
 	if hasURing {
-		cells = append(cells, nonReadCell888{"adaptive/async", celeris.Adaptive, true})
+		cells = append(cells, nonReadCell888{"adaptive/async", celeris.Adaptive, true, false})
 	}
 	// std is the control: its writes are bounded by WriteTimeout one at a time.
-	return append(cells, nonReadCell888{"std/async", celeris.Std, true})
+	return append(cells, nonReadCell888{"std/async", celeris.Std, true, false})
 }
 
 // producer888 shapes what the handler sends: one event of burstBytes at once,
@@ -217,7 +220,7 @@ func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, d
 	if p.noHeaderTimer {
 		cfg.ReadHeaderTimeout = -1
 	}
-	addr, shutdown = startSSEServerCfg(tb, cfg, false, handler)
+	addr, shutdown = startSSEServerCfg(tb, cfg, cell.routeAsync, handler)
 	return addr, done, shutdown
 }
 

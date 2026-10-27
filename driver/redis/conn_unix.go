@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/engine"
 )
 
@@ -92,7 +93,7 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 	c.pollBeforeRearmFn = c.pollBeforeRearm
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
+	if err := eventloop.RegisterConnWait(ctx, loop, fd, c.onRecvFn, c.onCloseFn); err != nil {
 		// Close via file.Close() to disarm the *os.File finalizer; a plain
 		// syscall.Close(fd) would leak the finalizer and risk a double
 		// close on a reassigned fd when GC later runs it.

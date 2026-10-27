@@ -184,6 +184,7 @@ type connState struct {
 	fixedFile      bool         // 1: true when fd is fixed file index
 	recvLinked     bool         // 1: RECV was linked to SEND (skip standalone prepareRecv)
 	needsRecv      bool         // 1: recv arm was dropped (SQ ring full); retry on next opportunity
+	gateRead       bool         // 1: the shutdown gate's first pass found a request in the kernel's receive queue (holdUnreadAtGate, celeris#1104): gateReadsOn lets it be read
 	recvIntoBody   bool         // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
 	zcNotifPending bool         // 1: waiting for SEND_ZC notification CQE
 	h2GoAwaySent   bool         // 1: a graceful shutdown sent this H2 conn its GOAWAY (celeris#759)
@@ -698,6 +699,7 @@ func releaseConnState(cs *connState) {
 	cs.fixedFile = false
 	cs.recvLinked = false
 	cs.needsRecv = false
+	cs.gateRead = false
 	cs.recvIntoBody = false
 	cs.zcNotifPending = false
 	cs.h2GoAwaySent = false
