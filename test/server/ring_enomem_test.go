@@ -38,8 +38,8 @@ func isRingENOMEM(err error) bool {
 }
 
 // isAddrInUse reports a Start error that is the bind race of a starter that
-// picks a free port, closes it and has Start bind it: another test of the
-// process was given the port in between.
+// has Start bind a port it picked and closed (the start-shutdown rig's plain
+// Start arm): another test of the process was given the port in between.
 func isAddrInUse(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "address already in use")
 }
@@ -138,14 +138,15 @@ func TestRetryRingENOMEM1104(t *testing.T) {
 	}
 }
 
-// A starter that picks a free port, closes it and has Start bind it can lose
-// the race: another test of the process, running in parallel, is given the port
-// in between (a client socket of its own takes ephemeral ports from the same
-// range). The SSE 855 starter retried any error for three seconds before the
-// ENOMEM change narrowed it, and TestStalledSSEEndsWithShutdown855/std/h2c/budget
-// failed once in CI with "startErr=listen tcp 127.0.0.1:38797: bind: address
-// already in use". The starters that pick a fresh port per try retry that class
-// too, a bounded number of times: a port that stays taken is a real conflict.
+// A start whose port is taken before it binds fails with "address already in
+// use": the start-shutdown rig's plain-Start arm picks a free port, closes it
+// and has Start bind it, and two parallel test cells of one process can pick the
+// same port (celeris#1104: TestStalledSSEEndsWithShutdown855/std/h2c/budget
+// failed once with "startErr=listen: ... bind: address already in use"). The
+// starters that can hand the server its listener do (startPicked1104); where
+// Start must bind itself, the error reaches this retry (waitReadyErr refuses
+// another server's /ping answer), which takes a fresh port, up to
+// maxAddrInUseTries times: a port that stays taken is a real conflict.
 func TestRetryStartRetriesAnAddressInUse1104(t *testing.T) {
 	inUse := errors.New("server did not start: listen tcp 127.0.0.1:38797: bind: address already in use")
 

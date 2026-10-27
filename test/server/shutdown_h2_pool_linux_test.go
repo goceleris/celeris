@@ -1282,18 +1282,21 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			// of the baseline taken before the first dial, every conn this test
 			// opened (24 HTTP/2, the keep-alive ones, the silent ones, the download,
 			// the upload on the sync arm, the promoted conn on the async arm) and
-			// every request it sent whole (24 HTTP/2 GETs, one ping per keep-alive
-			// conn, the download's GET, the promoted conn's ping). The conn count
-			// is exact (+34 in every run). The request count runs at or one above the
-			// arithmetic (+32 against 31 on the sync arm, +32 or +33 against
-			// 32 on the async one, as counted at the instant the wait returns) and the source of that unit is not pinned down;
-			// it is waited for as a lower bound. The upload's request is not whole
-			// until its body is, so it is not counted: its headers and first 64 KiB
-			// may still be unread when the shutdown begins.
+			// every request it sent (24 HTTP/2 GETs, one ping per keep-alive conn,
+			// the download's GET, and on the sync arm the upload, which the loop
+			// counts once it has read its headers and first 64 KiB, or on the
+			// async arm the promoted conn's ping). The conn count is exact: +34 in
+			// every run. The request count is a lower bound: measured, it ends at
+			// the arithmetic or one above it (sync +32 or +33 against 32, async
+			// +32 or +33 against 32), and the extra unit is already there after the
+			// keep-alive step, before the download and the upload are sent, so it is
+			// neither of them; its source was not found, which is why this wait is
+			// `>=` for requests and exact for conns.
 			wantConns := uint64(24 + len(idle) + len(silent) + 1) // + the download
-			wantReqs := uint64(24 + len(idle) + 1)
+			wantReqs := uint64(24 + len(idle) + 1)                // + the download's GET
 			if arm == "sync" {
 				wantConns++ // the upload
+				wantReqs++  // the upload's request, counted when its first bytes are read
 			}
 			if promoted != nil {
 				wantConns++
