@@ -7,6 +7,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/iouring"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 // An io_uring engine's start can fail with "cannot allocate memory" at ring
@@ -111,5 +115,25 @@ func startRetryingRingENOMEM(t testing.TB, what string, attempt func() error) {
 	}
 	if tries > 1 {
 		t.Logf("%s: retried on ring ENOMEM: %d tries", what, tries)
+	}
+}
+
+// A host or environment where the engine refuses io_uring (a tier capped to
+// none, a kernel before 5.19) answers "io_uring not available on this system"
+// at once and for good; retrying it for the whole window turns a skip into 30 s
+// of waiting. Here the refusal is forced with CELERIS_MAX_IOURING_TIER=none,
+// where a 4-entry ring still works: only the engine says no.
+func TestRetryDoesNotWaitWhenTheEngineRefusesIOUring1104(t *testing.T) {
+	t.Setenv("CELERIS_MAX_IOURING_TIER", "none")
+	start := time.Now()
+	tries, err := retryRingENOMEM(func() error {
+		_, err := iouring.New(resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1, Resources: resource.Resources{Workers: 2}}, &echoHandler{})
+		return err
+	}, 3*time.Second)
+	if err == nil {
+		t.Skip("the engine accepted io_uring with the tier capped to none")
+	}
+	if tries != 1 || time.Since(start) > time.Second {
+		t.Errorf("a refusal of io_uring was retried: %d tries over %v (%v); want 1 try at once", tries, time.Since(start).Round(time.Millisecond), err)
 	}
 }
