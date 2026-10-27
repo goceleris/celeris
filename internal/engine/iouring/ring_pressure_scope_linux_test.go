@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -72,5 +73,48 @@ func TestIsRingStartPressure1104(t *testing.T) {
 	}
 	if isRingStartPressure(nil) {
 		t.Error("isRingStartPressure(nil) = true")
+	}
+}
+
+// TestEngineMayUseIOUringAgreesWithTheEngine1104 ties engineMayUseIOUring to
+// the decision the engine itself takes. The helper cannot call the engine's
+// parser (probe.parseTierName is unexported) or probe.Probe (it builds a ring,
+// which a memlock shortage makes fail, the very case the helper must not be
+// fooled by), so it re-states the cap rule: CELERIS_MAX_IOURING_TIER reads
+// optional, high and base as those tiers and every other non-empty value,
+// case-sensitively, as none. This test runs both on a host where probe.Probe
+// works, for the values that matter, and fails if they ever disagree (the rule
+// changed in probe, or a new alias was added). The kernel-before-5.19 branch of
+// the helper cannot be exercised here (the host's kernel is what it is); it
+// mirrors the engine's requirement (engine.go, requireAsyncCancelFlags) and is
+// covered by the table test above with the host stood in. A copy of this helper
+// and this test is in test/integration; keep the two in step.
+func TestEngineMayUseIOUringAgreesWithTheEngine1104(t *testing.T) {
+	t.Setenv("CELERIS_MAX_IOURING_TIER", "")
+	if _, small := memlockBelowRingBudgetFloor(); small {
+		t.Skip("RLIMIT_MEMLOCK is below the ring budget floor: probe.Probe cannot be trusted here")
+	}
+	if !probe.Probe().IOUringTier.Available() {
+		t.Skip("probe.Probe finds no io_uring tier here: nothing to compare the helper with")
+	}
+	if !engineMayUseIOUring() {
+		t.Skip("the kernel is before 5.19: the helper answers false whatever the tier")
+	}
+	for _, v := range []string{"", "none", "NONE", "optional", "high", "base", "Base", "bogus"} {
+		t.Run("tier="+v, func(t *testing.T) {
+			t.Setenv("CELERIS_MAX_IOURING_TIER", v)
+			// probe.Probe builds a ring; under a transient shortage it reads tier none.
+			want := false
+			for i := 0; i < 5 && !want; i++ {
+				want = probe.Probe().IOUringTier.Available()
+				if want {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if got := engineMayUseIOUring(); got != want {
+				t.Errorf("CELERIS_MAX_IOURING_TIER=%q: engineMayUseIOUring() = %v, probe.Probe().IOUringTier.Available() = %v", v, got, want)
+			}
+		})
 	}
 }
