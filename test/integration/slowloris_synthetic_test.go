@@ -77,11 +77,8 @@ func TestSlowlorisSynthetic(t *testing.T) {
 				IdleTimeout:       120 * time.Second,
 				Logger:            nil,
 			}
-			eng, err := tc.newEng(cfg)
-			if err != nil {
-				engineNewFailed890(t, tc.name, err)
-			}
-			startEngine(t, eng)
+			eng := startEngineRetry(t, func() (engine.Engine, error) { return tc.newEng(cfg) },
+				func(err error) { engineNewFailed890(t, tc.name, err) })
 
 			ag, ok := eng.(addrGetter)
 			if !ok {
@@ -216,11 +213,8 @@ func TestSlowlorisSyntheticConcurrent(t *testing.T) {
 				// hangs in the matrix nightly.
 				AsyncHandlers: true,
 			}
-			eng, err := tc.newEng(cfg)
-			if err != nil {
-				engineNewFailed890(t, tc.name, err)
-			}
-			startEngine(t, eng)
+			eng := startEngineRetry(t, func() (engine.Engine, error) { return tc.newEng(cfg) },
+				func(err error) { engineNewFailed890(t, tc.name, err) })
 			addr := eng.(addrGetter).Addr().String()
 			t.Logf("[%s] server listening on %s", tc.name, addr)
 

@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -186,8 +187,12 @@ func TestH2AsyncRouteRunsOnTheWorkerPool951(t *testing.T) {
 		t.Run(eng.name, func(t *testing.T) {
 			var addr string
 			var s *celeris.Server
-			startDone := make(chan error, 1)
-			for tries := 0; ; tries++ {
+			var startDone chan error
+			// An io_uring Start can fail with the ring-setup ENOMEM while earlier
+			// rings are still charged against RLIMIT_MEMLOCK: a fresh server per
+			// try, retried for the window; any other Start error fails at once
+			// instead of after the 10 s readiness poll (celeris#1104).
+			startRetryingRingENOMEM(t, "server start", func() error {
 				ln, err := net.Listen("tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
@@ -197,22 +202,24 @@ func TestH2AsyncRouteRunsOnTheWorkerPool951(t *testing.T) {
 				s = celeris.New(celeris.Config{Addr: addr, Engine: eng.e})
 				s.GET("/async", func(c *celeris.Context) error { return c.String(200, "pool=%v", onPool()) }).Async()
 				s.GET("/sync", func(c *celeris.Context) error { return c.String(200, "pool=%v", onPool()) })
-				go func() { startDone <- s.Start() }()
-				ready := false
+				startDone = make(chan error, 1)
+				go func(s *celeris.Server, d chan error) { d <- s.Start() }(s, startDone)
 				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+					select {
+					case err := <-startDone:
+						return fmt.Errorf("Start returned before the listener was up: %w", err)
+					default:
+					}
 					if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
 						_ = c.Close()
-						ready = true
-						break
+						return nil
 					}
 				}
-				if ready {
-					break
-				}
-				if tries > 3 {
-					t.Fatal("server did not start")
-				}
-			}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = s.Shutdown(ctx)
+				cancel()
+				return errors.New("server did not start listening within 10 s")
+			})
 			defer func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()

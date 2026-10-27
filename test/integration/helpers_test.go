@@ -58,6 +58,57 @@ func freePort(t *testing.T) int {
 
 func startEngine(t *testing.T, e engine.Engine) {
 	t.Helper()
+	stop, err := tryStartEngine(t, e)
+	if err != nil {
+		t.Skipf("engine failed to start: %v", err)
+	}
+	t.Cleanup(stop)
+}
+
+// startEngineRetry builds an engine with mk and starts it, retrying both the
+// build and the Listen for the window when they fail with the ring-setup ENOMEM
+// (an io_uring engine's New reads a probe ring that hit the same ENOMEM as "not
+// available", its Listen the ring setup itself; celeris#1104). Each try builds a
+// fresh engine. A build error that is not a ring ENOMEM, or still is after the
+// window, goes to onNewErr (which skips or fails the test, as the caller's
+// build error did); a Listen error is a skip, as in startEngine.
+func startEngineRetry(t *testing.T, mk func() (engine.Engine, error), onNewErr func(error)) engine.Engine {
+	t.Helper()
+	var (
+		e      engine.Engine
+		stop   func()
+		newErr error
+	)
+	tries, err := retryRingENOMEM(func() error {
+		var err error
+		if e, err = mk(); err != nil {
+			newErr = err
+			return err
+		}
+		newErr = nil
+		stop, err = tryStartEngine(t, e)
+		return err
+	}, ringENOMEMWindow)
+	if tries > 1 {
+		t.Logf("engine start retried on ring ENOMEM: %d tries", tries)
+	}
+	switch {
+	case newErr != nil:
+		onNewErr(newErr)
+		t.FailNow() // onNewErr skips or fails; never continue without an engine
+	case err != nil:
+		t.Skipf("engine failed to start: %v", err)
+	}
+	t.Cleanup(stop)
+	return e
+}
+
+// tryStartEngine runs e.Listen, waits for it to bind and probes /healthz. It
+// returns the engine's stop function, or the error Listen returned, which the
+// caller decides on (startEngine skips on it, startEngineRetry retries a ring
+// ENOMEM). The other outcomes skip or fail the test as startEngine always did.
+func tryStartEngine(t *testing.T, e engine.Engine) (stop func(), listenErr error) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)
 	go func() {
@@ -71,7 +122,7 @@ func startEngine(t *testing.T, e engine.Engine) {
 			case err := <-errCh:
 				cancel()
 				if err != nil {
-					t.Skipf("engine failed to start: %v", err)
+					return nil, err
 				}
 				t.Fatal("engine Listen returned nil without addr")
 			default:
@@ -84,7 +135,7 @@ func startEngine(t *testing.T, e engine.Engine) {
 			select {
 			case err := <-errCh:
 				if err != nil {
-					t.Skipf("engine failed to start: %v", err)
+					return nil, err
 				}
 			case <-time.After(5 * time.Second):
 			}
@@ -107,10 +158,10 @@ func startEngine(t *testing.T, e engine.Engine) {
 		_ = resp.Body.Close()
 	}
 
-	t.Cleanup(func() {
+	return func() {
 		cancel()
 		<-errCh
-	})
+	}, nil
 }
 
 func defaultTestConfig(port int, proto engine.Protocol) resource.Config {
