@@ -17,6 +17,23 @@ var pinThreadToCPU = platform.PinToCPU
 // plan.
 var planWorkerCPUs = platform.PlanWorkerCPUsFor
 
+// detectNUMA reads the host's NUMA topology, for the MaxEvents split in Listen.
+// A variable so a test can stand in a topology.
+var detectNUMA = platform.DetectNUMA
+
+// splitMaxEvents is the MaxEvents a loop gets on a host with topo: the
+// configured figure divided by the number of NUMA nodes, never under 64.
+func splitMaxEvents(maxEvents int, topo platform.NUMATopology, allowed []int) int {
+	_ = allowed
+	if topo.NumNodes > 1 {
+		maxEvents /= topo.NumNodes
+		if maxEvents < 64 {
+			maxEvents = 64
+		}
+	}
+	return maxEvents
+}
+
 // annotateNICIRQs adds the report of the CPUs that service the interrupts of
 // the NIC the listener is reachable through to a plan that is already decided
 // (celeris#1036). It only reports: the loops are the plan's. A variable so a

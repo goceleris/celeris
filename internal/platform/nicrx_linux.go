@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Reading the NICs behind a listener (celeris#1036 item 1). The rx-port rule
@@ -121,6 +122,10 @@ func (osNICFS) exists(name string) bool {
 	_, err := os.Stat(name)
 	return err == nil
 }
+
+// netlinkRIB is the netlink dump osIfaceAddrs reads addresses with. A variable
+// so a test can count the dumps (celeris#885 item 53).
+var netlinkRIB = syscall.NetlinkRIB
 
 // osIfaceAddrs lists the interfaces and their addresses with the net package
 // (one netlink dump per interface; no cgo and no ip binary).

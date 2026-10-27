@@ -150,7 +150,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	resolved := e.cfg.Resources.Resolve()
 
-	topo := platform.DetectNUMA()
+	topo := detectNUMA()
 	// celeris#909: the CPU of loop i is the i-th member of the process's
 	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
 	// the loop count (celeris#1036): on a big.LITTLE host it holds one loop
@@ -159,12 +159,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	cpus := plan.CPUs
 	resolved.Workers = len(cpus)
 
-	if topo.NumNodes > 1 {
-		resolved.MaxEvents = resolved.MaxEvents / topo.NumNodes
-		if resolved.MaxEvents < 64 {
-			resolved.MaxEvents = 64
-		}
-	}
+	resolved.MaxEvents = splitMaxEvents(resolved.MaxEvents, topo, plan.Allowed)
 
 	e.mu.Lock()
 	e.loops = make([]*Loop, resolved.Workers)

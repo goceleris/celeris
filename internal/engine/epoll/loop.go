@@ -2868,6 +2868,9 @@ func (l *Loop) initProtocol(cs *connState) {
 			} else {
 				cs.asyncDetachPending = true
 			}
+			if f := detachPostCountHook.Load(); f != nil {
+				(*f)() // test seam, #889 item 48 (between the snapshot and the rollback)
+			}
 			orig := cs.writeFn
 			guarded := func(data []byte) {
 				mu.Lock()

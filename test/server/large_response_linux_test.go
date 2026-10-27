@@ -15,10 +15,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/conn"
 )
 
 // Tests for celeris#761. On epoll and io_uring the per-connection write
@@ -412,20 +414,30 @@ func TestBackloggedPeerIsClosed(t *testing.T) {
 				}
 				defer func() { _ = raw.Close() }()
 				_ = raw.(*net.TCPConn).SetReadBuffer(64 << 10)
+				refused := watchBacklogRefusal890(t, raw.LocalAddr().String())
 				if _, err := io.WriteString(raw, strings.Repeat("GET /big HTTP/1.1\r\nHost: x\r\n\r\n", requests)); err != nil {
 					t.Fatal(err)
 				}
-				// The server stages what it will before the client reads. Two
-				// conditions are visible from here: the server has read every request
-				// (receive queue empty) and its kernel send queue has stopped growing.
-				// Neither is exact: the stop point is overBacklogH1 (pendingBytes >
-				// maxPendingBytes), which is unexported, and the kernel send queue
-				// plateaus before the engine stops staging, so a short fixed grace
-				// follows (celeris#890 item 22, open question: it needs an engine-side
-				// observable; was a 300 ms sleep).
+				// The server stages what it will before the client reads, and the
+				// native engines then refuse the request that finds the unsent
+				// responses over the 4 MiB cap (maxPendingBytes, maxSendQueueBytes:
+				// unexported). That refusal is the server-side event to wait for
+				// (conn.BacklogRefusedHook, celeris#890 item 22; it was a fixed 100
+				// ms after the kernel send queue had plateaued): once it has fired
+				// the engine closes the connection when what is staged has gone out,
+				// whatever the client does next, so the client may start reading.
+				// std has no cap to refuse at: its handler blocks on the socket.
 				waitServerReadAll761(t, raw, addr)
-				waitServerSendQueued761(raw, addr)
-				time.Sleep(backlogGrace761)
+				if e.eng != celeris.Std {
+					select {
+					case <-refused:
+					case <-time.After(10 * time.Second):
+						t.Fatalf("%s/%s: no request was refused within 10s of the server reading all %d requests: "+
+							"the engine did not apply its back-pressure cap to a client that read nothing, "+
+							"or conn.BacklogRefusedHook is not called where a request is refused",
+							e.name, sh.name, requests)
+					}
+				}
 				br := bufio.NewReaderSize(idleConn761{raw}, 64<<10)
 				whole := 0
 				for whole < requests {
@@ -661,10 +673,33 @@ func hexPort761(field string) int {
 	return int(p)
 }
 
-// backlogGrace761 is the fixed wait that follows the server-side conditions in
-// TestBackloggedPeerIsClosed, for the engine to finish staging after the
-// kernel send queue has plateaued.
-const backlogGrace761 = 100 * time.Millisecond
+// backlogWatch890 maps the peer address of a connection a test watches to the
+// channel its refusal is reported on. One hook serves every test; it is
+// installed on first use and tells only the watched connection's test.
+var (
+	backlogWatch890    sync.Map // remote address string -> chan struct{} (buffer 1)
+	backlogHookOnce890 sync.Once
+	backlogHookSeen890 = func(remote string) {
+		if v, ok := backlogWatch890.Load(remote); ok {
+			select {
+			case v.(chan struct{}) <- struct{}{}:
+			default:
+			}
+		}
+	}
+)
+
+// watchBacklogRefusal890 returns a channel that receives when the engine
+// refuses a request on the connection whose client end is clientAddr (the
+// server sees it as that remote address).
+func watchBacklogRefusal890(t *testing.T, clientAddr string) <-chan struct{} {
+	t.Helper()
+	backlogHookOnce890.Do(func() { conn.BacklogRefusedHook.Store(&backlogHookSeen890) })
+	ch := make(chan struct{}, 1)
+	backlogWatch890.Store(clientAddr, ch)
+	t.Cleanup(func() { backlogWatch890.Delete(clientAddr) })
+	return ch
+}
 
 // waitServerReadAll761 waits until the server has read everything sent on
 // raw so far: its receive queue is empty. Used where a test sends a request
