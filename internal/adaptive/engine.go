@@ -186,10 +186,11 @@ type Engine struct {
 //     fast-path setup flags); require the "bundles" era (>6.10) OR the 6.1+
 //     fast tier (DEFER_TASKRUN + SINGLE_ISSUER + MULTISHOT_RECV + PROVIDED_BUFFERS).
 //   - Memlock: io_uring's provided-buffer rings need locked pages per worker
-//     (minMemlockPerWorker). If RLIMIT_MEMLOCK can't fund the requested workers,
-//     io_uring caps to a fraction of them and its throughput collapses; epoll
-//     does not memlock buffer rings, so it keeps all workers. In that case
-//     io_uring is never the right engine.
+//     (minMemlockPerWorker). If RLIMIT_MEMLOCK can't fund the workers the
+//     engines will start (startedLoops: the requested count, or the shorter
+//     big.LITTLE plan), io_uring caps to a fraction of them and its
+//     throughput collapses; epoll does not memlock buffer rings, so it keeps
+//     all workers. In that case io_uring is never the right engine.
 func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
 	if !p.IOUringTier.Available() {
 		return false
@@ -199,7 +200,11 @@ func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
 	if !bundlesEra && !fastTier {
 		return false
 	}
-	wantWorkers := cfg.Resources.Resolve().Workers
+	// The loops the engines START, not the request: iouring.planWithinMemlock
+	// caps the plan, and on a big.LITTLE host the plan is shorter than the
+	// request (celeris#886 item 30). Comparing the request kept the engine off
+	// io_uring for a ceiling between the plan and the request.
+	wantWorkers := startedLoops(cfg.Resources.Resolve().Workers, cfg.Resources.Workers > 0)
 	if maxW := maxWorkersForMemlock(); maxW != -1 && maxW < wantWorkers {
 		return false
 	}
@@ -207,9 +212,20 @@ func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
 }
 
 // planLoopCPUs is the platform's CPU plan, the one the sub-engines plan their
-// loops from, behind a var so tests can stand in a big.LITTLE host (celeris#886
-// item 30). Nothing reads it yet.
+// loops from, behind a var so tests can stand in a big.LITTLE host.
 var planLoopCPUs = platform.PlanWorkerCPUsFor
+
+// startedLoops is how many loops the engines will start for a request of
+// `requested` workers (explicit: Config.Resources.Workers was set by the
+// user): the length of the platform's CPU plan. On a big.LITTLE host that is
+// one loop per non-little CPU, fewer than GOMAXPROCS (celeris#1036, #1049); on
+// every other host it is `requested`. The plan is made without the listen
+// address, so the rx-port rule that may leave a few more CPUs out is not
+// applied: the count is the upper bound of what the engines start, and the
+// memlock test below never says "viable" for fewer loops than they start.
+func startedLoops(requested int, explicit bool) int {
+	return len(planLoopCPUs(requested, explicit, "").CPUs)
+}
 
 // maxWorkersForMemlock is the io_uring memlock worker-ceiling probe behind a var
 // so tests can inject a low cap without mutating the process RLIMIT_MEMLOCK.
