@@ -4,7 +4,6 @@ package websocket_test
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -103,90 +102,61 @@ const (
 
 func detachedCountWindow(t *testing.T, engine celeris.EngineType) {
 	run := detachedCountRun.Add(1)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-
-	srv := celeris.New(celeris.Config{
-		Engine:        engine,
-		AsyncHandlers: true,
-		Workers:       dcwWorkers,
-		Logger:        slog.New(slog.NewTextHandler(os.Stderr, nil)),
-		// -1 is documented to disable the slowloris header timeout (0 means
-		// the 10 s default). With the timeout enabled the sweep gate is 0x1F
-		// and the idle wait <= 25 ms REGARDLESS of detachedCount (worker.go
-		// gate and adaptiveTimeout), so O3 cannot tell a drifted count from
-		// a correct one — measured: the control build reaped every anchor
-		// within 1.3 s. MEASURED TOO: -1 does not survive to the worker
-		// today — Server.doPrepare applies WithDefaults (-1 → 0) and
-		// iouring.New applies it AGAIN (0 → 10 s), so the worker still sees
-		// 10 s (traced w.cfg.ReadHeaderTimeout=10s). Kept so O3 starts to
-		// discriminate once that double normalisation is fixed; until then
-		// O3 is a non-discriminating sanity bound on both builds.
-		ReadHeaderTimeout: -1,
+	srv, addr, stop := startWS888(t, func() *celeris.Server {
+		srv := celeris.New(celeris.Config{
+			Engine:        engine,
+			AsyncHandlers: true,
+			Workers:       dcwWorkers,
+			Logger:        slog.New(slog.NewTextHandler(os.Stderr, nil)),
+			// -1 is documented to disable the slowloris header timeout (0 means
+			// the 10 s default). With the timeout enabled the sweep gate is 0x1F
+			// and the idle wait <= 25 ms REGARDLESS of detachedCount (worker.go
+			// gate and adaptiveTimeout), so O3 cannot tell a drifted count from
+			// a correct one — measured: the control build reaped every anchor
+			// within 1.3 s. MEASURED TOO: -1 does not survive to the worker
+			// today — Server.doPrepare applies WithDefaults (-1 → 0) and
+			// iouring.New applies it AGAIN (0 → 10 s), so the worker still sees
+			// 10 s (traced w.cfg.ReadHeaderTimeout=10s). Kept so O3 starts to
+			// discriminate once that double normalisation is fixed; until then
+			// O3 is a non-discriminating sanity bound on both builds.
+			ReadHeaderTimeout: -1,
+		})
+		// Adaptive route (inherits AsyncHandlers, no explicit .Async()), like the
+		// refapp's /ws: runs inline on an unpromoted conn, on the dispatch
+		// goroutine on a promoted one. CheckOrigin runs before Detach; the
+		// trigger conns ask it to stall so the RST is reaped mid-upgrade.
+		srv.GET("/ws", websocket.New(websocket.Config{
+			CheckOrigin: func(c *celeris.Context) bool {
+				if c.Header(dcwStallHeader) != "" {
+					time.Sleep(dcwOriginStall)
+				}
+				return true
+			},
+			IdleTimeout: dcwIdleTimeout,
+			Handler: func(c *websocket.Conn) {
+				for {
+					mt, msg, err := c.ReadMessage()
+					if err != nil {
+						return
+					}
+					if err := c.WriteMessage(mt, msg); err != nil {
+						return
+					}
+				}
+			},
+		}))
+		// Explicit sync: warms an inline (unpromoted) trigger conn.
+		srv.GET("/sync", func(c *celeris.Context) error {
+			return c.String(200, "ok")
+		}).Sync()
+		// Explicit async: the first request on a conn that hits it promotes the
+		// conn to its dispatch goroutine for every later request.
+		srv.GET("/promote", func(c *celeris.Context) error {
+			return c.String(200, "ok")
+		}).Async()
+		return srv
 	})
-	// Adaptive route (inherits AsyncHandlers, no explicit .Async()), like the
-	// refapp's /ws: runs inline on an unpromoted conn, on the dispatch
-	// goroutine on a promoted one. CheckOrigin runs before Detach; the
-	// trigger conns ask it to stall so the RST is reaped mid-upgrade.
-	srv.GET("/ws", websocket.New(websocket.Config{
-		CheckOrigin: func(c *celeris.Context) bool {
-			if c.Header(dcwStallHeader) != "" {
-				time.Sleep(dcwOriginStall)
-			}
-			return true
-		},
-		IdleTimeout: dcwIdleTimeout,
-		Handler: func(c *websocket.Conn) {
-			for {
-				mt, msg, err := c.ReadMessage()
-				if err != nil {
-					return
-				}
-				if err := c.WriteMessage(mt, msg); err != nil {
-					return
-				}
-			}
-		},
-	}))
-	// Explicit sync: warms an inline (unpromoted) trigger conn.
-	srv.GET("/sync", func(c *celeris.Context) error {
-		return c.String(200, "ok")
-	}).Sync()
-	// Explicit async: the first request on a conn that hits it promotes the
-	// conn to its dispatch goroutine for every later request.
-	srv.GET("/promote", func(c *celeris.Context) error {
-		return c.String(200, "ok")
-	}).Async()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	var startErr atomic.Pointer[error]
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if e := srv.StartWithListenerAndContext(ctx, ln); e != nil {
-			startErr.Store(&e)
-		}
-	}()
-	time.Sleep(500 * time.Millisecond)
-	// A Start that fails after the settle sleep is not missed (celeris#706).
-	waitUpOrStopped(t, srv, done, 30*time.Second)
-	if p := startErr.Load(); p != nil {
-		msg := (*p).Error()
-		if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
-			t.Skipf("engine unavailable on this runner: %v", *p)
-		}
-		t.Fatalf("server start: %v", *p)
-	}
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-		}
-	}()
+	defer stop()
 	metrics := func() celeris.EngineMetrics {
 		info := srv.EngineInfo()
 		if info == nil {

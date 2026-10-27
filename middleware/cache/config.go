@@ -12,8 +12,10 @@ type Config struct {
 	// Store is the cache backend. Default: [NewMemoryStore].
 	//
 	// Two fills of one key can overlap (concurrent misses with
-	// DisableSingleflight, or a coalesced call that was replaced once its
-	// result expired while its Set hung). The cache's own [MemoryStore]
+	// DisableSingleflight, a coalesced call that was replaced once its
+	// result expired while its Set hung, or a Set the middleware stopped
+	// waiting for, see [Config.SetTimeout], which returns later). The cache's
+	// own [MemoryStore]
 	// applies each fill's write in order: an entry written by a fill whose
 	// handler started later is not replaced by an earlier fill's write that
 	// lands after it. Any other store, including a type that embeds
@@ -115,7 +117,46 @@ type Config struct {
 
 	// SkipPaths lists paths to skip (exact match).
 	SkipPaths []string
+
+	// SetTimeout bounds how long the middleware waits for each Store.Set it
+	// makes to store a response. Zero selects the default, 5 seconds, a
+	// negative value waits for ever, as before the field.
+	// When the Set has not returned in time the request goes on without it:
+	// the leader of a coalesced fill releases its key and writes its
+	// response, and a request that cannot store its response is answered
+	// all the same. Without the bound a Set that never returns (a remote
+	// store whose connection hung) holds the leader request, for ever on a
+	// native HTTP/1 request, whose context never ends, and with it, on epoll
+	// and io_uring, the event loop a sync leader runs on: for as long as the
+	// bound, a hung Set still holds that loop.
+	//
+	// The Set is given a context with the same deadline. A store that honours
+	// it returns at the timeout (celeris's own Redis and Memcached drivers
+	// do); one that ignores it is not stopped: its goroutine and the response
+	// body it holds live until it returns, for every abandoned Set, and there
+	// is no cap on how many accumulate (a store that never returns, 2000
+	// misses: 2000 goroutines and about 37 MiB for 16 KiB bodies). It may
+	// still write then, after a newer fill has written the key (the entry
+	// that remains is the one the store applied last, as for two fills that
+	// overlap, see [Config.Store]). A panic in a Set the middleware had
+	// stopped waiting for is logged at Error level through slog.Default; in
+	// one it was waiting for it is raised on the request, as without the
+	// bound.
+	//
+	// The bound applies to every store except [MemoryStore] and
+	// [store.MemoryKV] themselves, which only take a lock. Any other type is
+	// bounded, one that wraps an in-process store included (a type that
+	// embeds [store.MemoryKV], and the stores [store.Prefixed] returns): each
+	// of its fills costs a goroutine and a timer, about 1.4 microseconds and
+	// 11 allocations. The bound does not apply to Get.
+	SetTimeout time.Duration
 }
+
+// defaultSetTimeout is the bound on a Store.Set when Config.SetTimeout is 0.
+// PENDING the maintainer's decision (celeris#888 item 30): this one constant
+// and the sentence "Zero selects the default, 5 seconds," in the SetTimeout
+// field's doc are the only places to change.
+const defaultSetTimeout = 5 * time.Second
 
 // defaultConfig holds the defaults. Every bool field's default is false, so
 // a Config literal that leaves one out gets its default (celeris#922).
@@ -129,6 +170,9 @@ var defaultConfig = Config{
 func applyDefaults(cfg Config) Config {
 	if cfg.Store == nil {
 		cfg.Store = NewMemoryStore()
+	}
+	if cfg.SetTimeout == 0 {
+		cfg.SetTimeout = defaultSetTimeout
 	}
 	if cfg.TTL <= 0 {
 		cfg.TTL = defaultConfig.TTL
