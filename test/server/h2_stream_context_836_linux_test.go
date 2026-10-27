@@ -477,40 +477,11 @@ func TestH2CUnmatchedThroughTimeoutSingleflight836(t *testing.T) {
 // readiness probe /ping is registered after it.
 func startGlobalChainServer836(t *testing.T, cfg celeris.Config, setup func(*celeris.Server)) string {
 	t.Helper()
-	retryUntil := time.Now().Add(30 * time.Second)
-	for {
-		ln, err := listenForStart1104()
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		cfg.Addr = addr
-		s := celeris.New(cfg)
+	// The listener is handed to the server, so the port cannot be taken between
+	// the pick and the bind (celeris#1104, startPicked1104).
+	_, addr := startPickedPing1104(t, cfg, func(s *celeris.Server) {
 		setup(s)
-		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
-		startDone := make(chan error, 1)
-		go func() { startDone <- s.Start() }()
-		if err = waitReady761(addr, startDone); err == nil {
-			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				_ = s.Shutdown(ctx)
-				select {
-				case <-startDone:
-				case <-time.After(15 * time.Second):
-					t.Errorf("Start did not return within 15s of Shutdown")
-				}
-			})
-			return addr
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = s.Shutdown(ctx)
-		cancel()
-		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		t.Fatalf("server did not start: %v", err)
-	}
+		ping1104(s)
+	})
+	return addr
 }
