@@ -454,6 +454,11 @@ var ErrSentinelUnhealthy = errors.New("celeris-redis: sentinel client unhealthy,
 // fail, the client is marked unhealthy and returns errors until the next
 // successful +switch-master.
 func (s *SentinelClient) handleSwitchMaster(payload string) {
+	// watchFailover's select between a queued message and closeCh picks at
+	// random, so this can run after Close: make no dial for a closed client.
+	if s.closed.Load() {
+		return
+	}
 	// Format: "<master-name> <old-ip> <old-port> <new-ip> <new-port>"
 	parts := splitFields(payload)
 	if len(parts) < 5 {
