@@ -131,33 +131,55 @@ func get885(t *testing.T, c net.Conn, path string) {
 }
 
 // TestEngineKeepAliveResponseSurvivesReadTimeoutWhileTheClientReads885:
-// ReadTimeout 1 s, WriteTimeout 30 s, a keep-alive response of 40 MiB that the
-// client takes at about 16 MiB/s, steadily, over more than twice ReadTimeout;
+// ReadTimeout 2 s, WriteTimeout 30 s, a keep-alive response of 40 MiB that the
+// client takes at about 8 MiB/s, steadily, over more than twice ReadTimeout;
 // then, a third of a second after the last byte, a second request on the same
 // conn, which the conn must still be there to answer (the idle clock after a
 // response starts at its end, not at the request before it).
 func TestEngineKeepAliveResponseSurvivesReadTimeoutWhileTheClientReads885(t *testing.T) {
 	for _, async := range []bool{false, true} {
 		t.Run(map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
-			runKeepAliveSurvives885(t, async, 0, 300*time.Millisecond)
+			// The server's send buffer is bounded, so its last write runs at most
+			// 64 KiB (8 ms at the client's pace) ahead of the client's last read,
+			// and the second request follows 50 ms after that read: the idle
+			// clock has about 1.9 s of its 2 s to spare. With a 1 s ReadTimeout,
+			// the default send buffer and a 300 ms gap it had about 550 ms (see
+			// the margin test below).
+			runKeepAliveSurvives885(t, async, keepAliveSndBuf885, 50*time.Millisecond)
 		})
 	}
 }
 
-// TestEngineKeepAliveMarginProbe885 measures how much room the test above has.
-// The idle clock after a response starts when the SERVER finished writing it,
-// not when the client finished reading: with the kernel's default send buffer
-// (autotuned up to tcp_wmem's maximum, 4 MiB) the server's last write runs ahead
-// of the client's last read by the buffer's drain time at the client's 16 MiB/s,
-// up to about 250 ms. Measured at --cpus 2: the second request, sent `gap` after
-// the client's last read, finds the conn alive at a gap of 800 ms and reaped at
-// 900 ms (5 of 5 runs each, both arms), so the 300 ms gap of the test above
-// leaves about 550 ms of margin, which a loaded runner with coverage and -race
-// can eat (the test failed once in CI, in the async arm).
-func TestEngineKeepAliveMarginProbe885(t *testing.T) {
+// The tests above and below: the server's SO_SNDBUF, the ReadTimeout and the
+// client's pace. ReadTimeout is 2 s and the pace 8 MiB/s (40 MiB in 5 s, over
+// twice the ReadTimeout as the premise requires), where they were 1 s and
+// 16 MiB/s: the margin of the second request is a fraction of ReadTimeout, so a
+// stall of the loop thread on a loaded runner has to be twice as long to reap the
+// conn.
+const (
+	keepAliveSndBuf885 = 64 << 10
+	keepAliveRead885   = 2 * time.Second
+	keepAliveRate885   = 8 << 20 // bytes per second
+)
+
+// TestEngineKeepAliveMarginWithABoundedSendBuffer885 holds the margin the test
+// above relies on. The idle clock after a response starts when the SERVER
+// finished writing it, not when the client finished reading: with the kernel's
+// default send buffer (autotuned up to tcp_wmem's maximum, 4 MiB) the server's
+// last write runs ahead of the client's last read by the buffer's drain time at
+// the client's pace, up to about 250 ms at 16 MiB/s. Measured at --cpus 2 on
+// the original test (ReadTimeout 1 s, 16 MiB/s), with the default buffer the
+// second request finds the conn alive at a gap of 800 ms after the client's
+// last read and reaped at 900 ms (5 of 5 runs each, both arms), so its 300 ms
+// gap left about 550 ms of margin, which a loaded runner with coverage and
+// -race can eat (the test failed once in CI, in the async arm). With the send
+// buffer bounded to 64 KiB the lag is a few milliseconds and the idle clock
+// has its full ReadTimeout: a gap of 1.5 s, three quarters of the 2 s, must
+// find the conn alive, i.e. the test above (it uses 50 ms) has this much room.
+func TestEngineKeepAliveMarginWithABoundedSendBuffer885(t *testing.T) {
 	for _, async := range []bool{false, true} {
 		t.Run(map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
-			runKeepAliveSurvives885(t, async, 0, 900*time.Millisecond)
+			runKeepAliveSurvives885(t, async, keepAliveSndBuf885, 1500*time.Millisecond)
 		})
 	}
 }
@@ -168,7 +190,7 @@ func TestEngineKeepAliveMarginProbe885(t *testing.T) {
 func runKeepAliveSurvives885(t *testing.T, async bool, sndbuf int, gap time.Duration) {
 	const body = 40 << 20
 	_, addr := startE2E885(t, async, newPathHandler885(body), func(c *resource.Config) {
-		c.ReadTimeout = time.Second
+		c.ReadTimeout = keepAliveRead885
 		c.WriteTimeout = 30 * time.Second
 		c.IdleTimeout = -1
 		c.Resources.SocketSend = sndbuf
@@ -189,18 +211,18 @@ func runKeepAliveSurvives885(t *testing.T, async bool, sndbuf int, gap time.Dura
 		var n int
 		n, rerr = resp.Body.Read(buf)
 		got += int64(n)
-		// Paced to 16 MiB/s by the clock, not by a sleep per read.
-		if d := time.Until(start.Add(time.Duration(float64(got) / (16 << 20) * float64(time.Second)))); d > 0 {
+		// Paced to keepAliveRate885 by the clock, not by a sleep per read.
+		if d := time.Until(start.Add(time.Duration(float64(got) / keepAliveRate885 * float64(time.Second)))); d > 0 {
 			time.Sleep(d)
 		}
 	}
 	took := time.Since(start)
-	t.Logf("client received %d of %d body bytes in %v with ReadTimeout 1s (end: %v)", got, body, took.Round(time.Millisecond), rerr)
+	t.Logf("client received %d of %d body bytes in %v with ReadTimeout %v (end: %v)", got, body, took.Round(time.Millisecond), keepAliveRead885, rerr)
 	if got != body {
 		t.Fatalf("the client received %d of %d body bytes %v in, reading steadily: the keep-alive response was cut by a "+
-			"ReadTimeout of 1s measured from the request (celeris#885 item 35)", got, body, took.Round(time.Millisecond))
+			"ReadTimeout of %v measured from the request (celeris#885 item 35)", got, body, took.Round(time.Millisecond), keepAliveRead885)
 	}
-	if took < 2*time.Second {
+	if took < 2*keepAliveRead885 {
 		t.Fatalf("celeris885 PREMISE: the transfer took %v, not longer than twice ReadTimeout", took)
 	}
 	time.Sleep(gap)
