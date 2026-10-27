@@ -214,12 +214,15 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 		} else {
 			perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn)
 			// The replay is the recv event of this conn's first bytes and
-			// counts one, whatever the verdict (celeris#886). handleRecv
-			// counts a recv after ProcessH1 too, but returns before it on an
-			// h2c upgrade and never counts a direct-body recv: a carry that
-			// is an upgrade request counts one here and its recv would have
-			// counted none.
-			w.reqBatch++
+			// counts one, whatever the verdict but one (celeris#886).
+			// handleRecv counts a recv after ProcessH1 too, but returns before
+			// it on an h2c upgrade and never counts a direct-body recv: a
+			// carry that is an upgrade request counts none here either, as its
+			// recv would have counted none (item 23: both paths now count the
+			// upgrade request as none).
+			if !errors.Is(perr, conn.ErrUpgradeH2C) {
+				w.reqBatch++
+			}
 			if perr != nil {
 				if !w.endCarriedReplay(cs, newFD, perr) {
 					return // hijacked (handed off) or closed on error — nothing more to arm
@@ -277,11 +280,13 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		return false
 	}
 	// Counted for every outcome but the promotion above, whose
-	// promoteConnToAsync counts it: the replay is the recv event of this
-	// conn's first bytes (celeris#886). Unlike handleRecv it also counts a
-	// carry that ends in an h2c upgrade, which that path returns before
-	// counting.
-	w.reqBatch++
+	// promoteConnToAsync counts it, and an h2c upgrade: the replay is the recv
+	// event of this conn's first bytes (celeris#886). Like handleRecv, which
+	// returns on the upgrade verdict before it counts, it counts a carry that
+	// ends in an h2c upgrade as none (item 23).
+	if !errors.Is(perr, conn.ErrUpgradeH2C) {
+		w.reqBatch++
+	}
 	if perr != nil {
 		// Nothing below may touch cs.h1State: an h2c upgrade has replaced it.
 		return w.endCarriedReplay(cs, fd, perr)
