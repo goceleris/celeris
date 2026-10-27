@@ -498,19 +498,33 @@ func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok boo
 	if r.doneFlag {
 		return 0, false, false
 	}
-	r.appendRowFromAlias(fields)
-	// Direct-mode result-buffer cap. In direct mode syncMode is pinned
-	// so lazy streaming never fires; without a cap a huge SELECT would
-	// buffer every row in memory unbounded. Cap at maxDirectResultBytes
-	// (64 MiB) and fail with ErrResultTooBig — caller paginates or
-	// switches modes.
+	// Direct-mode result-buffer cap. In direct mode, and on the sync fast
+	// path, syncMode is pinned so lazy streaming never fires (the caller's
+	// goroutine is the dispatcher), and the poll cannot be stopped from here:
+	// it reads the rest of the reply whatever this returns. So the cap is a
+	// bound on the BUFFER: a row that would take it past maxDirectResultBytes is
+	// not appended, the request fails with ErrResultTooBig (the caller sees it
+	// after the rows already buffered, as before) and the rest of the reply is
+	// read and dropped to keep the wire aligned. Checked after the append, as it
+	// was, it bounded nothing: a reply of 240 MB was buffered whole, 1.1 to
+	// 1.2 GB of heap, before the error (celeris#1104).
 	syncMode = r.syncMode.Load()
-	if syncMode && len(r.rowSlab) > maxDirectResultBytes {
-		if r.err == nil {
-			r.err = ErrResultTooBig
+	if syncMode {
+		if errors.Is(r.err, ErrResultTooBig) {
+			return 0, syncMode, false // over the cap already: drop the row
 		}
-		return 0, syncMode, false
+		size := 0
+		for _, f := range fields {
+			size += len(f)
+		}
+		if len(r.rowSlab)+size > maxDirectResultBytes {
+			if r.err == nil {
+				r.err = ErrResultTooBig
+			}
+			return 0, syncMode, false
+		}
 	}
+	r.appendRowFromAlias(fields)
 	return len(r.rows), syncMode, true
 }
 
