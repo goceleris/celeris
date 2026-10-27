@@ -88,8 +88,8 @@ func (a arm855) config(eng celeris.EngineType, async bool) celeris.Config {
 // tick855 for as long as the client is there (events == 0), or n events and
 // then ends. HeartbeatInterval is off, as the bench adapter's /events has no
 // heartbeat: the stream ends when its context ends or a Send fails.
-func events855(s *celeris.Server, n int) {
-	s.GET("/events", sse.New(sse.Config{
+func events855(s *celeris.Server, n int) *celeris.Route {
+	return s.GET("/events", sse.New(sse.Config{
 		HeartbeatInterval: -1,
 		Handler: func(client *sse.Client) {
 			tk := time.NewTicker(tick855)
@@ -205,25 +205,34 @@ func (c sseCell855) name() string {
 
 // TestSSEStaysOpenPastServerTimeouts855: with ReadTimeout and/or WriteTimeout
 // at 1 s, an SSE stream keeps delivering events for 4.5 s on every engine,
-// sync and async, over HTTP/1.1, and on std over h2c as well. std has all
-// three arms; the others, which never cut a stream, have "both".
+// sync and async, over HTTP/1.1 and over h2c. std has all three arms; the
+// others, which never cut a stream, have "both".
 //
-// h2c is std's only: on epoll, io_uring and adaptive an HTTP/2 stream's
-// response goes out when its handler returns (Flush is no delivery guarantee
-// on HTTP/2, see StreamWriter.Flush), so an SSE stream over h2c shows no
-// headers until it ends (a polish item on #889). That is a defect of its own,
-// not this one.
+// Over h2c the native engines run the route on the worker pool only if it is
+// .Async(): an inline HTTP/2 handler runs on the event loop, which sends the
+// response when the handler returns, so an SSE stream on such a route shows no
+// headers until it ends (celeris#889 item 34, probed; see middleware/sse's package
+// documentation). The native h2c cells register /events with .Async(); std
+// does not need it. The native h2c cells have the WriteTimeout arm only (see
+// the cell list below for ReadTimeout).
 func TestSSEStaysOpenPastServerTimeouts855(t *testing.T) {
 	var cells []sseCell855
 	for _, e := range engines761 {
 		for _, async := range []bool{false, true} {
 			for _, h2c := range []bool{false, true} {
-				if h2c && e.name != "std" {
-					continue
-				}
 				arms := []arm855{armBoth855}
-				if e.name == "std" {
+				switch {
+				case e.name == "std":
 					arms = []arm855{armRead855, armWrite855, armBoth855}
+				case h2c:
+					// The native engines cut an h2c stream at ReadTimeout (the
+					// sweep closes a conn that has read nothing for ReadTimeout,
+					// and an HTTP/2 conn is never detached): measured on epoll
+					// and Adaptive, a stream with ReadTimeout 1 s ends after
+					// 0.8 s with an unexpected EOF, with or without WriteTimeout
+					// (found by this cell while probing celeris#889 item 34). Only the
+					// WriteTimeout arm stays open, and is asserted.
+					arms = []arm855{armWrite855}
 				}
 				for _, a := range arms {
 					cells = append(cells, sseCell855{e.name, async, h2c, a})
@@ -239,7 +248,12 @@ func TestSSEStaysOpenPastServerTimeouts855(t *testing.T) {
 		t.Run(cell.name(), func(t *testing.T) {
 			t.Parallel()
 			cfg := cell.arm.config(engOf[cell.eng], cell.async)
-			addr := startServerConfig761(t, cfg, func(s *celeris.Server) { events855(s, 0) })
+			addr := startServerConfig761(t, cfg, func(s *celeris.Server) {
+				r := events855(s, 0)
+				if cell.h2c && cell.eng != "std" {
+					r.Async()
+				}
+			})
 			var (
 				events int
 				span   time.Duration

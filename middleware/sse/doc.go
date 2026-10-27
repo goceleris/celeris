@@ -55,8 +55,40 @@
 //     is sampled every quarter of WriteTimeout; a SEND completion restarts the
 //     clock at once), plus the engine's sweep interval (up to about 0.1 s on
 //     epoll, up to 2 s on io_uring; a WriteTimeout shorter than that can
-//     double). This is for HTTP/1.1 streams: an h2c stream is not covered
-//     yet (celeris#884).
+//     double). This is for HTTP/1.1 streams. An h2c stream is not detached and
+//     this bound does not apply to it; what ends one whose client reads
+//     nothing is HTTP/2 flow control (see HTTP/2 below).
+//
+// Over HTTP/2 (h2c), register the SSE route with [celeris.Route.Async]. On
+// epoll, io_uring and Adaptive an HTTP/2 handler runs on the event loop unless
+// its route is async, and the engine sends the response when the handler
+// returns: on a route that is not async the client sees neither the response
+// headers nor any event until the stream ends, and the stream holds its event
+// loop for as long as it lives, so other connections on that loop wait. The
+// server's AsyncHandlers setting does not change this for HTTP/2. On an async
+// route the stream runs on the worker pool, the headers and each event go out
+// as the handler writes them, and the loop is free. (Measured on epoll and
+// Adaptive with a 3 s stream: the first event reached the client after 1 ms on
+// an async route and after 3.06 s on an inline one; std streams either way.)
+// [celeris.StreamWriter.Flush] is no delivery guarantee on HTTP/2, and an
+// async route does not need one: its headers and events are not waiting for a
+// flush.
+//
+// The native engines do not exempt an HTTP/2 stream from ReadTimeout, as they
+// do a detached HTTP/1.1 one: a connection that has read no frame from its
+// client for ReadTimeout (default 60 s) is closed, an SSE stream's with it.
+// Measured on epoll and Adaptive with ReadTimeout 1 s, an async-route stream
+// ended after 0.8 s (found while probing celeris#889 item 34; open). std
+// does not; io_uring is not measured.
+//
+// A client of an async-route stream that stays connected and reads nothing more
+// than the headers is disconnected as well. With the default flow-control
+// window a write from the worker pool waits for the peer's window for at most
+// WriteTimeout and then resets the stream, which cancels [Client.Context] and
+// runs [Config.OnDisconnect]. Measured on epoll with WriteTimeout 1 s, the
+// disconnect came 1.4 s after connect with the default 64 KiB window, and 1.7 s
+// with a window of 1 GiB, which the stream does not fill: what ends that one is
+// not confirmed. io_uring is not measured.
 //
 // A HEAD request to an SSE route (answered by its GET route) gets the stream's
 // response headers and no body. [Config.OnConnect] runs for it, and a rejection
