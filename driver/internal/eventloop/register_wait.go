@@ -49,7 +49,9 @@ func IsNumberBusy(err error) bool {
 // it retries with a growing pause until the number is free, ctx is done, or
 // registerWaitBudget has passed, and then returns the refusal wrapped together
 // with the reason it stopped (ctx.Err(), or errRegisterWaitBudget), so
-// errors.Is sees both. Every other error is returned at once, and a failed
+// errors.Is sees both. A ctx that is done is never followed by another
+// RegisterConn call, whatever the timing of the pause: only the first call is
+// made for a ctx that was done on entry. Every other error is returned at once, and a failed
 // call leaves fd with the caller, as RegisterConn does. The drivers' dials use
 // it: without it Pool.Acquire fails under connection churn on the io_uring
 // engine (celeris#887 item 28).
@@ -89,9 +91,15 @@ func registerConnWait(ctx context.Context, loop engine.WorkerLoop, fd int, onRec
 		t := time.NewTimer(pause)
 		select {
 		case <-ctx.Done():
-			t.Stop()
-			return fmt.Errorf("%w (gave up waiting: %w)", err, ctx.Err())
 		case <-t.C:
+		}
+		t.Stop()
+		// A ctx that is done wins over a pause that ended too: when the
+		// goroutine was not run for the whole pause both cases are ready and
+		// select picks at random, and a second RegisterConn would register the
+		// fd for a caller that gave up.
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("%w (gave up waiting: %w)", err, cerr)
 		}
 		if err = loop.RegisterConn(fd, onRecv, onClose); !IsNumberBusy(err) {
 			return err
