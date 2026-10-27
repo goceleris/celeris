@@ -16,6 +16,11 @@ import (
 // turns the unretried error into a failure. startFDLEngine is one of the
 // starters that called New and Listen once (celeris#1104).
 func TestStartFDLEngineRidesOutRingENOMEM(t *testing.T) {
+	if !engineMayUseIOUring() {
+		// The test sets CELERIS_REQUIRE_IOURING_WORKERS=1 itself, so a refusal
+		// that is not a memlock shortage would fail it instead of skipping.
+		t.Skip("the engine does not run io_uring here (a kernel before 5.19, or CELERIS_MAX_IOURING_TIER capping the tier to none)")
+	}
 	t.Setenv(envRequireIOUring656, "1")
 	chargeMemlock(t, 600*time.Millisecond)
 	start := time.Now()
