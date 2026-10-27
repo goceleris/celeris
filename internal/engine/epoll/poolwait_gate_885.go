@@ -43,7 +43,8 @@ import (
 // route every conn whose read leaves a partial request is promoted, whatever its
 // route, and a conn on an Async route is) is otherwise left to the end of the
 // wait, with a request in progress on it unread: the documented behaviour and
-// a follow-up shared with io_uring (which has no idle close at all).
+// a follow-up (io_uring's gate, shutdown_gate_884.go, looks inside such a conn
+// under the goroutine's own locks and closes it when idle).
 
 // poolWaitGrace is how long into the wait for the HTTP/2 pool handlers the
 // gate stays open: io_uring's shutdownSendDrainNanos, and this engine's
@@ -58,20 +59,31 @@ const gateClosesPerPass = 64
 
 // refusesRecv reports whether a loop past the pool wait's gate reads no more
 // from cs: an HTTP/1 conn (detached or not) or one whose protocol is not
-// detected yet, which io_uring's refuseRecv test mirrors, with one exception
-// io_uring does not make: a request in progress is read on, and answered, as
-// std's Shutdown answers the request of an active conn (headers in pieces, a
-// body still arriving, the bytes of a protocol decision begun). A conn whose
-// dispatch goroutine owns its parse state (asyncPromoted) is refused as before:
-// its state is not the loop's to read. Loop thread.
+// detected yet, which io_uring's gateReadsOn mirrors: a request in progress is
+// read on, and answered, as std's Shutdown answers the request of an active
+// conn (headers in pieces, a body still arriving, the bytes of a protocol
+// decision begun). A conn whose
+// dispatch goroutine owns its parse state (asyncPromoted) is refused as before
+// while it is HTTP/1: its state is not the loop's to read. Loop thread.
 func refusesRecv(cs *connState) bool {
 	if !cs.detected {
 		return cs.detectN == 0
 	}
+	if cs.asyncPromoted {
+		// protocol, h1State and h2State are the dispatch goroutine's, which
+		// writes them in switchToH2Local under detachMu: not read here. The
+		// conn is HTTP/1 until the goroutine sets h2Switched (under asyncInMu,
+		// which is held for an instant, never across a handler, so waiting for
+		// it cannot stall the pass), and an HTTP/1 conn it owns is refused, as
+		// before; one it has switched is HTTP/2 and is served (celeris#885
+		// item 28). Not refused on asyncPromoted alone: the pool wait is for
+		// the HTTP/2 conns.
+		return !cs.switchedToH2()
+	}
 	if cs.protocol != engine.HTTP1 {
 		return false
 	}
-	return cs.asyncPromoted || cs.h1State == nil || !cs.h1State.HasPendingData()
+	return cs.h1State == nil || !cs.h1State.HasPendingData()
 }
 
 // poolWaitGate applies the gate once the loop has waited poolWaitGrace for the
@@ -180,10 +192,21 @@ func (l *Loop) stopDetachedProducers() {
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
 		cs := l.liveConns[i]
 		mu := cs.detachMu
-		if mu == nil || cs.hijacked.Load() || cs.h1State == nil || !cs.h1State.Detached.Load() {
+		if mu == nil || cs.hijacked.Load() {
+			continue
+		}
+		// h1State is read before the lock only on a conn the loop owns: on a
+		// promoted conn the dispatch goroutine sets it to nil in the h2c switch,
+		// under detachMu, so it is read under the lock (celeris#885 item 28).
+		promoted := cs.asyncPromoted
+		if !promoted && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
 			continue
 		}
 		if !mu.TryLock() {
+			continue
+		}
+		if promoted && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
+			mu.Unlock()
 			continue
 		}
 		// Re-tested under the lock, as closeConn's ownership check is: an async

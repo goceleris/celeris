@@ -652,11 +652,12 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 // The gate comes shutdownSendDrainNanos (250 ms) into the wait, as the send
 // drain's does, so a request in flight when the shutdown begins is still
 // answered: the first assertion is that requests made as soon as every
-// listener has closed are. A request whose bytes have not all arrived by the
-// gate is another matter: the gate drops the bytes that come after it and the
-// recv is not re-armed (a slow upload, headers in pieces), which the pull
-// request's open questions record. The oracle looks 1.5 s in, well past the grace and the time a worker idle in its ring
-// wait takes to notice the cancel.
+// listener has closed are. A request in progress at the gate (a slow upload,
+// headers in pieces) is another matter, pinned by TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885
+// on epoll and by TestIOUringShutdownGateConns884 on io_uring (both read it on
+// and answer it with Connection: close). The oracle looks 1.5 s in, well past
+// the grace and the time a worker idle in its ring wait takes to notice the
+// cancel.
 //
 // Both native engines have the gate: io_uring's (celeris#884) and epoll's
 // (celeris#885 item 49, poolWaitGate). Before epoll's, its pool wait did not

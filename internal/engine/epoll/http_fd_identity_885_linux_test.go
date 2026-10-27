@@ -81,7 +81,7 @@ func drainEvents885(l *Loop) {
 // (attachAdoptedFD, on this goroutine) and returns its descriptor, its peer
 // and its slot. The peer has written a byte before the adoption, so the ADD
 // reports EPOLLIN at once.
-func adoptedPair885(t *testing.T, l *Loop) (fd, peer int, cs *connState) {
+func adoptedPair885(t testing.TB, l *Loop) (fd, peer int, cs *connState) {
 	t.Helper()
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {

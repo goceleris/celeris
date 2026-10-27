@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -819,8 +820,10 @@ type Worker struct {
 
 	// refuseRecv is true once the send drain, or the wait for the HTTP/2
 	// pool handlers before it, is past its first shutdownSendDrainNanos:
-	// handleRecv then reads nothing more from an HTTP/1 connection
-	// (celeris#806, celeris#884). The drain lasts as long as the
+	// handleRecv then reads no new request from an HTTP/1 connection
+	// (celeris#806, celeris#884): a request in progress is read on
+	// (gateReadsOn), and the conns that hold nothing are closed
+	// (closeIdleH1, shutdown_gate_884.go). The drain lasts as long as the
 	// budget, and on keep-alive connections whose responses queue in the
 	// worker, new requests would keep the queues from ever emptying.
 	// Worker thread only; read in handleRecv.
@@ -962,9 +965,17 @@ type Worker struct {
 	// ringWaitWarned is set once the first retried wait was logged
 	// (ringWaitContinues). Worker thread only.
 	ringWaitWarned bool
-	// producersStopNext is when (UnixNano) the pool wait's gate may walk the
-	// detached conns again (stopProducersPaced). Worker thread only.
+	// producersStopNext is when (UnixNano) the shutdown gate may walk the
+	// conns again (stopProducersPaced, closeIdlePaced). Worker thread only.
 	producersStopNext int64
+	// ringWaitRunStart is when (UnixNano) the run of consecutive retried ring
+	// waits that reaped nothing began, ringWaitRunLast when the last of them
+	// was, and ringWaitRunTick the loop pass
+	// (tickCounter) of the last of them: ringWaitContinues' ceiling
+	// (celeris#884 item 72). Zero start: no run. Worker thread only.
+	ringWaitRunStart int64
+	ringWaitRunLast  int64
+	ringWaitRunTick  uint32
 }
 
 // recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
@@ -1587,14 +1598,21 @@ func (w *Worker) run(ctx context.Context) {
 				// the walk over every conn is not paid on every pass); the
 				// HTTP/2 conns this wait is for are served on
 				// (celeris#884). h2PoolSettled has set h2DrainStart. A
-				// request whose bytes have not all arrived by then is not
-				// answered: the bytes after the gate are dropped (a slow
-				// upload, headers in pieces). The producers' OnError and
-				// OnDetachClose run on this thread, as in the send drain,
-				// so a slow callback delays the HTTP/2 conns served here.
+				// request in progress at the gate (a slow upload, headers in
+				// pieces) is read on and answered, with Connection: close, as
+				// std's Shutdown answers an active conn; the conns that hold
+				// nothing (idle keep-alive, no byte sent, a detached stream
+				// the gate ended) are closed (closeIdleH1), paced with the
+				// walk, so a client fails at once instead of waiting for the
+				// end of the wait with no answer (celeris#884 item 73). The
+				// producers' OnError and OnDetachClose run on this thread, as
+				// in the send drain, so a slow callback delays the HTTP/2
+				// conns served here.
 				if now := time.Now().UnixNano(); now > w.h2DrainStart+shutdownSendDrainNanos {
 					w.refuseRecv = true
-					w.stopProducersPaced(now)
+					if w.stopProducersPaced(now) {
+						w.closeIdleH1()
+					}
 				}
 			} else {
 				now := time.Now().UnixNano()
@@ -1614,6 +1632,7 @@ func (w *Worker) run(ctx context.Context) {
 					w.stopAccepting(ctx)
 					w.refuseRecv = true
 					w.stopDetachedProducers()
+					w.closeIdlePaced(now)
 				}
 			}
 		}
@@ -2893,6 +2912,18 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 				}
 			default:
 				w.processCQE(ctx, c, now)
+				// The terminal CQE of an accept of THIS descriptor number ends
+				// the wait (celeris#896). Known limit (celeris#884 item 63,
+				// decided 2026-10-12 as a comment, not a fix): a terminal CQE
+				// of an earlier listen socket that is still unread, when a
+				// re-created socket shares its number (a pause, a resume and a
+				// shutdown together: the re-created socket usually gets the
+				// same number), is taken for this one and ends the wait early;
+				// the port then stays bound for the ring teardown's ~2 ms.
+				// Counting terminal accept CQEs against the cancel's result
+				// (the number it cancelled) would close it, but needs the
+				// order of the cancel's CQE and the accept's terminal CQE
+				// pinned on every kernel CI runs. Narrow, not reproduced.
 				if ud&udMask == udAccept && decodeFD(ud) == lfd && !cqeHasMore(c.Flags) {
 					acceptOwed = false
 				}
@@ -3397,6 +3428,52 @@ func (w *Worker) initProtocol(cs *connState) {
 				prevRaw, prevPause, prevResume = h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv
 			}
 			counted, finished := false, false
+			// unlockDetachMu: this goroutine holds detachMu (the promoted async path) and
+			// releases it on the way out; a conn that is not on that path is rolled back
+			// instead. Decided here, from the snapshot, so that the rollback below is
+			// registered before the first mutation and an edit that adds one between
+			// the snapshot and the install is inside it (#889 item 48). It is the gate
+			// the hook used after it had allocated detachMu: in sync mode w.async is false
+			// either way, and in async mode detachMu was allocated at acquireConnState,
+			// so prevMu is not nil.
+			unlockDetachMu := w.async && cs.asyncPromoted.Load() && prevMu != nil && !cs.asyncDetachUnlocked
+			if !unlockDetachMu {
+				// A conn that is not on the promoted async path goes on after a panic
+				// out of this hook: Context.Detach has not marked the Context detached,
+				// the router answers 500, and the next request is served on the same
+				// conn. Put back everything the hook changes from here on, so that it is
+				// exactly as if Detach had not run: a guarded writeFn left behind
+				// locks detachMu again on the first write of the H2C branch and of
+				// serveAsync, which hold it across theirs (the loop thread, or the
+				// dispatch goroutine, deadlocks on itself), a count left behind is
+				// made again by the next Detach, and closeConn undoes one. The
+				// promoted path closes the conn instead (the deferred hook below).
+				// Assignments only, under no lock: this goroutine owns the conn's
+				// state here, as it did when the hook installed it (#889 item 34).
+				defer func() {
+					if finished {
+						return
+					}
+					cs.writeFn = prevWrite
+					if h1 != nil {
+						h1.UpdateWriteFn(prevWrite)
+						h1.SetWriteErrQuery(cs)
+						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
+					}
+					cs.detachMu = prevMu
+					cs.asyncDetachPending = prevPending
+					if counted {
+						// Sync mode only. The next Detach counts again, and closeConn undoes the count
+						// of a conn with detachCounted set, so the sync path relies on this leaving it
+						// false (#889 item 48).
+						w.detachedCount--
+						cs.detachCounted = false
+						if w.detachedConns != nil {
+							w.detachedConns.Add(-1)
+						}
+					}
+				}()
+			}
 			mu := cs.detachMu
 			if mu == nil {
 				mu = &sync.Mutex{}
@@ -3420,6 +3497,9 @@ func (w *Worker) initProtocol(cs *connState) {
 				}
 			} else {
 				cs.asyncDetachPending = true
+			}
+			if f := detachPostCountHook.Load(); f != nil {
+				(*f)() // test seam, #889 item 48 (between the snapshot and the rollback)
 			}
 			orig := cs.writeFn
 			wake := w.wakeFD
@@ -3545,46 +3625,13 @@ func (w *Worker) initProtocol(cs *connState) {
 			// CloseH1 instead of recycling the Context/stream this WS/SSE
 			// middleware goroutine is still using — the use-after-recycle that
 			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade.
-			unlockDetachMu := w.async && cs.asyncPromoted.Load() && cs.detachMu != nil && !cs.asyncDetachUnlocked
+			// unlockDetachMu was decided at the top of the hook, before the first mutation, so that the rollback is
+			// registered before any of them.
 			// completed: this closure ran to its end. Nothing is owed when this
 			// goroutine holds no lock here.
 			completed := !unlockDetachMu
 			// flagged: asyncDetachUnlocked has been published by this closure.
 			flagged := false
-			if !unlockDetachMu {
-				// A conn that is not on the promoted async path goes on after a panic
-				// out of this hook: Context.Detach has not marked the Context detached,
-				// the router answers 500, and the next request is served on the same
-				// conn. Put back everything installed above and below, so that it is
-				// exactly as if Detach had not run: a guarded writeFn left behind
-				// locks detachMu again on the first write of the H2C branch and of
-				// serveAsync, which hold it across theirs (the loop thread, or the
-				// dispatch goroutine, deadlocks on itself), a count left behind is
-				// made again by the next Detach, and closeConn undoes one. The
-				// promoted path closes the conn instead (the deferred hook below).
-				// Assignments only, under no lock: this goroutine owns the conn's
-				// state here, as it did when the hook installed it (#889 item 34).
-				defer func() {
-					if finished {
-						return
-					}
-					cs.writeFn = prevWrite
-					if h1 != nil {
-						h1.UpdateWriteFn(prevWrite)
-						h1.SetWriteErrQuery(cs)
-						h1.RawWriteFn, h1.PauseRecv, h1.ResumeRecv = prevRaw, prevPause, prevResume
-					}
-					cs.detachMu = prevMu
-					cs.asyncDetachPending = prevPending
-					if counted {
-						w.detachedCount--
-						cs.detachCounted = false
-						if w.detachedConns != nil {
-							w.detachedConns.Add(-1)
-						}
-					}
-				}()
-			}
 			if unlockDetachMu {
 				// Registered before guarded is installed (celeris#844): from the moment
 				// cs.writeFn is guarded, a write through the response adapter locks
@@ -3960,16 +4007,19 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// more (celeris#806): the drain finishes the responses it has, and a
 	// request taken now could only be answered into a queue that the
 	// drain, which lasts as long as the budget, would never find empty
-	// under steady keep-alive traffic. Epoll's shutdown phases stop reading
-	// (its pool wait does not: celeris#885). The bytes are dropped with the
-	// connection, which shutdown closes; the recv is not re-armed, so a
-	// request whose bytes were still arriving at the gate (the body of an
-	// upload, headers in pieces) is never answered. A detached conn is read no
-	// more either (its writes were ended with the gate: stopDetachedProducers).
+	// under steady keep-alive traffic. The bytes of a NEW request are dropped
+	// and the recv is not re-armed: the conn holds nothing, and the gate's pass
+	// closes it (closeIdleH1). A request already IN PROGRESS (the body of an
+	// upload, headers in pieces, the bytes of a protocol decision begun) is read
+	// on, as std's Shutdown answers an active conn, and answered with
+	// Connection: close (gateReadsOn, celeris#884 item 73); that includes a
+	// conn whose dispatch goroutine owns the parse state, which epoll cannot
+	// yet look inside. A detached conn is read no more (its writes were ended
+	// with the gate: stopDetachedProducers).
 	// HTTP/2 conns are served on: they have had GOAWAY since the pool wait,
 	// and what their responses may still wait for was waited for there or
 	// is out of time.
-	if w.refuseRecv && (!cs.detected || w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
+	if w.refuseRecv && (!cs.detected || w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) && !w.gateReadsOn(cs) {
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
 			w.hasBufReturns = true
@@ -7770,7 +7820,22 @@ const (
 // no new stream on it, as net/http's graceful shutdown does, and a stream it
 // opens anyway is refused. The wait is bounded by the budget the last
 // Engine.Shutdown handed over, as epoll's is, and never ends before
-// h2PoolDrainFloor. Worker thread.
+// h2PoolDrainFloor.
+//
+// A GOAWAY the write hook refuses (the conn's backlog is over the HTTP/2 cap,
+// 64 MiB, so its peer has stopped reading) is lost and sets writeRefused; this
+// pass does not look at it (celeris#885 item 14, read from the code, not
+// measured). The conn is not left open for it: the next drainH2Writes with a
+// frame queued closes the conn (closeConn sends what was staged first), a recv
+// of the conn that finds writeRefused ends it as a request error does
+// (handleRecv), and a conn with none of those is not busy here, so the pass
+// settles and shutdown closes it. What the lost GOAWAY costs is the client's
+// graceful notice, from a peer that was not reading; what a conn that stays
+// busy (OutboundPending, response DATA waiting for a WINDOW_UPDATE that will not
+// come) costs is the wait up to the drain's bound, the same as for any conn
+// whose peer is not taking its response.
+//
+// Worker thread.
 func (w *Worker) h2PoolSettled() bool {
 	if len(w.h2Conns) == 0 {
 		return true
@@ -7978,10 +8043,21 @@ func endDetachedWrites(cs *connState) {
 func (w *Worker) stopDetachedProducers() {
 	for _, fd := range w.liveConns {
 		cs := w.conns[fd]
-		if cs == nil || cs.detachMu == nil || cs.h1State == nil || !cs.h1State.Detached.Load() {
+		if cs == nil || cs.detachMu == nil {
+			continue
+		}
+		// h1State is read before the lock only on a conn the worker owns; on a
+		// promoted conn the dispatch goroutine may set it to nil (an h2c
+		// upgrade, celeris#722), so it is read under detachMu.
+		promoted := cs.asyncPromoted.Load()
+		if !promoted && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
 			continue
 		}
 		if !cs.detachMu.TryLock() {
+			continue
+		}
+		if promoted && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
+			cs.detachMu.Unlock()
 			continue
 		}
 		if !cs.detachClosed && !cs.asyncDetachPending {
@@ -8004,13 +8080,23 @@ func (w *Worker) stopDetachedProducers() {
 // flushed, or EAGAIN) says the CQ ring has no room, not that the ring failed:
 // the SQEs the enter did not take stay pending (retryPending), and the loop's
 // own pass over the CQ ring after this returns is the reap that makes room.
-// The error is counted and, the first time on a worker, logged as a Warn;
-// there is no ceiling on the retries (a ring that fails for good with EBUSY
-// or EAGAIN is retried until the context is cancelled: the checklist of
-// celeris#884 records it). With nothing in the ring to reap the worker gives
-// the kernel a moment (cancelAccept's drain does the same) rather than enter
-// again at once. Any other error is the ring failing: the worker stops, and
-// closes what it owns.
+// The error is counted and, the first time on a worker, logged as a Warn.
+// With nothing in the ring to reap the worker gives the kernel a moment
+// (cancelAccept's drain does the same) rather than enter again at once.
+//
+// A ring that answers for good, with nothing in its CQ ring to reap, is not
+// one whose CQ ring is full but one that is failing, and the retries end as
+// they did before they existed: after ringWaitCeiling of consecutive retries
+// that reaped nothing the worker stops (false: the caller shuts it down) and
+// logs an Error (celeris#884 item 72). A retry that finds a completion in the
+// CQ ring, which the loop's own pass reaps, is the loop being behind its ring
+// and ends the run; so does a wait that succeeded in between (the loop pass
+// count, which moves once per pass, jumps by more than one: a retry is part
+// of the run only if it follows the last one at once), and a run is not
+// carried over a gap longer than ringWaitRunGap between two retries, which is
+// more than a pass of a ring that fails takes and than a timed wait of an
+// idle one (a park, a slow callback in the gate pass, a long wait end it). Any other error is the ring
+// failing: the worker stops, and closes what it owns.
 func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 	if h := ringWaitSeam; h != nil {
 		err = h(w, mode, err)
@@ -8023,18 +8109,38 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 	}
 	w.ringWaitRetries.Add(1)
 	if !w.ringWaitWarned {
-		// Once per worker: there is no ceiling on the retries and the counter
-		// is not a public metric, so this line is how an operator on a 5.19
-		// to 6.1 kernel sees a loop that keeps retrying.
+		// Once per worker: the counter is not a public metric, so this line is
+		// how an operator on a 5.19 to 6.1 kernel sees a loop that keeps
+		// retrying (it stops after ringWaitCeiling of retries that reap
+		// nothing).
 		w.ringWaitWarned = true
 		if w.logger != nil {
 			w.logger.Warn("io_uring: a ring wait answered a retryable error (the CQ ring has no room); the worker reaps and retries, and does not log this again",
 				"worker", w.id, "wait", mode.String(), "err", err)
 		}
 	}
-	if h, t := w.ring.BeginCQ(); h == t {
-		time.Sleep(50 * time.Microsecond)
+	h, t := w.ring.BeginCQ()
+	if h != t {
+		w.ringWaitRunStart = 0 // the loop reaps: not a ring that is stuck
+		return true
 	}
+	now := time.Now().UnixNano()
+	if w.ringWaitRunStart == 0 || w.tickCounter-w.ringWaitRunTick > 1 || now-w.ringWaitRunLast > int64(ringWaitRunGap) {
+		// A new run: a wait succeeded since the last retry (the pass count
+		// moved by more than one), or a pass took longer than a retried
+		// pass can (a park, a slow callback): the retries are not consecutive.
+		w.ringWaitRunStart = now
+	} else if now-w.ringWaitRunStart >= int64(ringWaitCeiling) {
+		if w.logger != nil {
+			w.logger.Error("io_uring: a ring wait has answered a retryable error for the whole ceiling with nothing to reap; the ring is failing, the worker stops",
+				"worker", w.id, "wait", mode.String(), "err", err, "ceiling", ringWaitCeiling,
+				"retries", w.ringWaitRetries.Load())
+		}
+		return false
+	}
+	w.ringWaitRunTick = w.tickCounter
+	w.ringWaitRunLast = now
+	time.Sleep(50 * time.Microsecond)
 	return true
 }
 
@@ -8397,6 +8503,21 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 	// own rules: a byte over 255 ("300.1.1.1" bound 44.1.1.1), a leading zero
 	// ("0127.0.0.1": octal in some parsers), a fifth byte, and the shorthands
 	// inet_aton reads ("10", "127.1": "1.2.3" bound 1.2.3.0).
+	//
+	// A zoned IPv6 host ("fe80::1%eth0") is what net.Listen binds and net.ParseIP
+	// rejects: it is read with netip, which keeps the zone, and the zone becomes
+	// the socket address's scope id as net.Listen makes it (bindiag.ZoneID). An
+	// IPv4-mapped host is IPv4 whatever its zone, as for std (celeris#885
+	// item 54).
+	var zone string
+	if strings.IndexByte(host, '%') >= 0 {
+		za, err := netip.ParseAddr(host)
+		if err != nil || !za.Is6() {
+			return nil, fmt.Errorf("invalid addr: %s", addr)
+		}
+		zone = za.Zone()
+		host = za.WithZone("").String()
+	}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return nil, fmt.Errorf("invalid addr: %s", addr)
@@ -8406,7 +8527,7 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 		copy(sa.Addr[:], ip4)
 		return sa, nil
 	}
-	sa := &unix.SockaddrInet6{Port: port}
+	sa := &unix.SockaddrInet6{Port: port, ZoneId: bindiag.ZoneID(zone)}
 	copy(sa.Addr[:], ip.To16())
 	return sa, nil
 }

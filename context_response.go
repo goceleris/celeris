@@ -1834,7 +1834,13 @@ func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 	return sw.streamer.WriteHeader(sw.stream, status, headers)
 }
 
-// Write sends a chunk of the response body. May be called multiple times.
+// Write sends a chunk of the response body. May be called multiple times. On
+// HTTP/1.1 an empty data sends nothing (a zero-length chunk would end the
+// response). On epoll, io_uring and Adaptive a Write after Close, or after the
+// headers of a response that has no body (HEAD, 1xx, 204, 304), sends nothing
+// and returns a nil error ([StreamWriter.BytesWritten] counts it; the std
+// engine leaves what net/http does with it). One Write of more than 1 GiB is sent
+// as several chunks, so an error part-way leaves the first of them sent.
 //
 // On HTTP/2 the chunk is held to the peer's flow-control windows
 // (RFC 9113 §6.9.1). Called from a worker-pool goroutine (an async route), Write
@@ -1848,7 +1854,7 @@ func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 // bytes written, though part of the chunk may already have been sent on
 // HTTP/2, and [StreamWriter.BytesWritten] does not count it. On HTTP/1.1 on
 // epoll, io_uring and Adaptive none of the chunk is staged when it returns an
-// error (see [StreamWriter.Flush] for the limits that refuse one).
+// error (a Write of more than 1 GiB excepted; see [StreamWriter.Flush] for the limits that refuse one).
 //
 // On HTTP/2 the stream ends when the handler returns, detached or not (see
 // [Context.Detach]): a Write, WriteHeader or Close from a goroutine that
@@ -1951,6 +1957,9 @@ func (sw *StreamWriter) Close() error {
 // the writer, then reject the request (authentication in OnConnect) with a
 // proper status. Once the writer has been used, or the Context detached, the
 // response belongs to the stream and an error is not written.
+// A handler that takes the writer, sends nothing and returns nil is answered
+// with an empty 200, as a handler that answers nothing is; so is one that sent
+// only an interim (1xx) response; on epoll, io_uring and Adaptive a 500 answers one that failed after it (std answers an empty 200).
 //
 // On native engines (epoll, io_uring), the caller must call [Context.Detach]
 // before spawning a goroutine that uses the StreamWriter. Call Close() when done.
@@ -1974,6 +1983,21 @@ func (sw *StreamWriter) Close() error {
 // runtime.Goexit after its headers went out. END_STREAM is never sent for a
 // body that is not as long as its declared length. The reset is logged through
 // [Config].Logger, and the end of an unclosed complete response at Debug level.
+//
+// On HTTP/1.1 a handler that returns without calling Close does not leave the
+// client waiting either: the chunked response is ended with its last chunk when
+// the handler returns, on every engine (a HEAD response, and one with a status
+// that has no content, 1xx, 204 and 304, has none to send). A response that
+// declared a content-length is ended only if the handler wrote exactly that
+// many bytes. A handler that panicked or returned an error after its headers
+// went out, or wrote a body that is not as long as it declared, has not
+// finished a response, so the last chunk is not sent: on epoll, io_uring and
+// Adaptive the connection is closed without it, and the client sees a
+// truncated body (the HTTP/1.1 form of the reset above; on the std engine the
+// router recovers a panic and swallows an error before net/http sees it, so
+// net/http ends the response). An explicit Close ends the response whatever was
+// written. A Context that was detached before the handler returned is the
+// goroutine's to end: nothing is sent at the handler's return.
 func (c *Context) StreamWriter() *StreamWriter {
 	// Streaming is fundamentally incompatible with response buffering:
 	// buffered responses are held in memory for possible mutation/discard,

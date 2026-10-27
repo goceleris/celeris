@@ -235,9 +235,10 @@ jobs:
           #     workers and the runner's 8 MiB funds one; the step "celeris#592
           #     settled-route retime rig" below runs them with memlock raised and
           #     CELERIS_REQUIRE_IOURING_WORKERS=1, where a skip is a failure.
-          #   * TestRouteAdaptive_SettleReopenCost and
-          #     TestWriteBufBackpressureClosesSlowConsumer: opt-in measurements
-          #     (CELERIS_592_COST=1, GOTEST_BACKPRESSURE=1), not checks.
+          #   * TestRouteAdaptive_SettleReopenCost,
+          #     TestWriteBufBackpressureClosesSlowConsumer and
+          #     TestProbeDrainReadFloodLatency885: opt-in measurements
+          #     (CELERIS_592_COST=1, GOTEST_BACKPRESSURE=1, CELERIS_PROBE_885=1), not checks.
           #   * the four alloc-count tests in middleware/sse: they skip
           #     under -race and every step of this job is -race (celeris#684);
           #     the step "celeris#890 allocation guards and alloc-count tests,
@@ -252,7 +253,7 @@ jobs:
           # too. That is safe only while this step excludes /engine/iouring$ (the
           # pkgs line above; the step after it runs that package with its own list).
           # A name added here allows that name in every package this step runs.
-          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestSlowClientDropPathAllocs888|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux'
+          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestProbeDrainReadFloodLatency885|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestSlowClientDropPathAllocs888|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux'
           required='TestSendfileEndToEndLargeFile|TestSendfileHEADNoBody|TestSendfileRangeRequest|TestSendfileSubThresholdFallback'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
           ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/root.log || true)
@@ -1893,10 +1894,12 @@ jobs:
       # name (its allow-list) and this step runs them with memlock raised and
       # CELERIS_REQUIRE_IOURING_WORKERS=1, which turns the skip into a failure.
       # The pause/resume pair of the `unit` job (one funded worker there) runs
-      # here with the two it asks for, and so does celeris#886's resume test
+      # here with the two it asks for, and so do celeris#886's resume test
       # (TestResumeAcceptReachesAWorkerThatCannotPark886: at 8 MiB it has one
       # worker and cannot tell a resume that signals every worker from one that
-      # signals the first). Exactly seven top-level PASS lines and no SKIP line: a rename or a
+      # signals the first) and its pause test
+      # (TestBeginPauseAcceptReachesAnIdleWorker886, the same for the pause).
+      # Exactly eight top-level PASS lines and no SKIP line: a rename or a
       # quarantine selects nothing silently, and a skip is not coverage.
       - name: celeris#895/#896 multi-worker listener tests (memlock raised, skipping forbidden)
         if: ${{ !cancelled() }}
@@ -1907,7 +1910,7 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895|TestPort0ResumeKeepsThePort895|TestPort0PausedPortCannotBeTaken895|TestResumeAcceptReachesAWorkerThatCannotPark886'
+          names='TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895|TestPort0ResumeKeepsThePort895|TestPort0PausedPortCannotBeTaken895|TestResumeAcceptReachesAWorkerThatCannotPark886|TestBeginPauseAcceptReachesAnIdleWorker886'
           go test -race -count=1 -timeout=600s -v -run "^(${names})\$" \
             ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring895.log
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))

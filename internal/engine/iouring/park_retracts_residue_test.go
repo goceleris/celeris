@@ -23,9 +23,19 @@ package iouring
 // close owed does not park, so the next iteration's sweep() retracts. The arm
 // goes red with both removed, not with the retraction alone (checked in
 // celeris#885 item 11); the retraction is what a close with nothing in flight
-// would need.
+// would need. TestParkedWorkerRetractsResidueOfACloseWithNothingInFlight884 is
+// that close (celeris#884 item 80): the conn's recv is ended and reaped inside
+// the sweep's own pass, so its close lands after sweep() with nothing owed to
+// the kernel, the gate does not hold the worker, and only the retraction at
+// the park clears the gauges (red with it removed). What this proves: the
+// retraction is needed for that state. What it does not: that production
+// reaches that state (no traffic path was found that leaves the last conn with
+// no op in flight after sweep(); the state is manufactured in the hook), so the
+// item's other outcome, calling the retraction dead behind the closeFDOwed gate,
+// is not shown either.
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -100,7 +110,12 @@ func parkWaitIou(d time.Duration, f func() bool) bool {
 // checkTimeouts (postSweep) or by the client, right after PauseAccept
 // (!postSweep), and asserts that a worker that has parked holding nothing
 // publishes nothing. The header timeout is 60 s in both arms: far from either.
-func parkResidueIou(t *testing.T, postSweep bool) {
+func parkResidueIou(t *testing.T, postSweep bool) { parkResidueIouMode(t, postSweep, false) }
+
+// parkResidueIouMode is parkResidueIou with a third kind of close: nothingOwed
+// replaces ReadTimeout's close by one made after sweep() with no op owed to the
+// kernel (see afterSweepNothingOwed884).
+func parkResidueIouMode(t *testing.T, postSweep, nothingOwed bool) {
 	var disc atomic.Int64
 	e, addr := startParkEngine711(t, fdlHandler{}, func(c *resource.Config) {
 		c.OnDisconnect = func(string) { disc.Add(1) }
@@ -110,7 +125,7 @@ func parkResidueIou(t *testing.T, postSweep bool) {
 		// listener, the only kind that parks.
 		c.DisableDeferAccept = true
 		c.ReadHeaderTimeout = 60 * time.Second // neither the header timer nor its checkTimeouts close can come first
-		if postSweep {
+		if postSweep && !nothingOwed {
 			c.ReadTimeout = 300 * time.Millisecond
 			c.IdleTimeout = 10 * time.Minute
 		}
@@ -156,6 +171,12 @@ func parkResidueIou(t *testing.T, postSweep bool) {
 		t.Fatalf("celeris711 PREMISE: the sweep never published a residue of 1 (sum=%d adopted=%d)",
 			residueSum(e.Metrics()), tgt.adopted.Load())
 	}
+	var manufactured atomic.Int32
+	if nothingOwed {
+		hook := afterSweepNothingOwed884(&manufactured)
+		testHookCheckTimeouts.Store(&hook)
+		t.Cleanup(func() { testHookCheckTimeouts.Store(nil) })
+	}
 	if err := e.PauseAccept(); err != nil {
 		t.Fatalf("pause: %v", err)
 	}
@@ -163,13 +184,16 @@ func parkResidueIou(t *testing.T, postSweep bool) {
 		t.Fatalf("celeris711 PREMISE: the connection closed (active=%d) before PauseAccept returned, so not "+
 			"on a worker without a listener", n)
 	}
-	if !postSweep {
+	if !postSweep && !nothingOwed {
 		// The client leaves, far before any deadline: the worker reads the
 		// EOF from a CQE, and CQEs are dispatched before sweep().
 		_ = c.Close()
 	}
 	if !parkWaitIou(10*time.Second, func() bool { return e.Metrics().ActiveConnections == 0 }) {
 		t.Fatalf("celeris711 PREMISE: the connection was never closed")
+	}
+	if nothingOwed && manufactured.Load() != 1 {
+		t.Fatalf("celeris884 PREMISE: the sweep hook ended the conn's recv %d times, want 1", manufactured.Load())
 	}
 	if !parkWaitIou(3*time.Second, allParked) {
 		t.Fatalf("celeris711 PREMISE: not every worker parked")
@@ -202,3 +226,45 @@ func TestParkedWorkerRetractsResidueOfAPostSweepClose(t *testing.T) { parkResidu
 // connection closed by the client's EOF, a CQE dispatched before sweep(),
 // which retracted before this fix as well.
 func TestParkedWorkerRetractsResidueOfAPreSweepClose(t *testing.T) { parkResidueIou(t, false) }
+
+// afterSweepNothingOwed884 is a checkTimeouts hook (it runs on the worker's
+// thread, after sweep() in the same pass) that gives a worker with one live
+// conn, no listener and a recv armed on it the close celeris#884 item 80 asks
+// for: it cancels the recv, submits, and reaps the cancelled recv's CQE the way
+// the loop does, which closes the conn (a failed recv closes it) with nothing
+// left in flight. The close is therefore after sweep() and owes the kernel
+// nothing, so closeFDOwed stays 0 and the worker parks in the same pass; once.
+func afterSweepNothingOwed884(done *atomic.Int32) func(*Worker) {
+	return func(w *Worker) {
+		if done.Load() != 0 || w.listenFD >= 0 || !w.acceptPaused.Load() || len(w.liveConns) != 1 {
+			return
+		}
+		cs := w.conns[w.liveConns[0]]
+		if cs == nil || !cs.recvArmed || cs.closing {
+			return
+		}
+		fd := cs.fd
+		if w.cancelConnOps(fd, cs) {
+			return // the cancel was not placed; the next sweep tries again
+		}
+		done.Store(1)
+		for end := time.Now().Add(2 * time.Second); w.conns[fd] == cs && time.Now().Before(end); {
+			if err := w.ring.SubmitAndWaitTimeout(10 * time.Millisecond); err != nil && !ringWaitRetryable(err) {
+				return
+			}
+			head, tail := w.ring.BeginCQ()
+			for ; head != tail; head++ {
+				w.processCQE(context.Background(), w.ring.cqeAt(head), time.Now().UnixNano())
+			}
+			w.ring.EndCQ(head)
+		}
+	}
+}
+
+// TestParkedWorkerRetractsResidueOfACloseWithNothingInFlight884 is the arm item
+// 80 asks for: the last conn closed after sweep() with nothing owed to the
+// kernel, which the closeFDOwed gate does not hold off the park. It goes red
+// with the park's sweepRetract removed.
+func TestParkedWorkerRetractsResidueOfACloseWithNothingInFlight884(t *testing.T) {
+	parkResidueIouMode(t, true, true)
+}
