@@ -202,45 +202,29 @@ type h2PoolServer759 struct {
 	shutErr   chan error
 }
 
+// startH2PoolServer759 starts a server on a listener it picked, under a context
+// the server's cancel stops (StartWithListenerAndContext, which shares
+// StartWithContext's shutdown), and waits until it answers /ping; see
+// startServer760 for the retry and startPickedCtx1104 for the listener.
 func startH2PoolServer759(t *testing.T, eng celeris.EngineType, budget time.Duration, routes func(*celeris.Server)) *h2PoolServer759 {
 	t.Helper()
-	retryUntil := time.Now().Add(30 * time.Second)
-	for tries := 1; ; tries++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		s := celeris.New(celeris.Config{Engine: eng, Addr: addr, ShutdownTimeout: budget})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // a start that never succeeds leaves nothing running
+	s, addr, done := startPickedCtx1104(ctx, t, celeris.Config{Engine: eng, ShutdownTimeout: budget}, func(s *celeris.Server) {
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 		routes(s)
-		ctx, cancel := context.WithCancel(context.Background())
-		srv := &h2PoolServer759{s: s, addr: addr, cancel: cancel, startDone: make(chan error, 1)}
-		go func() { srv.startDone <- s.StartWithContext(ctx) }()
-		err = waitDrainOrderReady(addr, srv.startDone)
-		if err == nil {
-			if tries > 1 {
-				t.Logf("server start retried on ring ENOMEM: %d tries", tries)
-			}
-			t.Cleanup(func() {
-				cancel()
-				select {
-				case err := <-srv.startDone:
-					srv.startDone <- err
-				case <-time.After(30 * time.Second):
-					t.Errorf("StartWithContext did not return within 30s of the cleanup cancel")
-				}
-			})
-			return srv
-		}
+	}, func(_ *celeris.Server, addr string, done <-chan error) error { return waitDrainOrderReady(addr, done) })
+	srv := &h2PoolServer759{s: s, addr: addr, cancel: cancel, startDone: done}
+	t.Cleanup(func() {
 		cancel()
-		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
-			time.Sleep(20 * time.Millisecond)
-			continue
+		select {
+		case err := <-srv.startDone:
+			srv.startDone <- err
+		case <-time.After(30 * time.Second):
+			t.Errorf("StartWithContext did not return within 30s of the cleanup cancel")
 		}
-		t.Fatalf("server did not start: %v", err)
-	}
+	})
+	return srv
 }
 
 // beginShutdown starts the shutdown: a cancel of StartWithContext's context
