@@ -128,6 +128,9 @@ type pgRequest struct {
 	rows      [][][]byte
 	rowFields [][]byte
 	rowSlab   []byte
+	// slabBytes is the payload bytes buffered in total, over every slab chunk
+	// (rowSlab is the current one): what maxDirectResultBytes bounds.
+	slabBytes int
 	tag       string
 	err       error
 	doneCh    chan struct{}
@@ -360,6 +363,7 @@ func releasePgRequest(r *pgRequest) {
 	}
 	r.rowFields = r.rowFields[:0]
 	r.rowSlab = r.rowSlab[:0]
+	r.slabBytes = 0
 	r.tag = ""
 	r.err = nil
 	r.rowCh = nil
@@ -376,11 +380,15 @@ func releasePgRequest(r *pgRequest) {
 // preserves the nil-vs-empty distinction for PG NULLs (nil) vs zero-length
 // text (non-nil empty slice).
 //
-// Aliasing correctness: the slab grows with append, which may reallocate
-// the backing array. Any sub-slice taken before the reallocation would be
-// stale. We avoid the problem by growing the slab to its final size first
-// (single pre-append if capacity is insufficient) and then handing out
-// sub-slices against the now-stable backing array.
+// Aliasing correctness: a row-view points into the slab and the row fields
+// that were current when it was carved. When one is full, a NEW chunk is
+// started and the old one is not copied: the earlier views keep pointing into
+// the old array, which stays valid for as long as a row references it, and no
+// view is ever carved across a chunk (a row's fields are made to fit first).
+// Growing by copy left every earlier generation reachable through the views
+// already handed out: with 1.25x growth that is 5 times the data held, for a
+// reply of 2M rows 1.1 GB of live heap (celeris#1104). Chunked, the live heap
+// is the data plus the unused tail of the last chunk.
 func (r *pgRequest) appendRowFromAlias(fields [][]byte) {
 	totalBytes := 0
 	for _, f := range fields {
@@ -391,22 +399,15 @@ func (r *pgRequest) appendRowFromAlias(fields [][]byte) {
 	// same backing array and stay valid.
 	if totalBytes > 0 {
 		if cap(r.rowSlab)-len(r.rowSlab) < totalBytes {
-			// Grow with append+len to get amortized 2x behavior.
-			need := len(r.rowSlab) + totalBytes
-			// Use make+copy so we can size the new slab to fit without
-			// walking through a sequence of incremental appends.
-			ns := make([]byte, len(r.rowSlab), growCap(cap(r.rowSlab), need))
-			copy(ns, r.rowSlab)
-			r.rowSlab = ns
+			// The current chunk is full: start the next, not a copy of this one.
+			r.rowSlab = make([]byte, 0, chunkCap(cap(r.rowSlab), totalBytes))
 		}
+		r.slabBytes += totalBytes
 	}
 	// Ensure rowFields has stable storage for the row-view. One grow if
 	// needed, then a no-realloc append for the row itself.
 	if cap(r.rowFields)-len(r.rowFields) < len(fields) {
-		need := len(r.rowFields) + len(fields)
-		nf := make([][]byte, len(r.rowFields), growCap(cap(r.rowFields), need))
-		copy(nf, r.rowFields)
-		r.rowFields = nf
+		r.rowFields = make([][]byte, 0, chunkCap(cap(r.rowFields), len(fields)))
 	}
 	start := len(r.rowFields)
 	r.rowFields = r.rowFields[:start+len(fields)]
@@ -427,20 +428,16 @@ func (r *pgRequest) appendRowFromAlias(fields [][]byte) {
 	r.rows = append(r.rows, view)
 }
 
-// growCap returns a capacity for a slice growth from old to at least need.
-// Mirrors runtime.growslice heuristics (double up to ~1KB, then 1.25x).
-func growCap(old, need int) int {
-	if old < 32 {
-		old = 32
-	}
-	for old < need {
-		if old < 1024 {
-			old *= 2
-		} else {
-			old = old + old/4
-		}
-	}
-	return old
+// maxChunk is the largest chunk of slab (bytes) or row fields (elements) a
+// request starts without being asked for more: past it chunks stop doubling, so
+// the unused tail of the last one stays small however large the reply is.
+const maxChunk = 1 << 16
+
+// chunkCap is the capacity of the next chunk after one of capacity old, for at
+// least need: double, then a fixed maxChunk.
+func chunkCap(old, need int) int {
+	n := min(max(old, 32)*2, maxChunk)
+	return max(n, need)
 }
 
 // Ctx implements async.PendingRequest.
@@ -517,7 +514,7 @@ func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok boo
 		for _, f := range fields {
 			size += len(f)
 		}
-		if len(r.rowSlab)+size > maxDirectResultBytes {
+		if r.slabBytes+size > maxDirectResultBytes {
 			if r.err == nil {
 				r.err = ErrResultTooBig
 			}
