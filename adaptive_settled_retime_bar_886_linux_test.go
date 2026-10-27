@@ -3,7 +3,9 @@
 package celeris
 
 import (
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -173,5 +175,66 @@ created by github.com/goceleris/celeris/internal/engine/iouring.(*Engine).Listen
 				t.Fatalf("classifyLoopStack589 = %q (parked %v), want %q (parked %v)", got, mutexParked589(got), tc.want, tc.parked)
 			}
 		})
+	}
+}
+
+// TestClassifyLoopStackReadsEveryMutexWait589 (celeris#886 item 27): the
+// classifier counted only a sync.(*Mutex).Lock frame. A worker parked on an
+// RWMutex, or one whose Lock frame is not in the dump but whose header carries
+// the wait reason, is as parked as the verbatim celeris#593 one. The stacks are
+// synthetic, built on the shape of that verbatim dump.
+func TestClassifyLoopStackReadsEveryMutexWait589(t *testing.T) {
+	loop := func(header, frames string) string {
+		return header + "\n" + frames +
+			"github.com/goceleris/celeris/internal/engine/epoll.(*Loop).run(0xc000123456, {0xdd3928, 0xc000628870})\n" +
+			"\t/src/internal/engine/epoll/loop.go:100 +0x1688"
+	}
+	for _, tc := range []struct {
+		name, stack, want string
+	}{
+		{"Mutex frame", loop("goroutine 7 [sync.Mutex.Lock]:", "sync.(*Mutex).Lock(...)\n\t/usr/local/go/src/sync/mutex.go:46\n"), "other_Mutex_Lock"},
+		{"RWMutex write lock frame", loop("goroutine 7 [sync.RWMutex.Lock]:", "sync.(*RWMutex).Lock(0xc0001)\n\t/usr/local/go/src/sync/rwmutex.go:150 +0x40\n"), "other_Mutex_Lock"},
+		{"RWMutex read lock frame", loop("goroutine 7 [sync.RWMutex.RLock]:", "sync.(*RWMutex).RLock(...)\n\t/usr/local/go/src/sync/rwmutex.go:70\n"), "other_Mutex_Lock"},
+		{"wait reason in the header only", loop("goroutine 7 [sync.RWMutex.RLock, locked to thread]:", ""), "other_Mutex_Lock"},
+		{"Mutex wait reason in the header only", loop("goroutine 7 [sync.Mutex.Lock, 3 minutes]:", ""), "other_Mutex_Lock"},
+		{"checkTimeouts on an RWMutex", loop("goroutine 7 [sync.RWMutex.RLock]:", "sync.(*RWMutex).RLock(...)\ngithub.com/goceleris/celeris/internal/engine/epoll.(*Loop).checkTimeouts(0xc0001)\n"), "checkTimeouts_detachMu_Lock"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !isLoopGoroutine589(tc.stack) {
+				t.Fatalf("the synthetic stack is not an event loop to isLoopGoroutine589:\n%s", tc.stack)
+			}
+			got := classifyLoopStack589(tc.stack)
+			if got != tc.want || !mutexParked589(got) {
+				t.Errorf("classifyLoopStack589 = %q (parked %v), want %q (parked)", got, mutexParked589(got), tc.want)
+			}
+		})
+	}
+	running := loop("goroutine 7 [running]:", "")
+	if got := classifyLoopStack589(running); mutexParked589(got) {
+		t.Errorf("a running loop is classified %q, parked", got)
+	}
+}
+
+// TestFullStackIsNotCutAtItsFirstBuffer589: capture used one fixed 1 MiB buffer
+// and read what fitted. A process with enough goroutines to overflow it lost
+// the tail of the dump. Park enough goroutines to need more than 1 MiB, and
+// require every one of them in the dump.
+func TestFullStackIsNotCutAtItsFirstBuffer589(t *testing.T) {
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	const n = 20000
+	for range n {
+		wg.Add(1)
+		go func() { defer wg.Done(); <-stop }()
+	}
+	defer func() { close(stop); wg.Wait() }()
+
+	dump := fullStack589()
+	if len(dump) <= 1<<20 {
+		t.Fatalf("%d parked goroutines produced a %d byte dump, not over the 1 MiB first buffer: the test does not reach the growth", n, len(dump))
+	}
+	headers := strings.Count(string(dump), "\ngoroutine ") + 1
+	if want := runtime.NumGoroutine(); headers < n || headers > want+50 {
+		t.Errorf("the dump holds %d goroutines, want at least the %d parked ones and about %d in all", headers, n, want)
 	}
 }
