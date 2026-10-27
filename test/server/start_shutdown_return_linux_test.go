@@ -93,7 +93,7 @@ func runStartShutdownCaseCfg(t *testing.T, cfg celeris.Config, withListener bool
 	// A fresh server and listener per try: an io_uring Start can fail with
 	// ring-setup ENOMEM under the runner's 8 MiB memlock while earlier rings
 	// are still charged (celeris#1104).
-	startRetryingRingENOMEM(t, "server start", func() error {
+	startRetrying1104(t, "server start", func() error {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("listen: %v", err)
@@ -117,7 +117,12 @@ func runStartShutdownCaseCfg(t *testing.T, cfg celeris.Config, withListener bool
 			cfg.Addr = addr
 		}
 		s = celeris.New(cfg)
-		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+		// Start picks nothing here when !withListener, but the port was picked and
+		// closed by this test: a parallel test can take it first, and then the
+		// OTHER server's /ping would answer this one's readiness probe while this
+		// Start failed. /ping therefore says whose it is (celeris#1104).
+		token := fmt.Sprintf("ok-%d", time.Now().UnixNano())
+		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "%s", token) })
 		s.GET("/slow", func(c *celeris.Context) error {
 			select {
 			case handlerStarted <- struct{}{}:
@@ -138,7 +143,7 @@ func runStartShutdownCaseCfg(t *testing.T, cfg celeris.Config, withListener bool
 		// engine is up, the probe listener's backlog still accepts the TCP
 		// connection and nobody answers, so a long timeout would park the poll
 		// loop and hide a Start that already returned an error.
-		ok, werr := waitReadyErr(&http.Client{Timeout: 300 * time.Millisecond}, "http://"+addr+"/ping", startDone)
+		ok, werr := waitReadyErr(&http.Client{Timeout: 300 * time.Millisecond}, "http://"+addr+"/ping", token, startDone)
 		if werr != nil {
 			if withListener {
 				_ = ln.Close()
@@ -214,7 +219,7 @@ func runStartShutdownCaseCfg(t *testing.T, cfg celeris.Config, withListener bool
 // a silent skip would look like a pass).
 func waitReady(t *testing.T, client *http.Client, url string, startDone <-chan error) bool {
 	t.Helper()
-	ok, err := waitReadyErr(client, url, startDone)
+	ok, err := waitReadyErr(client, url, "", startDone)
 	if err != nil {
 		t.Fatalf("Start returned before the server was ready: %v", err)
 	}
@@ -223,7 +228,10 @@ func waitReady(t *testing.T, client *http.Client, url string, startDone <-chan e
 
 // waitReadyErr is waitReady that returns the error Start returned first
 // instead of failing, so a caller can retry a ring-setup ENOMEM (celeris#1104).
-func waitReadyErr(client *http.Client, url string, startDone <-chan error) (bool, error) {
+// A non-empty want is the body the server's own /ping returns: an answer with
+// another body is another server's (one that holds the port this one failed to
+// bind) and does not count as ready, so Start's error is what is returned.
+func waitReadyErr(client *http.Client, url, want string, startDone <-chan error) (bool, error) {
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
@@ -233,9 +241,9 @@ func waitReadyErr(client *http.Client, url string, startDone <-chan error) (bool
 		}
 		resp, err := client.Get(url)
 		if err == nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
+			b, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			if resp.StatusCode == http.StatusOK && (want == "" || string(b) == want) {
 				return true, nil
 			}
 		}

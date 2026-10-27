@@ -347,6 +347,15 @@ type H1State struct {
 	// mid-body. Called on the goroutine running ProcessH1, under the
 	// engine's lock for the connection's buffers if it has one.
 	WriteBacklogged func() bool
+
+	// CloseAfter, set by an engine that is shutting down (epoll's pool-wait
+	// gate, celeris#885 item 49), makes every request handled from then on
+	// close-after: its response carries Connection: close and the connection
+	// ends once the response has gone, as net/http's response written after
+	// Shutdown began does, so a client does not write its next request to a
+	// connection that is about to be closed. Set and read on the goroutine that
+	// runs ProcessH1 (the loop thread for a conn the loop parses).
+	CloseAfter bool
 }
 
 // TakeBufferedBytes returns a copy of any bytes ProcessH1 stashed in the
@@ -429,6 +438,13 @@ func (s *H1State) CurrentRoute() (method, path string) {
 // OnDetach to route StreamWriter writes through the mutex-guarded writeFn.
 func (s *H1State) UpdateWriteFn(fn func([]byte)) {
 	s.rw.write = fn
+	// The stream is detached from here on: its writer lives as long as the
+	// connection, so it keeps a small chunk scratch at most (a broadcast of one
+	// large event must not pin a large buffer on every connection).
+	s.rw.scratchDetached = true
+	if cap(s.rw.chunkBuf) > chunkScratchKeep {
+		s.rw.chunkBuf = nil
+	}
 }
 
 // WriteErrQuery is the engine's write-error query for an HTTP/1 streaming
@@ -1422,10 +1438,14 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	handler stream.Handler, write func([]byte)) error {
 
 	if state.WriteBacklogged != nil && state.WriteBacklogged() {
+		backlogRefused(state)
 		return ErrWriteBacklog
 	}
 
 	req := &state.req
+	if state.CloseAfter {
+		req.KeepAlive = false
+	}
 	s := populateCachedStream(state, req, body)
 
 	// Reuse the connection-scoped response adapter — avoids a heap allocation
@@ -1442,6 +1462,8 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	rw.keepAlive = req.KeepAlive
 	rw.isHEAD = req.Method == "HEAD"
 	rw.hijacked = false
+	rw.streamBegun, rw.streamNoBody, rw.streamOpen, rw.streamBroken, rw.streamInterim = false, false, false, false, false
+	rw.scratchDetached = false // a detach that was rolled back leaves an ordinary connection
 	s.ResponseWriter = rw
 
 	if err := handler.HandleStream(ctx, s); err != nil {
@@ -1452,6 +1474,14 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 			state.stream = nil
 			return ErrHijacked
 		}
+		// A chunked response under way cannot be answered with a 500: it
+		// would be read as chunk data. The connection is closed instead, with
+		// no last chunk, so the client sees a truncated body. A detached
+		// handler's response belongs to its goroutine (read the adapter only
+		// after the Detached check).
+		if !state.Detached.Load() && rw.streamBegun && !rw.streamInterim {
+			return err
+		}
 		writeErrorResponse(write, 500, "Internal Server Error")
 		return err
 	}
@@ -1459,6 +1489,36 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 		state.stream.Release()
 		state.stream = nil
 		return ErrHijacked
+	}
+	// A StreamWriter response the handler did not close is ended here, as
+	// net/http ends a response when its handler returns (celeris#889): with the
+	// last chunk, or, for a response the handler broke off after its headers or
+	// whose body is not as long as its declared content-length, by closing the
+	// connection without it, so that a truncated body does not look whole. A
+	// detached handler's goroutine owns the response, and the adapter is not
+	// read: Detached is published before Context.Detach returns.
+	if !state.Detached.Load() && rw.streamBegun {
+		var err error
+		switch {
+		case rw.streamInterim:
+			// Only interim (1xx) responses were sent: the final one is owed.
+			if rw.streamBroken {
+				writeErrorResponse(write, 500, "Internal Server Error")
+				err = errConnectionClose
+			} else {
+				_ = rw.WriteResponse(s, 200, [][2]string{{"content-length", "0"}}, nil)
+			}
+		case rw.streamOpen && (rw.streamBroken || !rw.streamComplete() || rw.Close(s) != nil):
+			// Closed without the last chunk, or the engine refused it: the
+			// response is cut.
+			err = errConnectionClose
+		}
+		// A request-scoped response is over: do not keep a large chunk's
+		// scratch for the rest of a keep-alive connection.
+		if cap(rw.chunkBuf) > chunkScratchKeep {
+			rw.chunkBuf = nil
+		}
+		return err
 	}
 	return nil
 }

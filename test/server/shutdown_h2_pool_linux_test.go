@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -200,45 +202,29 @@ type h2PoolServer759 struct {
 	shutErr   chan error
 }
 
+// startH2PoolServer759 starts a server on a listener it picked, under a context
+// the server's cancel stops (StartWithListenerAndContext, which shares
+// StartWithContext's shutdown), and waits until it answers /ping; see
+// startServer760 for the retry and startPickedCtx1104 for the listener.
 func startH2PoolServer759(t *testing.T, eng celeris.EngineType, budget time.Duration, routes func(*celeris.Server)) *h2PoolServer759 {
 	t.Helper()
-	retryUntil := time.Now().Add(30 * time.Second)
-	for tries := 1; ; tries++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		s := celeris.New(celeris.Config{Engine: eng, Addr: addr, ShutdownTimeout: budget})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // a start that never succeeds leaves nothing running
+	s, addr, done := startPickedCtx1104(ctx, t, celeris.Config{Engine: eng, ShutdownTimeout: budget}, func(s *celeris.Server) {
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 		routes(s)
-		ctx, cancel := context.WithCancel(context.Background())
-		srv := &h2PoolServer759{s: s, addr: addr, cancel: cancel, startDone: make(chan error, 1)}
-		go func() { srv.startDone <- s.StartWithContext(ctx) }()
-		err = waitDrainOrderReady(addr, srv.startDone)
-		if err == nil {
-			if tries > 1 {
-				t.Logf("server start retried on ring ENOMEM: %d tries", tries)
-			}
-			t.Cleanup(func() {
-				cancel()
-				select {
-				case err := <-srv.startDone:
-					srv.startDone <- err
-				case <-time.After(30 * time.Second):
-					t.Errorf("StartWithContext did not return within 30s of the cleanup cancel")
-				}
-			})
-			return srv
-		}
+	}, func(_ *celeris.Server, addr string, done <-chan error) error { return waitDrainOrderReady(addr, done) })
+	srv := &h2PoolServer759{s: s, addr: addr, cancel: cancel, startDone: done}
+	t.Cleanup(func() {
 		cancel()
-		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
-			time.Sleep(20 * time.Millisecond)
-			continue
+		select {
+		case err := <-srv.startDone:
+			srv.startDone <- err
+		case <-time.After(30 * time.Second):
+			t.Errorf("StartWithContext did not return within 30s of the cleanup cancel")
 		}
-		t.Fatalf("server did not start: %v", err)
-	}
+	})
+	return srv
 }
 
 // beginShutdown starts the shutdown: a cancel of StartWithContext's context
@@ -650,19 +636,21 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 // The gate comes shutdownSendDrainNanos (250 ms) into the wait, as the send
 // drain's does, so a request in flight when the shutdown begins is still
 // answered: the first assertion is that requests made as soon as every
-// listener has closed are. A request whose bytes have not all arrived by the
-// gate is another matter: the gate drops the bytes that come after it and the
-// recv is not re-armed (a slow upload, headers in pieces), which the pull
-// request's open questions record. The oracle looks 1.5 s in, well past the grace and the time a worker idle in its ring
-// wait takes to notice the cancel.
+// listener has closed are. A request in progress at the gate (a slow upload,
+// headers in pieces) is another matter, pinned by TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885
+// on epoll and by TestIOUringShutdownGateConns884 on io_uring (both read it on
+// and answer it with Connection: close). The oracle looks 1.5 s in, well past
+// the grace and the time a worker idle in its ring wait takes to notice the
+// cancel.
 //
-// io_uring only: epoll's pool wait (Loop.run, h2PoolSettled) does not stop
-// reading or writing either; its loops stop at their shutdown, after the pool
-// settles (the same run asserts it: with epoll in the list this test fails on
-// it, which the polish checklist of epoll, celeris#885, records; with epoll
-// in the list the run measures 16 of 16 answered and 688 to 704 ticks in
-// 900 ms). The adaptive engine is run on io_uring (CELERIS_ADAPTIVE_START), as
-// the second arm: its gate is the io_uring worker's.
+// Both native engines have the gate: io_uring's (celeris#884) and epoll's
+// (celeris#885 item 49, poolWaitGate). Before epoll's, its pool wait did not
+// stop reading or writing either (its loops stopped at their shutdown, after
+// the pool settled): with epoll in the list the run measured 16 of 16 answered
+// and 688 to 704 ticks in 900 ms. The adaptive engine is run on each engine
+// (CELERIS_ADAPTIVE_START), as the further arms. Where io_uring is not
+// available the io_uring arm cannot start and the adaptive-iouring arm runs
+// on epoll.
 func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 	const nH2 = 48
 	for _, e := range []struct {
@@ -670,7 +658,9 @@ func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 		eng   celeris.EngineType
 		setup func(*testing.T)
 	}{
+		{"epoll", celeris.Epoll, func(*testing.T) {}},
 		{"io_uring", celeris.IOUring, func(*testing.T) {}},
+		{"adaptive-epoll", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "epoll") }},
 		{"adaptive-iouring", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "iouring") }},
 	} {
 		t.Run(e.name, func(t *testing.T) {
@@ -911,4 +901,498 @@ func TestShutdownPoolWaitStopsServingH1AndDetached884(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestShutdownPoolWaitGateClosesIdleH1AndEndsDetached885 pins what the pool
+// wait's gate does with the conns it stops reading (celeris#885 item 49), on
+// the epoll engine: with 48 HTTP/2 streams held so that every loop is in the
+// pool wait,
+//
+//   - an idle HTTP/1 keep-alive conn is closed once the gate has passed, so
+//     its client fails at once and retries elsewhere, as it does against
+//     std's Shutdown, and does not wait for the end of the pool wait to be cut
+//     with no answer (the budget here is 20 s; the assertion is 2 s);
+//   - a detached stream's producer, ended by the gate, gets an error from its
+//     next Write (net.ErrClosed), not a silent drop;
+//   - what the producer had queued for a client that was not reading when the
+//     gate came is still flushed: the client reads it afterwards, every
+//     byte of the writes that reported success (to within the one chunk that
+//     may have raced the gate).
+//
+// The HTTP/1 request that the gate refuses is the previous test's subject.
+func TestShutdownPoolWaitGateClosesIdleH1AndEndsDetached885(t *testing.T) {
+	const nH2, nIdle, nBulk, chunk = 48, 8, 4, 256 << 10
+	// asyncBulk: the stream's route is an Async one, so its handler detaches on
+	// a dispatch goroutine and the conn is promoted (r3 M1: its client used to
+	// get no FIN).
+	for _, e := range []struct {
+		name      string
+		eng       celeris.EngineType
+		setup     func(*testing.T)
+		asyncBulk bool
+	}{
+		{"epoll", celeris.Epoll, func(*testing.T) {}, false},
+		{"epoll-async-route", celeris.Epoll, func(*testing.T) {}, true},
+		{"adaptive-epoll", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "epoll") }, false},
+		{"adaptive-epoll-async-route", celeris.Adaptive, func(t *testing.T) { t.Setenv("CELERIS_ADAPTIVE_START", "epoll") }, true},
+	} {
+		t.Run(e.name, func(t *testing.T) {
+			e.setup(t)
+			entered := make(chan struct{}, nH2)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseHeld := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseHeld()
+			var okBytes [nBulk]atomic.Int64
+			var firstErr [nBulk]atomic.Pointer[error]
+			srv := startH2PoolServer759(t, e.eng, 20*time.Second, func(s *celeris.Server) {
+				s.GET("/held", func(c *celeris.Context) error {
+					entered <- struct{}{}
+					<-release
+					return c.String(http.StatusOK, "done")
+				}).Async()
+				// The stream's index is in the path: the client conn it belongs to
+				// is not the order the server happens to accept them in.
+				bulkRoute := s.GET("/bulk/:i", func(c *celeris.Context) error {
+					i, convErr := strconv.Atoi(c.Param("i"))
+					done := c.Detach()
+					sw := c.StreamWriter()
+					if sw == nil || convErr != nil || i < 0 || i >= nBulk {
+						done()
+						return errors.New("no stream writer")
+					}
+					if err := sw.WriteHeader(http.StatusOK, [][2]string{{"content-type", "application/octet-stream"}}); err != nil {
+						done()
+						return err
+					}
+					go func() {
+						defer done()
+						buf := bytes.Repeat([]byte{'x'}, chunk)
+						for {
+							if _, err := sw.Write(buf); err != nil {
+								firstErr[i].Store(&err)
+								return
+							}
+							okBytes[i].Add(chunk)
+							time.Sleep(10 * time.Millisecond)
+						}
+					}()
+					return nil
+				})
+				if e.asyncBulk {
+					bulkRoute.Async()
+				}
+			})
+
+			var h2wg sync.WaitGroup
+			for range nH2 {
+				c, fr := dialH2759(t, srv.addr)
+				writeH2Get759(t, fr, 1, "/held")
+				h2wg.Add(1)
+				go func() {
+					defer h2wg.Done()
+					frames759(c, fr, new(sync.Mutex), 15*time.Second, func(f http2.Frame) bool {
+						d, ok := f.(*http2.DataFrame)
+						return ok && d.StreamID == 1 && d.StreamEnded()
+					})
+				}()
+			}
+			for i := range nH2 {
+				select {
+				case <-entered:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("only %d of %d held handlers started within 10s", i, nH2)
+				}
+			}
+
+			// Idle keep-alive clients, each answered once.
+			idle := make([]net.Conn, nIdle)
+			idleBr := make([]*bufio.Reader, nIdle)
+			for i := range idle {
+				c, err := net.Dial("tcp", srv.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = c.Close() }()
+				idle[i], idleBr[i] = c, bufio.NewReader(c)
+				if _, err := io.WriteString(c, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+					t.Fatal(err)
+				}
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				resp, err := http.ReadResponse(idleBr[i], nil)
+				if err != nil {
+					t.Fatalf("keep-alive request before the shutdown: %v", err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+			}
+
+			// Detached streams to clients that read nothing until later: the
+			// producers' bytes pile up in the engine's queues.
+			bulk := make([]net.Conn, nBulk)
+			for i := range bulk {
+				c, err := net.Dial("tcp", srv.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = c.Close() }()
+				bulk[i] = c
+				if _, err := io.WriteString(c, fmt.Sprintf("GET /bulk/%d HTTP/1.1\r\nHost: x\r\n\r\n", i)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for deadline := time.Now().Add(5 * time.Second); ; {
+				ready := true
+				for i := range okBytes {
+					ready = ready && okBytes[i].Load() >= 4*chunk
+				}
+				if ready {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the producers wrote under 1 MiB each within 5s")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			begin := time.Now()
+			srv.beginShutdown("Shutdown", 20*time.Second)
+
+			// Idle HTTP/1: closed, not left to hang.
+			for i, c := range idle {
+				_ = c.SetReadDeadline(begin.Add(2500 * time.Millisecond))
+				if _, err := idleBr[i].ReadByte(); err == nil {
+					t.Errorf("idle keep-alive client %d read a byte after the shutdown began", i)
+				} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					t.Errorf("idle keep-alive client %d was still connected %v into the shutdown, in the wait for HTTP/2 handlers (budget 20s): "+
+						"the gate left it waiting for a close with no answer (celeris#885 item 49)", i, time.Since(begin).Round(10*time.Millisecond))
+				}
+			}
+
+			// Producers ended with an error.
+			time.Sleep(time.Until(begin.Add(1500 * time.Millisecond)))
+			for i := range firstErr {
+				p := firstErr[i].Load()
+				if p == nil {
+					t.Errorf("producer %d: Write still succeeded 1.5 s into the shutdown, while HTTP/2 handlers were running", i)
+				} else if !errors.Is(*p, net.ErrClosed) {
+					t.Errorf("producer %d: Write ended with %v, want an error wrapping net.ErrClosed", i, *p)
+				}
+			}
+
+			// What was queued is flushed: read it all now, every stream at the
+			// same time (a client that sat on a full window for seconds and
+			// then reads one stream after the other waits for the TCP persist
+			// timer of the others, which says nothing about the engine).
+			type streamResult struct {
+				got, ok int64
+				err     error
+				end     error // what the read after the flushed bytes met
+			}
+			results := make([]streamResult, nBulk)
+			var rwg sync.WaitGroup
+			for i, c := range bulk {
+				ok := okBytes[i].Load()
+				rwg.Add(1)
+				go func() {
+					defer rwg.Done()
+					_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
+					resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+					if err != nil {
+						results[i] = streamResult{ok: ok, err: err}
+						return
+					}
+					var got int64
+					buf := make([]byte, 64<<10)
+					for got < ok {
+						n, err := resp.Body.Read(buf)
+						got += int64(n)
+						if err != nil {
+							results[i] = streamResult{got: got, ok: ok, err: err}
+							return
+						}
+					}
+					// The stream is over: the gate ended it, and a client that gets no
+					// FIN would wait for the end of the wait (up to the budget)
+					// before it could reconnect elsewhere.
+					// (A write that raced the gate may have been queued and sent
+					// although its Write reported the close: read what is left, up
+					// to the end of the stream.)
+					_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+					var endErr error
+					for endErr == nil {
+						_, endErr = resp.Body.Read(buf)
+					}
+					results[i] = streamResult{got: got, ok: ok, end: endErr}
+				}()
+			}
+			rwg.Wait()
+			for i, r := range results {
+				t.Logf("celeris885 %s stream %d: %d of %d bytes written before the gate were received (%v)", e.name, i, r.got, r.ok, r.err)
+				if r.err == nil && !errors.Is(r.end, io.EOF) && !errors.Is(r.end, io.ErrUnexpectedEOF) {
+					t.Errorf("stream %d: after the flushed bytes the client read %v, 2 s on, want a FIN (EOF or unexpected EOF, not a reset or silence): the gate ended the stream but did not close its connection (celeris#885 item 49)", i, r.end)
+				}
+				if r.err != nil || r.got < r.ok-chunk {
+					t.Errorf("stream %d: the client received %d of the %d bytes whose writes had succeeded (%v): what the producer had queued was not flushed after the gate (celeris#885 item 49)", i, r.got, r.ok, r.err)
+				}
+			}
+			releaseHeld()
+			h2wg.Wait()
+			srv.waitStart(t, 25*time.Second)
+		})
+	}
+}
+
+// TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885 pins what the pool
+// wait's gate does to the HTTP/1 conns it stops reading, on a loop with no Async
+// route (the default, synchronous one) and on one that has an Async route (a
+// dispatch goroutine for the conns it promotes), with the wait held by 24 HTTP/2
+// responses of 16 MiB that nobody gives window to (celeris#885 item 49, Opus
+// review r2):
+//
+//   - an idle keep-alive conn, and one that was accepted and has sent nothing
+//     (a browser's preconnect), get a FIN as soon as the gate has passed;
+//   - a download queued in the engine for a client reading slowly is delivered in
+//     full before its conn is closed;
+//   - a request in progress when the shutdown begins (the headers and the first
+//     64 KiB of a 2 MiB body) is read on and answered, as std's Shutdown answers
+//     the request of an active conn, with Connection: close, then its conn is
+//     closed. On a server with any Async route a conn whose read leaves a partial
+//     request is promoted whatever its route, its state belongs to the dispatch
+//     goroutine, and the request is not read: not asserted (a known gap, noted in
+//     the pull request);
+//   - a conn on an Async route (promoted) that is idle is not closed by the gate:
+//     it is left to the end of the wait, which is what is pinned. (A detached
+//     stream on an Async route is closed once the gate has ended it: the other
+//     test.)
+func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
+	for _, arm := range []string{"sync", "async-route"} {
+		t.Run(arm, func(t *testing.T) {
+			big := strings.Repeat("y", 16<<20)
+			srv := startH2PoolServer759(t, celeris.Epoll, 20*time.Second, func(s *celeris.Server) {
+				s.GET("/big", func(c *celeris.Context) error { return c.String(http.StatusOK, "%s", big) })
+				s.POST("/up", func(c *celeris.Context) error { return c.String(http.StatusOK, "got %d", len(c.Body())) })
+				if arm == "async-route" {
+					s.GET("/aping", func(c *celeris.Context) error { return c.String(http.StatusOK, "a") }).Async()
+				}
+			})
+			// What the engine counts before this test sends anything: the readiness
+			// probe of startH2PoolServer759 (its keep-alive conn stays open in the
+			// default transport's pool, and it polled /ping one or more times).
+			base := settledEngineMetrics1104(srv)
+			// The wait is held: GET /big on 24 HTTP/2 conns, no WINDOW_UPDATE.
+			var h2conns []net.Conn
+			for range 24 {
+				c, fr := dialH2759(t, srv.addr)
+				h2conns = append(h2conns, c)
+				writeH2Get759(t, fr, 1, "/big")
+			}
+			time.Sleep(300 * time.Millisecond)
+
+			keepAlive := func(path string) (net.Conn, *bufio.Reader) {
+				c, err := net.Dial("tcp", srv.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = c.Close() })
+				br := bufio.NewReader(c)
+				if _, err := io.WriteString(c, "GET "+path+" HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+					t.Fatal(err)
+				}
+				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second)) // 24 HTTP/2 conns of 16 MiB are running under -race
+				resp, err := http.ReadResponse(br, nil)
+				if err != nil {
+					t.Fatalf("%s before the shutdown: %v", path, err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				return c, br
+			}
+			idle := make([]net.Conn, 6)
+			idleBr := make([]*bufio.Reader, 6)
+			for i := range idle {
+				idle[i], idleBr[i] = keepAlive("/ping")
+			}
+			silent := make([]net.Conn, 2)
+			for i := range silent {
+				c, err := net.Dial("tcp", srv.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = c.Close() })
+				silent[i] = c
+			}
+			var promoted net.Conn
+			var promotedBr *bufio.Reader
+			if arm == "async-route" {
+				promoted, promotedBr = keepAlive("/aping")
+			}
+			// A download queued in the engine: the client's receive buffer is small.
+			d := net.Dialer{Control: func(_, _ string, rc syscall.RawConn) error {
+				return rc.Control(func(fd uintptr) {
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 32<<10)
+				})
+			}}
+			dl, err := d.Dial("tcp", srv.addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = dl.Close() })
+			if _, err := io.WriteString(dl, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			// A request in progress.
+			var up net.Conn
+			const upSize = 2 << 20
+			if arm == "sync" {
+				up, err = net.Dial("tcp", srv.addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = up.Close() })
+				if _, err := io.WriteString(up, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: "+strconv.Itoa(upSize)+"\r\n\r\n"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := up.Write(make([]byte, 64<<10)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// TCP_DEFER_ACCEPT hands the engine a conn with no byte after about a
+			// second: the silent conns are in its table by then.
+			time.Sleep(1300 * time.Millisecond)
+			// The gate's first pass runs 250 ms after the shutdown began, and a
+			// conn the loop has accepted but not read yet, or a request whose
+			// bytes it has not read, is closed by it as idle (the loop of a runner
+			// busy with 24 HTTP/2 downloads under -race and -cover can be that far
+			// behind: celeris#1104). So begin only once the engine counts, on top
+			// of the baseline taken before the first dial, every conn this test
+			// opened (24 HTTP/2, the keep-alive ones, the silent ones, the download,
+			// the upload on the sync arm, the promoted conn on the async arm) and
+			// every request it sent (24 HTTP/2 GETs, one ping per keep-alive conn,
+			// the download's GET, and on the sync arm the upload, which the loop
+			// counts once it has read its headers and first 64 KiB, or on the
+			// async arm the promoted conn's ping). The conn count is exact: +34 in
+			// every run. The request count is a lower bound: measured, it ends at
+			// the arithmetic or one above it (sync +32 or +33 against 32, async
+			// +32 or +33 against 32), and the extra unit is already there after the
+			// keep-alive step, before the download and the upload are sent, so it is
+			// neither of them; its source was not found, which is why this wait is
+			// `>=` for requests and exact for conns.
+			wantConns := uint64(24 + len(idle) + len(silent) + 1) // + the download
+			wantReqs := uint64(24 + len(idle) + 1)                // + the download's GET
+			if arm == "sync" {
+				wantConns++ // the upload
+				wantReqs++  // the upload's request, counted when its first bytes are read
+			}
+			if promoted != nil {
+				wantConns++
+				wantReqs++
+			}
+			waitEngineBusy1104(t, srv, base, wantConns, wantReqs)
+
+			begin := time.Now()
+			srv.beginShutdown("Shutdown", 20*time.Second)
+
+			expectFIN := func(name string, c net.Conn, br *bufio.Reader) {
+				_ = c.SetReadDeadline(begin.Add(1500 * time.Millisecond))
+				var err error
+				if br != nil {
+					_, err = br.ReadByte()
+				} else {
+					_, err = c.Read(make([]byte, 1))
+				}
+				if err != io.EOF {
+					t.Errorf("%s: read %v at %v, want a FIN (io.EOF) once the gate has passed (celeris#885 item 49)", name, err, time.Since(begin).Round(time.Millisecond))
+				}
+			}
+			for i, c := range idle {
+				expectFIN("idle keep-alive "+strconv.Itoa(i), c, idleBr[i])
+			}
+			for i, c := range silent {
+				expectFIN("connection with no byte sent "+strconv.Itoa(i), c, nil)
+			}
+			if promoted != nil {
+				_ = promoted.SetReadDeadline(begin.Add(2 * time.Second))
+				if _, err := promotedBr.ReadByte(); err == nil {
+					t.Errorf("the conn an Async route promoted read a byte after the shutdown began")
+				} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+					t.Errorf("the conn an Async route promoted was closed (%v) at %v: it has a dispatch goroutine, and the gate leaves it to the end of the wait", err, time.Since(begin).Round(time.Millisecond))
+				}
+			}
+			if up != nil {
+				// The rest of the body arrives after the gate has passed.
+				_ = up.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if _, err := up.Write(make([]byte, upSize-(64<<10))); err != nil {
+					t.Errorf("the rest of the upload, sent %v into the shutdown: %v: a request in progress was cut (celeris#885 item 49)", time.Since(begin).Round(time.Millisecond), err)
+				} else {
+					_ = up.SetReadDeadline(time.Now().Add(3 * time.Second))
+					resp, err := http.ReadResponse(bufio.NewReader(up), nil)
+					if err != nil {
+						t.Errorf("the response to the upload: %v: a request in progress was not answered (celeris#885 item 49)", err)
+					} else {
+						b, _ := io.ReadAll(resp.Body)
+						if want := "got " + strconv.Itoa(upSize); string(b) != want {
+							t.Errorf("the response to the upload: %q, want %q", b, want)
+						}
+						// Answered after the gate: close-after, as net/http's
+						// response written after Shutdown began, so that a client
+						// does not write its next request to a conn that is closing.
+						if !resp.Close {
+							t.Errorf("the response to the upload, written after the gate, has no Connection: close (r3 m1)")
+						}
+						_ = up.SetReadDeadline(time.Now().Add(2 * time.Second))
+						if _, err := up.Read(make([]byte, 1)); err != io.EOF {
+							t.Errorf("after the response to the upload the conn read %v, want a FIN (io.EOF)", err)
+						}
+					}
+				}
+			}
+			// The queued download arrives whole, and then its conn is closed.
+			_ = dl.SetReadDeadline(time.Now().Add(15 * time.Second))
+			resp, err := http.ReadResponse(bufio.NewReader(dl), nil)
+			if err != nil {
+				t.Fatalf("the download's head: %v", err)
+			}
+			if n, err := io.Copy(io.Discard, resp.Body); n != int64(len(big)) {
+				t.Errorf("the queued download delivered %d of %d bytes (%v): the gate cut a response that was still going out", n, len(big), err)
+			}
+			for _, c := range h2conns { // the HTTP/2 clients go: the wait ends
+				_ = c.Close()
+			}
+			srv.waitStart(t, 25*time.Second)
+		})
+	}
+}
+
+// settledEngineMetrics1104 returns the engine's metrics once neither the open
+// conns nor the handled requests have changed for 100 ms: the readiness probe
+// of startH2PoolServer759 counts its request after it has its response, so a
+// baseline taken the instant the server is up can miss one.
+func settledEngineMetrics1104(srv *h2PoolServer759) celeris.EngineMetrics {
+	prev := srv.s.EngineInfo().Metrics
+	for i := 0; i < 100; i++ {
+		time.Sleep(100 * time.Millisecond)
+		m := srv.s.EngineInfo().Metrics
+		if m.ActiveConnections == prev.ActiveConnections && m.RequestCount == prev.RequestCount {
+			return m
+		}
+		prev = m
+	}
+	return prev
+}
+
+// waitEngineBusy1104 waits, up to 20 s, until the engine counts at least conns
+// more open connections and reqs more handled requests than base, the metrics
+// taken before the test's first dial, and logs the surplus it ended with.
+func waitEngineBusy1104(t *testing.T, srv *h2PoolServer759, base celeris.EngineMetrics, conns, reqs uint64) {
+	t.Helper()
+	var m celeris.EngineMetrics
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		m = srv.s.EngineInfo().Metrics
+		if uint64(m.ActiveConnections-base.ActiveConnections) >= conns && m.RequestCount-base.RequestCount >= reqs {
+			t.Logf("engine counted +%d conns (want %d) and +%d requests (want %d) over the baseline of %d conns and %d requests",
+				m.ActiveConnections-base.ActiveConnections, conns, m.RequestCount-base.RequestCount, reqs, base.ActiveConnections, base.RequestCount)
+			return
+		}
+	}
+	t.Fatalf("the engine counted +%d conns and +%d requests over its baseline, want +%d and +%d before the shutdown begins",
+		m.ActiveConnections-base.ActiveConnections, m.RequestCount-base.RequestCount, conns, reqs)
 }

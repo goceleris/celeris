@@ -4,6 +4,7 @@ package iouring
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -120,6 +121,18 @@ func testTailUpgrade908(t *testing.T, e *Engine, linked bool) {
 			break
 		}
 	}
+	// What the 101 was sent with is a precondition, not the defect: the
+	// defect is a conn that is not HTTP/2 after the 101 (h2Streams908 below).
+	// A 101 sent unlinked, followed by a standalone re-arm, is a correct
+	// alternative to the chained one, so the counters are polled and recorded
+	// here, the defect is checked first, and the precondition is reported
+	// after it, with Errorf (celeris#890 item 84).
+	var preconditions []string
+	defer func() { // h2Streams908 ends the test with Fatalf on the defect
+		for _, p := range preconditions {
+			t.Error(p)
+		}
+	}()
 	if linked {
 		// The client has the 101, so handleRecv has returned from the
 		// upgrade arm: its arm decision is made. The chained recv is counted
@@ -131,10 +144,10 @@ func testTailUpgrade908(t *testing.T, e *Engine, linked bool) {
 			}
 		}
 		if m.RecvLinkedArms <= m0.RecvLinkedArms {
-			t.Fatalf("the 101 did not go out chained to a recv (RecvLinkedArms %d -> %d): the guard is not exercised", m0.RecvLinkedArms, m.RecvLinkedArms)
+			preconditions = append(preconditions, fmt.Sprintf("the 101 did not go out chained to a recv (RecvLinkedArms %d -> %d): the guard is not exercised", m0.RecvLinkedArms, m.RecvLinkedArms))
 		}
 		if m.RecvArmDeclined != m0.RecvArmDeclined {
-			t.Errorf("the upgrade arm asked for a second recv beside the chained one: RecvArmDeclined %d -> %d, want no change", m0.RecvArmDeclined, m.RecvArmDeclined)
+			preconditions = append(preconditions, fmt.Sprintf("the upgrade arm asked for a second recv beside the chained one: RecvArmDeclined %d -> %d, want no change", m0.RecvArmDeclined, m.RecvArmDeclined))
 		}
 	}
 	// The 101 alone is not the upgrade: the conn must go on as HTTP/2 (the

@@ -258,16 +258,60 @@ func s0Bind(t *testing.T, cfg resource.Config, h stream.Handler) (*Engine, strin
 	}
 	e.ctrl.cooldown = 0
 	e.FreezeSwitching()
+	addr, stop := listenAndAwaitBind890(t, e)
+	return e, addr, stop
+}
+
+// bindLimit890 bounds how long the adaptive tests wait for Listen to publish
+// the engine's address. It is a guard against a hang, not an expectation: Listen
+// gives up on its own after listenBindDeadline (20 s) and returns its error,
+// which listenAndAwaitBind890 reports. The 3 s it replaces was missed once in
+// 400 runs at --cpus 2 with two busy loops (celeris#890 item 98) by a poll that
+// may have been starved, or by a Listen that was slow: the wait now says which.
+const bindLimit890 = 30 * time.Second
+
+// awaitBind890 polls addr every 10 ms until it is non-nil and returns it with
+// the time the wait took. It stops with an error when ended is closed (Listen
+// returned without binding) or limit has passed.
+func awaitBind890(addr func() net.Addr, ended <-chan struct{}, limit time.Duration) (net.Addr, time.Duration, error) {
+	start := time.Now()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	limitC := time.NewTimer(limit)
+	defer limitC.Stop()
+	for {
+		if a := addr(); a != nil {
+			return a, time.Since(start), nil
+		}
+		select {
+		case <-ended:
+			if a := addr(); a != nil {
+				return a, time.Since(start), nil
+			}
+			return nil, time.Since(start), errors.New("Listen returned before the engine published an address")
+		case <-limitC.C:
+			return nil, time.Since(start), fmt.Errorf("no address after %v", limit)
+		case <-tick.C:
+		}
+	}
+}
+
+// listenAndAwaitBind890 starts e.Listen, waits for the bound address (see
+// awaitBind890), logs how long the bind took, and returns the address with a
+// stop func that cancels Listen and joins it. It fails the test with Listen's
+// own error when Listen returned first.
+func listenAndAwaitBind890(t *testing.T, e *Engine) (string, func()) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	for dl := time.Now().Add(3 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
+	ended := make(chan struct{})
+	go func() { done <- e.Listen(ctx); close(ended) }()
+	a, took, err := awaitBind890(e.Addr, ended, bindLimit890)
+	if err != nil {
 		cancel()
-		<-done
-		t.Fatal("adaptive engine never bound")
+		lerr := <-done
+		t.Fatalf("adaptive engine never bound: %v (waited %v; Listen: %v)", err, took, lerr)
 	}
-	return e, e.Addr().String(), func() { cancel(); <-done }
+	t.Logf("adaptive engine bound %v after Listen started", took.Round(time.Millisecond))
+	return a.String(), func() { cancel(); <-done }
 }

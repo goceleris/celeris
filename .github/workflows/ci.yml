@@ -84,11 +84,19 @@ jobs:
       # and with a result line a test's own output joined (celeris#890).
       - name: named-tally.sh self-test
         run: .github/scripts/named-tally-test.sh
-      # The tools CI runs are pinned in one place, .github/tools/go.mod, and
-      # three other places name them: the allow list of its Dependabot entry
+      # The tally of the job `iouring-base-tier` (base-tier-tally.sh) on fixture
+      # logs: an allowed skip, a skip nobody allowed, an arm that ran at tier=high,
+      # a probe line of an uncapped run, and a named test missing or skipped
+      # (celeris#890 item 87).
+      - name: base-tier-tally.sh self-test
+        run: .github/scripts/base-tier-tally-test.sh
+      # The tools CI runs are pinned in one place, .github/tools/go.mod (the Go
+      # ones) or .github/tools/requirements.txt (zizmor), and three other places
+      # name them: the allow list of its Dependabot entry
       # (a tool without an entry, or one that names a package path instead
       # of the module path, silently stops getting bump PRs), CONTRIBUTING's
-      # golangci-lint version, and the workflows (no `go install ...@v`).
+      # golangci-lint version, and the workflows (no `go install ...@v`, no
+      # `name==version` of a Python tool).
       # tool-pins-check.sh compares them; its self-test runs it on broken
       # fixtures, so a check that stops failing is a red Lint (celeris#890).
       - name: Tool pins agree
@@ -138,10 +146,15 @@ jobs:
         # template injection, excessive permissions). Complements
         # actionlint, which checks syntax rather than security posture.
         # Needs only the ephemeral job token (read) for the online audits;
-        # no repository secrets. Pinned to an exact version.
+        # no repository secrets. Pinned to an exact version in
+        # .github/tools/requirements.txt, which Dependabot's pip entry bumps
+        # (celeris#890 item 93); the step names no version of its own.
         env:
           GH_TOKEN: ${{ github.token }}
-        run: pipx run --spec zizmor==1.30.0 zizmor --color always .github/workflows
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zizmor-venv"
+          "$RUNNER_TEMP/zizmor-venv/bin/pip" install --quiet --disable-pip-version-check -r .github/tools/requirements.txt
+          "$RUNNER_TEMP/zizmor-venv/bin/zizmor" --color always .github/workflows
 
   # The required check "Unit (root + middleware sub-modules)" is the `unit-gate`
   # job below: it passes only when this job AND every root-package shard passed.
@@ -222,9 +235,10 @@ jobs:
           #     workers and the runner's 8 MiB funds one; the step "celeris#592
           #     settled-route retime rig" below runs them with memlock raised and
           #     CELERIS_REQUIRE_IOURING_WORKERS=1, where a skip is a failure.
-          #   * TestRouteAdaptive_SettleReopenCost and
-          #     TestWriteBufBackpressureClosesSlowConsumer: opt-in measurements
-          #     (CELERIS_592_COST=1, GOTEST_BACKPRESSURE=1), not checks.
+          #   * TestRouteAdaptive_SettleReopenCost,
+          #     TestWriteBufBackpressureClosesSlowConsumer and
+          #     TestProbeDrainReadFloodLatency885: opt-in measurements
+          #     (CELERIS_592_COST=1, GOTEST_BACKPRESSURE=1, CELERIS_PROBE_885=1), not checks.
           #   * the four alloc-count tests in middleware/sse: they skip
           #     under -race and every step of this job is -race (celeris#684);
           #     the step "celeris#890 allocation guards and alloc-count tests,
@@ -239,7 +253,7 @@ jobs:
           # too. That is safe only while this step excludes /engine/iouring$ (the
           # pkgs line above; the step after it runs that package with its own list).
           # A name added here allows that name in every package this step runs.
-          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestSlowClientDropPathAllocs888|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux'
+          allowed='TestAdaptiveSettledRouteRetime592/iouring/settled|TestAdaptiveSettledRouteRetime592/iouring/negctrl_async|TestAdaptiveSettledRouteRetime592/iouring/negctrl_learning|TestRouteAdaptive_SettleReopenCost|TestWriteBufBackpressureClosesSlowConsumer|TestProbeDrainReadFloodLatency885|TestBrokerFanOutFormatsOnce|TestRingBufferAppendAllocs|TestSlowClientSendNonFullQueueAllocs|TestSlowClientDropPathAllocs888|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestProbeNonLinux|TestValidateEngineRequiresLinux'
           required='TestSendfileEndToEndLargeFile|TestSendfileHEADNoBody|TestSendfileRangeRequest|TestSendfileSubThresholdFallback'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
           ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/root.log || true)
@@ -1252,16 +1266,20 @@ jobs:
       # with -v, and tallies by name per package: every listed test must run and
       # PASS, and no SKIP line is allowed.
       #
-      # Which of them can fail a pull request: celeristest, middleware/timeout and
-      # middleware/ratelimit fail on any count over their budget. The rest (the
-      # drivers, middleware/{cache,idempotency,overload}) only log an over-budget
-      # count unless TESTING_STRICT_ALLOC_BUDGETS=1, which this step does not set,
-      # so for them it proves the guard ran (PASS, no skip) and not that the count
-      # held. Setting it is the stricter choice; see the pull request for the
-      # numbers behind it. The sse and websocket tests fail on their own bounds.
+      # Every one of them fails a pull request on a count over its budget.
+      # celeristest, middleware/timeout and middleware/ratelimit always did; the
+      # rest (the drivers, middleware/{cache,idempotency,overload}) only logged an
+      # over-budget count unless TESTING_STRICT_ALLOC_BUDGETS=1, which this step
+      # now sets (celeris#890 item 91), so for them a PASS says the count held and
+      # not only that the guard ran. The one guard that was over budget when the
+      # variable was first set, driver/postgres Query_1col_1row (14 allocs/op
+      # against 4), has the budget the driver costs. The sse and websocket tests
+      # fail on their own bounds.
       - name: celeris#890 allocation guards and alloc-count tests, without -race (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
+        env:
+          TESTING_STRICT_ALLOC_BUDGETS: "1"
         run: |
           set -o pipefail
           # "<package> <top-level tests that must PASS, as a regex alternation>"
@@ -1792,6 +1810,22 @@ jobs:
             echo "engines to report a refused steal -- was one renamed or removed, or did an io_uring arm skip?"
             exit 1
           fi
+      # celeris#890 item 96: ./test/integration is not run by this workflow (its
+      # tests need a host; `mage` runs them), but its adaptive_*_test.go files keep
+      # a copy of ./internal/adaptive's CELERIS_REQUIRE_UPSWITCH gate
+      # (skipOrFailIfStandbyAborted886). This guard, the counterpart of
+      # TestAdaptiveSkipRouting684, fails on a raw t.Skip in those files that
+      # bypasses it and is not registered with a reason, and its self-test
+      # plants one. It is the only test of the package that runs here, by name.
+      - name: celeris#890 test/integration adaptive skips go through the gate
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout=300s -v -run '^(TestAdaptiveSkipRoutingIntegration890|TestAdaptiveSkipRoutingGuardSelfTest890)$' ./test/integration/ 2>&1 | tee /tmp/integration-skip-guard.log
+          "$GITHUB_WORKSPACE"/.github/scripts/named-tally.sh 'test/integration skip guard (celeris#890 item 96)' /tmp/integration-skip-guard.log \
+            TestAdaptiveSkipRoutingIntegration890 \
+            TestAdaptiveSkipRoutingGuardSelfTest890
 
   # NOT a required check: the repository's ruleset ("Main — CI") requires Lint,
   # "Unit (root + middleware sub-modules)" (the `unit-gate` job), Conformance,
@@ -1860,10 +1894,12 @@ jobs:
       # name (its allow-list) and this step runs them with memlock raised and
       # CELERIS_REQUIRE_IOURING_WORKERS=1, which turns the skip into a failure.
       # The pause/resume pair of the `unit` job (one funded worker there) runs
-      # here with the two it asks for, and so does celeris#886's resume test
+      # here with the two it asks for, and so do celeris#886's resume test
       # (TestResumeAcceptReachesAWorkerThatCannotPark886: at 8 MiB it has one
       # worker and cannot tell a resume that signals every worker from one that
-      # signals the first). Exactly seven top-level PASS lines and no SKIP line: a rename or a
+      # signals the first) and its pause test
+      # (TestBeginPauseAcceptReachesAnIdleWorker886, the same for the pause).
+      # Exactly eight top-level PASS lines and no SKIP line: a rename or a
       # quarantine selects nothing silently, and a skip is not coverage.
       - name: celeris#895/#896 multi-worker listener tests (memlock raised, skipping forbidden)
         if: ${{ !cancelled() }}
@@ -1874,7 +1910,7 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895|TestPort0ResumeKeepsThePort895|TestPort0PausedPortCannotBeTaken895|TestResumeAcceptReachesAWorkerThatCannotPark886'
+          names='TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895|TestPort0ResumeKeepsThePort895|TestPort0PausedPortCannotBeTaken895|TestResumeAcceptReachesAWorkerThatCannotPark886|TestBeginPauseAcceptReachesAnIdleWorker886'
           go test -race -count=1 -timeout=600s -v -run "^(${names})\$" \
             ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring895.log
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
@@ -2317,6 +2353,162 @@ jobs:
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$log" || true)
           if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
           exit "$bad"
+
+  # NOT a required check for merging (see the note above `iouring`), but a gate of
+  # releases: release.yml calls this workflow and tag-submodules needs its result to
+  # be success, so a red run of this job blocks the tag. celeris#890 item 87:
+  # nothing ran the io_uring base tier. CELERIS_MAX_IOURING_TIER=base caps the
+  # probe's tier at "base" (no provided buffer ring, single-shot accept, no
+  # multishot recv), the tier a kernel without those features gets and the one
+  # PR #1026 made non-blocking on accept (item 53, celeris#884): a partial
+  # inline write of a detached stream leaves a remainder in writeBuf there
+  # (TestShutdownDetachedPartialWriteIsFlushed806), a state the other tiers do
+  # not reach the same way. Until this job only local runs covered it.
+  #
+  # Two steps, each with memlock raised (the tests that ask for several workers
+  # need it) and the cap in the environment:
+  #   * ./internal/engine/iouring under -race. The cap must have taken effect:
+  #     TestReportTier844 must print io_uring_tier=base for the capped probe
+  #     and no engine arm may report tier=high (a misspelled value counts as
+  #     "none" and would skip everything, which the tally also refuses);
+  #   * the root package and ./test/server, the tests whose names say Shutdown,
+  #     Detach, SSE, Stream, WebSocket, Hijack or Drain, under -race.
+  # The -timeout of each step is about twice its measured time (473 s and 239 s), so a
+  # run with the cap lost (a misspelled value made 47 tests fail slowly and kept the
+  # second step busy for 23 minutes before it was cancelled, run 40416230192) ends
+  # in minutes.
+  # CELERIS_REQUIRE_ZONED_PEER=1, as in the unit job: the zoned link-local tests (celeris#885,
+  # #1127) fail rather than skip on a runner without an fe80:: address, so they need no
+  # allow-list entry.
+  # Tests that need the high tier skip at this tier on purpose; each skip that
+  # is allowed is listed by name with its reason in .github/base-tier-skips-iouring.txt
+  # and -root.txt, and any other SKIP line fails the step (base-tier-tally.sh,
+  # whose self-test is a Lint step). First run on a hosted runner (kernel
+  # 6.17.0-1022-azure, run 40414278698): the package took 473 s under -race (504 s
+  # for the step), 554 top-level tests passed and 12 SKIP lines are the allowed
+  # ones; the root package and ./test/server took 4.6 s and 239 s (258 s for the
+  # step), 107 top-level tests passed and 19 SKIP lines are allowed. Those 19 are
+  # the io_uring and adaptive arms of tests whose probe (c714ProbeIOUring,
+  # keptProbeIOUring) calls io_uring usable only at the high tier: with the cap
+  # they skip with "no usable io_uring", so what this step adds for the root tests
+  # is the tests that start an io_uring engine without such a probe: they run at
+  # the base tier here and at the high tier in every other job. The root list names
+  # those arms by pattern (a new probe-gated test needs no edit; the arm must have
+  # logged the probe's own "io_uring tier=base kernel=..." skip message) after run
+  # 40419578127, on a merge with main,
+  # met nine new such tests (117 passed, 46 SKIP lines) and failed a list of names.
+  iouring-base-tier:
+    name: io_uring base tier (CELERIS_MAX_IOURING_TIER=base, celeris#890)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CELERIS_MAX_IOURING_TIER: base
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: internal/engine/iouring at the base tier (race, tier asserted, skips accounted for)
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CELERIS_MAX_IOURING_TIER=$CELERIS_MAX_IOURING_TIER"
+          start=$SECONDS
+          CELERIS_REQUIRE_DUALSTACK=1 CELERIS_REQUIRE_ZONED_PEER=1 go test -race -count=1 -timeout=900s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/base-iouring.log
+          echo "internal/engine/iouring at the base tier took $((SECONDS - start)) s"
+          .github/scripts/base-tier-tally.sh iouring /tmp/base-iouring.log TestShutdownDetachedPartialWriteIsFlushed806 TestReportTier844
+      - name: Root package and test/server, Shutdown/Detach/SSE/Stream/WebSocket/Hijack/Drain tests at the base tier (race)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CELERIS_MAX_IOURING_TIER=$CELERIS_MAX_IOURING_TIER"
+          start=$SECONDS
+          # -p 1: one test process at a time, so the runner's one memlock budget never funds two.
+          CELERIS_REQUIRE_DUALSTACK=1 CELERIS_REQUIRE_ZONED_PEER=1 go test -p 1 -race -count=1 -timeout=600s -v -run 'Shutdown|Detach|SSE|Stream|WebSocket|Hijack|Drain' . ./test/server 2>&1 | tee /tmp/base-root.log
+          echo "root and test/server at the base tier took $((SECONDS - start)) s"
+          .github/scripts/base-tier-tally.sh root /tmp/base-root.log
+
+  # NOT a required check for merging, but a gate of releases (release.yml calls this
+  # workflow and tag-submodules needs its result to be success). celeris#890 item 92: the large-response tests of
+  # ./test/server (celeris#761, #817, #836) have a lean shape and a full-size
+  # one. lean761() (large_response_linux_test.go) is true under -race and
+  # under coverage, which are the only ways the other jobs run ./test/server,
+  # so their 16 MiB / 64 MiB bodies, their request counts and the h2c
+  # AsyncHandlers arm of TestH2CUnmatchedThroughTimeoutSingleflight836
+  # (AsyncHandlers: !raceOn761) never ran in CI. This job builds the test binary
+  # without -race and without coverage (race761_off_test.go makes raceOn761
+  # false) and runs the eight tests that read lean761(), n836() or raceOn761,
+  # by name, with memlock raised (they start io_uring engines), -v, and a tally
+  # by name: each must run once and PASS, with no SKIP line. The script prints
+  # the wall time and the peak resident set of the test process, so a log says
+  # what the full-size shape costs on a runner.
+  large-response:
+    name: Large responses at full size, no race (./test/server, celeris#890)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: test/server large-response tests at full size (no race, no coverage)
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CPUs: $(nproc), memory: $(free -m | awk '/^Mem:/ {print $2}') MiB"
+          tests=(
+            TestLargeResponseIsDelivered
+            TestLargeFileResponseIsDelivered
+            TestLargeResponseIsDeliveredH2
+            TestConcurrentResponsesOwnTheirBodies
+            TestH2DerivedContextDoesNotPanic836
+            TestH2DetachedContextIsItsRequests836
+            TestH2InlineCleanupDoesNotReleaseAReusedStream947
+            TestH2CUnmatchedThroughTimeoutSingleflight836
+          )
+          regex=$(IFS='|'; echo "${tests[*]}")
+          # Discovery: a Test function of ./test/server that reads lean761(), raceOn761, n836() or
+          # dur836() runs a lean shape everywhere else, so it must be in the list above or its
+          # full-size shape runs nowhere (the failure this job exists for). A helper that is not a
+          # Test function and reads them is not seen: its callers are not found this way.
+          used=$(awk 'FNR == 1 { fn = "" } /^func / { fn = $2; sub(/\(.*/, "", fn) } /lean761\(\)|raceOn761|n836\(|dur836\(/ && fn ~ /^Test/ { print fn }' test/server/*_test.go | sort -u)
+          listed=$(printf '%s\n' "${tests[@]}" | sort -u)
+          if [ "$used" != "$listed" ]; then
+            echo "tests of ./test/server that read the lean-shape helpers (left) against the list of this step (right):"
+            diff <(echo "$used") <(echo "$listed") || true
+            echo "add the test to the list (or take it out when it no longer reads a helper)"
+            exit 1
+          fi
+          go test -c -o /tmp/server.test ./test/server
+          python3 - /tmp/server.test "^(${regex})\$" <<'PY' 2>&1 | tee /tmp/large.log
+          import resource, subprocess, sys, time
+          binary, run = sys.argv[1], sys.argv[2]
+          t0 = time.monotonic()
+          rc = subprocess.run([binary, "-test.run", run, "-test.v", "-test.count=1", "-test.timeout=1500s"]).returncode
+          rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss  # KiB on Linux
+          print("full-size shape: wall %.1f s, peak RSS of the test process %.0f MiB, exit %d" % (time.monotonic() - t0, rss / 1024, rc))
+          sys.exit(rc)
+          PY
+          .github/scripts/named-tally.sh 'test/server full-size shape (celeris#890 item 92)' /tmp/large.log "${tests[@]}"
+          # The shape itself: the 64 MiB HTTP/1 bodies (16 MiB under lean761) and the 16 MiB
+          # HTTP/2 ones (8 MiB under lean761) ran, on all four engines.
+          full1=$(grep -cE '^=== RUN   TestLargeResponseIsDelivered/[a-z_]+/[a-z-]+/67108864/' /tmp/large.log || true)
+          full2=$(grep -cE '^=== RUN   TestLargeResponseIsDeliveredH2/[a-z_]+/[a-z-]+/16777216$' /tmp/large.log || true)
+          lean1=$(grep -cE '^=== RUN   TestLargeResponseIsDelivered/.*/16777216/' /tmp/large.log || true)
+          lean2=$(grep -cE '^=== RUN   TestLargeResponseIsDeliveredH2/.*/8388608$' /tmp/large.log || true)
+          echo "full-size bodies: HTTP/1 64 MiB runs $full1 (want 12), HTTP/2 16 MiB runs $full2 (want 8), lean-size runs $lean1 and $lean2 (want 0)"
+          if [ "$full1" -ne 12 ] || [ "$full2" -ne 8 ] || [ "$lean1" -ne 0 ] || [ "$lean2" -ne 0 ]; then
+            echo "expected the full-size bodies, not the lean ones -- did lean761() become true here (race or coverage), or did a size change?"
+            exit 1
+          fi
 
   conformance:
     name: Conformance

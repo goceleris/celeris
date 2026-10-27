@@ -23,6 +23,18 @@ type Bridge struct {
 
 // ServeHTTP converts an http.Request to a stream.Stream, calls the handler, and writes the response.
 func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor == 2 && r.Method == "PRI" && r.RequestURI == "*" {
+		// "PRI * HTTP/2.0" is the start of the HTTP/2 connection preface
+		// (RFC 9113 3.4), never a request. It gets here when the connection
+		// is not served as HTTP/2: Protocol HTTP1, or a preface with header
+		// lines, which the prior-knowledge test of h2cHandler does not take.
+		// The handler never sees it, as on the native engines, which answer
+		// it 400 on Protocol HTTP1 (celeris#889). Not counted as a request,
+		// nor as an HTTP/2 stream.
+		w.Header().Set("Connection", "close")
+		http.Error(w, "400 Bad Request", http.StatusBadRequest)
+		return
+	}
 	if r.ProtoMajor == 2 {
 		// An h2c stream: the drain waits for it (celeris#759), unless the
 		// drain has ended, when nothing new may start (celeris#878).
@@ -63,9 +75,11 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.ProtoMajor == 2 {
 		s = stream.NewStream(1)
 		defer s.Release()
-		// Deferred after Release, so it runs before it: a cancel must not
-		// reach the stream once it is back in the pool.
-		defer BindStreamCancel(r.Context(), s)()
+		// The stream's context ends with the request's, once the handler asks
+		// for it (Context.Context): nothing is registered with r.Context()
+		// for a handler that never does (celeris#889). Release ends the
+		// binding.
+		s.BindParentContext(r.Context())
 	} else {
 		s = stream.NewH1Stream(1)
 		defer s.Release()
@@ -100,7 +114,7 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if maxBodySize > 0 && r.ContentLength > maxBodySize {
 			b.engine.metrics.errs.RequestBody.Add(1)
 			if r.ProtoMajor == 1 {
-				w.Header().Set("Connection", "close")
+				closeAfterUnreadBody(w)
 			}
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
@@ -172,6 +186,21 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.GetHeadersSent() {
 		w.WriteHeader(http.StatusOK)
 	}
+}
+
+// closeAfterUnreadBody is for an HTTP/1 answer that leaves the request's body
+// unread (a declared length over the limit): the connection is closed after
+// the answer, and net/http is told not to wait for the body first. Connection:
+// close alone is not enough: net/http's finishRequest still reads up to 256
+// KiB of an unread body (a declared length within that) before it closes, so a
+// client that declared a body and never sent it kept the connection's
+// goroutine until ReadTimeout (celeris#889). The read deadline, set to now,
+// makes that read fail at once; it is the connection's, which is closed
+// anyway, and the answer is written regardless. A writer that cannot set one
+// (http.ErrNotSupported) leaves the connection as it was.
+func closeAfterUnreadBody(w http.ResponseWriter) {
+	w.Header().Set("Connection", "close")
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 }
 
 // stdResponseWriter adapts http.ResponseWriter to stream.ResponseWriter.

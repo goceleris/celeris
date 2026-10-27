@@ -10,9 +10,10 @@ import (
 // `size` appended events. Append is O(1); Since is O(retained-after-lastID).
 // IDs are sequential decimal strings starting at 1, so a numerically
 // larger ID is always more recent (within a single ring instance). Each
-// entry holds a copy of the appended event's strings. In queued mode
-// the ring keeps the copy Send made, unless it is wrapped by another store,
-// in which case each event is copied twice.
+// entry holds a copy of the appended event's strings. In queued mode the ring
+// keeps the copy Send made, with no second copy, also when another store wraps
+// it and forwards the event as it got it (a decorator that changes a string of
+// the event gets the ring's own copy of it).
 //
 // `size` is clamped to 1 if non-positive.
 func NewRingBuffer(size int) ReplayStore {
@@ -43,8 +44,15 @@ type ringStore struct {
 // overwritten, and the caller's strings can be another request's views
 // (see [Client.Send]). e.ID is replaced by the ring's own ID, so it is not
 // copied.
-func (r *ringStore) Append(_ context.Context, e Event) (string, error) {
+//
+// An event the queue already copied is kept as it is: a ReplayStore that wraps
+// the ring is handed that event by the drain and forwards it with its context
+// (see ownedCtx; celeris#888 item 24).
+func (r *ringStore) Append(ctx context.Context, e Event) (string, error) {
 	e.ID = ""
+	if oc, ok := ctx.(*ownedCtx); ok && oc.owns(&e) {
+		return r.appendOwned(e), nil
+	}
 	return r.appendOwned(ownEvent(e)), nil
 }
 

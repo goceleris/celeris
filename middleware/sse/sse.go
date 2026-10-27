@@ -202,6 +202,13 @@ func (c *Client) sendQueued(e Event) error {
 // close, remaining events dropped — the connection is already gone).
 func (c *Client) drain() {
 	defer close(c.drainDone)
+	// A store other than the bare ring is told which strings are the queue's own
+	// copy (ownedCtx), so a ring behind a wrapper does not copy them again.
+	storeCtx, oc := c.ctx, (*ownedCtx)(nil)
+	if _, bare := c.replayStore.(*ringStore); c.replayStore != nil && !bare {
+		oc = &ownedCtx{Context: c.ctx}
+		storeCtx = oc
+	}
 	for e := range c.queue {
 		c.mu.Lock()
 		if c.closed {
@@ -214,7 +221,10 @@ func (c *Client) drain() {
 		// a transient store hiccup must not kill an otherwise healthy
 		// connection. The next successful Send recovers the order.
 		if c.replayStore != nil {
-			if id, err := appendQueued(c.ctx, c.replayStore, e); err == nil {
+			if oc != nil {
+				oc.set(&e)
+			}
+			if id, err := appendQueued(storeCtx, c.replayStore, e); err == nil {
 				e.ID = id
 			}
 		}
@@ -233,8 +243,8 @@ func (c *Client) drain() {
 
 // appendQueued appends an event the drain took off the queue. sendQueued
 // copied it before it queued it, so the ring store keeps it without a
-// second copy; any other store gets it through Append. A store that wraps
-// a ring is not a *ringStore, so its ring copies the event a second time.
+// second copy; any other store gets it through Append, with a context that
+// tells a ring behind a wrapper which strings are owned (ownedCtx).
 func appendQueued(ctx context.Context, s ReplayStore, e Event) (string, error) {
 	if r, ok := s.(*ringStore); ok {
 		return r.appendOwned(e), nil

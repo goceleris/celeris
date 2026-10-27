@@ -145,6 +145,23 @@ const (
 // port is freed with the rest: the evidence of msr1 is that CPU 8, which
 // services enp49s0's TX completion, can lose its loop while CPU 1 keeps one.
 //
+// When it does not engage. The rule reads the counters since boot, once, at the
+// first Listen, before any workload: the packet shares of step 1 and 7 are
+// those of the host's whole uptime, not of the load the server is about to
+// carry. On msr1 under kernel 7.0.0-38 the two ports of the bond (802.3ad,
+// layer3+4 hash, receive hashing off on both) each take about half of a cell's
+// packets (enp49s0: median 50.0% with a range of 39.2% to 61.8% over 64 cells
+// measured), so no window, recent or since boot, reliably shows the one port
+// over rxPortPercent that step 1 needs, and the rule took the two CPUs only
+// where the counters had drifted to one port over 60% through a long uptime. A
+// host whose counters do not show one port over 60% with a million packets (a
+// freshly booted one, under rxMinPackets, or a network that splits evenly like
+// msr1's) does not engage the rule, and its plan is the one without it: one
+// loop on every big CPU (celeris#1049). That is the fallback working as
+// intended, not a fault, and the rule is left as it is. A run that compares the
+// plan lines of two builds on such a host should expect the rule to have acted
+// on neither.
+//
 // Any read that fails, any format it does not know, a busy vector whose CPU is
 // not a single one: no CPU is freed and Why says why. It reads nothing when the
 // floor leaves no CPU to free.

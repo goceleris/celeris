@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -185,9 +187,44 @@ type h1ResponseAdapter struct {
 	werr      error
 	keepAlive bool
 	isHEAD    bool
-	hijackFn  func() (net.Conn, error)
-	hijacked  bool
-	respBuf   []byte // per-connection reusable response buffer, avoids sync.Pool per request
+	// A streamed response (WriteHeader, Write, Close) keeps its own state, set
+	// by WriteHeader and cleared for each request (handleH1Request), so that
+	// what a later chunk does depends on the request that began the response
+	// and not on whatever request the adapter holds by then (celeris#889).
+	// Like the rest of the adapter, not safe for concurrent use; the handler
+	// that detached owns it, and handleH1Request reads it only for a response
+	// the handler did not detach.
+	//
+	// streamBegun: WriteHeader has begun a response, and streamNoBody says it has
+	// none: a HEAD's, or one with a status that has no content (headers only, no
+	// chunk, no last chunk). streamOpen: a chunked
+	// response is under way and its last chunk has not been sent (a HEAD's, and
+	// one with no content, 1xx, 204 and 304, never is). streamBroken: the
+	// handler failed after its headers went out.
+	streamBegun  bool
+	streamNoBody bool
+	streamOpen   bool
+	streamBroken bool
+	// streamInterim: the last WriteHeader was a 1xx, so no final response has
+	// been sent (handleH1Request answers one when the handler returns).
+	streamInterim bool
+	// streamDeclared is the content-length WriteHeader was given (-1: none,
+	// declaredInvalid: one that cannot be held to) and streamWritten the body
+	// bytes Write has staged: a response its handler leaves unclosed is ended
+	// only if they agree.
+	streamDeclared int64
+	streamWritten  int64
+	// chunkBuf is the scratch a streamed chunk is framed in. Every write hook
+	// copies its argument before it returns (the engines append it to their
+	// send buffer), so it is reused for the next chunk; it never grows past
+	// maxChunkScratch, a larger chunk is framed in a buffer of its own. Once
+	// the stream is detached (UpdateWriteFn), a long-lived writer keeps at most
+	// chunkScratchKeep (scratchDetached).
+	chunkBuf        []byte
+	scratchDetached bool
+	hijackFn        func() (net.Conn, error)
+	hijacked        bool
+	respBuf         []byte // per-connection reusable response buffer, avoids sync.Pool per request
 }
 
 // sendfileThreshold is the minimum body size at which the H1 response
@@ -1135,10 +1172,18 @@ func statusText(code int) string {
 
 func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers [][2]string) error {
 	a.werr = nil
+	noContent := status < 200 || status == 204 || status == 304
+	a.streamBegun, a.streamNoBody = true, a.isHEAD || noContent
+	a.streamBroken = false
+	a.streamInterim = status >= 100 && status < 200 && status != 101
+	a.streamOpen = !a.streamNoBody
+	a.streamDeclared, a.streamWritten = declaredLength(headers), 0
 	buf := a.respBuf[:0]
 	buf = appendStatusLine(buf, status)
 	buf = appendCachedDate(buf)
-	buf = append(buf, "transfer-encoding: chunked\r\n"...)
+	if !noContent { // RFC 9112 section 6.1: not on a 1xx, 204 or 304
+		buf = append(buf, "transfer-encoding: chunked\r\n"...)
+	}
 	for _, h := range headers {
 		// Same invariant as WriteResponse: headers reach this path
 		// pre-validated by celeris.Context's Set methods.
@@ -1176,12 +1221,35 @@ func (a *h1ResponseAdapter) askWriteErr(n int) error {
 	return nil
 }
 
+// maxChunkScratch bounds a connection's chunk scratch buffer: a chunk that
+// needs more is framed in a buffer of its own, as a chunk always was.
+const maxChunkScratch = 64 << 10
+
+// maxChunkData is the most data one chunk carries.
+const maxChunkData = 1 << 30
+
+// chunkScratchKeep is the largest chunk scratch kept when a handler that
+// streamed returns without detaching: a connection that goes on to serve other
+// requests does not hold a large one.
+const chunkScratchKeep = 4 << 10
+
+// headResponse reports whether the response being written has no body: the one
+// WriteHeader began (a HEAD's, or a status with no content), if it has begun
+// one, else the request the adapter holds.
+func (a *h1ResponseAdapter) headResponse() bool {
+	if a.streamBegun {
+		return a.streamNoBody
+	}
+	return a.isHEAD
+}
+
 func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
 	// RFC 9110 §9.3.2: a HEAD response has no content. WriteHeader sent
 	// the header block (transfer-encoding: chunked says what a GET would
 	// get); a chunk here would be read as the start of the next response
-	// on the connection.
-	if a.isHEAD {
+	// on the connection. Nor after the response was ended (Close): a chunk
+	// behind the last chunk is no chunk.
+	if a.headResponse() || (a.streamBegun && !a.streamOpen) {
 		return nil
 	}
 	// The engine refused an earlier write of this response, or the conn is
@@ -1189,22 +1257,96 @@ func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
 	if a.werr != nil {
 		return a.werr
 	}
-	// Chunked transfer encoding: hex(len)\r\n data \r\n
-	var hexBuf [20]byte
-	chunk := strconv.AppendInt(hexBuf[:0], int64(len(data)), 16)
-	chunk = append(chunk, '\r', '\n')
-	// The engine is asked before the chunk is staged: one that would take the
-	// response held unsent past the engine's limit is refused whole, and
-	// nothing of it is appended (the hook cannot undo an append).
-	if err := a.askWriteErr(len(chunk) + len(data) + len(crlf)); err != nil {
-		return err
+	// A zero-length chunk is the last chunk (RFC 9112 §7.1): an empty Write
+	// sends nothing, as net/http's does, and Close ends the response.
+	if len(data) == 0 {
+		return nil
 	}
-	chunk = append(chunk, data...)
+	// A chunk of more than 1 GiB goes out as several, so that the size of the
+	// buffer that frames one cannot overflow.
+	for len(data) > maxChunkData {
+		if err := a.Write(nil, data[:maxChunkData]); err != nil {
+			return err
+		}
+		data = data[maxChunkData:]
+	}
+	// Chunked transfer encoding: hex(len)\r\n data \r\n, built in the
+	// connection's scratch (see chunkBuf).
+	limit := maxChunkScratch
+	if a.scratchDetached {
+		limit = chunkScratchKeep
+	}
+	var chunk []byte
+	n := len(data)
+	if n <= limit-20 {
+		if need := n + 20; cap(a.chunkBuf) < need {
+			a.chunkBuf = make([]byte, 0, 1<<bits.Len(uint(need-1)))
+		}
+		chunk = a.chunkBuf[:0]
+		chunk = strconv.AppendInt(chunk, int64(n), 16)
+		chunk = append(chunk, '\r', '\n')
+		if err := a.askWriteErr(len(chunk) + n + len(crlf)); err != nil {
+			return err
+		}
+		chunk = append(chunk, data...)
+	} else {
+		// Framed in a buffer of its own, grown from the prefix by append, which
+		// does not zero the bytes the copy overwrites (make would).
+		if cap(a.chunkBuf) < 32 {
+			a.chunkBuf = make([]byte, 0, 32)
+		}
+		prefix := strconv.AppendInt(a.chunkBuf[:0], int64(n), 16)
+		prefix = append(prefix, '\r', '\n')
+		if err := a.askWriteErr(len(prefix) + n + len(crlf)); err != nil {
+			return err
+		}
+		chunk = append(prefix[:len(prefix):len(prefix)], data...)
+	}
 	chunk = append(chunk, crlf...)
 	a.write(chunk)
+	a.streamWritten += int64(n)
 	// And again after the hook: a detached conn's hook refuses a write whose
 	// backlog is over the limit, and drops it.
 	return a.askWriteErr(0)
+}
+
+// declaredInvalid is the declared length of a response whose content-length
+// cannot be held to: not a plain number, or given more than once.
+const declaredInvalid = -2
+
+// declaredLength is the content-length the headers of a streamed response
+// declare: -1 for none, declaredInvalid for one that cannot be held to (not
+// all digits, too long for an int64, or several fields).
+func declaredLength(headers [][2]string) int64 {
+	declared := int64(-1)
+	for _, h := range headers {
+		if len(h[0]) != len("content-length") || !strings.EqualFold(h[0], "content-length") {
+			continue
+		}
+		if declared != -1 {
+			return declaredInvalid
+		}
+		v := strings.TrimSpace(h[1])
+		if v == "" || len(v) > 18 {
+			return declaredInvalid
+		}
+		declared = 0
+		for i := 0; i < len(v); i++ {
+			if v[i] < '0' || v[i] > '9' {
+				return declaredInvalid
+			}
+			declared = declared*10 + int64(v[i]-'0')
+		}
+	}
+	return declared
+}
+
+// streamComplete reports whether the streamed response that is under way has
+// every byte its headers declared, if they declared any: the condition for
+// ending it at the handler's return (a body that is not as long as declared is
+// cut, not ended: the last chunk would make it look whole).
+func (a *h1ResponseAdapter) streamComplete() bool {
+	return a.streamDeclared == -1 || a.streamDeclared == a.streamWritten
 }
 
 // Flush has nothing to send: the write hook does not hold bytes back for it
@@ -1219,9 +1361,12 @@ func (a *h1ResponseAdapter) Flush(_ *stream.Stream) error {
 }
 
 func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
-	if a.isHEAD {
-		return nil // no content, so no last-chunk either (see Write)
+	// A response with no body (HEAD, 1xx, 204, 304) has no last chunk (see
+	// Write), and one that is already ended is not ended twice.
+	if a.headResponse() || (a.streamBegun && !a.streamOpen) {
+		return nil
 	}
+	a.streamOpen = false
 	if a.werr != nil {
 		return a.werr
 	}
@@ -1234,6 +1379,22 @@ func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
 	}
 	a.write(last)
 	return a.askWriteErr(0)
+}
+
+// NeedsEmptyAnswer marks this writer as the native HTTP/1 engines': they send
+// nothing for a handler that returns without answering, so the router answers
+// for it (an empty 200); net/http's and HTTP/2's own writers do not have it.
+func (a *h1ResponseAdapter) NeedsEmptyAnswer() {}
+
+// FailResponse records that the handler failed after its streamed response was
+// under way, with the failure swallowed above the engine (the router recovers a
+// panic and answers an error with a 500 only when nothing was sent): the
+// response is not whole, so it is not ended at the handler's return, and the
+// connection is closed instead (handleH1Request), as a client of net/http sees
+// a handler that panics after its headers. The HTTP/1.1 form of the reset the
+// HTTP/2 processor sends (celeris#889).
+func (a *h1ResponseAdapter) FailResponse() {
+	a.streamBroken = true
 }
 
 // h2 streaming support — h2ResponseAdapter implements stream.Streamer.

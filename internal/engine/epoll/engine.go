@@ -150,7 +150,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	resolved := e.cfg.Resources.Resolve()
 
-	topo := platform.DetectNUMA()
+	topo := detectNUMA()
 	// celeris#909: the CPU of loop i is the i-th member of the process's
 	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
 	// the loop count (celeris#1036): on a big.LITTLE host it holds one loop
@@ -159,12 +159,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	cpus := plan.CPUs
 	resolved.Workers = len(cpus)
 
-	if topo.NumNodes > 1 {
-		resolved.MaxEvents = resolved.MaxEvents / topo.NumNodes
-		if resolved.MaxEvents < 64 {
-			resolved.MaxEvents = 64
-		}
-	}
+	resolved.MaxEvents = splitMaxEvents(resolved.MaxEvents, topo, plan.Allowed)
 
 	e.mu.Lock()
 	e.loops = make([]*Loop, resolved.Workers)
@@ -342,7 +337,10 @@ func (e *Engine) Type() engine.EngineType {
 
 // BeginPauseAccept starts pausing accept and returns without waiting
 // (celeris#662). Each loop sees the flag at the top of its next iteration,
-// a few milliseconds later at most while it listens. Then, on its own
+// a few milliseconds later at most while it listens (adaptiveTimeoutMs caps
+// the wait at 4 ms; measured 0.8 to 5.9 ms from the call to the closed
+// listener, celeris#886 item 24), which is why it does not signal the wake
+// eventfd, as io_uring's does for its 100 ms ring wait. Then, on its own
 // thread, it clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
 // serving for the linger (about 1.5 s from that clear), and closes the
 // listener once it has drained the accept queue. A connection whose

@@ -4,10 +4,8 @@ package websocket_test
 
 import (
 	"bufio"
-	"context"
 	"net"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,63 +38,28 @@ func TestWebSocketUpgradeOnNativeEngines(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			addr := ln.Addr().String()
-
-			srv := celeris.New(celeris.Config{
-				Engine:        tc.engine,
-				AsyncHandlers: tc.async,
+			_, addr, stop := startWS888(t, func() *celeris.Server {
+				srv := celeris.New(celeris.Config{
+					Engine:        tc.engine,
+					AsyncHandlers: tc.async,
+				})
+				srv.GET("/ws", websocket.New(websocket.Config{
+					CheckOrigin: func(c *celeris.Context) bool { return true },
+					Handler: func(c *websocket.Conn) {
+						for {
+							mt, msg, err := c.ReadMessage()
+							if err != nil {
+								return
+							}
+							if err := c.WriteMessage(mt, msg); err != nil {
+								return
+							}
+						}
+					},
+				}))
+				return srv
 			})
-			srv.GET("/ws", websocket.New(websocket.Config{
-				CheckOrigin: func(c *celeris.Context) bool { return true },
-				Handler: func(c *websocket.Conn) {
-					for {
-						mt, msg, err := c.ReadMessage()
-						if err != nil {
-							return
-						}
-						if err := c.WriteMessage(mt, msg); err != nil {
-							return
-						}
-					}
-				},
-			}))
-			var startErr atomic.Pointer[error]
-			startCtx, startCancel := context.WithCancel(context.Background())
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				if e := srv.StartWithListenerAndContext(startCtx, ln); e != nil {
-					startErr.Store(&e)
-				}
-			}()
-			// iouring/epoll rebind via SO_REUSEPORT. Give them time
-			// to settle. See sse_engine_linux_test.go for context.
-			time.Sleep(500 * time.Millisecond)
-			// A Start that fails after the settle sleep is not missed (celeris#706).
-			waitUpOrStopped(t, srv, done, 30*time.Second)
-			if p := startErr.Load(); p != nil {
-				// Docker / minimal-kernel CI runners may lack io_uring
-				// support. Skip rather than fail — the test exercises a
-				// kernel-feature-gated path and the failure mode is
-				// "engine unavailable", not a celeris bug.
-				msg := (*p).Error()
-				if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
-					t.Skipf("engine unavailable on this runner: %v", *p)
-				}
-				t.Fatalf("server start: %v", *p)
-			}
-			defer func() {
-				startCancel()
-				select {
-				case <-done:
-				case <-time.After(3 * time.Second):
-					t.Log("server goroutine did not exit within 3s")
-				}
-			}()
+			defer stop()
 
 			conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
 			if err != nil {

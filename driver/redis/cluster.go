@@ -224,6 +224,9 @@ func (c *ClusterClient) getOrCreateNodeAs(addr string, isPrimary bool) (*cluster
 	if ok {
 		return n, nil
 	}
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
 	var (
 		client *Client
 		err    error
@@ -236,14 +239,26 @@ func (c *ClusterClient) getOrCreateNodeAs(addr string, isPrimary bool) (*cluster
 	if err != nil {
 		return nil, err
 	}
-	n = &clusterNode{addr: addr, client: client, primary: isPrimary}
+	return c.installNode(&clusterNode{addr: addr, client: client, primary: isPrimary})
+}
+
+// installNode stores a node a redirect just dialled and returns the node to
+// use. If the address was stored meanwhile it returns that one, and if Close ran
+// while the node dialled (closeNodes left c.nodes nil, and a write into it is a
+// panic) it returns ErrClosed; in both cases n's client is closed.
+func (c *ClusterClient) installNode(n *clusterNode) (*clusterNode, error) {
 	c.mu.Lock()
-	if existing, ok := c.nodes[addr]; ok {
+	if c.nodes == nil {
 		c.mu.Unlock()
-		_ = client.Close()
+		_ = n.client.Close()
+		return nil, ErrClosed
+	}
+	if existing, ok := c.nodes[n.addr]; ok {
+		c.mu.Unlock()
+		_ = n.client.Close()
 		return existing, nil
 	}
-	c.nodes[addr] = n
+	c.nodes[n.addr] = n
 	c.mu.Unlock()
 	return n, nil
 }
@@ -336,8 +351,20 @@ func (c *ClusterClient) refreshTopology(ctx context.Context) error {
 	if v.Type != protocol.TyArray {
 		return fmt.Errorf("CLUSTER SLOTS: unexpected reply type %s", v.Type)
 	}
+	return c.applyTopology(ctx, v)
+}
+
+// applyTopology rebuilds the slot-to-node mapping from a CLUSTER SLOTS reply.
+// It is the part of refreshTopology that runs under c.mu, split out so a test
+// can run it at the moment a Close has just returned.
+func (c *ClusterClient) applyTopology(ctx context.Context, v *Value) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// closeNodes leaves c.nodes nil: a refresh whose reply came before Close
+	// gets here after it, and must neither dial nor write into the nil map.
+	if c.nodes == nil {
+		return ErrClosed
+	}
 
 	wantReplicas := c.cfg.ReadOnly || c.cfg.RouteByLatency
 

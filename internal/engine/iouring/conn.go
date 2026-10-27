@@ -184,6 +184,7 @@ type connState struct {
 	fixedFile      bool         // 1: true when fd is fixed file index
 	recvLinked     bool         // 1: RECV was linked to SEND (skip standalone prepareRecv)
 	needsRecv      bool         // 1: recv arm was dropped (SQ ring full); retry on next opportunity
+	gateRead       bool         // 1: the shutdown gate's first pass found a request in the kernel's receive queue (holdUnreadAtGate, celeris#1104): gateReadsOn lets it be read
 	recvIntoBody   bool         // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
 	zcNotifPending bool         // 1: waiting for SEND_ZC notification CQE
 	h2GoAwaySent   bool         // 1: a graceful shutdown sent this H2 conn its GOAWAY (celeris#759)
@@ -244,6 +245,15 @@ type connState struct {
 	// detection does not start the budget again. handleRecv closes a conn
 	// whose deciding recv comes after it, and clears it once initProtocol ran.
 	detectDeadline int64 // 8
+	// h2OwedAt is the time (UnixNano) of the last sweep that found this HTTP/2
+	// conn with a stream the server owes an answer for (H2State.ServerOwes), 0
+	// if none yet. checkTimeouts exempts such a conn from ReadTimeout and
+	// IdleTimeout, whose clock is the client's last frame or completed send, and
+	// when the stream ends the idle period starts there, within a sweep, as
+	// net/http starts its idle timer when the last stream closes (celeris#889).
+	// Not lastActivity: that is the WriteTimeout clock of the dirty/sending arm.
+	// Worker thread only; reset on release.
+	h2OwedAt int64 // 8
 	// bodyRecvPin retains the H1State.bodyBuf backing array while a
 	// single-shot recv has been armed directly into it (pickRecvTarget's
 	// recvIntoBody path). conn.CloseH1 nils H1State.bodyBuf on close, which
@@ -689,6 +699,7 @@ func releaseConnState(cs *connState) {
 	cs.fixedFile = false
 	cs.recvLinked = false
 	cs.needsRecv = false
+	cs.gateRead = false
 	cs.recvIntoBody = false
 	cs.zcNotifPending = false
 	cs.h2GoAwaySent = false
@@ -751,6 +762,7 @@ func releaseConnState(cs *connState) {
 	cs.bodyRecvPin = nil
 	cs.detectAccum = cs.detectAccum[:0]
 	cs.detectDeadline = 0
+	cs.h2OwedAt = 0
 	// kernelInflight is zero on every normal release (drainPendingRelease
 	// gates on it); reset for the wall-clock-backstop path, where the worker
 	// gave up waiting on a CQE the kernel never produced, and for the

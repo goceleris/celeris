@@ -518,9 +518,12 @@ type server760 struct {
 	startDone chan error
 }
 
-// startServer760 starts a server with routes on StartWithContext, with
-// ShutdownTimeout budget (and WriteTimeout writeTimeout, 0 for the default),
-// and waits until it answers /ping. An io_uring start
+// startServer760 starts a server with routes on a listener it picked, under a
+// context it cancels to stop it (StartWithListenerAndContext, which shares
+// StartWithContext's shutdown), with ShutdownTimeout budget (and WriteTimeout
+// writeTimeout, 0 for the default), and waits until it answers /ping. The
+// listener is handed to the server, not closed and bound again (see
+// startPickedCtx1104). An io_uring start
 // that fails only with ENOMEM is retried, with a new server, for up to 30 s:
 // the kernel charges ring memory to RLIMIT_MEMLOCK per UID and gives it back
 // some milliseconds after a ring closes, so at the CI runner's 8 MiB a start
@@ -528,46 +531,26 @@ type server760 struct {
 // leaked (see startC714DetachServer).
 func startServer760(t *testing.T, eng celeris.EngineType, budget, writeTimeout time.Duration, cfgFn func(*celeris.Config), routes func(*celeris.Server)) *server760 {
 	t.Helper()
-	retryUntil := time.Now().Add(30 * time.Second)
-	for tries := 1; ; tries++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		cfg := celeris.Config{Engine: eng, Addr: addr, ShutdownTimeout: budget, WriteTimeout: writeTimeout}
-		if cfgFn != nil {
-			cfgFn(&cfg)
-		}
-		s := celeris.New(cfg)
+	cfg := celeris.Config{Engine: eng, ShutdownTimeout: budget, WriteTimeout: writeTimeout}
+	if cfgFn != nil {
+		cfgFn(&cfg)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // a start that never succeeds leaves nothing running
+	s, addr, done := startPickedCtx1104(ctx, t, cfg, func(s *celeris.Server) {
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 		routes(s)
-		ctx, cancel := context.WithCancel(context.Background())
-		srv := &server760{s: s, addr: addr, cancel: cancel, startDone: make(chan error, 1)}
-		go func() { srv.startDone <- s.StartWithContext(ctx) }()
-		err = waitReady760(addr, srv.startDone)
-		if err == nil {
-			if tries > 1 {
-				t.Logf("server start retried on ring ENOMEM: %d tries", tries)
-			}
-			t.Cleanup(func() {
-				cancel()
-				select {
-				case <-srv.startDone:
-				case <-time.After(30 * time.Second):
-					t.Errorf("StartWithContext did not return within 30s of the cleanup cancel")
-				}
-			})
-			return srv
-		}
+	}, func(_ *celeris.Server, addr string, done <-chan error) error { return waitReady760(addr, done) })
+	srv := &server760{s: s, addr: addr, cancel: cancel, startDone: done}
+	t.Cleanup(func() {
 		cancel()
-		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
-			time.Sleep(20 * time.Millisecond)
-			continue
+		select {
+		case <-srv.startDone:
+		case <-time.After(30 * time.Second):
+			t.Errorf("StartWithContext did not return within 30s of the cleanup cancel")
 		}
-		t.Fatalf("server did not start: %v", err)
-	}
+	})
+	return srv
 }
 
 // waitReady760 polls /ping until it answers 200, or returns the error the

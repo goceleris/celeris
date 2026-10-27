@@ -52,11 +52,28 @@ func mutexParked589(class string) bool {
 	return class == "checkTimeouts_detachMu_Lock" || class == "other_Mutex_Lock"
 }
 
+// parkedOnMutex589 reports whether a goroutine dump is a goroutine waiting for
+// a sync mutex: a frame in a Lock/RLock of sync.Mutex or sync.RWMutex, or the
+// wait reason in the goroutine header ("[sync.Mutex.Lock", "[sync.RWMutex.Lock",
+// "[sync.RWMutex.RLock"), which survives the inlining that can hide the Lock
+// frame (celeris#886 item 27).
+func parkedOnMutex589(g string) bool {
+	for _, m := range [...]string{
+		"sync.(*Mutex).Lock", "sync.(*RWMutex).Lock", "sync.(*RWMutex).RLock",
+		"[sync.Mutex.Lock", "[sync.RWMutex.Lock", "[sync.RWMutex.RLock",
+	} {
+		if strings.Contains(g, m) {
+			return true
+		}
+	}
+	return false
+}
+
 func classifyLoopStack589(g string) string {
 	switch {
-	case strings.Contains(g, "checkTimeouts") && strings.Contains(g, "sync.(*Mutex).Lock"):
+	case strings.Contains(g, "checkTimeouts") && parkedOnMutex589(g):
 		return "checkTimeouts_detachMu_Lock"
-	case strings.Contains(g, "sync.(*Mutex).Lock"):
+	case parkedOnMutex589(g):
 		return "other_Mutex_Lock"
 	case strings.Contains(g, "SubmitAndWait") || strings.Contains(g, "EpollWait"):
 		return "kernel_wait" // io_uring_enter / epoll_wait: the loop is idle, not pinned
@@ -86,13 +103,26 @@ func isLoopGoroutine589(g string) bool {
 	return strings.Contains(g, "internal/engine/iouring.(*Worker).run(") || strings.Contains(g, "internal/engine/epoll.(*Loop).run(")
 }
 
+// fullStack589 is the stack of every goroutine. runtime.Stack truncates
+// silently when the buffer is full, and a dump cut short could lose the stack of
+// the pinned worker and read as not parked, so the buffer grows until the dump
+// fits (celeris#886 item 27).
+func fullStack589() []byte {
+	buf := make([]byte, 1<<20)
+	for {
+		if n := runtime.Stack(buf, true); n < len(buf) {
+			return buf[:n]
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
 func (st *stackTally589) capture(t *testing.T) {
 	t.Helper()
-	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
+	dump := fullStack589()
 	st.captures++
 	parkedHere := false
-	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+	for _, g := range strings.Split(string(dump), "\n\n") {
 		if !isLoopGoroutine589(g) {
 			continue
 		}
@@ -610,11 +640,15 @@ func assertSettledStall589(o stall589Obs) error {
 // re-timed, so a settled route whose store turns slow is promoted and stops
 // running on the engine worker. State is asserted on both engines. The latency
 // observable differs by engine: epoll is judged on the ratio below, io_uring on
-// the fraction of post-promotion samples that waited for the blocked Set,
-// because io_uring separately pinned its worker in the timeout sweep even when
-// every conn is async-dispatched (celeris#593; fixed on main by PR #604). A
-// pinned worker shows that fraction at 0.3 and the fixed tree at 0, so it
-// needs no reference window and is not subject to the VOID case.
+// the worker's own stack (ioUringPin592): no event-loop goroutine parked on a
+// mutex in a quarter or more of at least stall592PinMinCaptures captures taken
+// while a /ping sat unanswered for 100 ms. io_uring needs that because it
+// separately pinned its worker in the timeout sweep even when every conn is
+// async-dispatched (celeris#593; fixed on main by PR #604). The stack read
+// needs no reference window and is not subject to the VOID case. It replaced a
+// bar on the fraction of post-promotion samples that waited for the blocked
+// Set (0.3 pinned, 0 fixed), which a starved box moved as much as the pin did
+// (celeris#886 item 1).
 //
 // The latency observable is RELATIVE (celeris#622). What the settled arm
 // claims is that a re-timed route stops costing the worker — not that a /ping
@@ -1378,6 +1412,39 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		return time.Since(t0), nil
 	}
 
+	// pingWatched is pingOnce on the shape the stack watch needs: the request
+	// runs on its own goroutine and a 100 ms timer waits for it, and a probe
+	// still unanswered when the timer fires calls onStall (nil: nothing to do)
+	// before waiting out the answer. BOTH windows probe through it, with the
+	// same goroutine and the same timer per probe, so that the two medians
+	// differ only in the engine state they observed (celeris#622, #886 item 27);
+	// only the post-promotion window passes an onStall that takes the stacks.
+	// With CELERIS_589_FRESH the probe is pingOnce's fresh-conn one in both.
+	pingWatched := func(onStall func()) (time.Duration, error) {
+		if fresh {
+			return pingOnce()
+		}
+		t0 := time.Now()
+		done := make(chan error, 1)
+		go func() { done <- get589(pc, pbr, "/ping") }()
+		stalled := time.NewTimer(100 * time.Millisecond)
+		defer stalled.Stop()
+		select {
+		case err := <-done:
+			if err != nil {
+				return 0, err
+			}
+		case <-stalled.C:
+			if onStall != nil {
+				onStall()
+			}
+			if err := <-done; err != nil {
+				return 0, err
+			}
+		}
+		return time.Since(t0), nil
+	}
+
 	// celeris#592: the settled classification is re-opened every
 	// adaptiveSettleTTL, the re-timed run is ~D (far over
 	// adaptiveBlockingThreshold) and the route promotes. Wait for that —
@@ -1408,7 +1475,7 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 					return
 				default:
 				}
-				d, err := pingOnce()
+				d, err := pingWatched(nil)
 				if err != nil {
 					select {
 					case refErr <- err:
@@ -1469,38 +1536,22 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	// (stackTally589, celeris#886 item 1): 100 ms into any /ping that has not
 	// been answered, the event-loop goroutines' stacks are classified.
 	stackDiag := !fresh
+	if stackDiag {
+		// 100 ms into EVERY stalled /ping, classify the event-loop goroutines'
+		// blocking site (tallied on the STACKTALLY589 line; CELERIS_589_STACK=1
+		// also dumps the first one in full).
+		o.stacks = &stackTally589{}
+	}
 	for time.Since(winStart) < stall589Window {
+		var onStall func()
 		if stackDiag {
-			// 100 ms into EVERY stalled /ping, classify the event-loop
-			// goroutines' blocking site (tallied on the STACKTALLY589 line;
-			// CELERIS_589_STACK=1 also dumps the first one in full).
-			if o.stacks == nil {
-				o.stacks = &stackTally589{}
-			}
-			t0 := time.Now()
-			done := make(chan error, 1)
-			go func() { done <- get589(pc, pbr, "/ping") }()
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatalf("GET /ping during window: %v", err)
-				}
-			case <-time.After(100 * time.Millisecond):
-				o.stacks.capture(t)
-				if err := <-done; err != nil {
-					t.Fatalf("GET /ping during window: %v", err)
-				}
-			}
-			lat = append(lat, time.Since(t0))
-		} else {
-			// The same call the reference window made (celeris#622), so the
-			// two medians differ only in the engine state they observed.
-			d, err := pingOnce()
-			if err != nil {
-				t.Fatalf("GET /ping during window: %v", err)
-			}
-			lat = append(lat, d)
+			onStall = func() { o.stacks.capture(t) }
 		}
+		d, err := pingWatched(onStall)
+		if err != nil {
+			t.Fatalf("GET /ping during window: %v", err)
+		}
+		lat = append(lat, d)
 		time.Sleep(stall589Spacing)
 	}
 	winEnd := time.Now()

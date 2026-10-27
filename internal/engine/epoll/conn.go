@@ -179,7 +179,8 @@ type connState struct {
 	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
 	detectN  uint8           // 1 byte: bytes at the head of buf received but too few to detect on, under detect.PrefaceLen (celeris#870); 0 once detected
 	goMoved  bool            // 1 byte: the dispatch goroutine's flush took bytes of a response (left the rest queued, or emptied the queue; resyncPending); under detachMu, consumed by noteWriteProgress (celeris#885 items 35 and 45)
-	_        [2]byte         // padding to 8-byte alignment
+	gateRead bool            // 1 byte: the pool wait's gate found a request in the kernel's receive queue (holdUnreadAtGate, celeris#1104): refusesRecv lets it be read
+	_        [1]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
@@ -366,6 +367,17 @@ type connState struct {
 	// straight to the dispatch goroutine instead of retrying the inline
 	// fast path. Reset on release.
 	asyncPromoted bool
+	// h2Switched is set by switchToH2Local, under asyncInMu, after it has
+	// written cs.h1State, cs.h2State and cs.protocol, and is what the loop
+	// thread reads of them for a promoted conn (drainRead's async gate, under
+	// the same lock): a true read orders every later read of the three after
+	// those writes, which the dispatch goroutine makes holding cs.detachMu and
+	// the loop thread does not take. A conn that is not switched is HTTP/1 by
+	// construction (a promoted conn started as one), so the gate never reads
+	// cs.protocol while the goroutine may be writing it (celeris#885 item 28).
+	// Declared beside asyncPromoted, in the byte of padding before the atomic
+	// that follows (TestConnStateStaysInItsSizeClass). Reset on release.
+	h2Switched bool
 	// asyncH2Promoted signals that runAsyncHandler observed ErrUpgradeH2C
 	// and completed the cs-local H1→H2 swap under detachMu. The worker
 	// must finish the promotion in drainDetachQueue (append fd to
@@ -503,6 +515,29 @@ func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *con
 	return cs
 }
 
+// h2OwedAt is the time (UnixNano) of the last sweep that found this HTTP/2 conn
+// with a stream the server owes an answer for (H2State.ServerOwes), 0 if none
+// yet. checkTimeouts exempts such a conn from ReadTimeout and IdleTimeout, whose
+// clock is the client's last frame, and when the stream ends the idle period
+// starts there, within a sweep, as net/http starts its idle timer when the last
+// stream closes (celeris#889). Not lastActivity: that is the sweep's write
+// clock too (sweepWriteClock). It lives in detectDeadline, which is free once
+// the protocol is detected (initProtocol hands what is left of it to the H1
+// header deadline and the deciding read zeroes it; a conn that is fixed at
+// accept or adopted never had one) and which connState has no room beside:
+// TestConnStateStaysInItsSizeClass. Valid for a detected conn only; loop thread;
+// zeroed on release with detectDeadline.
+func (cs *connState) h2OwedAt() int64 {
+	if !cs.detected {
+		return 0
+	}
+	return cs.detectDeadline
+}
+
+// noteH2Owed records a sweep that found cs, a detected HTTP/2 conn, owing a
+// stream's answer (h2OwedAt).
+func (cs *connState) noteH2Owed(now int64) { cs.detectDeadline = now }
+
 func releaseConnState(cs *connState) {
 	cs.h1State = nil
 	cs.h2State = nil
@@ -512,8 +547,10 @@ func releaseConnState(cs *connState) {
 	cs.dirtyNext = nil
 	cs.dirtyPrev = nil
 	cs.protocol = 0
+	cs.h2Switched = false
 	cs.detected = false
 	cs.detectN = 0
+	cs.gateRead = false
 	cs.detectDeadline = 0
 	cs.dirty = false
 	cs.epollOut = false

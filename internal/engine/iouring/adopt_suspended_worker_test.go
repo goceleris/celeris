@@ -77,42 +77,22 @@ type suspendedIOUring658 struct {
 
 func startSuspendedIOUring658(t *testing.T, onDisconnect func(string)) *suspendedIOUring658 {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-
-	e, err := New(resource.Config{
-		Addr:         addr,
-		Protocol:     engine.HTTP1,
-		Resources:    resource.Resources{Workers: 2},
-		OnDisconnect: onDisconnect,
-	}, transplantTestHandler{})
-	if err != nil {
-		t.Skipf("iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &suspendedIOUring658{e: e, cancel: cancel, errCh: make(chan error, 1)}
-	go func() { s.errCh <- e.Listen(ctx) }()
+	e, cancel, errCh := startRingRetried662(t, func() (*Engine, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("pick port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		return New(resource.Config{
+			Addr:         addr,
+			Protocol:     engine.HTTP1,
+			Resources:    resource.Resources{Workers: 2},
+			OnDisconnect: onDisconnect,
+		}, transplantTestHandler{})
+	})
+	s := &suspendedIOUring658{e: e, cancel: cancel, errCh: errCh}
 	t.Cleanup(func() { s.stop(t) })
-
-	for dl := time.Now().Add(10 * time.Second); time.Now().Before(dl); {
-		if e.Addr() != nil && e.NumWorkers() > 0 {
-			break
-		}
-		select {
-		case lerr := <-s.errCh:
-			s.errCh = nil
-			t.Skipf("io_uring Listen failed here: %v", lerr)
-		default:
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if e.Addr() == nil || e.NumWorkers() == 0 {
-		t.Fatal("engine did not bind with workers")
-	}
 	if err := e.PauseAccept(); err != nil {
 		t.Fatalf("PauseAccept: %v", err)
 	}

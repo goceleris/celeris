@@ -97,7 +97,7 @@ const (
 
 func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, mode string) {
 	if eng == celeris.IOUring {
-		if ok, p := keptProbeIOUring(); !ok {
+		if ok, p := keptProbeIOUring(t); !ok {
 			if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 				t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids skipping", p.IOUringTier, p.KernelVersion)
 			}
@@ -113,7 +113,7 @@ func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, mode string) {
 	// A fresh server per try: an io_uring Start can fail with ring-setup ENOMEM
 	// under the runner's 8 MiB memlock while earlier rings are still charged
 	// (celeris#1104).
-	startRetryingRingENOMEM(t, "server start", func() error {
+	startRetrying1104(t, "server start", func() error {
 		s := celeris.New(celeris.Config{Engine: eng, Workers: 2})
 		s.GET("/boom", func(c *celeris.Context) error {
 			hits.Add(1)
