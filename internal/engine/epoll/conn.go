@@ -515,6 +515,29 @@ func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *con
 	return cs
 }
 
+// h2OwedAt is the time (UnixNano) of the last sweep that found this HTTP/2 conn
+// with a stream the server owes an answer for (H2State.ServerOwes), 0 if none
+// yet. checkTimeouts exempts such a conn from ReadTimeout and IdleTimeout, whose
+// clock is the client's last frame, and when the stream ends the idle period
+// starts there, within a sweep, as net/http starts its idle timer when the last
+// stream closes (celeris#889). Not lastActivity: that is the sweep's write
+// clock too (sweepWriteClock). It lives in detectDeadline, which is free once
+// the protocol is detected (initProtocol hands what is left of it to the H1
+// header deadline and the deciding read zeroes it; a conn that is fixed at
+// accept or adopted never had one) and which connState has no room beside:
+// TestConnStateStaysInItsSizeClass. Valid for a detected conn only; loop thread;
+// zeroed on release with detectDeadline.
+func (cs *connState) h2OwedAt() int64 {
+	if !cs.detected {
+		return 0
+	}
+	return cs.detectDeadline
+}
+
+// noteH2Owed records a sweep that found cs, a detected HTTP/2 conn, owing a
+// stream's answer (h2OwedAt).
+func (cs *connState) noteH2Owed(now int64) { cs.detectDeadline = now }
+
 func releaseConnState(cs *connState) {
 	cs.h1State = nil
 	cs.h2State = nil

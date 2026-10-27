@@ -237,6 +237,28 @@ type Config struct {
 
 	// ReadTimeout is the max duration for reading the entire request.
 	// Zero uses the default (60s). Set to -1 for no timeout.
+	//
+	// On the native engines (epoll, io_uring, adaptive) it is measured from the
+	// connection's last read (on io_uring also from the start and the completion
+	// of its sends, on epoll also from the end of a response the kernel did not
+	// take at once).
+	//
+	// An HTTP/2 connection is not closed by it or by IdleTimeout while it has a
+	// stream open whose request is whole and no response is waiting for the
+	// client's flow-control window: a stream the server is writing to (an SSE
+	// stream) outlives a client that sends no frame. A stream that outlived the
+	// timeout and ends keeps the connection for the timeout from the sweep that
+	// last saw it; one that ends before the clock reaches the timeout does not
+	// move the clock, so the connection is closed at the timeout after the
+	// client's last frame, as before (on epoll that can be right after the
+	// stream). A stream whose handler never answers is exempt for as long as it
+	// holds the stream, where an HTTP/1.1 async handler that overruns ReadTimeout
+	// is closed. A client that owes the server something, the rest of a request
+	// or the WINDOW_UPDATE a response is waiting for, and sends nothing is
+	// closed as on HTTP/1.1, as is an HTTP/2 connection with no stream open. A
+	// client that sends a frame of any kind (a PING) at least once per
+	// ReadTimeout is not bounded by it; std bounds a request and a response per
+	// stream, the native engines do not.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This
@@ -348,7 +370,8 @@ type Config struct {
 	// WriteTimeout finite when handlers share locks across response writes.
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
-	// Zero uses the default (600s). Set to -1 for no timeout.
+	// Zero uses the default (600s). Set to -1 for no timeout. On an HTTP/2
+	// connection with a stream the server owes an answer for, see ReadTimeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts

@@ -2325,9 +2325,12 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 
 	for streamID, stream := range p.manager.streams {
 		if streamID > lastStreamID {
-			prev := stream.GetState()
 			p.manager.dropPlaceholderLocked(stream) // before Release clears its flags
-			stream.state.Store(int32(StateClosed))
+			// One Swap, as SetState and takeLocked do: a pool handler's own
+			// SetState(Closed) is a Swap without this lock, and a read of the
+			// state followed by a store would lower the counts a second time
+			// for a stream the goroutine had just closed (celeris#889).
+			prev := State(stream.state.Swap(int32(StateClosed)))
 			p.manager.updateActiveCount(prev, StateClosed)
 			stream.Cancel()
 			if stream.flags.Load()&flagAsyncRunning == 0 {
