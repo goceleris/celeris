@@ -4,6 +4,7 @@ package adaptive
 
 import (
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
 )
@@ -40,22 +41,26 @@ func TestMetricsWorkersSumsUnequalSubEngines886(t *testing.T) {
 
 // TestControllerDividesByTheActiveEnginesOwnLoops886: the controller's
 // conns-per-worker is the ACTIVE engine's connections over the ACTIVE engine's
-// loops, not over the adaptive sum. This is the divisor 886 item 30 (2) asks
-// about on a big.LITTLE host (8 loops, not GOMAXPROCS 12); the thresholds are
-// not changed by this test, only the arithmetic is pinned.
+// loops, not over the adaptive sum. It is driven through ctrl.evaluate, so that
+// it is the engine the controller hands to the sampler that is under test. This
+// is the divisor 886 item 30 (2) asks about on a big.LITTLE host (8 loops, not
+// GOMAXPROCS 12); the thresholds are not changed by this test, only the
+// arithmetic is pinned.
 func TestControllerDividesByTheActiveEnginesOwnLoops886(t *testing.T) {
-	e, _ := newAdaptiveStartingOnEpoll(t)
-	e.primary.(*mockEngine).SetMetrics(engine.EngineMetrics{Workers: 8, ActiveConnections: 192})
-	e.secondary.(*mockEngine).SetMetrics(engine.EngineMetrics{Workers: 10})
-
-	snap := newLiveSampler(nil).Sample(e.primary)
-	if snap.ConnsPerWorker != 24 {
-		t.Errorf("ConnsPerWorker = %v for 192 connections on 8 loops, want 24 (not 192/18 = %v)",
-			snap.ConnsPerWorker, 192.0/18)
+	epoll, iou := newMockEngine(engine.Epoll), newMockEngine(engine.IOUring)
+	epoll.SetMetrics(engine.EngineMetrics{Workers: 8, ActiveConnections: 192})
+	iou.SetMetrics(engine.EngineMetrics{Workers: 10, ActiveConnections: 1000})
+	sampler := &lastSnapSampler{TelemetrySampler: newLiveSampler(nil)}
+	c := newController(epoll, iou, sampler, testLogger())
+	c.cooldown = 0
+	c.evaluate(time.Now(), false)
+	// 192 connections are 24/worker on 8 loops, at the up-threshold. The same
+	// 192 connections on the 12 loops a host of alike CPUs would start are 16;
+	// divided by the sum of both engines' loops they would be 10.67.
+	if got := sampler.last.ConnsPerWorker; got != 24 {
+		t.Errorf("ConnsPerWorker = %v for 192 connections on 8 loops, want 24 (not 192/18 = %v)", got, 192.0/18)
 	}
-	// 192 connections are 24/worker on 8 loops: at the up-threshold. The same
-	// 192 connections on the 12 loops a host of alike CPUs would start are 16.
-	if c := newController(nil, nil, nil, testLogger()); snap.ConnsPerWorker < c.upThreshold {
-		t.Errorf("ConnsPerWorker %v is under the up-threshold %v", snap.ConnsPerWorker, c.upThreshold)
+	if sampler.last.ConnsPerWorker < c.upThreshold {
+		t.Errorf("ConnsPerWorker %v is under the up-threshold %v", sampler.last.ConnsPerWorker, c.upThreshold)
 	}
 }

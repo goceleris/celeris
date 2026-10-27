@@ -17,7 +17,8 @@ import (
 func fakeAddr890() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242} }
 
 // TestAwaitBindOutwaitsTheOldThreeSeconds890: the limit the tests use is well
-// past the 3 s that was missed.
+// past the 3 s that was missed. It pins the constant; that the wait waits is
+// what the four tests below show.
 func TestAwaitBindOutwaitsTheOldThreeSeconds890(t *testing.T) {
 	if bindLimit890 < 15*time.Second {
 		t.Errorf("bindLimit890 = %v, want at least 15 s (it was 3 s when the flake hit)", bindLimit890)

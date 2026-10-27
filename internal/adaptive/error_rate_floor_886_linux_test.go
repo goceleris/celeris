@@ -143,7 +143,7 @@ func TestFaultsBelowTheFloorDoNotAddUpAcrossIntervals886(t *testing.T) {
 
 // TestFloorLeavesAStormOnAnIdlePoolReverting886: the other direction. Faults at
 // the floor on a mostly idle pool whose sends all fail still revert when the
-// rate is over the bar; the floor removes the one-fault case and nothing else.
+// rate is over the bar; the floor removes the cases of one and two faults in an interval and nothing else.
 func TestFloorLeavesAStormOnAnIdlePoolReverting886(t *testing.T) {
 	base := engine.EngineMetrics{RequestCount: 1000, ActiveConnections: 40, Workers: 1}
 	revert, snap := feed886(t, testLogger(), base, func(m *engine.EngineMetrics) {

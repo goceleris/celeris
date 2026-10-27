@@ -229,12 +229,18 @@ func TestFullStackIsNotCutAtItsFirstBuffer589(t *testing.T) {
 	}
 	defer func() { close(stop); wg.Wait() }()
 
+	before := runtime.NumGoroutine()
 	dump := fullStack589()
+	after := runtime.NumGoroutine()
 	if len(dump) <= 1<<20 {
 		t.Fatalf("%d parked goroutines produced a %d byte dump, not over the 1 MiB first buffer: the test does not reach the growth", n, len(dump))
 	}
 	headers := strings.Count(string(dump), "\ngoroutine ") + 1
-	if want := runtime.NumGoroutine(); headers < n || headers > want+50 {
-		t.Errorf("the dump holds %d goroutines, want at least the %d parked ones and about %d in all", headers, n, want)
+	// The lower bound is what the test is for. The upper one only says the
+	// dump is a dump of this process, and goroutines left by an earlier test
+	// can exit while it is taken, so it is read on both sides of the dump.
+	if hi := max(before, after) + 50; headers < n || headers > hi {
+		t.Errorf("the dump holds %d goroutines, want at least the %d parked ones and at most %d (%d before the dump, %d after)",
+			headers, n, hi, before, after)
 	}
 }

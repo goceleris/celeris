@@ -222,7 +222,10 @@ var planLoopCPUs = platform.PlanWorkerCPUsFor
 // every other host it is `requested`. The plan is made without the listen
 // address, so the rx-port rule that may leave a few more CPUs out is not
 // applied: the count is the upper bound of what the engines start, and the
-// memlock test below never says "viable" for fewer loops than they start.
+// memlock test below never says "viable" for fewer loops than they start. It
+// plans on the CPU affinity of the thread that calls New, the sub-engines on
+// the one that calls Listen (sched_getaffinity is per thread): they differ
+// only if an application narrows the mask of one thread.
 func startedLoops(requested int, explicit bool) int {
 	return len(planLoopCPUs(requested, explicit, "").CPUs)
 }
