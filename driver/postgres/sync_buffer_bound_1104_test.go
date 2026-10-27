@@ -39,8 +39,8 @@ func TestAppendBufferedStopsAtTheCap1104(t *testing.T) {
 	if got := len(r.rowSlab); got > maxDirectResultBytes {
 		t.Errorf("the buffer holds %d bytes of rows, over the %d cap: the cap is checked after the append", got, maxDirectResultBytes)
 	}
-	if got, max := len(r.rows), maxDirectResultBytes/(1<<10); got > max {
-		t.Errorf("%d rows buffered, want at most %d (the cap)", got, max)
+	if got, limit := len(r.rows), maxDirectResultBytes/(1<<10); got > limit {
+		t.Errorf("%d rows buffered, want at most %d (the cap)", got, limit)
 	}
 }
 
@@ -184,7 +184,7 @@ func TestDirectModeResultAboveTheCapIsBounded1104(t *testing.T) {
 			if rerr == io.EOF {
 				rerr = nil
 			}
-			if !errors.Is(rerr, tc.wantErr) && !(tc.wantErr == nil && rerr == nil) {
+			if (tc.wantErr == nil && rerr != nil) || (tc.wantErr != nil && !errors.Is(rerr, tc.wantErr)) {
 				t.Fatalf("after %d rows: err = %v, want %v", got, rerr, tc.wantErr)
 			}
 			if tc.wantErr == nil {
@@ -193,8 +193,8 @@ func TestDirectModeResultAboveTheCapIsBounded1104(t *testing.T) {
 				}
 				return
 			}
-			if max := maxDirectResultBytes / (1 << 10); got > max {
-				t.Errorf("read %d rows of a reply over the cap, want at most %d: the reply was buffered whole", got, max)
+			if limit := maxDirectResultBytes / (1 << 10); got > limit {
+				t.Errorf("read %d rows of a reply over the cap, want at most %d: the reply was buffered whole", got, limit)
 			}
 		})
 	}
