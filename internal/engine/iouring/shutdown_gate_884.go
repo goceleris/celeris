@@ -56,11 +56,12 @@ const gateClosesPerPass = 64
 // called only when refuseRecv is set and the conn is HTTP/1 or undecided, and
 // it marks the conn close-after when it says yes. Worker thread.
 func (w *Worker) gateReadsOn(cs *connState) bool {
-	if cs.gateRead {
-		// The gate's first pass found the bytes of a request in the kernel's
-		// receive queue (holdUnreadAtGate): they reached it before the gate,
-		// and are read and answered whatever the conn looks like (the conn is
-		// marked close-after by the pass, or by initProtocol).
+	if cs.gateRead && !cs.writeEnded.Load() {
+		// The gate's first pass found a request that reached the kernel before
+		// the gate, in its socket queue (holdUnreadAtGate) or as a recv CQE not
+		// reaped yet (holdPostedRecvs): it is read and answered whatever the
+		// conn looks like (the conn is marked close-after by the pass, or by
+		// initProtocol). Not a detached stream the gate has ended.
 		return true
 	}
 	if !cs.detected {
@@ -149,7 +150,7 @@ func (w *Worker) closeIdleH1() {
 	first := !w.gateSwept
 	w.gateSwept = true
 	if first {
-		w.holdPostedRecvs()
+		w.sweepUnreadAtGate()
 	}
 	closed := 0
 	for i := len(w.liveConns) - 1; i >= 0; i-- {
@@ -164,13 +165,18 @@ func (w *Worker) closeIdleH1() {
 		if !w.gateCloseable(cs) {
 			continue
 		}
-		// The first pass asks the kernel's receive queue (celeris#1104): bytes
-		// there reached the kernel before the gate, and are a request in
-		// progress, read on and answered instead of the conn being closed. Ahead
-		// of the cap and the send-side tests, so that a conn those leave for the
-		// next pass is not met unasked.
-		if first && (cs.gateRead || w.holdUnreadAtGate(cs)) {
-			continue
+		// A conn the first pass held (sweepUnreadAtGate, celeris#1104) holds a
+		// request that is read on and answered, not closed. On the first pass
+		// that is all; a later pass closes it only once its socket has nothing
+		// left to deliver (a recv that has not yet been re-armed leaves the bytes
+		// there, and close(2) would reset them).
+		if cs.gateRead {
+			if first || !ownsDescriptorNumber(cs) {
+				continue
+			}
+			if q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ); err != nil || q != 0 {
+				continue
+			}
 		}
 		// Past the cap the conn was still looked at, so it is marked close-after
 		// (gateCloseable); it is closed by a later pass.
@@ -196,6 +202,32 @@ func (w *Worker) closeIdleH1() {
 		w.closeConn(fd)
 		closed++
 	}
+}
+
+// sweepUnreadAtGate is the first pass's look for requests that reached the
+// kernel before the gate (celeris#1104), ahead of the walk that closes. Order
+// matters: the sockets are asked first (every conn the pass could close:
+// holdUnreadAtGate), the completion queue second (holdPostedRecvs). On a ring
+// whose task work runs at any syscall return (COOP_TASKRUN, and the base tier's
+// flags 0) the ioctls of the first walk can themselves turn a later conn's
+// bytes into a recv CQE; looked at in the other order, such a request is in
+// neither place when each is asked. Asked this way it is in one of them: still
+// in the socket, or already a CQE by the time the queue is read. Worker thread.
+func (w *Worker) sweepUnreadAtGate() {
+	for i := len(w.liveConns) - 1; i >= 0; i-- {
+		cs := w.conns[w.liveConns[i]]
+		if cs == nil || cs.closing {
+			continue
+		}
+		if cs.detected && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
+			continue
+		}
+		if !w.gateCloseable(cs) {
+			continue
+		}
+		w.holdUnreadAtGate(cs)
+	}
+	w.holdPostedRecvs()
 }
 
 // holdPostedRecvs marks every conn whose recv completion is in the completion
@@ -238,15 +270,17 @@ func (w *Worker) holdPostedRecvs() {
 // holds the bytes of a request in the kernel's receive queue, and if so marks
 // it to be read on (cs.gateRead, gateReadsOn): the recv that is armed on it
 // delivers them, as a CQE the next reap takes, and the request is answered with
-// Connection: close. On a ring whose completions are task work (COOP_TASKRUN,
-// DEFER_TASKRUN) a request that reaches a socket between two of the worker's
-// enters waits there, in the socket's queue, until the next enter posts its
-// recv CQE: the pass, at the top of the iteration, is that window. An ended
-// detached stream is not asked (its bytes are the application's), and a
-// fixed-file conn cannot be (its slot is an index into the ring's file table,
-// not a descriptor: ownsDescriptorNumber): such a conn is judged by what the
-// worker holds for it alone. A failed ioctl is not an answer: the conn is left
-// to the next pass. Worker thread.
+// Connection: close. Where the bytes are when the pass runs depends on the
+// ring's task work: on a DEFER_TASKRUN ring (the default tier on a 6.1+ kernel)
+// a request that reaches a socket between two of the worker's enters waits in
+// the socket's queue until the next enter posts its recv CQE, which is what
+// this asks; on the base tier and under COOP_TASKRUN the recv completes when the
+// bytes arrive and the request is a CQE already (holdPostedRecvs, which the
+// sweep asks second). An ended detached stream is not asked (its bytes are the
+// application's), and a fixed-file conn cannot be (its slot is an index into the
+// ring's file table, not a descriptor: ownsDescriptorNumber; its CQE is still
+// seen). A failed ioctl is not an answer: the conn is held for this pass.
+// Worker thread.
 func (w *Worker) holdUnreadAtGate(cs *connState) bool {
 	if cs.writeEnded.Load() || !ownsDescriptorNumber(cs) {
 		return false

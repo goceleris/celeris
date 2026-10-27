@@ -169,7 +169,10 @@ func TestPoolWaitGateDoesNotCloseAConnWithAnUnreadRequest1104(t *testing.T) {
 	var accepted atomic.Int64
 	h := &gateUnread1104Handler{started: make(chan struct{}, 1), release: make(chan struct{})}
 	h.onGate = func(l *Loop) {
-		// The loop's accept of the iteration before the pass.
+		// The loop's accept of the iteration before the pass. An emulation: in
+		// production nothing is accepted once the gate is up (stopAccepting runs at
+		// the cancel), so the silent, keep-alive and budget tests are the
+		// production-reachable arms of this window.
 		before := len(l.liveConns)
 		l.acceptAll(context.Background(), time.Now().UnixNano())
 		accepted.Store(int64(len(l.liveConns) - before))

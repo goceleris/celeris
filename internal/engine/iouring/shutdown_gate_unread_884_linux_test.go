@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -326,5 +327,48 @@ func TestGatePassIgnoresAPostedRecvCQEOfAnotherGeneration1104(t *testing.T) {
 	w.closeIdleH1()
 	if w.conns[css[0].fd] == css[0] {
 		t.Errorf("the pass kept a conn on the strength of a CQE of another generation")
+	}
+}
+
+// TestGateLaterPassKeepsAHeldConnWhileItsBytesAreUnread1104: a conn the first
+// pass held, whose recv has not delivered the bytes by the next pass (it is not
+// armed), is not closed by that pass with the bytes unread (an RST); once its
+// socket is empty it is closed like any idle conn.
+func TestGateLaterPassKeepsAHeldConnWhileItsBytesAreUnread1104(t *testing.T) {
+	w, css, peers := gateRig884(t, 1)
+	if _, err := unix.Write(peers[0], []byte("GET /x HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	w.refuseRecv = true
+	w.closeIdleH1() // the first pass: held
+	if !css[0].gateRead {
+		t.Fatal("premise: the first pass did not hold the conn")
+	}
+	w.closeIdleH1() // a later pass, the bytes still in the socket
+	if w.conns[css[0].fd] != css[0] {
+		t.Fatalf("a later pass closed a held conn whose bytes were still unread (an RST)")
+	}
+	buf := make([]byte, 4096)
+	if _, err := unix.Read(css[0].fd, buf); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	w.closeIdleH1()
+	if w.conns[css[0].fd] == css[0] {
+		t.Errorf("the held conn, its socket now empty, was not closed by a later pass")
+	}
+}
+
+// TestGateReadsOnIgnoresTheMarkOfAnEndedDetachedStream1104: a conn marked to be
+// read on whose detached stream the gate has since ended is read no more.
+func TestGateReadsOnIgnoresTheMarkOfAnEndedDetachedStream1104(t *testing.T) {
+	w := &Worker{}
+	cs := gateConn884(7)
+	cs.detachMu = &sync.Mutex{}
+	cs.h1State.Detached.Store(true)
+	cs.detachClosed = true
+	cs.writeEnded.Store(true)
+	cs.gateRead = true
+	if w.gateReadsOn(cs) {
+		t.Errorf("gateReadsOn read on an ended detached stream because of its mark")
 	}
 }

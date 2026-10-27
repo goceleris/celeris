@@ -189,7 +189,8 @@ func (l *Loop) closeIdleH1(first bool, now int64) {
 			// is the few microseconds of those tests (a request that arrives
 			// in it is cut as std's Shutdown cuts one that arrives as it
 			// closes an idle conn, an RST for the unread bytes). An error is
-			// not an answer: the conn is left to the next pass.
+			// not an answer: the conn is left alone in this pass (a later pass,
+			// which does not ask, closes it).
 			q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ)
 			if err != nil {
 				continue
