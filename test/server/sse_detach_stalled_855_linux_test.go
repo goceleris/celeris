@@ -123,29 +123,16 @@ func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Durat
 		cfg.MaxQueueDepth = 4
 		cfg.OnSlowClient = func(*sse.Client, sse.Event) sse.ClientPolicy { return sse.ClientPolicyClose }
 	}
-	var addr string
 	// A ring's memlock is returned when the engine before it has closed, so a
-	// start that fails with ring-setup ENOMEM is retried (celeris#1104).
-	startRetryingRingENOMEM(t, "server start", func() error {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr = ln.Addr().String()
-		_ = ln.Close()
-		s := celeris.New(celeris.Config{Addr: addr, Engine: eng, ReadTimeout: wt, WriteTimeout: wt, ShutdownTimeout: shutdown})
-		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
-		s.GET("/events", sse.New(cfg))
-		st.s, st.startDone = s, make(chan error, 1)
-		go func(done chan error) { done <- s.Start() }(st.startDone)
-		if err := waitReady761(addr, st.startDone); err != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = s.Shutdown(ctx)
-			cancel()
-			return err
-		}
-		return nil
-	})
+	// start that fails with ring-setup ENOMEM is retried; the port stays with
+	// the server from the pick to the bind (celeris#1104).
+	var addr string
+	st.s, addr, st.startDone = startPicked1104(t, celeris.Config{Engine: eng, ReadTimeout: wt, WriteTimeout: wt, ShutdownTimeout: shutdown},
+		func(s *celeris.Server) {
+			s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+			s.GET("/events", sse.New(cfg))
+		},
+		func(_ *celeris.Server, addr string, done <-chan error) error { return waitReady761(addr, done) })
 	st.addr = addr
 	t.Cleanup(func() {
 		if st.conn != nil {

@@ -37,31 +37,55 @@ func isRingENOMEM(err error) bool {
 	return strings.Contains(msg, "cannot allocate memory") || strings.Contains(msg, "io_uring not available on this system")
 }
 
-// retryRingENOMEM calls attempt until it returns nil or an error that is not a
-// ring ENOMEM, or until window has passed since the first call. It returns the
-// number of calls and the last error. attempt must release whatever a failed
-// try holds (stop the server, close the listener) before it returns.
-func retryRingENOMEM(attempt func() error, window time.Duration) (tries int, err error) {
+// isAddrInUse reports a Start error that is the bind race of a starter that
+// has Start bind a port it picked and closed (the start-shutdown rig's plain
+// Start arm): another test of the process was given the port in between.
+func isAddrInUse(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "address already in use")
+}
+
+// maxAddrInUseTries bounds how often a taken port is retried: a port that stays
+// taken is a real conflict, not the race.
+const maxAddrInUseTries = 10
+
+// retryStart1104 calls attempt until it returns nil or an error it should not
+// retry, or until window has passed since the first call. It retries a ring
+// ENOMEM for the whole window and an address already in use up to
+// maxAddrInUseTries times (attempt picks a fresh port each call); any other
+// error is returned at once. It returns the number of calls and the last error.
+// attempt must release whatever a failed try holds (stop the server, close the
+// listener) before it returns.
+func retryStart1104(attempt func() error, window time.Duration) (tries int, err error) {
 	deadline := time.Now().Add(window)
+	inUse := 0
 	for {
 		tries++
-		if err = attempt(); err == nil || !isRingENOMEM(err) || !time.Now().Before(deadline) {
+		if err = attempt(); err == nil || !time.Now().Before(deadline) {
+			return tries, err
+		}
+		switch {
+		case isRingENOMEM(err):
+		case isAddrInUse(err):
+			if inUse++; inUse >= maxAddrInUseTries {
+				return tries, err
+			}
+		default:
 			return tries, err
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 }
 
-// startRetryingRingENOMEM runs attempt with retryRingENOMEM and fails t with
+// startRetrying1104 runs attempt with retryStart1104 and fails t with
 // what if it still fails.
-func startRetryingRingENOMEM(t testing.TB, what string, attempt func() error) {
+func startRetrying1104(t testing.TB, what string, attempt func() error) {
 	t.Helper()
-	tries, err := retryRingENOMEM(attempt, ringENOMEMWindow)
+	tries, err := retryStart1104(attempt, ringENOMEMWindow)
 	if err != nil {
 		t.Fatalf("%s: %v (try %d)", what, err, tries)
 	}
 	if tries > 1 {
-		t.Logf("%s: retried on ring ENOMEM: %d tries", what, tries)
+		t.Logf("%s: retried (a ring ENOMEM or a taken port): %d tries", what, tries)
 	}
 }
 
@@ -88,7 +112,7 @@ func TestRetryRingENOMEM1104(t *testing.T) {
 
 	// A ring ENOMEM is retried until the start succeeds.
 	calls := 0
-	tries, err := retryRingENOMEM(func() error {
+	tries, err := retryStart1104(func() error {
 		calls++
 		if calls < 3 {
 			return enomem
@@ -101,15 +125,45 @@ func TestRetryRingENOMEM1104(t *testing.T) {
 
 	// Any other error is returned at once.
 	calls = 0
-	tries, err = retryRingENOMEM(func() error { calls++; return other }, time.Second)
+	tries, err = retryStart1104(func() error { calls++; return other }, time.Second)
 	if !errors.Is(err, other) || tries != 1 || calls != 1 {
 		t.Errorf("a non-ENOMEM error: %d tries, err %v; want 1, %v", tries, err, other)
 	}
 
 	// A persistent ENOMEM is retried for the window, then returned.
 	start := time.Now()
-	tries, err = retryRingENOMEM(func() error { return enomem }, 100*time.Millisecond)
+	tries, err = retryStart1104(func() error { return enomem }, 100*time.Millisecond)
 	if !errors.Is(err, enomem) || tries < 2 || time.Since(start) < 100*time.Millisecond {
 		t.Errorf("a persistent ENOMEM: %d tries after %v, err %v; want >=2 tries over the 100 ms window, then %v", tries, time.Since(start), err, enomem)
+	}
+}
+
+// A start whose port is taken before it binds fails with "address already in
+// use": the start-shutdown rig's plain-Start arm picks a free port, closes it
+// and has Start bind it, and two parallel test cells of one process can pick the
+// same port (celeris#1104: TestStalledSSEEndsWithShutdown855/std/h2c/budget
+// failed once with "startErr=listen: ... bind: address already in use"). The
+// starters that can hand the server its listener do (startPicked1104); where
+// Start must bind itself, the error reaches this retry (waitReadyErr refuses
+// another server's /ping answer), which takes a fresh port, up to
+// maxAddrInUseTries times: a port that stays taken is a real conflict.
+func TestRetryStartRetriesAnAddressInUse1104(t *testing.T) {
+	inUse := errors.New("server did not start: listen tcp 127.0.0.1:38797: bind: address already in use")
+
+	calls := 0
+	tries, err := retryStart1104(func() error {
+		calls++
+		if calls < 3 {
+			return inUse
+		}
+		return nil
+	}, time.Second)
+	if err != nil || tries != 3 {
+		t.Errorf("two taken ports then success: %d tries, err %v; want 3, nil", tries, err)
+	}
+
+	tries, err = retryStart1104(func() error { return inUse }, 5*time.Second)
+	if !errors.Is(err, inUse) || tries != maxAddrInUseTries {
+		t.Errorf("a port that stays taken: %d tries, err %v; want exactly %d tries, then %v", tries, err, maxAddrInUseTries, inUse)
 	}
 }
