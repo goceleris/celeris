@@ -37,15 +37,39 @@ func isRingENOMEM(err error) bool {
 	return strings.Contains(msg, "cannot allocate memory") || strings.Contains(msg, "io_uring not available on this system")
 }
 
-// retryRingENOMEM calls attempt until it returns nil or an error that is not a
-// ring ENOMEM, or until window has passed since the first call. It returns the
-// number of calls and the last error. attempt must release whatever a failed
-// try holds (stop the server, close the listener) before it returns.
+// isAddrInUse reports a Start error that is the bind race of a starter that
+// picks a free port, closes it and has Start bind it: another test of the
+// process was given the port in between.
+func isAddrInUse(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "address already in use")
+}
+
+// maxAddrInUseTries bounds how often a taken port is retried: a port that stays
+// taken is a real conflict, not the race.
+const maxAddrInUseTries = 10
+
+// retryRingENOMEM calls attempt until it returns nil or an error it should not
+// retry, or until window has passed since the first call. It retries a ring
+// ENOMEM for the whole window and an address already in use up to
+// maxAddrInUseTries times (attempt picks a fresh port each call); any other
+// error is returned at once. It returns the number of calls and the last error.
+// attempt must release whatever a failed try holds (stop the server, close the
+// listener) before it returns.
 func retryRingENOMEM(attempt func() error, window time.Duration) (tries int, err error) {
 	deadline := time.Now().Add(window)
+	inUse := 0
 	for {
 		tries++
-		if err = attempt(); err == nil || !isRingENOMEM(err) || !time.Now().Before(deadline) {
+		if err = attempt(); err == nil || !time.Now().Before(deadline) {
+			return tries, err
+		}
+		switch {
+		case isRingENOMEM(err):
+		case isAddrInUse(err):
+			if inUse++; inUse >= maxAddrInUseTries {
+				return tries, err
+			}
+		default:
 			return tries, err
 		}
 		time.Sleep(20 * time.Millisecond)
