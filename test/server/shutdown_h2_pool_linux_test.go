@@ -1191,6 +1191,10 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 					s.GET("/aping", func(c *celeris.Context) error { return c.String(http.StatusOK, "a") }).Async()
 				}
 			})
+			// What the engine counts before this test sends anything: the readiness
+			// probe of startH2PoolServer759 (its keep-alive conn stays open in the
+			// default transport's pool, and it polled /ping one or more times).
+			base := settledEngineMetrics1104(srv)
 			// The wait is held: GET /big on 24 HTTP/2 conns, no WINDOW_UPDATE.
 			var h2conns []net.Conn
 			for range 24 {
@@ -1270,6 +1274,35 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			// TCP_DEFER_ACCEPT hands the engine a conn with no byte after about a
 			// second: the silent conns are in its table by then.
 			time.Sleep(1300 * time.Millisecond)
+			// The gate's first pass runs 250 ms after the shutdown began, and a
+			// conn the loop has accepted but not read yet, or a request whose
+			// bytes it has not read, is closed by it as idle (the loop of a runner
+			// busy with 24 HTTP/2 downloads under -race and -cover can be that far
+			// behind: celeris#1104). So begin only once the engine counts, on top
+			// of the baseline taken before the first dial, every conn this test
+			// opened (24 HTTP/2, the keep-alive ones, the silent ones, the download,
+			// the upload on the sync arm, the promoted conn on the async arm) and
+			// every request it sent (24 HTTP/2 GETs, one ping per keep-alive conn,
+			// the download's GET, and on the sync arm the upload, which the loop
+			// counts once it has read its headers and first 64 KiB, or on the
+			// async arm the promoted conn's ping). The conn count is exact: +34 in
+			// every run. The request count is a lower bound: measured, it ends at
+			// the arithmetic or one above it (sync +32 or +33 against 32, async
+			// +32 or +33 against 32), and the extra unit is already there after the
+			// keep-alive step, before the download and the upload are sent, so it is
+			// neither of them; its source was not found, which is why this wait is
+			// `>=` for requests and exact for conns.
+			wantConns := uint64(24 + len(idle) + len(silent) + 1) // + the download
+			wantReqs := uint64(24 + len(idle) + 1)                // + the download's GET
+			if arm == "sync" {
+				wantConns++ // the upload
+				wantReqs++  // the upload's request, counted when its first bytes are read
+			}
+			if promoted != nil {
+				wantConns++
+				wantReqs++
+			}
+			waitEngineBusy1104(t, srv, base, wantConns, wantReqs)
 
 			begin := time.Now()
 			srv.beginShutdown("Shutdown", 20*time.Second)
@@ -1343,4 +1376,39 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			srv.waitStart(t, 25*time.Second)
 		})
 	}
+}
+
+// settledEngineMetrics1104 returns the engine's metrics once neither the open
+// conns nor the handled requests have changed for 100 ms: the readiness probe
+// of startH2PoolServer759 counts its request after it has its response, so a
+// baseline taken the instant the server is up can miss one.
+func settledEngineMetrics1104(srv *h2PoolServer759) celeris.EngineMetrics {
+	prev := srv.s.EngineInfo().Metrics
+	for i := 0; i < 100; i++ {
+		time.Sleep(100 * time.Millisecond)
+		m := srv.s.EngineInfo().Metrics
+		if m.ActiveConnections == prev.ActiveConnections && m.RequestCount == prev.RequestCount {
+			return m
+		}
+		prev = m
+	}
+	return prev
+}
+
+// waitEngineBusy1104 waits, up to 20 s, until the engine counts at least conns
+// more open connections and reqs more handled requests than base, the metrics
+// taken before the test's first dial, and logs the surplus it ended with.
+func waitEngineBusy1104(t *testing.T, srv *h2PoolServer759, base celeris.EngineMetrics, conns, reqs uint64) {
+	t.Helper()
+	var m celeris.EngineMetrics
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		m = srv.s.EngineInfo().Metrics
+		if uint64(m.ActiveConnections-base.ActiveConnections) >= conns && m.RequestCount-base.RequestCount >= reqs {
+			t.Logf("engine counted +%d conns (want %d) and +%d requests (want %d) over the baseline of %d conns and %d requests",
+				m.ActiveConnections-base.ActiveConnections, conns, m.RequestCount-base.RequestCount, reqs, base.ActiveConnections, base.RequestCount)
+			return
+		}
+	}
+	t.Fatalf("the engine counted +%d conns and +%d requests over its baseline, want +%d and +%d before the shutdown begins",
+		m.ActiveConnections-base.ActiveConnections, m.RequestCount-base.RequestCount, conns, reqs)
 }

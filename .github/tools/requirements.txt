@@ -2,4 +2,4 @@
 # /.github/tools (.github/dependabot.yml) proposes their bumps (celeris#890
 # item 93). The Lint job installs this file with `pip install -r`; no workflow
 # names a version of its own (.github/scripts/tool-pins-check.sh, check 4).
-zizmor==1.30.0
+zizmor==1.31.1

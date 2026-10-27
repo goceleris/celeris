@@ -5,12 +5,15 @@ package iouring
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/probe"
 )
 
 // Ring memory, and the tests that start engines one after another.
@@ -66,6 +69,51 @@ func isRingENOMEM(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "cannot allocate memory")
 }
 
+// isRingStartPressure reports an engine start error that the ring budget
+// explains: the ring-setup ENOMEM itself, or the bare "io_uring not available on
+// this system", which is what New answers when the capability probe's own
+// private ring (probe.Probe builds one per call and is not cached) met the same
+// ENOMEM and read as no io_uring. The second is retried only where the engine
+// would run io_uring on this host (engineMayUseIOUring) and the syscall works
+// (ioUringUsableHere): New gives the same answer, for good, to a host without
+// io_uring, to CELERIS_MAX_IOURING_TIER capping the tier to none and to a
+// kernel before 5.19 (the last with a suffix), and none of those can be waited
+// out, so they skip at once instead of after ringUnchargeBound. A 4-entry ring
+// working is not enough to tell them apart; the kernel version and the tier cap
+// are what the engine itself decides on (celeris#1104).
+func isRingStartPressure(err error) bool {
+	if isRingENOMEM(err) {
+		return true
+	}
+	return err != nil && strings.HasSuffix(err.Error(), "io_uring not available on this system") &&
+		engineMayUseIOUring() && ringUsableHere()
+}
+
+// engineMayUseIOUring reports whether the engine would run io_uring on this host
+// were no ring refused for want of memory: a kernel of 5.19 or later (the engine
+// refuses io_uring below it, for the async-cancel flags every connection close
+// uses) and no CELERIS_MAX_IOURING_TIER that caps the tier to none (probe.Probe
+// reads a value that is not optional, high or base as none). It looks at no ring,
+// so memlock pressure cannot make it answer false. A variable so a test can
+// stand in for another host.
+var engineMayUseIOUring = func() bool {
+	switch os.Getenv("CELERIS_MAX_IOURING_TIER") {
+	case "", "optional", "high", "base":
+	default:
+		return false
+	}
+	var u unix.Utsname
+	if unix.Uname(&u) != nil {
+		return false
+	}
+	kv, err := probe.ParseKernelVersion(unix.ByteSliceToString(u.Release[:]))
+	return err == nil && kv.AtLeast(5, 19)
+}
+
+// ringUsableHere is ioUringUsableHere, a variable so a test can stand in for a
+// host.
+var ringUsableHere = ioUringUsableHere
+
 // ioUringUsable caches a positive answer of ioUringUsableHere only.
 var ioUringUsable atomic.Bool
 
@@ -105,7 +153,7 @@ func retryRingENOMEM(start func() error) (waited time.Duration, tries int, err e
 		tries++
 		waited = time.Since(t0)
 		err = start()
-		if small || !isRingENOMEM(err) || time.Since(t0) > ringUnchargeBound {
+		if small || !isRingStartPressure(err) || time.Since(t0) > ringUnchargeBound {
 			return waited, tries, err
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -142,7 +190,7 @@ var errNoBind662 = errors.New("engine did not bind with workers within 10s")
 // other failure is judged by skipOrFail656, as the rigs judged it before; a
 // Listen that neither failed nor bound fails the test. It returns the running
 // engine, its cancel, and a channel that receives Listen's result.
-func startRingRetried662(t *testing.T, build func() (*Engine, error)) (*Engine, context.CancelFunc, <-chan error) {
+func startRingRetried662(t *testing.T, build func() (*Engine, error)) (*Engine, context.CancelFunc, chan error) {
 	t.Helper()
 	var (
 		e      *Engine
