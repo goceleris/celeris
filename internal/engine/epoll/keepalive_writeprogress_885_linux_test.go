@@ -133,16 +133,17 @@ func get885(t *testing.T, c net.Conn, path string) {
 // TestEngineKeepAliveResponseSurvivesReadTimeoutWhileTheClientReads885:
 // ReadTimeout 2 s, WriteTimeout 30 s, a keep-alive response of 40 MiB that the
 // client takes at about 8 MiB/s, steadily, over more than twice ReadTimeout;
-// then, a third of a second after the last byte, a second request on the same
+// then, 50 ms after the last byte, a second request on the same
 // conn, which the conn must still be there to answer (the idle clock after a
 // response starts at its end, not at the request before it).
 func TestEngineKeepAliveResponseSurvivesReadTimeoutWhileTheClientReads885(t *testing.T) {
 	for _, async := range []bool{false, true} {
 		t.Run(map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
-			// The server's send buffer is bounded, so its last write runs at most
-			// 64 KiB (8 ms at the client's pace) ahead of the client's last read,
-			// and the second request follows 50 ms after that read: the idle
-			// clock has about 1.9 s of its 2 s to spare. With a 1 s ReadTimeout,
+			// The server's send buffer is bounded (the kernel doubles the 64 KiB,
+			// and the client's receive buffer holds as much again), so its last
+			// write runs a few tens of milliseconds ahead of the client's last
+			// read, and the second request follows 50 ms after that read: the
+			// idle clock has about 1.9 s of its 2 s to spare. With a 1 s ReadTimeout,
 			// the default send buffer and a 300 ms gap it had about 550 ms (see
 			// the margin test below).
 			runKeepAliveSurvives885(t, async, keepAliveSndBuf885, 50*time.Millisecond)
@@ -170,16 +171,21 @@ const (
 // the client's pace, up to about 250 ms at 16 MiB/s. Measured at --cpus 2 on
 // the original test (ReadTimeout 1 s, 16 MiB/s), with the default buffer the
 // second request finds the conn alive at a gap of 800 ms after the client's
-// last read and reaped at 900 ms (5 of 5 runs each, both arms), so its 300 ms
-// gap left about 550 ms of margin, which a loaded runner with coverage and
+// last read and reaped at 900 ms (most runs: 5 of 5 in one measurement, 4 of 6
+// in another), so its 300 ms gap left about 550 ms of margin, which a loaded runner with coverage and
 // -race can eat (the test failed once in CI, in the async arm). With the send
-// buffer bounded to 64 KiB the lag is a few milliseconds and the idle clock
-// has its full ReadTimeout: a gap of 1.5 s, three quarters of the 2 s, must
-// find the conn alive, i.e. the test above (it uses 50 ms) has this much room.
+// buffer bounded to 64 KiB the lag is a few tens of milliseconds and the idle
+// clock has its full ReadTimeout: measured at --cpus 2 with -race, a gap of
+// 1.9 s finds the conn alive (6 of 6 runs, both arms) and 2.1 s finds it reaped
+// (6 of 6), a cliff at the 2 s ReadTimeout plus the 25 ms sweep. The assertion
+// is a gap of 1.0 s, half the ReadTimeout and about a second below the cliff
+// (the original test sat about 0.55 s below its own): it holds with the lag far
+// below ReadTimeout, and still has a second of slack for a late sleep. The test
+// above (50 ms) has 1.9 s.
 func TestEngineKeepAliveMarginWithABoundedSendBuffer885(t *testing.T) {
 	for _, async := range []bool{false, true} {
 		t.Run(map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
-			runKeepAliveSurvives885(t, async, keepAliveSndBuf885, 1500*time.Millisecond)
+			runKeepAliveSurvives885(t, async, keepAliveSndBuf885, time.Second)
 		})
 	}
 }
