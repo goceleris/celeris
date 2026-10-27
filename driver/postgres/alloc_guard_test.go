@@ -43,7 +43,12 @@ func TestAllocBudgets(t *testing.T) {
 	}
 
 	guards := []guard{
-		{name: "Query_1col_1row", budget: 4, bench: benchQuery1col1row},
+		// 14, what the driver costs: celeris#890 item 91 measured 14 allocs/op on a
+		// linux/arm64 container (20 of 20 runs) and on the GitHub amd64 runner (run
+		// 39074958353) against the aspirational 4 this row held until then, which
+		// never failed because no CI step set TESTING_STRICT_ALLOC_BUDGETS=1. The
+		// allocation-guard step of ci.yml sets it now, so 14 is the bound.
+		{name: "Query_1col_1row", budget: 14, bench: benchQuery1col1row},
 		{name: "Pool_AcquireRelease", budget: 0, bench: benchPoolAcquireRelease},
 		// Prepared exec is intentionally omitted: it requires the extended
 		// protocol (Parse/Bind/Execute/Sync) handshake which the existing

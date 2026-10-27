@@ -149,8 +149,52 @@
 # 189 minutes rounded up per job (celeris 21 jobs and 101 minutes, loadgen 22
 # and 88), two thirds of it pull request runs. At that rate the 600 minutes
 # last 3.6 to 4.1 days (rounded or raw job time; CodSpeed's own meter is not
-# public), and pushes to main alone would use them in about two weeks. Whether to gate pull request runs on the `performance` label,
-# or more, is an open decision (celeris#754).
+# public), and pushes to main alone would use them in about two weeks.
+#
+# What happened (celeris#890 items 7 and 97). The 163 jobs of this workflow
+# that got a macro runner between 2026-09-26 and 2026-10-12 add up to 880
+# minutes rounded up per job (786 raw); 644 of them fall in October, and the
+# count passes 600 at 13:45Z on 2026-10-12. The last job ran at 20:37Z that
+# day (run 38305334372). None of the 76 jobs created after it got a runner:
+# 35 were cancelled within 3 hours (replaced by the next run of their group),
+# 41 after waiting the 24 hours GitHub allows a queued job, and 7 runs are
+# still queued as this is written. That fits an exhausted monthly quota (the
+# meter here is a count of job minutes, CodSpeed's own is not public, and the
+# organization's settings page in CodSpeed holds the real figure: a maintainer
+# reads it there). It is also why the main baseline went stale: a push to main
+# queued behind the one before it, and a group keeps one pending run.
+#
+# So, since celeris#890 item 7:
+#   - a pull request runs the benchmarks only while it carries the
+#     `performance` label (CONTRIBUTING.md lists it among the release-note
+#     labels, and a benchmark-path change that is labelled for the notes is
+#     the one to measure). Adding the label starts a run, every push to a
+#     labelled pull request starts another, and a draft waits until it is
+#     marked ready, as before. A pull request without the label costs no
+#     macro-runner minute: its run exists and its job is skipped, which is the
+#     result a reviewer sees;
+#   - main is measured once a day (the schedule below) and no longer on every
+#     push, which makes the baseline a day old at most. A job took 4.8 minutes
+#     on average (786 raw minutes over 163 jobs), so that is about 144 minutes
+#     a month, against about 440 for the 92 pushes to main of the 30 days to
+#     2026-10-26 (all of them started a run);
+#   - a scheduled run replaces an older one that is still waiting for a
+#     runner, so a stall cannot pile up a queue behind it.
+# The label gate in loadgen's workflow is the other half of the decision and
+# is not in this repository.
+#
+# Unproven, and to be checked after the merge: CodSpeed's GitHub Actions page
+# (https://codspeed.io/docs/integrations/ci/github-actions) says that pushes to
+# the default branch record the baseline and names workflow_dispatch for
+# backtests; it does not mention `schedule`. Look at the first scheduled run in
+# the CodSpeed dashboard (not before the quota resets on 2026-10-31; until then
+# no run gets a runner); if it is not recorded as the main baseline, either
+# bring `push: branches: [main]` (with the paths below) back beside the schedule,
+# or keep the cron but have it start `gh workflow run codspeed.yml --ref main`
+# (a `workflow_dispatch` run, which CodSpeed documents), for example from a small
+# hosted workflow with `actions: write`. Either way a pull request then compares
+# with a main run of the day, not with an older report.
+#
 # The trigger paths below are the non-test code of every package the
 # benchmark set executes (measured: the set run once with -coverpkg over the
 # whole module, on Linux and macOS), the benchmark files, the root
@@ -165,10 +209,18 @@
 name: CodSpeed
 
 on:
-  push:
+  # Main, once a day (celeris#890 item 7). A schedule has no path filter, so
+  # it runs whether or not the benchmark paths changed; it replaces the push
+  # trigger, which started a run for each push that touched them.
+  schedule:
+    - cron: "17 3 * * *"
+  pull_request:
     branches: [main]
-    # One list for both events: the pull_request trigger below aliases it.
-    paths: &benchmark-paths
+    # `labeled` starts the run when `performance` is added; the job's `if:`
+    # below skips every other label. `unlabeled` is not listed: taking the
+    # label off does not stop a run in flight and starts none.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    paths:
       - "*.go"
       - "celeristest/**"
       - "internal/ctxkit/**"
@@ -207,10 +259,6 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/codspeed.yml"
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths: *benchmark-paths
   # Backtests: CodSpeed dispatches this to measure older commits, and it is
   # the manual way to take a fresh baseline or to run a draft pull request's
   # branch (gh workflow run codspeed.yml --ref <branch>).
@@ -220,25 +268,36 @@ permissions:
   contents: read
 
 # One run per pull request: a new push cancels the one in flight, so a
-# burst of pushes costs one run. Pushes to main are never cancelled -- each
-# is a baseline -- but a burst still collapses to the newest pending one.
-# Every dispatch gets a group of its own, so the backtests CodSpeed
-# dispatches together never cancel one another.
+# burst of pushes costs one run. A scheduled run cancels an older scheduled
+# run that is still waiting for a runner (a stalled queue must not hold the
+# baseline back: celeris#890 item 97). Every dispatch gets a group of its
+# own, so the backtests CodSpeed dispatches together never cancel one
+# another. So does the run that adding any label other than `performance`
+# starts: its job is skipped, and without a group of its own it would cancel
+# the benchmark run that the label `performance` started a minute before.
 concurrency:
-  group: codspeed-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.run_id) || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: codspeed-${{ (github.event.action == 'labeled' && github.event.label.name != 'performance' && github.run_id) || github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'schedule' }}
 
 jobs:
   benchmarks:
     name: Benchmarks (arm64 macro runner)
-    # Skips fork pull requests (as this file is written; the approval policy
-    # in the header is what holds against a fork that edits it) and drafts,
-    # which wait until they are marked ready (ready_for_review above), to
-    # save minutes.
+    # A pull request runs only with the `performance` label, and the label's
+    # own event (celeris#890 item 7): the run that adding another label starts
+    # skips the job, and so does a label added to a closed or merged pull request
+    # (a release-notes clean-up after the merge must not spend the quota). Fork pull
+    # requests are skipped as this file is written
+    # (the approval policy in the header is what holds against a fork that
+    # edits it), and so are drafts, which wait until they are marked ready
+    # (ready_for_review above), to save minutes. Every other event (the
+    # schedule, a dispatch) runs.
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-      !github.event.pull_request.draft)
+      github.event.pull_request.state == 'open' &&
+      !github.event.pull_request.draft &&
+      contains(github.event.pull_request.labels.*.name, 'performance') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'performance'))
     runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
     # A hang must not burn the month's minutes. A full run is a few minutes.
     timeout-minutes: 20

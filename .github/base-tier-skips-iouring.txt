@@ -1,0 +1,26 @@
+# Tests that skip at CELERIS_MAX_IOURING_TIER=base on purpose, for .github/scripts/base-tier-tally.sh
+# (celeris#890 item 87): the full test or subtest name, then why. A name covers its own
+# subtests. Measured on the run of the job iouring-base-tier cited in the pull request:
+# 554 top-level tests passed, 4 skipped at the top level, 12 SKIP lines in all. On main
+# 8936e89 (with #1123 and #1127) a docker run (kernel without an fe80:: address) gave 577
+# passed and 13 SKIP lines, the 13th being TestListenOnAZonedLinkLocalServes885, which
+# the job does not allow: it sets CELERIS_REQUIRE_ZONED_PEER=1, so the test fails rather
+# than skips on a runner without one.
+min-pass 540
+
+# Tier base has no multishot recv with provided buffers (the tests say so in their skip).
+TestSpentDetectBudgetReturnsItsRingBuffer/check no provided buffer ring at the base tier
+TestSpentDetectBudgetReturnsItsRingBuffer/recheck no provided buffer ring at the base tier
+TestSpentDetectBudgetReturnsItsRingBuffer/check-async no provided buffer ring at the base tier
+TestSpentDetectBudgetReturnsItsRingBuffer/recheck-async no provided buffer ring at the base tier
+TestStartupLineReportsTheMultishotRecvThatIsInUse/unset tier base has no multishot recv
+TestStartupLineReportsTheMultishotRecvThatIsInUse/zero tier base has no multishot recv
+TestStartupLineReportsTheMultishotRecvThatIsInUse/true-is-not-1 tier base has no multishot recv
+TestStartupLineReportsTheMultishotRecvThatIsInUse/one tier base has no multishot recv
+TestMultishotRecvDecidedOnceAtNew/on_at_New,_off_after tier base has no multishot recv
+TestMultishotRecvDecidedOnceAtNew/off_at_New,_on_after tier base has no multishot recv
+
+# They need net.ipv4.tcp_synack_retries=0; the runner has 5. The step "celeris#662
+# tcp_synack_retries=0 guard" of the job adaptive sets it and forbids the skip.
+TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero needs net.ipv4.tcp_synack_retries=0
+TestPauseAcceptNoGuardLosesAtSynackRetriesZero needs net.ipv4.tcp_synack_retries=0
