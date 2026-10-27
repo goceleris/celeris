@@ -3,7 +3,8 @@
 # subtests. Measured on the run of the job iouring-base-tier cited in the pull request:
 # 107 top-level tests passed, 3 skipped at the top level, 19 SKIP lines in all (and
 # 117 passed with 46 SKIP lines once main had brought in nine more tests of the kind below).
-min-pass 100
+# On main 8936e89 (docker, merged tree): 118 passed, 46 SKIP lines, all allowed.
+min-pass 105
 
 # The probes of the tests that gate their io_uring arms (c714ProbeIOUring,
 # keptProbeIOUring, h2_handler_return_889's) call io_uring "usable" only at the high

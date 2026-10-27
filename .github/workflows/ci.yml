@@ -2377,6 +2377,9 @@ jobs:
   # run with the cap lost (a misspelled value made 47 tests fail slowly and kept the
   # second step busy for 23 minutes before it was cancelled, run 40416230192) ends
   # in minutes.
+  # CELERIS_REQUIRE_ZONED_PEER=1, as in the unit job: the zoned link-local tests (celeris#885,
+  # #1127) fail rather than skip on a runner without an fe80:: address, so they need no
+  # allow-list entry.
   # Tests that need the high tier skip at this tier on purpose; each skip that
   # is allowed is listed by name with its reason in .github/base-tier-skips-iouring.txt
   # and -root.txt, and any other SKIP line fails the step (base-tier-tally.sh,
@@ -2414,7 +2417,7 @@ jobs:
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l), CELERIS_MAX_IOURING_TIER=$CELERIS_MAX_IOURING_TIER"
           start=$SECONDS
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=900s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/base-iouring.log
+          CELERIS_REQUIRE_DUALSTACK=1 CELERIS_REQUIRE_ZONED_PEER=1 go test -race -count=1 -timeout=900s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/base-iouring.log
           echo "internal/engine/iouring at the base tier took $((SECONDS - start)) s"
           .github/scripts/base-tier-tally.sh iouring /tmp/base-iouring.log TestShutdownDetachedPartialWriteIsFlushed806 TestReportTier844
       - name: Root package and test/server, Shutdown/Detach/SSE/Stream/WebSocket/Hijack/Drain tests at the base tier (race)
@@ -2426,7 +2429,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l), CELERIS_MAX_IOURING_TIER=$CELERIS_MAX_IOURING_TIER"
           start=$SECONDS
           # -p 1: one test process at a time, so the runner's one memlock budget never funds two.
-          CELERIS_REQUIRE_DUALSTACK=1 go test -p 1 -race -count=1 -timeout=600s -v -run 'Shutdown|Detach|SSE|Stream|WebSocket|Hijack|Drain' . ./test/server 2>&1 | tee /tmp/base-root.log
+          CELERIS_REQUIRE_DUALSTACK=1 CELERIS_REQUIRE_ZONED_PEER=1 go test -p 1 -race -count=1 -timeout=600s -v -run 'Shutdown|Detach|SSE|Stream|WebSocket|Hijack|Drain' . ./test/server 2>&1 | tee /tmp/base-root.log
           echo "root and test/server at the base tier took $((SECONDS - start)) s"
           .github/scripts/base-tier-tally.sh root /tmp/base-root.log
 
