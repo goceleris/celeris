@@ -44,6 +44,11 @@ type SentinelConfig struct {
 // subscription.
 var sentinelDownGrace = 5 * time.Second
 
+// sentinelSwitchBackoffBase is the first pause of handleSwitchMaster between
+// two dials of the new master (it doubles, up to 2 s). A variable so a test can
+// make the pause end at once.
+var sentinelSwitchBackoffBase = 100 * time.Millisecond
+
 // SentinelClient is a Redis client managed by Redis Sentinel. It discovers the
 // current primary via Sentinel, connects to it, and automatically reconnects
 // to the new primary when a failover is detected.
@@ -459,7 +464,7 @@ func (s *SentinelClient) handleSwitchMaster(payload string) {
 	}
 	newAddr := net.JoinHostPort(parts[3], parts[4])
 
-	bo := async.NewBackoff(100*time.Millisecond, 2*time.Second)
+	bo := async.NewBackoff(sentinelSwitchBackoffBase, 2*time.Second)
 	const maxRetries = 3
 	var newClient *Client
 	var lastErr error
