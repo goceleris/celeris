@@ -336,6 +336,13 @@ func (c *ClusterClient) refreshTopology(ctx context.Context) error {
 	if v.Type != protocol.TyArray {
 		return fmt.Errorf("CLUSTER SLOTS: unexpected reply type %s", v.Type)
 	}
+	return c.applyTopology(ctx, v)
+}
+
+// applyTopology rebuilds the slot-to-node mapping from a CLUSTER SLOTS reply.
+// It is the part of refreshTopology that runs under c.mu, split out so a test
+// can run it at the moment a Close has just returned.
+func (c *ClusterClient) applyTopology(ctx context.Context, v *Value) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
