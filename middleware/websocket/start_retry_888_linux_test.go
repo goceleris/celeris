@@ -5,6 +5,7 @@ package websocket_test
 import (
 	"context"
 	"net"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -74,12 +75,36 @@ func classifyStart(msg string, exists func() bool, retryLeft bool) startFailure 
 // ioUringExists reports whether io_uring exists on this host: a raw
 // io_uring_setup answers ENOMEM (it exists, and is short of memory), or the
 // probe finds a tier of High or better with provided buffers (it works).
-func ioUringExists(_ testing.TB) bool {
+func ioUringExists(tb testing.TB) bool {
 	if ioUringSetupErrno() == unix.ENOMEM {
 		return true
 	}
-	p := probe.Probe()
-	return p.IOUringTier >= celerisengine.High && p.ProvidedBuffers
+	return probeIOUring(tb)
+}
+
+// probeIOUring probes the kernel's io_uring support as c714ProbeIOUring (package
+// websocket, not visible from this external test package) does: with
+// CELERIS_REQUIRE_IOURING_WORKERS=1 a probe that finds no usable ring is retried
+// for up to 10 s, because the probe's own ring can fail with ENOMEM against
+// RLIMIT_MEMLOCK while the rings of engines stopped moments ago, or of another
+// test binary of the same user, are still charged. Without it a flaky probe would
+// make the helper skip a cell where io_uring works.
+func probeIOUring(tb testing.TB) bool {
+	usable := func() bool {
+		p := probe.Probe()
+		return p.IOUringTier >= celerisengine.High && p.ProvidedBuffers
+	}
+	ok := usable()
+	if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") != "1" {
+		return ok
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for round := 1; !ok && time.Now().Before(deadline); round++ {
+		tb.Logf("probeIOUring: retry round %d, no usable io_uring ring yet", round)
+		time.Sleep(10 * time.Millisecond)
+		ok = usable()
+	}
+	return ok
 }
 
 // ioUringSetupErrno makes one io_uring_setup call and returns its errno, 0 when
