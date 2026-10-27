@@ -13,7 +13,7 @@ trap 'rm -rf "$dir"' EXIT
 fail=0
 n=0
 export BASE_TIER_SKIPS_DIR=$dir
-printf '# header\nmin-pass 2\nTestNeedsHighTier needs a provided buffer ring\n' >"$dir/base-tier-skips-iouring.txt"
+printf '# header\nmin-pass 2\nTestNeedsHighTier needs a provided buffer ring\nTestDot.Name a name with a regular expression character\n' >"$dir/base-tier-skips-iouring.txt"
 printf '# header\nmin-pass 1\npattern:^.+/(io_uring|adaptive)$ the arms of probe-gated tests\nTestNeedsHighTier needs a provided buffer ring\n' >"$dir/base-tier-skips-root.txt"
 
 # expect NAME WANT_STATUS WANT_STDERR_SUBSTRING LABEL LOG [TESTS...]
@@ -49,6 +49,11 @@ sed 's/NeedsHighTier/NeedsSomething/' "$dir/good.log" >"$dir/unlisted.log"
 expect "a skip nobody allowed fails" 1 "TestNeedsSomething" iouring "$dir/unlisted.log" TestShutdownDetachedPartialWriteIsFlushed806
 sed 's/tier=base arm=park/tier=high arm=park/' "$dir/good.log" >"$dir/high.log"
 expect "an arm at tier=high fails" 1 "the cap did not take effect" iouring "$dir/high.log" TestShutdownDetachedPartialWriteIsFlushed806
+# A name is literal: the dot of an allowed name is no wildcard.
+{ cat "$dir/good.log"; printf '%s\n' '--- SKIP: TestDot.Name (0.00s)' '--- SKIP: TestDotXName (0.00s)'; } >"$dir/dot.log"
+expect "a regular expression character in an allowed name is literal" 1 "TestDotXName" iouring "$dir/dot.log"
+grep -v 'TestDotXName' "$dir/dot.log" >"$dir/dot-ok.log"
+expect "the allowed name itself passes" 0 "" iouring "$dir/dot-ok.log"
 grep -v 'celeris844 PROBE' "$dir/good.log" >"$dir/noprobe.log"
 expect "a missing capped probe line fails" 1 "the cap did not take effect" iouring "$dir/noprobe.log" TestShutdownDetachedPartialWriteIsFlushed806
 sed 's/CELERIS_MAX_IOURING_TIER="base"/CELERIS_MAX_IOURING_TIER=""/' "$dir/good.log" >"$dir/nocap.log"
@@ -78,6 +83,23 @@ expect "root: an arm that logged tier=base is allowed by the pattern" 0 "" root 
 printf '%s\n' '=== RUN   TestP' '=== RUN   TestP/io_uring' '2026/10/26 23:34:23 INFO io_uring engine selected tier=base multishot_accept=false' \
   '    p_test.go:9: the peer never connected' '--- PASS: TestP (0.00s)' '    --- SKIP: TestP/io_uring (0.00s)' >"$dir/arm-engine.log"
 expect "root: an arm that started an engine and skipped for another reason fails" 1 "TestP/io_uring" root "$dir/arm-engine.log"
+# Parallel subtests interleave their output and go test marks the switch with `=== NAME`
+# (and `=== CONT` after a pause): a probe message printed under one arm must not be
+# credited to another arm that skipped for a different reason (review r1 of #1124, m1).
+printf '%s\n' '=== RUN   TestP' '=== RUN   TestP/io_uring' '=== PAUSE TestP/io_uring' '=== RUN   TestQ' '=== RUN   TestQ/io_uring' '=== PAUSE TestQ/io_uring' \
+  '=== CONT  TestP/io_uring' '    p_test.go:9: io_uring tier=base kernel=6.17: no usable io_uring' \
+  '=== NAME  TestQ/io_uring' '    q_test.go:12: listener never became ready' \
+  '--- PASS: TestP (0.00s)' '    --- SKIP: TestP/io_uring (0.00s)' '--- PASS: TestQ (0.00s)' '    --- SKIP: TestQ/io_uring (0.00s)' >"$dir/arm-interleaved.log"
+expect "root: a probe message of one parallel arm does not excuse another's skip" 1 "TestQ/io_uring" root "$dir/arm-interleaved.log"
+printf '%s\n' '=== RUN   TestP' '=== RUN   TestP/io_uring' '=== PAUSE TestP/io_uring' '=== RUN   TestP/adaptive' '=== PAUSE TestP/adaptive' \
+  '=== CONT  TestP/io_uring' '    p_test.go:9: io_uring tier=base kernel=6.17: no usable io_uring' \
+  '=== CONT  TestP/adaptive' '    p_test.go:9: io_uring tier=base kernel=6.17: no usable io_uring' \
+  '--- PASS: TestP (0.00s)' '    --- SKIP: TestP/io_uring (0.00s)' '    --- SKIP: TestP/adaptive (0.00s)' >"$dir/arm-interleaved-ok.log"
+expect "root: parallel arms that each logged the probe message are allowed" 0 "" root "$dir/arm-interleaved-ok.log"
+# The pattern's evidence is the message the comments name, not any tier=base line of a probe:
+# a Logf that merely says so, or another tier=base message, is no excuse (m2).
+arm io_uring 'io_uring tier=base kernel=6.17: io_uring arms not run' >"$dir/arm-notrun.log"
+expect "root: another tier=base message is not the probe's skip message" 1 "TestP/io_uring" root "$dir/arm-notrun.log"
 arm io_uring 'the kernel has no io_uring' >"$dir/arm-other.log"
 expect "root: an arm that skipped for another reason fails" 1 "TestP/io_uring" root "$dir/arm-other.log"
 arm epoll 'io_uring tier=base kernel=6.17: no usable io_uring' >"$dir/arm-epoll.log"

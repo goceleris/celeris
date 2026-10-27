@@ -167,6 +167,30 @@ expect pip-install-continuation 1 'ci.yml'
 fixture pip-install-composite
 printf '    - run: pipx install zizmor==1.30.0\n      shell: bash\n' >>"$dir/pip-install-composite/.github/actions/probe/action.yml"
 expect pip-install-composite 1 'actions/probe/action.yml'
+# Pin forms other than ==: uv's name@version, and range pins (review r1 of #1124, m4).
+fixture uvx-at-pin
+printf '      - run: uvx zizmor@1.30.0 .github/workflows\n' >>"$dir/uvx-at-pin/.github/workflows/ci.yml"
+expect uvx-at-pin 1 'ci.yml'
+fixture uv-tool-run-at-pin
+printf '      - run: uv tool run zizmor@v1.30.0 .\n' >>"$dir/uv-tool-run-at-pin/.github/workflows/ci.yml"
+expect uv-tool-run-at-pin 1 'ci.yml'
+fixture pip-range-pin
+printf '      - run: pip install "zizmor>=1.30,<1.31"\n' >>"$dir/pip-range-pin/.github/workflows/ci.yml"
+expect pip-range-pin 1 'ci.yml'
+fixture pip-compatible-pin
+printf '      - run: pipx run --spec zizmor~=1.30 zizmor .\n' >>"$dir/pip-compatible-pin/.github/workflows/ci.yml"
+expect pip-compatible-pin 1 'ci.yml'
+fixture pip-upper-pin
+printf '      - run: python3 -m pip install "zizmor<2"\n' >>"$dir/pip-upper-pin/.github/workflows/ci.yml"
+expect pip-upper-pin 1 'ci.yml'
+# An @ that is no version (a path, a mail address) and a plain redirection are fine.
+fixture uvx-at-path
+printf '      - run: uvx zizmor .github/workflows 2>&1 | tee log@host.txt\n' >>"$dir/uvx-at-path/.github/workflows/ci.yml"
+expect uvx-at-path 0
+fixture pip-redirect
+printf '      - run: pip install -r .github/tools/requirements.txt >/dev/null\n' >>"$dir/pip-redirect/.github/workflows/ci.yml"
+expect pip-redirect 0
+
 # Reading the pins from a requirements file, and a comment, are fine.
 fixture pip-install-requirements
 printf '      - run: pip install -r .github/tools/requirements.txt\n' >>"$dir/pip-install-requirements/.github/workflows/ci.yml"
