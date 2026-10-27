@@ -90,48 +90,25 @@ type engine806 struct {
 // instead of in the kernel whatever the host's autotuning would have given.
 func startEngine806(t *testing.T, h stream.Handler, mut func(*resource.Config)) *engine806 {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	cfg := resource.Config{
-		Addr:      addr,
-		Protocol:  engine.HTTP1,
-		Resources: resource.Resources{Workers: 2, SocketSend: 16 << 10},
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-	if mut != nil {
-		mut(&cfg)
-	}
-	e, err := New(cfg, h)
-	if err != nil {
-		skipOrFail656(t, "iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	for deadline := time.Now().Add(8 * time.Second); ; {
-		if c, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond); derr == nil {
-			_ = c.Close()
-			if e.NumWorkers() > 0 {
-				break
-			}
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("pick port: %v", err)
 		}
-		select {
-		case err := <-done:
-			cancel()
-			skipOrFail656(t, "iouring engine failed to start: %v", err)
-		default:
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		cfg := resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2, SocketSend: 16 << 10},
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatal("engine did not start listening within 8s")
+		if mut != nil {
+			mut(&cfg)
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	r := &engine806{e: e, addr: addr, cancel: cancel, done: done}
+		return New(cfg, h)
+	})
+	r := &engine806{e: e, addr: e.Addr().String(), cancel: cancel, done: done}
 	t.Cleanup(func() {
 		cancel()
 		select {
