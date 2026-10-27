@@ -21,12 +21,16 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 )
 
-// maxDirectResultBytes is the per-query result buffer cap in direct mode.
-// Direct mode pins syncMode=true (lazy streaming cannot activate because
-// the caller goroutine IS the dispatcher — a blocking channel send would
-// deadlock), so without a cap a SELECT against a huge table would buffer
-// every row into req.rowSlab. 64 MiB matches the WebSocket detach-limit
-// on the engine side and gives typical result sets a wide margin.
+// maxDirectResultBytes is the per-query result buffer cap, on the payload of the
+// DataRows, wherever a reply is buffered whole: direct mode, which pins
+// syncMode=true (lazy streaming cannot activate because the caller goroutine IS
+// the dispatcher: a blocking channel send would deadlock), and the sync fast
+// path of a non-direct pool while its poll has not returned. A row that would
+// take the buffer past it is not appended: the request fails with
+// ErrResultTooBig, the rows buffered up to then are what the caller reads before
+// the error, and the rest of the reply is read and discarded. 64 MiB matches the
+// WebSocket detach-limit on the engine side and gives typical result sets a
+// wide margin.
 const maxDirectResultBytes = 64 << 20
 
 // syncRoundTripper is the optional interface for event-loop workers that
@@ -128,9 +132,6 @@ type pgRequest struct {
 	rows      [][][]byte
 	rowFields [][]byte
 	rowSlab   []byte
-	// slabBytes is the payload bytes buffered in total, over every slab chunk
-	// (rowSlab is the current one): what maxDirectResultBytes bounds.
-	slabBytes int
 	tag       string
 	err       error
 	doneCh    chan struct{}
@@ -201,6 +202,9 @@ type pgRequest struct {
 	// finished is true, preventing a race where a new acquirePgRequest
 	// reuses the request while finish()/fail() is still reading its fields.
 	finished atomic.Bool
+	// slabBytes is the payload bytes buffered in total, over every slab chunk
+	// (rowSlab is the current one): what maxDirectResultBytes bounds.
+	slabBytes int
 }
 
 // finish signals completion of the request exactly once. Safe for
@@ -388,12 +392,10 @@ func releasePgRequest(r *pgRequest) {
 // Growing by copy left every earlier generation reachable through the views
 // already handed out: with 1.25x growth that is 5 times the data held, for a
 // reply of 2M rows 1.1 GB of live heap (celeris#1104). Chunked, the live heap
-// is the data plus the unused tail of the last chunk.
-func (r *pgRequest) appendRowFromAlias(fields [][]byte) {
-	totalBytes := 0
-	for _, f := range fields {
-		totalBytes += len(f)
-	}
+// is the data plus 24 bytes of field view and of row view per row, plus at most one
+// row's worth of unused tail per chunk (the tail a row did not fit in is left;
+// worst case about twice the data, for rows just over half a chunk).
+func (r *pgRequest) appendRowFromAlias(fields [][]byte, totalBytes int) {
 	// Ensure the slab has stable storage for every non-nil field. We do
 	// this in one shot so later sub-slices (view[i]) can point into the
 	// same backing array and stay valid.
@@ -506,22 +508,25 @@ func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok boo
 	// was, it bounded nothing: a reply of 240 MB was buffered whole, 1.1 to
 	// 1.2 GB of heap, before the error (celeris#1104).
 	syncMode = r.syncMode.Load()
-	if syncMode {
-		if errors.Is(r.err, ErrResultTooBig) {
-			return 0, syncMode, false // over the cap already: drop the row
-		}
-		size := 0
-		for _, f := range fields {
-			size += len(f)
-		}
-		if r.slabBytes+size > maxDirectResultBytes {
-			if r.err == nil {
-				r.err = ErrResultTooBig
-			}
-			return 0, syncMode, false
-		}
+	// Once the cap has tripped no row is buffered, in any mode: the sync fast
+	// path clears syncMode when its poll returns before the reply is done, and
+	// the event loop then dispatches the rest of the reply with it false. A row
+	// appended there would be promoted to streaming behind the rows already
+	// buffered, with the dropped ones missing in between and the error lost.
+	// Returning false also keeps promoteToStreaming from running, so the caller
+	// wakes on doneCh with the buffered rows and ErrResultTooBig.
+	if r.err == ErrResultTooBig {
+		return 0, syncMode, false
 	}
-	r.appendRowFromAlias(fields)
+	size := 0
+	for _, f := range fields {
+		size += len(f)
+	}
+	if syncMode && r.slabBytes+size > maxDirectResultBytes {
+		r.err = ErrResultTooBig
+		return 0, syncMode, false
+	}
+	r.appendRowFromAlias(fields, size)
 	return len(r.rows), syncMode, true
 }
 
