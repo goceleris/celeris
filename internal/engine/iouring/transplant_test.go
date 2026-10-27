@@ -37,26 +37,24 @@ func (transplantTestHandler) HandleStream(_ context.Context, s *stream.Stream) e
 // counter and the active-connection gauge — the metric that read 0 post-switch in
 // the hollow-promotion bug (#396).
 func TestAdoptConnServesTransplantedFD(t *testing.T) {
-	// Start an io_uring engine.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-
-	cfg := resource.Config{
-		Addr:      addr,
-		Protocol:  engine.HTTP1,
-		Resources: resource.Resources{Workers: 2},
-	}
-	e, err := New(cfg, transplantTestHandler{})
-	if err != nil {
-		t.Skipf("iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	errCh := make(chan error, 1)
-	go func() { errCh <- e.Listen(ctx) }()
+	// Start an io_uring engine. A Listen is not enough for AdoptConn: Listen
+	// publishes e.workers under e.mu AFTER the socket is bound, so dial
+	// readiness alone raced AdoptConn ("no workers available to adopt fd N",
+	// observed flaking CI on main); startRingRetried662 waits for the address
+	// and the workers, and retries a ring-setup ENOMEM (celeris#1104).
+	e, cancel, errCh := startRingRetried662(t, func() (*Engine, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("pick port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		return New(resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2},
+		}, transplantTestHandler{})
+	})
 	defer func() {
 		cancel()
 		select {
@@ -64,26 +62,6 @@ func TestAdoptConnServesTransplantedFD(t *testing.T) {
 		case <-time.After(3 * time.Second):
 		}
 	}()
-
-	// Wait until the engine is actually listening.
-	// A successful dial only proves the listening socket is bound. Listen
-	// publishes e.workers under e.mu AFTER that, so dial-readiness alone races
-	// AdoptConn, which rejects an empty worker set ("no workers available to
-	// adopt fd N") -- observed flaking CI on main. Require both.
-	listening := false
-	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); {
-		if c, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond); derr == nil {
-			_ = c.Close()
-			if e.NumWorkers() > 0 {
-				listening = true
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !listening {
-		t.Skipf("engine did not start listening with workers on %s (constrained runner)", addr)
-	}
 
 	// Create a TCP connection the engine has NEVER seen, via our own listener.
 	extLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -174,23 +152,18 @@ func TestAdoptConnServesTransplantedFD(t *testing.T) {
 // fresh parser and respond WITHOUT the client sending anything new, then keep
 // serving the conn normally.
 func TestAdoptConnReplaysBufferedRequest(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-
-	e, err := New(resource.Config{
-		Addr: addr, Protocol: engine.HTTP1,
-		Resources: resource.Resources{Workers: 2},
-	}, transplantTestHandler{})
-	if err != nil {
-		t.Skipf("iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	errCh := make(chan error, 1)
-	go func() { errCh <- e.Listen(ctx) }()
+	e, cancel, errCh := startRingRetried662(t, func() (*Engine, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("pick port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		return New(resource.Config{
+			Addr: addr, Protocol: engine.HTTP1,
+			Resources: resource.Resources{Workers: 2},
+		}, transplantTestHandler{})
+	})
 	defer func() {
 		cancel()
 		select {
@@ -198,25 +171,6 @@ func TestAdoptConnReplaysBufferedRequest(t *testing.T) {
 		case <-time.After(3 * time.Second):
 		}
 	}()
-
-	// A successful dial only proves the listening socket is bound. Listen
-	// publishes e.workers under e.mu AFTER that, so dial-readiness alone races
-	// AdoptConn, which rejects an empty worker set ("no workers available to
-	// adopt fd N") -- observed flaking CI on main. Require both.
-	listening := false
-	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); {
-		if c, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond); derr == nil {
-			_ = c.Close()
-			if e.NumWorkers() > 0 {
-				listening = true
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !listening {
-		t.Skipf("engine did not start listening with workers on %s (constrained runner)", addr)
-	}
 
 	extLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
