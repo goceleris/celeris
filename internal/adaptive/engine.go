@@ -16,6 +16,7 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/epoll"
 	"github.com/goceleris/celeris/internal/engine/iouring"
+	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
@@ -204,6 +205,11 @@ func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
 	}
 	return true
 }
+
+// planLoopCPUs is the platform's CPU plan, the one the sub-engines plan their
+// loops from, behind a var so tests can stand in a big.LITTLE host (celeris#886
+// item 30). Nothing reads it yet.
+var planLoopCPUs = platform.PlanWorkerCPUsFor
 
 // maxWorkersForMemlock is the io_uring memlock worker-ceiling probe behind a var
 // so tests can inject a low cap without mutating the process RLIMIT_MEMLOCK.
