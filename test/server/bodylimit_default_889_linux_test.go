@@ -69,42 +69,13 @@ var bodyCfgs889 = []bodyCfg889{
 // the number of body bytes the handler saw.
 func bodyServer889(t *testing.T, eng celeris.EngineType, limit int64) string {
 	t.Helper()
-	retryUntil := time.Now().Add(30 * time.Second)
-	for tries := 1; ; tries++ {
-		ln, err := listenForStart1104()
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		s := celeris.New(celeris.Config{Addr: addr, Engine: eng, Protocol: celeris.Auto, MaxRequestBodySize: limit})
-		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+	// The listener is handed to the server, so the port cannot be taken between
+	// the pick and the bind (celeris#1104, startPicked1104).
+	_, addr := startPickedPing1104(t, celeris.Config{Engine: eng, Protocol: celeris.Auto, MaxRequestBodySize: limit}, func(s *celeris.Server) {
+		ping1104(s)
 		s.POST("/up", func(c *celeris.Context) error { return c.String(http.StatusOK, "n=%d", len(c.Body())) })
-		startDone := make(chan error, 1)
-		go func() { startDone <- s.Start() }()
-		err = waitReady761(addr, startDone)
-		if err == nil {
-			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				_ = s.Shutdown(ctx)
-				select {
-				case <-startDone:
-				case <-time.After(15 * time.Second):
-					t.Errorf("Start did not return within 15s of Shutdown")
-				}
-			})
-			return addr
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = s.Shutdown(ctx)
-		cancel()
-		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		t.Fatalf("server did not start (try %d): %v", tries, err)
-	}
+	})
+	return addr
 }
 
 const bodyUpgradeHead889 = "POST /up HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n" +

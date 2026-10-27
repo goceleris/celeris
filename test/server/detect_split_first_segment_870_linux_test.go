@@ -4,7 +4,6 @@ package celeris_test
 
 import (
 	"bufio"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -74,16 +73,9 @@ func startServer870(t *testing.T, cfg celeris.Config) string {
 // that reads its metrics.
 func startServerSrv870(t *testing.T, cfg celeris.Config) (string, *celeris.Server) {
 	t.Helper()
-	retryUntil := time.Now().Add(30 * time.Second)
-	for tries := 1; ; tries++ {
-		ln, err := listenForStart1104()
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		cfg.Addr = addr
-		s := celeris.New(cfg)
+	// The listener is handed to the server, so the port cannot be taken between
+	// the pick and the bind (celeris#1104, startPicked1104).
+	s, addr := startPickedPing1104(t, cfg, func(s *celeris.Server) {
 		// With AsyncHandlers on, a route that only answers runs inline and its conn
 		// is never promoted to a dispatch goroutine (AsyncPromotedConns stays 0), so
 		// the route is marked async: the conn is promoted at its first request and
@@ -92,35 +84,12 @@ func startServerSrv870(t *testing.T, cfg celeris.Config) (string, *celeris.Serve
 		if cfg.AsyncHandlers {
 			h.Async()
 		}
-		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+		ping1104(s)
 		s.POST("/len", func(c *celeris.Context) error {
 			return c.String(http.StatusOK, "%d", len(c.Body()))
 		})
-		startDone := make(chan error, 1)
-		go func() { startDone <- s.Start() }()
-		err = waitReady761(addr, startDone)
-		if err == nil {
-			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				_ = s.Shutdown(ctx)
-				select {
-				case <-startDone:
-				case <-time.After(15 * time.Second):
-					t.Errorf("Start did not return within 15s of Shutdown")
-				}
-			})
-			return addr, s
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = s.Shutdown(ctx)
-		cancel()
-		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		t.Fatalf("server did not start (try %d): %v", tries, err)
-	}
+	})
+	return addr, s
 }
 
 // sendPieces870 dials addr and writes each piece as its own segment, pieceGap870
