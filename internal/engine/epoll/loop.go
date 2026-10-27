@@ -2775,6 +2775,10 @@ func (l *Loop) initProtocol(cs *connState) {
 	switch cs.protocol {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
+		// A conn whose protocol is decided past the pool wait's gate (bytes of
+		// a decision begun, or a request the gate reads on) is answered
+		// close-after, as the conns the gate has met are (celeris#1104).
+		cs.h1State.CloseAfter = l.refuseRecv
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue

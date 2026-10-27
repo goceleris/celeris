@@ -828,6 +828,11 @@ type Worker struct {
 	// worker, new requests would keep the queues from ever emptying.
 	// Worker thread only; read in handleRecv.
 	refuseRecv bool
+	// gateSwept is set by the first pass of the gate (closeIdleH1): that pass
+	// asks the kernel for the receive queue of the conns it would close, and
+	// holds a conn that has a request in it (holdUnreadAtGate, celeris#1104).
+	// Worker thread only.
+	gateSwept bool
 
 	// drainBudget points at the engine's record of the budget of the last
 	// Engine.Shutdown call, and h2DrainStart is when the worker, its
@@ -3350,6 +3355,10 @@ func (w *Worker) initProtocol(cs *connState) {
 	switch engine.Protocol(cs.protocol.Load()) {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
+		// A conn whose protocol is decided past the gate (the bytes of a
+		// decision begun, or a request the gate reads on) is answered
+		// close-after, as the conns the gate has met are (celeris#1104).
+		cs.h1State.CloseAfter = w.refuseRecv
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue
