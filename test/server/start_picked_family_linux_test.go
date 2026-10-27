@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris"
 )
@@ -19,6 +21,20 @@ import (
 // held gets a fresh one) and requires them to end on different ports. A starter
 // that frees the port between the pick and the bind gives both of them the same
 // one, and one of the two servers is not the one that answers there.
+//
+// It runs on the std engine, the only one that serves on the listener it is
+// handed. The epoll, io_uring and adaptive engines close it inside Listen and
+// rebind the address with SO_REUSEPORT, so a hand-off only shortens their window
+// and two servers can still end on one port: the same test with the engine
+// swapped ended two servers on one port with epoll in 2 of 5 runs of up to 630
+// subtests (2 failures in the run counted), with io_uring in 2 of 3 runs of 630
+// (1 failure each), and the review of celeris#1139 saw 3 of 105 and 2 of 210. No
+// retry sees it, as both binds succeed. The starters are tested here, on std,
+// where the guarantee holds.
+//
+// The two starts of a pair run as parallel subtests, not as bare goroutines, so a
+// start that fails (the starters call t.Fatal) ends its own subtest. A failed
+// start leaves its address empty and is reported by its subtest alone.
 func TestStartersForcedOntoOnePortEndOnPortsOfTheirOwn1104(t *testing.T) {
 	std := celeris.Config{Engine: celeris.Std}
 	none := func(*celeris.Server) {}
@@ -50,14 +66,36 @@ func TestStartersForcedOntoOnePortEndOnPortsOfTheirOwn1104(t *testing.T) {
 					}
 					return net.Listen("tcp", "127.0.0.1:0")
 				}
-				var wg sync.WaitGroup
 				addrs := make([]string, 2)
-				for i := range addrs {
-					wg.Add(1)
-					go func() { defer wg.Done(); addrs[i] = st.start(t) }()
+				// A starter's server stops when its subtest ends, so each waits for
+				// the other to be up first (the barrier), or the second could be given
+				// the port of a first that is gone.
+				var up sync.WaitGroup
+				up.Add(len(addrs))
+				bothUp := make(chan struct{})
+				go func() { up.Wait(); close(bothUp) }()
+				var overlapped atomic.Int32
+				// The inner Run returns once both parallel subtests are done.
+				t.Run("pair", func(t *testing.T) {
+					for i := range addrs {
+						t.Run(fmt.Sprintf("starter%d", i), func(t *testing.T) {
+							t.Parallel()
+							defer func() {
+								up.Done()
+								select {
+								case <-bothUp:
+									overlapped.Add(1)
+								case <-time.After(30 * time.Second):
+								}
+							}()
+							addrs[i] = st.start(t)
+						})
+					}
+				})
+				if overlapped.Load() != int32(len(addrs)) {
+					t.Errorf("the two starters were not up at the same time (is -parallel 1?)")
 				}
-				wg.Wait()
-				if addrs[0] == addrs[1] {
+				if addrs[0] != "" && addrs[0] == addrs[1] {
 					t.Errorf("both starters ended on %s: one of the two servers failed to bind it and the other's /ping answered for it", addrs[0])
 				}
 			})

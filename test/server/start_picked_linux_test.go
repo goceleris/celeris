@@ -22,11 +22,16 @@ var listenForStart1104 = func() (net.Listener, error) { return net.Listen("tcp",
 // startPicked1104 builds a server with cfg (Addr is set here) and routes, starts
 // it on a listener it picked, and returns it with its address and Start's result
 // channel once ready reports it up. The listener is handed to the server
-// (StartWithListener), so the port is never free between the pick and the bind:
-// another cell picking the same one gets a different port, and a readiness probe
-// can only be answered by this server. A ring ENOMEM is retried for the window
-// (startRetrying1104; a fresh server and port per try) and a start that fails
-// otherwise fails t. ready is given the server, its address and Start's result
+// (StartWithListener). On the std engine, which serves on that listener, the
+// port is never free between the pick and the bind: another cell picking the
+// same one gets a different port, and a readiness probe can only be answered by
+// this server. The epoll, io_uring and adaptive engines close the supplied
+// listener inside Listen and rebind its address with SO_REUSEPORT, so there the
+// hand-off only shortens the window to the close and the rebind, and two native
+// servers that both win the port both bind it, without an error, and share it
+// (see TestStartersForcedOntoOnePortEndOnPortsOfTheirOwn1104). A ring ENOMEM is
+// retried for the window (startRetrying1104; a fresh server and port per try)
+// and a start that fails otherwise fails t. ready is given the server, its address and Start's result
 // channel and must return Start's error if it comes first.
 func startPicked1104(t testing.TB, cfg celeris.Config, routes func(*celeris.Server), ready func(s *celeris.Server, addr string, done <-chan error) error) (*celeris.Server, string, chan error) {
 	t.Helper()
