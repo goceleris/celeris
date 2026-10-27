@@ -255,7 +255,7 @@ func TestDefaultSetTimeoutIsInTheDoc888(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "(defaultSetTimeout: " + secondsWord888(defaultSetTimeout) + ")"
+	want := "Zero selects the default, " + secondsWord888(defaultSetTimeout) + ","
 	src = bytes.Join(bytes.Fields(src), []byte(" "))
 	src = bytes.ReplaceAll(src, []byte(" // "), []byte(" "))
 	if !strings.Contains(string(src), want) {

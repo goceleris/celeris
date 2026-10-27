@@ -5,11 +5,15 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -69,6 +73,14 @@ func fill(ctx context.Context, kv store.KV, key string, enc []byte, ttl time.Dur
 	return boundedSet(ctx, kv, key, enc, ttl, bound)
 }
 
+// Where a bounded Set's result goes: the waiter takes it (delivered), or the
+// waiter gave up first (abandoned) and the Set's goroutine is on its own.
+const (
+	setWaiting int32 = iota
+	setDelivered
+	setAbandoned
+)
+
 // setResult is how a bounded Set ended: it returned, or it panicked.
 type setResult struct {
 	panicked bool
@@ -90,18 +102,29 @@ type setResult struct {
 // one the store applied last, as for two overlapping fills; see Config.Store).
 // The key is copied, as it can be a view of the request that ends before the
 // Set does; the caller must not reuse enc for the same reason. A panic in Set
-// is raised again on the caller's goroutine, as when Set ran there.
+// is raised again on the caller's goroutine, as when Set ran there; a panic in
+// a Set that was given up on has no request to reach, and is logged at Error
+// level through slog.Default (the server's Config.Logger when it sets none of
+// its own) with the store's type, the value and the stack.
 func boundedSet(ctx context.Context, kv store.KV, key string, enc []byte, ttl, bound time.Duration) (abandoned bool) {
 	key = strings.Clone(key)
 	sctx, cancel := context.WithTimeout(ctx, bound)
 	done := make(chan setResult, 1)
+	var state atomic.Int32
 	go func() {
 		var res setResult
+		var stack []byte
 		defer func() {
 			if r := recover(); r != nil {
 				res = setResult{panicked: true, value: r}
+				stack = debug.Stack()
 			}
-			done <- res
+			if state.CompareAndSwap(setWaiting, setDelivered) {
+				done <- res
+			} else if res.panicked {
+				slog.Error("cache: Store.Set panicked after Config.SetTimeout; the request had been answered without it",
+					"store", fmt.Sprintf("%T", kv), "panic", res.value, "stack", string(stack))
+			}
 			cancel()
 		}()
 		_ = kv.Set(sctx, key, enc, ttl)
@@ -111,12 +134,12 @@ func boundedSet(ctx context.Context, kv store.KV, key string, enc []byte, ttl, b
 	case res = <-done:
 	case <-sctx.Done():
 		// The deadline, or the request's own context ending, may be seen
-		// together with the Set's return: prefer the return.
-		select {
-		case res = <-done:
-		default:
+		// together with the Set's return: if the goroutine has already
+		// delivered, take its result.
+		if state.CompareAndSwap(setWaiting, setAbandoned) {
 			return true
 		}
+		res = <-done
 	}
 	if res.panicked {
 		panic(res.value)
