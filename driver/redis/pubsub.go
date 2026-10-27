@@ -10,6 +10,11 @@ import (
 	"github.com/goceleris/celeris/driver/internal/async"
 )
 
+// pubsubStableAfter is how long a re-established pub/sub conn must stay up
+// before the reconnect backoff starts over from its base delay (celeris#887
+// item 30). A conn that dies sooner is a failed attempt.
+var pubsubStableAfter = 5 * time.Second
+
 // Message is one pub/sub notification. Pattern is set only for PSUBSCRIBE
 // deliveries ("pmessage" push type). Shard is true for shard channel
 // deliveries ("smessage" push type, Redis 7+).

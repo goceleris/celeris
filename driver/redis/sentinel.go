@@ -37,6 +37,13 @@ type SentinelConfig struct {
 	Engine           ServerProvider
 }
 
+// sentinelDownGrace is how long watchFailover lets the PubSub of the sentinel
+// it follows stay down (conn lost and not re-established, or re-established
+// and lost again before it was stable) before it gives that sentinel up and
+// lets subscribeLoop connect to the next address of SentinelAddrs
+// (celeris#887 item 29).
+var sentinelDownGrace = 5 * time.Second
+
 // SentinelClient is a Redis client managed by Redis Sentinel. It discovers the
 // current primary via Sentinel, connects to it, and automatically reconnects
 // to the new primary when a failover is detected.
