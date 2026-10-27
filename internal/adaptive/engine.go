@@ -16,6 +16,7 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/epoll"
 	"github.com/goceleris/celeris/internal/engine/iouring"
+	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
@@ -185,10 +186,11 @@ type Engine struct {
 //     fast-path setup flags); require the "bundles" era (>6.10) OR the 6.1+
 //     fast tier (DEFER_TASKRUN + SINGLE_ISSUER + MULTISHOT_RECV + PROVIDED_BUFFERS).
 //   - Memlock: io_uring's provided-buffer rings need locked pages per worker
-//     (minMemlockPerWorker). If RLIMIT_MEMLOCK can't fund the requested workers,
-//     io_uring caps to a fraction of them and its throughput collapses; epoll
-//     does not memlock buffer rings, so it keeps all workers. In that case
-//     io_uring is never the right engine.
+//     (minMemlockPerWorker). If RLIMIT_MEMLOCK can't fund the workers the
+//     engines will start (startedLoops: the requested count, or the shorter
+//     big.LITTLE plan), io_uring caps to a fraction of them and its
+//     throughput collapses; epoll does not memlock buffer rings, so it keeps
+//     all workers. In that case io_uring is never the right engine.
 func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
 	if !p.IOUringTier.Available() {
 		return false
@@ -198,11 +200,34 @@ func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
 	if !bundlesEra && !fastTier {
 		return false
 	}
-	wantWorkers := cfg.Resources.Resolve().Workers
+	// The loops the engines START, not the request: iouring.planWithinMemlock
+	// caps the plan, and on a big.LITTLE host the plan is shorter than the
+	// request (celeris#886 item 30). Comparing the request kept the engine off
+	// io_uring for a ceiling between the plan and the request.
+	wantWorkers := startedLoops(cfg.Resources.Resolve().Workers, cfg.Resources.Workers > 0)
 	if maxW := maxWorkersForMemlock(); maxW != -1 && maxW < wantWorkers {
 		return false
 	}
 	return true
+}
+
+// planLoopCPUs is the platform's CPU plan, the one the sub-engines plan their
+// loops from, behind a var so tests can stand in a big.LITTLE host.
+var planLoopCPUs = platform.PlanWorkerCPUsFor
+
+// startedLoops is how many loops the engines will start for a request of
+// `requested` workers (explicit: Config.Resources.Workers was set by the
+// user): the length of the platform's CPU plan. On a big.LITTLE host that is
+// one loop per non-little CPU, fewer than GOMAXPROCS (celeris#1036, #1049); on
+// every other host it is `requested`. The plan is made without the listen
+// address, so the rx-port rule that may leave a few more CPUs out is not
+// applied: the count is the upper bound of what the engines start, and the
+// memlock test below never says "viable" for fewer loops than they start. It
+// plans on the CPU affinity of the thread that calls New, the sub-engines on
+// the one that calls Listen (sched_getaffinity is per thread): they differ
+// only if an application narrows the mask of one thread.
+func startedLoops(requested int, explicit bool) int {
+	return len(planLoopCPUs(requested, explicit, "").CPUs)
 }
 
 // maxWorkersForMemlock is the io_uring memlock worker-ceiling probe behind a var
@@ -578,7 +603,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// but if the active sub-engine has already returned an error to errCh
 	// (e.g. ENOMEM at io_uring_setup under low RLIMIT_MEMLOCK), surface it
 	// immediately instead of waiting out the deadline.
-	deadline := time.Now().Add(listenBindDeadline)
+	deadline := time.Now().Add(bindDeadline())
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer tick.Stop()
 	bindWait := time.NewTimer(time.Until(deadline))
@@ -622,7 +647,7 @@ bindLoop:
 	if active.Addr() == nil {
 		innerCancel()
 		wg.Wait()
-		return fmt.Errorf("active sub-engine failed to initialize within %v deadline", listenBindDeadline)
+		return fmt.Errorf("active sub-engine failed to initialize within %v deadline", bindDeadline())
 	}
 
 	// No standby to pause: only the active engine is in the SO_REUSEPORT group,
@@ -1666,10 +1691,22 @@ func reusePortAddr(ln net.Listener) (string, error) {
 var listenGapHook func(addr string)
 
 // listenBindDeadline is how long Listen waits for the start engine to publish
-// its address before it gives up. A variable only so that a test can reach
-// that return without waiting out 20 s (celeris#886 item 4); nothing else
-// writes it.
-var listenBindDeadline = 20 * time.Second
+// its address before it gives up, as a time.Duration in nanoseconds; 0 means
+// defaultListenBindDeadline (read it with bindDeadline). A variable only so
+// that a test can reach that return without waiting out 20 s (celeris#886
+// item 4); nothing else writes it. It is atomic because the test writes it
+// while a Listen goroutine of an earlier test may still be running and reading
+// it (celeris#886 item 27).
+var listenBindDeadline atomic.Int64
+
+const defaultListenBindDeadline = 20 * time.Second
+
+func bindDeadline() time.Duration {
+	if d := listenBindDeadline.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return defaultListenBindDeadline
+}
 
 // releasePortHold closes the socket that has held the engine's port since New
 // (celeris#616), once. Safe from any goroutine: Listen and Shutdown can both

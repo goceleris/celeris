@@ -38,7 +38,7 @@ func TestAdaptiveSwitchVerdictOnAFailedStandby886(t *testing.T) {
 		t.Skip("integration")
 	}
 	if !probe.Probe().IOUringTier.Available() {
-		t.Skip("io_uring unavailable: the standby refusal is never reached")
+		skipOrFailUpswitch890(t, "io_uring unavailable: the standby refusal is never reached")
 	}
 	run := func(require bool) (string, int) {
 		t.Helper()

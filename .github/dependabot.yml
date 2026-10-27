@@ -92,6 +92,26 @@ updates:
     commit-message:
       prefix: "deps"
 
+  # ----- CI Python tools -----
+  # zizmor, the workflow security audit of the Lint job, is the one CI tool
+  # that is not a `tool` directive of .github/tools/go.mod. Its pin is
+  # .github/tools/requirements.txt, installed by `pip install -r`. The Lint step
+  # "Tool pins agree" (.github/scripts/tool-pins-check.sh, check 4) fails when a
+  # workflow names a `name==version` of its own, and when a requirements file
+  # under .github/ has no entry like this one. No `allow` rule: the file lists
+  # direct dependencies only. A bump of zizmor can add or change findings of the
+  # Lint job; the pull request shows them.
+  - package-ecosystem: pip
+    directory: /.github/tools
+    schedule:
+      interval: daily
+    groups:
+      ci-python-tools:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+
   # ----- GitHub Actions -----
   # Watches every workflow under .github/workflows. Group all action
   # version bumps into ONE PR per scheduled run.
