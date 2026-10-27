@@ -88,3 +88,31 @@ func TestTwoStartsRacingForOnePortEndOnPortsOfTheirOwn1104(t *testing.T) {
 		}
 	}
 }
+
+// A readiness probe answered by another server must not count: with a non-empty
+// want, waitReadyErr takes only the body of the server's own /ping, and returns
+// Start's error when that arrives instead.
+func TestWaitReadyErrDoesNotTakeAnotherServersAnswer1104(t *testing.T) {
+	other := http.NewServeMux()
+	other.HandleFunc("/ping", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok-other") })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: other}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	bindErr := fmt.Errorf("listen tcp %s: bind: address already in use", ln.Addr())
+	done := make(chan error, 1)
+	go func() { time.Sleep(100 * time.Millisecond); done <- bindErr }()
+	ok, err := waitReadyErr(&http.Client{Timeout: 300 * time.Millisecond}, "http://"+ln.Addr().String()+"/ping", "ok-mine", done)
+	if ok || err == nil || !isAddrInUse(err) {
+		t.Fatalf("waitReadyErr = %v, %v; want not ready and Start's error (the other server's answer is not this one's)", ok, err)
+	}
+	// Its own answer is ready.
+	ok, err = waitReadyErr(&http.Client{Timeout: 300 * time.Millisecond}, "http://"+ln.Addr().String()+"/ping", "ok-other", make(chan error))
+	if !ok || err != nil {
+		t.Fatalf("waitReadyErr with the server's own body = %v, %v; want ready", ok, err)
+	}
+}

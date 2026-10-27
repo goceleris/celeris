@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -192,13 +191,16 @@ func startTCPReady889(t *testing.T, cfg celeris.Config) string {
 				return err
 			default:
 			}
-			c, err := net.DialTimeout("tcp", addr, time.Second)
-			if err == nil {
-				_ = c.Close()
-				return nil
+			// The listener is the server's from the start, so a dial alone proves
+			// nothing: wait for the engine to publish its address, then dial.
+			if s.Addr() != nil {
+				if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+					_ = c.Close()
+					return nil
+				}
 			}
 			if i > 300 {
-				return fmt.Errorf("not listening: %w", err)
+				return errors.New("the engine did not publish an address within 15 s")
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
