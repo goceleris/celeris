@@ -11,12 +11,13 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 )
 
-// Tests for h2StreamOpen, checkTimeouts' look at whether a conn that is due for
-// ReadTimeout or IdleTimeout is an HTTP/2 conn with a stream open (celeris#889).
+// Tests for h2ServerOwes, checkTimeouts' look at whether a conn that is due for
+// ReadTimeout or IdleTimeout is an HTTP/2 conn whose open streams all have a whole
+// request (celeris#889).
 
-// TestH2StreamOpenAnswers889: the answer for the conns the sweep meets, with
+// TestH2ServerOwesAnswers889: the answer for the conns the sweep meets, with
 // and without a detachMu.
-func TestH2StreamOpenAnswers889(t *testing.T) {
+func TestH2ServerOwesAnswers889(t *testing.T) {
 	for _, withMu := range []bool{false, true} {
 		for _, tc := range []struct {
 			name string
@@ -28,7 +29,8 @@ func TestH2StreamOpenAnswers889(t *testing.T) {
 				cs.protocol.Store(int32(engine.H2C))
 				cs.h2State = conn.NewH2State(nil, conn.H2Config{}, func([]byte) {}, nil)
 			}, false},
-			{"h2-stream-open", func(cs *connState) { cs.protocol.Store(int32(engine.H2C)); cs.h2State = h2OpenStream889(t) }, true},
+			{"h2-request-open", func(cs *connState) { cs.protocol.Store(int32(engine.H2C)); cs.h2State = h2OpenStream889(t, false) }, false},
+			{"h2-request-whole", func(cs *connState) { cs.protocol.Store(int32(engine.H2C)); cs.h2State = h2OpenStream889(t, true) }, true},
 		} {
 			name := tc.name
 			if withMu {
@@ -40,34 +42,34 @@ func TestH2StreamOpenAnswers889(t *testing.T) {
 					cs.detachMu = &sync.Mutex{}
 				}
 				tc.set(cs)
-				open, known := h2StreamOpen(cs)
+				open, known := h2ServerOwes(cs)
 				if !known || open != tc.open {
-					t.Fatalf("h2StreamOpen = (open %v, known %v), want (%v, true)", open, known, tc.open)
+					t.Fatalf("h2ServerOwes = (open %v, known %v), want (%v, true)", open, known, tc.open)
 				}
 			})
 		}
 	}
 }
 
-// TestH2StreamOpenSkipsAHeldLock889: the dispatch goroutine holds detachMu
+// TestH2ServerOwesSkipsAHeldLock889: the dispatch goroutine holds detachMu
 // across a handler; nothing is read and the sweep leaves the conn to the next.
-func TestH2StreamOpenSkipsAHeldLock889(t *testing.T) {
+func TestH2ServerOwesSkipsAHeldLock889(t *testing.T) {
 	cs := &connState{fd: 3, detected: true, detachMu: &sync.Mutex{}}
 	cs.protocol.Store(int32(engine.H2C))
-	cs.h2State = h2OpenStream889(t)
+	cs.h2State = h2OpenStream889(t, true)
 	cs.detachMu.Lock()
 	defer cs.detachMu.Unlock()
-	if open, known := h2StreamOpen(cs); open || known {
+	if open, known := h2ServerOwes(cs); open || known {
 		t.Fatalf("(open %v, known %v), want (false, false)", open, known)
 	}
 }
 
-// TestH2StreamOpenReadsUnderTheLock889: the h1-to-h2c upgrade writes cs.h2State
+// TestH2ServerOwesReadsUnderTheLock889: the h1-to-h2c upgrade writes cs.h2State
 // off the worker, under detachMu. Run with -race: a read outside the lock is
 // reported.
-func TestH2StreamOpenReadsUnderTheLock889(t *testing.T) {
+func TestH2ServerOwesReadsUnderTheLock889(t *testing.T) {
 	cs := &connState{fd: 3, detected: true, detachMu: &sync.Mutex{}}
-	st := h2OpenStream889(t)
+	st := h2OpenStream889(t, true)
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -83,7 +85,7 @@ func TestH2StreamOpenReadsUnderTheLock889(t *testing.T) {
 		}
 	}()
 	for range 20000 {
-		h2StreamOpen(cs)
+		h2ServerOwes(cs)
 	}
 	stop.Store(true)
 	wg.Wait()

@@ -930,12 +930,36 @@ func (s *H2State) PoolHandlersRunning() bool {
 
 // ActiveStreams is the number of streams of this connection that are open or
 // half-closed (the manager's count for MAX_CONCURRENT_STREAMS): a stream the
-// client has opened and the server has not finished with, including one whose
-// request is whole and whose response is still being written. The engines'
-// timeout sweep tests it before applying ReadTimeout and IdleTimeout to an
-// HTTP/2 connection (celeris#889). An atomic load; safe from any goroutine.
+// client has opened and the server has not finished with. An atomic load; safe
+// from any goroutine.
 func (s *H2State) ActiveStreams() int {
 	return s.processor.GetManager().CountActiveStreams()
+}
+
+// ServerOwes reports whether the connection has a stream open and every open
+// stream is one whose request is whole, so that what is owed is the server's
+// answer (celeris#889). The engines' timeout sweep tests it before applying
+// ReadTimeout and IdleTimeout, measured from the client's last frame, to an
+// HTTP/2 connection: a client that owes the server the rest of a request is
+// the silence ReadTimeout is for. Atomic loads; safe from any goroutine.
+func (s *H2State) ServerOwes() bool {
+	return s.processor.GetManager().ServerOwes()
+}
+
+// OpenStreamForTest opens stream id on the connection's manager as the HEADERS
+// of a request would, and with requestWhole as half-closed (remote), the state
+// of a stream whose request is whole and whose answer is still owed: the seam
+// for the engines' tests of their timeout sweep (celeris#889), as EnqueueWrite
+// is for the write-queue pass. Nothing in the serving path calls it.
+func (s *H2State) OpenStreamForTest(id uint32, requestWhole bool) {
+	m := s.processor.GetManager()
+	st, ok := m.TryOpenStream(id)
+	if !ok {
+		panic("h2: OpenStreamForTest: no stream slot")
+	}
+	if requestWhole {
+		st.SetState(stream.StateHalfClosedRemote)
+	}
 }
 
 // OutboundPending reports whether a stream of this connection has response

@@ -21,6 +21,7 @@ type Manager struct {
 	localMaxFrameSize       uint32 // our advertised SETTINGS_MAX_FRAME_SIZE (caps what PEER sends us)
 	initialWindowSize       uint32
 	activeStreams           atomic.Uint32
+	requestOpen             atomic.Uint32
 	headerTableSize         uint32 // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
 	pendingConnWindowUpdate uint32
 	pendingStreamUpdates    map[uint32]uint32
@@ -281,6 +282,7 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 		m.lastClientStream.Store(id)
 	}
 	m.activeStreams.Add(1)
+	m.requestOpen.Add(1)
 	m.mu.Unlock()
 
 	if replaced != nil {
@@ -565,26 +567,52 @@ func (m *Manager) CountActiveStreams() int {
 	return int(m.activeStreams.Load())
 }
 
-// updateActiveCount adjusts activeStreams atomically when a stream transitions
-// between active and inactive states. No locks required.
+// ServerOwes reports whether the connection has a stream open and every open
+// stream is one the server owes the rest of its answer: the client's request is
+// whole (HalfClosedRemote). A client that owes the server something, the rest of
+// a request, is not served by the exemption from ReadTimeout and IdleTimeout
+// that the engines' sweep gives a conn with a stream open (celeris#889): its
+// silence is the thing ReadTimeout bounds. requestOpen counts the streams whose
+// request is not whole (Open and HalfClosedLocal), activeStreams all that are
+// open; both move together in updateActiveCount, the one place a stream's
+// state change reaches them. Atomic loads; safe from any goroutine.
+func (m *Manager) ServerOwes() bool {
+	return m.activeStreams.Load() > 0 && m.requestOpen.Load() == 0
+}
+
+// updateActiveCount adjusts activeStreams, and requestOpen, atomically when a
+// stream transitions between states. No locks required.
 func (m *Manager) updateActiveCount(prev State, next State) {
 	wasActive := prev == StateOpen || prev == StateHalfClosedLocal || prev == StateHalfClosedRemote
 	isActive := next == StateOpen || next == StateHalfClosedLocal || next == StateHalfClosedRemote
-	if wasActive == isActive {
-		return
+	if wasActive != isActive {
+		if isActive {
+			m.activeStreams.Add(1)
+		} else {
+			lowerCount(&m.activeStreams)
+		}
 	}
-	if isActive {
-		m.activeStreams.Add(1)
-	} else {
-		// Guard against underflow from duplicate transitions.
-		for {
-			old := m.activeStreams.Load()
-			if old == 0 {
-				return
-			}
-			if m.activeStreams.CompareAndSwap(old, old-1) {
-				return
-			}
+	wasReq := prev == StateOpen || prev == StateHalfClosedLocal
+	isReq := next == StateOpen || next == StateHalfClosedLocal
+	if wasReq != isReq {
+		if isReq {
+			m.requestOpen.Add(1)
+		} else {
+			lowerCount(&m.requestOpen)
+		}
+	}
+}
+
+// lowerCount decrements c, guarding against underflow from duplicate
+// transitions.
+func lowerCount(c *atomic.Uint32) {
+	for {
+		old := c.Load()
+		if old == 0 {
+			return
+		}
+		if c.CompareAndSwap(old, old-1) {
+			return
 		}
 	}
 }

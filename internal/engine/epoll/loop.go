@@ -4752,13 +4752,13 @@ func (l *Loop) checkTimeouts() {
 		elapsed := time.Duration(now - last)
 		if (l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout) ||
 			(l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout) {
-			// An HTTP/2 conn with a stream open is not idle and is not
-			// waiting for a request: the stream is the server's to serve
-			// (celeris#889). Looked at only here, once a timeout is due: a
+			// An HTTP/2 conn whose open streams all have a whole request is
+			// not idle and is not waiting for a request: the answer is the
+			// server's to give (celeris#889). Looked at only here, once a timeout is due: a
 			// conn within its timeouts pays nothing for it, and one that is
 			// exempt pays this look on every sweep (its clock, the last read,
 			// does not move while it is exempt).
-			if open, ok := h2StreamOpen(cs); !ok || open {
+			if open, ok := h2ServerOwes(cs); !ok || open {
 				continue
 			}
 			l.closeConn(fd)
@@ -4766,10 +4766,13 @@ func (l *Loop) checkTimeouts() {
 	}
 }
 
-// h2StreamOpen is checkTimeouts' look at whether a conn due for ReadTimeout or
-// IdleTimeout is an HTTP/2 conn with a stream open (H2State.ActiveStreams > 0),
-// whose clock, the last read, says nothing about a stream the server is
-// answering: an SSE stream whose client sends no frame is the case (celeris#889).
+// h2ServerOwes is checkTimeouts' look at whether a conn due for ReadTimeout or
+// IdleTimeout is an HTTP/2 conn that has a stream open and whose open streams
+// all have a whole request (H2State.ServerOwes), whose clock, the last read,
+// says nothing about a stream the server is answering: an SSE stream whose
+// client sends no frame is the case (celeris#889). A client that owes the server
+// the rest of its request is the silence ReadTimeout is for, so its conn is not
+// exempt.
 // ok=false means nothing was read and the sweep leaves the conn for the next
 // one.
 //
@@ -4784,21 +4787,21 @@ func (l *Loop) checkTimeouts() {
 // running on an HTTP/1 conn is answered as snapshotH1Deadlines answers it
 // (dispatchBusy: the timeouts apply to a conn whose handler overruns them,
 // celeris#669), any other holder (one guarded write) by skipping the sweep.
-func h2StreamOpen(cs *connState) (open, ok bool) {
+func h2ServerOwes(cs *connState) (open, ok bool) {
 	mu := cs.detachMu
 	if mu == nil {
 		h2 := cs.h2State
-		return h2 != nil && h2.ActiveStreams() > 0, true
+		return h2 != nil && h2.ServerOwes(), true
 	}
 	if !mu.TryLock() {
 		if cs.switchedToH2() {
 			h2 := cs.h2State
-			return h2 != nil && h2.ActiveStreams() > 0, true
+			return h2 != nil && h2.ServerOwes(), true
 		}
 		return false, dispatchBusy(cs, nil)
 	}
 	h2 := cs.h2State
-	open = h2 != nil && h2.ActiveStreams() > 0
+	open = h2 != nil && h2.ServerOwes()
 	mu.Unlock()
 	return open, true
 }

@@ -7487,10 +7487,13 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	return snap, true
 }
 
-// h2StreamOpen is checkTimeouts' look at whether a conn due for ReadTimeout or
-// IdleTimeout is an HTTP/2 conn with a stream open (H2State.ActiveStreams > 0),
-// whose clock, the last read, says nothing about a stream the server is
-// answering: an SSE stream whose client sends no frame is the case (celeris#889).
+// h2ServerOwes is checkTimeouts' look at whether a conn due for ReadTimeout or
+// IdleTimeout is an HTTP/2 conn that has a stream open and whose open streams
+// all have a whole request (H2State.ServerOwes), whose clock, the last read,
+// says nothing about a stream the server is answering: an SSE stream whose
+// client sends no frame is the case (celeris#889). A client that owes the server
+// the rest of its request is the silence ReadTimeout is for, so its conn is not
+// exempt.
 // cs.h2State is written off the worker by the dispatch goroutine's
 // switchToH2Local, under detachMu (the h1-to-h2c upgrade of an async conn), so
 // it is read under that lock, with TryLock as snapshotH1Deadlines has it
@@ -7499,7 +7502,7 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 // the recv and header-timer paths share, so that they and the sweep of the conns
 // within their timeouts do not pay for a field only a conn past a timeout needs
 // (RULE 74).
-func h2StreamOpen(cs *connState) (open, known bool) {
+func h2ServerOwes(cs *connState) (open, known bool) {
 	if mu := cs.detachMu; mu != nil {
 		if !mu.TryLock() {
 			return false, false
@@ -7507,7 +7510,7 @@ func h2StreamOpen(cs *connState) (open, known bool) {
 		defer mu.Unlock()
 	}
 	h2 := cs.h2State
-	return h2 != nil && h2.ActiveStreams() > 0, true
+	return h2 != nil && h2.ServerOwes(), true
 }
 
 // detachedSendPending is checkTimeouts' look at whether a truly-detached conn
@@ -7805,13 +7808,13 @@ func (w *Worker) checkTimeouts() {
 			}
 		} else if (w.cfg.IdleTimeout > 0 && elapsed > w.cfg.IdleTimeout) ||
 			(w.cfg.ReadTimeout > 0 && elapsed > w.cfg.ReadTimeout) {
-			// An HTTP/2 conn with a stream open is not idle and is not
-			// waiting for a request: the stream is the server's to serve
-			// (celeris#889). Looked at only here, once a timeout is due: a
+			// An HTTP/2 conn whose open streams all have a whole request is
+			// not idle and is not waiting for a request: the answer is the
+			// server's to give (celeris#889). Looked at only here, once a timeout is due: a
 			// conn within its timeouts pays nothing for it, and one that is
 			// exempt pays this look on every sweep (its clock, the last read,
 			// does not move while it is exempt).
-			if open, known := h2StreamOpen(cs); !known || open {
+			if open, known := h2ServerOwes(cs); !known || open {
 				continue
 			}
 			w.closeConn(fd)
