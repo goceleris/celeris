@@ -280,6 +280,15 @@ func (s *SentinelClient) subscribeLoop() {
 		// exited on read error (that's what triggered this
 		// reconnect iteration).
 		s.sentinelMu.Lock()
+		if s.closed.Load() {
+			// Close ran between the check at the top of the loop and here: its
+			// list was already cleared, so it will never close sc. Whoever
+			// takes a sentinel out of the list, or declines to put it there,
+			// closes it (celeris#887 item 29).
+			s.sentinelMu.Unlock()
+			s.closeSentinel(sc)
+			return
+		}
 		for _, old := range s.sentinelConns {
 			// The PubSub first: its conn is checked out of the client's pool,
 			// so closing the client does not stop its reconnect loop.
@@ -295,6 +304,32 @@ func (s *SentinelClient) subscribeLoop() {
 		if s.watchFailover(sc) {
 			start = s.sentinelIndex(sc.addr) + 1
 		}
+	}
+}
+
+// takeSentinel removes sc from sentinelConns and reports whether it was there.
+// The caller that gets true owns sc's close.
+func (s *SentinelClient) takeSentinel(sc *sentinelConn) bool {
+	s.sentinelMu.Lock()
+	defer s.sentinelMu.Unlock()
+	for i, c := range s.sentinelConns {
+		if c == sc {
+			s.sentinelConns = append(s.sentinelConns[:i], s.sentinelConns[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// closeSentinel closes sc's PubSub and then its client: the PubSub's conn is
+// checked out of the client's pool, so closing the client alone does not stop
+// its reconnect loop.
+func (s *SentinelClient) closeSentinel(sc *sentinelConn) {
+	if sc.subPS != nil {
+		_ = sc.subPS.Close()
+	}
+	if sc.client != nil {
+		_ = sc.client.Close()
 	}
 }
 
@@ -389,9 +424,14 @@ func (s *SentinelClient) watchFailover(sc *sentinelConn) (gaveUp bool) {
 			s.handleSwitchMaster(msg.Payload)
 		case <-tick.C:
 			if sc.subPS.downFor() >= grace {
-				_ = sc.subPS.Close()
-				_ = sc.client.Close()
-				return true
+				// Whoever takes sc out of sentinelConns closes it: if
+				// SentinelClient.Close got there first it has closed (or is
+				// closing, under sentinelMu) this very client, and a second
+				// close would race it.
+				if s.takeSentinel(sc) {
+					s.closeSentinel(sc)
+				}
+				return !s.closed.Load()
 			}
 		case <-s.closeCh:
 			return false

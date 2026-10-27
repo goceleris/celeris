@@ -3,6 +3,7 @@ package eventloop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -46,10 +47,28 @@ func IsNumberBusy(err error) bool {
 // RegisterConnWait is loop.RegisterConn that waits out the io_uring engine's
 // "fd already registered" refusal (see [IsNumberBusy]) instead of returning it:
 // it retries with a growing pause until the number is free, ctx is done, or
-// registerWaitBudget has passed, and then returns the refusal. Every other
-// error is returned at once, and a failed call leaves fd with the caller, as
-// RegisterConn does. The drivers' dials use it: without it Pool.Acquire fails
-// under connection churn on the io_uring engine (celeris#887 item 28).
+// registerWaitBudget has passed, and then returns the refusal wrapped together
+// with the reason it stopped (ctx.Err(), or errRegisterWaitBudget), so
+// errors.Is sees both. Every other error is returned at once, and a failed
+// call leaves fd with the caller, as RegisterConn does. The drivers' dials use
+// it: without it Pool.Acquire fails under connection churn on the io_uring
+// engine (celeris#887 item 28).
+//
+// It must not run on the worker goroutine of loop (a handler of the server
+// whose engine is that loop's, called inline): the number is finalized by that
+// worker, which would be asleep in this wait, so the wait runs to its end,
+// stalls every connection of that worker for up to registerWaitBudget, and
+// returns the refusal anyway. The drivers do not dial there: with WithEngine on
+// io_uring, epoll or adaptive their command pools dial direct net.Conns and
+// never call RegisterConn. The one public path left is redis
+// Client.Subscribe called from a handler, whose PubSub pool still registers
+// with the engine; with the default config its handshake already blocks on the
+// worker it occupies, so the case that reaches this wait is ForceRESP2 with no
+// password and no DB. The engine gives no cheap, reliable way to tell that the
+// caller is on its worker, so this is documented, not guarded. The alternative
+// that works on any thread, moving the socket to a free number (F_DUPFD) before
+// registering it, changes which descriptor the driver owns and needs its own
+// review.
 func RegisterConnWait(ctx context.Context, loop engine.WorkerLoop, fd int, onRecv func([]byte), onClose func(error)) error {
 	err := loop.RegisterConn(fd, onRecv, onClose)
 	if !IsNumberBusy(err) {
@@ -62,14 +81,14 @@ func RegisterConnWait(ctx context.Context, loop engine.WorkerLoop, fd int, onRec
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return err
+			return fmt.Errorf("%w (gave up waiting: %w)", err, ctx.Err())
 		case <-t.C:
 		}
 		if err = loop.RegisterConn(fd, onRecv, onClose); !IsNumberBusy(err) {
 			return err
 		}
 		if !time.Now().Before(deadline) {
-			return err
+			return fmt.Errorf("%w (gave up waiting: %w)", err, errRegisterWaitBudget)
 		}
 		if pause < 5*time.Millisecond {
 			pause *= 2
