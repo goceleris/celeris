@@ -3,6 +3,7 @@
 package iouring
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -14,10 +15,17 @@ import (
 // but not yet uncharged (ring_budget_linux_test.go): it sets this process's
 // soft RLIMIT_MEMLOCK to 8 MiB, GitHub's default, and creates rings until the
 // limit refuses one, then closes them after d (or at cleanup). It is the
-// deterministic form of the flake celeris#1104 lists, for the tests of the
-// starters that must ride it out. The locked-memory count is per user, so a
-// test that charges must not run beside one that starts a ring (none here is
-// parallel).
+// deterministic form of that flake, for the tests of the starters that must ride
+// it out (the lane celeris#1104 tracks).
+//
+// The locked-memory count is per USER, not per process: while this runs, every
+// other process of the same user (another test binary of a parallel
+// `go test ./...`, a developer's server) sees ring creations fail with the same
+// ENOMEM, measured as 854 of 1399 in a second process during a run. CI runs this
+// package alone and no test here is parallel, so nothing there is disturbed;
+// locally, run it with -p 1 or on a machine that is not running io_uring
+// elsewhere. It takes the whole budget on purpose: the engine start must meet
+// the refusal at whichever of its rings comes first.
 func chargeMemlock(t *testing.T, d time.Duration) {
 	t.Helper()
 	var old unix.Rlimit
@@ -66,18 +74,14 @@ func chargeMemlock(t *testing.T, d time.Duration) {
 		_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &old)
 		t.Skipf("could not fill the memlock budget (%d rings held)", len(held))
 	}
-	done := make(chan struct{})
+	var once sync.Once
 	free := func() {
-		select {
-		case <-done:
-			return
-		default:
-		}
-		close(done)
-		for _, r := range held {
-			_ = r.Close()
-		}
-		_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &old)
+		once.Do(func() {
+			for _, r := range held {
+				_ = r.Close()
+			}
+			_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &old)
+		})
 	}
 	timer := time.AfterFunc(d, free)
 	t.Cleanup(func() { timer.Stop(); free() })
