@@ -112,14 +112,17 @@ func TestStreamingBasic(t *testing.T) {
 // while the rows are consumed, and after.
 //
 // It runs the conn without its sync fast path (syncLoop nil, as on a platform
-// that has none): with it, a poll that takes the whole reply in one go buffers
-// every row on purpose (syncMode, capped at maxDirectResultBytes) and never
-// streams, and whether the poll does is timing: on a loaded or instrumented run
-// it took all 100K rows (11.4 MB of buffered rows, held by the request pool
-// past the one GC the test then ran) in 6 of 8 iterations of the package with
-// -race -cover, and the test's streaming budget failed with no streaming bug
-// (celeris#1104). Without the fast path the request streams on every run, which
-// is the property under test.
+// that has none), so the request takes the streaming path on every run. With
+// the fast path, a poll that takes the whole reply in one go buffers every row
+// (syncMode) and never streams, and whether the poll does is timing: on a loaded
+// or instrumented run it took all 100K rows (11.4 MB of buffered rows, held by
+// the request pool past the one GC the test then ran) in 6 of 8 iterations of
+// the package with -race -cover, and the streaming budget failed with no
+// streaming bug (celeris#1104). What this test does NOT cover: the sync fast
+// path's whole-reply buffering, and the fall-through from it to streaming with
+// rows already buffered. Its memory is not bounded by maxDirectResultBytes
+// (appendBuffered checks that cap after it appends and cannot stop the poll), a
+// separate defect handled in the separate PR on the sync-path buffering bound.
 func TestStreamingLarge(t *testing.T) {
 	const numRows = 100_000
 	addr := startFakePG(t, func(c net.Conn) {

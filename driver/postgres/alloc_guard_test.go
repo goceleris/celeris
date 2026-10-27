@@ -10,7 +10,7 @@ import (
 	"context"
 	"net"
 	"os"
-	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,33 +37,30 @@ import (
 func TestAllocBudgets(t *testing.T) {
 	strict := os.Getenv("TESTING_STRICT_ALLOC_BUDGETS") == "1"
 
-	// What a query costs depends on the path: Linux has the sync fast path
-	// (syncLoop: the caller polls its own reply), where simpleQuery needs no
-	// colsCh; every other platform has none and takes the async path, which
-	// allocates the colsCh before it enqueues (simpleQuery), one more. Measured,
-	// -count=50 on linux/amd64 at --cpus 2: 14 in 50 of 50 runs, and 14 in 30 of
-	// 30 with six CPU hogs beside it; the same bench with syncLoop forced to nil
-	// on linux: 15 in 20 of 20; natively on darwin/arm64: 15 in 3 of 3; the Windows
-	// portable-fallback job logged 15. It is the path, not noise (celeris#1104).
-	query1col1rowBudget := int64(14)
-	if runtime.GOOS != "linux" {
-		query1col1rowBudget = 15
-	}
-
 	type guard struct {
 		name   string
-		budget int64
+		budget func() int64 // read after the benchmark ran
 		bench  func(b *testing.B)
 	}
+	fixed := func(n int64) func() int64 { return func() int64 { return n } }
 
 	guards := []guard{
-		// 14 on linux (15 elsewhere, see above), what the driver costs: celeris#890 item 91 measured 14 allocs/op on a
-		// linux/arm64 container (20 of 20 runs) and on the GitHub amd64 runner (run
-		// 39074958353) against the aspirational 4 this row held until then, which
-		// never failed because no CI step set TESTING_STRICT_ALLOC_BUDGETS=1. The
-		// allocation-guard step of ci.yml sets it now, so 14 is the bound.
-		{name: "Query_1col_1row", budget: query1col1rowBudget, bench: benchQuery1col1row},
-		{name: "Pool_AcquireRelease", budget: 0, bench: benchPoolAcquireRelease},
+		// What the driver costs: 14 with the sync fast path (the caller polls its own
+		// reply), measured by celeris#890 item 91 on linux/arm64 (20 of 20 runs) and on
+		// the GitHub amd64 runner against the aspirational 4 this row held until then;
+		// the ci.yml allocation-guard step sets TESTING_STRICT_ALLOC_BUDGETS=1 now.
+		// Without it simpleQuery allocates the colsCh before it enqueues: 15 (linux
+		// with syncLoop nil 20 of 20; darwin 3 of 3; the Windows job logged 15; linux
+		// with it: 14 in 50 of 50, and in 30 of 30 under CPU load; celeris#1104). The
+		// budget follows the path the bench's conn took (query1col1rowSyncPath), not
+		// the OS.
+		{name: "Query_1col_1row", budget: func() int64 {
+			if query1col1rowSyncPath.Load() {
+				return 14
+			}
+			return 15
+		}, bench: benchQuery1col1row},
+		{name: "Pool_AcquireRelease", budget: fixed(0), bench: benchPoolAcquireRelease},
 		// Prepared exec is intentionally omitted: it requires the extended
 		// protocol (Parse/Bind/Execute/Sync) handshake which the existing
 		// fake fixtures don't script, and adding that scaffolding here
@@ -75,14 +72,18 @@ func TestAllocBudgets(t *testing.T) {
 	for _, g := range guards {
 		t.Run(g.name, func(t *testing.T) {
 			res := testing.Benchmark(g.bench)
-			got := res.AllocsPerOp()
-			t.Logf("allocs/op=%d (budget %d) — %s", got, g.budget, res)
-			if strict && got > g.budget {
-				t.Fatalf("allocs/op %d exceeds budget %d (strict mode)", got, g.budget)
+			got, budget := res.AllocsPerOp(), g.budget()
+			t.Logf("allocs/op=%d (budget %d) — %s", got, budget, res)
+			if strict && got > budget {
+				t.Fatalf("allocs/op %d exceeds budget %d (strict mode)", got, budget)
 			}
 		})
 	}
 }
+
+// query1col1rowSyncPath is whether the conn benchQuery1col1row ran on took the
+// sync fast path (it has a syncLoop), which decides the allocs per query.
+var query1col1rowSyncPath atomic.Bool
 
 // benchQuery1col1row measures per-op allocs for QueryContext against a
 // fake backend that replies with RowDescription(1 col) + DataRow(1 field)
@@ -128,6 +129,7 @@ func benchQuery1col1row(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
+	query1col1rowSyncPath.Store(conn.syncLoop != nil)
 
 	b.ReportAllocs()
 	b.ResetTimer()
