@@ -15,9 +15,10 @@ import (
 // TestStartAsyncServerRidesOutRingENOMEM: with the memlock limit squeezed for
 // 600 ms the io_uring server's Start fails with the ring-setup ENOMEM, and
 // startAsyncServer must retry it until the limit is back instead of failing the
-// test on the first error (the flake of celeris#1104: TestPerHandlerAsync_*
+// test on the first error (TestPerHandlerAsync_*
 // /iouring at 0.01 s with "server exited early: ... cannot allocate memory").
 func TestStartAsyncServerRidesOutRingENOMEM(t *testing.T) {
+	skipUnlessIOUringRunnable(t)
 	squeezeMemlock(t, 600*time.Millisecond)
 	start := time.Now()
 	_, base, _ := startAsyncServer(t, celeris.IOUring, false)
@@ -29,6 +30,7 @@ func TestStartAsyncServerRidesOutRingENOMEM(t *testing.T) {
 // that hit the ENOMEM as "io_uring not available", Listen's ring setup fails
 // with the ENOMEM itself, and both are retried until the limit is back.
 func TestStartEngineRetryRidesOutRingENOMEM(t *testing.T) {
+	skipUnlessIOUringRunnable(t)
 	squeezeMemlock(t, 600*time.Millisecond)
 	start := time.Now()
 	e := startEngineRetry(t, func() (engine.Engine, error) {

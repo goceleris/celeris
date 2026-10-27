@@ -96,6 +96,10 @@ func startEngineRetry(t *testing.T, mk func() (engine.Engine, error), onNewErr f
 	case newErr != nil:
 		onNewErr(newErr)
 		t.FailNow() // onNewErr skips or fails; never continue without an engine
+	case err != nil && isRingENOMEM(err) && ioUringRunnableHere():
+		// io_uring works here and the ring budget never came back in the
+		// window: a failure, not a host without io_uring.
+		t.Fatalf("engine failed to start after %v of ring ENOMEM: %v", ringENOMEMWindow, err)
 	case err != nil:
 		t.Skipf("engine failed to start: %v", err)
 	}

@@ -4,12 +4,16 @@ package integration
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/iouring"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -20,8 +24,9 @@ import (
 // only once its workers have closed. That is the runner, not the code under
 // test, so a starter in this package retries it for ringENOMEMWindow and fails
 // on any other error at once. This is the twin of test/server's
-// ring_enomem_test.go (a helper cannot be shared across test packages)
-// (celeris#1104).
+// ring_enomem_test.go (a helper cannot be shared across test packages). The
+// flake is part of the lane that celeris#1104 tracks; that issue's own report
+// is a different test.
 
 // ringENOMEMWindow is how long a start is retried on a ring ENOMEM.
 const ringENOMEMWindow = 30 * time.Second
@@ -32,15 +37,77 @@ const ringENOMEMWindow = 30 * time.Second
 // allocate memory", or the same pressure one step earlier: the capability
 // probe builds a private ring per engine (probe.Probe is not cached) and reads a
 // failed ring as no io_uring, so New answers "io_uring not available on this
-// system" without the ENOMEM text. The starters that use this start an engine
-// the kernel supports, so that error there is the same transient; on a kernel
-// without io_uring such a start fails after the window instead of at once.
+// system" without the ENOMEM text. That second form is retried only where the
+// engine would run io_uring on this host (ioUringRunnableHere): on a host that
+// has none, or where the engine refuses it for good, the answer is final and
+// the caller skips or fails at once, as it did before the retry existed.
 func isRingENOMEM(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "cannot allocate memory") || strings.Contains(msg, "io_uring not available on this system")
+	if strings.Contains(msg, "cannot allocate memory") {
+		return true
+	}
+	// The bare answer only: New's refusal of a kernel before 5.19 carries a
+	// suffix ("...: the io_uring engine requires Linux 5.19 or later ...").
+	return strings.HasSuffix(msg, "io_uring not available on this system") && ioUringRunnableHere()
+}
+
+// engineMayUseIOUring reports whether the engine would run io_uring on this host
+// were no ring refused for want of memory: a kernel of 5.19 or later (the
+// engine refuses io_uring below it, for the async-cancel flags every connection
+// close uses) and no CELERIS_MAX_IOURING_TIER that caps the tier to none
+// (probe.Probe reads a value that is not optional, high or base as none). It
+// looks at no ring, so memlock pressure cannot make it answer false. It is a
+// variable so a test can stand in for another host.
+var engineMayUseIOUring = func() bool {
+	switch os.Getenv("CELERIS_MAX_IOURING_TIER") {
+	case "", "optional", "high", "base":
+	default:
+		return false
+	}
+	var u unix.Utsname
+	if unix.Uname(&u) != nil {
+		return false
+	}
+	kv, err := probe.ParseKernelVersion(unix.ByteSliceToString(u.Release[:]))
+	return err == nil && kv.AtLeast(5, 19)
+}
+
+// ioUringRunnableHere reports whether io_uring is there for the engine to use:
+// engineMayUseIOUring, and the io_uring syscall works (a 4-entry ring is
+// created, or refused for want of memory, which is the pressure being waited
+// out). False for a host whose seccomp profile or kernel has none.
+func ioUringRunnableHere() bool {
+	return engineMayUseIOUring() && ioUringSyscallPresent()
+}
+
+// ioUringSyscallPresent reports that the io_uring syscall works here: a 4-entry
+// ring is created, or refused for want of memory. A variable for tests, as is
+// engineMayUseIOUring.
+var ioUringSyscallPresent = func() bool {
+	r, err := iouring.NewRing(4, 0, 0)
+	if err == nil {
+		_ = r.Close()
+		return true
+	}
+	return strings.Contains(err.Error(), "cannot allocate memory")
+}
+
+// skipUnlessIOUringRunnable skips the calling test, or fails it where the CI
+// convention says io_uring is required (CELERIS_REQUIRE_IOURING_WORKERS=1, the
+// same variable the iouring package's skipOrFail656 reads), when io_uring is
+// not there for the engine to use.
+func skipUnlessIOUringRunnable(t *testing.T) {
+	t.Helper()
+	if ioUringRunnableHere() {
+		return
+	}
+	if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
+		t.Fatal("io_uring is not usable here, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids skipping")
+	}
+	t.Skip("io_uring is not usable here (kernel before 5.19, a capped tier or a blocked syscall)")
 }
 
 // retryRingENOMEM calls attempt until it returns nil or an error that is not a
@@ -59,20 +126,38 @@ func retryRingENOMEM(attempt func() error, window time.Duration) (tries int, err
 }
 
 func TestIsRingENOMEM1104(t *testing.T) {
+	enomem := "worker 0 ring setup: io_uring_setup: cannot allocate memory (likely RLIMIT_MEMLOCK; current=8388608 bytes (soft) / 8388608 bytes (hard))"
+	tiers := "all io_uring tiers failed, last error: io_uring_setup: cannot allocate memory (likely RLIMIT_MEMLOCK)"
+	bare := "create engine: io_uring not available on this system"
+	old := "create engine: io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, and kernel 5.15.0 predates it"
 	for _, tc := range []struct {
-		err  error
-		want bool
+		name            string
+		msg             string
+		mayUse, syscall bool // engineMayUseIOUring, ioUringSyscallPresent
+		want            bool
 	}{
-		{nil, false},
-		{errors.New("worker 0 ring setup: io_uring_setup: cannot allocate memory (likely RLIMIT_MEMLOCK; current=8388608 bytes (soft) / 8388608 bytes (hard))"), true},
-		{errors.New("all io_uring tiers failed, last error: io_uring_setup: cannot allocate memory (likely RLIMIT_MEMLOCK)"), true},
-		{errors.New("create engine: io_uring not available on this system"), true},
-		{errors.New("config validation: bad addr"), false},
-		{errors.New("listen tcp 127.0.0.1:1: bind: address already in use"), false},
+		{"ring ENOMEM", enomem, true, true, true},
+		{"ring ENOMEM, no io_uring here", enomem, false, false, true}, // the text says it is memory
+		{"all tiers failed on ENOMEM", tiers, true, true, true},
+		{"probe ring ENOMEM: bare answer where the engine would run io_uring", bare, true, true, true},
+		{"bare answer, tier capped to none or a kernel before 5.19", bare, false, true, false},
+		{"bare answer, io_uring syscall blocked", bare, true, false, false},
+		{"bare answer, nothing there", bare, false, false, false},
+		{"kernel before 5.19 refused by the engine", old, true, true, false},
+		{"bad config", "config validation: bad addr", true, true, false},
+		{"port in use", "listen tcp 127.0.0.1:1: bind: address already in use", true, true, false},
 	} {
-		if got := isRingENOMEM(tc.err); got != tc.want {
-			t.Errorf("isRingENOMEM(%v) = %v, want %v", tc.err, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			defer func(m, s func() bool) { engineMayUseIOUring, ioUringSyscallPresent = m, s }(engineMayUseIOUring, ioUringSyscallPresent)
+			engineMayUseIOUring = func() bool { return tc.mayUse }
+			ioUringSyscallPresent = func() bool { return tc.syscall }
+			if got := isRingENOMEM(errors.New(tc.msg)); got != tc.want {
+				t.Errorf("isRingENOMEM(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+	if isRingENOMEM(nil) {
+		t.Error("isRingENOMEM(nil) = true")
 	}
 }
 

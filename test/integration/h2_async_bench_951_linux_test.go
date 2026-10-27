@@ -192,7 +192,7 @@ func TestH2AsyncRouteRunsOnTheWorkerPool951(t *testing.T) {
 			// rings are still charged against RLIMIT_MEMLOCK: a fresh server per
 			// try, retried for the window; any other Start error fails at once
 			// instead of after the 10 s readiness poll (celeris#1104).
-			startRetryingRingENOMEM(t, "server start", func() error {
+			startOnce := func() error {
 				ln, err := net.Listen("tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
@@ -219,6 +219,17 @@ func TestH2AsyncRouteRunsOnTheWorkerPool951(t *testing.T) {
 				_ = s.Shutdown(ctx)
 				cancel()
 				return errors.New("server did not start listening within 10 s")
+			}
+			startRetryingRingENOMEM(t, "server start", func() error {
+				// The port was free when it was picked and is rebound by Start: a
+				// stolen one gets a fresh port, as the loop this replaced did.
+				var err error
+				for portTry := 0; portTry < 5; portTry++ {
+					if err = startOnce(); err == nil || !strings.Contains(err.Error(), "address already in use") {
+						return err
+					}
+				}
+				return err
 			})
 			defer func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

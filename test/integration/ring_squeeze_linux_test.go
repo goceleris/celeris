@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -14,8 +15,8 @@ import (
 // cleanup). Within d a ring setup fails the way it does on a CI runner that
 // still has the rings of the engines before it charged against its 8 MiB:
 // "io_uring_setup: cannot allocate memory (likely RLIMIT_MEMLOCK ...)". It is
-// the deterministic form of the flake celeris#1104 lists, for the tests of the
-// starters that must ride it out. The limit is per process, so a test that
+// the deterministic form of that flake, for the tests of the starters that must
+// ride it out (the lane celeris#1104 tracks). The limit is per process, so a test that
 // squeezes must not run in parallel with one that starts a ring (none here
 // calls t.Parallel).
 func squeezeMemlock(t *testing.T, d time.Duration) {
@@ -24,20 +25,15 @@ func squeezeMemlock(t *testing.T, d time.Duration) {
 	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &old); err != nil {
 		t.Skipf("getrlimit(RLIMIT_MEMLOCK): %v", err)
 	}
+	if old.Cur <= 64<<10 {
+		t.Skipf("RLIMIT_MEMLOCK is already %d bytes: nothing to squeeze", old.Cur)
+	}
 	low := unix.Rlimit{Cur: 64 << 10, Max: old.Max}
 	if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &low); err != nil {
 		t.Skipf("setrlimit(RLIMIT_MEMLOCK): %v", err)
 	}
-	restored := make(chan struct{})
-	restore := func() {
-		select {
-		case <-restored:
-			return
-		default:
-		}
-		_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &old)
-		close(restored)
-	}
+	var once sync.Once
+	restore := func() { once.Do(func() { _ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &old) }) }
 	timer := time.AfterFunc(d, restore)
 	t.Cleanup(func() { timer.Stop(); restore() })
 }
