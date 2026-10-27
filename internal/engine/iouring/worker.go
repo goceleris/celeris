@@ -7487,6 +7487,13 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	return snap, true
 }
 
+// timeoutsDue reports whether a conn that has had no read or completed send for
+// elapsed is past IdleTimeout or ReadTimeout.
+func (w *Worker) timeoutsDue(elapsed time.Duration) bool {
+	return (w.cfg.IdleTimeout > 0 && elapsed > w.cfg.IdleTimeout) ||
+		(w.cfg.ReadTimeout > 0 && elapsed > w.cfg.ReadTimeout)
+}
+
 // h2ServerOwes is checkTimeouts' look at whether a conn due for ReadTimeout or
 // IdleTimeout is an HTTP/2 conn that has a stream open and whose open streams
 // all have a whole request (H2State.ServerOwes), whose clock, the last read,
@@ -7806,15 +7813,27 @@ func (w *Worker) checkTimeouts() {
 			if w.cfg.WriteTimeout > 0 && elapsed > w.cfg.WriteTimeout {
 				w.closeConn(fd)
 			}
-		} else if (w.cfg.IdleTimeout > 0 && elapsed > w.cfg.IdleTimeout) ||
-			(w.cfg.ReadTimeout > 0 && elapsed > w.cfg.ReadTimeout) {
+		} else if w.timeoutsDue(elapsed) {
 			// An HTTP/2 conn whose open streams all have a whole request is
 			// not idle and is not waiting for a request: the answer is the
-			// server's to give (celeris#889). Looked at only here, once a timeout is due: a
-			// conn within its timeouts pays nothing for it, and one that is
-			// exempt pays this look on every sweep (its clock, the last read,
-			// does not move while it is exempt).
-			if open, known := h2ServerOwes(cs); !known || open {
+			// server's to give (celeris#889). Looked at only here, once a
+			// timeout is due: a conn within its timeouts pays nothing for it,
+			// and one that is exempt pays this look on every sweep (its clock,
+			// the last read, does not move while it is exempt).
+			owes, known := h2ServerOwes(cs)
+			if !known {
+				continue
+			}
+			if owes {
+				cs.h2OwedAt = now
+				continue
+			}
+			// No stream is owed now, but one was at an earlier sweep: the idle
+			// period starts where the stream was last seen, not at the
+			// client's last frame, which is as old as the stream (net/http
+			// starts its idle timer when the last stream closes). Not
+			// lastActivity, which is the WriteTimeout clock of the arm above.
+			if at := cs.h2OwedAt; at != 0 && !w.timeoutsDue(time.Duration(now-at)) {
 				continue
 			}
 			w.closeConn(fd)

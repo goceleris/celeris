@@ -4750,20 +4750,38 @@ func (l *Loop) checkTimeouts() {
 			}
 		}
 		elapsed := time.Duration(now - last)
-		if (l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout) ||
-			(l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout) {
+		if l.timeoutsDue(elapsed) {
 			// An HTTP/2 conn whose open streams all have a whole request is
 			// not idle and is not waiting for a request: the answer is the
-			// server's to give (celeris#889). Looked at only here, once a timeout is due: a
-			// conn within its timeouts pays nothing for it, and one that is
-			// exempt pays this look on every sweep (its clock, the last read,
-			// does not move while it is exempt).
-			if open, ok := h2ServerOwes(cs); !ok || open {
+			// server's to give (celeris#889). Looked at only here, once a
+			// timeout is due: a conn within its timeouts pays nothing for it,
+			// and one that is exempt pays this look on every sweep (its clock,
+			// the last read, does not move while it is exempt).
+			owes, ok := h2ServerOwes(cs)
+			if !ok {
+				continue
+			}
+			if owes {
+				cs.noteH2Owed(now)
+				continue
+			}
+			// No stream is owed now, but one was at an earlier sweep: the idle
+			// period starts where the stream was last seen, not at the
+			// client's last frame, which is as old as the stream (net/http
+			// starts its idle timer when the last stream closes).
+			if at := cs.h2OwedAt(); at != 0 && !l.timeoutsDue(time.Duration(now-at)) {
 				continue
 			}
 			l.closeConn(fd)
 		}
 	}
+}
+
+// timeoutsDue reports whether a conn that has had no frame from its client for
+// elapsed is past IdleTimeout or ReadTimeout.
+func (l *Loop) timeoutsDue(elapsed time.Duration) bool {
+	return (l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout) ||
+		(l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout)
 }
 
 // h2ServerOwes is checkTimeouts' look at whether a conn due for ReadTimeout or
