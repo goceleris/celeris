@@ -227,3 +227,89 @@ func startGateUnread1104(t *testing.T, h stream.Handler, silent bool) *Engine {
 	})
 	return e
 }
+
+// armPostedRecv1104 arms a recv on cs and lets the kernel complete it: peer
+// writes req, the SQE is submitted, and the call returns once the CQE is in the
+// completion queue, UNREAPED (no loop runs here). This is the shape of a request
+// on a ring whose recv completions are posted without the worker's help (the
+// base tier, and any ring where the kernel posts at once): the bytes have left
+// the socket's queue, and are a CQE the gate's pass, at the top of the worker
+// iteration, runs ahead of.
+func armPostedRecv1104(t *testing.T, w *Worker, cs *connState, peer int, req string) {
+	t.Helper()
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		t.Fatal("no SQE")
+	}
+	prepRecv(sqe, cs.fd, cs.buf)
+	setSQEUserData(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
+	cs.recvArmed = true
+	cs.kernelInflight++
+	if req != "" {
+		if _, err := unix.Write(peer, []byte(req)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	} else if err := unix.Shutdown(peer, unix.SHUT_WR); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if err := w.ring.SubmitAndWait(); err != nil {
+		t.Fatalf("SubmitAndWait: %v", err)
+	}
+	if head, tail := w.ring.BeginCQ(); head == tail {
+		t.Fatal("premise: no CQE posted")
+	}
+}
+
+// TestGatePassHoldsAConnWithARecvCQEPosted1104: a conn whose recv completion is
+// already in the completion queue holds a request (the base tier's shape, in
+// which the CI run showed 18 conns closed with their request delivered by the
+// kernel and not yet reaped): the pass must not close it, and a conn that is
+// idle (control) is still closed.
+func TestGatePassHoldsAConnWithARecvCQEPosted1104(t *testing.T) {
+	w, css, peers := gateRig884(t, 2)
+	armPostedRecv1104(t, w, css[0], peers[0], "GET /x HTTP/1.1\r\nHost: x\r\n\r\n")
+	w.refuseRecv = true
+	w.closeIdleH1()
+	if w.conns[css[0].fd] != css[0] {
+		t.Errorf("the pass closed a conn whose request is a posted recv CQE (celeris#1104)")
+	}
+	if !css[0].gateRead {
+		t.Errorf("the conn with a posted recv CQE is not marked to be read on")
+	}
+	if w.conns[css[1].fd] == css[1] {
+		t.Errorf("the idle control conn is still open: the pass must still close what holds nothing")
+	}
+}
+
+// TestGatePassHoldsAConnWithBytesInTheSocketQueue1104 is the other shape, on a
+// ring whose completions are task work (COOP_TASKRUN, DEFER_TASKRUN): the request
+// waits in the socket's queue, with no CQE yet.
+func TestGatePassHoldsAConnWithBytesInTheSocketQueue1104(t *testing.T) {
+	w, css, peers := gateRig884(t, 2)
+	if _, err := unix.Write(peers[0], []byte("GET /x HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	w.refuseRecv = true
+	w.closeIdleH1()
+	if w.conns[css[0].fd] != css[0] {
+		t.Errorf("the pass closed a conn whose request is in the socket's queue (celeris#1104)")
+	}
+	if !css[0].gateRead {
+		t.Errorf("the conn with bytes in its socket queue is not marked to be read on")
+	}
+	if w.conns[css[1].fd] == css[1] {
+		t.Errorf("the idle control conn is still open")
+	}
+}
+
+// TestGatePassClosesAConnWhoseRecvCQEIsAnEOF1104: a posted recv CQE with no
+// bytes (the peer's FIN) is not a request: the conn is closed.
+func TestGatePassClosesAConnWhoseRecvCQEIsAnEOF1104(t *testing.T) {
+	w, css, peers := gateRig884(t, 1)
+	armPostedRecv1104(t, w, css[0], peers[0], "")
+	w.refuseRecv = true
+	w.closeIdleH1()
+	if w.conns[css[0].fd] == css[0] {
+		t.Errorf("the pass kept a conn whose posted recv CQE is an EOF")
+	}
+}
