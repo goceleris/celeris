@@ -305,7 +305,7 @@ func startServerConfig421(t *testing.T, cfg celeris.Config, setup func(*celeris.
 	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := listenForStart1104()
 		if err != nil {
 			t.Fatal(err)
 		}

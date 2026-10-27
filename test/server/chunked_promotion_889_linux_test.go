@@ -35,7 +35,7 @@ func start889(t *testing.T, cfg celeris.Config, extra ...func(*celeris.Server)) 
 	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := listenForStart1104()
 		if err != nil {
 			t.Fatal(err)
 		}
