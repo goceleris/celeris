@@ -141,6 +141,11 @@ func TestExpireRequestAnswers408AndRemembersTheStream889(t *testing.T) {
 	for _, id := range m.ExpiredRequests(now, make([]uint32, 0, 8)) {
 		p.ExpireRequest(id, now)
 	}
+	// An expiry is not a refusal: none of the flood budgets is charged.
+	if p.refusedHeaderLists != 0 || p.refusedStreams != 0 || p.refusedMalformed != 0 || p.refusedBodies != 0 || p.emptyDataFrames != 0 {
+		t.Fatalf("an expiry charged a flood budget: header lists %d, streams %d, malformed %d, bodies %d, empty DATA %d",
+			p.refusedHeaderLists, p.refusedStreams, p.refusedMalformed, p.refusedBodies, p.emptyDataFrames)
+	}
 	rw.mu.Lock()
 	status := rw.statuses[1]
 	rw.mu.Unlock()
