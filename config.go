@@ -335,12 +335,11 @@ type Config struct {
 	// response parked (the first sweep takes the baseline, the window ends at
 	// the first sweep a WriteTimeout later); one that stops after a window it
 	// passed, within two WriteTimeouts plus two sweeps after its last byte. A
-	// client that takes
-	// exactly 64 KiB per window holds the connection, and the part of the
-	// response not yet sent, for as many windows as the response has 64 KiB (a
-	// response of S bytes: S/64 KiB times WriteTimeout, 64 minutes for 4 MiB at
-	// 60s; a smaller WriteTimeout raises the floor), so size WriteTimeout with
-	// that in mind. WriteTimeout -1 (or 0) is no write timeout at any rate. What
+	// client that takes exactly 64 KiB per window holds the connection, and the
+	// part of the response not yet sent, for as many windows as the response has
+	// 64 KiB (a response of S bytes: S/64 KiB times WriteTimeout, 64 minutes
+	// for 4 MiB at 60s; a smaller WriteTimeout raises the floor), so size
+	// WriteTimeout with that in mind. WriteTimeout -1 (or 0) is no write timeout at any rate. What
 	// the client sends is not progress: a pipelined request or an HTTP/2 PING
 	// does not hold a parked response.
 	//
