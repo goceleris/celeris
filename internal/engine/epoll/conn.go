@@ -270,6 +270,14 @@ type connState struct {
 	// the 4-byte hole before closeSince: see TestConnStateStaysInItsSizeClass.)
 	gen uint32
 
+	// closeAcked, closeAckedKnown and closeSampled have a third user, a live
+	// conn's parked response (parkedBelowRate, write_rate_885.go, celeris#885
+	// item 51): the baseline of the rate rule's window, sampled by the
+	// sweep while writeSince is set and closeSince is 0, forgotten where the
+	// response's clock ends (endWriteSlow, the sweep's empty-queue case) and by
+	// markClosing, which hands them to the drain below. A conn is in one of the
+	// three states at a time.
+	//
 	// closeSince, closePending and closeAcked are the clock of that deferred
 	// close (celeris#876): closeSince is when the engine last saw the close
 	// move forward, in nanoseconds, from the request that deferred it

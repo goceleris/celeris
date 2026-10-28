@@ -19,6 +19,18 @@
 // instance deployments, use [middleware/session/redisstore.New] with
 // a cache-specific prefix.
 //
+// # Store.Set bound
+//
+// The middleware waits for each Store.Set for at most [Config].SetTimeout,
+// 1 second by default, so a store whose Set hangs cannot hold the request
+// (and on epoll and io_uring its event loop) for longer. A Set that has not
+// returned in time is abandoned: the response is sent as usual, marked
+// X-Cache: MISS, and is not stored; nothing is logged or counted unless the
+// Set panics. A store that ignores the context it is given keeps running
+// the abandoned Set in a goroutine until it returns. Raise the bound for a
+// store whose Set is legitimately slower, for example
+// Config{SetTimeout: 5 * time.Second}; a negative value waits for ever.
+//
 // # Singleflight
 //
 // By default concurrent requests that miss on the same key coalesce: one
