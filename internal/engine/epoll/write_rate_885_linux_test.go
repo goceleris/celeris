@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,48 +32,35 @@ import (
 // they build against main, where they fail).
 const rateFloor885 = 64 << 10
 
-// TestParkedPeerAboveTheFloorWithoutAnEdgeIsNotReaped885: the peer takes 16 KiB
-// every 100 ms (about 160 KiB/s, 128 KiB per 800 ms window, twice the floor)
-// for five windows, no EPOLLOUT edge (handleWritable is never called) and no
-// flush: the write clock the flushes keep is at its first stamp. The conn must
-// survive every sweep (main closed it a WriteTimeout in). Then the peer stops,
-// and the conn goes within two windows of its last byte.
+// TestParkedPeerAboveTheFloorWithoutAnEdgeIsNotReaped885: the peer takes four
+// times the floor (about 320 KiB/s, 256 KiB per 800 ms window; a reader that
+// falls behind catches up on the next tick, ride885) for five windows, no
+// EPOLLOUT edge (handleWritable is never called) and no flush: the write clock
+// the flushes keep is at its first stamp. The conn must survive every sweep
+// (main closed it a WriteTimeout in). Then the peer stops, and the conn goes
+// within two windows of its last byte. (Margin 4x: the first cut read at twice
+// the floor, which a loaded runner could stretch below it, review r3 F9.)
 func TestParkedPeerAboveTheFloorWithoutAnEdgeIsNotReaped885(t *testing.T) {
 	const bound = 800 * time.Millisecond
-	r := parked885(t, resource.Config{ReadTimeout: -1, IdleTimeout: -1, WriteTimeout: bound})
-	start := time.Now()
-	lastRead := start
-	for time.Since(start) < 5*bound {
-		time.Sleep(25 * time.Millisecond)
-		if time.Since(lastRead) >= 100*time.Millisecond {
-			if r.read(16<<10) == 0 && time.Since(start) < bound/2 {
-				t.Fatalf("apparatus: the peer read nothing")
-			}
-			lastRead = time.Now()
-			// What the kernel took is what the peer can read: the engine's
-			// own flush keeps it supplied. A flush that is no EPOLLOUT edge
-			// (flushWrites, not handleWritable) is not progress for the
-			// flush clock either, which is the premise of this test.
-			_ = r.l.flushWrites(r.cs, true)
+	const stop = 5 * bound
+	var run riderRun885
+	for attempt := 1; attempt <= 3; attempt++ {
+		run = ride885(t, resource.Config{ReadTimeout: -1, IdleTimeout: -1, WriteTimeout: bound}, 4, 0, stop, stop+4*bound)
+		if run.closedAt == 0 || run.closedAt >= stop || !run.shortfall(int(run.closedAt/bound)) {
+			break
 		}
-		r.l.checkTimeouts()
-		if !r.open() {
-			t.Fatalf("celeris#885 item 51: reaped %v in, the peer taking 16 KiB every 100 ms (twice the floor of %d KiB per %v) and no edge",
-				time.Since(start).Round(time.Millisecond), rateFloor885>>10, bound)
-		}
+		t.Logf("attempt %d: the peer itself took %v bytes per window, under the floor: retrying", attempt, run.windows)
 	}
-	stopped := time.Now()
-	for time.Since(stopped) < 4*bound {
-		time.Sleep(25 * time.Millisecond)
-		r.l.checkTimeouts()
-		if !r.open() {
-			if gone := time.Since(stopped); gone > 2*bound+200*time.Millisecond {
-				t.Errorf("a peer that stopped was reaped %v after its last byte, want within two windows (%v)", gone.Round(time.Millisecond), 2*bound)
-			}
-			return
-		}
+	if run.closedAt != 0 && run.closedAt < stop {
+		t.Fatalf("celeris#885 item 51: reaped %v in, the peer taking 4x the floor (taken per %v window: %v; floor %d KiB) and no edge",
+			run.closedAt.Round(time.Millisecond), bound, run.windows, rateFloor885>>10)
 	}
-	t.Fatalf("a peer that stopped reading was not reaped %v after its last byte", 4*bound)
+	if run.closedAt == 0 {
+		t.Fatalf("a peer that stopped reading was not reaped %v after its last byte", 4*bound)
+	}
+	if gone := run.closedAt - stop; gone > 2*bound+250*time.Millisecond {
+		t.Errorf("a peer that stopped was reaped %v after its last byte, want within two windows (%v)", gone.Round(time.Millisecond), 2*bound)
+	}
 }
 
 // TestParkedPeerBelowTheFloorIsReapedWhateverItsFlushes885: the peer takes 12 KiB
@@ -113,9 +102,18 @@ func TestParkedConnWithNoWriteTimeoutIsNeverReapedByTheRate885(t *testing.T) {
 	}
 }
 
-// goneAfter885 polls the engine until the conn is gone, up to limit, and reports
-// when (0: still open).
-func goneAfter885(e *Engine, t0 time.Time, limit time.Duration, between func()) time.Duration {
+// goneAfter885 waits until the engine has counted the connection (an accepted
+// connection that the engine has not counted yet reads as "gone": review r3
+// F10), then polls until the conn is gone, up to limit from there, and reports
+// when (0: still open), measured from the count.
+func goneAfter885(t *testing.T, e *Engine, limit time.Duration, between func()) time.Duration {
+	t.Helper()
+	for dl := time.Now().Add(5 * time.Second); e.Metrics().ActiveConnections == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(dl) {
+			t.Fatalf("apparatus: the engine never counted the connection")
+		}
+	}
+	t0 := time.Now()
 	for time.Since(t0) < limit {
 		time.Sleep(20 * time.Millisecond)
 		if between != nil {
@@ -177,41 +175,76 @@ func TestEngineDownloadAtAModerateRateCompletesUnderIdleTimeout885(t *testing.T)
 }
 
 // TestEngineReaderAboveTheFloorIsNotClosedBetweenEdges885: a deep send queue
-// (1 MiB, so that half of it takes the client eight seconds), a client with a 4
-// KiB receive buffer reading 4 KiB every 30 ms (about 130 KiB/s), WriteTimeout 1
-// s, ReadTimeout and IdleTimeout off. It takes twice the 64 KiB per window and
-// no EPOLLOUT edge comes; it is held for five seconds. Main closes it at the
-// first WriteTimeout.
+// (1 MiB, so that half of it takes the client four seconds or more), a client
+// with a 4 KiB receive buffer reading 128 KiB/s (4 KiB turns, a reader that
+// falls behind catches up on the next one), WriteTimeout 2 s (a floor of 32
+// KiB/s: the client takes four times the 64 KiB per window), ReadTimeout and
+// IdleTimeout off. No EPOLLOUT edge comes in the first window; the conn is
+// held for three windows. Main closes it at the first WriteTimeout. (The first
+// cut read at 1.6 times the floor of a 1 s window, which a loaded runner
+// stretched under it: 10 of 10 failures with six busy loops, review r3 F9; the
+// run retries when the client itself took under the floor in a window.)
 func TestEngineReaderAboveTheFloorIsNotClosedBetweenEdges885(t *testing.T) {
+	const wt = 2 * time.Second
+	const runFor = 3*wt + 500*time.Millisecond
+	const rate = 128 << 10
+	t.Logf("net.core.wmem_max=%s", sysctl885("net/core/wmem_max"))
 	for _, async := range []bool{false, true} {
 		t.Run(fmt.Sprintf("async=%v", async), func(t *testing.T) {
-			e, addr := startE2E885(t, async, newPathHandler885(64<<20), func(c *resource.Config) {
-				c.ReadTimeout = -1
-				c.IdleTimeout = -1
-				c.WriteTimeout = time.Second
-				c.Resources.SocketSend = 1 << 20
-			})
-			c := dialRcvBuf885(t, addr, 4096)
-			get885(t, c, "/big")
-			t0 := time.Now()
-			var got int64
-			var lastRead time.Time
-			buf := make([]byte, 4096)
-			gone := goneAfter885(e, t0, 5*time.Second, func() {
-				if time.Since(lastRead) >= 30*time.Millisecond {
-					lastRead = time.Now()
-					_ = c.SetReadDeadline(time.Now().Add(time.Second))
-					n, _ := c.Read(buf)
-					got += int64(n)
+			for attempt := 1; ; attempt++ {
+				e, addr := startE2E885(t, async, newPathHandler885(64<<20), func(c *resource.Config) {
+					c.ReadTimeout = -1
+					c.IdleTimeout = -1
+					c.WriteTimeout = wt
+					c.Resources.SocketSend = 1 << 20
+				})
+				c := dialRcvBuf885(t, addr, 4096)
+				get885(t, c, "/big")
+				var got float64
+				windows := make([]int, int(runFor/wt)+1)
+				buf := make([]byte, 4096)
+				var t0 time.Time
+				gone := goneAfter885(t, e, runFor, func() {
+					if t0.IsZero() {
+						t0 = time.Now()
+					}
+					el := time.Since(t0)
+					for due := rate*el.Seconds() - got; due >= 4096; due -= 4096 {
+						_ = c.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
+						n, _ := c.Read(buf)
+						if n == 0 {
+							break
+						}
+						got += float64(n)
+						windows[int(el/wt)] += n
+					}
+				})
+				t.Logf("celeris885 above-floor async=%v attempt %d: taken per %v window %v, gone at %v", async, attempt, wt, windows, gone)
+				if gone == 0 {
+					return
 				}
-			})
-			t.Logf("celeris885 above-floor async=%v: %d bytes in %v, gone at %v", async, got, time.Since(t0).Round(time.Millisecond), gone)
-			if gone != 0 {
-				t.Errorf("the conn of a client reading steadily at %d KiB in %v was closed %v in, WriteTimeout 1s: "+
-					"progress between two EPOLLOUT edges is progress", got>>10, time.Since(t0).Round(time.Second), gone.Round(time.Millisecond))
+				short := false
+				for i := 0; i < int(gone/wt) && i < len(windows); i++ {
+					short = short || float64(windows[i]) < 1.25*rateFloor885
+				}
+				if short && attempt < 3 {
+					continue // the client itself fell under the floor: not the engine's doing
+				}
+				t.Errorf("the conn of a client reading steadily at 4x the floor (taken per %v window: %v, floor %d KiB) was closed %v in, "+
+					"WriteTimeout %v: progress between two EPOLLOUT edges is progress", wt, windows, rateFloor885>>10, gone.Round(time.Millisecond), wt)
+				return
 			}
 		})
 	}
+}
+
+// sysctl885 reads a /proc/sys value for a test log.
+func sysctl885(name string) string {
+	b, err := os.ReadFile("/proc/sys/" + name)
+	if err != nil {
+		return err.Error()
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // TestEngineSlowlorisBelowTheFloorIsClosed885 is the issue's hold: a shallow
@@ -232,11 +265,10 @@ func TestEngineSlowlorisBelowTheFloorIsClosed885(t *testing.T) {
 			})
 			c := dialRcvBuf885(t, addr, 4096)
 			get885(t, c, "/big")
-			t0 := time.Now()
 			buf := make([]byte, 16<<10)
 			var lastRead time.Time
 			turn := 0
-			gone := goneAfter885(e, t0, 8*time.Second, func() {
+			gone := goneAfter885(t, e, 8*time.Second, func() {
 				if time.Since(lastRead) >= 250*time.Millisecond {
 					lastRead = time.Now()
 					turn++
@@ -248,8 +280,8 @@ func TestEngineSlowlorisBelowTheFloorIsClosed885(t *testing.T) {
 			if gone == 0 {
 				t.Errorf("a client taking 40 KiB/s of a response, flushing at every edge, WriteTimeout 1s, was still held 8 s in: " +
 					"nothing bounds a parked response whose peer takes a half queue per window")
-			} else if gone > 3500*time.Millisecond {
-				t.Errorf("the conn was closed %v in, want within three windows (3.5 s)", gone.Round(time.Millisecond))
+			} else if gone > 3500*time.Millisecond || gone < 850*time.Millisecond {
+				t.Errorf("the conn was closed %v in, want between a window (1 s) and three (3.5 s)", gone.Round(time.Millisecond))
 			}
 		})
 	}
@@ -286,10 +318,9 @@ func TestEnginePeerInboundBytesDoNotRefreshTheWriteClock885(t *testing.T) {
 				})
 				c := dialRcvBuf885(t, addr, 4096)
 				get885(t, c, "/big")
-				t0 := time.Now()
 				buf := make([]byte, 4096)
 				var lastRead, lastPoke time.Time
-				gone := goneAfter885(e, t0, 8*time.Second, func() {
+				gone := goneAfter885(t, e, 8*time.Second, func() {
 					if time.Since(lastRead) >= 400*time.Millisecond {
 						lastRead = time.Now()
 						_ = c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
@@ -302,8 +333,8 @@ func TestEnginePeerInboundBytesDoNotRefreshTheWriteClock885(t *testing.T) {
 					}
 				})
 				t.Logf("celeris885 inbound poke=%q async=%v: gone at %v", poke, async, gone)
-				if gone == 0 || gone > 3*time.Second {
-					t.Errorf("a client reading 10 KiB/s and sending %q was closed at %v (0: still open), want within 3 s: "+
+				if gone == 0 || gone > 3*time.Second || gone < 850*time.Millisecond {
+					t.Errorf("a client reading 10 KiB/s and sending %q was closed at %v (0: still open), want between a window (1 s) and 3 s: "+
 						"the bytes it sends are not progress", poke, gone)
 				}
 			})
@@ -326,10 +357,9 @@ func TestEngineStuckPeersAreClosedWithinTwoWindows885(t *testing.T) {
 			})
 			c := dialRcvBuf885(t, addr, 4096)
 			get885(t, c, "/big")
-			t0 := time.Now()
 			var lastAct time.Time
 			one := make([]byte, 1)
-			gone := goneAfter885(e, t0, 6*time.Second, func() {
+			gone := goneAfter885(t, e, 6*time.Second, func() {
 				switch name {
 				case "zero-window+GET/s":
 					if time.Since(lastAct) >= time.Second {
@@ -346,8 +376,8 @@ func TestEngineStuckPeersAreClosedWithinTwoWindows885(t *testing.T) {
 				}
 			})
 			t.Logf("celeris885 stuck %s: gone at %v", name, gone)
-			if gone == 0 || gone > 3*time.Second {
-				t.Errorf("%s: closed at %v (0: still open), want within 3 s (two windows)", name, gone)
+			if gone == 0 || gone > 3*time.Second || gone < 850*time.Millisecond {
+				t.Errorf("%s: closed at %v (0: still open), want between a window (1 s) and 3 s (two windows+)", name, gone)
 			}
 		})
 	}
@@ -365,7 +395,7 @@ func TestEngineNoWriteTimeoutHoldsAStuckPeer885(t *testing.T) {
 	})
 	c := dialRcvBuf885(t, addr, 4096)
 	get885(t, c, "/big")
-	if gone := goneAfter885(e, time.Now(), 4*time.Second, nil); gone != 0 {
+	if gone := goneAfter885(t, e, 4*time.Second, nil); gone != 0 {
 		t.Errorf("the conn of a client that takes nothing was closed %v in with WriteTimeout -1 and ReadTimeout and IdleTimeout off", gone)
 	}
 }
