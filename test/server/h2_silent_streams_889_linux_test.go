@@ -84,12 +84,13 @@ var silentOwes889 = []struct {
 	{"response-8MiB-untaken", func(c *h2raw889) { c.request(1, "GET", "/big889?n=8388608", true, true) }},
 }
 
-// pingCells889 are the cells a pinging client holds open (see the last test).
+// pingCells889 are the cells a pinging client still holds open (see the last
+// test). The request-open cell is gone from it: the per-stream request deadline
+// flipped it (TestH2PingingClientRequestIsAnsweredAndReset889).
 var pingCells889 = []struct {
 	name string
 	req  func(c *h2raw889)
 }{
-	{"request-open", func(c *h2raw889) { c.request(1, "POST", "/upload889", false, true) }},
 	{"response-1MiB-untaken", func(c *h2raw889) { c.request(1, "GET", "/big889?n=1048576", true, true) }},
 }
 
@@ -118,16 +119,17 @@ func TestH2SilentClientOwingTheServerIsReaped889(t *testing.T) {
 	}
 }
 
-// TestH2PingingClientHoldsAnUnfinishedStream889 pins what neither main nor this
-// change bounds: a client that opens a stream it never completes, or a response
-// it never takes, and sends one PING every 500 ms (ReadTimeout is 1 s), is not
-// closed on the native engines (the PING restarts the conn clock, on main as
-// well: measured on main f4ae3ad, all three engines). std ends these streams
-// at ReadTimeout (RST_STREAM NO_ERROR, 1.00 s) and at WriteTimeout
-// (RST_STREAM INTERNAL_ERROR, 2.00 s). Only per-stream deadlines would: they
-// are tracked as the per-stream deadlines work under celeris#889 (L19 stage 2,
-// the std model). When they land these cells are FLIPPED to "the stream is
-// reset", not deleted, and this comment goes with them.
+// TestH2PingingClientHoldsAnUnfinishedStream889 pins what is still not bounded:
+// a client that opens a stream, asks for a response it never takes, and sends
+// one PING every 500 ms (ReadTimeout is 1 s), is not closed on the native
+// engines (the PING restarts the conn clock, on main as well: measured on main
+// f4ae3ad, all three engines). std ends such a stream at WriteTimeout
+// (RST_STREAM INTERNAL_ERROR, 2.00 s). The request side of this was flipped by
+// the per-stream request deadline (ReadTimeout, 408 and RST_STREAM(NO_ERROR));
+// the response side waits for the per-stream write deadline, the second stage
+// of the per-stream deadlines work under celeris#889 (L19, D2). When it lands
+// these cells are FLIPPED to "the stream is reset", not deleted, and this
+// comment goes with them.
 func TestH2PingingClientHoldsAnUnfinishedStream889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		for _, sc := range pingCells889 {

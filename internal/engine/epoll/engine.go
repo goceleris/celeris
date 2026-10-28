@@ -18,6 +18,7 @@ import (
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
+	"github.com/goceleris/celeris/internal/tcpack"
 )
 
 // Engine implements the epoll-based I/O engine.
@@ -104,6 +105,11 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	if errs := cfg.Validate(); len(errs) > 0 {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
+
+	// The idle clock of an h2 conn needs to know whether this host reports the
+	// bytes a peer has acknowledged: ask now, in the background, so that the
+	// answer is there long before a sweep needs it (internal/tcpack).
+	tcpack.Start()
 
 	e := &Engine{
 		cfg:     cfg,
