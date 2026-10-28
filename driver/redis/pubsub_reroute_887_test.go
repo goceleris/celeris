@@ -201,7 +201,7 @@ func TestClusterTwoSubscriptionsOneLost887(t *testing.T) {
 		poll(t, "both closed", 5*time.Second, func() bool { return cl.subscribers("sub") == 0 })
 	}
 	if ps1 == nil {
-		t.Skip("could not place the two subscriptions on different nodes")
+		t.Fatal("could not place the two subscriptions on different nodes")
 	}
 	t.Cleanup(func() { _ = ps1.Close(); _ = ps2.Close() })
 	rc1, rc2 := collect(ps1), collect(ps2)

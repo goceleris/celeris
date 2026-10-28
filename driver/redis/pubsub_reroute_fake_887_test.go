@@ -30,6 +30,8 @@ type rpCluster struct {
 	old [16384]*rpNode // what a stale CLUSTER SLOTS reply still shows
 	// stale is how many more CLUSTER SLOTS replies show old, not cur.
 	stale int
+	// slotsReplies counts the CLUSTER SLOTS replies given.
+	slotsReplies atomic.Int64
 }
 
 type rpNode struct {
@@ -482,6 +484,12 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 			return nil
 		}
 		for _, ch := range cmd[1:] {
+			if Slot(ch) != Slot(cmd[1]) {
+				writeError(c.w, "CROSSSLOT Keys in request don't hash to the same slot")
+				return nil
+			}
+		}
+		for _, ch := range cmd[1:] {
 			slot := int(Slot(ch))
 			if o := n.cl.owner(slot); o != n {
 				writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, o.addr))
@@ -511,6 +519,17 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 			}
 		}
 	case "SUNSUBSCRIBE":
+		// Like Redis 7, a node that does not serve the slot of a channel it
+		// holds no subscription for answers -MOVED.
+		for _, ch := range cmd[1:] {
+			c.mu.Lock()
+			_, held := c.ssubs[ch]
+			c.mu.Unlock()
+			if slot := int(Slot(ch)); !held && n.cl.owner(slot) != n {
+				writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, n.cl.owner(slot).addr))
+				return nil
+			}
+		}
 		c.mu.Lock()
 		names := cmd[1:]
 		if len(names) == 0 {
@@ -532,6 +551,7 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 // writeSlots answers CLUSTER SLOTS from the current table, or the old one
 // while stale replies are owed.
 func (cl *rpCluster) writeSlots(w *bufio.Writer) {
+	cl.slotsReplies.Add(1)
 	cl.mu.Lock()
 	tab := cl.cur
 	if cl.stale > 0 {
