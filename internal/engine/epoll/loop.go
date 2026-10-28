@@ -5306,6 +5306,25 @@ func (l *Loop) shutdown() {
 	l.closeAdoptQueue()
 	l.shutdownDrivers()
 
+	// Phase 0 (celeris#1104): close the HTTP/1 conns that hold nothing, now,
+	// ahead of everything below, which waits: phase 2 for the async goroutines,
+	// the send drain for the peers of the conns with a response queued, up to the
+	// Shutdown's budget, and phase 3, which closes the rest, comes after them. An
+	// idle keep-alive conn, or one that was accepted and sent nothing, waited that
+	// long for its FIN behind the slow download of another conn of the loop. A
+	// loop with an HTTP/2 conn to wait for has closed these 250 ms into the wait
+	// (poolWaitGate); one with none comes straight here (h2PoolSettled), and
+	// net/http's Shutdown closes its idle conns at once. The pass is the gate's, on
+	// conns in the state it was written for (nothing torn down yet): a conn with a
+	// response queued or unacked, a request in progress, a dispatch goroutine
+	// running a handler, or a detached stream not ended yet is left to the drain
+	// and to phase 3. Its cap per pass is for a loop that has other conns to
+	// serve; this one has none, so it goes on until a pass closes fewer.
+	now := time.Now().UnixNano()
+	for l.closeIdleH1(false, now) >= gateClosesPerPass {
+		now = time.Now().UnixNano()
+	}
+
 	// Phase 1: signal every async dispatch / detached goroutine to stop and
 	// tear down protocol state — but do NOT close any fd and do NOT release
 	// any connState yet. asyncClosed + the cond Broadcast MUST happen before
