@@ -38,8 +38,10 @@ const parkedMinAcked = 64 << 10
 //
 // So a peer that takes nothing (a zero window, a byte per second: the
 // kernel acknowledges a window update, not a byte) is closed between
-// WriteTimeout and WriteTimeout plus a sweep after the response parked, and one
-// that stops after a window it passed within two WriteTimeouts. A peer that
+// WriteTimeout and WriteTimeout plus two sweeps after the response parked (the
+// first sweep takes the baseline, the window ends at the first sweep a
+// WriteTimeout later), and one that stops after a window it passed within two
+// WriteTimeouts plus two sweeps. A peer that
 // takes exactly parkedMinAcked per window holds the conn and what is queued for
 // it for (response / parkedMinAcked) windows: there is no elapsed-time ceiling,
 // and a client that takes the response at a reasonable rate is never cut.

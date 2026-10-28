@@ -331,9 +331,11 @@ type Config struct {
 	// mistaken for a stalled one: a download completes whatever IdleTimeout is.
 	// A client that takes less, in whatever pieces (nothing, a byte at a time,
 	// a half send queue per WriteTimeout), is closed at the end of the first
-	// window, between WriteTimeout and WriteTimeout plus a sweep after the
-	// response parked; one that stops after a window it passed, within two
-	// WriteTimeouts plus a sweep after its last byte. A client that takes
+	// window, between WriteTimeout and WriteTimeout plus two sweeps after the
+	// response parked (the first sweep takes the baseline, the window ends at
+	// the first sweep a WriteTimeout later); one that stops after a window it
+	// passed, within two WriteTimeouts plus two sweeps after its last byte. A
+	// client that takes
 	// exactly 64 KiB per window holds the connection, and the part of the
 	// response not yet sent, for as many windows as the response has 64 KiB (a
 	// response of S bytes: S/64 KiB times WriteTimeout, 64 minutes for 4 MiB at
