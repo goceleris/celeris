@@ -329,9 +329,10 @@ func TestH2FastUploadIsNotKilled889(t *testing.T) {
 				}
 				switch f := f.(type) {
 				case *http2.WindowUpdateFrame:
-					if f.StreamID == 0 {
+					switch f.StreamID {
+					case 0:
 						connWin += int(f.Increment)
-					} else if f.StreamID == 1 {
+					case 1:
 						strWin += int(f.Increment)
 					}
 				case *http2.HeadersFrame:
