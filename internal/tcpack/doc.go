@@ -10,6 +10,8 @@
 // fill it (gVisor's netstack, as far as is known) a 0 says nothing, and the cap
 // must not close a conn for it. The two are told apart once, by asking this
 // host's stack: a loopback connection, one byte written, the count read from the
-// writer's side. The answer is latched true as soon as any socket of the process
-// has reported a count above 0.
+// writer's side. The probe runs in the background (the engines start it when they
+// are built) and is never waited for: until it has said yes, a 0 is "no count".
+// The answer is latched true as soon as the probe says so or any socket of the
+// process has reported a count above 0.
 package tcpack

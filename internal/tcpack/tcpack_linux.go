@@ -12,12 +12,13 @@ import (
 )
 
 var (
-	filled atomic.Bool // one-way: set once any socket has reported bytes_acked > 0
-	once   sync.Once
+	filled  atomic.Bool    // one-way: set once any socket has reported bytes_acked > 0, or the probe has
+	started sync.Once      // the probe is started once
+	probing sync.WaitGroup // the probe goroutine, for a test to wait for
 )
 
 // probeFn is the host probe; a variable so that a test can stand in for a stack
-// that does not fill the field.
+// that does not fill the field, or for a probe that never completes.
 var probeFn = probeLoopback
 
 // Note records a count read from a socket: a count above 0 shows the stack fills
@@ -28,20 +29,35 @@ func Note(acked uint64) {
 	}
 }
 
-// Filled reports whether this host's TCP stack fills bytes_acked, so that a count
-// of 0 means "the peer has acknowledged nothing". The first call that finds no
-// count above 0 yet runs the loopback probe (a few milliseconds at most, once per
-// process); a probe that cannot run (no loopback, no listener) answers false:
-// the caller then does not close for a 0.
+// Start begins the loopback probe in the background, once. The engines call it
+// when they are built, so that the answer is there long before a connection
+// needs it; Filled calls it too, as a safety net. It never blocks: the probe
+// waits on a loopback connection (up to a second or two if the host's loopback is
+// broken), and an event-loop thread must not.
+func Start() {
+	started.Do(func() {
+		fn := probeFn
+		probing.Add(1)
+		go func() {
+			defer probing.Done()
+			if fn() {
+				filled.Store(true)
+			}
+		}()
+	})
+}
+
+// Filled reports whether this host's TCP stack is known to fill bytes_acked, so
+// that a count of 0 means "the peer has acknowledged nothing". It never blocks:
+// until the probe has said yes (or any socket has reported a count above 0) the
+// answer is false, which the idle clock reads as "no count, extend the period",
+// the behaviour before the cap. A probe that cannot run, or never completes,
+// leaves it false for good (fail-open).
 func Filled() bool {
 	if filled.Load() {
 		return true
 	}
-	once.Do(func() {
-		if probeFn() {
-			filled.Store(true)
-		}
-	})
+	Start()
 	return filled.Load()
 }
 
