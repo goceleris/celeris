@@ -157,13 +157,9 @@ func abortAdaptive791(t *testing.T, adopted bool, inject func(*Engine)) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	for dl := time.Now().Add(3 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		t.Fatal("adaptive engine never bound")
-	}
+	ended := make(chan struct{})
+	go func() { done <- e.Listen(ctx); close(ended) }()
+	awaitBoundOrFail890(t, e, cancel, done, ended)
 	if inject != nil {
 		inject(e)
 	}
