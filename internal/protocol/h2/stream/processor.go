@@ -271,6 +271,9 @@ type Processor struct {
 	// Allocated on the first expiry. tombDL is the earliest of those instants.
 	expiredReq map[uint32]int64
 	tombDL     atomic.Int64
+	// hdrTimeout and hdrDL are the header-block deadline (SetHeaderBlockTimeout).
+	hdrTimeout time.Duration
+	hdrDL      atomic.Int64
 
 	// OnHandlerGoexit, when set, is told that a stream's handler ended its
 	// goroutine with runtime.Goexit (celeris#889): the stream's id and the
@@ -1913,6 +1916,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		p.continuationState = cs
 		p.continuationActive.Store(true)
 		p.continuationStateMu.Unlock()
+		p.armHeaderBlock()
 		return nil
 	}
 
@@ -2428,6 +2432,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	if len(p.continuationState.headerBlock)+len(f.HeaderBlockFragment()) > p.headerListMax*headerBlockExpansion {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
+		p.disarmHeaderBlock()
 		return nil, p.headerBlockTooLarge(f.StreamID)
 	}
 
@@ -2436,6 +2441,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	if p.continuationState.continuations++; p.continuationState.continuations > maxContinuationFrames {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
+		p.disarmHeaderBlock()
 		return nil, p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("too many CONTINUATION frames"),
 			fmt.Errorf("header block on stream %d has more than %d CONTINUATION frames", f.StreamID, maxContinuationFrames))
 	}
@@ -2451,6 +2457,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	cs := p.continuationState
 	p.continuationState = nil
 	p.continuationActive.Store(false)
+	p.disarmHeaderBlock()
 	return cs, nil
 }
 

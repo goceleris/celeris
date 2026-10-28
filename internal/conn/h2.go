@@ -74,6 +74,10 @@ type H2Config struct {
 	// answered 408 and reset with RST_STREAM(NO_ERROR) (celeris#889). Absolute,
 	// as net/http's. 0 = no deadline.
 	ReadTimeout time.Duration
+	// ReadHeaderTimeout is the deadline of a header block: one that does not end
+	// with its first HEADERS frame and is not complete this long after it ends the
+	// connection with GOAWAY(ENHANCE_YOUR_CALM) (celeris#889). 0 = no deadline.
+	ReadHeaderTimeout time.Duration
 	// Logger, when set, receives an Error record for each panic that escapes
 	// an HTTP/2 stream's handler (the celeris router answers a handler's
 	// panic with a 500 first, so this is a panic out of the router itself or
@@ -595,6 +599,7 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	proc.SetOutboundSink(s.adapter.sendDataFromLoop)
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
 	proc.GetManager().SetRequestTimeout(cfg.ReadTimeout)
+	proc.SetHeaderBlockTimeout(cfg.ReadHeaderTimeout)
 	if lg := cfg.Logger; lg != nil {
 		proc.OnHandlerPanic = func(id uint32, r any, stack []byte) {
 			lg.Error("h2 handler panicked",
@@ -1017,6 +1022,9 @@ type SweepResult struct {
 	Wrote bool
 	// Expired is how many requests were answered 408 and reset.
 	Expired int
+	// CloseAfterFlush: a GOAWAY ended the connection (a header block that was not
+	// completed in time); the engine closes it once what was written has gone out.
+	CloseAfterFlush bool
 }
 
 // Sweep is the engines' per-connection look at the deadlines of the HTTP/2
@@ -1030,12 +1038,14 @@ type SweepResult struct {
 //   - a request whose deadline passed is answered 408 and reset with
 //     RST_STREAM(NO_ERROR); the stream is remembered until its client ends it
 //     (the tombstone: its DATA in flight is ignored and credited, never a
-//     connection error).
+//     connection error);
+//   - a header block that was not completed in time: GOAWAY(ENHANCE_YOUR_CALM)
+//     and CloseAfterFlush.
 func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 	m := s.processor.GetManager()
 	p := s.processor
-	dl, td := m.NextRequestDeadline(), p.NextTombstoneDeadline()
-	if (dl == 0 || now < dl) && (td == 0 || now < td) {
+	dl, hd, td := m.NextRequestDeadline(), p.NextHeaderBlockDeadline(), p.NextTombstoneDeadline()
+	if (dl == 0 || now < dl) && (hd == 0 || now < hd) && (td == 0 || now < td) {
 		return res
 	}
 	if !s.mu.TryLock() {
@@ -1052,7 +1062,11 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 	if td != 0 && now >= td {
 		p.DropTombstones(now)
 	}
-	if res.Expired > 0 {
+	if hd != 0 && now >= hd {
+		p.ExpireHeaderBlock()
+		res.CloseAfterFlush = true
+	}
+	if res.Expired > 0 || res.CloseAfterFlush {
 		flushOutBuf(&s.outBuf, write)
 		s.DrainWriteQueue(write)
 		res.Wrote = true

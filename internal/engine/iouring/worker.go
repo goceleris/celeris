@@ -1361,6 +1361,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 			WriteTimeout:         cfg.WriteTimeout,
 			ReadTimeout:          cfg.ReadTimeout,
+			ReadHeaderTimeout:    cfg.ReadHeaderTimeout,
 			Logger:               cfg.Logger,
 		},
 		sockOpts: sockopts.Options{
@@ -6520,8 +6521,16 @@ func (w *Worker) sweepH2Deadlines(now int64) {
 			// kept for: do not keep the conn another timeout for them (A3).
 			cs.h2OwedAt = 0
 		}
-		if res.Wrote && w.flushSend(cs) {
-			w.markDirty(cs)
+		switch {
+		case res.CloseAfterFlush:
+			if w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+			w.closeConn(cs.fd) // sends what was staged first
+		case res.Wrote:
+			if w.flushSend(cs) {
+				w.markDirty(cs)
+			}
 		}
 	}
 }

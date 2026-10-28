@@ -419,6 +419,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 			WriteTimeout:         cfg.WriteTimeout,
 			ReadTimeout:          cfg.ReadTimeout,
+			ReadHeaderTimeout:    cfg.ReadHeaderTimeout,
 			Logger:               cfg.Logger,
 		},
 		async: cfg.AsyncHandlers,
@@ -4815,7 +4816,10 @@ func (l *Loop) sweepH2Deadlines(now int64) {
 			// kept for: do not keep the conn another timeout for them (A3).
 			cs.clearH2Owed()
 		}
-		if res.Wrote {
+		switch {
+		case res.CloseAfterFlush:
+			l.closeWhenFlushed(cs)
+		case res.Wrote:
 			// Sent now, not left to the dirty pass: the scan below may close a
 			// silent conn in this very sweep, and a close does not wait for
 			// what is still in the write buffer.

@@ -1,6 +1,8 @@
 package stream
 
 import (
+	"time"
+
 	"golang.org/x/net/http2"
 )
 
@@ -9,8 +11,11 @@ import (
 // A request that is not whole ReadTimeout after its HEADERS is answered 408 and
 // reset with RST_STREAM(NO_ERROR), the connection and its other streams go on
 // (net/http's model: RFC 9113 section 8.1 lets a server answer before the
-// request is whole and then reset the stream with NO_ERROR). It is armed on the
-// loop thread under H2State.mu; the engines' sweep expires it (conn.H2State.Sweep).
+// request is whole and then reset the stream with NO_ERROR). A header block
+// that is not complete ReadHeaderTimeout after its first HEADERS frame ends the
+// connection with GOAWAY(ENHANCE_YOUR_CALM): HPACK state is the connection's, so
+// a half-read block cannot be skipped. Both are armed on the loop thread under
+// H2State.mu; the engines' sweep expires them (conn.H2State.Sweep).
 
 // requestTombstoneFactor is how long, in request timeouts, the server remembers
 // a request it expired when the client does not finish it: until the client's
@@ -122,4 +127,38 @@ func (p *Processor) DropTombstones(now int64) {
 		}
 	}
 	p.tombDL.Store(next)
+}
+
+// SetHeaderBlockTimeout sets the deadline of a header block (the server's
+// ReadHeaderTimeout): ReadHeaderTimeout after the first HEADERS frame of a block
+// that does not end with it, the connection ends with GOAWAY(ENHANCE_YOUR_CALM).
+// 0 turns it off. Set once, before the first frame.
+func (p *Processor) SetHeaderBlockTimeout(d time.Duration) { p.hdrTimeout = d }
+
+// armHeaderBlock starts the deadline of the header block that has just begun
+// (a HEADERS frame without END_HEADERS).
+func (p *Processor) armHeaderBlock() {
+	if p.hdrTimeout > 0 {
+		p.hdrDL.Store(time.Now().UnixNano() + int64(p.hdrTimeout))
+	}
+}
+
+// disarmHeaderBlock ends it: the block is complete, or the connection is over.
+func (p *Processor) disarmHeaderBlock() {
+	if p.hdrDL.Load() != 0 {
+		p.hdrDL.Store(0)
+	}
+}
+
+// NextHeaderBlockDeadline is the instant the pending header block runs out of
+// time, or 0 if none is pending. An atomic load for the sweep.
+func (p *Processor) NextHeaderBlockDeadline() int64 { return p.hdrDL.Load() }
+
+// ExpireHeaderBlock ends the connection whose header block was not completed in
+// time: GOAWAY(ENHANCE_YOUR_CALM), naming the last stream the server opened. The
+// caller closes the connection once the GOAWAY is out. It is not PROTOCOL_ERROR:
+// the peer's frames so far were well formed, it was slow.
+func (p *Processor) ExpireHeaderBlock() {
+	p.disarmHeaderBlock()
+	_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("header block not completed in time"))
 }

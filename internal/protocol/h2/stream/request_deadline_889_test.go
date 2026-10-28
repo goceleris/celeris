@@ -226,3 +226,37 @@ func TestServerOwesIgnoresAnOpenRequestWhenItHasADeadline889(t *testing.T) {
 	m.outboundHeld.Add(1)
 	owes889(t, m, false, "with a response waiting for the client's window")
 }
+
+func TestHeaderBlockDeadline889(t *testing.T) {
+	p, _, rw := deadlineProc889(t, 0)
+	p.SetHeaderBlockTimeout(time.Second)
+	ctx := context.Background()
+	block := encodeHeaders(t, [][2]string{{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"}})
+	if err := p.ProcessFrame(ctx, makeHeadersFrame(t, 1, true, false, block[:3])); err != nil { // no END_HEADERS
+		t.Fatal(err)
+	}
+	dl := p.NextHeaderBlockDeadline()
+	if dl == 0 || dl < time.Now().UnixNano() {
+		t.Fatalf("header block deadline %d, want one in the future", dl)
+	}
+	var buf []byte
+	_ = buf
+	p.ExpireHeaderBlock()
+	rw.mu.Lock()
+	ga := append([]goAwayRecord(nil), rw.goAwaysSent...)
+	rw.mu.Unlock()
+	if len(ga) != 1 || ga[0].code != http2.ErrCodeEnhanceYourCalm {
+		t.Fatalf("GOAWAYs %+v, want one ENHANCE_YOUR_CALM", ga)
+	}
+	if p.NextHeaderBlockDeadline() != 0 {
+		t.Fatal("the deadline is still armed after it expired")
+	}
+	// Off by default.
+	q, _, _ := deadlineProc889(t, 0)
+	if err := q.ProcessFrame(ctx, makeHeadersFrame(t, 1, true, false, block[:3])); err != nil {
+		t.Fatal(err)
+	}
+	if q.NextHeaderBlockDeadline() != 0 {
+		t.Fatal("a header block armed a deadline with no ReadHeaderTimeout")
+	}
+}
