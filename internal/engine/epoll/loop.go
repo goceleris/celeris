@@ -31,6 +31,7 @@ import (
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 	"github.com/goceleris/celeris/internal/sockopts"
+	"github.com/goceleris/celeris/internal/tcpack"
 	"github.com/goceleris/celeris/internal/wakefd"
 )
 
@@ -4864,7 +4865,7 @@ func (l *Loop) sweepH2Deadlines(now int64) {
 				// that pings faster than its round trip), the conn is closed
 				// below, with the GOAWAY.
 				acked, err := l.bytesAcked(cs.fd)
-				if cs.h2State.ExtendIdle(now, acked, err == nil && acked > 0) {
+				if cs.h2State.ExtendIdle(now, acked, tcpack.Usable(acked, err)) {
 					break
 				}
 			}

@@ -408,6 +408,22 @@ func TestSweepExtendIdleNeedsProgress889(t *testing.T) {
 			t.Fatal("refused with more acknowledged than the server wrote")
 		}
 	})
+	t.Run("a-zero-count-is-a-count", func(t *testing.T) {
+		// A peer that never acknowledges data (its own TCP stack): the first
+		// extension is given, every one after it is refused. A baseline marker that
+		// is itself 0 would read the second 0 as 0 - 1, a wrapped 4 GiB of progress.
+		r, now := newConn()
+		now += step
+		r.st.Sweep(now, r.write)
+		if !r.st.ExtendIdle(now, 0, true) {
+			t.Fatal("the first extension has no baseline and is given, whatever the count")
+		}
+		now += step
+		r.st.Sweep(now, r.write)
+		if r.st.ExtendIdle(now, 0, true) {
+			t.Fatal("extended again with 0 bytes acknowledged: a peer that never acknowledges holds the conn")
+		}
+	})
 	t.Run("no-count-extends", func(t *testing.T) {
 		r, now := newConn()
 		for i := range 4 {
@@ -421,14 +437,14 @@ func TestSweepExtendIdleNeedsProgress889(t *testing.T) {
 	t.Run("activity-clears-the-baseline", func(t *testing.T) {
 		r, t0 := newConn()
 		r.st.Sweep(t0+step, r.write)
-		if !r.st.ExtendIdle(t0+step, 1000, true) || r.st.d0Acked == 0 {
+		if !r.st.ExtendIdle(t0+step, 1000, true) || !r.st.d0Has {
 			t.Fatal("setup")
 		}
 		r.frames(func(fr *http2.Framer) {
 			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r.block("POST", "/u"), EndHeaders: true})
 		})
 		r.st.Sweep(t0+2*step, r.write)
-		if r.st.d0Acked != 0 {
+		if r.st.d0Has {
 			t.Fatalf("stream activity left the baseline at %d", r.st.d0Acked)
 		}
 	})
@@ -481,16 +497,18 @@ func TestSweepFramesOnAResetStreamAreNotActivity889(t *testing.T) {
 	})
 }
 
-// TestH2StateStaysInItsSizeClass889: an H2State is one allocation of exactly
-// 640 bytes, the edge of a malloc size class; one byte more is 704, 10% more memory
-// for every h2 connection. The sweep's fields (celeris#889) were packed to stay
-// in it; the words the sweep's look at a conn with nothing due reads are the
-// first 40 bytes.
+// TestH2StateStaysInItsSizeClass889: an H2State is one allocation. On Go 1.27 an
+// object with pointers over 512 bytes carries an 8-byte malloc header, so it costs
+// sizeof + 8 rounded up to a malloc size class: 704 for the 640 it is (main's 560
+// costs 576). The pin is the edge of that class, sizeof + 8 <= 704: a field that
+// takes it past 696 moves every h2 connection to the 768 class. (An earlier
+// version of this test said the edge was 640, which forgot the header; measured
+// by the review of celeris#1150, r6 F8.)
 func TestH2StateStaysInItsSizeClass889(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		t.Skip("the size class is a 64-bit one")
 	}
-	if got := unsafe.Sizeof(H2State{}); got > 640 {
-		t.Errorf("sizeof(H2State) = %d, want at most 640 (the malloc size class it was in)", got)
+	if got := unsafe.Sizeof(H2State{}) + 8; got > 704 {
+		t.Errorf("sizeof(H2State) + the 8-byte malloc header = %d, want at most 704 (its size class)", got)
 	}
 }

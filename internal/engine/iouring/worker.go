@@ -32,6 +32,7 @@ import (
 	"github.com/goceleris/celeris/internal/recvtheft"
 	"github.com/goceleris/celeris/internal/resource"
 	"github.com/goceleris/celeris/internal/sockopts"
+	"github.com/goceleris/celeris/internal/tcpack"
 	"github.com/goceleris/celeris/internal/wakefd"
 	"github.com/goceleris/celeris/internal/zcwindow"
 	"github.com/goceleris/celeris/validation"
@@ -6524,17 +6525,18 @@ func (cs *connState) holdsOutput() bool {
 }
 
 // ackedNow is the bytes the peer of cs has acknowledged (tcp_info bytes_acked,
-// which only grows), and whether it could be read: a fixed-file conn, a failed
-// getsockopt and a count of 0 (a stack that does not fill the field) are not.
+// which only grows), and whether that is a count the idle clock may judge on: a
+// fixed-file conn (development only) and a failed getsockopt are not, and a 0 is
+// one only on a stack that fills the field (tcpack.Usable).
 func (cs *connState) ackedNow() (uint64, bool) {
 	if cs.fixedFile {
 		return 0, false
 	}
 	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
-	if err != nil || ti.Bytes_acked == 0 {
+	if err != nil {
 		return 0, false
 	}
-	return ti.Bytes_acked, true
+	return ti.Bytes_acked, tcpack.Usable(ti.Bytes_acked, nil)
 }
 
 // sweepH2Deadlines runs the per-stream deadlines of the HTTP/2 conns
@@ -7709,21 +7711,26 @@ func (w *Worker) closeStalled(fd int, cs *connState, now int64) {
 }
 
 // closeRefused is the close of an h2 conn the idle clock gave up on because its
-// output did not go out (ExtendIdle refused: the peer acknowledged nothing for
-// an idle period). Its SEND in flight is one the peer is not taking, and
-// closeConn defers the descriptor behind it for a drain bound, up to
-// WriteTimeout, on top of the two idle periods the conn has had. The drain's
-// clock is set back past the bound, as closeStalled does, and the sweep's
-// liveConns pass reaps it at once (the GOAWAY staged behind the SEND is lost with
-// it, which it would have been anyway: nothing behind that SEND reaches a peer
-// that takes nothing). The first sample of the peer's acknowledged bytes
-// (noteClosingAcked reads a conn it has not sampled as progressing) is taken
-// here, as the baseline, so that it is not the sweep's first, which would give
-// the conn the bound again.
+// output did not go out (ExtendIdle refused: the peer acknowledged no more than
+// the control frames the server sent it, a client that stopped reading or one that
+// pings faster than its round trip). Its SEND in flight, if any, is one the peer
+// may not be taking, and closeConn defers the descriptor behind it for a drain
+// bound, up to WriteTimeout, on top of the idle periods the conn has had. The
+// drain's clock is set back so that the bound runs out at the next sweep, as
+// closeStalled does for a stalled detached conn, and not in this one: the GOAWAY
+// staged behind the SEND is an SQE the loop submits before the next sweep, and a
+// peer whose window is open (the pinger) gets its GOAWAY(NO_ERROR); a peer that
+// takes nothing (zero window) has the GOAWAY behind a SEND that never completes
+// and is reaped one sweep later, not after the drain bound (review r6 F9: reaping
+// in the same pass shut the socket before the SQE was submitted, and the pinger
+// got a bare EOF where epoll delivers the GOAWAY). Submitting the ring before the
+// reap would not do: on an SQPOLL tier a submit only wakes the poller. The first
+// sample of the peer's acknowledged bytes (noteClosingAcked reads a conn it has
+// not sampled as progressing) is taken here, as the baseline, so that it is not
+// the sweep's first, which would give the conn the bound again.
 //
 // Only for the refused conn: the idle close of a conn with nothing to send but its
-// GOAWAY must give that SEND its drain, or the reap of the same pass shuts the
-// socket before the SEND is submitted (review r5 F1). Worker thread.
+// GOAWAY must give that SEND its drain (review r5 F1). Worker thread.
 func (w *Worker) closeRefused(fd int, cs *connState, now int64) {
 	w.closeConn(fd)
 	if w.conns[fd] != cs || !cs.closing {
@@ -7732,7 +7739,7 @@ func (w *Worker) closeRefused(fd int, cs *connState, now int64) {
 	if !cs.fixedFile && !cs.closeAckedKnown {
 		w.noteClosingAcked(cs, now)
 	}
-	cs.lastActivity = now - w.closingDrainBound() - 1
+	cs.lastActivity = now - w.closingDrainBound() + 1 // out of bound at the next sweep, not this one
 }
 
 // sweepWatchDue reports whether the loop owes a timeout sweep outside its

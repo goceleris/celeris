@@ -528,8 +528,8 @@ type H2State struct {
 	// rest is the loop thread's, from the sweep. d0Last is the last client stream
 	// ID the sweep saw, d0At when it last saw stream activity, d0Check when it last
 	// looked. d0Acked is the low 32 bits of the bytes the peer had acknowledged
-	// when the idle clock last extended its period (ExtendIdle), 0 when it has not
-	// since the last stream activity; ctlOut is the bytes this state has written
+	// when the idle clock last extended its period (ExtendIdle), valid when d0Has
+	// (cleared by stream activity); ctlOut is the bytes this state has written
 	// to the connection since then (flushOut).
 	hints   stream.DeadlineHints
 	d0Check int64
@@ -538,6 +538,7 @@ type H2State struct {
 	d0Last  uint32
 	d0Acked uint32
 	ctlOut  uint32
+	d0Has   bool // d0Acked is a baseline (an extension was given since the last stream activity)
 
 	initialized       bool
 	serverPrefaceSent bool // true if server SETTINGS already written (h2c upgrade path)
@@ -1117,7 +1118,7 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 		m := s.processor.GetManager()
 		switch last := m.GetLastClientStreamID(); {
 		case last != s.d0Last || m.CountActiveStreams() > 0 || s.processor.TakeIgnoredActivity():
-			s.d0Last, s.d0At, s.d0Acked = last, now, 0
+			s.d0Last, s.d0At, s.d0Has = last, now, false
 		case s.d0At == 0:
 			s.d0At = now
 		case now-s.d0At > s.idleNs:
@@ -1173,36 +1174,39 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 // is going out is not idle, so the idle period restarts at now, at once, and
 // ExtendIdle reports true; but only while it goes out: acked is the bytes the
 // peer has acknowledged so far (tcp_info bytes_acked, which only grows; ackedOK
-// false when the engine could not read it), and the next time the period runs out
-// ExtendIdle reports false, "close it", unless the peer acknowledged more since
-// the last extension than the control frames this state wrote to it in the
-// meantime. The control bytes are the floor because a client that does not read
-// and pings still has its PING answers acknowledged one by one at the pace of its
-// round trip, and that must not count as taking the response. A client that has
-// stopped reading (a closed window) acknowledges nothing, one that pings faster
-// than its round trip acknowledges about what it is sent, and neither is closed
-// later than a few periods; a reader that is slow but reading acknowledges its
-// bytes at every period and is never cut. The bytes held are not the measure: on
-// io_uring the SEND in flight and the kernel's queue hold the same bytes, and the
-// count went up while the client read (celeris#889, review r5). Any stream
-// activity clears the baseline.
+// false when the engine has no count it may judge on), and the next time the
+// period runs out ExtendIdle reports false, "close it", unless the peer
+// acknowledged more since the last extension than the control frames this state
+// wrote to it in the meantime. The control bytes are the floor because a client
+// that does not read and pings still has its PING answers acknowledged one by one
+// at the pace of its round trip, and that must not count as taking the response.
+// A client that has stopped reading (a closed window) acknowledges nothing, one
+// that pings faster than its round trip acknowledges about what it is sent, and
+// neither is closed later than a few periods; a reader that is slow but reading
+// acknowledges its bytes at every period and is never cut. The bytes held are not
+// the measure: on io_uring the SEND in flight and the kernel's queue hold the same
+// bytes, and the count went up while the client read (celeris#889, review r5).
+// Any stream activity clears the baseline.
 //
-// Without a count (ackedOK false: the ioctl or getsockopt failed, a stack that
-// does not fill bytes_acked) the period is extended, as before the cap: a conn
-// whose progress cannot be seen is not closed for it, which is the failure the
-// cap's first version was fixed for, and the stacks that cannot answer are the
-// ones where closing would cut a reader. Such a conn is bounded by the conn's own
-// clock only, as #1119's rule is by the flush clock. Loop thread, from the sweep.
+// A count of 0 is a count: the peer has acknowledged nothing, which is what a
+// peer that never acknowledges data, or advertises a zero window from the start,
+// looks like (the first extension is given, and the second refused). It is
+// "no count" (ackedOK false, the period extended, as before the cap) only where
+// the engine cannot judge: the getsockopt failed, the conn is a fixed-file one
+// (development only), or the host's stack does not fill the field (internal/
+// tcpack: gVisor's, as far as is known; there the cap is off, as on main). A
+// conn that cannot be judged is bounded by the conn's own clock only, as #1119's
+// rule is by the flush clock. Loop thread, from the sweep.
 func (s *H2State) ExtendIdle(now int64, acked uint64, ackedOK bool) bool {
 	if !ackedOK {
-		s.d0At, s.d0Acked, s.ctlOut = now, 0, 0
+		s.d0At, s.d0Has, s.ctlOut = now, false, 0
 		return true
 	}
 	a := uint32(acked)
-	if s.d0Acked != 0 && a-s.d0Acked <= s.ctlOut {
+	if s.d0Has && a-s.d0Acked <= s.ctlOut {
 		return false
 	}
-	s.d0Acked, s.d0At, s.ctlOut = max(a, 1), now, 0 // 0 means "no baseline"
+	s.d0Acked, s.d0Has, s.d0At, s.ctlOut = a, true, now, 0
 	return true
 }
 
