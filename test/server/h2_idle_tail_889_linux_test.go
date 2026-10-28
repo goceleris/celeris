@@ -3,7 +3,10 @@
 package celeris_test
 
 import (
+	"errors"
 	"net"
+	"os"
+	"os/exec"
 	"strconv"
 	"testing"
 	"time"
@@ -14,7 +17,7 @@ import (
 )
 
 // The idle clock of an h2 conn with no stream open must not run while the conn
-// still has a response to send (celeris#889, found by the review of the first
+// still has a response that is going out (celeris#889, found by the review of the first
 // version of D0). The stream of a response is gone from the manager as soon as
 // its last DATA is in the conn's buffers, which for a client with a wide window
 // (Go's Transport grants 4 MiB per stream) is the whole tail of a large body:
@@ -70,8 +73,10 @@ func (e errReset889) Error() string { return "RST_STREAM " + http2.ErrCode(e).St
 
 // TestH2IdleClockDoesNotCutAFinishedResponseOfAPingingClient889: a GET of 8 MiB
 // with wide windows, the client sends a PING every 300 ms, reads nothing for
-// 2.5 s (IdleTimeout is 1 s) and then reads: the body arrives whole. On main the
-// PINGs restamped the conn's clock and it did.
+// 1.5 s (IdleTimeout is 1 s: one idle period, which the output pending
+// extends; a client that reads nothing for a second period is the next cell's)
+// and then reads: the body arrives whole. On main the PINGs restamped the
+// conn's clock and it did.
 func TestH2IdleClockDoesNotCutAFinishedResponseOfAPingingClient889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		t.Run(e.name, func(t *testing.T) {
@@ -87,7 +92,7 @@ func TestH2IdleClockDoesNotCutAFinishedResponseOfAPingingClient889(t *testing.T)
 			c.request(1, "GET", "/tail889?n="+strconv.Itoa(total), true, true)
 			stop := c.pingEvery889(300 * time.Millisecond)
 			defer stop()
-			time.Sleep(2500 * time.Millisecond)
+			time.Sleep(1500 * time.Millisecond)
 			got, err := c.takeAll889(total, nil)
 			t.Logf("TAIL889 ping engine=%s: %d of %d bytes, err %v, at %v", e.name, got, total, err, time.Since(c.t0).Round(time.Millisecond))
 			if err != nil || got != total {
@@ -122,6 +127,99 @@ func TestH2IdleClockDoesNotCutASlowReader889(t *testing.T) {
 			t.Logf("TAIL889 wu engine=%s: %d of %d bytes, err %v, at %v", e.name, got, total, err, time.Since(c.t0).Round(time.Millisecond))
 			if err != nil || got != total {
 				t.Fatalf("the download of a slow reader was cut after %d of %d bytes: %v", got, total, err)
+			}
+		})
+	}
+}
+
+// TestH2IdleClockClosesAConnWhoseClientStopsReadingButPings889: a GET of 16 MiB
+// (more than the kernel holds for a client that does not read), wide windows,
+// the client reads nothing and sends a PING every 300 ms for 3.5 s, IdleTimeout
+// 1 s. The output pending extends the idle period once (the first cell above),
+// but not for ever: an extension is for output that is going out, and this
+// client's window is shut, the count of bytes still to send has not gone down
+// by the next idle expiry, and the conn is closed, within two idle periods
+// (GOAWAY(NO_ERROR) best effort, then the close; the tail may be dropped). On the
+// head that extends for as long as there is output, a client that never reads
+// and pings holds the conn (and the memory of the response) for as long as it
+// likes: it was still open and delivered the whole body after 60 s.
+func TestH2IdleClockClosesAConnWhoseClientStopsReadingButPings889(t *testing.T) {
+	for _, e := range nativeEngines889() {
+		t.Run(e.name, func(t *testing.T) {
+			t.Parallel()
+			c := dialH2raw889(t, tailServer889(t, e.eng), h2dial889{initialWindow: 1 << 30})
+			if tc, ok := c.conn.(*net.TCPConn); ok {
+				_ = tc.SetReadBuffer(4 << 10)
+			}
+			c.wmu.Lock()
+			_ = c.fr.WriteWindowUpdate(0, 1<<30)
+			c.wmu.Unlock()
+			const total = 16 << 20
+			c.request(1, "GET", "/tail889?n="+strconv.Itoa(total), true, true)
+			stop := c.pingEvery889(300 * time.Millisecond)
+			time.Sleep(3500 * time.Millisecond)
+			stop()
+			// Now read, for at most 6 s: a conn that was closed gives an error
+			// that is not a timeout (a reset, the end of the stream of bytes)
+			// soon; one that is still open gives bytes, or nothing, until the
+			// deadline.
+			got, closed := 0, false
+			_ = c.conn.SetReadDeadline(time.Now().Add(6 * time.Second))
+			for {
+				f, err := c.fr.ReadFrame()
+				if err != nil {
+					closed = !errors.Is(err, os.ErrDeadlineExceeded)
+					t.Logf("TAIL889 zero-window engine=%s: read %d of %d bytes, then %v (closed %v), at %v", e.name, got, total, err, closed, time.Since(c.t0).Round(time.Millisecond))
+					break
+				}
+				if d, ok := f.(*http2.DataFrame); ok {
+					got += len(d.Data())
+				}
+			}
+			if !closed {
+				t.Fatalf("a client that reads nothing for 3.5 s and pings still has its conn after %d of %d bytes: the idle clock holds a conn for output that is not going out", got, total)
+			}
+		})
+	}
+}
+
+// TestH2IdleClockBoundsAClientThatPingsFasterThanItsRTT889: a client that reads
+// everything, sends one small GET and then a PING every 200 ms, over a path with
+// a 300 ms round trip (netem 150 ms each way on lo: needs root and tc, so it runs
+// only with CELERIS_NETEM_TESTS=1, in a container with NET_ADMIN). The server's
+// PING ACKs are always in flight, unacknowledged bytes in the kernel's send
+// queue, and the count of bytes the conn holds (TIOCOUTQ) is never zero. A conn
+// that is not closed because of them never closes, as it did on the head that
+// extended the idle period for any output (held 10 s with IdleTimeout 1 s). The
+// count of bytes in flight goes up and down with the ACKs, never lower than the
+// last extension for long, and the conn is closed once it has not gone down by
+// the next expiry: at most one extension per ACK that can be in flight, here
+// 2 (300 ms RTT over 200 ms pings), so within 4 idle periods; the bound the cell
+// asserts is 6 s.
+func TestH2IdleClockBoundsAClientThatPingsFasterThanItsRTT889(t *testing.T) {
+	if os.Getenv("CELERIS_NETEM_TESTS") != "1" {
+		t.Skip("set CELERIS_NETEM_TESTS=1 (root, tc, NET_ADMIN)")
+	}
+	if out, err := exec.Command("tc", "qdisc", "replace", "dev", "lo", "root", "netem", "delay", "150ms").CombinedOutput(); err != nil {
+		t.Skipf("tc netem: %v: %s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("tc", "qdisc", "del", "dev", "lo", "root").Run() })
+	for _, e := range nativeEngines889() {
+		t.Run(e.name, func(t *testing.T) {
+			c := dialH2raw889(t, tailServer889(t, e.eng), h2dial889{})
+			c.request(1, "GET", "/tail889?n=100", true, true)
+			t0 := time.Now()
+			stop := c.pingEvery889(200 * time.Millisecond)
+			defer stop()
+			_ = c.conn.SetReadDeadline(t0.Add(6 * time.Second))
+			for {
+				if _, err := c.fr.ReadFrame(); err != nil {
+					if errors.Is(err, os.ErrDeadlineExceeded) {
+						t.Fatalf("engine=%s: still open 6 s after the request, a client that pings faster than its RTT holds the conn", e.name)
+					}
+					t.Logf("TAIL889 ack-lag engine=%s: closed after %v: %v", e.name, time.Since(t0).Round(time.Millisecond), err)
+					return
+				}
 			}
 		})
 	}
