@@ -90,6 +90,19 @@ func TestClusterPubSubCloseLeavesNoConnBehind887(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The table must hold the three nodes before anything else is asked of
+		// it (a CLUSTER SLOTS reply that is not one empties it, and the first
+		// symptom is an SSubscribe that finds no node: seen once, on Windows).
+		cc.mu.RLock()
+		var table []string
+		for addr := range cc.nodes {
+			table = append(table, addr)
+		}
+		cc.mu.RUnlock()
+		if len(table) != 3 {
+			t.Fatalf("iteration %d: after NewClusterClient the client's node table is %v, want the three nodes %v (CLUSTER SLOTS replies given: %d)",
+				i, table, cl.addrs(), cl.slotsReplies.Load())
+		}
 		const ch = "foo"
 		slot := int(Slot(ch))
 		to := cl.nodes[0]
