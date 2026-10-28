@@ -147,6 +147,30 @@ func (r *pubsubRouter) clear() {
 	r.mu.Unlock()
 }
 
+// shardUnsubscribed reports a "sunsubscribe" push for ch to the PubSub: it is
+// either the ack of the PubSub's own SUnsubscribe or the server telling the
+// client that it no longer serves the channel's slot (celeris#887 item 31).
+func (r *pubsubRouter) shardUnsubscribed(ch string) {
+	r.mu.Lock()
+	t := r.target
+	r.mu.Unlock()
+	if t != nil {
+		t.onShardUnsubscribed(ch)
+	}
+}
+
+// controlError reports an error reply that arrived in pubsub mode, where no
+// command waits for a reply (the control writes are not tracked): a -MOVED to
+// an SSUBSCRIBE, say (celeris#887 item 31).
+func (r *pubsubRouter) controlError(msg string) {
+	r.mu.Lock()
+	t := r.target
+	r.mu.Unlock()
+	if t != nil {
+		t.onControlError(msg)
+	}
+}
+
 //nolint:unparam // bool return kept for test introspection and backpressure
 func (r *pubsubRouter) deliver(m *Message) bool {
 	r.mu.Lock()
@@ -295,7 +319,18 @@ func (s *redisState) dispatch(v protocol.Value) error {
 		head := s.bridge.Pop()
 		if head == nil {
 			if s.currentMode() == modePubSub {
+				// Nothing waits for a reply here (the control writes are not
+				// tracked), so an error reply is dropped, except that a
+				// cluster PubSub learns from it that its subscription did not
+				// take (a -MOVED to an SSUBSCRIBE).
+				var emsg string
+				if v.Type == protocol.TyError || v.Type == protocol.TyBlobErr {
+					emsg = string(v.Str)
+				}
 				s.reader.Release(v)
+				if emsg != "" {
+					s.router.controlError(emsg)
+				}
 				return nil
 			}
 			s.reader.Release(v)
@@ -652,8 +687,12 @@ func (s *redisState) routePush(v protocol.Value) {
 			payload := string(v.Array[2].Str)
 			s.router.deliver(&Message{Channel: ch, Payload: payload, Shard: true})
 		}
+	case "sunsubscribe":
+		// The ack of a SUnsubscribe, or the server dropping a shard channel
+		// whose slot moved to another node: the PubSub tells them apart.
+		s.router.shardUnsubscribed(string(v.Array[1].Str))
 	case "subscribe", "unsubscribe", "psubscribe", "punsubscribe",
-		"ssubscribe", "sunsubscribe":
+		"ssubscribe":
 		// Control acks — drop silently; PubSub tracks subs independently.
 	}
 }
