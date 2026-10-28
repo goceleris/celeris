@@ -51,10 +51,14 @@ import (
 // (its client gets a FIN and reconnects), whatever kind of route it is on. A
 // conn a dispatch goroutine owns (asyncPromoted: on a server with any Async
 // route every conn whose read leaves a partial request is promoted, whatever its
-// route, and a conn on an Async route is) is otherwise left to the end of the
-// wait, with a request in progress on it unread: the documented behaviour and
-// a follow-up (io_uring's gate, shutdown_gate_884.go, looks inside such a conn
-// under the goroutine's own locks and closes it when idle).
+// route, and a conn on an Async route is) is looked at under the goroutine's own
+// locks, as io_uring's gate does (shutdown_gate_884.go; celeris#1165, #1166):
+// closed when idle, read on and answered when a request is in progress on it.
+//
+// A loop with no HTTP/2 conn runs the same gate for as long as an HTTP/1
+// request is in progress on it (poolWaitSettled), and closes its idle conns at
+// the start of shutdown (celeris#1104), so the gate's behaviour does not depend
+// on whether the server has an HTTP/2 client.
 
 // poolWaitGrace is how long into the wait for the HTTP/2 pool handlers the
 // gate stays open: io_uring's shutdownSendDrainNanos, and this engine's
