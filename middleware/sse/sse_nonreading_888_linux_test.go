@@ -101,6 +101,11 @@ type producer888 struct {
 	fastFor      time.Duration
 	trickleBytes int
 	trickleEvery time.Duration
+	// flood is how many trickle events are sent back to back when the settle
+	// ends, before the trickle: the 4-slot queue cannot take them all, which is
+	// what a drain goroutine that was not scheduled for a few milliseconds
+	// (a starved runner under -race and coverage) does to the producer's pace.
+	flood int
 
 	// writeTimeout is the server's WriteTimeout (nonReadWriteTimeout888 when
 	// zero). noHeaderTimer sets ReadHeaderTimeout -1, which takes away the
@@ -208,6 +213,11 @@ func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, d
 				return
 			case <-time.After(p.settle):
 			}
+			for range p.flood {
+				if err := client.Send(sse.Event{Event: "tick", Data: trickle}); err != nil {
+					return
+				}
+			}
 			tick := time.NewTicker(p.trickleEvery)
 			defer tick.Stop()
 			for {
@@ -292,6 +302,11 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 		// The burst fills the socket and queues the rest in the engine; then
 		// a trickle of 1 KB every 5 ms.
 		{"steady", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond}},
+		// The same, with 50 events sent back to back where the trickle starts: a
+		// full queue before WriteTimeout (a drain goroutine that was not
+		// scheduled for a few ms does that to the 5 ms trickle too: celeris#1104)
+		// must not end the stream.
+		{"steady-flood", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond, flood: 50}},
 		// The same, then one event every 300 ms: a sweep must still reach the
 		// conn when almost nothing wakes the worker.
 		{"sparse", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 300 * time.Millisecond}},
