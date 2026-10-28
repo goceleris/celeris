@@ -3,6 +3,7 @@
 package sse_test
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -39,6 +40,11 @@ const nonReadWriteTimeout888 = time.Second
 type disconnect888 struct {
 	at    time.Time
 	early int64
+	// slowClose is when OnSlowClient answered ClientPolicyClose for the first
+	// time (zero: it never did), and started when the handler began: a stream
+	// ended by a full queue is not one ended by the stall bound.
+	slowClose time.Time
+	started   time.Time
 }
 
 // nonReadCell888 is one engine configuration of the matrix.
@@ -149,7 +155,7 @@ func burstFor888(tb testing.TB) int {
 func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, disconnected <-chan disconnect888, shutdown func()) {
 	tb.Helper()
 	done := make(chan disconnect888, 1)
-	var started, early atomic.Int64 // handler start (unix nanos), events dropped by dropEarly
+	var started, early, slowClose atomic.Int64 // handler start (unix nanos), events dropped by dropEarly, first ClientPolicyClose (unix nanos)
 	wt := p.wt()
 	var burst string
 	if p.fastFor == 0 {
@@ -164,11 +170,16 @@ func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, d
 				early.Add(1)
 				return sse.ClientPolicyDrop
 			}
+			slowClose.CompareAndSwap(0, time.Now().UnixNano())
 			return sse.ClientPolicyClose
 		},
 		OnDisconnect: func(*celeris.Context, *sse.Client) {
+			d := disconnect888{at: time.Now(), early: early.Load(), started: time.Unix(0, started.Load())}
+			if n := slowClose.Load(); n != 0 {
+				d.slowClose = time.Unix(0, n)
+			}
 			select {
-			case done <- disconnect888{time.Now(), early.Load()}:
+			case done <- d:
 			default:
 			}
 		},
@@ -312,7 +323,11 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 					// queue behind it is full (ClientPolicyClose), earlier than
 					// WriteTimeout: the lower bound is for the native engines.
 					if cell.engine != celeris.Std && el < wt {
-						t.Errorf("OnDisconnect ran %v after connect, before WriteTimeout %v: the stream was ended by something other than the stall bound", el, wt)
+						why := "OnSlowClient never answered ClientPolicyClose"
+						if !d.slowClose.IsZero() {
+							why = fmt.Sprintf("OnSlowClient answered ClientPolicyClose %v after the handler began (a full queue)", d.slowClose.Sub(d.started).Round(time.Millisecond))
+						}
+						t.Errorf("OnDisconnect ran %v after connect, before WriteTimeout %v: the stream was ended by something other than the stall bound (%s)", el, wt, why)
 					}
 				case <-time.After(wt + slack):
 					t.Fatalf("OnDisconnect never ran %v after connect (WriteTimeout %v): a client that reads nothing holds its stream for ever (celeris#888 item 38)",
