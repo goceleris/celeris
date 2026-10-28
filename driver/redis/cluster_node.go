@@ -18,34 +18,46 @@ type clusterNode struct {
 	latency atomic.Int64
 }
 
-// failFlag is clusterNode.failing: a flag that remembers whether the last
-// change came from a PubSub dial. Store, which the command path and the topology
-// refresh use, takes the node over: a later successful PubSub dial then leaves
-// the flag alone. markPubSub and clearPubSub are the PubSub path's.
+// failFlag is clusterNode.failing: a flag that also remembers whether it was last
+// set by a failed PubSub dial. One atomic word holds both bits, so every change
+// is one atomic operation and none can be lost to another:
+//
+//	0           healthy
+//	failingBit  failing, set by the command path or found by a topology refresh
+//	failingBit|byPubSubBit  failing, set by a failed PubSub dial
+//
+// Store, which the command path and the topology refresh use, takes the node
+// over: it replaces the word, so a later successful PubSub dial leaves it alone.
+// markPubSub replaces it with the PubSub's own verdict. clearPubSub clears the
+// flag only if the word is exactly the PubSub's own mark (one compare and
+// swap), so it never erases a mark that changed after it looked.
 type failFlag struct {
-	atomic.Bool
-	pubsub atomic.Bool
+	w atomic.Uint32
 }
+
+const (
+	failingBit  uint32 = 1
+	byPubSubBit uint32 = 2
+)
+
+// Load reports whether the node is marked failing.
+func (f *failFlag) Load() bool { return f.w.Load()&failingBit != 0 }
 
 // Store sets the flag as the command path or the topology refresh found it.
 func (f *failFlag) Store(v bool) {
-	f.pubsub.Store(false)
-	f.Bool.Store(v)
+	if v {
+		f.w.Store(failingBit)
+		return
+	}
+	f.w.Store(0)
 }
 
 // markPubSub sets the flag because a PubSub dial failed.
-func (f *failFlag) markPubSub() {
-	f.Bool.Store(true)
-	f.pubsub.Store(true)
-}
+func (f *failFlag) markPubSub() { f.w.Store(failingBit | byPubSubBit) }
 
-// clearPubSub clears the flag after a successful PubSub dial, but only if the
-// last thing that changed it was a failed PubSub dial.
-func (f *failFlag) clearPubSub() {
-	if f.pubsub.CompareAndSwap(true, false) {
-		f.Bool.Store(false)
-	}
-}
+// clearPubSub clears the flag after a successful PubSub dial, but only if a
+// failed PubSub dial set it and nothing has changed it since.
+func (f *failFlag) clearPubSub() { f.w.CompareAndSwap(failingBit|byPubSubBit, 0) }
 
 // Close tears down the node's client.
 func (n *clusterNode) Close() error {

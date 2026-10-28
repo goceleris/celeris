@@ -1019,9 +1019,10 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 // accepts it and delivers it, until the next reroute of any kind, whose replay
 // sends only the channels of the served slot and leaves it out; the move of that
 // slot does not reroute the PubSub. If the first channel is removed while a
-// channel of another node's slot remains, that channel is not subscribed
-// either. See [ClusterClient.Subscribe] for what the caller sees while it is
-// down and when the ClusterClient is closed.
+// channel of another node's slot remains, that channel is not subscribed until
+// the next reroute of any kind, whose replay serves the re-selected slot. See
+// [ClusterClient.Subscribe] for what the caller sees while it is down and when
+// the ClusterClient is closed.
 func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	if len(channels) == 0 {
 		return nil, errors.New("celeris-redis: SSubscribe requires at least one channel")
