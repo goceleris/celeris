@@ -765,13 +765,25 @@ func (s *SentinelClient) Publish(ctx context.Context, channel, message string) (
 
 // Subscribe is [Client.Subscribe] on the current master: it returns the
 // PubSub with a nil error when the conn is found down on the first SUBSCRIBE,
-// and the reconnect replays the channels.
+// and the reconnect replays the channels. The reconnect dials the master the
+// SentinelClient has at that moment, so after a failover the PubSub follows the
+// new master instead of retrying the old one, once its conn to the old master
+// has dropped (a conn that stays up, on a loop shared with another Client or
+// WithEngine, is not moved). When the SentinelClient is closed, a PubSub whose
+// conn is down (or goes down afterwards) gives up: Channel() is closed.
 func (s *SentinelClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	c, err := s.getClient()
 	if err != nil {
 		return nil, err
 	}
-	return c.Subscribe(ctx, channels...)
+	ps, err := c.newPubSubRouted(ctx, sentinelPubSubRoute{s})
+	if err != nil {
+		return nil, err
+	}
+	if len(channels) == 0 {
+		return ps, nil
+	}
+	return ps.firstControl(ps.Subscribe(ctx, channels...))
 }
 
 func (s *SentinelClient) Do(ctx context.Context, args ...any) (*Value, error) {

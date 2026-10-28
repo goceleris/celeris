@@ -490,6 +490,11 @@ func (c *ClusterClient) refreshLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			// closeCh wins a tie with the ticker: select picks at random
+			// when both are ready, and a refresh after Close dials nodes.
+			if c.closed.Load() {
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			_ = c.refreshTopology(ctx)
 			cancel()
@@ -956,16 +961,41 @@ func (c *ClusterClient) Publish(ctx context.Context, channel, message string) (i
 }
 
 // Subscribe opens a pub/sub connection on any cluster node and subscribes to
-// channels (SUBSCRIBE is cluster-wide). See [Client.Subscribe]: when the node is
-// found down on the first SUBSCRIBE the PubSub and a nil error are returned and
-// the reconnect retries that one node address.
+// channels (SUBSCRIBE is node-local, and the cluster delivers every PUBLISH to
+// every node). See [Client.Subscribe]: when the node is found down on the first
+// SUBSCRIBE the PubSub and a nil error are returned and the reconnect replays
+// the channels.
+//
+// The PubSub follows its subscription: when the node that holds it goes away,
+// it subscribes again on another node and keeps delivering to the same
+// [PubSub.Channel]. A message published while it switches is lost (a gap), and
+// the PubSub itself delivers from one conn at a time: it stops listening to the
+// old conn before the new one subscribes. The cluster, though, sends a PUBLISH
+// to every node over its bus asynchronously, so a message in flight around the
+// switch can in rare cases reach the old and the new node and be delivered
+// twice. While the
+// PubSub has no conn its control calls ([PubSub.Subscribe] and the others)
+// return [ErrPubSubConnDown]; nothing else is surfaced as long as a node can be
+// reached, and the PubSub retries with backoff, with no limit, until
+// [PubSub.Close]. When the ClusterClient is closed, a PubSub whose conn is down
+// (or goes down afterwards) gives up: its Channel() is closed and its control
+// calls return [ErrClosed]. A PubSub whose conn stays up after the close (the
+// event loop is shared with another Client, or WithEngine) keeps it until
+// [PubSub.Close].
 func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
-	// Regular SUBSCRIBE is cluster-wide: pick any node.
+	// Regular SUBSCRIBE is node-local: pick any node.
 	node := c.anyNode()
 	if node == nil {
 		return nil, errors.New("celeris-redis: no cluster nodes available")
 	}
-	return node.client.Subscribe(ctx, channels...)
+	ps, err := c.openPubSub(ctx, node.client, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(channels) == 0 {
+		return ps, nil
+	}
+	return ps.firstControl(ps.Subscribe(ctx, channels...))
 }
 
 // SSubscribe opens a pub/sub connection and subscribes to shard channels
@@ -974,9 +1004,25 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 // SHOULD hash to the same slot (use hash tags); mixing slots in one PubSub is
 // undefined behavior in cluster mode. Like [Client.Subscribe], it returns the
 // PubSub and a nil error when the conn is found down on the first SSUBSCRIBE:
-// the reconnect replays the channels, to the same node address. It does not
-// follow a slot move, so a caller that wants the new owner closes the PubSub
-// and calls SSubscribe again.
+// the reconnect replays the channels.
+//
+// The PubSub follows its slot: when the owner goes away, or the slot moves (the
+// server drops the subscription with an unsolicited sunsubscribe, or answers
+// the SSUBSCRIBE with -MOVED), it refreshes the cluster topology, subscribes
+// again on the new owner and keeps delivering to the same [PubSub.Channel],
+// with the PubSub's reconnect backoff between attempts and no limit. A message
+// published while it switches is lost (a gap); one owner serves a slot, so the
+// switch cannot deliver a message twice. One PubSub serves one slot, the slot of
+// its first channel; a channel of another slot added to it later is not served.
+// If another node owns that slot, the SSUBSCRIBE is answered -MOVED, which is not
+// reported, and the channel is not subscribed. If the same node owns it, the node
+// accepts it and delivers it, until the next reroute of any kind, whose replay
+// sends only the channels of the served slot and leaves it out; the move of that
+// slot does not reroute the PubSub. If the first channel is removed while a
+// channel of another node's slot remains, that channel is not subscribed until
+// the next reroute of any kind, whose replay serves the re-selected slot. See
+// [ClusterClient.Subscribe] for what the caller sees while it is down and when
+// the ClusterClient is closed.
 func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	if len(channels) == 0 {
 		return nil, errors.New("celeris-redis: SSubscribe requires at least one channel")
@@ -989,7 +1035,7 @@ func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*Pu
 	if node == nil {
 		return nil, errors.New("celeris-redis: no cluster nodes available")
 	}
-	ps, err := node.client.newPubSub(ctx)
+	ps, err := c.openPubSub(ctx, node.client, channels[0])
 	if err != nil {
 		return nil, err
 	}

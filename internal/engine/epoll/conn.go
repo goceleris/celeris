@@ -546,6 +546,15 @@ func (cs *connState) h2OwedAt() int64 {
 // stream's answer (h2OwedAt).
 func (cs *connState) noteH2Owed(now int64) { cs.detectDeadline = now }
 
+// clearH2Owed forgets the last sweep that found a stream owed (h2OwedAt): a
+// request deadline reset the stream, and the conn's idle period is not kept for
+// it.
+func (cs *connState) clearH2Owed() {
+	if cs.detected {
+		cs.detectDeadline = 0
+	}
+}
+
 func releaseConnState(cs *connState) {
 	cs.h1State = nil
 	cs.h2State = nil

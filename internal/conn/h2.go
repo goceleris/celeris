@@ -69,6 +69,20 @@ type H2Config struct {
 	// wrapping os.ErrDeadlineExceeded. The engines pass the server's
 	// WriteTimeout. 0 = no bound.
 	WriteTimeout time.Duration
+	// ReadTimeout is the request deadline of a stream (the server's
+	// ReadTimeout): a request that is not whole this long after its HEADERS is
+	// answered 408 and reset with RST_STREAM(NO_ERROR) (celeris#889). Absolute,
+	// as net/http's. 0 = no deadline.
+	ReadTimeout time.Duration
+	// ReadHeaderTimeout is the deadline of a header block: one that does not end
+	// with its first HEADERS frame and is not complete this long after it ends the
+	// connection with GOAWAY(ENHANCE_YOUR_CALM) (celeris#889). 0 = no deadline.
+	ReadHeaderTimeout time.Duration
+	// IdleTimeout is the idle clock of a connection with no stream open: it runs
+	// from the last stream activity the sweep saw, and a PING, a SETTINGS or a
+	// connection WINDOW_UPDATE does not move it, as net/http's idle timer, which
+	// no frame touches, does not (celeris#889). 0 = off.
+	IdleTimeout time.Duration
 	// Logger, when set, receives an Error record for each panic that escapes
 	// an HTTP/2 stream's handler (the celeris router answers a handler's
 	// panic with a 500 first, so this is a panic out of the router itself or
@@ -507,6 +521,25 @@ func writeH2DataFragmented(buf *bytes.Buffer, streamID uint32, endStream bool, d
 // and has its own lifecycle hooks, so collapsing it into the parent would
 // invert the existing layering.
 type H2State struct {
+	// The sweep's state comes first. The words its look at a connection with
+	// nothing due reads (the deadline hints, d0Check, idleNs) are the first 40
+	// bytes; the rest is read every 100 ms (d0Interval) or at an idle expiry. The
+	// hints are written by the manager and the processor (SetHints, under mu); the
+	// rest is the loop thread's, from the sweep. d0Last is the last client stream
+	// ID the sweep saw, d0At when it last saw stream activity, d0Check when it last
+	// looked. d0Acked is the low 32 bits of the bytes the peer had acknowledged
+	// when the idle clock last extended its period (ExtendIdle), valid when d0Has
+	// (cleared by stream activity); ctlOut is the bytes this state has written
+	// to the connection since then (flushOut).
+	hints   stream.DeadlineHints
+	d0Check int64
+	idleNs  int64
+	d0At    int64
+	d0Last  uint32
+	d0Acked uint32
+	ctlOut  uint32
+	d0Has   bool // d0Acked is a baseline (an extension was given since the last stream activity)
+
 	initialized       bool
 	serverPrefaceSent bool // true if server SETTINGS already written (h2c upgrade path)
 	prefaceBuf        []byte
@@ -589,6 +622,10 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	// write queue, behind the stream's HEADERS (celeris#903).
 	proc.SetOutboundSink(s.adapter.sendDataFromLoop)
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
+	s.idleNs = int64(cfg.IdleTimeout)
+	proc.GetManager().SetHints(&s.hints)
+	proc.GetManager().SetRequestTimeout(cfg.ReadTimeout)
+	proc.SetHeaderBlockTimeout(cfg.ReadHeaderTimeout)
 	if lg := cfg.Logger; lg != nil {
 		proc.OnHandlerPanic = func(id uint32, r any, stack []byte) {
 			lg.Error("h2 handler panicked",
@@ -726,7 +763,7 @@ func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]by
 		{uint32(http2.SettingMaxHeaderListSize), stream.MaxHeaderListSize},
 	})
 	writeSettingsAckFrame(&state.outBuf)
-	flushOutBuf(&state.outBuf, write)
+	state.flushOut(write)
 	state.serverPrefaceSent = true
 
 	// Extract authority (Host) from headers (lowercase).
@@ -763,7 +800,7 @@ func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]by
 	}
 	// Drain any inline response that the handler produced (common case for
 	// simple GET handlers that write immediately).
-	flushOutBuf(&state.outBuf, write)
+	state.flushOut(write)
 	if state.writeQueue.pending.Load() {
 		state.writeQueue.DrainTo(write)
 	}
@@ -788,7 +825,7 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 				{uint32(http2.SettingMaxFrameSize), state.cfg.MaxFrameSize},
 				{uint32(http2.SettingMaxHeaderListSize), stream.MaxHeaderListSize},
 			})
-			flushOutBuf(&state.outBuf, write)
+			state.flushOut(write)
 			state.serverPrefaceSent = true
 		}
 
@@ -877,7 +914,7 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 					_ = state.processor.SendGoAway(
 						state.processor.GetManager().GetLastStreamID(),
 						http2.ErrCode(ce), []byte(ce.Error()))
-					flushOutBuf(&state.outBuf, write)
+					state.flushOut(write)
 				} else if errors.Is(err, http2.ErrFrameTooLarge) {
 					// A frame over the advertised size, from its header alone
 					// (hasCompleteFrame): RFC 9113 section 4.2 asks for
@@ -886,7 +923,7 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 					_ = state.processor.SendGoAway(
 						state.processor.GetManager().GetLastStreamID(),
 						http2.ErrCodeFrameSize, []byte(err.Error()))
-					flushOutBuf(&state.outBuf, write)
+					state.flushOut(write)
 				}
 				state.mu.Unlock()
 				state.DrainWriteQueue(write)
@@ -895,12 +932,12 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 			processErr = state.processor.ProcessFrame(ctx, f)
 		}
 		if processErr != nil {
-			flushOutBuf(&state.outBuf, write)
+			state.flushOut(write)
 			state.mu.Unlock()
 			state.DrainWriteQueue(write)
 			return processErr
 		}
-		flushOutBuf(&state.outBuf, write)
+		state.flushOut(write)
 		// Drain inline handler responses immediately so they're sent in the
 		// same event loop iteration. Without this, responses queue up and
 		// never flush until the frame loop exits (starving h2load clients).
@@ -985,7 +1022,7 @@ func (s *H2State) GoAway(write func([]byte)) bool {
 		return false
 	}
 	_ = s.processor.SendGoAway(s.processor.GetManager().GetLastClientStreamID(), http2.ErrCodeNo, nil)
-	flushOutBuf(&s.outBuf, write)
+	s.flushOut(write)
 	return true
 }
 
@@ -1002,4 +1039,192 @@ func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {
 		write(buf.Bytes())
 		buf.Reset()
 	}
+}
+
+// flushOut is flushOutBuf for the state's own buffer, counting what it writes
+// (ctlOut): once a conn has no stream open, what this state writes to it is the
+// server's control frames (PING and SETTINGS acknowledgements, WINDOW_UPDATEs, a
+// GOAWAY), and ExtendIdle sets the bytes the peer acknowledged against them.
+// Loop thread (or the dispatch goroutine of an h2c upgrade, before the conn joins
+// the sweep's list).
+func (s *H2State) flushOut(write func([]byte)) {
+	s.ctlOut += uint32(s.outBuf.Len())
+	flushOutBuf(&s.outBuf, write)
+}
+
+// d0Interval is how often Sweep looks at the idle clock of a connection: the
+// clock is seconds long, and the look reads the manager's counters, which are
+// cache lines the sweep would otherwise not touch for a connection with nothing
+// due. A stream that opens and ends between two looks still shows: the last
+// client stream ID has moved.
+const d0Interval = int64(100 * time.Millisecond)
+
+// expireBudget is how long one sweep spends answering expired requests: a
+// request costs a few microseconds (a 408 and a RST_STREAM), so this is a few
+// hundred of them, more than any default MAX_CONCURRENT_STREAMS, and a stall of
+// the loop that long only a burst of that size causes.
+//
+// A variable so that a test can take the clock out of the count of what one sweep
+// answers (celeris#889, review r5).
+var expireBudget = 2 * time.Millisecond
+
+// SweepResult is what H2State.Sweep did and what the engine owes the connection.
+type SweepResult struct {
+	// Wrote: frames were written (a 408 and a RST_STREAM, a GOAWAY); the engine
+	// flushes the connection.
+	Wrote bool
+	// Expired is how many requests were answered 408 and reset.
+	Expired int
+	// CloseAfterFlush: a GOAWAY ended the connection (a header block that was not
+	// completed in time); the engine closes it once what was written has gone out.
+	CloseAfterFlush bool
+	// CloseNow: the connection has been idle for IdleTimeout with no stream open.
+	// A proposal: the engine closes it only if it has nothing left to send, in
+	// its buffers or in the kernel's send queue (a close with unread frames of the
+	// peer in the receive queue is a reset, which discards the send queue), and
+	// otherwise calls ExtendIdle, which says whether to extend (a conn whose
+	// output goes out is not idle) or to close (it has not gone down since the
+	// last extension).
+	CloseNow bool
+}
+
+// Sweep is the engines' per-connection look at the deadlines of the HTTP/2
+// streams and of the connection (celeris#889), run from the timeout sweep on the
+// loop thread for every connection on h2Conns, before the sweep looks at the
+// connection's own clock. When nothing is due it takes no lock: a few atomic
+// loads and compares. When something is due it takes H2State.mu with TryLock (the
+// holder is the loop thread itself, or the dispatch goroutine of an h2c upgrade
+// for the instant it runs the first frames; a held lock means "next sweep"):
+//
+//   - a request whose deadline passed is answered 408 and reset with
+//     RST_STREAM(NO_ERROR); the stream is remembered until its client ends it
+//     (the tombstone: its DATA in flight is ignored and credited, never a
+//     connection error);
+//   - a header block that was not completed in time: GOAWAY(ENHANCE_YOUR_CALM)
+//     and CloseAfterFlush;
+//   - the idle clock of a connection with no stream open (D0): see below.
+//
+// Idle clock. IdleTimeout, for a connection with no stream open, runs from the
+// last stream activity this sweep saw (a new client stream, a stream open, a frame
+// ignored for a stream the server reset): a PING, a SETTINGS or a connection
+// WINDOW_UPDATE does not move it, so a client that only pings holds a bare
+// connection for IdleTimeout, not for ever (net/http's idle timer is touched by
+// no frame). The connection's own clock (the last read) still closes a silent
+// connection at ReadTimeout or IdleTimeout, as before.
+func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
+	h := &s.hints
+	if s.idleNs > 0 && now-s.d0Check >= d0Interval {
+		s.d0Check = now
+		m := s.processor.GetManager()
+		switch last := m.GetLastClientStreamID(); {
+		case last != s.d0Last || m.CountActiveStreams() > 0 || s.processor.TakeIgnoredActivity():
+			s.d0Last, s.d0At, s.d0Has = last, now, false
+		case s.d0At == 0:
+			s.d0At = now
+		case now-s.d0At > s.idleNs:
+			res.CloseNow = true
+		}
+	}
+	dl, td, hd := h.ReqDL.Load(), h.TombDL.Load(), h.HdrDL.Load()
+	if (dl == 0 || now < dl) && (td == 0 || now < td) && (hd == 0 || now < hd) {
+		return res
+	}
+	if !s.mu.TryLock() {
+		return res
+	}
+	defer s.mu.Unlock()
+	m, p := s.processor.GetManager(), s.processor
+	if dl != 0 && now >= dl {
+		// Every request that is due is answered in this sweep, in batches of 32
+		// under a time budget (a burst of MaxConcurrentStreams at once is one
+		// request deadline's worth, and the last of them used to wait for a
+		// sweep per 8: 1.2 s late on io_uring). A batch that fills leaves the
+		// hint due, so what the budget cuts off is the next sweep's.
+		var ids [32]uint32
+		began := time.Now()
+		for {
+			got := m.ExpiredRequests(now, ids[:0])
+			for _, id := range got {
+				p.ExpireRequest(id, now)
+				res.Expired++
+			}
+			if len(got) < len(ids) || time.Since(began) > expireBudget {
+				break
+			}
+		}
+	}
+	if td != 0 && now >= td {
+		p.DropTombstones(now)
+	}
+	if hd != 0 && now >= hd {
+		p.ExpireHeaderBlock()
+		res.CloseAfterFlush = true
+	}
+	if res.Expired > 0 || res.CloseAfterFlush {
+		s.flushOut(write)
+		s.DrainWriteQueue(write)
+		res.Wrote = true
+		res.CloseNow = false
+	}
+	return res
+}
+
+// ExtendIdle is the engine's answer to CloseNow when the connection still holds
+// output (it has bytes in its buffers or in the kernel's send queue). Output that
+// is going out is not idle, so the idle period restarts at now, at once, and
+// ExtendIdle reports true; but only while it goes out: acked is the bytes the
+// peer has acknowledged so far (tcp_info bytes_acked, which only grows; ackedOK
+// false when the engine has no count it may judge on), and the next time the
+// period runs out ExtendIdle reports false, "close it", unless the peer
+// acknowledged more since the last extension than the control frames this state
+// wrote to it in the meantime. The control bytes are the floor because a client
+// that does not read and pings still has its PING answers acknowledged one by one
+// at the pace of its round trip, and that must not count as taking the response.
+// A client that has stopped reading (a closed window) acknowledges nothing, one
+// that pings faster than its round trip acknowledges about what it is sent, and
+// neither is closed later than a few periods; a reader that is slow but reading
+// acknowledges its bytes at every period and is never cut. The bytes held are not
+// the measure: on io_uring the SEND in flight and the kernel's queue hold the same
+// bytes, and the count went up while the client read (celeris#889, review r5).
+// Any stream activity clears the baseline.
+//
+// A count of 0 is a count: the peer has acknowledged nothing, which is what a
+// peer that never acknowledges data, or advertises a zero window from the start,
+// looks like (the first extension is given, and the second refused). It is
+// "no count" (ackedOK false, the period extended, as before the cap) only where
+// the engine cannot judge: the getsockopt failed, the conn is a fixed-file one
+// (development only), or the host's stack does not fill the field (internal/
+// tcpack: gVisor's, as far as is known; there the cap is off, as on main). A
+// conn that cannot be judged is bounded by the conn's own clock only, as #1119's
+// rule is by the flush clock. Loop thread, from the sweep.
+func (s *H2State) ExtendIdle(now int64, acked uint64, ackedOK bool) bool {
+	if !ackedOK {
+		s.d0At, s.d0Has, s.ctlOut = now, false, 0
+		return true
+	}
+	a := uint32(acked)
+	if s.d0Has && a-s.d0Acked <= s.ctlOut {
+		return false
+	}
+	s.d0Acked, s.d0Has, s.d0At, s.ctlOut = a, true, now, 0
+	return true
+}
+
+// GoAwayNoWait is GoAway for a close the engine is about to make (the idle
+// close of Sweep): GOAWAY(NO_ERROR) naming the last client stream, so that the
+// client does not take a request it sent in the last instant as processed, and
+// does not wait for it. Best effort: it takes H2State.mu with TryLock (a held
+// lock means the conn is not idle) and reports whether the GOAWAY was written to
+// write; the caller flushes it and closes.
+func (s *H2State) GoAwayNoWait(write func([]byte)) bool {
+	if !s.mu.TryLock() {
+		return false
+	}
+	defer s.mu.Unlock()
+	if !s.serverPrefaceSent {
+		return false
+	}
+	_ = s.processor.SendGoAway(s.processor.GetManager().GetLastClientStreamID(), http2.ErrCodeNo, nil)
+	s.flushOut(write)
+	return true
 }
