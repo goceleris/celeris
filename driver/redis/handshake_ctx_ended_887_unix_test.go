@@ -16,6 +16,10 @@ package redis
 // meaningful under -race (-count=20 is the bar; without -race it counts wrong
 // replies, which is probabilistic). It is left out of the Windows job, whose
 // timer granularity would make it pass without testing anything.
+//
+// It is meant to run once per CI job. Every round opens a connection, and a
+// local -count=20 uses about half of the macOS ephemeral port range (TIME_WAIT);
+// run it with a modest -count, and leave a minute between big runs.
 
 import (
 	"bufio"
@@ -104,7 +108,7 @@ func TestHandshakeWhoseContextEndedDoesNotRecycleItsRequestWhileTheReaderHoldsIt
 			}
 		}()
 	}
-	for i := 0; i < 1500; i++ {
+	for i := 0; i < 1000; i++ {
 		c, err := NewClient(addr)
 		if err != nil {
 			t.Fatal(err)
