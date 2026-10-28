@@ -98,6 +98,7 @@ func TestGateClosesAPromotedConnOnlyWhenItIsIdle1165(t *testing.T) {
 				panic("premise: the partial head is not pending data")
 			}
 		}, false},
+		{"h2c-upgrade-pending", func(r *promoted1165) { r.cs.h1State.UpgradeInfo = &conn.UpgradeInfo{} }, false},
 		{"switched-to-h2", func(r *promoted1165) {
 			r.cs.asyncInMu.Lock()
 			r.cs.h2Switched = true
@@ -126,7 +127,7 @@ func TestGateClosesAPromotedConnOnlyWhenItIsIdle1165(t *testing.T) {
 				}
 				return
 			}
-			if tc.name == "request-in-progress" && !r.cs.h1State.CloseAfter {
+			if (tc.name == "request-in-progress" || tc.name == "h2c-upgrade-pending") && !r.cs.h1State.CloseAfter {
 				t.Fatal("a request in progress on a promoted conn is not marked close-after: it would be answered with keep-alive")
 			}
 			if n != 0 || r.l.conns[r.fd] == nil || r.discons.Load() != 0 || r.l.closeCount.Load() != 0 || r.l.activeConns.Load() != 1 {
