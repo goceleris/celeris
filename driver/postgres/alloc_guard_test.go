@@ -7,7 +7,10 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"io"
 	"net"
 	"os"
 	"sync/atomic"
@@ -45,21 +48,28 @@ func TestAllocBudgets(t *testing.T) {
 	fixed := func(n int64) func() int64 { return func() int64 { return n } }
 
 	guards := []guard{
-		// What the driver costs: 14 with the sync fast path (the caller polls its own
-		// reply), measured by celeris#890 item 91 on linux/arm64 (20 of 20 runs) and on
-		// the GitHub amd64 runner against the aspirational 4 this row held until then;
-		// the ci.yml allocation-guard step sets TESTING_STRICT_ALLOC_BUDGETS=1 now.
-		// Without it simpleQuery allocates the colsCh before it enqueues: 15 (linux
-		// with syncLoop nil 20 of 20; darwin 3 of 3; the Windows job logged 15; linux
-		// with it: 14 in 50 of 50, and in 30 of 30 under CPU load; celeris#1104). The
-		// budget follows the path the bench's conn took (query1col1rowSyncPath), not
-		// the OS.
-		{name: "Query_1col_1row", budget: func() int64 {
-			if query1col1rowSyncPath.Load() {
-				return 14
-			}
-			return 15
-		}, bench: benchQuery1col1row},
+		// What the driver costs for one query whose reply is there when the sync poll
+		// reads it: 4, with the sync fast path (the caller polls its own reply), and 5
+		// without it (simpleQuery allocates the colsCh before it enqueues; a platform
+		// with no sync poll, and a poll that reads only part of the reply, which falls
+		// through to the async wait and allocates it there: "Partial or EAGAIN").
+		// Measured on linux/arm64 and linux/amd64, with the fake backend answering in
+		// one segment from a prebuilt reply (benchQuery1col1rowReply). This row held 14
+		// from celeris#890 item 91 to celeris#1104, and 14 was not the driver's cost:
+		// two thirds of it was the fake backend's own allocations (the bench counts the
+		// whole process), and the backend wrote the reply as four segments, so a poll
+		// that read it in pieces, in every query of a run, made it 15 against 14 on a CI
+		// runner (celeris#890 allocation guards, twice). The budget follows the path the
+		// bench's conn took (query1col1rowSyncPath), not the OS.
+		{name: "Query_1col_1row", budget: query1col1rowBudget, bench: benchQuery1col1row},
+		// The same query with the reply arriving in pieces (the backend writes its four
+		// messages 2 ms apart, so the sync poll reads the first one and falls through to
+		// the async wait, where simpleQuery allocates colsCh): the whole reply's 4 and
+		// that one. Without the sync poll the colsCh is allocated up front: 5 as well.
+		// celeris#1104: the guard above counted 15 against 14 on a CI runner when its
+		// backend's four writes, then back to back, were read in pieces; the backend
+		// now answers it in one segment, and this row is the pieces' price.
+		{name: "Query_1col_1row_reply_in_pieces", budget: fixed(5), bench: benchQuery1col1rowInPieces},
 		{name: "Pool_AcquireRelease", budget: fixed(0), bench: benchPoolAcquireRelease},
 		// Prepared exec is intentionally omitted: it requires the extended
 		// protocol (Parse/Bind/Execute/Sync) handshake which the existing
@@ -81,6 +91,19 @@ func TestAllocBudgets(t *testing.T) {
 	}
 }
 
+// fakePGWriteGap is how long benchQuery1col1rowReply waits between the writes of
+// a reply it sends in pieces (apart). A test sets it.
+var fakePGWriteGap atomic.Int64
+
+// query1col1rowBudget is the Query_1col_1row budget of the path the bench's
+// conn took (see the guard).
+func query1col1rowBudget() int64 {
+	if query1col1rowSyncPath.Load() {
+		return 4
+	}
+	return 5
+}
+
 // query1col1rowSyncPath is whether the conn benchQuery1col1row ran on took the
 // sync fast path (it has a syncLoop), which decides the allocs per query.
 var query1col1rowSyncPath atomic.Bool
@@ -88,25 +111,70 @@ var query1col1rowSyncPath atomic.Bool
 // benchQuery1col1row measures per-op allocs for QueryContext against a
 // fake backend that replies with RowDescription(1 col) + DataRow(1 field)
 // + CommandComplete + ReadyForQuery for every Query message.
-func benchQuery1col1row(b *testing.B) {
+func benchQuery1col1row(b *testing.B) { benchQuery1col1rowReply(b, false) }
+
+// benchQuery1col1rowInPieces is benchQuery1col1row with a backend that writes
+// the four messages of its reply 2 ms apart.
+func benchQuery1col1rowInPieces(b *testing.B) {
+	fakePGWriteGap.Store(int64(2 * time.Millisecond))
+	defer fakePGWriteGap.Store(0)
+	benchQuery1col1rowReply(b, true)
+}
+
+// benchQuery1col1rowReply is benchQuery1col1row with the shape of the reply on
+// the wire: one segment (apart false: what postgres sends, it flushes at
+// ReadyForQuery) or one segment per message with fakePGWriteGap between them
+// (apart true: a reply that reaches the client in pieces).
+//
+// The reply is built once and the backend reads into one buffer, so that the
+// allocations the bench counts (testing.Benchmark counts the whole process) are
+// the driver's and not the fake backend's, which used to be about two thirds of
+// them and varied with how its four writes were scheduled (celeris#1104).
+func benchQuery1col1rowReply(b *testing.B, apart bool) {
+	rd := buildRowDescription([]colSpec{{name: "n", typeOID: protocol.OIDInt4, typeSize: 4, format: protocol.FormatText}})
+	msgs := [][]byte{
+		pgMsg(protocol.BackendRowDescription, rd),
+		pgMsg(protocol.BackendDataRow, buildDataRow([][]byte{[]byte("7")})),
+		pgMsg(protocol.BackendCommandComplete, append([]byte("SELECT 1"), 0)),
+		pgMsg(protocol.BackendReadyForQuery, []byte{'I'}),
+	}
+	reply := bytes.Join(msgs, nil)
 	addr := startFakePGBench(b, func(c net.Conn) {
 		fakePGTrustStartupB(b, c, 1, 2, func(c net.Conn) {
+			var hdr [5]byte
+			body := make([]byte, 256)
 			for {
-				typ, _, err := readMsg(c)
-				if err != nil {
+				if _, err := io.ReadFull(c, hdr[:]); err != nil {
 					return
 				}
-				if typ != protocol.MsgQuery {
-					if typ == protocol.MsgTerminate {
+				n := int(binary.BigEndian.Uint32(hdr[1:5])) - 4
+				if n < 0 {
+					return
+				}
+				if n > len(body) {
+					body = make([]byte, n)
+				}
+				if _, err := io.ReadFull(c, body[:n]); err != nil {
+					return
+				}
+				if hdr[0] != protocol.MsgQuery {
+					if hdr[0] == protocol.MsgTerminate {
 						return
 					}
 					continue
 				}
-				rd := buildRowDescription([]colSpec{{name: "n", typeOID: protocol.OIDInt4, typeSize: 4, format: protocol.FormatText}})
-				_ = writeMsg(c, protocol.BackendRowDescription, rd)
-				_ = writeMsg(c, protocol.BackendDataRow, buildDataRow([][]byte{[]byte("7")}))
-				_ = writeCommandComplete(c, "SELECT 1")
-				_ = writeReadyForQuery(c, 'I')
+				if !apart {
+					_, _ = c.Write(reply)
+					continue
+				}
+				for i, m := range msgs {
+					if i > 0 {
+						if g := fakePGWriteGap.Load(); g > 0 {
+							time.Sleep(time.Duration(g))
+						}
+					}
+					_, _ = c.Write(m)
+				}
 			}
 		})
 	})

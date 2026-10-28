@@ -1273,7 +1273,8 @@ jobs:
       # now sets (celeris#890 item 91), so for them a PASS says the count held and
       # not only that the guard ran. The one guard that was over budget when the
       # variable was first set, driver/postgres Query_1col_1row (14 allocs/op
-      # against 4), has the budget the driver costs. The sse and websocket tests
+      # against 4: the 14 counted the fake backend's own allocations, and the
+      # budget is the driver's 4 since celeris#1104). The sse and websocket tests
       # fail on their own bounds.
       - name: celeris#890 allocation guards and alloc-count tests, without -race (skipping forbidden)
         if: ${{ !cancelled() }}
