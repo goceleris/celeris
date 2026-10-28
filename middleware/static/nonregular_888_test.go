@@ -155,6 +155,13 @@ func TestNonRegularFilesAreNotServed888(t *testing.T) {
 					rec, _ := get888(t, mw, path)
 					return rec
 				})
+				// a conditional request is no oracle for a file that is not served
+				if cond := within888(t, "conditional GET "+path, 5*time.Second, func() *celeristest.ResponseRecorder {
+					rec, _ := get888(t, mw, path, "if-none-match", "*")
+					return rec
+				}); cond.StatusCode == 304 || cond.Header("etag") != "" {
+					t.Errorf("conditional GET %s: status %d etag %q, want it passed on", path, cond.StatusCode, cond.Header("etag"))
+				}
 				body := string(rec.Body)
 				switch {
 				case c.name == "spa":
