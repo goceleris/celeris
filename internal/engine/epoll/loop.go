@@ -212,6 +212,12 @@ type Loop struct {
 	// floor, shutdownSendDrainFloor.
 	drainBudget *atomic.Pointer[context.Context]
 
+	// shutdownBegun points at the engine's flag of a shutdown that has begun
+	// (Engine.shutdownBegun), which every HTTP/1 conn's H1State carries
+	// (initProtocol): see conn.H1State.Shutdown. nil in a loop built without an
+	// engine (tests): no conn closes for it.
+	shutdownBegun *atomic.Bool
+
 	// h2DrainStart is when the loop began waiting, its context cancelled,
 	// for the HTTP/2 stream handlers running on the shared worker pool
 	// (celeris#759; h2PoolSettled). Zero until then. Loop thread.
@@ -556,6 +562,11 @@ func (l *Loop) run(ctx context.Context) {
 			// below, for the HTTP/2 conns it has, and a conn accepted now
 			// would be served and then cut at the budget.
 			l.stopAccepting()
+			// A context cancelled with no Engine.Shutdown (a Listen caller's
+			// own cancel): the shutdown has begun all the same.
+			if sb := l.shutdownBegun; sb != nil && !sb.Load() {
+				sb.Store(true)
+			}
 			if l.h2PoolSettled() {
 				l.shutdown()
 				return
@@ -2806,6 +2817,7 @@ func (l *Loop) initProtocol(cs *connState) {
 		// a decision begun, or a request the gate reads on) is answered
 		// close-after, as the conns the gate has met are (celeris#1104).
 		cs.h1State.CloseAfter = l.refuseRecv
+		cs.h1State.Shutdown = l.shutdownBegun
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue

@@ -187,6 +187,11 @@ type h1ResponseAdapter struct {
 	werr      error
 	keepAlive bool
 	isHEAD    bool
+	// shutdown is H1State.Shutdown, wired once with the write hook: a final
+	// response (status 200 and up) written while it is up says
+	// Connection: close and clears keepAlive, which handleH1Request turns into
+	// the end of the connection (see closing).
+	shutdown *atomic.Bool
 	// A streamed response (WriteHeader, Write, Close) keeps its own state, set
 	// by WriteHeader and cleared for each request (handleH1Request), so that
 	// what a later chunk does depends on the request that began the response
@@ -277,11 +282,64 @@ func mustFrameEmptyBody(status int) bool {
 	}
 }
 
+// closing reports whether the response being written with status ends the
+// connection: the request said so (keepAlive already false), or the engine's
+// shutdown has begun (celeris#884, celeris#885): every final response written
+// from then on says Connection: close and the connection ends after it, as the
+// engines' gate does for a request it meets (H1State.CloseAfter). It is read
+// when the head is built, so a handler that was already running when Shutdown
+// began (a sync handler holding its loop, an Async-route handler on its
+// goroutine) is covered, not just a request read after it. An interim response
+// (1xx, which includes 101 Switching Protocols of an upgrade) is not final: it
+// neither says close nor ends the connection. One nil test and, with the flag
+// wired, one atomic load of a word that is written once, per response.
+func (a *h1ResponseAdapter) closing(status int) bool {
+	if !a.keepAlive {
+		return true
+	}
+	if sd := a.shutdown; sd != nil && status >= 200 && sd.Load() {
+		a.keepAlive = false
+		return true
+	}
+	return false
+}
+
+// withoutConnectionHeaders returns headers with every Connection entry removed,
+// for a response that ends the connection: it carries the one
+// "connection: close" the head builders append, as net/http's response written
+// after Shutdown began carries one (a handler's "Connection: keep-alive" is
+// replaced, its "Connection: close" is not repeated). The common case, no such
+// header, returns headers itself and allocates nothing. Cold: only a closing
+// response asks.
+func withoutConnectionHeaders(headers [][2]string) [][2]string {
+	n := 0
+	for _, h := range headers {
+		if len(h[0]) == len("connection") && strings.EqualFold(h[0], "connection") {
+			n++
+		}
+	}
+	if n == 0 {
+		return headers
+	}
+	out := make([][2]string, 0, len(headers)-n)
+	for _, h := range headers {
+		if len(h[0]) == len("connection") && strings.EqualFold(h[0], "connection") {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	// Reuse per-connection buffer. This eliminates sync.Pool Get/Put
 	// per response (~40ns). The buffer grows as needed and persists
 	// across requests on the same keep-alive connection.
 	buf := a.respBuf[:0]
+	closing := a.closing(status)
+	if closing && status >= 200 { // an interim head's Connection (101: Upgrade) is the handler's
+		headers = withoutConnectionHeaders(headers)
+	}
 
 	// Ultra-fast path: 200 + 2 standard headers (content-type, content-length)
 	// where the content-type is one of the cached common types — collapse
@@ -307,7 +365,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 			buf = append(buf, clPrefix...)
 			buf = append(buf, headers[1][1]...)
 			buf = append(buf, crlf...)
-			if !a.keepAlive {
+			if closing {
 				buf = append(buf, "connection: close\r\n"...)
 			}
 			buf = append(buf, crlf...)
@@ -407,7 +465,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 		}
 	}
 
-	if !a.keepAlive {
+	if closing {
 		buf = append(buf, "connection: close\r\n"...)
 	}
 
@@ -447,6 +505,10 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 // (non-fast) path of WriteResponse so a sendfile response is byte-for-byte
 // equivalent to the buffered response that would otherwise be emitted.
 func (a *h1ResponseAdapter) appendFileResponseHead(buf []byte, status int, headers [][2]string, bodyLen int64) []byte {
+	closing := a.closing(status)
+	if closing && status >= 200 { // an interim head's Connection (101: Upgrade) is the handler's
+		headers = withoutConnectionHeaders(headers)
+	}
 	if status == 200 {
 		buf = appendCachedStatus200Date(buf)
 	} else {
@@ -489,7 +551,7 @@ func (a *h1ResponseAdapter) appendFileResponseHead(buf []byte, status int, heade
 		buf = strconv.AppendInt(buf, bodyLen, 10)
 		buf = append(buf, crlf...)
 	}
-	if !a.keepAlive {
+	if closing {
 		buf = append(buf, "connection: close\r\n"...)
 	}
 	return append(buf, crlf...)
@@ -1179,6 +1241,10 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 	a.streamOpen = !a.streamNoBody
 	a.streamDeclared, a.streamWritten = declaredLength(headers), 0
 	buf := a.respBuf[:0]
+	closing := a.closing(status)
+	if closing && status >= 200 { // an interim head's Connection (101: Upgrade) is the handler's
+		headers = withoutConnectionHeaders(headers)
+	}
 	buf = appendStatusLine(buf, status)
 	buf = appendCachedDate(buf)
 	if !noContent { // RFC 9112 section 6.1: not on a 1xx, 204 or 304
@@ -1192,7 +1258,7 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 		buf = append(buf, h[1]...)
 		buf = append(buf, crlf...)
 	}
-	if !a.keepAlive {
+	if closing {
 		buf = append(buf, "connection: close\r\n"...)
 	}
 	buf = append(buf, crlf...)

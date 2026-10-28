@@ -23,6 +23,13 @@ import (
 // TestShutdownPoolWaitStopsServingH1AndDetached884 on epoll: 16 of 16
 // requests answered and about 700 ticks written 1.5 s into the shutdown.
 //
+// The gate is not what makes a response close any more (celeris#884): from
+// Engine.Shutdown on, every HTTP/1 response written, in the first poolWaitGrace
+// as after it, carries Connection: close and ends its conn (conn.H1State.Shutdown,
+// read where the response head is built). The CloseAfter marks below stay: they
+// make a conn the gate meets close-after for the request it reads on, and are the
+// per-conn half the flag does not replace.
+//
 // The gate comes poolWaitGrace after the wait began, as the send drain's does,
 // so a request in flight when the shutdown began is still answered. From then
 // on the loop reads no more new requests from an HTTP/1 conn (refuseRecv) and

@@ -36,6 +36,12 @@ import (
 //   - the HTTP/2 conns the wait is for are served on: they have had GOAWAY since
 //     the wait began.
 //
+// The gate is not what makes a response close any more: from Engine.Shutdown on,
+// every HTTP/1 response written, before the gate as after it, carries
+// Connection: close and ends its conn (conn.H1State.Shutdown, read where the
+// response head is built; celeris#884). The CloseAfter marks below stay: they
+// are the per-conn half, which the flag does not replace.
+//
 // A conn whose dispatch goroutine owns its parse state (asyncPromoted: a conn on
 // an Async route, or, on a server with any Async route, one whose read left a
 // partial request) is looked at under the goroutine's own locks, never without:

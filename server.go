@@ -631,6 +631,22 @@ func (s *Server) cancelListen() {
 // ends first gets its ctx's error, from its wait for Listen. Adaptive hands its
 // ctx to both of its engines.
 //
+// Every HTTP/1 response written once Shutdown has begun ends its connection, as
+// net/http's does: one to a request that was already in its handler when
+// Shutdown began, and one to a request that arrives on a keep-alive connection
+// before the connection is closed. On the native engines (epoll, io_uring,
+// adaptive) it carries exactly one "Connection: close", an HTTP/1.0 client's
+// included (celeris#884, celeris#885); a handler's own Connection header on it
+// is replaced by that one. std, which is net/http, closes the connection after
+// the response and says close to an HTTP/1.1 client, but not to an HTTP/1.0 one.
+// A request pipelined behind such a response is not served: its bytes, already
+// read, are dropped with the connection. Not changed: a response whose head went
+// out before Shutdown began (a stream under way keeps the head it sent), a
+// detached stream (Server-Sent Events, a WebSocket), which the engines end
+// themselves, a hijacked connection, which is the application's, and a
+// connection that has sent nothing yet (it is answered close when its first
+// request is). HTTP/2 connections get GOAWAY instead.
+//
 // A Shutdown that arrives before the server ever started still latches the
 // shut-down state, so a Start racing it returns instead of parking on a context
 // nothing will ever cancel (celeris#595).
