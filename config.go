@@ -422,11 +422,16 @@ type Config struct {
 	// applied while a stream the server owes an answer for is open; see
 	// ReadTimeout. A connection that still has output to send (in its buffers or
 	// the kernel's send queue) is not idle while the output goes out: the period
-	// restarts, and the connection is closed (GOAWAY with NO_ERROR, then the
-	// close; the end of the output may be lost) at the end of a period in which
-	// the bytes it holds did not go down, as a client that has stopped reading
-	// and one that pings faster than its round trip leave them. On epoll, for a
-	// response parked on the socket, see WriteTimeout.
+	// restarts, and the connection is closed (GOAWAY with NO_ERROR where it can
+	// still be sent, then the close; the end of the output may be lost) at the end
+	// of a period in which the peer acknowledged no more than the control frames
+	// (PING and SETTINGS acknowledgements, WINDOW_UPDATEs) the server sent it, as a
+	// client that has stopped reading and one that pings faster than its round
+	// trip leave it. A client that reads, however slowly, acknowledges more. On a
+	// stack that reports no acknowledged-bytes count the period is always
+	// extended. A frame for a stream the server reset moves the period only for a
+	// request that expired at ReadTimeout, for the 2 x ReadTimeout its late DATA may
+	// take. On epoll, for a response parked on the socket, see WriteTimeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts
