@@ -444,6 +444,19 @@ func TestH2RequestDeadlineResetsOneStreamNotTheConn889(t *testing.T) {
 			ev := c.await889(1, 6*time.Second)
 			t.Logf("RD889 idle<read engine=%s: %s", e.name, ev)
 			wantReset889(t, ev, 2700*time.Millisecond, 4500*time.Millisecond)
+			// The conn's own clock (IdleTimeout 1 s) was due all along and the open
+			// request exempted the conn from it; with the request reset, nothing is
+			// left to keep the silent conn for: it goes with the reset, not another
+			// IdleTimeout later (the stamp of the last owed stream is cleared at an
+			// expiry). io_uring's clock is restamped by the 408's completed send.
+			at, closed := c.closedAfter889(7 * time.Second)
+			bound := 3600 * time.Millisecond
+			if e.name == "io_uring" {
+				bound = 4600 * time.Millisecond
+			}
+			if !closed || at > bound {
+				t.Fatalf("the silent conn was closed=%v at %v, want it closed by %v (the reset at 3 s)", closed, at.Round(time.Millisecond), bound)
+			}
 		})
 	}
 }
