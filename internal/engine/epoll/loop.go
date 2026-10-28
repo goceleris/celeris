@@ -4973,12 +4973,22 @@ func (l *Loop) sweepWriteClock(cs *connState, fd int, now, last int64) (from int
 				// passed, and a client reading steadily between two EPOLLOUT
 				// edges moves neither (a ReadTimeout or IdleTimeout not above
 				// WriteTimeout, the defaults' shape, would cut it before the
-				// rule decides), and a response has no request behind it for
-				// ReadTimeout to bound (a pipelined head has ReadHeaderTimeout,
-				// above). A peer that stops is closed by the rule one window
-				// after it falls under the floor. Back to the idle scan when the
-				// response ends (endWrite) or the baseline is lost (a failed
-				// sample).
+				// rule decides). The price: a request pipelined behind the
+				// response is bounded by ReadHeaderTimeout for its head (the
+				// hdrDL check above runs first and the loop keeps EPOLLIN armed
+				// while parked), but a pipelined request whose head is whole and
+				// whose body is pending has no header deadline, and ReadTimeout
+				// does not bound it until the response ends (measured: ReadTimeout
+				// 1 s cut it at 1.34 s on main, the head held it for the run;
+				// after the drain ReadTimeout applies again, gone at 6.94 s on
+				// both). The skip also bypasses h2ServerOwes' dispatchBusy answer
+				// for an async HTTP/1.1 conn (read, not measured): a pipelined
+				// handler that overruns ReadTimeout is not closed while an earlier
+				// response on the conn is rate-held. Bounded by the rule: the
+				// client must keep acknowledging the floor. A peer that stops is
+				// closed by the rule one window after it falls under the floor.
+				// Back to the idle scan when the response ends (endWrite) or the
+				// baseline is lost (a failed sample).
 				return last, true
 			}
 			if time.Duration(now-cs.writeSince) > wt {

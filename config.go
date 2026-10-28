@@ -241,10 +241,13 @@ type Config struct {
 	// On the native engines (epoll, io_uring, adaptive) it is measured from the
 	// connection's last read (on io_uring also from the start and the completion
 	// of its sends). On epoll a response the kernel did not take whole is
-	// bounded by WriteTimeout's minimum rate and not by ReadTimeout or
-	// IdleTimeout while the client takes it at that rate (see WriteTimeout):
-	// they run from the end of that response, and from the last flush that
-	// took bytes where the socket reports no acknowledged bytes.
+	// bounded by WriteTimeout's minimum rate alone, from the first sweep that
+	// finds it parked until it ends (see WriteTimeout): ReadTimeout and
+	// IdleTimeout run again from its end, and, where the socket reports no
+	// acknowledged bytes, from the last flush that took bytes. A request
+	// pipelined behind such a response is bounded by ReadHeaderTimeout for its
+	// headers and by ReadTimeout only once the response has been sent; the
+	// overrun check of an HTTP/1.1 async handler is suspended the same way.
 	//
 	// An HTTP/2 connection is not closed by it or by IdleTimeout while it has a
 	// stream open whose request is whole and no response is waiting for the
@@ -339,9 +342,13 @@ type Config struct {
 	// part of the response not yet sent, for as many windows as the response has
 	// 64 KiB (a response of S bytes: S/64 KiB times WriteTimeout, 64 minutes
 	// for 4 MiB at 60s; a smaller WriteTimeout raises the floor), so size
-	// WriteTimeout with that in mind. WriteTimeout -1 (or 0) is no write timeout at any rate. What
-	// the client sends is not progress: a pipelined request or an HTTP/2 PING
-	// does not hold a parked response.
+	// WriteTimeout with that in mind. WriteTimeout -1 is no write timeout at
+	// any rate. What the client sends is not progress: a pipelined request or
+	// an HTTP/2 PING does not hold a parked response. The times above hold
+	// with ReadHeaderTimeout set (the default): the engine's 25 ms sweep timer
+	// is armed only then, and without it a stalled response can outlast them by
+	// seconds (measured: WriteTimeout 1s, ReadHeaderTimeout -1, closed at 5 s,
+	// on main too).
 	//
 	// While the rule has a baseline for a parked response (from the first sweep
 	// that finds it parked), it is the only bound on the connection:
@@ -363,11 +370,11 @@ type Config struct {
 	// closing drain below, which counts each byte the client acknowledges and
 	// has no floor: a client that sends one and then takes a few bytes per
 	// WriteTimeout holds the connection, a known limit that is not changed here.
-	// io_uring is unchanged: it has no rate, and bounds the response as a
-	// whole, measured from the last read, the start of a send from an idle
-	// connection or a completed send (a client that completes one send per
-	// WriteTimeout, or sends another request, restarts it), not
-	// from the request's headers as std does. On io_uring a response whose
+	// io_uring is unchanged: it has no rate, and measures WriteTimeout from
+	// the last read, the start of a send from an idle connection or a
+	// completed send (a client that completes one send per WriteTimeout, or
+	// sends another request, restarts it), not from the request's headers as
+	// std does. On io_uring a response whose
 	// unsent remainder is under 64 KiB, to a client that stops reading, on an
 	// otherwise idle worker, can outlast WriteTimeout (measured with async
 	// responses of 96 to 144 KiB; the larger and the sync sizes are closed).
