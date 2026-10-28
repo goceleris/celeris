@@ -372,6 +372,7 @@ func TestH2ExpiredRequestDataAfterTheResetWindow889(t *testing.T) {
 				t.Parallel()
 				c := dialH2raw889(t, rdServer889(t, e.eng, nil), h2dial889{})
 				c.request(1, "POST", "/upload889", false, true)
+				opened := c.t0 // the deadline runs from here; c.t0 moves with every request that follows
 				id := uint32(3)
 				for range 2100 {
 					c.request(id, "GET", "/ping", true, true)
@@ -391,7 +392,10 @@ func TestH2ExpiredRequestDataAfterTheResetWindow889(t *testing.T) {
 				ev := c.await889(1, 4*time.Second)
 				stop()
 				t.Logf("RD889 m3 engine=%s late=%s: %s (the malformed stream was %d)", e.name, late, ev, bad)
-				wantReset889(t, ev, 900*time.Millisecond, 3*time.Second)
+				// ev.at counts from the last frame the client sent, which on a
+				// slow runner (2100 requests under -race) is a good while after
+				// the HEADERS of stream 1: the lower bound is the deadline's, from there.
+				wantReset889(t, ev, 900*time.Millisecond-c.t0.Sub(opened), 3*time.Second)
 				switch late {
 				case "data":
 					c.sendData889(1, false, []byte("late"))
