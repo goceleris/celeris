@@ -21,12 +21,16 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 )
 
-// maxDirectResultBytes is the per-query result buffer cap in direct mode.
-// Direct mode pins syncMode=true (lazy streaming cannot activate because
-// the caller goroutine IS the dispatcher — a blocking channel send would
-// deadlock), so without a cap a SELECT against a huge table would buffer
-// every row into req.rowSlab. 64 MiB matches the WebSocket detach-limit
-// on the engine side and gives typical result sets a wide margin.
+// maxDirectResultBytes is the per-query result buffer cap, on the payload of the
+// DataRows, wherever a reply is buffered whole: direct mode, which pins
+// syncMode=true (lazy streaming cannot activate because the caller goroutine IS
+// the dispatcher: a blocking channel send would deadlock), and the sync fast
+// path of a non-direct pool while its poll has not returned. A row that would
+// take the buffer past it is not appended: the request fails with
+// ErrResultTooBig, the rows buffered up to then are what the caller reads before
+// the error, and the rest of the reply is read and discarded. 64 MiB matches the
+// WebSocket detach-limit on the engine side and gives typical result sets a
+// wide margin.
 const maxDirectResultBytes = 64 << 20
 
 // syncRoundTripper is the optional interface for event-loop workers that
@@ -198,6 +202,9 @@ type pgRequest struct {
 	// finished is true, preventing a race where a new acquirePgRequest
 	// reuses the request while finish()/fail() is still reading its fields.
 	finished atomic.Bool
+	// slabBytes is the payload bytes buffered in total, over every slab chunk
+	// (rowSlab is the current one): what maxDirectResultBytes bounds.
+	slabBytes int
 }
 
 // finish signals completion of the request exactly once. Safe for
@@ -360,6 +367,7 @@ func releasePgRequest(r *pgRequest) {
 	}
 	r.rowFields = r.rowFields[:0]
 	r.rowSlab = r.rowSlab[:0]
+	r.slabBytes = 0
 	r.tag = ""
 	r.err = nil
 	r.rowCh = nil
@@ -376,37 +384,32 @@ func releasePgRequest(r *pgRequest) {
 // preserves the nil-vs-empty distinction for PG NULLs (nil) vs zero-length
 // text (non-nil empty slice).
 //
-// Aliasing correctness: the slab grows with append, which may reallocate
-// the backing array. Any sub-slice taken before the reallocation would be
-// stale. We avoid the problem by growing the slab to its final size first
-// (single pre-append if capacity is insufficient) and then handing out
-// sub-slices against the now-stable backing array.
-func (r *pgRequest) appendRowFromAlias(fields [][]byte) {
-	totalBytes := 0
-	for _, f := range fields {
-		totalBytes += len(f)
-	}
+// Aliasing correctness: a row-view points into the slab and the row fields
+// that were current when it was carved. When one is full, a NEW chunk is
+// started and the old one is not copied: the earlier views keep pointing into
+// the old array, which stays valid for as long as a row references it, and no
+// view is ever carved across a chunk (a row's fields are made to fit first).
+// Growing by copy left every earlier generation reachable through the views
+// already handed out: with 1.25x growth that is 5 times the data held, for a
+// reply of 2M rows 1.1 GB of live heap (celeris#1104). Chunked, the live heap
+// is the data plus 24 bytes of field view and of row view per row, plus at most one
+// row's worth of unused tail per chunk (the tail a row did not fit in is left;
+// worst case about twice the data, for rows just over half a chunk).
+func (r *pgRequest) appendRowFromAlias(fields [][]byte, totalBytes int) {
 	// Ensure the slab has stable storage for every non-nil field. We do
 	// this in one shot so later sub-slices (view[i]) can point into the
 	// same backing array and stay valid.
 	if totalBytes > 0 {
 		if cap(r.rowSlab)-len(r.rowSlab) < totalBytes {
-			// Grow with append+len to get amortized 2x behavior.
-			need := len(r.rowSlab) + totalBytes
-			// Use make+copy so we can size the new slab to fit without
-			// walking through a sequence of incremental appends.
-			ns := make([]byte, len(r.rowSlab), growCap(cap(r.rowSlab), need))
-			copy(ns, r.rowSlab)
-			r.rowSlab = ns
+			// The current chunk is full: start the next, not a copy of this one.
+			r.rowSlab = make([]byte, 0, chunkCap(cap(r.rowSlab), totalBytes))
 		}
+		r.slabBytes += totalBytes
 	}
 	// Ensure rowFields has stable storage for the row-view. One grow if
 	// needed, then a no-realloc append for the row itself.
 	if cap(r.rowFields)-len(r.rowFields) < len(fields) {
-		need := len(r.rowFields) + len(fields)
-		nf := make([][]byte, len(r.rowFields), growCap(cap(r.rowFields), need))
-		copy(nf, r.rowFields)
-		r.rowFields = nf
+		r.rowFields = make([][]byte, 0, chunkCap(cap(r.rowFields), len(fields)))
 	}
 	start := len(r.rowFields)
 	r.rowFields = r.rowFields[:start+len(fields)]
@@ -427,20 +430,16 @@ func (r *pgRequest) appendRowFromAlias(fields [][]byte) {
 	r.rows = append(r.rows, view)
 }
 
-// growCap returns a capacity for a slice growth from old to at least need.
-// Mirrors runtime.growslice heuristics (double up to ~1KB, then 1.25x).
-func growCap(old, need int) int {
-	if old < 32 {
-		old = 32
-	}
-	for old < need {
-		if old < 1024 {
-			old *= 2
-		} else {
-			old = old + old/4
-		}
-	}
-	return old
+// maxChunk is the largest chunk of slab (bytes) or row fields (elements) a
+// request starts without being asked for more: past it chunks stop doubling, so
+// the unused tail of the last one stays small however large the reply is.
+const maxChunk = 1 << 16
+
+// chunkCap is the capacity of the next chunk after one of capacity old, for at
+// least need: double, then a fixed maxChunk.
+func chunkCap(old, need int) int {
+	n := min(max(old, 32)*2, maxChunk)
+	return max(n, need)
 }
 
 // Ctx implements async.PendingRequest.
@@ -498,19 +497,36 @@ func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok boo
 	if r.doneFlag {
 		return 0, false, false
 	}
-	r.appendRowFromAlias(fields)
-	// Direct-mode result-buffer cap. In direct mode syncMode is pinned
-	// so lazy streaming never fires; without a cap a huge SELECT would
-	// buffer every row in memory unbounded. Cap at maxDirectResultBytes
-	// (64 MiB) and fail with ErrResultTooBig — caller paginates or
-	// switches modes.
+	// Direct-mode result-buffer cap. In direct mode, and on the sync fast
+	// path, syncMode is pinned so lazy streaming never fires (the caller's
+	// goroutine is the dispatcher), and the poll cannot be stopped from here:
+	// it reads the rest of the reply whatever this returns. So the cap is a
+	// bound on the BUFFER: a row that would take it past maxDirectResultBytes is
+	// not appended, the request fails with ErrResultTooBig (the caller sees it
+	// after the rows already buffered, as before) and the rest of the reply is
+	// read and dropped to keep the wire aligned. Checked after the append, as it
+	// was, it bounded nothing: a reply of 240 MB was buffered whole, 1.1 to
+	// 1.2 GB of heap, before the error (celeris#1104).
 	syncMode = r.syncMode.Load()
-	if syncMode && len(r.rowSlab) > maxDirectResultBytes {
-		if r.err == nil {
-			r.err = ErrResultTooBig
-		}
+	// Once the cap has tripped no row is buffered, in any mode: the sync fast
+	// path clears syncMode when its poll returns before the reply is done, and
+	// the event loop then dispatches the rest of the reply with it false. A row
+	// appended there would be promoted to streaming behind the rows already
+	// buffered, with the dropped ones missing in between and the error lost.
+	// Returning false also keeps promoteToStreaming from running, so the caller
+	// wakes on doneCh with the buffered rows and ErrResultTooBig.
+	if r.err == ErrResultTooBig {
 		return 0, syncMode, false
 	}
+	size := 0
+	for _, f := range fields {
+		size += len(f)
+	}
+	if syncMode && r.slabBytes+size > maxDirectResultBytes {
+		r.err = ErrResultTooBig
+		return 0, syncMode, false
+	}
+	r.appendRowFromAlias(fields, size)
 	return len(r.rows), syncMode, true
 }
 
