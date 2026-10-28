@@ -7,6 +7,29 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+// DotfilesPolicy is what the middleware does with a request whose path below
+// the root has a segment that names a hidden file or directory: one that
+// starts with a dot (.env, .git, .ssh, .htaccess), except the exact segment
+// ".well-known". See [Config].Dotfiles.
+type DotfilesPolicy uint8
+
+const (
+	// DotfilesIgnore (the default) answers such a request as if the file did
+	// not exist: the request goes to the next handler, as a path with no file
+	// does (the router's 404 when nothing else answers it), so nothing tells
+	// a client whether the hidden file exists. In SPA mode it gets the index
+	// file, as any other missing path does.
+	DotfilesIgnore DotfilesPolicy = iota
+
+	// DotfilesAllow serves hidden files like any other: the behaviour before
+	// v1.6.0.
+	DotfilesAllow
+
+	// DotfilesDeny answers such a request with 403 Forbidden, whether or not
+	// the file exists.
+	DotfilesDeny
+)
+
 // Config defines the static file middleware configuration.
 type Config struct {
 	// Skip defines a function to skip this middleware for certain requests.
@@ -87,6 +110,10 @@ type Config struct {
 	// Accept-Encoding in Vary (once), whether or not the file has a variant.
 	// Works with both OS filesystem (Root) and fs.FS.
 	Compress bool
+
+	// Dotfiles is the policy for hidden files and directories: names that
+	// start with a dot. The zero value is [DotfilesIgnore].
+	Dotfiles DotfilesPolicy
 }
 
 var defaultConfig = Config{
