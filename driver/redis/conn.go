@@ -794,12 +794,18 @@ func (c *redisConn) handshake(ctx context.Context) error {
 		}
 		return nil
 	}
-	// Release the request from the failed exec — it may hold pooled Reader
-	// slices that would otherwise leak.
-	c.releaseResult(req)
 	// If HELLO was rejected, fall back to legacy auth + select.
 	var rerr *RedisError
 	if errors.As(err, &rerr) {
+		// The server's error reply was dispatched: dispatch is done with req.
+		// Any other error (the caller's context ended, the conn closed) leaves
+		// the request to the garbage collector, as every other caller of exec
+		// does: the reader goroutine may still be filling it in, and a request
+		// given back to the pool now could be reused by another conn and
+		// woken by that late finish with a reply that is not its own. Nothing
+		// leaks: req.owned is never set in production code, so releaseResult
+		// only skips a sync.Pool reuse here.
+		c.releaseResult(req)
 		c.state.proto.Store(2)
 		return c.legacyAuth(ctx)
 	}
