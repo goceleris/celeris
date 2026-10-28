@@ -424,6 +424,31 @@ func TestSweepExtendIdleNeedsProgress889(t *testing.T) {
 			t.Fatal("extended again with 0 bytes acknowledged: a peer that never acknowledges holds the conn")
 		}
 	})
+	t.Run("a-count-that-appears-late", func(t *testing.T) {
+		// The host probe (internal/tcpack) answers in the background: a conn judged
+		// before it has said yes has "no count" (extended, no baseline), and the same
+		// conn judged after is held to the rule from its next extension: the first
+		// extension with a count is given and records the baseline, the one after
+		// it with no progress is refused. A late answer opens no hole.
+		r, now := newConn()
+		for i := range 3 {
+			now += step
+			r.st.Sweep(now, r.write)
+			if !r.st.ExtendIdle(now, 0, false) {
+				t.Fatalf("no-count extension %d refused", i)
+			}
+		}
+		now += step
+		r.st.Sweep(now, r.write)
+		if !r.st.ExtendIdle(now, 0, true) {
+			t.Fatal("the first extension with a count has no baseline and is given")
+		}
+		now += step
+		r.st.Sweep(now, r.write)
+		if r.st.ExtendIdle(now, 0, true) {
+			t.Fatal("a conn with no progress was extended after the count appeared")
+		}
+	})
 	t.Run("no-count-extends", func(t *testing.T) {
 		r, now := newConn()
 		for i := range 4 {

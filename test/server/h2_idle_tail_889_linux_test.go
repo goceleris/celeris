@@ -146,10 +146,12 @@ func TestH2IdleClockClosesAConnWhoseClientStopsReadingButPings889(t *testing.T) 
 	for _, e := range nativeEngines889() {
 		t.Run(e.name, func(t *testing.T) {
 			t.Parallel()
-			c := dialH2raw889(t, tailServer889(t, e.eng), h2dial889{initialWindow: 1 << 30})
-			if tc, ok := c.conn.(*net.TCPConn); ok {
-				_ = tc.SetReadBuffer(4 << 10)
-			}
+			// The receive buffer is set before the connect: set after it, the
+			// window the handshake offered stays and the kernel goes on accepting
+			// bytes for a client that reads none (acknowledged bytes grew by 33 to
+			// 65 KB a period under load: a slow reader by the cap's rule, and the
+			// cell failed on a CI runner).
+			c := dialH2raw889(t, tailServer889(t, e.eng), h2dial889{initialWindow: 1 << 30, rcvBuf: 4096})
 			c.wmu.Lock()
 			_ = c.fr.WriteWindowUpdate(0, 1<<30)
 			c.wmu.Unlock()
