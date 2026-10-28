@@ -423,3 +423,29 @@ func TestRootSpellingsOverTheWire888(t *testing.T) {
 		})
 	}
 }
+
+// TestRootSpellingsBrowseDoesNotListASymlinkedDirOut888: a directory listing
+// is refused for a symlink to a directory outside the root (the recheck in
+// serveOS), whichever way the root is spelled, and a symlink to a directory
+// inside is listed.
+func TestRootSpellingsBrowseDoesNotListASymlinkedDirOut888(t *testing.T) {
+	for _, sp := range spellings888() {
+		if !sp.chdir {
+			continue
+		}
+		t.Run(sp.name, func(t *testing.T) {
+			r := tree888(t)
+			r.write(t, filepath.Join(r.root, "plain", "listed.txt"), []byte("x"), secretTime888)
+			r.link(t, "plain", "in-plain")
+			mw := sp.open888(t, r, Config{Browse: true})
+			o, _ := outcomeOf888(t, mw, "/esc-dir/")
+			if o.status == 200 || strings.Contains(o.body, "secret.txt") {
+				t.Errorf("GET /esc-dir/: %v, want the listing of a directory outside the root refused", o)
+			}
+			o, _ = outcomeOf888(t, mw, "/in-plain/")
+			if o.status != 200 || !strings.Contains(o.body, "listed.txt") {
+				t.Errorf("GET /in-plain/: %v, want its listing", o)
+			}
+		})
+	}
+}
