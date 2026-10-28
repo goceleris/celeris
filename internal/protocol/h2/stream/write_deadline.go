@@ -74,10 +74,10 @@ func (m *Manager) noteBuffered(id uint32, n int) {
 	if m.wrTimeout <= 0 || n <= 0 {
 		return
 	}
-	now := time.Now().UnixNano()
 	m.stallMu.Lock()
 	st := m.stalls[id]
 	if st == nil {
+		now := time.Now().UnixNano() // read only when a window begins, not for every append to a stalled stream
 		if m.stalls == nil {
 			m.stalls = make(map[uint32]*stall)
 		}

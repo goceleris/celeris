@@ -460,3 +460,56 @@ func BenchmarkOneByteGrantWriteDeadline889(b *testing.B) {
 		})
 	}
 }
+
+// What a stalled stream's floor is made of, through the frames a client sends: a
+// WINDOW_UPDATE that lets 70000 bytes out and a SETTINGS_INITIAL_WINDOW_SIZE raise
+// that does are progress; a hundred WINDOW_UPDATEs of one byte are not.
+func TestWriteProgressThroughFramesIsBytesReleased889(t *testing.T) {
+	ctx := context.Background()
+	mk := func(t *testing.T) (*Processor, *Manager) {
+		p, m, _ := wdSetup889(t)
+		stalled889(m, 1, 1<<20)
+		return p, m
+	}
+	t.Run("window-update-of-70000", func(t *testing.T) {
+		p, m := mk(t)
+		if err := p.ProcessFrame(ctx, makeWindowUpdateFrame(t, 1, 70000)); err != nil {
+			t.Fatal(err)
+		}
+		if out := m.ExpiredWrites(dueAt889(), make([]uint32, 0, 4)); len(out) != 0 {
+			t.Fatalf("expired %v after a WINDOW_UPDATE that released 70000 bytes", out)
+		}
+	})
+	t.Run("settings-initial-window-raise", func(t *testing.T) {
+		p, m := mk(t)
+		f := makeSettingsFrame(t, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 65535 + 70000})
+		if err := p.ProcessFrame(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+		if out := m.ExpiredWrites(dueAt889(), make([]uint32, 0, 4)); len(out) != 0 {
+			t.Fatalf("expired %v after a SETTINGS raise that released 70000 bytes", out)
+		}
+	})
+	t.Run("a-hundred-one-byte-updates", func(t *testing.T) {
+		p, m := mk(t)
+		for i := 0; i < 100; i++ {
+			if err := p.ProcessFrame(ctx, makeWindowUpdateFrame(t, 1, 1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if out := m.ExpiredWrites(dueAt889(), make([]uint32, 0, 4)); len(out) != 1 {
+			t.Fatalf("expired %v, want the dribbled stream", out)
+		}
+	})
+	t.Run("a-ping-and-a-conn-window-update-with-no-stream-in-need", func(t *testing.T) {
+		p, m := mk(t)
+		for i := 0; i < 50; i++ {
+			if err := p.ProcessFrame(ctx, makeWindowUpdateFrame(t, 0, 1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if out := m.ExpiredWrites(dueAt889(), make([]uint32, 0, 4)); len(out) != 1 {
+			t.Fatalf("expired %v: a conn WINDOW_UPDATE does not move a stream whose own window is shut", out)
+		}
+	})
+}
