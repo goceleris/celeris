@@ -421,3 +421,42 @@ func TestWriteDeadlineCommonPathIsFree889(t *testing.T) {
 		t.Fatalf("conn released %d, want 1000 while a stream is stalled", m.connReleased.Load())
 	}
 }
+
+// BenchmarkOneByteGrantWriteDeadline889 is BenchmarkOneByteGrant911 with the write
+// deadline on (off, it is that benchmark): the price of a stalled stream's flush,
+// which takes the books' lock once to credit what it released.
+func BenchmarkOneByteGrantWriteDeadline889(b *testing.B) {
+	for _, on := range []bool{false, true} {
+		name := "off"
+		if on {
+			name = "on"
+		}
+		b.Run(name, func(b *testing.B) {
+			fw := newTestFrameWriter()
+			p := NewProcessor(HandlerFunc(func(context.Context, *Stream) error { return nil }), fw, newTestResponseWriter())
+			m := p.GetManager()
+			if on {
+				m.SetWriteTimeout(time.Minute)
+			}
+			m.UpdateConnectionWindow(1 << 30)
+			s := m.CreateStream(1)
+			s.SetState(StateOpen)
+			s.SetWindowSize(0)
+			body := make([]byte, 1<<20)
+			s.BufferOutbound(body, true)
+			wu := makeWindowUpdateFrame(&testing.T{}, 1, 1)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if s.OutboundBuffer.Len() < 2 {
+					b.StopTimer()
+					s.BufferOutbound(body, true)
+					b.StartTimer()
+				}
+				if err := p.ProcessFrame(context.Background(), wu); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
