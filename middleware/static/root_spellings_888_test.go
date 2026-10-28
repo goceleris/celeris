@@ -134,42 +134,56 @@ func outcomeOf888(t *testing.T, mw celeris.HandlerFunc, path string, hdr ...stri
 	return o, rec.Header("etag")
 }
 
-// TestRootSpellingsServeTheTree888: the files, directories, index files and
-// dotfiles of the tree are served under "." and "./" (relative to the working
-// directory) and "/" (by absolute path), as under the absolute Root.
+// TestRootSpellingsServeTheTree888: the files, directories and index files of
+// the tree (and its dotfiles, with Dotfiles: Allow) are served under "." and "./"
+// (relative to the working directory) and "/" (by absolute path), as under the
+// absolute Root.
 func TestRootSpellingsServeTheTree888(t *testing.T) {
 	cases := []struct {
 		path string
 		want string // the body of the 200
+		dot  bool   // a hidden file: served with Dotfiles: DotfilesAllow, passed on by default
 	}{
-		{"/", indexBody888},
-		{"/index.html", indexBody888},
-		{"/hello.txt", helloBody888},
-		{"/sub/", subBody888},
-		{"/sub", subBody888},
-		{"/sub/page.txt", pageBody888},
-		{"/./hello.txt", helloBody888},
-		{"/sub/../hello.txt", helloBody888},
-		// The package has no dotfile rule: a dotfile below the root is served,
-		// as under any Root.
-		{"/.env", envBody888},
-		{"/.hidden/x.txt", envBody888},
+		{"/", indexBody888, false},
+		{"/index.html", indexBody888, false},
+		{"/hello.txt", helloBody888, false},
+		{"/sub/", subBody888, false},
+		{"/sub", subBody888, false},
+		{"/sub/page.txt", pageBody888, false},
+		{"/./hello.txt", helloBody888, false},
+		{"/sub/../hello.txt", helloBody888, false},
+		// Hidden files are not served by default (Config.Dotfiles); allowed,
+		// they are served under these roots as under any other.
+		{"/.env", envBody888, true},
+		{"/.hidden/x.txt", envBody888, true},
 	}
 	for _, sp := range append(spellings888(), spelling888{"absolute", "", false, nil}) {
 		for _, tc := range cases {
 			t.Run(sp.name+tc.path, func(t *testing.T) {
 				r := tree888(t)
-				var mw celeris.HandlerFunc
+				cfg := Config{}
+				if tc.dot {
+					cfg.Dotfiles = DotfilesAllow
+				}
+				var mw, def celeris.HandlerFunc
 				path := tc.path
 				if sp.name == "absolute" {
-					mw = New(Config{Root: r.root})
+					cfg.Root = r.root
+					mw = New(cfg)
+					def = New(Config{Root: r.root})
 				} else {
-					mw = sp.open888(t, r, Config{})
+					mw = sp.open888(t, r, cfg)
+					def = sp.open888(t, r, Config{})
 					path = sp.url(r, tc.path)
 				}
 				o, _ := outcomeOf888(t, mw, path)
 				if o.kind != "ok" || o.status != 200 || o.body != tc.want {
 					t.Errorf("GET %s: %v, want a 200 with %q", path, o, tc.want)
+				}
+				if tc.dot {
+					if o, _ := outcomeOf888(t, def, path); o.kind != "passed-on" {
+						t.Errorf("GET %s by default: %v, want it passed on (hidden)", path, o)
+					}
 				}
 			})
 		}

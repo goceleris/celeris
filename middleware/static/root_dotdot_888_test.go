@@ -29,7 +29,7 @@ import (
 // The tree (T is a temp dir; the working directory is T/p/c):
 //
 //	T/../ABOVE.txt  T/TOPSECRET.txt  T/p/PSECRET.txt  T/p/other/o.txt
-//	T/p/c/{index.html,a.txt,.env}  T/p/c/sub/{index.html,b.txt}  T/p/c/x/
+//	T/p/c/{index.html,a.txt,envfile}  T/p/c/sub/{index.html,b.txt}  T/p/c/x/
 //
 // Every file has its own marker as content. For each root spelling the
 // directory R it resolves to is computed independently of the code under test
@@ -58,7 +58,7 @@ func newDotTree888(t *testing.T) dotTree888 {
 	d := dotTree888{top: top, cwd: filepath.Join(top, "p", "c"), files: map[string]string{}}
 	for _, f := range []string{
 		"../ABOVE.txt", "TOPSECRET.txt", "p/PSECRET.txt", "p/other/o.txt",
-		"p/c/index.html", "p/c/a.txt", "p/c/.env", "p/c/sub/index.html", "p/c/sub/b.txt",
+		"p/c/index.html", "p/c/a.txt", "p/c/envfile", "p/c/sub/index.html", "p/c/sub/b.txt",
 	} {
 		abs := filepath.Join(top, filepath.FromSlash(f))
 		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
