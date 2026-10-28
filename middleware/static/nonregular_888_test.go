@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -91,7 +90,7 @@ func newSpecialTree888(t *testing.T) specialTree888 {
 	if err := os.WriteFile(filepath.Join(dir, "reg.txt"), []byte("REG"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Mkfifo(filepath.Join(dir, "fifo"), 0o644); err != nil {
+	if err := mkfifo888(filepath.Join(dir, "fifo")); err != nil {
 		t.Skipf("no mkfifo here: %v", err)
 	}
 	ln, err := net.Listen("unix", filepath.Join(dir, "sock"))
