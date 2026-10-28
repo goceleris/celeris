@@ -37,12 +37,49 @@ func TestPathWithin(t *testing.T) {
 		{"/", "/etc/passwd", true},
 		{"/", "/a", true},
 	}
+	// A base of ".." segments names a directory above the working directory;
+	// nothing above that one is within it. The working directory of these rows
+	// is a tree of three levels, so the answers do not depend on where it is.
+	dotdot := []struct {
+		base, p string
+		want    bool
+	}{
+		{"..", "..", true},
+		{"..", "../a", true},
+		{"..", "../c/a", true},
+		{"..", "a", true}, // the working directory is inside its parent
+		{"..", "../..", false},
+		{"..", "../../etc/passwd", false},
+		{"../..", "../../x", true},
+		{"../..", "../x", true},
+		{"../..", "../../..", false},
+		{"../..", "../../../x", false},
+		{"../..", "../../../../etc/passwd", false},
+		{"../../..", "../../../x", true},
+		{"../../..", "../../../../x", false},
+		{"../x", "../x/y", true},
+		{"../x", "../y", false},
+		{"../x", "../../x", false},
+		{"..", "/etc/passwd", false},
+	}
 	for _, tc := range cases {
 		if runtime.GOOS == "windows" {
 			break // the cases are slash paths; the volume root is checked below
 		}
 		if got := PathWithin(tc.base, tc.p); got != tc.want {
 			t.Errorf("PathWithin(%q, %q) = %v, want %v", tc.base, tc.p, got, tc.want)
+		}
+	}
+	if runtime.GOOS != "windows" {
+		wd := filepath.Join(t.TempDir(), "a", "b", "c")
+		if err := os.MkdirAll(wd, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(wd)
+		for _, tc := range dotdot {
+			if got := PathWithin(tc.base, tc.p); got != tc.want {
+				t.Errorf("PathWithin(%q, %q) = %v, want %v", tc.base, tc.p, got, tc.want)
+			}
 		}
 	}
 	// The root of the volume, whatever the separator.
@@ -81,6 +118,12 @@ func TestResolvedWithin(t *testing.T) {
 		{dir, filepath.Join(dir, "a"), true},
 		{dir, "/etc/passwd", false},
 		{"/", "/etc/passwd", true},
+		// A relative path that climbs back into the base (a symlink "../c/a"
+		// from a working directory named c), and one that climbs out.
+		{".", filepath.Join("..", filepath.Base(dir), "a"), true},
+		{".", filepath.Join("..", "other"), false},
+		{"..", filepath.Join("..", filepath.Base(dir), "a"), true},
+		{"..", filepath.Join("..", "..", "x"), false},
 	} {
 		if got := ResolvedWithin(tc.base, tc.resolved); got != tc.want {
 			t.Errorf("ResolvedWithin(%q, %q) = %v, want %v", tc.base, tc.resolved, got, tc.want)

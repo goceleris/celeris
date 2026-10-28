@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/celeristest"
 )
 
 // A Root of ".", "./" and "/" serves the tree below it (celeris#888 item 46;
@@ -445,6 +446,31 @@ func TestRootSpellingsBrowseDoesNotListASymlinkedDirOut888(t *testing.T) {
 			o, _ = outcomeOf888(t, mw, "/in-plain/")
 			if o.status != 200 || !strings.Contains(o.body, "listed.txt") {
 				t.Errorf("GET /in-plain/: %v, want its listing", o)
+			}
+		})
+	}
+}
+
+// TestRootSpellingsHeadAndRange888: HEAD and a byte range below "." , "./" and
+// "/" are answered as under any Root (the recorder keeps a HEAD's body; the
+// engine drops it on the wire).
+func TestRootSpellingsHeadAndRange888(t *testing.T) {
+	for _, sp := range spellings888() {
+		t.Run(sp.name, func(t *testing.T) {
+			r := tree888(t)
+			mw := sp.open888(t, r, Config{})
+			path := sp.url(r, "/hello.txt")
+			ctx, rec := celeristest.NewContextT(t, "HEAD", path, celeristest.WithHandlers(mw))
+			if err := ctx.Next(); err != nil || rec.StatusCode != 200 || rec.Header("content-length") != fmt.Sprint(len(helloBody888)) {
+				t.Errorf("HEAD %s: status %d, content-length %q, err %v, want 200 and %d", path, rec.StatusCode, rec.Header("content-length"), err, len(helloBody888))
+			}
+			rg, err := get888(t, mw, path, "range", "bytes=0-4")
+			if err != nil || rg.StatusCode != 206 || string(rg.Body) != "hello" {
+				t.Errorf("GET %s bytes=0-4: status %d body %q err %v, want 206 %q", path, rg.StatusCode, rg.Body, err, "hello")
+			}
+			ri, err := get888(t, mw, sp.url(r, "/"), "range", "bytes=0-2")
+			if err != nil || ri.StatusCode != 206 || string(ri.Body) != indexBody888[:3] {
+				t.Errorf("GET / bytes=0-2: status %d body %q err %v, want 206 %q", ri.StatusCode, ri.Body, err, indexBody888[:3])
 			}
 		})
 	}

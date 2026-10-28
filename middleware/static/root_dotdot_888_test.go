@@ -28,7 +28,7 @@ import (
 //
 // The tree (T is a temp dir; the working directory is T/p/c):
 //
-//	T/TOPSECRET.txt  T/p/PSECRET.txt  T/p/other/o.txt
+//	T/../ABOVE.txt  T/TOPSECRET.txt  T/p/PSECRET.txt  T/p/other/o.txt
 //	T/p/c/{index.html,a.txt,.env}  T/p/c/sub/{index.html,b.txt}  T/p/c/x/
 //
 // Every file has its own marker as content. For each root spelling the
@@ -50,13 +50,14 @@ func newDotTree888(t *testing.T) dotTree888 {
 	if runtime.GOOS == "windows" {
 		t.Skip("slash paths and Root \"/\": not run on Windows")
 	}
-	top, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	top := filepath.Join(base, "top")
 	d := dotTree888{top: top, cwd: filepath.Join(top, "p", "c"), files: map[string]string{}}
 	for _, f := range []string{
-		"TOPSECRET.txt", "p/PSECRET.txt", "p/other/o.txt",
+		"../ABOVE.txt", "TOPSECRET.txt", "p/PSECRET.txt", "p/other/o.txt",
 		"p/c/index.html", "p/c/a.txt", "p/c/.env", "p/c/sub/index.html", "p/c/sub/b.txt",
 	} {
 		abs := filepath.Join(top, filepath.FromSlash(f))
@@ -85,7 +86,7 @@ func (d dotTree888) spellings() []rootSpelling888 {
 	return []rootSpelling888{
 		{".", d.cwd}, {"./", d.cwd}, {"x/..", d.cwd}, {"sub/..", d.cwd}, {"./sub/../", d.cwd},
 		{"..", abs("..")}, {"../", abs("..")}, {"./..", abs("..")}, {"x/../..", abs("..")}, {"a/../..", abs("..")},
-		{"../..", abs("../..")}, {"../../", abs("../..")},
+		{"../..", abs("../..")}, {"../../", abs("../..")}, {"../../..", abs("../../..")},
 		{"../x/..", abs("..")}, {"../c", d.cwd}, {"../other", abs("../other")},
 		{"sub", abs("sub")}, {"sub/", abs("sub")},
 		{d.cwd, d.cwd}, {d.cwd + "/", d.cwd}, {filepath.Join(d.cwd, ".."), abs("..")},
@@ -211,7 +212,7 @@ func wire888(t *testing.T, eng celeris.EngineType, reg func(s *celeris.Server)) 
 		_ = s.Shutdown(ctx)
 		<-done
 	})
-	return func(path string) (int, string) {
+	do := func(path string) (int, string) {
 		var lastErr error
 		for range 200 {
 			c, err := net.Dial("tcp", ln.Addr().String())
@@ -236,6 +237,18 @@ func wire888(t *testing.T, eng celeris.EngineType, reg func(s *celeris.Server)) 
 		t.Fatalf("cannot connect: %v", lastErr)
 		return 0, ""
 	}
+	// The server is ready when something answers: a native engine closes the
+	// listener it was given and rebinds it, so an early connection is dropped.
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		if status, _ := do("/ready-probe"); status != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the server did not answer in 30 s")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return do
 }
 
 // wireEngines888 is the engines the wire tests run on; an epoll engine is added
