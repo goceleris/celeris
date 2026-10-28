@@ -259,8 +259,9 @@ type Config struct {
 	// read. A request without a body has no deadline.
 	//
 	// The connection's own clock (the last read) does not close an HTTP/2
-	// connection that has a stream open whose request is whole and no response
-	// waiting for the client's flow-control window: a stream the server is
+	// connection that has a stream open whose request is whole (a response
+	// waiting for the client's flow-control window is bounded by WriteTimeout,
+	// see there, and no longer takes the exemption away): a stream the server is
 	// writing to (an SSE stream) outlives a client that sends no frame. A stream
 	// whose handler never answers is exempt for as long as it holds the stream,
 	// where an HTTP/1.1 async handler that overruns ReadTimeout is closed. When
@@ -372,10 +373,19 @@ type Config struct {
 	// last flush that took bytes there, as before the rule. The rule covers an
 	// HTTP/2 response parked on the socket too. A response that waits for the
 	// client's HTTP/2 flow-control window is not parked (nothing is queued on
-	// the socket) and WriteTimeout does not bound it on epoll: ReadTimeout and
-	// IdleTimeout do, from the client's last frame, so a client that sends a
-	// frame of any kind (a PING) at least once per ReadTimeout holds it, until
-	// per-stream deadlines are added. A request error read while a
+	// the socket); WriteTimeout bounds its stream in its own right, as a
+	// minimum rate, on the native engines: in each WriteTimeout window a stream
+	// that holds buffered bytes must have had at least 64 KiB of them (or all
+	// it held, if less) sent, released by the client's WINDOW_UPDATEs, or it is
+	// reset with RST_STREAM(INTERNAL_ERROR), as net/http resets a stream at its
+	// write deadline. A stream that takes its floor in every window is never
+	// cut (there is no ceiling, where std's deadline is absolute), and a PING or
+	// a WINDOW_UPDATE of a byte is not progress. A stream whose own window has
+	// room but whose bytes wait for the connection's is credited with what the
+	// whole connection released in the window. While such a stream lives,
+	// ReadTimeout and IdleTimeout do not close the connection (WriteTimeout is
+	// its bound); a handler blocked waiting for window keeps its own bound of
+	// WriteTimeout from the start of the wait. A request error read while a
 	// response is queued (a malformed request) puts the connection on the
 	// closing drain below, which counts each byte the client acknowledges and
 	// has no floor: a client that sends one and then takes a few bytes per
