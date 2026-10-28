@@ -6504,16 +6504,24 @@ func (w *Worker) drainH2Writes() {
 	}
 }
 
-// holdsOutput reports whether the conn still has bytes to send: staged in its
-// buffers, a SEND in flight, on the dirty list, or in the kernel's send queue
-// (TIOCOUTQ: unsent and unacknowledged bytes). An error from the ioctl counts as
-// "yes". Worker thread.
-func (cs *connState) holdsOutput() bool {
-	if len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0 || cs.sending || cs.zcNotifPending || cs.dirty {
-		return true
+// outstanding is how many bytes the conn still has to get to its peer: staged
+// in its buffers or in a SEND in flight, or in the kernel's send queue (TIOCOUTQ:
+// unsent and unacknowledged bytes); 0 when there are none. A conn that holds
+// something the count does not see (a SEND or its notification pending, the dirty
+// list) or that cannot be asked (the ioctl failed) reports at least 1. A
+// fixed-file conn is not asked: only its buffers count. Worker thread.
+func (cs *connState) outstanding() int64 {
+	n := int64(len(cs.writeBuf) + len(cs.sendBuf))
+	var err error
+	if !cs.fixedFile { // a fixed-file conn (development only) has no descriptor to ask
+		var q int
+		q, err = unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ)
+		n += int64(max(q, 0))
 	}
-	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ)
-	return err != nil || q != 0
+	if n == 0 && (err != nil || cs.sending || cs.zcNotifPending || cs.dirty) {
+		n = 1
+	}
+	return n
 }
 
 // sweepH2Deadlines runs the per-stream deadlines of the HTTP/2 conns
@@ -6541,17 +6549,17 @@ func (w *Worker) sweepH2Deadlines(now int64) {
 			}
 			w.closeConn(cs.fd) // sends what was staged first
 		case res.CloseNow:
-			if cs.holdsOutput() {
-				// Still sending the tail of a response: not idle (see epoll's
-				// sweepH2Deadlines; io_uring's close already waits for the
-				// SENDs it has issued, but not for the kernel's queue).
-				cs.h2State.ExtendIdle(now)
+			if n := cs.outstanding(); n > 0 && cs.h2State.ExtendIdle(now, n) {
+				// Still sending the tail of a response, and it is going out: not
+				// idle (see epoll's sweepH2Deadlines; io_uring's close already
+				// waits for the SENDs it has issued, but not for the kernel's
+				// queue). Not going out: closed, below, with the GOAWAY.
 				break
 			}
 			if cs.h2State.GoAwayNoWait(cs.writeFn) && w.flushSend(cs) {
 				w.markDirty(cs)
 			}
-			w.closeConn(cs.fd) // sends what was staged first
+			w.closeIdle(cs.fd, cs, now)
 		case res.Wrote:
 			if w.flushSend(cs) {
 				w.markDirty(cs)
@@ -7674,6 +7682,26 @@ func (w *Worker) closeStalled(fd int, cs *connState, now int64) {
 	if w.conns[fd] == cs && cs.closing {
 		cs.lastActivity = now - w.closingDrainBound() - 1
 	}
+}
+
+// closeIdle is the close of an h2 conn the idle clock gave up on: closeConn
+// sends what was staged first. When that is a SEND in flight, the conn is the one
+// ExtendIdle refused (its output did not go down for an idle period: a peer that
+// is not taking it), and closeConn would hold its descriptor and queue for a
+// drain bound, up to WriteTimeout, on top of the two idle periods it has had.
+// The drain's clock is set back past the bound, as closeStalled does; its first
+// sample of the peer's acknowledged bytes (noteClosingAcked reads a conn it has
+// not sampled as progressing) is taken here, as the baseline, so that it is not
+// the sweep's first, which would give the conn the bound again. Worker thread.
+func (w *Worker) closeIdle(fd int, cs *connState, now int64) {
+	w.closeConn(fd)
+	if w.conns[fd] != cs || !cs.closing {
+		return
+	}
+	if !cs.fixedFile && !cs.closeAckedKnown {
+		w.noteClosingAcked(cs, now)
+	}
+	cs.lastActivity = now - w.closingDrainBound() - 1
 }
 
 // sweepWatchDue reports whether the loop owes a timeout sweep outside its

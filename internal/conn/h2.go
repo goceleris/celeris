@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -532,6 +533,10 @@ type H2State struct {
 	d0At    int64
 	idleNs  int64
 	d0Last  uint32
+	// d0Out is the bytes the connection still held when the idle clock last
+	// extended its period (ExtendIdle), 0 when it has not since the last stream
+	// activity: the baseline the next extension has to be under.
+	d0Out uint32
 
 	initialized       bool
 	serverPrefaceSent bool // true if server SETTINGS already written (h2c upgrade path)
@@ -1061,7 +1066,9 @@ type SweepResult struct {
 	// A proposal: the engine closes it only if it has nothing left to send, in
 	// its buffers or in the kernel's send queue (a close with unread frames of the
 	// peer in the receive queue is a reset, which discards the send queue), and
-	// otherwise calls ExtendIdle: a conn still sending is not idle.
+	// otherwise calls ExtendIdle, which says whether to extend (a conn whose
+	// output goes out is not idle) or to close (it has not gone down since the
+	// last extension).
 	CloseNow bool
 }
 
@@ -1095,7 +1102,7 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 		m := s.processor.GetManager()
 		switch last := m.GetLastClientStreamID(); {
 		case last != s.d0Last || m.CountActiveStreams() > 0 || s.processor.TakeIgnoredActivity():
-			s.d0Last, s.d0At = last, now
+			s.d0Last, s.d0At, s.d0Out = last, now, 0
 		case s.d0At == 0:
 			s.d0At = now
 		case now-s.d0At > s.idleNs:
@@ -1146,11 +1153,26 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 	return res
 }
 
-// ExtendIdle restarts the idle period of the connection at now: the engine found
-// it still had output to send when Sweep proposed to close it as idle (CloseNow),
-// and a conn that is sending is not idle: IdleTimeout runs again from here, once
-// the output has gone. Loop thread, from the sweep.
-func (s *H2State) ExtendIdle(now int64) { s.d0At = now }
+// ExtendIdle is the engine's answer to CloseNow when the connection still holds
+// output (outstanding bytes: what is in its write buffers plus the kernel's send
+// queue, unsent and unacknowledged, at least 1 when it holds anything). The
+// output pending is not idle while it goes out, so the idle period restarts at
+// now, at once, and ExtendIdle reports true; but only while it goes out: it
+// remembers outstanding, and the next time the period runs out it reports false,
+// "close it", unless the count is lower than at the last extension. A client that
+// has stopped reading (a closed window), or that pings faster than its round trip
+// (the ACKs of the PING answers are always in flight), does not move the count
+// down, and is closed within two idle periods; a reader that is slow but reading
+// does, at every period (the tail of an 8 MiB body at 1 MB/s). Any stream activity
+// clears the baseline. Loop thread, from the sweep.
+func (s *H2State) ExtendIdle(now int64, outstanding int64) bool {
+	n := uint32(min(max(outstanding, 1), math.MaxUint32))
+	if s.d0Out != 0 && n >= s.d0Out {
+		return false
+	}
+	s.d0Out, s.d0At = n, now
+	return true
+}
 
 // GoAwayNoWait is GoAway for a close the engine is about to make (the idle
 // close of Sweep): GOAWAY(NO_ERROR) naming the last client stream, so that the

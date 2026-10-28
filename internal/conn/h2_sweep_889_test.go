@@ -264,7 +264,9 @@ func TestSweepExtendIdleAndGoAwayNoWait889(t *testing.T) {
 	if res := r.st.Sweep(at, r.write); !res.CloseNow {
 		t.Fatalf("after 1.5 s idle: %+v, want CloseNow", res)
 	}
-	r.st.ExtendIdle(at) // the engine found output pending
+	if !r.st.ExtendIdle(at, 1000) { // the engine found output pending
+		t.Fatal("the first ExtendIdle refused")
+	}
 	if res := r.st.Sweep(at+int64(500*time.Millisecond), r.write); res.CloseNow {
 		t.Fatal("CloseNow 0.5 s after ExtendIdle")
 	}
@@ -315,5 +317,59 @@ func TestSweepAnswersABurstOfExpiriesInOneSweep889(t *testing.T) {
 	}
 	if total != n {
 		t.Fatalf("%d of %d expired requests answered after repeated sweeps", total, n)
+	}
+}
+
+// TestSweepExtendIdleNeedsProgress889: the idle period is extended for output
+// only while the count of bytes the conn holds goes down from one extension to
+// the next; one that stays or goes up is refused (the engine then closes it), and
+// stream activity forgets the baseline.
+func TestSweepExtendIdleNeedsProgress889(t *testing.T) {
+	r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
+	r.written()
+	now := time.Now().UnixNano()
+	r.st.Sweep(now, r.write)
+	step := int64(1200 * time.Millisecond)
+	expire := func() {
+		t.Helper()
+		now += step
+		if res := r.st.Sweep(now, r.write); !res.CloseNow {
+			t.Fatalf("no CloseNow at %v", time.Duration(now))
+		}
+	}
+	expire()
+	for i, n := range []int64{1 << 20, 600 << 10, 100 << 10, 1} {
+		if !r.st.ExtendIdle(now, n) {
+			t.Fatalf("extension %d at %d bytes refused, the count is going down", i, n)
+		}
+		expire()
+	}
+	if r.st.ExtendIdle(now, 1) {
+		t.Fatal("extended at the same count: no progress")
+	}
+	if r.st.ExtendIdle(now, 5<<20) {
+		t.Fatal("extended at a higher count")
+	}
+	// A conn with no baseline (the first expiry) is always given one period, and
+	// the call with 0 (nothing held) is clamped to 1, not a free pass later.
+	q := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
+	q.written()
+	if !q.st.ExtendIdle(now, 0) || q.st.ExtendIdle(now, 0) {
+		t.Fatal("0 outstanding: the first call must extend and the second refuse")
+	}
+	// Stream activity clears the baseline: a new stream, then idle again.
+	r2 := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
+	r2.written()
+	t0 := time.Now().UnixNano()
+	r2.st.Sweep(t0, r2.write)
+	if res := r2.st.Sweep(t0+step, r2.write); !res.CloseNow || !r2.st.ExtendIdle(t0+step, 1000) {
+		t.Fatalf("setup: %+v", res)
+	}
+	r2.frames(func(fr *http2.Framer) {
+		_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r2.block("POST", "/u"), EndHeaders: true})
+	})
+	r2.st.Sweep(t0+2*step, r2.write)
+	if r2.st.d0Out != 0 {
+		t.Fatalf("stream activity left the baseline at %d", r2.st.d0Out)
 	}
 }
