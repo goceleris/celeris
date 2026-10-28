@@ -1074,13 +1074,19 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // "." or "./" is the working directory and one of "/" the filesystem's root
 // (before v1.6.0 these two refused every file with a 400): with "/" nothing is
 // outside baseDir, so only the file's own existence limits what userPath may
-// name.
+// name. An empty baseDir is refused with a 400, not read as ".".
 func (c *Context) FileFromDir(baseDir, userPath string) error {
 	return c.fileFromDir(baseDir, userPath, "", nil)
 }
 
 // fileFromDir is FileFromDir with serveFile's contentType and onOpen.
 func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+	if baseDir == "" {
+		// filepath.Clean("") is ".": an unset root (Server.Static("/f",
+		// os.Getenv("DIR"))) would serve the working directory. It was refused
+		// before "." was accepted, and stays so.
+		return NewHTTPError(400, "invalid file path")
+	}
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
 	if !ctxkit.PathWithin(base, abs) {
