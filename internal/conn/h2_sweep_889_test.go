@@ -5,6 +5,7 @@ import (
 	"context"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -478,4 +479,18 @@ func TestSweepFramesOnAResetStreamAreNotActivity889(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestH2StateStaysInItsSizeClass889: an H2State is one allocation of exactly
+// 640 bytes, the edge of a malloc size class; one byte more is 704, 10% more memory
+// for every h2 connection. The sweep's fields (celeris#889) were packed to stay
+// in it; the words the sweep's look at a conn with nothing due reads are the
+// first 40 bytes.
+func TestH2StateStaysInItsSizeClass889(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("the size class is a 64-bit one")
+	}
+	if got := unsafe.Sizeof(H2State{}); got > 640 {
+		t.Errorf("sizeof(H2State) = %d, want at most 640 (the malloc size class it was in)", got)
+	}
 }
