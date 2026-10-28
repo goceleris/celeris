@@ -264,7 +264,7 @@ func TestSweepExtendIdleAndGoAwayNoWait889(t *testing.T) {
 	if res := r.st.Sweep(at, r.write); !res.CloseNow {
 		t.Fatalf("after 1.5 s idle: %+v, want CloseNow", res)
 	}
-	if !r.st.ExtendIdle(at, 1000) { // the engine found output pending
+	if !r.st.ExtendIdle(at, 1000, true) { // the engine found output pending
 		t.Fatal("the first ExtendIdle refused")
 	}
 	if res := r.st.Sweep(at+int64(500*time.Millisecond), r.write); res.CloseNow {
@@ -293,83 +293,189 @@ func TestSweepExtendIdleAndGoAwayNoWait889(t *testing.T) {
 	}
 }
 
-// A burst of expiries is answered in one Sweep.
+// A burst of expiries is answered in one Sweep: all of them, in batches of 32
+// until a batch comes back short. The time budget that bounds the loop is taken
+// out of the count (a variable a test sets), so that the count does not depend on
+// the machine: with it off, 100 expiries take one Sweep (a mutant that answers
+// one batch of 32, or 8, per sweep needs 4 or 13) and with a budget that is spent
+// at once the first batch is all one Sweep answers and the rest is the next's,
+// never lost.
 func TestSweepAnswersABurstOfExpiriesInOneSweep889(t *testing.T) {
-	r := newSweepRig889(t, H2Config{ReadTimeout: time.Second})
-	r.written()
 	const n = 100
-	r.frames(func(fr *http2.Framer) {
-		for i := range n {
-			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: uint32(1 + 2*i), BlockFragment: r.block("POST", "/u"), EndHeaders: true})
+	burst := func(t *testing.T, budget time.Duration) (sweeps, first int) {
+		t.Helper()
+		old := expireBudget
+		expireBudget = budget
+		t.Cleanup(func() { expireBudget = old })
+		r := newSweepRig889(t, H2Config{ReadTimeout: time.Second})
+		r.written()
+		r.frames(func(fr *http2.Framer) {
+			for i := range n {
+				_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: uint32(1 + 2*i), BlockFragment: r.block("POST", "/u"), EndHeaders: true})
+			}
+		})
+		now := time.Now().UnixNano() + int64(2*time.Second)
+		total := 0
+		for total < n && sweeps < 20 {
+			e := r.st.Sweep(now+int64(sweeps), r.write).Expired
+			if sweeps == 0 {
+				first = e
+			}
+			total += e
+			sweeps++
+		}
+		if total != n {
+			t.Fatalf("%d of %d expired requests answered after %d sweeps", total, n, sweeps)
+		}
+		return sweeps, first
+	}
+	t.Run("no-budget", func(t *testing.T) {
+		if sweeps, first := burst(t, time.Hour); sweeps != 1 || first != n {
+			t.Fatalf("%d sweeps, the first answered %d of %d: want one sweep for all", sweeps, first, n)
 		}
 	})
-	now := time.Now().UnixNano() + int64(2*time.Second)
-	res := r.st.Sweep(now, r.write)
-	// The batch loop is bounded by a time budget (2 ms), which the race
-	// detector's slowdown can use up: what the budget cuts off is the next
-	// sweep's, never lost.
-	if res.Expired < 32 {
-		t.Fatalf("one Sweep answered %d of %d expired requests, want at least a batch (32)", res.Expired, n)
-	}
-	total := res.Expired
-	for i := 0; i < 20 && total < n; i++ {
-		total += r.st.Sweep(now+int64(i), r.write).Expired
-	}
-	if total != n {
-		t.Fatalf("%d of %d expired requests answered after repeated sweeps", total, n)
-	}
+	t.Run("budget-spent", func(t *testing.T) {
+		if sweeps, first := burst(t, -1); first != 32 || sweeps != 4 {
+			t.Fatalf("%d sweeps, the first answered %d: want a batch of 32 per sweep (4 sweeps) when the budget is spent at once", sweeps, first)
+		}
+	})
 }
 
 // TestSweepExtendIdleNeedsProgress889: the idle period is extended for output
-// only while the count of bytes the conn holds goes down from one extension to
-// the next; one that stays or goes up is refused (the engine then closes it), and
-// stream activity forgets the baseline.
+// only while the peer acknowledged more bytes since the last extension than the
+// control frames the server wrote to it in the meantime; stream activity forgets
+// the baseline, and a conn whose acknowledged bytes cannot be read is extended.
 func TestSweepExtendIdleNeedsProgress889(t *testing.T) {
-	r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
-	r.written()
-	now := time.Now().UnixNano()
-	r.st.Sweep(now, r.write)
+	newConn := func() (*sweepRig889, int64) {
+		r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
+		r.written()
+		now := time.Now().UnixNano()
+		r.st.Sweep(now, r.write)
+		return r, now
+	}
 	step := int64(1200 * time.Millisecond)
-	expire := func() {
-		t.Helper()
-		now += step
-		if res := r.st.Sweep(now, r.write); !res.CloseNow {
-			t.Fatalf("no CloseNow at %v", time.Duration(now))
+	ctl := func(r *sweepRig889, n int) { // the server writes n bytes of control frames
+		r.st.outBuf.Write(make([]byte, n))
+		r.st.flushOut(r.write)
+	}
+	t.Run("a-reader-extends", func(t *testing.T) {
+		r, now := newConn()
+		acked := uint64(1000)
+		for i := range 6 { // the peer takes 100 KB per period, the server wrote 100 bytes of ACKs
+			now += step
+			if res := r.st.Sweep(now, r.write); !res.CloseNow {
+				t.Fatalf("no CloseNow at period %d", i)
+			}
+			if !r.st.ExtendIdle(now, acked, true) {
+				t.Fatalf("extension %d refused although the peer acknowledged 100 KB", i)
+			}
+			ctl(r, 100)
+			acked += 100 << 10
 		}
-	}
-	expire()
-	for i, n := range []int64{1 << 20, 600 << 10, 100 << 10, 1} {
-		if !r.st.ExtendIdle(now, n) {
-			t.Fatalf("extension %d at %d bytes refused, the count is going down", i, n)
-		}
-		expire()
-	}
-	if r.st.ExtendIdle(now, 1) {
-		t.Fatal("extended at the same count: no progress")
-	}
-	if r.st.ExtendIdle(now, 5<<20) {
-		t.Fatal("extended at a higher count")
-	}
-	// A conn with no baseline (the first expiry) is always given one period, and
-	// the call with 0 (nothing held) is clamped to 1, not a free pass later.
-	q := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
-	q.written()
-	if !q.st.ExtendIdle(now, 0) || q.st.ExtendIdle(now, 0) {
-		t.Fatal("0 outstanding: the first call must extend and the second refuse")
-	}
-	// Stream activity clears the baseline: a new stream, then idle again.
-	r2 := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
-	r2.written()
-	t0 := time.Now().UnixNano()
-	r2.st.Sweep(t0, r2.write)
-	if res := r2.st.Sweep(t0+step, r2.write); !res.CloseNow || !r2.st.ExtendIdle(t0+step, 1000) {
-		t.Fatalf("setup: %+v", res)
-	}
-	r2.frames(func(fr *http2.Framer) {
-		_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r2.block("POST", "/u"), EndHeaders: true})
 	})
-	r2.st.Sweep(t0+2*step, r2.write)
-	if r2.st.d0Out != 0 {
-		t.Fatalf("stream activity left the baseline at %d", r2.st.d0Out)
-	}
+	t.Run("a-flat-count-refuses", func(t *testing.T) {
+		r, now := newConn()
+		now += step
+		r.st.Sweep(now, r.write)
+		if !r.st.ExtendIdle(now, 5000, true) {
+			t.Fatal("the first extension has no baseline and is given")
+		}
+		now += step
+		r.st.Sweep(now, r.write)
+		if r.st.ExtendIdle(now, 5000, true) {
+			t.Fatal("extended with nothing acknowledged in the period (a client that stopped reading)")
+		}
+	})
+	t.Run("acks-of-our-own-frames-are-not-progress", func(t *testing.T) {
+		r, now := newConn()
+		now += step
+		r.st.Sweep(now, r.write)
+		r.st.ExtendIdle(now, 5000, true)
+		ctl(r, 85) // five PING answers
+		now += step
+		r.st.Sweep(now, r.write)
+		if r.st.ExtendIdle(now, 5000+85, true) {
+			t.Fatal("extended on the acknowledgement of the 85 bytes the server itself wrote (ACK lag)")
+		}
+		// One more byte than the server wrote is progress (the in-flight went down).
+		r2, now2 := newConn()
+		now2 += step
+		r2.st.Sweep(now2, r2.write)
+		r2.st.ExtendIdle(now2, 5000, true)
+		ctl(r2, 85)
+		if !r2.st.ExtendIdle(now2+step, 5000+86, true) {
+			t.Fatal("refused with more acknowledged than the server wrote")
+		}
+	})
+	t.Run("no-count-extends", func(t *testing.T) {
+		r, now := newConn()
+		for i := range 4 {
+			now += step
+			r.st.Sweep(now, r.write)
+			if !r.st.ExtendIdle(now, 0, false) {
+				t.Fatalf("a conn whose acknowledged bytes cannot be read was refused at %d", i)
+			}
+		}
+	})
+	t.Run("activity-clears-the-baseline", func(t *testing.T) {
+		r, t0 := newConn()
+		r.st.Sweep(t0+step, r.write)
+		if !r.st.ExtendIdle(t0+step, 1000, true) || r.st.d0Acked == 0 {
+			t.Fatal("setup")
+		}
+		r.frames(func(fr *http2.Framer) {
+			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r.block("POST", "/u"), EndHeaders: true})
+		})
+		r.st.Sweep(t0+2*step, r.write)
+		if r.st.d0Acked != 0 {
+			t.Fatalf("stream activity left the baseline at %d", r.st.d0Acked)
+		}
+	})
+}
+
+// TestSweepFramesOnAResetStreamAreNotActivity889: the server resets a request
+// (no :path) whose client side is still open; DATA the client goes on sending for
+// that stream is ignored and is not stream activity, so the idle clock runs out
+// whatever it sends. For the stream of an expired request, which has a tombstone
+// that lasts at most 2 x ReadTimeout, it is activity (the slow uploader, M3).
+func TestSweepFramesOnAResetStreamAreNotActivity889(t *testing.T) {
+	step := int64(300 * time.Millisecond)
+	t.Run("reset-for-another-cause", func(t *testing.T) {
+		r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
+		r.written()
+		now := time.Now().UnixNano()
+		r.st.Sweep(now, r.write)
+		r.frames(func(fr *http2.Framer) {
+			noPath := []byte{0x82, 0x86, 0x41, 0x01, 'x'}
+			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: noPath, EndHeaders: true})
+		})
+		closed := false
+		for i := 0; i < 12 && !closed; i++ {
+			now += step
+			r.frames(func(fr *http2.Framer) { _ = fr.WriteData(1, false, []byte{'x'}) })
+			closed = r.st.Sweep(now, r.write).CloseNow
+		}
+		if !closed {
+			t.Fatal("DATA for a stream the server reset held the idle clock for 3.6 s with IdleTimeout 1 s")
+		}
+	})
+	t.Run("expired-request", func(t *testing.T) {
+		r := newSweepRig889(t, H2Config{IdleTimeout: time.Second, ReadTimeout: time.Second})
+		r.written()
+		now := time.Now().UnixNano()
+		r.frames(func(fr *http2.Framer) {
+			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r.block("POST", "/u"), EndHeaders: true})
+		})
+		now += int64(1100 * time.Millisecond)
+		if res := r.st.Sweep(now, r.write); res.Expired != 1 {
+			t.Fatalf("setup: %+v", res)
+		}
+		for i := 0; i < 6; i++ { // 1.8 s of the uploader's DATA, past IdleTimeout
+			now += step
+			r.frames(func(fr *http2.Framer) { _ = fr.WriteData(1, false, []byte{'x'}) })
+			if r.st.Sweep(now, r.write).CloseNow {
+				t.Fatalf("the uploader's DATA for an expired request did not hold the idle clock (at %d ms)", (i+1)*300)
+			}
+		}
+	})
 }

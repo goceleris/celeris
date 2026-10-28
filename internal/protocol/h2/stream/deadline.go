@@ -137,9 +137,16 @@ func (p *Processor) DropTombstones(now int64) {
 	p.manager.hints.TombDL.Store(next)
 }
 
-// ignoredFrame notes that a frame of a reset or expired stream was ignored: the
-// client is still talking about its streams, which the connection's idle clock
-// counts as activity (conn.H2State.Sweep). A cold path.
+// ignoredFrame notes that a frame of an expired request's stream was ignored: the
+// client is still sending that request, which the connection's idle clock counts
+// as activity (conn.H2State.Sweep). It is called only for a stream with a
+// tombstone, whose memory lasts at most 2 x ReadTimeout from the expiry: the slow
+// uploader's DATA and trailers in flight (M3) are activity for that long and no
+// longer. A frame for a stream the server reset for another cause, or one that is
+// in the window of reset identifiers only, is ignored and is not activity: a
+// client could otherwise send a byte of DATA on such a stream every period for as
+// long as it liked, at no cost, and hold the idle clock and the progress cap's
+// baseline (celeris#889, review r5 F2). A cold path.
 func (p *Processor) ignoredFrame() { p.ignoredAct.Store(true) }
 
 // TakeIgnoredActivity reports, and clears, whether a frame was ignored for a

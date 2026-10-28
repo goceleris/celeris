@@ -4814,21 +4814,20 @@ func (l *Loop) checkTimeouts() {
 	}
 }
 
-// outstanding is how many bytes the conn still has to get to its peer: in its
-// write buffers (csPendingBytes), or in the kernel's send queue (TIOCOUTQ:
-// unsent and unacknowledged bytes; the notion the pool-wait gate uses before it
-// closes a conn); 0 when there are none. A conn that holds something the count
-// does not see (the dirty list, EPOLLOUT armed, a write in progress) or that
-// cannot be asked (the ioctl failed) reports at least 1: a conn is not closed as
-// idle by a clock that cannot see its output. Loop thread.
-func (cs *connState) outstanding() int64 {
-	n := int64(csPendingBytes(cs))
-	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ)
-	n += int64(max(q, 0))
-	if n == 0 && (err != nil || cs.dirty || cs.epollOut || cs.writeSince != 0 || csWritePending(cs)) {
-		n = 1
+// holdsOutput reports whether the conn still has bytes to get to its peer: in
+// its write buffers (csWritePending, the dirty list, EPOLLOUT armed), or in the
+// kernel's send queue (TIOCOUTQ: unsent and unacknowledged bytes; the notion the
+// pool-wait gate uses before it closes a conn). An ioctl that fails counts as
+// "yes": a conn that cannot be asked is not closed for output the idle clock
+// cannot see, and the progress it makes is judged by the acknowledged bytes
+// (H2State.ExtendIdle), which has its own answer for a conn that cannot be asked
+// (it is extended, bounded by the conn's own clock). Loop thread.
+func (cs *connState) holdsOutput() bool {
+	if csWritePending(cs) || cs.dirty || cs.epollOut || cs.writeSince != 0 {
+		return true
 	}
-	return n
+	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ)
+	return err != nil || q != 0
 }
 
 // sweepH2Deadlines runs the per-stream deadlines of the HTTP/2 conns
@@ -4853,16 +4852,21 @@ func (l *Loop) sweepH2Deadlines(now int64) {
 		case res.CloseAfterFlush:
 			l.closeWhenFlushed(cs)
 		case res.CloseNow:
-			if n := cs.outstanding(); n > 0 && cs.h2State.ExtendIdle(now, n) {
-				// Still sending the tail of a response, and it is going out: not
-				// idle. The stream is gone from the manager once its last DATA is
-				// in the conn's buffers, and the kernel's send queue can hold
+			if cs.holdsOutput() {
+				// Still sending the tail of a response: not idle while it goes
+				// out. The stream is gone from the manager once its last DATA
+				// is in the conn's buffers, and the kernel's send queue can hold
 				// megabytes; a close with the peer's frames unread in the receive
 				// queue is a reset, which discards it (the review of the first
-				// version of D0 measured an 8 MiB download cut at 5 MB). Not
-				// going out (ExtendIdle says no: the count has not gone down
-				// since the last extension): closed, below, with the GOAWAY.
-				break
+				// version of D0 measured an 8 MiB download cut at 5 MB). It goes
+				// out if the peer acknowledged bytes since the last extension
+				// (ExtendIdle); if it did not (a client that stopped reading, one
+				// that pings faster than its round trip), the conn is closed
+				// below, with the GOAWAY.
+				acked, err := l.bytesAcked(cs.fd)
+				if cs.h2State.ExtendIdle(now, acked, err == nil && acked > 0) {
+					break
+				}
 			}
 			// GOAWAY(NO_ERROR) naming the last client stream, flushed inline,
 			// then the close: the client knows what was processed.
