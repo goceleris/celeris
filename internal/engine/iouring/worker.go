@@ -7724,10 +7724,15 @@ func (w *Worker) closeStalled(fd int, cs *connState, now int64) {
 // and is reaped one sweep later, not after the drain bound (review r6 F9: reaping
 // in the same pass shut the socket before the SQE was submitted, and the pinger
 // got a bare EOF where epoll delivers the GOAWAY). Submitting the ring before the
-// reap would not do: on an SQPOLL tier a submit only wakes the poller. The first
-// sample of the peer's acknowledged bytes (noteClosingAcked reads a conn it has
-// not sampled as progressing) is taken here, as the baseline, so that it is not
-// the sweep's first, which would give the conn the bound again.
+// reap would not do: on an SQPOLL tier a submit only wakes the poller.
+//
+// The sweep after this one must not look at the peer's acknowledged bytes
+// (noteClosingAcked): the ACKs of bytes that were in flight at the moment of the
+// decision still arrive after it, and the look would read them as the peer taking
+// bytes and give the conn another drain bound, up to WriteTimeout (the zero-window
+// cell failed once on a CI runner, the conn open 9.5 s later; the first version of
+// the grace did that). The decision rests on a whole idle period without progress,
+// which is more evidence than one sample.
 //
 // Only for the refused conn: the idle close of a conn with nothing to send but its
 // GOAWAY must give that SEND its drain (review r5 F1). Worker thread.
@@ -7736,10 +7741,11 @@ func (w *Worker) closeRefused(fd int, cs *connState, now int64) {
 	if w.conns[fd] != cs || !cs.closing {
 		return
 	}
-	if !cs.fixedFile && !cs.closeAckedKnown {
-		w.noteClosingAcked(cs, now)
-	}
-	cs.lastActivity = now - w.closingDrainBound() + 1 // out of bound at the next sweep, not this one
+	// Out of bound at the next sweep, not this one; and no sample of the peer's
+	// acknowledged bytes in between: closeSampled is set past the instant the
+	// sweep's rule would take one (see noteClosingAcked's callers).
+	cs.lastActivity = now - w.closingDrainBound() + 1
+	cs.closeSampled = now + 2
 }
 
 // sweepWatchDue reports whether the loop owes a timeout sweep outside its
