@@ -19,9 +19,9 @@ const wellKnown = ".well-known"
 
 // HiddenSegment reports whether one path segment names a hidden file or
 // directory: it starts with a dot (".env", ".git", ".ssh", ".htaccess",
-// ".."), except the exact name ".well-known". The segment "." and the empty
-// segment are not names and are not hidden (HiddenPath drops them first). A
-// segment that percent-decodes to such a name is hidden too, so a layer that
+// ".", ".."), except the exact name ".well-known". A literal "." segment is
+// not a name and never reaches it (HiddenPath drops it first); "%2e" does, and
+// is hidden. A segment that percent-decodes to such a name is hidden too, so a layer that
 // decodes the path later cannot turn a visible segment into a dotfile.
 func HiddenSegment(seg string) bool {
 	if hiddenName(seg) {

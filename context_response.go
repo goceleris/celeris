@@ -1078,14 +1078,33 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // baseDir is read against the working directory at each call; one made of ".."
 // segments ("..", "../..") means the directory it resolves to, and a userPath
 // that climbs out of that directory is refused (before v1.6.0 it was not: a
-// baseDir of ".." served any file the process could read). Dotfiles are served:
-// there is no rule against them.
+// baseDir of ".." served any file the process could read). Hidden files
+// (names that start with a dot) are served: the caller chooses the path, and
+// the dotfile rule of middleware/static, Server.Static and Group.Static does not
+// apply here.
 func (c *Context) FileFromDir(baseDir, userPath string) error {
-	return c.fileFromDir(baseDir, userPath, "", nil)
+	return c.fileFromDir(baseDir, userPath, "", nil, nil)
+}
+
+// serveStaticFile is what Server.Static and Group.Static serve with: FileFromDir
+// for a directory server, which does not serve hidden files and directories
+// (names that start with a dot, except the exact ".well-known"; see
+// middleware/static, Config.Dotfiles): a path with such a segment, or that
+// leads to one through a symlink, is a 404 whether or not the file exists.
+// FileFromDir itself, whose caller chooses the path, is unchanged.
+func (c *Context) serveStaticFile(root, tail string) error {
+	if ctxkit.HiddenPath(tail) {
+		return NewHTTPError(404, "Not Found")
+	}
+	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
+	if errors.Is(err, ctxkit.ErrHidden) {
+		return NewHTTPError(404, "Not Found")
+	}
+	return err
 }
 
 // fileFromDir is FileFromDir with serveFile's contentType and onOpen.
-func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64), hidden func(rel string) bool) error {
 	if baseDir == "" {
 		// filepath.Clean("") is ".": an unset root (Server.Static("/f",
 		// os.Getenv("DIR"))) would serve the working directory. It was refused
@@ -1108,6 +1127,17 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 	}
 	if !ctxkit.ResolvedWithin(resolvedBase, resolved) {
 		return NewHTTPError(400, "invalid file path")
+	}
+	if hidden != nil {
+		// Where the path leads, not only what it says: a visible name that is a
+		// symlink to a dotfile of the tree is refused like the dotfile.
+		rel, ok := ctxkit.RelWithin(resolvedBase, resolved)
+		if !ok {
+			return NewHTTPError(400, "invalid file path")
+		}
+		if hidden(rel) {
+			return ctxkit.ErrHidden
+		}
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {

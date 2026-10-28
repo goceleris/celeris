@@ -10,6 +10,8 @@
 //   - [Config].SPA — single-page app mode: unknown paths serve the index file.
 //   - [Config].MaxAge — Cache-Control max-age duration (zero = no header).
 //   - [Config].Compress — serve pre-compressed .br/.gz variants when accepted.
+//   - [Config].Dotfiles — hidden files and directories (names that start with
+//     a dot) are not served by default.
 //   - [Config].Skip / [Config].SkipPaths — skip the middleware dynamically or
 //     by exact path match.
 //
@@ -34,15 +36,42 @@
 // checks agree, for a Root of ".", "./" and "/" as for any other directory:
 // these three serve the tree below them (before v1.6.0 they served nothing below
 // the root, and the root's own index answered 400 or 304 depending on whether a
-// validator matched). Their meaning is wide: "." is the working directory,
-// dotfiles (.env, .git) included, and "/" the whole filesystem; when the
-// working directory is "/" (a systemd service, a container without a WORKDIR),
-// "." is the whole filesystem too, /proc/self/environ among its files. A
-// configuration that was inert since v1.3.3 starts to serve files after the
-// upgrade. The package has no dotfile rule today (a default deny is being
-// decided). A Root made of ".." segments means the directory it resolves to,
-// and nothing outside it is served. Name the directory that holds what is
-// public; see [Config].Root.
+// validator matched). Their meaning is wide: "." is the working directory and
+// "/" the whole filesystem; when the working directory is "/" (a systemd
+// service, a container without a WORKDIR), "." is the whole filesystem too,
+// /proc/self/environ among its files. A configuration that was inert since
+// v1.3.3 starts to serve files after the upgrade, which the dotfile rule below
+// makes safer (.env and .git are not served by default). A Root made of ".."
+// segments means the directory it resolves to, and nothing outside it is
+// served. Name the directory that holds what is public; see [Config].Root.
+//
+// # Dotfiles
+//
+// A file or directory whose name starts with a dot (.env, .git, .ssh,
+// .htaccess) is not served by default: a request whose path below the root
+// has such a segment is answered as if the file did not exist ([DotfilesIgnore]:
+// the next handler, which is the router's 404 when nothing else answers; the
+// index file in SPA mode), whether or not it exists, so a client learns
+// nothing about it. Every segment of the request path counts, after the path
+// is cleaned ("a/../.env" is ".env") and with one level of percent-decoding;
+// the name of the root does not: a Root that is ".config", or "." in such a
+// directory, serves its files. The rule also follows a symlink: a visible name
+// that leads to a hidden file or directory of the tree is refused like it. The
+// exact segment ".well-known" is served (RFC 8615: ACME challenges,
+// security.txt, apple-app-site-association), but its children are served only
+// if they are not hidden themselves. A directory listing (Browse) leaves the
+// hidden entries out. The Index file is the operator's choice and is served
+// even if its name starts with a dot. [DotfilesDeny] answers 403 instead;
+// [DotfilesAllow] serves hidden files like any other, as before v1.6.0:
+//
+//	// A project that serves a hidden file on purpose names its directory and
+//	// allows dotfiles there, and keeps its secrets out of that directory.
+//	static.New(static.Config{Root: "./public", Dotfiles: static.DotfilesAllow})
+//
+// The rule is the middleware's, and that of Server.Static and Group.Static,
+// which serve a directory too (without a way to opt out: use the middleware for
+// that). [celeris.Context.FileFromDir], whose caller chooses the path, does not
+// apply it.
 //
 // With compress in front of an [Config].FS, the strong tag of a file that compress
 // encodes is made weak on the 200 (W/"hash"), and static marks the response so

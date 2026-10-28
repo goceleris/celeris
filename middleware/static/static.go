@@ -3,6 +3,7 @@ package static
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -111,6 +112,24 @@ func New(config ...Config) celeris.HandlerFunc {
 	root := cfg.Root
 	fsys := cfg.FS
 	compress := cfg.Compress
+	dotfiles := cfg.Dotfiles
+
+	// hidden is nil when hidden files are served (DotfilesAllow). Otherwise it
+	// tells whether a slash path below the root, resolved, has a hidden
+	// segment; the Index file, which the operator chose, is not counted.
+	var hidden func(rel string) bool
+	if dotfiles != DotfilesAllow {
+		idx := strings.Trim(filepath.ToSlash(filepath.Clean(index)), "/")
+		hidden = func(rel string) bool {
+			for _, v := range [...]string{"", ".br", ".gz"} {
+				if t := idx + v; rel == t || strings.HasSuffix(rel, "/"+t) {
+					rel = strings.TrimSuffix(strings.TrimSuffix(rel, t), "/")
+					break
+				}
+			}
+			return ctxkit.HiddenPath(rel)
+		}
+	}
 
 	// Precompute cleanRoot once instead of per request.
 	var cleanRoot string
@@ -161,17 +180,41 @@ func New(config ...Config) celeris.HandlerFunc {
 		filePath := strings.TrimPrefix(reqPath, "/")
 		filePath = strings.TrimSuffix(filePath, "/")
 
-		if fsys != nil {
-			return serveFS(c, fsys, filePath, index, browse, spa, compress, cacheControl, &fsCache)
+		// notFound answers a hidden path as a path with no file is answered:
+		// the index in SPA mode, the next handler otherwise (DotfilesIgnore), or
+		// refuses it (DotfilesDeny). A hidden path is decided before the file
+		// system is looked at, so what is answered does not tell whether it exists.
+		notFound := func() error {
+			if dotfiles == DotfilesDeny {
+				return celeris.NewHTTPError(403, "Forbidden")
+			}
+			switch {
+			case spa && fsys != nil:
+				return serveFS(c, fsys, index, index, browse, false, compress, cacheControl, &fsCache, true)
+			case spa:
+				return c.FileFromDir(cleanRoot, index)
+			}
+			return c.Next()
 		}
-		return serveOS(c, cleanRoot, filePath, index, browse, spa, cacheControl, compress)
+		if hidden != nil && ctxkit.HiddenPath(filePath) {
+			return notFound()
+		}
+
+		if fsys != nil {
+			return serveFS(c, fsys, filePath, index, browse, spa, compress, cacheControl, &fsCache, hidden != nil)
+		}
+		err := serveOS(c, cleanRoot, filePath, index, browse, spa, cacheControl, compress, hidden)
+		if errors.Is(err, ctxkit.ErrHidden) {
+			return notFound()
+		}
+		return err
 	}
 }
 
 // serveOS serves a file from the OS filesystem using c.FileFromDir (which
 // handles directory traversal, symlink escape, and range requests).
 // cleanRoot must be filepath.Clean(root) — precomputed by New.
-func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, cacheControl string, compress bool) error {
+func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, cacheControl string, compress bool, hidden func(rel string) bool) error {
 	fullPath := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
 
 	// Prevent directory traversal: filepath.Join resolves ".." segments,
@@ -216,7 +259,13 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 			if !ctxkit.ResolvedWithin(resolvedRoot, resolved) {
 				return c.Next()
 			}
-			return serveDirListingOS(c, resolved)
+			if hidden != nil {
+				// a visible name that leads to a hidden directory is not listed
+				if rel, ok := ctxkit.RelWithin(resolvedRoot, resolved); !ok || hidden(rel) {
+					return ctxkit.ErrHidden
+				}
+			}
+			return serveDirListingOS(c, resolved, hidden != nil)
 		} else {
 			return c.Next()
 		}
@@ -231,12 +280,12 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 	// variant when one is served; this stat only decided that there is a file,
 	// and answers a 304.
 	if compress {
-		if served, err := servePreCompressed(c, cleanRoot, filePath, fullPath, cacheControl); served {
+		if served, err := servePreCompressed(c, cleanRoot, filePath, fullPath, cacheControl, hidden); served {
 			return err
 		}
 	}
 
-	return serveOSFile(c, cleanRoot, filePath, "", "", cacheControl, info)
+	return serveOSFile(c, cleanRoot, filePath, "", "", cacheControl, info, hidden)
 }
 
 // serveOSHook is a test seam (celeris#846 item 4): when set it runs in serveOS
@@ -265,7 +314,7 @@ var serveOSHook func()
 // variant is served with its original's, not the one its ".gz" maps to).
 // encoding, when not empty, is set as Content-Encoding on the response that
 // carries the file, not on a 304; File drops it again from a 416.
-func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding, cacheControl string, early os.FileInfo) error {
+func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding, cacheControl string, early os.FileInfo, hidden func(rel string) bool) error {
 	if c.Header("if-none-match") != "" || c.Header("if-modified-since") != "" {
 		// Nothing goes on the response until the 304 is decided: early is a
 		// stat, which follows a symlink out of the root before FileFromDir
@@ -281,7 +330,7 @@ func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding,
 		// FileFromDir, which refuses it (celeris#888). The check comes first
 		// and runs for every conditional request, so what it costs does not
 		// depend on whether the client's validator matches the target.
-		if resolvesInside(cleanRoot, filePath) && notModified(c, etag, early.ModTime()) {
+		if resolvesInside(cleanRoot, filePath, hidden) && notModified(c, etag, early.ModTime()) {
 			if etag != "" {
 				setValidators(c, early.ModTime(), etag, cacheControl)
 			}
@@ -293,7 +342,7 @@ func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding,
 		if encoding != "" {
 			c.SetHeader("content-encoding", encoding)
 		}
-	})
+	}, hidden)
 }
 
 // resolvesInside reports whether filePath, a slash path below cleanRoot, still
@@ -309,7 +358,7 @@ func serveOSFile(c *celeris.Context, cleanRoot, filePath, contentType, encoding,
 // lexically outside the root (Config.Index is joined to the requested
 // directory unchecked) is refused without a syscall. The answer can change
 // before the 304 is sent, as it can between FileFromDir's check and its open.
-func resolvesInside(cleanRoot, filePath string) bool {
+func resolvesInside(cleanRoot, filePath string, hidden func(rel string) bool) bool {
 	if resolvesInsideHook != nil {
 		resolvesInsideHook()
 	}
@@ -349,7 +398,15 @@ func resolvesInside(cleanRoot, filePath string) bool {
 	if err != nil {
 		return false
 	}
-	return ctxkit.ResolvedWithin(resolvedRoot, resolved)
+	if !ctxkit.ResolvedWithin(resolvedRoot, resolved) {
+		return false
+	}
+	if hidden != nil {
+		// a symlink that leads to a hidden file is no 304 oracle either
+		rel, ok := ctxkit.RelWithin(resolvedRoot, resolved)
+		return ok && !hidden(rel)
+	}
+	return true
 }
 
 // resolvesInsideHook is a test seam (celeris#888 item 35): when set it runs at
@@ -374,7 +431,7 @@ func acceptsCoding(c *celeris.Context, enc string) bool {
 // 304, If-Range and Content-Range are its own (celeris#846), and it is served
 // with the original's content type. Returns (true, err) if a pre-compressed
 // file was served, (false, nil) to fall through to normal serving.
-func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cacheControl string) (bool, error) {
+func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cacheControl string, hidden func(rel string) bool) (bool, error) {
 	if c.Header("accept-encoding") == "" {
 		return false, nil
 	}
@@ -395,14 +452,14 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cache
 		if ct == "" {
 			ct = "application/octet-stream"
 		}
-		return true, serveOSFile(c, cleanRoot, filePath+v.suffix, ct, v.encoding, cacheControl, vi)
+		return true, serveOSFile(c, cleanRoot, filePath+v.suffix, ct, v.encoding, cacheControl, vi, hidden)
 	}
 
 	return false, nil
 }
 
 // serveFS serves a file from an fs.FS with ETag/Last-Modified and range support.
-func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, cacheControl string, cache *sync.Map) error {
+func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, cacheControl string, cache *sync.Map, hide bool) error {
 	// 1. Open + stat + directory handling.
 	openPath := filePath
 	if openPath == "" {
@@ -412,7 +469,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	f, err := fsys.Open(openPath)
 	if err != nil {
 		if spa {
-			return serveFS(c, fsys, index, index, browse, false, compress, cacheControl, cache)
+			return serveFS(c, fsys, index, index, browse, false, compress, cacheControl, cache, hide)
 		}
 		return c.Next()
 	}
@@ -436,11 +493,11 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 			indexStat, statErr := indexFile.Stat()
 			_ = indexFile.Close()
 			if statErr == nil && !indexStat.IsDir() {
-				return serveFS(c, fsys, indexPath, index, browse, spa, compress, cacheControl, cache)
+				return serveFS(c, fsys, indexPath, index, browse, spa, compress, cacheControl, cache, hide)
 			}
 		}
 		if browse {
-			return serveDirListingFS(c, fsys, openPath)
+			return serveDirListingFS(c, fsys, openPath, hide)
 		}
 		return c.Next()
 	}
@@ -779,21 +836,39 @@ func etagMatch(inm, etag string) bool {
 }
 
 // serveDirListingOS renders a directory listing for an OS path.
-func serveDirListingOS(c *celeris.Context, dirPath string) error {
+func serveDirListingOS(c *celeris.Context, dirPath string, hide bool) error {
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
 		return err
+	}
+	if hide {
+		entries = withoutHidden(entries)
 	}
 	return c.HTML(200, renderListing(c.Path(), entries))
 }
 
 // serveDirListingFS renders a directory listing for an fs.FS path.
-func serveDirListingFS(c *celeris.Context, fsys fs.FS, dirPath string) error {
+func serveDirListingFS(c *celeris.Context, fsys fs.FS, dirPath string, hide bool) error {
 	entries, err := fs.ReadDir(fsys, dirPath)
 	if err != nil {
 		return err
 	}
+	if hide {
+		entries = withoutHidden(entries)
+	}
 	return c.HTML(200, renderListing(c.Path(), entries))
+}
+
+// withoutHidden drops the entries whose name is hidden (starts with a dot,
+// except ".well-known"). It filters in place: the slice is the caller's own.
+func withoutHidden(entries []fs.DirEntry) []fs.DirEntry {
+	kept := entries[:0]
+	for _, e := range entries {
+		if !ctxkit.HiddenSegment(e.Name()) {
+			kept = append(kept, e)
+		}
+	}
+	return kept
 }
 
 // renderListing generates an HTML directory listing. Filenames are

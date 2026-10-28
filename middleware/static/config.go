@@ -42,9 +42,9 @@ type Config struct {
 	// files. Mutually exclusive with FS. If neither Root nor FS is set,
 	// the middleware panics.
 	//
-	// Everything below Root is served, dotfiles and dot directories included
-	// (.env, .git/config): the package has no rule against them today (a
-	// default deny for them is being decided). A path that leaves Root, by
+	// Everything below Root is served, except hidden files and directories
+	// (names that start with a dot, see [Config].Dotfiles: .env and .git are not
+	// served by default). A path that leaves Root, by
 	// "..", an absolute path, or a symlink that resolves outside it, is
 	// refused. A relative Root is read against the working directory at each
 	// request; a Root made of ".." segments ("..", "../..") means the directory
@@ -52,11 +52,13 @@ type Config struct {
 	//
 	// Root may be ".", "./" or "/", and serves the tree below it as any other
 	// directory does. Mind what that is: "." is the process's working
-	// directory, with its sources and configuration (.env, .git), and "/" is
+	// directory, with its sources and configuration, and "/" is
 	// the whole filesystem (/etc/passwd, the home directories,
 	// /proc/self/environ, the process's environment: whatever the process may
 	// read), where nothing is outside Root any more, so the containment check
-	// that protects the others protects nothing. When the working directory
+	// that protects the others protects nothing; only the dotfile rule still
+	// applies to the request path (/home/u/.ssh is not served), and
+	// /etc/passwd and /proc/self/environ are not dotfiles. When the working directory
 	// is "/" (the default of a systemd service and of a container without a
 	// WORKDIR), "." is the whole filesystem too. Before v1.6.0 these three
 	// served nothing below the root, so a configuration that was inert since
@@ -112,7 +114,18 @@ type Config struct {
 	Compress bool
 
 	// Dotfiles is the policy for hidden files and directories: names that
-	// start with a dot. The zero value is [DotfilesIgnore].
+	// start with a dot (.env, .git, .ssh, .htaccess). A request whose path
+	// below Root (or FS) has such a segment, after cleaning ("a/../.env" is
+	// ".env") and one level of percent-decoding, is answered as the policy says:
+	// [DotfilesIgnore] as if the file did not exist, whether or not it does,
+	// [DotfilesDeny] with 403, [DotfilesAllow] by serving it. The exact segment
+	// ".well-known" is not hidden (RFC 8615), but its children are if their own
+	// names start with a dot. Only the segments of the request count: the name
+	// of Root, or of the directory Root "." is in, does not. A visible name that
+	// is a symlink to a hidden file or directory of the tree is refused like the
+	// hidden name. Browse leaves hidden entries out of a listing. The Index file
+	// is the operator's choice and is served even if its name starts with a dot.
+	// The zero value is [DotfilesIgnore].
 	Dotfiles DotfilesPolicy
 }
 
