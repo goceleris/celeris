@@ -159,3 +159,124 @@ func TestGateHoldsAPromotedConnWithAnUnreadRequest1165(t *testing.T) {
 		t.Fatal("the request was not handed to the dispatch goroutine's input")
 	}
 }
+
+// celeris#1166. The gate reads on, and answers, a request in progress on a
+// promoted conn too (a slow upload on a server with any Async route promotes the
+// conn whose request arrives in pieces), and refuses what an idle one sends.
+func TestRefusesRecvReadsOnAPromotedConnOnlyWhileARequestIsInProgress1166(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(r *promoted1165)
+		refuse bool
+	}{
+		{"idle", func(*promoted1165) {}, true},
+		{"partial-request-in-the-parser", func(r *promoted1165) {
+			_ = conn.ProcessH1(context.Background(), []byte("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc"), r.cs.h1State, r.l.handler, func([]byte) {})
+		}, false},
+		{"input-waiting-for-the-goroutine", func(r *promoted1165) {
+			r.cs.asyncInMu.Lock()
+			r.cs.asyncInBuf = append(r.cs.asyncInBuf, 'x')
+			r.cs.asyncInMu.Unlock()
+		}, false},
+		{"inside-a-handler", func(r *promoted1165) {
+			r.cs.asyncInMu.Lock()
+			r.cs.asyncParked = false
+			r.cs.asyncInMu.Unlock()
+		}, false},
+		{"switched-to-h2", func(r *promoted1165) {
+			r.cs.asyncInMu.Lock()
+			r.cs.h2Switched = true
+			r.cs.asyncInMu.Unlock()
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPromoted1165(t)
+			tc.mutate(r)
+			if got := refusesRecv(r.cs); got != tc.refuse {
+				t.Fatalf("refusesRecv = %v, want %v", got, tc.refuse)
+			}
+		})
+	}
+}
+
+// celeris#1166. h1InProgress is what keeps a loop with no HTTP/2 conn waiting,
+// after its context is cancelled, for the request a client is in the middle of
+// sending (or the handler answering it); every case below is a state that must
+// not end the wait, and the idle ones must.
+func TestH1InProgressDecidesTheWaitOfALoopWithoutHTTP21166(t *testing.T) {
+	partial := func(r *promoted1165) {
+		_ = conn.ProcessH1(context.Background(), []byte("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc"), r.cs.h1State, r.l.handler, func([]byte) {})
+	}
+	plain := func(f func(r *promoted1165)) func(r *promoted1165) {
+		return func(r *promoted1165) { r.cs.asyncPromoted = false; f(r) }
+	}
+	cases := []struct {
+		name       string
+		mutate     func(r *promoted1165)
+		inProgress bool
+	}{
+		{"plain-idle", plain(func(*promoted1165) {}), false},
+		{"promoted-idle", func(*promoted1165) {}, false},
+		{"plain-partial-request", plain(partial), true},
+		{"promoted-partial-request", partial, true},
+		{"plain-h2c-upgrade-pending", plain(func(r *promoted1165) { r.cs.h1State.UpgradeInfo = &conn.UpgradeInfo{} }), true},
+		{"undetected-with-some-bytes", plain(func(r *promoted1165) { r.cs.detected, r.cs.detectN = false, 3 }), true},
+		{"undetected-with-none", plain(func(r *promoted1165) { r.cs.detected, r.cs.detectN = false, 0 }), false},
+		{"promoted-input-waiting", func(r *promoted1165) {
+			r.cs.asyncInMu.Lock()
+			r.cs.asyncInBuf = append(r.cs.asyncInBuf, 'x')
+			r.cs.asyncInMu.Unlock()
+		}, true},
+		{"promoted-inside-a-handler", func(r *promoted1165) {
+			r.cs.asyncInMu.Lock()
+			r.cs.asyncParked = false
+			r.cs.asyncInMu.Unlock()
+		}, true},
+		{"promoted-parked-with-a-guarded-write", func(r *promoted1165) { r.cs.detachMu.Lock() }, false},
+		{"plain-detached-stream", plain(func(r *promoted1165) {
+			partial(r)
+			r.cs.h1State.Detached.Store(true)
+		}), false},
+		{"plain-http2", plain(func(r *promoted1165) { r.cs.protocol = engine.H2C }), false},
+		{"promoted-switched-to-h2", func(r *promoted1165) {
+			partial(r)
+			r.cs.asyncInMu.Lock()
+			r.cs.h2Switched = true
+			r.cs.asyncInMu.Unlock()
+		}, false},
+		{"hijacked", func(r *promoted1165) {
+			partial(r)
+			r.cs.hijacked.Store(true)
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPromoted1165(t)
+			tc.mutate(r)
+			locked := tc.name == "promoted-parked-with-a-guarded-write"
+			got := r.l.h1InProgress()
+			if locked {
+				r.cs.detachMu.Unlock()
+			}
+			if got != tc.inProgress {
+				t.Fatalf("h1InProgress = %v, want %v", got, tc.inProgress)
+			}
+		})
+	}
+	t.Run("request-unread-in-the-kernel-first-call-only", func(t *testing.T) {
+		r := newPromoted1165(t)
+		r.cs.asyncPromoted = false
+		if _, err := unix.Write(r.peer, []byte("GET /y HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		if !r.l.h1InProgress() {
+			t.Fatal("a request in the kernel's receive queue, not read yet, is not in progress on the first call")
+		}
+		// The pacing clock holds the answer between polls; a second asker after it
+		// does not ask the kernel again (the loop reads the bytes as events).
+		r.l.h1InProgressNext = 0
+		if r.l.h1InProgress() {
+			t.Fatal("the second call asked the kernel again")
+		}
+	})
+}
