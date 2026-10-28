@@ -492,3 +492,26 @@ func TestH2FlowingDownloadIsNotResetByTheRequestDeadline889(t *testing.T) {
 		})
 	}
 }
+
+// TestH2SilentUnfinishedRequestEndsTheConnWithTheReset889: a client that opens a
+// POST, sends nothing more and is silent for ReadTimeout (1 s) has the request
+// answered 408 and reset at 1 s, and then, having nothing left open and having
+// been silent for ReadTimeout, loses the connection at once: the idle period of
+// the conn is not kept another timeout for a stream the deadline reset (the
+// stamp of the last stream the server owed is cleared at an expiry).
+func TestH2SilentUnfinishedRequestEndsTheConnWithTheReset889(t *testing.T) {
+	for _, e := range nativeEngines889() {
+		t.Run(e.name, func(t *testing.T) {
+			t.Parallel()
+			c := dialH2raw889(t, rdServer889(t, e.eng, nil), h2dial889{})
+			c.request(1, "POST", "/upload889", false, true)
+			ev := c.await889(1, 4*time.Second)
+			wantReset889(t, ev, 900*time.Millisecond, 2500*time.Millisecond)
+			at, closed := c.closedAfter889(4 * time.Second)
+			t.Logf("RD889 silent engine=%s: reset at %v, conn closed=%v at %v", e.name, ev.at.Round(time.Millisecond), closed, at.Round(time.Millisecond))
+			if !closed || at > 1700*time.Millisecond {
+				t.Fatalf("the conn of a silent client was closed=%v at %v, want it closed with the reset (about 1 s), not another timeout later", closed, at.Round(time.Millisecond))
+			}
+		})
+	}
+}
