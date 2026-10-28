@@ -48,7 +48,16 @@ func dotTree(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	files := map[string]string{}
 	for name, body := range dotFiles888 {
+		files[name] = body
+	}
+	if runtime.GOOS != "windows" {
+		// names that hold a backslash and "..": one name on these systems, so
+		// ".." must not pop the segment before it
+		files[`.git/..\x`], files[`.s\..\y`] = "BSX", "BSY"
+	}
+	for name, body := range files {
 		p := filepath.Join(root, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			t.Fatal(err)
@@ -60,8 +69,12 @@ func dotTree(t *testing.T) string {
 			t.Fatal(err)
 		}
 	}
-	for link, target := range map[string]string{"link-env": ".env", "link-dir": ".git", "link-wk": ".well-known", ".dot-link": "a.txt"} {
-		if err := os.Symlink(target, filepath.Join(root, link)); err != nil {
+	for link, target := range map[string]string{
+		"link-env": ".env", "link-dir": ".git", "link-wk": ".well-known", ".dot-link": "a.txt",
+		"chain1": "chain2", "chain2": ".env", "lnkrel": "sub/../.env", "lnkabs": filepath.Join(root, ".env"),
+		".well-known/g": "../.git", "ok-abs": filepath.Join(root, "a.txt"),
+	} {
+		if err := os.Symlink(target, filepath.Join(root, filepath.FromSlash(link))); err != nil {
 			t.Skipf("symlinks are not available here: %v", err)
 		}
 	}
@@ -105,6 +118,10 @@ var dotCases888 = []dotCase888{
 	{"/.env\x00", true, ""}, {"/.env%00", true, ""},
 	// symlinks: a visible name that leads to a dotfile or directory of the tree, and a hidden name
 	{"/link-env", true, "ENV"}, {"/link-dir/config", true, "GITCFG"}, {"/.dot-link", true, "A"},
+	{"/chain1", true, "ENV"}, {"/chain2", true, "ENV"}, {"/lnkrel", true, "ENV"}, {"/lnkabs", true, "ENV"},
+	{"/.well-known/g/config", true, "GITCFG"}, {"/link-dir/", true, ""}, {"/ok-abs", false, "A"},
+	// a literal backslash is part of the name on these systems (not a separator)
+	{`/.git/..\x`, true, "BSX"}, {`/.s\..\y`, true, "BSY"}, {`/sub/..\.git/config`, true, ""},
 	// visible
 	{"/", false, tagIndex888}, {"/index.html", false, tagIndex888}, {"/a.txt", false, "A"}, {"/a.env", false, "AENV"},
 	{"/sub/", false, "SUBIDX"}, {"/sub", false, "SUBIDX"}, {"/sub/b.txt", false, "B"},
@@ -410,7 +427,7 @@ func TestDotfilesFS888(t *testing.T) {
 		mw := New(Config{FS: m, Dotfiles: pol})
 		absent := missing888(t, mw)
 		for _, tc := range dotCases888 {
-			if strings.Contains(tc.path, "link") || strings.Contains(tc.path, `\`) || strings.Contains(tc.path, "\x00") || strings.Contains(tc.path, "%00") || strings.HasPrefix(tc.path, "/.dot") {
+			if strings.Contains(tc.path, "link") || strings.Contains(tc.path, "chain") || strings.Contains(tc.path, "lnk") || strings.Contains(tc.path, "ok-abs") || strings.Contains(tc.path, ".well-known/g/") || strings.Contains(tc.path, `\`) || strings.Contains(tc.path, "\x00") || strings.Contains(tc.path, "%00") || strings.HasPrefix(tc.path, "/.dot") {
 				continue // symlinks and the OS-only rows
 			}
 			weird := strings.Contains(tc.path, "..") || strings.Contains(tc.path, "/./") || strings.Contains(tc.path, "//")
