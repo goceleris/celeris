@@ -29,6 +29,11 @@ var streamPool = sync.Pool{New: func() any {
 const (
 	flagCancelled    uint32 = 1 << 0
 	flagAsyncRunning uint32 = 1 << 1
+	// flagReqDeadline marks a stream whose request deadline is armed
+	// (Manager.ArmRequest): the request was not whole at its HEADERS, and
+	// StartTimeNs holds the instant it was armed. The loop thread alone arms and
+	// disarms it, under H2State.mu; takeLocked clears it with the stream.
+	flagReqDeadline uint32 = 1 << 2
 	// flagBudgetPool marks an inline-eligible stream that runs on the worker
 	// pool only because its connection was over its outbound budget
 	// (celeris#893). Its response never goes to its OutboundBuffer
