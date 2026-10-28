@@ -157,8 +157,22 @@ func runShutdownH1Gate1165(t *testing.T, eng celeris.EngineType, downloads bool)
 		}()
 	}
 
-	// The rest of the upload, sent once the gate's grace (250 ms) has passed.
-	time.Sleep(400 * time.Millisecond)
+	wg.Wait()
+	close(res)
+	var late []string
+	for r := range res {
+		if r.err != io.EOF {
+			late = append(late, r.name+": "+r.err.Error()+" at "+r.at.Round(time.Millisecond).String())
+		}
+	}
+	if len(late) > 0 {
+		t.Errorf("%d of %d idle conns had no FIN %v into the shutdown (celeris#1165):\n  %s", len(late), len(idle), finBy, strings.Join(late, "\n  "))
+	}
+	// The rest of the upload, sent once every idle conn has had its FIN: the
+	// gate's pass (grace 250 ms, then it marks each conn it meets close-after
+	// and closes the idle ones) has run on both loops by then, so the response is
+	// written after it, whatever the load. (A response written before the pass
+	// is a keep-alive one: the request was in flight when the shutdown began.)
 	_ = up.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if _, err := up.Write(make([]byte, upSize-(64<<10))); err != nil {
 		t.Errorf("the rest of the upload, sent %v into the shutdown: %v: a request in progress was cut (celeris#1166)", time.Since(begin).Round(time.Millisecond), err)
@@ -182,17 +196,6 @@ func runShutdownH1Gate1165(t *testing.T, eng celeris.EngineType, downloads bool)
 		}
 	}
 
-	wg.Wait()
-	close(res)
-	var late []string
-	for r := range res {
-		if r.err != io.EOF {
-			late = append(late, r.name+": "+r.err.Error()+" at "+r.at.Round(time.Millisecond).String())
-		}
-	}
-	if len(late) > 0 {
-		t.Errorf("%d of %d idle conns had no FIN %v into the shutdown (celeris#1165):\n  %s", len(late), len(idle), finBy, strings.Join(late, "\n  "))
-	}
 	// The downloaders go; the shutdown ends well before its budget.
 	for _, c := range dls {
 		_ = c.Close()
