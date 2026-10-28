@@ -119,7 +119,7 @@ type Config struct {
 	SkipPaths []string
 
 	// SetTimeout bounds how long the middleware waits for each Store.Set it
-	// makes to store a response. Zero selects the default, 5 seconds, a
+	// makes to store a response. Zero selects the default, 1 second, a
 	// negative value waits for ever, as before the field.
 	// When the Set has not returned in time the request goes on without it:
 	// the leader of a coalesced fill releases its key and writes its
@@ -153,10 +153,13 @@ type Config struct {
 }
 
 // defaultSetTimeout is the bound on a Store.Set when Config.SetTimeout is 0.
-// PENDING the maintainer's decision (celeris#888 item 30): this one constant
-// and the sentence "Zero selects the default, 5 seconds," in the SetTimeout
-// field's doc are the only places to change.
-const defaultSetTimeout = 5 * time.Second
+// A Set that never returns holds its request, and on epoll and io_uring the
+// event loop a sync request runs on, for the whole bound (a bystander on that
+// loop was measured 951 ms late at 1 s and 2.95 s late at 3 s), so the default is
+// short: a healthy Redis or Memcached Set takes well under a millisecond. This
+// one constant and the sentence "Zero selects the default, 1 second," in the
+// SetTimeout field's doc are the only places to change (celeris#888 item 30).
+const defaultSetTimeout = time.Second
 
 // defaultConfig holds the defaults. Every bool field's default is false, so
 // a Config literal that leaves one out gets its default (celeris#922).
