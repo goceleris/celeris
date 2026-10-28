@@ -76,10 +76,16 @@ func TestWriteClockRestartsWhenTheFlushTakesBytes885(t *testing.T) {
 				"the clock must restart when a flush takes bytes", time.Since(start).Round(time.Millisecond), bound)
 		}
 	}
-	time.Sleep(bound + 100*time.Millisecond)
-	r.l.checkTimeouts()
+	// The peer took bytes in the window that is running (the rate rule holds a
+	// conn another window when the last passed, celeris#885 item 51), and none
+	// after: it goes when that window has passed, within two WriteTimeouts.
+	deadline := time.Now().Add(2*bound + 200*time.Millisecond)
+	for r.open() && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+		r.l.checkTimeouts()
+	}
 	if r.open() {
-		t.Fatalf("a peer that stopped reading was not reaped %v after its last byte", bound+100*time.Millisecond)
+		t.Fatalf("a peer that stopped reading was not reaped %v after its last byte", 2*bound+200*time.Millisecond)
 	}
 }
 

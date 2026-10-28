@@ -370,6 +370,12 @@ type Loop struct {
 	// asking the kernel about a descriptor number that may now belong to
 	// something else. Written once before ready; read only after it.
 	listenAddr net.Addr
+
+	// ackedProbe replaces the getsockopt that reads a conn's acknowledged
+	// byte count when set (bytesAcked, write_rate_885.go): a test seam for a
+	// TCP stack whose TCP_INFO answers but does not fill it. nil in
+	// production. Loop thread (a test sets it before it drives the loop).
+	ackedProbe func(fd int) (uint64, error)
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -2279,6 +2285,7 @@ func (l *Loop) markClosing(cs *connState, pending int) {
 	}
 	cs.closeSince = time.Now().UnixNano()
 	cs.closePending = pending
+	cs.closeAckedKnown = false // a live conn's window baseline (parkedBelowRate) is not the drain's
 }
 
 // noteClosingProgress restarts the drain clock of a conn markClosing deferred
@@ -2373,6 +2380,14 @@ func (cs *connState) endWrite() {
 // inlines at its call sites (the drain paths of every response).
 func (cs *connState) endWriteSlow() {
 	cs.writeSince = 0
+	cs.closeAckedKnown = false // the baseline of the response's window (parkedBelowRate)
+	if cs.closeSince == 0 {
+		// A live conn's last sample is of the response that ended: the next
+		// one parks with no baseline and takes it at its first sweep, not
+		// after a quarter of WriteTimeout (closing and detached conns keep
+		// theirs, which they own).
+		cs.closeSampled = 0
+	}
 	cs.lastActivity = time.Now().UnixNano()
 }
 
@@ -4911,7 +4926,10 @@ func (cs *connState) endDetachedStall() {
 // write clock (writeSince), or is on the dirty list. WriteTimeout is "no
 // progress for WriteTimeout" there: the clock starts at the first partial flush
 // and restarts when a flush takes bytes (noteWriteProgress), where std's is an
-// absolute deadline for the whole response. It answers the instant IdleTimeout
+// absolute deadline for the whole response; where the peer's acknowledged bytes
+// can be read the minimum-rate rule decides instead (parkedBelowRate, celeris#885
+// item 51), and is then the only bound: the conn is exempt from the idle scan
+// for as long as the rule has a baseline. It answers the instant IdleTimeout
 // and ReadTimeout are measured from, the later of the last read and the clock,
 // and whether the conn is done for this sweep (closed, or exempt from the idle
 // scan). Kept out of line: the sweep of a conn without a clock does not run it.
@@ -4940,14 +4958,56 @@ func (l *Loop) sweepWriteClock(cs *connState, fd int, now, last int64) (from int
 		pending = csWritePending(cs)
 	}
 	if pending {
-		if wt := l.cfg.WriteTimeout; wt > 0 && time.Duration(now-ws) > wt {
-			l.closeConn(fd)
-			return last, true
+		if wt := l.cfg.WriteTimeout; wt > 0 {
+			// The minimum-rate rule (celeris#885 item 51) reaps a conn whose
+			// peer's acknowledged bytes it can see; the flush clock the rest.
+			if l.parkedBelowRate(cs, now, ws, int64(wt)) {
+				l.closeConn(fd)
+				return last, true
+			}
+			if cs.closeAckedKnown {
+				// The rule has a baseline for this response and is its only
+				// bound (celeris#885 item 51): a peer taking at least the floor
+				// per window is not stalled, whatever the idle clocks say. They
+				// run from the last flush that took bytes or the last window
+				// passed, and a client reading steadily between two EPOLLOUT
+				// edges moves neither (a ReadTimeout or IdleTimeout not above
+				// WriteTimeout, the defaults' shape, would cut it before the
+				// rule decides). The price: a request pipelined behind the
+				// response is bounded by ReadHeaderTimeout for its head (the
+				// hdrDL check above runs first and the loop keeps EPOLLIN armed
+				// while parked), but a pipelined request whose head is whole and
+				// whose body is pending has no header deadline, and ReadTimeout
+				// does not bound it until the response ends (measured: ReadTimeout
+				// 1 s cut it at 1.34 s on main, the head held it for the run;
+				// after the drain ReadTimeout applies again, gone at 6.94 s on
+				// both). The skip also bypasses h2ServerOwes' dispatchBusy answer
+				// for an async HTTP/1.1 conn (read, not measured): a pipelined
+				// handler that overruns ReadTimeout is not closed while an earlier
+				// response on the conn is rate-held. Bounded by the rule: the
+				// client must keep acknowledging the floor. A peer that stops is
+				// closed by the rule one window after it falls under the floor.
+				// Back to the idle scan when the response ends (endWrite) or the
+				// baseline is lost (a failed sample).
+				return last, true
+			}
+			if time.Duration(now-cs.writeSince) > wt {
+				l.closeConn(fd)
+				return last, true
+			}
 		}
 	} else {
 		// End the clock as endWrite does, from its last stamp, which is no
-		// later than the drain.
+		// later than the drain. A response the rule governed has no recent
+		// stamp (it moves once per window): the drain is dated by this
+		// sweep, so that ReadTimeout or IdleTimeout, shorter than the
+		// window, do not cut the conn on the instant its response ended.
+		if cs.closeAckedKnown {
+			ws = now
+		}
 		cs.writeSince = 0
+		cs.closeAckedKnown = false
+		cs.closeSampled = 0 // the next response's baseline is not delayed by this one's sample
 		if ws > last {
 			cs.lastActivity = ws
 		}
