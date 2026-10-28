@@ -315,3 +315,42 @@ func TestPoolWaitSettledWaitsForARequestInProgressAndIsBounded1166(t *testing.T)
 		t.Fatal("the wait for a request in progress is not bounded")
 	}
 }
+
+// A detached stream's writer goroutine owns the conn's write state (it appends
+// to writeBuf under detachMu through the guarded write hook); h1InProgress, on
+// the loop thread, must not read that state (csWritePending) of a detached
+// conn: CI's -race saw it in TestStalledSSEEndsWithShutdown855. The writer here
+// does what the hook does, and the first call asks about the kernel's queue as
+// the shutdown's first call does. Run it under -race.
+func TestH1InProgressDoesNotReadADetachedStreamsWriteState1166(t *testing.T) {
+	r := newPromoted1165(t)
+	r.cs.asyncPromoted = false
+	r.cs.h1State.Detached.Store(true)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			r.cs.detachMu.Lock()
+			r.cs.writeBuf = append(r.cs.writeBuf[:0], 'x')
+			r.cs.writePos = 0
+			r.cs.bodyBuf = nil
+			r.cs.detachMu.Unlock()
+		}
+	}()
+	for range 2000 {
+		r.l.h1InProgressAsked = false // the first call, which asks the kernel
+		r.l.h1InProgressNext = 0
+		if r.l.h1InProgress() {
+			t.Error("a detached stream is a request in progress")
+			break
+		}
+	}
+	close(stop)
+	<-done
+}

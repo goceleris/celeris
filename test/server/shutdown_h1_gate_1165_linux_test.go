@@ -67,6 +67,7 @@ func runShutdownH1Gate1165(t *testing.T, eng celeris.EngineType, downloads bool)
 		s.POST("/up", func(c *celeris.Context) error { return c.String(http.StatusOK, "got %d", len(c.Body())) })
 	}, func(_ *celeris.Server, addr string, done <-chan error) error { return waitDrainOrderReady(addr, done) })
 
+	base := settledEngineMetrics1104Server(s)
 	type idleConn struct {
 		name string
 		c    net.Conn
@@ -128,7 +129,18 @@ func runShutdownH1Gate1165(t *testing.T, eng celeris.EngineType, downloads bool)
 	if _, err := up.Write(make([]byte, 64<<10)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond) // the downloads are in the engine; the upload's first bytes are read
+	// The engine has accepted every conn before the shutdown begins: a conn still
+	// in the accept queue (a loop busy formatting six 16 MiB responses under -race
+	// has not got to the upload's) is reset by the listener's close, which says
+	// nothing about the gate. Then the downloads are in the engine and the upload's
+	// first bytes are read.
+	want := base + int64(len(idle)+len(dls)+1)
+	for dl := time.Now().Add(20 * time.Second); s.EngineInfo().Metrics.ActiveConnections < want; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(dl) {
+			t.Fatalf("the engine counts %d conns, want %d before the shutdown begins", s.EngineInfo().Metrics.ActiveConnections, want)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
 
 	begin := time.Now()
 	shutErr := make(chan error, 1)
@@ -213,4 +225,19 @@ func runShutdownH1Gate1165(t *testing.T, eng celeris.EngineType, downloads bool)
 	case <-time.After(25 * time.Second):
 		t.Error("the server did not stop")
 	}
+}
+
+// settledEngineMetrics1104Server is the engine's open conns once they have not
+// changed for 100 ms (the readiness probe's conn goes when its client does).
+func settledEngineMetrics1104Server(s *celeris.Server) int64 {
+	prev := s.EngineInfo().Metrics.ActiveConnections
+	for range 100 {
+		time.Sleep(100 * time.Millisecond)
+		m := s.EngineInfo().Metrics.ActiveConnections
+		if m == prev {
+			return m
+		}
+		prev = m
+	}
+	return prev
 }

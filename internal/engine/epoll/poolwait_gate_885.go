@@ -431,7 +431,11 @@ func (l *Loop) h1InProgress() bool {
 			l.h1InProgressNext = now + int64(h2PoolDrainPollMs*time.Millisecond)
 			return true
 		}
-		if first && !csWritePending(cs) && !(cs.h1State != nil && cs.h1State.Detached.Load()) {
+		// A detached stream is not asked: its writer goroutine owns the conn's
+		// write state (writeBuf and the fields csWritePending reads) under its own
+		// lock, which the loop does not take here, so the test for Detached comes
+		// before the one for the queue.
+		if detached := cs.h1State != nil && cs.h1State.Detached.Load(); first && !detached && !csWritePending(cs) {
 			if q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ); err == nil && q != 0 {
 				l.h1InProgressNext = now + int64(h2PoolDrainPollMs*time.Millisecond)
 				return true
