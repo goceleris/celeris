@@ -356,6 +356,10 @@ type H1State struct {
 	// connection that is about to be closed. Set and read on the goroutine that
 	// runs ProcessH1 (the loop thread for a conn the loop parses).
 	CloseAfter bool
+
+	// Shutdown is the engine-wide flag of a shutdown that has begun (celeris#884,
+	// celeris#885). Declared here, unused, for the tests to compile against.
+	Shutdown *atomic.Bool
 }
 
 // TakeBufferedBytes returns a copy of any bytes ProcessH1 stashed in the

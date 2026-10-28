@@ -124,6 +124,9 @@ type Engine struct {
 	// wait for HTTP/2 pool handlers the workers run when Listen's context is
 	// cancelled (celeris#759; Worker.h2PoolSettled).
 	drainBudget atomic.Pointer[context.Context]
+
+	// shutdownBegun: declared here, unused, for the tests to compile against.
+	shutdownBegun atomic.Bool
 }
 
 // New creates a new io_uring engine.

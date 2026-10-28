@@ -92,6 +92,9 @@ type Engine struct {
 	// send drain the loops run when Listen's context is cancelled
 	// (celeris#760; see Loop.drainSends).
 	drainBudget atomic.Pointer[context.Context]
+
+	// shutdownBegun: declared here, unused, for the tests to compile against.
+	shutdownBegun atomic.Bool
 }
 
 // portHoldHook is called by Listen with the address a port 0 was resolved
