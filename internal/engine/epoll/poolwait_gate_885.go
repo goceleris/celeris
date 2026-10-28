@@ -141,9 +141,9 @@ func (l *Loop) poolWaitGate() {
 // the pass would otherwise close, ahead of the cap and the send-side tests so
 // that a conn those leave for the next pass is not met unasked; later passes
 // do not ask: what has arrived since is a request that begins after the gate,
-// refused as before, and its conn is closed. now is the pass's UnixNano. Loop
-// thread.
-func (l *Loop) closeIdleH1(first bool, now int64) {
+// refused as before, and its conn is closed. now is the pass's UnixNano. It
+// returns the number of conns it closed. Loop thread.
+func (l *Loop) closeIdleH1(first bool, now int64) int {
 	closed := 0
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
 		cs := l.liveConns[i]
@@ -212,6 +212,7 @@ func (l *Loop) closeIdleH1(first bool, now int64) {
 		l.closeConn(cs.fd)
 		closed++
 	}
+	return closed
 }
 
 // testHookGateBeforeClose, when set, runs on the loop thread in closeIdleH1
