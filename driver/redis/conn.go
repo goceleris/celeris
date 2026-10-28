@@ -761,6 +761,21 @@ func (c *redisConn) releaseResult(req *redisRequest) {
 	putRequest(req)
 }
 
+// testHookHandshakeRelease, when non-nil, runs for every request handshake gives
+// back to the pool. It is nil in production (handshake runs once per conn, so
+// the check is off every hot path); a test sets it to see that a handshake that
+// failed for any reason but a server error reply gives nothing back (the reader
+// may still be filling the request in), and resets it to nil when it is done.
+var testHookHandshakeRelease atomic.Pointer[func(req *redisRequest)]
+
+// releaseHandshakeReq is releaseResult for handshake's requests.
+func (c *redisConn) releaseHandshakeReq(req *redisRequest) {
+	if h := testHookHandshakeRelease.Load(); h != nil {
+		(*h)(req)
+	}
+	c.releaseResult(req)
+}
+
 // handshake runs HELLO (with optional fallback to AUTH+SELECT) to negotiate
 // protocol version and authentication.
 func (c *redisConn) handshake(ctx context.Context) error {
@@ -784,7 +799,7 @@ func (c *redisConn) handshake(ctx context.Context) error {
 	}
 	req, err := c.exec(ctx, helloArgs...)
 	if err == nil {
-		defer c.releaseResult(req)
+		defer c.releaseHandshakeReq(req)
 		c.state.proto.Store(int32(targetProto))
 		// After HELLO OK, select db.
 		if c.cfg.DB != 0 {
@@ -794,12 +809,18 @@ func (c *redisConn) handshake(ctx context.Context) error {
 		}
 		return nil
 	}
-	// Release the request from the failed exec — it may hold pooled Reader
-	// slices that would otherwise leak.
-	c.releaseResult(req)
 	// If HELLO was rejected, fall back to legacy auth + select.
 	var rerr *RedisError
 	if errors.As(err, &rerr) {
+		// The server's error reply was dispatched: dispatch is done with req.
+		// Any other error (the caller's context ended, the conn closed) leaves
+		// the request to the garbage collector, as every other caller of exec
+		// does: the reader goroutine may still be filling it in, and a request
+		// given back to the pool now could be reused by another conn and
+		// woken by that late finish with a reply that is not its own. Nothing
+		// leaks: req.owned is never set in production code, so releaseResult
+		// only skips a sync.Pool reuse here.
+		c.releaseHandshakeReq(req)
 		c.state.proto.Store(2)
 		return c.legacyAuth(ctx)
 	}

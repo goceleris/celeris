@@ -3,6 +3,8 @@ package redis
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,7 +55,14 @@ type Message struct {
 // [Client.Subscribe], [Client.PSubscribe] and [ClusterClient.SSubscribe] apply
 // the same rule to their first call: they return the PubSub and a nil error,
 // not [ErrPubSubConnDown]; the PubSub then retries the address of that one
-// node (it does not follow a cluster slot move). Any other error
+// node. A PubSub of a [ClusterClient] or a [SentinelClient] is the exception:
+// its reconnect asks the client for the node to dial each time, so when its
+// conn goes down it follows a node that is gone and a sentinel failover, and a
+// cluster slot that moved is noticed even though the conn stays up (see
+// [ClusterClient.Subscribe] and [ClusterClient.SSubscribe]). When that client
+// is closed, a PubSub whose conn is down, or goes down afterwards, gives up and
+// its Channel() closes; one whose conn stays up (a loop shared with another
+// Client, or WithEngine, keeps it open) keeps it until [PubSub.Close]. Any other error
 // from the write (for example [ErrQueueFull] on a live connection) means the
 // command was not sent and nothing replays it before the next reconnect.
 // [ErrClosed] means the PubSub itself is closed, also when [PubSub.Close] raced
@@ -61,6 +70,23 @@ type Message struct {
 // return before it releases the connection.
 type PubSub struct {
 	client *Client
+
+	// route, when not nil, chooses the client every reconnect dials: a cluster
+	// or sentinel PubSub follows its subscription to another node. Nil (a
+	// standalone Client) means client, for ever. Set before the PubSub is
+	// published and never changed.
+	route pubsubRoute
+	// connClient is the client whose pool conn came from, so the conn is
+	// released to that pool and no other. Guarded by mu, set with conn.
+	connClient *Client
+	// routeCur is the client the loop tried last (or the one the conn lost
+	// came from). Owned by the constructor and then by the one running
+	// reconnect loop, each loop handed over through reconnectingMu.
+	routeCur *Client
+	// ctx is cancelled by Close, so a dial or a topology refresh of the
+	// reconnect loop that is in flight ends with it.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// ctlMu keeps a control write and the release of its conn apart
 	// (celeris#929). A conn is written by its file-descriptor number, and the
@@ -87,15 +113,26 @@ type PubSub struct {
 	subs      map[string]struct{}
 	psubs     map[string]struct{}
 	shardSubs map[string]struct{}
-	msgCh     chan *Message
-	closeCh   chan struct{}
-	closed    atomic.Bool
+	// servedSlot is the slot of the shard channels a cluster PubSub serves (the
+	// slot of the first one added); hasServed says it is set. Guarded by mu; use
+	// servedSlotLocked.
+	servedSlot uint16
+	hasServed  bool
+	msgCh      chan *Message
+	closeCh    chan struct{}
+	closed     atomic.Bool
 
 	// reconnecting is set while a reconnect goroutine is active. Guards
 	// against double-fires from both onRecv-error and onClose in the same
 	// conn teardown.
 	reconnectingMu sync.Mutex
 	reconnecting   bool
+	// pendingReroute records a trigger that came from a conn that is up (an
+	// unsolicited sunsubscribe, a -MOVED) while a reconnect loop was running:
+	// the conn's close hook cannot report it, so the loop's tail starts one
+	// more. Cleared when the loop installs its conn: whatever the old conn
+	// said before that is answered by the replay.
+	pendingReroute bool
 	// The outage state below is guarded by reconnectingMu (celeris#887 items
 	// 29 and 30). An outage starts at the first drop of a conn and ends when a
 	// replayed conn has stayed up for pubsubStableAfter. The backoff runs over
@@ -177,7 +214,28 @@ func (ps *PubSub) firstControl(err error) (*PubSub, error) {
 // the hook to fire on (no t.Parallel), and resets it to nil when it is done.
 var testHookBeforeBind atomic.Pointer[func(conn *redisConn)]
 
+// testHookReplayed, when non-nil, runs in reconnectLoop after a conn was
+// installed and replayed, before the old conn is released and before the loop
+// returns (reconnecting is still set, ctlMu is held). It is nil in production;
+// a test sets it to hold the loop there, to make a trigger arrive from the new
+// conn during the handover or to look at the old conn while it is still open
+// (celeris#887 item 31). A test that sets it resets it to nil when it is done.
+var testHookReplayed atomic.Pointer[func(ps *PubSub)]
+
+// testHookBeforeInstall, when non-nil, runs in reconnectLoop after a conn was
+// dialled and before the loop takes ctlMu to install it (no lock held). It is
+// nil in production; a test sets it to close the PubSub in that window
+// (celeris#887 item 31) and resets it to nil when it is done.
+var testHookBeforeInstall atomic.Pointer[func(ps *PubSub)]
+
 func (c *Client) newPubSub(ctx context.Context) (*PubSub, error) {
+	return c.newPubSubRouted(ctx, nil)
+}
+
+// newPubSubRouted is newPubSub for a PubSub that follows its subscription:
+// route chooses the client of every reconnect (nil: always c). The first conn
+// is dialled on c.
+func (c *Client) newPubSubRouted(ctx context.Context, route pubsubRoute) (*PubSub, error) {
 	conn, err := c.pool.acquirePubSub(ctx)
 	if err != nil {
 		return nil, err
@@ -185,15 +243,21 @@ func (c *Client) newPubSub(ctx context.Context) (*PubSub, error) {
 	if h := testHookBeforeBind.Load(); h != nil {
 		(*h)(conn)
 	}
+	psCtx, cancel := context.WithCancel(context.Background())
 	ps := &PubSub{
-		client:    c,
-		conn:      conn,
-		subs:      map[string]struct{}{},
-		psubs:     map[string]struct{}{},
-		shardSubs: map[string]struct{}{},
-		msgCh:     make(chan *Message, defaultPubSubChanBuf),
-		closeCh:   make(chan struct{}),
-		backoff:   async.NewBackoff(50*time.Millisecond, 5*time.Second),
+		client:     c,
+		route:      route,
+		connClient: c,
+		routeCur:   c,
+		ctx:        psCtx,
+		cancel:     cancel,
+		conn:       conn,
+		subs:       map[string]struct{}{},
+		psubs:      map[string]struct{}{},
+		shardSubs:  map[string]struct{}{},
+		msgCh:      make(chan *Message, defaultPubSubChanBuf),
+		closeCh:    make(chan struct{}),
+		backoff:    async.NewBackoff(50*time.Millisecond, 5*time.Second),
 		// Read once: the goroutines of the PubSub never touch the package
 		// variable, which tests set.
 		stableAfter: pubsubStableAfter,
@@ -218,8 +282,10 @@ func (ps *PubSub) bindConn(conn *redisConn) {
 	conn.setPubSubCloseHook(ps.onConnDrop)
 }
 
-// Channel returns the read-only message stream. It remains open until Close
-// is called or the reconnect loop exhausts its retries.
+// Channel returns the read-only message stream. It remains open until Close is
+// called, or until the [ClusterClient] or [SentinelClient] the PubSub follows is
+// closed while its conn is down (the reconnect loop then gives up). The reconnect
+// loop has no retry budget: it does not give up on its own.
 func (ps *PubSub) Channel() <-chan *Message {
 	return ps.msgCh
 }
@@ -282,6 +348,9 @@ func (ps *PubSub) PUnsubscribe(_ context.Context, patterns ...string) error {
 func (ps *PubSub) SSubscribe(_ context.Context, channels ...string) error {
 	return ps.control("SSUBSCRIBE", channels, func() {
 		for _, ch := range channels {
+			if len(ps.shardSubs) == 0 {
+				ps.servedSlot, ps.hasServed = Slot(ch), true
+			}
 			ps.shardSubs[ch] = struct{}{}
 		}
 	})
@@ -294,10 +363,14 @@ func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
 	return ps.control("SUNSUBSCRIBE", channels, func() {
 		if len(channels) == 0 {
 			ps.shardSubs = map[string]struct{}{}
+			ps.hasServed = false
 			return
 		}
 		for _, ch := range channels {
 			delete(ps.shardSubs, ch)
+		}
+		if len(ps.shardSubs) == 0 {
+			ps.hasServed = false
 		}
 	})
 }
@@ -376,8 +449,10 @@ func (ps *PubSub) Close() error {
 		return nil
 	}
 	close(ps.closeCh)
+	// Cut short a dial or a topology refresh of the reconnect loop.
+	ps.cancel()
 	ps.mu.Lock()
-	conn := ps.conn
+	conn, client := ps.conn, ps.connClient
 	ps.conn = nil
 	ps.mu.Unlock()
 	if conn != nil {
@@ -389,7 +464,7 @@ func (ps *PubSub) Close() error {
 		// number under it, so none can start after the release either.
 		ps.detach(conn)
 		ps.ctlMu.Lock()
-		ps.client.pool.releasePubSub(conn)
+		client.pool.releasePubSub(conn)
 		ps.ctlMu.Unlock()
 	}
 	ps.closeMsgCh()
@@ -414,6 +489,7 @@ func (ps *PubSub) takeConn(conn *redisConn) bool {
 		return false
 	}
 	ps.conn = nil
+	ps.connClient = nil
 	return true
 }
 
@@ -464,16 +540,26 @@ func (ps *PubSub) deliver(m *Message) bool {
 // once: harmless. Comparing the dropped conn with ps.conn would avoid that
 // extra dial and cost a signature change in the hook plumbing and a second
 // lock on this path. No subscription is lost by the extra reconnect; a message
-// published in the swap window (the new conn's SUBSCRIBE is sent without
-// waiting for the server's reply, then the old, live conn is released) may be
-// lost, and one published just before the old conn is released may arrive
-// twice, as on any reconnect.
-func (ps *PubSub) onConnDrop(_ error) {
+// published in the swap window (the old conn is cut off from the PubSub before
+// the new conn is bound, and the new conn's SUBSCRIBE is sent without waiting
+// for the server's reply) may be lost. The PubSub delivers from one conn at a
+// time, so the swap does not deliver a message twice by itself.
+func (ps *PubSub) onConnDrop(_ error) { ps.trigger(false) }
+
+// trigger starts a reconnect loop unless one is running or the PubSub is
+// closed. live is true for a trigger that comes from a conn that is up (the
+// server dropped the subscription, or refused it): the close hook will not
+// report that one, so when a loop is already running it is remembered
+// (pendingReroute) and the loop's tail starts another.
+func (ps *PubSub) trigger(live bool) {
 	if ps.closed.Load() {
 		return
 	}
 	ps.reconnectingMu.Lock()
 	if ps.reconnecting {
+		if live {
+			ps.pendingReroute = true
+		}
 		ps.reconnectingMu.Unlock()
 		return
 	}
@@ -519,23 +605,36 @@ func (ps *PubSub) downFor() time.Duration {
 }
 
 // reconnectLoop re-dials the pubsub conn and replays subscriptions with
-// exponential backoff. It terminates when the pubsub is closed or the backoff
-// reaches its cap and a configured retry budget is exhausted (here we keep
-// retrying indefinitely, but every iteration honors closeCh).
+// exponential backoff. It terminates when the pubsub is closed, or when the
+// route says there is nowhere to dial for good (the ClusterClient or
+// SentinelClient was closed: the loop gives up and closes the PubSub). There is
+// no retry budget: it keeps retrying indefinitely, but every iteration honors
+// closeCh.
+//
+// Each attempt asks the route which client to dial (a standalone PubSub
+// always dials its own), so a subscription follows a node that is gone and a
+// slot that moved (celeris#887 item 31). The conn it installs replaces the
+// one in ps.conn, which may be dead or may still be up (a trigger from a live
+// conn): the old conn is cut off from the PubSub before the new one is bound
+// and replayed, so a message is delivered by one conn or the other, never
+// both.
 func (ps *PubSub) reconnectLoop() {
 	defer func() {
 		ps.reconnectingMu.Lock()
 		ps.reconnecting = false
+		again := ps.pendingReroute
+		ps.pendingReroute = false
 		ps.reconnectingMu.Unlock()
 		// A close hook that fired while reconnecting was set (the new conn
 		// died during the handover) was ignored by onConnDrop, and the hook
 		// fires once: look at the conn now, after the flag is down. The
 		// conn's closed flag is stored before its hook runs, so no drop is
-		// missed between the two.
+		// missed between the two. A trigger from a conn that is up (again) is
+		// not seen by that check, it was recorded for this point.
 		ps.mu.Lock()
 		cur := ps.conn
 		ps.mu.Unlock()
-		if cur != nil && cur.closed.Load() {
+		if again || (cur != nil && cur.closed.Load()) {
 			ps.onConnDrop(nil)
 		}
 	}()
@@ -552,21 +651,37 @@ func (ps *PubSub) reconnectLoop() {
 		ps.reconnectingMu.Lock()
 		ps.attempt = attempt + 1
 		ps.reconnectingMu.Unlock()
-		select {
-		case <-time.After(delay):
-		case <-ps.closeCh:
+		if !ps.sleep(delay) {
 			return
 		}
-		if ps.closed.Load() {
-			return
+		// The first attempt of an outage goes back to the node it lost (a
+		// blip is the common case); a later one, or a conn that died soon
+		// after its replay, looks elsewhere.
+		client, err := ps.pickClient(attempt > 0)
+		if err != nil {
+			if errors.Is(err, ErrClosed) {
+				// The owner of the route is closed: nothing to re-route to,
+				// ever. Give up the way the PubSub doc says: Channel() closes.
+				_ = ps.Close()
+				return
+			}
+			continue
 		}
+		ps.routeCur = client
 		// Give the dial a bounded window so a hard-down server doesn't
-		// block reconnect forever on a single attempt.
-		dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		conn, err := ps.client.pool.acquirePubSub(dialCtx)
+		// block reconnect forever on a single attempt. Close cuts it short.
+		dialCtx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+		conn, err := client.pool.acquirePubSub(dialCtx)
 		cancel()
+		if ps.route != nil && ps.ctx.Err() == nil {
+			// (Not after Close: a dial it cut short says nothing of the node.)
+			ps.route.dialed(client, err == nil)
+		}
 		if err != nil {
 			continue
+		}
+		if h := testHookBeforeInstall.Load(); h != nil {
+			(*h)(ps)
 		}
 		ps.ctlMu.Lock()
 		ps.mu.Lock()
@@ -574,19 +689,30 @@ func (ps *PubSub) reconnectLoop() {
 			ps.mu.Unlock()
 			ps.ctlMu.Unlock()
 			// Never installed: nothing else holds conn.
-			ps.client.pool.releasePubSub(conn)
+			client.pool.releasePubSub(conn)
 			return
 		}
 		// Install conn under ctlMu and mu together, and resubscribe on it
 		// before ctlMu is let go: a caller's control write then goes to
 		// conn, after the replay, and Close cannot release conn under the
 		// replay's writes.
-		old := ps.conn
+		old, oldClient := ps.conn, ps.connClient
+		if old != nil {
+			// Cut the old conn off before the new one is bound: from here on
+			// only conn delivers. The old conn may still be up (the server
+			// dropped one subscription of it, or the client follows a master
+			// switch), and a PUBLISH reaches every node.
+			old.state.router.clear()
+		}
+		ps.reconnectingMu.Lock()
+		ps.pendingReroute = false
+		ps.reconnectingMu.Unlock()
 		// Bind first, so a Close that takes conn as soon as it is published
 		// detaches a conn that is already bound, and cannot be re-bound
 		// after its detach.
 		ps.bindConn(conn)
 		ps.conn = conn
+		ps.connClient = client
 		subs := make([]string, 0, len(ps.subs))
 		for s := range ps.subs {
 			subs = append(subs, s)
@@ -596,7 +722,15 @@ func (ps *PubSub) reconnectLoop() {
 			psubs = append(psubs, p)
 		}
 		ssubs := make([]string, 0, len(ps.shardSubs))
+		// A cluster serves one slot per SSUBSCRIBE (-CROSSSLOT otherwise), and
+		// one PubSub serves one slot: replay the channels of that slot, so a
+		// channel of another slot cannot take the rest down with it.
+		served, onlyServed := ps.servedSlotLocked()
+		onlyServed = onlyServed && ps.route != nil && ps.route.slotted()
 		for s := range ps.shardSubs {
+			if onlyServed && Slot(s) != served {
+				continue
+			}
 			ssubs = append(ssubs, s)
 		}
 		ps.mu.Unlock()
@@ -629,20 +763,24 @@ func (ps *PubSub) reconnectLoop() {
 		if ok && conn.closed.Load() {
 			ok = false
 		}
+		if h := testHookReplayed.Load(); h != nil {
+			(*h)(ps)
+		}
 		var failed *redisConn
 		if !ok && ps.takeConn(conn) {
 			failed = conn // else Close took it and releases it
 		}
 		ps.ctlMu.Unlock()
 		// The dropped conn is out of ps.conn, no writer can hold it (writers
-		// hold ctlMu and read ps.conn under it): release it, once.
+		// hold ctlMu and read ps.conn under it): release it, once, to the
+		// pool it came from.
 		if old != nil {
 			ps.detach(old)
-			ps.client.pool.releasePubSub(old)
+			oldClient.pool.releasePubSub(old)
 		}
 		if failed != nil {
 			ps.detach(failed)
-			ps.client.pool.releasePubSub(failed)
+			client.pool.releasePubSub(failed)
 		}
 		if ok {
 			// No Reset: the backoff starts over when a drop finds this conn
@@ -653,5 +791,146 @@ func (ps *PubSub) reconnectLoop() {
 			ps.reconnectingMu.Unlock()
 			return
 		}
+	}
+}
+
+// sleep waits for d and reports whether the loop should go on: false once the
+// PubSub is closed. closeCh wins every tie with the timer: a select picks at
+// random when both are ready, and an attempt after Close would dial a conn
+// nobody owns.
+func (ps *PubSub) sleep(d time.Duration) bool {
+	select {
+	case <-ps.closeCh:
+		return false
+	default:
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ps.closeCh:
+		return false
+	case <-t.C:
+	}
+	return !ps.closed.Load()
+}
+
+// pickClient returns the client the next dial goes to. moveOn says the last
+// client tried did not work out (a failed dial or a replay that did not hold),
+// so a route that has a choice picks another.
+func (ps *PubSub) pickClient(moveOn bool) (*Client, error) {
+	if ps.route == nil {
+		return ps.client, nil
+	}
+	ps.mu.Lock()
+	// The route follows the slot the PubSub serves, by one of its channels.
+	shard := ""
+	if slot, ok := ps.servedSlotLocked(); ok {
+		for ch := range ps.shardSubs {
+			if Slot(ch) == slot && (shard == "" || ch < shard) {
+				shard = ch
+			}
+		}
+	}
+	ps.mu.Unlock()
+	return ps.route.pick(ps.ctx, shard, ps.routeCur, moveOn)
+}
+
+// servedSlotLocked returns the slot of the shard channels the PubSub serves:
+// the slot of the first one added, kept while a channel of that slot is still
+// tracked, otherwise the slot of the smallest tracked channel. ok is false when
+// there is no shard channel. The caller holds mu.
+func (ps *PubSub) servedSlotLocked() (slot uint16, ok bool) {
+	if len(ps.shardSubs) == 0 {
+		ps.hasServed = false
+		return 0, false
+	}
+	if ps.hasServed {
+		for ch := range ps.shardSubs {
+			if Slot(ch) == ps.servedSlot {
+				return ps.servedSlot, true
+			}
+		}
+	}
+	first := ""
+	for ch := range ps.shardSubs {
+		if first == "" || ch < first {
+			first = ch
+		}
+	}
+	ps.servedSlot, ps.hasServed = Slot(first), true
+	return ps.servedSlot, true
+}
+
+// onShardUnsubscribed is the router's report, from the conn whose router is
+// from, of a "sunsubscribe" push for ch. A control call updates the tracked set
+// before it writes, so a channel that is still in shardSubs was not removed by
+// the caller: the server dropped it (its slot moved to another node) and the
+// PubSub subscribes again where the slot lives now. A channel that is gone from
+// the set is the ack of the caller's own SUnsubscribe. One for a channel
+// outside the served slot is ignored (see below). (A SUnsubscribe(x)
+// followed at once by a SSubscribe(x) can make the ack look like the server's:
+// one extra reroute, harmless.)
+//
+// It runs on the event-loop worker: mu and reconnectingMu only, never ctlMu. A
+// report from a conn that is not ps.conn any more (one the reroute loop has
+// replaced, its report still in flight) is ignored: the replay already answers
+// it. mu is held across trigger, as the loop holds it across the install that
+// clears pendingReroute, so a report is either before the install (and cleared
+// by it) or after it (and ignored).
+func (ps *PubSub) onShardUnsubscribed(from *pubsubRouter, ch string) {
+	if ps.route == nil {
+		return
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.conn == nil || ps.conn.state.router != from {
+		return
+	}
+	// Only the slot the PubSub serves: a channel of another slot that the same
+	// node happened to accept is dropped from the replay anyway, and its slot
+	// moving away is no reason to rebuild the subscription that is served.
+	if served, ok := ps.servedSlotLocked(); ok && Slot(ch) == served {
+		if _, still := ps.shardSubs[ch]; still {
+			ps.trigger(true)
+		}
+	}
+}
+
+// onControlError is the router's report, from the conn whose router is from, of
+// an error reply in pubsub mode. The replies of the control writes are not
+// matched to their commands, so the rule is by content, on a PubSub that serves
+// shard channels of a cluster:
+//   - -MOVED for the slot the PubSub serves: the node does not serve it (the
+//     slot moved, or the topology was stale), so the subscription did not take:
+//     look for the owner again, with the backoff. A -MOVED for another slot
+//     answers something else (Redis answers a SUNSUBSCRIBE of a channel it holds
+//     no subscription for, in a slot it does not serve, with -MOVED; a channel
+//     of a second slot added to the PubSub is not served) and is ignored.
+//   - -CLUSTERDOWN: the cluster is between owners; look again, with the backoff.
+//
+// Anything else (a -CROSSSLOT, an unknown command) is the caller's to fix:
+// retrying would loop. Same context and locking as onShardUnsubscribed.
+func (ps *PubSub) onControlError(from *pubsubRouter, msg string) {
+	if ps.route == nil || !ps.route.slotted() {
+		return
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.conn == nil || ps.conn.state.router != from {
+		return
+	}
+	served, ok := ps.servedSlotLocked()
+	if !ok {
+		return
+	}
+	switch {
+	case strings.HasPrefix(msg, "MOVED "):
+		if f := strings.Fields(msg); len(f) >= 2 {
+			if n, err := strconv.Atoi(f[1]); err == nil && n == int(served) {
+				ps.trigger(true)
+			}
+		}
+	case strings.HasPrefix(msg, "CLUSTERDOWN"):
+		ps.trigger(true)
 	}
 }
