@@ -263,11 +263,19 @@ func start844(t *testing.T, h *a844, gate bool) *rig844 {
 	t.Cleanup(cancel)
 	r.done = make(chan error, 1)
 	go func() { r.done <- ae.Listen(ctx) }()
-	for dl := time.Now().Add(5 * time.Second); ae.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ae.Addr() == nil {
-		t.Fatal("adaptive engine never bound")
+	// A guard against a hang, not an expectation: Listen gives up on its own after
+	// its bind deadline (20 s) and returns its error, which this reports. The
+	// 5 s it replaces could be missed by a starved poll or a slow Listen alone
+	// (celeris#890 item 98, internal/adaptive's awaitBind890).
+	for dl := time.Now().Add(30 * time.Second); ae.Addr() == nil; time.Sleep(10 * time.Millisecond) {
+		select {
+		case lerr := <-r.done:
+			t.Fatalf("adaptive engine never bound: Listen returned %v", lerr)
+		default:
+		}
+		if time.Now().After(dl) {
+			t.Fatal("adaptive engine never bound within 30s")
+		}
 	}
 	r.addr = ae.Addr().String()
 	if pkg844 == "iouring" {
