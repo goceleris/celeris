@@ -171,7 +171,7 @@ func eachRequest888(d dotTree888, sp rootSpelling888, fn func(path string, r req
 func TestDotDotRootsMiddleware888(t *testing.T) {
 	d := newDotTree888(t)
 	for _, sp := range d.spellings() {
-		mw := New(Config{Root: sp.root})
+		mw := New(Config{Root: sp.root, AllowFilesystemRoot: sp.root == "/"})
 		eachRequest888(d, sp, func(path string, r req888, hostile bool) {
 			rec, _ := get888(t, mw, path)
 			d.verdict(t, "static", sp, r, hostile, rec.StatusCode, string(rec.Body))
@@ -268,7 +268,7 @@ func TestDotDotRootsOverTheWire888(t *testing.T) {
 	}
 	entries := []entry{
 		{"middleware", "", func(root string) func(s *celeris.Server) {
-			return func(s *celeris.Server) { s.Use(New(Config{Root: root})) }
+			return func(s *celeris.Server) { s.Use(New(Config{Root: root, AllowFilesystemRoot: root == "/"})) }
 		}},
 		{"Server.Static", "/files", func(root string) func(s *celeris.Server) {
 			return func(s *celeris.Server) { s.Static("/files", root) }
@@ -280,6 +280,9 @@ func TestDotDotRootsOverTheWire888(t *testing.T) {
 	for _, eng := range wireEngines888 {
 		for _, e := range entries {
 			for _, sp := range d.spellings() {
+				if sp.root == "/" && e.prefix != "" {
+					continue // Server.Static and Group.Static refuse a filesystem root (TestFilesystemRootIsRefused888)
+				}
 				t.Run(fmt.Sprintf("%v/%s/%s", eng, e.name, sp.root), func(t *testing.T) {
 					raw := wire888(t, eng, e.reg(sp.root))
 					eachRequest888(d, sp, func(path string, r req888, hostile bool) {

@@ -104,6 +104,7 @@ func (s spelling888) open888(t *testing.T, r root888, cfg Config) celeris.Handle
 		t.Chdir(r.root)
 	}
 	cfg.Root = s.root
+	cfg.AllowFilesystemRoot = s.root == "/" // "/" is a filesystem root: acknowledged
 	return New(cfg)
 }
 
@@ -291,7 +292,7 @@ func TestRootSlashHasNoOutside888(t *testing.T) {
 		t.Skip("Root \"/\" is the current volume's root on Windows")
 	}
 	r := tree888(t)
-	mw := New(Config{Root: "/"})
+	mw := New(Config{Root: "/", AllowFilesystemRoot: true})
 	base := strings.TrimSuffix(filepath.ToSlash(r.root), "/")
 	for _, p := range []string{
 		base + "/esc-abs",

@@ -142,7 +142,7 @@ func TestNonRegularFilesAreNotServed888(t *testing.T) {
 	cfgs := []cfg{
 		{"abs-root", func(t *testing.T) celeris.HandlerFunc { return New(Config{Root: st.dir}) }, rel},
 		{"dot-root", func(t *testing.T) celeris.HandlerFunc { t.Chdir(st.dir); return New(Config{Root: "."}) }, rel},
-		{"slash-root", func(t *testing.T) celeris.HandlerFunc { return New(Config{Root: "/"}) }, func(p string) string { return st.dir + p }},
+		{"slash-root", func(t *testing.T) celeris.HandlerFunc { return New(Config{Root: "/", AllowFilesystemRoot: true}) }, func(p string) string { return st.dir + p }},
 		{"dirfs", func(t *testing.T) celeris.HandlerFunc { return New(Config{FS: os.DirFS(st.dir)}) }, rel},
 		{"spa", func(t *testing.T) celeris.HandlerFunc { return New(Config{Root: st.dir, SPA: true}) }, rel},
 	}
@@ -234,7 +234,7 @@ func TestDeviceFilesStatic888(t *testing.T) {
 	for _, root := range []string{"/", "."} {
 		t.Run(root, func(t *testing.T) {
 			t.Chdir("/")
-			mw := New(Config{Root: root})
+			mw := New(Config{Root: root, AllowFilesystemRoot: true})
 			for _, p := range []string{"/dev/zero", "/dev/null", "/dev/urandom", "/dev/random", "/dev/full"} {
 				rec := within888(t, "GET "+p, 10*time.Second, func() *celeristest.ResponseRecorder {
 					rec, _ := get888(t, mw, p)
@@ -297,8 +297,8 @@ func TestDeviceFilesExplicitAPIs888(t *testing.T) {
 }
 
 // TestDeviceFilesOverTheWire888: the exact request of the review, over the
-// engines: Root "." with a working directory of "/", Root "/", Server.Static
-// and Group.Static over "." — GET /dev/zero is a 404 and the server stays up.
+// engines: Root "." with a working directory of "/" and Root "/" (acknowledged
+// with AllowFilesystemRoot) — GET /dev/zero is a 404 and the server stays up.
 func TestDeviceFilesOverTheWire888(t *testing.T) {
 	deviceCellsOK888(t)
 	guardMemory888(t, 256<<20)
@@ -309,10 +309,8 @@ func TestDeviceFilesOverTheWire888(t *testing.T) {
 	}
 	for _, eng := range wireEngines888 {
 		for _, e := range []entry{
-			{"middleware-dot", "", func(s *celeris.Server) { s.Use(New(Config{Root: "."})) }},
-			{"middleware-slash", "", func(s *celeris.Server) { s.Use(New(Config{Root: "/"})) }},
-			{"Server.Static-dot", "/files", func(s *celeris.Server) { s.Static("/files", ".") }},
-			{"Group.Static-slash", "/g/files", func(s *celeris.Server) { s.Group("/g").Static("/files", "/") }},
+			{"middleware-dot", "", func(s *celeris.Server) { s.Use(New(Config{Root: ".", AllowFilesystemRoot: true})) }},
+			{"middleware-slash", "", func(s *celeris.Server) { s.Use(New(Config{Root: "/", AllowFilesystemRoot: true})) }},
 		} {
 			t.Run(fmt.Sprintf("%v/%s", eng, e.name), func(t *testing.T) {
 				raw := wire888(t, eng, e.reg)

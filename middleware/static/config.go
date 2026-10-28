@@ -127,6 +127,14 @@ type Config struct {
 	// is the operator's choice and is served even if its name starts with a dot.
 	// The zero value is [DotfilesIgnore].
 	Dotfiles DotfilesPolicy
+
+	// AllowFilesystemRoot acknowledges a Root that resolves to the root of a
+	// filesystem ("/", "." when the working directory is "/", "../../.."
+	// reaching it, a symlink to "/", a drive root such as C:\ on Windows). It
+	// is refused at New, with a panic that names the resolved path, unless this
+	// is true: such a Root serves every file the process can read below it, and
+	// nothing is outside it any more. Default: false.
+	AllowFilesystemRoot bool
 }
 
 var defaultConfig = Config{
