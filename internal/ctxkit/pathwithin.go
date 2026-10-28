@@ -1,6 +1,7 @@
 package ctxkit
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -8,21 +9,51 @@ import (
 // PathWithin reports whether p is base or a path below it. Both are cleaned
 // paths (filepath.Clean), of the same kind: both relative or both absolute.
 //
-// The test "p starts with base + separator" is wrong for two bases. The
-// working directory, ".", is a prefix of no cleaned path (filepath.Join(".",
+// The test "p starts with base + separator" is wrong for three kinds of base.
+// The working directory, ".", is a prefix of no cleaned path (filepath.Join(".",
 // "a/b") is "a/b"), so everything below it was refused: p is below "." when it
 // is relative and does not climb out ("..", "../x"). A base that ends in a
 // separator, the root of a filesystem ("/", `C:\`), has "//" as its prefix, which
-// no path starts with: p is below it when it starts with base itself.
+// no path starts with: p is below it when it starts with base itself. And a
+// relative base that starts with ".." names a directory above the working
+// directory, so a path that "starts with" it says nothing ("../../etc/passwd"
+// starts with ".." and a separator, and is not below ".."): such a base and p are
+// made absolute, against the working directory with its symlinks resolved, and
+// compared as absolute paths. A Root of "..", "../.." or "../x/.." serves the
+// directory it resolves to and nothing outside it.
 func PathWithin(base, p string) bool {
 	if p == base {
 		return true
 	}
-	if base == "." {
-		if filepath.IsAbs(p) || filepath.VolumeName(p) != "" || p == ".." {
+	if !filepath.IsAbs(base) && climbs(base) {
+		ab, err := absPhysical(base)
+		if err != nil {
 			return false
 		}
-		return !strings.HasPrefix(p, ".."+string(filepath.Separator))
+		ap, err := absPhysical(p)
+		if err != nil {
+			return false
+		}
+		return withinClean(ab, ap)
+	}
+	return withinClean(base, p)
+}
+
+// climbs reports whether the cleaned relative path starts with "..".
+func climbs(p string) bool {
+	return p == ".." || strings.HasPrefix(p, ".."+string(filepath.Separator))
+}
+
+// withinClean is PathWithin for two cleaned paths whose base does not climb.
+func withinClean(base, p string) bool {
+	if p == base {
+		return true
+	}
+	if base == "." {
+		if filepath.IsAbs(p) || filepath.VolumeName(p) != "" {
+			return false
+		}
+		return !climbs(p)
 	}
 	if !strings.HasPrefix(p, base) {
 		return false
@@ -30,27 +61,49 @@ func PathWithin(base, p string) bool {
 	return base[len(base)-1] == filepath.Separator || p[len(base)] == filepath.Separator
 }
 
+// absPhysical makes the cleaned path absolute against the working directory
+// with its symlinks resolved, so that ".." in the result climbs the way the
+// operating system does (a working directory reached through a symlink has a
+// different parent than its logical path has). An absolute path is returned
+// as it is.
+func absPhysical(p string) (string, error) {
+	if filepath.IsAbs(p) {
+		return p, nil
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	wd, err = filepath.EvalSymlinks(wd)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(wd, p), nil
+}
+
 // ResolvedWithin is PathWithin for the results of filepath.EvalSymlinks:
 // resolved is the resolved path and base the resolved base. EvalSymlinks keeps a
 // relative path relative unless a symlink on the way has an absolute target, so
 // under a relative base (".", "public") a resolved path can be absolute and
-// still inside it. That is the case ResolvedWithin settles, with the base made
-// absolute and resolved the same way; a resolved path that stays relative is
-// compared as it is (one that climbs, "../x", is refused).
+// still inside it, or relative and climb through the base's own name
+// ("../c/a" from a working directory c) and still be inside. When the lexical
+// comparison refuses and one of the two is relative, both are made absolute
+// (absPhysical; neither holds a symlink any more, so the result is exact) and
+// compared; two absolute paths are compared as they are.
 func ResolvedWithin(base, resolved string) bool {
 	if PathWithin(base, resolved) {
 		return true
 	}
-	if filepath.IsAbs(base) || !filepath.IsAbs(resolved) {
+	if filepath.IsAbs(base) && filepath.IsAbs(resolved) {
 		return false
 	}
-	abs, err := filepath.Abs(base)
+	ab, err := absPhysical(base)
 	if err != nil {
 		return false
 	}
-	abs, err = filepath.EvalSymlinks(abs)
+	ar, err := absPhysical(resolved)
 	if err != nil {
 		return false
 	}
-	return PathWithin(abs, resolved)
+	return withinClean(ab, ar)
 }

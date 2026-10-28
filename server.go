@@ -334,7 +334,12 @@ func (s *Server) OnShutdown(fn func(ctx context.Context)) *Server {
 }
 
 // Static registers a GET handler that serves files from root under the given
-// prefix. Uses FileFromDir for path traversal protection.
+// prefix. Uses FileFromDir for path traversal protection. root may be ".",
+// "./" or "/" (from v1.6.0; before, every file below them was refused): "." is
+// the working directory, dotfiles and .git included, and "/" the whole
+// filesystem, so name a directory that holds only what is public. A root made
+// of ".." segments means the directory it resolves to, and nothing outside it
+// is served. An empty root serves nothing.
 //
 //	s.Static("/assets", "./public")
 func (s *Server) Static(prefix, root string) *Route {

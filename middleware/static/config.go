@@ -20,20 +20,25 @@ type Config struct {
 	// the middleware panics.
 	//
 	// Everything below Root is served, dotfiles and dot directories included
-	// (.env, .git/config): the package has no rule against them. A path that
-	// leaves Root, by "..", an absolute path, or a symlink that resolves outside
-	// it, is refused. A relative Root is read against the working directory at
-	// each request.
+	// (.env, .git/config): the package has no rule against them today (a
+	// default deny for them is being decided). A path that leaves Root, by
+	// "..", an absolute path, or a symlink that resolves outside it, is
+	// refused. A relative Root is read against the working directory at each
+	// request; a Root made of ".." segments ("..", "../..") means the directory
+	// it resolves to, and nothing outside that directory is served.
 	//
 	// Root may be ".", "./" or "/", and serves the tree below it as any other
 	// directory does. Mind what that is: "." is the process's working
-	// directory, with its sources and configuration, and "/" is the whole
-	// filesystem (/etc/passwd, the home directories, /proc/self/environ, the
-	// process's environment: whatever the process may read), where nothing is
-	// outside Root any more, so the containment check that protects the others
-	// protects nothing. Before v1.6.0 these three served nothing below the
-	// root, so an upgrade starts to serve what the config always named: name a
-	// directory that holds only what is meant to be public.
+	// directory, with its sources and configuration (.env, .git), and "/" is
+	// the whole filesystem (/etc/passwd, the home directories,
+	// /proc/self/environ, the process's environment: whatever the process may
+	// read), where nothing is outside Root any more, so the containment check
+	// that protects the others protects nothing. When the working directory
+	// is "/" (the default of a systemd service and of a container without a
+	// WORKDIR), "." is the whole filesystem too. Before v1.6.0 these three
+	// served nothing below the root, so a configuration that was inert since
+	// v1.3.3 starts to serve files after the upgrade: name a directory that
+	// holds only what is meant to be public.
 	Root string
 
 	// FS is an [fs.FS] from which to serve files (e.g. embed.FS).

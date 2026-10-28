@@ -1074,7 +1074,12 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // "." or "./" is the working directory and one of "/" the filesystem's root
 // (before v1.6.0 these two refused every file with a 400): with "/" nothing is
 // outside baseDir, so only the file's own existence limits what userPath may
-// name. An empty baseDir is refused with a 400, not read as ".".
+// name. An empty baseDir is refused with a 400, not read as ".". A relative
+// baseDir is read against the working directory at each call; one made of ".."
+// segments ("..", "../..") means the directory it resolves to, and a userPath
+// that climbs out of that directory is refused (before v1.6.0 it was not: a
+// baseDir of ".." served any file the process could read). Dotfiles are served:
+// there is no rule against them.
 func (c *Context) FileFromDir(baseDir, userPath string) error {
 	return c.fileFromDir(baseDir, userPath, "", nil)
 }

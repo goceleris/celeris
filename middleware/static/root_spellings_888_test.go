@@ -41,6 +41,7 @@ const (
 //	index.html, hello.txt, .env, .hidden/x.txt, sub/index.html, sub/page.txt
 //	in-abs     -> <root>/hello.txt        (a symlink to a file inside, absolute)
 //	in-rel     -> hello.txt               (relative)
+//	in-up      -> ../root/hello.txt       (relative, climbs through the root's own name)
 //	in-dir     -> <root>/sub              (a symlink to a directory inside, absolute)
 //	esc-abs    -> <outside>/secret.txt    (a symlink out of the root)
 //	esc-rel    -> ../outside/secret.txt
@@ -62,6 +63,7 @@ func tree888(t *testing.T) root888 {
 	}
 	r.link(t, filepath.Join(r.root, "hello.txt"), "in-abs")
 	r.link(t, "hello.txt", "in-rel")
+	r.link(t, filepath.Join("..", "root", "hello.txt"), "in-up") // climbs, through the root's own name
 	r.link(t, filepath.Join(r.root, "sub"), "in-dir")
 	r.link(t, filepath.Join(r.outside, "secret.txt"), "esc-abs")
 	r.link(t, filepath.Join("..", "outside", "secret.txt"), "esc-rel")
@@ -210,6 +212,7 @@ func TestRootSpellingsFollowSymlinksInside888(t *testing.T) {
 	}{
 		{"/in-abs", helloBody888, len(helloBody888)},
 		{"/in-rel", helloBody888, len(helloBody888)},
+		{"/in-up", helloBody888, len(helloBody888)},
 		{"/in-dir/page.txt", pageBody888, len(pageBody888)},
 		{"/in-dir/", subBody888, len(subBody888)},
 	}

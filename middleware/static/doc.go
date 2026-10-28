@@ -34,9 +34,15 @@
 // checks agree, for a Root of ".", "./" and "/" as for any other directory:
 // these three serve the tree below them (before v1.6.0 they served nothing below
 // the root, and the root's own index answered 400 or 304 depending on whether a
-// validator matched). Their meaning is wide: "." is the working directory and
-// "/" the whole filesystem, and dotfiles are served under every Root. Name the
-// directory that holds what is public; see [Config].Root.
+// validator matched). Their meaning is wide: "." is the working directory,
+// dotfiles (.env, .git) included, and "/" the whole filesystem; when the
+// working directory is "/" (a systemd service, a container without a WORKDIR),
+// "." is the whole filesystem too, /proc/self/environ among its files. A
+// configuration that was inert since v1.3.3 starts to serve files after the
+// upgrade. The package has no dotfile rule today (a default deny is being
+// decided). A Root made of ".." segments means the directory it resolves to,
+// and nothing outside it is served. Name the directory that holds what is
+// public; see [Config].Root.
 //
 // With compress in front of an [Config].FS, the strong tag of a file that compress
 // encodes is made weak on the 200 (W/"hash"), and static marks the response so
