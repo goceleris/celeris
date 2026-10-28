@@ -50,20 +50,23 @@ type Config struct {
 	// request; a Root made of ".." segments ("..", "../..") means the directory
 	// it resolves to, and nothing outside that directory is served.
 	//
-	// Root may be ".", "./" or "/", and serves the tree below it as any other
-	// directory does. Mind what that is: "." is the process's working
-	// directory, with its sources and configuration, and "/" is
-	// the whole filesystem (/etc/passwd, the home directories,
-	// /proc/self/environ, the process's environment: whatever the process may
-	// read), where nothing is outside Root any more, so the containment check
-	// that protects the others protects nothing; only the dotfile rule still
-	// applies to the request path (/home/u/.ssh is not served), and
-	// /etc/passwd and /proc/self/environ are not dotfiles. When the working directory
-	// is "/" (the default of a systemd service and of a container without a
-	// WORKDIR), "." is the whole filesystem too. Before v1.6.0 these three
-	// served nothing below the root, so a configuration that was inert since
-	// v1.3.3 starts to serve files after the upgrade: name a directory that
-	// holds only what is meant to be public.
+	// Root may be ".", "./" or a path with ".." segments, and serves the tree
+	// below it as any other directory does; "." is the process's working
+	// directory, with its sources and configuration. A Root that resolves to the
+	// root of a filesystem is refused: "/", "." when the working directory is "/"
+	// (the default of a systemd service and of a container without a WORKDIR),
+	// "../../.." reaching it, a symlink to it, a drive root such as C:\ on
+	// Windows. New panics with a message that names the resolved path, unless
+	// [Config].AllowFilesystemRoot is set: such a Root serves every file the
+	// process can read (/etc/passwd, /proc/self/environ, keys without a dot in
+	// their path), nothing is outside it, and the dotfile rule is no secrets
+	// filter. The check resolves the Root when New is called; a chdir after that
+	// is not covered, so resolve a relative Root to an absolute path at startup.
+	// No released version served anything below such a Root, so no working
+	// deployment depends on it. Before v1.6.0 "." and "./" served nothing below
+	// the root either: a configuration that was inert since v1.3.3 starts to
+	// serve the working directory after the upgrade (without its hidden files:
+	// see [Config].Dotfiles).
 	Root string
 
 	// FS is an [fs.FS] from which to serve files (e.g. embed.FS).
@@ -123,9 +126,20 @@ type Config struct {
 	// names start with a dot. Only the segments of the request count: the name
 	// of Root, or of the directory Root "." is in, does not. A visible name that
 	// is a symlink to a hidden file or directory of the tree is refused like the
-	// hidden name. Browse leaves hidden entries out of a listing. The Index file
+	// hidden name (for an FS, when it can resolve symlinks: an [os.DirFS] can, as
+	// an [fs.ReadLinkFS]; an FS that is not one has none to follow). Browse leaves
+	// hidden entries out of a listing. The Index file
 	// is the operator's choice and is served even if its name starts with a dot.
-	// The zero value is [DotfilesIgnore].
+	//
+	// The rule is not a secrets filter: it looks at the names in the request
+	// path and at where symlinks lead, nothing else. A secret whose path has no
+	// dot segment (/etc/shadow readable by the process, /proc/self/environ, an
+	// id_rsa, /var/run/secrets/...) is served from any Root that reaches it. And
+	// it is not a sandbox against a writable tree: a symlink swapped between the
+	// check and the open, and a hard link to a hidden file, defeat any path rule,
+	// so the served tree must not be writable by untrusted parties.
+	// The zero value is [DotfilesIgnore]; any other value than the three
+	// constants panics at New.
 	Dotfiles DotfilesPolicy
 
 	// AllowFilesystemRoot acknowledges a Root that resolves to the root of a

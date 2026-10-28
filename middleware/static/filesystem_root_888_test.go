@@ -73,7 +73,6 @@ func TestFilesystemRootIsRefused888(t *testing.T) {
 		{"up-beyond-slash", up + "/../../..", ""},
 		{"symlink-to-slash", link, ""},
 		{"symlink-to-slash-slash", link + "/", ""},
-		{"symlink-to-slash-dotdot", link + "/..", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.cwd != "" {

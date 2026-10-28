@@ -33,17 +33,25 @@
 // containment check, the one [celeris.Context.FileFromDir] applies to a file it
 // sends (symlinks resolved), has passed for its path, and that check runs for
 // every conditional request, whether or not its validator matches. The two
-// checks agree, for a Root of ".", "./" and "/" as for any other directory:
-// these three serve the tree below them (before v1.6.0 they served nothing below
-// the root, and the root's own index answered 400 or 304 depending on whether a
-// validator matched). Their meaning is wide: "." is the working directory and
-// "/" the whole filesystem; when the working directory is "/" (a systemd
-// service, a container without a WORKDIR), "." is the whole filesystem too,
-// /proc/self/environ among its files. A configuration that was inert since
-// v1.3.3 starts to serve files after the upgrade, which the dotfile rule below
-// makes safer (.env and .git are not served by default). A Root made of ".."
-// segments means the directory it resolves to, and nothing outside it is
-// served. Name the directory that holds what is public; see [Config].Root.
+// checks agree, for a Root of ".", "./" as for any other directory: these
+// serve the tree below them (before v1.6.0 they served nothing below the root,
+// and the root's own index answered 400 or 304 depending on whether a validator
+// matched), so a configuration that was inert since v1.3.3 starts to serve the
+// working directory after the upgrade, without its hidden files (below). A Root
+// made of ".." segments means the directory it resolves to, and nothing outside
+// it is served.
+//
+// A Root that resolves to the root of a filesystem is refused: "/", "." when
+// the working directory is "/" (a systemd service, a container without a
+// WORKDIR), "../../.." reaching it, a symlink to it, a drive root on Windows.
+// New panics, naming the resolved path, unless [Config].AllowFilesystemRoot is
+// set; Server.Static and Group.Static refuse it with no way to acknowledge, so
+// serve a filesystem root on purpose with this middleware. The Root is
+// resolved when New is called: a chdir after that is not covered, so resolve a
+// relative Root to an absolute path at startup. Devices, FIFOs and sockets are
+// never served: they are answered as a missing file, since reading /dev/zero
+// never ends and opening a FIFO waits for a writer. Name the directory that holds
+// what is public; see [Config].Root.
 //
 // # Dotfiles
 //
@@ -67,6 +75,15 @@
 //	// A project that serves a hidden file on purpose names its directory and
 //	// allows dotfiles there, and keeps its secrets out of that directory.
 //	static.New(static.Config{Root: "./public", Dotfiles: static.DotfilesAllow})
+//
+// The rule is not a secrets filter. It looks at the names in the request path
+// and at where symlinks lead, and nothing else: a secret whose path has no dot
+// segment (/etc/shadow when the process can read it, /proc/self/environ, an
+// id_rsa, /var/run/secrets/...) is served from any Root that reaches it, and
+// that is what an acknowledged filesystem root does. Nor is it a sandbox for a
+// tree that others can write to: a symlink swapped between the check and the
+// open, and a hard link to a hidden file, defeat any rule about paths. Keep
+// secrets out of the served directory, and the directory out of untrusted hands.
 //
 // The rule is the middleware's, and that of Server.Static and Group.Static,
 // which serve a directory too (without a way to opt out: use the middleware for

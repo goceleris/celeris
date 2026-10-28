@@ -137,6 +137,16 @@ func New(config ...Config) celeris.HandlerFunc {
 		// A root made of ".." segments is resolved against the working
 		// directory here, once (see ctxkit.ResolveClimbingRoot).
 		cleanRoot = ctxkit.ResolveClimbingRoot(filepath.Clean(root))
+		// A root that resolves to the root of a filesystem serves every file the
+		// process can read: refused unless acknowledged. The working directory
+		// and the symlinks are read now; a chdir after this is not covered.
+		if fsys == nil && !cfg.AllowFilesystemRoot {
+			if resolved, ok := ctxkit.FilesystemRoot(cleanRoot); ok {
+				panic(fmt.Sprintf("static: Root %q resolves to the filesystem root %q, which serves every file the process can read: "+
+					"name the directory that holds the public files, or set Config.AllowFilesystemRoot to serve a filesystem root on purpose "+
+					"(the working directory is read now: a later chdir is not covered)", root, resolved))
+			}
+		}
 	}
 
 	// Precompute the cache-control header once — maxAge is closure-constant,

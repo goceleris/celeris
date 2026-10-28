@@ -943,7 +943,12 @@ func staticRoot(root string) string {
 	if root == "" {
 		return root
 	}
-	return ctxkit.ResolveClimbingRoot(filepath.Clean(root))
+	root = ctxkit.ResolveClimbingRoot(filepath.Clean(root))
+	if resolved, ok := ctxkit.FilesystemRoot(root); ok {
+		panic(fmt.Sprintf("celeris: Static root %q resolves to the filesystem root %q, which serves every file the process can read: "+
+			"name the directory that holds the public files, or serve a filesystem root on purpose with middleware/static and Config.AllowFilesystemRoot", root, resolved))
+	}
+	return root
 }
 
 // errNotRegular is the error for a path that is not a regular file (a device, a
@@ -1125,7 +1130,11 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // baseDir of ".." served any file the process could read). Hidden files
 // (names that start with a dot) are served: the caller chooses the path, and
 // the dotfile rule of middleware/static, Server.Static and Group.Static does not
-// apply here.
+// apply here, and neither does the refusal of a base that is the root of a
+// filesystem: a baseDir of "/" serves every file the process can read to a
+// userPath the caller got from a client, so choose the path with care. A device,
+// a FIFO or a socket is not served: it is an HTTPError 404 "not a regular
+// file".
 func (c *Context) FileFromDir(baseDir, userPath string) error {
 	return c.fileFromDir(baseDir, userPath, "", nil, nil)
 }

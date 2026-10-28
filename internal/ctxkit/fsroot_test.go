@@ -63,7 +63,8 @@ func TestFilesystemRoot(t *testing.T) {
 		root string
 		want bool
 	}{
-		{"/", true}, {"/.", true}, {"//", true}, {"/..", true}, {link, true}, {link + "/..", true}, {up, true},
+		{"/", true}, {"/.", true}, {"//", true}, {"/..", true}, {link, true}, {up, true},
+		{link + "/..", false}, // cleaned lexically, as the package cleans a root: the directory that holds the link
 		{".", false}, {"..", false}, {"../..", false}, {wd, false}, {"/etc", false}, {"/no/such", false}, {"sub", false},
 	} {
 		got, ok := FilesystemRoot(filepath.Clean(tc.root))
