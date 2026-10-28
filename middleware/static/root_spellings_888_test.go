@@ -388,7 +388,9 @@ func TestRootSpellingsOverTheWire888(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				_ = s.Shutdown(ctx)
-				_ = <-done
+				if err := <-done; err != nil {
+					t.Logf("Start returned %v", err)
+				}
 			})
 			raw := func(path string) string {
 				var lastErr error

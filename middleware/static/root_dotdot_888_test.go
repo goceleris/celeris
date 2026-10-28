@@ -210,7 +210,9 @@ func wire888(t *testing.T, eng celeris.EngineType, reg func(s *celeris.Server)) 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = s.Shutdown(ctx)
-		<-done
+		if err := <-done; err != nil {
+			t.Logf("Start returned %v", err)
+		}
 	})
 	do := func(path string) (int, string) {
 		var lastErr error
