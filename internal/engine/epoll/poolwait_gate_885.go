@@ -150,40 +150,43 @@ func (l *Loop) closeIdleH1(first bool, now int64) int {
 		if cs.hijacked.Load() {
 			continue
 		}
-		// A conn a dispatch goroutine owns is closed here only when the gate has
-		// ended its detached stream (an SSE or WebSocket handler on an Async
-		// route detaches on that goroutine): the goroutine is out of its handler,
-		// since detachClosed is set only under a detachMu the handler held, its
-		// writes no-op, and closeConn takes the lock as shutdown's own teardown
-		// does. The state is read under the lock.
-		ended := false
+		// A conn a dispatch goroutine owns (asyncPromoted: every conn that ever served
+		// an Async route, and on a server with any Async route every conn whose
+		// request once arrived in pieces) is looked at as io_uring's gate looks at
+		// it (gateCloseable, celeris#884; here celeris#1165): not while the goroutine
+		// has input waiting or is inside a handler (promotedGateState), and then
+		// under detachMu, which a goroutine parked between requests does not hold.
+		// Closed when the gate has ended its detached stream, or when it is idle:
+		// no request in progress in its parser. The state is read under the lock;
+		// closeConn takes the lock itself, and a goroutine that is parked exits on
+		// the asyncClosed it sets.
+		ended, promotedIdle := false, false
 		if cs.asyncPromoted {
-			mu := cs.detachMu
-			if mu == nil || !mu.TryLock() {
-				continue
-			}
-			ended = cs.detachClosed && cs.protocol == engine.HTTP1 && cs.h1State != nil && cs.h1State.Detached.Load()
-			mu.Unlock()
-			if !ended {
+			ended, promotedIdle = promotedGateState(cs)
+			if !ended && !promotedIdle {
 				continue
 			}
 		}
-		if cs.detected {
-			if cs.protocol != engine.HTTP1 {
-				continue
-			}
-			if h := cs.h1State; h != nil && !ended {
-				// A request read after the gate is answered close-after (net/http
-				// does the same for a response written after Shutdown began).
-				h.CloseAfter = true
-				if h.HasPendingData() || (h.Detached.Load() && !cs.detachClosed) {
+		h1Detached := false
+		if !promotedIdle {
+			if cs.detected {
+				if cs.protocol != engine.HTTP1 {
 					continue
 				}
+				if h := cs.h1State; h != nil && !ended {
+					// A request read after the gate is answered close-after (net/http
+					// does the same for a response written after Shutdown began).
+					h.CloseAfter = true
+					if h.HasPendingData() || (h.Detached.Load() && !cs.detachClosed) {
+						continue
+					}
+				}
+			} else if cs.detectN != 0 {
+				continue
 			}
-		} else if cs.detectN != 0 {
-			continue
+			h1Detached = cs.h1State != nil && cs.h1State.Detached.Load()
 		}
-		if first && !ended && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
+		if first && !ended && !h1Detached {
 			// The kernel's receive queue, last before the tests that lead to
 			// the close, so that the window between the question and close(2)
 			// is the few microseconds of those tests (a request that arrives
@@ -317,4 +320,37 @@ func (l *Loop) stopDetachedProducers() {
 		}
 		mu.Unlock()
 	}
+}
+
+// promotedGateState is closeIdleH1's look at a conn whose dispatch goroutine
+// owns its parse state (asyncPromoted). ended: the gate has ended its detached
+// stream and what was queued has been handed over, so the conn may be closed.
+// idle: the goroutine is parked with no input waiting, nothing is detached, the
+// conn is still HTTP/1 and its parser holds no part of a request; the conn is
+// marked close-after, as the gate marks every conn it meets, since the loop
+// cannot know that no request will follow before it closes the conn. Both false
+// while the goroutine has work (dispatchHasWork) or holds detachMu inside a
+// handler or a guarded write, and for a conn the goroutine switched to HTTP/2.
+// Loop thread.
+func promotedGateState(cs *connState) (ended, idle bool) {
+	cs.asyncInMu.Lock()
+	busy := len(cs.asyncInBuf) > 0 || (cs.asyncRun && !cs.asyncParked && !cs.asyncDetachUnlocked)
+	cs.asyncInMu.Unlock()
+	if busy {
+		return false, false
+	}
+	mu := cs.detachMu
+	if mu == nil || !mu.TryLock() {
+		return false, false
+	}
+	defer mu.Unlock()
+	h := cs.h1State
+	if h == nil || cs.protocol != engine.HTTP1 || cs.switchedToH2() {
+		return false, false
+	}
+	if h.Detached.Load() {
+		return cs.detachClosed, false
+	}
+	h.CloseAfter = true
+	return false, !h.HasPendingData() && h.AtRequestBoundary()
 }

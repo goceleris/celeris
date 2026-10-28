@@ -126,6 +126,9 @@ func TestGateClosesAPromotedConnOnlyWhenItIsIdle1165(t *testing.T) {
 				}
 				return
 			}
+			if tc.name == "request-in-progress" && !r.cs.h1State.CloseAfter {
+				t.Fatal("a request in progress on a promoted conn is not marked close-after: it would be answered with keep-alive")
+			}
 			if n != 0 || r.l.conns[r.fd] == nil || r.discons.Load() != 0 || r.l.closeCount.Load() != 0 || r.l.activeConns.Load() != 1 {
 				t.Fatalf("closed=%d live=%v OnDisconnect=%d closeCount=%d activeConns=%d, want the conn left alone",
 					n, r.l.conns[r.fd] != nil, r.discons.Load(), r.l.closeCount.Load(), r.l.activeConns.Load())
