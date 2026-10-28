@@ -88,11 +88,8 @@ func TestAdaptiveSwitchIsNotALoopExit848(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- ae.Listen(ctx) }()
 	t.Cleanup(func() { cancel(); <-done })
-	for dl := time.Now().Add(5 * time.Second); ae.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ae.Addr() == nil {
-		t.Fatal("adaptive engine never bound")
+	if err := awaitAdaptiveBound844(ae, done, 30*time.Second); err != nil {
+		t.Fatalf("adaptive engine never bound: %v", err)
 	}
 	addr := ae.Addr().String()
 	keep, err := net.DialTimeout("tcp", addr, 2*time.Second) // idle keep-alive across the switches
