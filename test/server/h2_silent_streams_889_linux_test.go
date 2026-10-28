@@ -17,12 +17,14 @@ import (
 // request, the WINDOW_UPDATE a response is waiting for) and then sends nothing
 // is a different case, and main reaps it at ReadTimeout. These cells hold the
 // engines to that: ReadTimeout 1 s, IdleTimeout off, WriteTimeout 2 s, routes
-// sync and async, a client that sends no frame after its request.
+// sync and async, a client that sends no frame after its request. (A response
+// that waits for the window and is buffered in the stream is bounded by
+// WriteTimeout now, and keeps the conn until its stream is reset: the conn is
+// closed after that, still within the bound below.)
 //
 // A client that sends a frame of any kind at least once per ReadTimeout is not
-// reaped, on main or here (it restarts the conn clock): only a per-stream
-// deadline, which std has and the native engines do not, bounds one. The last
-// test pins that.
+// reaped by the conn clock (it restarts it): the per-stream deadlines bound its
+// streams. The last test pins that for a response.
 
 // silentServer889 is the server of these cells: /upload889 (POST, answers ok
 // once its body is whole), /big889 (a 1 MiB or, with ?n=8388608, an 8 MiB
@@ -84,9 +86,10 @@ var silentOwes889 = []struct {
 	{"response-8MiB-untaken", func(c *h2raw889) { c.request(1, "GET", "/big889?n=8388608", true, true) }},
 }
 
-// pingCells889 are the cells a pinging client still holds open (see the last
-// test). The request-open cell is gone from it: the per-stream request deadline
-// flipped it (TestH2PingingClientRequestIsAnsweredAndReset889).
+// pingCells889 are the cells of a client that pings and never takes a response
+// (see the last test): the request-open cell was flipped by the per-stream request
+// deadline (TestH2PingingClientRequestIsAnsweredAndReset889), the untaken response
+// by the per-stream write deadline.
 var pingCells889 = []struct {
 	name string
 	req  func(c *h2raw889)
@@ -119,17 +122,16 @@ func TestH2SilentClientOwingTheServerIsReaped889(t *testing.T) {
 	}
 }
 
-// TestH2PingingClientHoldsAnUnfinishedStream889 pins what is still not bounded:
-// a client that opens a stream, asks for a response it never takes, and sends
-// one PING every 500 ms (ReadTimeout is 1 s), is not closed on the native
-// engines (the PING restarts the conn clock, on main as well: measured on main
-// f4ae3ad, all three engines). std ends such a stream at WriteTimeout
-// (RST_STREAM INTERNAL_ERROR, 2.00 s). The request side of this was flipped by
-// the per-stream request deadline (ReadTimeout, 408 and RST_STREAM(NO_ERROR));
-// the response side waits for the per-stream write deadline, the second stage
-// of the per-stream deadlines work under celeris#889 (L19, D2). When it lands
-// these cells are FLIPPED to "the stream is reset", not deleted, and this
-// comment goes with them.
+// TestH2PingingClientHoldsAnUnfinishedStream889 (name kept) was the pinned cell
+// of a client that opens a stream, asks for a response it never takes, and sends
+// one PING every 500 ms (ReadTimeout is 1 s): on main it was not closed and its
+// stream was never reset on the native engines (measured on main f4ae3ad, all
+// three engines), where std ends such a stream at WriteTimeout (RST_STREAM
+// INTERNAL_ERROR, 2.00 s). The request side was flipped by the per-stream
+// request deadline (ReadTimeout, 408 and RST_STREAM(NO_ERROR)); this is the
+// response side, FLIPPED by the per-stream write deadline (L19, D2): the stream
+// is reset with INTERNAL_ERROR at WriteTimeout (2 s), and the conn, whose client
+// pings, stays and serves the next request.
 func TestH2PingingClientHoldsAnUnfinishedStream889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		for _, sc := range pingCells889 {
@@ -138,32 +140,12 @@ func TestH2PingingClientHoldsAnUnfinishedStream889(t *testing.T) {
 				addr := silentServer889(t, e.eng, false)
 				c := dialH2raw889(t, addr, h2dial889{})
 				sc.req(c)
-				stop := make(chan struct{})
-				done := make(chan struct{})
-				go func() {
-					defer close(done)
-					tk := time.NewTicker(500 * time.Millisecond)
-					defer tk.Stop()
-					for {
-						select {
-						case <-stop:
-							return
-						case <-tk.C:
-							c.wmu.Lock()
-							_ = c.fr.WritePing(false, [8]byte{'8', '8', '9'})
-							c.wmu.Unlock()
-						}
-					}
-				}()
-				o := c.watch(0, 6*time.Second)
-				close(stop)
-				<-done
-				t.Logf("H2PINGOWES889 engine=%s cell=%s: %s", e.name, sc.name, o)
-				if !o.open {
-					t.Fatalf("the connection was closed %v after the request although the client pinged every 500 ms (%s): %s; "+
-						"this cell pins that a pinging client is not bounded by ReadTimeout (as on main), see the comment",
-						o.at.Round(time.Millisecond), sc.name, o.how)
-				}
+				stop := c.pingEvery889(500 * time.Millisecond)
+				defer stop()
+				ev := c.await889(1, 6*time.Second)
+				t.Logf("H2PINGOWES889 engine=%s cell=%s: %s", e.name, sc.name, ev)
+				wantWriteReset889(t, ev, 1800*time.Millisecond, 3500*time.Millisecond)
+				c.serves889(3)
 			})
 		}
 	}

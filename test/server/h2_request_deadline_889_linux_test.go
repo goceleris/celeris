@@ -210,9 +210,9 @@ func (c *h2raw889) serves889(id uint32) {
 // TestH2PingingClientRequestIsAnsweredAndReset889 is the pinned ping cell of
 // the previous work FLIPPED: a client that never completes its POST and sends a
 // PING every 500 ms is no longer held: the request is answered 408 and reset at
-// ReadTimeout, the conn stays and serves the next request. (The pinned cells for
-// an unread RESPONSE stay pinned until the per-stream write deadline; see
-// TestH2PingingClientHoldsAnUnfinishedStream889.)
+// ReadTimeout, the conn stays and serves the next request. (The pinned cell for
+// an unread RESPONSE was flipped the same way by the per-stream write deadline;
+// see TestH2PingingClientHoldsAnUnfinishedStream889.)
 func TestH2PingingClientRequestIsAnsweredAndReset889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		t.Run(e.name, func(t *testing.T) {
