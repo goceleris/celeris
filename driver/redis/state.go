@@ -155,7 +155,7 @@ func (r *pubsubRouter) shardUnsubscribed(ch string) {
 	t := r.target
 	r.mu.Unlock()
 	if t != nil {
-		t.onShardUnsubscribed(ch)
+		t.onShardUnsubscribed(r, ch)
 	}
 }
 
@@ -167,7 +167,7 @@ func (r *pubsubRouter) controlError(msg string) {
 	t := r.target
 	r.mu.Unlock()
 	if t != nil {
-		t.onControlError(msg)
+		t.onControlError(r, msg)
 	}
 }
 

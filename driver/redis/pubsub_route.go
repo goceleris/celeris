@@ -25,6 +25,10 @@ type pubsubRoute interface {
 	pick(ctx context.Context, shard string, cur *Client, moveOn bool) (*Client, error)
 	// dialed reports the outcome of a dial on cl.
 	dialed(cl *Client, ok bool)
+	// slotted reports whether the route serves shard channels by slot (a
+	// cluster): the PubSub then serves one slot and ignores a -MOVED for
+	// another.
+	slotted() bool
 }
 
 // errPubSubNoOwner is a transient pick failure: the topology names no node for
@@ -73,13 +77,24 @@ func (r clusterPubSubRoute) pick(ctx context.Context, shard string, cur *Client,
 	return c.pubsubNode(cur, moveOn)
 }
 
+func (clusterPubSubRoute) slotted() bool { return true }
+
+// dialed records what a PubSub dial found out about a node. A failure marks the
+// node failing (so the next attempt moves on) and remembers that the PubSub
+// path did it; a success clears the mark only if the PubSub path set it, never
+// the command path's.
 func (r clusterPubSubRoute) dialed(cl *Client, ok bool) {
 	c := r.c
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, n := range c.nodes {
 		if n.client == cl {
-			n.failing.Store(!ok)
+			if !ok {
+				n.failing.Store(true)
+				n.psFailed.Store(true)
+			} else if n.psFailed.CompareAndSwap(true, false) {
+				n.failing.Store(false)
+			}
 			return
 		}
 	}
@@ -126,6 +141,7 @@ func (c *ClusterClient) pubsubNode(cur *Client, moveOn bool) (*Client, error) {
 func (c *ClusterClient) openPubSub(ctx context.Context, first *Client, shard string) (*PubSub, error) {
 	route := clusterPubSubRoute{c}
 	cl := first
+	tried := map[*Client]struct{}{cl: {}}
 	var lastErr error
 	for try := 0; ; try++ {
 		ps, err := cl.newPubSubRouted(ctx, route)
@@ -133,7 +149,11 @@ func (c *ClusterClient) openPubSub(ctx context.Context, first *Client, shard str
 			route.dialed(cl, true)
 			return ps, nil
 		}
-		route.dialed(cl, false)
+		// A dial that failed because the caller's context ended says nothing
+		// about the node.
+		if ctx.Err() == nil {
+			route.dialed(cl, false)
+		}
 		lastErr = err
 		c.mu.RLock()
 		n := len(c.nodes)
@@ -145,6 +165,12 @@ func (c *ClusterClient) openPubSub(ctx context.Context, first *Client, shard str
 		if perr != nil {
 			return nil, lastErr
 		}
+		// Each node at most once: a stale topology keeps naming a dead owner,
+		// and dialling it again (after a refresh) only spends the caller's time.
+		if _, seen := tried[next]; seen {
+			return nil, lastErr
+		}
+		tried[next] = struct{}{}
 		cl = next
 	}
 }
@@ -159,3 +185,5 @@ func (r sentinelPubSubRoute) pick(context.Context, string, *Client, bool) (*Clie
 }
 
 func (r sentinelPubSubRoute) dialed(*Client, bool) {}
+
+func (sentinelPubSubRoute) slotted() bool { return false }

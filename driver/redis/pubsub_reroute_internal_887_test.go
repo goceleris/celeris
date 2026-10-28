@@ -6,6 +6,7 @@ package redis
 
 import (
 	"context"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ func (r sameClientRoute) pick(context.Context, string, *Client, bool) (*Client, 
 	return r.c, nil
 }
 func (sameClientRoute) dialed(*Client, bool) {}
+func (sameClientRoute) slotted() bool        { return true }
 
 // routedPubSub opens a RESP2 PubSub on the only node of cl with a route.
 func routedPubSub(t *testing.T, cl *rpCluster, resp2 bool) *PubSub {
@@ -288,5 +290,52 @@ func TestClusterRerouteDoesNotInstallAConnOnAClosedPubSub887(t *testing.T) {
 	ps.mu.Unlock()
 	if conn != nil {
 		t.Errorf("the loop installed a conn on a closed PubSub")
+	}
+}
+
+// A report from the old conn that was in flight when the loop installed the new
+// one (the router's callback read its target before the install cleared the
+// router, then waited for mu) must not start a second reroute: the replay
+// already answers it. The loop is held after the install and the old conn's
+// router reports in that window.
+func TestClusterRerouteIgnoresAReportFromTheReplacedConn887(t *testing.T) {
+	cl := newRPCluster(t, 3)
+	cc := newRPClusterClient(t, cl)
+	const ch = "foo"
+	slot := int(Slot(ch))
+	from := cl.owner(slot)
+	to := cl.nodes[0]
+	ps, err := cc.SSubscribe(rpCtx(t), ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	poll(t, "SSUBSCRIBE on the owner", 5*time.Second, func() bool { return from.subscribers("ssub") == 1 })
+
+	ps.mu.Lock()
+	oldRouter := ps.conn.state.router
+	ps.mu.Unlock()
+	var held atomic.Int64
+	hook := func(p *PubSub) {
+		if p != ps || held.Add(1) > 1 {
+			return
+		}
+		// After the install: the replaced conn's late reports.
+		p.onShardUnsubscribed(oldRouter, ch)
+		p.onControlError(oldRouter, "MOVED "+strconv.Itoa(slot)+" 127.0.0.1:1")
+		p.reconnectingMu.Lock()
+		pending := p.pendingReroute
+		p.reconnectingMu.Unlock()
+		if pending {
+			t.Error("a report from the replaced conn set pendingReroute")
+		}
+	}
+	testHookReplayed.Store(&hook)
+	t.Cleanup(func() { testHookReplayed.Store(nil) })
+	cl.moveSlot(slot, to, 0)
+	poll(t, "SSUBSCRIBE on the new owner", 10*time.Second, func() bool { return to.subscribers("ssub") == 1 })
+	time.Sleep(700 * time.Millisecond)
+	if n := to.subCmds.Load(); n != 1 {
+		t.Errorf("the new owner saw %d SSUBSCRIBE commands, want 1: a late report of the old conn made another reroute", n)
 	}
 }

@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,9 +113,14 @@ type PubSub struct {
 	subs      map[string]struct{}
 	psubs     map[string]struct{}
 	shardSubs map[string]struct{}
-	msgCh     chan *Message
-	closeCh   chan struct{}
-	closed    atomic.Bool
+	// servedSlot is the slot of the shard channels a cluster PubSub serves (the
+	// slot of the first one added); hasServed says it is set. Guarded by mu; use
+	// servedSlotLocked.
+	servedSlot uint16
+	hasServed  bool
+	msgCh      chan *Message
+	closeCh    chan struct{}
+	closed     atomic.Bool
 
 	// reconnecting is set while a reconnect goroutine is active. Guards
 	// against double-fires from both onRecv-error and onClose in the same
@@ -276,8 +282,10 @@ func (ps *PubSub) bindConn(conn *redisConn) {
 	conn.setPubSubCloseHook(ps.onConnDrop)
 }
 
-// Channel returns the read-only message stream. It remains open until Close
-// is called or the reconnect loop exhausts its retries.
+// Channel returns the read-only message stream. It remains open until Close is
+// called, or until the [ClusterClient] or [SentinelClient] the PubSub follows is
+// closed while its conn is down (the reconnect loop then gives up). The reconnect
+// loop has no retry budget: it does not give up on its own.
 func (ps *PubSub) Channel() <-chan *Message {
 	return ps.msgCh
 }
@@ -340,6 +348,9 @@ func (ps *PubSub) PUnsubscribe(_ context.Context, patterns ...string) error {
 func (ps *PubSub) SSubscribe(_ context.Context, channels ...string) error {
 	return ps.control("SSUBSCRIBE", channels, func() {
 		for _, ch := range channels {
+			if len(ps.shardSubs) == 0 {
+				ps.servedSlot, ps.hasServed = Slot(ch), true
+			}
 			ps.shardSubs[ch] = struct{}{}
 		}
 	})
@@ -352,10 +363,14 @@ func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
 	return ps.control("SUNSUBSCRIBE", channels, func() {
 		if len(channels) == 0 {
 			ps.shardSubs = map[string]struct{}{}
+			ps.hasServed = false
 			return
 		}
 		for _, ch := range channels {
 			delete(ps.shardSubs, ch)
+		}
+		if len(ps.shardSubs) == 0 {
+			ps.hasServed = false
 		}
 	})
 }
@@ -525,10 +540,10 @@ func (ps *PubSub) deliver(m *Message) bool {
 // once: harmless. Comparing the dropped conn with ps.conn would avoid that
 // extra dial and cost a signature change in the hook plumbing and a second
 // lock on this path. No subscription is lost by the extra reconnect; a message
-// published in the swap window (the new conn's SUBSCRIBE is sent without
-// waiting for the server's reply, then the old, live conn is released) may be
-// lost, and one published just before the old conn is released may arrive
-// twice, as on any reconnect.
+// published in the swap window (the old conn is cut off from the PubSub before
+// the new conn is bound, and the new conn's SUBSCRIBE is sent without waiting
+// for the server's reply) may be lost. The PubSub delivers from one conn at a
+// time, so the swap does not deliver a message twice by itself.
 func (ps *PubSub) onConnDrop(_ error) { ps.trigger(false) }
 
 // trigger starts a reconnect loop unless one is running or the PubSub is
@@ -707,7 +722,15 @@ func (ps *PubSub) reconnectLoop() {
 			psubs = append(psubs, p)
 		}
 		ssubs := make([]string, 0, len(ps.shardSubs))
+		// A cluster serves one slot per SSUBSCRIBE (-CROSSSLOT otherwise), and
+		// one PubSub serves one slot: replay the channels of that slot, so a
+		// channel of another slot cannot take the rest down with it.
+		served, onlyServed := ps.servedSlotLocked()
+		onlyServed = onlyServed && ps.route != nil && ps.route.slotted()
 		for s := range ps.shardSubs {
+			if onlyServed && Slot(s) != served {
+				continue
+			}
 			ssubs = append(ssubs, s)
 		}
 		ps.mu.Unlock()
@@ -799,48 +822,109 @@ func (ps *PubSub) pickClient(moveOn bool) (*Client, error) {
 		return ps.client, nil
 	}
 	ps.mu.Lock()
+	// The route follows the slot the PubSub serves, by one of its channels.
 	shard := ""
-	for ch := range ps.shardSubs {
-		if shard == "" || ch < shard {
-			shard = ch
+	if slot, ok := ps.servedSlotLocked(); ok {
+		for ch := range ps.shardSubs {
+			if Slot(ch) == slot && (shard == "" || ch < shard) {
+				shard = ch
+			}
 		}
 	}
 	ps.mu.Unlock()
 	return ps.route.pick(ps.ctx, shard, ps.routeCur, moveOn)
 }
 
-// onShardUnsubscribed is the router's report of a "sunsubscribe" push for ch.
-// A control call updates the tracked set before it writes, so a channel that
-// is still in shardSubs was not removed by the caller: the server dropped it
-// (its slot moved to another node) and the PubSub subscribes again where the
-// slot lives now. A channel that is gone from the set is the ack of the
-// caller's own SUnsubscribe. (A SUnsubscribe(x) followed at once by a
-// SSubscribe(x) can make the ack look like the server's: one extra reroute,
-// harmless.) It runs on the event-loop worker: mu and reconnectingMu only,
-// never ctlMu.
-func (ps *PubSub) onShardUnsubscribed(ch string) {
+// servedSlotLocked returns the slot of the shard channels the PubSub serves:
+// the slot of the first one added, kept while a channel of that slot is still
+// tracked, otherwise the slot of the smallest tracked channel. ok is false when
+// there is no shard channel. The caller holds mu.
+func (ps *PubSub) servedSlotLocked() (slot uint16, ok bool) {
+	if len(ps.shardSubs) == 0 {
+		ps.hasServed = false
+		return 0, false
+	}
+	if ps.hasServed {
+		for ch := range ps.shardSubs {
+			if Slot(ch) == ps.servedSlot {
+				return ps.servedSlot, true
+			}
+		}
+	}
+	first := ""
+	for ch := range ps.shardSubs {
+		if first == "" || ch < first {
+			first = ch
+		}
+	}
+	ps.servedSlot, ps.hasServed = Slot(first), true
+	return ps.servedSlot, true
+}
+
+// onShardUnsubscribed is the router's report, from the conn whose router is
+// from, of a "sunsubscribe" push for ch. A control call updates the tracked set
+// before it writes, so a channel that is still in shardSubs was not removed by
+// the caller: the server dropped it (its slot moved to another node) and the
+// PubSub subscribes again where the slot lives now. A channel that is gone from
+// the set is the ack of the caller's own SUnsubscribe. (A SUnsubscribe(x)
+// followed at once by a SSubscribe(x) can make the ack look like the server's:
+// one extra reroute, harmless.)
+//
+// It runs on the event-loop worker: mu and reconnectingMu only, never ctlMu. A
+// report from a conn that is not ps.conn any more (one the reroute loop has
+// replaced, its report still in flight) is ignored: the replay already answers
+// it. mu is held across trigger, as the loop holds it across the install that
+// clears pendingReroute, so a report is either before the install (and cleared
+// by it) or after it (and ignored).
+func (ps *PubSub) onShardUnsubscribed(from *pubsubRouter, ch string) {
 	if ps.route == nil {
 		return
 	}
 	ps.mu.Lock()
-	_, still := ps.shardSubs[ch]
-	ps.mu.Unlock()
-	if still {
+	defer ps.mu.Unlock()
+	if ps.conn == nil || ps.conn.state.router != from {
+		return
+	}
+	if _, still := ps.shardSubs[ch]; still {
 		ps.trigger(true)
 	}
 }
 
-// onControlError is the router's report of an error reply in pubsub mode. On
-// a PubSub that follows a cluster, -MOVED (the node does not serve the slot of
-// the SSUBSCRIBE) and -CLUSTERDOWN (it is between owners) mean the subscription
-// did not take, and the PubSub looks for the owner again, with the backoff.
+// onControlError is the router's report, from the conn whose router is from, of
+// an error reply in pubsub mode. The replies of the control writes are not
+// matched to their commands, so the rule is by content, on a PubSub that serves
+// shard channels of a cluster:
+//   - -MOVED for the slot the PubSub serves: the node does not serve it (the
+//     slot moved, or the topology was stale), so the subscription did not take:
+//     look for the owner again, with the backoff. A -MOVED for another slot
+//     answers something else (Redis answers a SUNSUBSCRIBE of a channel it holds
+//     no subscription for, in a slot it does not serve, with -MOVED; a channel
+//     of a second slot added to the PubSub is not served) and is ignored.
+//   - -CLUSTERDOWN: the cluster is between owners; look again, with the backoff.
+//
 // Anything else (a -CROSSSLOT, an unknown command) is the caller's to fix:
-// retrying would loop. Same context as onShardUnsubscribed.
-func (ps *PubSub) onControlError(msg string) {
-	if ps.route == nil {
+// retrying would loop. Same context and locking as onShardUnsubscribed.
+func (ps *PubSub) onControlError(from *pubsubRouter, msg string) {
+	if ps.route == nil || !ps.route.slotted() {
 		return
 	}
-	if strings.HasPrefix(msg, "MOVED ") || strings.HasPrefix(msg, "CLUSTERDOWN") {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.conn == nil || ps.conn.state.router != from {
+		return
+	}
+	served, ok := ps.servedSlotLocked()
+	if !ok {
+		return
+	}
+	switch {
+	case strings.HasPrefix(msg, "MOVED "):
+		if f := strings.Fields(msg); len(f) >= 2 {
+			if n, err := strconv.Atoi(f[1]); err == nil && n == int(served) {
+				ps.trigger(true)
+			}
+		}
+	case strings.HasPrefix(msg, "CLUSTERDOWN"):
 		ps.trigger(true)
 	}
 }

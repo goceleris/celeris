@@ -968,8 +968,12 @@ func (c *ClusterClient) Publish(ctx context.Context, channel, message string) (i
 //
 // The PubSub follows its subscription: when the node that holds it goes away,
 // it subscribes again on another node and keeps delivering to the same
-// [PubSub.Channel]. A message published while it switches is lost (it is
-// delivered once, by the old conn or the new one, never by both). While the
+// [PubSub.Channel]. A message published while it switches is lost (a gap), and
+// the PubSub itself delivers from one conn at a time: it stops listening to the
+// old conn before the new one subscribes. The cluster, though, sends a PUBLISH
+// to every node over its bus asynchronously, so a message in flight around the
+// switch can in rare cases reach the old and the new node and be delivered
+// twice. While the
 // PubSub has no conn its control calls ([PubSub.Subscribe] and the others)
 // return [ErrPubSubConnDown]; nothing else is surfaced as long as a node can be
 // reached, and the PubSub retries with backoff, with no limit, until
@@ -1007,9 +1011,13 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 // the SSUBSCRIBE with -MOVED), it refreshes the cluster topology, subscribes
 // again on the new owner and keeps delivering to the same [PubSub.Channel],
 // with the PubSub's reconnect backoff between attempts and no limit. A message
-// published while it switches is lost (never delivered twice). See
-// [ClusterClient.Subscribe] for what the caller sees while it is down and when
-// the ClusterClient is closed.
+// published while it switches is lost (a gap); one owner serves a slot, so the
+// switch cannot deliver a message twice. Only the channels of one slot are
+// served by one PubSub: the slot of the first channel. A channel of another slot
+// added to the PubSub later is not subscribed (its node answers -MOVED, which is
+// not reported), the PubSub keeps serving the first slot, and a reroute replays
+// only the channels of that slot. See [ClusterClient.Subscribe] for what the
+// caller sees while it is down and when the ClusterClient is closed.
 func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	if len(channels) == 0 {
 		return nil, errors.New("celeris-redis: SSubscribe requires at least one channel")
