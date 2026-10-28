@@ -26,7 +26,8 @@ type Manager struct {
 	hints                   *DeadlineHints
 	ownHints                DeadlineHints
 	reqTimeout              time.Duration
-	headerTableSize         uint32 // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
+	wrTimeout               time.Duration // the write deadline (SetWriteTimeout)
+	headerTableSize         uint32        // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
 	pendingConnWindowUpdate uint32
 	pendingStreamUpdates    map[uint32]uint32
 	windowUpdateMu          sync.Mutex
@@ -44,6 +45,15 @@ type Manager struct {
 	sendWindowWaiters atomic.Int32
 	sendWindowMu      sync.Mutex
 	sendWaiters       []*sendWaiter
+
+	// The write deadline's books (write_deadline.go): a record per stream that
+	// holds buffered bytes, in stalls, guarded by stallMu; stallN is how many, for
+	// a load on the paths that have none; connReleased is the bytes of DATA the
+	// connection released while a stream was stalled (ReserveSendWindow).
+	stallMu      sync.Mutex
+	stalls       map[uint32]*stall
+	stallN       atomic.Int32
+	connReleased atomic.Int64
 
 	// retired holds the pool-handler streams whose handler has returned and
 	// which are out of the map, waiting for the event loop to return them to
@@ -377,6 +387,7 @@ func (m *Manager) takeLocked(id uint32, s *Stream) (release bool) {
 	prev := State(s.state.Swap(int32(StateClosed)))
 	m.updateActiveCount(prev, StateClosed)
 	m.dropPlaceholderLocked(s)
+	m.dropStall(id)
 	f := s.flags.Load()
 	if f&flagReqDeadline != 0 {
 		m.disarmRequestLocked(s)
@@ -428,6 +439,7 @@ func (m *Manager) RemoveStreamFromMap(id uint32) {
 	delete(m.streams, id)
 	m.priorityTree.RemoveStream(id)
 	m.mu.Unlock()
+	m.dropStall(id)
 
 	m.windowUpdateMu.Lock()
 	delete(m.pendingStreamUpdates, id)
@@ -478,6 +490,7 @@ func (m *Manager) retire(s *Stream) {
 		s.OutboundBuffer = nil
 	}
 	id := s.ID
+	m.dropStall(id)
 	// The request is dropped now, not at the loop's next batch: a detached
 	// Context that reads the stream meanwhile sees nothing, as it did when
 	// this goroutine reset the stream (celeris#904), and a connection that
@@ -601,7 +614,7 @@ func (m *Manager) CountActiveStreams() int {
 func (m *Manager) ServerOwes() bool {
 	return m.activeStreams.Load() > 0 &&
 		(m.reqTimeout > 0 || m.requestOpen.Load() == 0) &&
-		m.outboundHeld.Load() == 0 &&
+		(m.wrTimeout > 0 || m.outboundHeld.Load() == 0) &&
 		m.sendWindowWaiters.Load() == 0
 }
 
@@ -791,6 +804,7 @@ func (m *Manager) Close() {
 	// that returns from here on releases its stream itself (retire).
 	m.closed = true
 	m.placeholders = 0
+	m.dropAllStalls()
 	retired := m.retired
 	m.retired = nil
 	m.hasRetired.Store(false)
@@ -873,6 +887,7 @@ type DeadlineHints struct {
 	ReqDL  atomic.Int64
 	TombDL atomic.Int64
 	HdrDL  atomic.Int64
+	WrDL   atomic.Int64 // the earliest end of a stalled stream's write window
 }
 
 // SetHints points the manager (and the processor that owns it) at h, which the

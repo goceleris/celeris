@@ -1069,6 +1069,9 @@ func (s *Stream) bufferOutbound(data []byte, endStream bool) {
 	}
 	s.OutboundBuffer.Write(data)
 	s.OutboundEndStream = endStream
+	if m := s.manager; m != nil {
+		m.noteBuffered(s.ID, len(data))
+	}
 	s.mu.Unlock()
 }
 

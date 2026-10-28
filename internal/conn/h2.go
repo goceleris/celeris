@@ -625,6 +625,7 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	s.idleNs = int64(cfg.IdleTimeout)
 	proc.GetManager().SetHints(&s.hints)
 	proc.GetManager().SetRequestTimeout(cfg.ReadTimeout)
+	proc.GetManager().SetWriteTimeout(cfg.WriteTimeout)
 	proc.SetHeaderBlockTimeout(cfg.ReadHeaderTimeout)
 	if lg := cfg.Logger; lg != nil {
 		proc.OnHandlerPanic = func(id uint32, r any, stack []byte) {
@@ -1125,8 +1126,8 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 			res.CloseNow = true
 		}
 	}
-	dl, td, hd := h.ReqDL.Load(), h.TombDL.Load(), h.HdrDL.Load()
-	if (dl == 0 || now < dl) && (td == 0 || now < td) && (hd == 0 || now < hd) {
+	dl, td, hd, wd := h.ReqDL.Load(), h.TombDL.Load(), h.HdrDL.Load(), h.WrDL.Load()
+	if (dl == 0 || now < dl) && (td == 0 || now < td) && (hd == 0 || now < hd) && (wd == 0 || now < wd) {
 		return res
 	}
 	if !s.mu.TryLock() {
@@ -1146,6 +1147,24 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 			got := m.ExpiredRequests(now, ids[:0])
 			for _, id := range got {
 				p.ExpireRequest(id, now)
+				res.Expired++
+			}
+			if len(got) < len(ids) || time.Since(began) > expireBudget {
+				break
+			}
+		}
+	}
+	if wd != 0 && now >= wd {
+		// The write windows that have ended: the streams that released less than
+		// their floor are reset with RST_STREAM(INTERNAL_ERROR), in batches and
+		// under the same budget as the requests (a stalled client with many
+		// streams is one window's worth).
+		var ids [32]uint32
+		began := time.Now()
+		for {
+			got := m.ExpiredWrites(now, ids[:0])
+			for _, id := range got {
+				p.ExpireWrite(id)
 				res.Expired++
 			}
 			if len(got) < len(ids) || time.Since(began) > expireBudget {
