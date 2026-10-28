@@ -31,11 +31,17 @@ func fallThroughRow(i int) []byte {
 }
 
 // partialSync delivers first, then reports the poll over although the reply is
-// not (data came, then EAGAIN).
-type partialSync struct{ first []byte }
+// not (data came, then EAGAIN). polled is closed once first has been delivered:
+// the reader is single-threaded, and the rest of the reply may only be fed after
+// the poll's own onRecv has returned.
+type partialSync struct {
+	first  []byte
+	polled chan struct{}
+}
 
 func (s partialSync) WriteAndPoll(_ int, _ []byte, _ []byte, onRecv func([]byte)) (bool, error) {
 	onRecv(s.first)
+	close(s.polled)
 	return true, nil
 }
 
@@ -64,11 +70,22 @@ func TestSyncFallThroughAfterTheCapKeepsOrderAndTheError1104(t *testing.T) {
 				rest = append(rest, fallThroughRow(i)...)
 			}
 			rest = append(rest, pgCompleteAndReady()...)
-			c := newSyncFaultConn(partialSync{first: first})
+			polled := make(chan struct{})
+			c := newSyncFaultConn(partialSync{first: first, polled: polled})
 			go func() {
 				// The event loop dispatches the rest once the caller has fallen
-				// through: its request has left the sync mode (and the poll's
-				// onRecv has returned, the reader is single-threaded).
+				// through. First the poll must have delivered its part: a request
+				// is queued with syncMode still false, before the query sets it, so
+				// the flag alone cannot say the caller fell through, and feeding
+				// then raced the poll's onRecv on the reader (and showed the
+				// extended-query parser a DataRow before its ParseComplete:
+				// "unexpected DataRow in extended query"; celeris#1104).
+				select {
+				case <-polled:
+				case <-time.After(20 * time.Second):
+					return
+				}
+				// Then the caller has left the sync mode.
 				for dl := time.Now().Add(20 * time.Second); time.Now().Before(dl); time.Sleep(time.Millisecond) {
 					c.pendingMu.Lock()
 					fell := len(c.pending) > 0 && c.pending[0] != nil && !c.pending[0].syncMode.Load()
