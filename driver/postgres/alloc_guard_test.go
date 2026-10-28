@@ -81,6 +81,17 @@ func TestAllocBudgets(t *testing.T) {
 	}
 }
 
+// fakePGWriteGap is how long the fake backend of benchQuery1col1row waits
+// between the writes of one reply (zero: none). A test sets it to model a reply
+// that reaches the client in pieces.
+var fakePGWriteGap atomic.Int64
+
+func fakePGPause() {
+	if g := fakePGWriteGap.Load(); g > 0 {
+		time.Sleep(time.Duration(g))
+	}
+}
+
 // query1col1rowSyncPath is whether the conn benchQuery1col1row ran on took the
 // sync fast path (it has a syncLoop), which decides the allocs per query.
 var query1col1rowSyncPath atomic.Bool
@@ -104,8 +115,11 @@ func benchQuery1col1row(b *testing.B) {
 				}
 				rd := buildRowDescription([]colSpec{{name: "n", typeOID: protocol.OIDInt4, typeSize: 4, format: protocol.FormatText}})
 				_ = writeMsg(c, protocol.BackendRowDescription, rd)
+				fakePGPause()
 				_ = writeMsg(c, protocol.BackendDataRow, buildDataRow([][]byte{[]byte("7")}))
+				fakePGPause()
 				_ = writeCommandComplete(c, "SELECT 1")
+				fakePGPause()
 				_ = writeReadyForQuery(c, 'I')
 			}
 		})
