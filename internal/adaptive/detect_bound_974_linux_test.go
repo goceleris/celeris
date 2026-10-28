@@ -161,7 +161,7 @@ func startOnIOUring974(t *testing.T, readHeaderTimeout time.Duration) string {
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-done:
+		case <-ended: // closed after done is sent on, whoever has drained it
 		case <-time.After(10 * time.Second):
 			t.Error("adaptive engine did not stop within 10s")
 		}
