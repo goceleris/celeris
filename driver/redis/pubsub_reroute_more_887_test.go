@@ -177,6 +177,13 @@ func TestSentinelPubSubFollowsAFailover887(t *testing.T) {
 	rc := collect(ps)
 	poll(t, "the subscription on the master", 5*time.Second, func() bool { return m1.subscribers("sub") == 1 })
 
+	// The SentinelClient subscribes to +switch-master in the background: a
+	// switch pushed before that subscription exists is never heard.
+	poll(t, "the SentinelClient subscribed to +switch-master", 5*time.Second, func() bool {
+		sentinel.mu.Lock()
+		defer sentinel.mu.Unlock()
+		return len(sentinel.subWriters) > 0
+	})
 	m1.kill()
 	sentinel.SetMaster(m2.addr)
 	poll(t, "the subscription on the new master", 15*time.Second, func() bool { return m2.subscribers("sub") == 1 })
