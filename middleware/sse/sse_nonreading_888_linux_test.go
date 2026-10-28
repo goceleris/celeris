@@ -115,7 +115,11 @@ type producer888 struct {
 	noHeaderTimer bool
 
 	// dropEarly makes a full queue drop the event, not close the stream, for
-	// the first WriteTimeout of the handler's run. The fast phase sends 2000
+	// the first WriteTimeout of the handler's run. Every producer sets it: the
+	// test's lower bound (the stream does not end before WriteTimeout) is for
+	// the stall bound, and a close by a full queue is a different one (CI saw
+	// the trickle of "steady" cut at 0.82 s, and so did a run of this test with
+	// two processes on one CPU: celeris#1104). The fast phase sends 2000
 	// events a second; a drain goroutine that falls 4 events behind (the loop
 	// holds the connection's write lock for a partial send, or the runner is
 	// starved under -race and coverage) is a full queue, and
@@ -301,15 +305,15 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 	}{
 		// The burst fills the socket and queues the rest in the engine; then
 		// a trickle of 1 KB every 5 ms.
-		{"steady", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond}},
+		{"steady", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond, dropEarly: true}},
 		// The same, with 50 events sent back to back where the trickle starts: a
 		// full queue before WriteTimeout (a drain goroutine that was not
 		// scheduled for a few ms does that to the 5 ms trickle too: celeris#1104)
 		// must not end the stream.
-		{"steady-flood", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond, flood: 50}},
+		{"steady-flood", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond, flood: 50, dropEarly: true}},
 		// The same, then one event every 300 ms: a sweep must still reach the
 		// conn when almost nothing wakes the worker.
-		{"sparse", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 300 * time.Millisecond}},
+		{"sparse", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 300 * time.Millisecond, dropEarly: true}},
 		// No burst: 4 KB events every 0.5 ms for 1.2 s fill the socket with
 		// small sends (an io_uring SEND of under 64 KiB is not one the worker
 		// is told to expect to wait for), then one event every 300 ms.
