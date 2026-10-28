@@ -31,14 +31,12 @@
 // containment check, the one [celeris.Context.FileFromDir] applies to a file it
 // sends (symlinks resolved), has passed for its path, and that check runs for
 // every conditional request, whether or not its validator matches. The two
-// checks agree for a Root that names a directory. A Root of ".", "./" or "/"
-// is not served from: a request for anything below it is passed to the next
-// handler (the guard against ".." compares the path with the root and a
-// separator, which no path below these roots starts with). For "." and "./"
-// the request for the root directory itself, answered by its index file, gets
-// a 400 from FileFromDir, which requires the "./" prefix a Root of "." lacks,
-// and a 304 when a validator matches; the file is inside the root either way.
-// Name the directory.
+// checks agree, for a Root of ".", "./" and "/" as for any other directory:
+// these three serve the tree below them (before v1.6.0 they served nothing below
+// the root, and the root's own index answered 400 or 304 depending on whether a
+// validator matched). Their meaning is wide: "." is the working directory and
+// "/" the whole filesystem, and dotfiles are served under every Root. Name the
+// directory that holds what is public; see [Config].Root.
 //
 // With compress in front of an [Config].FS, the strong tag of a file that compress
 // encodes is made weak on the 200 (W/"hash"), and static marks the response so

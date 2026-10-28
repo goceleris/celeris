@@ -176,7 +176,7 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 
 	// Prevent directory traversal: filepath.Join resolves ".." segments,
 	// so verify the result stays within the root directory.
-	if fullPath != cleanRoot && !strings.HasPrefix(fullPath, cleanRoot+string(filepath.Separator)) {
+	if !ctxkit.PathWithin(cleanRoot, fullPath) {
 		return c.Next()
 	}
 
@@ -213,7 +213,7 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 			if err != nil {
 				return c.Next()
 			}
-			if resolved != resolvedRoot && !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
+			if !ctxkit.ResolvedWithin(resolvedRoot, resolved) {
 				return c.Next()
 			}
 			return serveDirListingOS(c, resolved)
@@ -314,13 +314,7 @@ func resolvesInside(cleanRoot, filePath string) bool {
 		resolvesInsideHook()
 	}
 	full := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
-	if cleanRoot == "." {
-		// Join drops a leading ".", so a path that leaves the working
-		// directory starts with "..".
-		if full == ".." || strings.HasPrefix(full, ".."+string(filepath.Separator)) {
-			return false
-		}
-	} else if !pathUnder(cleanRoot, full) {
+	if !ctxkit.PathWithin(cleanRoot, full) {
 		return false
 	}
 	start := len(cleanRoot)
@@ -355,25 +349,13 @@ func resolvesInside(cleanRoot, filePath string) bool {
 	if err != nil {
 		return false
 	}
-	return resolved == resolvedRoot || strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator))
+	return ctxkit.ResolvedWithin(resolvedRoot, resolved)
 }
 
 // resolvesInsideHook is a test seam (celeris#888 item 35): when set it runs at
 // the top of resolvesInside, so a test can count the containment checks a
 // conditional request pays.
 var resolvesInsideHook func()
-
-// pathUnder reports whether p is root or a path below it, both cleaned, without
-// building root + separator.
-func pathUnder(root, p string) bool {
-	if p == root {
-		return true
-	}
-	if !strings.HasPrefix(p, root) {
-		return false
-	}
-	return root[len(root)-1] == filepath.Separator || p[len(root)] == filepath.Separator
-}
 
 // acceptsCoding reports whether the request's Accept-Encoding accepts the
 // content coding enc (q-values read, q=0 refuses), and names Accept-Encoding

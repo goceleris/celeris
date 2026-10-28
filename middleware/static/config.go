@@ -18,6 +18,22 @@ type Config struct {
 	// Root is the directory path on the OS filesystem from which to serve
 	// files. Mutually exclusive with FS. If neither Root nor FS is set,
 	// the middleware panics.
+	//
+	// Everything below Root is served, dotfiles and dot directories included
+	// (.env, .git/config): the package has no rule against them. A path that
+	// leaves Root, by "..", an absolute path, or a symlink that resolves outside
+	// it, is refused. A relative Root is read against the working directory at
+	// each request.
+	//
+	// Root may be ".", "./" or "/", and serves the tree below it as any other
+	// directory does. Mind what that is: "." is the process's working
+	// directory, with its sources and configuration, and "/" is the whole
+	// filesystem (/etc/passwd, the home directories, /proc/self/environ, the
+	// process's environment: whatever the process may read), where nothing is
+	// outside Root any more, so the containment check that protects the others
+	// protects nothing. Before v1.6.0 these three served nothing below the
+	// root, so an upgrade starts to serve what the config always named: name a
+	// directory that holds only what is meant to be public.
 	Root string
 
 	// FS is an [fs.FS] from which to serve files (e.g. embed.FS).

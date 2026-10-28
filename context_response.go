@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/httprange"
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
@@ -1069,7 +1070,11 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // FileFromDir safely serves a file from within baseDir. The userPath is
 // cleaned and joined with baseDir; if the result escapes baseDir, a 400
 // error is returned. Symlinks are resolved and rechecked to prevent a
-// symlink under baseDir from escaping the directory boundary.
+// symlink under baseDir from escaping the directory boundary. A baseDir of
+// "." or "./" is the working directory and one of "/" the filesystem's root
+// (before v1.6.0 these two refused every file with a 400): with "/" nothing is
+// outside baseDir, so only the file's own existence limits what userPath may
+// name.
 func (c *Context) FileFromDir(baseDir, userPath string) error {
 	return c.fileFromDir(baseDir, userPath, "", nil)
 }
@@ -1078,7 +1083,7 @@ func (c *Context) FileFromDir(baseDir, userPath string) error {
 func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
-	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {
+	if !ctxkit.PathWithin(base, abs) {
 		return NewHTTPError(400, "invalid file path")
 	}
 	// Resolve symlinks and recheck prefix to prevent symlink escape.
@@ -1090,7 +1095,7 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 	if err != nil {
 		return err
 	}
-	if resolved != resolvedBase && !strings.HasPrefix(resolved, resolvedBase+string(filepath.Separator)) {
+	if !ctxkit.ResolvedWithin(resolvedBase, resolved) {
 		return NewHTTPError(400, "invalid file path")
 	}
 	info, err := os.Stat(resolved)
