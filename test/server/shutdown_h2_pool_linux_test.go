@@ -1291,17 +1291,31 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			begin := time.Now()
 			srv.beginShutdown("Shutdown", 20*time.Second)
 
+			// Every conn is read at the same time, so that each one's wait for
+			// its FIN is its own: read one after the other, the first conn that
+			// timed out left the others a deadline already past, and Go's read
+			// of a conn whose deadline has passed fails before it looks at the
+			// socket, FIN or not: one late conn was reported as five.
+			type finResult struct {
+				name string
+				err  error
+				at   time.Duration
+			}
+			var finWG sync.WaitGroup
+			finRes := make(chan finResult, len(idle)+len(silent))
 			expectFIN := func(name string, c net.Conn, br *bufio.Reader) {
-				_ = c.SetReadDeadline(begin.Add(1500 * time.Millisecond))
-				var err error
-				if br != nil {
-					_, err = br.ReadByte()
-				} else {
-					_, err = c.Read(make([]byte, 1))
-				}
-				if err != io.EOF {
-					t.Errorf("%s: read %v at %v, want a FIN (io.EOF) once the gate has passed (celeris#885 item 49)", name, err, time.Since(begin).Round(time.Millisecond))
-				}
+				finWG.Add(1)
+				go func() {
+					defer finWG.Done()
+					_ = c.SetReadDeadline(begin.Add(1500 * time.Millisecond))
+					var err error
+					if br != nil {
+						_, err = br.ReadByte()
+					} else {
+						_, err = c.Read(make([]byte, 1))
+					}
+					finRes <- finResult{name, err, time.Since(begin)}
+				}()
 			}
 			for i, c := range idle {
 				expectFIN("idle keep-alive "+strconv.Itoa(i), c, idleBr[i])
@@ -1309,6 +1323,17 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			for i, c := range silent {
 				expectFIN("connection with no byte sent "+strconv.Itoa(i), c, nil)
 			}
+			finWG.Wait()
+			close(finRes)
+			var latest time.Duration
+			for r := range finRes {
+				if r.err != io.EOF {
+					t.Errorf("%s: read %v at %v, want a FIN (io.EOF) once the gate has passed (celeris#885 item 49)", r.name, r.err, r.at.Round(time.Millisecond))
+				} else if r.at > latest {
+					latest = r.at
+				}
+			}
+			t.Logf("the last of the %d idle and silent conns had its FIN %v into the shutdown", len(idle)+len(silent), latest.Round(time.Millisecond))
 			if promoted != nil {
 				_ = promoted.SetReadDeadline(begin.Add(2 * time.Second))
 				if _, err := promotedBr.ReadByte(); err == nil {
