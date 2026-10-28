@@ -3,6 +3,7 @@ package stream
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Manager manages multiple HTTP/2 streams.
@@ -22,6 +23,9 @@ type Manager struct {
 	initialWindowSize       uint32
 	activeStreams           atomic.Uint32
 	requestOpen             atomic.Uint32
+	hints                   *DeadlineHints
+	ownHints                DeadlineHints
+	reqTimeout              time.Duration
 	headerTableSize         uint32 // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
 	pendingConnWindowUpdate uint32
 	pendingStreamUpdates    map[uint32]uint32
@@ -71,7 +75,7 @@ type Manager struct {
 // single default-priority stream (e.g. an h2c upgrade that closes right
 // after the response) they stay nil and save three map allocations.
 func NewManager() *Manager {
-	return &Manager{
+	m := &Manager{
 		streams:           make(map[uint32]*Stream),
 		nextStreamID:      1,
 		connectionWindow:  65535,
@@ -84,6 +88,8 @@ func NewManager() *Manager {
 		initialWindowSize: 65535,
 		headerTableSize:   4096, // RFC 7540 §6.5.2 default
 	}
+	m.hints = &m.ownHints
+	return m
 }
 
 // SetLocalMaxFrameSize records the SETTINGS_MAX_FRAME_SIZE we advertised to
@@ -371,7 +377,11 @@ func (m *Manager) takeLocked(id uint32, s *Stream) (release bool) {
 	prev := State(s.state.Swap(int32(StateClosed)))
 	m.updateActiveCount(prev, StateClosed)
 	m.dropPlaceholderLocked(s)
-	return s.flags.Load()&flagAsyncRunning == 0
+	f := s.flags.Load()
+	if f&flagReqDeadline != 0 {
+		m.disarmRequestLocked(s)
+	}
+	return f&flagAsyncRunning == 0
 }
 
 // afterTake finishes what takeLocked began, after m.mu is released: it drops
@@ -579,14 +589,18 @@ func (m *Manager) CountActiveStreams() int {
 //
 // requestOpen counts the streams whose request is not whole (Open and
 // HalfClosedLocal), activeStreams all that are open; both move together in
-// updateActiveCount, the one place a stream's state change reaches them.
+// updateActiveCount, the one place a stream's state change reaches them. With
+// a request deadline (SetRequestTimeout) the streams whose request is not whole
+// are bounded one by one (ArmRequest, ExpiredRequests), and requestOpen is not
+// consulted: while it was, a quiet client got the WHOLE connection closed, the
+// streams the server was answering included, where the deadline resets one.
 // outboundHeld is the bytes the streams hold buffered for the peer's window
 // (charged and refunded where the buffer fills, drains, and is dropped with its
 // stream), sendWindowWaiters the pool handlers waiting for a window in
 // AwaitSendWindow. Atomic loads, no scan; safe from any goroutine.
 func (m *Manager) ServerOwes() bool {
 	return m.activeStreams.Load() > 0 &&
-		m.requestOpen.Load() == 0 &&
+		(m.reqTimeout > 0 || m.requestOpen.Load() == 0) &&
 		m.outboundHeld.Load() == 0 &&
 		m.sendWindowWaiters.Load() == 0
 }
@@ -790,4 +804,113 @@ func (m *Manager) Close() {
 		clear(m.pendingStreamUpdates)
 	}
 	m.windowUpdateMu.Unlock()
+}
+
+// SetRequestTimeout sets the request deadline (the server's ReadTimeout): a
+// stream whose request is not whole that long after its HEADERS is expired by
+// ExpiredRequests. 0 turns it off. Set once, before the first frame.
+func (m *Manager) SetRequestTimeout(d time.Duration) { m.reqTimeout = d }
+
+// RequestTimeout is the deadline SetRequestTimeout set.
+func (m *Manager) RequestTimeout() time.Duration { return m.reqTimeout }
+
+// ArmRequest starts the request deadline of s, a stream just opened by a HEADERS
+// frame without END_STREAM, at now (nanoseconds, wall clock). Absolute: it is
+// not moved by the stream's DATA or by anything else. The instant is kept in
+// s.StartTimeNs, unused on HTTP/2 (the engines' cache of a recv's clock, which
+// only HTTP/1 fills), and the flag marks that it is there; the manager keeps
+// the earliest deadline as a hint the engines' sweep reads with one atomic load
+// (the armed streams are found by walking the map when it is due). No allocation, no lock: it runs on the loop thread
+// under H2State.mu, and the request has no handler yet (the handler runs once the
+// request is whole). A request whole at its HEADERS never gets here.
+func (m *Manager) ArmRequest(s *Stream, now int64) {
+	if m.reqTimeout <= 0 {
+		return
+	}
+	s.StartTimeNs = now
+	s.flags.Or(flagReqDeadline)
+	dl := now + int64(m.reqTimeout)
+	for {
+		cur := m.hints.ReqDL.Load()
+		if cur != 0 && cur <= dl {
+			return
+		}
+		if m.hints.ReqDL.CompareAndSwap(cur, dl) {
+			return
+		}
+	}
+}
+
+// DisarmRequest ends the request deadline of s because its request is whole (its
+// END_STREAM, on DATA or on trailers). StartTimeNs goes back to 0, which the
+// handler's latency reads as "unset" (handler.go): an h2 request's latency does
+// not include its upload. A stream that never armed pays one load of its flags.
+// The hint is left as it was (a stale hint costs one scan, once).
+func (m *Manager) DisarmRequest(s *Stream) {
+	if s.flags.Load()&flagReqDeadline == 0 {
+		return
+	}
+	s.StartTimeNs = 0
+	s.flags.And(^flagReqDeadline)
+}
+
+// disarmRequestLocked is DisarmRequest for a stream leaving the map (takeLocked,
+// handleGoAway), with m.mu held.
+func (m *Manager) disarmRequestLocked(s *Stream) { m.DisarmRequest(s) }
+
+// NextRequestDeadline is the earliest deadline of an armed request, or 0 if none
+// is armed (or the hint is stale after a disarm: ExpiredRequests settles it).
+// One atomic load; the engines' sweep reads it for every h2 conn.
+func (m *Manager) NextRequestDeadline() int64 { return m.hints.ReqDL.Load() }
+
+// DeadlineHints are the words the engines' sweep reads for an h2 connection:
+// the earliest request deadline, the earliest end of an expired request's memory,
+// the deadline of the pending header block. One struct, so that the sweep's look
+// at a connection that has nothing due is one cache line (the conn layer embeds
+// it in H2State, beside the sweep's own state, and points the manager at it:
+// SetHints); a manager built alone (tests) uses its own. 0 means none.
+type DeadlineHints struct {
+	ReqDL  atomic.Int64
+	TombDL atomic.Int64
+	HdrDL  atomic.Int64
+}
+
+// SetHints points the manager (and the processor that owns it) at h, which the
+// conn layer keeps beside the sweep's state. Before the first frame.
+func (m *Manager) SetHints(h *DeadlineHints) { m.hints = h }
+
+// ExpiredRequests appends to out, up to its capacity, the IDs of the streams
+// whose request deadline has passed at now, and settles the hint to the earliest
+// deadline of those that have not. Called by the loop thread under H2State.mu
+// when NextRequestDeadline says one is due; it walks the stream map under m.mu
+// (at most MAX_CONCURRENT_STREAMS entries), which happens once per deadline, not
+// once per sweep. If out is full the hint is left due, so the next sweep takes
+// the rest.
+func (m *Manager) ExpiredRequests(now int64, out []uint32) []uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var next int64
+	full := false
+	for id, s := range m.streams {
+		if s.flags.Load()&flagReqDeadline == 0 {
+			continue
+		}
+		dl := s.StartTimeNs + int64(m.reqTimeout)
+		if dl > now {
+			if next == 0 || dl < next {
+				next = dl
+			}
+			continue
+		}
+		if len(out) == cap(out) {
+			full = true
+			continue
+		}
+		out = append(out, id)
+	}
+	if full {
+		next = now // due again at the next sweep
+	}
+	m.hints.ReqDL.Store(next)
+	return out
 }

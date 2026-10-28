@@ -10,6 +10,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -93,16 +94,30 @@ type h2raw889 struct {
 	addr string
 	t0   time.Time  // when the last frame the client sent went out
 	wmu  sync.Mutex // the framer is not safe for concurrent writes (the ping goroutine, the ack)
+
+	gaSeen bool          // closedAfter889 saw a GOAWAY before the conn ended
+	gaCode http2.ErrCode // its error code
 }
 
 type h2dial889 struct {
+	rcvBuf        int    // SO_RCVBUF, set before connect; 0 = the default
 	initialWindow uint32 // SETTINGS_INITIAL_WINDOW_SIZE, 0 = leave the default
 	prefaceOnly   bool   // the 24 bytes of the preface and no SETTINGS
 }
 
 func dialH2raw889(t *testing.T, addr string, o h2dial889) *h2raw889 {
 	t.Helper()
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	d := net.Dialer{Timeout: 2 * time.Second}
+	if o.rcvBuf > 0 { // before connect: the window the handshake offers is this small
+		d.Control = func(_, _ string, rc syscall.RawConn) error {
+			var e error
+			if err := rc.Control(func(fd uintptr) { e = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, o.rcvBuf) }); err != nil {
+				return err
+			}
+			return e
+		}
+	}
+	conn, err := d.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +169,10 @@ func (c *h2raw889) block(method, path string) []byte {
 func (c *h2raw889) request(id uint32, method, path string, endStream, endHeaders bool) {
 	c.t.Helper()
 	blk := c.block(method, path)
-	if err := c.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk, EndStream: endStream, EndHeaders: endHeaders}); err != nil {
+	c.wmu.Lock() // a pinger or a trickle may be writing on the framer
+	err := c.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk, EndStream: endStream, EndHeaders: endHeaders})
+	c.wmu.Unlock()
+	if err != nil {
 		c.t.Fatal(err)
 	}
 	c.t0 = time.Now()

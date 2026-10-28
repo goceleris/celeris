@@ -266,6 +266,16 @@ type Processor struct {
 	// its HEADERS or its DATA is not in it, or leaves it when it ends
 	// (clearResetOpen): a further HEADERS on it is a connection error.
 	resetOpen serverResets
+	// expiredReq remembers the requests whose deadline expired (ExpireRequest) and
+	// whose client has not ended them: id to the instant the entry runs out.
+	// Allocated on the first expiry; the earliest of those instants is
+	// manager.hints.TombDL.
+	expiredReq map[uint32]int64
+	// ignoredAct is set when a frame of a reset or expired stream was ignored.
+	ignoredAct atomic.Bool
+	// hdrTimeout is the header-block deadline (SetHeaderBlockTimeout); the pending
+	// block's instant is manager.hints.HdrDL.
+	hdrTimeout time.Duration
 
 	// OnHandlerGoexit, when set, is told that a stream's handler ended its
 	// goroutine with runtime.Goexit (celeris#889): the stream's id and the
@@ -1677,7 +1687,7 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 	if !exists {
 		last := m.lastClientStream.Load()
 
-		if id <= last && p.resetOpen.has(id) {
+		if id <= last && (p.resetOpen.has(id) || p.requestExpired(id)) {
 			// A request this server reset (as malformed, for its header list,
 			// for MAX_CONCURRENT_STREAMS or for its body) before its client
 			// side ended: its trailers, in flight, are ignored, once. After the
@@ -1687,7 +1697,11 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 			// over for the peer when they arrive. A block without END_STREAM is
 			// the peer breaking that rule, and every further one would cost a
 			// decode: the connection ends, before the block is read.
+			if p.requestExpired(id) {
+				p.ignoredFrame() // the uploader of an expired request: see ignoredFrame
+			}
 			p.clearResetOpen(id)
+			p.forgetExpired(id)
 			if !endStream {
 				return nil, admitRefused, p.GoAwayErr(m.GetLastStreamID(), http2.ErrCodeProtocol, []byte("trailers without END_STREAM"),
 					fmt.Errorf("HEADERS frame without END_STREAM after the request on stream %d, which the server reset", id))
@@ -1731,6 +1745,12 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 	}
 	if stream.ResponseWriter == nil {
 		stream.ResponseWriter = p.connWriter
+	}
+	if !endStream && m.reqTimeout > 0 {
+		// A request that is not whole at its HEADERS has a deadline (celeris#889):
+		// ReadTimeout from now, absolute. A request without a body (every GET)
+		// pays the one test of endStream that is made anyway.
+		m.ArmRequest(stream, time.Now().UnixNano())
 	}
 	return stream, admitNew, nil
 }
@@ -1839,6 +1859,7 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 		stream.AddHeadersBatch(headers)
 		if endStream {
 			stream.EndStream = true
+			p.manager.DisarmRequest(stream)
 			stream.SetState(StateHalfClosedRemote)
 			p.runHandler(stream)
 		}
@@ -1900,6 +1921,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		p.continuationState = cs
 		p.continuationActive.Store(true)
 		p.continuationStateMu.Unlock()
+		p.armHeaderBlock()
 		return nil
 	}
 
@@ -1942,9 +1964,12 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 		// (above the last client stream, even, stream 0) is still a connection
 		// error: h2spec 5.1 and 6.1 pin that. The last client stream check is
 		// defensive: a reset of an identifier above it ends the connection.
-		if f.StreamID <= p.manager.GetLastClientStreamID() && p.resetIDs.has(f.StreamID) {
+		if f.StreamID <= p.manager.GetLastClientStreamID() && (p.resetIDs.has(f.StreamID) || p.requestExpired(f.StreamID)) {
 			if err := p.countEmptyData(f); err != nil {
 				return err
+			}
+			if p.requestExpired(f.StreamID) {
+				p.ignoredFrame() // the uploader of an expired request: see ignoredFrame
 			}
 			if f.Header().Length > 0 { // nothing to credit for a frame of length 0: no lock, no map range
 				p.manager.AccumulateWindowUpdate(0, f.Header().Length)
@@ -1952,6 +1977,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 			}
 			if f.StreamEnded() {
 				p.clearResetOpen(f.StreamID) // the peer's side has ended: no trailers can follow
+				p.forgetExpired(f.StreamID)
 			}
 			return nil
 		}
@@ -1998,6 +2024,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	if f.StreamEnded() {
 		p.manager.FlushWindowUpdates(p.writer, true)
 		stream.EndStream = true
+		p.manager.DisarmRequest(stream)
 		stream.SetState(StateHalfClosedRemote)
 
 		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
@@ -2264,6 +2291,10 @@ func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 		return nil
 	}
 	if f.StreamID <= p.manager.GetLastClientStreamID() {
+		// A client that gives up on a stream the server reset (an expired
+		// request) ends it: nothing more is to come on it.
+		p.forgetExpired(f.StreamID)
+		p.clearResetOpen(f.StreamID)
 		return nil
 	}
 	return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
@@ -2332,6 +2363,7 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 			// for a stream the goroutine had just closed (celeris#889).
 			prev := State(stream.state.Swap(int32(StateClosed)))
 			p.manager.updateActiveCount(prev, StateClosed)
+			p.manager.disarmRequestLocked(stream)
 			stream.Cancel()
 			if stream.flags.Load()&flagAsyncRunning == 0 {
 				stream.Release()
@@ -2412,6 +2444,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	if len(p.continuationState.headerBlock)+len(f.HeaderBlockFragment()) > p.headerListMax*headerBlockExpansion {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
+		p.disarmHeaderBlock()
 		return nil, p.headerBlockTooLarge(f.StreamID)
 	}
 
@@ -2420,6 +2453,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	if p.continuationState.continuations++; p.continuationState.continuations > maxContinuationFrames {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
+		p.disarmHeaderBlock()
 		return nil, p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("too many CONTINUATION frames"),
 			fmt.Errorf("header block on stream %d has more than %d CONTINUATION frames", f.StreamID, maxContinuationFrames))
 	}
@@ -2435,6 +2469,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	cs := p.continuationState
 	p.continuationState = nil
 	p.continuationActive.Store(false)
+	p.disarmHeaderBlock()
 	return cs, nil
 }
 

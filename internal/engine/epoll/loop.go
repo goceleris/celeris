@@ -31,6 +31,7 @@ import (
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 	"github.com/goceleris/celeris/internal/sockopts"
+	"github.com/goceleris/celeris/internal/tcpack"
 	"github.com/goceleris/celeris/internal/wakefd"
 )
 
@@ -424,6 +425,9 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			MaxFrameSize:         cfg.MaxFrameSize,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 			WriteTimeout:         cfg.WriteTimeout,
+			ReadTimeout:          cfg.ReadTimeout,
+			ReadHeaderTimeout:    cfg.ReadHeaderTimeout,
+			IdleTimeout:          cfg.IdleTimeout,
 			Logger:               cfg.Logger,
 		},
 		async: cfg.AsyncHandlers,
@@ -2161,32 +2165,40 @@ func (l *Loop) drainH2Writes() {
 				l.closeWhenFlushed(cs)
 				continue
 			}
-			if cs.writePos < len(cs.writeBuf) {
-				queued := 0
-				if cs.writeSince != 0 {
-					queued = csPendingBytes(cs) // before this flush (celeris#885)
-				}
-				if fErr := l.flushWrites(cs, true); fErr != nil {
-					l.removeDirty(cs)
-					l.closeConn(fd)
-					continue
-				} else if cs.writePos < len(cs.writeBuf) {
-					// Send buffer full: arm EPOLLOUT instead of the dirty
-					// list so we don't busy-poll the backpressured H2 conn.
-					cs.noteWriteProgress(queued, csPendingBytes(cs))
-					l.armEpollOut(cs)
-				} else {
-					cs.endWrite()
-				}
-			}
-			// Resync pendingBytes, as every other flush point does: the
-			// write hook added every frame drained above to it, and left
-			// alone it outgrew what is really queued until the hook
-			// refused frames of a conn that had nothing queued
-			// (celeris#761).
-			cs.pendingBytes = csPendingBytes(cs)
+			l.flushH2Conn(cs)
 		}
 	}
+}
+
+// flushH2Conn sends what the drain of cs's H2 write queue (or the deadline sweep)
+// put in its write buffer: inline, and if the kernel does not take it all, an
+// EPOLLOUT arm instead of the dirty list so that a backpressured H2 conn is not
+// busy-polled. A write error closes the conn. Loop thread.
+func (l *Loop) flushH2Conn(cs *connState) {
+	if cs.writePos < len(cs.writeBuf) {
+		queued := 0
+		if cs.writeSince != 0 {
+			queued = csPendingBytes(cs) // before this flush (celeris#885)
+		}
+		if fErr := l.flushWrites(cs, true); fErr != nil {
+			l.removeDirty(cs)
+			l.closeConn(cs.fd)
+			return
+		} else if cs.writePos < len(cs.writeBuf) {
+			// Send buffer full: arm EPOLLOUT instead of the dirty
+			// list so we don't busy-poll the backpressured H2 conn.
+			cs.noteWriteProgress(queued, csPendingBytes(cs))
+			l.armEpollOut(cs)
+		} else {
+			cs.endWrite()
+		}
+	}
+	// Resync pendingBytes, as every other flush point does: the
+	// write hook added every frame drained above to it, and left
+	// alone it outgrew what is really queued until the hook
+	// refused frames of a conn that had nothing queued
+	// (celeris#761).
+	cs.pendingBytes = csPendingBytes(cs)
 }
 
 // testHookCloseWhenFlushed, when set, runs at the start of every
@@ -4623,6 +4635,13 @@ func (l *Loop) checkTimeouts() {
 	if h := testHookCheckTimeouts.Load(); h != nil {
 		(*h)(l)
 	}
+	// The deadlines of the HTTP/2 streams and of the h2 conns' idle clock come
+	// first, before the scan of the conns' own clocks below: a request that has
+	// expired is answered 408 and reset, ONE stream, and the scan then finds the
+	// conn as that leaves it (celeris#889).
+	if len(l.h2Conns) != 0 {
+		l.sweepH2Deadlines(now)
+	}
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
 		cs := l.liveConns[i]
 		if cs.hijacked.Load() {
@@ -4792,6 +4811,75 @@ func (l *Loop) checkTimeouts() {
 				continue
 			}
 			l.closeConn(fd)
+		}
+	}
+}
+
+// holdsOutput reports whether the conn still has bytes to get to its peer: in
+// its write buffers (csWritePending, the dirty list, EPOLLOUT armed), or in the
+// kernel's send queue (TIOCOUTQ: unsent and unacknowledged bytes; the notion the
+// pool-wait gate uses before it closes a conn). An ioctl that fails counts as
+// "yes": a conn that cannot be asked is not closed for output the idle clock
+// cannot see, and the progress it makes is judged by the acknowledged bytes
+// (H2State.ExtendIdle), which has its own answer for a conn that cannot be asked
+// (it is extended, bounded by the conn's own clock). Loop thread.
+func (cs *connState) holdsOutput() bool {
+	if csWritePending(cs) || cs.dirty || cs.epollOut || cs.writeSince != 0 {
+		return true
+	}
+	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ)
+	return err != nil || q != 0
+}
+
+// sweepH2Deadlines runs the per-stream deadlines of the HTTP/2 conns
+// (H2State.Sweep): for each conn on h2Conns, a few atomic loads when nothing is
+// due. By index, from the end: a close swap-removes the conn from h2Conns.
+// h2Conns holds a conn only once its h2State is installed and the h1-to-h2c
+// switch is complete, so h2State is read without detachMu, as drainH2Writes
+// reads it. Loop thread.
+func (l *Loop) sweepH2Deadlines(now int64) {
+	for i := len(l.h2Conns) - 1; i >= 0; i-- {
+		cs := l.conns[l.h2Conns[i]]
+		if cs == nil || cs.h2State == nil || cs.closeSince != 0 || cs.hijacked.Load() {
+			continue
+		}
+		res := cs.h2State.Sweep(now, cs.writeFn)
+		if res.Expired > 0 {
+			// The streams it reset are the ones the conn's idle period was
+			// kept for: do not keep the conn another timeout for them (A3).
+			cs.clearH2Owed()
+		}
+		switch {
+		case res.CloseAfterFlush:
+			l.closeWhenFlushed(cs)
+		case res.CloseNow:
+			if cs.holdsOutput() {
+				// Still sending the tail of a response: not idle while it goes
+				// out. The stream is gone from the manager once its last DATA
+				// is in the conn's buffers, and the kernel's send queue can hold
+				// megabytes; a close with the peer's frames unread in the receive
+				// queue is a reset, which discards it (the review of the first
+				// version of D0 measured an 8 MiB download cut at 5 MB). It goes
+				// out if the peer acknowledged bytes since the last extension
+				// (ExtendIdle); if it did not (a client that stopped reading, one
+				// that pings faster than its round trip), the conn is closed
+				// below, with the GOAWAY.
+				acked, err := l.bytesAcked(cs.fd)
+				if cs.h2State.ExtendIdle(now, acked, tcpack.Usable(acked, err)) {
+					break
+				}
+			}
+			// GOAWAY(NO_ERROR) naming the last client stream, flushed inline,
+			// then the close: the client knows what was processed.
+			if cs.h2State.GoAwayNoWait(cs.writeFn) {
+				l.flushH2Conn(cs)
+			}
+			l.closeConn(cs.fd)
+		case res.Wrote:
+			// Sent now, not left to the dirty pass: the scan below may close a
+			// silent conn in this very sweep, and a close does not wait for
+			// what is still in the write buffer.
+			l.flushH2Conn(cs)
 		}
 	}
 }

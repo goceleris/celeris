@@ -32,6 +32,7 @@ import (
 	"github.com/goceleris/celeris/internal/recvtheft"
 	"github.com/goceleris/celeris/internal/resource"
 	"github.com/goceleris/celeris/internal/sockopts"
+	"github.com/goceleris/celeris/internal/tcpack"
 	"github.com/goceleris/celeris/internal/wakefd"
 	"github.com/goceleris/celeris/internal/zcwindow"
 	"github.com/goceleris/celeris/validation"
@@ -1360,6 +1361,9 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 			MaxFrameSize:         cfg.MaxFrameSize,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 			WriteTimeout:         cfg.WriteTimeout,
+			ReadTimeout:          cfg.ReadTimeout,
+			ReadHeaderTimeout:    cfg.ReadHeaderTimeout,
+			IdleTimeout:          cfg.IdleTimeout,
 			Logger:               cfg.Logger,
 		},
 		sockOpts: sockopts.Options{
@@ -6501,6 +6505,95 @@ func (w *Worker) drainH2Writes() {
 	}
 }
 
+// holdsOutput reports whether the conn still has bytes to get to its peer:
+// staged in its buffers or in a SEND in flight, on the dirty list, or in the
+// kernel's send queue (TIOCOUTQ: unsent and unacknowledged bytes). An ioctl that
+// fails counts as "yes" (see epoll's holdsOutput). A fixed-file conn
+// (development only) is not asked: only its buffers count. It is a yes/no, not a
+// count: the SEND in flight and the kernel's queue hold the same bytes, and a
+// sum of them went up while the client read (review r5); progress is judged by
+// the bytes the peer acknowledged (ackedNow). Worker thread.
+func (cs *connState) holdsOutput() bool {
+	if len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0 || cs.sending || cs.zcNotifPending || cs.dirty {
+		return true
+	}
+	if cs.fixedFile {
+		return false
+	}
+	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ)
+	return err != nil || q != 0
+}
+
+// ackedNow is the bytes the peer of cs has acknowledged (tcp_info bytes_acked,
+// which only grows), and whether that is a count the idle clock may judge on: a
+// fixed-file conn (development only) and a failed getsockopt are not, and a 0 is
+// one only on a stack that fills the field (tcpack.Usable).
+func (cs *connState) ackedNow() (uint64, bool) {
+	if cs.fixedFile {
+		return 0, false
+	}
+	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	if err != nil {
+		return 0, false
+	}
+	return ti.Bytes_acked, tcpack.Usable(ti.Bytes_acked, nil)
+}
+
+// sweepH2Deadlines runs the per-stream deadlines of the HTTP/2 conns
+// (H2State.Sweep): for each conn on h2Conns, a few atomic loads when nothing is
+// due. By index, from the end: a close swap-removes the conn from h2Conns.
+// h2Conns holds a conn only once its h2State is installed and the h1-to-h2c
+// switch is complete, so h2State is read without detachMu, as drainH2Writes
+// reads it. Worker thread.
+func (w *Worker) sweepH2Deadlines(now int64) {
+	for i := len(w.h2Conns) - 1; i >= 0; i-- {
+		cs := w.conns[w.h2Conns[i]]
+		if cs == nil || cs.h2State == nil || cs.closing {
+			continue
+		}
+		res := cs.h2State.Sweep(now, cs.writeFn)
+		if res.Expired > 0 {
+			// The streams it reset are the ones the conn's idle period was
+			// kept for: do not keep the conn another timeout for them (A3).
+			cs.h2OwedAt = 0
+		}
+		switch {
+		case res.CloseAfterFlush:
+			if w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+			w.closeConn(cs.fd) // sends what was staged first
+		case res.CloseNow:
+			refused := false
+			if cs.holdsOutput() {
+				// Still sending the tail of a response: not idle while it goes
+				// out, which is the peer's acknowledging bytes (see epoll's
+				// sweepH2Deadlines; io_uring's close already waits for the SENDs
+				// it has issued, but not for the kernel's queue).
+				acked, ok := cs.ackedNow()
+				if cs.h2State.ExtendIdle(now, acked, ok) {
+					break
+				}
+				refused = true
+			}
+			if cs.h2State.GoAwayNoWait(cs.writeFn) && w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+			if refused {
+				w.closeRefused(cs.fd, cs, now)
+			} else {
+				// Nothing left to send but the GOAWAY: closeConn defers behind
+				// its SEND, which the drain gives its time to complete.
+				w.closeConn(cs.fd)
+			}
+		case res.Wrote:
+			if w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+		}
+	}
+}
+
 func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
 		if cs.closing {
@@ -7617,6 +7710,44 @@ func (w *Worker) closeStalled(fd int, cs *connState, now int64) {
 	}
 }
 
+// closeRefused is the close of an h2 conn the idle clock gave up on because its
+// output did not go out (ExtendIdle refused: the peer acknowledged no more than
+// the control frames the server sent it, a client that stopped reading or one that
+// pings faster than its round trip). Its SEND in flight, if any, is one the peer
+// may not be taking, and closeConn defers the descriptor behind it for a drain
+// bound, up to WriteTimeout, on top of the idle periods the conn has had. The
+// drain's clock is set back so that the bound runs out at the next sweep, as
+// closeStalled does for a stalled detached conn, and not in this one: the GOAWAY
+// staged behind the SEND is an SQE the loop submits before the next sweep, and a
+// peer whose window is open (the pinger) gets its GOAWAY(NO_ERROR); a peer that
+// takes nothing (zero window) has the GOAWAY behind a SEND that never completes
+// and is reaped one sweep later, not after the drain bound (review r6 F9: reaping
+// in the same pass shut the socket before the SQE was submitted, and the pinger
+// got a bare EOF where epoll delivers the GOAWAY). Submitting the ring before the
+// reap would not do: on an SQPOLL tier a submit only wakes the poller.
+//
+// The sweep after this one must not look at the peer's acknowledged bytes
+// (noteClosingAcked): the ACKs of bytes that were in flight at the moment of the
+// decision still arrive after it, and the look would read them as the peer taking
+// bytes and give the conn another drain bound, up to WriteTimeout (the zero-window
+// cell failed once on a CI runner, the conn open 9.5 s later; the first version of
+// the grace did that). The decision rests on a whole idle period without progress,
+// which is more evidence than one sample.
+//
+// Only for the refused conn: the idle close of a conn with nothing to send but its
+// GOAWAY must give that SEND its drain (review r5 F1). Worker thread.
+func (w *Worker) closeRefused(fd int, cs *connState, now int64) {
+	w.closeConn(fd)
+	if w.conns[fd] != cs || !cs.closing {
+		return
+	}
+	// Out of bound at the next sweep, not this one; and no sample of the peer's
+	// acknowledged bytes in between: closeSampled is set past the instant the
+	// sweep's rule would take one (see noteClosingAcked's callers).
+	cs.lastActivity = now - w.closingDrainBound() + 1
+	cs.closeSampled = now + 2
+}
+
 // sweepWatchDue reports whether the loop owes a timeout sweep outside its
 // iteration gate (celeris#811): the dirty pass gave up a conn whose SEND is
 // outstanding (sendWatch), so no spin reaches the gate for its WriteTimeout,
@@ -7662,6 +7793,13 @@ func (w *Worker) checkTimeouts() {
 	w.sweepTickFired = false
 	if h := testHookCheckTimeouts.Load(); h != nil {
 		(*h)(w)
+	}
+	// The deadlines of the HTTP/2 streams and of the h2 conns' idle clock come
+	// first, before the scan of the conns' own clocks below: a request that has
+	// expired is answered 408 and reset, ONE stream, and the scan then finds the
+	// conn as that leaves it (celeris#889).
+	if len(w.h2Conns) != 0 {
+		w.sweepH2Deadlines(now)
 	}
 	// sendOut: a conn has a SEND (or a SEND_ZC notification) outstanding, so
 	// the watch (sendWatch, set by the dirty pass's give-up) stays on.
