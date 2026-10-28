@@ -5320,8 +5320,13 @@ func (l *Loop) shutdown() {
 	// running a handler, or a detached stream not ended yet is left to the drain
 	// and to phase 3. Its cap per pass is for a loop that has other conns to
 	// serve; this one has none, so it goes on until a pass closes fewer.
+	// A pass counts the closeConn calls it made, and closeConn may leave a conn
+	// in place (a dispatch goroutine running a handler owes the close), so the
+	// loop has a bound of its own: a pass that closes the cap is followed by
+	// another only while the passes made could still have closed every conn
+	// that was live on entry. It cannot spin.
 	now := time.Now().UnixNano()
-	for l.closeIdleH1(false, now) >= gateClosesPerPass {
+	for passes := len(l.liveConns)/gateClosesPerPass + 1; passes > 0 && l.closeIdleH1(false, now) >= gateClosesPerPass; passes-- {
 		now = time.Now().UnixNano()
 	}
 
