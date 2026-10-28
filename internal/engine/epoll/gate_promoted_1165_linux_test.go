@@ -237,7 +237,10 @@ func TestH1InProgressDecidesTheWaitOfALoopWithoutHTTP21166(t *testing.T) {
 			partial(r)
 			r.cs.h1State.Detached.Store(true)
 		}), false},
-		{"plain-http2", plain(func(r *promoted1165) { r.cs.protocol = engine.H2C }), false},
+		{"plain-http2", plain(func(r *promoted1165) {
+			partial(r)
+			r.cs.protocol = engine.H2C
+		}), false},
 		{"promoted-switched-to-h2", func(r *promoted1165) {
 			partial(r)
 			r.cs.asyncInMu.Lock()
@@ -279,4 +282,36 @@ func TestH1InProgressDecidesTheWaitOfALoopWithoutHTTP21166(t *testing.T) {
 			t.Fatal("the second call asked the kernel again")
 		}
 	})
+}
+
+// The wait is paced and bounded: a yes holds until the next poll time, and the
+// wait ends at sendDrainWait's end whatever the clients are doing.
+func TestPoolWaitSettledWaitsForARequestInProgressAndIsBounded1166(t *testing.T) {
+	r := newPromoted1165(t)
+	r.cs.asyncPromoted = false
+	_ = conn.ProcessH1(context.Background(), []byte("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc"), r.cs.h1State, r.l.handler, func([]byte) {})
+	if r.l.poolWaitSettled() {
+		t.Fatal("the loop is settled with a request in progress")
+	}
+	if r.l.h2DrainStart.IsZero() {
+		t.Fatal("the wait has no start: its bound would never come")
+	}
+	// The request ends; the pacing holds the answer until the next poll time.
+	r.cs.h1State = conn.NewH1State()
+	if r.l.poolWaitSettled() {
+		t.Fatal("the loop is settled before the pacing's next poll")
+	}
+	r.l.h1InProgressNext = 0
+	if !r.l.poolWaitSettled() {
+		t.Fatal("the loop is not settled with nothing in progress")
+	}
+	// A request that never ends: the wait ends at its bound (no Shutdown budget:
+	// the floor, 250 ms, from the start).
+	r.cs.h1State = conn.NewH1State()
+	_ = conn.ProcessH1(context.Background(), []byte("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc"), r.cs.h1State, r.l.handler, func([]byte) {})
+	r.l.h1InProgressNext = 0
+	r.l.h2DrainStart = time.Now().Add(-2 * shutdownSendDrainFloor)
+	if !r.l.poolWaitSettled() {
+		t.Fatal("the wait for a request in progress is not bounded")
+	}
 }
