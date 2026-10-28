@@ -51,18 +51,11 @@ func newBoundAdaptive(t *testing.T) (*Engine, func()) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	ended := make(chan struct{})
+	go func() { done <- e.Listen(ctx); close(ended) }()
 
 	// Wait for bound.
-	deadline := time.Now().Add(3 * time.Second)
-	for e.Addr() == nil && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		cancel()
-		<-done
-		t.Fatal("adaptive engine never bound")
-	}
+	awaitBoundOrFail890(t, e, cancel, done, ended)
 
 	stop := func() {
 		cancel()

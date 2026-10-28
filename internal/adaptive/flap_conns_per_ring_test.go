@@ -296,6 +296,22 @@ func awaitBind890(addr func() net.Addr, ended <-chan struct{}, limit time.Durati
 	}
 }
 
+// awaitBoundOrFail890 is awaitBind890 for a test that started Listen itself
+// (it keeps ctx's cancel and the done channel, to assert on the stop). The
+// caller's Listen goroutine sends its result on done and then closes ended. On
+// failure it cancels Listen, joins it and fails t with Listen's own error.
+func awaitBoundOrFail890(t *testing.T, e *Engine, cancel context.CancelFunc, done <-chan error, ended <-chan struct{}) net.Addr {
+	t.Helper()
+	a, took, err := awaitBind890(e.Addr, ended, bindLimit890)
+	if err != nil {
+		cancel()
+		lerr := <-done
+		t.Fatalf("adaptive engine never bound: %v (waited %v; Listen: %v)", err, took, lerr)
+	}
+	t.Logf("adaptive engine bound %v after Listen started", took.Round(time.Millisecond))
+	return a
+}
+
 // listenAndAwaitBind890 starts e.Listen, waits for the bound address (see
 // awaitBind890), logs how long the bind took, and returns the address with a
 // stop func that cancels Listen and joins it. It fails the test with Listen's
