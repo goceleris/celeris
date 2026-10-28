@@ -287,3 +287,36 @@ func TestParkedConnWithNothingParkedIsStillReapedByReadTimeout885(t *testing.T) 
 		t.Fatalf("a parked conn with no acknowledged-bytes signal was not reaped by ReadTimeout %v, 2 s in", rt)
 	})
 }
+
+// TestParkedResponseDrainedBehindTheLoopStartsTheIdleClockAtTheSweep885: a
+// response the rule governs (a baseline is known, writeSince is the last
+// window's stamp) that the dispatch goroutine's own flush drains, which the
+// loop sees at a sweep (the queue is found empty), starts ReadTimeout from that
+// sweep and not from the stamp of a window passed long before: a conn is not
+// reaped at the instant its response ended because ReadTimeout (200 ms) is
+// shorter than the window (1.6 s) it was last stamped in.
+func TestParkedResponseDrainedBehindTheLoopStartsTheIdleClockAtTheSweep885(t *testing.T) {
+	const wt = 1600 * time.Millisecond
+	r := parked885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: -1, WriteTimeout: wt})
+	r.l.checkTimeouts() // the baseline
+	if !r.cs.closeAckedKnown {
+		t.Fatalf("apparatus: no baseline after the first sweep")
+	}
+	r.l.cfg.ReadTimeout = 200 * time.Millisecond
+	time.Sleep(500 * time.Millisecond) // the stamp is now older than ReadTimeout
+	r.l.checkTimeouts()
+	if !r.open() {
+		t.Fatalf("the rule governs a parked response; ReadTimeout reaped it")
+	}
+	// The goroutine's flush emptied the queue; the loop has not seen it.
+	r.cs.writeBuf = r.cs.writeBuf[:0]
+	r.cs.writePos = 0
+	r.cs.pendingBytes = 0
+	r.l.checkTimeouts()
+	if !r.open() {
+		t.Fatalf("the conn was reaped at the sweep that found its response drained: ReadTimeout ran from the stamp of a window passed 500 ms before")
+	}
+	if r.cs.writeSince != 0 || r.cs.closeAckedKnown {
+		t.Errorf("the sweep left the clock running (writeSince=%d known=%v)", r.cs.writeSince, r.cs.closeAckedKnown)
+	}
+}

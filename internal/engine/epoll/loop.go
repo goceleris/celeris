@@ -2375,6 +2375,13 @@ func (cs *connState) endWrite() {
 func (cs *connState) endWriteSlow() {
 	cs.writeSince = 0
 	cs.closeAckedKnown = false // the baseline of the response's window (parkedBelowRate)
+	if cs.closeSince == 0 {
+		// A live conn's last sample is of the response that ended: the next
+		// one parks with no baseline and takes it at its first sweep, not
+		// after a quarter of WriteTimeout (closing and detached conns keep
+		// theirs, which they own).
+		cs.closeSampled = 0
+	}
 	cs.lastActivity = time.Now().UnixNano()
 }
 
@@ -4951,17 +4958,39 @@ func (l *Loop) sweepWriteClock(cs *connState, fd int, now, last int64) (from int
 				l.closeConn(fd)
 				return last, true
 			}
-			if !cs.closeAckedKnown && time.Duration(now-cs.writeSince) > wt {
+			if cs.closeAckedKnown {
+				// The rule has a baseline for this response and is its only
+				// bound (celeris#885 item 51): a peer taking at least the floor
+				// per window is not stalled, whatever the idle clocks say. They
+				// run from the last flush that took bytes or the last window
+				// passed, and a client reading steadily between two EPOLLOUT
+				// edges moves neither (a ReadTimeout or IdleTimeout not above
+				// WriteTimeout, the defaults' shape, would cut it before the
+				// rule decides), and a response has no request behind it for
+				// ReadTimeout to bound (a pipelined head has ReadHeaderTimeout,
+				// above). A peer that stops is closed by the rule one window
+				// after it falls under the floor. Back to the idle scan when the
+				// response ends (endWrite) or the baseline is lost (a failed
+				// sample).
+				return last, true
+			}
+			if time.Duration(now-cs.writeSince) > wt {
 				l.closeConn(fd)
 				return last, true
 			}
-			ws = cs.writeSince // a window passed moves the clock
 		}
 	} else {
 		// End the clock as endWrite does, from its last stamp, which is no
-		// later than the drain.
+		// later than the drain. A response the rule governed has no recent
+		// stamp (it moves once per window): the drain is dated by this
+		// sweep, so that ReadTimeout or IdleTimeout, shorter than the
+		// window, do not cut the conn on the instant its response ended.
+		if cs.closeAckedKnown {
+			ws = now
+		}
 		cs.writeSince = 0
 		cs.closeAckedKnown = false
+		cs.closeSampled = 0 // the next response's baseline is not delayed by this one's sample
 		if ws > last {
 			cs.lastActivity = ws
 		}
