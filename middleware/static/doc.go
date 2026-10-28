@@ -51,9 +51,15 @@
 // relative Root to an absolute path at startup. The Root should exist then; a
 // Root that is or contains a symlink is followed at each request, so a later
 // retarget to "/" is not refused. Devices, FIFOs and sockets are
-// never served: they are answered as a missing file, since reading /dev/zero
-// never ends and opening a FIFO waits for a writer. Name the directory that holds
-// what is public; see [Config].Root.
+// not served: a Root answers them as a missing file, since reading /dev/zero
+// never ends and opening a FIFO waits for a writer. A [Config].FS cannot be held
+// to as much: every name of the tree is looked at before it is opened (an
+// os.DirFS and an fs.Sub of one are), so a FIFO planted in it, as an index file
+// or as a pre-compressed variant too, is answered as a missing file, but an FS
+// cannot open non-blocking, so a FIFO swapped in after that look can still
+// block one request; and a link that leaves an fs.Sub, followed under
+// DotfilesAllow, ends where the FS cannot look, so a FIFO there blocks too.
+// Name the directory that holds what is public; see [Config].Root.
 //
 // # Dotfiles
 //
@@ -85,7 +91,7 @@
 //
 // The rule is not a secrets filter. It looks at the names in the request path
 // and at where symlinks lead, and nothing else: a secret whose path has no dot
-// segment (/etc/shadow when the process can read it, /proc/self/environ, an
+// segment (/etc/shadow when the process can read it, an
 // id_rsa, /var/run/secrets/...) is served from any Root that reaches it, and
 // that is what an acknowledged filesystem root does. Nor is it a sandbox for a
 // tree that others can write to: a symlink swapped between the check and the

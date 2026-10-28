@@ -1223,17 +1223,8 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 // use [Context.FileFromDir] instead.
 func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 	// Before the open: for an os.DirFS, open(2) of a FIFO waits for a writer.
-	if _, ok := fsys.(fs.StatFS); ok {
-		if info, err := fs.Stat(fsys, name); err == nil && notServable(info) {
-			return errNotRegular()
-		}
-	} else if rl, ok := fsys.(fs.ReadLinkFS); ok {
-		// an fs.Sub of an os.DirFS is no StatFS: look at where its links lead
-		if resolved, ok := ctxkit.ResolveFSLinks(rl, name); ok {
-			if info, err := rl.Lstat(resolved); err == nil && notServable(info) {
-				return errNotRegular()
-			}
-		}
+	if bad, _ := ctxkit.NotRegularFS(fsys, name); bad {
+		return errNotRegular()
 	}
 	f, err := fsys.Open(name)
 	if err != nil {

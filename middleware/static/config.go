@@ -58,7 +58,7 @@ type Config struct {
 	// "../../.." reaching it, a symlink to it, a drive root such as C:\ on
 	// Windows. New panics with a message that names the resolved path, unless
 	// [Config].AllowFilesystemRoot is set: such a Root serves every file the
-	// process can read (/etc/passwd, /proc/self/environ, keys without a dot in
+	// process can read (/etc/passwd, keys without a dot in
 	// their path), nothing is outside it, and the dotfile rule is no secrets
 	// filter. The refusal looks at the Root once, when New is called, and the Root
 	// should exist then (one that does not is not refused, and serves nothing
@@ -138,15 +138,24 @@ type Config struct {
 	// more than 8 links on a path (a loop included), or a walk of more than 256
 	// steps, is not followed and the path is refused like a hidden one, because
 	// the FS cannot say what is beyond it (an os.DirFS lets the operating system
-	// follow it); DotfilesAllow follows them all, as before. An FS that is neither
-	// an [fs.StatFS] nor an [fs.ReadLinkFS] is opened as it is: a FIFO in it
-	// blocks the request. Browse leaves
+	// follow it); DotfilesAllow follows them all, as before. A path through such
+	// a link is refused whatever it leads to: a link with an absolute target to a
+	// visible file, a re-entry by the FS root's own name (../pub/x), a chain of
+	// more than 8 links (a "current -> /srv/releases/42" layout under an FS needs
+	// DotfilesAllow, or a Root). Every name of the tree is looked at before it is
+	// opened, a directory's index file and a pre-compressed variant included, so
+	// a FIFO planted in an [os.DirFS] or an fs.Sub of one is answered as a
+	// missing file; but an FS cannot be opened without blocking, so a FIFO
+	// swapped in after that look can still block a request, and an FS that is
+	// neither an [fs.StatFS] nor an [fs.ReadLinkFS] is opened as it is, as is a
+	// link that leaves an fs.Sub under DotfilesAllow (the FS cannot say what is
+	// beyond it). Browse leaves
 	// hidden entries out of a listing. The Index file
 	// is the operator's choice and is served even if its name starts with a dot.
 	//
 	// The rule is not a secrets filter: it looks at the names in the request
 	// path and at where symlinks lead, nothing else. A secret whose path has no
-	// dot segment (/etc/shadow readable by the process, /proc/self/environ, an
+	// dot segment (/etc/shadow readable by the process, an
 	// id_rsa, /var/run/secrets/...) is served from any Root that reaches it. And
 	// it is not a sandbox against a writable tree: a symlink swapped between the
 	// check and the open, and a hard link to a hidden file, defeat any path rule,
@@ -161,8 +170,10 @@ type Config struct {
 	// is refused at New, with a panic that names the resolved path, unless this
 	// is true: such a Root serves every file the process can read below it, and
 	// nothing is outside it any more. A filesystem root also serves /proc and
-	// /sys: their regular files (/proc/self/environ, /proc/self/status) are
-	// served, those that report a size of 0 as an empty body. Default: false.
+	// /sys: the /proc files that report a size of 0 (/proc/self/environ,
+	// /proc/self/status) are served empty, not with their content; /sys files and
+	// any other pseudo-file that reports a size are served for the bytes they
+	// hold, and can expose process or machine state. Default: false.
 	//
 	// Not every way to reach a filesystem root is refused: an FS
 	// ([os.DirFS]("/"), or os.DirFS(".") in a working directory of "/") has no

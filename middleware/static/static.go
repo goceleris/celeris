@@ -511,25 +511,15 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	// A link that leaves the FS (an absolute target, or one that climbs above the
 	// FS root) is not followed: the FS cannot say what is beyond it, and an
 	// os.DirFS lets the OS follow it, so the path is refused as hidden.
-	_, isStat := fsys.(fs.StatFS)
-	if rl, ok := fsys.(fs.ReadLinkFS); ok && filePath != "" && (hidden != nil || !isStat) {
-		resolved, ok := ctxkit.ResolveFSLinks(rl, filePath)
-		if hidden != nil && (!ok || hidden(resolved)) {
+	if rl, ok := fsys.(fs.ReadLinkFS); ok && hidden != nil && filePath != "" {
+		if resolved, ok := ctxkit.ResolveFSLinks(rl, filePath); !ok || hidden(resolved) {
 			return ctxkit.ErrHidden
 		}
-		// Before the open, for an FS that is no StatFS (an fs.Sub of an os.DirFS):
-		// open(2) of a FIFO waits for a writer.
-		if !isStat && ok {
-			if fi, err := rl.Lstat(resolved); err == nil && !fi.IsDir() && !fi.Mode().IsRegular() {
-				return ctxkit.ErrNotRegular
-			}
-		}
 	}
-	// Before the open: for an os.DirFS, open(2) of a FIFO waits for a writer.
-	if isStat {
-		if info, err := fs.Stat(fsys, openPath); err == nil && !info.IsDir() && !info.Mode().IsRegular() {
-			return ctxkit.ErrNotRegular
-		}
+	// Before the open: open(2) of a FIFO waits for a writer. Every Open of a name
+	// from the tree below is preceded by this check.
+	if bad, _ := ctxkit.NotRegularFS(fsys, openPath); bad {
+		return ctxkit.ErrNotRegular
 	}
 
 	f, err := fsys.Open(openPath)
@@ -554,12 +544,15 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		} else {
 			indexPath = filePath + "/" + index
 		}
-		indexFile, indexErr := fsys.Open(indexPath)
-		if indexErr == nil {
-			indexStat, statErr := indexFile.Stat()
-			_ = indexFile.Close()
-			if statErr == nil && !indexStat.IsDir() {
-				return serveFS(c, fsys, indexPath, index, browse, spa, compress, cacheControl, cache, hidden)
+		// an index that is a FIFO (or any non-regular file) is no index: it is not opened
+		if bad, _ := ctxkit.NotRegularFS(fsys, indexPath); !bad {
+			indexFile, indexErr := fsys.Open(indexPath)
+			if indexErr == nil {
+				indexStat, statErr := indexFile.Stat()
+				_ = indexFile.Close()
+				if statErr == nil && !indexStat.IsDir() {
+					return serveFS(c, fsys, indexPath, index, browse, spa, compress, cacheControl, cache, hidden)
+				}
 			}
 		}
 		if browse {
@@ -718,6 +711,9 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath, cacheControl
 					continue
 				}
 			}
+		}
+		if bad, _ := ctxkit.NotRegularFS(fsys, compPath); bad {
+			continue
 		}
 		if _, ok := fsys.(fs.StatFS); ok {
 			if info, err := fs.Stat(fsys, compPath); err != nil || !info.Mode().IsRegular() {

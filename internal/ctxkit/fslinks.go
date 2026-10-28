@@ -98,3 +98,35 @@ func walkFSLinks(rl fs.ReadLinkFS, name string) (string, bool) {
 	}
 	return strings.Join(resolved, "/"), true
 }
+
+// NotRegularFS reports whether name in fsys is something that must not be
+// opened: neither a regular file nor a directory (a FIFO, a socket, a device),
+// found without opening it. Every Open of a name taken from a served tree goes
+// through it first, because open(2) of a FIFO waits for a writer. An
+// fs.StatFS is stat-ed (an os.DirFS follows links); an FS that reads links but has
+// no Stat (an fs.Sub of an os.DirFS) is looked at through ResolveFSLinks and an
+// Lstat of the resolved name. checked is false when neither is possible: the FS
+// has no way to look (it is opened as it is), or a link on the way leaves the FS
+// and the FS cannot say what is beyond it.
+func NotRegularFS(fsys fs.FS, name string) (notRegular, checked bool) {
+	if _, ok := fsys.(fs.StatFS); ok {
+		info, err := fs.Stat(fsys, name)
+		if err != nil {
+			return false, true // it does not exist: the open will say so
+		}
+		return !info.IsDir() && !info.Mode().IsRegular(), true
+	}
+	rl, ok := fsys.(fs.ReadLinkFS)
+	if !ok {
+		return false, false
+	}
+	resolved, ok := ResolveFSLinks(rl, name)
+	if !ok {
+		return false, false
+	}
+	info, err := rl.Lstat(resolved)
+	if err != nil {
+		return false, true
+	}
+	return !info.IsDir() && !info.Mode().IsRegular(), true
+}
