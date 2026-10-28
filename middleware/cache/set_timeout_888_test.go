@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,10 +15,9 @@ import (
 	"github.com/goceleris/celeris/middleware/store"
 )
 
-// Config.SetTimeout (celeris#888 item 30). PENDING the maintainer's decision
-// on the default: nothing here names its value except
-// TestDefaultSetTimeoutIsInTheDoc888 and TestSetTimeoutZeroSelectsTheDefault888,
-// which go through defaultSetTimeout.
+// Config.SetTimeout (celeris#888 item 30). The default is 1 second (the
+// maintainer's decision): TestDefaultSetTimeoutIsOneSecond888 and
+// TestSetTimeoutZeroSelectsTheDefault888 name the number.
 
 // A Set that hangs no longer holds the leader past SetTimeout, with a store
 // that ignores its context and with one that honours it, coalesced or not.
@@ -152,8 +150,26 @@ func TestSetTimeoutZeroSelectsTheDefault888(t *testing.T) {
 	if d == nil {
 		t.Fatal("the Set was given a context without a deadline")
 	}
-	if until := time.Until(*d); until > defaultSetTimeout || until < defaultSetTimeout-2*time.Second {
-		t.Errorf("the Set's context ends in %v, want about defaultSetTimeout (%v)", until, defaultSetTimeout)
+	// The literal 1 s, not the constant: a changed default must fail here.
+	if until := time.Until(*d); until > time.Second || until < 500*time.Millisecond {
+		t.Errorf("the Set's context ends in %v, want between 500ms and 1s (the default, 1 second)", until)
+	}
+}
+
+// TestDefaultSetTimeoutIsOneSecond888 pins the default's value: 1 second, a
+// hung Set holds its event loop for the whole bound (celeris#888 item 30).
+func TestDefaultSetTimeoutIsOneSecond888(t *testing.T) {
+	if defaultSetTimeout != time.Second {
+		t.Errorf("defaultSetTimeout = %v, want 1s", defaultSetTimeout)
+	}
+	if got := applyDefaults(Config{}).SetTimeout; got != time.Second {
+		t.Errorf("applyDefaults(Config{}).SetTimeout = %v, want 1s", got)
+	}
+	if got := applyDefaults(Config{SetTimeout: 3 * time.Second}).SetTimeout; got != 3*time.Second {
+		t.Errorf("an explicit SetTimeout of 3s became %v", got)
+	}
+	if got := applyDefaults(Config{SetTimeout: -1}).SetTimeout; got != -1 {
+		t.Errorf("a negative SetTimeout became %v, want it kept (no bound)", got)
 	}
 }
 
@@ -255,21 +271,10 @@ func TestDefaultSetTimeoutIsInTheDoc888(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "Zero selects the default, " + secondsWord888(defaultSetTimeout) + ","
+	want := "Zero selects the default, 1 second,"
 	src = bytes.Join(bytes.Fields(src), []byte(" "))
 	src = bytes.ReplaceAll(src, []byte(" // "), []byte(" "))
 	if !strings.Contains(string(src), want) {
 		t.Errorf("config.go's SetTimeout doc does not say %q: change the doc with the constant", want)
 	}
-}
-
-func secondsWord888(d time.Duration) string {
-	if d%time.Second == 0 {
-		n := int(d / time.Second)
-		if n == 1 {
-			return "1 second"
-		}
-		return strconv.Itoa(n) + " seconds"
-	}
-	return d.String()
 }
