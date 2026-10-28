@@ -36,9 +36,8 @@ func (s *neverSetKV) Set(_ context.Context, _ string, _ []byte, _ time.Duration)
 // miss whose Store.Set never returns holds its epoll event loop for as long as
 // the bound, and a request that lands on that loop waits as long. The default
 // bound is 1 second: the reviewer measured a bystander delayed 951 ms at a 1 s
-// bound and 2.95 s at 3 s. The server has one worker, so the bystander is on
-// the held loop whatever the kernel does with the connection. Config.SetTimeout
-// is left unset: this is the default's test.
+// bound and 2.95 s at 3 s. Config.SetTimeout is left unset: this is the
+// default's test.
 //
 // The engine needs two workers at least, so bystanders are sent one after the
 // other, each on a new connection, until the miss is answered: the first one
@@ -122,7 +121,7 @@ func TestDefaultSetTimeoutBoundsTheLoopHold888(t *testing.T) {
 	if ping < 300*time.Millisecond {
 		t.Fatalf("the longest bystander wait was only %v: no bystander met the held loop, so this test measures nothing", ping)
 	}
-	const limit = 2500 * time.Millisecond // 1 s bound plus slack; the 5 s placeholder gives about 5 s
+	const limit = 2500 * time.Millisecond // 1 s bound plus slack; a 5 s bound would give about 5 s
 	if r.d > limit || ping > limit {
 		t.Errorf("miss answered after %v, bystander waited %v; want both within %v (default bound 1 s)", r.d, ping, limit)
 	}

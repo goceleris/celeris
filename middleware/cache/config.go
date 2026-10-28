@@ -143,6 +143,12 @@ type Config struct {
 	// one it was waiting for it is raised on the request, as without the
 	// bound.
 	//
+	// A Set that has not returned in time is abandoned silently: nothing is
+	// logged or counted (only a panic is), the Set's error is dropped, and the
+	// client gets a normal response marked X-Cache: MISS. A store whose Set can
+	// legitimately take longer than the default (Redis over a WAN, a saturated
+	// pool) needs a larger value, for example 5 * time.Second.
+	//
 	// The bound applies to every store except [MemoryStore] and
 	// [store.MemoryKV] themselves, which only take a lock. Any other type is
 	// bounded, one that wraps an in-process store included (a type that
