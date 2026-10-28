@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/goceleris/celeris/internal/ctxkit"
 )
 
 // Context.FileFromDir with a baseDir of ".", "./" and "/" (celeris#888 item
@@ -183,4 +185,9 @@ func TestFileFromDirRelativeBaseAbsoluteSymlink888(t *testing.T) {
 			t.Errorf("FileFromDir(%q, out): status %d body %q err %v, want a 400", base, status, body, err)
 		}
 	}
+}
+
+func isNotRegular888(err error) bool {
+	var he *HTTPError
+	return errors.As(err, &he) && he.Code == 404 && errors.Is(err, ctxkit.ErrNotRegular)
 }

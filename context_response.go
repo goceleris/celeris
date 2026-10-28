@@ -978,11 +978,15 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 	return c.serveOpenFile(filePath, contentType, onOpen)
 }
 
+// openForServe opens the file serveOpenFile serves; a variable so that a test can
+// put another file under a path that was just stat-ed.
+var openForServe = os.Open
+
 // serveOpenFile is serveFile for a path that was just stat-ed as a regular file
 // or a directory (fileFromDir): it checks the open descriptor again, which is
 // what is read, and bounds the buffered read.
 func (c *Context) serveOpenFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
-	f, err := os.Open(filePath)
+	f, err := openForServe(filePath)
 	if err != nil {
 		return err
 	}
