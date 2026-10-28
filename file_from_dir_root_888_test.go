@@ -126,3 +126,61 @@ func TestFileFromDirDotAndSlashBases888(t *testing.T) {
 		}
 	})
 }
+
+// An empty baseDir is not the working directory: filepath.Clean("") is ".",
+// and the check that now accepts everything below "." must not accept it.
+// Server.Static and Group.Static pass their root on unchecked, so
+// s.Static("/files", os.Getenv("STATIC_DIR")) with the variable unset was
+// answered with a 400 for every file, and must still be.
+func TestFileFromDirEmptyBaseIsRefused888(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	for _, p := range []string{"a.txt", "/a.txt", "./a.txt", ""} {
+		status, body, err := fileFromDir888(t, "", p)
+		if !isInvalidPath888(err) || status == 200 || body != "" {
+			t.Errorf("FileFromDir(%q, %q): status %d body %q err %v, want an HTTPError 400", "", p, status, body, err)
+		}
+	}
+}
+
+// A relative baseDir that is not "." widens a little with this change: a
+// symlink with an absolute target that stays inside it is served (it was a 400:
+// the resolved path is absolute, the resolved base relative); one that leaves
+// it is refused as before.
+func TestFileFromDirRelativeBaseAbsoluteSymlink888(t *testing.T) {
+	tmp, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p, body := range map[string]string{
+		filepath.Join(tmp, "public", "a.txt"):  "A",
+		filepath.Join(tmp, "private", "s.txt"): "S",
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range map[string]string{
+		"in":  filepath.Join(tmp, "public", "a.txt"),
+		"out": filepath.Join(tmp, "private", "s.txt"),
+	} {
+		if err := os.Symlink(target, filepath.Join(tmp, "public", name)); err != nil {
+			t.Skipf("symlinks are not available here: %v", err)
+		}
+	}
+	t.Chdir(tmp)
+	for _, base := range []string{"public", "./public"} {
+		if status, body, err := fileFromDir888(t, base, "in"); err != nil || status != 200 || body != "A" {
+			t.Errorf("FileFromDir(%q, in): status %d body %q err %v, want 200 A", base, status, body, err)
+		}
+		if status, body, err := fileFromDir888(t, base, "out"); !isInvalidPath888(err) || status == 200 || body != "" {
+			t.Errorf("FileFromDir(%q, out): status %d body %q err %v, want a 400", base, status, body, err)
+		}
+	}
+}
