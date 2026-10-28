@@ -17,6 +17,22 @@ func ExampleNew() {
 	})
 }
 
+func ExampleNew_dotfiles() {
+	// Hidden files and directories (.env, .git, .htaccess) are not served by
+	// default: the request goes on as if the file did not exist, and the
+	// exact segment ".well-known" is served. Refuse them with a 403 instead:
+	_ = static.New(static.Config{
+		Root:     "./public",
+		Dotfiles: static.DotfilesDeny,
+	})
+	// A project that serves a hidden file on purpose allows them for a
+	// directory that holds nothing secret.
+	_ = static.New(static.Config{
+		Root:     "./public",
+		Dotfiles: static.DotfilesAllow,
+	})
+}
+
 func ExampleNew_browse() {
 	// Enable directory listing.
 	_ = static.New(static.Config{

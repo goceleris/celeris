@@ -21,8 +21,12 @@ var ReleaseContext func(c any)
 // (not for a 413). contentType, when not empty, replaces
 // the type taken from the extension of the file served (a pre-compressed ".gz"
 // variant is served with the original's type).
+//
+// hidden, when not nil, is called with the slash path of the file below the
+// base once symlinks are resolved, before the file is opened; when it reports
+// true the call returns ErrHidden and writes nothing.
 var FileFromDir func(c any, baseDir, userPath, contentType string,
-	onOpen func(modTime time.Time, size int64)) error
+	onOpen func(modTime time.Time, size int64), hidden func(rel string) bool) error
 
 // workerIDKey is the private context key carrying the event-loop worker ID
 // that accepted / is servicing the current connection. Engines set it at

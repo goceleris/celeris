@@ -334,13 +334,26 @@ func (s *Server) OnShutdown(fn func(ctx context.Context)) *Server {
 }
 
 // Static registers a GET handler that serves files from root under the given
-// prefix. Uses FileFromDir for path traversal protection.
+// prefix. Uses FileFromDir for path traversal protection. root may be ".",
+// "./" (from v1.6.0; before, every file below them was refused): "." is the
+// working directory, so name a directory that holds only what is public. A root
+// that resolves to the root of a filesystem ("/", "." when the working directory
+// is "/", a symlink to "/") panics here, with no way to acknowledge it: serve a
+// filesystem root on purpose with middleware/static and AllowFilesystemRoot. A
+// root made of ".." segments means the directory it resolves to, resolved once
+// when the route is registered, and nothing outside it is served. An empty root
+// serves nothing. A file that is not there is a 404; devices, FIFOs and sockets
+// are not served. Files and directories whose name starts with a dot (.env, .git) are
+// not served, and a path to one, or to a symlink that leads to one, is a 404
+// whether or not it exists; the exact segment ".well-known" is served. There is
+// no opt-out here: use middleware/static with Dotfiles: static.DotfilesAllow.
 //
 //	s.Static("/assets", "./public")
 func (s *Server) Static(prefix, root string) *Route {
 	p := strings.TrimRight(prefix, "/") + "/*filepath"
+	root = staticRoot(root)
 	return s.GET(p, func(c *Context) error {
-		return c.FileFromDir(root, c.Param("filepath"))
+		return c.serveStaticFile(root, c.Param("filepath"))
 	})
 }
 
