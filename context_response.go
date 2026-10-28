@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/httprange"
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
@@ -934,6 +935,35 @@ func (c *Context) File(filePath string) error {
 	return c.serveFile(filePath, "", nil)
 }
 
+// staticRoot is the root of Server.Static and Group.Static as the route keeps
+// it: a root made of ".." segments is resolved against the working directory
+// once, when the route is registered (see ctxkit.ResolveClimbingRoot); any
+// other root, the empty one included, is kept as given.
+func staticRoot(root string) string {
+	if root == "" {
+		return root
+	}
+	root = ctxkit.ResolveClimbingRoot(filepath.Clean(root))
+	if resolved, ok := ctxkit.FilesystemRoot(root); ok {
+		panic(fmt.Sprintf("celeris: Static root %q resolves to the filesystem root %q, which serves every file the process can read: "+
+			"name the directory that holds the public files, or serve a filesystem root on purpose with middleware/static and Config.AllowFilesystemRoot", root, resolved))
+	}
+	return root
+}
+
+// errNotRegular is the error for a path that is not a regular file (a device, a
+// FIFO, a socket): reading one is unbounded (/dev/zero) or never ends (a FIFO),
+// so none is served. It is an HTTPError 404 that wraps ctxkit.ErrNotRegular.
+func errNotRegular() error {
+	return NewHTTPError(404, "not a regular file").WithError(ctxkit.ErrNotRegular)
+}
+
+// notServable reports whether info is a file that is neither a regular file nor
+// a directory.
+func notServable(info fs.FileInfo) bool {
+	return !info.IsDir() && !info.Mode().IsRegular()
+}
+
 // serveFile is File. contentType, when not empty, replaces the type taken from
 // filePath's extension. onOpen, when not nil, runs once the file is open and
 // its size and mtime are read from the open descriptor, before the response is
@@ -941,7 +971,25 @@ func (c *Context) File(filePath string) error {
 // middleware/static sets its validators from them there, so they describe the
 // bytes that are sent even when the path is replaced meanwhile (celeris#846).
 func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
-	f, err := os.Open(filePath)
+	// Before the open: open(2) of a FIFO waits for a writer.
+	if info, err := os.Stat(filePath); err == nil && notServable(info) {
+		return errNotRegular()
+	}
+	return c.serveOpenFile(filePath, contentType, onOpen)
+}
+
+// openForServe opens the file serveOpenFile serves: without blocking where the
+// platform has O_NONBLOCK, so that a FIFO swapped in for a regular file after the
+// stat does not wait in open(2) for a writer (the check on the open descriptor
+// then refuses it). A variable so that a test can put another file under a path
+// that was just stat-ed.
+var openForServe = openNonblock
+
+// serveOpenFile is serveFile for a path that was just stat-ed as a regular file
+// or a directory (fileFromDir): it checks the open descriptor again, which is
+// what is read, and bounds the buffered read.
+func (c *Context) serveOpenFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+	f, err := openForServe(filePath)
 	if err != nil {
 		return err
 	}
@@ -950,6 +998,9 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 	stat, err := f.Stat()
 	if err != nil {
 		return err
+	}
+	if notServable(stat) {
+		return errNotRegular()
 	}
 	size := stat.Size()
 
@@ -1008,7 +1059,11 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 		return err
 	}
 
-	data, err := io.ReadAll(f)
+	// The read is bounded by the size the open file reports (which the cap above
+	// bounded): a file that grows meanwhile is cut at the size its validators
+	// describe, and a pseudo-file of size 0 that has content (/proc/self/pagemap
+	// reads 100 MB) is served empty, as the sendfile path serves it.
+	data, err := io.ReadAll(io.LimitReader(f, size))
 	if err != nil {
 		return err
 	}
@@ -1069,16 +1124,56 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // FileFromDir safely serves a file from within baseDir. The userPath is
 // cleaned and joined with baseDir; if the result escapes baseDir, a 400
 // error is returned. Symlinks are resolved and rechecked to prevent a
-// symlink under baseDir from escaping the directory boundary.
+// symlink under baseDir from escaping the directory boundary. A baseDir of
+// "." or "./" is the working directory and one of "/" the filesystem's root
+// (before v1.6.0 these two refused every file with a 400): with "/" nothing is
+// outside baseDir, so only the file's own existence limits what userPath may
+// name. An empty baseDir is refused with a 400, not read as ".". A relative
+// baseDir is read against the working directory at each call; one made of ".."
+// segments ("..", "../..") means the directory it resolves to, and a userPath
+// that climbs out of that directory is refused (before v1.6.0 it was not: a
+// baseDir of ".." served any file the process could read). Hidden files
+// (names that start with a dot) are served: the caller chooses the path, and
+// the dotfile rule of middleware/static, Server.Static and Group.Static does not
+// apply here, and neither does the refusal of a base that is the root of a
+// filesystem: a baseDir of "/" serves every file the process can read to a
+// userPath the caller got from a client, so choose the path with care. A device,
+// a FIFO or a socket is not served: it is an HTTPError 404 "not a regular
+// file".
 func (c *Context) FileFromDir(baseDir, userPath string) error {
-	return c.fileFromDir(baseDir, userPath, "", nil)
+	return c.fileFromDir(baseDir, userPath, "", nil, nil)
+}
+
+// serveStaticFile is what Server.Static and Group.Static serve with: FileFromDir
+// for a directory server, which does not serve hidden files and directories
+// (names that start with a dot, except the exact ".well-known"; see
+// middleware/static, Config.Dotfiles): a path with such a segment, or that
+// leads to one through a symlink, is a 404 whether or not the file exists.
+// FileFromDir itself, whose caller chooses the path, is unchanged.
+func (c *Context) serveStaticFile(root, tail string) error {
+	if ctxkit.HiddenPath(tail) {
+		return NewHTTPError(404, "Not Found")
+	}
+	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
+	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, fs.ErrNotExist) {
+		// a path to a hidden file is a 404 whether or not it exists, and so is a
+		// file that is not there (the raw lstat error was a 500)
+		return NewHTTPError(404, "Not Found")
+	}
+	return err
 }
 
 // fileFromDir is FileFromDir with serveFile's contentType and onOpen.
-func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64), hidden func(rel string) bool) error {
+	if baseDir == "" {
+		// filepath.Clean("") is ".": an unset root (Server.Static("/f",
+		// os.Getenv("DIR"))) would serve the working directory. It was refused
+		// before "." was accepted, and stays so.
+		return NewHTTPError(400, "invalid file path")
+	}
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
-	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {
+	if !ctxkit.PathWithin(base, abs) {
 		return NewHTTPError(400, "invalid file path")
 	}
 	// Resolve symlinks and recheck prefix to prevent symlink escape.
@@ -1090,8 +1185,19 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 	if err != nil {
 		return err
 	}
-	if resolved != resolvedBase && !strings.HasPrefix(resolved, resolvedBase+string(filepath.Separator)) {
+	if !ctxkit.ResolvedWithin(resolvedBase, resolved) {
 		return NewHTTPError(400, "invalid file path")
+	}
+	if hidden != nil {
+		// Where the path leads, not only what it says: a visible name that is a
+		// symlink to a dotfile of the tree is refused like the dotfile.
+		rel, ok := ctxkit.RelWithin(resolvedBase, resolved)
+		if !ok {
+			return NewHTTPError(400, "invalid file path")
+		}
+		if hidden(rel) {
+			return ctxkit.ErrHidden
+		}
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
@@ -1100,7 +1206,10 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 	if info.IsDir() {
 		return NewHTTPError(400, "invalid file path")
 	}
-	return c.serveFile(resolved, contentType, onOpen)
+	if !info.Mode().IsRegular() {
+		return errNotRegular()
+	}
+	return c.serveOpenFile(resolved, contentType, onOpen)
 }
 
 // FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
@@ -1113,6 +1222,10 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 // user-supplied paths to prevent directory traversal. For untrusted input,
 // use [Context.FileFromDir] instead.
 func (c *Context) FileFromFS(name string, fsys fs.FS) error {
+	// Before the open: for an os.DirFS, open(2) of a FIFO waits for a writer.
+	if bad, _ := ctxkit.NotRegularFS(fsys, name); bad {
+		return errNotRegular()
+	}
 	f, err := fsys.Open(name)
 	if err != nil {
 		return err
@@ -1125,6 +1238,9 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 	}
 	if stat.IsDir() {
 		return NewHTTPError(400, "path is a directory")
+	}
+	if !stat.Mode().IsRegular() {
+		return errNotRegular()
 	}
 	size := stat.Size()
 	if size > int64(maxStreamBodySize) {
@@ -1145,7 +1261,7 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		}
 	}
 
-	data, err := io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, size))
 	if err != nil {
 		return err
 	}

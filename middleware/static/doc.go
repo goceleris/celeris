@@ -10,6 +10,8 @@
 //   - [Config].SPA — single-page app mode: unknown paths serve the index file.
 //   - [Config].MaxAge — Cache-Control max-age duration (zero = no header).
 //   - [Config].Compress — serve pre-compressed .br/.gz variants when accepted.
+//   - [Config].Dotfiles — hidden files and directories (names that start with
+//     a dot) are not served by default.
 //   - [Config].Skip / [Config].SkipPaths — skip the middleware dynamically or
 //     by exact path match.
 //
@@ -31,14 +33,75 @@
 // containment check, the one [celeris.Context.FileFromDir] applies to a file it
 // sends (symlinks resolved), has passed for its path, and that check runs for
 // every conditional request, whether or not its validator matches. The two
-// checks agree for a Root that names a directory. A Root of ".", "./" or "/"
-// is not served from: a request for anything below it is passed to the next
-// handler (the guard against ".." compares the path with the root and a
-// separator, which no path below these roots starts with). For "." and "./"
-// the request for the root directory itself, answered by its index file, gets
-// a 400 from FileFromDir, which requires the "./" prefix a Root of "." lacks,
-// and a 304 when a validator matches; the file is inside the root either way.
-// Name the directory.
+// checks agree, for a Root of ".", "./" as for any other directory: these
+// serve the tree below them (before v1.6.0 they served nothing below the root,
+// and the root's own index answered 400 or 304 depending on whether a validator
+// matched), so a configuration that was inert since v1.3.3 starts to serve the
+// working directory after the upgrade, without its hidden files (below). A Root
+// made of ".." segments means the directory it resolves to, and nothing outside
+// it is served.
+//
+// A Root that resolves to the root of a filesystem is refused: "/", "." when
+// the working directory is "/" (a systemd service, a container without a
+// WORKDIR), "../../.." reaching it, a symlink to it, a drive root on Windows.
+// New panics, naming the resolved path, unless [Config].AllowFilesystemRoot is
+// set; Server.Static and Group.Static refuse it with no way to acknowledge, so
+// serve a filesystem root on purpose with this middleware. The Root is
+// resolved when New is called: a chdir after that is not covered, so resolve a
+// relative Root to an absolute path at startup. The Root should exist then; a
+// Root that is or contains a symlink is followed at each request, so a later
+// retarget to "/" is not refused. Devices, FIFOs and sockets are
+// not served: a Root answers them as a missing file, since reading /dev/zero
+// never ends and opening a FIFO waits for a writer. A [Config].FS cannot be held
+// to as much: every name of the tree is looked at before it is opened (an
+// os.DirFS and an fs.Sub of one are), so a FIFO planted in it, as an index file
+// or as a pre-compressed variant too, is answered as a missing file, but an FS
+// cannot open non-blocking, so a FIFO swapped in after that look can still
+// block one request; and a link that leaves an fs.Sub, followed under
+// DotfilesAllow, ends where the FS cannot look, so a FIFO there blocks too.
+// Name the directory that holds what is public; see [Config].Root.
+//
+// # Dotfiles
+//
+// A file or directory whose name starts with a dot (.env, .git, .ssh,
+// .htaccess) is not served by default: a request whose path below the root
+// has such a segment is answered as if the file did not exist ([DotfilesIgnore]:
+// the next handler, which is the router's 404 when nothing else answers; the
+// index file in SPA mode), whether or not it exists, so a client learns
+// nothing about it. Every segment of the request path counts, after the path
+// is cleaned ("a/../.env" is ".env") and with one level of percent-decoding;
+// the name of the root does not: a Root that is ".config", or "." in such a
+// directory, serves its files. The rule also follows a symlink: a visible name
+// that leads to a hidden file or directory of the tree is refused like it. Under
+// a [Config].FS (an os.DirFS, or an fs.Sub of one) the links are followed while
+// they stay inside the FS; links that leave the FS (an absolute target, or one
+// that climbs above its root) are not followed under Ignore and Deny: such a
+// path is refused like a hidden one, because the FS cannot say what is beyond
+// it. The
+// exact segment ".well-known" is served (RFC 8615: ACME challenges,
+// security.txt, apple-app-site-association), but its children are served only
+// if they are not hidden themselves. A directory listing (Browse) leaves the
+// hidden entries out. The Index file is the operator's choice and is served
+// even if its name starts with a dot. [DotfilesDeny] answers 403 instead;
+// [DotfilesAllow] serves hidden files like any other, as before v1.6.0:
+//
+//	// A project that serves a hidden file on purpose names its directory and
+//	// allows dotfiles there, and keeps its secrets out of that directory.
+//	static.New(static.Config{Root: "./public", Dotfiles: static.DotfilesAllow})
+//
+// The rule is not a secrets filter. It looks at the names in the request path
+// and at where symlinks lead, and nothing else: a secret whose path has no dot
+// segment (/etc/shadow when the process can read it, an
+// id_rsa, /var/run/secrets/...) is served from any Root that reaches it, and
+// that is what an acknowledged filesystem root does. Nor is it a sandbox for a
+// tree that others can write to: a symlink swapped between the check and the
+// open, and a hard link to a hidden file, defeat any rule about paths. Keep
+// secrets out of the served directory, and the directory out of untrusted hands.
+//
+// The rule is the middleware's, and that of Server.Static and Group.Static,
+// which serve a directory too (without a way to opt out: use the middleware for
+// that). [celeris.Context.FileFromDir], whose caller chooses the path, does not
+// apply it.
 //
 // With compress in front of an [Config].FS, the strong tag of a file that compress
 // encodes is made weak on the 200 (W/"hash"), and static marks the response so
