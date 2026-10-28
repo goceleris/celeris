@@ -151,4 +151,7 @@ func (cfg Config) validate() {
 	if cfg.Prefix != "" && cfg.Prefix[0] != '/' {
 		panic("static: Prefix must start with /")
 	}
+	if cfg.Dotfiles > DotfilesDeny {
+		panic("static: Dotfiles must be DotfilesIgnore, DotfilesAllow or DotfilesDeny")
+	}
 }

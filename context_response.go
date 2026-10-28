@@ -935,6 +935,30 @@ func (c *Context) File(filePath string) error {
 	return c.serveFile(filePath, "", nil)
 }
 
+// staticRoot is the root of Server.Static and Group.Static as the route keeps
+// it: a root made of ".." segments is resolved against the working directory
+// once, when the route is registered (see ctxkit.ResolveClimbingRoot); any
+// other root, the empty one included, is kept as given.
+func staticRoot(root string) string {
+	if root == "" {
+		return root
+	}
+	return ctxkit.ResolveClimbingRoot(filepath.Clean(root))
+}
+
+// errNotRegular is the error for a path that is not a regular file (a device, a
+// FIFO, a socket): reading one is unbounded (/dev/zero) or never ends (a FIFO),
+// so none is served. It is an HTTPError 404 that wraps ctxkit.ErrNotRegular.
+func errNotRegular() error {
+	return NewHTTPError(404, "not a regular file").WithError(ctxkit.ErrNotRegular)
+}
+
+// notServable reports whether info is a file that is neither a regular file nor
+// a directory.
+func notServable(info fs.FileInfo) bool {
+	return !info.IsDir() && !info.Mode().IsRegular()
+}
+
 // serveFile is File. contentType, when not empty, replaces the type taken from
 // filePath's extension. onOpen, when not nil, runs once the file is open and
 // its size and mtime are read from the open descriptor, before the response is
@@ -942,6 +966,17 @@ func (c *Context) File(filePath string) error {
 // middleware/static sets its validators from them there, so they describe the
 // bytes that are sent even when the path is replaced meanwhile (celeris#846).
 func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+	// Before the open: open(2) of a FIFO waits for a writer.
+	if info, err := os.Stat(filePath); err == nil && notServable(info) {
+		return errNotRegular()
+	}
+	return c.serveOpenFile(filePath, contentType, onOpen)
+}
+
+// serveOpenFile is serveFile for a path that was just stat-ed as a regular file
+// or a directory (fileFromDir): it checks the open descriptor again, which is
+// what is read, and bounds the buffered read.
+func (c *Context) serveOpenFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -951,6 +986,9 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 	stat, err := f.Stat()
 	if err != nil {
 		return err
+	}
+	if notServable(stat) {
+		return errNotRegular()
 	}
 	size := stat.Size()
 
@@ -1009,9 +1047,15 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 		return err
 	}
 
-	data, err := io.ReadAll(f)
+	// A regular file has a size, and it was capped above; the read is bounded by
+	// the cap all the same, for a file that grows meanwhile and for a
+	// pseudo-file the size of which is not its length.
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxStreamBodySize)+1))
 	if err != nil {
 		return err
+	}
+	if len(data) > maxStreamBodySize {
+		return NewHTTPError(413, "file exceeds 100MB limit")
 	}
 	return c.Blob(200, contentType, data)
 }
@@ -1097,7 +1141,9 @@ func (c *Context) serveStaticFile(root, tail string) error {
 		return NewHTTPError(404, "Not Found")
 	}
 	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
-	if errors.Is(err, ctxkit.ErrHidden) {
+	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, fs.ErrNotExist) {
+		// a path to a hidden file is a 404 whether or not it exists, and so is a
+		// file that is not there (the raw lstat error was a 500)
 		return NewHTTPError(404, "Not Found")
 	}
 	return err
@@ -1146,7 +1192,10 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 	if info.IsDir() {
 		return NewHTTPError(400, "invalid file path")
 	}
-	return c.serveFile(resolved, contentType, onOpen)
+	if !info.Mode().IsRegular() {
+		return errNotRegular()
+	}
+	return c.serveOpenFile(resolved, contentType, onOpen)
 }
 
 // FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
@@ -1159,6 +1208,12 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 // user-supplied paths to prevent directory traversal. For untrusted input,
 // use [Context.FileFromDir] instead.
 func (c *Context) FileFromFS(name string, fsys fs.FS) error {
+	// Before the open: for an os.DirFS, open(2) of a FIFO waits for a writer.
+	if _, ok := fsys.(fs.StatFS); ok {
+		if info, err := fs.Stat(fsys, name); err == nil && notServable(info) {
+			return errNotRegular()
+		}
+	}
 	f, err := fsys.Open(name)
 	if err != nil {
 		return err
@@ -1171,6 +1226,9 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 	}
 	if stat.IsDir() {
 		return NewHTTPError(400, "path is a directory")
+	}
+	if !stat.Mode().IsRegular() {
+		return errNotRegular()
 	}
 	size := stat.Size()
 	if size > int64(maxStreamBodySize) {
@@ -1191,9 +1249,12 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		}
 	}
 
-	data, err := io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxStreamBodySize)+1))
 	if err != nil {
 		return err
+	}
+	if len(data) > maxStreamBodySize {
+		return NewHTTPError(413, "file exceeds 100MB limit")
 	}
 	return c.Blob(200, contentType, data)
 }

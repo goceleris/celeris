@@ -107,3 +107,22 @@ func ResolvedWithin(base, resolved string) bool {
 	}
 	return withinClean(ab, ar)
 }
+
+// ResolveClimbingRoot returns root, a cleaned path, made absolute against the
+// working directory (symlinks resolved) when it is relative and starts with
+// ".." ("..", "../..", "../x"): such a root names a directory above the working
+// directory, and each containment check would otherwise have to resolve the
+// working directory again (a Getwd and an EvalSymlinks per call). Done once,
+// when the middleware or the route is made, a later change of the working
+// directory does not move the root. Any other root, and one that cannot be
+// resolved, is returned as it is.
+func ResolveClimbingRoot(root string) string {
+	if root == "" || filepath.IsAbs(root) || !climbs(root) {
+		return root
+	}
+	abs, err := absPhysical(root)
+	if err != nil {
+		return root
+	}
+	return abs
+}

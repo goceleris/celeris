@@ -347,6 +347,7 @@ func (s *Server) OnShutdown(fn func(ctx context.Context)) *Server {
 //	s.Static("/assets", "./public")
 func (s *Server) Static(prefix, root string) *Route {
 	p := strings.TrimRight(prefix, "/") + "/*filepath"
+	root = staticRoot(root)
 	return s.GET(p, func(c *Context) error {
 		return c.serveStaticFile(root, c.Param("filepath"))
 	})

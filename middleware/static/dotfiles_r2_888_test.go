@@ -138,8 +138,9 @@ func TestServerStaticMissingIs404_888(t *testing.T) {
 
 // TestDotDotRootCostsAboutADotRoot888 (R2-F6): a Root of ".." segments is
 // resolved once, when the middleware is made, so a request costs what it costs
-// under any relative Root, not five times that (Getwd and EvalSymlinks of the
-// working directory in every containment check).
+// under an absolute Root (the same work), not four times that (Getwd and
+// EvalSymlinks of the working directory in every containment check: 388
+// allocations against 98 on the review's measurement).
 func TestDotDotRootCostsAboutADotRoot888(t *testing.T) {
 	skipWindows888(t)
 	d := newDotTree888(t) // the working directory is T/p/c
@@ -154,10 +155,10 @@ func TestDotDotRootCostsAboutADotRoot888(t *testing.T) {
 			celeristest.ReleaseContext(ctx)
 		})
 	}
-	dot := cost(".", "/a.txt")
+	dot := cost(d.cwd, "/a.txt") // an absolute Root: what a resolved ".." root is
 	for _, tc := range []struct{ root, path string }{{"..", "/c/a.txt"}, {"../c", "/a.txt"}, {"x/..", "/a.txt"}, {"../..", "/p/c/a.txt"}} {
 		if got := cost(tc.root, tc.path); got > dot+8 {
-			t.Errorf("Root %q: %.0f allocations per request, Root \".\" costs %.0f", tc.root, got, dot)
+			t.Errorf("Root %q: %.0f allocations per request, an absolute Root costs %.0f", tc.root, got, dot)
 		}
 	}
 	// a working directory that changes after New is not followed by a resolved root

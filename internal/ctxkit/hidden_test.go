@@ -41,8 +41,11 @@ func TestHiddenPath(t *testing.T) {
 		{"./.env", true}, {"//.env", true}, {"a//.env", true}, {"a/./.env", true}, {"a/../.env", true}, {"a/../b", false},
 		{".git/../a", false}, {".well-known/../.env", true}, {"a/.b/..", false}, {"a/.b/../c", false}, {"../a", false}, {"/../.env", true},
 		{"a/b/../../.env", true}, {"a/.env/../b", false},
-		// backslashes separate
+		// a backslash is a name character (not a separator) except on Windows:
+		// a piece that starts with a dot hides the segment, ".." is hidden, and a
+		// ".." never pops the segment before it
 		{`\.env`, true}, {`a\.env`, true}, {`a\b`, false}, {`.well-known\.x`, true},
+		{`.git/..\x`, true}, {`.s\..\y`, true}, {`sub/..\.git/config`, true}, {`a\..\b`, true},
 		// encoded: one decoding
 		{"%2eenv", true}, {"a/%2Eenv", true}, {"%2e%2e/a", true}, {"a/%2e%2e/b", true}, {"%252eenv", false},
 		{".env\x00", true}, {"a\x00/.b", true},

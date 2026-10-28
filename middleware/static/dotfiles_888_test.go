@@ -119,7 +119,8 @@ var dotCases888 = []dotCase888{
 	// symlinks: a visible name that leads to a dotfile or directory of the tree, and a hidden name
 	{"/link-env", true, "ENV"}, {"/link-dir/config", true, "GITCFG"}, {"/.dot-link", true, "A"},
 	{"/chain1", true, "ENV"}, {"/chain2", true, "ENV"}, {"/lnkrel", true, "ENV"}, {"/lnkabs", true, "ENV"},
-	{"/.well-known/g/config", true, "GITCFG"}, {"/link-dir/", true, ""}, {"/ok-abs", false, "A"},
+	// (a directory link to a hidden directory, with no index and no listing, is no file: passed on)
+	{"/.well-known/g/config", true, "GITCFG"}, {"/link-dir/", false, ""}, {"/ok-abs", false, "A"},
 	// a literal backslash is part of the name on these systems (not a separator)
 	{`/.git/..\x`, true, "BSX"}, {`/.s\..\y`, true, "BSY"}, {`/sub/..\.git/config`, true, ""},
 	// visible

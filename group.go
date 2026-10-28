@@ -134,6 +134,7 @@ func (g *RouteGroup) Handle(method, path string, handlers ...HandlerFunc) *Route
 // no opt-out here: use middleware/static with Dotfiles: static.DotfilesAllow.
 func (g *RouteGroup) Static(prefix, root string) *Route {
 	p := strings.TrimRight(prefix, "/") + "/*filepath"
+	root = staticRoot(root)
 	return g.GET(p, func(c *Context) error {
 		return c.serveStaticFile(root, c.Param("filepath"))
 	})
