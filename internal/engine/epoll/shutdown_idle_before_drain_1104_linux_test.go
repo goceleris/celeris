@@ -103,11 +103,9 @@ func TestShutdownClosesAnIdleConnWhileAnotherConnsSendDrainWaits1104(t *testing.
 //   - promoted: a conn with a dispatch goroutine parked after its request, as
 //     production makes one (asyncPromoted is set whenever the goroutine is
 //     started: the flag is sticky, so every conn that ever served an Async route
-//     is one). The pass does NOT close it (closeIdleH1 skips every promoted conn:
-//     the follow-up celeris#1165, which gives it io_uring's look inside the
-//     goroutine's own locks), shutdown's later phases do, and nothing is counted
-//     for it there (phase 3 fires no OnDisconnect). This pins what the pass
-//     guarantees today, and is the case #1165 turns around.
+//     is one). The pass closes it as it closes the sync one, from outside the
+//     goroutine (celeris#1165): once, with one OnDisconnect, and the goroutine
+//     exits on the asyncClosed closeConn sets.
 func TestShutdownIdlePassTearsAConnThatServedARequestDownOnce1104(t *testing.T) {
 	for _, promoted := range []bool{false, true} {
 		async := promoted
@@ -182,12 +180,12 @@ func TestShutdownIdlePassTearsAConnThatServedARequestDownOnce1104(t *testing.T) 
 				}
 			}
 			if promoted {
-				// The pass alone: it leaves the promoted conn live and uncounted.
-				if n := l.closeIdleH1(false, time.Now().UnixNano()); n != 0 {
-					t.Errorf("the pass closed %d promoted conns, want 0 (celeris#1165)", n)
+				// The pass alone closes the parked promoted conn (celeris#1165).
+				if n := l.closeIdleH1(false, time.Now().UnixNano()); n != 1 {
+					t.Errorf("the pass closed %d promoted conns, want 1", n)
 				}
-				if l.conns[fd] == nil || l.activeConns.Load() != 1 || disconnects.Load() != 0 {
-					t.Errorf("after the pass the promoted conn is live=%v activeConns=%d OnDisconnect=%d, want live, 1, 0",
+				if l.conns[fd] != nil || l.activeConns.Load() != 0 || disconnects.Load() != 1 {
+					t.Errorf("after the pass the promoted conn is live=%v activeConns=%d OnDisconnect=%d, want closed, 0, 1",
 						l.conns[fd] != nil, l.activeConns.Load(), disconnects.Load())
 				}
 			}
@@ -199,10 +197,6 @@ func TestShutdownIdlePassTearsAConnThatServedARequestDownOnce1104(t *testing.T) 
 				t.Fatal("shutdown did not return")
 			}
 			wantCalls, wantActive := int64(1), int64(0)
-			if promoted {
-				// Closed by phase 3, which counts nothing (pre-existing; celeris#1165).
-				wantCalls, wantActive = 0, 1
-			}
 			if got := disconnects.Load(); got != wantCalls {
 				t.Errorf("OnDisconnect ran %d times for one conn, want %d", got, wantCalls)
 			}
