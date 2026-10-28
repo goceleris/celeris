@@ -154,7 +154,10 @@ func (c *h2raw889) block(method, path string) []byte {
 func (c *h2raw889) request(id uint32, method, path string, endStream, endHeaders bool) {
 	c.t.Helper()
 	blk := c.block(method, path)
-	if err := c.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk, EndStream: endStream, EndHeaders: endHeaders}); err != nil {
+	c.wmu.Lock() // a pinger or a trickle may be writing on the framer
+	err := c.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: blk, EndStream: endStream, EndHeaders: endHeaders})
+	c.wmu.Unlock()
+	if err != nil {
 		c.t.Fatal(err)
 	}
 	c.t0 = time.Now()
