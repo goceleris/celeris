@@ -24,7 +24,8 @@ type Manager struct {
 	activeStreams           atomic.Uint32
 	requestOpen             atomic.Uint32
 	reqArmed                atomic.Int32
-	reqDL                   atomic.Int64
+	hints                   *DeadlineHints
+	ownHints                DeadlineHints
 	reqTimeout              time.Duration
 	headerTableSize         uint32 // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
 	pendingConnWindowUpdate uint32
@@ -75,7 +76,7 @@ type Manager struct {
 // single default-priority stream (e.g. an h2c upgrade that closes right
 // after the response) they stay nil and save three map allocations.
 func NewManager() *Manager {
-	return &Manager{
+	m := &Manager{
 		streams:           make(map[uint32]*Stream),
 		nextStreamID:      1,
 		connectionWindow:  65535,
@@ -88,6 +89,8 @@ func NewManager() *Manager {
 		initialWindowSize: 65535,
 		headerTableSize:   4096, // RFC 7540 §6.5.2 default
 	}
+	m.hints = &m.ownHints
+	return m
 }
 
 // SetLocalMaxFrameSize records the SETTINGS_MAX_FRAME_SIZE we advertised to
@@ -830,11 +833,11 @@ func (m *Manager) ArmRequest(s *Stream, now int64) {
 	m.reqArmed.Add(1)
 	dl := now + int64(m.reqTimeout)
 	for {
-		cur := m.reqDL.Load()
+		cur := m.hints.ReqDL.Load()
 		if cur != 0 && cur <= dl {
 			return
 		}
-		if m.reqDL.CompareAndSwap(cur, dl) {
+		if m.hints.ReqDL.CompareAndSwap(cur, dl) {
 			return
 		}
 	}
@@ -873,7 +876,23 @@ func lowerCount32(c *atomic.Int32) {
 // NextRequestDeadline is the earliest deadline of an armed request, or 0 if none
 // is armed (or the hint is stale after a disarm: ExpiredRequests settles it).
 // One atomic load; the engines' sweep reads it for every h2 conn.
-func (m *Manager) NextRequestDeadline() int64 { return m.reqDL.Load() }
+func (m *Manager) NextRequestDeadline() int64 { return m.hints.ReqDL.Load() }
+
+// DeadlineHints are the words the engines' sweep reads for an h2 connection:
+// the earliest request deadline, the earliest end of an expired request's memory,
+// the deadline of the pending header block. One struct, so that the sweep's look
+// at a connection that has nothing due is one cache line (the conn layer embeds
+// it in H2State, beside the sweep's own state, and points the manager at it:
+// SetHints); a manager built alone (tests) uses its own. 0 means none.
+type DeadlineHints struct {
+	ReqDL  atomic.Int64
+	TombDL atomic.Int64
+	HdrDL  atomic.Int64
+}
+
+// SetHints points the manager (and the processor that owns it) at h, which the
+// conn layer keeps beside the sweep's state. Before the first frame.
+func (m *Manager) SetHints(h *DeadlineHints) { m.hints = h }
 
 // ExpiredRequests appends to out, up to its capacity, the IDs of the streams
 // whose request deadline has passed at now, and settles the hint to the earliest
@@ -907,6 +926,6 @@ func (m *Manager) ExpiredRequests(now int64, out []uint32) []uint32 {
 	if full {
 		next = now // due again at the next sweep
 	}
-	m.reqDL.Store(next)
+	m.hints.ReqDL.Store(next)
 	return out
 }

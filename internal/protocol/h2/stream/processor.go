@@ -268,14 +268,14 @@ type Processor struct {
 	resetOpen serverResets
 	// expiredReq remembers the requests whose deadline expired (ExpireRequest) and
 	// whose client has not ended them: id to the instant the entry runs out.
-	// Allocated on the first expiry. tombDL is the earliest of those instants.
+	// Allocated on the first expiry; the earliest of those instants is
+	// manager.hints.TombDL.
 	expiredReq map[uint32]int64
-	tombDL     atomic.Int64
 	// ignoredAct is set when a frame of a reset or expired stream was ignored.
 	ignoredAct atomic.Bool
-	// hdrTimeout and hdrDL are the header-block deadline (SetHeaderBlockTimeout).
+	// hdrTimeout is the header-block deadline (SetHeaderBlockTimeout); the pending
+	// block's instant is manager.hints.HdrDL.
 	hdrTimeout time.Duration
-	hdrDL      atomic.Int64
 
 	// OnHandlerGoexit, when set, is told that a stream's handler ended its
 	// goroutine with runtime.Goexit (celeris#889): the stream's id and the

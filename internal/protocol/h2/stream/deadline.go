@@ -88,11 +88,11 @@ func (p *Processor) ExpireRequest(id uint32, now int64) {
 
 func (p *Processor) noteTombstoneDeadline(until int64) {
 	for {
-		cur := p.tombDL.Load()
+		cur := p.manager.hints.TombDL.Load()
 		if cur != 0 && cur <= until {
 			return
 		}
-		if p.tombDL.CompareAndSwap(cur, until) {
+		if p.manager.hints.TombDL.CompareAndSwap(cur, until) {
 			return
 		}
 	}
@@ -111,7 +111,7 @@ func (p *Processor) dropOldestTombstone() {
 
 // NextTombstoneDeadline is the instant the first expired-request memory runs out,
 // or 0. An atomic load for the sweep.
-func (p *Processor) NextTombstoneDeadline() int64 { return p.tombDL.Load() }
+func (p *Processor) NextTombstoneDeadline() int64 { return p.manager.hints.TombDL.Load() }
 
 // DropTombstones forgets the expired requests whose memory has run out at now and
 // settles the hint. Loop thread, under H2State.mu.
@@ -126,7 +126,7 @@ func (p *Processor) DropTombstones(now int64) {
 			next = t
 		}
 	}
-	p.tombDL.Store(next)
+	p.manager.hints.TombDL.Store(next)
 }
 
 // ignoredFrame notes that a frame of a reset or expired stream was ignored: the
@@ -154,20 +154,20 @@ func (p *Processor) SetHeaderBlockTimeout(d time.Duration) { p.hdrTimeout = d }
 // (a HEADERS frame without END_HEADERS).
 func (p *Processor) armHeaderBlock() {
 	if p.hdrTimeout > 0 {
-		p.hdrDL.Store(time.Now().UnixNano() + int64(p.hdrTimeout))
+		p.manager.hints.HdrDL.Store(time.Now().UnixNano() + int64(p.hdrTimeout))
 	}
 }
 
 // disarmHeaderBlock ends it: the block is complete, or the connection is over.
 func (p *Processor) disarmHeaderBlock() {
-	if p.hdrDL.Load() != 0 {
-		p.hdrDL.Store(0)
+	if p.manager.hints.HdrDL.Load() != 0 {
+		p.manager.hints.HdrDL.Store(0)
 	}
 }
 
 // NextHeaderBlockDeadline is the instant the pending header block runs out of
 // time, or 0 if none is pending. An atomic load for the sweep.
-func (p *Processor) NextHeaderBlockDeadline() int64 { return p.hdrDL.Load() }
+func (p *Processor) NextHeaderBlockDeadline() int64 { return p.manager.hints.HdrDL.Load() }
 
 // ExpireHeaderBlock ends the connection whose header block was not completed in
 // time: GOAWAY(ENHANCE_YOUR_CALM), naming the last stream the server opened. The

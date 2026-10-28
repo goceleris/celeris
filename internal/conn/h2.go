@@ -521,6 +521,18 @@ func writeH2DataFragmented(buf *bytes.Buffer, streamID uint32, endStream bool, d
 // and has its own lifecycle hooks, so collapsing it into the parent would
 // invert the existing layering.
 type H2State struct {
+	// The sweep's state comes first, so that its look at a connection with nothing
+	// due is one cache line: the deadline hints (the manager and the processor
+	// write them, SetHints), the idle clock of a connection with no stream open
+	// (Sweep: d0Last is the last client stream ID the sweep saw, d0At when it last
+	// saw stream activity, d0Check when it last looked) and IdleTimeout. Loop
+	// thread only, from the sweep, except the hints' writers (under mu).
+	hints   stream.DeadlineHints
+	d0Check int64
+	d0At    int64
+	idleNs  int64
+	d0Last  uint32
+
 	initialized       bool
 	serverPrefaceSent bool // true if server SETTINGS already written (h2c upgrade path)
 	prefaceBuf        []byte
@@ -534,12 +546,6 @@ type H2State struct {
 	inlineAdapter     h2InlineResponseAdapter
 	writeQueue        h2ShardedQueue
 	cfg               H2Config // cached with defaults applied
-
-	// The idle clock of a connection with no stream open (Sweep, D0): d0Last is
-	// the last client stream ID the sweep saw and d0At when it last saw stream
-	// activity. Loop thread only, from the sweep; no lock.
-	d0Last uint32
-	d0At   int64
 }
 
 // SetRemoteAddr sets the remote address on the H2 stream manager so that
@@ -609,6 +615,8 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	// write queue, behind the stream's HEADERS (celeris#903).
 	proc.SetOutboundSink(s.adapter.sendDataFromLoop)
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
+	s.idleNs = int64(cfg.IdleTimeout)
+	proc.GetManager().SetHints(&s.hints)
 	proc.GetManager().SetRequestTimeout(cfg.ReadTimeout)
 	proc.SetHeaderBlockTimeout(cfg.ReadHeaderTimeout)
 	if lg := cfg.Logger; lg != nil {
@@ -1026,6 +1034,13 @@ func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {
 	}
 }
 
+// d0Interval is how often Sweep looks at the idle clock of a connection: the
+// clock is seconds long, and the look reads the manager's counters, which are
+// cache lines the sweep would otherwise not touch for a connection with nothing
+// due. A stream that opens and ends between two looks still shows: the last
+// client stream ID has moved.
+const d0Interval = int64(100 * time.Millisecond)
+
 // SweepResult is what H2State.Sweep did and what the engine owes the connection.
 type SweepResult struct {
 	// Wrote: frames were written (a 408 and a RST_STREAM, a GOAWAY); the engine
@@ -1065,27 +1080,28 @@ type SweepResult struct {
 // no frame). The connection's own clock (the last read) still closes a silent
 // connection at ReadTimeout or IdleTimeout, as before.
 func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
-	m := s.processor.GetManager()
-	p := s.processor
-	if s.cfg.IdleTimeout > 0 {
-		last := m.GetLastClientStreamID()
-		switch {
-		case last != s.d0Last || m.CountActiveStreams() > 0 || p.TakeIgnoredActivity():
+	h := &s.hints
+	if s.idleNs > 0 && now-s.d0Check >= d0Interval {
+		s.d0Check = now
+		m := s.processor.GetManager()
+		switch last := m.GetLastClientStreamID(); {
+		case last != s.d0Last || m.CountActiveStreams() > 0 || s.processor.TakeIgnoredActivity():
 			s.d0Last, s.d0At = last, now
 		case s.d0At == 0:
 			s.d0At = now
-		case now-s.d0At > int64(s.cfg.IdleTimeout):
+		case now-s.d0At > s.idleNs:
 			res.CloseNow = true
 		}
 	}
-	dl, hd, td := m.NextRequestDeadline(), p.NextHeaderBlockDeadline(), p.NextTombstoneDeadline()
-	if (dl == 0 || now < dl) && (hd == 0 || now < hd) && (td == 0 || now < td) {
+	dl, td, hd := h.ReqDL.Load(), h.TombDL.Load(), h.HdrDL.Load()
+	if (dl == 0 || now < dl) && (td == 0 || now < td) && (hd == 0 || now < hd) {
 		return res
 	}
 	if !s.mu.TryLock() {
 		return res
 	}
 	defer s.mu.Unlock()
+	m, p := s.processor.GetManager(), s.processor
 	if dl != 0 && now >= dl {
 		var ids [8]uint32
 		for _, id := range m.ExpiredRequests(now, ids[:0]) {
