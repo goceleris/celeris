@@ -420,8 +420,13 @@ type Config struct {
 	// connection it runs from the last stream activity while no stream is open
 	// (PING, SETTINGS and WINDOW_UPDATE frames do not move it) and is not
 	// applied while a stream the server owes an answer for is open; see
-	// ReadTimeout. On epoll, for a response parked on the socket, see
-	// WriteTimeout.
+	// ReadTimeout. A connection that still has output to send (in its buffers or
+	// the kernel's send queue) is not idle while the output goes out: the period
+	// restarts, and the connection is closed (GOAWAY with NO_ERROR, then the
+	// close; the end of the output may be lost) at the end of a period in which
+	// the bytes it holds did not go down, as a client that has stopped reading
+	// and one that pings faster than its round trip leave them. On epoll, for a
+	// response parked on the socket, see WriteTimeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts
