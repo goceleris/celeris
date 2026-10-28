@@ -978,9 +978,12 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 	return c.serveOpenFile(filePath, contentType, onOpen)
 }
 
-// openForServe opens the file serveOpenFile serves; a variable so that a test can
-// put another file under a path that was just stat-ed.
-var openForServe = os.Open
+// openForServe opens the file serveOpenFile serves: without blocking where the
+// platform has O_NONBLOCK, so that a FIFO swapped in for a regular file after the
+// stat does not wait in open(2) for a writer (the check on the open descriptor
+// then refuses it). A variable so that a test can put another file under a path
+// that was just stat-ed.
+var openForServe = openNonblock
 
 // serveOpenFile is serveFile for a path that was just stat-ed as a regular file
 // or a directory (fileFromDir): it checks the open descriptor again, which is
@@ -1056,15 +1059,13 @@ func (c *Context) serveOpenFile(filePath, contentType string, onOpen func(modTim
 		return err
 	}
 
-	// A regular file has a size, and it was capped above; the read is bounded by
-	// the cap all the same, for a file that grows meanwhile and for a
-	// pseudo-file the size of which is not its length.
-	data, err := io.ReadAll(io.LimitReader(f, int64(maxStreamBodySize)+1))
+	// The read is bounded by the size the open file reports (which the cap above
+	// bounded): a file that grows meanwhile is cut at the size its validators
+	// describe, and a pseudo-file of size 0 that has content (/proc/self/pagemap
+	// reads 100 MB) is served empty, as the sendfile path serves it.
+	data, err := io.ReadAll(io.LimitReader(f, size))
 	if err != nil {
 		return err
-	}
-	if len(data) > maxStreamBodySize {
-		return NewHTTPError(413, "file exceeds 100MB limit")
 	}
 	return c.Blob(200, contentType, data)
 }
@@ -1154,7 +1155,7 @@ func (c *Context) serveStaticFile(root, tail string) error {
 		return NewHTTPError(404, "Not Found")
 	}
 	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
-	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, fs.ErrNotExist) {
 		// a path to a hidden file is a 404 whether or not it exists, and so is a
 		// file that is not there (the raw lstat error was a 500)
 		return NewHTTPError(404, "Not Found")
@@ -1226,6 +1227,13 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		if info, err := fs.Stat(fsys, name); err == nil && notServable(info) {
 			return errNotRegular()
 		}
+	} else if rl, ok := fsys.(fs.ReadLinkFS); ok {
+		// an fs.Sub of an os.DirFS is no StatFS: look at where its links lead
+		if resolved, ok := ctxkit.ResolveFSLinks(rl, name); ok {
+			if info, err := rl.Lstat(resolved); err == nil && notServable(info) {
+				return errNotRegular()
+			}
+		}
 	}
 	f, err := fsys.Open(name)
 	if err != nil {
@@ -1262,12 +1270,9 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		}
 	}
 
-	data, err := io.ReadAll(io.LimitReader(f, int64(maxStreamBodySize)+1))
+	data, err := io.ReadAll(io.LimitReader(f, size))
 	if err != nil {
 		return err
-	}
-	if len(data) > maxStreamBodySize {
-		return NewHTTPError(413, "file exceeds 100MB limit")
 	}
 	return c.Blob(200, contentType, data)
 }

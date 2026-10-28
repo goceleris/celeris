@@ -48,7 +48,9 @@
 // set; Server.Static and Group.Static refuse it with no way to acknowledge, so
 // serve a filesystem root on purpose with this middleware. The Root is
 // resolved when New is called: a chdir after that is not covered, so resolve a
-// relative Root to an absolute path at startup. Devices, FIFOs and sockets are
+// relative Root to an absolute path at startup. The Root should exist then; a
+// Root that is or contains a symlink is followed at each request, so a later
+// retarget to "/" is not refused. Devices, FIFOs and sockets are
 // never served: they are answered as a missing file, since reading /dev/zero
 // never ends and opening a FIFO waits for a writer. Name the directory that holds
 // what is public; see [Config].Root.
@@ -64,7 +66,12 @@
 // is cleaned ("a/../.env" is ".env") and with one level of percent-decoding;
 // the name of the root does not: a Root that is ".config", or "." in such a
 // directory, serves its files. The rule also follows a symlink: a visible name
-// that leads to a hidden file or directory of the tree is refused like it. The
+// that leads to a hidden file or directory of the tree is refused like it. Under
+// a [Config].FS (an os.DirFS, or an fs.Sub of one) the links are followed while
+// they stay inside the FS; links that leave the FS (an absolute target, or one
+// that climbs above its root) are not followed under Ignore and Deny: such a
+// path is refused like a hidden one, because the FS cannot say what is beyond
+// it. The
 // exact segment ".well-known" is served (RFC 8615: ACME challenges,
 // security.txt, apple-app-site-association), but its children are served only
 // if they are not hidden themselves. A directory listing (Browse) leaves the

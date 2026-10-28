@@ -60,8 +60,12 @@ type Config struct {
 	// [Config].AllowFilesystemRoot is set: such a Root serves every file the
 	// process can read (/etc/passwd, /proc/self/environ, keys without a dot in
 	// their path), nothing is outside it, and the dotfile rule is no secrets
-	// filter. The check resolves the Root when New is called; a chdir after that
-	// is not covered, so resolve a relative Root to an absolute path at startup.
+	// filter. The refusal looks at the Root once, when New is called, and the Root
+	// should exist then (one that does not is not refused, and serves nothing
+	// until it does): a chdir after that is not covered, and neither is a Root
+	// that is or contains a symlink retargeted later, which is followed at each
+	// request (a "current" symlink of a deploy). Resolve a relative Root to an
+	// absolute path at startup.
 	// No released version served anything below such a Root, so no working
 	// deployment depends on it. Before v1.6.0 "." and "./" served nothing below
 	// the root either: a configuration that was inert since v1.3.3 starts to
@@ -126,8 +130,17 @@ type Config struct {
 	// names start with a dot. Only the segments of the request count: the name
 	// of Root, or of the directory Root "." is in, does not. A visible name that
 	// is a symlink to a hidden file or directory of the tree is refused like the
-	// hidden name (for an FS, when it can resolve symlinks: an [os.DirFS] can, as
-	// an [fs.ReadLinkFS]; an FS that is not one has none to follow). Browse leaves
+	// hidden name. For an FS this needs an FS that can read symlinks (an
+	// [fs.ReadLinkFS], as an [os.DirFS] and an [fs.Sub] of one are; an FS that is
+	// not one, an embed.FS, has none to follow), and the links are followed only
+	// while they stay inside the FS: under DotfilesIgnore and DotfilesDeny a link
+	// that leaves the FS (an absolute target, or one that climbs above its root),
+	// more than 8 links on a path (a loop included), or a walk of more than 256
+	// steps, is not followed and the path is refused like a hidden one, because
+	// the FS cannot say what is beyond it (an os.DirFS lets the operating system
+	// follow it); DotfilesAllow follows them all, as before. An FS that is neither
+	// an [fs.StatFS] nor an [fs.ReadLinkFS] is opened as it is: a FIFO in it
+	// blocks the request. Browse leaves
 	// hidden entries out of a listing. The Index file
 	// is the operator's choice and is served even if its name starts with a dot.
 	//
@@ -147,7 +160,17 @@ type Config struct {
 	// reaching it, a symlink to "/", a drive root such as C:\ on Windows). It
 	// is refused at New, with a panic that names the resolved path, unless this
 	// is true: such a Root serves every file the process can read below it, and
-	// nothing is outside it any more. Default: false.
+	// nothing is outside it any more. A filesystem root also serves /proc and
+	// /sys: their regular files (/proc/self/environ, /proc/self/status) are
+	// served, those that report a size of 0 as an empty body. Default: false.
+	//
+	// Not every way to reach a filesystem root is refused: an FS
+	// ([os.DirFS]("/"), or os.DirFS(".") in a working directory of "/") has no
+	// root to check, [celeris.Context.FileFromDir] with a base of "/" is an
+	// explicit call whose caller chooses the path, a Root that is retargeted
+	// after New (a symlink swapped to "/", a chdir) is not looked at again, and
+	// a bind mount of "/" under another path looks like any directory. They are
+	// unprotected by design; serve a directory.
 	AllowFilesystemRoot bool
 }
 

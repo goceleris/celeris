@@ -495,52 +495,6 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cache
 	return false, nil
 }
 
-// resolveFSLinks returns name, a slash path below the FS root, with every
-// symlink on it replaced by its target, as the operating system would walk it:
-// the path the file is really at, for the hidden check. A link whose target is
-// absolute leaves the FS: the result is then the target, with the rest of the
-// path after it, and its own segments are what counts. A path that climbs above
-// the FS root keeps its "..", which the check cleans away. More than 40 links
-// on the way (a loop) resolve to a hidden path: refused.
-func resolveFSLinks(rl fs.ReadLinkFS, name string) string {
-	queue := strings.Split(name, "/")
-	var resolved []string
-	for follows := 0; len(queue) > 0; {
-		seg := queue[0]
-		queue = queue[1:]
-		switch seg {
-		case "", ".":
-			continue
-		case "..":
-			if n := len(resolved); n > 0 && resolved[n-1] != ".." {
-				resolved = resolved[:n-1]
-			} else {
-				resolved = append(resolved, "..")
-			}
-			continue
-		}
-		cand := strings.Join(append(resolved, seg), "/")
-		fi, err := rl.Lstat(cand)
-		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
-			resolved = append(resolved, seg)
-			continue
-		}
-		if follows++; follows > 40 {
-			return ".loop"
-		}
-		target, err := rl.ReadLink(cand)
-		if err != nil {
-			return ".unreadable-link"
-		}
-		target = filepath.ToSlash(target)
-		if strings.HasPrefix(target, "/") || filepath.IsAbs(target) {
-			return target + "/" + strings.Join(queue, "/")
-		}
-		queue = append(strings.Split(target, "/"), queue...)
-	}
-	return strings.Join(resolved, "/")
-}
-
 // serveFS serves a file from an fs.FS with ETag/Last-Modified and range support.
 func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, cacheControl string, cache *sync.Map, hidden func(rel string) bool) error {
 	// 1. Open + stat + directory handling.
@@ -553,13 +507,26 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	// a visible name that links to a hidden file or directory is refused like
 	// the hidden name (an FS that cannot, an embed.FS or an fstest.MapFS
 	// without links, has none to follow).
-	if hidden != nil && filePath != "" {
-		if rl, ok := fsys.(fs.ReadLinkFS); ok && hidden(resolveFSLinks(rl, filePath)) {
+	//
+	// A link that leaves the FS (an absolute target, or one that climbs above the
+	// FS root) is not followed: the FS cannot say what is beyond it, and an
+	// os.DirFS lets the OS follow it, so the path is refused as hidden.
+	_, isStat := fsys.(fs.StatFS)
+	if rl, ok := fsys.(fs.ReadLinkFS); ok && filePath != "" && (hidden != nil || !isStat) {
+		resolved, ok := ctxkit.ResolveFSLinks(rl, filePath)
+		if hidden != nil && (!ok || hidden(resolved)) {
 			return ctxkit.ErrHidden
+		}
+		// Before the open, for an FS that is no StatFS (an fs.Sub of an os.DirFS):
+		// open(2) of a FIFO waits for a writer.
+		if !isStat && ok {
+			if fi, err := rl.Lstat(resolved); err == nil && !fi.IsDir() && !fi.Mode().IsRegular() {
+				return ctxkit.ErrNotRegular
+			}
 		}
 	}
 	// Before the open: for an os.DirFS, open(2) of a FIFO waits for a writer.
-	if _, ok := fsys.(fs.StatFS); ok {
+	if isStat {
 		if info, err := fs.Stat(fsys, openPath); err == nil && !info.IsDir() && !info.Mode().IsRegular() {
 			return ctxkit.ErrNotRegular
 		}
@@ -744,9 +711,12 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath, cacheControl
 		}
 		compPath := filePath + v.suffix
 		if hidden != nil {
-			// a variant that is a symlink to a hidden file is no variant
-			if rl, ok := fsys.(fs.ReadLinkFS); ok && hidden(resolveFSLinks(rl, compPath)) {
-				continue
+			// a variant that is a symlink to a hidden file, or that leaves the FS,
+			// is no variant
+			if rl, ok := fsys.(fs.ReadLinkFS); ok {
+				if resolved, ok := ctxkit.ResolveFSLinks(rl, compPath); !ok || hidden(resolved) {
+					continue
+				}
 			}
 		}
 		if _, ok := fsys.(fs.StatFS); ok {

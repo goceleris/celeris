@@ -30,6 +30,12 @@ func TestDotfilesDirFS888(t *testing.T) {
 				continue
 			}
 			weird := strings.Contains(tc.path, "..") || strings.Contains(tc.path, "/./") || strings.Contains(tc.path, "//")
+			// a link with an absolute target leaves the FS, which cannot vouch for what
+			// is beyond it: refused even when the target is a visible file
+			tc := tc
+			if tc.path == "/ok-abs" {
+				tc.hidden = true
+			}
 			t.Run(fmt.Sprintf("policy%d/%q", pol, tc.path), func(t *testing.T) {
 				rec, err := get888(t, mw, tc.path)
 				status := rec.StatusCode
