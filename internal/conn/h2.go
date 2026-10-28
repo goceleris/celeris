@@ -78,6 +78,11 @@ type H2Config struct {
 	// with its first HEADERS frame and is not complete this long after it ends the
 	// connection with GOAWAY(ENHANCE_YOUR_CALM) (celeris#889). 0 = no deadline.
 	ReadHeaderTimeout time.Duration
+	// IdleTimeout is the idle clock of a connection with no stream open: it runs
+	// from the last stream activity the sweep saw, and a PING, a SETTINGS or a
+	// connection WINDOW_UPDATE does not move it, as net/http's idle timer, which
+	// no frame touches, does not (celeris#889). 0 = off.
+	IdleTimeout time.Duration
 	// Logger, when set, receives an Error record for each panic that escapes
 	// an HTTP/2 stream's handler (the celeris router answers a handler's
 	// panic with a 500 first, so this is a panic out of the router itself or
@@ -529,6 +534,12 @@ type H2State struct {
 	inlineAdapter     h2InlineResponseAdapter
 	writeQueue        h2ShardedQueue
 	cfg               H2Config // cached with defaults applied
+
+	// The idle clock of a connection with no stream open (Sweep, D0): d0Last is
+	// the last client stream ID the sweep saw and d0At when it last saw stream
+	// activity. Loop thread only, from the sweep; no lock.
+	d0Last uint32
+	d0At   int64
 }
 
 // SetRemoteAddr sets the remote address on the H2 stream manager so that
@@ -1025,6 +1036,9 @@ type SweepResult struct {
 	// CloseAfterFlush: a GOAWAY ended the connection (a header block that was not
 	// completed in time); the engine closes it once what was written has gone out.
 	CloseAfterFlush bool
+	// CloseNow: the connection has been idle for IdleTimeout with no stream open
+	// and nothing to flush.
+	CloseNow bool
 }
 
 // Sweep is the engines' per-connection look at the deadlines of the HTTP/2
@@ -1040,10 +1054,30 @@ type SweepResult struct {
 //     (the tombstone: its DATA in flight is ignored and credited, never a
 //     connection error);
 //   - a header block that was not completed in time: GOAWAY(ENHANCE_YOUR_CALM)
-//     and CloseAfterFlush.
+//     and CloseAfterFlush;
+//   - the idle clock of a connection with no stream open (D0): see below.
+//
+// Idle clock. IdleTimeout, for a connection with no stream open, runs from the
+// last stream activity this sweep saw (a new client stream, a stream open, a frame
+// ignored for a stream the server reset): a PING, a SETTINGS or a connection
+// WINDOW_UPDATE does not move it, so a client that only pings holds a bare
+// connection for IdleTimeout, not for ever (net/http's idle timer is touched by
+// no frame). The connection's own clock (the last read) still closes a silent
+// connection at ReadTimeout or IdleTimeout, as before.
 func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 	m := s.processor.GetManager()
 	p := s.processor
+	if s.cfg.IdleTimeout > 0 {
+		last := m.GetLastClientStreamID()
+		switch {
+		case last != s.d0Last || m.CountActiveStreams() > 0 || p.TakeIgnoredActivity():
+			s.d0Last, s.d0At = last, now
+		case s.d0At == 0:
+			s.d0At = now
+		case now-s.d0At > int64(s.cfg.IdleTimeout):
+			res.CloseNow = true
+		}
+	}
 	dl, hd, td := m.NextRequestDeadline(), p.NextHeaderBlockDeadline(), p.NextTombstoneDeadline()
 	if (dl == 0 || now < dl) && (hd == 0 || now < hd) && (td == 0 || now < td) {
 		return res
@@ -1070,6 +1104,7 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 		flushOutBuf(&s.outBuf, write)
 		s.DrainWriteQueue(write)
 		res.Wrote = true
+		res.CloseNow = false
 	}
 	return res
 }

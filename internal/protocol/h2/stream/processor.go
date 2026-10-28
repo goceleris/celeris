@@ -271,6 +271,8 @@ type Processor struct {
 	// Allocated on the first expiry. tombDL is the earliest of those instants.
 	expiredReq map[uint32]int64
 	tombDL     atomic.Int64
+	// ignoredAct is set when a frame of a reset or expired stream was ignored.
+	ignoredAct atomic.Bool
 	// hdrTimeout and hdrDL are the header-block deadline (SetHeaderBlockTimeout).
 	hdrTimeout time.Duration
 	hdrDL      atomic.Int64
@@ -1697,6 +1699,7 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 			// decode: the connection ends, before the block is read.
 			p.clearResetOpen(id)
 			p.forgetExpired(id)
+			p.ignoredFrame()
 			if !endStream {
 				return nil, admitRefused, p.GoAwayErr(m.GetLastStreamID(), http2.ErrCodeProtocol, []byte("trailers without END_STREAM"),
 					fmt.Errorf("HEADERS frame without END_STREAM after the request on stream %d, which the server reset", id))
@@ -1963,6 +1966,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 			if err := p.countEmptyData(f); err != nil {
 				return err
 			}
+			p.ignoredFrame()
 			if f.Header().Length > 0 { // nothing to credit for a frame of length 0: no lock, no map range
 				p.manager.AccumulateWindowUpdate(0, f.Header().Length)
 				p.manager.FlushWindowUpdates(p.writer, false)

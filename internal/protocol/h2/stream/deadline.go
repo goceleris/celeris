@@ -129,6 +129,21 @@ func (p *Processor) DropTombstones(now int64) {
 	p.tombDL.Store(next)
 }
 
+// ignoredFrame notes that a frame of a reset or expired stream was ignored: the
+// client is still talking about its streams, which the connection's idle clock
+// counts as activity (conn.H2State.Sweep). A cold path.
+func (p *Processor) ignoredFrame() { p.ignoredAct.Store(true) }
+
+// TakeIgnoredActivity reports, and clears, whether a frame was ignored for a
+// reset or expired stream since the last call.
+func (p *Processor) TakeIgnoredActivity() bool {
+	if !p.ignoredAct.Load() {
+		return false
+	}
+	p.ignoredAct.Store(false)
+	return true
+}
+
 // SetHeaderBlockTimeout sets the deadline of a header block (the server's
 // ReadHeaderTimeout): ReadHeaderTimeout after the first HEADERS frame of a block
 // that does not end with it, the connection ends with GOAWAY(ENHANCE_YOUR_CALM).

@@ -420,6 +420,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			WriteTimeout:         cfg.WriteTimeout,
 			ReadTimeout:          cfg.ReadTimeout,
 			ReadHeaderTimeout:    cfg.ReadHeaderTimeout,
+			IdleTimeout:          cfg.IdleTimeout,
 			Logger:               cfg.Logger,
 		},
 		async: cfg.AsyncHandlers,
@@ -4819,6 +4820,8 @@ func (l *Loop) sweepH2Deadlines(now int64) {
 		switch {
 		case res.CloseAfterFlush:
 			l.closeWhenFlushed(cs)
+		case res.CloseNow:
+			l.closeConn(cs.fd)
 		case res.Wrote:
 			// Sent now, not left to the dirty pass: the scan below may close a
 			// silent conn in this very sweep, and a close does not wait for

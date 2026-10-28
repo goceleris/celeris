@@ -163,6 +163,9 @@ func TestExpireRequestAnswers408AndRemembersTheStream889(t *testing.T) {
 	if err := p.ProcessFrame(ctx, makeDataFrame(t, 1, false, []byte("late"))); err != nil {
 		t.Fatalf("DATA on an expired request ended the connection: %v", err)
 	}
+	if !p.TakeIgnoredActivity() {
+		t.Fatal("an ignored DATA frame is not counted as activity")
+	}
 	trailers := makeHeadersFrame(t, 1, true, true, encodeHeaders(t, [][2]string{{"x-t", "1"}}))
 	if err := p.ProcessFrame(ctx, trailers); err != nil {
 		t.Fatalf("trailers on an expired request ended the connection: %v", err)

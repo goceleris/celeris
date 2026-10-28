@@ -1362,6 +1362,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 			WriteTimeout:         cfg.WriteTimeout,
 			ReadTimeout:          cfg.ReadTimeout,
 			ReadHeaderTimeout:    cfg.ReadHeaderTimeout,
+			IdleTimeout:          cfg.IdleTimeout,
 			Logger:               cfg.Logger,
 		},
 		sockOpts: sockopts.Options{
@@ -6527,6 +6528,8 @@ func (w *Worker) sweepH2Deadlines(now int64) {
 				w.markDirty(cs)
 			}
 			w.closeConn(cs.fd) // sends what was staged first
+		case res.CloseNow:
+			w.closeConn(cs.fd)
 		case res.Wrote:
 			if w.flushSend(cs) {
 				w.markDirty(cs)
