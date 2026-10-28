@@ -81,7 +81,12 @@ func (p *Processor) ExpireRequest(id uint32, now int64) {
 	p.noteTombstoneDeadline(until)
 	p.resetIDs.mark(id)
 	if p.connWriter != nil {
-		p.connWriter.MarkStreamClosed(id) // as sendRSTStreamAndMarkClosed does: nothing queued for it may follow the reset
+		// As sendRSTStreamAndMarkClosed does, for a writer that records closed
+		// streams; the engines' adapters of today keep no such record (their
+		// MarkStreamClosed is empty), so this is a no-op there, and what keeps a
+		// late write for the stream from following the reset is the stream's
+		// removal from the manager just below.
+		p.connWriter.MarkStreamClosed(id)
 	}
 	if err := p.writer.WriteRSTStream(id, http2.ErrCodeNo); err == nil {
 		p.flush()
