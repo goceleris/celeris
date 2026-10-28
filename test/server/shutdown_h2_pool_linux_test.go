@@ -1142,11 +1142,18 @@ func TestShutdownPoolWaitGateClosesIdleH1AndEndsDetached885(t *testing.T) {
 	}
 }
 
+// The HTTP/2 conns that hold the pool wait of the test below: h2Big1104 asking
+// for 16 MiB and the rest for 512 KiB.
+const (
+	h2Conns1104 = 64
+	h2Big1104   = 24
+)
+
 // TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885 pins what the pool
 // wait's gate does to the HTTP/1 conns it stops reading, on a loop with no Async
 // route (the default, synchronous one) and on one that has an Async route (a
-// dispatch goroutine for the conns it promotes), with the wait held by 24 HTTP/2
-// responses of 16 MiB that nobody gives window to (celeris#885 item 49, Opus
+// dispatch goroutine for the conns it promotes), with the wait held by HTTP/2
+// responses (24 of 16 MiB and 40 of 512 KiB) that nobody gives window to (celeris#885 item 49, Opus
 // review r2):
 //
 //   - an idle keep-alive conn, and one that was accepted and has sent nothing
@@ -1168,8 +1175,10 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 	for _, arm := range []string{"sync", "async-route"} {
 		t.Run(arm, func(t *testing.T) {
 			big := strings.Repeat("y", 16<<20)
+			hold := big[:512<<10] // more than a stream's initial window: it holds the wait as /big does
 			srv := startH2PoolServer759(t, celeris.Epoll, 20*time.Second, func(s *celeris.Server) {
 				s.GET("/big", func(c *celeris.Context) error { return c.String(http.StatusOK, "%s", big) })
+				s.GET("/hold", func(c *celeris.Context) error { return c.String(http.StatusOK, "%s", hold) })
 				s.POST("/up", func(c *celeris.Context) error { return c.String(http.StatusOK, "got %d", len(c.Body())) })
 				if arm == "async-route" {
 					s.GET("/aping", func(c *celeris.Context) error { return c.String(http.StatusOK, "a") }).Async()
@@ -1179,12 +1188,24 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			// probe of startH2PoolServer759 (its keep-alive conn stays open in the
 			// default transport's pool, and it polled /ping one or more times).
 			base := settledEngineMetrics1104(srv)
-			// The wait is held: GET /big on 24 HTTP/2 conns, no WINDOW_UPDATE.
+			// The wait is held: GET /big on 24 HTTP/2 conns, and GET /hold on 40 more,
+			// no WINDOW_UPDATE. The gate belongs to a loop that waits for HTTP/2
+			// conns; a loop with none shuts down at once and does neither (it cuts a
+			// request in progress and the conn of an Async route as it cuts any, and
+			// used to hold its idle conns behind another conn's send drain:
+			// celeris#1104). The server has one loop per CPU and the kernel spreads
+			// the conns over them by their addresses, so the HTTP/2 conns are many
+			// enough that no loop is left without one: 4 loops, (3/4)^64 each, and
+			// 16 loops (15/16)^64 each, 16 of them: 0.3%.
 			var h2conns []net.Conn
-			for range 24 {
+			for i := range h2Conns1104 {
 				c, fr := dialH2759(t, srv.addr)
 				h2conns = append(h2conns, c)
-				writeH2Get759(t, fr, 1, "/big")
+				path := "/big"
+				if i >= h2Big1104 {
+					path = "/hold"
+				}
+				writeH2Get759(t, fr, 1, path)
 			}
 			time.Sleep(300 * time.Millisecond)
 
@@ -1198,7 +1219,7 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 				if _, err := io.WriteString(c, "GET "+path+" HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 					t.Fatal(err)
 				}
-				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second)) // 24 HTTP/2 conns of 16 MiB are running under -race
+				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second)) // 64 HTTP/2 conns are running under -race
 				resp, err := http.ReadResponse(br, nil)
 				if err != nil {
 					t.Fatalf("%s before the shutdown: %v", path, err)
@@ -1261,12 +1282,12 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			// The gate's first pass runs 250 ms after the shutdown began, and a
 			// conn the loop has accepted but not read yet, or a request whose
 			// bytes it has not read, is closed by it as idle (the loop of a runner
-			// busy with 24 HTTP/2 downloads under -race and -cover can be that far
+			// busy with the HTTP/2 downloads under -race and -cover can be that far
 			// behind: celeris#1104). So begin only once the engine counts, on top
 			// of the baseline taken before the first dial, every conn this test
-			// opened (24 HTTP/2, the keep-alive ones, the silent ones, the download,
+			// opened (the HTTP/2 ones, the keep-alive ones, the silent ones, the download,
 			// the upload on the sync arm, the promoted conn on the async arm) and
-			// every request it sent (24 HTTP/2 GETs, one ping per keep-alive conn,
+			// every request it sent (the HTTP/2 GETs, one ping per keep-alive conn,
 			// the download's GET, and on the sync arm the upload, which the loop
 			// counts once it has read its headers and first 64 KiB, or on the
 			// async arm the promoted conn's ping). The conn count is exact: +34 in
@@ -1276,8 +1297,8 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			// keep-alive step, before the download and the upload are sent, so it is
 			// neither of them; its source was not found, which is why this wait is
 			// `>=` for requests and exact for conns.
-			wantConns := uint64(24 + len(idle) + len(silent) + 1) // + the download
-			wantReqs := uint64(24 + len(idle) + 1)                // + the download's GET
+			wantConns := uint64(h2Conns1104 + len(idle) + len(silent) + 1) // + the download
+			wantReqs := uint64(h2Conns1104 + len(idle) + 1)                // + the download's GET
 			if arm == "sync" {
 				wantConns++ // the upload
 				wantReqs++  // the upload's request, counted when its first bytes are read
@@ -1291,17 +1312,31 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			begin := time.Now()
 			srv.beginShutdown("Shutdown", 20*time.Second)
 
+			// Every conn is read at the same time, so that each one's wait for
+			// its FIN is its own: read one after the other, the first conn that
+			// timed out left the others a deadline already past, and Go's read
+			// of a conn whose deadline has passed fails before it looks at the
+			// socket, FIN or not: one late conn was reported as five.
+			type finResult struct {
+				name string
+				err  error
+				at   time.Duration
+			}
+			var finWG sync.WaitGroup
+			finRes := make(chan finResult, len(idle)+len(silent))
 			expectFIN := func(name string, c net.Conn, br *bufio.Reader) {
-				_ = c.SetReadDeadline(begin.Add(1500 * time.Millisecond))
-				var err error
-				if br != nil {
-					_, err = br.ReadByte()
-				} else {
-					_, err = c.Read(make([]byte, 1))
-				}
-				if err != io.EOF {
-					t.Errorf("%s: read %v at %v, want a FIN (io.EOF) once the gate has passed (celeris#885 item 49)", name, err, time.Since(begin).Round(time.Millisecond))
-				}
+				finWG.Add(1)
+				go func() {
+					defer finWG.Done()
+					_ = c.SetReadDeadline(begin.Add(1500 * time.Millisecond))
+					var err error
+					if br != nil {
+						_, err = br.ReadByte()
+					} else {
+						_, err = c.Read(make([]byte, 1))
+					}
+					finRes <- finResult{name, err, time.Since(begin)}
+				}()
 			}
 			for i, c := range idle {
 				expectFIN("idle keep-alive "+strconv.Itoa(i), c, idleBr[i])
@@ -1309,6 +1344,17 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			for i, c := range silent {
 				expectFIN("connection with no byte sent "+strconv.Itoa(i), c, nil)
 			}
+			finWG.Wait()
+			close(finRes)
+			var latest time.Duration
+			for r := range finRes {
+				if r.err != io.EOF {
+					t.Errorf("%s: read %v at %v, want a FIN (io.EOF) once the gate has passed (celeris#885 item 49)", r.name, r.err, r.at.Round(time.Millisecond))
+				} else if r.at > latest {
+					latest = r.at
+				}
+			}
+			t.Logf("the last of the %d idle and silent conns had its FIN %v into the shutdown", len(idle)+len(silent), latest.Round(time.Millisecond))
 			if promoted != nil {
 				_ = promoted.SetReadDeadline(begin.Add(2 * time.Second))
 				if _, err := promotedBr.ReadByte(); err == nil {
