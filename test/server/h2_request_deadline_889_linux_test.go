@@ -537,3 +537,56 @@ func TestH2SilentUnfinishedRequestEndsTheConnWithTheReset889(t *testing.T) {
 		})
 	}
 }
+
+// TestH2BurstOfExpiriesIsAnsweredInOneSweep889: 100 POSTs opened at once (the
+// default MAX_CONCURRENT_STREAMS) and never finished expire together; every one is
+// answered 408 and reset in the same sweep, not eight per sweep (the last of the
+// hundred was 1.2 s late on io_uring and 0.3 s on epoll). The client answers
+// each reset as an aborting client does, with a DATA and RST_STREAM(CANCEL): no
+// GOAWAY, the conn serves the next request.
+func TestH2BurstOfExpiriesIsAnsweredInOneSweep889(t *testing.T) {
+	for _, e := range nativeEngines889() {
+		t.Run(e.name, func(t *testing.T) {
+			t.Parallel()
+			c := dialH2raw889(t, rdServer889(t, e.eng, nil), h2dial889{})
+			const n = 100
+			for i := range n {
+				c.request(uint32(1+2*i), "POST", "/upload889", false, true)
+			}
+			t0 := c.t0
+			stop := c.pingEvery889(300 * time.Millisecond) // the client is not silent
+			var first, last time.Duration
+			seen := map[uint32]bool{}
+			_ = c.conn.SetReadDeadline(t0.Add(6 * time.Second))
+			for len(seen) < n {
+				f, err := c.fr.ReadFrame()
+				if err != nil {
+					stop()
+					t.Fatalf("after %d of %d resets: %v", len(seen), n, err)
+				}
+				switch f := f.(type) {
+				case *http2.RSTStreamFrame:
+					if f.ErrCode != http2.ErrCodeNo {
+						stop()
+						t.Fatalf("stream %d reset with %v, want NO_ERROR", f.StreamID, f.ErrCode)
+					}
+					at := time.Since(t0)
+					if len(seen) == 0 {
+						first = at
+					}
+					last = at
+					seen[f.StreamID] = true
+				case *http2.GoAwayFrame:
+					stop()
+					t.Fatalf("GOAWAY %v after %d resets", f.ErrCode, len(seen))
+				}
+			}
+			stop()
+			t.Logf("RD889 burst engine=%s: %d resets between %v and %v", e.name, len(seen), first.Round(time.Millisecond), last.Round(time.Millisecond))
+			if last-first > 150*time.Millisecond {
+				t.Fatalf("the resets spread over %v (first %v, last %v), want one sweep's worth", (last - first).Round(time.Millisecond), first.Round(time.Millisecond), last.Round(time.Millisecond))
+			}
+			c.serves889(uint32(1 + 2*n))
+		})
+	}
+}
