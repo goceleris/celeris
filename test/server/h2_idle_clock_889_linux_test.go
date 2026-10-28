@@ -147,9 +147,12 @@ func TestH2ExpiredRequestThenPingOnlyIsClosedAtIdleTimeout889(t *testing.T) {
 }
 
 // TestH2UploaderStillSendingAfterTheResetKeepsTheConn889: the slow uploader's DATA
-// for the stream the server reset is ignored, and it is activity: with
-// IdleTimeout 1 s a conn with no stream open and an uploader that goes on for
-// 3 s after the reset is not closed.
+// for the stream the server reset is ignored, and it is activity for as long as
+// the expired request is remembered (2 x ReadTimeout from the expiry: the
+// tombstone; a frame for any other reset stream is not activity, review r5 F2):
+// with IdleTimeout 1 s a conn with no stream open and an uploader that goes on
+// for 1.7 s after the reset (more than IdleTimeout, less than the tombstone's
+// second) is not closed.
 func TestH2UploaderStillSendingAfterTheResetKeepsTheConn889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		t.Run(e.name, func(t *testing.T) {
@@ -161,7 +164,7 @@ func TestH2UploaderStillSendingAfterTheResetKeepsTheConn889(t *testing.T) {
 			ev := c.await889(1, 4*time.Second)
 			wantReset889(t, ev, 900*time.Millisecond, 2500*time.Millisecond)
 			c.t0 = time.Now()
-			at, closed := c.closedAfter889(3 * time.Second)
+			at, closed := c.closedAfter889(1700 * time.Millisecond)
 			if closed {
 				t.Fatalf("the conn was closed at %v while the uploader was still sending DATA for its reset stream", at.Round(time.Millisecond))
 			}
