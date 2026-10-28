@@ -1041,6 +1041,12 @@ func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {
 // client stream ID has moved.
 const d0Interval = int64(100 * time.Millisecond)
 
+// expireBudget is how long one sweep spends answering expired requests: a
+// request costs a few microseconds (a 408 and a RST_STREAM), so this is a few
+// hundred of them, more than any default MAX_CONCURRENT_STREAMS, and a stall of
+// the loop that long only a burst of that size causes.
+const expireBudget = 2 * time.Millisecond
+
 // SweepResult is what H2State.Sweep did and what the engine owes the connection.
 type SweepResult struct {
 	// Wrote: frames were written (a 408 and a RST_STREAM, a GOAWAY); the engine
@@ -1051,8 +1057,11 @@ type SweepResult struct {
 	// CloseAfterFlush: a GOAWAY ended the connection (a header block that was not
 	// completed in time); the engine closes it once what was written has gone out.
 	CloseAfterFlush bool
-	// CloseNow: the connection has been idle for IdleTimeout with no stream open
-	// and nothing to flush.
+	// CloseNow: the connection has been idle for IdleTimeout with no stream open.
+	// A proposal: the engine closes it only if it has nothing left to send, in
+	// its buffers or in the kernel's send queue (a close with unread frames of the
+	// peer in the receive queue is a reset, which discards the send queue), and
+	// otherwise calls ExtendIdle: a conn still sending is not idle.
 	CloseNow bool
 }
 
@@ -1103,10 +1112,22 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 	defer s.mu.Unlock()
 	m, p := s.processor.GetManager(), s.processor
 	if dl != 0 && now >= dl {
-		var ids [8]uint32
-		for _, id := range m.ExpiredRequests(now, ids[:0]) {
-			p.ExpireRequest(id, now)
-			res.Expired++
+		// Every request that is due is answered in this sweep, in batches of 32
+		// under a time budget (a burst of MaxConcurrentStreams at once is one
+		// request deadline's worth, and the last of them used to wait for a
+		// sweep per 8: 1.2 s late on io_uring). A batch that fills leaves the
+		// hint due, so what the budget cuts off is the next sweep's.
+		var ids [32]uint32
+		began := time.Now()
+		for {
+			got := m.ExpiredRequests(now, ids[:0])
+			for _, id := range got {
+				p.ExpireRequest(id, now)
+				res.Expired++
+			}
+			if len(got) < len(ids) || time.Since(began) > expireBudget {
+				break
+			}
 		}
 	}
 	if td != 0 && now >= td {
@@ -1123,4 +1144,29 @@ func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
 		res.CloseNow = false
 	}
 	return res
+}
+
+// ExtendIdle restarts the idle period of the connection at now: the engine found
+// it still had output to send when Sweep proposed to close it as idle (CloseNow),
+// and a conn that is sending is not idle: IdleTimeout runs again from here, once
+// the output has gone. Loop thread, from the sweep.
+func (s *H2State) ExtendIdle(now int64) { s.d0At = now }
+
+// GoAwayNoWait is GoAway for a close the engine is about to make (the idle
+// close of Sweep): GOAWAY(NO_ERROR) naming the last client stream, so that the
+// client does not take a request it sent in the last instant as processed, and
+// does not wait for it. Best effort: it takes H2State.mu with TryLock (a held
+// lock means the conn is not idle) and reports whether the GOAWAY was written to
+// write; the caller flushes it and closes.
+func (s *H2State) GoAwayNoWait(write func([]byte)) bool {
+	if !s.mu.TryLock() {
+		return false
+	}
+	defer s.mu.Unlock()
+	if !s.serverPrefaceSent {
+		return false
+	}
+	_ = s.processor.SendGoAway(s.processor.GetManager().GetLastClientStreamID(), http2.ErrCodeNo, nil)
+	flushOutBuf(&s.outBuf, write)
+	return true
 }

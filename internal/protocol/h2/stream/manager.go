@@ -23,7 +23,6 @@ type Manager struct {
 	initialWindowSize       uint32
 	activeStreams           atomic.Uint32
 	requestOpen             atomic.Uint32
-	reqArmed                atomic.Int32
 	hints                   *DeadlineHints
 	ownHints                DeadlineHints
 	reqTimeout              time.Duration
@@ -819,9 +818,9 @@ func (m *Manager) RequestTimeout() time.Duration { return m.reqTimeout }
 // frame without END_STREAM, at now (nanoseconds, wall clock). Absolute: it is
 // not moved by the stream's DATA or by anything else. The instant is kept in
 // s.StartTimeNs, unused on HTTP/2 (the engines' cache of a recv's clock, which
-// only HTTP/1 fills), and the flag marks that it is there; the manager counts
-// the armed streams and keeps the earliest deadline as a hint the engines' sweep
-// reads with one atomic load. No allocation, no lock: it runs on the loop thread
+// only HTTP/1 fills), and the flag marks that it is there; the manager keeps
+// the earliest deadline as a hint the engines' sweep reads with one atomic load
+// (the armed streams are found by walking the map when it is due). No allocation, no lock: it runs on the loop thread
 // under H2State.mu, and the request has no handler yet (the handler runs once the
 // request is whole). A request whole at its HEADERS never gets here.
 func (m *Manager) ArmRequest(s *Stream, now int64) {
@@ -830,7 +829,6 @@ func (m *Manager) ArmRequest(s *Stream, now int64) {
 	}
 	s.StartTimeNs = now
 	s.flags.Or(flagReqDeadline)
-	m.reqArmed.Add(1)
 	dl := now + int64(m.reqTimeout)
 	for {
 		cur := m.hints.ReqDL.Load()
@@ -854,24 +852,11 @@ func (m *Manager) DisarmRequest(s *Stream) {
 	}
 	s.StartTimeNs = 0
 	s.flags.And(^flagReqDeadline)
-	lowerCount32(&m.reqArmed)
 }
 
 // disarmRequestLocked is DisarmRequest for a stream leaving the map (takeLocked,
 // handleGoAway), with m.mu held.
 func (m *Manager) disarmRequestLocked(s *Stream) { m.DisarmRequest(s) }
-
-func lowerCount32(c *atomic.Int32) {
-	for {
-		old := c.Load()
-		if old <= 0 {
-			return
-		}
-		if c.CompareAndSwap(old, old-1) {
-			return
-		}
-	}
-}
 
 // NextRequestDeadline is the earliest deadline of an armed request, or 0 if none
 // is armed (or the hint is stale after a disarm: ExpiredRequests settles it).

@@ -2287,6 +2287,10 @@ func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 		return nil
 	}
 	if f.StreamID <= p.manager.GetLastClientStreamID() {
+		// A client that gives up on a stream the server reset (an expired
+		// request) ends it: nothing more is to come on it.
+		p.forgetExpired(f.StreamID)
+		p.clearResetOpen(f.StreamID)
 		return nil
 	}
 	return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,

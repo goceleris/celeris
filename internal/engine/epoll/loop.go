@@ -4814,6 +4814,20 @@ func (l *Loop) checkTimeouts() {
 	}
 }
 
+// holdsOutput reports whether the conn still has bytes to send: in its write
+// buffer, on the dirty list or parked on EPOLLOUT, or in the kernel's send queue
+// (TIOCOUTQ: unsent and unacknowledged bytes; the notion the pool-wait gate uses
+// before it closes a conn). An error from the ioctl counts as "yes": a conn that
+// cannot be asked is not closed by a clock that cannot see its output. Loop
+// thread.
+func (cs *connState) holdsOutput() bool {
+	if csWritePending(cs) || cs.dirty || cs.epollOut || cs.writeSince != 0 {
+		return true
+	}
+	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ)
+	return err != nil || q != 0
+}
+
 // sweepH2Deadlines runs the per-stream deadlines of the HTTP/2 conns
 // (H2State.Sweep): for each conn on h2Conns, a few atomic loads when nothing is
 // due. By index, from the end: a close swap-removes the conn from h2Conns.
@@ -4836,6 +4850,21 @@ func (l *Loop) sweepH2Deadlines(now int64) {
 		case res.CloseAfterFlush:
 			l.closeWhenFlushed(cs)
 		case res.CloseNow:
+			if cs.holdsOutput() {
+				// Still sending the tail of a response: not idle. The stream
+				// is gone from the manager once its last DATA is in the conn's
+				// buffers, and the kernel's send queue can hold megabytes; a
+				// close with the peer's frames unread in the receive queue is a
+				// reset, which discards it (the review of the first version of
+				// D0 measured an 8 MiB download cut at 5 MB).
+				cs.h2State.ExtendIdle(now)
+				break
+			}
+			// GOAWAY(NO_ERROR) naming the last client stream, flushed inline,
+			// then the close: the client knows what was processed.
+			if cs.h2State.GoAwayNoWait(cs.writeFn) {
+				l.flushH2Conn(cs)
+			}
 			l.closeConn(cs.fd)
 		case res.Wrote:
 			// Sent now, not left to the dirty pass: the scan below may close a

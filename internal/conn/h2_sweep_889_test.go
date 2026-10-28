@@ -250,3 +250,70 @@ func TestSweepTakesNoLockWhenNothingIsDue889(t *testing.T) {
 		t.Fatalf("after the lock was released: %+v, want the expiry", res)
 	}
 }
+
+// An engine that finds the conn still sending when Sweep proposes the idle close
+// calls ExtendIdle: the idle period runs again from there. GoAwayNoWait writes a
+// GOAWAY(NO_ERROR) for the close that does go ahead, and leaves a held lock to
+// the next sweep.
+func TestSweepExtendIdleAndGoAwayNoWait889(t *testing.T) {
+	r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
+	r.written()
+	t0 := time.Now().UnixNano()
+	r.st.Sweep(t0, r.write)
+	at := t0 + int64(1500*time.Millisecond)
+	if res := r.st.Sweep(at, r.write); !res.CloseNow {
+		t.Fatalf("after 1.5 s idle: %+v, want CloseNow", res)
+	}
+	r.st.ExtendIdle(at) // the engine found output pending
+	if res := r.st.Sweep(at+int64(500*time.Millisecond), r.write); res.CloseNow {
+		t.Fatal("CloseNow 0.5 s after ExtendIdle")
+	}
+	if res := r.st.Sweep(at+int64(1200*time.Millisecond), r.write); !res.CloseNow {
+		t.Fatal("no CloseNow IdleTimeout after ExtendIdle")
+	}
+	r.st.mu.Lock()
+	if r.st.GoAwayNoWait(r.write) {
+		t.Fatal("GoAwayNoWait wrote with H2State.mu held")
+	}
+	r.st.mu.Unlock()
+	if !r.st.GoAwayNoWait(r.write) {
+		t.Fatal("GoAwayNoWait did not write")
+	}
+	var ga *wframe889
+	for _, f := range r.written() {
+		if f.typ == http2.FrameGoAway {
+			f := f
+			ga = &f
+		}
+	}
+	if ga == nil || ga.code != http2.ErrCodeNo {
+		t.Fatalf("want GOAWAY(NO_ERROR), got %+v", ga)
+	}
+}
+
+// A burst of expiries is answered in one Sweep.
+func TestSweepAnswersABurstOfExpiriesInOneSweep889(t *testing.T) {
+	r := newSweepRig889(t, H2Config{ReadTimeout: time.Second})
+	r.written()
+	const n = 100
+	r.frames(func(fr *http2.Framer) {
+		for i := range n {
+			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: uint32(1 + 2*i), BlockFragment: r.block("POST", "/u"), EndHeaders: true})
+		}
+	})
+	now := time.Now().UnixNano() + int64(2*time.Second)
+	res := r.st.Sweep(now, r.write)
+	// The batch loop is bounded by a time budget (2 ms), which the race
+	// detector's slowdown can use up: what the budget cuts off is the next
+	// sweep's, never lost.
+	if res.Expired < 32 {
+		t.Fatalf("one Sweep answered %d of %d expired requests, want at least a batch (32)", res.Expired, n)
+	}
+	total := res.Expired
+	for i := 0; i < 20 && total < n; i++ {
+		total += r.st.Sweep(now+int64(i), r.write).Expired
+	}
+	if total != n {
+		t.Fatalf("%d of %d expired requests answered after repeated sweeps", total, n)
+	}
+}

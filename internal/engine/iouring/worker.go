@@ -6504,6 +6504,18 @@ func (w *Worker) drainH2Writes() {
 	}
 }
 
+// holdsOutput reports whether the conn still has bytes to send: staged in its
+// buffers, a SEND in flight, on the dirty list, or in the kernel's send queue
+// (TIOCOUTQ: unsent and unacknowledged bytes). An error from the ioctl counts as
+// "yes". Worker thread.
+func (cs *connState) holdsOutput() bool {
+	if len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0 || cs.sending || cs.zcNotifPending || cs.dirty {
+		return true
+	}
+	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCOUTQ)
+	return err != nil || q != 0
+}
+
 // sweepH2Deadlines runs the per-stream deadlines of the HTTP/2 conns
 // (H2State.Sweep): for each conn on h2Conns, a few atomic loads when nothing is
 // due. By index, from the end: a close swap-removes the conn from h2Conns.
@@ -6529,7 +6541,17 @@ func (w *Worker) sweepH2Deadlines(now int64) {
 			}
 			w.closeConn(cs.fd) // sends what was staged first
 		case res.CloseNow:
-			w.closeConn(cs.fd)
+			if cs.holdsOutput() {
+				// Still sending the tail of a response: not idle (see epoll's
+				// sweepH2Deadlines; io_uring's close already waits for the
+				// SENDs it has issued, but not for the kernel's queue).
+				cs.h2State.ExtendIdle(now)
+				break
+			}
+			if cs.h2State.GoAwayNoWait(cs.writeFn) && w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+			w.closeConn(cs.fd) // sends what was staged first
 		case res.Wrote:
 			if w.flushSend(cs) {
 				w.markDirty(cs)

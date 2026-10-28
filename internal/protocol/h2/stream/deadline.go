@@ -80,6 +80,9 @@ func (p *Processor) ExpireRequest(id uint32, now int64) {
 	p.expiredReq[id] = until
 	p.noteTombstoneDeadline(until)
 	p.resetIDs.mark(id)
+	if p.connWriter != nil {
+		p.connWriter.MarkStreamClosed(id) // as sendRSTStreamAndMarkClosed does: nothing queued for it may follow the reset
+	}
 	if err := p.writer.WriteRSTStream(id, http2.ErrCodeNo); err == nil {
 		p.flush()
 	}
