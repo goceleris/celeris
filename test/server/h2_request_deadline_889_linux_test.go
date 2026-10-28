@@ -145,6 +145,32 @@ func (c *h2raw889) pingEvery889(d time.Duration) (stop func()) {
 	return func() { close(quit); <-done }
 }
 
+// trickle889 sends one byte of DATA on stream id every d, as a slow uploader
+// does, until the returned stop is called. A client that sends nothing at all
+// for ReadTimeout is silent, and a connection with no stream open that has been
+// silent for ReadTimeout is closed whatever happened to its streams; an uploader
+// that is slow but sending is not.
+func (c *h2raw889) trickle889(id uint32, d time.Duration) (stop func()) {
+	quit := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tk := time.NewTicker(d)
+		defer tk.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-tk.C:
+				c.wmu.Lock()
+				_ = c.fr.WriteData(id, false, []byte{'x'})
+				c.wmu.Unlock()
+			}
+		}
+	}()
+	return func() { close(quit); <-done }
+}
+
 func (c *h2raw889) sendData889(id uint32, end bool, b []byte) {
 	c.t.Helper()
 	c.wmu.Lock()
@@ -261,8 +287,9 @@ func TestH2SlowUploaderAtTheDeadline889(t *testing.T) {
 			t.Parallel()
 			c := dialH2raw889(t, rdServer889(t, e.eng, nil), h2dial889{})
 			c.request(1, "POST", "/upload889", false, true)
-			c.sendData889(1, false, []byte("hello "))
+			stop := c.trickle889(1, 250*time.Millisecond)
 			ev := c.await889(1, 3*time.Second)
+			stop()
 			t.Logf("RD889 after engine=%s: %s", e.name, ev)
 			wantReset889(t, ev, 900*time.Millisecond, 2500*time.Millisecond)
 			// The uploader had not finished: its DATA and END_STREAM are in flight.
@@ -359,7 +386,9 @@ func TestH2ExpiredRequestDataAfterTheResetWindow889(t *testing.T) {
 				}
 				bad := id
 				id += 2
+				stop := c.trickle889(1, 250*time.Millisecond)
 				ev := c.await889(1, 4*time.Second)
+				stop()
 				t.Logf("RD889 m3 engine=%s late=%s: %s (the malformed stream was %d)", e.name, late, ev, bad)
 				wantReset889(t, ev, 900*time.Millisecond, 3*time.Second)
 				switch late {
