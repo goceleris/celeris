@@ -58,7 +58,9 @@ func TestPubSubSunsubscribeOfAWantedChannelResubscribes887(t *testing.T) {
 				t.Fatal(err)
 			}
 			node := cl.nodes[0]
-			poll(t, "the first SSUBSCRIBE", 5*time.Second, func() bool { return node.subCmds.Load() == 1 })
+			// (The fake counts a command when it receives it, before it records the
+			// subscription: wait for both, or the sunsubscribe below finds nothing.)
+			poll(t, "the first SSUBSCRIBE", 5*time.Second, func() bool { return node.subCmds.Load() == 1 && node.subscribers("ssub") == 1 })
 			node.sunsubscribeSlot(int(Slot("foo")))
 			poll(t, "the second SSUBSCRIBE", 5*time.Second, func() bool { return node.subscribers("ssub") == 1 && node.subCmds.Load() == 2 })
 		})
