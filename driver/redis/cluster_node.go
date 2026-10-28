@@ -10,15 +10,41 @@ type clusterNode struct {
 	client  *Client
 	primary bool
 	// failing is set when the node is unreachable; cleared after a successful
-	// command or topology refresh confirms it is alive.
-	failing atomic.Bool
-	// psFailed is set when a PubSub dial on this node failed (and set failing
-	// with it); a later successful PubSub dial clears failing only if psFailed
-	// was set, so it never undoes the command path's verdict.
-	psFailed atomic.Bool
+	// command or topology refresh confirms it is alive. A PubSub dial also
+	// sets it, and clears only what it set (see failFlag).
+	failing failFlag
 	// latency stores the last-measured round-trip time in nanoseconds, updated
 	// during topology refresh. Used by RouteByLatency to pick the fastest node.
 	latency atomic.Int64
+}
+
+// failFlag is clusterNode.failing: a flag that remembers whether the last
+// change came from a PubSub dial. Store, which the command path and the topology
+// refresh use, takes the node over: a later successful PubSub dial then leaves
+// the flag alone. markPubSub and clearPubSub are the PubSub path's.
+type failFlag struct {
+	atomic.Bool
+	pubsub atomic.Bool
+}
+
+// Store sets the flag as the command path or the topology refresh found it.
+func (f *failFlag) Store(v bool) {
+	f.pubsub.Store(false)
+	f.Bool.Store(v)
+}
+
+// markPubSub sets the flag because a PubSub dial failed.
+func (f *failFlag) markPubSub() {
+	f.Bool.Store(true)
+	f.pubsub.Store(true)
+}
+
+// clearPubSub clears the flag after a successful PubSub dial, but only if the
+// last thing that changed it was a failed PubSub dial.
+func (f *failFlag) clearPubSub() {
+	if f.pubsub.CompareAndSwap(true, false) {
+		f.Bool.Store(false)
+	}
 }
 
 // Close tears down the node's client.

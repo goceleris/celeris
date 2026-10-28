@@ -1012,12 +1012,16 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 // again on the new owner and keeps delivering to the same [PubSub.Channel],
 // with the PubSub's reconnect backoff between attempts and no limit. A message
 // published while it switches is lost (a gap); one owner serves a slot, so the
-// switch cannot deliver a message twice. Only the channels of one slot are
-// served by one PubSub: the slot of the first channel. A channel of another slot
-// added to the PubSub later is not subscribed (its node answers -MOVED, which is
-// not reported), the PubSub keeps serving the first slot, and a reroute replays
-// only the channels of that slot. See [ClusterClient.Subscribe] for what the
-// caller sees while it is down and when the ClusterClient is closed.
+// switch cannot deliver a message twice. One PubSub serves one slot, the slot of
+// its first channel; a channel of another slot added to it later is not served.
+// If another node owns that slot, the SSUBSCRIBE is answered -MOVED, which is not
+// reported, and the channel is not subscribed. If the same node owns it, the node
+// accepts it and delivers it, until the next reroute of any kind, whose replay
+// sends only the channels of the served slot and leaves it out; the move of that
+// slot does not reroute the PubSub. If the first channel is removed while a
+// channel of another node's slot remains, that channel is not subscribed
+// either. See [ClusterClient.Subscribe] for what the caller sees while it is
+// down and when the ClusterClient is closed.
 func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	if len(channels) == 0 {
 		return nil, errors.New("celeris-redis: SSubscribe requires at least one channel")

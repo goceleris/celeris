@@ -81,8 +81,9 @@ func (clusterPubSubRoute) slotted() bool { return true }
 
 // dialed records what a PubSub dial found out about a node. A failure marks the
 // node failing (so the next attempt moves on) and remembers that the PubSub
-// path did it; a success clears the mark only if the PubSub path set it, never
-// the command path's.
+// path did it; a success clears the mark only if the PubSub path's failure was
+// the last thing to change it (a mark the command path or a topology probe has
+// set or cleared since is theirs).
 func (r clusterPubSubRoute) dialed(cl *Client, ok bool) {
 	c := r.c
 	c.mu.RLock()
@@ -90,10 +91,9 @@ func (r clusterPubSubRoute) dialed(cl *Client, ok bool) {
 	for _, n := range c.nodes {
 		if n.client == cl {
 			if !ok {
-				n.failing.Store(true)
-				n.psFailed.Store(true)
-			} else if n.psFailed.CompareAndSwap(true, false) {
-				n.failing.Store(false)
+				n.failing.markPubSub()
+			} else {
+				n.failing.clearPubSub()
 			}
 			return
 		}

@@ -866,7 +866,8 @@ func (ps *PubSub) servedSlotLocked() (slot uint16, ok bool) {
 // before it writes, so a channel that is still in shardSubs was not removed by
 // the caller: the server dropped it (its slot moved to another node) and the
 // PubSub subscribes again where the slot lives now. A channel that is gone from
-// the set is the ack of the caller's own SUnsubscribe. (A SUnsubscribe(x)
+// the set is the ack of the caller's own SUnsubscribe. One for a channel
+// outside the served slot is ignored (see below). (A SUnsubscribe(x)
 // followed at once by a SSubscribe(x) can make the ack look like the server's:
 // one extra reroute, harmless.)
 //
@@ -885,8 +886,13 @@ func (ps *PubSub) onShardUnsubscribed(from *pubsubRouter, ch string) {
 	if ps.conn == nil || ps.conn.state.router != from {
 		return
 	}
-	if _, still := ps.shardSubs[ch]; still {
-		ps.trigger(true)
+	// Only the slot the PubSub serves: a channel of another slot that the same
+	// node happened to accept is dropped from the replay anyway, and its slot
+	// moving away is no reason to rebuild the subscription that is served.
+	if served, ok := ps.servedSlotLocked(); ok && Slot(ch) == served {
+		if _, still := ps.shardSubs[ch]; still {
+			ps.trigger(true)
+		}
 	}
 }
 
