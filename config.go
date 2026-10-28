@@ -243,22 +243,28 @@ type Config struct {
 	// of its sends, on epoll also from the end of a response the kernel did not
 	// take at once).
 	//
-	// An HTTP/2 connection is not closed by it or by IdleTimeout while it has a
-	// stream open whose request is whole and no response is waiting for the
-	// client's flow-control window: a stream the server is writing to (an SSE
-	// stream) outlives a client that sends no frame. A stream that outlived the
-	// timeout and ends keeps the connection for the timeout from the sweep that
-	// last saw it; one that ends before the clock reaches the timeout does not
-	// move the clock, so the connection is closed at the timeout after the
-	// client's last frame, as before (on epoll that can be right after the
-	// stream). A stream whose handler never answers is exempt for as long as it
-	// holds the stream, where an HTTP/1.1 async handler that overruns ReadTimeout
-	// is closed. A client that owes the server something, the rest of a request
-	// or the WINDOW_UPDATE a response is waiting for, and sends nothing is
-	// closed as on HTTP/1.1, as is an HTTP/2 connection with no stream open. A
-	// client that sends a frame of any kind (a PING) at least once per
-	// ReadTimeout is not bounded by it; std bounds a request and a response per
-	// stream, the native engines do not.
+	// HTTP/2 on the native engines: each request is bounded by ReadTimeout from
+	// its HEADERS, absolute, as net/http's is. A request that is not whole by
+	// then (its body, or its trailers, still to come) is answered 408 and its
+	// stream is reset with RST_STREAM(NO_ERROR); the connection and its other
+	// streams go on. A DATA frame, or a PING, does not move the deadline, so an
+	// HTTP/2 upload has to fit in ReadTimeout (as on std; there is no per-route
+	// override), where an HTTP/1.1 body is bounded by the time since the last
+	// read. A request without a body has no deadline.
+	//
+	// The connection's own clock (the last read) does not close an HTTP/2
+	// connection that has a stream open whose request is whole and no response
+	// waiting for the client's flow-control window: a stream the server is
+	// writing to (an SSE stream) outlives a client that sends no frame. A stream
+	// whose handler never answers is exempt for as long as it holds the stream,
+	// where an HTTP/1.1 async handler that overruns ReadTimeout is closed. When
+	// the last such stream ends the connection is kept for the timeout from the
+	// sweep that last saw it. With no stream open, a silent connection is closed
+	// at ReadTimeout or IdleTimeout from the client's last frame, and a client
+	// that sends only PINGs, SETTINGS or connection WINDOW_UPDATEs is closed at
+	// IdleTimeout (alone, as net/http's idle timer) from the last stream
+	// activity, which those frames do not move. A response the client does not
+	// take, from a client that keeps sending frames, is not bounded by ReadTimeout.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This
@@ -278,6 +284,10 @@ type Config struct {
 	// accept, which with TCP_DEFER_ACCEPT (see DisableDeferAccept) is the
 	// connection's first byte or about a second after its SYN, whichever
 	// comes first; std counts from the handshake.
+	//
+	// On HTTP/2 (epoll, io_uring, adaptive) it also bounds a header block: one
+	// that begins with a HEADERS frame without END_HEADERS and is not complete this
+	// long after that frame ends the connection with GOAWAY(ENHANCE_YOUR_CALM).
 	ReadHeaderTimeout time.Duration
 	// WriteTimeout is the max duration for writing the response; what it
 	// bounds differs by engine, as the paragraphs below set out.
@@ -371,7 +381,10 @@ type Config struct {
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
 	// Zero uses the default (600s). Set to -1 for no timeout. On an HTTP/2
-	// connection with a stream the server owes an answer for, see ReadTimeout.
+	// connection it runs from the last stream activity while no stream is open
+	// (PING, SETTINGS and WINDOW_UPDATE frames do not move it) and is not
+	// applied while a stream the server owes an answer for is open; see
+	// ReadTimeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts
