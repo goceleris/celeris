@@ -200,7 +200,7 @@ func TestDotfilesHeadRangeConditional888(t *testing.T) {
 				if rec.StatusCode == 206 || rec.StatusCode == 304 || rec.StatusCode == 200 || len(rec.Body) != 0 {
 					t.Errorf("policy %d GET %s %v: status %d body %q err %v", pol, p, hdr, rec.StatusCode, rec.Body, err)
 				}
-				if pol == DotfilesDeny && !(err != nil && err.(*celeris.HTTPError).Code == 403) {
+				if pol == DotfilesDeny && (err == nil || err.(*celeris.HTTPError).Code != 403) {
 					t.Errorf("policy %d GET %s %v: err %v, want a 403", pol, p, hdr, err)
 				}
 				if pol == DotfilesIgnore && err != nil {
@@ -359,7 +359,7 @@ func TestDotfilesSPA888(t *testing.T) {
 	}
 	deny := New(Config{Root: root, SPA: true, Dotfiles: DotfilesDeny})
 	rec, err := get888(t, deny, "/.env")
-	if !(err != nil && err.(*celeris.HTTPError).Code == 403) || len(rec.Body) != 0 {
+	if err == nil || err.(*celeris.HTTPError).Code != 403 || len(rec.Body) != 0 {
 		t.Errorf("SPA Deny GET /.env: status %d body %q err %v, want 403", rec.StatusCode, rec.Body, err)
 	}
 	allow := New(Config{Root: root, SPA: true, Dotfiles: DotfilesAllow})

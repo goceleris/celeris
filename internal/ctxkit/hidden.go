@@ -79,7 +79,7 @@ func HiddenPath(p string) bool {
 // RelWithin returns the slash path of p below base, for a p that
 // ResolvedWithin(base, p) accepted. Both are results of filepath.EvalSymlinks.
 func RelWithin(base, p string) (string, bool) {
-	if !(!filepath.IsAbs(base) && climbs(base)) && withinClean(base, p) {
+	if (filepath.IsAbs(base) || !climbs(base)) && withinClean(base, p) {
 		switch {
 		case p == base:
 			return "", true
