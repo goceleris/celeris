@@ -57,11 +57,11 @@ func (l *Loop) parkedBelowRate(cs *connState, now, ws, wt int64) bool {
 			return false // a failed sample, not tried again yet
 		}
 		cs.closeSampled = now
-		ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+		acked, err := l.bytesAcked(cs.fd)
 		if err != nil {
 			return false
 		}
-		cs.closeAcked, cs.closeAckedKnown = ti.Bytes_acked, true
+		cs.closeAcked, cs.closeAckedKnown = acked, true
 		// A conn first met after the flush clock's bound had passed has no
 		// window behind it and no evidence of progress: it is judged by the
 		// clock, as before (a loop whose sweeps are further apart than
@@ -71,16 +71,29 @@ func (l *Loop) parkedBelowRate(cs *connState, now, ws, wt int64) bool {
 	if now-cs.closeSampled < wt {
 		return false
 	}
-	ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	acked, err := l.bytesAcked(cs.fd)
 	if err != nil {
 		cs.closeAckedKnown = false // the flush clock from here
 		cs.closeSampled = now
 		return false
 	}
-	if ti.Bytes_acked-cs.closeAcked >= parkedMinAcked {
-		cs.closeAcked, cs.closeSampled = ti.Bytes_acked, now
+	if acked-cs.closeAcked >= parkedMinAcked {
+		cs.closeAcked, cs.closeSampled = acked, now
 		cs.writeSince = now
 		return false
 	}
 	return true
+}
+
+// bytesAcked reads how many bytes the peer of fd has acknowledged (tcp_info
+// bytes_acked, which only grows).
+func (l *Loop) bytesAcked(fd int) (uint64, error) {
+	if f := l.ackedProbe; f != nil {
+		return f(fd)
+	}
+	ti, err := unix.GetsockoptTCPInfo(fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+	if err != nil {
+		return 0, err
+	}
+	return ti.Bytes_acked, nil
 }

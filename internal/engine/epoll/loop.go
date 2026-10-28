@@ -370,6 +370,12 @@ type Loop struct {
 	// asking the kernel about a descriptor number that may now belong to
 	// something else. Written once before ready; read only after it.
 	listenAddr net.Addr
+
+	// ackedProbe replaces the getsockopt that reads a conn's acknowledged
+	// byte count when set (bytesAcked, write_rate_885.go): a test seam for a
+	// TCP stack whose TCP_INFO answers but does not fill it. nil in
+	// production. Loop thread (a test sets it before it drives the loop).
+	ackedProbe func(fd int) (uint64, error)
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
