@@ -95,7 +95,13 @@ func TestClusterPubSubCloseLeavesNoConnBehind887(t *testing.T) {
 		to := cl.nodes[0]
 		ps, err := cc.SSubscribe(rpCtx(t), ch)
 		if err != nil {
-			t.Fatal(err)
+			// (Seen once, on Windows, as "no cluster nodes available": say what
+			// the client's table looked like.)
+			cc.mu.RLock()
+			nodes, owner := len(cc.nodes), cc.slots[slot] != nil
+			cc.mu.RUnlock()
+			t.Fatalf("iteration %d: SSubscribe: %v (the client knows %d nodes, slot owner known: %v, CLUSTER SLOTS replies given: %d)",
+				i, err, nodes, owner, cl.slotsReplies.Load())
 		}
 		poll(t, "SSUBSCRIBE", 5*time.Second, func() bool { return cl.subscribers("ssub") == 1 })
 		cl.moveSlot(slot, to, 0)
