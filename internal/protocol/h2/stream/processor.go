@@ -266,6 +266,11 @@ type Processor struct {
 	// its HEADERS or its DATA is not in it, or leaves it when it ends
 	// (clearResetOpen): a further HEADERS on it is a connection error.
 	resetOpen serverResets
+	// expiredReq remembers the requests whose deadline expired (ExpireRequest) and
+	// whose client has not ended them: id to the instant the entry runs out.
+	// Allocated on the first expiry. tombDL is the earliest of those instants.
+	expiredReq map[uint32]int64
+	tombDL     atomic.Int64
 
 	// OnHandlerGoexit, when set, is told that a stream's handler ended its
 	// goroutine with runtime.Goexit (celeris#889): the stream's id and the
@@ -1677,7 +1682,7 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 	if !exists {
 		last := m.lastClientStream.Load()
 
-		if id <= last && p.resetOpen.has(id) {
+		if id <= last && (p.resetOpen.has(id) || p.requestExpired(id)) {
 			// A request this server reset (as malformed, for its header list,
 			// for MAX_CONCURRENT_STREAMS or for its body) before its client
 			// side ended: its trailers, in flight, are ignored, once. After the
@@ -1688,6 +1693,7 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 			// the peer breaking that rule, and every further one would cost a
 			// decode: the connection ends, before the block is read.
 			p.clearResetOpen(id)
+			p.forgetExpired(id)
 			if !endStream {
 				return nil, admitRefused, p.GoAwayErr(m.GetLastStreamID(), http2.ErrCodeProtocol, []byte("trailers without END_STREAM"),
 					fmt.Errorf("HEADERS frame without END_STREAM after the request on stream %d, which the server reset", id))
@@ -1731,6 +1737,12 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 	}
 	if stream.ResponseWriter == nil {
 		stream.ResponseWriter = p.connWriter
+	}
+	if !endStream && m.reqTimeout > 0 {
+		// A request that is not whole at its HEADERS has a deadline (celeris#889):
+		// ReadTimeout from now, absolute. A request without a body (every GET)
+		// pays the one test of endStream that is made anyway.
+		m.ArmRequest(stream, time.Now().UnixNano())
 	}
 	return stream, admitNew, nil
 }
@@ -1839,6 +1851,7 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 		stream.AddHeadersBatch(headers)
 		if endStream {
 			stream.EndStream = true
+			p.manager.DisarmRequest(stream)
 			stream.SetState(StateHalfClosedRemote)
 			p.runHandler(stream)
 		}
@@ -1942,7 +1955,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 		// (above the last client stream, even, stream 0) is still a connection
 		// error: h2spec 5.1 and 6.1 pin that. The last client stream check is
 		// defensive: a reset of an identifier above it ends the connection.
-		if f.StreamID <= p.manager.GetLastClientStreamID() && p.resetIDs.has(f.StreamID) {
+		if f.StreamID <= p.manager.GetLastClientStreamID() && (p.resetIDs.has(f.StreamID) || p.requestExpired(f.StreamID)) {
 			if err := p.countEmptyData(f); err != nil {
 				return err
 			}
@@ -1952,6 +1965,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 			}
 			if f.StreamEnded() {
 				p.clearResetOpen(f.StreamID) // the peer's side has ended: no trailers can follow
+				p.forgetExpired(f.StreamID)
 			}
 			return nil
 		}
@@ -1998,6 +2012,7 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	if f.StreamEnded() {
 		p.manager.FlushWindowUpdates(p.writer, true)
 		stream.EndStream = true
+		p.manager.DisarmRequest(stream)
 		stream.SetState(StateHalfClosedRemote)
 
 		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
@@ -2332,6 +2347,7 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 			// for a stream the goroutine had just closed (celeris#889).
 			prev := State(stream.state.Swap(int32(StateClosed)))
 			p.manager.updateActiveCount(prev, StateClosed)
+			p.manager.disarmRequestLocked(stream)
 			stream.Cancel()
 			if stream.flags.Load()&flagAsyncRunning == 0 {
 				stream.Release()

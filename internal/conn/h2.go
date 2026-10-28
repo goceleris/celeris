@@ -69,6 +69,11 @@ type H2Config struct {
 	// wrapping os.ErrDeadlineExceeded. The engines pass the server's
 	// WriteTimeout. 0 = no bound.
 	WriteTimeout time.Duration
+	// ReadTimeout is the request deadline of a stream (the server's
+	// ReadTimeout): a request that is not whole this long after its HEADERS is
+	// answered 408 and reset with RST_STREAM(NO_ERROR) (celeris#889). Absolute,
+	// as net/http's. 0 = no deadline.
+	ReadTimeout time.Duration
 	// Logger, when set, receives an Error record for each panic that escapes
 	// an HTTP/2 stream's handler (the celeris router answers a handler's
 	// panic with a 500 first, so this is a panic out of the router itself or
@@ -589,6 +594,7 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	// write queue, behind the stream's HEADERS (celeris#903).
 	proc.SetOutboundSink(s.adapter.sendDataFromLoop)
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
+	proc.GetManager().SetRequestTimeout(cfg.ReadTimeout)
 	if lg := cfg.Logger; lg != nil {
 		proc.OnHandlerPanic = func(id uint32, r any, stack []byte) {
 			lg.Error("h2 handler panicked",
@@ -1002,4 +1008,54 @@ func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {
 		write(buf.Bytes())
 		buf.Reset()
 	}
+}
+
+// SweepResult is what H2State.Sweep did and what the engine owes the connection.
+type SweepResult struct {
+	// Wrote: frames were written (a 408 and a RST_STREAM, a GOAWAY); the engine
+	// flushes the connection.
+	Wrote bool
+	// Expired is how many requests were answered 408 and reset.
+	Expired int
+}
+
+// Sweep is the engines' per-connection look at the deadlines of the HTTP/2
+// streams and of the connection (celeris#889), run from the timeout sweep on the
+// loop thread for every connection on h2Conns, before the sweep looks at the
+// connection's own clock. When nothing is due it takes no lock: a few atomic
+// loads and compares. When something is due it takes H2State.mu with TryLock (the
+// holder is the loop thread itself, or the dispatch goroutine of an h2c upgrade
+// for the instant it runs the first frames; a held lock means "next sweep"):
+//
+//   - a request whose deadline passed is answered 408 and reset with
+//     RST_STREAM(NO_ERROR); the stream is remembered until its client ends it
+//     (the tombstone: its DATA in flight is ignored and credited, never a
+//     connection error).
+func (s *H2State) Sweep(now int64, write func([]byte)) (res SweepResult) {
+	m := s.processor.GetManager()
+	p := s.processor
+	dl, td := m.NextRequestDeadline(), p.NextTombstoneDeadline()
+	if (dl == 0 || now < dl) && (td == 0 || now < td) {
+		return res
+	}
+	if !s.mu.TryLock() {
+		return res
+	}
+	defer s.mu.Unlock()
+	if dl != 0 && now >= dl {
+		var ids [8]uint32
+		for _, id := range m.ExpiredRequests(now, ids[:0]) {
+			p.ExpireRequest(id, now)
+			res.Expired++
+		}
+	}
+	if td != 0 && now >= td {
+		p.DropTombstones(now)
+	}
+	if res.Expired > 0 {
+		flushOutBuf(&s.outBuf, write)
+		s.DrainWriteQueue(write)
+		res.Wrote = true
+	}
+	return res
 }

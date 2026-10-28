@@ -1360,6 +1360,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 			MaxFrameSize:         cfg.MaxFrameSize,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 			WriteTimeout:         cfg.WriteTimeout,
+			ReadTimeout:          cfg.ReadTimeout,
 			Logger:               cfg.Logger,
 		},
 		sockOpts: sockopts.Options{
@@ -6501,6 +6502,30 @@ func (w *Worker) drainH2Writes() {
 	}
 }
 
+// sweepH2Deadlines runs the per-stream deadlines of the HTTP/2 conns
+// (H2State.Sweep): for each conn on h2Conns, a few atomic loads when nothing is
+// due. By index, from the end: a close swap-removes the conn from h2Conns.
+// h2Conns holds a conn only once its h2State is installed and the h1-to-h2c
+// switch is complete, so h2State is read without detachMu, as drainH2Writes
+// reads it. Worker thread.
+func (w *Worker) sweepH2Deadlines(now int64) {
+	for i := len(w.h2Conns) - 1; i >= 0; i-- {
+		cs := w.conns[w.h2Conns[i]]
+		if cs == nil || cs.h2State == nil || cs.closing {
+			continue
+		}
+		res := cs.h2State.Sweep(now, cs.writeFn)
+		if res.Expired > 0 {
+			// The streams it reset are the ones the conn's idle period was
+			// kept for: do not keep the conn another timeout for them (A3).
+			cs.h2OwedAt = 0
+		}
+		if res.Wrote && w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+	}
+}
+
 func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
 		if cs.closing {
@@ -7662,6 +7687,13 @@ func (w *Worker) checkTimeouts() {
 	w.sweepTickFired = false
 	if h := testHookCheckTimeouts.Load(); h != nil {
 		(*h)(w)
+	}
+	// The deadlines of the HTTP/2 streams and of the h2 conns' idle clock come
+	// first, before the scan of the conns' own clocks below: a request that has
+	// expired is answered 408 and reset, ONE stream, and the scan then finds the
+	// conn as that leaves it (celeris#889).
+	if len(w.h2Conns) != 0 {
+		w.sweepH2Deadlines(now)
 	}
 	// sendOut: a conn has a SEND (or a SEND_ZC notification) outstanding, so
 	// the watch (sendWatch, set by the dirty pass's give-up) stays on.
