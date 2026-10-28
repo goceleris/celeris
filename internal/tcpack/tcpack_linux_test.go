@@ -32,8 +32,10 @@ func TestUsableLatch889(t *testing.T) {
 	if Usable(0, errors.New("getsockopt")) {
 		t.Fatal("a failed read was usable")
 	}
-	if Usable(0, nil) || Usable(0, nil) {
-		t.Fatal("0 on a stack that does not fill the field was a count")
+	for range 2 {
+		if Usable(0, nil) {
+			t.Fatal("0 on a stack that does not fill the field was a count")
+		}
 	}
 	if probes.Load() != 1 {
 		t.Fatalf("the probe ran %d times, want once", probes.Load())
