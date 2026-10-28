@@ -4928,7 +4928,8 @@ func (cs *connState) endDetachedStall() {
 // and restarts when a flush takes bytes (noteWriteProgress), where std's is an
 // absolute deadline for the whole response; where the peer's acknowledged bytes
 // can be read the minimum-rate rule decides instead (parkedBelowRate, celeris#885
-// item 51). It answers the instant IdleTimeout
+// item 51), and is then the only bound: the conn is exempt from the idle scan
+// for as long as the rule has a baseline. It answers the instant IdleTimeout
 // and ReadTimeout are measured from, the later of the last read and the clock,
 // and whether the conn is done for this sweep (closed, or exempt from the idle
 // scan). Kept out of line: the sweep of a conn without a clock does not run it.

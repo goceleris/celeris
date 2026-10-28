@@ -240,8 +240,11 @@ type Config struct {
 	//
 	// On the native engines (epoll, io_uring, adaptive) it is measured from the
 	// connection's last read (on io_uring also from the start and the completion
-	// of its sends, on epoll also from the end of a response the kernel did not
-	// take at once).
+	// of its sends). On epoll a response the kernel did not take whole is
+	// bounded by WriteTimeout's minimum rate and not by ReadTimeout or
+	// IdleTimeout while the client takes it at that rate (see WriteTimeout):
+	// they run from the end of that response, and from the last flush that
+	// took bytes where the socket reports no acknowledged bytes.
 	//
 	// An HTTP/2 connection is not closed by it or by IdleTimeout while it has a
 	// stream open whose request is whole and no response is waiting for the
@@ -315,38 +318,54 @@ type Config struct {
 	// a large download or a chunked body written with [Context.StreamWriter]
 	// without Detach, stays under WriteTimeout as an absolute deadline for the
 	// whole response: raise it or set -1 for such routes. On the epoll engine
-	// (and adaptive while it runs on epoll) WriteTimeout bounds a response
-	// that is not detached differently: it is "no progress for WriteTimeout",
-	// the time a client may go without taking any of a response the kernel has
-	// not accepted whole, restarted each time it takes some. A download read
-	// steadily for longer than WriteTimeout is not cut there, and a client
-	// that reads nothing is closed WriteTimeout after the response stalled.
-	// Progress is the bytes the client acknowledges, which the engine's sweep
-	// reads (tcp_info): a response parked on the socket is held for another
-	// WriteTimeout if the client acknowledged at least 64 KiB in the last one (a
-	// floor of 64 KiB per WriteTimeout: 64 KiB/s at 1s, about 1 KiB/s at the 60s
-	// default), and closed if it did not. A client that reads at a reasonable
-	// rate is never cut, however long the response takes; one that reads steadily
-	// between two EPOLLOUT edges is not mistaken for a stalled one; and one that
-	// takes a half send queue per WriteTimeout, or sends bytes while it reads (a
-	// pipelined request, an HTTP/2 PING, a bare CRLF), cannot hold the
-	// connection and the response queued for it, because what it sends is not
-	// progress. A client that takes nothing, or a byte at a time (the kernel
-	// acknowledges a window update, not a byte), is closed between WriteTimeout
-	// and WriteTimeout plus a sweep after the response parked, and one that stops
-	// after a window it passed, within two WriteTimeouts. A client that takes
-	// exactly 64 KiB per window holds the connection for as many windows as the
-	// response has 64 KiB: there is no elapsed-time ceiling, so a large download
-	// at a reasonable rate completes whatever IdleTimeout is, and WriteTimeout -1
-	// is no write timeout at any rate. A socket that does not report
-	// acknowledged bytes (not TCP) has the flush clock alone: "no flush took
-	// bytes for WriteTimeout". While a response is queued, ReadTimeout and
-	// IdleTimeout run from the last progress, so they slide with it, and the
-	// earlier of ReadTimeout and WriteTimeout is the time a client may take no
-	// bytes at all (ReadTimeout 5s with WriteTimeout 60s closes a client that
-	// pauses for 6s). io_uring bounds the
-	// response as a whole, measured from the last read or completed flush
-	// of the connection (a client that sends another request restarts it), not
+	// (and adaptive while it runs on epoll) WriteTimeout bounds a response that
+	// is not detached differently: it is a minimum rate on the bytes the client
+	// acknowledges, with no elapsed-time ceiling. A response the kernel did not
+	// accept whole is queued in the engine ("parked"); the engine's sweep reads
+	// how many bytes the client has acknowledged (tcp_info) and holds the
+	// connection another WriteTimeout if the client acknowledged at least 64 KiB
+	// in the last one (a floor of 64 KiB per WriteTimeout: 64 KiB/s at 1s,
+	// about 1 KiB/s at the 60s default), and closes it if it did not. A client
+	// that reads at or above the floor is never cut, however long the response
+	// takes, and one that reads steadily between two EPOLLOUT edges is not
+	// mistaken for a stalled one: a download completes whatever IdleTimeout is.
+	// A client that takes less, in whatever pieces (nothing, a byte at a time,
+	// a half send queue per WriteTimeout), is closed at the end of the first
+	// window, between WriteTimeout and WriteTimeout plus a sweep after the
+	// response parked; one that stops after a window it passed, within two
+	// WriteTimeouts plus a sweep after its last byte. A client that takes
+	// exactly 64 KiB per window holds the connection, and the part of the
+	// response not yet sent, for as many windows as the response has 64 KiB (a
+	// response of S bytes: S/64 KiB times WriteTimeout, 64 minutes for 4 MiB at
+	// 60s; a smaller WriteTimeout raises the floor), so size WriteTimeout with
+	// that in mind. WriteTimeout -1 (or 0) is no write timeout at any rate. What
+	// the client sends is not progress: a pipelined request or an HTTP/2 PING
+	// does not hold a parked response.
+	//
+	// While the rule has a baseline for a parked response (from the first sweep
+	// that finds it parked), it is the only bound on the connection:
+	// ReadTimeout and IdleTimeout do not apply, so a client at or above the
+	// floor is not cut by either whatever they are next to WriteTimeout (the
+	// defaults are 60s, 600s and 60s), and one that stops is closed by the rule
+	// within the times above. They apply again from the end of the response. A
+	// socket that does not report acknowledged bytes (not TCP, or a TCP stack
+	// that leaves bytes_acked at 0) has the flush clock alone, "no flush took
+	// bytes for WriteTimeout", and ReadTimeout and IdleTimeout run from the
+	// last flush that took bytes there, as before the rule. The rule covers an
+	// HTTP/2 response parked on the socket too. A response that waits for the
+	// client's HTTP/2 flow-control window is not parked (nothing is queued on
+	// the socket) and WriteTimeout does not bound it on epoll: ReadTimeout and
+	// IdleTimeout do, from the client's last frame, so a client that sends a
+	// frame of any kind (a PING) at least once per ReadTimeout holds it, until
+	// per-stream deadlines are added. A request error read while a
+	// response is queued (a malformed request) puts the connection on the
+	// closing drain below, which counts each byte the client acknowledges and
+	// has no floor: a client that sends one and then takes a few bytes per
+	// WriteTimeout holds the connection, a known limit that is not changed here.
+	// io_uring is unchanged: it has no rate, and bounds the response as a
+	// whole, measured from the last read, the start of a send from an idle
+	// connection or a completed send (a client that completes one send per
+	// WriteTimeout, or sends another request, restarts it), not
 	// from the request's headers as std does. On io_uring a response whose
 	// unsent remainder is under 64 KiB, to a client that stops reading, on an
 	// otherwise idle worker, can outlast WriteTimeout (measured with async
@@ -354,8 +373,8 @@ type Config struct {
 	// On epoll, a response parked behind a handler that holds the connection's
 	// dispatch lock for longer than WriteTimeout can be closed at WriteTimeout
 	// even though nothing is queued for it (a narrow pipelined-handler case).
-	// A response that ends the connection (Connection: close, a refused write)
-	// has a drain of its own on both native engines: the connection is cut
+	// A response that ends the connection (Connection: close, a request error,
+	// a refused write) has a drain of its own on both native engines: the connection is cut
 	// once the client has taken no byte for WriteTimeout (epoll) or
 	// max(5s, WriteTimeout) (io_uring), and for 5 s on either when WriteTimeout
 	// is -1. A byte taken is a flush or send completion that moved the
@@ -380,7 +399,8 @@ type Config struct {
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
 	// Zero uses the default (600s). Set to -1 for no timeout. On an HTTP/2
-	// connection with a stream the server owes an answer for, see ReadTimeout.
+	// connection with a stream the server owes an answer for, see ReadTimeout;
+	// on epoll, for a response parked on the socket, see WriteTimeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts

@@ -33,8 +33,8 @@ const parkedMinAcked = 64 << 10
 // closeSampled; closeAckedKnown says there is one), and when the window has
 // passed the conn is held another if the peer acknowledged at least
 // parkedMinAcked in it (the baseline moves to that sample and so does the write
-// clock, writeSince, which ReadTimeout and IdleTimeout slide with) and closed
-// if it did not. The sample is one getsockopt per conn per window.
+// clock, writeSince) and closed if it did not. The sample is one getsockopt per
+// conn per window.
 //
 // So a peer that takes nothing (a zero window, a byte per second: the
 // kernel acknowledges a window update, not a byte) is closed between
@@ -46,9 +46,16 @@ const parkedMinAcked = 64 << 10
 //
 // While the baseline is known the flush clock does not reap: its stamp moves at
 // flushes the peer's reading did not cause as well (a request read, a flush of a
-// byte), and the rule here is the one that counts bytes taken. A conn whose
-// socket does not report them (not TCP, a failed getsockopt, which is retried
-// at most every quarter of WriteTimeout) has the flush clock alone, as before.
+// byte), and the rule here is the one that counts bytes taken. Nor do
+// ReadTimeout and IdleTimeout (sweepWriteClock exempts the conn from the idle
+// scan while the baseline is known): they run from the last flush that took
+// bytes or the last window passed, which a peer reading steadily between two
+// EPOLLOUT edges moves at neither, and with them not above WriteTimeout (the
+// defaults' shape) they would cut it before the rule had decided. A conn whose
+// socket does not report acknowledged bytes (not TCP, a failed getsockopt, a
+// count of 0 as a stack that does not fill bytes_acked answers, review r3 F4;
+// retried at most every quarter of WriteTimeout) has the flush clock alone, as
+// before, and ReadTimeout and IdleTimeout from it.
 // ws is the flush clock, writeSince. Loop thread; the caller's conn is parked
 // (pending) and WriteTimeout wt > 0.
 func (l *Loop) parkedBelowRate(cs *connState, now, ws, wt int64) bool {
