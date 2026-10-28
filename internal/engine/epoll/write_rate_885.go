@@ -58,7 +58,14 @@ func (l *Loop) parkedBelowRate(cs *connState, now, ws, wt int64) bool {
 		}
 		cs.closeSampled = now
 		acked, err := l.bytesAcked(cs.fd)
-		if err != nil {
+		if err != nil || acked == 0 {
+			// No count, or a count of 0: a parked conn has had bytes sent, so
+			// a stack that reports bytes_acked reads more than 0 once the peer
+			// has taken any; 0 is a peer that has taken none yet (retried
+			// every quarter window, the flush clock bounds it meanwhile) or a
+			// stack that does not fill the field (gVisor; Linux before 4.1),
+			// where a baseline of 0 would read every peer as acknowledging
+			// nothing and turn the rule into a hard cutoff.
 			return false
 		}
 		cs.closeAcked, cs.closeAckedKnown = acked, true
@@ -72,7 +79,7 @@ func (l *Loop) parkedBelowRate(cs *connState, now, ws, wt int64) bool {
 		return false
 	}
 	acked, err := l.bytesAcked(cs.fd)
-	if err != nil {
+	if err != nil || acked == 0 {
 		cs.closeAckedKnown = false // the flush clock from here
 		cs.closeSampled = now
 		return false
