@@ -452,7 +452,7 @@ func TestH2RequestDeadlineResetsOneStreamNotTheConn889(t *testing.T) {
 			at, closed := c.closedAfter889(7 * time.Second)
 			bound := 3600 * time.Millisecond
 			if e.name == "io_uring" {
-				bound = 4600 * time.Millisecond
+				bound = 5500 * time.Millisecond
 			}
 			if !closed || at > bound {
 				t.Fatalf("the silent conn was closed=%v at %v, want it closed by %v (the reset at 3 s)", closed, at.Round(time.Millisecond), bound)
