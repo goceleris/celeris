@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"github.com/goceleris/celeris"
 )
 
@@ -39,9 +41,25 @@ func rdServerCfg889(t *testing.T, cfg celeris.Config) string {
 func (c *h2raw889) closedAfter889(d time.Duration) (time.Duration, bool) {
 	_ = c.conn.SetReadDeadline(c.t0.Add(d))
 	for {
-		if _, err := c.fr.ReadFrame(); err != nil {
+		f, err := c.fr.ReadFrame()
+		if err != nil {
 			return time.Since(c.t0), !isTimeout889(err)
 		}
+		if g, ok := f.(*http2.GoAwayFrame); ok {
+			c.gaSeen, c.gaCode = true, g.ErrCode
+		}
+	}
+}
+
+// wantIdleGoAway889 checks that the conn ended with a GOAWAY(NO_ERROR) before it
+// closed, as the idle close of D0 sends (celeris#889; a bare close left the
+// client unsure what the server had processed). The cells that read until the
+// end accepted a bare EOF for a while, and the io_uring close lost its GOAWAY
+// without any of them noticing.
+func (c *h2raw889) wantIdleGoAway889(t *testing.T) {
+	t.Helper()
+	if !c.gaSeen || c.gaCode != http2.ErrCodeNo {
+		t.Fatalf("the conn was closed as idle without GOAWAY(NO_ERROR) before the close (seen %v, code %v)", c.gaSeen, c.gaCode)
 	}
 }
 
@@ -62,6 +80,7 @@ func TestH2PingOnlyConnIsClosedAtIdleTimeout889(t *testing.T) {
 			if !closed || at < 800*time.Millisecond || at > 3*time.Second {
 				t.Fatalf("a PING-only conn (IdleTimeout 1 s) was closed=%v at %v, want it closed at about 1 s", closed, at.Round(time.Millisecond))
 			}
+			c.wantIdleGoAway889(t)
 		})
 		t.Run(e.name+"/from-the-start", func(t *testing.T) {
 			t.Parallel()
@@ -74,6 +93,7 @@ func TestH2PingOnlyConnIsClosedAtIdleTimeout889(t *testing.T) {
 			if !closed || at < 800*time.Millisecond || at > 3*time.Second {
 				t.Fatalf("a PING-only conn from the start (IdleTimeout 1 s) was closed=%v at %v, want it closed at about 1 s", closed, at.Round(time.Millisecond))
 			}
+			c.wantIdleGoAway889(t)
 		})
 		// A client that goes on using the conn is not idle: a request every 500 ms.
 		t.Run(e.name+"/busy", func(t *testing.T) {
@@ -121,6 +141,7 @@ func TestH2ExpiredRequestThenPingOnlyIsClosedAtIdleTimeout889(t *testing.T) {
 			if !closed || at > 6*time.Second {
 				t.Fatalf("a PING-only conn after an expired request was closed=%v at %v, want it closed by about 3 s", closed, at.Round(time.Millisecond))
 			}
+			c.wantIdleGoAway889(t)
 		})
 	}
 }
