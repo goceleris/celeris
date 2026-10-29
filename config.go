@@ -397,10 +397,11 @@ type Config struct {
 	// links should set WriteTimeout to 5s or more. When the connection itself
 	// releases less than 64 KiB, the first window is the verdict. A stream the
 	// client never grants is reset after 1+k windows alone, or 4+k with siblings
-	// that keep the connection moving, k being the whole 64 KiB's of the bytes in
-	// flight when it stalled, at most four (about the peer's initial window): 1 and 4
-	// WriteTimeouts for the default 64 KiB window, 5 and 8 for a window of 256 KiB or
-	// more; a one-byte WINDOW_UPDATE dribbler on such a window likewise. A stream
+	// that keep the connection moving, k being the number of whole 64 KiB in the
+	// bytes in flight when it stalled (about the peer's initial window), at most
+	// four: 1 and 4 WriteTimeouts for the default 64 KiB window, 5 and 8 for a
+	// window of 256 KiB or more; a one-byte WINDOW_UPDATE dribbler is reset in the
+	// 2nd window of the default window and in the 5th of a larger one. A stream
 	// whose own window has room but whose bytes wait for the connection's is
 	// credited with what the whole connection released. While such a stream
 	// lives, ReadTimeout and IdleTimeout do not close the connection
