@@ -57,6 +57,12 @@ type ccVariant884 struct {
 	// HTTP/1.0 client (it adds one only when the request is HTTP/1.1 or later);
 	// the native engines say close to every request.
 	http10 bool
+	// wantBody > 0: the body must arrive whole (this many bytes, no read error)
+	// and the conn then end with an EOF, not a reset: close(2) with unread bytes
+	// in the receive queue sends an RST that destroys the response still in
+	// flight, so a closing conn that a late request reached must have those
+	// bytes read and dropped before it closes.
+	wantBody int
 }
 
 const ccGet884 = "GET %s HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -199,10 +205,16 @@ func wantClosed884(t *testing.T, name string, c net.Conn, br *bufio.Reader, v cc
 	if !resp.Close {
 		t.Errorf("%s: the response does not say it closes the conn", name)
 	}
-	_, _ = io.ReadAll(resp.Body)
+	body, rerr := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if v.wantBody > 0 && (rerr != nil || len(body) != v.wantBody) {
+		t.Errorf("%s: the body is %d of %d bytes (%v): the close cut the response", name, len(body), v.wantBody, rerr)
+	}
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	n, err := rd.Read(make([]byte, 1))
+	if v.wantBody > 0 && !errors.Is(err, io.EOF) {
+		t.Errorf("%s: after the whole body the conn read %v, want io.EOF (a reset is the close of a conn with unread bytes)", name, err)
+	}
 	if n != 0 || err == nil {
 		t.Errorf("%s: read %d byte(s), %v after the response, want the conn closed with nothing more to read", name, n, err)
 	} else if !errors.Is(err, io.EOF) && !isReset884(err) {
@@ -429,7 +441,15 @@ func runConnCloseArm884(t *testing.T, a ccArm884) {
 	late := func(path string) {
 		c := dialSmallRcvbuf884(t, srv.addr)
 		send(c, "GET "+path+" HTTP/1.1\r\nHost: x\r\n\r\n")
-		lates = append(lates, flight{"late-pipelined " + path, ccVariant884{name: "get"}, c, bufio.NewReader(c)})
+		// Whole-body strictness where main delivers the whole response: a loop
+		// that waits (the gate's first pass finds the closing conn with the late
+		// request in its queue). A loop that shuts down at once, and net/http,
+		// reset such a conn on close, as main does (not this change).
+		wb := 0
+		if !a.direct && !a.std {
+			wb = 16 << 20
+		}
+		lates = append(lates, flight{"late-pipelined " + path, ccVariant884{name: "get", wantBody: wb}, c, bufio.NewReader(c)})
 		want++
 	}
 	if a.async {
