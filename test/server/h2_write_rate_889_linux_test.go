@@ -222,23 +222,29 @@ func slowLink889(t *testing.T, addr string, bps float64, ids []uint32, size int,
 // cell). On the previous head each was reset at 2.3 s.
 func TestH2ParallelDownloadsSharingASlowLinkAreNotCut889(t *testing.T) {
 	type cell struct {
-		n   int
-		bps float64
+		n    int
+		bps  float64
+		size int
 	}
+	// The last two end their responses while the link is still shared: the grant for
+	// a stream's last bytes waits behind its siblings' bytes in the socket and lands
+	// a moment after the window ends, when the stream (or the whole connection) holds
+	// less than one floor and "released all of it" is the verdict (r8 F-A: reset 8 to
+	// 16 bytes before the end of the file, after the whole transfer).
 	for _, e := range nativeEngines889() {
-		for _, cl := range []cell{{2, 100e3}, {4, 200e3}} {
-			t.Run(fmt.Sprintf("%s/%dstreams/%.0fKBps", e.name, cl.n, cl.bps/1e3), func(t *testing.T) {
+		for _, cl := range []cell{{2, 100e3, 256 << 10}, {4, 200e3, 256 << 10}, {2, 100e3, 384 << 10}, {8, 200e3, 128 << 10}} {
+			t.Run(fmt.Sprintf("%s/%dstreams/%.0fKBps/%dKiB", e.name, cl.n, cl.bps/1e3, cl.size>>10), func(t *testing.T) {
 				t.Parallel()
 				addr := wdServer889(t, e.eng, -1, -1, wd889)
 				var ids []uint32
 				for i := 0; i < cl.n; i++ {
 					ids = append(ids, uint32(2*i+1))
 				}
-				res, got, at := slowLink889(t, addr, cl.bps, ids, 256<<10, nil, nil)
-				t.Logf("WR889 shared %s/%dstreams/%.0fKBps: %v %v at %v", e.name, cl.n, cl.bps/1e3, res, got, at)
+				res, got, at := slowLink889(t, addr, cl.bps, ids, cl.size, nil, nil)
+				t.Logf("WR889 shared %s/%dstreams/%.0fKBps/%dKiB: %v %v at %v", e.name, cl.n, cl.bps/1e3, cl.size>>10, res, got, at)
 				for _, id := range ids {
-					if res[id] != "complete" || got[id] != 256<<10 {
-						t.Fatalf("stream %d on a link shared by %d streams (the connection moved %.0f KB/s, above the floor): %q after %d bytes at %v", id, cl.n, cl.bps/1e3, res[id], got[id], at[id].Round(time.Millisecond))
+					if res[id] != "complete" || got[id] != cl.size {
+						t.Fatalf("stream %d on a link shared by %d streams (the connection moved %.0f KB/s, above the floor): %q after %d of %d bytes at %v", id, cl.n, cl.bps/1e3, res[id], got[id], cl.size, at[id].Round(time.Millisecond))
 					}
 				}
 			})
