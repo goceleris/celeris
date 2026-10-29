@@ -61,11 +61,12 @@ b TestH2MaxConcurrentStreamsHeadersContinuation981
 b TestNoDeprecatedPublicAPI830
 b TestHijackedConnNotCutByServerTimeoutsStd855
 
-# The write deadline's cells (celeris#889, D2): 3 to 9 s each at the root, 40 s together, shared out so that the rest stays inside its timeout.
+# The write deadline's cells (celeris#889, D2): 3 to 28 s each at the root, 70 s together, shared out so that the rest stays inside its timeout.
 a TestH2SparseWindowUpdatesAreNotCut889
 a TestH2PausedAndDribbledStreamsOnAHealthyConnAreBounded889
 a TestH2StalledTailIsResetAtWriteTimeout889
 a TestH2WindowUpdateDribblerIsResetAtTheFirstJudgement889
+a TestH2SilentClientWithASmallRemainderIsLetGo889
 b TestH2ParallelDownloadsSharingASlowLinkAreNotCut889
 b TestH2WriteRateFloor889
 b TestH2ConnWindowStarvedStreamsAreJudgedPerConnection889

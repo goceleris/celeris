@@ -303,11 +303,14 @@ func TestWriteFloorFollowsWhatTheStreamHolds889(t *testing.T) {
 // nothing is the verdict, and a tail that goes on missing half of itself is reset
 // after writeIdleWindows such windows.
 func TestWriteTailGraceIsBounded889(t *testing.T) {
-	t.Run("nothing-released-is-the-verdict", func(t *testing.T) {
+	// Nothing released is not the verdict at the first window (r9 F-A2: a connection
+	// that holds under one floor is draining its backlog, and a window can pass
+	// with nothing going out); it is the verdict after writeIdleWindows of them.
+	t.Run("nothing-released-is-held-for-the-idle-windows", func(t *testing.T) {
 		_, m, _ := wdSetup889(t)
 		stalled889(m, 1, 1000)
-		if out := windowEnd889(m, time.Now().UnixNano(), 1); len(out) != 1 {
-			t.Fatalf("expired %v, want the tail that released nothing", out)
+		if w := firstReset889(m, 1, time.Now().UnixNano(), 10, nil); w != writeIdleWindows+1 {
+			t.Fatalf("reset in window %d, want %d (held for %d)", w, writeIdleWindows+1, writeIdleWindows)
 		}
 	})
 	t.Run("half-every-window-is-bounded", func(t *testing.T) {
@@ -327,34 +330,33 @@ func TestWriteTailGraceIsBounded889(t *testing.T) {
 }
 
 // A tail held by the whole connection (several streams each waiting for a few
-// bytes, the connection's floor made of those tails) is judged by half, too.
+// bytes, the connection's floor made of those tails) is held without proof that it
+// moves: the end of a transfer is on the wire, and the drain of its backlog can take
+// more than a window (r9 F-A2; r8 judged by half of the connection's floor, which a
+// slow drain does not reach). Bounded by the idle windows, whatever went out.
 func TestWriteConnTailGrace889(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		release int
-		expired bool
 	}{
-		{"half-of-the-conn-floor-went-out", 100, false},
-		{"under-half", 99, true},
+		{"half-of-the-conn-floor-went-out", 100},
+		{"under-half", 99},
+		{"nothing-went-out", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, m, _ := wdSetup889(t)
+			start := time.Now().UnixNano()
 			for i := 0; i < 3; i++ {
 				stalled889(m, uint32(1+2*i), 100)
 			}
 			c := m.CreateStream(99)
 			c.SetState(StateOpen)
 			c.SetWindowSize(1 << 20)
-			m.ReserveSendWindow(c, int32(tc.release)) // a sibling's direct send: the conn releases
-			// The third stream armed while the conn held 200 bytes (the budget is charged after
-			// the record is made): the connection's floor is 200, half of it is 100.
-			out := m.ExpiredWrites(dueAt889(), make([]uint32, 0, 8))
-			got := false
-			for _, id := range out {
-				got = got || id == 5
+			if tc.release > 0 {
+				m.ReserveSendWindow(c, int32(tc.release)) // a sibling's direct send: the conn releases
 			}
-			if got != tc.expired {
-				t.Fatalf("expired %v, want stream 5 expired=%v", out, tc.expired)
+			if w := firstReset889(m, 5, start, 10, nil); w != writeIdleWindows+1 {
+				t.Fatalf("stream 5 reset in window %d, want %d (held for the %d idle windows)", w, writeIdleWindows+1, writeIdleWindows)
 			}
 		})
 	}

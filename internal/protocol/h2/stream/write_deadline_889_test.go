@@ -119,7 +119,12 @@ func TestExpiredWritesFloor889(t *testing.T) {
 		// in one window" was the floor). The grace is bounded: TestWriteTailGraceIsBounded889.
 		{"small-tail-nearly-all", 10000, 9999, false, true},
 		{"small-tail-half", 10000, 5000, false, true},
-		{"small-tail-under-half", 10000, 4999, true, true},
+		// Less than half went out: this was the verdict in r8 and is held now. The
+		// connection holds under one floor, so the end of the transfer is on the wire and
+		// the drain of the backlog behind it can take more than a window (r9 F-A2: 9 of 20
+		// parallel downloads were reset 2 to 8 bytes from the end). Still bounded by the
+		// idle windows; a client that never reads is let go (TestWriteUnreadSmallRemainderBounds889).
+		{"small-tail-under-half", 10000, 4999, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, m, _ := wdSetup889(t)
@@ -262,10 +267,19 @@ func TestExpiredWritesConnStarved889(t *testing.T) {
 // A batch that fills leaves the hint due and the rest for the next sweep.
 func TestExpiredWritesBatch889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
+	start := time.Now().UnixNano()
 	for i := 0; i < 40; i++ {
 		stalled889(m, uint32(1+2*i), 100)
 	}
-	now := dueAt889()
+	// The connection holds 4000 bytes, under one floor: its tail is held for the idle
+	// windows (r9 F-A2) rather than reset at the first one, and the batch limit is shown
+	// in the window after, when 40 are due.
+	for w := 1; w <= writeIdleWindows; w++ {
+		if len(windowEnd889(m, start, w)) != 0 {
+			t.Fatalf("window %d: expired, a tail is held for %d windows", w, writeIdleWindows)
+		}
+	}
+	now := start + int64(writeIdleWindows+1)*(int64(wt889)+int64(time.Millisecond))
 	out := m.ExpiredWrites(now, make([]uint32, 0, 32))
 	if len(out) != 32 {
 		t.Fatalf("first batch %d, want 32", len(out))

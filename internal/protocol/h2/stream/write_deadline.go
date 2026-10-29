@@ -322,7 +322,15 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 		switch {
 		case total >= floor:
 			hold = true
-			st.bank = min(total-floor, writeBankWindows*writeMinRelease)
+			charge := floor
+			if st.released < floor {
+				// Held on the bank alone: the window pays a whole floor, not the
+				// (smaller) rest, or a stream whose rest is under a floor and that is
+				// never read would spend a few bytes a window of its bank and live
+				// for tens of thousands of windows (r9 F-H).
+				charge = writeMinRelease
+			}
+			st.bank = min(max(total-charge, 0), writeBankWindows*writeMinRelease)
 			st.idle = 0
 		case moving:
 			share := int(connFloor) / (2 * max(len(m.stalls), 1))
@@ -333,13 +341,17 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 				hold = true
 			}
 			st.bank = 0
-		case (st.held < writeMinRelease && st.released*2 >= floor) || (st.connHeld < writeMinRelease && connRel*2 >= connFloor):
+		case (st.held < writeMinRelease && st.released*2 >= floor) || st.connHeld < writeMinRelease:
 			// A tail. What is held (by the stream, or by the whole connection) is under
 			// one floor, and "all of it in one window" is brittle: the grant for the last
 			// bytes of a response waits behind its siblings' bytes in the socket and can
 			// land just after the window (r8 F-A: reset 8 to 16 bytes before the end of
-			// a download that took 21 s). Half of it released is a grace window, inside
-			// the idle bound; nothing, or less, is the verdict.
+			// a download that took 21 s). For a stream whose own rest is small, half of
+			// it released is a grace window; when the whole connection holds under one
+			// floor, the end of the transfer is on the wire and the drain of its
+			// backlog can take more than one window (r9 F-A2: 9 of 20 parallel downloads
+			// reset 2 to 8 bytes from the end), so the connection's tail is held without
+			// that proof. Both are inside the idle bound (writeIdleWindows).
 			if st.idle++; st.idle <= writeIdleWindows {
 				hold = true
 			}
