@@ -395,18 +395,28 @@ type Config struct {
 	// take longer than three WriteTimeouts to read (N streams of W bytes in flight
 	// on a link of L bytes/s: N x W / L), so a server whose clients are on slow
 	// links should set WriteTimeout to 5s or more. When the connection itself
-	// releases less than 64 KiB, the first window is the verdict. A stream the
-	// client never grants is reset after 1+k windows alone, or 4+k with siblings
-	// that keep the connection moving, k being the number of whole 64 KiB in the
-	// bytes in flight when it stalled (about the peer's initial window), at most
-	// four: 1 and 4 WriteTimeouts for the default 64 KiB window, 5 and 8 for a
-	// window of 256 KiB or more; a one-byte WINDOW_UPDATE dribbler is reset in the
-	// 2nd window of the default window and in the 5th of a larger one. A stream
+	// releases less than 64 KiB while it holds more, the first window is the
+	// verdict. The end of a response is given grace: a stream that holds less than
+	// 64 KiB, and has had half of it sent in the window, or any stream while the
+	// connection as a whole holds less than 64 KiB (the last bytes of the transfer
+	// are on the wire, and the grant for them can wait behind its siblings' bytes in
+	// the client's socket for more than a window), is held for three windows more
+	// and reset in the fourth if nothing moves it. A stream the client never
+	// grants is reset after 1+k windows alone, or 4+k with siblings that keep the
+	// connection moving, k being the number of whole 64 KiB in the bytes in flight
+	// when it stalled (about the peer's initial window), at most four: 1 and 4
+	// WriteTimeouts for the default 64 KiB window, 5 and 8 for a window of 256 KiB or
+	// more. When what it has left to send is under 64 KiB (the response is a
+	// little longer than the window), the bytes in flight are spent a whole floor a
+	// window, and the tail grace above follows: 5 WriteTimeouts for the default
+	// window, 6 for 128 KiB, 8 for 256 KiB or more. A one-byte WINDOW_UPDATE
+	// dribbler is reset in window max(2, 1+k): the 2nd of the default window, the
+	// 3rd of 128 KiB, the 4th of 192 KiB, the 5th of 256 KiB or more. A stream
 	// whose own window has room but whose bytes wait for the connection's is
 	// credited with what the whole connection released. While such a stream
 	// lives, ReadTimeout and IdleTimeout do not close the connection
 	// (WriteTimeout is its bound), so a silent client's unread response, and the
-	// buffer it pins, lives for up to 5 WriteTimeouts (1, with the default window)
+	// buffer it pins, lives for up to 8 WriteTimeouts (5, with the default window)
 	// where it used to be dropped with the whole connection at ReadTimeout. A
 	// handler blocked waiting for window keeps its own, absolute, bound of
 	// WriteTimeout from the start of the wait, whatever the client reads: parallel

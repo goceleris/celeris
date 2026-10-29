@@ -375,8 +375,10 @@ func (c Config) WithDefaults() Config {
 // A zero means "unset" only on the first pass: once normalised is true, 0 is
 // a disabled timeout this function must leave alone, otherwise the second
 // WithDefaults (in the engine constructor) reinstates the default over an
-// explicitly disabled timeout — celeris#594. Any positive value is kept
-// verbatim on every pass, so N stays N.
+// explicitly disabled timeout — celeris#594. A positive value is kept on every
+// pass up to MaxTimeout (a hundred years, which now + timeout cannot overflow
+// with) and a larger one, math.MaxInt64 the usual way to write "never", is
+// clamped to it, so N stays N for every N below that.
 func resolveTimeout(v, def time.Duration, normalised bool) time.Duration {
 	switch {
 	case v < 0:

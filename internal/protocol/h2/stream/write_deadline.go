@@ -44,11 +44,21 @@ import (
 // dribbled or queued behind its siblings), and reset after that: the memory a
 // stream that is not read pins is bounded by writeIdleWindows+1 windows, not by
 // the siblings' life. When the connection itself releases less than the floor
-// nothing is held: the first window that does not move is the verdict, as for a
-// single stream. A stream whose own window is shut is judged by its own releases
+// nothing is held (but a tail, below): the first window that does not move is the
+// verdict, as for a single stream. A stream whose own window is shut is judged by its own releases
 // and these allowances, even when the connection window is shut too, or a client
 // could shut the conn window by dribbling to a sibling and shelter every stalled
 // stream for ever.
+//
+// The end of a response is given a grace (tail grace, r8 F-A and r9 F-A2): the grant
+// for the last bytes waits behind the siblings' bytes in the client's socket and can
+// land after the window, and the backlog behind them can take more than a window to
+// drain. A stream that holds under one floor and has had half of it released, and any
+// stream while the whole connection holds under one floor, is held for up to
+// writeIdleWindows windows without proof, reset in the next. The bank does not hide
+// an unread stream: a window held on the bank alone pays a whole floor, however
+// small the rest, so a response a little longer than the window is let go in the
+// same number of windows as a long one (r9 F-H).
 //
 // State: a record per stalled stream, in a small map on the Manager, made on the
 // first stall of the connection. Only a stream that holds buffered bytes has one,
@@ -303,7 +313,7 @@ func (m *Manager) ExpiredWrites(now int64, out []uint32) []uint32 {
 // holdsLocked is the verdict on the stalled stream st whose window has ended at
 // now: it reports whether the stream is held, and if so begins its next window.
 // starved says the stream's own window has room and the connection's is shut.
-// m.stallMu must be held. The rule is in the file's comment.
+// m.stallMu must be held. The rule, tail grace included, is in the file's comment.
 func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 	connRel := m.connReleased.Load() - st.connAt
 	connFloor := min(int64(writeMinRelease), st.connHeld)
