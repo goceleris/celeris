@@ -284,6 +284,23 @@ func runConnCloseArm884(t *testing.T, a ccArm884) {
 			<-release
 			return c.String(http.StatusOK, "ok")
 		})
+		// The late-pipelined shape (the review of celeris#1169): a response large
+		// enough to be still flushing when the engine's gate makes its first
+		// pass, whose conn then has a second request in the kernel's receive
+		// queue that reached it after the first was read.
+		bigResp := strings.Repeat("L", 16<<20)
+		s.GET("/holdbig", func(c *celeris.Context) error {
+			entered.Add(1)
+			<-release
+			return c.String(http.StatusOK, "%s", bigResp)
+		})
+		if a.async {
+			s.GET("/g/bighold", func(c *celeris.Context) error {
+				entered.Add(1)
+				<-release
+				return c.String(http.StatusOK, "%s", bigResp)
+			}).Async()
+		}
 		for _, v := range vs {
 			h := v.h
 			register := func(path string, async, gated bool) {
@@ -402,25 +419,41 @@ func runConnCloseArm884(t *testing.T, a ccArm884) {
 			flights = append(flights, flight{"in-flight " + path, v, c, br})
 			want++
 		}
-	} else {
-		// A server with no Async route: one sync handler in flight per
-		// variant would hold every loop; the sync kind is one gated /hold.
-		c, br := dial()
-		send(c, "GET /hold HTTP/1.1\r\nHost: x\r\n\r\n")
-		flights = append(flights, flight{"in-flight sync /hold", ccVariant884{name: "hold", req: ccGet884}, c, br})
+	}
+	// The late-pipelined flights: a large response, read slowly (a small receive
+	// buffer, read after the gate), and a second request written once the first
+	// is in its handler. On a server with no Async route the one gated sync
+	// handler is this flight (a second sync handler could land on the loop the
+	// first holds).
+	var lates []flight
+	late := func(path string) {
+		c := dialSmallRcvbuf884(t, srv.addr)
+		send(c, "GET "+path+" HTTP/1.1\r\nHost: x\r\n\r\n")
+		lates = append(lates, flight{"late-pipelined " + path, ccVariant884{name: "get"}, c, bufio.NewReader(c)})
 		want++
 	}
 	if a.async {
+		// Before the sync /hold: a request sent after it could land behind it on
+		// the loop it holds.
+		late("/g/bighold")
 		c, br := dial()
 		send(c, "GET /hold HTTP/1.1\r\nHost: x\r\n\r\n")
 		flights = append(flights, flight{"in-flight sync /hold", ccVariant884{name: "hold", req: ccGet884}, c, br})
 		want++
+	} else {
+		late("/holdbig")
 	}
 	for deadline := time.Now().Add(10 * time.Second); entered.Load() < want; {
 		if time.Now().After(deadline) {
 			t.Fatalf("%d of %d gated handlers entered within 10s", entered.Load(), want)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The second request of each late flight reaches the kernel now, after the
+	// first was read and while its handler runs.
+	for _, f := range lates {
+		send(f.c, "GET /v/second HTTP/1.1\r\nHost: x\r\n\r\n")
 	}
 
 	srv.beginShutdown(a.mode, 20*time.Second)
@@ -454,6 +487,16 @@ func runConnCloseArm884(t *testing.T, a ccArm884) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			wantClosed884(t, f.name, f.c, f.br, f.v, a.std)
+		}()
+	}
+	for _, f := range lates {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Read only after the gate's first pass (250 ms into the wait): the
+			// response is then still flushing, to a client that has taken 32 KiB.
+			time.Sleep(700 * time.Millisecond)
 			wantClosed884(t, f.name, f.c, f.br, f.v, a.std)
 		}()
 	}
