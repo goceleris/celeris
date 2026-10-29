@@ -311,7 +311,8 @@ type Config struct {
 	// OnDisconnect runs), whatever the middleware's idle deadline or the last
 	// read of the connection. A peer that reads, however slowly, and a
 	// connection with nothing queued are not closed (there is no minimum
-	// rate); -1 sets no such bound. The close comes between about 3/4
+	// rate; an HTTP/2 stream whose client lets its flow-control window run out
+	// is bounded by the minimum rate described below); -1 sets no such bound. The close comes between about 3/4
 	// and 5/4 of WriteTimeout after the peer last took a byte (its progress
 	// is sampled every quarter of WriteTimeout; a SEND completion restarts the
 	// clock at once), plus the engine's sweep interval (up to about 0.1 s on
@@ -378,14 +379,27 @@ type Config struct {
 	// that holds buffered bytes must have had at least 64 KiB of them (or all
 	// it held, if less) sent, released by the client's WINDOW_UPDATEs, or it is
 	// reset with RST_STREAM(INTERNAL_ERROR), as net/http resets a stream at its
-	// write deadline. A stream that takes its floor in every window is never
-	// cut (there is no ceiling, where std's deadline is absolute), and a PING or
-	// a WINDOW_UPDATE of a byte is not progress. A stream whose own window has
-	// room but whose bytes wait for the connection's is credited with what the
-	// whole connection released in the window. While such a stream lives,
-	// ReadTimeout and IdleTimeout do not close the connection (WriteTimeout is
-	// its bound); a handler blocked waiting for window keeps its own bound of
-	// WriteTimeout from the start of the wait. A request error read while a
+	// write deadline. There is no ceiling, where std's deadline is absolute: a
+	// stream that releases at least that on average, lagging the rate by no
+	// more than four windows' worth (surplus released in one update carries to
+	// the next windows, and the bytes in flight when the stream stalled cover its
+	// first), is not cut however long its response takes. A PING or a
+	// WINDOW_UPDATE of a byte is not progress. A client whose updates are further
+	// apart than WriteTimeout is fine while it releases that much per window on
+	// average and its gaps stay under about five windows. When the connection
+	// as a whole releases at least that much in a window, a stream that takes less
+	// (parallel downloads share the client's socket) is held while it takes half
+	// its fair share of it and for three windows in a row when it takes less, so a
+	// stream the client does not read pins its buffer for at most four
+	// WriteTimeouts; when the connection itself releases less, the first window
+	// is the verdict. A stream whose own window has room but whose bytes wait for
+	// the connection's is credited with what the whole connection released.
+	// While such a stream lives, ReadTimeout and IdleTimeout do not close the
+	// connection (WriteTimeout is its bound), so a silent client's unread
+	// response, and the buffer it pins, now lives for WriteTimeout where it used
+	// to be dropped with the whole connection at ReadTimeout. A handler blocked
+	// waiting for window keeps its own bound of WriteTimeout from the start of
+	// the wait. A request error read while a
 	// response is queued (a malformed request) puts the connection on the
 	// closing drain below, which counts each byte the client acknowledges and
 	// has no floor: a client that sends one and then takes a few bytes per
