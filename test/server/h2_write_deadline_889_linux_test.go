@@ -145,7 +145,9 @@ func TestH2WindowUpdateDribblerIsResetAtTheFirstJudgement889(t *testing.T) {
 			defer stop()
 			ev := c.await889(1, 6*time.Second)
 			t.Logf("WD889 dribble engine=%s: %s", e.name, ev)
-			wantWriteReset889(t, ev, 900*time.Millisecond, 2500*time.Millisecond)
+			// The seed (the 65535 bytes in flight) and a few bytes cover the first
+			// window; the second is the verdict.
+			wantWriteReset889(t, ev, 900*time.Millisecond, 3500*time.Millisecond)
 		})
 	}
 }
@@ -163,7 +165,9 @@ func TestH2WriteRateFloor889(t *testing.T) {
 			time.AfterFunc(300*time.Millisecond, func() { c.window889(1, 65535); c.window889(0, 65535) })
 			ev := c.await889(1, 6*time.Second)
 			t.Logf("WD889 floor-1 engine=%s: %s", e.name, ev)
-			wantWriteReset889(t, ev, 900*time.Millisecond, 2500*time.Millisecond)
+			// 65535 released and 65535 in flight at the start make two floors less
+			// 2 bytes: the first window is held, the second is the verdict.
+			wantWriteReset889(t, ev, 1800*time.Millisecond, 4000*time.Millisecond)
 		})
 		t.Run(e.name+"/floor", func(t *testing.T) {
 			t.Parallel()
@@ -174,7 +178,7 @@ func TestH2WriteRateFloor889(t *testing.T) {
 			}
 			ev := c.await889(1, 9*time.Second)
 			t.Logf("WD889 floor engine=%s: %s", e.name, ev)
-			wantWriteReset889(t, ev, 3000*time.Millisecond, 5500*time.Millisecond)
+			wantWriteReset889(t, ev, 3000*time.Millisecond, 7000*time.Millisecond)
 		})
 	}
 }

@@ -549,6 +549,11 @@ func TestSweepResetsAStalledStreamWithInternalError889(t *testing.T) {
 	r.written()
 	m := r.st.processor.GetManager()
 	m.UpdateConnectionWindow(1 << 20)
+	// A client with an initial window of 0: nothing is in flight when a stream stalls,
+	// so the first window is judged on what is released and not on the seed.
+	r.frames(func(fr *http2.Framer) {
+		_ = fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 0})
+	})
 	mk := func(id uint32) *stream.Stream {
 		s := m.CreateStream(id)
 		s.SetState(stream.StateHalfClosedRemote)
@@ -561,9 +566,18 @@ func TestSweepResetsAStalledStreamWithInternalError889(t *testing.T) {
 	if res := r.st.Sweep(now+int64(500*time.Millisecond), r.write); res.Expired != 0 {
 		t.Fatalf("expired half a window in: %+v", res)
 	}
-	b.SetWindowSize(65536)
-	m.FlushOutbound(b, func(uint32, bool, []byte) {}) // b released its floor, a nothing
-	res := r.st.Sweep(now+int64(1100*time.Millisecond), r.write)
+	// Stream 3 releases its floor in every window; stream 1 nothing. The connection
+	// moves, so stream 1 is held for three windows (it may be queued behind its
+	// sibling) and the fourth is the verdict.
+	var res SweepResult
+	for w := 1; w <= 4; w++ {
+		b.SetWindowSize(65536)
+		m.FlushOutbound(b, func(uint32, bool, []byte) {})
+		res = r.st.Sweep(now+int64(w)*int64(1100*time.Millisecond), r.write)
+		if (w < 4) != (res.Expired == 0) {
+			t.Fatalf("window %d: %+v", w, res)
+		}
+	}
 	if res.Expired != 1 || !res.Wrote {
 		t.Fatalf("sweep after the window: %+v, want one stream expired and the conn written", res)
 	}
