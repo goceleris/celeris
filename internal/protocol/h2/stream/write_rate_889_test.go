@@ -587,7 +587,11 @@ func TestWriteBankIsSpentByAShareWindow889(t *testing.T) {
 	// connection is under its floor. The 30000 banked in window 1 do not make 70000.
 	b.SetWindowSize(40000)
 	m.FlushOutbound(b, discard889)
-	if out := windowEnd889(m, start, 3); len(out) == 0 {
-		t.Fatal("window 3: held; the bank of window 1 survived a window held on the share")
+	reset := false
+	for _, id := range windowEnd889(m, start, 3) {
+		reset = reset || id == 1
+	}
+	if !reset {
+		t.Fatal("window 3: stream 1 held; the bank of window 1 survived a window held on the share")
 	}
 }
