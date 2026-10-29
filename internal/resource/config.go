@@ -384,6 +384,12 @@ func resolveTimeout(v, def time.Duration, normalised bool) time.Duration {
 	case v == 0 && !normalised:
 		return def
 	default:
-		return v
+		return min(v, MaxTimeout)
 	}
 }
+
+// MaxTimeout is the longest timeout the engines keep: a hundred years. A timeout of
+// math.MaxInt64 (the common way to write "never") overflowed every `now + timeout`
+// the engines compute (a deadline in the past, due at once: celeris#889 review r8
+// F-F), and a hundred years is never in any practical sense.
+const MaxTimeout = 100 * 365 * 24 * time.Hour
