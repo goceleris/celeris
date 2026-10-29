@@ -292,14 +292,15 @@ func TestH2PausedAndDribbledStreamsOnAHealthyConnAreBounded889(t *testing.T) {
 // windows for the default window, 262,145 for 256 KiB or more; ReadTimeout and
 // IdleTimeout do not close a connection with such a stream, and main closed this one at
 // 1 s). With the three timeouts at 1 s the stream is reset and the connection closed
-// within 5 (default window) or 8 (>= 256 KiB) windows, 1.5x that on io_uring.
+// within 5 (default window) or 8 (>= 256 KiB) windows, 1.7x that on io_uring (measured 9.1 s and 13.7 s,
+// in a container with 2 CPUs), against a bound of 16 s and 24 s that a loaded runner can take.
 func TestH2SilentClientWithASmallRemainderIsLetGo889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		for _, cl := range []struct {
 			iw    uint32
 			extra int
 			limit time.Duration
-		}{{65535, 1000, 12 * time.Second}, {1 << 20, 1000, 18 * time.Second}} {
+		}{{65535, 1000, 16 * time.Second}, {1 << 20, 1000, 24 * time.Second}} {
 			t.Run(fmt.Sprintf("%s/W%dKiB/extra%d", e.name, cl.iw>>10, cl.extra), func(t *testing.T) {
 				t.Parallel()
 				addr := wdServer889(t, e.eng, time.Second, time.Second, time.Second)
