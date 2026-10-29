@@ -384,22 +384,33 @@ type Config struct {
 	// more than four windows' worth (surplus released in one update carries to
 	// the next windows, and the bytes in flight when the stream stalled cover its
 	// first), is not cut however long its response takes. A PING or a
-	// WINDOW_UPDATE of a byte is not progress. A client whose updates are further
-	// apart than WriteTimeout is fine while it releases that much per window on
-	// average and its gaps stay under about five windows. When the connection
-	// as a whole releases at least that much in a window, a stream that takes less
-	// (parallel downloads share the client's socket) is held while it takes half
-	// its fair share of it and for three windows in a row when it takes less, so a
-	// stream the client does not read pins its buffer for at most four
-	// WriteTimeouts; when the connection itself releases less, the first window
-	// is the verdict. A stream whose own window has room but whose bytes wait for
-	// the connection's is credited with what the whole connection released.
-	// While such a stream lives, ReadTimeout and IdleTimeout do not close the
-	// connection (WriteTimeout is its bound), so a silent client's unread
-	// response, and the buffer it pins, now lives for WriteTimeout where it used
-	// to be dropped with the whole connection at ReadTimeout. A handler blocked
-	// waiting for window keeps its own bound of WriteTimeout from the start of
-	// the wait. A request error read while a
+	// WINDOW_UPDATE of a byte is not progress. A client that updates in big steps
+	// (nghttp2 and curl, at half the window) is fine while the gap between its
+	// updates stays under about five WriteTimeouts: half the window divided by the
+	// rate it reads at. When the connection as a whole releases at least 64 KiB
+	// in a window, a stream that takes less (parallel downloads share the
+	// client's socket) is held while it takes half its fair share of it, and for
+	// three windows in a row when it takes less: a download queued behind its
+	// siblings' bytes in the client's socket is cut where the bytes ahead of it
+	// take longer than three WriteTimeouts to read (N streams of W bytes in flight
+	// on a link of L bytes/s: N x W / L), so a server whose clients are on slow
+	// links should set WriteTimeout to 5s or more. When the connection itself
+	// releases less than 64 KiB, the first window is the verdict. A stream the
+	// client never grants is reset after 1+k windows alone, or 4+k with siblings
+	// that keep the connection moving, k being the whole 64 KiB's of the bytes in
+	// flight when it stalled, at most four (about the peer's initial window): 1 and 4
+	// WriteTimeouts for the default 64 KiB window, 5 and 8 for a window of 256 KiB or
+	// more; a one-byte WINDOW_UPDATE dribbler on such a window likewise. A stream
+	// whose own window has room but whose bytes wait for the connection's is
+	// credited with what the whole connection released. While such a stream
+	// lives, ReadTimeout and IdleTimeout do not close the connection
+	// (WriteTimeout is its bound), so a silent client's unread response, and the
+	// buffer it pins, lives for up to 5 WriteTimeouts (1, with the default window)
+	// where it used to be dropped with the whole connection at ReadTimeout. A
+	// handler blocked waiting for window keeps its own, absolute, bound of
+	// WriteTimeout from the start of the wait, whatever the client reads: parallel
+	// downloads on one connection whose responses exceed the connection's 4 MiB
+	// output budget can lose the later ones to it. A request error read while a
 	// response is queued (a malformed request) puts the connection on the
 	// closing drain below, which counts each byte the client acknowledges and
 	// has no floor: a client that sends one and then takes a few bytes per
