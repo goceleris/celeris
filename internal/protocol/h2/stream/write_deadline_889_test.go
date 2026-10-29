@@ -187,6 +187,22 @@ func TestExpiredWritesConnStarved889(t *testing.T) {
 			t.Fatalf("expired %v although the conn released 70000 bytes in the window", out)
 		}
 	})
+	t.Run("starved-by-the-conn-window-is-held-as-long-as-the-conn-moves", func(t *testing.T) {
+		// Both streams have room in their own windows and the conn window is shut:
+		// the sibling takes every grant, the other gets nothing of its own for far
+		// more than writeIdleWindows windows, and is held all the time (it waits
+		// for the connection, which is no fault of its own).
+		m, a, _ := setup(t)
+		now := dueAt889()
+		for w := 0; w < 3*writeIdleWindows; w++ {
+			m.UpdateConnectionWindow(70000)
+			m.FlushOutbound(a, discard889)
+			if out := m.ExpiredWrites(now, make([]uint32, 0, 8)); len(out) != 0 {
+				t.Fatalf("window %d: expired %v while the conn released its floor", w, out)
+			}
+			now += int64(wt889) + int64(time.Millisecond)
+		}
+	})
 	t.Run("the-conn-released-a-dribble", func(t *testing.T) {
 		m, a, _ := setup(t)
 		m.UpdateConnectionWindow(1)
@@ -528,4 +544,20 @@ func TestWriteProgressThroughFramesIsBytesReleased889(t *testing.T) {
 			t.Fatalf("expired %v: a conn WINDOW_UPDATE does not move a stream whose own window is shut", out)
 		}
 	})
+}
+
+// A pool handler's direct send (nothing buffered) makes no record: only a buffer does.
+func TestPoolDirectSendLeavesNoRecord889(t *testing.T) {
+	_, m, _ := wdSetup889(t)
+	s := m.CreateStream(1)
+	s.SetState(StateOpen)
+	s.flags.Or(flagAsyncRunning)
+	s.SetWindowSize(1 << 20)
+	n, _, onPool, err := m.StreamWrite(s, s.Gen(), make([]byte, 5000), discard889)
+	if err != nil || !onPool || n != 5000 {
+		t.Fatalf("StreamWrite = %d, onPool %v, %v", n, onPool, err)
+	}
+	if m.stalledStreams() != 0 || m.NextWriteDeadline() != 0 {
+		t.Fatalf("a direct send left %d records, hint %d", m.stalledStreams(), m.NextWriteDeadline())
+	}
 }

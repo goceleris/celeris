@@ -220,17 +220,17 @@ func TestH2ConnWindowStarvedStreamsAreJudgedPerConnection889(t *testing.T) {
 			c.request(3, "GET", "/inline889?n=2097152", true, true)
 			var n atomic.Int32
 			stop := every889(700*time.Millisecond, func() {
-				if n.Add(1) <= 5 { // 128 KiB to the conn, about 3.5 s of it
+				if n.Add(1) <= 9 { // 128 KiB to the conn, about 6.3 s of it: far more than the idle grace
 					c.window889(0, 131072)
 				}
 			})
 			defer stop()
-			ev := c.awaitAny889([]uint32{1, 3}, 9*time.Second)
+			ev := c.awaitAny889([]uint32{1, 3}, 13*time.Second)
 			t.Logf("WD889 conn-credited engine=%s: stream %d %s", e.name, ev.id, ev)
 			if !ev.reset || ev.rst != http2.ErrCodeInternal {
 				t.Fatalf("want a reset with INTERNAL_ERROR once the grants stop, got %s", ev)
 			}
-			if ev.at < 3000*time.Millisecond {
+			if ev.at < 6000*time.Millisecond {
 				t.Fatalf("a stream was reset at %v, while the conn released 128 KiB in every window (the starved sibling is credited with it)", ev.at.Round(time.Millisecond))
 			}
 		})
