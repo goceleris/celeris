@@ -361,9 +361,9 @@ func TestWriteConnTailGrace889(t *testing.T) {
 }
 
 // firstReset889 runs windows and reports the one in which stream id is expired
-// (0 if it is not in max windows). before(w) acts at the start of window w.
-func firstReset889(m *Manager, id uint32, start int64, max int, before func(w int)) int {
-	for w := 1; w <= max; w++ {
+// (0 if it is not in limit windows). before(w) acts at the start of window w.
+func firstReset889(m *Manager, id uint32, start int64, limit int, before func(w int)) int {
+	for w := 1; w <= limit; w++ {
 		if before != nil {
 			before(w)
 		}
