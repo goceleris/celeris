@@ -1165,10 +1165,11 @@ const (
 //     the request of an active conn, with Connection: close, then its conn is
 //     closed. On a server with any Async route a conn whose read leaves a partial
 //     request is promoted whatever its route, its state belongs to the dispatch
-//     goroutine, and the request is not read: not asserted (a known gap, noted in
-//     the pull request);
-//   - a conn on an Async route (promoted) that is idle is not closed by the gate:
-//     it is left to the end of the wait, which is what is pinned. (A detached
+//     goroutine; the gate reads such a request on and answers it since
+//     celeris#1166 (asserted by TestShutdownIdleAndInProgressH1ConnsWithoutHTTP2_1165);
+//   - a conn on an Async route (promoted) that is idle is closed by the gate
+//     as the others are: it is looked at under its dispatch goroutine's locks
+//     (celeris#1165; it used to be left to the end of the wait). (A detached
 //     stream on an Async route is closed once the gate has ended it: the other
 //     test.)
 func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
@@ -1323,7 +1324,7 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 				at   time.Duration
 			}
 			var finWG sync.WaitGroup
-			finRes := make(chan finResult, len(idle)+len(silent))
+			finRes := make(chan finResult, len(idle)+len(silent)+1)
 			expectFIN := func(name string, c net.Conn, br *bufio.Reader) {
 				finWG.Add(1)
 				go func() {
@@ -1344,6 +1345,11 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 			for i, c := range silent {
 				expectFIN("connection with no byte sent "+strconv.Itoa(i), c, nil)
 			}
+			if promoted != nil {
+				// A conn that served an Async route has a dispatch goroutine; the
+				// gate looks inside it and closes it when it is idle (celeris#1165).
+				expectFIN("idle Async-route conn", promoted, promotedBr)
+			}
 			finWG.Wait()
 			close(finRes)
 			var latest time.Duration
@@ -1354,15 +1360,7 @@ func TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885(t *testing.T) {
 					latest = r.at
 				}
 			}
-			t.Logf("the last of the %d idle and silent conns had its FIN %v into the shutdown", len(idle)+len(silent), latest.Round(time.Millisecond))
-			if promoted != nil {
-				_ = promoted.SetReadDeadline(begin.Add(2 * time.Second))
-				if _, err := promotedBr.ReadByte(); err == nil {
-					t.Errorf("the conn an Async route promoted read a byte after the shutdown began")
-				} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
-					t.Errorf("the conn an Async route promoted was closed (%v) at %v: it has a dispatch goroutine, and the gate leaves it to the end of the wait", err, time.Since(begin).Round(time.Millisecond))
-				}
-			}
+			t.Logf("the last of the %d idle, silent and promoted conns had its FIN %v into the shutdown", len(idle)+len(silent)+btoi1165(promoted != nil), latest.Round(time.Millisecond))
 			if up != nil {
 				// The rest of the body arrives after the gate has passed.
 				_ = up.SetWriteDeadline(time.Now().Add(3 * time.Second))
@@ -1441,4 +1439,11 @@ func waitEngineBusy1104(t *testing.T, srv *h2PoolServer759, base celeris.EngineM
 	}
 	t.Fatalf("the engine counted +%d conns and +%d requests over its baseline, want +%d and +%d before the shutdown begins",
 		m.ActiveConnections-base.ActiveConnections, m.RequestCount-base.RequestCount, conns, reqs)
+}
+
+func btoi1165(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
