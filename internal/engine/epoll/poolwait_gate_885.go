@@ -23,6 +23,13 @@ import (
 // TestShutdownPoolWaitStopsServingH1AndDetached884 on epoll: 16 of 16
 // requests answered and about 700 ticks written 1.5 s into the shutdown.
 //
+// The gate is not what makes a response close any more (celeris#884): from
+// Engine.Shutdown on, every HTTP/1 response written, in the first poolWaitGrace
+// as after it, carries Connection: close and ends its conn (conn.H1State.Shutdown,
+// read where the response head is built). The CloseAfter marks below stay: they
+// make a conn the gate meets close-after for the request it reads on, and are the
+// per-conn half the flag does not replace.
+//
 // The gate comes poolWaitGrace after the wait began, as the send drain's does,
 // so a request in flight when the shutdown began is still answered. From then
 // on the loop reads no more new requests from an HTTP/1 conn (refuseRecv) and
@@ -51,10 +58,14 @@ import (
 // (its client gets a FIN and reconnects), whatever kind of route it is on. A
 // conn a dispatch goroutine owns (asyncPromoted: on a server with any Async
 // route every conn whose read leaves a partial request is promoted, whatever its
-// route, and a conn on an Async route is) is otherwise left to the end of the
-// wait, with a request in progress on it unread: the documented behaviour and
-// a follow-up (io_uring's gate, shutdown_gate_884.go, looks inside such a conn
-// under the goroutine's own locks and closes it when idle).
+// route, and a conn on an Async route is) is looked at under the goroutine's own
+// locks, as io_uring's gate does (shutdown_gate_884.go; celeris#1165, #1166):
+// closed when idle, read on and answered when a request is in progress on it.
+//
+// A loop with no HTTP/2 conn runs the same gate for as long as an HTTP/1
+// request is in progress on it (poolWaitSettled), and closes its idle conns at
+// the start of shutdown (celeris#1104), so the gate's behaviour does not depend
+// on whether the server has an HTTP/2 client.
 
 // poolWaitGrace is how long into the wait for the HTTP/2 pool handlers the
 // gate stays open: io_uring's shutdownSendDrainNanos, and this engine's
@@ -72,9 +83,10 @@ const gateClosesPerPass = 64
 // detected yet, which io_uring's gateReadsOn mirrors: a request in progress is
 // read on, and answered, as std's Shutdown answers the request of an active
 // conn (headers in pieces, a body still arriving, the bytes of a protocol
-// decision begun). A conn whose
-// dispatch goroutine owns its parse state (asyncPromoted) is refused as before
-// while it is HTTP/1: its state is not the loop's to read. Loop thread.
+// decision begun). A conn whose dispatch goroutine owns its parse state
+// (asyncPromoted) is looked at the same way, under its locks (celeris#1166):
+// read on while a request is in progress on it, refused when it is idle. Loop
+// thread.
 func refusesRecv(cs *connState) bool {
 	if cs.gateRead {
 		// The gate's first pass found the bytes of a request in the kernel's
@@ -87,14 +99,19 @@ func refusesRecv(cs *connState) bool {
 	}
 	if cs.asyncPromoted {
 		// protocol, h1State and h2State are the dispatch goroutine's, which
-		// writes them in switchToH2Local under detachMu: not read here. The
-		// conn is HTTP/1 until the goroutine sets h2Switched (under asyncInMu,
-		// which is held for an instant, never across a handler, so waiting for
-		// it cannot stall the pass), and an HTTP/1 conn it owns is refused, as
-		// before; one it has switched is HTTP/2 and is served (celeris#885
-		// item 28). Not refused on asyncPromoted alone: the pool wait is for
-		// the HTTP/2 conns.
-		return !cs.switchedToH2()
+		// writes them in switchToH2Local under detachMu: not read here but
+		// under the lock (promotedRequestInProgress). The conn is HTTP/1 until the
+		// goroutine sets h2Switched (under asyncInMu, which is held for an
+		// instant, never across a handler, so waiting for it cannot stall the
+		// pass); one it has switched is HTTP/2 and is served (celeris#885 item
+		// 28). An HTTP/1 conn it owns is read on while a request is in progress
+		// on it (input waiting for the goroutine, a handler running, a parser
+		// holding part of a request), as io_uring's gateReadsOn does for a
+		// promoted conn (celeris#1166), and refused when it is idle.
+		if cs.switchedToH2() {
+			return false
+		}
+		return !promotedRequestInProgress(cs, false)
 	}
 	if cs.protocol != engine.HTTP1 {
 		return false
@@ -150,40 +167,53 @@ func (l *Loop) closeIdleH1(first bool, now int64) int {
 		if cs.hijacked.Load() {
 			continue
 		}
-		// A conn a dispatch goroutine owns is closed here only when the gate has
-		// ended its detached stream (an SSE or WebSocket handler on an Async
-		// route detaches on that goroutine): the goroutine is out of its handler,
-		// since detachClosed is set only under a detachMu the handler held, its
-		// writes no-op, and closeConn takes the lock as shutdown's own teardown
-		// does. The state is read under the lock.
-		ended := false
+		// A conn a dispatch goroutine owns (asyncPromoted: every conn that ever served
+		// an Async route, and on a server with any Async route every conn whose
+		// request once arrived in pieces) is looked at as io_uring's gate looks at
+		// it (gateCloseable, celeris#884; here celeris#1165): not while the goroutine
+		// has input waiting or is inside a handler (promotedGateState), and then
+		// under detachMu, which a goroutine parked between requests does not hold.
+		// Closed when the gate has ended its detached stream, or when it is idle:
+		// no request in progress in its parser. The state is read under the lock;
+		// closeConn takes the lock itself, and a goroutine that is parked exits on
+		// the asyncClosed it sets.
+		ended, promotedIdle := false, false
 		if cs.asyncPromoted {
-			mu := cs.detachMu
-			if mu == nil || !mu.TryLock() {
-				continue
-			}
-			ended = cs.detachClosed && cs.protocol == engine.HTTP1 && cs.h1State != nil && cs.h1State.Detached.Load()
-			mu.Unlock()
-			if !ended {
+			ended, promotedIdle = promotedGateState(cs)
+			if !ended && !promotedIdle {
 				continue
 			}
 		}
-		if cs.detected {
-			if cs.protocol != engine.HTTP1 {
-				continue
-			}
-			if h := cs.h1State; h != nil && !ended {
-				// A request read after the gate is answered close-after (net/http
-				// does the same for a response written after Shutdown began).
-				h.CloseAfter = true
-				if h.HasPendingData() || (h.Detached.Load() && !cs.detachClosed) {
+		h1Detached := false
+		if !promotedIdle {
+			if cs.detected {
+				if cs.protocol != engine.HTTP1 {
 					continue
 				}
+				if h := cs.h1State; h != nil && !ended {
+					// A request read after the gate is answered close-after (net/http
+					// does the same for a response written after Shutdown began).
+					h.CloseAfter = true
+					if h.HasPendingData() || (h.Detached.Load() && !cs.detachClosed) {
+						continue
+					}
+				}
+			} else if cs.detectN != 0 {
+				continue
 			}
-		} else if cs.detectN != 0 {
-			continue
+			h1Detached = cs.h1State != nil && cs.h1State.Detached.Load()
 		}
-		if first && !ended && (cs.h1State == nil || !cs.h1State.Detached.Load()) {
+		if first && !ended && !h1Detached && cs.peerClosed {
+			// A conn that is already closing (closeWhenFlushed after a response
+			// that said Connection: close, or a peer's FIN) is not read again
+			// and not served: its close waits for the response it has queued.
+			// A request in its receive queue reached it behind that response
+			// (pipelined late), and is dropped unparsed (celeris#884). It is
+			// read off and discarded, not left: close(2) with unread bytes in the
+			// receive queue sends an RST, which destroys the response still in
+			// flight (a 16 MiB body arrived at 14.5 to 15.3 MiB, then ECONNRESET).
+			discardUnreadOfClosingConn(cs.fd)
+		} else if first && !ended && !h1Detached {
 			// The kernel's receive queue, last before the tests that lead to
 			// the close, so that the window between the question and close(2)
 			// is the few microseconds of those tests (a request that arrives
@@ -213,6 +243,21 @@ func (l *Loop) closeIdleH1(first bool, now int64) int {
 		closed++
 	}
 	return closed
+}
+
+// discardUnreadOfClosingConn reads what the kernel holds in fd's receive queue
+// and drops it, without parsing it: the bytes of a request that reached a conn
+// after the response that closes it (see closeIdleH1). Bounded (64 reads of 4
+// KiB; the rest of a flood is the close's RST, as before); EAGAIN, an EOF or an
+// error ends it. Loop thread, on a conn that is closing and so not read by
+// anything else.
+func discardUnreadOfClosingConn(fd int) {
+	var buf [4096]byte
+	for range 64 {
+		if n, err := unix.Read(fd, buf[:]); n <= 0 || err != nil {
+			return
+		}
+	}
 }
 
 // testHookGateBeforeClose, when set, runs on the loop thread in closeIdleH1
@@ -317,4 +362,157 @@ func (l *Loop) stopDetachedProducers() {
 		}
 		mu.Unlock()
 	}
+}
+
+// promotedGateState is closeIdleH1's look at a conn whose dispatch goroutine
+// owns its parse state (asyncPromoted). ended: the gate has ended its detached
+// stream and what was queued has been handed over, so the conn may be closed.
+// idle: the goroutine is parked with no input waiting, nothing is detached, the
+// conn is still HTTP/1 and its parser holds no part of a request; the conn is
+// marked close-after, as the gate marks every conn it meets, since the loop
+// cannot know that no request will follow before it closes the conn. Both false
+// while the goroutine has work (dispatchHasWork) or holds detachMu inside a
+// handler or a guarded write, and for a conn the goroutine switched to HTTP/2.
+// Loop thread.
+func promotedGateState(cs *connState) (ended, idle bool) {
+	cs.asyncInMu.Lock()
+	busy := len(cs.asyncInBuf) > 0 || (cs.asyncRun && !cs.asyncParked && !cs.asyncDetachUnlocked)
+	cs.asyncInMu.Unlock()
+	if busy {
+		return false, false
+	}
+	mu := cs.detachMu
+	if mu == nil || !mu.TryLock() {
+		return false, false
+	}
+	defer mu.Unlock()
+	h := cs.h1State
+	if h == nil || cs.protocol != engine.HTTP1 || cs.switchedToH2() {
+		return false, false
+	}
+	if h.Detached.Load() {
+		return cs.detachClosed, false
+	}
+	h.CloseAfter = true
+	return false, !h.HasPendingData() && h.AtRequestBoundary()
+}
+
+// poolWaitSettled reports whether a loop whose context is cancelled may go on to
+// shutdown(): the HTTP/2 pool handlers are done (h2PoolSettled) and no HTTP/1
+// request is in progress on it (celeris#1166). The gate answers a request in
+// progress (a slow upload, headers in pieces, a body arriving, a request not
+// read yet) with Connection: close, as std's Shutdown does; it ran only on a loop
+// that had an HTTP/2 conn to wait for, and on every other loop shutdown() cut the
+// request with its conn, unanswered. A loop with such a request now waits for
+// it as it waits for the pool handlers, from h2DrainStart and for as long as
+// sendDrainWait gives, and runs the same gate meanwhile (poolWaitGate). Loop
+// thread.
+func (l *Loop) poolWaitSettled() bool {
+	if !l.h2PoolSettled() {
+		return false
+	}
+	if !l.h1InProgress() {
+		return true
+	}
+	if l.h2DrainStart.IsZero() {
+		l.h2DrainStart = time.Now()
+	}
+	_, more := l.sendDrainWait(l.h2DrainStart)
+	return !more
+}
+
+// h1InProgress reports whether an HTTP/1 conn of the loop has a request in
+// progress: part of one in its parser (headers in pieces, a body arriving, an
+// upgrade pending), the protocol decision of its first bytes begun, a dispatch
+// goroutine with input waiting or inside a handler, and, on the first call of the
+// shutdown, bytes in the kernel's receive queue of a conn that holds nothing (a
+// request that reached the kernel before the cancel and that the loop has not
+// read: the epoll event that reports it is still to come, and the gate's first
+// pass holds it as celeris#1104 does). Detached streams and HTTP/2 conns are not
+// requests in progress here (the gate ends the first, h2PoolSettled waits for the
+// second). It is asked at most once per h2PoolDrainPollMs while it answers yes.
+// Loop thread.
+func (l *Loop) h1InProgress() bool {
+	now := time.Now().UnixNano()
+	if l.h1InProgressNext != 0 && now < l.h1InProgressNext {
+		return true
+	}
+	first := !l.h1InProgressAsked
+	l.h1InProgressAsked = true
+	for i := len(l.liveConns) - 1; i >= 0; i-- {
+		cs := l.liveConns[i]
+		if cs.hijacked.Load() {
+			continue
+		}
+		if cs.asyncPromoted {
+			if promotedRequestInProgress(cs, first) {
+				l.h1InProgressNext = now + int64(h2PoolDrainPollMs*time.Millisecond)
+				return true
+			}
+			continue
+		}
+		if cs.detected {
+			if cs.protocol != engine.HTTP1 {
+				continue
+			}
+			if h := cs.h1State; h != nil && !h.Detached.Load() && (h.HasPendingData() || !h.AtRequestBoundary()) {
+				l.h1InProgressNext = now + int64(h2PoolDrainPollMs*time.Millisecond)
+				return true
+			}
+		} else if cs.detectN != 0 {
+			l.h1InProgressNext = now + int64(h2PoolDrainPollMs*time.Millisecond)
+			return true
+		}
+		// A detached stream is not asked: its writer goroutine owns the conn's
+		// write state (writeBuf and the fields csWritePending reads) under its own
+		// lock, which the loop does not take here, so the test for Detached comes
+		// before the one for the queue.
+		if detached := cs.h1State != nil && cs.h1State.Detached.Load(); first && !detached && !csWritePending(cs) {
+			if q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ); err == nil && q != 0 {
+				l.h1InProgressNext = now + int64(h2PoolDrainPollMs*time.Millisecond)
+				return true
+			}
+		}
+	}
+	l.h1InProgressNext = 0
+	return false
+}
+
+// promotedRequestInProgress is h1InProgress's look at a conn whose dispatch
+// goroutine owns its parse state: true while input waits for the goroutine, it is
+// inside a handler (not one that has detached and streams inline), or its parser
+// holds part of a request. A lock held by a goroutine that is parked is a guarded
+// write of a stream, not a request. With askKernel (the shutdown's first look)
+// the kernel's receive queue of an idle conn that holds nothing is asked too.
+// Loop thread.
+func promotedRequestInProgress(cs *connState, askKernel bool) bool {
+	cs.asyncInMu.Lock()
+	busy := len(cs.asyncInBuf) > 0 || (cs.asyncRun && !cs.asyncParked && !cs.asyncDetachUnlocked)
+	cs.asyncInMu.Unlock()
+	if busy {
+		return true
+	}
+	mu := cs.detachMu
+	if mu == nil || !mu.TryLock() {
+		return false
+	}
+	defer mu.Unlock()
+	h := cs.h1State
+	if h == nil || cs.protocol != engine.HTTP1 || cs.switchedToH2() || h.Detached.Load() {
+		return false
+	}
+	if h.HasPendingData() || !h.AtRequestBoundary() {
+		return true
+	}
+	if askKernel && !csWritePending(cs) {
+		// The goroutine is parked with no input (busy above) and the lock is
+		// ours, so nothing writes the state csWritePending reads: the question
+		// h1InProgress asks of a plain conn on its first call, here (review r2 of
+		// celeris#1168: a request in the kernel's queue of an idle promoted conn
+		// was cut by phase 0 while a plain conn's was waited for).
+		if q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ); err == nil && q != 0 {
+			return true
+		}
+	}
+	return false
 }

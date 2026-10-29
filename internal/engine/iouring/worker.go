@@ -843,6 +843,12 @@ type Worker struct {
 	drainBudget  *atomic.Pointer[context.Context]
 	h2DrainStart int64
 
+	// shutdownBegun points at the engine's flag of a shutdown that has begun
+	// (Engine.shutdownBegun), which every HTTP/1 conn's H1State carries
+	// (initProtocol): see conn.H1State.Shutdown. nil in a worker built without
+	// an engine (tests): no conn closes for it.
+	shutdownBegun *atomic.Bool
+
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
 	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
@@ -1553,6 +1559,11 @@ func (w *Worker) run(ctx context.Context) {
 
 	for {
 		if ctx.Err() != nil {
+			// A context cancelled with no Engine.Shutdown (a Listen caller's
+			// own cancel): the shutdown has begun all the same.
+			if sb := w.shutdownBegun; sb != nil && !sb.Load() {
+				sb.Store(true)
+			}
 			// celeris#595: a response produced by a handler that was
 			// still running when the context was cancelled has only been
 			// PREPARED at this point — flushSend sets cs.sending when it
@@ -1628,7 +1639,7 @@ func (w *Worker) run(ctx context.Context) {
 				if w.shutdownDrainStart == 0 {
 					w.shutdownDrainStart = now
 				}
-				if !w.hasPendingSends() {
+				if !w.hasPendingSends() && !w.h1RequestInProgress() {
 					w.shutdown()
 					return
 				}
@@ -3363,6 +3374,7 @@ func (w *Worker) initProtocol(cs *connState) {
 		// decision begun, or a request the gate reads on) is answered
 		// close-after, as the conns the gate has met are (celeris#1104).
 		cs.h1State.CloseAfter = w.refuseRecv
+		cs.h1State.Shutdown = w.shutdownBegun
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue

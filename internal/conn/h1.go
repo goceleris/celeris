@@ -141,8 +141,9 @@ var errConnectionClose = errors.New("connection close requested")
 // to signal that the server is willing to accept the request body.
 var continue100Response = []byte("HTTP/1.1 100 Continue\r\n\r\n")
 
-// expectation417Response is sent when OnExpectContinue rejects the request.
-var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n")
+// expectation417Response is sent when OnExpectContinue rejects the request. The
+// conn is closed after it (the body bytes may follow), and says so.
+var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 
 // H1State holds per-connection H1 parsing state.
 type H1State struct {
@@ -356,6 +357,23 @@ type H1State struct {
 	// connection that is about to be closed. Set and read on the goroutine that
 	// runs ProcessH1 (the loop thread for a conn the loop parses).
 	CloseAfter bool
+
+	// Shutdown, set by the native engines (epoll, io_uring) to their flag of a
+	// shutdown that has begun (celeris#884, celeris#885), is CloseAfter's
+	// engine-wide twin: once it is up, every final HTTP/1 response (status 200
+	// and up) that is written carries exactly one Connection: close and the
+	// connection ends after it (ProcessH1 returns errConnectionClose, and drops
+	// the bytes already read behind that request). Unlike CloseAfter, which is
+	// per conn, set on the thread that runs ProcessH1 and read when a request
+	// begins, the flag is read when the response head is built, so it covers a
+	// handler that was running when Shutdown began, on the loop's own thread or
+	// on an Async route's goroutine, with no write to a field another goroutine
+	// reads. Both feed the one decision: the response adapter's keepAlive, and
+	// req.KeepAlive after the handler. Not set by the std engine: net/http ends
+	// the conn after a response written past Shutdown on its own. nil: no flag.
+	// Not for 1xx heads (101 is a handshake), a detached stream (its conn is the
+	// handler's), a hijacked conn or HTTP/2.
+	Shutdown *atomic.Bool
 }
 
 // TakeBufferedBytes returns a copy of any bytes ProcessH1 stashed in the
@@ -1458,6 +1476,7 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	if rw.write == nil {
 		rw.write = write
 		rw.hijackFn = state.HijackFn
+		rw.shutdown = state.Shutdown
 	}
 	rw.keepAlive = req.KeepAlive
 	rw.isHEAD = req.Method == "HEAD"
@@ -1490,6 +1509,9 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 		state.stream = nil
 		return ErrHijacked
 	}
+	// Read once: a detached handler's goroutine owns the adapter, and rw is not
+	// read when it is set (Detached is published before Context.Detach returns).
+	detached := state.Detached.Load()
 	// A StreamWriter response the handler did not close is ended here, as
 	// net/http ends a response when its handler returns (celeris#889): with the
 	// last chunk, or, for a response the handler broke off after its headers or
@@ -1497,7 +1519,7 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	// connection without it, so that a truncated body does not look whole. A
 	// detached handler's goroutine owns the response, and the adapter is not
 	// read: Detached is published before Context.Detach returns.
-	if !state.Detached.Load() && rw.streamBegun {
+	if !detached && rw.streamBegun {
 		var err error
 		switch {
 		case rw.streamInterim:
@@ -1518,7 +1540,21 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 		if cap(rw.chunkBuf) > chunkScratchKeep {
 			rw.chunkBuf = nil
 		}
+		if !rw.keepAlive {
+			req.KeepAlive = false // a head written past the start of the shutdown said close
+		}
 		return err
+	}
+	// A response written once the engine's shutdown had begun said
+	// Connection: close and cleared rw.keepAlive (closing): the connection ends
+	// after it, whatever the request asked for. This is the decision CloseAfter
+	// makes at the start of a request, taken where the response is written, for
+	// the handler that was already running when Shutdown began. ProcessH1 reads
+	// req.KeepAlive after every handler (errConnectionClose), and drops the
+	// bytes read behind this request: net/http does not serve a pipelined
+	// request behind the response that closes its conn.
+	if !detached && !rw.keepAlive {
+		req.KeepAlive = false
 	}
 	return nil
 }

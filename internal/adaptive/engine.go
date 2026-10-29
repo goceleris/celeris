@@ -1153,6 +1153,15 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	done := e.listenDone
 	e.listenMu.Unlock()
 
+	// The sub-engines raise their shutdown flags (every HTTP/1 response from then
+	// on carries Connection: close, celeris#884) in their Shutdown below, which
+	// runs once lockForShutdown has e.mu: a switch that holds it (a standby build
+	// waits up to 5 s for its bind) delays the flags, and the sub-engines cannot be
+	// reached without it (e.primary and e.secondary are what e.mu guards, and the
+	// standby may not exist yet). A response written in that wait is keep-alive; a
+	// Shutdown that gives the lock up cancels Listen's context, which every loop
+	// and worker turns into the flag too.
+	//
 	// Hand ctx to the sub-engines before the cancel below stops them:
 	// epoll's Shutdown makes it the budget of the send drain its loops run
 	// as they stop (celeris#760), and after the cancel it would come too
