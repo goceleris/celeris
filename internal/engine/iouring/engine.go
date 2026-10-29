@@ -124,6 +124,13 @@ type Engine struct {
 	// wait for HTTP/2 pool handlers the workers run when Listen's context is
 	// cancelled (celeris#759; Worker.h2PoolSettled).
 	drainBudget atomic.Pointer[context.Context]
+
+	// shutdownBegun goes up when Shutdown is called (or a worker sees Listen's
+	// context cancelled) and stays up: it is never lowered, so an Engine is not
+	// reusable after Shutdown (a Server builds a new one per Start). Every worker's H1State points at it
+	// (conn.H1State.Shutdown): from then on each HTTP/1 response carries
+	// Connection: close and ends its conn (celeris#884, celeris#885).
+	shutdownBegun atomic.Bool
 }
 
 // New creates a new io_uring engine.
@@ -579,6 +586,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.multishotRecv = e.multishotRecv
 		w.pause = &e.pause // celeris#662 pause linger
 		w.drainBudget = &e.drainBudget
+		w.shutdownBegun = &e.shutdownBegun
 		workers[i] = w
 	}
 	return workers, nil
@@ -623,6 +631,9 @@ func fallbackTier(current TierStrategy) TierStrategy {
 // when Listen's context is cancelled (celeris#759): Server.Shutdown calls it
 // before it cancels that context.
 func (e *Engine) Shutdown(ctx context.Context) error {
+	// First: a response written from here on says Connection: close, one a
+	// handler is still writing included (see conn.H1State.Shutdown).
+	e.shutdownBegun.Store(true)
 	e.drainBudget.Store(&ctx)
 	e.mu.Lock()
 	defer e.mu.Unlock()

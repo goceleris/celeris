@@ -92,6 +92,13 @@ type Engine struct {
 	// send drain the loops run when Listen's context is cancelled
 	// (celeris#760; see Loop.drainSends).
 	drainBudget atomic.Pointer[context.Context]
+
+	// shutdownBegun goes up when Shutdown is called (or a loop sees Listen's
+	// context cancelled) and stays up: it is never lowered, so an Engine is not
+	// reusable after Shutdown (a Server builds a new one per Start). Every loop's H1State points at it
+	// (conn.H1State.Shutdown): from then on each HTTP/1 response carries
+	// Connection: close and ends its conn (celeris#884, celeris#885).
+	shutdownBegun atomic.Bool
 }
 
 // portHoldHook is called by Listen with the address a port 0 was resolved
@@ -188,6 +195,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l.sweepCnt = &e.metrics.sweep
 		l.pause = &e.pause
 		l.drainBudget = &e.drainBudget
+		l.shutdownBegun = &e.shutdownBegun
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -266,6 +274,9 @@ func (e *Engine) Listen(ctx context.Context) error {
 // of StartWithContext's context reaches the loops first but the watcher's
 // Shutdown follows at once, within the drain's floor.
 func (e *Engine) Shutdown(ctx context.Context) error {
+	// First: a response written from here on says Connection: close, one a
+	// handler is still writing included (see conn.H1State.Shutdown).
+	e.shutdownBegun.Store(true)
 	e.drainBudget.Store(&ctx)
 	return nil
 }
