@@ -229,6 +229,10 @@ type Loop struct {
 	// walk the conns again. Loop thread.
 	refuseRecv        bool
 	producersStopNext int64
+	// h1InProgressNext and h1InProgressAsked pace and mark the shutdown's look
+	// for HTTP/1 requests in progress (poolWaitSettled, celeris#1166).
+	h1InProgressNext  int64
+	h1InProgressAsked bool
 
 	// transplantInFlight counts connections this loop has detached for a
 	// transplant whose hand-off is not finished yet — the deferred async
@@ -567,7 +571,7 @@ func (l *Loop) run(ctx context.Context) {
 			if sb := l.shutdownBegun; sb != nil && !sb.Load() {
 				sb.Store(true)
 			}
-			if l.h2PoolSettled() {
+			if l.poolWaitSettled() {
 				l.shutdown()
 				return
 			}

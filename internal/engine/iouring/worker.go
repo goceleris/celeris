@@ -1639,7 +1639,7 @@ func (w *Worker) run(ctx context.Context) {
 				if w.shutdownDrainStart == 0 {
 					w.shutdownDrainStart = now
 				}
-				if !w.hasPendingSends() {
+				if !w.hasPendingSends() && !w.h1RequestInProgress() {
 					w.shutdown()
 					return
 				}

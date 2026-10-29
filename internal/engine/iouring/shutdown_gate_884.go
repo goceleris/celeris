@@ -48,8 +48,7 @@ import (
 // asyncInMu says whether input is waiting for it or it is inside a handler,
 // and detachMu, taken with TryLock as every worker-thread site does (celeris#593),
 // is free only while the goroutine is between requests, so h1State is read under
-// it. Epoll cannot yet look inside such a conn (its follow-up F2); this engine
-// can.
+// it. Epoll looks inside such a conn the same way (celeris#1165, #1166).
 
 // gateClosesPerPass caps the conns closeIdleH1 closes in one pass, so that a
 // worker with thousands of idle conns does not stop serving the conns the gate
@@ -350,4 +349,47 @@ func (w *Worker) closeIdlePaced(now int64) {
 	}
 	w.producersStopNext = now + int64(h2PoolDrainPoll)
 	w.closeIdleH1()
+}
+
+// h1RequestInProgress reports whether an HTTP/1 conn of the worker has a request
+// in progress: part of one in its parser, the bytes of a protocol decision
+// begun, or a dispatch goroutine with input waiting or inside a handler
+// (promotedInProgress). With sends pending the send drain keeps the worker
+// turning and the gate reads such a request on and answers it; with none, the
+// worker used to shut down at once and cut the request with its conn, unanswered
+// (celeris#1166, as epoll's loop with no HTTP/2 conn did). It now waits for it,
+// bounded as the drain is (drainEnd), with the same gate meanwhile. A request
+// still in the kernel's queue or a recv CQE not reaped is not seen here (the
+// gate's first pass holds those at the floor, when the drain is still on).
+// Worker thread.
+func (w *Worker) h1RequestInProgress() bool {
+	for _, fd := range w.liveConns {
+		cs := w.conns[fd]
+		if cs == nil || cs.closing {
+			continue
+		}
+		if !cs.detected {
+			if len(cs.detectAccum) > 0 {
+				return true
+			}
+			continue
+		}
+		if engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
+			continue
+		}
+		if cs.asyncPromoted.Load() {
+			if w.promotedInProgress(cs) {
+				return true
+			}
+			continue
+		}
+		h := cs.h1State
+		if h == nil || h.Detached.Load() {
+			continue
+		}
+		if cs.recvIntoBody || h.HasPendingData() || !h.AtRequestBoundary() {
+			return true
+		}
+	}
+	return false
 }
