@@ -71,3 +71,20 @@ b TestH2WriteRateFloor889
 b TestH2ConnWindowStarvedStreamsAreJudgedPerConnection889
 b TestH2FlowingDownloadAndQuietStreamAreNotCut889
 b TestH2SilentClientWithAStalledResponseKeepsTheConnUntilTheStreamIsReset889
+
+# The rest step of the Unit job (test/server, -race, -timeout=540s) was at 539.2 s on the merge of #1169 (main alone: 501 s), 0.8 s from its timeout:
+# the 14 slowest tests of the root packages still in it (8 to 34 s each, 216 s of CI test time) move to the shards, which have 300 s of room.
+a TestShutdownConnCloseContract884
+a TestStreamWriterOverCapH1_875
+a TestDefaultMaxRequestBodySize4MiB889
+a TestConcurrentResponsesOwnTheirBodies
+a TestShutdownRunningAsyncHandlerAnswersCloseWithSlowDownloader884
+a TestShutdownPoolWaitStopsServingH1AndDetached884
+a TestSplitBodyResponsesKeepTheConnection
+b TestIOUringShutdownGateConns884
+b TestSeveralCookieLinesAreOneFieldOnEveryEngine889
+b TestExpectContinueOverLimit889
+b TestEpollStaticFileDownloadAtAModerateRateCompletes885
+b TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885
+b TestShutdownIdleAndInProgressH1ConnsWithoutHTTP2_1165
+b TestShutdownPoolWaitGateClosesIdleH1AndEndsDetached885
