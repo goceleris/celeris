@@ -170,6 +170,15 @@ func TestRefusesRecvReadsOnAPromotedConnOnlyWhileARequestIsInProgress1166(t *tes
 		refuse bool
 	}{
 		{"idle", func(*promoted1165) {}, true},
+		{"idle-with-a-request-arriving-after-the-gate", func(r *promoted1165) {
+			if _, err := unix.Write(r.peer, []byte("GET /y HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+				panic(err)
+			}
+		}, true},
+		{"detached-stream-with-bytes-in-its-parser", func(r *promoted1165) {
+			_ = conn.ProcessH1(context.Background(), []byte("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc"), r.cs.h1State, r.l.handler, func([]byte) {})
+			r.cs.h1State.Detached.Store(true)
+		}, true},
 		{"partial-request-in-the-parser", func(r *promoted1165) {
 			_ = conn.ProcessH1(context.Background(), []byte("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc"), r.cs.h1State, r.l.handler, func([]byte) {})
 		}, false},
@@ -232,6 +241,10 @@ func TestH1InProgressDecidesTheWaitOfALoopWithoutHTTP21166(t *testing.T) {
 			r.cs.asyncParked = false
 			r.cs.asyncInMu.Unlock()
 		}, true},
+		{"promoted-detached-stream-with-bytes-in-its-parser", func(r *promoted1165) {
+			partial(r)
+			r.cs.h1State.Detached.Store(true)
+		}, false},
 		{"promoted-parked-with-a-guarded-write", func(r *promoted1165) { r.cs.detachMu.Lock() }, false},
 		{"plain-detached-stream", plain(func(r *promoted1165) {
 			partial(r)
@@ -353,4 +366,50 @@ func TestH1InProgressDoesNotReadADetachedStreamsWriteState1166(t *testing.T) {
 	}
 	close(stop)
 	<-done
+}
+
+// celeris#1166 (review r2 of #1168, MINOR-2). A request that reached the
+// kernel before the cancel, on an idle PROMOTED conn, is as much a request in
+// progress as on a plain conn: the first call asks the kernel's queue, inside
+// the conn's lock and only with the goroutine parked and nothing queued (the
+// plain conn's line would read state the dispatch goroutine owns).
+func TestH1InProgressAsksTheKernelAboutAPromotedConn1166(t *testing.T) {
+	send := func(r *promoted1165) {
+		if _, err := unix.Write(r.peer, []byte("GET /y HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("unread-request-first-call", func(t *testing.T) {
+		r := newPromoted1165(t)
+		send(r)
+		if !r.l.h1InProgress() {
+			t.Fatal("a request in the kernel's queue of an idle promoted conn is not in progress: the loop would shut down and cut it")
+		}
+		r.l.h1InProgressNext = 0
+		if r.l.h1InProgress() {
+			t.Fatal("the second call asked the kernel again")
+		}
+	})
+	t.Run("nothing-unread", func(t *testing.T) {
+		r := newPromoted1165(t)
+		if r.l.h1InProgress() {
+			t.Fatal("an idle promoted conn with an empty queue is in progress")
+		}
+	})
+	t.Run("response-queued-is-not-asked", func(t *testing.T) {
+		r := newPromoted1165(t)
+		send(r)
+		r.cs.writeBuf = append(r.cs.writeBuf, 'x') // a conn that holds a response is not asked, as a plain one
+		if r.l.h1InProgress() {
+			t.Fatal("a promoted conn with a response queued was asked about the kernel's queue")
+		}
+	})
+	t.Run("detached-stream-is-not-asked", func(t *testing.T) {
+		r := newPromoted1165(t)
+		send(r)
+		r.cs.h1State.Detached.Store(true)
+		if r.l.h1InProgress() {
+			t.Fatal("a detached stream was asked about the kernel's queue")
+		}
+	})
 }

@@ -104,7 +104,7 @@ func refusesRecv(cs *connState) bool {
 		if cs.switchedToH2() {
 			return false
 		}
-		return !promotedRequestInProgress(cs)
+		return !promotedRequestInProgress(cs, false)
 	}
 	if cs.protocol != engine.HTTP1 {
 		return false
@@ -413,7 +413,7 @@ func (l *Loop) h1InProgress() bool {
 			continue
 		}
 		if cs.asyncPromoted {
-			if promotedRequestInProgress(cs) {
+			if promotedRequestInProgress(cs, first) {
 				l.h1InProgressNext = now + int64(h2PoolDrainPollMs*time.Millisecond)
 				return true
 			}
@@ -450,8 +450,10 @@ func (l *Loop) h1InProgress() bool {
 // goroutine owns its parse state: true while input waits for the goroutine, it is
 // inside a handler (not one that has detached and streams inline), or its parser
 // holds part of a request. A lock held by a goroutine that is parked is a guarded
-// write of a stream, not a request. Loop thread.
-func promotedRequestInProgress(cs *connState) bool {
+// write of a stream, not a request. With askKernel (the shutdown's first look)
+// the kernel's receive queue of an idle conn that holds nothing is asked too.
+// Loop thread.
+func promotedRequestInProgress(cs *connState, askKernel bool) bool {
 	cs.asyncInMu.Lock()
 	busy := len(cs.asyncInBuf) > 0 || (cs.asyncRun && !cs.asyncParked && !cs.asyncDetachUnlocked)
 	cs.asyncInMu.Unlock()
@@ -467,5 +469,18 @@ func promotedRequestInProgress(cs *connState) bool {
 	if h == nil || cs.protocol != engine.HTTP1 || cs.switchedToH2() || h.Detached.Load() {
 		return false
 	}
-	return h.HasPendingData() || !h.AtRequestBoundary()
+	if h.HasPendingData() || !h.AtRequestBoundary() {
+		return true
+	}
+	if askKernel && !csWritePending(cs) {
+		// The goroutine is parked with no input (busy above) and the lock is
+		// ours, so nothing writes the state csWritePending reads: the question
+		// h1InProgress asks of a plain conn on its first call, here (review r2 of
+		// celeris#1168: a request in the kernel's queue of an idle promoted conn
+		// was cut by phase 0 while a plain conn's was waited for).
+		if q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ); err == nil && q != 0 {
+			return true
+		}
+	}
+	return false
 }
