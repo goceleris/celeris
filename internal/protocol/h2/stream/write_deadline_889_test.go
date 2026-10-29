@@ -114,7 +114,12 @@ func TestExpiredWritesFloor889(t *testing.T) {
 		{"floor", 1 << 20, 65536, false, true},
 		{"above-floor", 1 << 20, 200000, false, true},
 		{"small-tail-all-released", 10000, 10000, false, false}, // the buffer empties: the record ends
-		{"small-tail-short", 10000, 9999, true, true},           // floor = held = 10000
+		// A tail (held under one floor) that went out all but a little is not the
+		// verdict: half of it is a grace window (r8 F-A; it used to be reset, "all of it
+		// in one window" was the floor). The grace is bounded: TestWriteTailGraceIsBounded889.
+		{"small-tail-nearly-all", 10000, 9999, false, true},
+		{"small-tail-half", 10000, 5000, false, true},
+		{"small-tail-under-half", 10000, 4999, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, m, _ := wdSetup889(t)

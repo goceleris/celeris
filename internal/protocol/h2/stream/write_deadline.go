@@ -333,6 +333,17 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 				hold = true
 			}
 			st.bank = 0
+		case (st.held < writeMinRelease && st.released*2 >= floor) || (st.connHeld < writeMinRelease && connRel*2 >= connFloor):
+			// A tail. What is held (by the stream, or by the whole connection) is under
+			// one floor, and "all of it in one window" is brittle: the grant for the last
+			// bytes of a response waits behind its siblings' bytes in the socket and can
+			// land just after the window (r8 F-A: reset 8 to 16 bytes before the end of
+			// a download that took 21 s). Half of it released is a grace window, inside
+			// the idle bound; nothing, or less, is the verdict.
+			if st.idle++; st.idle <= writeIdleWindows {
+				hold = true
+			}
+			st.bank = 0
 		}
 	}
 	if hold {

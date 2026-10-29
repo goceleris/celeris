@@ -1,6 +1,8 @@
 package stream
 
 import (
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -292,5 +294,300 @@ func TestWriteFloorFollowsWhatTheStreamHolds889(t *testing.T) {
 	m.FlushOutbound(s, discard889)
 	if out := windowEnd889(m, start, 2); len(out) != 0 {
 		t.Fatalf("window 2: expired %v although it released the 30000 it held when the window began", out)
+	}
+}
+
+// The tail of a response (what is held is under one floor) is not judged on
+// "all of it in one window": the grant for the last bytes can land just after the
+// window (r8 F-A). Half of it released is a grace window, inside the idle bound;
+// nothing is the verdict, and a tail that goes on missing half of itself is reset
+// after writeIdleWindows such windows.
+func TestWriteTailGraceIsBounded889(t *testing.T) {
+	t.Run("nothing-released-is-the-verdict", func(t *testing.T) {
+		_, m, _ := wdSetup889(t)
+		stalled889(m, 1, 1000)
+		if out := windowEnd889(m, time.Now().UnixNano(), 1); len(out) != 1 {
+			t.Fatalf("expired %v, want the tail that released nothing", out)
+		}
+	})
+	t.Run("half-every-window-is-bounded", func(t *testing.T) {
+		_, m, _ := wdSetup889(t)
+		s := stalled889(m, 1, 1000)
+		start := time.Now().UnixNano()
+		for w := 1; w <= writeIdleWindows+1; w++ {
+			s.SetWindowSize(500) // half of the 1000 held at the window's start...
+			m.FlushOutbound(s, discard889)
+			s.BufferOutbound(make([]byte, 500), true) // ...and the handler adds as much
+			out := windowEnd889(m, start, w)
+			if (w <= writeIdleWindows) != (len(out) == 0) {
+				t.Fatalf("window %d: expired %v (grace for %d windows)", w, out, writeIdleWindows)
+			}
+		}
+	})
+}
+
+// A tail held by the whole connection (several streams each waiting for a few
+// bytes, the connection's floor made of those tails) is judged by half, too.
+func TestWriteConnTailGrace889(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		release int
+		expired bool
+	}{
+		{"half-of-the-conn-floor-went-out", 100, false},
+		{"under-half", 99, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, m, _ := wdSetup889(t)
+			for i := 0; i < 3; i++ {
+				stalled889(m, uint32(1+2*i), 100)
+			}
+			c := m.CreateStream(99)
+			c.SetState(StateOpen)
+			c.SetWindowSize(1 << 20)
+			m.ReserveSendWindow(c, int32(tc.release)) // a sibling's direct send: the conn releases
+			// The third stream armed while the conn held 200 bytes (the budget is charged after
+			// the record is made): the connection's floor is 200, half of it is 100.
+			out := m.ExpiredWrites(dueAt889(), make([]uint32, 0, 8))
+			got := false
+			for _, id := range out {
+				got = got || id == 5
+			}
+			if got != tc.expired {
+				t.Fatalf("expired %v, want stream 5 expired=%v", out, tc.expired)
+			}
+		})
+	}
+}
+
+// firstReset889 runs windows and reports the one in which stream id is expired
+// (0 if it is not in max windows). before(w) acts at the start of window w.
+func firstReset889(m *Manager, id uint32, start int64, max int, before func(w int)) int {
+	for w := 1; w <= max; w++ {
+		if before != nil {
+			before(w)
+		}
+		for _, e := range windowEnd889(m, start, w) {
+			if e == id {
+				return w
+			}
+		}
+	}
+	return 0
+}
+
+// The true bounds of an unread stream (r8 F-C, derived from the code): the bytes it
+// had in flight when it stalled (the peer's initial window less what was left of its
+// own, up to four floors) are spent first, a floor a window; then, alone, the verdict;
+// with a sibling that keeps the connection above the floor, writeIdleWindows more.
+// So a stream the client never grants is reset in window 1+k alone and 1+k+3 with a
+// moving sibling, k = min(4, floor(in flight / 64 KiB)): 5 and 8 for a window of
+// 256 KiB or more (5 and 8 x WriteTimeout), against 1 and 4 for the default window.
+func TestWriteUnreadStreamBounds889(t *testing.T) {
+	for _, tc := range []struct {
+		initWin    uint32
+		alone, sib int
+	}{
+		{65535, 1, 4},
+		{128 << 10, 3, 6},
+		{192 << 10, 4, 7},
+		{256 << 10, 5, 8},
+		{1 << 20, 5, 8},
+		{1<<31 - 1, 5, 8},
+	} {
+		t.Run(strconv.Itoa(int(tc.initWin>>10))+"KiB", func(t *testing.T) {
+			_, m, _ := wdSetup889(t)
+			m.initWin.Store(tc.initWin)
+			stalled889(m, 1, 8<<20)
+			if w := firstReset889(m, 1, time.Now().UnixNano(), 20, nil); w != tc.alone {
+				t.Fatalf("alone: reset in window %d, want %d", w, tc.alone)
+			}
+			_, m2, _ := wdSetup889(t)
+			m2.initWin.Store(tc.initWin)
+			b := stalled889(m2, 1, 8<<20)
+			a := m2.CreateStream(3)
+			a.SetState(StateOpen)
+			a.SetWindowSize(0)
+			a.BufferOutbound(make([]byte, 64<<20), true)
+			_ = b
+			w := firstReset889(m2, 1, time.Now().UnixNano(), 20, func(int) { a.SetWindowSize(70000); m2.FlushOutbound(a, discard889) })
+			if w != tc.sib {
+				t.Fatalf("with a sibling that moves the connection: reset in window %d, want %d", w, tc.sib)
+			}
+		})
+	}
+}
+
+// A one-byte dribbler: reset in window 2 with a default window (the seed and a few
+// bytes cover window 1), in window 5 with a window of 256 KiB or more (four floors
+// of seed, spent a window each).
+func TestWriteDribblerBounds889(t *testing.T) {
+	for _, tc := range []struct {
+		initWin uint32
+		want    int
+	}{{65535, 2}, {128 << 10, 3}, {256 << 10, 5}, {1 << 30, 5}} {
+		t.Run(strconv.Itoa(int(tc.initWin>>10))+"KiB", func(t *testing.T) {
+			_, m, _ := wdSetup889(t)
+			m.initWin.Store(tc.initWin)
+			s := stalled889(m, 1, 8<<20)
+			w := firstReset889(m, 1, time.Now().UnixNano(), 20, func(int) {
+				for i := 0; i < 10; i++ {
+					s.SetWindowSize(1)
+					m.FlushOutbound(s, discard889)
+				}
+			})
+			if w != tc.want {
+				t.Fatalf("reset in window %d, want %d", w, tc.want)
+			}
+		})
+	}
+}
+
+// The idle count restarts when the stream takes its share, its floor, or is
+// starved by the connection window: a stream that alternates is not reset early.
+func TestWriteIdleCountRestarts889(t *testing.T) {
+	setup := func(t *testing.T) (*Manager, *Stream, *Stream) {
+		_, m, _ := wdSetup889(t)
+		b := stalled889(m, 1, 64<<20)
+		a := stalled889(m, 3, 64<<20)
+		return m, a, b
+	}
+	move := func(m *Manager, a *Stream) { a.SetWindowSize(70000); m.FlushOutbound(a, discard889) }
+	t.Run("share", func(t *testing.T) {
+		m, a, b := setup(t)
+		got := firstReset889(m, 1, time.Now().UnixNano(), 20, func(w int) {
+			move(m, a)
+			if w == 2 { // one window in which it takes its share
+				b.SetWindowSize(20000)
+				m.FlushOutbound(b, discard889)
+			}
+		})
+		if got != 2+writeIdleWindows+1 {
+			t.Fatalf("reset in window %d, want %d (idle 1, a share window, then %d idle windows held)", got, 2+writeIdleWindows+1, writeIdleWindows)
+		}
+	})
+	t.Run("floor", func(t *testing.T) {
+		m, a, b := setup(t)
+		got := firstReset889(m, 1, time.Now().UnixNano(), 20, func(w int) {
+			move(m, a)
+			if w == 2 {
+				b.SetWindowSize(70000)
+				m.FlushOutbound(b, discard889)
+			}
+		})
+		if got != 2+writeIdleWindows+1 {
+			t.Fatalf("reset in window %d, want %d", got, 2+writeIdleWindows+1)
+		}
+	})
+	t.Run("starved", func(t *testing.T) {
+		m, a, b := setup(t)
+		got := firstReset889(m, 1, time.Now().UnixNano(), 20, func(w int) {
+			if w == 3 { // the conn window is shut and b's own has room: starved; a sibling takes the grant
+				atomic.StoreInt32(&m.connectionWindow, 0)
+				b.SetWindowSize(1 << 20)
+				a.SetWindowSize(70000)
+				m.UpdateConnectionWindow(70000)
+				m.FlushOutbound(a, discard889)
+				return
+			}
+			b.SetWindowSize(0)
+			m.UpdateConnectionWindow(70000)
+			move(m, a)
+		})
+		if got != 3+writeIdleWindows+1 {
+			t.Fatalf("reset in window %d, want %d (a starved window restarts the count)", got, 3+writeIdleWindows+1)
+		}
+	})
+}
+
+// The share is half the connection's floor divided among the streams stalled.
+func TestWriteShareScalesWithTheStreamsAndHalves889(t *testing.T) {
+	run := func(t *testing.T, n, release int) int {
+		_, m, _ := wdSetup889(t)
+		b := stalled889(m, 1, 64<<20)
+		a := stalled889(m, 3, 64<<20)
+		for i := 2; i < n; i++ {
+			stalled889(m, uint32(1+2*i), 64<<20)
+		}
+		return firstReset889(m, 1, time.Now().UnixNano(), 12, func(int) {
+			a.SetWindowSize(70000)
+			m.FlushOutbound(a, discard889)
+			b.SetWindowSize(int32(release))
+			m.FlushOutbound(b, discard889)
+		})
+	}
+	// N = 2: the share is 65536 / (2 x 2) = 16384.
+	if w := run(t, 2, 20000); w != 0 {
+		t.Fatalf("N=2, 20000 a window (above the share): reset in window %d", w)
+	}
+	if w := run(t, 2, 10000); w != 1+writeIdleWindows {
+		t.Fatalf("N=2, 10000 a window (under the share): reset in window %d, want %d", w, 1+writeIdleWindows)
+	}
+	// N = 10: the share is 65536 / 20 = 3276.
+	if w := run(t, 10, 4000); w != 0 {
+		t.Fatalf("N=10, 4000 a window (above the share): reset in window %d", w)
+	}
+	if w := run(t, 10, 2000); w != 1+writeIdleWindows {
+		t.Fatalf("N=10, 2000 a window (under the share): reset in window %d, want %d", w, 1+writeIdleWindows)
+	}
+}
+
+// The seed is the bytes in flight, the initial window less what is left of it.
+func TestWriteSeedIsWhatIsInFlight889(t *testing.T) {
+	_, m, _ := wdSetup889(t)
+	m.initWin.Store(1 << 20)
+	s := m.CreateStream(1)
+	s.SetState(StateOpen)
+	s.SetWindowSize(1<<20 - 100000) // 100000 bytes sent, not granted back
+	s.BufferOutbound(make([]byte, 8<<20), true)
+	// 100000 covers window 1 (above the floor) and not window 2.
+	if w := firstReset889(m, 1, time.Now().UnixNano(), 10, nil); w != 2 {
+		t.Fatalf("reset in window %d, want 2: the seed is what is in flight, not the initial window", w)
+	}
+}
+
+// A connection whose floor is its few held bytes is "moving" when it releases them.
+func TestWriteConnFloorIsWhatTheConnHolds889(t *testing.T) {
+	_, m, _ := wdSetup889(t)
+	stalled889(m, 1, 100)
+	stalled889(m, 3, 100)
+	c := m.CreateStream(99)
+	c.SetState(StateOpen)
+	c.SetWindowSize(1 << 20)
+	m.ReserveSendWindow(c, 400) // a sibling releases 400 bytes: more than the connection held
+	if out := m.ExpiredWrites(dueAt889(), make([]uint32, 0, 8)); len(out) != 0 {
+		t.Fatalf("expired %v: the connection released more than it held (its floor is what it holds, not 64 KiB)", out)
+	}
+}
+
+// The bank does not survive a window held on the share: a stream below its floor
+// on a connection that does not move is the verdict.
+func TestWriteBankIsSpentByAShareWindow889(t *testing.T) {
+	_, m, _ := wdSetup889(t)
+	b := stalled889(m, 1, 64<<20)
+	a := stalled889(m, 3, 64<<20)
+	start := time.Now().UnixNano()
+	// Window 1: b releases 95536 (above the floor: 30000 banked) and a moves the conn.
+	b.SetWindowSize(95536)
+	m.FlushOutbound(b, discard889)
+	a.SetWindowSize(70000)
+	m.FlushOutbound(a, discard889)
+	if out := windowEnd889(m, start, 1); len(out) != 0 {
+		t.Fatalf("window 1: %v", out)
+	}
+	// Window 2: b takes 20000 (under the floor, over its share) while a moves the conn.
+	b.SetWindowSize(20000)
+	m.FlushOutbound(b, discard889)
+	a.SetWindowSize(70000)
+	m.FlushOutbound(a, discard889)
+	if out := windowEnd889(m, start, 2); len(out) != 0 {
+		t.Fatalf("window 2: %v", out)
+	}
+	// Window 3: b takes 40000 and nothing else moves: 40000 is under the floor and the
+	// connection is under its floor. The 30000 banked in window 1 do not make 70000.
+	b.SetWindowSize(40000)
+	m.FlushOutbound(b, discard889)
+	if out := windowEnd889(m, start, 3); len(out) == 0 {
+		t.Fatal("window 3: held; the bank of window 1 survived a window held on the share")
 	}
 }
