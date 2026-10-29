@@ -230,9 +230,12 @@ func TestH2ParallelDownloadsSharingASlowLinkAreNotCut889(t *testing.T) {
 	// a stream's last bytes waits behind its siblings' bytes in the socket and lands
 	// a moment after the window ends, when the stream (or the whole connection) holds
 	// less than one floor and "released all of it" is the verdict (r8 F-A: reset 8 to
-	// 16 bytes before the end of the file, after the whole transfer).
+	// 16 bytes before the end of the file, after the whole transfer). The last shape
+	// has a backlog of 2.6 s at the end (12 x 64 KiB on 300 KB/s), longer than one
+	// window: a window with nothing released inside the drain was the verdict (r9
+	// F-A2, the same class at WriteTimeout 2 s and 5 s with larger backlogs).
 	for _, e := range nativeEngines889() {
-		for _, cl := range []cell{{2, 100e3, 256 << 10}, {4, 200e3, 256 << 10}, {2, 100e3, 384 << 10}, {8, 200e3, 128 << 10}} {
+		for _, cl := range []cell{{2, 100e3, 256 << 10}, {4, 200e3, 256 << 10}, {2, 100e3, 384 << 10}, {8, 200e3, 128 << 10}, {12, 300e3, 256 << 10}} {
 			t.Run(fmt.Sprintf("%s/%dstreams/%.0fKBps/%dKiB", e.name, cl.n, cl.bps/1e3, cl.size>>10), func(t *testing.T) {
 				t.Parallel()
 				addr := wdServer889(t, e.eng, -1, -1, wd889)
@@ -275,6 +278,53 @@ func TestH2PausedAndDribbledStreamsOnAHealthyConnAreBounded889(t *testing.T) {
 				}
 				if r := res[1]; r != "" && r != "complete" {
 					t.Fatalf("the healthy sibling, stream 1, ended with %q", r)
+				}
+			})
+		}
+	}
+}
+
+// TestH2SilentClientWithASmallRemainderIsLetGo889: a client that opens its
+// connection window, asks for a response a little longer than its stream window and
+// never grants the stream (it reads its socket, sends no stream WINDOW_UPDATE). The
+// stream's unsent rest is under one floor, and its connection must not be held for
+// as long as the bytes in flight last at a few bytes per window (r9 F-H: 65,536
+// windows for the default window, 262,145 for 256 KiB or more; ReadTimeout and
+// IdleTimeout do not close a connection with such a stream, and main closed this one at
+// 1 s). With the three timeouts at 1 s the stream is reset and the connection closed
+// within 5 (default window) or 8 (>= 256 KiB) windows, 1.5x that on io_uring.
+func TestH2SilentClientWithASmallRemainderIsLetGo889(t *testing.T) {
+	for _, e := range nativeEngines889() {
+		for _, cl := range []struct {
+			iw    uint32
+			extra int
+			limit time.Duration
+		}{{65535, 1000, 12 * time.Second}, {1 << 20, 1000, 18 * time.Second}} {
+			t.Run(fmt.Sprintf("%s/W%dKiB/extra%d", e.name, cl.iw>>10, cl.extra), func(t *testing.T) {
+				t.Parallel()
+				addr := wdServer889(t, e.eng, time.Second, time.Second, time.Second)
+				c := dialH2raw889(t, addr, h2dial889{initialWindow: cl.iw})
+				c.window889(0, 1<<30-65535)
+				c.request(1, "GET", "/inline889?n="+strconv.Itoa(int(cl.iw)+cl.extra), true, true)
+				t0 := time.Now()
+				_ = c.conn.SetReadDeadline(t0.Add(cl.limit + 10*time.Second))
+				reset, closedAt := false, time.Duration(0)
+				for closedAt == 0 {
+					f, err := c.fr.ReadFrame()
+					if err != nil {
+						closedAt = time.Since(t0)
+						if isTimeout889(err) {
+							t.Fatalf("the connection was still open %v after a request for %d bytes that was never granted (reset=%v): a client holds a connection with one GET", closedAt.Round(time.Millisecond), int(cl.iw)+cl.extra, reset)
+						}
+						break
+					}
+					if r, ok := f.(*http2.RSTStreamFrame); ok && r.StreamID == 1 && r.ErrCode == http2.ErrCodeInternal {
+						reset = true
+					}
+				}
+				t.Logf("WR889 small remainder %s/W%dKiB: reset=%v, connection closed at %v", e.name, cl.iw>>10, reset, closedAt.Round(10*time.Millisecond))
+				if !reset || closedAt > cl.limit {
+					t.Fatalf("reset=%v, closed at %v, want the stream reset and the connection closed within %v", reset, closedAt.Round(time.Millisecond), cl.limit)
 				}
 			})
 		}

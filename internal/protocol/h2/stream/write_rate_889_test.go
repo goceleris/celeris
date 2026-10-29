@@ -616,3 +616,55 @@ func TestWriteStreamTailGraceBesideABigSibling889(t *testing.T) {
 		t.Fatal("the sibling that released nothing was held")
 	}
 }
+
+// An unread stream whose unsent rest is under one floor is let go as fast as a large
+// one (r9 F-H): the floor is what it holds, so the bytes in flight (the seed, up to 256
+// KiB) were spent at a few bytes per window, 65,536 windows for the default initial
+// window and 262,145 for 256 KiB or more, and the connection was exempt from
+// ReadTimeout and IdleTimeout all that time. A window that passes on the carried bank
+// pays a whole floor: such a remainder is reset in window 2 (default window) or 5 (256
+// KiB or more) when the connection is not moving... and the connection holding under
+// one floor in all gets the tail's three idle windows on top: window 5 and 8.
+func TestWriteUnreadSmallRemainderBounds889(t *testing.T) {
+	for _, held := range []int{1, 100, 10000, 60000} {
+		for _, tc := range []struct {
+			initWin uint32
+			want    int
+		}{{65535, 5}, {128 << 10, 6}, {1 << 20, 8}} {
+			t.Run(strconv.Itoa(held)+"B/"+strconv.Itoa(int(tc.initWin>>10))+"KiB", func(t *testing.T) {
+				_, m, _ := wdSetup889(t)
+				m.initWin.Store(tc.initWin)
+				stalled889(m, 1, held)
+				if w := firstReset889(m, 1, time.Now().UnixNano(), 40, nil); w != tc.want {
+					t.Fatalf("reset in window %d, want %d (0 means not within 40)", w, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// The carry-over of a streamed response survives a small window: a stream that
+// released 312 KiB of 320 KiB in one window and then buffers a megabyte keeps its
+// bank (r9, why the bank is not capped by the floor of the window judged).
+func TestWriteBankSurvivesASmallRenewal889(t *testing.T) {
+	for _, order := range []string{"buffer-after-renewal", "buffer-before-renewal"} {
+		t.Run(order, func(t *testing.T) {
+			_, m, _ := wdSetup889(t)
+			s := stalled889(m, 1, 320<<10)
+			start := time.Now().UnixNano()
+			s.SetWindowSize(312 << 10)
+			m.FlushOutbound(s, discard889)
+			if order == "buffer-before-renewal" {
+				s.BufferOutbound(make([]byte, 1<<20), true)
+			}
+			got := firstReset889(m, 1, start, 50, func(w int) {
+				if w == 2 && order == "buffer-after-renewal" {
+					s.BufferOutbound(make([]byte, 1<<20), true)
+				}
+			})
+			if got < 5 {
+				t.Fatalf("reset in window %d, want at least 5: the 256 KiB carried over must not be cut by a small window", got)
+			}
+		})
+	}
+}
