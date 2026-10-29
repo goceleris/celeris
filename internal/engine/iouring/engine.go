@@ -126,7 +126,8 @@ type Engine struct {
 	drainBudget atomic.Pointer[context.Context]
 
 	// shutdownBegun goes up when Shutdown is called (or a worker sees Listen's
-	// context cancelled) and stays up. Every worker's H1State points at it
+	// context cancelled) and stays up: it is never lowered, so an Engine is not
+	// reusable after Shutdown (a Server builds a new one per Start). Every worker's H1State points at it
 	// (conn.H1State.Shutdown): from then on each HTTP/1 response carries
 	// Connection: close and ends its conn (celeris#884, celeris#885).
 	shutdownBegun atomic.Bool

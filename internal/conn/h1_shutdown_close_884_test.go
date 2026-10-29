@@ -523,3 +523,21 @@ func TestShutdownFlagStreamHeadConnectionHeader884(t *testing.T) {
 		wantOneClose884(t, "streamed head, handler Connection: "+v, heads[0])
 	}
 }
+
+// TestExpectationFailedSaysClose884: the 417 that OnExpectContinue's refusal
+// writes ends the conn (the body bytes may follow), and says so.
+func TestExpectationFailedSaysClose884(t *testing.T) {
+	st := NewH1State()
+	st.OnExpectContinue = func(string, string, [][2]string) bool { return false }
+	h := funcHandler884(func(context.Context, *stream.Stream) error { t.Fatal("handler ran"); return nil })
+	var k sink884
+	err := process884(st, h, &k, "POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n")
+	if !errors.Is(err, errConnectionClose) {
+		t.Errorf("returned %v, want errConnectionClose", err)
+	}
+	heads := heads884(t, k.buf.String())
+	if len(heads) != 1 || !strings.HasPrefix(heads[0], "HTTP/1.1 417") {
+		t.Fatalf("answer %q, want a 417", k.buf.String())
+	}
+	wantOneClose884(t, "417", heads[0])
+}

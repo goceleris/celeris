@@ -141,8 +141,9 @@ var errConnectionClose = errors.New("connection close requested")
 // to signal that the server is willing to accept the request body.
 var continue100Response = []byte("HTTP/1.1 100 Continue\r\n\r\n")
 
-// expectation417Response is sent when OnExpectContinue rejects the request.
-var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n")
+// expectation417Response is sent when OnExpectContinue rejects the request. The
+// conn is closed after it (the body bytes may follow), and says so.
+var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 
 // H1State holds per-connection H1 parsing state.
 type H1State struct {

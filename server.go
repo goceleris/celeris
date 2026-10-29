@@ -640,8 +640,12 @@ func (s *Server) cancelListen() {
 // is replaced by that one. std, which is net/http, closes the connection after
 // the response and says close to an HTTP/1.1 client, but not to an HTTP/1.0 one.
 // A request pipelined behind such a response is not served: its bytes, already
-// read, are dropped with the connection. Not changed: a response whose head went
-// out before Shutdown began (a stream under way keeps the head it sent), a
+// read, are dropped with the connection, and so are those the kernel holds when
+// the engine's gate looks at the connection (a request that reaches it after
+// that can still reset it, as it can net/http's). Not changed: a response whose
+// head went out before Shutdown began (a stream under way keeps the head it
+// sent; its connection is closed by the shutdown, at once or when the gate looks
+// at it, 250 ms into a wait), a
 // detached stream (Server-Sent Events, a WebSocket), which the engines end
 // themselves, a hijacked connection, which is the application's, and a
 // connection that has sent nothing yet (it is answered close when its first

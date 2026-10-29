@@ -161,7 +161,19 @@ func (w *Worker) closeIdleH1() {
 	for i := len(w.liveConns) - 1; i >= 0; i-- {
 		fd := w.liveConns[i]
 		cs := w.conns[fd]
-		if cs == nil || cs.closing {
+		if cs == nil {
+			continue
+		}
+		if cs.closing {
+			// Already closing (a response that said Connection: close is still going
+			// out; its close waits for it): not read again and not served, but a
+			// request that reached it behind that response is in its receive queue
+			// unread when the descriptor is closed, and close(2) then sends an
+			// RST that destroys the response in flight (celeris#884; epoll's
+			// discardUnreadOfClosingConn). It is read off and dropped, unparsed.
+			if first {
+				w.discardUnreadOfClosingConn(cs)
+			}
 			continue
 		}
 		if cs.detected && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
@@ -206,6 +218,28 @@ func (w *Worker) closeIdleH1() {
 		}
 		w.closeConn(fd)
 		closed++
+	}
+}
+
+// discardUnreadOfClosingConn reads what the kernel holds in the receive queue of
+// a closing HTTP/1 conn and drops it without parsing it (see closeIdleH1).
+// Bounded: 64 reads of 4 KiB, then the close's RST as before; EAGAIN, an EOF or
+// an error ends it. Not for a fixed-file conn (its slot is no descriptor), a
+// conn a dispatch goroutine owns (its state is the goroutine's), HTTP/2, or a
+// detached stream. Worker thread.
+func (w *Worker) discardUnreadOfClosingConn(cs *connState) {
+	if !ownsDescriptorNumber(cs) || cs.asyncPromoted.Load() || !cs.detected ||
+		engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
+		return
+	}
+	if h := cs.h1State; h == nil || h.Detached.Load() {
+		return
+	}
+	var buf [4096]byte
+	for range 64 {
+		if n, err := unix.Read(cs.fd, buf[:]); n <= 0 || err != nil {
+			return
+		}
 	}
 }
 

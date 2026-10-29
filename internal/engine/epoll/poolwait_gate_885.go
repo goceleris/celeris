@@ -203,7 +203,17 @@ func (l *Loop) closeIdleH1(first bool, now int64) int {
 			}
 			h1Detached = cs.h1State != nil && cs.h1State.Detached.Load()
 		}
-		if first && !ended && !h1Detached {
+		if first && !ended && !h1Detached && cs.peerClosed {
+			// A conn that is already closing (closeWhenFlushed after a response
+			// that said Connection: close, or a peer's FIN) is not read again
+			// and not served: its close waits for the response it has queued.
+			// A request in its receive queue reached it behind that response
+			// (pipelined late), and is dropped unparsed (celeris#884). It is
+			// read off and discarded, not left: close(2) with unread bytes in the
+			// receive queue sends an RST, which destroys the response still in
+			// flight (a 16 MiB body arrived at 14.5 to 15.3 MiB, then ECONNRESET).
+			discardUnreadOfClosingConn(cs.fd)
+		} else if first && !ended && !h1Detached {
 			// The kernel's receive queue, last before the tests that lead to
 			// the close, so that the window between the question and close(2)
 			// is the few microseconds of those tests (a request that arrives
@@ -233,6 +243,21 @@ func (l *Loop) closeIdleH1(first bool, now int64) int {
 		closed++
 	}
 	return closed
+}
+
+// discardUnreadOfClosingConn reads what the kernel holds in fd's receive queue
+// and drops it, without parsing it: the bytes of a request that reached a conn
+// after the response that closes it (see closeIdleH1). Bounded (64 reads of 4
+// KiB; the rest of a flood is the close's RST, as before); EAGAIN, an EOF or an
+// error ends it. Loop thread, on a conn that is closing and so not read by
+// anything else.
+func discardUnreadOfClosingConn(fd int) {
+	var buf [4096]byte
+	for range 64 {
+		if n, err := unix.Read(fd, buf[:]); n <= 0 || err != nil {
+			return
+		}
+	}
 }
 
 // testHookGateBeforeClose, when set, runs on the loop thread in closeIdleH1
