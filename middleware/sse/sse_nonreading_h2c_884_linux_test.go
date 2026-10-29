@@ -118,8 +118,8 @@ func TestNonReadingH2CClientEndsStream884(t *testing.T) {
 		window uint32
 		p      producer888
 	}{
-		{"default-window", 65535, producer888{burstBytes: 1000, settle: 100 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond}},
-		{"huge-window", 1 << 30, producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond}},
+		{"default-window", 65535, producer888{burstBytes: 1000, settle: 100 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond, dropEarly: true}},
+		{"huge-window", 1 << 30, producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond, dropEarly: true}},
 	}
 	for _, cell := range cells {
 		for _, w := range wins {

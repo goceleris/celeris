@@ -3,6 +3,7 @@
 package sse_test
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -39,6 +40,11 @@ const nonReadWriteTimeout888 = time.Second
 type disconnect888 struct {
 	at    time.Time
 	early int64
+	// slowClose is when OnSlowClient answered ClientPolicyClose for the first
+	// time (zero: it never did), and started when the handler began: a stream
+	// ended by a full queue is not one ended by the stall bound.
+	slowClose time.Time
+	started   time.Time
 }
 
 // nonReadCell888 is one engine configuration of the matrix.
@@ -95,6 +101,11 @@ type producer888 struct {
 	fastFor      time.Duration
 	trickleBytes int
 	trickleEvery time.Duration
+	// flood is how many trickle events are sent back to back when the settle
+	// ends, before the trickle: the 4-slot queue cannot take them all, which is
+	// what a drain goroutine that was not scheduled for a few milliseconds
+	// (a starved runner under -race and coverage) does to the producer's pace.
+	flood int
 
 	// writeTimeout is the server's WriteTimeout (nonReadWriteTimeout888 when
 	// zero). noHeaderTimer sets ReadHeaderTimeout -1, which takes away the
@@ -104,7 +115,11 @@ type producer888 struct {
 	noHeaderTimer bool
 
 	// dropEarly makes a full queue drop the event, not close the stream, for
-	// the first WriteTimeout of the handler's run. The fast phase sends 2000
+	// the first WriteTimeout of the handler's run. Every producer sets it: the
+	// test's lower bound (the stream does not end before WriteTimeout) is for
+	// the stall bound, and a close by a full queue is a different one (CI saw
+	// the trickle of "steady" cut at 0.82 s, and so did a run of this test with
+	// two processes on one CPU: celeris#1104). The fast phase sends 2000
 	// events a second; a drain goroutine that falls 4 events behind (the loop
 	// holds the connection's write lock for a partial send, or the runner is
 	// starved under -race and coverage) is a full queue, and
@@ -149,7 +164,7 @@ func burstFor888(tb testing.TB) int {
 func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, disconnected <-chan disconnect888, shutdown func()) {
 	tb.Helper()
 	done := make(chan disconnect888, 1)
-	var started, early atomic.Int64 // handler start (unix nanos), events dropped by dropEarly
+	var started, early, slowClose atomic.Int64 // handler start (unix nanos), events dropped by dropEarly, first ClientPolicyClose (unix nanos)
 	wt := p.wt()
 	var burst string
 	if p.fastFor == 0 {
@@ -164,11 +179,16 @@ func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, d
 				early.Add(1)
 				return sse.ClientPolicyDrop
 			}
+			slowClose.CompareAndSwap(0, time.Now().UnixNano())
 			return sse.ClientPolicyClose
 		},
 		OnDisconnect: func(*celeris.Context, *sse.Client) {
+			d := disconnect888{at: time.Now(), early: early.Load(), started: time.Unix(0, started.Load())}
+			if n := slowClose.Load(); n != 0 {
+				d.slowClose = time.Unix(0, n)
+			}
 			select {
-			case done <- disconnect888{time.Now(), early.Load()}:
+			case done <- d:
 			default:
 			}
 		},
@@ -196,6 +216,11 @@ func serve888(tb testing.TB, cell nonReadCell888, p producer888) (addr string, d
 			case <-ctx.Done():
 				return
 			case <-time.After(p.settle):
+			}
+			for range p.flood {
+				if err := client.Send(sse.Event{Event: "tick", Data: trickle}); err != nil {
+					return
+				}
 			}
 			tick := time.NewTicker(p.trickleEvery)
 			defer tick.Stop()
@@ -280,10 +305,15 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 	}{
 		// The burst fills the socket and queues the rest in the engine; then
 		// a trickle of 1 KB every 5 ms.
-		{"steady", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond}},
+		{"steady", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond, dropEarly: true}},
+		// The same, with 50 events sent back to back where the trickle starts: a
+		// full queue before WriteTimeout (a drain goroutine that was not
+		// scheduled for a few ms does that to the 5 ms trickle too: celeris#1104)
+		// must not end the stream.
+		{"steady-flood", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 5 * time.Millisecond, flood: 50, dropEarly: true}},
 		// The same, then one event every 300 ms: a sweep must still reach the
 		// conn when almost nothing wakes the worker.
-		{"sparse", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 300 * time.Millisecond}},
+		{"sparse", producer888{burstBytes: burstFor888(t), settle: 700 * time.Millisecond, trickleBytes: 1000, trickleEvery: 300 * time.Millisecond, dropEarly: true}},
 		// No burst: 4 KB events every 0.5 ms for 1.2 s fill the socket with
 		// small sends (an io_uring SEND of under 64 KiB is not one the worker
 		// is told to expect to wait for), then one event every 300 ms.
@@ -312,7 +342,11 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 					// queue behind it is full (ClientPolicyClose), earlier than
 					// WriteTimeout: the lower bound is for the native engines.
 					if cell.engine != celeris.Std && el < wt {
-						t.Errorf("OnDisconnect ran %v after connect, before WriteTimeout %v: the stream was ended by something other than the stall bound", el, wt)
+						why := "OnSlowClient never answered ClientPolicyClose"
+						if !d.slowClose.IsZero() {
+							why = fmt.Sprintf("OnSlowClient answered ClientPolicyClose %v after the handler began (a full queue)", d.slowClose.Sub(d.started).Round(time.Millisecond))
+						}
+						t.Errorf("OnDisconnect ran %v after connect, before WriteTimeout %v: the stream was ended by something other than the stall bound (%s)", el, wt, why)
 					}
 				case <-time.After(wt + slack):
 					t.Fatalf("OnDisconnect never ran %v after connect (WriteTimeout %v): a client that reads nothing holds its stream for ever (celeris#888 item 38)",
