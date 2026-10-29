@@ -595,3 +595,24 @@ func TestWriteBankIsSpentByAShareWindow889(t *testing.T) {
 		t.Fatal("window 3: stream 1 held; the bank of window 1 survived a window held on the share")
 	}
 }
+
+// The stream's own tail is judged by half even when the connection holds much more
+// (a sibling with a megabyte waiting) and does not move: the conn clause does not
+// apply, the stream clause does.
+func TestWriteStreamTailGraceBesideABigSibling889(t *testing.T) {
+	_, m, _ := wdSetup889(t)
+	stalled889(m, 1, 1<<20) // the sibling: nothing released, a verdict at once
+	tail := stalled889(m, 3, 10000)
+	tail.SetWindowSize(6000) // 6000 of its 10000, under the connection's floor
+	m.FlushOutbound(tail, discard889)
+	got := map[uint32]bool{}
+	for _, id := range m.ExpiredWrites(dueAt889(), make([]uint32, 0, 8)) {
+		got[id] = true
+	}
+	if got[3] {
+		t.Fatal("the tail that went out 60% was reset")
+	}
+	if !got[1] {
+		t.Fatal("the sibling that released nothing was held")
+	}
+}
