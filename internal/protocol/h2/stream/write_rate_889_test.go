@@ -689,23 +689,23 @@ func TestWriteDribblerWithASmallRestSpendsItsBank889(t *testing.T) {
 }
 
 // What a window pays beyond the bank is not owed later: a stream that spent a bank
-// of less than a floor on a window it released nothing in starts the next from zero,
-// not from a debt (r9, the bank is clamped at 0). A stream that then releases all of
-// its small rest every window is held for as long as it does.
+// of less than a floor on a window it released nothing in (a whole floor is paid, the
+// bank was 20000) starts the next from zero, not from a debt (the bank is clamped at 0).
+// Then 135000 released in one window carry 134000 over (the floor of that window was the
+// 1000 it held), which is one window for the floor and one for the rest.
 func TestWriteBankIsNotADebt889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
-	m.initWin.Store(20000) // a bank of 20000, less than a floor
+	m.initWin.Store(20000)
 	s := stalled889(m, 1, 1000)
-	start := time.Now().UnixNano()
-	got := firstReset889(m, 1, start, 12, func(w int) {
-		if w > 1 { // window 1 releases nothing and pays a whole floor for it
-			s.SetWindowSize(1000)
+	got := firstReset889(m, 1, time.Now().UnixNano(), 12, func(w int) {
+		if w == 2 {
+			s.BufferOutbound(make([]byte, 1<<20), true)
+			s.SetWindowSize(135000)
 			m.FlushOutbound(s, discard889)
-			s.BufferOutbound(make([]byte, 1000), true)
 		}
 	})
-	if got != 0 {
-		t.Fatalf("reset in window %d: a stream that releases all it holds every window is held", got)
+	if got != 5 {
+		t.Fatalf("reset in window %d, want 5", got)
 	}
 }
 
