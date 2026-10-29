@@ -1184,6 +1184,7 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 			newWindowSize := int32(s.Val)
 			delta := newWindowSize - oldWindowSize
 			p.manager.initialWindowSize = s.Val
+			p.manager.initWin.Store(s.Val)
 
 			for sid, stream := range p.manager.streams {
 				oldWin := stream.windowSize.Load()

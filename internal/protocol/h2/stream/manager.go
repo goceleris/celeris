@@ -21,6 +21,7 @@ type Manager struct {
 	maxFrameSize            uint32 // peer's SETTINGS_MAX_FRAME_SIZE (caps what WE send)
 	localMaxFrameSize       uint32 // our advertised SETTINGS_MAX_FRAME_SIZE (caps what PEER sends us)
 	initialWindowSize       uint32
+	initWin                 atomic.Uint32 // initialWindowSize for readers that hold no lock (write_deadline.go)
 	activeStreams           atomic.Uint32
 	requestOpen             atomic.Uint32
 	hints                   *DeadlineHints
@@ -99,6 +100,7 @@ func NewManager() *Manager {
 		headerTableSize:   4096, // RFC 7540 §6.5.2 default
 	}
 	m.hints = &m.ownHints
+	m.initWin.Store(65535)
 	return m
 }
 
@@ -697,6 +699,7 @@ func (m *Manager) ApplySetting(id uint16, val uint32) {
 		}
 		m.mu.Lock()
 		m.initialWindowSize = val
+		m.initWin.Store(val)
 		m.mu.Unlock()
 	case 0x5: // MAX_FRAME_SIZE
 		if val < 16384 || val > 16777215 {
@@ -823,7 +826,7 @@ func (m *Manager) Close() {
 // SetRequestTimeout sets the request deadline (the server's ReadTimeout): a
 // stream whose request is not whole that long after its HEADERS is expired by
 // ExpiredRequests. 0 turns it off. Set once, before the first frame.
-func (m *Manager) SetRequestTimeout(d time.Duration) { m.reqTimeout = d }
+func (m *Manager) SetRequestTimeout(d time.Duration) { m.reqTimeout = clampTimeout(d) }
 
 // RequestTimeout is the deadline SetRequestTimeout set.
 func (m *Manager) RequestTimeout() time.Duration { return m.reqTimeout }

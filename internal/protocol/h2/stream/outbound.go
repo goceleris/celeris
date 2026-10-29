@@ -539,7 +539,7 @@ func (m *Manager) sendOrBufferLocked(s *Stream, data []byte, send OutboundSend) 
 		}
 		s.OutboundBuffer.Write(data[n:])
 		m.chargeOutbound(len(data) - n)
-		m.noteBuffered(s.ID, len(data)-n)
+		m.noteBuffered(s, len(data)-n)
 	}
 }
 

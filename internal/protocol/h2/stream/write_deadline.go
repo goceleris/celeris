@@ -21,12 +21,34 @@ import (
 // response. The measure is bytes released (FlushOutbound), never frames: a PING,
 // or a WINDOW_UPDATE that lets one byte out, moves nothing.
 //
-// A stream whose own send window has room but whose bytes wait for the
-// CONNECTION window is not waiting for anything of its own: its credit is what
-// the whole connection released in the window (reserveCredit). A stream whose own
-// window is shut is judged by its own releases, even when the connection window
-// is shut too, or a client could shut the conn window by dribbling to a sibling
-// and shelter every stalled stream.
+// What counts. A stream that released its floor in the window is held. The
+// surplus beyond the floor carries to the next windows, up to writeBankWindows
+// windows' worth (the bank), and a stream's first window is covered by the bytes
+// it had in flight when it stalled (the seed, capped the same way): a client that
+// sends few WINDOW_UPDATEs (nghttp2 and curl update when half of the window is
+// consumed) releases in big steps, with windows between its updates that release
+// nothing, and a rule that counted only the window it fell in reset it while it
+// read far above the floor (review r7 F1). The guarantee is on the average: a stream
+// that releases at least the floor per window on average, lagging that rate by no
+// more than writeBankWindows windows' worth, survives however long its response.
+//
+// The connection's own rate matters too. A stream whose OWN send window has room
+// but whose bytes wait for the CONNECTION window is credited with what the whole
+// connection released in the window (a sibling takes it). And when the connection as
+// a whole releases at least the floor, a stream that is below its own floor is not
+// judged alone (review r7 F6): N parallel downloads that share a slow socket each
+// get link/N, and the client reads the socket in the order the server sent, so a
+// stream can wait behind its siblings' bytes for a window or more. It is held while
+// it takes its share, at least half of floor/N (N the streams stalled), and held for
+// up to writeIdleWindows consecutive windows in which it takes less (paused,
+// dribbled or queued behind its siblings), and reset after that: the memory a
+// stream that is not read pins is bounded by writeIdleWindows+1 windows, not by
+// the siblings' life. When the connection itself releases less than the floor
+// nothing is held: the first window that does not move is the verdict, as for a
+// single stream. A stream whose own window is shut is judged by its own releases
+// and these allowances, even when the connection window is shut too, or a client
+// could shut the conn window by dribbling to a sibling and shelter every stalled
+// stream for ever.
 //
 // State: a record per stalled stream, in a small map on the Manager, made on the
 // first stall of the connection. Only a stream that holds buffered bytes has one,
@@ -43,12 +65,36 @@ import (
 // WriteTimeout and about 1 KiB/s at the 60 s default.
 const writeMinRelease = 64 << 10
 
+// writeBankWindows is how many windows' worth of surplus release a stream may carry
+// to later windows (and how many its in-flight bytes may cover at the start): the
+// bound on how far behind the floor's rate a client's WINDOW_UPDATEs may lag.
+const writeBankWindows = 4
+
+// writeIdleWindows is how many consecutive windows a stream that takes less than its
+// share may be held, on a connection that moves above the floor, before it is reset.
+const writeIdleWindows = 3
+
+// maxTimeout bounds a deadline length so that now + timeout cannot overflow an
+// int64 of nanoseconds (a timeout of math.MaxInt64, the common way to write "never",
+// made every deadline due at once: review r7 F3): a hundred years.
+const maxTimeout = 100 * 365 * 24 * time.Hour
+
+// clampTimeout is d, or maxTimeout if it is longer.
+func clampTimeout(d time.Duration) time.Duration {
+	if d > maxTimeout {
+		return maxTimeout
+	}
+	return d
+}
+
 // stall is the record of a stream that holds buffered bytes.
 type stall struct {
 	armedAt  int64 // when the current window began (wall clock ns)
 	held     int   // bytes the stream held when the window began
 	pending  int   // bytes it holds now
 	released int   // bytes of its own released in the window
+	bank     int   // surplus released in earlier windows (and the seed), carried over
+	idle     int   // consecutive windows held below its share on a connection above the floor
 	connAt   int64 // Manager.connReleased when the window began
 	connHeld int64 // Manager.outboundHeld when the window began
 }
@@ -56,7 +102,7 @@ type stall struct {
 // SetWriteTimeout sets the write deadline (the server's WriteTimeout): the length
 // of the window a stalled stream is judged over. 0 or less turns it off. Set once,
 // before the first frame.
-func (m *Manager) SetWriteTimeout(d time.Duration) { m.wrTimeout = d }
+func (m *Manager) SetWriteTimeout(d time.Duration) { m.wrTimeout = clampTimeout(d) }
 
 // WriteTimeout is the window SetWriteTimeout set.
 func (m *Manager) WriteTimeout() time.Duration { return m.wrTimeout }
@@ -66,14 +112,18 @@ func (m *Manager) WriteTimeout() time.Duration { return m.wrTimeout }
 // settles it). One atomic load; the engines' sweep reads it for every h2 conn.
 func (m *Manager) NextWriteDeadline() int64 { return m.hints.WrDL.Load() }
 
-// noteBuffered records that n bytes were just added to the buffer of stream id,
-// already charged to outboundHeld: the stream is stalled from here, and its
-// window begins if it was not already. Called with the stream's lock held, on the
-// event loop or on a pool goroutine.
-func (m *Manager) noteBuffered(id uint32, n int) {
+// noteBuffered records that n bytes were just added to the buffer of s, already
+// charged to outboundHeld: the stream is stalled from here, and its window begins
+// if it was not already, seeded with the bytes it had in flight (sent, not yet
+// granted back: the peer's initial window less what is left of it), at most
+// writeBankWindows floors, which cover the time the client needs to consume them
+// before its first update. Called with the stream's lock held, on the event loop or
+// on a pool goroutine.
+func (m *Manager) noteBuffered(s *Stream, n int) {
 	if m.wrTimeout <= 0 || n <= 0 {
 		return
 	}
+	id := s.ID
 	m.stallMu.Lock()
 	st := m.stalls[id]
 	if st == nil {
@@ -81,7 +131,8 @@ func (m *Manager) noteBuffered(id uint32, n int) {
 		if m.stalls == nil {
 			m.stalls = make(map[uint32]*stall)
 		}
-		st = &stall{armedAt: now, connAt: m.connReleased.Load(), connHeld: max(m.outboundHeld.Load(), int64(n))}
+		seed := min(max(int(m.initWin.Load())-int(s.windowSize.Load()), 0), writeBankWindows*writeMinRelease)
+		st = &stall{armedAt: now, bank: seed, connAt: m.connReleased.Load(), connHeld: max(m.outboundHeld.Load(), int64(n))}
 		m.stalls[id] = st
 		m.stallN.Store(int32(len(m.stalls)))
 		m.lowerWrDL(now + int64(m.wrTimeout))
@@ -180,11 +231,12 @@ func (m *Manager) ExpiredWrites(now int64, out []uint32) []uint32 {
 		return out
 	}
 	var idBuf [32]uint32
-	ids := idBuf[:0]
+	var stBuf [32]*stall
+	ids, sts := idBuf[:0], stBuf[:0]
 	m.stallMu.Lock()
 	for id, st := range m.stalls {
 		if st.armedAt+wt <= now {
-			ids = append(ids, id)
+			ids, sts = append(ids, id), append(sts, st)
 		}
 	}
 	m.stallMu.Unlock()
@@ -215,27 +267,23 @@ func (m *Manager) ExpiredWrites(now int64, out []uint32) []uint32 {
 	m.stallMu.Lock()
 	for i, id := range ids {
 		st := m.stalls[id]
-		if st == nil {
+		// The record judged is the one found due: one that ended and began again
+		// while the windows were read (a pool goroutine flushed the buffer whole and
+		// buffered a new tail) is another window, not due (review r7 F2).
+		if st == nil || st != sts[i] || st.armedAt+wt > now {
 			continue
 		}
 		if views[i]&viewGone != 0 {
 			delete(m.stalls, id)
 			continue
 		}
-		credit, floor := st.released, min(writeMinRelease, st.held)
-		if views[i]&viewOwn != 0 && connShut { // starved by the connection window
-			credit, floor = int(m.connReleased.Load()-st.connAt), int(min(writeMinRelease, st.connHeld))
+		if !m.holdsLocked(st, views[i]&viewOwn != 0 && connShut, now) {
+			if len(out) == cap(out) {
+				full = true
+				continue
+			}
+			out = append(out, id)
 		}
-		if credit >= floor {
-			st.armedAt, st.held, st.released = now, st.pending, 0
-			st.connAt, st.connHeld = m.connReleased.Load(), max(m.outboundHeld.Load(), int64(st.pending))
-			continue
-		}
-		if len(out) == cap(out) {
-			full = true
-			continue
-		}
-		out = append(out, id)
 	}
 	var next int64
 	for _, st := range m.stalls {
@@ -250,6 +298,48 @@ func (m *Manager) ExpiredWrites(now int64, out []uint32) []uint32 {
 	m.hints.WrDL.Store(next) // under stallMu, as noteBuffered lowers it: an arm is not lost
 	m.stallMu.Unlock()
 	return out
+}
+
+// holdsLocked is the verdict on the stalled stream st whose window has ended at
+// now: it reports whether the stream is held, and if so begins its next window.
+// starved says the stream's own window has room and the connection's is shut.
+// m.stallMu must be held. The rule is in the file's comment.
+func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
+	connRel := m.connReleased.Load() - st.connAt
+	connFloor := min(int64(writeMinRelease), st.connHeld)
+	moving := connRel >= connFloor // the connection as a whole released its floor
+
+	hold := false
+	switch {
+	case starved:
+		// Waiting for the connection window, which is no fault of the stream's own:
+		// its credit is the connection's.
+		hold = moving
+		st.idle = 0
+	default:
+		total := st.released + st.bank
+		floor := min(writeMinRelease, st.held)
+		switch {
+		case total >= floor:
+			hold = true
+			st.bank = min(total-floor, writeBankWindows*writeMinRelease)
+			st.idle = 0
+		case moving:
+			share := int(connFloor) / (2 * max(len(m.stalls), 1))
+			if st.released > 0 && st.released >= share {
+				hold = true
+				st.idle = 0
+			} else if st.idle++; st.idle <= writeIdleWindows {
+				hold = true
+			}
+			st.bank = 0
+		}
+	}
+	if hold {
+		st.armedAt, st.held, st.released = now, st.pending, 0
+		st.connAt, st.connHeld = m.connReleased.Load(), max(m.outboundHeld.Load(), int64(st.pending))
+	}
+	return hold
 }
 
 // expireWrite resets the stalled stream id: the bytes it holds are dropped
@@ -271,10 +361,18 @@ func (m *Manager) expireWrite(id uint32, reset func(*Stream)) bool {
 	}
 	cancelled := s.IsCancelled()
 	s.mu.Lock()
-	if buf := s.OutboundBuffer; buf != nil && buf.Len() > 0 {
-		m.refundOutbound(buf.Len())
-		buf.Reset()
+	buf := s.OutboundBuffer
+	if buf == nil || buf.Len() == 0 {
+		// Nothing is held any more: the response went out whole between the verdict
+		// and here (a pool goroutine flushed it). A reset now would follow its
+		// END_STREAM (review r7 F2).
+		s.mu.Unlock()
+		m.mu.Unlock()
+		m.dropStall(id)
+		return false
 	}
+	m.refundOutbound(buf.Len())
+	buf.Reset()
 	s.OutboundEndStream = false
 	s.outboundAbandoned = false
 	s.mu.Unlock()

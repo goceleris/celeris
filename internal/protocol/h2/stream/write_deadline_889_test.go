@@ -51,6 +51,7 @@ func wdSetup889(t testing.TB) (*Processor, *Manager, *rstRecorder889) {
 	m := p.GetManager()
 	m.SetWriteTimeout(wt889)
 	m.UpdateConnectionWindow(1 << 30)
+	m.initWin.Store(0) // no seed: a stream's first window is judged on what it releases (the seed has its own tests)
 	return p, m, rec
 }
 
@@ -196,13 +197,28 @@ func TestExpiredWritesConnStarved889(t *testing.T) {
 		}
 	})
 	t.Run("own-window-shut-is-judged-alone", func(t *testing.T) {
+		// Stream 3's own window is shut while the conn released 70000 bytes, all to
+		// stream 1. It is not credited with them as a starved stream is: it takes
+		// nothing of its own, so it is held for writeIdleWindows windows (it may be
+		// queued behind its sibling) and reset at the next.
 		m, a, b := setup(t)
 		b.SetWindowSize(0)
-		m.UpdateConnectionWindow(70000)
-		m.FlushOutbound(a, discard889) // the conn released 70000, all to a
-		out := m.ExpiredWrites(dueAt889(), make([]uint32, 0, 8))
-		if len(out) != 1 || out[0] != 3 {
-			t.Fatalf("expired %v, want only stream 3: its own window was shut, the conn's releases are not its credit", out)
+		now := dueAt889()
+		for w := 0; w <= writeIdleWindows+1; w++ {
+			m.UpdateConnectionWindow(70000)
+			m.FlushOutbound(a, discard889)
+			out := m.ExpiredWrites(now, make([]uint32, 0, 8))
+			want := 0
+			if w == writeIdleWindows {
+				want = 1 // the (writeIdleWindows+1)th window with nothing of its own
+			}
+			if len(out) != want || (want == 1 && out[0] != 3) {
+				t.Fatalf("window %d: expired %v, want %d (only stream 3, in window %d)", w, out, want, writeIdleWindows)
+			}
+			if want == 1 {
+				return
+			}
+			now += int64(wt889) + int64(time.Millisecond)
 		}
 	})
 	t.Run("releases-outside-a-flush-count", func(t *testing.T) {

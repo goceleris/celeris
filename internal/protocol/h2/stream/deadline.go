@@ -163,7 +163,7 @@ func (p *Processor) TakeIgnoredActivity() bool {
 // ReadHeaderTimeout): ReadHeaderTimeout after the first HEADERS frame of a block
 // that does not end with it, the connection ends with GOAWAY(ENHANCE_YOUR_CALM).
 // 0 turns it off. Set once, before the first frame.
-func (p *Processor) SetHeaderBlockTimeout(d time.Duration) { p.hdrTimeout = d }
+func (p *Processor) SetHeaderBlockTimeout(d time.Duration) { p.hdrTimeout = clampTimeout(d) }
 
 // armHeaderBlock starts the deadline of the header block that has just begun
 // (a HEADERS frame without END_HEADERS).
