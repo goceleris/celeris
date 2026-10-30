@@ -88,6 +88,7 @@ func TestH2PoolWaiterThatGrantsNothingIsReset1170(t *testing.T) {
 				t.Parallel()
 				var p pool1170
 				c := dialH2raw889(t, p.server(t, e.eng, -1, -1, time.Second), h2dial889{initialWindow: tc.iw})
+				c.window889(0, 1<<30-65535) // the connection window is not the limit: the stream's is
 				c.request(1, "GET", "/pool?n=8388608", true, true)
 				defer c.pingEvery889(200 * time.Millisecond)()
 				ev := c.await889(1, 12*time.Second)
@@ -110,6 +111,7 @@ func TestH2PoolWaiterDribblerIsReset1170(t *testing.T) {
 				t.Parallel()
 				var p pool1170
 				c := dialH2raw889(t, p.server(t, e.eng, -1, -1, time.Second), h2dial889{initialWindow: tc.iw})
+				c.window889(0, 1<<30-65535) // the connection window is not the limit: the stream's is
 				c.request(1, "GET", "/pool?n=8388608", true, true)
 				defer every889(100*time.Millisecond, func() { c.window889(1, 1); c.window889(0, 1) })()
 				ev := c.await889(1, 12*time.Second)
@@ -130,6 +132,7 @@ func TestH2PoolStreamWriterDribblerIsReset1170(t *testing.T) {
 			t.Parallel()
 			var p pool1170
 			c := dialH2raw889(t, p.server(t, e.eng, -1, -1, time.Second), h2dial889{initialWindow: 1 << 20})
+			c.window889(0, 1<<30-65535)
 			c.request(1, "GET", "/stream?n=67108864&chunk=65536", true, true)
 			defer c.pingEvery889(300 * time.Millisecond)()
 			// The client takes the first megabyte at once (its window), then grants 64 KiB
@@ -232,6 +235,7 @@ func TestH2PoolWaiterOfASilentClientEndsTheConnection1170(t *testing.T) {
 				var p pool1170
 				addr := p.server(t, e.eng, time.Second, time.Second, time.Second)
 				c := dialH2raw889(t, addr, h2dial889{initialWindow: 1 << 20})
+				c.window889(0, 1<<30-65535)
 				c.request(1, "GET", path, true, true)
 				ev := c.await889(1, 20*time.Second)
 				closedAt, closed := c.closedAfter889(20 * time.Second)
@@ -256,6 +260,7 @@ func TestH2PoolWaiterWithoutAWriteTimeoutKeepsTheOldClocks1170(t *testing.T) {
 			t.Parallel()
 			var p pool1170
 			c := dialH2raw889(t, p.server(t, e.eng, time.Second, time.Second, -1), h2dial889{initialWindow: 1 << 20})
+			c.window889(0, 1<<30-65535)
 			c.request(1, "GET", "/pool?n=8388608", true, true)
 			_ = c.await889(1, 20*time.Second)
 			closedAt, closed := c.closedAfter889(20 * time.Second)
