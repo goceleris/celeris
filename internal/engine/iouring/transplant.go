@@ -180,13 +180,14 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	if w.transplantCount != nil {
 		w.transplantCount.Add(1)
 	}
-	// A fresh clock, not w.cachedNow: an adoption is drained after the CQE
-	// batch, which is what reads cachedNow, and in an iteration that carried
-	// none cachedNow is as old as the wait before it, up to 1 s on a draining
-	// worker, or the whole park (celeris#713). checkTimeouts reads a stamp's
-	// age as idle time. The adoption's eventfd wake is normally a CQE of the
-	// same iteration; this covers one drained without it. Adoptions come one
-	// per handed-off connection, so the vDSO call is off the request path.
+	// A fresh clock rather than w.cachedNow: an adoption is drained after the
+	// CQE batch, and the clock the loop read for it can be a batch old (the
+	// whole park, celeris#713; the loop now reads it after every wait,
+	// readClockAfterWait, celeris#1173, so this read is no longer needed for an
+	// iteration with no completion and stays only so that the stamp does not
+	// depend on that). checkTimeouts reads a stamp's age as idle time.
+	// Adoptions come one per handed-off connection, so the vDSO call is off the
+	// request path.
 	cs.lastActivity = time.Now().UnixNano()
 
 	// #383 adopts HTTP/1 keep-alive conns only; lock the protocol and install a
