@@ -73,6 +73,18 @@ b TestH2ConnWindowStarvedStreamsAreJudgedPerConnection889
 b TestH2FlowingDownloadAndQuietStreamAreNotCut889
 b TestH2SilentClientWithAStalledResponseKeepsTheConnUntilTheStreamIsReset889
 
+# The pool handler's wait for window as a minimum rate (celeris#1170, stage 3): 5 to 40 s each, 220 s together.
+a TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170
+a TestH2GoTransportManyParallelDownloadsAreNotCut1170
+a TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170
+a TestH2PoolWaiterThatGrantsNothingIsReset1170
+b TestH2PoolWaiterLoopBlockedThreshold1170
+b TestH2GoTransportQueueBeyondTheCapIsCut1170
+b TestH2PoolWaiterBurstyReaderIsNotClosedByReadTimeout1170
+b TestH2PoolWaiterOfASilentClientEndsTheConnection1170
+b TestH2PoolWaiterDribblerIsReset1170
+b TestH2PoolStreamWriterDribblerIsReset1170
+
 # The rest step of the Unit job (test/server, -race, -timeout=540s) was at 539.2 s on the merge of #1169 (main alone: 501 s), 0.8 s from its timeout:
 # the 14 slowest tests of the root packages still in it (8 to 34 s each, 216 s of CI test time) move to the shards, which have 300 s of room.
 a TestShutdownConnCloseContract884

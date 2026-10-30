@@ -134,7 +134,6 @@ func (m *Manager) beginWait(s *Stream, id uint32, w *SendWait, rest int, gen uin
 	if wt <= 0 {
 		return 0
 	}
-	now := time.Now().UnixNano()
 	// The seed reads the stream's books under its lock, taken before stallMu.
 	seed := 0
 	if !w.made {
@@ -146,6 +145,7 @@ func (m *Manager) beginWait(s *Stream, id uint32, w *SendWait, rest int, gen uin
 	m.stallMu.Lock()
 	st := m.stalls[id]
 	if st == nil {
+		now := time.Now().UnixNano() // read only when a record is made, not for every wait
 		if m.stalls == nil {
 			m.stalls = make(map[uint32]*stall)
 		}
@@ -158,7 +158,7 @@ func (m *Manager) beginWait(s *Stream, id uint32, w *SendWait, rest int, gen uin
 	end := st.armedAt + wt
 	m.stallMu.Unlock()
 	if w.start == 0 {
-		w.start = now
+		w.start = time.Now().UnixNano()
 	}
 	w.m, w.id, w.made = m, id, true
 	return end
