@@ -729,6 +729,6 @@ func TestLoopWatchTellsAnEpisodeOnce1170(t *testing.T) {
 	if got := h.n.Load(); got != 2 {
 		t.Fatalf("%d lines after a second episode, want 2", got)
 	}
-	var none *LoopWatch = NewLoopWatch() // no logger: nothing, no crash
+	none := NewLoopWatch() // no logger: nothing, no crash
 	none.noteStuck(0, 0, wt)
 }
