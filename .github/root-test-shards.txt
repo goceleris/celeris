@@ -73,7 +73,7 @@ b TestH2ConnWindowStarvedStreamsAreJudgedPerConnection889
 b TestH2FlowingDownloadAndQuietStreamAreNotCut889
 b TestH2SilentClientWithAStalledResponseKeepsTheConnUntilTheStreamIsReset889
 
-# The pool handler's wait for window as a minimum rate (celeris#1170, stage 3): 5 to 40 s each, 220 s together.
+# The pool handler's wait for window as a minimum rate (celeris#1170, stage 3): 5 to 105 s each, 330 s together.
 a TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170
 a TestH2GoTransportManyParallelDownloadsAreNotCut1170
 a TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170
