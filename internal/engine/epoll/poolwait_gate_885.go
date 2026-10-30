@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/drainclock"
 	"github.com/goceleris/celeris/internal/engine"
 )
 
@@ -131,10 +132,12 @@ func (l *Loop) poolWaitGate() {
 	}
 	first := !l.refuseRecv
 	l.refuseRecv = true
-	if n := now.UnixNano(); first || n >= l.producersStopNext {
-		l.producersStopNext = n + int64(h2PoolDrainPollMs*time.Millisecond)
+	if p := drainclock.Now(); first || p >= l.producersStopNext {
+		l.producersStopNext = p + int64(h2PoolDrainPollMs*time.Millisecond)
 		l.stopDetachedProducers()
-		l.closeIdleH1(first, n)
+		// The wall clock, not the pacer's: closeIdleH1 hands it to drainRead,
+		// which stamps a conn's lastActivity with it.
+		l.closeIdleH1(first, now.UnixNano())
 	}
 }
 
@@ -433,7 +436,7 @@ func (l *Loop) poolWaitSettled() bool {
 // second). It is asked at most once per h2PoolDrainPollMs while it answers yes.
 // Loop thread.
 func (l *Loop) h1InProgress() bool {
-	now := time.Now().UnixNano()
+	now := drainclock.Now()
 	if l.h1InProgressNext != 0 && now < l.h1InProgressNext {
 		return true
 	}

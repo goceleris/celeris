@@ -46,7 +46,8 @@ import (
 type holdHandler896 struct {
 	started chan struct{}
 	release chan struct{}
-	big     []byte // the /big response; nil unless the test serves it
+	big     []byte       // the /big response; nil unless the test serves it
+	running atomic.Int64 // /hold handlers that have started (started drops past its 4)
 }
 
 func newHoldHandler896(bigBody bool) *holdHandler896 {
@@ -71,6 +72,7 @@ func (h *holdHandler896) HandleStream(_ context.Context, s *stream.Stream) error
 	}
 	switch path {
 	case "/hold":
+		h.running.Add(1)
 		select {
 		case h.started <- struct{}{}:
 		default:
@@ -87,8 +89,9 @@ func (h *holdHandler896) HasAsyncRoutes() bool           { return true }
 
 // startHold896 starts a standalone io_uring engine on addr with handler h and
 // returns once it has published its address. A start that fails only on ring
-// ENOMEM is retried, as start896's is.
-func startHold896(t *testing.T, addr string, workers int, h stream.Handler) *engineRun896 {
+// ENOMEM is retried, as start896's is. writeTimeout is the engine's
+// (resource.Config.WriteTimeout: 0 is the default, -1 none).
+func startHold896(t *testing.T, addr string, workers int, writeTimeout time.Duration, h stream.Handler) *engineRun896 {
 	t.Helper()
 	var run *engineRun896
 	_, _, err := retryRingENOMEM(func() error {
@@ -97,6 +100,7 @@ func startHold896(t *testing.T, addr string, workers int, h stream.Handler) *eng
 			Engine:        engine.IOUring,
 			Protocol:      engine.Auto,
 			AsyncHandlers: true,
+			WriteTimeout:  writeTimeout,
 			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 			Resources:     resource.Resources{Workers: workers},
 		}, h)
@@ -194,12 +198,33 @@ func seam896(t *testing.T, full bool) *atomic.Int64 {
 // waitCalls896 waits until the seam has been called more than before times.
 func waitCalls896(t *testing.T, calls *atomic.Int64, before int64) {
 	t.Helper()
+	if !waitSeam896(calls, before) {
+		t.Fatal("the shutdown never reached cancelAccept: the test is not exercising the stopAccepting route")
+	}
+}
+
+func waitSeam896(calls *atomic.Int64, before int64) bool {
 	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(time.Millisecond) {
 		if calls.Load() > before {
-			return
+			return true
 		}
 	}
-	t.Fatal("the shutdown never reached cancelAccept: the test is not exercising the stopAccepting route")
+	return false
+}
+
+// clockStep896 is how far the wall clock moved, in either direction, relative
+// to the monotonic clock between two readings of time.Now. The engine's drain
+// deadlines were wall-clock (time.Now().UnixNano() against the budget's
+// Deadline) until celeris#1176, so a step of more than a second in the middle
+// of an iteration changed what the drain did: forward it found the budget
+// spent and gave up at its 250 ms floor, never stopping the accept; backward it
+// found the floor not yet passed for as long as the step was big. A Docker
+// Desktop VM steps its clock by tens of seconds when the host sleeps or
+// throttles it. They are monotonic now (drain_clock_step_1176_linux_test.go
+// steps the clock on purpose); this stays in the failure message of the
+// iteration, which still names a step it saw.
+func clockStep896(from, to time.Time) time.Duration {
+	return to.Round(0).Sub(from.Round(0)) - to.Sub(from)
 }
 
 type iter896 func(t *testing.T, calls *atomic.Int64) (addr string, returned time.Time)
@@ -243,7 +268,7 @@ func loop896(t *testing.T, label string, n int, full bool, iter iter896) {
 func h2Iteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
 	addr := freeAddr639(t)
 	h := newHoldHandler896(false)
-	run := startHold896(t, addr, 2, h)
+	run := startHold896(t, addr, 2, 0, h)
 	c := h2Request896(t, addr, "/hold")
 	defer func() { _ = c.Close() }()
 	select {
@@ -275,9 +300,10 @@ func (r *engineRun896) stopped() (time.Time, error) {
 // first). Past the mark the worker stops accepting; the peer then goes away
 // and Listen returns.
 func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
+	t0 := time.Now()
 	addr := freeAddr639(t)
 	h := newHoldHandler896(true)
-	run := startHold896(t, addr, 2, h)
+	run := startHold896(t, addr, 2, -1, h)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial %s: %v", addr, err)
@@ -286,13 +312,42 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	if _, err := c.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	time.Sleep(20 * time.Millisecond) // the response is on its way, and does not fit the socket buffers
-	budget, cancelBudget := context.WithTimeout(context.Background(), 10*time.Second)
+	// Wait for the condition the iteration needs, not for a guess at it: the
+	// first byte of the response is at the client, so the worker has read the
+	// request and has the rest (32 MiB, more than the socket buffers take) in
+	// flight to a peer that reads no more. A fixed 20 ms was not enough on a
+	// loaded runner: the worker had accepted the conn but not yet reaped the
+	// recv, so it saw no send pending and no request in progress, shut down at
+	// once and never reached stopAccepting (celeris#1172).
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(c, make([]byte, 1)); err != nil {
+		t.Fatalf("no byte of the /big response within 10 s: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Time{})
+	// A budget with no deadline (net/http's "as long as it takes") and an
+	// engine with no WriteTimeout: the drain's end is then the peer's going
+	// away, which this test does, and not an instant. The drain's end was
+	// wall-clock (drainEnd compared time.Now().UnixNano() with the budget's
+	// Deadline and with start + WriteTimeout), so a wall clock that stepped
+	// forward past either (a Docker Desktop VM steps by tens of seconds) ended
+	// the drain at its 250 ms floor, with shutdown, before stopAccepting
+	// (celeris#1172). It is monotonic since celeris#1176; this iteration keeps
+	// its no-deadline budget, which the 250 ms floor and the peer's going away
+	// decide on their own.
+	budget, cancelBudget := context.WithCancel(context.Background())
 	defer cancelBudget()
 	_ = run.e.Shutdown(budget)
 	before := calls.Load()
 	run.cancel()
-	waitCalls896(t, calls, before)
+	if !waitSeam896(calls, before) {
+		// Say what the client saw of the response and whether the clock stepped.
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		buf := make([]byte, 64<<10)
+		n, rerr := c.Read(buf)
+		t.Fatalf("the shutdown never reached cancelAccept: the test is not exercising the stopAccepting route "+
+			"(the client read %d bytes of the response, then %v; wall clock minus monotonic since the iteration began: %v)",
+			n, rerr, clockStep896(t0, time.Now()))
+	}
 	_ = c.Close()
 	returned, err := run.stopped()
 	if err != nil {

@@ -376,7 +376,7 @@ func (w *Worker) gateCloseable(cs *connState) bool {
 // send drain's gate, whose own walk over the detached conns is not paced (the
 // drain is not a serving phase). It shares producersStopNext with the pool
 // wait's gate, which never runs in the same loop pass. now is the pass's
-// UnixNano. Worker thread.
+// drainclock.Now. Worker thread.
 func (w *Worker) closeIdlePaced(now int64) {
 	if now < w.producersStopNext {
 		return

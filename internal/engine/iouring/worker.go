@@ -23,6 +23,7 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/deferlinger"
+	"github.com/goceleris/celeris/internal/drainclock"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/bindiag"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
@@ -675,7 +676,7 @@ type Worker struct {
 	linkArmBatch uint64
 
 	tickCounter uint32
-	cachedNow   int64  // cached time.Now().UnixNano(), refreshed on every CQE-bearing iteration and by checkTimeouts
+	cachedNow   int64  // cached time.Now().UnixNano(), read once per iteration after its wait (readClockAfterWait), and by checkTimeouts
 	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
 	// dirtySendGiveUps counts the dirty pass's give-ups of a conn with a SEND
 	// outstanding (celeris#811). Worker-owned; read by tests after the
@@ -806,7 +807,8 @@ type Worker struct {
 	zcHoldCount int
 	zcHoldBytes int
 
-	// shutdownDrainStart is when (UnixNano) the send drain the run loop
+	// shutdownDrainStart is when (drainclock.Now, the monotonic clock, not
+	// cachedNow's: celeris#1176) the send drain the run loop
 	// performs once its context is cancelled began (celeris#595): after the
 	// HTTP/2 pool handlers are done (h2PoolSettled), so zero until then. The
 	// drain's end is drainEnd(shutdownDrainStart, ...), worked out afresh
@@ -838,8 +840,9 @@ type Worker struct {
 	// drainBudget points at the engine's record of the budget of the last
 	// Engine.Shutdown call, and h2DrainStart is when the worker, its
 	// context cancelled, began waiting for the HTTP/2 stream handlers on
-	// the shared worker pool (celeris#759; h2PoolSettled). Worker thread
-	// only; h2DrainStart is zero until then.
+	// the shared worker pool (celeris#759; h2PoolSettled), on
+	// drainclock.Now (monotonic, not cachedNow's: celeris#1176). Worker
+	// thread only; h2DrainStart is zero until then.
 	drainBudget  *atomic.Pointer[context.Context]
 	h2DrainStart int64
 
@@ -978,7 +981,7 @@ type Worker struct {
 	// ringWaitWarned is set once the first retried wait was logged
 	// (ringWaitContinues). Worker thread only.
 	ringWaitWarned bool
-	// producersStopNext is when (UnixNano) the shutdown gate may walk the
+	// producersStopNext is when (drainclock.Now) the shutdown gate may walk the
 	// conns again (stopProducersPaced, closeIdlePaced). Worker thread only.
 	producersStopNext int64
 	// ringWaitRunStart is when (UnixNano) the run of consecutive retried ring
@@ -1629,14 +1632,14 @@ func (w *Worker) run(ctx context.Context) {
 				// producers' OnError and OnDetachClose run on this thread, as
 				// in the send drain, so a slow callback delays the HTTP/2
 				// conns served here.
-				if now := time.Now().UnixNano(); now > w.h2DrainStart+shutdownSendDrainNanos {
+				if now := drainclock.Now(); now > w.h2DrainStart+shutdownSendDrainNanos {
 					w.refuseRecv = true
 					if w.stopProducersPaced(now) {
 						w.closeIdleH1()
 					}
 				}
 			} else {
-				now := time.Now().UnixNano()
+				now := drainclock.Now()
 				if w.shutdownDrainStart == 0 {
 					w.shutdownDrainStart = now
 				}
@@ -1806,6 +1809,7 @@ func (w *Worker) run(ctx context.Context) {
 		w.sendsPending = false
 
 		gotCQE := cqHead != cqTail
+		w.readClockAfterWait(gotCQE)
 		if gotCQE {
 			w.emptyIters = 0 // Reset adaptive timeout on activity.
 			// Read the clock once per CQE batch, after the wait that
@@ -1979,13 +1983,9 @@ func (w *Worker) run(ctx context.Context) {
 		// queuePendingRelease docstring).
 		w.iterCount++
 		if len(w.pendingRelease) > 0 {
-			// An idle iteration with a descriptor still kept for an owed op
-			// (celeris#685) refreshes the clock the backstop reads: cachedNow
-			// moves only with CQE traffic or the timeout sweep, and a kept
-			// descriptor also keeps this worker from parking.
-			if w.closeFDOwed > 0 && w.emptyIters > 0 {
-				w.cachedNow = time.Now().UnixNano()
-			}
+			// (An idle iteration with a descriptor kept for an owed op, celeris#685,
+			// used to refresh the clock the backstop reads here: the loop now reads
+			// it after every wait, readClockAfterWait.)
 			w.drainPendingRelease()
 		}
 
@@ -2899,8 +2899,8 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 	setSQEUserData(sqe, encodeUserData(udListenCancel, lfd))
 	var ringErr error
 	acceptOwed := true
-	deadline := time.Now().UnixNano() + shutdownFDDrainNanos
-	for acceptOwed && time.Now().UnixNano() < deadline {
+	deadline := drainclock.Now() + shutdownFDDrainNanos
+	for acceptOwed && drainclock.Now() < deadline {
 		if err := shutdownRingWait(w.ring, 10*time.Millisecond); err != nil {
 			if !ringWaitRetryable(err) {
 				ringErr = err
@@ -6505,6 +6505,9 @@ func (w *Worker) drainH2Writes() {
 		fd := w.h2Conns[i]
 		cs := w.conns[fd]
 		if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+			if h := h2WriteDrainSeam.Load(); h != nil {
+				(*h)(w, fd)
+			}
 			cs.h2State.DrainWriteQueue(cs.writeFn)
 			if cs.writeRefused {
 				// A frame refused on back-pressure is lost, and the
@@ -6517,6 +6520,26 @@ func (w *Worker) drainH2Writes() {
 				w.markDirty(cs)
 			}
 		}
+	}
+}
+
+// readClockAfterWait is the loop's clock read for an iteration whose wait
+// returned no completion. An iteration with completions reads the clock once
+// for its batch; one without left cachedNow as old as the last batch or sweep,
+// up to the whole idle wait (1 ms, then 5 ms, up to 100 ms, 1 s on a worker
+// with no listener). What the iteration does next stamps with it: a handler's
+// write that landed after the loop looked for completions (the enqueue and its
+// wake of the eventfd come after the check) is staged by drainH2Writes or
+// drainDetachQueue in this very iteration, flushSend starts that conn's write
+// clock from cachedNow, and the sweep later in the same iteration reads a fresh
+// clock and closes a conn with a SEND staged whose clock is older than
+// WriteTimeout: a stream quiet for most of WriteTimeout began its response
+// with the clock most of WriteTimeout old, 103 to 128 ms against 100 in the
+// test (celeris#1173). An iteration with no completion has nothing to be quick
+// about: one vDSO call. Worker thread.
+func (w *Worker) readClockAfterWait(gotCQE bool) {
+	if !gotCQE {
+		w.cachedNow = time.Now().UnixNano()
 	}
 }
 
@@ -7322,9 +7345,10 @@ func (w *Worker) flushSend(cs *connState) bool {
 	// WriteTimeout for a conn with a send in flight from it, so for a stream
 	// that was quiet for longer than WriteTimeout the whole gap counted, and a
 	// sweep that found the next chunk's SEND in flight closed the conn with it
-	// (celeris#889). A store of the clock the iteration already read: the
-	// recv, the wake of a handler goroutine's write, or the sweep refreshed
-	// cachedNow before this ran.
+	// (celeris#889). A store of the clock the iteration already read: the loop
+	// reads it after every wait, for the batch of completions or, with none,
+	// at once (readClockAfterWait; a wake of the handler's write that was not
+	// a completion of this iteration left it as old as the wait, celeris#1173).
 	cs.lastActivity = w.cachedNow
 	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
 
@@ -8062,7 +8086,7 @@ func (w *Worker) h2PoolSettled() bool {
 	if len(w.h2Conns) == 0 {
 		return true
 	}
-	now := time.Now().UnixNano()
+	now := drainclock.Now()
 	if w.h2DrainStart == 0 {
 		w.h2DrainStart = now
 	}
@@ -8096,7 +8120,8 @@ func (w *Worker) h2PoolSettled() bool {
 	return bounded && now > end
 }
 
-// drainEnd is when (UnixNano) a drain that began at start gives up, and false
+// drainEnd is when (drainclock.Now, the monotonic clock: a step of the wall
+// clock does not move it, celeris#1176) a drain that began at start gives up, and false
 // while it has no end but the budget's being done. It is bounded as epoll's
 // send drain is (epoll's Loop.sendDrainWait), and the HTTP/2 wait and the
 // send drain share it so the two agree: while the budget the last
@@ -8117,7 +8142,7 @@ func (w *Worker) drainEnd(start, floor int64) (end int64, bounded bool) {
 		return end, true
 	}
 	d, hasDeadline := (*p).Deadline()
-	ext := d.UnixNano()
+	ext := drainclock.At(d)
 	if wt := int64(w.cfg.WriteTimeout); wt > 0 && (!hasDeadline || start+wt < ext) {
 		ext, hasDeadline = start+wt, true
 	}
@@ -8370,7 +8395,7 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 // h2PoolDrainPoll, for the pool wait's gate (celeris#884): a producer whose
 // lock was busy is tried again within a poll, and no loop pass pays the walk
 // over every live conn twice in one. It reports whether it walked. now is the
-// pass's UnixNano. Worker thread.
+// pass's drainclock.Now. Worker thread.
 func (w *Worker) stopProducersPaced(now int64) bool {
 	if now < w.producersStopNext {
 		return false

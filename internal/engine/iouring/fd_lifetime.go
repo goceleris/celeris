@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/drainclock"
 	"github.com/goceleris/celeris/internal/engine"
 )
 
@@ -683,8 +684,8 @@ func (w *Worker) endOwedOpsAtShutdown() {
 			w.cancelConnOps(cs.fd, cs)
 			_ = unix.Shutdown(cs.fd, unix.SHUT_RDWR)
 		}
-		deadline := time.Now().UnixNano() + shutdownFDDrainNanos
-		for pending() && time.Now().UnixNano() < deadline {
+		deadline := drainclock.Now() + shutdownFDDrainNanos
+		for pending() && drainclock.Now() < deadline {
 			if err := shutdownRingWait(w.ring, 10*time.Millisecond); err != nil {
 				if !ringWaitRetryable(err) {
 					ringErr = err
