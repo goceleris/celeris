@@ -194,12 +194,30 @@ func seam896(t *testing.T, full bool) *atomic.Int64 {
 // waitCalls896 waits until the seam has been called more than before times.
 func waitCalls896(t *testing.T, calls *atomic.Int64, before int64) {
 	t.Helper()
+	if !waitSeam896(calls, before) {
+		t.Fatal("the shutdown never reached cancelAccept: the test is not exercising the stopAccepting route")
+	}
+}
+
+func waitSeam896(calls *atomic.Int64, before int64) bool {
 	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(time.Millisecond) {
 		if calls.Load() > before {
-			return
+			return true
 		}
 	}
-	t.Fatal("the shutdown never reached cancelAccept: the test is not exercising the stopAccepting route")
+	return false
+}
+
+// clockStep896 is how far the wall clock moved, in either direction, relative
+// to the monotonic clock between two readings of time.Now. The engine's drain
+// deadlines are wall-clock (time.Now().UnixNano() against the budget's
+// Deadline), so a step of more than a second in the middle of an iteration
+// changes what the drain does: forward it finds the budget spent and gives up
+// at its 250 ms floor, never stopping the accept; backward it finds the floor
+// not yet passed for as long as the step is big. A Docker Desktop VM steps its
+// clock by tens of seconds when the host sleeps or throttles it.
+func clockStep896(from, to time.Time) time.Duration {
+	return to.Round(0).Sub(from.Round(0)) - to.Sub(from)
 }
 
 type iter896 func(t *testing.T, calls *atomic.Int64) (addr string, returned time.Time)
@@ -275,6 +293,7 @@ func (r *engineRun896) stopped() (time.Time, error) {
 // first). Past the mark the worker stops accepting; the peer then goes away
 // and Listen returns.
 func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
+	t0 := time.Now()
 	addr := freeAddr639(t)
 	h := newHoldHandler896(true)
 	run := startHold896(t, addr, 2, h)
@@ -292,7 +311,15 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	_ = run.e.Shutdown(budget)
 	before := calls.Load()
 	run.cancel()
-	waitCalls896(t, calls, before)
+	if !waitSeam896(calls, before) {
+		// Say what the client saw of the response and whether the clock stepped.
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		buf := make([]byte, 64<<10)
+		n, rerr := c.Read(buf)
+		t.Fatalf("the shutdown never reached cancelAccept: the test is not exercising the stopAccepting route "+
+			"(the client read %d bytes of the response, then %v; wall clock minus monotonic since the iteration began: %v)",
+			n, rerr, clockStep896(t0, time.Now()))
+	}
 	_ = c.Close()
 	returned, err := run.stopped()
 	if err != nil {
