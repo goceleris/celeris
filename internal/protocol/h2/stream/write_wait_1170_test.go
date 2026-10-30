@@ -275,6 +275,24 @@ func TestWaiterRecordBooks1170(t *testing.T) {
 	}
 }
 
+// The record follows the handler's own count of what is left, whatever the credits
+// said: a send that was not credited does not leave the books ahead of the handler.
+func TestWaiterBooksFollowTheHandlersCount1170(t *testing.T) {
+	m, s := waitRig1170(t, time.Millisecond, 1<<20) // a seed: the verdict holds
+	var w SendWait
+	m.beginWait(s, s.ID, &w, 10000, s.Gen())
+	time.Sleep(5 * time.Millisecond) // the window ended: due
+	// The handler sent 3000 and the credit was not made; it tells its rest to the judge.
+	m.judgeWait(s, s.ID, &w, 7000)
+	m.stallMu.Lock()
+	st := m.stalls[s.ID]
+	got := st != nil && st.pending == 7000 && m.waitHeld == 7000
+	m.stallMu.Unlock()
+	if !got {
+		t.Fatalf("the record after the judge: %+v waitHeld %d, want pending 7000", st, m.waitHeld)
+	}
+}
+
 // A stream is a waiter or a buffer, never both; if it ever were, the sweep judges
 // the record and the waiter's judge defers to it.
 func TestWaiterAndBufferNeverHaveTwoJudges1170(t *testing.T) {

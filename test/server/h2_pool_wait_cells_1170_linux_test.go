@@ -54,6 +54,9 @@ func (p *pool1170) server(t *testing.T, eng celeris.EngineType, read, idle, writ
 			}
 			return sw.Close()
 		}).Async()
+		s.GET("/fill", func(c *celeris.Context) error {
+			return c.Blob(200, "application/octet-stream", make([]byte, 1536<<10))
+		})
 		s.GET("/hold", func(c *celeris.Context) error {
 			n, _ := strconv.Atoi(c.Query("n"))
 			p.mu.Lock()
@@ -273,40 +276,79 @@ func TestH2PoolWaiterWithoutAWriteTimeoutKeepsTheOldClocks1170(t *testing.T) {
 }
 
 // TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170: the wedge of #906's review,
-// with a client that reads at a compliant rate. /hold writes 8 MiB while it holds a
-// mutex that /locked (sync, on the event loops) waits for; the client has a 1 MiB
-// window and reads at 128 KB/s, twice the floor at WriteTimeout 1 s, so the rule alone
-// would hold /hold for the whole download (64 s) and the loops with it. The loops are
-// stuck in a batch for more than half a WriteTimeout: the wait falls back to
-// WriteTimeout in all, and every /locked is answered within 1.5 WriteTimeouts plus
-// slack.
+// with a client that reads at a compliant rate. The connection is put over the
+// outbound budget (four sync GETs of a 1.5 MiB body nobody credits, as #906's own cell
+// does), then /hold writes 8 MiB while it holds a mutex that /locked (sync, on the
+// event loops) waits for. The client reads /hold at 128 KB/s and grants it as it
+// reads, twice the floor at WriteTimeout 1 s, so the rule alone would hold /hold for
+// the whole download (64 s) and the loops with it. The loops are stuck in a batch for
+// more than half a WriteTimeout: the wait falls back to WriteTimeout in all, and every
+// /locked is answered within 1.5 WriteTimeouts plus slack.
 func TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170(t *testing.T) {
 	const timeout = time.Second
 	for _, e := range nativeEngines889() {
 		t.Run(e.name, func(t *testing.T) {
 			var p pool1170
 			addr := p.server(t, e.eng, -1, -1, timeout)
-			done := make(chan string, 1)
-			go func() {
-				end, _, at := batched889(t, addr, "/hold?n=8388608", 1<<20, 128<<10, 128e3, 40*time.Second)
-				done <- fmt.Sprintf("%s at %v", end, at.Round(time.Millisecond))
+			c := dialH2raw889(t, addr, h2dial889{})
+			c.window889(0, 1<<30-65535)
+			for i := 0; i < 4; i++ {
+				c.request(uint32(2*i+1), "GET", "/fill", true, true) // never credited
+			}
+			time.Sleep(300 * time.Millisecond)
+			c.request(9, "GET", "/hold?n=8388608", true, true)
+			stop := make(chan struct{})
+			defer close(stop)
+			var recv atomic.Int64
+			go func() { // reads, answers PINGs
+				for {
+					f, err := c.fr.ReadFrame()
+					if err != nil {
+						return
+					}
+					switch f := f.(type) {
+					case *http2.DataFrame:
+						if f.StreamID == 9 {
+							recv.Add(int64(len(f.Data())))
+						}
+					case *http2.PingFrame:
+						if !f.IsAck() {
+							c.wmu.Lock()
+							_ = c.fr.WritePing(true, f.Data)
+							c.wmu.Unlock()
+						}
+					}
+				}
 			}()
-			time.Sleep(300 * time.Millisecond) // /hold is waiting for window with the lock
+			go func() { // grants stream 9 as it "consumes" at 128 KB/s
+				t0, acked := time.Now(), 0
+				tk := time.NewTicker(50 * time.Millisecond)
+				defer tk.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-tk.C:
+						consumed := min(int(128e3*time.Since(t0).Seconds()), int(recv.Load()))
+						if consumed > acked {
+							c.window889(9, uint32(consumed-acked))
+							c.window889(0, uint32(consumed-acked))
+							acked = consumed
+						}
+					}
+				}
+			}()
+			time.Sleep(700 * time.Millisecond) // /hold waits for window, with the lock
 			t0 := time.Now()
 			lockers := get893(8, "http://"+addr+"/locked", timeout+6*time.Second)
 			took := time.Since(t0)
 			n, sl := answered893(lockers)
-			t.Logf("WG1170 %s: /locked %s in %v", e.name, sl, took.Round(time.Millisecond))
+			t.Logf("WG1170 %s: /locked %s in %v; /hold had received %d bytes", e.name, sl, took.Round(time.Millisecond), recv.Load())
 			if n != 8 {
 				t.Errorf("/locked answered %d/8: the loops waited for the lock a compliant reader's download held", n)
 			}
 			if took > 3*timeout {
 				t.Errorf("the lockers waited %v, want about 1.5 x WriteTimeout (%v) plus slack", took, timeout)
-			}
-			select {
-			case r := <-done:
-				t.Logf("WG1170 %s: the /hold download ended: %s", e.name, r)
-			case <-time.After(45 * time.Second):
 			}
 		})
 	}
