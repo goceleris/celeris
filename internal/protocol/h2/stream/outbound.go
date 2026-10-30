@@ -39,19 +39,26 @@ import (
 // 4 MiB matches the HTTP/1 per-connection backlog limit (the engines'
 // maxPendingBytes).
 //
-// A waiting handler is blocked while the peer withholds window, for no
-// longer than the server's WriteTimeout from its write: then its stream is
-// reset (AwaitSendWindow's deadline, set by the conn layer). The connection's
-// read and idle timeouts do not bound it: they measure the peer's silence, and
-// a peer that withholds window but sends any frame, a PING, keeps them from
-// firing. Whatever waits for a waiting handler waits with it: a request that
-// needs a lock it holds across its write, a cache's coalesced fill it leads
-// (celeris#913). On std that stalls only those requests. On epoll, io_uring
-// and adaptive a sync handler that waits for it holds its event loop, and so
-// every connection on that loop, until the deadline. With WriteTimeout
-// disabled there is no deadline: the wait lasts until the peer grants window
-// or the connection closes, and never ends if the loop that would see either
-// is the one waiting.
+// A waiting handler is blocked while the peer withholds window, bounded by the
+// server's WriteTimeout as a minimum rate, not by a deadline: the peer must let
+// at least 64 KiB of what it still has to send (or all of it, if less) out per
+// WriteTimeout window, with the carry-over and the grace the rule of every stalled
+// stream gives (AwaitSendWindowRate, write_wait.go; celeris#1170), or its stream is
+// reset. It was an absolute deadline, WriteTimeout from the start of the wait
+// (celeris#906), which cut a peer that read at a healthy rate when the bytes queued
+// ahead of its stream took longer. The connection's read and idle timeouts do not
+// bound it: they measure the peer's silence, and a peer that withholds window but
+// sends any frame, a PING, keeps them from firing. Whatever waits for a waiting
+// handler waits with it: a request that needs a lock it holds across its write, a
+// cache's coalesced fill it leads (celeris#913). On std that stalls only those
+// requests. On epoll, io_uring and adaptive a sync handler that waits for it holds
+// its event loop, and so every connection on that loop, and with a rate a reader
+// that takes its floor would hold it for the whole download: so while an event loop
+// of the server has been in one batch for half a WriteTimeout (at least 250 ms)
+// every waiting handler that has waited a WriteTimeout is bounded by WriteTimeout in
+// all, as before (LoopWatch). With WriteTimeout disabled there is no bound: the wait
+// lasts until the peer grants window or the connection closes, and never ends if the
+// loop that would see either is the one waiting.
 const OutboundBudget = 4 << 20
 
 // OutboundHeld returns how many bytes this connection's streams hold in their
@@ -256,7 +263,9 @@ func (s *Stream) TryBufferOutbound(data []byte, endStream bool) bool {
 
 // AwaitSendWindow blocks the pool handler of s until both of s's send windows
 // are open, so some of its DATA can be sent (celeris#893), and then returns
-// nil. It returns context.Canceled when s is cancelled: the peer reset it, or
+// nil. This is the wait with an absolute deadline; the handlers of the conn layer
+// use AwaitSendWindowRate (write_wait.go), whose bound is a rate, and this one is
+// kept for the tests and benchmarks of the wake machinery they share. It returns context.Canceled when s is cancelled: the peer reset it, or
 // its connection closed (Manager.Close cancels every stream), and nothing
 // more is to be sent. It returns os.ErrDeadlineExceeded once deadline has
 // passed, whether or not the windows are open (a zero deadline never

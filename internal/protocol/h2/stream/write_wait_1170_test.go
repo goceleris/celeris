@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // celeris#1170: a pool handler's wait for window is a record in the stall books,
@@ -71,9 +73,41 @@ func TestWaiterGrantInsideTheSeedIsServed1170(t *testing.T) {
 	}()
 	var w SendWait
 	err, took := run1170(s, &w, 4<<20)
-	w.End(s, s.Gen())
 	if err != nil || took < 3*wait1170 {
 		t.Fatalf("err %v after %v, want nil after the grant at 3.5 windows", err, took)
+	}
+	if m.stalledStreams() != 1 || m.waitHeld != 4<<20 {
+		t.Fatalf("while the handler sends: %d records, waitHeld %d, want its record", m.stalledStreams(), m.waitHeld)
+	}
+	w.End(s, s.Gen())
+	if m.stalledStreams() != 0 || m.waitHeld != 0 {
+		t.Fatalf("after End: %d records, waitHeld %d", m.stalledStreams(), m.waitHeld)
+	}
+}
+
+// The connection window the peer raises moves the high mark connInFlight is measured
+// from, through the frame the processor applies (not only through
+// UpdateConnectionWindow).
+func TestConnWindowUpdateFrameMovesTheHighMark1170(t *testing.T) {
+	p, m, _ := wdSetup889(t)
+	m.connHigh.Store(65535)
+	m.connectionWindow = 65535
+	m.connectionWindow -= 40000 // 40000 sent
+	if got := m.connInFlight(); got != 40000 {
+		t.Fatalf("in flight %d, want 40000", got)
+	}
+	upd := func(n uint32) {
+		if err := p.handleWindowUpdate(&http2.WindowUpdateFrame{FrameHeader: http2.FrameHeader{}, Increment: n}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upd(30000) // the client reads and returns 30000
+	if got := m.connInFlight(); got != 10000 {
+		t.Fatalf("after a return of 30000: %d in flight, want 10000", got)
+	}
+	upd(1 << 20) // the client opens the window far beyond what was sent
+	if got := m.connInFlight(); got != 0 || m.connHigh.Load() < 1<<20 {
+		t.Fatalf("after opening beyond: %d in flight, high %d", got, m.connHigh.Load())
 	}
 }
 
