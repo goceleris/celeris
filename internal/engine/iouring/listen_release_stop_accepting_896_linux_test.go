@@ -46,7 +46,8 @@ import (
 type holdHandler896 struct {
 	started chan struct{}
 	release chan struct{}
-	big     []byte // the /big response; nil unless the test serves it
+	big     []byte       // the /big response; nil unless the test serves it
+	running atomic.Int64 // /hold handlers that have started (started drops past its 4)
 }
 
 func newHoldHandler896(bigBody bool) *holdHandler896 {
@@ -71,6 +72,7 @@ func (h *holdHandler896) HandleStream(_ context.Context, s *stream.Stream) error
 	}
 	switch path {
 	case "/hold":
+		h.running.Add(1)
 		select {
 		case h.started <- struct{}{}:
 		default:
@@ -212,12 +214,15 @@ func waitSeam896(calls *atomic.Int64, before int64) bool {
 
 // clockStep896 is how far the wall clock moved, in either direction, relative
 // to the monotonic clock between two readings of time.Now. The engine's drain
-// deadlines are wall-clock (time.Now().UnixNano() against the budget's
-// Deadline), so a step of more than a second in the middle of an iteration
-// changes what the drain does: forward it finds the budget spent and gives up
-// at its 250 ms floor, never stopping the accept; backward it finds the floor
-// not yet passed for as long as the step is big. A Docker Desktop VM steps its
-// clock by tens of seconds when the host sleeps or throttles it.
+// deadlines were wall-clock (time.Now().UnixNano() against the budget's
+// Deadline) until celeris#1176, so a step of more than a second in the middle
+// of an iteration changed what the drain did: forward it found the budget
+// spent and gave up at its 250 ms floor, never stopping the accept; backward it
+// found the floor not yet passed for as long as the step was big. A Docker
+// Desktop VM steps its clock by tens of seconds when the host sleeps or
+// throttles it. They are monotonic now (drain_clock_step_1176_linux_test.go
+// steps the clock on purpose); this stays in the failure message of the
+// iteration, which still names a step it saw.
 func clockStep896(from, to time.Time) time.Duration {
 	return to.Round(0).Sub(from.Round(0)) - to.Sub(from)
 }
@@ -321,11 +326,14 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	_ = c.SetReadDeadline(time.Time{})
 	// A budget with no deadline (net/http's "as long as it takes") and an
 	// engine with no WriteTimeout: the drain's end is then the peer's going
-	// away, which this test does, and not a wall-clock instant. drainEnd
-	// compares time.Now().UnixNano() with the budget's Deadline (and with
-	// start + WriteTimeout), so a wall clock that steps forward past either
-	// (a Docker Desktop VM steps by tens of seconds) ended the drain at its
-	// 250 ms floor, with shutdown, before stopAccepting (celeris#1172).
+	// away, which this test does, and not an instant. The drain's end was
+	// wall-clock (drainEnd compared time.Now().UnixNano() with the budget's
+	// Deadline and with start + WriteTimeout), so a wall clock that stepped
+	// forward past either (a Docker Desktop VM steps by tens of seconds) ended
+	// the drain at its 250 ms floor, with shutdown, before stopAccepting
+	// (celeris#1172). It is monotonic since celeris#1176; this iteration keeps
+	// its no-deadline budget, which the 250 ms floor and the peer's going away
+	// decide on their own.
 	budget, cancelBudget := context.WithCancel(context.Background())
 	defer cancelBudget()
 	_ = run.e.Shutdown(budget)

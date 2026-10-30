@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/drainclock"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -30,13 +31,21 @@ func budgetWorker806(t *testing.T, budget func() (context.Context, context.Cance
 	return w
 }
 
+func absDiff806(a, b int64) int64 {
+	if a < b {
+		return b - a
+	}
+	return a - b
+}
+
 func TestDrainEnd806(t *testing.T) {
 	const start = int64(1_000_000_000_000)
 	floor := shutdownSendDrainNanos
 	in := func(d time.Duration) func() (context.Context, context.CancelFunc) {
 		return func() (context.Context, context.CancelFunc) {
-			// The deadline is absolute wall-clock time; the cases are
-			// worked out against it with start moved to the same clock.
+			// The deadline is an instant; the cases are worked out against
+			// it with start moved to the same clock (drainclock.Now, the
+			// monotonic one: celeris#1176).
 			return context.WithTimeout(context.Background(), d)
 		}
 	}
@@ -69,9 +78,10 @@ func TestDrainEnd806(t *testing.T) {
 		w := budgetWorker806(t, in(30*time.Second), 0)
 		p := w.drainBudget.Load()
 		want, _ := (*p).Deadline()
-		end, bounded := w.drainEnd(start, floor)
-		if !bounded || end != want.UnixNano() {
-			t.Fatalf("end=%d bounded=%v, want the budget's deadline %d", end, bounded, want.UnixNano())
+		now := drainclock.Now()
+		end, bounded := w.drainEnd(now, floor)
+		if wantEnd := now + int64(time.Until(want)); !bounded || absDiff806(end, wantEnd) > int64(50*time.Millisecond) {
+			t.Fatalf("end=%d bounded=%v, want the budget's deadline %d", end, bounded, wantEnd)
 		}
 	})
 	t.Run("deadline-inside-the-floor-gets-the-floor", func(t *testing.T) {
@@ -80,7 +90,7 @@ func TestDrainEnd806(t *testing.T) {
 		w := budgetWorker806(t, in(10*time.Millisecond), 0)
 		p := w.drainBudget.Load()
 		dl, _ := (*p).Deadline()
-		s := dl.UnixNano() - int64(10*time.Millisecond)
+		s := drainclock.At(dl) - int64(10*time.Millisecond)
 		end, bounded := w.drainEnd(s, floor)
 		if !bounded || end != s+floor {
 			t.Fatalf("end=%d bounded=%v, want the floor %d", end, bounded, s+floor)
@@ -110,14 +120,16 @@ func TestDrainEnd806(t *testing.T) {
 		// StartWithContext's cancel reaches the worker before the watcher's
 		// Engine.Shutdown stores the budget: the end moves out when it does.
 		w := &Worker{drainBudget: &atomic.Pointer[context.Context]{}}
-		before, _ := w.drainEnd(start, floor)
+		s := drainclock.Now()
+		before, _ := w.drainEnd(s, floor)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		t.Cleanup(cancel)
 		w.drainBudget.Store(&ctx)
-		after, bounded := w.drainEnd(start, floor)
+		after, bounded := w.drainEnd(s, floor)
 		want, _ := ctx.Deadline()
-		if !bounded || before != start+floor || after != want.UnixNano() {
-			t.Fatalf("before=%d after=%d bounded=%v, want %d then %d", before, after, bounded, start+floor, want.UnixNano())
+		wantAfter := s + int64(time.Until(want))
+		if !bounded || before != s+floor || absDiff806(after, wantAfter) > int64(50*time.Millisecond) {
+			t.Fatalf("before=%d after=%d bounded=%v, want %d then %d", before, after, bounded, s+floor, wantAfter)
 		}
 	})
 }
