@@ -1804,6 +1804,20 @@ func (w *Worker) run(ctx context.Context) {
 		w.sendsPending = false
 
 		gotCQE := cqHead != cqTail
+		if !gotCQE {
+			// A wait that ended with no completion (the HTTP/2 conns' poll, a
+			// timed wait that ran out) leaves cachedNow as old as the last
+			// batch or sweep, up to the whole idle wait. What this iteration
+			// does next stamps with it: drainH2Writes and flushDirty stage the
+			// SEND of a handler's write and flushSend starts that conn's write
+			// clock from cachedNow, so a stream quiet for most of
+			// WriteTimeout began its SEND with the clock most of WriteTimeout
+			// old, measured at 103 to 127 ms against 100 (celeris#1173), and
+			// a sweep that found the SEND still in flight closed the conn
+			// mid-stream. An iteration with no completion has no work to be
+			// quick about: one vDSO call.
+			w.cachedNow = time.Now().UnixNano()
+		}
 		if gotCQE {
 			w.emptyIters = 0 // Reset adaptive timeout on activity.
 			// Read the clock once per CQE batch, after the wait that
