@@ -106,6 +106,12 @@ func TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/WT%v", e.name, wt), func(t *testing.T) {
 				t.Parallel()
 				addr := wdServer889(t, e.eng, -1, -1, wt)
+				// Every loop has handled a batch of events before the download starts and
+				// is idle after it: a loop that kept the stamp of its last batch would
+				// read as stuck for ever, and switch the rule off (the fallback to
+				// WriteTimeout in all).
+				_ = get893(8, "http://"+addr+"/inline889?n=1", 5*time.Second)
+				time.Sleep(700 * time.Millisecond)
 				ends, at := downloads1170(t, addr, "/pool889", 4, 8<<20, 1e6, 60*time.Second)
 				t.Logf("GT1170 %s/WT%v: %q at %v", e.name, wt, ends, at)
 				for i, r := range ends {
