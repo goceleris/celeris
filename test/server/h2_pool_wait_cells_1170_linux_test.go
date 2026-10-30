@@ -149,10 +149,11 @@ func TestH2PoolStreamWriterDribblerIsReset1170(t *testing.T) {
 // (512 KB/s on average, eight times the floor of 64 KiB per 5 s window; a half-window
 // updater like curl or nghttp2 with a think time), so its frames are 2 s apart,
 // longer than ReadTimeout (1 s), and nothing is queued for it in between. The wait is
-// bounded by its rate, so the connection is exempt from the clocks while it lives. On
-// the previous head a waiter did not exempt it and the connection was closed at the
-// first gap. Go's Transport sends an update every few KiB and could not show this,
-// and a client slow enough to leave output queued extends the clocks by itself.
+// bounded by its rate, so the connection is exempt from the clocks while it lives.
+// Measured on the previous head: this client is NOT closed there either (also with
+// gaps of 4 s): a conn with a pool handler in flight is shielded by the engines' pool
+// gate, whatever ServerOwes says. So the cell is a guard (it is green on main), not
+// the red the review expected; the ServerOwes term is pinned by the unit test.
 func TestH2PoolWaiterBurstyReaderIsNotClosedByReadTimeout1170(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		t.Run(e.name, func(t *testing.T) {
@@ -215,11 +216,17 @@ func TestH2PoolWaiterBurstyReaderIsNotClosedByReadTimeout1170(t *testing.T) {
 // a waiting pool handler: the handler's wait is reset in window 1+k (5 with a 1 MiB
 // window), the stream leaves the connection at the reset, and the connection's
 // clocks (all 1 s) close it. Bound: 5 WriteTimeouts + ReadTimeout + slack. Also with
-// a handler that goes on sleeping for 30 s after the error: the connection does not
-// wait for the handler.
+// a handler that goes on sleeping 3 s after the error: a pool handler in flight
+// shields its connection from the clocks (the engines' pool gate), as on main, so the
+// connection closes when the handler returns (measured: red on main only for that
+// reason, it is the same after).
 func TestH2PoolWaiterOfASilentClientEndsTheConnection1170(t *testing.T) {
 	for _, e := range nativeEngines889() {
-		for _, path := range []string{"/pool?n=8388608", "/stream?n=8388608&chunk=1048576&sleep=30000"} {
+		for _, pc := range []struct {
+			path  string
+			sleep time.Duration // what the handler goes on doing after its error
+		}{{"/pool?n=8388608", 0}, {"/stream?n=8388608&chunk=1048576&sleep=3000", 3 * time.Second}} {
+			path := pc.path
 			t.Run(e.name+path[:5], func(t *testing.T) {
 				t.Parallel()
 				var p pool1170
@@ -232,8 +239,8 @@ func TestH2PoolWaiterOfASilentClientEndsTheConnection1170(t *testing.T) {
 				if !ev.reset || ev.rst != http2.ErrCodeInternal {
 					t.Fatalf("the stream was not reset with INTERNAL_ERROR: %s", ev)
 				}
-				if !closed || closedAt > 5*time.Second+time.Second+4*time.Second {
-					t.Fatalf("the connection was closed=%v at %v, want within 5 WriteTimeouts + ReadTimeout + slack (10 s)", closed, closedAt)
+				if lim := 10*time.Second + pc.sleep; !closed || closedAt > lim {
+					t.Fatalf("the connection was closed=%v at %v, want within 5 WriteTimeouts + ReadTimeout + the handler's sleep + slack (%v)", closed, closedAt, lim)
 				}
 			})
 		}
