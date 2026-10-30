@@ -345,11 +345,11 @@ func TestWriteConnTailGrace889(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, m, _ := wdSetup889(t)
-			start := time.Now().UnixNano()
 			for i := 0; i < 3; i++ {
 				stalled889(m, uint32(1+2*i), 100)
 				time.Sleep(2 * time.Millisecond) // a slow runner (the coverage build): the records are not armed in one instant
 			}
+			start := time.Now().UnixNano() // after the records, so that window 1 is judged for all of them
 			c := m.CreateStream(99)
 			c.SetState(StateOpen)
 			c.SetWindowSize(1 << 20)

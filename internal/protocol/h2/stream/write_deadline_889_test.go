@@ -267,11 +267,11 @@ func TestExpiredWritesConnStarved889(t *testing.T) {
 // A batch that fills leaves the hint due and the rest for the next sweep.
 func TestExpiredWritesBatch889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
-	start := time.Now().UnixNano()
 	for i := 0; i < 40; i++ {
 		stalled889(m, uint32(1+2*i), 100)
 		time.Sleep(2 * time.Millisecond) // a slow runner (the coverage build): the records are not armed in one instant
 	}
+	start := time.Now().UnixNano() // after the records: every window is judged for all of them (CI at 7e7f5ce: 2 of 40 armed after start+1ms missed window 1)
 	// The connection holds 4000 bytes, under one floor: its tail is held for the idle
 	// windows (r9 F-A2) rather than reset at the first one, and the batch limit is shown
 	// in the window after, when 40 are due.
