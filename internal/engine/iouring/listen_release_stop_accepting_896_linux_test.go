@@ -87,8 +87,9 @@ func (h *holdHandler896) HasAsyncRoutes() bool           { return true }
 
 // startHold896 starts a standalone io_uring engine on addr with handler h and
 // returns once it has published its address. A start that fails only on ring
-// ENOMEM is retried, as start896's is.
-func startHold896(t *testing.T, addr string, workers int, h stream.Handler) *engineRun896 {
+// ENOMEM is retried, as start896's is. writeTimeout is the engine's
+// (resource.Config.WriteTimeout: 0 is the default, -1 none).
+func startHold896(t *testing.T, addr string, workers int, writeTimeout time.Duration, h stream.Handler) *engineRun896 {
 	t.Helper()
 	var run *engineRun896
 	_, _, err := retryRingENOMEM(func() error {
@@ -97,6 +98,7 @@ func startHold896(t *testing.T, addr string, workers int, h stream.Handler) *eng
 			Engine:        engine.IOUring,
 			Protocol:      engine.Auto,
 			AsyncHandlers: true,
+			WriteTimeout:  writeTimeout,
 			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 			Resources:     resource.Resources{Workers: workers},
 		}, h)
@@ -261,7 +263,7 @@ func loop896(t *testing.T, label string, n int, full bool, iter iter896) {
 func h2Iteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
 	addr := freeAddr639(t)
 	h := newHoldHandler896(false)
-	run := startHold896(t, addr, 2, h)
+	run := startHold896(t, addr, 2, 0, h)
 	c := h2Request896(t, addr, "/hold")
 	defer func() { _ = c.Close() }()
 	select {
@@ -296,7 +298,7 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	t0 := time.Now()
 	addr := freeAddr639(t)
 	h := newHoldHandler896(true)
-	run := startHold896(t, addr, 2, h)
+	run := startHold896(t, addr, 2, -1, h)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial %s: %v", addr, err)
@@ -305,8 +307,26 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	if _, err := c.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	time.Sleep(20 * time.Millisecond) // the response is on its way, and does not fit the socket buffers
-	budget, cancelBudget := context.WithTimeout(context.Background(), 10*time.Second)
+	// Wait for the condition the iteration needs, not for a guess at it: the
+	// first byte of the response is at the client, so the worker has read the
+	// request and has the rest (32 MiB, more than the socket buffers take) in
+	// flight to a peer that reads no more. A fixed 20 ms was not enough on a
+	// loaded runner: the worker had accepted the conn but not yet reaped the
+	// recv, so it saw no send pending and no request in progress, shut down at
+	// once and never reached stopAccepting (celeris#1172).
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(c, make([]byte, 1)); err != nil {
+		t.Fatalf("no byte of the /big response within 10 s: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Time{})
+	// A budget with no deadline (net/http's "as long as it takes") and an
+	// engine with no WriteTimeout: the drain's end is then the peer's going
+	// away, which this test does, and not a wall-clock instant. drainEnd
+	// compares time.Now().UnixNano() with the budget's Deadline (and with
+	// start + WriteTimeout), so a wall clock that steps forward past either
+	// (a Docker Desktop VM steps by tens of seconds) ended the drain at its
+	// 250 ms floor, with shutdown, before stopAccepting (celeris#1172).
+	budget, cancelBudget := context.WithCancel(context.Background())
 	defer cancelBudget()
 	_ = run.e.Shutdown(budget)
 	before := calls.Load()
