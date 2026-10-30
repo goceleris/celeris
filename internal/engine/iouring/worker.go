@@ -6502,6 +6502,9 @@ func (w *Worker) drainH2Writes() {
 		fd := w.h2Conns[i]
 		cs := w.conns[fd]
 		if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+			if h := h2WriteDrainSeam; h != nil {
+				h(w, fd)
+			}
 			cs.h2State.DrainWriteQueue(cs.writeFn)
 			if cs.writeRefused {
 				// A frame refused on back-pressure is lost, and the
