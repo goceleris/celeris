@@ -10,6 +10,7 @@
 package drainclock
 
 import (
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -52,7 +53,17 @@ func Now() int64 { return read().Mono }
 // context.WithTimeout carries a monotonic reading, which time.Until uses; one
 // with none (context.WithDeadline of a wall-clock time) is an instant of the
 // wall clock, and is read against it as it is now.
-func At(d time.Time) int64 { return Now() + int64(time.Until(d)) }
+//
+// A deadline more than about 292 years away saturates (time.Until does, and the
+// sum would wrap to a negative number that ends the drain at its floor): At
+// answers math.MaxInt64, "never" on this scale.
+func At(d time.Time) int64 {
+	now := Now()
+	if u := int64(time.Until(d)); u <= math.MaxInt64-now {
+		return now + u
+	}
+	return math.MaxInt64
+}
 
 // SetSeam makes Now read f instead of the clocks, until the returned function
 // is called, which puts back what was set before, but only if this call's f is

@@ -46,7 +46,8 @@ import (
 type holdHandler896 struct {
 	started chan struct{}
 	release chan struct{}
-	big     []byte // the /big response; nil unless the test serves it
+	big     []byte       // the /big response; nil unless the test serves it
+	running atomic.Int64 // /hold handlers that have started (started drops past its 4)
 }
 
 func newHoldHandler896(bigBody bool) *holdHandler896 {
@@ -71,6 +72,7 @@ func (h *holdHandler896) HandleStream(_ context.Context, s *stream.Stream) error
 	}
 	switch path {
 	case "/hold":
+		h.running.Add(1)
 		select {
 		case h.started <- struct{}{}:
 		default:

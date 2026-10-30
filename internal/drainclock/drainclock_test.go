@@ -72,3 +72,15 @@ func TestSetSeamRestoresOnlyItsOwn(t *testing.T) {
 		t.Fatalf("Now = %d with every seam restored, want the real clock", got)
 	}
 }
+
+// A deadline further away than time.Duration can count does not wrap.
+func TestAtSaturatesForAFarDeadline(t *testing.T) {
+	for _, d := range []time.Time{time.Date(2600, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)} {
+		if got := At(d); got < Now()+int64(100*365*24*time.Hour) {
+			t.Errorf("At(%v) = %d: wrapped or ended at once", d, got)
+		}
+	}
+	if got := At(time.Time{}); got >= Now() {
+		t.Errorf("At(zero) = %d, want a point in the past", got)
+	}
+}

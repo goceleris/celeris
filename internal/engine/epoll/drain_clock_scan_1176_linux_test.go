@@ -9,6 +9,8 @@ import (
 	"testing"
 )
 
+// (The scan also refuses the calls that strip a time.Time's monotonic reading:
+// Round, Truncate, UTC, Local, In, and the loop's wall stamps.)
 // The shutdown's deadlines on epoll are time.Time values (monotonic) or
 // drainclock.Now (the gate's pacers); none is time.Now().UnixNano(), the wall
 // clock as an integer (celeris#1176). The behaviour tests step the drainclock
@@ -35,7 +37,10 @@ func unixReads1176(n ast.Node) (ints int, inCloseIdle bool) {
 	ast.Inspect(n, func(m ast.Node) bool {
 		if se, ok := m.(*ast.SelectorExpr); ok {
 			switch se.Sel.Name {
-			case "UnixNano", "Unix", "UnixMilli", "UnixMicro":
+			case "UnixNano", "Unix", "UnixMilli", "UnixMicro", "cachedNow", "lastSweep", "lastActivity":
+				ints++
+			case "Round", "Truncate", "UTC", "Local", "In":
+				// These strip the monotonic reading of a time.Time.
 				ints++
 			}
 		}

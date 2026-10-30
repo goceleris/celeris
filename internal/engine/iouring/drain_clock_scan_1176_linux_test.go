@@ -15,8 +15,10 @@ import (
 // that hold the shutdown's deadlines are pinned not to read the wall clock
 // themselves: every reading is drainclock.Now or drainclock.At.
 
-// wallReads1176 counts the calls of time.Now and of the selectors that make a
-// time an integer on the wall scale (UnixNano and friends) in n.
+// wallReads1176 counts the calls of time.Now and of the selectors that read a
+// wall-scale integer in n: a time made an integer (UnixNano and friends) and
+// the stamps the loop keeps on the wall clock (cachedNow, lastSweep,
+// lastActivity: a drain deadline compared with one is on the wrong scale).
 func wallReads1176(n ast.Node) (nows, ints int) {
 	ast.Inspect(n, func(m ast.Node) bool {
 		se, ok := m.(*ast.SelectorExpr)
@@ -24,7 +26,7 @@ func wallReads1176(n ast.Node) (nows, ints int) {
 			return true
 		}
 		switch se.Sel.Name {
-		case "UnixNano", "Unix", "UnixMilli", "UnixMicro":
+		case "UnixNano", "Unix", "UnixMilli", "UnixMicro", "cachedNow", "lastSweep", "lastActivity", "lastStallLook":
 			ints++
 		case "Now":
 			if id, ok := se.X.(*ast.Ident); ok && id.Name == "time" {
