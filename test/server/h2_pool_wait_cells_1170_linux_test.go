@@ -144,22 +144,67 @@ func TestH2PoolStreamWriterDribblerIsReset1170(t *testing.T) {
 	}
 }
 
-// TestH2PoolWaiterHalfWindowReaderIsNotClosedByReadTimeout1170 (review r2 decision
-// 2): a client that updates at half a 1 MiB window while reading at 300 KB/s has gaps
-// of about 1.7 s between its frames, longer than ReadTimeout (1 s); WriteTimeout 5 s.
-// The wait is bounded by its rate, so the connection is exempt from the clocks while
-// it lives. On the previous head it was closed at the first gap (a waiter was not
-// exempt). Go's Transport sends an update every few KiB and could not show this.
-func TestH2PoolWaiterHalfWindowReaderIsNotClosedByReadTimeout1170(t *testing.T) {
+// TestH2PoolWaiterBurstyReaderIsNotClosedByReadTimeout1170 (review r2 decision 2): a
+// client that takes a whole 1 MiB window at once and grants it back every 2 s
+// (512 KB/s on average, eight times the floor of 64 KiB per 5 s window; a half-window
+// updater like curl or nghttp2 with a think time), so its frames are 2 s apart,
+// longer than ReadTimeout (1 s), and nothing is queued for it in between. The wait is
+// bounded by its rate, so the connection is exempt from the clocks while it lives. On
+// the previous head a waiter did not exempt it and the connection was closed at the
+// first gap. Go's Transport sends an update every few KiB and could not show this,
+// and a client slow enough to leave output queued extends the clocks by itself.
+func TestH2PoolWaiterBurstyReaderIsNotClosedByReadTimeout1170(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		t.Run(e.name, func(t *testing.T) {
 			t.Parallel()
 			var p pool1170
 			addr := p.server(t, e.eng, time.Second, time.Second, 5*time.Second)
-			end, got, at := batched889(t, addr, "/pool?n=6291456", 1<<20, 512<<10, 300e3, 60*time.Second)
-			t.Logf("RT1170 %s: %s, %d bytes at %v", e.name, end, got, at)
-			if end != "complete" || got != 6291456 {
-				t.Fatalf("a client reading at 300 KB/s (4.6 x the floor of 64 KiB per 5 s window... far above) ended %q after %d of 6291456 bytes at %v", end, got, at)
+			c := dialH2raw889(t, addr, h2dial889{initialWindow: 1 << 20})
+			c.window889(0, 1<<30-65535)
+			const total = 6 << 20
+			c.request(1, "GET", "/pool?n="+strconv.Itoa(total), true, true)
+			var got, acked int
+			_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			t0 := time.Now()
+			tick := time.Now().Add(2 * time.Second)
+			end := ""
+			for end == "" {
+				// Read as fast as the server sends, until the next grant is due.
+				_ = c.conn.SetReadDeadline(tick)
+				f, err := c.fr.ReadFrame()
+				if err != nil {
+					if !isTimeout889(err) {
+						end = "conn error: " + err.Error()
+						break
+					}
+					if got > acked {
+						c.window889(1, uint32(got-acked))
+						c.window889(0, uint32(got-acked))
+						acked = got
+					}
+					tick = time.Now().Add(2 * time.Second)
+					if time.Since(t0) > 60*time.Second {
+						end = "still open at the limit"
+					}
+					continue
+				}
+				switch f := f.(type) {
+				case *http2.DataFrame:
+					if f.StreamID == 1 {
+						got += len(f.Data())
+						if f.StreamEnded() {
+							end = "complete"
+						}
+					}
+				case *http2.RSTStreamFrame:
+					end = "RST " + f.ErrCode.String()
+				case *http2.GoAwayFrame:
+					end = "GOAWAY " + f.ErrCode.String()
+				}
+			}
+			t.Logf("RT1170 %s: %s, %d bytes at %v", e.name, end, got, time.Since(t0).Round(time.Millisecond))
+			if end != "complete" || got != total {
+				t.Fatalf("a client granting 1 MiB every 2 s ended %q after %d of %d bytes at %v", end, got, total, time.Since(t0).Round(time.Millisecond))
 			}
 		})
 	}
