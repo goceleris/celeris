@@ -225,12 +225,13 @@ type Loop struct {
 
 	// refuseRecv is set by the pool wait's gate (poolWaitGate, celeris#885
 	// item 49): from then on drainRead reads no more from an HTTP/1 conn.
-	// producersStopNext is the time (UnixNano) before which the gate does not
-	// walk the conns again. Loop thread.
+	// producersStopNext is the time (drainclock.Now, monotonic) before which
+	// the gate does not walk the conns again. Loop thread.
 	refuseRecv        bool
 	producersStopNext int64
 	// h1InProgressNext and h1InProgressAsked pace and mark the shutdown's look
-	// for HTTP/1 requests in progress (poolWaitSettled, celeris#1166).
+	// for HTTP/1 requests in progress (poolWaitSettled, celeris#1166);
+	// h1InProgressNext is on drainclock.Now, monotonic.
 	h1InProgressNext  int64
 	h1InProgressAsked bool
 

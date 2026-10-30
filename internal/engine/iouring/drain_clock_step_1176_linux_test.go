@@ -57,6 +57,16 @@ func stairClock1176(t *testing.T, step time.Duration) (restore func()) {
 
 // waitDone1176 waits for Listen to return, up to bound, and reports how long
 // after t0 it did and whether it did.
+// reap1176 waits, for a little, for a Listen that a failing test has cancelled
+// and restored the clock for; a regression can leave it in a wait that the
+// restored clock does not end, and the test must report that, not hang in it.
+func reap1176(run *engineRun896) {
+	select {
+	case <-run.done:
+	case <-time.After(3 * time.Second):
+	}
+}
+
 func waitDone1176(run *engineRun896, t0 time.Time, bound time.Duration) (time.Duration, bool) {
 	select {
 	case <-run.done:
@@ -106,7 +116,7 @@ func TestSendDrainIsNotCutByAForwardClockStep1176(t *testing.T) {
 	if !waitSeam896(calls, 0) {
 		restore()
 		_ = c.Close()
-		<-run.done
+		reap1176(run)
 		t.Fatalf("the drain ended before the worker stopped accepting, %v after the shutdown began: "+
 			"the stepped wall clock ended it (gave up %d)", time.Since(t0), run.e.metrics.handoffLoss.shutdownSendDrainGaveUp.Load())
 	}
@@ -133,7 +143,7 @@ func TestSendDrainIsNotCutByAForwardClockStep1176(t *testing.T) {
 // longer, whichever way the wall clock steps: the bound is the budget's
 // deadline, or WriteTimeout after the drain began, whichever comes first.
 func TestSendDrainBoundIsTheMonotonicClocksWhateverTheWallDoes1176(t *testing.T) {
-	const budget = 1500 * time.Millisecond
+	const budget = 1000 * time.Millisecond
 	for _, tc := range []struct {
 		name         string
 		step         time.Duration
@@ -167,7 +177,7 @@ func TestSendDrainBoundIsTheMonotonicClocksWhateverTheWallDoes1176(t *testing.T)
 			if !ok {
 				restore()
 				_ = c.Close()
-				<-run.done
+				reap1176(run)
 				t.Fatalf("Listen had not returned %v after the shutdown began, for a drain bounded at %v: "+
 					"a wall clock stepped %v kept it open", took, budget, tc.step)
 			}
@@ -301,13 +311,13 @@ func isTimeout1176(err error) bool {
 	return ok && ne.Timeout()
 }
 
-// The shutdown's waits for the kernel to complete what it owes (the cancel of
-// the listen socket's accept, the ops owed on a connection's descriptor) are
-// each bounded by shutdownFDDrainNanos on the monotonic clock. The ring wait is
-// answered with nothing, as TestShutdownWaitForTheAcceptIsBounded896 does, so
-// both waits run to their bounds, one after the other: a stepped wall clock
-// ends each in the first 50 ms, so the sum is the witness that neither was.
-func TestShutdownFDWaitsAreBoundedByTheMonotonicClock1176(t *testing.T) {
+// The wait for the kernel to complete what it owes at the end of a shutdown
+// (endOwedOpsAtShutdown: the accept's cancel and the ops owed on a connection's
+// descriptor) is bounded by shutdownFDDrainNanos on the monotonic clock. The
+// ring wait is answered with nothing, as TestShutdownWaitForTheAcceptIsBounded896
+// does, so the wait runs to its bound: no sooner, which a wall clock stepped
+// forward would make it, and no later, which one stepped back would.
+func TestShutdownOwedOpsWaitIsBoundedByTheMonotonicClock1176(t *testing.T) {
 	for _, step := range []time.Duration{stepSize1176, -stepSize1176} {
 		t.Run(step.String(), func(t *testing.T) {
 			orig := shutdownRingWait
@@ -332,19 +342,89 @@ func TestShutdownFDWaitsAreBoundedByTheMonotonicClock1176(t *testing.T) {
 			t0 := time.Now()
 			run.cancel()
 			bound := time.Duration(shutdownFDDrainNanos)
-			took, ok := waitDone1176(run, t0, 2*bound+3*time.Second)
+			took, ok := waitDone1176(run, t0, bound+3*time.Second)
 			if !ok {
 				restore()
-				<-run.done
+				reap1176(run)
 				t.Fatalf("Listen had not returned %v after the cancel: a wall clock stepped %v kept a wait for the kernel open", took, step)
 			}
-			t.Logf("Listen returned %v after the cancel, two bounds of %v", took, bound)
-			if took < 2*bound-100*time.Millisecond {
-				t.Fatalf("Listen returned after %v, before the %v the two waits take: the stepped wall clock ended one of them", took, 2*bound)
+			t.Logf("Listen returned %v after the cancel, a wait bounded at %v", took, bound)
+			if took < bound-50*time.Millisecond {
+				t.Fatalf("Listen returned after %v, before the wait's %v bound: the stepped wall clock ended it", took, bound)
 			}
 			if n := run.e.metrics.handoffLoss.shutdownListenCancelGaveUp.Load(); n == 0 {
 				t.Error("the accept's cancel was not counted as given up")
 			}
 		})
 	}
+}
+
+// The wait cancelAccept makes, when the worker stops accepting in the middle
+// of a drain, is bounded the same way. The pool wait stops accepting at its
+// start, the ring wait answers nothing, and the worker's calls of it, one per
+// 10 ms, are counted while a handler keeps the pool wait going: a bound of
+// 250 ms is 25 of them. A wall clock stepped forward ends the wait in the
+// first few; one stepped back keeps it going for the whole count window.
+func TestCancelAcceptWaitIsBoundedByTheMonotonicClock1176(t *testing.T) {
+	for _, step := range []time.Duration{stepSize1176, -stepSize1176} {
+		t.Run(step.String(), func(t *testing.T) {
+			var ring atomic.Pointer[Ring]
+			var calls atomic.Int64
+			orig := shutdownRingWait
+			shutdownRingWait = func(r *Ring, d time.Duration) error {
+				if r == ring.Load() {
+					calls.Add(1)
+				}
+				time.Sleep(d)
+				return nil
+			}
+			t.Cleanup(func() { shutdownRingWait = orig })
+			cancelAcceptSeam = func(w *Worker, _ int) { ring.CompareAndSwap(nil, w.ring) }
+			t.Cleanup(func() { cancelAcceptSeam = nil })
+			restore := stairClock1176(t, step)
+
+			h := newHoldHandler896(false)
+			release := releaseOnce1176(h)
+			defer release()
+			run := startHold896(t, freeAddr639(t), 2, 0, h)
+			c := h2Request896(t, run.e.Addr().String(), "/hold")
+			defer func() { _ = c.Close() }()
+			select {
+			case <-h.started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the /hold handler never ran")
+			}
+			budget, cancelBudget := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelBudget()
+			_ = run.e.Shutdown(budget)
+			run.cancel()
+			if !waitSeam896Ring1176(&ring) {
+				restore()
+				t.Fatal("the pool wait never stopped accepting")
+			}
+			time.Sleep(700 * time.Millisecond) // the wait's bound is 250 ms; the handler keeps the pool wait going
+			n := calls.Load()
+			restore()
+			release()
+			if _, ok := waitDone1176(run, time.Now(), 10*time.Second); !ok {
+				t.Fatal("Listen did not return after the handler ended")
+			}
+			t.Logf("cancelAccept's ring wait was entered %d times in 700 ms (a 250 ms bound is about 25)", n)
+			if n < 15 {
+				t.Fatalf("cancelAccept waited %d times, fewer than the bound's 25: the stepped wall clock ended the wait", n)
+			}
+			if n > 40 {
+				t.Fatalf("cancelAccept waited %d times, more than the bound's 25: the stepped wall clock kept the wait open", n)
+			}
+		})
+	}
+}
+
+func waitSeam896Ring1176(ring *atomic.Pointer[Ring]) bool {
+	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(time.Millisecond) {
+		if ring.Load() != nil {
+			return true
+		}
+	}
+	return false
 }

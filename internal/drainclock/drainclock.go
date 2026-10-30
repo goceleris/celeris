@@ -46,13 +46,13 @@ func read() Reading {
 // set". It is not comparable with a wall-clock reading (cachedNow, a conn's
 // lastActivity): the two are on different scales, and a comparison of them is
 // wrong by the size of the process's age.
-func Now() int64 { return read().Wall }
+func Now() int64 { return read().Mono }
 
 // At is d on the Now scale, for a deadline taken from a context. A deadline of
 // context.WithTimeout carries a monotonic reading, which time.Until uses; one
 // with none (context.WithDeadline of a wall-clock time) is an instant of the
 // wall clock, and is read against it as it is now.
-func At(d time.Time) int64 { return d.UnixNano() }
+func At(d time.Time) int64 { return Now() + int64(time.Until(d)) }
 
 // SetSeam makes Now read f instead of the clocks, until the returned function
 // is called, which puts back what was set before, but only if this call's f is

@@ -807,7 +807,8 @@ type Worker struct {
 	zcHoldCount int
 	zcHoldBytes int
 
-	// shutdownDrainStart is when (UnixNano) the send drain the run loop
+	// shutdownDrainStart is when (drainclock.Now, the monotonic clock, not
+	// cachedNow's: celeris#1176) the send drain the run loop
 	// performs once its context is cancelled began (celeris#595): after the
 	// HTTP/2 pool handlers are done (h2PoolSettled), so zero until then. The
 	// drain's end is drainEnd(shutdownDrainStart, ...), worked out afresh
@@ -839,8 +840,9 @@ type Worker struct {
 	// drainBudget points at the engine's record of the budget of the last
 	// Engine.Shutdown call, and h2DrainStart is when the worker, its
 	// context cancelled, began waiting for the HTTP/2 stream handlers on
-	// the shared worker pool (celeris#759; h2PoolSettled). Worker thread
-	// only; h2DrainStart is zero until then.
+	// the shared worker pool (celeris#759; h2PoolSettled), on
+	// drainclock.Now (monotonic, not cachedNow's: celeris#1176). Worker
+	// thread only; h2DrainStart is zero until then.
 	drainBudget  *atomic.Pointer[context.Context]
 	h2DrainStart int64
 
@@ -978,7 +980,7 @@ type Worker struct {
 	// ringWaitWarned is set once the first retried wait was logged
 	// (ringWaitContinues). Worker thread only.
 	ringWaitWarned bool
-	// producersStopNext is when (UnixNano) the shutdown gate may walk the
+	// producersStopNext is when (drainclock.Now) the shutdown gate may walk the
 	// conns again (stopProducersPaced, closeIdlePaced). Worker thread only.
 	producersStopNext int64
 	// ringWaitRunStart is when (UnixNano) the run of consecutive retried ring
@@ -8115,7 +8117,8 @@ func (w *Worker) h2PoolSettled() bool {
 	return bounded && now > end
 }
 
-// drainEnd is when (UnixNano) a drain that began at start gives up, and false
+// drainEnd is when (drainclock.Now, the monotonic clock: a step of the wall
+// clock does not move it, celeris#1176) a drain that began at start gives up, and false
 // while it has no end but the budget's being done. It is bounded as epoll's
 // send drain is (epoll's Loop.sendDrainWait), and the HTTP/2 wait and the
 // send drain share it so the two agree: while the budget the last
@@ -8389,7 +8392,7 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 // h2PoolDrainPoll, for the pool wait's gate (celeris#884): a producer whose
 // lock was busy is tried again within a poll, and no loop pass pays the walk
 // over every live conn twice in one. It reports whether it walked. now is the
-// pass's UnixNano. Worker thread.
+// pass's drainclock.Now. Worker thread.
 func (w *Worker) stopProducersPaced(now int64) bool {
 	if now < w.producersStopNext {
 		return false
