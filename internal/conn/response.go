@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/bits"
 	"net"
@@ -813,6 +814,10 @@ type h2ResponseAdapter struct {
 	// loops is the engine's watch on its event loops (H2Config.LoopWatch): a pool
 	// handler's wait is bounded by WriteTimeout in all while one is stuck.
 	loops *stream.LoopWatch
+	// log is the server's logger (H2Config.Logger): the reason of each reset of a
+	// pool handler's wait is told at Debug level (rate, or an event loop stuck), so
+	// that a stream cut by it can be told from one cut by anything else.
+	log *slog.Logger
 }
 
 // peerMaxFrame returns the peer's currently-advertised SETTINGS_MAX_FRAME_SIZE,
@@ -1054,6 +1059,7 @@ func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uin
 				return nil // reset by the peer, or the connection closed
 			}
 			a.resetStreamOnce(s, http2.ErrCodeInternal)
+			a.logWaitReset(s.ID, len(rest), &w)
 			return waitRateError(s.ID, len(rest), "the response", a.writeTimeout, &w, err)
 		}
 		if n := h2ReserveSend(a.manager, s, len(rest)); n > 0 {
@@ -1085,6 +1091,18 @@ func waitRateError(id uint32, left int, what string, wt time.Duration, w *stream
 	}
 	return fmt.Errorf("h2: stream %d reset: %d bytes of %s still waited for the peer's window and the client did not take the minimum rate of WriteTimeout (%v per window): %w",
 		id, left, what, wt, err)
+}
+
+// logWaitReset tells why a pool handler's wait was reset (Debug).
+func (a *h2ResponseAdapter) logWaitReset(id uint32, left int, w *stream.SendWait) {
+	if a.log == nil {
+		return
+	}
+	reason := "rate"
+	if w.BlockedLoop() {
+		reason = "loop-blocked"
+	}
+	a.log.Debug("h2: pool handler wait reset", "stream", id, "reason", reason, "left", left, "write_timeout", a.writeTimeout)
 }
 
 // resetStreamOnce is resetStream for a wait that was judged: the stream is cancelled
@@ -1624,6 +1642,7 @@ func (a *h2ResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) 
 				return err // reset by the peer, the connection closed, or the stream's use is over
 			}
 			a.resetStreamUse(s, gen, http2.ErrCodeInternal)
+			a.logWaitReset(id, len(data), &w)
 			return waitRateError(id, len(data), fmt.Sprintf("a write of %d bytes", total), a.writeTimeout, &w, err)
 		}
 		n, _, _, err := m.StreamWrite(s, gen, data, a.sendData)

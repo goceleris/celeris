@@ -554,6 +554,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 	resolved resource.ResolvedResources) ([]*Worker, error) {
 	workers := make([]*Worker, len(cpus))
 	e.loopWatch = stream.NewLoopWatch()
+	e.loopWatch.SetLogger(e.cfg.Logger)
 	for i := range workers {
 		w, err := newWorker(i, cpus[i], tier, e.handler,
 			resolved, e.cfg,

@@ -60,6 +60,12 @@ func downloads1170(t *testing.T, addr, path string, n, size int, bps float64, li
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}
+	return downloadsOn1170(t, cl, addr, path, n, size, limit)
+}
+
+// downloadsOn1170 is downloads1170 on a client that already holds its connection.
+func downloadsOn1170(t *testing.T, cl *http.Client, addr, path string, n, size int, limit time.Duration) (ends []string, at []time.Duration) {
+	t.Helper()
 	ends, at = make([]string, n), make([]time.Duration, n)
 	t0 := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), limit)
@@ -120,17 +126,18 @@ func TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170(t *testing.T) {
 					if wt >= 5*time.Second {
 						t.Parallel()
 					}
-					addr := wdServer889(t, e.eng, -1, -1, wt)
+					var p pool1170
+					addr := p.server(t, e.eng, -1, -1, wt)
 					// Every loop has handled a batch of events before the download starts
 					// and is idle after it: a loop that kept the stamp of its last batch
 					// would read as stuck for ever, and switch the rule off.
-					_ = get893(8, "http://"+addr+"/inline889?n=1", 5*time.Second)
+					_ = get893(8, "http://"+addr+"/ping", 5*time.Second)
 					time.Sleep(700 * time.Millisecond)
-					ends, at := downloads1170(t, addr, "/pool889", 4, 8<<20, 1e6, 60*time.Second)
-					t.Logf("GT1170 %s/WT%v: %q at %v", e.name, wt, ends, at)
+					ends, at := downloads1170(t, addr, "/pool", 4, 8<<20, 1e6, 60*time.Second)
+					t.Logf("GT1170 %s/WT%v: %q at %v; %s", e.name, wt, ends, at, p.logs.summary())
 					for i, r := range ends {
 						if r != "complete" {
-							t.Fatalf("download %d: %s at %v (all four must complete)", i, r, at[i].Round(time.Millisecond))
+							t.Fatalf("download %d: %s at %v (all four must complete); %s", i, r, at[i].Round(time.Millisecond), p.logs.summary())
 						}
 					}
 				})
@@ -150,12 +157,13 @@ func TestH2GoTransportManyParallelDownloadsAreNotCut1170(t *testing.T) {
 		}
 		t.Run(e.name, func(t *testing.T) {
 			t.Parallel()
-			addr := wdServer889(t, e.eng, -1, -1, time.Second)
-			ends, at := downloads1170(t, addr, "/pool889", 8, 8<<20, 2e6, 90*time.Second)
-			t.Logf("GT1170 many %s: %q at %v", e.name, ends, at)
+			var p pool1170
+			addr := p.server(t, e.eng, -1, -1, time.Second)
+			ends, at := downloads1170(t, addr, "/pool", 8, 8<<20, 2e6, 90*time.Second)
+			t.Logf("GT1170 many %s: %q at %v; %s", e.name, ends, at, p.logs.summary())
 			for i, r := range ends {
 				if r != "complete" {
-					t.Fatalf("download %d: %s at %v (all eight must complete)", i, r, at[i].Round(time.Millisecond))
+					t.Fatalf("download %d: %s at %v (all eight must complete); %s", i, r, at[i].Round(time.Millisecond), p.logs.summary())
 				}
 			}
 		})
@@ -164,7 +172,7 @@ func TestH2GoTransportManyParallelDownloadsAreNotCut1170(t *testing.T) {
 
 // TestH2GoTransportQueueBeyondTheCapIsCut1170: the cap exists. Four 8 MiB
 // downloads on 1 MB/s at WriteTimeout 0.5 s: the last waiter's first grant is about
-// 27 windows in, past the allowance (16 + the seed's 4), so it is reset, as
+// 27 windows in, past the allowance (12 + the seed's 4), so it is reset, as
 // documented ("N x W / L under about 20 x WriteTimeout").
 func TestH2GoTransportQueueBeyondTheCapIsCut1170(t *testing.T) {
 	for _, e := range nativeEngines889() {
@@ -173,9 +181,10 @@ func TestH2GoTransportQueueBeyondTheCapIsCut1170(t *testing.T) {
 		}
 		t.Run(e.name, func(t *testing.T) {
 			t.Parallel()
-			addr := wdServer889(t, e.eng, -1, -1, 500*time.Millisecond)
-			ends, at := downloads1170(t, addr, "/pool889", 4, 8<<20, 1e6, 60*time.Second)
-			t.Logf("GT1170 beyond the cap %s: %q at %v", e.name, ends, at)
+			var p pool1170
+			addr := p.server(t, e.eng, -1, -1, 500*time.Millisecond)
+			ends, at := downloads1170(t, addr, "/pool", 4, 8<<20, 1e6, 60*time.Second)
+			t.Logf("GT1170 beyond the cap %s: %q at %v; %s", e.name, ends, at, p.logs.summary())
 			cut := 0
 			for _, r := range ends {
 				if r != "complete" {
@@ -183,7 +192,7 @@ func TestH2GoTransportQueueBeyondTheCapIsCut1170(t *testing.T) {
 				}
 			}
 			if cut == 0 {
-				t.Fatalf("all four completed: the queue (about 27 windows) is past the cap of 16 + 4 and a waiter must have been reset")
+				t.Fatalf("all four completed: the queue (about 27 windows) is past the cap of 12 + 4 and a waiter must have been reset")
 			}
 		})
 	}

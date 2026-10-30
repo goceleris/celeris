@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -185,10 +186,17 @@ func (m *Manager) judgeWait(s *Stream, id uint32, w *SendWait, rest int) (waitVe
 	}
 	wt := int64(m.wrTimeout)
 	now := time.Now().UnixNano()
-	if lw := w.Loops; lw != nil && now-w.start >= wt && lw.BlockedFor(now, loopStuckFor(wt)) {
-		m.dropWait(id)
-		w.failed = true
-		return waitExpired, 0
+	if lw := w.Loops; lw != nil {
+		if idx, age, stuck := lw.stuck(now, loopStuckFor(wt)); !stuck {
+			lw.noteClear()
+		} else {
+			lw.noteStuck(idx, age, wt)
+			if now-w.start >= wt {
+				m.dropWait(id)
+				w.failed = true
+				return waitExpired, 0
+			}
+		}
 	}
 	starved := s.windowSize.Load() > 0 && atomic.LoadInt32(&m.connectionWindow) <= 0
 	m.stallMu.Lock()
@@ -208,7 +216,7 @@ func (m *Manager) judgeWait(s *Stream, id uint32, w *SendWait, rest int) (waitVe
 		m.stallN.Store(int32(len(m.stalls)))
 		return waitHeld, now + wt
 	case !st.waiter:
-		return waitHeld, st.armedAt + wt // the sweep's record: it judges
+		return waitHeld, max(st.armedAt+wt, now+wt) // the sweep's record: it judges (a time to look again, never in the past)
 	}
 	if st.armedAt+wt > now {
 		return waitHeld, st.armedAt + wt // not due: a grant renewed it, or the timer fired early
@@ -355,6 +363,33 @@ func (*stillWaiting) Error() string { return "still waiting" }
 type LoopWatch struct {
 	mu    sync.Mutex
 	slots atomic.Pointer[[]*LoopSlot]
+	// log is where an episode of a stuck loop is told (SetLogger); episode is set from
+	// the first waiter that sees one until the first that does not.
+	log     atomic.Pointer[slog.Logger]
+	episode atomic.Bool
+}
+
+// SetLogger sets where the watch tells an episode of a stuck loop, once per episode
+// (a Warn line): the rule is off for the server while it lasts, and nothing else says
+// so. Nil: nothing is told.
+func (w *LoopWatch) SetLogger(l *slog.Logger) { w.log.Store(l) }
+
+// noteStuck tells the operator, once per episode, that the rate rule of waiting pool
+// handlers is suspended because loop idx has been in one batch for age ns.
+func (w *LoopWatch) noteStuck(idx int, age, wt int64) {
+	if w.episode.CompareAndSwap(false, true) {
+		if l := w.log.Load(); l != nil {
+			l.Warn("h2: the minimum rate of a pool handler's wait for window is suspended: an event loop has been in one batch for half a WriteTimeout, so such waits are bounded by WriteTimeout in all until it ends",
+				"loop", idx, "stuck_for", time.Duration(age), "write_timeout", time.Duration(wt), "threshold", time.Duration(loopStuckFor(wt)))
+		}
+	}
+}
+
+// noteClear ends the episode, if one was told.
+func (w *LoopWatch) noteClear() {
+	if w.episode.Load() {
+		w.episode.Store(false)
+	}
 }
 
 // LoopSlot is one loop's stamp. Padded: each loop writes its own twice a batch.
@@ -397,16 +432,22 @@ func (s *LoopSlot) Leave() {
 // BlockedFor reports whether some loop has been in one batch since at least d
 // before now.
 func (w *LoopWatch) BlockedFor(now, d int64) bool {
+	_, _, ok := w.stuck(now, d)
+	return ok
+}
+
+// stuck is BlockedFor with the first loop found stuck and for how long.
+func (w *LoopWatch) stuck(now, d int64) (idx int, age int64, ok bool) {
 	p := w.slots.Load()
 	if p == nil {
-		return false
+		return 0, 0, false
 	}
-	for _, s := range *p {
+	for i, s := range *p {
 		if t := s.since.Load(); t != 0 && now-t >= d {
-			return true
+			return i, now - t, true
 		}
 	}
-	return false
+	return 0, 0, false
 }
 
 // minLoopStuck is the shortest a loop's batch is taken as stuck: ordinary batches

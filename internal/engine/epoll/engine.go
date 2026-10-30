@@ -178,6 +178,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	e.mu.Lock()
 	e.loops = make([]*Loop, resolved.Workers)
 	e.loopWatch = stream.NewLoopWatch()
+	e.loopWatch.SetLogger(e.cfg.Logger)
 	for i := range resolved.Workers {
 		l := newLoop(i, cpus[i], e.handler,
 			resolved, e.cfg,

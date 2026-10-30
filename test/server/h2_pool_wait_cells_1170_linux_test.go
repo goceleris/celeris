@@ -3,8 +3,14 @@
 package celeris_test
 
 import (
+	"bufio"
+	"context"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,11 +32,69 @@ import (
 type pool1170 struct {
 	streamErr atomic.Value // the error of the last failed Write
 	mu        sync.Mutex
+	logs      sink1170 // what the server logged (Debug and up): why a wait was reset, the episodes of a stuck loop
+}
+
+// sink1170 is a slog handler that keeps the records of a server: the CI logs do not say
+// which rule cut a stream, and a cell that fails must (review r10 item 4).
+type sink1170 struct {
+	mu   sync.Mutex
+	recs []string // "message reason=..." per record
+}
+
+func (s *sink1170) Enabled(context.Context, slog.Level) bool { return true }
+func (s *sink1170) Handle(_ context.Context, r slog.Record) error {
+	line := r.Message
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "reason" || a.Key == "loop" {
+			line += " " + a.Key + "=" + a.Value.String()
+		}
+		return true
+	})
+	s.mu.Lock()
+	s.recs = append(s.recs, line)
+	s.mu.Unlock()
+	return nil
+}
+func (s *sink1170) WithAttrs([]slog.Attr) slog.Handler { return s }
+func (s *sink1170) WithGroup(string) slog.Handler      { return s }
+
+// resets counts the resets of a pool handler's wait by reason ("rate", "loop-blocked").
+func (s *sink1170) resets() map[string]int {
+	out := map[string]int{}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.recs {
+		if strings.HasPrefix(l, "h2: pool handler wait reset") {
+			if i := strings.Index(l, "reason="); i >= 0 {
+				out[l[i+len("reason="):]]++
+			}
+		}
+	}
+	return out
+}
+
+// episodes counts the times the server said the rate rule was suspended.
+func (s *sink1170) episodes() int {
+	n := 0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.recs {
+		if strings.HasPrefix(l, "h2: the minimum rate of a pool handler's wait") {
+			n++
+		}
+	}
+	return n
+}
+
+// summary is for a failing cell's message.
+func (s *sink1170) summary() string {
+	return fmt.Sprintf("server log: resets by reason %v, %d episode(s) of a stuck loop", s.resets(), s.episodes())
 }
 
 func (p *pool1170) server(t *testing.T, eng celeris.EngineType, read, idle, write time.Duration) string {
 	t.Helper()
-	cfg := celeris.Config{Engine: eng, ReadTimeout: read, IdleTimeout: idle, WriteTimeout: write}
+	cfg := celeris.Config{Engine: eng, ReadTimeout: read, IdleTimeout: idle, WriteTimeout: write, Logger: slog.New(&p.logs)}
 	return startServerConfig761(t, cfg, func(s *celeris.Server) {
 		s.GET("/pool", func(c *celeris.Context) error {
 			n, _ := strconv.Atoi(c.Query("n"))
@@ -413,14 +477,82 @@ func TestH2PoolWaiterLoopBlockedThreshold1170(t *testing.T) {
 							cut++
 						}
 					}
-					t.Logf("LB1170 %s/%s: %d cut: %q at %v", e.name, tc.name, cut, ends, at)
-					if tc.cut && cut == 0 {
-						t.Fatal("every download completed although a loop was blocked for 0.8 s at a time: the fallback to WriteTimeout in all was not applied")
+					t.Logf("LB1170 %s/%s: %d cut: %q at %v; %s", e.name, tc.name, cut, ends, at, p.logs.summary())
+					if tc.cut && (cut == 0 || p.logs.resets()["loop-blocked"] == 0 || p.logs.episodes() == 0) {
+						t.Fatalf("%d cut although a loop was blocked for 0.8 s at a time: the fallback to WriteTimeout in all must cut some, say so (%s)", cut, p.logs.summary())
 					}
-					if !tc.cut && cut != 0 {
-						t.Fatalf("%d downloads were cut although the loops were blocked for only 0.2 s at a time (under the threshold of 0.5 s)", cut)
+					if !tc.cut && (cut != 0 || p.logs.resets()["loop-blocked"] != 0) {
+						t.Fatalf("%d downloads were cut although the loops were blocked for only 0.2 s at a time (under the threshold of 0.5 s): %s", cut, p.logs.summary())
 					}
 				})
+			}
+		})
+	}
+}
+
+// TestH2PoolWaiterAfterTheLoopsParked1170 (review r10 F2): PauseAccept, then the
+// last connections close: a loop with no connection parks on a channel, not in
+// epoll_wait or the ring wait, right after the batch that closed its last one. If it
+// kept the stamp of that batch it read as stuck for ever, and every waiter on the
+// engine fell back to WriteTimeout in all until ResumeAccept, silently. Go's Transport
+// holds an h2 connection through the pause and downloads 4 x 8 MiB after it; nothing
+// may be cut, and nothing may be said about a stuck loop. io_uring is run at 5 s (its
+// own send clock cuts at 1 s), epoll and adaptive at 1 s. (Adaptive's standby side
+// runs the same park code.)
+func TestH2PoolWaiterAfterTheLoopsParked1170(t *testing.T) {
+	for _, e := range nativeEngines889() {
+		wt := time.Second
+		if e.name == "io_uring" {
+			wt = 5 * time.Second
+		}
+		t.Run(e.name, func(t *testing.T) {
+			var p pool1170
+			cfg := celeris.Config{Engine: e.eng, ReadTimeout: -1, IdleTimeout: -1, WriteTimeout: wt, Logger: slog.New(&p.logs)}
+			srv, addr := startPickedPing1104(t, cfg, func(s *celeris.Server) {
+				ping1104(s)
+				s.GET("/pool", func(c *celeris.Context) error {
+					n, _ := strconv.Atoi(c.Query("n"))
+					return c.Blob(200, "application/octet-stream", make([]byte, n))
+				}).Async()
+			})
+			cl := goTransport1170(1e6)
+			if resp, err := cl.Get("http://" + addr + "/pool?n=1"); err == nil { // the h2 connection, kept by the Transport
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			} else {
+				t.Fatalf("warm-up: %v", err)
+			}
+			// h1 connections that each did a request: every loop has handled a batch.
+			var hs []net.Conn
+			for i := 0; i < 16; i++ {
+				c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+				if err != nil {
+					t.Fatalf("dial: %v", err)
+				}
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				_, _ = c.Write([]byte("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"))
+				if line, err := bufio.NewReader(c).ReadString('\n'); err != nil || !strings.Contains(line, "200") {
+					t.Fatalf("h1 ping: %q %v", line, err)
+				}
+				hs = append(hs, c)
+			}
+			if err := srv.PauseAccept(); err != nil {
+				t.Skipf("PauseAccept: %v", err)
+			}
+			for _, c := range hs {
+				_ = c.Close()
+			}
+			time.Sleep(1500 * time.Millisecond) // the loops with no connection are parked, and a stale stamp has aged
+			ends, at := downloadsOn1170(t, cl, addr, "/pool", 4, 8<<20, 60*time.Second)
+			_ = srv.ResumeAccept()
+			t.Logf("PK1170 %s WT%v: %q at %v; %s", e.name, wt, ends, at, p.logs.summary())
+			for i, r := range ends {
+				if r != "complete" {
+					t.Fatalf("download %d: %s at %v: %s", i, r, at[i].Round(time.Millisecond), p.logs.summary())
+				}
+			}
+			if p.logs.episodes() != 0 {
+				t.Fatalf("the server said the rate rule was suspended (a parked loop read as stuck): %s", p.logs.summary())
 			}
 		})
 	}

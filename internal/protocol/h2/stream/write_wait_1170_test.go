@@ -3,7 +3,9 @@ package stream
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -684,4 +686,48 @@ func TestOneEmptyWindowOfAMovingConnectionIsHeld1170(t *testing.T) {
 	if got := run(func(w int) bool { return w != 4 && w != 5 }); got != 5 {
 		t.Errorf("two empty windows in a row: reset in window %d, want 5", got)
 	}
+}
+
+// logCount1170 is a slog handler that counts the records it gets.
+type logCount1170 struct {
+	n    atomic.Int32
+	last atomic.Value
+}
+
+func (h *logCount1170) Enabled(context.Context, slog.Level) bool { return true }
+func (h *logCount1170) Handle(_ context.Context, r slog.Record) error {
+	h.n.Add(1)
+	h.last.Store(r.Message)
+	return nil
+}
+func (h *logCount1170) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logCount1170) WithGroup(string) slog.Handler      { return h }
+
+// The fallback tells the operator, once per episode: the rate rule is off for the
+// server while a loop is stuck, and nothing else says so (review r10 M1).
+func TestLoopWatchTellsAnEpisodeOnce1170(t *testing.T) {
+	var h logCount1170
+	lw := NewLoopWatch()
+	lw.SetLogger(slog.New(&h))
+	slot := lw.Slot()
+	wt := int64(time.Second)
+	now := time.Now().UnixNano()
+	for i := 0; i < 5; i++ { // five judgements that see the loop stuck: one line
+		slot.Enter(now - int64(time.Second))
+		if idx, _, ok := lw.stuck(now, loopStuckFor(wt)); ok {
+			lw.noteStuck(idx, 0, wt)
+		}
+	}
+	if got := h.n.Load(); got != 1 {
+		t.Fatalf("%d lines for one episode, want 1", got)
+	}
+	slot.Leave() // it ends: a judgement that finds no loop stuck ends the episode
+	lw.noteClear()
+	slot.Enter(now - int64(time.Second))
+	lw.noteStuck(0, 0, wt)
+	if got := h.n.Load(); got != 2 {
+		t.Fatalf("%d lines after a second episode, want 2", got)
+	}
+	var none *LoopWatch = NewLoopWatch() // no logger: nothing, no crash
+	none.noteStuck(0, 0, wt)
 }
