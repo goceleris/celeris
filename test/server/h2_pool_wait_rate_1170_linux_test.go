@@ -1,0 +1,169 @@
+//go:build linux
+
+package celeris_test
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"golang.org/x/net/http2"
+)
+
+// celeris#1170 (stage 3 of #889). A pool handler whose response the connection's
+// outbound budget could not buffer waits for the peer's window in sendRest, and was
+// bounded by an absolute WriteTimeout from the start of the wait (#906), whatever
+// the client read. These cells use Go's own x/net/http2.Transport over a link of
+// bps bytes/s, the client the issue was found with.
+
+// slowConn1170 reads at most bps bytes per second in total (the link), 4 KiB a read.
+type slowConn1170 struct {
+	net.Conn
+	th *throttled889
+}
+
+func (c *slowConn1170) Read(p []byte) (int, error) { return c.th.Read(p) }
+
+// goTransport1170 is a Go HTTP/2 client over h2c whose connection is read at bps.
+func goTransport1170(addr string, bps float64) *http.Client {
+	tr := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
+			c, err := (&net.Dialer{}).DialContext(ctx, network, a)
+			if err != nil {
+				return nil, err
+			}
+			sc := &slowConn1170{Conn: c}
+			sc.th = &throttled889{r: c, bps: bps, t0: time.Now()}
+			return sc, nil
+		},
+	}
+	return &http.Client{Transport: tr}
+}
+
+// downloads1170 runs n parallel GETs of path (size bytes each) on one connection and
+// reports, per request, how it ended and when.
+func downloads1170(t *testing.T, addr, path string, n, size int, bps float64, limit time.Duration) (ends []string, at []time.Duration) {
+	t.Helper()
+	cl := goTransport1170(addr, bps)
+	ends, at = make([]string, n), make([]time.Duration, n)
+	t0 := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequestWithContext(ctx, "GET", "http://"+addr+path+"?n="+strconv.Itoa(size), nil)
+			resp, err := cl.Do(req)
+			if err != nil {
+				ends[i], at[i] = "do: "+err.Error(), time.Since(t0)
+				return
+			}
+			got, err := io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			at[i] = time.Since(t0)
+			switch {
+			case err != nil:
+				ends[i] = fmt.Sprintf("body after %d of %d: %v", got, size, err)
+			case int(got) != size:
+				ends[i] = fmt.Sprintf("short: %d of %d", got, size)
+			default:
+				ends[i] = "complete"
+			}
+		}()
+	}
+	wg.Wait()
+	return ends, at
+}
+
+// TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170: four 8 MiB
+// downloads by Go's Transport on a 1 MB/s link (each about 250 KB/s, four times the
+// 64 KiB-per-window floor). On the previous head three of the four were reset with
+// INTERNAL_ERROR (the client sees it at about 17 s, behind the bytes queued ahead of
+// it): the first grant of the second, third and fourth stream comes 5, 9 and 14 s
+// after their handlers began to wait (a 4 MiB stream window each is queued in the
+// socket ahead of the next), and #906's deadline was 1 WriteTimeout.
+//
+// io_uring at WriteTimeout 1 s is not in the table: its own send clock (a send
+// that does not complete for WriteTimeout, "io_uring is unchanged" in
+// Config.WriteTimeout) closes the connection first, identically on main (measured:
+// every stream ends in an unexpected EOF at 17 to 24 s). It is not this rule.
+func TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170(t *testing.T) {
+	for _, e := range nativeEngines889() {
+		for _, wt := range []time.Duration{time.Second, 5 * time.Second} {
+			if e.name == "io_uring" && wt < 5*time.Second {
+				continue
+			}
+			t.Run(fmt.Sprintf("%s/WT%v", e.name, wt), func(t *testing.T) {
+				t.Parallel()
+				addr := wdServer889(t, e.eng, -1, -1, wt)
+				ends, at := downloads1170(t, addr, "/pool889", 4, 8<<20, 1e6, 60*time.Second)
+				t.Logf("GT1170 %s/WT%v: %q at %v", e.name, wt, ends, at)
+				for i, r := range ends {
+					if r != "complete" {
+						t.Fatalf("download %d: %s at %v (all four must complete)", i, r, at[i].Round(time.Millisecond))
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestH2GoTransportManyParallelDownloadsAreNotCut1170: eight 8 MiB downloads on a
+// 2 MB/s link, WriteTimeout 1 s: the last stream's first grant is 7 x 4 MiB / 2 MB/s
+// = 14 s after its wait began, 14 windows (the idle allowance covers it, not the 3 of
+// the rule before celeris#1170).
+func TestH2GoTransportManyParallelDownloadsAreNotCut1170(t *testing.T) {
+	for _, e := range nativeEngines889() {
+		if e.name == "io_uring" {
+			continue // its own send clock at WriteTimeout 1 s, see above
+		}
+		t.Run(e.name, func(t *testing.T) {
+			t.Parallel()
+			addr := wdServer889(t, e.eng, -1, -1, time.Second)
+			ends, at := downloads1170(t, addr, "/pool889", 8, 8<<20, 2e6, 90*time.Second)
+			t.Logf("GT1170 many %s: %q at %v", e.name, ends, at)
+			for i, r := range ends {
+				if r != "complete" {
+					t.Fatalf("download %d: %s at %v (all eight must complete)", i, r, at[i].Round(time.Millisecond))
+				}
+			}
+		})
+	}
+}
+
+// TestH2GoTransportQueueBeyondTheCapIsCut1170: the cap exists. Four 8 MiB
+// downloads on 1 MB/s at WriteTimeout 0.5 s: the last waiter's first grant is about
+// 27 windows in, past the allowance (16 + the seed's 4), so it is reset, as
+// documented ("N x W / L under about 20 x WriteTimeout").
+func TestH2GoTransportQueueBeyondTheCapIsCut1170(t *testing.T) {
+	for _, e := range nativeEngines889() {
+		if e.name == "io_uring" {
+			continue // its own send clock, see above
+		}
+		t.Run(e.name, func(t *testing.T) {
+			t.Parallel()
+			addr := wdServer889(t, e.eng, -1, -1, 500*time.Millisecond)
+			ends, at := downloads1170(t, addr, "/pool889", 4, 8<<20, 1e6, 60*time.Second)
+			t.Logf("GT1170 beyond the cap %s: %q at %v", e.name, ends, at)
+			cut := 0
+			for _, r := range ends {
+				if r != "complete" {
+					cut++
+				}
+			}
+			if cut == 0 {
+				t.Fatalf("all four completed: the queue (about 27 windows) is past the cap of 16 + 4 and a waiter must have been reset")
+			}
+		})
+	}
+}
