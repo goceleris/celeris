@@ -501,6 +501,9 @@ func TestH2PoolWaiterLoopBlockedThreshold1170(t *testing.T) {
 // runs the same park code.)
 func TestH2PoolWaiterAfterTheLoopsParked1170(t *testing.T) {
 	for _, e := range nativeEngines889() {
+		if e.name == "adaptive" {
+			continue // it has no PauseAccept of its own; its standby side runs the park code of these two
+		}
 		wt := time.Second
 		if e.name == "io_uring" {
 			wt = 5 * time.Second
@@ -537,7 +540,7 @@ func TestH2PoolWaiterAfterTheLoopsParked1170(t *testing.T) {
 				hs = append(hs, c)
 			}
 			if err := srv.PauseAccept(); err != nil {
-				t.Skipf("PauseAccept: %v", err)
+				t.Fatalf("PauseAccept: %v", err)
 			}
 			for _, c := range hs {
 				_ = c.Close()

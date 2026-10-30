@@ -605,10 +605,11 @@ func TestWriteBankIsSpentByAShareWindow889(t *testing.T) {
 			t.Fatal("window 3: stream 1 reset: one window in which the connection released nothing, after one in which it moved, is held")
 		}
 	}
-	// Windows 4 and 5: still nothing moves besides b, 40000 a window: under the floor, the
-	// connection under its floor in two windows in a row: the verdict.
+	// Windows 4 to 6: still nothing moves besides b, 40000 a window: under the floor, the
+	// connection under its floor for as many windows as the bank covers (it last moved in
+	// window 2): the verdict.
 	reset := false
-	for w := 4; w <= 5 && !reset; w++ {
+	for w := 4; w <= 6 && !reset; w++ {
 		b.SetWindowSize(40000)
 		m.FlushOutbound(b, discard889)
 		for _, id := range windowEnd889(m, start, w) {
@@ -616,7 +617,7 @@ func TestWriteBankIsSpentByAShareWindow889(t *testing.T) {
 		}
 	}
 	if !reset {
-		t.Fatal("stream 1 held for two windows in which the connection released nothing")
+		t.Fatal("stream 1 held for four windows in which the connection released nothing")
 	}
 }
 

@@ -674,17 +674,18 @@ func TestOneEmptyWindowOfAMovingConnectionIsHeld1170(t *testing.T) {
 		})
 	}
 	// The sibling moves in windows 1 to 5, then stops: stream 1, which takes its share,
-	// is held through the first empty window (the horizon) and reset in the second.
-	if got := run(func(w int) bool { return w <= 5 }); got != 7 {
-		t.Errorf("the sibling stops after window 5: reset in window %d, want 7 (window 6 is held on the horizon)", got)
+	// is held through the windows the bank covers (6, 7 and 8: the horizon) and reset in
+	// the fourth.
+	if got := run(func(w int) bool { return w <= 5 }); got != 5+writeBankWindows {
+		t.Errorf("the sibling stops after window 5: reset in window %d, want %d (%d empty windows are held)", got, 5+writeBankWindows, writeBankWindows-1)
 	}
-	// One empty window in the middle of a moving connection does not end anything.
-	if got := run(func(w int) bool { return w != 4 }); got != 0 {
-		t.Errorf("one empty window in the middle: reset in window %d, want never", got)
+	// Empty windows in the middle of a moving connection, up to the horizon, end nothing.
+	if got := run(func(w int) bool { return w < 4 || w > 6 }); got != 0 {
+		t.Errorf("three empty windows in the middle: reset in window %d, want never", got)
 	}
-	// Two in a row do.
-	if got := run(func(w int) bool { return w != 4 && w != 5 }); got != 5 {
-		t.Errorf("two empty windows in a row: reset in window %d, want 5", got)
+	// One more does.
+	if got := run(func(w int) bool { return w < 4 || w > 7 }); got != 7 {
+		t.Errorf("four empty windows in a row: reset in window %d, want 7", got)
 	}
 }
 

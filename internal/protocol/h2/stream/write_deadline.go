@@ -119,7 +119,9 @@ type stall struct {
 	connAt   int64 // Manager.connReleased when the window began
 	connHeld int64 // what the connection held (buffered and waiting) when the window began
 	idleMax  int   // idle windows allowed in the current idle run: the largest allowance it has seen
-	prevRel  int64 // what the connection's other streams released in the window before this one
+	prevRel  int64 // what the connection's other streams released lately: the largest of the windows before, halved each window
+	win      int   // windows judged
+	lastMove int   // the window in which the connection's other streams last released a floor (0: never)
 	waiter   bool  // a pool handler blocked for window, not a buffer (write_wait.go): judged by its handler
 }
 
@@ -387,15 +389,22 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 	connRel := m.connReleased.Load() - st.connAt
 	connFloor := min(int64(writeMinRelease), st.connHeld)
 	moving := connRel >= connFloor // the connection as a whole released its floor
-	// A connection that moved in the window before is still moving through one window
-	// in which it released nothing (review r10 F1): a client that returns connection
-	// window in large steps, as Go's Transport does (about 1 MiB every 1.05 s at
-	// 1 MB/s), leaves some windows with neither a grant nor a send, and that must not
-	// end a stream's idle run, or the verdict. Two such windows in a row do. What
-	// carries is what the OTHER streams released: the stream's own release must not
-	// shelter it in the window after (a client that took its floor every fourth window
-	// would live for ever on it).
-	movingH := moving || st.prevRel >= connFloor
+	// A connection that moved lately is still moving through windows in which it
+	// released nothing, for as many as the bank covers (review r10 F1): a client that
+	// returns connection window in large steps, as Go's Transport does (about 1 MiB
+	// every 1.05 s at 1 MB/s), leaves some windows with neither a grant nor a send, and
+	// a queue of siblings' bytes ahead of a stream can leave the connection without a
+	// release for a few windows between the first grants and the stream's own; that must
+	// not end a stream's idle run, or be its verdict. Such a window counts as an idle
+	// one (the allowance bounds them). What carries is what the OTHER streams
+	// released: the stream's own release must not shelter it in the windows after (a
+	// client that took its floor every fourth window would live for ever on it).
+	st.win++
+	others := max(connRel-int64(st.released), 0)
+	if others >= connFloor {
+		st.lastMove = st.win
+	}
+	movingH := moving || (st.lastMove > 0 && st.win-st.lastMove < writeBankWindows)
 	rate := max(connRel, st.prevRel) // what the idle allowance divides the bytes in flight by
 
 	hold := false
@@ -458,7 +467,7 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 		}
 	}
 	if hold {
-		st.prevRel = max(connRel-int64(st.released), 0) // before the stream's own release is cleared
+		st.prevRel = max(others, st.prevRel/2)
 		st.armedAt, st.held, st.released = now, st.pending, 0
 		st.connAt, st.connHeld = m.connReleased.Load(), m.heldLocked(int64(st.pending))
 	}
