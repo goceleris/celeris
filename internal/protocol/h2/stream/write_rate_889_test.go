@@ -487,6 +487,7 @@ func TestWriteIdleCountRestarts889(t *testing.T) {
 		got := firstReset889(m, 1, time.Now().UnixNano(), 20, func(w int) {
 			if w == 3 { // the conn window is shut and b's own has room: starved; a sibling takes the grant
 				atomic.StoreInt32(&m.connectionWindow, 0)
+				m.connHigh.Store(0) // nothing in flight at the connection level (the allowance has its own tests)
 				b.SetWindowSize(1 << 20)
 				a.SetWindowSize(70000)
 				m.UpdateConnectionWindow(70000)

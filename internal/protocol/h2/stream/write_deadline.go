@@ -84,6 +84,17 @@ const writeBankWindows = 4
 // share may be held, on a connection that moves above the floor, before it is reset.
 const writeIdleWindows = 3
 
+// writeIdleCapWindows is the most idle windows a stream below its share may be
+// held, on a connection that moves, when the connection has a long queue of bytes
+// in flight (celeris#1170): the allowance is ceil(in flight / what the connection
+// released in the window) windows, at least writeIdleWindows and at most this. A
+// stream that waits behind its siblings' bytes in the client's socket is not
+// idle for as long as the client takes to read what was sent ahead of it, and
+// no longer. The cost is the bound of a stream that is truly paused or abandoned
+// while the connection moves: 4 (the seed) + this + 1 windows. The one place the
+// bound of the minimum rate is stretched; see the PR for #1170.
+const writeIdleCapWindows = 16
+
 // maxTimeout bounds a deadline length so that now + timeout cannot overflow an
 // int64 of nanoseconds (a timeout of math.MaxInt64, the common way to write "never",
 // made every deadline due at once: review r7 F3): a hundred years.
@@ -106,7 +117,9 @@ type stall struct {
 	bank     int   // surplus released in earlier windows (and the seed), carried over
 	idle     int   // consecutive windows held below its share on a connection above the floor
 	connAt   int64 // Manager.connReleased when the window began
-	connHeld int64 // Manager.outboundHeld when the window began
+	connHeld int64 // what the connection held (buffered and waiting) when the window began
+	idleMax  int   // idle windows allowed in the current idle run, fixed when it begins
+	waiter   bool  // a pool handler blocked for window, not a buffer (write_wait.go): judged by its handler
 }
 
 // SetWriteTimeout sets the write deadline (the server's WriteTimeout): the length
@@ -136,13 +149,20 @@ func (m *Manager) noteBuffered(s *Stream, n int) {
 	id := s.ID
 	m.stallMu.Lock()
 	st := m.stalls[id]
+	if st != nil && st.waiter {
+		// A stream is a waiter or a buffer, never both (a pool handler that waits
+		// buffers nothing). If it ever were, the sweep judges it: the waiter's
+		// judge defers to a record that is not its own (judgeWait).
+		m.waitHeld -= int64(st.pending)
+		st.waiter = false
+		m.lowerWrDL(st.armedAt + int64(m.wrTimeout))
+	}
 	if st == nil {
 		now := time.Now().UnixNano() // read only when a window begins, not for every append to a stalled stream
 		if m.stalls == nil {
 			m.stalls = make(map[uint32]*stall)
 		}
-		seed := min(max(int(m.initWin.Load())-int(s.windowSize.Load()), 0), writeBankWindows*writeMinRelease)
-		st = &stall{armedAt: now, bank: seed, connAt: m.connReleased.Load(), connHeld: max(m.outboundHeld.Load(), int64(n))}
+		st = &stall{armedAt: now, bank: m.seedLocked(s), connAt: m.connReleased.Load(), connHeld: m.heldLocked(int64(n))}
 		m.stalls[id] = st
 		m.stallN.Store(int32(len(m.stalls)))
 		m.lowerWrDL(now + int64(m.wrTimeout))
@@ -170,20 +190,55 @@ func (m *Manager) lowerWrDL(at int64) {
 // noteReleased records that n bytes of the stream's buffer were just sent
 // (FlushOutbound), with the stream's lock held: the stream's window is credited,
 // and the record ends with the buffer.
-func (m *Manager) noteReleased(id uint32, n int) {
+func (m *Manager) noteReleased(s *Stream, n int) {
 	if m.wrTimeout <= 0 || n <= 0 {
 		return
 	}
 	m.stallMu.Lock()
-	if st := m.stalls[id]; st != nil {
+	if st := m.stalls[s.ID]; st != nil && !st.waiter {
 		st.released += n
 		st.pending -= n
 		if st.pending <= 0 {
-			delete(m.stalls, id)
-			m.stallN.Store(int32(len(m.stalls)))
+			m.delStallLocked(s.ID)
+			s.recordEnded() // s.mu is held: the next record's seed counts what is sent from here
 		}
 	}
 	m.stallMu.Unlock()
+}
+
+// seedLocked is the bank a stream's first window starts with: the bytes it had in
+// flight (sent, not yet granted back: the peer's initial window less what is left
+// of its own), at most writeBankWindows floors, and no more than the stream has
+// sent since its previous record ended (Stream.seedSince). The last bound is for a streaming
+// response whose Writes each wait: without it every record was seeded again with
+// the same bytes the client never granted back, and a client that granted each
+// Write's bytes once in five windows held the stream at a fifth of the floor for
+// ever (celeris#1170 review r2 F2). A stream with no previous record has the first
+// two bounds only. The stream's lock (for seedSince) must be held.
+func (m *Manager) seedLocked(s *Stream) int {
+	seed := min(max(int(m.initWin.Load())-int(s.windowSize.Load()), 0), writeBankWindows*writeMinRelease)
+	if s.seedSince > 0 {
+		seed = min(seed, int(s.seedSince)-1)
+	}
+	return seed
+}
+
+// heldLocked is what the connection holds waiting for the peer: the bytes its
+// streams buffer and the bytes its pool handlers still have to send, and at
+// least own (the stream judged). stallMu must be held.
+func (m *Manager) heldLocked(own int64) int64 {
+	return max(m.outboundHeld.Load()+m.waitHeld, own)
+}
+
+// delStallLocked ends the record of stream id. stallMu must be held.
+func (m *Manager) delStallLocked(id uint32) {
+	if st, ok := m.stalls[id]; ok {
+		if st.waiter {
+			m.waitHeld -= int64(st.pending)
+		}
+		delete(m.stalls, id)
+		m.stallN.Store(int32(len(m.stalls)))
+	}
 }
 
 // dropStall ends the record of stream id, whose buffer was dropped or whose
@@ -193,10 +248,7 @@ func (m *Manager) dropStall(id uint32) {
 		return
 	}
 	m.stallMu.Lock()
-	if _, ok := m.stalls[id]; ok {
-		delete(m.stalls, id)
-		m.stallN.Store(int32(len(m.stalls)))
-	}
+	m.delStallLocked(id)
 	m.stallMu.Unlock()
 }
 
@@ -204,6 +256,7 @@ func (m *Manager) dropStall(id uint32) {
 func (m *Manager) dropAllStalls() {
 	m.stallMu.Lock()
 	clear(m.stalls)
+	m.waitHeld = 0
 	m.stallN.Store(0)
 	m.stallMu.Unlock()
 }
@@ -245,7 +298,7 @@ func (m *Manager) ExpiredWrites(now int64, out []uint32) []uint32 {
 	ids, sts := idBuf[:0], stBuf[:0]
 	m.stallMu.Lock()
 	for id, st := range m.stalls {
-		if st.armedAt+wt <= now {
+		if !st.waiter && st.armedAt+wt <= now { // a waiter is judged by its handler
 			ids, sts = append(ids, id), append(sts, st)
 		}
 	}
@@ -283,8 +336,11 @@ func (m *Manager) ExpiredWrites(now int64, out []uint32) []uint32 {
 		if st == nil || st != sts[i] || st.armedAt+wt > now {
 			continue
 		}
+		if st.waiter {
+			continue // became a waiter's since it was found due
+		}
 		if views[i]&viewGone != 0 {
-			delete(m.stalls, id)
+			m.delStallLocked(id)
 			continue
 		}
 		if !m.holdsLocked(st, views[i]&viewOwn != 0 && connShut, now) {
@@ -297,6 +353,9 @@ func (m *Manager) ExpiredWrites(now int64, out []uint32) []uint32 {
 	}
 	var next int64
 	for _, st := range m.stalls {
+		if st.waiter {
+			continue // the hint is the sweep's: a waiter's window is its handler's timer
+		}
 		if at := st.armedAt + wt; next == 0 || at < next {
 			next = at
 		}
@@ -347,8 +406,13 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 			if st.released > 0 && st.released >= share {
 				hold = true
 				st.idle = 0
-			} else if st.idle++; st.idle <= writeIdleWindows {
-				hold = true
+			} else {
+				if st.idle == 0 { // an idle run begins: its allowance is fixed now
+					st.idleMax = m.idleAllowance(connRel)
+				}
+				if st.idle++; st.idle <= st.idleMax {
+					hold = true
+				}
 			}
 			st.bank = 0
 		case (st.held < writeMinRelease && st.released*2 >= floor) || st.connHeld < writeMinRelease:
@@ -370,7 +434,7 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 	}
 	if hold {
 		st.armedAt, st.held, st.released = now, st.pending, 0
-		st.connAt, st.connHeld = m.connReleased.Load(), max(m.outboundHeld.Load(), int64(st.pending))
+		st.connAt, st.connHeld = m.connReleased.Load(), m.heldLocked(int64(st.pending))
 	}
 	return hold
 }

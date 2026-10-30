@@ -294,6 +294,7 @@ type Loop struct {
 	dirtyHead      *connState // head of intrusive doubly-linked dirty list
 	h2Conns        []int      // FDs of H2 connections (for write queue polling)
 	h2cfg          conn.H2Config
+	loopSlot       *stream.LoopSlot // stamped around each batch of events (celeris#1170)
 	detachQueue    []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
 	detachQMu      sync.Mutex
 	detachQSpare   []*connState // reuse slice to avoid alloc in drainDetachQueue
@@ -669,6 +670,7 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
+		l.loopSlot.Leave() // not in a batch while it waits
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
 		if err != nil {
 			if err == unix.EINTR {
@@ -694,6 +696,7 @@ func (l *Loop) run(ctx context.Context) {
 			// is loop-thread-local, so no synchronization is needed.
 			l.cachedNow = time.Now().UnixNano()
 			now = l.cachedNow
+			l.loopSlot.Enter(now) // the batch below runs handlers: a stuck one shows (celeris#1170)
 		}
 		for i := range n {
 			ev := &l.events[i]

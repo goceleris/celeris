@@ -52,6 +52,10 @@ func wdSetup889(t testing.TB) (*Processor, *Manager, *rstRecorder889) {
 	m.SetWriteTimeout(wt889)
 	m.UpdateConnectionWindow(1 << 30)
 	m.initWin.Store(0) // no seed: a stream's first window is judged on what it releases (the seed has its own tests)
+	// No bytes in flight at the connection level: the rule's tables are derived for
+	// a client that returns the connection window as it reads, with nothing queued
+	// ahead (the idle allowance of celeris#1170 has its own tests).
+	m.connHigh.Store(0)
 	return p, m, rec
 }
 
@@ -434,8 +438,9 @@ func TestExpireWriteWakesAPoolHandlerAsReset889(t *testing.T) {
 }
 
 // With a write deadline a conn whose only business is a stalled stream is
-// exempt from the conn clocks (D2 resets the stream); without one, or with a
-// pool handler waiting in AwaitSendWindow, it is not.
+// exempt from the conn clocks (D2 resets the stream), and so is one whose pool
+// handler waits for the window (its wait is judged by the same rule, celeris#1170:
+// the connection's clocks apply once the stream is gone); without one, neither is.
 func TestServerOwesWithAWriteDeadline889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	s := stalled889(m, 1, 5000)
@@ -444,14 +449,19 @@ func TestServerOwesWithAWriteDeadline889(t *testing.T) {
 		t.Fatal("a stalled stream does not exempt the conn although D2 bounds it")
 	}
 	m.sendWindowWaiters.Add(1)
-	if m.ServerOwes() {
-		t.Fatal("a pool handler waiting for the window exempts the conn: its bound is #906's, and the conn clock stays")
+	if !m.ServerOwes() {
+		t.Fatal("a pool handler waiting for the window does not exempt the conn although its wait is bounded by the rate (celeris#1170)")
 	}
 	m.sendWindowWaiters.Add(-1)
 	m.SetWriteTimeout(0)
 	if m.ServerOwes() {
 		t.Fatal("without a write deadline a stalled stream exempts the conn (the old rule)")
 	}
+	m.sendWindowWaiters.Add(1)
+	if m.ServerOwes() {
+		t.Fatal("without a write deadline a pool handler waiting for the window exempts the conn (the old rule)")
+	}
+	m.sendWindowWaiters.Add(-1)
 }
 
 // The common path pays nothing: reserving window allocates nothing and touches no

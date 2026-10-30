@@ -464,7 +464,7 @@ func (m *Manager) FlushOutbound(s *Stream, send OutboundSend) (finished bool) {
 	finished = last && (s.OutboundEndStream || s.outboundAbandoned)
 	send(s.ID, end, buf.Next(n))
 	m.refundOutbound(n) // celeris#893
-	m.noteReleased(s.ID, n)
+	m.noteReleased(s, n)
 	if buf.Len() == 0 {
 		buf.Reset()
 	}
@@ -503,13 +503,13 @@ func (m *Manager) StreamWrite(s *Stream, gen uint64, data []byte, send OutboundS
 	}
 	if !s.RunsOnPool() {
 		m.sendOrBufferLocked(s, data, send)
-		s.respWritten += int64(len(data))
 		return len(data), id, false, nil
 	}
 	n = int(m.ReserveSendWindow(s, clampWindowRequest(len(data))))
 	if n > 0 {
 		send(id, false, data[:n])
-		s.respWritten += int64(n)
+		s.noteWritten(n)
+		m.NoteWaitSent(id, n) // the credit of a wait that is in progress (write_wait.go)
 	}
 	return n, id, true, nil
 }
@@ -531,6 +531,7 @@ func (m *Manager) sendOrBufferLocked(s *Stream, data []byte, send OutboundSend) 
 		n = int(m.ReserveSendWindow(s, clampWindowRequest(len(data))))
 		if n > 0 {
 			send(s.ID, false, data[:n])
+			s.noteWritten(n) // before the record's seed is taken: what is sent counts in it
 		}
 	}
 	if n < len(data) {
@@ -540,6 +541,7 @@ func (m *Manager) sendOrBufferLocked(s *Stream, data []byte, send OutboundSend) 
 		s.OutboundBuffer.Write(data[n:])
 		m.chargeOutbound(len(data) - n)
 		m.noteBuffered(s, len(data)-n)
+		s.noteWritten(len(data) - n)
 	}
 }
 

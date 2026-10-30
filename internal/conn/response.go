@@ -1027,28 +1027,34 @@ func (a *h2ResponseAdapter) finishBody(s *stream.Stream, rest []byte, maxFrame u
 // Stream.TryBufferOutbound).
 //
 // It gives up, sending nothing more, when the stream is reset or its
-// connection closes. And it waits no longer than writeTimeout from now, the
-// server's WriteTimeout, in all: then it resets the stream with
-// INTERNAL_ERROR, as net/http does at a stream's write deadline, and returns
-// an error that wraps os.ErrDeadlineExceeded. The bound is a timer, so it
-// holds when the event loop cannot run: on the native engines a sync handler
-// waiting for this one (a lock it holds across this write, a coalesced call it
-// leads) holds its loop until this handler returns.
+// connection closes. And it is bounded by the server's WriteTimeout as a
+// minimum rate, the rule of every stream that waits for the peer's window
+// (stream.AwaitSendWindowRate, celeris#1170): the client must let at least 64 KiB
+// of the rest out per WriteTimeout window, with the carry-over, the connection's
+// credit and the grace the rule gives; when it does not, the stream is reset with
+// INTERNAL_ERROR, as net/http does at a stream's write deadline, and sendRest
+// returns an error that wraps os.ErrDeadlineExceeded. Before celeris#1170 the
+// bound was WriteTimeout in all from the first wait (#906), which cut a client
+// that read at a healthy rate when the bytes ahead of this stream in its socket
+// took longer. The bound is a timer of this handler's, so it holds when the event
+// loop cannot run: on the native engines a sync handler waiting for this one (a
+// lock it holds across this write, a coalesced call it leads) holds its loop until
+// this handler returns; while a loop is stuck like that the wait is bounded by
+// WriteTimeout in all, as before.
 func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uint32) error {
-	var deadline time.Time
-	if a.writeTimeout > 0 {
-		deadline = time.Now().Add(a.writeTimeout)
-	}
+	var w stream.SendWait
+	gen := s.Gen()
+	defer w.End(s, gen)
 	for {
-		if err := s.AwaitSendWindow(deadline); err != nil {
+		if err := s.AwaitSendWindowRate(&w, len(rest)); err != nil {
 			if !errors.Is(err, os.ErrDeadlineExceeded) {
 				return nil // reset by the peer, or the connection closed
 			}
-			a.resetStream(s, http2.ErrCodeInternal)
-			return fmt.Errorf("h2: stream %d reset: %d bytes of the response still waited for the peer's window at WriteTimeout (%v): %w",
-				s.ID, len(rest), a.writeTimeout, err)
+			a.resetStreamOnce(s, http2.ErrCodeInternal)
+			return waitRateError(s.ID, len(rest), "the response", a.writeTimeout, &w, err)
 		}
 		if n := h2ReserveSend(a.manager, s, len(rest)); n > 0 {
+			a.manager.NoteWaitSent(s.ID, n)
 			isEnd := n == len(rest)
 			pooled := getH2FrameBuf()
 			frameBuf := (*pooled)[:0]
@@ -1064,6 +1070,32 @@ func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uin
 			rest = rest[n:]
 		}
 	}
+}
+
+// waitRateError is the error of a handler whose wait for the peer's window was
+// judged not to make the minimum rate of WriteTimeout (wraps err, an
+// os.ErrDeadlineExceeded).
+func waitRateError(id uint32, left int, what string, wt time.Duration, w *stream.SendWait, err error) error {
+	if w.BlockedLoop() {
+		return fmt.Errorf("h2: stream %d reset: %d bytes of %s still waited for the peer's window after WriteTimeout (%v) while an event loop of the server was blocked: %w",
+			id, left, what, wt, err)
+	}
+	return fmt.Errorf("h2: stream %d reset: %d bytes of %s still waited for the peer's window and the client did not take the minimum rate of WriteTimeout (%v per window): %w",
+		id, left, what, wt, err)
+}
+
+// resetStreamOnce is resetStream for a wait that was judged: the stream is cancelled
+// first, and the RST_STREAM goes only if this call cancelled it. A stream the peer
+// reset between the verdict and here gets no second reset (RFC 9113 §5.1).
+func (a *h2ResponseAdapter) resetStreamOnce(s *stream.Stream, code http2.ErrCode) {
+	if !s.CancelFirst() {
+		return
+	}
+	var payload [4]byte
+	binary.BigEndian.PutUint32(payload[:], uint32(code))
+	pooled := getH2FrameBuf()
+	*pooled = appendH2Frame((*pooled)[:0], h2FrameRSTStream, 0, s.ID, payload[:])
+	a.writeQueue.Enqueue(s.ID, pooled)
 }
 
 // resetStream queues a RST_STREAM for s behind the frames s has queued (all of
@@ -1094,7 +1126,7 @@ func (a *h2ResponseAdapter) resetStreamUse(s *stream.Stream, gen uint64, code ht
 		return
 	}
 	defer s.UseUnlock()
-	a.resetStream(s, code)
+	a.resetStreamOnce(s, code)
 }
 
 // SendGoAway writes a GOAWAY frame via the shared writer.
@@ -1576,18 +1608,20 @@ func (a *h2ResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) 
 	if !onPool {
 		return nil // taken whole: sent, buffered behind the DATA already sent, or a HEAD's, dropped
 	}
-	// A pool goroutine: wait for the windows and send as they allow. The
-	// deadline starts when the call first has to wait, not before: a Write
-	// that finds the windows open reads no clock, and takes one lock.
-	var deadline time.Time
+	// A pool goroutine: wait for the windows and send as they allow. The wait
+	// is judged as a minimum rate of WriteTimeout (stream.AwaitSendWindowRateUse),
+	// from the moment the call first has to wait: a Write that finds the windows
+	// open reads no clock, and takes one lock. One wait per Write, not per
+	// response: a stream (SSE) is meant to outlast any one write.
+	var w stream.SendWait
+	defer w.End(s, gen)
 	for len(data) > 0 {
-		if err := s.AwaitSendWindowUse(gen, a.writeTimeout, &deadline); err != nil {
+		if err := s.AwaitSendWindowRateUse(gen, &w, len(data)); err != nil {
 			if !errors.Is(err, os.ErrDeadlineExceeded) {
 				return err // reset by the peer, the connection closed, or the stream's use is over
 			}
 			a.resetStreamUse(s, gen, http2.ErrCodeInternal)
-			return fmt.Errorf("h2: stream %d reset: %d of %d bytes of a write still waited for the peer's window at WriteTimeout (%v): %w",
-				id, len(data), total, a.writeTimeout, err)
+			return waitRateError(id, len(data), fmt.Sprintf("a write of %d bytes", total), a.writeTimeout, &w, err)
 		}
 		n, _, _, err := m.StreamWrite(s, gen, data, a.sendData)
 		if err != nil {

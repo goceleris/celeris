@@ -860,6 +860,7 @@ type Worker struct {
 	wakeFD         *wakefd.WakeFD
 	h2PollArmed    bool // true when POLL_ADD is active on the wakeup eventfd
 	h2cfg          conn.H2Config
+	loopSlot       *stream.LoopSlot // stamped around each batch of CQEs (celeris#1170)
 	emptyIters     uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
 	detachQueue    []*connState
 	detachQMu      sync.Mutex
@@ -1719,6 +1720,7 @@ func (w *Worker) run(ctx context.Context) {
 		}
 
 		var cqHead, cqTail uint32
+		w.loopSlot.Leave() // not in a batch while it waits
 		if w.sqpoll {
 			// SQPOLL path: kernel thread submits SQEs from the shared ring.
 			// We never call Submit() — just clear the pending counter.
@@ -1820,6 +1822,7 @@ func (w *Worker) run(ctx context.Context) {
 			// per request.
 			w.cachedNow = time.Now().UnixNano()
 			now := w.cachedNow
+			w.loopSlot.Enter(now) // the batch below runs handlers: a stuck one shows (celeris#1170)
 			for cqHead != cqTail {
 				entry := w.ring.cqeAt(cqHead)
 				// Inlined CQE dispatch — eliminates processCQE method call
