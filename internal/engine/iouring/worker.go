@@ -23,6 +23,7 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/deferlinger"
+	"github.com/goceleris/celeris/internal/drainclock"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/bindiag"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
@@ -1628,14 +1629,14 @@ func (w *Worker) run(ctx context.Context) {
 				// producers' OnError and OnDetachClose run on this thread, as
 				// in the send drain, so a slow callback delays the HTTP/2
 				// conns served here.
-				if now := time.Now().UnixNano(); now > w.h2DrainStart+shutdownSendDrainNanos {
+				if now := drainclock.Now(); now > w.h2DrainStart+shutdownSendDrainNanos {
 					w.refuseRecv = true
 					if w.stopProducersPaced(now) {
 						w.closeIdleH1()
 					}
 				}
 			} else {
-				now := time.Now().UnixNano()
+				now := drainclock.Now()
 				if w.shutdownDrainStart == 0 {
 					w.shutdownDrainStart = now
 				}
@@ -2893,8 +2894,8 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 	setSQEUserData(sqe, encodeUserData(udListenCancel, lfd))
 	var ringErr error
 	acceptOwed := true
-	deadline := time.Now().UnixNano() + shutdownFDDrainNanos
-	for acceptOwed && time.Now().UnixNano() < deadline {
+	deadline := drainclock.Now() + shutdownFDDrainNanos
+	for acceptOwed && drainclock.Now() < deadline {
 		if err := shutdownRingWait(w.ring, 10*time.Millisecond); err != nil {
 			if !ringWaitRetryable(err) {
 				ringErr = err
@@ -8080,7 +8081,7 @@ func (w *Worker) h2PoolSettled() bool {
 	if len(w.h2Conns) == 0 {
 		return true
 	}
-	now := time.Now().UnixNano()
+	now := drainclock.Now()
 	if w.h2DrainStart == 0 {
 		w.h2DrainStart = now
 	}
@@ -8135,7 +8136,7 @@ func (w *Worker) drainEnd(start, floor int64) (end int64, bounded bool) {
 		return end, true
 	}
 	d, hasDeadline := (*p).Deadline()
-	ext := d.UnixNano()
+	ext := drainclock.At(d)
 	if wt := int64(w.cfg.WriteTimeout); wt > 0 && (!hasDeadline || start+wt < ext) {
 		ext, hasDeadline = start+wt, true
 	}
