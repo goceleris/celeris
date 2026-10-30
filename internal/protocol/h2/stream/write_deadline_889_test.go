@@ -270,6 +270,7 @@ func TestExpiredWritesBatch889(t *testing.T) {
 	start := time.Now().UnixNano()
 	for i := 0; i < 40; i++ {
 		stalled889(m, uint32(1+2*i), 100)
+		time.Sleep(2 * time.Millisecond) // a slow runner (the coverage build): the records are not armed in one instant
 	}
 	// The connection holds 4000 bytes, under one floor: its tail is held for the idle
 	// windows (r9 F-A2) rather than reset at the first one, and the batch limit is shown

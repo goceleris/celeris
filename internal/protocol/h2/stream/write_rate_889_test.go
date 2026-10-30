@@ -348,6 +348,7 @@ func TestWriteConnTailGrace889(t *testing.T) {
 			start := time.Now().UnixNano()
 			for i := 0; i < 3; i++ {
 				stalled889(m, uint32(1+2*i), 100)
+				time.Sleep(2 * time.Millisecond) // a slow runner (the coverage build): the records are not armed in one instant
 			}
 			c := m.CreateStream(99)
 			c.SetState(StateOpen)
