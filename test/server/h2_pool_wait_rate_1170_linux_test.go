@@ -4,7 +4,6 @@ package celeris_test
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -13,8 +12,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/net/http2"
 )
 
 // celeris#1170 (stage 3 of #889). A pool handler whose response the connection's
@@ -31,11 +28,15 @@ type slowConn1170 struct {
 
 func (c *slowConn1170) Read(p []byte) (int, error) { return c.th.Read(p) }
 
-// goTransport1170 is a Go HTTP/2 client over h2c whose connection is read at bps.
-func goTransport1170(addr string, bps float64) *http.Client {
-	tr := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
+// goTransport1170 is a Go HTTP/2 client over h2c (net/http's Transport with
+// unencrypted HTTP/2, the bundled implementation of x/net/http2's transport: 4 MiB
+// stream window, 1 GiB connection window) whose connection is read at bps.
+func goTransport1170(bps float64) *http.Client {
+	var pr http.Protocols
+	pr.SetUnencryptedHTTP2(true)
+	tr := &http.Transport{
+		Protocols: &pr,
+		DialContext: func(ctx context.Context, network, a string) (net.Conn, error) {
 			c, err := (&net.Dialer{}).DialContext(ctx, network, a)
 			if err != nil {
 				return nil, err
@@ -52,7 +53,13 @@ func goTransport1170(addr string, bps float64) *http.Client {
 // reports, per request, how it ended and when.
 func downloads1170(t *testing.T, addr, path string, n, size int, bps float64, limit time.Duration) (ends []string, at []time.Duration) {
 	t.Helper()
-	cl := goTransport1170(addr, bps)
+	cl := goTransport1170(bps)
+	// One tiny request first: the downloads share its connection (a Transport that
+	// is asked for several at once may dial several).
+	if resp, err := cl.Get("http://" + addr + path + "?n=1"); err == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
 	ends, at = make([]string, n), make([]time.Duration, n)
 	t0 := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), limit)

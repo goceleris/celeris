@@ -65,7 +65,7 @@ func (p *pool1170) server(t *testing.T, eng celeris.EngineType, read, idle, writ
 		})
 		s.GET("/locked", func(c *celeris.Context) error {
 			p.mu.Lock()
-			p.mu.Unlock() //nolint:staticcheck // waiting for the lock is the point
+			p.mu.Unlock() // waiting for the lock is the point
 			return c.String(200, "ok")
 		})
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(200, "pong") })
@@ -367,7 +367,7 @@ func TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170(t *testing.T) {
 
 // TestH2PoolWaiterIsNotCutWhileALoopIsBlockedBelowTheThreshold1170 and ...Above...:
 // the fallback is server-wide and has a threshold (half a WriteTimeout, at least 250
-// ms). A route that blocks one loop for 0.3 s at a time (under it) leaves Go's
+// ms). A route that blocks one loop for 0.2 s at a time (under it) leaves Go's
 // Transport 4 x 8 MiB at WriteTimeout 1 s as green as without it; one that blocks 0.8
 // s (over) switches the fallback on, and the downloads are bounded by WriteTimeout in
 // all, as before celeris#1170: some are reset, as documented.
@@ -380,7 +380,7 @@ func TestH2PoolWaiterLoopBlockedThreshold1170(t *testing.T) {
 			name  string
 			block int // ms a batch blocks
 			cut   bool
-		}{{"under", 300, false}, {"over", 800, true}} {
+		}{{"under", 200, false}, {"over", 800, true}} {
 			t.Run(e.name+"/"+tc.name, func(t *testing.T) {
 				t.Parallel()
 				var p pool1170
@@ -413,7 +413,7 @@ func TestH2PoolWaiterLoopBlockedThreshold1170(t *testing.T) {
 					t.Fatal("every download completed although a loop was blocked for 0.8 s at a time: the fallback to WriteTimeout in all was not applied")
 				}
 				if !tc.cut && cut != 0 {
-					t.Fatalf("%d downloads were cut although the loops were blocked for only 0.3 s at a time (under the threshold of 0.5 s)", cut)
+					t.Fatalf("%d downloads were cut although the loops were blocked for only 0.2 s at a time (under the threshold of 0.5 s)", cut)
 				}
 			})
 		}

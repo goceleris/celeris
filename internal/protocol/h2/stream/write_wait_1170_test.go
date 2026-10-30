@@ -28,10 +28,10 @@ func waitRig1170(t *testing.T, wt time.Duration, initWin uint32) (*Manager, *Str
 
 // run1170 waits for window as a pool handler with rest bytes to send and reports
 // the error and how long it took.
-func run1170(s *Stream, w *SendWait, rest int) (error, time.Duration) {
+func run1170(s *Stream, w *SendWait, rest int) (time.Duration, error) {
 	t0 := time.Now()
 	err := s.AwaitSendWindowRate(w, rest)
-	return err, time.Since(t0)
+	return time.Since(t0), err
 }
 
 const wait1170 = 40 * time.Millisecond
@@ -46,7 +46,7 @@ func TestWaiterNothingGrantedIsResetAtTheBound1170(t *testing.T) {
 	}{{0, 1}, {65535, 1}, {1 << 20, 5}} {
 		m, s := waitRig1170(t, wait1170, tc.initWin)
 		var w SendWait
-		err, took := run1170(s, &w, 4<<20)
+		took, err := run1170(s, &w, 4<<20)
 		w.End(s, s.Gen())
 		if !errors.Is(err, os.ErrDeadlineExceeded) {
 			t.Fatalf("initWin %d: err %v, want os.ErrDeadlineExceeded", tc.initWin, err)
@@ -72,7 +72,7 @@ func TestWaiterGrantInsideTheSeedIsServed1170(t *testing.T) {
 		m.notifyStreamWindow(s.ID)
 	}()
 	var w SendWait
-	err, took := run1170(s, &w, 4<<20)
+	took, err := run1170(s, &w, 4<<20)
 	if err != nil || took < 3*wait1170 {
 		t.Fatalf("err %v after %v, want nil after the grant at 3.5 windows", err, took)
 	}
@@ -123,7 +123,7 @@ func TestWaiterGrantAtTheWindowEndIsNotJudged1170(t *testing.T) {
 		s.SetWindowSize(100000)
 	}()
 	var w SendWait
-	err, _ := run1170(s, &w, 4<<20)
+	_, err := run1170(s, &w, 4<<20)
 	w.End(s, s.Gen())
 	if err != nil {
 		t.Fatalf("err %v: a window that opened was judged as a stall", err)
@@ -140,7 +140,7 @@ func TestWaiterCancelledStreamIsNotExpired1170(t *testing.T) {
 		s.Cancel()
 	}()
 	var w SendWait
-	err, _ := run1170(s, &w, 4<<20)
+	_, err := run1170(s, &w, 4<<20)
 	w.End(s, s.Gen())
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err %v, want context.Canceled", err)
@@ -168,7 +168,7 @@ func TestWaiterMissingRecordIsRemade1170(t *testing.T) {
 		m.dropStall(s.ID)
 	}()
 	var w SendWait
-	err, took := run1170(s, &w, 4<<20)
+	took, err := run1170(s, &w, 4<<20)
 	w.End(s, s.Gen())
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("err %v, want os.ErrDeadlineExceeded: a wait without a record was never judged", err)
@@ -539,7 +539,7 @@ func TestWaiterLoopBlockedFallback1170(t *testing.T) {
 				}()
 			}
 			var w SendWait
-			err, took := run1170(s, &w, 4<<20)
+			took, err := run1170(s, &w, 4<<20)
 			w.End(s, s.Gen())
 			if !errors.Is(err, os.ErrDeadlineExceeded) {
 				t.Fatalf("err %v", err)

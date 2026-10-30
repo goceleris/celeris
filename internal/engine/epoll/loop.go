@@ -295,7 +295,7 @@ type Loop struct {
 	h2Conns        []int      // FDs of H2 connections (for write queue polling)
 	h2cfg          conn.H2Config
 	loopSlot       *stream.LoopSlot // stamped around each batch of events (celeris#1170)
-	detachQueue    []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
+	detachQueue    []*connState     // detached conns with pending writes (goroutine-safe via detachQMu)
 	detachQMu      sync.Mutex
 	detachQSpare   []*connState // reuse slice to avoid alloc in drainDetachQueue
 	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain

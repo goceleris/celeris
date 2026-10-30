@@ -861,7 +861,7 @@ type Worker struct {
 	h2PollArmed    bool // true when POLL_ADD is active on the wakeup eventfd
 	h2cfg          conn.H2Config
 	loopSlot       *stream.LoopSlot // stamped around each batch of CQEs (celeris#1170)
-	emptyIters     uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
+	emptyIters     uint32           // consecutive iterations with zero CQEs (for adaptive timeout)
 	detachQueue    []*connState
 	detachQMu      sync.Mutex
 	detachQSpare   []*connState
