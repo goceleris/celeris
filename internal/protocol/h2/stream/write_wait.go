@@ -30,7 +30,7 @@ import (
 //     (a sync handler waiting for a lock this handler holds holds its loop, and a wait
 //     that only the loop's sweep could end would end never): the sweep skips waiter
 //     records, so one record has one judge and a stream is reset at most once;
-//   - the pool handler's own bytes (waitHeld) count in what the connection holds, for
+//   - the pool handler's own bytes (waitHeldLocked) count in what the connection holds, for
 //     the tail grace.
 //
 // While an event loop of the server is stuck in one batch for as long as a window
@@ -47,6 +47,10 @@ type SendWait struct {
 	start  int64 // when the wait first blocked (wall clock ns)
 	made   bool  // the record was made (and not just re-made)
 	failed bool  // judged and reset by the loop-blocked fallback
+	// Loops is the server's watch on its event loops, set by the caller (the conn
+	// layer's adapter has it from the engine): while one of them is stuck, the wait
+	// is bounded by WriteTimeout in all. Nil: never.
+	Loops *LoopWatch
 }
 
 // BlockedLoop reports whether the wait ended because an event loop was stuck,
@@ -81,9 +85,7 @@ func (m *Manager) NoteWaitSent(id uint32, n int) {
 	m.stallMu.Lock()
 	if st := m.stalls[id]; st != nil && st.waiter {
 		st.released += n
-		d := min(n, st.pending)
-		st.pending -= d
-		m.waitHeld -= int64(d)
+		st.pending -= min(n, st.pending)
 		if st.pending <= 0 {
 			m.delStallLocked(id)
 		}
@@ -152,7 +154,6 @@ func (m *Manager) beginWait(s *Stream, id uint32, w *SendWait, rest int, gen uin
 		st = &stall{armedAt: now, bank: seed, waiter: true, held: rest, pending: rest,
 			connAt: m.connReleased.Load(), connHeld: m.heldLocked(int64(rest))}
 		m.stalls[id] = st
-		m.waitHeld += int64(rest)
 		m.stallN.Store(int32(len(m.stalls)))
 	}
 	end := st.armedAt + wt
@@ -184,7 +185,7 @@ func (m *Manager) judgeWait(s *Stream, id uint32, w *SendWait, rest int) (waitVe
 	}
 	wt := int64(m.wrTimeout)
 	now := time.Now().UnixNano()
-	if lw := m.loops; lw != nil && now-w.start >= wt && lw.blockedFor(now, loopStuckFor(wt)) {
+	if lw := w.Loops; lw != nil && now-w.start >= wt && lw.blockedFor(now, loopStuckFor(wt)) {
 		m.dropWait(id)
 		w.failed = true
 		return waitExpired, 0
@@ -204,7 +205,6 @@ func (m *Manager) judgeWait(s *Stream, id uint32, w *SendWait, rest int) (waitVe
 		st = &stall{armedAt: now, waiter: true, held: rest, pending: rest,
 			connAt: m.connReleased.Load(), connHeld: m.heldLocked(int64(rest))}
 		m.stalls[id] = st
-		m.waitHeld += int64(rest)
 		m.stallN.Store(int32(len(m.stalls)))
 		return waitHeld, now + wt
 	case !st.waiter:
@@ -213,10 +213,7 @@ func (m *Manager) judgeWait(s *Stream, id uint32, w *SendWait, rest int) (waitVe
 	if st.armedAt+wt > now {
 		return waitHeld, st.armedAt + wt // not due: a grant renewed it, or the timer fired early
 	}
-	if d := int64(rest - st.pending); d != 0 { // the books follow the handler's
-		m.waitHeld += d
-		st.pending = rest
-	}
+	st.pending = rest // the books follow the handler's count
 	if m.holdsLocked(st, starved, now) {
 		return waitHeld, st.armedAt + wt
 	}
@@ -421,7 +418,3 @@ const minLoopStuck = 250 * time.Millisecond
 func loopStuckFor(wt int64) int64 {
 	return max(wt/2, int64(minLoopStuck))
 }
-
-// SetLoopWatch sets the server's watch on its event loops. Set once, before the
-// first frame; nil (the default) never reports a loop stuck.
-func (m *Manager) SetLoopWatch(w *LoopWatch) { m.loops = w }

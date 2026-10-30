@@ -630,7 +630,7 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	proc.GetManager().SetHints(&s.hints)
 	proc.GetManager().SetRequestTimeout(cfg.ReadTimeout)
 	proc.GetManager().SetWriteTimeout(cfg.WriteTimeout)
-	proc.GetManager().SetLoopWatch(cfg.LoopWatch)
+	s.adapter.loops = cfg.LoopWatch
 	proc.SetHeaderBlockTimeout(cfg.ReadHeaderTimeout)
 	if lg := cfg.Logger; lg != nil {
 		proc.OnHandlerPanic = func(id uint32, r any, stack []byte) {

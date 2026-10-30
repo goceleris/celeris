@@ -51,19 +51,15 @@ type Manager struct {
 	// holds buffered bytes, in stalls, guarded by stallMu; stallN is how many, for
 	// a load on the paths that have none; connReleased is the bytes of DATA the
 	// connection released while a stream was stalled (ReserveSendWindow).
-	stallMu      sync.Mutex
-	stalls       map[uint32]*stall
-	stallN       atomic.Int32
+	stallMu sync.Mutex
+	stalls  map[uint32]*stall
+	stallN  atomic.Int32
+	// connHigh is the highest the connection window has been since it was last
+	// raised by the peer: connHigh less the window now is the bytes in flight on the
+	// connection, sent and not yet granted back (connInFlight, write_wait.go). Beside
+	// stallN, in the padding before connReleased: the Manager stays in its size class.
+	connHigh     atomic.Int32
 	connReleased atomic.Int64
-	// waitHeld is the bytes the pool handlers that wait for window still have to
-	// send (the sum of their records' pending), guarded by stallMu. connHigh is the
-	// highest the connection window has been since it was last raised by the peer:
-	// connHigh less the window now is the bytes in flight on the connection, sent
-	// and not yet granted back (connInFlight). loops is the server's watch on its
-	// event loops (write_wait.go).
-	waitHeld int64
-	connHigh atomic.Int32
-	loops    *LoopWatch
 
 	// retired holds the pool-handler streams whose handler has returned and
 	// which are out of the map, waiting for the event loop to return them to

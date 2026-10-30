@@ -153,7 +153,6 @@ func (m *Manager) noteBuffered(s *Stream, n int) {
 		// A stream is a waiter or a buffer, never both (a pool handler that waits
 		// buffers nothing). If it ever were, the sweep judges it: the waiter's
 		// judge defers to a record that is not its own (judgeWait).
-		m.waitHeld -= int64(st.pending)
 		st.waiter = false
 		m.lowerWrDL(st.armedAt + int64(m.wrTimeout))
 	}
@@ -227,15 +226,26 @@ func (m *Manager) seedLocked(s *Stream) int {
 // streams buffer and the bytes its pool handlers still have to send, and at
 // least own (the stream judged). stallMu must be held.
 func (m *Manager) heldLocked(own int64) int64 {
-	return max(m.outboundHeld.Load()+m.waitHeld, own)
+	return max(m.outboundHeld.Load()+m.waitHeldLocked(), own)
+}
+
+// waitHeldLocked is the bytes the pool handlers that wait for window still have to
+// send: the sum of their records' pending. A scan of the stalled streams (at most
+// the connection's concurrent streams), made where a window begins, not on any path
+// that sends. stallMu must be held.
+func (m *Manager) waitHeldLocked() int64 {
+	var n int64
+	for _, st := range m.stalls {
+		if st.waiter {
+			n += int64(st.pending)
+		}
+	}
+	return n
 }
 
 // delStallLocked ends the record of stream id. stallMu must be held.
 func (m *Manager) delStallLocked(id uint32) {
-	if st, ok := m.stalls[id]; ok {
-		if st.waiter {
-			m.waitHeld -= int64(st.pending)
-		}
+	if _, ok := m.stalls[id]; ok {
 		delete(m.stalls, id)
 		m.stallN.Store(int32(len(m.stalls)))
 	}
@@ -256,7 +266,6 @@ func (m *Manager) dropStall(id uint32) {
 func (m *Manager) dropAllStalls() {
 	m.stallMu.Lock()
 	clear(m.stalls)
-	m.waitHeld = 0
 	m.stallN.Store(0)
 	m.stallMu.Unlock()
 }

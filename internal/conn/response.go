@@ -810,6 +810,9 @@ type h2ResponseAdapter struct {
 	// writeTimeout bounds how long sendRest waits for the peer's window
 	// (H2Config.WriteTimeout; 0 = no bound).
 	writeTimeout time.Duration
+	// loops is the engine's watch on its event loops (H2Config.LoopWatch): a pool
+	// handler's wait is bounded by WriteTimeout in all while one is stuck.
+	loops *stream.LoopWatch
 }
 
 // peerMaxFrame returns the peer's currently-advertised SETTINGS_MAX_FRAME_SIZE,
@@ -1042,7 +1045,7 @@ func (a *h2ResponseAdapter) finishBody(s *stream.Stream, rest []byte, maxFrame u
 // this handler returns; while a loop is stuck like that the wait is bounded by
 // WriteTimeout in all, as before.
 func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uint32) error {
-	var w stream.SendWait
+	w := stream.SendWait{Loops: a.loops}
 	gen := s.Gen()
 	defer w.End(s, gen)
 	for {
@@ -1613,7 +1616,7 @@ func (a *h2ResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) 
 	// from the moment the call first has to wait: a Write that finds the windows
 	// open reads no clock, and takes one lock. One wait per Write, not per
 	// response: a stream (SSE) is meant to outlast any one write.
-	var w stream.SendWait
+	w := stream.SendWait{Loops: a.loops}
 	defer w.End(s, gen)
 	for len(data) > 0 {
 		if err := s.AwaitSendWindowRateUse(gen, &w, len(data)); err != nil {

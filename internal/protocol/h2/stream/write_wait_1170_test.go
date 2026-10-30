@@ -36,6 +36,13 @@ func run1170(s *Stream, w *SendWait, rest int) (time.Duration, error) {
 
 const wait1170 = 40 * time.Millisecond
 
+// waitHeld1170 is the bytes the waiters of m still have to send.
+func waitHeld1170(m *Manager) int64 {
+	m.stallMu.Lock()
+	defer m.stallMu.Unlock()
+	return m.waitHeldLocked()
+}
+
 // Nothing is granted: the wait is judged at the end of its window, like a
 // buffered tail. With no bytes in flight that is the first window; with a 1 MiB
 // window the seed covers four more (the bounds of TestWriteUnreadStreamBounds889).
@@ -57,8 +64,8 @@ func TestWaiterNothingGrantedIsResetAtTheBound1170(t *testing.T) {
 		if w.BlockedLoop() {
 			t.Fatal("reported a blocked loop")
 		}
-		if n := m.stalledStreams(); n != 0 || m.waitHeld != 0 {
-			t.Fatalf("after the verdict: %d records, waitHeld %d", n, m.waitHeld)
+		if n := m.stalledStreams(); n != 0 || waitHeld1170(m) != 0 {
+			t.Fatalf("after the verdict: %d records, waitHeld %d", n, waitHeld1170(m))
 		}
 	}
 }
@@ -76,12 +83,12 @@ func TestWaiterGrantInsideTheSeedIsServed1170(t *testing.T) {
 	if err != nil || took < 3*wait1170 {
 		t.Fatalf("err %v after %v, want nil after the grant at 3.5 windows", err, took)
 	}
-	if m.stalledStreams() != 1 || m.waitHeld != 4<<20 {
-		t.Fatalf("while the handler sends: %d records, waitHeld %d, want its record", m.stalledStreams(), m.waitHeld)
+	if m.stalledStreams() != 1 || waitHeld1170(m) != 4<<20 {
+		t.Fatalf("while the handler sends: %d records, waitHeld %d, want its record", m.stalledStreams(), waitHeld1170(m))
 	}
 	w.End(s, s.Gen())
-	if m.stalledStreams() != 0 || m.waitHeld != 0 {
-		t.Fatalf("after End: %d records, waitHeld %d", m.stalledStreams(), m.waitHeld)
+	if m.stalledStreams() != 0 || waitHeld1170(m) != 0 {
+		t.Fatalf("after End: %d records, waitHeld %d", m.stalledStreams(), waitHeld1170(m))
 	}
 }
 
@@ -184,10 +191,10 @@ func TestWaiterMissingRecordIsRemade1170(t *testing.T) {
 	}
 	m2.stallMu.Lock()
 	st := m2.stalls[s2.ID]
-	ok := st != nil && st.waiter && st.bank == 0 && st.pending == 5000 && m2.waitHeld == 5000
+	ok := st != nil && st.waiter && st.bank == 0 && st.pending == 5000 && m2.waitHeldLocked() == 5000
 	m2.stallMu.Unlock()
 	if !ok {
-		t.Fatalf("the remade record: %+v, waitHeld %d", st, m2.waitHeld)
+		t.Fatalf("the remade record: %+v, waitHeld %d", st, waitHeld1170(m2))
 	}
 }
 
@@ -223,8 +230,8 @@ func TestWaiterRecordBooks1170(t *testing.T) {
 	if end := m.beginWait(s, s.ID, &w, 10000, s.Gen()); end == 0 {
 		t.Fatal("no window")
 	}
-	if m.waitHeld != 10000 || m.stalledStreams() != 2 {
-		t.Fatalf("waitHeld %d, %d records", m.waitHeld, m.stalledStreams())
+	if waitHeld1170(m) != 10000 || m.stalledStreams() != 2 {
+		t.Fatalf("waitHeld %d, %d records", waitHeld1170(m), m.stalledStreams())
 	}
 	// The connection holds the buffer and the waiter's bytes.
 	m.stallMu.Lock()
@@ -236,10 +243,10 @@ func TestWaiterRecordBooks1170(t *testing.T) {
 	m.NoteWaitSent(s.ID, 4000)
 	m.stallMu.Lock()
 	st := m.stalls[s.ID]
-	got := st.released == 4000 && st.pending == 6000 && m.waitHeld == 6000
+	got := st.released == 4000 && st.pending == 6000 && m.waitHeldLocked() == 6000
 	m.stallMu.Unlock()
 	if !got {
-		t.Fatalf("after a credit: %+v waitHeld %d", st, m.waitHeld)
+		t.Fatalf("after a credit: %+v waitHeld %d", st, waitHeld1170(m))
 	}
 	m.NoteWaitSent(other.ID, 100) // a buffered tail is credited by the flush, not by this
 	m.stallMu.Lock()
@@ -260,8 +267,8 @@ func TestWaiterRecordBooks1170(t *testing.T) {
 		t.Fatalf("hint %d with only a waiter: the sweep would spin", h)
 	}
 	m.NoteWaitSent(s.ID, 6000) // the rest goes out: the record ends with it
-	if m.stalledStreams() != 0 || m.waitHeld != 0 {
-		t.Fatalf("after the last bytes: %d records, waitHeld %d", m.stalledStreams(), m.waitHeld)
+	if m.stalledStreams() != 0 || waitHeld1170(m) != 0 {
+		t.Fatalf("after the last bytes: %d records, waitHeld %d", m.stalledStreams(), waitHeld1170(m))
 	}
 	// End after the record is gone is a no-op, and a second End too.
 	w.End(s, s.Gen())
@@ -270,8 +277,8 @@ func TestWaiterRecordBooks1170(t *testing.T) {
 	var w2 SendWait
 	m.beginWait(s, s.ID, &w2, 777, s.Gen())
 	m.dropAllStalls()
-	if m.waitHeld != 0 || m.stalledStreams() != 0 {
-		t.Fatalf("dropAllStalls: waitHeld %d, %d records", m.waitHeld, m.stalledStreams())
+	if waitHeld1170(m) != 0 || m.stalledStreams() != 0 {
+		t.Fatalf("dropAllStalls: waitHeld %d, %d records", waitHeld1170(m), m.stalledStreams())
 	}
 }
 
@@ -286,10 +293,10 @@ func TestWaiterBooksFollowTheHandlersCount1170(t *testing.T) {
 	m.judgeWait(s, s.ID, &w, 7000)
 	m.stallMu.Lock()
 	st := m.stalls[s.ID]
-	got := st != nil && st.pending == 7000 && m.waitHeld == 7000
+	got := st != nil && st.pending == 7000 && m.waitHeldLocked() == 7000
 	m.stallMu.Unlock()
 	if !got {
-		t.Fatalf("the record after the judge: %+v waitHeld %d, want pending 7000", st, m.waitHeld)
+		t.Fatalf("the record after the judge: %+v waitHeld %d, want pending 7000", st, waitHeld1170(m))
 	}
 }
 
@@ -302,10 +309,10 @@ func TestWaiterAndBufferNeverHaveTwoJudges1170(t *testing.T) {
 	s.BufferOutbound(make([]byte, 200000), true) // noteBuffered on a waiter's stream
 	m.stallMu.Lock()
 	st := m.stalls[s.ID]
-	conv := st != nil && !st.waiter && m.waitHeld == 0 && st.pending == 500000
+	conv := st != nil && !st.waiter && m.waitHeldLocked() == 0 && st.pending == 500000
 	m.stallMu.Unlock()
 	if !conv {
-		t.Fatalf("the record after a buffer joined: %+v waitHeld %d", st, m.waitHeld)
+		t.Fatalf("the record after a buffer joined: %+v waitHeld %d", st, waitHeld1170(m))
 	}
 	if v, _ := m.judgeWait(s, s.ID, &w, 300000); v != waitHeld {
 		t.Fatalf("the waiter's judge decided %v on the sweep's record", v)
@@ -517,10 +524,9 @@ func TestWaiterLoopBlockedFallback1170(t *testing.T) {
 		{"no loop stuck", 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m, s := waitRig1170(t, wait1170, 1<<20) // the seed would hold it for 5 windows
+			_, s := waitRig1170(t, wait1170, 1<<20) // the seed would hold it for 5 windows
 			lw := NewLoopWatch()
 			slot := lw.Slot()
-			m.SetLoopWatch(lw)
 			if tc.stuck > 0 {
 				// A loop that is always this far into a batch (it re-enters as time passes).
 				quit := make(chan struct{})
@@ -538,7 +544,7 @@ func TestWaiterLoopBlockedFallback1170(t *testing.T) {
 					}
 				}()
 			}
-			var w SendWait
+			w := SendWait{Loops: lw}
 			took, err := run1170(s, &w, 4<<20)
 			w.End(s, s.Gen())
 			if !errors.Is(err, os.ErrDeadlineExceeded) {
