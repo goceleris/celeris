@@ -23,15 +23,16 @@ import (
 
 // celeris#1173: the write clock of an HTTP/2 response a handler's goroutine
 // writes after a quiet gap. flushSend stamps lastActivity, from which the sweep
-// measures WriteTimeout for a conn with a SEND in flight, with w.cachedNow: the
-// clock the loop read for its last batch of completions or its last sweep. A
-// worker that is woken for the handler's write without a completion (the
-// 100 us poll of an HTTP/2 conn, a timed wait that ran out) stamped a clock as
-// old as that last read, so a stream quiet for most of WriteTimeout had a
-// write clock that was already most of WriteTimeout old when its SEND went out
-// (measured 70 ms of 100 in CI-like runs), and a sweep that found the SEND
-// still in flight (the worker descheduled between the submit and the reaping of
-// its completion) closed the conn mid-stream.
+// measures WriteTimeout for a conn with a SEND staged or in flight, with
+// w.cachedNow: the clock the loop read for its last batch of completions or its
+// last sweep. A handler's enqueue that lands after the loop has looked for
+// completions, on an iteration whose timed wait ran out, is drained by that very
+// iteration with a clock as old as the wait, and the sweep later in the same
+// iteration, which reads a fresh clock, closes a conn with a SEND staged whose
+// write clock is older than WriteTimeout (a stream quiet for most of
+// WriteTimeout: measured 103 to 128 ms of 100). This test is the statistical
+// form (about half the runs on a build without the fix); the deterministic form
+// is in write_clock_stale_stamp_det_1173_linux_test.go.
 
 const writeTimeout1173 = 100 * time.Millisecond
 
@@ -56,8 +57,11 @@ func (g *gate1173) HandleStream(_ context.Context, s *stream.Stream) error {
 func (g *gate1173) RouteAsync(_, path string) bool { return path == "/gate" }
 func (g *gate1173) HasAsyncRoutes() bool           { return true }
 
-func TestWriteClockStampAfterAQuietGapIsFresh1173(t *testing.T) {
-	g := &gate1173{started: make(chan struct{}, 1), gate: make(chan struct{})}
+// startGate1173 starts a two-worker io_uring engine of the shape of
+// TestQuietH2StreamIsNotCutByWriteTimeout889 (WriteTimeout the only timeout on,
+// and short) with handler g, and returns it with its address.
+func startGate1173(t *testing.T, g *gate1173) (*engineRun896, string) {
+	t.Helper()
 	addr := freeAddr639(t)
 	var run *engineRun896
 	_, _, err := retryRingENOMEM(func() error {
@@ -103,18 +107,25 @@ func TestWriteClockStampAfterAQuietGapIsFresh1173(t *testing.T) {
 		}
 		t.Fatalf("engine start on %s: %v", addr, err)
 	}
+	return run, addr
+}
+
+func TestWriteClockStampAfterAQuietGapIsFresh1173(t *testing.T) {
+	g := &gate1173{started: make(chan struct{}, 1), gate: make(chan struct{})}
+	run, addr := startGate1173(t, g)
 	defer func() { _, _ = run.stop() }()
 
 	// The seam sees every drain of a handler's write; the test arms it for the
 	// one that follows its release of the gate and keeps the first age it sees.
 	var armed atomic.Bool
 	var age atomic.Int64
-	h2WriteDrainSeam = func(w *Worker, _ int) {
+	seam := func(w *Worker, _ int) {
 		if armed.CompareAndSwap(true, false) {
 			age.Store(time.Now().UnixNano() - w.cachedNow)
 		}
 	}
-	t.Cleanup(func() { h2WriteDrainSeam = nil })
+	h2WriteDrainSeam.Store(&seam)
+	t.Cleanup(func() { h2WriteDrainSeam.Store(nil) })
 
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
@@ -188,6 +199,6 @@ func TestWriteClockStampAfterAQuietGapIsFresh1173(t *testing.T) {
 	// runs; 50 ms is not reached by that.)
 	if maxAge > writeTimeout1173/2 {
 		t.Fatalf("the write clock of a response written after a quiet gap starts %v in the past (median %v) with WriteTimeout %v: "+
-			"a sweep that finds the SEND in flight closes the conn mid-stream", maxAge, median, writeTimeout1173)
+			"the sweep of the same iteration closes the conn with the response staged", maxAge, median, writeTimeout1173)
 	}
 }

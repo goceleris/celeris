@@ -45,6 +45,11 @@ func (w *Worker) sweepDue(now int64, gateHit bool) bool {
 	return d >= sweepCeiling || d < 0 || w.sweepTickFired || (gateHit && d >= sweepFloor)
 }
 
+// sweepClock is the clock sweepDue is given. (Since celeris#1173 the loop reads
+// the clock after every wait, readClockAfterWait, so cachedNow is never older
+// than the iteration and the fresh reads below are second ones on the empty
+// iterations; they stay because the cadence tests and the benchmark pin this
+// function, and can go in a follow-up.)
 // sweepClock is the clock sweepDue is given: the batch's own (cachedNow) on an
 // iteration that had CQEs, and on an empty one a fresh read only where it can
 // matter, because an empty iteration may be a zero-wait spin (baseTimeout is 0

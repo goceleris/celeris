@@ -675,7 +675,7 @@ type Worker struct {
 	linkArmBatch uint64
 
 	tickCounter uint32
-	cachedNow   int64  // cached time.Now().UnixNano(), refreshed on every CQE-bearing iteration and by checkTimeouts
+	cachedNow   int64  // cached time.Now().UnixNano(), read once per iteration after its wait (readClockAfterWait), and by checkTimeouts
 	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
 	// dirtySendGiveUps counts the dirty pass's give-ups of a conn with a SEND
 	// outstanding (celeris#811). Worker-owned; read by tests after the
@@ -1804,20 +1804,7 @@ func (w *Worker) run(ctx context.Context) {
 		w.sendsPending = false
 
 		gotCQE := cqHead != cqTail
-		if !gotCQE {
-			// A wait that ended with no completion (the HTTP/2 conns' poll, a
-			// timed wait that ran out) leaves cachedNow as old as the last
-			// batch or sweep, up to the whole idle wait. What this iteration
-			// does next stamps with it: drainH2Writes and flushDirty stage the
-			// SEND of a handler's write and flushSend starts that conn's write
-			// clock from cachedNow, so a stream quiet for most of
-			// WriteTimeout began its SEND with the clock most of WriteTimeout
-			// old, measured at 103 to 127 ms against 100 (celeris#1173), and
-			// a sweep that found the SEND still in flight closed the conn
-			// mid-stream. An iteration with no completion has no work to be
-			// quick about: one vDSO call.
-			w.cachedNow = time.Now().UnixNano()
-		}
+		w.readClockAfterWait(gotCQE)
 		if gotCQE {
 			w.emptyIters = 0 // Reset adaptive timeout on activity.
 			// Read the clock once per CQE batch, after the wait that
@@ -1990,13 +1977,9 @@ func (w *Worker) run(ctx context.Context) {
 		// queuePendingRelease docstring).
 		w.iterCount++
 		if len(w.pendingRelease) > 0 {
-			// An idle iteration with a descriptor still kept for an owed op
-			// (celeris#685) refreshes the clock the backstop reads: cachedNow
-			// moves only with CQE traffic or the timeout sweep, and a kept
-			// descriptor also keeps this worker from parking.
-			if w.closeFDOwed > 0 && w.emptyIters > 0 {
-				w.cachedNow = time.Now().UnixNano()
-			}
+			// (An idle iteration with a descriptor kept for an owed op, celeris#685,
+			// used to refresh the clock the backstop reads here: the loop now reads
+			// it after every wait, readClockAfterWait.)
 			w.drainPendingRelease()
 		}
 
@@ -6516,8 +6499,8 @@ func (w *Worker) drainH2Writes() {
 		fd := w.h2Conns[i]
 		cs := w.conns[fd]
 		if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
-			if h := h2WriteDrainSeam; h != nil {
-				h(w, fd)
+			if h := h2WriteDrainSeam.Load(); h != nil {
+				(*h)(w, fd)
 			}
 			cs.h2State.DrainWriteQueue(cs.writeFn)
 			if cs.writeRefused {
@@ -6531,6 +6514,26 @@ func (w *Worker) drainH2Writes() {
 				w.markDirty(cs)
 			}
 		}
+	}
+}
+
+// readClockAfterWait is the loop's clock read for an iteration whose wait
+// returned no completion. An iteration with completions reads the clock once
+// for its batch; one without left cachedNow as old as the last batch or sweep,
+// up to the whole idle wait (1 ms, then 5 ms, up to 100 ms, 1 s on a worker
+// with no listener). What the iteration does next stamps with it: a handler's
+// write that landed after the loop looked for completions (the enqueue and its
+// wake of the eventfd come after the check) is staged by drainH2Writes or
+// drainDetachQueue in this very iteration, flushSend starts that conn's write
+// clock from cachedNow, and the sweep later in the same iteration reads a fresh
+// clock and closes a conn with a SEND staged whose clock is older than
+// WriteTimeout: a stream quiet for most of WriteTimeout began its response
+// with the clock most of WriteTimeout old, 103 to 128 ms against 100 in the
+// test (celeris#1173). An iteration with no completion has nothing to be quick
+// about: one vDSO call. Worker thread.
+func (w *Worker) readClockAfterWait(gotCQE bool) {
+	if !gotCQE {
+		w.cachedNow = time.Now().UnixNano()
 	}
 }
 
@@ -7336,9 +7339,10 @@ func (w *Worker) flushSend(cs *connState) bool {
 	// WriteTimeout for a conn with a send in flight from it, so for a stream
 	// that was quiet for longer than WriteTimeout the whole gap counted, and a
 	// sweep that found the next chunk's SEND in flight closed the conn with it
-	// (celeris#889). A store of the clock the iteration already read: the
-	// recv, the wake of a handler goroutine's write, or the sweep refreshed
-	// cachedNow before this ran.
+	// (celeris#889). A store of the clock the iteration already read: the loop
+	// reads it after every wait, for the batch of completions or, with none,
+	// at once (readClockAfterWait; a wake of the handler's write that was not
+	// a completion of this iteration left it as old as the wait, celeris#1173).
 	cs.lastActivity = w.cachedNow
 	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
 
