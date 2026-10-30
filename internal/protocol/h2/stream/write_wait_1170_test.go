@@ -412,8 +412,9 @@ func TestIdleAllowance1170(t *testing.T) {
 		{300000, 100000, writeIdleWindows},
 		{300001, 100000, 4},
 		{1000000, 100000, 10},
-		{1600000, 100000, 16},
-		{1600001, 100000, writeIdleCapWindows},
+		{1200000, 100000, 12},
+		{1200001, 100000, writeIdleCapWindows},
+		{1600000, 100000, writeIdleCapWindows},
 		{1 << 28, 1000, writeIdleCapWindows},
 		{1 << 20, 0, writeIdleWindows}, // a connection that moves released something; 0 is no basis for a quotient
 	} {
@@ -422,8 +423,8 @@ func TestIdleAllowance1170(t *testing.T) {
 			t.Errorf("in flight %d, released %d: allowance %d, want %d", tc.inflight, tc.rel, got, tc.want)
 		}
 	}
-	if writeIdleCapWindows != 16 {
-		t.Errorf("the cap is %d, decided 16", writeIdleCapWindows)
+	if writeIdleCapWindows != 12 {
+		t.Errorf("the cap is %d, decided 12", writeIdleCapWindows)
 	}
 }
 
@@ -644,5 +645,43 @@ func TestIdleAllowanceIsTheLargestOfTheRun1170(t *testing.T) {
 	fast := run(4<<20, 1<<20) // the run begins in a window in which 4 MiB were released
 	if fast != steady {
 		t.Fatalf("reset in window %d after a fast first window, %d when steady: the first window fixed the allowance", fast, steady)
+	}
+}
+
+// A connection that moved in the window before is still moving through ONE window in
+// which it released nothing (review r10 F1: Go's Transport returns connection window
+// in about 1 MiB steps, so some 1 s windows at 1 MB/s have neither a grant nor a send),
+// and the verdict is two such windows in a row. What carries is what the OTHER streams
+// released: a stream's own release does not shelter it in the next window.
+func TestOneEmptyWindowOfAMovingConnectionIsHeld1170(t *testing.T) {
+	// Stream 1 takes 20000 a window (over its share, under its floor) beside stream 3,
+	// which moves the connection in the windows moves(w) says.
+	run := func(moves func(w int) bool) int {
+		_, m, _ := wdSetup889(t)
+		m.initWin.Store(0)
+		a := stalled889(m, 1, 64<<20)
+		b := stalled889(m, 3, 64<<20)
+		start := time.Now().UnixNano()
+		return firstReset889(m, 1, start, 40, func(w int) {
+			a.SetWindowSize(20000)
+			m.FlushOutbound(a, discard889)
+			if moves(w) {
+				b.SetWindowSize(70000)
+				m.FlushOutbound(b, discard889)
+			}
+		})
+	}
+	// The sibling moves in windows 1 to 5, then stops: stream 1, which takes its share,
+	// is held through the first empty window (the horizon) and reset in the second.
+	if got := run(func(w int) bool { return w <= 5 }); got != 7 {
+		t.Errorf("the sibling stops after window 5: reset in window %d, want 7 (window 6 is held on the horizon)", got)
+	}
+	// One empty window in the middle of a moving connection does not end anything.
+	if got := run(func(w int) bool { return w != 4 }); got != 0 {
+		t.Errorf("one empty window in the middle: reset in window %d, want never", got)
+	}
+	// Two in a row do.
+	if got := run(func(w int) bool { return w != 4 && w != 5 }); got != 5 {
+		t.Errorf("two empty windows in a row: reset in window %d, want 5", got)
 	}
 }

@@ -93,7 +93,7 @@ const writeIdleWindows = 3
 // no longer. The cost is the bound of a stream that is truly paused or abandoned
 // while the connection moves: 4 (the seed) + this + 1 windows. The one place the
 // bound of the minimum rate is stretched; see the PR for #1170.
-const writeIdleCapWindows = 16
+const writeIdleCapWindows = 12
 
 // maxTimeout bounds a deadline length so that now + timeout cannot overflow an
 // int64 of nanoseconds (a timeout of math.MaxInt64, the common way to write "never",
@@ -118,7 +118,8 @@ type stall struct {
 	idle     int   // consecutive windows held below its share on a connection above the floor
 	connAt   int64 // Manager.connReleased when the window began
 	connHeld int64 // what the connection held (buffered and waiting) when the window began
-	idleMax  int   // idle windows allowed in the current idle run, fixed when it begins
+	idleMax  int   // idle windows allowed in the current idle run: the largest allowance it has seen
+	prevRel  int64 // what the connection's other streams released in the window before this one
 	waiter   bool  // a pool handler blocked for window, not a buffer (write_wait.go): judged by its handler
 }
 
@@ -386,6 +387,16 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 	connRel := m.connReleased.Load() - st.connAt
 	connFloor := min(int64(writeMinRelease), st.connHeld)
 	moving := connRel >= connFloor // the connection as a whole released its floor
+	// A connection that moved in the window before is still moving through one window
+	// in which it released nothing (review r10 F1): a client that returns connection
+	// window in large steps, as Go's Transport does (about 1 MiB every 1.05 s at
+	// 1 MB/s), leaves some windows with neither a grant nor a send, and that must not
+	// end a stream's idle run, or the verdict. Two such windows in a row do. What
+	// carries is what the OTHER streams released: the stream's own release must not
+	// shelter it in the window after (a client that took its floor every fourth window
+	// would live for ever on it).
+	movingH := moving || st.prevRel >= connFloor
+	rate := max(connRel, st.prevRel) // what the idle allowance divides the bytes in flight by
 
 	hold := false
 	switch {
@@ -410,15 +421,20 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 			}
 			st.bank = min(max(total-charge, 0), writeBankWindows*writeMinRelease)
 			st.idle = 0
-		case moving:
+		case movingH:
 			share := int(connFloor) / (2 * max(len(m.stalls), 1))
 			if st.released > 0 && st.released >= share {
 				hold = true
 				st.idle = 0
 			} else {
-				if st.idle == 0 { // an idle run begins: its allowance is fixed now
-					st.idleMax = m.idleAllowance(connRel)
+				// The allowance of an idle run is the largest it has seen, within the cap
+				// (review r10 F3: a run that began in the tail branch had none, and one
+				// that began in a window the connection released a lot in had a small
+				// one for good).
+				if st.idle == 0 {
+					st.idleMax = 0
 				}
+				st.idleMax = max(st.idleMax, m.idleAllowance(rate))
 				if st.idle++; st.idle <= st.idleMax {
 					hold = true
 				}
@@ -442,6 +458,7 @@ func (m *Manager) holdsLocked(st *stall, starved bool, now int64) bool {
 		}
 	}
 	if hold {
+		st.prevRel = max(connRel-int64(st.released), 0) // before the stream's own release is cleared
 		st.armedAt, st.held, st.released = now, st.pending, 0
 		st.connAt, st.connHeld = m.connReleased.Load(), m.heldLocked(int64(st.pending))
 	}
