@@ -105,10 +105,11 @@ func downloads1170(t *testing.T, addr, path string, n, size int, bps float64, li
 // Config.WriteTimeout) closes the connection first, identically on main (measured:
 // every stream ends in an unexpected EOF at 17 to 24 s). It is not this rule.
 func TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170(t *testing.T) {
-	// One WriteTimeout at a time, the engines of it side by side: five of these cells
-	// at once on a 2-CPU runner under -race starve each other's event loops, and a loop
-	// that is stuck in one batch for half a WriteTimeout switches the rule off for the
-	// server (the fallback), which at 1 s is a cell's flake, not a finding.
+	// One WriteTimeout at a time, and at 1 s one engine at a time: a few of these cells
+	// at once under -race or a coverage profile starve each other's event loops (CI saw
+	// it), and a loop that is stuck in one batch for half a WriteTimeout switches the
+	// rule off for the server (the fallback), which at 1 s is a cell's flake, not a
+	// finding. At 5 s the threshold is 2.5 s and the engines run side by side.
 	for _, wt := range []time.Duration{time.Second, 5 * time.Second} {
 		t.Run(fmt.Sprintf("WT%v", wt), func(t *testing.T) {
 			for _, e := range nativeEngines889() {
@@ -116,7 +117,9 @@ func TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170(t *testing.T) {
 					continue
 				}
 				t.Run(e.name, func(t *testing.T) {
-					t.Parallel()
+					if wt >= 5*time.Second {
+						t.Parallel()
+					}
 					addr := wdServer889(t, e.eng, -1, -1, wt)
 					// Every loop has handled a batch of events before the download starts
 					// and is idle after it: a loop that kept the stamp of its last batch

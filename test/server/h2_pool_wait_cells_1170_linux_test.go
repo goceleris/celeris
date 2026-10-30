@@ -372,50 +372,56 @@ func TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170(t *testing.T) {
 // s (over) switches the fallback on, and the downloads are bounded by WriteTimeout in
 // all, as before celeris#1170: some are reset, as documented.
 func TestH2PoolWaiterLoopBlockedThreshold1170(t *testing.T) {
-	for _, e := range nativeEngines889() {
-		if e.name == "io_uring" {
-			continue // its own send clock at WriteTimeout 1 s
-		}
-		for _, tc := range []struct {
-			name  string
-			block int // ms a batch blocks
-			cut   bool
-		}{{"under", 200, false}, {"over", 800, true}} {
-			t.Run(e.name+"/"+tc.name, func(t *testing.T) {
-				t.Parallel()
-				var p pool1170
-				addr := p.server(t, e.eng, -1, -1, time.Second)
-				stop := make(chan struct{})
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go func() { // one connection at a time: one loop is blocked, then not
-					defer wg.Done()
-					for {
-						select {
-						case <-stop:
-							return
-						case <-time.After(300 * time.Millisecond):
+	// "under" and "over" one after the other, the engines of one side by side: four
+	// servers with their sleepers and downloads at once under -race or coverage on a
+	// CI runner starve each other's loops, and a loop that the CPU leaves stuck for
+	// half a WriteTimeout is the thing "under" says must not happen.
+	for _, tc := range []struct {
+		name  string
+		block int // ms a batch blocks
+		cut   bool
+	}{{"under", 200, false}, {"over", 800, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, e := range nativeEngines889() {
+				if e.name == "io_uring" {
+					continue // its own send clock at WriteTimeout 1 s
+				}
+				t.Run(e.name, func(t *testing.T) {
+					t.Parallel()
+					var p pool1170
+					addr := p.server(t, e.eng, -1, -1, time.Second)
+					stop := make(chan struct{})
+					var wg sync.WaitGroup
+					wg.Add(1)
+					go func() { // one connection at a time: one loop is blocked, then not
+						defer wg.Done()
+						for {
+							select {
+							case <-stop:
+								return
+							case <-time.After(300 * time.Millisecond):
+							}
+							_ = get893(1, "http://"+addr+"/sleep?ms="+strconv.Itoa(tc.block), 5*time.Second)
 						}
-						_ = get893(1, "http://"+addr+"/sleep?ms="+strconv.Itoa(tc.block), 5*time.Second)
+					}()
+					ends, at := downloads1170(t, addr, "/pool", 4, 8<<20, 1e6, 60*time.Second)
+					close(stop)
+					wg.Wait()
+					cut := 0
+					for _, r := range ends {
+						if r != "complete" {
+							cut++
+						}
 					}
-				}()
-				ends, at := downloads1170(t, addr, "/pool", 4, 8<<20, 1e6, 60*time.Second)
-				close(stop)
-				wg.Wait()
-				cut := 0
-				for _, r := range ends {
-					if r != "complete" {
-						cut++
+					t.Logf("LB1170 %s/%s: %d cut: %q at %v", e.name, tc.name, cut, ends, at)
+					if tc.cut && cut == 0 {
+						t.Fatal("every download completed although a loop was blocked for 0.8 s at a time: the fallback to WriteTimeout in all was not applied")
 					}
-				}
-				t.Logf("LB1170 %s/%s: %d cut: %q at %v", e.name, tc.name, cut, ends, at)
-				if tc.cut && cut == 0 {
-					t.Fatal("every download completed although a loop was blocked for 0.8 s at a time: the fallback to WriteTimeout in all was not applied")
-				}
-				if !tc.cut && cut != 0 {
-					t.Fatalf("%d downloads were cut although the loops were blocked for only 0.2 s at a time (under the threshold of 0.5 s)", cut)
-				}
-			})
-		}
+					if !tc.cut && cut != 0 {
+						t.Fatalf("%d downloads were cut although the loops were blocked for only 0.2 s at a time (under the threshold of 0.5 s)", cut)
+					}
+				})
+			}
+		})
 	}
 }
