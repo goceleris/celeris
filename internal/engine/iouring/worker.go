@@ -2115,6 +2115,7 @@ func (w *Worker) run(ctx context.Context) {
 			if len(w.liveConns) == 0 {
 				w.sweepRetract()
 			}
+			w.loopSlot.Leave() // a parked worker is not in a batch: its last stamp must not age (celeris#1170)
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() ||
 				w.driverActionPending.Load() != 0 || w.detachQPending.Load() != 0 {

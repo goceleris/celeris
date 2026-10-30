@@ -1003,6 +1003,7 @@ func (l *Loop) run(ctx context.Context) {
 			if len(l.liveConns) == 0 {
 				l.sweepRetract()
 			}
+			l.loopSlot.Leave() // a parked loop is not in a batch: its last stamp must not age (celeris#1170)
 			l.wakeMu.Lock()
 			if !l.acceptPaused.Load() || l.hasDriverConns.Load() ||
 				l.adoptQPending.Load() != 0 || l.detachQPending.Load() != 0 {

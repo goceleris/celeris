@@ -185,7 +185,7 @@ func (m *Manager) judgeWait(s *Stream, id uint32, w *SendWait, rest int) (waitVe
 	}
 	wt := int64(m.wrTimeout)
 	now := time.Now().UnixNano()
-	if lw := w.Loops; lw != nil && now-w.start >= wt && lw.blockedFor(now, loopStuckFor(wt)) {
+	if lw := w.Loops; lw != nil && now-w.start >= wt && lw.BlockedFor(now, loopStuckFor(wt)) {
 		m.dropWait(id)
 		w.failed = true
 		return waitExpired, 0
@@ -394,9 +394,9 @@ func (s *LoopSlot) Leave() {
 	}
 }
 
-// blockedFor reports whether some loop has been in one batch since at least d
+// BlockedFor reports whether some loop has been in one batch since at least d
 // before now.
-func (w *LoopWatch) blockedFor(now, d int64) bool {
+func (w *LoopWatch) BlockedFor(now, d int64) bool {
 	p := w.slots.Load()
 	if p == nil {
 		return false

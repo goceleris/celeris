@@ -567,16 +567,16 @@ func TestLoopWatch1170(t *testing.T) {
 	lw := NewLoopWatch()
 	a, b := lw.Slot(), lw.Slot()
 	now := time.Now().UnixNano()
-	if lw.blockedFor(now, 1) {
+	if lw.BlockedFor(now, 1) {
 		t.Fatal("idle loops read as stuck")
 	}
 	a.Enter(now - int64(time.Second))
-	if !lw.blockedFor(now, int64(500*time.Millisecond)) || lw.blockedFor(now, int64(2*time.Second)) {
+	if !lw.BlockedFor(now, int64(500*time.Millisecond)) || lw.BlockedFor(now, int64(2*time.Second)) {
 		t.Fatal("a batch of one second: stuck for 500 ms, not for 2 s")
 	}
 	a.Leave()
 	b.Enter(now)
-	if lw.blockedFor(now, int64(time.Millisecond)) {
+	if lw.BlockedFor(now, int64(time.Millisecond)) {
 		t.Fatal("a batch that has just begun, or one that ended, reads as stuck")
 	}
 	var nilSlot *LoopSlot
