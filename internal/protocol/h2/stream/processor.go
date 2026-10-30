@@ -1184,6 +1184,7 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 			newWindowSize := int32(s.Val)
 			delta := newWindowSize - oldWindowSize
 			p.manager.initialWindowSize = s.Val
+			p.manager.initWin.Store(s.Val)
 
 			for sid, stream := range p.manager.streams {
 				oldWin := stream.windowSize.Load()
@@ -2364,6 +2365,7 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 			prev := State(stream.state.Swap(int32(StateClosed)))
 			p.manager.updateActiveCount(prev, StateClosed)
 			p.manager.disarmRequestLocked(stream)
+			p.manager.dropStall(streamID)
 			stream.Cancel()
 			if stream.flags.Load()&flagAsyncRunning == 0 {
 				stream.Release()

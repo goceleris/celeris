@@ -375,8 +375,10 @@ func (c Config) WithDefaults() Config {
 // A zero means "unset" only on the first pass: once normalised is true, 0 is
 // a disabled timeout this function must leave alone, otherwise the second
 // WithDefaults (in the engine constructor) reinstates the default over an
-// explicitly disabled timeout — celeris#594. Any positive value is kept
-// verbatim on every pass, so N stays N.
+// explicitly disabled timeout — celeris#594. A positive value is kept on every
+// pass up to MaxTimeout (a hundred years, which now + timeout cannot overflow
+// with) and a larger one, math.MaxInt64 the usual way to write "never", is
+// clamped to it, so N stays N for every N below that.
 func resolveTimeout(v, def time.Duration, normalised bool) time.Duration {
 	switch {
 	case v < 0:
@@ -384,6 +386,12 @@ func resolveTimeout(v, def time.Duration, normalised bool) time.Duration {
 	case v == 0 && !normalised:
 		return def
 	default:
-		return v
+		return min(v, MaxTimeout)
 	}
 }
+
+// MaxTimeout is the longest timeout the engines keep: a hundred years. A timeout of
+// math.MaxInt64 (the common way to write "never") overflowed every `now + timeout`
+// the engines compute (a deadline in the past, due at once: celeris#889 review r8
+// F-F), and a hundred years is never in any practical sense.
+const MaxTimeout = 100 * 365 * 24 * time.Hour

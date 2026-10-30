@@ -55,6 +55,7 @@ func rdServer889(t *testing.T, eng celeris.EngineType, mutate func(*celeris.Conf
 
 // rdEvent889 is what a stream (and its connection) did, as the client saw it.
 type rdEvent889 struct {
+	id      uint32        // the stream awaitAny889 ended on
 	status  string        // :status of the first HEADERS on the stream, "" if none
 	reset   bool          // RST_STREAM on the stream
 	rst     http2.ErrCode // its code
@@ -209,9 +210,9 @@ func (c *h2raw889) serves889(id uint32) {
 // TestH2PingingClientRequestIsAnsweredAndReset889 is the pinned ping cell of
 // the previous work FLIPPED: a client that never completes its POST and sends a
 // PING every 500 ms is no longer held: the request is answered 408 and reset at
-// ReadTimeout, the conn stays and serves the next request. (The pinned cells for
-// an unread RESPONSE stay pinned until the per-stream write deadline; see
-// TestH2PingingClientHoldsAnUnfinishedStream889.)
+// ReadTimeout, the conn stays and serves the next request. (The pinned cell for
+// an unread RESPONSE was flipped the same way by the per-stream write deadline;
+// see TestH2PingingClientHoldsAnUnfinishedStream889.)
 func TestH2PingingClientRequestIsAnsweredAndReset889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		t.Run(e.name, func(t *testing.T) {
@@ -598,5 +599,48 @@ func TestH2BurstOfExpiriesIsAnsweredInOneSweep889(t *testing.T) {
 			}
 			c.serves889(uint32(1 + 2*n))
 		})
+	}
+}
+
+// awaitAny889 is await889 for several streams: it returns at the first reset or
+// end of any of them (ev.id says which), the conn ending, or d since c.t0.
+func (c *h2raw889) awaitAny889(ids []uint32, d time.Duration) rdEvent889 {
+	c.t.Helper()
+	var ev rdEvent889
+	want := map[uint32]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	_ = c.conn.SetReadDeadline(c.t0.Add(d))
+	for {
+		f, err := c.fr.ReadFrame()
+		ev.at = time.Since(c.t0)
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				ev.timeout = true
+				return ev
+			}
+			ev.connEnd = "EOF"
+			return ev
+		}
+		switch f := f.(type) {
+		case *http2.DataFrame:
+			if want[f.StreamID] {
+				ev.data += len(f.Data())
+				if f.StreamEnded() {
+					ev.id, ev.ended = f.StreamID, true
+					return ev
+				}
+			}
+		case *http2.RSTStreamFrame:
+			if want[f.StreamID] {
+				ev.id, ev.reset, ev.rst = f.StreamID, true, f.ErrCode
+				return ev
+			}
+		case *http2.GoAwayFrame:
+			ev.connEnd = "GOAWAY " + f.ErrCode.String()
+			return ev
+		}
 	}
 }

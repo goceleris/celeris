@@ -464,6 +464,7 @@ func (m *Manager) FlushOutbound(s *Stream, send OutboundSend) (finished bool) {
 	finished = last && (s.OutboundEndStream || s.outboundAbandoned)
 	send(s.ID, end, buf.Next(n))
 	m.refundOutbound(n) // celeris#893
+	m.noteReleased(s.ID, n)
 	if buf.Len() == 0 {
 		buf.Reset()
 	}
@@ -538,6 +539,7 @@ func (m *Manager) sendOrBufferLocked(s *Stream, data []byte, send OutboundSend) 
 		}
 		s.OutboundBuffer.Write(data[n:])
 		m.chargeOutbound(len(data) - n)
+		m.noteBuffered(s, len(data)-n)
 	}
 }
 
@@ -713,6 +715,7 @@ func (m *Manager) DiscardOutbound(s *Stream) {
 		m.refundOutbound(buf.Len())
 		buf.Reset()
 	}
+	m.dropStall(s.ID)
 	s.OutboundEndStream = false
 	s.outboundAbandoned = false
 }

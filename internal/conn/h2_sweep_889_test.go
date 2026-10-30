@@ -9,6 +9,8 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // H2State.Sweep (celeris#889): the engines' per-connection look at the request
@@ -536,4 +538,63 @@ func TestH2StateStaysInItsSizeClass889(t *testing.T) {
 	if got := unsafe.Sizeof(H2State{}) + 8; got > 704 {
 		t.Errorf("sizeof(H2State) + the 8-byte malloc header = %d, want at most 704 (its size class)", got)
 	}
+}
+
+// TestSweepResetsAStalledStreamWithInternalError889: a stream that holds bytes for
+// the client's window and releases less than its floor in WriteTimeout is reset
+// by the sweep with RST_STREAM(INTERNAL_ERROR), written to the connection through
+// the write queue; one that released its floor is not.
+func TestSweepResetsAStalledStreamWithInternalError889(t *testing.T) {
+	r := newSweepRig889(t, H2Config{WriteTimeout: time.Second})
+	r.written()
+	m := r.st.processor.GetManager()
+	m.UpdateConnectionWindow(1 << 20)
+	// A client with an initial window of 0: nothing is in flight when a stream stalls,
+	// so the first window is judged on what is released and not on the seed.
+	r.frames(func(fr *http2.Framer) {
+		_ = fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 0})
+	})
+	mk := func(id uint32) *stream.Stream {
+		s := m.CreateStream(id)
+		s.SetState(stream.StateHalfClosedRemote)
+		s.SetWindowSize(0)
+		s.BufferOutbound(make([]byte, 1<<20), true)
+		return s
+	}
+	a, b := mk(1), mk(3)
+	now := time.Now().UnixNano()
+	if res := r.st.Sweep(now+int64(500*time.Millisecond), r.write); res.Expired != 0 {
+		t.Fatalf("expired half a window in: %+v", res)
+	}
+	// Stream 3 releases its floor in every window; stream 1 nothing. The connection
+	// moves, so stream 1 is held for three windows (it may be queued behind its
+	// sibling) and the fourth is the verdict.
+	var res SweepResult
+	for w := 1; w <= 4; w++ {
+		b.SetWindowSize(65536)
+		m.FlushOutbound(b, func(uint32, bool, []byte) {})
+		res = r.st.Sweep(now+int64(w)*int64(1100*time.Millisecond), r.write)
+		if (w < 4) != (res.Expired == 0) {
+			t.Fatalf("window %d: %+v", w, res)
+		}
+	}
+	if res.Expired != 1 || !res.Wrote {
+		t.Fatalf("sweep after the window: %+v, want one stream expired and the conn written", res)
+	}
+	var rsts []wframe889
+	for _, f := range r.written() {
+		if f.typ == http2.FrameRSTStream {
+			rsts = append(rsts, f)
+		}
+	}
+	if len(rsts) != 1 || rsts[0].stream != 1 || rsts[0].code != http2.ErrCodeInternal {
+		t.Fatalf("frames written: %+v, want RST_STREAM(INTERNAL_ERROR) for stream 1 only", rsts)
+	}
+	if _, ok := m.GetStream(1); ok {
+		t.Fatal("stream 1 is still on the connection")
+	}
+	if _, ok := m.GetStream(3); !ok {
+		t.Fatal("stream 3, which released its floor, was taken")
+	}
+	_ = a
 }
