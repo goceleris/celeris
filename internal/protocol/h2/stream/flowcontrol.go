@@ -94,6 +94,7 @@ func (m *Manager) ReserveSendWindow(s *Stream, want int32) int32 {
 			m.notifyStreamWindow(s.ID)
 		}
 	}
+	m.creditConn(connGrant)
 	return connGrant
 }
 

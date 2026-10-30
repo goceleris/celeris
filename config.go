@@ -259,8 +259,9 @@ type Config struct {
 	// read. A request without a body has no deadline.
 	//
 	// The connection's own clock (the last read) does not close an HTTP/2
-	// connection that has a stream open whose request is whole and no response
-	// waiting for the client's flow-control window: a stream the server is
+	// connection that has a stream open whose request is whole (a response
+	// waiting for the client's flow-control window is bounded by WriteTimeout,
+	// see there, and no longer takes the exemption away): a stream the server is
 	// writing to (an SSE stream) outlives a client that sends no frame. A stream
 	// whose handler never answers is exempt for as long as it holds the stream,
 	// where an HTTP/1.1 async handler that overruns ReadTimeout is closed. When
@@ -310,7 +311,8 @@ type Config struct {
 	// OnDisconnect runs), whatever the middleware's idle deadline or the last
 	// read of the connection. A peer that reads, however slowly, and a
 	// connection with nothing queued are not closed (there is no minimum
-	// rate); -1 sets no such bound. The close comes between about 3/4
+	// rate; an HTTP/2 stream whose client lets its flow-control window run out
+	// is bounded by the minimum rate described below); -1 sets no such bound. The close comes between about 3/4
 	// and 5/4 of WriteTimeout after the peer last took a byte (its progress
 	// is sampled every quarter of WriteTimeout; a SEND completion restarts the
 	// clock at once), plus the engine's sweep interval (up to about 0.1 s on
@@ -372,10 +374,54 @@ type Config struct {
 	// last flush that took bytes there, as before the rule. The rule covers an
 	// HTTP/2 response parked on the socket too. A response that waits for the
 	// client's HTTP/2 flow-control window is not parked (nothing is queued on
-	// the socket) and WriteTimeout does not bound it on epoll: ReadTimeout and
-	// IdleTimeout do, from the client's last frame, so a client that sends a
-	// frame of any kind (a PING) at least once per ReadTimeout holds it, until
-	// per-stream deadlines are added. A request error read while a
+	// the socket); WriteTimeout bounds its stream in its own right, as a
+	// minimum rate, on the native engines: in each WriteTimeout window a stream
+	// that holds buffered bytes must have had at least 64 KiB of them (or all
+	// it held, if less) sent, released by the client's WINDOW_UPDATEs, or it is
+	// reset with RST_STREAM(INTERNAL_ERROR), as net/http resets a stream at its
+	// write deadline. There is no ceiling, where std's deadline is absolute: a
+	// stream that releases at least that on average, lagging the rate by no
+	// more than four windows' worth (surplus released in one update carries to
+	// the next windows, and the bytes in flight when the stream stalled cover its
+	// first), is not cut however long its response takes. A PING or a
+	// WINDOW_UPDATE of a byte is not progress. A client that updates in big steps
+	// (nghttp2 and curl, at half the window) is fine while the gap between its
+	// updates stays under about five WriteTimeouts: half the window divided by the
+	// rate it reads at. When the connection as a whole releases at least 64 KiB
+	// in a window, a stream that takes less (parallel downloads share the
+	// client's socket) is held while it takes half its fair share of it, and for
+	// three windows in a row when it takes less: a download queued behind its
+	// siblings' bytes in the client's socket is cut where the bytes ahead of it
+	// take longer than three WriteTimeouts to read (N streams of W bytes in flight
+	// on a link of L bytes/s: N x W / L), so a server whose clients are on slow
+	// links should set WriteTimeout to 5s or more. When the connection itself
+	// releases less than 64 KiB while it holds more, the first window is the
+	// verdict. The end of a response is given grace: a stream that holds less than
+	// 64 KiB, and has had half of it sent in the window, or any stream while the
+	// connection as a whole holds less than 64 KiB (the last bytes of the transfer
+	// are on the wire, and the grant for them can wait behind its siblings' bytes in
+	// the client's socket for more than a window), is held for three windows more
+	// and reset in the fourth if nothing moves it. A stream the client never
+	// grants is reset after 1+k windows alone, or 4+k with siblings that keep the
+	// connection moving, k being the number of whole 64 KiB in the bytes in flight
+	// when it stalled (about the peer's initial window), at most four: 1 and 4
+	// WriteTimeouts for the default 64 KiB window, 5 and 8 for a window of 256 KiB or
+	// more. When what it has left to send is under 64 KiB (the response is a
+	// little longer than the window), the bytes in flight are spent a whole floor a
+	// window, and the tail grace above follows: 5 WriteTimeouts for the default
+	// window, 6 for 128 KiB, 8 for 256 KiB or more. A one-byte WINDOW_UPDATE
+	// dribbler is reset in window max(2, 1+k): the 2nd of the default window, the
+	// 3rd of 128 KiB, the 4th of 192 KiB, the 5th of 256 KiB or more. A stream
+	// whose own window has room but whose bytes wait for the connection's is
+	// credited with what the whole connection released. While such a stream
+	// lives, ReadTimeout and IdleTimeout do not close the connection
+	// (WriteTimeout is its bound), so a silent client's unread response, and the
+	// buffer it pins, lives for up to 8 WriteTimeouts (5, with the default window)
+	// where it used to be dropped with the whole connection at ReadTimeout. A
+	// handler blocked waiting for window keeps its own, absolute, bound of
+	// WriteTimeout from the start of the wait, whatever the client reads: parallel
+	// downloads on one connection whose responses exceed the connection's 4 MiB
+	// output budget can lose the later ones to it. A request error read while a
 	// response is queued (a malformed request) puts the connection on the
 	// closing drain below, which counts each byte the client acknowledges and
 	// has no floor: a client that sends one and then takes a few bytes per
