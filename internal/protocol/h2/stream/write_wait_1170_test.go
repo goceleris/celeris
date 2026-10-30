@@ -586,3 +586,63 @@ func TestLoopWatch1170(t *testing.T) {
 		t.Fatal("the threshold is half a WriteTimeout, at least 250 ms")
 	}
 }
+
+// An idle run that begins in the tail branch has an allowance too (review r10 F3): a
+// tail window, then a window in which a sibling's last bytes move the connection, was
+// reset at once (the allowance was only set by the moving branch), where the rule before
+// celeris#1170 held it.
+func TestIdleRunThatBeginsInATailKeepsAnAllowance1170(t *testing.T) {
+	m := NewManager()
+	m.SetWriteTimeout(time.Second)
+	a := &stall{held: 10, pending: 10, connHeld: 20}
+	b := &stall{held: 10, pending: 10, connHeld: 20}
+	m.stalls = map[uint32]*stall{1: a, 3: b}
+	m.stallN.Store(2)
+	now := time.Now().UnixNano()
+	m.stallMu.Lock()
+	defer m.stallMu.Unlock()
+	h1 := m.holdsLocked(a, false, now)
+	_ = m.holdsLocked(b, false, now)
+	m.connReleased.Add(10) // b's bytes go out in window 2
+	b.released, b.pending = 10, 0
+	h2 := m.holdsLocked(a, false, now+int64(time.Second))
+	if !h1 || !h2 {
+		t.Fatalf("window 1 hold=%v, window 2 hold=%v (idle %d, allowance %d): a tail that waited one window and then saw the connection move was reset", h1, h2, a.idle, a.idleMax)
+	}
+}
+
+// The allowance of an idle run is the largest the run has seen, within the cap
+// (review r10 F3): a fast first window (the connection released a lot at once) must not
+// fix a small allowance for the whole run.
+func TestIdleAllowanceIsTheLargestOfTheRun1170(t *testing.T) {
+	run := func(r1, r2 int64) int {
+		m := NewManager()
+		m.SetWriteTimeout(time.Second)
+		m.connHigh.Store(16 << 20)
+		m.connectionWindow = 0 // 16 MiB in flight
+		st := &stall{held: 1 << 20, pending: 1 << 20, connHeld: 8 << 20}
+		other := &stall{held: 1 << 20, pending: 1 << 20, connHeld: 8 << 20}
+		m.stalls = map[uint32]*stall{1: st, 3: other}
+		m.stallN.Store(2)
+		now := time.Now().UnixNano()
+		m.stallMu.Lock()
+		defer m.stallMu.Unlock()
+		for w := 1; w <= 60; w++ {
+			r := r2
+			if w == 1 {
+				r = r1
+			}
+			m.connReleased.Add(r)
+			now += int64(time.Second)
+			if !m.holdsLocked(st, false, now) {
+				return w
+			}
+		}
+		return 0
+	}
+	steady := run(1<<20, 1<<20)
+	fast := run(4<<20, 1<<20) // the run begins in a window in which 4 MiB were released
+	if fast != steady {
+		t.Fatalf("reset in window %d after a fast first window, %d when steady: the first window fixed the allowance", fast, steady)
+	}
+}
