@@ -237,48 +237,55 @@ func TestStalledWorkerDoesNotCutAConnWithAStagedSend1173(t *testing.T) {
 	if err := fr.WriteSettings(); err != nil {
 		t.Fatal(err)
 	}
-	var hb bytes.Buffer
-	enc := hpack.NewEncoder(&hb)
-	for _, f := range [][2]string{{":method", "GET"}, {":scheme", "http"}, {":path", "/gate"}, {":authority", "x"}} {
-		_ = enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
-	}
-	if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: hb.Bytes(), EndStream: true, EndHeaders: true}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-g.started:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the handler never ran")
-	}
-	armed.Store(true)
-	g.gate <- struct{}{} // the handler writes its response: the worker drains it and stalls
-
-	gotResponse, gotAck := false, false
-	pinged := false
-	for !gotAck {
-		f, err := fr.ReadFrame()
-		if err != nil {
-			t.Fatalf("celeris#1173: the conn ended (%v) after a worker stall of %v in the iteration that staged the response, the peer reading normally "+
-				"(response seen: %v, PING sent: %v)", err, stallDuration1173, gotResponse, pinged)
+	// A response is not always drained through the write queue (a handler's
+	// write can go out inline), so streams go on until one has been drained
+	// with the stall injected: the stall is the one thing the test must have
+	// seen. Each stream's response and a PING after it must come back.
+	const maxStreams = 20
+	for i := 0; i < maxStreams && stalls.Load() == 0; i++ {
+		id := uint32(2*i + 1)
+		var hb bytes.Buffer
+		enc := hpack.NewEncoder(&hb)
+		for _, f := range [][2]string{{":method", "GET"}, {":scheme", "http"}, {":path", "/gate"}, {":authority", "x"}} {
+			_ = enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
 		}
-		switch f := f.(type) {
-		case *http2.DataFrame:
-			if f.StreamEnded() && !pinged {
-				gotResponse = true
-				// The conn must still be alive: a PING goes round.
-				if err := fr.WritePing(false, [8]byte{1, 2, 3, 4, 5, 6, 7, 8}); err != nil {
-					t.Fatalf("PING: %v", err)
-				}
-				pinged = true
+		if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: hb.Bytes(), EndStream: true, EndHeaders: true}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-g.started:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("stream %d: the handler never ran", id)
+		}
+		armed.Store(true)
+		g.gate <- struct{}{} // the handler writes its response: the worker drains it and stalls
+
+		gotResponse, gotAck, pinged := false, false, false
+		for !gotAck {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				t.Fatalf("celeris#1173: the conn ended (%v) on stream %d, after a worker stall of %v in the iteration that staged the response (injected: %d), "+
+					"the peer reading normally (response seen: %v, PING sent: %v)", err, id, stallDuration1173, stalls.Load(), gotResponse, pinged)
 			}
-		case *http2.PingFrame:
-			if f.IsAck() {
-				gotAck = true
+			switch f := f.(type) {
+			case *http2.DataFrame:
+				if f.StreamEnded() && !pinged {
+					gotResponse = true
+					// The conn must still be alive: a PING goes round.
+					if err := fr.WritePing(false, [8]byte{1, 2, 3, 4, 5, 6, 7, 8}); err != nil {
+						t.Fatalf("PING: %v", err)
+					}
+					pinged = true
+				}
+			case *http2.PingFrame:
+				if f.IsAck() {
+					gotAck = true
+				}
 			}
 		}
 	}
 	if stalls.Load() != 1 {
-		t.Fatalf("apparatus: the stall was injected %d times, want 1", stalls.Load())
+		t.Fatalf("apparatus: the stall was injected %d times in %d streams, want 1", stalls.Load(), maxStreams)
 	}
 }
 
