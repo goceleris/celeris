@@ -130,10 +130,10 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	// time.Now() vDSO. Falls back to time.Now() for synthetic / std-engine
 	// streams that didn't go through populateCachedStream.
 	if s.StartTimeNs != 0 {
-		// Defer the time.Unix conversion: store the raw ns and only
-		// materialize a time.Time when c.StartTime() is actually called
-		// (rare — the per-request hot path only needs ns for the duration
-		// computation in recoverAndRelease).
+		// Store the raw stamp (internal/mono's clock) and only materialize a
+		// time.Time (mono.Time) when c.StartTime() is actually called (rare — the
+		// per-request hot path only needs the stamp for the duration computation
+		// in recoverAndRelease).
 		c.startTimeNs = s.StartTimeNs
 	} else {
 		t := time.Now()
@@ -469,9 +469,9 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 		if status == 0 {
 			status = 200
 		}
-		// Use the raw int64 ns. time.Since on a time.Unix-constructed
-		// time.Time falls back to wall-clock subtraction; this saves the
-		// detour through time.Time.Sub.
+		// Use the raw stamp: the difference of two readings of internal/mono's
+		// clock, which a step of the wall clock does not move (celeris#1178).
+		// This saves the detour through a time.Time.
 		duration := time.Duration(mono.Now() - c.startTimeNs)
 		a.server.collector.RecordRequestSharded(uint32(c.workerID), duration, status)
 	}

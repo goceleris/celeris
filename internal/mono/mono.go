@@ -63,6 +63,13 @@
 // one to a function that takes a stamp. A statement that mixes a drainclock or
 // deferlinger reading with one of this package fails too.
 //
+// The scan has no types, so it cannot see a wall read written as time.Since(x) of
+// a variable x that holds a time.Time without a monotonic reading (time.Unix,
+// time.Date, Round(0)); time.Since(time.Date(...)) written out is seen. The skew
+// canary is the backstop for that form: CI runs the engines' stepped-clock test
+// under it, which fails ten to fourteen times on a loop-thread clock read that is
+// not routed, and the canary subsets.
+//
 // # The skew canary (test builds only)
 //
 // The seam cannot step the real clock, so it cannot see a site that still reads

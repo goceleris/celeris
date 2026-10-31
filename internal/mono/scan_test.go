@@ -133,6 +133,20 @@ func wallWhat(c *ast.CallExpr) string {
 	if id, ok := se.X.(*ast.Ident); ok && id.Name == "time" && timeFuncs[name] && len(c.Args) > 0 {
 		return "time." + name
 	}
+	// time.Since(time.Date(...)) and time.Since(time.Unix(...)): a duration since a
+	// time.Time that has no monotonic reading is a wall-clock subtraction, a wall
+	// read with no Unix* call in it. (A variable holding such a time, as in
+	// time.Since(epoch), is not seen: no types here. The skew canary is the
+	// backstop for that form, and the engines' stepped-clock tests under it.)
+	if id, ok := se.X.(*ast.Ident); ok && id.Name == "time" && (name == "Since" || name == "Until") && len(c.Args) == 1 {
+		if in, ok := c.Args[0].(*ast.CallExpr); ok {
+			if ise, ok := in.Fun.(*ast.SelectorExpr); ok {
+				if iid, ok := ise.X.(*ast.Ident); ok && iid.Name == "time" && (ise.Sel.Name == "Date" || timeFuncs[ise.Sel.Name]) {
+					return "time." + name + "(wall time)"
+				}
+			}
+		}
+	}
 	switch {
 	case wallMethods[name] && len(c.Args) == 0:
 		return "." + name
@@ -427,6 +441,7 @@ var nowNano = func() int64 { return time.Now().UnixNano() }
 type W struct{ lastActivity int64 }
 func (w *W) a() { w.lastActivity = time.Now().UnixNano(); _ = time.Now().Unix(); _ = time.Unix(0, 5); _ = time.Now().Round(0).UTC().Local() }
 func b(t time.Time) { _ = t.UnixMilli(); _ = t.In(nil); _ = t.Round(time.Second) }
+func f() int64 { return int64(time.Since(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC))) + int64(time.Since(epoch)) }
 func c() { _ = mono.Now() + drainclock.Now() }
 func d() { x := mono.Now(); y := drainclock.Now(); _, _ = x, y }
 func e() int64 { return drainclock.At(time.Time{}) - mono.FromTime(time.Time{}) }
@@ -444,6 +459,7 @@ func e() int64 { return drainclock.At(time.Time{}) - mono.FromTime(time.Time{}) 
 		{"p.go", "W.a", ".UTC"}:                                 0, // placeholder removed below
 		{"p.go", "b", ".UnixMilli"}:                             1,
 		{"p.go", "b", ".In"}:                                    1,
+		{"p.go", "f", "time.Since(wall time)"}:                  1,
 		{"p.go", "c", "mixes mono with drainclock/deferlinger"}: 1,
 		{"p.go", "e", "mixes mono with drainclock/deferlinger"}: 1,
 	}

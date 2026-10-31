@@ -73,42 +73,53 @@ func TestRequestLatencyIgnoresAStepOfTheWallClock1178(t *testing.T) {
 	}
 }
 
-// The latency of the std and HTTP/2 fallback (a stream no engine stamped:
-// handler.go stamps it with mono.FromTime of the time.Now() it takes) is the same.
-func TestFallbackLatencyIgnoresAStepOfTheWallClock1178(t *testing.T) {
-	var st mono.Stepper
-	defer mono.SetStepper(&st)()
+// The latency the collector records (handler.go: mono.Now() - c.startTimeNs) is the
+// request's, whichever way the request was stamped: by an engine (Stream.StartTimeNs)
+// or by the fallback every HTTP/2 and std-engine request takes (mono.FromTime of a
+// time.Now() the handler takes). A step of the wall clock while the handler runs is
+// not part of it. The detach snapshot above is the detached path; this is the plain
+// one. (The fallback's c.startTime is a real time.Now(), so the context's own elapsed
+// time (time.Since) never counted a step; the collector's duration is what the flip
+// changes, and it is red against the wall clock.)
+func TestCollectorLatencyIgnoresAStepOfTheWallClock1178(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stamped bool
+	}{{"stamped-by-an-engine", true}, {"fallback", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var st mono.Stepper
+			defer mono.SetStepper(&st)()
 
-	srv := New(Config{})
-	got := make(chan time.Duration, 1)
-	srv.GET("/d", func(c *Context) error {
-		c.OnRelease(func() {
-			if snap := c.detachSnap; snap != nil {
-				got <- snap.elapsed
-			} else {
-				got <- -1
+			srv := New(Config{})
+			srv.GET("/p", func(c *Context) error {
+				time.Sleep(20 * time.Millisecond)
+				st.Add(75 * time.Second) // the step, while the handler runs
+				return nil
+			})
+			adapter := &routerAdapter{server: srv}
+			s, _ := newTestStream("GET", "/p")
+			defer s.Release()
+			if tc.stamped {
+				s.StartTimeNs = mono.Now()
+			}
+			before := srv.Collector().Snapshot()
+			if err := adapter.HandleStream(context.Background(), s); err != nil {
+				t.Fatal(err)
+			}
+			snap := srv.Collector().Snapshot()
+			if snap.RequestsTotal != before.RequestsTotal+1 {
+				t.Fatalf("the collector recorded %d requests, want 1", snap.RequestsTotal-before.RequestsTotal)
+			}
+			// The request took about 20 ms: its bucket's upper bound is well under a
+			// second. 75 s lands in the last bucket (bound 5 s, the overflow).
+			for i, n := range snap.LatencyBuckets {
+				if n <= before.LatencyBuckets[i] {
+					continue
+				}
+				if i >= len(snap.BucketBounds) || snap.BucketBounds[i] >= 1 {
+					t.Errorf("the request was recorded in latency bucket %d (bounds %v): a step of 75 s is not request time", i, snap.BucketBounds)
+				}
 			}
 		})
-		done := c.Detach()
-		go func() {
-			time.Sleep(20 * time.Millisecond)
-			st.Add(75 * time.Second)
-			done()
-		}()
-		return nil
-	})
-	adapter := &routerAdapter{server: srv}
-	s, _ := newTestStream("GET", "/d") // StartTimeNs 0: the fallback
-	defer s.Release()
-	if err := adapter.HandleStream(context.Background(), s); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case el := <-got:
-		if el < 20*time.Millisecond || el > 5*time.Second {
-			t.Errorf("the fallback's elapsed = %v, want about 20 ms", el)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the Context was not released")
 	}
 }
