@@ -396,18 +396,23 @@ type Config struct {
 	// what is in flight on the connection at the rate the connection moves (the
 	// bytes sent and not yet granted back at the connection level over what the
 	// connection released in the window), at least three and at most twelve. The
-	// connection counts as moving through windows in which it released nothing for
-	// as long as the bank covers (four): a client that returns window in big steps
-	// leaves some windows with neither a grant nor a send. A download queued behind
-	// its siblings' bytes in the client's socket is cut where the bytes ahead of it
-	// take longer than that to read (N streams of W bytes in flight on a link of L
-	// bytes/s: N x W / L over about 16 WriteTimeouts), so a server whose clients are
-	// on slow links should set WriteTimeout to 2s or more, and 5s where the links
-	// are slower than a megabyte a second (measured with Go's HTTP/2 client: 4 x
-	// 8 MiB on 1 MB/s and 8 x 8 MiB on 2 MB/s complete at 1s, 2s and 5s). A stream
-	// that is paused, or dribbles one byte at a time, beside siblings that keep the
-	// connection moving is held for as long: up to 17 windows (13 for the default
-	// window), against 8 when little is in flight. When the connection itself
+	// connection counts as moving for four windows after its other streams last
+	// released 64 KiB, so a connection whose other streams release a floor only once
+	// in four windows keeps its stalled streams for as long as the allowance lasts: a
+	// client that returns window in big steps leaves some windows with neither a grant
+	// nor a send. Those windows count as idle ones, so the bound below holds. A
+	// download queued behind its siblings' bytes in the client's socket is cut where
+	// the bytes ahead of it take longer than that to read (N streams of W bytes in
+	// flight on a link of L bytes/s: N x W / L over about 16 WriteTimeouts, the cut
+	// beginning between 16.8 and 21), so a server whose clients are on slow links
+	// should set WriteTimeout to 2s or more, and 5s where the links are slower than a
+	// megabyte a second. Measured with Go's HTTP/2 client on epoll and adaptive: 4 x
+	// 8 MiB on 1 MB/s and 8 x 8 MiB on 2 MB/s complete at 1s, 2s and 5s, with about one
+	// window of headroom; on io_uring the engine's own send clock closes such a
+	// connection at 1s, so io_uring is measured from 5s. A stream that is paused, or
+	// dribbles one byte at a time, beside siblings that keep the connection moving is
+	// held for as long: up to 17 windows in all (13 for the default window), against 8
+	// when little is in flight. When the connection itself
 	// releases less than 64 KiB while it holds more, for more windows than the
 	// bank covers, the verdict is the first window that does not move. The end of a response is given grace: a stream that holds less than
 	// 64 KiB, and has had half of it sent in the window, or any stream while the
@@ -450,8 +455,10 @@ type Config struct {
 	// logs the reason of each such reset at Debug level (rate, or loop-blocked). A
 	// client that stops reading altogether for a WriteTimeout (a pause of 1s at
 	// WriteTimeout 1s) loses its connection to the engines' write clock on epoll and
-	// io_uring alike, with or without this rule; use 2s or more for clients that
-	// pause. A request error read while a
+	// io_uring alike, with or without this rule, and on io_uring so does a client that
+	// reads at 1 MB/s at WriteTimeout 1s (a send that does not complete for a
+	// WriteTimeout); use 2s or more for clients that pause, 5s for io_uring on slow
+	// links. A request error read while a
 	// response is queued (a malformed request) puts the connection on the
 	// closing drain below, which counts each byte the client acknowledges and
 	// has no floor: a client that sends one and then takes a few bytes per

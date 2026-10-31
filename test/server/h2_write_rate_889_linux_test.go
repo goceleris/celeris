@@ -266,8 +266,8 @@ func TestH2ParallelDownloadsSharingASlowLinkAreNotCut889(t *testing.T) {
 // stop) the allowance is the queue the sibling's 2 MiB leaves in flight over its rate,
 // and the stream is reset when that is read and the siblings have been quiet for the
 // horizon: measured 12.2 to 13.8 s here (the client sees the RST behind the data it
-// is still reading). The bound is 4 + 12 + 1 windows plus the horizon after the sibling
-// ends, so [3.5 s, 18 s].
+// is still reading). The bound is 4 + 12 + 1 windows in all (the windows the horizon
+// holds count inside the allowance), so [3.5 s, 18 s].
 func TestH2PausedAndDribbledStreamsOnAHealthyConnAreBounded889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		for _, mode := range []string{"paused", "dribbled"} {
