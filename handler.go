@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/validation"
 )
@@ -137,7 +138,7 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	} else {
 		t := time.Now()
 		c.startTime = t
-		c.startTimeNs = t.UnixNano()
+		c.startTimeNs = mono.FromTime(t) // t is the clock read above: no second read
 	}
 	c.trustedNets = a.server.trustedNets
 
@@ -471,7 +472,7 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 		// Use the raw int64 ns. time.Since on a time.Unix-constructed
 		// time.Time falls back to wall-clock subtraction; this saves the
 		// detour through time.Time.Sub.
-		duration := time.Duration(time.Now().UnixNano() - c.startTimeNs)
+		duration := time.Duration(mono.Now() - c.startTimeNs)
 		a.server.collector.RecordRequestSharded(uint32(c.workerID), duration, status)
 	}
 	releaseContext(c)

@@ -12,17 +12,13 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/mono"
 	h1 "github.com/goceleris/celeris/internal/protocol/h1"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/validation"
 )
-
-// timeNow is a package-level alias so tests can stub the clock when
-// exercising the read-header-deadline path. Production = time.Now.
-var timeNow = time.Now
 
 func init() {
 	// Wire the H1-package helpers so internal/protocol/h2/stream can lazily
@@ -94,7 +90,7 @@ func (s *H1State) ArmHeaderDeadline() {
 		// Already armed; don't reset (slowloris-bypass guard).
 		return
 	}
-	s.HeaderDeadlineNs.Store(timeNow().UnixNano() + s.ReadHeaderTimeoutNs)
+	s.HeaderDeadlineNs.Store(mono.Now() + s.ReadHeaderTimeoutNs)
 	// Notify the engine so it can submit a kernel-enforced timer
 	// (iouring IORING_OP_TIMEOUT SQE) — see field docstring.
 	if s.OnHeaderDeadlineArmed != nil {
@@ -123,7 +119,7 @@ func (s *H1State) ArmHeaderDeadlineAt(notAfter int64) {
 	if s.HeaderDeadlineNs.Load() != 0 {
 		return
 	}
-	dl := timeNow().UnixNano() + s.ReadHeaderTimeoutNs
+	dl := mono.Now() + s.ReadHeaderTimeoutNs
 	if notAfter > 0 && notAfter < dl {
 		dl = notAfter
 	}
@@ -315,7 +311,7 @@ type H1State struct {
 	WorkerID    int32
 	WorkerIDSet bool
 
-	// NowNs is the engine's worker-local cached time.Now().UnixNano()
+	// NowNs is the engine's worker-local cached mono.Now()
 	// for the most recent recv. The engine writes it just before calling
 	// ProcessH1; populateCachedStream copies it to the stream so the
 	// handler can record start time without a per-request time.Now() vDSO.
@@ -1591,7 +1587,11 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 			return state.PauseRecv, state.ResumeRecv
 		}
 		s.OnWSSetIdleDeadline = func(ns int64) {
-			state.IdleDeadlineNs.Store(ns)
+			// ns is a wall-clock Unix time in nanoseconds, the contract of
+			// Context.SetWSIdleDeadline; the engines compare the deadline with the
+			// clock of their stamps (internal/mono). FromWall keeps the time left and
+			// passes 0 (unset) and 1 (expired, SSE) through (celeris#1178).
+			state.IdleDeadlineNs.Store(mono.FromWall(ns))
 		}
 	} else {
 		// Reset per-request fields. The stream is reused, so clear state
