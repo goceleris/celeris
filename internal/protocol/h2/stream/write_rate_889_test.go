@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The refinements of the minimum rate that keep it from cutting a slow reader that
@@ -26,7 +28,7 @@ func windowEnd889(m *Manager, start int64, n int) []uint32 {
 func TestWriteSurplusCarriesOverUpToTheBank889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	s := stalled889(m, 1, 8<<20)
-	start := time.Now().UnixNano()
+	start := mono.Now()
 	s.SetWindowSize(3 << 20) // 3 MiB at once, in window 1
 	m.FlushOutbound(s, discard889)
 	// Window 1 is held on the release, the bank is capped at writeBankWindows floors:
@@ -59,7 +61,7 @@ func TestWriteAverageRateIsTheGuarantee889(t *testing.T) {
 			_, m, _ := wdSetup889(t)
 			m.initWin.Store(1 << 20) // the stream stalls with a megabyte in flight: a full seed
 			s := stalled889(m, 1, 64<<20)
-			start := time.Now().UnixNano()
+			start := mono.Now()
 			expiredAt := 0
 			for w := 1; w <= 200 && expiredAt == 0; w++ {
 				if (w-1)%tc.every == tc.every-1 {
@@ -98,7 +100,7 @@ func TestWriteSeedCoversTheFirstWindow889(t *testing.T) {
 			_, m, _ := wdSetup889(t)
 			m.initWin.Store(tc.initWin)
 			stalled889(m, 1, 8<<20) // window 0: the stream sent initWin bytes
-			start := time.Now().UnixNano()
+			start := mono.Now()
 			held := 0
 			for w := 1; w <= 10; w++ {
 				if out := windowEnd889(m, start, w); len(out) != 0 {
@@ -120,7 +122,7 @@ func TestWriteDribblerIsResetWithinTwoWindowsOfADefaultWindow889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	m.initWin.Store(65535)
 	s := stalled889(m, 1, 4<<20)
-	start := time.Now().UnixNano()
+	start := mono.Now()
 	n := 0
 	for w := 1; w <= 5 && n == 0; w++ {
 		for i := 0; i < 10; i++ { // 10 one-byte grants a window
@@ -149,7 +151,7 @@ func TestWriteIdleStreamOnAHealthyConnIsBounded889(t *testing.T) {
 	}
 	t.Run("zero-release-is-held-K-windows", func(t *testing.T) {
 		m, a, _ := setup(t)
-		start := time.Now().UnixNano()
+		start := mono.Now()
 		for w := 1; w <= writeIdleWindows+1; w++ {
 			a.SetWindowSize(70000)
 			m.FlushOutbound(a, discard889) // the sibling moves the connection above the floor
@@ -164,7 +166,7 @@ func TestWriteIdleStreamOnAHealthyConnIsBounded889(t *testing.T) {
 	})
 	t.Run("a-dribble-is-no-share", func(t *testing.T) {
 		m, a, b := setup(t)
-		start := time.Now().UnixNano()
+		start := mono.Now()
 		for w := 1; w <= writeIdleWindows+1; w++ {
 			a.SetWindowSize(70000)
 			m.FlushOutbound(a, discard889)
@@ -180,7 +182,7 @@ func TestWriteIdleStreamOnAHealthyConnIsBounded889(t *testing.T) {
 	})
 	t.Run("its-share-holds-it-for-ever", func(t *testing.T) {
 		m, a, b := setup(t)
-		start := time.Now().UnixNano()
+		start := mono.Now()
 		for w := 1; w <= 30; w++ {
 			a.SetWindowSize(40000)
 			m.FlushOutbound(a, discard889)
@@ -193,7 +195,7 @@ func TestWriteIdleStreamOnAHealthyConnIsBounded889(t *testing.T) {
 	})
 	t.Run("a-slow-connection-is-the-verdict-at-once", func(t *testing.T) {
 		m, a, b := setup(t)
-		start := time.Now().UnixNano()
+		start := mono.Now()
 		a.SetWindowSize(20000)
 		m.FlushOutbound(a, discard889)
 		b.SetWindowSize(20000)
@@ -215,7 +217,7 @@ func TestExpiredWritesJudgesTheRecordItFoundDue889(t *testing.T) {
 
 	m.mu.Lock() // hold the read of the streams' windows
 	done := make(chan []uint32)
-	go func() { done <- m.ExpiredWrites(time.Now().UnixNano(), make([]uint32, 0, 32)) }()
+	go func() { done <- m.ExpiredWrites(mono.Now(), make([]uint32, 0, 32)) }()
 	time.Sleep(50 * time.Millisecond)
 	// Meanwhile a pool goroutine's flush takes the whole buffer and it buffers a new tail.
 	s.SetWindowSize(1 << 20)
@@ -249,10 +251,10 @@ func TestHugeTimeoutsDoNotOverflow889(t *testing.T) {
 		_, m, _ := wdSetup889(t)
 		m.SetWriteTimeout(never)
 		stalled889(m, 1, 5000)
-		if h := m.NextWriteDeadline(); h <= time.Now().UnixNano() {
+		if h := m.NextWriteDeadline(); h <= mono.Now() {
 			t.Fatalf("hint %d is not in the future", h)
 		}
-		if out := m.ExpiredWrites(time.Now().UnixNano()+int64(time.Hour), make([]uint32, 0, 4)); len(out) != 0 {
+		if out := m.ExpiredWrites(mono.Now()+int64(time.Hour), make([]uint32, 0, 4)); len(out) != 0 {
 			t.Fatalf("expired %v an hour in", out)
 		}
 	})
@@ -261,11 +263,11 @@ func TestHugeTimeoutsDoNotOverflow889(t *testing.T) {
 		m.SetRequestTimeout(never)
 		s := m.CreateStream(1)
 		s.SetState(StateOpen)
-		m.ArmRequest(s, time.Now().UnixNano())
-		if h := m.NextRequestDeadline(); h <= time.Now().UnixNano() {
+		m.ArmRequest(s, mono.Now())
+		if h := m.NextRequestDeadline(); h <= mono.Now() {
 			t.Fatalf("request deadline hint %d is not in the future", h)
 		}
-		if out := m.ExpiredRequests(time.Now().UnixNano()+int64(time.Hour), make([]uint32, 0, 4)); len(out) != 0 {
+		if out := m.ExpiredRequests(mono.Now()+int64(time.Hour), make([]uint32, 0, 4)); len(out) != 0 {
 			t.Fatalf("expired %v an hour in", out)
 		}
 	})
@@ -283,7 +285,7 @@ func TestHugeTimeoutsDoNotOverflow889(t *testing.T) {
 func TestWriteFloorFollowsWhatTheStreamHolds889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	s := stalled889(m, 1, 100000) // held 100000: floor 65536
-	start := time.Now().UnixNano()
+	start := mono.Now()
 	s.SetWindowSize(70000) // 70000 released, 30000 left
 	m.FlushOutbound(s, discard889)
 	if out := windowEnd889(m, start, 1); len(out) != 0 {
@@ -309,14 +311,14 @@ func TestWriteTailGraceIsBounded889(t *testing.T) {
 	t.Run("nothing-released-is-held-for-the-idle-windows", func(t *testing.T) {
 		_, m, _ := wdSetup889(t)
 		stalled889(m, 1, 1000)
-		if w := firstReset889(m, 1, time.Now().UnixNano(), 10, nil); w != writeIdleWindows+1 {
+		if w := firstReset889(m, 1, mono.Now(), 10, nil); w != writeIdleWindows+1 {
 			t.Fatalf("reset in window %d, want %d (held for %d)", w, writeIdleWindows+1, writeIdleWindows)
 		}
 	})
 	t.Run("half-every-window-is-bounded", func(t *testing.T) {
 		_, m, _ := wdSetup889(t)
 		s := stalled889(m, 1, 1000)
-		start := time.Now().UnixNano()
+		start := mono.Now()
 		for w := 1; w <= writeIdleWindows+1; w++ {
 			s.SetWindowSize(500) // half of the 1000 held at the window's start...
 			m.FlushOutbound(s, discard889)
@@ -349,7 +351,7 @@ func TestWriteConnTailGrace889(t *testing.T) {
 				stalled889(m, uint32(1+2*i), 100)
 				time.Sleep(2 * time.Millisecond) // a slow runner (the coverage build): the records are not armed in one instant
 			}
-			start := time.Now().UnixNano() // after the records, so that window 1 is judged for all of them
+			start := mono.Now() // after the records, so that window 1 is judged for all of them
 			c := m.CreateStream(99)
 			c.SetState(StateOpen)
 			c.SetWindowSize(1 << 20)
@@ -402,7 +404,7 @@ func TestWriteUnreadStreamBounds889(t *testing.T) {
 			_, m, _ := wdSetup889(t)
 			m.initWin.Store(tc.initWin)
 			stalled889(m, 1, 8<<20)
-			if w := firstReset889(m, 1, time.Now().UnixNano(), 20, nil); w != tc.alone {
+			if w := firstReset889(m, 1, mono.Now(), 20, nil); w != tc.alone {
 				t.Fatalf("alone: reset in window %d, want %d", w, tc.alone)
 			}
 			_, m2, _ := wdSetup889(t)
@@ -413,7 +415,7 @@ func TestWriteUnreadStreamBounds889(t *testing.T) {
 			a.SetWindowSize(0)
 			a.BufferOutbound(make([]byte, 64<<20), true)
 			_ = b
-			w := firstReset889(m2, 1, time.Now().UnixNano(), 20, func(int) { a.SetWindowSize(70000); m2.FlushOutbound(a, discard889) })
+			w := firstReset889(m2, 1, mono.Now(), 20, func(int) { a.SetWindowSize(70000); m2.FlushOutbound(a, discard889) })
 			if w != tc.sib {
 				t.Fatalf("with a sibling that moves the connection: reset in window %d, want %d", w, tc.sib)
 			}
@@ -433,7 +435,7 @@ func TestWriteDribblerBounds889(t *testing.T) {
 			_, m, _ := wdSetup889(t)
 			m.initWin.Store(tc.initWin)
 			s := stalled889(m, 1, 8<<20)
-			w := firstReset889(m, 1, time.Now().UnixNano(), 20, func(int) {
+			w := firstReset889(m, 1, mono.Now(), 20, func(int) {
 				for i := 0; i < 10; i++ {
 					s.SetWindowSize(1)
 					m.FlushOutbound(s, discard889)
@@ -458,7 +460,7 @@ func TestWriteIdleCountRestarts889(t *testing.T) {
 	move := func(m *Manager, a *Stream) { a.SetWindowSize(70000); m.FlushOutbound(a, discard889) }
 	t.Run("share", func(t *testing.T) {
 		m, a, b := setup(t)
-		got := firstReset889(m, 1, time.Now().UnixNano(), 20, func(w int) {
+		got := firstReset889(m, 1, mono.Now(), 20, func(w int) {
 			move(m, a)
 			if w == 2 { // one window in which it takes its share
 				b.SetWindowSize(20000)
@@ -471,7 +473,7 @@ func TestWriteIdleCountRestarts889(t *testing.T) {
 	})
 	t.Run("floor", func(t *testing.T) {
 		m, a, b := setup(t)
-		got := firstReset889(m, 1, time.Now().UnixNano(), 20, func(w int) {
+		got := firstReset889(m, 1, mono.Now(), 20, func(w int) {
 			move(m, a)
 			if w == 2 {
 				b.SetWindowSize(70000)
@@ -484,7 +486,7 @@ func TestWriteIdleCountRestarts889(t *testing.T) {
 	})
 	t.Run("starved", func(t *testing.T) {
 		m, a, b := setup(t)
-		got := firstReset889(m, 1, time.Now().UnixNano(), 20, func(w int) {
+		got := firstReset889(m, 1, mono.Now(), 20, func(w int) {
 			if w == 3 { // the conn window is shut and b's own has room: starved; a sibling takes the grant
 				atomic.StoreInt32(&m.connectionWindow, 0)
 				m.connHigh.Store(0) // nothing in flight at the connection level (the allowance has its own tests)
@@ -513,7 +515,7 @@ func TestWriteShareScalesWithTheStreamsAndHalves889(t *testing.T) {
 		for i := 2; i < n; i++ {
 			stalled889(m, uint32(1+2*i), 64<<20)
 		}
-		return firstReset889(m, 1, time.Now().UnixNano(), 12, func(int) {
+		return firstReset889(m, 1, mono.Now(), 12, func(int) {
 			a.SetWindowSize(70000)
 			m.FlushOutbound(a, discard889)
 			b.SetWindowSize(int32(release))
@@ -545,7 +547,7 @@ func TestWriteSeedIsWhatIsInFlight889(t *testing.T) {
 	s.SetWindowSize(1<<20 - 100000) // 100000 bytes sent, not granted back
 	s.BufferOutbound(make([]byte, 8<<20), true)
 	// 100000 covers window 1 (above the floor) and not window 2.
-	if w := firstReset889(m, 1, time.Now().UnixNano(), 10, nil); w != 2 {
+	if w := firstReset889(m, 1, mono.Now(), 10, nil); w != 2 {
 		t.Fatalf("reset in window %d, want 2: the seed is what is in flight, not the initial window", w)
 	}
 }
@@ -572,7 +574,7 @@ func TestWriteBankIsSpentByAShareWindow889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	b := stalled889(m, 1, 64<<20)
 	a := stalled889(m, 3, 64<<20)
-	start := time.Now().UnixNano()
+	start := mono.Now()
 	// Window 1: b releases 95536 (above the floor: 30000 banked) and a moves the conn.
 	b.SetWindowSize(95536)
 	m.FlushOutbound(b, discard889)
@@ -661,7 +663,7 @@ func TestWriteUnreadSmallRemainderBounds889(t *testing.T) {
 				_, m, _ := wdSetup889(t)
 				m.initWin.Store(tc.initWin)
 				stalled889(m, 1, held)
-				if w := firstReset889(m, 1, time.Now().UnixNano(), 40, nil); w != tc.want {
+				if w := firstReset889(m, 1, mono.Now(), 40, nil); w != tc.want {
 					t.Fatalf("reset in window %d, want %d (0 means not within 40)", w, tc.want)
 				}
 			})
@@ -677,7 +679,7 @@ func TestWriteBankSurvivesASmallRenewal889(t *testing.T) {
 		t.Run(order, func(t *testing.T) {
 			_, m, _ := wdSetup889(t)
 			s := stalled889(m, 1, 320<<10)
-			start := time.Now().UnixNano()
+			start := mono.Now()
 			s.SetWindowSize(312 << 10)
 			m.FlushOutbound(s, discard889)
 			if order == "buffer-before-renewal" {
@@ -701,7 +703,7 @@ func TestWriteDribblerWithASmallRestSpendsItsBank889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	m.initWin.Store(1 << 20) // 256 KiB of bank
 	s := stalled889(m, 1, 1000)
-	got := firstReset889(m, 1, time.Now().UnixNano(), 40, func(int) {
+	got := firstReset889(m, 1, mono.Now(), 40, func(int) {
 		s.SetWindowSize(1)
 		m.FlushOutbound(s, discard889)
 		s.BufferOutbound([]byte{0}, true)
@@ -720,7 +722,7 @@ func TestWriteBankIsNotADebt889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	m.initWin.Store(20000)
 	s := stalled889(m, 1, 1000)
-	got := firstReset889(m, 1, time.Now().UnixNano(), 12, func(w int) {
+	got := firstReset889(m, 1, mono.Now(), 12, func(w int) {
 		if w == 2 {
 			s.BufferOutbound(make([]byte, 1<<20), true)
 			s.SetWindowSize(135000)
@@ -743,7 +745,7 @@ func TestWriteSmallConnShareHoldClearsIdle889(t *testing.T) {
 	c := m.CreateStream(99)
 	c.SetState(StateOpen)
 	c.SetWindowSize(1 << 30)
-	start := time.Now().UnixNano()
+	start := mono.Now()
 	got := firstReset889(m, 1, start, 12, func(int) {
 		a.SetWindowSize(3000) // more than its share (10000 / (2 x 2)), less than half of what it holds
 		m.FlushOutbound(a, discard889)

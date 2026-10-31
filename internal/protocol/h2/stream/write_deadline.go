@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The per-stream write deadline (celeris#889, D2).
@@ -110,7 +112,7 @@ func clampTimeout(d time.Duration) time.Duration {
 
 // stall is the record of a stream that holds buffered bytes.
 type stall struct {
-	armedAt  int64 // when the current window began (wall clock ns)
+	armedAt  int64 // when the current window began (internal/mono ns)
 	held     int   // bytes the stream held when the window began
 	pending  int   // bytes it holds now
 	released int   // bytes of its own released in the window
@@ -160,7 +162,7 @@ func (m *Manager) noteBuffered(s *Stream, n int) {
 		m.lowerWrDL(st.armedAt + int64(m.wrTimeout))
 	}
 	if st == nil {
-		now := time.Now().UnixNano() // read only when a window begins, not for every append to a stalled stream
+		now := mono.Now() // read only when a window begins, not for every append to a stalled stream
 		if m.stalls == nil {
 			m.stalls = make(map[uint32]*stall)
 		}

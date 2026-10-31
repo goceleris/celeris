@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The per-stream request deadline and the header-block deadline (celeris#889).
@@ -169,7 +171,7 @@ func (p *Processor) SetHeaderBlockTimeout(d time.Duration) { p.hdrTimeout = clam
 // (a HEADERS frame without END_HEADERS).
 func (p *Processor) armHeaderBlock() {
 	if p.hdrTimeout > 0 {
-		p.manager.hints.HdrDL.Store(time.Now().UnixNano() + int64(p.hdrTimeout))
+		p.manager.hints.HdrDL.Store(mono.Now() + int64(p.hdrTimeout))
 	}
 }
 

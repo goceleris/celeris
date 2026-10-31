@@ -211,6 +211,13 @@ jobs:
             CELERIS_MONO_SKEW=$skew go test -count=1 -timeout=120s -tags celeris_monoskew -run '^(TestArmHeaderDeadlineAt|TestHeaderDeadline_ClearArmCycle)$' ./internal/conn/
             CELERIS_MONO_SKEW=$skew go test -count=1 -timeout=120s -tags celeris_monoskew -run '^TestDetachSnapshotElapsedFromStartTimeNs889$' .
           done
+          # Step 5 (celeris#1178): the HTTP/2 deadlines and waits, whole packages: conn
+          # (the H2 sweep against the stream stamps) and the stream code itself. With
+          # steps 2 to 5 the whole stamp component is routed, and both pass skewed.
+          for skew in 3600s -3600s; do
+            echo "== conn and h2 stream, whole, CELERIS_MONO_SKEW=$skew"
+            CELERIS_MONO_SKEW=$skew go test -count=1 -timeout=300s -tags celeris_monoskew ./internal/conn/ ./internal/protocol/h2/stream/
+          done
       # Excludes ./test/... to keep this job deterministic — those
       # suites (integration, spec, sustainedload) are timing-sensitive
       # on shared GitHub Actions runners and run locally / in the

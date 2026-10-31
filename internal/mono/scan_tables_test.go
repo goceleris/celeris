@@ -25,40 +25,10 @@ var stays = map[site]entry{
 var pending = map[site]entry{
 	// step 4: route internal/conn H1 and the root package (handler.go, context_response.go; context.go StartTime keeps time.Unix(0, ns) until the flip PR, which makes it mono.Time and deletes its entry)
 	{"context.go", "Context.StartTime", "time.Unix"}: {1, "step 4"},
-	// step 5: route the HTTP/2 stream code (internal/protocol/h2/stream)
-	{"internal/protocol/h2/stream/deadline.go", "Processor.armHeaderBlock", ".UnixNano"}:     {1, "step 5"},
-	{"internal/protocol/h2/stream/processor.go", "Processor.admitHeaders", ".UnixNano"}:      {1, "step 5"},
-	{"internal/protocol/h2/stream/write_deadline.go", "Manager.noteBuffered", ".UnixNano"}:   {1, "step 5"},
-	{"internal/protocol/h2/stream/write_wait.go", "Manager.beginWait", ".UnixNano"}:          {2, "step 5"},
-	{"internal/protocol/h2/stream/write_wait.go", "Manager.judgeWait", ".UnixNano"}:          {1, "step 5"},
-	{"internal/protocol/h2/stream/write_wait.go", "Stream.awaitSendWindowRate", "time.Unix"}: {2, "step 5"},
 }
 
 // pendingFixtures: test functions that write a wall reading into a stamp field or
 // hand one to a function that takes a stamp. Each moves to mono.Now() with the
 // routing PR of its package (the skew canary fails them otherwise), and its entry
 // goes with it.
-var pendingFixtures = map[string]bool{
-	// step 5
-	"internal/conn/h2_sweep_889_test.go | TestSweepAnswersABurstOfExpiriesInOneSweep889":                              true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepExpiresARequestAnswers408AndResets889":                             true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepExtendIdleAndGoAwayNoWait889":                                      true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepExtendIdleNeedsProgress889":                                        true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepFramesOnAResetStreamAreNotActivity889":                             true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepHeaderBlockDeadlineEndsTheConn889":                                 true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepIdleClockIgnoresPings889":                                          true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepResetsAStalledStreamWithInternalError889":                          true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepTakesNoLockWhenNothingIsDue889":                                    true,
-	"internal/protocol/h2/stream/request_deadline_889_test.go | TestClientResetOfAnExpiredRequestForgetsIt889":        true,
-	"internal/protocol/h2/stream/request_deadline_889_test.go | TestEveryRequestOpenStreamCarriesADeadline889":        true,
-	"internal/protocol/h2/stream/request_deadline_889_test.go | TestExpireRequestAnswers408AndRemembersTheStream889":  true,
-	"internal/protocol/h2/stream/request_deadline_889_test.go | TestExpiredRequestTombstonesRunOut889":                true,
-	"internal/protocol/h2/stream/request_deadline_889_test.go | TestRequestDeadlineDisarmedWhenTheStreamLeaves889":    true,
-	"internal/protocol/h2/stream/request_deadline_889_test.go | TestRequestDeadlineNeverAllocatesOnTheRequestPath889": true,
-	"internal/protocol/h2/stream/write_deadline_889_test.go | TestExpiredWritesBatch889":                              true,
-	"internal/protocol/h2/stream/write_deadline_889_test.go | TestExpiredWritesWindows889":                            true,
-	"internal/protocol/h2/stream/write_rate_889_test.go | TestExpiredWritesJudgesTheRecordItFoundDue889":              true,
-	"internal/protocol/h2/stream/write_rate_889_test.go | TestHugeTimeoutsDoNotOverflow889":                           true,
-	"internal/protocol/h2/stream/write_wait_1170_test.go | TestWaiterAndBufferNeverHaveTwoJudges1170":                 true,
-	"internal/protocol/h2/stream/write_wait_1170_test.go | TestWaiterRecordBooks1170":                                 true,
-}
+var pendingFixtures = map[string]bool{}

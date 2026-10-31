@@ -214,6 +214,12 @@ func Time(ns int64) time.Time {
 	return t.Add(-time.Duration(curAt(t) - ns))
 }
 
+// Until is how long it is, on Now's clock, until the stamp ns: ns - Now(), as a
+// duration (negative when it has passed). The waiters' timers are made of it. It
+// replaces time.Until(time.Unix(0, ns)), which reads the WALL clock against a
+// stamp of this one: the two differ by every step since the start of the process.
+func Until(ns int64) time.Duration { return time.Duration(ns - Now()) }
+
 // FromTime is the stamp of an instant t that the caller already has (a
 // time.Now() it took for another reason, as handler.go does for a request
 // that no engine stamped): no second clock read. t should carry a monotonic

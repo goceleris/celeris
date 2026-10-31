@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The write deadline's books and verdicts (celeris#889, D2): the records, the
@@ -70,7 +72,7 @@ func stalled889(m *Manager, id uint32, n int) *Stream {
 
 func discard889(uint32, bool, []byte) {}
 
-func dueAt889() int64 { return time.Now().UnixNano() + int64(wt889) + int64(time.Millisecond) }
+func dueAt889() int64 { return mono.Now() + int64(wt889) + int64(time.Millisecond) }
 
 // A record is made when a buffer fills and only with a write deadline, and the hint
 // is the end of the first window; sending that fits the window makes none.
@@ -85,9 +87,9 @@ func TestStallIsArmedByABufferOnly889(t *testing.T) {
 	if m.stalledStreams() != 0 || m.NextWriteDeadline() != 0 {
 		t.Fatalf("a write that fit the window left %d records, hint %d", m.stalledStreams(), m.NextWriteDeadline())
 	}
-	before := time.Now().UnixNano()
+	before := mono.Now()
 	stalled889(m, 3, 100)
-	after := time.Now().UnixNano()
+	after := mono.Now()
 	if m.stalledStreams() != 1 {
 		t.Fatalf("%d records after a buffer filled, want 1", m.stalledStreams())
 	}
@@ -154,7 +156,7 @@ func TestExpiredWritesFloor889(t *testing.T) {
 func TestExpiredWritesWindows889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	s := stalled889(m, 1, 1<<22)
-	start := time.Now().UnixNano()
+	start := mono.Now()
 	if out := m.ExpiredWrites(start+int64(wt889)/2, make([]uint32, 0, 4)); len(out) != 0 {
 		t.Fatalf("expired %v half a window in", out)
 	}
@@ -275,7 +277,7 @@ func TestExpiredWritesBatch889(t *testing.T) {
 		stalled889(m, uint32(1+2*i), 100)
 		time.Sleep(2 * time.Millisecond) // a slow runner (the coverage build): the records are not armed in one instant
 	}
-	start := time.Now().UnixNano() // after the records: every window is judged for all of them (CI at 7e7f5ce: 2 of 40 armed after start+1ms missed window 1)
+	start := mono.Now() // after the records: every window is judged for all of them (CI at 7e7f5ce: 2 of 40 armed after start+1ms missed window 1)
 	// The connection holds 4000 bytes, under one floor: its tail is held for the idle
 	// windows (r9 F-A2) rather than reset at the first one, and the batch limit is shown
 	// in the window after, when 40 are due.

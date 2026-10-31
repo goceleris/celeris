@@ -10,6 +10,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
@@ -103,7 +104,7 @@ func TestSweepExpiresARequestAnswers408AndResets889(t *testing.T) {
 	r.frames(func(fr *http2.Framer) {
 		_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r.block("POST", "/u"), EndHeaders: true})
 	})
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if res := r.st.Sweep(now, r.write); res.Wrote || res.Expired != 0 {
 		t.Fatalf("a request inside its deadline was touched: %+v", res)
 	}
@@ -157,7 +158,7 @@ func TestSweepHeaderBlockDeadlineEndsTheConn889(t *testing.T) {
 	r.frames(func(fr *http2.Framer) {
 		_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: blk[:2], EndStream: true, EndHeaders: false})
 	})
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if res := r.st.Sweep(now, r.write); res.CloseAfterFlush || res.Wrote {
 		t.Fatalf("inside the deadline: %+v", res)
 	}
@@ -190,7 +191,7 @@ func TestSweepHeaderBlockDeadlineEndsTheConn889(t *testing.T) {
 func TestSweepIdleClockIgnoresPings889(t *testing.T) {
 	r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
 	r.written()
-	t0 := time.Now().UnixNano()
+	t0 := mono.Now()
 	if res := r.st.Sweep(t0, r.write); res.CloseNow {
 		t.Fatalf("the first sweep closed the conn: %+v", res)
 	}
@@ -227,7 +228,7 @@ func TestSweepTakesNoLockWhenNothingIsDue889(t *testing.T) {
 	r.frames(func(fr *http2.Framer) {
 		_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r.block("POST", "/u"), EndHeaders: true})
 	})
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	r.st.mu.Lock()
 	done := make(chan SweepResult)
 	go func() { done <- r.st.Sweep(now, r.write) }()
@@ -261,7 +262,7 @@ func TestSweepTakesNoLockWhenNothingIsDue889(t *testing.T) {
 func TestSweepExtendIdleAndGoAwayNoWait889(t *testing.T) {
 	r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
 	r.written()
-	t0 := time.Now().UnixNano()
+	t0 := mono.Now()
 	r.st.Sweep(t0, r.write)
 	at := t0 + int64(1500*time.Millisecond)
 	if res := r.st.Sweep(at, r.write); !res.CloseNow {
@@ -317,7 +318,7 @@ func TestSweepAnswersABurstOfExpiriesInOneSweep889(t *testing.T) {
 				_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: uint32(1 + 2*i), BlockFragment: r.block("POST", "/u"), EndHeaders: true})
 			}
 		})
-		now := time.Now().UnixNano() + int64(2*time.Second)
+		now := mono.Now() + int64(2*time.Second)
 		total := 0
 		for total < n && sweeps < 20 {
 			e := r.st.Sweep(now+int64(sweeps), r.write).Expired
@@ -352,7 +353,7 @@ func TestSweepExtendIdleNeedsProgress889(t *testing.T) {
 	newConn := func() (*sweepRig889, int64) {
 		r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
 		r.written()
-		now := time.Now().UnixNano()
+		now := mono.Now()
 		r.st.Sweep(now, r.write)
 		return r, now
 	}
@@ -487,7 +488,7 @@ func TestSweepFramesOnAResetStreamAreNotActivity889(t *testing.T) {
 	t.Run("reset-for-another-cause", func(t *testing.T) {
 		r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
 		r.written()
-		now := time.Now().UnixNano()
+		now := mono.Now()
 		r.st.Sweep(now, r.write)
 		r.frames(func(fr *http2.Framer) {
 			noPath := []byte{0x82, 0x86, 0x41, 0x01, 'x'}
@@ -506,7 +507,7 @@ func TestSweepFramesOnAResetStreamAreNotActivity889(t *testing.T) {
 	t.Run("expired-request", func(t *testing.T) {
 		r := newSweepRig889(t, H2Config{IdleTimeout: time.Second, ReadTimeout: time.Second})
 		r.written()
-		now := time.Now().UnixNano()
+		now := mono.Now()
 		r.frames(func(fr *http2.Framer) {
 			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r.block("POST", "/u"), EndHeaders: true})
 		})
@@ -562,7 +563,7 @@ func TestSweepResetsAStalledStreamWithInternalError889(t *testing.T) {
 		return s
 	}
 	a, b := mk(1), mk(3)
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if res := r.st.Sweep(now+int64(500*time.Millisecond), r.write); res.Expired != 0 {
 		t.Fatalf("expired half a window in: %+v", res)
 	}

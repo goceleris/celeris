@@ -113,7 +113,7 @@ type Stream struct {
 	CachedRoutePath     string
 	CachedRouteHandlers any // []celeris.HandlerFunc — typed any to avoid cycle
 	CachedRouteFullPath string
-	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
+	// StartTimeNs is the engine's cached mono.Now() for the
 	// recv that produced this request. populated by populateCachedStream
 	// from the engine's worker-local clock cache so HandleStream avoids a
 	// per-request time.Now() vDSO call. Zero means "unset, fall back to

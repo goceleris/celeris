@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The pool handler's wait for window as a minimum rate (celeris#1170, stage 3 of
@@ -45,7 +47,7 @@ import (
 type SendWait struct {
 	m      *Manager
 	id     uint32
-	start  int64 // when the wait first blocked (wall clock ns)
+	start  int64 // when the wait first blocked (internal/mono ns)
 	made   bool  // the record was made (and not just re-made)
 	failed bool  // judged and reset by the loop-blocked fallback
 	// Loops is the server's watch on its event loops, set by the caller (the conn
@@ -148,7 +150,7 @@ func (m *Manager) beginWait(s *Stream, id uint32, w *SendWait, rest int, gen uin
 	m.stallMu.Lock()
 	st := m.stalls[id]
 	if st == nil {
-		now := time.Now().UnixNano() // read only when a record is made, not for every wait
+		now := mono.Now() // read only when a record is made, not for every wait
 		if m.stalls == nil {
 			m.stalls = make(map[uint32]*stall)
 		}
@@ -160,7 +162,7 @@ func (m *Manager) beginWait(s *Stream, id uint32, w *SendWait, rest int, gen uin
 	end := st.armedAt + wt
 	m.stallMu.Unlock()
 	if w.start == 0 {
-		w.start = time.Now().UnixNano()
+		w.start = mono.Now()
 	}
 	w.m, w.id, w.made = m, id, true
 	return end
@@ -185,7 +187,7 @@ func (m *Manager) judgeWait(s *Stream, id uint32, w *SendWait, rest int) (waitVe
 		return waitCancelled, 0
 	}
 	wt := int64(m.wrTimeout)
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if lw := w.Loops; lw != nil {
 		if idx, age, stuck := lw.stuck(now, loopStuckFor(wt)); !stuck {
 			lw.noteClear()
@@ -293,7 +295,7 @@ func (s *Stream) awaitSendWindowRate(m *Manager, id uint32, done <-chan struct{}
 	end := m.beginWait(s, id, w, rest, gen)
 	var expired <-chan time.Time
 	if end != 0 {
-		d := time.Until(time.Unix(0, end))
+		d := mono.Until(end)
 		if sw.timer == nil {
 			sw.timer = time.NewTimer(d)
 		} else {
@@ -315,7 +317,7 @@ func (s *Stream) awaitSendWindowRate(m *Manager, id uint32, done <-chan struct{}
 		case waitExpired:
 			return os.ErrDeadlineExceeded
 		default:
-			sw.timer.Reset(time.Until(time.Unix(0, next)))
+			sw.timer.Reset(mono.Until(next))
 			return errStillWaiting
 		}
 	}
@@ -415,7 +417,7 @@ func (w *LoopWatch) Slot() *LoopSlot {
 	return s
 }
 
-// Enter stamps the start of a batch at now (wall clock ns).
+// Enter stamps the start of a batch at now (internal/mono ns).
 func (s *LoopSlot) Enter(now int64) {
 	if s != nil {
 		s.since.Store(now)
