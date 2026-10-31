@@ -650,12 +650,12 @@ func TestIdleAllowanceIsTheLargestOfTheRun1170(t *testing.T) {
 	}
 }
 
-// A connection that moved in the window before is still moving through ONE window in
-// which it released nothing (review r10 F1: Go's Transport returns connection window
-// in about 1 MiB steps, so some 1 s windows at 1 MB/s have neither a grant nor a send),
-// and the verdict is two such windows in a row. What carries is what the OTHER streams
-// released: a stream's own release does not shelter it in the next window.
-func TestOneEmptyWindowOfAMovingConnectionIsHeld1170(t *testing.T) {
+// A connection that moved lately is still moving through the windows the bank covers
+// (four) in which it released nothing (review r10 F1: Go's Transport returns connection
+// window in about 1 MiB steps, so some 1 s windows at 1 MB/s have neither a grant nor a
+// send), and the verdict is the first window after them. What carries is what the OTHER
+// streams released: a stream's own release does not shelter it in the next window.
+func TestEmptyWindowsOfAMovingConnectionAreHeldUpToTheHorizon1170(t *testing.T) {
 	// Stream 1 takes 20000 a window (over its share, under its floor) beside stream 3,
 	// which moves the connection in the windows moves(w) says.
 	run := func(moves func(w int) bool) int {
@@ -731,4 +731,74 @@ func TestLoopWatchTellsAnEpisodeOnce1170(t *testing.T) {
 	}
 	none := NewLoopWatch() // no logger: nothing, no crash
 	none.noteStuck(0, 0, wt)
+}
+
+// The windows a connection is held "moving" by the horizon alone count as idle windows of
+// the stream's run (review r11 N1): the worst case of an abandoned stream next to
+// siblings that keep the connection moving is the seed plus the allowance plus one, 17
+// windows (13 without a seed), and not more however the siblings pace themselves. Without
+// the count, a decoy that releases a floor in one window out of four held it for 49 windows
+// (53 with the seed). In flight: 16 MiB (the allowance is the cap), stream 1 never
+// granted, stream 3 the decoy.
+func TestHorizonWindowsAreIdleWindows1170(t *testing.T) {
+	run := func(seed bool, moves func(w int) bool) int {
+		_, m, _ := wdSetup889(t)
+		if seed {
+			m.initWin.Store(1 << 20) // the client's initial stream window: the seed covers four floors
+		}
+		m.connHigh.Store(1 << 30)
+		stalled889(m, 1, 64<<20)
+		b := stalled889(m, 3, 64<<20)
+		m.connectionWindow = 1<<30 - 16<<20
+		return firstReset889(m, 1, time.Now().UnixNano(), 80, func(w int) {
+			if moves(w) {
+				b.SetWindowSize(70000)
+				m.FlushOutbound(b, discard889)
+			}
+			m.connectionWindow = 1<<30 - 16<<20
+		})
+	}
+	every := func(int) bool { return true }
+	fourth := func(w int) bool { return w%4 == 1 }
+	for _, tc := range []struct {
+		name  string
+		moves func(w int) bool
+		want  int // without the seed
+	}{
+		{"a decoy in every window", every, 1 + writeIdleCapWindows},
+		{"a decoy in one window out of four", fourth, 1 + writeIdleCapWindows},
+		{"a decoy that stops after three windows", func(w int) bool { return w <= 3 }, 3 + writeBankWindows},
+	} {
+		if got := run(false, tc.moves); got != tc.want {
+			t.Errorf("%s: reset in window %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	if got := run(true, fourth); got != writeBankWindows+1+writeIdleCapWindows {
+		t.Errorf("with the seed, a decoy in one window out of four: reset in window %d, want %d", got, writeBankWindows+1+writeIdleCapWindows)
+	}
+}
+
+// Each idle run has its own allowance (review r11 NIT): the running maximum starts again
+// when the stream takes its share and a new run begins, so a long queue that has drained
+// does not leave the next run with the allowance of the first.
+func TestIdleAllowanceStartsAgainWithEachRun1170(t *testing.T) {
+	_, m, _ := wdSetup889(t)
+	m.connHigh.Store(1 << 30)
+	a := stalled889(m, 1, 64<<20)
+	b := stalled889(m, 3, 64<<20)
+	m.connectionWindow = 1<<30 - 16<<20 // 16 MiB in flight: the first run has the cap
+	got := firstReset889(m, 1, time.Now().UnixNano(), 80, func(w int) {
+		b.SetWindowSize(70000) // the connection moves in every window
+		m.FlushOutbound(b, discard889)
+		switch {
+		case w == 3: // stream 1 takes its share: the run ends
+			a.SetWindowSize(20000)
+			m.FlushOutbound(a, discard889)
+		case w == 4: // the queue has drained: no bytes in flight for the second run
+			m.connectionWindow = 1 << 30
+		}
+	})
+	if want := 3 + writeIdleWindows + 1; got != want {
+		t.Fatalf("reset in window %d, want %d: the second run (window 4 on, nothing in flight) must have the minimum allowance, not the first run's", got, want)
+	}
 }
