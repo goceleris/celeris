@@ -447,14 +447,14 @@ func (e *Engine) ResumeAccept() error {
 		l.listenFDClosed.Store(false)
 		l.wakeIfSuspended()
 		// A loop that has not parked closed its listener at the pause and
-		// went back to epoll_wait, which is 500 ms long with no listener,
-		// and a loop without a header deadline has no 25 ms timerfd to end
-		// it sooner. That is a loop that holds a connection, and also an
-		// idle one just after the pause (it parks at the iteration after
-		// the close). wakeIfSuspended does not reach it: the wake eventfd,
-		// which is in the epoll set, does (celeris#886). A leaf lock and one
-		// write(2); a loop that is running just reads the counter at its
-		// next wakeup.
+		// went back to epoll_wait, which is 500 ms long with no listener;
+		// its 25 ms timerfd (every loop has one since celeris#1194) ends the
+		// wait sooner, but only at the next tick. That is a loop that holds a
+		// connection, and also an idle one just after the pause (it parks at
+		// the iteration after the close). wakeIfSuspended does not reach it:
+		// the wake eventfd, which is in the epoll set, does (celeris#886). A
+		// leaf lock and one write(2); a loop that is running just reads the
+		// counter at its next wakeup.
 		l.wakeFD.Signal()
 	}
 	return nil

@@ -236,7 +236,9 @@ type Config struct {
 	WorkloadHint WorkloadHint
 
 	// ReadTimeout is the max duration for reading the entire request.
-	// Zero uses the default (60s). Set to -1 for no timeout.
+	// Zero uses the default (60s). Set to -1 for no timeout. The native engines
+	// enforce it in a sweep of their connections, about 30 ms after its time on
+	// epoll (see IdleTimeout).
 	//
 	// On the native engines (epoll, io_uring, adaptive) it is measured from the
 	// connection's last read (on io_uring also from the start and the completion
@@ -357,10 +359,9 @@ type Config struct {
 	// WriteTimeout with that in mind. WriteTimeout -1 is no write timeout at
 	// any rate. What the client sends is not progress: a pipelined request or
 	// an HTTP/2 PING does not hold a parked response. The times above hold
-	// with ReadHeaderTimeout set (the default): the engine's 25 ms sweep timer
-	// is armed only then, and without it a stalled response can outlast them by
-	// seconds (measured: WriteTimeout 1s, ReadHeaderTimeout -1, closed at 5 s,
-	// on main too).
+	// with the epoll sweep at its 25 ms period, which every worker has whatever
+	// ReadHeaderTimeout and the other timeouts are; io_uring sweeps more coarsely,
+	// see IdleTimeout.
 	//
 	// While the rule has a baseline for a parked response (from the first sweep
 	// that finds it parked), it is the only bound on the connection:
@@ -516,6 +517,16 @@ type Config struct {
 	// failed getsockopt) the period is always extended. A frame for a stream the server reset moves the period only for a
 	// request that expired at ReadTimeout, for the 2 x ReadTimeout its late DATA may
 	// take. On epoll, for a response parked on the socket, see WriteTimeout.
+	//
+	// The native engines look at IdleTimeout, ReadTimeout and WriteTimeout in a
+	// sweep of their connections, so one is enforced a little after its time, not
+	// at it. On epoll the sweep runs every 25 ms, from a kernel timer each worker
+	// arms whatever ReadHeaderTimeout and the timeouts are, so a timeout is
+	// enforced within about 30 ms of its time (a 1 s IdleTimeout closed an idle
+	// connection at 1.00 to 1.03 s on docker arm64 with 2 CPUs, with
+	// ReadHeaderTimeout off as well as set). On io_uring the sweep of an idle
+	// worker is about a second apart, so a timeout of a few seconds or less is
+	// approximate by that much there.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts

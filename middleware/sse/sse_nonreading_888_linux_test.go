@@ -108,9 +108,10 @@ type producer888 struct {
 	flood int
 
 	// writeTimeout is the server's WriteTimeout (nonReadWriteTimeout888 when
-	// zero). noHeaderTimer sets ReadHeaderTimeout -1, which takes away the
-	// epoll engine's 25 ms timerfd: with a detached conn the sweep then
-	// depends on the loop's own iterations.
+	// zero). noHeaderTimer sets ReadHeaderTimeout -1, which used to take away
+	// the epoll engine's 25 ms timerfd, so that the sweep depended on the
+	// loop's own iterations (celeris#1194: every epoll loop has the timerfd
+	// now; the cell keeps the bound for a server without a header deadline).
 	writeTimeout  time.Duration
 	noHeaderTimer bool
 
@@ -320,8 +321,9 @@ func TestNonReadingClientEndsStream888(t *testing.T) {
 		// WriteTimeout 2 s puts the close after the fast phase.
 		{"small-events", producer888{fastBytes: 4 << 10, fastEvery: 500 * time.Microsecond, fastFor: 1200 * time.Millisecond, settle: 100 * time.Millisecond,
 			trickleBytes: 1000, trickleEvery: 300 * time.Millisecond, writeTimeout: 2 * time.Second, dropEarly: true}},
-		// The same without the epoll timerfd (ReadHeaderTimeout -1), so nothing
-		// but the loop's own iterations reaches the sweep.
+		// The same with ReadHeaderTimeout -1, which used to take the epoll
+		// timerfd away, so that nothing but the loop's own iterations reached
+		// the sweep (celeris#1194).
 		{"small-events-no-header-timer", producer888{fastBytes: 4 << 10, fastEvery: 500 * time.Microsecond, fastFor: 1200 * time.Millisecond, settle: 100 * time.Millisecond,
 			trickleBytes: 1000, trickleEvery: 300 * time.Millisecond, writeTimeout: 2 * time.Second, noHeaderTimer: true, dropEarly: true}},
 	}

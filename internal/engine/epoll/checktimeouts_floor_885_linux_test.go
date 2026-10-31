@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/mono"
@@ -22,8 +24,8 @@ import (
 )
 
 // celeris#885 item 29: checkTimeouts is driven by the loop's iterations (every
-// 32 epoll_wait returns when ReadHeaderTimeout is set, which is the default, or
-// a conn is detached), so a busy loop swept thousands of times a second where
+// 32 epoll_wait returns, since celeris#1194; before, when ReadHeaderTimeout was
+// set, which is the default, or a conn was detached), so a busy loop swept thousands of times a second where
 // the 25 ms timerfd promises 40 (measured: 5,400 to 6,200 a second in all on
 // two loops with sixteen busy clients, 12.9% of a core on 8192 idle conns).
 // The sweep now has a floor between two of them (sweepFloor), outside
@@ -32,14 +34,20 @@ import (
 // Two tests. The first counts the sweeps one busy loop makes in a window, under
 // sixteen busy keep-alive clients and the default configuration; it fails on a
 // loop whose gate has no floor. The second is the price of the floor and the
-// guard against a floor set too high: with the timerfd off (ReadHeaderTimeout
-// disabled) the gate is the only source of sweeps on a busy loop, and a
+// guard against a floor set too high: with the timerfd disarmed
+// (every loop has one since celeris#1194) the gate is the only source of sweeps on a busy loop, and a
 // detached conn's idle deadline (a WebSocket's, an SSE stream's) must still be
 // reaped about when it expires.
 
 // sweepProbe885 records the time of every sweep of the loop that serves addr.
 type sweepProbe885 struct {
 	addr string
+
+	// disarm, when set, disarms the timerfd of every loop at its first sweep,
+	// so that the gate is the only source of sweeps left (every loop has a
+	// timerfd since celeris#1194, whatever its ReadHeaderTimeout).
+	disarm   bool
+	disarmed map[*Loop]bool // guarded by mu
 
 	mu       sync.Mutex
 	at       map[*Loop][]int64 // UnixNano of each sweep, by loop
@@ -59,7 +67,14 @@ func (p *sweepProbe885) hook(l *Loop) {
 	p.at[l] = append(p.at[l], mono.Now())
 	p.live[l] = len(l.liveConns)
 	p.timerFD, p.sawLoop = l.timerFD, true
+	first := p.disarm && !p.disarmed[l]
+	if first {
+		p.disarmed[l] = true
+	}
 	p.mu.Unlock()
+	if first && l.timerFD >= 0 {
+		_ = unix.TimerfdSettime(l.timerFD, 0, &unix.ItimerSpec{}, nil)
+	}
 	for _, cs := range l.liveConns {
 		if h1 := cs.h1State; h1 != nil && h1.Detached.Load() && !p.seen[cs] {
 			p.seen[cs] = true
@@ -136,6 +151,12 @@ var _ stream.AsyncRouteResolver = floorHandler885{}
 // startFloorEngine885 serves cfg on two loops (the least the engine accepts)
 // and returns the address and the probe. The engine is stopped, and Listen waited for, at cleanup.
 func startFloorEngine885(t *testing.T, cfg resource.Config) (string, *sweepProbe885) {
+	return startFloorEngine885x(t, cfg, false)
+}
+
+// startFloorEngine885x is startFloorEngine885 with the timerfds disarmed when
+// disarm is set (see sweepProbe885).
+func startFloorEngine885x(t *testing.T, cfg resource.Config, disarm bool) (string, *sweepProbe885) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -150,7 +171,7 @@ func startFloorEngine885(t *testing.T, cfg resource.Config) (string, *sweepProbe
 	if err != nil {
 		t.Fatalf("epoll engine: %v", err) // not a skip: a skip would take the witness out of CI silently
 	}
-	p := &sweepProbe885{addr: addr, at: map[*Loop][]int64{}, live: map[*Loop]int{},
+	p := &sweepProbe885{addr: addr, disarm: disarm, disarmed: map[*Loop]bool{}, at: map[*Loop][]int64{}, live: map[*Loop]int{},
 		detached: make(chan *conn.H1State, 16), seen: map[*connState]bool{}}
 	hook := p.hook
 	testHookCheckTimeouts.Store(&hook)
@@ -292,16 +313,16 @@ func TestBusyLoopSweepsAtMostOnceAFloorPeriod885(t *testing.T) {
 }
 
 // TestDetachedIdleDeadlineIsReapedPromptlyUnderLoad885 is the price of the
-// floor. ReadHeaderTimeout is disabled, so there is no timerfd and the gate
-// (every 32 iterations while a conn is detached) is the only sweep on a busy
-// loop. Sixteen clients keep the loop busy; a detached conn (a WebSocket's,
+// floor. The timerfd is disarmed (every loop has one since celeris#1194,
+// whatever its ReadHeaderTimeout), so the gate (every 32 iterations) is the only
+// sweep on a busy loop. Sixteen clients keep the loop busy; a detached conn (a WebSocket's,
 // SSE's) gets an idle deadline 200 ms ahead and must be reaped (within 400 ms
 // of it, a sanity bound). The median gap between two sweeps is the structural
 // bound, and does not depend on where in a gap the deadline falls: a floor of
 // 250 ms moves every gap past it (the control of that mutant), where a floor
 // of the timerfd's 25 ms leaves the gaps at the time of 32 iterations.
 func TestDetachedIdleDeadlineIsReapedPromptlyUnderLoad885(t *testing.T) {
-	addr, p := startFloorEngine885(t, resource.Config{ReadHeaderTimeout: -1, AsyncHandlers: true})
+	addr, p := startFloorEngine885x(t, resource.Config{ReadHeaderTimeout: -1, AsyncHandlers: true}, true)
 	dc, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -373,8 +394,11 @@ func TestDetachedIdleDeadlineIsReapedPromptlyUnderLoad885(t *testing.T) {
 	t.Logf("celeris885 item 29: detached conn reaped %v after its deadline; %d sweeps of its loop in %v, gaps median %v max %v, %d requests in all; timerFD=%d",
 		late.Round(time.Millisecond), len(w), to.Sub(from).Round(time.Millisecond), medGap.Round(time.Millisecond), maxGap.Round(time.Millisecond), reqs, tfd)
 
-	if !saw || tfd >= 0 {
-		t.Fatalf("PREMISE: the loop has a timerfd (%d, saw %v): ReadHeaderTimeout -1 disables it, and without that the gate is not the only sweep", tfd, saw)
+	p.mu.Lock()
+	off := p.disarmed[detLoop]
+	p.mu.Unlock()
+	if !saw || !off {
+		t.Fatalf("PREMISE: the timerfd of the detached conn's loop was not disarmed (timerFD %d, saw %v, disarmed %v): without that the gate is not the only sweep", tfd, saw, off)
 	}
 	if reqs < 1000 {
 		t.Fatalf("PREMISE: the loop was not busy: %d requests in %v", reqs, to.Sub(from))
