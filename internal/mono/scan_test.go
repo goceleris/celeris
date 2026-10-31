@@ -343,28 +343,14 @@ func mustRead(t testing.TB, path string) []byte {
 	return b
 }
 
-// TestNoWallStamps: every wall read of the scanned tree is listed, once, with
-// its count, in stays (for good) or pending (to move), and every entry of both
-// is still there. A routing PR deletes its pending entries; a wall read added
-// later, or re-added by a revert, is in neither table and fails here.
+// TestNoWallStamps: every wall read of the scanned tree is listed, with its count,
+// in stays (with its reason), and every entry is still there. A wall read added
+// later, or re-added by a revert of a routing PR, is not listed and fails here.
 func TestNoWallStamps(t *testing.T) {
 	prod, _ := scanTree(t, moduleRoot(t))
-	listed := map[site]bool{}
-	for s := range stays {
-		listed[s] = true
-	}
-	for s := range pending {
-		if listed[s] {
-			t.Errorf("%s is in stays and in pending: decide which", s)
-		}
-		listed[s] = true
-	}
 	var unlisted, stale, count []string
 	for s, n := range prod {
 		e, ok := stays[s]
-		if p, isP := pending[s]; isP {
-			e, ok = p, true
-		}
 		switch {
 		case !ok:
 			unlisted = append(unlisted, fmt.Sprintf("%s (x%d)", s, n))
@@ -372,7 +358,7 @@ func TestNoWallStamps(t *testing.T) {
 			count = append(count, fmt.Sprintf("%s: found %d, listed %d", s, n, e.Count))
 		}
 	}
-	for s := range listed {
+	for s := range stays {
 		if _, ok := prod[s]; !ok {
 			stale = append(stale, s.String())
 		}
@@ -393,47 +379,24 @@ func TestNoWallStamps(t *testing.T) {
 	}
 }
 
-// TestNoWallFixtures is the same for the test files: a test function that
-// writes a wall reading into a stamp field, or hands one to a function that
-// takes a stamp, is correct only while the clock and the wall agree, which the
-// skew canary does not allow. It moves to mono.Now() with the routing PR of
-// its package, and its entry goes.
+// TestNoWallFixtures: no test function of the scanned tree writes a wall reading
+// into a stamp field or hands one to a function that takes a stamp. Such a test is
+// correct only while the clock and the wall agree, which the skew canary does not
+// allow; it writes mono.Now() instead.
 func TestNoWallFixtures(t *testing.T) {
 	_, fixtures := scanTree(t, moduleRoot(t))
-	var unlisted, stale []string
+	var bad []string
 	for f := range fixtures {
-		if !pendingFixtures[f] {
-			unlisted = append(unlisted, f)
-		}
+		bad = append(bad, f)
 	}
-	for f := range pendingFixtures {
-		if !fixtures[f] {
-			stale = append(stale, f)
-		}
-	}
-	sort.Strings(unlisted)
-	sort.Strings(stale)
-	if len(unlisted) > 0 {
-		t.Errorf("test functions that write a wall reading into a stamp field (%d): use mono.Now() instead (the stamps are on its clock):\n  %s", len(unlisted), strings.Join(unlisted, "\n  "))
-	}
-	if len(stale) > 0 {
-		t.Errorf("stale pendingFixtures entries (%d): delete them:\n  %s", len(stale), strings.Join(stale, "\n  "))
+	sort.Strings(bad)
+	if len(bad) > 0 {
+		t.Errorf("test functions that write a wall reading into a stamp field (%d): use mono.Now() instead (the stamps are on its clock):\n  %s", len(bad), strings.Join(bad, "\n  "))
 	}
 }
 
-// TestPendingIsEmptyWhenFlipped holds the flip back in code: with flipped true,
-// no site and no fixture may be left to move.
-func TestPendingIsEmptyWhenFlipped(t *testing.T) {
-	if flipped && (len(pending) != 0 || len(pendingFixtures) != 0) {
-		t.Fatalf("flipped is true with %d pending sites and %d pending fixtures: route them first", len(pending), len(pendingFixtures))
-	}
-	if !flipped {
-		t.Logf("routing phase: %d sites and %d fixtures still to move", len(pending), len(pendingFixtures))
-	}
-}
-
-// TestScanDump prints what the scan sees, as the tables' lines, for writing or
-// updating them: MONO_SCAN_DUMP=1 go test -run TestScanDump -v ./internal/mono
+// TestScanDump prints what the scan sees, as the table's lines, for writing or
+// updating it: MONO_SCAN_DUMP=1 go test -run TestScanDump -v ./internal/mono
 func TestScanDump(t *testing.T) {
 	if os.Getenv("MONO_SCAN_DUMP") == "" {
 		return // not a skip: CI's tally fails the step on any SKIP line
