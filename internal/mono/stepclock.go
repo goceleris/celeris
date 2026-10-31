@@ -47,3 +47,44 @@ func SetStair(step, every time.Duration) (restore func()) {
 		return Reading{Wall: t.UnixNano() + n*int64(step), Mono: m - 1}
 	})
 }
+
+// Manual is a clock that moves only when a test moves it, so that a test of a
+// deadline needs no sleep and no margin for a slow runner: Advance moves both
+// readings (time passes), Step moves the wall reading alone (the wall clock is
+// stepped). Before the flip the clock is the wall reading, so a Step moves every
+// deadline; after it, none. Tests only (SetManual).
+type Manual struct {
+	wall0 int64
+	mono  atomic.Int64
+	step  atomic.Int64
+}
+
+// NewManual returns a manual clock that stands one hour past the REAL wall clock,
+// whatever the canary's skew is. The hour is on purpose: a site that still reads the
+// real clock (time.Now) instead of this package is then an hour behind every stamp of
+// the clock, so a test of its deadline fails at once, where a clock standing at the
+// real time would agree with it to the millisecond and hide it. It is anchored to the
+// real wall AFTER the skew: the skewed form of Now (base, which includes the skew,
+// plus the monotonic reading, or the wall reading plus the skew) is real + 1 h at
+// every CELERIS_MONO_SKEW, including -1 h, where an hour put on the monotonic reading
+// alone would cancel the skew and stand on the real wall.
+func NewManual() *Manual {
+	wall := time.Now().UnixNano()
+	m := &Manual{wall0: base - skew} // wall mode: Wall + skew = base + mono
+	m.mono.Store(wall + int64(time.Hour) - base)
+	return m
+}
+
+// Advance lets d of time pass on both readings.
+func (m *Manual) Advance(d time.Duration) { m.mono.Add(int64(d)) }
+
+// Step steps the wall reading by d (negative: backward); the monotonic one stays.
+func (m *Manual) Step(d time.Duration) { m.step.Add(int64(d)) }
+
+// SetManual installs m as the clock until the returned function is called.
+func SetManual(m *Manual) (restore func()) {
+	return SetSeam(func() Reading {
+		mo := m.mono.Load()
+		return Reading{Wall: m.wall0 + mo + m.step.Load(), Mono: mo}
+	})
+}
