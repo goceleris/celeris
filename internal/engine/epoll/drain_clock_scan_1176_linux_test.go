@@ -17,7 +17,12 @@ import (
 // seam, which a direct wall reading does not go through, so the functions that
 // hold them are pinned here not to make one.
 
-func unixReads1176(n ast.Node) (ints int, inCloseIdle bool) {
+// (celeris#1178) The loop's stamps are internal/mono readings (mono.Now and its
+// conversions): the clock of cachedNow, lastActivity and the sweep, on the wall's
+// scale, which is not the drain's. The gate hands closeIdleH1 one of them, made of
+// the time.Now() it holds for its pacing (mono.FromTime), and no deadline of the
+// shutdown reads one.
+func unixReads1176(n ast.Node) (ints, monos int, inCloseIdle bool) {
 	ast.Inspect(n, func(m ast.Node) bool {
 		call, ok := m.(*ast.CallExpr)
 		if !ok {
@@ -26,8 +31,10 @@ func unixReads1176(n ast.Node) (ints int, inCloseIdle bool) {
 		if se, ok := call.Fun.(*ast.SelectorExpr); ok && se.Sel.Name == "closeIdleH1" {
 			for _, a := range call.Args {
 				if c, ok := a.(*ast.CallExpr); ok {
-					if s, ok := c.Fun.(*ast.SelectorExpr); ok && s.Sel.Name == "UnixNano" {
-						inCloseIdle = true
+					if s, ok := c.Fun.(*ast.SelectorExpr); ok && s.Sel.Name == "FromTime" {
+						if id, ok := s.X.(*ast.Ident); ok && id.Name == "mono" {
+							inCloseIdle = true
+						}
 					}
 				}
 			}
@@ -42,11 +49,15 @@ func unixReads1176(n ast.Node) (ints int, inCloseIdle bool) {
 			case "Round", "Truncate", "UTC", "Local", "In":
 				// These strip the monotonic reading of a time.Time.
 				ints++
+			case "Now", "FromTime", "FromWall", "Time":
+				if id, ok := se.X.(*ast.Ident); ok && id.Name == "mono" {
+					monos++
+				}
 			}
 		}
 		return true
 	})
-	return ints, inCloseIdle
+	return ints, monos, inCloseIdle
 }
 
 func TestShutdownDeadlinesReadNoWallClock1176(t *testing.T) {
@@ -71,13 +82,13 @@ func TestShutdownDeadlinesReadNoWallClock1176(t *testing.T) {
 		return nil
 	}
 	for _, fn := range []string{"sendDrainWait", "drainSends", "h2PoolSettled", "poolWaitSettled", "h1InProgress"} {
-		if ints, _ := unixReads1176(find(fn).Body); ints != 0 {
-			t.Errorf("%s makes %d wall-clock integers (UnixNano and friends): its deadlines are time.Time or drainclock.Now (celeris#1176)", fn, ints)
+		if ints, monos, _ := unixReads1176(find(fn).Body); ints != 0 || monos != 0 {
+			t.Errorf("%s makes %d wall-clock integers (UnixNano and friends) and %d mono readings: its deadlines are time.Time or drainclock.Now (celeris#1176)", fn, ints, monos)
 		}
 	}
-	// poolWaitGate hands closeIdleH1 the wall stamp drainRead gives a conn's
-	// lastActivity, and reads no other.
-	if ints, inCloseIdle := unixReads1176(find("poolWaitGate").Body); ints != 1 || !inCloseIdle {
-		t.Errorf("poolWaitGate has %d wall-clock integers, in closeIdleH1's arguments: %v; want exactly the one closeIdleH1 is given", ints, inCloseIdle)
+	// poolWaitGate hands closeIdleH1 the stamp drainRead gives a conn's
+	// lastActivity (mono.FromTime of the time.Now() it holds), and reads no other.
+	if ints, monos, inCloseIdle := unixReads1176(find("poolWaitGate").Body); ints != 0 || monos != 1 || !inCloseIdle {
+		t.Errorf("poolWaitGate has %d wall-clock integers and %d mono readings, in closeIdleH1's arguments: %v; want none and exactly the one closeIdleH1 is given", ints, monos, inCloseIdle)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -23,7 +24,7 @@ import (
 func TestPartialFlushAfterADrainThatLeftEPOLLOUTArmedStartsTheClock885(t *testing.T) {
 	const bound = 300 * time.Millisecond
 	r := newTCPClosingRig876(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: bound}, 1<<20)
-	r.cs.lastActivity = time.Now().UnixNano()
+	r.cs.lastActivity = mono.Now()
 	r.l.armEpollOut(r.cs)
 	if r.cs.writeSince == 0 || !r.cs.epollOut {
 		t.Fatalf("premise: armEpollOut did not park the conn")
@@ -69,7 +70,7 @@ func TestPartialFlushAfterADrainThatLeftEPOLLOUTArmedStartsTheClock885(t *testin
 func TestPartialFlushAfterTheSweepEndedTheClockStartsTheClock885(t *testing.T) {
 	const bound = 300 * time.Millisecond
 	r := newTCPClosingRig876(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: bound}, 1<<20)
-	r.cs.lastActivity = time.Now().UnixNano()
+	r.cs.lastActivity = mono.Now()
 	r.l.armEpollOut(r.cs)
 	for i := 0; i < 400 && csWritePending(r.cs); i++ {
 		for r.read(256<<10) > 0 {

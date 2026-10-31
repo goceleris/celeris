@@ -11,6 +11,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -63,12 +64,12 @@ func BenchmarkCheckTimeoutsH2889(b *testing.B) {
 							cs.h2State = h2OpenStream889(b, true)
 							cs.lastActivity = 1
 							if mode == "h2-within" {
-								cs.lastActivity = time.Now().UnixNano()
+								cs.lastActivity = mono.Now()
 							}
 						} else {
 							cs.protocol = engine.HTTP1
 							cs.h1State = conn.NewH1State()
-							cs.lastActivity = time.Now().UnixNano()
+							cs.lastActivity = mono.Now()
 						}
 						l.addLiveConn(cs)
 					}

@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -325,7 +326,7 @@ func TestFlushBeforeHijackKeepsTheWriteClock936(t *testing.T) {
 		cs, peer := pair936(t)
 		cs.writeBuf = append(cs.writeBuf, "small reply"...)
 		cs.pendingBytes = len(cs.writeBuf)
-		old := time.Now().Add(-time.Hour).UnixNano()
+		old := (mono.Now() + int64(-time.Hour))
 		cs.writeSince, cs.lastActivity = old, old
 		l := &Loop{bytesWritten: new(atomic.Uint64)}
 		if err := l.flushBeforeHijack(cs, true); err != nil {
@@ -346,7 +347,7 @@ func TestFlushBeforeHijackKeepsTheWriteClock936(t *testing.T) {
 		reply := bytes.Repeat([]byte("x"), 64<<10) // far more than 4 KiB buffers: refused after progress
 		cs.writeBuf = append(cs.writeBuf, reply...)
 		cs.pendingBytes = len(reply)
-		old := time.Now().Add(-time.Hour).UnixNano()
+		old := (mono.Now() + int64(-time.Hour))
 		cs.writeSince = old
 		l := &Loop{bytesWritten: new(atomic.Uint64)}
 		err := l.flushBeforeHijack(cs, true)

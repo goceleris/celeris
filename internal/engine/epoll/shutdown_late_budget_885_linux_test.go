@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#885 item 12 (from #819 item 2). StartWithContext's watcher hands the
@@ -40,7 +42,7 @@ func TestShutdownSendDrainExtendsToABudgetThatArrivesAfterItBegan(t *testing.T) 
 		once.Do(func() {
 			c := ctx
 			budget.Store(&c)
-			arrived.Store(time.Now().UnixNano())
+			arrived.Store(mono.Now())
 		})
 	})
 	t.Cleanup(restore)

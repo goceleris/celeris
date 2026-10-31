@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -79,12 +80,12 @@ func TestEngineH2ClosingConnIsReapedWhileTheHandlerKeepsWriting(t *testing.T) {
 				return nil
 			}
 		}
-		burstDone.Store(time.Now().UnixNano())
+		burstDone.Store(mono.Now())
 		if trickle {
 			small := bytes.Repeat([]byte{'y'}, 1024)
 			for end := time.Now().Add(trickleFor); time.Now().Before(end); {
 				if ctx.Err() != nil || s.IsCancelled() {
-					cancelledAt.Store(time.Now().UnixNano())
+					cancelledAt.Store(mono.Now())
 					break
 				}
 				if err := st.Write(s, small); err != nil {
@@ -95,7 +96,7 @@ func TestEngineH2ClosingConnIsReapedWhileTheHandlerKeepsWriting(t *testing.T) {
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
-		handlerEnd.Store(time.Now().UnixNano())
+		handlerEnd.Store(mono.Now())
 		return nil
 	})
 
@@ -180,19 +181,19 @@ func TestEngineH2ClosingConnIsReapedWhileTheHandlerKeepsWriting(t *testing.T) {
 		t.Logf("CloseCount reached 1 at %v after the request; ActiveConnections reached 0 at %v", countedAt.Sub(sent).Round(time.Millisecond), closedAt.Sub(sent).Round(time.Millisecond))
 	}
 	if ca := cancelledAt.Load(); ca != 0 {
-		t.Logf("handler saw its stream cancelled %v after the request", time.Unix(0, ca).Sub(sent).Round(time.Millisecond))
+		t.Logf("handler saw its stream cancelled %v after the request", mono.Time(ca).Sub(sent).Round(time.Millisecond))
 	}
 	bd := burstDone.Load()
 	var sinceBurst time.Duration
 	if bd != 0 && !closedAt.IsZero() {
-		sinceBurst = closedAt.Sub(time.Unix(0, bd))
+		sinceBurst = closedAt.Sub(mono.Time(bd))
 	}
 	t.Logf("trickle=%v: request at 0; burst done %s; conn closed %s after the request (%s after the burst); trickles=%d writeErr=%v BytesWritten=%d",
 		trickle, func() string {
 			if bd == 0 {
 				return "never"
 			}
-			return time.Unix(0, bd).Sub(sent).Round(time.Millisecond).String()
+			return mono.Time(bd).Sub(sent).Round(time.Millisecond).String()
 		}(), closedAt.Sub(sent).Round(time.Millisecond), sinceBurst.Round(time.Millisecond), trickles.Load(), writeErr.Load(),
 		e.Metrics().BytesWritten)
 	if bd == 0 {
@@ -268,7 +269,7 @@ func TestEngineH2ClosingConnTakesNoFrameTheHandlerWritesAfterTheRefusal885(t *te
 				return nil
 			}
 		}
-		burstDone.Store(time.Now().UnixNano())
+		burstDone.Store(mono.Now())
 		small := bytes.Repeat([]byte{'y'}, 1024)
 		for end := time.Now().Add(trickleFor); time.Now().Before(end); {
 			if ctx.Err() != nil || s.IsCancelled() {

@@ -33,6 +33,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -338,7 +339,7 @@ func TestDrainReadIsBoundedUnderAFlood885(t *testing.T) {
 
 	before := l.bytesReadBatch
 	start := time.Now()
-	l.drainRead(fd, time.Now().UnixNano())
+	l.drainRead(fd, mono.Now())
 	took := time.Since(start)
 	read := l.bytesReadBatch - before
 	fedDuring := queued.Load()

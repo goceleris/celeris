@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -174,7 +175,7 @@ func TestPoolWaitGateDoesNotCloseAConnWithAnUnreadRequest1104(t *testing.T) {
 		// the cancel), so the silent, keep-alive and budget tests are the
 		// production-reachable arms of this window.
 		before := len(l.liveConns)
-		l.acceptAll(context.Background(), time.Now().UnixNano())
+		l.acceptAll(context.Background(), mono.Now())
 		accepted.Store(int64(len(l.liveConns) - before))
 	}
 	h.pass = gatePass1104

@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -128,7 +129,7 @@ func pumpReads885(l *Loop, fd int, got *responses885) int {
 		}
 		if ev.Events&unix.EPOLLIN != 0 {
 			turns++
-			l.drainRead(fd, time.Now().UnixNano())
+			l.drainRead(fd, mono.Now())
 			got.take()
 		}
 	}
@@ -145,7 +146,7 @@ func TestDrainReadBudgetGivesTheConnAnotherTurn885(t *testing.T) {
 	sendAll885(t, peer, []byte(strings.Repeat("GET /small HTTP/1.1\r\nHost: x\r\n\r\n", reqs)))
 
 	before := l.bytesReadBatch
-	l.drainRead(fd, time.Now().UnixNano())
+	l.drainRead(fd, mono.Now())
 	read := int(l.bytesReadBatch - before)
 	if read < 16<<10 || read > 16<<10+4096 {
 		t.Fatalf("the first turn read %d bytes, want the budget (16384) and at most one buffer more", read)
@@ -160,7 +161,7 @@ func TestDrainReadBudgetGivesTheConnAnotherTurn885(t *testing.T) {
 	// The event was consumed by the check above: ready again only through a
 	// MOD, so pump from the state the run loop is in (it would have this event).
 	got := &responses885{peer: peer}
-	l.drainRead(fd, time.Now().UnixNano())
+	l.drainRead(fd, mono.Now())
 	got.take()
 	turns := 2 + pumpReads885(l, fd, got)
 	if got.count() != reqs {
@@ -184,7 +185,7 @@ func TestDrainReadBudgetAfterADirectBody885(t *testing.T) {
 	sendAll885(t, peer, []byte(req+strings.Repeat("GET /small HTTP/1.1\r\nHost: x\r\n\r\n", tail)))
 
 	got := &responses885{peer: peer}
-	l.drainRead(fd, time.Now().UnixNano())
+	l.drainRead(fd, mono.Now())
 	got.take()
 	turns := 1 + pumpReads885(l, fd, got)
 	if got.count() != 1+tail {
@@ -204,14 +205,14 @@ func TestDrainReadBudgetKeepsEPOLLOUT885(t *testing.T) {
 	// A small send queue, so that the response parks.
 	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096)
 	sendAll885(t, peer, []byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n"))
-	l.drainRead(fd, time.Now().UnixNano())
+	l.drainRead(fd, mono.Now())
 	if !cs.epollOut {
 		t.Fatalf("apparatus: the conn is not parked on its response (epollOut false)")
 	}
 	drainEvents885(l)
 
 	sendAll885(t, peer, []byte(strings.Repeat("GET /small HTTP/1.1\r\nHost: x\r\n\r\n", 2000)))
-	l.drainRead(fd, time.Now().UnixNano()) // stops at the budget, MODs
+	l.drainRead(fd, mono.Now()) // stops at the budget, MODs
 	if !cs.epollOut {
 		t.Fatalf("the turn disarmed EPOLLOUT in the conn's own state")
 	}
@@ -243,7 +244,7 @@ func TestDrainReadBudgetSparesAClosingConn885(t *testing.T) {
 	sendAll885(t, peer, []byte(strings.Repeat("GET /small HTTP/1.1\r\nHost: x\r\n\r\n", 3000)))
 	drainEvents885(l)
 	before := l.bytesReadBatch
-	l.drainRead(fd, time.Now().UnixNano())
+	l.drainRead(fd, mono.Now())
 	if read := int(l.bytesReadBatch - before); read <= 16<<10+4096 {
 		t.Fatalf("a closing conn stopped after %d bytes: the turn must go on as it did without a budget", read)
 	}

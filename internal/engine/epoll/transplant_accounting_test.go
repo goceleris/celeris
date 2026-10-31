@@ -13,6 +13,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -113,7 +114,7 @@ func TestAttachAdoptedFDCountsTheAdopt(t *testing.T) {
 	l := newLedgerLoop(t)
 	fd := socketpairFD(t, l)
 
-	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{RemoteAddr: "127.0.0.1:1"}, time.Now().UnixNano())
+	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{RemoteAddr: "127.0.0.1:1"}, mono.Now())
 
 	if l.conns[fd] == nil {
 		t.Fatalf("fd %d was not adopted (errors=%d) — test setup, not the counter",
@@ -140,7 +141,7 @@ func TestAttachAdoptedFDCountsAnOccupiedSlot(t *testing.T) {
 	t.Cleanup(func() { _ = unix.Close(fd) })
 	occupant := regLive(l, fd)
 
-	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{}, time.Now().UnixNano())
+	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{}, mono.Now())
 
 	if got := l.transplantSlotOccupied.Load(); got != 1 {
 		t.Errorf("transplantSlotOccupied = %d, want 1 — the refusal is still "+

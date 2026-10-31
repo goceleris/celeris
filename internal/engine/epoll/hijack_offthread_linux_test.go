@@ -22,6 +22,7 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -54,8 +55,8 @@ func offThreadRig(t *testing.T, bystanders int) (*hijackRaceRig, []*connState) {
 	t.Helper()
 	rig := hijackRaceConn(t)
 	rig.l.cfg.ReadTimeout = 0
-	rig.cs.lastActivity = time.Now().UnixNano()
-	now := time.Now().UnixNano()
+	rig.cs.lastActivity = mono.Now()
+	now := mono.Now()
 	bs := make([]*connState, bystanders)
 	for i := range bs {
 		b := &connState{fd: 900 + i, liveIdx: -1, lastActivity: now}
@@ -219,7 +220,7 @@ func TestHijackedEntryDoesNotAliasTheNextOwnerOfItsDescriptor(t *testing.T) {
 	l.addLiveConn(cs)
 	// Expired: if its stale entry were read as the next owner, the reap
 	// would close that owner.
-	cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-time.Hour))
 
 	cs.detachMu.Lock()
 	nc, err := l.hijackConn(local)
@@ -231,7 +232,7 @@ func TestHijackedEntryDoesNotAliasTheNextOwnerOfItsDescriptor(t *testing.T) {
 
 	// The number is reissued and accepted again on this loop.
 	pipeWrite := hijackRaceRecycle(t, local)
-	next := &connState{fd: local, liveIdx: -1, lastActivity: time.Now().UnixNano()}
+	next := &connState{fd: local, liveIdx: -1, lastActivity: mono.Now()}
 	next.h1State = conn.NewH1State()
 	l.driverMu.Lock()
 	l.conns[local] = next
@@ -523,7 +524,7 @@ func acceptAfterHijackAttempt(t *testing.T) bool {
 	acceptOne := func() {
 		for dl := time.Now().Add(3 * time.Second); time.Now().Before(dl); {
 			before := len(l.liveConns)
-			l.acceptAll(context.Background(), time.Now().UnixNano())
+			l.acceptAll(context.Background(), mono.Now())
 			if len(l.liveConns) > before {
 				return
 			}
@@ -565,7 +566,7 @@ func acceptAfterHijackAttempt(t *testing.T) bool {
 			time.Sleep(50 * time.Microsecond)
 		}
 		for range 3000 {
-			if l.acceptAll(context.Background(), time.Now().UnixNano()) != acceptDrained || len(l.liveConns) > 1 {
+			if l.acceptAll(context.Background(), mono.Now()) != acceptDrained || len(l.liveConns) > 1 {
 				return
 			}
 			time.Sleep(time.Millisecond)

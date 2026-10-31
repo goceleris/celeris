@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -80,7 +81,7 @@ func TestParkedLoopsAreNotStuck1170(t *testing.T) {
 		}
 	}
 	time.Sleep(300 * time.Millisecond)
-	if watch.BlockedFor(time.Now().UnixNano(), int64(100*time.Millisecond)) {
+	if watch.BlockedFor(mono.Now(), int64(100*time.Millisecond)) {
 		t.Fatal("a parked loop reads as stuck in a batch: its stamp was left behind")
 	}
 }

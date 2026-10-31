@@ -27,6 +27,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -95,7 +96,7 @@ func adoptedPair885(t testing.TB, l *Loop) (fd, peer int, cs *connState) {
 	if _, err := unix.Write(peer, []byte("x")); err != nil {
 		t.Fatalf("write the peer: %v", err)
 	}
-	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{RemoteAddr: "pair"}, time.Now().UnixNano())
+	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{RemoteAddr: "pair"}, mono.Now())
 	cs = slotOf885(l, fd)
 	if cs == nil {
 		t.Fatalf("attachAdoptedFD(%d) left the slot empty", fd)
@@ -163,7 +164,7 @@ func TestHTTPEventsCarryAGeneration885(t *testing.T) {
 		// is queued.
 		var fd int
 		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
-			l.acceptAll(context.Background(), time.Now().UnixNano())
+			l.acceptAll(context.Background(), mono.Now())
 			for i, cs := range l.conns {
 				if cs != nil {
 					fd = i
@@ -260,7 +261,7 @@ func TestHTTPEventsCarryAGeneration885(t *testing.T) {
 			t.Fatalf("write the request: %v", err)
 		}
 		cs.recvPauseDesired.Store(true)
-		l.drainRead(fd, time.Now().UnixNano())
+		l.drainRead(fd, mono.Now())
 		if !cs.recvPaused {
 			t.Fatalf("drainRead did not apply the pause (conn closed: %v)", slotOf885(l, fd) == nil)
 		}
@@ -382,7 +383,7 @@ func TestStaleHTTPEventDoesNotReachConnOnReusedNumber885(t *testing.T) {
 			// descriptor on it would keep its epoll registration alive.
 			gClosed.Store(true)
 			_ = unix.Close(gFD)
-			l.attachAdoptedFD(context.Background(), fFD, engine.Carryover{RemoteAddr: "G"}, time.Now().UnixNano())
+			l.attachAdoptedFD(context.Background(), fFD, engine.Carryover{RemoteAddr: "G"}, mono.Now())
 		})
 	}, func(error) {}); err != nil {
 		t.Fatalf("RegisterConn(P): %v", err)

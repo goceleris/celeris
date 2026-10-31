@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -245,7 +246,7 @@ func TestParkedConnWithNothingParkedIsStillReapedByReadTimeout885(t *testing.T) 
 	t.Run("tcp-drained-then-idle", func(t *testing.T) {
 		const rt = 300 * time.Millisecond
 		r := newTCPClosingRig876(t, resource.Config{ReadTimeout: rt, IdleTimeout: -1, WriteTimeout: 600 * time.Millisecond}, 1<<20)
-		r.cs.lastActivity = time.Now().UnixNano()
+		r.cs.lastActivity = mono.Now()
 		r.l.armEpollOut(r.cs)
 		for i := 0; i < 400 && csWritePending(r.cs); i++ {
 			for r.read(256<<10) > 0 {
@@ -271,7 +272,7 @@ func TestParkedConnWithNothingParkedIsStillReapedByReadTimeout885(t *testing.T) 
 	t.Run("not-tcp-parked", func(t *testing.T) {
 		const rt = 300 * time.Millisecond
 		r := newClosingRig876(t, resource.Config{ReadTimeout: rt, IdleTimeout: -1, WriteTimeout: time.Hour}, 1<<20)
-		r.cs.lastActivity = time.Now().UnixNano()
+		r.cs.lastActivity = mono.Now()
 		r.l.armEpollOut(r.cs)
 		start := time.Now()
 		for time.Since(start) < 2*time.Second {

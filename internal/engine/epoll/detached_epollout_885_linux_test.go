@@ -15,6 +15,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#885 item 42, unit level: a truly-detached conn with a remainder
@@ -231,7 +232,7 @@ func TestDrainReadsInlineFlushHandsADetachedConnToEPOLLOUT885(t *testing.T) {
 		t.Fatalf("peer write: %d, %v", n, err)
 	}
 
-	l.drainRead(cs.fd, time.Now().UnixNano())
+	l.drainRead(cs.fd, mono.Now())
 
 	if !csWritePending(cs) {
 		t.Fatal("premise: the socket took the whole queue")
