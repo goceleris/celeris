@@ -180,17 +180,27 @@ func TestSweepTickOnARealRing884(t *testing.T) {
 	}
 }
 
-// waitCQE1183 waits on r for a completion and returns the CQ ring's head and
-// tail, and how many times the wait came back with the CQ ring empty.
+// waitCQE1183 waits on r until its CQ ring has a completion, or 10 s have gone
+// by, and returns the CQ ring's head and tail and how many times a wait came
+// back with the CQ ring empty. The condition is a completion, not one wait
+// returning: SubmitAndWait returns nil on a signal, and a wait can end with
+// nothing to read (celeris#1183). Each retry is a new io_uring_enter with
+// GETEVENTS, as the run loop's iterations are: under DEFER_TASKRUN a
+// completion is posted by that call and a look at the CQ ring would not
+// find it.
 func waitCQE1183(r *Ring) (head, tail uint32, empty int, err error) {
-	if err = r.SubmitAndWait(); err != nil {
-		return 0, 0, 0, err
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if err = r.SubmitAndWait(); err != nil {
+			return 0, 0, empty, err
+		}
+		if head, tail = r.BeginCQ(); head != tail {
+			return head, tail, empty, nil
+		}
+		empty++
+		if !time.Now().Before(deadline) {
+			return head, tail, empty, nil
+		}
 	}
-	head, tail = r.BeginCQ()
-	if head == tail {
-		empty = 1
-	}
-	return head, tail, empty, nil
 }
 
 // TestSweepTickWaitSurvivesAnEmptyReturn1183: Ring.SubmitAndWait returns nil
