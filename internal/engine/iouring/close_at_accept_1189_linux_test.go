@@ -55,7 +55,11 @@ func TestConnClosedByTheArmAtAcceptGetsNoRecv1189(t *testing.T) {
 	testHookCheckTimeouts.Store(&hook)
 	t.Cleanup(func() { testHookCheckTimeouts.Store(nil) })
 	logs := &syncBuf806{}
-	var first atomic.Bool
+	var (
+		first        atomic.Bool
+		connReturned atomic.Pointer[time.Time] // when the slow OnConnect returned
+		closedAt     atomic.Pointer[time.Time] // when the first connection's OnDisconnect ran
+	)
 	r := startEngine806(t, loadHandler806{}, func(c *resource.Config) {
 		c.Protocol = engine.Auto
 		c.ReadHeaderTimeout = 200 * time.Millisecond
@@ -64,7 +68,13 @@ func TestConnClosedByTheArmAtAcceptGetsNoRecv1189(t *testing.T) {
 		c.OnConnect = func(string) {
 			if first.CompareAndSwap(false, true) {
 				time.Sleep(300 * time.Millisecond)
+				now := time.Now()
+				connReturned.Store(&now)
 			}
+		}
+		c.OnDisconnect = func(string) {
+			now := time.Now()
+			closedAt.CompareAndSwap(nil, &now)
 		}
 	})
 	mu.Lock()
@@ -80,6 +90,22 @@ func TestConnClosedByTheArmAtAcceptGetsNoRecv1189(t *testing.T) {
 	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatalf("the connection whose budget was spent at the accept: read = %v, want it closed (EOF)", err)
 	}
+
+	// The scenario happened: the arm closed the connection at the accept, as soon as
+	// OnConnect returned, not at a timer or a sweep after it. Without this the test
+	// passes when the OnConnect did not outlast the budget (nothing is closed at the
+	// accept), or when a timer or the sweep closed the connection, which have nothing
+	// to leave behind. The close is within microseconds of the return when it is the
+	// arm's (measured 6 to 75 microseconds, under -race too); a timer
+	// would be ReadHeaderTimeout (200 ms) after the accept, which is 200 ms after the return, and the sweep's 100 ms or more.
+	ret, closed := connReturned.Load(), closedAt.Load()
+	if ret == nil || closed == nil {
+		t.Fatalf("OnConnect returned: %v, OnDisconnect ran: %v: the scenario did not occur", ret != nil, closed != nil)
+	}
+	if gap := closed.Sub(*ret); gap < 0 || gap > 50*time.Millisecond {
+		t.Fatalf("the connection was closed %v after its slow OnConnect returned, want within 50ms: it was not the arm at the accept that closed it", gap)
+	}
+	t.Logf("closed %v after OnConnect returned", closed.Sub(*ret))
 
 	// A healthy connection is served.
 	c2, err := net.DialTimeout("tcp", r.addr, 3*time.Second)
