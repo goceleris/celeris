@@ -14,6 +14,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -129,8 +130,8 @@ func TestDetachedPeerThatTakesNothingIsClosed888(t *testing.T) {
 	s := newStall888(t, stall888Bound)
 	// The last read of the connection is fresh and stays so: a WebSocket ping,
 	// an SSE client's request. The clock is not keyed on it.
-	s.cs.lastActivity = time.Now().UnixNano()
-	el, closing := s.sweepUntilClosing(5*time.Second, func() { s.cs.lastActivity = time.Now().UnixNano() })
+	s.cs.lastActivity = mono.Now()
+	el, closing := s.sweepUntilClosing(5*time.Second, func() { s.cs.lastActivity = mono.Now() })
 	if !closing {
 		t.Fatalf("a detached conn whose peer takes nothing was not closed within %v (WriteTimeout %v)", el, stall888Bound)
 	}
@@ -147,7 +148,7 @@ func TestDetachedPeerThatTakesNothingIsClosed888(t *testing.T) {
 // does not depend on it.
 func TestDetachedStallIsBoundedWhateverTheIdleDeadlineSays888(t *testing.T) {
 	s := newStall888(t, stall888Bound)
-	push := func() { s.cs.h1State.IdleDeadlineNs.Store(time.Now().Add(time.Hour).UnixNano()) }
+	push := func() { s.cs.h1State.IdleDeadlineNs.Store((mono.Now() + int64(time.Hour))) }
 	push()
 	if el, closing := s.sweepUntilClosing(5*time.Second, push); !closing {
 		t.Fatalf("a stalled conn with its idle deadline pushed out was not closed within %v", el)
@@ -161,7 +162,7 @@ func TestDetachedPeerThatTakesBytesIsNotClosed888(t *testing.T) {
 	for _, mode := range []string{"send-completions", "acked-bytes"} {
 		t.Run(mode, func(t *testing.T) {
 			s := newStall888(t, stall888Bound)
-			s.cs.lastActivity = time.Now().Add(-time.Hour).UnixNano() // the request is long ago
+			s.cs.lastActivity = (mono.Now() + int64(-time.Hour)) // the request is long ago
 			// Fill the socket so that acknowledged bytes are the peer's reads.
 			filled := fillSocket888(t, s.cs.fd)
 			t.Logf("socket took %d bytes before parking", filled)
@@ -188,7 +189,7 @@ func TestDetachedPeerThatTakesBytesIsNotClosed888(t *testing.T) {
 					s.cs.zcNotifPending = true
 					s.cs.sendBuf = make([]byte, 1<<20)
 					s.cs.sending = true
-					s.w.completeSend(s.cs, s.cs.fd, 4096, time.Now().UnixNano(), false)
+					s.w.completeSend(s.cs, s.cs.fd, 4096, mono.Now(), false)
 					s.cs.sending = true
 					s.cs.zcNotifPending = false
 					s.cs.detachMu.Unlock()

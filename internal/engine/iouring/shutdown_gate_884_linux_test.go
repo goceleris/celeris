@@ -14,6 +14,7 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
@@ -214,7 +215,7 @@ func gateRig884(t *testing.T, n int) (*Worker, []*connState, []int) {
 		handoffLoss: &handoffLossStats{},
 		listenFD:    -1,
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	var css []*connState
 	var peers []int
 	for range n {

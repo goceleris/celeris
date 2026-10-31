@@ -10,6 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -36,7 +37,7 @@ func newClosingDrainWorker(t *testing.T, ring *Ring) (*Worker, *connState) {
 		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{IdleTimeout: time.Second},
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	cs := &connState{
 		fd:             local,
 		liveIdx:        -1,
@@ -45,7 +46,7 @@ func newClosingDrainWorker(t *testing.T, ring *Ring) (*Worker, *connState) {
 		kernelInflight: 1,
 		sendBuf:        []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
 		// Idle for an hour: the conn is being closed BECAUSE it timed out.
-		lastActivity: time.Now().Add(-time.Hour).UnixNano(),
+		lastActivity: (mono.Now() + int64(-time.Hour)),
 	}
 	w.conns[local] = cs
 	w.addLiveConn(cs)
@@ -70,7 +71,7 @@ func TestCheckTimeoutsReapsWedgedClosingConn(t *testing.T) {
 	// Parked by the deferred-close branch, with the drain deadline base
 	// stamped long enough ago that no plausible bound is still running.
 	cs.closing = true
-	cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-time.Hour))
 
 	before := ring.Pending()
 	w.checkTimeouts()
@@ -154,7 +155,7 @@ func TestCheckTimeoutsGivesClosingConnItsWriteTimeout(t *testing.T) {
 			w.cfg.WriteTimeout = tc.wt
 			fd := cs.fd
 			cs.closing = true
-			cs.lastActivity = time.Now().Add(-tc.idle).UnixNano()
+			cs.lastActivity = (mono.Now() + int64(-tc.idle))
 			w.checkTimeouts()
 			if reaped := w.conns[fd] == nil; reaped != tc.reaps {
 				t.Fatalf("closing conn idle %v with WriteTimeout %v: reaped=%v, want %v", tc.idle, tc.wt, reaped, tc.reaps)
@@ -172,10 +173,10 @@ func TestCompleteSendRestampsClosingDrain(t *testing.T) {
 	w, cs := newClosingDrainWorker(t, ring)
 	fd := cs.fd
 	cs.closing = true
-	stale := time.Now().Add(-time.Hour).UnixNano()
+	stale := (mono.Now() + int64(-time.Hour))
 	cs.lastActivity = stale
 	cs.sendBuf = make([]byte, 64<<10) // a response tail, 1 KiB of it sent below
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	w.completeSend(cs, fd, 1<<10, now, false)
 	if w.conns[fd] != cs {
 		t.Fatalf("a partial send closed the closing conn")

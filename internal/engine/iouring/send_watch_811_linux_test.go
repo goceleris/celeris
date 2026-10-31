@@ -5,6 +5,8 @@ package iouring
 import (
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // TestIouringDirtyPassGiveUpSetsTheSendWatch811: the give-up leaves a parked
@@ -41,7 +43,7 @@ func TestIouringDirtyPassGiveUpSetsTheSendWatch811(t *testing.T) {
 		{"not_an_8th_iteration", 9, 2 * time.Second, false},
 	} {
 		w.tickCounter = tc.tick
-		w.lastSweep = time.Now().Add(-tc.sweptAgo).UnixNano()
+		w.lastSweep = (mono.Now() + int64(-tc.sweptAgo))
 		if got := w.sweepWatchDue(); got != tc.want {
 			t.Errorf("sweepWatchDue %s (tick %d, last sweep %v ago) = %v, want %v", tc.name, tc.tick, tc.sweptAgo, got, tc.want)
 		}
@@ -56,7 +58,7 @@ func TestIouringDirtyPassGiveUpSetsTheSendWatch811(t *testing.T) {
 		t.Errorf("sweepWatchDue right after a sweep")
 	}
 
-	w.handleSend(sendCQE750(rig, int32(len(tail)), 0), rig.local, time.Now().UnixNano())
+	w.handleSend(sendCQE750(rig, int32(len(tail)), 0), rig.local, mono.Now())
 	if cs.sending {
 		t.Fatalf("apparatus: the SEND is still outstanding after its completion")
 	}
@@ -96,7 +98,7 @@ func TestIouringRemainderSendSetsTheWatches884(t *testing.T) {
 	if !waitUntimed(true, true, false, w.remainderWatch) {
 		t.Errorf("waitUntimed is false with only a first SEND in flight")
 	}
-	w.handleSend(sendCQE750(rig, int32(len("a response")), 0), rig.local, time.Now().UnixNano())
+	w.handleSend(sendCQE750(rig, int32(len("a response")), 0), rig.local, mono.Now())
 
 	// A long first SEND (an async handler's short direct write leaves the
 	// rest of a large response to the ring, as a first SEND into a socket that
@@ -110,7 +112,7 @@ func TestIouringRemainderSendSetsTheWatches884(t *testing.T) {
 		t.Fatalf("a first SEND of %d bytes: sending=%v remainderOut=%v remainderWatch=%v sendWatch=%v, want all true",
 			longSendBytes, cs.sending, cs.remainderOut, w.remainderWatch, w.sendWatch)
 	}
-	w.handleSend(sendCQE750(rig, int32(longSendBytes), 0), rig.local, time.Now().UnixNano())
+	w.handleSend(sendCQE750(rig, int32(longSendBytes), 0), rig.local, mono.Now())
 	if cs.remainderOut {
 		t.Fatalf("the long SEND's completion left remainderOut set")
 	}
@@ -123,7 +125,7 @@ func TestIouringRemainderSendSetsTheWatches884(t *testing.T) {
 	const first = "0123456789abcdef"
 	inFlight750(rig, first, false)
 	w.sendWatch = false
-	w.handleSend(sendCQE750(rig, 8, 0), rig.local, time.Now().UnixNano())
+	w.handleSend(sendCQE750(rig, 8, 0), rig.local, mono.Now())
 	if sqes := takeSQEs(w.ring); len(sqes) != 1 {
 		t.Fatalf("apparatus: %d SQEs after a partial completion, want the remainder's SEND", len(sqes))
 	}
@@ -147,7 +149,7 @@ func TestIouringRemainderSendSetsTheWatches884(t *testing.T) {
 	}
 
 	// Its completion ends them: the conn's flag at once, the worker's at the sweep.
-	w.handleSend(sendCQE750(rig, int32(len(first)-8), 0), rig.local, time.Now().UnixNano())
+	w.handleSend(sendCQE750(rig, int32(len(first)-8), 0), rig.local, mono.Now())
 	if cs.sending || cs.remainderOut {
 		t.Fatalf("after the remainder's completion sending=%v remainderOut=%v, want both false", cs.sending, cs.remainderOut)
 	}
@@ -187,7 +189,7 @@ func TestIouringLongSendCompletionEndsRemainderWatchAtOnce884(t *testing.T) {
 	if !cs.remainderOut || !w.remainderWatch {
 		t.Fatalf("apparatus: the long SEND left remainderOut=%v remainderWatch=%v, want both true", cs.remainderOut, w.remainderWatch)
 	}
-	w.handleSend(sendCQE750(rig, int32(longSendBytes), 0), rig.local, time.Now().UnixNano())
+	w.handleSend(sendCQE750(rig, int32(longSendBytes), 0), rig.local, mono.Now())
 	if cs.remainderOut {
 		t.Fatalf("the long SEND's completion left remainderOut set")
 	}

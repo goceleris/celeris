@@ -17,6 +17,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -121,7 +122,7 @@ func TestWriteClockStampAfterAQuietGapIsFresh1173(t *testing.T) {
 	var age atomic.Int64
 	seam := func(w *Worker, _ int) {
 		if armed.CompareAndSwap(true, false) {
-			age.Store(time.Now().UnixNano() - w.cachedNow)
+			age.Store(mono.Now() - w.cachedNow)
 		}
 	}
 	h2WriteDrainSeam.Store(&seam)

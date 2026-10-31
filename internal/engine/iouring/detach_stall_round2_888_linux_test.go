@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // Review round 1 of celeris#1077: the stall bound's reach (a SEND of any size
@@ -76,7 +77,7 @@ func TestDetachedSparseSweepsGiveAReadingPeerABound888(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			s := newStall888(t, stall888Bound)
-			s.cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
+			s.cs.lastActivity = (mono.Now() + int64(-time.Hour))
 			fillSocket888(t, s.cs.fd)
 			gap := stall888Bound * 3 / 2
 			buf := make([]byte, 4096)
@@ -156,7 +157,7 @@ func TestStallLookRateLimit888(t *testing.T) {
 // the clock.
 func TestStalledCloseSkipsTheClosingDrain888(t *testing.T) {
 	s := newStall888(t, stall888Bound)
-	s.cs.lastActivity = time.Now().UnixNano()
+	s.cs.lastActivity = mono.Now()
 	fillSocket888(t, s.cs.fd)
 	if _, closing := s.sweepUntilClosing(5*time.Second, nil); !closing {
 		t.Fatal("not closed")
@@ -164,14 +165,14 @@ func TestStalledCloseSkipsTheClosingDrain888(t *testing.T) {
 	bound := s.w.closingDrainBound()
 	spent := func(when string) {
 		t.Helper()
-		if age := time.Now().UnixNano() - s.cs.lastActivity; age <= bound {
+		if age := mono.Now() - s.cs.lastActivity; age <= bound {
 			t.Fatalf("%s: the closing drain's clock is %v old, the bound is %v: the stalled conn would hold its descriptor and queue for another bound",
 				when, time.Duration(age), time.Duration(bound))
 		}
 	}
 	spent("after the stall close")
 	// The closing sample, a quarter of the bound later, with the peer silent.
-	later := time.Now().UnixNano() + bound/4 + int64(time.Millisecond)
+	later := mono.Now() + bound/4 + int64(time.Millisecond)
 	s.w.noteClosingAcked(s.cs, later)
 	spent("after a closing sample of a silent peer")
 	// The peer reads: its acknowledged count moves, and the drain goes on.

@@ -5,6 +5,8 @@ package iouring
 import (
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // TestPendingReleaseDrainsWhenNoKernelOps verifies the fast path of the
@@ -14,7 +16,7 @@ import (
 // is gone — release is gated on the kernel's terminal CQEs, not time.
 func TestPendingReleaseDrainsWhenNoKernelOps(t *testing.T) {
 	w := &Worker{}
-	start := time.Now().UnixNano()
+	start := mono.Now()
 
 	w.queuePendingRelease(&connState{})         // pooled-recycle path
 	w.queuePendingReleaseDetached(&connState{}) // detached path (drops the ref)
@@ -40,7 +42,7 @@ func TestPendingReleaseDrainsWhenNoKernelOps(t *testing.T) {
 // so a retransmitted POST segment was DMA'd into freed memory.
 func TestPendingReleaseHeldWhileKernelOpsInflight(t *testing.T) {
 	w := &Worker{}
-	start := time.Now().UnixNano()
+	start := mono.Now()
 
 	cs := &connState{fd: 9, generation: 3, kernelInflight: 1, recvArmed: true}
 	w.noteClosedInflight(cs)
@@ -90,7 +92,7 @@ func TestPendingReleaseBackstopIsWallClock(t *testing.T) {
 	}
 
 	w := &Worker{}
-	start := time.Now().UnixNano()
+	start := mono.Now()
 
 	cs := &connState{fd: 5, generation: 7, kernelInflight: 1, recvArmed: true}
 	w.noteClosedInflight(cs)
@@ -140,7 +142,7 @@ func TestPendingReleaseStragglerDoesNotBlockQueue(t *testing.T) {
 	w.queuePendingRelease(&connState{fd: 4, generation: 1}) // drained
 	w.queuePendingRelease(&connState{fd: 6, generation: 2}) // drained
 
-	w.cachedNow = time.Now().UnixNano() // before any backstop deadline
+	w.cachedNow = mono.Now() // before any backstop deadline
 	w.drainPendingRelease()
 	if got := len(w.pendingRelease); got != 1 {
 		t.Fatalf("straggler blocked the queue: %d left, want 1", got)
@@ -174,7 +176,7 @@ func TestClosedOpsCollisionHoldsAllConns(t *testing.T) {
 	}
 
 	ud := encodeUserDataGen(udRecv, fd, gen)
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 
 	// Two of three terminal CQEs: nobody releases yet.
 	for i := 0; i < 2; i++ {
@@ -224,7 +226,7 @@ func TestStaleTerminalOpIgnoresIntermediateCQEs(t *testing.T) {
 	if cs.kernelInflight != 1 {
 		t.Fatalf("intermediate F_MORE CQE drained the count: %d", cs.kernelInflight)
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	w.drainPendingRelease()
 	if got := len(w.pendingRelease); got != 1 {
 		t.Fatalf("released on intermediate CQE: %d left, want 1", got)

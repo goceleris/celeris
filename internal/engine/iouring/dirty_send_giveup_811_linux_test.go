@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#811, the fixture half. The end-to-end test
@@ -55,7 +57,7 @@ func TestIouringDirtyPassGivesUpAConnWithAnOutstandingSend811(t *testing.T) {
 			// notification re-sends the unsent bytes as a plain SEND.
 			name: "zc_first_completion_failed", zc: true,
 			setup: func(rig *stallRig704) {
-				rig.w.handleSend(sendCQE750(rig, -int32(unix.ENOMEM), cqeFMore), rig.local, time.Now().UnixNano())
+				rig.w.handleSend(sendCQE750(rig, -int32(unix.ENOMEM), cqeFMore), rig.local, mono.Now())
 			},
 			cqes: []step811{{0, cqeFNotif}}, want: tail,
 		},
@@ -91,7 +93,7 @@ func TestIouringDirtyPassGivesUpAConnWithAnOutstandingSend811(t *testing.T) {
 			// The completions are what act for the conn now.
 			var placed []sqeRec
 			for _, s := range tc.cqes {
-				w.handleSend(sendCQE750(rig, s.res, s.flags), rig.local, time.Now().UnixNano())
+				w.handleSend(sendCQE750(rig, s.res, s.flags), rig.local, mono.Now())
 				placed = append(placed, takeSQEs(w.ring)...)
 			}
 			if len(placed) != 1 || placed[0].op != opSEND || !cs.sending || string(cs.sendBuf) != tc.want {
@@ -133,7 +135,7 @@ func TestIouringDirtyPassGiveUpKeepsTheRecvStallEpisode811(t *testing.T) {
 	w.flushDirty() // not listed: nothing more may be counted
 	takeSQEs(w.ring)
 
-	w.handleSend(sendCQE750(rig, int32(len(tail)), 0), rig.local, time.Now().UnixNano())
+	w.handleSend(sendCQE750(rig, int32(len(tail)), 0), rig.local, mono.Now())
 	placed := takeSQEs(w.ring)
 	if len(placed) != 1 || placed[0].op != opRECV || !cs.recvArmed || cs.needsRecv {
 		t.Errorf("after the SEND completed: placed %v recvArmed=%v needsRecv=%v; want the owed recv armed",
@@ -175,13 +177,13 @@ func TestIouringCheckTimeoutsJudgesAFailedFirstZCCompletionByWriteTimeout811(t *
 			rig := newStallRig704(t)
 			w, cs := rig.w, rig.cs
 			inFlight750(rig, tail, true)
-			w.handleSend(sendCQE750(rig, -int32(unix.ENOMEM), cqeFMore), rig.local, time.Now().UnixNano())
+			w.handleSend(sendCQE750(rig, -int32(unix.ENOMEM), cqeFMore), rig.local, mono.Now())
 			if cs.sending || !cs.zcNotifPending || cs.dirty {
 				t.Fatalf("apparatus: sending=%v zcNotifPending=%v dirty=%v, want false/true/false", cs.sending, cs.zcNotifPending, cs.dirty)
 			}
 			takeSQEs(w.ring)
 			w.cfg.WriteTimeout, w.cfg.ReadTimeout, w.cfg.IdleTimeout = tc.write, tc.read, time.Hour
-			cs.lastActivity = time.Now().Add(-age).UnixNano()
+			cs.lastActivity = (mono.Now() + int64(-age))
 
 			w.checkTimeouts()
 

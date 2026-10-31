@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -51,7 +52,7 @@ func (h loadHandler806) HandleStream(_ context.Context, s *stream.Stream) error 
 	body := []byte("ok")
 	if s.Path == "/big" {
 		body = h.big
-		h.lastEntry.Store(time.Now().UnixNano())
+		h.lastEntry.Store(mono.Now())
 	}
 	return s.ResponseWriter.WriteResponse(s, 200,
 		[][2]string{{"content-type", "application/octet-stream"}, {"content-length", strconv.Itoa(len(body))}}, body)
@@ -223,7 +224,7 @@ func TestShutdownUnderKeepAliveLoad806(t *testing.T) {
 				// still be answered). A request is a 1 MiB response away from
 				// the next, so 350 ms of slack covers the dispatch, not a second
 				// wave of them.
-				if late := time.Duration(lastEntry.Load() - start.UnixNano()); late > floor+350*time.Millisecond {
+				if late := time.Duration(lastEntry.Load() - mono.FromTime(start)); late > floor+350*time.Millisecond {
 					t.Errorf("a request reached the handler %v into the shutdown, past the drain's first %v: the loop is still serving keep-alive connections", late.Round(time.Millisecond), floor)
 				}
 				if took > 1500*time.Millisecond {

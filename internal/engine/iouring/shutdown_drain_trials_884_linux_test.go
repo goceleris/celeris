@@ -6,6 +6,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#884 item 16, trials (a) and (b). The shutdown drain
@@ -39,7 +41,7 @@ func reapReal884(t *testing.T, w *Worker, stop func(c *completionEntry) bool) bo
 		found := false
 		for ; head != tail; head++ {
 			c := w.ring.cqeAt(head)
-			w.processCQE(context.Background(), c, time.Now().UnixNano())
+			w.processCQE(context.Background(), c, mono.Now())
 			if stop(c) {
 				found = true
 			}

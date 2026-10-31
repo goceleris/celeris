@@ -4,7 +4,8 @@ package iouring
 
 import (
 	"testing"
-	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // BenchmarkCompleteSend888 is completeSend's all-sent path for an ordinary
@@ -16,7 +17,7 @@ func BenchmarkCompleteSend888(b *testing.B) {
 	w := &Worker{}
 	cs := &connState{fd: 7, liveIdx: -1, detected: true}
 	buf := make([]byte, 128)
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

@@ -7,6 +7,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The timeout sweep's pacing (celeris#884 items 65, 74 and 75): the time gate
@@ -69,7 +71,7 @@ func (w *Worker) sweepClock(gotCQE, gateHit bool) int64 {
 		return w.cachedNow
 	}
 	if gateHit || w.sweepTickFired || w.hasLongIdleWait() || (w.emptyIters > 10 && w.dirtyHead == nil) || w.tickCounter&0x7 == 0 {
-		return time.Now().UnixNano()
+		return mono.Now()
 	}
 	return w.cachedNow
 }

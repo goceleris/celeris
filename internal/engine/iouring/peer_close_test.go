@@ -14,6 +14,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -49,7 +50,7 @@ func TestPeerCloseSurfacesEOF(t *testing.T) {
 		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{IdleTimeout: time.Second},
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 
 	var mu sync.Mutex
 	var got error

@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -306,7 +307,7 @@ func TestReapOnTheRunningKernel(t *testing.T) {
 			head, tail := f.w.ring.BeginCQ()
 			for ; head != tail; head++ {
 				c := *f.w.ring.cqeAt(head)
-				f.w.processCQE(context.Background(), &c, time.Now().UnixNano())
+				f.w.processCQE(context.Background(), &c, mono.Now())
 			}
 			f.w.ring.EndCQ(head)
 			if _, err := f.w.ring.Submit(); err != nil {

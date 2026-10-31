@@ -10,6 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#884 items 20 and 21: what becomes of a send completion held for a
@@ -230,7 +231,7 @@ func holdOne884(t *testing.T, rig *stallRig704, tail string) *completionEntry {
 	release := holdAsHandler704(t, rig.cs, true)
 	defer release()
 	c := sendCQE750(rig, int32(len(tail)), 0)
-	rig.w.handleSend(c, rig.local, time.Now().UnixNano())
+	rig.w.handleSend(c, rig.local, mono.Now())
 	if heldSends750(rig.cs) != 1 {
 		t.Fatalf("apparatus: the completion was not held (held=%d)", heldSends750(rig.cs))
 	}
@@ -258,7 +259,7 @@ func TestIouringHeldCompletionIsNotAppliedToANewOwner884(t *testing.T) {
 		}
 		cs.sending, cs.sendBuf = true, append(cs.sendBuf[:0], fresh...)
 		c := &completionEntry{UserData: encodeUserDataGen(udSend, rig.local, cs.generation), Res: int32(len(fresh))}
-		w.handleSend(c, rig.local, time.Now().UnixNano())
+		w.handleSend(c, rig.local, mono.Now())
 		t.Logf("celeris884 REUSE arm=release held=%d sending=%v sendBuf=%d", heldSends750(cs), cs.sending, len(cs.sendBuf))
 		if cs.sending || len(cs.sendBuf) != 0 || heldSends750(cs) != 0 {
 			t.Errorf("the new owner's completion was not applied (sending=%v sendBuf=%q held=%d): a stale held "+

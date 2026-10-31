@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The deterministic form of TestWriteClockStampAfterAQuietGapIsFresh1173
@@ -62,7 +64,7 @@ func TestWriteClockStampAfterAnEmptyWaitIsFreshDeterministic1173(t *testing.T) {
 	}
 	seam := func(w *Worker, _ int) {
 		if probing.CompareAndSwap(true, false) {
-			age.Store(time.Now().UnixNano() - w.cachedNow)
+			age.Store(mono.Now() - w.cachedNow)
 			select {
 			case resultCh <- struct{}{}:
 			default:
@@ -146,10 +148,10 @@ func TestWriteClockStampAfterAnEmptyWaitIsFreshDeterministic1173(t *testing.T) {
 func TestReadClockAfterWaitIsFreshWithNoCompletion1173(t *testing.T) {
 	for _, iters := range []uint32{0, 1, 2, 5, 10, 50, 100, 150, 200} {
 		w := &Worker{emptyIters: iters}
-		stale := time.Now().UnixNano() - int64(time.Second)
+		stale := mono.Now() - int64(time.Second)
 		w.cachedNow = stale
 		w.readClockAfterWait(false)
-		if age := time.Duration(time.Now().UnixNano() - w.cachedNow); age > 100*time.Millisecond {
+		if age := time.Duration(mono.Now() - w.cachedNow); age > 100*time.Millisecond {
 			t.Errorf("emptyIters %d: the clock is %v old after a wait with no completion", iters, age)
 		}
 	}

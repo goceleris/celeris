@@ -17,6 +17,7 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -69,7 +70,7 @@ func BenchmarkSweepH2Deadlines889(b *testing.B) {
 					closeCount:  &atomic.Uint64{},
 					cfg:         resource.Config{ReadTimeout: 60 * time.Second, IdleTimeout: 600 * time.Second},
 				}
-				now := time.Now().UnixNano()
+				now := mono.Now()
 				for i := 0; i < n; i++ {
 					fd := i + 3
 					cs := &connState{fd: fd, liveIdx: -1, detected: true}
