@@ -177,12 +177,12 @@ jobs:
       # one and fails at once; the seam cannot see such a site, only this can.
       # The tag exists for these runs only: the default build has no skew code.
       #
-      # Today it runs the package's own test (nothing is routed yet, so a wider run
-      # would pass without telling anything). Each routing PR of celeris#1178 adds its
-      # packages here, in a non-race run of their tests, and migrates their fixtures
-      # (internal/mono's pendingFixtures list says which): iouring, epoll, conn, the
-      # h2 stream package and the root package. Cost today: two runs of one package, 1 s
-      # each with a warm cache, about 15 s cold (the compile).
+      # It runs the package's own test and the tests of the packages routed so far.
+      # Each routing PR of celeris#1178 adds its packages here, in a non-race run of
+      # the tests that read or write the clock, after migrating their fixtures:
+      # io_uring (step 2), epoll (3), conn and the root package (4), the HTTP/2 stream
+      # code (5). Cost: about 2.5 s for internal/mono (both signs, compile included,
+      # on the runner); each engine's subset is measured in its PR.
       - name: internal/mono - skew canary (celeris#1178), clock +1 h and -1 h
         shell: bash
         run: |
@@ -191,6 +191,15 @@ jobs:
             echo "== CELERIS_MONO_SKEW=$skew"
             CELERIS_MONO_SKEW=$skew go test -count=1 -timeout=120s -tags celeris_monoskew -v ./internal/mono/ 2>&1 | tee "/tmp/mono-skew.log"
             grep -q -- '--- PASS: TestSkewMovesEveryForm' /tmp/mono-skew.log || { echo "the canary's own test did not run and pass"; exit 1; }
+          done
+          # Step 2 (celeris#1178): the io_uring engine's own stamps. The tests whose
+          # fixtures write the engine's clock (internal/mono) run with it skewed; the
+          # tests that start an engine join as conn, the root package and the HTTP/2
+          # stream code are routed (steps 4 and 5). TestHeaderTimerEarlyFireRearms762
+          # waits for step 4: the header deadline it arms is conn's.
+          for skew in 3600s -3600s; do
+            echo "== io_uring, CELERIS_MONO_SKEW=$skew"
+            CELERIS_MONO_SKEW=$skew go test -count=1 -timeout=300s -tags celeris_monoskew -run '^(TestAdoptionIsStampedWithTheTimeItWasAdopted|TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced|TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC|TestBackstopStillHoldsAZCNotificationWhoseSendCancelWasNeverPlaced|TestCheckTimeoutsClosesFDZero|TestCheckTimeoutsGivesClosingConnItsWriteTimeout|TestCheckTimeoutsReapsWedgedClosingConn|TestCheckTimeoutsSwapRemoveNoSkip|TestClosedOpsCollisionHoldsAllConns|TestCloseReleasesDescriptorWithOnlyAZCNotificationOwed|TestClosingDrainFirstMetAfterItsBoundIsGivenOneMoreBound884|TestClosingDrainIsSampledBeforeItIsReapedWhateverTheSampleRate884|TestClosingDrainOfAFixedFileConnIsNotSampled884|TestClosingDrainOfAReadingPeerIsNotCutAtTheBound884|TestClosingDrainOfAStalledPeerIsStillReapedAtTheBound884|TestClosingSweepAppliesAHeldSendNotification|TestClosingSweepDoesNotWaitForARunningAsyncHandler|TestCompleteSendRestampsClosingDrain|TestDetachedPeerThatTakesBytesIsNotClosed888|TestDetachedPeerThatTakesNothingIsClosed888|TestDetachedSparseSweepsGiveAReadingPeerABound888|TestDetachedStallClockEndsWithTheQueue888|TestDetachedStallIsBoundedWhateverTheIdleDeadlineSays888|TestFdOpsBothSendZCCompletionsHeldByTheKernel|TestFinishCloseKeepsDescriptorWhileRecvOwed|TestHeldSendZCFirstCompletionDoesNotKeepTheDescriptor|TestIouringCheckTimeoutsJudgesAFailedFirstZCCompletionByWriteTimeout811|TestIouringCloseAppliesAHeldSendCompletion|TestIouringDirtyPassGivesUpAConnWithAnOutstandingSend811|TestIouringDirtyPassGiveUpKeepsTheRecvStallEpisode811|TestIouringDirtyPassGiveUpSetsTheSendWatch811|TestIouringHeldCompletionIsNotAppliedToANewOwner884|TestIouringHeldSendCompletionDoesNotKeepTheRingPolling|TestIouringLongSendCompletionEndsRemainderWatchAtOnce884|TestIouringPeerCloseDoesNotWaitForARunningAsyncHandler|TestIouringRemainderSendSetsTheWatches884|TestIouringSendCompletionDoesNotWaitForARunningAsyncHandler|TestIouringSendCompletionsAreAppliedInOrder|TestIouringSendCompletionStillWaitsForABoundedHolder|TestIouringSweepKeepsAMarkItsDeferredCloseMade884|TestIouringSweepKeepsAMarkItsOwnReplayMade884|TestMissedCancelDoesNotRetireASecondOutstandingCancel|TestMissedPauseCancelClearsCancelPending|TestPeerCloseSurfacesEOF|TestPendingReleaseBackstopIsWallClock|TestPendingReleaseDrainsWhenNoKernelOps|TestPendingReleaseHeldWhileKernelOpsInflight|TestPendingReleaseStragglerDoesNotBlockQueue|TestReadClockAfterWaitIsFreshWithNoCompletion1173|TestReapOnTheRunningKernel|TestRefusedCloseIsNotRescuedByAStragglerAck889|TestResumeBeforeCancelLandsPlacesNoSecondRecv|TestShutdownRetainsSendBuffersAZCMayStillRead|TestStaleTerminalOpIgnoresIntermediateCQEs|TestStalledCloseSkipsTheClosingDrain888|TestTransplantNeverHandsOffArmedRecv|TestWriteClockStampAfterAnEmptyWaitIsFreshDeterministic1173)$' ./internal/engine/iouring/
           done
       # Excludes ./test/... to keep this job deterministic — those
       # suites (integration, spec, sustainedload) are timing-sensitive

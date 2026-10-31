@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#884 item 1 (from celeris#762 item 2). The kernel header timer of a
@@ -46,7 +48,7 @@ func headerTimerFixture762(t *testing.T, promoted bool) *fdlFixture {
 		t.Fatalf("apparatus: accept-time arm placed %v (headerTimerArmed=%v), want one TIMEOUT tagged udHeaderTimer for fd %d",
 			got, f.cs.headerTimerArmed, f.fd)
 	}
-	if dl := f.cs.h1State.HeaderDeadlineNs.Load(); dl <= time.Now().UnixNano() {
+	if dl := f.cs.h1State.HeaderDeadlineNs.Load(); dl <= mono.Now() {
 		t.Fatalf("apparatus: HeaderDeadlineNs %d is not in the future", dl)
 	}
 	if promoted {
@@ -159,9 +161,9 @@ func TestHeaderTimerEarlyFireRearms762(t *testing.T) {
 	t.Run("early_rearms", func(t *testing.T) {
 		f := headerTimerFixture762(t, false)
 		dl := f.cs.h1State.HeaderDeadlineNs.Load()
-		before := time.Now().UnixNano()
+		before := mono.Now()
 		f.process(f.timerCQE())
-		after := time.Now().UnixNano()
+		after := mono.Now()
 		wantOneTimer762(t, f, "the early fire", takeSQEs(f.w.ring))
 		if f.cs.closing || f.w.conns[f.fd] != f.cs {
 			t.Fatalf("an early fire closed the conn (closing=%v)", f.cs.closing)
@@ -173,7 +175,7 @@ func TestHeaderTimerEarlyFireRearms762(t *testing.T) {
 	})
 	t.Run("late_closes", func(t *testing.T) {
 		f := headerTimerFixture762(t, false)
-		f.cs.h1State.HeaderDeadlineNs.Store(time.Now().UnixNano() - int64(time.Millisecond))
+		f.cs.h1State.HeaderDeadlineNs.Store(mono.Now() - int64(time.Millisecond))
 		f.process(f.timerCQE())
 		if timers, _ := timers762(takeSQEs(f.w.ring)); len(timers) != 0 {
 			t.Fatalf("a late fire placed %d TIMEOUTs", len(timers))

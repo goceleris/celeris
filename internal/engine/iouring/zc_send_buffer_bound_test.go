@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // What the celeris#812 hold costs while it lasts, and what bounds it
@@ -33,7 +33,7 @@ func zcHeldWorker(tb testing.TB, n int) *Worker {
 		w.noteClosedInflight(cs)
 		w.queuePendingReleaseFD(cs, false, -1)
 	}
-	w.cachedNow = time.Now().UnixNano() + 2*pendingReleaseHoldNanos
+	w.cachedNow = mono.Now() + 2*pendingReleaseHoldNanos
 	w.drainPendingRelease()
 	if got := w.handoffLoss.zcNotifHeld.Load(); got != uint64(n) {
 		tb.Fatalf("held %d of %d", got, n)

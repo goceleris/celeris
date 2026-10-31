@@ -4,7 +4,8 @@ package iouring
 
 import (
 	"testing"
-	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // BenchmarkSweepGate884 is the sweep gate of Worker.run, one iteration's
@@ -20,7 +21,7 @@ import (
 func BenchmarkSweepGate884(b *testing.B) {
 	newW := func() *Worker {
 		w := &Worker{}
-		w.lastSweep = time.Now().UnixNano()
+		w.lastSweep = mono.Now()
 		w.cachedNow = w.lastSweep
 		return w
 	}
@@ -86,7 +87,7 @@ func BenchmarkSweepGate884(b *testing.B) {
 		var sink int
 		for b.Loop() {
 			w.tickCounter++
-			if w.sweepDue(time.Now().UnixNano(), w.tickCounter&gate == 0) || w.sweepWatchDue() {
+			if w.sweepDue(mono.Now(), w.tickCounter&gate == 0) || w.sweepWatchDue() {
 				sink++
 			}
 		}

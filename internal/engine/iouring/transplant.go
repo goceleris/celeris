@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/sockopts"
 )
 
@@ -188,7 +188,7 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	// depend on that). checkTimeouts reads a stamp's age as idle time.
 	// Adoptions come one per handed-off connection, so the vDSO call is off the
 	// request path.
-	cs.lastActivity = time.Now().UnixNano()
+	cs.lastActivity = mono.Now()
 
 	// #383 adopts HTTP/1 keep-alive conns only; lock the protocol and install a
 	// fresh parser at the request boundary.

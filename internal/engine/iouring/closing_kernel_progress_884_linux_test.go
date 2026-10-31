@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -107,7 +108,7 @@ func newTCPClosingDrainWorker(t *testing.T, ring *Ring) (*Worker, *connState, in
 		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{IdleTimeout: time.Hour},
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	cs := &connState{
 		fd:             local,
 		liveIdx:        -1,
@@ -115,7 +116,7 @@ func newTCPClosingDrainWorker(t *testing.T, ring *Ring) (*Worker, *connState, in
 		sending:        true,
 		kernelInflight: 1,
 		sendBuf:        make([]byte, 1<<20), // the response tail the SEND has not placed
-		lastActivity:   time.Now().UnixNano(),
+		lastActivity:   mono.Now(),
 	}
 	w.conns[local] = cs
 	w.addLiveConn(cs)
@@ -156,7 +157,7 @@ func TestClosingDrainOfAReadingPeerIsNotCutAtTheBound884(t *testing.T) {
 	fd := cs.fd
 	bound := time.Duration(w.closingDrainBound())
 	cs.closing = true
-	cs.lastActivity = time.Now().Add(-bound / 2).UnixNano() // inside the bound
+	cs.lastActivity = (mono.Now() + int64(-bound/2)) // inside the bound
 
 	w.checkTimeouts() // the baseline sample
 	if w.conns[fd] != cs {
@@ -166,13 +167,13 @@ func TestClosingDrainOfAReadingPeerIsNotCutAtTheBound884(t *testing.T) {
 		t.Fatalf("PREMISE: the peer took only %d bytes", got)
 	}
 	cs.closeSampled = 0 // the next sweep is due a sample
-	cs.lastActivity = time.Now().Add(-bound - time.Second).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-bound-time.Second))
 	w.checkTimeouts()
 	if w.conns[fd] != cs {
 		t.Fatalf("the closing conn was reaped %v after its drain clock last moved, though the peer had acknowledged bytes since "+
 			"the last sample (the SEND had not completed): %v bound (celeris#884 item 52)", bound+time.Second, bound)
 	}
-	if now := time.Now().UnixNano(); now-cs.lastActivity > int64(time.Second) {
+	if now := mono.Now(); now-cs.lastActivity > int64(time.Second) {
 		t.Errorf("the sweep kept the conn but left the drain clock %v old", time.Duration(now-cs.lastActivity))
 	}
 }
@@ -186,7 +187,7 @@ func TestClosingDrainOfAStalledPeerIsStillReapedAtTheBound884(t *testing.T) {
 	fd := cs.fd
 	bound := time.Duration(w.closingDrainBound())
 	cs.closing = true
-	cs.lastActivity = time.Now().Add(-bound / 2).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-bound/2))
 
 	w.checkTimeouts() // the baseline sample
 	if w.conns[fd] != cs {
@@ -194,7 +195,7 @@ func TestClosingDrainOfAStalledPeerIsStillReapedAtTheBound884(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 	cs.closeSampled = 0
-	cs.lastActivity = time.Now().Add(-bound - time.Second).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-bound-time.Second))
 	w.checkTimeouts()
 	if w.conns[fd] != nil {
 		t.Fatalf("a closing conn whose peer took nothing since the last sample was not reaped %v past its drain clock", bound+time.Second)
@@ -212,7 +213,7 @@ func TestClosingDrainFirstMetAfterItsBoundIsGivenOneMoreBound884(t *testing.T) {
 	fd := cs.fd
 	bound := time.Duration(w.closingDrainBound())
 	cs.closing = true
-	cs.lastActivity = time.Now().Add(-10 * bound).UnixNano() // the close was asked long ago
+	cs.lastActivity = (mono.Now() + int64(-10*bound)) // the close was asked long ago
 
 	w.checkTimeouts()
 	if w.conns[fd] != cs {
@@ -220,7 +221,7 @@ func TestClosingDrainFirstMetAfterItsBoundIsGivenOneMoreBound884(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 	cs.closeSampled = 0
-	cs.lastActivity = time.Now().Add(-bound - time.Second).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-bound-time.Second))
 	w.checkTimeouts()
 	if w.conns[fd] != nil {
 		t.Fatalf("a closing conn whose peer reads nothing was not reaped at its second bound")
@@ -238,13 +239,13 @@ func TestClosingDrainOfAFixedFileConnIsNotSampled884(t *testing.T) {
 	bound := time.Duration(w.closingDrainBound())
 	cs.closing = true
 	cs.fixedFile = true
-	cs.lastActivity = time.Now().Add(-bound / 2).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-bound/2))
 	w.checkTimeouts()
 	if got := peerReads(t, peer, 256<<10); got < 64<<10 {
 		t.Fatalf("PREMISE: the peer took only %d bytes", got)
 	}
 	cs.closeSampled = 0
-	cs.lastActivity = time.Now().Add(-bound - time.Second).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-bound-time.Second))
 	w.checkTimeouts()
 	if cs.closeAckedKnown || cs.closeSampled != 0 {
 		t.Errorf("a fixed-file conn was sampled (known=%v sampledAt=%d)", cs.closeAckedKnown, cs.closeSampled)
@@ -269,7 +270,7 @@ func TestClosingDrainIsSampledBeforeItIsReapedWhateverTheSampleRate884(t *testin
 	fd := cs.fd
 	bound := time.Duration(w.closingDrainBound())
 	cs.closing = true
-	cs.lastActivity = time.Now().Add(-bound * 9 / 10).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-bound*9/10))
 
 	w.checkTimeouts() // the baseline, 0.9 bound into the drain
 	if w.conns[fd] != cs || cs.closeSampled == 0 || !cs.closeAckedKnown {
@@ -285,7 +286,7 @@ func TestClosingDrainIsSampledBeforeItIsReapedWhateverTheSampleRate884(t *testin
 	if w.conns[fd] != cs {
 		t.Fatalf("a closing conn whose peer acknowledged bytes since the baseline sample was reaped at 1.05 bound without a fresh sample (the rate limit of bound/4 stood in for it)")
 	}
-	if now := time.Now().UnixNano(); now-cs.lastActivity > int64(time.Second) {
+	if now := mono.Now(); now-cs.lastActivity > int64(time.Second) {
 		t.Errorf("the sweep kept the conn but left the drain clock %v old", time.Duration(now-cs.lastActivity))
 	}
 }

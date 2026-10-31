@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#880, review round 1: fdOps with a SEND_ZC's completions held for the
@@ -33,7 +35,7 @@ import (
 // deliver880 feeds one completion to the worker the way the loop does.
 func deliver880(w *Worker, rig *stallRig704, c *completionEntry) {
 	if !w.staleConnCQE(c, rig.local, c.UserData) {
-		w.handleSend(c, rig.local, time.Now().UnixNano())
+		w.handleSend(c, rig.local, mono.Now())
 	}
 }
 
@@ -172,7 +174,7 @@ func TestFdOpsBothSendZCCompletionsHeldByTheKernel(t *testing.T) {
 				sawNotif = true
 			}
 			if !w.staleConnCQE(&c, fd, c.UserData) {
-				w.handleSend(&c, fd, time.Now().UnixNano())
+				w.handleSend(&c, fd, mono.Now())
 			}
 		}
 		w.ring.EndCQ(head)
@@ -226,7 +228,7 @@ func TestClosingSweepDoesNotCutOffASendTheReplayMoved(t *testing.T) {
 	w.checkTimeouts()
 	t.Logf("celeris880 BOUND slot_owned=%v sending=%v held=%d idle=%v bound=%v",
 		w.conns[rig.local] == cs, cs.sending, len(cs.heldSends),
-		time.Duration(time.Now().UnixNano()-cs.lastActivity).Round(time.Millisecond), w.closingDrainBound())
+		time.Duration(mono.Now()-cs.lastActivity).Round(time.Millisecond), w.closingDrainBound())
 	if w.conns[rig.local] != cs {
 		t.Errorf("the sweep tore a conn down whose replayed completion had just moved bytes (the peer is reading)")
 	}

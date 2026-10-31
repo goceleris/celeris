@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
@@ -171,7 +172,7 @@ func TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced(t *testing.T) {
 
 			// The backstop fires with the recv still owed and its cancel never placed.
 			w.pendingRelease[0].releaseAtNanos = 1
-			w.cachedNow = time.Now().UnixNano()
+			w.cachedNow = mono.Now()
 			w.drainPendingRelease()
 			held := len(w.pendingRelease)
 			t.Logf("celeris869 BACKSTOP arm=%s pendingRelease_after_backstop=%d fd_open=%v kernelInflight=%d CloseFDForced=%d",
@@ -203,7 +204,7 @@ func TestBackstopHoldsAConnStateWhoseCancelWasNeverPlaced(t *testing.T) {
 			// The recv ends (-ECANCELED): the connState and the descriptor go.
 			c := &completionEntry{UserData: recvUD, Res: -int32(unix.ECANCELED)}
 			w.staleConnCQE(c, f.fd, recvUD)
-			w.cachedNow = time.Now().UnixNano()
+			w.cachedNow = mono.Now()
 			w.drainPendingRelease()
 			if len(w.pendingRelease) != 0 || fdOpen704(f.fd) || w.closeFDOwed != 0 {
 				t.Errorf("after the terminal completion: pendingRelease=%d fd_open=%v closeFDOwed=%d, want 0 false 0",
@@ -249,7 +250,7 @@ func TestBackstopKeepsTheDescriptorOfARecvWhoseCancelWasNeverPlacedBesideASendZC
 	takeSQEs(w.ring)
 
 	w.pendingRelease[0].releaseAtNanos = 1
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	w.drainPendingRelease()
 	t.Logf("celeris869 ORDER pendingRelease=%d zcHolds=%d fd_open=%v CloseFDForced=%d cancelMissed=%v",
 		len(w.pendingRelease), len(w.zcHolds), fdOpen704(f.fd), w.handoffLoss.closeFDForced.Load(), cs.cancelMissed)
@@ -295,7 +296,7 @@ func TestBackstopStillHoldsAZCNotificationWhoseSendCancelWasNeverPlaced(t *testi
 			w.conns[f.fd], len(w.pendingRelease), cs.cancelMissed, w.closedZCOwed(cs))
 	}
 	w.pendingRelease[0].releaseAtNanos = 1
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	w.drainPendingRelease()
 	t.Logf("celeris869 NOTIFONLY pendingRelease=%d zcHolds=%d CloseFDForced=%d fd_open=%v",
 		len(w.pendingRelease), len(w.zcHolds), w.handoffLoss.closeFDForced.Load(), fdOpen704(f.fd))

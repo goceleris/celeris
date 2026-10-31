@@ -40,6 +40,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -428,7 +429,7 @@ func TestAdoptionIsStampedWithTheTimeItWasAdopted(t *testing.T) {
 	if fd >= len(w.conns) {
 		t.Fatalf("celeris713 PREMISE: fd %d is past the fixture's table (%d)", fd, len(w.conns))
 	}
-	t0 := time.Now().UnixNano()
+	t0 := mono.Now()
 	w.cachedNow = t0 - int64(time.Hour)
 	w.attachAdoptedFD(fd, engine.Carryover{RemoteAddr: "127.0.0.1:1"})
 	cs := w.conns[fd]

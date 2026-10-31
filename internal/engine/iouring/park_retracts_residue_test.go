@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -254,7 +255,7 @@ func afterSweepNothingOwed884(done *atomic.Int32) func(*Worker) {
 			}
 			head, tail := w.ring.BeginCQ()
 			for ; head != tail; head++ {
-				w.processCQE(context.Background(), w.ring.cqeAt(head), time.Now().UnixNano())
+				w.processCQE(context.Background(), w.ring.cqeAt(head), mono.Now())
 			}
 			w.ring.EndCQ(head)
 		}

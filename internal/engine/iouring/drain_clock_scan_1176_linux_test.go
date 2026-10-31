@@ -18,8 +18,11 @@ import (
 // wallReads1176 counts the calls of time.Now and of the selectors that read a
 // wall-scale integer in n: a time made an integer (UnixNano and friends) and
 // the stamps the loop keeps on the wall clock (cachedNow, lastSweep,
-// lastActivity: a drain deadline compared with one is on the wrong scale).
-func wallReads1176(n ast.Node) (nows, ints int) {
+// lastActivity: a drain deadline compared with one is on the wrong scale), and
+// monos, the readings of internal/mono (mono.Now and its conversions): the
+// stamps of the loop's clock, which is not the drain's (celeris#1178: it is on
+// the wall's scale, drainclock's is small).
+func wallReads1176(n ast.Node) (nows, ints, monos int) {
 	ast.Inspect(n, func(m ast.Node) bool {
 		se, ok := m.(*ast.SelectorExpr)
 		if !ok {
@@ -28,14 +31,17 @@ func wallReads1176(n ast.Node) (nows, ints int) {
 		switch se.Sel.Name {
 		case "UnixNano", "Unix", "UnixMilli", "UnixMicro", "cachedNow", "lastSweep", "lastActivity", "lastStallLook":
 			ints++
-		case "Now":
-			if id, ok := se.X.(*ast.Ident); ok && id.Name == "time" {
+		case "Now", "FromTime", "FromWall", "Time":
+			if id, ok := se.X.(*ast.Ident); ok && id.Name == "time" && se.Sel.Name == "Now" {
 				nows++
+			}
+			if id, ok := se.X.(*ast.Ident); ok && id.Name == "mono" {
+				monos++
 			}
 		}
 		return true
 	})
-	return nows, ints
+	return nows, ints, monos
 }
 
 func funcDecl1176(t *testing.T, f *ast.File, name string) *ast.FuncDecl {
@@ -64,23 +70,23 @@ func TestShutdownDeadlinesReadNoWallClock1176(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range []struct {
-		file *ast.File
-		fn   string
-		nows int // time.Now calls allowed: the wall stamp a CQE's handler is given, which is not a deadline
+		file  *ast.File
+		fn    string
+		monos int // internal/mono readings allowed: the stamp a CQE's handler is given, which is not a deadline
 	}{
 		{worker, "drainEnd", 0},
 		{worker, "h2PoolSettled", 0},
 		{worker, "stopProducersPaced", 0},
 		{gate, "closeIdlePaced", 0},
 		{fdl, "endOwedOpsAtShutdown", 0},
-		// cancelAccept hands processCQE `now`, as the loop does; its deadline and its loop
-		// condition are drainclock.Now.
+		// cancelAccept hands processCQE `now`, as the loop does (a stamp of the loop's
+		// clock, mono.Now); its deadline and its loop condition are drainclock.Now.
 		{worker, "cancelAccept", 1},
 	} {
-		nows, ints := wallReads1176(funcDecl1176(t, c.file, c.fn).Body)
-		if nows != c.nows || ints != c.nows {
-			t.Errorf("%s reads the wall clock: %d time.Now calls and %d Unix* conversions, want %d of each "+
-				"(a shutdown deadline is drainclock.Now, celeris#1176)", c.fn, nows, ints, c.nows)
+		nows, ints, monos := wallReads1176(funcDecl1176(t, c.file, c.fn).Body)
+		if nows != 0 || ints != 0 || monos != c.monos {
+			t.Errorf("%s reads the wall clock: %d time.Now calls, %d Unix* conversions and %d mono readings, want 0, 0 and %d "+
+				"(a shutdown deadline is drainclock.Now, celeris#1176; the only mono reading is the stamp handed to processCQE)", c.fn, nows, ints, monos, c.monos)
 		}
 	}
 	// The branch of Worker.run that runs once the context is cancelled: its
@@ -108,8 +114,8 @@ func TestShutdownDeadlinesReadNoWallClock1176(t *testing.T) {
 	if branch == nil {
 		t.Fatal("Worker.run has no `if ctx.Err() != ...` branch: the scan is out of date")
 	}
-	if nows, ints := wallReads1176(branch.Body); nows != 0 || ints != 0 {
-		t.Errorf("the cancelled-context branch of Worker.run reads the wall clock (%d time.Now, %d Unix*): "+
-			"its deadlines are drainclock.Now", nows, ints)
+	if nows, ints, monos := wallReads1176(branch.Body); nows != 0 || ints != 0 || monos != 0 {
+		t.Errorf("the cancelled-context branch of Worker.run reads the wall clock (%d time.Now, %d Unix*, %d mono): "+
+			"its deadlines are drainclock.Now", nows, ints, monos)
 	}
 }

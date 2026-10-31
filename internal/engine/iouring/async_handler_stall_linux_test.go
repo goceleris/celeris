@@ -25,6 +25,7 @@ import (
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -82,7 +83,7 @@ func newStallRig704(t *testing.T) *stallRig704 {
 		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{OnDisconnect: func(string) { rig.disconnects.Add(1) }},
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	cs := acquireConnState(context.Background(), rig.local, 4096, true)
 	cs.protocol.Store(int32(engine.HTTP1))
 	cs.detected = true
@@ -312,7 +313,7 @@ func TestIouringPeerCloseDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 			rig := newStallRig704(t)
 			release := holdAsHandler704(t, rig.cs, true)
 			c := &completionEntry{Res: tc.res}
-			if !returnsWhileHeld704(t, release, func() { rig.w.handleRecv(c, rig.local, time.Now().UnixNano()) }) {
+			if !returnsWhileHeld704(t, release, func() { rig.w.handleRecv(c, rig.local, mono.Now()) }) {
 				t.Fatalf("celeris#704: handleRecv's %s branch waited %v on cs.detachMu held by a running "+
 					"async handler; a client that disconnects mid-handler parks the whole ring", tc.name, stallWait704)
 			}

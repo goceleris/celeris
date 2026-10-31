@@ -4,7 +4,8 @@ package iouring
 
 import (
 	"testing"
-	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // TestDetachedStallClockEndsWithTheQueue888: a conn whose queue drained ends
@@ -20,7 +21,7 @@ func TestDetachedStallClockEndsWithTheQueue888(t *testing.T) {
 	// The last SEND completes whole.
 	s.cs.detachMu.Lock()
 	n := len(s.cs.sendBuf)
-	s.w.completeSend(s.cs, s.cs.fd, n, time.Now().UnixNano(), false)
+	s.w.completeSend(s.cs, s.cs.fd, n, mono.Now(), false)
 	s.cs.detachMu.Unlock()
 	if s.cs.stallSince != 0 {
 		t.Errorf("stallSince=%d after the queue drained in completeSend, want 0", s.cs.stallSince)

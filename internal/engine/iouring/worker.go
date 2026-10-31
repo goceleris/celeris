@@ -27,6 +27,7 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/bindiag"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/protocol/detect"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
@@ -676,7 +677,7 @@ type Worker struct {
 	linkArmBatch uint64
 
 	tickCounter uint32
-	cachedNow   int64  // cached time.Now().UnixNano(), read once per iteration after its wait (readClockAfterWait), and by checkTimeouts
+	cachedNow   int64  // cached mono.Now(), read once per iteration after its wait (readClockAfterWait), and by checkTimeouts
 	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
 	// dirtySendGiveUps counts the dirty pass's give-ups of a conn with a SEND
 	// outstanding (celeris#811). Worker-owned; read by tests after the
@@ -1209,7 +1210,7 @@ func (w *Worker) beginRecvStall(cs *connState) {
 	if cs.recvStallSince != 0 {
 		return
 	}
-	cs.recvStallSince = time.Now().UnixNano()
+	cs.recvStallSince = mono.Now()
 	if w.recvArm != nil {
 		w.recvArm.stallEpisodes.Add(1)
 	}
@@ -1224,7 +1225,7 @@ func (w *Worker) endRecvStall(cs *connState) {
 	if cs.recvStallSince == 0 {
 		return
 	}
-	d := time.Now().UnixNano() - cs.recvStallSince
+	d := mono.Now() - cs.recvStallSince
 	cs.recvStallSince = 0
 	w.recvArm.noteStallEnd(d)
 	recvStallProbe(cs, d)
@@ -1559,7 +1560,7 @@ func (w *Worker) run(ctx context.Context) {
 	// From ready on, shutdown owns these descriptors (celeris#656).
 	initDone = true
 	w.ready <- nil
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 
 	for {
 		if ctx.Err() != nil {
@@ -1824,7 +1825,7 @@ func (w *Worker) run(ctx context.Context) {
 			// past ReadTimeout it closed a connection in the middle of
 			// steady traffic (celeris#713). One vDSO call per batch, not
 			// per request.
-			w.cachedNow = time.Now().UnixNano()
+			w.cachedNow = mono.Now()
 			now := w.cachedNow
 			w.loopSlot.Enter(now) // the batch below runs handlers: a stuck one shows (celeris#1170)
 			for cqHead != cqTail {
@@ -2476,7 +2477,7 @@ func (w *Worker) handleHeaderTimer(fd int) {
 		// fresh timer SQE.
 		return
 	}
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if now < dl {
 		// True early fire (kernel clock drift, very rare). Re-arm
 		// a fresh timer for the actual remaining time, from the
@@ -2526,7 +2527,7 @@ func (w *Worker) armHeaderTimerAt(cs *connState, dl int64) {
 	if cs.headerTimerArmed || dl == 0 {
 		return
 	}
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	remaining := dl - now
 	if remaining <= 0 {
 		// Deadline already past — close immediately rather than queue
@@ -2913,7 +2914,7 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 				time.Sleep(50 * time.Microsecond)
 			}
 		}
-		now := time.Now().UnixNano()
+		now := mono.Now()
 		head, tail := w.ring.BeginCQ()
 		for ; head != tail; head++ {
 			c := w.ring.cqeAt(head)
@@ -3091,7 +3092,7 @@ func (w *Worker) leaveGroupAfterExit() (keptZC int) {
 // listenFD is the socket being closed. The caller has already cleared
 // w.listenFD, so no completion handled on the way can re-arm accept on it.
 func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	for range len(w.conns) {
 		newFD, _, err := unix.Accept4(listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
@@ -4242,7 +4243,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		if hook != nil {
 			(*hook)(w, cs, detectBeforeBudgetCheck)
 		}
-		if dd := cs.detectDeadline; dd > 0 && time.Now().UnixNano() > dd {
+		if dd := cs.detectDeadline; dd > 0 && mono.Now() > dd {
 			w.dropUndecided(cs, hasProvidedBuf, providedBufID)
 			w.closeConn(fd)
 			return
@@ -5485,7 +5486,7 @@ func (w *Worker) queuePendingRelease(cs *connState) {
 func (w *Worker) queuePendingReleaseFD(cs *connState, detached bool, keptFD int) {
 	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
 		cs:             cs,
-		releaseAtNanos: time.Now().UnixNano() + pendingReleaseHoldNanos,
+		releaseAtNanos: mono.Now() + pendingReleaseHoldNanos,
 		detached:       detached,
 		holdsFD:        keptFD >= 0,
 		fd:             int32(keptFD),
@@ -5563,7 +5564,7 @@ func (w *Worker) drainPendingRelease() {
 			if cs.cancelMissed && !retried {
 				retried = true
 				if w.retryMissedCancel(cs) {
-					entry.releaseAtNanos = time.Now().UnixNano() + pendingReleaseHoldNanos
+					entry.releaseAtNanos = mono.Now() + pendingReleaseHoldNanos
 				}
 			}
 			// A kept descriptor goes as soon as no owed op names it
@@ -6540,7 +6541,7 @@ func (w *Worker) drainH2Writes() {
 // about: one vDSO call. Worker thread.
 func (w *Worker) readClockAfterWait(gotCQE bool) {
 	if !gotCQE {
-		w.cachedNow = time.Now().UnixNano()
+		w.cachedNow = mono.Now()
 	}
 }
 
@@ -7795,7 +7796,7 @@ func (w *Worker) closeRefused(fd int, cs *connState, now int64) {
 // iteration; the clock is read on every 8th, and only while the watch is set.
 func (w *Worker) sweepWatchDue() bool {
 	return w.sendWatch && w.tickCounter&0x7 == 0 &&
-		time.Now().UnixNano()-w.lastSweep >= int64(time.Second)
+		mono.Now()-w.lastSweep >= int64(time.Second)
 }
 
 // testHookCheckTimeouts, when set, runs at the start of every checkTimeouts
@@ -7828,7 +7829,7 @@ var testHookCheckTimeouts atomic.Pointer[func(*Worker)]
 // ~8 Ki conns on a 16-core box; with liveConns the scan cost is O(active
 // conns) regardless of FD space.
 func (w *Worker) checkTimeouts() {
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	w.lastSweep = now
 	w.sweepTickFired = false
 	if h := testHookCheckTimeouts.Load(); h != nil {
@@ -8372,7 +8373,7 @@ func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
 		w.ringWaitRunStart = 0 // the loop reaps: not a ring that is stuck
 		return true
 	}
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if w.ringWaitRunStart == 0 || w.tickCounter-w.ringWaitRunTick > 1 || now-w.ringWaitRunLast > int64(ringWaitRunGap) {
 		// A new run: a wait succeeded since the last retry (the pass count
 		// moved by more than one), or a pass took longer than a retried

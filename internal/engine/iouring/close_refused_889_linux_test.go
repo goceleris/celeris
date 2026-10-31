@@ -5,6 +5,8 @@ package iouring
 import (
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // TestRefusedCloseIsNotRescuedByAStragglerAck889: the idle clock's cap refused a
@@ -19,7 +21,7 @@ func TestRefusedCloseIsNotRescuedByAStragglerAck889(t *testing.T) {
 	s := newStall888(t, 30*time.Second) // the drain bound is max(5 s, WriteTimeout): 30 s
 	fillSocket888(t, s.cs.fd)
 	fd := s.cs.fd
-	s.w.closeRefused(fd, s.cs, time.Now().UnixNano())
+	s.w.closeRefused(fd, s.cs, mono.Now())
 	if !s.cs.closing {
 		t.Fatal("closeRefused did not defer the close behind the SEND in flight")
 	}
@@ -40,6 +42,6 @@ func TestRefusedCloseIsNotRescuedByAStragglerAck889(t *testing.T) {
 		return false
 	}()
 	if !reaped {
-		t.Fatalf("the refused conn was not reaped by the sweep after it: a straggler's ACK gave it another drain bound (lastActivity %v ago)", time.Since(time.Unix(0, s.cs.lastActivity)).Round(time.Millisecond))
+		t.Fatalf("the refused conn was not reaped by the sweep after it: a straggler's ACK gave it another drain bound (lastActivity %v ago)", time.Since(mono.Time(s.cs.lastActivity)).Round(time.Millisecond))
 	}
 }

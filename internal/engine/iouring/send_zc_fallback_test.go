@@ -15,6 +15,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -146,7 +147,7 @@ func newZCFallbackWorker(t *testing.T, n int) (*Worker, []*zcConn) {
 		// control.
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 
 	out := make([]*zcConn, 0, n)
 	for _, fd := range locals {
