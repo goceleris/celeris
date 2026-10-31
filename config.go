@@ -376,8 +376,10 @@ type Config struct {
 	// client's HTTP/2 flow-control window is not parked (nothing is queued on
 	// the socket); WriteTimeout bounds its stream in its own right, as a
 	// minimum rate, on the native engines: in each WriteTimeout window a stream
-	// that holds buffered bytes must have had at least 64 KiB of them (or all
-	// it held, if less) sent, released by the client's WINDOW_UPDATEs, or it is
+	// that holds bytes waiting for the window, buffered or still held by a handler
+	// on the worker pool that is blocked in its write, must have had at least
+	// 64 KiB of them (or all it held, if less) sent, released by the client's
+	// WINDOW_UPDATEs, or it is
 	// reset with RST_STREAM(INTERNAL_ERROR), as net/http resets a stream at its
 	// write deadline. There is no ceiling, where std's deadline is absolute: a
 	// stream that releases at least that on average, lagging the rate by no
@@ -389,22 +391,39 @@ type Config struct {
 	// updates stays under about five WriteTimeouts: half the window divided by the
 	// rate it reads at. When the connection as a whole releases at least 64 KiB
 	// in a window, a stream that takes less (parallel downloads share the
-	// client's socket) is held while it takes half its fair share of it, and for
-	// three windows in a row when it takes less: a download queued behind its
-	// siblings' bytes in the client's socket is cut where the bytes ahead of it
-	// take longer than three WriteTimeouts to read (N streams of W bytes in flight
-	// on a link of L bytes/s: N x W / L), so a server whose clients are on slow
-	// links should set WriteTimeout to 5s or more. When the connection itself
-	// releases less than 64 KiB while it holds more, the first window is the
-	// verdict. The end of a response is given grace: a stream that holds less than
+	// client's socket) is held while it takes half its fair share of it, and,
+	// when it takes less, for as many windows in a row as the client needs to read
+	// what is in flight on the connection at the rate the connection moves (the
+	// bytes sent and not yet granted back at the connection level over what the
+	// connection released in the window), at least three and at most twelve. The
+	// connection counts as moving for four windows after its other streams last
+	// released 64 KiB, so a connection whose other streams release a floor only once
+	// in four windows keeps its stalled streams for as long as the allowance lasts: a
+	// client that returns window in big steps leaves some windows with neither a grant
+	// nor a send. Those windows count as idle ones, so the bound below holds. A
+	// download queued behind its siblings' bytes in the client's socket is cut where
+	// the bytes ahead of it take longer than that to read (N streams of W bytes in
+	// flight on a link of L bytes/s: N x W / L over about 16 WriteTimeouts, the cut
+	// beginning between 16.8 and 21), so a server whose clients are on slow links
+	// should set WriteTimeout to 2s or more, and 5s where the links are slower than a
+	// megabyte a second. Measured with Go's HTTP/2 client on epoll and adaptive: 4 x
+	// 8 MiB on 1 MB/s and 8 x 8 MiB on 2 MB/s complete at 1s, 2s and 5s, with about one
+	// window of headroom; on io_uring the engine's own send clock closes such a
+	// connection at 1s, so io_uring is measured from 5s. A stream that is paused, or
+	// dribbles one byte at a time, beside siblings that keep the connection moving is
+	// held for as long: up to 17 windows in all (13 for the default window), against 8
+	// when little is in flight. When the connection itself
+	// releases less than 64 KiB while it holds more, for more windows than the
+	// bank covers, the verdict is the first window that does not move. The end of a response is given grace: a stream that holds less than
 	// 64 KiB, and has had half of it sent in the window, or any stream while the
 	// connection as a whole holds less than 64 KiB (the last bytes of the transfer
 	// are on the wire, and the grant for them can wait behind its siblings' bytes in
 	// the client's socket for more than a window), is held for three windows more
 	// and reset in the fourth if nothing moves it. A stream the client never
 	// grants is reset after 1+k windows alone, or 4+k with siblings that keep the
-	// connection moving, k being the number of whole 64 KiB in the bytes in flight
-	// when it stalled (about the peer's initial window), at most four: 1 and 4
+	// connection moving and little in flight on it, k being the number of whole
+	// 64 KiB in the bytes in flight when it stalled (about the peer's initial
+	// window), at most four: 1 and 4
 	// WriteTimeouts for the default 64 KiB window, 5 and 8 for a window of 256 KiB or
 	// more. When what it has left to send is under 64 KiB (the response is a
 	// little longer than the window), the bytes in flight are spent a whole floor a
@@ -418,10 +437,28 @@ type Config struct {
 	// (WriteTimeout is its bound), so a silent client's unread response, and the
 	// buffer it pins, lives for up to 8 WriteTimeouts (5, with the default window)
 	// where it used to be dropped with the whole connection at ReadTimeout. A
-	// handler blocked waiting for window keeps its own, absolute, bound of
-	// WriteTimeout from the start of the wait, whatever the client reads: parallel
-	// downloads on one connection whose responses exceed the connection's 4 MiB
-	// output budget can lose the later ones to it. A request error read while a
+	// handler on the worker pool that blocks in its write for the client's window
+	// (a response over the connection's 4 MiB output budget, a StreamWriter's
+	// Write) is bounded by the same rule, judged by its own timer from the moment it
+	// first blocks, so that parallel downloads on one connection are not lost to a
+	// deadline that is absolute (celeris#906 had WriteTimeout in all from the first
+	// block): its write returns an error that wraps os.ErrDeadlineExceeded when the
+	// stream is reset. While an event loop of the server has been in one batch of
+	// events (all the handlers it runs, not one) for half a WriteTimeout (at least
+	// 250 ms, which matters only for a WriteTimeout under 500 ms: at the 60s default
+	// the threshold is 30s), as a synchronous handler that waits for a lock a waiting
+	// handler holds across its response write makes it, or any slow blocking call,
+	// every such wait that has lasted a WriteTimeout is bounded by WriteTimeout in
+	// all, as before: about 1.5 WriteTimeouts from the start of the freeze, whatever
+	// the client reads. The server says so once per episode, in a Warn log line
+	// ("the minimum rate of a pool handler's wait for window is suspended"), and
+	// logs the reason of each such reset at Debug level (rate, or loop-blocked). A
+	// client that stops reading altogether for a WriteTimeout (a pause of 1s at
+	// WriteTimeout 1s) loses its connection to the engines' write clock on epoll and
+	// io_uring alike, with or without this rule, and on io_uring so does a client that
+	// reads at 1 MB/s at WriteTimeout 1s (a send that does not complete for a
+	// WriteTimeout); use 2s or more for clients that pause, 5s for io_uring on slow
+	// links. A request error read while a
 	// response is queued (a malformed request) puts the connection on the
 	// closing drain below, which counts each byte the client acknowledges and
 	// has no floor: a client that sends one and then takes a few bytes per

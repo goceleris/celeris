@@ -1463,8 +1463,10 @@ jobs:
   # the runner today), because a skip is absent, not a pass.
   #
   # -timeout=660s: the shards took 214.7 s (a) and 225.5 s (b) on the runner (run
-  # 38348908017; 215.3 s and 220.5 s on a linux/arm64 container with 4 CPUs), so
-  # 660 s keeps a margin of 2.9x or more.
+  # 38348908017; 215.3 s and 220.5 s on a linux/arm64 container with 4 CPUs). With the
+  # write-deadline cells (celeris#889, #1170) in a and b they ran at 519 s and 497 s
+  # (79% of the timeout); the cells of #1170 have a shard of their own (c) now, and
+  # a, b and c are about 360 s each, a margin of 1.8x.
   unit-root-shard:
     name: Unit root shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -1474,7 +1476,7 @@ jobs:
       matrix:
         # Every shard named in .github/root-test-shards.txt (the guard in the
         # `unit` job and in test-coverage.yml fails when the two differ).
-        shard: [a, b]
+        shard: [a, b, c]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

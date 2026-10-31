@@ -26,6 +26,7 @@ import (
 // Engine implements the io_uring-based I/O engine.
 type Engine struct {
 	workers      []*Worker
+	loopWatch    *stream.LoopWatch // the workers' stamps, for the pool handlers' wait (celeris#1170)
 	tier         TierStrategy
 	profile      engine.CapabilityProfile
 	cfg          resource.Config
@@ -552,6 +553,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 	resolved resource.ResolvedResources) ([]*Worker, error) {
 	workers := make([]*Worker, len(cpus))
+	e.loopWatch = stream.NewLoopWatch()
+	e.loopWatch.SetLogger(e.cfg.Logger)
 	for i := range workers {
 		w, err := newWorker(i, cpus[i], tier, e.handler,
 			resolved, e.cfg,
@@ -587,6 +590,8 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.pause = &e.pause // celeris#662 pause linger
 		w.drainBudget = &e.drainBudget
 		w.shutdownBegun = &e.shutdownBegun
+		w.loopSlot = e.loopWatch.Slot()
+		w.h2cfg.LoopWatch = e.loopWatch
 		workers[i] = w
 	}
 	return workers, nil

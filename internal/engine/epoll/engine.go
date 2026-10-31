@@ -24,6 +24,7 @@ import (
 // Engine implements the epoll-based I/O engine.
 type Engine struct {
 	loops        []*Loop
+	loopWatch    *stream.LoopWatch // the loops' stamps, for the pool handlers' wait (celeris#1170)
 	cfg          resource.Config
 	handler      stream.Handler
 	addr         atomic.Pointer[net.Addr]
@@ -176,6 +177,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	e.mu.Lock()
 	e.loops = make([]*Loop, resolved.Workers)
+	e.loopWatch = stream.NewLoopWatch()
+	e.loopWatch.SetLogger(e.cfg.Logger)
 	for i := range resolved.Workers {
 		l := newLoop(i, cpus[i], e.handler,
 			resolved, e.cfg,
@@ -193,6 +196,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l.transplantStranded = &e.metrics.transplantStranded
 		l.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
 		l.sweepCnt = &e.metrics.sweep
+		l.loopSlot = e.loopWatch.Slot()
+		l.h2cfg.LoopWatch = e.loopWatch
 		l.pause = &e.pause
 		l.drainBudget = &e.drainBudget
 		l.shutdownBegun = &e.shutdownBegun

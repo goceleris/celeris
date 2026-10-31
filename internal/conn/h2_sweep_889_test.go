@@ -573,6 +573,7 @@ func TestSweepResetsAStalledStreamWithInternalError889(t *testing.T) {
 	for w := 1; w <= 4; w++ {
 		b.SetWindowSize(65536)
 		m.FlushOutbound(b, func(uint32, bool, []byte) {})
+		m.UpdateConnectionWindow(65536) // the client reads, and returns the connection window: nothing queued ahead
 		res = r.st.Sweep(now+int64(w)*int64(1100*time.Millisecond), r.write)
 		if (w < 4) != (res.Expired == 0) {
 			t.Fatalf("window %d: %+v", w, res)

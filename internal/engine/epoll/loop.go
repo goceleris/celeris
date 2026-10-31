@@ -295,7 +295,8 @@ type Loop struct {
 	dirtyHead      *connState // head of intrusive doubly-linked dirty list
 	h2Conns        []int      // FDs of H2 connections (for write queue polling)
 	h2cfg          conn.H2Config
-	detachQueue    []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
+	loopSlot       *stream.LoopSlot // stamped around each batch of events (celeris#1170)
+	detachQueue    []*connState     // detached conns with pending writes (goroutine-safe via detachQMu)
 	detachQMu      sync.Mutex
 	detachQSpare   []*connState // reuse slice to avoid alloc in drainDetachQueue
 	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
@@ -670,6 +671,7 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
+		l.loopSlot.Leave() // not in a batch while it waits
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
 		if err != nil {
 			if err == unix.EINTR {
@@ -695,6 +697,7 @@ func (l *Loop) run(ctx context.Context) {
 			// is loop-thread-local, so no synchronization is needed.
 			l.cachedNow = time.Now().UnixNano()
 			now = l.cachedNow
+			l.loopSlot.Enter(now) // the batch below runs handlers: a stuck one shows (celeris#1170)
 		}
 		for i := range n {
 			ev := &l.events[i]
@@ -1000,6 +1003,7 @@ func (l *Loop) run(ctx context.Context) {
 			if len(l.liveConns) == 0 {
 				l.sweepRetract()
 			}
+			l.loopSlot.Leave() // a parked loop is not in a batch: its last stamp must not age (celeris#1170)
 			l.wakeMu.Lock()
 			if !l.acceptPaused.Load() || l.hasDriverConns.Load() ||
 				l.adoptQPending.Load() != 0 || l.detachQPending.Load() != 0 {

@@ -2098,6 +2098,7 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			}
 			//nolint:gosec // G115: safe conversion, newWin validated above
 			if atomic.CompareAndSwapInt32(&p.manager.connectionWindow, oldWin, int32(newWin)) {
+				p.manager.noteConnWindow(int32(newWin)) //nolint:gosec // G115: validated above
 				break
 			}
 		}
@@ -2586,6 +2587,7 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 			}
 			//nolint:gosec // G115: safe conversion, newWin validated above
 			if atomic.CompareAndSwapInt32(&p.manager.connectionWindow, oldWin, int32(newWin)) {
+				p.manager.noteConnWindow(int32(newWin)) //nolint:gosec // G115: validated above
 				break
 			}
 		}

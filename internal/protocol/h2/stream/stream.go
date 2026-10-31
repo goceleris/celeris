@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,18 +165,25 @@ type Stream struct {
 	h1Mode                 bool  // single-threaded H1 stream; skip mutex in GetHeaders
 	protoMajor             uint8 // 0=infer from h1Mode, 1=HTTP/1.1, 2=HTTP/2
 	flags                  atomic.Uint32
-	ctx                    atomic.Pointer[streamCtx] // this use's context, made on first ask (celeris#836)
-	parent                 context.Context           // what this use's context ends with, bound when it is made (BindParentContext, celeris#889); unlocked, see there
-	phase                  Phase
-	CachedCtx              any                     // per-connection cached context (avoids pool Get/Put per request)
-	OnDetach               func()                  // called by Context.Detach to install write-thread safety
-	OnWSUpgrade            func(func([]byte))      // called by Context to install WS data delivery callback
-	OnWSRawWrite           func() func([]byte)     // returns raw write fn (bypasses chunked encoding)
-	OnWSDetachClose        func(func())            // installs callback for engine-side connection close
-	OnWSSetError           func(func(error))       // installs error handler for engine-side I/O failures
-	OnWSReadPauser         func() (func(), func()) // returns (pause, resume) callbacks for inbound backpressure
-	OnWSSetIdleDeadline    func(int64)             // sets the absolute idle deadline (Unix nanoseconds)
-	hdrBuf                 [16][2]string
+	// seedSince is how many bytes a StreamWriter has sent since the stream's last
+	// write-deadline record ended, plus one, saturating at MaxInt32; zero for a stream
+	// that has had no record (write_deadline.go, celeris#1170 review r2 F2): a later
+	// record's seed counts no more than this. Four bytes after flags,
+	// in the padding before the next pointer, where the Stream's size
+	// class has room. Guarded by mu.
+	seedSince           int32
+	ctx                 atomic.Pointer[streamCtx] // this use's context, made on first ask (celeris#836)
+	parent              context.Context           // what this use's context ends with, bound when it is made (BindParentContext, celeris#889); unlocked, see there
+	phase               Phase
+	CachedCtx           any                     // per-connection cached context (avoids pool Get/Put per request)
+	OnDetach            func()                  // called by Context.Detach to install write-thread safety
+	OnWSUpgrade         func(func([]byte))      // called by Context to install WS data delivery callback
+	OnWSRawWrite        func() func([]byte)     // returns raw write fn (bypasses chunked encoding)
+	OnWSDetachClose     func(func())            // installs callback for engine-side connection close
+	OnWSSetError        func(func(error))       // installs error handler for engine-side I/O failures
+	OnWSReadPauser      func() (func(), func()) // returns (pause, resume) callbacks for inbound backpressure
+	OnWSSetIdleDeadline func(int64)             // sets the absolute idle deadline (Unix nanoseconds)
+	hdrBuf              [16][2]string
 	// Last in the struct, so the fields the hot paths read keep their offsets.
 	// respWritten is how many body bytes a StreamWriter has handed to this
 	// use of the stream, sent or buffered (Manager.StreamWrite). Guarded by mu.
@@ -429,13 +437,23 @@ func (s *Stream) useCtx() *streamCtx {
 
 // Cancel cancels the stream's context.
 func (s *Stream) Cancel() {
+	s.CancelFirst()
+}
+
+// CancelFirst is Cancel, and reports whether this call was the one that
+// cancelled the stream: false when it was already cancelled (the peer's
+// RST_STREAM, a connection that closed, another reset). A caller that is about
+// to send a RST_STREAM sends it only when it was first, so a stream the peer has
+// reset gets no second reset after it (RFC 9113 §5.1).
+func (s *Stream) CancelFirst() bool {
 	old := s.flags.Or(flagCancelled)
 	if old&flagCancelled != 0 {
-		return // already cancelled
+		return false // already cancelled
 	}
 	if c := s.ctx.Load(); c != nil {
 		c.cancel()
 	}
+	return true
 }
 
 // endCtx ends this use's context: it is cancelled, if it is not yet, and
@@ -621,6 +639,7 @@ func (s *Stream) resetLocked() {
 	s.OutboundEndStream = false
 	s.outboundAbandoned = false
 	s.respWritten = 0
+	s.seedSince = 0
 	s.respDeclared.Store(0)
 	s.headersSent.Store(false)
 	s.EndStream = false
@@ -853,6 +872,7 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.respWritten = 0
+	s.seedSince = 0
 	s.respDeclared.Store(0)
 	s.headersSent.Store(false)
 	s.EndStream = false
@@ -1103,3 +1123,18 @@ func (s *Stream) WriteLock() { s.writeMu.Lock() }
 
 // WriteUnlock releases the per-stream write lock.
 func (s *Stream) WriteUnlock() { s.writeMu.Unlock() }
+
+// noteWritten counts n body bytes a StreamWriter handed to this use of the stream
+// (respWritten) and, once the stream has had a write-deadline record, since the last
+// one ended (seedSince, which holds that count plus one; zero means no record has
+// ended yet). The stream's lock must be held.
+func (s *Stream) noteWritten(n int) {
+	s.respWritten += int64(n)
+	if s.seedSince > 0 {
+		s.seedSince = int32(min(int64(s.seedSince)+int64(n), math.MaxInt32)) //nolint:gosec // G115: clamped to MaxInt32
+	}
+}
+
+// recordEnded notes that a write-deadline record of the stream ended: its next
+// record's seed counts the bytes sent from here. The stream's lock must be held.
+func (s *Stream) recordEnded() { s.seedSince = 1 }

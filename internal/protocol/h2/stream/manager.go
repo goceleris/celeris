@@ -51,9 +51,14 @@ type Manager struct {
 	// holds buffered bytes, in stalls, guarded by stallMu; stallN is how many, for
 	// a load on the paths that have none; connReleased is the bytes of DATA the
 	// connection released while a stream was stalled (ReserveSendWindow).
-	stallMu      sync.Mutex
-	stalls       map[uint32]*stall
-	stallN       atomic.Int32
+	stallMu sync.Mutex
+	stalls  map[uint32]*stall
+	stallN  atomic.Int32
+	// connHigh is the highest the connection window has been since it was last
+	// raised by the peer: connHigh less the window now is the bytes in flight on the
+	// connection, sent and not yet granted back (connInFlight, write_wait.go). Beside
+	// stallN, in the padding before connReleased: the Manager stays in its size class.
+	connHigh     atomic.Int32
 	connReleased atomic.Int64
 
 	// retired holds the pool-handler streams whose handler has returned and
@@ -101,6 +106,7 @@ func NewManager() *Manager {
 	}
 	m.hints = &m.ownHints
 	m.initWin.Store(65535)
+	m.connHigh.Store(65535)
 	return m
 }
 
@@ -579,7 +585,7 @@ func (m *Manager) GetLastClientStreamID() uint32 {
 
 // UpdateConnectionWindow atomically updates the connection-level flow control window.
 func (m *Manager) UpdateConnectionWindow(delta int32) {
-	atomic.AddInt32(&m.connectionWindow, delta)
+	m.noteConnWindow(atomic.AddInt32(&m.connectionWindow, delta))
 }
 
 // GetConnectionWindow atomically returns the current connection window size.
@@ -612,12 +618,18 @@ func (m *Manager) CountActiveStreams() int {
 // outboundHeld is the bytes the streams hold buffered for the peer's window
 // (charged and refunded where the buffer fills, drains, and is dropped with its
 // stream), sendWindowWaiters the pool handlers waiting for a window in
-// AwaitSendWindow. Atomic loads, no scan; safe from any goroutine.
+// AwaitSendWindow. With a write deadline (WriteTimeout > 0) neither exempts the
+// connection from nothing: a stream whose response waits for the peer's window,
+// buffered or held by a pool handler, is bounded by its own minimum rate
+// (write_deadline.go, write_wait.go), and the connection is exempt while it
+// lives, as for a buffered tail since celeris#889 (A2 retired), and subject to
+// the connection's clocks once it is gone (celeris#1170). Without one (WriteTimeout
+// <= 0) a response that waits is not exempt, as before. Atomic loads, no scan; safe
+// from any goroutine.
 func (m *Manager) ServerOwes() bool {
 	return m.activeStreams.Load() > 0 &&
 		(m.reqTimeout > 0 || m.requestOpen.Load() == 0) &&
-		(m.wrTimeout > 0 || m.outboundHeld.Load() == 0) &&
-		m.sendWindowWaiters.Load() == 0
+		(m.wrTimeout > 0 || (m.outboundHeld.Load() == 0 && m.sendWindowWaiters.Load() == 0))
 }
 
 // updateActiveCount adjusts activeStreams, and requestOpen, atomically when a
