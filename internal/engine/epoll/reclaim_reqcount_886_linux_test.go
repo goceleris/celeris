@@ -4,9 +4,10 @@ package epoll
 
 import (
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#886 item 25: a hand-off that the target refuses puts the conn back on
@@ -30,7 +31,7 @@ func TestReclaimTransplantDoesNotCountTheCarriedRecvTwice886(t *testing.T) {
 	if _, err := unix.Write(peer, []byte("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HT")); err != nil {
 		t.Fatalf("peer write: %v", err)
 	}
-	l.drainRead(fd, time.Now().UnixNano())
+	l.drainRead(fd, mono.Now())
 	if l.reqBatch != 1 {
 		t.Fatalf("apparatus: drainRead counted %d recvs, want 1", l.reqBatch)
 	}

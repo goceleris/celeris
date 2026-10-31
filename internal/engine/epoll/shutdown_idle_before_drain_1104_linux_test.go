@@ -12,6 +12,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#1104 (the flakes lane; TestShutdownPoolWaitGateRequestsInProgressAnd
@@ -164,7 +165,7 @@ func TestShutdownIdlePassTearsAConnThatServedARequestDownOnce1104(t *testing.T) 
 				if _, err := unix.Write(peer, []byte(req)); err != nil {
 					t.Fatalf("write request: %v", err)
 				}
-				l.drainRead(fd, time.Now().UnixNano())
+				l.drainRead(fd, mono.Now())
 				if l.conns[fd] == nil {
 					t.Fatal("the conn was closed by its own request")
 				}
@@ -181,7 +182,7 @@ func TestShutdownIdlePassTearsAConnThatServedARequestDownOnce1104(t *testing.T) 
 			}
 			if promoted {
 				// The pass alone closes the parked promoted conn (celeris#1165).
-				if n := l.closeIdleH1(false, time.Now().UnixNano()); n != 1 {
+				if n := l.closeIdleH1(false, mono.Now()); n != 1 {
 					t.Errorf("the pass closed %d promoted conns, want 1", n)
 				}
 				if l.conns[fd] != nil || l.activeConns.Load() != 0 || disconnects.Load() != 1 {

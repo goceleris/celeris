@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 func BenchmarkDrainReadFloodThroughput885(b *testing.B) {
@@ -202,7 +204,7 @@ func BenchmarkDrainReadLoop885(b *testing.B) {
 			_, _ = unix.Read(fd, one[:]) // the byte adoptedPair885 wrote
 			req := []byte(strings.Repeat("GET /flood HTTP/1.1\r\nHost: x\r\n\r\n", n))
 			out := make([]byte, 64<<10)
-			now := time.Now().UnixNano()
+			now := mono.Now()
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {

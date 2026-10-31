@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // A truly-detached conn (WS/SSE) whose peer takes none of the bytes queued for
@@ -152,9 +153,9 @@ func TestDetachedPeerThatTakesNothingIsClosed888(t *testing.T) {
 	// A read of the connection (a WebSocket ping, an SSE client's request) is
 	// not evidence that the peer takes what is queued: the clock is not keyed
 	// on it.
-	c.cs.lastActivity = time.Now().UnixNano()
+	c.cs.lastActivity = mono.Now()
 
-	el, closed := sweepUntil(l, c.cs.fd, c.cs, 5*time.Second, func() { c.cs.lastActivity = time.Now().UnixNano() })
+	el, closed := sweepUntil(l, c.cs.fd, c.cs, 5*time.Second, func() { c.cs.lastActivity = mono.Now() })
 	if !closed {
 		t.Fatalf("a detached conn whose peer takes nothing was not closed within %v (WriteTimeout %v)", el, stall888Bound)
 	}
@@ -171,7 +172,7 @@ func TestDetachedStallIsBoundedWhateverTheIdleDeadlineSays888(t *testing.T) {
 	l := stall888Loop(t, stall888Bound)
 	c := newStall888Conn(t, l)
 	c.fillAndQueue(t, l)
-	push := func() { c.cs.h1State.IdleDeadlineNs.Store(time.Now().Add(time.Hour).UnixNano()) }
+	push := func() { c.cs.h1State.IdleDeadlineNs.Store((mono.Now() + int64(time.Hour))) }
 	push()
 	if el, closed := sweepUntil(l, c.cs.fd, c.cs, 5*time.Second, push); !closed {
 		t.Fatalf("a stalled conn with its idle deadline pushed out was not closed within %v", el)
@@ -186,7 +187,7 @@ func TestDetachedReadingPeerIsNotClosed888(t *testing.T) {
 	l := stall888Loop(t, stall888Bound)
 	c := newStall888Conn(t, l)
 	c.fillAndQueue(t, l)
-	c.cs.lastActivity = time.Now().Add(-time.Hour).UnixNano() // the request is long ago
+	c.cs.lastActivity = (mono.Now() + int64(-time.Hour)) // the request is long ago
 
 	buf := make([]byte, 4096)
 	tick := 0

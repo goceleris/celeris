@@ -15,6 +15,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -67,7 +68,7 @@ func BenchmarkSweepH2Deadlines889(b *testing.B) {
 					timerFD:     -1,
 					cfg:         resource.Config{ReadTimeout: 60 * time.Second, IdleTimeout: 600 * time.Second},
 				}
-				now := time.Now().UnixNano()
+				now := mono.Now()
 				for i := 0; i < n; i++ {
 					fd := i + 3
 					cs := acquireConnState(context.Background(), fd, 64, false)

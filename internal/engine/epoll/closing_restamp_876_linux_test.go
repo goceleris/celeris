@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -23,7 +24,7 @@ func TestRepeatedCloseRequestsDoNotRestartTheDrainClock(t *testing.T) {
 		t.Fatalf("celeris876 PREMISE: closeWhenFlushed did not start the clock (peerClosed=%v closeSince=%d)",
 			r.cs.peerClosed, r.cs.closeSince)
 	}
-	aged := time.Now().Add(-10 * time.Second).UnixNano()
+	aged := (mono.Now() + int64(-10*time.Second))
 	r.cs.closeSince = aged
 
 	// A flush that sends nothing is not progress (the peer reads nothing

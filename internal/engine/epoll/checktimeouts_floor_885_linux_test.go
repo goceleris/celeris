@@ -16,6 +16,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -55,7 +56,7 @@ func (p *sweepProbe885) hook(l *Loop) {
 		return
 	}
 	p.mu.Lock()
-	p.at[l] = append(p.at[l], time.Now().UnixNano())
+	p.at[l] = append(p.at[l], mono.Now())
 	p.live[l] = len(l.liveConns)
 	p.timerFD, p.sawLoop = l.timerFD, true
 	p.mu.Unlock()
@@ -267,7 +268,7 @@ func TestBusyLoopSweepsAtMostOnceAFloorPeriod885(t *testing.T) {
 	time.Sleep(span)
 	to := time.Now()
 	reqs := b.served.Load() - served0
-	sweeps := len(p.window(nil, from.UnixNano(), to.UnixNano()))
+	sweeps := len(p.window(nil, mono.FromTime(from), mono.FromTime(to)))
 	nLoops, _, _ := p.loops()
 	tfd, saw := p.timerfd()
 	t.Logf("celeris885 item 29: %d sweeps in %v on %d loops under 16 busy clients (%d requests, %.0f req/s); timerFD=%d; sweepFloor=%v",
@@ -338,7 +339,7 @@ func TestDetachedIdleDeadlineIsReapedPromptlyUnderLoad885(t *testing.T) {
 	served0 := b.served.Load()
 	const lead = 200 * time.Millisecond
 	deadline := time.Now().Add(lead)
-	h1.IdleDeadlineNs.Store(deadline.UnixNano())
+	h1.IdleDeadlineNs.Store(mono.FromTime(deadline))
 	// The reap closes the socket: the detached client reads EOF.
 	_ = dc.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, rerr := dc.Read(make([]byte, 1))
@@ -353,7 +354,7 @@ func TestDetachedIdleDeadlineIsReapedPromptlyUnderLoad885(t *testing.T) {
 	to := time.Now()
 	reqs := b.served.Load() - served0
 
-	w := p.window(detLoop, from.UnixNano(), to.UnixNano())
+	w := p.window(detLoop, mono.FromTime(from), mono.FromTime(to))
 	var gaps []time.Duration
 	for i := 1; i < len(w); i++ {
 		gaps = append(gaps, time.Duration(w[i]-w[i-1]))

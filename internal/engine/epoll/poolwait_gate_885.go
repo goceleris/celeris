@@ -10,6 +10,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/drainclock"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The gate of the wait for HTTP/2 pool handlers (celeris#885 item 49), the
@@ -135,9 +136,10 @@ func (l *Loop) poolWaitGate() {
 	if p := drainclock.Now(); first || p >= l.producersStopNext {
 		l.producersStopNext = p + int64(h2PoolDrainPollMs*time.Millisecond)
 		l.stopDetachedProducers()
-		// The wall clock, not the pacer's: closeIdleH1 hands it to drainRead,
-		// which stamps a conn's lastActivity with it.
-		l.closeIdleH1(first, now.UnixNano())
+		// The loop's clock (internal/mono), not the pacer's: closeIdleH1 hands it
+		// to drainRead, which stamps a conn's lastActivity with it. FromTime makes
+		// it of the time.Now() the gate already holds, without a second read.
+		l.closeIdleH1(first, mono.FromTime(now))
 	}
 }
 

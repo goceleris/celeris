@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -264,7 +265,7 @@ func TestDetachedIdleReapDrainIsBounded(t *testing.T) {
 	}
 
 	// Middleware extends the idle deadline: the stamp must not survive it.
-	cs.h1State.IdleDeadlineNs.Store(time.Now().Add(time.Hour).UnixNano())
+	cs.h1State.IdleDeadlineNs.Store((mono.Now() + int64(time.Hour)))
 	l.checkTimeouts()
 	if l.conns[local] == nil {
 		t.Fatalf("conn closed while its idle deadline was in the future")
@@ -280,7 +281,7 @@ func TestDetachedIdleReapDrainIsBounded(t *testing.T) {
 	if cs.drainDeadline == 0 {
 		t.Fatalf("second expiry did not re-stamp a drain deadline")
 	}
-	cs.drainDeadline = time.Now().Add(-time.Second).UnixNano()
+	cs.drainDeadline = (mono.Now() + int64(-time.Second))
 	l.checkTimeouts()
 	if l.conns[local] != nil {
 		t.Fatalf("conn survived the drain grace with a peer that never reads")

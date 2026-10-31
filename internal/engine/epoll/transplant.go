@@ -5,12 +5,12 @@ package epoll
 import (
 	"context"
 	"sync/atomic"
-	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // transplantState is published via Loop.transplant while a drain-to-io_uring is
@@ -220,7 +220,7 @@ func (l *Loop) reclaimTransplant(fd int, carry engine.Carryover, bucket *atomic.
 	}
 	now := l.cachedNow
 	if now == 0 {
-		now = time.Now().UnixNano()
+		now = mono.Now()
 	}
 	// The carried bytes were read by this loop, and counted as the recv that
 	// read them, before the hand-off (celeris#886 item 25).

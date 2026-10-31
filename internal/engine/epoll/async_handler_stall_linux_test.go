@@ -21,6 +21,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -167,7 +168,7 @@ func TestPeerCloseDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	if err := unix.Shutdown(peer, unix.SHUT_WR); err != nil {
 		t.Fatalf("shutdown peer: %v", err)
 	}
-	if !returnsWhileHeld(t, release, func() { l.drainRead(local, time.Now().UnixNano()) }) {
+	if !returnsWhileHeld(t, release, func() { l.drainRead(local, mono.Now()) }) {
 		t.Fatalf("celeris#669: drainRead's EOF branch waited %v on cs.detachMu held by a running async "+
 			"handler; a client that disconnects mid-handler parks the whole loop", stallWait)
 	}
@@ -339,7 +340,7 @@ func TestATransplantWaitsForARelink(t *testing.T) {
 	l.async = true
 	cs.protocol = engine.HTTP1
 	cs.detected = true
-	cs.lastActivity = time.Now().UnixNano()
+	cs.lastActivity = mono.Now()
 	l.markDirty(cs)
 	release := holdAsHandler(t, cs, true)
 	if !returnsWhileHeld(t, release, l.flushDirty) {
@@ -394,7 +395,7 @@ func TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits(t *testing.T) {
 		l.async = true
 		cs.protocol = engine.HTTP1
 		cs.detected = true
-		cs.lastActivity = time.Now().UnixNano()
+		cs.lastActivity = mono.Now()
 		setup(l, cs)
 		cs.asyncInMu.Lock()
 		cs.asyncRun, cs.asyncParked = true, true

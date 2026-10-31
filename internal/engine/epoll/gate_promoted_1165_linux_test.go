@@ -12,6 +12,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#1165. closeIdleH1 skipped every conn with a dispatch goroutine
@@ -116,7 +117,7 @@ func TestGateClosesAPromotedConnOnlyWhenItIsIdle1165(t *testing.T) {
 			r := newPromoted1165(t)
 			tc.mutate(r)
 			locked := tc.name == "detachMu-held"
-			n := r.l.closeIdleH1(false, time.Now().UnixNano())
+			n := r.l.closeIdleH1(false, mono.Now())
 			if locked {
 				r.cs.detachMu.Unlock()
 			}
@@ -146,7 +147,7 @@ func TestGateHoldsAPromotedConnWithAnUnreadRequest1165(t *testing.T) {
 	if _, err := unix.Write(r.peer, []byte("GET /y HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
-	if n := r.l.closeIdleH1(true, time.Now().UnixNano()); n != 0 {
+	if n := r.l.closeIdleH1(true, mono.Now()); n != 0 {
 		t.Fatalf("the first pass closed %d conns, want the promoted conn with an unread request held", n)
 	}
 	if r.l.conns[r.fd] == nil || !r.cs.gateRead {

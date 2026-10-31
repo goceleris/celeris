@@ -26,6 +26,7 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/bindiag"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/protocol/detect"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
@@ -184,8 +185,8 @@ type Loop struct {
 	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
 	tickCounter       uint32
 	consecutiveEmpty  uint32 // consecutive iterations with no events (for adaptive timeout)
-	cachedNow         int64  // cached time.Now().UnixNano(), refreshed once per events return
-	lastSweep         int64  // time.Now().UnixNano() at the start of the last checkTimeouts, any caller; the run loop's gate tests it against sweepFloor (celeris#885 item 29)
+	cachedNow         int64  // cached mono.Now(), refreshed once per events return
+	lastSweep         int64  // mono.Now() at the start of the last checkTimeouts, any caller; the run loop's gate tests it against sweepFloor (celeris#885 item 29)
 
 	// The #383 transplant ledger, engine-wide and shared like the counters
 	// above; all of them are nil-safe so a bare test Loop literal can skip
@@ -560,7 +561,7 @@ func (l *Loop) run(ctx context.Context) {
 	l.ready <- nil
 
 	activeTimeoutMs := 1 // 1ms default epoll timeout
-	l.cachedNow = time.Now().UnixNano()
+	l.cachedNow = mono.Now()
 
 	for {
 		if ctx.Err() != nil {
@@ -695,7 +696,7 @@ func (l *Loop) run(ctx context.Context) {
 			// closing still-active conns early. The vDSO cost (~50ns) is
 			// negligible amortized over the whole event batch. cachedNow
 			// is loop-thread-local, so no synchronization is needed.
-			l.cachedNow = time.Now().UnixNano()
+			l.cachedNow = mono.Now()
 			now = l.cachedNow
 			l.loopSlot.Enter(now) // the batch below runs handlers: a stuck one shows (celeris#1170)
 		}
@@ -833,7 +834,7 @@ func (l *Loop) run(ctx context.Context) {
 		// explicitly here rather than relying on a listen-fd event. acceptAll
 		// clears or re-sets listenHot based on whether the backlog drained.
 		if l.listenHot && l.listenFD >= 0 {
-			l.acceptAll(ctx, time.Now().UnixNano())
+			l.acceptAll(ctx, mono.Now())
 		}
 
 		// Adaptive timeout tracking. A round that collected nothing counts as
@@ -931,7 +932,7 @@ func (l *Loop) run(ctx context.Context) {
 		}
 		if l.tickCounter&gate == 0 {
 			// The clock is read at a gate hit only, one iteration in 32.
-			if d := time.Now().UnixNano() - l.lastSweep; d >= int64(sweepFloor) || d < 0 {
+			if d := mono.Now() - l.lastSweep; d >= int64(sweepFloor) || d < 0 {
 				l.checkTimeouts()
 			}
 		}
@@ -1399,7 +1400,7 @@ const pauseAcceptRounds = connTableSize / acceptAllCap
 //     retransmitted SYN-ACK or a client that does not answer it.
 func (l *Loop) acceptQueuedOnPause(ctx context.Context) {
 	for range pauseAcceptRounds {
-		if l.acceptAll(ctx, time.Now().UnixNano()) != acceptCapped {
+		if l.acceptAll(ctx, mono.Now()) != acceptCapped {
 			return
 		}
 	}
@@ -2315,7 +2316,7 @@ func (l *Loop) markClosing(cs *connState, pending int) {
 	if cs.closeSince != 0 {
 		return
 	}
-	cs.closeSince = time.Now().UnixNano()
+	cs.closeSince = mono.Now()
 	cs.closePending = pending
 	cs.closeAckedKnown = false // a live conn's window baseline (parkedBelowRate) is not the drain's
 }
@@ -2336,7 +2337,7 @@ func (l *Loop) markClosing(cs *connState, pending int) {
 // those bytes go.
 func (cs *connState) noteClosingProgress(pending int) {
 	if pending < cs.closePending {
-		cs.closeSince = time.Now().UnixNano()
+		cs.closeSince = mono.Now()
 	}
 	cs.closePending = pending
 }
@@ -2358,7 +2359,7 @@ func (cs *connState) noteClosingProgress(pending int) {
 // which every response's first flush goes through. Loop thread.
 func (cs *connState) noteWriteProgress(queued, pending int) {
 	if cs.writeSince != 0 && (pending < queued || cs.goMoved) {
-		cs.writeSince = time.Now().UnixNano()
+		cs.writeSince = mono.Now()
 	}
 	cs.goMoved = false
 }
@@ -2420,7 +2421,7 @@ func (cs *connState) endWriteSlow() {
 		// theirs, which they own).
 		cs.closeSampled = 0
 	}
-	cs.lastActivity = time.Now().UnixNano()
+	cs.lastActivity = mono.Now()
 }
 
 // noteClosingAcked is the sweep's evidence of progress on a closing conn: the
@@ -4254,7 +4255,7 @@ func (l *Loop) armEpollOut(cs *connState) {
 	// clock, and its next response's partial flush must start one. A partial
 	// flush is the backpressure path, not the common one.
 	if cs.writeSince == 0 {
-		cs.writeSince = time.Now().UnixNano()
+		cs.writeSince = mono.Now()
 	}
 	if cs.epollOut {
 		return
@@ -4395,7 +4396,7 @@ func (l *Loop) handleWritable(cs *connState) {
 				// was queued without a pass through armEpollOut. Start it here
 				// rather than rely on a later flush reaching armEpollOut
 				// (celeris#885 items 35 and 45). The backpressure path.
-				cs.writeSince = time.Now().UnixNano()
+				cs.writeSince = mono.Now()
 			}
 		}
 	}
@@ -4651,7 +4652,7 @@ var testHookCheckTimeouts atomic.Pointer[func(*Loop)]
 // would skip the swapped-in element. Walking high→low means any swap only
 // touches indices we've already visited.
 func (l *Loop) checkTimeouts() {
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	l.lastSweep = now
 	if h := testHookCheckTimeouts.Load(); h != nil {
 		(*h)(l)
@@ -5434,9 +5435,9 @@ func (l *Loop) shutdown() {
 	// loop has a bound of its own: a pass that closes the cap is followed by
 	// another only while the passes made could still have closed every conn
 	// that was live on entry. It cannot spin.
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	for passes := len(l.liveConns)/gateClosesPerPass + 1; passes > 0 && l.closeIdleH1(false, now) >= gateClosesPerPass; passes-- {
-		now = time.Now().UnixNano()
+		now = mono.Now()
 	}
 
 	// Phase 1: signal every async dispatch / detached goroutine to stop and

@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -159,7 +160,7 @@ func TestClosingConnFirstMetAfterItsBoundIsGivenOneMoreBound(t *testing.T) {
 	const bound = 400 * time.Millisecond
 	r := newTCPClosingRig876(t, resource.Config{ReadTimeout: time.Hour, WriteTimeout: bound}, 8<<20)
 	r.l.closeWhenFlushed(r.cs)
-	r.cs.closeSince = time.Now().Add(-10 * bound).UnixNano() // the close was asked long ago
+	r.cs.closeSince = (mono.Now() + int64(-10*bound)) // the close was asked long ago
 	r.l.checkTimeouts()
 	if !r.open() {
 		t.Fatalf("the first sweep to meet a closing conn %v past its %v bound reaped it on no evidence (celeris#876)", 10*bound, bound)
@@ -188,7 +189,7 @@ func TestClosingConnIsSampledBeforeItIsReapedWhateverTheSampleRate(t *testing.T)
 	const bound = 5 * time.Second
 	r := newTCPClosingRig876(t, resource.Config{ReadTimeout: time.Hour, WriteTimeout: bound}, 8<<20)
 	r.l.closeWhenFlushed(r.cs)
-	r.cs.closeSince = time.Now().Add(-bound * 9 / 10).UnixNano()
+	r.cs.closeSince = (mono.Now() + int64(-bound*9/10))
 
 	r.l.checkTimeouts() // the baseline, 0.9 bound into the drain
 	if !r.open() || r.cs.closeSampled == 0 || !r.cs.closeAckedKnown {
@@ -215,7 +216,7 @@ func TestClosingConnIsSampledBeforeItIsReapedWhateverTheSampleRate(t *testing.T)
 		t.Fatalf("a closing conn whose peer acknowledged %d bytes since the baseline sample was reaped at 1.05 bound "+
 			"without a fresh sample (the rate limit of bound/4 stood in for it)", got)
 	}
-	if now := time.Now().UnixNano(); now-r.cs.closeSince > int64(time.Second) {
+	if now := mono.Now(); now-r.cs.closeSince > int64(time.Second) {
 		t.Errorf("the sweep kept the conn but left the drain clock %v old", time.Duration(now-r.cs.closeSince))
 	}
 }
