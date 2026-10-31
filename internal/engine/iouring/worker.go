@@ -6545,6 +6545,51 @@ func (w *Worker) readClockAfterWait(gotCQE bool) {
 	}
 }
 
+// restampUnsubmittedSends starts the write clock again, at now, of every conn
+// whose SEND the kernel has not been given yet (celeris#1173). A SEND is staged
+// in the SQ ring by flushSend, flushSendLink or handleSend's remainder and
+// submitted at the top of the NEXT iteration, while the sweep runs later in the
+// SAME one; checkTimeouts counts a staged SEND as in flight and measures
+// WriteTimeout from the stamp flushSend took when it staged it. A worker that
+// stalls for longer than WriteTimeout in between (a handler of another conn
+// running inline in the batch, a GC assist, -race, a CFS quota throttling a
+// container) would close a conn whose peer was never handed a byte: the time
+// the engine held the SEND is the engine's, not the peer's. The SQ ring holds
+// exactly the SQEs the kernel has not consumed, [head, tail), so the sweep reads
+// them: a SEND whose conn is still the one that placed it (generation) and still
+// has it in flight is restamped, and the peer's WriteTimeout starts here, no
+// later than the submit that follows. No per-send state and nothing on the send
+// path: the cost is one pass over the unconsumed SQEs per sweep (a few ns each,
+// the ones staged by the iteration that sweeps), and none when the ring is
+// empty, as it is after any wait that submitted. epoll has no such state: it
+// writes inline. A stall between the sweep and the next submit is not covered
+// (the peer's clock then runs from this stamp). Worker thread.
+func (w *Worker) restampUnsubmittedSends(now int64) {
+	r := w.ring
+	if r == nil || w.cfg.WriteTimeout <= 0 {
+		return
+	}
+	head, tail := r.sqConsumed(), r.sqPlaced()
+	n := tail - head
+	if n == 0 || n > r.params.sqEntries {
+		return // empty, or a head read that moved under a kernel SQ thread: nothing sure to say
+	}
+	for i := head; i != tail; i++ {
+		ud := *(*uint64)(unsafe.Pointer(&r.sqes[uintptr(i&r.sqMask)*sqeSize+32]))
+		if ud&udMask != udSend {
+			continue
+		}
+		fd := int(ud & fdMask)
+		if fd >= len(w.conns) {
+			continue
+		}
+		cs := w.conns[fd]
+		if cs != nil && cs.generation == decodeGen(ud) && cs.sending && !cs.closing {
+			cs.lastActivity = now
+		}
+	}
+}
+
 // holdsOutput reports whether the conn still has bytes to get to its peer:
 // staged in its buffers or in a SEND in flight, on the dirty list, or in the
 // kernel's send queue (TIOCOUTQ: unsent and unacknowledged bytes). An ioctl that
@@ -7865,6 +7910,9 @@ func (w *Worker) checkTimeouts() {
 	if len(w.pendingRelease) > 0 {
 		w.drainPendingRelease()
 	}
+	// A SEND still in our own SQ ring is not the peer's to be charged for
+	// (celeris#1173): its write clock starts now.
+	w.restampUnsubmittedSends(now)
 	// Iterate in REVERSE by index: closeConn → finishClose → removeLiveConn
 	// swap-removes the FD with the last live entry and shrinks the slice. A
 	// forward `range` would then (a) skip the swapped-in conn (moved into an
