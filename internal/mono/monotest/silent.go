@@ -29,8 +29,9 @@ const (
 	// idle backoff (1 ms, then 5 ms, then 25 ms waits) to have run its course.
 	settle = 700 * time.Millisecond
 
-	// deferWindow is the longest a silent connection waits in the kernel, with
-	// TCP_DEFER_ACCEPT on, before the engine accepts it.
+	// deferWindow is what a silent connection is allowed to wait in the kernel, with
+	// TCP_DEFER_ACCEPT on, before the engine accepts it: the 1.5 s that
+	// deferlinger.DefaultLinger budgets for it (1.07 s was the most measured).
 	deferWindow = 1500 * time.Millisecond
 )
 
