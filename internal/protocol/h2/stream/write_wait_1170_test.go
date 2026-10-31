@@ -790,11 +790,11 @@ func TestIdleAllowanceStartsAgainWithEachRun1170(t *testing.T) {
 	got := firstReset889(m, 1, time.Now().UnixNano(), 80, func(w int) {
 		b.SetWindowSize(70000) // the connection moves in every window
 		m.FlushOutbound(b, discard889)
-		switch {
-		case w == 3: // stream 1 takes its share: the run ends
+		switch w {
+		case 3: // stream 1 takes its share: the run ends
 			a.SetWindowSize(20000)
 			m.FlushOutbound(a, discard889)
-		case w == 4: // the queue has drained: no bytes in flight for the second run
+		case 4: // the queue has drained: no bytes in flight for the second run
 			m.connectionWindow = 1 << 30
 		}
 	})
