@@ -111,11 +111,11 @@ func dial(t *testing.T, addr string) net.Conn {
 	return c
 }
 
-// closedAfter waits for the server to close c, up to max, and returns how long it
+// closedAfter waits for the server to close c, up to limit, and returns how long it
 // took and whether it did. Whatever the server sends meanwhile is read and dropped.
-func closedAfter(c net.Conn, t0 time.Time, max time.Duration) (time.Duration, bool) {
+func closedAfter(c net.Conn, t0 time.Time, limit time.Duration) (time.Duration, bool) {
 	buf := make([]byte, 4096)
-	_ = c.SetReadDeadline(t0.Add(max))
+	_ = c.SetReadDeadline(t0.Add(limit))
 	for {
 		if _, err := c.Read(buf); err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -164,7 +164,7 @@ func readResponse(br *bufio.Reader, n int) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.ContentLength != int64(n) {
 		return fmt.Errorf("Content-Length %d, want %d", resp.ContentLength, n)
 	}
