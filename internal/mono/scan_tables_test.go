@@ -65,9 +65,12 @@ var pending = map[site]entry{
 	{"internal/conn/h1.go", "H1State.ArmHeaderDeadline", ".UnixNano"}:   {1, "step 4"},
 	{"internal/conn/h1.go", "H1State.ArmHeaderDeadlineAt", ".UnixNano"}: {1, "step 4"},
 	// step 5: route the HTTP/2 stream code (internal/protocol/h2/stream)
-	{"internal/protocol/h2/stream/deadline.go", "Processor.armHeaderBlock", ".UnixNano"}:   {1, "step 5"},
-	{"internal/protocol/h2/stream/processor.go", "Processor.admitHeaders", ".UnixNano"}:    {1, "step 5"},
-	{"internal/protocol/h2/stream/write_deadline.go", "Manager.noteBuffered", ".UnixNano"}: {1, "step 5"},
+	{"internal/protocol/h2/stream/deadline.go", "Processor.armHeaderBlock", ".UnixNano"}:     {1, "step 5"},
+	{"internal/protocol/h2/stream/processor.go", "Processor.admitHeaders", ".UnixNano"}:      {1, "step 5"},
+	{"internal/protocol/h2/stream/write_deadline.go", "Manager.noteBuffered", ".UnixNano"}:   {1, "step 5"},
+	{"internal/protocol/h2/stream/write_wait.go", "Manager.beginWait", ".UnixNano"}:          {2, "step 5"},
+	{"internal/protocol/h2/stream/write_wait.go", "Manager.judgeWait", ".UnixNano"}:          {1, "step 5"},
+	{"internal/protocol/h2/stream/write_wait.go", "Stream.awaitSendWindowRate", "time.Unix"}: {2, "step 5"},
 }
 
 // pendingFixtures: test functions that write a wall reading into a stamp field or
@@ -235,4 +238,6 @@ var pendingFixtures = map[string]bool{
 	"internal/protocol/h2/stream/write_deadline_889_test.go | TestExpiredWritesWindows889":                            true,
 	"internal/protocol/h2/stream/write_rate_889_test.go | TestExpiredWritesJudgesTheRecordItFoundDue889":              true,
 	"internal/protocol/h2/stream/write_rate_889_test.go | TestHugeTimeoutsDoNotOverflow889":                           true,
+	"internal/protocol/h2/stream/write_wait_1170_test.go | TestWaiterAndBufferNeverHaveTwoJudges1170":                 true,
+	"internal/protocol/h2/stream/write_wait_1170_test.go | TestWaiterRecordBooks1170":                                 true,
 }
