@@ -152,13 +152,13 @@ func TestSweepTickOnARealRing884(t *testing.T) {
 			t.Fatalf("flags=%s: no SQE for the tick", fl.name)
 		}
 		t0 := time.Now()
-		h, tl, _, err := waitCQE1183(r)
+		h, tl, empty, err := waitCQE1183(r)
 		if err != nil {
 			t.Fatalf("flags=%s: wait: %v", fl.name, err)
 		}
 		el := time.Since(t0)
 		if h == tl {
-			t.Fatalf("flags=%s: the wait returned with no CQE", fl.name)
+			t.Fatalf("flags=%s: the wait returned with no CQE (%d empty returns)", fl.name, empty)
 		}
 		c := r.cqeAt(h)
 		ud, res := c.UserData, c.Res
@@ -180,14 +180,16 @@ func TestSweepTickOnARealRing884(t *testing.T) {
 	}
 }
 
-// waitCQE1183 waits on r until its CQ ring has a completion, or 10 s have gone
-// by, and returns the CQ ring's head and tail and how many times a wait came
+// waitCQE1183 waits on r until its CQ ring has a completion, or until a wait
+// that returns empty finds 10 s gone by, and returns the CQ ring's head and tail and how many times a wait came
 // back with the CQ ring empty. The condition is a completion, not one wait
 // returning: SubmitAndWait returns nil on a signal, and a wait can end with
 // nothing to read (celeris#1183). Each retry is a new io_uring_enter with
 // GETEVENTS, as the run loop's iterations are: under DEFER_TASKRUN a
 // completion is posted by that call and a look at the CQ ring would not
-// find it.
+// find it. The deadline is checked only after a wait returns: it bounds a run
+// of empty returns, not a wait that never returns (SubmitAndWait has no
+// timeout; go test -timeout catches that).
 func waitCQE1183(r *Ring) (head, tail uint32, empty int, err error) {
 	for deadline := time.Now().Add(10 * time.Second); ; {
 		if err = r.SubmitAndWait(); err != nil {
@@ -205,13 +207,19 @@ func waitCQE1183(r *Ring) (head, tail uint32, empty int, err error) {
 
 // TestSweepTickWaitSurvivesAnEmptyReturn1183: Ring.SubmitAndWait returns nil
 // when a signal ends the wait (EINTR, as its comment says, and the engine's
-// loop relies on), so a nil return is not a completion; a wait with min_complete
-// 1 can also come back at once with nothing to read (measured on a loaded
-// 7.0 kernel, with no signal: 5 of 4000 fresh coop_taskrun rings). The run loop
+// loop relies on), so a nil return is not a completion. A wait with
+// min_complete 1 comes back with nothing to read for two reasons: a signal
+// (io_uring_enter reports the wait's EINTR only when it submitted nothing, so
+// a call that also submitted the timer returns the submit count with errno 0),
+// and a timer that wakes the wait (cq_timeouts) before its CQE is posted,
+// which under DEFER_TASKRUN only a later GETEVENTS enter posts. Measured on a
+// loaded 7.0 kernel: 5 of 4000 fresh coop_taskrun rings returned empty in under
+// 1 ms; which of the two causes each was is not known. The run loop
 // iterates on an empty return; the test of the tick on a real ring read the CQ
 // ring after a single wait and failed "the wait returned with no CQE"
-// (celeris#1183). Here Go's preemption signal (SIGURG, which the runtime ignores
-// when it has not asked for it) ends the wait of a 300 ms timer every 5 ms, and
+// (celeris#1183). Here Go's preemption signal (SIGURG, which the runtime uses to
+// preempt and handles on every thread, a no-op for a goroutine in a syscall)
+// ends the wait of a 300 ms timer every 5 ms, and
 // the wait must still deliver the timer's CQE.
 func TestSweepTickWaitSurvivesAnEmptyReturn1183(t *testing.T) {
 	runtime.LockOSThread()
