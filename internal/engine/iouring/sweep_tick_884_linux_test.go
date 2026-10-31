@@ -152,11 +152,11 @@ func TestSweepTickOnARealRing884(t *testing.T) {
 			t.Fatalf("flags=%s: no SQE for the tick", fl.name)
 		}
 		t0 := time.Now()
-		if err := r.SubmitAndWait(); err != nil {
+		h, tl, _, err := waitCQE1183(r)
+		if err != nil {
 			t.Fatalf("flags=%s: wait: %v", fl.name, err)
 		}
 		el := time.Since(t0)
-		h, tl := r.BeginCQ()
 		if h == tl {
 			t.Fatalf("flags=%s: the wait returned with no CQE", fl.name)
 		}
@@ -173,6 +173,101 @@ func TestSweepTickOnARealRing884(t *testing.T) {
 		}
 		if el < 900*time.Millisecond || el > 3*time.Second {
 			t.Errorf("flags=%s: the tick came %v after the submit, want about 1 s", fl.name, el)
+		}
+	}
+	if rings == 0 {
+		skipOrFail656(t, "no ring could be set up with any of the engine's flag sets")
+	}
+}
+
+// waitCQE1183 waits on r until its CQ ring has a completion, or 10 s have gone
+// by, and returns the CQ ring's head and tail and how many times a wait came
+// back with the CQ ring empty. The condition is a completion, not one wait
+// returning: SubmitAndWait returns nil on a signal, and a wait can end with
+// nothing to read (celeris#1183). Each retry is a new io_uring_enter with
+// GETEVENTS, as the run loop's iterations are: under DEFER_TASKRUN a
+// completion is posted by that call and a look at the CQ ring would not
+// find it.
+func waitCQE1183(r *Ring) (head, tail uint32, empty int, err error) {
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if err = r.SubmitAndWait(); err != nil {
+			return 0, 0, empty, err
+		}
+		if head, tail = r.BeginCQ(); head != tail {
+			return head, tail, empty, nil
+		}
+		empty++
+		if !time.Now().Before(deadline) {
+			return head, tail, empty, nil
+		}
+	}
+}
+
+// TestSweepTickWaitSurvivesAnEmptyReturn1183: Ring.SubmitAndWait returns nil
+// when a signal ends the wait (EINTR, as its comment says, and the engine's
+// loop relies on), so a nil return is not a completion; a wait with min_complete
+// 1 can also come back at once with nothing to read (measured on a loaded
+// 7.0 kernel, with no signal: 5 of 4000 fresh coop_taskrun rings). The run loop
+// iterates on an empty return; the test of the tick on a real ring read the CQ
+// ring after a single wait and failed "the wait returned with no CQE"
+// (celeris#1183). Here Go's preemption signal (SIGURG, which the runtime ignores
+// when it has not asked for it) ends the wait of a 300 ms timer every 5 ms, and
+// the wait must still deliver the timer's CQE.
+func TestSweepTickWaitSurvivesAnEmptyReturn1183(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	pid, tid := unix.Getpid(), unix.Gettid()
+	rings := 0
+	for _, fl := range []struct {
+		name  string
+		flags uint32
+	}{
+		{"plain", 0},
+		{"defer_taskrun", setupDeferTaskrun | setupSingleIssuer},
+		{"coop_taskrun", setupCoopTaskrun | setupSingleIssuer},
+	} {
+		r, err := NewRing(64, fl.flags, 0)
+		if err != nil {
+			t.Logf("celeris1183 flags=%s: ring unavailable: %v", fl.name, err)
+			continue
+		}
+		rings++
+		spec := kernelTimespec{Nsec: int64(300 * time.Millisecond)}
+		prepTimeout(r.GetSQE(), unsafe.Pointer(&spec), 0, 0)
+		stop, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			for tk := time.NewTicker(5 * time.Millisecond); ; {
+				select {
+				case <-stop:
+					tk.Stop()
+					return
+				case <-tk.C:
+					_ = unix.Tgkill(pid, tid, unix.SIGURG)
+				}
+			}
+		}()
+		h, tl, empty, err := waitCQE1183(r)
+		close(stop)
+		<-done
+		runtime.KeepAlive(&spec)
+		if err != nil {
+			_ = r.Close()
+			t.Fatalf("flags=%s: wait: %v", fl.name, err)
+		}
+		if h == tl {
+			_ = r.Close()
+			t.Fatalf("flags=%s: the wait returned with no CQE (%d empty returns)", fl.name, empty)
+		}
+		res := r.cqeAt(h).Res
+		r.EndCQ(h + 1)
+		_ = r.Close()
+		t.Logf("celeris1183 flags=%s empty_returns=%d res=%d", fl.name, empty, res)
+		if res != -int32(unix.ETIME) {
+			t.Errorf("flags=%s: the timer completed with res=%d, want -ETIME", fl.name, res)
+		}
+		if empty == 0 {
+			t.Errorf("flags=%s: no signal ended the wait early: the test is not exercising an empty return", fl.name)
 		}
 	}
 	if rings == 0 {
