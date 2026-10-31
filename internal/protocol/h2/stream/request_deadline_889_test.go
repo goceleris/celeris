@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The request deadline and the header-block deadline of the processor
@@ -130,11 +132,11 @@ func TestRequestDeadlineDisarmedWhenTheStreamLeaves889(t *testing.T) {
 		t.Fatalf("after a reset, a delete and a GOAWAY: armed %d, want 1 (stream 5)", armedIn889(m))
 	}
 	// A hint left stale by the disarms costs one scan, and settles.
-	ids := m.ExpiredRequests(time.Now().UnixNano()+int64(time.Hour), nil)
+	ids := m.ExpiredRequests(mono.Now()+int64(time.Hour), nil)
 	if len(ids) != 0 {
 		t.Fatalf("no cap, no ids: %v", ids)
 	}
-	ids = m.ExpiredRequests(time.Now().UnixNano()+int64(time.Hour), make([]uint32, 0, 8))
+	ids = m.ExpiredRequests(mono.Now()+int64(time.Hour), make([]uint32, 0, 8))
 	if len(ids) != 1 || ids[0] != 5 {
 		t.Fatalf("expired %v, want [5]", ids)
 	}
@@ -150,7 +152,7 @@ func TestExpireRequestAnswers408AndRemembersTheStream889(t *testing.T) {
 	if err := p.ProcessFrame(ctx, postHeaders889(t, 1, false)); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UnixNano() + int64(2*time.Second)
+	now := mono.Now() + int64(2*time.Second)
 	for _, id := range m.ExpiredRequests(now, make([]uint32, 0, 8)) {
 		p.ExpireRequest(id, now)
 	}
@@ -203,7 +205,7 @@ func TestExpiredRequestTombstonesRunOut889(t *testing.T) {
 	if err := p.ProcessFrame(ctx, postHeaders889(t, 1, false)); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UnixNano() + int64(2*time.Second)
+	now := mono.Now() + int64(2*time.Second)
 	for _, id := range p.GetManager().ExpiredRequests(now, make([]uint32, 0, 8)) {
 		p.ExpireRequest(id, now)
 	}
@@ -224,7 +226,7 @@ func TestRequestDeadlineNeverAllocatesOnTheRequestPath889(t *testing.T) {
 	m := NewManager()
 	m.SetRequestTimeout(time.Second)
 	s, _ := m.TryOpenStream(1)
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if n := testing.AllocsPerRun(1000, func() {
 		m.ArmRequest(s, now)
 		m.DisarmRequest(s)
@@ -257,7 +259,7 @@ func TestHeaderBlockDeadline889(t *testing.T) {
 		t.Fatal(err)
 	}
 	dl := p.NextHeaderBlockDeadline()
-	if dl == 0 || dl < time.Now().UnixNano() {
+	if dl == 0 || dl < mono.Now() {
 		t.Fatalf("header block deadline %d, want one in the future", dl)
 	}
 	var buf []byte
@@ -343,7 +345,7 @@ func TestEveryRequestOpenStreamCarriesADeadline889(t *testing.T) {
 	step("a malformed request", noPath)
 	step("a client RST_STREAM", makeRSTStreamFrame(t, 1, http2.ErrCodeCancel))
 	step("a POST after the reset", postHeaders889(t, 15, false))
-	now := time.Now().UnixNano() + int64(2*time.Second)
+	now := mono.Now() + int64(2*time.Second)
 	for _, id := range m.ExpiredRequests(now, make([]uint32, 0, 8)) {
 		p.ExpireRequest(id, now)
 	}
@@ -361,7 +363,7 @@ func TestClientResetOfAnExpiredRequestForgetsIt889(t *testing.T) {
 	if err := p.ProcessFrame(ctx, postHeaders889(t, 1, false)); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UnixNano() + int64(2*time.Second)
+	now := mono.Now() + int64(2*time.Second)
 	for _, id := range p.GetManager().ExpiredRequests(now, make([]uint32, 0, 8)) {
 		p.ExpireRequest(id, now)
 	}

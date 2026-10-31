@@ -282,3 +282,19 @@ func TestZeroAllocations(t *testing.T) {
 		}
 	}
 }
+
+func TestUntil(t *testing.T) {
+	for _, d := range []time.Duration{10 * time.Second, -10 * time.Second, 0} {
+		if got := Until(Now() + int64(d)); got < d-time.Second || got > d+time.Second {
+			t.Errorf("Until(Now()%+v) = %v", d, got)
+		}
+	}
+	// Under a stepped seam the answer follows the clock, not the real wall.
+	restore := SetSeam(func() Reading {
+		return Reading{Wall: time.Now().UnixNano() + int64(75*time.Second), Mono: int64(time.Since(start))}
+	})
+	defer restore()
+	if got := Until(Now() + int64(5*time.Second)); got < 4*time.Second || got > 6*time.Second {
+		t.Errorf("under a stepped seam Until(Now()+5s) = %v", got)
+	}
+}

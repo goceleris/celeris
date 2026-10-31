@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#1170: a pool handler's wait for window is a record in the stall books,
@@ -258,12 +260,12 @@ func TestWaiterRecordBooks1170(t *testing.T) {
 		t.Fatalf("NoteWaitSent credited a buffered record: %d", rel)
 	}
 	// The sweep skips it, in the verdicts and in the hint.
-	if out := m.ExpiredWrites(time.Now().UnixNano()+int64(2*time.Hour), make([]uint32, 0, 8)); len(out) != 1 || out[0] != other.ID {
+	if out := m.ExpiredWrites(mono.Now()+int64(2*time.Hour), make([]uint32, 0, 8)); len(out) != 1 || out[0] != other.ID {
 		t.Fatalf("the sweep expired %v, want only the buffered stream %d", out, other.ID)
 	}
 	m.dropStall(other.ID)
 	if m.hints.WrDL.Load() != 0 {
-		_ = m.ExpiredWrites(time.Now().UnixNano(), make([]uint32, 0, 8))
+		_ = m.ExpiredWrites(mono.Now(), make([]uint32, 0, 8))
 	}
 	if h := m.NextWriteDeadline(); h != 0 {
 		t.Fatalf("hint %d with only a waiter: the sweep would spin", h)
@@ -319,7 +321,7 @@ func TestWaiterAndBufferNeverHaveTwoJudges1170(t *testing.T) {
 	if v, _ := m.judgeWait(s, s.ID, &w, 300000); v != waitHeld {
 		t.Fatalf("the waiter's judge decided %v on the sweep's record", v)
 	}
-	if out := m.ExpiredWrites(time.Now().UnixNano()+int64(wait1170)*2, make([]uint32, 0, 4)); len(out) != 1 {
+	if out := m.ExpiredWrites(mono.Now()+int64(wait1170)*2, make([]uint32, 0, 4)); len(out) != 1 {
 		t.Fatalf("the sweep expired %v, want the stream (it judges now)", out)
 	}
 }
@@ -478,7 +480,7 @@ func TestUnreadStreamBoundWithAQueueAhead1170(t *testing.T) {
 		a.SetState(StateOpen)
 		a.SetWindowSize(0)
 		a.BufferOutbound(make([]byte, 64<<20), true)
-		w := firstReset889(m, 1, time.Now().UnixNano(), 60, func(int) {
+		w := firstReset889(m, 1, mono.Now(), 60, func(int) {
 			a.SetWindowSize(100000) // the sibling takes 100000 a window: the connection moves
 			m.FlushOutbound(a, discard889)
 			m.connectionWindow = int32(1<<30+65535) - int32(tc.inflight) // the client returns what it reads
@@ -501,7 +503,7 @@ func TestIdleAllowanceIsFixedWhenTheRunBegins1170(t *testing.T) {
 	a.SetState(StateOpen)
 	a.SetWindowSize(0)
 	a.BufferOutbound(make([]byte, 64<<20), true)
-	w := firstReset889(m, 1, time.Now().UnixNano(), 60, func(win int) {
+	w := firstReset889(m, 1, mono.Now(), 60, func(win int) {
 		a.SetWindowSize(100000)
 		m.FlushOutbound(a, discard889)
 		if win > 1 {
@@ -534,7 +536,7 @@ func TestWaiterLoopBlockedFallback1170(t *testing.T) {
 				// A loop that is always this far into a batch (it re-enters as time passes).
 				quit := make(chan struct{})
 				defer close(quit)
-				stamp := func() { slot.Enter(time.Now().Add(-tc.stuck).UnixNano()) }
+				stamp := func() { slot.Enter((mono.Now() + int64(-tc.stuck))) }
 				stamp()
 				go func() {
 					for {
@@ -569,7 +571,7 @@ func TestWaiterLoopBlockedFallback1170(t *testing.T) {
 func TestLoopWatch1170(t *testing.T) {
 	lw := NewLoopWatch()
 	a, b := lw.Slot(), lw.Slot()
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if lw.BlockedFor(now, 1) {
 		t.Fatal("idle loops read as stuck")
 	}
@@ -601,7 +603,7 @@ func TestIdleRunThatBeginsInATailKeepsAnAllowance1170(t *testing.T) {
 	b := &stall{held: 10, pending: 10, connHeld: 20}
 	m.stalls = map[uint32]*stall{1: a, 3: b}
 	m.stallN.Store(2)
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	m.stallMu.Lock()
 	defer m.stallMu.Unlock()
 	h1 := m.holdsLocked(a, false, now)
@@ -627,7 +629,7 @@ func TestIdleAllowanceIsTheLargestOfTheRun1170(t *testing.T) {
 		other := &stall{held: 1 << 20, pending: 1 << 20, connHeld: 8 << 20}
 		m.stalls = map[uint32]*stall{1: st, 3: other}
 		m.stallN.Store(2)
-		now := time.Now().UnixNano()
+		now := mono.Now()
 		m.stallMu.Lock()
 		defer m.stallMu.Unlock()
 		for w := 1; w <= 60; w++ {
@@ -663,7 +665,7 @@ func TestEmptyWindowsOfAMovingConnectionAreHeldUpToTheHorizon1170(t *testing.T) 
 		m.initWin.Store(0)
 		a := stalled889(m, 1, 64<<20)
 		b := stalled889(m, 3, 64<<20)
-		start := time.Now().UnixNano()
+		start := mono.Now()
 		return firstReset889(m, 1, start, 40, func(w int) {
 			a.SetWindowSize(20000)
 			m.FlushOutbound(a, discard889)
@@ -712,7 +714,7 @@ func TestLoopWatchTellsAnEpisodeOnce1170(t *testing.T) {
 	lw.SetLogger(slog.New(&h))
 	slot := lw.Slot()
 	wt := int64(time.Second)
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	for i := 0; i < 5; i++ { // five judgements that see the loop stuck: one line
 		slot.Enter(now - int64(time.Second))
 		if idx, _, ok := lw.stuck(now, loopStuckFor(wt)); ok {
@@ -750,7 +752,7 @@ func TestHorizonWindowsAreIdleWindows1170(t *testing.T) {
 		stalled889(m, 1, 64<<20)
 		b := stalled889(m, 3, 64<<20)
 		m.connectionWindow = 1<<30 - 16<<20
-		return firstReset889(m, 1, time.Now().UnixNano(), 80, func(w int) {
+		return firstReset889(m, 1, mono.Now(), 80, func(w int) {
 			if moves(w) {
 				b.SetWindowSize(70000)
 				m.FlushOutbound(b, discard889)
@@ -787,7 +789,7 @@ func TestIdleAllowanceStartsAgainWithEachRun1170(t *testing.T) {
 	a := stalled889(m, 1, 64<<20)
 	b := stalled889(m, 3, 64<<20)
 	m.connectionWindow = 1<<30 - 16<<20 // 16 MiB in flight: the first run has the cap
-	got := firstReset889(m, 1, time.Now().UnixNano(), 80, func(w int) {
+	got := firstReset889(m, 1, mono.Now(), 80, func(w int) {
 		b.SetWindowSize(70000) // the connection moves in every window
 		m.FlushOutbound(b, discard889)
 		switch w {

@@ -844,7 +844,7 @@ func (m *Manager) SetRequestTimeout(d time.Duration) { m.reqTimeout = clampTimeo
 func (m *Manager) RequestTimeout() time.Duration { return m.reqTimeout }
 
 // ArmRequest starts the request deadline of s, a stream just opened by a HEADERS
-// frame without END_STREAM, at now (nanoseconds, wall clock). Absolute: it is
+// frame without END_STREAM, at now (nanoseconds, internal/mono). Absolute: it is
 // not moved by the stream's DATA or by anything else. The instant is kept in
 // s.StartTimeNs, unused on HTTP/2 (the engines' cache of a recv's clock, which
 // only HTTP/1 fills), and the flag marks that it is there; the manager keeps

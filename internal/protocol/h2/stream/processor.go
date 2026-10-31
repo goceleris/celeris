@@ -11,6 +11,8 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // ContinuationState tracks the state of CONTINUATION frames.
@@ -1751,7 +1753,7 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 		// A request that is not whole at its HEADERS has a deadline (celeris#889):
 		// ReadTimeout from now, absolute. A request without a body (every GET)
 		// pays the one test of endStream that is made anyway.
-		m.ArmRequest(stream, time.Now().UnixNano())
+		m.ArmRequest(stream, mono.Now())
 	}
 	return stream, admitNew, nil
 }
