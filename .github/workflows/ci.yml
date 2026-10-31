@@ -214,13 +214,14 @@ jobs:
           # celeris#1190: the stepped-clock tests of the HTTP/2 deadlines the engines' test
           # does not reach (idle clock and ack cap, write window and ExpiredWrites,
           # header block, tombstone), on a clock that moves only when the test moves it
-          # (mono.Manual), skewed by +1 h like the rest. Milliseconds; the whole of
+          # (mono.Manual), skewed by +1 h like the rest. Under a second (the waiter's test is
+          # 0.7 s: a real timer); the whole of
           # internal/conn runs skewed below as well, this line names them so that a
           # rename or a removal fails the step instead of passing as "no tests".
           echo "== h2 stepped-clock tests (celeris#1190), CELERIS_MONO_SKEW=3600s"
-          CELERIS_MONO_SKEW=3600s go test -count=1 -timeout=120s -tags celeris_monoskew -v -run '1190$' ./internal/conn/ 2>&1 | tee /tmp/mono-1190.log
+          CELERIS_MONO_SKEW=3600s go test -count=1 -p 1 -timeout=120s -tags celeris_monoskew -v -run '1190$' ./internal/conn/ ./internal/protocol/h2/stream/ 2>&1 | tee /tmp/mono-1190.log
           n=$(grep -cE '^--- PASS: Test[A-Za-z]+1190 ' /tmp/mono-1190.log || true)
-          if [ "$n" -ne 5 ]; then echo "want 5 passing 1190 tests, got $n"; exit 1; fi
+          if [ "$n" -ne 7 ]; then echo "want 7 passing 1190 tests (6 in conn, 1 in h2 stream), got $n"; exit 1; fi
           # The engines' stepped-clock test (celeris#1178), without -race, with the clock
           # skewed by +1 h: it moves the wall reading of the clock by 75 s every 50 ms,
           # and under the skew it is also the strongest check that the loops' own clock

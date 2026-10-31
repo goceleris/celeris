@@ -19,6 +19,14 @@ import (
 // early), and the time that then really passes must fire it (a deadline held past its
 // bound, which a backward step does to a clock on the wall).
 
+// On the monotonic clock a step moves nothing, so a "forward" and a "backward"
+// subtest test the same thing there (the time that passes fires the deadline); they
+// differ on the wall clock, which is where the tests are RED (flipped = false). The
+// sweeps that assert "the step alone fired nothing" come after enough time has passed
+// to cross D0's d0Interval gate (100 ms), or the sweep would not look at the clock.
+// The mutants that a site back on the real wall clock would be are killed by the
+// clock's hour (mono.NewManual), which a wall read does not share.
+
 var steps1190 = []struct {
 	name string
 	step time.Duration
@@ -46,12 +54,11 @@ func TestIdleClockAndAckCapIgnoreAStepOfTheWallClock1190(t *testing.T) {
 				t.Fatalf("the first sweep closed the conn: %+v", res)
 			}
 			clk.Step(tc.step)
-			if tc.step > 0 { // a backward step is judged by the time that passes
-				if res := r.st.Sweep(mono.Now(), r.write); res.CloseNow {
-					t.Fatalf("a step of %v closed an idle clock that had run for nothing: %+v", tc.step, res)
-				}
+			clk.Advance(150 * time.Millisecond) // past d0Interval: the sweep looks at the idle clock
+			if res := r.st.Sweep(mono.Now(), r.write); res.CloseNow {
+				t.Fatalf("a step of %v closed an idle clock that had run for 0.15 s: %+v", tc.step, res)
 			}
-			clk.Advance(1200 * time.Millisecond)
+			clk.Advance(1050 * time.Millisecond)
 			if res := r.st.Sweep(mono.Now(), r.write); !res.CloseNow {
 				t.Fatalf("after IdleTimeout (1.2 s of time, step %v) the idle conn was not closed: %+v", tc.step, res)
 			}
@@ -81,6 +88,10 @@ func TestIdleClockAndAckCapIgnoreAStepOfTheWallClock1190(t *testing.T) {
 			clk.Advance(500 * time.Millisecond)
 			if res := r.st.Sweep(mono.Now(), r.write); res.CloseNow {
 				t.Fatalf("0.5 s into a period given for acknowledged output (step %v) the conn was closed: %+v", tc.step, res)
+			}
+			clk.Advance(700 * time.Millisecond)
+			if res := r.st.Sweep(mono.Now(), r.write); !res.CloseNow {
+				t.Fatalf("the period given for acknowledged output (1.2 s of time, step %v) did not run out: %+v", tc.step, res)
 			}
 		})
 	}
@@ -220,9 +231,13 @@ func TestTombstoneDeadlineIgnoresAStepOfTheWallClock1190(t *testing.T) {
 			r.frames(func(fr *http2.Framer) {
 				_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r.block("POST", "/u"), EndHeaders: true})
 			})
-			clk.Advance(1200 * time.Millisecond)
+			clk.Advance(500 * time.Millisecond)
+			if res := r.st.Sweep(mono.Now(), r.write); res.Expired != 0 {
+				t.Fatalf("the request was expired 0.5 s into its 1 s: %+v", res)
+			}
+			clk.Advance(700 * time.Millisecond)
 			if res := r.st.Sweep(mono.Now(), r.write); res.Expired != 1 {
-				t.Fatalf("the request was not expired: %+v", res)
+				t.Fatalf("the request was not expired after 1.2 s: %+v", res)
 			}
 			p := r.st.processor
 			left := time.Duration(p.NextTombstoneDeadline() - mono.Now())
@@ -245,6 +260,40 @@ func TestTombstoneDeadlineIgnoresAStepOfTheWallClock1190(t *testing.T) {
 			r.st.Sweep(mono.Now(), r.write)
 			if p.NextTombstoneDeadline() != 0 {
 				t.Fatalf("the tombstone outlived its 2 s (2.2 s of time, step %v)", tc.step)
+			}
+		})
+	}
+}
+
+// D0 restarts from stream activity: a stream the sweep saw (open, or new since the last
+// look) moves the idle clock to that sweep. A conn that had 0.7 s of idle clock and then
+// carried a stream is idle for IdleTimeout (1 s) after the stream, not after the
+// first sweep: it is not closed 0.65 s after the stream, and is 1.25 s after it.
+func TestIdleClockRestartsFromStreamActivityOnAStepOfTheWallClock1190(t *testing.T) {
+	for _, tc := range steps1190 {
+		t.Run(tc.name, func(t *testing.T) {
+			clk := clock1190(t)
+			r := newSweepRig889(t, H2Config{IdleTimeout: time.Second})
+			r.written()
+			if res := r.st.Sweep(mono.Now(), r.write); res.CloseNow {
+				t.Fatalf("the first sweep closed the conn: %+v", res)
+			}
+			clk.Advance(700 * time.Millisecond)
+			r.frames(func(fr *http2.Framer) {
+				_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: r.block("POST", "/u"), EndHeaders: true})
+			})
+			if res := r.st.Sweep(mono.Now(), r.write); res.CloseNow { // the activity: the clock restarts here
+				t.Fatalf("a conn with a stream open was closed as idle: %+v", res)
+			}
+			r.frames(func(fr *http2.Framer) { _ = fr.WriteRSTStream(1, http2.ErrCodeCancel) }) // the stream leaves
+			clk.Step(tc.step)
+			clk.Advance(650 * time.Millisecond)
+			if res := r.st.Sweep(mono.Now(), r.write); res.CloseNow {
+				t.Fatalf("0.65 s after its last stream (step %v) the conn was closed: the idle clock did not restart: %+v", tc.step, res)
+			}
+			clk.Advance(600 * time.Millisecond)
+			if res := r.st.Sweep(mono.Now(), r.write); !res.CloseNow {
+				t.Fatalf("1.25 s after its last stream (step %v) the idle conn was not closed: %+v", tc.step, res)
 			}
 		})
 	}

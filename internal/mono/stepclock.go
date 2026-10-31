@@ -59,14 +59,19 @@ type Manual struct {
 	step  atomic.Int64
 }
 
-// NewManual returns a manual clock standing one hour past the real wall time on both
-// readings. The hour is on purpose: a site that still reads the real clock
-// (time.Now) instead of this package is then an hour behind every stamp of the clock,
-// so a test of its deadline fails at once, where a clock that stood at the real time
-// would agree with it to the millisecond and hide it.
+// NewManual returns a manual clock that stands one hour past the REAL wall clock,
+// whatever the canary's skew is. The hour is on purpose: a site that still reads the
+// real clock (time.Now) instead of this package is then an hour behind every stamp of
+// the clock, so a test of its deadline fails at once, where a clock standing at the
+// real time would agree with it to the millisecond and hide it. It is anchored to the
+// real wall AFTER the skew: the skewed form of Now (base, which includes the skew,
+// plus the monotonic reading, or the wall reading plus the skew) is real + 1 h at
+// every CELERIS_MONO_SKEW, including -1 h, where an hour put on the monotonic reading
+// alone would cancel the skew and stand on the real wall.
 func NewManual() *Manual {
-	m := &Manual{wall0: time.Now().UnixNano()}
-	m.mono.Store(int64(time.Hour))
+	real := time.Now().UnixNano()
+	m := &Manual{wall0: base - skew} // wall mode: Wall + skew = base + mono
+	m.mono.Store(real + int64(time.Hour) - base)
 	return m
 }
 
