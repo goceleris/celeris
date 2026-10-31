@@ -1,7 +1,9 @@
 package mono
 
-// The two tables of TestNoWallStamps and the list of TestNoWallFixtures (see the
-// package documentation). Generated once by TestScanDump; edited by hand since.
+// The table of TestNoWallStamps (see the package documentation): the wall reads
+// that stay wall for good. The pending tables of the routing steps are gone: every
+// stamp of the engines, conn, the root package and the HTTP/2 stream code is read
+// from this package (celeris#1178), and a new wall read has to be argued for here.
 
 type entry struct {
 	Count  int
@@ -19,16 +21,3 @@ var stays = map[site]entry{
 	{"middleware/websocket/conn.go", "Conn.ReadMessageReuse", ".UnixNano"}:             {1, "the public Context.SetWSIdleDeadline contract (wall Unix nanoseconds); the engine converts it with mono.FromWall"},
 	{"router.go", "var nowNano", ".UnixNano"}:                                          {1, "the adaptive promotion TTL: stamped and compared in router.go, with its own test hook"},
 }
-
-// pending: every wall stamp that has still to move onto mono.Now(). A routing PR
-// deletes its entries; the flip PR requires the table to be empty.
-var pending = map[site]entry{
-	// step 4: route internal/conn H1 and the root package (handler.go, context_response.go; context.go StartTime keeps time.Unix(0, ns) until the flip PR, which makes it mono.Time and deletes its entry)
-	{"context.go", "Context.StartTime", "time.Unix"}: {1, "step 4"},
-}
-
-// pendingFixtures: test functions that write a wall reading into a stamp field or
-// hand one to a function that takes a stamp. Each moves to mono.Now() with the
-// routing PR of its package (the skew canary fails them otherwise), and its entry
-// goes with it.
-var pendingFixtures = map[string]bool{}

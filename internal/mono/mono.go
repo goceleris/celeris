@@ -36,38 +36,32 @@
 // first sweep, for the rest of the process's life): worse than today, where a
 // step only cuts the connections that were open during it. So:
 //
-//  1. (this package) The clock, its seam, and the scan test. [Now] still reads
-//     the WALL clock, so nothing here changes a value.
-//  2. Routing PRs send every wall stamp through this package, one package at a
-//     time. They never change a clock, so each is correct on its own and they
-//     merge in any order.
-//  3. The FLIP changes [Now] to the monotonic form (the constant flipped) in
-//     ONE PR. It is the only change of a clock.
+//  1. The clock, its seam, the scan and the canary. [Now] reads the WALL clock,
+//     so nothing changes a value.
+//  2. Routing PRs (io_uring, epoll, conn and the root package, the HTTP/2 stream
+//     code, StartTime) sent every wall stamp through this package. They never
+//     changed a clock, so each was correct on its own.
+//  3. The FLIP changes [Now] to the monotonic form (the constant flipped) in ONE
+//     PR. It is the only change of a clock.
 //
-// # The scan test and its PENDING list (scan_test.go)
+// # The scan test (scan_test.go)
 //
 // TestNoWallStamps walks the directories (not a package list) of the engines,
 // internal/conn, internal/protocol, the root package and the WebSocket and SSE
 // middleware, and matches SYNTACTICALLY, without type information: every call
 // of .UnixNano(), .UnixMilli(), .UnixMicro() or .Unix(), every time.Unix(...),
 // and the calls that strip a monotonic reading (.Round(0), .UTC(), .Local(),
-// .In(...)). Each match, by (file, enclosing function, what), must be listed in
-// one of two tables, keyed by names and counts, never by line:
-//
-//   - stays: a site that stays on the wall for good (the Date header, the
-//     public SetWSIdleDeadline contract, one-second flood windows), with its
-//     reason;
-//   - pending: every site that has still to move onto this clock. A routing
-//     PR deletes its entries (the test also fails on a STALE entry, so a
-//     deleted entry cannot be forgotten, and a re-added wall read is a match in
-//     neither table). The test files that write a wall reading into a stamp
-//     field are in pendingFixtures, deleted the same way.
-//
-// The flip is gated in code: TestPendingIsEmptyWhenFlipped fails while flipped
-// is true and any pending entry is left. A routing PR reverted after the flip
-// re-adds an unlisted match, and CI goes red; the flip cherry-picked without
-// its routing PRs fails on the release branch. The flip PR also carries the
-// behaviour tests (red against the wall, green after).
+// .In(...)). Each match, by (file, enclosing function, what) with a count,
+// never by line, must be in the table stays with its reason (the Date header,
+// the public SetWSIdleDeadline contract, one-second flood windows); the test
+// also fails on a stale entry. During the routing steps a second table listed
+// every site still to move and the test functions that wrote a wall reading into
+// a stamp field; it is gone, so a routing PR reverted after the flip re-adds a
+// match that is listed nowhere and CI goes red, and the flip cherry-picked
+// without its routing PRs fails on the release branch. TestNoWallFixtures
+// refuses a test function that writes a wall reading into a stamp field or hands
+// one to a function that takes a stamp. A statement that mixes a drainclock or
+// deferlinger reading with one of this package fails too.
 //
 // # The skew canary (test builds only)
 //
