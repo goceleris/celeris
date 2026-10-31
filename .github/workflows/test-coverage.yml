@@ -286,11 +286,13 @@ jobs:
   # own 8 MiB memlock). Each shard writes a profile of the root package for its
   # tests and uploads it under the `root` flag; the `coverage` job uploads the
   # rest under the same flag, and Codecov adds the uploads of a commit together
-  # (codecov.yml waits for all seven). The shard's tests must each run and PASS
+  # (codecov.yml waits for all eight). The shard's tests must each run and PASS
   # by name, as in ci.yml. Not a required check, like the job above.
   #
   # -timeout=660s: the shards took 215.5 s (a) and 221.2 s (b) under coverage on
-  # the runner (run 38348908034), so 660 s keeps a margin of 3x.
+  # the runner (run 38348908034). With the write-deadline cells (celeris#889, #1170) in
+  # a and b they ran at 523 s and 497 s (79% of the timeout); the cells of #1170 have
+  # a shard of their own (c) now, and a, b and c are about 360 s each, a margin of 1.8x.
   coverage-root-shard:
     name: Coverage root shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -300,7 +302,7 @@ jobs:
       matrix:
         # Every shard named in .github/root-test-shards.txt (the guard in the
         # `coverage` job's root step fails when the two differ).
-        shard: [a, b]
+        shard: [a, b, c]
     permissions:
       contents: read # checkout
       id-token: write # Codecov upload over OIDC, as the job above

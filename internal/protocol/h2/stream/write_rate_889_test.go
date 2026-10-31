@@ -487,6 +487,7 @@ func TestWriteIdleCountRestarts889(t *testing.T) {
 		got := firstReset889(m, 1, time.Now().UnixNano(), 20, func(w int) {
 			if w == 3 { // the conn window is shut and b's own has room: starved; a sibling takes the grant
 				atomic.StoreInt32(&m.connectionWindow, 0)
+				m.connHigh.Store(0) // nothing in flight at the connection level (the allowance has its own tests)
 				b.SetWindowSize(1 << 20)
 				a.SetWindowSize(70000)
 				m.UpdateConnectionWindow(70000)
@@ -563,8 +564,10 @@ func TestWriteConnFloorIsWhatTheConnHolds889(t *testing.T) {
 	}
 }
 
-// The bank does not survive a window held on the share: a stream below its floor
-// on a connection that does not move is the verdict.
+// The bank does not survive a window held on the share. (Until celeris#1170 this was
+// shown by the verdict of the next window, a stream below its floor on a connection
+// that stopped moving; the connection that moved in the window before now carries
+// through one window that releases nothing, review r10 F1, so the books are looked at.)
 func TestWriteBankIsSpentByAShareWindow889(t *testing.T) {
 	_, m, _ := wdSetup889(t)
 	b := stalled889(m, 1, 64<<20)
@@ -586,16 +589,35 @@ func TestWriteBankIsSpentByAShareWindow889(t *testing.T) {
 	if out := windowEnd889(m, start, 2); len(out) != 0 {
 		t.Fatalf("window 2: %v", out)
 	}
-	// Window 3: b takes 40000 and nothing else moves: 40000 is under the floor and the
-	// connection is under its floor. The 30000 banked in window 1 do not make 70000.
+	// The 30000 banked in window 1 are gone: a window held on the share clears the bank.
+	m.stallMu.Lock()
+	bank := m.stalls[1].bank
+	m.stallMu.Unlock()
+	if bank != 0 {
+		t.Fatalf("the bank of window 1 survived a window held on the share: %d", bank)
+	}
+	// Window 3: b takes 40000 and nothing else moves: the connection moved in window 2, so
+	// one empty window is held (idle); the 30000 banked in window 1 would have made 70000.
 	b.SetWindowSize(40000)
 	m.FlushOutbound(b, discard889)
-	reset := false
 	for _, id := range windowEnd889(m, start, 3) {
-		reset = reset || id == 1
+		if id == 1 {
+			t.Fatal("window 3: stream 1 reset: one window in which the connection released nothing, after one in which it moved, is held")
+		}
+	}
+	// Windows 4 to 6: still nothing moves besides b, 40000 a window: under the floor, the
+	// connection under its floor for as many windows as the bank covers (it last moved in
+	// window 2): the verdict.
+	reset := false
+	for w := 4; w <= 6 && !reset; w++ {
+		b.SetWindowSize(40000)
+		m.FlushOutbound(b, discard889)
+		for _, id := range windowEnd889(m, start, w) {
+			reset = reset || id == 1
+		}
 	}
 	if !reset {
-		t.Fatal("window 3: stream 1 held; the bank of window 1 survived a window held on the share")
+		t.Fatal("stream 1 held for four windows in which the connection released nothing")
 	}
 }
 

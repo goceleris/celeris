@@ -258,9 +258,16 @@ func TestH2ParallelDownloadsSharingASlowLinkAreNotCut889(t *testing.T) {
 // TestH2PausedAndDribbledStreamsOnAHealthyConnAreBounded889: on a connection that
 // moves well above the floor a stream the client does not read at all (no
 // WINDOW_UPDATE), or feeds a byte every 100 ms, is held for a few windows (it may be
-// waiting behind its siblings in the same socket) and reset after that: three
-// windows with nothing of its own, so the fourth judgement, 4 s in. Its sibling,
-// read at 250 KB/s, goes on. On the previous head it was reset at 1.0 s.
+// waiting behind its siblings in the same socket) and reset after that. Its sibling,
+// read at 250 KB/s, goes on. On the head before celeris#889 D2 it was reset at 1.0 s;
+// with D2 three windows with nothing of its own, the fourth judgement, 4 s in; since
+// celeris#1170 (option B: the idle allowance follows the bytes in flight, at most 12
+// windows, and the connection counts as moving for four windows after its siblings
+// stop) the allowance is the queue the sibling's 2 MiB leaves in flight over its rate,
+// and the stream is reset when that is read and the siblings have been quiet for the
+// horizon: measured 12.2 to 13.8 s here (the client sees the RST behind the data it
+// is still reading). The bound is 4 + 12 + 1 windows in all (the windows the horizon
+// holds count inside the allowance), so [3.5 s, 18 s].
 func TestH2PausedAndDribbledStreamsOnAHealthyConnAreBounded889(t *testing.T) {
 	for _, e := range nativeEngines889() {
 		for _, mode := range []string{"paused", "dribbled"} {
@@ -273,8 +280,8 @@ func TestH2PausedAndDribbledStreamsOnAHealthyConnAreBounded889(t *testing.T) {
 				}
 				res, got, at := slowLink889(t, addr, 250e3, []uint32{1, 3}, 2<<20, skip, dribble)
 				t.Logf("WR889 paused %s/%s: %v %v at %v", e.name, mode, res, got, at)
-				if res[3] != "RST INTERNAL_ERROR" || at[3] < 3500*time.Millisecond || at[3] > 7*time.Second {
-					t.Fatalf("stream 3 (%s): %q at %v, want RST INTERNAL_ERROR in [3.5 s, 7 s] (three windows of grace, then the verdict)", mode, res[3], at[3].Round(time.Millisecond))
+				if res[3] != "RST INTERNAL_ERROR" || at[3] < 3500*time.Millisecond || at[3] > 18*time.Second {
+					t.Fatalf("stream 3 (%s): %q at %v, want RST INTERNAL_ERROR in [3.5 s, 18 s] (the allowance of option B, then the verdict)", mode, res[3], at[3].Round(time.Millisecond))
 				}
 				if r := res[1]; r != "" && r != "complete" {
 					t.Fatalf("the healthy sibling, stream 1, ended with %q", r)

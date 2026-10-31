@@ -69,6 +69,10 @@ type H2Config struct {
 	// wrapping os.ErrDeadlineExceeded. The engines pass the server's
 	// WriteTimeout. 0 = no bound.
 	WriteTimeout time.Duration
+	// LoopWatch is the engine's watch on its event loops: while one of them is
+	// stuck in a batch for half a WriteTimeout, a pool handler's wait for window is
+	// bounded by WriteTimeout in all (celeris#1170, stream.LoopWatch). Nil: never.
+	LoopWatch *stream.LoopWatch
 	// ReadTimeout is the request deadline of a stream (the server's
 	// ReadTimeout): a request that is not whole this long after its HEADERS is
 	// answered 408 and reset with RST_STREAM(NO_ERROR) (celeris#889). Absolute,
@@ -626,6 +630,8 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 	proc.GetManager().SetHints(&s.hints)
 	proc.GetManager().SetRequestTimeout(cfg.ReadTimeout)
 	proc.GetManager().SetWriteTimeout(cfg.WriteTimeout)
+	s.adapter.loops = cfg.LoopWatch
+	s.adapter.log = cfg.Logger
 	proc.SetHeaderBlockTimeout(cfg.ReadHeaderTimeout)
 	if lg := cfg.Logger; lg != nil {
 		proc.OnHandlerPanic = func(id uint32, r any, stack []byte) {
