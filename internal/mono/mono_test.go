@@ -298,3 +298,36 @@ func TestUntil(t *testing.T) {
 		t.Errorf("under a stepped seam Until(Now()+5s) = %v", got)
 	}
 }
+
+// The stepped clocks tests of other packages use: the wall reading steps, the
+// monotonic one runs.
+func TestSteppedClocks(t *testing.T) {
+	var st Stepper
+	restore := SetStepper(&st)
+	a := Now()
+	st.Add(75 * time.Second)
+	b := Now()
+	restore()
+	if flipped {
+		if d := time.Duration(b - a); d < 0 || d > time.Second {
+			t.Fatalf("flipped: a step of the wall moved Now by %v", d)
+		}
+	} else if d := time.Duration(b - a); d < 74*time.Second || d > 76*time.Second {
+		t.Fatalf("routing phase: Now moved %v, want the wall's 75 s", d)
+	}
+	if st.Offset() != 75*time.Second {
+		t.Fatalf("offset = %v", st.Offset())
+	}
+	restore = SetStair(time.Minute, 20*time.Millisecond)
+	defer restore()
+	t0 := Now()
+	time.Sleep(110 * time.Millisecond)
+	d := time.Duration(Now() - t0)
+	if flipped {
+		if d > time.Second {
+			t.Fatalf("flipped: the stair moved Now by %v", d)
+		}
+	} else if d < 3*time.Minute {
+		t.Fatalf("routing phase: the stair moved Now by only %v in 110 ms (every 20 ms by a minute)", d)
+	}
+}
