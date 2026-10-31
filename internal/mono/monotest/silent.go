@@ -19,11 +19,14 @@ const (
 
 	// silentSlack is what a silent connection may exceed its deadline by once it
 	// has been accepted. epoll sweeps every 25 ms and io_uring arms a timer of its
-	// own, so a connection is closed within about 30 ms of its deadline (measured,
-	// docker arm64 with 2 CPUs, 20 runs per engine); 400 ms is more than ten times
-	// that, and is not tuned to the machine. The io_uring sweep that enforced the
-	// deadline before celeris#1189 came 0.54 to 0.86 s late (40 runs).
-	silentSlack = 400 * time.Millisecond
+	// own, so a connection is closed within 8 to 25 ms of its deadline (measured,
+	// docker arm64 with 2 CPUs, 20 runs per engine); 150 ms is six times the larger
+	// and is not tuned to the machine. It does not tell the io_uring sweep from the
+	// timer on every run: the sweep that enforced the deadline before celeris#1189
+	// came 0.1 to 0.9 s late, depending on where its phase fell after the accept.
+	// The regression test for that is the io_uring package's
+	// TestUndecidedConnHasItsHeaderTimerArmed1189, which does not depend on timing.
+	silentSlack = 150 * time.Millisecond
 
 	// settle is how long the engine idles before the connection, for its workers'
 	// idle backoff (1 ms, then 5 ms, then 25 ms waits) to have run its course.
@@ -39,7 +42,7 @@ const (
 // TCP_DEFER_ACCEPT off, so the deadline counts from the connect, opens a connection
 // that sends nothing and another that sends one byte (the protocol is not decided
 // yet) and then nothing, and asserts each is closed no sooner than 900 ms and no later
-// than 1.4 s after its connect.
+// than 1.15 s after its connect.
 func SilentConnIsCutAtReadHeaderTimeout(t *testing.T, start Start) {
 	cfg := Config()
 	cfg.ReadHeaderTimeout = silentTimeout

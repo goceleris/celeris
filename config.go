@@ -280,8 +280,10 @@ type Config struct {
 	// ReadHeaderTimeout off). With ReadHeaderTimeout off epoll has no such timer and
 	// looks much more rarely (a 1 s IdleTimeout closed an idle connection at 3 to 6 s
 	// in measurement). A timeout of a few seconds or less is approximate by that
-	// much on io_uring. ReadHeaderTimeout, which has a timer of its own on io_uring,
-	// is not.
+	// much on io_uring. The HTTP/1 header deadline, and the budget of a connection
+	// whose protocol is not decided yet, have a timer of their own on io_uring and
+	// are not; the HTTP/2 header-block bound of ReadHeaderTimeout is checked by the
+	// sweep and is late by up to a sweep period.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This
@@ -309,10 +311,9 @@ type Config struct {
 	// and on io_uring (a timer of the connection's own), measured on docker
 	// arm64 with 2 CPUs. With DisableDeferAccept the deferral is gone: a silent
 	// connection is closed at ReadHeaderTimeout from its connect, and a
-	// ReadHeaderTimeout of one second closed it at 1.00 to 1.03 s. The io_uring
-	// engine used to leave the check of a connection that had sent nothing, or
-	// not enough to tell HTTP/1 from HTTP/2, to its sweep (0.8 s apart when idle),
-	// and closed a silent connection 0.5 to 0.9 s late.
+	// ReadHeaderTimeout of one second closed it at 1.00 to 1.03 s. The HTTP/2
+	// header-block bound below is checked by the engine's sweep, not by a timer,
+	// and is late by up to a sweep period (see ReadTimeout).
 	//
 	// On HTTP/2 (epoll, io_uring, adaptive) it also bounds a header block: one
 	// that begins with a HEADERS frame without END_HEADERS and is not complete this

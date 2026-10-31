@@ -2797,6 +2797,15 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		// to be had the arm is skipped and the sweep is the fallback, as for a
 		// timer the ring dropped.
 		w.armHeaderTimerAt(cs, cs.detectDeadline)
+		// The arm closes the conn when the budget is spent already: detectDeadline
+		// comes from the batch's clock, which is older than ReadHeaderTimeout when an
+		// OnConnect hook, or a slow inline handler earlier in the batch, ran long. A
+		// closed conn is given nothing: a recv on it would name a descriptor number
+		// that is released, on a connState queued for release, and nothing would
+		// account for it (celeris#685, celeris#256). As handleRecv does after its arm.
+		if w.conns[newFD] != cs || cs.closing {
+			return
+		}
 	}
 	if !w.prepareRecv(cs, cs.buf) {
 		cs.needsRecv = true
