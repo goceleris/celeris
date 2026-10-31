@@ -228,6 +228,12 @@ func slowHeader(t *testing.T, start Start) {
 func silentConn(t *testing.T, start Start) {
 	cfg := Config()
 	cfg.ReadHeaderTimeout = time.Second
+	// Without the deferral the budget counts from the connect. With it the engine
+	// accepts the connection about a second after its SYN (TCP_DEFER_ACCEPT), and
+	// that second would make a deadline that fires at once, as a forward step makes
+	// a wall-clock one, indistinguishable from one on time: the lower bound below
+	// would not bite (celeris#1189: a forward step closed the connection at 1.05 s).
+	cfg.DisableDeferAccept = true
 	addr := start(t, cfg, handler{})
 	c := dial(t, addr)
 	expect(t, "silent conn (ReadHeaderTimeout 1 s)", c, time.Now(), 600*time.Millisecond, 7*time.Second)
