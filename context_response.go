@@ -25,6 +25,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/httprange"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
@@ -1773,7 +1774,7 @@ func (c *Context) Detach() (done func()) {
 		if !c.startTime.IsZero() {
 			elapsed = time.Since(c.startTime) // monotonic, as before
 		} else {
-			elapsed = time.Duration(time.Now().UnixNano() - c.startTimeNs)
+			elapsed = time.Duration(mono.Now() - c.startTimeNs)
 		}
 		c.detachSnap = &detachSnapshot{
 			status:  c.statusCode,

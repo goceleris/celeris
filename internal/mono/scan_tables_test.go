@@ -24,12 +24,7 @@ var stays = map[site]entry{
 // deletes its entries; the flip PR requires the table to be empty.
 var pending = map[site]entry{
 	// step 4: route internal/conn H1 and the root package (handler.go, context_response.go; context.go StartTime keeps time.Unix(0, ns) until the flip PR, which makes it mono.Time and deletes its entry)
-	{"context.go", "Context.StartTime", "time.Unix"}:                    {1, "step 4"},
-	{"context_response.go", "Context.Detach", ".UnixNano"}:              {1, "step 4"},
-	{"handler.go", "routerAdapter.HandleStream", ".UnixNano"}:           {1, "step 4"},
-	{"handler.go", "routerAdapter.recoverAndRelease", ".UnixNano"}:      {1, "step 4"},
-	{"internal/conn/h1.go", "H1State.ArmHeaderDeadline", ".UnixNano"}:   {1, "step 4"},
-	{"internal/conn/h1.go", "H1State.ArmHeaderDeadlineAt", ".UnixNano"}: {1, "step 4"},
+	{"context.go", "Context.StartTime", "time.Unix"}: {1, "step 4"},
 	// step 5: route the HTTP/2 stream code (internal/protocol/h2/stream)
 	{"internal/protocol/h2/stream/deadline.go", "Processor.armHeaderBlock", ".UnixNano"}:     {1, "step 5"},
 	{"internal/protocol/h2/stream/processor.go", "Processor.admitHeaders", ".UnixNano"}:      {1, "step 5"},
@@ -44,20 +39,16 @@ var pending = map[site]entry{
 // routing PR of its package (the skew canary fails them otherwise), and its entry
 // goes with it.
 var pendingFixtures = map[string]bool{
-	// step 4 (root package)
-	"detach_elapsed_889_test.go | TestDetachSnapshotElapsedFromStartTimeNs889": true,
-	// step 4
-	"internal/conn/h1_header_deadline_at_test.go | TestArmHeaderDeadlineAt":                  true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepAnswersABurstOfExpiriesInOneSweep889":     true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepExpiresARequestAnswers408AndResets889":    true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepExtendIdleAndGoAwayNoWait889":             true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepExtendIdleNeedsProgress889":               true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepFramesOnAResetStreamAreNotActivity889":    true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepHeaderBlockDeadlineEndsTheConn889":        true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepIdleClockIgnoresPings889":                 true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepResetsAStalledStreamWithInternalError889": true,
-	"internal/conn/h2_sweep_889_test.go | TestSweepTakesNoLockWhenNothingIsDue889":           true,
 	// step 5
+	"internal/conn/h2_sweep_889_test.go | TestSweepAnswersABurstOfExpiriesInOneSweep889":                              true,
+	"internal/conn/h2_sweep_889_test.go | TestSweepExpiresARequestAnswers408AndResets889":                             true,
+	"internal/conn/h2_sweep_889_test.go | TestSweepExtendIdleAndGoAwayNoWait889":                                      true,
+	"internal/conn/h2_sweep_889_test.go | TestSweepExtendIdleNeedsProgress889":                                        true,
+	"internal/conn/h2_sweep_889_test.go | TestSweepFramesOnAResetStreamAreNotActivity889":                             true,
+	"internal/conn/h2_sweep_889_test.go | TestSweepHeaderBlockDeadlineEndsTheConn889":                                 true,
+	"internal/conn/h2_sweep_889_test.go | TestSweepIdleClockIgnoresPings889":                                          true,
+	"internal/conn/h2_sweep_889_test.go | TestSweepResetsAStalledStreamWithInternalError889":                          true,
+	"internal/conn/h2_sweep_889_test.go | TestSweepTakesNoLockWhenNothingIsDue889":                                    true,
 	"internal/protocol/h2/stream/request_deadline_889_test.go | TestClientResetOfAnExpiredRequestForgetsIt889":        true,
 	"internal/protocol/h2/stream/request_deadline_889_test.go | TestEveryRequestOpenStreamCarriesADeadline889":        true,
 	"internal/protocol/h2/stream/request_deadline_889_test.go | TestExpireRequestAnswers408AndRemembersTheStream889":  true,
