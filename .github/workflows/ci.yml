@@ -209,8 +209,15 @@ jobs:
           for skew in 3600s -3600s; do
             echo "== conn and root, CELERIS_MONO_SKEW=$skew"
             CELERIS_MONO_SKEW=$skew go test -count=1 -timeout=120s -tags celeris_monoskew -run '^(TestArmHeaderDeadlineAt|TestHeaderDeadline_ClearArmCycle)$' ./internal/conn/
-            CELERIS_MONO_SKEW=$skew go test -count=1 -timeout=120s -tags celeris_monoskew -run '^(TestDetachSnapshotElapsedFromStartTimeNs889|TestStartTimeIsTheTrueWallTimeOfTheRequestsStamp1178)$' .
+            CELERIS_MONO_SKEW=$skew go test -count=1 -timeout=120s -tags celeris_monoskew -run '^(TestDetachSnapshotElapsedFromStartTimeNs889|TestStartTimeIsTheTrueWallTimeOfTheRequestsStamp1178|TestCollectorLatencyIgnoresAStepOfTheWallClock1178)$' .
           done
+          # The engines' stepped-clock test (celeris#1178), without -race, with the clock
+          # skewed by +1 h: it moves the wall reading of the clock by 75 s every 50 ms,
+          # and under the skew it is also the strongest check that the loops' own clock
+          # reads (cachedNow of a batch, the sweep's now) go through internal/mono. About
+          # 75 s per engine. -p 1: the bounds it asserts are timing, one engine at a time.
+          echo "== stepped-clock tests of both engines, CELERIS_MONO_SKEW=3600s"
+          CELERIS_MONO_SKEW=3600s go test -count=1 -p 1 -timeout=400s -tags celeris_monoskew -run '^TestEngineTimeoutsIgnoreAStepOfTheWallClock1178$' ./internal/engine/iouring/ ./internal/engine/epoll/
           # Step 5 (celeris#1178): the HTTP/2 deadlines and waits, whole packages: conn
           # (the H2 sweep against the stream stamps) and the stream code itself. With
           # steps 2 to 5 the whole stamp component is routed, and both pass skewed.
@@ -266,6 +273,12 @@ jobs:
           # or when a `shard:` matrix is not exactly the file's shards. Every root test NOT listed runs here.
           .github/scripts/root-shards.sh check
           skip=$(.github/scripts/root-shards.sh skip-regex)
+          # celeris#1178: the engines' stepped-clock test (80 s under -race, per engine)
+          # is not run here: with it this set and the iouring step beside it sat at 99 per
+          # cent of their timeouts. It runs under -race in the base-tier job (66 per cent
+          # of its timeout) and without -race, with the clock skewed by +1 h, in the canary
+          # step of the unit job.
+          skip="$skip|^TestEngineTimeoutsIgnoreAStepOfTheWallClock1178$"
           # -timeout=540s: the tests that stay here took 179.5 s on the runner with the
           # other packages running beside them (run 38348908017; 596.4 s for the whole
           # package before the shards, run 38344043158), so 540 s keeps a margin of 3x.
@@ -412,13 +425,16 @@ jobs:
       # instead of a result. 600 s is 44% over the 415.8 s here and 37% over the
       # 437.3 s there. If the package keeps growing, split its slow tests into
       # a step of their own rather than raise this again (celeris#890 item 66).
+      # celeris#1178: the stepped-clock test (80 s under -race) is skipped here by name; it runs
+      # under -race in the base-tier job and without it in the canary step. With it this
+      # step took 592.7 s of 600 s.
       - name: internal/engine/iouring — race tests at the runner's memlock (every skip accounted for)
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=600s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
+          CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout=600s -skip '^TestEngineTimeoutsIgnoreAStepOfTheWallClock1178$' -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
           allowed='TestListenClosesListenSocketsWhenEveryWorkerRingSetupFails|TestListenClosesListenSocketWhenOneWorkerRingSetupFails|TestListenClosesListenSocketRingAndEventfdWhenInitialSubmitFails|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895'
           required='TestListenWithCancelledContextPublishesTheBoundAddress|TestListenRefusesToStartWhenNoWorkerReportsItsAddress'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))

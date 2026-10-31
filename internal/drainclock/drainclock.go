@@ -44,9 +44,10 @@ func read() Reading {
 
 // Now is the clock every shutdown deadline is taken and read on: nanoseconds on
 // the monotonic clock. A stamp of it is never 0, so 0 can still mean "not
-// set". It is not comparable with a wall-clock reading (cachedNow, a conn's
-// lastActivity): the two are on different scales, and a comparison of them is
-// wrong by the size of the process's age.
+// set". It is not comparable with the engines' stamps (cachedNow, a conn's
+// lastActivity: internal/mono's clock, on the wall's scale) nor with a wall-clock
+// reading: they are on different scales, and a comparison of them is wrong by the
+// size of the process's age (celeris#1178).
 func Now() int64 { return read().Mono }
 
 // At is d on the Now scale, for a deadline taken from a context. A deadline of

@@ -36,8 +36,8 @@
 // first sweep, for the rest of the process's life): worse than today, where a
 // step only cuts the connections that were open during it. So:
 //
-//  1. The clock, its seam, the scan and the canary. [Now] reads the WALL clock,
-//     so nothing changes a value.
+//  1. The clock, its seam, the scan and the canary. [Now] first read the WALL
+//     clock, so nothing changed a value.
 //  2. Routing PRs (io_uring, epoll, conn and the root package, the HTTP/2 stream
 //     code, StartTime) sent every wall stamp through this package. They never
 //     changed a clock, so each was correct on its own.
@@ -62,6 +62,13 @@
 // refuses a test function that writes a wall reading into a stamp field or hands
 // one to a function that takes a stamp. A statement that mixes a drainclock or
 // deferlinger reading with one of this package fails too.
+//
+// The scan has no types, so it cannot see a wall read written as time.Since(x) of
+// a variable x that holds a time.Time without a monotonic reading (time.Unix,
+// time.Date, Round(0)); time.Since(time.Date(...)) written out is seen. The skew
+// canary is the backstop for that form: CI runs the engines' stepped-clock test
+// under it, which fails ten to fourteen times on a loop-thread clock read that is
+// not routed, and the canary subsets.
 //
 // # The skew canary (test builds only)
 //
@@ -90,11 +97,12 @@ import (
 	"time"
 )
 
-// flipped selects the clock. false: [Now] is the wall clock, as every stamp
-// of the engines is today (value-neutral). true: [Now] is monotonic on the
-// wall's scale. Only the flip PR changes it, and TestPendingIsEmptyWhenFlipped
-// holds it back until no wall stamp is left to move.
-const flipped = false
+// flipped selects the clock. true: [Now] is monotonic on the wall's scale (the
+// flip of celeris#1178, after every stamp of the engines, conn, the root package
+// and the HTTP/2 stream code was routed through this package; the scan test
+// holds that: a wall read it does not list fails it). false would put [Now] back
+// on the wall clock, value for value, which is what the routing steps ran on.
+const flipped = true
 
 // The lowest and highest value base can take: 2006 and 2116 in Unix
 // nanoseconds. A host without a hardware clock can start a process at 1970 +
@@ -154,7 +162,7 @@ func curAt(t time.Time) int64 {
 }
 
 // Now is the clock every stamp is taken and compared on: nanoseconds on the
-// wall's scale. Until the flip it IS the wall clock. A stamp of it is never 0
+// wall's scale: monotonic, a step of the wall clock does not move it. A stamp of it is never 0
 // or 1, so 0 can still mean "not set" and 1 "expired". It is not comparable
 // with a drainclock or deferlinger reading.
 func Now() int64 {
@@ -175,7 +183,7 @@ func nowMonotonic() int64 { return base + int64(time.Since(start)) }
 // on Now's scale, keeping the time left to it: Now() + (w - the wall's now).
 // The wall's now is the REAL wall, not a seam's, so a stepped seam moves Now
 // and not the caller's reading, as in production, where the two are one
-// clock. Until the flip it is w itself.
+// clock.
 //
 // The sentinels pass through: w <= 1 (0 is "unset", 1 "expired") comes back
 // as it is, and any other input comes back as at least 2, so that a deadline
@@ -201,8 +209,9 @@ func FromWall(w int64) int64 {
 // instant it was taken, with a monotonic reading, so that time.Since(Time(ns))
 // is the monotonic age of the stamp and ignores steps. It is one time.Now()
 // (the stamp's age on Now's scale is subtracted from it). Context.StartTime()
-// is this; until the flip the value is the stamp's wall time, as time.Unix(0,
-// ns) gives, and the monotonic reading is the only difference.
+// is this: the instant a request's stamp was taken, as time.Unix(0, ns) would
+// give it if the stamp were a wall time, but right however far the clock has
+// moved from the wall since the process started.
 func Time(ns int64) time.Time {
 	t := time.Now()
 	return t.Add(-time.Duration(curAt(t) - ns))
@@ -240,8 +249,9 @@ func fromTimeMonotonic(t time.Time) int64 { return base + int64(t.Sub(start)) }
 // function is called, which puts back what was set before, but only if this
 // call's f is still the one installed. Tests only; the seam is process-wide,
 // so a test that sets it runs no other engine meanwhile. The wall reading of
-// the seam is the clock until the flip; its Mono reading after, so a test that
-// steps Wall is red before the flip and green after.
+// the seam is not the clock (its Mono reading is): a test that steps Wall moves
+// nothing that reads this package, and a wall reading that is not routed through it
+// is what the scan and the skew canary find.
 func SetSeam(f func() Reading) (restore func()) {
 	var p *func() Reading
 	if f != nil {
