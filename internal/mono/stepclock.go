@@ -69,9 +69,9 @@ type Manual struct {
 // every CELERIS_MONO_SKEW, including -1 h, where an hour put on the monotonic reading
 // alone would cancel the skew and stand on the real wall.
 func NewManual() *Manual {
-	real := time.Now().UnixNano()
+	wall := time.Now().UnixNano()
 	m := &Manual{wall0: base - skew} // wall mode: Wall + skew = base + mono
-	m.mono.Store(real + int64(time.Hour) - base)
+	m.mono.Store(wall + int64(time.Hour) - base)
 	return m
 }
 
