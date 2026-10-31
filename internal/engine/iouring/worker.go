@@ -6545,48 +6545,89 @@ func (w *Worker) readClockAfterWait(gotCQE bool) {
 	}
 }
 
-// restampUnsubmittedSends starts the write clock again, at now, of every conn
-// whose SEND the kernel has not been given yet (celeris#1173). A SEND is staged
+// restampUnsubmittedSends gives back to a conn the time the ENGINE held its
+// bytes in this pass, before the kernel had them (celeris#1173). A SEND is staged
 // in the SQ ring by flushSend, flushSendLink or handleSend's remainder and
 // submitted at the top of the NEXT iteration, while the sweep runs later in the
 // SAME one; checkTimeouts counts a staged SEND as in flight and measures
-// WriteTimeout from the stamp flushSend took when it staged it. A worker that
-// stalls for longer than WriteTimeout in between (a handler of another conn
+// WriteTimeout from the stamp taken when it was staged, which is the clock the
+// pass read when it started (passClock, w.cachedNow). A worker that stalls
+// between that read and the sweep, now - passClock (a handler of another conn
 // running inline in the batch, a GC assist, -race, a CFS quota throttling a
-// container) would close a conn whose peer was never handed a byte: the time
-// the engine held the SEND is the engine's, not the peer's. The SQ ring holds
-// exactly the SQEs the kernel has not consumed, [head, tail), so the sweep reads
-// them: a SEND whose conn is still the one that placed it (generation) and still
-// has it in flight is restamped, and the peer's WriteTimeout starts here, no
-// later than the submit that follows. No per-send state and nothing on the send
-// path: the cost is one pass over the unconsumed SQEs per sweep (a few ns each,
-// the ones staged by the iteration that sweeps), and none when the ring is
-// empty, as it is after any wait that submitted. epoll has no such state: it
-// writes inline. A stall between the sweep and the next submit is not covered
-// (the peer's clock then runs from this stamp). Worker thread.
-func (w *Worker) restampUnsubmittedSends(now int64) {
-	r := w.ring
-	if r == nil || w.cfg.WriteTimeout <= 0 {
+// container), would close a conn whose peer was handed no byte for the whole of
+// it: the stall is the engine's, not the peer's.
+//
+// What is given back is that time and no more: the clocks move by now -
+// passClock, never to now. A fresh SEND was stamped with passClock, so it ends
+// at now, as if the stall had not happened; a partial send's remainder keeps
+// the rule of io_uring's WriteTimeout (it runs from the first SEND of the
+// response, a partial completion does not restart it) and is excused this
+// pass's stall only, so WriteTimeout of a large response does not depend on
+// whether a sweep lands in the pass of a partial completion. A conn that stays
+// in the engine's hands pass after pass (a SEND the kernel keeps refusing to
+// take, EAGAIN or EBUSY) gets back one pass's stall per sweep, which a sweep
+// interval outgrows.
+//
+// Whose bytes the kernel has not got:
+//   - a SEND among the SQEs it has not consumed, [head, tail) of the SQ ring,
+//     whose conn is still the one that placed it (generation) and still has it
+//     in flight: lastActivity, the clock of every conn but a detached one, and
+//     stallSince, that of a detached conn (WS/SSE; the sweep's tcp_info
+//     evidence of the peer taking bytes is not there for a fixed-file or a
+//     non-TCP descriptor, and the clock is then all there is);
+//   - a conn on the dirty list with bytes and no SEND: the SQ ring was full
+//     when they were staged.
+//
+// No per-send state and nothing on the send path: one pass over the unconsumed
+// SQEs per sweep (a few ns each, the ones this iteration staged; none after a
+// wait that submitted everything) and over the dirty list (empty in normal
+// load). epoll has no such state: it writes inline. Not covered: a conn that is
+// closing (its drain bound is 5 s or WriteTimeout, whichever is larger) and a
+// stall between this sweep and the next submit (no handler runs in it, and a
+// peer that is reading takes the SEND at that submit). Worker thread.
+func (w *Worker) restampUnsubmittedSends(passClock, now int64) {
+	hold := now - passClock
+	if hold <= 0 || w.cfg.WriteTimeout <= 0 {
 		return
 	}
-	head, tail := r.sqConsumed(), r.sqPlaced()
-	n := tail - head
-	if n == 0 || n > r.params.sqEntries {
-		return // empty, or a head read that moved under a kernel SQ thread: nothing sure to say
+	if r := w.ring; r != nil {
+		head, tail := r.sqConsumed(), r.sqPlaced()
+		n := tail - head
+		// n is at most sqEntries: the guard is defensive only (no tier uses
+		// SQPOLL, so nothing moves head but our own io_uring_enter).
+		if n != 0 && n <= r.params.sqEntries {
+			for i := head; i != tail; i++ {
+				ud := *(*uint64)(unsafe.Pointer(&r.sqes[uintptr(i&r.sqMask)*sqeSize+32]))
+				if ud&udMask != udSend {
+					continue
+				}
+				fd := int(ud & fdMask)
+				if fd >= len(w.conns) {
+					continue
+				}
+				cs := w.conns[fd]
+				if cs != nil && cs.generation == decodeGen(ud) && cs.sending && !cs.closing {
+					cs.excuseHold(passClock, hold)
+				}
+			}
+		}
 	}
-	for i := head; i != tail; i++ {
-		ud := *(*uint64)(unsafe.Pointer(&r.sqes[uintptr(i&r.sqMask)*sqeSize+32]))
-		if ud&udMask != udSend {
-			continue
+	for cs := w.dirtyHead; cs != nil; cs = cs.dirtyNext {
+		if cs.dirty && !cs.sending && !cs.zcNotifPending && !cs.closing && len(cs.writeBuf)+len(cs.sendBuf) > 0 {
+			cs.excuseHold(passClock, hold)
 		}
-		fd := int(ud & fdMask)
-		if fd >= len(w.conns) {
-			continue
-		}
-		cs := w.conns[fd]
-		if cs != nil && cs.generation == decodeGen(ud) && cs.sending && !cs.closing {
-			cs.lastActivity = now
-		}
+	}
+}
+
+// excuseHold moves cs's write clocks forward by hold, the time the engine held
+// its bytes in the pass whose clock was passClock. A clock stamped after
+// passClock (not by this pass's clock) is left alone. Worker thread.
+func (cs *connState) excuseHold(passClock, hold int64) {
+	if cs.lastActivity <= passClock {
+		cs.lastActivity += hold
+	}
+	if cs.stallSince != 0 && cs.stallSince <= passClock {
+		cs.stallSince += hold
 	}
 }
 
@@ -7875,6 +7916,9 @@ var testHookCheckTimeouts atomic.Pointer[func(*Worker)]
 // conns) regardless of FD space.
 func (w *Worker) checkTimeouts() {
 	now := mono.Now()
+	// The clock the pass read when it started: what flushSend stamped the
+	// pass's SENDs with (restampUnsubmittedSends). cachedNow is set to now below.
+	passClock := w.cachedNow
 	w.lastSweep = now
 	w.sweepTickFired = false
 	if h := testHookCheckTimeouts.Load(); h != nil {
@@ -7910,9 +7954,10 @@ func (w *Worker) checkTimeouts() {
 	if len(w.pendingRelease) > 0 {
 		w.drainPendingRelease()
 	}
-	// A SEND still in our own SQ ring is not the peer's to be charged for
-	// (celeris#1173): its write clock starts now.
-	w.restampUnsubmittedSends(now)
+	// Bytes the engine itself still holds (a SEND in our own SQ ring, a conn
+	// on the dirty list) are not the peer's to be charged for the time the pass
+	// stalled (celeris#1173).
+	w.restampUnsubmittedSends(passClock, now)
 	// Iterate in REVERSE by index: closeConn → finishClose → removeLiveConn
 	// swap-removes the FD with the last live entry and shrinks the slice. A
 	// forward `range` would then (a) skip the swapped-in conn (moved into an

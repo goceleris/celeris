@@ -17,14 +17,15 @@ import (
 
 // celeris#1173, the cause #1175 left open. A SEND the loop has staged is
 // submitted to the kernel at the top of the NEXT iteration, and the sweep runs
-// later in the SAME iteration. flushSend stamps the conn's write clock
-// (lastActivity) when it stages, and checkTimeouts counts a staged SEND as in
-// flight: a worker that stalls for longer than WriteTimeout between the two (a
-// GC assist or a handler of another conn running inline in the batch, -race, a
-// CFS quota throttling a CPU-limited container) closes a conn whose SEND the
-// kernel has not even been given, and the peer, who could not have read a byte,
-// is charged for the time the engine held it. Only io_uring has such a state:
-// epoll writes inline.
+// later in the SAME one. flushSend stamps the conn's write clock (lastActivity)
+// with the clock the iteration read when it started (w.cachedNow), and
+// checkTimeouts counts a staged SEND as in flight: a worker that stalls for
+// longer than WriteTimeout in the iteration that stages the response, between
+// that read and its timeout sweep (a handler of another conn running inline in
+// the batch, a GC assist, -race, a CFS quota throttling a CPU-limited
+// container), closes a conn whose SEND the kernel has not even been given, and
+// the peer, who could not have read a byte, is charged for the time the engine
+// held it. Only io_uring has such a state: epoll writes inline.
 //
 // The time here is mono.Manual: it moves when the test moves it, so the stall is
 // a number and no test depends on the speed of the runner. The ring is real, so
@@ -191,11 +192,14 @@ func TestStalledPeerIsStillCutByWriteTimeout1173(t *testing.T) {
 	}
 }
 
-// The same, end to end, on a real engine: the worker's clock jumps by a second
-// (a stall) after an HTTP/2 response is drained into a SEND and before that
-// iteration's sweep. The client reads normally, so the conn must survive; with
-// the bug the sweep closes it (after the response has gone out, the close being
-// deferred behind the SEND), which the PING that follows finds.
+// The same, end to end, on a real engine: the worker stalls for a second in the
+// iteration that stages an HTTP/2 response, before that iteration's sweep. The
+// stall is injected by the write-drain seam, which runs before the drain stages
+// the frames; flushSend then stamps the clock the iteration read before the
+// stall, and the sweep of the same iteration reads the clock after it. The
+// client reads normally, so the conn must survive; with the bug the sweep closes
+// it (after the response has gone out, the close being deferred behind the
+// SEND), which the PING that follows finds.
 func TestStalledWorkerDoesNotCutAConnWithAStagedSend1173(t *testing.T) {
 	clk := clock1173(t)
 	g := &gate1173{started: make(chan struct{}, 1), gate: make(chan struct{})}
@@ -207,10 +211,12 @@ func TestStalledWorkerDoesNotCutAConnWithAStagedSend1173(t *testing.T) {
 	seam := func(w *Worker, _ int) {
 		if armed.CompareAndSwap(true, false) {
 			stalls.Add(1)
-			// The stall, and a sweep that is due in this very iteration (the
-			// last one a whole ceiling ago: sweepDue is given the batch's clock,
-			// so it is the worker's own record that is moved); checkTimeouts
-			// then reads the clock after the stall.
+			// The stall (before the drain stages the response, so that
+			// flushSend stamps the clock read before it), and a sweep that is
+			// due in this very iteration (the last one a whole ceiling ago:
+			// sweepDue is given the batch's clock, so it is the worker's own
+			// record that is moved); checkTimeouts then reads the clock after
+			// the stall.
 			clk.Advance(stallDuration1173)
 			w.lastSweep = w.cachedNow - sweepCeiling
 		}
@@ -252,7 +258,7 @@ func TestStalledWorkerDoesNotCutAConnWithAStagedSend1173(t *testing.T) {
 	for !gotAck {
 		f, err := fr.ReadFrame()
 		if err != nil {
-			t.Fatalf("celeris#1173: the conn ended (%v) after a worker stall of %v with a SEND staged, the peer reading normally "+
+			t.Fatalf("celeris#1173: the conn ended (%v) after a worker stall of %v in the iteration that staged the response, the peer reading normally "+
 				"(response seen: %v, PING sent: %v)", err, stallDuration1173, gotResponse, pinged)
 		}
 		switch f := f.(type) {
