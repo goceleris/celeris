@@ -274,16 +274,19 @@ type Config struct {
 	// take, from a client that keeps sending frames, is not bounded by ReadTimeout.
 	//
 	// The native engines look at ReadTimeout, IdleTimeout and WriteTimeout in a
-	// sweep of their connections, so one is enforced up to a sweep period after
-	// its time: 25 ms on epoll when ReadHeaderTimeout is set (the default), and on
-	// io_uring about 0.8 s (0.83 s measured on an idle worker; about 1 s with
-	// ReadHeaderTimeout off). With ReadHeaderTimeout off epoll has no such timer and
-	// looks much more rarely (a 1 s IdleTimeout closed an idle connection at 3 to 6 s
-	// in measurement). A timeout of a few seconds or less is approximate by that
-	// much on io_uring. The HTTP/1 header deadline, and the budget of a connection
-	// whose protocol is not decided yet, have a timer of their own on io_uring and
-	// are not; the HTTP/2 header-block bound of ReadHeaderTimeout is checked by the
-	// sweep and is late by up to a sweep period.
+	// sweep of their connections, so ReadTimeout and IdleTimeout are enforced up to
+	// a sweep period after their time. On epoll the sweep runs every 25 ms, from a
+	// kernel timer each worker arms whatever ReadHeaderTimeout and the timeouts
+	// are, so within about 30 ms (a 1 s IdleTimeout closed an idle connection at
+	// 1.00 to 1.03 s on docker arm64 with 2 CPUs, with ReadHeaderTimeout off as well
+	// as set). On io_uring the sweep of an idle worker is about 0.8 s apart (0.83 s
+	// measured; about 1 s with ReadHeaderTimeout off), so a timeout of a few
+	// seconds or less is approximate by that much there. WriteTimeout is judged in
+	// windows that end at a sweep too: see WriteTimeout. The HTTP/1 header
+	// deadline, and the budget of a connection whose protocol is not decided yet,
+	// have a timer of their own on io_uring and are not late; the HTTP/2
+	// header-block bound of ReadHeaderTimeout is checked by the sweep and is late
+	// by up to a sweep period.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This
@@ -338,7 +341,7 @@ type Config struct {
 	// is bounded by the minimum rate described below); -1 sets no such bound. The close comes between about 3/4
 	// and 5/4 of WriteTimeout after the peer last took a byte (its progress
 	// is sampled every quarter of WriteTimeout; a SEND completion restarts the
-	// clock at once), plus the engine's sweep interval (up to about 0.1 s on
+	// clock at once), plus the engine's sweep interval (25 ms on
 	// epoll, up to 2 s on io_uring; a WriteTimeout shorter than that can
 	// double). An h2c stream is not covered yet (celeris#884).
 	// On the std engine net/http arms WriteTimeout as one deadline for the
@@ -380,10 +383,9 @@ type Config struct {
 	// WriteTimeout with that in mind. WriteTimeout -1 is no write timeout at
 	// any rate. What the client sends is not progress: a pipelined request or
 	// an HTTP/2 PING does not hold a parked response. The times above hold
-	// with ReadHeaderTimeout set (the default): the engine's 25 ms sweep timer
-	// is armed only then, and without it a stalled response can outlast them by
-	// seconds (measured: WriteTimeout 1s, ReadHeaderTimeout -1, closed at 5 s,
-	// on main too).
+	// with the epoll sweep at its 25 ms period, which every worker has whatever
+	// ReadHeaderTimeout and the other timeouts are; io_uring sweeps more coarsely,
+	// see ReadTimeout.
 	//
 	// While the rule has a baseline for a parked response (from the first sweep
 	// that finds it parked), it is the only bound on the connection:
@@ -544,6 +546,8 @@ type Config struct {
 	// failed getsockopt) the period is always extended. A frame for a stream the server reset moves the period only for a
 	// request that expired at ReadTimeout, for the 2 x ReadTimeout its late DATA may
 	// take. On epoll, for a response parked on the socket, see WriteTimeout.
+	//
+	// How closely IdleTimeout is enforced is described under ReadTimeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts

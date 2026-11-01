@@ -30,15 +30,19 @@ const sndbuf885x42 = 16 << 20
 // gives a few hundred KiB), so the loop reads it over several rounds: a turn is
 // driverReadBudget reads of driverReadBufSize (256 KiB), and every round after
 // the first is an epoll_wait(0) that collects nothing. The engine has
-// ReadHeaderTimeout -1, so no 25 ms timerfd can end the flood's counting between
-// two rounds. On the last read the count is 0 (round 1 had an event), and with
+// ReadHeaderTimeout -1 and its 25 ms timerfd disarmed, so that nothing can end
+// the flood's counting between two rounds. On the last read the count is 0 (round 1 had an event), and with
 // more than eleven turns the wait the loop would make next (adaptiveTimeoutMs)
 // is the base, 1 ms: the rounds a queue forced to zero are not idle rounds.
 func TestQueuedZeroTimeoutRoundsDoNotStretchTheIdleWait885(t *testing.T) {
 	eng, _ := startE2E885(t, false, newPathHandler885(1), func(c *resource.Config) { c.ReadHeaderTimeout = -1 })
 	l := eng.WorkerLoop(0).(*Loop)
-	if l.timerFD >= 0 {
-		t.Fatalf("apparatus: the loop has a sweep timerfd, which can fire between two rounds of the flood")
+	if l.timerFD < 0 {
+		t.Fatalf("apparatus: the loop has no sweep timerfd to disarm (every loop has one, celeris#1194)")
+	}
+	// The timerfd can fire between two rounds of the flood: disarm it.
+	if err := unix.TimerfdSettime(l.timerFD, 0, &unix.ItimerSpec{}, nil); err != nil {
+		t.Fatalf("apparatus: disarm the sweep timerfd: %v", err)
 	}
 	a, peer := socketpairNonblocking(t)
 	t.Cleanup(func() { _ = unix.Close(a); _ = unix.Close(peer) })

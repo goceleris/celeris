@@ -49,26 +49,28 @@ func pauseLag886(t *testing.T, e *Engine, port, want int, gaveup time.Duration) 
 
 // TestBeginPauseAcceptReachesAnIdleLoop886: a pause must close every loop's
 // listener within lagBound, whatever the loop is waiting for. The default arm
-// is the guard that the 25 ms timerfd keeps the lag short; the arm without a
-// header deadline has no timerfd and sits in epoll_wait for up to 500 ms, which
-// is the one the eventfd signal is for.
+// is the guard that the 25 ms timerfd keeps the lag short; the arm with the
+// timerfd disarmed (every loop has one since celeris#1194, whatever its
+// ReadHeaderTimeout) sits in epoll_wait for up to 500 ms, which is the one the
+// eventfd signal is for.
 func TestBeginPauseAcceptReachesAnIdleLoop886(t *testing.T) {
 	const (
 		cycles   = 8
 		lagBound = 100 * time.Millisecond
 	)
 	for _, tc := range []struct {
-		name  string
-		rht   time.Duration
-		conns int
+		name   string
+		rht    time.Duration
+		disarm bool
+		conns  int
 	}{
-		{"default-read-header-timeout/live-connections", 0, 16},
-		{"no-read-header-timeout/live-connections", -1, 16},
-		{"default-read-header-timeout/no-connections", 0, 0},
-		{"no-read-header-timeout/no-connections", -1, 0},
+		{"default-read-header-timeout/live-connections", 0, false, 16},
+		{"no-timerfd/live-connections", -1, true, 16},
+		{"default-read-header-timeout/no-connections", 0, false, 0},
+		{"no-timerfd/no-connections", -1, true, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := start886(t, 2, tc.rht)
+			r := start886(t, 2, tc.rht, tc.disarm)
 			r.e.mu.Lock()
 			want := len(r.e.loops)
 			r.e.mu.Unlock()
