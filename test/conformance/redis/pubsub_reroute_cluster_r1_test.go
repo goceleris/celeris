@@ -32,11 +32,11 @@ func r1Collect(ps *redis.PubSub) *r1Counter {
 	return c
 }
 
-// Two slots on one PubSub (documented undefined behaviour): the channel of the
-// first slot keeps delivering, as it did before the PubSub followed its slot.
-// The second channel is on another node (the SSUBSCRIBE is answered -MOVED) and
-// is not served. A reroute that replayed both channels in one SSUBSCRIBE would
-// get -CROSSSLOT from Redis and leave both dead.
+// Two slots on one PubSub, the second on another node than the first: the channel
+// of the first slot keeps delivering. The second channel is on another node (the
+// SSUBSCRIBE is answered -MOVED) and is not served by this PubSub. A reroute that
+// replayed both channels in one SSUBSCRIBE would get -CROSSSLOT from Redis and
+// leave both dead.
 func TestClusterSecondSlotOnOnePubSubKeepsTheFirstDelivering(t *testing.T) {
 	cc := newClusterClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

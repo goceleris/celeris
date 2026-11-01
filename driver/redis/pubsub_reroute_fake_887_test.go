@@ -156,6 +156,16 @@ func (cl *rpCluster) moveSlot(slot int, to *rpNode, staleReplies int) {
 	from.sunsubscribeSlot(slot)
 }
 
+// unbind leaves slot with no owner, as a DELSLOTS does with
+// cluster-require-full-coverage no: CLUSTER SLOTS does not list it and a node
+// answers a command on it -CLUSTERDOWN Hash slot not served.
+func (cl *rpCluster) unbind(slot int) {
+	cl.mu.Lock()
+	cl.cur[slot] = nil
+	cl.old[slot] = nil
+	cl.mu.Unlock()
+}
+
 // failover gives every slot of from to to, as a promoted replica does.
 func (cl *rpCluster) failover(from, to *rpNode, staleReplies int) {
 	cl.mu.Lock()
@@ -502,7 +512,10 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 		}
 		for _, ch := range cmd[1:] {
 			slot := int(Slot(ch))
-			if o := n.cl.owner(slot); o != n {
+			if o := n.cl.owner(slot); o == nil {
+				writeError(c.w, "CLUSTERDOWN Hash slot not served")
+				return nil
+			} else if o != n {
 				writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, o.addr))
 				return nil
 			}
@@ -544,7 +557,11 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 			_, held := c.ssubs[ch]
 			c.mu.Unlock()
 			if slot := int(Slot(ch)); !held && n.cl.owner(slot) != n {
-				writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, n.cl.owner(slot).addr))
+				if o := n.cl.owner(slot); o == nil {
+					writeError(c.w, "CLUSTERDOWN Hash slot not served")
+				} else {
+					writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, o.addr))
+				}
 				return nil
 			}
 		}

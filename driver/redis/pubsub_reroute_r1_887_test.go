@@ -164,7 +164,7 @@ func TestClusterForeignSUnsubscribeDoesNotRerouteAHealthySubscription887(t *test
 	poll(t, "m1", 5*time.Second, func() bool { return rc.count("m1") == 1 })
 }
 
-// F4. Two slots on one PubSub (documented undefined behaviour): the channel of
+// F4. Two slots on one PubSub, the second on another node: the channel of
 // the first slot keeps working, as on the base. The first head sent both in one
 // SSUBSCRIBE after a reroute, got -CROSSSLOT, and left both dead.
 func TestClusterSecondSlotOnOnePubSubDoesNotKillTheFirst887(t *testing.T) {

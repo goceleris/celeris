@@ -72,10 +72,11 @@ func TestClusterReplayGroupsShardChannelsBySlot1204(t *testing.T) {
 	poll(t, "a message of the second slot", 5*time.Second, func() bool { return rc.count("mb") == 1 })
 }
 
-// A new owner that serves only the first slot answers the other slot's
-// SSUBSCRIBE with -MOVED: that is not reported and does not disturb the served
-// slot (the F4 contract of #1154, kept by the grouped replay).
-func TestClusterReplayOfAnotherNodesSlotLeavesTheServedSlotUp1204(t *testing.T) {
+// The replay sends a slot other than the served one only to a node that owns
+// it, by the topology the reroute just read: a node that does not would answer
+// -MOVED (ignored), and one for a slot with no owner -CLUSTERDOWN, which is a
+// reroute trigger. The served slot stays up.
+func TestClusterReplayDoesNotSendAnotherNodesSlot1204(t *testing.T) {
 	cl := newRPCluster(t, 3)
 	cc := newRPClusterClient(t, cl)
 	slotA, slotB := int(Slot(slotsChA1)), int(Slot(slotsChB1))
@@ -98,15 +99,55 @@ func TestClusterReplayOfAnotherNodesSlotLeavesTheServedSlotUp1204(t *testing.T) 
 	}
 	cl.moveSlot(slotA, to, 0)
 	poll(t, "the served slot subscribed", 10*time.Second, func() bool { return to.subscribers("ssub") == 1 })
-	poll(t, "the other slot tried on the new owner too", 2*time.Second, func() bool { return len(to.ssubCommands()) >= 2 })
+	time.Sleep(300 * time.Millisecond)
+	if got := to.ssubCommands(); len(got) != 1 {
+		t.Errorf("the new owner received SSUBSCRIBE %q, want only the served slot's (the other slot is another node's)", got)
+	}
 	cl.spublish(slotsChA1, "ma")
 	poll(t, "a message of the served slot", 5*time.Second, func() bool { return rc.count("ma") == 1 })
-	// The -MOVED for the other slot did not start another reroute.
 	n := to.acceptedConns()
 	time.Sleep(700 * time.Millisecond)
 	if got := to.acceptedConns(); got != n {
-		t.Errorf("the PubSub dialled %d more conns after the -MOVED of a slot it does not serve", got-n)
+		t.Errorf("the PubSub dialled %d more conns", got-n)
 	}
+}
+
+// A slot the PubSub holds a channel of loses its owner (DELSLOTS with
+// cluster-require-full-coverage no): the node answers its SSUBSCRIBE
+// -CLUSTERDOWN Hash slot not served. A replay that sends it makes a reroute,
+// whose replay sends it again: the PubSub reroutes for ever (r5 of #1210, real
+// Redis 8.0.2: 9 attempts in 12 s, main stable). The topology names no owner, so
+// the replay leaves the slot out and the PubSub settles after one reroute.
+func TestClusterReplayOfAnUnboundSlotDoesNotRerouteForEver1204(t *testing.T) {
+	cl := newRPCluster(t, 1)
+	cc := newRPClusterClient(t, cl)
+	n := cl.nodes[0]
+	ps, err := cc.SSubscribe(rpCtx(t), slotsChA1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ps.Close() })
+	rc := collect(ps)
+	poll(t, "SSUBSCRIBE", 5*time.Second, func() bool { return n.subscribers("ssub") == 1 })
+	if err := ps.SSubscribe(rpCtx(t), slotsChB1); err != nil { // the same node owns it: accepted
+		t.Fatal(err)
+	}
+	cl.unbind(int(Slot(slotsChB1)))
+	ps.mu.Lock()
+	conn := ps.conn
+	ps.mu.Unlock()
+	_ = conn.closeWithErr(errors.New("test: conn killed"))
+	poll(t, "the served slot back after the kill", 10*time.Second, func() bool {
+		return n.acceptedConns() >= 2 && n.subscribers("ssub") == 1
+	})
+	time.Sleep(300 * time.Millisecond) // a reroute the unbound slot would start
+	c0 := n.acceptedConns()
+	time.Sleep(1200 * time.Millisecond)
+	if got := n.acceptedConns() - c0; got != 0 {
+		t.Errorf("the PubSub dialled %d more conns in 1.2 s after the replay: it reroutes for ever on the unbound slot", got)
+	}
+	cl.spublish(slotsChA1, "ma")
+	poll(t, "a message of the served slot", 5*time.Second, func() bool { return rc.count("ma") == 1 })
 }
 
 // One SSubscribe call whose channels span slots is refused the way a cluster
@@ -129,6 +170,20 @@ func TestClusterSSubscribeAcrossSlotsIsCrossSlot1204(t *testing.T) {
 		for _, n := range cl.nodes {
 			if c := n.subCmds.Load(); c != 0 {
 				t.Errorf("node %s received %d subscribe commands, want none", n.addr, c)
+			}
+		}
+		// Refused before a conn was dialled (the command conns of the client
+		// are not counted: only a pub/sub dial would be an extra accept).
+		base := make([]int, len(cl.nodes))
+		for i, n := range cl.nodes {
+			base[i] = n.acceptedConns()
+		}
+		if ps, err := cc.SSubscribe(rpCtx(t), slotsChA1, slotsChB1); err == nil || ps != nil {
+			t.Fatalf("second call: ps=%v err=%v", ps, err)
+		}
+		for i, n := range cl.nodes {
+			if got := n.acceptedConns() - base[i]; got != 0 {
+				t.Errorf("node %s accepted %d conns for a refused call, want none", n.addr, got)
 			}
 		}
 	})
