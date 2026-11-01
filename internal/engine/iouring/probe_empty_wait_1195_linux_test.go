@@ -3,8 +3,13 @@
 package iouring
 
 import (
+	"errors"
+	"runtime"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // waitCut1195 says how a cut wait of emptyWaits1195 ends.
@@ -246,4 +251,138 @@ func TestProbeWaitExpiryIsRetriedOnce1195(t *testing.T) {
 				"a missing notification is an answer and is not retried", got, why, *calls, *cuts, SendZCBroken)
 		}
 	}
+}
+
+// TestProbeWaitCQEIsBounded1195: probeWaitCQE re-enters while the CQ ring is
+// empty, and what it asks of each wait is bounded. A storm of waits that
+// return at once with nothing to read (a signal storm) ends when the budget
+// does, each wait is given a positive time that only shrinks (a zero or
+// negative timespec makes the kernel answer at once or EINVAL), an error ends
+// the call at the first wait, and a real wait on an empty ring takes the
+// budget and no more. Nothing here waits longer than 40 ms.
+func TestProbeWaitCQEIsBounded1195(t *testing.T) {
+	r, err := NewRing(8, 0, 0)
+	if err != nil {
+		skipOrFail656(t, "io_uring unavailable: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+	saved := probeRingWait
+	t.Cleanup(func() { probeRingWait = saved })
+
+	const budget = 30 * time.Millisecond
+	var asked []time.Duration
+	probeRingWait = func(_ *Ring, d time.Duration) error { asked = append(asked, d); return nil }
+	start := time.Now()
+	h, tl, empty, err := probeWaitCQE(r, budget)
+	took := time.Since(start)
+	if err != nil || h != tl {
+		t.Fatalf("a storm of empty waits on an empty ring: head %d tail %d err %v, want an empty ring and no error", h, tl, err)
+	}
+	if took < budget || took > time.Second {
+		t.Errorf("a storm of empty waits ended after %v, want the %v budget and not much more", took, budget)
+	}
+	if empty != len(asked) || empty < 2 {
+		t.Errorf("%d empty returns for %d waits, want one per wait and more than one: the call must re-enter", empty, len(asked))
+	}
+	for i, d := range asked {
+		if d <= 0 || d > budget || (i > 0 && d > asked[i-1]) {
+			t.Errorf("wait %d was given %v of a %v budget (the one before: %v), want a positive time that only shrinks", i, d, budget, asked[max(i-1, 0)])
+			break
+		}
+	}
+
+	boom := errors.New("ring failed")
+	calls := 0
+	probeRingWait = func(*Ring, time.Duration) error { calls++; return boom }
+	if _, _, _, err := probeWaitCQE(r, budget); !errors.Is(err, boom) || calls != 1 {
+		t.Errorf("a wait that failed: err %v after %d wait(s), want the error after 1", err, calls)
+	}
+
+	// The real wait on an empty ring: its timeout is the budget.
+	probeRingWait = saved
+	start = time.Now()
+	h, tl, empty, err = probeWaitCQE(r, 40*time.Millisecond)
+	took = time.Since(start)
+	if err != nil || h != tl || empty < 1 || took < 40*time.Millisecond || took > time.Second {
+		t.Errorf("a real wait on an empty ring: head %d tail %d, %d empty, err %v after %v, want an empty ring after about 40 ms", h, tl, empty, err, took)
+	}
+}
+
+// TestProbeWaitCQESurvivesSignals1195: the same wait on the real kernel, with
+// Go's preemption signal (SIGURG, a no-op for a goroutine in a syscall)
+// sent to the waiting thread every 5 ms while a 150 ms timer is pending. The
+// timer was submitted before the wait, so no enter has anything to submit
+// and the kernel reports each signal's EINTR (SubmitAndWaitTimeout turns it
+// into nil): the wait comes back empty again and again, and probeWaitCQE must
+// still deliver the timer's CQE. Both a plain ring and a DEFER_TASKRUN one,
+// whose CQE only a GETEVENTS enter posts.
+func TestProbeWaitCQESurvivesSignals1195(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	pid, tid := unix.Getpid(), unix.Gettid()
+	rings := 0
+	for _, fl := range []struct {
+		name  string
+		flags uint32
+	}{
+		{"plain", 0},
+		{"defer_taskrun", setupDeferTaskrun | setupSingleIssuer},
+	} {
+		r, err := NewRing(8, fl.flags, 0)
+		if err != nil {
+			t.Logf("celeris1195 flags=%s: ring unavailable: %v", fl.name, err)
+			continue
+		}
+		rings++
+		spec := kernelTimespec{Nsec: int64(150 * time.Millisecond)}
+		prepTimer1195(r.GetSQE(), &spec)
+		if _, err := r.Submit(); err != nil {
+			_ = r.Close()
+			t.Fatalf("flags=%s: submit: %v", fl.name, err)
+		}
+		stop, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			for tk := time.NewTicker(5 * time.Millisecond); ; {
+				select {
+				case <-stop:
+					tk.Stop()
+					return
+				case <-tk.C:
+					_ = unix.Tgkill(pid, tid, unix.SIGURG)
+				}
+			}
+		}()
+		h, tl, empty, err := probeWaitCQE(r, 2*time.Second)
+		close(stop)
+		<-done
+		runtime.KeepAlive(&spec)
+		if err != nil || h == tl {
+			_ = r.Close()
+			t.Fatalf("flags=%s: head %d tail %d err %v after %d empty return(s), want the timer's CQE", fl.name, h, tl, err, empty)
+		}
+		res := r.cqeAt(h).Res
+		r.EndCQ(h + 1)
+		_ = r.Close()
+		t.Logf("celeris1195 flags=%s empty_returns=%d res=%d", fl.name, empty, res)
+		if res != -int32(unix.ETIME) {
+			t.Errorf("flags=%s: the timer completed with res=%d, want -ETIME", fl.name, res)
+		}
+		if empty == 0 {
+			t.Errorf("flags=%s: no signal ended the wait early: the test is not exercising an empty return", fl.name)
+		}
+	}
+	if rings == 0 {
+		skipOrFail656(t, "no ring could be set up with either flag set")
+	}
+}
+
+// prepTimer1195 is prepTimeout with count 0 and flags 0 (a relative timer that
+// ends only at its deadline) written out here: prepTimeout's three callers all
+// pass 0 and 0, and a fourth makes unparam report the parameter it was given.
+func prepTimer1195(sqePtr unsafe.Pointer, ts *kernelTimespec) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opTIMEOUT
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(unsafe.Pointer(ts)))
+	*(*uint32)(unsafe.Pointer(&sqe[24])) = 1 // len: must be 1
 }

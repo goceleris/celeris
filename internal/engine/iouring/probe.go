@@ -139,6 +139,73 @@ var (
 	probeNotifWaitBudget = 2 * time.Second
 )
 
+// probeWaitCQE waits on r until its CQ ring has a completion, or until budget
+// has gone by, and returns the CQ ring's head and tail (equal when budget ran
+// out with nothing to read) and how many waits came back with the ring empty.
+// An error from the wait other than the two SubmitAndWaitTimeout turns into
+// nil (ETIME, EINTR) is returned at once.
+//
+// One wait is not the answer. SubmitAndWaitTimeout returns nil when a signal
+// ends the wait (EINTR; io_uring_enter reports it only when the call submitted
+// nothing, so a call that also submitted returns the submit count) and when its
+// timeout expires, and a wait with min_complete 1 can also be woken by a timer
+// before the completion it stands for is posted (cq_timeouts; celeris#1183).
+// Each of those leaves the CQ ring empty and says nothing about the kernel, and
+// the probes' results are cached for the process: read as final, an empty ring
+// switched SEND_ZC, fixed files or multishot accept off until the process
+// ended (celeris#1195). So the wait is entered again, with the time that is
+// left, each time it comes back with nothing to read. Each re-entry is a new
+// io_uring_enter with GETEVENTS, which is what posts a completion that a
+// DEFER_TASKRUN ring holds back; a look at the CQ ring alone would not.
+//
+// The budget is wall time, not a count of waits, and it bounds the call: every
+// wait is given only what is left of it, so a probe takes budget and a
+// scheduling delay at most, as one wait did. Startup only: the run loop has its
+// own (Worker.run).
+func probeWaitCQE(r *Ring, budget time.Duration) (head, tail uint32, empty int, err error) {
+	deadline := time.Now().Add(budget)
+	for left := budget; ; {
+		if err = probeRingWait(r, left); err != nil {
+			return 0, 0, empty, err
+		}
+		if head, tail = r.BeginCQ(); head != tail {
+			return head, tail, empty, nil
+		}
+		empty++
+		// left stays positive: a zero or negative timespec would make the
+		// next wait return at once (or EINVAL), and the loop spin on it.
+		if left = time.Until(deadline); left <= 0 {
+			return head, tail, empty, nil
+		}
+	}
+}
+
+// probeRetryNoAnswer runs a probe, and runs it once more, with new rings and
+// sockets, when the first run says it got no answer: the wait for its first
+// completion used up its whole budget with nothing in the CQ ring (see
+// probeWaitCQE). The result of a probe is cached for the process, and a
+// completion that is normally there at submit and was not there for 500 ms is
+// more likely a stalled process than a kernel that never posts it, so the
+// second look costs one budget, once, and only when that happened. A second
+// run with no answer is the answer: a kernel that posts nothing costs two
+// budgets at startup, and the negative is kept. The wait for SEND_ZC's
+// notification is not retried: the send completed with F_MORE and the
+// notification did not come, which is how an ENA NIC answers (SendZCBroken),
+// and a retry would add its 2 s to every startup on such a host.
+func probeRetryNoAnswer[R any](once func() (R, string, bool)) (R, string) {
+	res, why, noAnswer := once()
+	if noAnswer {
+		res, why, _ = once()
+	}
+	return res, why
+}
+
+// sendZCAnswered is parseSendZCResult's result as probeSendZCOnce returns it:
+// an answer, not a missing one.
+func sendZCAnswered(res SendZCProbeResult, why string) (SendZCProbeResult, string, bool) {
+	return res, why, false
+}
+
 // SEND_ZC ioprio flags and notification result values.
 const (
 	sendZCReportUsage         = 1 << 3  // IORING_SEND_ZC_REPORT_USAGE: request ZC usage info in notification
@@ -192,40 +259,44 @@ func (r SendZCProbeResult) String() string {
 // no DMA). On a real NIC with working zero-copy support, the result is
 // SendZCTrueZeroCopy. On ENA (AWS), the result is SendZCBroken because
 // the notification CQE never arrives.
-func probeSendZC() (SendZCProbeResult, string) {
+func probeSendZC() (SendZCProbeResult, string) { return probeRetryNoAnswer(probeSendZCOnce) }
+
+// probeSendZCOnce is one run of probeSendZC. noAnswer is true when the wait for its first
+// completion used up the whole budget with nothing in the CQ ring, and only then.
+func probeSendZCOnce() (SendZCProbeResult, string, bool) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return SendZCUnsupported, "net.Listen failed: " + err.Error()
+		return SendZCUnsupported, "net.Listen failed: " + err.Error(), false
 	}
 	defer func() { _ = ln.Close() }()
 
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		return SendZCUnsupported, "net.Dial failed: " + err.Error()
+		return SendZCUnsupported, "net.Dial failed: " + err.Error(), false
 	}
 	defer func() { _ = conn.Close() }()
 
 	accepted, err := ln.Accept()
 	if err != nil {
-		return SendZCUnsupported, "ln.Accept failed: " + err.Error()
+		return SendZCUnsupported, "ln.Accept failed: " + err.Error(), false
 	}
 	defer func() { _ = accepted.Close() }()
 
 	rawConn, err := conn.(*net.TCPConn).SyscallConn()
 	if err != nil {
-		return SendZCUnsupported, "SyscallConn failed: " + err.Error()
+		return SendZCUnsupported, "SyscallConn failed: " + err.Error(), false
 	}
 
 	var fd int
 	if err := rawConn.Control(func(f uintptr) { fd = int(f) }); err != nil {
-		return SendZCUnsupported, "SyscallConn.Control failed: " + err.Error()
+		return SendZCUnsupported, "SyscallConn.Control failed: " + err.Error(), false
 	}
 	if fd <= 0 {
-		return SendZCUnsupported, fmt.Sprintf("invalid socket fd from Control: %d", fd)
+		return SendZCUnsupported, fmt.Sprintf("invalid socket fd from Control: %d", fd), false
 	}
 	ring, err := NewRing(4, 0, 0)
 	if err != nil {
-		return SendZCUnsupported, "NewRing failed: " + err.Error()
+		return SendZCUnsupported, "NewRing failed: " + err.Error(), false
 	}
 	defer func() { _ = ring.Close() }()
 
@@ -234,7 +305,7 @@ func probeSendZC() (SendZCProbeResult, string) {
 	payload := []byte("probe-send-zc-test-payload")
 	sqe := ring.GetSQE()
 	if sqe == nil {
-		return SendZCUnsupported, "GetSQE returned nil"
+		return SendZCUnsupported, "GetSQE returned nil", false
 	}
 	prepSendZC(sqe, fd, payload, false)
 	// Set IORING_SEND_ZC_REPORT_USAGE in ioprio field (offset 2).
@@ -243,13 +314,12 @@ func probeSendZC() (SendZCProbeResult, string) {
 	setSQEUserData(sqe, 42)
 
 	// Submit and wait for the first CQE.
-	if err := probeRingWait(ring, probeFirstWaitBudget); err != nil {
-		return SendZCUnsupported, "SubmitAndWaitTimeout (initial) failed: " + err.Error()
+	cqHead, cqTail, empty, err := probeWaitCQE(ring, probeFirstWaitBudget)
+	if err != nil {
+		return SendZCUnsupported, "SubmitAndWaitTimeout (initial) failed: " + err.Error(), false
 	}
-
-	cqHead, cqTail := ring.BeginCQ()
 	if cqHead == cqTail {
-		return SendZCUnsupported, "no initial CQE produced after submit"
+		return SendZCUnsupported, fmt.Sprintf("no initial CQE produced after submit (waited %v, %d empty return(s))", probeFirstWaitBudget, empty), true
 	}
 	entry := ring.cqeAt(cqHead)
 	initialRes := entry.Res
@@ -257,17 +327,16 @@ func probeSendZC() (SendZCProbeResult, string) {
 	ring.EndCQ(cqHead + 1)
 
 	if initialRes < 0 || initialFlags&0x02 == 0 {
-		return parseSendZCResult(initialRes, initialFlags, false, nil, 0, 0)
+		return sendZCAnswered(parseSendZCResult(initialRes, initialFlags, false, nil, 0, 0))
 	}
 
 	// Wait for the notification CQE.
-	if err := probeRingWait(ring, probeNotifWaitBudget); err != nil {
-		return parseSendZCResult(initialRes, initialFlags, false, err, 0, 0)
+	cqHead, cqTail, _, err = probeWaitCQE(ring, probeNotifWaitBudget)
+	if err != nil {
+		return sendZCAnswered(parseSendZCResult(initialRes, initialFlags, false, err, 0, 0))
 	}
-
-	cqHead, cqTail = ring.BeginCQ()
 	if cqHead == cqTail {
-		return parseSendZCResult(initialRes, initialFlags, false, nil, 0, 0)
+		return sendZCAnswered(parseSendZCResult(initialRes, initialFlags, false, nil, 0, 0))
 	}
 
 	entry = ring.cqeAt(cqHead)
@@ -280,7 +349,7 @@ func probeSendZC() (SendZCProbeResult, string) {
 	_ = accepted.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	_, _ = accepted.Read(buf)
 
-	return parseSendZCResult(initialRes, initialFlags, true, nil, notifRes, notifFlags)
+	return sendZCAnswered(parseSendZCResult(initialRes, initialFlags, true, nil, notifRes, notifFlags))
 }
 
 // parseSendZCResult evaluates the CQE outcomes from the SEND_ZC probe.
@@ -351,57 +420,61 @@ func resolveSendZCPolicy(functional bool, envVal string) (enabled, recognized bo
 // temporary listen socket. If the kernel returns EINVAL (-22), we know
 // fixed files are non-functional on this host and surface it as a probe
 // miss so the engine takes the plain-fd path from the start.
-func probeFixedFiles() (bool, string) {
+func probeFixedFiles() (bool, string) { return probeRetryNoAnswer(probeFixedFilesOnce) }
+
+// probeFixedFilesOnce is one run of probeFixedFiles. noAnswer is true when the wait for its first
+// completion used up the whole budget with nothing in the CQ ring, and only then.
+func probeFixedFilesOnce() (bool, string, bool) {
 	ring, err := NewRing(8, 0, 0)
 	if err != nil {
-		return false, "NewRing failed: " + err.Error()
+		return false, "NewRing failed: " + err.Error(), false
 	}
 	defer func() { _ = ring.Close() }()
 
 	if err := ring.RegisterFiles(16); err != nil {
-		return false, "RegisterFiles failed: " + err.Error()
+		return false, "RegisterFiles failed: " + err.Error(), false
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return false, "net.Listen failed: " + err.Error()
+		return false, "net.Listen failed: " + err.Error(), false
 	}
 	defer func() { _ = ln.Close() }()
 
 	rc, err := ln.(*net.TCPListener).SyscallConn()
 	if err != nil {
-		return false, "SyscallConn failed: " + err.Error()
+		return false, "SyscallConn failed: " + err.Error(), false
 	}
 	var listenFD int
 	_ = rc.Control(func(fd uintptr) { listenFD = int(fd) })
 	if listenFD <= 0 {
-		return false, fmt.Sprintf("listen FD=%d <= 0", listenFD)
+		return false, fmt.Sprintf("listen FD=%d <= 0", listenFD), false
 	}
 
 	sqe := ring.GetSQE()
 	if sqe == nil {
-		return false, "GetSQE returned nil"
+		return false, "GetSQE returned nil", false
 	}
 	prepMultishotAcceptDirect(sqe, listenFD)
 	setSQEUserData(sqe, 0xF17EDF11E) // distinct tag for this probe
 	if _, err := ring.Submit(); err != nil {
-		return false, "Submit failed: " + err.Error()
+		return false, "Submit failed: " + err.Error(), false
 	}
 
 	// Trigger one accept so the kernel produces a CQE for the multishot SQE.
 	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
 	conn, err := dialer.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		return false, "probe dial failed: " + err.Error()
+		return false, "probe dial failed: " + err.Error(), false
 	}
 	defer func() { _ = conn.Close() }()
 
-	if err := probeRingWait(ring, probeFirstWaitBudget); err != nil {
-		return false, "SubmitAndWaitTimeout failed: " + err.Error()
+	head, tail, empty, err := probeWaitCQE(ring, probeFirstWaitBudget)
+	if err != nil {
+		return false, "SubmitAndWaitTimeout failed: " + err.Error(), false
 	}
-	head, tail := ring.BeginCQ()
 	if head == tail {
-		return false, "no CQE produced after multishot accept-direct + dial"
+		return false, fmt.Sprintf("no CQE produced after multishot accept-direct + dial (waited %v, %d empty return(s))", probeFirstWaitBudget, empty), true
 	}
 	cqe := ring.cqeAt(head)
 	res := cqe.Res
@@ -413,9 +486,9 @@ func probeFixedFiles() (bool, string) {
 	// io_accept_prep rejects by design. That is fixed (celeris#541), so a
 	// rejection here is now genuinely the kernel's.
 	if res < 0 {
-		return false, fmt.Sprintf("ACCEPT_DIRECT rejected by kernel: cqe.res=%d (likely -EINVAL=-22)", res)
+		return false, fmt.Sprintf("ACCEPT_DIRECT rejected by kernel: cqe.res=%d (likely -EINVAL=-22)", res), false
 	}
-	return true, ""
+	return true, "", false
 }
 
 // probeProvidedBuffers tests whether IORING_REGISTER_PBUF_RING works on this
@@ -461,52 +534,56 @@ func probeProvidedBuffers() (bool, string) {
 // once, and check that (a) Res ≥ 0 and (b) CQE_F_MORE is set. If F_MORE is
 // missing on the first CQE the multishot path is broken — fall back to
 // single-shot accept which the worker re-arms explicitly on every CQE.
-func probeMultishotAccept() (bool, string) {
+func probeMultishotAccept() (bool, string) { return probeRetryNoAnswer(probeMultishotAcceptOnce) }
+
+// probeMultishotAcceptOnce is one run of probeMultishotAccept. noAnswer is true when the wait for its first
+// completion used up the whole budget with nothing in the CQ ring, and only then.
+func probeMultishotAcceptOnce() (bool, string, bool) {
 	ring, err := NewRing(8, 0, 0)
 	if err != nil {
-		return false, "NewRing failed: " + err.Error()
+		return false, "NewRing failed: " + err.Error(), false
 	}
 	defer func() { _ = ring.Close() }()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return false, "net.Listen failed: " + err.Error()
+		return false, "net.Listen failed: " + err.Error(), false
 	}
 	defer func() { _ = ln.Close() }()
 
 	rc, err := ln.(*net.TCPListener).SyscallConn()
 	if err != nil {
-		return false, "SyscallConn failed: " + err.Error()
+		return false, "SyscallConn failed: " + err.Error(), false
 	}
 	var listenFD int
 	_ = rc.Control(func(fd uintptr) { listenFD = int(fd) })
 	if listenFD <= 0 {
-		return false, fmt.Sprintf("listen FD=%d <= 0", listenFD)
+		return false, fmt.Sprintf("listen FD=%d <= 0", listenFD), false
 	}
 
 	sqe := ring.GetSQE()
 	if sqe == nil {
-		return false, "GetSQE returned nil"
+		return false, "GetSQE returned nil", false
 	}
 	prepMultishotAccept(sqe, listenFD)
 	setSQEUserData(sqe, 0xACCE9701B0)
 	if _, subErr := ring.Submit(); subErr != nil {
-		return false, "Submit failed: " + subErr.Error()
+		return false, "Submit failed: " + subErr.Error(), false
 	}
 
 	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
 	conn, err := dialer.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		return false, "probe dial failed: " + err.Error()
+		return false, "probe dial failed: " + err.Error(), false
 	}
 	defer func() { _ = conn.Close() }()
 
-	if waitErr := probeRingWait(ring, probeFirstWaitBudget); waitErr != nil {
-		return false, "SubmitAndWaitTimeout failed: " + waitErr.Error()
+	head, tail, empty, waitErr := probeWaitCQE(ring, probeFirstWaitBudget)
+	if waitErr != nil {
+		return false, "SubmitAndWaitTimeout failed: " + waitErr.Error(), false
 	}
-	head, tail := ring.BeginCQ()
 	if head == tail {
-		return false, "no CQE produced after multishot accept + dial"
+		return false, fmt.Sprintf("no CQE produced after multishot accept + dial (waited %v, %d empty return(s))", probeFirstWaitBudget, empty), true
 	}
 	cqe := ring.cqeAt(head)
 	res := cqe.Res
@@ -514,16 +591,16 @@ func probeMultishotAccept() (bool, string) {
 	ring.EndCQ(head + 1)
 
 	if res < 0 {
-		return false, fmt.Sprintf("multishot accept rejected by kernel: cqe.res=%d", res)
+		return false, fmt.Sprintf("multishot accept rejected by kernel: cqe.res=%d", res), false
 	}
 	// Close the accepted FD so it doesn't leak — we have its fd in res.
 	if res > 0 {
 		_ = unix.Close(int(res))
 	}
 	if flags&cqeFMore == 0 {
-		return false, "first multishot accept CQE missing CQE_F_MORE (kernel won't re-arm)"
+		return false, "first multishot accept CQE missing CQE_F_MORE (kernel won't re-arm)", false
 	}
-	return true, ""
+	return true, "", false
 }
 
 // The async-cancel-flags probe's own user_data values: the op it tries to
