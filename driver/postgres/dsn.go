@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +47,11 @@ type Options struct {
 	// time with ErrSSLNotSupported.
 	SSLMode string
 }
+
+// testHookDefaultConnectTimeout, when set, replaces the default connect timeout
+// (10 s) that applies when the DSN has no connect_timeout. A test sets it to avoid
+// waiting 10 s, and resets it to nil when it is done.
+var testHookDefaultConnectTimeout atomic.Pointer[time.Duration]
 
 // DSN is the parsed form of a PostgreSQL connection string.
 type DSN struct {
