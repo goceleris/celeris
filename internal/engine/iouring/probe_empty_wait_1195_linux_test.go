@@ -108,10 +108,21 @@ func TestProbesSurviveAnEmptyWait1195(t *testing.T) {
 		// waits is how many waits a clean run makes at least.
 		waits int
 	}
+	// Every row can fail: the three that could not were dropped (celeris#1200,
+	// fixed_files skip[1], multishot_accept skip[1], send_zc skip[2]). A
+	// skipped wait leaves the CQ ring as it is. Fixed files and multishot accept
+	// submit their SQE before the dial, so their completion is already in the
+	// ring when a skipped first wait returns; SEND_ZC's notification is posted
+	// inline, so it is too when the second wait is skipped. SEND_ZC's first
+	// wait is what submits its SQE, and skipping it does leave the ring empty.
+	// Checked by mutation: with probeWaitCQE returning after one wait, hide[2]
+	// and hide[1,2,3] of SEND_ZC and hide[1,2,3] of the two accepts fail; with
+	// that and no second run of a probe whose first wait found nothing (main
+	// before #1198), all eight rows do.
 	all := func(second bool) []cut {
-		cuts := []cut{{cutHide, []int{1}}, {cutHide, []int{1, 2, 3}}, {cutSkip, []int{1}}}
+		cuts := []cut{{cutHide, []int{1}}, {cutHide, []int{1, 2, 3}}}
 		if second {
-			cuts = append(cuts, cut{cutHide, []int{2}}, cut{cutSkip, []int{2}})
+			cuts = append(cuts, cut{cutHide, []int{2}}, cut{cutSkip, []int{1}})
 		}
 		return cuts
 	}
@@ -184,7 +195,7 @@ func boolName1195(b bool) string {
 // more with a new ring before a negative is kept. Once, not more: a kernel that
 // really posts nothing costs two budgets, once. SEND_ZC's notification wait is
 // the exception: the send completed with F_MORE and the notification did not
-// come in 2 s, which is what an ENA NIC does (SendZCBroken), an answer; a retry
+// come in 2 s, which is what the AWS 6.17 kernel does (SendZCBroken), an answer; a retry
 // there would cost every startup on such a host 2 s more. The budgets are
 // shortened to 20 ms; the cut waits take their whole budget (cutExpire).
 func TestProbeWaitExpiryIsRetriedOnce1195(t *testing.T) {

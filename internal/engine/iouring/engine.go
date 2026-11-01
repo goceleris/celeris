@@ -207,6 +207,10 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 			profile.MultishotAccept = false
 		}
 	}
+	// A probe that could not run (out of descriptors or memory, a failed wait)
+	// left its feature off for this engine without saying anything about the
+	// kernel, and is not cached: say so once (celeris#1200).
+	logProbesNotRun(cfg.Logger)
 
 	// Every cancel the engine submits sets IORING_ASYNC_CANCEL flags, which
 	// exist from Linux 5.19: the close paths' (cancelConnOps), the accept
