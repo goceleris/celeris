@@ -437,15 +437,21 @@ func (ps *PubSub) slotGroups(channels []string) [][]string {
 	return groups
 }
 
-// shardReplayGroupsLocked returns the arguments of the SSUBSCRIBE commands a
-// replay sends. On a slot-routed PubSub a cluster refuses a command whose keys
-// span slots, so there is one command per slot, the channels of each sorted,
-// the served slot first (the subscription the route follows is the first thing
-// the new node learns) and the others by slot. A node that does not own a
-// slot answers its command -MOVED, which is ignored for a slot the PubSub does
-// not serve (see onControlError). Any other PubSub sends one command. The caller
-// holds mu.
-func (ps *PubSub) shardReplayGroupsLocked() [][]string {
+// shardGroup is the channels of one slot a replay may subscribe. served marks
+// the slot the PubSub serves.
+type shardGroup struct {
+	slot   uint16
+	served bool
+	chans  []string
+}
+
+// shardReplayGroupsLocked returns the shard channels of a replay, grouped for
+// the SSUBSCRIBE commands. On a slot-routed PubSub a cluster refuses a command
+// whose keys span slots, so there is one group per slot, the channels of each
+// sorted, the served slot first (the subscription the route follows is the first
+// thing the new node learns) and the others by slot. Any other PubSub has one
+// group. The caller holds mu.
+func (ps *PubSub) shardReplayGroupsLocked() []shardGroup {
 	if len(ps.shardSubs) == 0 {
 		return nil
 	}
@@ -454,7 +460,7 @@ func (ps *PubSub) shardReplayGroupsLocked() [][]string {
 		for ch := range ps.shardSubs {
 			all = append(all, ch)
 		}
-		return [][]string{all}
+		return []shardGroup{{chans: all}}
 	}
 	served, _ := ps.servedSlotLocked()
 	bySlot := make(map[uint16][]string)
@@ -475,13 +481,32 @@ func (ps *PubSub) shardReplayGroupsLocked() [][]string {
 		}
 		return cmp.Compare(a, b)
 	})
-	groups := make([][]string, 0, len(slots))
+	groups := make([]shardGroup, 0, len(slots))
 	for _, sl := range slots {
 		g := bySlot[sl]
 		slices.Sort(g)
-		groups = append(groups, g)
+		groups = append(groups, shardGroup{slot: sl, served: sl == served, chans: g})
 	}
 	return groups
+}
+
+// ownedGroups returns the SSUBSCRIBE arguments of groups for a replay on
+// client. On a slot-routed PubSub the served slot is always sent; a slot the
+// PubSub does not serve is sent only if client owns it by the route's topology.
+// A node that does not answers -MOVED, which is ignored for a slot not served
+// (see onControlError), and a slot with no owner draws -CLUSTERDOWN, which is a
+// reroute trigger: sending it would make the replay of every reroute start the
+// next one, for ever (r5 of #1210). It is called with no lock held: the route
+// takes the cluster's.
+func (ps *PubSub) ownedGroups(groups []shardGroup, client *Client) [][]string {
+	out := make([][]string, 0, len(groups))
+	for _, g := range groups {
+		if ps.slotted() && !g.served && !ps.route.owns(client, g.slot) {
+			continue
+		}
+		out = append(out, g.chans)
+	}
+	return out
 }
 
 // control applies update to the tracked sets under mu, then sends verb with
@@ -844,8 +869,9 @@ func (ps *PubSub) reconnectLoop() {
 		for p := range ps.psubs {
 			psubs = append(psubs, p)
 		}
-		ssubGroups := ps.shardReplayGroupsLocked()
+		shardGroups := ps.shardReplayGroupsLocked()
 		ps.mu.Unlock()
+		ssubGroups := ps.ownedGroups(shardGroups, client)
 		ok := true
 		// One command per kind; SSUBSCRIBE one per slot group on a cluster.
 		cmds := make([][]string, 0, 2+len(ssubGroups))
@@ -1003,9 +1029,11 @@ func (ps *PubSub) onShardUnsubscribed(from *pubsubRouter, ch string) {
 	if ps.conn == nil || ps.conn.state.router != from {
 		return
 	}
-	// Only the slot the PubSub serves: a channel of another slot that the same
-	// node happened to accept is dropped from the replay anyway, and its slot
-	// moving away is no reason to rebuild the subscription that is served.
+	// Only the slot the PubSub serves: its move does not reroute (the PubSub is
+	// on one node and follows one slot), and a rebuild for a slot it does not
+	// serve would only disturb the subscription that is served. A channel of
+	// another slot is replayed whenever the node a reroute lands on owns the slot
+	// (see ownedGroups), so it is back at the next reroute of any kind.
 	if served, ok := ps.servedSlotLocked(); ok && Slot(ch) == served {
 		if _, still := ps.shardSubs[ch]; still {
 			ps.trigger(true)

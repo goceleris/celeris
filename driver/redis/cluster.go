@@ -1020,11 +1020,12 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 // be added by separate [PubSub.SSubscribe] calls and are subscribed where the
 // node the PubSub is on owns their slot. If another node owns it, the
 // SSUBSCRIBE is answered -MOVED, which is not reported, and the channel is not
-// subscribed. A reroute of any kind replays the channels of every slot, one
-// SSUBSCRIBE per slot (the served slot first), so a channel of another slot is
-// subscribed again if the new node owns its slot and is not, silently, if it
-// does not. The move of a slot other than the served one does not reroute the
-// PubSub. If the first channel is removed while a channel of another node's
+// subscribed. A reroute of any kind replays the channels of the served slot and
+// of every other slot the new node owns by the topology the reroute has just
+// read, one SSUBSCRIBE per slot (the served slot first): a channel of another
+// slot is subscribed again if the new node owns its slot, and is left out, with
+// no error, if another node or nobody owns it. The move of a slot other than the
+// served one does not reroute the PubSub. If the first channel is removed while a channel of another node's
 // slot remains, that channel is not subscribed until the next reroute of any
 // kind, whose replay serves the re-selected slot. See [ClusterClient.Subscribe]
 // for what the caller sees while it is down and when the ClusterClient is
