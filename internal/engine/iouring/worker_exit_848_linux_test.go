@@ -202,6 +202,24 @@ func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && e.abnormalWorkerExits.Load() == 0; time.Sleep(5 * time.Millisecond) {
 	}
 	time.Sleep(200 * time.Millisecond)
+	// The worker died inside a batch, with its stamp set (celeris#1170): a stamp that
+	// is left behind ages for ever, and every waiting pool handler of the engine would
+	// be cut as "loop-blocked" from then on. The exit clears it.
+	// (Its own slot: a live worker caught in a batch at this instant is not the one.)
+	e.mu.Lock()
+	var dead *Worker
+	for _, x := range e.workers {
+		if int64(x.id) == boomID848.Load() {
+			dead = x
+		}
+	}
+	e.mu.Unlock()
+	if dead == nil {
+		t.Fatalf("PREMISE: no worker with id %d", boomID848.Load())
+	}
+	if dead.loopSlot.Stamped() {
+		t.Error("the worker that ended without returning left its LoopWatch stamp set: it reads as stuck for ever")
+	}
 	// Only one worker died: a conn on another worker is still served.
 	var otherAnswered, others int
 	for k, c := range conns {
