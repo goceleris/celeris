@@ -31,10 +31,12 @@ type SentinelConfig struct {
 
 	PoolSize         int
 	MaxIdlePerWorker int
-	DialTimeout      time.Duration
-	ReadTimeout      time.Duration
-	WriteTimeout     time.Duration
-	Engine           ServerProvider
+	// DialTimeout bounds each new connection's TCP connect and, separately,
+	// its handshake; default 5s. See [Config].DialTimeout.
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	Engine       ServerProvider
 }
 
 // sentinelDownGrace is how long watchFailover lets the PubSub of the sentinel
