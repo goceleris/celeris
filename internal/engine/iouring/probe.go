@@ -121,6 +121,24 @@ func probeAsyncCancelFlagsCached() (asyncCancelProbe, string) {
 // goroutine; the process-wide answer it sets is the caller's to restore.
 var runAsyncCancelProbe = probeAsyncCancelFlags
 
+// probeRingWait is the wait of the SEND_ZC, fixed-files and multishot-accept
+// probes: it submits what is pending and waits up to d for a completion. A
+// variable so a test can answer it the way a wait a signal cut short does, with
+// nil and no completion (celeris#1195). Replaced only from a test goroutine
+// that no other probe can run against, as asyncCancelProbeWait is.
+var probeRingWait = func(r *Ring, d time.Duration) error { return r.SubmitAndWaitTimeout(d) }
+
+// How long the probes wait for their completion: probeFirstWaitBudget for the
+// first one (the SEND_ZC send's, the multishot accepts'), which is normally
+// there when the wait starts, and probeNotifWaitBudget for SEND_ZC's
+// notification. Variables so a test can shorten them (celeris#1195). They carry
+// probeRingWait's constraint: only from a test goroutine that no other probe can
+// run against.
+var (
+	probeFirstWaitBudget = 500 * time.Millisecond
+	probeNotifWaitBudget = 2 * time.Second
+)
+
 // SEND_ZC ioprio flags and notification result values.
 const (
 	sendZCReportUsage         = 1 << 3  // IORING_SEND_ZC_REPORT_USAGE: request ZC usage info in notification
@@ -225,7 +243,7 @@ func probeSendZC() (SendZCProbeResult, string) {
 	setSQEUserData(sqe, 42)
 
 	// Submit and wait for the first CQE.
-	if err := ring.SubmitAndWaitTimeout(500 * time.Millisecond); err != nil {
+	if err := probeRingWait(ring, probeFirstWaitBudget); err != nil {
 		return SendZCUnsupported, "SubmitAndWaitTimeout (initial) failed: " + err.Error()
 	}
 
@@ -243,7 +261,7 @@ func probeSendZC() (SendZCProbeResult, string) {
 	}
 
 	// Wait for the notification CQE.
-	if err := ring.SubmitAndWaitTimeout(2 * time.Second); err != nil {
+	if err := probeRingWait(ring, probeNotifWaitBudget); err != nil {
 		return parseSendZCResult(initialRes, initialFlags, false, err, 0, 0)
 	}
 
@@ -378,7 +396,7 @@ func probeFixedFiles() (bool, string) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	if err := ring.SubmitAndWaitTimeout(500 * time.Millisecond); err != nil {
+	if err := probeRingWait(ring, probeFirstWaitBudget); err != nil {
 		return false, "SubmitAndWaitTimeout failed: " + err.Error()
 	}
 	head, tail := ring.BeginCQ()
@@ -483,7 +501,7 @@ func probeMultishotAccept() (bool, string) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	if waitErr := ring.SubmitAndWaitTimeout(500 * time.Millisecond); waitErr != nil {
+	if waitErr := probeRingWait(ring, probeFirstWaitBudget); waitErr != nil {
 		return false, "SubmitAndWaitTimeout failed: " + waitErr.Error()
 	}
 	head, tail := ring.BeginCQ()
