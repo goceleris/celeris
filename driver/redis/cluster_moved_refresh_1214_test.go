@@ -5,12 +5,17 @@ package redis
 // pipeline batch. When a hot slot moves, every in-flight command on it gets its
 // own -MOVED and sends its own CLUSTER SLOTS to the same probe node, and each
 // applyTopology takes the table lock to rebuild 16384 slots. The fix reads the
-// table with refreshTopologySince, with the mark taken when the reason to look
-// (the MOVED reply, the network error) was received.
+// table with refreshTopologySince, with a mark taken by event (eventMarkLocked):
+// the commands that got the same -MOVED (same slot, same target), or lost the same
+// primary, share one read that started after the first of their replies. (A plain
+// topoMark taken at each reply shares nothing here: every command registers its
+// read right after taking its mark, so the next mark is already past it.)
 
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -416,5 +421,211 @@ func TestPipelineOfTwoMovesNeedsAReadAfterBoth1214(t *testing.T) {
 				t.Errorf("the first command: %v", err)
 			}
 		})
+	}
+}
+
+// goroutinesIn counts the goroutines whose stack mentions fn.
+func goroutinesIn(fn string) int {
+	buf := make([]byte, 1<<22)
+	buf = buf[:runtime.Stack(buf, true)]
+	n := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, fn) {
+			n++
+		}
+	}
+	return n
+}
+
+// keyOwnedBy returns a key (tagged by prefix) whose slot is owned by one of the
+// nodes of want and is not in used.
+func keyOwnedBy(t *testing.T, cl *rpCluster, prefix string, want func(*rpNode) bool, used ...int) string {
+	t.Helper()
+	for i := 0; i < 10000; i++ {
+		k := fmt.Sprintf("{%s%d}k", prefix, i)
+		s := int(Slot(k))
+		ok := want(cl.owner(s))
+		for _, u := range used {
+			ok = ok && u != s
+		}
+		if ok {
+			return k
+		}
+	}
+	t.Fatal("no key found")
+	return ""
+}
+
+// The exact version of the herd test: the first read is HELD after its table is
+// taken, until every one of the 200 commands has its -MOVED and waits for a read.
+// They all share that one read: exactly one CLUSTER SLOTS, whatever the speed of
+// the machine. (Main: one per command.)
+func TestMovedHerdSharesTheReadInFlightExactly1214(t *testing.T) {
+	const n = 200
+	const key = "{exact}k"
+	cl, cc, from, _ := herdSlotMove(t, key, 0)
+	waitHeld, release := holdNextSlotsRead(t)
+	before := cl.slotsReplies.Load()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res := make(chan error, 1)
+	go func() {
+		res <- runHerd(n, func() error {
+			v, err := cc.Get(ctx, key)
+			if err == nil && v != "v" {
+				err = fmt.Errorf("GET = %q", v)
+			}
+			return err
+		})
+	}()
+	waitHeld()
+	// Every command has its -MOVED and is waiting for the read (the leader's
+	// goroutine and the n-1 that joined it all sit in refreshTopologySince).
+	poll(t, "every command waiting for the read", 5*time.Second, func() bool {
+		return from.getMoved.Load() >= n && goroutinesIn("(*ClusterClient).refreshTopologySince") >= n
+	})
+	release()
+	if err := <-res; err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.slotsReplies.Load() - before; got != 1 {
+		t.Errorf("%d CLUSTER SLOTS for %d commands that all waited for one read, want exactly 1", got, n)
+	}
+}
+
+// An event stays resolved: a slot that went to B (the command's read ended), came
+// back to A seen only by a background refresh, and goes to B again. The command
+// that gets the new -MOVED while another read, started before that move, is in
+// flight must not wait for it (its table is from before the move): it reads again.
+// (A variant that looks only at the latest read re-opens the old event while any
+// newer read runs and waits for it.)
+func TestMovedEventStaysResolvedWhenALaterReadIsRunning1214(t *testing.T) {
+	const key = "{sticky}k"
+	cl := newRPCluster(t, 3)
+	cc := newRPClusterClient(t, cl)
+	slot := int(Slot(key))
+	a := cl.owner(slot)
+	b := otherNode(cl, a)
+	ctx := rpCtx(t)
+	cl.moveSlot(slot, b, 0)
+	if v, err := cc.Get(ctx, key); err != nil || v != "v" { // event (slot, b), resolved by its read
+		t.Fatalf("first GET = %q, %v", v, err)
+	}
+	cl.moveSlot(slot, a, 0)
+	if err := cc.refreshTopology(ctx); err != nil { // a background refresh learns it; no -MOVED seen
+		t.Fatal(err)
+	}
+	waitHeld, release := holdNextSlotsRead(t)
+	r := make(chan error, 1)
+	go func() { r <- cc.refreshTopology(rpCtx(t)) }() // a read in flight, its table has the slot on a
+	waitHeld()
+	cl.moveSlot(slot, b, 0)
+	before := cl.slotsReplies.Load()
+	gctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if v, err := cc.Get(gctx, key); err != nil || v != "v" {
+		t.Fatalf("GET after the second move = %q, %v: it waited for a read that started before its move", v, err)
+	}
+	if got := cl.slotsReplies.Load() - before; got != 1 {
+		t.Errorf("%d CLUSTER SLOTS for the command, want one of its own", got)
+	}
+	release()
+	if err := <-r; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Events are per slot: two different slots that move to the SAME node are two
+// events. The second command must not take the read held for the first (its table
+// is from before the second slot moved). (A variant that keys the event on the
+// target alone shares it.)
+func TestTwoSlotsMovedToTheSameNodeDoNotShareARead1214(t *testing.T) {
+	cl := newRPCluster(t, 3)
+	cc := newRPClusterClient(t, cl)
+	b := cl.nodes[0]
+	notB := func(n *rpNode) bool { return n != b }
+	k1 := keyOwnedBy(t, cl, "twoa", notB)
+	k2 := keyOwnedBy(t, cl, "twob", notB, int(Slot(k1)))
+	cl.moveSlot(int(Slot(k1)), b, 0)
+
+	waitHeld, release := holdNextSlotsRead(t)
+	first := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := cc.Get(ctx, k1) // -MOVED of slot 1 to b: its read is held
+		first <- err
+	}()
+	waitHeld()
+	cl.moveSlot(int(Slot(k2)), b, 0) // after that read took its table; same target
+	before := cl.slotsReplies.Load()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if v, err := cc.Get(ctx, k2); err != nil || v != "v" {
+		t.Fatalf("GET on the second slot = %q, %v: it waited for the read held for the first slot", v, err)
+	}
+	if got := cl.slotsReplies.Load() - before; got != 1 {
+		t.Errorf("%d CLUSTER SLOTS for the second slot, want one of its own", got)
+	}
+	release()
+	if err := <-first; err != nil {
+		t.Errorf("the first command: %v", err)
+	}
+}
+
+// A lost primary is its own event: a command that loses a primary while a read
+// held for a -MOVED is in flight must not take that read (its table is from before
+// the primary died).
+func TestLostPrimaryDoesNotTakeAReadHeldForAMoved1214(t *testing.T) {
+	cl := newRPCluster(t, 3)
+	cc := newRPClusterClient(t, cl)
+	k1 := keyOwnedBy(t, cl, "lostmv", func(*rpNode) bool { return true })
+	s1 := int(Slot(k1))
+	o1 := cl.owner(s1)
+	b := otherNode(cl, o1)
+	x := otherNode(cl, o1, b) // the node that will die
+	k2 := keyOwnedBy(t, cl, "lostx", func(n *rpNode) bool { return n == x }, s1)
+	cl.moveSlot(s1, b, 0)
+	// The held read must not ask the node that is about to die.
+	cc.mu.RLock()
+	cc.nodes[x.addr].failing.Store(true)
+	cc.mu.RUnlock()
+
+	waitHeld, release := holdNextSlotsRead(t)
+	first := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := cc.Get(ctx, k1)
+		first <- err
+	}()
+	waitHeld()
+	x.kill()
+	cl.failover(x, o1, 0)
+	before := cl.slotsReplies.Load()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if v, err := cc.Get(ctx, k2); err != nil || v != "v" {
+		t.Fatalf("GET on the lost primary's slot = %q, %v: it waited for the read held for a -MOVED", v, err)
+	}
+	if got := cl.slotsReplies.Load() - before; got != 1 {
+		t.Errorf("%d CLUSTER SLOTS for the lost primary, want one of its own", got)
+	}
+	release()
+	if err := <-first; err != nil {
+		t.Errorf("the first command: %v", err)
+	}
+}
+
+// A pipeline in which nothing fails pays nothing for the MOVED scan: the scan
+// must not allocate (an error pointer declared before the nil check escapes to the
+// heap and costs one allocation per command of every pipeline).
+func TestRefreshForMovedAllocatesNothingWhenNothingFailed1214(t *testing.T) {
+	cl := newRPCluster(t, 1)
+	cc := newRPClusterClient(t, cl)
+	cp := cc.Pipeline()
+	errs := make([]error, 100)
+	if got := testing.AllocsPerRun(100, func() { cp.refreshForMoved(context.Background(), errs) }); got != 0 {
+		t.Errorf("refreshForMoved allocated %v times for 100 commands that did not fail, want 0", got)
 	}
 }
