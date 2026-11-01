@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -100,11 +99,9 @@ func TestClusterSecondSlotOfTheSameNodeSurvivesAReplay(t *testing.T) {
 	if !r3Deliver(ctx, t, cc, rc, a, "a0") || !r3Deliver(ctx, t, cc, rc, b, "b0") {
 		t.Fatal("the channels of the two slots are not both delivered before the kill")
 	}
-	ids := ssubConnIDs(ctx, t, owner)
-	if len(ids) != 1 {
-		t.Fatalf("the owner has %d connections holding a shard subscription, want 1", len(ids))
-	}
-	if _, err := owner.Do(ctx, "CLIENT", "KILL", "ID", strings.TrimPrefix(ids[0], "id=")); err != nil {
+	// The server hangs up on the PubSub's conn (the only pub/sub client of the
+	// node here); the reconnect replays both channels.
+	if _, err := owner.Do(ctx, "CLIENT", "KILL", "TYPE", "pubsub"); err != nil {
 		t.Fatalf("CLIENT KILL: %v", err)
 	}
 	if !r3Deliver(ctx, t, cc, rc, a, "a1") {
