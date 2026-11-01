@@ -10,10 +10,12 @@ package redis
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,9 +23,18 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 )
 
-// startSilentNode accepts TCP conns and never reads or answers them.
+// startSilentNode accepts TCP conns and never answers them.
 func startSilentNode(t *testing.T) string {
 	t.Helper()
+	addr, _ := startSilentNodeCounting(t)
+	return addr
+}
+
+// startSilentNodeCounting is startSilentNode that also counts the conns the
+// client has closed (the server read their end of stream).
+func startSilentNodeCounting(t *testing.T) (string, *atomic.Int32) {
+	t.Helper()
+	closed := new(atomic.Int32)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -47,9 +58,13 @@ func startSilentNode(t *testing.T) string {
 			mu.Lock()
 			conns = append(conns, c)
 			mu.Unlock()
+			go func() {
+				_, _ = io.Copy(io.Discard, c) // reads the HELLO, never answers
+				closed.Add(1)
+			}()
 		}
 	}()
-	return ln.Addr().String()
+	return ln.Addr().String(), closed
 }
 
 // within runs call with a context that has no deadline (the case that hung for
@@ -78,6 +93,22 @@ func within(t *testing.T, limit time.Duration, what string, call func(ctx contex
 		cancel()
 		t.Fatalf("%s still blocked after %v: the handshake is not bounded by DialTimeout", what, limit)
 		return nil
+	}
+}
+
+// wantTimeout fails the test unless err is the driver's handshake bound: an
+// error that matches context.DeadlineExceeded and names the handshake, once
+// (the loop paths' context error is not repeated).
+func wantTimeout(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want one matching context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "handshake timed out") {
+		t.Fatalf("err = %v, want it to say the handshake timed out", err)
+	}
+	if strings.Count(err.Error(), "context deadline exceeded") > 1 {
+		t.Fatalf("err = %q repeats the context error", err)
 	}
 }
 
@@ -125,9 +156,7 @@ func TestDialHandshakeIsBoundedByDialTimeout1205(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			err := within(t, 2*time.Second, tc.name+" dial", tc.dial)
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("err = %v, want one matching context.DeadlineExceeded (the handshake timed out)", err)
-			}
+			wantTimeout(t, err)
 		})
 	}
 }
@@ -165,20 +194,20 @@ func TestClientSubscribeAndDoBoundTheHandshake1205(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 	t.Run("Subscribe", func(t *testing.T) {
 		t.Parallel()
-		_ = within(t, 2*time.Second, "Client.Subscribe", func(ctx context.Context) error {
+		wantTimeout(t, within(t, 2*time.Second, "Client.Subscribe", func(ctx context.Context) error {
 			ps, err := c.Subscribe(ctx, "ch")
 			if ps != nil {
 				_ = ps.Close()
 			}
 			return err
-		})
+		}))
 	})
 	t.Run("Do", func(t *testing.T) {
 		t.Parallel()
-		_ = within(t, 2*time.Second, "Client.Do", func(ctx context.Context) error {
+		wantTimeout(t, within(t, 2*time.Second, "Client.Do", func(ctx context.Context) error {
 			_, err := c.Do(ctx, "PING")
 			return err
-		})
+		}))
 	})
 }
 
@@ -198,22 +227,109 @@ func TestClusterSubscribeBoundsTheHandshake1205(t *testing.T) {
 
 	t.Run("Subscribe", func(t *testing.T) {
 		t.Parallel()
-		_ = within(t, 2*time.Second, "ClusterClient.Subscribe", func(ctx context.Context) error {
+		wantTimeout(t, within(t, 2*time.Second, "ClusterClient.Subscribe", func(ctx context.Context) error {
 			ps, err := cc.Subscribe(ctx, "ch")
 			if ps != nil {
 				_ = ps.Close()
 			}
 			return err
-		})
+		}))
 	})
 	t.Run("SSubscribe", func(t *testing.T) {
 		t.Parallel()
-		_ = within(t, 2*time.Second, "ClusterClient.SSubscribe", func(ctx context.Context) error {
+		wantTimeout(t, within(t, 2*time.Second, "ClusterClient.SSubscribe", func(ctx context.Context) error {
 			ps, err := cc.SSubscribe(ctx, "ch")
 			if ps != nil {
 				_ = ps.Close()
 			}
 			return err
-		})
+		}))
 	})
+}
+
+// A client whose DialTimeout is unset gets the default (5 s) as the handshake
+// bound. The test lowers the default through the test hook, so it does not wait
+// 5 s, and checks that the bound is the default's, not none.
+func TestHandshakeIsBoundedByTheDefaultDialTimeout1205(t *testing.T) {
+	addr := startSilentNode(t)
+	d := 300 * time.Millisecond
+	testHookDefaultHandshakeTimeout.Store(&d)
+	t.Cleanup(func() { testHookDefaultHandshakeTimeout.Store(nil) })
+
+	c, err := NewClient(addr) // no WithDialTimeout
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	start := time.Now()
+	err = within(t, 2*time.Second, "Client.Subscribe with the default DialTimeout", func(ctx context.Context) error {
+		ps, err := c.Subscribe(ctx, "ch")
+		if ps != nil {
+			_ = ps.Close()
+		}
+		return err
+	})
+	wantTimeout(t, err)
+	if !strings.Contains(err.Error(), "after "+d.String()) {
+		t.Fatalf("err = %v, want the bound to be the default (%v)", err, d)
+	}
+	if el := time.Since(start); el < d {
+		t.Fatalf("returned after %v, before the %v bound", el, d)
+	}
+}
+
+// A caller that cancels its context during the handshake gets its own
+// cancellation back at once, not relabelled as the driver's bound, and the
+// half-open conn is closed (the node sees the end of stream). The direct path
+// does not watch a context's cancellation (only its deadline), so it is not in
+// the cases.
+func TestHandshakeKeepsTheCallersCancellation1205(t *testing.T) {
+	prov, err := eventloop.Resolve(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { eventloop.Release(prov) })
+	portable := netConnProvider(t)
+
+	cases := []struct {
+		name string
+		dial func(ctx context.Context, cfg Config) error
+	}{
+		{"eventloop", func(ctx context.Context, cfg Config) error {
+			c, err := dialRedisConn(ctx, prov, cfg, -1)
+			if c != nil {
+				_ = c.Close()
+			}
+			return err
+		}},
+		{"netconn", func(ctx context.Context, cfg Config) error {
+			var p engine.EventLoopProvider = portable
+			c, err := dialRedisConnNetConn(ctx, p, cfg, -1)
+			if c != nil {
+				_ = c.Close()
+			}
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			addr, closed := startSilentNodeCounting(t)
+			cfg := Config{Addr: addr, DialTimeout: 30 * time.Second}
+			ctx, cancel := context.WithCancel(context.Background())
+			time.AfterFunc(200*time.Millisecond, cancel)
+			start := time.Now()
+			err := tc.dial(ctx, cfg)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want context.Canceled", err)
+			}
+			if strings.Contains(err.Error(), "handshake timed out") {
+				t.Fatalf("err = %v: the caller's cancellation is reported as the driver's bound", err)
+			}
+			if el := time.Since(start); el > time.Second {
+				t.Fatalf("returned after %v, want about the cancel at 200ms", el)
+			}
+			poll(t, "the node to see the conn closed", 2*time.Second, func() bool { return closed.Load() == 1 })
+		})
+	}
 }

@@ -776,6 +776,12 @@ func (c *redisConn) releaseHandshakeReq(req *redisRequest) {
 	c.releaseResult(req)
 }
 
+// testHookDefaultHandshakeTimeout, when non-nil, replaces defaultDialTimeout as
+// the handshake bound of a conn whose Config.DialTimeout is unset. It is nil in
+// production; a test sets it to see that the default is applied without waiting
+// 5 s, and resets it to nil when it is done.
+var testHookDefaultHandshakeTimeout atomic.Pointer[time.Duration]
+
 // handshake runs HELLO (with optional fallback to AUTH+SELECT) to negotiate
 // protocol version and authentication. The whole exchange is bounded by
 // Config.DialTimeout (default 5 s), on top of whatever deadline ctx carries: the
@@ -789,6 +795,9 @@ func (c *redisConn) handshake(ctx context.Context) error {
 	timeout := c.cfg.DialTimeout
 	if timeout <= 0 {
 		timeout = defaultDialTimeout
+		if h := testHookDefaultHandshakeTimeout.Load(); h != nil {
+			timeout = *h
+		}
 	}
 	// Is the caller's own deadline the earlier one? Then it ends the handshake
 	// and is reported as the caller's.
@@ -804,6 +813,9 @@ func (c *redisConn) handshake(ctx context.Context) error {
 		// before hctx's timer), the others the context's.
 		var rerr *RedisError
 		if (hctx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded)) && !errors.As(err, &rerr) {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("celeris-redis: handshake timed out after %v: %w", timeout, err)
+			}
 			return fmt.Errorf("celeris-redis: handshake timed out after %v: %w: %w", timeout, context.DeadlineExceeded, err)
 		}
 	}
