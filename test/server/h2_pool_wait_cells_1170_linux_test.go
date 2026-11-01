@@ -350,7 +350,9 @@ func TestH2PoolWaiterWithoutAWriteTimeoutKeepsTheOldClocks1170(t *testing.T) {
 // if it is another loop (the case the fallback is for) only the fallback to WriteTimeout
 // in all can: the trial is repeated on fresh connections, one locker each, so that a
 // server without the fallback fails it with the probability of a coin in every trial.
-// Every locker is answered within 1.5 WriteTimeouts plus slack.
+// Every locker is answered within the bound of the fallback, max(WriteTimeout/2, 2 s)
+// + WriteTimeout (a loop is taken as stuck after half a WriteTimeout, and at least 2 s:
+// a healthy loop of a loaded host has batches of a second or more), plus slack.
 func TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170(t *testing.T) {
 	const timeout = time.Second
 	for _, e := range nativeEngines889() {
@@ -418,8 +420,8 @@ func TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170(t *testing.T) {
 				if n != 1 {
 					t.Errorf("trial %d: /locked not answered: the loop waited for the lock a compliant reader's download held", i)
 				}
-				if took > 3*timeout {
-					t.Errorf("trial %d: the locker waited %v, want about 1.5 x WriteTimeout (%v) plus slack", i, took, timeout)
+				if bound := max(timeout/2, 2*time.Second) + timeout + time.Second; took > bound {
+					t.Errorf("trial %d: the locker waited %v, want within max(WriteTimeout/2, 2 s) + WriteTimeout (WriteTimeout %v) plus 1 s of slack = %v", i, took, timeout, bound)
 				}
 			}
 			for i := 0; i < 8; i++ {
@@ -430,11 +432,13 @@ func TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170(t *testing.T) {
 }
 
 // TestH2PoolWaiterIsNotCutWhileALoopIsBlockedBelowTheThreshold1170 and ...Above...:
-// the fallback is server-wide and has a threshold (half a WriteTimeout, at least 250
-// ms). A route that blocks one loop for 0.1 s at a time (under it) leaves Go's
-// Transport 4 x 8 MiB at WriteTimeout 1 s as green as without it; one that blocks 0.8
+// the fallback is server-wide and has a threshold (half a WriteTimeout, at least 2
+// s). A route that blocks one loop for 0.1 s at a time (under it) leaves Go's
+// Transport 4 x 8 MiB at WriteTimeout 1 s as green as without it; one that blocks 2.5
 // s (over) switches the fallback on, and the downloads are bounded by WriteTimeout in
-// all, as before celeris#1170: some are reset, as documented.
+// all, as before celeris#1170: some are reset, as documented. (A batch of 0.8 to 1.9 s
+// is not a wedge: that is what a healthy loop of a loaded host has, and the unit tests
+// of the threshold pin it at the edge, on a stepped clock.)
 func TestH2PoolWaiterLoopBlockedThreshold1170(t *testing.T) {
 	// "under" and "over" one after the other, the engines of one side by side: four
 	// servers with their sleepers and downloads at once under -race or coverage on a
@@ -444,7 +448,7 @@ func TestH2PoolWaiterLoopBlockedThreshold1170(t *testing.T) {
 		name  string
 		block int // ms a batch blocks
 		cut   bool
-	}{{"under", 100, false}, {"over", 800, true}} {
+	}{{"under", 100, false}, {"over", 2500, true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, e := range nativeEngines889() {
 				if e.name == "io_uring" {
@@ -479,10 +483,10 @@ func TestH2PoolWaiterLoopBlockedThreshold1170(t *testing.T) {
 					}
 					t.Logf("LB1170 %s/%s: %d cut: %q at %v; %s", e.name, tc.name, cut, ends, at, p.logs.summary())
 					if tc.cut && (cut == 0 || p.logs.resets()["loop-blocked"] == 0 || p.logs.episodes() == 0) {
-						t.Fatalf("%d cut although a loop was blocked for 0.8 s at a time: the fallback to WriteTimeout in all must cut some, say so (%s)", cut, p.logs.summary())
+						t.Fatalf("%d cut although a loop was blocked for 2.5 s at a time: the fallback to WriteTimeout in all must cut some, say so (%s)", cut, p.logs.summary())
 					}
 					if !tc.cut && (cut != 0 || p.logs.resets()["loop-blocked"] != 0) {
-						t.Fatalf("%d downloads were cut although the loops were blocked for only 0.1 s at a time (under the threshold of 0.5 s): %s", cut, p.logs.summary())
+						t.Fatalf("%d downloads were cut although the loops were blocked for only 0.1 s at a time (under the threshold of 2 s): %s", cut, p.logs.summary())
 					}
 				})
 			}

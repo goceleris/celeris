@@ -113,9 +113,9 @@ func downloadsOn1170(t *testing.T, cl *http.Client, addr, path string, n, size i
 func TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170(t *testing.T) {
 	// One WriteTimeout at a time, and at 1 s one engine at a time: a few of these cells
 	// at once under -race or a coverage profile starve each other's event loops (CI saw
-	// it), and a loop that is stuck in one batch for half a WriteTimeout switches the
-	// rule off for the server (the fallback), which at 1 s is a cell's flake, not a
-	// finding. At 5 s the threshold is 2.5 s and the engines run side by side.
+	// it), and a loop that is stuck in one batch for half a WriteTimeout (at least 2 s)
+	// switches the rule off for the server (the fallback), which at 1 s is a cell's flake,
+	// not a finding. At 5 s the threshold is 2.5 s and the engines run side by side.
 	for _, wt := range []time.Duration{time.Second, 5 * time.Second} {
 		t.Run(fmt.Sprintf("WT%v", wt), func(t *testing.T) {
 			for _, e := range nativeEngines889() {
@@ -151,16 +151,24 @@ func TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170(t *testing.T) {
 // = 14 s after its wait began, 14 windows (the idle allowance covers it, not the 3 of
 // the rule before celeris#1170).
 func TestH2GoTransportManyParallelDownloadsAreNotCut1170(t *testing.T) {
+	// One engine at a time: both side by side under -race and a coverage profile on two
+	// CPUs gave each other's event loops batches of a second or more (Coverage root shard
+	// c, run 41246492268), which is a cell's flake and not a finding. Each is its own
+	// server, and the property is per server: eight downloads on one connection are not
+	// cut by the rate rule.
 	for _, e := range nativeEngines889() {
 		if e.name == "io_uring" {
 			continue // its own send clock at WriteTimeout 1 s, see above
 		}
 		t.Run(e.name, func(t *testing.T) {
-			t.Parallel()
 			var p pool1170
 			addr := p.server(t, e.eng, -1, -1, time.Second)
 			ends, at := downloads1170(t, addr, "/pool", 8, 8<<20, 2e6, 90*time.Second)
 			t.Logf("GT1170 many %s: %q at %v; %s", e.name, ends, at, p.logs.summary())
+			// The condition, before the timing: the healthy loop was not taken as a wedge.
+			if n := p.logs.resets()["loop-blocked"]; n != 0 || p.logs.episodes() != 0 {
+				t.Errorf("%d waits were reset as loop-blocked (%d episodes): a healthy loop of a loaded host is not a wedge; %s", n, p.logs.episodes(), p.logs.summary())
+			}
 			for i, r := range ends {
 				if r != "complete" {
 					t.Fatalf("download %d: %s at %v (all eight must complete); %s", i, r, at[i].Round(time.Millisecond), p.logs.summary())
