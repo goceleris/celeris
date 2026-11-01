@@ -36,11 +36,11 @@ import (
 //	                a reset.
 //	    A-accepted-draining, A-deferred-draining
 //	                the same with a response going out on every worker (16
-//	                clients that do not read an 8 MiB response). epoll: as above.
-//	                io_uring serves on for the first 250 ms of its send drain:
-//	                idle and silent conns get their FIN at about 250 ms, and a
-//	                first request 50 ms in is answered, on an accepted conn and on
-//	                a deferred one.
+//	                clients that do not read an 8 MiB response). epoll: as above
+//	                (A-deferred-draining is io_uring only). io_uring serves on for
+//	                the first 250 ms of its send drain: idle and silent conns get
+//	                their FIN at about 250 ms, and a first request 50 ms in is
+//	                answered, on an accepted conn and on a deferred one.
 //	shape B, a request head in the kernel that the server has not read when
 //	  Shutdown begins:
 //	    B-busy-loop   natives: the loop is held by a handler while the head
@@ -238,6 +238,11 @@ func TestShutdownSilentConn_1208_ShapeA(t *testing.T) {
 			}
 			if ec.native && ec.eng != celeris.Adaptive { // adaptive starts on epoll: the same cells
 				t.Run("A-accepted-draining", func(t *testing.T) { t.Parallel(); silentAcceptedDraining1208(t, ec.eng) })
+			}
+			if ec.eng == celeris.IOUring {
+				// Not epoll: its loops close their listeners at their own pace
+				// while they send, so a first request that arrives in the first
+				// ms is answered, not reset.
 				t.Run("A-deferred-draining", func(t *testing.T) { t.Parallel(); silentDeferredDraining1208(t, ec.eng) })
 			}
 		})
@@ -709,7 +714,12 @@ func silentAcceptedDraining1208(t *testing.T, eng celeris.EngineType) {
 		return ch
 	}
 	silentFin, idleFin := finOf(silent), finOf(idle)
-	time.Sleep(50 * time.Millisecond)
+	if eng == celeris.IOUring {
+		time.Sleep(50 * time.Millisecond)
+	} else if err := waitFIN1208(getter, 3*time.Second); err != nil {
+		// epoll closes at its own pace while it sends: the request goes in after the FIN.
+		t.Fatalf("%v: the silent conn had no FIN 3 s into the shutdown: %v", eng, err)
+	}
 	o := send1208(getter, get1208, 0)
 	sf, idf := <-silentFin, <-idleFin
 	for name, f := range map[string]fin{"silent": sf, "idle": idf} {
@@ -734,31 +744,21 @@ func silentAcceptedDraining1208(t *testing.T, eng celeris.EngineType) {
 	r.finish(silent, idle, getter)
 }
 
-// silentDeferredDraining1208 (A-deferred-draining): a conn TCP_DEFER_ACCEPT holds
-// back sends its first request 50 ms into a shutdown while every worker has a
-// response going out: epoll resets it, an io_uring worker is still accepting and
-// answers it.
+// silentDeferredDraining1208 (A-deferred-draining, io_uring): a conn
+// TCP_DEFER_ACCEPT holds back sends its first request 50 ms into a shutdown while
+// every worker has a response going out: the worker is still accepting (the first
+// 250 ms of its send drain) and answers it, where an idle worker, or epoll,
+// resets it (A-deferred).
 func silentDeferredDraining1208(t *testing.T, eng celeris.EngineType) {
 	r := startRig1208(t, celeris.Config{Engine: eng}, routesBig1208)
 	stop := r.stallers(t, 16)
-	k := r.dial() // accepted and idle: on epoll its FIN says the shutdown has begun
-	if o := send1208(k, get1208, 0); !o.answered() || o.close {
-		t.Fatalf("the keep-alive conn before the shutdown: %v", o)
-	}
 	d := r.dial()
 	r.shutdown()
-	if eng == celeris.IOUring {
-		time.Sleep(50 * time.Millisecond)
-	} else if err := waitFIN1208(k, 2*time.Second); err != nil {
-		t.Fatalf("%v: the idle conn had no FIN 2 s into the shutdown: %v", eng, err)
-	}
+	time.Sleep(50 * time.Millisecond)
 	o := send1208(d, get1208, 0)
-	switch {
-	case eng == celeris.IOUring && (!o.answered() || o.body != "ok"):
-		t.Errorf("io_uring: a first request of a held-back conn 50 ms into the shutdown, with a send pending: %v, want it answered", o)
-	case eng != celeris.IOUring && o.kind != "reset":
-		t.Errorf("%v: a first request of a held-back conn: %v, want a reset", eng, o)
+	if !o.answered() || o.body != "ok" {
+		t.Errorf("%v: a first request of a held-back conn 50 ms into the shutdown, with a send pending: %v, want it answered", eng, o)
 	}
 	stop() // Shutdown waits for the stalled responses
-	r.finish(k, d)
+	r.finish(d)
 }

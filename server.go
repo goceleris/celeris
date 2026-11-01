@@ -683,7 +683,9 @@ func (s *Server) cancelListen() {
 //     (TCP_DEFER_ACCEPT, see [Config.DisableDeferAccept]); while it is held back
 //     Shutdown neither closes it nor lets a request through on epoll or on an
 //     io_uring worker with no response going out: its first request gets a
-//     reset. An io_uring worker that has a response going out keeps accepting
+//     reset once the loops have closed their listeners (an epoll loop busy
+//     sending can take a few milliseconds to, and answers it with Connection:
+//     close until then). An io_uring worker that has a response going out keeps accepting
 //     for its first 250 ms: it closes an accepted silent connection at 250 ms and
 //     answers, with Connection: close, a first request that arrives before then,
 //     on an accepted connection or a held-back one. std keeps the connection
