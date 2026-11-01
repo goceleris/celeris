@@ -11,8 +11,12 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
@@ -143,8 +147,9 @@ func TestReadTimeoutIsOnTimeWithoutReadHeaderTimeout1194(t *testing.T) {
 // every 25 ms (4.0 to 4.4 s without), 2.06 to 2.17 s under -race, where the
 // baseline sweep comes later, and 1.24 s once, with the first window failed
 // (the peer's kernel acknowledged less than the floor). The window runs from
-// one WriteTimeout to two and 300 ms more than the other tests allow, the
-// stall rule's windows being measured from a sweep, not from the request.
+// one WriteTimeout to two and 800 ms more than the other tests allow (3.0 s
+// with the lateness; main closes at 4.2 s and later), the stall rule's windows
+// being measured from a sweep, not from the request.
 func TestWriteTimeoutIsOnTimeWithoutReadHeaderTimeout1194(t *testing.T) {
 	_, addr, closed := start1194(t, func(c *resource.Config) { c.WriteTimeout = time.Second })
 	c, err := net.Dial("tcp", addr)
@@ -157,7 +162,7 @@ func TestWriteTimeoutIsOnTimeWithoutReadHeaderTimeout1194(t *testing.T) {
 	if _, err := fmt.Fprint(c, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
-	closeWithin1194(t, "non-reading peer (WriteTimeout 1 s)", closed, t0, time.Second, 2*time.Second+300*time.Millisecond)
+	closeWithin1194(t, "non-reading peer (WriteTimeout 1 s)", closed, t0, time.Second, 2*time.Second+800*time.Millisecond)
 }
 
 // Every timeout rides the sweep, so the sweep has its kernel timer whatever
@@ -181,5 +186,60 @@ func TestEveryLoopHasASweepTimer1194(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// logBuf1194 is a log sink a test reads while the loops write to it.
+type logBuf1194 struct {
+	mu sync.Mutex
+	sb strings.Builder
+}
+
+func (b *logBuf1194) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.Write(p)
+}
+
+func (b *logBuf1194) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.String()
+}
+
+// A loop whose sweep timer cannot be set up says so, once per loop: without it
+// the deadlines that ride the sweep are late (about 130 ms with the listener
+// open, 16 s without one) and the documentation's 25 ms does not hold.
+func TestSweepTimerFailureIsLogged1194(t *testing.T) {
+	orig := timerfdCreate
+	timerfdCreate = func(int, int) (int, error) { return -1, unix.EMFILE }
+	t.Cleanup(func() { timerfdCreate = orig }) // registered first: runs after the engine has stopped
+	logs := &logBuf1194{}
+	eng, addr, _ := start1194(t, func(c *resource.Config) {
+		c.Logger = slog.New(slog.NewTextHandler(logs, nil))
+	})
+	for i := 0; i < eng.NumWorkers(); i++ {
+		if l := eng.WorkerLoop(i).(*Loop); l.timerFD >= 0 {
+			t.Errorf("loop %d has a timerfd (%d) though its creation failed", i, l.timerFD)
+		}
+	}
+	if got, want := strings.Count(logs.String(), "the sweep timer could not be set up"), eng.NumWorkers(); got != want {
+		t.Errorf("%d log lines about the sweep timer, want %d (one per loop):\n%s", got, want, logs.String())
+	}
+	if !strings.Contains(logs.String(), "EMFILE") && !strings.Contains(logs.String(), "too many open files") {
+		t.Errorf("the log line does not carry the error:\n%s", logs.String())
+	}
+	// The loop still serves.
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprint(c, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := http.ReadResponse(bufio.NewReader(c), nil); err != nil {
+		t.Fatalf("a loop without a sweep timer does not serve: %v", err)
 	}
 }

@@ -544,7 +544,7 @@ func (l *Loop) run(ctx context.Context) {
 	// sweep every 8 minutes. The default configuration (ReadHeaderTimeout 10 s)
 	// has always armed it, so this changes the loop only for a server that
 	// turned ReadHeaderTimeout off; see sweepFloor for what it costs.
-	tfd, tfdErr := unix.TimerfdCreate(unix.CLOCK_MONOTONIC, unix.TFD_NONBLOCK|unix.TFD_CLOEXEC)
+	tfd, tfdErr := timerfdCreate(unix.CLOCK_MONOTONIC, unix.TFD_NONBLOCK|unix.TFD_CLOEXEC)
 	if tfdErr == nil {
 		// sweepFloor periodic (25 ms); first fire at the same.
 		spec := unix.ItimerSpec{
@@ -553,15 +553,23 @@ func (l *Loop) run(ctx context.Context) {
 		}
 		if err := unix.TimerfdSettime(tfd, 0, &spec, nil); err != nil {
 			_ = unix.Close(tfd)
-			tfd = -1
+			tfd, tfdErr = -1, err
 		} else if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, tfd, &unix.EpollEvent{
 			Events: unix.EPOLLIN,
 			Fd:     int32(tfd),
 		}); err != nil {
 			_ = unix.Close(tfd)
-			tfd = -1
+			tfd, tfdErr = -1, err
 		}
 		l.timerFD = tfd
+	}
+	if tfdErr != nil && l.logger != nil {
+		// Not silent (celeris#1194): without the timer the deadlines that ride
+		// the sweep are seen from the loop's gate alone, about 130 ms apart
+		// with the listener open and 16 s apart while it has none, where the
+		// documentation promises 25 ms.
+		l.logger.Warn("epoll: the sweep timer could not be set up; timeouts are enforced late on this loop",
+			"loop", l.id, "err", tfdErr)
 	}
 
 	// celeris#639: listenFD is certainly this loop's socket here; after ready
@@ -922,10 +930,9 @@ func (l *Loop) run(ctx context.Context) {
 			l.bytesWrittenBatch = 0
 		}
 
-		// Check connection timeouts. Default cadence is every 1024 iterations;
-		// when detached conns exist with idle deadlines the gate tightens to
-		// every 32 iterations so the WS idle-close fires within its
-		// configured budget. An iteration is one epoll_wait return, so the
+		// Check connection timeouts. The gate is every 32 iterations (it was
+		// 1024 without ReadHeaderTimeout or a detached conn, celeris#1194). An
+		// iteration is one epoll_wait return, so the
 		// wall time between gate hits depends on the load: on a busy loop it
 		// is well under a millisecond, and the timerfd (25 ms) is only the
 		// floor on an idle one. So a gate hit sweeps only when sweepFloor has
@@ -4515,13 +4522,13 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	if len(l.h2Conns) > 0 && l.wakeFD.FD() < 0 {
 		return 1
 	}
-	// The wait never exceeds the sweep period, so that checkTimeouts fires the
-	// deadlines that ride it (the header deadline, idle, read and write
-	// timeouts, a detached conn's idle deadline) reliably under low traffic,
-	// whatever the timeouts are (celeris#1194; the cap was 25 ms with
-	// ReadHeaderTimeout set, 50 ms with a conn detached, 500 ms otherwise). The
-	// timerfd ends the wait on its own; the cap is what keeps the bound if the
-	// timerfd could not be created.
+	// A ceiling for the wait at the sweep period (celeris#1194; it was 25 ms
+	// with ReadHeaderTimeout set, 50 ms with a conn detached, 500 ms otherwise).
+	// With base 1 ms the backoff below tops out at 4 ms, so the ceiling does not
+	// bind today, and it is not what bounds the sweep: the timerfd is. A loop
+	// whose timerfd could not be created (it logs that once) sweeps from the gate
+	// alone, every 32 iterations, about 130 ms apart with its listener open,
+	// and about 16 s apart while it has no listener and waits 500 ms (see run).
 	maxMs := int(sweepFloor / time.Millisecond)
 	switch {
 	case l.consecutiveEmpty == 0:
@@ -4627,6 +4634,10 @@ func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
 	}
 	return snap, true
 }
+
+// timerfdCreate is unix.TimerfdCreate; a test replaces it to fail the creation
+// (celeris#1194). Set before an engine is created and restored after it stops.
+var timerfdCreate = unix.TimerfdCreate
 
 // sweepFloor is the least time between two checkTimeouts sweeps that the run
 // loop's iteration gate asks for, and the period of the timerfd that
