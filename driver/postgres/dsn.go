@@ -13,7 +13,13 @@ import (
 // Options holds client-side driver knobs parsed out of the DSN before they are
 // passed to the server as startup parameters.
 type Options struct {
-	// ConnectTimeout bounds dial + startup. Zero means no client-side timeout.
+	// ConnectTimeout bounds the dial and the startup together: the TCP connect,
+	// then the startup exchange (authentication, ParameterStatus, BackendKeyData)
+	// up to ReadyForQuery. A server that accepts the connection and does not
+	// complete the startup in that time fails the dial with an error that matches
+	// [context.DeadlineExceeded]. A shorter deadline of the caller's context still
+	// wins. Zero means no client-side timeout: the caller's context is then the
+	// only bound. From the DSN it is connect_timeout, in whole seconds.
 	ConnectTimeout time.Duration
 	// StatementCacheSize is the per-conn LRU capacity for named prepared
 	// statements. Zero disables the cache.
