@@ -135,13 +135,20 @@ func runShutdownH1Gate1165(t *testing.T, eng celeris.EngineType, downloads bool)
 	// in the accept queue (a loop busy formatting six 16 MiB responses under -race
 	// has not got to the upload's) is reset by the listener's close, which says
 	// nothing about the gate. Then the engine has read what the downloads and the
-	// upload sent: a request whose head the engine reads after the shutdown began
-	// is not one in progress but a new one, which net/http drops (it returns from
-	// the conn's goroutine once the head is parsed and the server is shutting
-	// down, closing the conn with the body unread: an RST, celeris#1166) and the
-	// native engines do not answer either. The conn counts are not enough (std
-	// counts a conn when it accepts it, before its goroutine has run) and nor is a
-	// sleep: a loop busy under -race can be a few hundred ms late to a conn.
+	// upload sent: a request whose head std's conn goroutine parses after the
+	// shutdown began is not one in progress but a new one, which net/http drops (it
+	// returns from the conn's goroutine once the head is parsed and the server is
+	// shutting down, closing the conn with the body unread: an RST, celeris#1166).
+	// epoll reads and answers a head still in the kernel at its first gate pass;
+	// io_uring is not covered by this comment (not verified). The conn counts are
+	// not enough (std counts a conn when it accepts it, before its goroutine has
+	// run) and nor is a sleep: a loop busy under -race can be a few hundred ms late
+	// to a conn. The wait is exact for the upload only: on std about 61 KiB of it
+	// stay in the kernel until the handler reads the body, which is past the
+	// shutting-down check. A download is a bare GET that std's first 4 KiB read
+	// empties before that check, and on io_uring an empty receive queue means the
+	// kernel handed the bytes over, not that the engine parsed them; for those the
+	// sleep below covers the rest (no assertion reads the downloads).
 	want := base + int64(len(idle)+len(dls)+1)
 	for dl := time.Now().Add(20 * time.Second); s.EngineInfo().Metrics.ActiveConnections < want; time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(dl) {
