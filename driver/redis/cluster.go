@@ -81,6 +81,11 @@ type ClusterClient struct {
 
 	replicaIdx atomic.Uint64 // round-robin counter for replica selection
 
+	// refMu guards refLast, the latest topology refresh that started (see
+	// refreshTopologySince).
+	refMu   sync.Mutex
+	refLast *topoRefresh
+
 	closeCh chan struct{}
 	closed  atomic.Bool
 }
@@ -335,9 +340,83 @@ func (c *ClusterClient) anyNode() *clusterNode {
 	return nil
 }
 
+// topoRefresh is one topology refresh: when it started, and, once done is
+// closed, how it ended.
+type topoRefresh struct {
+	start time.Time
+	done  chan struct{}
+	err   error
+	// cut is set when it failed while its own caller's context had ended.
+	cut bool
+}
+
+// joinable reports whether a caller that needs a table read after its own
+// trigger may use the outcome of f: f started after that moment (checked by the
+// caller) and either runs, or ended with a table or with a node's failure. A
+// refresh that ended because its own caller's context ended says nothing.
+// The caller holds refMu.
+func (f *topoRefresh) joinable() bool {
+	select {
+	case <-f.done:
+		return !f.cut
+	default:
+		return true
+	}
+}
+
 // refreshTopology queries CLUSTER SLOTS on any live node and rebuilds the
-// slot-to-node mapping, including replica nodes and per-node latency.
+// slot-to-node mapping, including replica nodes and per-node latency. It always
+// reads the table; refreshTopologySince is the variant that may share a read.
 func (c *ClusterClient) refreshTopology(ctx context.Context) error {
+	f := &topoRefresh{start: time.Now(), done: make(chan struct{})}
+	c.refMu.Lock()
+	c.refLast = f
+	c.refMu.Unlock()
+	return c.runRefresh(ctx, f)
+}
+
+// refreshTopologySince is refreshTopology for a caller that needs a table read
+// at or after since (the moment its reason to look arose): it uses the latest
+// refresh if that started at or after since, running or done, instead of
+// sending its own CLUSTER SLOTS. N PubSubs hit by one slot move, or retrying
+// the same outage, then cost one CLUSTER SLOTS per window in which none of
+// their triggers is newer than the last read, not N (celeris#1203). A refresh
+// that began before since is never used: its reply may predate the event. The
+// check and the registration of a new refresh are one step under refMu, so
+// callers that arrive together start one.
+func (c *ClusterClient) refreshTopologySince(ctx context.Context, since time.Time) error {
+	for {
+		c.refMu.Lock()
+		f := c.refLast
+		if f == nil || f.start.Before(since) || !f.joinable() {
+			f = &topoRefresh{start: time.Now(), done: make(chan struct{})}
+			c.refLast = f
+			c.refMu.Unlock()
+			return c.runRefresh(ctx, f)
+		}
+		c.refMu.Unlock()
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if ctx.Err() == nil && f.cut {
+			continue // the one we joined was cut short by its own caller: read again
+		}
+		return f.err
+	}
+}
+
+// runRefresh reads the table on behalf of f and publishes the outcome.
+func (c *ClusterClient) runRefresh(ctx context.Context, f *topoRefresh) error {
+	f.err = c.readTopology(ctx)
+	f.cut = f.err != nil && ctx.Err() != nil
+	close(f.done)
+	return f.err
+}
+
+// readTopology is one CLUSTER SLOTS round trip and applyTopology.
+func (c *ClusterClient) readTopology(ctx context.Context) error {
 	node := c.anyNode()
 	if node == nil {
 		return errors.New("no live nodes")

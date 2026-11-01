@@ -17,7 +17,7 @@ import (
 // triggers, so the cells below run on one fake node.
 type sameClientRoute struct{ c *Client }
 
-func (r sameClientRoute) pick(context.Context, string, *Client, bool) (*Client, error) {
+func (r sameClientRoute) pick(context.Context, string, *Client, bool, time.Time) (*Client, error) {
 	return r.c, nil
 }
 func (sameClientRoute) dialed(*Client, bool) {}

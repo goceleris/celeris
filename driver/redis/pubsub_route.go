@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"time"
 )
 
 // pubsubRoute chooses the client a PubSub's next conn is dialled on, so a
@@ -19,10 +20,13 @@ type pubsubRoute interface {
 	// holds ("" if none): the client must be the owner of its slot. cur is
 	// the client the PubSub last used and moveOn is true when it did not work
 	// out; for a subscription that can live on any node a route then returns
-	// another. An error that matches [ErrClosed] means the route's owner is
+	// another. since is when the reason for this pick arose (the trigger of the
+	// reroute, or the end of the attempt that failed): a route that reads the
+	// cluster topology needs a read taken at or after it, and may share one
+	// that other PubSubs started in between. An error that matches [ErrClosed] means the route's owner is
 	// closed and nothing will ever work (the loop gives up); any other error is
 	// retried with the backoff.
-	pick(ctx context.Context, shard string, cur *Client, moveOn bool) (*Client, error)
+	pick(ctx context.Context, shard string, cur *Client, moveOn bool, since time.Time) (*Client, error)
 	// dialed reports the outcome of a dial on cl.
 	dialed(cl *Client, ok bool)
 	// slotted reports whether the route serves shard channels by slot (a
@@ -43,9 +47,11 @@ var errPubSubNoOwner = errors.New("celeris-redis: no cluster node for the pubsub
 //     (by address) that is not marked failing.
 //   - A sharded subscription lives on the owner of its slot: the topology is
 //     refreshed (bounded by the dial timeout) and the owner of the slot read.
+//     The refresh is shared with the other PubSubs that need one: a read that
+//     started after this attempt's reason arose serves them all.
 type clusterPubSubRoute struct{ c *ClusterClient }
 
-func (r clusterPubSubRoute) pick(ctx context.Context, shard string, cur *Client, moveOn bool) (*Client, error) {
+func (r clusterPubSubRoute) pick(ctx context.Context, shard string, cur *Client, moveOn bool, since time.Time) (*Client, error) {
 	c := r.c
 	if c.closed.Load() {
 		return nil, ErrClosed
@@ -57,7 +63,7 @@ func (r clusterPubSubRoute) pick(ctx context.Context, shard string, cur *Client,
 		}
 		rctx, cancel := context.WithTimeout(ctx, bound)
 		// A failed refresh leaves the table as it was: the dial tells.
-		_ = c.refreshTopology(rctx)
+		_ = c.refreshTopologySince(rctx, since)
 		cancel()
 		if c.closed.Load() {
 			return nil, ErrClosed
@@ -161,7 +167,7 @@ func (c *ClusterClient) openPubSub(ctx context.Context, first *Client, shard str
 		if ctx.Err() != nil || try+1 >= max(n, 2) || c.closed.Load() {
 			return nil, lastErr
 		}
-		next, perr := route.pick(ctx, shard, cl, true)
+		next, perr := route.pick(ctx, shard, cl, true, time.Now())
 		if perr != nil {
 			return nil, lastErr
 		}
@@ -180,7 +186,7 @@ func (c *ClusterClient) openPubSub(ctx context.Context, first *Client, shard str
 // closed client for ever.
 type sentinelPubSubRoute struct{ s *SentinelClient }
 
-func (r sentinelPubSubRoute) pick(context.Context, string, *Client, bool) (*Client, error) {
+func (r sentinelPubSubRoute) pick(context.Context, string, *Client, bool, time.Time) (*Client, error) {
 	return r.s.getClient()
 }
 
