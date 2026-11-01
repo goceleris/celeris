@@ -86,6 +86,12 @@
 # request. Excluded by default. The open alternative is to batch the grants
 # inside the benchmark, and to settle that change with
 # .github/scripts/bench-ab.sh before it is kept.
+# BenchmarkOneByteGrantWriteDeadline889 (same package, celeris#889, "off" and
+# "on" subbenchmarks) is that benchmark with the write deadline switched on
+# ("off" is BenchmarkOneByteGrant911). It came after the pattern and is not
+# named in it: the prefix BenchmarkOneByteG, spelled out below to drop
+# BenchmarkOneByteGrant911, drops it too, so it is excluded with it and runs
+# only under a plain `go test -bench`.
 #
 # How the set is chosen. CodSpeed's Go runner (go-runner, pinned below)
 # passes exactly three things from `run:` to `go test`: -bench, -benchtime
@@ -95,11 +101,13 @@
 # no negative lookahead, so the pattern spells out a complement: it selects
 # every top-level benchmark except the names that start with BenchmarkInternH
 # or BenchmarkOneByteG (each prefix is spelled out one letter at a time). In
-# these packages that leaves out exactly two benchmarks:
-# BenchmarkInternH2HeaderName (see "Removed") and BenchmarkOneByteGrant911 (see
-# "Also excluded").
-# The selection, each benchmark run once (92 leaves on linux/arm64 and 87 on
-# macOS arm64; 95 and 90 before BenchmarkOneByteGrant911 was excluded):
+# these packages that leaves out exactly three benchmarks:
+# BenchmarkInternH2HeaderName (see "Removed"), BenchmarkOneByteGrant911 and
+# BenchmarkOneByteGrantWriteDeadline889 (see "Also excluded"). A new benchmark
+# whose name starts with either prefix is excluded the same way.
+# The selection, each top-level benchmark run once (88 benchmarks in these
+# packages on linux, 85 selected; 83 on macOS, 80 selected; re-count with
+# `go test -list 'Benchmark.*'` over the package list below):
 #   go test -run '^$' -bench '^Benchmark([^IO]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H]|O[^n]|On[^e]|One[^B]|OneB[^y]|OneBy[^t]|OneByt[^e]|OneByte[^G])' \
 #     -benchtime 1x . ./test/server ./internal/protocol/... ./middleware ./middleware/logger
 #
