@@ -58,14 +58,19 @@ jobs:
   coverage:
     name: Coverage (root + middleware sub-modules)
     runs-on: ubuntu-latest
-    # 45: the root step may run 600 s and then 540 s (the other packages, then ./test/server,
-    # each with its own -timeout), the iouring step up to 780 s and the four
-    # middleware steps up to 120 s each, which is 40 min at their own limits before
-    # checkout and setup-go (it was 36 min of 40 before the root step went to 600 s and
-    # the iouring step to 780 s, 30 before ./test/server got an invocation of
-    # its own, and 40 while the root step's limit was 1200 s). The job takes about
-    # 20 min (19.5 to 19.8 min in runs 39408130885, 39404206705 and 39331135786),
-    # the iouring step 516 to 538 s of it (see its comment below). Refs #890.
+    # 45: each go test binary has its own -timeout, and a multi-package invocation can
+    # run longer than that, so the step limits do not add up to a bound: the root step's
+    # first invocation took 765 to 866 s of wall time (runs 41259965862, 41262675953 and
+    # 41268784922) for binaries of at most 401.0 s (epoll) and 322.8 s (./test/server),
+    # the rest being builds and the packages queued behind the slowest. At their own
+    # limits the steps are 600 s and 540 s (the root step's two invocations: the other
+    # packages, then ./test/server), 780 s (iouring) and 4 x 120 s (middleware), 40 min
+    # (it was 36 min of 40 before the root step went to 600 s and the iouring step to
+    # 780 s, 30 before ./test/server got an invocation of its own, and 40 while the root
+    # step's limit was 1200 s). The job takes 22.6 to 24.8 min on main (seven runs from
+    # 5aecd53 to 86981b3; 19.5 to 19.8 min in runs 39408130885, 39404206705 and
+    # 39331135786 earlier), the iouring step 516 to 538 s of it (see its comment below).
+    # 45 min covers the job and one hung binary (at most about 260 s more). Refs #890.
     timeout-minutes: 45
     env:
       # ci.yml's unit selection (see "Same packages as ci.yml" below).
@@ -160,14 +165,14 @@ jobs:
           # -timeout=600s for the other packages: the tests that stay in the root package
           # took 176.4 s under coverage on the runner (run 38348908034; 620.8 s for the
           # whole package before the shards, run 38327908174), but the longest binary of
-          # this invocation is internal/engine/epoll: 360.9 to 394.0 s (median 381.9 s,
-          # 90th percentile 391.3 s) in the fourteen Coverage runs on main from 1002dcb
-          # (2026-10-30) to 64fe9e5 (2026-11-01), of the 540 s that were here before: 37%
-          # over the longest. 600 s is 52% over 394.0 s. -timeout applies to each test
-          # binary. A new root test that is in no shard lands here until it is listed in
+          # this invocation is internal/engine/epoll: 360.9 to 401.0 s (median 381.9 s,
+          # 90th percentile 391.3 s in the first fourteen) in the Coverage runs on main from
+          # 1002dcb (2026-10-30) to 86981b3 (2026-11-01; 401.0 s in run 41268784922), of the
+          # 540 s that were here before: 35% over the longest. 600 s is 50% over 401.0 s.
+          # -timeout applies to each test binary. A new root test that is in no shard lands here until it is listed in
           # .github/root-test-shards.txt. timeout-headroom.sh prints the longest
           # package's share of the timeout and warns above 75% (450 s). Refs #890.
-          # ./test/server, below, took 302.6 to 321.9 s of its 540 s (68% over the longest).
+          # ./test/server, below, took 302.6 to 322.8 s of its 540 s (67% over the longest).
           root_timeout=600
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
           go test -race -count=1 -timeout="${root_timeout}s" -covermode=atomic -skip "$skip" \

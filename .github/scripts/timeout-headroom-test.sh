@@ -40,6 +40,12 @@ printf '%s\n' \
   'ok  	github.com/goceleris/celeris/test/server	333.899s' >"$dir/root.log"
 check "the slowest package is the one reported, below the threshold: no warning" "$dir/root.log" 600 0 0 'internal/engine/epoll took 398.1 s of its 600 s timeout: 66% of the timeout, 51% headroom'
 check "74 per cent of the timeout is still below the threshold: no warning" "$dir/root.log" 540 0 0 '74% of the timeout'
+# The threshold itself: 450.000 s of 600 s is exactly 75% and does not warn ("above 75%"),
+# 450.001 s does.
+printf '%s\n' 'ok  	github.com/goceleris/celeris/internal/engine/epoll	450.000s' >"$dir/edge.log"
+check "exactly at the threshold: no warning" "$dir/edge.log" 600 0 0 '75% of the timeout'
+printf '%s\n' 'ok  	github.com/goceleris/celeris/internal/engine/epoll	450.001s' >"$dir/edge-over.log"
+check "a millisecond above the threshold: one warning" "$dir/edge-over.log" 600 0 1 '75% of the timeout'
 check "above the threshold: one warning, the step still passes" "$dir/root.log" 500 0 1 '80% of the timeout'
 rm -f "$dir/summary"
 GITHUB_STEP_SUMMARY="$dir/summary" "$helper" "$dir/root.log" 500 >/dev/null

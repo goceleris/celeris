@@ -2486,7 +2486,12 @@ jobs:
   # 417.1 to 447.9 s (median 436.5 s) in the same runs, which left 600 s 34% over the
   # longest, and is now 660 s (47% over 447.9 s). Both steps run timeout-headroom.sh
   # after their tally: a package above 75% of its timeout (675 s and 495 s) carries a
-  # warning annotation. The steps' limits are 1560 s together; the job's 30 minutes leave 4.
+  # warning annotation. -timeout is per test binary: the second step runs two of them, one
+  # after the other (-p 1), each with its own 660 s, so the two steps' limits do not add up
+  # to a bound of the job's 30 minutes (900 + 2 x 660 = 2220 s). In practice the root
+  # binary takes 4.3 to 5.3 s, the job 17.4 to 18.5 min, and a hang in one binary still
+  # ends inside the 30 minutes (606 + 660 + 450 s and the builds); only a hang in two
+  # binaries at once is cut by the job limit, after the first one's panic dump is logged.
   # CELERIS_REQUIRE_ZONED_PEER=1, as in the unit job: the zoned link-local tests (celeris#885,
   # #1127) fail rather than skip on a runner without an fe80:: address, so they need no
   # allow-list entry.

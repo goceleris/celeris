@@ -4,10 +4,10 @@
 # `go test -timeout=N` applies to each test binary, so the figure that matters is the
 # longest `ok <package> <seconds>s` line of the step's log (the line carries the binary's
 # run time, without the build). The script prints that figure as a share of the timeout and,
-# when it is above HEADROOM_WARN_PCT per cent (default 75), emits a `::warning::` annotation
-# and, if GITHUB_STEP_SUMMARY is set, a line in the job summary. It does NOT fail the step
-# on a high figure: a step 5 per cent slower on a busy runner would turn a required check
-# red for every unrelated pull request, which is the harm the headroom is there to prevent.
+# when it is strictly above HEADROOM_WARN_PCT per cent (default 75; exactly 75% does not
+# warn), emits a `::warning::` annotation and, if GITHUB_STEP_SUMMARY is set, a line in
+# the job summary. It does NOT fail the step on a high figure: a step 5 per cent slower
+# on a busy runner would turn a required check red for every unrelated pull request, which is the harm the headroom is there to prevent.
 # The warning is how the next regression becomes visible before it reaches the wall; the
 # timeout panic is still the only hard failure.
 #
