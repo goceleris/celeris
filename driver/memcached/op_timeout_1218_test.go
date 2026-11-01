@@ -81,11 +81,6 @@ type int32Counter struct {
 }
 
 func (c *int32Counter) add() { c.mu.Lock(); c.n++; c.mu.Unlock() }
-func (c *int32Counter) get() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.n
-}
 
 // opClients are the three ways a Client reaches its conns: direct (what a client
 // without an engine uses), the unix event loop, and the net.Conn loop.
@@ -123,11 +118,11 @@ var opClients = []struct {
 
 // opWithin runs op and fails the test (not the test binary's timeout) if it is
 // still blocked after limit.
-func opWithin(t *testing.T, limit time.Duration, ctx context.Context, op func(ctx context.Context) error) (time.Duration, error) {
+func opWithin(t *testing.T, limit time.Duration, op func() error) (time.Duration, error) {
 	t.Helper()
 	done := make(chan error, 1)
 	start := time.Now()
-	go func() { done <- op(ctx) }()
+	go func() { done <- op() }()
 	select {
 	case err := <-done:
 		return time.Since(start), err
@@ -157,7 +152,7 @@ func TestOperationIsBoundedByTimeout1218(t *testing.T) {
 							ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
 							defer cancel()
 						}
-						elapsed, err := opWithin(t, 2*time.Second, ctx, func(ctx context.Context) error {
+						elapsed, err := opWithin(t, 2*time.Second, func() error {
 							switch op {
 							case "Get":
 								_, err := c.Get(ctx, "k")
@@ -201,7 +196,7 @@ func TestOperationKeepsTheCallersShorterDeadline1218(t *testing.T) {
 			c := cl.new(t, Config{Addr: addr, Timeout: 30 * time.Second})
 			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 			defer cancel()
-			elapsed, err := opWithin(t, 2*time.Second, ctx, func(ctx context.Context) error {
+			elapsed, err := opWithin(t, 2*time.Second, func() error {
 				_, err := c.Get(ctx, "k")
 				return err
 			})
@@ -238,6 +233,94 @@ func TestTimeoutDoesNotTouchAnAnsweredOperation1218(t *testing.T) {
 			time.Sleep(300 * time.Millisecond) // past Timeout
 			if v, err := c.Get(ctx, "k"+cl.name); err != nil || v != "v" {
 				t.Fatalf("Get after Timeout passed = %q, %v", v, err)
+			}
+		})
+	}
+}
+
+// A client whose Timeout is unset gets the default (3 s). The test lowers the
+// default through the test hook, so it does not wait 3 s.
+func TestOperationIsBoundedByTheDefaultTimeout1218(t *testing.T) {
+	const def = 300 * time.Millisecond
+	d := def
+	testHookDefaultOpTimeout.Store(&d)
+	t.Cleanup(func() { testHookDefaultOpTimeout.Store(nil) })
+	for _, proto := range []Protocol{ProtocolText, ProtocolBinary} {
+		for _, cl := range opClients {
+			t.Run(proto.String()+"/"+cl.name, func(t *testing.T) {
+				t.Parallel()
+				addr, _ := startMuteServer(t, proto == ProtocolBinary)
+				c := cl.new(t, Config{Addr: addr, Protocol: proto}) // no Timeout
+				elapsed, err := opWithin(t, 2*time.Second, func() error {
+					ctx := context.Background()
+					_, err := c.Get(ctx, "k")
+					return err
+				})
+				if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "after "+def.String()) {
+					t.Errorf("error %v, want the operation timeout of the default (%v)", err, def)
+				}
+				if elapsed < def/2 {
+					t.Errorf("returned after %v, before the default of %v", elapsed, def)
+				}
+			})
+		}
+	}
+}
+
+// A negative Timeout turns the per-operation deadline off: only the caller's
+// context ends the operation (here a deadline of 900 ms, three times the lowered
+// default), and its error is not relabelled.
+func TestNegativeTimeoutTurnsTheOperationBoundOff1218(t *testing.T) {
+	d := 300 * time.Millisecond
+	testHookDefaultOpTimeout.Store(&d)
+	t.Cleanup(func() { testHookDefaultOpTimeout.Store(nil) })
+	for _, cl := range opClients {
+		t.Run(cl.name, func(t *testing.T) {
+			t.Parallel()
+			addr, _ := startMuteServer(t, false)
+			c := cl.new(t, Config{Addr: addr, Timeout: -1})
+			ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+			defer cancel()
+			elapsed, err := opWithin(t, 3*time.Second, func() error {
+				_, err := c.Get(ctx, "k")
+				return err
+			})
+			if err == nil || strings.Contains(err.Error(), "operation timed out") || elapsed < 800*time.Millisecond {
+				t.Errorf("returned after %v with %v: the bound was not off", elapsed, err)
+			}
+		})
+	}
+}
+
+// A caller that cancels its context gets its own cancellation back, not relabelled
+// as the driver's timeout, and the conn is dropped. (A direct conn does not watch a
+// context's cancellation, only its deadline, so it is not in the cases.)
+func TestOperationKeepsTheCallersCancellation1218(t *testing.T) {
+	if defaultTimeout != 3*time.Second {
+		t.Errorf("defaultTimeout = %v, want the documented 3 s", defaultTimeout)
+	}
+	for _, cl := range opClients {
+		if cl.name == "direct" {
+			continue
+		}
+		t.Run(cl.name, func(t *testing.T) {
+			t.Parallel()
+			addr, _ := startMuteServer(t, false)
+			c := cl.new(t, Config{Addr: addr, Timeout: 30 * time.Second})
+			ctx, cancel := context.WithCancel(context.Background())
+			time.AfterFunc(200*time.Millisecond, cancel)
+			elapsed, err := opWithin(t, 2*time.Second, func() error {
+				_, err := c.Get(ctx, "k")
+				return err
+			})
+			if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "operation timed out") {
+				t.Errorf("error %v, want the caller's context.Canceled as it is", err)
+			}
+			if elapsed > time.Second {
+				t.Errorf("returned after %v, want about the cancel at 200 ms", elapsed)
+			}
+			if n := c.PoolStats().Open; n != 0 {
+				t.Errorf("the pool holds %d conns after the cancel, want 0", n)
 			}
 		})
 	}

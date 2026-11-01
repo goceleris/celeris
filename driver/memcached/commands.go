@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"time"
 
@@ -107,15 +108,65 @@ func asBytes(v any) ([]byte, error) {
 	}
 }
 
-// run acquires a conn, runs fn with it, and releases the conn. On ctx
-// cancellation or context deadline the conn is discarded because the server
-// may still send a stale reply.
+// opTimeout is the per-operation bound of the client: Config.Timeout, the default
+// (3 s) when it is zero, none when it is negative.
+func (c *Client) opTimeout() time.Duration {
+	t := c.cfg.Timeout
+	if t == 0 {
+		t = defaultTimeout
+		if h := testHookDefaultOpTimeout.Load(); h != nil {
+			t = *h
+		}
+	}
+	return max(t, 0)
+}
+
+// opContext limits ctx by the per-operation timeout (celeris#1218): the returned
+// context ends at the caller's deadline or after the timeout, whichever is first. A
+// caller's deadline that is not later than the timeout is left alone (ctx comes back
+// as it is, and its error is the caller's). timeout is 0 when ctx was not limited.
+func (c *Client) opContext(ctx context.Context) (octx context.Context, cancel context.CancelFunc, timeout time.Duration) {
+	t := c.opTimeout()
+	if t == 0 {
+		return ctx, func() {}, 0
+	}
+	if dl, ok := ctx.Deadline(); ok && !dl.After(time.Now().Add(t)) {
+		return ctx, func() {}, 0
+	}
+	octx, cancel = context.WithTimeout(ctx, t)
+	return octx, cancel, t
+}
+
+// opError reports an error of an operation run on a context from opContext. When
+// the per-operation timeout ended it (timeout > 0, the caller's context is alive,
+// and either the derived context expired or a direct conn's socket deadline fired a
+// hair before it), the error says so and matches context.DeadlineExceeded, which
+// also tells run to drop the conn.
+func opError(ctx, octx context.Context, err error, timeout time.Duration) error {
+	if err == nil || timeout == 0 || ctx.Err() != nil {
+		return err
+	}
+	if octx.Err() == nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		return err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("celeris-memcached: operation timed out after %v: %w", timeout, err)
+	}
+	return fmt.Errorf("celeris-memcached: operation timed out after %v: %w: %w", timeout, context.DeadlineExceeded, err)
+}
+
+// run acquires a conn, runs fn with it, and releases the conn. fn runs under the
+// per-operation timeout (opContext); acquiring the conn does not (a new conn has
+// its own DialTimeout). On ctx cancellation or context deadline the conn is
+// discarded because the server may still send a stale reply.
 func (c *Client) run(ctx context.Context, fn func(ctx context.Context, conn *memcachedConn) error) error {
 	conn, err := c.pool.acquire(ctx, workerFromCtx(ctx))
 	if err != nil {
 		return err
 	}
-	ferr := fn(ctx, conn)
+	octx, cancel, timeout := c.opContext(ctx)
+	ferr := opError(ctx, octx, fn(octx, conn), timeout)
+	cancel()
 	if ferr != nil && (errors.Is(ferr, context.Canceled) || errors.Is(ferr, context.DeadlineExceeded)) {
 		c.pool.discard(conn)
 		return ferr
@@ -851,7 +902,9 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	perr := conn.Ping(ctx)
+	octx, cancel, timeout := c.opContext(ctx)
+	perr := opError(ctx, octx, conn.Ping(octx), timeout)
+	cancel()
 	if perr != nil {
 		if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
 			c.pool.discard(conn)

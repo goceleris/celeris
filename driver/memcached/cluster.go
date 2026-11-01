@@ -49,7 +49,8 @@ type ClusterConfig struct {
 	// [Config.MaxOpen]; zero means NumWorkers * 4 per node.
 	MaxOpen int
 
-	// Timeout is the advisory per-op deadline forwarded to each node client.
+	// Timeout is the per-operation deadline forwarded to each node client: see
+	// [Config.Timeout].
 	Timeout time.Duration
 
 	// DialTimeout is forwarded to each node client: see [Config.DialTimeout]
