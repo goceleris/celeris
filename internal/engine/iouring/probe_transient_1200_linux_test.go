@@ -412,6 +412,47 @@ func TestProbeRefusalAndResourceClassification1200(t *testing.T) {
 			t.Errorf("probeResOutcome(%d) = %v, want %v", tc.res, got, tc.want)
 		}
 	}
+	// The completions of the three probes, read by the functions the probes call.
+	for _, res := range []int32{-int32(unix.EMFILE), -int32(unix.ENOMEM), -int32(unix.ENOBUFS)} {
+		if r, why, out := fixedFilesCQE(res); r || out != probeNotRun || why == "" {
+			t.Errorf("fixedFilesCQE(%d) = %v, %q, %v, want a negative with its reason, not run", res, r, why, out)
+		}
+		if r, why, out := multishotAcceptCQE(res, 0); r || out != probeNotRun || why == "" {
+			t.Errorf("multishotAcceptCQE(%d, 0) = %v, %q, %v, want a negative with its reason, not run", res, r, why, out)
+		}
+		if r, why, out, done := sendZCFirstCQE(res, 0); r != SendZCUnsupported || out != probeNotRun || why == "" || !done {
+			t.Errorf("sendZCFirstCQE(%d, 0) = %v, %q, %v, %v, want unsupported with its reason, not run, done", res, r, why, out, done)
+		}
+	}
+	if r, _, out := fixedFilesCQE(-int32(unix.EINVAL)); r || out != probeAnswered {
+		t.Errorf("fixedFilesCQE(-EINVAL) = %v, %v, want the kernel's rejection", r, out)
+	}
+	if r, _, out := fixedFilesCQE(0); !r || out != probeAnswered {
+		t.Errorf("fixedFilesCQE(0) = %v, %v, want a working feature", r, out)
+	}
+	for _, tc := range []struct {
+		res   int32
+		flags uint32
+		ok    bool
+	}{{5, cqeFMore, true}, {5, 0, false}, {-int32(unix.EINVAL), 0, false}, {-int32(unix.ECONNABORTED), cqeFMore, false}} {
+		if r, _, out := multishotAcceptCQE(tc.res, tc.flags); r != tc.ok || out != probeAnswered {
+			t.Errorf("multishotAcceptCQE(%d, %#x) = %v, %v, want %v, the kernel's answer", tc.res, tc.flags, r, out, tc.ok)
+		}
+	}
+	for _, tc := range []struct {
+		res   int32
+		flags uint32
+		want  SendZCProbeResult
+		done  bool
+	}{
+		{-int32(unix.EINVAL), 0, SendZCUnsupported, true},
+		{8, 0, SendZCNoNotification, true},
+		{8, 0x02, 0, false},
+	} {
+		if r, _, out, done := sendZCFirstCQE(tc.res, tc.flags); done != tc.done || out != probeAnswered || done && r != tc.want {
+			t.Errorf("sendZCFirstCQE(%d, %#x) = %v, %v, %v, want %v answered, done %v", tc.res, tc.flags, r, out, done, tc.want, tc.done)
+		}
+	}
 	var unset probeOutcome
 	if unset == probeAnswered {
 		t.Errorf("the zero value of probeOutcome reads as an answer: an outcome that was never set would be cached")
@@ -462,29 +503,32 @@ func TestNewSaysOnceThatAProbeCouldNotRun1200(t *testing.T) {
 
 // TestAsyncCancelProbeSecondWaitIsPositive1200: the cancel probe's second wait
 // is given the time that is left, and that time was read after the check that
-// there was some: a wait that came back a few nanoseconds before the deadline
-// could be followed by one with a zero or negative timespec (EINVAL, or an
-// instant return, and the probe called that no answer). The first wait of each
-// run here comes back empty 30 ns before its time is up, 100 times; no wait
-// may be asked for less than a nanosecond. The window is nanoseconds wide, so
-// this is a guard that is likely, not certain, to fail without the clamp.
+// there was some: a first wait that came back a few nanoseconds before the
+// deadline could be followed by one with a zero or negative timespec (EINVAL, or
+// an instant return, and the probe called that no answer). The first wait of
+// each run here comes back empty a little before its time is up, a little
+// earlier each run (0 to 400 ns), so that one of them lands between the
+// check and the read; no wait may be asked for less than a nanosecond. The
+// window is nanoseconds wide: this guard is likely, not certain, to fail
+// without the fix.
 func TestAsyncCancelProbeSecondWaitIsPositive1200(t *testing.T) {
 	requireRing1200(t)
 	swap1200(t, &asyncCancelProbeSubmit, func(*Ring) (int, error) { return 0, nil })
-	swap1200(t, &asyncCancelProbeTimeout, 300*time.Microsecond)
+	swap1200(t, &asyncCancelProbeTimeout, 200*time.Microsecond)
 	var waits int
+	var lead time.Duration
 	var asked []time.Duration
 	swap1200(t, &asyncCancelProbeWait, func(r *Ring, d time.Duration) error {
 		waits++
 		asked = append(asked, d)
 		if waits == 1 {
-			for end := time.Now().Add(d - 30*time.Nanosecond); time.Now().Before(end); {
+			for end := time.Now().Add(d - lead); time.Now().Before(end); {
 			}
 			return nil
 		}
 		return r.SubmitAndWaitTimeout(d)
 	})
-	for i := 0; i < 100; i++ {
+	for lead = 0; lead < 400*time.Nanosecond; lead += 4 * time.Nanosecond {
 		waits = 0
 		probeAsyncCancel(cancelAll)
 	}

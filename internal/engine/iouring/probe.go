@@ -474,14 +474,8 @@ func probeSendZCOnce() (SendZCProbeResult, string, probeOutcome) {
 	initialFlags := entry.Flags
 	ring.EndCQ(cqHead + 1)
 
-	// A completion that reports the kernel out of a resource (-ENOBUFS,
-	// -ENOMEM) is not its answer about SEND_ZC.
-	if out := probeResOutcome(initialRes); out != probeAnswered {
-		return SendZCUnsupported, fmt.Sprintf("the SEND_ZC send completed with cqe.res=%d (%s): out of a resource, not the kernel's answer",
-			initialRes, errnoName(-initialRes)), out
-	}
-	if initialRes < 0 || initialFlags&0x02 == 0 {
-		return sendZCAnswered(parseSendZCResult(initialRes, initialFlags, false, nil, 0, 0))
+	if res, why, out, done := sendZCFirstCQE(initialRes, initialFlags); done {
+		return res, why, out
 	}
 
 	// Wait for the notification CQE.
@@ -506,6 +500,23 @@ func probeSendZCOnce() (SendZCProbeResult, string, probeOutcome) {
 	_, _ = accepted.Read(buf)
 
 	return sendZCAnswered(parseSendZCResult(initialRes, initialFlags, true, nil, notifRes, notifFlags))
+}
+
+// sendZCFirstCQE reads the completion of the probe's send. done says the probe
+// is over: the result is negative (the kernel's refusal, or a resource error
+// that is not an answer, probeResOutcome) or the CQE has no F_MORE, so that no
+// notification follows. Not done, the probe goes on to wait for the
+// notification.
+func sendZCFirstCQE(res int32, flags uint32) (SendZCProbeResult, string, probeOutcome, bool) {
+	if out := probeResOutcome(res); out != probeAnswered {
+		return SendZCUnsupported, fmt.Sprintf("the SEND_ZC send completed with cqe.res=%d (%s): out of a resource, not the kernel's answer",
+			res, errnoName(-res)), out, true
+	}
+	if res < 0 || flags&0x02 == 0 {
+		r, why := parseSendZCResult(res, flags, false, nil, 0, 0)
+		return r, why, probeAnswered, true
+	}
+	return 0, "", probeAnswered, false
 }
 
 // parseSendZCResult evaluates the CQE outcomes from the SEND_ZC probe.
@@ -648,6 +659,13 @@ func probeFixedFilesOnce() (bool, string, probeOutcome) {
 	// was our own SQE passing SOCK_CLOEXEC alongside a fixed file slot, which
 	// io_accept_prep rejects by design. That is fixed (celeris#541), so a
 	// rejection here is now genuinely the kernel's.
+	return fixedFilesCQE(res)
+}
+
+// fixedFilesCQE reads the completion of the fixed-files probe's accept-direct:
+// a resource error is not an answer (probeResOutcome), another negative result
+// is the kernel's rejection, a result of 0 or more is a working feature.
+func fixedFilesCQE(res int32) (bool, string, probeOutcome) {
 	if out := probeResOutcome(res); out != probeAnswered {
 		return false, fmt.Sprintf("ACCEPT_DIRECT completed with cqe.res=%d (%s): out of a resource, not the kernel's answer",
 			res, errnoName(-res)), out
@@ -773,16 +791,24 @@ func probeMultishotAcceptOnce() (bool, string, probeOutcome) {
 	flags := cqe.Flags
 	ring.EndCQ(head + 1)
 
+	// Close the accepted FD so it doesn't leak — we have its fd in res.
+	if res > 0 {
+		_ = unix.Close(int(res))
+	}
+	return multishotAcceptCQE(res, flags)
+}
+
+// multishotAcceptCQE reads the first completion of the multishot-accept probe.
+// A resource error is not an answer (an accept whose descriptor table is full
+// completes with -EMFILE, without F_MORE), another negative result is the
+// kernel's rejection, and without F_MORE the kernel will not re-arm.
+func multishotAcceptCQE(res int32, flags uint32) (bool, string, probeOutcome) {
 	if out := probeResOutcome(res); out != probeAnswered {
 		return false, fmt.Sprintf("multishot accept completed with cqe.res=%d (%s): out of a resource, not the kernel's answer",
 			res, errnoName(-res)), out
 	}
 	if res < 0 {
 		return false, fmt.Sprintf("multishot accept rejected by kernel: cqe.res=%d", res), probeAnswered
-	}
-	// Close the accepted FD so it doesn't leak — we have its fd in res.
-	if res > 0 {
-		_ = unix.Close(int(res))
 	}
 	if flags&cqeFMore == 0 {
 		return false, "first multishot accept CQE missing CQE_F_MORE (kernel won't re-arm)", probeAnswered
