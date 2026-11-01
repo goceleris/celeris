@@ -293,6 +293,13 @@ func (w *Worker) sweepUnreadAtGate() {
 // walked once, on the first pass only. A CQE the kernel posts after the look is
 // the race any close has. Worker thread.
 func (w *Worker) holdPostedRecvs() {
+	w.eachPostedRecv(func(cs *connState) bool { cs.gateRead = true; return false })
+}
+
+// eachPostedRecv calls f for each conn whose recv completion, with bytes, is in
+// the completion queue and not reaped yet (the checks of holdPostedRecvs), and
+// stops at the first f that returns true. Nothing is consumed. Worker thread.
+func (w *Worker) eachPostedRecv(f func(cs *connState) bool) {
 	head, tail := w.ring.BeginCQ()
 	for ; head != tail; head++ {
 		e := w.ring.cqeAt(head)
@@ -308,7 +315,9 @@ func (w *Worker) holdPostedRecvs() {
 		if cs == nil || cs.closing || cs.generation != decodeGen(ud) || cs.writeEnded.Load() {
 			continue
 		}
-		cs.gateRead = true
+		if f(cs) {
+			return
+		}
 	}
 }
 
@@ -400,14 +409,21 @@ func (w *Worker) closeIdlePaced(now int64) {
 // worker used to shut down at once and cut the request with its conn, unanswered
 // (celeris#1166, as epoll's loop with no HTTP/2 conn did). It now waits for it,
 // bounded as the drain is (drainEnd), with the same gate meanwhile. A request
-// still in the kernel's queue or a recv CQE not reaped is not seen here (the
-// gate's first pass holds those at the floor, when the drain is still on).
-// Worker thread.
+// still in the kernel's queue or a recv CQE not reaped is not seen here
+// (h1UnreadInKernel asks for those inside the floor, the gate's first pass
+// marks them at it: gateRead, counted here). Worker thread.
 func (w *Worker) h1RequestInProgress() bool {
 	for _, fd := range w.liveConns {
 		cs := w.conns[fd]
 		if cs == nil || cs.closing {
 			continue
+		}
+		if cs.gateRead && !cs.writeEnded.Load() {
+			// The gate's first pass found a request that reached the kernel
+			// before it (holdUnreadAtGate, holdPostedRecvs): it is read on and
+			// answered (gateReadsOn), and the worker waits for that. The conn
+			// leaves this walk once it is closing.
+			return true
 		}
 		if !cs.detected {
 			if len(cs.detectAccum) > 0 {
@@ -433,4 +449,65 @@ func (w *Worker) h1RequestInProgress() bool {
 		}
 	}
 	return false
+}
+
+// h1UnreadInKernel reports whether an HTTP/1 conn of the worker has the bytes of
+// a request the worker has not read: in the socket's receive queue (TIOCINQ, a
+// ring whose completions are task work leaves a request there until the next
+// enter) or as a recv CQE with bytes that the reap has not taken. It is the
+// look of the gate's first pass (sweepUnreadAtGate, celeris#1104) without its
+// marks, asked by a worker with nothing to send on its first look at the
+// shutdown: epoll's h1InProgress counts the same bytes, and the worker used to
+// exit with them unserved (celeris#1208). Sockets first, the completion queue
+// second, as the sweep does. A conn the gate would not look at is not asked:
+// closing, a detached stream (its bytes are the application's), HTTP/2, and a
+// fixed-file conn's socket (its slot is no descriptor; its CQE is still seen).
+// Worker thread.
+func (w *Worker) h1UnreadInKernel() bool {
+	for _, fd := range w.liveConns {
+		cs := w.conns[fd]
+		if cs == nil || cs.closing || cs.writeEnded.Load() || !ownsDescriptorNumber(cs) {
+			continue
+		}
+		if cs.detected && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
+			continue
+		}
+		if cs.detected && w.detachedOrBusy(cs) {
+			continue
+		}
+		if q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ); err != nil || q != 0 {
+			return true
+		}
+	}
+	return w.postedRecvs()
+}
+
+// detachedOrBusy reports whether h1UnreadInKernel leaves a detected conn out: a
+// detached stream, or a conn whose dispatch goroutine holds detachMu (inside a
+// handler: a request in progress that h1RequestInProgress sees). Worker thread.
+func (w *Worker) detachedOrBusy(cs *connState) bool {
+	if mu := cs.detachMu; mu != nil {
+		if !mu.TryLock() {
+			return true
+		}
+		defer mu.Unlock()
+	}
+	h := cs.h1State
+	return h == nil || h.Detached.Load()
+}
+
+// postedRecvs reports whether the completion queue holds a recv with bytes for
+// an HTTP/1 conn the gate could still read on (the conns h1UnreadInKernel
+// leaves out are left out here), without marking it (holdPostedRecvs is the
+// marking twin). Worker thread.
+func (w *Worker) postedRecvs() bool {
+	found := false
+	w.eachPostedRecv(func(cs *connState) bool {
+		if cs.detected && (engine.Protocol(cs.protocol.Load()) != engine.HTTP1 || w.detachedOrBusy(cs)) {
+			return false
+		}
+		found = true
+		return true
+	})
+	return found
 }
