@@ -21,7 +21,12 @@ import (
 // headers in pieces), which was dropped, never answered, and cut at the end.
 // std's Shutdown closes the idle conns at once and answers the request of an
 // active conn, so a client of either fails or finishes at once and retries
-// elsewhere. The gate now does the same:
+// elsewhere. The gate now does the same (a conn that has sent nothing is closed
+// at once and never answered; a head in the kernel of a conn the worker was
+// already reading is answered, but not that of a conn whose OnConnect callback
+// was still running, which is closed without an answer; the Server.Shutdown
+// godoc has the contract per engine and
+// test/server/shutdown_conn_shapes_1208_linux_test.go pins it, celeris#1208):
 //
 //   - a conn that is idle, holds nothing queued (user space or the kernel's
 //     send queue) and has no request in progress is closed (closeIdleH1): an

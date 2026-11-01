@@ -647,9 +647,38 @@ func (s *Server) cancelListen() {
 // sent; its connection is closed by the shutdown, at once or when the gate looks
 // at it, 250 ms into a wait), a
 // detached stream (Server-Sent Events, a WebSocket), which the engines end
-// themselves, a hijacked connection, which is the application's, and a
-// connection that has sent nothing yet (it is answered close when its first
-// request is). HTTP/2 connections get GOAWAY instead.
+// themselves, and a hijacked connection, which is the application's. HTTP/2
+// connections get GOAWAY instead.
+//
+// What a connection gets depends on what it has sent when Shutdown begins
+// (celeris#1208, measured on every engine):
+//
+//   - An idle keep-alive connection, which has no request under way, is closed
+//     at once on every engine.
+//   - A request in progress, whose head the server has read, is read on and
+//     answered, with Connection: close as above, on every engine.
+//   - A request head that has reached the kernel without the server having read
+//     it, on a connection the server is already reading (its loop is busy with
+//     another connection's handler, say), is answered, with Connection: close,
+//     on epoll, io_uring and adaptive, as a request in progress is; a head that
+//     reaches the kernel after the engine's gate has looked at the connection is
+//     refused, as above. On a connection whose accept the server has not
+//     finished (its [Config.OnConnect] callback is still running) the head is
+//     answered on epoll and dropped on io_uring: the connection is closed
+//     without an answer. adaptive does what the engine it is running on does,
+//     epoll when it starts. On std, net/http reads the head after Shutdown began
+//     and drops the request: the connection is closed without an answer, and
+//     reset if the request has a body.
+//   - A connection that has sent nothing is not answered on any engine, and a
+//     request it sends once Shutdown has begun is dropped. On epoll, io_uring
+//     and adaptive it is closed at once if the engine has accepted it. By
+//     default the kernel does not hand such a connection to the engine for about
+//     a second (TCP_DEFER_ACCEPT, see [Config.DisableDeferAccept]); while it is
+//     held back Shutdown neither closes it nor lets a request through: its first
+//     request gets a reset. std keeps it open until its first request is read,
+//     which is then dropped as above, or until net/http closes it for being five
+//     seconds old, so a client that connects and sends nothing can hold Shutdown
+//     on std for about five seconds, within ctx.
 //
 // A Shutdown that arrives before the server ever started still latches the
 // shut-down state, so a Start racing it returns instead of parking on a context
