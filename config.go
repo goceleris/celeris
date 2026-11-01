@@ -470,12 +470,14 @@ type Config struct {
 	// block): its write returns an error that wraps os.ErrDeadlineExceeded when the
 	// stream is reset. While an event loop of the server has been in one batch of
 	// events (all the handlers it runs, not one) for half a WriteTimeout (at least
-	// 250 ms, which matters only for a WriteTimeout under 500 ms: at the 60s default
-	// the threshold is 30s), as a synchronous handler that waits for a lock a waiting
-	// handler holds across its response write makes it, or any slow blocking call,
-	// every such wait that has lasted a WriteTimeout is bounded by WriteTimeout in
-	// all, as before: about 1.5 WriteTimeouts from the start of the freeze, whatever
-	// the client reads. The server says so once per episode, in a Warn log line
+	// 2s, which matters only for a WriteTimeout under 4s: at the 60s default the
+	// threshold is 30s; a healthy loop of an overloaded or instrumented host has
+	// batches of a second or two), as a synchronous handler that waits for a lock a
+	// waiting handler holds across its response write makes it, or any slow blocking
+	// call, every such wait that has lasted a WriteTimeout is bounded by WriteTimeout
+	// in all, as before: at most max(WriteTimeout/2, 2s) + WriteTimeout from the start
+	// of the freeze (1.5 WriteTimeouts for a WriteTimeout of 4s or more), whatever the
+	// client reads. The server says so once per episode, in a Warn log line
 	// ("the minimum rate of a pool handler's wait for window is suspended"), and
 	// logs the reason of each such reset at Debug level (rate, or loop-blocked). A
 	// client that stops reading altogether for a WriteTimeout (a pause of 1s at

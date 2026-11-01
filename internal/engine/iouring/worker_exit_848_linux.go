@@ -51,6 +51,10 @@ func (e *Engine) runWatched(ctx context.Context, w *Worker) {
 		// PauseAccept that checked in between.
 		w.exited.Store(true)
 		w.pause.Notify()
+		// A worker that ended inside a batch (a Goexit in a sync handler) has its stamp
+		// set: left, it ages for ever, and every waiting pool handler of the engine
+		// is then bounded by WriteTimeout in all as for a wedge (celeris#1170).
+		w.loopSlot.Leave()
 	}()
 	w.run(ctx)
 	returned = true
