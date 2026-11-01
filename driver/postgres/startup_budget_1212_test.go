@@ -57,8 +57,8 @@ func TestStartupHasWhatTheDialLeftOfConnectTimeout1212(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the startup is still blocked after 2s: it did not end at the budget the dial left")
 	}
-	if got := connectDeadline(time.Now(), Options{}); !got.IsZero() {
-		t.Errorf("connectDeadline with no ConnectTimeout = %v, want the zero time", got)
+	if got := connectDeadline(time.Now(), Options{ConnectTimeout: -1}); !got.IsZero() {
+		t.Errorf("connectDeadline with no timeout = %v, want the zero time", got)
 	}
 }
 

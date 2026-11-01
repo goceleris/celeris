@@ -141,3 +141,43 @@ func TestExplicitConnectTimeoutOverridesTheDefault1212(t *testing.T) {
 		}
 	}
 }
+
+// The DSN parser tells an absent connect_timeout from a written one, and the
+// budget is worked out from that: written N is N seconds, written 0 is none,
+// absent is the default (10 s); in a DSN built in code, zero is "not set" and a
+// negative value is "no timeout".
+func TestEffectiveConnectTimeout1212(t *testing.T) {
+	for _, tc := range []struct {
+		dsn       string
+		want      time.Duration
+		isDefault bool
+	}{
+		{"host=h user=u", defaultConnectTimeout, true},
+		{"postgres://u@h/d", defaultConnectTimeout, true},
+		{"host=h user=u connect_timeout=0", 0, false},
+		{"postgres://u@h/d?connect_timeout=0", 0, false},
+		{"host=h user=u connect_timeout=3", 3 * time.Second, false},
+		{"postgres://u@h/d?connect_timeout=7", 7 * time.Second, false},
+	} {
+		d, err := ParseDSN(tc.dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, isDef := d.Options.effectiveConnectTimeout()
+		if got != tc.want || isDef != tc.isDefault {
+			t.Errorf("%q: budget %v (default %v), want %v (default %v)", tc.dsn, got, isDef, tc.want, tc.isDefault)
+		}
+	}
+	if defaultConnectTimeout != 10*time.Second {
+		t.Errorf("the default is %v, want 10 s", defaultConnectTimeout)
+	}
+	if got, def := (Options{}).effectiveConnectTimeout(); got != defaultConnectTimeout || !def {
+		t.Errorf("Options{}: %v (default %v)", got, def)
+	}
+	if got, def := (Options{ConnectTimeout: -1}).effectiveConnectTimeout(); got != 0 || def {
+		t.Errorf("Options{ConnectTimeout: -1}: %v (default %v), want no timeout", got, def)
+	}
+	if got, _ := (Options{ConnectTimeout: 2 * time.Second}).effectiveConnectTimeout(); got != 2*time.Second {
+		t.Errorf("Options{ConnectTimeout: 2s}: %v", got)
+	}
+}
