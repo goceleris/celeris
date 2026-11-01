@@ -21,6 +21,11 @@ import (
 	"time"
 )
 
+// rpSlotsHold, when set, runs once in the next CLUSTER SLOTS reply, after the
+// table snapshot is taken and before the reply is written: a test holds a read
+// there (its table is already fixed) while the cluster changes.
+var rpSlotsHold atomic.Pointer[func()]
+
 type rpCluster struct {
 	t     *testing.T
 	nodes []*rpNode
@@ -594,6 +599,9 @@ func (cl *rpCluster) writeSlots(w *bufio.Writer) {
 		tab = cl.old
 	}
 	cl.mu.Unlock()
+	if h := rpSlotsHold.Swap(nil); h != nil {
+		(*h)()
+	}
 	type rng struct {
 		lo, hi int
 		o      *rpNode

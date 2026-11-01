@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +83,13 @@ type ClusterClient struct {
 	replicas [16384][]*clusterNode   // slot -> replica nodes
 
 	replicaIdx atomic.Uint64 // round-robin counter for replica selection
+
+	// refMu guards refLast, the latest topology refresh that started (see
+	// refreshTopologySince).
+	refMu   sync.Mutex
+	refLast *topoRefresh
+	// refSeq counts the topology reads that have started (guarded by refMu).
+	refSeq uint64
 
 	closeCh chan struct{}
 	closed  atomic.Bool
@@ -337,23 +345,166 @@ func (c *ClusterClient) anyNode() *clusterNode {
 	return nil
 }
 
+// topoMark is a position in the sequence of topology reads of a ClusterClient:
+// the number of reads that had started when it was taken. A caller takes one at
+// the moment its reason to look arose (topoMark), and may share a read whose
+// sequence number is greater: that read started after the reason, by the
+// order in which reads are registered under refMu. No clock is involved, so the
+// rule is the same on a clock too coarse to tell two instants apart (Windows).
+type topoMark uint64
+
+// topoRefresh is one topology refresh: its sequence number (the order in which
+// reads started) and, once done is closed, how it ended.
+type topoRefresh struct {
+	seq  uint64
+	done chan struct{}
+	err  error
+	// cut is set when it failed while its own caller's context had ended.
+	cut bool
+}
+
+// joinable reports whether a caller that needs a table read after its own
+// trigger may use the outcome of f: f started after that moment (checked by the
+// caller, by sequence number) and either runs, or ended with a table or with a node's failure. A
+// refresh that ended because its own caller's context ended says nothing.
+// The caller holds refMu.
+func (f *topoRefresh) joinable() bool {
+	select {
+	case <-f.done:
+		return !f.cut
+	default:
+		return true
+	}
+}
+
 // refreshTopology queries CLUSTER SLOTS on any live node and rebuilds the
-// slot-to-node mapping, including replica nodes and per-node latency.
+// slot-to-node mapping, including replica nodes and per-node latency. It always
+// reads the table; refreshTopologySince is the variant that may share a read.
 func (c *ClusterClient) refreshTopology(ctx context.Context) error {
-	node := c.anyNode()
-	if node == nil {
-		return errors.New("no live nodes")
+	c.refMu.Lock()
+	f := c.newRefreshLocked()
+	c.refMu.Unlock()
+	return c.runRefresh(ctx, f)
+}
+
+// newRefreshLocked registers a topology read that is about to start: it takes the
+// next sequence number and becomes the latest read. The caller holds refMu.
+func (c *ClusterClient) newRefreshLocked() *topoRefresh {
+	c.refSeq++
+	f := &topoRefresh{seq: c.refSeq, done: make(chan struct{})}
+	c.refLast = f
+	return f
+}
+
+// topoMark returns the position now in the sequence of topology reads: the
+// reads that start from here on are the ones that started after the caller's
+// reason to look.
+func (c *ClusterClient) topoMark() topoMark {
+	c.refMu.Lock()
+	defer c.refMu.Unlock()
+	return topoMark(c.refSeq)
+}
+
+// refreshTopologySince is refreshTopology for a caller that needs a table read
+// that started after mark (taken by topoMark at the moment its reason to look
+// arose): it uses the latest read if that started after mark, running or done,
+// instead of sending its own CLUSTER SLOTS. N PubSubs hit by one slot move, or
+// retrying the same outage, then cost one CLUSTER SLOTS per window in which none
+// of their triggers is newer than the last read, not N (celeris#1203). A read
+// that began before mark is never used: its reply may predate the event. The
+// check and the registration of a new read are one step under refMu, so callers
+// that arrive together start one. "After" is the order of registration under
+// refMu, not a timestamp, so it holds on any clock.
+func (c *ClusterClient) refreshTopologySince(ctx context.Context, mark topoMark) error {
+	for {
+		c.refMu.Lock()
+		f := c.refLast
+		if f == nil || f.seq <= uint64(mark) || !f.joinable() {
+			f = c.newRefreshLocked()
+			c.refMu.Unlock()
+			return c.runRefresh(ctx, f)
+		}
+		c.refMu.Unlock()
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if ctx.Err() == nil && f.cut {
+			continue // the one we joined was cut short by its own caller: read again
+		}
+		return f.err
 	}
-	v, err := node.client.Do(ctx, "CLUSTER", "SLOTS")
-	if err != nil {
-		node.failing.Store(true)
-		return err
+}
+
+// runRefresh reads the table on behalf of f and publishes the outcome.
+func (c *ClusterClient) runRefresh(ctx context.Context, f *topoRefresh) error {
+	// Closed on a panic too, so joiners are not left waiting for a read that
+	// will never end (the panic goes on to the caller).
+	defer close(f.done)
+	f.err = c.readTopology(ctx)
+	f.cut = f.err != nil && ctx.Err() != nil
+	return f.err
+}
+
+// topologyProbes is how many nodes one topology read asks before it gives up.
+const topologyProbes = 3
+
+// readTopology is one CLUSTER SLOTS round trip and applyTopology. It asks a
+// node anyNode picks; if that one fails (a node that is down and not yet marked
+// failing is found out by the first read that meets it) and the caller's context
+// is still alive, it asks the next node that was not tried, preferring the ones
+// not marked failing, up to topologyProbes. One failed read is shared by every
+// caller it serves (see refreshTopologySince), so it must not be lost to a node
+// the others could have come from.
+func (c *ClusterClient) readTopology(ctx context.Context) error {
+	var tried []*clusterNode
+	var lastErr error
+	for range topologyProbes {
+		node := c.probeNode(tried)
+		if node == nil {
+			break
+		}
+		tried = append(tried, node)
+		v, err := node.client.Do(ctx, "CLUSTER", "SLOTS")
+		if err != nil {
+			node.failing.Store(true)
+			lastErr = err
+			if ctx.Err() != nil {
+				return err
+			}
+			continue
+		}
+		node.failing.Store(false)
+		if v.Type != protocol.TyArray {
+			return fmt.Errorf("CLUSTER SLOTS: unexpected reply type %s", v.Type)
+		}
+		return c.applyTopology(ctx, v)
 	}
-	node.failing.Store(false)
-	if v.Type != protocol.TyArray {
-		return fmt.Errorf("CLUSTER SLOTS: unexpected reply type %s", v.Type)
+	if lastErr != nil {
+		return lastErr
 	}
-	return c.applyTopology(ctx, v)
+	return errors.New("no live nodes")
+}
+
+// probeNode returns the node a topology read asks next: not one of tried,
+// preferring a node not marked failing; nil if there is none.
+func (c *ClusterClient) probeNode(tried []*clusterNode) *clusterNode {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var failing *clusterNode
+	for _, n := range c.nodes {
+		if slices.Contains(tried, n) {
+			continue
+		}
+		if !n.failing.Load() {
+			return n
+		}
+		if failing == nil {
+			failing = n
+		}
+	}
+	return failing
 }
 
 // applyTopology rebuilds the slot-to-node mapping from a CLUSTER SLOTS reply.
