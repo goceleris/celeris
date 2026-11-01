@@ -58,14 +58,20 @@ jobs:
   coverage:
     name: Coverage (root + middleware sub-modules)
     runs-on: ubuntu-latest
-    # 40: the root step may run 540 s twice (the other packages, then ./test/server,
-    # each with its own -timeout=540s), the iouring step up to 600 s and the four
-    # middleware steps up to 120 s each, which is 36 min at their own limits before
-    # checkout and setup-go (it was 30 before ./test/server got an invocation of
-    # its own, and 40 while the root step's limit was 1200 s). The job takes about
-    # 20 min (19.5 to 19.8 min in runs 39408130885, 39404206705 and 39331135786),
-    # the iouring step 411 to 437 s of it (see its comment below). Refs #890.
-    timeout-minutes: 40
+    # 45: each go test binary has its own -timeout, and a multi-package invocation can
+    # run longer than that, so the step limits do not add up to a bound: the root step's
+    # first invocation took 765 to 866 s of wall time (runs 41259965862, 41262675953 and
+    # 41268784922) for binaries of at most 401.0 s (epoll) and 322.8 s (./test/server),
+    # the rest being builds and the packages queued behind the slowest. At their own
+    # limits the steps are 600 s and 540 s (the root step's two invocations: the other
+    # packages, then ./test/server), 780 s (iouring) and 4 x 120 s (middleware), 40 min
+    # (it was 36 min of 40 before the root step went to 600 s and the iouring step to
+    # 780 s, 30 before ./test/server got an invocation of its own, and 40 while the root
+    # step's limit was 1200 s). The job takes 22.6 to 24.8 min on main (seven runs from
+    # 5aecd53 to 86981b3; 19.5 to 19.8 min in runs 39408130885, 39404206705 and
+    # 39331135786 earlier), the iouring step 516 to 538 s of it (see its comment below).
+    # 45 min covers the job and one hung binary (at most about 260 s more). Refs #890.
+    timeout-minutes: 45
     env:
       # ci.yml's unit selection (see "Same packages as ci.yml" below).
       COVER_EXCLUDE: "/test/|/adaptive($|/)|/middleware/websocket($|/)"
@@ -156,23 +162,33 @@ jobs:
           # of its timeout) and without -race, with the clock skewed by +1 h, in the canary
           # step of the unit job.
           skip="$skip|^TestEngineTimeoutsIgnoreAStepOfTheWallClock1178$"
-          # -timeout=540s: the tests that stay here took 176.4 s under coverage on the
-          # runner (run 38348908034; 620.8 s for the whole package before the shards,
-          # run 38327908174), so 540 s keeps a margin of 3x. A new root test that is
-          # in no shard lands here until it is listed in .github/root-test-shards.txt.
-          # Refs #890.
+          # -timeout=600s for the other packages: the tests that stay in the root package
+          # took 176.4 s under coverage on the runner (run 38348908034; 620.8 s for the
+          # whole package before the shards, run 38327908174), but the longest binary of
+          # this invocation is internal/engine/epoll: 360.9 to 401.0 s (median 381.9 s,
+          # 90th percentile 391.3 s in the first fourteen) in the Coverage runs on main from
+          # 1002dcb (2026-10-30) to 86981b3 (2026-11-01; 401.0 s in run 41268784922), of the
+          # 540 s that were here before: 35% over the longest. 600 s is 50% over 401.0 s.
+          # -timeout applies to each test binary. A new root test that is in no shard lands here until it is listed in
+          # .github/root-test-shards.txt. timeout-headroom.sh prints the longest
+          # package's share of the timeout and warns above 75% (450 s). Refs #890.
+          # ./test/server, below, took 302.6 to 322.8 s of its 540 s (67% over the longest).
+          root_timeout=600
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
-          go test -race -count=1 -timeout=540s -covermode=atomic -skip "$skip" \
-            -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
+          go test -race -count=1 -timeout="${root_timeout}s" -covermode=atomic -skip "$skip" \
+            -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs 2>&1 | tee /tmp/cover-root.log
+          .github/scripts/timeout-headroom.sh /tmp/cover-root.log "$root_timeout"
           # The root package's tests of the exported API, in ./test/server. -coverpkg
           # puts their coverage on the root package, where it was counted while they sat
           # in the root directory; its own invocation keeps the other packages' numbers
           # per package. A second profile of the same upload (the root upload below
           # names both files), so the upload count stays what codecov.yml waits for.
           # -p 1 is moot with one package; the skip regex is the same as above.
-          go test -race -count=1 -timeout=540s -covermode=atomic -skip "$skip" \
+          server_timeout=540
+          go test -race -count=1 -timeout="${server_timeout}s" -covermode=atomic -skip "$skip" \
             -coverpkg=github.com/goceleris/celeris \
-            -coverprofile="$RUNNER_TEMP/cover-root-server.out" "$COVER_SERVER_STEP"
+            -coverprofile="$RUNNER_TEMP/cover-root-server.out" "$COVER_SERVER_STEP" 2>&1 | tee /tmp/cover-server.log
+          .github/scripts/timeout-headroom.sh /tmp/cover-server.log "$server_timeout"
       # ./internal/engine/iouring on its own, as ci.yml's unit job runs it.
       # io_uring charges ring memory to the user, so every test process of the
       # runner user shares one 8 MiB memlock budget. In the root step, the
@@ -182,18 +198,24 @@ jobs:
       # the packages are disjoint, so the blocks are appended after the mode
       # line.
       #
-      # -timeout=600s, the unit job's own for this package. Under -race and
+      # -timeout=780s, the unit job's own for this package. Under -race and
       # -covermode=atomic the package took 291.9 s on main (61ea3cb) and 296.7 s
       # on celeris#990's branch, of a 300 s timeout; the celeris#895/#896 tests
       # add about 12 s, and the run ended in a timeout panic. 309.9 s on main
       # (3cfee4b) and 341.7 s with celeris#811's tests (PR #994 at 5adaf15: the
       # WriteTimeout bound test alone is about 16 s), of 420 s: under 25%
-      # margin, so 480 s (40%). Since then it has grown to 410.8 to 426.2 s in seven
+      # margin, so 480 s (40%). It then grew to 410.8 to 426.2 s in seven
       # Coverage runs on main from 13fa176 (2026-10-18) to 6ab5c28 (2026-10-20)
       # (run 39331135786: 425.6 s), and 437.3 s in an eighth (run 39334596754,
       # which failed on a test, not on the timeout): 480 s was 10% over that, 600 s
-      # is 37% over (celeris#890 item 66; the unit job's step has the same limit
-      # and its figures).
+      # was 37% over (celeris#890 item 66). Since celeris#1178 moved the stepped-clock
+      # test out (with it this step took 594.96 s of 600 s): 515.9 to 537.6 s (median
+      # 523.9 s, 90th percentile 531.9 s) in the fourteen Coverage runs on main from
+      # 1002dcb (2026-10-30) to 64fe9e5 (2026-11-01; 525.1 s in run 41262675953;
+      # 537.6 s in run 41219055572), which left 600 s 12% over the longest. 780 s is
+      # 45% over 537.6 s. The unit job's step has the same limit and its figures
+      # (ci.yml: no handful of tests dominates the package, so the step raises its
+      # timeout and warns above 75% of it, 585 s, with timeout-headroom.sh).
       - name: internal/engine/iouring (own step, ci.yml unit set)
         run: |
           set -o pipefail
@@ -201,8 +223,10 @@ jobs:
           # celeris#1178: the engines' stepped-clock test (80 s under -race; with it this step
           # took 594.96 s of 600 s) is skipped by name; ci.yml runs it in the base-tier job and
           # in the canary step.
-          go test -race -count=1 -timeout=600s -covermode=atomic -skip '^TestEngineTimeoutsIgnoreAStepOfTheWallClock1178$' \
-            -coverprofile="$RUNNER_TEMP/cover-iouring.out" ./internal/engine/iouring/
+          iouring_timeout=780
+          go test -race -count=1 -timeout="${iouring_timeout}s" -covermode=atomic -skip '^TestEngineTimeoutsIgnoreAStepOfTheWallClock1178$' \
+            -coverprofile="$RUNNER_TEMP/cover-iouring.out" ./internal/engine/iouring/ 2>&1 | tee /tmp/cover-iouring.log
+          .github/scripts/timeout-headroom.sh /tmp/cover-iouring.log "$iouring_timeout"
           root="$RUNNER_TEMP/cover-root.out"
           own="$RUNNER_TEMP/cover-iouring.out"
           if [ "$(head -n1 "$own")" != "$(head -n1 "$root")" ]; then
