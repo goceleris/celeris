@@ -459,3 +459,38 @@ func TestNewSaysOnceThatAProbeCouldNotRun1200(t *testing.T) {
 		t.Errorf("a probe that ran fine said it could not: %q", lines.buf.String()[before:])
 	}
 }
+
+// TestAsyncCancelProbeSecondWaitIsPositive1200: the cancel probe's second wait
+// is given the time that is left, and that time was read after the check that
+// there was some: a wait that came back a few nanoseconds before the deadline
+// could be followed by one with a zero or negative timespec (EINVAL, or an
+// instant return, and the probe called that no answer). The first wait of each
+// run here comes back empty 30 ns before its time is up, 100 times; no wait
+// may be asked for less than a nanosecond. The window is nanoseconds wide, so
+// this is a guard that is likely, not certain, to fail without the clamp.
+func TestAsyncCancelProbeSecondWaitIsPositive1200(t *testing.T) {
+	requireRing1200(t)
+	swap1200(t, &asyncCancelProbeSubmit, func(*Ring) (int, error) { return 0, nil })
+	swap1200(t, &asyncCancelProbeTimeout, 300*time.Microsecond)
+	var waits int
+	var asked []time.Duration
+	swap1200(t, &asyncCancelProbeWait, func(r *Ring, d time.Duration) error {
+		waits++
+		asked = append(asked, d)
+		if waits == 1 {
+			for end := time.Now().Add(d - 30*time.Nanosecond); time.Now().Before(end); {
+			}
+			return nil
+		}
+		return r.SubmitAndWaitTimeout(d)
+	})
+	for i := 0; i < 100; i++ {
+		waits = 0
+		probeAsyncCancel(cancelAll)
+	}
+	for _, d := range asked {
+		if d <= 0 {
+			t.Fatalf("a wait was asked for %v: the time left after the check must be positive", d)
+		}
+	}
+}

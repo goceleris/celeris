@@ -325,8 +325,10 @@ func probeWaitCQE(r *Ring, budget time.Duration) (head, tail uint32, empty int, 
 // run with no answer is probeExpired: the negative for this engine, kept for
 // the process after probeMaxExpiredRuns such runs. The wait for SEND_ZC's
 // notification is not retried: the send completed with F_MORE and the
-// notification did not come, which is how an ENA NIC answers (SendZCBroken),
-// and a retry would add its 2 s to every startup on such a host.
+// notification did not come, which is how the AWS 6.17 kernel answers
+// (SendZCBroken; commit 39a7ce1 recorded it on virtual and metal alike, and the
+// probe sends over loopback, so no NIC takes part), and a retry would add its
+// 2 s to every startup on such a host.
 func probeRetryNoAnswer[R any](once func() (R, string, probeOutcome)) (R, string, probeOutcome) {
 	res, why, out := once()
 	if out == probeExpired {
@@ -391,10 +393,11 @@ func (r SendZCProbeResult) String() string {
 // Returns a detailed result describing whether SEND_ZC is functional and
 // whether true zero-copy is achieved.
 //
-// On loopback, the result is always SendZCCopyFallback (kernel copies data,
-// no DMA). On a real NIC with working zero-copy support, the result is
-// SendZCTrueZeroCopy. On ENA (AWS), the result is SendZCBroken because
-// the notification CQE never arrives.
+// The probe sends over loopback (127.0.0.1) and never through a NIC, so a
+// working kernel copies the data (no DMA) and the result is SendZCCopyFallback.
+// On the AWS 6.17 kernel (commit 39a7ce1) the result is SendZCBroken because the
+// notification CQE is never posted: that is the kernel's behaviour, not a
+// driver's.
 func probeSendZC() (SendZCProbeResult, string) {
 	res, why, _ := probeSendZCRun()
 	return res, why
@@ -907,16 +910,19 @@ func probeAsyncCancel(cancelFlags uint32) (asyncCancelProbe, string) {
 	if head == tail {
 		timeout := asyncCancelProbeTimeout
 		deadline := time.Now().Add(timeout)
-		for waits := 1; ; waits++ {
-			if err := asyncCancelProbeWait(ring, time.Until(deadline)); err != nil {
+		for waits, left := 1, timeout; ; waits++ {
+			if err := asyncCancelProbeWait(ring, left); err != nil {
 				return asyncCancelNoAnswer, "SubmitAndWaitTimeout failed: " + err.Error()
 			}
 			if head, tail = ring.BeginCQ(); head != tail {
 				break
 			}
 			// An early return with nothing to read is a wait a signal cut
-			// short: wait once more, for the rest of the time.
-			if waits == 2 || !time.Now().Before(deadline) {
+			// short: wait once more, for the rest of the time. That time is
+			// read once, checked and passed as it was checked: a zero or
+			// negative timespec would make the wait return at once, or EINVAL
+			// (probeWaitCQE does the same).
+			if left = time.Until(deadline); waits == 2 || left <= 0 {
 				return asyncCancelNoAnswer, fmt.Sprintf("no CQE produced for the cancel (waited %v, %d wait(s))", timeout, waits)
 			}
 		}
