@@ -664,16 +664,14 @@ func (s *Server) cancelListen() {
 //   - A request in progress, whose head the server has read, is read on and
 //     answered, with Connection: close as above, on every engine.
 //   - A request head that has reached the kernel without the server having read
-//     it is answered, with Connection: close, on epoll, and on io_uring while its
-//     worker has a response going out or a request in progress when it sees the
-//     Shutdown. An io_uring worker with neither exits at once, and such a
-//     connection is closed without an answer (for instance one whose head
-//     arrived while the loop was held in another connection's [Config.OnConnect]
-//     callback). A head that reaches the kernel after the engine's gate has
-//     looked at the connection is refused, as above. On std net/http reads the
-//     head after Shutdown began and drops the request: the connection is closed
-//     without an answer, and reset if body bytes are still unread (a small body,
-//     2 KiB measured, is read with the head and the close is a FIN; 64 KiB gave a
+//     it is answered, with Connection: close, on epoll, io_uring and adaptive, as
+//     a request in progress is (also for a connection whose head arrived while
+//     the loop was held in another connection's [Config.OnConnect] callback); a
+//     head that reaches the kernel after the engine's gate has looked at the
+//     connection is refused, as above. On std net/http reads the head after
+//     Shutdown began and drops the request: the connection is closed without an
+//     answer, and reset if body bytes are still unread (a small body, 2 KiB
+//     measured, is read with the head and the close is a FIN; 64 KiB gave a
 //     reset).
 //   - A connection that has sent nothing is not answered by std, or by epoll and
 //     an io_uring worker with no response going out, and a request it sends once
