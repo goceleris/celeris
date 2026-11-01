@@ -2041,7 +2041,8 @@ func (w *Worker) run(ctx context.Context) {
 		//     legit traffic (observability+static_swagger_proxy) the
 		//     0x3FF gate is too coarse and the walker times out before
 		//     the sweep notices. Tightening to 0x1F caps the worst-case
-		//     close latency on a dropped arm to ~50ms.
+		//     close latency on a dropped arm to 32 iterations: about 0.8 s
+		//     on an idle worker (25 ms waits), less on a busy one.
 		w.tickCounter++
 		gate := uint32(0x3FF)
 		if w.detachedCount > 0 || w.cfg.ReadHeaderTimeout > 0 {
@@ -2453,6 +2454,21 @@ func (w *Worker) handleHeaderTimer(fd int) {
 	if cs.closing {
 		return
 	}
+	// A conn whose protocol is not decided yet has no H1 state: its deadline is
+	// detectDeadline, armed at accept (handleAccept), and cs.detected and the
+	// deadline are the worker's own, so no lock is needed (celeris#974). Past it
+	// the conn is closed as the sweep closes it; a timer that came early is armed
+	// again. Once the protocol is decided the deadline is the H1 state's, below.
+	if !cs.detected {
+		if dd := cs.detectDeadline; dd > 0 {
+			if mono.Now() >= dd {
+				w.closeConn(fd)
+			} else {
+				w.armHeaderTimerAt(cs, dd)
+			}
+		}
+		return
+	}
 	// Snapshot under detachMu — same TOCTOU as checkTimeouts (celeris#548) and
 	// the same TryLock for the same reason (celeris#593): this runs on the
 	// LockOSThread'd worker, and runAsyncHandler holds detachMu for the whole
@@ -2461,9 +2477,9 @@ func (w *Worker) handleHeaderTimer(fd int) {
 	if !ok {
 		// detachMu held ⇒ the conn is inside its handler, not waiting for a
 		// request line, so the header deadline cannot be live. Dropping this
-		// timer costs nothing: checkTimeouts re-reads HeaderDeadlineNs on its
-		// ~50ms slowloris cadence and is the documented fallback for a timer
-		// that failed to arm. Re-arming here instead would spin — the spec's
+		// timer costs nothing: checkTimeouts re-reads HeaderDeadlineNs at its
+		// sweep (about every 0.8 s on an idle worker, sweepFloor on a busy
+		// one) and is the documented fallback for a timer that failed to arm. Re-arming here instead would spin — the spec's
 		// deadline has already passed, so the fresh timer would fire at once.
 		return
 	}
@@ -2771,6 +2787,25 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		// checkTimeouts instead of living on the activity stamp each of its
 		// bytes refreshes (celeris#974).
 		cs.detectDeadline = now + int64(w.cfg.ReadHeaderTimeout)
+		// The kernel holds the deadline, as it does for a conn whose protocol is
+		// fixed (initProtocol): a sweep comes about every 0.8 s on an idle
+		// worker, so a conn that stays silent was closed up to that late
+		// (celeris#1189). The timer is the one initProtocol would arm at
+		// detection, for the same instant (ArmHeaderDeadlineAt(detectDeadline)),
+		// so an HTTP/1 conn costs no SQE more than before; an HTTP/2 conn costs
+		// one, which fires once and does nothing (handleHeaderTimer). With no SQE
+		// to be had the arm is skipped and the sweep is the fallback, as for a
+		// timer the ring dropped.
+		w.armHeaderTimerAt(cs, cs.detectDeadline)
+		// The arm closes the conn when the budget is spent already: detectDeadline
+		// comes from the batch's clock, which is older than ReadHeaderTimeout when an
+		// OnConnect hook, or a slow inline handler earlier in the batch, ran long. A
+		// closed conn is given nothing: a recv on it would name a descriptor number
+		// that is released, on a connState queued for release, and nothing would
+		// account for it (celeris#685, celeris#256). As handleRecv does after its arm.
+		if w.conns[newFD] != cs || cs.closing {
+			return
+		}
 	}
 	if !w.prepareRecv(cs, cs.buf) {
 		cs.needsRecv = true
@@ -3829,6 +3864,13 @@ func (w *Worker) initProtocol(cs *connState) {
 			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
 			// only stamped HeaderDeadlineNs, not the SQE.
 			w.armHeaderTimer(cs)
+		}
+		// The timer of the budget was armed at the accept (handleAccept), so the
+		// arms above found it in flight and did not look at the clock. Look, so
+		// that a budget that is spent by now ends the conn here, the last thing
+		// done to it, as the arm did when it was the first (celeris#974).
+		if dd := cs.detectDeadline; dd > 0 && cs.headerTimerArmed && mono.Now() >= dd {
+			w.closeConn(cs.fd)
 		}
 	case engine.H2C:
 		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, w.wakeFD)
@@ -7819,8 +7861,19 @@ var testHookCheckTimeouts atomic.Pointer[func(*Worker)]
 // 2 s on a worker with no listener; the gate alone was 1.6 s with a detached
 // conn and about 102 s with none). While the worker waits without a timeout for a
 // SEND's completion (waitUntimed) no iteration runs; the standing timer
-// (armSweepTick) ends that wait within sweepCeiling. This
-// replaces the timer wheel: instead of allocating entries and updating maps
+// (armSweepTick) ends that wait within sweepCeiling.
+//
+// What rides on the sweep, and so is enforced up to one sweep period late (a
+// period of about 0.8 s on an idle worker: measured 0.83 s, celeris#1189): the
+// idle, read and write timeouts, the WebSocket idle deadline, the HTTP/2
+// deadlines, and the closing drain. The HTTP/1 header deadline and the budget of
+// a conn whose protocol is not decided yet (detectDeadline) have a timer of
+// their own in the kernel (armHeaderTimer, armed at the accept for the latter)
+// and are met within milliseconds; the sweep is their fallback for a timer the
+// ring could not take. epoll's sweep is a 25 ms timerfd, so it is late by at most
+// that when ReadHeaderTimeout is set.
+//
+// This replaces the timer wheel: instead of allocating entries and updating maps
 // on every recv/send, we store a single lastActivity timestamp on the
 // connState and scan here.
 //

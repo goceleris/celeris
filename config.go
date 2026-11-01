@@ -274,6 +274,18 @@ type Config struct {
 	// IdleTimeout (alone, as net/http's idle timer) from the last stream
 	// activity, which those frames do not move. A response the client does not
 	// take, from a client that keeps sending frames, is not bounded by ReadTimeout.
+	//
+	// The native engines look at ReadTimeout, IdleTimeout and WriteTimeout in a
+	// sweep of their connections, so one is enforced up to a sweep period after
+	// its time: 25 ms on epoll when ReadHeaderTimeout is set (the default), and on
+	// io_uring about 0.8 s (0.83 s measured on an idle worker; about 1 s with
+	// ReadHeaderTimeout off). With ReadHeaderTimeout off epoll has no such timer and
+	// looks much more rarely (a 1 s IdleTimeout closed an idle connection at 3 to 6 s
+	// in measurement). A timeout of a few seconds or less is approximate by that
+	// much on io_uring. The HTTP/1 header deadline, and the budget of a connection
+	// whose protocol is not decided yet, have a timer of their own on io_uring and
+	// are not; the HTTP/2 header-block bound of ReadHeaderTimeout is checked by the
+	// sweep and is late by up to a sweep period.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This
@@ -293,6 +305,17 @@ type Config struct {
 	// accept, which with TCP_DEFER_ACCEPT (see DisableDeferAccept) is the
 	// connection's first byte or about a second after its SYN, whichever
 	// comes first; std counts from the handshake.
+	//
+	// So the bound on a connection that sends nothing is its connect, plus
+	// about one second of deferral on epoll, io_uring and adaptive (measured
+	// 1.00 to 1.07 s), plus ReadHeaderTimeout, plus
+	// the lateness of the engine's check: about 30 ms on epoll (a 25 ms timer)
+	// and on io_uring (a timer of the connection's own), measured on docker
+	// arm64 with 2 CPUs. With DisableDeferAccept the deferral is gone: a silent
+	// connection is closed at ReadHeaderTimeout from its connect, and a
+	// ReadHeaderTimeout of one second closed it at 1.00 to 1.03 s. The HTTP/2
+	// header-block bound below is checked by the engine's sweep, not by a timer,
+	// and is late by up to a sweep period (see ReadTimeout).
 	//
 	// On HTTP/2 (epoll, io_uring, adaptive) it also bounds a header block: one
 	// that begins with a HEADERS frame without END_HEADERS and is not complete this
