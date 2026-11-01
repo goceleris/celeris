@@ -244,7 +244,28 @@ func (c *memcachedConn) handshake(ctx context.Context) error {
 	}
 	hctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// A direct conn waits in a socket read that does not look at a context (only
+	// at the deadline execBinaryDirect set from it), so the end of the caller's
+	// context, a cancellation too, wakes the read.
+	var stopWake func()
+	if c.useDirect {
+		stopWake = c.wakeReadOnDone(hctx)
+	}
 	err := c.runHandshake(hctx)
+	if stopWake != nil {
+		stopWake()
+	}
+	if err != nil && errors.Is(err, os.ErrDeadlineExceeded) && (ctx.Err() != nil || callerFirst) {
+		// The caller's context ended the handshake (its deadline can fire on the
+		// socket a hair before the context reports it): its error, not a bare
+		// "i/o timeout" that matches neither context.Canceled nor
+		// context.DeadlineExceeded.
+		cerr := ctx.Err()
+		if cerr == nil {
+			cerr = context.DeadlineExceeded
+		}
+		return fmt.Errorf("%w: %w", cerr, err)
+	}
 	if err != nil && !callerFirst && ctx.Err() == nil && (hctx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded)) {
 		// The direct path reports the socket's deadline (it can fire a hair
 		// before hctx's timer), the others the context's.
@@ -254,6 +275,34 @@ func (c *memcachedConn) handshake(ctx context.Context) error {
 		return fmt.Errorf("celeris-memcached: handshake timed out after %v: %w: %w", timeout, context.DeadlineExceeded, err)
 	}
 	return err
+}
+
+// wakeReadOnDone arranges that, when ctx ends, the socket of a direct conn gets a
+// deadline of "now", which wakes a read blocked on a silent server (celeris#1213;
+// a direct conn does not watch its context's cancellation, only its deadline). The
+// returned func disarms it; it also undoes a wake that raced with a handshake that
+// had just succeeded, so the conn is not left with a deadline in the past.
+func (c *memcachedConn) wakeReadOnDone(ctx context.Context) (disarm func()) {
+	var mu sync.Mutex
+	fired, done := false, false
+	tcp := c.tcp // Close sets c.tcp to nil
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !done {
+			fired = true
+			_ = tcp.SetDeadline(time.Now())
+		}
+	})
+	return func() {
+		stop()
+		mu.Lock()
+		defer mu.Unlock()
+		done = true
+		if fired && !c.closed.Load() {
+			_ = tcp.SetDeadline(time.Time{})
+		}
+	}
 }
 
 // runHandshake is the binary handshake without the bound: a VERSION round trip.

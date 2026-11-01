@@ -13,7 +13,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -181,8 +180,8 @@ func TestBinaryHandshakeKeepsTheCallersShorterDeadline1213(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("still blocked after 2s: the caller's own deadline did not end the handshake")
 			}
-			if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrDeadlineExceeded) {
-				t.Fatalf("err = %v, want a deadline error", err)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("err = %v, want one matching context.DeadlineExceeded (also on the direct path)", err)
 			}
 			if strings.Contains(err.Error(), "handshake timed out") {
 				t.Fatalf("err = %v: the caller's own deadline is reported as the driver's DialTimeout", err)
@@ -212,13 +211,11 @@ func TestClientBoundsTheBinaryHandshake1213(t *testing.T) {
 
 // A caller that cancels its context during the handshake gets its own
 // cancellation back, not relabelled as the driver's bound, and the half-open conn
-// is closed (the server sees the end of stream). The direct path does not watch a
-// context's cancellation (only its deadline), so it is not in the cases.
+// is closed (the server sees the end of stream). This includes the direct path,
+// the one the pool uses: it ends at the cancel, not at DialTimeout, and the error
+// matches context.Canceled, not a bare i/o timeout.
 func TestBinaryHandshakeKeepsTheCallersCancellation1213(t *testing.T) {
 	for _, p := range dialPaths(t) {
-		if p.name == "direct" {
-			continue
-		}
 		t.Run(p.name, func(t *testing.T) {
 			t.Parallel()
 			addr, closed := startSilentServer(t)
@@ -226,7 +223,14 @@ func TestBinaryHandshakeKeepsTheCallersCancellation1213(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			time.AfterFunc(200*time.Millisecond, cancel)
 			start := time.Now()
-			err := p.dial(ctx, cfg)
+			done := make(chan error, 1)
+			go func() { done <- p.dial(ctx, cfg) }()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("still blocked 2s after the cancel: the caller's cancellation did not end the handshake")
+			}
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("err = %v, want context.Canceled", err)
 			}
