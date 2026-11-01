@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -479,16 +480,26 @@ func TestNewSaysOnceThatAProbeCouldNotRun1200(t *testing.T) {
 	if _, err := New(cfg, transplantTestHandler{}); err != nil {
 		t.Fatalf("second New with the probes failing: %v", err)
 	}
-	total := 0
-	for _, name := range []string{"SEND_ZC", "fixed files", "provided buffers", "multishot accept"} {
+	// The probes New runs are the ones the host's profile has the feature for
+	// (a run capped to a lower tier, CELERIS_MAX_IOURING_TIER, runs fewer or
+	// none); a probe that did not run cannot say it could not.
+	prof := probe.Probe()
+	byProbe := map[string]bool{"SEND_ZC": prof.SendZC, "fixed files": prof.FixedFiles,
+		"provided buffers": prof.ProvidedBuffers, "multishot accept": prof.MultishotAccept}
+	total, ran := 0, 0
+	for name, ranHere := range byProbe {
 		n := lines.count(name)
-		if n > 1 {
-			t.Errorf("probe %q: %d lines say it could not run after two engines, want at most 1: %q", name, n, lines.buf.String())
+		if n > 1 || n == 1 && !ranHere {
+			t.Errorf("probe %q (run by New: %v): %d lines say it could not run after two engines, want 1 if it ran and none if not: %q",
+				name, ranHere, n, lines.buf.String())
 		}
 		total += n
+		if ranHere {
+			ran++
+		}
 	}
-	if total == 0 {
-		t.Errorf("no probe could not run line after a New with every ring failing: %q", lines.buf.String())
+	if ran > 0 && total == 0 {
+		t.Errorf("no \"could not run\" line after a New with every ring failing, with %d probe(s) run: %q", ran, lines.buf.String())
 	}
 
 	restore()
