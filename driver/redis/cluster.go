@@ -77,10 +77,13 @@ var ErrClusterMaxRedirects = errors.New("celeris-redis: cluster max redirects ex
 type ClusterClient struct {
 	cfg ClusterConfig
 
-	mu       sync.RWMutex
-	nodes    map[string]*clusterNode // addr -> node
-	slots    [16384]*clusterNode     // slot -> primary node
-	replicas [16384][]*clusterNode   // slot -> replica nodes
+	mu    sync.RWMutex
+	nodes map[string]*clusterNode // addr -> node
+	// topoApplied is the registration number of the read whose table is in
+	// slots (guarded by mu; see applyTopology).
+	topoApplied uint64
+	slots       [16384]*clusterNode   // slot -> primary node
+	replicas    [16384][]*clusterNode // slot -> replica nodes
 
 	replicaIdx atomic.Uint64 // round-robin counter for replica selection
 
@@ -538,7 +541,7 @@ func (c *ClusterClient) runRefresh(ctx context.Context, f *topoRefresh) error {
 	// Closed on a panic too, so joiners are not left waiting for a read that
 	// will never end (the panic goes on to the caller).
 	defer close(f.done)
-	f.err = c.readTopology(ctx)
+	f.err = c.readTopology(ctx, f.seq)
 	f.cut = f.err != nil && ctx.Err() != nil
 	if !f.cut {
 		c.refMu.Lock()
@@ -558,7 +561,7 @@ const topologyProbes = 3
 // not marked failing, up to topologyProbes. One failed read is shared by every
 // caller it serves (see refreshTopologySince), so it must not be lost to a node
 // the others could have come from.
-func (c *ClusterClient) readTopology(ctx context.Context) error {
+func (c *ClusterClient) readTopology(ctx context.Context, seq uint64) error {
 	var tried []*clusterNode
 	var lastErr error
 	for range topologyProbes {
@@ -580,7 +583,7 @@ func (c *ClusterClient) readTopology(ctx context.Context) error {
 		if v.Type != protocol.TyArray {
 			return fmt.Errorf("CLUSTER SLOTS: unexpected reply type %s", v.Type)
 		}
-		return c.applyTopology(ctx, v)
+		return c.applyTopology(ctx, v, seq)
 	}
 	if lastErr != nil {
 		return lastErr
@@ -611,13 +614,25 @@ func (c *ClusterClient) probeNode(tried []*clusterNode) *clusterNode {
 // applyTopology rebuilds the slot-to-node mapping from a CLUSTER SLOTS reply.
 // It is the part of refreshTopology that runs under c.mu, split out so a test
 // can run it at the moment a Close has just returned.
-func (c *ClusterClient) applyTopology(ctx context.Context, v *Value) error {
+func (c *ClusterClient) applyTopology(ctx context.Context, v *Value, seq uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// closeNodes leaves c.nodes nil: a refresh whose reply came before Close
 	// gets here after it, and must neither dial nor write into the nil map.
 	if c.nodes == nil {
 		return ErrClosed
+	}
+	// A read registered before the one whose table is in place answers about an
+	// older moment, whatever order they ended in: its table is dropped, so it
+	// cannot put a slot back where it was before a move (celeris#1219). seq is the
+	// read's registration number (topoRefresh.seq); 0 is "unordered" and always
+	// applies. The order is that of registration, not of the requests reaching the
+	// server, which is the best a client can tell without a clock.
+	if seq != 0 {
+		if seq < c.topoApplied {
+			return nil
+		}
+		c.topoApplied = seq
 	}
 
 	wantReplicas := c.cfg.ReadOnly || c.cfg.RouteByLatency

@@ -455,6 +455,11 @@ var ErrSentinelUnhealthy = errors.New("celeris-redis: sentinel client unhealthy,
 // On dial failure, it retries 3 times with exponential backoff. If all retries
 // fail, the client is marked unhealthy and returns errors until the next
 // successful +switch-master.
+//
+// It is called only from watchFailover, which subscribeLoop runs inline, so the
+// notifications are handled one at a time in the order they were delivered: a
+// slow dial of an older failover cannot install its client after a newer one (the
+// ordering problem of celeris#1219 does not exist on this path).
 func (s *SentinelClient) handleSwitchMaster(payload string) {
 	// watchFailover's select between a queued message and closeCh picks at
 	// random, so this can run after Close: make no dial for a closed client.
