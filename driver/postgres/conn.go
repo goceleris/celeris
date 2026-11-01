@@ -1075,8 +1075,7 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	dialStart := time.Now()
-	dialer := net.Dialer{Timeout: dsn.Options.ConnectTimeout}
+	dialer, dialStart := beginDial(dsn.Options)
 	raw, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
 		return nil, err
@@ -1122,6 +1121,22 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 	return c, nil
 }
 
+// testHookAfterDialStart, when set, runs right after the clock of ConnectTimeout
+// started and before the TCP connect: a test makes the connect slow with it (a
+// loopback connect takes no measurable time).
+var testHookAfterDialStart atomic.Pointer[func()]
+
+// beginDial starts the clock of o.ConnectTimeout, which counts the dial and the
+// startup together, and returns the dialer for the TCP connect and the time the
+// clock started. Every dial path calls it first, before the connect.
+func beginDial(o Options) (net.Dialer, time.Time) {
+	start := time.Now()
+	if h := testHookAfterDialStart.Load(); h != nil {
+		(*h)()
+	}
+	return net.Dialer{Timeout: o.ConnectTimeout}, start
+}
+
 // connectDeadline is when o.ConnectTimeout, counted from dialStart, runs out: the
 // time the dial plus the startup have. The zero time if ConnectTimeout is unset.
 func connectDeadline(dialStart time.Time, o Options) time.Time {
@@ -1156,9 +1171,9 @@ func (b *startupBound) abort(err error) {
 	b.err = err
 	b.c.failAll(err)
 	if b.c.useDirect && b.c.tcp != nil {
-		// Wakes the blocked read of driveDirect, which then sees the request
-		// failed.
-		_ = b.c.tcp.SetReadDeadline(time.Now())
+		// Wakes the blocked read of driveDirect (or a blocked write), which
+		// then sees the request failed.
+		_ = b.c.tcp.SetDeadline(time.Now())
 	}
 }
 
@@ -1203,10 +1218,8 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 		doneCh:  make(chan struct{}),
 	}
 	c.enqueue(req)
-	if err := c.writeRaw(initial); err != nil {
-		c.failReq(req, err)
-		return err
-	}
+	// The bound is armed before the first message is written, so it covers the
+	// write too (in direct mode a write to a peer that does not read can block).
 	b := &startupBound{c: c}
 	b.stopCtx = context.AfterFunc(ctx, func() { b.abort(ctx.Err()) })
 	if !c.connectDeadline.IsZero() {
@@ -1215,6 +1228,13 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 			b.abort(fmt.Errorf("celeris-postgres: startup timed out (connect_timeout %v): %w",
 				c.dsn.Options.ConnectTimeout, context.DeadlineExceeded))
 		})
+	}
+	if err := c.writeRaw(initial); err != nil {
+		c.failReq(req, err)
+		if aerr := b.finish(); aerr != nil {
+			return aerr
+		}
+		return err
 	}
 	werr := c.wait(ctx, req)
 	if aerr := b.finish(); aerr != nil {

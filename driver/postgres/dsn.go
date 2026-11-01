@@ -19,7 +19,9 @@ type Options struct {
 	// complete the startup in that time fails the dial with an error that matches
 	// [context.DeadlineExceeded]. A shorter deadline of the caller's context still
 	// wins. Zero means no client-side timeout: the caller's context is then the
-	// only bound. From the DSN it is connect_timeout, in whole seconds.
+	// only bound. From the DSN it is connect_timeout, in whole seconds (a negative
+	// value is rejected). The host name lookup that precedes the dial is not
+	// bounded by it, nor by the caller's context.
 	ConnectTimeout time.Duration
 	// StatementCacheSize is the per-conn LRU capacity for named prepared
 	// statements. Zero disables the cache.
@@ -204,6 +206,9 @@ func applyDSNKey(d *DSN, k, v string) error {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("celeris-postgres: connect_timeout = %q: %w", v, err)
+		}
+		if n < 0 {
+			return fmt.Errorf("celeris-postgres: connect_timeout = %d: must be >= 0 (0 or absent: no timeout)", n)
 		}
 		d.Options.ConnectTimeout = time.Duration(n) * time.Second
 	case "statement_cache_size":
