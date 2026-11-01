@@ -156,8 +156,10 @@ func TestRestampFindsASendAcrossAWrappedRing1173(t *testing.T) {
 	if w.flushSend(rig.cs) {
 		t.Fatal("apparatus: flushSend found no SQE")
 	}
-	if w.ring.GetSQE() == nil || w.ring.GetSQE() == nil {
-		t.Fatal("apparatus: no SQE")
+	for range 2 { // two more SQEs after the SEND
+		if w.ring.GetSQE() == nil {
+			t.Fatal("apparatus: no SQE")
+		}
 	}
 	if tail := w.ring.sqPlaced(); tail != 1 {
 		t.Fatalf("apparatus: tail %#x, want 1 (wrapped)", tail)
