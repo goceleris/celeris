@@ -128,6 +128,17 @@ var runAsyncCancelProbe = probeAsyncCancelFlags
 // that no other probe can run against, as asyncCancelProbeWait is.
 var probeRingWait = func(r *Ring, d time.Duration) error { return r.SubmitAndWaitTimeout(d) }
 
+// probeNewRing makes the private ring of the SEND_ZC, fixed-files,
+// provided-buffers and multishot-accept probes, and probeListen the loopback
+// listener of the first, second and fourth. Variables so a test can make the
+// setup fail the way a process out of file descriptors does (celeris#1200).
+// They carry probeRingWait's constraint: replaced only from a test goroutine
+// that no other probe can run against.
+var (
+	probeNewRing = NewRing
+	probeListen  = func() (net.Listener, error) { return net.Listen("tcp", "127.0.0.1:0") }
+)
+
 // How long the probes wait for their completion: probeFirstWaitBudget for the
 // first one (the SEND_ZC send's, the multishot accepts'), which is normally
 // there when the wait starts, and probeNotifWaitBudget for SEND_ZC's
@@ -264,7 +275,7 @@ func probeSendZC() (SendZCProbeResult, string) { return probeRetryNoAnswer(probe
 // probeSendZCOnce is one run of probeSendZC. noAnswer is true when the wait for its first
 // completion used up the whole budget with nothing in the CQ ring, and only then.
 func probeSendZCOnce() (SendZCProbeResult, string, bool) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := probeListen()
 	if err != nil {
 		return SendZCUnsupported, "net.Listen failed: " + err.Error(), false
 	}
@@ -294,7 +305,7 @@ func probeSendZCOnce() (SendZCProbeResult, string, bool) {
 	if fd <= 0 {
 		return SendZCUnsupported, fmt.Sprintf("invalid socket fd from Control: %d", fd), false
 	}
-	ring, err := NewRing(4, 0, 0)
+	ring, err := probeNewRing(4, 0, 0)
 	if err != nil {
 		return SendZCUnsupported, "NewRing failed: " + err.Error(), false
 	}
@@ -425,7 +436,7 @@ func probeFixedFiles() (bool, string) { return probeRetryNoAnswer(probeFixedFile
 // probeFixedFilesOnce is one run of probeFixedFiles. noAnswer is true when the wait for its first
 // completion used up the whole budget with nothing in the CQ ring, and only then.
 func probeFixedFilesOnce() (bool, string, bool) {
-	ring, err := NewRing(8, 0, 0)
+	ring, err := probeNewRing(8, 0, 0)
 	if err != nil {
 		return false, "NewRing failed: " + err.Error(), false
 	}
@@ -435,7 +446,7 @@ func probeFixedFilesOnce() (bool, string, bool) {
 		return false, "RegisterFiles failed: " + err.Error(), false
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := probeListen()
 	if err != nil {
 		return false, "net.Listen failed: " + err.Error(), false
 	}
@@ -497,7 +508,7 @@ func probeFixedFilesOnce() (bool, string, bool) {
 // cannot be used — the engine must fall back to single-shot per-connection
 // recv buffers regardless of the kernel-version-based tier.
 func probeProvidedBuffers() (bool, string) {
-	ring, err := NewRing(8, 0, 0)
+	ring, err := probeNewRing(8, 0, 0)
 	if err != nil {
 		return false, "NewRing failed: " + err.Error()
 	}
@@ -539,13 +550,13 @@ func probeMultishotAccept() (bool, string) { return probeRetryNoAnswer(probeMult
 // probeMultishotAcceptOnce is one run of probeMultishotAccept. noAnswer is true when the wait for its first
 // completion used up the whole budget with nothing in the CQ ring, and only then.
 func probeMultishotAcceptOnce() (bool, string, bool) {
-	ring, err := NewRing(8, 0, 0)
+	ring, err := probeNewRing(8, 0, 0)
 	if err != nil {
 		return false, "NewRing failed: " + err.Error(), false
 	}
 	defer func() { _ = ring.Close() }()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := probeListen()
 	if err != nil {
 		return false, "net.Listen failed: " + err.Error(), false
 	}
