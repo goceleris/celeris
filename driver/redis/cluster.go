@@ -90,6 +90,9 @@ type ClusterClient struct {
 	refLast *topoRefresh
 	// refSeq counts the topology reads that have started (guarded by refMu).
 	refSeq uint64
+	// refEvents are the unresolved events the command path looked at the topology
+	// for, by key (see eventMark). Guarded by refMu.
+	refEvents map[string]topoEvent
 
 	closeCh chan struct{}
 	closed  atomic.Bool
@@ -375,6 +378,84 @@ func (f *topoRefresh) joinable() bool {
 	default:
 		return true
 	}
+}
+
+// topoEvent is a reason to read the topology that several commands can share: a
+// slot that moved to to (-MOVED), a node that was lost. mark is the position in the
+// sequence of reads when the first command that saw it received its reply.
+type topoEvent struct {
+	to   string
+	mark topoMark
+}
+
+// maxTopoEvents is the size past which eventMark drops the resolved events.
+const maxTopoEvents = 1024
+
+// eventMark returns the mark for a command that received the reply that is
+// event key (to is what the reply named, "" if nothing). The command path cannot
+// take a plain topoMark: each command takes it as its own reply arrives, and
+// registers its read right after, so the next command's mark is already past that
+// read and nothing is shared (celeris#1214; the PubSub reroute of #1203 has a
+// backoff sleep between its trigger and its read, so its marks all come first).
+//
+// The first command to see the event takes the mark now. Another that sees the
+// same event (same key, same to) while it is unresolved takes the same mark: a read
+// registered after the first reply was sent after the event happened, so it is as
+// fresh for the second command as one registered after its own reply. An event is
+// resolved when a read registered after its mark has ended without being cut short:
+// the next reply for the key is then a new event and takes a new mark. A reply for
+// the same key that names a different to replaces the event (the slot moved again),
+// and so takes a new mark. The one case a read may be older than the event of the
+// command that uses it is a slot that moves away and comes back to the same node
+// while one read runs; the command then finds the old table, and its next -MOVED
+// (the event is resolved by then) takes a new mark.
+func (c *ClusterClient) eventMark(key, to string) topoMark {
+	c.refMu.Lock()
+	defer c.refMu.Unlock()
+	if ev, ok := c.refEvents[key]; ok && ev.to == to && !c.resolvedLocked(ev.mark) {
+		return ev.mark
+	}
+	if c.refEvents == nil {
+		c.refEvents = make(map[string]topoEvent)
+	}
+	if len(c.refEvents) >= maxTopoEvents {
+		for k, ev := range c.refEvents {
+			if c.resolvedLocked(ev.mark) {
+				delete(c.refEvents, k)
+			}
+		}
+	}
+	mark := topoMark(c.refSeq)
+	c.refEvents[key] = topoEvent{to: to, mark: mark}
+	return mark
+}
+
+// resolvedLocked reports whether a read registered after mark has ended with a
+// table or a node's failure (not cut short by its caller). Only the latest read
+// is looked at: if it is older than the mark, or still running, the event is
+// open. The caller holds refMu.
+func (c *ClusterClient) resolvedLocked(mark topoMark) bool {
+	f := c.refLast
+	if f == nil || f.seq <= uint64(mark) {
+		return false
+	}
+	select {
+	case <-f.done:
+		return !f.cut
+	default:
+		return false
+	}
+}
+
+// movedMark is the mark for a command that received -MOVED for slot to addr.
+func (c *ClusterClient) movedMark(slot uint16, addr string) topoMark {
+	return c.eventMark("m"+strconv.Itoa(int(slot)), addr)
+}
+
+// lostMark is the mark for a command that lost the primary at addr (a network
+// error): every command that lost it shares the read that follows.
+func (c *ClusterClient) lostMark(addr string) topoMark {
+	return c.eventMark("l"+addr, "")
 }
 
 // refreshTopology queries CLUSTER SLOTS on any live node and rebuilds the
@@ -724,8 +805,12 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 			if node.primary && !triedPrimaryRefresh {
 				node.failing.Store(true)
 				triedPrimaryRefresh = true
+				// The commands that lost this primary share one read that
+				// started after the first of them saw the error
+				// (celeris#1214).
+				mark := c.lostMark(node.addr)
 				rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				refreshErr := c.refreshTopology(rctx)
+				refreshErr := c.refreshTopologySince(rctx, mark)
 				cancel()
 				if refreshErr == nil {
 					if newPrim := c.route(slot); newPrim != nil && newPrim != node {
@@ -741,13 +826,17 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 			if addr == "" {
 				return err
 			}
-			// Refresh topology on every MOVED — not just attempt==0.
+			// Read the topology for every MOVED — not just attempt==0.
 			// A stale slot map keeps generating redirects; routing
 			// by the embedded MOVED address only helps for this one
 			// call, subsequent commands for the same slot still hit
-			// the old node and loop.
+			// the old node and loop. Every MOVED asks for a read, but the
+			// commands that got the same MOVED share one: one that started
+			// after the first of their replies (celeris#1214). The
+			// redirect below still goes to the address this reply named.
+			mark := c.movedMark(slot, addr)
 			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			_ = c.refreshTopology(rctx)
+			_ = c.refreshTopologySince(rctx, mark)
 			cancel()
 			n, nerr := c.getOrCreateNode(addr)
 			if nerr != nil {
@@ -1431,7 +1520,7 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 
 	// Scan for MOVED/ASK errors and collect commands to retry.
 	var retryCmds []clusterPipeCmd
-	topologyRefreshed := false
+	cp.refreshForMoved(ctx, errs)
 	for i := range errs {
 		if errs[i] == nil {
 			continue
@@ -1441,12 +1530,6 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 			continue
 		}
 		if rerr.Prefix == "MOVED" {
-			if !topologyRefreshed {
-				rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				_ = cp.cluster.refreshTopology(rctx)
-				cancel()
-				topologyRefreshed = true
-			}
 			errs[i] = nil
 			retryCmds = append(retryCmds, clusterPipeCmd{
 				slot:    cp.cmds[i].slot,
@@ -1500,6 +1583,31 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 	if len(retryCmds) > 0 {
 		cp.execRound(ctx, retryCmds, results, errs, true)
 	}
+}
+
+// refreshForMoved reads the topology once if any of errs is a -MOVED, before the
+// retry round. The read must have started after every one of those replies, so
+// its mark is the latest of the marks of the moves in the batch (movedMark): a
+// batch with two moved slots does not use a read that predates the second. The
+// batches of other pipelines and commands that hit the same moves share the read
+// (celeris#1214). Every reply of the round was received before this runs.
+func (cp *ClusterPipeline) refreshForMoved(ctx context.Context, errs []error) {
+	var mark topoMark
+	moved := false
+	for i := range errs {
+		var rerr *RedisError
+		if errs[i] == nil || !errors.As(errs[i], &rerr) || rerr.Prefix != "MOVED" {
+			continue
+		}
+		moved = true
+		mark = max(mark, cp.cluster.movedMark(cp.cmds[i].slot, parseRedirectAddr(rerr.Msg)))
+	}
+	if !moved {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = cp.cluster.refreshTopologySince(rctx, mark)
+	cancel()
 }
 
 // Discard drops all queued commands.
