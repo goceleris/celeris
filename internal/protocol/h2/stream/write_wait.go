@@ -431,6 +431,9 @@ func (s *LoopSlot) Leave() {
 	}
 }
 
+// Stamped reports whether the loop is inside a batch (its stamp is set). Tests.
+func (s *LoopSlot) Stamped() bool { return s != nil && s.since.Load() != 0 }
+
 // BlockedFor reports whether some loop has been in one batch since at least d
 // before now.
 func (w *LoopWatch) BlockedFor(now, d int64) bool {

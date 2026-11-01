@@ -19,7 +19,6 @@ import (
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/engine"
-	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -206,10 +205,19 @@ func TestSyncHandlerGoexitEndsOneWorkerLoudly848(t *testing.T) {
 	// The worker died inside a batch, with its stamp set (celeris#1170): a stamp that
 	// is left behind ages for ever, and every waiting pool handler of the engine would
 	// be cut as "loop-blocked" from then on. The exit clears it.
+	// (Its own slot: a live worker caught in a batch at this instant is not the one.)
 	e.mu.Lock()
-	watch := e.loopWatch
+	var dead *Worker
+	for _, x := range e.workers {
+		if int64(x.id) == boomID848.Load() {
+			dead = x
+		}
+	}
 	e.mu.Unlock()
-	if watch.BlockedFor(mono.Now()+int64(time.Hour), 1) {
+	if dead == nil {
+		t.Fatalf("PREMISE: no worker with id %d", boomID848.Load())
+	}
+	if dead.loopSlot.Stamped() {
 		t.Error("the worker that ended without returning left its LoopWatch stamp set: it reads as stuck for ever")
 	}
 	// Only one worker died: a conn on another worker is still served.

@@ -42,6 +42,11 @@ import (
 func (e *Engine) runWatched(ctx context.Context, l *Loop) {
 	returned := false
 	defer func() {
+		// First: a loop that ended inside a batch (a Goexit in a sync handler) has its
+		// stamp set, and every statement below, a blocking Logger among them, lets it age
+		// while every waiting pool handler of the engine is bounded by WriteTimeout in
+		// all as for a wedge (celeris#1170).
+		l.loopSlot.Leave()
 		if !returned {
 			e.reportLoopExit(l)
 		}
@@ -50,10 +55,6 @@ func (e *Engine) runWatched(ctx context.Context, l *Loop) {
 		// PauseAccept that checked in between.
 		l.exited.Store(true)
 		l.pause.Notify()
-		// A loop that ended inside a batch (a Goexit in a sync handler) has its stamp
-		// set: left, it ages for ever, and every waiting pool handler of the engine
-		// is then bounded by WriteTimeout in all as for a wedge (celeris#1170).
-		l.loopSlot.Leave()
 	}()
 	l.run(ctx)
 	returned = true
