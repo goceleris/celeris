@@ -490,7 +490,12 @@ type Config struct {
 	// the last read, the start of a send from an idle connection or a
 	// completed send (a client that completes one send per WriteTimeout, or
 	// sends another request, restarts it), not from the request's headers as
-	// std does. On io_uring a response whose
+	// std does. A timeout sweep that finds the connection's bytes still in the
+	// engine's own hands (a SEND not yet submitted to the kernel, or queued
+	// for want of room in the submission ring) gives back the time the worker
+	// stalled in that loop iteration, and only that: a stall of the worker is
+	// not the client's, and the clock of a partial send's remainder is not
+	// restarted. On io_uring a response whose
 	// unsent remainder is under 64 KiB, to a client that stops reading, on an
 	// otherwise idle worker, can outlast WriteTimeout (measured with async
 	// responses of 96 to 144 KiB; the larger and the sync sizes are closed).
