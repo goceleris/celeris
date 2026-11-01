@@ -80,3 +80,35 @@ func TestTopologyReadsThatEndInOrderAllApply1219(t *testing.T) {
 		t.Error("a read after a cancelled one did not apply")
 	}
 }
+
+// An older read that carries the move is still in flight when a newer read fails
+// (here: cut short by its caller). The failed read applies nothing, so it must not
+// advance the order: the older read, which ends later, applies and the table gets
+// the move. (A variant that advances the order when a read fails, or one that drops
+// a result whenever a newer read is merely registered, loses the update.)
+func TestAnOlderReadStillAppliesWhenTheNewerOneFailed1219(t *testing.T) {
+	const key = "{newerfails}k"
+	cl := newRPCluster(t, 3)
+	cc := newRPClusterClient(t, cl)
+	slot := int(Slot(key))
+	from := cl.owner(slot)
+	to := otherNode(cl, from)
+	cl.moveSlot(slot, to, 0) // the client's table still names from
+
+	waitHeld, release := holdNextSlotsRead(t)
+	r1 := make(chan error, 1)
+	go func() { r1 <- cc.refreshTopology(rpCtx(t)) }() // takes the post-move table, held
+	waitHeld()
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := cc.refreshTopology(cctx); err == nil { // registered later, cut short
+		t.Fatal("the cancelled read succeeded")
+	}
+	release()
+	if err := <-r1; err != nil {
+		t.Fatal(err)
+	}
+	if r := cc.route(Slot(key)); r == nil || r.addr != to.addr {
+		t.Errorf("the older read, which carries the move, was dropped because a newer read failed")
+	}
+}

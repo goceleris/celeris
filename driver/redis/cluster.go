@@ -622,18 +622,23 @@ func (c *ClusterClient) applyTopology(ctx context.Context, v *Value, seq uint64)
 	if c.nodes == nil {
 		return ErrClosed
 	}
-	// A read registered before the one whose table is in place answers about an
-	// older moment, whatever order they ended in: its table is dropped, so it
+	// The slot table is never replaced by a read registered before the one whose
+	// table is in place, whatever order they ended in: an older read that ends last
 	// cannot put a slot back where it was before a move (celeris#1219). seq is the
-	// read's registration number (topoRefresh.seq); 0 is "unordered" and always
-	// applies. The order is that of registration, not of the requests reaching the
-	// server, which is the best a client can tell without a clock.
-	if seq != 0 {
-		if seq < c.topoApplied {
-			return nil
-		}
-		c.topoApplied = seq
+	// read's registration number (topoRefresh.seq, 1 or more). A read that failed,
+	// or was cut short, never gets here and so does not advance topoApplied.
+	//
+	// What this does NOT guarantee: the order is that of registration, not of the
+	// requests reaching the server or of the cluster's truth, which a client cannot
+	// tell without a server epoch (CLUSTER SLOTS has none). A read registered later
+	// that was sent to a lagging node, or an older read that retried a second node
+	// after the newer one was sent, can still install the older table, and the
+	// fresher answer is dropped. The next -MOVED corrects it (one extra round), as
+	// would the 60 s refresh.
+	if seq < c.topoApplied {
+		return nil
 	}
+	c.topoApplied = seq
 
 	wantReplicas := c.cfg.ReadOnly || c.cfg.RouteByLatency
 
