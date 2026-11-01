@@ -76,7 +76,8 @@ step "the complete logs pass, each group tallied" "$dir/iou.base" "$dir/root.bas
   ': want 10, ran 10, passed 10, SKIP lines 0, FAIL lines 0' \
   'twins (celeris#713): want 2, ran 2, passed 2' \
   '(celeris#909): want 3, ran 3, passed 3' \
-  '(celeris#919): want 1, ran 1, passed 1'
+  '(celeris#919): want 1, ran 1, passed 1' \
+  '(celeris#727): want 1, ran 1, passed 1'
 
 # A test renamed or removed: no RUN line, no PASS line.
 sed 's/TestParkedWorkerSendsFINForAReadTimeoutClose/TestParkedWorkerSendsFINForAReadTimeoutCloseRenamed/' "$dir/iou.base" >"$dir/iou.renamed"
@@ -93,6 +94,9 @@ step "a removed epoll twin fails" "$dir/iou.base" "$dir/root.notwin" 1 \
 grep -v 'TestInlineHandlerChildKeepsTheProcessMask919' "$dir/root.base" >"$dir/root.no919"
 step "a removed 919 test fails" "$dir/iou.base" "$dir/root.no919" 1 \
   'TestInlineHandlerChildKeepsTheProcessMask919 ran 0, passed 0'
+grep -v 'TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits' "$dir/root.base" >"$dir/root.no727"
+step "a removed or renamed deferred-transplant test fails" "$dir/iou.base" "$dir/root.no727" 1 \
+  'TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits ran 0, passed 0'
 
 # A test that skipped: a RUN line, a SKIP line, no PASS line.
 sed 's/^--- PASS: TestAdoptAfterAShortParkIsNotTimedOut /--- SKIP: TestAdoptAfterAShortParkIsNotTimedOut /' "$dir/iou.base" >"$dir/iou.skip"
@@ -104,6 +108,10 @@ step "a skipped 909 test fails (the root step would forgive it after a re-run)" 
 { cat "$dir/root.base"; printf '    --- SKIP: TestLoopsPinInsideTheAllowedSet909/arm (0.00s)\n'; } >"$dir/root.subskip"
 step "a skipped subtest of a counted test fails even with the parent's PASS" "$dir/iou.base" "$dir/root.subskip" 1 \
   'TestLoopsPinInsideTheAllowedSet909 ran 1, passed 1, SKIP lines 1'
+
+sed 's/^--- PASS: TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits /--- SKIP: TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits /' "$dir/root.base" >"$dir/root.skip727"
+step "a skipped deferred-transplant test fails" "$dir/iou.base" "$dir/root.skip727" 1 \
+  'TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits ran 1, passed 0, SKIP lines 1'
 
 # A test that failed or ran twice. A subtest's FAIL line stands beside the parent's
 # PASS here to show the FAIL count is a check of its own; go test marks the parent
@@ -191,8 +199,8 @@ for n in $names; do
     fail=1
   fi
 done
-if [ "$count" -ne 22 ]; then
-  echo "FAIL the step names $count distinct tests, want 22 (6 + 10 + 2 + 3 + 1)"
+if [ "$count" -ne 23 ]; then
+  echo "FAIL the step names $count distinct tests, want 23 (6 + 10 + 2 + 3 + 1 + 1)"
   fail=1
 else
   echo "ok   the step's $count names are test functions"
