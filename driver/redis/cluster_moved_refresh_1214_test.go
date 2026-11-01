@@ -19,6 +19,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // movedHerdBound is the most CLUSTER SLOTS a herd of 200 commands may cost. The
@@ -627,5 +628,63 @@ func TestRefreshForMovedAllocatesNothingWhenNothingFailed1214(t *testing.T) {
 	errs := make([]error, 100)
 	if got := testing.AllocsPerRun(100, func() { cp.refreshForMoved(context.Background(), errs) }); got != 0 {
 		t.Errorf("refreshForMoved allocated %v times for 100 commands that did not fail, want 0", got)
+	}
+}
+
+// The event table costs nothing until the first -MOVED: the client is the two slot
+// tables of main plus a small rest, and the 16384-entry table of events is
+// allocated by the first -MOVED, not by NewClusterClient (it would double the
+// client, and the GC scans it).
+func TestEventTableIsAllocatedByTheFirstMoved1214(t *testing.T) {
+	var cc ClusterClient
+	slotTables := unsafe.Sizeof(cc.slots) + unsafe.Sizeof(cc.replicas)
+	if rest := unsafe.Sizeof(cc) - slotTables; rest > 2048 {
+		t.Errorf("ClusterClient is %d bytes beyond its slot tables, want a small constant (the event table must not be inline)", rest)
+	}
+	const key = "{table}k"
+	cl, c, _, _ := herdSlotMove(t, key, 0)
+	c.refMu.Lock()
+	idle := c.refMoved
+	c.refMu.Unlock()
+	if idle != nil {
+		t.Error("a client that has met no -MOVED holds the event table")
+	}
+	if v, err := c.Get(rpCtx(t), key); err != nil || v != "v" {
+		t.Fatalf("GET = %q, %v", v, err)
+	}
+	c.refMu.Lock()
+	after := c.refMoved
+	c.refMu.Unlock()
+	if after == nil {
+		t.Error("the first -MOVED did not allocate the event table")
+	}
+	_ = cl
+}
+
+// refDone only goes up: a read that started earlier and ends after a newer one
+// must not lower it (the newer read already resolved the events before it).
+func TestRefDoneNeverGoesDown1214(t *testing.T) {
+	cl := newRPCluster(t, 3)
+	cc := newRPClusterClient(t, cl)
+	ctx := rpCtx(t)
+	waitHeld, release := holdNextSlotsRead(t)
+	r1 := make(chan error, 1)
+	go func() { r1 <- cc.refreshTopology(ctx) }() // the older read, held
+	waitHeld()
+	if err := cc.refreshTopology(ctx); err != nil { // a newer one ends first
+		t.Fatal(err)
+	}
+	done := func() uint64 {
+		cc.refMu.Lock()
+		defer cc.refMu.Unlock()
+		return cc.refDone
+	}
+	newer := done()
+	release()
+	if err := <-r1; err != nil {
+		t.Fatal(err)
+	}
+	if got := done(); got != newer {
+		t.Errorf("refDone = %d after the older read ended, want %d: it went down", got, newer)
 	}
 }

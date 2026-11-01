@@ -95,8 +95,10 @@ type ClusterClient struct {
 	refDone uint64
 	// refMoved is, per slot, the last -MOVED the command path read the topology
 	// for; refLost, per node address, the last lost primary (see eventMarkLocked).
+	// refMoved is a table of 16384 entries (384 KiB), allocated by the first
+	// -MOVED: a client that never meets one pays a pointer, not the table.
 	// Guarded by refMu.
-	refMoved [16384]topoEvent
+	refMoved *[16384]topoEvent
 	refLost  map[string]*topoEvent
 
 	closeCh chan struct{}
@@ -442,6 +444,9 @@ func (c *ClusterClient) resolvedLocked(mark topoMark) bool {
 func (c *ClusterClient) movedMark(slot uint16, addr string) topoMark {
 	c.refMu.Lock()
 	defer c.refMu.Unlock()
+	if c.refMoved == nil {
+		c.refMoved = new([16384]topoEvent)
+	}
 	return c.eventMarkLocked(&c.refMoved[slot], addr)
 }
 
