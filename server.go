@@ -647,9 +647,52 @@ func (s *Server) cancelListen() {
 // sent; its connection is closed by the shutdown, at once or when the gate looks
 // at it, 250 ms into a wait), a
 // detached stream (Server-Sent Events, a WebSocket), which the engines end
-// themselves, a hijacked connection, which is the application's, and a
-// connection that has sent nothing yet (it is answered close when its first
-// request is). HTTP/2 connections get GOAWAY instead.
+// themselves, and a hijacked connection, which is the application's. HTTP/2
+// connections get GOAWAY instead.
+//
+// What a connection gets depends on what it has sent when Shutdown begins
+// (celeris#1208; measured on arm64, in docker with 2 CPUs, on a 7.0 kernel with
+// io_uring's high tier; the io_uring lines depend on whether the worker has a
+// response going out, as its send drain above does, and adaptive does what the
+// engine it is running on does, epoll when it starts):
+//
+//   - An idle keep-alive connection, which has no request under way, is closed
+//     at once by std and epoll, and by an io_uring worker with no response going
+//     out. An io_uring worker that has one serves on for the first 250 ms of its
+//     send drain, so its idle connections are closed at 250 ms, and a request
+//     one of them sends before then is answered with Connection: close.
+//   - A request in progress, whose head the server has read, is read on and
+//     answered, with Connection: close as above, on every engine.
+//   - A request head that has reached the kernel without the server having read
+//     it is answered, with Connection: close, on epoll, and on io_uring while its
+//     worker has a response going out or a request in progress when it sees the
+//     Shutdown. An io_uring worker with neither exits at once, and such a
+//     connection is closed without an answer (for instance one whose head
+//     arrived while the loop was held in another connection's [Config.OnConnect]
+//     callback). A head that reaches the kernel after the engine's gate has
+//     looked at the connection is refused, as above. On std net/http reads the
+//     head after Shutdown began and drops the request: the connection is closed
+//     without an answer, and reset if body bytes are still unread (a small body,
+//     2 KiB measured, is read with the head and the close is a FIN; 64 KiB gave a
+//     reset).
+//   - A connection that has sent nothing is not answered by std, or by epoll and
+//     an io_uring worker with no response going out, and a request it sends once
+//     Shutdown has begun is dropped there. epoll and such a worker close the
+//     connection at once if the engine has accepted it. By default the kernel
+//     does not hand such a connection to the engine for about a second
+//     (TCP_DEFER_ACCEPT, see [Config.DisableDeferAccept]); while it is held back
+//     Shutdown neither closes it nor lets a request through on epoll or on an
+//     io_uring worker with no response going out: its first request gets a
+//     reset once the loops have closed their listeners (an epoll loop busy
+//     sending can take a few milliseconds to, and answers it with Connection:
+//     close until then). An io_uring worker that has a response going out keeps accepting
+//     for its first 250 ms: it closes an accepted silent connection at 250 ms and
+//     answers, with Connection: close, a first request that arrives before then,
+//     on an accepted connection or a held-back one. std keeps the connection
+//     open until its first request is read, which is then dropped as above, or
+//     until net/http closes it for being five seconds old, so a client that
+//     connects and sends nothing can hold Shutdown on std for about five seconds,
+//     within ctx.
 //
 // A Shutdown that arrives before the server ever started still latches the
 // shut-down state, so a Start racing it returns instead of parking on a context

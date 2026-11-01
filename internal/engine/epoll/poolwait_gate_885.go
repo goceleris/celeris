@@ -64,6 +64,14 @@ import (
 // locks, as io_uring's gate does (shutdown_gate_884.go; celeris#1165, #1166):
 // closed when idle, read on and answered when a request is in progress on it.
 //
+// A conn that has sent nothing is therefore closed at once and never answered
+// (epoll's gate has no drain to wait for): a request it sends after the
+// shutdown began is dropped. (Until TCP_DEFER_ACCEPT
+// hands it over, about a second after its SYN, the kernel holds it back and the
+// loop does not see it at all.) The Server.Shutdown godoc has the per-engine
+// contract and test/server/shutdown_conn_shapes_1208_linux_test.go pins it
+// (celeris#1208).
+//
 // A loop with no HTTP/2 conn runs the same gate for as long as an HTTP/1
 // request is in progress on it (poolWaitSettled), and closes its idle conns at
 // the start of shutdown (celeris#1104), so the gate's behaviour does not depend

@@ -101,17 +101,23 @@ func normaliseDoc(s string) string { return strings.Join(strings.Fields(s), " ")
 // stale phrase that is still in it.
 func requireDoc(t *testing.T, what, doc string, want, stale []string) {
 	t.Helper()
+	requireDocTagged(t, "celeris#891", what, doc, want, stale)
+}
+
+// requireDocTagged is requireDoc naming the issue tag in its failures.
+func requireDocTagged(t *testing.T, tag, what, doc string, want, stale []string) {
+	t.Helper()
 	if len(doc) < 200 {
 		t.Fatalf("positive control: %s doc is only %d bytes", what, len(doc))
 	}
 	for _, s := range want {
 		if !strings.Contains(doc, s) {
-			t.Errorf("%s: godoc lacks %q (celeris#891)", what, s)
+			t.Errorf("%s: godoc lacks %q (%s)", what, s, tag)
 		}
 	}
 	for _, s := range stale {
 		if strings.Contains(doc, s) {
-			t.Errorf("%s: godoc still says %q (celeris#891)", what, s)
+			t.Errorf("%s: godoc still says %q (%s)", what, s, tag)
 		}
 	}
 }
