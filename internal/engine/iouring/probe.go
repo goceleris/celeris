@@ -121,8 +121,9 @@ func (c *probeCache[R]) get(run func() (R, string, probeOutcome)) (R, string) {
 }
 
 // logPending logs, once per probe per process, that a run of the probe was not
-// an answer: the engine built at that call has the feature off, and the cause
-// is not the kernel's. Called by New with the engine's logger after the
+// an answer: the engine being built when it failed has the feature off, and
+// the cause is not the kernel's. (failedWhy is per process: a New running at the
+// same time as the failing one may log it for an engine that has the feature.) Called by New with the engine's logger after the
 // probes; the lock makes a concurrent New log it only once.
 func (c *probeCache[R]) logPending(l *slog.Logger) {
 	c.mu.Lock()
@@ -131,8 +132,9 @@ func (c *probeCache[R]) logPending(l *slog.Logger) {
 		return
 	}
 	c.logged = true
-	l.Warn("io_uring startup probe could not run, so the feature is off for this engine; "+
-		"the probe runs again when the next engine is built (a probe whose wait gets no answer in two runs is kept as unsupported)",
+	l.Warn("io_uring startup probe could not run when an engine was built, so the feature was off for the engine being built then; "+
+		"the probe runs again when the next engine is built (restart the server, or build a new engine, to probe again; "+
+		"a probe whose wait gets no answer in two runs is kept as unsupported)",
 		"probe", c.name, "reason", c.failedWhy)
 }
 
@@ -162,6 +164,18 @@ func probeRefused(err error) bool {
 func probeRingOutcome(err error) probeOutcome {
 	if probeRefused(err) {
 		return probeAnswered
+	}
+	return probeNotRun
+}
+
+// probeDialOutcome is the outcome of a failed dial of the loopback listener: a
+// timeout (the 500 ms of the dialer; a host that drops loopback SYNs) costs a
+// budget each time, so it is probeExpired and capped; any other error (EMFILE,
+// ECONNREFUSED) returns at once and is probeNotRun.
+func probeDialOutcome(err error) probeOutcome {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return probeExpired
 	}
 	return probeNotRun
 }
@@ -639,7 +653,7 @@ func probeFixedFilesOnce() (bool, string, probeOutcome) {
 	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
 	conn, err := dialer.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		return false, "probe dial failed: " + err.Error(), probeNotRun
+		return false, "probe dial failed: " + err.Error(), probeDialOutcome(err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -775,7 +789,7 @@ func probeMultishotAcceptOnce() (bool, string, probeOutcome) {
 	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
 	conn, err := dialer.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		return false, "probe dial failed: " + err.Error(), probeNotRun
+		return false, "probe dial failed: " + err.Error(), probeDialOutcome(err)
 	}
 	defer func() { _ = conn.Close() }()
 

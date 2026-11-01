@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -100,15 +101,16 @@ func emfile1200(op string) error {
 	return &net.OpError{Op: op, Net: "tcp", Err: os.NewSyscallError("socket", unix.EMFILE)}
 }
 
-// wantAnswer1200 is the answer of one real run of p, or skips the test for a
-// kernel that does not answer with a working feature: there is then nothing
-// the second call could show.
+// wantAnswer1200 is the answer of one real run of p, or ends the test with
+// skipOrFail656 (a skip, which the CI steps that count SKIP lines turn red, or
+// a failure where CELERIS_REQUIRE_IOURING_WORKERS=1) for a kernel that does not
+// answer with a working feature: there is then nothing the second call could
+// show, and a pass would say otherwise.
 func wantAnswer1200(t *testing.T, p probe1200) (want, why string) {
 	t.Helper()
 	want, why = p.direct()
 	if !p.ok(want) {
-		t.Logf("%s: the kernel does not answer it with a working feature (%s, %q): nothing to keep", p.name, want, why)
-		return "", ""
+		skipOrFail656(t, "%s: the kernel does not answer it with a working feature (%s, %q): nothing to keep", p.name, want, why)
 	}
 	return want, why
 }
@@ -139,9 +141,6 @@ func TestProbeSetupFailureIsNotCached1200(t *testing.T) {
 			t.Run(p.name+"/"+inj, func(t *testing.T) {
 				resetProbeCaches1200(t)
 				want, wantWhy := wantAnswer1200(t, p)
-				if want == "" {
-					return
-				}
 				hits := 0
 				var restore func()
 				if inj == "NewRing" {
@@ -232,9 +231,6 @@ func TestProbeWaitErrorIsNotCached1200(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/wait%d", p.name, n), func(t *testing.T) {
 				resetProbeCaches1200(t)
 				want, wantWhy := wantAnswer1200(t, p)
-				if want == "" {
-					return
-				}
 
 				// A transient errno: the first call is negative, the second the kernel's.
 				w := &wait1200{n: n, err: fmt.Errorf("io_uring_enter submit+wait timeout: %w", unix.EBUSY)}
@@ -311,9 +307,6 @@ func TestProbeNoAnswerIsCappedAndNotifExpiryIsKept1200(t *testing.T) {
 		t.Run(p.name, func(t *testing.T) {
 			resetProbeCaches1200(t)
 			want, wantWhy := wantAnswer1200(t, p)
-			if want == "" {
-				return
-			}
 
 			// The first run expires (its two waits), the second answers.
 			calls, cuts := emptyWaits1195(t, cutExpire, 1, 2)
@@ -454,6 +447,22 @@ func TestProbeRefusalAndResourceClassification1200(t *testing.T) {
 			t.Errorf("sendZCFirstCQE(%d, %#x) = %v, %v, %v, want %v answered, done %v", tc.res, tc.flags, r, out, done, tc.want, tc.done)
 		}
 	}
+	// A dial that timed out costs a budget each time: expired, and capped.
+	// Anything else that fails a dial returns at once.
+	for _, tc := range []struct {
+		err  error
+		want probeOutcome
+	}{
+		{&net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}, probeExpired},
+		{fmt.Errorf("probe: %w", &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}), probeExpired},
+		{emfile1200("dial"), probeNotRun},
+		{&net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", unix.ECONNREFUSED)}, probeNotRun},
+		{errors.New("dial failed"), probeNotRun},
+	} {
+		if got := probeDialOutcome(tc.err); got != tc.want {
+			t.Errorf("probeDialOutcome(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
 	var unset probeOutcome
 	if unset == probeAnswered {
 		t.Errorf("the zero value of probeOutcome reads as an answer: an outcome that was never set would be cached")
@@ -547,5 +556,127 @@ func TestAsyncCancelProbeSecondWaitIsPositive1200(t *testing.T) {
 		if d <= 0 {
 			t.Fatalf("a wait was asked for %v: the time left after the check must be positive", d)
 		}
+	}
+}
+
+// TestProbeSustainedSetupFailureIsNeverKept1200: a setup failure that lasts is
+// not counted toward the cap of the expired runs: five calls in a row with the
+// ring failing (EMFILE, a process that stays out of descriptors) all give the
+// negative, and the call after the failure ends gives the kernel's answer. A
+// "N failed runs, then final" policy fails here, and it is the one that makes
+// a sustained EMFILE permanent.
+func TestProbeSustainedSetupFailureIsNeverKept1200(t *testing.T) {
+	requireRing1200(t)
+	for _, p := range probes1200() {
+		t.Run(p.name, func(t *testing.T) {
+			resetProbeCaches1200(t)
+			want, wantWhy := wantAnswer1200(t, p)
+			restore := swap1200(t, &probeNewRing, func(uint32, uint32, uint32) (*Ring, error) {
+				return nil, fmt.Errorf("io_uring_setup: %w", unix.EMFILE)
+			})
+			for i := 1; i <= 5; i++ {
+				if got, why := p.cached(); p.ok(got) {
+					t.Fatalf("%s: call %d with the ring failing answered %s (%q), want a negative", p.name, i, got, why)
+				}
+			}
+			restore()
+			if got, why := p.cached(); got != want {
+				t.Errorf("%s: after 5 failed calls the next answered %s (%q), want the kernel's %s (%q): "+
+					"a failure to set up was kept after a few runs", p.name, got, why, want, wantWhy)
+			}
+		})
+	}
+}
+
+// TestNewDoesNotWarnWhenTheProbesRan1200: the line that says a probe could not
+// run is for a probe that could not, not for one that ran: a New from probes
+// that have never run, on a host where they work, logs none.
+func TestNewDoesNotWarnWhenTheProbesRan1200(t *testing.T) {
+	requireRing1200(t)
+	resetProbeCaches1200(t)
+	log, lines := logCapture1200()
+	cfg := resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1, Logger: log}
+	for i := 0; i < 2; i++ {
+		if _, err := New(cfg, transplantTestHandler{}); err != nil {
+			skipOrFail656(t, "iouring engine unavailable: %v", err)
+		}
+	}
+	if strings.Contains(lines.buf.String(), "could not run") {
+		t.Errorf("a New whose probes ran said one could not: %q", lines.buf.String())
+	}
+}
+
+const emfileChild1200 = "CELERIS_TEST_EMFILE_CHILD_1200"
+
+// TestMultishotAcceptEMFILECompletion1200: a real -EMFILE completion. With the
+// descriptor table full except for the slot the probe's own dial takes, the
+// kernel completes the multishot accept with cqe.res=-24 (it has no descriptor
+// for the connection): that is not an answer about multishot accept, and the
+// probe must say it did not run and be run again. The only probe that can get
+// this from the kernel: ACCEPT_DIRECT fills slots of the registered table, not
+// descriptors, and SEND_ZC allocates none; theirs stay checked against
+// synthetic completions. It runs in a child of the test binary, so that the
+// lowered RLIMIT_NOFILE reaches no other test.
+func TestMultishotAcceptEMFILECompletion1200(t *testing.T) {
+	if os.Getenv(emfileChild1200) != "1" {
+		requireRing1200(t)
+		cmd := exec.Command(os.Args[0], "-test.run=^TestMultishotAcceptEMFILECompletion1200$", "-test.count=1", "-test.v")
+		cmd.Env = append(os.Environ(), emfileChild1200+"=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("the child failed: %v\n%s", err, out)
+		}
+		if !bytes.Contains(out, []byte("--- PASS: TestMultishotAcceptEMFILECompletion1200")) {
+			t.Fatalf("the child did not pass the test (it skipped?):\n%s", out)
+		}
+		return
+	}
+	requireRing1200(t)
+	p := probes1200()[3]
+	want, _ := wantAnswer1200(t, p) // before the limit is lowered
+
+	var lim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &lim); err != nil {
+		t.Fatalf("getrlimit: %v", err)
+	}
+	saved := lim
+	lim.Cur = min(512, lim.Max)
+	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &lim); err != nil {
+		t.Fatalf("cannot lower RLIMIT_NOFILE: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Setrlimit(unix.RLIMIT_NOFILE, &saved) })
+
+	resetProbeCaches1200(t)
+	var dups []int
+	restore := swap1200(t, &probeListen, func() (net.Listener, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		// Fill the table, then give one slot back: the probe's dial takes it,
+		// and the accept of that connection finds none.
+		for {
+			fd, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+			if err != nil {
+				break
+			}
+			dups = append(dups, fd)
+		}
+		if len(dups) > 0 {
+			_ = unix.Close(dups[len(dups)-1])
+			dups = dups[:len(dups)-1]
+		}
+		return ln, nil
+	})
+	got, why := p.cached()
+	restore()
+	for _, fd := range dups {
+		_ = unix.Close(fd)
+	}
+	if p.ok(got) || !strings.Contains(why, "out of a resource") || !strings.Contains(why, "cqe.res=-24") {
+		t.Fatalf("with the descriptor table full the probe answered %s (%q), want a negative from a -EMFILE completion (out of a resource)", got, why)
+	}
+	if got, why := p.cached(); got != want {
+		t.Errorf("after the table was emptied the next call answered %s (%q), want the kernel's %s: the -EMFILE completion was kept", got, why, want)
 	}
 }
