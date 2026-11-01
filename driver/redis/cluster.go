@@ -88,6 +88,8 @@ type ClusterClient struct {
 	// refreshTopologySince).
 	refMu   sync.Mutex
 	refLast *topoRefresh
+	// refSeq counts the topology reads that have started (guarded by refMu).
+	refSeq uint64
 
 	closeCh chan struct{}
 	closed  atomic.Bool
@@ -343,19 +345,27 @@ func (c *ClusterClient) anyNode() *clusterNode {
 	return nil
 }
 
-// topoRefresh is one topology refresh: when it started, and, once done is
-// closed, how it ended.
+// topoMark is a position in the sequence of topology reads of a ClusterClient:
+// the number of reads that had started when it was taken. A caller takes one at
+// the moment its reason to look arose (topoMark), and may share a read whose
+// sequence number is greater: that read started after the reason, by the
+// order in which reads are registered under refMu. No clock is involved, so the
+// rule is the same on a clock too coarse to tell two instants apart (Windows).
+type topoMark uint64
+
+// topoRefresh is one topology refresh: its sequence number (the order in which
+// reads started) and, once done is closed, how it ended.
 type topoRefresh struct {
-	start time.Time
-	done  chan struct{}
-	err   error
+	seq  uint64
+	done chan struct{}
+	err  error
 	// cut is set when it failed while its own caller's context had ended.
 	cut bool
 }
 
 // joinable reports whether a caller that needs a table read after its own
 // trigger may use the outcome of f: f started after that moment (checked by the
-// caller) and either runs, or ended with a table or with a node's failure. A
+// caller, by sequence number) and either runs, or ended with a table or with a node's failure. A
 // refresh that ended because its own caller's context ended says nothing.
 // The caller holds refMu.
 func (f *topoRefresh) joinable() bool {
@@ -371,35 +381,46 @@ func (f *topoRefresh) joinable() bool {
 // slot-to-node mapping, including replica nodes and per-node latency. It always
 // reads the table; refreshTopologySince is the variant that may share a read.
 func (c *ClusterClient) refreshTopology(ctx context.Context) error {
-	f := &topoRefresh{start: time.Now(), done: make(chan struct{})}
 	c.refMu.Lock()
-	c.refLast = f
+	f := c.newRefreshLocked()
 	c.refMu.Unlock()
 	return c.runRefresh(ctx, f)
 }
 
+// newRefreshLocked registers a topology read that is about to start: it takes the
+// next sequence number and becomes the latest read. The caller holds refMu.
+func (c *ClusterClient) newRefreshLocked() *topoRefresh {
+	c.refSeq++
+	f := &topoRefresh{seq: c.refSeq, done: make(chan struct{})}
+	c.refLast = f
+	return f
+}
+
+// topoMark returns the position now in the sequence of topology reads: the
+// reads that start from here on are the ones that started after the caller's
+// reason to look.
+func (c *ClusterClient) topoMark() topoMark {
+	c.refMu.Lock()
+	defer c.refMu.Unlock()
+	return topoMark(c.refSeq)
+}
+
 // refreshTopologySince is refreshTopology for a caller that needs a table read
-// at or after since (the moment its reason to look arose): it uses the latest
-// refresh if that started at or after since, running or done, instead of
-// sending its own CLUSTER SLOTS. N PubSubs hit by one slot move, or retrying
-// the same outage, then cost one CLUSTER SLOTS per window in which none of
-// their triggers is newer than the last read, not N (celeris#1203). A refresh
-// that began before since is never used: its reply may predate the event. The
-// check and the registration of a new refresh are one step under refMu, so
-// callers that arrive together start one.
-//
-// The comparison is strict on one side only: a read that started at the same
-// instant as since is shared. Both are monotonic readings; on a clock coarse
-// enough for the two to tie (the reroute loop takes since a whole jittered
-// backoff before it asks, so a tie needs a tick longer than 40 ms), the cost of
-// a wrong share is one backoff step, and the next attempt's since is newer.
-func (c *ClusterClient) refreshTopologySince(ctx context.Context, since time.Time) error {
+// that started after mark (taken by topoMark at the moment its reason to look
+// arose): it uses the latest read if that started after mark, running or done,
+// instead of sending its own CLUSTER SLOTS. N PubSubs hit by one slot move, or
+// retrying the same outage, then cost one CLUSTER SLOTS per window in which none
+// of their triggers is newer than the last read, not N (celeris#1203). A read
+// that began before mark is never used: its reply may predate the event. The
+// check and the registration of a new read are one step under refMu, so callers
+// that arrive together start one. "After" is the order of registration under
+// refMu, not a timestamp, so it holds on any clock.
+func (c *ClusterClient) refreshTopologySince(ctx context.Context, mark topoMark) error {
 	for {
 		c.refMu.Lock()
 		f := c.refLast
-		if f == nil || f.start.Before(since) || !f.joinable() {
-			f = &topoRefresh{start: time.Now(), done: make(chan struct{})}
-			c.refLast = f
+		if f == nil || f.seq <= uint64(mark) || !f.joinable() {
+			f = c.newRefreshLocked()
 			c.refMu.Unlock()
 			return c.runRefresh(ctx, f)
 		}

@@ -793,10 +793,14 @@ func (ps *PubSub) reconnectLoop() {
 		if ps.closed.Load() {
 			return
 		}
-		// The moment the reason for this attempt arose: the trigger for the
-		// first one, the failure of the last for the others. A topology read
-		// that started after it is as good as one of the loop's own.
-		since := time.Now()
+		// The position in the route's topology reads when the reason for this
+		// attempt arose: the trigger for the first one, the failure of the last
+		// for the others. A topology read that started after it is as good as
+		// one of the loop's own.
+		var mark topoMark
+		if ps.route != nil {
+			mark = ps.route.topoMark()
+		}
 		delay := ps.backoff.Next(attempt)
 		// The next loop of this outage (a conn that dies right after its
 		// replay starts one) continues from the next attempt.
@@ -809,7 +813,7 @@ func (ps *PubSub) reconnectLoop() {
 		// The first attempt of an outage goes back to the node it lost (a
 		// blip is the common case); a later one, or a conn that died soon
 		// after its replay, looks elsewhere.
-		client, err := ps.pickClient(attempt > 0, since)
+		client, err := ps.pickClient(attempt > 0, mark)
 		if err != nil {
 			if errors.Is(err, ErrClosed) {
 				// The owner of the route is closed: nothing to re-route to,
@@ -964,7 +968,7 @@ func (ps *PubSub) sleep(d time.Duration) bool {
 // pickClient returns the client the next dial goes to. moveOn says the last
 // client tried did not work out (a failed dial or a replay that did not hold),
 // so a route that has a choice picks another.
-func (ps *PubSub) pickClient(moveOn bool, since time.Time) (*Client, error) {
+func (ps *PubSub) pickClient(moveOn bool, mark topoMark) (*Client, error) {
 	if ps.route == nil {
 		return ps.client, nil
 	}
@@ -979,7 +983,7 @@ func (ps *PubSub) pickClient(moveOn bool, since time.Time) (*Client, error) {
 		}
 	}
 	ps.mu.Unlock()
-	return ps.route.pick(ps.ctx, shard, ps.routeCur, moveOn, since)
+	return ps.route.pick(ps.ctx, shard, ps.routeCur, moveOn, mark)
 }
 
 // servedSlotLocked returns the slot of the shard channels the PubSub serves:

@@ -172,7 +172,7 @@ func TestShardedRerouteDoesNotJoinARunningRefreshOlderThanItsTrigger1203(t *test
 func TestRefreshJoinerReadsAgainWhenTheReadItJoinedWasCancelled1203(t *testing.T) {
 	cl := newRPCluster(t, 3)
 	cc := newRPClusterClient(t, cl)
-	since := time.Now()
+	mark := cc.topoMark()
 	snap := make(chan struct{})
 	release := make(chan struct{})
 	h := func() { close(snap); <-release }
@@ -181,11 +181,11 @@ func TestRefreshJoinerReadsAgainWhenTheReadItJoinedWasCancelled1203(t *testing.T
 
 	actx, acancel := context.WithCancel(context.Background())
 	aerr := make(chan error, 1)
-	go func() { aerr <- cc.refreshTopologySince(actx, since) }()
+	go func() { aerr <- cc.refreshTopologySince(actx, mark) }()
 	<-snap // A's read runs, its reply held
 	before := cl.slotsReplies.Load()
 	berr := make(chan error, 1)
-	go func() { berr <- cc.refreshTopologySince(rpCtx(t), since) }()
+	go func() { berr <- cc.refreshTopologySince(rpCtx(t), mark) }()
 	time.Sleep(50 * time.Millisecond) // B joined A's read
 	acancel()
 	if err := <-aerr; err == nil {
@@ -224,5 +224,38 @@ func TestTopologyReadTriesTheNextNodeWhenTheProbeIsDown1203(t *testing.T) {
 	}
 	if cc.route(0) == nil {
 		t.Fatal("the table is empty")
+	}
+}
+
+// "After" is the order in which reads are registered, not a timestamp: calls
+// made back to back, in the same clock tick on a coarse clock (Windows), still
+// share exactly what they should. A mark taken after a read does not share it,
+// however close in time; a mark taken before it does.
+func TestRefreshTopologySinceOrdersByRegistrationNotByTime1203(t *testing.T) {
+	cl := newRPCluster(t, 3)
+	cc := newRPClusterClient(t, cl)
+	ctx := rpCtx(t)
+	for i := 0; i < 300; i++ {
+		before := cc.topoMark()
+		if err := cc.refreshTopology(ctx); err != nil {
+			t.Fatal(err)
+		}
+		n := cl.slotsReplies.Load()
+		// Marked after the read above: it is not newer than the mark, so a read
+		// of its own is needed.
+		if err := cc.refreshTopologySince(ctx, cc.topoMark()); err != nil {
+			t.Fatal(err)
+		}
+		if got := cl.slotsReplies.Load() - n; got != 1 {
+			t.Fatalf("round %d: a mark taken after a read shared it (%d new reads, want 1)", i, got)
+		}
+		// Marked before the latest read started: shares it.
+		n = cl.slotsReplies.Load()
+		if err := cc.refreshTopologySince(ctx, before); err != nil {
+			t.Fatal(err)
+		}
+		if got := cl.slotsReplies.Load() - n; got != 0 {
+			t.Fatalf("round %d: a mark taken before a read did not share it (%d new reads, want 0)", i, got)
+		}
 	}
 }
