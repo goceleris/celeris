@@ -55,6 +55,9 @@ type rpNode struct {
 	onSSub func(n *rpNode, c *rpConn, ch string)
 	// subCmds counts SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE commands received.
 	subCmds atomic.Int64
+	// ssubLog is the arguments (channels) of every SSUBSCRIBE received, in
+	// order, answered or not. Guarded by mu; read it with ssubCommands.
+	ssubLog [][]string
 	// ssubErrs are error replies the next SSUBSCRIBE commands get, one each,
 	// before the node answers them normally. Guarded by mu.
 	ssubErrs []string
@@ -70,6 +73,13 @@ func (n *rpNode) setOnSSub(f func(n *rpNode, c *rpConn, ch string)) {
 	n.mu.Lock()
 	n.onSSub = f
 	n.mu.Unlock()
+}
+
+// ssubCommands returns the channels of every SSUBSCRIBE the node received.
+func (n *rpNode) ssubCommands() [][]string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([][]string(nil), n.ssubLog...)
 }
 
 func (n *rpNode) setSSubErrs(errs ...string) {
@@ -474,6 +484,7 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 	case "SSUBSCRIBE":
 		n.subCmds.Add(1)
 		n.mu.Lock()
+		n.ssubLog = append(n.ssubLog, append([]string(nil), cmd[1:]...))
 		var forced string
 		if len(n.ssubErrs) > 0 {
 			forced, n.ssubErrs = n.ssubErrs[0], n.ssubErrs[1:]
@@ -519,6 +530,13 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 			}
 		}
 	case "SUNSUBSCRIBE":
+		// Like Redis 7 (checked on 8.0.2), a command across slots is refused.
+		for _, ch := range cmd[1:] {
+			if Slot(ch) != Slot(cmd[1]) {
+				writeError(c.w, "CROSSSLOT Keys in request don't hash to the same slot")
+				return nil
+			}
+		}
 		// Like Redis 7, a node that does not serve the slot of a channel it
 		// holds no subscription for answers -MOVED.
 		for _, ch := range cmd[1:] {
