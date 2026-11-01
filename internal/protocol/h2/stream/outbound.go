@@ -54,7 +54,7 @@ import (
 // requests. On epoll, io_uring and adaptive a sync handler that waits for it holds
 // its event loop, and so every connection on that loop, and with a rate a reader
 // that takes its floor would hold it for the whole download: so while an event loop
-// of the server has been in one batch for half a WriteTimeout (at least 250 ms)
+// of the server has been in one batch for half a WriteTimeout (at least 2 s)
 // every waiting handler that has waited a WriteTimeout is bounded by WriteTimeout in
 // all, as before (LoopWatch). With WriteTimeout disabled there is no bound: the wait
 // lasts until the peer grants window or the connection closes, and never ends if the

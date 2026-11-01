@@ -516,7 +516,7 @@ func TestIdleAllowanceIsFixedWhenTheRunBegins1170(t *testing.T) {
 }
 
 // While an event loop is stuck in one batch for half a WriteTimeout (and at least
-// 250 ms) a waiter that has waited a whole WriteTimeout is reset at its next
+// 2 s) a waiter that has waited a whole WriteTimeout is reset at its next
 // judgement, whatever its seed and credit say; just under the threshold it is not.
 func TestWaiterLoopBlockedFallback1170(t *testing.T) {
 	for _, tc := range []struct {
@@ -524,8 +524,8 @@ func TestWaiterLoopBlockedFallback1170(t *testing.T) {
 		stuck  time.Duration // how long the loop has been in its batch when the waiter first blocks
 		blocks bool
 	}{
-		{"just under the threshold", 200 * time.Millisecond, false},
-		{"just over the threshold", 400 * time.Millisecond, true},
+		{"just under the threshold", 1500 * time.Millisecond, false},
+		{"just over the threshold", 2100 * time.Millisecond, true},
 		{"no loop stuck", 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -587,8 +587,8 @@ func TestLoopWatch1170(t *testing.T) {
 	var nilSlot *LoopSlot
 	nilSlot.Enter(1)
 	nilSlot.Leave() // a loop without a slot (a test) is not a crash
-	if loopStuckFor(int64(time.Second)) != int64(500*time.Millisecond) || loopStuckFor(int64(100*time.Millisecond)) != int64(250*time.Millisecond) {
-		t.Fatal("the threshold is half a WriteTimeout, at least 250 ms")
+	if loopStuckFor(int64(time.Second)) != int64(2*time.Second) || loopStuckFor(int64(10*time.Second)) != int64(5*time.Second) {
+		t.Fatal("the threshold is half a WriteTimeout, at least 2 s")
 	}
 }
 
@@ -716,7 +716,7 @@ func TestLoopWatchTellsAnEpisodeOnce1170(t *testing.T) {
 	wt := int64(time.Second)
 	now := mono.Now()
 	for i := 0; i < 5; i++ { // five judgements that see the loop stuck: one line
-		slot.Enter(now - int64(time.Second))
+		slot.Enter(now - int64(3*time.Second))
 		if idx, _, ok := lw.stuck(now, loopStuckFor(wt)); ok {
 			lw.noteStuck(idx, 0, wt)
 		}
@@ -726,7 +726,7 @@ func TestLoopWatchTellsAnEpisodeOnce1170(t *testing.T) {
 	}
 	slot.Leave() // it ends: a judgement that finds no loop stuck ends the episode
 	lw.noteClear()
-	slot.Enter(now - int64(time.Second))
+	slot.Enter(now - int64(3*time.Second))
 	lw.noteStuck(0, 0, wt)
 	if got := h.n.Load(); got != 2 {
 		t.Fatalf("%d lines after a second episode, want 2", got)
