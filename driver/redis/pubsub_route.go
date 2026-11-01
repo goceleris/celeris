@@ -29,6 +29,12 @@ type pubsubRoute interface {
 	pick(ctx context.Context, shard string, cur *Client, moveOn bool, since time.Time) (*Client, error)
 	// dialed reports the outcome of a dial on cl.
 	dialed(cl *Client, ok bool)
+	// owns reports whether cl, the client a replay is about to write to, is the
+	// owner of slot by the topology the route knows (it has just refreshed it
+	// for a sharded reroute). A replay sends a shard channel of a slot the
+	// PubSub does not serve only to the owner: any other node answers -MOVED, and
+	// a slot with no owner -CLUSTERDOWN, which would start another reroute.
+	owns(cl *Client, slot uint16) bool
 	// slotted reports whether the route serves shard channels by slot (a
 	// cluster): the PubSub then serves one slot and ignores a -MOVED for
 	// another.
@@ -81,6 +87,11 @@ func (r clusterPubSubRoute) pick(ctx context.Context, shard string, cur *Client,
 		return n.client, nil
 	}
 	return c.pubsubNode(cur, moveOn)
+}
+
+func (r clusterPubSubRoute) owns(cl *Client, slot uint16) bool {
+	n := r.c.route(slot)
+	return n != nil && n.client == cl
 }
 
 func (clusterPubSubRoute) slotted() bool { return true }
@@ -191,5 +202,7 @@ func (r sentinelPubSubRoute) pick(context.Context, string, *Client, bool, time.T
 }
 
 func (r sentinelPubSubRoute) dialed(*Client, bool) {}
+
+func (sentinelPubSubRoute) owns(*Client, uint16) bool { return true }
 
 func (sentinelPubSubRoute) slotted() bool { return false }

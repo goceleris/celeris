@@ -49,9 +49,11 @@ type ClusterConfig struct {
 
 	PoolSize         int
 	MaxIdlePerWorker int
-	DialTimeout      time.Duration
-	ReadTimeout      time.Duration
-	WriteTimeout     time.Duration
+	// DialTimeout bounds each new node connection's TCP connect and, separately,
+	// its handshake; default 5s. See [Config].DialTimeout.
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 	// MaxRedirects is the maximum number of MOVED/ASK redirects before an
 	// error is returned. Default: 3.
 	MaxRedirects int
@@ -1130,11 +1132,12 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 
 // SSubscribe opens a pub/sub connection and subscribes to shard channels
 // (Redis 7+ SSUBSCRIBE). Shard channels are slot-scoped: the connection is
-// established to the node owning the slot of the first channel. All channels
-// SHOULD hash to the same slot (use hash tags); mixing slots in one PubSub is
-// undefined behavior in cluster mode. Like [Client.Subscribe], it returns the
-// PubSub and a nil error when the conn is found down on the first SSUBSCRIBE:
-// the reconnect replays the channels.
+// established to the node owning the slot of the first channel. All channels of
+// one call must hash to the same slot (use hash tags): a call whose channels
+// span slots returns [ErrCrossSlot], as the cluster would answer the command,
+// and so does [PubSub.SSubscribe] on the PubSub it returns. Like
+// [Client.Subscribe], it returns the PubSub and a nil error when the conn is
+// found down on the first SSUBSCRIBE: the reconnect replays the channels.
 //
 // The PubSub follows its slot: when the owner goes away, or the slot moves (the
 // server drops the subscription with an unsolicited sunsubscribe, or answers
@@ -1142,22 +1145,33 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 // again on the new owner and keeps delivering to the same [PubSub.Channel],
 // with the PubSub's reconnect backoff between attempts and no limit. A message
 // published while it switches is lost (a gap); one owner serves a slot, so the
-// switch cannot deliver a message twice. One PubSub serves one slot, the slot of
-// its first channel; a channel of another slot added to it later is not served.
-// If another node owns that slot, the SSUBSCRIBE is answered -MOVED, which is not
-// reported, and the channel is not subscribed. If the same node owns it, the node
-// accepts it and delivers it, until the next reroute of any kind, whose replay
-// sends only the channels of the served slot and leaves it out; the move of that
-// slot does not reroute the PubSub. If the first channel is removed while a
-// channel of another node's slot remains, that channel is not subscribed until
-// the next reroute of any kind, whose replay serves the re-selected slot. See
-// [ClusterClient.Subscribe] for what the caller sees while it is down and when
-// the ClusterClient is closed.
+// switch cannot deliver a message twice.
+//
+// One PubSub holds one conn, so it is on one node. It serves the slot of its
+// first channel (and the route follows that slot); channels of other slots can
+// be added by separate [PubSub.SSubscribe] calls and are subscribed where the
+// node the PubSub is on owns their slot. If another node owns it, the
+// SSUBSCRIBE is answered -MOVED, which is not reported, and the channel is not
+// subscribed. A reroute of any kind replays the channels of the served slot and
+// of every other slot the new node owns by the topology the reroute has just
+// read, one SSUBSCRIBE per slot (the served slot first): a channel of another
+// slot is subscribed again if the new node owns its slot, and is left out, with
+// no error, if another node or nobody owns it. The move of a slot other than the
+// served one does not reroute the PubSub. If the first channel is removed while a channel of another node's
+// slot remains, that channel is not subscribed until the next reroute of any
+// kind, whose replay serves the re-selected slot. See [ClusterClient.Subscribe]
+// for what the caller sees while it is down and when the ClusterClient is
+// closed.
 func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	if len(channels) == 0 {
 		return nil, errors.New("celeris-redis: SSubscribe requires at least one channel")
 	}
 	slot := Slot(channels[0])
+	for _, ch := range channels[1:] {
+		if Slot(ch) != slot {
+			return nil, ErrCrossSlot
+		}
+	}
 	node := c.route(slot)
 	if node == nil {
 		node = c.anyNode()

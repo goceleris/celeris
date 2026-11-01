@@ -42,6 +42,8 @@ var ErrTxAborted = errors.New("celeris-redis: transaction aborted")
 // ErrCrossSlot is returned by [ClusterTx] and [ClusterClient.Watch] when the
 // queued commands (or watched keys) span multiple hash slots. Redis Cluster
 // requires all keys in a MULTI/EXEC transaction to reside in the same slot.
+// It is also returned by [ClusterClient.SSubscribe] and by [PubSub.SSubscribe]
+// on the PubSub of a [ClusterClient] when the channels of one call span slots.
 // Use hash tags (e.g. "{tag}") to colocate related keys.
 var ErrCrossSlot = errors.New("celeris-redis: CROSSSLOT keys in request don't hash to the same slot; use hash tags {}")
 

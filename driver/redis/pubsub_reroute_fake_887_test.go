@@ -60,6 +60,9 @@ type rpNode struct {
 	onSSub func(n *rpNode, c *rpConn, ch string)
 	// subCmds counts SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE commands received.
 	subCmds atomic.Int64
+	// ssubLog is the arguments (channels) of every SSUBSCRIBE received, in
+	// order, answered or not. Guarded by mu; read it with ssubCommands.
+	ssubLog [][]string
 	// ssubErrs are error replies the next SSUBSCRIBE commands get, one each,
 	// before the node answers them normally. Guarded by mu.
 	ssubErrs []string
@@ -75,6 +78,13 @@ func (n *rpNode) setOnSSub(f func(n *rpNode, c *rpConn, ch string)) {
 	n.mu.Lock()
 	n.onSSub = f
 	n.mu.Unlock()
+}
+
+// ssubCommands returns the channels of every SSUBSCRIBE the node received.
+func (n *rpNode) ssubCommands() [][]string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([][]string(nil), n.ssubLog...)
 }
 
 func (n *rpNode) setSSubErrs(errs ...string) {
@@ -149,6 +159,16 @@ func (cl *rpCluster) moveSlot(slot int, to *rpNode, staleReplies int) {
 	cl.stale = staleReplies
 	cl.mu.Unlock()
 	from.sunsubscribeSlot(slot)
+}
+
+// unbind leaves slot with no owner, as a DELSLOTS does with
+// cluster-require-full-coverage no: CLUSTER SLOTS does not list it and a node
+// answers a command on it -CLUSTERDOWN Hash slot not served.
+func (cl *rpCluster) unbind(slot int) {
+	cl.mu.Lock()
+	cl.cur[slot] = nil
+	cl.old[slot] = nil
+	cl.mu.Unlock()
 }
 
 // failover gives every slot of from to to, as a promoted replica does.
@@ -479,6 +499,7 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 	case "SSUBSCRIBE":
 		n.subCmds.Add(1)
 		n.mu.Lock()
+		n.ssubLog = append(n.ssubLog, append([]string(nil), cmd[1:]...))
 		var forced string
 		if len(n.ssubErrs) > 0 {
 			forced, n.ssubErrs = n.ssubErrs[0], n.ssubErrs[1:]
@@ -496,7 +517,10 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 		}
 		for _, ch := range cmd[1:] {
 			slot := int(Slot(ch))
-			if o := n.cl.owner(slot); o != n {
+			if o := n.cl.owner(slot); o == nil {
+				writeError(c.w, "CLUSTERDOWN Hash slot not served")
+				return nil
+			} else if o != n {
 				writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, o.addr))
 				return nil
 			}
@@ -524,6 +548,13 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 			}
 		}
 	case "SUNSUBSCRIBE":
+		// Like Redis 7 (checked on 8.0.2), a command across slots is refused.
+		for _, ch := range cmd[1:] {
+			if Slot(ch) != Slot(cmd[1]) {
+				writeError(c.w, "CROSSSLOT Keys in request don't hash to the same slot")
+				return nil
+			}
+		}
 		// Like Redis 7, a node that does not serve the slot of a channel it
 		// holds no subscription for answers -MOVED.
 		for _, ch := range cmd[1:] {
@@ -531,7 +562,11 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 			_, held := c.ssubs[ch]
 			c.mu.Unlock()
 			if slot := int(Slot(ch)); !held && n.cl.owner(slot) != n {
-				writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, n.cl.owner(slot).addr))
+				if o := n.cl.owner(slot); o == nil {
+					writeError(c.w, "CLUSTERDOWN Hash slot not served")
+				} else {
+					writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, o.addr))
+				}
 				return nil
 			}
 		}
