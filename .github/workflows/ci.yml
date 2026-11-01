@@ -486,7 +486,7 @@ jobs:
             exit 1
           fi
           .github/scripts/timeout-headroom.sh /tmp/iouring-pkg.log "$iouring_timeout"
-      # celeris#890 items 18, 19 and 61: five groups of tests that the two steps
+      # celeris#890 items 18, 19, 61 and 4: six groups of tests that the two steps
       # above run (-v, so their logs are /tmp/root.log and /tmp/iouring-pkg.log)
       # and count only as part of a skip tally, never by name. A tally of skips
       # is blind to a test that is renamed or removed (nothing runs, nothing
@@ -504,13 +504,16 @@ jobs:
       #     CPU set) and TestInlineHandlerChildKeepsTheProcessMask919 of
       #     ./test/server (they run in a process of their own and skip when it may
       #     use fewer than 3 CPUs for the unpinned-loops test and fewer than 2 for
-      #     the 919 test, which a runner with 4 CPUs does not).
+      #     the 919 test, which a runner with 4 CPUs does not);
+      #   * TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits of
+      #     internal/engine/epoll (celeris#727, #890 item 4), which the Unit job
+      #     also runs, without -v, in the mono-skew canary step.
       # .github/scripts/named-tally.sh prints "want N, ran N, passed N, SKIP lines
       # K, FAIL lines F" per group and lists each test that is not exactly one
       # RUN and one PASS; its self-test (a captured log, a missing, a skipped and
       # a failed test) is a Lint step. The step runs after the two it reads and
       # fails when either log is missing.
-      - name: celeris#890 by-name tally (park_close_fin, park_stale_clock, 909, 919)
+      - name: celeris#890 by-name tally (park_close_fin, park_stale_clock, 909, 919, 727)
         if: ${{ !cancelled() }}
         shell: bash
         run: |
@@ -544,6 +547,8 @@ jobs:
               TestFailedPinIsLoggedOnceAndNotPretended909 || bad=1
             "$tally" 'inline handler child mask (celeris#919)' /tmp/root.log \
               TestInlineHandlerChildKeepsTheProcessMask919 || bad=1
+            "$tally" 'epoll deferred transplant (celeris#727)' /tmp/root.log \
+              TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits || bad=1
           }
           if [ "$bad" -ne 0 ]; then
             echo "expected every test listed above to run once and PASS with no SKIP line -- was one renamed,"
@@ -1932,14 +1937,15 @@ jobs:
 
   # NOT a required check: the repository's ruleset ("Main — CI") requires Lint,
   # "Unit (root + middleware sub-modules)" (the `unit-gate` job), Conformance,
-  # Driver Conformance, the two Build jobs and Vulnerability Check, and not this
-  # job. The skip-forbidding steps below (celeris#656, #895/#896, #691) therefore
-  # report on a pull request but do not stop its merge: a red run of this job has
-  # to be looked at, and a skip that slips in here is seen only by someone who
-  # reads the run. Making the job a required check is an org-admin ruleset
-  # change (celeris#890). The same holds for every job below `unit-gate` that
-  # the ruleset does not list (`adaptive`, `zc-window`, `recv-theft`,
-  # `windows-cross`, `portable-fallback`).
+  # Driver Conformance, the two Build jobs, Vulnerability Check, the two
+  # Cross-compile jobs (`windows-cross`) and the two Portable fallback jobs
+  # (`portable-fallback`), and not this job. The skip-forbidding steps below
+  # (celeris#656, #895/#896, #691) therefore report on a pull request but do not
+  # stop its merge: a red run of this job has to be looked at, and a skip that
+  # slips in here is seen only by someone who reads the run. Making the job a
+  # required check is an org-admin ruleset change (celeris#890). The same holds
+  # for every job below `unit-gate` that the ruleset does not list (`adaptive`,
+  # `zc-window`, `recv-theft`).
   iouring:
     name: io_uring init-failure regression (./internal/engine/iouring)
     runs-on: ubuntu-latest

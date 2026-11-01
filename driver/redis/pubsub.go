@@ -1,8 +1,10 @@
 package redis
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -345,7 +347,19 @@ func (ps *PubSub) PUnsubscribe(_ context.Context, patterns ...string) error {
 // SSubscribe adds shard channels (Redis 7+ SSUBSCRIBE) to the subscription
 // set. Shard channels are scoped to the cluster slot of the channel name. The
 // ctx argument is kept for API symmetry; cancellation is not honored.
+//
+// On the PubSub of a [ClusterClient], a call whose channels do not all hash to
+// one slot returns [ErrCrossSlot], as the cluster would answer the command: it
+// sends nothing and changes nothing (use hash tags, or one call per slot).
+// Channels of different slots may be added by separate calls; see
+// [ClusterClient.SSubscribe] for which of them the PubSub serves.
 func (ps *PubSub) SSubscribe(_ context.Context, channels ...string) error {
+	if ps.closed.Load() {
+		return ErrClosed
+	}
+	if ps.crossSlot(channels) {
+		return ErrCrossSlot
+	}
 	return ps.control("SSUBSCRIBE", channels, func() {
 		for _, ch := range channels {
 			if len(ps.shardSubs) == 0 {
@@ -358,9 +372,11 @@ func (ps *PubSub) SSubscribe(_ context.Context, channels ...string) error {
 
 // SUnsubscribe removes shard channels. Empty list unsubscribes all shard
 // channels. The ctx argument is kept for API symmetry; cancellation is not
-// honored.
+// honored. On the PubSub of a [ClusterClient] the channels of different slots
+// are sent as one SUNSUBSCRIBE per slot (a cluster refuses a command whose
+// keys span slots).
 func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
-	return ps.control("SUNSUBSCRIBE", channels, func() {
+	return ps.controlGroups("SUNSUBSCRIBE", ps.slotGroups(channels), func() {
 		if len(channels) == 0 {
 			ps.shardSubs = map[string]struct{}{}
 			ps.hasServed = false
@@ -375,6 +391,124 @@ func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
 	})
 }
 
+// slotted reports whether ps routes shard channels by cluster slot: the PubSub
+// of a [ClusterClient].
+func (ps *PubSub) slotted() bool { return ps.route != nil && ps.route.slotted() }
+
+// crossSlot reports whether channels, the arguments of one shard command on a
+// slot-routed PubSub, hash to more than one slot. A cluster refuses such a
+// command with -CROSSSLOT; on a PubSub in pubsub mode that reply is not matched
+// to its command and is dropped, so the client refuses it first. A PubSub that
+// is not routed by slots (a plain [Client]: a standalone server has no slots)
+// sends them as given.
+func (ps *PubSub) crossSlot(channels []string) bool {
+	if len(channels) < 2 || !ps.slotted() {
+		return false
+	}
+	first := Slot(channels[0])
+	for _, ch := range channels[1:] {
+		if Slot(ch) != first {
+			return true
+		}
+	}
+	return false
+}
+
+// slotGroups splits channels, the arguments of a shard command, into the
+// groups a slot-routed PubSub may send as one command each: one group per slot,
+// in the order the slots first appear. Any other PubSub, and an empty list, send
+// the channels as one command.
+func (ps *PubSub) slotGroups(channels []string) [][]string {
+	if len(channels) < 2 || !ps.slotted() {
+		return [][]string{channels}
+	}
+	var groups [][]string
+	at := map[uint16]int{}
+	for _, ch := range channels {
+		sl := Slot(ch)
+		i, ok := at[sl]
+		if !ok {
+			i = len(groups)
+			at[sl] = i
+			groups = append(groups, nil)
+		}
+		groups[i] = append(groups[i], ch)
+	}
+	return groups
+}
+
+// shardGroup is the channels of one slot a replay may subscribe. served marks
+// the slot the PubSub serves.
+type shardGroup struct {
+	slot   uint16
+	served bool
+	chans  []string
+}
+
+// shardReplayGroupsLocked returns the shard channels of a replay, grouped for
+// the SSUBSCRIBE commands. On a slot-routed PubSub a cluster refuses a command
+// whose keys span slots, so there is one group per slot, the channels of each
+// sorted, the served slot first (the subscription the route follows is the first
+// thing the new node learns) and the others by slot. Any other PubSub has one
+// group. The caller holds mu.
+func (ps *PubSub) shardReplayGroupsLocked() []shardGroup {
+	if len(ps.shardSubs) == 0 {
+		return nil
+	}
+	if !ps.slotted() {
+		all := make([]string, 0, len(ps.shardSubs))
+		for ch := range ps.shardSubs {
+			all = append(all, ch)
+		}
+		return []shardGroup{{chans: all}}
+	}
+	served, _ := ps.servedSlotLocked()
+	bySlot := make(map[uint16][]string)
+	for ch := range ps.shardSubs {
+		sl := Slot(ch)
+		bySlot[sl] = append(bySlot[sl], ch)
+	}
+	slots := make([]uint16, 0, len(bySlot))
+	for sl := range bySlot {
+		slots = append(slots, sl)
+	}
+	slices.SortFunc(slots, func(a, b uint16) int {
+		if (a == served) != (b == served) {
+			if a == served {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(a, b)
+	})
+	groups := make([]shardGroup, 0, len(slots))
+	for _, sl := range slots {
+		g := bySlot[sl]
+		slices.Sort(g)
+		groups = append(groups, shardGroup{slot: sl, served: sl == served, chans: g})
+	}
+	return groups
+}
+
+// ownedGroups returns the SSUBSCRIBE arguments of groups for a replay on
+// client. On a slot-routed PubSub the served slot is always sent; a slot the
+// PubSub does not serve is sent only if client owns it by the route's topology.
+// A node that does not answers -MOVED, which is ignored for a slot not served
+// (see onControlError), and a slot with no owner draws -CLUSTERDOWN, which is a
+// reroute trigger: sending it would make the replay of every reroute start the
+// next one, for ever (r5 of #1210). It is called with no lock held: the route
+// takes the cluster's.
+func (ps *PubSub) ownedGroups(groups []shardGroup, client *Client) [][]string {
+	out := make([][]string, 0, len(groups))
+	for _, g := range groups {
+		if ps.slotted() && !g.served && !ps.route.owns(client, g.slot) {
+			continue
+		}
+		out = append(out, g.chans)
+	}
+	return out
+}
+
 // control applies update to the tracked sets under mu, then sends verb with
 // names on the conn ps holds at that moment. The send runs under ctlMu, so
 // the conn cannot be released while it is in flight: the write goes to the
@@ -386,6 +520,15 @@ func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
 // open). ErrClosed is returned only when the PubSub is closed, including when
 // its Close raced the write and made it fail.
 func (ps *PubSub) control(verb string, names []string, update func()) error {
+	return ps.controlGroups(verb, [][]string{names}, update)
+}
+
+// controlGroups is control for a call that is sent as several commands of the
+// same verb, one per group of names (a SUNSUBSCRIBE across slots: a cluster
+// refuses it as one command). The sets are updated once, then every command is
+// written on the same conn under the same ctlMu hold; the first write error
+// ends the call.
+func (ps *PubSub) controlGroups(verb string, groups [][]string, update func()) error {
 	if ps.closed.Load() {
 		return ErrClosed
 	}
@@ -395,7 +538,12 @@ func (ps *PubSub) control(verb string, names []string, update func()) error {
 	update()
 	conn := ps.conn
 	ps.mu.Unlock()
-	err := sendPubSubControl(conn, append([]string{verb}, names...))
+	var err error
+	for _, names := range groups {
+		if err = sendPubSubControl(conn, append([]string{verb}, names...)); err != nil {
+			break
+		}
+	}
 	if err == nil {
 		return nil
 	}
@@ -645,6 +793,14 @@ func (ps *PubSub) reconnectLoop() {
 		if ps.closed.Load() {
 			return
 		}
+		// The position in the route's topology reads when the reason for this
+		// attempt arose: the trigger for the first one, the failure of the last
+		// for the others. A topology read that started after it is as good as
+		// one of the loop's own.
+		var mark topoMark
+		if ps.route != nil {
+			mark = ps.route.topoMark()
+		}
 		delay := ps.backoff.Next(attempt)
 		// The next loop of this outage (a conn that dies right after its
 		// replay starts one) continues from the next attempt.
@@ -657,7 +813,7 @@ func (ps *PubSub) reconnectLoop() {
 		// The first attempt of an outage goes back to the node it lost (a
 		// blip is the common case); a later one, or a conn that died soon
 		// after its replay, looks elsewhere.
-		client, err := ps.pickClient(attempt > 0)
+		client, err := ps.pickClient(attempt > 0, mark)
 		if err != nil {
 			if errors.Is(err, ErrClosed) {
 				// The owner of the route is closed: nothing to re-route to,
@@ -721,32 +877,27 @@ func (ps *PubSub) reconnectLoop() {
 		for p := range ps.psubs {
 			psubs = append(psubs, p)
 		}
-		ssubs := make([]string, 0, len(ps.shardSubs))
-		// A cluster serves one slot per SSUBSCRIBE (-CROSSSLOT otherwise), and
-		// one PubSub serves one slot: replay the channels of that slot, so a
-		// channel of another slot cannot take the rest down with it.
-		served, onlyServed := ps.servedSlotLocked()
-		onlyServed = onlyServed && ps.route != nil && ps.route.slotted()
-		for s := range ps.shardSubs {
-			if onlyServed && Slot(s) != served {
-				continue
-			}
-			ssubs = append(ssubs, s)
-		}
+		shardGroups := ps.shardReplayGroupsLocked()
 		ps.mu.Unlock()
+		ssubGroups := ps.ownedGroups(shardGroups, client)
 		ok := true
-		for _, r := range [...]struct {
-			verb  string
-			names []string
-		}{{"SUBSCRIBE", subs}, {"PSUBSCRIBE", psubs}, {"SSUBSCRIBE", ssubs}} {
-			if len(r.names) == 0 {
-				continue
-			}
+		// One command per kind; SSUBSCRIBE one per slot group on a cluster.
+		cmds := make([][]string, 0, 2+len(ssubGroups))
+		if len(subs) > 0 {
+			cmds = append(cmds, append([]string{"SUBSCRIBE"}, subs...))
+		}
+		if len(psubs) > 0 {
+			cmds = append(cmds, append([]string{"PSUBSCRIBE"}, psubs...))
+		}
+		for _, g := range ssubGroups {
+			cmds = append(cmds, append([]string{"SSUBSCRIBE"}, g...))
+		}
+		for _, args := range cmds {
 			if ps.closed.Load() {
 				ok = false
 				break
 			}
-			if err := sendPubSubControl(conn, append([]string{r.verb}, r.names...)); err != nil {
+			if err := sendPubSubControl(conn, args); err != nil {
 				ok = false
 				break
 			}
@@ -817,7 +968,7 @@ func (ps *PubSub) sleep(d time.Duration) bool {
 // pickClient returns the client the next dial goes to. moveOn says the last
 // client tried did not work out (a failed dial or a replay that did not hold),
 // so a route that has a choice picks another.
-func (ps *PubSub) pickClient(moveOn bool) (*Client, error) {
+func (ps *PubSub) pickClient(moveOn bool, mark topoMark) (*Client, error) {
 	if ps.route == nil {
 		return ps.client, nil
 	}
@@ -832,7 +983,7 @@ func (ps *PubSub) pickClient(moveOn bool) (*Client, error) {
 		}
 	}
 	ps.mu.Unlock()
-	return ps.route.pick(ps.ctx, shard, ps.routeCur, moveOn)
+	return ps.route.pick(ps.ctx, shard, ps.routeCur, moveOn, mark)
 }
 
 // servedSlotLocked returns the slot of the shard channels the PubSub serves:
@@ -886,9 +1037,11 @@ func (ps *PubSub) onShardUnsubscribed(from *pubsubRouter, ch string) {
 	if ps.conn == nil || ps.conn.state.router != from {
 		return
 	}
-	// Only the slot the PubSub serves: a channel of another slot that the same
-	// node happened to accept is dropped from the replay anyway, and its slot
-	// moving away is no reason to rebuild the subscription that is served.
+	// Only the slot the PubSub serves: its move does not reroute (the PubSub is
+	// on one node and follows one slot), and a rebuild for a slot it does not
+	// serve would only disturb the subscription that is served. A channel of
+	// another slot is replayed whenever the node a reroute lands on owns the slot
+	// (see ownedGroups), so it is back at the next reroute of any kind.
 	if served, ok := ps.servedSlotLocked(); ok && Slot(ch) == served {
 		if _, still := ps.shardSubs[ch]; still {
 			ps.trigger(true)

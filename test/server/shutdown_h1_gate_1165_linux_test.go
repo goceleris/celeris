@@ -5,9 +5,11 @@ package celeris_test
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -132,14 +134,28 @@ func runShutdownH1Gate1165(t *testing.T, eng celeris.EngineType, downloads bool)
 	// The engine has accepted every conn before the shutdown begins: a conn still
 	// in the accept queue (a loop busy formatting six 16 MiB responses under -race
 	// has not got to the upload's) is reset by the listener's close, which says
-	// nothing about the gate. Then the downloads are in the engine and the upload's
-	// first bytes are read.
+	// nothing about the gate. Then the engine has read what the downloads and the
+	// upload sent: a request whose head std's conn goroutine parses after the
+	// shutdown began is not one in progress but a new one, which net/http drops (it
+	// returns from the conn's goroutine once the head is parsed and the server is
+	// shutting down, closing the conn with the body unread: an RST, celeris#1166).
+	// epoll reads and answers a head still in the kernel at its first gate pass;
+	// io_uring is not covered by this comment (not verified). The conn counts are
+	// not enough (std counts a conn when it accepts it, before its goroutine has
+	// run) and nor is a sleep: a loop busy under -race can be a few hundred ms late
+	// to a conn. The wait is exact for the upload only: on std about 61 KiB of it
+	// stay in the kernel until the handler reads the body, which is past the
+	// shutting-down check. A download is a bare GET that std's first 4 KiB read
+	// empties before that check, and on io_uring an empty receive queue means the
+	// kernel handed the bytes over, not that the engine parsed them; for those the
+	// sleep below covers the rest (no assertion reads the downloads).
 	want := base + int64(len(idle)+len(dls)+1)
 	for dl := time.Now().Add(20 * time.Second); s.EngineInfo().Metrics.ActiveConnections < want; time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(dl) {
 			t.Fatalf("the engine counts %d conns, want %d before the shutdown begins", s.EngineInfo().Metrics.ActiveConnections, want)
 		}
 	}
+	waitServerReadAll1166(t, addr, append(append([]net.Conn(nil), dls...), up)...)
 	time.Sleep(300 * time.Millisecond)
 
 	begin := time.Now()
@@ -240,4 +256,78 @@ func settledEngineMetrics1104Server(s *celeris.Server) int64 {
 		prev = m
 	}
 	return prev
+}
+
+// waitServerReadAll1166 returns once, for each of conns, everything the client
+// has written is read by the server: the client's socket has no unacknowledged
+// byte (tx_queue 0) and the server's socket has no unread one (rx_queue 0), as
+// /proc/net/tcp has them. Loopback delivers a write before the call returns, so
+// a server socket with an empty queue has had its bytes read. It is the point
+// from which a request is in progress for the engine, however late the loop that
+// serves the conn is to it (a head the engine reads after the shutdown began is a
+// new request, not an upload in progress: see runShutdownH1Gate1165). Where
+// /proc/net/tcp cannot be read the wait is skipped and the test keeps its
+// sleep.
+func waitServerReadAll1166(t *testing.T, srvAddr string, conns ...net.Conn) {
+	t.Helper()
+	_, sport, err := net.SplitHostPort(srvAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for dl := time.Now().Add(20 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		queues, err := procTCPQueues1166()
+		if err != nil {
+			t.Logf("no /proc/net/tcp, the wait for the server's reads is skipped: %v", err)
+			return
+		}
+		pending := ""
+		for _, c := range conns {
+			cport := strconv.Itoa(c.LocalAddr().(*net.TCPAddr).Port)
+			tx, ok1 := queues[[2]string{cport, sport}] // the client's socket: local port, remote port
+			rx, ok2 := queues[[2]string{sport, cport}] // the server's socket
+			if !ok1 || !ok2 || tx.tx != 0 || rx.rx != 0 {
+				pending = fmt.Sprintf("client port %s: found %v/%v, unacknowledged %d, unread by the server %d", cport, ok1, ok2, tx.tx, rx.rx)
+				break
+			}
+		}
+		if pending == "" {
+			return
+		}
+		if time.Now().After(dl) {
+			t.Fatalf("the engine has not read what a client wrote 20 s before the shutdown begins: %s", pending)
+		}
+	}
+}
+
+type tcpQueues1166 struct{ tx, rx int64 }
+
+// procTCPQueues1166 is the tx and rx queues of every IPv4 socket, keyed by
+// (local port, remote port).
+func procTCPQueues1166() (map[[2]string]tcpQueues1166, error) {
+	b, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[[2]string]tcpQueues1166)
+	for _, line := range strings.Split(string(b), "\n")[1:] {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		lp := f[1][strings.LastIndexByte(f[1], ':')+1:]
+		rp := f[2][strings.LastIndexByte(f[2], ':')+1:]
+		lport, err1 := strconv.ParseInt(lp, 16, 32)
+		rport, err2 := strconv.ParseInt(rp, 16, 32)
+		q := strings.SplitN(f[4], ":", 2)
+		if err1 != nil || err2 != nil || len(q) != 2 {
+			continue
+		}
+		tx, err3 := strconv.ParseInt(q[0], 16, 64)
+		rx, err4 := strconv.ParseInt(q[1], 16, 64)
+		if err3 != nil || err4 != nil {
+			continue
+		}
+		out[[2]string{strconv.FormatInt(lport, 10), strconv.FormatInt(rport, 10)}] = tcpQueues1166{tx, rx}
+	}
+	return out, nil
 }

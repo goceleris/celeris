@@ -17,11 +17,14 @@ import (
 // triggers, so the cells below run on one fake node.
 type sameClientRoute struct{ c *Client }
 
-func (r sameClientRoute) pick(context.Context, string, *Client, bool) (*Client, error) {
+func (sameClientRoute) topoMark() topoMark { return 0 }
+
+func (r sameClientRoute) pick(context.Context, string, *Client, bool, topoMark) (*Client, error) {
 	return r.c, nil
 }
-func (sameClientRoute) dialed(*Client, bool) {}
-func (sameClientRoute) slotted() bool        { return true }
+func (sameClientRoute) dialed(*Client, bool)      {}
+func (sameClientRoute) owns(*Client, uint16) bool { return true }
+func (sameClientRoute) slotted() bool             { return true }
 
 // routedPubSub opens a RESP2 PubSub on the only node of cl with a route.
 func routedPubSub(t *testing.T, cl *rpCluster, resp2 bool) *PubSub {

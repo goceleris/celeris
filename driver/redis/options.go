@@ -25,7 +25,10 @@ type Config struct {
 	Username string
 	// DB is the numeric database index applied via SELECT post-HELLO.
 	DB int
-	// DialTimeout is the TCP dial timeout; default 5s.
+	// DialTimeout bounds each new connection's TCP connect and, separately,
+	// its handshake (HELLO, then AUTH and SELECT); default 5s. A server that
+	// accepts the connection and does not answer the handshake fails the dial
+	// after DialTimeout, also when the caller's context has no deadline.
 	DialTimeout time.Duration
 	// ReadTimeout is unused currently — responses are driven by the event
 	// loop and cancellation is via the request context.
@@ -76,7 +79,8 @@ func WithUsername(s string) Option { return func(c *Config) { c.Username = s } }
 // WithDB selects a database index.
 func WithDB(db int) Option { return func(c *Config) { c.DB = db } }
 
-// WithDialTimeout sets the TCP dial timeout.
+// WithDialTimeout sets Config.DialTimeout: the bound of a new connection's TCP
+// connect and of its handshake, each.
 func WithDialTimeout(d time.Duration) Option { return func(c *Config) { c.DialTimeout = d } }
 
 // WithReadTimeout sets the read timeout (currently advisory).
