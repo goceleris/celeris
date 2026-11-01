@@ -772,6 +772,9 @@ type pgConn struct {
 
 	createdAt  time.Time
 	lastUsedAt atomic.Int64 // unix nanos
+	// connectDeadline is when Options.ConnectTimeout, counted from the start of
+	// the dial, runs out; the zero time if it is unset. doStartup ends at it.
+	connectDeadline time.Time
 
 	maxLifetime time.Duration
 	maxIdleTime time.Duration
@@ -1072,7 +1075,7 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	dialer := net.Dialer{Timeout: dsn.Options.ConnectTimeout}
+	dialer, dialStart := beginDial(dsn.Options)
 	raw, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
 		return nil, err
@@ -1106,6 +1109,8 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 		pending:      make([]*pgRequest, 0, 8),
 		createdAt:    time.Now(),
 		serverParams: map[string]string{},
+
+		connectDeadline: connectDeadline(dialStart, dsn.Options),
 	}
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
@@ -1116,9 +1121,88 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 	return c, nil
 }
 
-// doStartup performs the full startup handshake synchronously. The event loop
-// delivers bytes to onRecv, which drives the StartupState machine via a
-// dedicated pgRequest of kind reqStartup.
+// testHookAfterDialStart, when set, runs right after the clock of ConnectTimeout
+// started and before the TCP connect: a test makes the connect slow with it (a
+// loopback connect takes no measurable time).
+var testHookAfterDialStart atomic.Pointer[func()]
+
+// beginDial starts the clock of o.ConnectTimeout, which counts the dial and the
+// startup together, and returns the dialer for the TCP connect and the time the
+// clock started. Every dial path calls it first, before the connect.
+func beginDial(o Options) (net.Dialer, time.Time) {
+	start := time.Now()
+	if h := testHookAfterDialStart.Load(); h != nil {
+		(*h)()
+	}
+	return net.Dialer{Timeout: o.ConnectTimeout}, start
+}
+
+// connectDeadline is when o.ConnectTimeout, counted from dialStart, runs out: the
+// time the dial plus the startup have. The zero time if ConnectTimeout is unset.
+func connectDeadline(dialStart time.Time, o Options) time.Time {
+	if o.ConnectTimeout <= 0 {
+		return time.Time{}
+	}
+	return dialStart.Add(o.ConnectTimeout)
+}
+
+// startupBound ends a startup that must not go on: the caller's context ended, or
+// ConnectTimeout (counted from the start of the dial) ran out. The startup waits
+// for the server, in a place that does not look at a context (a read on the
+// socket in direct mode, the request's done channel on a loop), so the bound
+// fails the request and, in direct mode, wakes the read.
+type startupBound struct {
+	c       *pgConn
+	mu      sync.Mutex
+	err     error // why the startup was ended; nil if it was not
+	done    bool  // the startup is over: abort does nothing from here on
+	stopCtx func() bool
+	timer   *time.Timer
+}
+
+// abort ends the startup with err. It does nothing once finish has run, or if an
+// earlier abort did.
+func (b *startupBound) abort(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.done || b.err != nil {
+		return
+	}
+	b.err = err
+	b.c.failAll(err)
+	if b.c.useDirect && b.c.tcp != nil {
+		// Wakes the blocked read of driveDirect (or a blocked write), which
+		// then sees the request failed.
+		_ = b.c.tcp.SetDeadline(time.Now())
+	}
+}
+
+// finish disarms the bound and returns the error the startup was ended with, nil
+// if it was not. An abort that is running is waited for, so a startup that
+// completed at the instant the bound fired is reported as ended: the abort has
+// failed the conn and (in direct mode) set a read deadline on its socket.
+func (b *startupBound) finish() error {
+	b.stopCtx()
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.done = true
+	return b.err
+}
+
+// doStartup performs the full startup handshake synchronously: the optional
+// authentication exchange, ParameterStatus and BackendKeyData, up to
+// ReadyForQuery. The event loop delivers bytes to onRecv, which drives the
+// StartupState machine via a dedicated pgRequest of kind reqStartup.
+//
+// The startup ends when the caller's context ends or when ConnectTimeout, counted
+// from the start of the dial, runs out (celeris#1212), whichever comes first. The
+// bound (startupBound) does it: wait's own handling of a cancelled context cannot,
+// as it sends a CancelRequest, which needs the BackendKeyData the startup has not
+// got yet, and then waits up to 30 s for a reply that is not coming (and direct
+// mode does not look at the context while it is blocked in a read).
 func (c *pgConn) doStartup(ctx context.Context) error {
 	st := &protocol.StartupState{
 		User:     c.dsn.User,
@@ -1134,12 +1218,30 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 		doneCh:  make(chan struct{}),
 	}
 	c.enqueue(req)
+	// The bound is armed before the first message is written, so it covers the
+	// write too (in direct mode a write to a peer that does not read can block).
+	b := &startupBound{c: c}
+	b.stopCtx = context.AfterFunc(ctx, func() { b.abort(ctx.Err()) })
+	if !c.connectDeadline.IsZero() {
+		d := time.Until(c.connectDeadline)
+		b.timer = time.AfterFunc(d, func() {
+			b.abort(fmt.Errorf("celeris-postgres: startup timed out (connect_timeout %v): %w",
+				c.dsn.Options.ConnectTimeout, context.DeadlineExceeded))
+		})
+	}
 	if err := c.writeRaw(initial); err != nil {
 		c.failReq(req, err)
+		if aerr := b.finish(); aerr != nil {
+			return aerr
+		}
 		return err
 	}
-	if err := c.wait(ctx, req); err != nil {
-		return err
+	werr := c.wait(ctx, req)
+	if aerr := b.finish(); aerr != nil {
+		return aerr
+	}
+	if werr != nil {
+		return werr
 	}
 	c.pid = st.PID
 	c.secret = st.Secret
