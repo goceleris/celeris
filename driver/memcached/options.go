@@ -49,7 +49,13 @@ type Config struct {
 	MaxOpen int
 	// MaxIdlePerWorker bounds each worker's idle list; default 2.
 	MaxIdlePerWorker int
-	// DialTimeout is the TCP dial timeout; default 5s.
+	// DialTimeout bounds the TCP dial and, separately, the binary-protocol
+	// handshake (a VERSION round trip) of a new conn; default 5s. A server that
+	// accepts the connection and does not answer the handshake within DialTimeout
+	// fails the dial with an error that matches [context.DeadlineExceeded], also
+	// when the caller's context has a longer deadline or none; a slow connect
+	// followed by a silent server takes up to about twice DialTimeout. A shorter
+	// deadline of the caller's context wins. The text protocol has no handshake.
 	DialTimeout time.Duration
 	// Timeout is the advisory per-op deadline used when the caller's context
 	// carries no deadline. Default 3s.
@@ -78,7 +84,8 @@ func WithMaxOpen(n int) Option { return func(c *Config) { c.MaxOpen = n } }
 // WithMaxIdlePerWorker bounds each worker's idle list.
 func WithMaxIdlePerWorker(n int) Option { return func(c *Config) { c.MaxIdlePerWorker = n } }
 
-// WithDialTimeout sets the TCP dial timeout.
+// WithDialTimeout sets [Config.DialTimeout]: the bound of the TCP dial and of the
+// binary-protocol handshake.
 func WithDialTimeout(d time.Duration) Option { return func(c *Config) { c.DialTimeout = d } }
 
 // WithTimeout sets the default per-op deadline when the caller's ctx has none.

@@ -15,8 +15,9 @@ import (
 )
 
 // dialMemcachedConn dials a TCP connection, sets it non-blocking, registers it
-// with the event loop, and (on binary protocol) sends a NOOP to validate the
-// handshake. Text protocol is handshake-free; we trust the connect.
+// with the event loop, and (on binary protocol) sends a VERSION to validate the
+// handshake, bounded by Config.DialTimeout (see handshake). Text protocol is
+// handshake-free; we trust the connect.
 func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg Config, workerHint int) (*memcachedConn, error) {
 	timeout := cfg.DialTimeout
 	if timeout <= 0 {
