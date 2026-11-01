@@ -68,14 +68,14 @@ const (
 // probeMaxExpiredRuns is how many runs of one probe that end in probeExpired
 // the process makes before the negative is kept. Each run costs two waits of
 // probeFirstWaitBudget, so a kernel that never answers costs a probe 1 s per
-// run, in the first probeMaxExpiredRuns Ns: 2 s per probe, 6 s for the three
+// run, in the first probeMaxExpiredRuns News: 2 s per probe, 6 s for the three
 // that wait, against 3 s when the first run's negative was final (celeris#1198).
 const probeMaxExpiredRuns = 2
 
 // probeCache holds a startup probe's answer for the process, and what is
 // needed to say that it could not run. A mutex, not a sync.Once: a run that
 // is not an answer must leave the next call free to run again. The lock is
-// held for the run, so concurrent Ns wait for one probe, as they did on the
+// held for the run, so concurrent News wait for one probe, as they did on the
 // Once.
 type probeCache[R any] struct {
 	name string
