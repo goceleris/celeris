@@ -777,8 +777,41 @@ func (c *redisConn) releaseHandshakeReq(req *redisRequest) {
 }
 
 // handshake runs HELLO (with optional fallback to AUTH+SELECT) to negotiate
-// protocol version and authentication.
+// protocol version and authentication. The whole exchange is bounded by
+// Config.DialTimeout (default 5 s), on top of whatever deadline ctx carries: the
+// dialer's timeout covers only the TCP connect (connect and handshake are two
+// budgets, each DialTimeout), and a node that accepts and
+// never answers HELLO would otherwise hold the dial until ctx ends, which is
+// never under context.Background (celeris#1205). The three dial paths
+// (dialRedisConn on unix and on the net.Conn loop, dialDirectRedisConn) all end
+// here, so the pool's command and pub/sub dials are bounded alike.
 func (c *redisConn) handshake(ctx context.Context) error {
+	timeout := c.cfg.DialTimeout
+	if timeout <= 0 {
+		timeout = defaultDialTimeout
+	}
+	// Is the caller's own deadline the earlier one? Then it ends the handshake
+	// and is reported as the caller's.
+	callerFirst := false
+	if dl, ok := ctx.Deadline(); ok && !dl.After(time.Now().Add(timeout)) {
+		callerFirst = true
+	}
+	hctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := c.runHandshake(hctx)
+	if err != nil && !callerFirst && ctx.Err() == nil {
+		// The direct path reports the socket's deadline (it can fire a hair
+		// before hctx's timer), the others the context's.
+		var rerr *RedisError
+		if (hctx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded)) && !errors.As(err, &rerr) {
+			return fmt.Errorf("celeris-redis: handshake timed out after %v: %w: %w", timeout, context.DeadlineExceeded, err)
+		}
+	}
+	return err
+}
+
+// runHandshake is handshake without the bound.
+func (c *redisConn) runHandshake(ctx context.Context) error {
 	if c.cfg.ForceRESP2 {
 		return c.legacyAuth(ctx)
 	}

@@ -48,9 +48,11 @@ type ClusterConfig struct {
 
 	PoolSize         int
 	MaxIdlePerWorker int
-	DialTimeout      time.Duration
-	ReadTimeout      time.Duration
-	WriteTimeout     time.Duration
+	// DialTimeout bounds each new node connection's TCP connect and, separately,
+	// its handshake; default 5s. See [Config].DialTimeout.
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 	// MaxRedirects is the maximum number of MOVED/ASK redirects before an
 	// error is returned. Default: 3.
 	MaxRedirects int
