@@ -1,8 +1,14 @@
 package memcached
 
 import (
+	"sync/atomic"
 	"time"
 )
+
+// testHookDefaultOpTimeout, when set, replaces the default per-operation timeout
+// (defaultTimeout, 3 s) of a client whose Config.Timeout is unset. A test sets it
+// to avoid waiting 3 s, and resets it to nil when it is done.
+var testHookDefaultOpTimeout atomic.Pointer[time.Duration]
 
 // Protocol selects the memcached wire dialect spoken by a Client. Every
 // memcached deployment supports text; binary was deprecated upstream but
