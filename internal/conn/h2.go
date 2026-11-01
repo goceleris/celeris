@@ -70,8 +70,9 @@ type H2Config struct {
 	// WriteTimeout. 0 = no bound.
 	WriteTimeout time.Duration
 	// LoopWatch is the engine's watch on its event loops: while one of them is
-	// stuck in a batch for half a WriteTimeout, a pool handler's wait for window is
-	// bounded by WriteTimeout in all (celeris#1170, stream.LoopWatch). Nil: never.
+	// stuck in a batch for half a WriteTimeout (at least 2 s), a pool handler's wait
+	// for window is bounded by WriteTimeout in all (celeris#1170, stream.LoopWatch).
+	// Nil: never.
 	LoopWatch *stream.LoopWatch
 	// ReadTimeout is the request deadline of a stream (the server's
 	// ReadTimeout): a request that is not whole this long after its HEADERS is

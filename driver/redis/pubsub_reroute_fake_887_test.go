@@ -60,6 +60,9 @@ type rpNode struct {
 	onSSub func(n *rpNode, c *rpConn, ch string)
 	// subCmds counts SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE commands received.
 	subCmds atomic.Int64
+	// getCmds counts GET commands received; getMoved how many of them it
+	// answered -MOVED (celeris#1214).
+	getCmds, getMoved atomic.Int64
 	// ssubLog is the arguments (channels) of every SSUBSCRIBE received, in
 	// order, answered or not. Guarded by mu; read it with ssubCommands.
 	ssubLog [][]string
@@ -491,6 +494,23 @@ func (n *rpNode) handle(c *rpConn, verb string, cmd []string) func() {
 			c.pushAck(kind, ch, int64(len(set)))
 		}
 		c.mu.Unlock()
+	case "GET":
+		// A node that does not serve the slot answers -MOVED, as Redis does;
+		// the owner answers "v".
+		n.getCmds.Add(1)
+		slot := 0
+		if len(cmd) > 1 {
+			slot = int(Slot(cmd[1]))
+		}
+		switch o := n.cl.owner(slot); {
+		case o == nil:
+			writeError(c.w, "CLUSTERDOWN Hash slot not served")
+		case o != n:
+			n.getMoved.Add(1)
+			writeError(c.w, fmt.Sprintf("MOVED %d %s", slot, o.addr))
+		default:
+			writeBulk(c.w, "v")
+		}
 	case "ROLE":
 		writeArrayHeader(c.w, 3)
 		writeBulk(c.w, "master")

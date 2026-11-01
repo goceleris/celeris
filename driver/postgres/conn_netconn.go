@@ -35,8 +35,7 @@ func dialConnNetConn(ctx context.Context, prov engine.EventLoopProvider, closeLo
 		return nil, err
 	}
 
-	dialTimeout := dsn.Options.ConnectTimeout
-	dialer := net.Dialer{Timeout: dialTimeout}
+	dialer, dialStart := beginDial(dsn.Options)
 	raw, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
 		return nil, err
@@ -84,6 +83,8 @@ func dialConnNetConn(ctx context.Context, prov engine.EventLoopProvider, closeLo
 		pending:      make([]*pgRequest, 0, 8),
 		createdAt:    time.Now(),
 		serverParams: map[string]string{},
+
+		connectDeadline: connectDeadline(dialStart, dsn.Options),
 	}
 	c.onRecvFn = c.onRecv
 	c.onCloseFn = c.onClose

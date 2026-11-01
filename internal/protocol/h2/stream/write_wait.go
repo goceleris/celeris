@@ -381,7 +381,7 @@ func (w *LoopWatch) SetLogger(l *slog.Logger) { w.log.Store(l) }
 func (w *LoopWatch) noteStuck(idx int, age, wt int64) {
 	if w.episode.CompareAndSwap(false, true) {
 		if l := w.log.Load(); l != nil {
-			l.Warn("h2: the minimum rate of a pool handler's wait for window is suspended: an event loop has been in one batch for half a WriteTimeout, so such waits are bounded by WriteTimeout in all until it ends",
+			l.Warn("h2: the minimum rate of a pool handler's wait for window is suspended: an event loop has been in one batch for half a WriteTimeout (at least 2 s), so such waits are bounded by WriteTimeout in all until it ends",
 				"loop", idx, "stuck_for", time.Duration(age), "write_timeout", time.Duration(wt), "threshold", time.Duration(loopStuckFor(wt)))
 		}
 	}
@@ -431,6 +431,9 @@ func (s *LoopSlot) Leave() {
 	}
 }
 
+// Stamped reports whether the loop is inside a batch (its stamp is set). Tests.
+func (s *LoopSlot) Stamped() bool { return s != nil && s.since.Load() != 0 }
+
 // BlockedFor reports whether some loop has been in one batch since at least d
 // before now.
 func (w *LoopWatch) BlockedFor(now, d int64) bool {
@@ -452,12 +455,22 @@ func (w *LoopWatch) stuck(now, d int64) (idx int, age int64, ok bool) {
 	return 0, 0, false
 }
 
-// minLoopStuck is the shortest a loop's batch is taken as stuck: ordinary batches
-// of a loaded loop are not.
-const minLoopStuck = 250 * time.Millisecond
+// minLoopStuck is the shortest a loop's batch is taken as stuck. A batch is all that
+// one wake of the loop does (its events, the write-queue drain of its h2 connections),
+// and on an overloaded or instrumented host a healthy loop's batch reaches a second or
+// two: measured 0.4 to 1.9 s with -race and a coverage profile on two starved CPUs
+// (0.3 s without), almost all of it one h2 connection's drain. A blocked loop (a
+// handler waiting for a lock a waiting pool handler holds) is not a batch that short:
+// it stays in the batch until the lock is released. At 250 ms the fallback cut healthy
+// waiters of eight parallel downloads (celeris#1170, Coverage root shard c). Only a
+// WriteTimeout under 4 s sees the floor; at the 60 s default the threshold is 30 s.
+const minLoopStuck = 2 * time.Second
 
 // loopStuckFor is how long a loop must have been in one batch to switch the
-// fallback on: half a WriteTimeout, and at least minLoopStuck.
+// fallback on: half a WriteTimeout, and at least minLoopStuck. A wedge is then cut at
+// the first judgement (one per WriteTimeout window) after that, so within
+// loopStuckFor(wt) + wt of the loop's block: 1.5 WriteTimeouts for a WriteTimeout of
+// 4 s or more, WriteTimeout + 2 s below.
 func loopStuckFor(wt int64) int64 {
 	return max(wt/2, int64(minLoopStuck))
 }
