@@ -1644,7 +1644,16 @@ func (w *Worker) run(ctx context.Context) {
 				if w.shutdownDrainStart == 0 {
 					w.shutdownDrainStart = now
 				}
-				if !w.hasPendingSends() && !w.h1RequestInProgress() {
+				// Nothing to send and no request parsed: the worker is done, unless a
+				// request already in the kernel (the socket's queue, or a recv CQE
+				// not reaped) has not been read yet: it is answered, as epoll's
+				// h1InProgress does, instead of being reaped without being served
+				// (celeris#1208). Looked at only inside the floor (the first
+				// shutdownSendDrainNanos), while the worker serves as an ordinary
+				// iteration; past it the gate's first pass marks such a request
+				// (gateRead) and h1RequestInProgress waits for it.
+				pastFloor := now > w.shutdownDrainStart+shutdownSendDrainNanos
+				if !w.hasPendingSends() && !w.h1RequestInProgress() && (pastFloor || !w.h1UnreadInKernel()) {
 					w.shutdown()
 					return
 				}
