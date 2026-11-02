@@ -381,6 +381,8 @@ if err := s.StartWithContext(ctx); err != nil {
 }
 ```
 
+What a connection gets depends on what it has sent when the shutdown begins: an idle keep-alive connection is closed at once (on io_uring, while a worker still has a response going out, at 250 ms); a request in progress is answered with `Connection: close`. A connection that has sent nothing is not answered by std, or by epoll and an io_uring worker with nothing to send, and a request it sends later is dropped there; an io_uring worker that has a response going out answers a first request that arrives in the first 250 ms. A request head that has reached the kernel but that the server has not read yet is answered on epoll, io_uring and adaptive, and dropped on std (net/http). The exact per-engine contract, with what was measured, is in the [`Server.Shutdown`](https://pkg.go.dev/github.com/goceleris/celeris#Server.Shutdown) godoc.
+
 ## Observability
 
 The core provides a lightweight metrics collector via `Server.Collector()`:

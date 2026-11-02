@@ -57,8 +57,8 @@ func TestStartupHasWhatTheDialLeftOfConnectTimeout1212(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the startup is still blocked after 2s: it did not end at the budget the dial left")
 	}
-	if got := connectDeadline(time.Now(), Options{}); !got.IsZero() {
-		t.Errorf("connectDeadline with no ConnectTimeout = %v, want the zero time", got)
+	if got := connectDeadline(time.Now(), Options{ConnectTimeout: -1}); !got.IsZero() {
+		t.Errorf("connectDeadline with no timeout = %v, want the zero time", got)
 	}
 }
 
@@ -100,7 +100,7 @@ func TestParseDSNRejectsANegativeConnectTimeout1212(t *testing.T) {
 		"postgres://u@h/d?connect_timeout=-5",
 	} {
 		_, err := ParseDSN(dsn)
-		if err == nil || !strings.Contains(err.Error(), "connect_timeout") {
+		if err == nil || !strings.Contains(err.Error(), "connect_timeout") || !strings.Contains(err.Error(), "absent: the 10s default") {
 			t.Errorf("ParseDSN(%q) error = %v, want a connect_timeout error", dsn, err)
 		}
 	}

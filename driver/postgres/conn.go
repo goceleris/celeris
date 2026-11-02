@@ -1134,16 +1134,18 @@ func beginDial(o Options) (net.Dialer, time.Time) {
 	if h := testHookAfterDialStart.Load(); h != nil {
 		(*h)()
 	}
-	return net.Dialer{Timeout: o.ConnectTimeout}, start
+	d, _ := o.effectiveConnectTimeout()
+	return net.Dialer{Timeout: d}, start
 }
 
 // connectDeadline is when o.ConnectTimeout, counted from dialStart, runs out: the
-// time the dial plus the startup have. The zero time if ConnectTimeout is unset.
+// time the dial plus the startup have. The zero time if there is no timeout.
 func connectDeadline(dialStart time.Time, o Options) time.Time {
-	if o.ConnectTimeout <= 0 {
+	d, _ := o.effectiveConnectTimeout()
+	if d <= 0 {
 		return time.Time{}
 	}
-	return dialStart.Add(o.ConnectTimeout)
+	return dialStart.Add(d)
 }
 
 // startupBound ends a startup that must not go on: the caller's context ended, or
@@ -1224,9 +1226,13 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 	b.stopCtx = context.AfterFunc(ctx, func() { b.abort(ctx.Err()) })
 	if !c.connectDeadline.IsZero() {
 		d := time.Until(c.connectDeadline)
+		budget, isDefault := c.dsn.Options.effectiveConnectTimeout()
+		msg := fmt.Sprintf("connect_timeout %v", budget)
+		if isDefault {
+			msg = fmt.Sprintf("default connect_timeout %v; set connect_timeout=0 for none", budget)
+		}
 		b.timer = time.AfterFunc(d, func() {
-			b.abort(fmt.Errorf("celeris-postgres: startup timed out (connect_timeout %v): %w",
-				c.dsn.Options.ConnectTimeout, context.DeadlineExceeded))
+			b.abort(fmt.Errorf("celeris-postgres: startup timed out (%s): %w", msg, context.DeadlineExceeded))
 		})
 	}
 	if err := c.writeRaw(initial); err != nil {
