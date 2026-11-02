@@ -10,9 +10,13 @@ import (
 type Options struct {
 	TCPNoDelay  bool
 	TCPQuickAck bool
-	SOBusyPoll  time.Duration
-	RecvBuf     int
-	SendBuf     int
+	// SOBusyPoll is the SO_BUSY_POLL budget (Linux). Zero, the default, sets
+	// nothing: busy polling is opt-in (celeris#1036). A positive
+	// value of at least one microsecond sets SO_BUSY_POLL to it, in whole
+	// microseconds, and tries SO_PREFER_BUSY_POLL and SO_BUSY_POLL_BUDGET too.
+	SOBusyPoll time.Duration
+	RecvBuf    int
+	SendBuf    int
 }
 
 // ApplyFD applies socket options to a raw file descriptor. Platform-specific

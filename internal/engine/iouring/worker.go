@@ -1380,9 +1380,10 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  true,
 			TCPQuickAck: true,
-			SOBusyPoll:  50 * time.Microsecond,
-			RecvBuf:     resolved.SocketRecv,
-			SendBuf:     resolved.SocketSend,
+			// Opt-in, 0 unless Config.SocketBusyPoll is set (celeris#1036).
+			SOBusyPoll: resolved.SocketBusyPoll,
+			RecvBuf:    resolved.SocketRecv,
+			SendBuf:    resolved.SocketSend,
 		},
 	}, nil
 }
