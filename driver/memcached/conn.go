@@ -77,7 +77,11 @@ type memcachedConn struct {
 	wakeDone  bool
 	wakeFn    func()
 	wakeStop  func() bool
-	wakeTCP   *net.TCPConn
+	// wakeRan has capacity 1: the callback signals it when it has run, and
+	// disarmWake waits on it whenever stopping the wake failed, so that a callback
+	// of one command never lands in the next one.
+	wakeRan chan struct{}
+	wakeTCP *net.TCPConn
 
 	// Direct-mode fields.
 	tcp *net.TCPConn
@@ -303,20 +307,27 @@ func (c *memcachedConn) handshake(ctx context.Context) error {
 // lives on the conn and the callback is built once per conn, so what a command pays
 // for it is context.AfterFunc's own two allocations and nothing else (celeris#1218).
 // disarmWake ends it; it also undoes a wake that raced with a command that had
-// just succeeded, so the conn is not left with a deadline in the past.
+// just succeeded, so the conn is not left with a deadline in the past. A callback
+// that has started when the command ends is waited for there (wakeRan), so it
+// cannot run during the next command on the same conn and fail it.
 func (c *memcachedConn) armWake(ctx context.Context) {
 	if c.wakeFn == nil {
 		tcp := c.tcp // Close sets c.tcp to nil
 		c.wakeTCP = tcp
+		c.wakeRan = make(chan struct{}, 1)
 		c.wakeFn = func() {
 			if d := testHookWakeDelay.Load(); d != nil {
 				time.Sleep(*d)
 			}
 			c.wakeMu.Lock()
-			defer c.wakeMu.Unlock()
 			if !c.wakeDone {
 				c.wakeFired = true
 				_ = tcp.SetDeadline(time.Now())
+			}
+			c.wakeMu.Unlock()
+			select {
+			case c.wakeRan <- struct{}{}:
+			default:
 			}
 		}
 	}
@@ -331,7 +342,11 @@ func (c *memcachedConn) disarmWake() {
 	if c.wakeStop == nil {
 		return
 	}
-	c.wakeStop()
+	if !c.wakeStop() {
+		// The context has ended and the callback has been started on its own
+		// goroutine (stop is called once per arm): it signals wakeRan when done.
+		<-c.wakeRan
+	}
 	c.wakeStop = nil
 	c.wakeMu.Lock()
 	defer c.wakeMu.Unlock()
