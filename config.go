@@ -626,6 +626,9 @@ type Config struct {
 	SocketRecvBuf int
 	// SocketSendBuf sets SO_SNDBUF for accepted connections (0 = OS default).
 	SocketSendBuf int
+	// SocketBusyPoll is the per-socket busy-poll budget of accepted connections
+	// (celeris#945, celeris#1036). The field is declared; see the next commit.
+	SocketBusyPoll time.Duration
 	// MaxConns is the max simultaneous connections per worker (0 = unlimited);
 	// the server-wide limit is MaxConns times the loops started, see [Config.Workers].
 	MaxConns int

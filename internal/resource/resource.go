@@ -1,5 +1,7 @@
 package resource
 
+import "time"
+
 // WorkloadHint is an OPTIONAL operator declaration of the expected steady-state
 // concurrency, consumed only by the adaptive engine's start-engine decision.
 //
@@ -40,6 +42,8 @@ type Resources struct {
 	SocketRecv int
 	// SocketSend is the SO_SNDBUF size for accepted connections (0 = OS default).
 	SocketSend int
+	// SocketBusyPoll is the SO_BUSY_POLL budget of accepted connections (0 = off).
+	SocketBusyPoll time.Duration
 	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
 	MaxConns int
 	// WorkloadHint is an OPTIONAL operator concurrency declaration; the only
@@ -92,6 +96,8 @@ type ResolvedResources struct {
 	SocketRecv int
 	// SocketSend is the resolved SO_SNDBUF size.
 	SocketSend int
+	// SocketBusyPoll is the resolved SO_BUSY_POLL budget (0 = off).
+	SocketBusyPoll time.Duration
 }
 
 // Resolve applies hardcoded defaults, user overrides, and hard caps.
