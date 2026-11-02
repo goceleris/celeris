@@ -5,6 +5,7 @@ package memcached
 // the caller until its context ended: for ever under context.Background().
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -350,5 +351,107 @@ func TestOpErrorRelabelsOnlyDeadlineErrors1218(t *testing.T) {
 	defer dcancel()
 	if err := c.opError(dctx, sock); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("a caller's deadline became %v", err)
+	}
+}
+
+// The pool's health check pings an idle conn with conn.Ping, outside any Client
+// command, after the command that last used it. The limit of that command must have
+// been cleared: a stale deadline in the past would fail every ping at once, and the
+// check would close every idle conn.
+func TestHealthCheckPingAfterALimitedCommand1218(t *testing.T) {
+	f := startFake(t)
+	for _, cl := range opClients {
+		t.Run(cl.name, func(t *testing.T) {
+			c := cl.new(t, Config{Addr: f.Addr(), Timeout: 40 * time.Millisecond})
+			ctx := context.Background()
+			if err := c.Set(ctx, "k"+cl.name, "v", 0); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(80 * time.Millisecond) // past that command's limit
+			conn, err := c.pool.acquire(ctx, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.pool.release(conn)
+			for i := 0; i < 5; i++ {
+				if err := conn.Ping(ctx); err != nil {
+					t.Fatalf("health-style Ping %d after a limited command: %v", i, err)
+				}
+			}
+		})
+	}
+}
+
+// startSlowFirstServer answers the first command of each conn after a delay (the
+// caller parks for it) and none after it (it stalls): the second command on a
+// reused conn is the one the limit must end.
+func startSlowFirstServer(t *testing.T, delay time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			go func() {
+				r := bufio.NewReader(c)
+				if _, err := r.ReadString('\n'); err != nil {
+					return
+				}
+				time.Sleep(delay)
+				if _, err := c.Write([]byte("VERSION 1.6.0\r\n")); err != nil {
+					return
+				}
+				_, _ = io.Copy(io.Discard, r) // the next command is never answered
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// The limit is armed again on a conn that is used again: the first command parks and
+// is answered, the second on the same conn stalls and must end at about Timeout, not
+// run unbounded. (Every other bounded test uses a fresh conn, whose first park builds
+// the timer; a loop conn that does not re-arm its timer on reuse leaves every command
+// after the first unbounded.)
+func TestLimitIsArmedAgainOnAReusedConn1218(t *testing.T) {
+	const bound = 150 * time.Millisecond
+	for _, cl := range opClients {
+		t.Run(cl.name, func(t *testing.T) {
+			t.Parallel()
+			addr := startSlowFirstServer(t, 40*time.Millisecond)
+			c := cl.new(t, Config{Addr: addr, Timeout: bound})
+			ctx := context.Background()
+			if _, err := c.Version(ctx); err != nil {
+				t.Fatalf("the first command: %v", err)
+			}
+			elapsed, err := opWithin(t, 2*time.Second, func() error {
+				_, err := c.Version(ctx)
+				return err
+			})
+			if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "timed out") {
+				t.Errorf("second command error %v, want the operation timeout", err)
+			}
+			if elapsed < bound/2 {
+				t.Errorf("second command returned after %v, before the bound of %v", elapsed, bound)
+			}
+		})
 	}
 }

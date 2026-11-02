@@ -8,16 +8,22 @@ import (
 
 // The per-operation limit costs a command no allocation: a client with Timeout
 // (the 3 s default or a set one) allocates exactly what one with the limit off does,
-// on the direct and the loop paths. (A context built per command cost 4 allocations
-// and broke the strict budgets of TestAllocBudgets; the CI step that runs them
-// skips -race; the comparison below holds under -race too, both sides being inflated alike.)
+// on the direct and the loop paths, with a context that cannot be cancelled. (A
+// context built per command cost 4 allocations and broke the strict budgets of
+// TestAllocBudgets; the CI step that runs them skips -race; the comparison below
+// holds under -race too, both sides being inflated alike.)
+//
+// A context that CAN be cancelled (WithCancel, WithTimeout, an HTTP/2 stream's)
+// costs a direct conn context.AfterFunc's two allocations, which arm the wake of
+// its blocked read (the loop paths select on the context and cost nothing). That
+// price is budgeted here, explicitly: direct at most 2 more than the plain command,
+// loop paths at most 0 more. (The first version of the wake cost 5.)
 func TestOperationLimitDoesNotAllocate1218(t *testing.T) {
 	f := startFake(t)
 	f.store.kv["k"] = memItem{value: []byte("v"), cas: 1}
 	for _, cl := range opClients {
 		t.Run(cl.name, func(t *testing.T) {
-			ctx := context.Background()
-			allocs := func(timeout time.Duration) float64 {
+			allocs := func(timeout time.Duration, ctx context.Context) float64 {
 				c := cl.new(t, Config{Addr: f.Addr(), Timeout: timeout})
 				if _, err := c.Get(ctx, "k"); err != nil { // warm the pool
 					t.Fatal(err)
@@ -28,10 +34,23 @@ func TestOperationLimitDoesNotAllocate1218(t *testing.T) {
 					}
 				})
 			}
-			on, off := allocs(3*time.Second), allocs(-1)
+			bg := context.Background()
+			on, off := allocs(3*time.Second, bg), allocs(-1, bg)
 			t.Logf("Get: %.1f allocs/op with the limit, %.1f without", on, off)
 			if on > off {
 				t.Errorf("the per-operation limit costs %.1f allocations per command, want 0", on-off)
+			}
+
+			cctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cancellable := allocs(3*time.Second, cctx)
+			extra := 0.0
+			if cl.name == "direct" {
+				extra = 2
+			}
+			t.Logf("Get with a cancellable context: %.1f allocs/op (plain %.1f, budget plain+%.0f)", cancellable, off, extra)
+			if cancellable > off+extra {
+				t.Errorf("a cancellable context costs %.1f allocations per command, budget %.0f", cancellable-off, extra)
 			}
 		})
 	}

@@ -139,22 +139,19 @@ func (c *Client) opLimit(ctx context.Context) (timeout time.Duration, deadline t
 
 // beginOp puts the per-operation limit on conn for one command and, for a direct
 // conn (which waits in a socket read that does not look at a context), arms the wake
-// of its read on the end of a cancellable ctx. It returns the func that disarms the
-// wake, nil when none was armed (a ctx that cannot be cancelled costs nothing, not
-// even a closure). Pair it with endOp(disarm), after opError.
-func (c *Client) beginOp(ctx context.Context, conn *memcachedConn) (disarm func()) {
+// of its read on the end of a cancellable ctx (armWake). A ctx that cannot be
+// cancelled costs nothing; a cancellable one costs context.AfterFunc's two
+// allocations. Pair it with endOp, after opError.
+func (c *Client) beginOp(ctx context.Context, conn *memcachedConn) {
 	conn.opTimeout, conn.opDeadline = c.opLimit(ctx)
 	if conn.useDirect && ctx.Done() != nil {
-		return conn.wakeReadOnDone(ctx)
+		conn.armWake(ctx)
 	}
-	return nil
 }
 
 // endOp ends the limit of the command that ran on conn and disarms the wake.
-func endOp(conn *memcachedConn, disarm func()) {
-	if disarm != nil {
-		disarm()
-	}
+func endOp(conn *memcachedConn) {
+	conn.disarmWake()
 	conn.opTimeout, conn.opDeadline = 0, time.Time{}
 }
 
@@ -167,9 +164,9 @@ func (c *Client) run(ctx context.Context, fn func(ctx context.Context, conn *mem
 	if err != nil {
 		return err
 	}
-	disarm := c.beginOp(ctx, conn)
+	c.beginOp(ctx, conn)
 	ferr := conn.opError(ctx, fn(ctx, conn))
-	endOp(conn, disarm)
+	endOp(conn)
 	if ferr != nil && (errors.Is(ferr, context.Canceled) || errors.Is(ferr, context.DeadlineExceeded)) {
 		c.pool.discard(conn)
 		return ferr
@@ -905,9 +902,9 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	disarm := c.beginOp(ctx, conn)
+	c.beginOp(ctx, conn)
 	perr := conn.opError(ctx, conn.Ping(ctx))
-	endOp(conn, disarm)
+	endOp(conn)
 	if perr != nil {
 		if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
 			c.pool.discard(conn)

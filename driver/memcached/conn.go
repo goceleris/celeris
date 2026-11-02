@@ -70,6 +70,15 @@ type memcachedConn struct {
 	opDeadline time.Time
 	opTimer    *time.Timer
 
+	// The wake of a direct conn's blocked read on the end of the caller's context
+	// (armWake). The state is on the conn so that a command allocates none of it.
+	wakeMu    sync.Mutex
+	wakeFired bool
+	wakeDone  bool
+	wakeFn    func()
+	wakeStop  func() bool
+	wakeTCP   *net.TCPConn
+
 	// Direct-mode fields.
 	tcp *net.TCPConn
 	// tcpFd caches the raw fd for MSG_DONTWAIT peeks. Pre-netpoll
@@ -256,14 +265,11 @@ func (c *memcachedConn) handshake(ctx context.Context) error {
 	// A direct conn waits in a socket read that does not look at a context (only
 	// at the deadline execBinaryDirect set from it), so the end of the caller's
 	// context, a cancellation too, wakes the read.
-	var stopWake func()
 	if c.useDirect {
-		stopWake = c.wakeReadOnDone(hctx)
+		c.armWake(hctx)
 	}
 	err := c.runHandshake(hctx)
-	if stopWake != nil {
-		stopWake()
-	}
+	c.disarmWake()
 	if err != nil && errors.Is(err, os.ErrDeadlineExceeded) && (ctx.Err() != nil || callerFirst) {
 		// The caller's context ended the handshake (its deadline can fire on the
 		// socket a hair before the context reports it): its error, not a bare
@@ -286,31 +292,44 @@ func (c *memcachedConn) handshake(ctx context.Context) error {
 	return err
 }
 
-// wakeReadOnDone arranges that, when ctx ends, the socket of a direct conn gets a
-// deadline of "now", which wakes a read blocked on a silent server (celeris#1213;
-// a direct conn does not watch its context's cancellation, only its deadline). The
-// returned func disarms it; it also undoes a wake that raced with a handshake that
-// had just succeeded, so the conn is not left with a deadline in the past.
-func (c *memcachedConn) wakeReadOnDone(ctx context.Context) (disarm func()) {
-	var mu sync.Mutex
-	fired, done := false, false
-	tcp := c.tcp // Close sets c.tcp to nil
-	stop := context.AfterFunc(ctx, func() {
-		mu.Lock()
-		defer mu.Unlock()
-		if !done {
-			fired = true
-			_ = tcp.SetDeadline(time.Now())
+// armWake arranges that, when ctx ends, the socket of a direct conn gets a deadline
+// of "now", which wakes a read blocked on a silent server (celeris#1213; a direct
+// conn does not watch its context's cancellation, only its deadline). Its state
+// lives on the conn and the callback is built once per conn, so what a command pays
+// for it is context.AfterFunc's own two allocations and nothing else (celeris#1218).
+// disarmWake ends it; it also undoes a wake that raced with a command that had
+// just succeeded, so the conn is not left with a deadline in the past.
+func (c *memcachedConn) armWake(ctx context.Context) {
+	if c.wakeFn == nil {
+		tcp := c.tcp // Close sets c.tcp to nil
+		c.wakeTCP = tcp
+		c.wakeFn = func() {
+			c.wakeMu.Lock()
+			defer c.wakeMu.Unlock()
+			if !c.wakeDone {
+				c.wakeFired = true
+				_ = tcp.SetDeadline(time.Now())
+			}
 		}
-	})
-	return func() {
-		stop()
-		mu.Lock()
-		defer mu.Unlock()
-		done = true
-		if fired && !c.closed.Load() {
-			_ = tcp.SetDeadline(time.Time{})
-		}
+	}
+	c.wakeMu.Lock()
+	c.wakeFired, c.wakeDone = false, false
+	c.wakeMu.Unlock()
+	c.wakeStop = context.AfterFunc(ctx, c.wakeFn)
+}
+
+// disarmWake ends the wake armed by armWake; it does nothing if none is armed.
+func (c *memcachedConn) disarmWake() {
+	if c.wakeStop == nil {
+		return
+	}
+	c.wakeStop()
+	c.wakeStop = nil
+	c.wakeMu.Lock()
+	defer c.wakeMu.Unlock()
+	c.wakeDone = true
+	if c.wakeFired && !c.closed.Load() {
+		_ = c.wakeTCP.SetDeadline(time.Time{})
 	}
 }
 
