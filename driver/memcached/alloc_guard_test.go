@@ -65,6 +65,11 @@ func TestAllocBudgets(t *testing.T) {
 		// per-request slab allocation that replaces the per-value copies
 		// — tracked for v1.4.1.
 		{name: "GetMulti_10", budget: 26, bench: benchGetMulti10},
+		// GET with a context that can be cancelled (WithCancel, WithTimeout, an
+		// HTTP/2 stream's): on the direct path the blocked read is woken when the
+		// context ends, which costs context.AfterFunc's two allocations on top of
+		// the 3 of GET_small (celeris#1218). The wake's own state lives on the conn.
+		{name: "GET_small_cancellable", budget: 5, bench: benchGETSmallCancellable},
 		{name: "PoolAcquireRelease", budget: 0, bench: benchPoolAcquireRelease},
 	}
 
@@ -90,6 +95,28 @@ func benchGETSmall(b *testing.B) {
 	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	// Warm the pool.
+	if _, err := c.Get(ctx, "k"); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.Get(ctx, "k"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchGETSmallCancellable(b *testing.B) {
+	fake := startFakeB(b)
+	fake.store.kv["k"] = memItem{value: []byte("v"), cas: 1}
+	c, err := NewClient(fake.Addr())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	if _, err := c.Get(ctx, "k"); err != nil {
 		b.Fatal(err)
 	}
