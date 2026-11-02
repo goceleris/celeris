@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"sync"
+	"time"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/engine"
@@ -15,6 +16,12 @@ import (
 // celeris.Server's event loop.
 type Connector struct {
 	dsn DSN
+
+	// engine and busyPoll decide the SO_BUSY_POLL budget of each connection:
+	// busyPoll when positive (WithSocketBusyPoll), else the server's
+	// Config.SocketBusyPoll (WithEngine), else none (celeris#1228).
+	engine   ServerProvider
+	busyPoll time.Duration
 
 	// provider is the event loop; resolved lazily on first Connect so that
 	// sql.Open("celeris-postgres", dsn) does not spin up a standalone loop
@@ -54,8 +61,12 @@ func newConnector(dsn string) (*Connector, error) {
 // WithEngine rebinds this Connector to sp's event loop. The returned
 // Connector shares the DSN but replaces the provider; it does not own the
 // loop (so Close does not tear it down).
+//
+// The connections it opens take the server's Config.SocketBusyPoll as their
+// SO_BUSY_POLL budget (Linux; 0, off, by default), unless
+// [Connector.WithSocketBusyPoll] set one.
 func (c *Connector) WithEngine(sp ServerProvider) *Connector {
-	clone := &Connector{dsn: c.dsn}
+	clone := &Connector{dsn: c.dsn, engine: sp, busyPoll: c.busyPoll}
 	if sp != nil {
 		if p := sp.EventLoopProvider(); p != nil {
 			clone.provider = p
@@ -63,6 +74,25 @@ func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 			return clone
 		}
 	}
+	return clone
+}
+
+// WithSocketBusyPoll returns a Connector that is this one with d as the
+// SO_BUSY_POLL budget (Linux) of the connections it opens: a positive d sets
+// it, whole microseconds only. Busy polling is off by default, and the budget
+// of a Connector bound with [Connector.WithEngine] is the server's
+// Config.SocketBusyPoll unless d overrides it, so d is for a standalone
+// Connector; a zero d cannot turn off a server that has it on. Before v1.6.0
+// the driver set 50 microseconds on every connection with no way to turn it
+// off (celeris#1228). Like [Connector.WithEngine] it returns a new Connector
+// that shares the DSN and not the loop.
+func (c *Connector) WithSocketBusyPoll(d time.Duration) *Connector {
+	clone := &Connector{dsn: c.dsn, engine: c.engine, busyPoll: d}
+	c.provMu.Lock()
+	if c.provider != nil && !c.ownsLoop {
+		clone.provider = c.provider
+	}
+	c.provMu.Unlock()
 	return clone
 }
 
@@ -78,7 +108,9 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	// Each conn releases the loop on Close if and only if the connector
 	// itself owns it — but we share one loop across all conns, so the
 	// refcount lives here, not on the conn. The pgConn's closeLoop is nil.
-	return dialConn(ctx, prov, nil, c.dsn, -1)
+	dsn := c.dsn
+	dsn.Options.busyPoll = eventloop.BusyPoll(c.engine, c.busyPoll)
+	return dialConn(ctx, prov, nil, dsn, -1)
 }
 
 // Driver returns the singleton Driver.

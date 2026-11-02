@@ -60,7 +60,7 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 		_ = file.Close()
 		return nil, err
 	}
-	tuneConnSocket(fd)
+	tuneConnSocket(fd, dsn.Options.busyPoll)
 	_ = tcp.Close()
 
 	nw := prov.NumWorkers()

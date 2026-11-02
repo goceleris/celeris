@@ -2,6 +2,7 @@ package eventloop
 
 import (
 	"sync"
+	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
 )
@@ -38,6 +39,33 @@ func IsAsyncServer(sp ServerProvider) bool {
 		return a.AsyncHandlers()
 	}
 	return false
+}
+
+// BusyPollProvider is optionally implemented by ServerProvider to report the
+// server's resolved Config.SocketBusyPoll, the SO_BUSY_POLL budget its native
+// engines put on the connections they accept (0 = off). Drivers opened
+// WithEngine(srv) consult it via type assertion, so a driver socket registered
+// on the server's loops follows the server's decision (celeris#1228). A
+// ServerProvider that does not implement it reports off.
+type BusyPollProvider interface {
+	SocketBusyPoll() time.Duration
+}
+
+// BusyPoll is the SO_BUSY_POLL budget a driver puts on a connection it dials:
+// explicit, the driver's own option, when it is positive, else the budget sp
+// reports, else 0 (off, the default, which means no setsockopt call). Safe to
+// call with a nil sp.
+func BusyPoll(sp ServerProvider, explicit time.Duration) time.Duration {
+	if explicit > 0 {
+		return explicit
+	}
+	if sp == nil {
+		return 0
+	}
+	if b, ok := sp.(BusyPollProvider); ok {
+		return b.SocketBusyPoll()
+	}
+	return 0
 }
 
 // standaloneState tracks the package-level refcounted standalone Loop shared

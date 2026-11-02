@@ -57,6 +57,20 @@ type Config struct {
 	// Engine hooks the driver into a running celeris.Server's event loop.
 	// If nil, a standalone loop is resolved on NewClient.
 	Engine ServerProvider
+	// SocketBusyPoll is the SO_BUSY_POLL budget (Linux) put on each connection
+	// this driver registers on an event loop. Default 0: off, and no
+	// setsockopt call is made. Before v1.6.0 the driver set 50 microseconds on
+	// every connection with no way to turn it off; busy polling is opt-in now,
+	// as celeris.Config.SocketBusyPoll is for the connections a server
+	// accepts (celeris#1228). A positive value sets that budget. With 0 and
+	// Engine set, the connection takes the server's SocketBusyPoll, so one
+	// setting decides both; 0 cannot turn off a server that has it on. Only
+	// whole microseconds count, and a value under one microsecond is off. It
+	// matters only on Linux, and not on a connection dialed through Go's
+	// netpoll (the path taken when the server runs async handlers), which
+	// the driver leaves as the kernel made it. See celeris.Config.SocketBusyPoll
+	// for what it does and what was measured.
+	SocketBusyPoll time.Duration
 	// OnPush is invoked when a RESP3 push frame arrives on a command
 	// connection. The channel is the first element of the push array
 	// (e.g. "invalidate" for client-tracking invalidations) and data
@@ -111,6 +125,11 @@ func WithHealthCheckInterval(d time.Duration) Option {
 func WithEngine(sp ServerProvider) Option {
 	return func(c *Config) { c.Engine = sp }
 }
+
+// WithSocketBusyPoll sets [Config.SocketBusyPoll], the SO_BUSY_POLL budget of
+// the driver's connections (Linux; off by default, and inherited from the
+// server under WithEngine).
+func WithSocketBusyPoll(d time.Duration) Option { return func(c *Config) { c.SocketBusyPoll = d } }
 
 // WithForceRESP2 forces the RESP2 dialect; skips HELLO.
 func WithForceRESP2() Option { return func(c *Config) { c.ForceRESP2 = true } }

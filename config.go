@@ -656,6 +656,15 @@ type Config struct {
 	// process; [Config.SocketRecvBuf] and [Config.SocketSendBuf] are still
 	// applied, they are set first.
 	//
+	// Drivers opened with WithEngine(srv) follow it: the celeris drivers
+	// (redis, postgres, memcached) used to set SO_BUSY_POLL, 50 microseconds,
+	// on every connection they dial, and now put this server's budget on the
+	// connections they register on its event loops (see [Server.SocketBusyPoll]),
+	// so a server with it off has drivers with it off too (celeris#1228).
+	// A driver without an engine is off by default; its own SocketBusyPoll
+	// option turns it on. The numbers below are for accepted sockets; no
+	// driver traffic was measured, and the mechanism is the same.
+	//
 	// When it is set the engine also asks for SO_PREFER_BUSY_POLL, which the
 	// kernel gives only to a process with CAP_NET_ADMIN (that combination was
 	// never measured: the benchmark runs below were unprivileged). When it is

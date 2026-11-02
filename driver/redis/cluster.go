@@ -65,6 +65,8 @@ type ClusterConfig struct {
 	ReadOnly bool
 
 	Engine ServerProvider
+	// SocketBusyPoll is forwarded to each node client: see [Config].SocketBusyPoll.
+	SocketBusyPoll time.Duration
 }
 
 // ErrClusterMaxRedirects is returned when the maximum number of MOVED/ASK
@@ -210,6 +212,9 @@ func (c *ClusterClient) nodeOpts() []Option {
 	}
 	if c.cfg.Engine != nil {
 		opts = append(opts, WithEngine(c.cfg.Engine))
+	}
+	if c.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(c.cfg.SocketBusyPoll))
 	}
 	return opts
 }

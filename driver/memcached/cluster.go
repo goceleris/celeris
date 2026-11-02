@@ -61,6 +61,9 @@ type ClusterConfig struct {
 	// If nil, a standalone loop is resolved for each node client.
 	Engine ServerProvider
 
+	// SocketBusyPoll is forwarded to each node client: see [Config].SocketBusyPoll.
+	SocketBusyPoll time.Duration
+
 	// FailureThreshold is the number of consecutive infrastructure-level
 	// errors (dial failures, I/O errors, protocol corruption) that must
 	// be observed on a node before it is marked as failing and skipped
@@ -100,6 +103,9 @@ func (cfg ClusterConfig) options() []Option {
 	}
 	if cfg.Engine != nil {
 		opts = append(opts, WithEngine(cfg.Engine))
+	}
+	if cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(cfg.SocketBusyPoll))
 	}
 	return opts
 }

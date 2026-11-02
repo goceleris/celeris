@@ -14,6 +14,7 @@ func WithMaxIdleTime(time.Duration) Option
 func WithMaxLifetime(time.Duration) Option
 func WithMaxOpen(int) Option
 func WithProtocol(Protocol) Option
+func WithSocketBusyPoll(time.Duration) Option
 func WithTimeout(time.Duration) Option
 func WithWorker(context.Context, int) context.Context
 method (*Client) Add(context.Context, string, any, time.Duration) error
@@ -96,9 +97,10 @@ type ClusterConfig struct, HealthProbeInterval time.Duration
 type ClusterConfig struct, MaxFailoverHops int
 type ClusterConfig struct, MaxOpen int
 type ClusterConfig struct, Protocol Protocol
+type ClusterConfig struct, SocketBusyPoll time.Duration
 type ClusterConfig struct, Timeout time.Duration
 type ClusterConfig struct, Weights []uint32
-type ClusterConfig struct, field order Addrs, Weights, Protocol, MaxOpen, Timeout, DialTimeout, Engine, FailureThreshold, HealthProbeInterval, MaxFailoverHops
+type ClusterConfig struct, field order Addrs, Weights, Protocol, MaxOpen, Timeout, DialTimeout, Engine, SocketBusyPoll, FailureThreshold, HealthProbeInterval, MaxFailoverHops
 type ClusterConfig struct, not comparable
 type Config struct
 type Config struct, Addr string
@@ -110,8 +112,9 @@ type Config struct, MaxIdleTime time.Duration
 type Config struct, MaxLifetime time.Duration
 type Config struct, MaxOpen int
 type Config struct, Protocol Protocol
+type Config struct, SocketBusyPoll time.Duration
 type Config struct, Timeout time.Duration
-type Config struct, field order Addr, Protocol, MaxOpen, MaxIdlePerWorker, DialTimeout, Timeout, MaxLifetime, MaxIdleTime, HealthCheckInterval, Engine
+type Config struct, field order Addr, Protocol, MaxOpen, MaxIdlePerWorker, DialTimeout, Timeout, MaxLifetime, MaxIdleTime, HealthCheckInterval, Engine, SocketBusyPoll
 type MemcachedError struct
 type MemcachedError struct, Kind string
 type MemcachedError struct, Msg string

@@ -55,6 +55,9 @@ type options struct {
 	// sync path is preferred to avoid the busy-spin P-hogging that cuts
 	// other handler Gs on the same P off from running.
 	asyncEngine bool
+	// engine is the server WithEngine was given, kept for its
+	// Config.SocketBusyPoll.
+	engine ServerProvider
 }
 
 // Option configures Open.
@@ -68,6 +71,7 @@ func WithEngine(sp ServerProvider) Option {
 			return
 		}
 		o.hasEngine = true
+		o.engine = sp
 		if eventloop.IsAsyncServer(sp) {
 			o.asyncEngine = true
 		}
@@ -154,6 +158,9 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	if !dsn.Options.autoCacheStatementsExplicit {
 		dsn.Options.AutoCacheStatements = true
 	}
+	// Only a connection registered on an engine's loop is tuned (dialConn);
+	// the pool dials through Go's netpoll otherwise, and sets no option.
+	dsn.Options.busyPoll = eventloop.BusyPoll(o.engine, 0)
 	if o.provider == nil {
 		prov, err := eventloop.Resolve(nil)
 		if err != nil {
