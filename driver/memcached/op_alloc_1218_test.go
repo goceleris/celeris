@@ -16,8 +16,8 @@ import (
 // A context that CAN be cancelled (WithCancel, WithTimeout, an HTTP/2 stream's)
 // costs a direct conn context.AfterFunc's two allocations, which arm the wake of
 // its blocked read (the loop paths select on the context and cost nothing). That
-// price is budgeted here, explicitly: direct at most 2 more than the plain command,
-// loop paths at most 0 more. (The first version of the wake cost 5.)
+// price is budgeted in TestAllocBudgets (GET_small_cancellable, which CI runs
+// without -race): AllocsPerRun is too noisy under -race to hold it here.
 func TestOperationLimitDoesNotAllocate1218(t *testing.T) {
 	f := startFake(t)
 	f.store.kv["k"] = memItem{value: []byte("v"), cas: 1}
@@ -41,17 +41,6 @@ func TestOperationLimitDoesNotAllocate1218(t *testing.T) {
 				t.Errorf("the per-operation limit costs %.1f allocations per command, want 0", on-off)
 			}
 
-			cctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			cancellable := allocs(3*time.Second, cctx)
-			extra := 0.0
-			if cl.name == "direct" {
-				extra = 2
-			}
-			t.Logf("Get with a cancellable context: %.1f allocs/op (plain %.1f, budget plain+%.0f)", cancellable, off, extra)
-			if cancellable > off+extra {
-				t.Errorf("a cancellable context costs %.1f allocations per command, budget %.0f", cancellable-off, extra)
-			}
 		})
 	}
 }
