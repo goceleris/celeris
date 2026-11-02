@@ -229,6 +229,11 @@ func (c *memcachedConn) pollIsDone() bool {
 // A test sets it to avoid waiting 5 s, and resets it to nil when it is done.
 var testHookDefaultHandshakeTimeout atomic.Pointer[time.Duration]
 
+// testHookWakeDelay, when set, makes the wake callback of armWake sleep that long
+// before it acts, so that a test can hold a callback in flight across the end of
+// its command (celeris#1218). It is nil in production.
+var testHookWakeDelay atomic.Pointer[time.Duration]
+
 // handshake runs per-protocol validation. Text protocol has no handshake;
 // for binary we issue a VERSION opcode to confirm the server speaks binary.
 // (Some older stacks accept the TCP connection but send back a text ERROR
@@ -304,6 +309,9 @@ func (c *memcachedConn) armWake(ctx context.Context) {
 		tcp := c.tcp // Close sets c.tcp to nil
 		c.wakeTCP = tcp
 		c.wakeFn = func() {
+			if d := testHookWakeDelay.Load(); d != nil {
+				time.Sleep(*d)
+			}
 			c.wakeMu.Lock()
 			defer c.wakeMu.Unlock()
 			if !c.wakeDone {

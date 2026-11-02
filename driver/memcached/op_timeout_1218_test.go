@@ -455,3 +455,89 @@ func TestLimitIsArmedAgainOnAReusedConn1218(t *testing.T) {
 		})
 	}
 }
+
+// The wake callback of a command that ended as its context was cancelled can still
+// be in flight when the next command starts on the same direct conn; it must not
+// give that command, whose context is alive, a deadline of "now" (a false "operation
+// timed out" and a lost healthy conn). The hook holds the callback of the first
+// command for 100 ms so that it lands after the second one has armed its own wake.
+func TestLateWakeDoesNotFailTheNextCommand1218(t *testing.T) {
+	d := 100 * time.Millisecond
+	testHookWakeDelay.Store(&d)
+	t.Cleanup(func() { testHookWakeDelay.Store(nil) })
+	for _, proto := range []struct {
+		name  string
+		p     Protocol
+		start func(t *testing.T) string
+	}{
+		{"text", ProtocolText, func(t *testing.T) string { return startFake(t).Addr() }},
+		{"binary", ProtocolBinary, func(t *testing.T) string { return startFakeBinary(t).Addr() }},
+	} {
+		t.Run(proto.name, func(t *testing.T) {
+			c := opClients[0].new(t, Config{Addr: proto.start(t), Protocol: proto.p, Timeout: 30 * time.Second})
+			conn, err := c.pool.acquire(context.Background(), -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.pool.release(conn)
+			// First command: its context ends as it finishes, the stop of its wake
+			// fails (the callback has started) and the callback is held by the hook.
+			ctx1, cancel1 := context.WithCancel(context.Background())
+			conn.armWake(ctx1)
+			cancel1()
+			conn.disarmWake()
+			// Second command, on a live context.
+			ctx2, cancel2 := context.WithCancel(context.Background())
+			defer cancel2()
+			conn.armWake(ctx2)
+			defer conn.disarmWake()
+			time.Sleep(3 * d) // the held callback of the first command runs now, if it still can
+			if err := conn.Ping(ctx2); err != nil {
+				t.Fatalf("a live command on the conn after a cancelled one: %v", err)
+			}
+		})
+	}
+}
+
+// A cancellation reaches a command on a conn that has already served one: the wake
+// is armed again for every command, so the cancel ends it at once instead of at
+// Config.Timeout. (Every other cancellation test uses a fresh conn; one whose wake
+// state is not reset per command has it spent by the first command's disarm, and
+// every cancel after it waits for the limit. For the binary protocol the handshake
+// is that first use.) The first command runs under a cancellable context, since a
+// context that cannot be cancelled arms no wake.
+func TestCancelOnAReusedDirectConn1218(t *testing.T) {
+	for _, proto := range []struct {
+		name  string
+		p     Protocol
+		start func(t *testing.T) string
+		first func(ctx context.Context, c *Client) error
+	}{
+		{"text", ProtocolText, func(t *testing.T) string { return startSlowFirstServer(t, 10*time.Millisecond) },
+			func(ctx context.Context, c *Client) error { _, err := c.Version(ctx); return err }},
+		{"binary", ProtocolBinary, func(t *testing.T) string { a, _ := startMuteServer(t, true); return a },
+			func(ctx context.Context, c *Client) error { return nil }}, // the handshake was the first use
+	} {
+		t.Run(proto.name, func(t *testing.T) {
+			t.Parallel()
+			c := opClients[0].new(t, Config{Addr: proto.start(t), Protocol: proto.p, Timeout: 30 * time.Second})
+			ctx1, cancel1 := context.WithCancel(context.Background())
+			defer cancel1()
+			if err := proto.first(ctx1, c); err != nil {
+				t.Fatalf("the first command: %v", err)
+			}
+			ctx2, cancel2 := context.WithCancel(context.Background())
+			time.AfterFunc(150*time.Millisecond, cancel2)
+			elapsed, err := opWithin(t, 3*time.Second, func() error {
+				_, err := c.Get(ctx2, "k")
+				return err
+			})
+			if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "operation timed out") {
+				t.Errorf("error %v, want the caller's context.Canceled", err)
+			}
+			if elapsed > time.Second {
+				t.Errorf("returned after %v, want about the cancel at 150 ms and not the 30 s Timeout", elapsed)
+			}
+		})
+	}
+}
