@@ -45,7 +45,7 @@ type engineRun896 struct {
 // listenAsync896 runs e.Listen(ctx) on a goroutine of its own. done receives
 // its result; returned is closed after that, so a cleanup that waits on it
 // can still read done.
-func listenAsync896(e *Engine, ctx context.Context) (done chan error, returned chan struct{}) {
+func listenAsync896(ctx context.Context, e *Engine) (done chan error, returned chan struct{}) {
 	done = make(chan error, 1)
 	returned = make(chan struct{})
 	go func() {
@@ -115,7 +115,7 @@ func start896Config(t *testing.T, addr string, workers int, disableDefer bool) *
 			skipOrFail656(t, "New: %v", err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		done, returned := listenAsync896(e, ctx)
+		done, returned := listenAsync896(ctx, e)
 		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); {
 			if e.Addr() != nil {
 				run = &engineRun896{e: e, cancel: cancel, done: done, returned: returned}

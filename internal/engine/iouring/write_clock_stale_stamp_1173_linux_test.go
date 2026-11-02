@@ -83,7 +83,7 @@ func startGate1173(t *testing.T, g *gate1173) (*engineRun896, string) {
 			skipOrFail656(t, "New: %v", err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		done, returned := listenAsync896(e, ctx)
+		done, returned := listenAsync896(ctx, e)
 		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); {
 			if e.Addr() != nil {
 				run = &engineRun896{e: e, cancel: cancel, done: done, returned: returned}
