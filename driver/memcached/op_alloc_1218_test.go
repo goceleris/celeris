@@ -1,5 +1,3 @@
-//go:build !race
-
 package memcached
 
 import (
@@ -12,7 +10,7 @@ import (
 // (the 3 s default or a set one) allocates exactly what one with the limit off does,
 // on the direct and the loop paths. (A context built per command cost 4 allocations
 // and broke the strict budgets of TestAllocBudgets; the CI step that runs them
-// skips -race, as this file does.)
+// skips -race; the comparison below holds under -race too, both sides being inflated alike.)
 func TestOperationLimitDoesNotAllocate1218(t *testing.T) {
 	f := startFake(t)
 	f.store.kv["k"] = memItem{value: []byte("v"), cas: 1}
