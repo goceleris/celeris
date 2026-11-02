@@ -1380,9 +1380,10 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  true,
 			TCPQuickAck: true,
-			SOBusyPoll:  50 * time.Microsecond,
-			RecvBuf:     resolved.SocketRecv,
-			SendBuf:     resolved.SocketSend,
+			// Opt-in, 0 unless Config.SocketBusyPoll is set (celeris#1036).
+			SOBusyPoll: resolved.SocketBusyPoll,
+			RecvBuf:    resolved.SocketRecv,
+			SendBuf:    resolved.SocketSend,
 		},
 	}, nil
 }
@@ -2737,12 +2738,13 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	}
 
 	if !isFixedFile {
-		_ = sockopts.ApplyFD(newFD, w.sockOpts)
+		sockopts.ApplyAccepted(newFD, w.sockOpts, w.logger)
 	}
-	// For fixed files, socket options were applied by the kernel at accept time
-	// via inherited options. TCP_NODELAY etc. must be set post-accept for
-	// non-inherited options — but with fixed files (ACCEPT_DIRECT), the fd field
-	// is actually a fixed file index and we can't call setsockopt on it directly.
+	// With fixed files (ACCEPT_DIRECT, the unsupported CELERIS_IOURING_FIXED_FILES
+	// mode) the fd field is a fixed file index, so setsockopt cannot be called
+	// on it and NO socket option is applied: nothing sets any on the listener
+	// for the accepted socket to inherit, so Config.SocketBusyPoll,
+	// SocketRecvBuf and SocketSendBuf do not take effect in that mode.
 
 	bufSize := w.resolved.BufferSize
 	if w.bufRing != nil {

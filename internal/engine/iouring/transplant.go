@@ -155,7 +155,7 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 
 	// Re-apply socket options on the worker's own thread (the fd is a real,
 	// non-fixed-file socket). Harmless if epoll already set them.
-	_ = sockopts.ApplyFD(newFD, w.sockOpts)
+	sockopts.ApplyAccepted(newFD, w.sockOpts, w.logger)
 
 	bufSize := w.resolved.BufferSize
 	if w.bufRing != nil {

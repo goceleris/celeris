@@ -193,7 +193,7 @@ func (l *Loop) attachFD(ctx context.Context, fd int, carry engine.Carryover, now
 		return
 	}
 
-	_ = sockopts.ApplyFD(fd, l.sockOpts)
+	sockopts.ApplyAccepted(fd, l.sockOpts, l.logger)
 	// The registration's generation, drawn before the ADD (celeris#885
 	// item 18): every event of the conn carries it.
 	gen := l.nextHTTPGen()

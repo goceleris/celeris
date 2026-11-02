@@ -3,6 +3,7 @@ package resource
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"runtime"
 	"time"
@@ -170,6 +171,10 @@ type Config struct {
 	defaulted bool
 }
 
+// maxSocketBusyPoll is the largest SO_BUSY_POLL budget the kernel takes: its
+// option is a C int of microseconds.
+const maxSocketBusyPoll = math.MaxInt32 * time.Microsecond
+
 // Validate checks all config fields and returns any validation errors.
 func (c Config) Validate() []error {
 	var errs []error
@@ -208,6 +213,13 @@ func (c Config) Validate() []error {
 
 	if c.Resources.BufferSize != 0 && c.Resources.BufferSize < MinBufferSize {
 		errs = append(errs, fmt.Errorf("bufferSize must be >= %d if set, got %d", MinBufferSize, c.Resources.BufferSize))
+	}
+
+	// SO_BUSY_POLL takes whole microseconds in a C int. A negative budget is
+	// no budget, and one under a microsecond would truncate to 0 and leave
+	// busy polling off with no word: both are refused, not rounded.
+	if d := c.Resources.SocketBusyPoll; d < 0 || (d > 0 && d < time.Microsecond) || d > maxSocketBusyPoll {
+		errs = append(errs, fmt.Errorf("socketBusyPoll must be 0 (off) or between %v and %v, got %v", time.Microsecond, maxSocketBusyPoll, d))
 	}
 
 	if c.Resources.MemoryLimitBytes < 0 {
