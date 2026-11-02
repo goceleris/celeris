@@ -735,8 +735,8 @@ func silentAcceptedDraining1208(t *testing.T, eng celeris.EngineType) {
 		}
 	}
 	switch {
-	case eng == celeris.IOUring && (!o.answered() || o.body != "ok"):
-		t.Errorf("io_uring: a first request 50 ms into the shutdown, with a send pending: %v, want it answered", o)
+	case eng == celeris.IOUring && (!o.answered() || o.body != "ok" || !o.close):
+		t.Errorf("io_uring: a first request 50 ms into the shutdown, with a send pending: %v, want it answered with Connection: close (celeris#1169)", o)
 	case eng != celeris.IOUring && o.answered():
 		t.Errorf("%v: a first request 50 ms into the shutdown: %v, want it dropped", eng, o)
 	}
