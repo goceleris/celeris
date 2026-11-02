@@ -139,8 +139,12 @@ func runShutdownH1Gate1165(t *testing.T, eng celeris.EngineType, downloads bool)
 	// shutdown began is not one in progress but a new one, which net/http drops (it
 	// returns from the conn's goroutine once the head is parsed and the server is
 	// shutting down, closing the conn with the body unread: an RST, celeris#1166).
-	// epoll reads and answers a head still in the kernel at its first gate pass;
-	// io_uring is not covered by this comment (not verified). The conn counts are
+	// epoll reads and answers a head still in the kernel of a conn it was reading,
+	// and so does an io_uring worker that is still in its drain (a response going
+	// out, as here with the downloads; one with nothing to send exits at once and
+	// does not: celeris#1208, see shutdown_conn_shapes_1208_linux_test.go), so for
+	// them the wait mostly removes timing
+	// dependence; it is std's behaviour that needs it. The conn counts are
 	// not enough (std counts a conn when it accepts it, before its goroutine has
 	// run) and nor is a sleep: a loop busy under -race can be a few hundred ms late
 	// to a conn. The wait is exact for the upload only: on std about 61 KiB of it
