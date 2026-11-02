@@ -3,8 +3,11 @@
 package sockoptstest
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"strconv"
@@ -133,9 +136,9 @@ func sockaddrPort(sa unix.Sockaddr) (netip.AddrPort, bool) {
 	return netip.AddrPort{}, false
 }
 
-// RoundTrip sends one HTTP/1.1 request on c and reads the first bytes of the
-// response, so that the server has accepted c and applied its socket options
-// to it (see Accepted).
+// RoundTrip sends one HTTP/1.1 request on c and reads the whole response, so
+// that the server has accepted c and applied its socket options to it (see
+// Accepted), and so that c can carry another RoundTrip.
 func RoundTrip(t testing.TB, c net.Conn) {
 	t.Helper()
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
@@ -143,16 +146,12 @@ func RoundTrip(t testing.TB, c net.Conn) {
 	if _, err := fmt.Fprintf(c, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 		t.Fatalf("write the request: %v", err)
 	}
-	buf := make([]byte, 12)
-	n := 0
-	for n < len(buf) {
-		m, err := c.Read(buf[n:])
-		n += m
-		if err != nil {
-			t.Fatalf("read the response: %v (%q)", err, buf[:n])
-		}
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("read the response: %v", err)
 	}
-	if string(buf[:9]) != "HTTP/1.1 " {
-		t.Fatalf("response %q is not HTTP/1.1", buf[:n])
+	defer func() { _ = resp.Body.Close() }()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("read the response body: %v", err)
 	}
 }

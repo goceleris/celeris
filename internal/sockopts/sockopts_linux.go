@@ -9,24 +9,29 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// setsockoptInt is unix.SetsockoptInt behind a seam, so a unit test can record
+// which options applyFD sets without the privilege some of them need
+// (SO_PREFER_BUSY_POLL wants CAP_NET_ADMIN in the init user namespace).
+var setsockoptInt = unix.SetsockoptInt
+
 func applyFD(fd int, opts Options) error {
 	if opts.TCPNoDelay {
-		if err := unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1); err != nil {
+		if err := setsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1); err != nil {
 			return err
 		}
 	}
 	if opts.TCPQuickAck {
-		if err := unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1); err != nil {
+		if err := setsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1); err != nil {
 			return err
 		}
 	}
 	if opts.RecvBuf > 0 {
-		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, opts.RecvBuf); err != nil {
+		if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, opts.RecvBuf); err != nil {
 			return err
 		}
 	}
 	if opts.SendBuf > 0 {
-		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, opts.SendBuf); err != nil {
+		if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, opts.SendBuf); err != nil {
 			return err
 		}
 	}
@@ -40,13 +45,13 @@ func applyFD(fd int, opts Options) error {
 	// CONFIG_NET_RX_BUSY_POLL) returns its error after the buffer sizes are
 	// set, not before them.
 	if micros := int(opts.SOBusyPoll.Microseconds()); micros > 0 {
-		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, micros); err != nil {
+		if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, micros); err != nil {
 			return err
 		}
 		// Best effort: SO_PREFER_BUSY_POLL needs CAP_NET_ADMIN, and the
 		// budget is the kernel's own default of 8.
-		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, 69, 1) // SO_PREFER_BUSY_POLL
-		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, 70, 8) // SO_BUSY_POLL_BUDGET
+		_ = setsockoptInt(fd, unix.SOL_SOCKET, 69, 1) // SO_PREFER_BUSY_POLL
+		_ = setsockoptInt(fd, unix.SOL_SOCKET, 70, 8) // SO_BUSY_POLL_BUDGET
 	}
 	return nil
 }
