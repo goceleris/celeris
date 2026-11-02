@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,6 +49,7 @@ type holdHandler896 struct {
 	release chan struct{}
 	big     []byte       // the /big response; nil unless the test serves it
 	running atomic.Int64 // /hold handlers that have started (started drops past its 4)
+	once    sync.Once    // unblock's
 }
 
 func newHoldHandler896(bigBody bool) *holdHandler896 {
@@ -57,6 +59,10 @@ func newHoldHandler896(bigBody bool) *holdHandler896 {
 	}
 	return h
 }
+
+// unblock releases the /hold handlers, once however often it is called: a test
+// calls it, and so does the cleanup of the engine that serves them.
+func (h *holdHandler896) unblock() { h.once.Do(func() { close(h.release) }) }
 
 func (h *holdHandler896) HandleStream(_ context.Context, s *stream.Stream) error {
 	if s.ResponseWriter == nil {
@@ -279,7 +285,7 @@ func h2Iteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
 	before := calls.Load()
 	run.cancel()
 	waitCalls896(t, calls, before)
-	close(h.release)
+	h.unblock()
 	returned, err := run.stopped()
 	if err != nil {
 		t.Fatalf("Listen returned %v after a cancel", err)

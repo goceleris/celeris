@@ -6,7 +6,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -356,10 +355,7 @@ func TestPoolWaitGateWaitsItsWindowWhateverTheWallDoes1176(t *testing.T) {
 
 // releaseOnce1176 is h's release, closed at most once, so a test that fails
 // before the handler is released still lets it go.
-func releaseOnce1176(h *holdHandler896) func() {
-	var once sync.Once
-	return func() { once.Do(func() { close(h.release) }) }
-}
+func releaseOnce1176(h *holdHandler896) func() { return h.unblock }
 
 func isTimeout1176(err error) bool {
 	ne, ok := err.(net.Error)
