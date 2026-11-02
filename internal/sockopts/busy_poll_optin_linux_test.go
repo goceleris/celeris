@@ -13,7 +13,7 @@ import (
 )
 
 // SO_BUSY_POLL is opt-in (celeris#1036): ApplyFD and ApplyConn
-// set it, and SO_PREFER_BUSY_POLL and SO_BUSY_POLL_BUDGET with it, only for a
+// set it, and ask for SO_PREFER_BUSY_POLL with it, only for a
 // positive SOBusyPoll, and leave the socket as the kernel made it otherwise.
 
 // acceptedPair returns a connected pair of loopback TCP sockets; the server

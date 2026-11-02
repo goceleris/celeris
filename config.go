@@ -628,49 +628,57 @@ type Config struct {
 	SocketSendBuf int
 	// SocketBusyPoll turns on SO_BUSY_POLL, the Linux per-socket busy polling
 	// of the network device's receive queue (NAPI), for the connections the
-	// native engines (epoll, io_uring, adaptive) accept. With it on, a read
-	// on a socket with nothing queued spins for up to this long, polling the
-	// device, before the thread sleeps. Default 0: off. Before v1.6.0 the
-	// engines set it, to 50 microseconds, on every accepted socket with no way
-	// to turn it off; it is opt-in now (celeris#1036), and
+	// native engines (epoll, io_uring, adaptive) accept. Default 0: off.
+	// Before v1.6.0 the engines set it, to 50 microseconds, on every accepted
+	// socket with no way to turn it off; it is opt-in now (celeris#1036), and
 	// 50 * time.Microsecond restores the old behaviour.
 	//
-	// The value is a whole number of microseconds, 0 (off) or from 1 to
-	// 2147483647 microseconds; a negative one, or one under a microsecond
-	// (which the kernel would read as 0 and leave off), is a configuration
-	// error and the server does not start. It matters only on Linux with the
-	// native engines: the std engine serves through net/http and ignores it,
-	// as does every other operating system. The kernel must be built with
-	// CONFIG_NET_RX_BUSY_POLL, and a driver that supports NAPI busy polling
-	// is what gives it an effect; where the kernel refuses the option the
-	// connection is served without it and nothing is logged ([Config.SocketRecvBuf]
-	// and [Config.SocketSendBuf] are still applied: they are set first).
+	// What it does here: with the option set, a read that finds a socket
+	// empty first runs one pass of the device's receive polling on the
+	// calling CPU, and only then reports that there is nothing to read. The
+	// budget is not a time the engine spins: the kernel uses it as a limit
+	// for blocking reads only (as read from the kernel source, not measured),
+	// and the engines' sockets are non-blocking, so any positive value
+	// behaves alike, 1 microsecond or 50 or 1 millisecond. It is a Duration
+	// because it is the kernel option's own value.
 	//
-	// When it is set the engine also asks for SO_PREFER_BUSY_POLL (which needs
-	// CAP_NET_ADMIN, and is left off without it) and SO_BUSY_POLL_BUDGET 8;
-	// when it is 0 none of the three options is touched, and the socket keeps
-	// what the kernel gave it (net.core.busy_read, 0 by default).
+	// The value is 0 (off) or at least one microsecond, up to 2147483647
+	// microseconds: a negative one, or one under a microsecond (which the
+	// kernel would read as 0 and leave off), is a configuration error and the
+	// server does not start. A fraction of a microsecond is dropped (1.5
+	// microseconds sets 1). It matters only on Linux with the native engines:
+	// the std engine serves through net/http and ignores it, as does every
+	// other operating system, and so does the io_uring engine in its
+	// unsupported fixed-files mode (CELERIS_IOURING_FIXED_FILES). The kernel
+	// must be built with CONFIG_NET_RX_BUSY_POLL, and a driver that supports
+	// NAPI busy polling gives it an effect. Where the kernel refuses the
+	// option, connections are served without it and a Warn is logged once per
+	// process; [Config.SocketRecvBuf] and [Config.SocketSendBuf] are still
+	// applied, they are set first.
 	//
-	// Why it is off: it did not pay for itself on the two hosts measured, and
-	// on one of them it cost. A loop that spins in the kernel on an empty
-	// socket takes the device's receive NAPI for itself. On an arm64
-	// big.LITTLE host with a single-queue NIC (msr1, Realtek r8127), where the
-	// CPU a loop was pinned to also took the NIC's receive softirq, that let
-	// the loop capture the NAPI there: ksoftirqd on that CPU took over the
-	// receive processing in 5 of 32 runs of 90 s with busy polling on and 0
-	// of 32 with it off, and 4 of the 32 had requests that waited 1 s or more
-	// (the longest 6.7 s) against none with it off (one-sided Fisher p =
-	// 0.057, so indicative rather than firm; the 5 takeovers: p = 0.026).
-	// Throughput was 3.0% higher with it off (502.0k against 517.2k requests
-	// per second, 512 connections, GET, io_uring). On amd64 (msa2-server,
-	// Intel i40e with 16 queues, 8 runs of 90 s per arm, same cell) it was 1.11%
-	// higher with it off (90% CI 0.94% to 1.42%), the p99 0.3% lower and the
-	// p99.99 1.7% higher, with no stall in either arm. One cell, one engine on
-	// each host, and the comparison was against a separate build of the same
-	// source with the option removed, so a smaller effect than about 0.5% on
-	// amd64 is not attributable to busy polling. Set it only where you have
-	// measured a gain for your own traffic and NIC, and keep the NIC's
-	// interrupt vectors off the CPUs that run loops when you do.
+	// When it is set the engine also asks for SO_PREFER_BUSY_POLL, which the
+	// kernel gives only to a process with CAP_NET_ADMIN (that combination was
+	// never measured: the benchmark runs below were unprivileged). When it is
+	// 0 neither option is touched, and the socket keeps what the kernel gave
+	// it (net.core.busy_read, 0 by default).
+	//
+	// Why it is off: turning it off was faster on both hosts measured. The
+	// cell was 512 connections, GET, io_uring, 90 s runs, and "off" is a build
+	// of the same source with the option removed (a second build of the same
+	// binary differed by 0.4% on amd64). On msr1 (arm64 big.LITTLE, a
+	// single-queue Realtek r8127 NIC), 32 runs per arm: ksoftirqd on the CPU
+	// of one loop took over the receive processing in 5 runs with it on and in
+	// none with it off (Fisher p = 0.026), requests of 1 s or more (the
+	// longest 6.7 s) occurred in 4 runs and in none (p = 0.057), and median
+	// throughput was 3.0% higher off (502.0k against 517.2k requests per
+	// second). The mechanism is inferred, not observed: that a loop polling
+	// the device on a CPU already saturated by receive softirq captured the
+	// NIC's receive NAPI there. The stall result is indicative, not firm. On
+	// msa2-server (amd64, Intel i40e with 16 queues), 8 runs per arm,
+	// throughput was 1.11% higher off (90% CI 0.94% to 1.42%), p99 0.3% lower
+	// and p99.99 1.7% higher, with no stall in either arm. Set it only where
+	// you have measured a gain for your own traffic and NIC, and keep the
+	// NIC's interrupt vectors off the CPUs that run loops when you do.
 	SocketBusyPoll time.Duration
 	// MaxConns is the max simultaneous connections per worker (0 = unlimited);
 	// the server-wide limit is MaxConns times the loops started, see [Config.Workers].

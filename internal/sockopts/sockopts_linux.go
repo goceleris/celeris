@@ -36,22 +36,24 @@ func applyFD(fd int, opts Options) error {
 		}
 	}
 	// SO_BUSY_POLL is opt-in (celeris#1036): the engines set SOBusyPoll only
-	// from Config.SocketBusyPoll, 0 unless the caller asked, and with 0 none
-	// of the three options is touched. A budget under one microsecond is no
-	// budget (the kernel takes microseconds), so it reads as off here instead
-	// of setting the companion options beside a zero.
+	// from Config.SocketBusyPoll, 0 unless the caller asked, and with 0
+	// neither it nor SO_PREFER_BUSY_POLL is touched. A budget under one
+	// microsecond is no budget (the kernel takes microseconds), so it reads as
+	// off here instead of setting the companion option beside a zero.
 	//
 	// It comes last: a kernel that refuses SO_BUSY_POLL (one built without
 	// CONFIG_NET_RX_BUSY_POLL) returns its error after the buffer sizes are
 	// set, not before them.
 	if micros := int(opts.SOBusyPoll.Microseconds()); micros > 0 {
 		if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, micros); err != nil {
-			return err
+			return &BusyPollError{Micros: micros, Err: err}
 		}
-		// Best effort: SO_PREFER_BUSY_POLL needs CAP_NET_ADMIN, and the
-		// budget is the kernel's own default of 8.
+		// Best effort, and only meaningful with CAP_NET_ADMIN (the kernel
+		// refuses it without): SO_PREFER_BUSY_POLL. The engines used to set
+		// SO_BUSY_POLL_BUDGET 8 beside it. That was a no-op in every case:
+		// raising the budget above the socket's current one (0) also needs
+		// CAP_NET_ADMIN, and 8 is the value the kernel uses for 0.
 		_ = setsockoptInt(fd, unix.SOL_SOCKET, 69, 1) // SO_PREFER_BUSY_POLL
-		_ = setsockoptInt(fd, unix.SOL_SOCKET, 70, 8) // SO_BUSY_POLL_BUDGET
 	}
 	return nil
 }
