@@ -64,6 +64,9 @@ func TestStartupIsBoundedByTheDefaultConnectTimeout1212(t *testing.T) {
 				if !strings.Contains(err.Error(), "startup timed out") {
 					t.Errorf("error %q does not say that the startup timed out", err)
 				}
+				if !strings.Contains(err.Error(), "default connect_timeout 300ms; set connect_timeout=0 for none") {
+					t.Errorf("error %q does not say that the default bound it, and how to turn it off", err)
+				}
 				if elapsed < def/2 {
 					t.Errorf("returned after %v, before the default of %v", elapsed, def)
 				}
@@ -130,6 +133,9 @@ func TestExplicitConnectTimeoutOverridesTheDefault1212(t *testing.T) {
 						t.Fatalf("error %v does not match context.DeadlineExceeded", err)
 					}
 					driver := strings.Contains(err.Error(), "startup timed out")
+					if driver && strings.Contains(err.Error(), "default connect_timeout") {
+						t.Errorf("error %q blames the default, but connect_timeout was written in the DSN", err)
+					}
 					if tc.wantDriver && (!driver || elapsed < 800*time.Millisecond || elapsed > 2*time.Second) {
 						t.Errorf("returned after %v with %q: want the driver's bound of the explicit connect_timeout=1, not the default (300 ms)", elapsed, err)
 					}
@@ -179,5 +185,36 @@ func TestEffectiveConnectTimeout1212(t *testing.T) {
 	}
 	if got, _ := (Options{ConnectTimeout: 2 * time.Second}).effectiveConnectTimeout(); got != 2*time.Second {
 		t.Errorf("Options{ConnectTimeout: 2s}: %v", got)
+	}
+}
+
+// The default reaches the TCP connect: net.Dialer.Timeout is the budget, not the
+// raw ConnectTimeout. (A host that drops connection attempts would otherwise hold
+// a dial with no connect_timeout for the operating system's connect timeout, one to
+// two minutes, because the startup timer is armed only after the connect returns;
+// loopback connects at once, so only the dialer's value shows it.)
+func TestDialerTimeoutIsTheBudget1212(t *testing.T) {
+	for _, tc := range []struct {
+		dsn  string
+		want time.Duration
+	}{
+		{"host=h user=u", defaultConnectTimeout},
+		{"postgres://u@h/d", defaultConnectTimeout},
+		{"host=h user=u connect_timeout=0", 0},
+		{"host=h user=u connect_timeout=4", 4 * time.Second},
+		{"postgres://u@h/d?connect_timeout=6", 6 * time.Second},
+	} {
+		d, err := ParseDSN(tc.dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dialer, _ := beginDial(d.Options); dialer.Timeout != tc.want {
+			t.Errorf("%q: dialer timeout %v, want %v", tc.dsn, dialer.Timeout, tc.want)
+		}
+	}
+	lowerDefaultConnectTimeout(t, 250*time.Millisecond)
+	d, _ := ParseDSN("host=h user=u")
+	if dialer, _ := beginDial(d.Options); dialer.Timeout != 250*time.Millisecond {
+		t.Errorf("with the default lowered to 250 ms the dialer timeout is %v", dialer.Timeout)
 	}
 }

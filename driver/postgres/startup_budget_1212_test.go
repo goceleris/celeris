@@ -100,7 +100,7 @@ func TestParseDSNRejectsANegativeConnectTimeout1212(t *testing.T) {
 		"postgres://u@h/d?connect_timeout=-5",
 	} {
 		_, err := ParseDSN(dsn)
-		if err == nil || !strings.Contains(err.Error(), "connect_timeout") {
+		if err == nil || !strings.Contains(err.Error(), "connect_timeout") || !strings.Contains(err.Error(), "absent: the 10s default") {
 			t.Errorf("ParseDSN(%q) error = %v, want a connect_timeout error", dsn, err)
 		}
 	}

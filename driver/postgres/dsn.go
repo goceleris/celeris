@@ -28,7 +28,8 @@ type Options struct {
 	// connect_timeout in the DSN is rejected. In a DSN built in code, a zero
 	// ConnectTimeout is "not set" (the default applies) and a negative one is "no
 	// timeout". The host name lookup that precedes the dial is not bounded by it,
-	// nor by the caller's context.
+	// nor by the caller's context. Environment variables (PGCONNECT_TIMEOUT and the
+	// other PG* ones) are not read.
 	ConnectTimeout time.Duration
 	// connectTimeoutExplicit tracks whether the DSN parser observed a
 	// connect_timeout, so that an explicit 0 (no timeout) can be told from an
@@ -244,7 +245,7 @@ func applyDSNKey(d *DSN, k, v string) error {
 			return fmt.Errorf("celeris-postgres: connect_timeout = %q: %w", v, err)
 		}
 		if n < 0 {
-			return fmt.Errorf("celeris-postgres: connect_timeout = %d: must be >= 0 (0 or absent: no timeout)", n)
+			return fmt.Errorf("celeris-postgres: connect_timeout = %d: must be >= 0 (0: no timeout; absent: the 10s default)", n)
 		}
 		d.Options.ConnectTimeout = time.Duration(n) * time.Second
 		d.Options.connectTimeoutExplicit = true
