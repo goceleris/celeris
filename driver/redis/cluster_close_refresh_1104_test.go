@@ -59,7 +59,7 @@ func TestClusterRefreshAfterCloseDoesNotWriteToTheNodes1104(t *testing.T) {
 	for range iters {
 		cc, v, _ := closedClusterWithSlots1104(t)
 		var err error
-		if p := panicOf1104(func() { err = cc.applyTopology(context.Background(), v) }); p != nil {
+		if p := panicOf1104(func() { err = cc.applyTopology(context.Background(), v, 1) }); p != nil {
 			panics++
 			continue
 		}

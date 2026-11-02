@@ -52,7 +52,8 @@ type ClusterConfig struct {
 	// Timeout is the advisory per-op deadline forwarded to each node client.
 	Timeout time.Duration
 
-	// DialTimeout is the TCP dial timeout forwarded to each node client.
+	// DialTimeout is forwarded to each node client: see [Config.DialTimeout]
+	// (it bounds the TCP dial and the binary-protocol handshake).
 	DialTimeout time.Duration
 
 	// Engine hooks the cluster into a running celeris.Server's event loop.
