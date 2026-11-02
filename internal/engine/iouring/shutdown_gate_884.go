@@ -421,7 +421,10 @@ func (w *Worker) h1RequestInProgress() bool {
 			// The gate's first pass found a request that reached the kernel
 			// before it (holdUnreadAtGate, holdPostedRecvs): it is read on and
 			// answered (gateReadsOn), and the worker waits for that. The conn
-			// leaves this walk once it is closing.
+			// leaves this walk once it is closing. (A fixed-file conn, a
+			// development setting, that a CQE marked with bytes that were only a
+			// boundary, a bare CRLF, is never closed by closeIdleH1, whose
+			// TIOCINQ cannot ask its slot: it holds the worker to drainEnd.)
 			return true
 		}
 		if !cs.detected {
@@ -448,6 +451,20 @@ func (w *Worker) h1RequestInProgress() bool {
 		}
 	}
 	return false
+}
+
+// sendDrainDone reports whether the worker, on this pass of its send drain, has
+// nothing left to wait for: no send pending, no request in progress, and, inside
+// the floor (the first shutdownSendDrainNanos from shutdownDrainStart), no request
+// still in the kernel (h1UnreadInKernel). Past the floor the gate's first pass
+// has marked such a request (gateRead, counted by h1RequestInProgress), so the
+// kernel is no longer asked: the look cannot keep a worker past the floor.
+// A request head fragment, or a bare CRLF, that the worker finds and reads is a
+// request in progress like any other and holds the drain to its budget (drainEnd),
+// as it does on epoll (celeris#1166, #1208). Worker thread.
+func (w *Worker) sendDrainDone(now int64) bool {
+	pastFloor := now > w.shutdownDrainStart+shutdownSendDrainNanos
+	return !w.hasPendingSends() && !w.h1RequestInProgress() && (pastFloor || !w.h1UnreadInKernel())
 }
 
 // h1UnreadInKernel reports whether an HTTP/1 conn of the worker has the bytes of

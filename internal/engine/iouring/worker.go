@@ -1652,8 +1652,7 @@ func (w *Worker) run(ctx context.Context) {
 				// shutdownSendDrainNanos), while the worker serves as an ordinary
 				// iteration; past it the gate's first pass marks such a request
 				// (gateRead) and h1RequestInProgress waits for it.
-				pastFloor := now > w.shutdownDrainStart+shutdownSendDrainNanos
-				if !w.hasPendingSends() && !w.h1RequestInProgress() && (pastFloor || !w.h1UnreadInKernel()) {
+				if w.sendDrainDone(now) {
 					w.shutdown()
 					return
 				}
