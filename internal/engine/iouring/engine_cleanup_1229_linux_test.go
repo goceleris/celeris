@@ -3,6 +3,8 @@
 package iouring
 
 import (
+	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -151,4 +153,21 @@ func setCancelAcceptSeam1229(t *testing.T, fn func(*Worker, int)) {
 	t.Helper()
 	cancelAcceptSeam.Store(&fn)
 	t.Cleanup(func() { cancelAcceptSeam.Store(nil) })
+}
+
+// TestDialDiagNamesTheListenSocketOfAPort1229: the failure message of a dial
+// that timed out says whether a LISTEN socket was there for it.
+func TestDialDiagNamesTheListenSocketOfAPort1229(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if got := dialDiag896(addr); !strings.Contains(got, "queues(tx:rx)=") {
+		t.Errorf("dialDiag896 of a live listener = %q, want its /proc/net/tcp row", got)
+	}
+	_ = ln.Close()
+	if got := dialDiag896(addr); !strings.Contains(got, "no LISTEN socket") {
+		t.Errorf("dialDiag896 of a closed port = %q, want it to say no LISTEN socket", got)
+	}
 }

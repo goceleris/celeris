@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -154,7 +156,59 @@ func startHold896(t *testing.T, addr string, workers int, writeTimeout time.Dura
 		release = hh.unblock
 	}
 	run.reapAtCleanup(t, release)
+	// Shown only if the test fails: a dial that times out on a Coverage run
+	// (celeris#1229) names no tier, and the engine's own log is discarded.
+	t.Logf("celeris1229 engine on %s: %s", addr, describeEngine896(run.e))
 	return run
+}
+
+// describeEngine896 names the tier the engine's workers run on and the
+// kernel's view of its listen sockets (dialDiag896), for the failure message
+// of a dial that timed out.
+func describeEngine896(e *Engine) string {
+	e.mu.Lock()
+	ws := e.workers
+	e.mu.Unlock()
+	tier := "no workers"
+	if len(ws) > 0 {
+		tier = ws[0].tier.Tier().String()
+	}
+	return fmt.Sprintf("tier=%s workers=%d", tier, len(ws))
+}
+
+// dialDiag896 returns the LISTEN rows /proc/net/tcp and tcp6 hold for addr's
+// port: the receive queue of a listen socket is its accept queue, the transmit
+// queue its backlog. A dial that timed out against a port with no row had no
+// listener, one against a row whose queue is full had a listener nobody
+// accepts from.
+func dialDiag896(addr string) string {
+	_, ps, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "no port in " + addr
+	}
+	port, _ := strconv.Atoi(ps)
+	var rows []string
+	for _, f := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, ln := range strings.Split(string(b), "\n")[1:] {
+			fl := strings.Fields(ln)
+			// sl local_address rem_address st tx_queue:rx_queue ...
+			if len(fl) < 5 || fl[3] != "0A" {
+				continue
+			}
+			if i := strings.LastIndexByte(fl[1], ':'); i < 0 || fl[1][i+1:] != fmt.Sprintf("%04X", port) {
+				continue
+			}
+			rows = append(rows, fmt.Sprintf("%s %s queues(tx:rx)=%s", filepath.Base(f), fl[1], fl[4]))
+		}
+	}
+	if len(rows) == 0 {
+		return fmt.Sprintf("no LISTEN socket on port %d in /proc/net/tcp{,6}", port)
+	}
+	return strings.Join(rows, "; ")
 }
 
 // h2Request896 opens an HTTP/2 connection to addr (prior knowledge) and sends
@@ -163,7 +217,7 @@ func h2Request896(t *testing.T, addr, path string) net.Conn {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
-		t.Fatalf("dial %s: %v", addr, err)
+		t.Fatalf("dial %s: %v (%s)", addr, err, dialDiag896(addr))
 	}
 	_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := c.Write([]byte(http2.ClientPreface)); err != nil {
@@ -317,7 +371,7 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	run := startHold896(t, addr, 2, -1, h)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
-		t.Fatalf("dial %s: %v", addr, err)
+		t.Fatalf("dial %s: %v (%s)", addr, err, dialDiag896(addr))
 	}
 	defer func() { _ = c.Close() }()
 	if _, err := c.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
