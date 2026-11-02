@@ -47,15 +47,15 @@ import (
 //	                  arrives on a conn it was reading. answered, with
 //	                  Connection: close.
 //	    B-hold-other  natives: the loop is held in another conn's OnConnect
-//	                  while 24 conns it was reading send their heads. epoll,
-//	                  adaptive (starts on epoll): answered, close; io_uring: the
-//	                  held worker has nothing to send and exits at once, those
-//	                  heads are dropped.
+//	                  while 24 conns it was reading send their heads. answered,
+//	                  close, on all (io_uring dropped them before the fix of
+//	                  celeris#1208: its worker has nothing to send and exited).
 //	    B-accept-hold OnConnect holds the conn before the engine reads it.
 //	                  std (net/http parses the head after Shutdown began):
 //	                  GET closed without an answer, with a body reset;
-//	                  epoll, adaptive (starts on epoll): answered, close;
-//	                  io_uring: closed without an answer.
+//	                  epoll, adaptive (starts on epoll), io_uring: answered, close
+//	                  (io_uring closed it without an answer before the fix of
+//	                  celeris#1208).
 //	    B-accept-hold-draining
 //	                  the same on epoll and io_uring with a response going out on
 //	                  every worker: answered, close, on both.
@@ -332,10 +332,10 @@ func TestShutdownKernelHead_1208_ShapeB(t *testing.T) {
 				t.Run("B-accept-hold-draining", func(t *testing.T) { t.Parallel(); kernelHeadAcceptHold1208(t, ec.eng, true, false, true, "answered") })
 			}
 			if ec.native {
-				t.Run("B-busy-loop", func(t *testing.T) { t.Parallel(); kernelHeadHeldLoop1208(t, ec.eng, "busy-loop", "answered") })
+				t.Run("B-busy-loop", func(t *testing.T) { t.Parallel(); kernelHeadHeldLoop1208(t, ec.eng, "busy-loop") })
 				t.Run("B-hold-other", func(t *testing.T) {
 					t.Parallel()
-					kernelHeadHeldLoop1208(t, ec.eng, "hold-other", wantHoldOther1208(ec.eng))
+					kernelHeadHeldLoop1208(t, ec.eng, "hold-other")
 				})
 			}
 		})
@@ -349,19 +349,17 @@ func TestShutdownKernelHead_1208_ShapeB(t *testing.T) {
 //     of a POST left unread makes the close a reset;
 //   - epoll (and adaptive, which starts on epoll): the gate asks the kernel for
 //     the receive queue (TIOCINQ) and reads the head on: answered, with close;
-//   - io_uring: closed without an answer, GET or POST (a FIN, not an RST). The
-//     worker has no send pending and no parsed request in progress when it first
-//     looks at the shutdown, so it exits at once (worker.go, the send-drain
-//     branch), and h1RequestInProgress does not look at the kernel, as epoll's
-//     h1InProgress does: the recv it had prepared after OnConnect is reaped
-//     without being served. A worker with a send pending, or a request in
-//     progress, stays in its drain and answers it (B-hold-other-draining).
+//   - io_uring: answered, with close. Until the fix of celeris#1208 it was closed
+//     without an answer (a FIN, GET or POST): a worker with no send pending and
+//     no parsed request in progress exited on its first look at the shutdown,
+//     and h1RequestInProgress did not look at the kernel, as epoll's
+//     h1InProgress does, so the recv it had prepared after OnConnect was reaped
+//     without being served. The worker now asks the kernel inside the 250 ms
+//     floor (h1UnreadInKernel). RED on the commit before the fix.
 func wantAcceptHold1208(eng celeris.EngineType, post bool) string {
 	switch eng {
-	case celeris.Epoll, celeris.Adaptive:
+	case celeris.Epoll, celeris.Adaptive, celeris.IOUring:
 		return "answered"
-	case celeris.IOUring:
-		return "closed-without-answer"
 	}
 	if post {
 		return "reset"
@@ -449,17 +447,6 @@ func kernelHeadAcceptHold1208(t *testing.T, eng celeris.EngineType, native, post
 	wg.Wait()
 }
 
-// wantHoldOther1208 is what B-hold-other gets (measured): epoll answers, io_uring
-// drops. The loop is held in another conn's OnConnect, so on io_uring the worker
-// has no send pending and no request parsed when it first looks at the shutdown,
-// and exits (see wantAcceptHold1208).
-func wantHoldOther1208(eng celeris.EngineType) string {
-	if eng == celeris.IOUring {
-		return "dropped"
-	}
-	return "answered"
-}
-
 // kernelHeadHeldLoop1208: epoll, io_uring and adaptive. One loop is held while
 // 24 conns the engine is already reading send their heads: those on the held
 // loop have their head in the kernel (epoll) or unreaped (io_uring) when Shutdown
@@ -471,15 +458,15 @@ func wantHoldOther1208(eng celeris.EngineType) string {
 //     send pending, which keeps an io_uring worker in its drain whatever the
 //     conns hold.
 //   - "hold-other": the OnConnect of another, silent conn holds the loop. No send
-//     is pending and no request is in progress, so the io_uring worker exits at
-//     once on its first look at the shutdown, with the heads still in the kernel
-//     (celeris#1208; #1104's contract is "a request that reached the kernel
-//     before the gate is answered").
+//     is pending and no request is in progress, so the io_uring worker used to
+//     exit at once on its first look at the shutdown, with the heads still in the
+//     kernel (celeris#1208; #1104's contract is "a request that reached the
+//     kernel before the gate is answered"): RED on the commit before the fix.
 //
 // The conns are spread by the kernel over the loops (p = 2^-23 that none is on
 // the held one): that is a failure, not a skip, which CI's tally would fail
 // anyway.
-func kernelHeadHeldLoop1208(t *testing.T, eng celeris.EngineType, how, want string) {
+func kernelHeadHeldLoop1208(t *testing.T, eng celeris.EngineType, how string) {
 	const n = 24
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -588,36 +575,27 @@ func kernelHeadHeldLoop1208(t *testing.T, eng celeris.EngineType, how, want stri
 	wg.Wait()
 	// A conn answered with close is either one the shutdown found unread or one
 	// of the loop that was not held whose request was still arriving when it
-	// began (a loaded machine): both are answered. Dropped conns are the held
-	// loop's, with the heads unread, and are what "dropped" counts.
-	unread, dropped := 0, 0
+	// began (a loaded machine): both are answered.
+	unread := 0
 	for i, o := range res {
 		if o.answered() && !o.close {
 			continue // served by the loop that was not held, before the shutdown
 		}
 		unread++
 		if !o.answered() {
-			dropped++
+			t.Errorf("%v/%s conn %d (post=%v): a head in the kernel when the shutdown began: %v, want it answered", eng, how, i, i%2 == 1, o)
+			continue
 		}
-		if want == "answered" {
-			if !o.answered() {
-				t.Errorf("%v/%s conn %d (post=%v): a head in the kernel when the shutdown began: %v, want it answered", eng, how, i, i%2 == 1, o)
-			} else {
-				wantBody := "ok"
-				if i%2 == 1 {
-					wantBody = "got " + strconv.Itoa(postBody1208)
-				}
-				if o.body != wantBody {
-					t.Errorf("conn %d: body %q, want %q", i, o.body, wantBody)
-				}
-			}
+		wantBody := "ok"
+		if i%2 == 1 {
+			wantBody = "got " + strconv.Itoa(postBody1208)
+		}
+		if o.body != wantBody {
+			t.Errorf("conn %d: body %q, want %q", i, o.body, wantBody)
 		}
 	}
 	if unread == 0 {
 		t.Errorf("%v/%s: every conn was on the loop that was not held: nothing was unread (p = 2^-23)", eng, how)
-	}
-	if want == "dropped" && dropped == 0 {
-		t.Errorf("%v/%s: no conn was dropped: %d answered with close, want the held loop's heads dropped", eng, how, unread)
 	}
 	if how == "busy-loop" {
 		_ = holder.SetReadDeadline(time.Now().Add(5 * time.Second))
