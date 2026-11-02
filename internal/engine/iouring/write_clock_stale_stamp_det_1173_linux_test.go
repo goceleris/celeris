@@ -37,8 +37,7 @@ func TestWriteClockStampAfterAnEmptyWaitIsFreshDeterministic1173(t *testing.T) {
 		visible  atomic.Int64
 		resultCh = make(chan struct{}, 1)
 	)
-	oldWait := ringWaitSeam
-	ringWaitSeam = func(w *Worker, _ ringWaitMode, err error) error {
+	waitSeam := func(w *Worker, _ ringWaitMode, err error) error {
 		if err != nil || !armed.Load() || len(w.h2Conns) == 0 {
 			return err
 		}
@@ -71,8 +70,9 @@ func TestWriteClockStampAfterAnEmptyWaitIsFreshDeterministic1173(t *testing.T) {
 			}
 		}
 	}
+	setRingWaitSeam884(t, waitSeam)
 	h2WriteDrainSeam.Store(&seam)
-	t.Cleanup(func() { ringWaitSeam = oldWait; h2WriteDrainSeam.Store(nil) })
+	t.Cleanup(func() { h2WriteDrainSeam.Store(nil) })
 
 	g := &gate1173{started: make(chan struct{}, 1), gate: make(chan struct{})}
 	run, addr := startGate1173(t, g)

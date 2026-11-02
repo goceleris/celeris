@@ -123,11 +123,10 @@ func startHold896(t *testing.T, addr string, workers int, writeTimeout time.Dura
 			skipOrFail656(t, "New: %v", err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- e.Listen(ctx) }()
+		done, returned := listenAsync896(e, ctx)
 		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); {
 			if e.Addr() != nil {
-				run = &engineRun896{e: e, cancel: cancel, done: done}
+				run = &engineRun896{e: e, cancel: cancel, done: done, returned: returned}
 				return nil
 			}
 			select {
@@ -148,6 +147,13 @@ func startHold896(t *testing.T, addr string, workers int, writeTimeout time.Dura
 		}
 		t.Fatalf("engine start on %s: %v", addr, err)
 	}
+	// A handler of h that the test holds is released before Listen is waited
+	// for: it waits for the HTTP/2 stream handlers on the worker pool.
+	var release func()
+	if hh, ok := h.(*holdHandler896); ok {
+		release = hh.unblock
+	}
+	run.reapAtCleanup(t, release)
 	return run
 }
 
@@ -185,7 +191,7 @@ func h2Request896(t *testing.T, addr, path string) net.Conn {
 func seam896(t *testing.T, full bool) *atomic.Int64 {
 	t.Helper()
 	var calls atomic.Int64
-	cancelAcceptSeam = func(w *Worker, _ int) {
+	setCancelAcceptSeam1229(t, func(w *Worker, _ int) {
 		if full {
 			for {
 				sqe := w.ring.GetSQE()
@@ -196,8 +202,7 @@ func seam896(t *testing.T, full bool) *atomic.Int64 {
 			}
 		}
 		calls.Add(1)
-	}
-	t.Cleanup(func() { cancelAcceptSeam = nil })
+	})
 	return &calls
 }
 

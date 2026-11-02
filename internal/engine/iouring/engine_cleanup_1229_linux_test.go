@@ -16,8 +16,10 @@ import (
 // cancelAcceptSeam) had those workers read it: answered EBUSY for waits it
 // never asked about, and raced with the seam's restore.
 
-// engineAfterItsTestEnded1229 runs start in a subtest that ends at once, the
-// way a failed assertion ends one, and returns the run the helper started and
+// engineAfterItsTestEnded1229 runs start in a subtest that returns at once
+// without stopping what it started, which is all a failed assertion does to
+// the cleanups of its test (runtime.Goexit runs them, and nothing else of the
+// test's body), and returns the run the helper started and
 // whether Listen had returned by the time the subtest's cleanups had run. A
 // run that is still going is cancelled here, so that this test does not leak
 // what it looks for.
@@ -25,7 +27,6 @@ func engineAfterItsTestEnded1229(t *testing.T, start func(t *testing.T) *engineR
 	t.Helper()
 	t.Run("ended", func(t *testing.T) {
 		run = start(t)
-		t.SkipNow()
 	})
 	if run == nil {
 		t.Skip("the engine did not start here")
@@ -148,6 +149,6 @@ func TestCancelAcceptSeamRestoreIsSafeAgainstALateReader1229(t *testing.T) {
 // it nil when the test ends.
 func setCancelAcceptSeam1229(t *testing.T, fn func(*Worker, int)) {
 	t.Helper()
-	cancelAcceptSeam = fn
-	t.Cleanup(func() { cancelAcceptSeam = nil })
+	cancelAcceptSeam.Store(&fn)
+	t.Cleanup(func() { cancelAcceptSeam.Store(nil) })
 }

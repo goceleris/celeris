@@ -433,8 +433,7 @@ func TestCancelAcceptWaitIsBoundedByTheMonotonicClock1176(t *testing.T) {
 				return nil
 			}
 			t.Cleanup(func() { shutdownRingWait = orig })
-			cancelAcceptSeam = func(w *Worker, _ int) { ring.CompareAndSwap(nil, w.ring) }
-			t.Cleanup(func() { cancelAcceptSeam = nil })
+			setCancelAcceptSeam1229(t, func(w *Worker, _ int) { ring.CompareAndSwap(nil, w.ring) })
 			restore := stairClock1176(t, step)
 
 			h := newHoldHandler896(false)
