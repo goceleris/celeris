@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"strconv"
 	"time"
 
@@ -121,52 +120,56 @@ func (c *Client) opTimeout() time.Duration {
 	return max(t, 0)
 }
 
-// opContext limits ctx by the per-operation timeout (celeris#1218): the returned
-// context ends at the caller's deadline or after the timeout, whichever is first. A
-// caller's deadline that is not later than the timeout is left alone (ctx comes back
-// as it is, and its error is the caller's). timeout is 0 when ctx was not limited.
-func (c *Client) opContext(ctx context.Context) (octx context.Context, cancel context.CancelFunc, timeout time.Duration) {
+// opLimit works out the per-operation limit of one command (celeris#1218), as a
+// value: no context is built, so a command pays no allocation for it. It returns
+// the timeout and the time it ends, or zero values when the command is not limited
+// by it: the timeout is off, or the caller's deadline is not later than it (the
+// caller's deadline then ends the command, and its error is the caller's).
+func (c *Client) opLimit(ctx context.Context) (timeout time.Duration, deadline time.Time) {
 	t := c.opTimeout()
 	if t == 0 {
-		return ctx, func() {}, 0
+		return 0, time.Time{}
 	}
-	if dl, ok := ctx.Deadline(); ok && !dl.After(time.Now().Add(t)) {
-		return ctx, func() {}, 0
+	dl := time.Now().Add(t)
+	if cdl, ok := ctx.Deadline(); ok && !cdl.After(dl) {
+		return 0, time.Time{}
 	}
-	octx, cancel = context.WithTimeout(ctx, t)
-	return octx, cancel, t
+	return t, dl
 }
 
-// opError reports an error of an operation run on a context from opContext. When
-// the per-operation timeout ended it (timeout > 0, the caller's context is alive,
-// and either the derived context expired or a direct conn's socket deadline fired a
-// hair before it), the error says so and matches context.DeadlineExceeded, which
-// also tells run to drop the conn.
-func opError(ctx, octx context.Context, err error, timeout time.Duration) error {
-	if err == nil || timeout == 0 || ctx.Err() != nil {
-		return err
+// beginOp puts the per-operation limit on conn for one command and, for a direct
+// conn (which waits in a socket read that does not look at a context), arms the wake
+// of its read on the end of a cancellable ctx. It returns the func that disarms the
+// wake, nil when none was armed (a ctx that cannot be cancelled costs nothing, not
+// even a closure). Pair it with endOp(disarm), after opError.
+func (c *Client) beginOp(ctx context.Context, conn *memcachedConn) (disarm func()) {
+	conn.opTimeout, conn.opDeadline = c.opLimit(ctx)
+	if conn.useDirect && ctx.Done() != nil {
+		return conn.wakeReadOnDone(ctx)
 	}
-	if octx.Err() == nil && !errors.Is(err, os.ErrDeadlineExceeded) {
-		return err
+	return nil
+}
+
+// endOp ends the limit of the command that ran on conn and disarms the wake.
+func endOp(conn *memcachedConn, disarm func()) {
+	if disarm != nil {
+		disarm()
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("celeris-memcached: operation timed out after %v: %w", timeout, err)
-	}
-	return fmt.Errorf("celeris-memcached: operation timed out after %v: %w: %w", timeout, context.DeadlineExceeded, err)
+	conn.opTimeout, conn.opDeadline = 0, time.Time{}
 }
 
 // run acquires a conn, runs fn with it, and releases the conn. fn runs under the
-// per-operation timeout (opContext); acquiring the conn does not (a new conn has
-// its own DialTimeout). On ctx cancellation or context deadline the conn is
-// discarded because the server may still send a stale reply.
+// per-operation timeout (beginOp); acquiring the conn does not (a new conn has its
+// own DialTimeout). On ctx cancellation or context deadline the conn is discarded
+// because the server may still send a stale reply.
 func (c *Client) run(ctx context.Context, fn func(ctx context.Context, conn *memcachedConn) error) error {
 	conn, err := c.pool.acquire(ctx, workerFromCtx(ctx))
 	if err != nil {
 		return err
 	}
-	octx, cancel, timeout := c.opContext(ctx)
-	ferr := opError(ctx, octx, fn(octx, conn), timeout)
-	cancel()
+	disarm := c.beginOp(ctx, conn)
+	ferr := conn.opError(ctx, fn(ctx, conn))
+	endOp(conn, disarm)
 	if ferr != nil && (errors.Is(ferr, context.Canceled) || errors.Is(ferr, context.DeadlineExceeded)) {
 		c.pool.discard(conn)
 		return ferr
@@ -902,9 +905,9 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	octx, cancel, timeout := c.opContext(ctx)
-	perr := opError(ctx, octx, conn.Ping(octx), timeout)
-	cancel()
+	disarm := c.beginOp(ctx, conn)
+	perr := conn.opError(ctx, conn.Ping(ctx))
+	endOp(conn, disarm)
 	if perr != nil {
 		if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
 			c.pool.discard(conn)

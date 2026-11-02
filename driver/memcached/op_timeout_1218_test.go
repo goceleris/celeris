@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -200,8 +201,8 @@ func TestOperationKeepsTheCallersShorterDeadline1218(t *testing.T) {
 				_, err := c.Get(ctx, "k")
 				return err
 			})
-			if !errors.Is(err, context.DeadlineExceeded) && !isTimeout(err) {
-				t.Fatalf("error %v, want a deadline error", err)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error %v, want one matching context.DeadlineExceeded (also on the direct path)", err)
 			}
 			if strings.Contains(err.Error(), "operation timed out") {
 				t.Errorf("error %q: the caller's own deadline is reported as Config.Timeout", err)
@@ -211,11 +212,6 @@ func TestOperationKeepsTheCallersShorterDeadline1218(t *testing.T) {
 			}
 		})
 	}
-}
-
-func isTimeout(err error) bool {
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // A client that answers within the bound is not affected, and the bound does not
@@ -293,16 +289,15 @@ func TestNegativeTimeoutTurnsTheOperationBoundOff1218(t *testing.T) {
 }
 
 // A caller that cancels its context gets its own cancellation back, not relabelled
-// as the driver's timeout, and the conn is dropped. (A direct conn does not watch a
-// context's cancellation, only its deadline, so it is not in the cases.)
+// as the driver's timeout, and the conn is dropped. This includes the direct path,
+// the one a client without an engine uses: its blocked read is woken by the cancel,
+// it does not wait for Config.Timeout, and the error matches context.Canceled, not a
+// bare i/o timeout.
 func TestOperationKeepsTheCallersCancellation1218(t *testing.T) {
 	if defaultTimeout != 3*time.Second {
 		t.Errorf("defaultTimeout = %v, want the documented 3 s", defaultTimeout)
 	}
 	for _, cl := range opClients {
-		if cl.name == "direct" {
-			continue
-		}
 		t.Run(cl.name, func(t *testing.T) {
 			t.Parallel()
 			addr, _ := startMuteServer(t, false)
@@ -323,5 +318,37 @@ func TestOperationKeepsTheCallersCancellation1218(t *testing.T) {
 				t.Errorf("the pool holds %d conns after the cancel, want 0", n)
 			}
 		})
+	}
+}
+
+// opError never relabels an application answer, whatever the time: only a deadline
+// error (the socket's, on a direct conn) is turned into the per-operation timeout,
+// and a caller's ended context wins over it.
+func TestOpErrorRelabelsOnlyDeadlineErrors1218(t *testing.T) {
+	c := &memcachedConn{opTimeout: 300 * time.Millisecond}
+	if err := c.opError(context.Background(), ErrCacheMiss); err != ErrCacheMiss {
+		t.Errorf("an application answer was relabelled: %v", err)
+	}
+	sock := os.ErrDeadlineExceeded
+	err := c.opError(context.Background(), sock)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, os.ErrDeadlineExceeded) || !strings.Contains(err.Error(), "operation timed out after 300ms") {
+		t.Errorf("the socket's deadline error became %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = c.opError(ctx, sock)
+	if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "operation timed out") {
+		t.Errorf("a caller's cancel became %v", err)
+	}
+	// No limit on the command: the socket's error is left alone while the caller's
+	// deadline has not been reached, and is the caller's once it has.
+	c.opTimeout = 0
+	if err := c.opError(context.Background(), sock); err != sock {
+		t.Errorf("an error of an unlimited command was changed: %v", err)
+	}
+	dctx, dcancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer dcancel()
+	if err := c.opError(dctx, sock); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a caller's deadline became %v", err)
 	}
 }

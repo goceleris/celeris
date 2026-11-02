@@ -68,7 +68,8 @@ type Config struct {
 	// matches [context.DeadlineExceeded], and the conn it used is dropped. It
 	// applies whether or not the caller's context has a deadline; a deadline of the
 	// caller's that is not later than Timeout wins and its error is returned as it
-	// is. It does not cover waiting for a pool slot or dialling a new conn (that is
+	// is. A multi-key get, Stats and Flush are one operation each: Timeout covers
+	// the whole command, not each key or each read. It does not cover waiting for a pool slot or dialling a new conn (that is
 	// [Config.DialTimeout]'s). Zero means the default, 3s; a negative value turns
 	// the per-operation deadline off, and the caller's context is then the only
 	// bound.

@@ -61,6 +61,15 @@ type syncMultiRoundTripper interface {
 type memcachedConn struct {
 	useDirect bool
 
+	// opTimeout and opDeadline are the per-operation limit of the command that is
+	// running on this conn (celeris#1218): both zero when it is not limited by
+	// Config.Timeout. They are set by Client.beginOp and cleared by endOp, on the
+	// goroutine that owns the conn for the command. opTimer is the timer a loop
+	// conn parks on for it, created on first use and reused.
+	opTimeout  time.Duration
+	opDeadline time.Time
+	opTimer    *time.Timer
+
 	// Direct-mode fields.
 	tcp *net.TCPConn
 	// tcpFd caches the raw fd for MSG_DONTWAIT peeks. Pre-netpoll
@@ -599,13 +608,99 @@ func (c *memcachedConn) waitTransport(ctx context.Context, req *mcRequest) error
 		default:
 		}
 	}
+	tc := c.armOpTimer()
+	defer c.disarmOpTimer()
 	select {
 	case <-req.doneCh:
 		return nil
 	case <-ctx.Done():
 		_ = c.closeWithErr(ctx.Err())
 		return ctx.Err()
+	case <-tc:
+		return c.opTimedOut(nil)
 	}
+}
+
+// opTimeoutError is the error of a command that Config.Timeout ended. It matches
+// context.DeadlineExceeded (and says "timed out"); cause is the socket's own
+// timeout on a direct conn, nil on a loop conn.
+type opTimeoutError struct {
+	d     time.Duration
+	cause error
+}
+
+func (e *opTimeoutError) Error() string {
+	s := fmt.Sprintf("celeris-memcached: operation timed out after %v: %v", e.d, context.DeadlineExceeded)
+	if e.cause != nil {
+		s += ": " + e.cause.Error()
+	}
+	return s
+}
+func (e *opTimeoutError) Is(target error) bool { return target == context.DeadlineExceeded }
+func (e *opTimeoutError) Unwrap() error        { return e.cause }
+func (e *opTimeoutError) Timeout() bool        { return true }
+
+// directDeadline is the deadline a direct conn's socket gets for the running
+// command: the earlier of the caller's and the per-operation one.
+func (c *memcachedConn) directDeadline(ctx context.Context) (time.Time, bool) {
+	dl, ok := ctx.Deadline()
+	if !c.opDeadline.IsZero() && (!ok || c.opDeadline.Before(dl)) {
+		return c.opDeadline, true
+	}
+	return dl, ok
+}
+
+// armOpTimer arms the conn's timer for what is left of the per-operation limit and
+// returns its channel; nil (a channel that never fires) if the command has no
+// limit. Called only when a loop conn is about to park: a reply that comes within
+// the spin window costs nothing.
+func (c *memcachedConn) armOpTimer() <-chan time.Time {
+	if c.opDeadline.IsZero() {
+		return nil
+	}
+	d := time.Until(c.opDeadline)
+	if c.opTimer == nil {
+		c.opTimer = time.NewTimer(d)
+	} else {
+		c.opTimer.Reset(d)
+	}
+	return c.opTimer.C
+}
+
+func (c *memcachedConn) disarmOpTimer() {
+	if c.opTimer != nil && !c.opDeadline.IsZero() {
+		c.opTimer.Stop()
+	}
+}
+
+// opTimedOut ends the running command because its per-operation limit ran out: the
+// conn is closed (the server may still send a reply) and the error says so.
+func (c *memcachedConn) opTimedOut(cause error) error {
+	err := &opTimeoutError{d: c.opTimeout, cause: cause}
+	_ = c.closeWithErr(err)
+	return err
+}
+
+// opError turns the error of a command into what the caller should see. A
+// deadline that fired on a direct conn's socket is reported as what ended it: the
+// caller's context if that has ended (its error, wrapped around the socket's), the
+// per-operation timeout if that was the limit, the caller's deadline if that has
+// been reached. An application answer is never relabelled, whatever the time.
+// Call it before endOp (commands.go): it reads the limit beginOp put on the conn.
+func (c *memcachedConn) opError(ctx context.Context, err error) error {
+	if err == nil || !errors.Is(err, os.ErrDeadlineExceeded) {
+		return err
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%w: %w", cerr, err)
+	}
+	if c.opTimeout != 0 {
+		return &opTimeoutError{d: c.opTimeout, cause: err}
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
+	return err
 }
 
 // closeWithErr records err as the close cause and closes the conn. Safe to
@@ -643,6 +738,8 @@ func (c *memcachedConn) wait(ctx context.Context, req *mcRequest) error {
 		default:
 		}
 	}
+	tc := c.armOpTimer()
+	defer c.disarmOpTimer()
 	select {
 	case <-req.doneCh:
 		return req.resultErr
@@ -653,6 +750,8 @@ func (c *memcachedConn) wait(ctx context.Context, req *mcRequest) error {
 		// is poisoned — close it so the pool discards it.
 		_ = c.closeWithErr(ctx.Err())
 		return ctx.Err()
+	case <-tc:
+		return c.opTimedOut(nil)
 	}
 }
 
@@ -737,7 +836,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 		c.syncBuf = make([]byte, 16<<10)
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
+	if dl, ok := c.directDeadline(ctx); ok {
 		_ = c.tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
@@ -785,7 +884,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 		c.syncBuf = make([]byte, 16<<10)
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
+	if dl, ok := c.directDeadline(ctx); ok {
 		_ = c.tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
@@ -834,7 +933,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 		c.syncBuf = make([]byte, 16<<10)
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
+	if dl, ok := c.directDeadline(ctx); ok {
 		_ = c.tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
