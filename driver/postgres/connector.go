@@ -81,8 +81,9 @@ func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 // SO_BUSY_POLL budget (Linux) of the connections it opens: a positive d sets
 // it, whole microseconds only. Busy polling is off by default, and the budget
 // of a Connector bound with [Connector.WithEngine] is the server's
-// Config.SocketBusyPoll unless d overrides it, so d is for a standalone
-// Connector; a zero d cannot turn off a server that has it on. Before v1.6.0
+// Config.SocketBusyPoll unless a positive d overrides it, which it does; it
+// is the only way to enable it without an engine. A zero d inherits and so
+// cannot turn off a server that has it on. Before v1.6.0
 // the driver set 50 microseconds on every connection with no way to turn it
 // off (celeris#1228). Like [Connector.WithEngine] it returns a new Connector
 // that shares the DSN and not the loop.

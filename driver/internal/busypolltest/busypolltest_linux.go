@@ -8,8 +8,9 @@ import (
 	"testing"
 	"time"
 
-	celeris "github.com/goceleris/celeris"
 	"golang.org/x/sys/unix"
+
+	celeris "github.com/goceleris/celeris"
 )
 
 // StartServer runs a celeris server on the epoll engine, on a loopback
