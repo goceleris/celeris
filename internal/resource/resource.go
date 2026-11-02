@@ -1,5 +1,7 @@
 package resource
 
+import "time"
+
 // WorkloadHint is an OPTIONAL operator declaration of the expected steady-state
 // concurrency, consumed only by the adaptive engine's start-engine decision.
 //
@@ -40,6 +42,10 @@ type Resources struct {
 	SocketRecv int
 	// SocketSend is the SO_SNDBUF size for accepted connections (0 = OS default).
 	SocketSend int
+	// SocketBusyPoll is the SO_BUSY_POLL budget of accepted connections on the
+	// native engines (Linux). 0, the default, is off: busy polling is opt-in
+	// (celeris#1036). See celeris.Config.SocketBusyPoll.
+	SocketBusyPoll time.Duration
 	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
 	MaxConns int
 	// WorkloadHint is an OPTIONAL operator concurrency declaration; the only
@@ -92,6 +98,8 @@ type ResolvedResources struct {
 	SocketRecv int
 	// SocketSend is the resolved SO_SNDBUF size.
 	SocketSend int
+	// SocketBusyPoll is the resolved SO_BUSY_POLL budget (0 = off, the default).
+	SocketBusyPoll time.Duration
 }
 
 // Resolve applies hardcoded defaults, user overrides, and hard caps.
@@ -112,6 +120,9 @@ func (r Resources) Resolve() ResolvedResources {
 	}
 	if r.SocketSend > 0 {
 		res.SocketSend = r.SocketSend
+	}
+	if r.SocketBusyPoll > 0 {
+		res.SocketBusyPoll = r.SocketBusyPoll
 	}
 
 	res.Workers = clamp(res.Workers, MinWorkers, 0)

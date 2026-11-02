@@ -420,9 +420,10 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		// ApplyFD doesn't need to re-issue it.
 		sockOpts: sockopts.Options{
 			TCPQuickAck: true,
-			SOBusyPoll:  50 * time.Microsecond,
-			RecvBuf:     resolved.SocketRecv,
-			SendBuf:     resolved.SocketSend,
+			// Opt-in, 0 unless Config.SocketBusyPoll is set (celeris#1036).
+			SOBusyPoll: resolved.SocketBusyPoll,
+			RecvBuf:    resolved.SocketRecv,
+			SendBuf:    resolved.SocketSend,
 		},
 		reqCount:      reqCount,
 		activeConns:   activeConns,
@@ -1293,7 +1294,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 			l.growConns(newFD)
 		}
 
-		_ = sockopts.ApplyFD(newFD, l.sockOpts)
+		sockopts.ApplyAccepted(newFD, l.sockOpts, l.logger)
 
 		// EPOLLRDHUP: report peer half-close (FIN) as a distinct condition. The
 		// short-read fast path in drainRead returns without a trailing EAGAIN

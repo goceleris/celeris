@@ -249,13 +249,14 @@ type Config struct, Protocol Protocol
 type Config struct, ReadHeaderTimeout time.Duration
 type Config struct, ReadTimeout time.Duration
 type Config struct, ShutdownTimeout time.Duration
+type Config struct, SocketBusyPoll time.Duration
 type Config struct, SocketRecvBuf int
 type Config struct, SocketSendBuf int
 type Config struct, TrustedProxies []string
 type Config struct, Workers int
 type Config struct, WorkloadHint WorkloadHint
 type Config struct, WriteTimeout time.Duration
-type Config struct, field order Addr, Protocol, Engine, Workers, WorkloadHint, ReadTimeout, ReadHeaderTimeout, WriteTimeout, IdleTimeout, ShutdownTimeout, MaxFormSize, MaxRequestBodySize, MaxConcurrentStreams, MaxFrameSize, InitialWindowSize, MaxHeaderBytes, DisableKeepAlive, DisableDeferAccept, BufferSize, SocketRecvBuf, SocketSendBuf, MaxConns, MemoryLimitBytes, DisableMetrics, AsyncHandlers, OnExpectContinue, OnConnect, OnDisconnect, TrustedProxies, Logger, EnableH2Upgrade, DisableAutoHEAD, DisableAutoOPTIONS
+type Config struct, field order Addr, Protocol, Engine, Workers, WorkloadHint, ReadTimeout, ReadHeaderTimeout, WriteTimeout, IdleTimeout, ShutdownTimeout, MaxFormSize, MaxRequestBodySize, MaxConcurrentStreams, MaxFrameSize, InitialWindowSize, MaxHeaderBytes, DisableKeepAlive, DisableDeferAccept, BufferSize, SocketRecvBuf, SocketSendBuf, SocketBusyPoll, MaxConns, MemoryLimitBytes, DisableMetrics, AsyncHandlers, OnExpectContinue, OnConnect, OnDisconnect, TrustedProxies, Logger, EnableH2Upgrade, DisableAutoHEAD, DisableAutoOPTIONS
 type Config struct, not comparable
 type Context struct
 type Context struct, not comparable
