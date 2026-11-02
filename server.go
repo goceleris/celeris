@@ -920,10 +920,13 @@ func (s *Server) AsyncHandlers() bool {
 // SocketBusyPoll reports the SO_BUSY_POLL budget the server's native engines
 // put on the connections they accept: [Config.SocketBusyPoll], 0 (off) by
 // default. Celeris drivers opened via WithEngine(srv) consult it and put the
-// same budget on the sockets they dial, which the server's event loops serve,
-// so one setting decides both (celeris#1228). The std engine ignores
-// Config.SocketBusyPoll, and so does this: it reports 0 for it, since the
-// drivers then run on their own loop. It can be called before Start.
+// same budget on the connections they register on an event loop, so one
+// setting decides both (celeris#1228); which of a driver's connections that
+// is depends on the driver, see its SocketBusyPoll documentation. The std
+// engine ignores Config.SocketBusyPoll, and so does this: it reports 0 for it.
+// It reports the configured value, also in the unsupported io_uring
+// fixed-files mode, where the engine ignores it for accepted sockets. It can
+// be called before Start.
 func (s *Server) SocketBusyPoll() time.Duration {
 	rc := s.config.toResourceConfig().WithDefaults()
 	switch rc.Engine {

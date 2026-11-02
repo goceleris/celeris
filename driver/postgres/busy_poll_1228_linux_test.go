@@ -126,12 +126,65 @@ func TestConnectorSocketBusyPollOption(t *testing.T) {
 			return cn.WithEngine(srvOff).WithSocketBusyPoll(29 * time.Microsecond)
 		}, 29},
 		{"server 37us, option unset inherits", func(cn *Connector) *Connector { return cn.WithEngine(srvOn) }, 37},
+		{"server 37us, option set to 0 inherits", func(cn *Connector) *Connector {
+			return cn.WithEngine(srvOn).WithSocketBusyPoll(0)
+		}, 37},
+		{"server 37us, option under a microsecond inherits", func(cn *Connector) *Connector {
+			return cn.WithEngine(srvOn).WithSocketBusyPoll(500 * time.Nanosecond)
+		}, 37},
+		{"server 37us, option first, then 0 keeps the engine", func(cn *Connector) *Connector {
+			return cn.WithEngine(srvOn).WithSocketBusyPoll(29 * time.Microsecond).WithSocketBusyPoll(0)
+		}, 37},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cn := tc.build(newFakePGConnector(t))
 			t.Cleanup(func() { _ = cn.Close() })
 			c := connectorSocket(t, cn)
 			if got := busypolltest.BusyPoll(t, c.fd); got != tc.want {
+				t.Errorf("SO_BUSY_POLL = %d, want %d (baseline %d)", got, tc.want, base)
+			}
+		})
+	}
+}
+
+// Through the public Open: a Pool dials on an event loop only when it is opened
+// with the Engine of a server that has not started yet (it then uses its own
+// loop), and takes that server's budget; with no engine, or a started server's,
+// it dials through Go's netpoll and sets no option. A Pool has no option of its
+// own.
+func TestPoolSocketBusyPoll(t *testing.T) {
+	base := sockoptstest.Baseline(t)
+	started := busypolltest.StartServer(t, 37*time.Microsecond)
+	for _, tc := range []struct {
+		name string
+		opts func() []Option
+		want int
+	}{
+		{"standalone", func() []Option { return nil }, base},
+		{"server not started, 37us", func() []Option { return []Option{WithEngine(busypolltest.NewServer(37 * time.Microsecond))} }, 37},
+		{"server not started, off", func() []Option { return []Option{WithEngine(busypolltest.NewServer(0))} }, base},
+		{"server started, 37us (netpoll)", func() []Option { return []Option{WithEngine(started)} }, base},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := startFakePG(t, func(c net.Conn) {
+				fakePGTrustStartup(t, c, 42, 0x1ABCD123, func(c net.Conn) { _, _ = io.Copy(io.Discard, c) })
+			})
+			host, port, _ := net.SplitHostPort(addr)
+			p, err := Open("postgres://u@"+host+":"+port+"/d?sslmode=disable", tc.opts()...)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			defer func() { _ = p.Close() }()
+			c, err := p.acquire(context.Background())
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer p.release(c)
+			fd := c.fd
+			if fd == 0 {
+				fd = int(c.tcpFd)
+			}
+			if got := busypolltest.BusyPoll(t, fd); got != tc.want {
 				t.Errorf("SO_BUSY_POLL = %d, want %d (baseline %d)", got, tc.want, base)
 			}
 		})

@@ -52,11 +52,13 @@ type BusyPollProvider interface {
 }
 
 // BusyPoll is the SO_BUSY_POLL budget a driver puts on a connection it dials:
-// explicit, the driver's own option, when it is positive, else the budget sp
-// reports, else 0 (off, the default, which means no setsockopt call). Safe to
-// call with a nil sp.
+// explicit, the driver's own option, when it is at least one microsecond (the
+// kernel takes whole microseconds, so anything less is "not set", and cannot
+// silently turn off a server that has it on), else the budget sp reports, else
+// 0 (off, the default, which means no setsockopt call). Safe to call with a nil
+// sp.
 func BusyPoll(sp ServerProvider, explicit time.Duration) time.Duration {
-	if explicit > 0 {
+	if explicit >= time.Microsecond {
 		return explicit
 	}
 	if sp == nil {

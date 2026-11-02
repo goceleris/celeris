@@ -13,6 +13,13 @@ import (
 	celeris "github.com/goceleris/celeris"
 )
 
+// NewServer returns a celeris server on the epoll engine whose
+// Config.SocketBusyPoll is busyPoll, that has not been started: a driver opened
+// WithEngine of it cannot reach an event loop of the server, and runs on its own.
+func NewServer(busyPoll time.Duration) *celeris.Server {
+	return celeris.New(celeris.Config{Addr: "127.0.0.1:0", Engine: celeris.Epoll, SocketBusyPoll: busyPoll})
+}
+
 // StartServer runs a celeris server on the epoll engine, on a loopback
 // listener and with no routes, whose Config.SocketBusyPoll is busyPoll, and
 // returns it once it is listening. Its event loop is the one a driver opened
@@ -20,7 +27,7 @@ import (
 // the test ends. A host that cannot run the epoll engine skips the test.
 func StartServer(t testing.TB, busyPoll time.Duration) *celeris.Server {
 	t.Helper()
-	srv := celeris.New(celeris.Config{Addr: "127.0.0.1:0", Engine: celeris.Epoll, SocketBusyPoll: busyPoll})
+	srv := NewServer(busyPoll)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)

@@ -64,7 +64,7 @@ func newConnector(dsn string) (*Connector, error) {
 //
 // The connections it opens take the server's Config.SocketBusyPoll as their
 // SO_BUSY_POLL budget (Linux; 0, off, by default), unless
-// [Connector.WithSocketBusyPoll] set one.
+// [Connector.WithSocketBusyPoll] set one of its own.
 func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 	clone := &Connector{dsn: c.dsn, engine: sp, busyPoll: c.busyPoll}
 	if sp != nil {
@@ -78,15 +78,15 @@ func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 }
 
 // WithSocketBusyPoll returns a Connector that is this one with d as the
-// SO_BUSY_POLL budget (Linux) of the connections it opens: a positive d sets
-// it, whole microseconds only. Busy polling is off by default, and the budget
-// of a Connector bound with [Connector.WithEngine] is the server's
-// Config.SocketBusyPoll unless a positive d overrides it, which it does; it
-// is the only way to enable it without an engine. A zero d inherits and so
-// cannot turn off a server that has it on. Before v1.6.0
-// the driver set 50 microseconds on every connection with no way to turn it
-// off (celeris#1228). Like [Connector.WithEngine] it returns a new Connector
-// that shares the DSN and not the loop.
+// SO_BUSY_POLL budget (Linux) of the connections it opens, all of which are
+// registered on an event loop. A budget of one microsecond or more sets it, in
+// whole microseconds, and wins over the server's; anything less (0, a negative
+// value) leaves it to the server's Config.SocketBusyPoll when the Connector is
+// bound with [Connector.WithEngine], else off, so it cannot turn off a server
+// that has it on. Busy polling is off by default. Before v1.6.0 the driver set
+// 50 microseconds on every connection of a Connector (celeris#1228). A refused
+// setsockopt is ignored, silently. Like [Connector.WithEngine] it returns a new
+// Connector that shares the DSN and not the loop.
 func (c *Connector) WithSocketBusyPoll(d time.Duration) *Connector {
 	clone := &Connector{dsn: c.dsn, engine: c.engine, busyPoll: d}
 	c.provMu.Lock()

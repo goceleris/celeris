@@ -656,14 +656,18 @@ type Config struct {
 	// process; [Config.SocketRecvBuf] and [Config.SocketSendBuf] are still
 	// applied, they are set first.
 	//
-	// Drivers opened with WithEngine(srv) follow it: the celeris drivers
-	// (redis, postgres, memcached) used to set SO_BUSY_POLL, 50 microseconds,
-	// on every connection they dial, and now put this server's budget on the
-	// connections they register on its event loops (see [Server.SocketBusyPoll]),
-	// so a server with it off has drivers with it off too (celeris#1228).
-	// A driver without an engine is off by default; its own SocketBusyPoll
-	// option turns it on. The numbers below are for accepted sockets; no
-	// driver traffic was measured, and the mechanism is the same.
+	// The celeris drivers (redis, postgres, memcached) follow it when they are
+	// opened with WithEngine(srv): the connections they register on an event
+	// loop take this budget, see [Server.SocketBusyPoll] (celeris#1228). Before
+	// v1.6.0 those connections were set to 50 microseconds with no way to turn
+	// it off. That was never every connection a driver dials: only those
+	// registered on an event loop (redis Pub/Sub and, when it runs on a loop,
+	// the redis command pool; postgres Connector connections and, for a server
+	// not started yet, a Pool; memcached only for a server not started yet).
+	// Connections dialed through Go's netpoll were never set, and still are
+	// not. A driver without an engine is off by default; redis and postgres
+	// (Connector) have an option of their own. The numbers below are for
+	// accepted sockets; no driver traffic was measured.
 	//
 	// When it is set the engine also asks for SO_PREFER_BUSY_POLL, which the
 	// kernel gives only to a process with CAP_NET_ADMIN (that combination was

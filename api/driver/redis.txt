@@ -322,7 +322,7 @@ type Config struct, ReadTimeout time.Duration
 type Config struct, SocketBusyPoll time.Duration
 type Config struct, Username string
 type Config struct, WriteTimeout time.Duration
-type Config struct, field order Addr, Password, Username, DB, DialTimeout, ReadTimeout, WriteTimeout, PoolSize, MaxIdlePerWorker, MaxLifetime, MaxIdleTime, HealthCheckInterval, Proto, ForceRESP2, Engine, SocketBusyPoll, OnPush
+type Config struct, field order Addr, Password, Username, DB, DialTimeout, ReadTimeout, WriteTimeout, PoolSize, MaxIdlePerWorker, MaxLifetime, MaxIdleTime, HealthCheckInterval, Proto, ForceRESP2, Engine, OnPush, SocketBusyPoll
 type Config struct, not comparable
 type FloatCmd struct
 type FloatCmd struct, unexported fields

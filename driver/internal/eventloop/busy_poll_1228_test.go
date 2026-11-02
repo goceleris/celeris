@@ -36,6 +36,9 @@ func TestBusyPoll(t *testing.T) {
 		{"option wins over the server", busyPollServer{srv}, own, own},
 		{"option wins over a server that is off", busyPollServer{}, own, own},
 		{"negative option falls through", busyPollServer{srv}, -own, srv},
+		{"sub-microsecond option falls through", busyPollServer{srv}, 500 * time.Nanosecond, srv},
+		{"sub-microsecond option, no server", nil, 500 * time.Nanosecond, 0},
+		{"one microsecond is an option", busyPollServer{srv}, time.Microsecond, time.Microsecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := BusyPoll(tc.sp, tc.explicit); got != tc.want {

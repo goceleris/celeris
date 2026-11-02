@@ -46,7 +46,7 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 		_ = file.Close()
 		return nil, err
 	}
-	tuneConnSocket(fd, eventloop.BusyPoll(cfg.Engine, cfg.SocketBusyPoll))
+	tuneConnSocket(fd, eventloop.BusyPoll(cfg.Engine, 0))
 	_ = tcp.Close()
 
 	nw := prov.NumWorkers()

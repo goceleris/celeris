@@ -65,6 +65,14 @@ type Option func(*options)
 
 // WithEngine routes pool connections through the event loop of a running
 // celeris.Server. When unset, Open resolves a standalone loop.
+//
+// The connections a Pool registers on an event loop take the server's
+// Config.SocketBusyPoll as their SO_BUSY_POLL budget (Linux; 0, off, by
+// default). In practice that is a Pool opened with a server that has not started
+// yet (the Pool then uses the driver's own loop): a Pool without an engine, or
+// with a started server's, dials through Go's netpoll and sets no socket
+// option. The Pool has no busy poll option of its own; a [Connector]
+// does ([Connector.WithSocketBusyPoll]).
 func WithEngine(sp ServerProvider) Option {
 	return func(o *options) {
 		if sp == nil {

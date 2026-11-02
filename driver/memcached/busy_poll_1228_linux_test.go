@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/busypolltest"
-	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/sockopts/sockoptstest"
 )
 
@@ -67,40 +65,42 @@ func TestDriverOnTheServerMakesTheServersBusyPollCalls(t *testing.T) {
 	}
 }
 
-// The driver's own option sets the budget on a standalone loop, where nothing
-// else would, and wins over the server's; with neither a server's value nor
-// an option, the standalone driver stays off.
-func TestDriverSocketBusyPollOption(t *testing.T) {
+// Through the public NewClient, the one entry point a user has: the only
+// memcached connection on an event loop is that of a Client opened with the
+// Engine of a server that has not started yet, and it takes that server's
+// budget. A Client with no engine, and one with a started server's, dial through
+// Go's netpoll and are never tuned; there is no option to change that.
+func TestNewClientSocketBusyPoll(t *testing.T) {
 	base := sockoptstest.Baseline(t)
-	std, err := eventloop.Resolve(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { eventloop.Release(std) })
-	srvOn := busypolltest.StartServer(t, 37*time.Microsecond)
-	srvOff := busypolltest.StartServer(t, 0)
+	started := busypolltest.StartServer(t, 37*time.Microsecond)
 	for _, tc := range []struct {
 		name string
-		prov engine.EventLoopProvider
-		cfg  Config
+		opts func() []Option
 		want int
 	}{
-		{"standalone, default", std, Config{}, base},
-		{"standalone, option 29us", std, Config{SocketBusyPoll: 29 * time.Microsecond}, 29},
-		{"server 37us, option 29us wins", srvOn.EventLoopProvider(), Config{Engine: srvOn, SocketBusyPoll: 29 * time.Microsecond}, 29},
-		{"server off, option 29us", srvOff.EventLoopProvider(), Config{Engine: srvOff, SocketBusyPoll: 29 * time.Microsecond}, 29},
-		{"server 37us, option unset inherits", srvOn.EventLoopProvider(), Config{Engine: srvOn}, 37},
+		{"standalone", func() []Option { return nil }, base},
+		{"server not started, 37us", func() []Option { return []Option{WithEngine(busypolltest.NewServer(37 * time.Microsecond))} }, 37},
+		{"server not started, off", func() []Option { return []Option{WithEngine(busypolltest.NewServer(0))} }, base},
+		{"server started, 37us (netpoll)", func() []Option { return []Option{WithEngine(started)} }, base},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := startFake(t)
-			tc.cfg.Addr = fake.Addr()
-			c, err := dialMemcachedConn(context.Background(), tc.prov, tc.cfg, 0)
+			cl, err := NewClient(fake.Addr(), tc.opts()...)
 			if err != nil {
-				t.Fatalf("dial: %v", err)
+				t.Fatal(err)
 			}
-			defer func() { _ = c.Close() }()
-			if got := busypolltest.BusyPoll(t, c.fd); got != tc.want {
-				t.Errorf("SO_BUSY_POLL = %d, want %d (baseline %d)", got, tc.want, base)
+			defer func() { _ = cl.Close() }()
+			c, err := cl.pool.acquire(context.Background(), 0)
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			defer cl.pool.release(c)
+			fd := c.fd
+			if c.useDirect {
+				fd = int(c.tcpFd)
+			}
+			if got := busypolltest.BusyPoll(t, fd); got != tc.want {
+				t.Errorf("SO_BUSY_POLL = %d, want %d (baseline %d, direct conn: %v)", got, tc.want, base, c.useDirect)
 			}
 		})
 	}
