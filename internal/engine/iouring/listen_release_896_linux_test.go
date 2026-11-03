@@ -40,6 +40,7 @@ type engineRun896 struct {
 	cancel   context.CancelFunc
 	done     chan error    // receives Listen's result
 	returned chan struct{} // closed once done has it (listenAsync896)
+	reaper   *reaper896    // set by reapAtCleanup
 }
 
 // listenAsync896 runs e.Listen(ctx) on a goroutine of its own. done receives
@@ -65,16 +66,41 @@ func listenAsync896(ctx context.Context, e *Engine) (done chan error, returned c
 // restores of the seams the test installed earlier.
 func (r *engineRun896) reapAtCleanup(t *testing.T, release func()) {
 	t.Helper()
-	t.Cleanup(func() {
-		if release != nil {
-			release()
+	r.reaper = &reaper896{cancel: r.cancel, returned: r.returned, release: release}
+	rp := r.reaper
+	t.Cleanup(func() { rp.reap(t) })
+}
+
+// reap is reapAtCleanup's stop, at once. A loop that starts an engine per
+// iteration defers it, so that the engine, and the handler it holds (a 32 MiB
+// response in the send-drain loops), are not kept until the test ends.
+func (r *engineRun896) reap(t *testing.T) {
+	t.Helper()
+	r.reaper.reap(t)
+}
+
+// reaper896 is what the cleanup holds of a run: not the engine, so that a
+// finished iteration's engine is garbage.
+type reaper896 struct {
+	cancel   context.CancelFunc
+	returned chan struct{}
+	release  func()
+	once     sync.Once
+}
+
+func (rp *reaper896) reap(t *testing.T) {
+	t.Helper()
+	rp.once.Do(func() {
+		if rp.release != nil {
+			rp.release()
 		}
-		r.cancel()
+		rp.cancel()
 		select {
-		case <-r.returned:
+		case <-rp.returned:
 		case <-time.After(10 * time.Second):
 			t.Errorf("Listen had not returned 10 s after the test ended: a worker is still running")
 		}
+		rp.release = nil
 	})
 }
 

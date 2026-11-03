@@ -106,13 +106,17 @@ func TestEngineStartHelpersStopTheirEngineWhenTheTestEnds1229(t *testing.T) {
 // restore goes on reading the seam through read: a worker that an earlier test
 // leaked. The restore is a write the race detector must not find unordered
 // with the read, so a seam read and written as a plain variable fails this
-// test under -race ("race detected during execution of test").
+// test under -race ("race detected during execution of test"), in most runs
+// and not in every one: the detector reports the races it observes, and the
+// interleaving is not forced.
 func seamRestoredUnderALateReader1229(t *testing.T, install func(t *testing.T), read func()) {
 	t.Helper()
 	stop := make(chan struct{})
 	finished := make(chan struct{})
+	started := false
 	t.Run("seam", func(t *testing.T) {
 		install(t)
+		started = true
 		go func() {
 			defer close(finished)
 			for {
@@ -125,6 +129,9 @@ func seamRestoredUnderALateReader1229(t *testing.T, install func(t *testing.T), 
 			}
 		}()
 	})
+	if !started { // -run filtered the subtest out: no reader to wait for
+		return
+	}
 	close(stop)
 	<-finished
 }

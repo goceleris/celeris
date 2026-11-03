@@ -48,7 +48,12 @@ func (g *gate1173) HandleStream(_ context.Context, s *stream.Stream) error {
 	}
 	for _, hh := range s.Headers {
 		if hh[0] == ":path" && hh[1] == "/gate" {
-			g.started <- struct{}{}
+			// Never blocks: started holds one signal, and a handler after the
+			// first must still reach the gate, which the engine's cleanup closes.
+			select {
+			case g.started <- struct{}{}:
+			default:
+			}
 			<-g.gate
 		}
 	}

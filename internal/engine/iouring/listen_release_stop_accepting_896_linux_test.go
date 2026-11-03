@@ -334,6 +334,7 @@ func h2Iteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
 	addr := freeAddr639(t)
 	h := newHoldHandler896(false)
 	run := startHold896(t, addr, 2, 0, h)
+	defer run.reap(t)
 	c := h2Request896(t, addr, "/hold")
 	defer func() { _ = c.Close() }()
 	select {
@@ -369,6 +370,7 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	addr := freeAddr639(t)
 	h := newHoldHandler896(true)
 	run := startHold896(t, addr, 2, -1, h)
+	defer run.reap(t)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial %s: %v (%s)", addr, err, dialDiag896(addr))
