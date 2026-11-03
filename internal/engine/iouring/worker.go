@@ -1749,7 +1749,7 @@ func (w *Worker) run(ctx context.Context) {
 			if cqHead == cqTail {
 				// No CQEs — wait with adaptive timeout.
 				err := w.ring.WaitCQETimeout(w.adaptiveTimeout())
-				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSQPoll, err) {
+				if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(waitModeSQPoll, err) {
 					w.shutdown()
 					return
 				}
@@ -1782,7 +1782,7 @@ func (w *Worker) run(ctx context.Context) {
 				// submission + CQE retrieval into one syscall (saves ~300ns vs
 				// separate Submit + next-iteration wait).
 				err := w.ring.SubmitAndWait()
-				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSubmitReady, err) {
+				if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(waitModeSubmitReady, err) {
 					w.shutdown()
 					return
 				}
@@ -1800,7 +1800,7 @@ func (w *Worker) run(ctx context.Context) {
 				// worker's standing sweep timer (armSweepTick, celeris#884
 				// item 74) is what ends this wait, in about sweepCeiling.
 				err := w.ring.SubmitAndWait()
-				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSubmitSends, err) {
+				if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(waitModeSubmitSends, err) {
 					w.shutdown()
 					return
 				}
@@ -1809,7 +1809,7 @@ func (w *Worker) run(ctx context.Context) {
 				// Mode 3b: no guaranteed CQEs — wait with adaptive timeout for
 				// shutdown checks and CQE_SKIP_SUCCESS operations.
 				err := w.ring.SubmitAndWaitTimeout(w.adaptiveTimeout())
-				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeTimed, err) {
+				if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(waitModeTimed, err) {
 					w.shutdown()
 					return
 				}
@@ -2934,8 +2934,8 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 // completion is handled as the loop would (processCQE), so a connection the
 // accept delivered meanwhile is served.
 func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
-	if h := cancelAcceptSeam; h != nil {
-		h(w, lfd)
+	if h := cancelAcceptSeam.Load(); h != nil {
+		(*h)(w, lfd)
 	}
 	sqe := w.getCancelSQE()
 	if sqe == nil {
@@ -8503,8 +8503,8 @@ func (w *Worker) stopDetachedProducers() {
 // idle one (a park, a slow callback in the gate pass, a long wait end it). Any other error is the ring
 // failing: the worker stops, and closes what it owns.
 func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
-	if h := ringWaitSeam; h != nil {
-		err = h(w, mode, err)
+	if h := ringWaitSeam.Load(); h != nil {
+		err = (*h)(w, mode, err)
 	}
 	if err == nil {
 		return true
