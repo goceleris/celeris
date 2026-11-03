@@ -55,6 +55,9 @@ type options struct {
 	// sync path is preferred to avoid the busy-spin P-hogging that cuts
 	// other handler Gs on the same P off from running.
 	asyncEngine bool
+	// engine is the server WithEngine was given, kept for its
+	// Config.SocketBusyPoll.
+	engine ServerProvider
 }
 
 // Option configures Open.
@@ -62,12 +65,23 @@ type Option func(*options)
 
 // WithEngine routes pool connections through the event loop of a running
 // celeris.Server. When unset, Open resolves a standalone loop.
+//
+// The connections a Pool registers on an event loop take the server's
+// Config.SocketBusyPoll as their SO_BUSY_POLL budget (Linux; 0, off, by
+// default). In practice that is a Pool opened with a server that does not run
+// async handlers and either has not started yet or is on the std engine, which
+// has no event loop of its own (the Pool then uses the driver's own loop): a
+// Pool without an engine, with a started epoll, io_uring or adaptive server's,
+// or with one that runs async handlers (also before it starts), dials through
+// Go's netpoll and sets no socket option. The Pool has no busy poll option of
+// its own; a [Connector] does ([Connector.WithSocketBusyPoll]).
 func WithEngine(sp ServerProvider) Option {
 	return func(o *options) {
 		if sp == nil {
 			return
 		}
 		o.hasEngine = true
+		o.engine = sp
 		if eventloop.IsAsyncServer(sp) {
 			o.asyncEngine = true
 		}
@@ -154,6 +168,9 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	if !dsn.Options.autoCacheStatementsExplicit {
 		dsn.Options.AutoCacheStatements = true
 	}
+	// Only a connection registered on an engine's loop is tuned (dialConn);
+	// the pool dials through Go's netpoll otherwise, and sets no option.
+	dsn.Options.busyPoll = eventloop.BusyPoll(o.engine, 0)
 	if o.provider == nil {
 		prov, err := eventloop.Resolve(nil)
 		if err != nil {
