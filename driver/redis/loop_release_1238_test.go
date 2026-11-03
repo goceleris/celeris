@@ -32,15 +32,23 @@ func TestClientWithEngineReleasesTheStandaloneLoop1238(t *testing.T) {
 	for name, srv := range loopServers(t) {
 		t.Run(name, func(t *testing.T) {
 			before := eventloop.StandaloneRefs()
+			// Another user of the loop, whose reference must survive the Client:
+			// with none, the loop is gone after the first Release and a second
+			// one could not be seen.
+			other, err := eventloop.Resolve(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer eventloop.Release(other)
 			cl, err := NewClient("127.0.0.1:1", WithEngine(srv))
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantRefs(t, before+1, "open")
+			wantRefs(t, before+2, "open")
 			_ = cl.Close()
-			wantRefs(t, before, "closed")
+			wantRefs(t, before+1, "closed")
 			_ = cl.Close()
-			wantRefs(t, before, "closed twice")
+			wantRefs(t, before+1, "closed twice")
 		})
 	}
 }
