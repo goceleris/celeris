@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -171,5 +174,45 @@ func TestNewSentinelClientKeepsTheErrorOfEverySentinel1248(t *testing.T) {
 			}
 			wantRefs(t, before, "after the failed discovery")
 		})
+	}
+}
+
+// withCtxErr tags a failure that came with the end of its context as that
+// context's, leaves a nil error nil, and leaves an error reply of the server alone
+// even when the context is done: a WRONGPASS that arrives as the deadline passes
+// is not a timeout.
+func TestWithCtxErr1248(t *testing.T) {
+	expired, cancelExpired := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelExpired()
+	<-expired.Done()
+	live, cancelLive := context.WithCancel(context.Background())
+	defer cancelLive()
+
+	if got := withCtxErr(expired, nil); got != nil {
+		t.Errorf("withCtxErr(nil) = %v, want nil", got)
+	}
+
+	reply := &RedisError{Prefix: "WRONGPASS", Msg: "invalid username-password pair"}
+	for name, ctx := range map[string]context.Context{"ctx done": expired, "ctx live": live} {
+		got := withCtxErr(ctx, fmt.Errorf("sentinel x: %w", reply))
+		if errors.Is(got, context.DeadlineExceeded) {
+			t.Errorf("%s: a server error was tagged as a timeout: %v", name, got)
+		}
+		var rerr *RedisError
+		if !errors.As(got, &rerr) || rerr != reply {
+			t.Errorf("%s: err = %v, want the *RedisError", name, got)
+		}
+	}
+
+	// The socket's deadline, with the context's timer not yet fired, and a plain
+	// failure with the context done, are the context's.
+	if got := withCtxErr(live, os.ErrDeadlineExceeded); !errors.Is(got, context.DeadlineExceeded) || !errors.Is(got, os.ErrDeadlineExceeded) {
+		t.Errorf("socket deadline: err = %v, want both the context's deadline and the socket's", got)
+	}
+	if got := withCtxErr(expired, io.ErrUnexpectedEOF); !errors.Is(got, context.DeadlineExceeded) || !errors.Is(got, io.ErrUnexpectedEOF) {
+		t.Errorf("plain failure, ctx done: err = %v, want the context's deadline and the failure", got)
+	}
+	if got := withCtxErr(live, io.ErrUnexpectedEOF); got != io.ErrUnexpectedEOF {
+		t.Errorf("plain failure, ctx live: err = %v, want it unchanged", got)
 	}
 }

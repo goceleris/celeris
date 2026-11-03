@@ -254,7 +254,14 @@ func (s *SentinelClient) discoverMaster() (string, error) {
 // withCtxErr makes a failure that came with the end of ctx recognizable as it: a
 // direct-mode Client reports the deadline of its socket (os.ErrDeadlineExceeded),
 // not the context's, and the socket's can fire a hair before the context's timer.
+//
+// A reply of the server (an error such as WRONGPASS or NOAUTH) is not a timeout,
+// whenever ctx ended, and is returned as it is; so is a nil error.
 func withCtxErr(ctx context.Context, err error) error {
+	var rerr *RedisError
+	if err == nil || errors.As(err, &rerr) {
+		return err
+	}
 	if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
 		return fmt.Errorf("%w: %w", cerr, err)
 	}
