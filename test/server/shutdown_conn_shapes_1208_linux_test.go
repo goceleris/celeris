@@ -741,6 +741,19 @@ func judgeFirst1244(o outcome1208, written, at time.Duration) verdict1244 {
 // never met, or the engine does not answer inside it. The retries are the cell's
 // answer to a clock it cannot pin; the deterministic cell, with the drain's clock
 // held, is in internal/engine/iouring (draining_floor_1244_linux_test.go).
+//
+// What the retries cost: the first conclusive attempt decides, so a regression
+// that is wrong on every request (never Connection: close, a worker that reads
+// nothing in the drain, a listener closed at the first pass) fails the cell, in
+// seconds, as a failure inside the floor or as eight inconclusive attempts; one
+// that is wrong on some requests only can pass on a later attempt. The pin for
+// those is the internal cell, which sends the request on 8 conns of a drain.
+//
+// The other cells of this package that sleep into a shutdown (the 884 gate's
+// 300 ms and 1200 ms, the 806 probe at 600 ms, the 1165 and h2-pool gates, the
+// 50 ms retry pause of startDrainServer806) all want to be later than the floor,
+// which a starved test goroutine only is more of: celeris#1244 found no other
+// cell that needs to be earlier.
 func floorRuns1244(t *testing.T, what string, attempt func() verdict1244) {
 	t.Helper()
 	var last string

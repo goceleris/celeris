@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -274,8 +275,17 @@ func (r *drainRig1244) waitConns(n int64) {
 
 const (
 	get1244 = "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"
-	// floor1244 is shutdownSendDrainNanos.
-	floor1244 = time.Duration(shutdownSendDrainNanos)
+	// floor1244 is the floor of the send drain, as a literal and not as
+	// shutdownSendDrainNanos: a test that read the constant would follow a floor
+	// of 0 or of 500 ms and see nothing (with the clock held the floor is never
+	// over, whatever its length). The held clock is advanced to just under it,
+	// where the contract says the worker serves on, and then past it, where it
+	// closes: both sides of the one number.
+	floor1244 = 250 * time.Millisecond
+	// conns1244 is how many conns of each kind a cell uses, so that a regression
+	// that fails some of the conns of a drain, and not all (a counter, a race),
+	// fails here, in one run.
+	conns1244 = 8
 )
 
 // answered1244 reads the response to a first request and returns its body.
@@ -308,26 +318,65 @@ func isTimeout1244(err error) bool {
 }
 
 // TestDrainingFloorAnswersADeferredConn1244 is test/server's A-deferred-draining
-// with the floor held: the first request of a conn the kernel held back, sent
-// when every worker is past the first pass of its drain, is accepted and
-// answered, with Connection: close, whatever the machine's speed.
+// with the floor held: the first request of conns the kernel holds back
+// (TCP_DEFER_ACCEPT), sent just under the floor of the drain, when every worker
+// is past the first pass of its drain, is accepted and answered, with
+// Connection: close, whatever the machine's speed.
+//
+// The conns are dialed once the drain has begun, so that the kernel's hold (1 s,
+// the worker's TCP_DEFER_ACCEPT) starts then and a cell that the machine made
+// slow cannot have had them accepted before the request: that is asserted, from
+// the engine's count of open conns, right before the writes, and is a PREMISE
+// failure, not a pass, when it does not hold. A listener closed at the first
+// pass refuses the connect.
 func TestDrainingFloorAnswersADeferredConn1244(t *testing.T) {
 	r := newDrainRig1244(t, false)
-	d := r.dial() // TCP_DEFER_ACCEPT keeps it out of the worker
 	r.beginDrain()
-	if _, err := io.WriteString(d, get1244); err != nil {
-		t.Fatal(err)
+	r.clk.advance(floor1244 - time.Millisecond)
+	var held []net.Conn
+	for try := 1; ; try++ {
+		base := r.run.e.Metrics().ActiveConnections
+		held = held[:0]
+		for range conns1244 {
+			c, err := net.DialTimeout("tcp", r.addr, 2*time.Second)
+			if err != nil {
+				t.Fatalf("a connect just under the floor of the send drain, with a send pending: %v, want it accepted by the kernel (the listener is open for the floor)", err)
+			}
+			t.Cleanup(func() { _ = c.Close() })
+			held = append(held, c)
+		}
+		if n := r.run.e.Metrics().ActiveConnections; n == base {
+			break
+		} else if try == 3 {
+			t.Fatalf("PREMISE: the engine counts %d open conns, %d before the %d connects: it accepted a conn that has sent nothing (TCP_DEFER_ACCEPT) after %d tries", n, base, conns1244, try)
+		}
+		for _, c := range held {
+			_ = c.Close()
+		}
 	}
-	answered1244(t, d, "deferred")
+	for _, c := range held {
+		if _, err := io.WriteString(c, get1244); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, c := range held {
+		answered1244(t, c, fmt.Sprintf("deferred %d", i))
+	}
 }
 
 // TestDrainingFloorAnswersAnAcceptedConn1244 is A-accepted-draining with the
-// floor held: the first request of an accepted conn is answered with
-// Connection: close, and the silent and the idle conns beside it are open until
-// the floor is over, and get their FIN once it is.
+// floor held. Just under the floor (249 ms of the drain's clock) the first request
+// of each of 8 accepted conns is answered with Connection: close, the silent and
+// the idle conns beside them are open; 2 ms later, past the floor, they get their
+// FIN. The floor is a literal 250 ms: a floor of 0 closes them at the first pass
+// and fails the first half, one of 500 ms leaves them open and fails the second.
 func TestDrainingFloorAnswersAnAcceptedConn1244(t *testing.T) {
 	r := newDrainRig1244(t, true)
-	silent, idle, getter := r.dial(), r.dial(), r.dial()
+	silent, idle := r.dial(), r.dial()
+	getters := make([]net.Conn, conns1244)
+	for i := range getters {
+		getters[i] = r.dial()
+	}
 	_ = idle.SetDeadline(time.Now().Add(30 * time.Second))
 	if _, err := io.WriteString(idle, get1244); err != nil {
 		t.Fatal(err)
@@ -337,26 +386,31 @@ func TestDrainingFloorAnswersAnAcceptedConn1244(t *testing.T) {
 		t.Fatalf("the keep-alive conn before the shutdown: %v (close=%v)", err, resp != nil && resp.Close)
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2))
-	r.waitConns(stalled1244 + 3)
+	r.waitConns(stalled1244 + 2 + conns1244)
 
 	r.beginDrain()
-	if _, err := io.WriteString(getter, get1244); err != nil {
-		t.Fatal(err)
+	r.clk.advance(floor1244 - time.Millisecond)
+	for _, c := range getters {
+		if _, err := io.WriteString(c, get1244); err != nil {
+			t.Fatal(err)
+		}
 	}
-	answered1244(t, getter, "accepted")
+	for i, c := range getters {
+		answered1244(t, c, fmt.Sprintf("accepted %d", i))
+	}
 
-	// The clock is held, so the floor is not over: the silent and the idle conn
+	// 249 ms into the drain the floor is not over: the silent and the idle conn
 	// are open however long the real time. A real wait cannot flake: it asserts
 	// that nothing happens.
 	for name, c := range map[string]net.Conn{"silent": silent, "idle": idle} {
 		if err := fin1244(c, 300*time.Millisecond); !isTimeout1244(err) {
-			t.Errorf("the %s conn read %v inside the floor of the drain (clock held), want it open", name, err)
+			t.Errorf("the %s conn read %v 249 ms into the drain (clock held), want it open: the floor is 250 ms", name, err)
 		}
 	}
-	r.clk.advance(floor1244 + time.Millisecond)
+	r.clk.advance(2 * time.Millisecond)
 	for name, c := range map[string]net.Conn{"silent": silent, "idle": idle} {
-		if err := fin1244(c, 30*time.Second); err != nil {
-			t.Errorf("the %s conn read %v once the floor was over, want a FIN", name, err)
+		if err := fin1244(c, 10*time.Second); err != nil {
+			t.Errorf("the %s conn read %v 251 ms into the drain (clock held), want a FIN: the floor is 250 ms", name, err)
 		}
 	}
 }
