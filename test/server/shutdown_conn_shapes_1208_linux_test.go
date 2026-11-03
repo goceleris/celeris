@@ -40,7 +40,14 @@ import (
 //	                (A-deferred-draining is io_uring only). io_uring serves on for
 //	                the first 250 ms of its send drain: idle and silent conns get
 //	                their FIN at about 250 ms, and a first request 50 ms in is
-//	                answered, on an accepted conn and on a deferred one.
+//	                answered, on an accepted conn and on a deferred one. The 250
+//	                ms is the worker's, measured from its own first pass of the
+//	                drain, which no test of this package can read: a first
+//	                request is therefore sent inside it by luck of the clock, and
+//	                the cells say, from a clock that cannot run ahead of the
+//	                worker's, whether a failure is evidence (floorRuns1244). The
+//	                deterministic pin of the same contract is in
+//	                internal/engine/iouring (draining_floor_1244_linux_test.go).
 //	shape B, a request head in the kernel that the server has not read when
 //	  Shutdown begins:
 //	    B-busy-loop   natives: the loop is held by a handler while the head
@@ -666,17 +673,123 @@ func (r *rig1208) stallers(t *testing.T, n int) func() {
 	return stop
 }
 
+// sendFirst1244 is send1208 for a first request that floorRuns1244 judges: it
+// also returns how long after begin the request was written and how long after
+// begin its outcome was observed, so that a verdict can say which of the two a
+// starved machine delayed.
+func sendFirst1244(c net.Conn, begin time.Time) (o outcome1208, written, observed time.Duration) {
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	_, werr := io.WriteString(c, get1208)
+	written = time.Since(begin)
+	o = classify1208(bufio.NewReader(c), werr)
+	return o, written, time.Since(begin)
+}
+
+// floor1244 is the floor of the io_uring send drain (shutdownSendDrainNanos in
+// internal/engine/iouring, which this package cannot read: the constant is
+// mirrored here, and the cells of this file say "about 250 ms" of it already).
+const floor1244 = 250 * time.Millisecond
+
+// floorAttempts1244 bounds floorRuns1244. An attempt is inconclusive only when
+// a loaded machine kept the test, or the worker, from running for about 250 ms
+// at a time, and the cell's retry cost is a few hundred ms.
+const floorAttempts1244 = 8
+
+// verdict1244 is what one attempt of an in-floor cell saw of its first request.
+type verdict1244 struct {
+	ok           bool   // the request was answered as the contract says
+	inconclusive string // set when the attempt says nothing of the contract: why
+	fail         string // set when it is evidence against it
+}
+
+// judgeFirst1244 decides what a first request of an io_uring conn, sent a nominal
+// 50 ms into a shutdown whose workers have a response going out, shows. begin was
+// taken before Shutdown was called; written and at are how long after begin the
+// request was written and its outcome o observed.
+//
+// The worker serves on for the first 250 ms of its send drain, which began after
+// begin (Shutdown's call to the engine and the worker's first pass come after
+// it, on the monotonic clock both read). So an outcome observed less than that
+// after begin is one the floor cannot have caused, and a failure in it is
+// evidence, however slowly the machine runs: the test goroutine that sleeps 50 ms
+// and sends may be starved for longer than the floor (celeris#1244: a reset 287
+// ms after the drain began, on main), and the worker may be, which only ever
+// pushes the observation later. The other way a request can land outside the
+// contract's window is before the worker has seen the shutdown, where it is
+// answered like any, keep-alive: the contract says answered with Connection:
+// close. Neither is evidence, and the cell runs again on a fresh rig rather than
+// pass or fail on it.
+func judgeFirst1244(o outcome1208, written, at time.Duration) verdict1244 {
+	r := func(d time.Duration) time.Duration { return d.Round(time.Millisecond) }
+	switch {
+	case o.answered() && o.body == "ok" && o.close:
+		return verdict1244{ok: true}
+	case o.answered() && o.body == "ok":
+		return verdict1244{inconclusive: fmt.Sprintf("answered keep-alive (written %v, answered %v into the shutdown): the worker had not yet seen the shutdown when it served it", r(written), r(at))}
+	case at < floor1244:
+		return verdict1244{fail: fmt.Sprintf("%v, written %v and observed %v into the shutdown, inside the %v floor", o, r(written), r(at), floor1244)}
+	}
+	return verdict1244{inconclusive: fmt.Sprintf("%v, written %v and observed %v into the shutdown: the floor may have passed", o, r(written), r(at))}
+}
+
+// floorRuns1244 runs attempt, which starts a rig of its own and stops it, until
+// one says something about the contract: it passes, or it fails with evidence
+// (a window-independent assertion of the attempt is reported by the attempt
+// itself). An inconclusive attempt is logged and run again on a fresh rig, up
+// to floorAttempts1244 times; when all of them are inconclusive the cell fails,
+// for the premise of the contract (a request inside the worker's floor) was
+// never met, or the engine does not answer inside it. The retries are the cell's
+// answer to a clock it cannot pin; the deterministic cell, with the drain's clock
+// held, is in internal/engine/iouring (draining_floor_1244_linux_test.go).
+func floorRuns1244(t *testing.T, what string, attempt func() verdict1244) {
+	t.Helper()
+	var last string
+	for i := 1; i <= floorAttempts1244; i++ {
+		v := attempt()
+		switch {
+		case v.ok:
+			if i > 1 {
+				t.Logf("%s: decided on attempt %d of %d", what, i, floorAttempts1244)
+			}
+			return
+		case v.fail != "":
+			t.Errorf("%s: %s", what, v.fail)
+			return
+		}
+		last = v.inconclusive
+		t.Logf("%s: attempt %d of %d inconclusive (celeris#1244): %s", what, i, floorAttempts1244, last)
+		if t.Failed() {
+			return
+		}
+	}
+	t.Errorf("%s: none of %d attempts landed its first request inside the worker's floor and was answered with Connection: close; the last: %s", what, floorAttempts1244, last)
+}
+
 // silentAcceptedDraining1208 (A-accepted-draining): the same silent, idle and
 // first-request-50-ms-in conns as A-accepted, with every worker having a
 // response going out. epoll closes them at once. An io_uring worker serves on for
 // the first 250 ms of its send drain (celeris#595, #806): its idle and silent
-// conns get their FIN at 250 ms, and a first request before then is answered.
+// conns get their FIN at 250 ms, and a first request before then is answered. The
+// request's attempts are floorRuns1244's (celeris#1244).
 func silentAcceptedDraining1208(t *testing.T, eng celeris.EngineType) {
+	floorRuns1244(t, "A-accepted-draining", func() verdict1244 { return acceptedDrainingAttempt1208(t, eng) })
+}
+
+func acceptedDrainingAttempt1208(t *testing.T, eng celeris.EngineType) verdict1244 {
 	r := startRig1208(t, celeris.Config{Engine: eng, DisableDeferAccept: true}, routesBig1208)
 	stop := r.stallers(t, 16)
 	base := settledEngineMetrics1104Server(r.s)
 	silent, idle, getter := r.dial(), r.dial(), r.dial()
 	if o := send1208(idle, get1208, 0); !o.answered() || o.close {
+		if o.kind == "no-reply" {
+			// Not an answer to the shutdown at all: the machine has not served a
+			// request in 5 s (two rigs with 16 stalled responses each, on one
+			// CPU that hogs share). The cell has not begun; it runs again.
+			r.shutdown()
+			stop()
+			r.finish(silent, idle, getter)
+			return verdict1244{inconclusive: fmt.Sprintf("the keep-alive conn before the shutdown: %v", o)}
+		}
 		t.Fatalf("the keep-alive conn before the shutdown: %v", o)
 	}
 	r.waitConns(base, 3)
@@ -698,13 +811,14 @@ func silentAcceptedDraining1208(t *testing.T, eng celeris.EngineType) {
 		// epoll closes at its own pace while it sends: the request goes in after the FIN.
 		t.Fatalf("%v: the silent conn had no FIN 3 s into the shutdown: %v", eng, err)
 	}
-	o := send1208(getter, get1208, 0)
+	o, written, at := sendFirst1244(getter, begin)
 	sf, idf := <-silentFin, <-idleFin
 	for name, f := range map[string]fin{"silent": sf, "idle": idf} {
 		if f.err != nil {
 			t.Errorf("%v: the %s conn had no FIN 3 s into the shutdown: %v", eng, name, f.err)
 			continue
 		}
+		// begin is before the drain's start: a FIN early by it is early by the drain's.
 		if eng == celeris.IOUring && f.at < 150*time.Millisecond {
 			t.Errorf("io_uring: the %s conn had its FIN at %v, want it at about 250 ms (the send drain's floor)", name, f.at)
 		}
@@ -712,31 +826,43 @@ func silentAcceptedDraining1208(t *testing.T, eng celeris.EngineType) {
 			t.Errorf("%v: the %s conn had its FIN at %v, want it at once", eng, name, f.at)
 		}
 	}
+	var v verdict1244
 	switch {
-	case eng == celeris.IOUring && (!o.answered() || o.body != "ok" || !o.close):
-		t.Errorf("io_uring: a first request 50 ms into the shutdown, with a send pending: %v, want it answered with Connection: close (celeris#1169)", o)
-	case eng != celeris.IOUring && o.answered():
-		t.Errorf("%v: a first request 50 ms into the shutdown: %v, want it dropped", eng, o)
+	case eng == celeris.IOUring:
+		if v = judgeFirst1244(o, written, at); v.fail != "" {
+			v.fail = "a first request 50 ms into the shutdown, with a send pending: " + v.fail + " (want it answered with Connection: close, celeris#1169)"
+		}
+	case o.answered():
+		v = verdict1244{fail: fmt.Sprintf("%v: a first request 50 ms into the shutdown: %v, want it dropped", eng, o)}
+	default:
+		v = verdict1244{ok: true}
 	}
 	stop() // Shutdown waits for the stalled responses
 	r.finish(silent, idle, getter)
+	return v
 }
 
 // silentDeferredDraining1208 (A-deferred-draining, io_uring): a conn
 // TCP_DEFER_ACCEPT holds back sends its first request 50 ms into a shutdown while
 // every worker has a response going out: the worker is still accepting (the first
 // 250 ms of its send drain) and answers it, where an idle worker, or epoll,
-// resets it (A-deferred).
+// resets it (A-deferred). The request's attempts are floorRuns1244's
+// (celeris#1244).
 func silentDeferredDraining1208(t *testing.T, eng celeris.EngineType) {
-	r := startRig1208(t, celeris.Config{Engine: eng}, routesBig1208)
-	stop := r.stallers(t, 16)
-	d := r.dial()
-	r.shutdown()
-	time.Sleep(50 * time.Millisecond)
-	o := send1208(d, get1208, 0)
-	if !o.answered() || o.body != "ok" {
-		t.Errorf("%v: a first request of a held-back conn 50 ms into the shutdown, with a send pending: %v, want it answered", eng, o)
-	}
-	stop() // Shutdown waits for the stalled responses
-	r.finish(d)
+	floorRuns1244(t, "A-deferred-draining", func() verdict1244 {
+		r := startRig1208(t, celeris.Config{Engine: eng}, routesBig1208)
+		stop := r.stallers(t, 16)
+		d := r.dial()
+		begin := time.Now()
+		r.shutdown()
+		time.Sleep(50 * time.Millisecond)
+		o, written, at := sendFirst1244(d, begin)
+		v := judgeFirst1244(o, written, at)
+		if v.fail != "" {
+			v.fail = fmt.Sprintf("%v: a first request of a held-back conn 50 ms into the shutdown, with a send pending: %s (want it answered)", eng, v.fail)
+		}
+		stop() // Shutdown waits for the stalled responses
+		r.finish(d)
+		return v
+	})
 }
