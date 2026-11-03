@@ -203,7 +203,7 @@ func NewRingCPU(entries uint32, flags uint32, sqPollIdle uint32, cpuID int) (*Ri
 	}
 
 	if err := r.mmap(); err != nil {
-		_ = unix.Close(int(fd))
+		closeFD(int(fd))
 		return nil, err
 	}
 
@@ -609,5 +609,5 @@ func (r *Ring) Close() error {
 	if r.sqRing != nil {
 		_ = unix.Munmap(r.sqRing)
 	}
-	return unix.Close(r.fd)
+	return closeFDErr(r.fd)
 }

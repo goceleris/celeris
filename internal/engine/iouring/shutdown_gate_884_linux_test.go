@@ -204,6 +204,10 @@ func TestGateLookAtAConn884(t *testing.T) {
 // of a socketpair each), each idle HTTP/1, as closeConn needs to close them.
 func gateRig884(t *testing.T, n int) (*Worker, []*connState, []int) {
 	t.Helper()
+	// Every descriptor of a rig is closed once, whoever closes it: the pass
+	// under test, the test, or the rig's cleanup (celeris#1242).
+	tr := installFDTrap1242(t)
+	t.Cleanup(func() { tr.verdict(t) })
 	ring := newTestRing(t)
 	w := &Worker{
 		ring:        ring,
@@ -218,6 +222,7 @@ func gateRig884(t *testing.T, n int) (*Worker, []*connState, []int) {
 	w.cachedNow = mono.Now()
 	var css []*connState
 	var peers []int
+	var ids []fdID1242
 	for range n {
 		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
@@ -230,6 +235,7 @@ func gateRig884(t *testing.T, n int) (*Worker, []*connState, []int) {
 		cs.buf = make([]byte, 4096)
 		css = append(css, cs)
 		peers = append(peers, peer)
+		ids = append(ids, fdIdentity1242(t, local))
 	}
 	w.conns = make([]*connState, 0)
 	maxfd := 0
@@ -245,9 +251,11 @@ func gateRig884(t *testing.T, n int) (*Worker, []*connState, []int) {
 	}
 	t.Cleanup(func() {
 		// What the test left open: closeConn's close is deferred behind the
-		// recv-cancel's completion, which no loop runs here.
+		// recv-cancel's completion, which no loop runs here. A conn a pass
+		// closed, or a test closed itself, is not closed again: its number is
+		// free, and the next open in the process takes it (celeris#1242).
 		for _, cs := range css {
-			_ = unix.Close(cs.fd)
+			closeFD(cs.fd)
 		}
 	})
 	return w, css, peers
@@ -332,8 +340,9 @@ func TestGatePassWaitsForTheKernelSendQueue884(t *testing.T) {
 	w.removeLiveConn(old)
 	w.clearConnSlot(old.fd)
 	w.connCount--
-	_ = unix.Close(old.fd)
+	closeFD(old.fd)
 	_ = peers
+	_ = fdIdentity1242(t, local)
 	cs := gateConn884(local)
 	cs.generation = 9
 	cs.buf = make([]byte, 4096)
@@ -374,7 +383,8 @@ func TestGatePassWaitsForTheKernelSendQueue884(t *testing.T) {
 	if w.conns[local] == cs {
 		t.Error("the pass left an idle conn with an empty send queue open")
 	}
-	_ = unix.Close(local)
+	// The pass closed it when the test passes: not closed again.
+	closeFD(local)
 }
 
 // TestGateReadsOnNeverReadsH1StateOfAGoroutinesConn884 is the regression test of
