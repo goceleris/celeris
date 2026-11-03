@@ -25,7 +25,8 @@ import (
 // sent nothing are closed at the gate, 250 ms into a drain, or at once by a
 // worker with nothing to send; a head in the kernel is answered: by the gate's
 // first pass, and by the look a worker with nothing to send makes inside the
-// floor (h1UnreadInKernel) before it exits, as epoll's h1InProgress does; the
+// floor (h1UnreadInKernel) at the conns that had one when its drain began
+// (markUnreadAtShutdown), before it exits, as epoll's h1InProgress does; the
 // Server.Shutdown godoc has the contract per engine and
 // test/server/shutdown_conn_shapes_1208_linux_test.go pins it, celeris#1208):
 //
@@ -456,49 +457,107 @@ func (w *Worker) h1RequestInProgress() bool {
 // sendDrainDone reports whether the worker, on this pass of its send drain, has
 // nothing left to wait for: no send pending, no request in progress, and, inside
 // the floor (the first shutdownSendDrainNanos from shutdownDrainStart), no request
-// still in the kernel (h1UnreadInKernel). Past the floor the gate's first pass
-// has marked such a request (gateRead, counted by h1RequestInProgress), so the
-// kernel is no longer asked: the look cannot keep a worker past the floor.
+// that was in the kernel when the drain began still there (h1UnreadInKernel).
+// Past the floor the gate's first pass has marked such a request (gateRead,
+// counted by h1RequestInProgress), so the kernel is no longer asked: the look
+// cannot keep a worker past the floor.
 // A request head fragment, or a bare CRLF, that the worker finds and reads is a
 // request in progress like any other and holds the drain to its budget (drainEnd),
-// as it does on epoll (celeris#1166, #1208). Worker thread.
-func (w *Worker) sendDrainDone(now int64) bool {
-	pastFloor := now > w.shutdownDrainStart+shutdownSendDrainNanos
-	return !w.hasPendingSends() && !w.h1RequestInProgress() && (pastFloor || !w.h1UnreadInKernel())
+// as it does on epoll (celeris#1166, #1208). held is true when the look at the
+// kernel is the only thing the worker waits for (nothing to send, no request in
+// progress): the caller stops accepting then, so that the connections that keep
+// arriving cannot bring a response to send, or a request in progress, that keeps
+// the worker serving up to the floor (celeris#1229). Worker thread.
+func (w *Worker) sendDrainDone(now int64) (done, held bool) {
+	if w.hasPendingSends() || w.h1RequestInProgress() {
+		return false, false
+	}
+	if pastFloor := now > w.shutdownDrainStart+shutdownSendDrainNanos; pastFloor || !w.h1UnreadInKernel() {
+		return true, false
+	}
+	return false, true
 }
 
-// h1UnreadInKernel reports whether an HTTP/1 conn of the worker has the bytes of
-// a request the worker has not read: in the socket's receive queue (TIOCINQ, a
-// ring whose completions are task work leaves a request there until the next
-// enter) or as a recv CQE with bytes that the reap has not taken. It is the
+// h1Asked reports whether the look at the kernel asks about cs: not closing, not
+// a detached stream that has ended, and, once detected, HTTP/1 and neither a
+// detached stream (its bytes are the application's) nor a conn whose dispatch
+// goroutine is inside a handler (a request in progress that h1RequestInProgress
+// sees). Worker thread.
+func (w *Worker) h1Asked(cs *connState) bool {
+	if cs == nil || cs.closing || cs.writeEnded.Load() {
+		return false
+	}
+	if cs.detected && (engine.Protocol(cs.protocol.Load()) != engine.HTTP1 || w.detachedOrBusy(cs)) {
+		return false
+	}
+	return true
+}
+
+// socketUnread reports whether cs's socket holds bytes the worker has not read
+// (TIOCINQ: a ring whose completions are task work leaves a request there until
+// the next enter). A fixed-file conn's slot is no descriptor, so it cannot be
+// asked. Worker thread.
+func socketUnread(cs *connState) bool {
+	if !ownsDescriptorNumber(cs) {
+		return false
+	}
+	q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ)
+	return err != nil || q != 0
+}
+
+// markUnreadAtShutdown takes the snapshot of the requests in the kernel that
+// h1UnreadInKernel waits for, once, at the first pass of the send drain: it marks
+// (cs.shutdownUnread) each HTTP/1 conn that has the bytes of a request the worker
+// has not read, in the socket's receive queue (TIOCINQ) or as a recv CQE with
+// bytes that the reap has not taken, and says whether it marked any. It is the
 // look of the gate's first pass (sweepUnreadAtGate, celeris#1104) without its
-// marks, asked by a worker with nothing to send on its first look at the
-// shutdown: epoll's h1InProgress counts the same bytes, and the worker used to
-// exit with them unserved (celeris#1208). Sockets first, the completion queue
-// second, as the sweep does. A conn the gate would not look at is not asked:
-// closing, a detached stream (its bytes are the application's), HTTP/2, and a
-// fixed-file conn's socket (its slot is no descriptor; its CQE is still seen).
-// Worker thread.
-func (w *Worker) h1UnreadInKernel() bool {
+// marks. Sockets first, the completion queue second, as the sweep does. A conn
+// the gate would not look at is not marked (h1Asked); a fixed-file conn's socket
+// is not asked, its CQE is still seen. A conn accepted after the snapshot is
+// never marked: the listener stays open in the drain, and connections that keep
+// arriving with a request each used to renew a look made on every pass, holding
+// the worker to the floor (celeris#1229). Worker thread.
+func (w *Worker) markUnreadAtShutdown() bool {
+	w.unreadMarked = false
 	for _, fd := range w.liveConns {
 		cs := w.conns[fd]
-		if cs == nil || cs.closing || cs.writeEnded.Load() || !ownsDescriptorNumber(cs) {
+		if cs == nil {
 			continue
 		}
-		if cs.detected && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
-			continue
+		cs.shutdownUnread = w.h1Asked(cs) && socketUnread(cs)
+		w.unreadMarked = w.unreadMarked || cs.shutdownUnread
+	}
+	w.eachPostedRecv(func(cs *connState) bool {
+		if w.h1Asked(cs) {
+			cs.shutdownUnread = true
+			w.unreadMarked = true
 		}
-		if cs.detected && w.detachedOrBusy(cs) {
-			continue
-		}
-		if q, err := unix.IoctlGetInt(cs.fd, unix.TIOCINQ); err != nil || q != 0 {
+		return false
+	})
+	return w.unreadMarked
+}
+
+// h1UnreadInKernel reports whether a conn that markUnreadAtShutdown marked still
+// has the bytes of a request the worker has not read: in the socket's receive
+// queue or as a recv CQE with bytes that the reap has not taken (sockets first,
+// the completion queue second, as the snapshot does). It is asked by a worker
+// with nothing to send, inside the floor: epoll's h1InProgress counts the same
+// bytes, and the worker used to exit with them unserved (celeris#1208). A marked
+// conn that has been read leaves the look, as does one that has closed or become
+// a detached stream, and no other conn is asked (celeris#1229). Worker thread.
+func (w *Worker) h1UnreadInKernel() bool {
+	if !w.unreadMarked {
+		return false
+	}
+	for _, fd := range w.liveConns {
+		if cs := w.conns[fd]; cs != nil && cs.shutdownUnread && w.h1Asked(cs) && socketUnread(cs) {
 			return true
 		}
 	}
 	return w.postedRecvs()
 }
 
-// detachedOrBusy reports whether h1UnreadInKernel leaves a detected conn out: a
+// detachedOrBusy reports whether h1Asked leaves a detected conn out: a
 // detached stream, or a conn whose dispatch goroutine holds detachMu (inside a
 // handler: a request in progress that h1RequestInProgress sees). Worker thread.
 func (w *Worker) detachedOrBusy(cs *connState) bool {
@@ -513,17 +572,13 @@ func (w *Worker) detachedOrBusy(cs *connState) bool {
 }
 
 // postedRecvs reports whether the completion queue holds a recv with bytes for
-// an HTTP/1 conn the gate could still read on (the conns h1UnreadInKernel
-// leaves out are left out here), without marking it (holdPostedRecvs is the
-// marking twin). Worker thread.
+// a conn that markUnreadAtShutdown marked and that h1Asked still asks about,
+// without marking it (holdPostedRecvs is the marking twin). Worker thread.
 func (w *Worker) postedRecvs() bool {
 	found := false
 	w.eachPostedRecv(func(cs *connState) bool {
-		if cs.detected && (engine.Protocol(cs.protocol.Load()) != engine.HTTP1 || w.detachedOrBusy(cs)) {
-			return false
-		}
-		found = true
-		return true
+		found = cs.shutdownUnread && w.h1Asked(cs)
+		return found
 	})
 	return found
 }
