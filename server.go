@@ -669,9 +669,13 @@ func (s *Server) cancelListen() {
 //     the loop was held in another connection's [Config.OnConnect] callback). A
 //     fragment of a head, or a bare CRLF, found there is read and is a request in
 //     progress like any other: it holds Shutdown until the request completes or
-//     the budget ends, on epoll and io_uring alike. A head that reaches the
-//     kernel after the engine's gate has looked at the connection is refused, as
-//     above. On std net/http reads the head after
+//     the budget ends, on epoll and io_uring alike. An io_uring worker with
+//     nothing to send looks once, when it sees the Shutdown, and waits only for
+//     the connections that had such a head then, with its listener closed: a
+//     connection that arrives afterwards does not hold it, however many keep
+//     coming (celeris#1229), and a request it sends is dropped. A
+//     head that reaches the kernel after the engine's gate has looked at the
+//     connection is refused, as above. On std net/http reads the head after
 //     Shutdown began and drops the request: the connection is closed without an
 //     answer, and reset if body bytes are still unread (a small body, 2 KiB
 //     measured, is read with the head and the close is a FIN; 64 KiB gave a

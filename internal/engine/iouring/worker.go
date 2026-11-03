@@ -832,6 +832,10 @@ type Worker struct {
 	// worker, new requests would keep the queues from ever emptying.
 	// Worker thread only; read in handleRecv.
 	refuseRecv bool
+	// unreadMarked is true when the snapshot of the requests in the kernel, taken
+	// once at the first pass of the send drain (markUnreadAtShutdown,
+	// celeris#1229), marked a conn (cs.unreadAtShutdown). Worker thread only.
+	unreadMarked bool
 	// gateSwept is set by the first pass of the gate (closeIdleH1): that pass
 	// asks the kernel for the receive queue of the conns it would close, and
 	// holds a conn that has a request in it (holdUnreadAtGate, celeris#1104).
@@ -1647,18 +1651,36 @@ func (w *Worker) run(ctx context.Context) {
 				now := drainclock.Now()
 				if w.shutdownDrainStart == 0 {
 					w.shutdownDrainStart = now
+					// The requests in the kernel now: the only ones the worker
+					// waits for below (celeris#1229).
+					w.markUnreadAtShutdown()
 				}
 				// Nothing to send and no request parsed: the worker is done, unless a
-				// request already in the kernel (the socket's queue, or a recv CQE
-				// not reaped) has not been read yet: it is answered, as epoll's
-				// h1InProgress does, instead of being reaped without being served
-				// (celeris#1208). Looked at only inside the floor (the first
-				// shutdownSendDrainNanos), while the worker serves as an ordinary
-				// iteration; past it the gate's first pass marks such a request
-				// (gateRead) and h1RequestInProgress waits for it.
-				if w.sendDrainDone(now) {
+				// request that was already in the kernel (the socket's queue, or a
+				// recv CQE not reaped) when the drain began has not been read yet: it
+				// is answered, as epoll's h1InProgress does, instead of being reaped
+				// without being served (celeris#1208). Only the conns marked at that
+				// snapshot are waited for, inside the floor (the first
+				// shutdownSendDrainNanos) and while the worker serves as an ordinary
+				// iteration: a conn accepted after it, which the open listener keeps
+				// bringing, is not asked about, so a steady client cannot renew the
+				// wait up to the floor (celeris#1229). Past the floor the gate's first
+				// pass marks such a request (gateRead) and h1RequestInProgress waits
+				// for it.
+				done, held := w.sendDrainDone(now)
+				if done {
 					w.shutdown()
 					return
+				}
+				if held {
+					// The worker waits for requests that were already in the
+					// kernel, and for nothing else: the listener closes, as
+					// net/http's Shutdown closes its listeners first, so that no
+					// connection accepted from now on (and answered, with a
+					// response to send) keeps it serving to the floor. A request
+					// such a connection sends is dropped, as it is when the worker
+					// exits at once (celeris#1229).
+					w.stopAccepting(ctx)
 				}
 				if end, bounded := w.drainEnd(w.shutdownDrainStart, shutdownSendDrainNanos); bounded && now > end {
 					w.noteSendDrainGaveUp(now - w.shutdownDrainStart)
@@ -3012,10 +3034,12 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 // stopAccepting cancels the accept and closes the listener, once the
 // worker's context is cancelled and it waits for the HTTP/2 stream handlers
 // on the shared worker pool (celeris#759), or, past the first
-// shutdownSendDrainNanos of its send drain (celeris#806). Either wait can
+// shutdownSendDrainNanos of its send drain (celeris#806), or when a worker
+// with nothing to send waits for the requests that were in the kernel when its
+// drain began (sendDrainDone, celeris#1229). Each wait can
 // last the whole budget, and the worker accepted and served new connections
-// meanwhile, which were then cut at its end; net/http's Shutdown closes its
-// listeners first. What is still in the kernel's accept queue is reset, as
+// meanwhile, which were then cut at its end, or kept it serving; net/http's
+// Shutdown closes its listeners first. What is still in the kernel's accept queue is reset, as
 // the close in shutdown did. Only then, not on every shutdown: the cancel
 // submits the SQ ring and handles its completions, and a shutdown whose
 // send drain is done within its first 250 ms goes straight on, leaving the
