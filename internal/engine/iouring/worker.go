@@ -1641,6 +1641,9 @@ func (w *Worker) run(ctx context.Context) {
 					}
 				}
 			} else {
+				if h := sendDrainSeam.Load(); h != nil {
+					(*h)(w)
+				}
 				now := drainclock.Now()
 				if w.shutdownDrainStart == 0 {
 					w.shutdownDrainStart = now
