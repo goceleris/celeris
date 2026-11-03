@@ -96,9 +96,12 @@ func TestFinishCloseCountsAMissingConnState(t *testing.T) {
 			if got := w.activeConns.Load(); got != 0 {
 				t.Errorf("activeConns = %d, want 0", got)
 			}
-			// The close path closed it, unless it stopped short: not closed
-			// twice, the number is free once the first close is made
-			// (celeris#1242).
+			// The nil-state path ends in the close; the live one may stop short
+			// at the ring this unit Worker does not have. Not closed twice:
+			// the number is free once the first close is made (celeris#1242).
+			if tc.nilState && fdID.names(fd) {
+				t.Error("finishClose left the descriptor open")
+			}
 			if fdID.names(fd) {
 				_ = unix.Close(fd)
 			}

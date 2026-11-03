@@ -45,6 +45,7 @@ type fdTrap1242 struct {
 	n         atomic.Int64
 	keep      int // when > 0, the placeholders of the oldest closes are released past this many (a whole-package run would run out of descriptor numbers)
 	order     []int
+	removed   bool // release ran: a late close (a worker an earlier test leaked) is a plain close(2)
 	echo      bool // also write each close and each fault to stderr as it happens (a panicking worker ends the process before any verdict)
 }
 
@@ -65,6 +66,7 @@ func newFDTrap1242() (*fdTrap1242, error) {
 func (tr *fdTrap1242) release() {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
+	tr.removed = true
 	for fd := range tr.last {
 		if tr.isPlaceholder(fd) {
 			_ = unix.Close(fd)
@@ -129,6 +131,11 @@ func (tr *fdTrap1242) closeFD(fd int) error {
 	site := tr.site()
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
+	if tr.removed {
+		// The placeholder is gone with the trap: a close that loaded it just
+		// before the seam was put back closes the number, as without a trap.
+		return unix.Close(fd)
+	}
 	if tr.echo {
 		fmt.Fprintf(os.Stderr, "celeris1242 CLOSE fd=%d at %s\n", fd, site)
 	}
@@ -182,8 +189,8 @@ func (tr *fdTrap1242) verdict(t *testing.T) {
 // question: a number the code under test freed is taken by the next open in
 // the process (a sibling test's engine that is still running, the Go
 // runtime's own sockets), and closing it then closes that one (celeris#1242).
-// Sockets have an inode each; do not use it for io_uring rings on kernels
-// that share one inode between them.
+// Sockets have an inode each. io_uring rings do not on every kernel: use
+// ringNamed1242 for one.
 type fdID1242 struct{ dev, ino uint64 }
 
 func fdIdentity1242(t testing.TB, fd int) fdID1242 {
@@ -199,6 +206,18 @@ func fdIdentity1242(t testing.TB, fd int) fdID1242 {
 func (id fdID1242) names(fd int) bool {
 	var st unix.Stat_t
 	return unix.Fstat(fd, &st) == nil && st.Dev == id.dev && st.Ino == id.ino
+}
+
+// ringNamed1242 reports whether fd still names the io_uring ring the identity
+// was taken from: the same inode and still an io_uring file, so that on a
+// kernel where rings share an inode a socket that took the number is not
+// taken for the ring. (Another ring on the number would be, there.)
+func ringNamed1242(id fdID1242, fd int) bool {
+	if !id.names(fd) {
+		return false
+	}
+	link, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	return err == nil && link == "anon_inode:[io_uring]"
 }
 
 // stopAtCleanup1242 stops the engine when the test ends, whether or not the
@@ -580,4 +599,30 @@ func TestFDTrapFlagsOnlyAStaleClose1242(t *testing.T) {
 	tr.mu.Lock()
 	tr.bad = nil
 	tr.mu.Unlock()
+}
+
+// A trap that has been removed is out of the way: a worker an earlier test
+// leaked may still call the function it loaded before the seam was put back,
+// and its close must be a plain close(2), not a dup3 of a placeholder that is
+// gone onto a number that may be someone else's by now.
+func TestARemovedFDTrapClosesPlainly1242(t *testing.T) {
+	tr, err := newFDTrap1242()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.release()
+	if err := tr.closeFD(fd); err != nil {
+		t.Fatalf("a close after the removal failed: %v", err)
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+		_ = unix.Close(fd)
+		t.Fatal("a close after the removal left the descriptor open (a placeholder was put on it)")
+	}
+	if f := tr.faultsFor(fd); len(f) != 0 {
+		t.Fatalf("a removed trap reported: %v", f)
+	}
 }

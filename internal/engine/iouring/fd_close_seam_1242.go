@@ -25,9 +25,13 @@ var fdCloseSeam atomic.Pointer[func(fd int) error]
 // closeFDErr is close(2) of one descriptor number the engine owns, through
 // fdCloseSeam. Every close of an engine-owned descriptor in this package goes
 // through here (or closeFD, which drops the error): a bare unix.Close is
-// invisible to the seam test of celeris#1242. The one other closer is the
-// wake eventfd's handle (internal/wakefd), which retires the number under its
-// lock before it closes it (celeris#655) and so cannot close it twice.
+// invisible to the seam test of celeris#1242. Two closes are outside it, by
+// design. The wake eventfd's handle (internal/wakefd) retires the number
+// under its lock before it closes it (celeris#655) and so cannot close it
+// twice. A hijacked connection's descriptor is closed through the *os.File
+// that net.FileConn was given (hijackConn): routing that close through
+// closeFD would leave the file's finalizer to close the number again at a
+// later GC, after it has been reused, which is the bug this seam hunts.
 func closeFDErr(fd int) error {
 	if h := fdCloseSeam.Load(); h != nil {
 		return (*h)(fd)

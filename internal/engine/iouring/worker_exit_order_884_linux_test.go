@@ -59,11 +59,14 @@ func TestLeaveGroupAfterExitClosesTheRingAndTheListener884(t *testing.T) {
 	// process gets one (celeris#1242).
 	var w *Worker
 	lfdID, ringID := fdIdentity1242(t, lfd), fdIdentity1242(t, ringFD)
+	ringOpen := func() bool { return ringNamed1242(ringID, ringFD) }
 	t.Cleanup(func() {
 		if lfdID.names(lfd) && (w == nil || w.listenFD >= 0) {
 			closeFD(lfd)
 		}
-		if ringID.names(ringFD) && (w == nil || w.ring != nil) {
+		// By the worker's own word, not by what the number names: rings may
+		// share one inode.
+		if w == nil || w.ring != nil {
 			_ = ring.Close()
 		}
 	})
@@ -80,8 +83,8 @@ func TestLeaveGroupAfterExitClosesTheRingAndTheListener884(t *testing.T) {
 	if _, err := net.DialTimeout("tcp", addr.String(), time.Second); !errors.Is(err, syscall.ECONNREFUSED) {
 		t.Errorf("a connect after leaveGroupAfterExit gave %v, want connection refused: the listener is still in the group", err)
 	}
-	if w.ring != nil || ringID.names(ringFD) {
-		t.Errorf("the ring is not closed after leaveGroupAfterExit: w.ring=%v fd open=%v", w.ring != nil, ringID.names(ringFD))
+	if w.ring != nil || ringOpen() {
+		t.Errorf("the ring is not closed after leaveGroupAfterExit: w.ring=%v fd open=%v", w.ring != nil, ringOpen())
 	}
 	if w.listenFD != -1 || lfdID.names(lfd) {
 		t.Errorf("the listener is not closed after leaveGroupAfterExit: listenFD=%d fd open=%v", w.listenFD, lfdID.names(lfd))

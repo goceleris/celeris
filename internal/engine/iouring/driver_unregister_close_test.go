@@ -640,6 +640,11 @@ func TestDriverFailureCloseCompletionSparesConnOnReusedNumber(t *testing.T) {
 	n.fd, n.peer = nonblockSocketPair(t)
 	defer n.closePeer()
 	if n.fd != a.fd {
+		// A's number is free (closed above): dup3 over a number that is open
+		// closes whatever took it, so only a free one is taken (celeris#1242).
+		if fdOpen704(a.fd) {
+			t.Fatalf("PREMISE: descriptor %d, the number of A, was taken by another open", a.fd)
+		}
 		if err := unix.Dup3(n.fd, a.fd, unix.O_CLOEXEC); err != nil {
 			t.Fatalf("dup3: %v", err)
 		}
