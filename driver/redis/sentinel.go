@@ -32,7 +32,9 @@ type SentinelConfig struct {
 	PoolSize         int
 	MaxIdlePerWorker int
 	// DialTimeout bounds each new connection's TCP connect and, separately,
-	// its handshake; default 5s. See [Config].DialTimeout.
+	// its handshake; default 5s. See [Config].DialTimeout. It also bounds the
+	// query for the master address that NewSentinelClient makes to each
+	// sentinel in turn (connect, handshake and reply together).
 	DialTimeout  time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
@@ -227,17 +229,23 @@ func (s *SentinelClient) getClient() (*Client, error) {
 
 // discoverMaster queries sentinels for the master address.
 func (s *SentinelClient) discoverMaster() (string, error) {
+	var lastErr error
 	for _, addr := range s.cfg.SentinelAddrs {
 		masterAddr, err := s.queryMaster(addr)
 		if err != nil {
+			lastErr = err
 			continue
 		}
 		return masterAddr, nil
 	}
-	return "", fmt.Errorf("no responsive sentinel for master %q", s.cfg.MasterName)
+	return "", fmt.Errorf("no responsive sentinel for master %q: %w", s.cfg.MasterName, lastErr)
 }
 
-// queryMaster connects to a single sentinel and asks for the master address.
+// queryMaster connects to a single sentinel and asks for the master address. The
+// connect, the handshake and the reply together are bound by DialTimeout, and by
+// the SentinelClient's lifecycle context: a sentinel that accepts the connection
+// and never answers fails this query after DialTimeout and discoverMaster goes on
+// to the next address (celeris#1248).
 func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	var opts []Option
 	opts = append(opts, WithDialTimeout(s.cfg.DialTimeout))
@@ -257,7 +265,9 @@ func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	}
 	defer func() { _ = c.Close() }()
 
-	v, err := c.Do(context.Background(), "SENTINEL", "get-master-addr-by-name", s.cfg.MasterName)
+	ctx, cancel := context.WithTimeout(s.baseCtx(), s.cfg.DialTimeout)
+	defer cancel()
+	v, err := c.Do(ctx, "SENTINEL", "get-master-addr-by-name", s.cfg.MasterName)
 	if err != nil {
 		return "", err
 	}
