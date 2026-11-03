@@ -158,16 +158,18 @@ var testHookClientBuilt atomic.Pointer[func(s *SentinelClient, kind string, ctx 
 //
 // Close cancels the dials in flight, so it returns as soon as the work has
 // closed what it holds: at once for the sentinel subscription, and for a
-// failover dial that is connecting or in the handshake of the new master (in
-// direct mode, the plain net.Conn Client of a started server that runs
-// AsyncHandlers or of an engine without a mini-loop, such as every one on
-// darwin and windows, closing the conn ends the handshake). A failover dial
-// that has finished the handshake and waits for the master's reply to ROLE
-// ends in direct mode only when DialTimeout does, so Close can wait up to
-// DialTimeout for it (5 s by default): the reply is read on a plain net.Conn
-// that honours the deadline of the dial and not its cancellation. A Close that
-// comes in while another runs waits for it to end, and a later one returns at
-// once.
+// failover dial that is connecting or in the handshake of the new master. A
+// failover dial that has finished the handshake and waits for the master's
+// reply to ROLE ends only when DialTimeout does (5 s by default) if its Client
+// is in direct mode, so Close can wait that long for it; with a mini-loop it
+// ends at once. A Client is in direct mode, reading a plain net.Conn that
+// honours the deadline of the dial and not its cancellation, when Engine is a
+// server that runs AsyncHandlers (on any OS), or when its event-loop worker has
+// no synchronous round trip: every Engine on darwin and windows, and on Linux a
+// started epoll, io_uring or adaptive engine. With no Engine, or on Linux with
+// the Engine of a server that is not started or runs on the std engine, the
+// Client is not in direct mode. A Close that comes in while another runs waits
+// for it to end, and a later one returns at once.
 func (s *SentinelClient) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		if s.closeDone != nil {

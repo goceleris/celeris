@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -261,6 +262,19 @@ func TestSentinelCloseAfterAFailoverReleasesEachClientOnce1246(t *testing.T) {
 	}
 }
 
+// startHangServer1246 starts a hangServer1246 closed by the test's cleanup.
+func startHangServer1246(t *testing.T) *hangServer1246 {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &hangServer1246{ln: ln}
+	go h.accept()
+	t.Cleanup(h.close)
+	return h
+}
+
 // hangServer1246 accepts TCP conns and never answers; close, in a cleanup, ends
 // the dials still waiting on them.
 type hangServer1246 struct {
@@ -326,10 +340,7 @@ func TestSentinelCloseCancelsAFailoverDialInTheHandshake1246(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			master := startFakeMaster(t)
 			sentinel := startFakeSentinel(t, master.Addr())
-			hang := &hangServer1246{}
-			hang.ln, _ = net.Listen("tcp", "127.0.0.1:0")
-			go hang.accept()
-			t.Cleanup(hang.close)
+			hang := startHangServer1246(t)
 			before := eventloop.StandaloneRefs()
 			sc, err := NewSentinelClient(SentinelConfig{
 				MasterName:    "mymaster",
@@ -396,10 +407,14 @@ func proxyFirstThenHang1246(t *testing.T, target string) (addr string, accepted 
 	return ln.Addr().String(), accepted
 }
 
-// Close cancels the subscription connecting to a sentinel that accepts and never
-// answers, whatever the DialTimeout. (The discovery of NewSentinelClient is
-// answered; the one that is not hangs there, which this test does not touch.)
-func TestSentinelCloseCancelsTheSubscriptionToAHungSentinel1246(t *testing.T) {
+// Close returns, with every Client given back, while the subscription is on a
+// sentinel that accepts and never answers, whatever the DialTimeout. This does not
+// pin the cancel (the subscription's SUBSCRIBE is written without waiting for the
+// reply, so it is not blocked, and Close ends it through closeCh): the cancel is
+// pinned by the failover dial of the test above and by the direct-dial test. The
+// discovery of NewSentinelClient is answered; the one that is not hangs there,
+// which this test does not touch.
+func TestSentinelCloseWithASubscriptionToAHungSentinel1246(t *testing.T) {
 	for name, srv := range dialModes1246(t) {
 		t.Run(name, func(t *testing.T) {
 			master := startFakeMaster(t)
@@ -450,6 +465,9 @@ func TestSentinelClientsShareTheStandaloneLoop1246(t *testing.T) {
 			if err := a.Set(ctx, "k", "v", 0); err != nil {
 				t.Fatal(err)
 			}
+			// Both subscriptions are on the fake before a closes: b's failover
+			// notification below reaches b whenever it is sent.
+			awaitSubscribed1246(t, sentinel, 2)
 			if err := a.Close(); err != nil {
 				t.Fatalf("Close a: %v", err)
 			}
@@ -462,8 +480,7 @@ func TestSentinelClientsShareTheStandaloneLoop1246(t *testing.T) {
 			if v, err := b.Get(ctx, "k"); err != nil || v != "v" {
 				t.Fatalf("b.Get after a closed: %q, %v", v, err)
 			}
-			// b's failover still works: both subscriptions are on the fake by now.
-			awaitSubscribed1246(t, sentinel, 2)
+			// b's failover still works.
 			first, err := b.getClient()
 			if err != nil {
 				t.Fatal(err)
@@ -481,5 +498,43 @@ func TestSentinelClientsShareTheStandaloneLoop1246(t *testing.T) {
 			}
 			wantRefs(t, before, "both closed")
 		})
+	}
+}
+
+// A direct-mode dial whose ctx is cancelled in the handshake of a node that
+// accepts and never answers ends at once, with the cancel as its error, whatever
+// the DialTimeout. It needs no Engine, so it runs on every OS and pins the
+// cancel of dialDirectRedisConn where no Client is in direct mode by default
+// (celeris#1246).
+func TestDirectDialEndsOnCancelInTheHandshake1246(t *testing.T) {
+	hang := startHangServer1246(t)
+	cfg := Config{Addr: hang.ln.Addr().String(), DialTimeout: time.Hour}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		c   *redisConn
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		c, err := dialDirectRedisConn(ctx, cfg)
+		done <- result{c, err}
+	}()
+	// The node has the conn: the dial is in its handshake, or about to be (a
+	// cancel that comes first is as well reported, and the mutant, with no
+	// cancel, waits the hour out either way).
+	pollUntil1246(t, "the node to accept the dial", func() bool { return hang.accepted.Load() >= 1 })
+	cancel()
+	select {
+	case r := <-done:
+		if r.c != nil {
+			_ = r.c.Close()
+			t.Error("the dial returned a conn")
+		}
+		if !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", r.err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the direct dial did not end on cancel")
 	}
 }
