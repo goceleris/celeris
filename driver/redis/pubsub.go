@@ -49,10 +49,12 @@ type Message struct {
 // returns for a descriptor it has forgotten), the subscription set is updated
 // and the reconnect replays it, so the call need not be repeated, while the
 // [Client] is open. [Client.Close] does not close the PubSub (its conn is
-// checked out of the pool), but a Client that owns its event loop (no
-// WithEngine, or the Engine of a server that has not started or has no event
-// loop of its own) releases the loop with it, which takes the PubSub's conn down at
-// once. After [Client.Close] the reconnect has no pool to dial: a PubSub whose
+// checked out of the pool), but a Client that holds a reference to
+// the driver's own event loop (no WithEngine, or the Engine of a server that has
+// not started, is on the std engine, or runs AsyncHandlers) releases it with
+// it, and when it was the last holder the loop closes and takes the PubSub's
+// conn down at once; another Client sharing the loop keeps it working. The
+// Engine of a started server that runs its own event loop is not released. After [Client.Close] the reconnect has no pool to dial: a PubSub whose
 // conn is down then returns [ErrPubSubConnDown] from its control calls until
 // [PubSub.Close], and the replay never happens. The constructors
 // [Client.Subscribe], [Client.PSubscribe] and [ClusterClient.SSubscribe] apply
