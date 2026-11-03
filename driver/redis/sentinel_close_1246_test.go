@@ -2,7 +2,10 @@ package redis
 
 import (
 	"context"
+	"io"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,14 +21,25 @@ import (
 // hold such a Client open from a hook while Close is called, which makes the
 // race certain instead of a matter of scheduling.
 
+// lingerAfterCancel is how long the hook of holdLateClient keeps a Client open
+// once Close has cancelled its dial, unless the test has sampled the count
+// first. A Close that waits for the work returns only after the hook has let go,
+// so for it the linger is a delay and the count it reads is 0; a Close that does
+// not wait returns while the hook still holds the Client, and reads 1. The
+// outcome does not depend on the order the goroutines run in; the linger only
+// bounds how long the hook can hold.
+const lingerAfterCancel = 300 * time.Millisecond
+
 // holdLateClient arms testHookClientBuilt for the SentinelClients opened with
 // srv: the first Client of kind the background work builds signals entered and
-// then stays in the hook until release is closed or Close cancels its ctx. The
-// returned stop releases it, and disarms the hook, and is safe to call twice.
-func holdLateClient(t *testing.T, srv ServerProvider, kind string) (entered <-chan struct{}, stop func()) {
+// then stays in the hook until release is closed or Close cancels its ctx, and
+// after that until sampled is called or lingerAfterCancel passes. stop releases
+// it at once and disarms the hook, and is safe to call twice.
+func holdLateClient(t *testing.T, srv ServerProvider, kind string) (entered <-chan struct{}, sampled, stop func()) {
 	t.Helper()
 	enter := make(chan struct{})
 	release := make(chan struct{})
+	sample := make(chan struct{})
 	var once sync.Once
 	hook := func(s *SentinelClient, k string, ctx context.Context) {
 		if s.cfg.Engine != srv || k != kind {
@@ -38,11 +52,18 @@ func holdLateClient(t *testing.T, srv ServerProvider, kind string) (entered <-ch
 		}
 		select {
 		case <-release:
+			return
 		case <-ctx.Done():
+		}
+		select {
+		case <-release:
+		case <-sample:
+		case <-time.After(lingerAfterCancel):
 		}
 	}
 	testHookClientBuilt.Store(&hook)
-	var stopOnce sync.Once
+	var stopOnce, sampleOnce sync.Once
+	sampled = func() { sampleOnce.Do(func() { close(sample) }) }
 	stop = func() {
 		stopOnce.Do(func() {
 			testHookClientBuilt.Store(nil)
@@ -50,7 +71,7 @@ func holdLateClient(t *testing.T, srv ServerProvider, kind string) (entered <-ch
 		})
 	}
 	t.Cleanup(stop)
-	return enter, stop
+	return enter, sampled, stop
 }
 
 // awaitClosed1246 fails the test unless ch is closed within the deadline: the
@@ -78,16 +99,16 @@ func pollUntil1246(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// awaitSubscribed1246 waits until the fake sentinel has recorded the
-// +switch-master subscription of the SentinelClient: a notification pushed
+// awaitSubscribed1246 waits until the fake sentinel has recorded n
+// +switch-master subscriptions (one per SentinelClient): a notification pushed
 // before that reaches nobody. The SUBSCRIBE is written without waiting for the
 // server, so the SentinelClient having connected does not say it.
-func awaitSubscribed1246(t *testing.T, fs *fakeSentinel) {
+func awaitSubscribed1246(t *testing.T, fs *fakeSentinel, n int) {
 	t.Helper()
 	pollUntil1246(t, "the sentinel to record the +switch-master subscription", func() bool {
 		fs.mu.Lock()
 		defer fs.mu.Unlock()
-		return len(fs.subWriters) > 0
+		return len(fs.subWriters) >= n
 	})
 }
 
@@ -100,7 +121,7 @@ func TestSentinelCloseWithASentinelClientInFlight1246(t *testing.T) {
 			master := startFakeMaster(t)
 			sentinel := startFakeSentinel(t, master.Addr())
 			before := eventloop.StandaloneRefs()
-			entered, stop := holdLateClient(t, srv, "sentinel")
+			entered, sampled, stop := holdLateClient(t, srv, "sentinel")
 			sc, err := NewSentinelClient(SentinelConfig{
 				MasterName:    "mymaster",
 				SentinelAddrs: []string{sentinel.Addr()},
@@ -116,6 +137,7 @@ func TestSentinelCloseWithASentinelClientInFlight1246(t *testing.T) {
 			}
 			_ = sc.Close()
 			wantRefs(t, before, "closed with a sentinel Client in flight")
+			sampled()
 			stop()
 			_ = sc.Close()
 			wantRefs(t, before, "closed twice")
@@ -131,7 +153,7 @@ func TestSentinelConcurrentCloseWithAClientInFlight1246(t *testing.T) {
 			master := startFakeMaster(t)
 			sentinel := startFakeSentinel(t, master.Addr())
 			before := eventloop.StandaloneRefs()
-			entered, _ := holdLateClient(t, srv, "sentinel")
+			entered, sampled, _ := holdLateClient(t, srv, "sentinel")
 			sc, err := NewSentinelClient(SentinelConfig{
 				MasterName:    "mymaster",
 				SentinelAddrs: []string{sentinel.Addr()},
@@ -155,6 +177,7 @@ func TestSentinelConcurrentCloseWithAClientInFlight1246(t *testing.T) {
 				}()
 			}
 			wg.Wait()
+			sampled()
 			for i, got := range refs {
 				if got != before {
 					t.Errorf("Close %d returned with standalone loop references = %d, want %d", i, got, before)
@@ -184,12 +207,13 @@ func TestSentinelCloseWithAMasterClientInFlight1246(t *testing.T) {
 			}
 			// The subscription has connected, so +switch-master reaches the
 			// failover handler.
-			awaitSubscribed1246(t, sentinel)
-			entered, stop := holdLateClient(t, srv, "master")
+			awaitSubscribed1246(t, sentinel, 1)
+			entered, sampled, stop := holdLateClient(t, srv, "master")
 			sentinel.SetMaster(master2.Addr())
 			awaitClosed1246(t, entered, "the failover to build the new master's Client")
 			_ = sc.Close()
 			wantRefs(t, before, "closed with a master Client in flight")
+			sampled()
 			stop()
 		})
 	}
@@ -223,7 +247,7 @@ func TestSentinelCloseAfterAFailoverReleasesEachClientOnce1246(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			awaitSubscribed1246(t, sentinel)
+			awaitSubscribed1246(t, sentinel, 1)
 			sentinel.SetMaster(master2.Addr())
 			pollUntil1246(t, "the failover to swap the master Client", func() bool {
 				c, err := sc.getClient()
@@ -233,6 +257,229 @@ func TestSentinelCloseAfterAFailoverReleasesEachClientOnce1246(t *testing.T) {
 			wantRefs(t, before+1, "closed after a failover")
 			_ = sc.Close()
 			wantRefs(t, before+1, "closed twice")
+		})
+	}
+}
+
+// hangServer1246 accepts TCP conns and never answers; close, in a cleanup, ends
+// the dials still waiting on them.
+type hangServer1246 struct {
+	ln       net.Listener
+	mu       sync.Mutex
+	conns    []net.Conn
+	accepted atomic.Int32
+}
+
+func (h *hangServer1246) accept() {
+	for {
+		c, err := h.ln.Accept()
+		if err != nil {
+			return
+		}
+		h.mu.Lock()
+		h.conns = append(h.conns, c)
+		h.mu.Unlock()
+		h.accepted.Add(1)
+	}
+}
+
+func (h *hangServer1246) close() {
+	_ = h.ln.Close()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, c := range h.conns {
+		_ = c.Close()
+	}
+}
+
+// closeWithin1246 runs Close of sc and fails the test, with a deadline that
+// only bounds a hang, unless it returns.
+func closeWithin1246(t *testing.T, sc *SentinelClient, what string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = sc.Close()
+	}()
+	awaitClosed1246(t, done, "Close with "+what)
+}
+
+// dialModes1246 are the Engine settings a SentinelClient is opened with: none
+// (the mini-loop of the driver), and the two servers that run on the driver's
+// standalone loop (a Client in direct mode on darwin and windows).
+func dialModes1246(t *testing.T) map[string]ServerProvider {
+	m := map[string]ServerProvider{"no engine": nil}
+	for name, srv := range loopServers(t) {
+		m[name] = srv
+	}
+	return m
+}
+
+// Close cancels the dial of a failover whose master accepts the connection and
+// never answers the handshake: with a DialTimeout of an hour, only the cancel can
+// end the dial (the deadline is out of reach), so a Close that does not cancel
+// it does not return within the test's bound. In direct mode the handshake reads
+// a plain net.Conn, which does not honour a cancel unless the dial closes the
+// conn on it.
+func TestSentinelCloseCancelsAFailoverDialInTheHandshake1246(t *testing.T) {
+	for name, srv := range dialModes1246(t) {
+		t.Run(name, func(t *testing.T) {
+			master := startFakeMaster(t)
+			sentinel := startFakeSentinel(t, master.Addr())
+			hang := &hangServer1246{}
+			hang.ln, _ = net.Listen("tcp", "127.0.0.1:0")
+			go hang.accept()
+			t.Cleanup(hang.close)
+			before := eventloop.StandaloneRefs()
+			sc, err := NewSentinelClient(SentinelConfig{
+				MasterName:    "mymaster",
+				SentinelAddrs: []string{sentinel.Addr()},
+				DialTimeout:   time.Hour,
+				Engine:        srv,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			awaitSubscribed1246(t, sentinel, 1)
+			sentinel.SetMaster(hang.ln.Addr().String())
+			pollUntil1246(t, "the failover to dial the master", func() bool { return hang.accepted.Load() >= 1 })
+			closeWithin1246(t, sc, "a failover dial in the handshake")
+			wantRefs(t, before, "closed")
+		})
+	}
+}
+
+// proxyFirstThenHang1246 forwards its first accepted conn (the discovery of
+// NewSentinelClient) to target and holds every later one open without answering:
+// the subscription then waits in the handshake or the first SUBSCRIBE of a
+// sentinel that does not answer.
+func proxyFirstThenHang1246(t *testing.T, target string) (addr string, accepted *atomic.Int32) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	accepted = new(atomic.Int32)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			if accepted.Add(1) != 1 {
+				continue
+			}
+			up, err := net.Dial("tcp", target)
+			if err != nil {
+				continue
+			}
+			mu.Lock()
+			conns = append(conns, up)
+			mu.Unlock()
+			go func() { _, _ = io.Copy(up, c) }()
+			go func() { _, _ = io.Copy(c, up) }()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return ln.Addr().String(), accepted
+}
+
+// Close cancels the subscription connecting to a sentinel that accepts and never
+// answers, whatever the DialTimeout. (The discovery of NewSentinelClient is
+// answered; the one that is not hangs there, which this test does not touch.)
+func TestSentinelCloseCancelsTheSubscriptionToAHungSentinel1246(t *testing.T) {
+	for name, srv := range dialModes1246(t) {
+		t.Run(name, func(t *testing.T) {
+			master := startFakeMaster(t)
+			good := startFakeSentinel(t, master.Addr())
+			hung, accepted := proxyFirstThenHang1246(t, good.Addr())
+			before := eventloop.StandaloneRefs()
+			sc, err := NewSentinelClient(SentinelConfig{
+				MasterName:    "mymaster",
+				SentinelAddrs: []string{hung},
+				DialTimeout:   time.Hour,
+				Engine:        srv,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pollUntil1246(t, "the subscription to dial the hung sentinel", func() bool { return accepted.Load() >= 2 })
+			closeWithin1246(t, sc, "a subscription to a hung sentinel")
+			wantRefs(t, before, "closed")
+		})
+	}
+}
+
+// Two SentinelClients on the shared standalone loop: closing one, twice, leaves
+// the other working and its failover intact, and both give the loop back.
+func TestSentinelClientsShareTheStandaloneLoop1246(t *testing.T) {
+	for name, srv := range loopServers(t) {
+		t.Run(name, func(t *testing.T) {
+			master := startFakeMaster(t)
+			master2 := startFakeMaster(t)
+			sentinel := startFakeSentinel(t, master.Addr())
+			before := eventloop.StandaloneRefs()
+			cfg := SentinelConfig{
+				MasterName:    "mymaster",
+				SentinelAddrs: []string{sentinel.Addr()},
+				DialTimeout:   2 * time.Second,
+				Engine:        srv,
+			}
+			a, err := NewSentinelClient(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := NewSentinelClient(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := a.Set(ctx, "k", "v", 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.Close(); err != nil {
+				t.Fatalf("Close a: %v", err)
+			}
+			if err := a.Close(); err != nil {
+				t.Fatalf("Close a twice: %v", err)
+			}
+			if _, err := a.Get(ctx, "k"); err != ErrClosed {
+				t.Fatalf("a.Get after Close: %v, want ErrClosed", err)
+			}
+			if v, err := b.Get(ctx, "k"); err != nil || v != "v" {
+				t.Fatalf("b.Get after a closed: %q, %v", v, err)
+			}
+			// b's failover still works: both subscriptions are on the fake by now.
+			awaitSubscribed1246(t, sentinel, 2)
+			first, err := b.getClient()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sentinel.SetMaster(master2.Addr())
+			pollUntil1246(t, "b's failover to swap the master Client", func() bool {
+				c, err := b.getClient()
+				return err == nil && c != first
+			})
+			if err := b.Set(ctx, "k3", "v3", 0); err != nil {
+				t.Fatalf("b.Set after the failover: %v", err)
+			}
+			if err := b.Close(); err != nil {
+				t.Fatalf("Close b: %v", err)
+			}
+			wantRefs(t, before, "both closed")
 		})
 	}
 }

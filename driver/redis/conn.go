@@ -211,7 +211,18 @@ func dialDirectRedisConn(ctx context.Context, cfg Config) (*redisConn, error) {
 		createdAt: time.Now(),
 	}
 	c.lastUsedAt.Store(time.Now().UnixNano())
-	if err := c.handshake(ctx); err != nil {
+	// The handshake in direct mode waits on a plain net.Conn, which honours
+	// ctx's deadline (execDirectBuf) but not its cancellation: closing the conn
+	// ends the read when ctx is cancelled, as a dial in a mini-loop ends on
+	// ctx.Done (celeris#1246: SentinelClient.Close cancels the dials in flight
+	// and waits for them).
+	stop := context.AfterFunc(ctx, func() { _ = tcp.Close() })
+	err = c.handshake(ctx)
+	if !stop() && err == nil {
+		// ctx was cancelled as the handshake ended and the conn is being closed.
+		err = ctx.Err()
+	}
+	if err != nil {
 		_ = c.Close()
 		return nil, err
 	}

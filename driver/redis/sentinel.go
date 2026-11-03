@@ -154,10 +154,20 @@ var testHookClientBuilt atomic.Pointer[func(s *SentinelClient, kind string, ctx 
 // progress) has returned too, so that no Client it was building is left open
 // when Close returns: a Client built WithEngine of a server with no event loop
 // of its own holds a reference to the driver's standalone loop, which it would
-// otherwise keep for as long as it takes the work to notice (celeris#1246). The
-// dials in flight are cancelled, so this takes no longer than the work needs to
-// close what it holds. A Close that comes in while another runs waits for it to
-// end, and a later one returns at once.
+// otherwise keep for as long as it takes the work to notice (celeris#1246).
+//
+// Close cancels the dials in flight, so it returns as soon as the work has
+// closed what it holds: at once for the sentinel subscription, and for a
+// failover dial that is connecting or in the handshake of the new master (in
+// direct mode, the plain net.Conn Client of a started server that runs
+// AsyncHandlers or of an engine without a mini-loop, such as every one on
+// darwin and windows, closing the conn ends the handshake). A failover dial
+// that has finished the handshake and waits for the master's reply to ROLE
+// ends in direct mode only when DialTimeout does, so Close can wait up to
+// DialTimeout for it (5 s by default): the reply is read on a plain net.Conn
+// that honours the deadline of the dial and not its cancellation. A Close that
+// comes in while another runs waits for it to end, and a later one returns at
+// once.
 func (s *SentinelClient) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		if s.closeDone != nil {
@@ -433,7 +443,8 @@ func (s *SentinelClient) connectSentinel() (*sentinelConn, error) {
 func (s *SentinelClient) connectSentinelFrom(start int) (*sentinelConn, error) {
 	n := len(s.cfg.SentinelAddrs)
 	for k := 0; k < n; k++ {
-		// No Client for a closed SentinelClient: Close waits for this call.
+		// No Client for a closed SentinelClient: Close waits for this call. (The
+		// cancel already fails the dials that follow; this saves building them.)
 		if s.closed.Load() {
 			break
 		}
