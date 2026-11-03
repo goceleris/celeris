@@ -179,6 +179,9 @@ func (c *redisConn) notifyPubSubClose(err error) {
 	}
 }
 
+// aLongTimeAgo is a deadline in the past: it ends a read in progress.
+var aLongTimeAgo = time.Unix(1, 0)
+
 // dialDirectRedisConn dials a TCP connection in direct mode: no mini-loop
 // registration, no fd extraction. The conn keeps the live *net.TCPConn
 // and does Write/Read on the caller's goroutine via Go's netpoll.
@@ -211,7 +214,20 @@ func dialDirectRedisConn(ctx context.Context, cfg Config) (*redisConn, error) {
 		createdAt: time.Now(),
 	}
 	c.lastUsedAt.Store(time.Now().UnixNano())
-	if err := c.handshake(ctx); err != nil {
+	// The handshake in direct mode waits on a plain net.Conn, which honours
+	// ctx's deadline (execDirectBuf) but not its cancellation: a deadline in the
+	// past ends the read when ctx ends, as a dial in a mini-loop ends on
+	// ctx.Done (celeris#1246: SentinelClient.Close cancels the dials in flight
+	// and waits for them). The conn is not closed here: the handshake goroutine
+	// peeks its raw fd number (tcpFd), which a close from this goroutine could
+	// leave naming another socket; whoever dialled closes it, as always.
+	stop := context.AfterFunc(ctx, func() { _ = tcp.SetDeadline(aLongTimeAgo) })
+	err = c.handshake(ctx)
+	if !stop() {
+		// ctx ended during the handshake: report it, whatever the read saw.
+		err = ctx.Err()
+	}
+	if err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -327,6 +343,11 @@ func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []
 				_ = c.tcp.SetDeadline(time.Time{})
 			}
 		}()
+		// A cancel that set a past deadline before the line above is not lost.
+		if err := ctx.Err(); err != nil {
+			_ = c.closeWithErr(err)
+			return req, err
+		}
 	}
 	if _, err := c.tcp.Write(buf); err != nil {
 		_ = c.closeWithErr(err)
@@ -381,6 +402,11 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 				_ = c.tcp.SetDeadline(time.Time{})
 			}
 		}()
+		// A cancel that set a past deadline before the line above is not lost.
+		if err := ctx.Err(); err != nil {
+			_ = c.closeWithErr(err)
+			return reqs, err
+		}
 	}
 	if _, err := c.tcp.Write(data); err != nil {
 		_ = c.closeWithErr(err)
