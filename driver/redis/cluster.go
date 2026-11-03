@@ -162,9 +162,15 @@ func (c *ClusterClient) closeNodes() {
 	c.nodes = nil
 }
 
-// initNodes dials the seed addresses and creates initial node clients.
+// initNodes dials the seed addresses and creates initial node clients. An
+// address listed more than once gets one node: nodes is keyed by address, so a
+// Client built for the repeat would replace the first in the map and nothing
+// would ever close the first.
 func (c *ClusterClient) initNodes() error {
 	for _, addr := range c.cfg.Addrs {
+		if _, dup := c.nodes[addr]; dup {
+			continue
+		}
 		client, err := c.dialNode(addr)
 		if err != nil {
 			continue
