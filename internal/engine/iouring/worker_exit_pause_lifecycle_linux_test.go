@@ -249,12 +249,11 @@ func TestGoexitInThePauseCloseStillLeavesTheGroup848(t *testing.T) {
 	e, _, cancel, done := start848(t, "127.0.0.1:0", true)
 	addr := e.Addr().String()
 	var fired atomic.Bool
-	cancelAcceptSeam = func(*Worker, int) {
+	setCancelAcceptSeam1229(t, func(*Worker, int) {
 		if fired.CompareAndSwap(false, true) {
 			runtime.Goexit()
 		}
-	}
-	t.Cleanup(func() { cancelAcceptSeam = nil })
+	})
 
 	t0 := time.Now()
 	if err := e.PauseAccept(); err != nil {

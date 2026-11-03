@@ -17,16 +17,11 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
 )
-
-// movedHerdBound is the most CLUSTER SLOTS a herd of 200 commands may cost. The
-// calls share a read only if it began after the mark of each, and the MOVED
-// replies arrive over some time, so the count is a few waves, not exactly one.
-// Main sends one per command (about 200).
-const movedHerdBound = 20
 
 // herdSlotMove builds a 3-node fake cluster whose slot of key has moved from
 // from to to, with a client that has not learnt of it yet.
@@ -69,12 +64,72 @@ func runHerd(n int, fn func() error) error {
 	return nil
 }
 
+// sharedReads runs the herd of n calls of fn while the first CLUSTER SLOTS read is
+// HELD after its table is taken, and releases it once every call has its trigger
+// (seen, if not nil: the -MOVED replies the old owner has sent) and every call is
+// waiting for a read. It returns the CLUSTER SLOTS replies the herd cost and the
+// first error.
+//
+// The calls share a read only if it began after the trigger of each, and the
+// triggers arrive over some time (the scheduler, the time a dial to a closed port
+// takes to be refused, a coarse clock), so a herd left to itself costs a few reads
+// and the number depends on the machine: 4 at most on Linux (the herds below, 400
+// runs, plain and -race), 21 on a Windows runner (celeris#1234). Held, every
+// trigger arrives while the first read is in flight and unresolved, so the herd
+// costs exactly one read on any machine.
+//
+// Every call must be waiting for the read when it is released: a call that has
+// finished by then did not wait for it (it skipped the read, or did not wait for
+// the running one) and the test fails, whatever the count. A call that finishes
+// early does not hold the gate up, so a variant that reads once per command (the
+// held read and one for each of the others, which finish while it is held) fails
+// on the count and does not wait for the gate to time out.
+func sharedReads(t *testing.T, cl *rpCluster, n int, seen func() bool, fn func() error) (reads int64, err error) {
+	t.Helper()
+	waitHeld, release := holdNextSlotsRead(t)
+	before := cl.slotsReplies.Load()
+	var finished atomic.Int64
+	res := make(chan error, 1)
+	go func() {
+		res <- runHerd(n, func() error {
+			defer finished.Add(1)
+			return fn()
+		})
+	}()
+	waitHeld()
+	// The held read runs under the 5 s limit of the command path: a herd that
+	// takes longer than that to arrive would be cut short, not counted.
+	const gate = 4 * time.Second
+	deadline := time.Now().Add(gate)
+	var done, waiting int
+	for {
+		// The finished count comes first: a command that ends between the two
+		// reads is missed, not counted twice.
+		done = int(finished.Load())
+		waiting = goroutinesIn("(*ClusterClient).refreshTopologySince")
+		if done+waiting >= n && (seen == nil || seen()) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the herd was not released after %v: of %d commands, %d finished and %d waiting for the read (triggers all seen: %v)",
+				gate, n, done, waiting, seen == nil || seen())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	release()
+	err = <-res
+	if done > 0 {
+		t.Errorf("%d of %d commands finished before the read was released: they did not wait for it", done, n)
+	}
+	return cl.slotsReplies.Load() - before, err
+}
+
 // 200 concurrent GETs on a slot that has moved: each gets -MOVED. The topology is
-// read a few times for all of them, not once each, and every GET still goes to
-// the address its -MOVED named. With staleReplies the probe node keeps showing
-// the old table (a node that has not heard of the move): the redirect must still
-// reach the new owner, whatever the refreshed table says.
-func TestMovedHerdRefreshesTheTopologyAFewTimes1214(t *testing.T) {
+// read once for all of them, not once each, and every GET still goes to the
+// address its -MOVED named. With staleReplies the probe node keeps showing the old
+// table (a node that has not heard of the move): the redirect must still reach the
+// new owner, whatever the refreshed table says.
+func TestMovedHerdSharesOneTopologyRead1214(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		stale int
@@ -83,10 +138,9 @@ func TestMovedHerdRefreshesTheTopologyAFewTimes1214(t *testing.T) {
 			const n = 200
 			const key = "{herd}k"
 			cl, cc, from, to := herdSlotMove(t, key, tc.stale)
-			before := cl.slotsReplies.Load()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			err := runHerd(n, func() error {
+			got, err := sharedReads(t, cl, n, func() bool { return from.getMoved.Load() >= n }, func() error {
 				v, err := cc.Get(ctx, key)
 				if err != nil {
 					return err
@@ -99,11 +153,10 @@ func TestMovedHerdRefreshesTheTopologyAFewTimes1214(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got := cl.slotsReplies.Load() - before
 			t.Logf("%d GETs on a moved slot (%s): %d CLUSTER SLOTS; %d GETs reached the old owner, %d the new one",
 				n, tc.name, got, from.getCmds.Load(), to.getCmds.Load())
-			if got > movedHerdBound {
-				t.Errorf("%d CLUSTER SLOTS for %d GETs that hit one slot move, want at most %d", got, n, movedHerdBound)
+			if got != 1 {
+				t.Errorf("%d CLUSTER SLOTS for %d GETs that hit one slot move and waited for one read, want exactly 1", got, n)
 			}
 			if g := to.getCmds.Load(); g < n {
 				t.Errorf("the new owner got %d GETs, want %d: the redirect did not go to the MOVED address", g, n)
@@ -118,15 +171,14 @@ func TestMovedHerdRefreshesTheTopologyAFewTimes1214(t *testing.T) {
 }
 
 // 50 pipelines whose GETs hit the moved slot: one topology read per batch is
-// still one per pipeline. The retry goes to the new owner.
-func TestMovedHerdOfPipelinesRefreshesTheTopologyAFewTimes1214(t *testing.T) {
+// still one per pipeline. They share one read, and the retry goes to the new owner.
+func TestMovedHerdOfPipelinesSharesOneTopologyRead1214(t *testing.T) {
 	const n = 50
 	const key = "{pipeherd}k"
-	cl, cc, _, to := herdSlotMove(t, key, 0)
-	before := cl.slotsReplies.Load()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	cl, cc, from, to := herdSlotMove(t, key, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err := runHerd(n, func() error {
+	got, err := sharedReads(t, cl, n, func() bool { return from.getMoved.Load() >= n }, func() error {
 		p := cc.Pipeline()
 		p.Get(key)
 		vals, errs := p.Exec(ctx)
@@ -141,10 +193,9 @@ func TestMovedHerdOfPipelinesRefreshesTheTopologyAFewTimes1214(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := cl.slotsReplies.Load() - before
 	t.Logf("%d pipelines on a moved slot: %d CLUSTER SLOTS", n, got)
-	if got > movedHerdBound/2 {
-		t.Errorf("%d CLUSTER SLOTS for %d pipelines that hit one slot move, want at most %d", got, n, movedHerdBound/2)
+	if got != 1 {
+		t.Errorf("%d CLUSTER SLOTS for %d pipelines that hit one slot move and waited for one read, want exactly 1", got, n)
 	}
 	if g := to.getCmds.Load(); g < n {
 		t.Errorf("the new owner got %d GETs, want %d", g, n)
@@ -153,8 +204,13 @@ func TestMovedHerdOfPipelinesRefreshesTheTopologyAFewTimes1214(t *testing.T) {
 
 // 100 concurrent GETs on a slot whose primary dies and is replaced: each gets a
 // network error and refreshes the table (the primary-network-error path). The
-// topology is read a few times for all of them.
-func TestPrimaryLostHerdRefreshesTheTopologyAFewTimes1214(t *testing.T) {
+// topology is read once for all of them. The node is severed, not killed: its
+// port answers and closes every conn, so the error reaches every GET at once on
+// any OS. (With a dead port every GET beyond the pool's cap dials it, and a dial
+// to a closed port can take seconds to be refused on Windows: the errors then
+// arrive in groups, each a new trigger. That is the reading of the 21 CLUSTER
+// SLOTS of celeris#1234; the tail of a Windows runner is not measured here.)
+func TestPrimaryLostHerdSharesOneTopologyRead1214(t *testing.T) {
 	const n = 100
 	const key = "{lost}k"
 	cl := newRPCluster(t, 3)
@@ -168,12 +224,11 @@ func TestPrimaryLostHerdRefreshesTheTopologyAFewTimes1214(t *testing.T) {
 	if v, err := cc.Get(rpCtx(t), key); err != nil || v != "v" {
 		t.Fatalf("GET before the failure = %q, %v", v, err)
 	}
-	from.kill()
+	from.sever()
 	cl.failover(from, to, 0)
-	before := cl.slotsReplies.Load()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err := runHerd(n, func() error {
+	got, err := sharedReads(t, cl, n, nil, func() error {
 		v, err := cc.Get(ctx, key)
 		if err != nil {
 			return err
@@ -186,10 +241,9 @@ func TestPrimaryLostHerdRefreshesTheTopologyAFewTimes1214(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := cl.slotsReplies.Load() - before
 	t.Logf("%d GETs on a slot whose primary died: %d CLUSTER SLOTS", n, got)
-	if got > movedHerdBound {
-		t.Errorf("%d CLUSTER SLOTS for %d GETs that lost the same primary, want at most %d", got, n, movedHerdBound)
+	if got != 1 {
+		t.Errorf("%d CLUSTER SLOTS for %d GETs that lost the same primary and waited for one read, want exactly 1", got, n)
 	}
 }
 
@@ -455,43 +509,6 @@ func keyOwnedBy(t *testing.T, cl *rpCluster, prefix string, want func(*rpNode) b
 	}
 	t.Fatal("no key found")
 	return ""
-}
-
-// The exact version of the herd test: the first read is HELD after its table is
-// taken, until every one of the 200 commands has its -MOVED and waits for a read.
-// They all share that one read: exactly one CLUSTER SLOTS, whatever the speed of
-// the machine. (Main: one per command.)
-func TestMovedHerdSharesTheReadInFlightExactly1214(t *testing.T) {
-	const n = 200
-	const key = "{exact}k"
-	cl, cc, from, _ := herdSlotMove(t, key, 0)
-	waitHeld, release := holdNextSlotsRead(t)
-	before := cl.slotsReplies.Load()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	res := make(chan error, 1)
-	go func() {
-		res <- runHerd(n, func() error {
-			v, err := cc.Get(ctx, key)
-			if err == nil && v != "v" {
-				err = fmt.Errorf("GET = %q", v)
-			}
-			return err
-		})
-	}()
-	waitHeld()
-	// Every command has its -MOVED and is waiting for the read (the leader's
-	// goroutine and the n-1 that joined it all sit in refreshTopologySince).
-	poll(t, "every command waiting for the read", 5*time.Second, func() bool {
-		return from.getMoved.Load() >= n && goroutinesIn("(*ClusterClient).refreshTopologySince") >= n
-	})
-	release()
-	if err := <-res; err != nil {
-		t.Fatal(err)
-	}
-	if got := cl.slotsReplies.Load() - before; got != 1 {
-		t.Errorf("%d CLUSTER SLOTS for %d commands that all waited for one read, want exactly 1", got, n)
-	}
 }
 
 // An event stays resolved: a slot that went to B (the command's read ended), came

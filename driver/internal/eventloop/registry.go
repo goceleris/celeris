@@ -2,6 +2,7 @@ package eventloop
 
 import (
 	"sync"
+	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
 )
@@ -38,6 +39,35 @@ func IsAsyncServer(sp ServerProvider) bool {
 		return a.AsyncHandlers()
 	}
 	return false
+}
+
+// BusyPollProvider is optionally implemented by ServerProvider to report the
+// server's resolved Config.SocketBusyPoll, the SO_BUSY_POLL budget its native
+// engines put on the connections they accept (0 = off). Drivers opened
+// WithEngine(srv) consult it via type assertion, so a driver socket registered
+// on the server's loops follows the server's decision (celeris#1228). A
+// ServerProvider that does not implement it reports off.
+type BusyPollProvider interface {
+	SocketBusyPoll() time.Duration
+}
+
+// BusyPoll is the SO_BUSY_POLL budget a driver puts on a connection it dials:
+// explicit, the driver's own option, when it is at least one microsecond (the
+// kernel takes whole microseconds, so anything less is "not set", and cannot
+// silently turn off a server that has it on), else the budget sp reports, else
+// 0 (off, the default, which means no setsockopt call). Safe to call with a nil
+// sp.
+func BusyPoll(sp ServerProvider, explicit time.Duration) time.Duration {
+	if explicit >= time.Microsecond {
+		return explicit
+	}
+	if sp == nil {
+		return 0
+	}
+	if b, ok := sp.(BusyPollProvider); ok {
+		return b.SocketBusyPoll()
+	}
+	return 0
 }
 
 // standaloneState tracks the package-level refcounted standalone Loop shared
@@ -99,6 +129,27 @@ func Release(provider engine.EventLoopProvider) {
 	if toClose != nil {
 		_ = toClose.Close()
 	}
+}
+
+// IsStandalone reports whether provider is the standalone Loop, that is, whether
+// the Resolve that returned it took a reference that only a Release gives back.
+// A provider that came from a Server is not: the Server owns its lifetime.
+func IsStandalone(provider engine.EventLoopProvider) bool {
+	if provider == nil {
+		return false
+	}
+	standaloneMu.Lock()
+	defer standaloneMu.Unlock()
+	return standalone != nil && provider == engine.EventLoopProvider(standalone)
+}
+
+// StandaloneRefs is the number of references held on the standalone Loop, 0
+// when none is running. It is for tests, which assert that every Resolve of the
+// standalone Loop is paired with one Release (celeris#1238).
+func StandaloneRefs() int {
+	standaloneMu.Lock()
+	defer standaloneMu.Unlock()
+	return standaloneRef
 }
 
 // resetStandaloneForTest tears down any cached standalone loop. Intended for

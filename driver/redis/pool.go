@@ -276,7 +276,8 @@ func (p *redisPool) releasePubSub(c *redisConn) {
 // Close closes both pools and releases the event loop if owned.
 //
 // It is safe to call from several goroutines and more than once: the body runs
-// once, and a second caller returns at once. Releasing the shared standalone
+// once, and a caller that comes in while it runs waits for it to end (a later one
+// returns at once). Releasing the shared standalone
 // loop twice would drop a reference that belongs to another client
 // (celeris#887 item 29: SentinelClient.Close and the give-up of a sentinel
 // closed the same Client).

@@ -65,6 +65,8 @@ type ClusterConfig struct {
 	ReadOnly bool
 
 	Engine ServerProvider
+	// SocketBusyPoll is forwarded to each node client: see [Config].SocketBusyPoll.
+	SocketBusyPoll time.Duration
 }
 
 // ErrClusterMaxRedirects is returned when the maximum number of MOVED/ASK
@@ -160,9 +162,15 @@ func (c *ClusterClient) closeNodes() {
 	c.nodes = nil
 }
 
-// initNodes dials the seed addresses and creates initial node clients.
+// initNodes dials the seed addresses and creates initial node clients. An
+// address listed more than once gets one node: nodes is keyed by address, so a
+// Client built for the repeat would replace the first in the map and nothing
+// would ever close the first.
 func (c *ClusterClient) initNodes() error {
 	for _, addr := range c.cfg.Addrs {
+		if _, dup := c.nodes[addr]; dup {
+			continue
+		}
 		client, err := c.dialNode(addr)
 		if err != nil {
 			continue
@@ -210,6 +218,9 @@ func (c *ClusterClient) nodeOpts() []Option {
 	}
 	if c.cfg.Engine != nil {
 		opts = append(opts, WithEngine(c.cfg.Engine))
+	}
+	if c.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(c.cfg.SocketBusyPoll))
 	}
 	return opts
 }
@@ -1262,8 +1273,8 @@ func (c *ClusterClient) Publish(ctx context.Context, channel, message string) (i
 // [PubSub.Close]. When the ClusterClient is closed, a PubSub whose conn is down
 // (or goes down afterwards) gives up: its Channel() is closed and its control
 // calls return [ErrClosed]. A PubSub whose conn stays up after the close (the
-// event loop is shared with another Client, or WithEngine) keeps it until
-// [PubSub.Close].
+// event loop is shared with another Client that is still open, or is that of a
+// started server that runs its own event loop) keeps it until [PubSub.Close].
 func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	// Regular SUBSCRIBE is node-local: pick any node.
 	node := c.anyNode()

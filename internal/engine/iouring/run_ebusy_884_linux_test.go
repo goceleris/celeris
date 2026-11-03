@@ -123,12 +123,15 @@ func ebusyErr884() error {
 
 // setRingWaitSeam884 installs the seam before the engine starts and removes it
 // after the engine has stopped: the cleanup is registered first, so it runs
-// last, and the workers read the variable without a lock.
+// last. The workers load the variable atomically, so a worker an earlier test
+// left running cannot race with the restore (it would still be answered by the
+// seam, which is why the engine helpers stop their engines when a test fails,
+// celeris#1229).
 func setRingWaitSeam884(t *testing.T, fn func(*Worker, ringWaitMode, error) error) {
 	t.Helper()
-	old := ringWaitSeam
-	ringWaitSeam = fn
-	t.Cleanup(func() { ringWaitSeam = old })
+	old := ringWaitSeam.Load()
+	ringWaitSeam.Store(&fn)
+	t.Cleanup(func() { ringWaitSeam.Store(old) })
 }
 
 // warmLoad884 dials n keep-alive connections, each answered once, so every
@@ -358,7 +361,7 @@ func TestRingWaitScanSeesAnUnroutedWait884(t *testing.T) {
 	const src = `package iouring
 func (w *Worker) run() {
 	err := w.ring.SubmitAndWait()
-	if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(1, err) { return }
+	if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(1, err) { return }
 	err = w.ring.SubmitAndWaitTimeout(1)
 	if err != nil { w.shutdown(); return }
 	_ = w.ring.WaitCQETimeout(1)

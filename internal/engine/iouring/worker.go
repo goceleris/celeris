@@ -832,6 +832,10 @@ type Worker struct {
 	// worker, new requests would keep the queues from ever emptying.
 	// Worker thread only; read in handleRecv.
 	refuseRecv bool
+	// unreadMarked is true when the snapshot of the requests in the kernel, taken
+	// once at the first pass of the send drain (markUnreadAtShutdown,
+	// celeris#1229), marked a conn (cs.shutdownUnread). Worker thread only.
+	unreadMarked bool
 	// gateSwept is set by the first pass of the gate (closeIdleH1): that pass
 	// asks the kernel for the receive queue of the conns it would close, and
 	// holds a conn that has a request in it (holdUnreadAtGate, celeris#1104).
@@ -1641,21 +1645,42 @@ func (w *Worker) run(ctx context.Context) {
 					}
 				}
 			} else {
+				if h := sendDrainSeam.Load(); h != nil {
+					(*h)(w)
+				}
 				now := drainclock.Now()
 				if w.shutdownDrainStart == 0 {
 					w.shutdownDrainStart = now
+					// The requests in the kernel now: the only ones the worker
+					// waits for below (celeris#1229).
+					w.markUnreadAtShutdown()
 				}
 				// Nothing to send and no request parsed: the worker is done, unless a
-				// request already in the kernel (the socket's queue, or a recv CQE
-				// not reaped) has not been read yet: it is answered, as epoll's
-				// h1InProgress does, instead of being reaped without being served
-				// (celeris#1208). Looked at only inside the floor (the first
-				// shutdownSendDrainNanos), while the worker serves as an ordinary
-				// iteration; past it the gate's first pass marks such a request
-				// (gateRead) and h1RequestInProgress waits for it.
-				if w.sendDrainDone(now) {
+				// request that was already in the kernel (the socket's queue, or a
+				// recv CQE not reaped) when the drain began has not been read yet: it
+				// is answered, as epoll's h1InProgress does, instead of being reaped
+				// without being served (celeris#1208). Only the conns marked at that
+				// snapshot are waited for, inside the floor (the first
+				// shutdownSendDrainNanos) and while the worker serves as an ordinary
+				// iteration: a conn accepted after it, which the open listener keeps
+				// bringing, is not asked about, so a steady client cannot renew the
+				// wait up to the floor (celeris#1229). Past the floor the gate's first
+				// pass marks such a request (gateRead) and h1RequestInProgress waits
+				// for it.
+				done, held := w.sendDrainDone(now)
+				if done {
 					w.shutdown()
 					return
+				}
+				if held {
+					// The worker waits for requests that were already in the
+					// kernel, and for nothing else: the listener closes, as
+					// net/http's Shutdown closes its listeners first, so that no
+					// connection accepted from now on (and answered, with a
+					// response to send) keeps it serving to the floor. A request
+					// such a connection sends is dropped, as it is when the worker
+					// exits at once (celeris#1229).
+					w.stopAccepting(ctx)
 				}
 				if end, bounded := w.drainEnd(w.shutdownDrainStart, shutdownSendDrainNanos); bounded && now > end {
 					w.noteSendDrainGaveUp(now - w.shutdownDrainStart)
@@ -1749,7 +1774,7 @@ func (w *Worker) run(ctx context.Context) {
 			if cqHead == cqTail {
 				// No CQEs — wait with adaptive timeout.
 				err := w.ring.WaitCQETimeout(w.adaptiveTimeout())
-				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSQPoll, err) {
+				if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(waitModeSQPoll, err) {
 					w.shutdown()
 					return
 				}
@@ -1782,7 +1807,7 @@ func (w *Worker) run(ctx context.Context) {
 				// submission + CQE retrieval into one syscall (saves ~300ns vs
 				// separate Submit + next-iteration wait).
 				err := w.ring.SubmitAndWait()
-				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSubmitReady, err) {
+				if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(waitModeSubmitReady, err) {
 					w.shutdown()
 					return
 				}
@@ -1800,7 +1825,7 @@ func (w *Worker) run(ctx context.Context) {
 				// worker's standing sweep timer (armSweepTick, celeris#884
 				// item 74) is what ends this wait, in about sweepCeiling.
 				err := w.ring.SubmitAndWait()
-				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeSubmitSends, err) {
+				if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(waitModeSubmitSends, err) {
 					w.shutdown()
 					return
 				}
@@ -1809,7 +1834,7 @@ func (w *Worker) run(ctx context.Context) {
 				// Mode 3b: no guaranteed CQEs — wait with adaptive timeout for
 				// shutdown checks and CQE_SKIP_SUCCESS operations.
 				err := w.ring.SubmitAndWaitTimeout(w.adaptiveTimeout())
-				if (err != nil || ringWaitSeam != nil) && !w.ringWaitContinues(waitModeTimed, err) {
+				if (err != nil || ringWaitSeam.Load() != nil) && !w.ringWaitContinues(waitModeTimed, err) {
 					w.shutdown()
 					return
 				}
@@ -2934,8 +2959,8 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 // completion is handled as the loop would (processCQE), so a connection the
 // accept delivered meanwhile is served.
 func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
-	if h := cancelAcceptSeam; h != nil {
-		h(w, lfd)
+	if h := cancelAcceptSeam.Load(); h != nil {
+		(*h)(w, lfd)
 	}
 	sqe := w.getCancelSQE()
 	if sqe == nil {
@@ -3009,10 +3034,12 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 // stopAccepting cancels the accept and closes the listener, once the
 // worker's context is cancelled and it waits for the HTTP/2 stream handlers
 // on the shared worker pool (celeris#759), or, past the first
-// shutdownSendDrainNanos of its send drain (celeris#806). Either wait can
+// shutdownSendDrainNanos of its send drain (celeris#806), or when a worker
+// with nothing to send waits for the requests that were in the kernel when its
+// drain began (sendDrainDone, celeris#1229). Each wait can
 // last the whole budget, and the worker accepted and served new connections
-// meanwhile, which were then cut at its end; net/http's Shutdown closes its
-// listeners first. What is still in the kernel's accept queue is reset, as
+// meanwhile, which were then cut at its end, or kept it serving; net/http's
+// Shutdown closes its listeners first. What is still in the kernel's accept queue is reset, as
 // the close in shutdown did. Only then, not on every shutdown: the cancel
 // submits the SQ ring and handles its completions, and a shutdown whose
 // send drain is done within its first 250 ms goes straight on, leaving the
@@ -8375,18 +8402,29 @@ func (w *Worker) hasPendingSends() bool {
 			if !mu.TryLock() {
 				return true
 			}
-			pending := connSendPending(cs)
+			pending := connSendInFlight(cs)
 			mu.Unlock()
 			if pending {
 				return true
 			}
 			continue
 		}
-		if connSendPending(cs) {
+		if connSendInFlight(cs) {
 			return true
 		}
 	}
 	return false
+}
+
+// connSendInFlight is connSendPending plus the states the SEND_ZC paths and the
+// held completions pass through: a notification still outstanding and a send
+// completion held for the dispatch goroutine (celeris#750). Bytes are kept in
+// sendBuf for both today, so connSendPending already counts them; this does not
+// depend on that. A worker with any of them has a response going out, and the
+// shutdown drain (sendDrainDone) must never take it for a worker with nothing to
+// send, which stops accepting (celeris#1229).
+func connSendInFlight(cs *connState) bool {
+	return connSendPending(cs) || cs.zcNotifPending || len(cs.heldSends) > 0
 }
 
 // connSendPending reports whether cs has response bytes staged for a SEND or
@@ -8503,8 +8541,8 @@ func (w *Worker) stopDetachedProducers() {
 // idle one (a park, a slow callback in the gate pass, a long wait end it). Any other error is the ring
 // failing: the worker stops, and closes what it owns.
 func (w *Worker) ringWaitContinues(mode ringWaitMode, err error) bool {
-	if h := ringWaitSeam; h != nil {
-		err = h(w, mode, err)
+	if h := ringWaitSeam.Load(); h != nil {
+		err = (*h)(w, mode, err)
 	}
 	if err == nil {
 		return true
