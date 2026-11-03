@@ -220,6 +220,52 @@ func ringNamed1242(id fdID1242, fd int) bool {
 	return err == nil && link == "anon_inode:[io_uring]"
 }
 
+// premiseWithin1242 is how long a premise of these tests may take to come
+// true: the engine's own steps (a worker re-creating its listener after a
+// resume, a handler running after its request arrived) are asynchronous and
+// slow down under -race -covermode=atomic on one CPU shared with other work.
+// A premise is waited for to this bound, never slept for, and one that is not
+// true by then fails with what was seen.
+const premiseWithin1242 = 15 * time.Second
+
+// okWithin1242 dials until a /ok is answered, up to premiseWithin1242, and
+// returns the keep-alive connection that was answered. A refused or reset
+// dial is retried: a listener a worker has not re-created yet refuses.
+func okWithin1242(t *testing.T, addr string) (net.Conn, time.Duration) {
+	t.Helper()
+	start := time.Now()
+	var last error
+	for time.Since(start) < premiseWithin1242 {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+			_, _ = c.Write([]byte("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n"))
+			buf := make([]byte, 256)
+			var n int
+			if n, err = c.Read(buf); err == nil && strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
+				return c, time.Since(start)
+			} else if err == nil {
+				err = fmt.Errorf("not a 200: %q", buf[:n])
+			}
+			_ = c.Close()
+		}
+		last = err
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("PREMISE: no /ok answered within %v at %s, last error: %v", premiseWithin1242, addr, last)
+	return nil, 0
+}
+
+// waitFor1242 polls cond until it holds, up to premiseWithin1242.
+func waitFor1242(cond func() bool) bool {
+	for dl := time.Now().Add(premiseWithin1242); time.Now().Before(dl); time.Sleep(time.Millisecond) {
+		if cond() {
+			return true
+		}
+	}
+	return cond()
+}
+
 // stopAtCleanup1242 stops the engine when the test ends, whether or not the
 // test got as far as stop848, and waits for Listen to return.
 func stopAtCleanup1242(t *testing.T, cancel context.CancelFunc, done chan error) {
@@ -263,16 +309,8 @@ func TestEveryExitPathClosesEachDescriptorOnce1242(t *testing.T) {
 		stopAtCleanup1242(t, cancel, done)
 		// Keep-alive connections the stop has to close.
 		for i := 0; i < 6; i++ {
-			c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
-			if err != nil {
-				t.Fatal(err)
-			}
+			c, _ := okWithin1242(t, e.Addr().String())
 			defer func() { _ = c.Close() }()
-			_ = c.SetDeadline(time.Now().Add(2 * time.Second))
-			_, _ = c.Write([]byte("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n"))
-			if n, err := c.Read(make([]byte, 256)); err != nil || n == 0 {
-				t.Fatalf("PREMISE: /ok: %d bytes, %v", n, err)
-			}
 		}
 		stop848(t, cancel, done)
 		tr.requireCloses(t)
@@ -293,10 +331,12 @@ func TestEveryExitPathClosesEachDescriptorOnce1242(t *testing.T) {
 				t.Fatalf("ResumeAccept: %v", err)
 			}
 		}
-		// The workers re-create their listeners on the next iteration.
-		if _, err := okOnce848(e.Addr().String()); err != nil {
-			t.Fatalf("PREMISE: no answer after the resume: %v", err)
-		}
+		// ResumeAccept returns before the workers have re-created their
+		// listeners (they do it on their next iteration), so a dial right
+		// after it can be refused: wait for the answer, bounded.
+		c, took := okWithin1242(t, e.Addr().String())
+		_ = c.Close()
+		t.Logf("answered %v after the resume", took)
 		stop848(t, cancel, done)
 		tr.requireCloses(t)
 		tr.verdict(t)
@@ -310,18 +350,13 @@ func TestEveryExitPathClosesEachDescriptorOnce1242(t *testing.T) {
 		stopAtCleanup1242(t, cancel, done)
 		addr := e.Addr().String()
 		for i := 0; i < 12; i++ {
-			if _, err := okOnce848(addr); err != nil {
-				t.Fatal(err)
-			}
+			c, _ := okWithin1242(t, addr)
+			_ = c.Close()
 		}
-		boom, err := net.DialTimeout("tcp", addr, 2*time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
+		boom, _ := okWithin1242(t, addr)
 		defer func() { _ = boom.Close() }()
 		_, _ = boom.Write([]byte("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"))
-		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && e.abnormalWorkerExits.Load() == 0; time.Sleep(time.Millisecond) {
-		}
+		waitFor1242(func() bool { return e.abnormalWorkerExits.Load() != 0 })
 		if got := e.abnormalWorkerExits.Load(); got != 1 {
 			t.Fatalf("PREMISE: abnormalWorkerExits = %d, want 1", got)
 		}
@@ -355,6 +390,7 @@ func TestEveryExitPathClosesEachDescriptorOnce1242(t *testing.T) {
 		if err := e.PauseAccept(); err != nil {
 			t.Fatalf("PauseAccept: %v", err)
 		}
+		waitFor1242(func() bool { return e.abnormalWorkerExits.Load() != 0 })
 		if e.abnormalWorkerExits.Load() != 1 {
 			t.Fatalf("PREMISE: abnormalWorkerExits = %d, want 1", e.abnormalWorkerExits.Load())
 		}
@@ -421,11 +457,7 @@ func TestEveryExitPathClosesEachDescriptorOnce1242(t *testing.T) {
 		})
 		e, logs, cancel, done := start848(t, "127.0.0.1:0", false)
 		stopAtCleanup1242(t, cancel, done)
-		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); time.Sleep(time.Millisecond) {
-			if w := failed.Load(); w != nil && w.exited.Load() {
-				break
-			}
-		}
+		waitFor1242(func() bool { w := failed.Load(); return w != nil && w.exited.Load() })
 		if w := failed.Load(); w == nil || !w.exited.Load() {
 			t.Fatal("PREMISE: no worker left its loop after a failed ring wait")
 		}
@@ -447,9 +479,12 @@ func TestEveryExitPathClosesEachDescriptorOnce1242(t *testing.T) {
 		if err := e.PauseAccept(); err != nil {
 			t.Fatal(err)
 		}
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			t.Fatalf("a fixed port has no hold: %v", err)
+		// The pause's close takes the workers' listeners out of the group
+		// asynchronously: bind the port once they are gone.
+		var ln net.Listener
+		var lerr error
+		if !waitFor1242(func() bool { ln, lerr = net.Listen("tcp", addr); return lerr == nil }) {
+			t.Fatalf("PREMISE: the port was never free to hold after the pause: %v", lerr)
 		}
 		defer func() { _ = ln.Close() }()
 		if err := e.ResumeAccept(); err != nil {
@@ -457,9 +492,7 @@ func TestEveryExitPathClosesEachDescriptorOnce1242(t *testing.T) {
 		}
 		want := uint64(e.Metrics().Workers)
 		var lost uint64
-		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl) && lost < want; time.Sleep(5 * time.Millisecond) {
-			lost = e.Metrics().ErrorListenerRecreate
-		}
+		waitFor1242(func() bool { lost = e.Metrics().ErrorListenerRecreate; return lost >= want })
 		if want == 0 || lost != want {
 			t.Fatalf("PREMISE: ErrorListenerRecreate = %d, want %d (one per worker)", lost, want)
 		}
@@ -501,12 +534,9 @@ func TestPanickedWorkerClosesEachDescriptorOnce1242(t *testing.T) {
 		tr := installFDTrap1242(t)
 		tr.echo = true
 		e, _, _, _ := start848(t, "127.0.0.1:0", false)
-		c, err := net.DialTimeout("tcp", e.Addr().String(), 2*time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
+		c, _ := okWithin1242(t, e.Addr().String())
 		_, _ = c.Write([]byte("GET /panic HTTP/1.1\r\nHost: x\r\n\r\n"))
-		time.Sleep(5 * time.Second)
+		time.Sleep(30 * time.Second) // the panic ends the process long before
 		t.Log("celeris1242 child survived the panic")
 		return
 	}
