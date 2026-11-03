@@ -6,7 +6,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -356,10 +355,7 @@ func TestPoolWaitGateWaitsItsWindowWhateverTheWallDoes1176(t *testing.T) {
 
 // releaseOnce1176 is h's release, closed at most once, so a test that fails
 // before the handler is released still lets it go.
-func releaseOnce1176(h *holdHandler896) func() {
-	var once sync.Once
-	return func() { once.Do(func() { close(h.release) }) }
-}
+func releaseOnce1176(h *holdHandler896) func() { return h.unblock }
 
 func isTimeout1176(err error) bool {
 	ne, ok := err.(net.Error)
@@ -437,8 +433,7 @@ func TestCancelAcceptWaitIsBoundedByTheMonotonicClock1176(t *testing.T) {
 				return nil
 			}
 			t.Cleanup(func() { shutdownRingWait = orig })
-			cancelAcceptSeam = func(w *Worker, _ int) { ring.CompareAndSwap(nil, w.ring) }
-			t.Cleanup(func() { cancelAcceptSeam = nil })
+			setCancelAcceptSeam1229(t, func(w *Worker, _ int) { ring.CompareAndSwap(nil, w.ring) })
 			restore := stairClock1176(t, step)
 
 			h := newHoldHandler896(false)

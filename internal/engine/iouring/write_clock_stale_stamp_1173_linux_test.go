@@ -48,7 +48,12 @@ func (g *gate1173) HandleStream(_ context.Context, s *stream.Stream) error {
 	}
 	for _, hh := range s.Headers {
 		if hh[0] == ":path" && hh[1] == "/gate" {
-			g.started <- struct{}{}
+			// Never blocks: started holds one signal, and a handler after the
+			// first must still reach the gate, which the engine's cleanup closes.
+			select {
+			case g.started <- struct{}{}:
+			default:
+			}
 			<-g.gate
 		}
 	}
@@ -83,11 +88,10 @@ func startGate1173(t *testing.T, g *gate1173) (*engineRun896, string) {
 			skipOrFail656(t, "New: %v", err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- e.Listen(ctx) }()
+		done, returned := listenAsync896(ctx, e)
 		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); {
 			if e.Addr() != nil {
-				run = &engineRun896{e: e, cancel: cancel, done: done}
+				run = &engineRun896{e: e, cancel: cancel, done: done, returned: returned}
 				return nil
 			}
 			select {
@@ -108,6 +112,9 @@ func startGate1173(t *testing.T, g *gate1173) (*engineRun896, string) {
 		}
 		t.Fatalf("engine start on %s: %v", addr, err)
 	}
+	// Closing the gate frees a handler a failed test left waiting on it, which
+	// Listen would otherwise wait for; the tests only send on it.
+	run.reapAtCleanup(t, func() { close(g.gate) })
 	return run, addr
 }
 
