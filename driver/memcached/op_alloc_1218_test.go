@@ -2,6 +2,7 @@ package memcached
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 )
@@ -23,24 +24,37 @@ func TestOperationLimitDoesNotAllocate1218(t *testing.T) {
 	f.store.kv["k"] = memItem{value: []byte("v"), cas: 1}
 	for _, cl := range opClients {
 		t.Run(cl.name, func(t *testing.T) {
-			allocs := func(timeout time.Duration, ctx context.Context) float64 {
+			// Both clients are built and warmed first, then measured in turns, so
+			// whatever the process does meanwhile reaches both alike.
+			get := func(timeout time.Duration) func() {
 				c := cl.new(t, Config{Addr: f.Addr(), Timeout: timeout})
-				if _, err := c.Get(ctx, "k"); err != nil { // warm the pool
+				bg := context.Background()
+				if _, err := c.Get(bg, "k"); err != nil { // warm the pool
 					t.Fatal(err)
 				}
-				return testing.AllocsPerRun(200, func() {
-					if _, err := c.Get(ctx, "k"); err != nil {
+				return func() {
+					if _, err := c.Get(bg, "k"); err != nil {
 						t.Fatal(err)
 					}
-				})
+				}
 			}
-			bg := context.Background()
-			on, off := allocs(3*time.Second, bg), allocs(-1, bg)
-			t.Logf("Get: %.1f allocs/op with the limit, %.1f without", on, off)
-			if on > off {
-				t.Errorf("the per-operation limit costs %.1f allocations per command, want 0", on-off)
+			withLimit, without := get(3*time.Second), get(-1)
+			// Under -race sync.Pool drops Puts at random, so a round of either side
+			// can come out an allocation above its true cost (about 1 round in 35
+			// under -race on 2 CPUs, either side alike), and with one round per side
+			// the noise of one was set against the other's. The noise only adds
+			// allocations: the least of the rounds of a side is its cost. A limit
+			// that allocates raises every round of its side, so its least too.
+			const rounds = 7
+			onMin, offMin := math.Inf(1), math.Inf(1)
+			for range rounds {
+				onMin = min(onMin, testing.AllocsPerRun(100, withLimit))
+				offMin = min(offMin, testing.AllocsPerRun(100, without))
 			}
-
+			t.Logf("Get: %.1f allocs/op with the limit, %.1f without (least of %d rounds)", onMin, offMin, rounds)
+			if onMin > offMin {
+				t.Errorf("the per-operation limit costs %.1f allocations per command, want 0", onMin-offMin)
+			}
 		})
 	}
 }
