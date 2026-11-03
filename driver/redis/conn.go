@@ -182,6 +182,30 @@ func (c *redisConn) notifyPubSubClose(err error) {
 // aLongTimeAgo is a deadline in the past: it ends a read in progress.
 var aLongTimeAgo = time.Unix(1, 0)
 
+// directHooks are the seams of the direct-mode cancel, set by tests
+// (celeris#1250). Nil in production; a field left nil is not called.
+type directHooks struct {
+	// beforeDeadline runs in execDirectBuf and execManyDirect before the socket
+	// deadline is set from ctx's.
+	beforeDeadline func(c *redisConn)
+	// interrupted runs after the cancel hook has set the past deadline.
+	interrupted func(c *redisConn)
+	// afterHandshake runs when the handshake's commands have returned, before
+	// the cancel hook is stopped.
+	afterHandshake func(c *redisConn)
+}
+
+var testHookDirect atomic.Pointer[directHooks]
+
+// interruptDirect ends the read in progress on tcp, which belongs to c: a
+// deadline in the past, not a close (see handshake).
+func (c *redisConn) interruptDirect(tcp *net.TCPConn) {
+	_ = tcp.SetDeadline(aLongTimeAgo)
+	if h := testHookDirect.Load(); h != nil && h.interrupted != nil {
+		h.interrupted(c)
+	}
+}
+
 // dialDirectRedisConn dials a TCP connection in direct mode: no mini-loop
 // registration, no fd extraction. The conn keeps the live *net.TCPConn
 // and does Write/Read on the caller's goroutine via Go's netpoll.
@@ -214,19 +238,8 @@ func dialDirectRedisConn(ctx context.Context, cfg Config) (*redisConn, error) {
 		createdAt: time.Now(),
 	}
 	c.lastUsedAt.Store(time.Now().UnixNano())
-	// The handshake in direct mode waits on a plain net.Conn, which honours
-	// ctx's deadline (execDirectBuf) but not its cancellation: a deadline in the
-	// past ends the read when ctx ends, as a dial in a mini-loop ends on
-	// ctx.Done (celeris#1246: SentinelClient.Close cancels the dials in flight
-	// and waits for them). The conn is not closed here: the handshake goroutine
-	// peeks its raw fd number (tcpFd), which a close from this goroutine could
-	// leave naming another socket; whoever dialled closes it, as always.
-	stop := context.AfterFunc(ctx, func() { _ = tcp.SetDeadline(aLongTimeAgo) })
+	// The handshake interrupts its own reads when ctx ends (see handshake).
 	err = c.handshake(ctx)
-	if !stop() {
-		// ctx ended during the handshake: report it, whatever the read saw.
-		err = ctx.Err()
-	}
 	if err != nil {
 		_ = c.Close()
 		return nil, err
@@ -337,6 +350,9 @@ func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []
 	}
 	if dl, ok := ctx.Deadline(); ok {
 		tcp := c.tcp
+		if h := testHookDirect.Load(); h != nil && h.beforeDeadline != nil {
+			h.beforeDeadline(c)
+		}
 		_ = tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
@@ -396,6 +412,9 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 	}
 	if dl, ok := ctx.Deadline(); ok {
 		tcp := c.tcp
+		if h := testHookDirect.Load(); h != nil && h.beforeDeadline != nil {
+			h.beforeDeadline(c)
+		}
 		_ = tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
@@ -833,7 +852,26 @@ func (c *redisConn) handshake(ctx context.Context) error {
 	}
 	hctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// Direct mode: a past deadline ends the read when hctx ends. The hook is a child
+	// of hctx, so it runs only after hctx.Err() is set, which execDirectBuf checks
+	// after its own SetDeadline: the past deadline is never lost.
+	var stop func() bool
+	if c.useDirect && c.tcp != nil {
+		tcp := c.tcp
+		stop = context.AfterFunc(hctx, func() { c.interruptDirect(tcp) })
+	}
 	err := c.runHandshake(hctx)
+	if h := testHookDirect.Load(); h != nil && h.afterHandshake != nil {
+		h.afterHandshake(c)
+	}
+	if stop != nil && !stop() {
+		if ctx.Err() != nil {
+			return ctx.Err() // the caller's ctx ended during the handshake
+		}
+		if err == nil {
+			err = hctx.Err() // DialTimeout hit as the reply came: the deadline is past
+		}
+	}
 	if err != nil && !callerFirst && ctx.Err() == nil {
 		// The direct path reports the socket's deadline (it can fire a hair
 		// before hctx's timer), the others the context's.
