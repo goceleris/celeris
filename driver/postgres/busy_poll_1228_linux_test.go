@@ -6,12 +6,10 @@ import (
 	"context"
 	"io"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/busypolltest"
-	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/sockopts/sockoptstest"
 )
 
@@ -176,15 +174,7 @@ func TestPoolSocketBusyPoll(t *testing.T) {
 			if err != nil {
 				t.Fatalf("open: %v", err)
 			}
-			// A Pool opened WithEngine of a server that has not started takes a
-			// reference to the standalone loop and never gives it back.
-			prov := p.provider
-			defer func() {
-				_ = p.Close()
-				if strings.Contains(tc.name, "server not started") {
-					eventloop.Release(prov)
-				}
-			}()
+			defer func() { _ = p.Close() }()
 			c, err := p.acquire(context.Background())
 			if err != nil {
 				t.Fatalf("dial: %v", err)

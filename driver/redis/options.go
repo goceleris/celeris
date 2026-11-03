@@ -77,12 +77,13 @@ type Config struct {
 	//
 	// Which connections it reaches: every Pub/Sub connection, and the command
 	// connections of a Client that runs on an event loop, which is a Client with
-	// no Engine and one whose Engine is a server that has not started yet (the
-	// driver then uses its own loop, not the server's). The command
-	// connections of a Client opened with the Engine of a server that has
-	// started, or one that runs async handlers, dial through Go's netpoll
-	// and are never tuned; neither is a connection of a Client that does not
-	// run on a loop. A refused setsockopt is ignored, silently; the server
+	// no Engine and one whose Engine is a server that does not run async
+	// handlers and either has not started yet or is on the std engine, which
+	// has no event loop of its own (the driver then uses its own loop, not the
+	// server's). The command connections of a Client opened with the Engine of
+	// a started epoll, io_uring or adaptive server, or of one that runs async
+	// handlers (also before it starts), dial through Go's netpoll and are never
+	// tuned. A refused setsockopt is ignored, silently; the server
 	// logs a warning once. See celeris.Config.SocketBusyPoll for what it does
 	// and what was measured.
 	SocketBusyPoll time.Duration

@@ -661,11 +661,15 @@ type Config struct {
 	// loop take this budget, see [Server.SocketBusyPoll] (celeris#1228). Before
 	// v1.6.0 those connections were set to 50 microseconds with no way to turn
 	// it off. That was never every connection a driver dials: only those
-	// registered on an event loop (redis Pub/Sub and, when it runs on a loop,
-	// the redis command pool; postgres Connector connections and, for a server
-	// not started yet, a Pool; memcached only for a server not started yet).
-	// Connections dialed through Go's netpoll were never set, and still are
-	// not. A driver without an engine is off by default; redis and postgres
+	// registered on an event loop: redis Pub/Sub, postgres Connector
+	// connections, and, when the driver runs on its own loop (no engine, or the
+	// engine of a server that does not run async handlers and either has not
+	// started yet or is on the std engine), the redis and memcached command
+	// connections and the postgres Pool. Connections dialed through Go's
+	// netpoll were never set, and still are not: those of a started epoll,
+	// io_uring or adaptive server, of any server that runs async handlers
+	// (also before it starts), and memcached and the postgres Pool with no
+	// engine. A driver without an engine is off by default; redis and postgres
 	// (Connector) have an option of their own. The numbers below are for
 	// accepted sockets; no driver traffic was measured.
 	//

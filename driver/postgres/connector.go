@@ -18,7 +18,7 @@ type Connector struct {
 	dsn DSN
 
 	// engine and busyPoll decide the SO_BUSY_POLL budget of each connection:
-	// busyPoll when positive (WithSocketBusyPoll), else the server's
+	// busyPoll when at least a microsecond (WithSocketBusyPoll), else the server's
 	// Config.SocketBusyPoll (WithEngine), else none (celeris#1228).
 	engine   ServerProvider
 	busyPoll time.Duration
