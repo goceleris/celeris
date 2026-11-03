@@ -44,12 +44,24 @@ func TestOperationLimitDoesNotAllocate1218(t *testing.T) {
 			// under -race on 2 CPUs, either side alike), and with one round per side
 			// the noise of one was set against the other's. The noise only adds
 			// allocations: the least of the rounds of a side is its cost. A limit
-			// that allocates raises every round of its side, so its least too.
+			// that costs a whole allocation or more on every command raises every
+			// round of its side, so its least too. AllocsPerRun rounds its average
+			// down, so a limit that allocates on some of the commands only (under
+			// 1 per command on average) is not seen here, in plain mode or under
+			// -race, nor reliably by the single round this replaces (TestAllocBudgets
+			// is the plain guard). The side measured first alternates, so what a
+			// round does to the pools (a GC clears them) does not always fall on
+			// the same side.
 			const rounds = 7
 			onMin, offMin := math.Inf(1), math.Inf(1)
-			for range rounds {
-				onMin = min(onMin, testing.AllocsPerRun(100, withLimit))
-				offMin = min(offMin, testing.AllocsPerRun(100, without))
+			for r := range rounds {
+				if r%2 == 0 {
+					onMin = min(onMin, testing.AllocsPerRun(100, withLimit))
+					offMin = min(offMin, testing.AllocsPerRun(100, without))
+				} else {
+					offMin = min(offMin, testing.AllocsPerRun(100, without))
+					onMin = min(onMin, testing.AllocsPerRun(100, withLimit))
+				}
 			}
 			t.Logf("Get: %.1f allocs/op with the limit, %.1f without (least of %d rounds)", onMin, offMin, rounds)
 			if onMin > offMin {
