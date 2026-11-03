@@ -195,8 +195,12 @@ func freeAfter896(addr string, since time.Time, bound time.Duration) time.Durati
 // closed, so connections are arriving and being accepted while the engine is
 // shut down.
 func churn896(addr string, stop <-chan struct{}) *sync.WaitGroup {
+	return churnN896(addr, stop, 3)
+}
+
+func churnN896(addr string, stop <-chan struct{}, n int) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	for range 3 {
+	for range n {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
