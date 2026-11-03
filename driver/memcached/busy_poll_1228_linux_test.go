@@ -4,10 +4,12 @@ package memcached
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/busypolltest"
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/sockopts/sockoptstest"
 )
 
@@ -89,7 +91,14 @@ func TestNewClientSocketBusyPoll(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = cl.Close() }()
+			defer func() {
+				_ = cl.Close()
+				// A Client opened WithEngine of a server that has not started
+				// takes a reference to the standalone loop and never gives it back.
+				if strings.Contains(tc.name, "server not started") {
+					eventloop.Release(cl.pool.provider)
+				}
+			}()
 			c, err := cl.pool.acquire(context.Background(), 0)
 			if err != nil {
 				t.Fatalf("acquire: %v", err)
@@ -97,7 +106,7 @@ func TestNewClientSocketBusyPoll(t *testing.T) {
 			defer cl.pool.release(c)
 			fd := c.fd
 			if c.useDirect {
-				fd = int(c.tcpFd)
+				fd = c.tcpFd
 			}
 			if got := busypolltest.BusyPoll(t, fd); got != tc.want {
 				t.Errorf("SO_BUSY_POLL = %d, want %d (baseline %d, direct conn: %v)", got, tc.want, base, c.useDirect)
