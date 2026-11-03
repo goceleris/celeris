@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -193,12 +194,21 @@ func (o *orderedCtx) AfterFunc(f func()) func() bool {
 	}
 }
 
-func (o *orderedCtx) cancel(hold time.Duration) {
+// cancel runs the registered funcs in the order they were registered (FIFO) and
+// cancelLIFO in the reverse order: the first one runs at once, the others after
+// hold.
+func (o *orderedCtx) cancel(hold time.Duration)     { o.run(hold, false) }
+func (o *orderedCtx) cancelLIFO(hold time.Duration) { o.run(hold, true) }
+
+func (o *orderedCtx) run(hold time.Duration, reverse bool) {
 	o.mu.Lock()
 	o.err = context.Canceled
 	close(o.done)
 	fs := append([]func(){}, o.funcs...)
 	o.mu.Unlock()
+	if reverse {
+		slices.Reverse(fs)
+	}
 	ran := 0
 	for _, f := range fs {
 		if f == nil {
@@ -220,7 +230,22 @@ func (o *orderedCtx) cancel(hold time.Duration) {
 // context, ends the dial. A hook registered on the caller's ctx, not on the
 // handshake's, runs before that context hears of the cancel (the hold), the check
 // finds nothing, and the dial waits for its DialTimeout (an hour here).
+//
+// Two orders: the funcs of the caller's ctx in the order they were registered,
+// which catches a hook registered on it before the handshake's timeout context,
+// and in the reverse order, which catches one registered after it. With the hook
+// on the handshake's context, the caller's ctx carries that context's func alone,
+// and both orders end the dial.
 func TestDirectDialCancelOrderWithACtxOfItsOwn1250(t *testing.T) {
+	t.Run("registration order", func(t *testing.T) {
+		testDirectDialCancelOrder1250(t, (*orderedCtx).cancel)
+	})
+	t.Run("reverse order", func(t *testing.T) {
+		testDirectDialCancelOrder1250(t, (*orderedCtx).cancelLIFO)
+	})
+}
+
+func testDirectDialCancelOrder1250(t *testing.T, cancelCtx func(o *orderedCtx, hold time.Duration)) {
 	f := startFakeRedis(t, func(cmd []string, w *bufio.Writer) {
 		if len(cmd) > 0 && strings.EqualFold(cmd[0], "HELLO") {
 			handleHELLO(w, 3)
@@ -239,7 +264,7 @@ func TestDirectDialCancelOrderWithACtxOfItsOwn1250(t *testing.T) {
 			}
 			go func() {
 				defer close(cancelDone)
-				octx.cancel(300 * time.Millisecond)
+				cancelCtx(octx, 300*time.Millisecond)
 			}()
 			select {
 			case <-interrupted:
@@ -268,4 +293,31 @@ func TestDirectDialCancelOrderWithACtxOfItsOwn1250(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	awaitClosed1246(t, cancelDone, "the cancel to finish")
+}
+
+// DialTimeout fires after the handshake's replies came and before the cancel hook
+// is stopped: the hook has set a past deadline, so the dial must not return the
+// conn (its first command, with no deadline of its own, would fail with an i/o
+// timeout), and reports the deadline.
+func TestDirectDialTimeoutAfterTheRepliesIsNotReturned1250(t *testing.T) {
+	addr := startHelloPingNode1250(t)
+	setDirectHooks(t, &directHooks{afterHandshake: func(c *redisConn) {
+		if c.cfg.Addr == addr {
+			// Past DialTimeout: the handshake's timer fires the hook. The sleep
+			// only has to outlast the 50 ms, it orders nothing.
+			time.Sleep(150 * time.Millisecond)
+		}
+	}})
+	var c *redisConn
+	var err error
+	within1250(t, "the dial", func() {
+		c, err = dialDirectRedisConn(context.Background(), Config{Addr: addr, DialTimeout: 50 * time.Millisecond})
+	})
+	if c != nil {
+		_ = c.Close()
+		t.Fatal("the dial returned a conn whose cancel hook had fired")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want a deadline error", err)
+	}
 }
