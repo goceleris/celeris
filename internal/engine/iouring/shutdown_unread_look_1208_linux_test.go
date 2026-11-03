@@ -265,3 +265,42 @@ func TestGateMarkUnreadAtShutdownIsASnapshot1229(t *testing.T) {
 		}
 	})
 }
+
+// A worker with a response going out never takes the worker-with-nothing-to-send
+// path (sendDrainDone, held, which stops accepting): every state a response can
+// be in counts, including the ones the SEND_ZC and fallback paths pass through
+// (celeris#1229, after a Coverage run in which a held-back conn of a worker with
+// 16 stalled responses was reset). The unreachable-in-practice states are listed
+// too, so that the predicate does not depend on the send buffer being kept.
+func TestGateHasPendingSendsCountsEveryStateOfAResponse1229(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(cs *connState)
+	}{
+		{"a SEND in flight", func(cs *connState) { cs.sending = true }},
+		{"a queued resend (the SQ ring was full)", func(cs *connState) { cs.sendBuf = []byte("x") }},
+		{"bytes written, not flushed", func(cs *connState) { cs.writeBuf = []byte("x") }},
+		{"a ZC first completion that failed: sending cleared, the notification outstanding, the bytes kept", func(cs *connState) {
+			cs.zcNotifPending, cs.sendBuf = true, []byte("x")
+		}},
+		{"a ZC notification outstanding alone", func(cs *connState) { cs.zcNotifPending = true }},
+		{"a send completion held for the dispatch goroutine", func(cs *connState) {
+			cs.heldSends = append(cs.heldSends, completionEntry{})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, css, _ := gateRig884(t, 2)
+			if w.hasPendingSends() {
+				t.Fatal("control: idle conns have a send pending")
+			}
+			tc.set(css[1])
+			if !w.hasPendingSends() {
+				t.Errorf("hasPendingSends: false with %s", tc.name)
+			}
+			w.shutdownDrainStart = 5_000_000_000
+			if done, held := w.sendDrainDone(w.shutdownDrainStart + 1); done || held {
+				t.Errorf("sendDrainDone with %s = done %v, held %v, want false, false (a worker with a response going out does not stop accepting)", tc.name, done, held)
+			}
+		})
+	}
+}

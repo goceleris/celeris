@@ -8402,18 +8402,29 @@ func (w *Worker) hasPendingSends() bool {
 			if !mu.TryLock() {
 				return true
 			}
-			pending := connSendPending(cs)
+			pending := connSendInFlight(cs)
 			mu.Unlock()
 			if pending {
 				return true
 			}
 			continue
 		}
-		if connSendPending(cs) {
+		if connSendInFlight(cs) {
 			return true
 		}
 	}
 	return false
+}
+
+// connSendInFlight is connSendPending plus the states the SEND_ZC paths and the
+// held completions pass through: a notification still outstanding and a send
+// completion held for the dispatch goroutine (celeris#750). Bytes are kept in
+// sendBuf for both today, so connSendPending already counts them; this does not
+// depend on that. A worker with any of them has a response going out, and the
+// shutdown drain (sendDrainDone) must never take it for a worker with nothing to
+// send, which stops accepting (celeris#1229).
+func connSendInFlight(cs *connState) bool {
+	return connSendPending(cs) || cs.zcNotifPending || len(cs.heldSends) > 0
 }
 
 // connSendPending reports whether cs has response bytes staged for a SEND or
