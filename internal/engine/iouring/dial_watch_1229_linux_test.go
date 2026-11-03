@@ -283,7 +283,9 @@ func parseProcPairs896(text string, prefixes ...string) map[string]int64 {
 const (
 	softnetDroppedCol896 = 1  // packets dropped for want of room in the CPU's backlog
 	softnetSqueezeCol896 = 2  // softirq runs that ran out of budget
-	softnetBacklogCol896 = 14 // length of the CPU's backlog queue, kernels from 5.10
+	softnetBacklogCol896 = 11 // the CPU's backlog length, input and process queues together, kernels from 5.10
+	// (from 6.7, 13 is the input queue alone and 14 the process queue, the part
+	// process_backlog has already taken: a SYN waiting for the softirq is not in it)
 )
 
 // softnetSum896 sums column col (0-based; the values are hex) of
@@ -301,9 +303,9 @@ func softnetSum896(text string, col int) int64 {
 	return n
 }
 
-// softnetBacklog896 sums the backlog column of /proc/net/softnet_stat (the length of
-// the CPU's backlog queue, kernels from 5.10) over the CPUs: a SYN that sits
-// unprocessed shows here.
+// softnetBacklog896 sums the backlog column of /proc/net/softnet_stat (the
+// length of the CPU's backlog queue, input and process queues together) over
+// the CPUs: a SYN that sits unprocessed shows here.
 func softnetBacklog896() int64 {
 	b, err := os.ReadFile("/proc/net/softnet_stat")
 	if err != nil {
@@ -322,9 +324,14 @@ const (
 	snmpFixture896 = "Ip: Forwarding\nIp: 1\n" +
 		"Tcp: RtoAlgorithm AttemptFails EstabResets RetransSegs\n" +
 		"Tcp: 1 7 8 9\n"
-	// two CPUs: processed dropped time_squeeze ... (15 columns, hex)
-	softnetFixture896 = "0000aaaa 00000010 00000003 0 0 0 0 0 0 0 0 0 0 0 00000002 00000000\n" +
-		"0000bbbb 00000020 00000005 0 0 0 0 0 0 0 0 0 0 0 00000004 00000001\n"
+	// two CPUs, hex, as net/core/net-procfs.c prints them: processed, dropped,
+	// time_squeeze, five zero columns, cpu_collision 0, received_rps,
+	// flow_limit_count, the backlog length (11), the CPU index (12), and from
+	// kernel 6.7 the input queue (13) and the process queue (14) the length is
+	// the sum of. The first row is of that kernel (backlog 5 = 3 + 2), the
+	// second of 5.10 to 6.6, 13 columns (backlog 4).
+	softnetFixture896 = "0000aaaa 00000010 00000003 0 0 0 0 0 0 00000007 00000009 00000005 00000000 00000003 00000002\n" +
+		"0000bbbb 00000020 00000005 0 0 0 0 0 0 00000008 0000000a 00000004 00000001\n"
 )
 
 // tcpRowFixture896 is a /proc/net/tcp row whose local port is 0x1F90 (8080),
@@ -347,8 +354,8 @@ func TestDialWatchReadsTheProcFiles1229(t *testing.T) {
 			t.Errorf("state %s: rows = %q, want one starting %q", st, rows, want)
 		}
 	}
-	if rows := tcpRowsOf896("tcp", hdr+tcpRowFixture896("02", 3), 8080); len(rows) != 1 || !strings.HasSuffix(rows[0], " retrnsmt=3") {
-		t.Errorf("a retransmitted SYN_SENT row = %q, want retrnsmt=3", rows)
+	if rows := tcpRowsOf896("tcp", hdr+tcpRowFixture896("02", 12), 8080); len(rows) != 1 || !strings.HasSuffix(rows[0], " retrnsmt=12") {
+		t.Errorf("a retransmitted SYN_SENT row = %q, want retrnsmt=12", rows)
 	}
 	// The remote port counts too (the client's row), a port that is neither does not.
 	if rows := tcpRowsOf896("tcp", hdr+tcpRowFixture896("01", 0), 0xC350); len(rows) != 1 {
@@ -379,8 +386,8 @@ func TestDialWatchReadsTheProcFiles1229(t *testing.T) {
 	if got := softnetSum896(softnetFixture896, softnetSqueezeCol896); got != 8 {
 		t.Errorf("softnet squeeze = %d, want 8", got)
 	}
-	if got := softnetSum896(softnetFixture896, softnetBacklogCol896); got != 6 {
-		t.Errorf("softnet backlog length = %d, want 6", got)
+	if got := softnetSum896(softnetFixture896, softnetBacklogCol896); got != 9 {
+		t.Errorf("softnet backlog length = %d, want 9 (5 + 4)", got)
 	}
 
 	before := map[string]int64{"ListenDrops": 300, "ListenOverflows": 22}
@@ -415,7 +422,10 @@ func TestDialWatchGapSeesAStallThatSpansTheDeadline1229(t *testing.T) {
 		w := watchDialClock896("127.0.0.1:1", time.Second, clock)
 		offset.Store(int64(1500 * time.Millisecond))
 		if !onStop {
-			time.Sleep(60 * time.Millisecond) // a few ticks after the jump
+			// a tick after the jump: polled, a starved goroutine is late
+			for dl := time.Now().Add(time.Second); time.Duration(w.gaps.max.Load()) < 1500*time.Millisecond && time.Now().Before(dl); {
+				time.Sleep(5 * time.Millisecond)
+			}
 			if got := time.Duration(w.gaps.max.Load()); got < 1500*time.Millisecond {
 				t.Errorf("stall seen on a tick: largest gap before the stop = %v, want at least 1.5s", got)
 			}
@@ -457,14 +467,14 @@ func TestDialWatchDescribesTheSocketsOfAPort1229(t *testing.T) {
 
 	// A dial nobody answers: a reserved address, whose SYN goes unanswered.
 	const unanswered = "10.255.255.1:41234"
-	w = watchDial896(unanswered, 600*time.Millisecond)
+	w = watchDial896(unanswered, time.Second)
 	t0 := time.Now()
-	c, err = net.DialTimeout("tcp", unanswered, 600*time.Millisecond)
+	c, err = net.DialTimeout("tcp", unanswered, time.Second)
 	if err == nil {
 		_ = c.Close()
 		t.Skip("something answers 10.255.255.1")
 	}
-	if time.Since(t0) < 500*time.Millisecond {
+	if time.Since(t0) < 900*time.Millisecond {
 		t.Skipf("the dial to %s failed at once, not on its timeout: %v", unanswered, err)
 	}
 	got = w.report()
@@ -473,4 +483,22 @@ func TestDialWatchDescribesTheSocketsOfAPort1229(t *testing.T) {
 		t.Errorf("report of an unanswered dial lacks the SYN_SENT row of the snapshot: %s", got)
 	}
 	w.end() // a second end after report is harmless
+}
+
+// TestDialWatchSnapshotsOnlyFromHalfTheTimeout1229: a row seen before half
+// the dial's timeout is not kept as the near-deadline snapshot (the dial has
+// only just begun, and a snapshot of its first moments would stand in for the
+// deadline's); the first snapshot tick is at 250 ms, of a 2 s timeout.
+func TestDialWatchSnapshotsOnlyFromHalfTheTimeout1229(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	w := watchDial896(ln.Addr().String(), dialTimeout896) // the LISTEN row is there from the start
+	time.Sleep(400 * time.Millisecond)                    // past the first snapshot tick
+	w.end()
+	if w.near != nil {
+		t.Errorf("a snapshot was kept at %v, before half of the %v timeout: %q", w.nearAt, dialTimeout896, w.near)
+	}
 }
