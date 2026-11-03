@@ -53,6 +53,7 @@ func TestFinishCloseCountsAMissingConnState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fd, other := socketPairFDs(t)
 			defer func() { _ = unix.Close(other) }()
+			fdID := fdIdentity1242(t, fd)
 			// Non-blocking so the close path's recv drain can never park on
 			// a socketpair that has no data and a peer still open.
 			_ = unix.SetNonblock(fd, true)
@@ -95,7 +96,13 @@ func TestFinishCloseCountsAMissingConnState(t *testing.T) {
 			if got := w.activeConns.Load(); got != 0 {
 				t.Errorf("activeConns = %d, want 0", got)
 			}
-			if !tc.nilState {
+			// The nil-state path ends in the close; the live one may stop short
+			// at the ring this unit Worker does not have. Not closed twice:
+			// the number is free once the first close is made (celeris#1242).
+			if tc.nilState && fdID.names(fd) {
+				t.Error("finishClose left the descriptor open")
+			}
+			if fdID.names(fd) {
 				_ = unix.Close(fd)
 			}
 		})

@@ -32,6 +32,8 @@ import (
 // (listenFDClosed, which PauseAccept waits on). Red with the ring's Close
 // removed, or with the listener's.
 func TestLeaveGroupAfterExitClosesTheRingAndTheListener884(t *testing.T) {
+	tr := installFDTrap1242(t)
+	t.Cleanup(func() { tr.verdict(t) })
 	ring, err := NewRing(64, 0, 0)
 	if err != nil {
 		skipOrFail656(t, "io_uring unavailable: %v", err)
@@ -52,11 +54,19 @@ func TestLeaveGroupAfterExitClosesTheRingAndTheListener884(t *testing.T) {
 	}
 	sa, _ := unix.Getsockname(lfd)
 	addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sa.(*unix.SockaddrInet4).Port}
+	// What leaveGroupAfterExit has closed is not closed again here: the
+	// numbers are free the moment it returns, and whatever opens next in the
+	// process gets one (celeris#1242).
+	var w *Worker
+	lfdID, ringID := fdIdentity1242(t, lfd), fdIdentity1242(t, ringFD)
+	ringOpen := func() bool { return ringNamed1242(ringID, ringFD) }
 	t.Cleanup(func() {
-		if fdOpen704(lfd) {
-			_ = unix.Close(lfd)
+		if lfdID.names(lfd) && (w == nil || w.listenFD >= 0) {
+			closeFD(lfd)
 		}
-		if fdOpen704(ringFD) {
+		// By the worker's own word, not by what the number names: rings may
+		// share one inode.
+		if w == nil || w.ring != nil {
 			_ = ring.Close()
 		}
 	})
@@ -67,17 +77,17 @@ func TestLeaveGroupAfterExitClosesTheRingAndTheListener884(t *testing.T) {
 		_ = c.Close()
 	}
 
-	w := &Worker{id: 3, ring: ring, listenFD: lfd, handoffLoss: &handoffLossStats{}}
+	w = &Worker{id: 3, ring: ring, listenFD: lfd, handoffLoss: &handoffLossStats{}}
 	w.leaveGroupAfterExit()
 
 	if _, err := net.DialTimeout("tcp", addr.String(), time.Second); !errors.Is(err, syscall.ECONNREFUSED) {
 		t.Errorf("a connect after leaveGroupAfterExit gave %v, want connection refused: the listener is still in the group", err)
 	}
-	if w.ring != nil || fdOpen704(ringFD) {
-		t.Errorf("the ring is not closed after leaveGroupAfterExit: w.ring=%v fd open=%v", w.ring != nil, fdOpen704(ringFD))
+	if w.ring != nil || ringOpen() {
+		t.Errorf("the ring is not closed after leaveGroupAfterExit: w.ring=%v fd open=%v", w.ring != nil, ringOpen())
 	}
-	if w.listenFD != -1 || fdOpen704(lfd) {
-		t.Errorf("the listener is not closed after leaveGroupAfterExit: listenFD=%d fd open=%v", w.listenFD, fdOpen704(lfd))
+	if w.listenFD != -1 || lfdID.names(lfd) {
+		t.Errorf("the listener is not closed after leaveGroupAfterExit: listenFD=%d fd open=%v", w.listenFD, lfdID.names(lfd))
 	}
 	if !w.listenFDClosed.Load() {
 		t.Error("listenFDClosed is not set after leaveGroupAfterExit: a pause would wait for it")
@@ -163,6 +173,8 @@ func TestGoexitedWorkerLeavesTheGroupBeforeItIsMarkedExited884(t *testing.T) {
 // be set; and a goroutine told by the pause's channel (the notify) must find it
 // set too. Red with leaveGroupAfterExit moved after the flag and the notify.
 func TestReportWorkerExitLeavesTheGroupBeforeTheFlag884(t *testing.T) {
+	tr := installFDTrap1242(t)
+	t.Cleanup(func() { tr.verdict(t) })
 	const rounds = 400
 	e := &Engine{}
 	early := 0
@@ -179,6 +191,7 @@ func TestReportWorkerExitLeavesTheGroupBeforeTheFlag884(t *testing.T) {
 			_ = unix.Close(lfd)
 			t.Fatal(err)
 		}
+		lfdID := fdIdentity1242(t, lfd)
 		w := &Worker{id: round, listenFD: lfd, handoffLoss: &handoffLossStats{}, pause: &deferlinger.PauseState{}}
 		changed := w.pause.Changed()
 		saw := make(chan bool, 1)
@@ -200,8 +213,12 @@ func TestReportWorkerExitLeavesTheGroupBeforeTheFlag884(t *testing.T) {
 		if !<-notified {
 			early++
 		}
-		if fdOpen704(lfd) {
-			_ = unix.Close(lfd)
+		if w.listenFD != -1 || lfdID.names(lfd) {
+			// Only a number that still names the listener: a closed one was
+			// taken by the next open in the process (celeris#1242).
+			if lfdID.names(lfd) {
+				closeFD(lfd)
+			}
 			t.Fatalf("round %d: reportWorkerExit returned with the listener open", round)
 		}
 	}

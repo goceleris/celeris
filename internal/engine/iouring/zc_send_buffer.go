@@ -5,8 +5,6 @@ package iouring
 import (
 	"sync"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // The send buffer of a SEND_ZC (celeris#812).
@@ -314,7 +312,7 @@ func (w *Worker) retainZCSendBufsAtShutdown() {
 				w.staleConnCQE(c, int(ud&fdMask), ud)
 			case udAccept:
 				if c.Res >= 0 && !w.fixedFiles {
-					_ = unix.Close(int(c.Res))
+					closeFD(int(c.Res))
 				}
 			}
 		}

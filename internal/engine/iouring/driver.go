@@ -243,7 +243,7 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	}
 	if refused != nil {
 		w.driverMu.Unlock()
-		_ = unix.Close(opFD)
+		closeFD(opFD)
 		return refused
 	}
 	if w.driverConns == nil {
@@ -790,7 +790,7 @@ func closeDriverFDs(conns []*driverConn, sem chan struct{}) {
 
 // closeFD is the close(2) of one engine descriptor; its error is dropped, as
 // everywhere the engine closes a duplicate it has no use for any more.
-func closeFD(fd int) { _ = unix.Close(fd) }
+func closeFD(fd int) { _ = closeFDErr(fd) }
 
 // closeUnderBound runs closeFn(fd) holding a token of sem: it waits for one,
 // and gives it back when closeFn returns. A goroutine waiting for a token

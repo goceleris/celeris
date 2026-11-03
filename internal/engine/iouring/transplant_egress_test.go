@@ -49,6 +49,7 @@ func TestFinishAsyncTransplantHoldsForInflightEgress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fd, other := socketPairFDs(t)
 			defer func() { _ = unix.Close(other) }()
+			fdID := fdIdentity1242(t, fd)
 
 			w := newDirtyTestWorker(fd)
 			tgt := &recordingTarget{}
@@ -83,10 +84,9 @@ func TestFinishAsyncTransplantHoldsForInflightEgress(t *testing.T) {
 			}
 			// A held-back transplant must leave the original fd open: the
 			// conn stays in place and is retried at its next park boundary.
-			_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
-			closed := err != nil
+			closed := !fdID.names(fd)
 			if closed != tc.wantClosed {
-				t.Errorf("original fd closed = %v, want %v (err=%v)", closed, tc.wantClosed, err)
+				t.Errorf("original fd closed = %v, want %v", closed, tc.wantClosed)
 			}
 			if !closed {
 				_ = unix.Close(fd)
