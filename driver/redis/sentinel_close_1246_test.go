@@ -123,6 +123,47 @@ func TestSentinelCloseWithASentinelClientInFlight1246(t *testing.T) {
 	}
 }
 
+// Every Close that returns, the one that closes and one that comes in while it
+// runs, returns with nothing left open.
+func TestSentinelConcurrentCloseWithAClientInFlight1246(t *testing.T) {
+	for name, srv := range loopServers(t) {
+		t.Run(name, func(t *testing.T) {
+			master := startFakeMaster(t)
+			sentinel := startFakeSentinel(t, master.Addr())
+			before := eventloop.StandaloneRefs()
+			entered, _ := holdLateClient(t, srv, "sentinel")
+			sc, err := NewSentinelClient(SentinelConfig{
+				MasterName:    "mymaster",
+				SentinelAddrs: []string{sentinel.Addr()},
+				DialTimeout:   2 * time.Second,
+				Engine:        srv,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			awaitClosed1246(t, entered, "the subscription to build its sentinel Client")
+			// refs[i] is what Close number i saw on return; wg and the slice
+			// are the only things the goroutines share.
+			var refs [4]int
+			var wg sync.WaitGroup
+			for i := range refs {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = sc.Close()
+					refs[i] = eventloop.StandaloneRefs()
+				}()
+			}
+			wg.Wait()
+			for i, got := range refs {
+				if got != before {
+					t.Errorf("Close %d returned with standalone loop references = %d, want %d", i, got, before)
+				}
+			}
+		})
+	}
+}
+
 // A failover is dialling the new master (its Client is built) when Close is
 // called: Close must not return with that Client open.
 func TestSentinelCloseWithAMasterClientInFlight1246(t *testing.T) {

@@ -78,6 +78,9 @@ type SentinelClient struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	loopDone chan struct{}
+	// closeDone is closed when the Close that won the race has finished, for
+	// the Close calls that lost it to wait on; nil as loopDone.
+	closeDone chan struct{}
 
 	// downGrace is sentinelDownGrace as of construction; zero (a client built
 	// without NewSentinelClient) means the default.
@@ -109,6 +112,7 @@ func NewSentinelClient(cfg SentinelConfig) (*SentinelClient, error) {
 		closeCh:   make(chan struct{}),
 		downGrace: sentinelDownGrace,
 		loopDone:  make(chan struct{}),
+		closeDone: make(chan struct{}),
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	masterAddr, err := s.discoverMaster()
@@ -152,10 +156,17 @@ var testHookClientBuilt atomic.Pointer[func(s *SentinelClient, kind string, ctx 
 // of its own holds a reference to the driver's standalone loop, which it would
 // otherwise keep for as long as it takes the work to notice (celeris#1246). The
 // dials in flight are cancelled, so this takes no longer than the work needs to
-// close what it holds. A concurrent or later Close returns at once.
+// close what it holds. A Close that comes in while another runs waits for it to
+// end, and a later one returns at once.
 func (s *SentinelClient) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
+		if s.closeDone != nil {
+			<-s.closeDone
+		}
 		return nil
+	}
+	if s.closeDone != nil {
+		defer close(s.closeDone)
 	}
 	close(s.closeCh)
 	if s.cancel != nil {
