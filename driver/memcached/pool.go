@@ -3,6 +3,7 @@ package memcached
 import (
 	"context"
 	"runtime"
+	"sync"
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
@@ -17,6 +18,10 @@ type memcachedPool struct {
 	cfg      Config
 	provider engine.EventLoopProvider
 	ownsLoop bool
+
+	// closeOnce makes Close idempotent: releasing the shared standalone loop
+	// twice would drop a reference that belongs to another client.
+	closeOnce sync.Once
 }
 
 // newDirectPool creates a pool that dials direct-mode conns (no mini-loop).
@@ -182,13 +187,16 @@ func (p *memcachedPool) discard(c *memcachedConn) {
 	p.pool.Discard(c)
 }
 
-// Close closes the pool and releases the event loop if owned.
+// Close closes the pool and releases the event loop if owned. It is safe to
+// call from several goroutines and more than once: the body runs once.
 func (p *memcachedPool) Close() error {
-	_ = p.pool.Close()
-	if p.ownsLoop && p.provider != nil {
-		eventloop.Release(p.provider)
-		p.provider = nil
-	}
+	p.closeOnce.Do(func() {
+		_ = p.pool.Close()
+		if p.ownsLoop && p.provider != nil {
+			eventloop.Release(p.provider)
+			p.provider = nil
+		}
+	})
 	return nil
 }
 
