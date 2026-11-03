@@ -37,6 +37,9 @@ type SentinelConfig struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	Engine       ServerProvider
+	// SocketBusyPoll is forwarded to each client the SentinelClient opens: see
+	// [Config].SocketBusyPoll.
+	SocketBusyPoll time.Duration
 }
 
 // sentinelDownGrace is how long watchFailover lets the PubSub of the sentinel
@@ -172,6 +175,9 @@ func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	if s.cfg.Engine != nil {
 		opts = append(opts, WithEngine(s.cfg.Engine))
 	}
+	if s.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
+	}
 	opts = append(opts, WithForceRESP2())
 	c, err := NewClient(sentinelAddr, opts...)
 	if err != nil {
@@ -224,6 +230,9 @@ func (s *SentinelClient) dialMaster(addr string) (*Client, error) {
 	}
 	if s.cfg.Engine != nil {
 		opts = append(opts, WithEngine(s.cfg.Engine))
+	}
+	if s.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
 	}
 	c, err := NewClient(addr, opts...)
 	if err != nil {
@@ -369,6 +378,9 @@ func (s *SentinelClient) connectSentinelFrom(start int) (*sentinelConn, error) {
 		}
 		if s.cfg.Engine != nil {
 			opts = append(opts, WithEngine(s.cfg.Engine))
+		}
+		if s.cfg.SocketBusyPoll > 0 {
+			opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
 		}
 		opts = append(opts, WithForceRESP2())
 		c, err := NewClient(addr, opts...)

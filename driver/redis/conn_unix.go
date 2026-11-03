@@ -44,7 +44,7 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 		_ = file.Close()
 		return nil, err
 	}
-	tuneConnSocket(fd)
+	tuneConnSocket(fd, eventloop.BusyPoll(cfg.Engine, cfg.SocketBusyPoll))
 	_ = tcp.Close()
 
 	nw := prov.NumWorkers()

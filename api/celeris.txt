@@ -195,6 +195,7 @@ method (*Server) Pre(...HandlerFunc) *Server
 method (*Server) ResumeAccept() error
 method (*Server) Routes() []RouteInfo
 method (*Server) Shutdown(context.Context) error
+method (*Server) SocketBusyPoll() time.Duration
 method (*Server) Start() error
 method (*Server) StartWithContext(context.Context) error
 method (*Server) StartWithListener(net.Listener) error
