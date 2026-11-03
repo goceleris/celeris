@@ -64,11 +64,17 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	// locked-M Gs cleanly through Go netpoll.
 	if wl := provider.WorkerLoop(0); wl != nil {
 		if _, ok := wl.(syncRoundTripper); !ok {
+			// The direct pool keeps no loop: give back the reference Resolve
+			// took when the provider is the standalone one.
+			eventloop.Release(provider)
 			pool := newDirectPool(cfg)
 			return &Client{cfg: cfg, pool: pool}, nil
 		}
 	}
-	ownsLoop := false
+	// The Client owns the loop when Resolve took a reference to the standalone
+	// one: the engine of a server that has not started or has no loop of its
+	// own (std) is answered with it.
+	ownsLoop := eventloop.IsStandalone(provider)
 	pool := newPool(cfg, provider, ownsLoop)
 	return &Client{cfg: cfg, pool: pool}, nil
 }
