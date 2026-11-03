@@ -834,7 +834,7 @@ type Worker struct {
 	refuseRecv bool
 	// unreadMarked is true when the snapshot of the requests in the kernel, taken
 	// once at the first pass of the send drain (markUnreadAtShutdown,
-	// celeris#1229), marked a conn (cs.unreadAtShutdown). Worker thread only.
+	// celeris#1229), marked a conn (cs.shutdownUnread). Worker thread only.
 	unreadMarked bool
 	// gateSwept is set by the first pass of the gate (closeIdleH1): that pass
 	// asks the kernel for the receive queue of the conns it would close, and

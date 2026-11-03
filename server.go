@@ -670,11 +670,13 @@ func (s *Server) cancelListen() {
 //     fragment of a head, or a bare CRLF, found there is read and is a request in
 //     progress like any other: it holds Shutdown until the request completes or
 //     the budget ends, on epoll and io_uring alike. An io_uring worker with
-//     nothing to send looks once, when it sees the Shutdown, and waits only for
-//     the connections that had such a head then, with its listener closed: a
-//     connection that arrives afterwards does not hold it, however many keep
-//     coming (celeris#1229), and a request it sends is dropped. A
-//     head that reaches the kernel after the engine's gate has looked at the
+//     nothing to send looks once, when its send drain begins (after the wait for
+//     the HTTP/2 handlers), and waits only for the connections that had such a
+//     head then, with its listener closed: a connection that arrives afterwards
+//     does not hold it, however many keep coming (celeris#1229), and a request
+//     it sends is dropped. The head is answered on a connection the engine has
+//     accepted: one still in the accept queue when the listener closes gets a
+//     reset, on epoll as well. A head that reaches the kernel after the engine's gate has looked at the
 //     connection is refused, as above. On std net/http reads the head after
 //     Shutdown began and drops the request: the connection is closed without an
 //     answer, and reset if body bytes are still unread (a small body, 2 KiB

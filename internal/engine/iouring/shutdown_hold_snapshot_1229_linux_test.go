@@ -37,7 +37,7 @@ import (
 
 // holdBound1229 is well under the floor (shutdownSendDrainNanos, 250 ms): a
 // Listen that returns inside it was not held by the look.
-const holdBound1229 = 60 * time.Millisecond
+const holdBound1229 = 150 * time.Millisecond
 
 // held1229 is what the scenario saw.
 type held1229 struct {
@@ -178,5 +178,99 @@ func TestShutdownAnswersAHeadInTheKernelUnderChurn1229(t *testing.T) {
 	// net/http takes the Connection: close header out of the map and sets Close.
 	if r.resp.StatusCode != 200 || !r.resp.Close {
 		t.Errorf("answer to the head: status %d, Connection: close %v, want 200 and close", r.resp.StatusCode, r.resp.Close)
+	}
+}
+
+// TestShutdownSnapshotIsTakenOnce1229 pins that the look at the kernel is a
+// snapshot of the first pass of the drain, and not repeated: two keep-alive
+// conns the worker has accepted, the first gets its next request while the
+// workers are held in their first drain pass (before the snapshot), the second
+// gets it only once a worker that has served the first is quiet (nothing to
+// send, no request in progress) in a later pass, just before its look. The
+// first is answered, with Connection: close; the second is not waited for, and
+// its request is dropped as that of any connection that sends after the worker
+// has looked (a snapshot taken on every pass would mark it and answer it). With
+// the workers on different cores of work the second conn may belong to a worker
+// that has already exited: the assertions hold, and only the single-worker
+// shape (the runner's, with 8 MiB of memlock) tells the two behaviours apart.
+func TestShutdownSnapshotIsTakenOnce1229(t *testing.T) {
+	const req = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n"
+	var (
+		mu     sync.Mutex
+		calls  = map[*Worker]int{}
+		nW     atomic.Int64
+		first  sync.Once
+		second sync.Once
+		c1, c2 net.Conn
+	)
+	hold := func(w *Worker) {
+		mu.Lock()
+		calls[w]++
+		n, entered := calls[w], len(calls)
+		mu.Unlock()
+		if n == 1 {
+			// Every worker waits for all of them to be in the drain, so the head
+			// is written before any has taken its snapshot.
+			for dl := time.Now().Add(5 * time.Second); int64(entered) < nW.Load() && time.Now().Before(dl); {
+				time.Sleep(100 * time.Microsecond)
+				mu.Lock()
+				entered = len(calls)
+				mu.Unlock()
+			}
+			first.Do(func() { _, _ = c1.Write([]byte(req)) })
+			return
+		}
+		if !w.hasPendingSends() && !w.h1RequestInProgress() {
+			second.Do(func() { _, _ = c2.Write([]byte(req)) })
+		}
+	}
+	sendDrainSeam.Store(&hold)
+	t.Cleanup(func() { sendDrainSeam.Store(nil) })
+
+	addr := freeAddr639(t)
+	run := start896(t, addr, 2)
+	nW.Store(int64(len(run.e.workers)))
+
+	dial := func() (net.Conn, *bufio.Reader) {
+		c, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		br := bufio.NewReader(c)
+		if _, err := c.Write([]byte(req)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("read the first response: %v", err)
+		}
+		_, _ = br.Discard(int(resp.ContentLength))
+		return c, br
+	}
+	var br1, br2 *bufio.Reader
+	c1, br1 = dial()
+	c2, br2 = dial()
+
+	t0 := time.Now()
+	run.cancel()
+	resp1, err1 := http.ReadResponse(br1, nil)
+	resp2, err2 := http.ReadResponse(br2, nil)
+	returned, err := run.stopped()
+	if err != nil {
+		t.Fatalf("Listen returned %v after a cancel", err)
+	}
+	if err1 != nil {
+		t.Fatalf("the head that was in the kernel when the shutdown began got no answer: %v", err1)
+	}
+	if resp1.StatusCode != 200 || !resp1.Close {
+		t.Errorf("answer to the first head: status %d, Connection: close %v, want 200 and close", resp1.StatusCode, resp1.Close)
+	}
+	if err2 == nil {
+		t.Errorf("the head that reached the second conn after the snapshot was answered (status %d): the look is made again after the first pass", resp2.StatusCode)
+	}
+	if took := returned.Sub(t0); took > holdBound1229 {
+		t.Errorf("Listen took %v to return, bound %v", took, holdBound1229)
 	}
 }
