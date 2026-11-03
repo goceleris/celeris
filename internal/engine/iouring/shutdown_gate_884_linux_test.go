@@ -254,8 +254,10 @@ func gateRig884(t *testing.T, n int) (*Worker, []*connState, []int) {
 		// recv-cancel's completion, which no loop runs here. A conn a pass
 		// closed, or a test closed itself, is not closed again: its number is
 		// free, and the next open in the process takes it (celeris#1242).
-		for _, cs := range css {
-			closeFD(cs.fd)
+		for i, cs := range css {
+			if ids[i].names(cs.fd) {
+				closeFD(cs.fd)
+			}
 		}
 	})
 	return w, css, peers
@@ -342,7 +344,7 @@ func TestGatePassWaitsForTheKernelSendQueue884(t *testing.T) {
 	w.connCount--
 	closeFD(old.fd)
 	_ = peers
-	_ = fdIdentity1242(t, local)
+	localID := fdIdentity1242(t, local)
 	cs := gateConn884(local)
 	cs.generation = 9
 	cs.buf = make([]byte, 4096)
@@ -384,7 +386,9 @@ func TestGatePassWaitsForTheKernelSendQueue884(t *testing.T) {
 		t.Error("the pass left an idle conn with an empty send queue open")
 	}
 	// The pass closed it when the test passes: not closed again.
-	closeFD(local)
+	if localID.names(local) {
+		closeFD(local)
+	}
 }
 
 // TestGateReadsOnNeverReadsH1StateOfAGoroutinesConn884 is the regression test of

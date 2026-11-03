@@ -50,14 +50,23 @@ func newWakeWorker655(t *testing.T) (*Worker, int) {
 }
 
 // socketFor655 returns one end of a socketpair. Both ends are closed by
-// cleanup; nothing under test closes a driver-registered fd.
+// cleanup, unless a shutdown under test closed one already.
 func socketFor655(t *testing.T) int {
 	t.Helper()
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatalf("socketpair: %v", err)
 	}
-	t.Cleanup(func() { _ = unix.Close(pair[0]); _ = unix.Close(pair[1]) })
+	ids := [2]fdID1242{fdIdentity1242(t, pair[0]), fdIdentity1242(t, pair[1])}
+	t.Cleanup(func() {
+		// A shutdown that ran over a conn on it closed it already: not again,
+		// the number is free by then (celeris#1242).
+		for i, fd := range pair {
+			if ids[i].names(fd) {
+				_ = unix.Close(fd)
+			}
+		}
+	})
 	return pair[0]
 }
 

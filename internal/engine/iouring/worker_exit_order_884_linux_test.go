@@ -60,10 +60,10 @@ func TestLeaveGroupAfterExitClosesTheRingAndTheListener884(t *testing.T) {
 	var w *Worker
 	lfdID, ringID := fdIdentity1242(t, lfd), fdIdentity1242(t, ringFD)
 	t.Cleanup(func() {
-		if fdOpen704(lfd) {
+		if lfdID.names(lfd) && (w == nil || w.listenFD >= 0) {
 			closeFD(lfd)
 		}
-		if fdOpen704(ringFD) {
+		if ringID.names(ringFD) && (w == nil || w.ring != nil) {
 			_ = ring.Close()
 		}
 	})
@@ -213,7 +213,9 @@ func TestReportWorkerExitLeavesTheGroupBeforeTheFlag884(t *testing.T) {
 		if w.listenFD != -1 || lfdID.names(lfd) {
 			// Only a number that still names the listener: a closed one was
 			// taken by the next open in the process (celeris#1242).
-			closeFD(lfd)
+			if lfdID.names(lfd) {
+				closeFD(lfd)
+			}
 			t.Fatalf("round %d: reportWorkerExit returned with the listener open", round)
 		}
 	}

@@ -662,10 +662,11 @@ func TestDriverFailureCloseCompletionSparesConnOnReusedNumber(t *testing.T) {
 	select {
 	case err := <-n.closed:
 		t.Errorf("N: onClose(%v) fired, with N never unregistered: a close completion of A's reached it (celeris#707)", err)
+		_ = unix.Close(n.fd)
 	default:
+		// Closes n.fd and its peer.
 		n.unregisterAndWait(t, wl)
 	}
-	_ = unix.Close(n.fd)
 	q.d.unregisterAndWait(t, wl)
 	p.d.unregisterAndWait(t, wl)
 }
