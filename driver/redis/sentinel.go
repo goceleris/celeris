@@ -99,6 +99,15 @@ type sentinelConn struct {
 // first responsive sentinel, discovers the master address, and dials the
 // master. A background goroutine subscribes to +switch-master on sentinel
 // connections for automatic failover handling.
+//
+// The query to each sentinel for the master address, and the dial of the master
+// with its ROLE check, are each bound by [SentinelConfig].DialTimeout: a sentinel
+// that accepts the connection and does not answer is given up after it and the
+// next address is tried, so construction takes at most (N+1) x DialTimeout for N
+// sentinels (15 s for two at the default 5 s), and a sentinel that is slower than
+// DialTimeout to answer is skipped. When it fails, the error holds the error of
+// every sentinel that was tried (see [errors.Join]); one that timed out satisfies
+// errors.Is(err, context.DeadlineExceeded).
 func NewSentinelClient(cfg SentinelConfig) (*SentinelClient, error) {
 	if cfg.MasterName == "" {
 		return nil, errors.New("celeris-redis: SentinelConfig.MasterName is required")
@@ -229,23 +238,33 @@ func (s *SentinelClient) getClient() (*Client, error) {
 
 // discoverMaster queries sentinels for the master address.
 func (s *SentinelClient) discoverMaster() (string, error) {
-	var lastErr error
+	var errs []error
 	for _, addr := range s.cfg.SentinelAddrs {
 		masterAddr, err := s.queryMaster(addr)
 		if err != nil {
-			lastErr = err
+			errs = append(errs, err)
 			continue
 		}
 		return masterAddr, nil
 	}
-	return "", fmt.Errorf("no responsive sentinel for master %q: %w", s.cfg.MasterName, lastErr)
+	return "", fmt.Errorf("no responsive sentinel for master %q: %w", s.cfg.MasterName, errors.Join(errs...))
+}
+
+// withCtxErr makes a failure that came with the end of ctx recognizable as it:
+// a direct-mode Client reports the deadline of its socket (os.ErrDeadlineExceeded),
+// not the context's.
+func withCtxErr(ctx context.Context, err error) error {
+	if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
+		return fmt.Errorf("%w: %w", cerr, err)
+	}
+	return err
 }
 
 // queryMaster connects to a single sentinel and asks for the master address. The
 // connect, the handshake and the reply together are bound by DialTimeout, and by
 // the SentinelClient's lifecycle context: a sentinel that accepts the connection
 // and never answers fails this query after DialTimeout and discoverMaster goes on
-// to the next address (celeris#1248).
+// to the next address, keeping the error of each (celeris#1248).
 func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	var opts []Option
 	opts = append(opts, WithDialTimeout(s.cfg.DialTimeout))
@@ -269,7 +288,7 @@ func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	defer cancel()
 	v, err := c.Do(ctx, "SENTINEL", "get-master-addr-by-name", s.cfg.MasterName)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("sentinel %s: %w", sentinelAddr, withCtxErr(ctx, err))
 	}
 	if v.Type == protocol.TyNull {
 		return "", fmt.Errorf("sentinel %s: master %q not found", sentinelAddr, s.cfg.MasterName)
@@ -328,7 +347,7 @@ func (s *SentinelClient) dialMaster(addr string) (*Client, error) {
 	v, err := c.Do(ctx, "ROLE")
 	if err != nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("ROLE failed: %w", err)
+		return nil, fmt.Errorf("ROLE failed: %w", withCtxErr(ctx, err))
 	}
 	if v.Type != protocol.TyArray || len(v.Array) < 1 {
 		_ = c.Close()

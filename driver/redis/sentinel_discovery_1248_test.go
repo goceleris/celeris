@@ -1,7 +1,11 @@
 package redis
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +58,9 @@ func TestNewSentinelClientFailsWhenTheOnlySentinelNeverAnswers1248(t *testing.T)
 			if hang.accepted.Load() == 0 {
 				t.Error("the sentinel was never contacted")
 			}
+			if !strings.Contains(err.Error(), "no responsive sentinel") || !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("err = %v, want a discovery failure that wraps context.DeadlineExceeded", err)
+			}
 			wantRefs(t, before, "after the failed discovery")
 		})
 	}
@@ -91,14 +98,27 @@ func TestNewSentinelClientMovesOnFromASentinelThatNeverAnswers1248(t *testing.T)
 	}
 }
 
-// The other round trip NewSentinelClient makes, the handshake and ROLE of the
-// master the sentinel names, was already bound by DialTimeout: a master that
-// accepts and never answers fails the construction, and its Client is closed once.
-func TestNewSentinelClientFailsWhenTheMasterNeverAnswers1248(t *testing.T) {
+// The master the sentinel names answers the handshake and never answers ROLE: the
+// ROLE reply is bound by DialTimeout too (without the bound, nothing ends the
+// dial), the construction fails, and the master's Client is closed once.
+func TestNewSentinelClientFailsWhenTheMasterNeverAnswersROLE1248(t *testing.T) {
 	for name, srv := range dialModes1246(t) {
 		t.Run(name, func(t *testing.T) {
-			hang := startHangServer1246(t)
-			sentinel := startFakeSentinel(t, hang.ln.Addr().String())
+			var roles atomic.Int32
+			master := startFakeRedis(t, func(cmd []string, w *bufio.Writer) {
+				if len(cmd) == 0 {
+					return
+				}
+				switch strings.ToUpper(cmd[0]) {
+				case "HELLO":
+					handleHELLO(w, 3)
+				case "ROLE":
+					roles.Add(1) // never answered
+				default:
+					writeSimple(w, "OK")
+				}
+			})
+			sentinel := startFakeSentinel(t, master.Addr())
 			before := eventloop.StandaloneRefs()
 			sc, err := newSentinelWithin1248(t, SentinelConfig{
 				MasterName:    "mymaster",
@@ -108,9 +128,48 @@ func TestNewSentinelClientFailsWhenTheMasterNeverAnswers1248(t *testing.T) {
 			})
 			if err == nil {
 				_ = sc.Close()
-				t.Fatal("NewSentinelClient succeeded with a master that never answers")
+				t.Fatal("NewSentinelClient succeeded with a master that never answers ROLE")
 			}
-			wantRefs(t, before, "after the failed dial of the master")
+			if roles.Load() == 0 {
+				t.Error("the master never received ROLE: the handshake bound ended the dial, not the ROLE one")
+			}
+			if !strings.Contains(err.Error(), "ROLE failed") || !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("err = %v, want a ROLE failure that wraps context.DeadlineExceeded", err)
+			}
+			wantRefs(t, before, "after the failed ROLE of the master")
+		})
+	}
+}
+
+// The error of a failed discovery holds the error of every sentinel that was
+// tried: the first answers "not found" and the second never answers, and neither
+// is lost.
+func TestNewSentinelClientKeepsTheErrorOfEverySentinel1248(t *testing.T) {
+	for name, srv := range dialModes1246(t) {
+		t.Run(name, func(t *testing.T) {
+			noMaster := startFakeSentinel(t, "")
+			hang := startHangServer1246(t)
+			before := eventloop.StandaloneRefs()
+			sc, err := newSentinelWithin1248(t, SentinelConfig{
+				MasterName:    "mymaster",
+				SentinelAddrs: []string{noMaster.Addr(), hang.ln.Addr().String()},
+				DialTimeout:   200 * time.Millisecond,
+				Engine:        srv,
+			})
+			if err == nil {
+				_ = sc.Close()
+				t.Fatal("NewSentinelClient succeeded with no master")
+			}
+			msg := err.Error()
+			for _, want := range []string{"no responsive sentinel", `master "mymaster" not found`, hang.ln.Addr().String()} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("err = %q, want it to mention %q", msg, want)
+				}
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("err = %v, want it to wrap context.DeadlineExceeded (the sentinel that never answers)", err)
+			}
+			wantRefs(t, before, "after the failed discovery")
 		})
 	}
 }
