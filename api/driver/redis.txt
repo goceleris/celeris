@@ -34,6 +34,7 @@ func WithPassword(string) Option
 func WithPoolSize(int) Option
 func WithProto(int) Option
 func WithReadTimeout(time.Duration) Option
+func WithSocketBusyPoll(time.Duration) Option
 func WithUsername(string) Option
 func WithWorker(context.Context, int) context.Context
 func WithWriteTimeout(time.Duration) Option
@@ -292,9 +293,10 @@ type ClusterConfig struct, PoolSize int
 type ClusterConfig struct, ReadOnly bool
 type ClusterConfig struct, ReadTimeout time.Duration
 type ClusterConfig struct, RouteByLatency bool
+type ClusterConfig struct, SocketBusyPoll time.Duration
 type ClusterConfig struct, Username string
 type ClusterConfig struct, WriteTimeout time.Duration
-type ClusterConfig struct, field order Addrs, Password, Username, PoolSize, MaxIdlePerWorker, DialTimeout, ReadTimeout, WriteTimeout, MaxRedirects, RouteByLatency, ReadOnly, Engine
+type ClusterConfig struct, field order Addrs, Password, Username, PoolSize, MaxIdlePerWorker, DialTimeout, ReadTimeout, WriteTimeout, MaxRedirects, RouteByLatency, ReadOnly, Engine, SocketBusyPoll
 type ClusterConfig struct, not comparable
 type ClusterPipeline struct
 type ClusterPipeline struct, not comparable
@@ -317,9 +319,10 @@ type Config struct, Password string
 type Config struct, PoolSize int
 type Config struct, Proto int
 type Config struct, ReadTimeout time.Duration
+type Config struct, SocketBusyPoll time.Duration
 type Config struct, Username string
 type Config struct, WriteTimeout time.Duration
-type Config struct, field order Addr, Password, Username, DB, DialTimeout, ReadTimeout, WriteTimeout, PoolSize, MaxIdlePerWorker, MaxLifetime, MaxIdleTime, HealthCheckInterval, Proto, ForceRESP2, Engine, OnPush
+type Config struct, field order Addr, Password, Username, DB, DialTimeout, ReadTimeout, WriteTimeout, PoolSize, MaxIdlePerWorker, MaxLifetime, MaxIdleTime, HealthCheckInterval, Proto, ForceRESP2, Engine, OnPush, SocketBusyPoll
 type Config struct, not comparable
 type FloatCmd struct
 type FloatCmd struct, unexported fields
@@ -362,9 +365,10 @@ type SentinelConfig struct, PoolSize int
 type SentinelConfig struct, ReadTimeout time.Duration
 type SentinelConfig struct, SentinelAddrs []string
 type SentinelConfig struct, SentinelPassword string
+type SentinelConfig struct, SocketBusyPoll time.Duration
 type SentinelConfig struct, Username string
 type SentinelConfig struct, WriteTimeout time.Duration
-type SentinelConfig struct, field order MasterName, SentinelAddrs, Password, SentinelPassword, Username, DB, PoolSize, MaxIdlePerWorker, DialTimeout, ReadTimeout, WriteTimeout, Engine
+type SentinelConfig struct, field order MasterName, SentinelAddrs, Password, SentinelPassword, Username, DB, PoolSize, MaxIdlePerWorker, DialTimeout, ReadTimeout, WriteTimeout, Engine, SocketBusyPoll
 type SentinelConfig struct, not comparable
 type ServerProvider = github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider
 type StatusCmd struct

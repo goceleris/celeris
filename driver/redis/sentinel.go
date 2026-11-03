@@ -37,6 +37,9 @@ type SentinelConfig struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	Engine       ServerProvider
+	// SocketBusyPoll is forwarded to each client the SentinelClient opens: see
+	// [Config].SocketBusyPoll.
+	SocketBusyPoll time.Duration
 }
 
 // sentinelDownGrace is how long watchFailover lets the PubSub of the sentinel
@@ -172,6 +175,9 @@ func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	if s.cfg.Engine != nil {
 		opts = append(opts, WithEngine(s.cfg.Engine))
 	}
+	if s.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
+	}
 	opts = append(opts, WithForceRESP2())
 	c, err := NewClient(sentinelAddr, opts...)
 	if err != nil {
@@ -224,6 +230,9 @@ func (s *SentinelClient) dialMaster(addr string) (*Client, error) {
 	}
 	if s.cfg.Engine != nil {
 		opts = append(opts, WithEngine(s.cfg.Engine))
+	}
+	if s.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
 	}
 	c, err := NewClient(addr, opts...)
 	if err != nil {
@@ -369,6 +378,9 @@ func (s *SentinelClient) connectSentinelFrom(start int) (*sentinelConn, error) {
 		}
 		if s.cfg.Engine != nil {
 			opts = append(opts, WithEngine(s.cfg.Engine))
+		}
+		if s.cfg.SocketBusyPoll > 0 {
+			opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
 		}
 		opts = append(opts, WithForceRESP2())
 		c, err := NewClient(addr, opts...)
@@ -775,9 +787,11 @@ func (s *SentinelClient) Publish(ctx context.Context, channel, message string) (
 // and the reconnect replays the channels. The reconnect dials the master the
 // SentinelClient has at that moment, so after a failover the PubSub follows the
 // new master instead of retrying the old one, once its conn to the old master
-// has dropped (a conn that stays up, on a loop shared with another Client or
-// WithEngine, is not moved). When the SentinelClient is closed, a PubSub whose
-// conn is down (or goes down afterwards) gives up: Channel() is closed.
+// has dropped (a conn that stays up, on a loop shared with another Client that is
+// still open or on that of a started server that runs its own event loop, is
+// not moved). When the SentinelClient is
+// closed, a PubSub whose conn is down (or goes down afterwards) gives up:
+// Channel() is closed.
 func (s *SentinelClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	c, err := s.getClient()
 	if err != nil {

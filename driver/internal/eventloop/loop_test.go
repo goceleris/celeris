@@ -93,3 +93,52 @@ func TestResolveNilServer(t *testing.T) {
 	}
 	Release(got)
 }
+
+// celeris#1238: IsStandalone says which Resolve took a reference that a Release
+// has to give back, and StandaloneRefs counts them.
+func TestIsStandaloneAndRefs1238(t *testing.T) {
+	resetStandaloneForTest()
+	t.Cleanup(resetStandaloneForTest)
+
+	mock := &mockProvider{}
+	fromServer, err := Resolve(&fakeServer{p: mock})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if IsStandalone(fromServer) {
+		t.Error("a server's provider reported as the standalone loop")
+	}
+	if IsStandalone(nil) {
+		t.Error("nil reported as the standalone loop")
+	}
+	if got := StandaloneRefs(); got != 0 {
+		t.Errorf("references after a server-backed Resolve = %d, want 0", got)
+	}
+
+	// A server with no loop of its own is answered with the standalone loop.
+	a, err := Resolve(&fakeServer{p: nil})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	b, err := Resolve(nil)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !IsStandalone(a) || !IsStandalone(b) {
+		t.Error("the standalone loop not reported as standalone")
+	}
+	if got := StandaloneRefs(); got != 2 {
+		t.Errorf("references = %d, want 2", got)
+	}
+	Release(a)
+	if got := StandaloneRefs(); got != 1 {
+		t.Errorf("references after one Release = %d, want 1", got)
+	}
+	Release(b)
+	if got := StandaloneRefs(); got != 0 {
+		t.Errorf("references after the last Release = %d, want 0", got)
+	}
+	if IsStandalone(a) {
+		t.Error("a released loop reported as the standalone loop")
+	}
+}

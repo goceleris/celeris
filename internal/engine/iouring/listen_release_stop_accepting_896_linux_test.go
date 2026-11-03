@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,6 +49,7 @@ type holdHandler896 struct {
 	release chan struct{}
 	big     []byte       // the /big response; nil unless the test serves it
 	running atomic.Int64 // /hold handlers that have started (started drops past its 4)
+	once    sync.Once    // unblock's
 }
 
 func newHoldHandler896(bigBody bool) *holdHandler896 {
@@ -57,6 +59,10 @@ func newHoldHandler896(bigBody bool) *holdHandler896 {
 	}
 	return h
 }
+
+// unblock releases the /hold handlers, once however often it is called: a test
+// calls it, and so does the cleanup of the engine that serves them.
+func (h *holdHandler896) unblock() { h.once.Do(func() { close(h.release) }) }
 
 func (h *holdHandler896) HandleStream(_ context.Context, s *stream.Stream) error {
 	if s.ResponseWriter == nil {
@@ -117,11 +123,10 @@ func startHold896(t *testing.T, addr string, workers int, writeTimeout time.Dura
 			skipOrFail656(t, "New: %v", err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- e.Listen(ctx) }()
+		done, returned := listenAsync896(ctx, e)
 		for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); {
 			if e.Addr() != nil {
-				run = &engineRun896{e: e, cancel: cancel, done: done}
+				run = &engineRun896{e: e, cancel: cancel, done: done, returned: returned}
 				return nil
 			}
 			select {
@@ -142,17 +147,43 @@ func startHold896(t *testing.T, addr string, workers int, writeTimeout time.Dura
 		}
 		t.Fatalf("engine start on %s: %v", addr, err)
 	}
+	// A handler of h that the test holds is released before Listen is waited
+	// for: it waits for the HTTP/2 stream handlers on the worker pool.
+	var release func()
+	if hh, ok := h.(*holdHandler896); ok {
+		release = hh.unblock
+	}
+	run.reapAtCleanup(t, release)
+	// Shown only if the test fails: a dial that times out on a Coverage run
+	// (celeris#1229) names no tier, and the engine's own log is discarded.
+	t.Logf("celeris1229 engine on %s: %s", addr, describeEngine896(run.e))
 	return run
+}
+
+// describeEngine896 names the tier the engine's workers run on, for the
+// failure message of a dial that timed out (dialWatch896 gives the kernel's
+// side).
+func describeEngine896(e *Engine) string {
+	e.mu.Lock()
+	ws := e.workers
+	e.mu.Unlock()
+	tier := "no workers"
+	if len(ws) > 0 {
+		tier = ws[0].tier.Tier().String()
+	}
+	return fmt.Sprintf("tier=%s workers=%d", tier, len(ws))
 }
 
 // h2Request896 opens an HTTP/2 connection to addr (prior knowledge) and sends
 // GET path on stream 1, without reading any response.
 func h2Request896(t *testing.T, addr, path string) net.Conn {
 	t.Helper()
-	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	watch := watchDial896(addr, dialTimeout896)
+	c, err := net.DialTimeout("tcp", addr, dialTimeout896)
 	if err != nil {
-		t.Fatalf("dial %s: %v", addr, err)
+		t.Fatalf("dial %s: %v (%s)", addr, err, watch.report())
 	}
+	watch.end()
 	_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := c.Write([]byte(http2.ClientPreface)); err != nil {
 		t.Fatalf("write preface: %v", err)
@@ -179,7 +210,7 @@ func h2Request896(t *testing.T, addr, path string) net.Conn {
 func seam896(t *testing.T, full bool) *atomic.Int64 {
 	t.Helper()
 	var calls atomic.Int64
-	cancelAcceptSeam = func(w *Worker, _ int) {
+	setCancelAcceptSeam1229(t, func(w *Worker, _ int) {
 		if full {
 			for {
 				sqe := w.ring.GetSQE()
@@ -190,8 +221,7 @@ func seam896(t *testing.T, full bool) *atomic.Int64 {
 			}
 		}
 		calls.Add(1)
-	}
-	t.Cleanup(func() { cancelAcceptSeam = nil })
+	})
 	return &calls
 }
 
@@ -269,6 +299,7 @@ func h2Iteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
 	addr := freeAddr639(t)
 	h := newHoldHandler896(false)
 	run := startHold896(t, addr, 2, 0, h)
+	defer run.reap(t)
 	c := h2Request896(t, addr, "/hold")
 	defer func() { _ = c.Close() }()
 	select {
@@ -279,7 +310,7 @@ func h2Iteration896(t *testing.T, calls *atomic.Int64) (string, time.Time) {
 	before := calls.Load()
 	run.cancel()
 	waitCalls896(t, calls, before)
-	close(h.release)
+	h.unblock()
 	returned, err := run.stopped()
 	if err != nil {
 		t.Fatalf("Listen returned %v after a cancel", err)
@@ -304,10 +335,13 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	addr := freeAddr639(t)
 	h := newHoldHandler896(true)
 	run := startHold896(t, addr, 2, -1, h)
-	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	defer run.reap(t)
+	watch := watchDial896(addr, dialTimeout896)
+	c, err := net.DialTimeout("tcp", addr, dialTimeout896)
 	if err != nil {
-		t.Fatalf("dial %s: %v", addr, err)
+		t.Fatalf("dial %s: %v (%s)", addr, err, watch.report())
 	}
+	watch.end()
 	defer func() { _ = c.Close() }()
 	if _, err := c.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatalf("write: %v", err)

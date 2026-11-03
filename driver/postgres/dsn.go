@@ -51,6 +51,10 @@ type Options struct {
 	// distinguish "user opted out" from "field was never set" before
 	// flipping the default to true.
 	autoCacheStatementsExplicit bool
+	// busyPoll is the SO_BUSY_POLL budget dialConn puts on the connection
+	// (Linux); 0 puts none. The Connector and the Pool set it, from the
+	// server's Config.SocketBusyPoll under WithEngine (celeris#1228).
+	busyPoll time.Duration
 	// Application is copied into the "application_name" startup parameter.
 	Application string
 	// SSLMode is the parsed sslmode value. "disable" and "prefer" are

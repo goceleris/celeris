@@ -48,6 +48,11 @@ type rpNode struct {
 	conns    map[*rpConn]struct{}
 	dead     bool
 	accepted int
+	// severed makes the node accept conns and close them at once (a node that
+	// is gone but whose port still answers: the same network error as a dead
+	// one on every OS, where a dial to a closed port waits to be refused for
+	// seconds on Windows).
+	severed bool
 	// hang makes the node accept conns and never answer them (a blackholed
 	// host: a dial that waits for the HELLO reply).
 	hang bool
@@ -257,6 +262,11 @@ func (n *rpNode) accept() {
 		}
 		n.accepted++
 		hang := n.hang
+		if n.severed {
+			n.mu.Unlock()
+			_ = nc.Close()
+			continue
+		}
 		c := &rpConn{nc: nc, w: bufio.NewWriter(nc), proto: 2,
 			subs: map[string]struct{}{}, psubs: map[string]struct{}{}, ssubs: map[string]struct{}{}}
 		n.conns[c] = struct{}{}
@@ -276,6 +286,19 @@ func (n *rpNode) kill() {
 	n.conns = map[*rpConn]struct{}{}
 	n.mu.Unlock()
 	_ = n.ln.Close()
+	for c := range conns {
+		_ = c.nc.Close()
+	}
+}
+
+// sever closes every conn of the node and every later one at accept; the
+// listener stays open.
+func (n *rpNode) sever() {
+	n.mu.Lock()
+	n.severed = true
+	conns := n.conns
+	n.conns = map[*rpConn]struct{}{}
+	n.mu.Unlock()
 	for c := range conns {
 		_ = c.nc.Close()
 	}

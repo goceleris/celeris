@@ -2,6 +2,8 @@
 
 package iouring
 
+import "sync/atomic"
+
 // ringWaitMode names which of Worker.run's ring waits ended: the argument the
 // seam below receives, so a test can say which wait of the loop it answered.
 type ringWaitMode uint8
@@ -39,5 +41,8 @@ func (m ringWaitMode) String() string {
 // 5.19 to 6.1 kernel does for a CQ ring it cannot flush (a kernel the CI and
 // the laptop do not run), or counts the waits to prove an injection reached
 // the loop. Several workers call it, so a test keeps its state atomic. Nil in
-// production, where each wait costs one load of this variable.
-var ringWaitSeam func(w *Worker, mode ringWaitMode, err error) error
+// production, where each wait costs one load of this variable. An
+// atomic.Pointer, as h2WriteDrainSeam is, because a worker an earlier test left
+// running may still read it when a later test sets or restores it
+// (celeris#1229).
+var ringWaitSeam atomic.Pointer[func(w *Worker, mode ringWaitMode, err error) error]
