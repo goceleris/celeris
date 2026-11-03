@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -250,12 +251,15 @@ func (s *SentinelClient) discoverMaster() (string, error) {
 	return "", fmt.Errorf("no responsive sentinel for master %q: %w", s.cfg.MasterName, errors.Join(errs...))
 }
 
-// withCtxErr makes a failure that came with the end of ctx recognizable as it:
-// a direct-mode Client reports the deadline of its socket (os.ErrDeadlineExceeded),
-// not the context's.
+// withCtxErr makes a failure that came with the end of ctx recognizable as it: a
+// direct-mode Client reports the deadline of its socket (os.ErrDeadlineExceeded),
+// not the context's, and the socket's can fire a hair before the context's timer.
 func withCtxErr(ctx context.Context, err error) error {
 	if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
 		return fmt.Errorf("%w: %w", cerr, err)
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
 	}
 	return err
 }
