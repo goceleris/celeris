@@ -1267,8 +1267,8 @@ func (c *ClusterClient) Publish(ctx context.Context, channel, message string) (i
 // [PubSub.Close]. When the ClusterClient is closed, a PubSub whose conn is down
 // (or goes down afterwards) gives up: its Channel() is closed and its control
 // calls return [ErrClosed]. A PubSub whose conn stays up after the close (the
-// event loop is shared with another Client, or WithEngine) keeps it until
-// [PubSub.Close].
+// event loop is shared with another Client, or is that of a started server)
+// keeps it until [PubSub.Close].
 func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	// Regular SUBSCRIBE is node-local: pick any node.
 	node := c.anyNode()

@@ -788,8 +788,9 @@ func (s *SentinelClient) Publish(ctx context.Context, channel, message string) (
 // SentinelClient has at that moment, so after a failover the PubSub follows the
 // new master instead of retrying the old one, once its conn to the old master
 // has dropped (a conn that stays up, on a loop shared with another Client or
-// WithEngine, is not moved). When the SentinelClient is closed, a PubSub whose
-// conn is down (or goes down afterwards) gives up: Channel() is closed.
+// the event loop of a started server, is not moved). When the SentinelClient is
+// closed, a PubSub whose conn is down (or goes down afterwards) gives up:
+// Channel() is closed.
 func (s *SentinelClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	c, err := s.getClient()
 	if err != nil {

@@ -131,6 +131,18 @@ func Release(provider engine.EventLoopProvider) {
 	}
 }
 
+// IsStandalone reports whether provider is the standalone Loop, that is, whether
+// the Resolve that returned it took a reference that only a Release gives back.
+// A provider that came from a Server is not: the Server owns its lifetime.
+func IsStandalone(provider engine.EventLoopProvider) bool {
+	if provider == nil {
+		return false
+	}
+	standaloneMu.Lock()
+	defer standaloneMu.Unlock()
+	return standalone != nil && provider == engine.EventLoopProvider(standalone)
+}
+
 // StandaloneRefs is the number of references held on the standalone Loop, 0
 // when none is running. It is for tests, which assert that every Resolve of the
 // standalone Loop is paired with one Release (celeris#1238).

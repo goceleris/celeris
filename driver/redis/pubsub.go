@@ -50,7 +50,8 @@ type Message struct {
 // and the reconnect replays it, so the call need not be repeated, while the
 // [Client] is open. [Client.Close] does not close the PubSub (its conn is
 // checked out of the pool), but a Client that owns its event loop (no
-// WithEngine) releases the loop with it, which takes the PubSub's conn down at
+// WithEngine, or the Engine of a server that has not started or has no event
+// loop of its own) releases the loop with it, which takes the PubSub's conn down at
 // once. After [Client.Close] the reconnect has no pool to dial: a PubSub whose
 // conn is down then returns [ErrPubSubConnDown] from its control calls until
 // [PubSub.Close], and the replay never happens. The constructors

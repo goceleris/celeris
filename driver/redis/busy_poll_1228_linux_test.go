@@ -15,8 +15,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/driver/internal/busypolltest"
-	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/sockopts/sockoptstest"
 )
 
@@ -83,17 +81,6 @@ func helloOnly(cmd []string, w *bufio.Writer) {
 	}
 }
 
-// releaseLeakedLoop gives back the reference to the driver's standalone loop
-// that a Client opened WithEngine of a server that has not started takes and
-// never releases (its Engine is set, so it does not think it owns the loop).
-// Left held, the loop is shared with every later test of the package, and a
-// SentinelClient's Pub/Sub then keeps its connection after Close.
-func releaseLeakedLoop(prov engine.EventLoopProvider, name string) {
-	if strings.Contains(name, "server not started") {
-		eventloop.Release(prov)
-	}
-}
-
 func connFD(c *redisConn) int {
 	if c.useDirect {
 		return c.tcpFd
@@ -136,10 +123,7 @@ func TestNewClientSocketBusyPoll(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() {
-				_ = cl.Close()
-				releaseLeakedLoop(cl.pool.provider, tc.name)
-			}()
+			defer func() { _ = cl.Close() }()
 			ctx := context.Background()
 			c, err := cl.pool.acquireCmd(ctx, 0)
 			if err != nil {
