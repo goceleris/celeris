@@ -4,7 +4,7 @@ go 1.27.3
 
 require (
 	github.com/goceleris/celeris v1.5.11
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/lib/pq v1.12.3
 )
 
