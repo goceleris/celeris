@@ -162,9 +162,9 @@ func startHold896(t *testing.T, addr string, workers int, writeTimeout time.Dura
 	return run
 }
 
-// describeEngine896 names the tier the engine's workers run on and the
-// kernel's view of its listen sockets (dialDiag896), for the failure message
-// of a dial that timed out.
+// describeEngine896 names the tier the engine's workers run on, for the
+// failure message of a dial that timed out (dialWatch896 gives the kernel's
+// side).
 func describeEngine896(e *Engine) string {
 	e.mu.Lock()
 	ws := e.workers
@@ -176,49 +176,176 @@ func describeEngine896(e *Engine) string {
 	return fmt.Sprintf("tier=%s workers=%d", tier, len(ws))
 }
 
-// dialDiag896 returns the LISTEN rows /proc/net/tcp and tcp6 hold for addr's
-// port: the receive queue of a listen socket is its accept queue, the transmit
-// queue its backlog. A dial that timed out against a port with no row had no
-// listener, one against a row whose queue is full had a listener nobody
-// accepts from.
-func dialDiag896(addr string) string {
-	_, ps, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "no port in " + addr
+// dialWatch896 watches what the kernel and the test process do while a test
+// dials addr, for the failure message of a dial that times out (celeris#1229:
+// 2 s with no answer from an engine that is listening). It reads /proc only,
+// ignores every error, and never blocks: report is the whole of its cost.
+//
+// A dial that fails is one of two things. Either the handshake did not
+// complete (the SYN or the SYN-ACK was dropped or not processed: the client
+// has a SYN_SENT row, or none) or it completed and the test did not see it for
+// 2 s (the client has an ESTABLISHED row, and the ticker below shows the
+// process or the VM not running). The rows, the counters and the ticker tell
+// them apart.
+type dialWatch896 struct {
+	port     int
+	netstat  map[string]int64 // TcpExt counters when the watch began
+	softnet  int64            // dropped packets, summed over the CPUs, when it began
+	stop     chan struct{}
+	finished chan struct{}
+	maxGap   atomic.Int64 // the largest gap between two ticks of 10 ms, in ns
+}
+
+// dialCounters896 are the TcpExt counters of /proc/net/netstat that count a
+// SYN or a connection a listen socket refused.
+var dialCounters896 = []string{"ListenDrops", "ListenOverflows", "TCPReqQFullDrop", "TCPReqQFullDoCookies", "TCPDeferAcceptDrop"}
+
+func watchDial896(addr string) *dialWatch896 {
+	w := &dialWatch896{stop: make(chan struct{}), finished: make(chan struct{})}
+	if _, ps, err := net.SplitHostPort(addr); err == nil {
+		w.port, _ = strconv.Atoi(ps)
 	}
-	port, _ := strconv.Atoi(ps)
+	w.netstat = tcpExtCounters896()
+	w.softnet = softnetDrops896()
+	started := make(chan struct{})
+	go func() {
+		defer close(w.finished)
+		tk := time.NewTicker(10 * time.Millisecond)
+		defer tk.Stop()
+		last := time.Now()
+		close(started)
+		for {
+			select {
+			case <-w.stop:
+				return
+			case now := <-tk.C:
+				if gap := int64(now.Sub(last)); gap > w.maxGap.Load() {
+					w.maxGap.Store(gap)
+				}
+				last = now
+			}
+		}
+	}()
+	<-started
+	return w
+}
+
+// end stops the ticker; a watch whose dial succeeded calls only this.
+func (w *dialWatch896) end() {
+	select {
+	case <-w.stop:
+	default:
+		close(w.stop)
+	}
+	<-w.finished
+}
+
+// report ends the watch and describes the dial that just failed.
+func (w *dialWatch896) report() string {
+	w.end()
+	var d []string
+	now := tcpExtCounters896()
+	for _, k := range dialCounters896 {
+		if v, ok := now[k]; ok {
+			d = append(d, fmt.Sprintf("%s+%d", k, v-w.netstat[k]))
+		}
+	}
+	d = append(d, fmt.Sprintf("softnet_drop+%d", softnetDrops896()-w.softnet))
+	return fmt.Sprintf("sockets on port %d: [%s]; counters: %s; largest gap between 10 ms ticks: %v",
+		w.port, strings.Join(tcpRows896(w.port), "; "), strings.Join(d, " "),
+		time.Duration(w.maxGap.Load()).Round(time.Millisecond))
+}
+
+// tcpStates896 names the st column of /proc/net/tcp.
+var tcpStates896 = map[string]string{
+	"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1", "05": "FIN_WAIT2",
+	"06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING",
+	"0C": "NEW_SYN_RECV",
+}
+
+// tcpRows896 returns every row of /proc/net/tcp and tcp6 whose local or
+// remote port is port, in any state, with its state named. For a LISTEN
+// socket tx_queue is always 0 and rx_queue is its accept queue alone: a
+// connection TCP_DEFER_ACCEPT holds back is in the request queue and is not
+// counted, so an empty queue does not say the handshake failed.
+func tcpRows896(port int) []string {
 	var rows []string
+	want := fmt.Sprintf(":%04X", port)
 	for _, f := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			continue
 		}
-		for _, ln := range strings.Split(string(b), "\n")[1:] {
+		for _, ln := range strings.Split(string(b), "\n") {
 			fl := strings.Fields(ln)
 			// sl local_address rem_address st tx_queue:rx_queue ...
-			if len(fl) < 5 || fl[3] != "0A" {
+			if len(fl) < 5 || fl[0] == "sl" || (!strings.HasSuffix(fl[1], want) && !strings.HasSuffix(fl[2], want)) {
 				continue
 			}
-			if i := strings.LastIndexByte(fl[1], ':'); i < 0 || fl[1][i+1:] != fmt.Sprintf("%04X", port) {
-				continue
+			st := tcpStates896[fl[3]]
+			if st == "" {
+				st = fl[3]
 			}
-			rows = append(rows, fmt.Sprintf("%s %s queues(tx:rx)=%s", filepath.Base(f), fl[1], fl[4]))
+			rows = append(rows, fmt.Sprintf("%s %s>%s %s q(tx:rx)=%s", filepath.Base(f), fl[1], fl[2], st, fl[4]))
 		}
 	}
 	if len(rows) == 0 {
-		return fmt.Sprintf("no LISTEN socket on port %d in /proc/net/tcp{,6}", port)
+		return []string{"none"}
 	}
-	return strings.Join(rows, "; ")
+	return rows
+}
+
+// tcpExtCounters896 parses the TcpExt pair of lines of /proc/net/netstat.
+func tcpExtCounters896() map[string]int64 {
+	out := map[string]int64{}
+	b, err := os.ReadFile("/proc/net/netstat")
+	if err != nil {
+		return out
+	}
+	lines := strings.Split(string(b), "\n")
+	for i := 0; i+1 < len(lines); i++ {
+		if !strings.HasPrefix(lines[i], "TcpExt:") || !strings.HasPrefix(lines[i+1], "TcpExt:") {
+			continue
+		}
+		names, vals := strings.Fields(lines[i])[1:], strings.Fields(lines[i+1])[1:]
+		for j := 0; j < len(names) && j < len(vals); j++ {
+			if v, err := strconv.ParseInt(vals[j], 10, 64); err == nil {
+				out[names[j]] = v
+			}
+		}
+		break
+	}
+	return out
+}
+
+// softnetDrops896 sums the second column (packets dropped for want of room in
+// a CPU's backlog) of /proc/net/softnet_stat, whose values are hex.
+func softnetDrops896() int64 {
+	b, err := os.ReadFile("/proc/net/softnet_stat")
+	if err != nil {
+		return 0
+	}
+	var n int64
+	for _, ln := range strings.Split(string(b), "\n") {
+		if fl := strings.Fields(ln); len(fl) > 1 {
+			if v, err := strconv.ParseInt(fl[1], 16, 64); err == nil {
+				n += v
+			}
+		}
+	}
+	return n
 }
 
 // h2Request896 opens an HTTP/2 connection to addr (prior knowledge) and sends
 // GET path on stream 1, without reading any response.
 func h2Request896(t *testing.T, addr, path string) net.Conn {
 	t.Helper()
+	watch := watchDial896(addr)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
-		t.Fatalf("dial %s: %v (%s)", addr, err, dialDiag896(addr))
+		t.Fatalf("dial %s: %v (%s)", addr, err, watch.report())
 	}
+	watch.end()
 	_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := c.Write([]byte(http2.ClientPreface)); err != nil {
 		t.Fatalf("write preface: %v", err)
@@ -371,10 +498,12 @@ func sendDrainIteration896(t *testing.T, calls *atomic.Int64) (string, time.Time
 	h := newHoldHandler896(true)
 	run := startHold896(t, addr, 2, -1, h)
 	defer run.reap(t)
+	watch := watchDial896(addr)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
-		t.Fatalf("dial %s: %v (%s)", addr, err, dialDiag896(addr))
+		t.Fatalf("dial %s: %v (%s)", addr, err, watch.report())
 	}
+	watch.end()
 	defer func() { _ = c.Close() }()
 	if _, err := c.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatalf("write: %v", err)

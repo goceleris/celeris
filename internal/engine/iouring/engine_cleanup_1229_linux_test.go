@@ -162,19 +162,39 @@ func setCancelAcceptSeam1229(t *testing.T, fn func(*Worker, int)) {
 	t.Cleanup(func() { cancelAcceptSeam.Store(nil) })
 }
 
-// TestDialDiagNamesTheListenSocketOfAPort1229: the failure message of a dial
-// that timed out says whether a LISTEN socket was there for it.
-func TestDialDiagNamesTheListenSocketOfAPort1229(t *testing.T) {
+// TestDialWatchDescribesTheSocketsOfAPort1229: the failure message of a dial
+// that timed out lists every socket of the port, the client's included, with
+// its state named, and the counters and the tick gap; it works on a dial that
+// went through and on one that was refused.
+func TestDialWatchDescribesTheSocketsOfAPort1229(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	if got := dialDiag896(addr); !strings.Contains(got, "queues(tx:rx)=") {
-		t.Errorf("dialDiag896 of a live listener = %q, want its /proc/net/tcp row", got)
+	w := watchDial896(addr)
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
+	time.Sleep(30 * time.Millisecond) // a tick or two
+	got := w.report()
+	t.Logf("report: %s", got)
+	for _, want := range []string{"LISTEN", "ESTABLISHED", "largest gap between 10 ms ticks", "ListenDrops+0", "softnet_drop+"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report of a dial that went through lacks %q: %s", want, got)
+		}
+	}
+	_ = c.Close()
 	_ = ln.Close()
-	if got := dialDiag896(addr); !strings.Contains(got, "no LISTEN socket") {
-		t.Errorf("dialDiag896 of a closed port = %q, want it to say no LISTEN socket", got)
+
+	w = watchDial896(addr)
+	if c, err := net.DialTimeout("tcp", addr, 2*time.Second); err == nil {
+		_ = c.Close()
+		t.Skip("something listens on the port just closed")
 	}
+	if got := w.report(); !strings.Contains(got, "[none]") && strings.Contains(got, "LISTEN") {
+		t.Errorf("report of a dial to a closed port lists a LISTEN socket: %s", got)
+	}
+	w.end() // a second end after report is harmless
 }
