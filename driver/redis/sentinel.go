@@ -179,9 +179,9 @@ var testHookClientBuilt atomic.Pointer[func(s *SentinelClient, kind string, ctx 
 // server that runs AsyncHandlers (on any OS), or when its event-loop worker has
 // no synchronous round trip: every Engine on darwin and windows, and on Linux a
 // started epoll, io_uring or adaptive engine. With no Engine, or on Linux with
-// the Engine of a server that is not started or runs on the std engine, the
-// Client is not in direct mode. A Close that comes in while another runs waits
-// for it to end, and a later one returns at once.
+// the Engine of a server that is not started or runs on the std engine, without
+// AsyncHandlers, the Client is not in direct mode. A Close that comes in while
+// another runs waits for it to end, and a later one returns at once.
 func (s *SentinelClient) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		if s.closeDone != nil {
