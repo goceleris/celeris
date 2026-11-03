@@ -807,7 +807,7 @@ func probeMultishotAcceptOnce() (bool, string, probeOutcome) {
 
 	// Close the accepted FD so it doesn't leak — we have its fd in res.
 	if res > 0 {
-		_ = unix.Close(int(res))
+		closeFD(int(res))
 	}
 	return multishotAcceptCQE(res, flags)
 }

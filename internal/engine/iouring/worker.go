@@ -1547,7 +1547,7 @@ func (w *Worker) run(ctx context.Context) {
 	// celeris#655: producers hold the handle, never the number, so the
 	// descriptor cannot be written once shutdown has closed it.
 	if !w.wakeFD.Set(efd) && efd >= 0 {
-		_ = unix.Close(efd)
+		closeFD(efd)
 	}
 
 	w.prepareAccept()
@@ -2756,7 +2756,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	// Bounds check: reject FDs outside the flat conn array.
 	if newFD < 0 || newFD >= len(w.conns) {
 		if !isFixedFile {
-			_ = unix.Close(newFD)
+			closeFD(newFD)
 		}
 		w.errs.ConnTableCap.Add(1)
 		return
@@ -2926,7 +2926,7 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// accept it now instead and serve it like any other connection
 	// (celeris#662).
 	w.acceptQueuedOnPause(ctx, lfd)
-	_ = unix.Close(lfd)
+	closeFD(lfd)
 	w.closingFD = 0
 	w.lingerUntil = 0
 	deferlinger.NoteClose()
@@ -3053,7 +3053,7 @@ func (w *Worker) stopAccepting(ctx context.Context) {
 	w.listenFD = -1 // before the cancel's completions: handleAccept re-arms on a listenFD >= 0
 	w.closingFD = int32(lfd) + 1
 	w.cancelAccept(ctx, lfd)
-	_ = unix.Close(lfd)
+	closeFD(lfd)
 	w.closingFD = 0
 	w.lingerUntil = 0
 }
@@ -3105,13 +3105,13 @@ func (w *Worker) leaveGroupAfterExit() (keptZC int) {
 		w.ring = nil
 	}
 	if w.listenFD >= 0 {
-		_ = unix.Close(w.listenFD)
+		closeFD(w.listenFD)
 		w.listenFD = -1
 	}
 	if w.closingFD > 0 {
 		// The Goexit came from a handler the pause's close or stopAccepting
 		// ran, after they took the descriptor out of listenFD.
-		_ = unix.Close(int(w.closingFD) - 1)
+		closeFD(int(w.closingFD) - 1)
 		w.closingFD = 0
 	}
 	w.lingerUntil = 0
@@ -8667,7 +8667,7 @@ func (w *Worker) shutdown() {
 		// endOwedOpsAtShutdown has ended the ops owed on fd, so no op can
 		// resolve the number once it is free (celeris#685).
 		if !cs.fixedFile {
-			_ = unix.Close(fd)
+			closeFD(fd)
 		}
 		// Do NOT releaseConnState here, detached or not. Conns being torn
 		// down by shutdown almost always have a recv SQE armed on cs.buf,
@@ -8691,7 +8691,7 @@ func (w *Worker) shutdown() {
 	// retracts it — the sweep does not run after shutdown.
 	w.sweepRetract()
 	if w.listenFD >= 0 {
-		_ = unix.Close(w.listenFD)
+		closeFD(w.listenFD)
 		w.listenFD = -1 // a Goexit in a later step must not close the number twice (leaveGroupAfterExit)
 	}
 	// The worker has left the SO_REUSEPORT group for good. PauseAccept waits
@@ -8803,7 +8803,7 @@ func (w *Worker) releaseFailedInit() {
 	// unchanged.
 	w.wakeFD.Close()
 	if w.listenFD >= 0 {
-		_ = unix.Close(w.listenFD)
+		closeFD(w.listenFD)
 		w.listenFD = -1
 		// Keep the invariant the running loop maintains (celeris#656): the
 		// socket is out of the SO_REUSEPORT group, so the flag PauseAccept
@@ -8836,11 +8836,11 @@ func createListenSocket(addr string, deferAccept bool) (int, error) {
 	}
 
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-		_ = unix.Close(fd)
+		closeFD(fd)
 		return -1, fmt.Errorf("SO_REUSEADDR: %w", err)
 	}
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-		_ = unix.Close(fd)
+		closeFD(fd)
 		return -1, fmt.Errorf("SO_REUSEPORT: %w", err)
 	}
 
@@ -8856,12 +8856,12 @@ func createListenSocket(addr string, deferAccept bool) (int, error) {
 
 	if err := bindiag.BindWithRetry(fd, sa); err != nil {
 		diag := bindiag.Format(fd, sa)
-		_ = unix.Close(fd)
+		closeFD(fd)
 		return -1, fmt.Errorf("bind: %w [%s]", err, diag)
 	}
 	if err := unix.Listen(fd, 4096); err != nil {
 		diag := bindiag.Format(fd, sa)
-		_ = unix.Close(fd)
+		closeFD(fd)
 		return -1, fmt.Errorf("listen: %w [%s]", err, diag)
 	}
 

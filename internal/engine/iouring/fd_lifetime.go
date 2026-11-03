@@ -539,7 +539,7 @@ func (w *Worker) closedFDNamed(cs *connState) bool {
 // release closes it when cs goes, or earlier, once only a SEND_ZC
 // notification is still owed (celeris#798). Worker thread only.
 func (w *Worker) releaseKeptFD(e *pendingReleaseEntry) {
-	_ = unix.Close(int(e.fd))
+	closeFD(int(e.fd))
 	e.holdsFD = false
 	w.closeFDOwed--
 }
@@ -558,7 +558,7 @@ func keptFD(fd int, owed bool) int {
 // drainPendingRelease closes at the last owed op's terminal CQE.
 func closeUnlessOwed(fd int, owed bool) {
 	if !owed {
-		_ = unix.Close(fd)
+		closeFD(fd)
 	}
 }
 
@@ -728,7 +728,7 @@ func (w *Worker) endOwedOpsAtShutdown() {
 					w.staleConnCQE(c, fd, ud)
 				case udAccept:
 					if c.Res >= 0 && !w.fixedFiles {
-						_ = unix.Close(int(c.Res))
+						closeFD(int(c.Res))
 					}
 					// No more completions from this accept: it is over, and
 					// has let go of the listen socket's file. A multishot
@@ -777,7 +777,7 @@ func (w *Worker) endOwedOpsAtShutdown() {
 	}
 	for i := range w.pendingRelease {
 		if e := &w.pendingRelease[i]; e.holdsFD {
-			_ = unix.Close(int(e.fd))
+			closeFD(int(e.fd))
 			e.holdsFD = false
 		}
 	}

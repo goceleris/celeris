@@ -111,7 +111,7 @@ func (w *Worker) refuseAdopt(fd int, carry engine.Carryover) {
 	}
 	if fd >= 0 {
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
-		_ = unix.Close(fd)
+		closeFD(fd)
 	}
 	if w.closeCount != nil {
 		w.closeCount.Add(1)
