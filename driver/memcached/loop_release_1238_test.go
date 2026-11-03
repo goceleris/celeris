@@ -78,8 +78,11 @@ func TestClientWithEngineReleasesTheStandaloneLoop1238(t *testing.T) {
 }
 
 func TestClientConcurrentCloseReleasesTheStandaloneLoopOnce1238(t *testing.T) {
-	if !clientHoldsTheLoop(t) {
-		t.Skip("the standalone loop is not used by a memcached Client on this platform")
+	// Where the Client falls back to its direct pool it holds no reference, and
+	// the same count must hold after the concurrent Close.
+	held := 0
+	if clientHoldsTheLoop(t) {
+		held = 1
 	}
 	for name, srv := range loopServers(t) {
 		t.Run(name, func(t *testing.T) {
@@ -93,6 +96,7 @@ func TestClientConcurrentCloseReleasesTheStandaloneLoopOnce1238(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			wantRefs(t, before+1+held, "open")
 			var wg sync.WaitGroup
 			for range 8 {
 				wg.Add(1)
