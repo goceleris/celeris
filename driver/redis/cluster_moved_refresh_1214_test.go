@@ -65,9 +65,10 @@ func runHerd(n int, fn func() error) error {
 }
 
 // sharedReads runs the herd of n calls of fn while the first CLUSTER SLOTS read is
-// HELD after its table is taken, and releases it once every call has finished or
-// is waiting for a read. It returns the CLUSTER SLOTS replies the herd cost and
-// the first error.
+// HELD after its table is taken, and releases it once every call has its trigger
+// (seen, if not nil: the -MOVED replies the old owner has sent) and every call is
+// waiting for a read. It returns the CLUSTER SLOTS replies the herd cost and the
+// first error.
 //
 // The calls share a read only if it began after the trigger of each, and the
 // triggers arrive over some time (the scheduler, the time a dial to a closed port
@@ -75,10 +76,15 @@ func runHerd(n int, fn func() error) error {
 // and the number depends on the machine: 4 at most on Linux (the herds below, 400
 // runs, plain and -race), 21 on a Windows runner (celeris#1234). Held, every
 // trigger arrives while the first read is in flight and unresolved, so the herd
-// costs exactly one read on any machine. (Main, or a variant that reads once per
-// command: the held read and one for each of the others, which finish while it is
-// held.)
-func sharedReads(t *testing.T, cl *rpCluster, n int, fn func() error) (reads int64, err error) {
+// costs exactly one read on any machine.
+//
+// Every call must be waiting for the read when it is released: a call that has
+// finished by then did not wait for it (it skipped the read, or did not wait for
+// the running one) and the test fails, whatever the count. A call that finishes
+// early does not hold the gate up, so a variant that reads once per command (the
+// held read and one for each of the others, which finish while it is held) fails
+// on the count and does not wait for the gate to time out.
+func sharedReads(t *testing.T, cl *rpCluster, n int, seen func() bool, fn func() error) (reads int64, err error) {
 	t.Helper()
 	waitHeld, release := holdNextSlotsRead(t)
 	before := cl.slotsReplies.Load()
@@ -91,14 +97,30 @@ func sharedReads(t *testing.T, cl *rpCluster, n int, fn func() error) (reads int
 		})
 	}()
 	waitHeld()
-	poll(t, "every command finished or waiting for the read", 15*time.Second, func() bool {
+	// The held read runs under the 5 s limit of the command path: a herd that
+	// takes longer than that to arrive would be cut short, not counted.
+	const gate = 4 * time.Second
+	deadline := time.Now().Add(gate)
+	var done, waiting int
+	for {
 		// The finished count comes first: a command that ends between the two
 		// reads is missed, not counted twice.
-		done := int(finished.Load())
-		return done+goroutinesIn("(*ClusterClient).refreshTopologySince") >= n
-	})
+		done = int(finished.Load())
+		waiting = goroutinesIn("(*ClusterClient).refreshTopologySince")
+		if done+waiting >= n && (seen == nil || seen()) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the herd was not released after %v: of %d commands, %d finished and %d waiting for the read (triggers all seen: %v)",
+				gate, n, done, waiting, seen == nil || seen())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	release()
 	err = <-res
+	if done > 0 {
+		t.Errorf("%d of %d commands finished before the read was released: they did not wait for it", done, n)
+	}
 	return cl.slotsReplies.Load() - before, err
 }
 
@@ -118,7 +140,7 @@ func TestMovedHerdSharesOneTopologyRead1214(t *testing.T) {
 			cl, cc, from, to := herdSlotMove(t, key, tc.stale)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			got, err := sharedReads(t, cl, n, func() error {
+			got, err := sharedReads(t, cl, n, func() bool { return from.getMoved.Load() >= n }, func() error {
 				v, err := cc.Get(ctx, key)
 				if err != nil {
 					return err
@@ -153,10 +175,10 @@ func TestMovedHerdSharesOneTopologyRead1214(t *testing.T) {
 func TestMovedHerdOfPipelinesSharesOneTopologyRead1214(t *testing.T) {
 	const n = 50
 	const key = "{pipeherd}k"
-	cl, cc, _, to := herdSlotMove(t, key, 0)
+	cl, cc, from, to := herdSlotMove(t, key, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	got, err := sharedReads(t, cl, n, func() error {
+	got, err := sharedReads(t, cl, n, func() bool { return from.getMoved.Load() >= n }, func() error {
 		p := cc.Pipeline()
 		p.Get(key)
 		vals, errs := p.Exec(ctx)
@@ -206,7 +228,7 @@ func TestPrimaryLostHerdSharesOneTopologyRead1214(t *testing.T) {
 	cl.failover(from, to, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	got, err := sharedReads(t, cl, n, func() error {
+	got, err := sharedReads(t, cl, n, nil, func() error {
 		v, err := cc.Get(ctx, key)
 		if err != nil {
 			return err
