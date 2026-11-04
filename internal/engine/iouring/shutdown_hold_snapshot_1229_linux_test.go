@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/drainclock"
 )
 
 // celeris#1229. A worker with nothing to send waits, inside the 250 ms floor of
@@ -27,31 +29,85 @@ import (
 // shutdown, whatever the machine's speed), and 8 clients, started at that
 // moment, whose connections and requests wait in the kernel's accept queue and
 // go on arriving, as the churn of the listen-release tests does. Every drain
-// pass takes a millisecond more and brings a connection of its own, with its
-// request, so that a connection is accepted in every pass and answered in the
-// next whatever the machine's speed: a worker that goes on accepting while it
-// waits for the head has a response going out at every look, and is held to the
-// floor (the regime of a worker with a response to send, which keeps accepting
-// for the floor by design, entered through the wait for a head). It is held,
-// before the fix, by the look at the connections' unread requests as well.
+// pass takes a millisecond more and brings perPass1229 connections of its own,
+// with a request each, so that a connection is accepted in every pass and
+// answered in the next whatever the machine's speed: a worker that goes on
+// accepting while it waits for the head has a response going out at every look,
+// and is held to the floor (the regime of a worker with a response to send,
+// which keeps accepting for the floor by design, entered through the wait for a
+// head). It is held, before the fix, by the look at the connections' unread
+// requests as well.
 
-// holdBound1229 is well under the floor (shutdownSendDrainNanos, 250 ms): a
-// Listen that returns inside it was not held by the look.
-const holdBound1229 = 150 * time.Millisecond
+// The tests below do not time Listen. A bound on the time it takes, set well
+// under the floor (shutdownSendDrainNanos, 250 ms), failed on a machine that
+// starved the test, not the engine: 6 runs of 200 at 8 busy-loop CPU hogs on 2
+// CPUs took 184 to 301 ms against 150, and the worker's own part of that, the
+// time outside the test's seam, was 4 ms at the most (celeris#1258). The seam
+// sleeps and dials on the worker's thread, and a thread that the hogs starve
+// takes 100 to 200 ms for the 25 ms of it. They hold the drain's clock instead
+// (drainclock.SetSeam, as celeris#1244's cells do), at the instant of the cancel,
+// so that the floor cannot run out on its own, and judge whether Listen returns:
+// a worker that the look at the kernel, or the open listener, holds is held to a
+// floor that does not come, and Listen does not return until the test thaws the
+// clock in its cleanup; one that is not held returns whatever the machine's
+// speed. The tests wait listenWait1229 for it, which is no bound on the engine's
+// speed either: a longer wait changes no verdict.
+const listenWait1229 = 20 * time.Second
+
+// perPass1229 is how many connections, with a request each, every drain pass
+// brings, and keepExtra1229 how many of them the test keeps open (the oldest is
+// closed when there are more: a worker held for the wait of a test sees tens of
+// thousands of passes). A worker that goes on accepting is held by a response
+// going out in every pass, which needs a connection in the accept queue in every
+// pass: one connection a pass, and the 8 clients behind it, left the queue empty
+// in a pass now and then when the machine starved them (7 runs of 80 at 8 CPU
+// hogs on 2 CPUs, for the engine that keeps its listener open while only the
+// look is outstanding, celeris#1258); several a pass leave a backlog.
+const (
+	perPass1229   = 4
+	keepExtra1229 = 256
+)
+
+// holdDrainClock1229 holds the drain's clock for the test: the real monotonic
+// clock until freeze, and then the instant it was frozen at. The seam is
+// restored after the engine's stop (the test registers the thaw after it starts
+// the engine, so that it runs before).
+func holdDrainClock1229(t *testing.T) *heldClock1244 {
+	t.Helper()
+	clk := &heldClock1244{epoch: time.Now()}
+	t.Cleanup(drainclock.SetSeam(clk.read))
+	return clk
+}
+
+// listenReturned1229 waits for Listen, cancelled at t0 and with the drain's
+// clock held, for up to listenWait1229, and says whether it returned, when (by
+// the test's clock, which is logged and never judged) and with what error.
+func listenReturned1229(run *engineRun896, t0 time.Time) (returned bool, took time.Duration, err error) {
+	select {
+	case err = <-run.done:
+		return true, time.Since(t0), err
+	case <-time.After(listenWait1229):
+		return false, 0, nil
+	}
+}
 
 // held1229 is what the scenario saw.
 type held1229 struct {
-	resp      *http.Response // the answer to the head that was in the kernel
-	respErr   error
-	took      time.Duration // from the cancel to Listen's return
-	listenErr error
+	resp    *http.Response // the answer to the head that was in the kernel
+	respErr error
+	run     *engineRun896
+	t0      time.Time // the cancel
 }
 
-// shutdownWithAHeadInTheKernel1229 runs the scenario once. The restores of the
-// seam are registered before the engine starts, so the engine's reap, registered
-// by start896, runs before them.
-func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) held1229 {
+// shutdownWithAHeadInTheKernel1229 runs the scenario once, up to the answer to
+// the head, with the drain's clock held from the cancel on. The restores of the
+// seams are registered before the engine starts, so the engine's reap,
+// registered by start896, runs before them, and the thaw after the start, so
+// that it runs before the reap: a worker held by the floor (the engine these
+// tests are red on) goes on when the clock does, and the engine stops.
+func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) *held1229 {
 	t.Helper()
+	clk := holdDrainClock1229(t)
 	var (
 		mu       sync.Mutex
 		entered  = map[*Worker]bool{}
@@ -88,11 +144,17 @@ func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) held1229 {
 				time.Sleep(20 * time.Millisecond)
 			})
 		}
-		if ec, err := net.DialTimeout("tcp", addr.Load().(string), 100*time.Millisecond); err == nil {
-			_, _ = ec.Write([]byte(req))
-			extraMu.Lock()
-			extra = append(extra, ec)
-			extraMu.Unlock()
+		for range perPass1229 {
+			if ec, err := net.DialTimeout("tcp", addr.Load().(string), 100*time.Millisecond); err == nil {
+				_, _ = ec.Write([]byte(req))
+				extraMu.Lock()
+				extra = append(extra, ec)
+				if len(extra) > keepExtra1229 {
+					_ = extra[0].Close()
+					extra = extra[1:]
+				}
+				extraMu.Unlock()
+			}
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -110,6 +172,8 @@ func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) held1229 {
 	addr.Store(a)
 	run := start896(t, a, 2)
 	nWorkers.Store(int64(len(run.e.workers)))
+	t.Logf("engine: %d workers, io_uring tier %s", len(run.e.workers), tier844(run.e))
+	t.Cleanup(clk.thaw)
 
 	c, err := net.DialTimeout("tcp", a, time.Second)
 	if err != nil {
@@ -141,30 +205,41 @@ func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) held1229 {
 	w := func() { _, _ = c.Write([]byte(req)) }
 	write.Store(&w)
 
-	var res held1229
-	t0 := time.Now()
+	// The answer is awaited for as long as the wait for Listen: it does not
+	// depend on the floor either, and a deadline of the first request, set
+	// before the engine's start and the machine's stalls, must not be the end of
+	// it.
+	_ = c.SetDeadline(time.Now().Add(listenWait1229))
+	res := &held1229{run: run}
+	clk.freeze()
+	res.t0 = time.Now()
 	run.cancel()
 	res.resp, res.respErr = http.ReadResponse(br, nil)
-	returned, err := run.stopped()
-	res.took, res.listenErr = returned.Sub(t0), err
 	return res
 }
 
-// TestShutdownHoldIsNotRenewedByNewConnections1229: Listen must return well
-// inside the floor, with the head answered and connections arriving: a worker
-// that waits for a head and has nothing to send waits for the heads that were in
-// the kernel when it began, and for nothing a later connection brings.
+// TestShutdownHoldIsNotRenewedByNewConnections1229: Listen must return, with
+// the head answered and connections arriving, while the drain's clock is held
+// and the floor cannot run out. A worker that waits for a head and has nothing
+// to send waits for the heads that were in the kernel when it began, and for
+// nothing a later connection brings; one that the look at the kernel, renewed by
+// every connection a pass accepts, or the listener, which brings a response to
+// send, holds, is held to a floor that does not come, and Listen does not return
+// (the engine before celeris#1243, and one that keeps the listener open while
+// only the look is outstanding).
 func TestShutdownHoldIsNotRenewedByNewConnections1229(t *testing.T) {
 	r := shutdownWithAHeadInTheKernel1229(t, 8)
-	if r.listenErr != nil {
-		t.Fatalf("Listen returned %v after a cancel", r.listenErr)
+	returned, took, err := listenReturned1229(r.run, r.t0)
+	if !returned {
+		t.Fatalf("Listen had not returned %v after the cancel with the drain's clock held (floor %v, which cannot run out): "+
+			"new connections renewed the worker's look at the kernel, or the open listener brought it responses to send",
+			listenWait1229, time.Duration(shutdownSendDrainNanos))
 	}
-	t.Logf("Listen returned %v after the cancel, with connections arriving and a 1 ms drain pass (floor %v)",
-		r.took, time.Duration(shutdownSendDrainNanos))
-	if r.took > holdBound1229 {
-		t.Errorf("Listen took %v to return: new connections renewed the worker's look at the kernel, bound %v, floor %v",
-			r.took, holdBound1229, time.Duration(shutdownSendDrainNanos))
+	if err != nil {
+		t.Fatalf("Listen returned %v after a cancel", err)
 	}
+	t.Logf("Listen returned %v after the cancel, by the test's clock, with the drain's clock held (floor %v)",
+		took, time.Duration(shutdownSendDrainNanos))
 }
 
 // TestShutdownAnswersAHeadInTheKernelUnderChurn1229 is the celeris#1208
@@ -287,12 +362,14 @@ func TestShutdownSnapshotIsTakenOnce1229(t *testing.T) {
 			})
 		}
 	}
+	clk := holdDrainClock1229(t)
 	sendDrainSeam.Store(&hold)
 	t.Cleanup(func() { sendDrainSeam.Store(nil) })
 
 	addr := freeAddr639(t)
 	run := start896(t, addr, 2)
 	nW.Store(int64(len(run.e.workers)))
+	t.Cleanup(clk.thaw)
 
 	brs := make([]*bufio.Reader, nW.Load()+1)
 	for i := range brs {
@@ -314,7 +391,11 @@ func TestShutdownSnapshotIsTakenOnce1229(t *testing.T) {
 		cs = append(cs, c)
 		byAddr[c.LocalAddr().String()] = i
 	}
+	for _, c := range cs {
+		_ = c.SetDeadline(time.Now().Add(listenWait1229))
+	}
 
+	clk.freeze()
 	t0 := time.Now()
 	run.cancel()
 	select {
@@ -327,8 +408,11 @@ func TestShutdownSnapshotIsTakenOnce1229(t *testing.T) {
 	}
 	resp1, err1 := http.ReadResponse(brs[i1], nil)
 	resp2, err2 := http.ReadResponse(brs[i2], nil)
-	returned, err := run.stopped()
-	if err != nil {
+	returned, took, err := listenReturned1229(run, t0)
+	if !returned {
+		t.Errorf("Listen had not returned %v after the cancel with the drain's clock held (floor %v, which cannot run out)",
+			listenWait1229, time.Duration(shutdownSendDrainNanos))
+	} else if err != nil {
 		t.Fatalf("Listen returned %v after a cancel", err)
 	}
 	if err1 != nil {
@@ -343,7 +427,8 @@ func TestShutdownSnapshotIsTakenOnce1229(t *testing.T) {
 	if err2 == nil {
 		t.Errorf("the head that reached the second conn after the snapshot was answered (status %d): the look is made again after the first pass", resp2.StatusCode)
 	}
-	if took := returned.Sub(t0); took > holdBound1229 {
-		t.Errorf("Listen took %v to return, bound %v", took, holdBound1229)
+	if returned {
+		t.Logf("Listen returned %v after the cancel, by the test's clock, with the drain's clock held (floor %v)",
+			took, time.Duration(shutdownSendDrainNanos))
 	}
 }
