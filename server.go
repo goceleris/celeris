@@ -575,7 +575,10 @@ func (s *Server) cancelListen() {
 // On every engine Shutdown waits for that drain, bounded by ctx: it runs the
 // hooks, and returns, only once the Listen call of the Start* entry point has
 // returned. If ctx is done first, the hooks still run, with ctx, and Shutdown
-// returns ctx's error. Because it waits for the requests in flight, a handler
+// returns ctx's error (on epoll, io_uring and adaptive a drain that ctx's
+// deadline ends can finish at that same instant, and Shutdown then returns nil:
+// nil at the deadline does not mean nothing was cut, celeris#1225). Because it
+// waits for the requests in flight, a handler
 // that calls Shutdown and waits for it waits for itself until ctx is done:
 // call it from another goroutine (celeris#703). The Start* call that the
 // server was started with returns only after Shutdown has returned.
@@ -660,16 +663,53 @@ func (s *Server) cancelListen() {
 //     at once by std and epoll, and by an io_uring worker with no response going
 //     out. An io_uring worker that has one serves on for the first 250 ms of its
 //     send drain, so its idle connections are closed at 250 ms, and a request
-//     one of them sends before then is answered with Connection: close.
+//     one of them sends before then is answered with Connection: close. While a
+//     connection that has begun a head is open (the bullet below), epoll closes
+//     the idle connections of the loop that serves it at about 250 ms, the
+//     gate's floor, where a loop without one closes its idle connections at
+//     once, and io_uring closes its idle connections at about 250 ms (251 to 258
+//     ms with six; with 2000, all were closed within 0.46 s on epoll and 0.71 s
+//     on io_uring, against 11 ms and 17 ms with no such connection).
 //   - A request in progress, whose head the server has read, is read on and
 //     answered, with Connection: close as above, on every engine.
+//   - A head begun and not completed, a fragment or a bare CRLF, is a request in
+//     progress on epoll and io_uring (celeris#1225), whether the connection was
+//     idle after a response or is new: the engine reads on and waits for it, and
+//     does not close the connection as it closes an idle one. Shutdown waits
+//     until the head completes (the request is then answered, with Connection:
+//     close, and the wait ends), until a limit of the connection ends it, or
+//     until ctx is done. The limits are [Config.ReadHeaderTimeout], 10 s by
+//     default, counted from the head's first byte (for a new connection, from
+//     the engine's accept of it, which TCP_DEFER_ACCEPT, on by default, puts at
+//     that byte) and not extended by the bytes that follow (a head trickled in
+//     at one byte per 150 ms was cut at it), and [Config.WriteTimeout], from the
+//     start of the wait as above; when one of them ends the wait, Shutdown
+//     returns nil if that was all it waited for. A client can therefore hold a
+//     graceful shutdown for as long as the shortest of those by sending a bare
+//     CRLF or one byte of a head, and the bound the caller sets is ctx's
+//     deadline: when it comes before those limits, Shutdown returns at it, with
+//     ctx's error, or with nil when the engine's drain, which ends at that same
+//     deadline, lets Listen return before ctx's timer fires; the engine closes
+//     the connection, which gets its FIN, on epoll, io_uring and adaptive.
+//     net/http's Shutdown also waits for connections that are not idle until ctx
+//     is done, but it does not count this one as the native engines do. It
+//     marks a connection active only once a request head has been read in full
+//     (conn.serve, StateActive after readRequest returns), so std closes a
+//     keep-alive connection that has begun a head, or sent a bare CRLF, with the
+//     idle ones, without an answer, and Shutdown returns at once (measured at 1
+//     ms). A new connection that has begun its first head is not idle for
+//     net/http until it is about five seconds old (closeIdleConns, as for a
+//     silent one below), so Shutdown on std waits for it until the head
+//     completes, ReadHeaderTimeout cuts it, it is five seconds old, or ctx is
+//     done, when Shutdown returns ctx's error and leaves the connection open
+//     (still open 4 s later when measured).
 //   - A request head that has reached the kernel without the server having read
 //     it is answered, with Connection: close, on epoll, io_uring and adaptive, as
 //     a request in progress is (also for a connection whose head arrived while
 //     the loop was held in another connection's [Config.OnConnect] callback). A
 //     fragment of a head, or a bare CRLF, found there is read and is a request in
-//     progress like any other: it holds Shutdown until the request completes or
-//     the budget ends, on epoll and io_uring alike. An io_uring worker with
+//     progress like any other (the bullet above), on epoll and io_uring alike.
+//     An io_uring worker with
 //     nothing to send looks once, when its send drain begins (after the wait for
 //     the HTTP/2 handlers), and waits only for the connections that had such a
 //     head then, with its listener closed: a connection that arrives afterwards

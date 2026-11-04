@@ -19,7 +19,7 @@ func TestShutdownDocConnShapes1208(t *testing.T) {
 			"so its idle connections are closed at 250 ms, and a request one of them sends before then is answered with Connection: close",
 			"A request in progress, whose head the server has read, is read on and answered, with Connection: close as above, on every engine",
 			"is answered, with Connection: close, on epoll, io_uring and adaptive, as a request in progress is",
-			"A fragment of a head, or a bare CRLF, found there is read and is a request in progress like any other: it holds Shutdown until the request completes or the budget ends, on epoll and io_uring alike",
+			"A fragment of a head, or a bare CRLF, found there is read and is a request in progress like any other (the bullet above), on epoll and io_uring alike",
 			"looks once, when its send drain begins (after the wait for the HTTP/2 handlers), and waits only for the connections that had such a head then, with its listener closed: a connection that arrives afterwards does not hold it, however many keep coming",
 			"one still in the accept queue when the listener closes gets a reset, on epoll as well",
 			"net/http reads the head after Shutdown began and drops the request: the connection is closed without an answer, and reset if body bytes are still unread",
@@ -31,6 +31,7 @@ func TestShutdownDocConnShapes1208(t *testing.T) {
 			"can hold Shutdown on std for about five seconds",
 		},
 		[]string{
+			"it holds Shutdown until the request completes or the budget ends, on epoll and io_uring alike",
 			"An io_uring worker with neither exits at once",
 			"(it is answered close when its first request is)",
 			"it is answered close when its first request is",

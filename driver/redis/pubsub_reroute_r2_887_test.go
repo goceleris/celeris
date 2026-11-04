@@ -32,7 +32,9 @@ func TestClusterSunsubscribeOfANonServedSlotDoesNotRerouteTheServedOne887(t *tes
 	if err := ps.SSubscribe(rpCtx(t), f); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	// An SPUBLISH made before the node has registered the channel reaches no one
+	// (celeris#1255): the message goes out once it holds it.
+	poll(t, "the second channel registered on the node", 5*time.Second, func() bool { return holder.ssubscribed(f) })
 	cl.spublish(f, "f1")
 	poll(t, "f1 (the second slot is accepted by the same node)", 3*time.Second, func() bool { return rc.count("f1") == 1 })
 	accepted := holder.acceptedConns()

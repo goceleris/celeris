@@ -343,6 +343,25 @@ func (n *rpNode) subscribers(kind string) int {
 	return cnt
 }
 
+// ssubscribed reports whether one conn of the node holds every channel in chs
+// as a shard subscription: the command was answered, not only received (an
+// SSUBSCRIBE is in ssubCommands from the moment its arguments are read, before
+// the node checks the slots and registers the channels, so a test that
+// publishes after seeing the command can publish before the registration, and
+// the message goes to no one, as an SPUBLISH does on a real server).
+func (n *rpNode) ssubscribed(chs ...string) bool {
+	return n.conn(func(c *rpConn) bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, ch := range chs {
+			if _, ok := c.ssubs[ch]; !ok {
+				return false
+			}
+		}
+		return true
+	}) != nil
+}
+
 func (n *rpNode) conn(pred func(*rpConn) bool) *rpConn {
 	n.mu.Lock()
 	defer n.mu.Unlock()
