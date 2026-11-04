@@ -26,16 +26,23 @@ import (
 // one response of 1 MiB, 5 MiB and 64 MiB and logs how long the transfer took
 // (celeris#809: on epoll, io_uring and adaptive a 64 MiB response took about
 // 16 s to this client while std took 0.07 s and the net/http client 0.3-0.6 s).
-// It never fails on a slow transfer: a client that gives up at its 20 s timeout
-// with part of the body is a result to read, not an error. It fails only when
-// the transfer is wrong, that is when the server answers something other than
-// an HTTP/2 200 with exactly the body, or the connection breaks for a reason
-// other than that timeout.
+// What is judged: a wrong transfer fails the cell, that is a response other
+// than an HTTP/2 200 with exactly the body (also one that ends without an
+// error but short or long), or a connection that breaks for a reason other
+// than the client's own timeout. The 20 s client timeout is recorded
+// (end=timeout(conn open), with the bytes received so far in got) and the
+// cell passes: how slow a transfer was is for the reader of the log lines to
+// judge, not for this test. A server that hangs still ends the cell, but not
+// at once: the client gives up after 20 s, then the cleanup waits up to 10 s
+// for Shutdown and up to 15 s for Start to return, so a cell takes at most
+// about 45 s, and on a native engine a Start that does not return fails the
+// cell. On std Start does return, the cell passes, and a handler goroutine
+// that is stuck can be left behind.
 //
 // Each cell logs two lines the readers of the series parse:
 //
 //	ENGINE requested=<engine asked for> running=<engine EngineInfo reports>
-//	PROBE761 h2 engine=<e> route=<sync|async> body=<n> status=<s> proto=<p> got=<bytes> end=<complete|timeout(conn open)|error> elapsed=<seconds>s
+//	PROBE761 h2 engine=<e> route=<sync|async> body=<n> status=<s> proto=<p> got=<bytes> end=<complete|timeout(conn open)|the error text> elapsed=<seconds>s
 //
 // A cell whose running engine differs from the requested one (io_uring
 // unavailable on the host, which the cell logs and passes without a transfer)
