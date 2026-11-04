@@ -183,45 +183,108 @@ func TestShutdownAnswersAHeadInTheKernelUnderChurn1229(t *testing.T) {
 
 // TestShutdownSnapshotIsTakenOnce1229 pins that the look at the kernel is a
 // snapshot of the first pass of the drain, and not repeated: two keep-alive
-// conns the worker has accepted, the first gets its next request while the
-// workers are held in their first drain pass (before the snapshot), the second
-// gets it only once a worker that has served the first is quiet (nothing to
-// send, no request in progress) in a later pass, just before its look. The
-// first is answered, with Connection: close; the second is not waited for, and
-// its request is dropped as that of any connection that sends after the worker
-// has looked (a snapshot taken on every pass would mark it and answer it). With
-// the workers on different cores of work the second conn may belong to a worker
-// that has already exited: the assertions hold, and only the single-worker
-// shape (the runner's, with 8 MiB of memlock) tells the two behaviours apart.
+// conns of the SAME worker, the first gets its next request while the workers
+// are held in their first drain pass (before the snapshot), the second gets it
+// only in the pass in which that worker has nothing left to wait for (nothing to
+// send, no request in progress, and the look at the kernel clear: the first
+// conn's request read), so that the worker is done in that very pass, just
+// after the seam. The first is answered, with Connection: close; the second is
+// not waited for, and its request is dropped as that of any connection that
+// sends after the worker has looked (a snapshot taken on every pass would mark
+// it and answer it).
+//
+// Two things the scenario must not leave to the machine (celeris#1254):
+//
+//   - The second head is not written while the first is still unread. Nothing to
+//     send and no request in progress is also what the worker looks like in the
+//     pass after the first drain pass when that pass's reap did not take the
+//     first conn's recv completion (it is not in the CQ ring yet, or the recv
+//     was not armed): the worker is then held by the first head, and the
+//     ordinary path reads the second conn's head in the same reap as the first
+//     and answers it, as it answers any request in progress, whatever the
+//     snapshot.
+//   - The two conns are on one worker. The runner of the base tier has memlock
+//     for several workers, and a head written to a conn of another worker, one
+//     that has not exited yet (it has a send to reap) and that is not held, is
+//     read by it and answered. Each worker says, in its first pass, which of the
+//     test's conns it has accepted (by their address); the conns are one more
+//     than the workers, so that some worker has two; the first of them to have
+//     two is the one the heads go to.
+//
+// The test fails, and does not pass for want of a look, when no worker had two
+// conns or the second head was never written.
 func TestShutdownSnapshotIsTakenOnce1229(t *testing.T) {
 	const req = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n"
 	var (
 		mu     sync.Mutex
 		calls  = map[*Worker]int{}
+		owned  = map[*Worker][]int{} // the indexes of the test's conns each worker has accepted
 		nW     atomic.Int64
 		first  sync.Once
 		second sync.Once
-		c1, c2 net.Conn
+		wrote2 atomic.Bool
+		star   atomic.Pointer[Worker] // the worker both heads go to
+		chosen = make(chan struct{})  // closed once star is chosen (or found to be none)
+		byAddr = map[string]int{}     // the client address of each conn, to its index; set before the cancel
+		cs     []net.Conn
+		i1, i2 int // the conns of the heads, set before chosen is closed
 	)
 	hold := func(w *Worker) {
 		mu.Lock()
 		calls[w]++
 		n, entered := calls[w], len(calls)
+		if n == 1 {
+			mine := []int{}
+			for _, fd := range w.liveConns {
+				if c := w.conns[fd]; c != nil {
+					if i, ok := byAddr[c.remoteAddr]; ok {
+						mine = append(mine, i)
+					}
+				}
+			}
+			owned[w] = mine
+		}
 		mu.Unlock()
 		if n == 1 {
-			// Every worker waits for all of them to be in the drain, so the head
-			// is written before any has taken its snapshot.
+			// Every worker waits for all of them to be in the drain, with its
+			// conns told, so that the head is written before any has taken its
+			// snapshot.
 			for dl := time.Now().Add(5 * time.Second); int64(entered) < nW.Load() && time.Now().Before(dl); {
 				time.Sleep(100 * time.Microsecond)
 				mu.Lock()
 				entered = len(calls)
 				mu.Unlock()
 			}
-			first.Do(func() { _, _ = c1.Write([]byte(req)) })
+			first.Do(func() {
+				defer close(chosen)
+				mu.Lock()
+				var best *Worker
+				for ww, o := range owned {
+					if len(o) >= 2 && (best == nil || len(o) > len(owned[best]) || len(o) == len(owned[best]) && ww.id < best.id) {
+						best = ww
+					}
+				}
+				if best != nil {
+					i1, i2 = owned[best][0], owned[best][1]
+				}
+				mu.Unlock()
+				if best == nil {
+					return
+				}
+				star.Store(best)
+				_, _ = cs[i1].Write([]byte(req))
+			})
 			return
 		}
-		if !w.hasPendingSends() && !w.h1RequestInProgress() {
-			second.Do(func() { _, _ = c2.Write([]byte(req)) })
+		// In the pass in which the worker is done unless something new marks a
+		// conn: no send, no request in progress, and nothing of the first
+		// conn's head left in the kernel (the look the snapshot of the first
+		// pass left).
+		if w == star.Load() && !w.hasPendingSends() && !w.h1RequestInProgress() && !w.h1UnreadInKernel() {
+			second.Do(func() {
+				wrote2.Store(true)
+				_, _ = cs[i2].Write([]byte(req))
+			})
 		}
 	}
 	sendDrainSeam.Store(&hold)
@@ -231,38 +294,48 @@ func TestShutdownSnapshotIsTakenOnce1229(t *testing.T) {
 	run := start896(t, addr, 2)
 	nW.Store(int64(len(run.e.workers)))
 
-	dial := func() (net.Conn, *bufio.Reader) {
+	brs := make([]*bufio.Reader, nW.Load()+1)
+	for i := range brs {
 		c, err := net.DialTimeout("tcp", addr, time.Second)
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
 		t.Cleanup(func() { _ = c.Close() })
 		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-		br := bufio.NewReader(c)
+		brs[i] = bufio.NewReader(c)
 		if _, err := c.Write([]byte(req)); err != nil {
 			t.Fatalf("write: %v", err)
 		}
-		resp, err := http.ReadResponse(br, nil)
+		resp, err := http.ReadResponse(brs[i], nil)
 		if err != nil {
 			t.Fatalf("read the first response: %v", err)
 		}
-		_, _ = br.Discard(int(resp.ContentLength))
-		return c, br
+		_, _ = brs[i].Discard(int(resp.ContentLength))
+		cs = append(cs, c)
+		byAddr[c.LocalAddr().String()] = i
 	}
-	var br1, br2 *bufio.Reader
-	c1, br1 = dial()
-	c2, br2 = dial()
 
 	t0 := time.Now()
 	run.cancel()
-	resp1, err1 := http.ReadResponse(br1, nil)
-	resp2, err2 := http.ReadResponse(br2, nil)
+	select {
+	case <-chosen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("premise: no worker reached its drain")
+	}
+	if star.Load() == nil {
+		t.Fatalf("premise: no worker had accepted two of the %d conns (%d workers)", len(cs), nW.Load())
+	}
+	resp1, err1 := http.ReadResponse(brs[i1], nil)
+	resp2, err2 := http.ReadResponse(brs[i2], nil)
 	returned, err := run.stopped()
 	if err != nil {
 		t.Fatalf("Listen returned %v after a cancel", err)
 	}
 	if err1 != nil {
 		t.Fatalf("the head that was in the kernel when the shutdown began got no answer: %v", err1)
+	}
+	if !wrote2.Load() {
+		t.Fatal("premise: the second head was never written (no pass after the first head's was quiet), so an unanswered second conn says nothing of the snapshot")
 	}
 	if resp1.StatusCode != 200 || !resp1.Close {
 		t.Errorf("answer to the first head: status %d, Connection: close %v, want 200 and close", resp1.StatusCode, resp1.Close)
