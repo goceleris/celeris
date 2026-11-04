@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -46,12 +47,24 @@ import (
 // sleeps and dials on the worker's thread, and a thread that the hogs starve
 // takes 100 to 200 ms for the 25 ms of it. They hold the drain's clock instead
 // (drainclock.SetSeam, as celeris#1244's cells do), at the instant of the cancel,
-// so that the floor cannot run out on its own, and judge whether Listen returns:
-// a worker that the look at the kernel, or the open listener, holds is held to a
-// floor that does not come, and Listen does not return until the test thaws the
-// clock in its cleanup; one that is not held returns whatever the machine's
-// speed. The tests wait listenWait1229 for it, which is no bound on the engine's
-// speed either: a longer wait changes no verdict.
+// so that the floor cannot run out on its own, and judge whether Listen
+// returns. What is guaranteed, and what is not:
+//
+//   - A worker that nothing holds returns whatever the machine's speed: its own
+//     work took 4 ms at the most under the hogs, and no duration is judged.
+//   - A worker that the look at the kernel, renewed by every connection a pass
+//     accepts, holds (the engine before celeris#1243) is held to a floor that
+//     does not come: Listen does not return until the test thaws the clock in
+//     its cleanup, after listenWait1229.
+//   - A worker held only by the open listener (the engine that does not close it
+//     while only the look is outstanding) is held by a response going out in
+//     every pass, which the seam's dials make likely and the machine can
+//     prevent: on a machine that starves the test's own dialers past what any
+//     load seen in CI or in the runs of celeris#1258 did (96 hogs on one CPU),
+//     it found a pass with nothing to send and returned, after 0.3 to 14 s. A
+//     longer wait would not make that a failure, so the listener is checked
+//     directly as well: a worker that is in a second pass of its drain has
+//     closed its listener (see the hold test).
 const listenWait1229 = 20 * time.Second
 
 // perPass1229 is how many connections, with a request each, every drain pass
@@ -67,6 +80,20 @@ const (
 	perPass1229   = 4
 	keepExtra1229 = 256
 )
+
+// logEngine1229 says what engine the test ran on: the workers, the tier the probe
+// found (capped by CELERIS_MAX_IOURING_TIER, which is shown), and whether the
+// workers have a provided-buffer ring (multishot recv, CELERIS_IOURING_MULTISHOT_RECV=1),
+// which is all that tier844 reports as "high".
+func logEngine1229(t *testing.T, e *Engine) {
+	t.Helper()
+	recv := "single-shot recv"
+	if tier844(e) == "high" {
+		recv = "multishot recv with a provided-buffer ring"
+	}
+	t.Logf("engine: %d workers, io_uring tier %s (CELERIS_MAX_IOURING_TIER=%q), %s",
+		len(e.workers), e.tier.Tier(), os.Getenv("CELERIS_MAX_IOURING_TIER"), recv)
+}
 
 // holdDrainClock1229 holds the drain's clock for the test: the real monotonic
 // clock until freeze, and then the instant it was frozen at. The seam is
@@ -97,6 +124,9 @@ type held1229 struct {
 	respErr error
 	run     *engineRun896
 	t0      time.Time // the cancel
+	// openAfterFirst counts the seam calls after a worker's first that found its
+	// listener open.
+	openAfterFirst *atomic.Int64
 }
 
 // shutdownWithAHeadInTheKernel1229 runs the scenario once, up to the answer to
@@ -111,6 +141,8 @@ func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) *held1229 {
 	var (
 		mu       sync.Mutex
 		entered  = map[*Worker]bool{}
+		calls    = map[*Worker]int{}
+		open     atomic.Int64
 		wrote    sync.Once
 		nWorkers atomic.Int64 // set once the engine has started
 		addr     atomic.Value // string, as nWorkers
@@ -124,6 +156,15 @@ func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) *held1229 {
 	hold := func(w *Worker) {
 		mu.Lock()
 		entered[w] = true
+		calls[w]++
+		// The seam runs on the worker's thread. The worker that owns the head has
+		// it in the kernel at its first pass, and the engine closes the listener
+		// in that pass (only the look is outstanding); every other worker is done
+		// in its first pass. A second pass with the listener open is the engine
+		// that does not close it.
+		if calls[w] > 1 && w.listenFD >= 0 {
+			open.Add(1)
+		}
 		n := len(entered)
 		mu.Unlock()
 		// Every worker waits for all of them to be in the drain, so the head
@@ -172,7 +213,7 @@ func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) *held1229 {
 	addr.Store(a)
 	run := start896(t, a, 2)
 	nWorkers.Store(int64(len(run.e.workers)))
-	t.Logf("engine: %d workers, io_uring tier %s", len(run.e.workers), tier844(run.e))
+	logEngine1229(t, run.e)
 	t.Cleanup(clk.thaw)
 
 	c, err := net.DialTimeout("tcp", a, time.Second)
@@ -210,7 +251,7 @@ func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) *held1229 {
 	// before the engine's start and the machine's stalls, must not be the end of
 	// it.
 	_ = c.SetDeadline(time.Now().Add(listenWait1229))
-	res := &held1229{run: run}
+	res := &held1229{run: run, openAfterFirst: &open}
 	clk.freeze()
 	res.t0 = time.Now()
 	run.cancel()
@@ -223,13 +264,19 @@ func shutdownWithAHeadInTheKernel1229(t *testing.T, churn int) *held1229 {
 // and the floor cannot run out. A worker that waits for a head and has nothing
 // to send waits for the heads that were in the kernel when it began, and for
 // nothing a later connection brings; one that the look at the kernel, renewed by
-// every connection a pass accepts, or the listener, which brings a response to
-// send, holds, is held to a floor that does not come, and Listen does not return
-// (the engine before celeris#1243, and one that keeps the listener open while
-// only the look is outstanding).
+// every connection a pass accepts, holds (the engine before celeris#1243) does
+// not return while the clock is held, and the test fails after listenWait1229.
+// A worker that keeps its listener open while only the look is outstanding is
+// held by the responses the connections it accepts bring, which a machine
+// starved far enough can prevent (see listenWait1229): the test therefore also
+// requires that every drain pass after a worker's first finds its listener
+// closed, whatever the machine's speed.
 func TestShutdownHoldIsNotRenewedByNewConnections1229(t *testing.T) {
 	r := shutdownWithAHeadInTheKernel1229(t, 8)
 	returned, took, err := listenReturned1229(r.run, r.t0)
+	if n := r.openAfterFirst.Load(); n > 0 {
+		t.Errorf("%d drain passes after a worker's first found its listener open: the worker that waits only for the heads that were in the kernel must have stopped accepting (celeris#1229)", n)
+	}
 	if !returned {
 		t.Fatalf("Listen had not returned %v after the cancel with the drain's clock held (floor %v, which cannot run out): "+
 			"new connections renewed the worker's look at the kernel, or the open listener brought it responses to send",
@@ -369,6 +416,7 @@ func TestShutdownSnapshotIsTakenOnce1229(t *testing.T) {
 	addr := freeAddr639(t)
 	run := start896(t, addr, 2)
 	nW.Store(int64(len(run.e.workers)))
+	logEngine1229(t, run.e)
 	t.Cleanup(clk.thaw)
 
 	brs := make([]*bufio.Reader, nW.Load()+1)
