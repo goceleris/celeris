@@ -66,6 +66,12 @@ func TestClusterReplayGroupsShardChannelsBySlot1204(t *testing.T) {
 	if got := to.ssubCommands(); !slices.EqualFunc(got, want, slices.Equal[[]string]) {
 		t.Errorf("the new owner received SSUBSCRIBE %q, want one per slot, the served slot first: %q", got, want)
 	}
+	// ssubCommands lists a command when the node has read it, before it checks
+	// the slot and registers the channels: an SPUBLISH made then reaches no one
+	// (celeris#1255). The message goes out once the node holds every channel.
+	poll(t, "every channel of both slots registered on the new owner", 5*time.Second, func() bool {
+		return to.ssubscribed(slotsChA1, slotsChA2, slotsChB1, slotsChB2)
+	})
 	cl.spublish(slotsChB1, "mb")
 	cl.spublish(slotsChA1, "ma")
 	poll(t, "a message of the first slot", 5*time.Second, func() bool { return rc.count("ma") == 1 })
