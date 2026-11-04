@@ -78,9 +78,9 @@ func probe761H2Cell(t *testing.T, name string, eng celeris.EngineType, async boo
 	}
 	t.Logf("ENGINE requested=%s running=%s", eng, running)
 
-	cl := &http.Client{Timeout: 20 * time.Second, Transport: &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
+	cl := &http.Client{Timeout: 20 * time.Second, Transport: &http2.Transport{ //nolint:staticcheck // SA1019: x/net's h2c client is the one #809 measures.
+		AllowHTTP: true, //nolint:staticcheck // SA1019: as above.
+		DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) { //nolint:staticcheck // SA1019: as above.
 			var d net.Dialer
 			return d.DialContext(ctx, network, a)
 		},
