@@ -223,10 +223,13 @@ type redisState struct {
 	// sub-sliced. The slab is reset ([:0]) at the start of each pipeline
 	// Exec (sync: execManyCore, direct: execManyDirect) but the backing array
 	// is retained across calls, so steady-state pipelines of a given size
-	// never allocate. Nothing that outlives an Exec may alias the slab: typed
-	// strings are re-homed into Pipeline.strSlab by transferResult, and the
-	// direct path detaches mismatched replies (copyFallback). Slabs exceeding
-	// maxSlabRetain after a dispatch cycle are released to the GC.
+	// never allocate. On the direct path nothing that outlives an Exec
+	// aliases the slab: typed strings are re-homed into Pipeline.strSlab by
+	// transferResult, and mismatched replies are detached (copyFallback).
+	// The sync path is NOT audited for that: Tx/Watch results may still alias
+	// the slab (celeris#1265), and the syncMulti==nil branch of execManyCore
+	// does not reset it (celeris#1266). Slabs exceeding maxSlabRetain after a
+	// dispatch cycle are released to the GC.
 	copySlab []byte
 }
 
