@@ -221,9 +221,15 @@ type redisState struct {
 	// all string copies during a sync pipeline dispatch. Instead of one
 	// allocation per response, all Str bytes are appended to this slab and
 	// sub-sliced. The slab is reset ([:0]) at the start of each pipeline
-	// Exec but the backing array is retained across calls, so steady-state
-	// pipelines of a given size never allocate. Slabs exceeding
-	// maxSlabRetain after a dispatch cycle are released to the GC.
+	// Exec (sync: execManyCore, direct: execManyDirect) but the backing array
+	// is retained across calls, so steady-state pipelines of a given size
+	// never allocate. On the direct path nothing that outlives an Exec
+	// aliases the slab: typed strings are re-homed into Pipeline.strSlab by
+	// transferResult, and mismatched replies are detached (copyFallback).
+	// The sync path is NOT audited for that: Tx/Watch results may still alias
+	// the slab (celeris#1265), and the syncMulti==nil branch of execManyCore
+	// does not reset it (celeris#1266). Slabs exceeding maxSlabRetain after a
+	// dispatch cycle are released to the GC.
 	copySlab []byte
 }
 
@@ -400,6 +406,18 @@ func (s *redisState) dispatch(v protocol.Value) error {
 	return nil
 }
 
+// copyFallback copies a reply whose type did not match the typed extraction
+// (and that therefore survives Exec as a *Value in the Pipeline). On the sync
+// pipeline path it uses the slab, as before. On the direct path (no
+// syncPipeReqs) the slab is reset at the start of every Exec, so a Value that
+// outlives the Exec must not alias it: it is detached onto the heap instead.
+func (s *redisState) copyFallback(v protocol.Value) protocol.Value {
+	if s.syncPipeReqs != nil {
+		return s.copyValueSlab(v)
+	}
+	return copyValueDetached(v)
+}
+
 // extractDirect extracts the typed result from v directly into req's typed
 // fields, bypassing the intermediate protocol.Value copy entirely. String
 // bytes are appended to copySlab and converted to a Go string via
@@ -424,7 +442,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyInt:
 			req.strResult = strconv.FormatInt(v.Int, 10)
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	case expectStatus:
@@ -434,7 +452,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyNull:
 			req.resultErr = ErrNil
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	case expectInt:
@@ -444,7 +462,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyBulk, protocol.TySimple:
 			n, err := strconv.ParseInt(string(v.Str), 10, 64)
 			if err != nil {
-				req.result = s.copyValueSlab(v)
+				req.result = s.copyFallback(v)
 				req.expect = expectNone
 			} else {
 				req.intResult = n
@@ -452,7 +470,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyNull:
 			req.resultErr = ErrNil
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	case expectFloat:
@@ -462,7 +480,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyBulk, protocol.TySimple:
 			f, err := strconv.ParseFloat(string(v.Str), 64)
 			if err != nil {
-				req.result = s.copyValueSlab(v)
+				req.result = s.copyFallback(v)
 				req.expect = expectNone
 			} else {
 				req.floatResult = f
@@ -470,7 +488,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyNull:
 			req.resultErr = ErrNil
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	case expectBool:
@@ -482,11 +500,11 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyNull:
 			req.resultErr = ErrNil
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	default:
-		req.result = s.copyValueSlab(v)
+		req.result = s.copyFallback(v)
 	}
 }
 
