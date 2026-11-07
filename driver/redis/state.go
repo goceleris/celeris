@@ -217,19 +217,25 @@ type redisState struct {
 	// keeps the func() bool / func() callbacks alloc-free.
 	multiPollLastReq *redisRequest
 
-	// copySlab is a single contiguous buffer used by copyValueSlab to batch
-	// all string copies during a sync pipeline dispatch. Instead of one
-	// allocation per response, all Str bytes are appended to this slab and
-	// sub-sliced. The slab is reset ([:0]) at the start of each pipeline
-	// Exec (sync: execManyCore, direct: execManyDirect) but the backing array
-	// is retained across calls, so steady-state pipelines of a given size
-	// never allocate. On the direct path nothing that outlives an Exec
-	// aliases the slab: typed strings are re-homed into Pipeline.strSlab by
-	// transferResult, and mismatched replies are detached (copyFallback).
-	// The sync path is NOT audited for that: Tx/Watch results may still alias
-	// the slab (celeris#1265), and the syncMulti==nil branch of execManyCore
-	// does not reset it (celeris#1266). Slabs exceeding maxSlabRetain after a
-	// dispatch cycle are released to the GC.
+	// copySlab is a single contiguous buffer that batches the string copies of
+	// one pipeline Exec: extractDirect appends typed string replies to it
+	// (slabString) and, on the sync path only, dispatch appends untyped
+	// replies to it (copyValueSlab). Instead of one allocation per response,
+	// all Str bytes are appended and sub-sliced. It is reset ([:0]) under
+	// writerMu at the start of every pipeline Exec on all three branches of
+	// execManyCore (sync, direct via execManyDirect, and bridge/async), and the
+	// backing array is retained across calls, so steady-state pipelines of a
+	// given size never allocate.
+	//
+	// Because the next Exec on the conn rewrites it, nothing a caller keeps
+	// after an Exec may alias the slab. Typed strings are re-homed into
+	// Pipeline.strSlab by transferResult; replies whose type did not match
+	// are detached by copyFallback; Pipeline.transferResult detaches any
+	// untyped result it keeps; Tx.Exec detaches each element of the EXEC
+	// array (celeris#1265) before the conn goes back to the pool. Any new
+	// consumer of an untyped sync-path req.result must detach it the same way.
+	// Slabs exceeding maxSlabRetain after a dispatch cycle are released to the
+	// GC.
 	copySlab []byte
 }
 
@@ -407,14 +413,12 @@ func (s *redisState) dispatch(v protocol.Value) error {
 }
 
 // copyFallback copies a reply whose type did not match the typed extraction
-// (and that therefore survives Exec as a *Value in the Pipeline). On the sync
-// pipeline path it uses the slab, as before. On the direct path (no
-// syncPipeReqs) the slab is reset at the start of every Exec, so a Value that
-// outlives the Exec must not alias it: it is detached onto the heap instead.
+// (and that therefore survives Exec as a *Value in the Pipeline). The slab is
+// reset at the start of every Exec on every branch, so a Value that outlives
+// the Exec must not alias it: it is detached onto the heap (celeris#1265).
+// This path runs only for unexpected reply types, never for the typed fast
+// path.
 func (s *redisState) copyFallback(v protocol.Value) protocol.Value {
-	if s.syncPipeReqs != nil {
-		return s.copyValueSlab(v)
-	}
 	return copyValueDetached(v)
 }
 
