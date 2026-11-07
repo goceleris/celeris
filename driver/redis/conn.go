@@ -404,6 +404,12 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 	last := reqs[n-1]
 	c.writerMu.Lock()
 	defer c.writerMu.Unlock()
+	// Reset the copy slab so this batch's typed replies reuse the backing
+	// array of the previous Exec instead of appending to it (celeris#854).
+	// The previous Exec's results were re-homed into the Pipeline's own slab
+	// before it returned, and the direct path never hands out slab-backed
+	// Values (copyFallback), so nothing aliases the bytes overwritten here.
+	c.state.copySlab = c.state.copySlab[:0]
 	for i := 0; i < n; i++ {
 		c.state.bridge.Enqueue(reqs[i])
 	}
