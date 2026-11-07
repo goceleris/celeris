@@ -27,7 +27,7 @@ type syncSlabFake struct {
 	queue []string // keys of the GETs queued inside MULTI
 }
 
-func (f *syncSlabFake) val() string { return strings.Repeat(string(rune(f.fill.Load())), 4096) }
+func (f *syncSlabFake) val() string { return strings.Repeat(string(f.fill.Load()), 4096) }
 
 func (f *syncSlabFake) handle(cmd []string, w *bufio.Writer) {
 	f.mu.Lock()
@@ -96,7 +96,7 @@ func syncSlabClient(t *testing.T) (*Client, *syncSlabFake) {
 	return cl, f
 }
 
-func txOfGets(t *testing.T, cl *Client, ctx context.Context, n int) []*StringCmd {
+func txOfGets(ctx context.Context, t *testing.T, cl *Client, n int) []*StringCmd {
 	t.Helper()
 	tx, err := cl.TxPipeline(ctx)
 	if err != nil {
@@ -112,7 +112,7 @@ func txOfGets(t *testing.T, cl *Client, ctx context.Context, n int) []*StringCmd
 	return cmds
 }
 
-func pipeOfGets(t *testing.T, cl *Client, ctx context.Context, n int) {
+func pipeOfGets(ctx context.Context, t *testing.T, cl *Client, n int) {
 	t.Helper()
 	p := cl.Pipeline()
 	for i := 0; i < n; i++ {
@@ -133,13 +133,13 @@ func TestSyncTxResultsSurviveLaterExec1265(t *testing.T) {
 		t.Run("then_"+second, func(t *testing.T) {
 			cl, f := syncSlabClient(t)
 			const n = 10
-			cmds := txOfGets(t, cl, ctx, n)
+			cmds := txOfGets(ctx, t, cl, n)
 			want := strings.Repeat("a", 4096)
 			f.fill.Store('b')
 			if second == "tx" {
-				txOfGets(t, cl, ctx, n)
+				txOfGets(ctx, t, cl, n)
 			} else {
-				pipeOfGets(t, cl, ctx, n)
+				pipeOfGets(ctx, t, cl, n)
 			}
 			for i, c := range cmds {
 				got, err := c.Result()
@@ -172,7 +172,7 @@ func TestSyncPipelineFallbackResultSurvivesLaterExec1265(t *testing.T) {
 		t.Fatal("fixture: the mismatched INCR reply was not kept as a Value")
 	}
 	f.fill.Store('b')
-	pipeOfGets(t, cl, ctx, 10)
+	pipeOfGets(ctx, t, cl, 10)
 	_ = incr
 	got := string(first.cmds[0].val.Str)
 	if want := strings.Repeat("a", 4096); got != want {
@@ -189,14 +189,14 @@ func TestSyncTxResultsRaceWithLaterExec1265(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cl, f := syncSlabClient(t)
-	cmds := txOfGets(t, cl, ctx, 10)
+	cmds := txOfGets(ctx, t, cl, 10)
 	f.fill.Store('b')
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 20; i++ {
-			pipeOfGets(t, cl, ctx, 10)
+			pipeOfGets(ctx, t, cl, 10)
 		}
 	}()
 	for i := 0; i < 20; i++ {
@@ -228,7 +228,7 @@ func TestSyncTxNestedResultsSurviveLaterExec1265(t *testing.T) {
 		t.Fatalf("fixture: nested replies not decoded as 3-array and 2-map: %+v %+v", av, mv)
 	}
 	f.fill.Store('b')
-	pipeOfGets(t, cl, ctx, 10)
+	pipeOfGets(ctx, t, cl, 10)
 	want := strings.Repeat("a", 4096)
 	check := func(what string, b []byte) {
 		if string(b) != want {
