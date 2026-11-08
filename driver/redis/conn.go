@@ -445,6 +445,14 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 		_ = c.closeWithErr(err)
 		return reqs, err
 	}
+	// Auto and block mode (celeris#854) wait for the reply elsewhere; the
+	// default, netpoll, runs the loop below unchanged, with nothing added but
+	// this one load of the mode. Never off linux.
+	if directBlockSupported {
+		if mode := currentDirectWait(); mode != directWaitNetpoll {
+			return reqs, c.awaitDirectReplies(ctx, mode, last)
+		}
+	}
 	for !last.finished.Load() {
 		if c.tcpFd > 0 {
 			if rn, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, msgDontWait); rn > 0 {
