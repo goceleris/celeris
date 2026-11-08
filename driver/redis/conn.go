@@ -153,6 +153,14 @@ type redisConn struct {
 	// transport-level close can wake the PubSub's reconnect goroutine.
 	onPubSubCloseMu sync.Mutex
 	onPubSubClose   func(error)
+
+	// directWaitEWMA is the moving average, in ns, of the first-chunk wait of
+	// this conn's pipeline Execs, and directBlockOn the wait it selects: true
+	// means poll(2) rather than Go's netpoll (celeris#854, see direct_wait.go).
+	// Both are read and written under writerMu. They sit at the end of the
+	// struct so that every other field keeps its offset.
+	directWaitEWMA int64
+	directBlockOn  bool
 }
 
 // errBox wraps an error for atomic.Pointer — atomic.Value panics on type
