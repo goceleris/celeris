@@ -404,6 +404,12 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 	last := reqs[n-1]
 	c.writerMu.Lock()
 	defer c.writerMu.Unlock()
+	// Reset the copy slab so this batch's typed replies reuse the backing
+	// array of the previous Exec instead of appending to it (celeris#854).
+	// The previous Exec's results were re-homed into the Pipeline's own slab
+	// before it returned, and the direct path never hands out slab-backed
+	// Values (copyFallback), so nothing aliases the bytes overwritten here.
+	c.state.copySlab = c.state.copySlab[:0]
 	for i := 0; i < n; i++ {
 		c.state.bridge.Enqueue(reqs[i])
 	}
@@ -696,11 +702,19 @@ func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redis
 		// Partial or EAGAIN: fall through to spin-wait for the rest.
 		// Bridge was populated in beforeRearm, event loop will deliver.
 	} else {
-		// Async path: enqueue all into bridge, write, spin-wait.
+		// Async path: enqueue all into bridge, write, spin-wait. Reset the
+		// copy slab first, as the sync and direct branches do, so this
+		// batch's typed replies reuse the previous Exec's backing array
+		// instead of appending to it (celeris#1266). Nothing that outlives an
+		// Exec aliases the slab (see redisState.copySlab).
+		c.writerMu.Lock()
+		c.state.copySlab = c.state.copySlab[:0]
 		for i := 0; i < n; i++ {
 			c.state.bridge.Enqueue(reqs[i])
 		}
-		if err := c.sendRaw(data); err != nil {
+		err := c.sendRaw(data)
+		c.writerMu.Unlock()
+		if err != nil {
 			_ = c.closeWithErr(err)
 			return reqs, err
 		}
