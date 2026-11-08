@@ -212,7 +212,11 @@ func (tx *Tx) Exec(ctx context.Context) error {
 			}
 			continue
 		}
-		v := e
+		// The EXEC array was decoded on the sync path into the conn's
+		// copySlab, which the next Exec on this conn rewrites once the conn
+		// is back in the pool: detach each element onto the heap
+		// (celeris#1265).
+		v := copyValueDetached(e)
 		tx.cmds[i].val = &v
 	}
 	return firstErr

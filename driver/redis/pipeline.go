@@ -387,8 +387,12 @@ func (p *Pipeline) transferResult(pc *pipeCmd, r *redisRequest) {
 	} else {
 		// Allocate a Value on the heap. This path runs only for the async
 		// fallback, unexpected reply types, or error replies — the common
-		// sync pipeline case uses the direct path above.
-		v := r.result
+		// sync pipeline case uses the direct path above. On the sync path an
+		// untyped r.result may alias the conn's copySlab, which the next
+		// Exec on the conn rewrites, so detach it before the caller keeps it
+		// (celeris#1265). Already-detached values are copied once more; this
+		// path is rare.
+		v := copyValueDetached(r.result)
 		pc.val = &v
 	}
 }

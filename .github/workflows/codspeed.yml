@@ -323,7 +323,7 @@ jobs:
           # GOMODCACHE, so a restored setup-go cache would never be read.
           cache: false
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         env:
           # Frame-pointer unwinding: DWARF unwinding leaves Go flamegraphs
           # incomplete on arm64 (https://codspeed.io/docs/benchmarks/go).
