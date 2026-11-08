@@ -335,6 +335,12 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 		p.w.Reset()
 		p.cmds = p.cmds[:0]
 		p.reqs = p.reqs[:0]
+		// Give the pool slot back (celeris#1268). Every error execManyCore
+		// returns has closed the conn first (as does the ErrClosed of a conn
+		// that was already closed), and releaseCmd discards a closed conn, so
+		// Open drops and the slot is freed. Without this a failed Exec kept
+		// its slot for good.
+		p.client.pool.releaseCmd(conn)
 		return err
 	}
 	var firstErr error
