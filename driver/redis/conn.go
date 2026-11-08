@@ -153,6 +153,14 @@ type redisConn struct {
 	// transport-level close can wake the PubSub's reconnect goroutine.
 	onPubSubCloseMu sync.Mutex
 	onPubSubClose   func(error)
+
+	// directWaitEWMA is the moving average, in ns, of the first-chunk wait of
+	// this conn's pipeline Execs, and directBlockOn the wait it selects: true
+	// means poll(2) rather than Go's netpoll (celeris#854, see direct_wait.go).
+	// Both are read and written under writerMu. They sit at the end of the
+	// struct so that every other field keeps its offset.
+	directWaitEWMA int64
+	directBlockOn  bool
 }
 
 // errBox wraps an error for atomic.Pointer — atomic.Value panics on type
@@ -436,6 +444,14 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 	if _, err := c.tcp.Write(data); err != nil {
 		_ = c.closeWithErr(err)
 		return reqs, err
+	}
+	// Auto and block mode (celeris#854) wait for the reply elsewhere; the
+	// default, netpoll, runs the loop below unchanged, with nothing added but
+	// this one load of the mode. Never off linux.
+	if directBlockSupported {
+		if mode := currentDirectWait(); mode != directWaitNetpoll {
+			return reqs, c.awaitDirectReplies(ctx, mode, last)
+		}
 	}
 	for !last.finished.Load() {
 		if c.tcpFd > 0 {
