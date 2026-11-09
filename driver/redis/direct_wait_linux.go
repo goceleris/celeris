@@ -24,7 +24,9 @@ const directPollSlice = time.Millisecond
 // a stalled server, or a ctx with no deadline, costs a thread for at most this
 // long per wait, and the window in which the conn's fd is used outside Go's
 // reference count is bounded by it too. It is a few times the 1-5 ms round
-// trips the blocking wait is for.
+// trips the blocking wait is for. The budget is per wait and restarts for every
+// chunk of the reply that arrives, so a slowly streamed multi-chunk reply can
+// hold the thread for the whole transfer.
 const directPollBudget = 20 * time.Millisecond
 
 // directPollIn waits on the calling thread, in poll(2), until fd is readable

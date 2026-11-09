@@ -60,18 +60,21 @@ type syncMultiRoundTripper interface {
 //     sync round-trips via WriteAndPoll / WriteAndPollBusy. Driver FDs
 //     share the celeris HTTP engine's LockOSThread'd worker. Direct
 //     net.Conn.Read on that locked M would futex-storm.
-//   - Direct (cfg.Engine == nil OR AsyncHandlers=true, cmd pool only):
-//     tcp holds the live *net.TCPConn; exec() writes and reads directly
-//     on the caller's goroutine via Go's netpoll. Pub/sub conns still
-//     use the mini-loop path — unsolicited server-push messages need
-//     event-loop delivery.
+//   - Direct (AsyncHandlers=true, or the WithEngine fallback for an engine
+//     without a sync round-trip, cmd pool only): tcp holds the live
+//     *net.TCPConn; exec() writes and reads directly on the caller's
+//     goroutine, parked in Go's netpoll or, for a slow pipeline or Tx reply
+//     on linux, waiting in poll(2) on its thread (celeris#854, see
+//     direct_wait.go). Pub/sub conns still use the mini-loop path —
+//     unsolicited server-push messages need event-loop delivery.
 type redisConn struct {
 	useDirect bool
 
 	// Direct-mode fields.
 	tcp *net.TCPConn
 	// tcpFd caches the raw fd for MSG_DONTWAIT peeks before falling
-	// through to tcp.Read (which parks the G via Go's netpoll). A
+	// through to tcp.Read (which parks the G via Go's netpoll; a slow
+	// pipeline or Tx reply may wait in poll(2) first, see direct_wait.go). A
 	// single non-blocking peek catches loopback-fast responses without
 	// paying the netpoll wakeup round-trip. Zero when unavailable.
 	tcpFd sockFD
@@ -161,6 +164,10 @@ type redisConn struct {
 	// struct so that every other field keeps its offset.
 	directWaitEWMA int64
 	directBlockOn  bool
+	// netpollByDefault makes an unset CELERIS_REDIS_DIRECT_WAIT mean netpoll on
+	// this conn: set by the pool for the configurations the auto default was
+	// not measured on (see newDirectCmdPool). An explicit auto or block ignores it.
+	netpollByDefault bool
 }
 
 // errBox wraps an error for atomic.Pointer — atomic.Value panics on type
@@ -446,11 +453,12 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 		_ = c.closeWithErr(err)
 		return reqs, err
 	}
-	// Auto and block mode (celeris#854) wait for the reply elsewhere; the
-	// default, netpoll, runs the loop below unchanged, with nothing added but
-	// this one load of the mode. Never off linux.
+	// Auto (the default on linux, for the pools it was measured on) and block
+	// mode (celeris#854) wait for the reply elsewhere; netpoll mode
+	// (CELERIS_REDIS_DIRECT_WAIT=netpoll) runs the loop below unchanged, with
+	// nothing added but this one load of the mode. Never off linux.
 	if directBlockSupported {
-		if mode := currentDirectWait(); mode != directWaitNetpoll {
+		if mode := c.directWait(); mode != directWaitNetpoll {
 			return reqs, c.awaitDirectReplies(ctx, mode, last)
 		}
 	}

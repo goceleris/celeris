@@ -52,7 +52,7 @@ func TestDirectWaitSlowRepliesBlockOncePerExec854(t *testing.T) {
 						t.Errorf("netpoll mode blocked: %+v", d)
 					}
 					if d.NetpollParks != 0 {
-						t.Errorf("netpoll mode counted parks (%d): the default path counts nothing", d.NetpollParks)
+						t.Errorf("netpoll mode counted parks (%d): the netpoll path counts nothing", d.NetpollParks)
 					}
 					return
 				}
@@ -69,6 +69,56 @@ func TestDirectWaitSlowRepliesBlockOncePerExec854(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestDirectWaitDefaultBlocksOnSlowReplies854: with nothing pinning the mode,
+// a conn whose replies take 2 ms waits in poll(2) when the environment is unset
+// and the pool is a measured one (AsyncHandlers, bounded): the default on linux
+// is auto, not netpoll. The pools the default was not measured on, the
+// WithEngine fallback and an unbounded one (negative PoolSize), stay on netpoll
+// when the variable is unset and block when it says auto; "netpoll" never
+// blocks.
+func TestDirectWaitDefaultBlocksOnSlowReplies854(t *testing.T) {
+	const n = 20
+	for _, c := range []struct {
+		name     string
+		env      string // "-" means unset
+		pool     int
+		fallback bool
+		block    bool
+	}{
+		{"unset/async", "-", 1, false, true},
+		{"empty/async", "", 1, false, true},
+		{"netpoll/async", "netpoll", 1, false, false},
+		{"unset/engine-fallback", "-", 1, true, false},
+		{"auto/engine-fallback", "auto", 1, true, true},
+		{"unset/unbounded", "-", -1, false, false},
+		{"auto/unbounded", "auto", -1, false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			resetDirectWaitForTest(t) // the environment is read by the first Exec below
+			t.Setenv(directWaitEnv, c.env)
+			if c.env == "-" {
+				if err := os.Unsetenv(directWaitEnv); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f := startWaitFake(t)
+			f.setDelay(2 * time.Millisecond)
+			cl := newWaitClientFor(t, f.addr(), c.pool, c.fallback)
+			execN(t, cl, 4, 10) // warm: arms auto mode
+			before := directWaitSnapshot()
+			execN(t, cl, n, 10)
+			d := directWaitSnapshot().since(before)
+			t.Logf("%s: %d Execs -> %+v", c.name, n, d)
+			if c.block && d.Blocks < n/2 {
+				t.Errorf("blocks = %d over %d slow Execs, want at least %d", d.Blocks, n, n/2)
+			}
+			if !c.block && (d.Blocks != 0 || d.Handoffs != 0 || d.NetpollParks != 0) {
+				t.Errorf("the netpoll path counted something: %+v", d)
+			}
+		})
 	}
 }
 

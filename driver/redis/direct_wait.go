@@ -10,13 +10,16 @@ import (
 	"time"
 )
 
-// How execManyDirect waits for the first bytes of a pipeline's reply
-// (celeris#854). A direct-mode conn can park the goroutine in Go's netpoll
-// (cheap when the reply is quick) or wait in poll(2) on the caller's own
-// thread (cheaper when the round trip is long: no netpoll wake-up hop). The
-// switch below picks one for the whole process; the counters say what each
-// Exec did. Both are unexported on purpose: no public API, and the tests and a
-// probe built into the package read them.
+// How execManyDirect waits for the first bytes of a pipeline or Tx reply
+// (celeris#854). A pipeline or Tx Exec on a direct-mode conn can park the
+// goroutine in Go's netpoll (cheap when the reply is quick) or wait in poll(2)
+// on the caller's own thread (cheaper when the round trip is long: no netpoll
+// wake-up hop). The switch below picks one for the whole process; the counters
+// say what each Exec did. With the environment variable unset the choice is
+// auto on linux (directBlockSupported) for the conns the default was measured
+// on and netpoll for the rest (see directWaitDefault). Both are unexported on
+// purpose: no public API, and the tests and a probe built into the package
+// read them.
 
 // directWaitKind is the wait-mode switch.
 type directWaitKind int32
@@ -25,19 +28,30 @@ const (
 	// directWaitUnset means the environment has not been read yet.
 	directWaitUnset directWaitKind = -1
 	// directWaitNetpoll always parks in Go's netpoll (the behaviour before
-	// #854). It is the default.
+	// #854). It is the opt-out (CELERIS_REDIS_DIRECT_WAIT=netpoll) and the
+	// only mode off linux.
 	directWaitNetpoll directWaitKind = 0
-	// directWaitAuto lets each conn choose from its own first-chunk wait.
+	// directWaitAuto lets each conn choose from its own first-chunk wait. It is
+	// the default where directBlockSupported.
 	directWaitAuto directWaitKind = 1
-	// directWaitBlock always waits in poll(2) (where the platform has it).
+	// directWaitBlock always waits in poll(2) (on linux, directBlockSupported).
 	directWaitBlock directWaitKind = 2
+	// directWaitDefault is what an unset or empty environment gives on linux
+	// (directBlockSupported): auto, except on a conn whose pool opted out of
+	// the default (redisConn.netpollByDefault), which stays on netpoll. It is
+	// resolved per conn by redisConn.directWait and never reaches
+	// awaitDirectReplies.
+	directWaitDefault directWaitKind = 3
 )
 
-// directWaitEnv names the environment variable that sets the mode: "netpoll"
-// (the default), "auto" or "block", compared after trimming spaces and folding
-// case. Any other value means netpoll: a mistyped setting never switches the
-// feature on. It is read on the first Exec that needs it, not at program start,
-// so a program may os.Setenv it first.
+// directWaitEnv names the environment variable that sets the mode: "netpoll",
+// "auto" or "block", compared after trimming spaces and folding case. Unset,
+// empty or blank means the default: auto on linux (directBlockSupported) for
+// the pools it was measured on, netpoll elsewhere and for the other pools (see
+// directWaitDefault). An explicit "auto" or "block" applies to every direct
+// conn. An unknown value falls back to netpoll, the pre-#854 path. It is read
+// on the first Exec that needs it, not at program start, so a program may
+// os.Setenv it first.
 const directWaitEnv = "CELERIS_REDIS_DIRECT_WAIT"
 
 // directWaitMode is the process-wide mode, directWaitUnset until first use;
@@ -61,12 +75,40 @@ func currentDirectWait() directWaitKind {
 	if m := directWaitKind(directWaitMode.Load()); m != directWaitUnset {
 		return m
 	}
-	return directWaitNetpoll // a test reset the mode between the two loads
+	return defaultDirectWait() // a test reset the mode between the two loads
 }
 
-// parseDirectWait maps the environment value to a mode; unknown means netpoll.
+// defaultDirectWait is the mode when the environment does not name one:
+// directWaitDefault on linux (directBlockSupported), netpoll elsewhere.
+func defaultDirectWait() directWaitKind {
+	if directBlockSupported {
+		return directWaitDefault
+	}
+	return directWaitNetpoll
+}
+
+// directWait is the mode for this conn's Execs: the process-wide mode, with
+// directWaitDefault resolved to auto, or to netpoll on a conn whose pool opted
+// out of the default.
+func (c *redisConn) directWait() directWaitKind {
+	m := currentDirectWait()
+	if m != directWaitDefault {
+		return m
+	}
+	if c.netpollByDefault {
+		return directWaitNetpoll
+	}
+	return directWaitAuto
+}
+
+// parseDirectWait maps the environment value to a mode: empty (after trimming)
+// is the default (defaultDirectWait), an unknown value falls back to netpoll.
 func parseDirectWait(s string) directWaitKind {
 	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return defaultDirectWait()
+	case "netpoll":
+		return directWaitNetpoll
 	case "auto":
 		return directWaitAuto
 	case "block":
@@ -98,7 +140,7 @@ type directWaitCounters struct {
 	handoffs paddedCounter
 	// netpollParks counts the reads handed to Go's netpoll (tcp.Read) after the
 	// non-blocking peek found nothing, handoffs included, by waits in auto or
-	// block mode. The default netpoll mode runs the pre-#854 loop and counts
+	// block mode. The netpoll mode runs the pre-#854 loop and counts
 	// nothing: blocks and handoffs staying 0 is how a test sees it did not block.
 	netpollParks paddedCounter
 }

@@ -27,7 +27,7 @@ func directSlabClient(t *testing.T, handler func(cmd []string, w *bufio.Writer))
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { eventloop.Release(prov) })
-	pool := newDirectCmdPool(Config{Addr: fake.Addr(), PoolSize: 1}, prov)
+	pool := newDirectCmdPool(Config{Addr: fake.Addr(), PoolSize: 1}, prov, false)
 	cl := &Client{cfg: Config{Addr: fake.Addr(), PoolSize: 1}, pool: pool}
 	t.Cleanup(func() { _ = cl.Close() })
 	return cl
