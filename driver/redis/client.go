@@ -46,7 +46,7 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		pool := newDirectCmdPool(cfg, provider)
+		pool := newDirectCmdPool(cfg, provider, false)
 		return &Client{cfg: cfg, pool: pool}, nil
 	}
 	provider, err := eventloop.Resolve(cfg.Engine)
@@ -58,11 +58,14 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	// handshake: the handler goroutine is LockOSThread'd to the engine
 	// worker, so wait() parks the M and the CQE carrying the HELLO reply
 	// never drains. Fall back to direct mode (net.Conn via Go netpoll),
-	// which parks locked-M Gs cleanly.
+	// which parks locked-M Gs cleanly. A slow pipeline or Tx reply there may
+	// instead wait in poll(2) on that locked thread (celeris#854), which
+	// CELERIS_REDIS_DIRECT_WAIT=auto|block allows; the unset default keeps
+	// netpoll on this pool, which the auto default was not measured on.
 	if cfg.Engine != nil {
 		if wl := provider.WorkerLoop(0); wl != nil {
 			if _, ok := wl.(syncRoundTripper); !ok {
-				pool := newDirectCmdPool(cfg, provider)
+				pool := newDirectCmdPool(cfg, provider, true)
 				return &Client{cfg: cfg, pool: pool}, nil
 			}
 		}

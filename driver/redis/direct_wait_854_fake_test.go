@@ -207,6 +207,14 @@ func (f *waitFake) reply(c net.Conn, b []byte) bool {
 // newWaitClient is a Client on the direct (AsyncHandlers) command pool.
 func newWaitClient(tb testing.TB, addr string, pool int) *Client {
 	tb.Helper()
+	return newWaitClientFor(tb, addr, pool, false)
+}
+
+// newWaitClientFor is newWaitClient on the direct pool of the WithEngine
+// fallback when engineFallback is true. pool is the PoolSize (negative: an
+// unbounded pool).
+func newWaitClientFor(tb testing.TB, addr string, pool int, engineFallback bool) *Client {
+	tb.Helper()
 	cfg := Config{Addr: addr}
 	WithPoolSize(pool)(&cfg)
 	prov, err := eventloop.Resolve(nil)
@@ -214,7 +222,7 @@ func newWaitClient(tb testing.TB, addr string, pool int) *Client {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { eventloop.Release(prov) })
-	cl := &Client{cfg: cfg, pool: newDirectCmdPool(cfg, prov)}
+	cl := &Client{cfg: cfg, pool: newDirectCmdPool(cfg, prov, engineFallback)}
 	tb.Cleanup(func() { _ = cl.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

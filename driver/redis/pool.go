@@ -30,7 +30,14 @@ type redisPool struct {
 // pub/sub needs event-driven delivery of unsolicited push frames. provider
 // is the package-level standalone Loop from eventloop.Resolve(nil) (or the
 // engine's provider when engine is non-nil, for pubsub colocation).
-func newDirectCmdPool(cfg Config, provider engine.EventLoopProvider) *redisPool {
+//
+// With CELERIS_REDIS_DIRECT_WAIT unset, the conns of this pool wait for slow
+// pipeline and Tx replies in auto mode on linux (celeris#854), except the
+// conns of engineFallback (the WithEngine fallback, whose handler runs on a
+// locked engine worker thread) and of an unbounded pool (negative PoolSize):
+// the default was measured on neither, and a poll(2) wait holds one OS thread
+// per in-flight Exec. They stay on netpoll unless the variable says auto or block.
+func newDirectCmdPool(cfg Config, provider engine.EventLoopProvider, engineFallback bool) *redisPool {
 	nwCmd := runtime.GOMAXPROCS(0)
 	if nwCmd <= 0 {
 		nwCmd = 1
@@ -83,6 +90,7 @@ func newDirectCmdPool(cfg Config, provider engine.EventLoopProvider) *redisPool 
 		c.maxIdleTime = idleT
 		c.state.onPush = cfg.OnPush
 		c.workerID = workerID
+		c.netpollByDefault = engineFallback || cfg.PoolSize < 0
 		return c, nil
 	}
 	p.cmd = async.NewPool[*redisConn](asyncCfgCmd, dialCmdDirect)

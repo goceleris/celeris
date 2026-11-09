@@ -46,6 +46,30 @@
 // WithEngine colocation. It is tested in CI on windows-latest against
 // in-process fake servers, not benchmarked and not tuned; do not deploy it.
 //
+// # Waiting for pipeline and Tx replies
+//
+// On Linux, a pipeline or Tx Exec on a direct-mode connection (the pool of a
+// server with AsyncHandlers) can wait for its reply in poll(2) on the calling
+// goroutine's own thread instead of parking in Go's netpoll, which saves the
+// netpoll wake-up hop when the round trip is long (celeris#854). The
+// environment variable CELERIS_REDIS_DIRECT_WAIT, read on the first such Exec,
+// sets the mode:
+//
+//   - unset or empty: auto on Linux, where each connection switches to poll(2)
+//     while its first-reply wait stays above 300 us and back to netpoll below
+//     150 us. Elsewhere, and for a pool with a negative PoolSize or the
+//     WithEngine fallback pool, netpoll;
+//   - "netpoll": always Go's netpoll, the behaviour before #854 (the opt-out);
+//   - "auto": as the default, on every direct-mode pool;
+//   - "block": always poll(2), on every direct-mode pool;
+//   - any other value: netpoll.
+//
+// A slow Exec that waits in poll(2) holds one OS thread until the reply
+// arrives (at most 20 ms per wait, then it parks in netpoll), so the threads
+// held are bounded by the pool's MaxOpen ([Config.PoolSize], default 4 times
+// GOMAXPROCS) and unbounded with a negative PoolSize. Pub/sub and the other pools
+// are not affected, and no other platform has the poll(2) wait.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/data-stores
