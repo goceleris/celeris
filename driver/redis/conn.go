@@ -261,6 +261,7 @@ func (c *redisConn) onRecv(data []byte) {
 		c.closeErr.Store(&errBox{err: err})
 		c.closed.Store(true)
 		c.state.drainWithError(err)
+		c.state.failSyncPipe(err)
 		c.notifyPubSubClose(err)
 	}
 }

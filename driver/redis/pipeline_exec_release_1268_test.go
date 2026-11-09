@@ -221,10 +221,10 @@ func TestPipelineFailedExecReleasesItsSlot1268(t *testing.T) {
 // that the success path hands back; it passes on main. A reply that is not RESP
 // closes the conn. On the direct path and on the default path off Linux the
 // parser fails the requests and Exec's success path gives the closed conn to
-// releaseCmd, which drops it: that passes on main. On the default path on Linux
-// the sync poll does not end the Exec on it: it returns at its context deadline
-// (2 s here) through execManyCore's error return, the branch of #1268, so the
-// case fails on main there.
+// releaseCmd, which drops it. On the default path on Linux the sync poll ended
+// the Exec only at its context deadline (2 s here) through execManyCore's error
+// return, the branch of #1268, until #1270: the parse error now fails the sync
+// pipeline's requests at once, and the same success path drops the conn.
 func TestPipelineErrorRepliesReleaseTheirSlot1268(t *testing.T) {
 	cases := []struct {
 		name              string

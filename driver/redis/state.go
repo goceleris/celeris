@@ -740,6 +740,25 @@ func isPubSubArray(v protocol.Value) bool {
 	return false
 }
 
+// failSyncPipe fails the requests of a sync pipeline that have not had a reply
+// yet. They are not in the bridge, so drainWithError does not reach them, and
+// without this a parse error closes the conn while the Exec waits for replies
+// that never come (celeris#1270). It is called from onRecv, so on the sync poll
+// it runs under recvMu, as the dispatch of a sync pipeline does. On the other
+// paths syncPipeReqs is nil and it does nothing. The index moves to the end, so
+// pollBeforeRearm does not enqueue the failed requests on the bridge.
+func (s *redisState) failSyncPipe(err error) {
+	if s.syncPipeReqs == nil {
+		return
+	}
+	for i := s.syncPipeIdx; i < len(s.syncPipeReqs); i++ {
+		r := s.syncPipeReqs[i]
+		r.resultErr = err
+		r.finish()
+	}
+	s.syncPipeIdx = len(s.syncPipeReqs)
+}
+
 // drainWithError fails every pending request with err.
 func (s *redisState) drainWithError(err error) {
 	s.bridge.DrainWithError(err, func(req async.PendingRequest, e error) {
