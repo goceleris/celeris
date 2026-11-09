@@ -3,6 +3,8 @@
 package iouring
 
 import (
+	"encoding/binary"
+	"math/rand/v2"
 	"os"
 	"testing"
 	"unsafe"
@@ -30,6 +32,27 @@ func mapped(t *testing.T, p unsafe.Pointer) bool {
 	}
 	t.Fatalf("mincore: %v", err)
 	return false
+}
+
+// holds reports whether the 8 bytes at p are still want, read through
+// /proc/self/mem: a read of an address that is not mapped returns an error
+// instead of faulting, so asking is safe in any state (the read ignores page
+// protection, so a page kept PROT_NONE would still answer).
+//
+// This is the release check's answer to address reuse. Once Close has
+// unmapped a page, the kernel may give the same range to any other mmap in
+// the process (a Go runtime arena, a thread stack, another goroutine), so
+// "is the address mapped" (mapped) can be true for a page Close did release
+// (celeris#1272). A page Close wrongly kept still holds the bytes the test
+// wrote before Close; a reused one is a fresh mapping that cannot hold them.
+// Not covered: a Close that kept the address range but dropped the memory
+// (MADV_DONTNEED) reads back zeros and passes; it frees the RAM, and any check
+// by address has the reuse flake.
+func holds(t *testing.T, mem *os.File, p unsafe.Pointer, want [8]byte) bool {
+	t.Helper()
+	var got [8]byte
+	n, err := mem.ReadAt(got[:], int64(uintptr(p)))
+	return err == nil && n == len(got) && got == want
 }
 
 // TestBufferRingRetireKeepsBufferAndRefreshesRing pins celeris#868 at the
@@ -132,6 +155,24 @@ func TestBufferRingCloseKeepsOnlyRetiredPages(t *testing.T) {
 			for _, id := range tc.release {
 				releaseAddr[id] = addr(id)
 			}
+			// Mark each released slot, so that after Close "this page is
+			// still the one the ring mapped" can be told from "something
+			// else was mapped over the address since": mapped alone cannot.
+			mem, err := os.Open("/proc/self/mem")
+			if err != nil {
+				t.Fatalf("open /proc/self/mem: %v", err)
+			}
+			defer func() { _ = mem.Close() }()
+			mark := map[uint16][8]byte{}
+			for _, id := range tc.release {
+				var m [8]byte
+				binary.LittleEndian.PutUint64(m[:], rand.Uint64())
+				copy(unsafe.Slice((*byte)(releaseAddr[id]), len(m)), m[:])
+				mark[id] = m
+				if !holds(t, mem, releaseAddr[id], m) {
+					t.Fatalf("slot %d: cannot read back its mark before Close", id)
+				}
+			}
 			var views [][]byte
 			for _, id := range tc.retire {
 				v := br.GetBuffer(id, 8)
@@ -146,8 +187,8 @@ func TestBufferRingCloseKeepsOnlyRetiredPages(t *testing.T) {
 				}
 			}
 			for id, p := range releaseAddr {
-				if mapped(t, p) {
-					t.Errorf("slot %d (size %d) still mapped after Close: the memory kept is more than the retired slots' pages", id, tc.size)
+				if holds(t, mem, p, mark[id]) {
+					t.Errorf("slot %d (size %d) still holds its pre-Close bytes after Close: the memory kept is more than the retired slots' pages", id, tc.size)
 				}
 			}
 			for i, v := range views {
