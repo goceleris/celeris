@@ -219,10 +219,12 @@ var planLoopCPUs = platform.PlanWorkerCPUsFor
 // `requested` workers (explicit: Config.Resources.Workers was set by the
 // user): the length of the platform's CPU plan. On a big.LITTLE host that is
 // one loop per non-little CPU, fewer than GOMAXPROCS (celeris#1036, #1049); on
-// every other host it is `requested`. The plan is made without the listen
-// address, so the rx-port rule that may leave a few more CPUs out is not
-// applied: the count is the upper bound of what the engines start, and the
-// memlock test below never says "viable" for fewer loops than they start. It
+// a host of alike CPUs it is `requested` less the default reserve when the
+// count was not set by the user (celeris#756, #757), `requested` otherwise.
+// The plan is made without the listen address, so the rx-port rule that may
+// leave a few more CPUs out is not applied: the count is the upper bound of
+// what the engines start, and the memlock test below never says "viable" for
+// fewer loops than they start. It
 // plans on the CPU affinity of the thread that calls New, the sub-engines on
 // the one that calls Listen (sched_getaffinity is per thread): they differ
 // only if an application narrows the mask of one thread.

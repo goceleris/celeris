@@ -129,7 +129,7 @@ func TestPlanCapacityVariationAmongBigCPUsIsNotLittle(t *testing.T) {
 	for c, v := range []string{"1024", "866", "909", "960", "1024", "866", "880", "1000"} {
 		h.capacity(c, v)
 	}
-	p := planWorkerCPUs(8, false, h.src())
+	p := planWorkerCPUs(8, true, h.src())
 	if p.Heterogeneous {
 		t.Fatalf("capacities 866..1024 planned as heterogeneous: little %v", p.Little)
 	}
@@ -163,26 +163,26 @@ func TestPlanMaskedAllowedSetStaysInsideTheMask(t *testing.T) {
 	// CPUs 2-5 (celeris#909: the old code pinned CPUs 0-7).
 	allowed := append(rng(0, 1), rng(6, 11)...)
 	h := msr1(t, allowed)
-	p := planWorkerCPUs(8, false, h.src())
+	p := planWorkerCPUs(8, true, h.src())
 	eq(t, "cpus", p.CPUs, allowed)
 	if p.Heterogeneous {
 		t.Errorf("heterogeneous = true for an all-A720 mask")
 	}
 	// More loops than members wrap inside the set.
-	eq(t, "cpus(10)", planWorkerCPUs(10, false, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1})
+	eq(t, "cpus(10)", planWorkerCPUs(10, true, h.src()).CPUs, []int{0, 1, 6, 7, 8, 9, 10, 11, 0, 1})
 }
 
 func TestPlanTasksetOnAHomogeneousHost(t *testing.T) {
 	h := newFakeHost(t, rng(4, 7)) // taskset -c 4-7 on an 8-CPU x86 host, no cpu_capacity files
-	eq(t, "cpus(4)", planWorkerCPUs(4, false, h.src()).CPUs, []int{4, 5, 6, 7})
-	eq(t, "cpus(6)", planWorkerCPUs(6, false, h.src()).CPUs, []int{4, 5, 6, 7, 4, 5})
+	eq(t, "cpus(4)", planWorkerCPUs(4, true, h.src()).CPUs, []int{4, 5, 6, 7})
+	eq(t, "cpus(6)", planWorkerCPUs(6, true, h.src()).CPUs, []int{4, 5, 6, 7, 4, 5})
 	h = newFakeHost(t, []int{1, 2, 3})
-	eq(t, "cpus(3)", planWorkerCPUs(3, false, h.src()).CPUs, []int{1, 2, 3})
+	eq(t, "cpus(3)", planWorkerCPUs(3, true, h.src()).CPUs, []int{1, 2, 3})
 }
 
 func TestPlanX86LikeHomogeneousIsTheOldRule(t *testing.T) {
 	h := newFakeHost(t, rng(0, 7))
-	p := planWorkerCPUs(10, false, h.src())
+	p := planWorkerCPUs(10, true, h.src())
 	eq(t, "cpus", p.CPUs, []int{0, 1, 2, 3, 4, 5, 6, 7, 0, 1})
 	if p.Heterogeneous || p.Note != "" || len(p.Little) != 0 {
 		t.Errorf("homogeneous host: %+v", p)
@@ -191,25 +191,25 @@ func TestPlanX86LikeHomogeneousIsTheOldRule(t *testing.T) {
 	for c := 0; c < 8; c++ {
 		h.capacity(c, "1024")
 	}
-	eq(t, "equal caps", planWorkerCPUs(10, false, h.src()).CPUs, p.CPUs)
+	eq(t, "equal caps", planWorkerCPUs(10, true, h.src()).CPUs, p.CPUs)
 }
 
 func TestPlanSingleCPU(t *testing.T) {
 	h := newFakeHost(t, []int{5})
-	eq(t, "one worker", planWorkerCPUs(1, false, h.src()).CPUs, []int{5})
-	eq(t, "three workers", planWorkerCPUs(3, false, h.src()).CPUs, []int{5, 5, 5})
+	eq(t, "one worker", planWorkerCPUs(1, true, h.src()).CPUs, []int{5})
+	eq(t, "three workers", planWorkerCPUs(3, true, h.src()).CPUs, []int{5, 5, 5})
 }
 
 func TestPlanMissingOrBrokenCapacityIsHomogeneous(t *testing.T) {
 	// No cpu_capacity files at all.
 	h := newFakeHost(t, rng(0, 3))
-	eq(t, "missing", planWorkerCPUs(4, false, h.src()).CPUs, rng(0, 3))
+	eq(t, "missing", planWorkerCPUs(4, true, h.src()).CPUs, rng(0, 3))
 	// One allowed CPU has no file: not enough to classify, assume homogeneous.
 	h = newFakeHost(t, rng(0, 3))
 	h.capacity(0, "1024")
 	h.capacity(1, "1024")
 	h.capacity(2, "100")
-	eq(t, "one file missing", planWorkerCPUs(4, false, h.src()).CPUs, rng(0, 3))
+	eq(t, "one file missing", planWorkerCPUs(4, true, h.src()).CPUs, rng(0, 3))
 	// Garbage, zero and negative values.
 	for _, bad := range []string{"", "abc", "0", "-5"} {
 		h = newFakeHost(t, rng(0, 3))
@@ -286,7 +286,7 @@ func TestPlanAllowedErrorFallsBackToTheCPUCount(t *testing.T) {
 	h := newFakeHost(t, nil)
 	src := h.src()
 	src.allowed = func() ([]int, error) { return nil, errors.New("boom") }
-	p := planWorkerCPUs(3, false, src)
+	p := planWorkerCPUs(3, true, src)
 	if len(p.CPUs) != 3 || p.CPUs[0] != 0 || p.Heterogeneous {
 		t.Errorf("fallback plan: %+v", p)
 	}
@@ -299,21 +299,21 @@ func TestPlanNUMAIntersectsTheMask(t *testing.T) {
 	// CPU gets a loop before one gets a second, and none leaves the mask.
 	h := newFakeHost(t, []int{2, 3, 4, 5, 6})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "interleave", planWorkerCPUs(5, false, h.src()).CPUs, []int{2, 4, 3, 5, 6})
-	eq(t, "wrap", planWorkerCPUs(7, false, h.src()).CPUs, []int{2, 4, 3, 5, 6, 2, 4})
+	eq(t, "interleave", planWorkerCPUs(5, true, h.src()).CPUs, []int{2, 4, 3, 5, 6})
+	eq(t, "wrap", planWorkerCPUs(7, true, h.src()).CPUs, []int{2, 4, 3, 5, 6, 2, 4})
 	// A node the mask excludes entirely contributes nothing: its turns do not
 	// fall back to CPUs the other node already used.
 	h = newFakeHost(t, []int{4, 5, 6, 7})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "one node of two", planWorkerCPUs(4, false, h.src()).CPUs, []int{4, 5, 6, 7})
+	eq(t, "one node of two", planWorkerCPUs(4, true, h.src()).CPUs, []int{4, 5, 6, 7})
 	// No node list intersects the mask (stale sysfs): plain round-robin on the set.
 	h = newFakeHost(t, []int{8, 9})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "no intersection", planWorkerCPUs(3, false, h.src()).CPUs, []int{8, 9, 8})
+	eq(t, "no intersection", planWorkerCPUs(3, true, h.src()).CPUs, []int{8, 9, 8})
 	// A member no node lists (stale sysfs) comes after the nodes' CPUs.
 	h = newFakeHost(t, []int{2, 3, 9})
 	h.nodes = [][]int{rng(0, 3), rng(4, 7)}
-	eq(t, "unlisted member", planWorkerCPUs(4, false, h.src()).CPUs, []int{2, 3, 9, 2})
+	eq(t, "unlisted member", planWorkerCPUs(4, true, h.src()).CPUs, []int{2, 3, 9, 2})
 }
 
 // celeris#909 (review of #973): a cpuset or taskset that covers one NUMA node,
@@ -384,7 +384,7 @@ func TestPlanWorkerCPUsOnTheRealHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sched_getaffinity: %v", err)
 	}
-	p := PlanWorkerCPUs(len(allowed)+3, false)
+	p := PlanWorkerCPUs(len(allowed)+3, true)
 	if len(p.CPUs) != len(allowed)+3 {
 		t.Fatalf("plan has %d entries", len(p.CPUs))
 	}
@@ -457,12 +457,19 @@ func TestPlanUnrestrictedHomogeneousEqualsTheOldPlan(t *testing.T) {
 					h.nodes = nodes
 				}
 				want := oldDistributeWorkers(workers, ncpu, nodes)
-				// A homogeneous host ignores whether the count was user-set.
+				// An explicit count is the old plan. A default count is the old
+				// plan for the loops left after the reserve (celeris#756, #757;
+				// the figures are written out here, not taken from the planner).
 				for _, explicit := range []bool{false, true} {
+					wantN := workers
+					if !explicit && workers > 2 {
+						wantN -= max(1, workers/8)
+					}
+					wantPlan := want[:wantN]
 					got := planWorkerCPUs(workers, explicit, h.src()).CPUs
-					if !reflect.DeepEqual(got, want) {
+					if !reflect.DeepEqual(got, wantPlan) {
 						t.Errorf("%s, %d CPUs, %d workers (explicit=%v): got %v, old plan %v",
-							name, ncpu, workers, explicit, got, want)
+							name, ncpu, workers, explicit, got, wantPlan)
 					}
 				}
 			}

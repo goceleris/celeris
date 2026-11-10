@@ -33,7 +33,9 @@ func nicIRQReport(log *slog.Logger, plan platform.CPUPlan, addr string) platform
 }
 
 // The plan is also the loop count: the engine starts len(plan.CPUs) of them
-// (celeris#1036), which on a big.LITTLE host is fewer than the default.
+// (celeris#1036), which on a big.LITTLE host is fewer than the default, and for
+// a default count on a host of alike CPUs is the default less the reserve of
+// the platform's defaultLoopReserve (celeris#756, #757).
 
 // planWithinMemlock plans the workers and then holds the plan to what
 // RLIMIT_MEMLOCK funds. The plan comes first because on a big.LITTLE host it
