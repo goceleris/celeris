@@ -57,6 +57,9 @@ func (l *Loop) flushWrites(cs *connState, onLoopThread bool) error {
 	}
 	l.addWrittenBytes(n, onLoopThread)
 	cs.writePos += n
+	if rs := l.resid; rs != nil && onLoopThread {
+		rs.noteWrite(cs, cs.writePos >= len(cs.writeBuf)) // DIAG celeris#757: T_wr
+	}
 	if cs.writePos >= len(cs.writeBuf) {
 		// Fully flushed
 		cs.writeBuf = cs.writeBuf[:0]
@@ -196,6 +199,9 @@ func (l *Loop) flushWritesV(cs *connState, onLoopThread bool) error {
 	}
 	l.addWrittenBytes(n, onLoopThread)
 	total := len(headerRem) + len(cs.bodyBuf)
+	if rs := l.resid; rs != nil && onLoopThread {
+		rs.noteWrite(cs, n >= total) // DIAG celeris#757: T_wr
+	}
 	switch {
 	case n >= total:
 		// Everything out the door.

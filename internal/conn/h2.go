@@ -815,6 +815,15 @@ func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]by
 	return state, nil
 }
 
+// ResidCounts returns the requests the state's processor has run inline and the
+// streams it has handed to the handler pool (DIAG celeris#757, throwaway). The
+// epoll residence stamps read it before and after ProcessH2, on the thread that
+// calls ProcessH2 and under the same lock (cs.detachMu in async mode): the
+// processor increments both plainly on that thread.
+func (s *H2State) ResidCounts() (inline, pool uint64) {
+	return s.processor.InlineCount, s.processor.PoolSubmits
+}
+
 // ProcessH2 processes incoming H2 data.
 // On first call, validates the client preface and sends server settings.
 // PING, SETTINGS ACK) and falls back to x/net framer for complex types.

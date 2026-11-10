@@ -300,6 +300,11 @@ type Processor struct {
 	OnHandlerUnfinished func(streamID uint32, reset bool, written, declared int64, err error)
 	handlerGoexits      atomic.Uint64 // Goexits that reached the deferred cleanup, hook or not
 	unfinishedHandlers  atomic.Uint64 // handlers that returned without finishing their response, hook or not
+
+	// PoolSubmits counts the streams handed to the handler pool (DIAG
+	// celeris#757, throwaway: the epoll residence stamps read it beside
+	// InlineCount). Last in the struct so that no other field moves.
+	PoolSubmits uint64
 }
 
 // HandlerPanics is how many panics have escaped a stream's handler of this
@@ -1372,6 +1377,7 @@ func (p *Processor) runHandler(stream *Stream) {
 	}
 	stream.flags.Or(run)
 	p.poolRunning.Add(1)
+	p.PoolSubmits++ // DIAG celeris#757: a plain increment beside the atomic above, no worse than InlineCount++
 	globalH2Pool.Submit(p, stream)
 }
 

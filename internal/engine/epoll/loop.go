@@ -390,6 +390,11 @@ type Loop struct {
 	// TCP stack whose TCP_INFO answers but does not fill it. nil in
 	// production. Loop thread (a test sets it before it drives the loop).
 	ackedProbe func(fd int) (uint64, error)
+
+	// resid is the DIAG celeris#757 residence-stamp state (resid_linux.go): nil
+	// unless CELERIS_DIAG_RESID is set, and then every site is one nil check.
+	// Last in the struct so that the offsets of every other field are main's.
+	resid *residState
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -400,6 +405,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 
 	return &Loop{
 		id:           id,
+		resid:        newResidState(id),
 		cpuID:        cpuID,
 		epollFD:      -1,
 		listenFD:     -1,
@@ -691,6 +697,10 @@ func (l *Loop) run(ctx context.Context) {
 		}
 
 		l.loopSlot.Leave() // not in a batch while it waits
+		var residT0 int64
+		if rs := l.resid; rs != nil {
+			residT0 = rs.turnBegin() // DIAG celeris#757: 0 unless this turn is sampled
+		}
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
 		if err != nil {
 			if err == unix.EINTR {
@@ -717,6 +727,9 @@ func (l *Loop) run(ctx context.Context) {
 			l.cachedNow = mono.Now()
 			now = l.cachedNow
 			l.loopSlot.Enter(now) // the batch below runs handlers: a stuck one shows (celeris#1170)
+			if rs := l.resid; rs != nil {
+				rs.turnWoke(residT0, now) // DIAG celeris#757
+			}
 		}
 		timerOnly := false // the batch is the sweep timer's tick and nothing else (celeris#1194)
 		for i := range n {
@@ -907,6 +920,10 @@ func (l *Loop) run(ctx context.Context) {
 		// batch's HTTP responses have gone out.
 		if owedDriverReads != 0 {
 			l.serveDriverReadQ(owedDriverReads)
+		}
+
+		if rs := l.resid; rs != nil {
+			rs.turnEnd() // DIAG celeris#757: B of a sampled turn
 		}
 
 		// (flushBatchedCounters, at shutdown, repeats these three flushes:
@@ -1295,6 +1312,11 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		}
 
 		sockopts.ApplyAccepted(newFD, l.sockOpts, l.logger)
+		if l.resid != nil {
+			// DIAG celeris#757: the kernel stamps each received skb, which the
+			// sampled recvmsg reads back (G).
+			_ = unix.SetsockoptInt(newFD, unix.SOL_SOCKET, unix.SO_TIMESTAMPNS, 1)
+		}
 
 		// EPOLLRDHUP: report peer half-close (FIN) as a distinct condition. The
 		// short-read fast path in drainRead returns without a trailing EAGAIN
@@ -1720,6 +1742,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 		}
 		var n int
 		var err error
+		// DIAG celeris#757: this read is a sampled one of an HTTP/2 conn (never
+		// true with the gate off: one nil check).
+		sampled := l.resid != nil && l.resid.sampleRead(cs)
 		if cs.asyncPromoted {
 			// The conn's dispatch goroutine can hijack it, and so close
 			// this descriptor, at any moment: read only while it has not
@@ -1728,6 +1753,8 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if err == errHijackedConn {
 				return
 			}
+		} else if sampled {
+			n, err = l.resid.recv(fd, recvBuf)
 		} else {
 			n, err = unix.Read(fd, recvBuf)
 		}
@@ -1745,6 +1772,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 			return
 		}
 
+		if sampled {
+			l.resid.arm(cs, now)
+		}
 		cs.lastActivity = now
 		// n > 0 here (the err and EOF cases returned above): bytes read on
 		// this iteration, into either cs.buf or the zero-copy bodyBuf.
@@ -2036,10 +2066,25 @@ func (l *Loop) drainRead(fd int, now int64) {
 			// fix in internal/engine/iouring/worker.go).
 			if cs.detachMu != nil {
 				cs.detachMu.Lock()
+				if sampled {
+					l.resid.procBegin(cs.h2State)
+				}
 				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
+				if sampled {
+					l.resid.procEnd(cs.h2State)
+				}
 				cs.detachMu.Unlock()
 			} else {
+				if sampled {
+					l.resid.procBegin(cs.h2State)
+				}
 				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
+				if sampled {
+					l.resid.procEnd(cs.h2State)
+				}
+			}
+			if sampled {
+				l.resid.procStamp() // DIAG celeris#757: T_proc, after the locks are released
 			}
 		}
 
@@ -2074,6 +2119,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// (where N is the number of other events in the same epoll_wait batch).
 		if l.flushInline(cs, fd) {
 			return
+		}
+		if sampled {
+			l.resid.finish() // DIAG celeris#757: the response write has returned
 		}
 
 		// Detached WS/SSE backpressure: if the middleware signaled pause
