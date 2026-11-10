@@ -363,7 +363,7 @@ func capture(c *celeris.Context, cfg Config, include, exclude map[string]struct{
 			}
 		}
 		if cacheable {
-			filtered := filterHeaders(respHeaders, include, exclude)
+			filtered := filterHeaders(respHeaders, include, exclude, c.ResponseContentType())
 			enc := store.EncodedResponse{Status: status, Headers: filtered, Body: body}
 			cacheBytes = enc.AppendTo(cacheBytes[:0])
 		} else {
@@ -402,7 +402,11 @@ func answersRange(status int) bool {
 }
 
 func replay(c *celeris.Context, cfg Config, rep store.EncodedResponse) error {
-	ct := "application/octet-stream"
+	// The content type the handler set is stored as a content-type header
+	// (see filterHeaders). An entry with none is a response that had none (a
+	// NoContent, or a Blob written with an empty type): replay it as it was
+	// sent, not as application/octet-stream (celeris#1156).
+	ct := ""
 	for _, h := range rep.Headers {
 		// Stored headers come from c.ResponseHeaders() which is already
 		// lowercased by celeris.Context.SetHeader (HTTP/2 RFC 7540 §8.1.2),
@@ -417,11 +421,28 @@ func replay(c *celeris.Context, cfg Config, rep store.EncodedResponse) error {
 	if cfg.HeaderName != "" {
 		c.SetHeader(cfg.HeaderName, "HIT")
 	}
+	if ct == "" && len(rep.Body) == 0 {
+		return c.NoContent(rep.Status)
+	}
 	return c.Blob(rep.Status, ct, rep.Body)
 }
 
-func filterHeaders(hs [][2]string, include, exclude map[string]struct{}) [][2]string {
-	out := make([][2]string, 0, len(hs))
+// filterHeaders returns the headers to store: hs as include and exclude
+// select them, behind the response's content type, ct (c.ResponseContentType).
+// The content type of a response written with c.String, c.JSON, c.Blob and the
+// like is not among c.ResponseHeaders: Blob puts it on the wire itself. It is
+// stored as a content-type header, which replay reads back, ahead of hs so
+// that a content-type header the handler set itself still wins, as it did.
+// The content type is part of the representation: Config.IncludeHeaders does
+// not leave it out; Config.ExcludeHeaders names it only on purpose
+// (celeris#1156).
+func filterHeaders(hs [][2]string, include, exclude map[string]struct{}, ct string) [][2]string {
+	out := make([][2]string, 0, len(hs)+1)
+	if ct != "" {
+		if _, skip := exclude["content-type"]; !skip {
+			out = append(out, [2]string{"content-type", ct})
+		}
+	}
 	for _, h := range hs {
 		l := strings.ToLower(h[0])
 		if len(include) > 0 {
