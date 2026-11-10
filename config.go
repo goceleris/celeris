@@ -831,7 +831,10 @@ type Config struct {
 	// It runs on the event-loop goroutine on the native engines, whether the
 	// connection's routes are [Route.Async] or not, so it must not call
 	// runtime.Goexit: that ends the loop for good and the engine only logs an
-	// Error (see [Route.Sync]).
+	// Error (see [Route.Sync]). The [Std] engine runs it on a helper goroutine
+	// the accept path waits for, so a Goexit there ends only that helper and is
+	// logged as an Error: the connection proceeds and the engine keeps
+	// accepting.
 	OnConnect func(addr string)
 	// OnDisconnect is called when a connection is closed. The addr is the
 	// remote peer address. Must be fast — blocks the event loop.
