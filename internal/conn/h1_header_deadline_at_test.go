@@ -3,6 +3,8 @@ package conn
 import (
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // TestArmHeaderDeadlineAt pins ArmHeaderDeadlineAt: the deadline is the earlier
@@ -11,7 +13,7 @@ import (
 // fires the callback again.
 func TestArmHeaderDeadlineAt(t *testing.T) {
 	const budget = int64(10 * time.Second)
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	cases := []struct {
 		name     string
 		timeout  int64
@@ -31,9 +33,9 @@ func TestArmHeaderDeadlineAt(t *testing.T) {
 			s.ReadHeaderTimeoutNs = tc.timeout
 			calls := 0
 			s.OnHeaderDeadlineArmed = func() { calls++ }
-			before := time.Now().UnixNano()
+			before := mono.Now()
 			s.ArmHeaderDeadlineAt(tc.notAfter)
-			after := time.Now().UnixNano()
+			after := mono.Now()
 			dl := s.HeaderDeadlineNs.Load()
 			if !tc.want(before, after, dl) {
 				t.Fatalf("deadline %d, notAfter %d, now %d..%d, budget %d", dl, tc.notAfter, before, after, tc.timeout)

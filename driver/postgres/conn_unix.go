@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 	"github.com/goceleris/celeris/internal/engine"
 )
@@ -29,8 +30,7 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 		return nil, err
 	}
 
-	dialTimeout := dsn.Options.ConnectTimeout
-	dialer := net.Dialer{Timeout: dialTimeout}
+	dialer, dialStart := beginDial(dsn.Options)
 	raw, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
 		return nil, err
@@ -60,7 +60,7 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 		_ = file.Close()
 		return nil, err
 	}
-	tuneConnSocket(fd)
+	tuneConnSocket(fd, dsn.Options.busyPoll)
 	_ = tcp.Close()
 
 	nw := prov.NumWorkers()
@@ -108,6 +108,8 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 		pending:      make([]*pgRequest, 0, 8),
 		createdAt:    time.Now(),
 		serverParams: map[string]string{},
+
+		connectDeadline: connectDeadline(dialStart, dsn.Options),
 	}
 	if syncL != nil {
 		c.syncBuf = make([]byte, 16<<10) // 16 KiB read buffer for sync path
@@ -116,7 +118,7 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 	c.onCloseFn = c.onClose
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
+	if err := eventloop.RegisterConnWait(ctx, loop, fd, c.onRecvFn, c.onCloseFn); err != nil {
 		// Close via file.Close() to disarm the *os.File finalizer. A stray
 		// syscall.Close(fd) here would leave the finalizer armed; when GC
 		// later fires it would close the same fd a SECOND time, possibly

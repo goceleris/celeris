@@ -141,7 +141,7 @@ func need848(t *testing.T, eng celeris.EngineType) {
 	if eng != celeris.IOUring && eng != celeris.Adaptive {
 		return
 	}
-	if ok, p := keptProbeIOUring(); !ok {
+	if ok, p := keptProbeIOUring(t); !ok {
 		if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 			t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids skipping", p.IOUringTier, p.KernelVersion)
 		}
@@ -179,7 +179,7 @@ func start848With(t *testing.T, cfg celeris.Config, setup func(r *rig848)) *rig8
 		if err == nil {
 			return r
 		}
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(deadline) {
+		if isRingENOMEM(err) && time.Now().Before(deadline) {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}

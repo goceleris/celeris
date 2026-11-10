@@ -18,6 +18,7 @@
 # Add a test when it takes 3 s or more; keep the shards within ~10% of each other (the CI seconds below).
 #
 # shard a: ~221 s of CI test time, shard b: ~218 s; the rest: ~114 s (incl. TestAdaptiveSettledRouteRetime592, 37 s).
+# After the write-deadline cells of celeris#889 and #1170: shards a and b ~360 s, shard c ~370 s (unit run 41114943307 had a and b at 519 and 497 s of 660 s before shard c).
 
 a TestUnmatchedChainGoexitIsLoud848
 a TestShutdownHooksRunAfterTheDrain
@@ -60,3 +61,46 @@ b TestGlobalMiddlewareOfAnAsyncRouteKeepsTheLoop848
 b TestH2MaxConcurrentStreamsHeadersContinuation981
 b TestNoDeprecatedPublicAPI830
 b TestHijackedConnNotCutByServerTimeoutsStd855
+
+# The write deadline's cells (celeris#889, D2): 3 to 28 s each at the root, 70 s together, shared out so that the rest stays inside its timeout.
+a TestH2SparseWindowUpdatesAreNotCut889
+a TestH2PausedAndDribbledStreamsOnAHealthyConnAreBounded889
+a TestH2StalledTailIsResetAtWriteTimeout889
+a TestH2WindowUpdateDribblerIsResetAtTheFirstJudgement889
+a TestH2SilentClientWithASmallRemainderIsLetGo889
+b TestH2ParallelDownloadsSharingASlowLinkAreNotCut889
+b TestH2WriteRateFloor889
+b TestH2ConnWindowStarvedStreamsAreJudgedPerConnection889
+b TestH2FlowingDownloadAndQuietStreamAreNotCut889
+b TestH2SilentClientWithAStalledResponseKeepsTheConnUntilTheStreamIsReset889
+
+# The pool handler's wait for window as a minimum rate (celeris#1170, stage 3), a shard of its own: 5 to 136 s each, 430 s together.
+# (Shards a and b ran at 79% of their timeout with these in them: review r11 N4.)
+c TestH2GoTransportParallelDownloadsOnASlowLinkAreNotCut1170
+c TestH2PoolWaiterHoldingALockDoesNotWedgeTheServer1170
+c TestH2PoolWaiterThatGrantsNothingIsReset1170
+c TestH2PoolWaiterLoopBlockedThreshold1170
+c TestH2GoTransportManyParallelDownloadsAreNotCut1170
+c TestH2GoTransportQueueBeyondTheCapIsCut1170
+c TestH2PoolWaiterBurstyReaderIsNotClosedByReadTimeout1170
+c TestH2PoolWaiterOfASilentClientEndsTheConnection1170
+c TestH2PoolWaiterDribblerIsReset1170
+c TestH2PoolStreamWriterDribblerIsReset1170
+c TestH2PoolWaiterAfterTheLoopsParked1170
+
+# The rest step of the Unit job (test/server, -race, -timeout=540s) was at 539.2 s on the merge of #1169 (main alone: 501 s), 0.8 s from its timeout:
+# the 14 slowest tests of the root packages still in it (8 to 34 s each, 216 s of CI test time) move to the shards, which have 300 s of room.
+a TestShutdownConnCloseContract884
+a TestStreamWriterOverCapH1_875
+a TestDefaultMaxRequestBodySize4MiB889
+a TestConcurrentResponsesOwnTheirBodies
+a TestShutdownRunningAsyncHandlerAnswersCloseWithSlowDownloader884
+a TestShutdownPoolWaitStopsServingH1AndDetached884
+a TestSplitBodyResponsesKeepTheConnection
+b TestIOUringShutdownGateConns884
+b TestSeveralCookieLinesAreOneFieldOnEveryEngine889
+b TestExpectContinueOverLimit889
+b TestEpollStaticFileDownloadAtAModerateRateCompletes885
+b TestShutdownPoolWaitGateRequestsInProgressAndIdleConns885
+b TestShutdownIdleAndInProgressH1ConnsWithoutHTTP2_1165
+b TestShutdownPoolWaitGateClosesIdleH1AndEndsDetached885

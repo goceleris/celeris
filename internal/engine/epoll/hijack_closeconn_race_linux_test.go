@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -126,7 +127,7 @@ func hijackRaceConn(t *testing.T) *hijackRaceRig {
 	cs.h1State = conn.NewH1State()
 	// Older than ReadTimeout, so the sweep reaps it. Nothing refreshes this
 	// while a handler runs — that is the whole reachability argument.
-	cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-time.Hour))
 
 	l.conns[local] = cs
 	l.addLiveConn(cs)
@@ -393,7 +394,7 @@ func TestCloseConnLeavesAReissuedSlotAloneAfterWaitingOnDetachMu(t *testing.T) {
 	pipeWrite := hijackRaceRecycle(t, local)
 	newCS := &connState{fd: local, liveIdx: -1}
 	newCS.h1State = conn.NewH1State()
-	newCS.lastActivity = time.Now().UnixNano()
+	newCS.lastActivity = mono.Now()
 	l.driverMu.Lock()
 	l.conns[local] = newCS
 	l.driverMu.Unlock()

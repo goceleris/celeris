@@ -123,28 +123,16 @@ func stallBegin855(t *testing.T, eng celeris.EngineType, wt, shutdown time.Durat
 		cfg.MaxQueueDepth = 4
 		cfg.OnSlowClient = func(*sse.Client, sse.Event) sse.ClientPolicy { return sse.ClientPolicyClose }
 	}
+	// A ring's memlock is returned when the engine before it has closed, so a
+	// start that fails with ring-setup ENOMEM is retried; the port stays with
+	// the server from the pick to the bind (celeris#1104).
 	var addr string
-	for tries := 0; ; tries++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr = ln.Addr().String()
-		_ = ln.Close()
-		s := celeris.New(celeris.Config{Addr: addr, Engine: eng, ReadTimeout: wt, WriteTimeout: wt, ShutdownTimeout: shutdown})
-		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
-		s.GET("/events", sse.New(cfg))
-		st.s, st.startDone = s, make(chan error, 1)
-		go func(done chan error) { done <- s.Start() }(st.startDone)
-		err = waitReady761(addr, st.startDone)
-		if err == nil {
-			break
-		}
-		time.Sleep(200 * time.Millisecond) // a ring's memlock is returned when the engine before it has closed
-		if tries >= 15 {
-			t.Fatalf("server did not start: %v", err)
-		}
-	}
+	st.s, addr, st.startDone = startPicked1104(t, celeris.Config{Engine: eng, ReadTimeout: wt, WriteTimeout: wt, ShutdownTimeout: shutdown},
+		func(s *celeris.Server) {
+			s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+			s.GET("/events", sse.New(cfg))
+		},
+		func(_ *celeris.Server, addr string, done <-chan error) error { return waitReady761(addr, done) })
 	st.addr = addr
 	t.Cleanup(func() {
 		if st.conn != nil {

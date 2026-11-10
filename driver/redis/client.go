@@ -46,7 +46,7 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		pool := newDirectCmdPool(cfg, provider)
+		pool := newDirectCmdPool(cfg, provider, false)
 		return &Client{cfg: cfg, pool: pool}, nil
 	}
 	provider, err := eventloop.Resolve(cfg.Engine)
@@ -58,16 +58,22 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	// handshake: the handler goroutine is LockOSThread'd to the engine
 	// worker, so wait() parks the M and the CQE carrying the HELLO reply
 	// never drains. Fall back to direct mode (net.Conn via Go netpoll),
-	// which parks locked-M Gs cleanly.
+	// which parks locked-M Gs cleanly. A slow pipeline or Tx reply there may
+	// instead wait in poll(2) on that locked thread (celeris#854), which
+	// CELERIS_REDIS_DIRECT_WAIT=auto|block allows; the unset default keeps
+	// netpoll on this pool, which the auto default was not measured on.
 	if cfg.Engine != nil {
 		if wl := provider.WorkerLoop(0); wl != nil {
 			if _, ok := wl.(syncRoundTripper); !ok {
-				pool := newDirectCmdPool(cfg, provider)
+				pool := newDirectCmdPool(cfg, provider, true)
 				return &Client{cfg: cfg, pool: pool}, nil
 			}
 		}
 	}
-	ownsLoop := cfg.Engine == nil
+	// The Client owns the loop when Resolve took a reference to the standalone
+	// one: with no engine, but also with the engine of a server that has not
+	// started or has no loop of its own (std), which Resolve answers with it.
+	ownsLoop := eventloop.IsStandalone(provider)
 	pool := newPool(cfg, provider, ownsLoop)
 	return &Client{cfg: cfg, pool: pool}, nil
 }
@@ -75,9 +81,12 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 // Close tears down every pooled connection. Safe to call on a nil Client.
 //
 // Close the [PubSub]s opened from the Client first. Close does not close them:
-// their connections are checked out of the pool. A Client that owns its event
-// loop (no WithEngine) releases the loop, which takes their connections down
-// at once. Once the Client is closed their reconnect has no pool to dial: a
+// their connections are checked out of the pool. A Client that holds a
+// reference to the driver's own event loop (no WithEngine, or the Engine of a
+// server that has not started, is on the std engine, or runs AsyncHandlers)
+// releases it, and when it was the last holder the loop closes and takes their
+// connections down at once; another Client sharing the loop keeps them working.
+// The Engine of a started server that runs its own event loop is not released. Once the Client is closed their reconnect has no pool to dial: a
 // PubSub whose connection is down returns [ErrPubSubConnDown] from its control
 // calls until [PubSub.Close], and nothing replays them.
 func (c *Client) Close() error {

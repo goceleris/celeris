@@ -60,18 +60,21 @@ type syncMultiRoundTripper interface {
 //     sync round-trips via WriteAndPoll / WriteAndPollBusy. Driver FDs
 //     share the celeris HTTP engine's LockOSThread'd worker. Direct
 //     net.Conn.Read on that locked M would futex-storm.
-//   - Direct (cfg.Engine == nil OR AsyncHandlers=true, cmd pool only):
-//     tcp holds the live *net.TCPConn; exec() writes and reads directly
-//     on the caller's goroutine via Go's netpoll. Pub/sub conns still
-//     use the mini-loop path — unsolicited server-push messages need
-//     event-loop delivery.
+//   - Direct (AsyncHandlers=true, or the WithEngine fallback for an engine
+//     without a sync round-trip, cmd pool only): tcp holds the live
+//     *net.TCPConn; exec() writes and reads directly on the caller's
+//     goroutine, parked in Go's netpoll or, for a slow pipeline or Tx reply
+//     on linux, waiting in poll(2) on its thread (celeris#854, see
+//     direct_wait.go). Pub/sub conns still use the mini-loop path —
+//     unsolicited server-push messages need event-loop delivery.
 type redisConn struct {
 	useDirect bool
 
 	// Direct-mode fields.
 	tcp *net.TCPConn
 	// tcpFd caches the raw fd for MSG_DONTWAIT peeks before falling
-	// through to tcp.Read (which parks the G via Go's netpoll). A
+	// through to tcp.Read (which parks the G via Go's netpoll; a slow
+	// pipeline or Tx reply may wait in poll(2) first, see direct_wait.go). A
 	// single non-blocking peek catches loopback-fast responses without
 	// paying the netpoll wakeup round-trip. Zero when unavailable.
 	tcpFd sockFD
@@ -153,6 +156,18 @@ type redisConn struct {
 	// transport-level close can wake the PubSub's reconnect goroutine.
 	onPubSubCloseMu sync.Mutex
 	onPubSubClose   func(error)
+
+	// directWaitEWMA is the moving average, in ns, of the first-chunk wait of
+	// this conn's pipeline Execs, and directBlockOn the wait it selects: true
+	// means poll(2) rather than Go's netpoll (celeris#854, see direct_wait.go).
+	// Both are read and written under writerMu. They sit at the end of the
+	// struct so that every other field keeps its offset.
+	directWaitEWMA int64
+	directBlockOn  bool
+	// netpollByDefault makes an unset CELERIS_REDIS_DIRECT_WAIT mean netpoll on
+	// this conn: set by the pool for the configurations the auto default was
+	// not measured on (see newDirectCmdPool). An explicit auto or block ignores it.
+	netpollByDefault bool
 }
 
 // errBox wraps an error for atomic.Pointer — atomic.Value panics on type
@@ -176,6 +191,33 @@ func (c *redisConn) notifyPubSubClose(err error) {
 	c.onPubSubCloseMu.Unlock()
 	if fn != nil {
 		go fn(err)
+	}
+}
+
+// aLongTimeAgo is a deadline in the past: it ends a read in progress.
+var aLongTimeAgo = time.Unix(1, 0)
+
+// directHooks are the seams of the direct-mode cancel, set by tests
+// (celeris#1250). Nil in production; a field left nil is not called.
+type directHooks struct {
+	// beforeDeadline runs in execDirectBuf and execManyDirect before the socket
+	// deadline is set from ctx's.
+	beforeDeadline func(c *redisConn)
+	// interrupted runs after the cancel hook has set the past deadline.
+	interrupted func(c *redisConn)
+	// afterHandshake runs when the handshake's commands have returned, before
+	// the cancel hook is stopped.
+	afterHandshake func(c *redisConn)
+}
+
+var testHookDirect atomic.Pointer[directHooks]
+
+// interruptDirect ends the read in progress on tcp, which belongs to c: a
+// deadline in the past, not a close (see handshake).
+func (c *redisConn) interruptDirect(tcp *net.TCPConn) {
+	_ = tcp.SetDeadline(aLongTimeAgo)
+	if h := testHookDirect.Load(); h != nil && h.interrupted != nil {
+		h.interrupted(c)
 	}
 }
 
@@ -211,7 +253,9 @@ func dialDirectRedisConn(ctx context.Context, cfg Config) (*redisConn, error) {
 		createdAt: time.Now(),
 	}
 	c.lastUsedAt.Store(time.Now().UnixNano())
-	if err := c.handshake(ctx); err != nil {
+	// The handshake interrupts its own reads when ctx ends (see handshake).
+	err = c.handshake(ctx)
+	if err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -224,6 +268,7 @@ func (c *redisConn) onRecv(data []byte) {
 		c.closeErr.Store(&errBox{err: err})
 		c.closed.Store(true)
 		c.state.drainWithError(err)
+		c.state.failSyncPipe(err)
 		c.notifyPubSubClose(err)
 	}
 }
@@ -321,12 +366,20 @@ func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []
 	}
 	if dl, ok := ctx.Deadline(); ok {
 		tcp := c.tcp
+		if h := testHookDirect.Load(); h != nil && h.beforeDeadline != nil {
+			h.beforeDeadline(c)
+		}
 		_ = tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
 				_ = c.tcp.SetDeadline(time.Time{})
 			}
 		}()
+		// A cancel that set a past deadline before the line above is not lost.
+		if err := ctx.Err(); err != nil {
+			_ = c.closeWithErr(err)
+			return req, err
+		}
 	}
 	if _, err := c.tcp.Write(buf); err != nil {
 		_ = c.closeWithErr(err)
@@ -367,6 +420,12 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 	last := reqs[n-1]
 	c.writerMu.Lock()
 	defer c.writerMu.Unlock()
+	// Reset the copy slab so this batch's typed replies reuse the backing
+	// array of the previous Exec instead of appending to it (celeris#854).
+	// The previous Exec's results were re-homed into the Pipeline's own slab
+	// before it returned, and the direct path never hands out slab-backed
+	// Values (copyFallback), so nothing aliases the bytes overwritten here.
+	c.state.copySlab = c.state.copySlab[:0]
 	for i := 0; i < n; i++ {
 		c.state.bridge.Enqueue(reqs[i])
 	}
@@ -375,16 +434,33 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 	}
 	if dl, ok := ctx.Deadline(); ok {
 		tcp := c.tcp
+		if h := testHookDirect.Load(); h != nil && h.beforeDeadline != nil {
+			h.beforeDeadline(c)
+		}
 		_ = tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
 				_ = c.tcp.SetDeadline(time.Time{})
 			}
 		}()
+		// A cancel that set a past deadline before the line above is not lost.
+		if err := ctx.Err(); err != nil {
+			_ = c.closeWithErr(err)
+			return reqs, err
+		}
 	}
 	if _, err := c.tcp.Write(data); err != nil {
 		_ = c.closeWithErr(err)
 		return reqs, err
+	}
+	// Auto (the default on linux, for the pools it was measured on) and block
+	// mode (celeris#854) wait for the reply elsewhere; netpoll mode
+	// (CELERIS_REDIS_DIRECT_WAIT=netpoll) runs the loop below unchanged, with
+	// nothing added but this one load of the mode. Never off linux.
+	if directBlockSupported {
+		if mode := c.directWait(); mode != directWaitNetpoll {
+			return reqs, c.awaitDirectReplies(ctx, mode, last)
+		}
 	}
 	for !last.finished.Load() {
 		if c.tcpFd > 0 {
@@ -511,14 +587,7 @@ func (c *redisConn) execSyncBuf(ctx context.Context, req *redisRequest, buf []by
 	if c.syncBuf == nil {
 		c.syncBuf = make([]byte, 16<<10)
 	}
-	var ok bool
-	var err error
-	if c.useBusy {
-		ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
-	} else {
-		ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
-	}
-	c.writerMu.Unlock()
+	ok, err := c.pollSync(buf)
 	if err != nil {
 		_ = c.closeWithErr(err)
 		return nil, err
@@ -534,6 +603,49 @@ func (c *redisConn) execSyncBuf(ctx context.Context, req *redisRequest, buf []by
 	}
 	// EAGAIN or partial: fall through to blocking wait.
 	return req, c.wait(ctx, req)
+}
+
+// errSyncAborted is the close cause of a conn whose sync round trip ended in a
+// panic or a runtime.Goexit.
+var errSyncAborted = errors.New("celeris-redis: sync round trip aborted by a panic or Goexit")
+
+// pollSync runs the sync round trip for buf and releases c.writerMu, which the
+// caller holds on entry, however it ends. The poll runs the caller's onRecv
+// path (a RESP3 OnPush handler among it), so it can panic or call
+// runtime.Goexit; a recovered panic would otherwise leave writerMu locked, and
+// the conn's reader mid-frame, for the next command on a conn the caller still
+// holds. When the poll does not return, the conn is closed (closeWithErr, the
+// same poisoning every error path here uses) so no command reuses it.
+func (c *redisConn) pollSync(buf []byte) (bool, error) {
+	returned := false
+	defer c.endPoll(&returned)
+	var ok bool
+	var err error
+	if c.useBusy {
+		ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
+	} else {
+		ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
+	}
+	returned = true
+	return ok, err
+}
+
+// endPoll is the deferred half of pollSync and pollSyncMulti: it releases
+// writerMu and, when the poll did not return, closes the conn.
+func (c *redisConn) endPoll(returned *bool) {
+	c.writerMu.Unlock()
+	if !*returned {
+		_ = c.closeWithErr(errSyncAborted)
+	}
+}
+
+// pollSyncMulti is pollSync for the multi-response poll (execManyCore).
+func (c *redisConn) pollSyncMulti(data []byte) (bool, error) {
+	returned := false
+	defer c.endPoll(&returned)
+	ok, err := c.syncMulti.WriteAndPollMulti(c.fd, data, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, c.pollBeforeRearmFn)
+	returned = true
+	return ok, err
 }
 
 // execMany writes a pre-serialized multi-command buffer and enqueues n
@@ -601,8 +713,7 @@ func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redis
 		// from c.state. Passing them here avoids the two closure allocations
 		// that capturing lastReq/n/reqs/dispatched inline used to incur on
 		// every Pipeline.Exec.
-		ok, err := c.syncMulti.WriteAndPollMulti(c.fd, data, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, c.pollBeforeRearmFn)
-		c.writerMu.Unlock()
+		ok, err := c.pollSyncMulti(data)
 		if err != nil {
 			_ = c.closeWithErr(err)
 			return reqs, err
@@ -616,11 +727,19 @@ func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redis
 		// Partial or EAGAIN: fall through to spin-wait for the rest.
 		// Bridge was populated in beforeRearm, event loop will deliver.
 	} else {
-		// Async path: enqueue all into bridge, write, spin-wait.
+		// Async path: enqueue all into bridge, write, spin-wait. Reset the
+		// copy slab first, as the sync and direct branches do, so this
+		// batch's typed replies reuse the previous Exec's backing array
+		// instead of appending to it (celeris#1266). Nothing that outlives an
+		// Exec aliases the slab (see redisState.copySlab).
+		c.writerMu.Lock()
+		c.state.copySlab = c.state.copySlab[:0]
 		for i := 0; i < n; i++ {
 			c.state.bridge.Enqueue(reqs[i])
 		}
-		if err := c.sendRaw(data); err != nil {
+		err := c.sendRaw(data)
+		c.writerMu.Unlock()
+		if err != nil {
 			_ = c.closeWithErr(err)
 			return reqs, err
 		}
@@ -666,7 +785,13 @@ func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redis
 // call multiple times.
 func (c *redisConn) closeWithErr(err error) error {
 	c.closeErr.Store(&errBox{err: err})
-	return c.Close()
+	cerr := c.Close()
+	// A drain on another goroutine (onClose, the parse-error drain in onRecv)
+	// may still be notifying requests it took before this Close drained: wait
+	// for it, so that a caller that releases its request when this returns is
+	// not written to afterwards (celeris#887).
+	c.state.bridge.WaitDrained()
+	return cerr
 }
 
 // wait blocks until doneCh fires or ctx is canceled. Before parking on the
@@ -720,9 +845,88 @@ func (c *redisConn) releaseResult(req *redisRequest) {
 	putRequest(req)
 }
 
+// testHookHandshakeRelease, when non-nil, runs for every request handshake gives
+// back to the pool. It is nil in production (handshake runs once per conn, so
+// the check is off every hot path); a test sets it to see that a handshake that
+// failed for any reason but a server error reply gives nothing back (the reader
+// may still be filling the request in), and resets it to nil when it is done.
+var testHookHandshakeRelease atomic.Pointer[func(req *redisRequest)]
+
+// releaseHandshakeReq is releaseResult for handshake's requests.
+func (c *redisConn) releaseHandshakeReq(req *redisRequest) {
+	if h := testHookHandshakeRelease.Load(); h != nil {
+		(*h)(req)
+	}
+	c.releaseResult(req)
+}
+
+// testHookDefaultHandshakeTimeout, when non-nil, replaces defaultDialTimeout as
+// the handshake bound of a conn whose Config.DialTimeout is unset. It is nil in
+// production; a test sets it to see that the default is applied without waiting
+// 5 s, and resets it to nil when it is done.
+var testHookDefaultHandshakeTimeout atomic.Pointer[time.Duration]
+
 // handshake runs HELLO (with optional fallback to AUTH+SELECT) to negotiate
-// protocol version and authentication.
+// protocol version and authentication. The whole exchange is bounded by
+// Config.DialTimeout (default 5 s), on top of whatever deadline ctx carries: the
+// dialer's timeout covers only the TCP connect (connect and handshake are two
+// budgets, each DialTimeout), and a node that accepts and
+// never answers HELLO would otherwise hold the dial until ctx ends, which is
+// never under context.Background (celeris#1205). The three dial paths
+// (dialRedisConn on unix and on the net.Conn loop, dialDirectRedisConn) all end
+// here, so the pool's command and pub/sub dials are bounded alike.
 func (c *redisConn) handshake(ctx context.Context) error {
+	timeout := c.cfg.DialTimeout
+	if timeout <= 0 {
+		timeout = defaultDialTimeout
+		if h := testHookDefaultHandshakeTimeout.Load(); h != nil {
+			timeout = *h
+		}
+	}
+	// Is the caller's own deadline the earlier one? Then it ends the handshake
+	// and is reported as the caller's.
+	callerFirst := false
+	if dl, ok := ctx.Deadline(); ok && !dl.After(time.Now().Add(timeout)) {
+		callerFirst = true
+	}
+	hctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// Direct mode: a past deadline ends the read when hctx ends. The hook is a child
+	// of hctx, so it runs only after hctx.Err() is set, which execDirectBuf checks
+	// after its own SetDeadline: the past deadline is never lost.
+	var stop func() bool
+	if c.useDirect && c.tcp != nil {
+		tcp := c.tcp
+		stop = context.AfterFunc(hctx, func() { c.interruptDirect(tcp) })
+	}
+	err := c.runHandshake(hctx)
+	if h := testHookDirect.Load(); h != nil && h.afterHandshake != nil {
+		h.afterHandshake(c)
+	}
+	if stop != nil && !stop() {
+		if ctx.Err() != nil {
+			return ctx.Err() // the caller's ctx ended during the handshake
+		}
+		if err == nil {
+			err = hctx.Err() // DialTimeout hit as the reply came: the deadline is past
+		}
+	}
+	if err != nil && !callerFirst && ctx.Err() == nil {
+		// The direct path reports the socket's deadline (it can fire a hair
+		// before hctx's timer), the others the context's.
+		var rerr *RedisError
+		if (hctx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded)) && !errors.As(err, &rerr) {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("celeris-redis: handshake timed out after %v: %w", timeout, err)
+			}
+			return fmt.Errorf("celeris-redis: handshake timed out after %v: %w: %w", timeout, context.DeadlineExceeded, err)
+		}
+	}
+	return err
+}
+
+// runHandshake is handshake without the bound.
+func (c *redisConn) runHandshake(ctx context.Context) error {
 	if c.cfg.ForceRESP2 {
 		return c.legacyAuth(ctx)
 	}
@@ -743,7 +947,7 @@ func (c *redisConn) handshake(ctx context.Context) error {
 	}
 	req, err := c.exec(ctx, helloArgs...)
 	if err == nil {
-		defer c.releaseResult(req)
+		defer c.releaseHandshakeReq(req)
 		c.state.proto.Store(int32(targetProto))
 		// After HELLO OK, select db.
 		if c.cfg.DB != 0 {
@@ -753,12 +957,18 @@ func (c *redisConn) handshake(ctx context.Context) error {
 		}
 		return nil
 	}
-	// Release the request from the failed exec — it may hold pooled Reader
-	// slices that would otherwise leak.
-	c.releaseResult(req)
 	// If HELLO was rejected, fall back to legacy auth + select.
 	var rerr *RedisError
 	if errors.As(err, &rerr) {
+		// The server's error reply was dispatched: dispatch is done with req.
+		// Any other error (the caller's context ended, the conn closed) leaves
+		// the request to the garbage collector, as every other caller of exec
+		// does: the reader goroutine may still be filling it in, and a request
+		// given back to the pool now could be reused by another conn and
+		// woken by that late finish with a reply that is not its own. Nothing
+		// leaks: req.owned is never set in production code, so releaseResult
+		// only skips a sync.Pool reuse here.
+		c.releaseHandshakeReq(req)
 		c.state.proto.Store(2)
 		return c.legacyAuth(ctx)
 	}

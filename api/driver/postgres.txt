@@ -22,6 +22,7 @@ method (*Connector) Close() error
 method (*Connector) Connect(context.Context) (database/sql/driver.Conn, error)
 method (*Connector) Driver() database/sql/driver.Driver
 method (*Connector) WithEngine(ServerProvider) *Connector
+method (*Connector) WithSocketBusyPoll(time.Duration) *Connector
 method (*DSN) CheckSSL() error
 method (*Driver) Open(string) (database/sql/driver.Conn, error)
 method (*Driver) OpenConnector(string) (database/sql/driver.Connector, error)

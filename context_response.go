@@ -23,7 +23,9 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/httprange"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
@@ -934,6 +936,35 @@ func (c *Context) File(filePath string) error {
 	return c.serveFile(filePath, "", nil)
 }
 
+// staticRoot is the root of Server.Static and Group.Static as the route keeps
+// it: a root made of ".." segments is resolved against the working directory
+// once, when the route is registered (see ctxkit.ResolveClimbingRoot); any
+// other root, the empty one included, is kept as given.
+func staticRoot(root string) string {
+	if root == "" {
+		return root
+	}
+	root = ctxkit.ResolveClimbingRoot(filepath.Clean(root))
+	if resolved, ok := ctxkit.FilesystemRoot(root); ok {
+		panic(fmt.Sprintf("celeris: Static root %q resolves to the filesystem root %q, which serves every file the process can read: "+
+			"name the directory that holds the public files, or serve a filesystem root on purpose with middleware/static and Config.AllowFilesystemRoot", root, resolved))
+	}
+	return root
+}
+
+// errNotRegular is the error for a path that is not a regular file (a device, a
+// FIFO, a socket): reading one is unbounded (/dev/zero) or never ends (a FIFO),
+// so none is served. It is an HTTPError 404 that wraps ctxkit.ErrNotRegular.
+func errNotRegular() error {
+	return NewHTTPError(404, "not a regular file").WithError(ctxkit.ErrNotRegular)
+}
+
+// notServable reports whether info is a file that is neither a regular file nor
+// a directory.
+func notServable(info fs.FileInfo) bool {
+	return !info.IsDir() && !info.Mode().IsRegular()
+}
+
 // serveFile is File. contentType, when not empty, replaces the type taken from
 // filePath's extension. onOpen, when not nil, runs once the file is open and
 // its size and mtime are read from the open descriptor, before the response is
@@ -941,7 +972,25 @@ func (c *Context) File(filePath string) error {
 // middleware/static sets its validators from them there, so they describe the
 // bytes that are sent even when the path is replaced meanwhile (celeris#846).
 func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
-	f, err := os.Open(filePath)
+	// Before the open: open(2) of a FIFO waits for a writer.
+	if info, err := os.Stat(filePath); err == nil && notServable(info) {
+		return errNotRegular()
+	}
+	return c.serveOpenFile(filePath, contentType, onOpen)
+}
+
+// openForServe opens the file serveOpenFile serves: without blocking where the
+// platform has O_NONBLOCK, so that a FIFO swapped in for a regular file after the
+// stat does not wait in open(2) for a writer (the check on the open descriptor
+// then refuses it). A variable so that a test can put another file under a path
+// that was just stat-ed.
+var openForServe = openNonblock
+
+// serveOpenFile is serveFile for a path that was just stat-ed as a regular file
+// or a directory (fileFromDir): it checks the open descriptor again, which is
+// what is read, and bounds the buffered read.
+func (c *Context) serveOpenFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+	f, err := openForServe(filePath)
 	if err != nil {
 		return err
 	}
@@ -950,6 +999,9 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 	stat, err := f.Stat()
 	if err != nil {
 		return err
+	}
+	if notServable(stat) {
+		return errNotRegular()
 	}
 	size := stat.Size()
 
@@ -1008,7 +1060,11 @@ func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime ti
 		return err
 	}
 
-	data, err := io.ReadAll(f)
+	// The read is bounded by the size the open file reports (which the cap above
+	// bounded): a file that grows meanwhile is cut at the size its validators
+	// describe, and a pseudo-file of size 0 that has content (/proc/self/pagemap
+	// reads 100 MB) is served empty, as the sendfile path serves it.
+	data, err := io.ReadAll(io.LimitReader(f, size))
 	if err != nil {
 		return err
 	}
@@ -1069,16 +1125,56 @@ func (c *Context) trySendFile(f *os.File, status int, contentType string, offset
 // FileFromDir safely serves a file from within baseDir. The userPath is
 // cleaned and joined with baseDir; if the result escapes baseDir, a 400
 // error is returned. Symlinks are resolved and rechecked to prevent a
-// symlink under baseDir from escaping the directory boundary.
+// symlink under baseDir from escaping the directory boundary. A baseDir of
+// "." or "./" is the working directory and one of "/" the filesystem's root
+// (before v1.6.0 these two refused every file with a 400): with "/" nothing is
+// outside baseDir, so only the file's own existence limits what userPath may
+// name. An empty baseDir is refused with a 400, not read as ".". A relative
+// baseDir is read against the working directory at each call; one made of ".."
+// segments ("..", "../..") means the directory it resolves to, and a userPath
+// that climbs out of that directory is refused (before v1.6.0 it was not: a
+// baseDir of ".." served any file the process could read). Hidden files
+// (names that start with a dot) are served: the caller chooses the path, and
+// the dotfile rule of middleware/static, Server.Static and Group.Static does not
+// apply here, and neither does the refusal of a base that is the root of a
+// filesystem: a baseDir of "/" serves every file the process can read to a
+// userPath the caller got from a client, so choose the path with care. A device,
+// a FIFO or a socket is not served: it is an HTTPError 404 "not a regular
+// file".
 func (c *Context) FileFromDir(baseDir, userPath string) error {
-	return c.fileFromDir(baseDir, userPath, "", nil)
+	return c.fileFromDir(baseDir, userPath, "", nil, nil)
+}
+
+// serveStaticFile is what Server.Static and Group.Static serve with: FileFromDir
+// for a directory server, which does not serve hidden files and directories
+// (names that start with a dot, except the exact ".well-known"; see
+// middleware/static, Config.Dotfiles): a path with such a segment, or that
+// leads to one through a symlink, is a 404 whether or not the file exists.
+// FileFromDir itself, whose caller chooses the path, is unchanged.
+func (c *Context) serveStaticFile(root, tail string) error {
+	if ctxkit.HiddenPath(tail) {
+		return NewHTTPError(404, "Not Found")
+	}
+	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
+	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, fs.ErrNotExist) {
+		// a path to a hidden file is a 404 whether or not it exists, and so is a
+		// file that is not there (the raw lstat error was a 500)
+		return NewHTTPError(404, "Not Found")
+	}
+	return err
 }
 
 // fileFromDir is FileFromDir with serveFile's contentType and onOpen.
-func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64), hidden func(rel string) bool) error {
+	if baseDir == "" {
+		// filepath.Clean("") is ".": an unset root (Server.Static("/f",
+		// os.Getenv("DIR"))) would serve the working directory. It was refused
+		// before "." was accepted, and stays so.
+		return NewHTTPError(400, "invalid file path")
+	}
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
-	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {
+	if !ctxkit.PathWithin(base, abs) {
 		return NewHTTPError(400, "invalid file path")
 	}
 	// Resolve symlinks and recheck prefix to prevent symlink escape.
@@ -1090,8 +1186,19 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 	if err != nil {
 		return err
 	}
-	if resolved != resolvedBase && !strings.HasPrefix(resolved, resolvedBase+string(filepath.Separator)) {
+	if !ctxkit.ResolvedWithin(resolvedBase, resolved) {
 		return NewHTTPError(400, "invalid file path")
+	}
+	if hidden != nil {
+		// Where the path leads, not only what it says: a visible name that is a
+		// symlink to a dotfile of the tree is refused like the dotfile.
+		rel, ok := ctxkit.RelWithin(resolvedBase, resolved)
+		if !ok {
+			return NewHTTPError(400, "invalid file path")
+		}
+		if hidden(rel) {
+			return ctxkit.ErrHidden
+		}
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
@@ -1100,7 +1207,10 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 	if info.IsDir() {
 		return NewHTTPError(400, "invalid file path")
 	}
-	return c.serveFile(resolved, contentType, onOpen)
+	if !info.Mode().IsRegular() {
+		return errNotRegular()
+	}
+	return c.serveOpenFile(resolved, contentType, onOpen)
 }
 
 // FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
@@ -1113,6 +1223,10 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 // user-supplied paths to prevent directory traversal. For untrusted input,
 // use [Context.FileFromDir] instead.
 func (c *Context) FileFromFS(name string, fsys fs.FS) error {
+	// Before the open: for an os.DirFS, open(2) of a FIFO waits for a writer.
+	if bad, _ := ctxkit.NotRegularFS(fsys, name); bad {
+		return errNotRegular()
+	}
 	f, err := fsys.Open(name)
 	if err != nil {
 		return err
@@ -1125,6 +1239,9 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 	}
 	if stat.IsDir() {
 		return NewHTTPError(400, "path is a directory")
+	}
+	if !stat.Mode().IsRegular() {
+		return errNotRegular()
 	}
 	size := stat.Size()
 	if size > int64(maxStreamBodySize) {
@@ -1145,7 +1262,7 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		}
 	}
 
-	data, err := io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, size))
 	if err != nil {
 		return err
 	}
@@ -1179,16 +1296,13 @@ func (c *Context) respHeader(key string) string {
 	return ""
 }
 
-// Stream reads all data from r (capped at 100 MB) and writes it as the
-// response with the given status code and content type. Returns [HTTPError]
+// StreamReader reads all data from r (capped at 100 MB) and writes it as the
+// response with the given status code and content type. It returns [HTTPError]
 // with status 413 if the data exceeds 100 MB.
 //
-// Despite the name, Stream BUFFERS the entire reader before writing —
-// it is not incremental. Use [Context.StreamWriter] for true streaming
-// responses. The [Context.StreamReader] alias is the preferred name
-// going forward and makes the buffering behavior obvious at the call
-// site; Stream is retained for backwards compatibility.
-func (c *Context) Stream(code int, contentType string, r io.Reader) error {
+// Despite the name, StreamReader BUFFERS the entire reader before writing: it
+// is not incremental. Use [Context.StreamWriter] for true streaming responses.
+func (c *Context) StreamReader(code int, contentType string, r io.Reader) error {
 	data, err := io.ReadAll(io.LimitReader(r, int64(maxStreamBodySize)+1))
 	if err != nil {
 		return err
@@ -1197,14 +1311,6 @@ func (c *Context) Stream(code int, contentType string, r io.Reader) error {
 		return NewHTTPError(413, "stream body exceeds 100MB limit")
 	}
 	return c.Blob(code, contentType, data)
-}
-
-// StreamReader is the preferred name for [Context.Stream] — it makes
-// clear that the entire reader is buffered before writing, vs the
-// truly-incremental [Context.StreamWriter]. Behavior is identical to
-// [Context.Stream].
-func (c *Context) StreamReader(code int, contentType string, r io.Reader) error {
-	return c.Stream(code, contentType, r)
 }
 
 // Negotiate inspects the Accept header and returns the best matching content type
@@ -1374,9 +1480,26 @@ func (c *Context) BytesWritten() int {
 // cancelled before the socket can be handed over, and the cancel needs a free
 // queue entry. The connection is then left untouched and still the engine's,
 // so the handler can answer the request (a 503, say) and the connection goes
-// on serving. The failure is transient under engine back-pressure, and the
-// error is not exported: treat any Hijack error as "answer the request".
+// on serving. The failure is transient under engine back-pressure.
+//
+// A response an earlier request on the same connection already wrote, and
+// that is still queued in the engine when a later pipelined request hijacks,
+// is sent to the peer before the connection is handed over. The native
+// engines do that without waiting: if the socket's send buffer does not take
+// the whole reply now (a peer that reads slowly), Hijack fails with the
+// connection untouched and the reply still queued, as above, rather than
+// dropping the reply or blocking the event loop. If writing the queued reply
+// fails because the peer is gone, Hijack fails and the engine closes the
+// connection.
+//
+// Hijack on a Context that has been detached ([Context.Detach]) returns
+// [ErrHijackAfterDetach]: the connection is the detaching middleware's.
+// Hijack first, then Detach, is allowed. The other errors are not exported:
+// treat any Hijack error as "answer the request".
 func (c *Context) Hijack() (net.Conn, error) {
+	if c.detached {
+		return nil, ErrHijackAfterDetach
+	}
 	if c.written {
 		return nil, errors.New("celeris: cannot hijack after response written")
 	}
@@ -1542,7 +1665,8 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // goroutine, as far as the response writer allows it; the bound is kept per
 // stream. The native engines apply neither timeout to a detached connection.
 //
-// Detach after a successful [Context.Hijack] only keeps the Context out of the
+// [Context.Hijack] after Detach returns [ErrHijackAfterDetach]. Detach after a
+// successful [Context.Hijack] only keeps the Context out of the
 // pool until done is called. The connection is the caller's by then, so no
 // engine hook runs and no deadline is set on it (on epoll the hook would run
 // against connection state the hijack has released).
@@ -1650,7 +1774,7 @@ func (c *Context) Detach() (done func()) {
 		if !c.startTime.IsZero() {
 			elapsed = time.Since(c.startTime) // monotonic, as before
 		} else {
-			elapsed = time.Duration(time.Now().UnixNano() - c.startTimeNs)
+			elapsed = time.Duration(mono.Now() - c.startTimeNs)
 		}
 		c.detachSnap = &detachSnapshot{
 			status:  c.statusCode,
@@ -1827,7 +1951,13 @@ func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 	return sw.streamer.WriteHeader(sw.stream, status, headers)
 }
 
-// Write sends a chunk of the response body. May be called multiple times.
+// Write sends a chunk of the response body. May be called multiple times. On
+// HTTP/1.1 an empty data sends nothing (a zero-length chunk would end the
+// response). On epoll, io_uring and Adaptive a Write after Close, or after the
+// headers of a response that has no body (HEAD, 1xx, 204, 304), sends nothing
+// and returns a nil error ([StreamWriter.BytesWritten] counts it; the std
+// engine leaves what net/http does with it). One Write of more than 1 GiB is sent
+// as several chunks, so an error part-way leaves the first of them sent.
 //
 // On HTTP/2 the chunk is held to the peer's flow-control windows
 // (RFC 9113 §6.9.1). Called from a worker-pool goroutine (an async route), Write
@@ -1841,7 +1971,7 @@ func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
 // bytes written, though part of the chunk may already have been sent on
 // HTTP/2, and [StreamWriter.BytesWritten] does not count it. On HTTP/1.1 on
 // epoll, io_uring and Adaptive none of the chunk is staged when it returns an
-// error (see [StreamWriter.Flush] for the limits that refuse one).
+// error (a Write of more than 1 GiB excepted; see [StreamWriter.Flush] for the limits that refuse one).
 //
 // On HTTP/2 the stream ends when the handler returns, detached or not (see
 // [Context.Detach]): a Write, WriteHeader or Close from a goroutine that
@@ -1880,8 +2010,9 @@ func (sw *StreamWriter) BytesWritten() int64 {
 // send buffer, which goes out when the handler returns, so every byte
 // written so far stays in memory until then, however often Flush is called.
 // That buffer is bounded at 64 MiB: a Write (or Close) that would take the
-// response held unsent past it stages nothing and returns an error with a count
-// of 0, as does every later Write, Flush and Close of the response. The
+// response held unsent past it stages nothing and returns [ErrStreamRefused]
+// with a count of 0, as does every later Write, Flush and Close of the
+// response. The
 // response is cut, and the connection is closed once the bytes staged before
 // the refused Write have gone out, so the client sees a chunked body that
 // never ends. A response that needs more than that has to Detach. After Detach
@@ -1898,9 +2029,9 @@ func (sw *StreamWriter) BytesWritten() int64 {
 // one made before Detach by a handler that blocks the engine's thread cannot
 // see it at all. A detached connection whose peer stopped reading is closed
 // once more than 64 MiB are unsent: the Write that finds them over the limit
-// is dropped and returns an error (not one wrapping [net.ErrClosed]), and so
-// does each one after it. The Write before it, which took them over, was
-// staged and counted, so a detached connection holds at most 64 MiB plus one
+// is dropped and returns [ErrStreamRefused] (not an error wrapping
+// [net.ErrClosed]), and so does each one after it. The Write before it, which
+// took them over, was staged and counted, so a detached connection holds at most 64 MiB plus one
 // chunk. The behavior above is HTTP/1.1's; Flush is not a delivery guarantee
 // on HTTP/2 either.
 func (sw *StreamWriter) Flush() error {
@@ -1943,6 +2074,9 @@ func (sw *StreamWriter) Close() error {
 // the writer, then reject the request (authentication in OnConnect) with a
 // proper status. Once the writer has been used, or the Context detached, the
 // response belongs to the stream and an error is not written.
+// A handler that takes the writer, sends nothing and returns nil is answered
+// with an empty 200, as a handler that answers nothing is; so is one that sent
+// only an interim (1xx) response; on epoll, io_uring and Adaptive a 500 answers one that failed after it (std answers an empty 200).
 //
 // On native engines (epoll, io_uring), the caller must call [Context.Detach]
 // before spawning a goroutine that uses the StreamWriter. Call Close() when done.
@@ -1966,6 +2100,21 @@ func (sw *StreamWriter) Close() error {
 // runtime.Goexit after its headers went out. END_STREAM is never sent for a
 // body that is not as long as its declared length. The reset is logged through
 // [Config].Logger, and the end of an unclosed complete response at Debug level.
+//
+// On HTTP/1.1 a handler that returns without calling Close does not leave the
+// client waiting either: the chunked response is ended with its last chunk when
+// the handler returns, on every engine (a HEAD response, and one with a status
+// that has no content, 1xx, 204 and 304, has none to send). A response that
+// declared a content-length is ended only if the handler wrote exactly that
+// many bytes. A handler that panicked or returned an error after its headers
+// went out, or wrote a body that is not as long as it declared, has not
+// finished a response, so the last chunk is not sent: on epoll, io_uring and
+// Adaptive the connection is closed without it, and the client sees a
+// truncated body (the HTTP/1.1 form of the reset above; on the std engine the
+// router recovers a panic and swallows an error before net/http sees it, so
+// net/http ends the response). An explicit Close ends the response whatever was
+// written. A Context that was detached before the handler returned is the
+// goroutine's to end: nothing is sent at the handler's return.
 func (c *Context) StreamWriter() *StreamWriter {
 	// Streaming is fundamentally incompatible with response buffering:
 	// buffered responses are held in memory for possible mutation/discard,

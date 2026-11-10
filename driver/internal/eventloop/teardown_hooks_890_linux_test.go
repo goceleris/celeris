@@ -209,8 +209,10 @@ func TestShutdownMarksEveryConnClosedBeforeItClosesTheEpollFd890(t *testing.T) {
 // the loaded number after it (mutant WAKEATOMIC): FD() already returns -1 once
 // the close has run, so no hook placed after the close can order that shape,
 // and the race detector reports nothing (the number is an atomic, the write is
-// a syscall). Only the probabilistic oracle of
-// TestWriteRacingCloseNeverTouchesTheClosedEventfd862 covers it (celeris#890).
+// a syscall). That shape is pinned at the source by
+// TestWakeGoesThroughSignalOnly890 (wake_source_guard_890_test.go); the
+// probabilistic oracle of TestWriteRacingCloseNeverTouchesTheClosedEventfd862
+// only backs it (celeris#890).
 func TestAWakeAfterShutdownClosedTheEventfdWritesNothing890(t *testing.T) {
 	t.Cleanup(func() { testHookAfterWakeClose = nil }) // runs last
 	l, err := New(1)

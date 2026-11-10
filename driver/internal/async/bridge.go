@@ -29,6 +29,11 @@ type PendingRequest interface {
 // not allocate — a plain append+reslice queue would re-grow its backing
 // array every time Pop walked it forward past the capacity boundary.
 type Bridge struct {
+	// drainMu is held for the whole of a DrainWithError, notify callbacks
+	// included, and only there. It is separate from mu so Enqueue and Pop never
+	// wait for a drain's callbacks; WaitDrained takes it to wait for one.
+	drainMu sync.Mutex
+
 	mu   sync.Mutex
 	ring []PendingRequest
 	mask int
@@ -132,10 +137,31 @@ func (b *Bridge) Len() int {
 // size are reset: a drain that walked the ring after unlocking would read
 // and clear slots a concurrent Enqueue had just filled, notifying the new
 // request with the old requests' error and losing an old one (celeris#887).
+//
+// Drains are serialized: a second DrainWithError, and WaitDrained, return only
+// after the one in progress has called notify for every request it took. A
+// caller that gave up on its request (ctx done) and drains the bridge itself
+// finds the ring empty when another goroutine's drain already took the
+// request; waiting for that drain keeps its callbacks from writing to the
+// request after the caller has released it for reuse (celeris#887).
 func (b *Bridge) DrainWithError(err error, notify func(PendingRequest, error)) {
+	b.drainMu.Lock()
+	defer b.drainMu.Unlock()
+	drained := b.takeAll(notify != nil)
+	for _, req := range drained {
+		if req != nil {
+			notify(req, err)
+		}
+	}
+}
+
+// takeAll empties the ring under b.mu (unlocked by a defer) and returns the
+// requests it held when keep is set.
+func (b *Bridge) takeAll(keep bool) []PendingRequest {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	var drained []PendingRequest
-	if notify != nil && b.size > 0 {
+	if keep && b.size > 0 {
 		drained = make([]PendingRequest, 0, b.size)
 	}
 	for i := 0; i < b.size; i++ {
@@ -147,10 +173,15 @@ func (b *Bridge) DrainWithError(err error, notify func(PendingRequest, error)) {
 	}
 	b.head = 0
 	b.size = 0
-	b.mu.Unlock()
-	for _, req := range drained {
-		if req != nil {
-			notify(req, err)
-		}
-	}
+	return drained
+}
+
+// WaitDrained returns once no DrainWithError is in progress: every request an
+// earlier drain took has had notify called for it. It does not wait for a drain
+// that starts afterwards. The conn teardown paths call it after their own
+// drain, so that a request the caller then releases is no longer reachable
+// from any drain's callbacks.
+func (b *Bridge) WaitDrained() {
+	b.drainMu.Lock()
+	b.drainMu.Unlock() //nolint:staticcheck // SA2001: the empty critical section is the wait
 }

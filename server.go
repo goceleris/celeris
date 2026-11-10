@@ -149,6 +149,8 @@ func New(cfg Config) *Server {
 	// Seed the router's per-route async resolution with the server-level
 	// default so routes/groups that don't override inherit it.
 	s.router.defaultAsync = cfg.AsyncHandlers
+	s.router.noAutoHEAD = cfg.DisableAutoHEAD
+	s.router.noAutoOPTIONS = cfg.DisableAutoOPTIONS
 	if !cfg.DisableMetrics {
 		s.collector = observe.NewCollector()
 	}
@@ -248,7 +250,8 @@ func (s *Server) PATCH(path string, handlers ...HandlerFunc) *Route {
 // HEAD registers a handler for HEAD requests. A path without a HEAD route
 // is answered by its GET route, if it has one: the GET handler runs (it sees
 // Method() == "HEAD") and the engine sends its headers without the body
-// (RFC 9110 §9.3.2). Register HEAD only to answer it differently.
+// (RFC 9110 §9.3.2). Register HEAD only to answer it differently, or set
+// [Config.DisableAutoHEAD] to answer HEAD only where a HEAD route exists.
 //
 // A GET handler that streams through [Context.StreamWriter], with
 // [Context.Detach] and a goroutine that goes on writing, must check
@@ -265,6 +268,7 @@ func (s *Server) HEAD(path string, handlers ...HandlerFunc) *Route {
 // GET, and OPTIONS) and Content-Length: 0 (RFC 9110 §9.3.7). The global
 // middleware ([Server.Use]) runs first, so a CORS middleware answers its
 // preflight; group and route middleware do not run for it.
+// [Config.DisableAutoOPTIONS] turns the automatic answer off.
 func (s *Server) OPTIONS(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("OPTIONS", path, handlers...)
 }
@@ -330,13 +334,26 @@ func (s *Server) OnShutdown(fn func(ctx context.Context)) *Server {
 }
 
 // Static registers a GET handler that serves files from root under the given
-// prefix. Uses FileFromDir for path traversal protection.
+// prefix. Uses FileFromDir for path traversal protection. root may be ".",
+// "./" (from v1.6.0; before, every file below them was refused): "." is the
+// working directory, so name a directory that holds only what is public. A root
+// that resolves to the root of a filesystem ("/", "." when the working directory
+// is "/", a symlink to "/") panics here, with no way to acknowledge it: serve a
+// filesystem root on purpose with middleware/static and AllowFilesystemRoot. A
+// root made of ".." segments means the directory it resolves to, resolved once
+// when the route is registered, and nothing outside it is served. An empty root
+// serves nothing. A file that is not there is a 404; devices, FIFOs and sockets
+// are not served. Files and directories whose name starts with a dot (.env, .git) are
+// not served, and a path to one, or to a symlink that leads to one, is a 404
+// whether or not it exists; the exact segment ".well-known" is served. There is
+// no opt-out here: use middleware/static with Dotfiles: static.DotfilesAllow.
 //
 //	s.Static("/assets", "./public")
 func (s *Server) Static(prefix, root string) *Route {
 	p := strings.TrimRight(prefix, "/") + "/*filepath"
+	root = staticRoot(root)
 	return s.GET(p, func(c *Context) error {
-		return c.FileFromDir(root, c.Param("filepath"))
+		return c.serveStaticFile(root, c.Param("filepath"))
 	})
 }
 
@@ -558,7 +575,10 @@ func (s *Server) cancelListen() {
 // On every engine Shutdown waits for that drain, bounded by ctx: it runs the
 // hooks, and returns, only once the Listen call of the Start* entry point has
 // returned. If ctx is done first, the hooks still run, with ctx, and Shutdown
-// returns ctx's error. Because it waits for the requests in flight, a handler
+// returns ctx's error (on epoll, io_uring and adaptive a drain that ctx's
+// deadline ends can finish at that same instant, and Shutdown then returns nil:
+// nil at the deadline does not mean nothing was cut, celeris#1225). Because it
+// waits for the requests in flight, a handler
 // that calls Shutdown and waits for it waits for itself until ctx is done:
 // call it from another goroutine (celeris#703). The Start* call that the
 // server was started with returns only after Shutdown has returned.
@@ -613,6 +633,113 @@ func (s *Server) cancelListen() {
 // nil, so a caller whose ctx is still live gets nil; a caller whose own ctx
 // ends first gets its ctx's error, from its wait for Listen. Adaptive hands its
 // ctx to both of its engines.
+//
+// Every HTTP/1 response written once Shutdown has begun ends its connection, as
+// net/http's does: one to a request that was already in its handler when
+// Shutdown began, and one to a request that arrives on a keep-alive connection
+// before the connection is closed. On the native engines (epoll, io_uring,
+// adaptive) it carries exactly one "Connection: close", an HTTP/1.0 client's
+// included (celeris#884, celeris#885); a handler's own Connection header on it
+// is replaced by that one. std, which is net/http, closes the connection after
+// the response and says close to an HTTP/1.1 client, but not to an HTTP/1.0 one.
+// A request pipelined behind such a response is not served: its bytes, already
+// read, are dropped with the connection, and so are those the kernel holds when
+// the engine's gate looks at the connection (a request that reaches it after
+// that can still reset it, as it can net/http's). Not changed: a response whose
+// head went out before Shutdown began (a stream under way keeps the head it
+// sent; its connection is closed by the shutdown, at once or when the gate looks
+// at it, 250 ms into a wait), a
+// detached stream (Server-Sent Events, a WebSocket), which the engines end
+// themselves, and a hijacked connection, which is the application's. HTTP/2
+// connections get GOAWAY instead.
+//
+// What a connection gets depends on what it has sent when Shutdown begins
+// (celeris#1208; measured on arm64, in docker with 2 CPUs, on a 7.0 kernel with
+// io_uring's high tier; the io_uring lines depend on whether the worker has a
+// response going out, as its send drain above does, and adaptive does what the
+// engine it is running on does, epoll when it starts):
+//
+//   - An idle keep-alive connection, which has no request under way, is closed
+//     at once by std and epoll, and by an io_uring worker with no response going
+//     out. An io_uring worker that has one serves on for the first 250 ms of its
+//     send drain, so its idle connections are closed at 250 ms, and a request
+//     one of them sends before then is answered with Connection: close. While a
+//     connection that has begun a head is open (the bullet below), epoll closes
+//     the idle connections of the loop that serves it at about 250 ms, the
+//     gate's floor, where a loop without one closes its idle connections at
+//     once, and io_uring closes its idle connections at about 250 ms (251 to 258
+//     ms with six; with 2000, all were closed within 0.46 s on epoll and 0.71 s
+//     on io_uring, against 11 ms and 17 ms with no such connection).
+//   - A request in progress, whose head the server has read, is read on and
+//     answered, with Connection: close as above, on every engine.
+//   - A head begun and not completed, a fragment or a bare CRLF, is a request in
+//     progress on epoll and io_uring (celeris#1225), whether the connection was
+//     idle after a response or is new: the engine reads on and waits for it, and
+//     does not close the connection as it closes an idle one. Shutdown waits
+//     until the head completes (the request is then answered, with Connection:
+//     close, and the wait ends), until a limit of the connection ends it, or
+//     until ctx is done. The limits are [Config.ReadHeaderTimeout], 10 s by
+//     default, counted from the head's first byte (for a new connection, from
+//     the engine's accept of it, which TCP_DEFER_ACCEPT, on by default, puts at
+//     that byte) and not extended by the bytes that follow (a head trickled in
+//     at one byte per 150 ms was cut at it), and [Config.WriteTimeout], from the
+//     start of the wait as above; when one of them ends the wait, Shutdown
+//     returns nil if that was all it waited for. A client can therefore hold a
+//     graceful shutdown for as long as the shortest of those by sending a bare
+//     CRLF or one byte of a head, and the bound the caller sets is ctx's
+//     deadline: when it comes before those limits, Shutdown returns at it, with
+//     ctx's error, or with nil when the engine's drain, which ends at that same
+//     deadline, lets Listen return before ctx's timer fires; the engine closes
+//     the connection, which gets its FIN, on epoll, io_uring and adaptive.
+//     net/http's Shutdown also waits for connections that are not idle until ctx
+//     is done, but it does not count this one as the native engines do. It
+//     marks a connection active only once a request head has been read in full
+//     (conn.serve, StateActive after readRequest returns), so std closes a
+//     keep-alive connection that has begun a head, or sent a bare CRLF, with the
+//     idle ones, without an answer, and Shutdown returns at once (measured at 1
+//     ms). A new connection that has begun its first head is not idle for
+//     net/http until it is about five seconds old (closeIdleConns, as for a
+//     silent one below), so Shutdown on std waits for it until the head
+//     completes, ReadHeaderTimeout cuts it, it is five seconds old, or ctx is
+//     done, when Shutdown returns ctx's error and leaves the connection open
+//     (still open 4 s later when measured).
+//   - A request head that has reached the kernel without the server having read
+//     it is answered, with Connection: close, on epoll, io_uring and adaptive, as
+//     a request in progress is (also for a connection whose head arrived while
+//     the loop was held in another connection's [Config.OnConnect] callback). A
+//     fragment of a head, or a bare CRLF, found there is read and is a request in
+//     progress like any other (the bullet above), on epoll and io_uring alike.
+//     An io_uring worker with
+//     nothing to send looks once, when its send drain begins (after the wait for
+//     the HTTP/2 handlers), and waits only for the connections that had such a
+//     head then, with its listener closed: a connection that arrives afterwards
+//     does not hold it, however many keep coming (celeris#1229), and a request
+//     it sends is dropped. The head is answered on a connection the engine has
+//     accepted: one still in the accept queue when the listener closes gets a
+//     reset, on epoll as well. A head that reaches the kernel after the engine's gate has looked at the
+//     connection is refused, as above. On std net/http reads the head after
+//     Shutdown began and drops the request: the connection is closed without an
+//     answer, and reset if body bytes are still unread (a small body, 2 KiB
+//     measured, is read with the head and the close is a FIN; 64 KiB gave a
+//     reset).
+//   - A connection that has sent nothing is not answered by std, or by epoll and
+//     an io_uring worker with no response going out, and a request it sends once
+//     Shutdown has begun is dropped there. epoll and such a worker close the
+//     connection at once if the engine has accepted it. By default the kernel
+//     does not hand such a connection to the engine for about a second
+//     (TCP_DEFER_ACCEPT, see [Config.DisableDeferAccept]); while it is held back
+//     Shutdown neither closes it nor lets a request through on epoll or on an
+//     io_uring worker with no response going out: its first request gets a
+//     reset once the loops have closed their listeners (an epoll loop busy
+//     sending can take a few milliseconds to, and answers it with Connection:
+//     close until then). An io_uring worker that has a response going out keeps accepting
+//     for its first 250 ms: it closes an accepted silent connection at 250 ms and
+//     answers, with Connection: close, a first request that arrives before then,
+//     on an accepted connection or a held-back one. std keeps the connection
+//     open until its first request is read, which is then dropped as above, or
+//     until net/http closes it for being five seconds old, so a client that
+//     connects and sends nothing can hold Shutdown on std for about five seconds,
+//     within ctx.
 //
 // A Shutdown that arrives before the server ever started still latches the
 // shut-down state, so a Start racing it returns instead of parking on a context
@@ -833,6 +960,26 @@ func (s *Server) AsyncHandlers() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// SocketBusyPoll reports the SO_BUSY_POLL budget the server's native engines
+// put on the connections they accept: [Config.SocketBusyPoll], 0 (off) by
+// default. Celeris drivers opened via WithEngine(srv) consult it and put the
+// same budget on the connections they register on an event loop, so one
+// setting decides both (celeris#1228); which of a driver's connections that
+// is depends on the driver, see its SocketBusyPoll documentation. The std
+// engine ignores Config.SocketBusyPoll, and so does this: it reports 0 for it.
+// It reports the configured value, also in the unsupported io_uring
+// fixed-files mode, where the engine ignores it for accepted sockets. It can
+// be called before Start.
+func (s *Server) SocketBusyPoll() time.Duration {
+	rc := s.config.toResourceConfig().WithDefaults()
+	switch rc.Engine {
+	case engine.Epoll, engine.IOUring, engine.Adaptive:
+		return rc.Resources.Resolve().SocketBusyPoll
+	default:
+		return 0
 	}
 }
 

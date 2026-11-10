@@ -10,12 +10,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/engine"
 )
 
 // dialMemcachedConn dials a TCP connection, sets it non-blocking, registers it
-// with the event loop, and (on binary protocol) sends a NOOP to validate the
-// handshake. Text protocol is handshake-free; we trust the connect.
+// with the event loop, and (on binary protocol) sends a VERSION to validate the
+// handshake, bounded by Config.DialTimeout (see handshake). Text protocol is
+// handshake-free; we trust the connect.
 func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg Config, workerHint int) (*memcachedConn, error) {
 	timeout := cfg.DialTimeout
 	if timeout <= 0 {
@@ -44,7 +46,7 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 		_ = file.Close()
 		return nil, err
 	}
-	tuneConnSocket(fd)
+	tuneConnSocket(fd, eventloop.BusyPoll(cfg.Engine, 0))
 	_ = tcp.Close()
 
 	nw := prov.NumWorkers()
@@ -90,7 +92,7 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 	c.pollIsDoneFn = c.pollIsDone
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
+	if err := eventloop.RegisterConnWait(ctx, loop, fd, c.onRecvFn, c.onCloseFn); err != nil {
 		_ = file.Close()
 		return nil, err
 	}

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -23,7 +24,7 @@ import (
 func parked885(t *testing.T, cfg resource.Config) *closingRig876 {
 	t.Helper()
 	r := newTCPClosingRig876(t, cfg, 8<<20)
-	r.cs.lastActivity = time.Now().UnixNano()
+	r.cs.lastActivity = mono.Now()
 	if r.cs.writeSince != 0 {
 		t.Fatalf("celeris885 PREMISE: the rig's first flush started the clock")
 	}
@@ -76,10 +77,16 @@ func TestWriteClockRestartsWhenTheFlushTakesBytes885(t *testing.T) {
 				"the clock must restart when a flush takes bytes", time.Since(start).Round(time.Millisecond), bound)
 		}
 	}
-	time.Sleep(bound + 100*time.Millisecond)
-	r.l.checkTimeouts()
+	// The peer took bytes in the window that is running (the rate rule holds a
+	// conn another window when the last passed, celeris#885 item 51), and none
+	// after: it goes when that window has passed, within two WriteTimeouts.
+	deadline := time.Now().Add(2*bound + 200*time.Millisecond)
+	for r.open() && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+		r.l.checkTimeouts()
+	}
 	if r.open() {
-		t.Fatalf("a peer that stopped reading was not reaped %v after its last byte", bound+100*time.Millisecond)
+		t.Fatalf("a peer that stopped reading was not reaped %v after its last byte", 2*bound+200*time.Millisecond)
 	}
 }
 
@@ -91,7 +98,7 @@ func TestWriteClockRestartsWhenTheFlushTakesBytes885(t *testing.T) {
 func TestReadTimeoutOfAParkedConnRunsFromTheWriteClock885(t *testing.T) {
 	const bound = 300 * time.Millisecond
 	r := newTCPClosingRig876(t, resource.Config{ReadTimeout: bound, IdleTimeout: -1, WriteTimeout: -1}, 8<<20)
-	r.cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
+	r.cs.lastActivity = (mono.Now() + int64(-time.Hour))
 	r.l.armEpollOut(r.cs)
 	r.l.checkTimeouts()
 	if !r.open() {
@@ -118,7 +125,7 @@ func TestReadTimeoutOfAParkedConnRunsFromTheWriteClock885(t *testing.T) {
 // request starts there, not at the request before the response.
 func TestWriteClockEndsAtTheDrainAndFoldsIntoLastActivity885(t *testing.T) {
 	r := newTCPClosingRig876(t, resource.Config{ReadTimeout: 300 * time.Millisecond, IdleTimeout: -1, WriteTimeout: -1}, 1<<20)
-	r.cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
+	r.cs.lastActivity = (mono.Now() + int64(-time.Hour))
 	r.l.armEpollOut(r.cs)
 	for i := 0; i < 400 && csWritePending(r.cs); i++ {
 		for r.read(256<<10) > 0 {
@@ -131,7 +138,7 @@ func TestWriteClockEndsAtTheDrainAndFoldsIntoLastActivity885(t *testing.T) {
 	if r.cs.writeSince != 0 || r.cs.epollOut {
 		t.Errorf("after the drain writeSince=%d epollOut=%v, want 0 and disarmed", r.cs.writeSince, r.cs.epollOut)
 	}
-	if since := time.Since(time.Unix(0, r.cs.lastActivity)); since > time.Second {
+	if since := time.Since(mono.Time(r.cs.lastActivity)); since > time.Second {
 		t.Errorf("lastActivity is %v old after the drain: the idle clock of the next request must start at the end of the response", since)
 	}
 	r.l.checkTimeouts()
@@ -208,7 +215,7 @@ func TestFlushDirtyRestartsTheWriteClockOnlyWhenItTakesBytes885(t *testing.T) {
 	r.l.markDirty(r.cs)
 	r.read(256 << 10)
 	r.l.flushDirty()
-	if r.cs.writeSince == stale || time.Since(time.Unix(0, r.cs.writeSince)) > time.Second {
-		t.Errorf("a dirty pass that took bytes left the clock at %d (%v old), want it restarted", r.cs.writeSince, time.Since(time.Unix(0, r.cs.writeSince)))
+	if r.cs.writeSince == stale || time.Since(mono.Time(r.cs.writeSince)) > time.Second {
+		t.Errorf("a dirty pass that took bytes left the clock at %d (%v old), want it restarted", r.cs.writeSince, time.Since(mono.Time(r.cs.writeSince)))
 	}
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -31,7 +32,7 @@ import (
 
 // newLedgerLoop builds a bare Loop with a real epoll fd and the #383 ledger
 // counters wired to fresh atomics, mirroring what Engine.Listen does per loop.
-func newLedgerLoop(t *testing.T) *Loop {
+func newLedgerLoop(t testing.TB) *Loop {
 	t.Helper()
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -58,7 +59,7 @@ func newLedgerLoop(t *testing.T) *Loop {
 
 // socketpairFD returns one end of a connected AF_UNIX socketpair, small enough
 // to land inside the loop's conn table, with the peer closed on cleanup.
-func socketpairFD(t *testing.T, l *Loop) int {
+func socketpairFD(t testing.TB, l *Loop) int {
 	t.Helper()
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -113,7 +114,7 @@ func TestAttachAdoptedFDCountsTheAdopt(t *testing.T) {
 	l := newLedgerLoop(t)
 	fd := socketpairFD(t, l)
 
-	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{RemoteAddr: "127.0.0.1:1"}, time.Now().UnixNano())
+	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{RemoteAddr: "127.0.0.1:1"}, mono.Now())
 
 	if l.conns[fd] == nil {
 		t.Fatalf("fd %d was not adopted (errors=%d) — test setup, not the counter",
@@ -140,7 +141,7 @@ func TestAttachAdoptedFDCountsAnOccupiedSlot(t *testing.T) {
 	t.Cleanup(func() { _ = unix.Close(fd) })
 	occupant := regLive(l, fd)
 
-	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{}, time.Now().UnixNano())
+	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{}, mono.Now())
 
 	if got := l.transplantSlotOccupied.Load(); got != 1 {
 		t.Errorf("transplantSlotOccupied = %d, want 1 — the refusal is still "+

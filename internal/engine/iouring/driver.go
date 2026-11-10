@@ -243,7 +243,7 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	}
 	if refused != nil {
 		w.driverMu.Unlock()
-		_ = unix.Close(opFD)
+		closeFD(opFD)
 		return refused
 	}
 	if w.driverConns == nil {
@@ -408,7 +408,7 @@ func (w *Worker) armDriverRecv(dc *driverConn) {
 	// for any op in flight (a re-arm can have a SEND in the kernel) and
 	// then finalizes: onClose gets the error, and retire closes opFD.
 	// w.conns belongs to the worker goroutine, which this is.
-	if dc.fd < len(w.conns) && w.conns[dc.fd] != nil {
+	if dc.fd < len(w.conns) && ownsDescriptorNumber(w.conns[dc.fd]) {
 		dc.mu.Unlock()
 		w.failDriverConn(dc, fmt.Errorf("celeris/iouring: fd %d is already an HTTP connection", dc.fd))
 		return
@@ -790,7 +790,7 @@ func closeDriverFDs(conns []*driverConn, sem chan struct{}) {
 
 // closeFD is the close(2) of one engine descriptor; its error is dropped, as
 // everywhere the engine closes a duplicate it has no use for any more.
-func closeFD(fd int) { _ = unix.Close(fd) }
+func closeFD(fd int) { _ = closeFDErr(fd) }
 
 // closeUnderBound runs closeFn(fd) holding a token of sem: it waits for one,
 // and gives it back when closeFn returns. A goroutine waiting for a token

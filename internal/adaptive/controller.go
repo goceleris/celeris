@@ -33,7 +33,9 @@ import (
 //     sends to peers that had already gone away (celeris#856, see
 //     revertErrors), per unit of work: the larger of the interval's requests
 //     and its connection-seconds, so a streaming workload with a handful of
-//     requests is not read as faulty (celeris#886 item 9, see faultRate).
+//     requests is not read as faulty (celeris#886 item 9, see faultRate). An
+//     interval with fewer than minRevertFaults faults reads rate 0, so one
+//     stray accept error does not revert an engine (celeris#886 item 29).
 //
 // The oscillation lock (3 switches in 5 min → 5 min lock) and the post-switch
 // cooldown bound any residual thrash and hold io_uring after the fast snap.

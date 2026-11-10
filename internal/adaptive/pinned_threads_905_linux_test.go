@@ -60,7 +60,8 @@ func startPromoted905(t *testing.T, base string) (int, func()) {
 	e.FreezeSwitching()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	ended := make(chan struct{})
+	go func() { done <- e.Listen(ctx); close(ended) }()
 	stop := func() {
 		cancel()
 		select {
@@ -72,13 +73,7 @@ func startPromoted905(t *testing.T, base string) (int, func()) {
 			t.Fatal("the adaptive engine did not stop within 15s")
 		}
 	}
-	for dl := time.Now().Add(10 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		stop()
-		t.Fatal("the adaptive engine did not bind within 10s")
-	}
+	awaitBoundOrFail890(t, e, cancel, done, ended)
 	if got := e.ActiveEngine().Type(); got != engine.Epoll {
 		stop()
 		t.Fatalf("this test promotes from epoll, but the engine started on %v", got)

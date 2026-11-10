@@ -27,9 +27,10 @@ func (g *RouteGroup) handle(method, path string, handlers ...HandlerFunc) *Route
 
 // Async sets the dispatch mode for all routes registered on this group
 // AFTER this call (and inherited by sub-groups created after it),
-// overriding the server-level [Config.AsyncHandlers] default. Async() with
-// no argument means async (true). Individual routes can still override
-// via [Route.Async] / [Route.Sync] (route > group > server precedence).
+// overriding the server-level [Config.AsyncHandlers] default. Individual
+// routes can still override via [Route.Async] / [Route.Sync] (route > group >
+// server precedence); use [RouteGroup.Sync] to opt a group out of an async
+// default.
 // Must be called before [Server.Start]. Chainable:
 //
 //	api := srv.Group("/api").Async()              // async for all /api/* routes
@@ -42,19 +43,15 @@ func (g *RouteGroup) handle(method, path string, handlers ...HandlerFunc) *Route
 // SAFETY: do NOT call .Sync() on a group whose handlers hijack/detach the
 // connection (WebSocket upgrade, SSE) — detached flows are async by
 // construction.
-func (g *RouteGroup) Async(opt ...bool) *RouteGroup {
-	if len(opt) > 0 && !opt[0] {
-		g.async = asyncOff
-	} else {
-		g.async = asyncOn
-	}
+func (g *RouteGroup) Async() *RouteGroup {
+	g.async = asyncOn
 	return g
 }
 
 // Sync forces all routes registered on this group AFTER this call to run
 // inline on the worker / event-loop thread, overriding any server-level
-// async default. Equivalent to .Async(false). Individual routes can still
-// override via [Route.Async]. Chainable.
+// async default. Individual routes can still override via [Route.Async].
+// Chainable.
 //
 // SAFETY: do NOT call .Sync() on a group whose handlers hijack/detach the
 // connection (WebSocket upgrade, SSE) — detached flows are async by
@@ -126,11 +123,24 @@ func (g *RouteGroup) Handle(method, path string, handlers ...HandlerFunc) *Route
 }
 
 // Static registers a GET handler that serves files from root under the given
-// prefix. Uses FileFromDir for path traversal protection.
+// prefix. Uses FileFromDir for path traversal protection. root may be ".",
+// "./" (from v1.6.0; before, every file below them was refused): "." is the
+// working directory, so name a directory that holds only what is public. A root
+// that resolves to the root of a filesystem ("/", "." when the working directory
+// is "/", a symlink to "/") panics here, with no way to acknowledge it: serve a
+// filesystem root on purpose with middleware/static and AllowFilesystemRoot. A
+// root made of ".." segments means the directory it resolves to, resolved once
+// when the route is registered, and nothing outside it is served. An empty root
+// serves nothing. A file that is not there is a 404; devices, FIFOs and sockets
+// are not served. Files and directories whose name starts with a dot (.env, .git) are
+// not served, and a path to one, or to a symlink that leads to one, is a 404
+// whether or not it exists; the exact segment ".well-known" is served. There is
+// no opt-out here: use middleware/static with Dotfiles: static.DotfilesAllow.
 func (g *RouteGroup) Static(prefix, root string) *Route {
 	p := strings.TrimRight(prefix, "/") + "/*filepath"
+	root = staticRoot(root)
 	return g.GET(p, func(c *Context) error {
-		return c.FileFromDir(root, c.Param("filepath"))
+		return c.serveStaticFile(root, c.Param("filepath"))
 	})
 }
 

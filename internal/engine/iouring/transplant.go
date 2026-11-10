@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/sockopts"
 )
 
@@ -111,7 +111,7 @@ func (w *Worker) refuseAdopt(fd int, carry engine.Carryover) {
 	}
 	if fd >= 0 {
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
-		_ = unix.Close(fd)
+		closeFD(fd)
 	}
 	if w.closeCount != nil {
 		w.closeCount.Add(1)
@@ -155,7 +155,7 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 
 	// Re-apply socket options on the worker's own thread (the fd is a real,
 	// non-fixed-file socket). Harmless if epoll already set them.
-	_ = sockopts.ApplyFD(newFD, w.sockOpts)
+	sockopts.ApplyAccepted(newFD, w.sockOpts, w.logger)
 
 	bufSize := w.resolved.BufferSize
 	if w.bufRing != nil {
@@ -180,14 +180,15 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	if w.transplantCount != nil {
 		w.transplantCount.Add(1)
 	}
-	// A fresh clock, not w.cachedNow: an adoption is drained after the CQE
-	// batch, which is what reads cachedNow, and in an iteration that carried
-	// none cachedNow is as old as the wait before it, up to 1 s on a draining
-	// worker, or the whole park (celeris#713). checkTimeouts reads a stamp's
-	// age as idle time. The adoption's eventfd wake is normally a CQE of the
-	// same iteration; this covers one drained without it. Adoptions come one
-	// per handed-off connection, so the vDSO call is off the request path.
-	cs.lastActivity = time.Now().UnixNano()
+	// A fresh clock rather than w.cachedNow: an adoption is drained after the
+	// CQE batch, and the clock the loop read for it can be a batch old (the
+	// whole park, celeris#713; the loop now reads it after every wait,
+	// readClockAfterWait, celeris#1173, so this read is no longer needed for an
+	// iteration with no completion and stays only so that the stamp does not
+	// depend on that). checkTimeouts reads a stamp's age as idle time.
+	// Adoptions come one per handed-off connection, so the vDSO call is off the
+	// request path.
+	cs.lastActivity = mono.Now()
 
 	// #383 adopts HTTP/1 keep-alive conns only; lock the protocol and install a
 	// fresh parser at the request boundary.
@@ -214,12 +215,15 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 		} else {
 			perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn)
 			// The replay is the recv event of this conn's first bytes and
-			// counts one, whatever the verdict (celeris#886). handleRecv
-			// counts a recv after ProcessH1 too, but returns before it on an
-			// h2c upgrade and never counts a direct-body recv: a carry that
-			// is an upgrade request counts one here and its recv would have
-			// counted none.
-			w.reqBatch++
+			// counts one, whatever the verdict but one (celeris#886).
+			// handleRecv counts a recv after ProcessH1 too, but returns before
+			// it on an h2c upgrade and never counts a direct-body recv: a
+			// carry that is an upgrade request counts none here either, as its
+			// recv would have counted none (item 23: both paths now count the
+			// upgrade request as none).
+			if !errors.Is(perr, conn.ErrUpgradeH2C) {
+				w.reqBatch++
+			}
 			if perr != nil {
 				if !w.endCarriedReplay(cs, newFD, perr) {
 					return // hijacked (handed off) or closed on error — nothing more to arm
@@ -277,18 +281,20 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		return false
 	}
 	// Counted for every outcome but the promotion above, whose
-	// promoteConnToAsync counts it: the replay is the recv event of this
-	// conn's first bytes (celeris#886). Unlike handleRecv it also counts a
-	// carry that ends in an h2c upgrade, which that path returns before
-	// counting.
-	w.reqBatch++
+	// promoteConnToAsync counts it, and an h2c upgrade: the replay is the recv
+	// event of this conn's first bytes (celeris#886). Like handleRecv, which
+	// returns on the upgrade verdict before it counts, it counts a carry that
+	// ends in an h2c upgrade as none (item 23).
+	if !errors.Is(perr, conn.ErrUpgradeH2C) {
+		w.reqBatch++
+	}
 	if perr != nil {
 		// Nothing below may touch cs.h1State: an h2c upgrade has replaced it.
 		return w.endCarriedReplay(cs, fd, perr)
 	}
 	// Inline served the bytes, but if they ended inside a request (buffered
-	// headers, a chunked body) its continuation must run on the dispatch
-	// goroutine, as in handleRecv.
+	// headers) its continuation must run on the dispatch goroutine, as in
+	// handleRecv. A chunked body in progress stays inline (celeris#889).
 	if cs.h1State.HasPendingDispatchState() {
 		cs.asyncPromoted.Store(true)
 		w.asyncPromoted.Add(1)
@@ -297,6 +303,20 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 	return true
 }
 
+// Neither replay tail looks at cs.writeRefused, which handleRecv's tails do
+// (respondAndArm closes the conn on it): celeris#884 item 38, left as it was,
+// and not because it cannot be set. makeWriteFn refuses a write only over
+// sendCap(), which a fresh conn does not have unless the replayed handler
+// detaches (then it is maxSendQueueBytesDetached, 64 MiB). But StreamWriteErr
+// marks a refusal too, on an HTTP/1 conn that has not detached, once a
+// StreamWriter's staged response passes the same 64 MiB, and nothing is sent
+// while the handler runs: a carried request whose handler streams more than
+// that sets the flag, and the conn is then left open with that response cut
+// off, until its next request ends at the check of the recv path (or the
+// conn's timeout does). Code reading only, not reproduced: closing here, for
+// parity with handleRecv and epoll's flushCarriedReplay, is a behaviour change
+// no test shows to be needed.
+//
 // flushCarriedReplay ships what a transplant's carried-request replay queued,
 // under cs.detachMu when the conn has one. A carried request can detach during
 // the replay (a WebSocket or SSE handler on a pipelined request), and from

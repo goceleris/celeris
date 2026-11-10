@@ -156,21 +156,17 @@ func startOnIOUring974(t *testing.T, readHeaderTimeout time.Duration) string {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	ended := make(chan struct{})
+	go func() { done <- e.Listen(ctx); close(ended) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-done:
+		case <-ended: // closed after done is sent on, whoever has drained it
 		case <-time.After(10 * time.Second):
 			t.Error("adaptive engine did not stop within 10s")
 		}
 	})
-	for dl := time.Now().Add(10 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		t.Fatal("adaptive engine never bound")
-	}
+	awaitBoundOrFail890(t, e, cancel, done, ended)
 	if got := getOnce(t, addr); got != 200 {
 		t.Fatalf("GET = %d, want 200", got)
 	}

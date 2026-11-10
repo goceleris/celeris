@@ -10,6 +10,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -119,7 +120,7 @@ func (r *closingRig876) open() bool { return r.l.conns[r.fd] == r.cs }
 // reap must not fire: the close request, not the last read, starts the drain.
 func TestClosingConnIsNotReapedFromItsLastRead(t *testing.T) {
 	r := newClosingRig876(t, resource.Config{ReadTimeout: 50 * time.Millisecond, WriteTimeout: time.Minute}, 1<<20)
-	r.cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
+	r.cs.lastActivity = (mono.Now() + int64(-time.Hour))
 
 	r.l.closeWhenFlushed(r.cs)
 	if !r.cs.peerClosed || !r.cs.epollOut {
@@ -140,7 +141,7 @@ func TestClosingConnIsNotReapedFromItsLastRead(t *testing.T) {
 // flushing: it also reaches the sweep with a clock a read set long ago.
 func TestPeerHalfClosedConnIsNotReapedFromItsLastRead(t *testing.T) {
 	r := newClosingRig876(t, resource.Config{ReadTimeout: 50 * time.Millisecond, WriteTimeout: time.Minute}, 1<<20)
-	r.cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
+	r.cs.lastActivity = (mono.Now() + int64(-time.Hour))
 
 	r.l.onPeerHalfClose(r.fd)
 	if !r.cs.peerClosed {

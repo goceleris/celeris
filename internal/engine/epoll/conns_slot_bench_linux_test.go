@@ -38,6 +38,13 @@ func BenchmarkCloseConnSlotClear(b *testing.B) {
 // has counted every close. The kernel's connect and close dominate each op, so
 // the figure is read against an A/A floor; BenchmarkCloseConnSlotClear
 // isolates the lock itself.
+//
+// Warning: this instrument has extreme outlier samples. One A/A pair (two runs
+// of the same code) differed by up to about 9x in the review of the change that
+// added it (celeris#960, tracked in celeris#885), a spread the median floor of
+// 0.032 does not show. Do not read one pair, or one run: compare medians over
+// many interleaved rounds (.github/scripts/bench-ab.sh) and report the spread
+// beside the median. The 9x figure is that review's, not measured here.
 func BenchmarkCloseChurn(b *testing.B) {
 	eng, stop := newTestEngine(b)
 	defer stop()

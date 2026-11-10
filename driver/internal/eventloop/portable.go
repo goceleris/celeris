@@ -293,6 +293,15 @@ func (w *portableWorker) readLoop(c *portableConn) {
 func (w *portableWorker) UnregisterConn(fd int) error {
 	w.mu.Lock()
 	c, ok := w.conns[fd]
+	if ok && c.conn == nil {
+		// register's placeholder: a RegisterConn of this number is still
+		// opening the net.Conn. The number is not registered yet, so it is
+		// unknown to this call, as on the Linux workers, whose RegisterConn
+		// inserts the conn in one step. Leave the placeholder: register
+		// installs the conn over it, and an UnregisterConn issued after
+		// RegisterConn returned finds that (celeris#890).
+		ok = false
+	}
 	if ok {
 		delete(w.conns, fd)
 	}
@@ -389,14 +398,11 @@ func (w *portableWorker) Write(fd int, data []byte) error {
 // still delivering onRecv. No lock is held across the close or the callback.
 // The placeholder register puts in the table while it opens the net.Conn
 // (conn == nil) has no onClose and no reader, so for it this only marks it
-// closing: there is nothing to close and nothing to report. shutdown and
-// UnregisterConn both reach it. After shutdown's table swap register sees the
+// closing: there is nothing to close and nothing to report. Only shutdown
+// reaches it: UnregisterConn treats a placeholder as an unknown number and
+// leaves it (celeris#890). After shutdown's table swap register sees the
 // worker closed and drops the conn it opened; a failed open drops the
-// placeholder itself. An UnregisterConn that finds the placeholder deletes it
-// and returns nil, but register's second section checks only the worker's
-// closed flag, not that the placeholder is still in the table, so it installs
-// the opened conn and starts its reader anyway: that UnregisterConn is lost
-// (celeris#890).
+// placeholder itself.
 func (c *portableConn) shutdownConn(err error) {
 	c.mu.Lock()
 	if c.closing {

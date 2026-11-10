@@ -10,6 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // recvArmFixture is a real ring plus one connState on a socketpair, wired so
@@ -181,7 +182,7 @@ func TestResumeBeforeCancelLandsPlacesNoSecondRecv(t *testing.T) {
 		if cqes[i].Res <= 0 {
 			t.Fatalf("the cancel reported res=%d, want > 0: it was supposed to cancel the armed recv", cqes[i].Res)
 		}
-		w.processCQE(t.Context(), &cqes[i], time.Now().UnixNano())
+		w.processCQE(t.Context(), &cqes[i], mono.Now())
 		if cs.recvCancelPending != 1 {
 			t.Fatal("a cancel that HIT retired recvCancelPending; the -ECANCELED that follows " +
 				"would then fall through to the generic error path and close a healthy conn (celeris#484)")
@@ -191,7 +192,7 @@ func TestResumeBeforeCancelLandsPlacesNoSecondRecv(t *testing.T) {
 		t.Fatalf("no recv CQE among %+v", cqes)
 	}
 	pendingBefore := ring.Pending()
-	w.processCQE(t.Context(), recvCQE, time.Now().UnixNano())
+	w.processCQE(t.Context(), recvCQE, mono.Now())
 	if got := ring.Pending(); got != pendingBefore+1 {
 		t.Fatalf("the withdrawn pause's -ECANCELED re-armed %d recvs, want exactly 1", got-pendingBefore)
 	}

@@ -32,6 +32,7 @@ func newRefusalWorker(fds ...int) *Worker {
 func TestRefuseAdoptClosesAndFiresTheHook(t *testing.T) {
 	fd, other := socketPairFDs(t)
 	defer func() { _ = unix.Close(other) }()
+	fdID := fdIdentity1242(t, fd)
 
 	w := newRefusalWorker()
 	// Size the conn table so this exact descriptor is one slot past its end,
@@ -68,7 +69,7 @@ func TestRefuseAdoptClosesAndFiresTheHook(t *testing.T) {
 	if got := w.transplantCount.Load(); got != 0 {
 		t.Errorf("transplantCount = %d, want 0 — a refused adopt is not an adopt", got)
 	}
-	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+	if fdID.names(fd) {
 		t.Error("the refused descriptor was left open")
 		_ = unix.Close(fd)
 	}

@@ -147,6 +147,30 @@ func (r *pubsubRouter) clear() {
 	r.mu.Unlock()
 }
 
+// shardUnsubscribed reports a "sunsubscribe" push for ch to the PubSub: it is
+// either the ack of the PubSub's own SUnsubscribe or the server telling the
+// client that it no longer serves the channel's slot (celeris#887 item 31).
+func (r *pubsubRouter) shardUnsubscribed(ch string) {
+	r.mu.Lock()
+	t := r.target
+	r.mu.Unlock()
+	if t != nil {
+		t.onShardUnsubscribed(r, ch)
+	}
+}
+
+// controlError reports an error reply that arrived in pubsub mode, where no
+// command waits for a reply (the control writes are not tracked): a -MOVED to
+// an SSUBSCRIBE, say (celeris#887 item 31).
+func (r *pubsubRouter) controlError(msg string) {
+	r.mu.Lock()
+	t := r.target
+	r.mu.Unlock()
+	if t != nil {
+		t.onControlError(r, msg)
+	}
+}
+
 //nolint:unparam // bool return kept for test introspection and backpressure
 func (r *pubsubRouter) deliver(m *Message) bool {
 	r.mu.Lock()
@@ -193,13 +217,25 @@ type redisState struct {
 	// keeps the func() bool / func() callbacks alloc-free.
 	multiPollLastReq *redisRequest
 
-	// copySlab is a single contiguous buffer used by copyValueSlab to batch
-	// all string copies during a sync pipeline dispatch. Instead of one
-	// allocation per response, all Str bytes are appended to this slab and
-	// sub-sliced. The slab is reset ([:0]) at the start of each pipeline
-	// Exec but the backing array is retained across calls, so steady-state
-	// pipelines of a given size never allocate. Slabs exceeding
-	// maxSlabRetain after a dispatch cycle are released to the GC.
+	// copySlab is a single contiguous buffer that batches the string copies of
+	// one pipeline Exec: extractDirect appends typed string replies to it
+	// (slabString) and, on the sync path only, dispatch appends untyped
+	// replies to it (copyValueSlab). Instead of one allocation per response,
+	// all Str bytes are appended and sub-sliced. It is reset ([:0]) under
+	// writerMu at the start of every pipeline Exec on all three branches of
+	// execManyCore (sync, direct via execManyDirect, and bridge/async), and the
+	// backing array is retained across calls, so steady-state pipelines of a
+	// given size never allocate.
+	//
+	// Because the next Exec on the conn rewrites it, nothing a caller keeps
+	// after an Exec may alias the slab. Typed strings are re-homed into
+	// Pipeline.strSlab by transferResult; replies whose type did not match
+	// are detached by copyFallback; Pipeline.transferResult detaches any
+	// untyped result it keeps; Tx.Exec detaches each element of the EXEC
+	// array (celeris#1265) before the conn goes back to the pool. Any new
+	// consumer of an untyped sync-path req.result must detach it the same way.
+	// Slabs exceeding maxSlabRetain after a dispatch cycle are released to the
+	// GC.
 	copySlab []byte
 }
 
@@ -295,7 +331,18 @@ func (s *redisState) dispatch(v protocol.Value) error {
 		head := s.bridge.Pop()
 		if head == nil {
 			if s.currentMode() == modePubSub {
+				// Nothing waits for a reply here (the control writes are not
+				// tracked), so an error reply is dropped, except that a
+				// cluster PubSub learns from it that its subscription did not
+				// take (a -MOVED to an SSUBSCRIBE).
+				var emsg string
+				if v.Type == protocol.TyError || v.Type == protocol.TyBlobErr {
+					emsg = string(v.Str)
+				}
 				s.reader.Release(v)
+				if emsg != "" {
+					s.router.controlError(emsg)
+				}
 				return nil
 			}
 			s.reader.Release(v)
@@ -365,6 +412,16 @@ func (s *redisState) dispatch(v protocol.Value) error {
 	return nil
 }
 
+// copyFallback copies a reply whose type did not match the typed extraction
+// (and that therefore survives Exec as a *Value in the Pipeline). The slab is
+// reset at the start of every Exec on every branch, so a Value that outlives
+// the Exec must not alias it: it is detached onto the heap (celeris#1265).
+// This path runs only for unexpected reply types, never for the typed fast
+// path.
+func (s *redisState) copyFallback(v protocol.Value) protocol.Value {
+	return copyValueDetached(v)
+}
+
 // extractDirect extracts the typed result from v directly into req's typed
 // fields, bypassing the intermediate protocol.Value copy entirely. String
 // bytes are appended to copySlab and converted to a Go string via
@@ -389,7 +446,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyInt:
 			req.strResult = strconv.FormatInt(v.Int, 10)
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	case expectStatus:
@@ -399,7 +456,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyNull:
 			req.resultErr = ErrNil
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	case expectInt:
@@ -409,7 +466,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyBulk, protocol.TySimple:
 			n, err := strconv.ParseInt(string(v.Str), 10, 64)
 			if err != nil {
-				req.result = s.copyValueSlab(v)
+				req.result = s.copyFallback(v)
 				req.expect = expectNone
 			} else {
 				req.intResult = n
@@ -417,7 +474,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyNull:
 			req.resultErr = ErrNil
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	case expectFloat:
@@ -427,7 +484,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyBulk, protocol.TySimple:
 			f, err := strconv.ParseFloat(string(v.Str), 64)
 			if err != nil {
-				req.result = s.copyValueSlab(v)
+				req.result = s.copyFallback(v)
 				req.expect = expectNone
 			} else {
 				req.floatResult = f
@@ -435,7 +492,7 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyNull:
 			req.resultErr = ErrNil
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	case expectBool:
@@ -447,11 +504,11 @@ func (s *redisState) extractDirect(req *redisRequest, v protocol.Value) {
 		case protocol.TyNull:
 			req.resultErr = ErrNil
 		default:
-			req.result = s.copyValueSlab(v)
+			req.result = s.copyFallback(v)
 			req.expect = expectNone
 		}
 	default:
-		req.result = s.copyValueSlab(v)
+		req.result = s.copyFallback(v)
 	}
 }
 
@@ -652,8 +709,12 @@ func (s *redisState) routePush(v protocol.Value) {
 			payload := string(v.Array[2].Str)
 			s.router.deliver(&Message{Channel: ch, Payload: payload, Shard: true})
 		}
+	case "sunsubscribe":
+		// The ack of a SUnsubscribe, or the server dropping a shard channel
+		// whose slot moved to another node: the PubSub tells them apart.
+		s.router.shardUnsubscribed(string(v.Array[1].Str))
 	case "subscribe", "unsubscribe", "psubscribe", "punsubscribe",
-		"ssubscribe", "sunsubscribe":
+		"ssubscribe":
 		// Control acks — drop silently; PubSub tracks subs independently.
 	}
 }
@@ -677,6 +738,25 @@ func isPubSubArray(v protocol.Value) bool {
 		return true
 	}
 	return false
+}
+
+// failSyncPipe fails the requests of a sync pipeline that have not had a reply
+// yet. They are not in the bridge, so drainWithError does not reach them, and
+// without this a parse error closes the conn while the Exec waits for replies
+// that never come (celeris#1270). It is called from onRecv, so on the sync poll
+// it runs under recvMu, as the dispatch of a sync pipeline does. On the other
+// paths syncPipeReqs is nil and it does nothing. The index moves to the end, so
+// pollBeforeRearm does not enqueue the failed requests on the bridge.
+func (s *redisState) failSyncPipe(err error) {
+	if s.syncPipeReqs == nil {
+		return
+	}
+	for i := s.syncPipeIdx; i < len(s.syncPipeReqs); i++ {
+		r := s.syncPipeReqs[i]
+		r.resultErr = err
+		r.finish()
+	}
+	s.syncPipeIdx = len(s.syncPipeReqs)
 }
 
 // drainWithError fails every pending request with err.

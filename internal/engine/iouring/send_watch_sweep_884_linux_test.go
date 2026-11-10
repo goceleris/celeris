@@ -5,6 +5,8 @@ package iouring
 import (
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // TestIouringSweepKeepsAMarkItsOwnReplayMade884: the timeout sweep re-derives
@@ -32,7 +34,7 @@ func TestIouringSweepKeepsAMarkItsOwnReplayMade884(t *testing.T) {
 	release := asyncGoroutine880(t, cs)
 	cqe := sendCQE750(rig, 8, 0)
 	if !w.staleConnCQE(cqe, rig.local, cqe.UserData) {
-		w.handleSend(cqe, rig.local, time.Now().UnixNano())
+		w.handleSend(cqe, rig.local, mono.Now())
 	}
 	if len(cs.heldSends) != 1 {
 		t.Fatalf("apparatus: the completion was not held (%d)", len(cs.heldSends))
@@ -82,7 +84,7 @@ func TestIouringSweepKeepsAMarkItsDeferredCloseMade884(t *testing.T) {
 	w.cfg.ReadTimeout = time.Hour
 	w.cfg.IdleTimeout = time.Millisecond
 	cs.writeBuf = append(cs.writeBuf[:0], make([]byte, longSendBytes)...)
-	cs.lastActivity = time.Now().Add(-time.Minute).UnixNano()
+	cs.lastActivity = (mono.Now() + int64(-time.Minute))
 	if cs.sending || cs.remainderOut || w.remainderWatch || w.sendWatch {
 		t.Fatalf("apparatus: a SEND or a mark before the sweep")
 	}

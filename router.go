@@ -25,7 +25,7 @@ type staticEntry struct {
 // asyncSetting is the tri-state per-route/per-group dispatch override
 // carried from the registration API down to the router. asyncDefault
 // means "inherit the server default (Config.AsyncHandlers)"; asyncOn /
-// asyncOff are explicit overrides set by .Async(true) / .Async(false).
+// asyncOff are explicit overrides set by .Async() / .Sync().
 type asyncSetting int8
 
 const (
@@ -97,6 +97,13 @@ type router struct {
 	// Config.AsyncHandlers at server construction. Routes/groups that
 	// don't override inherit it.
 	defaultAsync bool
+	// noAutoHEAD and noAutoOPTIONS are Config.DisableAutoHEAD and
+	// Config.DisableAutoOPTIONS (celeris#891): with them set, a HEAD request
+	// is never answered by the path's GET route (findHEADAsGET misses), an
+	// OPTIONS request is never answered by the router itself, and
+	// allowedMethods lists neither unless the path has a route for it.
+	noAutoHEAD    bool
+	noAutoOPTIONS bool
 	// asyncRouteCount tracks how many registered routes resolve to
 	// async dispatch. hasAsyncRoutes() reads it to let the engine
 	// decide whether the async dispatch infrastructure is needed at
@@ -221,8 +228,8 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 
 // Async marks this route for the per-conn dispatch goroutine, overriding
 // any group-level or server-level (Config.AsyncHandlers) default.
-// SAFETY: do NOT call .Sync() (or .Async(false)) on a WebSocket / SSE
-// handler — detached flows run async by construction.
+// SAFETY: do NOT call .Sync() on a WebSocket / SSE handler — detached flows
+// run async by construction.
 //
 // An async route's handler does not run on the event loop, so a
 // [runtime.Goexit] in it (t.FailNow, t.Fatal and t.SkipNow in a test's
@@ -236,26 +243,21 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 // Goexit: see [Route.Sync].
 //
 // Precedence is route > group > server default. Must be called before
-// [Server.Start]. Chainable. Async() with no argument means true; the
-// variadic-bool form is kept for back-compat — prefer .Sync() to opt a
-// single route out of an async-default group/server.
+// [Server.Start]. Chainable. To opt a single route out of an async-default
+// group or server, call .Sync().
 //
 //	srv.GET("/users/:id", userHandler).Async()      // async, this route
 //	api.GET("/cached", cachedHandler).Sync()        // opt out of group async
 //
 // See [Config.AsyncHandlers] for the server-level default and the
 // per-handler async design overview.
-func (r *Route) Async(opt ...bool) *Route {
-	want := true
-	if len(opt) > 0 {
-		want = opt[0]
-	}
-	return r.setAsync(want)
+func (r *Route) Async() *Route {
+	return r.setAsync(true)
 }
 
 // Sync forces this route to run inline on the worker / event-loop thread,
-// overriding any group-level or server-level async default. Equivalent to
-// .Async(false) but reads more naturally at the call site:
+// overriding any group-level or server-level async default. It is the way
+// to opt a route out of an async default:
 //
 //	api := srv.Group("/api").Async()
 //	api.GET("/products", productHandler)            // async (from group)
@@ -557,7 +559,7 @@ func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, 
 	// celeris#356: a route that inherits the server-level AsyncHandlers=true
 	// default (rather than an explicit .Async()) starts INLINE and is promoted
 	// to async only when an inline run is observed to block. Explicit
-	// .Async(true)/.Async(false) is honored verbatim.
+	// .Async()/.Sync() is honored verbatim.
 	adaptive := as == asyncDefault && r.defaultAsync
 	if adaptive {
 		async = false
@@ -705,6 +707,9 @@ func isStaticPath(path string) bool {
 // keyed by method) and routeAsync (the dispatch decision), which must agree
 // on the route. n is the length params had before the failed walk.
 func (r *router) findHEADAsGET(path string, params *Params, n int) ([]HandlerFunc, string, bool) {
+	if r.noAutoHEAD {
+		return nil, "", false
+	}
 	*params = (*params)[:n]
 	return r.find("GET", path, params)
 }
@@ -759,11 +764,14 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 // §10.2.1), excluding except: every method with a route for the path, HEAD
 // when the path has a GET or HEAD route (a HEAD without its own route is
 // answered by the GET route, findHEADAsGET), and OPTIONS (answered
-// automatically when the path has no OPTIONS route). The order is GET, POST,
-// PUT, DELETE, PATCH, HEAD, OPTIONS, then custom methods sorted. A path with
-// no route at all returns nil, and a path with one returns at least OPTIONS
-// (when except is not "OPTIONS" itself), so with except "" an empty result
-// means the path is unrouted (handleUnmatched relies on it to walk once).
+// automatically when the path has no OPTIONS route). With Config.DisableAutoHEAD
+// or Config.DisableAutoOPTIONS (celeris#891) the automatic one is not listed.
+// The order is GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, then custom
+// methods sorted. A path with no route at all returns nil, and a path with
+// one returns at least that route's method (OPTIONS too, unless
+// DisableAutoOPTIONS, when except is not "OPTIONS" itself), so with except ""
+// an empty result means the path is unrouted (handleUnmatched relies on it to
+// walk once).
 func (r *router) allowedMethods(path string, except string) []string {
 	var params Params
 	has := func(method string) bool {
@@ -789,8 +797,8 @@ func (r *router) allowedMethods(path string, except string) []string {
 	if !routed {
 		return nil
 	}
-	found[mHEAD] = found[mHEAD] || found[mGET]
-	found[mOPTIONS] = true
+	found[mHEAD] = found[mHEAD] || found[mGET] && !r.noAutoHEAD
+	found[mOPTIONS] = found[mOPTIONS] || !r.noAutoOPTIONS
 	allowed := make([]string, 0, nMethods+len(custom))
 	for i, ok := range found {
 		if ok && methodNames[i] != except {

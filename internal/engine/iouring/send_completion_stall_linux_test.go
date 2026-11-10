@@ -21,6 +21,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -165,7 +166,7 @@ func TestIouringSendCompletionDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 
 			for i, s := range tc.cqes {
 				c := sendCQE750(rig, s.res, s.flags)
-				if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, time.Now().UnixNano()) }) {
+				if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, mono.Now()) }) {
 					t.Fatalf("celeris#750: send completion %d of %d (res=%d flags=%#x) waited %v on cs.detachMu held "+
 						"by a running async handler; the worker, and every connection of its ring, is parked until "+
 						"the handler returns", i+1, len(tc.cqes), s.res, s.flags, stallWait704)
@@ -208,11 +209,11 @@ func TestIouringSendCompletionsAreAppliedInOrder(t *testing.T) {
 	inFlight750(rig, tail, true)
 	release := holdAsHandler704(t, cs, true)
 	first := sendCQE750(rig, int32(len(tail)), cqeFMore)
-	if !returnsWhileHeld704(t, release, func() { w.handleSend(first, rig.local, time.Now().UnixNano()) }) {
+	if !returnsWhileHeld704(t, release, func() { w.handleSend(first, rig.local, mono.Now()) }) {
 		t.Fatalf("celeris#750: the SEND_ZC first completion waited %v on a running handler's detachMu", stallWait704)
 	}
 	release()
-	w.handleSend(sendCQE750(rig, 0, cqeFNotif), rig.local, time.Now().UnixNano())
+	w.handleSend(sendCQE750(rig, 0, cqeFNotif), rig.local, mono.Now())
 	t.Logf("celeris750 ORDER held=%d zcNotifPending=%v sending=%v", heldSends750(cs), cs.zcNotifPending, cs.sending)
 	handBack750(t, rig)
 	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) != 0 || heldSends750(cs) != 0 {
@@ -245,7 +246,7 @@ func TestIouringCloseAppliesAHeldSendCompletion(t *testing.T) {
 			inFlight750(rig, tail, false)
 			release := holdAsHandler704(t, cs, true)
 			c := sendCQE750(rig, tc.res, 0)
-			if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, time.Now().UnixNano()) }) {
+			if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, mono.Now()) }) {
 				t.Fatalf("celeris#750: the send completion waited %v on a running handler's detachMu", stallWait704)
 			}
 			release()
@@ -311,7 +312,7 @@ func TestIouringHeldSendCompletionDoesNotKeepTheRingPolling(t *testing.T) {
 			release := holdAsHandler704(t, cs, true)
 			cs.writeBuf = append(cs.writeBuf, next...) // the handler writes, under the lock it holds
 			c := sendCQE750(rig, int32(len(tail)), 0)
-			if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, time.Now().UnixNano()) }) {
+			if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, mono.Now()) }) {
 				t.Fatalf("celeris#750: the send completion waited %v on a running handler's detachMu", stallWait704)
 			}
 			if again {
@@ -388,7 +389,7 @@ func TestIouringSendCompletionStillWaitsForABoundedHolder(t *testing.T) {
 			// TryLock failed, and the holder is a bounded one), or it returned
 			// holding the completion: no timer decides (celeris#884 item 22).
 			waits, done := waitsOnBoundedHolder884(t, cs.detachMu, func() {
-				w.handleSend(c, rig.local, time.Now().UnixNano())
+				w.handleSend(c, rig.local, mono.Now())
 			})
 			if !waits {
 				release()

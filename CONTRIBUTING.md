@@ -171,6 +171,11 @@ category it belongs to so it lands in the right section:
 Anything else lands under "Other". If a change is breaking, label it
 `breaking` *and* say so in the PR description.
 
+The `performance` label has a second job: a pull request that touches the
+benchmarked paths starts the CodSpeed run (`.github/workflows/codspeed.yml`)
+only while it carries that label, because the run spends macro-runner minutes
+from a monthly budget shared with loadgen. Main is measured once a day.
+
 ### Commit sign-off
 
 We recommend signing off your commits with `git commit -s`, which adds a

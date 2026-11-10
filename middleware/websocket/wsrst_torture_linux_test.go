@@ -3,9 +3,7 @@
 package websocket_test
 
 import (
-	"context"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -48,57 +46,25 @@ func TestWSRSTMidUpgradeTorture(t *testing.T) {
 }
 
 func wsrstTorture(t *testing.T, engine celeris.EngineType) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-
-	srv := celeris.New(celeris.Config{Engine: engine, AsyncHandlers: true})
-	srv.GET("/ws", websocket.New(websocket.Config{
-		CheckOrigin: func(c *celeris.Context) bool { return true },
-		Handler: func(c *websocket.Conn) {
-			for {
-				mt, msg, err := c.ReadMessage()
-				if err != nil {
-					return
+	_, addr, stop := startWS888(t, func() *celeris.Server {
+		srv := celeris.New(celeris.Config{Engine: engine, AsyncHandlers: true})
+		srv.GET("/ws", websocket.New(websocket.Config{
+			CheckOrigin: func(c *celeris.Context) bool { return true },
+			Handler: func(c *websocket.Conn) {
+				for {
+					mt, msg, err := c.ReadMessage()
+					if err != nil {
+						return
+					}
+					if err := c.WriteMessage(mt, msg); err != nil {
+						return
+					}
 				}
-				if err := c.WriteMessage(mt, msg); err != nil {
-					return
-				}
-			}
-		},
-	}))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	var startErr atomic.Pointer[error]
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if e := srv.StartWithListenerAndContext(ctx, ln); e != nil {
-			startErr.Store(&e)
-		}
-	}()
-	time.Sleep(500 * time.Millisecond) // SO_REUSEPORT rebind settle
-	// A Start that fails after the settle sleep is not missed (celeris#706).
-	waitUpOrStopped(t, srv, done, 30*time.Second)
-	if p := startErr.Load(); p != nil {
-		// Docker / minimal-kernel runners may lack io_uring — skip rather
-		// than fail (feature-gated path, not a celeris bug).
-		msg := (*p).Error()
-		if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
-			t.Skipf("engine unavailable on this runner: %v", *p)
-		}
-		t.Fatalf("server start: %v", *p)
-	}
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-		}
-	}()
-
+			},
+		}))
+		return srv
+	})
+	defer stop()
 	req := "GET /ws HTTP/1.1\r\nHost: " + addr + "\r\n" +
 		"Connection: Upgrade\r\nUpgrade: websocket\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +

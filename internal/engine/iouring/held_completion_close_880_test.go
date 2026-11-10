@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#880 (from celeris#845, item outside-813, and #845 item 3): a send
@@ -55,7 +57,7 @@ func markClosing880(w *Worker, cs *connState) {
 	cs.closing = true
 	cs.asyncClosed.Store(true)
 	cs.detachClosed = true
-	cs.lastActivity = time.Now().UnixNano() - 2*w.closingDrainBound()
+	cs.lastActivity = mono.Now() - 2*w.closingDrainBound()
 	// "Long ago" includes the sweeps that sampled the peer's acknowledged bytes
 	// since (celeris#884 item 52) and found none: a conn first met after its
 	// bound with no sample is given one more bound, and these tests are about
@@ -63,7 +65,7 @@ func markClosing880(w *Worker, cs *connState) {
 	// as those sweeps left it: the sweep that reaps takes a fresh sample
 	// (celeris#884 item 52), and bytes the peer's kernel had acknowledged
 	// before the conn was marked are not growth since.
-	cs.closeAckedKnown, cs.closeSampled = true, time.Now().UnixNano()
+	cs.closeAckedKnown, cs.closeSampled = true, mono.Now()
 	if ti, err := unix.GetsockoptTCPInfo(cs.fd, unix.IPPROTO_TCP, unix.TCP_INFO); err == nil {
 		cs.closeAcked = ti.Bytes_acked
 	}
@@ -101,7 +103,7 @@ func holdZCFirstCompletion880(t *testing.T, w *Worker, cs *connState) {
 	head, _ := w.ring.BeginCQ()
 	held := *c
 	if !w.staleConnCQE(&held, fd, held.UserData) {
-		w.handleSend(&held, fd, time.Now().UnixNano())
+		w.handleSend(&held, fd, mono.Now())
 	}
 	w.ring.EndCQ(head + 1)
 	if len(cs.heldSends) != 1 || cs.zcNotifPending || !cs.sending || cs.kernelInflight != 1 {
@@ -140,7 +142,7 @@ func TestHeldSendZCFirstCompletionDoesNotKeepTheDescriptor(t *testing.T) {
 	for i := range w.pendingRelease {
 		w.pendingRelease[i].releaseAtNanos = 1
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	w.drainPendingRelease()
 	forced := w.handoffLoss.closeFDForced.Load()
 	t.Logf("celeris880 FD held=%d closed_at_sweep=%v closeFDOwed=%d CloseFDForced_after_backstop=%d (before %d)",
@@ -213,7 +215,7 @@ func TestClosingSweepAppliesAHeldSendNotification(t *testing.T) {
 	release := asyncGoroutine880(t, cs)
 	notif := sendCQE750(rig, 0, cqeFNotif)
 	if !w.staleConnCQE(notif, rig.local, notif.UserData) {
-		w.handleSend(notif, rig.local, time.Now().UnixNano())
+		w.handleSend(notif, rig.local, mono.Now())
 	}
 	if len(cs.heldSends) != 1 || !cs.zcNotifPending || cs.kernelInflight != 1 {
 		t.Fatalf("the notification was not held: held=%d zcNotifPending=%v kernelInflight=%d (want 1 true 1)",
@@ -225,7 +227,7 @@ func TestClosingSweepAppliesAHeldSendNotification(t *testing.T) {
 	for i := range w.pendingRelease {
 		w.pendingRelease[i].releaseAtNanos = 1
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	w.drainPendingRelease()
 
 	held := w.handoffLoss.zcNotifHeld.Load()
@@ -256,7 +258,7 @@ func TestClosingSweepDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	release := holdAsHandler704(t, cs, true)
 	first := sendCQE750(rig, int32(len(tail)), cqeFMore)
 	if !w.staleConnCQE(first, rig.local, first.UserData) {
-		w.handleSend(first, rig.local, time.Now().UnixNano())
+		w.handleSend(first, rig.local, mono.Now())
 	}
 	if len(cs.heldSends) != 1 {
 		t.Fatalf("the completion was not held (%d)", len(cs.heldSends))

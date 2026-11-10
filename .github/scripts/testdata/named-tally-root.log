@@ -14,6 +14,14 @@
         child| === RUN   TestFailedPinIsLoggedOnceAndNotPretended909
         child| --- PASS: TestFailedPinIsLoggedOnceAndNotPretended909 (0.01s)
 --- PASS: TestFailedPinIsLoggedOnceAndNotPretended909 (1.02s)
+=== RUN   TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits
+=== RUN   TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits/entry-drained-while-the-goroutine-lives
+=== RUN   TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits/entry-and-exit-in-one-batch
+=== RUN   TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits/relink-hand-back-behind-a-partial-flush
+--- PASS: TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits (0.00s)
+    --- PASS: TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits/entry-drained-while-the-goroutine-lives (0.00s)
+    --- PASS: TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits/entry-and-exit-in-one-batch (0.00s)
+    --- PASS: TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits/relink-hand-back-behind-a-partial-flush (0.00s)
 ok  	github.com/goceleris/celeris/internal/engine/epoll	208.179s
 === RUN   TestInlineHandlerChildKeepsTheProcessMask919
         child| === RUN   TestInlineHandlerChildKeepsTheProcessMask919

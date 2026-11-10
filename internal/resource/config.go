@@ -3,6 +3,7 @@ package resource
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"runtime"
 	"time"
@@ -170,6 +171,10 @@ type Config struct {
 	defaulted bool
 }
 
+// maxSocketBusyPoll is the largest SO_BUSY_POLL budget the kernel takes: its
+// option is a C int of microseconds.
+const maxSocketBusyPoll = math.MaxInt32 * time.Microsecond
+
 // Validate checks all config fields and returns any validation errors.
 func (c Config) Validate() []error {
 	var errs []error
@@ -208,6 +213,13 @@ func (c Config) Validate() []error {
 
 	if c.Resources.BufferSize != 0 && c.Resources.BufferSize < MinBufferSize {
 		errs = append(errs, fmt.Errorf("bufferSize must be >= %d if set, got %d", MinBufferSize, c.Resources.BufferSize))
+	}
+
+	// SO_BUSY_POLL takes whole microseconds in a C int. A negative budget is
+	// no budget, and one under a microsecond would truncate to 0 and leave
+	// busy polling off with no word: both are refused, not rounded.
+	if d := c.Resources.SocketBusyPoll; d < 0 || (d > 0 && d < time.Microsecond) || d > maxSocketBusyPoll {
+		errs = append(errs, fmt.Errorf("socketBusyPoll must be 0 (off) or between %v and %v, got %v", time.Microsecond, maxSocketBusyPoll, d))
 	}
 
 	if c.Resources.MemoryLimitBytes < 0 {
@@ -375,8 +387,10 @@ func (c Config) WithDefaults() Config {
 // A zero means "unset" only on the first pass: once normalised is true, 0 is
 // a disabled timeout this function must leave alone, otherwise the second
 // WithDefaults (in the engine constructor) reinstates the default over an
-// explicitly disabled timeout — celeris#594. Any positive value is kept
-// verbatim on every pass, so N stays N.
+// explicitly disabled timeout — celeris#594. A positive value is kept on every
+// pass up to MaxTimeout (a hundred years, which now + timeout cannot overflow
+// with) and a larger one, math.MaxInt64 the usual way to write "never", is
+// clamped to it, so N stays N for every N below that.
 func resolveTimeout(v, def time.Duration, normalised bool) time.Duration {
 	switch {
 	case v < 0:
@@ -384,6 +398,12 @@ func resolveTimeout(v, def time.Duration, normalised bool) time.Duration {
 	case v == 0 && !normalised:
 		return def
 	default:
-		return v
+		return min(v, MaxTimeout)
 	}
 }
+
+// MaxTimeout is the longest timeout the engines keep: a hundred years. A timeout of
+// math.MaxInt64 (the common way to write "never") overflowed every `now + timeout`
+// the engines compute (a deadline in the past, due at once: celeris#889 review r8
+// F-F), and a hundred years is never in any practical sense.
+const MaxTimeout = 100 * 365 * 24 * time.Hour

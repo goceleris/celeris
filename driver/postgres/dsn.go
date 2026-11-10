@@ -7,14 +7,34 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // Options holds client-side driver knobs parsed out of the DSN before they are
 // passed to the server as startup parameters.
 type Options struct {
-	// ConnectTimeout bounds dial + startup. Zero means no client-side timeout.
+	// ConnectTimeout bounds the dial and the startup together: the TCP connect,
+	// then the startup exchange (authentication, ParameterStatus, BackendKeyData)
+	// up to ReadyForQuery. A server that accepts the connection and does not
+	// complete the startup in that time fails the dial with an error that matches
+	// [context.DeadlineExceeded]. A shorter deadline of the caller's context still
+	// wins. From the DSN it is connect_timeout, in whole seconds.
+	//
+	// When the DSN has no connect_timeout the default applies, 10 s (more than a
+	// backend fork and SCRAM need, enough for a database that resumes from pause).
+	// connect_timeout=0 written in the DSN means no client-side timeout, as in
+	// libpq: the caller's context is then the only bound. A negative
+	// connect_timeout in the DSN is rejected. In a DSN built in code, a zero
+	// ConnectTimeout is "not set" (the default applies) and a negative one is "no
+	// timeout". The host name lookup that precedes the dial is not bounded by it,
+	// nor by the caller's context. Environment variables (PGCONNECT_TIMEOUT and the
+	// other PG* ones) are not read.
 	ConnectTimeout time.Duration
+	// connectTimeoutExplicit tracks whether the DSN parser observed a
+	// connect_timeout, so that an explicit 0 (no timeout) can be told from an
+	// absent key (the default).
+	connectTimeoutExplicit bool
 	// StatementCacheSize is the per-conn LRU capacity for named prepared
 	// statements. Zero disables the cache.
 	StatementCacheSize int
@@ -31,12 +51,41 @@ type Options struct {
 	// distinguish "user opted out" from "field was never set" before
 	// flipping the default to true.
 	autoCacheStatementsExplicit bool
+	// busyPoll is the SO_BUSY_POLL budget dialConn puts on the connection
+	// (Linux); 0 puts none. The Connector and the Pool set it, from the
+	// server's Config.SocketBusyPoll under WithEngine (celeris#1228).
+	busyPoll time.Duration
 	// Application is copied into the "application_name" startup parameter.
 	Application string
 	// SSLMode is the parsed sslmode value. "disable" and "prefer" are
 	// accepted; "require" / "verify-ca" / "verify-full" are rejected at Open
 	// time with ErrSSLNotSupported.
 	SSLMode string
+}
+
+// defaultConnectTimeout is the ConnectTimeout of a DSN that has no connect_timeout.
+const defaultConnectTimeout = 10 * time.Second
+
+// testHookDefaultConnectTimeout, when set, replaces the default connect timeout
+// (10 s) that applies when the DSN has no connect_timeout. A test sets it to avoid
+// waiting 10 s, and resets it to nil when it is done.
+var testHookDefaultConnectTimeout atomic.Pointer[time.Duration]
+
+// effectiveConnectTimeout is the budget for the dial and the startup: the
+// ConnectTimeout if it is set, none (0) for an explicit connect_timeout=0 or a
+// negative value, the default if the DSN had no connect_timeout. The second result
+// reports that the default was used.
+func (o Options) effectiveConnectTimeout() (d time.Duration, isDefault bool) {
+	switch {
+	case o.ConnectTimeout > 0:
+		return o.ConnectTimeout, false
+	case o.ConnectTimeout < 0 || o.connectTimeoutExplicit:
+		return 0, false
+	}
+	if h := testHookDefaultConnectTimeout.Load(); h != nil {
+		return *h, true
+	}
+	return defaultConnectTimeout, true
 }
 
 // DSN is the parsed form of a PostgreSQL connection string.
@@ -199,7 +248,11 @@ func applyDSNKey(d *DSN, k, v string) error {
 		if err != nil {
 			return fmt.Errorf("celeris-postgres: connect_timeout = %q: %w", v, err)
 		}
+		if n < 0 {
+			return fmt.Errorf("celeris-postgres: connect_timeout = %d: must be >= 0 (0: no timeout; absent: the 10s default)", n)
+		}
 		d.Options.ConnectTimeout = time.Duration(n) * time.Second
+		d.Options.connectTimeoutExplicit = true
 	case "statement_cache_size":
 		n, err := strconv.Atoi(v)
 		if err != nil {

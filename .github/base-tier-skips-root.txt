@@ -1,0 +1,25 @@
+# Tests that skip at CELERIS_MAX_IOURING_TIER=base on purpose, for .github/scripts/base-tier-tally.sh
+# (celeris#890 item 87): the full test or subtest name, then why. A name covers its own
+# subtests. Measured on the run of the job iouring-base-tier cited in the pull request:
+# 107 top-level tests passed, 3 skipped at the top level, 19 SKIP lines in all (and
+# 117 passed with 46 SKIP lines once main had brought in nine more tests of the kind below).
+# On main 8936e89 (docker, merged tree): 118 passed, 46 SKIP lines, all allowed.
+min-pass 105
+
+# The probes of the tests that gate their io_uring arms (c714ProbeIOUring,
+# keptProbeIOUring, h2_handler_return_889's) call io_uring "usable" only at the high
+# tier with provided buffers, so with the cap their io_uring and adaptive arms skip with
+# "io_uring tier=base kernel=...: no usable io_uring". The std and epoll arms of the
+# same tests run. A new test of this kind joins them without an edit here, because the
+# entry names the arms, not the tests (run 40419578127 met nine new ones that a merge
+# with main brought in: the TestH1Unclosed...889 family); the arm must have logged the
+# probe's own skip message ("io_uring tier=base kernel=...") while it was the current test, so an
+# arm that starts an engine and skips for another reason still fails the step.
+pattern:^.+/(io_uring|adaptive|adaptive-iouring)$ the io_uring, adaptive and adaptive-iouring arms of probe-gated tests
+
+# Tier base has no multishot recv, and these two tests are about it.
+TestHijackCopiesRequestValuesUnderMultishotRecv tier base has no multishot recv
+TestMultishotRingSurvivesHijacks tier base has no multishot recv
+
+# Its probe (keptProbeIOUring) calls io_uring usable only at the high tier: "no usable io_uring".
+TestServerAsyncRouteDetachThenGoexitOnIOUring no usable io_uring at the base tier

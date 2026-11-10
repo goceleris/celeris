@@ -9,6 +9,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The accounting and the counters behind the celeris#812 hold (see
@@ -338,10 +340,10 @@ func TestShutdownRetainsSendBuffersAZCMayStillRead(t *testing.T) {
 			}
 			if tc.closeFirst {
 				sweepClose(t, w, cs)
-				w.pendingRelease[0].releaseAtNanos = time.Now().UnixNano()
+				w.pendingRelease[0].releaseAtNanos = mono.Now()
 				for range 3 {
 					runRingOnce(t, w, 10*time.Millisecond)
-					w.cachedNow = time.Now().UnixNano()
+					w.cachedNow = mono.Now()
 					w.drainPendingRelease()
 				}
 				if len(w.pendingRelease) != 0 || len(w.zcHolds) != 1 || w.handoffLoss.zcHeldNow.Load() != 1 {

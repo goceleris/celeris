@@ -21,12 +21,16 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 )
 
-// maxDirectResultBytes is the per-query result buffer cap in direct mode.
-// Direct mode pins syncMode=true (lazy streaming cannot activate because
-// the caller goroutine IS the dispatcher — a blocking channel send would
-// deadlock), so without a cap a SELECT against a huge table would buffer
-// every row into req.rowSlab. 64 MiB matches the WebSocket detach-limit
-// on the engine side and gives typical result sets a wide margin.
+// maxDirectResultBytes is the per-query result buffer cap, on the payload of the
+// DataRows, wherever a reply is buffered whole: direct mode, which pins
+// syncMode=true (lazy streaming cannot activate because the caller goroutine IS
+// the dispatcher: a blocking channel send would deadlock), and the sync fast
+// path of a non-direct pool while its poll has not returned. A row that would
+// take the buffer past it is not appended: the request fails with
+// ErrResultTooBig, the rows buffered up to then are what the caller reads before
+// the error, and the rest of the reply is read and discarded. 64 MiB matches the
+// WebSocket detach-limit on the engine side and gives typical result sets a
+// wide margin.
 const maxDirectResultBytes = 64 << 20
 
 // syncRoundTripper is the optional interface for event-loop workers that
@@ -198,6 +202,9 @@ type pgRequest struct {
 	// finished is true, preventing a race where a new acquirePgRequest
 	// reuses the request while finish()/fail() is still reading its fields.
 	finished atomic.Bool
+	// slabBytes is the payload bytes buffered in total, over every slab chunk
+	// (rowSlab is the current one): what maxDirectResultBytes bounds.
+	slabBytes int
 }
 
 // finish signals completion of the request exactly once. Safe for
@@ -360,6 +367,7 @@ func releasePgRequest(r *pgRequest) {
 	}
 	r.rowFields = r.rowFields[:0]
 	r.rowSlab = r.rowSlab[:0]
+	r.slabBytes = 0
 	r.tag = ""
 	r.err = nil
 	r.rowCh = nil
@@ -376,37 +384,32 @@ func releasePgRequest(r *pgRequest) {
 // preserves the nil-vs-empty distinction for PG NULLs (nil) vs zero-length
 // text (non-nil empty slice).
 //
-// Aliasing correctness: the slab grows with append, which may reallocate
-// the backing array. Any sub-slice taken before the reallocation would be
-// stale. We avoid the problem by growing the slab to its final size first
-// (single pre-append if capacity is insufficient) and then handing out
-// sub-slices against the now-stable backing array.
-func (r *pgRequest) appendRowFromAlias(fields [][]byte) {
-	totalBytes := 0
-	for _, f := range fields {
-		totalBytes += len(f)
-	}
+// Aliasing correctness: a row-view points into the slab and the row fields
+// that were current when it was carved. When one is full, a NEW chunk is
+// started and the old one is not copied: the earlier views keep pointing into
+// the old array, which stays valid for as long as a row references it, and no
+// view is ever carved across a chunk (a row's fields are made to fit first).
+// Growing by copy left every earlier generation reachable through the views
+// already handed out: with 1.25x growth that is 5 times the data held, for a
+// reply of 2M rows 1.1 GB of live heap (celeris#1104). Chunked, the live heap
+// is the data plus 24 bytes of field view and of row view per row, plus at most one
+// row's worth of unused tail per chunk (the tail a row did not fit in is left;
+// worst case about twice the data, for rows just over half a chunk).
+func (r *pgRequest) appendRowFromAlias(fields [][]byte, totalBytes int) {
 	// Ensure the slab has stable storage for every non-nil field. We do
 	// this in one shot so later sub-slices (view[i]) can point into the
 	// same backing array and stay valid.
 	if totalBytes > 0 {
 		if cap(r.rowSlab)-len(r.rowSlab) < totalBytes {
-			// Grow with append+len to get amortized 2x behavior.
-			need := len(r.rowSlab) + totalBytes
-			// Use make+copy so we can size the new slab to fit without
-			// walking through a sequence of incremental appends.
-			ns := make([]byte, len(r.rowSlab), growCap(cap(r.rowSlab), need))
-			copy(ns, r.rowSlab)
-			r.rowSlab = ns
+			// The current chunk is full: start the next, not a copy of this one.
+			r.rowSlab = make([]byte, 0, chunkCap(cap(r.rowSlab), totalBytes))
 		}
+		r.slabBytes += totalBytes
 	}
 	// Ensure rowFields has stable storage for the row-view. One grow if
 	// needed, then a no-realloc append for the row itself.
 	if cap(r.rowFields)-len(r.rowFields) < len(fields) {
-		need := len(r.rowFields) + len(fields)
-		nf := make([][]byte, len(r.rowFields), growCap(cap(r.rowFields), need))
-		copy(nf, r.rowFields)
-		r.rowFields = nf
+		r.rowFields = make([][]byte, 0, chunkCap(cap(r.rowFields), len(fields)))
 	}
 	start := len(r.rowFields)
 	r.rowFields = r.rowFields[:start+len(fields)]
@@ -427,20 +430,16 @@ func (r *pgRequest) appendRowFromAlias(fields [][]byte) {
 	r.rows = append(r.rows, view)
 }
 
-// growCap returns a capacity for a slice growth from old to at least need.
-// Mirrors runtime.growslice heuristics (double up to ~1KB, then 1.25x).
-func growCap(old, need int) int {
-	if old < 32 {
-		old = 32
-	}
-	for old < need {
-		if old < 1024 {
-			old *= 2
-		} else {
-			old = old + old/4
-		}
-	}
-	return old
+// maxChunk is the largest chunk of slab (bytes) or row fields (elements) a
+// request starts without being asked for more: past it chunks stop doubling, so
+// the unused tail of the last one stays small however large the reply is.
+const maxChunk = 1 << 16
+
+// chunkCap is the capacity of the next chunk after one of capacity old, for at
+// least need: double, then a fixed maxChunk.
+func chunkCap(old, need int) int {
+	n := min(max(old, 32)*2, maxChunk)
+	return max(n, need)
 }
 
 // Ctx implements async.PendingRequest.
@@ -451,7 +450,7 @@ func (r *pgRequest) Ctx() context.Context { return r.ctx }
 // list and unblocks any caller waiting on colsCh for early streamRows
 // return.
 func (r *pgRequest) OnRowDesc(cols []protocol.ColumnDesc) {
-	r.columns = cols
+	r.setColumnsIfLive(cols)
 	if r.rowCh != nil && r.colsCh != nil {
 		r.closeColsCh()
 	}
@@ -470,24 +469,90 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 		r.sendRow(copyRow(fields))
 		return
 	}
-	r.appendRowFromAlias(fields)
-	// Direct-mode result-buffer cap. In direct mode syncMode is pinned
-	// so lazy streaming never fires; without a cap a huge SELECT would
-	// buffer every row in memory unbounded. Cap at maxDirectResultBytes
-	// (64 MiB) and fail with ErrResultTooBig — caller paginates or
-	// switches modes.
-	if r.syncMode.Load() && len(r.rowSlab) > maxDirectResultBytes {
-		r.doneMu.Lock()
-		if r.err == nil {
-			r.err = ErrResultTooBig
-		}
-		r.doneMu.Unlock()
+	// The append runs under doneMu, and not once the request is done: a
+	// failAll or failReq on another goroutine wakes the caller through doneCh
+	// (its fail() took doneMu after the last append that finished, so that
+	// append is ordered before the caller's read) and the caller reads r.rows
+	// and r.columns at once. A frame dispatch is still parsing then must not
+	// write them: it drops the row (celeris#887).
+	nrows, syncMode, ok := r.appendBuffered(fields)
+	if !ok {
 		return
 	}
 	// Skip streaming promotion when colsCh is nil (Exec paths don't
 	// allocate one; promoting would panic on close(nil colsCh)).
-	if !r.syncMode.Load() && r.colsCh != nil && len(r.rows) >= streamThreshold {
+	if !syncMode && r.colsCh != nil && nrows >= streamThreshold {
 		promoteToStreaming(r)
+	}
+}
+
+// appendBuffered appends one DataRow to the buffered result under doneMu, with
+// a deferred unlock: a panic in the append on the sync path unwinds through
+// pollSync's failAll, whose fail() takes doneMu again. ok is false when the row
+// was dropped (the request is done) or the direct-mode result cap failed the
+// request; nrows is the buffered row count and syncMode the request's mode.
+func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok bool) {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if r.doneFlag {
+		return 0, false, false
+	}
+	// Direct-mode result-buffer cap. In direct mode, and on the sync fast
+	// path, syncMode is pinned so lazy streaming never fires (the caller's
+	// goroutine is the dispatcher), and the poll cannot be stopped from here:
+	// it reads the rest of the reply whatever this returns. So the cap is a
+	// bound on the BUFFER: a row that would take it past maxDirectResultBytes is
+	// not appended, the request fails with ErrResultTooBig (the caller sees it
+	// after the rows already buffered, as before) and the rest of the reply is
+	// read and dropped to keep the wire aligned. Checked after the append, as it
+	// was, it bounded nothing: a reply of 240 MB was buffered whole, 1.1 to
+	// 1.2 GB of heap, before the error (celeris#1104).
+	syncMode = r.syncMode.Load()
+	// Once the cap has tripped no row is buffered, in any mode: the sync fast
+	// path clears syncMode when its poll returns before the reply is done, and
+	// the event loop then dispatches the rest of the reply with it false. A row
+	// appended there would be promoted to streaming behind the rows already
+	// buffered, with the dropped ones missing in between and the error lost.
+	// Returning false also keeps promoteToStreaming from running, so the caller
+	// wakes on doneCh with the buffered rows and ErrResultTooBig.
+	if r.err == ErrResultTooBig {
+		return 0, syncMode, false
+	}
+	size := 0
+	for _, f := range fields {
+		size += len(f)
+	}
+	if syncMode && r.slabBytes+size > maxDirectResultBytes {
+		r.err = ErrResultTooBig
+		return 0, syncMode, false
+	}
+	r.appendRowFromAlias(fields, size)
+	return len(r.rows), syncMode, true
+}
+
+// setColumnsIfLive stores the column list unless the request is done: failAll
+// (or failReq) completed it, its caller reads r.columns now, and a late frame
+// must not write it (celeris#887). The unlock is deferred like
+// appendBuffered's.
+func (r *pgRequest) setColumnsIfLive(cols []protocol.ColumnDesc) {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if !r.doneFlag {
+		r.columns = cols
+	}
+}
+
+// setResultIfLive stores the extended query's command tag and, when none is set
+// yet, its columns, unless the request is done (see setColumnsIfLive).
+func (r *pgRequest) setResultIfLive(tag string, cols []protocol.ColumnDesc) {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if r.doneFlag {
+		return
+	}
+	r.tag = tag
+	if r.columns == nil {
+		r.columns = cols
 	}
 }
 
@@ -707,6 +772,9 @@ type pgConn struct {
 
 	createdAt  time.Time
 	lastUsedAt atomic.Int64 // unix nanos
+	// connectDeadline is when Options.ConnectTimeout, counted from the start of
+	// the dial, runs out; the zero time if it is unset. doStartup ends at it.
+	connectDeadline time.Time
 
 	maxLifetime time.Duration
 	maxIdleTime time.Duration
@@ -806,6 +874,34 @@ func (c *pgConn) writeRawFromRecv(data []byte) error {
 		return ErrClosed
 	}
 	return c.writeRaw(data)
+}
+
+// errSyncAborted is the close cause of a conn whose sync round trip ended in a
+// panic or a runtime.Goexit.
+var errSyncAborted = errors.New("celeris-postgres: sync round trip aborted by a panic or Goexit")
+
+// pollSync writes payload and polls for the reply on the caller's goroutine
+// (syncLoop.WriteAndPoll), and releases c.writerMu, which the caller holds on
+// entry, however it ends. The poll runs onRecv on this goroutine. No user
+// callback runs there on this driver's query paths (the CopyTo dest runs only
+// for a COPY request), so a panic or runtime.Goexit leaving the poll is a
+// driver or parser bug, not user code; it would otherwise leave writerMu
+// locked, and the reader mid-frame with the request still queued, and
+// Pool.ExecContext's deferred release would put that conn back in the pool for
+// the next command to block on in writerMu.Lock, which has no ctx. When the poll does not return, the
+// conn is failed (failAll marks it closed, so Pool.release discards it)
+// after writerMu is released: Close takes writerMu, failAll does not.
+func (c *pgConn) pollSync(payload []byte) (ok bool, err error) {
+	returned := false
+	defer func() {
+		c.writerMu.Unlock()
+		if !returned {
+			c.failAll(errSyncAborted)
+		}
+	}()
+	ok, err = c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
+	returned = true
+	return ok, err
 }
 
 // buildMessage serializes writer access. fn runs under writerMu and may use
@@ -979,7 +1075,7 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	dialer := net.Dialer{Timeout: dsn.Options.ConnectTimeout}
+	dialer, dialStart := beginDial(dsn.Options)
 	raw, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
 		return nil, err
@@ -1013,6 +1109,8 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 		pending:      make([]*pgRequest, 0, 8),
 		createdAt:    time.Now(),
 		serverParams: map[string]string{},
+
+		connectDeadline: connectDeadline(dialStart, dsn.Options),
 	}
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
@@ -1023,9 +1121,90 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 	return c, nil
 }
 
-// doStartup performs the full startup handshake synchronously. The event loop
-// delivers bytes to onRecv, which drives the StartupState machine via a
-// dedicated pgRequest of kind reqStartup.
+// testHookAfterDialStart, when set, runs right after the clock of ConnectTimeout
+// started and before the TCP connect: a test makes the connect slow with it (a
+// loopback connect takes no measurable time).
+var testHookAfterDialStart atomic.Pointer[func()]
+
+// beginDial starts the clock of o.ConnectTimeout, which counts the dial and the
+// startup together, and returns the dialer for the TCP connect and the time the
+// clock started. Every dial path calls it first, before the connect.
+func beginDial(o Options) (net.Dialer, time.Time) {
+	start := time.Now()
+	if h := testHookAfterDialStart.Load(); h != nil {
+		(*h)()
+	}
+	d, _ := o.effectiveConnectTimeout()
+	return net.Dialer{Timeout: d}, start
+}
+
+// connectDeadline is when o.ConnectTimeout, counted from dialStart, runs out: the
+// time the dial plus the startup have. The zero time if there is no timeout.
+func connectDeadline(dialStart time.Time, o Options) time.Time {
+	d, _ := o.effectiveConnectTimeout()
+	if d <= 0 {
+		return time.Time{}
+	}
+	return dialStart.Add(d)
+}
+
+// startupBound ends a startup that must not go on: the caller's context ended, or
+// ConnectTimeout (counted from the start of the dial) ran out. The startup waits
+// for the server, in a place that does not look at a context (a read on the
+// socket in direct mode, the request's done channel on a loop), so the bound
+// fails the request and, in direct mode, wakes the read.
+type startupBound struct {
+	c       *pgConn
+	mu      sync.Mutex
+	err     error // why the startup was ended; nil if it was not
+	done    bool  // the startup is over: abort does nothing from here on
+	stopCtx func() bool
+	timer   *time.Timer
+}
+
+// abort ends the startup with err. It does nothing once finish has run, or if an
+// earlier abort did.
+func (b *startupBound) abort(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.done || b.err != nil {
+		return
+	}
+	b.err = err
+	b.c.failAll(err)
+	if b.c.useDirect && b.c.tcp != nil {
+		// Wakes the blocked read of driveDirect (or a blocked write), which
+		// then sees the request failed.
+		_ = b.c.tcp.SetDeadline(time.Now())
+	}
+}
+
+// finish disarms the bound and returns the error the startup was ended with, nil
+// if it was not. An abort that is running is waited for, so a startup that
+// completed at the instant the bound fired is reported as ended: the abort has
+// failed the conn and (in direct mode) set a read deadline on its socket.
+func (b *startupBound) finish() error {
+	b.stopCtx()
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.done = true
+	return b.err
+}
+
+// doStartup performs the full startup handshake synchronously: the optional
+// authentication exchange, ParameterStatus and BackendKeyData, up to
+// ReadyForQuery. The event loop delivers bytes to onRecv, which drives the
+// StartupState machine via a dedicated pgRequest of kind reqStartup.
+//
+// The startup ends when the caller's context ends or when ConnectTimeout, counted
+// from the start of the dial, runs out (celeris#1212), whichever comes first. The
+// bound (startupBound) does it: wait's own handling of a cancelled context cannot,
+// as it sends a CancelRequest, which needs the BackendKeyData the startup has not
+// got yet, and then waits up to 30 s for a reply that is not coming (and direct
+// mode does not look at the context while it is blocked in a read).
 func (c *pgConn) doStartup(ctx context.Context) error {
 	st := &protocol.StartupState{
 		User:     c.dsn.User,
@@ -1041,12 +1220,34 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 		doneCh:  make(chan struct{}),
 	}
 	c.enqueue(req)
+	// The bound is armed before the first message is written, so it covers the
+	// write too (in direct mode a write to a peer that does not read can block).
+	b := &startupBound{c: c}
+	b.stopCtx = context.AfterFunc(ctx, func() { b.abort(ctx.Err()) })
+	if !c.connectDeadline.IsZero() {
+		d := time.Until(c.connectDeadline)
+		budget, isDefault := c.dsn.Options.effectiveConnectTimeout()
+		msg := fmt.Sprintf("connect_timeout %v", budget)
+		if isDefault {
+			msg = fmt.Sprintf("default connect_timeout %v; set connect_timeout=0 for none", budget)
+		}
+		b.timer = time.AfterFunc(d, func() {
+			b.abort(fmt.Errorf("celeris-postgres: startup timed out (%s): %w", msg, context.DeadlineExceeded))
+		})
+	}
 	if err := c.writeRaw(initial); err != nil {
 		c.failReq(req, err)
+		if aerr := b.finish(); aerr != nil {
+			return aerr
+		}
 		return err
 	}
-	if err := c.wait(ctx, req); err != nil {
-		return err
+	werr := c.wait(ctx, req)
+	if aerr := b.finish(); aerr != nil {
+		return aerr
+	}
+	if werr != nil {
+		return werr
 	}
 	c.pid = st.PID
 	c.secret = st.Secret
@@ -1244,14 +1445,38 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 		return nil
 	}
 
-	c.pendingMu.Lock()
-	if len(c.pending) == 0 {
-		c.pendingMu.Unlock()
+	head := c.pinHead()
+	if head == nil {
 		return fmt.Errorf("celeris-postgres: unexpected server message %q with empty queue", msgType)
 	}
-	head := c.pending[0]
-	c.pendingMu.Unlock()
+	// The last act on head is the unpin, as in failAll; deferred so a panic in
+	// dispatchHead (a CopyTo dest callback) does not keep the pin for good.
+	defer head.failPins.Add(-1)
+	return c.dispatchHead(head, msgType, payload)
+}
 
+// pinHead returns the head of the pending queue with a failPins pin taken
+// under pendingMu (a failAll sweeps the queue under the same lock), or nil when
+// the queue is empty. The pin is the caller's to drop after its last touch of
+// the request: a failAll on another goroutine (the cancel timeout, Close, the
+// COPY and direct-drain timeouts) fails the head and wakes its caller, who
+// releases it, and releasePgRequest drops a pinned request instead of pooling
+// it. Unpinned, the pool could hand the head to the next query while dispatch
+// still closes its channels and finishes it, a silent wrong result for that
+// query (celeris#887).
+func (c *pgConn) pinHead() *pgRequest {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if len(c.pending) == 0 {
+		return nil
+	}
+	head := c.pending[0]
+	head.failPins.Add(1)
+	return head
+}
+
+// dispatchHead feeds one message into head, the request dispatch pinned.
+func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) error {
 	switch head.kind {
 	case reqStartup:
 		var resp []byte
@@ -1319,10 +1544,7 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			return nil
 		}
 		if done {
-			head.tag = head.extended.Tag
-			if head.columns == nil {
-				head.columns = head.extended.Columns
-			}
+			head.setResultIfLive(head.extended.Tag, head.extended.Columns)
 			if head.rowCh != nil {
 				head.closeColsCh()
 				head.closeRowCh()
@@ -1334,7 +1556,7 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			// response (before DataRow). Signal colsCh as soon as columns
 			// are available so the caller can return streamRows early.
 			if head.extended.Columns != nil && head.columns == nil {
-				head.columns = head.extended.Columns
+				head.setColumnsIfLive(head.extended.Columns)
 				head.closeColsCh()
 			}
 		}
@@ -1976,8 +2198,7 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 		req.syncMode.Store(true)
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
-		c.writerMu.Unlock()
+		ok, err := c.pollSync(payload)
 		if err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
@@ -2139,8 +2360,7 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 	if c.syncLoop != nil {
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
-		c.writerMu.Unlock()
+		ok, err := c.pollSync(payload)
 		if err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
@@ -2216,8 +2436,7 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 	if c.syncLoop != nil {
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
-		c.writerMu.Unlock()
+		ok, err := c.pollSync(payload)
 		if err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
@@ -2349,8 +2568,7 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		}
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
-		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecvFn)
-		c.writerMu.Unlock()
+		ok, werr := c.pollSync(c.writer.Bytes())
 		if werr != nil {
 			c.failReq(req, werr)
 			releasePgRequest(req)
@@ -2457,8 +2675,7 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 		protocol.AppendBind(c.writer, "", stmtName, formats, values, nil)
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
-		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecvFn)
-		c.writerMu.Unlock()
+		ok, werr := c.pollSync(c.writer.Bytes())
 		if werr != nil {
 			c.failReq(req, werr)
 			releasePgRequest(req)

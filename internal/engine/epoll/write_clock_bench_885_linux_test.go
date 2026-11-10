@@ -14,6 +14,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -38,7 +39,7 @@ func BenchmarkCheckTimeoutsParked885(b *testing.B) {
 					timerFD:     -1,
 					cfg:         resource.Config{WriteTimeout: time.Hour, IdleTimeout: time.Hour, ReadTimeout: time.Hour},
 				}
-				now := time.Now().UnixNano()
+				now := mono.Now()
 				for i := 0; i < n; i++ {
 					cs := acquireConnState(context.Background(), 3, 64, mode == "async")
 					cs.liveIdx = -1

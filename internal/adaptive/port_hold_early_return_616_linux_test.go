@@ -27,7 +27,10 @@ import (
 //     error;
 //   - "start engine fails": the start engine's Listen returns an error without
 //     ever publishing an address, as an io_uring engine whose worker init
-//     failed does, and Listen takes its "sub-engine startup failed" return.
+//     failed does, and Listen takes its "sub-engine startup failed" return;
+//   - "bind deadline passes": the start engine runs but publishes no address
+//     within listenBindDeadline (cut to 200 ms), and Listen takes its
+//     "failed to initialize within" return.
 //
 // Each arm checks that the injection made Listen return early (no address
 // published; the explicit return of a started engine is not the one under
@@ -61,14 +64,14 @@ func TestAdaptiveListenEarlyReturnReleasesHold616(t *testing.T) {
 			wantErr: "injected standby Listen failure"},
 		{name: "bind deadline passes/epoll", env: "epoll", want: engine.Epoll,
 			inject: func(e *Engine, _ context.CancelFunc) {
-				listenBindDeadline = 200 * time.Millisecond
+				listenBindDeadline.Store(int64(200 * time.Millisecond))
 				var silent engine.Engine = &lateBindingStandby{mockEngine: newMockEngine(engine.Epoll), listenEnded: make(chan struct{})}
 				e.active.Store(&silent)
 			},
 			wantErr: "failed to initialize within"},
 	}
-	savedDeadline := listenBindDeadline
-	defer func() { listenBindDeadline = savedDeadline }()
+	savedDeadline := listenBindDeadline.Load()
+	defer func() { listenBindDeadline.Store(savedDeadline) }()
 	for _, a := range arms {
 		t.Run(a.name, func(t *testing.T) {
 			e, addr, _ := newGapEngine(t, a.env, a.want)
@@ -85,7 +88,7 @@ func TestAdaptiveListenEarlyReturnReleasesHold616(t *testing.T) {
 			} else {
 				listenGapHook = func(string) { hooked = true }
 			}
-			defer func() { listenGapHook = nil; listenBindDeadline = savedDeadline }()
+			defer func() { listenGapHook = nil; listenBindDeadline.Store(savedDeadline) }()
 
 			lerr := e.Listen(ctx)
 			listenGapHook = nil

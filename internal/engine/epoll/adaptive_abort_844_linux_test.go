@@ -263,11 +263,12 @@ func start844(t *testing.T, h *a844, gate bool) *rig844 {
 	t.Cleanup(cancel)
 	r.done = make(chan error, 1)
 	go func() { r.done <- ae.Listen(ctx) }()
-	for dl := time.Now().Add(5 * time.Second); ae.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ae.Addr() == nil {
-		t.Fatal("adaptive engine never bound")
+	// A guard against a hang, not an expectation: Listen gives up on its own after
+	// its bind deadline (20 s) and returns its error, which awaitAdaptiveBound844 reports.
+	// The 5 s it replaces could be missed by a starved poll or a slow Listen
+	// alone (celeris#890 item 98, internal/adaptive's awaitBind890).
+	if err := awaitAdaptiveBound844(ae, r.done, 30*time.Second); err != nil {
+		t.Fatalf("adaptive engine never bound: %v", err)
 	}
 	r.addr = ae.Addr().String()
 	if pkg844 == "iouring" {
@@ -545,4 +546,24 @@ func TestAdaptiveAbortLogsAPanicValueThatSharesStreamMemory844(t *testing.T) {
 	if !strings.Contains(text, canary844) {
 		t.Errorf("celeris#844 item 3: the slog handler formatted the panic value after the conn was torn down and got %q", text)
 	}
+}
+
+// awaitAdaptiveBound844 waits up to d for the adaptive engine ae to publish its
+// address. If Listen returns first (done receives its result) it does not wait
+// out d: it fails with that error, and puts the value back on done for the
+// teardown. The same wait as internal/adaptive's awaitBind890 (this is another
+// package's test, so it cannot import it).
+func awaitAdaptiveBound844(ae interface{ Addr() net.Addr }, done chan error, d time.Duration) error {
+	for dl := time.Now().Add(d); ae.Addr() == nil; {
+		select {
+		case err := <-done:
+			done <- err
+			return fmt.Errorf("Listen returned before the engine bound: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(dl) {
+			return fmt.Errorf("no address after %v", d)
+		}
+	}
+	return nil
 }

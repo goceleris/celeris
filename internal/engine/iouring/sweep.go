@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The post-switch sweep, io_uring half (celeris#657 P9). The epoll half's
@@ -72,7 +73,7 @@ func (w *Worker) sweepWait() (time.Duration, bool) {
 	if w.sweepDormant || len(w.liveConns) == 0 {
 		return 0, false
 	}
-	d := time.Duration(w.sweepNext - time.Now().UnixNano())
+	d := time.Duration(w.sweepNext - mono.Now())
 	if d < 0 {
 		d = 0
 	}
@@ -162,7 +163,7 @@ func (w *Worker) sweep() {
 		}
 		return
 	}
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if now < w.sweepNext {
 		return
 	}

@@ -455,11 +455,13 @@ func TestBridgeDeclaredLengthDecidesBeforeTheRead976(t *testing.T) {
 	}
 }
 
-// TestUpgradeBadSettingsWinsOverDeclaredOversize976 pins the order in
-// h2cUpgrade: the HTTP2-Settings header is checked before the declared length,
-// so an upgrade request with an invalid header and a declared length over the
-// limit is answered 500, not 413, and is not counted as a refused body.
-func TestUpgradeBadSettingsWinsOverDeclaredOversize976(t *testing.T) {
+// TestUpgradeBadSettingsIsPlainHTTP1AndTheBodyLimitApplies976: an upgrade
+// request whose HTTP2-Settings does not decode is not an upgrade (RFC 7540
+// 3.2.1; celeris#889), so it is an ordinary HTTP/1.1 request, and the limit
+// that applies to every request body applies to it: a declared length over
+// MaxRequestBodySize is a 413 from Bridge, counted as a refused body. It used
+// to be answered 500 for its settings first, with the body not counted.
+func TestUpgradeBadSettingsIsPlainHTTP1AndTheBodyLimitApplies976(t *testing.T) {
 	e, addr := startH2CEngineWith(t, newPathHandler(), nil, func(c *resource.Config) {
 		c.Protocol = engine.H2C
 		c.SetH2Upgrade(true)
@@ -471,17 +473,15 @@ func TestUpgradeBadSettingsWinsOverDeclaredOversize976(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-	// The body is sent whole: the 500 does not close the connection, so
-	// net/http reads the declared body before it writes the answer.
 	if _, err := io.WriteString(c, "POST /h HTTP/1.1\r\nHost: std.test\r\nConnection: Upgrade, HTTP2-Settings\r\n"+
 		"Upgrade: h2c\r\nHTTP2-Settings: !!not-base64!!\r\nContent-Length: 8192\r\n\r\n"+strings.Repeat("x", 8192)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	line, _ := bufio.NewReader(c).ReadString('\n')
-	if !strings.HasPrefix(line, "HTTP/1.1 500") {
-		t.Fatalf("an upgrade with an invalid HTTP2-Settings and a declared length over the limit was answered %q, want 500", strings.TrimSpace(line))
+	if !strings.HasPrefix(line, "HTTP/1.1 413") {
+		t.Fatalf("an upgrade request with an invalid HTTP2-Settings and a declared length over the limit was answered %q, want 413 as any HTTP/1.1 request", strings.TrimSpace(line))
 	}
-	if got := e.Metrics().ErrorRequestBody; got != 0 {
-		t.Fatalf("ErrorRequestBody = %d, want 0: the request was refused for its settings, not its body", got)
+	if got := e.Metrics().ErrorRequestBody; got != 1 {
+		t.Fatalf("ErrorRequestBody = %d, want 1: the request is refused for its body, as any other", got)
 	}
 }

@@ -48,18 +48,8 @@ func newRampAdaptive(t *testing.T, h stream.Handler, cfg resource.Config) (*Engi
 		afterNew886(e)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	for dl := time.Now().Add(3 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		cancel()
-		<-done
-		t.Fatal("adaptive engine never bound")
-	}
-	return e, e.Addr().String(), func() { cancel(); <-done }
+	addr, stop := listenAndAwaitBind890(t, e)
+	return e, addr, stop
 }
 
 // errExemplarCap bounds how many DISTINCT verbatim error strings are retained

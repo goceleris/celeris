@@ -21,13 +21,14 @@ type Config struct, IncludeHeaders []string
 type Config struct, KeyGenerator func(*github.com/goceleris/celeris.Context) string
 type Config struct, MaxBodyBytes int
 type Config struct, Methods []string
+type Config struct, SetTimeout time.Duration
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, StatusFilter func(int) bool
 type Config struct, Store github.com/goceleris/celeris/middleware/store.KV
 type Config struct, TTL time.Duration
 type Config struct, VaryHeaders []string
-type Config struct, field order Store, TTL, KeyGenerator, DisableSingleflight, Methods, StatusFilter, VaryHeaders, HeaderName, MaxBodyBytes, IncludeHeaders, ExcludeHeaders, IgnoreCacheControl, Skip, SkipPaths
+type Config struct, field order Store, TTL, KeyGenerator, DisableSingleflight, Methods, StatusFilter, VaryHeaders, HeaderName, MaxBodyBytes, IncludeHeaders, ExcludeHeaders, IgnoreCacheControl, Skip, SkipPaths, SetTimeout
 type Config struct, not comparable
 type MemoryStore struct
 type MemoryStore struct, not comparable

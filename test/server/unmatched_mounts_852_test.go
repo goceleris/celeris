@@ -176,7 +176,7 @@ func startServerConfig852(t *testing.T, cfg celeris.Config, setup func(*celeris.
 		}
 		cancel()
 		<-done
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(retryUntil) {
+		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}

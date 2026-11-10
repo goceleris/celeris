@@ -2,6 +2,7 @@ package memcached
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -59,6 +60,28 @@ type syncMultiRoundTripper interface {
 // useDirect discriminates. Fields for the unused mode are zero.
 type memcachedConn struct {
 	useDirect bool
+
+	// opTimeout and opDeadline are the per-operation limit of the command that is
+	// running on this conn (celeris#1218): both zero when it is not limited by
+	// Config.Timeout. They are set by Client.beginOp and cleared by endOp, on the
+	// goroutine that owns the conn for the command. opTimer is the timer a loop
+	// conn parks on for it, created on first use and reused.
+	opTimeout  time.Duration
+	opDeadline time.Time
+	opTimer    *time.Timer
+
+	// The wake of a direct conn's blocked read on the end of the caller's context
+	// (armWake). The state is on the conn so that a command allocates none of it.
+	wakeMu    sync.Mutex
+	wakeFired bool
+	wakeDone  bool
+	wakeFn    func()
+	wakeStop  func() bool
+	// wakeRan has capacity 1: the callback signals it when it has run, and
+	// disarmWake waits on it whenever stopping the wake failed, so that a callback
+	// of one command never lands in the next one.
+	wakeRan chan struct{}
+	wakeTCP *net.TCPConn
 
 	// Direct-mode fields.
 	tcp *net.TCPConn
@@ -205,15 +228,136 @@ func (c *memcachedConn) pollIsDone() bool {
 	return last != nil && last.finished.Load()
 }
 
+// testHookDefaultHandshakeTimeout, when set, replaces the default (defaultDialTimeout,
+// 5 s) used as the handshake bound of a conn whose Config.DialTimeout is unset.
+// A test sets it to avoid waiting 5 s, and resets it to nil when it is done.
+var testHookDefaultHandshakeTimeout atomic.Pointer[time.Duration]
+
+// testHookWakeDelay, when set, makes the wake callback of armWake sleep that long
+// before it acts, so that a test can hold a callback in flight across the end of
+// its command (celeris#1218). It is nil in production.
+var testHookWakeDelay atomic.Pointer[time.Duration]
+
 // handshake runs per-protocol validation. Text protocol has no handshake;
 // for binary we issue a VERSION opcode to confirm the server speaks binary.
 // (Some older stacks accept the TCP connection but send back a text ERROR
 // for an unexpected binary magic byte — catching that here turns a mysterious
 // "first command fails" into a dial-time error.)
+//
+// The binary handshake is bounded by Config.DialTimeout (default 5 s), on top of
+// whatever deadline ctx carries: the dialer's timeout covers only the TCP connect
+// (connect and handshake are two budgets, each DialTimeout), and a server that
+// accepts and never answers VERSION would otherwise hold the dial until ctx ends,
+// which is never under context.Background (celeris#1213, as celeris#1205 for
+// redis). The three dial paths (dialMemcachedConn on unix and on the net.Conn
+// loop, dialDirectMemcachedConn) all end here, so the pool's dials are bounded
+// alike.
 func (c *memcachedConn) handshake(ctx context.Context) error {
 	if !c.binary {
 		return nil
 	}
+	timeout := c.cfg.DialTimeout
+	if timeout <= 0 {
+		timeout = defaultDialTimeout
+		if h := testHookDefaultHandshakeTimeout.Load(); h != nil {
+			timeout = *h
+		}
+	}
+	// Is the caller's own deadline the earlier one? Then it ends the handshake
+	// and is reported as the caller's.
+	callerFirst := false
+	if dl, ok := ctx.Deadline(); ok && !dl.After(time.Now().Add(timeout)) {
+		callerFirst = true
+	}
+	hctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// A direct conn waits in a socket read that does not look at a context (only
+	// at the deadline execBinaryDirect set from it), so the end of the caller's
+	// context, a cancellation too, wakes the read.
+	if c.useDirect {
+		c.armWake(hctx)
+	}
+	err := c.runHandshake(hctx)
+	c.disarmWake()
+	if err != nil && errors.Is(err, os.ErrDeadlineExceeded) && (ctx.Err() != nil || callerFirst) {
+		// The caller's context ended the handshake (its deadline can fire on the
+		// socket a hair before the context reports it): its error, not a bare
+		// "i/o timeout" that matches neither context.Canceled nor
+		// context.DeadlineExceeded.
+		cerr := ctx.Err()
+		if cerr == nil {
+			cerr = context.DeadlineExceeded
+		}
+		return fmt.Errorf("%w: %w", cerr, err)
+	}
+	if err != nil && !callerFirst && ctx.Err() == nil && (hctx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded)) {
+		// The direct path reports the socket's deadline (it can fire a hair
+		// before hctx's timer), the others the context's.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("celeris-memcached: handshake timed out after %v: %w", timeout, err)
+		}
+		return fmt.Errorf("celeris-memcached: handshake timed out after %v: %w: %w", timeout, context.DeadlineExceeded, err)
+	}
+	return err
+}
+
+// armWake arranges that, when ctx ends, the socket of a direct conn gets a deadline
+// of "now", which wakes a read blocked on a silent server (celeris#1213; a direct
+// conn does not watch its context's cancellation, only its deadline). Its state
+// lives on the conn and the callback is built once per conn, so what a command pays
+// for it is context.AfterFunc's own two allocations and nothing else (celeris#1218).
+// disarmWake ends it; it also undoes a wake that raced with a command that had
+// just succeeded, so the conn is not left with a deadline in the past. A callback
+// that has started when the command ends is waited for there (wakeRan), so it
+// cannot run during the next command on the same conn and fail it.
+func (c *memcachedConn) armWake(ctx context.Context) {
+	if c.wakeFn == nil {
+		tcp := c.tcp // Close sets c.tcp to nil
+		c.wakeTCP = tcp
+		c.wakeRan = make(chan struct{}, 1)
+		c.wakeFn = func() {
+			if d := testHookWakeDelay.Load(); d != nil {
+				time.Sleep(*d)
+			}
+			c.wakeMu.Lock()
+			if !c.wakeDone {
+				c.wakeFired = true
+				_ = tcp.SetDeadline(time.Now())
+			}
+			c.wakeMu.Unlock()
+			select {
+			case c.wakeRan <- struct{}{}:
+			default:
+			}
+		}
+	}
+	c.wakeMu.Lock()
+	c.wakeFired, c.wakeDone = false, false
+	c.wakeMu.Unlock()
+	c.wakeStop = context.AfterFunc(ctx, c.wakeFn)
+}
+
+// disarmWake ends the wake armed by armWake; it does nothing if none is armed.
+func (c *memcachedConn) disarmWake() {
+	if c.wakeStop == nil {
+		return
+	}
+	if !c.wakeStop() {
+		// The context has ended and the callback has been started on its own
+		// goroutine (stop is called once per arm): it signals wakeRan when done.
+		<-c.wakeRan
+	}
+	c.wakeStop = nil
+	c.wakeMu.Lock()
+	defer c.wakeMu.Unlock()
+	c.wakeDone = true
+	if c.wakeFired && !c.closed.Load() {
+		_ = c.wakeTCP.SetDeadline(time.Time{})
+	}
+}
+
+// runHandshake is the binary handshake without the bound: a VERSION round trip.
+func (c *memcachedConn) runHandshake(ctx context.Context) error {
 	req, err := c.execBinary(ctx, protocol.OpVersion, func(w *protocol.BinaryWriter, opaque uint32) []byte {
 		return w.AppendSimple(protocol.OpVersion, opaque)
 	})
@@ -239,6 +383,56 @@ func (c *memcachedConn) writeAndEnqueue(req *mcRequest, encode func() []byte) er
 	return nil
 }
 
+// errSyncAborted is the close cause of a conn whose sync round trip ended in a
+// panic or a runtime.Goexit.
+var errSyncAborted = errors.New("celeris-memcached: sync round trip aborted by a panic or Goexit")
+
+// pollSync runs the sync round trip for buf and releases c.writerMu, which the
+// caller holds on entry, however it ends. The poll runs the caller's onRecv
+// path, so it can panic or call runtime.Goexit; a recovered panic would
+// otherwise leave writerMu locked, and the conn's reader mid-frame, for the
+// next command on a conn the caller still holds. When the poll does not return,
+// the conn is closed (closeWithErr, the poisoning every error path here uses)
+// so no command reuses it.
+func (c *memcachedConn) pollSync(buf []byte) (bool, error) {
+	returned := false
+	defer c.endPoll(&returned)
+	var ok bool
+	var err error
+	if c.useBusy {
+		ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
+	} else {
+		ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
+	}
+	returned = true
+	return ok, err
+}
+
+// endPoll is the deferred half of pollSync and pollSyncMulti: it releases
+// writerMu and, when the poll did not return, closes the conn.
+func (c *memcachedConn) endPoll(returned *bool) {
+	c.writerMu.Unlock()
+	if !*returned {
+		_ = c.closeWithErr(errSyncAborted)
+	}
+}
+
+// pollSyncMulti is pollSync for the multi-response poll (execBinaryMulti). It
+// also clears multiPollLastReq, which the caller set under writerMu.
+func (c *memcachedConn) pollSyncMulti(buf []byte) (ok bool, err error) {
+	returned := false
+	defer func() {
+		c.state.multiPollLastReq = nil
+		c.writerMu.Unlock()
+		if !returned {
+			_ = c.closeWithErr(errSyncAborted)
+		}
+	}()
+	ok, err = c.syncMulti.WriteAndPollMulti(c.fd, buf, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, nil)
+	returned = true
+	return ok, err
+}
+
 // execText sends a text-protocol command and waits for the reply. kind is the
 // expected reply shape.
 func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode func(w *protocol.TextWriter) []byte) (*mcRequest, error) {
@@ -260,14 +454,7 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 		if c.syncBuf == nil {
 			c.syncBuf = make([]byte, 16<<10)
 		}
-		var ok bool
-		var err error
-		if c.useBusy {
-			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
-		} else {
-			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
-		}
-		c.writerMu.Unlock()
+		ok, err := c.pollSync(buf)
 		if err != nil {
 			_ = c.closeWithErr(err)
 			// Return the req so callers can putRequest it back to the pool
@@ -330,14 +517,7 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 		if c.syncBuf == nil {
 			c.syncBuf = make([]byte, 16<<10)
 		}
-		var ok bool
-		var err error
-		if c.useBusy {
-			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
-		} else {
-			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
-		}
-		c.writerMu.Unlock()
+		ok, err := c.pollSync(buf)
 		if err != nil {
 			_ = c.closeWithErr(err)
 			return req, err
@@ -407,9 +587,7 @@ func (c *memcachedConn) execBinaryMulti(
 		// the terminator packet is parsed.
 		if c.syncMulti != nil {
 			c.state.multiPollLastReq = req
-			ok, err := c.syncMulti.WriteAndPollMulti(c.fd, buf, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, nil)
-			c.state.multiPollLastReq = nil
-			c.writerMu.Unlock()
+			ok, err := c.pollSyncMulti(buf)
 			if err != nil {
 				_ = c.closeWithErr(err)
 				return req, err
@@ -423,14 +601,7 @@ func (c *memcachedConn) execBinaryMulti(
 			}
 			return req, c.waitTransport(ctx, req)
 		}
-		var ok bool
-		var err error
-		if c.useBusy {
-			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
-		} else {
-			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
-		}
-		c.writerMu.Unlock()
+		ok, err := c.pollSync(buf)
 		if err != nil {
 			_ = c.closeWithErr(err)
 			return req, err
@@ -479,20 +650,112 @@ func (c *memcachedConn) waitTransport(ctx context.Context, req *mcRequest) error
 		default:
 		}
 	}
+	tc := c.armOpTimer()
+	defer c.disarmOpTimer()
 	select {
 	case <-req.doneCh:
 		return nil
 	case <-ctx.Done():
 		_ = c.closeWithErr(ctx.Err())
 		return ctx.Err()
+	case <-tc:
+		return c.opTimedOut(nil)
 	}
+}
+
+// opTimeoutError is the error of a command that Config.Timeout ended. It matches
+// context.DeadlineExceeded (and says "timed out"); cause is the socket's own
+// timeout on a direct conn, nil on a loop conn.
+type opTimeoutError struct {
+	d     time.Duration
+	cause error
+}
+
+func (e *opTimeoutError) Error() string {
+	s := fmt.Sprintf("celeris-memcached: operation timed out after %v: %v", e.d, context.DeadlineExceeded)
+	if e.cause != nil {
+		s += ": " + e.cause.Error()
+	}
+	return s
+}
+func (e *opTimeoutError) Is(target error) bool { return target == context.DeadlineExceeded }
+func (e *opTimeoutError) Unwrap() error        { return e.cause }
+func (e *opTimeoutError) Timeout() bool        { return true }
+
+// directDeadline is the deadline a direct conn's socket gets for the running
+// command: the earlier of the caller's and the per-operation one.
+func (c *memcachedConn) directDeadline(ctx context.Context) (time.Time, bool) {
+	dl, ok := ctx.Deadline()
+	if !c.opDeadline.IsZero() && (!ok || c.opDeadline.Before(dl)) {
+		return c.opDeadline, true
+	}
+	return dl, ok
+}
+
+// armOpTimer arms the conn's timer for what is left of the per-operation limit and
+// returns its channel; nil (a channel that never fires) if the command has no
+// limit. Called only when a loop conn is about to park: a reply that comes within
+// the spin window costs nothing.
+func (c *memcachedConn) armOpTimer() <-chan time.Time {
+	if c.opDeadline.IsZero() {
+		return nil
+	}
+	d := time.Until(c.opDeadline)
+	if c.opTimer == nil {
+		c.opTimer = time.NewTimer(d)
+	} else {
+		c.opTimer.Reset(d)
+	}
+	return c.opTimer.C
+}
+
+func (c *memcachedConn) disarmOpTimer() {
+	if c.opTimer != nil && !c.opDeadline.IsZero() {
+		c.opTimer.Stop()
+	}
+}
+
+// opTimedOut ends the running command because its per-operation limit ran out: the
+// conn is closed (the server may still send a reply) and the error says so.
+func (c *memcachedConn) opTimedOut(cause error) error {
+	err := &opTimeoutError{d: c.opTimeout, cause: cause}
+	_ = c.closeWithErr(err)
+	return err
+}
+
+// opError turns the error of a command into what the caller should see. A
+// deadline that fired on a direct conn's socket is reported as what ended it: the
+// caller's context if that has ended (its error, wrapped around the socket's), the
+// per-operation timeout if that was the limit, the caller's deadline if that has
+// been reached. An application answer is never relabelled, whatever the time.
+// Call it before endOp (commands.go): it reads the limit beginOp put on the conn.
+func (c *memcachedConn) opError(ctx context.Context, err error) error {
+	if err == nil || !errors.Is(err, os.ErrDeadlineExceeded) {
+		return err
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%w: %w", cerr, err)
+	}
+	if c.opTimeout != 0 {
+		return &opTimeoutError{d: c.opTimeout, cause: err}
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
+	return err
 }
 
 // closeWithErr records err as the close cause and closes the conn. Safe to
 // call multiple times.
 func (c *memcachedConn) closeWithErr(err error) error {
 	c.closeErr.Store(&errBox{err: err})
-	return c.Close()
+	cerr := c.Close()
+	// A drain on another goroutine (onClose, the parse-error drain in onRecv)
+	// may still be notifying requests it took before this Close drained: wait
+	// for it, so that a caller that releases its request when this returns is
+	// not written to afterwards (celeris#887).
+	c.state.bridge.WaitDrained()
+	return cerr
 }
 
 // wait blocks until doneCh fires or ctx is canceled. Before parking on the
@@ -517,6 +780,8 @@ func (c *memcachedConn) wait(ctx context.Context, req *mcRequest) error {
 		default:
 		}
 	}
+	tc := c.armOpTimer()
+	defer c.disarmOpTimer()
 	select {
 	case <-req.doneCh:
 		return req.resultErr
@@ -527,6 +792,8 @@ func (c *memcachedConn) wait(ctx context.Context, req *mcRequest) error {
 		// is poisoned — close it so the pool discards it.
 		_ = c.closeWithErr(ctx.Err())
 		return ctx.Err()
+	case <-tc:
+		return c.opTimedOut(nil)
 	}
 }
 
@@ -611,7 +878,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 		c.syncBuf = make([]byte, 16<<10)
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
+	if dl, ok := c.directDeadline(ctx); ok {
 		_ = c.tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
@@ -659,7 +926,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 		c.syncBuf = make([]byte, 16<<10)
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
+	if dl, ok := c.directDeadline(ctx); ok {
 		_ = c.tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {
@@ -708,7 +975,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 		c.syncBuf = make([]byte, 16<<10)
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
+	if dl, ok := c.directDeadline(ctx); ok {
 		_ = c.tcp.SetDeadline(dl)
 		defer func() {
 			if c.tcp != nil {

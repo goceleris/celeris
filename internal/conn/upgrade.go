@@ -1,9 +1,7 @@
 package conn
 
 import (
-	"encoding/base64"
 	"errors"
-	"fmt"
 	"sync"
 )
 
@@ -56,7 +54,7 @@ func ReleaseUpgradeInfo(info *UpgradeInfo) {
 type UpgradeInfo struct {
 	// Settings is the base64url-decoded HTTP2-Settings payload. Each entry
 	// is a 6-byte pair (u16 identifier + u32 value); length is always a
-	// multiple of 6 (DecodeHTTP2Settings rejects others).
+	// multiple of 6 (h1.DecodeHTTP2Settings rejects others) and may be 0.
 	Settings []byte
 	// Method is the H1 request method (used to build the H2 :method
 	// pseudo-header).
@@ -75,30 +73,4 @@ type UpgradeInfo struct {
 	// preface + additional frames. The engine feeds this to ProcessH2
 	// synchronously after switchToH2 so no data is dropped at the seam.
 	Remaining []byte
-}
-
-// DecodeHTTP2Settings base64url-decodes the HTTP2-Settings header value.
-// RFC 7540 §3.2.1 specifies base64url without padding, but some clients
-// include padding — accept both.
-//
-// Validation: the decoded payload length must be a multiple of 6 (one
-// SETTINGS entry = u16 id + u32 value). Any other length indicates a
-// malformed payload.
-func DecodeHTTP2Settings(s string) ([]byte, error) {
-	if s == "" {
-		return nil, fmt.Errorf("empty HTTP2-Settings")
-	}
-	// Try RFC-preferred unpadded URL encoding first.
-	b, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil {
-		// Fall back to padded URL encoding for lenient clients.
-		b, err = base64.URLEncoding.DecodeString(s)
-		if err != nil {
-			return nil, fmt.Errorf("base64url decode: %w", err)
-		}
-	}
-	if len(b)%6 != 0 {
-		return nil, fmt.Errorf("HTTP2-Settings payload length %d not a multiple of 6", len(b))
-	}
-	return b, nil
 }

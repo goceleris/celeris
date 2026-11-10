@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -20,8 +21,8 @@ import (
 func TestGoroutineFlushThatTakesBytesRestartsTheWriteClock885(t *testing.T) {
 	const bound = time.Second
 	r := parked885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: bound})
-	r.cs.writeSince = time.Now().Add(-9 * bound / 10).UnixNano()
-	r.cs.lastActivity = time.Now().UnixNano() // the pipelined request's read
+	r.cs.writeSince = (mono.Now() + int64(-9*bound/10))
+	r.cs.lastActivity = mono.Now() // the pipelined request's read
 	got := 0
 	for i := 0; i < 8; i++ {
 		got += r.read(64 << 10)
@@ -42,7 +43,7 @@ func TestGoroutineFlushThatTakesBytesRestartsTheWriteClock885(t *testing.T) {
 	}
 	r.l.markDirty(r.cs)
 	r.l.flushDirty() // the hand-back: finds the socket full, takes nothing
-	if age := time.Since(time.Unix(0, r.cs.writeSince)); age > bound/2 {
+	if age := time.Since(mono.Time(r.cs.writeSince)); age > bound/2 {
 		t.Errorf("the write clock is %v old after the goroutine's flush took %d bytes: want it restarted", age.Round(time.Millisecond), before-after)
 	}
 	if r.cs.goMoved {
@@ -62,7 +63,7 @@ func TestGoroutineFlushThatTakesBytesRestartsTheWriteClock885(t *testing.T) {
 func TestGoroutineFlushThatTakesNothingDoesNotRestartTheWriteClock885(t *testing.T) {
 	const bound = time.Second
 	r := parked885(t, resource.Config{ReadTimeout: time.Hour, IdleTimeout: time.Hour, WriteTimeout: bound})
-	stamp := time.Now().Add(-9 * bound / 10).UnixNano()
+	stamp := (mono.Now() + int64(-9*bound/10))
 	r.cs.writeSince = stamp
 	r.cs.pendingBytes = csPendingBytes(r.cs)
 	_ = r.l.flushWrites(r.cs, false) // the peer has read nothing: the socket is full
@@ -132,7 +133,7 @@ func TestGoroutineFlushThatEmptiesTheQueueIsSeenByTheWriteClock885(t *testing.T)
 	r.cs.resyncPending()
 	r.l.markDirty(r.cs)
 	r.l.flushDirty()
-	age := time.Since(time.Unix(0, r.cs.writeSince))
+	age := time.Since(mono.Time(r.cs.writeSince))
 	sinceDrain := time.Since(drainedAt)
 	if age > sinceDrain+50*time.Millisecond {
 		t.Errorf("the write clock (%v old) predates the goroutine's draining flush (%v ago): that progress was not seen",

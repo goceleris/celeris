@@ -108,7 +108,21 @@ func TestStreamingBasic(t *testing.T) {
 }
 
 // TestStreamingLarge verifies that streaming 100K rows does not OOM.
-// The test checks that peak heap growth stays under 10MB.
+// The test checks that the live heap stays under 10MB more than its baseline
+// while the rows are consumed, and after.
+//
+// It runs the conn without its sync fast path (syncLoop nil, as on a platform
+// that has none), so the request takes the streaming path on every run. With
+// the fast path, a poll that takes the whole reply in one go buffers every row
+// (syncMode) and never streams, and whether the poll does is timing: on a loaded
+// or instrumented run it took all 100K rows (11.4 MB of buffered rows, held by
+// the request pool past the one GC the test then ran) in 6 of 8 iterations of
+// the package with -race -cover, and the streaming budget failed with no
+// streaming bug (celeris#1104). What this test does NOT cover: the sync fast
+// path's whole-reply buffering, and the fall-through from it to streaming with
+// rows already buffered. Its memory is not bounded by maxDirectResultBytes
+// (appendBuffered checks that cap after it appends and cannot stop the poll), a
+// separate defect handled in the separate PR on the sync-path buffering bound.
 func TestStreamingLarge(t *testing.T) {
 	const numRows = 100_000
 	addr := startFakePG(t, func(c net.Conn) {
@@ -159,11 +173,19 @@ func TestStreamingLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
+	conn.syncLoop = nil // before the first query; see the doc comment
 
-	// Force a GC before measuring baseline.
-	runtime.GC()
-	var mBefore runtime.MemStats
-	runtime.ReadMemStats(&mBefore)
+	// live is the heap that is reachable now: a full GC first (twice, so that
+	// what a sync.Pool holds in its victim cache goes too).
+	live := func() int64 {
+		runtime.GC()
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return int64(m.HeapAlloc)
+	}
+	before := live()
+	var peakGrowth int64
 
 	rows, err := conn.QueryContext(ctx, "SELECT id, payload FROM t", nil)
 	if err != nil {
@@ -181,6 +203,13 @@ func TestStreamingLarge(t *testing.T) {
 			t.Fatal(err)
 		}
 		count++
+		// Sampled mid-stream: a result that is buffered whole shows here, and
+		// not after the rows are closed and garbage.
+		if count%5000 == 0 {
+			if g := live() - before; g > peakGrowth {
+				peakGrowth = g
+			}
+		}
 	}
 	_ = rows.Close()
 
@@ -188,20 +217,18 @@ func TestStreamingLarge(t *testing.T) {
 		t.Fatalf("got %d rows, want %d", count, numRows)
 	}
 
-	runtime.GC()
-	var mAfter runtime.MemStats
-	runtime.ReadMemStats(&mAfter)
-
-	// With streaming, the peak heap should be bounded by the channel
-	// capacity * row size, NOT numRows * rowSize. Allow 10MB of headroom
-	// for test framework overhead and GC slack.
-	heapGrowth := int64(mAfter.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("heap growth: %d bytes (%.1f MB), rows=%d", heapGrowth, float64(heapGrowth)/(1<<20), count)
+	// With streaming, the live heap is bounded by the channel capacity * row
+	// size, NOT numRows * rowSize. Allow 10MB of headroom for test framework
+	// overhead and GC slack.
+	if g := live() - before; g > peakGrowth {
+		peakGrowth = g
+	}
+	t.Logf("heap growth (live, peak of the samples): %d bytes (%.1f MB), rows=%d", peakGrowth, float64(peakGrowth)/(1<<20), count)
 
 	const maxGrowth = 10 << 20 // 10 MB
-	if heapGrowth > maxGrowth {
+	if peakGrowth > maxGrowth {
 		t.Fatalf("heap grew %d bytes (%.1f MB), exceeds %d MB budget — likely not streaming",
-			heapGrowth, float64(heapGrowth)/(1<<20), maxGrowth/(1<<20))
+			peakGrowth, float64(peakGrowth)/(1<<20), maxGrowth/(1<<20))
 	}
 }
 

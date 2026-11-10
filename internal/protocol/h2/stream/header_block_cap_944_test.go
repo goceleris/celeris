@@ -95,9 +95,14 @@ func expandedBlock944(t *testing.T, padByte byte, listSize int) []byte {
 }
 
 // worstHuffmanByte944 is the byte with the longest Huffman code, and the code's
-// length in bits.
+// length in bits. NUL, LF and CR are left out: a request whose field value
+// holds one is refused (RFC 9113 8.2.1, validateRequestHeaders), and the list
+// of this test is meant to be served. 0x16 has a 30-bit code like LF and CR do.
 func worstHuffmanByte944() (b byte, bits uint64) {
 	for i := range 256 {
+		if i == 0 || i == '\n' || i == '\r' {
+			continue
+		}
 		// HuffmanEncodeLength counts whole bytes; 8 copies are 8 x bits bits,
 		// that is exactly bits bytes, so nothing is rounded.
 		if l := hpack.HuffmanEncodeLength(strings.Repeat(string([]byte{byte(i)}), 8)); l > bits {

@@ -11,6 +11,8 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // ContinuationState tracks the state of CONTINUATION frames.
@@ -246,6 +248,9 @@ type Processor struct {
 	refusalWindowSec   int64  // unix-second marker for the current window
 	refusedHeaderLists uint32 // header lists over the bound refused in the current second
 	refusedStreams     uint32 // streams refused for MAX_CONCURRENT_STREAMS in the current second
+	refusedMalformed   uint32 // malformed requests reset in the current second
+	refusedBodies      uint32 // requests reset for a body over MaxRequestBodySize in the current second
+	emptyDataFrames    uint32 // empty DATA frames without END_STREAM in the current second
 	// nowUnix is the clock noteRefusal reads (nil: the wall clock); tests set it.
 	nowUnix func() int64
 
@@ -254,6 +259,25 @@ type Processor struct {
 	// the wire is ignored (handleData), where DATA on any other closed stream
 	// is still a connection error. After refusedFields for the same reason.
 	resetIDs serverResets
+	// resetOpen is the subset of resetIDs whose client side was still open when
+	// the server reset the request without ending the connection (a malformed
+	// request, a header list over the bound, a stream refused for
+	// MAX_CONCURRENT_STREAMS, a body over MaxRequestBodySize; markResetOpen): the
+	// peer may have its DATA and its trailers in flight, and the trailers are
+	// ignored (dropResetStreamHeaders). A stream whose client side had ended with
+	// its HEADERS or its DATA is not in it, or leaves it when it ends
+	// (clearResetOpen): a further HEADERS on it is a connection error.
+	resetOpen serverResets
+	// expiredReq remembers the requests whose deadline expired (ExpireRequest) and
+	// whose client has not ended them: id to the instant the entry runs out.
+	// Allocated on the first expiry; the earliest of those instants is
+	// manager.hints.TombDL.
+	expiredReq map[uint32]int64
+	// ignoredAct is set when a frame of a reset or expired stream was ignored.
+	ignoredAct atomic.Bool
+	// hdrTimeout is the header-block deadline (SetHeaderBlockTimeout); the pending
+	// block's instant is manager.hints.HdrDL.
+	hdrTimeout time.Duration
 
 	// OnHandlerGoexit, when set, is told that a stream's handler ended its
 	// goroutine with runtime.Goexit (celeris#889): the stream's id and the
@@ -489,15 +513,32 @@ const (
 // is refused only by a race.
 const (
 	headerListRefusalBurstMax = 100
+	malformedRequestBurstMax  = 100
 	streamRefusalBurstMax     = 2000
+	// bodyLimitResetBurstMax: a request reset for a body over
+	// MaxRequestBodySize costs the peer 9 bytes of DATA header and a frame it
+	// may make as small as the limit allows (a limit of a few bytes is a
+	// configuration), the server a RST_STREAM and the stream's setup. A client
+	// whose upload is refused does not send another at once, let alone a
+	// hundred in a second on one connection.
+	bodyLimitResetBurstMax = 100
+	// emptyDataBurstMax is the policy number for the frames that do nothing: a
+	// DATA frame with no data and no END_STREAM, 9 bytes on the wire for a frame
+	// parse and, on a stream the server reset, a round of the window-update
+	// books. An honest client sends one rarely (to flush); 10000 a second is a
+	// connection that does nothing else. It is a default for the maintainers to
+	// tune; net/http's server has no such budget.
+	emptyDataBurstMax = 10000
 )
 
 // serverResetWindow is how many of the most recent odd stream identifiers
-// serverResets remembers: 1024, that is the last 2048 stream identifiers. A
-// client that opens 1000 streams at once against a limit of 100 has 900 of
-// them refused, and their DATA frames can trail their HEADERS frames by as
-// many streams.
-const serverResetWindow = 1024
+// serverResets remembers: 2048, that is the last 4096 stream identifiers, more
+// than the streamRefusalBurstMax (2000) streams refused in a second that the
+// server allows without ending the connection: the DATA and the trailers of
+// every one of them, in flight, are still ignored. A client that opens 1000
+// streams at once against a limit of 100 has 900 of them refused, and their
+// DATA frames can trail their HEADERS frames by as many streams. 256 bytes a set.
+const serverResetWindow = 2048
 
 // serverResets is a bitset over a sliding window of odd stream identifiers:
 // the ones this server sent a RST_STREAM for. An identifier older than the
@@ -535,6 +576,14 @@ func (r *serverResets) mark(id uint32) {
 		return // older than the window
 	}
 	r.bits[(idx%serverResetWindow)/64] |= 1 << (idx % 64)
+}
+
+// clear forgets stream id.
+func (r *serverResets) clear(id uint32) {
+	if r.has(id) {
+		idx := id >> 1
+		r.bits[(idx%serverResetWindow)/64] &^= 1 << (idx % 64)
+	}
 }
 
 // has reports whether stream id is one mark recorded and the window still holds.
@@ -795,11 +844,37 @@ func (p *Processor) endHeaderDecode() (tooLarge bool) {
 // block was decoded to its end, so the HPACK state is in step with the
 // peer's and the connection goes on. The request never reaches a handler.
 // A connection that keeps sending such blocks does not go on (noteRefusal).
-func (p *Processor) refuseHeaderList(streamID uint32) error {
+// clientDone is whether the request had ended on the client's side: if not, its
+// DATA and trailers may be on the wire already (markResetOpen).
+func (p *Processor) refuseHeaderList(streamID uint32, clientDone bool) error {
 	if err := p.noteRefusal(false); err != nil {
 		return err
 	}
+	p.markResetOpen(streamID, clientDone)
 	return p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeEnhanceYourCalm)
+}
+
+// markResetOpen records, for a stream this server is about to reset without
+// ending the connection, that its client side may still be open (clientDone
+// false): the peer may have DATA and its trailers in flight, and the trailers
+// are ignored, not a connection error (admitHeaders, dropResetStreamHeaders;
+// RFC 9113 section 5.1, closed: "An endpoint MUST ignore frames that it
+// receives on closed streams after it has sent a RST_STREAM frame"). One block
+// is ignored per stream (admitHeaders), so the work a peer can have the server
+// do for the trailers of its reset streams is bounded by the resets, which are
+// counted.
+func (p *Processor) markResetOpen(id uint32, clientDone bool) {
+	if clientDone {
+		return
+	}
+	p.resetOpen.mark(id)
+}
+
+// clearResetOpen forgets that stream id's client side may still be open: it has
+// ended (END_STREAM), so a frame that follows is an error whatever the server
+// reset.
+func (p *Processor) clearResetOpen(id uint32) {
+	p.resetOpen.clear(id)
 }
 
 // noteRefusal counts a request the processor refused (streamLimit: for
@@ -814,6 +889,29 @@ func (p *Processor) refuseHeaderList(streamID uint32) error {
 // as possibly processed though it was not: the safe side, and only an abusive
 // peer sees it. A stream refused for the limit was never opened and is not named.
 func (p *Processor) noteRefusal(streamLimit bool) error {
+	if streamLimit {
+		return p.countRefusal(refusedStreamLimit, nil)
+	}
+	return p.countRefusal(refusedHeaderList, nil)
+}
+
+// refusalKind says what a refusal is counted as: each kind has its own count in
+// the window of one second and its own burst.
+type refusalKind uint8
+
+const (
+	refusedStreamLimit refusalKind = iota // MAX_CONCURRENT_STREAMS
+	refusedHeaderList                     // a header list over the bound
+	refusedMalformed                      // a malformed request, or HEADERS on a stream this server reset
+	refusedBodyLimit                      // a request body over MaxRequestBodySize
+	refusedEmptyData                      // a DATA frame with no data and no END_STREAM (emptyDataBurstMax)
+)
+
+// countRefusal counts a refusal of kind k in the current window and, past the
+// kind's burst, ends the connection with GOAWAY(ENHANCE_YOUR_CALM). why is the
+// reason a malformed request is refused for, wrapped in the error of the
+// GOAWAY.
+func (p *Processor) countRefusal(k refusalKind, why error) error {
 	var now int64
 	if p.nowUnix != nil {
 		now = p.nowUnix()
@@ -822,19 +920,79 @@ func (p *Processor) noteRefusal(streamLimit bool) error {
 	}
 	if now != p.refusalWindowSec {
 		p.refusalWindowSec = now
-		p.refusedHeaderLists, p.refusedStreams = 0, 0
+		p.refusedHeaderLists, p.refusedStreams, p.refusedMalformed, p.refusedBodies, p.emptyDataFrames = 0, 0, 0, 0, 0
 	}
-	if streamLimit {
+	switch k {
+	case refusedStreamLimit:
 		if p.refusedStreams++; p.refusedStreams > streamRefusalBurstMax {
 			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("refused streams flood"),
 				fmt.Errorf("streams refused for MAX_CONCURRENT_STREAMS more than %d times in a second", streamRefusalBurstMax))
 		}
-		return nil
+	case refusedHeaderList:
+		if p.refusedHeaderLists++; p.refusedHeaderLists > headerListRefusalBurstMax {
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("refused header lists flood"),
+				fmt.Errorf("header lists over %d bytes refused more than %d times in a second", p.headerListMax, headerListRefusalBurstMax))
+		}
+	case refusedMalformed:
+		if p.refusedMalformed++; p.refusedMalformed > malformedRequestBurstMax {
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("malformed requests flood"),
+				fmt.Errorf("more than %d malformed requests in a second: %w", malformedRequestBurstMax, why))
+		}
+	case refusedEmptyData:
+		if p.emptyDataFrames++; p.emptyDataFrames > emptyDataBurstMax {
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("empty DATA flood"),
+				fmt.Errorf("more than %d empty DATA frames in a second", emptyDataBurstMax))
+		}
+	case refusedBodyLimit:
+		if p.refusedBodies++; p.refusedBodies > bodyLimitResetBurstMax {
+			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("request bodies over the limit flood"),
+				fmt.Errorf("more than %d request bodies over the limit in a second: %w", bodyLimitResetBurstMax, why))
+		}
 	}
-	if p.refusedHeaderLists++; p.refusedHeaderLists > headerListRefusalBurstMax {
-		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("refused header lists flood"),
-			fmt.Errorf("header lists over %d bytes refused more than %d times in a second", p.headerListMax, headerListRefusalBurstMax))
+	return nil
+}
+
+// refuseMalformed answers a request that is malformed (RFC 9113 section 8.1.1:
+// a field name or value that is not allowed, a trailer that is not, a
+// Content-Length its body does not match) with a stream error, as the
+// RFC asks: RST_STREAM(PROTOCOL_ERROR), the stream freed, the connection kept
+// and the other streams on it served. Its header block is decoded, so the
+// HPACK state is in step with the peer's. why is the reason, returned
+// wrapped when the peer has sent more than malformedRequestBurstMax of them in
+// a second: it is told to calm down (GOAWAY ENHANCE_YOUR_CALM) and the
+// connection ends, as for header lists over the bound (noteRefusal).
+// clientDone is whether the request had ended on the client's side (END_STREAM
+// seen): if not, its DATA and trailers may be on the wire already.
+func (p *Processor) refuseMalformed(id uint32, clientDone bool, why error) error {
+	if err := p.countRefusal(refusedMalformed, why); err != nil {
+		return err
 	}
+	p.markResetOpen(id, clientDone)
+	return p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeProtocol)
+}
+
+// dropResetStreamHeaders handles the header block of a stream this server reset
+// while the peer's side of it was open (RFC 9113 section 5.1, closed: "An
+// endpoint MUST ignore frames that it receives on closed streams after it has
+// sent a RST_STREAM frame"): the trailers of a request that the peer sent
+// before it saw the reset. The block is decoded to its end and dropped, as
+// refuseStream's is, because it may add to the dynamic table, which is the
+// connection's. It is not counted: admitHeaders allows one such block per reset
+// stream and no more (a second, or one without END_STREAM, ends the
+// connection), and the reset it follows was counted, so a peer cannot have more
+// blocks decoded than it has paid refusals for.
+func (p *Processor) dropResetStreamHeaders(block []byte) error {
+	p.beginHeaderDecode(&p.refusedFields, false)
+	p.hpackDecoder.SetEmitEnabled(false) // decode, build nothing
+	if _, err := p.hpackDecoder.Write(block); err != nil {
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+			fmt.Errorf("failed to decode headers: %w", err))
+	}
+	if err := p.hpackDecoder.Close(); err != nil {
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+			fmt.Errorf("failed to finalize headers: %w", err))
+	}
+	p.endHeaderDecode()
 	return nil
 }
 
@@ -1028,6 +1186,7 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 			newWindowSize := int32(s.Val)
 			delta := newWindowSize - oldWindowSize
 			p.manager.initialWindowSize = s.Val
+			p.manager.initWin.Store(s.Val)
 
 			for sid, stream := range p.manager.streams {
 				oldWin := stream.windowSize.Load()
@@ -1050,7 +1209,7 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 			p.manager.mu.Unlock()
 			// The windows changed: a handler waiting for one re-checks
 			// (celeris#893).
-			p.manager.notifySendWindow()
+			p.manager.notifyOpenStreamWindows()
 		case http2.SettingMaxFrameSize:
 			if s.Val < 16384 {
 				validationErr = fmt.Errorf("SETTINGS_MAX_FRAME_SIZE too small: %d", s.Val)
@@ -1531,6 +1690,27 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 	if !exists {
 		last := m.lastClientStream.Load()
 
+		if id <= last && (p.resetOpen.has(id) || p.requestExpired(id)) {
+			// A request this server reset (as malformed, for its header list,
+			// for MAX_CONCURRENT_STREAMS or for its body) before its client
+			// side ended: its trailers, in flight, are ignored, once. After the
+			// HEADERS that opened the request the only HEADERS frame it may have
+			// is its trailers, which end it (RFC 9113 section 8.1: a HEADERS
+			// frame without END_STREAM there is malformed), and the stream is
+			// over for the peer when they arrive. A block without END_STREAM is
+			// the peer breaking that rule, and every further one would cost a
+			// decode: the connection ends, before the block is read.
+			if p.requestExpired(id) {
+				p.ignoredFrame() // the uploader of an expired request: see ignoredFrame
+			}
+			p.clearResetOpen(id)
+			p.forgetExpired(id)
+			if !endStream {
+				return nil, admitRefused, p.GoAwayErr(m.GetLastStreamID(), http2.ErrCodeProtocol, []byte("trailers without END_STREAM"),
+					fmt.Errorf("HEADERS frame without END_STREAM after the request on stream %d, which the server reset", id))
+			}
+			return nil, admitRefused, p.dropResetStreamHeaders(block)
+		}
 		if id <= last {
 			_ = p.SendGoAway(m.GetLastStreamID(), http2.ErrCodeProtocol, []byte("HEADERS on closed stream (reused id)"))
 			return nil, admitNew, fmt.Errorf("HEADERS frame on closed stream %d (last stream: %d)", id, last)
@@ -1564,10 +1744,16 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 
 	stream, ok := m.TryOpenStream(id)
 	if !ok {
-		return nil, admitRefused, p.refuseStream(id, block)
+		return nil, admitRefused, p.refuseStream(id, endStream, block)
 	}
 	if stream.ResponseWriter == nil {
 		stream.ResponseWriter = p.connWriter
+	}
+	if !endStream && m.reqTimeout > 0 {
+		// A request that is not whole at its HEADERS has a deadline (celeris#889):
+		// ReadTimeout from now, absolute. A request without a body (every GET)
+		// pays the one test of endStream that is made anyway.
+		m.ArmRequest(stream, mono.Now())
 	}
 	return stream, admitNew, nil
 }
@@ -1579,7 +1765,7 @@ func (p *Processor) admitHeaders(id uint32, endStream bool, block []byte) (*Stre
 // refuseHeaderList's is: HPACK state is the connection's, and a block that
 // added a field to the dynamic table must add it here too, or the peer's next
 // block references an entry this decoder does not have.
-func (p *Processor) refuseStream(id uint32, block []byte) error {
+func (p *Processor) refuseStream(id uint32, endStream bool, block []byte) error {
 	// Counted before the block is decoded: past the burst the connection ends,
 	// and the decode would be for nothing (noteRefusal).
 	if err := p.noteRefusal(true); err != nil {
@@ -1602,6 +1788,7 @@ func (p *Processor) refuseStream(id uint32, block []byte) error {
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
 	p.endHeaderDecode()
+	p.markResetOpen(id, endStream)
 	return p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeRefusedStream)
 }
 
@@ -1610,6 +1797,19 @@ func (p *Processor) refuseStream(id uint32, block []byte) error {
 // the block itself (completeHeaderBlock). prio is nil for a HEADERS frame
 // without the PRIORITY flag.
 func (p *Processor) serveHeaderBlock(id uint32, endStream bool, prio *headerPriority, block []byte) error {
+	// A block longer than any encoding of a list within the bound
+	// (headerBlockExpansion) is a connection error whether it was assembled
+	// from fragments (appendContinuation, which stops it as soon as it is that
+	// long) or arrived whole in one HEADERS frame, up to SETTINGS_MAX_FRAME_SIZE
+	// (1 MiB by default): the decode of a megabyte for one 9-byte-header frame
+	// was the cost, and only then was the list refused. RFC 9113 section 10.5.1:
+	// a field block can be processed or the connection closed, and not decoded
+	// in part, which would put the HPACK state out of step with the peer's.
+	// One comparison, before the stream is admitted: nothing is opened, counted
+	// or decoded for it.
+	if len(block) > p.headerListMax*headerBlockExpansion {
+		return p.headerBlockTooLarge(id)
+	}
 	stream, adm, err := p.admitHeaders(id, endStream, block)
 	if err != nil || adm == admitRefused {
 		return err
@@ -1651,18 +1851,18 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
 	if p.endHeaderDecode() {
-		return p.refuseHeaderList(id)
+		return p.refuseHeaderList(id, endStream)
 	}
 	headers := *pooled
 
 	if trailers {
 		if err := validateTrailerHeaders(headers); err != nil {
-			_ = p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeProtocol)
-			return fmt.Errorf("invalid trailers: %w", err)
+			return p.refuseMalformed(id, true, fmt.Errorf("invalid trailers: %w", err))
 		}
 		stream.AddHeadersBatch(headers)
 		if endStream {
 			stream.EndStream = true
+			p.manager.DisarmRequest(stream)
 			stream.SetState(StateHalfClosedRemote)
 			p.runHandler(stream)
 		}
@@ -1670,8 +1870,7 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 	}
 
 	if err := validateRequestHeaders(headers); err != nil {
-		sendStreamError(p.writer, id, http2.ErrCodeProtocol)
-		return fmt.Errorf("invalid headers: %w", err)
+		return p.refuseMalformed(id, endStream, fmt.Errorf("invalid headers: %w", err))
 	}
 	for _, h := range headers {
 		if h[0] == ":method" && h[1] == "HEAD" {
@@ -1687,8 +1886,7 @@ func (p *Processor) completeHeaderBlock(stream *Stream, adm admission, id uint32
 		stream.SetState(StateHalfClosedRemote)
 
 		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
-			sendStreamError(p.writer, id, http2.ErrCodeProtocol)
-			return fmt.Errorf("content-length mismatch: %w", err)
+			return p.refuseMalformed(id, true, fmt.Errorf("content-length mismatch: %w", err))
 		}
 
 		p.runHandler(stream)
@@ -1726,6 +1924,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		p.continuationState = cs
 		p.continuationActive.Store(true)
 		p.continuationStateMu.Unlock()
+		p.armHeaderBlock()
 		return nil
 	}
 
@@ -1751,8 +1950,9 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	if !ok {
 		// A stream the manager does not hold that the server reset without
 		// ending the connection (a request refused for the stream limit, for its
-		// header list, or after the GOAWAY the server sent; every other reset
-		// returns an error, and the connection ends): RFC 9113 section 5.1
+		// header list, as malformed (refuseMalformed), or after the GOAWAY the
+		// server sent; every other reset returns an error, and the connection
+		// ends): RFC 9113 section 5.1
 		// (closed) says the endpoint that sent RST_STREAM "MUST be prepared to
 		// receive any frames that were sent before it processed the RST_STREAM",
 		// and a POST sent without waiting for the answer has its DATA on the
@@ -1767,9 +1967,21 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 		// (above the last client stream, even, stream 0) is still a connection
 		// error: h2spec 5.1 and 6.1 pin that. The last client stream check is
 		// defensive: a reset of an identifier above it ends the connection.
-		if f.StreamID <= p.manager.GetLastClientStreamID() && p.resetIDs.has(f.StreamID) {
-			p.manager.AccumulateWindowUpdate(0, f.Header().Length)
-			p.manager.FlushWindowUpdates(p.writer, false)
+		if f.StreamID <= p.manager.GetLastClientStreamID() && (p.resetIDs.has(f.StreamID) || p.requestExpired(f.StreamID)) {
+			if err := p.countEmptyData(f); err != nil {
+				return err
+			}
+			if p.requestExpired(f.StreamID) {
+				p.ignoredFrame() // the uploader of an expired request: see ignoredFrame
+			}
+			if f.Header().Length > 0 { // nothing to credit for a frame of length 0: no lock, no map range
+				p.manager.AccumulateWindowUpdate(0, f.Header().Length)
+				p.manager.FlushWindowUpdates(p.writer, false)
+			}
+			if f.StreamEnded() {
+				p.clearResetOpen(f.StreamID) // the peer's side has ended: no trailers can follow
+				p.forgetExpired(f.StreamID)
+			}
 			return nil
 		}
 		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("DATA on idle stream"),
@@ -1788,13 +2000,15 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 		return err
 	}
 
+	if err := p.countEmptyData(f); err != nil {
+		return err
+	}
 	dataLen := len(f.Data())
 	stream.ReceivedDataLen += dataLen
 
 	// Reject streams that exceed the maximum request body size.
 	if limit := p.maxBodySize(); limit > 0 && int64(stream.ReceivedDataLen) > limit {
-		_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeCancel)
-		return fmt.Errorf("request body exceeds %d bytes on stream %d", limit, f.StreamID)
+		return p.refuseBodyTooLarge(f, limit)
 	}
 
 	if err := stream.AddData(f.Data()); err != nil {
@@ -1805,25 +2019,63 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	// sections 6.1 and 6.9.1): that much goes back to both windows.
 	updateLen := f.Header().Length
 
-	p.manager.AccumulateWindowUpdate(f.StreamID, updateLen)
-	p.manager.AccumulateWindowUpdate(0, updateLen)
+	if updateLen > 0 { // a frame of length 0 credits nothing: no lock, no map insert
+		p.manager.AccumulateWindowUpdate(f.StreamID, updateLen)
+		p.manager.AccumulateWindowUpdate(0, updateLen)
+	}
 
 	if f.StreamEnded() {
 		p.manager.FlushWindowUpdates(p.writer, true)
 		stream.EndStream = true
+		p.manager.DisarmRequest(stream)
 		stream.SetState(StateHalfClosedRemote)
 
 		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
-			sendStreamError(p.writer, stream.ID, http2.ErrCodeProtocol)
-			return fmt.Errorf("content-length mismatch: %w", err)
+			return p.refuseMalformed(stream.ID, true, fmt.Errorf("content-length mismatch: %w", err))
 		}
 
 		p.runHandler(stream)
-	} else {
+	} else if updateLen > 0 {
 		p.manager.FlushWindowUpdates(p.writer, false)
 	}
 
 	return nil
+}
+
+// countEmptyData counts a DATA frame that carries no data and ends nothing, on a
+// live stream and on one the server reset alike (emptyDataBurstMax). The test is
+// on the data, not on the frame's length: a PADDED frame with pad length 0 and no
+// data has length 1 and the same cost, and its padding is still credited by the
+// callers (it is flow-controlled). Called for the frames that are accepted; a DATA
+// frame on a stream that is neither is a connection error already.
+func (p *Processor) countEmptyData(f *http2.DataFrame) error {
+	if len(f.Data()) == 0 && !f.StreamEnded() {
+		return p.countRefusal(refusedEmptyData, nil)
+	}
+	return nil
+}
+
+// refuseBodyTooLarge answers a request whose body has passed
+// MaxRequestBodySize: RST_STREAM CANCEL for that stream, as before, and no more
+// than that. It is a stream error (RFC 9113 section 5.4.2), not an end of the
+// connection: every other stream on it goes on. The DATA of the stream that is
+// still on the wire is ignored, and its trailers (handleData, admitHeaders), as
+// for any stream this server reset (section 5.1). The frame that went over the
+// limit is not delivered, but the peer spent its length from the connection's
+// window (section 6.9.1): it is credited back, or each refused upload would
+// leak that much of the window until the connection stalls. The resets are
+// counted (bodyLimitResetBurstMax): past a burst no honest client makes the
+// connection ends with GOAWAY ENHANCE_YOUR_CALM.
+func (p *Processor) refuseBodyTooLarge(f *http2.DataFrame, limit int64) error {
+	why := fmt.Errorf("request body exceeds %d bytes on stream %d", limit, f.StreamID)
+	if err := p.countRefusal(refusedBodyLimit, why); err != nil {
+		return err
+	}
+	p.markResetOpen(f.StreamID, f.StreamEnded())
+	err := p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeCancel)
+	p.manager.AccumulateWindowUpdate(0, f.Header().Length)
+	p.manager.FlushWindowUpdates(p.writer, false)
+	return err
 }
 
 // handleWindowUpdate processes WINDOW_UPDATE frames.
@@ -1848,6 +2100,7 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			}
 			//nolint:gosec // G115: safe conversion, newWin validated above
 			if atomic.CompareAndSwapInt32(&p.manager.connectionWindow, oldWin, int32(newWin)) {
+				p.manager.noteConnWindow(int32(newWin)) //nolint:gosec // G115: validated above
 				break
 			}
 		}
@@ -1858,7 +2111,7 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		// ran the connection window to 0 would never resume and the response
 		// would hang.
 		p.flushConnWindowStalledStreams()
-		p.manager.notifySendWindow() // celeris#893
+		p.manager.notifyOpenStreamWindows() // celeris#893
 		return nil
 	}
 
@@ -1894,7 +2147,7 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	}
 
 	// A pool handler waiting for this stream's window (celeris#893).
-	p.manager.notifySendWindow()
+	p.manager.notifyStreamWindow(f.StreamID)
 
 	// The channel is read before the flush: a flush that finishes the stream
 	// deletes it, which returns it to the stream pool, and the pooled object
@@ -2042,6 +2295,10 @@ func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 		return nil
 	}
 	if f.StreamID <= p.manager.GetLastClientStreamID() {
+		// A client that gives up on a stream the server reset (an expired
+		// request) ends it: nothing more is to come on it.
+		p.forgetExpired(f.StreamID)
+		p.clearResetOpen(f.StreamID)
 		return nil
 	}
 	return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
@@ -2103,10 +2360,15 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 
 	for streamID, stream := range p.manager.streams {
 		if streamID > lastStreamID {
-			prev := stream.GetState()
 			p.manager.dropPlaceholderLocked(stream) // before Release clears its flags
-			stream.state.Store(int32(StateClosed))
+			// One Swap, as SetState and takeLocked do: a pool handler's own
+			// SetState(Closed) is a Swap without this lock, and a read of the
+			// state followed by a store would lower the counts a second time
+			// for a stream the goroutine had just closed (celeris#889).
+			prev := State(stream.state.Swap(int32(StateClosed)))
 			p.manager.updateActiveCount(prev, StateClosed)
+			p.manager.disarmRequestLocked(stream)
+			p.manager.dropStall(streamID)
 			stream.Cancel()
 			if stream.flags.Load()&flagAsyncRunning == 0 {
 				stream.Release()
@@ -2187,6 +2449,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	if len(p.continuationState.headerBlock)+len(f.HeaderBlockFragment()) > p.headerListMax*headerBlockExpansion {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
+		p.disarmHeaderBlock()
 		return nil, p.headerBlockTooLarge(f.StreamID)
 	}
 
@@ -2195,6 +2458,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	if p.continuationState.continuations++; p.continuationState.continuations > maxContinuationFrames {
 		p.continuationState = nil
 		p.continuationActive.Store(false)
+		p.disarmHeaderBlock()
 		return nil, p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm, []byte("too many CONTINUATION frames"),
 			fmt.Errorf("header block on stream %d has more than %d CONTINUATION frames", f.StreamID, maxContinuationFrames))
 	}
@@ -2210,6 +2474,7 @@ func (p *Processor) appendContinuation(f *http2.ContinuationFrame) (*Continuatio
 	cs := p.continuationState
 	p.continuationState = nil
 	p.continuationActive.Store(false)
+	p.disarmHeaderBlock()
 	return cs, nil
 }
 
@@ -2324,11 +2589,12 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 			}
 			//nolint:gosec // G115: safe conversion, newWin validated above
 			if atomic.CompareAndSwapInt32(&p.manager.connectionWindow, oldWin, int32(newWin)) {
+				p.manager.noteConnWindow(int32(newWin)) //nolint:gosec // G115: validated above
 				break
 			}
 		}
 		p.flushConnWindowStalledStreams()
-		p.manager.notifySendWindow() // celeris#893
+		p.manager.notifyOpenStreamWindows() // celeris#893
 		return nil
 	}
 
@@ -2363,7 +2629,7 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 	}
 
 	// A pool handler waiting for this stream's window (celeris#893).
-	p.manager.notifySendWindow()
+	p.manager.notifyStreamWindow(streamID)
 
 	// The channel is read before the flush: a flush that finishes the stream
 	// deletes it, which returns it to the stream pool, and the pooled object

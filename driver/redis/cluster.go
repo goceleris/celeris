@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,9 +49,11 @@ type ClusterConfig struct {
 
 	PoolSize         int
 	MaxIdlePerWorker int
-	DialTimeout      time.Duration
-	ReadTimeout      time.Duration
-	WriteTimeout     time.Duration
+	// DialTimeout bounds each new node connection's TCP connect and, separately,
+	// its handshake; default 5s. See [Config].DialTimeout.
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 	// MaxRedirects is the maximum number of MOVED/ASK redirects before an
 	// error is returned. Default: 3.
 	MaxRedirects int
@@ -62,6 +65,8 @@ type ClusterConfig struct {
 	ReadOnly bool
 
 	Engine ServerProvider
+	// SocketBusyPoll is forwarded to each node client: see [Config].SocketBusyPoll.
+	SocketBusyPoll time.Duration
 }
 
 // ErrClusterMaxRedirects is returned when the maximum number of MOVED/ASK
@@ -74,12 +79,32 @@ var ErrClusterMaxRedirects = errors.New("celeris-redis: cluster max redirects ex
 type ClusterClient struct {
 	cfg ClusterConfig
 
-	mu       sync.RWMutex
-	nodes    map[string]*clusterNode // addr -> node
-	slots    [16384]*clusterNode     // slot -> primary node
-	replicas [16384][]*clusterNode   // slot -> replica nodes
+	mu    sync.RWMutex
+	nodes map[string]*clusterNode // addr -> node
+	// topoApplied is the registration number of the read whose table is in
+	// slots (guarded by mu; see applyTopology).
+	topoApplied uint64
+	slots       [16384]*clusterNode   // slot -> primary node
+	replicas    [16384][]*clusterNode // slot -> replica nodes
 
 	replicaIdx atomic.Uint64 // round-robin counter for replica selection
+
+	// refMu guards refLast, the latest topology refresh that started (see
+	// refreshTopologySince).
+	refMu   sync.Mutex
+	refLast *topoRefresh
+	// refSeq counts the topology reads that have started (guarded by refMu).
+	refSeq uint64
+	// refDone is the highest sequence number of a read that has ended without
+	// being cut short by its caller's context (guarded by refMu).
+	refDone uint64
+	// refMoved is, per slot, the last -MOVED the command path read the topology
+	// for; refLost, per node address, the last lost primary (see eventMarkLocked).
+	// refMoved is a table of 16384 entries (384 KiB), allocated by the first
+	// -MOVED: a client that never meets one pays a pointer, not the table.
+	// Guarded by refMu.
+	refMoved *[16384]topoEvent
+	refLost  map[string]*topoEvent
 
 	closeCh chan struct{}
 	closed  atomic.Bool
@@ -137,9 +162,15 @@ func (c *ClusterClient) closeNodes() {
 	c.nodes = nil
 }
 
-// initNodes dials the seed addresses and creates initial node clients.
+// initNodes dials the seed addresses and creates initial node clients. An
+// address listed more than once gets one node: nodes is keyed by address, so a
+// Client built for the repeat would replace the first in the map and nothing
+// would ever close the first.
 func (c *ClusterClient) initNodes() error {
 	for _, addr := range c.cfg.Addrs {
+		if _, dup := c.nodes[addr]; dup {
+			continue
+		}
 		client, err := c.dialNode(addr)
 		if err != nil {
 			continue
@@ -188,6 +219,9 @@ func (c *ClusterClient) nodeOpts() []Option {
 	if c.cfg.Engine != nil {
 		opts = append(opts, WithEngine(c.cfg.Engine))
 	}
+	if c.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(c.cfg.SocketBusyPoll))
+	}
 	return opts
 }
 
@@ -224,6 +258,9 @@ func (c *ClusterClient) getOrCreateNodeAs(addr string, isPrimary bool) (*cluster
 	if ok {
 		return n, nil
 	}
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
 	var (
 		client *Client
 		err    error
@@ -236,14 +273,26 @@ func (c *ClusterClient) getOrCreateNodeAs(addr string, isPrimary bool) (*cluster
 	if err != nil {
 		return nil, err
 	}
-	n = &clusterNode{addr: addr, client: client, primary: isPrimary}
+	return c.installNode(&clusterNode{addr: addr, client: client, primary: isPrimary})
+}
+
+// installNode stores a node a redirect just dialled and returns the node to
+// use. If the address was stored meanwhile it returns that one, and if Close ran
+// while the node dialled (closeNodes left c.nodes nil, and a write into it is a
+// panic) it returns ErrClosed; in both cases n's client is closed.
+func (c *ClusterClient) installNode(n *clusterNode) (*clusterNode, error) {
 	c.mu.Lock()
-	if existing, ok := c.nodes[addr]; ok {
+	if c.nodes == nil {
 		c.mu.Unlock()
-		_ = client.Close()
+		_ = n.client.Close()
+		return nil, ErrClosed
+	}
+	if existing, ok := c.nodes[n.addr]; ok {
+		c.mu.Unlock()
+		_ = n.client.Close()
 		return existing, nil
 	}
-	c.nodes[addr] = n
+	c.nodes[n.addr] = n
 	c.mu.Unlock()
 	return n, nil
 }
@@ -320,24 +369,287 @@ func (c *ClusterClient) anyNode() *clusterNode {
 	return nil
 }
 
+// topoMark is a position in the sequence of topology reads of a ClusterClient:
+// the number of reads that had started when it was taken. A caller takes one at
+// the moment its reason to look arose (topoMark), and may share a read whose
+// sequence number is greater: that read started after the reason, by the
+// order in which reads are registered under refMu. No clock is involved, so the
+// rule is the same on a clock too coarse to tell two instants apart (Windows).
+type topoMark uint64
+
+// topoRefresh is one topology refresh: its sequence number (the order in which
+// reads started) and, once done is closed, how it ended.
+type topoRefresh struct {
+	seq  uint64
+	done chan struct{}
+	err  error
+	// cut is set when it failed while its own caller's context had ended.
+	cut bool
+}
+
+// joinable reports whether a caller that needs a table read after its own
+// trigger may use the outcome of f: f started after that moment (checked by the
+// caller, by sequence number) and either runs, or ended with a table or with a node's failure. A
+// refresh that ended because its own caller's context ended says nothing.
+// The caller holds refMu.
+func (f *topoRefresh) joinable() bool {
+	select {
+	case <-f.done:
+		return !f.cut
+	default:
+		return true
+	}
+}
+
+// topoEvent is a reason to read the topology that several commands can share: a
+// slot that moved to to (-MOVED), a node that was lost. mark is the position in the
+// sequence of reads when the first command that saw it received its reply.
+type topoEvent struct {
+	to   string
+	mark topoMark
+	set  bool
+}
+
+// maxLostEvents is the size past which a new lost-primary event drops the resolved
+// ones (the nodes of a cluster are few; this only bounds a pathological churn of
+// addresses).
+const maxLostEvents = 256
+
+// eventMarkLocked returns the mark for a command that received a reply that is the event
+// ev (to is what the reply named, "" if nothing). The command path cannot take a
+// plain topoMark: each command takes it as its own reply arrives, and registers its
+// read right after, so the next command's mark is already past that read and
+// nothing is shared (celeris#1214; the PubSub reroute of #1203 has a backoff sleep
+// between its trigger and its read, so its marks all come first).
+//
+// The first command to see the event takes the mark now. Another that sees the
+// same event (same slot or node, same to) while it is unresolved takes the same
+// mark: a read registered after the first reply was sent after the event happened,
+// so it is as fresh for the second command as one registered after its own reply.
+// An event is resolved when a read registered after its mark has ended without
+// being cut short (refDone > mark; a read cut short by its caller's context says
+// nothing, and counting it would only cost an extra read): the next reply for the
+// slot is then a new event and takes a new mark, however long after. A reply for
+// the same slot that names a different to replaces the event (the slot moved
+// again), and so takes a new mark; so does a reply for another slot, whatever it
+// names: events are per slot, two slots moved to the same node do not share.
+//
+// The remaining hole: a slot that moves away and comes back to the same node
+// between a reply and the end of the first read registered after it. The command
+// that gets the second reply is then given a read that may predate its move; it
+// finds the old table, and its next -MOVED (the event is resolved by then) takes a
+// new mark. The redirect itself always goes to the address of the reply.
+func (c *ClusterClient) eventMarkLocked(ev *topoEvent, to string) topoMark {
+	if ev.set && ev.to == to && !c.resolvedLocked(ev.mark) {
+		return ev.mark
+	}
+	mark := topoMark(c.refSeq)
+	*ev = topoEvent{to: to, mark: mark, set: true}
+	return mark
+}
+
+// resolvedLocked reports whether a read registered after mark has ended with a
+// table or a node's failure (not cut short by its caller). The caller holds refMu.
+func (c *ClusterClient) resolvedLocked(mark topoMark) bool {
+	return c.refDone > uint64(mark)
+}
+
+// movedMark is the mark for a command that received -MOVED for slot to addr.
+func (c *ClusterClient) movedMark(slot uint16, addr string) topoMark {
+	c.refMu.Lock()
+	defer c.refMu.Unlock()
+	if c.refMoved == nil {
+		c.refMoved = new([16384]topoEvent)
+	}
+	return c.eventMarkLocked(&c.refMoved[slot], addr)
+}
+
+// lostMark is the mark for a command that lost the primary at addr (a network
+// error): every command that lost it shares the read that follows.
+func (c *ClusterClient) lostMark(addr string) topoMark {
+	c.refMu.Lock()
+	defer c.refMu.Unlock()
+	if c.refLost == nil {
+		c.refLost = make(map[string]*topoEvent)
+	}
+	ev := c.refLost[addr]
+	if ev == nil {
+		if len(c.refLost) >= maxLostEvents {
+			for k, e := range c.refLost {
+				if c.resolvedLocked(e.mark) {
+					delete(c.refLost, k)
+				}
+			}
+		}
+		ev = new(topoEvent)
+		c.refLost[addr] = ev
+	}
+	return c.eventMarkLocked(ev, "")
+}
+
 // refreshTopology queries CLUSTER SLOTS on any live node and rebuilds the
-// slot-to-node mapping, including replica nodes and per-node latency.
+// slot-to-node mapping, including replica nodes and per-node latency. It always
+// reads the table; refreshTopologySince is the variant that may share a read.
 func (c *ClusterClient) refreshTopology(ctx context.Context) error {
-	node := c.anyNode()
-	if node == nil {
-		return errors.New("no live nodes")
+	c.refMu.Lock()
+	f := c.newRefreshLocked()
+	c.refMu.Unlock()
+	return c.runRefresh(ctx, f)
+}
+
+// newRefreshLocked registers a topology read that is about to start: it takes the
+// next sequence number and becomes the latest read. The caller holds refMu.
+func (c *ClusterClient) newRefreshLocked() *topoRefresh {
+	c.refSeq++
+	f := &topoRefresh{seq: c.refSeq, done: make(chan struct{})}
+	c.refLast = f
+	return f
+}
+
+// topoMark returns the position now in the sequence of topology reads: the
+// reads that start from here on are the ones that started after the caller's
+// reason to look.
+func (c *ClusterClient) topoMark() topoMark {
+	c.refMu.Lock()
+	defer c.refMu.Unlock()
+	return topoMark(c.refSeq)
+}
+
+// refreshTopologySince is refreshTopology for a caller that needs a table read
+// that started after mark (taken by topoMark at the moment its reason to look
+// arose): it uses the latest read if that started after mark, running or done,
+// instead of sending its own CLUSTER SLOTS. N PubSubs hit by one slot move, or
+// retrying the same outage, then cost one CLUSTER SLOTS per window in which none
+// of their triggers is newer than the last read, not N (celeris#1203). A read
+// that began before mark is never used: its reply may predate the event. The
+// check and the registration of a new read are one step under refMu, so callers
+// that arrive together start one. "After" is the order of registration under
+// refMu, not a timestamp, so it holds on any clock.
+func (c *ClusterClient) refreshTopologySince(ctx context.Context, mark topoMark) error {
+	for {
+		c.refMu.Lock()
+		f := c.refLast
+		if f == nil || f.seq <= uint64(mark) || !f.joinable() {
+			f = c.newRefreshLocked()
+			c.refMu.Unlock()
+			return c.runRefresh(ctx, f)
+		}
+		c.refMu.Unlock()
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if ctx.Err() == nil && f.cut {
+			continue // the one we joined was cut short by its own caller: read again
+		}
+		return f.err
 	}
-	v, err := node.client.Do(ctx, "CLUSTER", "SLOTS")
-	if err != nil {
-		node.failing.Store(true)
-		return err
+}
+
+// runRefresh reads the table on behalf of f and publishes the outcome.
+func (c *ClusterClient) runRefresh(ctx context.Context, f *topoRefresh) error {
+	// Closed on a panic too, so joiners are not left waiting for a read that
+	// will never end (the panic goes on to the caller).
+	defer close(f.done)
+	f.err = c.readTopology(ctx, f.seq)
+	f.cut = f.err != nil && ctx.Err() != nil
+	if !f.cut {
+		c.refMu.Lock()
+		c.refDone = max(c.refDone, f.seq)
+		c.refMu.Unlock()
 	}
-	node.failing.Store(false)
-	if v.Type != protocol.TyArray {
-		return fmt.Errorf("CLUSTER SLOTS: unexpected reply type %s", v.Type)
+	return f.err
+}
+
+// topologyProbes is how many nodes one topology read asks before it gives up.
+const topologyProbes = 3
+
+// readTopology is one CLUSTER SLOTS round trip and applyTopology. It asks a
+// node anyNode picks; if that one fails (a node that is down and not yet marked
+// failing is found out by the first read that meets it) and the caller's context
+// is still alive, it asks the next node that was not tried, preferring the ones
+// not marked failing, up to topologyProbes. One failed read is shared by every
+// caller it serves (see refreshTopologySince), so it must not be lost to a node
+// the others could have come from.
+func (c *ClusterClient) readTopology(ctx context.Context, seq uint64) error {
+	var tried []*clusterNode
+	var lastErr error
+	for range topologyProbes {
+		node := c.probeNode(tried)
+		if node == nil {
+			break
+		}
+		tried = append(tried, node)
+		v, err := node.client.Do(ctx, "CLUSTER", "SLOTS")
+		if err != nil {
+			node.failing.Store(true)
+			lastErr = err
+			if ctx.Err() != nil {
+				return err
+			}
+			continue
+		}
+		node.failing.Store(false)
+		if v.Type != protocol.TyArray {
+			return fmt.Errorf("CLUSTER SLOTS: unexpected reply type %s", v.Type)
+		}
+		return c.applyTopology(ctx, v, seq)
 	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("no live nodes")
+}
+
+// probeNode returns the node a topology read asks next: not one of tried,
+// preferring a node not marked failing; nil if there is none.
+func (c *ClusterClient) probeNode(tried []*clusterNode) *clusterNode {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var failing *clusterNode
+	for _, n := range c.nodes {
+		if slices.Contains(tried, n) {
+			continue
+		}
+		if !n.failing.Load() {
+			return n
+		}
+		if failing == nil {
+			failing = n
+		}
+	}
+	return failing
+}
+
+// applyTopology rebuilds the slot-to-node mapping from a CLUSTER SLOTS reply.
+// It is the part of refreshTopology that runs under c.mu, split out so a test
+// can run it at the moment a Close has just returned.
+func (c *ClusterClient) applyTopology(ctx context.Context, v *Value, seq uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// closeNodes leaves c.nodes nil: a refresh whose reply came before Close
+	// gets here after it, and must neither dial nor write into the nil map.
+	if c.nodes == nil {
+		return ErrClosed
+	}
+	// The slot table is never replaced by a read registered before the one whose
+	// table is in place, whatever order they ended in: an older read that ends last
+	// cannot put a slot back where it was before a move (celeris#1219). seq is the
+	// read's registration number (topoRefresh.seq, 1 or more). A read that failed,
+	// or was cut short, never gets here and so does not advance topoApplied.
+	//
+	// What this does NOT guarantee: the order is that of registration, not of the
+	// requests reaching the server or of the cluster's truth, which a client cannot
+	// tell without a server epoch (CLUSTER SLOTS has none). A read registered later
+	// that was sent to a lagging node, or an older read that retried a second node
+	// after the newer one was sent, can still install the older table, and the
+	// fresher answer is dropped. The next -MOVED corrects it (one extra round), as
+	// would the 60 s refresh.
+	if seq < c.topoApplied {
+		return nil
+	}
+	c.topoApplied = seq
 
 	wantReplicas := c.cfg.ReadOnly || c.cfg.RouteByLatency
 
@@ -463,6 +775,11 @@ func (c *ClusterClient) refreshLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			// closeCh wins a tie with the ticker: select picks at random
+			// when both are ready, and a refresh after Close dials nodes.
+			if c.closed.Load() {
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			_ = c.refreshTopology(ctx)
 			cancel()
@@ -539,8 +856,12 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 			if node.primary && !triedPrimaryRefresh {
 				node.failing.Store(true)
 				triedPrimaryRefresh = true
+				// The commands that lost this primary share one read that
+				// started after the first of them saw the error
+				// (celeris#1214).
+				mark := c.lostMark(node.addr)
 				rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				refreshErr := c.refreshTopology(rctx)
+				refreshErr := c.refreshTopologySince(rctx, mark)
 				cancel()
 				if refreshErr == nil {
 					if newPrim := c.route(slot); newPrim != nil && newPrim != node {
@@ -556,13 +877,17 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 			if addr == "" {
 				return err
 			}
-			// Refresh topology on every MOVED — not just attempt==0.
+			// Read the topology for every MOVED — not just attempt==0.
 			// A stale slot map keeps generating redirects; routing
 			// by the embedded MOVED address only helps for this one
 			// call, subsequent commands for the same slot still hit
-			// the old node and loop.
+			// the old node and loop. Every MOVED asks for a read, but the
+			// commands that got the same MOVED share one: one that started
+			// after the first of their replies (celeris#1214). The
+			// redirect below still goes to the address this reply named.
+			mark := c.movedMark(slot, addr)
 			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			_ = c.refreshTopology(rctx)
+			_ = c.refreshTopologySince(rctx, mark)
 			cancel()
 			n, nerr := c.getOrCreateNode(addr)
 			if nerr != nil {
@@ -929,32 +1254,85 @@ func (c *ClusterClient) Publish(ctx context.Context, channel, message string) (i
 }
 
 // Subscribe opens a pub/sub connection on any cluster node and subscribes to
-// channels (SUBSCRIBE is cluster-wide). See [Client.Subscribe]: when the node is
-// found down on the first SUBSCRIBE the PubSub and a nil error are returned and
-// the reconnect retries that one node address.
+// channels (SUBSCRIBE is node-local, and the cluster delivers every PUBLISH to
+// every node). See [Client.Subscribe]: when the node is found down on the first
+// SUBSCRIBE the PubSub and a nil error are returned and the reconnect replays
+// the channels.
+//
+// The PubSub follows its subscription: when the node that holds it goes away,
+// it subscribes again on another node and keeps delivering to the same
+// [PubSub.Channel]. A message published while it switches is lost (a gap), and
+// the PubSub itself delivers from one conn at a time: it stops listening to the
+// old conn before the new one subscribes. The cluster, though, sends a PUBLISH
+// to every node over its bus asynchronously, so a message in flight around the
+// switch can in rare cases reach the old and the new node and be delivered
+// twice. While the
+// PubSub has no conn its control calls ([PubSub.Subscribe] and the others)
+// return [ErrPubSubConnDown]; nothing else is surfaced as long as a node can be
+// reached, and the PubSub retries with backoff, with no limit, until
+// [PubSub.Close]. When the ClusterClient is closed, a PubSub whose conn is down
+// (or goes down afterwards) gives up: its Channel() is closed and its control
+// calls return [ErrClosed]. A PubSub whose conn stays up after the close (the
+// event loop is shared with another Client that is still open, or is that of a
+// started server that runs its own event loop) keeps it until [PubSub.Close].
 func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
-	// Regular SUBSCRIBE is cluster-wide: pick any node.
+	// Regular SUBSCRIBE is node-local: pick any node.
 	node := c.anyNode()
 	if node == nil {
 		return nil, errors.New("celeris-redis: no cluster nodes available")
 	}
-	return node.client.Subscribe(ctx, channels...)
+	ps, err := c.openPubSub(ctx, node.client, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(channels) == 0 {
+		return ps, nil
+	}
+	return ps.firstControl(ps.Subscribe(ctx, channels...))
 }
 
 // SSubscribe opens a pub/sub connection and subscribes to shard channels
 // (Redis 7+ SSUBSCRIBE). Shard channels are slot-scoped: the connection is
-// established to the node owning the slot of the first channel. All channels
-// SHOULD hash to the same slot (use hash tags); mixing slots in one PubSub is
-// undefined behavior in cluster mode. Like [Client.Subscribe], it returns the
-// PubSub and a nil error when the conn is found down on the first SSUBSCRIBE:
-// the reconnect replays the channels, to the same node address. It does not
-// follow a slot move, so a caller that wants the new owner closes the PubSub
-// and calls SSubscribe again.
+// established to the node owning the slot of the first channel. All channels of
+// one call must hash to the same slot (use hash tags): a call whose channels
+// span slots returns [ErrCrossSlot], as the cluster would answer the command,
+// and so does [PubSub.SSubscribe] on the PubSub it returns. Like
+// [Client.Subscribe], it returns the PubSub and a nil error when the conn is
+// found down on the first SSUBSCRIBE: the reconnect replays the channels.
+//
+// The PubSub follows its slot: when the owner goes away, or the slot moves (the
+// server drops the subscription with an unsolicited sunsubscribe, or answers
+// the SSUBSCRIBE with -MOVED), it refreshes the cluster topology, subscribes
+// again on the new owner and keeps delivering to the same [PubSub.Channel],
+// with the PubSub's reconnect backoff between attempts and no limit. A message
+// published while it switches is lost (a gap); one owner serves a slot, so the
+// switch cannot deliver a message twice.
+//
+// One PubSub holds one conn, so it is on one node. It serves the slot of its
+// first channel (and the route follows that slot); channels of other slots can
+// be added by separate [PubSub.SSubscribe] calls and are subscribed where the
+// node the PubSub is on owns their slot. If another node owns it, the
+// SSUBSCRIBE is answered -MOVED, which is not reported, and the channel is not
+// subscribed. A reroute of any kind replays the channels of the served slot and
+// of every other slot the new node owns by the topology the reroute has just
+// read, one SSUBSCRIBE per slot (the served slot first): a channel of another
+// slot is subscribed again if the new node owns its slot, and is left out, with
+// no error, if another node or nobody owns it. The move of a slot other than the
+// served one does not reroute the PubSub. If the first channel is removed while a channel of another node's
+// slot remains, that channel is not subscribed until the next reroute of any
+// kind, whose replay serves the re-selected slot. See [ClusterClient.Subscribe]
+// for what the caller sees while it is down and when the ClusterClient is
+// closed.
 func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	if len(channels) == 0 {
 		return nil, errors.New("celeris-redis: SSubscribe requires at least one channel")
 	}
 	slot := Slot(channels[0])
+	for _, ch := range channels[1:] {
+		if Slot(ch) != slot {
+			return nil, ErrCrossSlot
+		}
+	}
 	node := c.route(slot)
 	if node == nil {
 		node = c.anyNode()
@@ -962,7 +1340,7 @@ func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*Pu
 	if node == nil {
 		return nil, errors.New("celeris-redis: no cluster nodes available")
 	}
-	ps, err := node.client.newPubSub(ctx)
+	ps, err := c.openPubSub(ctx, node.client, channels[0])
 	if err != nil {
 		return nil, err
 	}
@@ -1193,7 +1571,7 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 
 	// Scan for MOVED/ASK errors and collect commands to retry.
 	var retryCmds []clusterPipeCmd
-	topologyRefreshed := false
+	cp.refreshForMoved(ctx, errs)
 	for i := range errs {
 		if errs[i] == nil {
 			continue
@@ -1203,12 +1581,6 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 			continue
 		}
 		if rerr.Prefix == "MOVED" {
-			if !topologyRefreshed {
-				rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				_ = cp.cluster.refreshTopology(rctx)
-				cancel()
-				topologyRefreshed = true
-			}
 			errs[i] = nil
 			retryCmds = append(retryCmds, clusterPipeCmd{
 				slot:    cp.cmds[i].slot,
@@ -1262,6 +1634,36 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 	if len(retryCmds) > 0 {
 		cp.execRound(ctx, retryCmds, results, errs, true)
 	}
+}
+
+// refreshForMoved reads the topology once if any of errs is a -MOVED, before the
+// retry round. The read must have started after every one of those replies, so
+// its mark is the latest of the marks of the moves in the batch (movedMark): a
+// batch with two moved slots does not use a read that predates the second. The
+// batches of other pipelines and commands that hit the same moves share the read
+// (celeris#1214). Every reply of the round was received before this runs.
+func (cp *ClusterPipeline) refreshForMoved(ctx context.Context, errs []error) {
+	var mark topoMark
+	moved := false
+	for i := range errs {
+		// The nil check comes first: a rerr declared before it escapes to the heap
+		// (errors.As) and would allocate for every command of every pipeline.
+		if errs[i] == nil {
+			continue
+		}
+		var rerr *RedisError
+		if !errors.As(errs[i], &rerr) || rerr.Prefix != "MOVED" {
+			continue
+		}
+		moved = true
+		mark = max(mark, cp.cluster.movedMark(cp.cmds[i].slot, parseRedirectAddr(rerr.Msg)))
+	}
+	if !moved {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = cp.cluster.refreshTopologySince(rctx, mark)
+	cancel()
 }
 
 // Discard drops all queued commands.

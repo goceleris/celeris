@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h1"
 )
 
@@ -26,9 +27,9 @@ func TestHeaderDeadline_ClearArmCycle(t *testing.T) {
 	s.ReadHeaderTimeoutNs = int64(10 * time.Second)
 
 	// Arm — deadline should be ~10s in the future.
-	before := time.Now().UnixNano()
+	before := mono.Now()
 	s.ArmHeaderDeadline()
-	after := time.Now().UnixNano()
+	after := mono.Now()
 	dl := s.HeaderDeadlineNs.Load()
 	if dl < before+s.ReadHeaderTimeoutNs || dl > after+s.ReadHeaderTimeoutNs {
 		t.Errorf("ArmHeaderDeadline: dl=%d not in [%d, %d]",

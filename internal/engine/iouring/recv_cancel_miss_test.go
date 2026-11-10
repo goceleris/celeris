@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // TestMissedPauseCancelClearsCancelPending is the celeris#596 rig, flipped to
@@ -73,7 +75,7 @@ func TestMissedPauseCancelClearsCancelPending(t *testing.T) {
 		if decodeOp(c.UserData) == udRecv {
 			t.Fatalf("unexpected recv CQE after the cancel: %+v", c)
 		}
-		w.processCQE(t.Context(), &c, time.Now().UnixNano())
+		w.processCQE(t.Context(), &c, mono.Now())
 		n++
 	}
 	f.ring.EndCQ(head)
@@ -172,8 +174,8 @@ func TestMissedCancelDoesNotRetireASecondOutstandingCancel(t *testing.T) {
 	}
 
 	// The dangerous order: the MISS is processed first.
-	w.processCQE(t.Context(), missCQE, time.Now().UnixNano())
-	w.processCQE(t.Context(), hitCQE, time.Now().UnixNano())
+	w.processCQE(t.Context(), missCQE, mono.Now())
+	w.processCQE(t.Context(), hitCQE, mono.Now())
 	if cs.recvCancelPending != 1 {
 		t.Fatalf("recvCancelPending=%d after the missed cancel's completion, want 1: the cancel "+
 			"that HIT is still outstanding and its -ECANCELED has not arrived (celeris#596)", cs.recvCancelPending)
@@ -186,7 +188,7 @@ func TestMissedCancelDoesNotRetireASecondOutstandingCancel(t *testing.T) {
 	}
 
 	pendingBefore := ring.Pending()
-	w.processCQE(t.Context(), ecanceled, time.Now().UnixNano())
+	w.processCQE(t.Context(), ecanceled, mono.Now())
 	if cs.closing {
 		t.Fatal("the withdrawn pause's -ECANCELED closed a healthy connection: the missed cancel " +
 			"had retired the state the cancel that HIT still needed (celeris#484 / #596)")

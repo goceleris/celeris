@@ -4,6 +4,7 @@ package iouring
 
 import (
 	"errors"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -28,3 +29,25 @@ var shutdownRingWait = (*Ring).SubmitAndWaitTimeout
 func ringWaitRetryable(err error) bool {
 	return errors.Is(err, unix.EBUSY) || errors.Is(err, unix.EAGAIN)
 }
+
+// ringWaitCeiling is how long Worker.run retries a ring wait that answers a
+// retryable error, one pass after the other, with nothing in the CQ ring to
+// reap, before it takes the ring for a failing one and stops the worker, as it
+// did for every error before the retries existed (ringWaitContinues, celeris#884
+// item 72). A full CQ ring is cleared by the loop's own reap within a pass or
+// two, so a second of retries that reap nothing is a ring that will not recover.
+const ringWaitCeiling = time.Second
+
+// ringWaitRunGap is the longest time between two retried waits that still make
+// one run (ringWaitContinues). A ring that is failing returns its error at
+// once, so its retries come a pass apart, microseconds to a few milliseconds
+// (the 50 us sleep plus one pass). An idle worker's successful timed wait takes
+// up to 100 ms, or 1 s for a long-idle one (baseTimeout), which is longer than
+// this gap: such a worker's retries are never joined into a run, and that is
+// the point, since a wait that took that long did not fail. What the rule
+// relies on is only that a real failure is fast: passes of 200 ms between
+// retries (the seam-injected test, whose real wait precedes the injected error)
+// still stop at about 1.01 s, passes of 300 ms never do, by design. A longer gap
+// means something else ran in between (a park, a slow callback), so the run
+// starts again.
+const ringWaitRunGap = 250 * time.Millisecond

@@ -7,15 +7,14 @@ type Config struct
 type Config struct, BrokenPipeHandler func(*github.com/goceleris/celeris.Context, any) error
 type Config struct, DisableBrokenPipeLog bool
 type Config struct, DisableLogStack bool
-type Config struct, ErrorHandler func(*github.com/goceleris/celeris.Context, any) error
-type Config struct, ErrorHandlerErr func(*github.com/goceleris/celeris.Context, error) error
+type Config struct, ErrorHandler func(*github.com/goceleris/celeris.Context, error) error
 type Config struct, LogLevel log/slog.Level
 type Config struct, Logger *log/slog.Logger
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, StackAll bool
 type Config struct, StackSize int
-type Config struct, field order Skip, SkipPaths, ErrorHandler, ErrorHandlerErr, BrokenPipeHandler, StackSize, DisableLogStack, StackAll, DisableBrokenPipeLog, Logger, LogLevel
+type Config struct, field order Skip, SkipPaths, ErrorHandler, BrokenPipeHandler, StackSize, DisableLogStack, StackAll, DisableBrokenPipeLog, Logger, LogLevel
 type Config struct, not comparable
 var ErrBrokenPipe error
 var ErrPanic error

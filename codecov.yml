@@ -14,13 +14,13 @@ codecov:
   require_ci_to_pass: false
   notify:
     wait_for_ci: false
-    # Seven uploads per commit: root (the coverage job's), the two root-package
+    # Eight uploads per commit: root (the coverage job's), the three root-package
     # shards (coverage-root-shard jobs, also flagged root; celeris#890),
-    # compress, metrics, otel, protobuf. Waiting for all seven keeps Codecov
+    # compress, metrics, otel, protobuf. Waiting for all eight keeps Codecov
     # from posting a partial, misleading number. The root upload carries two
     # profile files (the root step's and ./test/server's, which run with
     # -coverpkg on the root package); that is still one upload.
-    after_n_builds: 7
+    after_n_builds: 8
 
 coverage:
   precision: 2
@@ -142,9 +142,9 @@ comment:
   # One comment per pull request, edited in place on every push.
   behavior: default
   require_changes: false
-  # The same seven uploads as codecov.notify.after_n_builds above: a comment
+  # The same eight uploads as codecov.notify.after_n_builds above: a comment
   # posted after five would show a partial number.
-  after_n_builds: 7
+  after_n_builds: 8
 
 github_checks:
   # No per-line "not covered" annotations in the Files tab. Many io_uring and

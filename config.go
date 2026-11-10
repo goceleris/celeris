@@ -237,6 +237,56 @@ type Config struct {
 
 	// ReadTimeout is the max duration for reading the entire request.
 	// Zero uses the default (60s). Set to -1 for no timeout.
+	//
+	// On the native engines (epoll, io_uring, adaptive) it is measured from the
+	// connection's last read (on io_uring also from the start and the completion
+	// of its sends). On epoll a response the kernel did not take whole is
+	// bounded by WriteTimeout's minimum rate alone, from the first sweep that
+	// finds it parked until it ends (see WriteTimeout): ReadTimeout and
+	// IdleTimeout run again from its end, and, where the socket reports no
+	// acknowledged bytes, from the last flush that took bytes. A request
+	// pipelined behind such a response is bounded by ReadHeaderTimeout for its
+	// headers and by ReadTimeout only once the response has been sent; the
+	// overrun check of an HTTP/1.1 async handler is suspended the same way.
+	//
+	// HTTP/2 on the native engines: each request is bounded by ReadTimeout from
+	// its HEADERS, absolute, as net/http's is. A request that is not whole by
+	// then (its body, or its trailers, still to come) is answered 408 and its
+	// stream is reset with RST_STREAM(NO_ERROR); the connection and its other
+	// streams go on. A DATA frame, or a PING, does not move the deadline, so an
+	// HTTP/2 upload has to fit in ReadTimeout (as on std; there is no per-route
+	// override), where an HTTP/1.1 body is bounded by the time since the last
+	// read. A request without a body has no deadline.
+	//
+	// The connection's own clock (the last read) does not close an HTTP/2
+	// connection that has a stream open whose request is whole (a response
+	// waiting for the client's flow-control window is bounded by WriteTimeout,
+	// see there, and no longer takes the exemption away): a stream the server is
+	// writing to (an SSE stream) outlives a client that sends no frame. A stream
+	// whose handler never answers is exempt for as long as it holds the stream,
+	// where an HTTP/1.1 async handler that overruns ReadTimeout is closed. When
+	// the last such stream ends the connection is kept for the timeout from the
+	// sweep that last saw it. With no stream open, a silent connection is closed
+	// at ReadTimeout or IdleTimeout from the client's last frame, and a client
+	// that sends only PINGs, SETTINGS or connection WINDOW_UPDATEs is closed at
+	// IdleTimeout (alone, as net/http's idle timer) from the last stream
+	// activity, which those frames do not move. A response the client does not
+	// take, from a client that keeps sending frames, is not bounded by ReadTimeout.
+	//
+	// The native engines look at ReadTimeout, IdleTimeout and WriteTimeout in a
+	// sweep of their connections, so ReadTimeout and IdleTimeout are enforced up to
+	// a sweep period after their time. On epoll the sweep runs every 25 ms, from a
+	// kernel timer each worker arms whatever ReadHeaderTimeout and the timeouts
+	// are, so within about 30 ms (a 1 s IdleTimeout closed an idle connection at
+	// 1.00 to 1.03 s on docker arm64 with 2 CPUs, with ReadHeaderTimeout off as well
+	// as set). On io_uring the sweep of an idle worker is about 0.8 s apart (0.83 s
+	// measured; about 1 s with ReadHeaderTimeout off), so a timeout of a few
+	// seconds or less is approximate by that much there. WriteTimeout is judged in
+	// windows that end at a sweep too: see WriteTimeout. The HTTP/1 header
+	// deadline, and the budget of a connection whose protocol is not decided yet,
+	// have a timer of their own on io_uring and are not late; the HTTP/2
+	// header-block bound of ReadHeaderTimeout is checked by the sweep and is late
+	// by up to a sweep period.
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout caps the read of just the request line + headers
 	// (separately from the request body, which ReadTimeout covers). This
@@ -256,6 +306,21 @@ type Config struct {
 	// accept, which with TCP_DEFER_ACCEPT (see DisableDeferAccept) is the
 	// connection's first byte or about a second after its SYN, whichever
 	// comes first; std counts from the handshake.
+	//
+	// So the bound on a connection that sends nothing is its connect, plus
+	// about one second of deferral on epoll, io_uring and adaptive (measured
+	// 1.00 to 1.07 s), plus ReadHeaderTimeout, plus
+	// the lateness of the engine's check: about 30 ms on epoll (a 25 ms timer)
+	// and on io_uring (a timer of the connection's own), measured on docker
+	// arm64 with 2 CPUs. With DisableDeferAccept the deferral is gone: a silent
+	// connection is closed at ReadHeaderTimeout from its connect, and a
+	// ReadHeaderTimeout of one second closed it at 1.00 to 1.03 s. The HTTP/2
+	// header-block bound below is checked by the engine's sweep, not by a timer,
+	// and is late by up to a sweep period (see ReadTimeout).
+	//
+	// On HTTP/2 (epoll, io_uring, adaptive) it also bounds a header block: one
+	// that begins with a HEADERS frame without END_HEADERS and is not complete this
+	// long after that frame ends the connection with GOAWAY(ENHANCE_YOUR_CALM).
 	ReadHeaderTimeout time.Duration
 	// WriteTimeout is the max duration for writing the response; what it
 	// bounds differs by engine, as the paragraphs below set out.
@@ -272,10 +337,11 @@ type Config struct {
 	// OnDisconnect runs), whatever the middleware's idle deadline or the last
 	// read of the connection. A peer that reads, however slowly, and a
 	// connection with nothing queued are not closed (there is no minimum
-	// rate); -1 sets no such bound. The close comes between about 3/4
+	// rate; an HTTP/2 stream whose client lets its flow-control window run out
+	// is bounded by the minimum rate described below); -1 sets no such bound. The close comes between about 3/4
 	// and 5/4 of WriteTimeout after the peer last took a byte (its progress
 	// is sampled every quarter of WriteTimeout; a SEND completion restarts the
-	// clock at once), plus the engine's sweep interval (up to about 0.1 s on
+	// clock at once), plus the engine's sweep interval (25 ms on
 	// epoll, up to 2 s on io_uring; a WriteTimeout shorter than that can
 	// double). An h2c stream is not covered yet (celeris#884).
 	// On the std engine net/http arms WriteTimeout as one deadline for the
@@ -293,38 +359,155 @@ type Config struct {
 	// a large download or a chunked body written with [Context.StreamWriter]
 	// without Detach, stays under WriteTimeout as an absolute deadline for the
 	// whole response: raise it or set -1 for such routes. On the epoll engine
-	// (and adaptive while it runs on epoll) WriteTimeout bounds a response
-	// that is not detached differently: it is "no progress for WriteTimeout",
-	// the time a client may go without taking any of a response the kernel has
-	// not accepted whole, restarted each time it takes some. A download read
-	// steadily for longer than WriteTimeout is not cut there, and a client
-	// that reads nothing is closed WriteTimeout after the response stalled.
-	// Progress is seen when the engine flushes, which follows the socket
-	// becoming writable again, about when half of its send queue has drained,
-	// or the client sending something (a pipelined request, an HTTP/2 PING or
-	// WINDOW_UPDATE), whose read flushes what the room it made allows.
-	// A client that takes less than half a send queue per WriteTimeout and
-	// sends nothing (a deep send queue and a slow reader) is closed while it
-	// is still reading; one that takes
-	// about half a send queue per WriteTimeout is never closed, and holds the
-	// connection and the whole response queued for it in memory for as long as
-	// it keeps doing so (std and io_uring end such a response at WriteTimeout,
-	// as a whole). Nothing else bounds that on epoll: while a response is
-	// queued, ReadTimeout and IdleTimeout run from the last progress too, so
-	// they slide with it, and the earlier of ReadTimeout and WriteTimeout
-	// is the time a client may take no bytes at all (ReadTimeout 5s with
-	// WriteTimeout 60s closes a client that pauses for 6s). io_uring bounds the
-	// response as a whole, measured from the last read or completed flush
-	// of the connection (a client that sends another request restarts it), not
-	// from the request's headers as std does. On io_uring a response whose
+	// (and adaptive while it runs on epoll) WriteTimeout bounds a response that
+	// is not detached differently: it is a minimum rate on the bytes the client
+	// acknowledges, with no elapsed-time ceiling. A response the kernel did not
+	// accept whole is queued in the engine ("parked"); the engine's sweep reads
+	// how many bytes the client has acknowledged (tcp_info) and holds the
+	// connection another WriteTimeout if the client acknowledged at least 64 KiB
+	// in the last one (a floor of 64 KiB per WriteTimeout: 64 KiB/s at 1s,
+	// about 1 KiB/s at the 60s default), and closes it if it did not. A client
+	// that reads at or above the floor is never cut, however long the response
+	// takes, and one that reads steadily between two EPOLLOUT edges is not
+	// mistaken for a stalled one: a download completes whatever IdleTimeout is.
+	// A client that takes less, in whatever pieces (nothing, a byte at a time,
+	// a half send queue per WriteTimeout), is closed at the end of the first
+	// window, between WriteTimeout and WriteTimeout plus two sweeps after the
+	// response parked (the first sweep takes the baseline, the window ends at
+	// the first sweep a WriteTimeout later); one that stops after a window it
+	// passed, within two WriteTimeouts plus two sweeps after its last byte. A
+	// client that takes exactly 64 KiB per window holds the connection, and the
+	// part of the response not yet sent, for as many windows as the response has
+	// 64 KiB (a response of S bytes: S/64 KiB times WriteTimeout, 64 minutes
+	// for 4 MiB at 60s; a smaller WriteTimeout raises the floor), so size
+	// WriteTimeout with that in mind. WriteTimeout -1 is no write timeout at
+	// any rate. What the client sends is not progress: a pipelined request or
+	// an HTTP/2 PING does not hold a parked response. The times above hold
+	// with the epoll sweep at its 25 ms period, which every worker has whatever
+	// ReadHeaderTimeout and the other timeouts are; io_uring sweeps more coarsely,
+	// see ReadTimeout.
+	//
+	// While the rule has a baseline for a parked response (from the first sweep
+	// that finds it parked), it is the only bound on the connection:
+	// ReadTimeout and IdleTimeout do not apply, so a client at or above the
+	// floor is not cut by either whatever they are next to WriteTimeout (the
+	// defaults are 60s, 600s and 60s), and one that stops is closed by the rule
+	// within the times above. They apply again from the end of the response. A
+	// socket that does not report acknowledged bytes (not TCP, or a TCP stack
+	// that leaves bytes_acked at 0) has the flush clock alone, "no flush took
+	// bytes for WriteTimeout", and ReadTimeout and IdleTimeout run from the
+	// last flush that took bytes there, as before the rule. The rule covers an
+	// HTTP/2 response parked on the socket too. A response that waits for the
+	// client's HTTP/2 flow-control window is not parked (nothing is queued on
+	// the socket); WriteTimeout bounds its stream in its own right, as a
+	// minimum rate, on the native engines: in each WriteTimeout window a stream
+	// that holds bytes waiting for the window, buffered or still held by a handler
+	// on the worker pool that is blocked in its write, must have had at least
+	// 64 KiB of them (or all it held, if less) sent, released by the client's
+	// WINDOW_UPDATEs, or it is
+	// reset with RST_STREAM(INTERNAL_ERROR), as net/http resets a stream at its
+	// write deadline. There is no ceiling, where std's deadline is absolute: a
+	// stream that releases at least that on average, lagging the rate by no
+	// more than four windows' worth (surplus released in one update carries to
+	// the next windows, and the bytes in flight when the stream stalled cover its
+	// first), is not cut however long its response takes. A PING or a
+	// WINDOW_UPDATE of a byte is not progress. A client that updates in big steps
+	// (nghttp2 and curl, at half the window) is fine while the gap between its
+	// updates stays under about five WriteTimeouts: half the window divided by the
+	// rate it reads at. When the connection as a whole releases at least 64 KiB
+	// in a window, a stream that takes less (parallel downloads share the
+	// client's socket) is held while it takes half its fair share of it, and,
+	// when it takes less, for as many windows in a row as the client needs to read
+	// what is in flight on the connection at the rate the connection moves (the
+	// bytes sent and not yet granted back at the connection level over what the
+	// connection released in the window), at least three and at most twelve. The
+	// connection counts as moving for four windows after its other streams last
+	// released 64 KiB, so a connection whose other streams release a floor only once
+	// in four windows keeps its stalled streams for as long as the allowance lasts: a
+	// client that returns window in big steps leaves some windows with neither a grant
+	// nor a send. Those windows count as idle ones, so the bound below holds. A
+	// download queued behind its siblings' bytes in the client's socket is cut where
+	// the bytes ahead of it take longer than that to read (N streams of W bytes in
+	// flight on a link of L bytes/s: N x W / L over about 16 WriteTimeouts, the cut
+	// beginning between 16.8 and 21), so a server whose clients are on slow links
+	// should set WriteTimeout to 2s or more, and 5s where the links are slower than a
+	// megabyte a second. Measured with Go's HTTP/2 client on epoll and adaptive: 4 x
+	// 8 MiB on 1 MB/s and 8 x 8 MiB on 2 MB/s complete at 1s, 2s and 5s, with about one
+	// window of headroom; on io_uring the engine's own send clock closes such a
+	// connection at 1s, so io_uring is measured from 5s. A stream that is paused, or
+	// dribbles one byte at a time, beside siblings that keep the connection moving is
+	// held for as long: up to 17 windows in all (13 for the default window), against 8
+	// when little is in flight. When the connection itself
+	// releases less than 64 KiB while it holds more, for more windows than the
+	// bank covers, the verdict is the first window that does not move. The end of a response is given grace: a stream that holds less than
+	// 64 KiB, and has had half of it sent in the window, or any stream while the
+	// connection as a whole holds less than 64 KiB (the last bytes of the transfer
+	// are on the wire, and the grant for them can wait behind its siblings' bytes in
+	// the client's socket for more than a window), is held for three windows more
+	// and reset in the fourth if nothing moves it. A stream the client never
+	// grants is reset after 1+k windows alone, or 4+k with siblings that keep the
+	// connection moving and little in flight on it, k being the number of whole
+	// 64 KiB in the bytes in flight when it stalled (about the peer's initial
+	// window), at most four: 1 and 4
+	// WriteTimeouts for the default 64 KiB window, 5 and 8 for a window of 256 KiB or
+	// more. When what it has left to send is under 64 KiB (the response is a
+	// little longer than the window), the bytes in flight are spent a whole floor a
+	// window, and the tail grace above follows: 5 WriteTimeouts for the default
+	// window, 6 for 128 KiB, 8 for 256 KiB or more. A one-byte WINDOW_UPDATE
+	// dribbler is reset in window max(2, 1+k): the 2nd of the default window, the
+	// 3rd of 128 KiB, the 4th of 192 KiB, the 5th of 256 KiB or more. A stream
+	// whose own window has room but whose bytes wait for the connection's is
+	// credited with what the whole connection released. While such a stream
+	// lives, ReadTimeout and IdleTimeout do not close the connection
+	// (WriteTimeout is its bound), so a silent client's unread response, and the
+	// buffer it pins, lives for up to 8 WriteTimeouts (5, with the default window)
+	// where it used to be dropped with the whole connection at ReadTimeout. A
+	// handler on the worker pool that blocks in its write for the client's window
+	// (a response over the connection's 4 MiB output budget, a StreamWriter's
+	// Write) is bounded by the same rule, judged by its own timer from the moment it
+	// first blocks, so that parallel downloads on one connection are not lost to a
+	// deadline that is absolute (celeris#906 had WriteTimeout in all from the first
+	// block): its write returns an error that wraps os.ErrDeadlineExceeded when the
+	// stream is reset. While an event loop of the server has been in one batch of
+	// events (all the handlers it runs, not one) for half a WriteTimeout (at least
+	// 2s, which matters only for a WriteTimeout under 4s: at the 60s default the
+	// threshold is 30s; a healthy loop of an overloaded or instrumented host has
+	// batches of a second or two), as a synchronous handler that waits for a lock a
+	// waiting handler holds across its response write makes it, or any slow blocking
+	// call, every such wait that has lasted a WriteTimeout is bounded by WriteTimeout
+	// in all, as before: at most max(WriteTimeout/2, 2s) + WriteTimeout from the start
+	// of the freeze (1.5 WriteTimeouts for a WriteTimeout of 4s or more), whatever the
+	// client reads. The server says so once per episode, in a Warn log line
+	// ("the minimum rate of a pool handler's wait for window is suspended"), and
+	// logs the reason of each such reset at Debug level (rate, or loop-blocked). A
+	// client that stops reading altogether for a WriteTimeout (a pause of 1s at
+	// WriteTimeout 1s) loses its connection to the engines' write clock on epoll and
+	// io_uring alike, with or without this rule, and on io_uring so does a client that
+	// reads at 1 MB/s at WriteTimeout 1s (a send that does not complete for a
+	// WriteTimeout); use 2s or more for clients that pause, 5s for io_uring on slow
+	// links. A request error read while a
+	// response is queued (a malformed request) puts the connection on the
+	// closing drain below, which counts each byte the client acknowledges and
+	// has no floor: a client that sends one and then takes a few bytes per
+	// WriteTimeout holds the connection, a known limit that is not changed here.
+	// io_uring is unchanged: it has no rate, and measures WriteTimeout from
+	// the last read, the start of a send from an idle connection or a
+	// completed send (a client that completes one send per WriteTimeout, or
+	// sends another request, restarts it), not from the request's headers as
+	// std does. A timeout sweep that finds the connection's bytes still in the
+	// engine's own hands (a SEND not yet submitted to the kernel, or queued
+	// for want of room in the submission ring) gives back the time the worker
+	// stalled in that loop iteration, and only that: a stall of the worker is
+	// not the client's, and the clock of a partial send's remainder is not
+	// restarted. On io_uring a response whose
 	// unsent remainder is under 64 KiB, to a client that stops reading, on an
 	// otherwise idle worker, can outlast WriteTimeout (measured with async
 	// responses of 96 to 144 KiB; the larger and the sync sizes are closed).
 	// On epoll, a response parked behind a handler that holds the connection's
 	// dispatch lock for longer than WriteTimeout can be closed at WriteTimeout
 	// even though nothing is queued for it (a narrow pipelined-handler case).
-	// A response that ends the connection (Connection: close, a refused write)
-	// has a drain of its own on both native engines: the connection is cut
+	// A response that ends the connection (Connection: close, a request error,
+	// a refused write) has a drain of its own on both native engines: the connection is cut
 	// once the client has taken no byte for WriteTimeout (epoll) or
 	// max(5s, WriteTimeout) (io_uring), and for 5 s on either when WriteTimeout
 	// is -1. A byte taken is a flush or send completion that moved the
@@ -348,7 +531,25 @@ type Config struct {
 	// WriteTimeout finite when handlers share locks across response writes.
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
-	// Zero uses the default (600s). Set to -1 for no timeout.
+	// Zero uses the default (600s). Set to -1 for no timeout. On an HTTP/2
+	// connection it runs from the last stream activity while no stream is open
+	// (PING, SETTINGS and WINDOW_UPDATE frames do not move it) and is not
+	// applied while a stream the server owes an answer for is open; see
+	// ReadTimeout. A connection that still has output to send (in its buffers or
+	// the kernel's send queue) is not idle while the output goes out: the period
+	// restarts, and the connection is closed (GOAWAY with NO_ERROR where it can
+	// still be sent, then the close; the end of the output may be lost) at the end
+	// of a period in which the peer acknowledged no more than the control frames
+	// (PING and SETTINGS acknowledgements, WINDOW_UPDATEs) the server sent it, as a
+	// client that has stopped reading and one that pings faster than its round
+	// trip leave it; so is one that has acknowledged nothing at all. A client that
+	// reads, however slowly, acknowledges more. Where the bytes the peer has
+	// acknowledged cannot be read (a host whose TCP stack does not report them, a
+	// failed getsockopt) the period is always extended. A frame for a stream the server reset moves the period only for a
+	// request that expired at ReadTimeout, for the 2 x ReadTimeout its late DATA may
+	// take. On epoll, for a response parked on the socket, see WriteTimeout.
+	//
+	// How closely IdleTimeout is enforced is described under ReadTimeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
 	// the context of StartWithContext or StartWithListenerAndContext starts
@@ -425,6 +626,78 @@ type Config struct {
 	SocketRecvBuf int
 	// SocketSendBuf sets SO_SNDBUF for accepted connections (0 = OS default).
 	SocketSendBuf int
+	// SocketBusyPoll turns on SO_BUSY_POLL, the Linux per-socket busy polling
+	// of the network device's receive queue (NAPI), for the connections the
+	// native engines (epoll, io_uring, adaptive) accept. Default 0: off.
+	// Before v1.6.0 the engines set it, to 50 microseconds, on every accepted
+	// socket with no way to turn it off; it is opt-in now (celeris#1036), and
+	// 50 * time.Microsecond restores the old behaviour.
+	//
+	// What it does here: with the option set, a read that finds a socket
+	// empty first runs one pass of the device's receive polling on the
+	// calling CPU, and only then reports that there is nothing to read. The
+	// budget is not a time the engine spins: the kernel uses it as a limit
+	// for blocking reads only (as read from the kernel source, not measured),
+	// and the engines' sockets are non-blocking, so any positive value
+	// behaves alike, 1 microsecond or 50 or 1 millisecond. It is a Duration
+	// because it is the kernel option's own value.
+	//
+	// The value is 0 (off) or at least one microsecond, up to 2147483647
+	// microseconds: a negative one, or one under a microsecond (which the
+	// kernel would read as 0 and leave off), is a configuration error and the
+	// server does not start. A fraction of a microsecond is dropped (1.5
+	// microseconds sets 1). It matters only on Linux with the native engines:
+	// the std engine serves through net/http and ignores it, as does every
+	// other operating system, and so does the io_uring engine in its
+	// unsupported fixed-files mode (CELERIS_IOURING_FIXED_FILES). The kernel
+	// must be built with CONFIG_NET_RX_BUSY_POLL, and a driver that supports
+	// NAPI busy polling gives it an effect. Where the kernel refuses the
+	// option, connections are served without it and a Warn is logged once per
+	// process; [Config.SocketRecvBuf] and [Config.SocketSendBuf] are still
+	// applied, they are set first.
+	//
+	// The celeris drivers (redis, postgres, memcached) follow it when they are
+	// opened with WithEngine(srv): the connections they register on an event
+	// loop take this budget, see [Server.SocketBusyPoll] (celeris#1228). Before
+	// v1.6.0 those connections were set to 50 microseconds with no way to turn
+	// it off. That was never every connection a driver dials: only those
+	// registered on an event loop. Redis Pub/Sub and postgres Connector
+	// connections always are. The command connections are only when the driver
+	// runs on its own loop, which is: redis with no engine; and redis,
+	// memcached and the postgres Pool with the engine of a server that does not
+	// run async handlers and either has not started yet or is on the std
+	// engine. Otherwise they go through Go's netpoll, and were never set and
+	// still are not: memcached and the postgres Pool with no engine, and all
+	// three with the engine of a started epoll, io_uring or adaptive server or
+	// of any server that runs async handlers. A driver without an engine is off
+	// by default; redis and postgres (Connector) have an option of their own.
+	// The numbers below are for
+	// accepted sockets; no driver traffic was measured.
+	//
+	// When it is set the engine also asks for SO_PREFER_BUSY_POLL, which the
+	// kernel gives only to a process with CAP_NET_ADMIN (that combination was
+	// never measured: the benchmark runs below were unprivileged). When it is
+	// 0 neither option is touched, and the socket keeps what the kernel gave
+	// it (net.core.busy_read, 0 by default).
+	//
+	// Why it is off: turning it off was faster on both hosts measured. The
+	// cell was 512 connections, GET, io_uring, 90 s runs, and "off" is a build
+	// of the same source with the option removed (a second build of the same
+	// binary differed by 0.4% on amd64). On msr1 (arm64 big.LITTLE, a
+	// single-queue Realtek r8127 NIC), 32 runs per arm: ksoftirqd on the CPU
+	// of one loop took over the receive processing in 5 runs with it on and in
+	// none with it off (Fisher p = 0.026), requests of 1 s or more (the
+	// longest 6.7 s) occurred in 4 runs and in none (p = 0.057), and median
+	// throughput was 3.0% higher off (502.0k against 517.2k requests per
+	// second). The mechanism is inferred, not observed: that a loop polling
+	// the device on a CPU already saturated by receive softirq captured the
+	// NIC's receive NAPI there. The stall result is indicative, not firm. On
+	// msa2-server (amd64, Intel i40e with 16 queues), 8 runs per arm,
+	// throughput was 1.11% higher off (90% CI 0.94% to 1.42%), p99 0.3% lower
+	// and p99.99 1.7% higher, with no stall in either arm. Set it only where
+	// you have measured a gain for your own traffic and NIC, and keep the
+	// NIC's interrupt vectors off the CPUs that run loops when you do.
+	SocketBusyPoll time.Duration
 	// MaxConns is the max simultaneous connections per worker (0 = unlimited);
 	// the server-wide limit is MaxConns times the loops started, see [Config.Workers].
 	MaxConns int
@@ -502,7 +775,7 @@ type Config struct {
 	// [RouteGroup.Async] (most-specific wins: route > group > this
 	// default), so a server with mostly CPU routes + a few DB routes can
 	// keep this false and mark just the DB routes .Async() / .UsesDriver(),
-	// or set this true and mark hot CPU routes .Async(false). On HTTP/2 the
+	// or set this true and mark hot CPU routes .Sync(). On HTTP/2 the
 	// override is honored per-stream (sync routes run inline on the event
 	// loop, async routes dispatch to the worker pool).
 	//
@@ -542,6 +815,8 @@ type Config struct {
 	// The method, the path and the header strings are request strings, valid only
 	// during the call (on epoll and io_uring, views of the receive buffer; see the
 	// package doc): copy one with [strings.Clone] before anything keeps it.
+	// Several Cookie lines are one field joined with "; ", as the handler sees
+	// them.
 	//
 	// On the native engines the callback runs on the event-loop goroutine,
 	// except on a connection already promoted to async dispatch, where it runs
@@ -592,8 +867,9 @@ type Config struct {
 	//
 	// All four engines (Std, Epoll, IOUring, Adaptive) decide whether a
 	// well-formed Upgrade: h2c request (Connection lists Upgrade and
-	// HTTP2-Settings, Upgrade is exactly h2c, one non-empty HTTP2-Settings)
-	// is upgraded the same way for every Protocol and every value:
+	// HTTP2-Settings, Upgrade is exactly h2c, exactly one HTTP2-Settings
+	// whose value decodes) is upgraded the same way for every Protocol and
+	// every value:
 	//
 	//	Protocol  nil   &false  &true
 	//	Auto      101   no      101
@@ -607,12 +883,45 @@ type Config struct {
 	// Prior-knowledge h2c (a connection that opens with the HTTP/2 preface)
 	// is served on Auto and H2C whatever this says, and never on HTTP1.
 	//
-	// A request that is malformed in its HTTP2-Settings header is not handled
-	// alike: Std answers 500 to a missing, repeated or invalid one and
-	// upgrades an empty one, where the native engines serve a missing or
-	// invalid one as HTTP/1.1, upgrade a repeated one and serve an empty one
-	// as HTTP/1.1 (tracked on celeris#889).
+	// The HTTP2-Settings header follows RFC 7540 section 3.2.1 on all four
+	// engines: a request with exactly one such header is upgraded when its
+	// value is a base64url SETTINGS payload (a whole number of 6-byte
+	// entries; an empty value is a payload with none), and a request whose
+	// header is missing, repeated or not such a payload is not upgraded: it
+	// is served as plain HTTP/1.1, never answered with an error status.
 	EnableH2Upgrade *bool
+
+	// DisableAutoHEAD turns off the router's automatic HEAD answer
+	// (celeris#421). By default a HEAD request to a path that has a GET route
+	// and no HEAD route runs the GET route (RFC 9110 §9.3.2: HEAD is GET
+	// without the content; the engine sends the headers and drops the body),
+	// and the path's Allow lists HEAD. When true, the router no longer
+	// answers HEAD with a GET route: a HEAD request that no HEAD route (or
+	// middleware, below) answers is answered like a method the path does not
+	// support, 405 Method Not Allowed with an Allow header that does not list
+	// HEAD (or 404 if the path has no route), running the
+	// [Server.MethodNotAllowed] handler. What still answers HEAD: a route
+	// registered with [Server.HEAD] or [Server.Any] (which registers HEAD),
+	// and middleware that answers it itself (healthcheck, swagger, static,
+	// anything in a [Server.Pre] or [Server.Use] chain that writes the
+	// response). Use it to keep a GET handler with a side effect, or a
+	// streaming one, from running for HEAD requests. Default: false (HEAD is
+	// answered by the GET route).
+	DisableAutoHEAD bool
+
+	// DisableAutoOPTIONS turns off the router's automatic OPTIONS answer
+	// (celeris#421). By default an OPTIONS request to a path that has routes
+	// and no OPTIONS route is answered 200 with an Allow header and
+	// Content-Length: 0 (RFC 9110 §9.3.7) after the global middleware
+	// ([Server.Use]) has run, and the path's Allow lists OPTIONS. When true,
+	// the router no longer answers it: an OPTIONS request that no OPTIONS
+	// route (also through [Server.Any]) or middleware, below, answers is
+	// answered like a method the path does not support (405 with an Allow
+	// header that does not list OPTIONS, or 404 if the path has no route).
+	// The global middleware still runs for it, so a CORS middleware
+	// installed with [Server.Use] still answers its preflight, and so does
+	// any other middleware that answers OPTIONS itself. Default: false.
+	DisableAutoOPTIONS bool
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
@@ -656,6 +965,8 @@ func (c Config) toResourceConfig() resource.Config {
 	if c.SocketSendBuf > 0 {
 		rc.Resources.SocketSend = c.SocketSendBuf
 	}
+	// Not behind a "> 0" guard, so that Validate sees a negative budget.
+	rc.Resources.SocketBusyPoll = c.SocketBusyPoll
 	if c.MaxConns > 0 {
 		rc.Resources.MaxConns = c.MaxConns
 	}

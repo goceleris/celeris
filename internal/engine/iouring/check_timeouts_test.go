@@ -10,6 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -32,7 +33,7 @@ func TestCheckTimeoutsClosesFDZero(t *testing.T) {
 		// sending=true routes the timeout check to the WriteTimeout branch.
 		cfg: resource.Config{WriteTimeout: time.Second},
 	}
-	past := time.Now().Add(-time.Hour).UnixNano()
+	past := (mono.Now() + int64(-time.Hour))
 	fds := []int{0, 5, 10, 15}
 	css := make([]*connState, len(fds))
 	for i, fd := range fds {
@@ -69,7 +70,7 @@ func TestCheckTimeoutsSwapRemoveNoSkip(t *testing.T) {
 		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{IdleTimeout: time.Second},
 	}
-	past := time.Now().Add(-time.Hour).UnixNano()
+	past := (mono.Now() + int64(-time.Hour))
 
 	var peers []int
 	t.Cleanup(func() {

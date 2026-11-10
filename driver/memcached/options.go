@@ -1,8 +1,14 @@
 package memcached
 
 import (
+	"sync/atomic"
 	"time"
 )
+
+// testHookDefaultOpTimeout, when set, replaces the default per-operation timeout
+// (defaultTimeout, 3 s) of a client whose Config.Timeout is unset. A test sets it
+// to avoid waiting 3 s, and resets it to nil when it is done.
+var testHookDefaultOpTimeout atomic.Pointer[time.Duration]
 
 // Protocol selects the memcached wire dialect spoken by a Client. Every
 // memcached deployment supports text; binary was deprecated upstream but
@@ -49,10 +55,24 @@ type Config struct {
 	MaxOpen int
 	// MaxIdlePerWorker bounds each worker's idle list; default 2.
 	MaxIdlePerWorker int
-	// DialTimeout is the TCP dial timeout; default 5s.
+	// DialTimeout bounds the TCP dial and, separately, the binary-protocol
+	// handshake (a VERSION round trip) of a new conn; default 5s. A server that
+	// accepts the connection and does not answer the handshake within DialTimeout
+	// fails the dial with an error that matches [context.DeadlineExceeded], also
+	// when the caller's context has a longer deadline or none; a slow connect
+	// followed by a silent server takes up to about twice DialTimeout. A shorter
+	// deadline of the caller's context wins. The text protocol has no handshake.
 	DialTimeout time.Duration
-	// Timeout is the advisory per-op deadline used when the caller's context
-	// carries no deadline. Default 3s.
+	// Timeout is the per-operation deadline: a command (and Ping, Version,
+	// Stats, ...) that has not completed after Timeout fails with an error that
+	// matches [context.DeadlineExceeded], and the conn it used is dropped. It
+	// applies whether or not the caller's context has a deadline; a deadline of the
+	// caller's that is not later than Timeout wins and its error is returned as it
+	// is. A multi-key get, Stats and Flush are one operation each: Timeout covers
+	// the whole command, not each key or each read. It does not cover waiting for a pool slot or dialling a new conn (that is
+	// [Config.DialTimeout]'s). Zero means the default, 3s; a negative value turns
+	// the per-operation deadline off, and the caller's context is then the only
+	// bound.
 	Timeout time.Duration
 	// MaxLifetime is the max age of a pooled conn; default 30m.
 	MaxLifetime time.Duration
@@ -78,10 +98,12 @@ func WithMaxOpen(n int) Option { return func(c *Config) { c.MaxOpen = n } }
 // WithMaxIdlePerWorker bounds each worker's idle list.
 func WithMaxIdlePerWorker(n int) Option { return func(c *Config) { c.MaxIdlePerWorker = n } }
 
-// WithDialTimeout sets the TCP dial timeout.
+// WithDialTimeout sets [Config.DialTimeout]: the bound of the TCP dial and of the
+// binary-protocol handshake.
 func WithDialTimeout(d time.Duration) Option { return func(c *Config) { c.DialTimeout = d } }
 
-// WithTimeout sets the default per-op deadline when the caller's ctx has none.
+// WithTimeout sets [Config.Timeout], the per-operation deadline (3s when unset,
+// negative for none).
 func WithTimeout(d time.Duration) Option { return func(c *Config) { c.Timeout = d } }
 
 // WithMaxLifetime sets the pooled conn lifetime.

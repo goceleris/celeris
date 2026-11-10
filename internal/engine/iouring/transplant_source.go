@@ -178,7 +178,7 @@ func (w *Worker) handOff(cs *connState, fd int, h *transplantTargetHolder, detac
 		return false
 	}
 	if serr := unix.SetNonblock(newFD, true); serr != nil {
-		_ = unix.Close(newFD)
+		closeFD(newFD)
 		cs.reapSuppressed = true
 		return false
 	}
@@ -218,7 +218,7 @@ func (w *Worker) handOff(cs *connState, fd int, h *transplantTargetHolder, detac
 	} else {
 		w.queuePendingRelease(cs)
 	}
-	_ = unix.Close(fd)
+	closeFD(fd)
 
 	if err := h.target.AdoptConn(newFD, carry); err != nil {
 		w.reclaimTransplant(newFD, carry, err)

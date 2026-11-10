@@ -120,8 +120,11 @@ func TestServerAdaptiveStartsOnEpollWhenIOUringRefused886(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	// The listener is handed to the server, not closed and bound again: adaptive
+	// gives it to the epoll fallback when the io_uring start engine is refused
+	// before Listen, and the port is not free between the pick and the bind
+	// until that engine rebinds it (celeris#1104).
 	addr := ln.Addr().String()
-	_ = ln.Close()
 
 	var logs lockedBuf886
 	s := celeris.New(celeris.Config{
@@ -133,7 +136,7 @@ func TestServerAdaptiveStartsOnEpollWhenIOUringRefused886(t *testing.T) {
 	s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- s.StartWithContext(ctx) }()
+	go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
 	defer func() {
 		cancel()
 		sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)

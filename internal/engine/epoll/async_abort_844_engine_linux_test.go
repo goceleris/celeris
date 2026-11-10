@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
@@ -95,7 +96,7 @@ func TestAbortAfterPeerCloseHandsTheConnBack844(t *testing.T) {
 			if err := unix.Shutdown(peer, unix.SHUT_WR); err != nil {
 				t.Fatalf("shutdown peer: %v", err)
 			}
-			l.drainRead(local, time.Now().UnixNano()) // the peer's FIN
+			l.drainRead(local, mono.Now()) // the peer's FIN
 			cs.asyncInMu.Lock()
 			owed := cs.closeOwed
 			cs.asyncInMu.Unlock()

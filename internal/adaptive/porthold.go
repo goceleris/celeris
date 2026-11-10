@@ -154,6 +154,16 @@ func bindHold(family int, ta *net.TCPAddr, reuseAddr bool) (string, *os.File, er
 	if err != nil {
 		return fail("getsockname", err)
 	}
+	// The bound string is built here, with its own zoneName below, and not by
+	// bindiag.BoundAddr (celeris#925, #986), which does the same job: bindiag
+	// lives at internal/engine/internal/bindiag, and Go's internal rule keeps
+	// it out of reach of this package (internal/adaptive is not under
+	// internal/engine). The rule is the same one (the zone is the interface
+	// name, or the number when no interface has the index, and absent for
+	// scope id 0); the difference is that zoneName below uses
+	// net.InterfaceByIndex, which bindiag avoids on the accept path. Here it
+	// runs once per hold, from New, never on an event loop. A change
+	// to the zone rule has to be made in both places.
 	var resolved string
 	switch b := bound.(type) {
 	case *unix.SockaddrInet4:
@@ -233,7 +243,10 @@ func zoneIndex(zone string) uint32 {
 }
 
 // zoneName is the inverse, as net.Listener.Addr spells it: the interface
-// name, or the number when no interface has it.
+// name, or the number when no interface has it. It is a copy of the rule of
+// bindiag's zoneName (internal/engine/internal/bindiag, celeris#986), kept here
+// because that package cannot be imported from internal/adaptive; see the
+// comment at the call in bindHold.
 func zoneName(id uint32) string {
 	if id == 0 {
 		return ""

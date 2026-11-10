@@ -67,7 +67,22 @@ func (l *Loop) finishH1Upgrade(cs *connState, fd int, writeFn func([]byte)) bool
 // out (closeWhenFlushed, celeris#761). The lock is released before the close,
 // which takes it again.
 //
-// internal/engine/iouring's endH1Verdict does the same.
+// internal/engine/iouring's endH1Verdict does the same, except for OnError on a
+// conn that has no detachMu: this one calls it whenever one is registered,
+// io_uring's only inside its `if mu := cs.detachMu; mu != nil`, so a sync conn
+// with a callback and no detach gets it here and loses it there (celeris#886
+// item 9). The recv path and the transplant replay both end here, so the rule
+// is the same for both on each engine. A sync conn holds a callback without a
+// detachMu when a handler registers one (Context.SetWSErrorHandler) and does
+// not Detach, and when a Detach faulted and was rolled back (the rollback
+// leaves the callback). The middleware callbacks (websocket, sse) are registered
+// just before the Detach, so they are in that state only after a faulted
+// Detach, and then only end their own reader or stream, which has not started.
+// Pinned on this side by TestEpollRecvPathOnErrorSync908 and
+// TestEpollAdoptCarriedOnErrorSync908, and on io_uring's by
+// TestIouringRecvPathOnErrorSyncNoDetachMuIsDropped886 and
+// TestIouringAdoptCarriedOnErrorSyncNoDetachMuIsDropped886. Which rule is right
+// is an open decision.
 func (l *Loop) endH1Verdict(cs *connState, err error) {
 	if mu := cs.detachMu; mu != nil {
 		mu.Lock()

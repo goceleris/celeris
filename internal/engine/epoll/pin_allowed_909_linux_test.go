@@ -5,6 +5,8 @@ package epoll
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -38,13 +40,33 @@ func (l *lockedBuf) String() string {
 	return l.b.String()
 }
 
+// logSink is where start909's engine logs and its caller reads back.
+type logSink interface {
+	Write(p []byte) (int, error)
+	String() string
+}
+
 // start909 starts an epoll engine with the given worker count, logging into
 // log, and returns it with its stop function.
-func start909(t *testing.T, workers int, log *lockedBuf) (*Engine, func()) {
+func start909(t *testing.T, workers int, log logSink) (*Engine, func()) {
 	t.Helper()
+	eng, stop, err := launch909(workers, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return eng, func() {
+		if err := stop(); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// launch909 is start909 without a *testing.T, so that a goroutine other than
+// the test's may start an engine and report why it could not.
+func launch909(workers int, log logSink) (*Engine, func() error, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("pick port: %v", err)
+		return nil, nil, fmt.Errorf("pick port: %w", err)
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
@@ -55,7 +77,7 @@ func start909(t *testing.T, workers int, log *lockedBuf) (*Engine, func()) {
 		Logger:    slog.New(slog.NewTextHandler(log, nil)),
 	}, respondingHandler{})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		return nil, nil, fmt.Errorf("New: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -64,26 +86,36 @@ func start909(t *testing.T, workers int, log *lockedBuf) (*Engine, func()) {
 		select {
 		case err := <-done:
 			cancel()
-			t.Fatalf("Listen returned before it bound: %v", err)
+			return nil, nil, fmt.Errorf("Listen returned before it bound: %w", err)
 		default:
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("the epoll engine did not bind within 10s")
+			return nil, nil, errors.New("the epoll engine did not bind within 10s")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	return eng, func() {
+	// Listen publishes the address and only then logs its listening line
+	// (celeris#890): a caller that reads the log on return must find it.
+	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(log.String(), "epoll engine listening"); {
+		if time.Now().After(deadline) {
+			cancel()
+			return nil, nil, errors.New("the epoll engine did not log its listening line within 10s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return eng, func() error {
 		cancel()
 		select {
 		case err := <-done:
 			if err != nil {
-				t.Errorf("Listen: %v", err)
+				return fmt.Errorf("Listen: %w", err)
 			}
+			return nil
 		case <-time.After(15 * time.Second):
-			t.Fatal("the epoll engine did not stop within 15s")
+			return errors.New("the epoll engine did not stop within 15s")
 		}
-	}
+	}, nil
 }
 
 // celeris#909: with the process restricted to a mask that leaves out its lowest
@@ -189,4 +221,65 @@ func TestFailedPinIsLoggedOnceAndNotPretended909(t *testing.T) {
 		t.Fatalf("the engine does not accept after failed pins: %v", err)
 	}
 	_ = conn.Close()
+}
+
+// gatedLog holds the write of the engine's listening line until gate is
+// closed.
+type gatedLog struct {
+	lockedBuf
+	gate chan struct{}
+}
+
+func (g *gatedLog) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("epoll engine listening")) {
+		<-g.gate
+	}
+	return g.lockedBuf.Write(p)
+}
+
+// celeris#890 (TestNICIRQReportAddsNoLoop1036 failed in CI with a log that had
+// the pinning lines and no "epoll engine listening" line): Listen publishes
+// the address and only then logs that line, and start909 returned as soon as
+// the address was there, so a test that read the log on return could read it
+// before the line was written. start909 returns once the line is in the log.
+func TestStart909ReturnsOnlyOnceTheListeningLineIsLogged(t *testing.T) {
+	g := &gatedLog{gate: make(chan struct{})}
+	type started struct {
+		eng  *Engine
+		stop func() error
+		err  error
+	}
+	ret := make(chan started, 1)
+	go func() {
+		eng, stop, err := launch909(2, g)
+		ret <- started{eng, stop, err}
+	}()
+	select {
+	case r := <-ret:
+		logged := g.String()
+		close(g.gate)
+		if r.err != nil {
+			t.Fatalf("launch909: %v", r.err)
+		}
+		_ = r.stop()
+		t.Fatalf("launch909 returned (address %v) before the listening line was in the log: %q", r.eng.Addr(), logged)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(g.gate)
+	select {
+	case r := <-ret:
+		if r.err != nil {
+			t.Fatalf("launch909: %v", r.err)
+		}
+		defer func() {
+			if err := r.stop(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if !strings.Contains(g.String(), "epoll engine listening") {
+			t.Fatalf("launch909 returned without the listening line in the log: %q", g.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("launch909 did not return once the listening line was logged")
+	}
 }

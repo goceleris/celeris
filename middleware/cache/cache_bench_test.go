@@ -7,6 +7,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 // BenchmarkCacheHit covers the HIT path — the key exists in the
@@ -129,4 +130,49 @@ func BenchmarkCacheMissCacheControl(b *testing.B) {
 		_ = c.Next()
 		celeristest.ReleaseContext(c)
 	}
+}
+
+// otherStore888 stands for any store that is not one of the two in-process types
+// the bound leaves alone (a remote store, or a type that embeds one of them): its
+// fill goes through the bounded Set (Config.SetTimeout, celeris#888 item 30), on a
+// goroutine. A real remote store adds a network round trip to every Set; the
+// rows below are the cost of the bound on a store whose Set takes nothing.
+type otherStore888 struct{ store.KV }
+
+func benchMiss888(b *testing.B, kv store.KV, noSF bool) {
+	var counter int
+	mw := New(Config{
+		Store:               kv,
+		TTL:                 time.Hour,
+		DisableSingleflight: noSF,
+		KeyGenerator: func(_ *celeris.Context) string {
+			counter++
+			return "k" + strconv.Itoa(counter)
+		},
+	})
+	handler := func(c *celeris.Context) error {
+		return c.Blob(200, "text/plain", []byte("hello"))
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(mw, handler)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		c, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = c.Next()
+		celeristest.ReleaseContext(c)
+	}
+}
+
+// Public API only, so the same benchmarks run against the merge-base.
+func BenchmarkCacheMissOtherStore888(b *testing.B) {
+	benchMiss888(b, otherStore888{store.NewMemoryKV()}, false)
+}
+
+func BenchmarkCacheMissNoSingleflightOtherStore888(b *testing.B) {
+	benchMiss888(b, otherStore888{store.NewMemoryKV()}, true)
+}
+
+// The bare MemoryKV is not bounded: the row that shows it pays nothing.
+func BenchmarkCacheMissMemoryKV888(b *testing.B) {
+	benchMiss888(b, store.NewMemoryKV(), false)
 }

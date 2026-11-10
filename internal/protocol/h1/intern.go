@@ -22,6 +22,10 @@ var (
 	sRoot    = "/"
 )
 
+// internMethod returns the interned string of one of the seven common
+// methods, or "" for any other. The seven are tokens by construction (RFC 9110
+// section 5.6.2), so a method that matched needs no check; the parser scans any
+// other for the token grammar (isToken), off the hot path.
 func internMethod(b []byte) string {
 	switch len(b) {
 	case 3:
@@ -51,11 +55,13 @@ func internMethod(b []byte) string {
 			return sOPTIONS
 		}
 	}
-	return UnsafeString(b)
+	return ""
 }
 
 func internVersion(b []byte) string {
-	if len(b) == 8 && b[0] == 'H' && b[5] == '1' && b[6] == '.' {
+	// All eight bytes: "HTTP/1." and the minor version. A version matched on
+	// some of them (H, 1, ., and the minor) took "HTTP\n1.1" and "H\x00TP/1.1".
+	if len(b) == 8 && string(b[:7]) == "HTTP/1." {
 		if b[7] == '1' {
 			return sHTTP11
 		}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // TestDetachSnapshotElapsedFromStartTimeNs889 pins the elapsed time the done
@@ -36,7 +38,7 @@ func TestDetachSnapshotElapsedFromStartTimeNs889(t *testing.T) {
 
 	s, _ := newTestStream("GET", "/d")
 	defer s.Release()
-	s.StartTimeNs = time.Now().UnixNano()
+	s.StartTimeNs = mono.Now()
 	if err := adapter.HandleStream(context.Background(), s); err != nil {
 		t.Fatal(err)
 	}

@@ -25,7 +25,10 @@ type Config struct {
 	Username string
 	// DB is the numeric database index applied via SELECT post-HELLO.
 	DB int
-	// DialTimeout is the TCP dial timeout; default 5s.
+	// DialTimeout bounds each new connection's TCP connect and, separately,
+	// its handshake (HELLO, then AUTH and SELECT); default 5s. A server that
+	// accepts the connection and does not answer the handshake fails the dial
+	// after DialTimeout, also when the caller's context has no deadline.
 	DialTimeout time.Duration
 	// ReadTimeout is unused currently — responses are driven by the event
 	// loop and cancellation is via the request context.
@@ -62,6 +65,28 @@ type Config struct {
 	// the goroutine that issued a command: see [Client.OnPush] for what it
 	// must not do.
 	OnPush func(channel string, data []Value)
+	// SocketBusyPoll is the SO_BUSY_POLL budget (Linux) put on the connections
+	// this driver registers on an event loop. Default 0: off, and then no
+	// setsockopt call is made. It is opt-in, as celeris.Config.SocketBusyPoll
+	// is for the connections a server accepts (celeris#1228). A budget of at
+	// least one microsecond sets it, in whole microseconds. Anything else (0, a
+	// negative value, less than a microsecond) leaves it unset, and then
+	// the connection takes the server's Config.SocketBusyPoll when Engine is
+	// set, so one setting decides both; an unset option cannot turn off a
+	// server that has it on.
+	//
+	// Which connections it reaches: every Pub/Sub connection, and the command
+	// connections of a Client that runs on an event loop, which is a Client with
+	// no Engine and one whose Engine is a server that does not run async
+	// handlers and either has not started yet or is on the std engine, which
+	// has no event loop of its own (the driver then uses its own loop, not the
+	// server's). The command connections of a Client opened with the Engine of
+	// a started epoll, io_uring or adaptive server, or of one that runs async
+	// handlers (also before it starts), dial through Go's netpoll and are never
+	// tuned. A refused setsockopt is ignored, silently; the server
+	// logs a warning once. See celeris.Config.SocketBusyPoll for what it does
+	// and what was measured.
+	SocketBusyPoll time.Duration
 }
 
 // Option mutates a Config during NewClient.
@@ -76,7 +101,8 @@ func WithUsername(s string) Option { return func(c *Config) { c.Username = s } }
 // WithDB selects a database index.
 func WithDB(db int) Option { return func(c *Config) { c.DB = db } }
 
-// WithDialTimeout sets the TCP dial timeout.
+// WithDialTimeout sets Config.DialTimeout: the bound of a new connection's TCP
+// connect and of its handshake, each.
 func WithDialTimeout(d time.Duration) Option { return func(c *Config) { c.DialTimeout = d } }
 
 // WithReadTimeout sets the read timeout (currently advisory).
@@ -107,6 +133,12 @@ func WithHealthCheckInterval(d time.Duration) Option {
 func WithEngine(sp ServerProvider) Option {
 	return func(c *Config) { c.Engine = sp }
 }
+
+// WithSocketBusyPoll sets [Config.SocketBusyPoll], the SO_BUSY_POLL budget of
+// the driver's connections on an event loop (Linux; off by default, and
+// inherited from the server under WithEngine). Only a budget of one
+// microsecond or more counts: it wins over the server's.
+func WithSocketBusyPoll(d time.Duration) Option { return func(c *Config) { c.SocketBusyPoll = d } }
 
 // WithForceRESP2 forces the RESP2 dialect; skips HELLO.
 func WithForceRESP2() Option { return func(c *Config) { c.ForceRESP2 = true } }

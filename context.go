@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/testhooks"
 )
@@ -481,11 +482,13 @@ func (c *Context) WorkerID() int {
 // the framework before the handler chain runs, so all middleware share the
 // same timestamp without calling time.Now() independently.
 func (c *Context) StartTime() time.Time {
-	// Materialize lazily from the raw ns set by routerAdapter.HandleStream.
-	// Most requests never call StartTime(), so the time.Unix division is
-	// deferred off the hot path.
+	// Materialize lazily from the raw stamp set by routerAdapter.HandleStream
+	// (internal/mono's clock). mono.Time gives the true wall time of the stamp with
+	// a monotonic reading, so (once the clock is monotonic, celeris#1178) time.Since(c.StartTime()) (the logger, metrics and
+	// otel latencies) ignores steps of the wall clock. Most requests never call
+	// StartTime(), so this one clock read is deferred off the hot path.
 	if c.startTime.IsZero() && c.startTimeNs != 0 {
-		c.startTime = time.Unix(0, c.startTimeNs)
+		c.startTime = mono.Time(c.startTimeNs)
 	}
 	return c.startTime
 }

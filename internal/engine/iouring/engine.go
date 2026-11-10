@@ -20,11 +20,13 @@ import (
 	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
+	"github.com/goceleris/celeris/internal/tcpack"
 )
 
 // Engine implements the io_uring-based I/O engine.
 type Engine struct {
 	workers      []*Worker
+	loopWatch    *stream.LoopWatch // the workers' stamps, for the pool handlers' wait (celeris#1170)
 	tier         TierStrategy
 	profile      engine.CapabilityProfile
 	cfg          resource.Config
@@ -123,6 +125,13 @@ type Engine struct {
 	// wait for HTTP/2 pool handlers the workers run when Listen's context is
 	// cancelled (celeris#759; Worker.h2PoolSettled).
 	drainBudget atomic.Pointer[context.Context]
+
+	// shutdownBegun goes up when Shutdown is called (or a worker sees Listen's
+	// context cancelled) and stays up: it is never lowered, so an Engine is not
+	// reusable after Shutdown (a Server builds a new one per Start). Every worker's H1State points at it
+	// (conn.H1State.Shutdown): from then on each HTTP/1 response carries
+	// Connection: close and ends its conn (celeris#884, celeris#885).
+	shutdownBegun atomic.Bool
 }
 
 // New creates a new io_uring engine.
@@ -131,6 +140,11 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	if errs := cfg.Validate(); len(errs) > 0 {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
+
+	// The idle clock of an h2 conn needs to know whether this host reports the
+	// bytes a peer has acknowledged: ask now, in the background, so that the
+	// answer is there long before a sweep needs it (internal/tcpack).
+	tcpack.Start()
 
 	profile := probe.Probe()
 	if !profile.IOUringTier.Available() {
@@ -193,6 +207,10 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 			profile.MultishotAccept = false
 		}
 	}
+	// A probe that could not run (out of descriptors or memory, a failed wait)
+	// left its feature off for this engine without saying anything about the
+	// kernel, and is not cached: say so once (celeris#1200).
+	logProbesNotRun(cfg.Logger)
 
 	// Every cancel the engine submits sets IORING_ASYNC_CANCEL flags, which
 	// exist from Linux 5.19: the close paths' (cancelConnOps), the accept
@@ -448,12 +466,18 @@ func (e *Engine) Listen(ctx context.Context) error {
 	defer innerCancel()
 
 	var wg sync.WaitGroup
-	for _, w := range workers {
+	for i, w := range workers {
 		wg.Add(1)
-		go func() {
+		run := func() {
 			defer wg.Done()
 			e.runWatched(innerCtx, w)
-		}()
+		}
+		// A test may take the first worker to run on the process's main thread
+		// (celeris#890 item 42); nil in production.
+		if i == 0 && runOnMainThread(run) {
+			continue
+		}
+		go run()
 	}
 
 	// A start that fails drops the failures its workers recorded; the engine
@@ -533,6 +557,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 	resolved resource.ResolvedResources) ([]*Worker, error) {
 	workers := make([]*Worker, len(cpus))
+	e.loopWatch = stream.NewLoopWatch()
+	e.loopWatch.SetLogger(e.cfg.Logger)
 	for i := range workers {
 		w, err := newWorker(i, cpus[i], tier, e.handler,
 			resolved, e.cfg,
@@ -567,6 +593,9 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.multishotRecv = e.multishotRecv
 		w.pause = &e.pause // celeris#662 pause linger
 		w.drainBudget = &e.drainBudget
+		w.shutdownBegun = &e.shutdownBegun
+		w.loopSlot = e.loopWatch.Slot()
+		w.h2cfg.LoopWatch = e.loopWatch
 		workers[i] = w
 	}
 	return workers, nil
@@ -611,6 +640,9 @@ func fallbackTier(current TierStrategy) TierStrategy {
 // when Listen's context is cancelled (celeris#759): Server.Shutdown calls it
 // before it cancels that context.
 func (e *Engine) Shutdown(ctx context.Context) error {
+	// First: a response written from here on says Connection: close, one a
+	// handler is still writing included (see conn.H1State.Shutdown).
+	e.shutdownBegun.Store(true)
 	e.drainBudget.Store(&ctx)
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -716,10 +748,12 @@ func (e *Engine) Type() engine.EngineType {
 // nothing yet is promoted by the kernel during the linger and served like
 // any other, instead of being reset by the close.
 //
-// It does not promise a prompt start: a worker sees the flag at its next
-// ring wakeup, which on an idle plain-HTTP/1 worker can be up to 100 ms
-// away. Correctness does not depend on that, because each listener's
-// deadline is taken at its own clear.
+// It signals each worker's wake eventfd, whose POLL_ADD the ring keeps armed
+// in every mode, so a worker idle in its ring wait sees the flag at once: it
+// used to see it at its next ring wakeup, up to 100 ms away on an idle
+// plain-HTTP/1 worker (measured, celeris#886 item 24). A worker that is
+// running just reads the counter at its next wakeup. Correctness does not
+// depend on that, because each listener's deadline is taken at its own clear.
 //
 // It reads net.ipv4.tcp_synack_retries once, here. When that reads 0, the
 // pausing listeners also get TCP_SYNCNT=1, without which the kernel would
@@ -729,6 +763,13 @@ func (e *Engine) Type() engine.EngineType {
 func (e *Engine) BeginPauseAccept() {
 	e.pause.Begin(e.cfg.Logger, "io_uring")
 	e.acceptPaused.Store(true)
+	// After the store, as ResumeAccept signals after its own: a worker woken
+	// here reads the flag set. A leaf lock and one write(2) per worker.
+	e.mu.Lock()
+	for _, w := range e.workers {
+		w.wakeFD.Signal()
+	}
+	e.mu.Unlock()
 }
 
 // PauseAccept stops accepting new connections. It is BeginPauseAccept

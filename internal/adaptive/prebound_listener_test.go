@@ -52,18 +52,10 @@ func preBoundAdaptive(t *testing.T, workers int) (*Engine, string, func()) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	ended := make(chan struct{})
+	go func() { done <- e.Listen(ctx); close(ended) }()
 
-	for dl := time.Now().Add(10 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		cancel()
-		if lerr := <-done; lerr != nil {
-			t.Fatalf("adaptive engine never bound; Listen: %v", lerr)
-		}
-		t.Fatal("adaptive engine never bound")
-	}
+	awaitBoundOrFail890(t, e, cancel, done, ended)
 	return e, want, func() {
 		cancel()
 		<-done

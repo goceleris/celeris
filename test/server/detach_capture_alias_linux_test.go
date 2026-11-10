@@ -283,7 +283,7 @@ func startC714DetachServer(t *testing.T, mk func() *celeris.Server) (string, fun
 		}
 		cancel()
 		_ = ln.Close()
-		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(deadline) {
+		if isRingENOMEM(err) && time.Now().Before(deadline) {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}

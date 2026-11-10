@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // trial806 is the shape of one run of the detached partial-write test. Stream
@@ -228,7 +229,7 @@ func runDetachedPartial806(t *testing.T, eng celeris.EngineType, p trial806) str
 	time.Sleep(150 * time.Millisecond) // the stream headers are out, the response is queued behind a full socket
 
 	start := time.Now()
-	t0.Store(start.UnixNano())
+	t0.Store(mono.FromTime(start))
 	shutDone := make(chan error, 1)
 	go func() {
 		sctx, scancel := context.WithTimeout(context.Background(), budget)

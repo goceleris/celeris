@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
@@ -20,6 +21,8 @@ type redisPool struct {
 	cfg      Config
 	provider engine.EventLoopProvider
 	ownsLoop bool
+	// closeOnce makes Close idempotent.
+	closeOnce sync.Once
 }
 
 // newDirectCmdPool creates a pool whose cmd conns dial via direct
@@ -27,7 +30,14 @@ type redisPool struct {
 // pub/sub needs event-driven delivery of unsolicited push frames. provider
 // is the package-level standalone Loop from eventloop.Resolve(nil) (or the
 // engine's provider when engine is non-nil, for pubsub colocation).
-func newDirectCmdPool(cfg Config, provider engine.EventLoopProvider) *redisPool {
+//
+// With CELERIS_REDIS_DIRECT_WAIT unset, the conns of this pool wait for slow
+// pipeline and Tx replies in auto mode on linux (celeris#854), except the
+// conns of engineFallback (the WithEngine fallback, whose handler runs on a
+// locked engine worker thread) and of an unbounded pool (negative PoolSize):
+// the default was measured on neither, and a poll(2) wait holds one OS thread
+// per in-flight Exec. They stay on netpoll unless the variable says auto or block.
+func newDirectCmdPool(cfg Config, provider engine.EventLoopProvider, engineFallback bool) *redisPool {
 	nwCmd := runtime.GOMAXPROCS(0)
 	if nwCmd <= 0 {
 		nwCmd = 1
@@ -80,6 +90,7 @@ func newDirectCmdPool(cfg Config, provider engine.EventLoopProvider) *redisPool 
 		c.maxIdleTime = idleT
 		c.state.onPush = cfg.OnPush
 		c.workerID = workerID
+		c.netpollByDefault = engineFallback || cfg.PoolSize < 0
 		return c, nil
 	}
 	p.cmd = async.NewPool[*redisConn](asyncCfgCmd, dialCmdDirect)
@@ -271,13 +282,22 @@ func (p *redisPool) releasePubSub(c *redisConn) {
 }
 
 // Close closes both pools and releases the event loop if owned.
+//
+// It is safe to call from several goroutines and more than once: the body runs
+// once, and a caller that comes in while it runs waits for it to end (a later one
+// returns at once). Releasing the shared standalone
+// loop twice would drop a reference that belongs to another client
+// (celeris#887 item 29: SentinelClient.Close and the give-up of a sentinel
+// closed the same Client).
 func (p *redisPool) Close() error {
-	_ = p.cmd.Close()
-	_ = p.pubsub.Close()
-	if p.ownsLoop && p.provider != nil {
-		eventloop.Release(p.provider)
-		p.provider = nil
-	}
+	p.closeOnce.Do(func() {
+		_ = p.cmd.Close()
+		_ = p.pubsub.Close()
+		if p.ownsLoop && p.provider != nil {
+			eventloop.Release(p.provider)
+			p.provider = nil
+		}
+	})
 	return nil
 }
 

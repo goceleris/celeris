@@ -74,7 +74,10 @@ func (c *Context) ContentLength() int64 {
 
 // Header returns the value of the named request header. Keys are normalized
 // to lowercase automatically (HTTP/2 mandates lowercase; the H1 parser
-// normalizes to lowercase).
+// normalizes to lowercase). A header sent in several fields returns the first,
+// like [net/http.Header.Get]; the exception is Cookie: a request's cookie
+// fields are joined into one with "; " before the handler runs, so
+// Header("cookie") returns them all.
 func (c *Context) Header(key string) string {
 	// Fast path: most programmatic keys are already lowercase.
 	needsLower := false
@@ -346,7 +349,11 @@ func (c *Context) BindXML(v any) error {
 }
 
 // Cookie returns the value of the named cookie from the request, or
-// ErrNoCookie if not found. Values are returned as-is without decoding.
+// ErrNoCookie if not found. Values are returned as-is without decoding. A
+// request that sends several Cookie fields (an HTTP/1.1 client may, though
+// RFC 6265 §5.4 has it send one) reaches the handler as one field joined with
+// "; ", as an HTTP/2 request's split cookie fields do, so every cookie is
+// found; the earlier one wins when a name repeats.
 func (c *Context) Cookie(name string) (string, error) {
 	if !c.cookieCached {
 		c.parseCookies()

@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	celerisengine "github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -26,10 +28,12 @@ import (
 // the iteration after the close). The wake eventfd is armed in every mode, so
 // ResumeAccept signals it.
 //
-// A loop whose Config has a ReadHeaderTimeout (the default, 10 s) also owns a
-// 25 ms timerfd, which ends that wait on its own: the lag is at most 25 ms
-// there (measured 18 to 24 ms on origin/main), and only a loop without a header
-// deadline (ReadHeaderTimeout < 0) sits out the whole 500 ms.
+// Every loop owns a 25 ms timerfd, which ends that wait on its own: the lag is
+// at most 25 ms there (measured 18 to 24 ms on origin/main), and only a loop
+// whose timerfd is disarmed sits out the whole 500 ms. Until celeris#1194 that
+// was a loop without a header deadline (ReadHeaderTimeout < 0), which had no
+// timerfd; the tests disarm it by hand now, so that the eventfd signal is still
+// what they test.
 
 // live886 opens n keep-alive connections to addr, each with one answered
 // request, so that they are registered with a loop: a loop that holds a
@@ -87,9 +91,10 @@ func resumeLag886(t *testing.T, e *Engine, port, want int, gaveup time.Duration)
 	return gaveup
 }
 
-// start886 is start895 with a ReadHeaderTimeout: a negative one disables the
-// header deadline, and with it the loop's 25 ms timerfd.
-func start886(t *testing.T, loops int, readHeaderTimeout time.Duration) *run895 {
+// start886 is start895 with a ReadHeaderTimeout, and with the loops' 25 ms
+// timerfd disarmed when disarmTimer is set (celeris#1194: every loop has one,
+// whatever the ReadHeaderTimeout).
+func start886(t *testing.T, loops int, readHeaderTimeout time.Duration, disarmTimer bool) *run895 {
 	t.Helper()
 	e, err := New(resource.Config{
 		Addr:               "127.0.0.1:0",
@@ -110,6 +115,21 @@ func start886(t *testing.T, loops int, readHeaderTimeout time.Duration) *run895 
 	for dl := time.Now().Add(5 * time.Second); time.Now().Before(dl); {
 		if e.Addr() != nil {
 			t.Cleanup(func() { cancel(); <-done })
+			if disarmTimer {
+				// Every loop's timerfd was created before its ready signal, and
+				// Addr is stored after every ready: reading timerFD here is
+				// ordered after it.
+				e.mu.Lock()
+				defer e.mu.Unlock()
+				for _, l := range e.loops {
+					if l.timerFD < 0 {
+						t.Fatalf("celeris886 PREMISE: loop %d has no timerfd to disarm", l.id)
+					}
+					if err := unix.TimerfdSettime(l.timerFD, 0, &unix.ItimerSpec{}, nil); err != nil {
+						t.Fatalf("celeris886 PREMISE: disarm timerfd: %v", err)
+					}
+				}
+			}
 			return r
 		}
 		select {
@@ -136,17 +156,18 @@ func TestResumeAcceptReachesALoopThatCannotPark886(t *testing.T) {
 		lagBound = 200 * time.Millisecond
 	)
 	for _, tc := range []struct {
-		name  string
-		rht   time.Duration
-		conns int
+		name   string
+		rht    time.Duration
+		disarm bool
+		conns  int
 	}{
-		{"default-read-header-timeout/live-connections", 0, 16},
-		{"no-read-header-timeout/live-connections", -1, 16},
-		{"default-read-header-timeout/no-connections", 0, 0},
-		{"no-read-header-timeout/no-connections", -1, 0},
+		{"default-read-header-timeout/live-connections", 0, false, 16},
+		{"no-timerfd/live-connections", -1, true, 16},
+		{"default-read-header-timeout/no-connections", 0, false, 0},
+		{"no-timerfd/no-connections", -1, true, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := start886(t, 2, tc.rht)
+			r := start886(t, 2, tc.rht, tc.disarm)
 			r.e.mu.Lock()
 			want := len(r.e.loops)
 			r.e.mu.Unlock()

@@ -21,7 +21,9 @@ type TelemetrySnapshot struct {
 	// the larger of the interval's requests and its connection-seconds). It
 	// drives the error-rate safety revert, so it is a measure of the ENGINE
 	// failing, not of the clients leaving. It is not capped at 1: it is a
-	// ratio of two counters.
+	// ratio of two counters. It is 0 for an interval with fewer than
+	// minRevertFaults faults (the floor, celeris#886 item 29); ErrorDelta still
+	// holds what each bucket grew by.
 	ErrorRate float64
 	// RateDenominator is what ErrorRate was divided by: max(requests,
 	// ConnSeconds) of the interval, 0 on the first sample of an engine and for
@@ -200,18 +202,33 @@ func connSeconds(prevActive, curActive int64, elapsed float64) float64 {
 // An interval with no request used to have rate 0 whatever the faults. It now
 // has the faults per connection-second, so faults on a stream with no new
 // request count. An interval with neither requests nor connections (nothing
-// to divide by) is 0, and so is one whose counters fell (satSub). There is no
-// floor on the faults or on the divisor: one accept error (AcceptCancelled
-// counts ECONNABORTED, EINTR, ECANCELED, EBADF) in a second of fewer than 20
-// connection-seconds and no request reads above errorRevertRate, as one fault
-// in one to nineteen requests did before.
+// to divide by) is 0, and so is one whose counters fell (satSub).
+//
+// An interval with fewer than minRevertFaults faults has rate 0 as well
+// (celeris#886 item 29, decided A on 2026-10-25), and the divisor is still
+// returned. Without the floor one accept error (AcceptCancelled counts
+// ECONNABORTED, EINTR, ECANCELED, EBADF) in a second of fewer than 20
+// connection-seconds and no request read above errorRevertRate, as one fault
+// in one to nineteen requests did before, and on the opt-in io_uring start the
+// revert is one-way. The floor is per interval and does not carry over: two
+// faults a second for ever never revert. The divisor is not floored: idle
+// connections still dilute a real rate, which is the cost of max(requests,
+// connection-seconds).
 func faultRate(faults, reqs uint64, connSecs float64) (rate, denom float64) {
 	denom = max(float64(reqs), connSecs)
 	if denom <= 0 {
 		return 0, 0
 	}
+	if faults < minRevertFaults {
+		return 0, denom
+	}
 	return float64(faults) / denom, denom
 }
+
+// minRevertFaults is the fewest faults in one sampling interval that count
+// toward the error rate: with fewer, the rate is 0 (celeris#886 item 29). The
+// maintainer's value, "for example 3"; not calibrated on a measurement.
+const minRevertFaults = 3
 
 func newLiveSampler(cpuMon engine.CPUMonitor) *liveSampler {
 	return &liveSampler{

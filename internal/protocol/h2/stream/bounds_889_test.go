@@ -23,9 +23,12 @@ func TestDecidedBounds889(t *testing.T) {
 	}{
 		{"headerListRefusalBurstMax", headerListRefusalBurstMax, 100},
 		{"streamRefusalBurstMax", streamRefusalBurstMax, 2000},
+		{"bodyLimitResetBurstMax", bodyLimitResetBurstMax, 100},
+		{"malformedRequestBurstMax", malformedRequestBurstMax, 100},
 		{"maxContinuationFrames", maxContinuationFrames, 32},
 		{"maxPriorityPlaceholders", maxPriorityPlaceholders, 16},
-		{"serverResetWindow", serverResetWindow, 1024},
+		{"serverResetWindow", serverResetWindow, 2048},
+		{"emptyDataBurstMax", emptyDataBurstMax, 10000},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %d, the decision is %d", c.name, c.got, c.want)

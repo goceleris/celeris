@@ -335,6 +335,12 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 		p.w.Reset()
 		p.cmds = p.cmds[:0]
 		p.reqs = p.reqs[:0]
+		// Give the pool slot back (celeris#1268). Every error execManyCore
+		// returns has closed the conn first (as does the ErrClosed of a conn
+		// that was already closed), and releaseCmd discards a closed conn, so
+		// Open drops and the slot is freed. Without this a failed Exec kept
+		// its slot for good.
+		p.client.pool.releaseCmd(conn)
 		return err
 	}
 	var firstErr error
@@ -387,8 +393,12 @@ func (p *Pipeline) transferResult(pc *pipeCmd, r *redisRequest) {
 	} else {
 		// Allocate a Value on the heap. This path runs only for the async
 		// fallback, unexpected reply types, or error replies — the common
-		// sync pipeline case uses the direct path above.
-		v := r.result
+		// sync pipeline case uses the direct path above. On the sync path an
+		// untyped r.result may alias the conn's copySlab, which the next
+		// Exec on the conn rewrites, so detach it before the caller keeps it
+		// (celeris#1265). Already-detached values are copied once more; this
+		// path is rare.
+		v := copyValueDetached(r.result)
 		pc.val = &v
 	}
 }

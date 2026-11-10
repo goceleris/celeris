@@ -38,28 +38,25 @@ import (
 // checked against the shape it was registered for.
 func startFDLEngine(t *testing.T, h stream.Handler, mut func(*resource.Config)) (*Engine, string) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	cfg := resource.Config{
-		Addr:      addr,
-		Protocol:  engine.HTTP1,
-		Resources: resource.Resources{Workers: 2},
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-	if mut != nil {
-		mut(&cfg)
-	}
-	e, err := New(cfg, h)
-	if err != nil {
-		skipOrFail656(t, "iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("pick port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		cfg := resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2},
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		if mut != nil {
+			mut(&cfg)
+		}
+		return New(cfg, h)
+	})
+	addr := e.Addr().String()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -68,23 +65,6 @@ func startFDLEngine(t *testing.T, h stream.Handler, mut func(*resource.Config)) 
 			t.Error("engine did not stop within 5s")
 		}
 	})
-	for deadline := time.Now().Add(8 * time.Second); ; {
-		if c, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond); derr == nil {
-			_ = c.Close()
-			if e.NumWorkers() > 0 {
-				break
-			}
-		}
-		select {
-		case err := <-done:
-			skipOrFail656(t, "iouring engine failed to start: %v", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("engine did not start listening within 8s")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 	t.Logf("celeris657 engine workers=%d", e.NumWorkers())
 	return e, addr
 }
@@ -164,6 +144,17 @@ type loadResult struct {
 // then stops, so each lost request is exactly one error.
 func runKeepAliveLoad(t *testing.T, addr string, n int, stop <-chan struct{}) func() loadResult {
 	t.Helper()
+	return runKeepAliveLoadPaced(t, addr, n, stop, 0)
+}
+
+// runKeepAliveLoadPaced is runKeepAliveLoad with think between a client's
+// answered request and its next (0: none, back to back). A worker serving
+// clients that never wait finds a completion ready at every pass of its loop
+// and takes no wait at all, or only the one that has sends to wait for; with
+// think the clients leave it idle between requests, and the wait it takes
+// then is the timed one (celeris#884 item 49, the test of that wait).
+func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{}, think time.Duration) func() loadResult {
+	t.Helper()
 	var ok, errsN atomic.Int64
 	var mu sync.Mutex
 	byClass := map[string]int64{}
@@ -216,6 +207,13 @@ func runKeepAliveLoad(t *testing.T, addr string, n int, stop <-chan struct{}) fu
 					return
 				}
 				ok.Add(1)
+				if think > 0 {
+					select {
+					case <-stop:
+						return
+					case <-time.After(think):
+					}
+				}
 			}
 		}()
 	}

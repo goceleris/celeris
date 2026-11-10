@@ -5,10 +5,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"math/bits"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -185,9 +188,49 @@ type h1ResponseAdapter struct {
 	werr      error
 	keepAlive bool
 	isHEAD    bool
-	hijackFn  func() (net.Conn, error)
-	hijacked  bool
-	respBuf   []byte // per-connection reusable response buffer, avoids sync.Pool per request
+	// shutdown is H1State.Shutdown, wired once with the write hook: a final
+	// response (status 200 and up) written while it is up says
+	// Connection: close and clears keepAlive, which handleH1Request turns into
+	// the end of the connection (see closing).
+	shutdown *atomic.Bool
+	// A streamed response (WriteHeader, Write, Close) keeps its own state, set
+	// by WriteHeader and cleared for each request (handleH1Request), so that
+	// what a later chunk does depends on the request that began the response
+	// and not on whatever request the adapter holds by then (celeris#889).
+	// Like the rest of the adapter, not safe for concurrent use; the handler
+	// that detached owns it, and handleH1Request reads it only for a response
+	// the handler did not detach.
+	//
+	// streamBegun: WriteHeader has begun a response, and streamNoBody says it has
+	// none: a HEAD's, or one with a status that has no content (headers only, no
+	// chunk, no last chunk). streamOpen: a chunked
+	// response is under way and its last chunk has not been sent (a HEAD's, and
+	// one with no content, 1xx, 204 and 304, never is). streamBroken: the
+	// handler failed after its headers went out.
+	streamBegun  bool
+	streamNoBody bool
+	streamOpen   bool
+	streamBroken bool
+	// streamInterim: the last WriteHeader was a 1xx, so no final response has
+	// been sent (handleH1Request answers one when the handler returns).
+	streamInterim bool
+	// streamDeclared is the content-length WriteHeader was given (-1: none,
+	// declaredInvalid: one that cannot be held to) and streamWritten the body
+	// bytes Write has staged: a response its handler leaves unclosed is ended
+	// only if they agree.
+	streamDeclared int64
+	streamWritten  int64
+	// chunkBuf is the scratch a streamed chunk is framed in. Every write hook
+	// copies its argument before it returns (the engines append it to their
+	// send buffer), so it is reused for the next chunk; it never grows past
+	// maxChunkScratch, a larger chunk is framed in a buffer of its own. Once
+	// the stream is detached (UpdateWriteFn), a long-lived writer keeps at most
+	// chunkScratchKeep (scratchDetached).
+	chunkBuf        []byte
+	scratchDetached bool
+	hijackFn        func() (net.Conn, error)
+	hijacked        bool
+	respBuf         []byte // per-connection reusable response buffer, avoids sync.Pool per request
 }
 
 // sendfileThreshold is the minimum body size at which the H1 response
@@ -240,11 +283,64 @@ func mustFrameEmptyBody(status int) bool {
 	}
 }
 
+// closing reports whether the response being written with status ends the
+// connection: the request said so (keepAlive already false), or the engine's
+// shutdown has begun (celeris#884, celeris#885): every final response written
+// from then on says Connection: close and the connection ends after it, as the
+// engines' gate does for a request it meets (H1State.CloseAfter). It is read
+// when the head is built, so a handler that was already running when Shutdown
+// began (a sync handler holding its loop, an Async-route handler on its
+// goroutine) is covered, not just a request read after it. An interim response
+// (1xx, which includes 101 Switching Protocols of an upgrade) is not final: it
+// neither says close nor ends the connection. One nil test and, with the flag
+// wired, one atomic load of a word that is written once, per response.
+func (a *h1ResponseAdapter) closing(status int) bool {
+	if !a.keepAlive {
+		return true
+	}
+	if sd := a.shutdown; sd != nil && status >= 200 && sd.Load() {
+		a.keepAlive = false
+		return true
+	}
+	return false
+}
+
+// withoutConnectionHeaders returns headers with every Connection entry removed,
+// for a response that ends the connection: it carries the one
+// "connection: close" the head builders append, as net/http's response written
+// after Shutdown began carries one (a handler's "Connection: keep-alive" is
+// replaced, its "Connection: close" is not repeated). The common case, no such
+// header, returns headers itself and allocates nothing. Cold: only a closing
+// response asks.
+func withoutConnectionHeaders(headers [][2]string) [][2]string {
+	n := 0
+	for _, h := range headers {
+		if len(h[0]) == len("connection") && strings.EqualFold(h[0], "connection") {
+			n++
+		}
+	}
+	if n == 0 {
+		return headers
+	}
+	out := make([][2]string, 0, len(headers)-n)
+	for _, h := range headers {
+		if len(h[0]) == len("connection") && strings.EqualFold(h[0], "connection") {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	// Reuse per-connection buffer. This eliminates sync.Pool Get/Put
 	// per response (~40ns). The buffer grows as needed and persists
 	// across requests on the same keep-alive connection.
 	buf := a.respBuf[:0]
+	closing := a.closing(status)
+	if closing && status >= 200 { // an interim head's Connection (101: Upgrade) is the handler's
+		headers = withoutConnectionHeaders(headers)
+	}
 
 	// Ultra-fast path: 200 + 2 standard headers (content-type, content-length)
 	// where the content-type is one of the cached common types — collapse
@@ -270,7 +366,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 			buf = append(buf, clPrefix...)
 			buf = append(buf, headers[1][1]...)
 			buf = append(buf, crlf...)
-			if !a.keepAlive {
+			if closing {
 				buf = append(buf, "connection: close\r\n"...)
 			}
 			buf = append(buf, crlf...)
@@ -370,7 +466,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 		}
 	}
 
-	if !a.keepAlive {
+	if closing {
 		buf = append(buf, "connection: close\r\n"...)
 	}
 
@@ -410,6 +506,10 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 // (non-fast) path of WriteResponse so a sendfile response is byte-for-byte
 // equivalent to the buffered response that would otherwise be emitted.
 func (a *h1ResponseAdapter) appendFileResponseHead(buf []byte, status int, headers [][2]string, bodyLen int64) []byte {
+	closing := a.closing(status)
+	if closing && status >= 200 { // an interim head's Connection (101: Upgrade) is the handler's
+		headers = withoutConnectionHeaders(headers)
+	}
 	if status == 200 {
 		buf = appendCachedStatus200Date(buf)
 	} else {
@@ -452,7 +552,7 @@ func (a *h1ResponseAdapter) appendFileResponseHead(buf []byte, status int, heade
 		buf = strconv.AppendInt(buf, bodyLen, 10)
 		buf = append(buf, crlf...)
 	}
-	if !a.keepAlive {
+	if closing {
 		buf = append(buf, "connection: close\r\n"...)
 	}
 	return append(buf, crlf...)
@@ -711,6 +811,13 @@ type h2ResponseAdapter struct {
 	// writeTimeout bounds how long sendRest waits for the peer's window
 	// (H2Config.WriteTimeout; 0 = no bound).
 	writeTimeout time.Duration
+	// loops is the engine's watch on its event loops (H2Config.LoopWatch): a pool
+	// handler's wait is bounded by WriteTimeout in all while one is stuck.
+	loops *stream.LoopWatch
+	// log is the server's logger (H2Config.Logger): the reason of each reset of a
+	// pool handler's wait is told at Debug level (rate, or an event loop stuck), so
+	// that a stream cut by it can be told from one cut by anything else.
+	log *slog.Logger
 }
 
 // peerMaxFrame returns the peer's currently-advertised SETTINGS_MAX_FRAME_SIZE,
@@ -928,28 +1035,35 @@ func (a *h2ResponseAdapter) finishBody(s *stream.Stream, rest []byte, maxFrame u
 // Stream.TryBufferOutbound).
 //
 // It gives up, sending nothing more, when the stream is reset or its
-// connection closes. And it waits no longer than writeTimeout from now, the
-// server's WriteTimeout, in all: then it resets the stream with
-// INTERNAL_ERROR, as net/http does at a stream's write deadline, and returns
-// an error that wraps os.ErrDeadlineExceeded. The bound is a timer, so it
-// holds when the event loop cannot run: on the native engines a sync handler
-// waiting for this one (a lock it holds across this write, a coalesced call it
-// leads) holds its loop until this handler returns.
+// connection closes. And it is bounded by the server's WriteTimeout as a
+// minimum rate, the rule of every stream that waits for the peer's window
+// (stream.AwaitSendWindowRate, celeris#1170): the client must let at least 64 KiB
+// of the rest out per WriteTimeout window, with the carry-over, the connection's
+// credit and the grace the rule gives; when it does not, the stream is reset with
+// INTERNAL_ERROR, as net/http does at a stream's write deadline, and sendRest
+// returns an error that wraps os.ErrDeadlineExceeded. Before celeris#1170 the
+// bound was WriteTimeout in all from the first wait (#906), which cut a client
+// that read at a healthy rate when the bytes ahead of this stream in its socket
+// took longer. The bound is a timer of this handler's, so it holds when the event
+// loop cannot run: on the native engines a sync handler waiting for this one (a
+// lock it holds across this write, a coalesced call it leads) holds its loop until
+// this handler returns; while a loop is stuck like that the wait is bounded by
+// WriteTimeout in all, as before.
 func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uint32) error {
-	var deadline time.Time
-	if a.writeTimeout > 0 {
-		deadline = time.Now().Add(a.writeTimeout)
-	}
+	w := stream.SendWait{Loops: a.loops}
+	gen := s.Gen()
+	defer w.End(s, gen)
 	for {
-		if err := s.AwaitSendWindow(deadline); err != nil {
+		if err := s.AwaitSendWindowRate(&w, len(rest)); err != nil {
 			if !errors.Is(err, os.ErrDeadlineExceeded) {
 				return nil // reset by the peer, or the connection closed
 			}
-			a.resetStream(s, http2.ErrCodeInternal)
-			return fmt.Errorf("h2: stream %d reset: %d bytes of the response still waited for the peer's window at WriteTimeout (%v): %w",
-				s.ID, len(rest), a.writeTimeout, err)
+			a.resetStreamOnce(s, http2.ErrCodeInternal)
+			a.logWaitReset(s.ID, len(rest), &w)
+			return waitRateError(s.ID, len(rest), "the response", a.writeTimeout, &w, err)
 		}
 		if n := h2ReserveSend(a.manager, s, len(rest)); n > 0 {
+			a.manager.NoteWaitSent(s.ID, n)
 			isEnd := n == len(rest)
 			pooled := getH2FrameBuf()
 			frameBuf := (*pooled)[:0]
@@ -965,6 +1079,44 @@ func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uin
 			rest = rest[n:]
 		}
 	}
+}
+
+// waitRateError is the error of a handler whose wait for the peer's window was
+// judged not to make the minimum rate of WriteTimeout (wraps err, an
+// os.ErrDeadlineExceeded).
+func waitRateError(id uint32, left int, what string, wt time.Duration, w *stream.SendWait, err error) error {
+	if w.BlockedLoop() {
+		return fmt.Errorf("h2: stream %d reset: %d bytes of %s still waited for the peer's window after WriteTimeout (%v) while an event loop of the server was blocked: %w",
+			id, left, what, wt, err)
+	}
+	return fmt.Errorf("h2: stream %d reset: %d bytes of %s still waited for the peer's window and the client did not take the minimum rate of WriteTimeout (%v per window): %w",
+		id, left, what, wt, err)
+}
+
+// logWaitReset tells why a pool handler's wait was reset (Debug).
+func (a *h2ResponseAdapter) logWaitReset(id uint32, left int, w *stream.SendWait) {
+	if a.log == nil {
+		return
+	}
+	reason := "rate"
+	if w.BlockedLoop() {
+		reason = "loop-blocked"
+	}
+	a.log.Debug("h2: pool handler wait reset", "stream", id, "reason", reason, "left", left, "write_timeout", a.writeTimeout)
+}
+
+// resetStreamOnce is resetStream for a wait that was judged: the stream is cancelled
+// first, and the RST_STREAM goes only if this call cancelled it. A stream the peer
+// reset between the verdict and here gets no second reset (RFC 9113 §5.1).
+func (a *h2ResponseAdapter) resetStreamOnce(s *stream.Stream, code http2.ErrCode) {
+	if !s.CancelFirst() {
+		return
+	}
+	var payload [4]byte
+	binary.BigEndian.PutUint32(payload[:], uint32(code))
+	pooled := getH2FrameBuf()
+	*pooled = appendH2Frame((*pooled)[:0], h2FrameRSTStream, 0, s.ID, payload[:])
+	a.writeQueue.Enqueue(s.ID, pooled)
 }
 
 // resetStream queues a RST_STREAM for s behind the frames s has queued (all of
@@ -995,7 +1147,7 @@ func (a *h2ResponseAdapter) resetStreamUse(s *stream.Stream, gen uint64, code ht
 		return
 	}
 	defer s.UseUnlock()
-	a.resetStream(s, code)
+	a.resetStreamOnce(s, code)
 }
 
 // SendGoAway writes a GOAWAY frame via the shared writer.
@@ -1135,10 +1287,22 @@ func statusText(code int) string {
 
 func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers [][2]string) error {
 	a.werr = nil
+	noContent := status < 200 || status == 204 || status == 304
+	a.streamBegun, a.streamNoBody = true, a.isHEAD || noContent
+	a.streamBroken = false
+	a.streamInterim = status >= 100 && status < 200 && status != 101
+	a.streamOpen = !a.streamNoBody
+	a.streamDeclared, a.streamWritten = declaredLength(headers), 0
 	buf := a.respBuf[:0]
+	closing := a.closing(status)
+	if closing && status >= 200 { // an interim head's Connection (101: Upgrade) is the handler's
+		headers = withoutConnectionHeaders(headers)
+	}
 	buf = appendStatusLine(buf, status)
 	buf = appendCachedDate(buf)
-	buf = append(buf, "transfer-encoding: chunked\r\n"...)
+	if !noContent { // RFC 9112 section 6.1: not on a 1xx, 204 or 304
+		buf = append(buf, "transfer-encoding: chunked\r\n"...)
+	}
 	for _, h := range headers {
 		// Same invariant as WriteResponse: headers reach this path
 		// pre-validated by celeris.Context's Set methods.
@@ -1147,7 +1311,7 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 		buf = append(buf, h[1]...)
 		buf = append(buf, crlf...)
 	}
-	if !a.keepAlive {
+	if closing {
 		buf = append(buf, "connection: close\r\n"...)
 	}
 	buf = append(buf, crlf...)
@@ -1176,12 +1340,35 @@ func (a *h1ResponseAdapter) askWriteErr(n int) error {
 	return nil
 }
 
+// maxChunkScratch bounds a connection's chunk scratch buffer: a chunk that
+// needs more is framed in a buffer of its own, as a chunk always was.
+const maxChunkScratch = 64 << 10
+
+// maxChunkData is the most data one chunk carries.
+const maxChunkData = 1 << 30
+
+// chunkScratchKeep is the largest chunk scratch kept when a handler that
+// streamed returns without detaching: a connection that goes on to serve other
+// requests does not hold a large one.
+const chunkScratchKeep = 4 << 10
+
+// headResponse reports whether the response being written has no body: the one
+// WriteHeader began (a HEAD's, or a status with no content), if it has begun
+// one, else the request the adapter holds.
+func (a *h1ResponseAdapter) headResponse() bool {
+	if a.streamBegun {
+		return a.streamNoBody
+	}
+	return a.isHEAD
+}
+
 func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
 	// RFC 9110 §9.3.2: a HEAD response has no content. WriteHeader sent
 	// the header block (transfer-encoding: chunked says what a GET would
 	// get); a chunk here would be read as the start of the next response
-	// on the connection.
-	if a.isHEAD {
+	// on the connection. Nor after the response was ended (Close): a chunk
+	// behind the last chunk is no chunk.
+	if a.headResponse() || (a.streamBegun && !a.streamOpen) {
 		return nil
 	}
 	// The engine refused an earlier write of this response, or the conn is
@@ -1189,22 +1376,96 @@ func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
 	if a.werr != nil {
 		return a.werr
 	}
-	// Chunked transfer encoding: hex(len)\r\n data \r\n
-	var hexBuf [20]byte
-	chunk := strconv.AppendInt(hexBuf[:0], int64(len(data)), 16)
-	chunk = append(chunk, '\r', '\n')
-	// The engine is asked before the chunk is staged: one that would take the
-	// response held unsent past the engine's limit is refused whole, and
-	// nothing of it is appended (the hook cannot undo an append).
-	if err := a.askWriteErr(len(chunk) + len(data) + len(crlf)); err != nil {
-		return err
+	// A zero-length chunk is the last chunk (RFC 9112 §7.1): an empty Write
+	// sends nothing, as net/http's does, and Close ends the response.
+	if len(data) == 0 {
+		return nil
 	}
-	chunk = append(chunk, data...)
+	// A chunk of more than 1 GiB goes out as several, so that the size of the
+	// buffer that frames one cannot overflow.
+	for len(data) > maxChunkData {
+		if err := a.Write(nil, data[:maxChunkData]); err != nil {
+			return err
+		}
+		data = data[maxChunkData:]
+	}
+	// Chunked transfer encoding: hex(len)\r\n data \r\n, built in the
+	// connection's scratch (see chunkBuf).
+	limit := maxChunkScratch
+	if a.scratchDetached {
+		limit = chunkScratchKeep
+	}
+	var chunk []byte
+	n := len(data)
+	if n <= limit-20 {
+		if need := n + 20; cap(a.chunkBuf) < need {
+			a.chunkBuf = make([]byte, 0, 1<<bits.Len(uint(need-1)))
+		}
+		chunk = a.chunkBuf[:0]
+		chunk = strconv.AppendInt(chunk, int64(n), 16)
+		chunk = append(chunk, '\r', '\n')
+		if err := a.askWriteErr(len(chunk) + n + len(crlf)); err != nil {
+			return err
+		}
+		chunk = append(chunk, data...)
+	} else {
+		// Framed in a buffer of its own, grown from the prefix by append, which
+		// does not zero the bytes the copy overwrites (make would).
+		if cap(a.chunkBuf) < 32 {
+			a.chunkBuf = make([]byte, 0, 32)
+		}
+		prefix := strconv.AppendInt(a.chunkBuf[:0], int64(n), 16)
+		prefix = append(prefix, '\r', '\n')
+		if err := a.askWriteErr(len(prefix) + n + len(crlf)); err != nil {
+			return err
+		}
+		chunk = append(prefix[:len(prefix):len(prefix)], data...)
+	}
 	chunk = append(chunk, crlf...)
 	a.write(chunk)
+	a.streamWritten += int64(n)
 	// And again after the hook: a detached conn's hook refuses a write whose
 	// backlog is over the limit, and drops it.
 	return a.askWriteErr(0)
+}
+
+// declaredInvalid is the declared length of a response whose content-length
+// cannot be held to: not a plain number, or given more than once.
+const declaredInvalid = -2
+
+// declaredLength is the content-length the headers of a streamed response
+// declare: -1 for none, declaredInvalid for one that cannot be held to (not
+// all digits, too long for an int64, or several fields).
+func declaredLength(headers [][2]string) int64 {
+	declared := int64(-1)
+	for _, h := range headers {
+		if len(h[0]) != len("content-length") || !strings.EqualFold(h[0], "content-length") {
+			continue
+		}
+		if declared != -1 {
+			return declaredInvalid
+		}
+		v := strings.TrimSpace(h[1])
+		if v == "" || len(v) > 18 {
+			return declaredInvalid
+		}
+		declared = 0
+		for i := 0; i < len(v); i++ {
+			if v[i] < '0' || v[i] > '9' {
+				return declaredInvalid
+			}
+			declared = declared*10 + int64(v[i]-'0')
+		}
+	}
+	return declared
+}
+
+// streamComplete reports whether the streamed response that is under way has
+// every byte its headers declared, if they declared any: the condition for
+// ending it at the handler's return (a body that is not as long as declared is
+// cut, not ended: the last chunk would make it look whole).
+func (a *h1ResponseAdapter) streamComplete() bool {
+	return a.streamDeclared == -1 || a.streamDeclared == a.streamWritten
 }
 
 // Flush has nothing to send: the write hook does not hold bytes back for it
@@ -1219,9 +1480,12 @@ func (a *h1ResponseAdapter) Flush(_ *stream.Stream) error {
 }
 
 func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
-	if a.isHEAD {
-		return nil // no content, so no last-chunk either (see Write)
+	// A response with no body (HEAD, 1xx, 204, 304) has no last chunk (see
+	// Write), and one that is already ended is not ended twice.
+	if a.headResponse() || (a.streamBegun && !a.streamOpen) {
+		return nil
 	}
+	a.streamOpen = false
 	if a.werr != nil {
 		return a.werr
 	}
@@ -1234,6 +1498,22 @@ func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
 	}
 	a.write(last)
 	return a.askWriteErr(0)
+}
+
+// NeedsEmptyAnswer marks this writer as the native HTTP/1 engines': they send
+// nothing for a handler that returns without answering, so the router answers
+// for it (an empty 200); net/http's and HTTP/2's own writers do not have it.
+func (a *h1ResponseAdapter) NeedsEmptyAnswer() {}
+
+// FailResponse records that the handler failed after its streamed response was
+// under way, with the failure swallowed above the engine (the router recovers a
+// panic and answers an error with a 500 only when nothing was sent): the
+// response is not whole, so it is not ended at the handler's return, and the
+// connection is closed instead (handleH1Request), as a client of net/http sees
+// a handler that panics after its headers. The HTTP/1.1 form of the reset the
+// HTTP/2 processor sends (celeris#889).
+func (a *h1ResponseAdapter) FailResponse() {
+	a.streamBroken = true
 }
 
 // h2 streaming support — h2ResponseAdapter implements stream.Streamer.
@@ -1349,18 +1629,21 @@ func (a *h2ResponseAdapter) WriteUse(s *stream.Stream, gen uint64, data []byte) 
 	if !onPool {
 		return nil // taken whole: sent, buffered behind the DATA already sent, or a HEAD's, dropped
 	}
-	// A pool goroutine: wait for the windows and send as they allow. The
-	// deadline starts when the call first has to wait, not before: a Write
-	// that finds the windows open reads no clock, and takes one lock.
-	var deadline time.Time
+	// A pool goroutine: wait for the windows and send as they allow. The wait
+	// is judged as a minimum rate of WriteTimeout (stream.AwaitSendWindowRateUse),
+	// from the moment the call first has to wait: a Write that finds the windows
+	// open reads no clock, and takes one lock. One wait per Write, not per
+	// response: a stream (SSE) is meant to outlast any one write.
+	w := stream.SendWait{Loops: a.loops}
+	defer w.End(s, gen)
 	for len(data) > 0 {
-		if err := s.AwaitSendWindowUse(gen, a.writeTimeout, &deadline); err != nil {
+		if err := s.AwaitSendWindowRateUse(gen, &w, len(data)); err != nil {
 			if !errors.Is(err, os.ErrDeadlineExceeded) {
 				return err // reset by the peer, the connection closed, or the stream's use is over
 			}
 			a.resetStreamUse(s, gen, http2.ErrCodeInternal)
-			return fmt.Errorf("h2: stream %d reset: %d of %d bytes of a write still waited for the peer's window at WriteTimeout (%v): %w",
-				id, len(data), total, a.writeTimeout, err)
+			a.logWaitReset(id, len(data), &w)
+			return waitRateError(id, len(data), fmt.Sprintf("a write of %d bytes", total), a.writeTimeout, &w, err)
 		}
 		n, _, _, err := m.StreamWrite(s, gen, data, a.sendData)
 		if err != nil {

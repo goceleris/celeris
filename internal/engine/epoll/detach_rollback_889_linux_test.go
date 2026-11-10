@@ -56,10 +56,14 @@ func (r *rig889) out() string {
 	return strings.Join(r.wrote, "")
 }
 
-// Two points the fault is injected at, both after cs.writeFn = guarded: early
-// (the state the hook publishes through is gone, so UpdateWriteFn faults) and
-// late (everything is installed).
+// Three points the fault is injected at. count: right after the count is made
+// and before anything is installed (detachPostCountHook; the span between the
+// snapshot and the place the rollback used to be registered, #889 item 48).
+// early and late are both after cs.writeFn = guarded: early (the state the
+// hook publishes through is gone, so UpdateWriteFn faults) and late
+// (everything is installed).
 const (
+	faultCount889 = "count"
 	faultEarly889 = "early"
 	faultLate889  = "late"
 )
@@ -67,6 +71,10 @@ const (
 func (r *rig889) panicking(t *testing.T, where string, hook func()) {
 	t.Helper()
 	switch where {
+	case faultCount889:
+		f := func() { panic("engine fault right after the count") }
+		detachPostCountHook.Store(&f)
+		defer detachPostCountHook.Store(nil)
 	case faultEarly889:
 		r.cs.h1State = nil
 		defer func() { r.cs.h1State = r.h1 }()
@@ -106,7 +114,7 @@ func (r *rig889) lockedWrite(fn func([]byte), s string) {
 
 func TestOnDetachPanicLeavesTheConnAsIfNeverRan889(t *testing.T) {
 	for _, async := range []bool{false, true} {
-		for _, where := range []string{faultEarly889, faultLate889} {
+		for _, where := range []string{faultCount889, faultEarly889, faultLate889} {
 			name := where + "/sync"
 			if async {
 				name = where + "/async-unpromoted"

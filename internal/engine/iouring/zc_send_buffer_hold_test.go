@@ -10,6 +10,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#812: the kernel reads a SEND_ZC's send buffer (cs.sendBuf) until the
@@ -128,7 +130,7 @@ func runZCBackstopCase(t *testing.T, tc zcBackstopCase) zcBackstopResult {
 	}
 	// The backstop is due from here on.
 	closedAt := time.Now()
-	w.pendingRelease[0].releaseAtNanos = closedAt.UnixNano()
+	w.pendingRelease[0].releaseAtNanos = mono.FromTime(closedAt)
 
 	// held: the array is still the send buffer of a connState queued for
 	// release, or held past the backstop off the release walk (zcHolds):
@@ -157,7 +159,7 @@ func runZCBackstopCase(t *testing.T, tc zcBackstopCase) zcBackstopResult {
 	pass := func(d time.Duration) {
 		runRingOnce(t, w, d)
 		owed := zcIdentityOwed(w, key)
-		w.cachedNow = time.Now().UnixNano()
+		w.cachedNow = mono.Now()
 		w.drainPendingRelease()
 		if r.releasedAfter < 0 && !held() {
 			r.releasedAfter = time.Since(closedAt)

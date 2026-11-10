@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +30,11 @@ var streamPool = sync.Pool{New: func() any {
 const (
 	flagCancelled    uint32 = 1 << 0
 	flagAsyncRunning uint32 = 1 << 1
+	// flagReqDeadline marks a stream whose request deadline is armed
+	// (Manager.ArmRequest): the request was not whole at its HEADERS, and
+	// StartTimeNs holds the instant it was armed. The loop thread alone arms and
+	// disarms it, under H2State.mu; takeLocked clears it with the stream.
+	flagReqDeadline uint32 = 1 << 2
 	// flagBudgetPool marks an inline-eligible stream that runs on the worker
 	// pool only because its connection was over its outbound budget
 	// (celeris#893). Its response never goes to its OutboundBuffer
@@ -74,15 +81,20 @@ type Stream struct {
 	// can read affinity without a per-request ctx.Value() walk.
 	WorkerID    int32
 	WorkerIDSet bool
+	// The one-byte flags below sit with WorkerIDSet, in the four bytes that
+	// follow WorkerID: spread among the wider fields they cost 16 bytes of
+	// padding, which BindParentContext's field (celeris#889) needs, in a
+	// Stream that is exactly 1024 bytes, the edge of its malloc size class.
+	lazyHeadersBuilt   bool
+	pseudoMaterialized bool
+	CachedRouteAsync   bool // resolved per-route async dispatch flag (cached with the chain)
 	// LazyRawHeaders, when non-nil on an H1 stream, holds raw request
 	// header bytes that have NOT been appended to Headers yet — the H1
 	// dispatch sets only the 4 pseudo-headers eagerly and defers the raw
 	// header lowercase + slice append until a handler actually reads them
 	// via Context.Header / Context.RequestHeaders. Materialized once per
 	// request via MaterializeHeaders. Cleared on stream reset.
-	LazyRawHeaders     [][2][]byte
-	lazyHeadersBuilt   bool
-	pseudoMaterialized bool
+	LazyRawHeaders [][2][]byte
 	// H1 dispatch sets these directly so extractRequestInfo / Host()
 	// don't need to walk Headers[0..3]. Empty for H2 streams (where
 	// pseudo-headers come from HPACK and live in s.Headers as before).
@@ -101,8 +113,7 @@ type Stream struct {
 	CachedRoutePath     string
 	CachedRouteHandlers any // []celeris.HandlerFunc — typed any to avoid cycle
 	CachedRouteFullPath string
-	CachedRouteAsync    bool // resolved per-route async dispatch flag (cached with the chain)
-	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
+	// StartTimeNs is the engine's cached mono.Now() for the
 	// recv that produced this request. populated by populateCachedStream
 	// from the engine's worker-local clock cache so HandleStream avoids a
 	// per-request time.Now() vDSO call. Zero means "unset, fall back to
@@ -154,17 +165,25 @@ type Stream struct {
 	h1Mode                 bool  // single-threaded H1 stream; skip mutex in GetHeaders
 	protoMajor             uint8 // 0=infer from h1Mode, 1=HTTP/1.1, 2=HTTP/2
 	flags                  atomic.Uint32
-	ctx                    atomic.Pointer[streamCtx] // this use's context, made on first ask (celeris#836)
-	phase                  Phase
-	CachedCtx              any                     // per-connection cached context (avoids pool Get/Put per request)
-	OnDetach               func()                  // called by Context.Detach to install write-thread safety
-	OnWSUpgrade            func(func([]byte))      // called by Context to install WS data delivery callback
-	OnWSRawWrite           func() func([]byte)     // returns raw write fn (bypasses chunked encoding)
-	OnWSDetachClose        func(func())            // installs callback for engine-side connection close
-	OnWSSetError           func(func(error))       // installs error handler for engine-side I/O failures
-	OnWSReadPauser         func() (func(), func()) // returns (pause, resume) callbacks for inbound backpressure
-	OnWSSetIdleDeadline    func(int64)             // sets the absolute idle deadline (Unix nanoseconds)
-	hdrBuf                 [16][2]string
+	// seedSince is how many bytes a StreamWriter has sent since the stream's last
+	// write-deadline record ended, plus one, saturating at MaxInt32; zero for a stream
+	// that has had no record (write_deadline.go, celeris#1170 review r2 F2): a later
+	// record's seed counts no more than this. Four bytes after flags,
+	// in the padding before the next pointer, where the Stream's size
+	// class has room. Guarded by mu.
+	seedSince           int32
+	ctx                 atomic.Pointer[streamCtx] // this use's context, made on first ask (celeris#836)
+	parent              context.Context           // what this use's context ends with, bound when it is made (BindParentContext, celeris#889); unlocked, see there
+	phase               Phase
+	CachedCtx           any                     // per-connection cached context (avoids pool Get/Put per request)
+	OnDetach            func()                  // called by Context.Detach to install write-thread safety
+	OnWSUpgrade         func(func([]byte))      // called by Context to install WS data delivery callback
+	OnWSRawWrite        func() func([]byte)     // returns raw write fn (bypasses chunked encoding)
+	OnWSDetachClose     func(func())            // installs callback for engine-side connection close
+	OnWSSetError        func(func(error))       // installs error handler for engine-side I/O failures
+	OnWSReadPauser      func() (func(), func()) // returns (pause, resume) callbacks for inbound backpressure
+	OnWSSetIdleDeadline func(int64)             // sets the absolute idle deadline (Unix nanoseconds)
+	hdrBuf              [16][2]string
 	// Last in the struct, so the fields the hot paths read keep their offsets.
 	// respWritten is how many body bytes a StreamWriter has handed to this
 	// use of the stream, sent or buffered (Manager.StreamWrite). Guarded by mu.
@@ -192,6 +211,10 @@ type Stream struct {
 type streamCtx struct {
 	state atomic.Uint32 // ctxCancelled | ctxDoneClosed
 	done  atomic.Value  // chan struct{}, set by the first Done: a new channel, or closedChan once cancelled
+	// stop removes the registration with the parent context this one was
+	// bound to (BindParentContext); nil if it has none. Written before the
+	// context is published, read only after it is taken from the stream.
+	stop func() bool
 }
 
 const (
@@ -338,6 +361,53 @@ func (s *Stream) Context() context.Context {
 	return s.useCtx()
 }
 
+// BindParentContext makes this use's context end when parent does, from the
+// moment something asks for the context (Context): a client that resets an
+// HTTP/2 stream or goes away cancels the request context of net/http and of
+// the HTTP/2 server behind the std engine's h2c front end, and a handler that
+// waits on c.Context() is told (celeris#949). Nothing is registered with
+// parent until then, so a request whose handler never asks pays for no
+// binding (celeris#889): one stored interface value, and no allocation.
+//
+// It cancels the context of this use, not the stream: a cancel that races the
+// end of the use can reach only a context nobody can ask for any more, never
+// the stream's next use. The registration is removed when the use ends (every
+// reset that ends one, endCtx), and parent is dropped then. The field is an
+// unlocked two-word interface: written before the handler runs, read by
+// Context during it, cleared by endCtx. A race on it is reachable only through
+// misuse, a goroutine that calls Context after its request ended, which already
+// races h1Mode and the other fields the reset writes; Context.Detach caches the
+// context during the handler, and on the native engines parent is always nil.
+// A parent that cannot
+// end (context.Background) binds nothing; one that has ended makes the context
+// cancelled when it is made, without a goroutine. The stream's
+// cancelled flag (IsCancelled) is not set by the parent: the readers of it
+// belong to the native engines' write path, and the std engine's writers do
+// not read it.
+//
+// Call it before the handler runs, on an HTTP/2 stream: an HTTP/1 stream's
+// context is context.Background() whatever is cancelled.
+func (s *Stream) BindParentContext(parent context.Context) {
+	if s.h1Mode {
+		return
+	}
+	s.parent = parent
+}
+
+// bindTo binds c, a context no one has seen yet, to the parent if there is
+// one.
+func (s *Stream) bindTo(c *streamCtx) {
+	p := s.parent
+	if p == nil || p.Done() == nil {
+		return
+	}
+	if p.Err() != nil {
+		c.cancel()
+		return
+	}
+	c.stop = context.AfterFunc(p, c.cancel)
+}
+
 // useCtx returns this use's context, making it on the first call.
 func (s *Stream) useCtx() *streamCtx {
 	for {
@@ -345,6 +415,9 @@ func (s *Stream) useCtx() *streamCtx {
 			return c
 		}
 		c := new(streamCtx)
+		if s.parent != nil {
+			s.bindTo(c)
+		}
 		if s.ctx.CompareAndSwap(nil, c) {
 			// Cancel sets flagCancelled before it looks for the context,
 			// and this looks at the flag after publishing the context, so
@@ -354,29 +427,51 @@ func (s *Stream) useCtx() *streamCtx {
 			}
 			return c
 		}
+		// Another caller published its context first: drop this one's
+		// registration and use theirs.
+		if c.stop != nil {
+			c.stop()
+		}
 	}
 }
 
 // Cancel cancels the stream's context.
 func (s *Stream) Cancel() {
+	s.CancelFirst()
+}
+
+// CancelFirst is Cancel, and reports whether this call was the one that
+// cancelled the stream: false when it was already cancelled (the peer's
+// RST_STREAM, a connection that closed, another reset). A caller that is about
+// to send a RST_STREAM sends it only when it was first, so a stream the peer has
+// reset gets no second reset after it (RFC 9113 §5.1).
+func (s *Stream) CancelFirst() bool {
 	old := s.flags.Or(flagCancelled)
 	if old&flagCancelled != 0 {
-		return // already cancelled
+		return false // already cancelled
 	}
 	if c := s.ctx.Load(); c != nil {
 		c.cancel()
 	}
+	return true
 }
 
 // endCtx ends this use's context: it is cancelled, if it is not yet, and
 // detached, so the stream's next use gets a new one (celeris#836). Called by
 // every reset that ends a use.
 func (s *Stream) endCtx() {
+	if s.parent != nil {
+		s.parent = nil
+	}
 	if s.ctx.Load() == nil {
 		return
 	}
 	if c := s.ctx.Swap(nil); c != nil {
 		c.cancel()
+		if c.stop != nil {
+			// A false answer means the cancel has started; it reaches c alone.
+			c.stop()
+		}
 	}
 }
 
@@ -544,6 +639,7 @@ func (s *Stream) resetLocked() {
 	s.OutboundEndStream = false
 	s.outboundAbandoned = false
 	s.respWritten = 0
+	s.seedSince = 0
 	s.respDeclared.Store(0)
 	s.headersSent.Store(false)
 	s.EndStream = false
@@ -640,11 +736,100 @@ func (s *Stream) MaterializeHeaders() {
 		)
 		s.pseudoMaterialized = true
 	}
+	// Several Cookie lines become one field joined with "; ", as HTTP/2
+	// delivers a request (celeris#889, see CookieJoiner). The loop is the plain
+	// append; only a request with a second cookie line pays for the join.
+	hdrs := s.Headers
+	first, extra := -1, 0
 	for _, rh := range s.LazyRawHeaders {
-		s.Headers = append(s.Headers, [2]string{
-			lazyLowerHeaderName(rh[0]),
-			unsafeStringFromBytes(rh[1]),
-		})
+		name := lazyLowerHeaderName(rh[0])
+		if name == "cookie" {
+			if first < 0 {
+				first = len(hdrs)
+			} else {
+				extra++
+			}
+		}
+		hdrs = append(hdrs, [2]string{name, unsafeStringFromBytes(rh[1])})
+	}
+	if extra > 0 {
+		hdrs = joinCookieFields(hdrs, first)
+	}
+	s.Headers = hdrs
+}
+
+// joinCookieFields joins every cookie field from index first on into the first
+// one with "; " and removes the others, in place: one allocation of exactly
+// the joined length, however many lines there are.
+func joinCookieFields(hdrs [][2]string, first int) [][2]string {
+	n := 0
+	for _, h := range hdrs[first:] {
+		if h[0] == "cookie" {
+			n += len(h[1]) + 2
+		}
+	}
+	var b strings.Builder
+	b.Grow(n - 2)
+	out := hdrs[:first+1]
+	b.WriteString(hdrs[first][1])
+	for _, h := range hdrs[first+1:] {
+		if h[0] == "cookie" {
+			b.WriteString("; ")
+			b.WriteString(h[1])
+			continue
+		}
+		out = append(out, h)
+	}
+	out[first][1] = b.String()
+	clear(hdrs[len(out):])
+	return out
+}
+
+// CookieJoiner joins the cookie fields of one request's header list into the
+// first one with "; ". An HTTP/1.1 client may send several Cookie lines, and
+// HTTP/2 joins the fields of a request at HPACK decode (RFC 9113 §8.2.3, as
+// net/http's server does, celeris#944); joining where the HTTP/1 header list
+// is built gives every protocol and engine one cookie field, so
+// Header("cookie"), Context.Cookie and every key built from them (singleflight,
+// cache VaryHeaders) see the same value (celeris#889). The pieces are
+// gathered in one buffer and the first field takes the result in Finish, so
+// the work is linear in the request however many lines it has (a line as small
+// as "a=b" must not make joining quadratic, as in hpackEmit). A request with
+// one cookie line allocates nothing. The zero value is ready; use one per
+// header list, and call Finish after the last Append.
+type CookieJoiner struct {
+	at     int // index of the cookie field in the list, valid when seen
+	seen   bool
+	joined bool
+	buf    []byte
+}
+
+// Append appends the request header field name: value to hdrs, except that a
+// cookie field after the first is gathered for Finish instead of being
+// appended. It does not lowercase: the caller passes name already lowercased
+// (the HTTP/1 and HTTP/2 paths and celeristest all do).
+func (j *CookieJoiner) Append(hdrs [][2]string, name, value string) [][2]string {
+	if name == "cookie" {
+		if !j.seen {
+			j.seen, j.at = true, len(hdrs)
+		} else {
+			if !j.joined {
+				j.buf = append(j.buf[:0], hdrs[j.at][1]...)
+				j.joined = true
+			}
+			j.buf = append(j.buf, "; "...)
+			j.buf = append(j.buf, value...)
+			return hdrs
+		}
+	}
+	return append(hdrs, [2]string{name, value})
+}
+
+// Finish stores the joined value in the first cookie field. hdrs must be the
+// list Append returned last.
+func (j *CookieJoiner) Finish(hdrs [][2]string) {
+	if j.joined {
+		hdrs[j.at][1] = string(j.buf)
 	}
 }
 
@@ -687,6 +872,7 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.respWritten = 0
+	s.seedSince = 0
 	s.respDeclared.Store(0)
 	s.headersSent.Store(false)
 	s.EndStream = false
@@ -903,6 +1089,9 @@ func (s *Stream) bufferOutbound(data []byte, endStream bool) {
 	}
 	s.OutboundBuffer.Write(data)
 	s.OutboundEndStream = endStream
+	if m := s.manager; m != nil {
+		m.noteBuffered(s, len(data))
+	}
 	s.mu.Unlock()
 }
 
@@ -934,3 +1123,18 @@ func (s *Stream) WriteLock() { s.writeMu.Lock() }
 
 // WriteUnlock releases the per-stream write lock.
 func (s *Stream) WriteUnlock() { s.writeMu.Unlock() }
+
+// noteWritten counts n body bytes a StreamWriter handed to this use of the stream
+// (respWritten) and, once the stream has had a write-deadline record, since the last
+// one ended (seedSince, which holds that count plus one; zero means no record has
+// ended yet). The stream's lock must be held.
+func (s *Stream) noteWritten(n int) {
+	s.respWritten += int64(n)
+	if s.seedSince > 0 {
+		s.seedSince = int32(min(int64(s.seedSince)+int64(n), math.MaxInt32)) //nolint:gosec // G115: clamped to MaxInt32
+	}
+}
+
+// recordEnded notes that a write-deadline record of the stream ended: its next
+// record's seed counts the bytes sent from here. The stream's lock must be held.
+func (s *Stream) recordEnded() { s.seedSince = 1 }

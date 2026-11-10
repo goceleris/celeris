@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,11 +32,30 @@ type SentinelConfig struct {
 
 	PoolSize         int
 	MaxIdlePerWorker int
-	DialTimeout      time.Duration
-	ReadTimeout      time.Duration
-	WriteTimeout     time.Duration
-	Engine           ServerProvider
+	// DialTimeout bounds each new connection's TCP connect and, separately,
+	// its handshake; default 5s. See [Config].DialTimeout. It also bounds the
+	// query for the master address that NewSentinelClient makes to each
+	// sentinel in turn (connect, handshake and reply together).
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	Engine       ServerProvider
+	// SocketBusyPoll is forwarded to each client the SentinelClient opens: see
+	// [Config].SocketBusyPoll.
+	SocketBusyPoll time.Duration
 }
+
+// sentinelDownGrace is how long watchFailover lets the PubSub of the sentinel
+// it follows stay down (see PubSub.downFor) before it gives that sentinel up
+// and lets subscribeLoop connect to the next address of SentinelAddrs
+// (celeris#887 item 29). A sentinel that restarts within it keeps the
+// subscription.
+var sentinelDownGrace = 5 * time.Second
+
+// sentinelSwitchBackoffBase is the first pause of handleSwitchMaster between
+// two dials of the new master (it doubles, up to 2 s). A variable so a test can
+// make the pause end at once.
+var sentinelSwitchBackoffBase = 100 * time.Millisecond
 
 // SentinelClient is a Redis client managed by Redis Sentinel. It discovers the
 // current primary via Sentinel, connects to it, and automatically reconnects
@@ -50,6 +70,24 @@ type SentinelClient struct {
 
 	closeCh chan struct{}
 	closed  atomic.Bool
+
+	// ctx bounds the dials and handshakes the background work makes and is
+	// cancelled by Close, so that Close does not wait out DialTimeout for them;
+	// nil (a client built without NewSentinelClient) means context.Background.
+	// loopDone is closed when subscribeLoop, which runs the failover handling
+	// inline, has returned: Close waits for it so that no Client is built or
+	// kept after Close returns (celeris#1246); nil means there is none to wait
+	// for.
+	ctx      context.Context
+	cancel   context.CancelFunc
+	loopDone chan struct{}
+	// closeDone is closed when the Close that won the race has finished, for
+	// the Close calls that lost it to wait on; nil as loopDone.
+	closeDone chan struct{}
+
+	// downGrace is sentinelDownGrace as of construction; zero (a client built
+	// without NewSentinelClient) means the default.
+	downGrace time.Duration
 }
 
 type sentinelConn struct {
@@ -62,6 +100,15 @@ type sentinelConn struct {
 // first responsive sentinel, discovers the master address, and dials the
 // master. A background goroutine subscribes to +switch-master on sentinel
 // connections for automatic failover handling.
+//
+// The query to each sentinel for the master address, and the dial of the master
+// with its ROLE check, are each bound by [SentinelConfig].DialTimeout: a sentinel
+// that accepts the connection and does not answer is given up after it and the
+// next address is tried, so construction takes at most (N+1) x DialTimeout for N
+// sentinels (15 s for two at the default 5 s), and a sentinel that is slower than
+// DialTimeout to answer is skipped. When it fails, the error holds the error of
+// every sentinel that was tried (see [errors.Join]); one that timed out satisfies
+// errors.Is(err, context.DeadlineExceeded).
 func NewSentinelClient(cfg SentinelConfig) (*SentinelClient, error) {
 	if cfg.MasterName == "" {
 		return nil, errors.New("celeris-redis: SentinelConfig.MasterName is required")
@@ -73,28 +120,82 @@ func NewSentinelClient(cfg SentinelConfig) (*SentinelClient, error) {
 		cfg.DialTimeout = defaultDialTimeout
 	}
 	s := &SentinelClient{
-		cfg:     cfg,
-		closeCh: make(chan struct{}),
+		cfg:       cfg,
+		closeCh:   make(chan struct{}),
+		downGrace: sentinelDownGrace,
+		loopDone:  make(chan struct{}),
+		closeDone: make(chan struct{}),
 	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	masterAddr, err := s.discoverMaster()
 	if err != nil {
+		s.cancel()
 		return nil, fmt.Errorf("celeris-redis: sentinel master discovery failed: %w", err)
 	}
 	client, err := s.dialMaster(masterAddr)
 	if err != nil {
+		s.cancel()
 		return nil, fmt.Errorf("celeris-redis: dial master %s failed: %w", masterAddr, err)
 	}
 	s.client = client
-	go s.subscribeLoop()
+	go func() {
+		defer close(s.loopDone)
+		s.subscribeLoop()
+	}()
 	return s, nil
 }
 
-// Close tears down the sentinel client and all sentinel connections.
+// baseCtx is the context the dials of the background work derive from.
+func (s *SentinelClient) baseCtx() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+// testHookClientBuilt, when set, runs in the background work of a SentinelClient
+// right after it built a Client, which by then holds its reference to the
+// event loop: kind is "sentinel" for the Client of a sentinel connection
+// (subscribeLoop) and "master" for a master Client (dialMaster); ctx is the
+// context the dial goes on with, cancelled by Close. A test blocks in it to hold
+// a late Client open while it calls Close (celeris#1246). Nil in production.
+var testHookClientBuilt atomic.Pointer[func(s *SentinelClient, kind string, ctx context.Context)]
+
+// Close tears down the sentinel client and all sentinel connections. It
+// returns once the background work (the sentinel subscription and a failover in
+// progress) has returned too, so that no Client it was building is left open
+// when Close returns: a Client built WithEngine of a server with no event loop
+// of its own holds a reference to the driver's standalone loop, which it would
+// otherwise keep for as long as it takes the work to notice (celeris#1246).
+//
+// Close cancels the dials in flight, so it returns as soon as the work has
+// closed what it holds: at once for the sentinel subscription, and for a
+// failover dial that is connecting or in the handshake of the new master. A
+// failover dial that has finished the handshake and waits for the master's
+// reply to ROLE ends only when DialTimeout does (5 s by default) if its Client
+// is in direct mode, so Close can wait that long for it; with a mini-loop it
+// ends at once. A Client is in direct mode, reading a plain net.Conn that
+// honours the deadline of the dial and not its cancellation, when Engine is a
+// server that runs AsyncHandlers (on any OS), or when its event-loop worker has
+// no synchronous round trip: every Engine on darwin and windows, and on Linux a
+// started epoll, io_uring or adaptive engine. With no Engine, or on Linux with
+// the Engine of a server that is not started or runs on the std engine, without
+// AsyncHandlers, the Client is not in direct mode. A Close that comes in while
+// another runs waits for it to end, and a later one returns at once.
 func (s *SentinelClient) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
+		if s.closeDone != nil {
+			<-s.closeDone
+		}
 		return nil
 	}
+	if s.closeDone != nil {
+		defer close(s.closeDone)
+	}
 	close(s.closeCh)
+	if s.cancel != nil {
+		s.cancel()
+	}
 	s.sentinelMu.Lock()
 	for _, sc := range s.sentinelConns {
 		if sc.subPS != nil {
@@ -111,10 +212,15 @@ func (s *SentinelClient) Close() error {
 	c := s.client
 	s.client = nil
 	s.mu.Unlock()
+	var err error
 	if c != nil {
-		return c.Close()
+		err = c.Close()
 	}
-	return nil
+	if s.loopDone != nil {
+		// Holding no lock: the work takes sentinelMu and mu to close what it built.
+		<-s.loopDone
+	}
+	return err
 }
 
 // getClient returns the current master client under read lock.
@@ -133,17 +239,43 @@ func (s *SentinelClient) getClient() (*Client, error) {
 
 // discoverMaster queries sentinels for the master address.
 func (s *SentinelClient) discoverMaster() (string, error) {
+	var errs []error
 	for _, addr := range s.cfg.SentinelAddrs {
 		masterAddr, err := s.queryMaster(addr)
 		if err != nil {
+			errs = append(errs, err)
 			continue
 		}
 		return masterAddr, nil
 	}
-	return "", fmt.Errorf("no responsive sentinel for master %q", s.cfg.MasterName)
+	return "", fmt.Errorf("no responsive sentinel for master %q: %w", s.cfg.MasterName, errors.Join(errs...))
 }
 
-// queryMaster connects to a single sentinel and asks for the master address.
+// withCtxErr makes a failure that came with the end of ctx recognizable as it: a
+// direct-mode Client reports the deadline of its socket (os.ErrDeadlineExceeded),
+// not the context's, and the socket's can fire a hair before the context's timer.
+//
+// A reply of the server (an error such as WRONGPASS or NOAUTH) is not a timeout,
+// whenever ctx ended, and is returned as it is; so is a nil error.
+func withCtxErr(ctx context.Context, err error) error {
+	var rerr *RedisError
+	if err == nil || errors.As(err, &rerr) {
+		return err
+	}
+	if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
+		return fmt.Errorf("%w: %w", cerr, err)
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
+	return err
+}
+
+// queryMaster connects to a single sentinel and asks for the master address. The
+// connect, the handshake and the reply together are bound by DialTimeout, and by
+// the SentinelClient's lifecycle context: a sentinel that accepts the connection
+// and never answers fails this query after DialTimeout and discoverMaster goes on
+// to the next address, keeping the error of each (celeris#1248).
 func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	var opts []Option
 	opts = append(opts, WithDialTimeout(s.cfg.DialTimeout))
@@ -153,6 +285,9 @@ func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	if s.cfg.Engine != nil {
 		opts = append(opts, WithEngine(s.cfg.Engine))
 	}
+	if s.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
+	}
 	opts = append(opts, WithForceRESP2())
 	c, err := NewClient(sentinelAddr, opts...)
 	if err != nil {
@@ -160,9 +295,11 @@ func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	}
 	defer func() { _ = c.Close() }()
 
-	v, err := c.Do(context.Background(), "SENTINEL", "get-master-addr-by-name", s.cfg.MasterName)
+	ctx, cancel := context.WithTimeout(s.baseCtx(), s.cfg.DialTimeout)
+	defer cancel()
+	v, err := c.Do(ctx, "SENTINEL", "get-master-addr-by-name", s.cfg.MasterName)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("sentinel %s: %w", sentinelAddr, withCtxErr(ctx, err))
 	}
 	if v.Type == protocol.TyNull {
 		return "", fmt.Errorf("sentinel %s: master %q not found", sentinelAddr, s.cfg.MasterName)
@@ -206,16 +343,22 @@ func (s *SentinelClient) dialMaster(addr string) (*Client, error) {
 	if s.cfg.Engine != nil {
 		opts = append(opts, WithEngine(s.cfg.Engine))
 	}
+	if s.cfg.SocketBusyPoll > 0 {
+		opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
+	}
+	ctx, cancel := context.WithTimeout(s.baseCtx(), s.cfg.DialTimeout)
+	defer cancel()
 	c, err := NewClient(addr, opts...)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.DialTimeout)
-	defer cancel()
+	if h := testHookClientBuilt.Load(); h != nil {
+		(*h)(s, "master", ctx)
+	}
 	v, err := c.Do(ctx, "ROLE")
 	if err != nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("ROLE failed: %w", err)
+		return nil, fmt.Errorf("ROLE failed: %w", withCtxErr(ctx, err))
 	}
 	if v.Type != protocol.TyArray || len(v.Array) < 1 {
 		_ = c.Close()
@@ -235,11 +378,16 @@ func (s *SentinelClient) dialMaster(addr string) (*Client, error) {
 func (s *SentinelClient) subscribeLoop() {
 	bo := async.NewBackoff(100*time.Millisecond, 10*time.Second)
 	attempt := 0
+	// start is the index of the SentinelAddrs entry connectSentinel tries
+	// first: 0, and after a sentinel was given up the one after it, so that a
+	// sentinel that accepts and hangs up does not take the subscription back
+	// from the next address for ever (celeris#887 item 29).
+	start := 0
 	for {
 		if s.closed.Load() {
 			return
 		}
-		sc, err := s.connectSentinel()
+		sc, err := s.connectSentinelFrom(start)
 		if err != nil {
 			delay := bo.Next(attempt)
 			attempt++
@@ -263,21 +411,86 @@ func (s *SentinelClient) subscribeLoop() {
 		// exited on read error (that's what triggered this
 		// reconnect iteration).
 		s.sentinelMu.Lock()
+		if s.closed.Load() {
+			// Close ran between the check at the top of the loop and here: its
+			// list was already cleared, so it will never close sc. Whoever
+			// takes a sentinel out of the list, or declines to put it there,
+			// closes it (celeris#887 item 29).
+			s.sentinelMu.Unlock()
+			s.closeSentinel(sc)
+			return
+		}
 		for _, old := range s.sentinelConns {
+			// The PubSub first: its conn is checked out of the client's pool,
+			// so closing the client does not stop its reconnect loop.
+			if old != nil && old.subPS != nil {
+				_ = old.subPS.Close()
+			}
 			if old != nil && old.client != nil {
 				_ = old.client.Close()
 			}
 		}
 		s.sentinelConns = append(s.sentinelConns[:0], sc)
 		s.sentinelMu.Unlock()
-		s.watchFailover(sc)
+		if s.watchFailover(sc) {
+			start = s.sentinelIndex(sc.addr) + 1
+		}
 	}
+}
+
+// takeSentinel removes sc from sentinelConns and reports whether it was there.
+// The caller that gets true owns sc's close.
+func (s *SentinelClient) takeSentinel(sc *sentinelConn) bool {
+	s.sentinelMu.Lock()
+	defer s.sentinelMu.Unlock()
+	for i, c := range s.sentinelConns {
+		if c == sc {
+			s.sentinelConns = append(s.sentinelConns[:i], s.sentinelConns[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// closeSentinel closes sc's PubSub and then its client: the PubSub's conn is
+// checked out of the client's pool, so closing the client alone does not stop
+// its reconnect loop.
+func (s *SentinelClient) closeSentinel(sc *sentinelConn) {
+	if sc.subPS != nil {
+		_ = sc.subPS.Close()
+	}
+	if sc.client != nil {
+		_ = sc.client.Close()
+	}
+}
+
+// sentinelIndex is the index of addr in SentinelAddrs, or -1.
+func (s *SentinelClient) sentinelIndex(addr string) int {
+	for i, a := range s.cfg.SentinelAddrs {
+		if a == addr {
+			return i
+		}
+	}
+	return -1
 }
 
 // connectSentinel connects to the first responsive sentinel and subscribes to
 // the +switch-master channel.
 func (s *SentinelClient) connectSentinel() (*sentinelConn, error) {
-	for _, addr := range s.cfg.SentinelAddrs {
+	return s.connectSentinelFrom(0)
+}
+
+// connectSentinelFrom is connectSentinel trying the addresses of
+// SentinelAddrs in order from index start, wrapping around once.
+func (s *SentinelClient) connectSentinelFrom(start int) (*sentinelConn, error) {
+	n := len(s.cfg.SentinelAddrs)
+	for k := 0; k < n; k++ {
+		// No Client for a closed SentinelClient: Close waits for this call. (The
+		// cancel already fails the dials that follow; this saves building them.)
+		if s.closed.Load() {
+			break
+		}
+		addr := s.cfg.SentinelAddrs[((start+k)%n+n)%n]
 		var opts []Option
 		opts = append(opts, WithDialTimeout(s.cfg.DialTimeout))
 		if s.cfg.SentinelPassword != "" {
@@ -286,12 +499,19 @@ func (s *SentinelClient) connectSentinel() (*sentinelConn, error) {
 		if s.cfg.Engine != nil {
 			opts = append(opts, WithEngine(s.cfg.Engine))
 		}
+		if s.cfg.SocketBusyPoll > 0 {
+			opts = append(opts, WithSocketBusyPoll(s.cfg.SocketBusyPoll))
+		}
 		opts = append(opts, WithForceRESP2())
+		ctx, cancel := context.WithTimeout(s.baseCtx(), s.cfg.DialTimeout)
 		c, err := NewClient(addr, opts...)
 		if err != nil {
+			cancel()
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.DialTimeout)
+		if h := testHookClientBuilt.Load(); h != nil {
+			(*h)(s, "sentinel", ctx)
+		}
 		// Not Client.Subscribe: its constructor keeps the PubSub when the
 		// first SUBSCRIBE finds the conn down (ErrPubSubConnDown, the reconnect
 		// replays it). For a sentinel that is wrong: the reconnect would retry
@@ -317,22 +537,47 @@ func (s *SentinelClient) connectSentinel() (*sentinelConn, error) {
 	return nil, errors.New("no responsive sentinel")
 }
 
-// watchFailover reads +switch-master messages and triggers a master swap.
-func (s *SentinelClient) watchFailover(sc *sentinelConn) {
+// watchFailover reads +switch-master messages and triggers a master swap. It
+// returns true when it gave the sentinel up: the sentinel's PubSub reconnects
+// to the same address for ever, so a sentinel that went away would otherwise
+// keep the subscription and the failovers of the other sentinels would never
+// be heard. The sentinel is given up once its PubSub has been without a
+// reliable conn for sentinelDownGrace (PubSub.downFor: gone, or accepting and
+// hanging up again and again); the PubSub and the client are closed, and
+// subscribeLoop moves on to the next address of SentinelAddrs. It returns
+// false when the SentinelClient is closed.
+func (s *SentinelClient) watchFailover(sc *sentinelConn) (gaveUp bool) {
 	ch := sc.subPS.Channel()
+	grace := s.downGrace
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	tick := time.NewTicker(max(grace/4, 5*time.Millisecond))
+	defer tick.Stop()
 	for {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				return
+				return !s.closed.Load()
 			}
 			if msg == nil {
 				continue
 			}
 			// +switch-master payload: "mymaster old-ip old-port new-ip new-port"
 			s.handleSwitchMaster(msg.Payload)
+		case <-tick.C:
+			if sc.subPS.downFor() >= grace {
+				// Whoever takes sc out of sentinelConns closes it: if
+				// SentinelClient.Close got there first it has closed (or is
+				// closing, under sentinelMu) this very client, and a second
+				// close would race it.
+				if s.takeSentinel(sc) {
+					s.closeSentinel(sc)
+				}
+				return !s.closed.Load()
+			}
 		case <-s.closeCh:
-			return
+			return false
 		}
 	}
 }
@@ -346,7 +591,17 @@ var ErrSentinelUnhealthy = errors.New("celeris-redis: sentinel client unhealthy,
 // On dial failure, it retries 3 times with exponential backoff. If all retries
 // fail, the client is marked unhealthy and returns errors until the next
 // successful +switch-master.
+//
+// It is called only from watchFailover, which subscribeLoop runs inline, so the
+// notifications are handled one at a time in the order they were delivered: a
+// slow dial of an older failover cannot install its client after a newer one (the
+// ordering problem of celeris#1219 does not exist on this path).
 func (s *SentinelClient) handleSwitchMaster(payload string) {
+	// watchFailover's select between a queued message and closeCh picks at
+	// random, so this can run after Close: make no dial for a closed client.
+	if s.closed.Load() {
+		return
+	}
 	// Format: "<master-name> <old-ip> <old-port> <new-ip> <new-port>"
 	parts := splitFields(payload)
 	if len(parts) < 5 {
@@ -357,7 +612,7 @@ func (s *SentinelClient) handleSwitchMaster(payload string) {
 	}
 	newAddr := net.JoinHostPort(parts[3], parts[4])
 
-	bo := async.NewBackoff(100*time.Millisecond, 2*time.Second)
+	bo := async.NewBackoff(sentinelSwitchBackoffBase, 2*time.Second)
 	const maxRetries = 3
 	var newClient *Client
 	var lastErr error
@@ -376,10 +631,26 @@ func (s *SentinelClient) handleSwitchMaster(payload string) {
 			case <-s.closeCh:
 				return
 			}
+			// closeCh wins a tie with the timer: select picks at random when
+			// both are ready, and another dial would connect to the master
+			// after Close.
+			if s.closed.Load() {
+				return
+			}
 		}
 	}
 
 	s.mu.Lock()
+	// Close sets closed before it takes s.mu to clear s.client, and a dial
+	// runs under its own timeout, not closeCh, so a Close can land while
+	// dialMaster is in flight. Nothing closes a client installed after it.
+	if s.closed.Load() {
+		s.mu.Unlock()
+		if newClient != nil {
+			_ = newClient.Close()
+		}
+		return
+	}
 	old := s.client
 	if newClient != nil {
 		s.client = newClient
@@ -637,13 +908,27 @@ func (s *SentinelClient) Publish(ctx context.Context, channel, message string) (
 
 // Subscribe is [Client.Subscribe] on the current master: it returns the
 // PubSub with a nil error when the conn is found down on the first SUBSCRIBE,
-// and the reconnect replays the channels.
+// and the reconnect replays the channels. The reconnect dials the master the
+// SentinelClient has at that moment, so after a failover the PubSub follows the
+// new master instead of retrying the old one, once its conn to the old master
+// has dropped (a conn that stays up, on a loop shared with another Client that is
+// still open or on that of a started server that runs its own event loop, is
+// not moved). When the SentinelClient is
+// closed, a PubSub whose conn is down (or goes down afterwards) gives up:
+// Channel() is closed.
 func (s *SentinelClient) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	c, err := s.getClient()
 	if err != nil {
 		return nil, err
 	}
-	return c.Subscribe(ctx, channels...)
+	ps, err := c.newPubSubRouted(ctx, sentinelPubSubRoute{s})
+	if err != nil {
+		return nil, err
+	}
+	if len(channels) == 0 {
+		return ps, nil
+	}
+	return ps.firstControl(ps.Subscribe(ctx, channels...))
 }
 
 func (s *SentinelClient) Do(ctx context.Context, args ...any) (*Value, error) {

@@ -10,8 +10,7 @@
 //	server.Use(recovery.New())
 //
 // [New] accepts an optional [Config] to customise behaviour. Key fields:
-//   - [Config].ErrorHandlerErr — preferred error handler (receives a typed error).
-//   - [Config].ErrorHandler — legacy handler (receives any); kept for compatibility.
+//   - [Config].ErrorHandler — error handler (receives the panic as an error).
 //   - [Config].BrokenPipeHandler — custom handler for broken pipe / ECONNRESET panics.
 //   - [Config].StackSize — max bytes for stack trace capture (default 4096; 0 disables).
 //   - [Config].DisableLogStack — suppress all panic log output when true.
@@ -24,7 +23,8 @@
 // WARN level without a stack trace.
 //
 // The package exports sentinel errors for use with [errors.Is]:
-//   - [ErrPanic]: generic panic recovery.
+//   - [ErrPanic]: a recovered panic whose value is not an error (an error panic
+//     value is passed to [Config].ErrorHandler as it is).
 //   - [ErrBrokenPipe]: broken pipe or ECONNRESET.
 //   - [ErrPanicContextCancelled]: panic after request context was cancelled.
 //   - [ErrPanicResponseCommitted]: panic after response has been committed.

@@ -16,21 +16,23 @@ import (
 // documented -1 "no timeout" sentinel must survive the double normalisation
 // (Server.doPrepare applies WithDefaults, then New applies it again) and reach
 // the loop config as disabled (0). The loop reads these fields with `> 0`
-// guards (loop.go checkTimeouts / the epoll_wait cap), so 0 is "off" and a
+// guards (loop.go checkTimeouts and the header deadline), so 0 is "off" and a
 // reinstated 10s default is an enforced timeout the caller asked to disable.
+// (The epoll_wait cap and the sweep gate used to follow ReadHeaderTimeout, and
+// this test read the sentinel through them; since celeris#1194 they do not, and
+// the fields are read directly.)
 func TestTimeoutSentinelReachesEngine(t *testing.T) {
 	const explicit = 3 * time.Second
 
 	cases := []struct {
-		name                               string
-		in                                 time.Duration
-		wantRead, wantHeader, wantWrite    time.Duration
-		wantIdle                           time.Duration
-		wantHeaderDeadlineSweepGateEnabled bool
+		name                            string
+		in                              time.Duration
+		wantRead, wantHeader, wantWrite time.Duration
+		wantIdle                        time.Duration
 	}{
-		{"disabled", -1, 0, 0, 0, 0, false},
-		{"unset", 0, 60 * time.Second, 10 * time.Second, 60 * time.Second, 600 * time.Second, true},
-		{"explicit", explicit, explicit, explicit, explicit, explicit, true},
+		{"disabled", -1, 0, 0, 0, 0},
+		{"unset", 0, 60 * time.Second, 10 * time.Second, 60 * time.Second, 600 * time.Second},
+		{"explicit", explicit, explicit, explicit, explicit, explicit},
 	}
 
 	for _, tc := range cases {
@@ -67,26 +69,6 @@ func TestTimeoutSentinelReachesEngine(t *testing.T) {
 				}
 				if e.cfg.IdleTimeout != tc.wantIdle {
 					t.Errorf("cfg.IdleTimeout = %v, want %v", e.cfg.IdleTimeout, tc.wantIdle)
-				}
-				// Consequence (celeris#584 on the epoll side): the
-				// epoll_wait cap and the checkTimeouts sweep gate are both
-				// `cfg.ReadHeaderTimeout > 0`. With the sentinel honoured
-				// the cap is driven by detachedCount alone; with the
-				// default reinstated it is pinned at 25ms forever.
-				l := &Loop{cfg: e.cfg, consecutiveEmpty: 200}
-				idle := l.adaptiveTimeoutMs(100)
-				l.detachedCount = 1
-				detached := l.adaptiveTimeoutMs(100)
-				if tc.wantHeaderDeadlineSweepGateEnabled {
-					if idle != 25 || detached != 25 {
-						t.Errorf("adaptiveTimeoutMs with ReadHeaderTimeout=%v: idle=%dms detached=%dms, want 25/25",
-							e.cfg.ReadHeaderTimeout, idle, detached)
-					}
-				} else {
-					if idle != 400 || detached != 50 {
-						t.Errorf("adaptiveTimeoutMs with ReadHeaderTimeout disabled: idle=%dms detached=%dms, want 400/50",
-							idle, detached)
-					}
 				}
 			})
 		}

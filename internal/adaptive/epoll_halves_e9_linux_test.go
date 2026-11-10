@@ -57,21 +57,17 @@ func startEpollAdaptive(t *testing.T, cfg resource.Config, h stream.Handler) (*E
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- e.Listen(ctx) }()
+	ended := make(chan struct{})
+	go func() { errCh <- e.Listen(ctx); close(ended) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-errCh:
-		case <-time.After(5 * time.Second): // 5 s: a test that waited for Listen has drained errCh already
+		case <-ended: // closed after errCh is sent on, whoever has drained it
+		case <-time.After(5 * time.Second):
 		}
 		_ = e.Shutdown(context.Background())
 	})
-	for dl := time.Now().Add(15 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		t.Fatal("adaptive engine did not bind")
-	}
+	awaitBoundOrFail890(t, e, cancel, errCh, ended)
 	if got := e.ActiveEngine().Type(); got != engine.Epoll {
 		t.Fatalf("e9 PREMISE: the active engine is %v, want epoll: the epoll halves of #874 and #876 are not what this test would run", got)
 	}

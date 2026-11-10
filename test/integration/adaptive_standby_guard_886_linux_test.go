@@ -56,7 +56,18 @@ func skipOrFailIfStandbyAborted886(t *testing.T, switches uint64, logs *syncBuf8
 	if switches != 0 || !standbyAborted886(logs) {
 		return
 	}
-	const msg = "the io_uring standby did not come up here: the engine aborted the forced switch and stayed put"
+	skipOrFailUpswitch890(t, "the io_uring standby did not come up here: the engine aborted the forced switch and stayed put")
+}
+
+// skipOrFailUpswitch890 is this package's one definition of the gate that
+// ./internal/adaptive keeps in skipOrFailUpswitch662 (the two cannot share a
+// function: separate packages, and the test files of internal/adaptive cannot be
+// imported). A test of the adaptive_*_test.go files that cannot run where the
+// io_uring standby is unavailable skips through it, and fails instead under
+// CELERIS_REQUIRE_UPSWITCH=1; TestAdaptiveSkipRoutingIntegration890 fails on a
+// raw t.Skip in those files that bypasses it (celeris#890 item 96).
+func skipOrFailUpswitch890(t *testing.T, msg string) {
+	t.Helper()
 	if os.Getenv("CELERIS_REQUIRE_UPSWITCH") == "1" {
 		t.Fatal(msg + " -- CELERIS_REQUIRE_UPSWITCH=1 forbids skipping")
 	}

@@ -32,6 +32,8 @@ type AcceptItem struct {
 // carries that q-value, whether that entry names the offer or is a wildcard,
 // then by their order in offers (so "*, gzip" with offers [gzip, br] gives
 // gzip and with [br, gzip] gives br; "gzip, *" gives gzip for both).
+//
+// Only the first 64 entries of the header count (see [ParseInto]).
 func Accept(header string, offers []string) string {
 	// Stack-backed entry buffer. Real Accept-Encoding / Accept-Language
 	// headers almost always hold ≤8 items; anything larger falls back to
@@ -135,14 +137,31 @@ func Parse(header string) []AcceptItem {
 	return ParseInto(nil, header)
 }
 
+// maxEntries bounds what [ParseInto] reads of a header: the first 64 entries.
+// A header is the client's, whose length the engines bound only loosely (64 KiB
+// on the native engines, 16 MiB by default on std), and an entry costs a slice
+// element and a lowered string: "a,a,a,..." cost about 60 to 70 times its
+// length in heap (celeris#888 item 42). A browser sends 4 to 20 entries.
+const maxEntries = 64
+
+// maxSegments bounds the list elements ParseInto walks, empty ones included
+// (",,,,"), so that a header of separators costs a fixed amount of work.
+const maxSegments = 4 * maxEntries
+
 // ParseInto is the alloc-friendly variant of [Parse]. Callers can pass
 // a pre-sized slice (e.g. a stack-backed `make([]AcceptItem, 0, 8)[:0]`
 // or the zero value of an array via `buf[:0]`) to avoid the fresh
 // allocation when the expected number of entries is small. If the
 // header yields more entries than dst's capacity, it grows naturally.
+//
+// It reads at most 64 entries (and walks at most 256 list elements): what
+// follows is not seen, whatever it says. So a coding listed after 64 others is
+// not accepted, and a q=0 past them does not refuse (see [Accept]). No browser
+// sends that many.
 func ParseInto(dst []AcceptItem, header string) []AcceptItem {
 	entries := dst
-	for len(header) > 0 {
+	kept := 0
+	for segments := 0; len(header) > 0 && kept < maxEntries && segments < maxSegments; segments++ {
 		var part string
 		if i := strings.IndexByte(header, ','); i >= 0 {
 			part = header[:i]
@@ -182,6 +201,7 @@ func ParseInto(dst []AcceptItem, header string) []AcceptItem {
 		e.MediaType = strings.ToLower(strings.TrimSpace(e.MediaType))
 		if e.MediaType != "" {
 			entries = append(entries, e)
+			kept++
 		}
 	}
 	return entries

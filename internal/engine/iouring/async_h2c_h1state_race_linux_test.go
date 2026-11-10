@@ -12,9 +12,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
 )
@@ -22,9 +25,11 @@ import (
 // celeris#722: on an async route, the worker read cs.h1State after it had
 // handed the connection to its dispatch goroutine, and that goroutine sets
 // cs.h1State to nil when the request is an h2c upgrade (switchToH2Local). The
-// two sites are the header-timer re-arm in promoteConnToAsync (the first
-// request of a connection) and the same re-arm in handleRecv's async feed (a
-// later recv of a promoted connection). Each test below drives one of them to
+// two sites were the header-timer re-arm in promoteConnToAsync (the first
+// request of a connection; that arm is gone, celeris#884 item 82, and the
+// promotion reads nothing of cs.h1State after it starts the goroutine) and the
+// same re-arm in handleRecv's async feed (a later recv of a promoted
+// connection). Each test below drives one of them to
 // an h2c upgrade; under -race the unordered read and write fail the test.
 
 // asyncEveryRouteHandler serves every request with "ok" and marks every route
@@ -43,10 +48,25 @@ func (asyncEveryRouteHandler) HasAsyncRoutes() bool        { return true }
 
 func startAsyncH2CEngine722(t *testing.T) (*Engine, string) {
 	t.Helper()
-	return startFDLEngine(t, asyncEveryRouteHandler{}, func(c *resource.Config) {
-		c.AsyncHandlers = true
-		c.EnableH2Upgrade = true
+	// With the ring-ENOMEM retry of the other tests of this package: the
+	// 8 MiB memlock of the CI step is shared by every ring of the uid, and a
+	// start that lands while another holds the budget fails without it.
+	addr := freeAddr639(t)
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		return New(resource.Config{
+			Addr: addr, Protocol: engine.HTTP1, AsyncHandlers: true, EnableH2Upgrade: true,
+			Resources: resource.Resources{Workers: 2},
+		}, asyncEveryRouteHandler{})
 	})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("engine did not stop within 5s")
+		}
+	})
+	return e, addr
 }
 
 // asyncDispatchParked722 counts the goroutines parked in a dispatch goroutine's
@@ -154,7 +174,44 @@ func TestAsyncH2CUpgradeOnPromotionLeavesH1StateToTheGoroutine(t *testing.T) {
 // and its goroutine parks with the body half read; the second reaches the
 // goroutine through handleRecv's async feed, and the goroutine then runs the
 // upgrade. The worker must not read cs.h1State after that feed.
+//
+// The two accesses are made to overlap by construction (celeris#884 items 83
+// and 84). The dispatch goroutine is held in switchToH2Local, immediately
+// before its write of cs.h1State (h2cUpgradeHook), until the worker's feed has
+// run (asyncFeedHook, which sits where the celeris#722 read was): a read of
+// cs.h1State on the worker after that point, with no lock, is then always
+// unordered with the write: the race detector reported the restored pre-celeris#722
+// form in each of 100 separate -race processes (it reports a race once per
+// process, so a -count loop in one process shows one), where the goroutine left
+// to the scheduler reported it in 1 of 20 runs. The release is the worker's
+// hook, which is called before that read position, so the wait gives the read no
+// happens-before
+// edge to the write. The feed hook also counts the feeds, and the test
+// asserts the second recv took one: the connection's responses do not show
+// it, as the inline path serves the same bytes and finishes the same upgrade.
 func TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine(t *testing.T) {
+	var feeds atomic.Int64
+	var fedOnce sync.Once
+	fed := make(chan struct{})
+	feedHook := func(*Worker, *connState, int64) {
+		feeds.Add(1)
+		fedOnce.Do(func() { close(fed) })
+	}
+	var heldUpgrades, heldTimedOut atomic.Int64
+	upgradeHook := func(*connState) {
+		heldUpgrades.Add(1)
+		select {
+		case <-fed:
+		case <-time.After(5 * time.Second):
+			heldTimedOut.Add(1)
+		}
+	}
+	asyncFeedHook.Store(&feedHook)
+	h2cUpgradeHook.Store(&upgradeHook)
+	t.Cleanup(func() {
+		asyncFeedHook.Store(nil)
+		h2cUpgradeHook.Store(nil)
+	})
 	e, addr := startAsyncH2CEngine722(t)
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
@@ -197,10 +254,18 @@ func TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine(t *testing.T) {
 	}
 	finishH2CUpgrade722(t, c, bufio.NewReader(c))
 	if m := e.Metrics(); m.AsyncPromotedConns != m0.AsyncPromotedConns+1 {
-		// The count says the connection was promoted exactly once, nothing
-		// more: this test cannot observe the feed itself (celeris#884 item 84 records
-		// that).
 		t.Fatalf("AsyncPromotedConns moved by %d, want 1: the connection was promoted more or less than once",
 			m.AsyncPromotedConns-m0.AsyncPromotedConns)
+	}
+	// The second recv took the feed, once: with the feed disabled the inline
+	// path serves the same bytes and the upgrade finishes all the same.
+	if got := feeds.Load(); got != 1 {
+		t.Errorf("celeris#884 item 84: handleRecv's async feed ran %d times, want 1: the second recv was not fed to the goroutine", got)
+	}
+	if got := heldUpgrades.Load(); got != 1 {
+		t.Errorf("celeris#884 item 83: the upgrade ran %d times through the dispatch goroutine's hook, want 1", got)
+	}
+	if got := heldTimedOut.Load(); got != 0 {
+		t.Errorf("celeris#884 item 83: the dispatch goroutine was held in the upgrade for 5 s without the worker's feed running")
 	}
 }

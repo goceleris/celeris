@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -51,7 +52,7 @@ func newSitesConn885(t *testing.T, cfg resource.Config) *sitesConn885 {
 		t.Fatalf("apparatus: the conn is not parked on its response: writeSince=%d epollOut=%v pending=%d",
 			r.cs.writeSince, r.cs.epollOut, csPendingBytes(r.cs))
 	}
-	r.cs.lastActivity = time.Now().UnixNano()
+	r.cs.lastActivity = mono.Now()
 	return r
 }
 
@@ -61,7 +62,7 @@ func (r *sitesConn885) send(data string) {
 	if _, err := unix.Write(r.peer, []byte(data)); err != nil {
 		r.t.Fatalf("peer write: %v", err)
 	}
-	r.l.drainRead(r.fd, time.Now().UnixNano())
+	r.l.drainRead(r.fd, mono.Now())
 }
 
 // read takes up to n bytes of the response at the peer.
@@ -78,7 +79,7 @@ func (r *sitesConn885) read(n int) int {
 func (r *sitesConn885) open() bool { return r.l.conns[r.fd] == r.cs }
 
 func (r *sitesConn885) age() time.Duration {
-	return time.Since(time.Unix(0, r.cs.writeSince)).Round(time.Millisecond)
+	return time.Since(mono.Time(r.cs.writeSince)).Round(time.Millisecond)
 }
 
 // TestDrainReadInlineFlushRestartsTheWriteClock885: the peer takes 64 KiB every
@@ -230,7 +231,7 @@ func TestWriteClockIsNotInheritedByTheNextPark885(t *testing.T) {
 		}
 	}
 	time.Sleep(bound + 50*time.Millisecond) // no sweep meanwhile
-	r.cs.lastActivity = time.Now().UnixNano()
+	r.cs.lastActivity = mono.Now()
 	r.send("GET /big HTTP/1.1\r\nHost: x\r\n\r\n") // parks again, its inline flush having taken bytes
 	if !csWritePending(r.cs) || r.cs.writeSince == 0 {
 		t.Fatalf("apparatus: the next response did not park (pending=%d writeSince=%d)", csPendingBytes(r.cs), r.cs.writeSince)

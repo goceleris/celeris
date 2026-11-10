@@ -14,6 +14,18 @@ import (
 	"github.com/goceleris/celeris/internal/resource"
 )
 
+// engineNewFailed890 handles a failed engine constructor in a table of engines
+// (celeris#890 item 95). epoll.New fails on config validation only, so on the
+// epoll arm a failure is a defect and the test fails; the io_uring arm skips,
+// as before (io_uring skips are celeris#888's).
+func engineNewFailed890(t *testing.T, name string, err error) {
+	t.Helper()
+	if name == "epoll" {
+		t.Fatalf("epoll.New: %v", err)
+	}
+	t.Skipf("%s engine unavailable on this host: %v", name, err)
+}
+
 // TestSlowlorisSynthetic is the focused per-engine reproducer for the
 // v1.4.11 slowloris-defence work. Replaces the 1h+ probatorium nightly
 // cycle with an in-process test that logs every relevant step.
@@ -39,9 +51,8 @@ import (
 //     (FIN-vs-RST issue — RST would force immediate fail).
 func TestSlowlorisSynthetic(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		newEng  func(cfg resource.Config) (engine.Engine, error)
-		minSkip string // skip message if engine unsupported
+		name   string
+		newEng func(cfg resource.Config) (engine.Engine, error)
 	}{
 		{
 			name: "iouring",
@@ -66,14 +77,8 @@ func TestSlowlorisSynthetic(t *testing.T) {
 				IdleTimeout:       120 * time.Second,
 				Logger:            nil,
 			}
-			eng, err := tc.newEng(cfg)
-			if err != nil {
-				if tc.minSkip != "" {
-					t.Skip(tc.minSkip)
-				}
-				t.Skipf("%s engine unavailable on this host: %v", tc.name, err)
-			}
-			startEngine(t, eng)
+			eng := startEngineRetry(t, func() (engine.Engine, error) { return tc.newEng(cfg) },
+				func(err error) { engineNewFailed890(t, tc.name, err) })
 
 			ag, ok := eng.(addrGetter)
 			if !ok {
@@ -208,11 +213,8 @@ func TestSlowlorisSyntheticConcurrent(t *testing.T) {
 				// hangs in the matrix nightly.
 				AsyncHandlers: true,
 			}
-			eng, err := tc.newEng(cfg)
-			if err != nil {
-				t.Skipf("%s engine unavailable: %v", tc.name, err)
-			}
-			startEngine(t, eng)
+			eng := startEngineRetry(t, func() (engine.Engine, error) { return tc.newEng(cfg) },
+				func(err error) { engineNewFailed890(t, tc.name, err) })
 			addr := eng.(addrGetter).Addr().String()
 			t.Logf("[%s] server listening on %s", tc.name, addr)
 

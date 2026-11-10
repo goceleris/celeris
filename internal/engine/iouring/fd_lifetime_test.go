@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // celeris#657 face 2 (the fd-lifetime rule, R0): a connection leaves io_uring
@@ -213,7 +215,7 @@ func TestTransplantNeverHandsOffArmedRecv(t *testing.T) {
 					r := c.Res
 					reapRes = &r
 				}
-				f.w.processCQE(context.Background(), &c, time.Now().UnixNano())
+				f.w.processCQE(context.Background(), &c, mono.Now())
 			}
 			f.w.ring.EndCQ(head)
 		}

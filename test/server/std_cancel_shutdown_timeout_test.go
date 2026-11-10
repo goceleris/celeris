@@ -42,8 +42,10 @@ func runStdCancelBudgetCase(t *testing.T, watchCtx bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The server is handed this listener (std serves on it), so the port is not
+	// free between the pick and the bind: no other test of the process can be
+	// given it, and nothing but this server can answer the /ping probe below.
 	addr := ln.Addr().String()
-	_ = ln.Close()
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -82,7 +84,7 @@ func runStdCancelBudgetCase(t *testing.T, watchCtx bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startDone := make(chan error, 1)
-	go func() { startDone <- s.StartWithContext(ctx) }()
+	go func() { startDone <- s.StartWithListenerAndContext(ctx, ln) }()
 	probe := &http.Client{Timeout: 300 * time.Millisecond}
 	for deadline := time.Now().Add(15 * time.Second); ; {
 		if resp, err := probe.Get("http://" + addr + "/ping"); err == nil {

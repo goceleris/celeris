@@ -3,7 +3,6 @@
 package iouring
 
 import (
-	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -21,6 +20,7 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -73,7 +73,7 @@ func newOwedCloseWorker(t *testing.T, detached bool) (*Worker, *connState, int) 
 		recvArm:     &recvArmStats{},
 		handoffLoss: &handoffLossStats{},
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	cs := &connState{
 		fd:         local,
 		liveIdx:    -1,
@@ -174,7 +174,7 @@ func TestFinishCloseKeepsDescriptorWhileRecvOwed(t *testing.T) {
 			if cs.kernelInflight != 0 {
 				t.Fatalf("the owed recv never ended: kernelInflight=%d", cs.kernelInflight)
 			}
-			w.cachedNow = time.Now().UnixNano()
+			w.cachedNow = mono.Now()
 			w.drainPendingRelease()
 			if fdTarget(fd) == target {
 				t.Fatalf("fd %d still open after its owed recv ended (recv results %v)", fd, res)
@@ -216,36 +216,22 @@ func TestFinishCloseClosesAtOnceWhenNothingOwed(t *testing.T) {
 // the engine must stop promptly, and the release backstop must not be what
 // closed any of them.
 func TestShutdownEndsOwedOpsBeforeClosing(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	e, err := New(resource.Config{
-		Addr:      addr,
-		Protocol:  engine.HTTP1,
-		Resources: resource.Resources{Workers: 2},
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}, transplantTestHandler{})
-	if err != nil {
-		skipOrFail656(t, "iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		return New(resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2},
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}, transplantTestHandler{})
+	})
+	addr := e.Addr().String()
 	defer cancel()
-	for deadline := time.Now().Add(8 * time.Second); e.Addr() == nil; {
-		select {
-		case err := <-done:
-			skipOrFail656(t, "iouring engine failed to start: %v", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("engine did not start")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 	const n = 8
 	var clients []net.Conn
 	var servers []int
@@ -447,7 +433,7 @@ func newZCCloseWorker(t *testing.T) (*Worker, *connState, int) {
 		// (celeris#884 item 17).
 		listenFD: -1,
 	}
-	w.cachedNow = time.Now().UnixNano()
+	w.cachedNow = mono.Now()
 	cs := &connState{
 		fd:         local,
 		liveIdx:    -1,
@@ -502,7 +488,7 @@ func startZCSend(t *testing.T, w *Worker, cs *connState, reap bool) int32 {
 	if reap {
 		head, _ := w.ring.BeginCQ()
 		if !w.staleConnCQE(c, cs.fd, c.UserData) {
-			w.handleSend(c, cs.fd, time.Now().UnixNano())
+			w.handleSend(c, cs.fd, mono.Now())
 		}
 		w.ring.EndCQ(head + 1)
 		if !cs.zcNotifPending || !cs.sending || cs.kernelInflight != 1 {
@@ -564,7 +550,7 @@ func drainZCPeer(t *testing.T, w *Worker, cs *connState, peer int) (got int, eof
 		if len(w.pendingRelease) == 1 && w.pendingRelease[0].cs == cs && cs.kernelInflight == 0 {
 			notified = true
 		}
-		w.cachedNow = time.Now().UnixNano()
+		w.cachedNow = mono.Now()
 		w.drainPendingRelease()
 		if eof && len(w.pendingRelease) == 0 {
 			break
@@ -628,7 +614,7 @@ func TestCloseReleasesDescriptorWithOnlyAZCNotificationOwed(t *testing.T) {
 					t.Fatalf("fd %d still open 6s after the close", fd)
 				}
 				runRingOnce(t, w, 10*time.Millisecond)
-				w.cachedNow = time.Now().UnixNano()
+				w.cachedNow = mono.Now()
 				w.drainPendingRelease()
 			}
 			forced := w.handoffLoss.closeFDForced.Load()
@@ -644,7 +630,7 @@ func TestCloseReleasesDescriptorWithOnlyAZCNotificationOwed(t *testing.T) {
 			// notification is owed, however often the release runs.
 			for end := time.Now().Add(100 * time.Millisecond); time.Now().Before(end); {
 				runRingOnce(t, w, 10*time.Millisecond)
-				w.cachedNow = time.Now().UnixNano()
+				w.cachedNow = mono.Now()
 				w.drainPendingRelease()
 			}
 			if len(w.pendingRelease) != 1 || w.pendingRelease[0].cs != cs || w.pendingRelease[0].holdsFD || cs.kernelInflight == 0 || cs.fd != fd {

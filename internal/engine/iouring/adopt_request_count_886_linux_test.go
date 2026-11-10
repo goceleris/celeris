@@ -4,6 +4,7 @@ package iouring
 
 import (
 	"bufio"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,8 +19,9 @@ import (
 // replayed in place of a recv, and the replay is that recv event. The rule
 // these tests pin, for every replay path (sync, async served inline, async
 // promoted, a replay that ends on a verdict): a replay of a non-empty carry
-// counts one, and an adoption with an empty carry counts none, as no recv
-// has happened. Each test adopts one conn onto a fresh engine, so the count
+// counts one, except one that is an h2c upgrade request (none, as on the
+// recv path, item 23), and an adoption with an empty carry counts none, as no
+// recv has happened. Each test adopts one conn onto a fresh engine, so the count
 // after it is the count of that adoption.
 
 // expectCount886 waits until RequestCount reaches want and then holds for
@@ -57,7 +59,19 @@ func adoptCount886(t *testing.T, e *Engine, carried string) (clientReader *bufio
 		_ = unix.Close(fd)
 		t.Fatalf("AdoptConn: %v", err)
 	}
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
 	return bufio.NewReader(client)
+}
+
+// expectUpgradeAnswered886 reads the 101 of an h2c upgrade off the client: the
+// replay has then run to its verdict, so a count it was going to make has been
+// made. Without it expectCount886 can return, with 0, before the replay ran.
+func expectUpgradeAnswered886(t *testing.T, br *bufio.Reader) {
+	t.Helper()
+	status, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(status, " 101 ") {
+		t.Fatalf("the upgrade request was answered %q (err %v), want a 101", status, err)
+	}
 }
 
 func TestIouringAdoptRequestCountSync886(t *testing.T) {
@@ -103,20 +117,22 @@ func TestIouringAdoptRequestCountEmptyCarry886(t *testing.T) {
 	expectCount886(t, e, 0)
 }
 
-// A carry that is an h2c upgrade request counts one like any other non-empty
-// carry. The recv path does not: it returns on the upgrade verdict before it
-// counts, so a conn that upgraded on a recv has counted none (celeris#886
-// item 5, open question in the PR that added these). The tests pin the
-// replay's answer so that it cannot drift unnoticed, whichever way the
-// question is settled.
+// A carry that is an h2c upgrade request counts none, as the recv path counts
+// none for the request that upgrades the conn (it returns on the upgrade
+// verdict before it counts) and as an HTTP/2 conn counts no request on
+// either path (celeris#886 item 23: the replay counted one, the recv path
+// none, and the rule picked is the recv path's, so that BytesPerReq does not
+// move by one request per upgraded conn depending on how the conn arrived).
 func TestIouringAdoptRequestCountUpgradeCarry886(t *testing.T) {
 	e, _ := start908(t, false, true) // EnableH2Upgrade: the carry is a real upgrade
-	adoptCount886(t, e, h2cUpgradeHead908())
-	expectCount886(t, e, 1)
+	br := adoptCount886(t, e, h2cUpgradeHead908())
+	expectUpgradeAnswered886(t, br)
+	expectCount886(t, e, 0)
 }
 
 func TestIouringAdoptRequestCountUpgradeCarryAsync886(t *testing.T) {
 	e, _ := start908(t, true, true) // EnableH2Upgrade: the carry is a real upgrade
-	adoptCount886(t, e, h2cUpgradeHead908())
-	expectCount886(t, e, 1)
+	br := adoptCount886(t, e, h2cUpgradeHead908())
+	expectUpgradeAnswered886(t, br)
+	expectCount886(t, e, 0)
 }

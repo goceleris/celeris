@@ -107,15 +107,66 @@ func asBytes(v any) ([]byte, error) {
 	}
 }
 
-// run acquires a conn, runs fn with it, and releases the conn. On ctx
-// cancellation or context deadline the conn is discarded because the server
-// may still send a stale reply.
+// opTimeout is the per-operation bound of the client: Config.Timeout, the default
+// (3 s) when it is zero, none when it is negative.
+func (c *Client) opTimeout() time.Duration {
+	t := c.cfg.Timeout
+	if t == 0 {
+		t = defaultTimeout
+		if h := testHookDefaultOpTimeout.Load(); h != nil {
+			t = *h
+		}
+	}
+	return max(t, 0)
+}
+
+// opLimit works out the per-operation limit of one command (celeris#1218), as a
+// value: no context is built, so a command pays no allocation for it. It returns
+// the timeout and the time it ends, or zero values when the command is not limited
+// by it: the timeout is off, or the caller's deadline is not later than it (the
+// caller's deadline then ends the command, and its error is the caller's).
+func (c *Client) opLimit(ctx context.Context) (timeout time.Duration, deadline time.Time) {
+	t := c.opTimeout()
+	if t == 0 {
+		return 0, time.Time{}
+	}
+	dl := time.Now().Add(t)
+	if cdl, ok := ctx.Deadline(); ok && !cdl.After(dl) {
+		return 0, time.Time{}
+	}
+	return t, dl
+}
+
+// beginOp puts the per-operation limit on conn for one command and, for a direct
+// conn (which waits in a socket read that does not look at a context), arms the wake
+// of its read on the end of a cancellable ctx (armWake). A ctx that cannot be
+// cancelled costs nothing; a cancellable one costs context.AfterFunc's two
+// allocations. Pair it with endOp, after opError.
+func (c *Client) beginOp(ctx context.Context, conn *memcachedConn) {
+	conn.opTimeout, conn.opDeadline = c.opLimit(ctx)
+	if conn.useDirect && ctx.Done() != nil {
+		conn.armWake(ctx)
+	}
+}
+
+// endOp ends the limit of the command that ran on conn and disarms the wake.
+func endOp(conn *memcachedConn) {
+	conn.disarmWake()
+	conn.opTimeout, conn.opDeadline = 0, time.Time{}
+}
+
+// run acquires a conn, runs fn with it, and releases the conn. fn runs under the
+// per-operation timeout (beginOp); acquiring the conn does not (a new conn has its
+// own DialTimeout). On ctx cancellation or context deadline the conn is discarded
+// because the server may still send a stale reply.
 func (c *Client) run(ctx context.Context, fn func(ctx context.Context, conn *memcachedConn) error) error {
 	conn, err := c.pool.acquire(ctx, workerFromCtx(ctx))
 	if err != nil {
 		return err
 	}
-	ferr := fn(ctx, conn)
+	c.beginOp(ctx, conn)
+	ferr := conn.opError(ctx, fn(ctx, conn))
+	endOp(conn)
 	if ferr != nil && (errors.Is(ferr, context.Canceled) || errors.Is(ferr, context.DeadlineExceeded)) {
 		c.pool.discard(conn)
 		return ferr
@@ -851,7 +902,9 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	perr := conn.Ping(ctx)
+	c.beginOp(ctx, conn)
+	perr := conn.opError(ctx, conn.Ping(ctx))
+	endOp(conn)
 	if perr != nil {
 		if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
 			c.pool.discard(conn)

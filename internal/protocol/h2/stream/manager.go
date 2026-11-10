@@ -3,6 +3,7 @@ package stream
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Manager manages multiple HTTP/2 streams.
@@ -20,8 +21,14 @@ type Manager struct {
 	maxFrameSize            uint32 // peer's SETTINGS_MAX_FRAME_SIZE (caps what WE send)
 	localMaxFrameSize       uint32 // our advertised SETTINGS_MAX_FRAME_SIZE (caps what PEER sends us)
 	initialWindowSize       uint32
+	initWin                 atomic.Uint32 // initialWindowSize for readers that hold no lock (write_deadline.go)
 	activeStreams           atomic.Uint32
-	headerTableSize         uint32 // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
+	requestOpen             atomic.Uint32
+	hints                   *DeadlineHints
+	ownHints                DeadlineHints
+	reqTimeout              time.Duration
+	wrTimeout               time.Duration // the write deadline (SetWriteTimeout)
+	headerTableSize         uint32        // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
 	pendingConnWindowUpdate uint32
 	pendingStreamUpdates    map[uint32]uint32
 	windowUpdateMu          sync.Mutex
@@ -32,13 +39,27 @@ type Manager struct {
 	// outboundHeld counts the bytes the connection's streams hold in their
 	// OutboundBuffers, waiting for the peer's window; sendWindowWaiters the
 	// pool handlers waiting in AwaitSendWindow for a window to open, and
-	// sendWindowCh the channel that wakes them, closed and replaced under
-	// sendWindowMu (a leaf lock) by notifySendWindow (celeris#893,
-	// outbound.go).
+	// sendWaiters those handlers, each with the channel that wakes it alone,
+	// guarded by sendWindowMu (a leaf lock; notifyStreamWindow,
+	// notifyOpenStreamWindows; celeris#893, outbound.go).
 	outboundHeld      atomic.Int64
 	sendWindowWaiters atomic.Int32
 	sendWindowMu      sync.Mutex
-	sendWindowCh      chan struct{}
+	sendWaiters       []*sendWaiter
+
+	// The write deadline's books (write_deadline.go): a record per stream that
+	// holds buffered bytes, in stalls, guarded by stallMu; stallN is how many, for
+	// a load on the paths that have none; connReleased is the bytes of DATA the
+	// connection released while a stream was stalled (ReserveSendWindow).
+	stallMu sync.Mutex
+	stalls  map[uint32]*stall
+	stallN  atomic.Int32
+	// connHigh is the highest the connection window has been since it was last
+	// raised by the peer: connHigh less the window now is the bytes in flight on the
+	// connection, sent and not yet granted back (connInFlight, write_wait.go). Beside
+	// stallN, in the padding before connReleased: the Manager stays in its size class.
+	connHigh     atomic.Int32
+	connReleased atomic.Int64
 
 	// retired holds the pool-handler streams whose handler has returned and
 	// which are out of the map, waiting for the event loop to return them to
@@ -55,9 +76,13 @@ type Manager struct {
 	drainBuf []*Stream
 
 	// placeholders counts the streams in the map that are PRIORITY placeholders
-	// (flagPlaceholder, CreatePlaceholder); guarded by mu. Last in the struct: the
-	// per-request fields keep their offsets.
-	placeholders int
+	// (flagPlaceholder, CreatePlaceholder), and placeholderIDs[:placeholders]
+	// are their identifiers, so that finding the ones that can never open
+	// (reapPassedPlaceholdersLocked) scans at most
+	// maxPriorityPlaceholders entries and not the map; guarded by mu. Last in
+	// the struct: the per-request fields keep their offsets.
+	placeholders   int
+	placeholderIDs [maxPriorityPlaceholders]uint32
 }
 
 // NewManager creates a new stream manager. Auxiliary maps
@@ -66,7 +91,7 @@ type Manager struct {
 // single default-priority stream (e.g. an h2c upgrade that closes right
 // after the response) they stay nil and save three map allocations.
 func NewManager() *Manager {
-	return &Manager{
+	m := &Manager{
 		streams:           make(map[uint32]*Stream),
 		nextStreamID:      1,
 		connectionWindow:  65535,
@@ -79,6 +104,10 @@ func NewManager() *Manager {
 		initialWindowSize: 65535,
 		headerTableSize:   4096, // RFC 7540 §6.5.2 default
 	}
+	m.hints = &m.ownHints
+	m.initWin.Store(65535)
+	m.connHigh.Store(65535)
+	return m
 }
 
 // SetLocalMaxFrameSize records the SETTINGS_MAX_FRAME_SIZE we advertised to
@@ -124,7 +153,8 @@ func (m *Manager) CreateStream(id uint32) *Stream {
 // 5.3.2 deprecates it); x/net's priority write scheduler keeps at most ten idle
 // nodes (MaxIdleNodesInTree, its default, discarding the oldest). A Stream
 // costs about 1.2 KB, and a peer pays 14 bytes of wire for each, so the number
-// is small. Past it a PRIORITY frame is ignored.
+// is small. Past it a PRIORITY frame is ignored, unless some of them can never
+// open (CreatePlaceholder).
 const maxPriorityPlaceholders = 16
 
 // CreatePlaceholder creates the idle stream a PRIORITY frame on a stream the
@@ -132,18 +162,35 @@ const maxPriorityPlaceholders = 16
 // maxPriorityPlaceholders; it reports false, and creates nothing, past that.
 // A stream that is in the map already is returned as it is.
 //
+// At the bound, the placeholders the last client stream has passed are
+// reaped first (reapPassedPlaceholdersLocked): an identifier at or below the
+// highest the peer has used is a closed stream's, and HEADERS on it is a
+// connection error (RFC 9113 section 5.1.1), so such a placeholder can never
+// open and would hold its slot, with its entry in the priority tree, until the
+// connection closes. 16 of them made every later PRIORITY frame on an idle
+// stream be ignored on a long-lived connection (priority is advisory, section
+// 5.3.2, but a client that builds its tree late loses it). The scan is of the
+// at most 16 identifiers kept for it, never of the map; a connection whose
+// placeholders are all live pays that once per PRIORITY frame past the bound.
+//
 // A placeholder is no stream the server has opened: it is not counted against
 // SETTINGS_MAX_CONCURRENT_STREAMS, the last client stream does not move, and
 // neither does the highest stream ID (GetLastStreamID), which a GOAWAY names.
 // TryOpenStream replaces it when HEADERS arrive on its identifier.
 func (m *Manager) CreatePlaceholder(id uint32) (*Stream, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if s, ok := m.streams[id]; ok {
+		m.mu.Unlock()
 		return s, true
 	}
+	var reaped [maxPriorityPlaceholders]*Stream
+	nreaped := 0
 	if m.placeholders >= maxPriorityPlaceholders {
-		return nil, false
+		nreaped = m.reapPassedPlaceholdersLocked(&reaped)
+		if m.placeholders >= maxPriorityPlaceholders { // nothing freed, not even a stale identifier
+			m.mu.Unlock()
+			return nil, false
+		}
 	}
 	s := NewStream(id)
 	s.manager = m
@@ -152,15 +199,59 @@ func (m *Manager) CreatePlaceholder(id uint32) (*Stream, bool) {
 	s.SetWindowSize(int32(m.initialWindowSize))
 	s.flags.Or(flagPlaceholder)
 	m.streams[id] = s
+	m.placeholderIDs[m.placeholders] = id
 	m.placeholders++
+	m.mu.Unlock()
+	// The reaped ones go back to the pool after the unlock, as afterTake's
+	// does (Release takes the stream's own lock).
+	for _, r := range reaped[:nreaped] {
+		r.Release()
+	}
 	return s, true
+}
+
+// reapPassedPlaceholdersLocked takes out of the map, and out of the priority
+// tree, the placeholders whose identifier is at or below the last client
+// stream, stores them in out and returns how many. The caller releases them
+// after it unlocks. m.mu must be held. Stale identifiers it forgets free a
+// slot without being returned.
+func (m *Manager) reapPassedPlaceholdersLocked(out *[maxPriorityPlaceholders]*Stream) int {
+	last := m.lastClientStream.Load()
+	n := 0
+	for i := 0; i < m.placeholders; {
+		id := m.placeholderIDs[i]
+		if id > last {
+			i++
+			continue
+		}
+		// The map decides what is taken: the entry must still be the idle
+		// placeholder the books say it is. An identifier whose entry is gone, or
+		// is another stream's (CreateStream overwrites without asking), is only
+		// forgotten here: releasing a live stream is the failure of celeris#950.
+		if s := m.streams[id]; s != nil && s.flags.Load()&flagPlaceholder != 0 && s.GetState() == StateIdle {
+			out[n] = s
+			n++
+			delete(m.streams, id)
+			m.priorityTree.RemoveStream(id)
+		}
+		m.placeholders--
+		m.placeholderIDs[i] = m.placeholderIDs[m.placeholders] // the last takes its place: look at it next
+	}
+	return n
 }
 
 // dropPlaceholderLocked uncounts s if it is a placeholder that leaves the
 // map. m.mu must be held.
 func (m *Manager) dropPlaceholderLocked(s *Stream) {
-	if s.flags.Load()&flagPlaceholder != 0 && m.placeholders > 0 {
-		m.placeholders--
+	if s.flags.Load()&flagPlaceholder == 0 {
+		return
+	}
+	for i := 0; i < m.placeholders; i++ {
+		if m.placeholderIDs[i] == s.ID {
+			m.placeholders--
+			m.placeholderIDs[i] = m.placeholderIDs[m.placeholders]
+			return
+		}
 	}
 }
 
@@ -215,6 +306,7 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 		m.lastClientStream.Store(id)
 	}
 	m.activeStreams.Add(1)
+	m.requestOpen.Add(1)
 	m.mu.Unlock()
 
 	if replaced != nil {
@@ -303,7 +395,12 @@ func (m *Manager) takeLocked(id uint32, s *Stream) (release bool) {
 	prev := State(s.state.Swap(int32(StateClosed)))
 	m.updateActiveCount(prev, StateClosed)
 	m.dropPlaceholderLocked(s)
-	return s.flags.Load()&flagAsyncRunning == 0
+	m.dropStall(id)
+	f := s.flags.Load()
+	if f&flagReqDeadline != 0 {
+		m.disarmRequestLocked(s)
+	}
+	return f&flagAsyncRunning == 0
 }
 
 // afterTake finishes what takeLocked began, after m.mu is released: it drops
@@ -350,6 +447,7 @@ func (m *Manager) RemoveStreamFromMap(id uint32) {
 	delete(m.streams, id)
 	m.priorityTree.RemoveStream(id)
 	m.mu.Unlock()
+	m.dropStall(id)
 
 	m.windowUpdateMu.Lock()
 	delete(m.pendingStreamUpdates, id)
@@ -400,6 +498,7 @@ func (m *Manager) retire(s *Stream) {
 		s.OutboundBuffer = nil
 	}
 	id := s.ID
+	m.dropStall(id)
 	// The request is dropped now, not at the loop's next batch: a detached
 	// Context that reads the stream meanwhile sees nothing, as it did when
 	// this goroutine reset the stream (celeris#904), and a connection that
@@ -486,7 +585,7 @@ func (m *Manager) GetLastClientStreamID() uint32 {
 
 // UpdateConnectionWindow atomically updates the connection-level flow control window.
 func (m *Manager) UpdateConnectionWindow(delta int32) {
-	atomic.AddInt32(&m.connectionWindow, delta)
+	m.noteConnWindow(atomic.AddInt32(&m.connectionWindow, delta))
 }
 
 // GetConnectionWindow atomically returns the current connection window size.
@@ -499,26 +598,73 @@ func (m *Manager) CountActiveStreams() int {
 	return int(m.activeStreams.Load())
 }
 
-// updateActiveCount adjusts activeStreams atomically when a stream transitions
-// between active and inactive states. No locks required.
+// ServerOwes reports whether the connection has a stream open and the client
+// owes the server nothing: every open stream has a whole request
+// (HalfClosedRemote), and no response is waiting for the client's window. That
+// is the exemption from ReadTimeout and IdleTimeout the engines' sweep gives a
+// conn with a stream open (celeris#889), for a stream the SERVER is writing to
+// (an SSE stream) whose client sends no frame. A client that owes the server
+// something, the rest of a request or the WINDOW_UPDATE a response is waiting
+// for, and sends nothing, is the silence ReadTimeout is for, so it is not
+// exempt.
+//
+// requestOpen counts the streams whose request is not whole (Open and
+// HalfClosedLocal), activeStreams all that are open; both move together in
+// updateActiveCount, the one place a stream's state change reaches them. With
+// a request deadline (SetRequestTimeout) the streams whose request is not whole
+// are bounded one by one (ArmRequest, ExpiredRequests), and requestOpen is not
+// consulted: while it was, a quiet client got the WHOLE connection closed, the
+// streams the server was answering included, where the deadline resets one.
+// outboundHeld is the bytes the streams hold buffered for the peer's window
+// (charged and refunded where the buffer fills, drains, and is dropped with its
+// stream), sendWindowWaiters the pool handlers waiting for a window in
+// AwaitSendWindow. With a write deadline (WriteTimeout > 0) neither exempts the
+// connection from nothing: a stream whose response waits for the peer's window,
+// buffered or held by a pool handler, is bounded by its own minimum rate
+// (write_deadline.go, write_wait.go), and the connection is exempt while it
+// lives, as for a buffered tail since celeris#889 (A2 retired), and subject to
+// the connection's clocks once it is gone (celeris#1170). Without one (WriteTimeout
+// <= 0) a response that waits is not exempt, as before. Atomic loads, no scan; safe
+// from any goroutine.
+func (m *Manager) ServerOwes() bool {
+	return m.activeStreams.Load() > 0 &&
+		(m.reqTimeout > 0 || m.requestOpen.Load() == 0) &&
+		(m.wrTimeout > 0 || (m.outboundHeld.Load() == 0 && m.sendWindowWaiters.Load() == 0))
+}
+
+// updateActiveCount adjusts activeStreams, and requestOpen, atomically when a
+// stream transitions between states. No locks required.
 func (m *Manager) updateActiveCount(prev State, next State) {
 	wasActive := prev == StateOpen || prev == StateHalfClosedLocal || prev == StateHalfClosedRemote
 	isActive := next == StateOpen || next == StateHalfClosedLocal || next == StateHalfClosedRemote
-	if wasActive == isActive {
-		return
+	if wasActive != isActive {
+		if isActive {
+			m.activeStreams.Add(1)
+		} else {
+			lowerCount(&m.activeStreams)
+		}
 	}
-	if isActive {
-		m.activeStreams.Add(1)
-	} else {
-		// Guard against underflow from duplicate transitions.
-		for {
-			old := m.activeStreams.Load()
-			if old == 0 {
-				return
-			}
-			if m.activeStreams.CompareAndSwap(old, old-1) {
-				return
-			}
+	wasReq := prev == StateOpen || prev == StateHalfClosedLocal
+	isReq := next == StateOpen || next == StateHalfClosedLocal
+	if wasReq != isReq {
+		if isReq {
+			m.requestOpen.Add(1)
+		} else {
+			lowerCount(&m.requestOpen)
+		}
+	}
+}
+
+// lowerCount decrements c, guarding against underflow from duplicate
+// transitions.
+func lowerCount(c *atomic.Uint32) {
+	for {
+		old := c.Load()
+		if old == 0 {
+			return
+		}
+		if c.CompareAndSwap(old, old-1) {
+			return
 		}
 	}
 }
@@ -565,6 +711,7 @@ func (m *Manager) ApplySetting(id uint16, val uint32) {
 		}
 		m.mu.Lock()
 		m.initialWindowSize = val
+		m.initWin.Store(val)
 		m.mu.Unlock()
 	case 0x5: // MAX_FRAME_SIZE
 		if val < 16384 || val > 16777215 {
@@ -672,6 +819,7 @@ func (m *Manager) Close() {
 	// that returns from here on releases its stream itself (retire).
 	m.closed = true
 	m.placeholders = 0
+	m.dropAllStalls()
 	retired := m.retired
 	m.retired = nil
 	m.hasRetired.Store(false)
@@ -685,4 +833,114 @@ func (m *Manager) Close() {
 		clear(m.pendingStreamUpdates)
 	}
 	m.windowUpdateMu.Unlock()
+}
+
+// SetRequestTimeout sets the request deadline (the server's ReadTimeout): a
+// stream whose request is not whole that long after its HEADERS is expired by
+// ExpiredRequests. 0 turns it off. Set once, before the first frame.
+func (m *Manager) SetRequestTimeout(d time.Duration) { m.reqTimeout = clampTimeout(d) }
+
+// RequestTimeout is the deadline SetRequestTimeout set.
+func (m *Manager) RequestTimeout() time.Duration { return m.reqTimeout }
+
+// ArmRequest starts the request deadline of s, a stream just opened by a HEADERS
+// frame without END_STREAM, at now (nanoseconds, internal/mono). Absolute: it is
+// not moved by the stream's DATA or by anything else. The instant is kept in
+// s.StartTimeNs, unused on HTTP/2 (the engines' cache of a recv's clock, which
+// only HTTP/1 fills), and the flag marks that it is there; the manager keeps
+// the earliest deadline as a hint the engines' sweep reads with one atomic load
+// (the armed streams are found by walking the map when it is due). No allocation, no lock: it runs on the loop thread
+// under H2State.mu, and the request has no handler yet (the handler runs once the
+// request is whole). A request whole at its HEADERS never gets here.
+func (m *Manager) ArmRequest(s *Stream, now int64) {
+	if m.reqTimeout <= 0 {
+		return
+	}
+	s.StartTimeNs = now
+	s.flags.Or(flagReqDeadline)
+	dl := now + int64(m.reqTimeout)
+	for {
+		cur := m.hints.ReqDL.Load()
+		if cur != 0 && cur <= dl {
+			return
+		}
+		if m.hints.ReqDL.CompareAndSwap(cur, dl) {
+			return
+		}
+	}
+}
+
+// DisarmRequest ends the request deadline of s because its request is whole (its
+// END_STREAM, on DATA or on trailers). StartTimeNs goes back to 0, which the
+// handler's latency reads as "unset" (handler.go): an h2 request's latency does
+// not include its upload. A stream that never armed pays one load of its flags.
+// The hint is left as it was (a stale hint costs one scan, once).
+func (m *Manager) DisarmRequest(s *Stream) {
+	if s.flags.Load()&flagReqDeadline == 0 {
+		return
+	}
+	s.StartTimeNs = 0
+	s.flags.And(^flagReqDeadline)
+}
+
+// disarmRequestLocked is DisarmRequest for a stream leaving the map (takeLocked,
+// handleGoAway), with m.mu held.
+func (m *Manager) disarmRequestLocked(s *Stream) { m.DisarmRequest(s) }
+
+// NextRequestDeadline is the earliest deadline of an armed request, or 0 if none
+// is armed (or the hint is stale after a disarm: ExpiredRequests settles it).
+// One atomic load; the engines' sweep reads it for every h2 conn.
+func (m *Manager) NextRequestDeadline() int64 { return m.hints.ReqDL.Load() }
+
+// DeadlineHints are the words the engines' sweep reads for an h2 connection:
+// the earliest request deadline, the earliest end of an expired request's memory,
+// the deadline of the pending header block. One struct, so that the sweep's look
+// at a connection that has nothing due is one cache line (the conn layer embeds
+// it in H2State, beside the sweep's own state, and points the manager at it:
+// SetHints); a manager built alone (tests) uses its own. 0 means none.
+type DeadlineHints struct {
+	ReqDL  atomic.Int64
+	TombDL atomic.Int64
+	HdrDL  atomic.Int64
+	WrDL   atomic.Int64 // the earliest end of a stalled stream's write window
+}
+
+// SetHints points the manager (and the processor that owns it) at h, which the
+// conn layer keeps beside the sweep's state. Before the first frame.
+func (m *Manager) SetHints(h *DeadlineHints) { m.hints = h }
+
+// ExpiredRequests appends to out, up to its capacity, the IDs of the streams
+// whose request deadline has passed at now, and settles the hint to the earliest
+// deadline of those that have not. Called by the loop thread under H2State.mu
+// when NextRequestDeadline says one is due; it walks the stream map under m.mu
+// (at most MAX_CONCURRENT_STREAMS entries), which happens once per deadline, not
+// once per sweep. If out is full the hint is left due, so the next sweep takes
+// the rest.
+func (m *Manager) ExpiredRequests(now int64, out []uint32) []uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var next int64
+	full := false
+	for id, s := range m.streams {
+		if s.flags.Load()&flagReqDeadline == 0 {
+			continue
+		}
+		dl := s.StartTimeNs + int64(m.reqTimeout)
+		if dl > now {
+			if next == 0 || dl < next {
+				next = dl
+			}
+			continue
+		}
+		if len(out) == cap(out) {
+			full = true
+			continue
+		}
+		out = append(out, id)
+	}
+	if full {
+		next = now // due again at the next sweep
+	}
+	m.hints.ReqDL.Store(next)
+	return out
 }

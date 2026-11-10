@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/mono"
 )
 
 // The post-switch sweep (celeris#657, face 1).
@@ -135,7 +136,7 @@ func (l *Loop) sweepWaitMs() int {
 	if l.sweepDormant || len(l.liveConns) == 0 {
 		return -1
 	}
-	d := (l.sweepNext - time.Now().UnixNano() + int64(time.Millisecond) - 1) / int64(time.Millisecond)
+	d := (l.sweepNext - mono.Now() + int64(time.Millisecond) - 1) / int64(time.Millisecond)
 	if d < 0 {
 		d = 0
 	}
@@ -244,7 +245,7 @@ func (l *Loop) sweep() {
 		}
 		return
 	}
-	now := time.Now().UnixNano()
+	now := mono.Now()
 	if now < l.sweepNext {
 		return
 	}

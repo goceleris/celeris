@@ -1,6 +1,7 @@
 package sse
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -83,4 +84,17 @@ func BenchmarkSendDropFullQueue(b *testing.B) {
 	if err := handler(ctx); err != nil {
 		b.Fatal(err)
 	}
+}
+
+// wrapRing888 is a ReplayStore that wraps a ring and forwards each Append: the
+// shape of a metrics or logging decorator (celeris#888 item 24). On main the
+// ring copies a queued event a second time behind it.
+type wrapRing888 struct{ ReplayStore }
+
+func (w wrapRing888) Append(ctx context.Context, e Event) (string, error) {
+	return w.ReplayStore.Append(ctx, e)
+}
+
+func BenchmarkSendBurstQueuedWrapRing888(b *testing.B) {
+	benchSendBurst732(b, Config{MaxQueueDepth: 2 * burst732, ReplayStore: wrapRing888{NewRingBuffer(1024)}})
 }

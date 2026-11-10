@@ -168,9 +168,12 @@ func WithBasicAuth(user, pass string) Option {
 	return WithHeader("authorization", "Basic "+encoded)
 }
 
-// WithCookie adds a cookie to the request. Name and value are joined as
-// "name=value" and concatenated with "; " between cookies, matching the
-// Cookie header wire format. This helper does not escape semicolons or
+// WithCookie adds a cookie to the request. A request built with several
+// cookie fields (WithCookie, and WithHeader("cookie", ...)) reaches the handler
+// as one field joined with "; ", as the engines deliver it, so Header("cookie")
+// returns them all. Name and value are joined as "name=value" and
+// concatenated with "; " between cookies, matching the Cookie header wire
+// format. This helper does not escape semicolons or
 // CR/LF inside value — tests should pass well-formed values only. If a
 // test needs to exercise the server's handling of malformed cookie
 // headers, set the raw "cookie" header via [WithHeader] instead.
@@ -290,14 +293,21 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 		[2]string{":scheme", "http"},
 		[2]string{":authority", "localhost"},
 	)
-	s.Headers = append(s.Headers, cfg.headers...)
+	// Several cookie fields (WithHeader("cookie", ...) and WithCookie each
+	// add one) reach the handler as one field joined with "; ", as the engines
+	// deliver a request (stream.AppendRequestField).
+	var cj stream.CookieJoiner
+	for _, h := range cfg.headers {
+		s.Headers = cj.Append(s.Headers, h[0], h[1])
+	}
 	if len(cfg.cookies) > 0 {
 		parts := make([]string, 0, len(cfg.cookies))
 		for _, kv := range cfg.cookies {
 			parts = append(parts, kv[0]+"="+kv[1])
 		}
-		s.Headers = append(s.Headers, [2]string{"cookie", strings.Join(parts, "; ")})
+		s.Headers = cj.Append(s.Headers, "cookie", strings.Join(parts, "; "))
 	}
+	cj.Finish(s.Headers)
 	if len(cfg.body) > 0 {
 		s.GetBuf().Write(cfg.body)
 	}

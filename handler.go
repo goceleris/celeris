@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/validation"
 )
@@ -129,15 +130,15 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	// time.Now() vDSO. Falls back to time.Now() for synthetic / std-engine
 	// streams that didn't go through populateCachedStream.
 	if s.StartTimeNs != 0 {
-		// Defer the time.Unix conversion: store the raw ns and only
-		// materialize a time.Time when c.StartTime() is actually called
-		// (rare — the per-request hot path only needs ns for the duration
-		// computation in recoverAndRelease).
+		// Store the raw stamp (internal/mono's clock) and only materialize a
+		// time.Time (mono.Time) when c.StartTime() is actually called (rare — the
+		// per-request hot path only needs the stamp for the duration computation
+		// in recoverAndRelease).
 		c.startTimeNs = s.StartTimeNs
 	} else {
 		t := time.Now()
 		c.startTime = t
-		c.startTimeNs = t.UnixNano()
+		c.startTimeNs = mono.FromTime(t) // t is the clock read above: no second read
 	}
 	c.trustedNets = a.server.trustedNets
 
@@ -280,7 +281,45 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 		c.bufferDepth = 1
 		_ = c.FlushResponse()
 	}
+	// A handler that returned without answering is answered with an empty 200,
+	// as net/http does and as the unmatched paths below do, including one that
+	// took a StreamWriter and never used it (celeris#889). The native HTTP/1
+	// engines would otherwise send nothing, and the next response on the
+	// connection would be read as this request's. Only their writer asks for it
+	// (the std engine's net/http answers by itself, HTTP/2's processor answers a
+	// stream that sent no headers). A detached or hijacked request answers for
+	// itself (hijack marks the response written).
+	if !c.detached && s.ResponseWriter != nil && (!c.written || c.reclaimUnusedStreamWriter()) {
+		if _, ok := s.ResponseWriter.(interface{ NeedsEmptyAnswer() }); ok {
+			c.statusCode = 200
+			_ = s.ResponseWriter.WriteResponse(s, 200, emptyAnswerHeaders(c, s.Method == "HEAD"), nil)
+			c.written = true
+		}
+	}
 	return nil
+}
+
+// emptyAnswerHeaders is the header list of an empty answer given for a handler
+// that sent none: the headers it set, and a content-length that agrees with
+// the empty body: 0. A content-length of its own is dropped, as two differing
+// ones are a framing error (RFC 9112 section 6.3); a HEAD keeps the size its
+// handler declared for a GET (RFC 9110 section 9.3.2), with no second one.
+func emptyAnswerHeaders(c *Context, head bool) [][2]string {
+	hdrs := make([][2]string, 0, len(c.respHeaders)+1)
+	declared := false
+	for _, h := range c.respHeaders {
+		if strings.EqualFold(h[0], "content-length") {
+			if !head || declared {
+				continue
+			}
+			declared = true
+		}
+		hdrs = append(hdrs, h)
+	}
+	if !declared {
+		hdrs = append(hdrs, [2]string{"content-length", "0"})
+	}
+	return hdrs
 }
 
 // adaptivePromoteThreshold is the inline handler duration that counts as a
@@ -430,10 +469,10 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 		if status == 0 {
 			status = 200
 		}
-		// Use the raw int64 ns. time.Since on a time.Unix-constructed
-		// time.Time falls back to wall-clock subtraction; this saves the
-		// detour through time.Time.Sub.
-		duration := time.Duration(time.Now().UnixNano() - c.startTimeNs)
+		// Use the raw stamp: the difference of two readings of internal/mono's
+		// clock, which a step of the wall clock does not move (celeris#1178).
+		// This saves the detour through a time.Time.
+		duration := time.Duration(mono.Now() - c.startTimeNs)
 		a.server.collector.RecordRequestSharded(uint32(c.workerID), duration, status)
 	}
 	releaseContext(c)
@@ -474,13 +513,30 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 		// No 500 can follow a response that is under way: tell the HTTP/2
 		// processor that a streamed one is broken off, so it resets the stream
 		// instead of ending it at the handler's return (celeris#889).
-		s.FailResponse()
+		failResponse(c, s)
+	}
+}
+
+// failResponse tells the engine that a streamed response under way was broken
+// off by its handler, with the failure swallowed here: on HTTP/2 the processor
+// resets the stream (Stream.FailResponse), on HTTP/1 the native engines close
+// the connection without the last chunk (the writer's FailResponse). Neither
+// may end the response as if it were whole: a truncated body must not look
+// complete. A detached request's writer belongs to its goroutine and is not
+// touched.
+func failResponse(c *Context, s *stream.Stream) {
+	s.FailResponse()
+	if c.detached {
+		return
+	}
+	if f, ok := s.ResponseWriter.(interface{ FailResponse() }); ok {
+		f.FailResponse()
 	}
 }
 
 func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 	var allowed []string
-	if c.method == "OPTIONS" {
+	if c.method == "OPTIONS" && !a.server.router.noAutoOPTIONS {
 		// celeris#421: a path with routes but no OPTIONS route is answered
 		// with what it allows (OPTIONS included). That list is never empty
 		// for a routed path, so an empty one means the path has no route at
@@ -567,11 +623,8 @@ func (a *routerAdapter) answerOptions(c *Context, s *stream.Stream, allowVal str
 	}
 	if !c.written && !c.detached && s.ResponseWriter != nil {
 		// A middleware returned without writing and without calling Next.
-		hdrs := make([][2]string, 0, len(c.respHeaders)+1)
-		hdrs = append(hdrs, c.respHeaders...)
-		hdrs = append(hdrs, [2]string{"content-length", "0"})
 		c.statusCode = 200
-		_ = s.ResponseWriter.WriteResponse(s, 200, hdrs, nil)
+		_ = s.ResponseWriter.WriteResponse(s, 200, emptyAnswerHeaders(c, false), nil)
 		c.written = true
 	}
 }
@@ -589,7 +642,7 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 		// streamed one that ends here would be taken for whole by the HTTP/2
 		// processor, which ends a response its handler did not close
 		// (celeris#889): tell it the response is broken off.
-		s.FailResponse()
+		failResponse(c, s)
 		return
 	}
 	if a.errorHandler != nil {
@@ -639,7 +692,7 @@ func (a *routerAdapter) HasAsyncRoutes() bool {
 	return a.server.router.hasAsyncRoutes()
 }
 
-// AsyncRouteCount returns the number of routes registered with .Async(true).
+// AsyncRouteCount returns the number of routes registered with .Async() or .UsesDriver().
 // Engines expose this through Metrics().AsyncRoutes for diagnostics.
 func (a *routerAdapter) AsyncRouteCount() int {
 	return a.server.router.asyncRouteCount

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -175,33 +176,35 @@ func firstReply889(t *testing.T, addr, wire string) []byte {
 // other starters here decide it is ready).
 func startTCPReady889(t *testing.T, cfg celeris.Config) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	cfg.Addr = addr
-	s := celeris.New(cfg)
-	s.GET("/h", func(c *celeris.Context) error { return c.String(http.StatusOK, "h1-answer") })
-	done := make(chan error, 1)
-	go func() { done <- s.Start() }()
-	for i := 0; ; i++ {
-		select {
-		case err := <-done:
-			t.Fatalf("Start returned before the listener was up: %v", err)
-		default:
+	// An io_uring Start can fail with ring-setup ENOMEM under the runner's
+	// 8 MiB memlock while earlier rings are still charged: startPicked1104
+	// retries it, and keeps the port from the pick to the bind (celeris#1104).
+	s, addr, done := startPicked1104(t, cfg, func(s *celeris.Server) {
+		s.GET("/h", func(c *celeris.Context) error { return c.String(http.StatusOK, "h1-answer") })
+	}, func(s *celeris.Server, addr string, done <-chan error) error {
+		for i := 0; ; i++ {
+			select {
+			case err := <-done:
+				if err == nil {
+					err = errors.New("Start returned nil before the listener was up")
+				}
+				return err
+			default:
+			}
+			// The listener is the server's from the start, so a dial alone proves
+			// nothing: wait for the engine to publish its address, then dial.
+			if s.Addr() != nil {
+				if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+					_ = c.Close()
+					return nil
+				}
+			}
+			if i > 300 {
+				return errors.New("the engine did not publish an address within 15 s")
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		c, err := net.DialTimeout("tcp", addr, time.Second)
-		if err == nil {
-			_ = c.Close()
-			break
-		}
-		if i > 300 {
-			t.Fatalf("not listening: %v", err)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	})
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

@@ -14,6 +14,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/mono"
 	"github.com/goceleris/celeris/internal/resource"
 )
 
@@ -91,7 +92,7 @@ func TestCheckTimeoutsClosesAllExpired(t *testing.T) {
 		bytesWritten: &atomic.Uint64{},
 		cfg:          resource.Config{IdleTimeout: time.Second},
 	}
-	past := time.Now().Add(-time.Hour).UnixNano()
+	past := (mono.Now() + int64(-time.Hour))
 
 	var peers []int
 	t.Cleanup(func() {
@@ -226,7 +227,7 @@ func TestAcceptAllDrainsBacklogNoStrand(t *testing.T) {
 	// Give the kernel a moment to enqueue all the SYNs into the accept queue.
 	deadline := time.Now().Add(2 * time.Second)
 	for len(l.liveConns) < len(clients) && time.Now().Before(deadline) {
-		l.acceptAll(context.Background(), time.Now().UnixNano())
+		l.acceptAll(context.Background(), mono.Now())
 		if l.listenHot {
 			continue
 		}

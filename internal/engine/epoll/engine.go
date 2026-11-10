@@ -18,11 +18,13 @@ import (
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/resource"
+	"github.com/goceleris/celeris/internal/tcpack"
 )
 
 // Engine implements the epoll-based I/O engine.
 type Engine struct {
 	loops        []*Loop
+	loopWatch    *stream.LoopWatch // the loops' stamps, for the pool handlers' wait (celeris#1170)
 	cfg          resource.Config
 	handler      stream.Handler
 	addr         atomic.Pointer[net.Addr]
@@ -91,6 +93,13 @@ type Engine struct {
 	// send drain the loops run when Listen's context is cancelled
 	// (celeris#760; see Loop.drainSends).
 	drainBudget atomic.Pointer[context.Context]
+
+	// shutdownBegun goes up when Shutdown is called (or a loop sees Listen's
+	// context cancelled) and stays up: it is never lowered, so an Engine is not
+	// reusable after Shutdown (a Server builds a new one per Start). Every loop's H1State points at it
+	// (conn.H1State.Shutdown): from then on each HTTP/1 response carries
+	// Connection: close and ends its conn (celeris#884, celeris#885).
+	shutdownBegun atomic.Bool
 }
 
 // portHoldHook is called by Listen with the address a port 0 was resolved
@@ -104,6 +113,11 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	if errs := cfg.Validate(); len(errs) > 0 {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
+
+	// The idle clock of an h2 conn needs to know whether this host reports the
+	// bytes a peer has acknowledged: ask now, in the background, so that the
+	// answer is there long before a sweep needs it (internal/tcpack).
+	tcpack.Start()
 
 	e := &Engine{
 		cfg:     cfg,
@@ -150,7 +164,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	resolved := e.cfg.Resources.Resolve()
 
-	topo := platform.DetectNUMA()
+	topo := detectNUMA()
 	// celeris#909: the CPU of loop i is the i-th member of the process's
 	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
 	// the loop count (celeris#1036): on a big.LITTLE host it holds one loop
@@ -159,15 +173,12 @@ func (e *Engine) Listen(ctx context.Context) error {
 	cpus := plan.CPUs
 	resolved.Workers = len(cpus)
 
-	if topo.NumNodes > 1 {
-		resolved.MaxEvents = resolved.MaxEvents / topo.NumNodes
-		if resolved.MaxEvents < 64 {
-			resolved.MaxEvents = 64
-		}
-	}
+	resolved.MaxEvents = splitMaxEvents(resolved.MaxEvents, topo, plan.Allowed)
 
 	e.mu.Lock()
 	e.loops = make([]*Loop, resolved.Workers)
+	e.loopWatch = stream.NewLoopWatch()
+	e.loopWatch.SetLogger(e.cfg.Logger)
 	for i := range resolved.Workers {
 		l := newLoop(i, cpus[i], e.handler,
 			resolved, e.cfg,
@@ -185,8 +196,11 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l.transplantStranded = &e.metrics.transplantStranded
 		l.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
 		l.sweepCnt = &e.metrics.sweep
+		l.loopSlot = e.loopWatch.Slot()
+		l.h2cfg.LoopWatch = e.loopWatch
 		l.pause = &e.pause
 		l.drainBudget = &e.drainBudget
+		l.shutdownBegun = &e.shutdownBegun
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -265,6 +279,9 @@ func (e *Engine) Listen(ctx context.Context) error {
 // of StartWithContext's context reaches the loops first but the watcher's
 // Shutdown follows at once, within the drain's floor.
 func (e *Engine) Shutdown(ctx context.Context) error {
+	// First: a response written from here on says Connection: close, one a
+	// handler is still writing included (see conn.H1State.Shutdown).
+	e.shutdownBegun.Store(true)
 	e.drainBudget.Store(&ctx)
 	return nil
 }
@@ -342,7 +359,10 @@ func (e *Engine) Type() engine.EngineType {
 
 // BeginPauseAccept starts pausing accept and returns without waiting
 // (celeris#662). Each loop sees the flag at the top of its next iteration,
-// a few milliseconds later at most while it listens. Then, on its own
+// a few milliseconds later at most while it listens (adaptiveTimeoutMs caps
+// the wait at 4 ms; measured 0.8 to 5.9 ms from the call to the closed
+// listener, celeris#886 item 24), which is why it does not signal the wake
+// eventfd, as io_uring's does for its 100 ms ring wait. Then, on its own
 // thread, it clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
 // serving for the linger (about 1.5 s from that clear), and closes the
 // listener once it has drained the accept queue. A connection whose
@@ -427,14 +447,14 @@ func (e *Engine) ResumeAccept() error {
 		l.listenFDClosed.Store(false)
 		l.wakeIfSuspended()
 		// A loop that has not parked closed its listener at the pause and
-		// went back to epoll_wait, which is 500 ms long with no listener,
-		// and a loop without a header deadline has no 25 ms timerfd to end
-		// it sooner. That is a loop that holds a connection, and also an
-		// idle one just after the pause (it parks at the iteration after
-		// the close). wakeIfSuspended does not reach it: the wake eventfd,
-		// which is in the epoll set, does (celeris#886). A leaf lock and one
-		// write(2); a loop that is running just reads the counter at its
-		// next wakeup.
+		// went back to epoll_wait, which is 500 ms long with no listener;
+		// its 25 ms timerfd (every loop has one since celeris#1194) ends the
+		// wait sooner, but only at the next tick. That is a loop that holds a
+		// connection, and also an idle one just after the pause (it parks at
+		// the iteration after the close). wakeIfSuspended does not reach it:
+		// the wake eventfd, which is in the epoll set, does (celeris#886). A
+		// leaf lock and one write(2); a loop that is running just reads the
+		// counter at its next wakeup.
 		l.wakeFD.Signal()
 	}
 	return nil
