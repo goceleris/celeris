@@ -232,7 +232,7 @@ func TestRoot304RelativeRoot888(t *testing.T) {
 		mw := New(Config{Root: rel})
 		rec, err := get888(t, mw, "/a/linkdir/secret.txt", "if-none-match", tag)
 		if rec.StatusCode == 304 || !refused888(rec, err) {
-			t.Errorf("Root %q: escape answered status %d, err %v; want a 400", rel, rec.StatusCode, err)
+			t.Errorf("Root %q: escape answered status %d, err %v; want the request passed on", rel, rec.StatusCode, err)
 		}
 		if got := rec.Header("etag"); got != "" {
 			t.Errorf("Root %q: etag %q on a refused request, want none", rel, got)
@@ -265,7 +265,7 @@ func TestRoot304SymlinkedRoot888(t *testing.T) {
 	}
 	rec, err = get888(t, mw, "/leak.txt", "if-none-match", tag)
 	if rec.StatusCode == 304 || !refused888(rec, err) || rec.Header("etag") != "" {
-		t.Errorf("escape from a symlinked Root: status %d, err %v, etag %q; want a 400 and no etag",
+		t.Errorf("escape from a symlinked Root: status %d, err %v, etag %q; want the request passed on and no etag",
 			rec.StatusCode, err, rec.Header("etag"))
 	}
 }

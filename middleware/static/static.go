@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -249,7 +250,8 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 
 	info, err := os.Stat(fullPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// "file.txt/x" fails with ENOTDIR: no file, as for a missing name.
+		if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 			if spa {
 				return c.FileFromDir(cleanRoot, index)
 			}

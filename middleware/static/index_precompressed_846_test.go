@@ -268,8 +268,10 @@ func outsideFixture846(t *testing.T) (celeris.HandlerFunc, string, string) {
 
 // TestRefusedPathLeaksNoValidators846: a path FileFromDir refuses (a symlink
 // out of the root) must not leave the target's ETag and Last-Modified on the
-// error response. They were set from the stat before the containment check,
-// and a conditional request that did not hold carried them out on the 400.
+// response. They were set from the stat before the containment check, and a
+// conditional request that did not hold carried them out on the 400 (since
+// celeris#888 item 91 such a path is passed on as a missing one, and an
+// escaping variant is no variant).
 func TestRefusedPathLeaksNoValidators846(t *testing.T) {
 	mw, outsideTag, outsideLM := outsideFixture846(t)
 	for _, tc := range []struct {

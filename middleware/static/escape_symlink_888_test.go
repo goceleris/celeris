@@ -2,6 +2,7 @@ package static
 
 import (
 	"bytes"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -93,6 +94,40 @@ func TestEscapingSymlinkIsAnsweredAsMissing888(t *testing.T) {
 					t.Errorf("GET %s %v: the file outside the Root was served", p, hdr)
 				}
 			}
+		}
+	}
+}
+
+// TestEscapingVariantConditionalLeaksNothing888: the conditional rows the
+// "gzip-variant" case of TestRoot304DoesNotFollowSymlinkOut888 held. A client
+// that guesses the outside file's tag or date gets nothing of it: no 304 for
+// the guess and none of its validators. (A 304 for the identity file, whose
+// own mtime the If-Modified-Since may pass, is legitimate.)
+func TestEscapingVariantConditionalLeaksNothing888(t *testing.T) {
+	secretTag := weakETag(secretTime888, int64(len(secretBytes888)))
+	secretDate := secretTime888.UTC().Format(http.TimeFormat)
+	identityTime := secretTime888.Add(-time.Hour)
+	for _, hdr := range [][]string{
+		{"accept-encoding", "gzip", "if-none-match", secretTag},
+		{"accept-encoding", "gzip", "if-modified-since", secretDate},
+		{"accept-encoding", "gzip", "if-none-match", `"x"`},
+	} {
+		r := newRoot888(t)
+		r.write(t, filepath.Join(r.root, "app.js"), []byte("plain"), identityTime)
+		r.link(t, filepath.Join(r.outside, "secret.txt"), "app.js.gz")
+		rec, err := get888(t, New(Config{Root: r.root, Compress: true}), "/app.js", hdr...)
+		if err != nil {
+			t.Fatalf("GET /app.js %v: %v", hdr, err)
+		}
+		if rec.StatusCode == 304 && rec.Header("etag") == secretTag {
+			t.Errorf("GET /app.js %v: a 304 for the outside file's tag", hdr)
+		}
+		if rec.Header("etag") == secretTag || rec.Header("last-modified") == secretDate || rec.Header("content-encoding") != "" {
+			t.Errorf("GET /app.js %v: etag %q last-modified %q content-encoding %q describe the outside file",
+				hdr, rec.Header("etag"), rec.Header("last-modified"), rec.Header("content-encoding"))
+		}
+		if bytes.Contains(rec.Body, secretBytes888) {
+			t.Errorf("GET /app.js %v: the outside file was served", hdr)
 		}
 	}
 }

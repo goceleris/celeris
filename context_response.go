@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 	"unsafe"
@@ -1156,7 +1157,8 @@ func (c *Context) serveStaticFile(root, tail string) error {
 		return NewHTTPError(404, "Not Found")
 	}
 	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
-	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, ctxkit.ErrEscapes) ||
+		errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		// a path to a hidden file is a 404 whether or not it exists, and so is a
 		// file that is not there (the raw lstat error was a 500)
 		return NewHTTPError(404, "Not Found")
