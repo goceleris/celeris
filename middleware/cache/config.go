@@ -95,7 +95,7 @@ type Config struct {
 	// ExcludeHeaders, when non-empty, is subtracted from the stored
 	// header set after applying [IncludeHeaders]. Default: "set-cookie".
 	// Naming "content-type" here also drops the handler's Content-Type: a
-	// HIT is then replayed as a response written with no type.
+	// HIT with a body is then replayed as application/octet-stream.
 	ExcludeHeaders []string
 
 	// IgnoreCacheControl, when true, stores responses whatever their

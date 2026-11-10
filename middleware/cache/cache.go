@@ -363,7 +363,7 @@ func capture(c *celeris.Context, cfg Config, include, exclude map[string]struct{
 			}
 		}
 		if cacheable {
-			filtered := filterHeaders(respHeaders, include, exclude, c.ResponseContentType())
+			filtered := filterHeaders(respHeaders, include, exclude, c.ResponseContentType(), len(body) > 0)
 			enc := store.EncodedResponse{Status: status, Headers: filtered, Body: body}
 			cacheBytes = enc.AppendTo(cacheBytes[:0])
 		} else {
@@ -403,20 +403,28 @@ func answersRange(status int) bool {
 
 func replay(c *celeris.Context, cfg Config, rep store.EncodedResponse) error {
 	// The content type the handler set is stored as a content-type header
-	// (see filterHeaders). An entry with none is a response that had none (a
-	// NoContent, or a Blob written with an empty type): replay it as it was
-	// sent, not as application/octet-stream (celeris#1156).
-	ct := ""
+	// (see filterHeaders), an empty one too when the response has a body
+	// (c.Blob(code, "", data)): it replays as stored, empty. An entry with a
+	// body and no content-type entry at all (written before celeris#1156, or
+	// ExcludeHeaders names content-type) replays as application/octet-stream,
+	// and one with neither a type nor a body is a NoContent (celeris#1156).
+	ct, typed := "", false
 	for _, h := range rep.Headers {
 		// Stored headers come from c.ResponseHeaders() which is already
 		// lowercased by celeris.Context.SetHeader (HTTP/2 RFC 7540 §8.1.2),
 		// so a plain string compare is correct and ~10x faster than
 		// strings.EqualFold on every HIT.
 		if h[0] == "content-type" {
-			ct = h[1]
+			ct, typed = h[1], true
 			continue
 		}
 		c.SetHeader(h[0], h[1])
+	}
+	// A body stored with no content-type entry at all comes from an entry
+	// written before celeris#1156 (or ExcludeHeaders names content-type):
+	// keep the previous default rather than an empty, invalid type.
+	if !typed && len(rep.Body) > 0 {
+		ct = "application/octet-stream"
 	}
 	if cfg.HeaderName != "" {
 		c.SetHeader(cfg.HeaderName, "HIT")
@@ -436,9 +444,11 @@ func replay(c *celeris.Context, cfg Config, rep store.EncodedResponse) error {
 // The content type is part of the representation: Config.IncludeHeaders does
 // not leave it out; Config.ExcludeHeaders names it only on purpose
 // (celeris#1156).
-func filterHeaders(hs [][2]string, include, exclude map[string]struct{}, ct string) [][2]string {
+func filterHeaders(hs [][2]string, include, exclude map[string]struct{}, ct string, hasBody bool) [][2]string {
 	out := make([][2]string, 0, len(hs)+1)
-	if ct != "" {
+	// An empty type is stored too when there is a body (c.Blob(code, "", data)),
+	// so replay can tell it from an entry that stores no type.
+	if ct != "" || hasBody {
 		if _, skip := exclude["content-type"]; !skip {
 			out = append(out, [2]string{"content-type", ct})
 		}

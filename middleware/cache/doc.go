@@ -10,10 +10,13 @@
 // c.String, c.JSON or c.Blob is stored with the headers (as a content-type
 // header), and a HIT is replayed with the type its MISS had. A response
 // written with no type is replayed the way it was written: a NoContent as a
-// NoContent, a Blob with an empty type as a Blob with an empty type. A 206 Partial Content or a 416 is never stored: both
-// answer one request's Range, which the default key does not include, and
-// even under a key that includes it a replay would skip the handler's
-// If-Range check.
+// NoContent, a Blob with an empty type and a body as a Blob with an empty
+// type. An entry with a body but no stored type (one written by an earlier
+// version, or with [Config.ExcludeHeaders] naming content-type) is replayed
+// as application/octet-stream. A 206 Partial Content or a 416 is never
+// stored: both answer one request's Range, which the default key does not
+// include, and even under a key that includes it a replay would skip the
+// handler's If-Range check.
 //
 // # Backends
 //
