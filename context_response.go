@@ -1320,7 +1320,10 @@ func (c *Context) StreamReader(code int, contentType string, r io.Reader) error 
 // and "*/*;q=0, text/html" accepts text/html alone (RFC 9110 12.5.1). Of the
 // types with the highest weight, the one whose entry comes first in the header
 // wins, and then the first offer: "*/*, application/json" gives the first of
-// the offers, whichever it is.
+// the offers, whichever it is. The offers are types without parameters, so a
+// range that carries parameters ("text/html;level=1") ranks below the same
+// type written without: "text/html;level=1;q=0, text/html" refuses the level-1
+// variant and accepts text/html.
 //
 // The response then depends on Accept, so Negotiate adds Accept to the
 // response's Vary header (once): a shared cache, or middleware/singleflight,

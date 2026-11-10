@@ -36,8 +36,8 @@ func TestParseQValueGrammar888(t *testing.T) {
 // A malformed weight is ignored, as "q=abc" always was: the entry has q=1.
 func TestMalformedWeightIsIgnored888(t *testing.T) {
 	for _, h := range []string{
-		"gzip;q=NaN", "gzip;q=Inf", "gzip;q=+Inf", "gzip;q=-Inf", "gzip;q=1e5", "gzip;q=1e-9",
-		"gzip;q=-1", "gzip;q=.5", "gzip;q=2", "gzip;q=999", "gzip;q=abc", "gzip;q=0x1",
+		"gzip;q=NaN", "gzip;q=Inf", "gzip;q=+Inf", "gzip;q=1e5", "gzip;q=1e-9",
+		"gzip;q=.5", "gzip;q=2", "gzip;q=999", "gzip;q=abc", "gzip;q=0x1",
 	} {
 		got := Parse(h)
 		if len(got) != 1 || got[0].MediaType != "gzip" || got[0].Quality != 1 {
@@ -45,6 +45,19 @@ func TestMalformedWeightIsIgnored888(t *testing.T) {
 		}
 		if math.IsNaN(got[0].Quality) {
 			t.Errorf("Parse(%q) leaves a NaN weight", h)
+		}
+	}
+}
+
+// A malformed weight that reads as zero or below stays a refusal, as it was
+// before the grammar: ignoring it would accept what the sender refused.
+func TestMalformedNonPositiveWeightStillRefuses888(t *testing.T) {
+	for _, h := range []string{"gzip;q=-1", "gzip;q=-0", "gzip;q=0e0", "gzip;q=00", "gzip;q=-Inf", "gzip;q=-0.5"} {
+		if got := Parse(h); len(got) != 1 || got[0].Quality != 0 {
+			t.Errorf("Parse(%q) = %+v, want gzip at q=0", h, got)
+		}
+		if got := Accept(h, []string{"gzip"}); got != "" {
+			t.Errorf("Accept(%q, [gzip]) = %q, want the refusal", h, got)
 		}
 	}
 }
@@ -60,8 +73,8 @@ func TestMalformedWeightDoesNotChangeTheChoice888(t *testing.T) {
 		{"gzip;q=NaN, br;q=0.5", []string{"br", "gzip"}, "gzip"},
 		{"gzip, br;q=Inf", []string{"gzip", "br"}, "gzip"},
 		{"gzip, br;q=1e5", []string{"gzip", "br"}, "gzip"},
-		{"gzip;q=0.5, br;q=1e5", []string{"gzip", "br"}, "br"}, // br at q=1, not at 100000
-		{"gzip;q=0.5, br;q=-Inf", []string{"gzip", "br"}, "br"},
+		{"gzip;q=0.5, br;q=1e5", []string{"gzip", "br"}, "br"},    // br at q=1, not at 100000
+		{"gzip;q=0.5, br;q=-Inf", []string{"gzip", "br"}, "gzip"}, // -Inf refuses br
 		{"text/html;q=NaN, text/plain;q=0.5", []string{"text/plain", "text/html"}, "text/html"},
 		// Well-formed weights are what they were.
 		{"gzip;q=0.5, br;q=0.4", []string{"br", "gzip"}, "gzip"},

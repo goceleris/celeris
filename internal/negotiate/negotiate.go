@@ -10,6 +10,11 @@ import (
 type AcceptItem struct {
 	MediaType string
 	Quality   float64
+	// Params is true when the entry carried a parameter other than the
+	// weight ("text/html;level=1", "gzip;foo=1"). Such an entry is less
+	// specific than the same type without parameters when an offer
+	// without parameters is weighed (see [Accept]).
+	Params bool
 }
 
 // Accept returns the best matching offer based on the Accept header value.
@@ -26,6 +31,12 @@ type AcceptItem struct {
 // (RFC 9110 12.5.1): the offer it decides is not returned, even when a less
 // specific entry would accept it. Where two entries are equally specific (a
 // repeated entry), q=0 wins, and otherwise the higher q-value does.
+//
+// An offer is a name or a type without parameters, so an entry that names it
+// with parameters ("text/html;level=1") is less specific than one that names it
+// without: "text/html;level=1;q=0, text/html" refuses the level-1 variant and
+// accepts text/html. An entry with parameters still outranks every wildcard
+// (RFC 9110 12.5.1 asks for the most specific range; celeris#888).
 //
 // Of the acceptable offers the highest q-value is chosen. Offers with the same
 // q-value are ranked by the earliest entry of the header that matches them and
@@ -79,7 +90,7 @@ func Accept(header string, offers []string) string {
 func offerQuality(entries []AcceptItem, offer string, specs []int8) (q float64, idx int) {
 	bestSpec := 0
 	for i, e := range entries {
-		spec := matchSpecificity(e.MediaType, offer)
+		spec := matchSpecificity(e, offer)
 		if i < len(specs) {
 			specs[i] = int8(spec)
 		}
@@ -107,28 +118,36 @@ func offerQuality(entries []AcceptItem, offer string, specs []int8) (q float64, 
 			if specs[i] != 0 {
 				return q, i
 			}
-		} else if matchSpecificity(e.MediaType, offer) != 0 {
+		} else if matchSpecificity(e, offer) != 0 {
 			return q, i
 		}
 	}
 	return q, idx
 }
 
-// matchSpecificity is 0 when the pattern does not match the offer, and
-// otherwise how specific the pattern is: 1 for "*" and "*/*", 2 for "type/*",
-// 3 for a name or a full type. Both are lowercase.
-func matchSpecificity(pattern, offer string) int {
+// matchSpecificity is 0 when the entry does not match the offer, and
+// otherwise how specific the entry is: 2 for "*" and "*/*", 4 for "type/*",
+// 6 for a name or a full type, each one less for an entry that carries
+// parameters (1, 3, 5), so that it ranks below the same range without them and
+// above the range below it. Both are lowercase.
+func matchSpecificity(e AcceptItem, offer string) int {
+	pattern := e.MediaType
 	if !MatchMedia(pattern, offer) {
 		return 0
 	}
+	var spec int
 	switch {
 	case pattern == "*" || pattern == "*/*":
-		return 1
+		spec = 2
 	case strings.HasSuffix(pattern, "/*"):
-		return 2
+		spec = 4
 	default:
-		return 3
+		spec = 6
 	}
+	if e.Params {
+		spec--
+	}
+	return spec
 }
 
 // Parse parses an Accept header value into a slice of AcceptItems.
@@ -188,6 +207,9 @@ func ParseInto(dst []AcceptItem, header string) []AcceptItem {
 					params = ""
 				}
 				p = strings.TrimSpace(p)
+				if p != "" && !isWeightParam(p) {
+					e.Params = true
+				}
 				// The parameter name is case-insensitive (RFC 9110 5.6.6, 12.4.2).
 				if len(p) > 2 && (p[0] == 'q' || p[0] == 'Q') && p[1] == '=' {
 					// A weight outside the grammar of RFC 9110 12.4.2 ("NaN",
@@ -195,6 +217,11 @@ func ParseInto(dst []AcceptItem, header string) []AcceptItem {
 					// keeps the q=1 it had, as with "q=abc" (celeris#888).
 					if q, ok := parseQValue(p[2:]); ok {
 						e.Quality = q
+					} else if f, err := strconv.ParseFloat(p[2:], 64); err == nil && f <= 0 {
+						// ...but one that reads as zero or below ("-1", "-0",
+						// "0e0", "00", "-Inf") stays a refusal: ignoring it
+						// would accept what the sender meant to refuse.
+						e.Quality = 0
 					}
 				}
 			}
@@ -208,6 +235,17 @@ func ParseInto(dst []AcceptItem, header string) []AcceptItem {
 		}
 	}
 	return entries
+}
+
+// isWeightParam reports whether the parameter p ("q=0.5", "Q = x") is named
+// "q", whatever its value: it is the weight, well formed or not, and not a
+// parameter of the media type.
+func isWeightParam(p string) bool {
+	name := p
+	if i := strings.IndexByte(p, '='); i >= 0 {
+		name = p[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(name), "q")
 }
 
 // parseQValue reads the weight of a "q" parameter: RFC 9110 12.4.2,
