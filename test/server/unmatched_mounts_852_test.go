@@ -3,9 +3,11 @@ package celeris_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -157,25 +159,16 @@ func startServerConfig852(t *testing.T, cfg celeris.Config, setup func(*celeris.
 		if err != nil {
 			t.Fatal(err)
 		}
-		s := celeris.New(cfg)
-		setup(s)
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
-		addr, err := waitReady852(s, done)
+		addr, stop, err := startOnce852(cfg, setup, ln)
 		if err == nil {
 			t.Cleanup(func() {
-				cancel()
-				select {
-				case <-done:
-				case <-time.After(15 * time.Second):
-					t.Errorf("server did not stop within 15s")
+				if err := stop(); err != nil {
+					t.Error(err)
 				}
 			})
 			return addr
 		}
-		cancel()
-		<-done
+		_ = ln.Close() // the failed attempt's listener
 		if isRingENOMEM(err) && time.Now().Before(retryUntil) {
 			time.Sleep(50 * time.Millisecond)
 			continue
@@ -184,13 +177,54 @@ func startServerConfig852(t *testing.T, cfg celeris.Config, setup func(*celeris.
 	}
 }
 
-func waitReady852(s *celeris.Server, done <-chan error) (string, error) {
+// startOnce852 is one attempt of startServerConfig852: a server on ln after
+// setup, waited for until it answers. It returns the address and the func that
+// stops the server, or, when the server did not start, the reason, with the
+// server stopped (or not running: Start returned it).
+func startOnce852(cfg celeris.Config, setup func(*celeris.Server), ln net.Listener) (addr string, stop func() error, err error) {
+	s := celeris.New(cfg)
+	setup(s)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
+	stop = func() error {
+		cancel()
+		select {
+		case <-done:
+			return nil
+		case <-time.After(15 * time.Second):
+			return fmt.Errorf("server did not stop within 15s; goroutines:\n%s", allStacks852())
+		}
+	}
+	addr, exited, err := waitReady852(s, done)
+	if err == nil {
+		return addr, stop, nil
+	}
+	cancel()
+	if !exited { // else Start's result is what waitReady852 took: nothing is left to wait for
+		if serr := stop(); serr != nil {
+			err = fmt.Errorf("%w; %v", err, serr)
+		}
+	}
+	return "", nil, err
+}
+
+// allStacks852 is the stack of every goroutine of the process, for the report
+// of a wait that timed out (a hang of this helper once left none: celeris#884).
+func allStacks852() []byte {
+	buf := make([]byte, 1<<20)
+	return buf[:runtime.Stack(buf, true)]
+}
+
+// waitReady852 reports exited when it took Start's result from done (Start
+// returned before the server was ready), which leaves done empty.
+func waitReady852(s *celeris.Server, done <-chan error) (addr string, exited bool, err error) {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if a := s.Addr(); a != nil {
 			if c, err := net.DialTimeout("tcp", a.String(), 100*time.Millisecond); err == nil {
 				_ = c.Close()
-				return a.String(), nil
+				return a.String(), false, nil
 			}
 		}
 		select {
@@ -198,9 +232,9 @@ func waitReady852(s *celeris.Server, done <-chan error) (string, error) {
 			if err == nil {
 				err = errors.New("Start returned nil before the server was ready")
 			}
-			return "", err
+			return "", true, err
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	return "", errors.New("server not ready within 10s")
+	return "", false, errors.New("server not ready within 10s")
 }
