@@ -117,9 +117,10 @@ func NewWithBreaker(config ...Config) (celeris.HandlerFunc, *Breaker) {
 	}
 
 	errHandler := cfg.ErrorHandler
+	countUnmatched := cfg.CountUnmatched
 
 	handler := func(c *celeris.Context) error {
-		if skip.ShouldSkip(c) || unmatched(c) {
+		if skip.ShouldSkip(c) || (!countUnmatched && unmatched(c)) {
 			return c.Next()
 		}
 

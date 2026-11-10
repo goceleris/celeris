@@ -103,3 +103,42 @@ func TestUnmatchedRequestsDoNotCountAgainstTheBreaker888(t *testing.T) {
 		t.Errorf("after a successful probe: %s, want closed", got)
 	}
 }
+
+// TestCountUnmatchedRefusesFallback888: with CountUnmatched a NotFound handler
+// that forwards to the protected downstream is refused while Open.
+func TestCountUnmatchedRefusesFallback888(t *testing.T) {
+	mw, brk := NewWithBreaker(Config{CountUnmatched: true, MinRequests: 1, Threshold: 0.5, CooldownPeriod: time.Hour})
+	s := celeris.New(celeris.Config{Engine: celeris.Std})
+	s.Use(mw)
+	s.NotFound(func(c *celeris.Context) error { return celeris.NewHTTPError(502, "upstream down") })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = s.StartWithListenerAndContext(ctx, ln) }()
+	get := func() int {
+		for deadline := time.Now().Add(5 * time.Second); ; {
+			resp, err := http.Get("http://" + ln.Addr().String() + "/legacy")
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				return resp.StatusCode
+			}
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if st := get(); st != 502 {
+		t.Fatalf("first: %d", st)
+	}
+	if brk.State() != Open {
+		t.Fatalf("state %s, want open", brk.State())
+	}
+	if st := get(); st != 503 {
+		t.Errorf("while open: %d, want 503", st)
+	}
+}
