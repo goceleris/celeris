@@ -181,7 +181,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			return chainErr
 		}
 
-		headers := c.ResponseHeaders()
+		headers := storedHeaders(c.ResponseHeaders(), c.ResponseContentType(), len(body) > 0)
 		enc := store.EncodedResponse{Status: status, Headers: headers, Body: body}
 		encoded := enc.Encode()
 
@@ -242,16 +242,52 @@ func validKey(key string, maxLen int) bool {
 	return true
 }
 
+// storedHeaders returns the headers to store for a completed response: hs, behind
+// the response's content type, ct (c.ResponseContentType).
+//
+// The content type of a response written with c.String, c.JSON, c.Blob and
+// the like is not among c.ResponseHeaders: the response buffer keeps it
+// apart and c.Blob puts it on the wire itself. It is stored as a content-type
+// header, which replay reads back. It goes ahead of hs so that a content-type
+// header the handler set itself still wins, as it did.
+//
+// An empty ct is stored too when there is a body (c.Blob(code, "", data)), so
+// that replay can tell a body written with an empty type from an entry that
+// stores no type at all (celeris#1280).
+func storedHeaders(hs [][2]string, ct string, hasBody bool) [][2]string {
+	if ct == "" && !hasBody {
+		return hs
+	}
+	out := make([][2]string, 0, len(hs)+1)
+	out = append(out, [2]string{"content-type", ct})
+	return append(out, hs...)
+}
+
+// replay writes a stored response. The content type the handler wrote is stored
+// as a content-type header (see storedHeaders) and is replayed as it was sent.
+//
+// Entries written by an earlier version store none of it. Such an entry is
+// replayed as before, as application/octet-stream, when it has a body: a body
+// stored with no content-type header at all is one of those. An entry with no
+// type and no body is a response that had neither (a NoContent, a 204): it is
+// replayed as a NoContent, not as an empty application/octet-stream Blob
+// (celeris#1280).
 func replay(c *celeris.Context, rep store.EncodedResponse) error {
-	ct := "application/octet-stream"
+	ct, typed := "", false
 	for _, h := range rep.Headers {
 		// Keys stored via c.SetHeader were already lowercased at capture
 		// time (see cache.go's same optimization); skip EqualFold.
 		if h[0] == "content-type" {
-			ct = h[1]
+			ct, typed = h[1], true
 			continue
 		}
 		c.SetHeader(h[0], h[1])
+	}
+	if !typed && len(rep.Body) > 0 {
+		ct = "application/octet-stream"
+	}
+	if ct == "" && len(rep.Body) == 0 {
+		return c.NoContent(rep.Status)
 	}
 	return c.Blob(rep.Status, ct, rep.Body)
 }
