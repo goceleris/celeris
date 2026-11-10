@@ -135,8 +135,7 @@ func New(config ...Config) celeris.HandlerFunc {
 				// The handler has unwound. A response "written" only because it
 				// took a StreamWriter it never used has sent nothing: it is
 				// still ours to answer (celeris#835, #888).
-				ctxkit.ReclaimUnusedStreamWriter(c)
-				if c.IsWritten() {
+				if c.IsWritten() && !ctxkit.ReclaimUnusedStreamWriter(c) {
 					ls := pl.own()
 					log.LogAttrs(c.Context(), logLevel, "panic after response committed",
 						slog.String("request_id", ls.requestID),

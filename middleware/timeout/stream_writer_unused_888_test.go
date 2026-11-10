@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,5 +104,30 @@ func TestTimeoutAfterUnusedStreamWriterRunsErrorHandler888(t *testing.T) {
 	}
 	if st, body := get888(t, base+"/used"); st != 200 || body == "timed-out888" {
 		t.Errorf("GET /used: %d %q, want the stream and no ErrorHandler body", st, body)
+	}
+}
+
+// TestNoReclaimWhenTheHandlerBeatTheDeadline888: the unused StreamWriter is
+// given back only on the paths that answer a timeout. A handler that took the
+// writer and returned in time leaves the context as it found it, so a
+// middleware above this one still reads IsWritten as true (and the request
+// pays no call for it).
+func TestNoReclaimWhenTheHandlerBeatTheDeadline888(t *testing.T) {
+	var sawWritten atomic.Bool
+	base := serve888(t, func(s *celeris.Server) {
+		s.Use(func(c *celeris.Context) error {
+			err := c.Next()
+			sawWritten.Store(c.IsWritten())
+			return err
+		})
+		s.Use(New(Config{Timeout: time.Second}))
+		s.GET("/quick", func(c *celeris.Context) error {
+			_ = c.StreamWriter()
+			return nil
+		})
+	})
+	get888(t, base+"/quick")
+	if !sawWritten.Load() {
+		t.Error("IsWritten is false above the timeout after an in-time handler took the StreamWriter: the writer was reclaimed on the success path")
 	}
 }

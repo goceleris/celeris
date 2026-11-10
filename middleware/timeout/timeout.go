@@ -75,31 +75,26 @@ func New(config ...Config) celeris.HandlerFunc {
 		c.SetContext(origCtx)
 		lazy.release()
 
-		// The handler has returned. A response "written" only because it took
-		// a StreamWriter it never used has sent nothing: the timeout is still
-		// ours to answer (celeris#835, #888).
-		ctxkit.ReclaimUnusedStreamWriter(c)
-
 		// Done() may have promoted lazy.realCtx; trust its Err first.
 		// Otherwise fall back to wall-clock check so a handler that
 		// merely overran the deadline (without observing Done()) still
 		// reports as a timeout.
 		if lazy.realCtx != nil {
 			if lazy.realCtx.Err() == context.DeadlineExceeded {
-				if c.IsWritten() {
+				if committed(c) {
 					return ErrServiceUnavailable
 				}
 				return safeErrHandler(c, context.DeadlineExceeded, errHandler)
 			}
 		} else if lazy.expired() {
-			if c.IsWritten() {
+			if committed(c) {
 				return ErrServiceUnavailable
 			}
 			return safeErrHandler(c, context.DeadlineExceeded, errHandler)
 		}
 
 		if err != nil && isTimeoutError(err, timeoutErrors) {
-			if c.IsWritten() {
+			if committed(c) {
 				return ErrServiceUnavailable
 			}
 			return safeErrHandler(c, err, errHandler)
@@ -107,6 +102,15 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		return err
 	}
+}
+
+// committed reports whether the response is under way, so the timeout can no
+// longer be answered. A response "written" only because the handler took a
+// StreamWriter it never used has sent nothing: it is given back and is still
+// ours to answer (celeris#835, #888). Called only once the handler has
+// returned, and only on the paths that answer the timeout.
+func committed(c *celeris.Context) bool {
+	return c.IsWritten() && !ctxkit.ReclaimUnusedStreamWriter(c)
 }
 
 // safeErrHandler calls the error handler with panic recovery. If the error
