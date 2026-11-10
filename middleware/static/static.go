@@ -448,11 +448,10 @@ var resolvesInsideHook func()
 // acceptsCoding reports whether the request's Accept-Encoding accepts the
 // content coding enc (q-values read, q=0 refuses), and names Accept-Encoding
 // in Vary, once. A client that accepts x-gzip accepts gzip (RFC 9110 8.4.1.3:
-// x-gzip is equivalent), and the variant is sent as "gzip".
+// x-gzip is equivalent: the negotiator reads the alias as the coding), and the
+// variant is sent as "gzip". "gzip;q=0, *" refuses it, whichever name the
+// wildcard would have reached.
 func acceptsCoding(c *celeris.Context, enc string) bool {
-	if enc == "gzip" {
-		return c.AcceptsEncodings("gzip", "x-gzip") != ""
-	}
 	return c.AcceptsEncodings(enc) != ""
 }
 
