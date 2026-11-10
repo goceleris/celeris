@@ -1,0 +1,105 @@
+package circuitbreaker
+
+import (
+	"context"
+	"io"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/goceleris/celeris"
+)
+
+// TestUnmatchedRequestsDoNotCountAgainstTheBreaker888: a breaker mounted with
+// Server.Use also sees the requests no route matched (a crawler asking for
+// /favicon.ico, a method a path does not take, the automatic OPTIONS answer).
+// They reach no downstream, and a 404 is not a failure under the default
+// IsError, so while the breaker was HalfOpen (or Open past its cooldown) the
+// first of them was taken for the probe, counted a success, and closed a
+// breaker whose downstream had not been asked.
+func TestUnmatchedRequestsDoNotCountAgainstTheBreaker888(t *testing.T) {
+	mw, brk := NewWithBreaker(Config{
+		Threshold:      0.5,
+		MinRequests:    2,
+		WindowSize:     time.Minute,
+		CooldownPeriod: 50 * time.Millisecond,
+		HalfOpenMax:    1,
+	})
+	s := celeris.New(celeris.Config{Engine: celeris.Std})
+	s.Use(mw)
+	s.GET("/boom", func(*celeris.Context) error { return celeris.NewHTTPError(500, "down") })
+	s.GET("/ok", func(c *celeris.Context) error { return c.String(200, "ok") })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Logf("server stopped: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("server did not stop within 10s")
+		}
+	}()
+	base := "http://" + ln.Addr().String()
+	cl := &http.Client{Timeout: 5 * time.Second}
+	do := func(method, path string) int {
+		t.Helper()
+		var resp *http.Response
+		var err error
+		for deadline := time.Now().Add(5 * time.Second); ; {
+			req, _ := http.NewRequest(method, base+path, nil)
+			resp, err = cl.Do(req)
+			if err == nil || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if st := do("GET", "/ok"); st != 200 {
+		t.Fatalf("GET /ok: %d", st)
+	}
+	do("GET", "/boom")
+	do("GET", "/boom")
+	if brk.State() != Open {
+		t.Fatalf("after two failures: %s, want open", brk.State())
+	}
+	time.Sleep(80 * time.Millisecond) // past the cooldown
+
+	for _, rq := range []struct {
+		method, path string
+		want         int
+	}{
+		{"GET", "/favicon.ico", 404}, // <unmatched>
+		{"DELETE", "/ok", 405},       // <method-not-allowed>
+		{"OPTIONS", "/ok", 200},      // <options>
+	} {
+		if st := do(rq.method, rq.path); st != rq.want {
+			t.Errorf("%s %s: %d, want %d", rq.method, rq.path, st, rq.want)
+		}
+		if got := brk.State(); got != Open {
+			t.Fatalf("after %s %s: breaker %s, want it still open (the request reached no downstream)", rq.method, rq.path, got)
+		}
+	}
+	// A request the downstream answers is the probe.
+	if st := do("GET", "/ok"); st != 200 {
+		t.Errorf("probe GET /ok: %d, want 200", st)
+	}
+	if got := brk.State(); got != Closed {
+		t.Errorf("after a successful probe: %s, want closed", got)
+	}
+}
