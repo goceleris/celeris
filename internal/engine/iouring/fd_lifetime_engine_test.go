@@ -78,6 +78,69 @@ type servingTarget struct {
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	conns   []net.Conn
+	// byPort is what the target saw of each adopted conn, keyed by the
+	// client's local port (this side's peer port), for attribute.
+	byPort map[int]*adoptedConn
+}
+
+// adoptedConn counts what the target's serving goroutine did on one conn.
+type adoptedConn struct {
+	adoptedAt  time.Time
+	lastRead   atomic.Int64 // sequence number of the last request the target read
+	lastSent   atomic.Int64 // sequence number of the last response the target wrote
+	lastSentAt atomic.Int64 // UnixNano at which that response was written
+}
+
+// attribute says, for each client that ended on a read timeout, where its
+// request stopped; see celeris#892 (from #816 item 4). The target's counts against the
+// client's, by the sequence number each request carries in its path: never
+// adopted (the conn was still the source's, or was closed by it); the last
+// request read is older than the last the client wrote (that request never
+// reached the target's reader: eaten by the source or lost in the hand-off);
+// the last request was read and not answered (the target's goroutine stalled);
+// or it was read and answered (the response was written and the client did
+// not read it within its deadline: a stall of the client or the host, not of
+// the engine), or it was answered, but only after the client's deadline had
+// passed (the target itself was late).
+func (s *servingTarget) attribute(ts []clientTimeout) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := map[string]int{}
+	var detail []string
+	for _, ct := range ts {
+		ac := s.byPort[ct.port]
+		var cls string
+		switch {
+		case ac == nil:
+			cls = "never_adopted"
+		case ac.lastRead.Load() < ct.sent:
+			cls = "request_never_reached_target"
+		case ac.lastSent.Load() < ct.sent:
+			cls = "target_read_not_answered"
+		case ac.lastSentAt.Load() > ct.deadline.UnixNano():
+			cls = "target_answered_after_client_deadline"
+		default:
+			cls = "target_answered_client_missed_it"
+		}
+		counts[cls]++
+		if len(detail) < 8 {
+			if ac == nil {
+				detail = append(detail, fmt.Sprintf("port=%d sent=%d answered=%d %s", ct.port, ct.sent, ct.answered, cls))
+			} else {
+				detail = append(detail, fmt.Sprintf("port=%d client_sent=%d client_answered=%d target_last_read=%d target_last_answered=%d adopted_%s_ago %s",
+					ct.port, ct.sent, ct.answered, ac.lastRead.Load(), ac.lastSent.Load(), time.Since(ac.adoptedAt).Round(time.Millisecond), cls))
+			}
+		}
+	}
+	return fmt.Sprintf("%s; first: [%s]", classes(toInt64(counts)), strings.Join(detail, "; "))
+}
+
+func toInt64(m map[string]int) map[string]int64 {
+	o := make(map[string]int64, len(m))
+	for k, v := range m {
+		o[k] = int64(v)
+	}
+	return o
 }
 
 func (s *servingTarget) AdoptConn(fd int, _ engine.Carryover) error {
@@ -91,8 +154,15 @@ func (s *servingTarget) AdoptConn(fd int, _ engine.Carryover) error {
 		return nil // fd closed above; nothing for the source to reclaim
 	}
 	s.adopted.Add(1)
+	ac := &adoptedConn{adoptedAt: time.Now()}
 	s.mu.Lock()
 	s.conns = append(s.conns, c)
+	if ra, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+		if s.byPort == nil {
+			s.byPort = map[int]*adoptedConn{}
+		}
+		s.byPort[ra.Port] = ac
+	}
 	s.mu.Unlock()
 	s.wg.Add(1)
 	go func() {
@@ -103,11 +173,16 @@ func (s *servingTarget) AdoptConn(fd int, _ engine.Carryover) error {
 			if err != nil {
 				return
 			}
+			if n, err := strconv.ParseInt(strings.TrimPrefix(req.URL.Path, "/"), 10, 64); err == nil {
+				ac.lastRead.Store(n)
+			}
 			_, _ = io.Copy(io.Discard, req.Body)
 			_ = req.Body.Close()
 			if _, err := c.Write([]byte("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nok")); err != nil {
 				return
 			}
+			ac.lastSentAt.Store(time.Now().UnixNano())
+			ac.lastSent.Store(ac.lastRead.Load())
 		}
 	}()
 	return nil
@@ -136,6 +211,21 @@ type loadResult struct {
 	ok      int64
 	errs    int64
 	byClass map[string]int64
+	// timeouts is one entry per client that ended on a read timeout, so a
+	// failure can be attributed to the conn that stalled; see
+	// servingTarget.attribute and celeris#892 (from #816 item 4).
+	timeouts []clientTimeout
+}
+
+// clientTimeout is what a keep-alive client knew when its read timed out:
+// the local port (the key servingTarget knows the conn by, as the peer port),
+// how many requests it had written, how many it had read a response to, and
+// the deadline of the read that failed.
+type clientTimeout struct {
+	port     int
+	sent     int64
+	answered int64
+	deadline time.Time // when the read of the last request's reply gave up
 }
 
 // runKeepAliveLoad drives n keep-alive clients against addr, each sending one
@@ -158,6 +248,7 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 	var ok, errsN atomic.Int64
 	var mu sync.Mutex
 	byClass := map[string]int64{}
+	var timeouts []clientTimeout
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -169,12 +260,19 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 			defer wg.Done()
 			defer func() { _ = c.Close() }()
 			br := bufio.NewReader(c)
+			var sent, answered int64
+			var deadline time.Time
 			fail := func(err error) {
 				errsN.Add(1)
 				cls := "other"
 				switch {
 				case errors.Is(err, os.ErrDeadlineExceeded):
 					cls = "read_timeout"
+					if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
+						mu.Lock()
+						timeouts = append(timeouts, clientTimeout{port: la.Port, sent: sent, answered: answered, deadline: deadline})
+						mu.Unlock()
+					}
 				case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 					cls = "eof"
 				case errors.Is(err, syscall.ECONNRESET):
@@ -190,11 +288,16 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 					return
 				default:
 				}
-				if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+				// The request path is its sequence number on this conn,
+				// which servingTarget.attribute reads back (the handlers
+				// ignore the path).
+				if _, err := c.Write([]byte("GET /" + strconv.FormatInt(sent+1, 10) + " HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 					fail(err)
 					return
 				}
-				_ = c.SetReadDeadline(time.Now().Add(time.Second))
+				sent++
+				deadline = time.Now().Add(time.Second)
+				_ = c.SetReadDeadline(deadline)
 				resp, err := http.ReadResponse(br, nil)
 				if err != nil {
 					fail(err)
@@ -206,6 +309,7 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 					fail(err)
 					return
 				}
+				answered++
 				ok.Add(1)
 				if think > 0 {
 					select {
@@ -225,7 +329,7 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 		for k, v := range byClass {
 			cp[k] = v
 		}
-		return loadResult{ok: ok.Load(), errs: errsN.Load(), byClass: cp}
+		return loadResult{ok: ok.Load(), errs: errsN.Load(), byClass: cp, timeouts: append([]clientTimeout(nil), timeouts...)}
 	}
 }
 
@@ -410,7 +514,8 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 				t.Errorf("stale recv data after the hand-offs: Transplanted=%d Unattributed=%d, want 0/0", tr, un)
 			}
 			if res.errs != 0 {
-				t.Errorf("clients saw %d errors (%s), want 0", res.errs, classes(res.byClass))
+				t.Errorf("clients saw %d errors (%s), want 0; attribution of the read timeouts: %s",
+					res.errs, classes(res.byClass), tgt.attribute(res.timeouts))
 			}
 			got := tgt.adopted.Load()
 			// The weak branch. The gate above leaves it reachable only
@@ -726,6 +831,39 @@ func TestWorkerParksWithNothingPending(t *testing.T) {
 	for i, w := range workers {
 		if p := w.ring.Pending(); p != 0 {
 			t.Errorf("worker %d parked with %d SQE(s) queued and never submitted", i, p)
+		}
+	}
+}
+
+// TestServingTargetAttributesTimeouts pins the classes servingTarget.attribute
+// puts a client read timeout in, one conn of each: celeris#892 (from #816
+// item 4).
+func TestServingTargetAttributesTimeouts(t *testing.T) {
+	tgt := &servingTarget{byPort: map[int]*adoptedConn{}}
+	deadline := time.Now()
+	add := func(port int, read, sent int64, sentAt time.Time) {
+		ac := &adoptedConn{adoptedAt: time.Now()}
+		ac.lastRead.Store(read)
+		ac.lastSent.Store(sent)
+		ac.lastSentAt.Store(sentAt.UnixNano())
+		tgt.byPort[port] = ac
+	}
+	add(1, 6, 6, deadline.Add(-time.Second))  // the target answered request 7's predecessor; 7 never arrived
+	add(2, 7, 6, deadline.Add(-time.Second))  // read 7, did not answer it
+	add(3, 7, 7, deadline.Add(-time.Second))  // answered 7 before the client gave up: the client missed the response
+	add(5, 7, 7, deadline.Add(2*time.Second)) // answered 7 after the client gave up: the target was late
+	ts := []clientTimeout{
+		{port: 1, sent: 7, deadline: deadline}, {port: 2, sent: 7, deadline: deadline},
+		{port: 3, sent: 7, deadline: deadline}, {port: 4, sent: 7, deadline: deadline},
+		{port: 5, sent: 7, deadline: deadline},
+	}
+	got := tgt.attribute(ts)
+	for _, want := range []string{
+		"never_adopted=1", "request_never_reached_target=1", "target_read_not_answered=1",
+		"target_answered_client_missed_it=1", "target_answered_after_client_deadline=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("attribution %q lacks %q", got, want)
 		}
 	}
 }
