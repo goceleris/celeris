@@ -26,6 +26,7 @@ def excluded_rows(loadgen_version):
     return OLD_CLIENT_ROWS
 LIBS = {"gnet-h1","fasthttp-h1","nbio-h1","gorilla_ws","hyper","hyper-h2","h2o","lithium","uws","bunraw"}
 STD = {"stdhttp-h1","stdhttp-h2","stdhttp-hybrid"}
+STDCEL = {"celeris-std-h1"}  # the std-engine configuration of celeris, left out of the "native" tally
 for arch in ("x86_64","arm64"):
     d = json.load(open(f"{root}/results/{VERSION}/{DATE}/{arch}/summary.json"))
     bc = d["benchmark_config"]
@@ -58,29 +59,32 @@ for arch in ("x86_64","arm64"):
     r = sorted(ratios)
     print(f"iouring-h1-async / epoll-h1-async over {len(r)} rows: median {statistics.median(x for x,_ in r):.3f} min {r[0]} max {r[-1]}")
     # frameworks vs libs: per-row best celeris vs best other Go framework (the docs rule), tally
-    def lang(n): return B[n]["language"]
-    wins=ties=loss=walk=0
-    detail=[]
-    for s in scn:
-        bc_=max((e["saturation_mode_rps"].get(s,0) for n,e in cel.items()), default=0)
-        rivals=[(e["saturation_mode_rps"].get(s,0),n) for n,e in B.items() if e["language"]=="go" and e["framework"]!="celeris" and n not in LIBS and n not in STD]
-        rv,rn = max(rivals, default=(0,""))
-        if bc_<=0: continue
-        if rv<=0: walk+=1; detail.append((s,"walkover")); continue
-        ratio=bc_/rv
-        k = "win" if ratio>1.05 else ("loss" if ratio<0.95 else "tie")
-        detail.append((s,k,round(ratio,3),rn))
-        wins+= k=="win"; ties+= k=="tie"; loss+= k=="loss"
-    EXCL = excluded_rows(bc.get("loadgen_version"))
-    t={"win":0,"tie":0,"loss":0}
-    for x in detail:
-        if x[0] in EXCL or x[1]=="walkover": continue
-        t[x[1]]+=1
-    print("same, excluding", sorted(EXCL) or "no rows", "and walkovers:", t, "rows", sum(t.values()))
-    drv=[x for x in detail if x[0].startswith("driver-")]
-    print("driver rows:", {k:sum(1 for x in drv if x[1]==k) for k in ("win","tie","loss")}, "of", len(drv))
-    print(f"Go-framework comparison (best celeris config vs best other Go framework, +-5% = tie, single run): win {wins} tie {ties} loss {loss} walkover {walk} rows {len(scn)}")
-    for x in detail: print("   ",x)
+    # Two tallies: "native" counts only the epoll, io_uring and adaptive configurations of celeris (the README numbers);
+    # "incl-std" also counts celeris-std-h1, as the docs site does. On driver-redis-pipeline the best configuration is the std engine.
+    for MODE in ("native", "incl-std"):
+        def lang(n): return B[n]["language"]
+        wins=ties=loss=walk=0
+        detail=[]
+        for s in scn:
+            bc_=max((e["saturation_mode_rps"].get(s,0) for n,e in cel.items() if MODE=="incl-std" or e["name"] not in STDCEL), default=0)
+            rivals=[(e["saturation_mode_rps"].get(s,0),n) for n,e in B.items() if e["language"]=="go" and e["framework"]!="celeris" and n not in LIBS and n not in STD]
+            rv,rn = max(rivals, default=(0,""))
+            if bc_<=0: continue
+            if rv<=0: walk+=1; detail.append((s,"walkover")); continue
+            ratio=bc_/rv
+            k = "win" if ratio>1.05 else ("loss" if ratio<0.95 else "tie")
+            detail.append((s,k,round(ratio,3),rn))
+            wins+= k=="win"; ties+= k=="tie"; loss+= k=="loss"
+        EXCL = excluded_rows(bc.get("loadgen_version"))
+        t={"win":0,"tie":0,"loss":0}
+        for x in detail:
+            if x[0] in EXCL or x[1]=="walkover": continue
+            t[x[1]]+=1
+        print(MODE, "same, excluding", sorted(EXCL) or "no rows", "and walkovers:", t, "rows", sum(t.values()))
+        drv=[x for x in detail if x[0].startswith("driver-")]
+        print(MODE, "driver rows:", {k:sum(1 for x in drv if x[1]==k) for k in ("win","tie","loss")}, "of", len(drv))
+        print(MODE, f"Go-framework comparison (best celeris config vs best other Go framework, +-5% = tie, single run): win {wins} tie {ties} loss {loss} walkover {walk} rows {len(scn)}")
+        for x in detail: print("   ",x)
 
 # ---- spread over every published cell of the version: how much the same quantities move between runs.
 import glob
@@ -89,7 +93,7 @@ for path in sorted(glob.glob(f"{root}/results/{VERSION}/*/*/summary.json")):
     d = json.load(open(path))
     B = d["benchmarks"]; cel = {n: e for n, e in B.items()} if False else None
     Bn = {e["name"]: e for e in B}
-    celc = [e for e in B if e["framework"] == "celeris"]
+    celc = [e for e in B if e["framework"] == "celeris" and e["name"] not in STDCEL]  # native engines only, as above
     scn = sorted({s for e in B for s in e["saturation_mode_rps"]})
     best = {}
     for e in B:
