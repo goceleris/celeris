@@ -1378,7 +1378,10 @@ func (c *Context) ResponseBody() []byte {
 	return c.capturedBody
 }
 
-// ResponseContentType returns the captured Content-Type, or "" if not captured.
+// ResponseContentType returns the captured Content-Type, or "" if none was
+// captured: nothing was buffered or captured, the response is a NoContent, or
+// it was written with an empty content type (c.Blob(code, "", data)). An empty
+// result does not mean the response has no body: check [Context.ResponseBody].
 func (c *Context) ResponseContentType() string { return c.capturedType }
 
 // BufferResponse instructs response methods (JSON, XML, Blob, NoContent, etc.)
@@ -1409,7 +1412,12 @@ func (c *Context) FlushResponse() error {
 	}
 	c.bufferDepth = 0
 	c.buffered = false
-	if c.capturedType == "" {
+	// A buffered NoContent leaves no body and no type; replay it as NoContent.
+	// A body with no type (c.Blob(code, "", data), which Adapt writes for a
+	// net/http handler that sets no Content-Type) is a Blob and keeps its
+	// body: the empty type alone does not say which of the two was buffered
+	// (celeris#1155).
+	if c.capturedType == "" && len(c.capturedBody) == 0 {
 		return c.NoContent(c.capturedStatus)
 	}
 	return c.Blob(c.capturedStatus, c.capturedType, c.capturedBody)
