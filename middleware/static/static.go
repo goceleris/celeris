@@ -225,8 +225,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		case err == nil:
 		case errors.Is(err, ctxkit.ErrHidden):
 			return notFound()
-		case errors.Is(err, ctxkit.ErrNotRegular):
-			// a device, a FIFO or a socket is answered as a missing file is
+		case errors.Is(err, ctxkit.ErrNotRegular), errors.Is(err, ctxkit.ErrEscapes):
+			// a device, a FIFO or a socket is answered as a missing file is, and
+			// so is a symlink that leads out of the root: a 400 for it and a 404
+			// for a name that is not there would tell a client which names exist
 			return missing()
 		}
 		return err
@@ -484,9 +486,9 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath, cache
 			ct = "application/octet-stream"
 		}
 		err = serveOSFile(c, cleanRoot, filePath+v.suffix, ct, v.encoding, cacheControl, vi, hidden)
-		if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) {
-			// a variant that is a symlink to a hidden file, or not a regular
-			// file, is no variant: the file itself is served
+		if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, ctxkit.ErrEscapes) {
+			// a variant that is a symlink to a hidden file, or out of the root,
+			// or not a regular file, is no variant: the file itself is served
 			continue
 		}
 		return true, err

@@ -19,7 +19,7 @@ import (
 // whose If-Modified-Since is at or after its mtime, got a 304 carrying that
 // file's ETag and Last-Modified: an oracle on a file outside the root. A path
 // that resolves outside the root is refused, as it is without a validator
-// (FileFromDir's 400), and a symlink that stays inside is still served.
+// (passed on as a missing name, celeris#888 item 91), and a symlink that stays inside is still served.
 
 var (
 	secretTime888  = time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
@@ -78,6 +78,14 @@ func get888(t *testing.T, mw celeris.HandlerFunc, path string, hdr ...string) (*
 	return rec, ctx.Next()
 }
 
+// refused888 reports that a path leading out of the Root was not served: the
+// request was passed on to the next handler with nothing written, as for a
+// name that is not there (celeris#888 item 91: it was a 400, which told a
+// client which names exist).
+func refused888(rec *celeristest.ResponseRecorder, err error) bool {
+	return err == nil && rec.StatusCode == 0 && len(rec.Body) == 0
+}
+
 func isHTTP400(err error) bool {
 	var he *celeris.HTTPError
 	return errors.As(err, &he) && he.Code == 400
@@ -113,10 +121,8 @@ func TestRoot304DoesNotFollowSymlinkOut888(t *testing.T) {
 		{"deep-parent-directory", func(t *testing.T, r root888) {
 			r.link(t, r.outside, filepath.Join("a", "b", "linkdir"))
 		}, "/a/b/linkdir/secret.txt", ""},
-		{"gzip-variant", func(t *testing.T, r root888) {
-			r.write(t, filepath.Join(r.root, "app.js"), []byte("plain"), secretTime888.Add(-time.Hour))
-			r.link(t, filepath.Join(r.outside, "secret.txt"), "app.js.gz")
-		}, "/app.js", "gzip"},
+		// (the pre-compressed variant that escapes is no variant: the identity
+		// file is served, TestEscapingVariantServesIdentity888)
 		{"directory-index", func(t *testing.T, r root888) {
 			r.link(t, filepath.Join(r.outside, "secret.txt"), filepath.Join("sub", "index.html"))
 		}, "/sub/", ""},
@@ -145,8 +151,8 @@ func TestRoot304DoesNotFollowSymlinkOut888(t *testing.T) {
 					t.Errorf("a path outside the Root answered 304 (etag %q, last-modified %q)",
 						rec.Header("etag"), rec.Header("last-modified"))
 				}
-				if !isHTTP400(err) {
-					t.Errorf("handler error %v, want a 400 (FileFromDir's refusal)", err)
+				if !refused888(rec, err) {
+					t.Errorf("handler error %v, want the request passed on, as for a name that is not there", err)
 				}
 				for _, h := range []string{"etag", "last-modified", "cache-control", "content-encoding"} {
 					if v := rec.Header(h); v != "" {
@@ -225,7 +231,7 @@ func TestRoot304RelativeRoot888(t *testing.T) {
 	for _, rel := range []string{"root", "./root", "root/a/.."} {
 		mw := New(Config{Root: rel})
 		rec, err := get888(t, mw, "/a/linkdir/secret.txt", "if-none-match", tag)
-		if rec.StatusCode == 304 || !isHTTP400(err) {
+		if rec.StatusCode == 304 || !refused888(rec, err) {
 			t.Errorf("Root %q: escape answered status %d, err %v; want a 400", rel, rec.StatusCode, err)
 		}
 		if got := rec.Header("etag"); got != "" {
@@ -258,7 +264,7 @@ func TestRoot304SymlinkedRoot888(t *testing.T) {
 		t.Errorf("symlink inside a symlinked Root: status %d, err %v; want a 304", rec.StatusCode, err)
 	}
 	rec, err = get888(t, mw, "/leak.txt", "if-none-match", tag)
-	if rec.StatusCode == 304 || !isHTTP400(err) || rec.Header("etag") != "" {
+	if rec.StatusCode == 304 || !refused888(rec, err) || rec.Header("etag") != "" {
 		t.Errorf("escape from a symlinked Root: status %d, err %v, etag %q; want a 400 and no etag",
 			rec.StatusCode, err, rec.Header("etag"))
 	}

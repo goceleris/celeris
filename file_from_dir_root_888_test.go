@@ -191,3 +191,28 @@ func isNotRegular888(err error) bool {
 	var he *HTTPError
 	return errors.As(err, &he) && he.Code == 404 && errors.Is(err, ctxkit.ErrNotRegular)
 }
+
+// A symlink that leaves the base is still a 400 for a caller of FileFromDir
+// (the path is the caller's to choose), and the error carries ctxkit.ErrEscapes
+// so that middleware/static can answer it as a missing name (celeris#888 item
+// 91). A lexical escape and a missing file are not it.
+func TestFileFromDirEscapeCarriesErrEscapes888(t *testing.T) {
+	tmp := t.TempDir()
+	base := filepath.Join(tmp, "base")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "secret.txt"), []byte("S"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(tmp, "secret.txt"), filepath.Join(base, "link.txt")); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	status, body, err := fileFromDir888(t, base, "link.txt")
+	if !isInvalidPath888(err) || !errors.Is(err, ctxkit.ErrEscapes) || status == 200 || body != "" {
+		t.Errorf("FileFromDir through a symlink out of the base: status %d body %q err %v, want an HTTPError 400 wrapping ErrEscapes", status, body, err)
+	}
+	if _, _, err := fileFromDir888(t, base, "nothing.txt"); errors.Is(err, ctxkit.ErrEscapes) {
+		t.Errorf("a missing file reports ErrEscapes: %v", err)
+	}
+}

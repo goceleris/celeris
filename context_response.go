@@ -1187,14 +1187,14 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 		return err
 	}
 	if !ctxkit.ResolvedWithin(resolvedBase, resolved) {
-		return NewHTTPError(400, "invalid file path")
+		return NewHTTPError(400, "invalid file path").WithError(ctxkit.ErrEscapes)
 	}
 	if hidden != nil {
 		// Where the path leads, not only what it says: a visible name that is a
 		// symlink to a dotfile of the tree is refused like the dotfile.
 		rel, ok := ctxkit.RelWithin(resolvedBase, resolved)
 		if !ok {
-			return NewHTTPError(400, "invalid file path")
+			return NewHTTPError(400, "invalid file path").WithError(ctxkit.ErrEscapes)
 		}
 		if hidden(rel) {
 			return ctxkit.ErrHidden

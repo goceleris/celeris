@@ -288,10 +288,16 @@ func TestRefusedPathLeaksNoValidators846(t *testing.T) {
 		for i := 0; i+1 < len(tc.hdr); i += 2 {
 			opts = append(opts, celeristest.WithHeader(tc.hdr[i], tc.hdr[i+1]))
 		}
-		c, _ := celeristest.NewContextT(t, "GET", tc.path, opts...)
+		c, rec := celeristest.NewContextT(t, "GET", tc.path, opts...)
 		err := c.Next()
-		if err == nil {
-			t.Fatalf("GET %s %v: the escaping symlink was served (%d)", tc.path, tc.hdr, c.ResponseStatus())
+		// A symlink out of the root is no file (celeris#888 item 91): the
+		// identity file is served in place of a variant that escapes, and a
+		// path that escapes is passed on as a missing one, not answered 400.
+		if len(rec.Body) == 4242 { // the outside file's size
+			t.Fatalf("GET %s %v: the escaping symlink was served (%d)", tc.path, tc.hdr, rec.StatusCode)
+		}
+		if err != nil {
+			t.Errorf("GET %s %v: %v, want the request passed on or the identity file served", tc.path, tc.hdr, err)
 		}
 		for _, h := range c.ResponseHeaders() {
 			if h[1] == outsideTag || h[1] == outsideLM {
