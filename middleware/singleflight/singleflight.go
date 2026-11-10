@@ -182,7 +182,10 @@ func New(config ...Config) celeris.HandlerFunc {
 			c.Abort()
 			c.SetResponseHeaders(entry.headers)
 			c.AddHeader("x-singleflight", "HIT")
-			if entry.ct == "" {
+			// A NoContent response has no type and no body; a body with no type
+			// (c.Blob(code, "", data)) is a Blob and keeps its body
+			// (celeris#1155).
+			if entry.ct == "" && len(entry.body) == 0 {
 				_ = c.NoContent(entry.status)
 			} else {
 				_ = c.Blob(entry.status, entry.ct, entry.body)

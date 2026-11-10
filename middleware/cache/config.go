@@ -87,10 +87,15 @@ type Config struct {
 	// IncludeHeaders, when non-empty, whitelists response headers that
 	// are stored alongside the body. When nil, all response headers
 	// are stored except those in [ExcludeHeaders] (default: Set-Cookie).
+	// The Content-Type the handler wrote (c.String, c.JSON, c.Blob) is
+	// part of the representation and is always stored, whatever this list
+	// says.
 	IncludeHeaders []string
 
 	// ExcludeHeaders, when non-empty, is subtracted from the stored
 	// header set after applying [IncludeHeaders]. Default: "set-cookie".
+	// Naming "content-type" here also drops the handler's Content-Type: a
+	// HIT with a body is then replayed as application/octet-stream.
 	ExcludeHeaders []string
 
 	// IgnoreCacheControl, when true, stores responses whatever their
