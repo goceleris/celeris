@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/validation"
 )
 
@@ -131,6 +132,10 @@ func New(config ...Config) celeris.HandlerFunc {
 					return
 				}
 
+				// The handler has unwound. A response "written" only because it
+				// took a StreamWriter it never used has sent nothing: it is
+				// still ours to answer (celeris#835, #888).
+				ctxkit.ReclaimUnusedStreamWriter(c)
 				if c.IsWritten() {
 					ls := pl.own()
 					log.LogAttrs(c.Context(), logLevel, "panic after response committed",

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/ctxkit"
 )
 
 var chanPool = sync.Pool{New: func() any { return make(chan error, 1) }}
@@ -73,6 +74,11 @@ func New(config ...Config) celeris.HandlerFunc {
 		unwinding = false
 		c.SetContext(origCtx)
 		lazy.release()
+
+		// The handler has returned. A response "written" only because it took
+		// a StreamWriter it never used has sent nothing: the timeout is still
+		// ours to answer (celeris#835, #888).
+		ctxkit.ReclaimUnusedStreamWriter(c)
 
 		// Done() may have promoted lazy.realCtx; trust its Err first.
 		// Otherwise fall back to wall-clock check so a handler that
