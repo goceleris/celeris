@@ -66,7 +66,7 @@ func newOptionsChain(middleware []HandlerFunc) []HandlerFunc {
 func (a *routerAdapter) buildUnmatchedChains() {
 	s := a.server
 	a.notFoundChain = newUnmatchedChain(s.middleware, s.notFoundHandler, builtinNotFound)
-	a.methodNotAllowedChain = newUnmatchedChain(s.middleware, s.methodNotAllowedHandler, builtinMethodNotAllowed)
+	a.methodNotAllowedChain = newMethodNotAllowedChain(s.middleware, s.methodNotAllowedHandler)
 	// Written only when true: Server.AsyncHandlers, which a driver opened
 	// WithEngine may call while Start runs, reads the flag only when the
 	// default is sync, and then nothing writes it.
@@ -93,6 +93,29 @@ func newUnmatchedChain(middleware []HandlerFunc, custom, builtin HandlerFunc) []
 	return append(chain, answerUnlessAnswered(end))
 }
 
+// newMethodNotAllowedChain is newUnmatchedChain for a 405, whose end sets the
+// Allow header before the NotFound-like handler runs (withAllow).
+func newMethodNotAllowedChain(middleware []HandlerFunc, custom HandlerFunc) []HandlerFunc {
+	end := builtinMethodNotAllowed
+	if custom != nil {
+		end = custom
+	}
+	return newUnmatchedChain(middleware, withAllow(end), nil)
+}
+
+// withAllow sets the Allow header of the 405 under way (handleUnmatched
+// stored it in c.unmatchedAllow) and runs h, so only a 405 answered by h
+// carries it. A middleware that answers first (an auth 401, a rate limit's
+// 429) sends none: celeris#889.
+func withAllow(h HandlerFunc) HandlerFunc {
+	return func(c *Context) error {
+		if c.unmatchedAllow != "" {
+			c.SetHeader("allow", c.unmatchedAllow)
+		}
+		return h(c)
+	}
+}
+
 // answerUnlessAnswered runs h only if no handler before it in the chain has
 // answered the request: written the response, had it captured by a buffering
 // middleware (compress, etag, cache, ...) or taken the connection over.
@@ -114,7 +137,7 @@ func answerUnlessAnswered(h HandlerFunc) HandlerFunc {
 // builtinNotFound and builtinMethodNotAllowed are the answers to an unmatched
 // request when no NotFound / MethodNotAllowed handler is set. They write
 // through the Context, as a route handler does, so buffering middleware sees
-// the response; handleUnmatched has set the Allow header of a 405.
+// the response; the end of a 405 chain sets its Allow header (withAllow).
 func builtinNotFound(c *Context) error {
 	return c.Blob(404, "text/plain", []byte("404 Not Found"))
 }
@@ -554,11 +577,12 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 		allowVal := strings.Join(allowed, ", ")
 		chain := a.methodNotAllowedChain
 		if chain == nil {
-			chain = newUnmatchedChain(a.server.middleware, a.server.methodNotAllowedHandler, builtinMethodNotAllowed)
+			chain = newMethodNotAllowedChain(a.server.middleware, a.server.methodNotAllowedHandler)
 		}
-		// Set before the chain, so the Allow header is on the response
-		// whichever handler writes it.
-		c.SetHeader("allow", allowVal)
+		// The end of the chain sets Allow (withAllow), not this function
+		// before the middleware: a middleware's own answer (an auth 401)
+		// must not tell the client which methods a path takes (celeris#889).
+		c.unmatchedAllow = allowVal
 		a.runUnmatched(c, s, chain)
 		if !c.written && !c.detached && s.ResponseWriter != nil {
 			// Nothing answered: a middleware aborted without writing, or

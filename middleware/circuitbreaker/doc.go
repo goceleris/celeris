@@ -9,6 +9,15 @@
 // half-open probe that panics reopens the breaker); the panic continues to
 // the recovery middleware.
 //
+// A request no route matched (the router answers it with a 404, a 405 or the
+// automatic OPTIONS answer, and runs the middleware mounted with Server.Use
+// on the way) reaches no downstream: it is passed on untouched, neither
+// refused while the breaker is Open nor counted, so a stray request for
+// /favicon.ico cannot close a HalfOpen breaker. When such a request does reach
+// the protected downstream (a Server.NotFound handler that forwards to a
+// legacy backend, a Use-mounted middleware serving its own paths), set
+// [Config.CountUnmatched] to refuse and count it like any other.
+//
 // Use [New] to create middleware with default settings (50% threshold,
 // minimum 10 requests, 10 s window, 30 s cooldown). Pass a [Config] to
 // tune [Config.Threshold], [Config.MinRequests], [Config.WindowSize],
