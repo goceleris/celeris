@@ -229,8 +229,8 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 					return // hijacked (handed off) or closed on error — nothing more to arm
 				}
 				// Switched to HTTP/2 (celeris#908): the 101 is sent, arm its recv below.
-			} else {
-				w.flushCarriedReplay(cs)
+			} else if !w.flushCarriedReplay(cs) {
+				return // a refused write: closed (celeris#884)
 			}
 		}
 	}
@@ -299,38 +299,48 @@ func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
 		cs.asyncPromoted.Store(true)
 		w.asyncPromoted.Add(1)
 	}
-	w.flushCarriedReplay(cs)
-	return true
+	return w.flushCarriedReplay(cs)
 }
 
-// Neither replay tail looks at cs.writeRefused, which handleRecv's tails do
-// (respondAndArm closes the conn on it): celeris#884 item 38, left as it was,
-// and not because it cannot be set. makeWriteFn refuses a write only over
-// sendCap(), which a fresh conn does not have unless the replayed handler
-// detaches (then it is maxSendQueueBytesDetached, 64 MiB). But StreamWriteErr
-// marks a refusal too, on an HTTP/1 conn that has not detached, once a
-// StreamWriter's staged response passes the same 64 MiB, and nothing is sent
-// while the handler runs: a carried request whose handler streams more than
-// that sets the flag, and the conn is then left open with that response cut
-// off, until its next request ends at the check of the recv path (or the
-// conn's timeout does). Code reading only, not reproduced: closing here, for
-// parity with handleRecv and epoll's flushCarriedReplay, is a behaviour change
-// no test shows to be needed.
-//
 // flushCarriedReplay ships what a transplant's carried-request replay queued,
-// under cs.detachMu when the conn has one. A carried request can detach during
-// the replay (a WebSocket or SSE handler on a pipelined request), and from
-// then on the middleware goroutine writes through the guarded writeFn, which
-// reads and writes cs.writeBuf, cs.sendBuf and cs.sending under that lock; the
-// flush touches the same fields. handleRecv's twin (respondAndArm) and epoll's
+// under cs.detachMu when the conn has one, and closes the conn when the replay
+// left it with a refused write, as handleRecv's tails do (respondAndArm,
+// celeris#884). It reports whether the conn is still open, so that the caller
+// arms its recv only then.
+//
+// A refusal can be set during the replay without a detach: makeWriteFn refuses
+// a write only over sendCap(), which a fresh conn does not have unless the
+// replayed handler detaches (then it is maxSendQueueBytesDetached, 64 MiB),
+// but StreamWriteErr marks one too, on an HTTP/1 conn that has not detached,
+// once a StreamWriter's staged response passes the same 64 MiB, and nothing is
+// sent while the handler runs. When the handler ends the response itself
+// (it closes its writer after the refused write, as one that defers the Close
+// does) ProcessH1 reports no verdict: the flag is all that says the response
+// is cut. Left alone, the conn stayed open with that response cut off until
+// its next request ended at the check of the recv path, or the conn's timeout.
+// Like respondAndArm, a refused conn is closed instead of flushed: closeConn
+// sends what was staged first.
+//
+// A carried request can detach during the replay (a WebSocket or SSE handler on
+// a pipelined request), and from then on the middleware goroutine writes
+// through the guarded writeFn, which reads and writes cs.writeBuf, cs.sendBuf
+// and cs.sending under that lock; the flush touches the same fields, and a
+// refusal is set there under it. handleRecv's twin (respondAndArm) and epoll's
 // flushCarriedReplay take the lock too (celeris#1084). Worker thread, on a
 // conn fresh from attachAdoptedFD: cs.detachMu is not held by this thread, and
 // the read of the field is ordered after the replay's ProcessH1, where an
 // OnDetach installs it.
-func (w *Worker) flushCarriedReplay(cs *connState) {
+func (w *Worker) flushCarriedReplay(cs *connState) bool {
 	mu := cs.detachMu
 	if mu != nil {
 		mu.Lock()
+	}
+	if cs.writeRefused {
+		if mu != nil {
+			mu.Unlock()
+		}
+		w.closeConn(cs.fd)
+		return false
 	}
 	if w.flushSend(cs) {
 		w.markDirty(cs)
@@ -338,6 +348,7 @@ func (w *Worker) flushCarriedReplay(cs *connState) {
 	if mu != nil {
 		mu.Unlock()
 	}
+	return true
 }
 
 // endCarriedReplay finishes a replay whose ProcessH1 returned a non-nil
