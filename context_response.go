@@ -1446,6 +1446,12 @@ func (c *Context) SetResponseBody(body []byte) {
 func (c *Context) ResponseStatus() int { return c.capturedStatus }
 
 // IsWritten returns true if a response has been written to the wire.
+//
+// It is also true once [Context.StreamWriter] has been taken, before anything
+// is sent through the writer: the handler that holds it may still use it. The
+// recovery and timeout middleware give such an unused response back once the
+// handler has returned or panicked (celeris#835); a middleware of your own
+// that must answer in that case cannot tell it apart from a committed one.
 func (c *Context) IsWritten() bool { return c.written }
 
 // BytesWritten returns the response body size in bytes, or 0 if no response
