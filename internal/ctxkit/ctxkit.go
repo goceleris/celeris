@@ -12,6 +12,17 @@ import (
 // internal/conn/h1.go uses it to release cached contexts on connection close.
 var ReleaseContext func(c any)
 
+// ReclaimUnusedStreamWriter is registered by the celeris package at init time:
+// it is Context.reclaimUnusedStreamWriter for the middleware that decide, once
+// the handler below them has returned or panicked, whether the response is
+// still theirs to write (recovery, timeout). c is the *celeris.Context. It
+// reports whether it gave the response back: a Context whose response is
+// "written" only because StreamWriter was taken, with nothing sent through any
+// writer, is answered as if nothing had been written (celeris#835, #888).
+// Context.IsWritten stays what it was (true for such a Context) so that a
+// handler that still holds its StreamWriter is not made to answer twice.
+var ReclaimUnusedStreamWriter func(c any) bool
+
 // FileFromDir is registered by the celeris package at init time: it is
 // Context.FileFromDir for the static middleware, which must set the validators
 // of the file it serves from the descriptor that is then served, not from a
