@@ -33,8 +33,10 @@ var ErrSwitchingNotFrozen = errors.New("celeris/engine: adaptive engine switchin
 // listening.
 type EventLoopProvider interface {
 	// NumWorkers returns the number of worker event loops available for
-	// driver FD registration. This is typically equal to the engine's
-	// configured worker count (one per CPU core).
+	// driver FD registration. This is the loops the engine started: the
+	// configured worker count, or on Linux for a default count on a host of alike
+	// CPUs GOMAXPROCS less a reserve (celeris#756, #757), and fewer on a
+	// big.LITTLE host or under an io_uring memlock cap.
 	NumWorkers() int
 	// WorkerLoop returns the WorkerLoop for worker n, where 0 <= n < NumWorkers().
 	// Calling WorkerLoop with an out-of-range index panics.

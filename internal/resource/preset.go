@@ -14,6 +14,9 @@ const (
 	MaxBufferSize = 262144
 )
 
+// resolveDefaults is the resolved default before any user value. Workers is
+// GOMAXPROCS, not the loops the native engines start: on Linux they take a
+// default count down by a reserve on a host of alike CPUs (celeris#756, #757).
 func resolveDefaults() ResolvedResources {
 	numCPU := runtime.GOMAXPROCS(0)
 	if numCPU < 1 {

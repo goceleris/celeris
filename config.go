@@ -120,7 +120,27 @@ type Config struct {
 	// Engine is the I/O engine (default Adaptive on Linux, Std elsewhere).
 	Engine EngineType
 
-	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
+	// Workers is the number of I/O worker goroutines (the loops of the native
+	// engines). Default: GOMAXPROCS, less a reserve on Linux: with Workers unset
+	// the native engines (epoll, io_uring, adaptive) on a host whose allowed
+	// CPUs are alike start GOMAXPROCS - max(1, GOMAXPROCS/8) loops (no reserve
+	// for a GOMAXPROCS of 2 or less): 28 on 32, 14 on 16, 7 on 8, 3 on 4, 2 on
+	// 3. A loop locks its thread and can block in the kernel while it holds its
+	// P, so the Ps that run no loop are left to the goroutines that are not
+	// loops (async and WebSocket handlers, the HTTP/2 stream pool, the garbage
+	// collector's workers). That mechanism is inferred from traces, not
+	// established; the reserve is provisional, its effect on latency is still
+	// being measured, and it may change (celeris#756, #757). A Workers you set
+	// is honoured as it is, so to opt out of the reserve set Workers to
+	// runtime.GOMAXPROCS(0): on such a host that starts one loop per P, as
+	// before the reserve (on a big.LITTLE host the default is not reduced, see
+	// below, and a Workers set above the non-little CPUs wraps loops over
+	// them). What follows the loop count follows the loops started: Metrics.Workers,
+	// the server-wide limit of MaxConns, and a driver pool sized from the
+	// engine's NumWorkers (a PostgreSQL pool opened with WithEngine, whose
+	// default of 4*NumWorkers is 56, not 64, on 16 CPUs). A pool sized from
+	// GOMAXPROCS or the standalone driver loop (Redis commands, Memcached with
+	// the native engines) is unchanged.
 	//
 	// On Linux the native engines (epoll, io_uring) pin each loop to one CPU
 	// the process is allowed to use. On a host whose allowed CPUs differ in
@@ -225,8 +245,9 @@ type Config struct {
 	// host, one observation); an automatic extra loop on the little CPU was
 	// tried and rejected because it raised tail latency on other workloads.
 	// Moving the interrupt is the host operator's call (README, "NIC interrupts
-	// on big.LITTLE hosts"). Hosts whose CPUs are alike are unchanged and read no
-	// NIC file (README, "CPU pinning").
+	// on big.LITTLE hosts"). Hosts whose CPUs are alike read no
+	// NIC file; the reserve above is their only difference (README, "CPU
+	// pinning").
 	Workers int
 
 	// WorkloadHint optionally declares the expected steady-state concurrency.
