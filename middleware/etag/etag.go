@@ -134,6 +134,11 @@ func New(config ...Config) celeris.HandlerFunc {
 				c.SetHeader("etag", tag)
 			}
 			c.DiscardBufferedResponse()
+			if status == 206 {
+				// The 206's Content-Range describes a part, which a 304
+				// does not carry (RFC 9110 14.4: it belongs to 206 and 416).
+				dropContentRange(c)
+			}
 			if nerr := c.NoContent(304); nerr != nil && err == nil {
 				err = nerr
 			}
@@ -148,6 +153,30 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 		return err
 	}
+}
+
+// dropContentRange removes the content-range response header, if set. It
+// rebuilds the list only when the header is there, so the common 304 is
+// untouched.
+func dropContentRange(c *celeris.Context) {
+	hs := c.ResponseHeaders()
+	found := false
+	for _, h := range hs {
+		if h[0] == "content-range" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	rebuilt := make([][2]string, 0, len(hs)-1)
+	for _, h := range hs {
+		if h[0] != "content-range" {
+			rebuilt = append(rebuilt, h)
+		}
+	}
+	c.SetResponseHeaders(rebuilt)
 }
 
 // hexDigit returns the lowercase hex character for the low 4 bits of b.

@@ -140,7 +140,7 @@ func setRingWaitSeam884(t *testing.T, fn func(*Worker, ringWaitMode, error) erro
 func warmLoad884(t *testing.T, addr string, n int, think time.Duration) (stop func() loadResult) {
 	t.Helper()
 	ch := make(chan struct{})
-	wait := runKeepAliveLoadPaced(t, addr, n, ch, think)
+	wait := runKeepAliveLoadPaced(t, addr, n, ch, think, time.Second) // celeris#884: a worker that oversleeps after EBUSY fails, as before
 	return func() loadResult {
 		close(ch)
 		return wait()
