@@ -4174,6 +4174,10 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			if tryInline {
 				cs.h1State.InlineMode = true
 			}
+			// The tail's requests came in with this recv: stamp it, not the
+			// recv that carried the headers of the body's request
+			// (celeris#884).
+			cs.h1State.NowNs = now
 			verdict = conn.ProcessH1(cs.ctx, rest, cs.h1State, w.handler, cs.writeFn)
 			if tryInline && cs.h1State != nil {
 				cs.h1State.InlineMode = false
@@ -6368,6 +6372,14 @@ func (w *Worker) serveAsync(cs *connState, holds *dispatchHolds) {
 				w.enqueueDetach(cs)
 			}
 			return
+		}
+		// The request's start stamp: the worker writes H1State.NowNs only for
+		// a recv it reads itself, and this conn's recvs go to this goroutine,
+		// so the stamp was the instant of the conn's last inline recv, however
+		// long ago (celeris#884). One clock read per feed, not per frame of a
+		// detached conn (it takes no detachMu here: its requests are over).
+		if acquiredDetachMu && cs.h1State != nil {
+			cs.h1State.NowNs = mono.Now()
 		}
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
 		// H1→H2 upgrade on the async dispatch path. ProcessH1 has

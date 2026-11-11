@@ -61,8 +61,8 @@ func TestRoot304ContainmentRunsForEveryGuess888(t *testing.T) {
 				calls.Store(0)
 				rec, err := get888(t, mw, tg.path, g.hdr...)
 				if tg.want == 400 {
-					if rec.StatusCode == 304 || !isHTTP400(err) {
-						t.Errorf("status %d, err %v; want a 400", rec.StatusCode, err)
+					if rec.StatusCode == 304 || !refused888(rec, err) {
+						t.Errorf("status %d, err %v; want the request passed on", rec.StatusCode, err)
 					}
 				} else if err != nil {
 					t.Errorf("unexpected error: %v", err)
