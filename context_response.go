@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 	"unsafe"
@@ -1156,7 +1157,8 @@ func (c *Context) serveStaticFile(root, tail string) error {
 		return NewHTTPError(404, "Not Found")
 	}
 	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
-	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, ctxkit.ErrEscapes) ||
+		errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		// a path to a hidden file is a 404 whether or not it exists, and so is a
 		// file that is not there (the raw lstat error was a 500)
 		return NewHTTPError(404, "Not Found")
@@ -1187,14 +1189,14 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 		return err
 	}
 	if !ctxkit.ResolvedWithin(resolvedBase, resolved) {
-		return NewHTTPError(400, "invalid file path")
+		return NewHTTPError(400, "invalid file path").WithError(ctxkit.ErrEscapes)
 	}
 	if hidden != nil {
 		// Where the path leads, not only what it says: a visible name that is a
 		// symlink to a dotfile of the tree is refused like the dotfile.
 		rel, ok := ctxkit.RelWithin(resolvedBase, resolved)
 		if !ok {
-			return NewHTTPError(400, "invalid file path")
+			return NewHTTPError(400, "invalid file path").WithError(ctxkit.ErrEscapes)
 		}
 		if hidden(rel) {
 			return ctxkit.ErrHidden
