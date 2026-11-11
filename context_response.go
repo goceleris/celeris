@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 	"unsafe"
@@ -1156,7 +1157,8 @@ func (c *Context) serveStaticFile(root, tail string) error {
 		return NewHTTPError(404, "Not Found")
 	}
 	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
-	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, ctxkit.ErrEscapes) ||
+		errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		// a path to a hidden file is a 404 whether or not it exists, and so is a
 		// file that is not there (the raw lstat error was a 500)
 		return NewHTTPError(404, "Not Found")
@@ -1187,14 +1189,14 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 		return err
 	}
 	if !ctxkit.ResolvedWithin(resolvedBase, resolved) {
-		return NewHTTPError(400, "invalid file path")
+		return NewHTTPError(400, "invalid file path").WithError(ctxkit.ErrEscapes)
 	}
 	if hidden != nil {
 		// Where the path leads, not only what it says: a visible name that is a
 		// symlink to a dotfile of the tree is refused like the dotfile.
 		rel, ok := ctxkit.RelWithin(resolvedBase, resolved)
 		if !ok {
-			return NewHTTPError(400, "invalid file path")
+			return NewHTTPError(400, "invalid file path").WithError(ctxkit.ErrEscapes)
 		}
 		if hidden(rel) {
 			return ctxkit.ErrHidden
@@ -1320,7 +1322,10 @@ func (c *Context) StreamReader(code int, contentType string, r io.Reader) error 
 // and "*/*;q=0, text/html" accepts text/html alone (RFC 9110 12.5.1). Of the
 // types with the highest weight, the one whose entry comes first in the header
 // wins, and then the first offer: "*/*, application/json" gives the first of
-// the offers, whichever it is.
+// the offers, whichever it is. The offers are types without parameters, so a
+// range that carries parameters ("text/html;level=1") ranks below the same
+// type written without: "text/html;level=1;q=0, text/html" refuses the level-1
+// variant and accepts text/html.
 //
 // The response then depends on Accept, so Negotiate adds Accept to the
 // response's Vary header (once): a shared cache, or middleware/singleflight,

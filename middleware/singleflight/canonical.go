@@ -25,8 +25,9 @@ const maxCanonicalAE = 256
 //
 // Accept-Encoding is canonical as the negotiator reads it: the list that
 // internal/negotiate.ParseInto makes of it (what c.AcceptsEncodings, and so
-// compress, uses), written as the lowercase coding and, unless it is 1, its
-// weight, entries separated by ",", in order. So two values have one form
+// compress, uses), written as the lowercase coding, ";p" if the entry carried
+// a parameter other than the weight and, unless it is 1, its weight, entries
+// separated by ",", in order. So two values have one form
 // exactly when the negotiator gives them one answer: "gzip, deflate, br"
 // and "gzip,deflate,br", "GZIP" and "gzip", "gzip;q=0.8" and "gzip; q=0.8",
 // and "gzip;q=0.80" are one value, and so are "gzip;q=0" and "gzip;Q=0" (the
@@ -47,6 +48,12 @@ func canonicalAppend(dst []byte, name, v string) []byte {
 			dst = append(dst, ',')
 		}
 		dst = append(dst, e.MediaType...)
+		if e.Params {
+			// An entry with parameters ranks below the same coding without
+			// them ("gzip;foo=1;q=0, gzip" accepts gzip, "gzip;q=0, gzip"
+			// refuses it), so it is a different value.
+			dst = append(dst, ";p"...)
+		}
 		if e.Quality != 1 {
 			dst = append(dst, ";q="...)
 			dst = strconv.AppendFloat(dst, e.Quality, 'g', -1, 64)
