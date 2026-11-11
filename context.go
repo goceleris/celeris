@@ -24,6 +24,9 @@ func init() {
 	ctxkit.ReleaseContext = func(c any) {
 		releaseContext(c.(*Context))
 	}
+	ctxkit.ReclaimUnusedStreamWriter = func(c any) bool {
+		return c.(*Context).reclaimUnusedStreamWriter()
+	}
 }
 
 // The functions below give the module's test infrastructure (celeristest,
