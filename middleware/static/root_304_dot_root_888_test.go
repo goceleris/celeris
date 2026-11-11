@@ -19,8 +19,10 @@ import (
 // root_spellings_888 tests cover what these roots serve). Until celeris#888
 // item 46 was fixed serveOS compared the joined path with cleanRoot + "/",
 // which no path below "." or "/" starts with, so only the root's own index got
-// here and the others were passed on unlooked at. The assertions: no 304, a
-// 400 as for any escape, and no validators of the target on the response.
+// here and the others were passed on unlooked at. The assertions: no 304, the
+// request passed on as a path with no file (celeris#888 item 91: a 400 for a
+// link and a 404 for a missing name told a client which names exist), nothing
+// written, and no validators of the target on the response.
 
 func TestRoot304DotRootDoesNotFollowSymlinkOut888(t *testing.T) {
 	secretTag := weakETag(secretTime888, int64(len(secretBytes888)))
@@ -73,8 +75,8 @@ func TestRoot304DotRootDoesNotFollowSymlinkOut888(t *testing.T) {
 					if rec.StatusCode == 304 {
 						t.Errorf("a path outside the Root answered 304 (etag %q, last-modified %q)", rec.Header("etag"), rec.Header("last-modified"))
 					}
-					if !isHTTP400(err) {
-						t.Errorf("handler error %v, want a 400 (FileFromDir's refusal)", err)
+					if err != nil || rec.StatusCode != 0 || len(rec.Body) != 0 {
+						t.Errorf("handler error %v, status %d, body %q: want the request passed on, as for a name that is not there", err, rec.StatusCode, rec.Body)
 					}
 					for _, h := range []string{"etag", "last-modified"} {
 						if v := rec.Header(h); v != "" {

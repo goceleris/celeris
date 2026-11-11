@@ -191,3 +191,60 @@ func isNotRegular888(err error) bool {
 	var he *HTTPError
 	return errors.As(err, &he) && he.Code == 404 && errors.Is(err, ctxkit.ErrNotRegular)
 }
+
+// A symlink that leaves the base is still a 400 for a caller of FileFromDir
+// (the path is the caller's to choose), and the error carries ctxkit.ErrEscapes
+// so that middleware/static can answer it as a missing name (celeris#888 item
+// 91). A lexical escape and a missing file are not it.
+func TestFileFromDirEscapeCarriesErrEscapes888(t *testing.T) {
+	tmp := t.TempDir()
+	base := filepath.Join(tmp, "base")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "secret.txt"), []byte("S"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(tmp, "secret.txt"), filepath.Join(base, "link.txt")); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	status, body, err := fileFromDir888(t, base, "link.txt")
+	if !isInvalidPath888(err) || !errors.Is(err, ctxkit.ErrEscapes) || status == 200 || body != "" {
+		t.Errorf("FileFromDir through a symlink out of the base: status %d body %q err %v, want an HTTPError 400 wrapping ErrEscapes", status, body, err)
+	}
+	if _, _, err := fileFromDir888(t, base, "nothing.txt"); errors.Is(err, ctxkit.ErrEscapes) {
+		t.Errorf("a missing file reports ErrEscapes: %v", err)
+	}
+}
+
+// Server.Static answers a symlink out of its root, and a path below a regular
+// file ("a.txt/x", ENOTDIR), as it answers a name that is not there: a 404. A
+// 400 for the link and a 500 for the file told a client which names exist
+// (celeris#888 item 91).
+func TestServeStaticFileEscapeAndNotDirAre404888(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "secret.txt"), []byte("S"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(tmp, "secret.txt"), filepath.Join(root, "leak.txt")); err != nil {
+		t.Skipf("symlinks are not available here: %v", err)
+	}
+	for _, p := range []string{"leak.txt", "a.txt/x", "nothing.txt"} {
+		s, rw := newTestStream("GET", "/s/"+p)
+		c := acquireContext(s)
+		err := c.serveStaticFile(root, p)
+		var he *HTTPError
+		if !errors.As(err, &he) || he.Code != 404 || rw.status != 0 || len(rw.body) != 0 {
+			t.Errorf("Server.Static %s: status %d err %v, want the 404 of a missing name", p, rw.status, err)
+		}
+		releaseContext(c)
+		s.Release()
+	}
+}

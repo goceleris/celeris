@@ -17,7 +17,7 @@ func (discardRW852) WriteResponse(*stream.Stream, int, [][2]string, []byte) erro
 // builds it, with no global middleware and with three that call Next (what
 // an unmatched request now runs, by design), under the sync default and
 // under AsyncHandlers (where the unmatched chain is timed like an adaptive
-// route until it settles; the loop measures the settled state).
+// route and never settles, celeris#886: two clock reads per request).
 func BenchmarkUnmatched852(b *testing.B) {
 	pass := func(c *Context) error { return c.Next() }
 	for _, v := range []struct {
