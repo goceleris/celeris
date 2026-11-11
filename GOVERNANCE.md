@@ -178,7 +178,8 @@ not marked experimental: `celeris`, `celeristest`, `observe`, the
     driver test addresses such as `CELERIS_PG_DSN`, and the numbered
     ones such as `CELERIS_589_*`).
 
-The tuning variables the engines read at startup (the README's
+The tuning variables the engines read at startup, and the Redis driver on
+first use (the README's
 [table](README.md#tuning-environment-variables) says what each does):
 
 | Variable | Level |
@@ -188,6 +189,7 @@ The tuning variables the engines read at startup (the README's
 | `CELERIS_IOURING_SEND_ZC` | supported |
 | `CELERIS_IOURING_MULTISHOT_RECV` | experimental |
 | `CELERIS_IOURING_PBUF_COUNT` | experimental |
+| `CELERIS_REDIS_DIRECT_WAIT` | experimental |
 | `CELERIS_IOURING_FIXED_FILES` | unsupported |
 | `CELERIS_ADAPTIVE_DEBUG` | unsupported |
 | `CELERIS_DEBUG_*` | unsupported |
