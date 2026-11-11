@@ -78,6 +78,69 @@ type servingTarget struct {
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	conns   []net.Conn
+	// byPort is what the target saw of each adopted conn, keyed by the
+	// client's local port (this side's peer port), for attribute.
+	byPort map[int]*adoptedConn
+}
+
+// adoptedConn counts what the target's serving goroutine did on one conn.
+type adoptedConn struct {
+	adoptedAt  time.Time
+	lastRead   atomic.Int64 // sequence number of the last request the target read
+	lastSent   atomic.Int64 // sequence number of the last response the target wrote
+	lastSentAt atomic.Int64 // UnixNano at which that response was written
+}
+
+// attribute says, for each client that ended on a read timeout, where its
+// request stopped; see celeris#892 (from #816 item 4). The target's counts against the
+// client's, by the sequence number each request carries in its path: never
+// adopted (the conn was still the source's, or was closed by it); the last
+// request read is older than the last the client wrote (that request never
+// reached the target's reader: eaten by the source or lost in the hand-off);
+// the last request was read and not answered (the target's goroutine stalled);
+// or it was read and answered (the response was written and the client did
+// not read it within its deadline: a stall of the client or the host, not of
+// the engine), or it was answered, but only after the client's deadline had
+// passed (the target itself was late).
+func (s *servingTarget) attribute(ts []clientTimeout) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := map[string]int{}
+	var detail []string
+	for _, ct := range ts {
+		ac := s.byPort[ct.port]
+		var cls string
+		switch {
+		case ac == nil:
+			cls = "never_adopted"
+		case ac.lastRead.Load() < ct.sent:
+			cls = "request_never_reached_target"
+		case ac.lastSent.Load() < ct.sent:
+			cls = "target_read_not_answered"
+		case ac.lastSentAt.Load() > ct.deadline.UnixNano():
+			cls = "target_answered_after_client_deadline"
+		default:
+			cls = "target_answered_client_missed_it"
+		}
+		counts[cls]++
+		if len(detail) < 8 {
+			if ac == nil {
+				detail = append(detail, fmt.Sprintf("port=%d sent=%d answered=%d %s", ct.port, ct.sent, ct.answered, cls))
+			} else {
+				detail = append(detail, fmt.Sprintf("port=%d client_sent=%d client_answered=%d target_last_read=%d target_last_answered=%d adopted_%s_ago %s",
+					ct.port, ct.sent, ct.answered, ac.lastRead.Load(), ac.lastSent.Load(), time.Since(ac.adoptedAt).Round(time.Millisecond), cls))
+			}
+		}
+	}
+	return fmt.Sprintf("%s; first: [%s]", classes(toInt64(counts)), strings.Join(detail, "; "))
+}
+
+func toInt64(m map[string]int) map[string]int64 {
+	o := make(map[string]int64, len(m))
+	for k, v := range m {
+		o[k] = int64(v)
+	}
+	return o
 }
 
 func (s *servingTarget) AdoptConn(fd int, _ engine.Carryover) error {
@@ -91,8 +154,15 @@ func (s *servingTarget) AdoptConn(fd int, _ engine.Carryover) error {
 		return nil // fd closed above; nothing for the source to reclaim
 	}
 	s.adopted.Add(1)
+	ac := &adoptedConn{adoptedAt: time.Now()}
 	s.mu.Lock()
 	s.conns = append(s.conns, c)
+	if ra, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+		if s.byPort == nil {
+			s.byPort = map[int]*adoptedConn{}
+		}
+		s.byPort[ra.Port] = ac
+	}
 	s.mu.Unlock()
 	s.wg.Add(1)
 	go func() {
@@ -103,11 +173,16 @@ func (s *servingTarget) AdoptConn(fd int, _ engine.Carryover) error {
 			if err != nil {
 				return
 			}
+			if n, err := strconv.ParseInt(strings.TrimPrefix(req.URL.Path, "/"), 10, 64); err == nil {
+				ac.lastRead.Store(n)
+			}
 			_, _ = io.Copy(io.Discard, req.Body)
 			_ = req.Body.Close()
 			if _, err := c.Write([]byte("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nok")); err != nil {
 				return
 			}
+			ac.lastSentAt.Store(time.Now().UnixNano())
+			ac.lastSent.Store(ac.lastRead.Load())
 		}
 	}()
 	return nil
@@ -133,18 +208,68 @@ func (r *refusingTarget) AdoptConn(int, engine.Carryover) error {
 
 // loadResult is what the clients saw.
 type loadResult struct {
-	ok      int64
-	errs    int64
+	ok   int64
+	errs int64
+	slow int64 // replies that took longer than keepAliveSlowReply but came
+	// canary is the longest a 10 ms ticker in the test process was late
+	// while the load ran: a stall of the whole process (the host starved it)
+	// shows here, a delay of the engine alone does not.
+	canary  time.Duration
 	byClass map[string]int64
+	// timeouts is one entry per client that ended on a read timeout, so a
+	// failure can be attributed to the conn that stalled; see
+	// servingTarget.attribute and celeris#892 (from #816 item 4).
+	timeouts []clientTimeout
 }
 
+// clientTimeout is what a keep-alive client knew when its read timed out:
+// the local port (the key servingTarget knows the conn by, as the peer port),
+// how many requests it had written, how many it had read a response to, and
+// the deadline of the read that failed.
+type clientTimeout struct {
+	port     int
+	sent     int64
+	answered int64
+	deadline time.Time // when the read of the last request's reply gave up
+}
+
+// keepAliveCanaryStall is how late the process's own 10 ms ticker has to have
+// been, at its worst, for a slow reply to be put down to the host rather than
+// the engine.
+const keepAliveCanaryStall = 500 * time.Millisecond
+
+// slowRepliesAreSuspect says whether res holds a reply slower than
+// keepAliveSlowReply that the test process cannot blame on itself being
+// starved: the canary ticker, which runs beside the clients, was never more
+// than keepAliveCanaryStall late, so a reply that took over a second was
+// delayed after it left the clients.
+func slowRepliesAreSuspect(res loadResult) bool {
+	return res.slow > 0 && res.canary < keepAliveCanaryStall
+}
+
+// keepAliveReadTimeout is how long a keep-alive client waits for a reply
+// before it counts the request as lost, and keepAliveSlowReply is the wait
+// after which a reply that did come is counted as slow (loadResult.slow) and
+// logged. The wait was a flat 1 s, so a host that starved the process for a
+// second (the Docker VM shared with other containers under -race: 3,614 and
+// 3,638 requests in the load window against a median of 67,167, and the
+// conns' target had answered every request they timed out on, celeris#892
+// (from #816 item 4)) failed the test with read_timeout and nothing to attribute. A
+// request that is lost never gets a reply, so the longer wait still fails it,
+// 10 s later.
+var (
+	keepAliveReadTimeout = 10 * time.Second
+	keepAliveSlowReply   = time.Second
+)
+
 // runKeepAliveLoad drives n keep-alive clients against addr, each sending one
-// request at a time with a 1 s read deadline, until stop is closed. A request
-// the server never answers surfaces as that client's read timeout; the client
-// then stops, so each lost request is exactly one error.
+// request at a time with a keepAliveReadTimeout read deadline, until stop is
+// closed. A request the server never answers surfaces as that client's read
+// timeout (the wait for it ends keepAliveReadTimeout after the request); the
+// client then stops, so each lost request is exactly one error.
 func runKeepAliveLoad(t *testing.T, addr string, n int, stop <-chan struct{}) func() loadResult {
 	t.Helper()
-	return runKeepAliveLoadPaced(t, addr, n, stop, 0)
+	return runKeepAliveLoadPaced(t, addr, n, stop, 0, keepAliveReadTimeout)
 }
 
 // runKeepAliveLoadPaced is runKeepAliveLoad with think between a client's
@@ -153,11 +278,35 @@ func runKeepAliveLoad(t *testing.T, addr string, n int, stop <-chan struct{}) fu
 // and takes no wait at all, or only the one that has sends to wait for; with
 // think the clients leave it idle between requests, and the wait it takes
 // then is the timed one (celeris#884 item 49, the test of that wait).
-func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{}, think time.Duration) func() loadResult {
+// readTimeout is how long a client waits for each reply: runKeepAliveLoad
+// passes keepAliveReadTimeout, and a test that relies on a short deadline to
+// catch a stopped worker passes its own (warmLoad884: 1 s).
+func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{}, think, readTimeout time.Duration) func() loadResult {
 	t.Helper()
-	var ok, errsN atomic.Int64
+	canaryStop := make(chan struct{})
+	var canaryMax atomic.Int64
+	go func() {
+		const period = 10 * time.Millisecond
+		tk := time.NewTicker(period)
+		defer tk.Stop()
+		last := time.Now()
+		for {
+			select {
+			case <-canaryStop:
+				return
+			case <-tk.C:
+				now := time.Now()
+				if late := int64(now.Sub(last) - period); late > canaryMax.Load() {
+					canaryMax.Store(late)
+				}
+				last = now
+			}
+		}
+	}()
+	var ok, errsN, slowN atomic.Int64
 	var mu sync.Mutex
 	byClass := map[string]int64{}
+	var timeouts []clientTimeout
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -169,12 +318,19 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 			defer wg.Done()
 			defer func() { _ = c.Close() }()
 			br := bufio.NewReader(c)
+			var sent, answered int64
+			var deadline time.Time
 			fail := func(err error) {
 				errsN.Add(1)
 				cls := "other"
 				switch {
 				case errors.Is(err, os.ErrDeadlineExceeded):
 					cls = "read_timeout"
+					if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
+						mu.Lock()
+						timeouts = append(timeouts, clientTimeout{port: la.Port, sent: sent, answered: answered, deadline: deadline})
+						mu.Unlock()
+					}
 				case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 					cls = "eof"
 				case errors.Is(err, syscall.ECONNRESET):
@@ -190,11 +346,17 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 					return
 				default:
 				}
-				if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+				// The request path is its sequence number on this conn,
+				// which servingTarget.attribute reads back (the handlers
+				// ignore the path).
+				if _, err := c.Write([]byte("GET /" + strconv.FormatInt(sent+1, 10) + " HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 					fail(err)
 					return
 				}
-				_ = c.SetReadDeadline(time.Now().Add(time.Second))
+				sent++
+				asked := time.Now()
+				deadline = asked.Add(readTimeout)
+				_ = c.SetReadDeadline(deadline)
 				resp, err := http.ReadResponse(br, nil)
 				if err != nil {
 					fail(err)
@@ -206,6 +368,10 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 					fail(err)
 					return
 				}
+				if time.Since(asked) > keepAliveSlowReply {
+					slowN.Add(1)
+				}
+				answered++
 				ok.Add(1)
 				if think > 0 {
 					select {
@@ -219,13 +385,14 @@ func runKeepAliveLoadPaced(t *testing.T, addr string, n int, stop <-chan struct{
 	}
 	return func() loadResult {
 		wg.Wait()
+		close(canaryStop)
 		mu.Lock()
 		defer mu.Unlock()
 		cp := map[string]int64{}
 		for k, v := range byClass {
 			cp[k] = v
 		}
-		return loadResult{ok: ok.Load(), errs: errsN.Load(), byClass: cp}
+		return loadResult{ok: ok.Load(), errs: errsN.Load(), slow: slowN.Load(), canary: time.Duration(canaryMax.Load()), byClass: cp, timeouts: append([]clientTimeout(nil), timeouts...)}
 	}
 }
 
@@ -262,10 +429,10 @@ func transplantUnderLoad(t *testing.T, e *Engine, addr string, n int, tgt engine
 	res := wait()
 	e.StopTransplant()
 	time.Sleep(100 * time.Millisecond)
-	t.Logf("celeris657 load conns=%d ok=%d errs=%d classes=[%s] W1T=%d W1U=%d W1C=%d W2=%d "+
+	t.Logf("celeris657 load conns=%d ok=%d slow=%d errs=%d classes=[%s] W1T=%d W1U=%d W1C=%d W2=%d "+
 		"held=%d reaps=%d misses=%d rescued=%d doubleclaim=%d detached=%d "+
 		"claimdeferred=%d reapfailed=%d reapunsupported=%d",
-		n, res.ok, res.errs, classes(res.byClass),
+		n, res.ok, res.slow, res.errs, classes(res.byClass),
 		e.metrics.handoffLoss.staleRecvDataTransplanted.Load(),
 		e.metrics.handoffLoss.staleRecvDataUnattributed.Load(),
 		e.metrics.handoffLoss.staleRecvDataClosed.Load(),
@@ -409,8 +576,18 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 				e.metrics.handoffLoss.staleRecvDataUnattributed.Load(); tr != 0 || un != 0 {
 				t.Errorf("stale recv data after the hand-offs: Transplanted=%d Unattributed=%d, want 0/0", tr, un)
 			}
+			if res.slow > 0 {
+				msg := fmt.Sprintf("%d replies took over %s (the process's 10 ms ticker was at worst %s late)",
+					res.slow, keepAliveSlowReply, res.canary.Round(time.Millisecond))
+				if slowRepliesAreSuspect(res) {
+					t.Errorf("%s: the process was not stalled, so the engine or the hand-off delayed them", msg)
+				} else {
+					t.Logf("%s: the process itself was stalled, not failed: celeris#892 (from #816 item 4)", msg)
+				}
+			}
 			if res.errs != 0 {
-				t.Errorf("clients saw %d errors (%s), want 0", res.errs, classes(res.byClass))
+				t.Errorf("clients saw %d errors (%s), want 0; attribution of the read timeouts: %s",
+					res.errs, classes(res.byClass), tgt.attribute(res.timeouts))
 			}
 			got := tgt.adopted.Load()
 			// The weak branch. The gate above leaves it reachable only
@@ -541,7 +718,7 @@ func TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen(t *testing.T) {
 			e.StopTransplant()
 			time.Sleep(100 * time.Millisecond)
 		}
-		time.Sleep(1200 * time.Millisecond) // a stranded conn's 1 s read deadline expires in here
+		time.Sleep(1200 * time.Millisecond) // a stranded conn gets no reply in here; it ends in wait() below as a rescued hold (check) or a read timeout
 		close(stop)
 		res := wait()
 		t.Logf("celeris657 flaps=5 ok=%d errs=%d classes=[%s] refused=%d", res.ok, res.errs,
@@ -728,4 +905,134 @@ func TestWorkerParksWithNothingPending(t *testing.T) {
 			t.Errorf("worker %d parked with %d SQE(s) queued and never submitted", i, p)
 		}
 	}
+}
+
+// TestServingTargetAttributesTimeouts pins the classes servingTarget.attribute
+// puts a client read timeout in, one conn of each: celeris#892 (from #816
+// item 4).
+func TestServingTargetAttributesTimeouts(t *testing.T) {
+	tgt := &servingTarget{byPort: map[int]*adoptedConn{}}
+	deadline := time.Now()
+	add := func(port int, read, sent int64, sentAt time.Time) {
+		ac := &adoptedConn{adoptedAt: time.Now()}
+		ac.lastRead.Store(read)
+		ac.lastSent.Store(sent)
+		ac.lastSentAt.Store(sentAt.UnixNano())
+		tgt.byPort[port] = ac
+	}
+	add(1, 6, 6, deadline.Add(-time.Second))  // the target answered request 7's predecessor; 7 never arrived
+	add(2, 7, 6, deadline.Add(-time.Second))  // read 7, did not answer it
+	add(3, 7, 7, deadline.Add(-time.Second))  // answered 7 before the client gave up: the client missed the response
+	add(5, 7, 7, deadline.Add(2*time.Second)) // answered 7 after the client gave up: the target was late
+	ts := []clientTimeout{
+		{port: 1, sent: 7, deadline: deadline}, {port: 2, sent: 7, deadline: deadline},
+		{port: 3, sent: 7, deadline: deadline}, {port: 4, sent: 7, deadline: deadline},
+		{port: 5, sent: 7, deadline: deadline},
+	}
+	got := tgt.attribute(ts)
+	for _, want := range []string{
+		"never_adopted=1", "request_never_reached_target=1", "target_read_not_answered=1",
+		"target_answered_client_missed_it=1", "target_answered_after_client_deadline=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("attribution %q lacks %q", got, want)
+		}
+	}
+}
+
+// TestSlowRepliesAreSuspect pins when a slow reply fails the hand-off test
+// celeris#892 (from #816 item 4): only when the test process itself ran on
+// time, as the canary shows, so the delay was the engine's. A stalled process
+// (a host that starved it) is logged, not failed.
+func TestSlowRepliesAreSuspect(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		res  loadResult
+		want bool
+	}{
+		{"no_slow_reply", loadResult{canary: time.Millisecond}, false},
+		{"slow_reply_on_a_quiet_process", loadResult{slow: 1, canary: 40 * time.Millisecond}, true},
+		{"slow_reply_in_a_stalled_process", loadResult{slow: 1, canary: 2 * time.Second}, false},
+	} {
+		if got := slowRepliesAreSuspect(tc.res); got != tc.want {
+			t.Errorf("%s: slowRepliesAreSuspect=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// keepAliveLoadAgainst serves each conn the function gets, and returns the
+// address and the result of a one-client load against it.
+func keepAliveLoadAgainst(t *testing.T, serve func(c net.Conn)) loadResult {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = c.Close() }()
+				serve(c)
+			}()
+		}
+	}()
+	stop := make(chan struct{})
+	wait := runKeepAliveLoad(t, ln.Addr().String(), 1, stop)
+	time.AfterFunc(1800*time.Millisecond, func() { close(stop) })
+	return wait()
+}
+
+// TestKeepAliveLoadToleratesAStalledReply is the harness half of celeris#892
+// (from #816 item 4): a reply that takes longer than the old flat 1 s read deadline
+// (the host starved the process) is a slow reply, not an error, while a reply
+// that never comes is still a read timeout, once keepAliveReadTimeout has
+// passed. It failed with the 1 s deadline: errs=1 for the stalled reply.
+func TestKeepAliveLoadToleratesAStalledReply(t *testing.T) {
+	savedTimeout, savedSlow := keepAliveReadTimeout, keepAliveSlowReply
+	t.Cleanup(func() { keepAliveReadTimeout, keepAliveSlowReply = savedTimeout, savedSlow })
+	reply := func(c net.Conn) {
+		_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"))
+	}
+	t.Run("stalled_reply_is_slow_not_an_error", func(t *testing.T) {
+		keepAliveReadTimeout, keepAliveSlowReply = 5*time.Second, time.Second
+		first := true
+		res := keepAliveLoadAgainst(t, func(c net.Conn) {
+			br := bufio.NewReader(c)
+			for {
+				if _, err := http.ReadRequest(br); err != nil {
+					return
+				}
+				if first {
+					first = false
+					time.Sleep(1300 * time.Millisecond) // longer than the old 1 s deadline
+				}
+				reply(c)
+			}
+		})
+		if res.errs != 0 {
+			t.Fatalf("a reply 1.3 s late was an error: errs=%d (%s)", res.errs, classes(res.byClass))
+		}
+		if res.slow < 1 { // under the load this models a second reply can be late too
+			t.Errorf("slow=%d, want at least 1 (the stalled reply)", res.slow)
+		}
+	})
+	t.Run("lost_request_still_times_out", func(t *testing.T) {
+		keepAliveReadTimeout, keepAliveSlowReply = 1500*time.Millisecond, time.Second
+		res := keepAliveLoadAgainst(t, func(c net.Conn) {
+			br := bufio.NewReader(c)
+			_, _ = http.ReadRequest(br)
+			time.Sleep(3 * time.Second) // never answers within the deadline
+		})
+		if res.byClass["read_timeout"] != 1 || res.errs != 1 {
+			t.Fatalf("a request that is never answered: errs=%d (%s), want one read_timeout", res.errs, classes(res.byClass))
+		}
+		if len(res.timeouts) != 1 {
+			t.Errorf("timeouts recorded: %d, want 1", len(res.timeouts))
+		}
+	})
 }
