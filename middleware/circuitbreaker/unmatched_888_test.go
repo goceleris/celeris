@@ -99,6 +99,19 @@ func TestUnmatchedRequestsDoNotCountAgainstTheBreaker888(t *testing.T) {
 	if st := do("GET", "/ok"); st != 200 {
 		t.Errorf("probe GET /ok: %d, want 200", st)
 	}
+	// The std engine flushes a c.String reply to the client from inside the
+	// handler, before the breaker middleware regains control after Next and
+	// records the probe's result, so the client can see the 200 and read the
+	// state a moment before the HalfOpen -> Closed transition. Wait for it.
+	// (A failed probe is not racy this way: the error is returned up the chain
+	// and answered after the breaker has settled.) The checks inside the loop
+	// above stay immediate: an unmatched request is never counted, so it
+	// neither starts nor settles a probe, and the Open state only changes when
+	// a counted request arrives.
+	deadline := time.Now().Add(5 * time.Second)
+	for brk.State() != Closed && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if got := brk.State(); got != Closed {
 		t.Errorf("after a successful probe: %s, want closed", got)
 	}
