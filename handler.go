@@ -707,7 +707,14 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 // RouteAsync reports whether the route matching method+path is configured
 // for async dispatch. Implements stream.AsyncRouteResolver so the H2
 // processor can choose inline vs. pooled handler execution per stream.
+//
+// path is a request target and may carry a query string (the H1 engines pass
+// it as parsed): it is cut at the first '?', as Context.extractRequestInfo does
+// for the router lookup, so both resolve the same route (celeris#857).
 func (a *routerAdapter) RouteAsync(method, path string) bool {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
 	return a.server.router.routeAsync(method, path)
 }
 
