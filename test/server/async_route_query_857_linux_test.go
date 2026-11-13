@@ -135,8 +135,10 @@ func TestAsyncRouteWithQueryRunsOnDispatchGoroutineH1857(t *testing.T) {
 // A connection promoted by an Async route requested with a query string stays
 // promoted: the revert check of the io_uring engine (canRevertToInline) asks the
 // router about the promoting route again at every park, with the path it
-// recorded, and a path that still carried its query came back "not async", so
-// the conn was handed back to the loop and promoted again by the next request.
+// recorded (CurrentRoute, query included). Unless RouteAsync itself cuts the
+// query, that comes back "not async" and the conn churns between the loop and
+// the dispatch goroutine (one promotion per request). On main it was never
+// promoted at all (rose by 0).
 func TestAsyncRouteWithQueryKeepsConnPromotedOnce857(t *testing.T) {
 	for _, a := range arms848() {
 		t.Run(a.name, func(t *testing.T) {
