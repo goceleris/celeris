@@ -123,8 +123,8 @@ type Config struct {
 	// Workers is the number of I/O worker goroutines (the loops of the native
 	// engines). Default: GOMAXPROCS, less a reserve on Linux: with Workers unset
 	// the native engines (epoll, io_uring, adaptive) on a host whose allowed
-	// CPUs are alike start GOMAXPROCS - max(1, GOMAXPROCS/8) loops (no reserve
-	// for a GOMAXPROCS of 2 or less): 28 on 32, 14 on 16, 7 on 8, 3 on 4, 2 on
+	// CPUs are alike start GOMAXPROCS - max(1, GOMAXPROCS/4) loops (no reserve
+	// for a GOMAXPROCS of 2 or less): 24 on 32, 12 on 16, 6 on 8, 3 on 4, 2 on
 	// 3. A loop locks its thread and can block in the kernel while it holds its
 	// P, so the Ps that run no loop are left to the goroutines that are not
 	// loops (async and WebSocket handlers, the HTTP/2 stream pool, the garbage

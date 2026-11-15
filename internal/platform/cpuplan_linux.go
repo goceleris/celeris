@@ -221,16 +221,21 @@ func schedAllowedCPUs() ([]int, error) {
 // loop (celeris#756, #757; a mechanism inferred from traces, not established).
 // The reserve leaves that many Ps to them.
 //
-// max(1, n/8), none for n <= 2 (a count that small would drop to one loop or
-// none): 14 of 16, chosen by the maintainer after a cluster comparison of 16,
-// 14 and 12 loops on one amd64 host. The runs on the final commit that would
-// confirm the reserve are still owed, so the value may change; changing it is
-// this function's one return statement (celeris#756, #757).
+// max(1, n/4), none for n <= 2 (a count that small would drop to one loop or
+// none): 12 of 16. It was max(1, n/8), 14 of 16, until a cluster comparison on
+// one amd64 host (celeris#756: 16 CPUs, WebSocket large-echo p99 against the
+// std engine, 5 repetitions per arm, the two rated levels 0.5 and 0.75 of
+// saturation) found that the Ps left free decide the tail: 14 loops on 16 Ps
+// 3.26 and 8.75 times, 12 loops 1.45 and 3.37 times at the same levels (a
+// measurement of one host, lane-finding, not a closing run). The runs on the
+// final commit that would confirm the reserve are still owed, so the value may
+// change; changing it is this function's one return statement (celeris#756,
+// #757).
 func defaultLoopReserve(n int) int {
 	if n <= 2 {
 		return 0
 	}
-	return max(1, n/8)
+	return max(1, n/4)
 }
 
 func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
