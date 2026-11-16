@@ -26,7 +26,15 @@ func TestGetChunkClasses756(t *testing.T) {
 		if len(b) != n {
 			t.Fatalf("getChunk(%d): len %d", n, len(b))
 		}
-		if c := cap(b); c < n || c&(c-1) != 0 {
+		c := cap(b)
+		switch {
+		case n < 512:
+			// Below the smallest class: an exactly sized plain allocation,
+			// never rounded up to 512 B.
+			if c != n {
+				t.Fatalf("getChunk(%d): cap %d, want %d (small reads are not rounded up)", n, c, n)
+			}
+		case c < n || c&(c-1) != 0:
 			t.Fatalf("getChunk(%d): cap %d is not a power-of-two class >= n", n, c)
 		}
 		putChunk(b)
