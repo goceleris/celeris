@@ -227,14 +227,16 @@ func tryEngineUpgrade(c *celeris.Context, acceptKey, subproto string,
 	backpressure, highPct, lowPct int) (*Conn, func()) {
 
 	reader := newChanReader(backpressure, highPct, lowPct)
+	// The engine callback is the reader's only producer and always goes
+	// through AppendCopy, so its chunks come from the chunk pool and Read
+	// returns them (celeris#756). Set before the first delivery.
+	reader.recycle = true
 
 	if !c.UpgradeWebSocket(func(data []byte) {
 		// Called on the event loop thread — must NOT block.
 		// COPY first because the engine reuses its read buffer after the
-		// callback returns; chanReader stores the slice as-is.
-		cp := make([]byte, len(data))
-		copy(cp, data)
-		reader.Append(cp)
+		// callback returns; AppendCopy copies into a pooled buffer.
+		reader.AppendCopy(data)
 	}) {
 		return nil, nil
 	}
