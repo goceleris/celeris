@@ -33,16 +33,19 @@ const (
 var chunkPools [chunkPoolMaxShift - chunkPoolMinShift + 1]sync.Pool
 
 // getChunk returns a buffer of length n whose capacity is a pool size class,
-// or a plain allocation when n is outside the classes. Its contents are
-// undefined: callers overwrite all n bytes.
+// or a plain, exactly sized allocation when n is outside the classes: a read
+// under the smallest class is not rounded up (a backed-up reader holds up to
+// two channels of chunks, and rounding 100-byte reads to 512 B each would pin
+// five times their size). Its contents are undefined: callers overwrite all n
+// bytes.
 func getChunk(n int) []byte {
 	if n <= 0 {
 		return nil
 	}
-	shift := bits.Len(uint(n - 1))
-	if shift < chunkPoolMinShift {
-		shift = chunkPoolMinShift
+	if n < 1<<chunkPoolMinShift {
+		return make([]byte, n)
 	}
+	shift := bits.Len(uint(n - 1))
 	if shift > chunkPoolMaxShift {
 		return make([]byte, n)
 	}
