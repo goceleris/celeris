@@ -4,7 +4,7 @@ go 1.27.3
 
 require (
 	github.com/goceleris/celeris v1.5.11
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/lib/pq v1.12.3
 )
 
@@ -14,7 +14,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 )
 
