@@ -1976,7 +1976,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			}
 			// Bytes for a detached WebSocket go to its reader and ready the
 			// handler goroutine blocked on it (celeris#756).
-			if h1 := cs.h1State; h1 != nil && h1.WSDataDelivery != nil && h1.Detached.Load() {
+			if h1 := cs.h1State; h1 != nil && h1.Detached.Load() && h1.WSDataDelivery != nil {
 				l.yieldReady = true
 			}
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)

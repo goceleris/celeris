@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+
+	"github.com/goceleris/celeris"
 )
 
 // TestNativeEngineYieldIntegrity756 is the byte-integrity oracle for the loop's
@@ -22,9 +24,23 @@ func TestNativeEngineYieldIntegrity756(t *testing.T) {
 		frames = 150
 	)
 	for _, kind := range engineKinds(t) {
-		kind := kind
-		t.Run(kind.String(), func(t *testing.T) {
-			addr, shutdown := startNativeServer(t, kind, Config{
+		for _, async := range []bool{false, true} {
+			kind, async := kind, async
+			name := kind.String() + "/sync"
+			if async {
+				name = kind.String() + "/async"
+			}
+			t.Run(name, func(t *testing.T) {
+				testYieldIntegrity756(t, kind, async, conns, frames)
+			})
+		}
+	}
+}
+
+func testYieldIntegrity756(t *testing.T, kind celeris.EngineType, async bool, conns, frames int) {
+	{
+		{
+			addr, shutdown, _ := startNativeServerCfg(t, celeris.Config{Engine: kind, AsyncHandlers: async}, Config{
 				Handler: func(c *Conn) {
 					for {
 						mt, msg, err := c.ReadMessage()
@@ -95,6 +111,6 @@ func TestNativeEngineYieldIntegrity756(t *testing.T) {
 			for err := range errs {
 				t.Error(err)
 			}
-		})
+		}
 	}
 }

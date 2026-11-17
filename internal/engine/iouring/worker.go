@@ -4487,7 +4487,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		(w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1)
 	// Bytes for a detached WebSocket go to its reader and ready the handler
 	// goroutine blocked on it (celeris#756).
-	if h1 := cs.h1State; h1 != nil && h1.WSDataDelivery != nil && h1.Detached.Load() {
+	if h1 := cs.h1State; h1 != nil && h1.Detached.Load() && h1.WSDataDelivery != nil {
 		w.yieldReady = true
 	}
 	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): no atomic

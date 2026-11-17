@@ -34,7 +34,8 @@ const yieldMinGap = 100 * time.Microsecond
 // The yield is taken only when the wait would block: a non-blocking
 // epoll_wait found no event, so a loop that is busy (events ready, a loaded
 // server) never pays the handoff, and a loop that readied nothing (HTTP/1
-// sync) never pays the extra system call. At most one yield per yieldMinGap.
+// sync) never pays the extra system call, and a loop inside the gap of its last
+// yield does not probe at all. At most one yield per yieldMinGap.
 func (l *Loop) epollWaitYielding(timeoutMs int) (int, error) {
 	if !l.yieldReady {
 		return unix.EpollWait(l.epollFD, l.events, timeoutMs)
@@ -43,13 +44,17 @@ func (l *Loop) epollWaitYielding(timeoutMs int) (int, error) {
 	if timeoutMs == 0 {
 		return unix.EpollWait(l.epollFD, l.events, 0)
 	}
+	// Inside the gap: no probe, no yield, the plain blocking wait (the probe
+	// is a system call and must not be paid on every wait after a readied batch).
+	now := mono.Now()
+	if now-l.yieldLastNs < int64(yieldMinGap) {
+		return unix.EpollWait(l.epollFD, l.events, timeoutMs)
+	}
 	n, err := unix.EpollWait(l.epollFD, l.events, 0)
 	if err != nil || n > 0 {
 		return n, err
 	}
-	if now := mono.Now(); now-l.yieldLastNs >= int64(yieldMinGap) {
-		l.yieldLastNs = now
-		runtime.Gosched()
-	}
+	l.yieldLastNs = now
+	runtime.Gosched()
 	return unix.EpollWait(l.epollFD, l.events, timeoutMs)
 }
