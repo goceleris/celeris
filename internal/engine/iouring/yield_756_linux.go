@@ -12,8 +12,9 @@ import (
 // yieldMinGap is the shortest time between two idle-wait yields of one worker
 // (celeris#756). See the epoll engine's constant of the same name: a yield
 // costs a thread handoff each way, and the gap bounds it for a worker that
-// goes idle and busy again at a high rate.
-const yieldMinGap = 100 * time.Microsecond
+// goes idle and busy again at a high rate. 100us was measured too short (see
+// the epoll engine's constant).
+const yieldMinGap = 2 * time.Millisecond
 
 // yieldBeforeWait hands the worker's P to the runtime when the worker has
 // readied a handler goroutine since its last wait and is about to block on

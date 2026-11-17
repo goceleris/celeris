@@ -16,8 +16,11 @@ import (
 // handoff each way, which costs tens of microseconds; the gap bounds that
 // cost for a loop that goes idle and busy again at a high rate (small
 // messages), where the handlers it readied are served by the loop's own
-// next turns anyway.
-const yieldMinGap = 100 * time.Microsecond
+// next turns anyway. 100us was measured too short: with one io_uring worker
+// serving 96 busy in-process connections, TestBackpressureInboundSequenceIntegrity
+// saw the worker unread for 5.7-8.1 s (limit 5 s) in 4 of 4 runs, against 0 of 2
+// on main and 0 of 2 at 2 ms (Docker, -race, 4 CPUs).
+const yieldMinGap = 2 * time.Millisecond
 
 // epollWaitYielding is unix.EpollWait with one addition: a loop that has
 // readied a handler goroutine since its last wait and finds nothing else to
