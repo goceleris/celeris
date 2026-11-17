@@ -677,7 +677,13 @@ type Worker struct {
 	linkArmBatch uint64
 
 	tickCounter uint32
-	cachedNow   int64  // cached mono.Now(), read once per iteration after its wait (readClockAfterWait), and by checkTimeouts
+	cachedNow   int64 // cached mono.Now(), read once per iteration after its wait (readClockAfterWait), and by checkTimeouts
+	// yieldReady is set on the worker thread when a goroutine was readied (an
+	// async dispatch hand-off, or bytes delivered to a detached WebSocket's
+	// reader) since the last wait; yieldBeforeWait reads and clears it.
+	// yieldLastNs is the mono time of the last idle-wait yield (celeris#756).
+	yieldReady  bool
+	yieldLastNs int64
 	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
 	// dirtySendGiveUps counts the dirty pass's give-ups of a conn with a SEND
 	// outstanding (celeris#811). Worker-owned; read by tests after the
@@ -1759,6 +1765,9 @@ func (w *Worker) run(ctx context.Context) {
 
 		var cqHead, cqTail uint32
 		w.loopSlot.Leave() // not in a batch while it waits
+		if w.yieldReady {
+			w.yieldBeforeWait()
+		}
 		if w.sqpoll {
 			// SQPOLL path: kernel thread submits SQEs from the shared ring.
 			// We never call Submit() — just clear the pending counter.
@@ -4434,6 +4443,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		} else {
 			cs.asyncCond.Signal()
 		}
+		w.yieldReady = true // a goroutine was readied (celeris#756)
 		w.reqBatch++
 		if f := asyncFeedHook.Load(); f != nil {
 			(*f)(w, cs, hdrDL) // test seam, celeris#884 items 82-84
@@ -4475,6 +4485,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// set only around the ProcessH1 call(s) below.
 	tryInline := w.async && !cs.asyncPromoted.Load() && cs.h1State != nil &&
 		(w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1)
+	// Bytes for a detached WebSocket go to its reader and ready the handler
+	// goroutine blocked on it (celeris#756).
+	if h1 := cs.h1State; h1 != nil && h1.WSDataDelivery != nil && h1.Detached.Load() {
+		w.yieldReady = true
+	}
 	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): no atomic
 	// Load, no switch dispatch, no upgrade-handling block — ProcessH1
 	// cannot return ErrUpgradeH2C because tryUpgradeH2C is gated off
@@ -6026,6 +6041,7 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 	} else {
 		cs.asyncCond.Signal()
 	}
+	w.yieldReady = true // a goroutine was readied (celeris#756)
 	w.reqBatch++
 	if !cqeHasMore(c.Flags) && !cs.recvPaused {
 		if !w.prepareRecv(cs, cs.buf) {

@@ -342,6 +342,13 @@ type Loop struct {
 	// it after drainRead and skips the half-close and error handling of the
 	// event that turn served (celeris#885 item 41).
 	readYielded bool
+	// yieldReady is set on the loop thread when a goroutine was readied
+	// (an async dispatch hand-off, or bytes delivered to a detached
+	// WebSocket's reader) since the last wait; epollWaitYielding reads and
+	// clears it. yieldLastNs is the mono time of the last idle-wait yield
+	// (celeris#756).
+	yieldReady  bool
+	yieldLastNs int64
 	// driverReadQ holds the driver conns whose last read turn used up
 	// driverReadBudget with bytes possibly left (loop thread only).
 	// Edge-triggered epoll does not report bytes already in the socket again,
@@ -691,7 +698,7 @@ func (l *Loop) run(ctx context.Context) {
 		}
 
 		l.loopSlot.Leave() // not in a batch while it waits
-		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
+		n, err := l.epollWaitYielding(timeoutMs)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -1925,6 +1932,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// Goroutine is parked in asyncCond.Wait — wake it.
 				cs.asyncCond.Signal()
 			}
+			l.yieldReady = true // a goroutine was readied (celeris#756)
 			// celeris#626: count this recv. The dispatch path `continue`s,
 			// so it never reaches the inline reqBatch++ below — before this
 			// line an async-promoted conn stopped being counted entirely and
@@ -1966,6 +1974,11 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if tryInline {
 				cs.h1State.InlineMode = true
 			}
+			// Bytes for a detached WebSocket go to its reader and ready the
+			// handler goroutine blocked on it (celeris#756).
+			if h1 := cs.h1State; h1 != nil && h1.WSDataDelivery != nil && h1.Detached.Load() {
+				l.yieldReady = true
+			}
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
 			// A handler that ran inline and hijacked has had cs released to
 			// the pool inside the Hijack call (hijackConn's inline branch):
@@ -1997,6 +2010,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				} else {
 					cs.asyncCond.Signal()
 				}
+				l.yieldReady = true // a goroutine was readied (celeris#756)
 				// celeris#626: count the promoting recv exactly once, here.
 				// This branch `continue`s, so the inline reqBatch++ below is
 				// NOT also reached — no double count at the promotion
