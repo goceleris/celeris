@@ -733,7 +733,42 @@ type Config struct {
 	// throughput is unaffected. NOTE: SetMemoryLimit is PROCESS-GLOBAL, so
 	// this is opt-in only — set it when celeris owns the process (e.g. a
 	// dedicated server binary). See [DeriveMemoryLimit] for a sized default.
+	// The same stance holds for [Config.GCPercent]: celeris changes no
+	// process-global runtime setting unless you opt in by setting the field.
+	// Unlike GCPercent, this limit is NOT put back when the server stops.
 	MemoryLimitBytes int64
+
+	// GCPercent is an OPTIONAL garbage-collector target, applied via
+	// runtime/debug.SetGCPercent when the server starts (the same knob as the
+	// GOGC environment variable). 0 = unset: celeris does not touch the
+	// process GC, so embedders, GOGC and [Config.MemoryLimitBytes] keep full
+	// control; that is the default. A value above 0 is applied at Start,
+	// never at init, and it wins over GOGC. A negative value is refused by
+	// validation, because it would switch the collector off.
+	//
+	// Why it exists: a large-message WebSocket echo allocates on every
+	// message, and a GC cycle that starts while the loops are busy can hold
+	// the free Ps the handlers need, which lifts the p99. A larger target
+	// means fewer cycles. In a cluster measurement of that workload (amd64,
+	// epoll engine, GOGC=400 set through the environment, not through this
+	// field), the p99 tail came much closer to net/http at high load. The
+	// cost is memory: peak resident memory was noticeably higher, and p99 at
+	// low load was slightly worse. Consider pairing it with a soft ceiling,
+	// [Config.MemoryLimitBytes] or GOMEMLIMIT, when memory is bounded; that
+	// pairing was not measured, and a ceiling close to the live heap brings
+	// the frequent GC cycles back, which undoes the gain.
+	//
+	// NOTE: SetGCPercent is PROCESS-GLOBAL, so this is opt-in only: set it
+	// when celeris owns the process (for example a dedicated server binary).
+	// Unlike [Config.MemoryLimitBytes], which is never undone, GCPercent is
+	// restored: the target that was in force before the first opted-in server
+	// started is put back when the last opted-in server in the process stops
+	// (Shutdown, a failed start, or a Start that returns without one), but
+	// only if the process target is still the last value celeris wrote;
+	// a value set by other code is left alone. While several opted-in servers
+	// run in one process, the last value written stays in force, whichever
+	// server stops first.
+	GCPercent int
 
 	// DisableMetrics disables the built-in metrics collector. When true,
 	// [Server.Collector] returns nil and per-request metric recording is skipped.
@@ -996,6 +1031,8 @@ func (c Config) toResourceConfig() resource.Config {
 		rc.Resources.MaxConns = c.MaxConns
 	}
 	rc.Resources.MemoryLimitBytes = c.MemoryLimitBytes
+	// Not behind a "> 0" guard, so that Validate sees a negative target.
+	rc.Resources.GCPercent = c.GCPercent
 	rc.Resources.WorkloadHint = resource.WorkloadHint(c.WorkloadHint)
 
 	rc.MaxRequestBodySize = c.MaxRequestBodySize

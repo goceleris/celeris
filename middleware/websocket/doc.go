@@ -49,6 +49,20 @@
 // across subscribers). Slow connections are handled by [HubConfig.OnSlowConn]
 // returning a [HubPolicy]. Authorization must happen before [Hub.Register].
 //
+// # Large messages and the garbage collector
+//
+// Echoing or proxying large messages allocates on every message, and a GC
+// cycle that starts while the engine loops are busy can delay the handlers.
+// In a cluster measurement of a large-message echo (celeris#756, amd64,
+// GOGC=400 set through the environment), a larger GC target cut the p99 tail
+// markedly at high load, at the price of noticeably higher peak memory: see
+// celeris.Config.GCPercent, which is off by default and sets the process GC
+// target (the GOGC knob) when you opt in. Consider pairing it with a soft
+// ceiling, celeris.Config.MemoryLimitBytes or GOMEMLIMIT; that pairing was
+// not measured, and a ceiling near the live heap undoes the gain. Both
+// settings are process-global; set them only in a binary that celeris owns.
+// This package does not change them itself.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/websocket

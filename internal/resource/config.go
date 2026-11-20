@@ -226,6 +226,12 @@ func (c Config) Validate() []error {
 		errs = append(errs, fmt.Errorf("memoryLimitBytes must be >= 0 (0 = unset), got %d", c.Resources.MemoryLimitBytes))
 	}
 
+	// A negative target would make SetGCPercent turn the collector OFF
+	// (-1) or be read as such; the option never does that, so it is refused.
+	if c.Resources.GCPercent < 0 {
+		errs = append(errs, fmt.Errorf("gcPercent must be >= 0 (0 = unset), got %d", c.Resources.GCPercent))
+	}
+
 	if c.ReadTimeout < -1 {
 		errs = append(errs, fmt.Errorf("readTimeout must be >= -1, got %v", c.ReadTimeout))
 	}
