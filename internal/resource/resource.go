@@ -66,6 +66,14 @@ type Resources struct {
 	// is PROCESS-GLOBAL, so this is opt-in only — set it just when celeris
 	// owns the process (e.g. a dedicated server binary). See DeriveMemoryLimit.
 	MemoryLimitBytes int64
+	// GCPercent is an OPTIONAL garbage-collector target (runtime/debug
+	// SetGCPercent, the GOGC knob). 0 = unset: celeris does not touch the
+	// process GC, so embedders keep full control (including the GOGC
+	// environment variable). When >0, the server applies it at start and,
+	// at shutdown, puts the previous value back if the value is still the one
+	// this server set. It overrides GOGC. NOTE: SetGCPercent is
+	// PROCESS-GLOBAL, so this is opt-in only. See celeris.Config.GCPercent.
+	GCPercent int
 }
 
 // DeriveMemoryLimit returns a generous soft heap ceiling for `workers` I/O

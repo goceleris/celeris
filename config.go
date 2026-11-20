@@ -733,7 +733,39 @@ type Config struct {
 	// throughput is unaffected. NOTE: SetMemoryLimit is PROCESS-GLOBAL, so
 	// this is opt-in only — set it when celeris owns the process (e.g. a
 	// dedicated server binary). See [DeriveMemoryLimit] for a sized default.
+	// The same stance holds for [Config.GCPercent]: celeris changes no
+	// process-global runtime setting unless you opt in by setting the field.
 	MemoryLimitBytes int64
+
+	// GCPercent is an OPTIONAL garbage-collector target, applied via
+	// runtime/debug.SetGCPercent when the server starts (the same knob as the
+	// GOGC environment variable). 0 = unset: celeris does not touch the
+	// process GC, so embedders, GOGC and [Config.MemoryLimitBytes] keep full
+	// control; that is the default. A value above 0 is applied at Start,
+	// never at init, and it wins over GOGC. A negative value is refused by
+	// validation, because it would switch the collector off.
+	//
+	// Why it exists: a large-message WebSocket echo allocates on every
+	// message, and a GC cycle that starts while the loops are busy can hold
+	// the free Ps the handlers need, which lifts the p99. A larger target
+	// means fewer cycles. On one amd64 cluster run (WebSocket echo of
+	// large messages, epoll engine, 16 CPUs), 400 brought the p99 ratio
+	// against net/http to between 1.5 and 2.0 at 0.25, 0.5 and 0.75 of
+	// saturation, where the default of 100 gave 3.3 to 3.8 at 0.5 and 5.5 to
+	// 7.8 at 0.75 (a lane-finding measurement, not a release gate). The cost
+	// is memory: peak resident memory was about 2.2 times higher (137 MiB
+	// against 61 MiB in that run), and p99 at 0.25 of saturation was slightly
+	// worse (0.83 ms against 0.66 ms). Pair it with a soft ceiling, either
+	// [Config.MemoryLimitBytes] or GOMEMLIMIT, when memory is bounded.
+	//
+	// NOTE: SetGCPercent is PROCESS-GLOBAL, so this is opt-in only: set it
+	// when celeris owns the process (for example a dedicated server binary).
+	// When Shutdown runs, the value that was in force before Start is put
+	// back, but only if the process value is still the one this server set;
+	// otherwise another writer's value is left alone. With several servers in
+	// one process, and any other code that calls SetGCPercent, the last
+	// writer wins.
+	GCPercent int
 
 	// DisableMetrics disables the built-in metrics collector. When true,
 	// [Server.Collector] returns nil and per-request metric recording is skipped.
@@ -996,6 +1028,8 @@ func (c Config) toResourceConfig() resource.Config {
 		rc.Resources.MaxConns = c.MaxConns
 	}
 	rc.Resources.MemoryLimitBytes = c.MemoryLimitBytes
+	// Not behind a "> 0" guard, so that Validate sees a negative target.
+	rc.Resources.GCPercent = c.GCPercent
 	rc.Resources.WorkloadHint = resource.WorkloadHint(c.WorkloadHint)
 
 	rc.MaxRequestBodySize = c.MaxRequestBodySize
