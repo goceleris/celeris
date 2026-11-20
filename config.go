@@ -735,6 +735,7 @@ type Config struct {
 	// dedicated server binary). See [DeriveMemoryLimit] for a sized default.
 	// The same stance holds for [Config.GCPercent]: celeris changes no
 	// process-global runtime setting unless you opt in by setting the field.
+	// Unlike GCPercent, this limit is NOT put back when the server stops.
 	MemoryLimitBytes int64
 
 	// GCPercent is an OPTIONAL garbage-collector target, applied via
@@ -748,23 +749,25 @@ type Config struct {
 	// Why it exists: a large-message WebSocket echo allocates on every
 	// message, and a GC cycle that starts while the loops are busy can hold
 	// the free Ps the handlers need, which lifts the p99. A larger target
-	// means fewer cycles. On one amd64 cluster run (WebSocket echo of
-	// large messages, epoll engine, 16 CPUs), 400 brought the p99 ratio
-	// against net/http to between 1.5 and 2.0 at 0.25, 0.5 and 0.75 of
-	// saturation, where the default of 100 gave 3.3 to 3.8 at 0.5 and 5.5 to
-	// 7.8 at 0.75 (a lane-finding measurement, not a release gate). The cost
-	// is memory: peak resident memory was about 2.2 times higher (137 MiB
-	// against 61 MiB in that run), and p99 at 0.25 of saturation was slightly
-	// worse (0.83 ms against 0.66 ms). Pair it with a soft ceiling, either
-	// [Config.MemoryLimitBytes] or GOMEMLIMIT, when memory is bounded.
+	// means fewer cycles. In a cluster measurement of that workload (amd64,
+	// epoll engine, GOGC=400 set through the environment, not through this
+	// field), the p99 tail came much closer to net/http at high load. The
+	// cost is memory: peak resident memory was noticeably higher, and p99 at
+	// low load was slightly worse. Consider pairing it with a soft ceiling,
+	// [Config.MemoryLimitBytes] or GOMEMLIMIT, when memory is bounded; that
+	// pairing was not measured, and a ceiling close to the live heap brings
+	// the frequent GC cycles back, which undoes the gain.
 	//
 	// NOTE: SetGCPercent is PROCESS-GLOBAL, so this is opt-in only: set it
 	// when celeris owns the process (for example a dedicated server binary).
-	// When Shutdown runs, the value that was in force before Start is put
-	// back, but only if the process value is still the one this server set;
-	// otherwise another writer's value is left alone. With several servers in
-	// one process, and any other code that calls SetGCPercent, the last
-	// writer wins.
+	// Unlike [Config.MemoryLimitBytes], which is never undone, GCPercent is
+	// restored: the target that was in force before the first opted-in server
+	// started is put back when the last opted-in server in the process stops
+	// (Shutdown, a failed start, or a Start that returns without one), but
+	// only if the process target is still the last value celeris wrote;
+	// a value set by other code is left alone. While several opted-in servers
+	// run in one process, the last value written stays in force, whichever
+	// server stops first.
 	GCPercent int
 
 	// DisableMetrics disables the built-in metrics collector. When true,

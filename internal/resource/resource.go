@@ -69,10 +69,11 @@ type Resources struct {
 	// GCPercent is an OPTIONAL garbage-collector target (runtime/debug
 	// SetGCPercent, the GOGC knob). 0 = unset: celeris does not touch the
 	// process GC, so embedders keep full control (including the GOGC
-	// environment variable). When >0, the server applies it at start and,
-	// at shutdown, puts the previous value back if the value is still the one
-	// this server set. It overrides GOGC. NOTE: SetGCPercent is
-	// PROCESS-GLOBAL, so this is opt-in only. See celeris.Config.GCPercent.
+	// environment variable). When >0, the server applies it at start; the
+	// last opted-in server to stop puts the original value back if the
+	// process value is still the last one celeris wrote. It overrides GOGC.
+	// NOTE: SetGCPercent is PROCESS-GLOBAL, so this is opt-in only. See
+	// celeris.Config.GCPercent.
 	GCPercent int
 }
 

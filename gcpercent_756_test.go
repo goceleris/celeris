@@ -17,7 +17,13 @@ func restoreGC(t *testing.T) int {
 	t.Helper()
 	orig := debug.SetGCPercent(100)
 	debug.SetGCPercent(orig)
-	t.Cleanup(func() { debug.SetGCPercent(orig) })
+	t.Cleanup(func() {
+		debug.SetGCPercent(orig)
+		// A failed test must not leak an active opt-in into the next one.
+		gcCoord.mu.Lock()
+		gcCoord.active = 0
+		gcCoord.mu.Unlock()
+	})
 	return orig
 }
 
@@ -131,17 +137,93 @@ func TestGCPercentTwoServers756(t *testing.T) {
 	debug.SetGCPercent(100)
 	var a, b gcPercentState
 	a.apply(400)
-	b.apply(300) // last writer wins
+	b.apply(300) // the last value written stays in force
 	if got := currentGC(); got != 300 {
 		t.Fatalf("two servers: got %d, want 300", got)
 	}
-	a.restore() // the value is not a's any more: left alone
+	a.restore() // another server still runs: nothing changes
 	if got := currentGC(); got != 300 {
-		t.Fatalf("first server's shutdown must keep the later value: got %d, want 300", got)
+		t.Fatalf("first server's shutdown must keep the value while another runs: got %d, want 300", got)
 	}
-	b.restore() // b's previous value was a's 400
+	b.restore() // the last one out puts the ORIGINAL value back
+	if got := currentGC(); got != 100 {
+		t.Fatalf("after both stopped the original target must be back: got %d, want 100", got)
+	}
+	assertGCCoordIdle(t)
+}
+
+// Same value, overlapping lifetimes: the first server to stop must not revert
+// the target while the second still runs (Opus B1, PR 1310).
+func TestGCPercentTwoServersSameValue756(t *testing.T) {
+	restoreGC(t)
+	debug.SetGCPercent(100)
+	var a, b gcPercentState
+	a.apply(400)
+	b.apply(400)
+	a.restore()
 	if got := currentGC(); got != 400 {
-		t.Fatalf("second server's shutdown puts back what it replaced: got %d, want 400", got)
+		t.Fatalf("A stopped while B runs: target reverted to %d, want 400", got)
+	}
+	b.restore()
+	if got := currentGC(); got != 100 {
+		t.Fatalf("both stopped: got %d, want the original 100", got)
+	}
+	assertGCCoordIdle(t)
+}
+
+// Different values, either stop order: the original value is back at the end.
+func TestGCPercentTwoServersEitherOrder756(t *testing.T) {
+	for _, firstOut := range []string{"A", "B"} {
+		t.Run("first out "+firstOut, func(t *testing.T) {
+			restoreGC(t)
+			debug.SetGCPercent(100)
+			var a, b gcPercentState
+			a.apply(400)
+			b.apply(300)
+			if firstOut == "A" {
+				a.restore()
+			} else {
+				b.restore()
+			}
+			if got := currentGC(); got != 300 {
+				t.Fatalf("one server still runs: got %d, want the last write 300", got)
+			}
+			if firstOut == "A" {
+				b.restore()
+			} else {
+				a.restore()
+			}
+			if got := currentGC(); got != 100 {
+				t.Fatalf("both stopped: got %d, want the original 100", got)
+			}
+			assertGCCoordIdle(t)
+		})
+	}
+}
+
+// A foreign writer between the servers' stops is left alone at the end.
+func TestGCPercentTwoServersForeignWriter756(t *testing.T) {
+	restoreGC(t)
+	debug.SetGCPercent(100)
+	var a, b gcPercentState
+	a.apply(400)
+	b.apply(400)
+	a.restore()
+	debug.SetGCPercent(250) // another writer
+	b.restore()
+	if got := currentGC(); got != 250 {
+		t.Fatalf("the foreign value must survive: got %d, want 250", got)
+	}
+	assertGCCoordIdle(t)
+}
+
+// The coordinator must be idle again after every test (no leaked opt-in).
+func assertGCCoordIdle(t *testing.T) {
+	t.Helper()
+	gcCoord.mu.Lock()
+	defer gcCoord.mu.Unlock()
+	if gcCoord.active != 0 {
+		t.Fatalf("gcCoord.active = %d after all servers stopped, want 0", gcCoord.active)
 	}
 }
 
