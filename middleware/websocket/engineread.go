@@ -42,6 +42,15 @@ import (
 type chanReader struct {
 	ch  chan []byte
 	cur []byte // partially consumed current chunk
+	// curBuf is the pooled buffer cur was cut from, set only when recycle is
+	// on. Read returns it to the chunk pool once cur is fully consumed.
+	curBuf []byte
+	// recycle is set before the first chunk by the engine upgrade, whose only
+	// producer is AppendCopy: every chunk then comes from the chunk pool and
+	// Read gives it back after the last byte has been copied out. It is false
+	// for a reader fed through Append with caller-owned slices (tests), whose
+	// chunks must never be recycled.
+	recycle bool
 	// done is closed exactly once, by closeWith, to signal shutdown. We
 	// close done — NEVER ch — so a concurrent Append can never send on a
 	// closed channel. Both Append and Read select on done to observe close.
@@ -257,6 +266,27 @@ func (r *chanReader) spillChunk(chunk []byte) (spilled, ok bool) {
 	r.spillMu.Unlock()
 	r.spilled.Add(1)
 	return true, true
+}
+
+// AppendCopy copies data and delivers the copy as Append does. The caller's
+// slice is free to be reused as soon as it returns, which is what the engine's
+// delivery callback needs. On a recycling reader the copy comes from the chunk
+// pool and goes back to it when Read has consumed it (celeris#756); otherwise
+// it is a plain allocation. A rejected chunk was not stored anywhere, so it is
+// returned to the pool at once.
+func (r *chanReader) AppendCopy(data []byte) bool {
+	if !r.recycle || len(data) == 0 {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		return r.Append(cp)
+	}
+	cp := getChunk(len(data))
+	copy(cp, data)
+	if r.Append(cp) {
+		return true
+	}
+	putChunk(cp)
+	return false
 }
 
 // requestPause asks the engine to suspend inbound delivery, edge-triggered
@@ -477,6 +507,9 @@ func (r *chanReader) Read(p []byte) (int, error) {
 			return 0, err
 		}
 		r.cur = chunk
+		if r.recycle {
+			r.curBuf = chunk
+		}
 
 		// Taking a chunk freed a slot: promote spilled chunks into the
 		// channel's tail so len(r.ch) keeps reflecting the true buffered
@@ -493,6 +526,12 @@ func (r *chanReader) Read(p []byte) (int, error) {
 	}
 	n := copy(p, r.cur)
 	r.cur = r.cur[n:]
+	if len(r.cur) == 0 && r.curBuf != nil {
+		// Every byte of the chunk now lives in p; nothing else references it.
+		putChunk(r.curBuf)
+		r.curBuf = nil
+		r.cur = nil // do not pin the recycled array through a zero-length tail
+	}
 	return n, nil
 }
 
