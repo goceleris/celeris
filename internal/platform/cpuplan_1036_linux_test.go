@@ -90,11 +90,11 @@ func TestPlanHeterogeneousNeverUnpinnedNeverLittle1036(t *testing.T) {
 						}
 						if !het {
 							// Alike CPUs: one entry per worker for a user-set count; a
-							// default count leaves the reserve of max(1, n/8) without
+							// default count leaves the reserve of max(1, n/4) without
 							// a loop, none for n <= 2 (celeris#756, #757).
 							wantLoops := workers
 							if !explicit && workers > 2 {
-								wantLoops -= max(1, workers/8)
+								wantLoops -= max(1, workers/4)
 							}
 							if len(p.CPUs) != wantLoops {
 								t.Fatalf("%s: %d entries, want %d (a host of alike CPUs keeps every worker it is asked for, less the default reserve)", tag, len(p.CPUs), wantLoops)
