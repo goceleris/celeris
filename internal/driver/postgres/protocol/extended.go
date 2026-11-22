@@ -12,6 +12,88 @@ type PreparedStmt struct {
 	Query     string
 	ParamOIDs []uint32
 	Columns   []ColumnDesc
+
+	// ResultFormats is the result-format vector to Bind this statement with:
+	// binary for the columns the driver has a binary codec for, text for every
+	// other column (see [ResultFormatsFor]). ResultColumns is Columns with
+	// FormatCode set to match. Both are computed once, when the statement is
+	// prepared, and are read-only: copy ResultColumns before handing it to a
+	// request. Nil on a PreparedStmt that was not built by the driver; use
+	// [PreparedStmt.ResultPlan], which falls back to computing them.
+	ResultFormats []int16
+	ResultColumns []ColumnDesc
+}
+
+// The two result-format vectors that do not depend on the columns. They are
+// shared and must not be modified.
+var (
+	resultFormatsBinary = []int16{FormatBinary}
+	resultFormatsText   = []int16{FormatText}
+)
+
+// ResultFormatsText is the result-format vector that asks for every result
+// column in the text format. It is what an extended query uses when the
+// columns are not known when Bind is sent (Parse, Bind, Describe and Execute
+// pipelined in one flight): a type without a binary codec then still arrives
+// in a form the driver can decode. The slice is shared; do not modify it.
+func ResultFormatsText() []int16 { return resultFormatsText }
+
+// HasBinaryCodec reports whether the driver can decode a column of the type
+// oid from the binary result format: a codec is registered for it and has a
+// binary decoder. Every other type must be requested in the text format.
+func HasBinaryCodec(oid uint32) bool {
+	c := LookupOID(oid)
+	return c != nil && c.DecodeBinary != nil
+}
+
+// ResultFormatsFor chooses the result format of each column of cols: binary
+// where [HasBinaryCodec], text for everything else, so no column can reach the
+// application as binary bytes the driver cannot decode (a type with no codec,
+// or one added to PostgreSQL later, arrives as its text form). It returns the
+// Bind result-format vector and cols with FormatCode set to the chosen
+// formats; the second result is nil exactly when cols is nil, so "known to
+// have zero columns" and "not described yet" stay distinct.
+//
+// When every column is binary (the common case: ints, text, ...) the vector is
+// the shared single code [FormatBinary], which is what Bind has always sent,
+// so such statements are encoded byte for byte as before.
+func ResultFormatsFor(cols []ColumnDesc) ([]int16, []ColumnDesc) {
+	if cols == nil {
+		return resultFormatsBinary, nil
+	}
+	out := make([]ColumnDesc, len(cols))
+	copy(out, cols)
+	allBinary := true
+	for i := range out {
+		if HasBinaryCodec(out[i].TypeOID) {
+			out[i].FormatCode = FormatBinary
+		} else {
+			out[i].FormatCode = FormatText
+			allBinary = false
+		}
+	}
+	if allBinary {
+		return resultFormatsBinary, out
+	}
+	formats := make([]int16, len(out))
+	for i := range out {
+		formats[i] = out[i].FormatCode
+	}
+	return formats, out
+}
+
+// ResultPlan returns the result-format vector and the format-annotated
+// columns for p. They are precomputed when the driver prepares the statement;
+// a PreparedStmt built without them is planned from its Columns on the spot.
+// A PreparedStmt that has no columns yet (nil Columns) plans text.
+func (p *PreparedStmt) ResultPlan() ([]int16, []ColumnDesc) {
+	if p == nil || (p.ResultFormats == nil && p.Columns == nil) {
+		return resultFormatsText, nil
+	}
+	if p.ResultFormats != nil {
+		return p.ResultFormats, p.ResultColumns
+	}
+	return ResultFormatsFor(p.Columns)
 }
 
 // WriteParse encodes a Parse ('P') message and returns a copy of the bytes.

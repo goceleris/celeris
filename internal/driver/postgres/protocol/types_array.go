@@ -19,14 +19,17 @@ import (
 //     int32 length (-1 => NULL)
 //     bytes length   (omitted when length == -1)
 //
-// Multi-dimensional arrays are decoded into a flat slice with dimension
-// metadata lost; the driver exposes them as []driver.Value. Callers that
-// need the dimension shape can decode manually via DecodeArrayBinary.
+// The driver exposes a one-dimensional array with the default lower bound as
+// []driver.Value. A multi-dimensional array, or one with another lower bound,
+// cannot be represented that way without losing its shape, so decoding it as a
+// column value is an error; callers that need the shape decode it with
+// DecodeArrayBinary, which returns Dims and LowerBound.
 
 // DecodedArray is a lightweight view over a decoded array value.
 type DecodedArray struct {
 	ElementOID uint32
 	Dims       []int32 // dim lengths
+	LowerBound []int32 // lower bound of each dimension (1 unless the array was built with explicit bounds)
 	Elements   []driver.Value
 }
 
@@ -44,13 +47,14 @@ func DecodeArrayBinary(src []byte) (*DecodedArray, error) {
 	}
 	pos := 12
 	dims := make([]int32, ndim)
+	lbounds := make([]int32, ndim)
 	total := int32(1)
 	for i := int32(0); i < ndim; i++ {
 		if pos+8 > len(src) {
 			return nil, fmt.Errorf("postgres/protocol: array dim header truncated")
 		}
 		length := int32(binary.BigEndian.Uint32(src[pos : pos+4]))
-		// lower bound at pos+4..pos+8 ignored
+		lbounds[i] = int32(binary.BigEndian.Uint32(src[pos+4 : pos+8]))
 		if length < 0 {
 			return nil, fmt.Errorf("postgres/protocol: array dim length negative")
 		}
@@ -61,7 +65,7 @@ func DecodeArrayBinary(src []byte) (*DecodedArray, error) {
 
 	codec := LookupOID(elemOID)
 
-	out := &DecodedArray{ElementOID: elemOID, Dims: dims, Elements: make([]driver.Value, 0, total)}
+	out := &DecodedArray{ElementOID: elemOID, Dims: dims, LowerBound: lbounds, Elements: make([]driver.Value, 0, total)}
 
 	// Empty array: ndim=0 is valid and means no elements, no dim header.
 	if ndim == 0 {
@@ -87,11 +91,11 @@ func DecodeArrayBinary(src []byte) (*DecodedArray, error) {
 		elemBytes := src[pos : pos+int(length)]
 		pos += int(length)
 		if codec == nil || codec.DecodeBinary == nil {
-			// Best-effort: return raw bytes when no decoder is registered.
-			cpy := make([]byte, len(elemBytes))
-			copy(cpy, elemBytes)
-			out.Elements = append(out.Elements, cpy)
-			continue
+			// Handing back the wire bytes of an element the driver cannot
+			// decode would be a silent wrong value. Result columns of types
+			// without a binary codec are requested in the text format, so this
+			// is unreachable for them; fail loudly if it is ever reached.
+			return nil, fmt.Errorf("postgres/protocol: array element type %d has no binary codec", elemOID)
 		}
 		v, err := codec.DecodeBinary(elemBytes)
 		if err != nil {
@@ -165,6 +169,13 @@ func decodeArrayBinaryValue(src []byte) (driver.Value, error) {
 	arr, err := DecodeArrayBinary(src)
 	if err != nil {
 		return nil, err
+	}
+	// A flat slice would silently drop the dimensions: refuse instead.
+	if len(arr.Dims) > 1 {
+		return nil, fmt.Errorf("postgres/protocol: multi-dimensional array (%d dimensions) is not supported as a column value; cast it to text in the query (col::text) to read its literal", len(arr.Dims))
+	}
+	if len(arr.Dims) == 1 && arr.LowerBound[0] != 1 {
+		return nil, fmt.Errorf("postgres/protocol: array with lower bound %d is not supported as a column value; cast it to text in the query (col::text) to read its literal", arr.LowerBound[0])
 	}
 	// Expose as []driver.Value for uniformity with database/sql.
 	return arr.Elements, nil

@@ -66,7 +66,7 @@ func (s *pgStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (dr
 	if s.conn == nil {
 		return nil, ErrClosed
 	}
-	return s.conn.extendedQuery(ctx, s.prep.Name, s.query, args)
+	return s.conn.extendedQuery(ctx, s.prep.Name, s.query, args, s.prep)
 }
 
 func toNamed(vals []driver.Value) []driver.NamedValue {

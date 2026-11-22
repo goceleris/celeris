@@ -369,3 +369,42 @@ func benchExtendedRow4Col(b *testing.B, autoCache bool) {
 
 func BenchmarkExtendedRow4ColCached(b *testing.B)  { benchExtendedRow4Col(b, true) }
 func BenchmarkExtendedRow4ColUnnamed(b *testing.B) { benchExtendedRow4Col(b, false) }
+
+// The per-query setup the cached path does for a 4-column int/text/text/int
+// statement, without the network: "Old" is what it did before result formats
+// were per column (copy the cached columns and set each to binary), "Plan" is
+// the code now (copy the precomputed, format-annotated columns). The Bind
+// vector is the shared single binary code in both.
+var rfBenchCols = []protocol.ColumnDesc{
+	{Name: "id", TypeOID: protocol.OIDInt4},
+	{Name: "name", TypeOID: protocol.OIDText},
+	{Name: "email", TypeOID: protocol.OIDText},
+	{Name: "score", TypeOID: protocol.OIDInt4},
+}
+
+var rfSink []protocol.ColumnDesc
+
+func BenchmarkResultFormatsSetupOld(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cols := make([]protocol.ColumnDesc, len(rfBenchCols))
+		copy(cols, rfBenchCols)
+		for j := range cols {
+			cols[j].FormatCode = protocol.FormatBinary
+		}
+		rfSink = cols
+	}
+}
+
+func BenchmarkResultFormatsSetupPlan(b *testing.B) {
+	prep := &protocol.PreparedStmt{Columns: rfBenchCols}
+	prep.ResultFormats, prep.ResultColumns = protocol.ResultFormatsFor(prep.Columns)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, plan := prep.ResultPlan()
+		cols := make([]protocol.ColumnDesc, len(plan))
+		copy(cols, plan)
+		rfSink = cols
+	}
+}
