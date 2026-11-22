@@ -42,12 +42,18 @@ type Config struct {
 	MinLength int
 
 	// Encodings lists the supported encodings in server-side priority order.
+	// Of the encodings the client accepts with the highest q-value, the first
+	// one listed here is used, whatever the order of the client's
+	// Accept-Encoding header: "gzip, deflate, br, zstd" (a browser's, with no
+	// q-values) gets the first of these four that is listed here. A q-value
+	// the client sets still wins: q=0 refuses an encoding, and a higher q
+	// beats a lower one whatever the order here.
 	// Supported values: "zstd", "br", "gzip", "deflate".
 	// Default: ["zstd", "br", "gzip"] (deflate is opt-in only).
 	Encodings []string
 
 	// GzipLevel sets the gzip compression level.
-	// Default: LevelDefault (0 = library default, gzip level 6).
+	// Default: LevelDefault (0 = library default: klauspost/compress level 5, not the stdlib's 6).
 	// Use LevelNone (-1) for store-only (no compression).
 	GzipLevel Level
 

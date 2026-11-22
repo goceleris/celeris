@@ -27,11 +27,13 @@ var priorityOrders = [][]string{
 // configuration and under each Encodings order. The want field holds one
 // answer per priorityOrders entry, in that order; "-" is no Content-Encoding.
 //
-// It pins the behaviour of the middleware before celeris#1335: among encodings
-// the client offers with the same q, the one named first in the CLIENT's
-// header won, and Config.Encodings only broke the ties the header left (an
-// "*", or a repeated name). So a browser's "gzip, deflate, br, zstd" always
-// got gzip, whatever Encodings said.
+// The rule it pins: an encoding the client refuses (q=0) or does not name
+// is never used; of the rest the one with the highest q wins; among those
+// with the same q, Config.Encodings, the server's priority order, decides,
+// and the order of the client's header does not. So a browser's "gzip,
+// deflate, br, zstd" gets what the server ranks first of the four, and
+// Config.Encodings does what its documentation says for the commonest request
+// (celeris#1335).
 func TestEncodingsPriority(t *testing.T) {
 	body := testBody()
 	h := func(c *celeris.Context) error { return c.Blob(200, "text/plain", body) }
@@ -44,13 +46,13 @@ func TestEncodingsPriority(t *testing.T) {
 	}{
 		// What the browsers and the benchmark client send, no q-values.
 		{"browser", "gzip, deflate, br, zstd",
-			[8]string{"gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip"}},
+			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
 		{"benchmark", "gzip, br",
-			[8]string{"gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip"}},
+			[8]string{"br", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
 		{"br first", "br, gzip",
-			[8]string{"br", "br", "br", "br", "br", "br", "br", "br"}},
+			[8]string{"br", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
 		{"zstd first", "zstd, br, gzip",
-			[8]string{"zstd", "zstd", "zstd", "zstd", "zstd", "zstd", "zstd", "zstd"}},
+			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "gzip"}},
 		{"deflate then gzip", "deflate, gzip",
 			[8]string{"gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "deflate"}},
 		// A single encoding.
@@ -72,12 +74,14 @@ func TestEncodingsPriority(t *testing.T) {
 		{"q gzip over br", "gzip, br;q=0.5",
 			[8]string{"gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip"}},
 		{"q zstd lowest", "gzip, br, zstd;q=0.1",
-			[8]string{"gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip"}},
+			[8]string{"br", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
 		// Equal q that is not 1: the client's order still decides.
 		{"equal q 0.5", "br;q=0.5, zstd;q=0.5, gzip;q=0.5",
-			[8]string{"br", "br", "br", "br", "br", "br", "br", "br"}},
+			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "gzip"}},
 		// The wildcard.
 		{"star", "*",
+			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
+		{"gzip then star", "gzip, *",
 			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
 		{"gzip refused, star", "gzip;q=0, *",
 			[8]string{"zstd", "zstd", "zstd", "br", "br", "br", "zstd", "deflate"}},
@@ -108,6 +112,9 @@ func TestEncodingsPriority(t *testing.T) {
 				c, rec := celeristest.NewContextT(t, "GET", "/", opts...)
 				if err := c.Next(); err != nil {
 					t.Fatalf("Accept-Encoding %q: %v", tc.ae, err)
+				}
+				if v := rec.Header("vary"); !strings.Contains(strings.ToLower(v), "accept-encoding") {
+					t.Errorf("Accept-Encoding %q: Vary %q does not name Accept-Encoding", tc.ae, v)
 				}
 				got := rec.Header("content-encoding")
 				if got == "" {

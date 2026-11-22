@@ -12,11 +12,12 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/negotiate"
 )
 
 // addVary adds Vary: Accept-Encoding to c's response unless a Vary line
-// already names it: Context.AcceptsEncodings adds one (celeris#912), and the
-// handler may have too. The response then names it once.
+// already names it: the handler may have added one (a Context.AcceptsEncodings
+// call adds it, celeris#912). The response then names it once.
 func addVary(c *celeris.Context) {
 	if !varyNamesAcceptEncoding(c.ResponseHeaders()) {
 		c.AddHeader("vary", "Accept-Encoding")
@@ -219,13 +220,17 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		encoding := c.AcceptsEncodings(encodings...)
+		// Config.Encodings is the server's priority order (celeris#1335): of the encodings
+		// the client accepts with the highest q-value, the first one listed
+		// there wins, not the one the client's header names first.
+		// c.AcceptsEncodings would rank equal q-values by the header (so
+		// "gzip, deflate, br, zstd" would always give gzip); it also names
+		// Accept-Encoding in Vary, which addVary does here, once.
+		encoding := negotiate.AcceptServerOrder(c.Header("accept-encoding"), encodings)
+		addVary(c)
 		if encoding == "" {
 			// No matching encoding. Vary still names Accept-Encoding so
 			// caches know the response varies by it even when uncompressed.
-			// AcceptsEncodings has named it (celeris#912); addVary keeps the
-			// line with a core older than that and adds no second one.
-			addVary(c)
 			return c.Next()
 		}
 
@@ -360,7 +365,7 @@ func resolveBrotliLevel(l Level) int {
 func resolveZstdLevel(l Level) zstd.EncoderLevel {
 	switch l {
 	case LevelDefault:
-		return zstd.SpeedDefault // 3
+		return zstd.SpeedDefault // = 2 (1 fastest, 3 better, 4 best), about zstd level 3
 	case LevelNone:
 		return zstd.SpeedFastest // 1 (zstd has no "store" mode; fastest is closest)
 	case LevelBest:

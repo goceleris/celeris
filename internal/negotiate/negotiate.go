@@ -79,6 +79,29 @@ func Accept(header string, offers []string) string {
 	return bestOffer
 }
 
+// AcceptServerOrder is [Accept] with the tie broken the other way: it weighs
+// the offers by the header exactly as Accept does (the most specific entry's
+// q-value, q=0 refuses, "*" stands for the codings not listed), and of the
+// offers with the highest q-value it returns the first in offers, whatever the
+// order of the entries in the header. The offers are the server's priority
+// order, so "gzip, deflate, br, zstd" with offers [zstd, br, gzip] gives zstd
+// where Accept gives gzip; "br;q=1, gzip;q=0.8" gives br for either order of
+// offers, as a higher q-value still wins.
+func AcceptServerOrder(header string, offers []string) string {
+	var entryBuf [8]AcceptItem
+	entries := ParseInto(entryBuf[:0], header)
+	var specBuf [16]int8
+	best := ""
+	bestQ := 0.0
+	for _, offer := range offers {
+		// Strictly greater: an earlier offer keeps a tie.
+		if q, _ := offerQuality(entries, coding(strings.ToLower(offer)), specBuf[:]); q > bestQ {
+			bestQ, best = q, offer
+		}
+	}
+	return best
+}
+
 // offerQuality returns the q-value of the lowercased offer and the index of
 // the entry that ranks it among offers of the same q-value: q is that of the
 // most specific entries matching the offer (see [Accept]), 0 if any of them
