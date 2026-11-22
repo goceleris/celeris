@@ -1,0 +1,1944 @@
+{
+  "version": 1,
+  "driver": "postgres",
+  "regenerate": "go test -tags postgres -run '^TestSupportTable$' ./test/conformance/postgres/",
+  "sections": [
+    {
+      "id": "column-types",
+      "title": "Column types read back",
+      "rows": [
+        {
+          "id": "bool",
+          "label": "bool",
+          "returns": "`bool`",
+          "works": [
+            "any",
+            "*bool"
+          ],
+          "null": [
+            "*sql.NullBool"
+          ]
+        },
+        {
+          "id": "int2",
+          "label": "int2",
+          "returns": "`int64`",
+          "works": [
+            "any",
+            "*int16",
+            "*int64",
+            "*int"
+          ],
+          "null": [
+            "*sql.NullInt64"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "int4",
+          "label": "int4",
+          "returns": "`int64`",
+          "works": [
+            "any",
+            "*int32",
+            "*int64",
+            "*int"
+          ],
+          "null": [
+            "*sql.NullInt64"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "int8",
+          "label": "int8",
+          "returns": "`int64`",
+          "works": [
+            "any",
+            "*int64",
+            "*int"
+          ],
+          "null": [
+            "*sql.NullInt64"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "float4",
+          "label": "float4",
+          "returns": "`float64`",
+          "works": [
+            "any",
+            "*float32",
+            "*float64"
+          ],
+          "null": [
+            "*sql.NullFloat64"
+          ]
+        },
+        {
+          "id": "float8",
+          "label": "float8",
+          "returns": "`float64`",
+          "works": [
+            "any",
+            "*float64"
+          ],
+          "null": [
+            "*sql.NullFloat64"
+          ]
+        },
+        {
+          "id": "numeric",
+          "label": "numeric",
+          "returns": "`string`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "text",
+          "label": "text",
+          "returns": "`string`",
+          "works": [
+            "any",
+            "*string",
+            "*[]byte"
+          ],
+          "null": [
+            "*sql.NullString"
+          ]
+        },
+        {
+          "id": "varchar-n",
+          "label": "varchar(n)",
+          "returns": "`string`",
+          "works": [
+            "any",
+            "*string",
+            "*[]byte"
+          ],
+          "null": [
+            "*sql.NullString"
+          ]
+        },
+        {
+          "id": "char-n",
+          "label": "char(n)",
+          "returns": "`[]byte`",
+          "works": [
+            "any",
+            "*string",
+            "*[]byte"
+          ],
+          "null": [
+            "*sql.NullString"
+          ]
+        },
+        {
+          "id": "name",
+          "label": "name",
+          "returns": "`[]byte`",
+          "works": [
+            "any",
+            "*string",
+            "*[]byte"
+          ],
+          "null": [
+            "*sql.NullString"
+          ]
+        },
+        {
+          "id": "bytea",
+          "label": "bytea",
+          "returns": "`[]byte`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*[]byte",
+              "gap": "B2",
+              "scope": [
+                "pool/simple"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "json",
+          "label": "json",
+          "returns": "`[]byte`",
+          "works": [
+            "any",
+            "*string",
+            "*[]byte"
+          ],
+          "null": [
+            "*sql.NullString"
+          ]
+        },
+        {
+          "id": "uuid",
+          "label": "uuid",
+          "returns": "`string`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B1",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "date",
+          "label": "date",
+          "returns": "`time.Time`",
+          "works": [
+            "any",
+            "*time.Time"
+          ],
+          "null": [
+            "*sql.NullTime"
+          ]
+        },
+        {
+          "id": "date-bc-a-year-before-1",
+          "label": "date (BC, a year before 1)",
+          "returns": "`time.Time`",
+          "works": [],
+          "null": [
+            "*sql.NullTime"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B5",
+              "scope": [
+                "pool/simple",
+                "sql/simple"
+              ]
+            },
+            {
+              "dest": "*time.Time",
+              "gap": "B5",
+              "scope": [
+                "pool/simple",
+                "sql/simple"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "time",
+          "label": "time",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "timetz",
+          "label": "timetz",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "timestamp",
+          "label": "timestamp",
+          "returns": "`time.Time`",
+          "works": [
+            "any",
+            "*time.Time"
+          ],
+          "null": [
+            "*sql.NullTime"
+          ]
+        },
+        {
+          "id": "timestamptz",
+          "label": "timestamptz",
+          "returns": "`time.Time`",
+          "works": [
+            "any",
+            "*time.Time"
+          ],
+          "null": [
+            "*sql.NullTime"
+          ]
+        },
+        {
+          "id": "timestamp-timestamptz-before-the-year-1708-or-after-2292",
+          "label": "timestamp, timestamptz (before the year 1708 or after 2292)",
+          "returns": "`time.Time`",
+          "works": [],
+          "null": [
+            "*sql.NullTime"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B13",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*time.Time",
+              "gap": "B13",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "interval",
+          "label": "interval",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "int2-array",
+          "label": "int2[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "int4-array",
+          "label": "int4[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "int8-array",
+          "label": "int8[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "text-array",
+          "label": "text[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "varchar-array",
+          "label": "varchar[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "float8-array",
+          "label": "float8[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "bool-array",
+          "label": "bool[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "uuid-array",
+          "label": "uuid[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "bytea-array",
+          "label": "bytea[]",
+          "returns": "`[]driver.Value`",
+          "works": [
+            "any"
+          ],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "*string",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B4",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "int4-array-array-two-dimensional",
+          "label": "int4[][] (two-dimensional)",
+          "returns": "Not supported (see the known gap)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B12",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B12",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B12",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "numeric-array",
+          "label": "numeric[]",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "date-array",
+          "label": "date[]",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "timestamptz-array",
+          "label": "timestamptz[]",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "inet",
+          "label": "inet",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "cidr",
+          "label": "cidr",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "macaddr",
+          "label": "macaddr",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "oid",
+          "label": "oid",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "enum-a-type-you-create",
+          "label": "enum (a type you create)",
+          "returns": "`[]byte`",
+          "works": [
+            "any",
+            "*string",
+            "*[]byte"
+          ],
+          "null": [
+            "*sql.NullString"
+          ]
+        },
+        {
+          "id": "enum-array",
+          "label": "enum[]",
+          "returns": "`[]byte` (text form)",
+          "works": [],
+          "null": [
+            "*sql.NullString"
+          ],
+          "fails": [
+            {
+              "dest": "any",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*string",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "*[]byte",
+              "gap": "B3",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "argument-kinds",
+      "title": "Go values passed as arguments",
+      "rows": [
+        {
+          "id": "bool",
+          "label": "bool",
+          "works": [
+            "bool"
+          ]
+        },
+        {
+          "id": "int",
+          "label": "int",
+          "works": [
+            "int2",
+            "int4"
+          ]
+        },
+        {
+          "id": "int32",
+          "label": "int32",
+          "works": [
+            "int4"
+          ]
+        },
+        {
+          "id": "int64",
+          "label": "int64",
+          "works": [
+            "int8",
+            "numeric"
+          ]
+        },
+        {
+          "id": "float64",
+          "label": "float64",
+          "works": [
+            "numeric",
+            "float8"
+          ]
+        },
+        {
+          "id": "string",
+          "label": "string",
+          "works": [
+            "numeric",
+            "text",
+            "char(4)",
+            "json",
+            "uuid",
+            "time",
+            "interval",
+            "int4[]",
+            "text[]",
+            "inet",
+            "cidr"
+          ]
+        },
+        {
+          "id": "float32",
+          "label": "float32",
+          "works": [
+            "float4"
+          ]
+        },
+        {
+          "id": "array-byte",
+          "label": "[]byte",
+          "works": [
+            "text",
+            "bytea",
+            "json",
+            "uuid"
+          ]
+        },
+        {
+          "id": "time-time",
+          "label": "time.Time",
+          "works": [
+            "date",
+            "timestamp",
+            "timestamptz"
+          ],
+          "fails": [
+            {
+              "dest": "time",
+              "gap": "B9",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "timestamptz (years before 1)",
+              "gap": "B9",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "nil-sql-null",
+          "label": "nil (SQL NULL)",
+          "works": [
+            "bool",
+            "int2",
+            "int4",
+            "int8",
+            "float4",
+            "float8",
+            "numeric",
+            "text",
+            "bytea",
+            "json",
+            "uuid",
+            "date",
+            "time",
+            "timestamp",
+            "timestamptz",
+            "interval",
+            "int4[]",
+            "text[]",
+            "inet",
+            "cidr"
+          ]
+        },
+        {
+          "id": "int16",
+          "label": "int16",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int2",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "int2",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "byte",
+          "label": "byte",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int4",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "int4",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "uint32",
+          "label": "uint32",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int8",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "int8",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "uint64",
+          "label": "uint64",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int8",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "int8",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "your-own-defined-string-type",
+          "label": "your own defined string type",
+          "works": [],
+          "fails": [
+            {
+              "dest": "text",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "text",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "your-own-defined-integer-type",
+          "label": "your own defined integer type",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int4",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "int4",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "a-type-that-implements-driver-valuer",
+          "label": "a type that implements driver.Valuer",
+          "works": [],
+          "fails": [
+            {
+              "dest": "text",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "text",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sql-nullstring",
+          "label": "sql.NullString",
+          "works": [],
+          "fails": [
+            {
+              "dest": "text",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "text",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sql-nullstring-holding-null",
+          "label": "sql.NullString holding NULL",
+          "works": [],
+          "fails": [
+            {
+              "dest": "text",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "text",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sql-nullint64",
+          "label": "sql.NullInt64",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int8",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "int8",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sql-nullint64-holding-null",
+          "label": "sql.NullInt64 holding NULL",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int8",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "int8",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sql-nullbool",
+          "label": "sql.NullBool",
+          "works": [],
+          "fails": [
+            {
+              "dest": "bool",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "bool",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sql-nullfloat64",
+          "label": "sql.NullFloat64",
+          "works": [],
+          "fails": [
+            {
+              "dest": "float8",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "float8",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sql-nulltime",
+          "label": "sql.NullTime",
+          "works": [],
+          "fails": [
+            {
+              "dest": "timestamptz",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "timestamptz",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "sql-null-int32",
+          "label": "sql.Null[int32]",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int4",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "int4",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "pointer-string",
+          "label": "*string",
+          "works": [],
+          "fails": [
+            {
+              "dest": "text",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "text",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "pointer-string-holding-null",
+          "label": "*string holding NULL",
+          "works": [],
+          "fails": [
+            {
+              "dest": "text",
+              "gap": "B6",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            },
+            {
+              "dest": "text",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "16-byte",
+          "label": "[16]byte",
+          "works": [],
+          "fails": [
+            {
+              "dest": "uuid",
+              "gap": "B11",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "json-rawmessage",
+          "label": "json.RawMessage",
+          "works": [],
+          "fails": [
+            {
+              "dest": "json",
+              "gap": "B6P",
+              "scope": [
+                "pool/ext",
+                "pool/nocache"
+              ]
+            },
+            {
+              "dest": "json",
+              "gap": "B7",
+              "scope": [
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "array-string",
+          "label": "[]string",
+          "works": [],
+          "fails": [
+            {
+              "dest": "text[]",
+              "gap": "B8",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "array-int64",
+          "label": "[]int64",
+          "works": [],
+          "fails": [
+            {
+              "dest": "int8[]",
+              "gap": "B8",
+              "scope": [
+                "pool/ext",
+                "pool/nocache",
+                "sql/ext",
+                "sql/nocache",
+                "sql/prep"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "id": "B1",
+      "release": "v1.6.0",
+      "summary": "With the native `Pool`, scanning an integer, numeric or uuid column into a `string` or a `[]byte` on a query with arguments gave the raw binary wire bytes instead of the text.",
+      "fix": "#1333",
+      "issue": "#1334"
+    },
+    {
+      "id": "B11",
+      "release": "v1.6.1",
+      "summary": "A `[16]byte` array is not accepted as a uuid argument. Pass the uuid as a `string`, or the 16 bytes as a `[]byte`.",
+      "error": "celeris-postgres: encode arg 1: celeris-postgres: unsupported argument type [16]uint8; convert to bool/int64/float64/string/[]byte/time.Time or register a codec"
+    },
+    {
+      "id": "B12",
+      "release": "v1.6.1",
+      "summary": "A two-dimensional array is returned flattened, as one list of all its elements. A change that makes it an error is planned for v1.6.0. Read it as text, `SELECT col::text`, until it is supported."
+    },
+    {
+      "id": "B13",
+      "release": "v1.6.0",
+      "summary": "On a query with arguments, a prepared statement or a query the driver caches, a `timestamp` or `timestamptz` before about the year 1708 or after about 2292 is read as a different time. The same query without arguments is correct."
+    },
+    {
+      "id": "B2",
+      "release": "v1.6.0",
+      "summary": "With the native `Pool` and a query without arguments, scanning a bytea column into a `[]byte` gave the text form (`\\x00ff...`) instead of the bytes.",
+      "fix": "#1333"
+    },
+    {
+      "id": "B3",
+      "release": "v1.6.0",
+      "summary": "On a query with arguments, a prepared statement or a query the driver caches, a column of a type the driver has no decoder for (time, timetz, interval, inet, cidr, macaddr, oid, and arrays of numeric, date, timestamptz or enum) came back as raw binary bytes. The same query without arguments returned the text."
+    },
+    {
+      "id": "B4",
+      "release": "v1.6.1",
+      "summary": "An array column cannot be scanned into a `string` or a `[]byte` on a query with arguments. With `database/sql` you get the error below. With the native `Pool` you get the raw binary bytes today and an error as well from v1.6.0 on. Scan it into an `any` and read the `[]driver.Value`, or cast it to text in the query (`SELECT col::text`). Whether an array comes back as a Go slice or as the text literal also depends on whether the query had arguments.",
+      "error": "sql: Scan error on column index 0, name \"c\": unsupported Scan, storing driver.Value type []driver.Value into type *string"
+    },
+    {
+      "id": "B5",
+      "release": "v1.6.0",
+      "summary": "A BC date cannot be read from a query without arguments. The same value is read correctly when the query has arguments.",
+      "error": "parsing time \"0044-03-15 BC\": extra text: \" BC\"",
+      "fix": "#1341"
+    },
+    {
+      "id": "B6",
+      "release": "v1.6.0",
+      "summary": "With `database/sql`, the wrappers and integer widths that it normally converts for you are rejected as arguments: `sql.NullString`, `sql.NullInt64` and the other `sql.Null*` types, anything that implements `driver.Valuer`, your own defined types, pointers, and `int16`, `uint8`, `uint32` and `uint64`. Writing a NULL with `sql.NullString{}` fails the same way.",
+      "error": "celeris-postgres: encode arg 1: celeris-postgres: unsupported argument type sql.NullString; convert to bool/int64/float64/string/[]byte/time.Time or register a codec",
+      "fix": "#1340"
+    },
+    {
+      "id": "B6P",
+      "release": "v1.6.1",
+      "summary": "The native `Pool` rejects the same values (`sql.Null*`, `driver.Valuer`, defined types, pointers, `json.RawMessage`, `int16`, `uint8`, `uint32`, `uint64`) as arguments, because it does not use the conversion `database/sql` applies. Pass the plain value instead, or use `database/sql`.",
+      "error": "celeris-postgres: encode arg 1: celeris-postgres: unsupported argument type sql.NullString; convert to bool/int64/float64/string/[]byte/time.Time or register a codec"
+    },
+    {
+      "id": "B7",
+      "release": "v1.6.0",
+      "summary": "With `database/sql`, `json.RawMessage` is rejected as an argument, because it is a defined type, as your own types are. Go reports its type as `jsontext.Value`.",
+      "error": "celeris-postgres: encode arg 1: celeris-postgres: unsupported argument type jsontext.Value; convert to bool/int64/float64/string/[]byte/time.Time or register a codec",
+      "fix": "#1340"
+    },
+    {
+      "id": "B8",
+      "release": "v1.6.1",
+      "summary": "Go slices (`[]string`, `[]int64`) are not accepted as array arguments. Pass the PostgreSQL array text, such as `{a,b}`, as a `string`.",
+      "error": "celeris-postgres: encode arg 1: celeris-postgres: unsupported argument type []string; convert to bool/int64/float64/string/[]byte/time.Time or register a codec"
+    },
+    {
+      "id": "B9",
+      "release": "v1.6.1",
+      "summary": "A `time.Time` cannot be passed to a `time` column, and a `time.Time` before year 1 cannot be passed to `timestamptz`. Pass the value as a `string`.",
+      "error": "ERROR: invalid input syntax for type time: \"2025-01-15T12:34:56.789123Z\" (SQLSTATE 22007)"
+    }
+  ]
+}
