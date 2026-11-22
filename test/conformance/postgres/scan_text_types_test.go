@@ -6,8 +6,11 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/driver/postgres"
 )
 
 // TestNativeScanVersionedTextTypes covers the native Pool.QueryContext /
@@ -142,4 +145,58 @@ func anyText(a any) string {
 		return v
 	}
 	return ""
+}
+
+// TestNativeScanInfinityIntoString checks that a date, timestamp or timestamptz
+// 'infinity' / '-infinity' scanned into *string or *[]byte reads back as the
+// server's own text on every path: simple (no arguments), cached (the DSN
+// default) and unnamed (auto_cache_statements=false). The decoded time.Time
+// is a sentinel (PGInfinity, PGNegInfinity); formatting it as RFC3339Nano
+// leaked "9999-12-31T23:59:59Z" on the binary paths.
+func TestNativeScanInfinityIntoString(t *testing.T) {
+	dsn := dsnFromEnv(t)
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	pools := map[string]*postgres.Pool{}
+	for name, d := range map[string]string{
+		"cached":  dsn,
+		"unnamed": dsn + sep + "auto_cache_statements=false",
+	} {
+		p, err := postgres.Open(d, postgres.WithMaxOpen(2))
+		if err != nil {
+			t.Fatalf("postgres.Open(%s): %v", name, err)
+		}
+		t.Cleanup(func() { _ = p.Close() })
+		pools[name] = p
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	for _, typ := range []string{"date", "timestamp", "timestamptz"} {
+		for _, inf := range []string{"infinity", "-infinity"} {
+			expr := "'" + inf + "'::" + typ
+			for _, mode := range []string{"simple", "cached", "unnamed"} {
+				t.Run(typ+"/"+inf+"/"+mode, func(t *testing.T) {
+					p, q, args := pools["cached"], "SELECT "+expr, []any(nil)
+					if mode != "simple" {
+						q += " WHERE $1::int = 1"
+						args = []any{1}
+					}
+					if mode == "unnamed" {
+						p = pools["unnamed"]
+					}
+					var s string
+					if err := p.QueryRow(ctx, q, args...).Scan(&s); err != nil || s != inf {
+						t.Errorf("native *string: got %q err %v, want %q", s, err, inf)
+					}
+					var b []byte
+					if err := p.QueryRow(ctx, q, args...).Scan(&b); err != nil || string(b) != inf {
+						t.Errorf("native *[]byte: got %q err %v, want %q", b, err, inf)
+					}
+				})
+			}
+		}
+	}
 }
