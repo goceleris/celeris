@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -756,6 +757,18 @@ func int64ToUint32(n int64) (uint32, error) {
 	return uint32(n), nil
 }
 
+// binaryFormIsValue reports whether a column of codec's type carries, in
+// binary result format, exactly the bytes a string or []byte destination
+// should receive. That holds for the text-like types (text, varchar, json) and
+// for bytea; every other registered codec decodes through its DecodeBinary.
+func binaryFormIsValue(codec *protocol.TypeCodec) bool {
+	switch codec.OID {
+	case protocol.OIDText, protocol.OIDVarchar, protocol.OIDJSON, protocol.OIDBytea:
+		return true
+	}
+	return false
+}
+
 // decodeBinaryInto decodes raw binary-format bytes directly into dest
 // for the common primitive types. Returns (true, err) when the type was
 // handled (err may be non-nil for decode failures); (false, nil) when
@@ -815,10 +828,18 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 		return true, nil
 	case *string:
 		// Fast path for text/varchar/etc.: no interface boxing, single
-		// string allocation out of the raw slab bytes.
+		// string allocation out of the raw slab bytes. Only for codecs
+		// whose binary form is the value itself; jsonb / jsonpath carry a
+		// version byte, int4 / uuid / timestamp / ... are fixed-width binary.
+		if !binaryFormIsValue(codec) {
+			return false, nil
+		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
+		if !binaryFormIsValue(codec) {
+			return false, nil
+		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -835,7 +856,7 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 }
 
 // decodeTextInto is the text-format counterpart to decodeBinaryInto.
-func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
+func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, error) {
 	switch d := dest.(type) {
 	case *int:
 		n, err := protocol.ParseIntTextASCII(raw)
@@ -867,9 +888,15 @@ func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
 		*d = v
 		return true, nil
 	case *string:
+		if codec.OID == protocol.OIDBytea {
+			return false, nil // text form is the hex escape, not the value
+		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
+		if codec.OID == protocol.OIDBytea {
+			return false, nil
+		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -1022,8 +1049,24 @@ func convertAssign(dest any, src any) error {
 			*d = cp
 		case string:
 			*d = []byte(s)
+		case int64, float64, bool:
+			// Same text form *string receives.
+			var str string
+			if err := convertAssign(&str, s); err != nil {
+				return err
+			}
+			*d = []byte(str)
 		default:
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to []byte", src)
+		}
+	case *json.RawMessage:
+		switch s := src.(type) {
+		case []byte:
+			*d = append(json.RawMessage(nil), s...)
+		case string:
+			*d = append(json.RawMessage(nil), s...)
+		default:
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to json.RawMessage", src)
 		}
 	case *any:
 		*d = src

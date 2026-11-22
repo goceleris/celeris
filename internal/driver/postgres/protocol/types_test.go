@@ -526,3 +526,40 @@ func TestLookupUnknownOID(t *testing.T) {
 		t.Fatalf("unknown oid returned %v", c)
 	}
 }
+
+func TestJSONPathBinaryStripsVersionByte(t *testing.T) {
+	c := LookupOID(OIDJSONPath)
+	if c == nil {
+		t.Fatal("no codec for jsonpath")
+	}
+	got, err := c.DecodeBinary([]byte("\x01$.\"a\""))
+	if err != nil || string(got.([]byte)) != `$."a"` {
+		t.Fatalf("binary: got %q err %v", got, err)
+	}
+	got, err = c.DecodeText([]byte(`$."a"`))
+	if err != nil || string(got.([]byte)) != `$."a"` {
+		t.Fatalf("text: got %q err %v", got, err)
+	}
+	if _, err := c.DecodeBinary([]byte("\x02$.a")); err == nil {
+		t.Fatal("expected version error")
+	}
+	if _, err := c.DecodeBinary(nil); err == nil {
+		t.Fatal("expected error for empty jsonpath")
+	}
+}
+
+func TestJSONArrayCodecsRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		arr, elem uint32
+		in        []byte
+	}{
+		{OIDJSONArr, OIDJSON, []byte(`{"a":1}`)},
+		{OIDJSONBArr, OIDJSONB, []byte(`{"a": 1}`)},
+		{OIDJSONPathArr, OIDJSONPath, []byte(`$."a"`)},
+	} {
+		got := roundTripBinary(t, tc.arr, []any{tc.in}).([]driver.Value)
+		if len(got) != 1 || !bytes.Equal(got[0].([]byte), tc.in) {
+			t.Fatalf("array OID %d -> %v", tc.arr, got)
+		}
+	}
+}

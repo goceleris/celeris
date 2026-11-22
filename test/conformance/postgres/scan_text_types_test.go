@@ -4,6 +4,7 @@ package postgres_test
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"testing"
 	"time"
@@ -102,13 +103,13 @@ func TestNativeScanJSONArrays(t *testing.T) {
 			if err := pool.QueryRow(ctx, q, 1).Scan(&a); err != nil {
 				t.Fatalf("native *any: %v", err)
 			}
-			vals, ok := a.([]any)
+			vals, ok := a.([]driver.Value)
 			if !ok || len(vals) != 1 || anyText(vals[0]) != c.elem {
 				t.Errorf("native *any: got %#v, want [%q]", a, c.elem)
 			}
 			var da any
 			if err := db.QueryRowContext(ctx, q, 1).Scan(&da); err == nil {
-				if vals, ok := da.([]any); !ok || len(vals) != 1 || anyText(vals[0]) != c.elem {
+				if vals, ok := da.([]driver.Value); !ok || len(vals) != 1 || anyText(vals[0]) != c.elem {
 					t.Errorf("database/sql *any: got %#v, want [%q]", da, c.elem)
 				}
 			}

@@ -227,4 +227,7 @@ func init() {
 	registerArrayCodec(OIDFloat8Arr, OIDFloat8, "_float8")
 	registerArrayCodec(OIDVarcharArr, OIDVarchar, "_varchar")
 	registerArrayCodec(OIDUUIDArr, OIDUUID, "_uuid")
+	registerArrayCodec(OIDJSONArr, OIDJSON, "_json")
+	registerArrayCodec(OIDJSONBArr, OIDJSONB, "_jsonb")
+	registerArrayCodec(OIDJSONPathArr, OIDJSONPath, "_jsonpath")
 }
