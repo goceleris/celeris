@@ -28,7 +28,11 @@ runs, so a gap of a few percent is not a ranking.
 """
 import html
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tie_rule  # composition.json beside the cell: tie rule of a cell composed from two dispatches
 
 LANG = {"go": "Go", "rust": "Rust", "c": "C", "cpp": "C++", "java": "Java", "node": "Node",
         "python": "Python", "csharp": "C#", "bun": "Bun", "zig": "Zig"}
@@ -57,6 +61,12 @@ def main():
     n_srv = sum(1 for e in d["benchmarks"] if e["saturation_mode_rps"].get(scn))
     if ranked[0][0] != "celeris":
         sys.exit("celeris is not first on %s: the headline of this chart would be false" % scn)
+    comp = tie_rule.load(path)  # None: a single-dispatch cell, no tie rule
+    if comp:
+        # first place must hold against every framework with its margin: other dispatch = the scenario's tie margin
+        st = tie_rule.standing(comp, scn, ranked[0][1][0], [(v, name) for fw, (v, name, lang) in ranked[1:]])
+        if st != "win":
+            sys.exit("celeris is not clearly ahead on %s (%s within the margin of the other dispatch, see composition.json): the headline of this chart would be false" % (scn, st))
     top = ranked[:9]
     std_i = [i for i, (fw, _) in enumerate(ranked) if fw == "net/http"][0]
     rows = [(i + 1,) + r for i, r in enumerate(top)]

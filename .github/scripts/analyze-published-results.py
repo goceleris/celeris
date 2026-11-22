@@ -6,12 +6,14 @@ Usage: analyze-published-results.py <docs-clone-dir> [version [date]]   (default
 
 Method, so the counts can be judged: per scenario, the best celeris configuration is compared with the best
 configuration of any other Go *framework* (fiber, gin, echo, chi, iris, hertz; gnet, fasthttp and nbio are
-libraries and net/http is the stdlib, both excluded as in the docs site). Within 5% counts as a tie. Rows
+libraries and net/http is the stdlib, both excluded as in the docs site). Within 5% counts as a tie (a cell composed from two dispatches ships composition.json, and a framework from the other dispatch then needs the scenario's tie margin instead: tie_rule.py). Rows
 where no other Go framework ran (the six WebSocket/SSE rows) are walkovers and are not counted. The HTTP/2 rows
 and churn-close are left out of the second tally only for a run made by a loadgen older than v1.4.14, which
 fixed the clients behind them (a run from v1.4.14 or later keeps them). One run per cell, so the 5% band is a
 convention, not a confidence interval."""
-import json, statistics, sys, re
+import json, os, statistics, sys, re
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tie_rule  # composition.json: the per-scenario tie rule of a cell composed from two dispatches
 root = sys.argv[1]
 VERSION = sys.argv[2] if len(sys.argv) > 2 else "v1.5.8"
 DATE = sys.argv[3] if len(sys.argv) > 3 else "20260829"
@@ -29,6 +31,7 @@ STD = {"stdhttp-h1","stdhttp-h2","stdhttp-hybrid"}
 STDCEL = {"celeris-std-h1"}  # the std-engine configuration of celeris, left out of the "native" tally
 for arch in ("x86_64","arm64"):
     d = json.load(open(f"{root}/results/{VERSION}/{DATE}/{arch}/summary.json"))
+    comp = tie_rule.load(f"{root}/results/{VERSION}/{DATE}/{arch}/summary.json")  # None: single dispatch
     bc = d["benchmark_config"]
     print(f"=== {arch}: {d['host_arch_pair']} run {bc['started_at']}..{bc['finished_at']} runs={bc['runs']} duration={bc['duration']/1e9:.0f}s warmup={bc['warmup']/1e9:.0f}s loadgen={bc.get('loadgen_version')} servers={len(d['benchmarks'])}")
     B = {e["name"]: e for e in d["benchmarks"]}
@@ -73,6 +76,8 @@ for arch in ("x86_64","arm64"):
             if rv<=0: walk+=1; detail.append((s,"walkover")); continue
             ratio=bc_/rv
             k = "win" if ratio>1.05 else ("loss" if ratio<0.95 else "tie")
+            if comp:  # composed cell: every rival with its own margin (other dispatch: the scenario's tie margin)
+                k = tie_rule.standing(comp, s, bc_, [r for r in rivals if r[0]>0])
             detail.append((s,k,round(ratio,3),rn))
             wins+= k=="win"; ties+= k=="tie"; loss+= k=="loss"
         EXCL = excluded_rows(bc.get("loadgen_version"))
@@ -91,6 +96,7 @@ import glob
 print("\n=== every published cell of", VERSION)
 for path in sorted(glob.glob(f"{root}/results/{VERSION}/*/*/summary.json")):
     d = json.load(open(path))
+    comp = tie_rule.load(path)
     B = d["benchmarks"]; cel = {n: e for n, e in B.items()} if False else None
     Bn = {e["name"]: e for e in B}
     celc = [e for e in B if e["framework"] == "celeris" and e["name"] not in STDCEL]  # native engines only, as above
@@ -109,6 +115,9 @@ for path in sorted(glob.glob(f"{root}/results/{VERSION}/*/*/summary.json")):
                   and e["name"] not in LIBS and e["name"] not in STD), default=0)
         if bc_ <= 0 or rv <= 0: continue
         k = "win" if bc_ / rv > 1.05 else ("loss" if bc_ / rv < 0.95 else "tie")
+        if comp:
+            k = tie_rule.standing(comp, s, bc_, [(e["saturation_mode_rps"].get(s, 0), e["name"]) for e in B if e["language"] == "go" and e["framework"] != "celeris"
+                                                 and e["name"] not in LIBS and e["name"] not in STD and e["saturation_mode_rps"].get(s, 0) > 0])
         t[k] += 1
         if s.startswith("driver-"): drv[k] += 1
     cfg = d["benchmark_config"]
