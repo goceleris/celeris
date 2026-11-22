@@ -967,6 +967,10 @@ func convertAssign(dest any, src any) error {
 			} else {
 				*d = "false"
 			}
+		case time.Time:
+			*d = s.Format(time.RFC3339Nano) // as database/sql does
+		case []driver.Value:
+			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
 			*d = fmt.Sprintf("%v", src)
 		}
@@ -1051,6 +1055,8 @@ func convertAssign(dest any, src any) error {
 			*d = cp
 		case string:
 			*d = []byte(s)
+		case time.Time:
+			*d = []byte(s.Format(time.RFC3339Nano))
 		case int64, float64, bool:
 			// Same text form *string receives.
 			var str string
