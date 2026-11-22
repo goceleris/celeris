@@ -437,33 +437,12 @@
           "id": "timestamp-timestamptz-before-the-year-1708-or-after-2292",
           "label": "timestamp, timestamptz (before the year 1708 or after 2292)",
           "returns": "`time.Time`",
-          "works": [],
+          "works": [
+            "any",
+            "*time.Time"
+          ],
           "null": [
             "*sql.NullTime"
-          ],
-          "fails": [
-            {
-              "dest": "any",
-              "gap": "B13",
-              "scope": [
-                "pool/ext",
-                "pool/nocache",
-                "sql/ext",
-                "sql/nocache",
-                "sql/prep"
-              ]
-            },
-            {
-              "dest": "*time.Time",
-              "gap": "B13",
-              "scope": [
-                "pool/ext",
-                "pool/nocache",
-                "sql/ext",
-                "sql/nocache",
-                "sql/prep"
-              ]
-            }
           ]
         },
         {
@@ -1878,11 +1857,6 @@
       "id": "B12",
       "release": "v1.6.1",
       "summary": "A two-dimensional array is returned flattened, as one list of all its elements. A change that makes it an error is planned for v1.6.0. Read it as text, `SELECT col::text`, until it is supported."
-    },
-    {
-      "id": "B13",
-      "release": "v1.6.0",
-      "summary": "On a query with arguments, a prepared statement or a query the driver caches, a `timestamp` or `timestamptz` before about the year 1708 or after about 2292 is read as a different time. The same query without arguments is correct."
     },
     {
       "id": "B2",

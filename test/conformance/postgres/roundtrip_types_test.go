@@ -344,10 +344,6 @@ func rtKnownBug(c *rtCase, api, proto, dest string) string {
 		if bin {
 			return "B12 multi-dimensional arrays are flattened (dimensions lost)"
 		}
-	case "tsfar":
-		if bin && dest != "null" {
-			return "B13 binary timestamp decode overflows a time.Duration outside about 1708..2292"
-		}
 	case "int", "numeric", "uuid", "bool", "float":
 		if api == "pool" && bin && (dest == "str" || dest == "bytes") {
 			return "B1 Pool.Scan raw fast path returns the binary wire bytes for " + c.typ

@@ -289,6 +289,4 @@ var rtGaps = []supporttable.Gap{
 		Error:   "celeris-postgres: encode arg 1: celeris-postgres: unsupported argument type [16]uint8; convert to bool/int64/float64/string/[]byte/time.Time or register a codec"},
 	{ID: "B12", Release: supporttable.V161,
 		Summary: "A two-dimensional array is returned flattened, as one list of all its elements. A change that makes it an error is planned for v1.6.0. Read it as text, `SELECT col::text`, until it is supported."},
-	{ID: "B13", Release: supporttable.V160,
-		Summary: "On a query with arguments, a prepared statement or a query the driver caches, a `timestamp` or `timestamptz` before about the year 1708 or after about 2292 is read as a different time. The same query without arguments is correct."},
 }
