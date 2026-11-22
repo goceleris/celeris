@@ -948,6 +948,20 @@ func scanValue(dest any, v driver.Value) error {
 	return convertAssign(dest, v)
 }
 
+// formatTimeText renders a decoded date/timestamp/timestamptz as the text a
+// *string or *[]byte destination receives: RFC3339Nano (as database/sql
+// does), except that the PGInfinity / PGNegInfinity sentinels read back as the
+// server's own "infinity" / "-infinity" rather than a made-up date.
+func formatTimeText(t time.Time) string {
+	switch {
+	case t.Equal(PGInfinity):
+		return "infinity"
+	case t.Equal(PGNegInfinity):
+		return "-infinity"
+	}
+	return t.Format(time.RFC3339Nano)
+}
+
 // convertAssign assigns src to dest pointer, performing common conversions.
 func convertAssign(dest any, src any) error {
 	switch d := dest.(type) {
@@ -968,7 +982,7 @@ func convertAssign(dest any, src any) error {
 				*d = "false"
 			}
 		case time.Time:
-			*d = s.Format(time.RFC3339Nano) // as database/sql does
+			*d = formatTimeText(s)
 		case []driver.Value:
 			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
@@ -1056,7 +1070,7 @@ func convertAssign(dest any, src any) error {
 		case string:
 			*d = []byte(s)
 		case time.Time:
-			*d = []byte(s.Format(time.RFC3339Nano))
+			*d = []byte(formatTimeText(s))
 		case int64, float64, bool:
 			// Same text form *string receives.
 			var str string
