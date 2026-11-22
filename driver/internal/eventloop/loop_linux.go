@@ -42,10 +42,33 @@ const readBudget = 16
 // used up its budget has bytes to read and is served with timeout 0.
 const busyRetryMs = 1
 
-// maxPendingBytes is the per-FD outbound buffer cap on the Linux worker.
-// Writes beyond this return engine.ErrQueueFull. Chosen to match the H1/H2
-// backpressure limit used by the HTTP epoll engine.
-const maxPendingBytes = 4 << 20 // 4 MiB
+// maxPendingBytes is the per-FD outbound buffer cap on the Linux worker: the
+// pending bytes plus a new write may not exceed it, so it is also the largest
+// single write. It matches the engine-hosted paths (the epoll and io_uring
+// engines cap a driver conn at the same [engine.DriverWriteLimit]); it was
+// 4 MiB, which refused a 4 MiB Redis SET when the driver ran standalone. The
+// buffer grows on demand (append), it is not allocated up to the cap.
+//
+// A write over the cap returns engine.ErrQueueFull when the queue is merely
+// busy (retry later) and a *engine.WriteTooLargeError, which matches it, when
+// the write alone is over the cap (it can never fit: celeris#1357).
+const maxPendingBytes = engine.DriverWriteLimit
+
+// writeBufKeep is the largest outbound buffer a conn keeps after a full
+// drain. A conn that sent one big frame would otherwise hold its capacity
+// (up to the cap, 64 MiB) for the rest of its life, where the 4 MiB cap
+// bounded that at about 4 MiB.
+const writeBufKeep = 4 << 20
+
+// errWriteCap is the error for a write that does not fit: pending bytes plus
+// the write exceed maxPendingBytes. A write that is over the cap by itself is
+// reported with the limit it exceeded, since waiting cannot help.
+func errWriteCap(n int) error {
+	if n > maxPendingBytes {
+		return &engine.WriteTooLargeError{Size: n, Limit: maxPendingBytes}
+	}
+	return engine.ErrQueueFull
+}
 
 // shutdownPartial closes any workers created before a failure in newLoop.
 func (l *Loop) shutdownPartial() error {
@@ -609,7 +632,8 @@ func (w *worker) forget(c *driverConn) {
 
 // Write satisfies [engine.WorkerLoop]. Data is appended to the FD's outbound
 // buffer and flushed asynchronously under c.mu (one write(2) in flight per
-// FD). Returns engine.ErrQueueFull when the buffer would exceed the cap,
+// FD). Returns engine.ErrQueueFull when the buffer would exceed the cap (a
+// *engine.WriteTooLargeError, which matches it, when data alone does),
 // engine.ErrUnknownFD for an FD that is not registered or is closing, and
 // ErrLoopClosed once the loop is closed.
 func (w *worker) Write(fd int, data []byte) error {
@@ -629,7 +653,7 @@ func (w *worker) Write(fd int, data []byte) error {
 	}
 	if len(c.writeBuf)-c.writePos+len(data) > maxPendingBytes {
 		c.mu.Unlock()
-		return engine.ErrQueueFull
+		return errWriteCap(len(data))
 	}
 	c.writeBuf = append(c.writeBuf, data...)
 	if c.sending {
@@ -691,7 +715,11 @@ func (w *worker) flushLocked(c *driverConn) error {
 		c.writePos += n
 	}
 	// Fully drained — reset for reuse.
-	c.writeBuf = c.writeBuf[:0]
+	if cap(c.writeBuf) > writeBufKeep {
+		c.writeBuf = nil
+	} else {
+		c.writeBuf = c.writeBuf[:0]
+	}
 	c.writePos = 0
 	if c.epollOut {
 		ev := c.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
@@ -805,7 +833,7 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 	}
 	if len(c.writeBuf)-c.writePos+len(data) > maxPendingBytes {
 		c.mu.Unlock()
-		return false, engine.ErrQueueFull
+		return false, errWriteCap(len(data))
 	}
 	c.writeBuf = append(c.writeBuf, data...)
 	if c.sending {
@@ -1011,7 +1039,7 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 	}
 	if len(c.writeBuf)-c.writePos+len(data) > maxPendingBytes {
 		c.mu.Unlock()
-		return false, engine.ErrQueueFull
+		return false, errWriteCap(len(data))
 	}
 	c.writeBuf = append(c.writeBuf, data...)
 	if c.sending {
@@ -1221,7 +1249,7 @@ func (w *worker) WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func
 	}
 	if len(c.writeBuf)-c.writePos+len(data) > maxPendingBytes {
 		c.mu.Unlock()
-		return false, engine.ErrQueueFull
+		return false, errWriteCap(len(data))
 	}
 	c.writeBuf = append(c.writeBuf, data...)
 	if c.sending {

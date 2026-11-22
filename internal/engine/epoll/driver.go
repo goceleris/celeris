@@ -15,7 +15,7 @@ import (
 // driverWriteCap bounds the pending outbound bytes per driver FD before
 // Write returns engine.ErrQueueFull. Matches the detached-conn ceiling so
 // long-lived driver sessions (postgres, redis) can amortize larger bursts.
-const driverWriteCap = 64 << 20 // 64 MiB
+const driverWriteCap = engine.DriverWriteLimit
 
 // driverReadBufSize is the scratch buffer the worker uses to drain data
 // from a driver FD on EPOLLIN. The buffer is reused across FDs since the
@@ -434,6 +434,9 @@ func (l *Loop) Write(fd int, data []byte) error {
 	pending := len(dc.writeBuf) - dc.sendPos
 	if pending+len(data) > driverWriteCap {
 		dc.mu.Unlock()
+		if len(data) > driverWriteCap {
+			return &engine.WriteTooLargeError{Size: len(data), Limit: driverWriteCap}
+		}
 		return engine.ErrQueueFull
 	}
 	dc.writeBuf = append(dc.writeBuf, data...)

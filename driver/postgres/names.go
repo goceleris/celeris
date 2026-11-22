@@ -68,6 +68,20 @@ type ServerProvider = eventloop.ServerProvider
 // ErrQueueFull is returned when the event-loop worker that owns a
 // connection has no room left in that connection's outbound queue. The
 // message was not sent. Match it with errors.Is.
+//
+// # Limit on a single write
+//
+// A connection's outbound queue holds at most 64 MiB on Linux, on every path:
+// the standalone driver loop (a client built without WithEngine; the limit
+// was 4 MiB in earlier builds), a client hosted on the epoll engine and a
+// client hosted on the io_uring engine. The limit applies to the encoded
+// frame (a pipeline or transaction counts as one), so a single write above
+// 64 MiB, and a write that does not fit beside bytes still queued, fail with
+// this error. A write that is above the limit by itself returns an error that
+// names it ("write of N bytes exceeds the per-write limit of 64 MiB") and
+// still matches ErrQueueFull. On macOS and Windows the portable loop has no
+// such limit. The drivers do not split a large
+// write (celeris#1357).
 var ErrQueueFull = engine.ErrQueueFull
 
 // ErrUnknownFD is returned when an event-loop operation refers to a
