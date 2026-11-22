@@ -67,11 +67,12 @@ type Client struct {
 //   - non-nil error: the event was NOT delivered (closed, context cancelled,
 //     or write failed); the caller may retry on a new connection.
 //   - nil error in blocking mode (MaxQueueDepth = 0): the event was handed
-//     to the connection and flushed. On epoll, io_uring and adaptive over
-//     HTTP/1.1 that means the engine accepted the bytes for sending: a
-//     write after the engine has noticed a reset is dropped without an
-//     error, and the disconnect arrives through [Client.Context], not
-//     through Send.
+//     to the connection and flushed. On the native engines over HTTP/1.1
+//     that means the engine accepted the bytes for sending, which says
+//     nothing about the peer: a write before the engine has noticed a
+//     reset still returns nil. Once it has, Send returns an error, either
+//     the context error of [Client.Context] (cancelled by the disconnect)
+//     or an error wrapping net.ErrClosed from the write itself.
 //   - nil error in queued mode (MaxQueueDepth > 0): the event was enqueued
 //     OR dropped silently per the [Config.OnSlowClient] policy; check
 //     [Client.DroppedEvents] to detect drops.
