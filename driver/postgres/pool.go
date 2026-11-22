@@ -866,6 +866,26 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 	return false, nil
 }
 
+// textFormIsValue reports whether the server's text form of a column of
+// codec's type is exactly what a string or []byte destination receives on the
+// binary (cached) path too, so the raw text can be copied without decoding it.
+// That holds for text, varchar, json, jsonb, jsonpath, numeric, uuid and the
+// integers. Every other codec goes through DecodeText and convertAssign, so the
+// result does not depend on the result format: 'true' (not 't') for bool,
+// RFC3339Nano for date, timestamp and timestamptz, the Go float formatting for
+// float4 and float8, the bytes (not the hex escape) for bytea. A type without a
+// codec never reaches here (its text is the value).
+func textFormIsValue(codec *protocol.TypeCodec) bool {
+	switch codec.OID {
+	case protocol.OIDText, protocol.OIDVarchar,
+		protocol.OIDJSON, protocol.OIDJSONB, protocol.OIDJSONPath,
+		protocol.OIDNumeric, protocol.OIDUUID,
+		protocol.OIDInt2, protocol.OIDInt4, protocol.OIDInt8:
+		return true
+	}
+	return false
+}
+
 // decodeTextInto is the text-format counterpart to decodeBinaryInto.
 func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, error) {
 	switch d := dest.(type) {
@@ -899,13 +919,13 @@ func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, erro
 		*d = v
 		return true, nil
 	case *string:
-		if codec.OID == protocol.OIDBytea {
-			return false, nil // text form is the hex escape, not the value
+		if !textFormIsValue(codec) {
+			return false, nil
 		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
-		if codec.OID == protocol.OIDBytea {
+		if !textFormIsValue(codec) {
 			return false, nil
 		}
 		cp := make([]byte, len(raw))
@@ -980,6 +1000,20 @@ func scanValue(dest any, v driver.Value) error {
 	return convertAssign(dest, v)
 }
 
+// formatTimeText renders a decoded date/timestamp/timestamptz as the text a
+// *string or *[]byte destination receives: RFC3339Nano (as database/sql
+// does), except that the PGInfinity / PGNegInfinity sentinels read back as the
+// server's own "infinity" / "-infinity" rather than a made-up date.
+func formatTimeText(t time.Time) string {
+	switch {
+	case t.Equal(PGInfinity):
+		return "infinity"
+	case t.Equal(PGNegInfinity):
+		return "-infinity"
+	}
+	return t.Format(time.RFC3339Nano)
+}
+
 // convertAssign assigns src to dest pointer, performing common conversions.
 func convertAssign(dest any, src any) error {
 	switch d := dest.(type) {
@@ -1000,7 +1034,7 @@ func convertAssign(dest any, src any) error {
 				*d = "false"
 			}
 		case time.Time:
-			*d = s.Format(time.RFC3339Nano) // as database/sql does
+			*d = formatTimeText(s)
 		case []driver.Value:
 			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
@@ -1088,7 +1122,7 @@ func convertAssign(dest any, src any) error {
 		case string:
 			*d = []byte(s)
 		case time.Time:
-			*d = []byte(s.Format(time.RFC3339Nano))
+			*d = []byte(formatTimeText(s))
 		case int64, float64, bool:
 			// Same text form *string receives.
 			var str string

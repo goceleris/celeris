@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -563,6 +564,51 @@ func TestJSONArrayCodecsRoundTrip(t *testing.T) {
 		got := roundTripBinary(t, tc.arr, []any{tc.in}).([]driver.Value)
 		if len(got) != 1 || !bytes.Equal(got[0].([]byte), tc.in) {
 			t.Fatalf("array OID %d -> %v", tc.arr, got)
+		}
+	}
+}
+
+// float4 text is parsed at 32 bits, so it widens to the same float64 the
+// binary form decodes to.
+func TestDecodeFloat4TextMatchesBinary(t *testing.T) {
+	for _, in := range []string{"1.1", "0.1", "16777216", "3.4028235e+38", "-1.5e-45"} {
+		f32, err := strconv.ParseFloat(in, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bin := make([]byte, 4)
+		binary.BigEndian.PutUint32(bin, math.Float32bits(float32(f32)))
+		want, _ := decodeFloat4Binary(bin)
+		got, err := decodeFloat4Text([]byte(in))
+		if err != nil || got != want {
+			t.Errorf("%s: text %v err %v, binary %v", in, got, err, want)
+		}
+	}
+	if v, _ := decodeFloat4Text([]byte("NaN")); !math.IsNaN(v.(float64)) {
+		t.Errorf("NaN: got %v", v)
+	}
+}
+
+// A time zone whose offset has seconds (Europe/Amsterdam before 1937 is
+// +00:19:32) prints the offset as +hh:mm:ss.
+func TestDecodeTimestamptzTextSecondOffset(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want time.Time
+	}{
+		{"1900-01-01 00:00:00+00:19:32", time.Date(1899, 12, 31, 23, 40, 28, 0, time.UTC)},
+		{"1900-01-01 12:00:00.5+00:19:32", time.Date(1900, 1, 1, 11, 40, 28, 500000000, time.UTC)},
+		{"1900-01-01 00:00:00-00:19:32", time.Date(1900, 1, 1, 0, 19, 32, 0, time.UTC)},
+		{"2024-01-02 03:04:05+05:30", time.Date(2024, 1, 1, 21, 34, 5, 0, time.UTC)},
+		{"2024-01-02 03:04:05+00", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)},
+	} {
+		v, err := decodeTimestamptzText([]byte(c.in))
+		if err != nil {
+			t.Errorf("%q: %v", c.in, err)
+			continue
+		}
+		if got := v.(time.Time); !got.Equal(c.want) {
+			t.Errorf("%q: got %v, want %v", c.in, got, c.want)
 		}
 	}
 }
