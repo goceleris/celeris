@@ -35,6 +35,27 @@
 // [ErrResultTooBig]. Custom type codecs ([TypeCodec]) can be registered
 // with [RegisterType].
 //
+// # Startup parameters and connection poolers
+//
+// The text result format the unnamed and simple query paths read depends on
+// three session settings, so the driver sends extra_float_digits=3,
+// DateStyle=ISO and bytea_output=hex in the StartupMessage (it overrides an
+// ALTER ROLE or ALTER DATABASE setting) unless the DSN sets them itself. A
+// connection pooler may refuse a startup parameter it does not track:
+// PgBouncer 1.26.1 answers "unsupported startup parameter: extra_float_digits"
+// (or bytea_output) and closes the connection, and accepts DateStyle. When the
+// server answers the startup with an error that names one of them, the driver
+// drops that parameter and dials again (once per parameter, remembered per
+// address for the life of the process, and each attempt has its own
+// connect_timeout); startup_pins=off in the DSN sends none. A bytea read into a
+// []byte is decoded from either the hex or the escape form, so a dropped
+// bytea_output costs nothing there. extra_float_digits is the one that does:
+// behind a pooler it is not applied to the client's session (not in session
+// mode, not in transaction mode), so with a role or database that sets it to 0
+// or less float8 and float4 columns read back rounded on those paths (0.3 for
+// 0.30000000000000004). Leave it at its default (1 since PostgreSQL 12). The
+// server does not report it in ParameterStatus, so the driver cannot tell.
+//
 // Current limitations: TLS is not yet supported (use sslmode=disable behind a
 // VPC/loopback/sidecar); authentication is limited to trust, cleartext, MD5,
 // and SCRAM-SHA-256 without channel binding; there is no LISTEN/NOTIFY,

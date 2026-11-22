@@ -57,6 +57,14 @@ type Options struct {
 	busyPoll time.Duration
 	// Application is copied into the "application_name" startup parameter.
 	Application string
+	// startupPinsOff is startup_pins=off in the DSN: the driver adds no
+	// startup parameter of its own (see startupPins). For a server that refuses
+	// them; dialWithPins drops a refused pin by itself, so this only saves the
+	// failed first attempt.
+	startupPinsOff bool
+	// dropPins is the set of startupPins (bit i is startupPins[i]) a server
+	// refused: dialWithPins sets it between attempts.
+	dropPins uint8
 	// SSLMode is the parsed sslmode value. "disable" and "prefer" are
 	// accepted; "require" / "verify-ca" / "verify-full" are rejected at Open
 	// time with ErrSSLNotSupported.
@@ -272,6 +280,15 @@ func applyDSNKey(d *DSN, k, v string) error {
 			return fmt.Errorf("celeris-postgres: auto_cache_statements = %q: want bool", v)
 		}
 		d.Options.autoCacheStatementsExplicit = true
+	case "startup_pins":
+		switch strings.ToLower(v) {
+		case "1", "true", "on", "yes":
+			d.Options.startupPinsOff = false
+		case "0", "false", "off", "no":
+			d.Options.startupPinsOff = true
+		default:
+			return fmt.Errorf("celeris-postgres: startup_pins = %q: want on or off", v)
+		}
 	case "application_name":
 		d.Options.Application = v
 	default:

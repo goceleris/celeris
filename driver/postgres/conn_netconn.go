@@ -27,6 +27,14 @@ import (
 //
 //nolint:unparam // closeLoop is always nil today but retained for pool reuse, as in dialConn
 func dialConnNetConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func(), dsn DSN, workerHint int) (*pgConn, error) {
+	return dialWithPins(dsn, func(d DSN) (*pgConn, error) {
+		return dialConnNetConnOnce(ctx, prov, closeLoop, d, workerHint)
+	})
+}
+
+// dialConnNetConnOnce is one attempt of dialConnNetConn, with the startup pins
+// dsn names.
+func dialConnNetConnOnce(ctx context.Context, prov engine.EventLoopProvider, closeLoop func(), dsn DSN, workerHint int) (*pgConn, error) {
 	if err := dsn.CheckSSL(); err != nil {
 		return nil, err
 	}

@@ -22,6 +22,13 @@ import (
 // dialConn accepts closeLoop for symmetry with Pool.dialConn; callers that
 // own the loop themselves (e.g. [Connector.Connect]) pass nil.
 func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func(), dsn DSN, workerHint int) (*pgConn, error) {
+	return dialWithPins(dsn, func(d DSN) (*pgConn, error) {
+		return dialConnOnce(ctx, prov, closeLoop, d, workerHint)
+	})
+}
+
+// dialConnOnce is one attempt of dialConn, with the startup pins dsn names.
+func dialConnOnce(ctx context.Context, prov engine.EventLoopProvider, closeLoop func(), dsn DSN, workerHint int) (*pgConn, error) {
 	if err := dsn.CheckSSL(); err != nil {
 		return nil, err
 	}

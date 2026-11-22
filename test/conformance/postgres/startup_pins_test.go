@@ -171,6 +171,18 @@ func TestStartupPinsByteaOutputAgainstRoleSetting(t *testing.T) {
 				} else if got, _ := a.([]byte); string(got) != string(want) {
 					t.Errorf("*any: got %#v, want %q", a, want)
 				}
+				// A bytea in an array (text on the unnamed and simple paths) keeps the
+				// hex form: the pin, not only the decoder, holds bytea_output.
+				aq := `SELECT ARRAY['\x00ff61'::bytea]`
+				if mode == "extended" {
+					aq += " WHERE $1::int = 1"
+				}
+				var arr any
+				if err := pool.QueryRow(ctx, aq, args...).Scan(&arr); err != nil {
+					t.Errorf("bytea[]: %v", err)
+				} else if b, ok := arr.([]byte); ok && !strings.Contains(string(b), `\\x00ff61`) {
+					t.Errorf("bytea[] text = %q, want the hex form", b)
+				}
 			})
 		}
 	}

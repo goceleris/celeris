@@ -1068,6 +1068,12 @@ func resolveAddr(host, port string) (*net.TCPAddr, error) {
 // engine dispatches HTTP handlers asynchronously (handler runs on an
 // unlocked G, so net.Conn.Read parks cleanly without a futex storm).
 func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
+	return dialWithPins(dsn, func(d DSN) (*pgConn, error) { return dialDirectConnOnce(ctx, d) })
+}
+
+// dialDirectConnOnce is one attempt of dialDirectConn, with the startup pins dsn
+// names.
+func dialDirectConnOnce(ctx context.Context, dsn DSN) (*pgConn, error) {
 	if err := dsn.CheckSSL(); err != nil {
 		return nil, err
 	}
@@ -1199,10 +1205,16 @@ func (b *startupBound) finish() error {
 // depends on them: extra_float_digits <= 0 rounds float4/float8 to 6 or 15
 // significant digits, and a DateStyle other than ISO prints dates and
 // timestamps in a form the text decoders do not parse, and bytea_output=escape
-// prints bytea in a form decodeByteaText rejects. A startup parameter
-// overrides a role or database setting (ALTER ROLE ... SET); a value the
-// application puts in the DSN (a key of that name, or in options=-c name=...)
-// is left alone.
+// prints a bytea inside an array (which those paths hand back as text) in a form
+// other than the hex one. A startup parameter overrides a role or database
+// setting (ALTER ROLE ... SET); a value the application puts in the DSN (a key
+// of that name, or in options=-c name=...) is left alone.
+//
+// A connection pooler may refuse a startup parameter it does not track (PgBouncer
+// 1.26.1 answers "unsupported startup parameter: extra_float_digits" and closes
+// the connection, and accepts DateStyle). dialWithPins drops a pin the server
+// refuses and dials again; startup_pins=off in the DSN sends none. A bytea read
+// into a []byte does not need its pin: decodeByteaText reads both forms.
 var startupPins = [...]struct{ name, value string }{
 	{"extra_float_digits", "3"},
 	{"DateStyle", "ISO"},
@@ -1210,11 +1222,16 @@ var startupPins = [...]struct{ name, value string }{
 }
 
 // startupParams returns the startup parameters to send: the DSN's, plus each
-// of [startupPins] the DSN does not set itself. It never modifies dsnParams.
-func startupParams(dsnParams map[string]string) map[string]string {
+// of [startupPins] the DSN does not set itself, unless pins are off
+// (startup_pins=off) or o.dropPins names the pin (a server refused it). It never
+// modifies dsnParams.
+func startupParams(dsnParams map[string]string, o Options) map[string]string {
+	if o.startupPinsOff {
+		return dsnParams
+	}
 	var out map[string]string
-	for _, pin := range startupPins {
-		if dsnSetsParam(dsnParams, pin.name) {
+	for i, pin := range startupPins {
+		if o.dropPins&(1<<i) != 0 || dsnSetsParam(dsnParams, pin.name) {
 			continue
 		}
 		if out == nil {
@@ -1229,6 +1246,71 @@ func startupParams(dsnParams map[string]string) map[string]string {
 		return dsnParams
 	}
 	return out
+}
+
+// pinRejects remembers, per server address, the pins a server refused, so a pool
+// that opens many connections to a pooler makes the failed attempt once (a
+// pooler logs each one) and not per connection. It lives for the process: a
+// pooler reconfigured to accept the parameters is noticed after a restart.
+var pinRejects = struct {
+	mu sync.Mutex
+	m  map[string]uint8
+}{m: map[string]uint8{}}
+
+func pinRejectKey(dsn DSN) string { return net.JoinHostPort(dsn.Host, dsn.Port) }
+
+// dialWithPins runs dial, with the startup pins the server at dsn's address is not
+// known to refuse. When the server answers the StartupMessage with an error that
+// names a pin the driver added (a pooler's "unsupported startup parameter: x", or
+// a server's "unrecognized configuration parameter"), the pin is dropped and the
+// dial runs again, at most once per pin. Any other error is returned as it is, and
+// so is one for a parameter the DSN itself sets.
+func dialWithPins(dsn DSN, dial func(DSN) (*pgConn, error)) (*pgConn, error) {
+	if dsn.Options.startupPinsOff {
+		return dial(dsn)
+	}
+	key := pinRejectKey(dsn)
+	pinRejects.mu.Lock()
+	known := pinRejects.m[key]
+	pinRejects.mu.Unlock()
+	dsn.Options.dropPins |= known
+	for {
+		c, err := dial(dsn)
+		if err == nil {
+			if dsn.Options.dropPins != known {
+				pinRejects.mu.Lock()
+				pinRejects.m[key] |= dsn.Options.dropPins
+				pinRejects.mu.Unlock()
+			}
+			return c, nil
+		}
+		bits := refusedPins(err, dsn)
+		if bits == 0 {
+			return nil, err
+		}
+		dsn.Options.dropPins |= bits
+	}
+}
+
+// refusedPins returns the bit set of the pins in the startup of dsn that err (a
+// server error) names. Every bit is a pin that was sent: one dropped before, or
+// set by the DSN itself, is not.
+func refusedPins(err error, dsn DSN) uint8 {
+	var pgErr *PGError
+	if !errors.As(err, &pgErr) {
+		return 0
+	}
+	msg := strings.ToLower(pgErr.Message)
+	var bits uint8
+	for i, pin := range startupPins {
+		if dsn.Options.dropPins&(1<<i) != 0 || dsnSetsParam(dsn.Params, pin.name) {
+			continue
+		}
+		if strings.Contains(msg, strings.ToLower(pin.name)) {
+			bits |= 1 << i
+		}
+	}
+	return bits
 }
 
 // dsnSetsParam reports whether the DSN sets the named runtime parameter,
@@ -1262,7 +1344,7 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 		User:     c.dsn.User,
 		Password: c.dsn.Password,
 		Database: c.dsn.Database,
-		Params:   startupParams(c.dsn.Params),
+		Params:   startupParams(c.dsn.Params, c.dsn.Options),
 	}
 	initial := c.buildMessage(func(w *protocol.Writer) []byte { return st.Start(w) })
 	req := &pgRequest{
