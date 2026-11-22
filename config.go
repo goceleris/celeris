@@ -981,6 +981,15 @@ type Config struct {
 	// The global middleware still runs for it, so a CORS middleware
 	// installed with [Server.Use] still answers its preflight, and so does
 	// any other middleware that answers OPTIONS itself. Default: false.
+	//
+	// The Allow header of the automatic answer is set before the global
+	// middleware runs, so a middleware's own answer to that request (a CORS
+	// preflight's 204, an authentication middleware's 401) carries the path's
+	// method list too. RFC 9110 §10.2.1 requires Allow on a 405 and allows it
+	// on any other response; a 405's Allow, unlike this one, is set at the end
+	// of the chain (see [Server.MethodNotAllowed]). An application that must
+	// not name a path's methods to a client that has not authenticated sets
+	// DisableAutoOPTIONS and answers OPTIONS in its own middleware or routes.
 	DisableAutoOPTIONS bool
 }
 
