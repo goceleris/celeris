@@ -69,7 +69,7 @@ Requires **Go 1.27.3+** (the `go` directive in `go.mod` is the source of truth).
   <img src=".github/benchmark.png" alt="Bar chart of saturation requests per second for plaintext GET at 1024 connections on linux/amd64: celeris 1,403,931, gnet 1,296,720, lithium 1,283,327, h2o 1,247,141, actix 1,208,346, with net/http at 646,425">
 </p>
 
-<!-- RELEASE: replace the chart and its caption with the v1.6.0 run: python3 .github/scripts/benchmark-hero.py <docs>/results/v1.6.0/<date>/x86_64/summary.json > hero.html, render it (Chrome command in the script header), then refill the figures below with .github/scripts/analyze-published-results.py <docs> v1.6.0 <date>. When the data is from loadgen v1.4.14 or later, delete the clause "leaving out the HTTP/2 rows and `churn-close` (loadgen v1.4.14 fixed the clients behind them)" in the same edit. -->
+<!-- RELEASE: replace the chart and its caption with the v1.6.0 run: python3 .github/scripts/benchmark-hero.py <docs>/results/v1.6.0/<date>/x86_64/summary.json > hero.html, render it (Chrome command in the script header), then refill the headline sentence and the table below from .github/scripts/analyze-published-results.py <docs> v1.6.0 <date>. The full-results page (goceleris/docs results.md) is derived from the same script: update it in the same release, and when the data is from loadgen v1.4.14 or later delete its clause "leaving out the HTTP/2 rows and `churn-close` (loadgen v1.4.14 fixed the clients behind them)". -->
 <p align="center"><em>Plaintext GET, 1024 connections, requests per second, linux/amd64, best configuration per framework. One row of the published v1.5.8 results (2026-08-29).</em></p>
 
 On plaintext GET with 1024 connections on linux/amd64, celeris's best configuration ranked first of [[PLACEHOLDER: number of frameworks, v1.6.0 amd64 run]] frameworks: [[PLACEHOLDER: percent ahead of the next server, v1.6.0 amd64 run]] ahead of the next server and [[PLACEHOLDER: ratio, v1.6.0 amd64 run]] times `net/http`. The last published run (v1.5.8, 2026-08-29, one 90 s run per cell) had it first of 31 frameworks, 8% ahead of gnet, a networking library, and 2.2 times `net/http`.
@@ -77,12 +77,14 @@ On plaintext GET with 1024 connections on linux/amd64, celeris's best configurat
 | Requests per second, plaintext GET, 1024 connections | v1.6.0 | v1.5.8 |
 |---|---|---|
 | amd64: celeris, best configuration | [[PLACEHOLDER: rps, amd64 run]] | 1,403,931 |
+| amd64: gnet, the next server overall (a networking library) | [[PLACEHOLDER: rps, amd64 run]] | 1,296,720 |
 | amd64: fiber, best other Go web framework | [[PLACEHOLDER: rps, amd64 run]] | 1,040,338 |
 | amd64: `net/http` | [[PLACEHOLDER: rps, amd64 run]] | 646,425 |
 | arm64: celeris, best configuration | [[PLACEHOLDER: rps, arm64 run]] | 430,146 |
 | arm64: fiber | [[PLACEHOLDER: rps, arm64 run]] | 252,509 |
 | arm64: `net/http` | [[PLACEHOLDER: rps, arm64 run]] | 143,504 |
 
+<!-- RELEASE: re-derive this list from the final v1.6.0 runs at tag time. An item whose issue has closed disappears; nothing stays because it was in the draft. -->
 **Where celeris is not ahead.**
 
 - On arm64 the same row is a tie with gnet (430,146 against 420,047 in v1.5.8), and a single run's few percent is within noise.
@@ -90,7 +92,7 @@ On plaintext GET with 1024 connections on linux/amd64, celeris's best configurat
 - On arm64, WebSocket echo p99 at light load on the epoll, io_uring and adaptive engines is 1.8 to 2.03 times that of the std engine in the same run (about 0.71 to 0.91 ms against 0.42 ms, one host, cause unknown, not closed in v1.6.0; [#755](https://github.com/goceleris/celeris/issues/755), [#1318](https://github.com/goceleris/celeris/issues/1318)).
 - Database rows are mixed: Redis pipelines with `AsyncHandlers` and memcached trail on arm64 ([#854](https://github.com/goceleris/celeris/issues/854), [#857](https://github.com/goceleris/celeris/issues/857)), loop-engine throughput on big.LITTLE arm64 is still being confirmed ([#1036](https://github.com/goceleris/celeris/issues/1036)), and WebSocket hub-broadcast p99 on amd64 is higher ([#858](https://github.com/goceleris/celeris/issues/858)).
 
-The figures come from a cross-framework benchmark of 52 server configurations on dedicated x86-64 and arm64 machines, driven by one load generator ([loadgen](https://github.com/goceleris/loadgen)) from a separate host, and a cell is one run. [How the numbers are made](https://goceleris.dev/methodology/); [full results and how to read them](https://goceleris.dev/docs/results).
+The figures come from a cross-framework benchmark of 52 configurations of 31 frameworks on dedicated x86-64 and arm64 machines, driven by one load generator ([loadgen](https://github.com/goceleris/loadgen)) from a separate host, and a cell is one run. [How the numbers are made](https://goceleris.dev/methodology/); [full results and how to read them](https://goceleris.dev/docs/results).
 
 ## Status and stability
 
@@ -98,6 +100,7 @@ The figures come from a cross-framework benchmark of 52 server configurations on
 - **Maturity.** celeris is a young project with one maintainer. Run it behind a TLS-terminating proxy and benchmark it on your own workload; TLS in-process is [#446](https://github.com/goceleris/celeris/issues/446).
 - **Platforms.** Linux is the production platform: io_uring needs 5.19 or later, epoll 5.10 or later. macOS and Windows run the std engine for development and testing.
 - **Security.** Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
+<!-- RELEASE: written at tag time from what is then open in the v1.6.0 milestone. An item whose issue has closed disappears; nothing stays because it was in the draft. -->
 - **Known open at this release.** [[PLACEHOLDER: one line per issue still open at the tag, written from the v1.6.0 milestone at tag time]]
 
 ## What's new in v1.6.0
@@ -207,7 +210,7 @@ Every field is documented on [goceleris.dev](https://goceleris.dev/docs/configur
 
 ## Async handlers and streaming
 
-Handlers run inline on the I/O worker by default. Mark a route that blocks on I/O `.Async()` so the worker stays free; precedence is route over group over `Config.AsyncHandlers`. **An inline handler must not call `runtime.Goexit`** (`t.FailNow` does): on the native engines it ends that event loop for good. Details are in [Runtime notes](https://goceleris.dev/docs/runtime-notes).
+Handlers run inline on the I/O worker by default. Mark a route that blocks on I/O `.Async()` so the worker stays free; precedence is route over group over `Config.AsyncHandlers`. An inline handler must not call `runtime.Goexit` (`t.FailNow` does): on the native engines it ends that event loop for good. Details are in [Runtime notes](https://goceleris.dev/docs/runtime-notes).
 
 ```go
 // CPU-only / cache-only — runs inline (default).
@@ -269,7 +272,7 @@ if err := s.StartWithContext(ctx); err != nil {
 }
 ```
 
-A connection that has begun a request head and not finished it (a fragment, or a bare CRLF) counts as a request in progress on epoll and io_uring: `Shutdown` waits for it until the head completes, until `ReadHeaderTimeout` (10 s by default, from the head's first byte, or for a new connection from its accept) or `WriteTimeout` cuts it, or until the context passed to `Shutdown` is done, so a client can hold a graceful shutdown for that long and the caller's bound is the context's deadline; std closes a keep-alive connection in that state with the idle ones, and waits for a new connection's first head as for a silent one. The exact per-engine contract, with what was measured, is in the [`Server.Shutdown`](https://pkg.go.dev/github.com/goceleris/celeris#Server.Shutdown) godoc.
+A connection that has begun a request head and not finished it (a fragment, or a bare CRLF) counts as a request in progress on epoll and io_uring. `Shutdown` waits for it until the head completes, until `ReadHeaderTimeout` (10 s by default, from the head's first byte, or for a new connection from its accept) or `WriteTimeout` cuts it, or until the context passed to `Shutdown` is done, so a client can hold a graceful shutdown for that long and the caller's bound is the context's deadline. The std engine differs: std closes a keep-alive connection in that state with the idle ones, and waits for a new connection's first head as for a silent one. The per-engine contract is in the [`Server.Shutdown`](https://pkg.go.dev/github.com/goceleris/celeris#Server.Shutdown) godoc.
 
 ## Observability
 
