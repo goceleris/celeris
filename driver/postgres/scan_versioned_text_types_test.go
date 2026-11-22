@@ -295,3 +295,25 @@ func TestScanRawArrayIntoStringErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestConvertAssignInfinityIntoString pins that the PGInfinity / PGNegInfinity
+// sentinels read into *string and *[]byte as the server's own text.
+func TestConvertAssignInfinityIntoString(t *testing.T) {
+	for _, c := range []struct {
+		in   time.Time
+		want string
+	}{
+		{PGInfinity, "infinity"},
+		{PGNegInfinity, "-infinity"},
+		{time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), "2026-01-02T03:04:05Z"},
+	} {
+		var s string
+		if err := convertAssign(&s, c.in); err != nil || s != c.want {
+			t.Errorf("*string from %v: got %q err %v, want %q", c.in, s, err, c.want)
+		}
+		var b []byte
+		if err := convertAssign(&b, c.in); err != nil || string(b) != c.want {
+			t.Errorf("*[]byte from %v: got %q err %v, want %q", c.in, b, err, c.want)
+		}
+	}
+}
