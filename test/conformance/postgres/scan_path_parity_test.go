@@ -26,7 +26,9 @@ func TestNativeScanPathParity(t *testing.T) {
 	// timestamptz prints with it on the text paths).
 	t.Run("tz-default", func(t *testing.T) { testNativeScanPathParity(t, dsnFromEnv(t)) })
 	// Before 1937 Amsterdam is at +00:19:32: the offset has seconds.
-	t.Run("tz-amsterdam", func(t *testing.T) { testNativeScanPathParity(t, withParams(dsnFromEnv(t), "TimeZone=Europe/Amsterdam")) })
+	t.Run("tz-amsterdam", func(t *testing.T) {
+		testNativeScanPathParity(t, withParams(dsnFromEnv(t), "TimeZone=Europe/Amsterdam"))
+	})
 	t.Run("tz-kolkata", func(t *testing.T) { testNativeScanPathParity(t, withParams(dsnFromEnv(t), "TimeZone=Asia/Kolkata")) })
 }
 
