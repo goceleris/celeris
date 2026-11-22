@@ -69,6 +69,15 @@ BENCH = {
 }
 
 
+# scenarios for the hero tests: quiet (clear lead), noisy, close (+3 %), second (celeris 2nd by 3 %), behind (-17 %)
+HERO_BENCH = {
+    "celeris-iouring-h1-async": ("celeris", "go", {"quiet": 106, "noisy": 111, "close": 103, "second": 100, "behind": 100}),
+    "fiber-h1": ("fiber", "go", {"quiet": 100, "noisy": 100, "close": 100, "second": 103, "behind": 100}),
+    "gin-h1": ("gin", "go", {"quiet": 100, "noisy": 100, "close": 100, "second": 100, "behind": 120}),
+    "stdhttp-h1": ("net/http", "go", {"quiet": 50, "noisy": 50, "close": 50, "second": 50, "behind": 50}),
+}
+
+
 def run(script, *args):
     return subprocess.run([sys.executable, os.path.join(HERE, script), *args], capture_output=True, text=True)
 
@@ -99,23 +108,41 @@ class Scripts(unittest.TestCase):
         # noisy: +11 % over gin from the other dispatch (margin 12 %) is a tie; quiet and the hero row win
         self.assertEqual((t["win"], t["tie"], t["loss"]), (2, 1, 0))
 
-    def hero(self, comp, scn):
+    def hero(self, comp, scn, bench=None):
         with tempfile.TemporaryDirectory() as root:
-            path = write_cell(root, "x86_64", BENCH, comp)
+            path = write_cell(root, "x86_64", bench or HERO_BENCH, comp)
             return run("benchmark-hero.py", path, scn)
 
-    def test_hero_single_dispatch(self):
-        self.assertEqual(self.hero(None, "noisy").returncode, 0)
+    def test_hero_clear_lead_renders_as_before(self):
+        for comp in (None, COMP):  # quiet: +6 % over gin (other dispatch, 5 %) and fiber (own dispatch, 5 %)
+            r = self.hero(comp, "quiet")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Celeris leads this row", r.stdout)
+            self.assertIn("#1 of", r.stdout)
+            self.assertNotIn("A tie", r.stdout)
 
-    def test_hero_refuses_a_headline_inside_the_tie_margin(self):
-        r = self.hero(COMP, "noisy")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("not clearly ahead", r.stderr)
+    def test_hero_tie_renders_with_the_tie_caption_and_does_not_exit(self):
+        # no composition: +3 % is inside the 5 % band; composed: +11 % over gin from the other dispatch is inside 12 %
+        for comp, scn, margin in ((None, "close", "±5%"), (COMP, "noisy", "±12%")):
+            r = self.hero(comp, scn)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("A tie:", r.stdout)
+            self.assertIn(margin, r.stdout)
+            self.assertIn("level at the top", r.stdout)
+            self.assertNotIn("Celeris leads this row", r.stdout)
 
-    def test_hero_accepts_a_clear_lead(self):
-        r = self.hero(COMP, "quiet")  # 106 vs gin (other dispatch, 5 %) and fiber (own dispatch, 5 %)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("Celeris leads this row", r.stdout)
+    def test_hero_tie_with_celeris_not_first_still_renders(self):
+        for comp in (None, COMP):  # celeris 100, fiber 103: inside the 5 % band of its own dispatch
+            r = self.hero(comp, "second")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("A tie:", r.stdout)
+            self.assertIn("#2 of", r.stdout)
+
+    def test_hero_exits_only_when_a_framework_is_clearly_ahead(self):
+        for comp in (None, COMP):  # celeris 100, gin 120: clear
+            r = self.hero(comp, "behind")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("clearly ahead of celeris", r.stderr)
 
     def test_a_non_composition_file_is_refused(self):
         with tempfile.TemporaryDirectory() as root:

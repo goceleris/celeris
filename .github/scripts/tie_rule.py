@@ -25,6 +25,11 @@ def load(summary_path):
     return c
 
 
+def single_dispatch():
+    """The rule of a cell without composition.json: every column is one dispatch, the 5 % band holds."""
+    return {"schema": "composition/1", "tie_floor": FLOOR, "tie_margin_by_scenario": {}, "columns": {}}
+
+
 def margin(comp, scn, name):
     """The margin celeris must exceed over column `name` on scenario `scn`."""
     floor = comp.get("tie_floor") or FLOOR
