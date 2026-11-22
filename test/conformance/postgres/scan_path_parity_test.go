@@ -25,6 +25,8 @@ func TestNativeScanPathParity(t *testing.T) {
 	// The default session time zone, and one with a non-zero offset (a
 	// timestamptz prints with it on the text paths).
 	t.Run("tz-default", func(t *testing.T) { testNativeScanPathParity(t, dsnFromEnv(t)) })
+	// Before 1937 Amsterdam is at +00:19:32: the offset has seconds.
+	t.Run("tz-amsterdam", func(t *testing.T) { testNativeScanPathParity(t, withParams(dsnFromEnv(t), "TimeZone=Europe/Amsterdam")) })
 	t.Run("tz-kolkata", func(t *testing.T) { testNativeScanPathParity(t, withParams(dsnFromEnv(t), "TimeZone=Asia/Kolkata")) })
 }
 
@@ -57,6 +59,7 @@ func testNativeScanPathParity(t *testing.T, dsn string) {
 		{"timestamp_neginf", `'-infinity'::timestamp`, false},
 		{"timestamptz", `'2024-01-02 03:04:05.123456+00'::timestamptz`, false},
 		{"timestamptz_micro", `'2024-06-30 23:59:59.999999+05:30'::timestamptz`, false},
+		{"timestamptz_1900", `'1900-01-01 12:00:00.5+00'::timestamptz`, false},
 		{"timestamptz_inf", `'infinity'::timestamptz`, false},
 		{"float4", `1.1::float4`, true},
 		{"float4_big", `16777216::float4`, true},

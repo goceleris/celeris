@@ -156,6 +156,9 @@ func decodeTimestamptzText(src []byte) (driver.Value, error) {
 		"2006-01-02 15:04:05Z07:00",
 		"2006-01-02 15:04:05.999999-07",
 		"2006-01-02 15:04:05-07",
+		// An offset with seconds (Europe/Amsterdam before 1937 is +00:19:32).
+		"2006-01-02 15:04:05.999999Z07:00:00",
+		"2006-01-02 15:04:05Z07:00:00",
 	} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC(), nil

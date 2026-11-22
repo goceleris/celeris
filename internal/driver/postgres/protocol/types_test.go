@@ -588,3 +588,27 @@ func TestDecodeFloat4TextMatchesBinary(t *testing.T) {
 		t.Errorf("NaN: got %v", v)
 	}
 }
+
+// A time zone whose offset has seconds (Europe/Amsterdam before 1937 is
+// +00:19:32) prints the offset as +hh:mm:ss.
+func TestDecodeTimestamptzTextSecondOffset(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want time.Time
+	}{
+		{"1900-01-01 00:00:00+00:19:32", time.Date(1899, 12, 31, 23, 40, 28, 0, time.UTC)},
+		{"1900-01-01 12:00:00.5+00:19:32", time.Date(1900, 1, 1, 11, 40, 28, 500000000, time.UTC)},
+		{"1900-01-01 00:00:00-00:19:32", time.Date(1900, 1, 1, 0, 19, 32, 0, time.UTC)},
+		{"2024-01-02 03:04:05+05:30", time.Date(2024, 1, 1, 21, 34, 5, 0, time.UTC)},
+		{"2024-01-02 03:04:05+00", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)},
+	} {
+		v, err := decodeTimestamptzText([]byte(c.in))
+		if err != nil {
+			t.Errorf("%q: %v", c.in, err)
+			continue
+		}
+		if got := v.(time.Time); !got.Equal(c.want) {
+			t.Errorf("%q: got %v, want %v", c.in, got, c.want)
+		}
+	}
+}
