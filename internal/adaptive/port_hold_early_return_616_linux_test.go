@@ -24,9 +24,13 @@ import (
 // (epoll or io_uring, on a starved runner: celeris#1328, 1 run in 500 with the
 // test pinned to 2 CPUs beside 3 busy loops) took Listen down the return of an
 // engine that did start, which TestAdaptivePortHeldUntilListenReturns616
-// covers, and the arm failed on its own premise. The engine still starts and is
-// still stopped by the cancel, with its sockets beside the hold, so the checks
-// after Listen are as strict as before.
+// covers, and the arm failed on its own premise. The engine may start (with an
+// already-cancelled context epoll and io_uring may also return before binding)
+// and is stopped by the cancel either way. The "injection not made" guard on
+// e.Addr() is inert for these two arms now: adaptive stores its address only on
+// the started path, which is unreachable. The checks that still bite are the
+// ones after Listen: it reports no error, the hold is gone, and a bare socket
+// can bind the port within 2 s.
 type addrHidden616 struct{ engine.Engine }
 
 func (addrHidden616) Addr() net.Addr { return nil }
