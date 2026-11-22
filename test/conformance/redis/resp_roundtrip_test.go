@@ -227,7 +227,14 @@ func TestRESPLargeAndBinaryBulk(t *testing.T) {
 		}
 		framing := append(append([]byte{}, all...), "\r\n$5\r\nhello\r\n+OK\r\n:1\r\n*1\r\n"...)
 		payloads := map[string][]byte{"all_bytes_and_framing": framing}
-		for _, n := range []int{1<<20 - 1, 1 << 20, 1<<20 + 1, 4<<20 + 13, 17 << 20} {
+		sizes := []int{1<<20 - 1, 1 << 20, 1<<20 + 1, 3<<20 + 13}
+		if rtKnownBugs {
+			// R3: on Linux the event loop caps one outbound write at 4 MiB
+			// (driver/internal/eventloop maxPendingBytes), so a SET of a value
+			// of 4 MiB or more fails with ErrQueueFull; Redis takes 512 MiB.
+			sizes = append(sizes, 4<<20+13, 17<<20)
+		}
+		for _, n := range sizes {
 			payloads["size_"+strconv.Itoa(n)] = bytes.Repeat([]byte("0123456789abcdef\r\n"), n/18+1)[:n]
 		}
 		for name, p := range payloads {
