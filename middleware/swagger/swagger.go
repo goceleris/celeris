@@ -343,10 +343,27 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 	return renderPage(swaggerUITmpl, data)
 }
 
+// scalarFontsOption is Scalar's option for its default fonts. The bundle
+// (@scalar/api-reference) turns it on unless told otherwise and then asks
+// fonts.scalar.com for Inter and JetBrains Mono, a request that sends the
+// viewer's address and the page's Referer to a third party (celeris#888
+// item 75, the same class as the validator badge of #849). The page sets it
+// to false unless Config.Options names it, and then the browser's own
+// fonts are used.
+const scalarFontsOption = "withDefaultFonts"
+
 func buildScalarPage(cfg Config, specURL string) string {
-	scalarOpts := cfg.Options
-	if scalarOpts == nil {
-		scalarOpts = map[string]any{"theme": "default"}
+	// The host's map is copied, not changed: the page is built once, but the
+	// map belongs to the caller.
+	scalarOpts := make(map[string]any, len(cfg.Options)+2)
+	if cfg.Options == nil {
+		scalarOpts["theme"] = "default"
+	}
+	for k, v := range cfg.Options {
+		scalarOpts[k] = v
+	}
+	if _, set := scalarOpts[scalarFontsOption]; !set {
+		scalarOpts[scalarFontsOption] = false
 	}
 
 	return renderPage(scalarTmpl, scalarPage{
