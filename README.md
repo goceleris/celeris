@@ -14,9 +14,8 @@
 </p>
 
 <p align="center">
-  <strong>A Go HTTP engine on epoll and io_uring, with a route-group and middleware API in the spirit of Gin and Echo.</strong><br>
-  It serves HTTP/1.1 and cleartext HTTP/2 from per-core event loops, can switch between io_uring and epoll while it runs,
-  and ships PostgreSQL, Redis and memcached clients that can register their connections on those loops (see [Database drivers](#database-drivers) for which ones do).
+  <strong>celeris is a Go HTTP engine that serves HTTP/1.1 and cleartext HTTP/2 from per-core epoll or io_uring event loops, with a route-group and middleware API in the spirit of Gin and Echo.</strong><br>
+  It ships PostgreSQL, Redis and memcached clients, and is validated on a real x86-64 and arm64 cluster.
 </p>
 
 <p align="center">
@@ -30,13 +29,13 @@
 
 ## Why celeris
 
-- **Event loops, not a goroutine per connection.** On Linux the native engines run pinned per-core loops on epoll (kernel 5.10+) or io_uring (5.19+). `Adaptive`, the Linux default, starts on epoll by default and moves to io_uring under sustained load. The `Std` engine runs on `net/http` for development and for other operating systems.
-- **A familiar API.** Route groups, named parameters, middleware, error-returning handlers, and `celeris.Adapt` to reuse a `net/http` handler. 46 in-tree middleware packages cover auth, CORS, sessions, rate limiting, caching, compression, Prometheus and OpenTelemetry (see [Middleware](#middleware)).
-- **First-party database drivers.** [`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis) and [`driver/memcached`](driver/memcached) are built on the same event-loop machinery, with no CGo. Which of their connections run on the server's loops depends on how you open them: with `WithEngine` on a started native server, PostgreSQL `Connector` connections do, and so do Redis Pub/Sub connections unless the server runs async handlers, while command connections and the PostgreSQL `Pool` use Go's netpoll (see [Database drivers](#database-drivers)).
-- **Streaming is built in.** WebSocket with a fan-out `Hub`, Server-Sent Events with a `Broker`, `StreamWriter` and `Detach` (see [Streaming](#streaming-sse--websocket--chunked)).
-- **Allocation discipline.** Request contexts are pooled, the HTTP/1.1 parser aliases the bytes it parses, and the context paths that matter are held to zero allocations by tests (`celeristest/alloc_guard_test.go`, `context_test.go`). What your own handler allocates is yours.
-- **Small dependency surface.** The root module's direct dependencies are `golang.org/x/sys` and `golang.org/x/net`; `golang.org/x/text` comes in indirectly, through `x/net`.
-- **Tested adversarially.** The [probatorium](https://github.com/goceleris/probatorium) harness runs every reference app on every engine on a real x86 and arm64 cluster (see [Continuous validation](#continuous-validation)).
+- **Event loops, not a goroutine per connection.** On Linux, pinned per-core loops on epoll or io_uring; `Adaptive`, the default, switches between them under load. `Std` runs on `net/http` for development and other systems.
+- **A familiar API.** Route groups, named parameters, middleware, error-returning handlers, and `celeris.Adapt` to reuse a `net/http` handler.
+- **46 middleware packages in the repository.** Authentication, CORS, sessions, rate limiting, caching, compression, Prometheus and OpenTelemetry.
+- **Database clients.** First-party PostgreSQL, Redis and memcached clients, no CGo ([details](https://goceleris.dev/docs/data-stores)).
+- **Streaming.** WebSocket with a fan-out `Hub`, Server-Sent Events with a `Broker`, `StreamWriter` and `Detach`.
+- **Allocation discipline.** Request contexts are pooled and the core request paths are held to zero allocations by tests.
+- **Small dependency surface.** The root module depends directly on `golang.org/x/sys` and `golang.org/x/net` only.
 
 ## Quick start
 
@@ -62,7 +61,7 @@ func main() {
 }
 ```
 
-Requires **Go 1.27.3+** (the `go` directive in `go.mod` is the source of truth). The io_uring, epoll and adaptive engines need Linux; the std engine runs on any OS (see [Platform support](#platform-support)). Routing, middleware, configuration and the rest are below.
+Requires **Go 1.27.3+** (the `go` directive in `go.mod` is the source of truth). The io_uring, epoll and adaptive engines need Linux; the std engine runs on any OS (see [Platform support](https://goceleris.dev/docs/runtime-notes#platform-support)). Routing, middleware, configuration and the rest are below.
 
 ## Performance
 
@@ -71,104 +70,45 @@ Requires **Go 1.27.3+** (the `go` directive in `go.mod` is the source of truth).
 </p>
 
 <!-- RELEASE: replace the chart and its caption with the v1.6.0 run: python3 .github/scripts/benchmark-hero.py <docs>/results/v1.6.0/<date>/x86_64/summary.json > hero.html, render it (Chrome command in the script header), then refill the figures below with .github/scripts/analyze-published-results.py <docs> v1.6.0 <date>. When the data is from loadgen v1.4.14 or later, delete the clause "leaving out the HTTP/2 rows and `churn-close` (loadgen v1.4.14 fixed the clients behind them)" in the same edit. -->
-<p align="center"><em>Plaintext GET, 1024 connections, saturation requests per second, linux/amd64, best configuration per framework. One row of the published v1.5.8 results.</em></p>
+<p align="center"><em>Plaintext GET, 1024 connections, requests per second, linux/amd64, best configuration per framework. One row of the published v1.5.8 results (2026-08-29).</em></p>
 
-The numbers on this page come from [goceleris/probatorium](https://github.com/goceleris/probatorium)'s cross-framework matrix, driven by [`goceleris/loadgen`](https://github.com/goceleris/loadgen) from a separate host, and are published in [goceleris/docs](https://github.com/goceleris/docs/tree/main/results) and at [goceleris.dev](https://goceleris.dev/benchmarks/); the [methodology page](https://goceleris.dev/methodology/) says how they are made. The latest published run is **v1.5.8** (2026-08-29, loadgen v1.4.13): one 90 s run per cell after a 20 s warm-up, 52 server configurations from 10 languages and runtimes, up to 29 scenarios. That run drove both architectures from one load-generator host at the same time, which can bias some amd64 rows ([probatorium#442](https://github.com/goceleris/probatorium/issues/442)), so the four earlier single-architecture amd64 runs of v1.5.8 in the same results tree (one of 90 s, three of 35 s with a 10 s warm-up) serve as a cross-check below. **The v1.6.0 release runs are not published yet**; their figures go in [v1.6.0 against v1.5.11](#v160-against-v1511) below, and every cell there is a marker until the run is published. A cell is one run, so treat a few percent as a tie; goceleris.dev averages all runs of a version and architecture, so its figures differ from the single run quoted here. "Best configuration" is a best-of comparison that favours celeris: celeris was entered in nine configurations (three on epoll, three on io_uring, two on adaptive and the std engine), each other Go framework in one or two.
+On plaintext GET with 1024 connections on linux/amd64, celeris's best configuration ranked first of [[PLACEHOLDER: number of frameworks, v1.6.0 amd64 run]] frameworks: [[PLACEHOLDER: percent ahead of the next server, v1.6.0 amd64 run]] ahead of the next server and [[PLACEHOLDER: ratio, v1.6.0 amd64 run]] times `net/http`. The last published run (v1.5.8, 2026-08-29, one 90 s run per cell) had it first of 31 frameworks, 8% ahead of gnet, a networking library, and 2.2 times `net/http`.
 
-What that run supports, and what it does not:
-
-- **The chart's row.** Celeris's best configuration served 1,403,931 requests per second against 1,296,720 for gnet (+8%), the next server (gnet is a networking library, not an HTTP framework), and 646,425 for `net/http` (2.2 times). Only the io_uring and adaptive configurations led; the epoll configurations served 1.21 to 1.22 million. The four earlier amd64 runs put celeris at 1.089 to 1.098 times gnet on this row, this run at 1.083. On linux/arm64 the same row is a tie: 430,146 for celeris (epoll), 420,047 for gnet.
-- **Across rows, Go frameworks.** Against the best other Go framework (fiber, gin, echo, chi, iris, hertz) on the 20 rows where another Go framework ran, leaving out the HTTP/2 rows and `churn-close` (loadgen v1.4.14 fixed the clients behind them) and counting only celeris's native-engine configurations (the std-engine configuration is left out), celeris's best configuration was more than 5% ahead on 11 rows, within 5% on 8 and more than 5% behind on 1 on linux/amd64, and 10, 6 and 4 on linux/arm64 (the 5% band is a convention, not a confidence interval). The four earlier amd64 runs of v1.5.8 gave 10, 9 and 1.
-- **Database-backed rows are not a sweep, and the std engine flatters them.** On the 11 driver rows (PostgreSQL, Redis, memcached, sessions), counting the native engines only, celeris was ahead on 3, level on 7 and behind on 1 on amd64 (the same in all five amd64 runs), and ahead on 1, level on 6 and behind on 4 on arm64. Counting the std-engine configuration too, as the site's rule does, the arm64 count is 2, 5 and 4: on `driver-redis-pipeline` the best celeris configuration is the std engine on both architectures. In that run the native engines' asynchronous (`AsyncHandlers`) configurations served that row at 0.70 of the best other Go framework on amd64 (0.73 to 0.75 in the four earlier amd64 runs) and 0.42 on arm64 ([#854](https://github.com/goceleris/celeris/issues/854) is the arm64 stall and is still open). The default wait for Redis pipeline replies changed after the run ([#1275](https://github.com/goceleris/celeris/pull/1275)); it has not been benchmarked on the release build. These rows describe v1.5.8, not v1.6.0. On arm64 the three memcached rows were at 0.68 to 0.87 of the best other Go framework; [#857](https://github.com/goceleris/celeris/issues/857) tracks the gap against fasthttp, a library this tally leaves out.
-- **The two native engines are close, not identical.** The median ratio of io_uring to epoll (the asynchronous HTTP/1 configuration of each) over the 27 shared scenarios was 0.99 on amd64 and 1.00 on arm64; single rows range from 0.61 to 1.34 on amd64.
-- **Not claimed.** There is no tail-latency ranking here: the rated passes carry known apparatus defects ([probatorium#441](https://github.com/goceleris/probatorium/issues/441), [#442](https://github.com/goceleris/probatorium/issues/442), [loadgen#102](https://github.com/goceleris/loadgen/issues/102)). The site's "fastest Go framework in N of M" count includes rows where no other Go framework ran ([docs#86](https://github.com/goceleris/docs/issues/86)), so it is not quoted.
-- **Known tail-latency gaps at partial load.** v1.6.0 does not claim these fixed. (a) amd64, 64 KiB WebSocket echo (64 connections) with the default garbage collector: on epoll the p99 is 2.03 ms at half of saturation and 6.14 ms at three quarters, against 0.59 and 0.74 ms on the std engine (3.4 and 8.3 times); that run measured the default GC on epoll only. The opt-in `Config.GCPercent` removes most of the gap at a memory cost and is off by default (see [Garbage collector target](#garbage-collector-target-opt-in)); every figure is probatorium run 44763955234, the median of 5 repetitions. ([#756](https://github.com/goceleris/celeris/issues/756)) (b) arm64, WebSocket echo (`ws-echo`, 128 connections): the p99 of the eight loop-engine configurations at a quarter of their own saturation rate is 1.80 to 2.03 times the p99 of the std engine in the same run (one pass at 60,000 requests per second), in the medians of five runs (probatorium runs 44962214245, 44968310755, 44974211702, 44979939701 and 44985455982 on the branch `ab/l755z-diag-20261121`); one configuration, adaptive with HTTP/1 handlers on goroutines, is at 2.03, above the 2.0 bar the project had set for this check, and the other seven are at 1.80 to 1.93 ([#755](https://github.com/goceleris/celeris/issues/755), [#1318](https://github.com/goceleris/celeris/issues/1318)). (c) HTTP/2 JSON GET on amd64 at about half of the maximum load: the p99 of the epoll and adaptive engines is [[PLACEHOLDER: ratio to the std engine, v1.6.0 amd64 run id]] times the std engine's; v1.5.11 has the same gap ([#757](https://github.com/goceleris/celeris/issues/757)). If tail latency matters for such a workload, measure it on your hardware, or compare with the std engine.
-
-The 20-row and 11-row counts and every figure above are derived by [`analyze-published-results.py`](.github/scripts/analyze-published-results.py) from the published `summary.json` files; the chart is generated from the same files by [`benchmark-hero.py`](.github/scripts/benchmark-hero.py).
-
-### v1.6.0 against v1.5.11
-
-The release gate is two full cross-framework runs, one on linux/amd64 and one on linux/arm64, each with a v1.5.11 build of celeris entered in the same run (the twin), so that both versions meet the same host, kernel and load generator. The table is filled from the published results of those two runs; every cell marked PLACEHOLDER below stands for a figure that does not exist yet, and none is estimated.
-
-| Row, one run each | v1.5.11 twin | v1.6.0 |
+| Requests per second, plaintext GET, 1024 connections | v1.6.0 | v1.5.8 |
 |---|---|---|
-| amd64, plaintext GET, 1024 connections: celeris best configuration, requests per second | [[PLACEHOLDER: v1.5.11 twin rps, amd64 run id]] | [[PLACEHOLDER: v1.6.0 rps, amd64 run id]] |
-| amd64, same row: best other server (gnet) and `net/http` | [[PLACEHOLDER: gnet rps, net/http rps, amd64 run id]] | [[PLACEHOLDER: gnet rps, net/http rps, amd64 run id]] |
-| arm64, same row: celeris best configuration, gnet, `net/http` | [[PLACEHOLDER: arm64 rps triple, arm64 run id]] | [[PLACEHOLDER: arm64 rps triple, arm64 run id]] |
-| amd64, against the best other Go framework: rows ahead / level / behind (5% band) | [[PLACEHOLDER: counts, amd64 run id]] | [[PLACEHOLDER: counts, amd64 run id]] |
-| arm64, same tally | [[PLACEHOLDER: counts, arm64 run id]] | [[PLACEHOLDER: counts, arm64 run id]] |
-| Driver rows (PostgreSQL, Redis, memcached, sessions), ahead / level / behind, both architectures | [[PLACEHOLDER: counts, run ids]] | [[PLACEHOLDER: counts, run ids]] |
-| Scenarios where v1.6.0 is slower than the v1.5.11 twin by more than the noise floor (the spread between two runs of the same build) | n/a | [[PLACEHOLDER: list or "none", run ids]] |
+| amd64: celeris, best configuration | [[PLACEHOLDER: rps, amd64 run]] | 1,403,931 |
+| amd64: fiber, best other Go web framework | [[PLACEHOLDER: rps, amd64 run]] | 1,040,338 |
+| amd64: `net/http` | [[PLACEHOLDER: rps, amd64 run]] | 646,425 |
+| arm64: celeris, best configuration | [[PLACEHOLDER: rps, arm64 run]] | 430,146 |
+| arm64: fiber | [[PLACEHOLDER: rps, arm64 run]] | 252,509 |
+| arm64: `net/http` | [[PLACEHOLDER: rps, arm64 run]] | 143,504 |
 
-How to reproduce: the runs are dispatches of the Benchmark Tier workflow of [probatorium](https://github.com/goceleris/probatorium) (`benchmark-tier.yml`, profile `full`; its README says how to dispatch it and what the cluster is), and their published results go to the [goceleris/docs `results/`](https://github.com/goceleris/docs/tree/main/results) tree under `v1.6.0/`. Recomputing a published figure from its `summary.json` needs no cluster: `.github/scripts/analyze-published-results.py <docs checkout> v1.6.0 <date>` derives the tallies above from those files. Re-measuring does need a cluster of the same shape; the in-tree benchmarks listed below run on any machine, measure single components, and do not substitute for the cross-framework runs.
+**Where celeris is not ahead.**
 
-In-tree comparison modules run in isolation:
+- On arm64 the same row is a tie with gnet (430,146 against 420,047 in v1.5.8), and a single run's few percent is within noise.
+- Tail latency at partial load on amd64: the p99 of 64 KiB WebSocket echo with the default garbage collector ([#756](https://github.com/goceleris/celeris/issues/756); the opt-in `Config.GCPercent` narrows the gap at about twice the memory on epoll) and of HTTP/2 JSON GET ([#757](https://github.com/goceleris/celeris/issues/757)) is higher than the std engine's.
+- On arm64, WebSocket echo p99 at light load on the epoll, io_uring and adaptive engines is 1.8 to 2.03 times that of the std engine in the same run (about 0.71 to 0.91 ms against 0.42 ms, one host, cause unknown, not closed in v1.6.0; [#755](https://github.com/goceleris/celeris/issues/755), [#1318](https://github.com/goceleris/celeris/issues/1318)).
+- Database rows are mixed: Redis pipelines with `AsyncHandlers` and memcached trail on arm64 ([#854](https://github.com/goceleris/celeris/issues/854), [#857](https://github.com/goceleris/celeris/issues/857)), loop-engine throughput on big.LITTLE arm64 is still being confirmed ([#1036](https://github.com/goceleris/celeris/issues/1036)), and WebSocket hub-broadcast p99 on amd64 is higher ([#858](https://github.com/goceleris/celeris/issues/858)).
 
-- [`test/drivercmp/`](test/drivercmp/) — PostgreSQL / Redis / memcached driver-isolation benchmarks (one module each).
-- [`test/benchcmp_ws/`](test/benchcmp_ws/) — WebSocket comparisons.
-- [`test/benchcmp_sse/`](test/benchcmp_sse/) — SSE broadcast (publish-to-N) comparisons.
-
-> **Note:** In-tree middleware benchmarks (e.g. `middleware/compress/bench_test.go`) use `celeristest`, which provides pool-based contexts with no HTTP overhead. Those numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use [probatorium](https://github.com/goceleris/probatorium) for fair cross-framework comparisons.
+The figures come from a cross-framework benchmark of 52 server configurations on dedicated x86-64 and arm64 machines, driven by one load generator ([loadgen](https://github.com/goceleris/loadgen)) from a separate host, and a cell is one run. [How the numbers are made](https://goceleris.dev/methodology/); [full results and how to read them](https://goceleris.dev/docs/results).
 
 ## Status and stability
 
-- **Releases.** The latest tag is shown in the badge row. v1.6.0 is the first release with a written [compatibility promise](GOVERNANCE.md#compatibility): the exported API of the packages without an `internal` path element follows the [Go 1 compatibility promise](https://go.dev/doc/go1compat) within v1 (the experimental `validation` package and the engine-provider type are not covered; the policy lists them), and a CI check compares it with the golden files in [`api/`](api/). v1.6.0 itself breaks earlier releases (see below).
-- **Maturity.** celeris is a young project with one maintainer. Run it behind a TLS-terminating proxy, benchmark it on your own hardware and workload, and read the open issues of the [v1.6.0](https://github.com/goceleris/celeris/milestone/26) and [v1.7.0](https://github.com/goceleris/celeris/milestone/36) milestones for what is known to be missing; the largest gap, [TLS](https://github.com/goceleris/celeris/issues/446), is on the Horizon milestone.
-- **Platforms.** Linux is the supported production platform: io_uring needs 5.19 or later, epoll 5.10 or later. macOS and Windows run the std engine and the drivers' portable fallback for development and testing; see [Platform support](#platform-support). Both x86-64 and arm64 are benchmarked and validated on a bare-metal cluster.
-- **Known open at this release.** v1.6.0 does not claim these fixed: the loop-engine tail latencies listed under [Performance](#performance) ([#756](https://github.com/goceleris/celeris/issues/756), closed by the opt-in `Config.GCPercent` while the default garbage collector keeps the gap, [#755](https://github.com/goceleris/celeris/issues/755) and [#1318](https://github.com/goceleris/celeris/issues/1318) on arm64, [#757](https://github.com/goceleris/celeris/issues/757) on HTTP/2); Redis pipelines with `AsyncHandlers` on arm64 ([#854](https://github.com/goceleris/celeris/issues/854): v1.6.0 changes how they wait for replies; release build: [[PLACEHOLDER: arm64 driver-redis-pipeline rows, v1.6.0 vs v1.5.11 twin, run id]]); loop-engine throughput on arm64 big.LITTLE hosts ([#1036](https://github.com/goceleris/celeris/issues/1036): v1.6.0 pins one loop per big CPU; release build: [[PLACEHOLDER: arm64 512-connection io_uring row, v1.6.0 vs v1.5.11 twin, run id]]); memcached throughput on arm64 against fasthttp ([#857](https://github.com/goceleris/celeris/issues/857)); and the WebSocket hub-broadcast p99 frame gap on amd64 ([#858](https://github.com/goceleris/celeris/issues/858)). The full list is the [v1.6.0 milestone](https://github.com/goceleris/celeris/milestone/26).
+- **Releases.** v1.6.0 is the first release with a written [compatibility promise](GOVERNANCE.md#compatibility): the exported API follows the Go 1 promise within v1, checked in CI against the golden files in [`api/`](api/). v1.6.0 itself breaks earlier releases.
+- **Maturity.** celeris is a young project with one maintainer. Run it behind a TLS-terminating proxy and benchmark it on your own workload; TLS in-process is [#446](https://github.com/goceleris/celeris/issues/446).
+- **Platforms.** Linux is the production platform: io_uring needs 5.19 or later, epoll 5.10 or later. macOS and Windows run the std engine for development and testing.
 - **Security.** Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
+- **Known open at this release.** [[PLACEHOLDER: one line per issue still open at the tag, written from the v1.6.0 milestone at tag time]]
 
 ## What's new in v1.6.0
 
-A correctness and hardening release: most of it comes from what the [probatorium](https://github.com/goceleris/probatorium) matrix and the audits behind it found. It does not claim the open performance items listed under [Status and stability](#status-and-stability) as fixed.
+- **Breaking.** The minimum Go version is 1.27.3, the engine, protocol and driver codec packages moved under `internal/`, and deprecated APIs were removed; the release notes list every migration.
+- **Compatibility.** The exported API is covered by a written promise and checked against `api/` golden files in CI.
+- **Correctness.** The io_uring and epoll shutdown, teardown and park paths and the HTTP/2 connection bounds were audited and corrected.
+- **New.** `HEAD` and `OPTIONS` are answered automatically, an opt-in `Config.GCPercent` exists for large-message WebSocket p99, and the drivers build and run on Windows.
+- **Changed defaults.** Request bodies are limited to 4 MiB, `SO_BUSY_POLL` is opt-in (`Config.SocketBusyPoll`), and swagger serves embedded assets.
 
-**Breaking** (the [pull request of the move](https://github.com/goceleris/celeris/pull/938) lists the migrations):
-
-- The minimum Go version is **1.27.3**.
-- The engine, protocol and driver codec packages moved under `internal/` and can no longer be imported; select an engine with `Config.Engine` and read counters as `celeris.EngineMetrics` or `observe.EngineMetrics`. Every deprecated public API was removed, `basicauth.HashPassword` included.
-- `Context.Stream` and the `bool` form of `Route.Async` / `RouteGroup.Async` were removed (use `StreamWriter`, `.Async()` and `.Sync()`), and `recovery`'s `ErrorHandler` now receives the recovered value as an `error`.
-- `Config.MaxRequestBodySize` defaults to 4 MiB, not 100 MB.
-- A handler that answers the request ends the chain, so a route that also matches a request a `Use`-mounted middleware answered no longer runs after it. `cache` and `swagger` options that defaulted to true are inverted (`DisableSingleflight`, `IgnoreCacheControl`, `DisablePKCE`). `otel` no longer records `server.address` as a metric attribute unless `MetricServerAddress` is set, and `Context.Scheme` returns only `"https"` or `"http"`. `Start*Context` returns only after the shutdown a cancel triggers.
-- The global middleware (`Use`) now also runs for a request no route matches, before its 404 or 405, so a `Use`-mounted `pprof`, `debug`, `metrics` or `static` that answered 404 now serves: check its `AuthFunc`.
-- `Context.File`, `FileFromDir`, `Static` and the `static` middleware answer an unsatisfiable range with 416 (it was a full 200) and honour `If-Range`.
-- `swagger` serves Swagger UI from embedded assets (about 2 MB added to a binary), `RendererScalar` and `RendererReDoc` need `CDN: true` or `AssetsPath` or `New` panics, and requests under `{BasePath}/assets/` must reach the middleware.
-- A failed `StartWithListener` closes the caller's listener, as `net/http`'s `Serve` does; on the adaptive engine, beside a same-user `SO_REUSEPORT` socket, `":PORT"` binds the dual-stack `[::]:PORT` where it bound IPv4 `0.0.0.0:PORT`.
-- This list is the headline items; the v1.6.0 release notes list every pull request labelled `breaking`.
-
-**Changed:** the native engines no longer set `SO_BUSY_POLL` (50 us) on the sockets they accept, and the drivers no longer set it on the connections they register on an event loop; it is opt-in through `Config.SocketBusyPoll` (`SocketBusyPoll: 50 * time.Microsecond` restores v1.5; see [Busy polling](#busy-polling-opt-in)). With `AsyncHandlers` and the default or a positive `PoolSize`, the Redis driver now waits for slow pipeline and transaction replies in `poll(2)` by default on Linux (opt out with `CELERIS_REDIS_DIRECT_WAIT=netpoll`; one OS thread per slow `Exec`, up to 20 ms per wait). It was measured on arm64 only (one benchmark run per wait mode, on one host: +14% to +19% requests per second against Go's netpoll, [#1275](https://github.com/goceleris/celeris/pull/1275)); no amd64 benefit is claimed, and [#854](https://github.com/goceleris/celeris/issues/854) stays open until the release build is re-verified.
-
-**New:** an opt-in `Config.GCPercent` (see [Garbage collector target](#garbage-collector-target-opt-in)); `HEAD` is answered by the `GET` route and `OPTIONS` with an `Allow` list (`Config.DisableAutoHEAD` and `Config.DisableAutoOPTIONS` turn each off); the drivers and their stores build and run on Windows through a portable `net.Conn` fallback; `api/` golden files make every API change visible in review; on big.LITTLE arm64 hosts the engines pin one loop per non-little CPU (see [CPU pinning](#feature-matrix)).
-
-**Fixed:** the io_uring teardown, transplant and driver paths and the epoll shutdown and park paths were audited and corrected; the native HTTP/2 connection bounds refusals, PRIORITY placeholders, header-block fragments and frame sizes; a detached connection whose peer takes none of its bytes is closed after `WriteTimeout`; the std engine no longer cuts an SSE stream at its timeouts, and `EnableH2Upgrade` means the same on every engine; `basicauth` hashes passwords with a salted PBKDF2.
-
-## Features
-
-- **Tiered io_uring** — probes the kernel at start and uses the feature set it supports (multishot accept from 5.19 and zero-copy send from 6.0; no tier enables SQPOLL); multishot receive with provided buffers is opt-in (see the tuning variables).
-- **Edge-triggered epoll** — per-core event loops with CPU pinning.
-- **Adaptive meta-engine** — by default starts on epoll and moves to io_uring under sustained load, based on telemetry (`CELERIS_ADAPTIVE_START` picks the starting engine).
-- **First-party database drivers** — native [`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis), and [`driver/memcached`](driver/memcached) run on the celeris event loop (see [Database drivers](#database-drivers)).
-- **Zero-copy HTTP/1.1 parser** — the parser returns header and body slices that alias the bytes it parses instead of copying them. On epoll and io_uring, a request that arrives whole in one read, with no body or a `Content-Length` body, and runs inline is parsed in place in the engine's read buffer; a request that spans reads, has a chunked body, or runs on an async handler is served from a per-connection buffer instead.
-- **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK, inline handler execution, a HEADERS fast path for simple frames.
-- **Auto-detect** — protocol negotiation from the first bytes on the wire.
-- **Error-returning handlers** — `HandlerFunc` returns `error`; structured `*HTTPError` carries status codes.
-- **Pre-routing middleware** — `Server.Pre()` runs middleware before route matching (method override, URL rewrite).
-- **Serialization** — JSON and XML response methods; `Bind` auto-detects request format from `Content-Type`.
-- **net/http compatibility** — wrap an existing `http.Handler` via `celeris.Adapt()` / `celeris.AdaptFunc()`.
-- **Streaming responses** — `StreamWriter()` for chunked incremental writes on any engine; `Detach()` for keep-alive-after-return streaming on native engines (see [Streaming](#streaming-sse--websocket--chunked)).
-- **Connection hijacking** — `Hijack()` for custom protocol upgrades (HTTP/1.1 only).
-- **Engine-integrated WebSocket** — `UpgradeWebSocket()` hands the conn to the worker loop with backpressure, permessage-deflate, and a `Hub` for fan-out broadcast.
-- **Response buffering** — `BufferResponse` / `FlushResponse` for transform middleware (compress, ETag, cache).
-- **File serving** — `File()` from the OS, `FileFromFS()` from `embed.FS` / `fs.FS`.
-- **Content negotiation** — `Negotiate`, `Respond`, `AcceptsEncodings`, `AcceptsLanguages`.
-- **Configurable body limits** — `MaxRequestBodySize` enforced on HTTP/1.1 and h2c (default 4 MiB; the net/http bridge has two fixed 100 MB caps: `ToHandler` on the request body, `Adapt` on the adapted handler's buffered response).
-- **100-continue control** — `OnExpectContinue` callback validates uploads before the body transfers.
-- **Accept control** — `PauseAccept()` / `ResumeAccept()` for graceful load shedding. A pause carries clients that have connected but not yet sent their request: it keeps the listen sockets open for about 1.5 s with `TCP_DEFER_ACCEPT` cleared before closing them, and blocks for that long; set `DisableDeferAccept` for a pause that closes at once ([#662](https://github.com/goceleris/celeris/issues/662), [#675](https://github.com/goceleris/celeris/issues/675)).
-- **Zero-downtime restart** — `InheritListener` + `StartWithListener` for socket inheritance.
-- **Built-in metrics** — atomic counters, CPU-utilization sampling, on by default via `Server.Collector().Snapshot()` (opt out with `Config.DisableMetrics`).
-- **Opt-in GC target** — `Config.GCPercent` sets the process GC target when the server starts (default off); it exists for large-message WebSocket p99 (see [Garbage collector target](#garbage-collector-target-opt-in)).
-- **Per-route async dispatch** — `Route.Async()` / `Route.Sync()` choose inline-on-worker vs. per-conn dispatch goroutine per route; h2 chooses per stream.
-
-**TLS:** celeris is cleartext by design: TLS is terminated at the edge. The io_uring and epoll engines speak HTTP/1.1 and h2c only, and there is no `ListenTLS`. Terminate TLS upstream (Caddy, Nginx, Envoy, a cloud load balancer). If you need HTTPS in-process, run the std engine and pass a TLS listener: `Engine: celeris.Std` with `StartWithListener(tls.NewListener(ln, cfg))` serves HTTPS over HTTP/1.1, at the std engine's performance. The database drivers are cleartext too (see [Database drivers](#database-drivers)). First-class TLS is tracked in [#446](https://github.com/goceleris/celeris/issues/446).
+[Release notes](https://github.com/goceleris/celeris/releases/tag/v1.6.0).
 
 ## Routing
 
@@ -203,46 +143,7 @@ s.Pre(methodOverride, urlRewrite)
 
 ## Middleware
 
-All middleware is in-tree under [`middleware/`](middleware/) — 46 importable packages: the root `middleware` package, the 36 below, and 9 store and cache sub-packages:
-
-| Package | Description |
-|---------|-------------|
-| [`adapters`](middleware/adapters) | Bidirectional stdlib ↔ celeris middleware/handler conversion |
-| [`basicauth`](middleware/basicauth) | HTTP Basic authentication with hashed password support |
-| [`bodylimit`](middleware/bodylimit) | Request body size enforcement |
-| [`cache`](middleware/cache) | HTTP response cache with singleflight + Cache-Control honoring |
-| [`circuitbreaker`](middleware/circuitbreaker) | Circuit breaker (3-state, sliding-window error rate, 503 + Retry-After) |
-| [`compress`](middleware/compress) | Response compression (zstd, brotli, gzip, deflate; separate go.mod) |
-| [`cors`](middleware/cors) | Cross-Origin Resource Sharing (precomputed headers) |
-| [`csrf`](middleware/csrf) | CSRF protection (double-submit cookie + origin validation) |
-| [`debug`](middleware/debug) | Debug / introspection endpoints (loopback-only by default) |
-| [`etag`](middleware/etag) | Automatic ETag generation and conditional 304 responses |
-| [`healthcheck`](middleware/healthcheck) | Kubernetes-style liveness / readiness / startup probes |
-| [`idempotency`](middleware/idempotency) | Idempotency-Key replay protection (in-flight 409 + cached replay) |
-| [`jwt`](middleware/jwt) | JWT authentication (HMAC / RSA / ECDSA / EdDSA, JWKS auto-refresh) |
-| [`keyauth`](middleware/keyauth) | API-key authentication with constant-time comparison |
-| [`logger`](middleware/logger) | Structured request logging (slog, pooled-buffer FastHandler) |
-| [`methodoverride`](middleware/methodoverride) | HTTP method override via header or form field |
-| [`metrics`](middleware/metrics) | Prometheus metrics (separate go.mod) |
-| [`otel`](middleware/otel) | OpenTelemetry tracing + metrics (separate go.mod) |
-| [`overload`](middleware/overload) | 5-stage CPU + queue-depth + tail-latency-EMA overload control (503 + Retry-After) |
-| [`pprof`](middleware/pprof) | Go profiling endpoints (loopback-only by default). `profile` and `trace` record for `?seconds=N` on the I/O worker that reads the connection, which serves nothing else meanwhile: mount it as an `.Async()` route (see the package documentation) |
-| [`protobuf`](middleware/protobuf) | Protobuf serialization with content negotiation (separate go.mod) |
-| [`proxy`](middleware/proxy) | Trusted-proxy header extraction (X-Forwarded-For, X-Real-IP) |
-| [`ratelimit`](middleware/ratelimit) | Sharded token-bucket / sliding-window rate limiter (Redis / memcached store adapters) |
-| [`recovery`](middleware/recovery) | Panic recovery with broken-pipe detection |
-| [`redirect`](middleware/redirect) | URL redirect / rewrite (HTTPS, www, trailing slash) |
-| [`requestid`](middleware/requestid) | Request-ID generation (buffered UUID v4) |
-| [`rewrite`](middleware/rewrite) | Regex-based URL rewriting with capture-group support |
-| [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
-| [`session`](middleware/session) | Cookie-based sessions on the unified [`store.KV`](middleware/store) (memory / Redis / Postgres / memcached adapters) |
-| [`singleflight`](middleware/singleflight) | Request coalescing (collapse identical in-flight requests) |
-| [`sse`](middleware/sse) | Server-Sent Events: heartbeat, Last-Event-ID replay, per-client slow-client policy, and a `Broker` for fan-out (see [Streaming](#streaming-sse--websocket--chunked)) |
-| [`static`](middleware/static) | Static file serving with directory browse, ETag / Last-Modified caching |
-| [`store`](middleware/store) | Unified in-memory `KV` (sharded, TTL eviction) shared by session / csrf / ratelimit / cache / idempotency; Redis / Postgres / memcached adapters live under the respective `session/*store` and `ratelimit/*store` subpackages |
-| [`swagger`](middleware/swagger) | OpenAPI spec + Swagger UI (embedded) / Scalar / ReDoc (pinned CDN, opt-in) |
-| [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
-| [`websocket`](middleware/websocket) | RFC 6455 WebSocket: permessage-deflate, engine-integrated backpressure, and a `Hub` for fan-out (see [Streaming](#streaming-sse--websocket--chunked)) |
+All middleware is in-tree under [`middleware/`](middleware/), documented at [goceleris.dev](https://goceleris.dev/docs/middleware): `adapters`, `basicauth`, `bodylimit`, `cache`, `circuitbreaker`, `compress`, `cors`, `csrf`, `debug`, `etag`, `healthcheck`, `idempotency`, `jwt`, `keyauth`, `logger`, `methodoverride`, `metrics`, `otel`, `overload`, `pprof`, `protobuf`, `proxy`, `ratelimit`, `recovery`, `redirect`, `requestid`, `rewrite`, `secure`, `session`, `singleflight`, `sse`, `static`, `store`, `swagger`, `timeout` and `websocket`. `compress`, `metrics`, `otel` and `protobuf` are separate modules. `pprof`'s profile and trace endpoints hold an I/O worker for their duration: mount it as an `.Async()` route.
 
 ```go
 import (
@@ -255,13 +156,6 @@ s := celeris.New(celeris.Config{Addr: ":8080"})
 s.Use(recovery.New())
 s.Use(logger.New())
 s.Use(cors.New())
-```
-
-Middleware with external dependencies lives in its own module — import it separately:
-
-```go
-import "github.com/goceleris/celeris/middleware/metrics" // requires prometheus
-import "github.com/goceleris/celeris/middleware/otel"    // requires opentelemetry
 ```
 
 ## Error handling
@@ -309,10 +203,11 @@ s := celeris.New(celeris.Config{
 	Logger:             slog.Default(),
 })
 ```
+Every field is documented on [goceleris.dev](https://goceleris.dev/docs/configuration). The opt-in `Config.GCPercent` is described on the [WebSocket page](https://goceleris.dev/docs/websocket#large-messages-and-the-garbage-collector).
 
-## Async handlers (per route)
+## Async handlers and streaming
 
-Celeris runs every handler **inline on the I/O worker** by default — no goroutine hand-off. For handlers that block on I/O (database, RPC, filesystem), opt **per route** into the per-connection dispatch goroutine so the worker stays free to drive other connections:
+Handlers run inline on the I/O worker by default. Mark a route that blocks on I/O `.Async()` so the worker stays free; precedence is route over group over `Config.AsyncHandlers`. **An inline handler must not call `runtime.Goexit`** (`t.FailNow` does): on the native engines it ends that event loop for good. Details are in [Runtime notes](https://goceleris.dev/docs/runtime-notes).
 
 ```go
 // CPU-only / cache-only — runs inline (default).
@@ -327,165 +222,37 @@ api.GET("/products", productHandler)     // async (inherited)
 api.GET("/cached", cachedHandler).Sync() // opt back to sync
 ```
 
-Precedence is **route > group > server default** (`Config.AsyncHandlers`). It works identically across io_uring, epoll, and adaptive — both sub-engines honor the per-route flag, and async promotions survive sub-engine swaps: a conn is promoted **once** via the `ErrAsyncDispatch` sentinel (sticky — subsequent requests skip the inline check entirely). h2 routes the choice **per stream** between inline-on-event-loop and the shared h2 worker pool. The `Async` / `Sync` distinction is a no-op on the std engine, where net/http already does goroutine-per-request.
-
-**An inline handler must not call `runtime.Goexit`.** `t.FailNow`, `t.Fatal` and `t.SkipNow` in a test's handler call it, and so do some libraries. A panic is caught (the router answers 500), but a Goexit cannot be: on epoll, io_uring and adaptive an inline handler runs on the event-loop goroutine, so a Goexit ends that loop for good. Every connection the loop owns goes unserved and its `SO_REUSEPORT` listener stops accepting. The engine logs an Error (`... ended without returning`, with the engine, the loop or worker id and the connection count) and cannot recover. A `.Async()` route's handler does not run on the loop, so the loop survives a Goexit there, but the cost depends on the protocol: on HTTP/1.1 the native engines close that connection and log an Error; on HTTP/2 the stream gets no response and no RST_STREAM, nothing is logged, and the connection stays open (the client waits for its own timeout). On HTTP/2 a stream of a sync route runs inline whether or not its request has a body, so a Goexit there ends the loop and is logged; the one exception is a connection that already holds 4 MiB of response data it could not send for the peer's window, where the stream runs on the h2 worker pool and ends silently, as an `.Async()` route's does. A request that matches no route runs its global middleware and its `NotFound` or `MethodNotAllowed` handler inline whatever the routes are marked (with `Config.AsyncHandlers` set, until a blocking run promotes them), and the `OnConnect` and `OnDisconnect` callbacks run on the loop too, as does `OnExpectContinue` unless its connection was promoted to async dispatch: none of them may call `runtime.Goexit`. The std engine runs each request on its own goroutine, so a Goexit there ends only that request's goroutine (net/http closes an HTTP/1.1 connection whose handler Goexits), not a loop.
-
-Observe how often the inline → goroutine handoff fires via `Server.EngineInfo().Metrics.AsyncRoutes` (static count of `.Async()` routes) and `.AsyncPromotedConns` (cumulative promotions).
-
-## Streaming (SSE / WebSocket / chunked)
-
-Streaming is a first-class feature, and native engines get an inline egress path that avoids funneling every write through one loop thread. Four building blocks compose:
-
-- **`Context.StreamWriter()`** — synchronous incremental writes (chunked / progressive responses). Works on **every** engine, including std.
-- **`Context.Detach()`** — keep the connection alive after the handler returns, so a spawned goroutine can drive a long-lived stream. This is **native-engine only** (io_uring / epoll / adaptive). On std, the connection closes the moment the handler returns.
-- **[`middleware/websocket`](middleware/websocket)** — RFC 6455 WebSocket with an engine-integrated `Hub` for broadcast.
-- **[`middleware/sse`](middleware/sse)** — Server-Sent Events with a `Broker` for publish-to-N fan-out and Last-Event-ID replay.
-
-Gate async streaming on the active engine with `Context.EngineSupportsAsyncDetach()` — it reports whether the engine can keep the conn alive after the handler returns:
-
-```go
-func stream(c *celeris.Context) error {
-	if c.EngineSupportsAsyncDetach() {
-		done := c.Detach()
-		go func() {
-			defer done()
-			driveStream(c) // writes flush through the engine's guarded path
-		}()
-		return nil // handler returns; conn stays alive
-	}
-	driveStream(c) // std: must complete before returning
-	return nil
-}
-```
-
-### WebSocket
-
-[`middleware/websocket`](middleware/websocket) is a full RFC 6455 implementation wired directly into the worker loop:
-
-- **Buffer-reusing reads** — `Conn.ReadMessageReuse()` reads into a caller buffer for echo / proxy hot paths.
-- **Streaming large messages** — `Conn.NextReader()` / `Conn.NextWriter()` read and write without whole-message buffering.
-- **Control frames** — `Conn.WriteControl()`, `Conn.WritePing()`, and `SetPingHandler` / `SetPongHandler` / `SetCloseHandler`.
-- **permessage-deflate** — RFC 7692 compression negotiated at handshake (`EnableCompression`).
-- **Fan-out `Hub`** — `NewHub(HubConfig{...})`, then `Broadcast` / `BroadcastFilter` / `BroadcastPrepared`. Encode once with `NewPreparedMessage` and reuse the `*PreparedMessage` across every subscriber for O(1) per-message wire-encoding cost. Slow connections are handled by `HubConfig.OnSlowConn`, which returns a `HubPolicy` (Drop / Remove / Close).
-
-### Garbage collector target (opt-in)
-
-`Config.GCPercent` sets the process garbage-collector target with `runtime/debug.SetGCPercent` when the server starts, the same knob as the `GOGC` environment variable. The default, `0`, leaves the runtime untouched, so an embedding program and `GOGC` keep control; a negative value is refused when the server starts, because it would switch the collector off. A value above zero wins over `GOGC`, and the previous target is put back when the last server that set one stops, unless other code changed it in between. The setting is process-global: use it only in a binary that celeris owns.
-
-```go
-s := celeris.New(celeris.Config{
-	Addr:      ":8080",
-	GCPercent: 400, // 0 (the default) leaves the runtime's GC target alone
-})
-```
-
-Why it exists: an echo of 64 KiB WebSocket messages allocates on every message, and a collection cycle that starts while the event loops are busy can hold the free Ps the handlers need, which shows as p99 latency at high load. A higher target means fewer cycles. Measured on amd64 (probatorium run 44763955234 on the branch `ab/l756j-diag-20261120`, which defines the columns; the adapter switch that sets the option is on probatorium `main`; celeris main at fe2b5be71ebc, 64 connections, 64 KiB messages, median p99 in milliseconds of 5 repetitions, offered load of 8,376, 16,753 and 25,129 requests per second, which are 0.25, 0.5 and 0.75 of the epoll saturation rate measured earlier on the same cluster; where two figures are given, they are two independent copies of the same column):
-
-| Server | 0.25 of saturation | 0.5 | 0.75 |
-|---|---|---|---|
-| std engine (`net/http`), default GC | 0.56 | 0.59 | 0.74 |
-| epoll, default GC | 0.66 | 2.03 | 6.14 |
-| epoll, `GCPercent: 400` | 0.76 / 0.83 | 1.16 / 1.13 | 1.30 / 1.46 |
-| io_uring, `GCPercent: 400` | 0.91 / 0.85 | 1.37 / 1.02 | 1.36 / 1.36 |
-| adaptive, `GCPercent: 400` | 0.84 / 0.73 | 1.33 / 1.16 | 1.30 / 1.29 |
-
-The cost is memory and a little p99 at low load: peak resident memory was 125 to 133 MiB with the option on epoll and adaptive and 238 to 245 MiB on io_uring, against 65 MiB for epoll at the default; no default-GC io_uring column was run, so the io_uring cost is not a ratio. The p99 at 0.25 was 0.73 to 0.91 ms with the option against 0.66 ms without. Limits of this evidence: one scenario, amd64 only, the single value 400 (no other was measured), and the adaptive engine did not switch away from epoll during the run. Pairing the option with `Config.MemoryLimitBytes` or `GOMEMLIMIT` was not measured, and a ceiling close to the live heap brings frequent collections back and can undo the gain. The benchmark matrix runs celeris at the default GC, so its published tables show the default-GC gap above.
-
-### SSE
-
-[`middleware/sse`](middleware/sse) provides heartbeats, Last-Event-ID replay via a pluggable `ReplayStore`, and a fan-out `Broker`:
-
-- **`NewBroker(BrokerConfig{...})`** — publish to N subscribers, each with a bounded queue.
-- **`BrokerConfig.OnSlowSubscriber`** — returns a `BrokerPolicy` (Drop / Remove / Close) when a subscriber's queue is full; slow-subscriber handling is bounded by `DefaultBrokerSlowConcurrency()` (`GOMAXPROCS*4`) so a misbehaving callback can't fan out unboundedly.
-- **Last-Event-ID replay** — on reconnect the broker reads `Since(lastID)` from the replay store and re-sends missed events.
+`StreamWriter()` streams on every engine; `Detach()` keeps a connection alive after the handler returns, on the native engines only. [`middleware/websocket`](middleware/websocket) (with a fan-out `Hub`) and [`middleware/sse`](middleware/sse) (with a `Broker` and Last-Event-ID replay) build on them; see [Streaming](https://goceleris.dev/docs/streaming).
 
 ## Database drivers
 
-Celeris ships first-party database drivers built on the event-loop machinery of the engines — no CGo. Which of their connections run on the server's worker loops depends on how you open them (see the table under [Busy polling](#busy-polling-opt-in)). They back the driver-isolation benchmarks and probatorium's driver-backed workloads.
-
-- **[`driver/postgres`](driver/postgres)** — speaks the PostgreSQL v3 wire protocol directly. Register it as a standard `database/sql` driver, or use the lower-level worker-affinity `Pool` to skip `database/sql` overhead.
-- **[`driver/redis`](driver/redis)** — RESP2 / RESP3 client (negotiates `HELLO 3` with automatic RESP2 fallback), per-worker connection pools, pub/sub, and Redis Cluster + Sentinel failover. Since v1.6.0, with `AsyncHandlers`, a pipeline or transaction whose replies are slow waits in `poll(2)` instead of Go's netpoll by default; `CELERIS_REDIS_DIRECT_WAIT=netpoll` restores the old behaviour (see [Tuning environment variables](#tuning-environment-variables)).
-- **[`driver/memcached`](driver/memcached)** — text and binary protocols, pooled single-node clients, and a consistent-hash cluster with failover.
-
-Pass a driver the server with its `WithEngine` option to share its loops where it can: on a started epoll, io_uring or adaptive server, PostgreSQL `Connector` connections register on the server's loops, and so do Redis Pub/Sub connections unless the server runs async handlers (then Pub/Sub uses a standalone loop of its own); the command connections of Redis and memcached and the PostgreSQL `Pool` go through Go's netpoll; before `Start`, or on the std engine, a driver uses its own standalone loop. Correctness is the same either way. See [goceleris.dev](https://goceleris.dev) for driver guides.
-
-The drivers have no TLS stack: connect them over a trusted network (loopback, a VPC, a private link) or through a TLS sidecar. They refuse rather than silently downgrade when TLS is mandatory:
-- Postgres returns `ErrSSLNotSupported` for `sslmode=require`, `verify-ca` and `verify-full`. `prefer` and `allow` connect in plaintext and print a warning.
-- Redis rejects `rediss://` addresses.
-- Memcached has no TLS option.
-
-Driver-side TLS is part of [#446](https://github.com/goceleris/celeris/issues/446).
-
-### Platform support
-
-The drivers (and the middleware stores built on them: CSRF, JWT cache, rate limit and session stores over Redis, Postgres and memcached) run on the celeris event loop on **Linux**, which is the supported production path and the one the benchmarks measure. On macOS and the other unix hosts they run on a goroutine-per-connection fallback for development and testing.
-
-On **Windows** the drivers and every store compile (`GOOS=windows go build ./...` and `go vet ./...` pass over the whole module), and work through the same kind of portable fallback: each connection is a `net.Conn` read by its own goroutine, with no `WithEngine` colocation, no write queue and no tuning. CI cross-compiles for windows/amd64 and windows/arm64 and runs the fallback's tests and the drivers' fake-server tests on `windows-latest` (the integration suites against real Redis, Postgres and memcached run on Linux only). Windows is not benchmarked and not a production target: deploy on Linux.
+[`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis) and [`driver/memcached`](driver/memcached) are first-party clients with no CGo and no TLS (connect over a trusted network or a TLS sidecar). Which connections run on the server's event loops depends on how you open them: see [Data stores](https://goceleris.dev/docs/data-stores) and [Runtime notes](https://goceleris.dev/docs/runtime-notes#database-drivers-and-event-loops).
 
 ## net/http compatibility
 
-Wrap existing `net/http` handlers and middleware:
-
 ```go
-// Wrap http.Handler
 s.GET("/legacy", celeris.Adapt(legacyHandler))
-
-// Wrap http.HandlerFunc
 s.GET("/func", celeris.AdaptFunc(func(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("from stdlib"))
 }))
 ```
 
-The bridge buffers the adapted handler's response in memory, capped at a compile-time **100 MB** limit (independent of `Config.MaxRequestBodySize`). Responses exceeding this limit return an error.
+The bridge buffers the adapted handler's response in memory, up to 100 MB.
 
-## Engine selection
+## Engines
 
-| Engine | Platform | Use case |
-|--------|----------|----------|
-| `IOUring` | Linux 5.19+ | Completion-based I/O; one of the two native engines |
-| `Epoll` | Linux 5.10+ | Readiness-based I/O; broadest kernel support |
-| `Adaptive` | Linux 5.10+ | Starts on epoll and moves connections to io_uring on telemetry; it uses io_uring only where that is viable (kernel 6.1 or later with the fast-tier probes passing, or 6.10 or later, and enough `RLIMIT_MEMLOCK`) and stays on epoll elsewhere |
-| `Std` | Any OS | Development, compatibility, non-Linux deploys |
+| Engine | Platform | Use |
+|--------|----------|-----|
+| `IOUring` | Linux 5.19+ | Completion-based I/O |
+| `Epoll` | Linux 5.10+ | Readiness-based I/O |
+| `Adaptive` | Linux 5.10+ | Starts on epoll and moves to io_uring under sustained load where the kernel allows it (6.1+ with the fast-tier probes, or 6.10+) |
+| `Std` | Any OS | Development, compatibility, TLS through a listener |
 
-The default is **Adaptive** on Linux and **Std** elsewhere. Prefer Adaptive unless you have a specific reason to pin an engine; on non-Linux platforms only Std is available (the native engines return an error). Neither native engine is the faster one everywhere: in the published v1.5.8 run the median io_uring-to-epoll throughput ratio was 0.99 on amd64 and 1.00 on arm64, but on the plaintext 1024-connection row io_uring led on amd64 (about 1.39 against 1.21 to 1.22 million requests per second) and the two were level on arm64 (430,146 for epoll, 421,265 for io_uring; see [Performance](#performance)).
-
-io_uring needs Linux 5.19 or later: every cancel the engine submits uses the `IORING_ASYNC_CANCEL` flags that release added, and an older kernel fails each one with `-EINVAL` ([#682](https://github.com/goceleris/celeris/issues/682)). The engine checks it at startup: a kernel version before 5.19 is refused outright (a partial vendor backport can pass a single probe cancel while its other cancel forms still fail), and from 5.19 a probe cancel that the kernel answers decides. Where the kernel version is below 5.19 or the kernel rejects the flags, `IOUring` fails to start with an error that names the requirement, and `Adaptive` runs on epoll (`CELERIS_ADAPTIVE_START=iouring` included).
-
-### Tuning environment variables
-
-The engines read these at startup; the Redis driver reads `CELERIS_REDIS_DIRECT_WAIT` on its first pipeline or transaction. None is needed for normal operation; to run a single engine with no switching, set `Config.Engine` instead. The Stability column is the level [GOVERNANCE.md](GOVERNANCE.md#compatibility) defines: a **supported** variable keeps its name, values and effect within v1; an **experimental** one may change in a minor release, with a release note; an **unsupported** one may change or go away in any release.
-
-| Variable | Engine | Stability | Values (default in bold) | Effect |
-|----------|--------|-----------|--------------------------|--------|
-| `CELERIS_ADAPTIVE_START` | Adaptive | supported | `epoll`, `iouring`, **`auto`** | Chooses the engine Adaptive **starts** on. It does not turn off runtime switching. Unrecognized values mean `auto`. `iouring` is a request: where the io_uring engine cannot be built (`CELERIS_MAX_IOURING_TIER=none`, say), Adaptive logs a `WARN` and starts on epoll. |
-| `CELERIS_MAX_IOURING_TIER` | io_uring | supported | `optional`, `high`, `base`, `none` (**unset: detected tier**) | Caps the io_uring feature tier below what the kernel supports; for exercising fallback paths. Any other non-empty value, typos included, counts as `none` (an empty value is the same as unset). At `none` the io_uring engine reports io_uring as unavailable, and Adaptive's automatic choice neither starts on io_uring nor switches to it. An explicit `CELERIS_ADAPTIVE_START=iouring` still tries io_uring first: the engine refuses, Adaptive logs one `WARN` (`io_uring start engine unavailable, falling back to epoll start`) and starts on epoll, and the switch to io_uring stays off. The detected kernel version is not capped. |
-| `CELERIS_IOURING_SEND_ZC` | io_uring | supported | `on`/`1`/`true`, `off`/`0`/`false`, **`auto`** | Zero-copy send. `auto` enables it where the startup probe finds SEND_ZC working; `on` cannot enable it where the probe failed. Unrecognized values mean `auto`; one is logged as a warning only where the probe finds SEND_ZC working (elsewhere the variable has no effect). |
-| `CELERIS_IOURING_MULTISHOT_RECV` | io_uring | experimental | `1` (**unset: off**) | Multishot receive into a provided-buffer ring (high tier, 5.19+). Any value other than `1` leaves it off. |
-| `CELERIS_IOURING_PBUF_COUNT` | io_uring | experimental | positive integer (**1024**) | Provided-buffer-ring entries per worker; used only with multishot receive. Rounded up to a power of two and clamped to 1024–32768. `0`, a negative value or a non-integer keeps the default. |
-| `CELERIS_IOURING_FIXED_FILES` | io_uring | unsupported | **do not set** | Development only. Fixed-file support is incomplete ([#541](https://github.com/goceleris/celeris/issues/541)); enabling it makes connections read from unrelated descriptors. |
-| `CELERIS_REDIS_DIRECT_WAIT` | Redis driver | experimental | `netpoll`, `auto`, `block` (**unset: `auto` on Linux for the pool of a server with `AsyncHandlers` and the default or a positive `PoolSize`; `netpoll` for every other pool and off Linux**) | How a Redis `Pipeline` or `Tx` `Exec` on a direct-mode connection waits for its reply. `auto` waits in `poll(2)` on the caller's thread while a connection's first-reply wait stays above 300 us and returns to Go's netpoll below 150 us; `block` always uses `poll(2)`; `netpoll` is the behaviour before v1.6.0 and the opt-out. A slow `Exec` in `poll(2)` holds one OS thread for up to 20 ms per wait. An unknown value means `netpoll`. Read on the first such `Exec`. |
-
-Variables named `CELERIS_DEBUG_*` and `CELERIS_ADAPTIVE_DEBUG` turn on diagnostic logging and measurement probes. They are for investigating a specific problem and are unsupported: not a stable interface.
-
-### Busy polling (opt-in)
-
-`Config.SocketBusyPoll` sets `SO_BUSY_POLL` (the Linux per-socket NAPI busy poll) on the connections the epoll, io_uring and adaptive engines accept. It is **off by default** (`0`). Before v1.6.0 the engines set it to 50 microseconds on every accepted socket with no way to turn it off; `SocketBusyPoll: 50 * time.Microsecond` restores that. With it on, a read that finds a socket empty first runs one pass of the device's receive polling on its CPU; the engines' sockets are non-blocking, so the value only switches that on (any positive value behaves alike; a fraction of a microsecond is dropped, and a value under 1 us or a negative one fails the start). The std engine, non-Linux platforms and the unsupported io_uring fixed-files mode ignore it. The drivers follow it. `driver/redis`, `driver/postgres` and `driver/memcached` used to set 50 microseconds on the connections they register on an event loop and no longer do. Which connections those are: redis Pub/Sub connections and postgres `Connector` connections always; the command connections (redis and memcached) and the postgres `Pool` only when the driver runs on its own event loop, as this table says (a set connection is one that was on a loop in v1.5 and got 50 microseconds; the others go through Go's netpoll and were never set, and still are not). An application that used only the netpoll ones was not affected.
-
-| Driver opened | redis commands | memcached | postgres `Pool` |
-|---|---|---|---|
-| no engine | loop (was set) | netpoll | netpoll |
-| `WithEngine` of a server that does not run async handlers and has not started yet, or is on the std engine | loop (was set) | loop (was set) | loop (was set) |
-| `WithEngine` of a started epoll, io_uring or adaptive server (the default is adaptive) | netpoll | netpoll | netpoll |
-| `WithEngine` of a server that runs async handlers, started or not | netpoll | netpoll | netpoll |
-
-Opened with `WithEngine(srv)`, the connections that are on a loop take the server's `SocketBusyPoll` (`srv.SocketBusyPoll()`), so off for the server is off for them. With no engine they are off unless `redis.WithSocketBusyPoll` or `postgres.Connector.WithSocketBusyPoll` says otherwise; memcached has no option of its own. When it is on the engine also asks for `SO_PREFER_BUSY_POLL` (only a process with `CAP_NET_ADMIN` is given it; never measured), and if the kernel refuses `SO_BUSY_POLL` it logs a Warn once.
-
-Why it is off: it was slower on both hosts measured (one cell, 512 connections, GET, io_uring; "off" is a build of the same source with the option removed). On an arm64 big.LITTLE host with a single-queue NIC (32 runs per arm), ksoftirqd took over a loop CPU's receive processing in 5 runs with busy polling on and 0 with it off (p = 0.026), requests of 1 to 7 s occurred in 4 runs and 0 (p = 0.057, indicative), and throughput was 3.0% higher with it off; we infer, but did not observe, that the busy-polling loop captured the NIC's receive NAPI on a CPU already saturated by receive softirq. On an amd64 host with a 16-queue NIC (8 runs per arm) throughput was 1.11% higher with it off (90% CI 0.94% to 1.42%) and nothing stalled either way. See the `SocketBusyPoll` documentation for the numbers and their limits.
+The default is `Adaptive` on Linux and `Std` elsewhere. Neither native engine is faster everywhere. TLS is not terminated in-process on the native engines: terminate it upstream. Tuning variables, busy polling, CPU pinning and the feature matrix are on [Engines](https://goceleris.dev/docs/engines), [Runtime notes](https://goceleris.dev/docs/runtime-notes) and [CPU pinning](https://goceleris.dev/docs/cpu-pinning).
 
 ## Graceful shutdown
 
-Use `StartWithContext` for production. When the context is canceled, the server drains in-flight requests up to `ShutdownTimeout` (default 30s).
+Use `StartWithContext` for production; when the context is cancelled the server drains in-flight requests up to `ShutdownTimeout` (default 30s).
 
 ```go
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -502,7 +269,7 @@ if err := s.StartWithContext(ctx); err != nil {
 }
 ```
 
-What a connection gets depends on what it has sent when the shutdown begins: an idle keep-alive connection is closed at once (on io_uring, while a worker still has a response going out, at 250 ms); a request in progress is answered with `Connection: close`. A connection that has sent nothing is not answered by std, or by epoll and an io_uring worker with nothing to send, and a request it sends later is dropped there; an io_uring worker that has a response going out answers a first request that arrives in the first 250 ms. A request head that has reached the kernel but that the server has not read yet is answered on epoll, io_uring and adaptive, and dropped on std (net/http). A connection that has begun a request head and not finished it (a fragment, or a bare CRLF) counts as a request in progress on epoll and io_uring: `Shutdown` waits for it until the head completes, until `ReadHeaderTimeout` (10 s by default, from the head's first byte, or for a new connection from its accept) or `WriteTimeout` cuts it, or until the context passed to `Shutdown` is done, so a client can hold a graceful shutdown for that long and the caller's bound is the context's deadline; std closes a keep-alive connection in that state with the idle ones, and waits for a new connection's first head as for a silent one. The exact per-engine contract, with what was measured, is in the [`Server.Shutdown`](https://pkg.go.dev/github.com/goceleris/celeris#Server.Shutdown) godoc.
+A connection that has begun a request head and not finished it (a fragment, or a bare CRLF) counts as a request in progress on epoll and io_uring: `Shutdown` waits for it until the head completes, until `ReadHeaderTimeout` (10 s by default, from the head's first byte, or for a new connection from its accept) or `WriteTimeout` cuts it, or until the context passed to `Shutdown` is done, so a client can hold a graceful shutdown for that long and the caller's bound is the context's deadline; std closes a keep-alive connection in that state with the idle ones, and waits for a new connection's first head as for a silent one. The exact per-engine contract, with what was measured, is in the [`Server.Shutdown`](https://pkg.go.dev/github.com/goceleris/celeris#Server.Shutdown) godoc.
 
 ## Observability
 
@@ -515,98 +282,24 @@ fmt.Println(snap.RequestsTotal, snap.ErrorsTotal, snap.ActiveConns, snap.CPUUtil
 
 For Prometheus exposition and debug endpoints, use [`middleware/metrics`](middleware/metrics) and [`middleware/debug`](middleware/debug). For OpenTelemetry, use [`middleware/otel`](middleware/otel).
 
-## Feature matrix
+## Requirements
 
-| Feature | io_uring | epoll | std |
-|---------|----------|-------|-----|
-| HTTP/1.1 | yes | yes | yes |
-| h2c | yes | yes | yes |
-| Auto-detect | yes | yes | yes |
-| CPU pinning | yes | yes | no |
-| Provided buffers | opt-in, with multishot recv (5.19+) | no | no |
-| Multishot accept | yes (5.19+) | no | no |
-| Multishot recv | opt-in (5.19+, `CELERIS_IOURING_MULTISHOT_RECV=1`) | no | no |
-| Provided-buffer ring size | 1024 entries per worker (`CELERIS_IOURING_PBUF_COUNT=N` to override) | n/a | n/a |
-| HEADERS fast path | yes | yes | no |
-| Inline h2 handlers | yes | yes | no |
-| Inline WS / SSE broadcast egress | yes | yes | n/a (net/http) |
-| `StreamWriter` (sync incremental) | yes | yes | yes |
-| `Detach` (async keep-alive) | yes | yes | no |
-| Connection hijack | yes | yes | yes |
-
-**CPU pinning** (epoll and io_uring): loop `i` pins its thread to the `i`-th CPU the thread that starts the server is allowed to use (`taskset`, a cgroup cpuset, `sched_setaffinity`), never to a CPU outside that set; on a host with several NUMA nodes the CPUs are taken from the nodes the set covers in turn, so every allowed CPU holds a loop before any holds a second. With `Workers` unset on a host whose allowed CPUs are alike, the engines start `GOMAXPROCS - max(1, GOMAXPROCS/8)` loops (28 of 32, 14 of 16, 7 of 8, 3 of 4; no reserve for a `GOMAXPROCS` of 2 or less): a loop can hold its thread and its P while it blocks in the kernel, so the Ps without a loop are left to the goroutines that are not loops (async and WebSocket handlers, the HTTP/2 stream pool, the garbage collector's workers) (celeris#756, #757). The mechanism is inferred from traces, not established; the reserve is provisional and its effect on latency is still being measured. To opt out, set `Workers: runtime.GOMAXPROCS(0)`: on such a host it starts one loop per P, as before (on a big.LITTLE host the default is not reduced, and a `Workers` above the non-little CPUs wraps loops over them, see below); a `Workers` you set is never reduced. `Metrics.Workers`, `NumWorkers()` and the server-wide `Config.MaxConns` limit follow the loops started, as on big.LITTLE below. On a host whose allowed CPUs differ in capacity (arm64 big.LITTLE, read from `/sys/devices/system/cpu/cpuN/cpu_capacity`, or the CPU parts in `/proc/cpuinfo` when the kernel exports none), the engines start at most one loop per CPU with at least half the largest capacity (`min(GOMAXPROCS, non-little CPUs)`: 8 loops on a 12-CPU host with 4 little CPUs, fewer than `GOMAXPROCS`) and pin every one of them: none runs on a little CPU and none is left unpinned (celeris#1036; a loop that floated drifted onto the little CPUs and a loop pinned to one stalled its connections). A `Config.Workers` above that count is honoured: the extra loops wrap round-robin over the non-little CPUs, each pinned, so the CPUs that get a second loop (4 of 8 for `Workers: 12`) take about twice the connections of the others; on io_uring the count is still capped by `RLIMIT_MEMLOCK`. Consequences of the smaller count: `Metrics.Workers` and `NumWorkers()` read the loops started (on the adaptive engine, the sum over its two engines), driver pools sized from `NumWorkers()` default smaller (a PostgreSQL pool of `4*NumWorkers`: 32 on that host, not 48), and `Config.MaxConns` is per loop, so the server-wide limit shrinks with it. The measurements that motivated this plan were taken on earlier builds and are not quoted here; [#1036](https://github.com/goceleris/celeris/issues/1036) stays open until the plan is measured on the v1.6.0 release. The engine logs one line saying how many loops it started and why; a pin the kernel refuses is logged once. With `Workers` unset, and a default count of at least one loop for each non-little CPU (8 of 8 on that host; a lower `GOMAXPROCS`, such as the default under a Kubernetes CPU limit, plans as above, so 7 default loops are 0, 1, 6, 7, 8, 9 and 10, more than the 6 loops of 8), the default plan also leaves the loops off the non-little CPUs that service the busy interrupt vectors of the NIC port that received the traffic (celeris#1036 item 1). At start the engine takes the physical ports behind the listen address (through bonds and VLANs); if one of them took at least 60% of the packets received since boot (`/sys/class/net/<if>/statistics/rx_packets`, and at least a million) it leaves without a loop the non-little CPUs that service its vectors with at least 1000 interrupts since boot (`/proc/interrupts`, `/proc/irq/N/effective_affinity_list`): CPUs 6 and 8 on that host, so the loops sit on 0, 1, 7, 9, 10 and 11. It frees never more than a quarter of the non-little CPUs (the loops never fall under `max(min(2, n), ceil(3n/4))` for `n` non-little CPUs) and never raises the count. A CPU that also services a busy vector of another port (or one shared with another port) keeps its loop, and at least one busy vector of a port with at least 10% of the packets pooled over the listener's ports (a choice, not measured; the measured host's ports carry about 27% and 73%) must stay on a CPU that keeps its loop: with a single port, or with a data NIC beside a management NIC that carries less, the plan is the plan without the rule. The rule also does nothing when a file cannot be read, when a port has a million packets and no busy vector, when the busy vectors sit on more CPUs than the quarter allows (a NIC spread over its queues), when the ports share the packets about evenly, or when a busy vector of another port is serviced by a CPU that runs no loop (the measured host's boot placement, IRQ 167 on little CPU 4: that plan is not measured). A host whose CPUs are alike, and any `Config.Workers` you set, read no NIC file. The Info line of the plan names the CPUs left free, the port and its share; the Debug line names the candidates it passed over or why the rule stepped aside. On the boots of the one cluster host where it was measured the rule planned the loops 0, 1, 7, 9, 10 and 11 by itself; whether it engages depends on the host and on the boot, because the packet counts it reads are since boot. Its measured effect is not quoted here (see #1036). Limits: the rule is fitted to that one host after its data was seen (the 60% and the quarter are choices), and its counts are since boot, so a server started at boot steps aside and a wrapped 32-bit interrupt counter can hide a vector (IRQ 135 on the measured host is at about 4.05e9 of 4.29e9); a LAG rehash that moves the traffic to the other port leaves the plan on the old CPUs until the next start; a wildcard listener pools every physical port that is up, related or not (the 10% share above governs a data NIC beside a management NIC); on NICs whose ports share all their vectors (mlx4) the rule never acts; io_uring's `RLIMIT_MEMLOCK` cap keeps the first loops of the plan in CPU order and can drop the CPU the rule meant to keep (a memlock of 4 gives 0, 1, 7 and 9); and the adaptive engine builds its io_uring standby when it first switches, from the counts of that moment, so its loop set can differ from the primary's. A handler that runs inline runs on a pinned thread and a process it starts inherits the pin: start it from a goroutine of its own, or mark the route `.Async()` (see `Config.AsyncHandlers`). Setting `AsyncHandlers` alone is not enough: a route that only inherits it runs inline until it is promoted.
-
-**NIC interrupts on big.LITTLE hosts** (epoll and io_uring, Linux, hosts whose allowed CPUs differ in capacity only; a host whose CPUs are alike reads nothing there). Once the engine has started its loops it finds the CPUs that service the interrupt vectors of the network interface the listener is reachable through (celeris#1036) and logs one Warn when a serviced CPU of the allowed set runs no loop and is either a little CPU, or a big CPU while no vector it found has a loop beside it. It only reports: it adds no loop, moves no loop and moves no interrupt, so the loops, `Metrics.Workers` and `NumWorkers()` are the ones described above on every host. The rule behind the Warn is the premise of the rx-port rule above: a loop stays beside a busy vector. On the host measured, CPUs 6 and 8 service the vectors of enp49s0 and run no loop in the default plan, and that plan is the measured one as long as CPU 1 keeps a loop beside IRQ 167; so a big CPU without a loop is not a reason to warn while another vector has a loop beside it, and with `Workers: 4` or a `GOMAXPROCS` of 4 (loops on 0, 1, 6 and 7, CPU 8 without one) nothing is logged. A little CPU runs no loop by design, so a vector serviced by one is always named. The CPUs the rx-port rule left without a loop on purpose are never named: a vector it listed, on a CPU it freed. What the Warn does on that host:
-
-- IRQ 167 on CPU 1, default `Workers` (the rule frees CPUs 6 and 8, loops on 0, 1, 7, 9, 10 and 11): no Warn.
-- IRQ 167 on little CPU 4 (the placement after boot; the rule steps aside, eight loops): the Warn names CPU 4 and IRQ 167. This is the case it exists for. If the 32-bit counter of IRQ 167 has wrapped and reads small, the rule still sees the vector busy (1000 interrupts) and steps aside, and the Warn names it whatever its share.
-- A `RLIMIT_MEMLOCK` cut of the io_uring loops: with a vector on a CPU that keeps a loop (IRQ 159 sits on CPU 0, which every cut keeps) no big CPU is named; with none, the CPU whose loop the cut dropped is.
-- A vector of another port on a CPU the rule freed is named; the rule's own vector on it is not.
-
-The report differs from the rule in what it reads: it does not read `rx_packets`, so any vector it found counts as "beside a loop", where the rule asks for a port with at least 10% of the packets. The interface is the one that owns the bound IP, or every up, non-loopback interface with a global address for a wildcard listener, followed through bond, team, VLAN, macvlan and bridge `lower_*` links to the physical devices; their vectors come from `/sys/class/net/<if>/device/msi_irqs` (else `device/irq`, else the names in `/proc/interrupts`), and the CPU of each from `/proc/irq/<n>/effective_affinity_list` (else a single-CPU `smp_affinity_list`; a vector whose CPU those files do not name is skipped, and the interrupt counts are never used to guess it: they are history). The files are world-readable and read once, a bounded number of them, and only when the logger shows a Warn (the rx-port rule reads them too, at planning, and this report reads them again after the loops started, so the two can differ if an interrupt moves between the reads); a file that cannot be read or a format that is not recognised leaves the report empty and nothing fails the start. A container with its own network namespace sees only a virtual interface and finds nothing. A server confined with `taskset` or a cpuset to the big CPUs sees a uniform set, reads nothing and logs nothing, even if a vector of its NIC is serviced by a little CPU. A serviced CPU outside the allowed set is named in the Info line (`nic_irq_cpus`) but not warned about: no loop of this process can run there.
-
-The measurement behind the Warn is one observation on one host, not a guarantee: on a bonded Realtek r8127 arm64 big.LITTLE host, with a TX-completion interrupt serviced by a CPU without a celeris loop, whole-port TX silences of about 200 ms were seen, and they were not seen after the interrupt was moved onto a CPU with a loop. An automatic extra loop on the little CPU was tried and rejected because it raised tail latency on other workloads, so the engine does not add one. Whether another host is affected, or the move helps it, is not known, and why the vector was on CPU 4 after boot is not known either (nothing shows that irqbalance put it there). The interrupt belongs to the host and is shared by every process, so moving it is the operator's choice, outside the process:
-
-- Move the interrupt onto a loop CPU that services no NIC vector; the Warn lists them (on the host measured, with the vector on CPU 4: 1, 7 and 9-11, not CPU 0, which carries IRQ 159, and not CPUs 6 and 8, which carry the vectors of enp49s0; CPU 1 is the placement that was measured). On 6 or 8 the rx-port rule would keep that CPU's loop at the next start and plan the loops 0, 1, 7, 8, 9, 10 and 11, which nobody measured, and two busy vectors would share a CPU. As root: `echo <cpu> > /proc/irq/<irq>/smp_affinity_list`. The setting is reversible (write the old CPU back), is lost on reboot unless made persistent (a boot-time unit or script that repeats the line), and irqbalance can move it again.
-- To keep irqbalance from moving it, ban the little CPUs from irqbalance's environment (`/etc/default/irqbalance` or `/etc/sysconfig/irqbalance`, depending on the distribution) and restart it. The variable is `IRQBALANCE_BANNED_CPULIST` (a CPU list) in current irqbalance and `IRQBALANCE_BANNED_CPUS` (a hex mask) in older versions; check the one your irqbalance documents.
-
-A vector is checked only if it carries traffic: in the one read of `/proc/interrupts` made at start (nothing is sampled and nothing sleeps) it must have taken at least 1000 interrupts since boot and at least 5% of the interrupts since boot of all the vectors of the listener's physical NICs (every vector of every port of a bond, whether or not its CPU is known); the one exception is a vector the rx-port rule stepped aside over, which counts at its floor of 1000 whatever its share. On the host measured the four busy vectors of the bond took 14% to 35% each and two others 3 interrupts, so any share from 0.00000003% up to 14% separates them; 5% and 1000 sit well inside that gap and are a choice, not a measurement. A vector with no interrupt, or under the floor or the share, is skipped and never warned about: the Info line counts them (`nic_irq_skipped`: 60 on that host, 58 that never fired and 2 with 3 interrupts) and a Debug line names the ones that took interrupts, with their CPU and count. Only the first 4096 vectors found are judged and counted. The Info line also carries `nic_irq_cpus` (the serviced CPUs) and `irq_took` (the time the reads took). The counts are since boot and the kernel prints them as 32-bit per CPU, which leaves blind spots in both directions. Missing a Warn: a server started at boot will most likely see every vector under 1000 interrupts and log nothing, while a restart later would; a counter that wrapped on the busy vector that matters reads small and can fall under 5% (it is still warned about when the rx-port rule stepped aside over it, but not where the rule does not run, such as an explicit `Workers` or a default count under the non-little CPUs, nor when it fell under 1000); a NIC balanced over more than about 20 evenly busy vectors puts each under 5% and gets no Warn (its Debug reason reads `none reaches the share/floor`). Warning about a vector that does not matter now: a vector that was busy long ago and is quiet now still qualifies, and a counter that wrapped on a busy vector of a big CPU shrinks the total and can lift another vector over 5%. If `/proc/interrupts` or the vectors of one port cannot be read, no vector is judged and nothing is logged beyond a Debug line. The report is made once, at start: an interrupt moved later (irqbalance, an interface restart, a reboot) is not followed, and a server started before its NIC is up (order it `After=network-online.target`) sees no vectors. The adaptive engine reports for each of its two engines when it builds them, the second at its first switch, possibly minutes later; the identical Warn (same logger, address and CPUs) is logged once and the repeat is a Debug line. There is no switch to turn the check off.
-
-`StreamWriter()` performs synchronous incremental writes on every engine. Async `Detach()` — keeping the connection alive after the handler returns — is native-engines-only (`EngineSupportsAsyncDetach()` is false on std, which closes the conn when the handler returns).
+- **Go 1.27.3+** (the `go` directive in `go.mod`); build with 1.27.4 or later: Go 1.27.3's `net/http` carries [GO-2026-6859](https://pkg.go.dev/vuln/GO-2026-6859) (an HTTP/1 server whose handler uses `MaxBytesReader` can crash), which matters for the std engine and for handlers you wrap with `celeris.Adapt`. celeris itself does not call `MaxBytesReader`.
+- **Linux** for the native engines; any OS for the std engine.
 
 ## Continuous validation
 
-Correctness is judged by [`goceleris/probatorium`](https://github.com/goceleris/probatorium), an adversarial matrix on a three-host cluster (x86-64 and arm64): every reference app (8, covering the middleware, streaming and the drivers) on every engine (`iouring`, `epoll`, `std`, `adaptive`) on both architectures, 64 cells per full matrix. Each cell takes session-shaped traffic, malformed HTTP/1.1, h2c-upgrade churn, WebSocket frame torture and killed SSE streams, while a per-second property loop checks invariants such as connection accounting, heap, goroutine and RSS growth, and unexpected panics.
-
-- **Nightly** (`matrix-nightly-tier`) and **Weekend soak** (`matrix-weekend-tier`, 24 h) run the full matrix; **Race** and **Checkptr** rebuild the reference apps with `-race` and the pointer checker; the **PR tier** (`matrix-pr-tier`) is a 10-minute matrix for probatorium pull requests that a maintainer labels `cluster-ok`. None of the tiers is a required check on celeris pull requests.
-- **The tiers are dispatched by hand.** Their schedules have been paused since 2026-09-15 to keep the cluster free for the v1.6.0 release validation, so there is no nightly cadence and no badge for them here. The latest runs and what each keeps are listed under [where the latest results live](https://github.com/goceleris/probatorium#where-the-latest-results-live).
-- **v1.6.0.** What the matrix says about the release commit: [[PLACEHOLDER: nightly, race, checkptr and 24 h soak verdicts on the release commit, run ids]].
-- **On every celeris pull request**, the required checks are Lint (which includes the `api/` golden-file check), Unit (the root module and the nested modules under `-race`), Conformance (the engines-by-protocols matrix in `test/conformance`), Driver Conformance against real PostgreSQL and Redis, Build on Linux and macOS, and a vulnerability check. Coverage, CodeQL and OpenSSF Scorecard also run on every push to `main`.
-
-## Project structure
-
-```
-api/            Golden files of the exported API, checked in CI
-celeristest/    Test helpers (NewContext, NewContextT, ResponseRecorder, With* options)
-cmd/celeris/    CLI launcher — validation / diagnostics entrypoint (see below)
-driver/         First-party event-loop database drivers (postgres, redis, memcached)
-internal/       Importable only under github.com/goceleris/celeris/:
-  adaptive/       Adaptive meta-engine (Linux)
-  driver/         Wire codecs of the drivers (redis RESP, postgres, memcached)
-  engine/         Engine interface + implementations (iouring, epoll, std)
-  probe/          System capability detection (kernel version, io_uring feature probe)
-  protocol/       Protocol parsers (h1, h2, detect)
-  resource/       Configuration, presets, defaults
-  ...             Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts, testhooks)
-magefiles/      Mage targets (build, test and release tasks)
-middleware/     In-tree middleware ecosystem (46 importable packages)
-observe/        Collector, CPUMonitor, Snapshot, EngineMetrics
-test/           Conformance, spec compliance, integration, benchmarks (drivercmp, benchcmp_ws, benchcmp_sse)
-validation/     Runtime invariant assertions + validation hooks (debug builds)
-```
-
-`cmd/celeris` is a minimal launcher around `celeris.New`, intended primarily as the entry point for validation soak runs; under the `validation` build tag it also streams assertion counters over a unix socket. Production deployments should embed `celeris.New` directly rather than depend on this binary.
-
-## Requirements
-
-- **Go 1.27.3+** (see the `go` directive in `go.mod`); build with 1.27.4 or later: Go 1.27.3's `net/http` carries [GO-2026-6859](https://pkg.go.dev/vuln/GO-2026-6859) (an HTTP/1 server whose handler uses `MaxBytesReader` can crash), which matters for the std engine and for handlers you wrap with `celeris.Adapt`. celeris itself does not call `MaxBytesReader`.
-- **Linux** for the io_uring / epoll / adaptive engines (kernel 5.19+ for io_uring; 5.10+ for epoll and adaptive, which stays on epoll below 6.1)
-- **Any OS** for the std engine
-- **Windows**: development and testing only, with the std engine and the portable driver fallback; see [Platform support](#platform-support)
-- Direct runtime dependencies: `golang.org/x/sys` and `golang.org/x/net` only (`golang.org/x/text` is indirect)
+[probatorium](https://github.com/goceleris/probatorium) runs every reference app on every engine on both architectures against malformed traffic, connection churn and fault injection, with invariants checked each second. On celeris pull requests the required checks are Lint (with the `api/` check), Unit, Conformance, Driver Conformance, Build and a vulnerability check. [[PLACEHOLDER: validation verdicts on the release commit, written at tag time]]
 
 ## Related projects
 
-Celeris is one of the [goceleris](https://github.com/goceleris) family:
-
-- **[celeris](https://github.com/goceleris/celeris)** — this repository: the HTTP engine, middleware, and drivers.
-- **[loadgen](https://github.com/goceleris/loadgen)** — the load generator that drives the cross-framework matrix.
-- **[probatorium](https://github.com/goceleris/probatorium)** — the adversarial correctness + performance bench harness.
-- **[docs](https://github.com/goceleris/docs)** — source for [goceleris.dev](https://goceleris.dev).
+- **[loadgen](https://github.com/goceleris/loadgen)**: the load generator behind the benchmarks.
+- **[probatorium](https://github.com/goceleris/probatorium)**: the benchmark and validation harness.
+- **[docs](https://github.com/goceleris/docs)**: the source of [goceleris.dev](https://goceleris.dev).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and pull-request guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
