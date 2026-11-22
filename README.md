@@ -1,3 +1,14 @@
+<!--
+HEADLINE ALTERNATIVES (decision pending; the rendered README keeps lead A until the release bot decides). Delete this block when decided.
+
+LEAD A (rendered now, in Performance):
+  "On plaintext GET with 1024 connections on linux/amd64, celeris's best configuration ranked first of [[PLACEHOLDER: N frameworks, v1.6.0 amd64 run]] frameworks: [[PLACEHOLDER: margin over the next server, v1.6.0 amd64 run]] ahead of the next server and [[PLACEHOLDER: ratio]] times net/http."
+
+LEAD B (bolder; use ONLY if every item of the checklist in the PR description holds in the v1.6.0 runs):
+  "celeris is the highest-throughput HTTP server we have measured: [[PLACEHOLDER: N frameworks, v1.6.0 amd64 run]] frameworks in 10 languages, including the C, C++, Rust and Java servers, on plaintext GET. [[PLACEHOLDER: conditions in the next sentence: row, 1024 connections, linux/amd64, run date, margins over gnet, fiber, net/http, lithium, h2o and actix, and the arm64 result in the same breath]]"
+  Never: "in the world", "fastest" without the field, or a ranking nobody measured.
+-->
+
 <p align="center">
   <img src=".github/cover.png" alt="celeris — the swift, load-bearing HTTP engine for Go">
 </p>
@@ -92,7 +103,7 @@ On plaintext GET with 1024 connections on linux/amd64, celeris's best configurat
 - On arm64, WebSocket echo p99 at light load on the epoll, io_uring and adaptive engines is 1.8 to 2.03 times that of the std engine in the same run (about 0.71 to 0.91 ms against 0.42 ms, one host, cause unknown, not closed in v1.6.0; [#755](https://github.com/goceleris/celeris/issues/755), [#1318](https://github.com/goceleris/celeris/issues/1318)).
 - Database rows are mixed: Redis pipelines with `AsyncHandlers` and memcached trail on arm64 ([#854](https://github.com/goceleris/celeris/issues/854), [#857](https://github.com/goceleris/celeris/issues/857)), loop-engine throughput on big.LITTLE arm64 is still being confirmed ([#1036](https://github.com/goceleris/celeris/issues/1036)), and WebSocket hub-broadcast p99 on amd64 is higher ([#858](https://github.com/goceleris/celeris/issues/858)).
 
-The figures come from a cross-framework benchmark of 52 configurations of 31 frameworks on dedicated x86-64 and arm64 machines, driven by one load generator ([loadgen](https://github.com/goceleris/loadgen)) from a separate host, and a cell is one run. [How the numbers are made](https://goceleris.dev/methodology/); [full results and how to read them](https://goceleris.dev/docs/results).
+The figures come from a cross-framework benchmark of 52 configurations of 31 frameworks on dedicated x86-64 and arm64 machines, driven by one load generator ([loadgen](https://github.com/goceleris/loadgen)) from a separate host, and a cell is one run. No tail-latency ranking is claimed from these runs: their latency passes carry a known load-generator limit ([loadgen#102](https://github.com/goceleris/loadgen/issues/102)). [How the numbers are made](https://goceleris.dev/methodology/); [full results and how to read them](https://goceleris.dev/docs/results).
 
 ## Status and stability
 
