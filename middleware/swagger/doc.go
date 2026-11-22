@@ -40,7 +40,12 @@
 // Subresource Integrity hash; Config.AssetsPath points the page at files
 // you serve yourself. Scalar and ReDoc are not embedded, to keep their
 // bundles out of every binary that imports this package: they need
-// Config.CDN or Config.AssetsPath, and [New] panics without one.
+// Config.CDN or Config.AssetsPath, and [New] panics without one. Scalar's
+// bundle asks fonts.scalar.com for its fonts unless told not to, a request to
+// a third party that carries the viewer's address and the page's Referer, so
+// the Scalar page sets its "withDefaultFonts" option to false unless
+// Config.Options names it. Scalar's request proxy, proxy.scalar.com, is used
+// only when Options sets "proxyUrl".
 //
 // The middleware has no built-in authentication; OpenAPI specs may expose
 // internal API structure, so place it after auth middleware to protect the
