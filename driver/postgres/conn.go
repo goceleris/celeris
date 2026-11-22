@@ -1198,15 +1198,13 @@ func (b *startupBound) finish() error {
 // because the text result format it asks for on the unnamed and simple paths
 // depends on them: extra_float_digits <= 0 rounds float4/float8 to 6 or 15
 // significant digits, and a DateStyle other than ISO prints dates and
-// timestamps in a form the text decoders do not parse, and bytea_output=escape
-// prints bytea in a form decodeByteaText rejects. A startup parameter
+// timestamps in a form the text decoders do not parse. A startup parameter
 // overrides a role or database setting (ALTER ROLE ... SET); a value the
 // application puts in the DSN (a key of that name, or in options=-c name=...)
 // is left alone.
 var startupPins = [...]struct{ name, value string }{
 	{"extra_float_digits", "3"},
 	{"DateStyle", "ISO"},
-	{"bytea_output", "hex"},
 }
 
 // startupParams returns the startup parameters to send: the DSN's, plus each

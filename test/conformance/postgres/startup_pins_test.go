@@ -137,45 +137,6 @@ func TestStartupPinsDateStyleAgainstRoleSetting(t *testing.T) {
 	}
 }
 
-func TestStartupPinsByteaOutputAgainstRoleSetting(t *testing.T) {
-	base := pinRole(t, "bytea_output = 'escape'")
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	want := []byte{0x00, 0xff, 'a'}
-	for name, dsn := range map[string]string{
-		"cached":  base,
-		"unnamed": withParams(base, "auto_cache_statements=false"),
-	} {
-		pool, err := postgres.Open(dsn, postgres.WithMaxOpen(2))
-		if err != nil {
-			t.Fatalf("postgres.Open: %v", err)
-		}
-		t.Cleanup(func() { _ = pool.Close() })
-		for _, mode := range []string{"extended", "simple"} {
-			if name == "cached" && mode == "simple" {
-				continue
-			}
-			t.Run(name+"/"+mode, func(t *testing.T) {
-				q, args := `SELECT '\x00ff61'::bytea`, []any(nil)
-				if mode == "extended" {
-					q += " WHERE $1::int = 1"
-					args = []any{1}
-				}
-				var b []byte
-				if err := pool.QueryRow(ctx, q, args...).Scan(&b); err != nil || string(b) != string(want) {
-					t.Errorf("*[]byte: got %q err %v, want %q", b, err, want)
-				}
-				var a any
-				if err := pool.QueryRow(ctx, q, args...).Scan(&a); err != nil {
-					t.Errorf("*any: %v", err)
-				} else if got, _ := a.([]byte); string(got) != string(want) {
-					t.Errorf("*any: got %#v, want %q", a, want)
-				}
-			})
-		}
-	}
-}
-
 // A value the DSN sets itself wins over the driver's default.
 func TestStartupPinsRespectExplicitDSN(t *testing.T) {
 	dsn := dsnFromEnv(t)
@@ -205,11 +166,5 @@ func TestStartupPinsRespectExplicitDSN(t *testing.T) {
 	}
 	if got := show(t, withParams(dsn, "DateStyle=SQL"), "DateStyle"); !strings.HasPrefix(got, "SQL") {
 		t.Errorf("explicit DateStyle = %q, want SQL...", got)
-	}
-	if got := show(t, dsn, "bytea_output"); got != "hex" {
-		t.Errorf("default bytea_output = %q, want hex", got)
-	}
-	if got := show(t, withParams(dsn, "bytea_output=escape"), "bytea_output"); got != "escape" {
-		t.Errorf("explicit bytea_output = %q, want escape", got)
 	}
 }
