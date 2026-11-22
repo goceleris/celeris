@@ -13,18 +13,18 @@ import (
 	"github.com/goceleris/celeris/middleware/sse"
 )
 
-// TestSendAfterPeerResetReturnsAnError891 pins the contract the Client.Send and
-// Client.WritePreparedEvent godoc state (celeris#891, umbrella item 168): on the
-// native engines over HTTP/1.1, once the client has reset the connection, a
-// handler that keeps writing sees a non-nil error from the write, an error that
-// wraps net.ErrClosed (the engine's closed-connection report, celeris#1067) or
-// the stream context's cancellation (Client.Context, which a reset also
-// cancels). Before #1067 such a write was dropped without an error; the godoc
-// still said so.
+// TestSendAfterPeerResetReturnsAnError891 pins what the Client.Send and
+// Client.WritePreparedEvent godoc state (celeris#891, umbrella item 168): over
+// HTTP/1.1 on the epoll and io_uring engines, a handler that ignores
+// Client.Context and keeps writing sees a non-nil error from the write once the
+// client has reset the connection, instead of writes that go on succeeding.
 //
-// The handler ignores Client.Context on purpose and writes until a write fails,
-// so the error it records is the one a caller that never looks at the context
-// gets.
+// In every cell the error is the cancelled context: both writers check the
+// stream context before writing, and a reset cancels it through the engine's
+// OnError / OnDetachClose callbacks (celeris#494). So this test does not
+// exercise the write itself failing with an error that wraps net.ErrClosed
+// (conn.ErrConnClosed, celeris#1067); that error is accepted below because the
+// godoc names it, but a reset in this test never reaches it.
 func TestSendAfterPeerResetReturnsAnError891(t *testing.T) {
 	type writer struct {
 		name  string
