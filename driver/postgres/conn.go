@@ -1194,56 +1194,6 @@ func (b *startupBound) finish() error {
 	return b.err
 }
 
-// startupPins are the session settings the driver fixes in the StartupMessage
-// because the text result format it asks for on the unnamed and simple paths
-// depends on them: extra_float_digits <= 0 rounds float4/float8 to 6 or 15
-// significant digits, and a DateStyle other than ISO prints dates and
-// timestamps in a form the text decoders do not parse. A startup parameter
-// overrides a role or database setting (ALTER ROLE ... SET); a value the
-// application puts in the DSN (a key of that name, or in options=-c name=...)
-// is left alone.
-var startupPins = [...]struct{ name, value string }{
-	{"extra_float_digits", "3"},
-	{"DateStyle", "ISO"},
-}
-
-// startupParams returns the startup parameters to send: the DSN's, plus each
-// of [startupPins] the DSN does not set itself. It never modifies dsnParams.
-func startupParams(dsnParams map[string]string) map[string]string {
-	var out map[string]string
-	for _, pin := range startupPins {
-		if dsnSetsParam(dsnParams, pin.name) {
-			continue
-		}
-		if out == nil {
-			out = make(map[string]string, len(dsnParams)+len(startupPins))
-			for k, v := range dsnParams {
-				out[k] = v
-			}
-		}
-		out[pin.name] = pin.value
-	}
-	if out == nil {
-		return dsnParams
-	}
-	return out
-}
-
-// dsnSetsParam reports whether the DSN sets the named runtime parameter,
-// either as its own key or inside options (-c name=value). Names are case
-// insensitive, as in the server.
-func dsnSetsParam(params map[string]string, name string) bool {
-	for k, v := range params {
-		if strings.EqualFold(k, name) {
-			return true
-		}
-		if strings.EqualFold(k, "options") && strings.Contains(strings.ToLower(v), strings.ToLower(name)) {
-			return true
-		}
-	}
-	return false
-}
-
 // doStartup performs the full startup handshake synchronously: the optional
 // authentication exchange, ParameterStatus and BackendKeyData, up to
 // ReadyForQuery. The event loop delivers bytes to onRecv, which drives the
@@ -1260,7 +1210,7 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 		User:     c.dsn.User,
 		Password: c.dsn.Password,
 		Database: c.dsn.Database,
-		Params:   startupParams(c.dsn.Params),
+		Params:   c.dsn.Params,
 	}
 	initial := c.buildMessage(func(w *protocol.Writer) []byte { return st.Start(w) })
 	req := &pgRequest{
