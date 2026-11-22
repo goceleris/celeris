@@ -38,6 +38,10 @@ func TestNativeScanVersionedTextTypes(t *testing.T) {
 		{"text", `'plain'::text`, "plain", false},
 		{"bytea", `'abc'::bytea`, "abc", false},
 		{"int4", `123::int4`, "123", false},
+		{"date", `'2026-01-02'::date`, "2026-01-02T00:00:00Z", false},
+		{"timestamp", `'2026-01-02 03:04:05'::timestamp`, "2026-01-02T03:04:05Z", false},
+		{"timestamptz", `'2026-01-02 03:04:05+00'::timestamptz`, "2026-01-02T03:04:05Z", false},
+		{"numeric-inf", `'-Infinity'::numeric`, "-Infinity", false},
 	}
 	for _, mode := range []string{"simple", "extended"} {
 		for _, c := range cols {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
@@ -225,5 +226,72 @@ func TestScanRawNullClearsDest(t *testing.T) {
 	s := "stale"
 	if err := scanRaw(&s, nil, codec, col, false); err != nil || s != "" {
 		t.Errorf("*string: got %q err %v, want empty", s, err)
+	}
+}
+
+// Times scanned into string / []byte take the RFC 3339 form database/sql
+// uses, not Go's "%v" form and not an error.
+func TestScanRawTimesAsRFC3339(t *testing.T) {
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 123456000, time.UTC)
+	for _, tc := range []struct {
+		name string
+		oid  uint32
+		in   time.Time
+		want string
+	}{
+		{"date", protocol.OIDDate, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), "2026-01-02T00:00:00Z"},
+		{"timestamp", protocol.OIDTimestamp, ts, "2026-01-02T03:04:05.123456Z"},
+		{"timestamptz", protocol.OIDTimestamptz, ts, "2026-01-02T03:04:05.123456Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			codec := protocol.LookupOID(tc.oid)
+			raw, err := codec.EncodeBinary(nil, tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			col := protocol.ColumnDesc{TypeOID: tc.oid, FormatCode: protocol.FormatBinary}
+			var s string
+			if err := scanRaw(&s, raw, codec, col, false); err != nil || s != tc.want {
+				t.Errorf("*string: got %q err %v, want %q", s, err, tc.want)
+			}
+			var b []byte
+			if err := scanRaw(&b, raw, codec, col, false); err != nil || string(b) != tc.want {
+				t.Errorf("*[]byte: got %q err %v, want %q", b, err, tc.want)
+			}
+		})
+	}
+}
+
+// Arrays decode to []driver.Value; scanning one into a string must fail
+// loudly (as database/sql does) instead of formatting Go's "%v" of the
+// element bytes ("[[123 34 97 ...]]").
+func TestScanRawArrayIntoStringErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		oid   uint32
+		elem  uint32
+		elems [][]byte
+	}{
+		{"jsonb[]", testOIDJSONBArr, protocol.OIDJSONB, [][]byte{[]byte("\x01{\"a\": 1}")}},
+		{"int4[]", protocol.OIDInt4Arr, protocol.OIDInt4, [][]byte{{0, 0, 0, 1}, {0, 0, 0, 2}}},
+		{"text[]", protocol.OIDTextArr, protocol.OIDText, [][]byte{[]byte("a"), []byte("b c")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			codec := protocol.LookupOID(tc.oid)
+			raw := binaryArray(tc.elem, tc.elems...)
+			col := protocol.ColumnDesc{TypeOID: tc.oid, FormatCode: protocol.FormatBinary}
+			var s string
+			if err := scanRaw(&s, raw, codec, col, false); err == nil {
+				t.Errorf("*string: got %q, want an error", s)
+			}
+			var b []byte
+			if err := scanRaw(&b, raw, codec, col, false); err == nil {
+				t.Errorf("*[]byte: got %q, want an error", b)
+			}
+			var a any
+			if err := scanRaw(&a, raw, codec, col, false); err != nil {
+				t.Errorf("*any: %v", err)
+			}
+		})
 	}
 }

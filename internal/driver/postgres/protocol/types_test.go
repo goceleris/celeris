@@ -335,6 +335,9 @@ func TestNumericDecode(t *testing.T) {
 		{[]byte{0, 0, 0, 0, 0, 0, 0, 0}, "0"},
 		// NaN
 		{[]byte{0, 0, 0, 0, 0xC0, 0, 0, 0}, "NaN"},
+		// +Infinity / -Infinity (PostgreSQL 14+): sign 0xD000 / 0xF000
+		{[]byte{0, 0, 0, 0, 0xD0, 0, 0, 0}, "Infinity"},
+		{[]byte{0, 0, 0, 0, 0xF0, 0, 0, 0}, "-Infinity"},
 		// 123: ndigits=1, weight=0, sign=0, dscale=0, digit=0x007B (123)
 		{[]byte{0, 1, 0, 0, 0, 0, 0, 0, 0, 123}, "123"},
 		// -1: ndigits=1, weight=0, sign=0x4000, dscale=0, digit=1
