@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -27,6 +29,48 @@ const (
 	pgDateInfinity         = int32(math.MaxInt32)
 	pgDateNegInfinity      = int32(math.MinInt32)
 )
+
+// -------------------- BC text forms --------------------
+
+// bcCycleYears is a multiple of 400, the length of the Gregorian calendar
+// cycle, so shifting a date by it keeps every month length and leap day.
+const bcCycleYears = 4800
+
+// splitBC reports whether the text form s ends in PostgreSQL's era suffix
+// " BC" and returns s without it. PostgreSQL prints a date or timestamp before
+// 1 AD as "YYYY-MM-DD BC" / "YYYY-MM-DD HH:MM:SS[.f][+tz] BC" with the year
+// counted from 1 BC.
+func splitBC(s string) (string, bool) {
+	return strings.CutSuffix(s, " BC")
+}
+
+// bcToCycle rewrites the text form of a BC value, whose year field is N (N BC),
+// to the same calendar position in an AD year that time.Parse accepts: Go's
+// astronomical year is 1-N, and bcCycleYears is added to make it positive.
+// 0045-02-29 BC (astronomical -44, a leap year) becomes year 4756, also a leap
+// year, so a leap day still parses. fromCycle undoes the shift on the parsed
+// time. N must be 1 to 4800 (PostgreSQL's earliest date is 4713 BC); there is
+// no year 0 BC in the text form, so "0000 BC" is an error.
+func bcToCycle(s string) (string, error) {
+	i := strings.IndexByte(s, '-')
+	if i < 1 || i > 5 {
+		return "", errBCYear
+	}
+	n, err := strconv.Atoi(s[:i])
+	if err != nil || n < 1 || n > bcCycleYears {
+		return "", errBCYear
+	}
+	y := strconv.Itoa(1 - n + bcCycleYears)
+	return strings.Repeat("0", 4-len(y)) + y + s[i:], nil
+}
+
+var errBCYear = fmt.Errorf("postgres/protocol: invalid BC year")
+
+// fromCycle maps a time parsed from bcToCycle's output back to the Go
+// (astronomical) year, keeping the zone.
+func fromCycle(t time.Time) time.Time {
+	return t.AddDate(-bcCycleYears, 0, 0)
+}
 
 // -------------------- date --------------------
 
@@ -51,6 +95,17 @@ func decodeDateText(src []byte) (driver.Value, error) {
 		return PGInfinity, nil
 	case "-infinity":
 		return PGNegInfinity, nil
+	}
+	if body, bc := splitBC(s); bc {
+		shifted, err := bcToCycle(body)
+		if err != nil {
+			return nil, fmt.Errorf("postgres/protocol: date text %q: %w", src, err)
+		}
+		t, err := time.Parse("2006-01-02", shifted)
+		if err != nil {
+			return nil, fmt.Errorf("postgres/protocol: date text %q: %w", src, err)
+		}
+		return fromCycle(t), nil
 	}
 	t, err := time.Parse("2006-01-02", s)
 	if err != nil {
@@ -132,11 +187,22 @@ func decodeTimestampText(src []byte) (driver.Value, error) {
 		return PGNegInfinity, nil
 	}
 	// Text form lacks timezone; parse as UTC.
+	body, bc := splitBC(s)
+	if bc {
+		shifted, err := bcToCycle(body)
+		if err != nil {
+			return nil, fmt.Errorf("postgres/protocol: timestamp text %q: %w", src, err)
+		}
+		body = shifted
+	}
 	for _, layout := range []string{
 		"2006-01-02 15:04:05.999999",
 		"2006-01-02 15:04:05",
 	} {
-		if t, err := time.ParseInLocation(layout, s, time.UTC); err == nil {
+		if t, err := time.ParseInLocation(layout, body, time.UTC); err == nil {
+			if bc {
+				t = fromCycle(t)
+			}
 			return t, nil
 		}
 	}
@@ -151,14 +217,26 @@ func decodeTimestamptzText(src []byte) (driver.Value, error) {
 	case "-infinity":
 		return PGNegInfinity, nil
 	}
+	body, bc := splitBC(s)
+	if bc {
+		shifted, err := bcToCycle(body)
+		if err != nil {
+			return nil, fmt.Errorf("postgres/protocol: timestamptz text %q: %w", src, err)
+		}
+		body = shifted
+	}
 	for _, layout := range []string{
 		"2006-01-02 15:04:05.999999Z07:00",
 		"2006-01-02 15:04:05Z07:00",
 		"2006-01-02 15:04:05.999999-07",
 		"2006-01-02 15:04:05-07",
 	} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t.UTC(), nil
+		if t, err := time.Parse(layout, body); err == nil {
+			t = t.UTC()
+			if bc {
+				t = fromCycle(t)
+			}
+			return t, nil
 		}
 	}
 	return nil, fmt.Errorf("postgres/protocol: timestamptz text %q", src)
