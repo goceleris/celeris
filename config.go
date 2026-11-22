@@ -120,7 +120,27 @@ type Config struct {
 	// Engine is the I/O engine (default Adaptive on Linux, Std elsewhere).
 	Engine EngineType
 
-	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
+	// Workers is the number of I/O worker goroutines (the loops of the native
+	// engines). Default: GOMAXPROCS, less a reserve on Linux: with Workers unset
+	// the native engines (epoll, io_uring, adaptive) on a host whose allowed
+	// CPUs are alike start GOMAXPROCS - max(1, GOMAXPROCS/8) loops (no reserve
+	// for a GOMAXPROCS of 2 or less): 28 on 32, 14 on 16, 7 on 8, 3 on 4, 2 on
+	// 3. A loop locks its thread and can block in the kernel while it holds its
+	// P, so the Ps that run no loop are left to the goroutines that are not
+	// loops (async and WebSocket handlers, the HTTP/2 stream pool, the garbage
+	// collector's workers). That mechanism is inferred from traces, not
+	// established; the reserve is provisional, its effect on latency is still
+	// being measured, and it may change (celeris#756, #757). A Workers you set
+	// is honoured as it is, so to opt out of the reserve set Workers to
+	// runtime.GOMAXPROCS(0): on such a host that starts one loop per P, as
+	// before the reserve (on a big.LITTLE host the default is not reduced, see
+	// below, and a Workers set above the non-little CPUs wraps loops over
+	// them). What follows the loop count follows the loops started: Metrics.Workers,
+	// the server-wide limit of MaxConns, and a driver pool sized from the
+	// engine's NumWorkers (a PostgreSQL pool opened with WithEngine, whose
+	// default of 4*NumWorkers is 56, not 64, on 16 CPUs). A pool sized from
+	// GOMAXPROCS or the standalone driver loop (Redis commands, Memcached with
+	// the native engines) is unchanged.
 	//
 	// On Linux the native engines (epoll, io_uring) pin each loop to one CPU
 	// the process is allowed to use. On a host whose allowed CPUs differ in
@@ -225,8 +245,9 @@ type Config struct {
 	// host, one observation); an automatic extra loop on the little CPU was
 	// tried and rejected because it raised tail latency on other workloads.
 	// Moving the interrupt is the host operator's call (README, "NIC interrupts
-	// on big.LITTLE hosts"). Hosts whose CPUs are alike are unchanged and read no
-	// NIC file (README, "CPU pinning").
+	// on big.LITTLE hosts"). Hosts whose CPUs are alike read no
+	// NIC file; the reserve above is their only difference (README, "CPU
+	// pinning").
 	Workers int
 
 	// WorkloadHint optionally declares the expected steady-state concurrency.
@@ -712,7 +733,42 @@ type Config struct {
 	// throughput is unaffected. NOTE: SetMemoryLimit is PROCESS-GLOBAL, so
 	// this is opt-in only — set it when celeris owns the process (e.g. a
 	// dedicated server binary). See [DeriveMemoryLimit] for a sized default.
+	// The same stance holds for [Config.GCPercent]: celeris changes no
+	// process-global runtime setting unless you opt in by setting the field.
+	// Unlike GCPercent, this limit is NOT put back when the server stops.
 	MemoryLimitBytes int64
+
+	// GCPercent is an OPTIONAL garbage-collector target, applied via
+	// runtime/debug.SetGCPercent when the server starts (the same knob as the
+	// GOGC environment variable). 0 = unset: celeris does not touch the
+	// process GC, so embedders, GOGC and [Config.MemoryLimitBytes] keep full
+	// control; that is the default. A value above 0 is applied at Start,
+	// never at init, and it wins over GOGC. A negative value is refused by
+	// validation, because it would switch the collector off.
+	//
+	// Why it exists: a large-message WebSocket echo allocates on every
+	// message, and a GC cycle that starts while the loops are busy can hold
+	// the free Ps the handlers need, which lifts the p99. A larger target
+	// means fewer cycles. In a cluster measurement of that workload (amd64,
+	// epoll engine, GOGC=400 set through the environment, not through this
+	// field), the p99 tail came much closer to net/http at high load. The
+	// cost is memory: peak resident memory was noticeably higher, and p99 at
+	// low load was slightly worse. Consider pairing it with a soft ceiling,
+	// [Config.MemoryLimitBytes] or GOMEMLIMIT, when memory is bounded; that
+	// pairing was not measured, and a ceiling close to the live heap brings
+	// the frequent GC cycles back, which undoes the gain.
+	//
+	// NOTE: SetGCPercent is PROCESS-GLOBAL, so this is opt-in only: set it
+	// when celeris owns the process (for example a dedicated server binary).
+	// Unlike [Config.MemoryLimitBytes], which is never undone, GCPercent is
+	// restored: the target that was in force before the first opted-in server
+	// started is put back when the last opted-in server in the process stops
+	// (Shutdown, a failed start, or a Start that returns without one), but
+	// only if the process target is still the last value celeris wrote;
+	// a value set by other code is left alone. While several opted-in servers
+	// run in one process, the last value written stays in force, whichever
+	// server stops first.
+	GCPercent int
 
 	// DisableMetrics disables the built-in metrics collector. When true,
 	// [Server.Collector] returns nil and per-request metric recording is skipped.
@@ -783,14 +839,15 @@ type Config struct {
 	// answer) runs the global middleware ([Server.Use]) and any NotFound /
 	// MethodNotAllowed handler. With this set it is dispatched like a route
 	// that inherits this default: inline until a timed run of that chain
-	// blocks, then async. All unmatched requests share that one state, and a
-	// run of fast ones settles it as it settles a route; from then on an
-	// unmatched request whose chain blocks runs inline on the engine worker,
-	// holding every connection on it, unless it is the one timed after a
-	// settle re-open. With this unset it always runs inline, even when
-	// routes are .Async(). So a global middleware that can block (a remote
-	// session store, an auth upstream, pprof's profile) can hold a worker
-	// for unmatched requests; mount it on .Async() routes where that matters.
+	// blocks, then async. All unmatched requests share that one state, and
+	// unlike a route's it never settles: every unmatched request is timed
+	// (two clock reads), so a blocking one is caught however many fast ones
+	// came before it, though the first such request still runs inline and
+	// holds its worker until it returns. With this unset it always runs
+	// inline, even when routes are .Async(). So a global middleware that can
+	// block (a remote session store, an auth upstream, pprof's profile) can
+	// hold a worker for unmatched requests; mount it on .Async() routes where
+	// that matters.
 	//
 	// DRIVERS: celeris drivers opened WithEngine(srv) pick their netpoll-park
 	// fast path from the server's EFFECTIVE async state — true when this flag
@@ -831,7 +888,10 @@ type Config struct {
 	// It runs on the event-loop goroutine on the native engines, whether the
 	// connection's routes are [Route.Async] or not, so it must not call
 	// runtime.Goexit: that ends the loop for good and the engine only logs an
-	// Error (see [Route.Sync]).
+	// Error (see [Route.Sync]). The [Std] engine runs it on a helper goroutine
+	// the accept path waits for, so a Goexit there ends only that helper and is
+	// logged as an Error: the connection proceeds and the engine keeps
+	// accepting.
 	OnConnect func(addr string)
 	// OnDisconnect is called when a connection is closed. The addr is the
 	// remote peer address. Must be fast — blocks the event loop.
@@ -971,6 +1031,8 @@ func (c Config) toResourceConfig() resource.Config {
 		rc.Resources.MaxConns = c.MaxConns
 	}
 	rc.Resources.MemoryLimitBytes = c.MemoryLimitBytes
+	// Not behind a "> 0" guard, so that Validate sees a negative target.
+	rc.Resources.GCPercent = c.GCPercent
 	rc.Resources.WorkloadHint = resource.WorkloadHint(c.WorkloadHint)
 
 	rc.MaxRequestBodySize = c.MaxRequestBodySize

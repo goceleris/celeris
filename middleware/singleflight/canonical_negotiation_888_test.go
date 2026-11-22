@@ -167,7 +167,7 @@ func TestCanonicalAcceptEncodingIsTheNegotiatorsReading888(t *testing.T) {
 			return false
 		}
 		for i := range a {
-			if a[i].MediaType != b[i].MediaType || (a[i].Quality != b[i].Quality && !(a[i].Quality != a[i].Quality && b[i].Quality != b[i].Quality)) {
+			if a[i].MediaType != b[i].MediaType || a[i].Params != b[i].Params || (a[i].Quality != b[i].Quality && !(a[i].Quality != a[i].Quality && b[i].Quality != b[i].Quality)) {
 				return false
 			}
 		}
@@ -235,5 +235,37 @@ func TestQueryNeverJoinsTheValidatorsLeader888(t *testing.T) {
 		"/doc", []celeristest.Option{celeristest.WithQuery("nm", "abc")})
 	if r.joined || r.calls != 2 || !strings.HasPrefix(string(r.second.Body), "q=abc ") {
 		t.Errorf("GET /doc?nm=abc: %q joined=%v runs %d, want its own response and 2 runs", r.second.Body, r.joined, r.calls)
+	}
+}
+
+// TestCanonicalAcceptEncodingKeepsParameterEntries888: an entry with a
+// parameter other than the weight ranks below the same coding without one, so
+// "gzip;foo=1;q=0, gzip" is answered gzip and "gzip;q=0, gzip" is answered
+// nothing. They must not share a key (a waiter would get an encoding it
+// refused), and spellings of one value still do.
+func TestCanonicalAcceptEncodingKeepsParameterEntries888(t *testing.T) {
+	differ := [][2]string{
+		{"gzip;foo=1;q=0, gzip", "gzip;q=0, gzip"},
+		{"gzip;foo=1", "gzip"},
+		{"gzip;foo=1;q=0.5", "gzip;q=0.5"},
+		{"gzip, br;level=1", "gzip, br"},
+	}
+	for _, p := range differ {
+		if sameCanonical("accept-encoding", canonicalValue("accept-encoding", p[0]), p[1]) {
+			t.Errorf("Accept-Encoding %q and %q share a key", p[0], p[1])
+		}
+	}
+	// The pair of the first row is the reason: the negotiator tells them apart.
+	if a, b := negotiate.Accept(differ[0][0], []string{"gzip"}), negotiate.Accept(differ[0][1], []string{"gzip"}); a != "gzip" || b != "" {
+		t.Errorf("negotiator answers %q and %q, want gzip and nothing", a, b)
+	}
+	same := [][2]string{
+		{"gzip;foo=1;q=0, gzip", "GZIP; foo=2; q=0,gzip"},
+		{"gzip;foo=1", "gzip;bar=2"},
+	}
+	for _, p := range same {
+		if !sameCanonical("accept-encoding", canonicalValue("accept-encoding", p[0]), p[1]) {
+			t.Errorf("Accept-Encoding %q and %q do not share a key", p[0], p[1])
+		}
 	}
 }

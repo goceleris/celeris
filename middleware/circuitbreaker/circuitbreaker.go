@@ -73,6 +73,20 @@ func (b *Breaker) Reset() {
 	}
 }
 
+// unmatched reports whether no route matched the request: the router answers
+// it (a 404, a 405, or the automatic OPTIONS answer) and runs the middleware
+// mounted with Server.Use on the way, with the sentinel FullPath documented on
+// [celeris.Context.FullPath]. Such a request reaches no downstream, so it is
+// neither refused nor counted: a 404 for /favicon.ico is no sign that the
+// downstream recovered, and must not close a HalfOpen breaker (celeris#888).
+func unmatched(c *celeris.Context) bool {
+	switch c.FullPath() {
+	case "<unmatched>", "<method-not-allowed>", "<options>":
+		return true
+	}
+	return false
+}
+
 // New creates a circuit breaker middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
 	mw, _ := NewWithBreaker(config...)
@@ -103,9 +117,10 @@ func NewWithBreaker(config ...Config) (celeris.HandlerFunc, *Breaker) {
 	}
 
 	errHandler := cfg.ErrorHandler
+	countUnmatched := cfg.CountUnmatched
 
 	handler := func(c *celeris.Context) error {
-		if skip.ShouldSkip(c) {
+		if skip.ShouldSkip(c) || (!countUnmatched && unmatched(c)) {
 			return c.Next()
 		}
 

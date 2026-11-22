@@ -1766,6 +1766,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// is handled exactly as the body's own (an h2c upgrade
 				// request pipelined behind the body is the case that was
 				// once closed instead, celeris#885).
+				// The tail's requests came in with this read: stamp it, not
+				// the read that carried the headers of the body's request
+				// (celeris#885).
+				cs.h1State.NowNs = now
 				verdict = conn.ProcessH1(cs.ctx, rest, cs.h1State, l.handler, cs.writeFn)
 			}
 			if verdict != nil {
@@ -3770,6 +3774,14 @@ func (l *Loop) serveAsync(cs *connState, holds *dispatchHolds) {
 				l.enqueueDetach(cs)
 			}
 			return
+		}
+		// The request's start stamp: the loop writes H1State.NowNs only for a
+		// read it makes itself, and this conn's reads go to this goroutine, so
+		// the stamp was the instant of the conn's last inline read, however
+		// long ago (celeris#885). One clock read per feed, not per frame of a
+		// detached conn (it takes no detachMu here: its requests are over).
+		if acquiredDetachMu && cs.h1State != nil {
+			cs.h1State.NowNs = mono.Now()
 		}
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
 		// H1→H2 upgrade on the async path. ProcessH1 has written the

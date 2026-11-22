@@ -721,7 +721,11 @@ func (c *Context) Protocol() string {
 // name of the weight, "q" or "Q", is not case-sensitive. Of the encodings with
 // the highest weight, the one whose entry comes first in the header wins, and
 // then the first offer: "*, gzip" gives gzip for [gzip, br] and br for
-// [br, gzip].
+// [br, gzip]. The deprecated names "x-gzip" and "x-compress" are read as
+// "gzip" and "compress" (RFC 9110 8.4.1.3), in the header and in the offers:
+// "x-gzip" accepts the offer "gzip", and "gzip;q=0, *" refuses it whichever
+// name the client used. A parameter other than the weight on an entry
+// ("gzip;foo=1") ranks that entry below the same coding written without one.
 func (c *Context) AcceptsEncodings(offers ...string) string {
 	c.varyOn("Accept-Encoding")
 	return negotiate.Accept(c.Header("accept-encoding"), offers)

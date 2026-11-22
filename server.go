@@ -71,6 +71,11 @@ type Server struct {
 	cpuMon   cpumon.Monitor
 	cpuMonMu sync.Mutex
 
+	// gc records the process GC target this server changed through
+	// Config.GCPercent, so shutdown (or a failed start) can put it back. See
+	// gcpercent.go.
+	gc gcPercentState
+
 	// listenCancel cancels the context handed to Engine.Listen by the
 	// Start* entry points; Shutdown calls it once the engine's graceful
 	// phase is over. Without it Start/StartWithListener never return on
@@ -549,6 +554,10 @@ func (s *Server) listenContext(parent context.Context) (context.Context, context
 		cancel()
 		s.router.stopSettleReopener()
 		s.closeCPUMonitor()
+		// Config.GCPercent (celeris#756): a Start* that ends without a
+		// Shutdown to come (Listen failed to bind, say) puts the GC target
+		// back too. Idempotent, like the two releases above.
+		s.gc.restore()
 	}
 }
 
@@ -785,6 +794,7 @@ func (s *Server) shutdown(ctx context.Context) error {
 	if eng == nil {
 		s.cancelListen()
 		s.closeCPUMonitor()
+		s.gc.restore()
 		return nil
 	}
 	err := eng.Shutdown(ctx)
@@ -809,6 +819,7 @@ func (s *Server) shutdown(ctx context.Context) error {
 		err = werr
 	}
 	s.closeCPUMonitor()
+	s.gc.restore()
 	for _, fn := range s.shutdownHooks {
 		func() {
 			defer func() { _ = recover() }()
@@ -1167,11 +1178,15 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 		if lim := cfg.Resources.MemoryLimitBytes; lim > 0 {
 			debug.SetMemoryLimit(lim)
 		}
+		// Optional process-global GC target (celeris#756), opt-in like the
+		// memory limit above; Shutdown puts the previous value back.
+		s.gc.apply(cfg.Resources.GCPercent)
 
 		var err error
 		eng, err = createEngine(cfg, handler, cpuMon)
 		if err != nil {
 			s.startErr = fmt.Errorf("create engine: %w", err)
+			s.gc.restore()
 			// celeris#737: only Shutdown closes the monitor, and a caller
 			// whose Start failed has no reason to call it, so the
 			// /proc/stat descriptor opened above would stay open.

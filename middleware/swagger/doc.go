@@ -52,6 +52,31 @@
 //
 //	server.Use(swagger.New(swagger.Config{SpecContent: spec}))
 //
+// # Compression
+//
+// The embedded files are sent as they are, not precompressed, and the page
+// loads swagger-ui-bundle.js (about 1.5 MiB), swagger-ui-standalone-preset.js
+// and swagger-ui.css (about 2 MB for the three). Behind the compress middleware
+// every request for one of them is compressed again: compress keeps no result
+// cache and has no size cap, so a request for the bundle costs from several
+// to tens of milliseconds of CPU, the most with brotli, and runs on the
+// worker that serves it. Browsers keep these files for a year
+// (the URL carries the version), but any client can request the bundle without
+// that. Leave the assets out of compress with its Skip option:
+//
+//	server.Use(compress.New(compress.Config{
+//		Skip: func(c *celeris.Context) bool {
+//			return strings.HasPrefix(c.Path(), "/docs/assets/")
+//		},
+//	}))
+//	server.Use(swagger.New(swagger.Config{BasePath: "/docs", SpecContent: spec}))
+//
+// (SkipPaths matches whole paths only.) A CDN or reverse proxy in front that
+// caches and compresses once is the other way. Config.CDN loads the files from
+// jsDelivr instead; with Config.AssetsPath the page loads them from wherever you
+// serve them, which costs the same if that is this process behind compress, so
+// skip that prefix too or serve the files precompressed.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/middleware-content

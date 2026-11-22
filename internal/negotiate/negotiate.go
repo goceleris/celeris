@@ -10,6 +10,11 @@ import (
 type AcceptItem struct {
 	MediaType string
 	Quality   float64
+	// Params is true when the entry carried a parameter other than the
+	// weight ("text/html;level=1", "gzip;foo=1"). Such an entry is less
+	// specific than the same type without parameters when an offer
+	// without parameters is weighed (see [Accept]).
+	Params bool
 }
 
 // Accept returns the best matching offer based on the Accept header value.
@@ -26,6 +31,12 @@ type AcceptItem struct {
 // (RFC 9110 12.5.1): the offer it decides is not returned, even when a less
 // specific entry would accept it. Where two entries are equally specific (a
 // repeated entry), q=0 wins, and otherwise the higher q-value does.
+//
+// An offer is a name or a type without parameters, so an entry that names it
+// with parameters ("text/html;level=1") is less specific than one that names it
+// without: "text/html;level=1;q=0, text/html" refuses the level-1 variant and
+// accepts text/html. An entry with parameters still outranks every wildcard
+// (RFC 9110 12.5.1 asks for the most specific range; celeris#888).
 //
 // Of the acceptable offers the highest q-value is chosen. Offers with the same
 // q-value are ranked by the earliest entry of the header that matches them and
@@ -51,7 +62,7 @@ func Accept(header string, offers []string) string {
 	bestQ := -1.0
 	bestIdx := len(entries) // higher = worse; prefer earlier Accept entries on tie
 	for _, offer := range offers {
-		lo := strings.ToLower(offer)
+		lo := coding(strings.ToLower(offer))
 		q, idx := offerQuality(entries, lo, specBuf[:])
 		if q <= 0 {
 			continue
@@ -79,7 +90,7 @@ func Accept(header string, offers []string) string {
 func offerQuality(entries []AcceptItem, offer string, specs []int8) (q float64, idx int) {
 	bestSpec := 0
 	for i, e := range entries {
-		spec := matchSpecificity(e.MediaType, offer)
+		spec := matchSpecificity(e, offer)
 		if i < len(specs) {
 			specs[i] = int8(spec)
 		}
@@ -107,28 +118,36 @@ func offerQuality(entries []AcceptItem, offer string, specs []int8) (q float64, 
 			if specs[i] != 0 {
 				return q, i
 			}
-		} else if matchSpecificity(e.MediaType, offer) != 0 {
+		} else if matchSpecificity(e, offer) != 0 {
 			return q, i
 		}
 	}
 	return q, idx
 }
 
-// matchSpecificity is 0 when the pattern does not match the offer, and
-// otherwise how specific the pattern is: 1 for "*" and "*/*", 2 for "type/*",
-// 3 for a name or a full type. Both are lowercase.
-func matchSpecificity(pattern, offer string) int {
+// matchSpecificity is 0 when the entry does not match the offer, and
+// otherwise how specific the entry is: 2 for "*" and "*/*", 4 for "type/*",
+// 6 for a name or a full type, each one less for an entry that carries
+// parameters (1, 3, 5), so that it ranks below the same range without them and
+// above the range below it. Both are lowercase.
+func matchSpecificity(e AcceptItem, offer string) int {
+	pattern := e.MediaType
 	if !MatchMedia(pattern, offer) {
 		return 0
 	}
+	var spec int
 	switch {
 	case pattern == "*" || pattern == "*/*":
-		return 1
+		spec = 2
 	case strings.HasSuffix(pattern, "/*"):
-		return 2
+		spec = 4
 	default:
-		return 3
+		spec = 6
 	}
+	if e.Params {
+		spec--
+	}
+	return spec
 }
 
 // Parse parses an Accept header value into a slice of AcceptItems.
@@ -188,23 +207,86 @@ func ParseInto(dst []AcceptItem, header string) []AcceptItem {
 					params = ""
 				}
 				p = strings.TrimSpace(p)
+				if p != "" && !isWeightParam(p) {
+					e.Params = true
+				}
 				// The parameter name is case-insensitive (RFC 9110 5.6.6, 12.4.2).
 				if len(p) > 2 && (p[0] == 'q' || p[0] == 'Q') && p[1] == '=' {
-					if q, err := strconv.ParseFloat(p[2:], 64); err == nil {
+					// A weight outside the grammar of RFC 9110 12.4.2 ("NaN",
+					// "Inf", "1e5", "-1", ".5", "1.5") is no weight: the entry
+					// keeps the q=1 it had, as with "q=abc" (celeris#888).
+					if q, ok := parseQValue(p[2:]); ok {
 						e.Quality = q
+					} else if f, err := strconv.ParseFloat(p[2:], 64); err == nil && f <= 0 {
+						// ...but one that reads as zero or below ("-1", "-0",
+						// "0e0", "00", "-Inf") stays a refusal: ignoring it
+						// would accept what the sender meant to refuse.
+						e.Quality = 0
 					}
 				}
 			}
 		} else {
 			e.MediaType = part
 		}
-		e.MediaType = strings.ToLower(strings.TrimSpace(e.MediaType))
+		e.MediaType = coding(strings.ToLower(strings.TrimSpace(e.MediaType)))
 		if e.MediaType != "" {
 			entries = append(entries, e)
 			kept++
 		}
 	}
 	return entries
+}
+
+// isWeightParam reports whether the parameter p ("q=0.5", "Q = x") is named
+// "q", whatever its value: it is the weight, well formed or not, and not a
+// parameter of the media type.
+func isWeightParam(p string) bool {
+	name := p
+	if i := strings.IndexByte(p, '='); i >= 0 {
+		name = p[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(name), "q")
+}
+
+// parseQValue reads the weight of a "q" parameter: RFC 9110 12.4.2,
+// qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] ). It is lenient
+// on one point, the count of digits after the point (a sender MUST NOT
+// produce more than three, a recipient reads what it gets: "0.0001" is a tiny
+// weight, not a malformed one). ok is false for anything else, which is not a
+// weight and is ignored by the caller: strconv.ParseFloat alone accepts "NaN",
+// "Inf", "1e5", "-1" and ".5".
+func parseQValue(s string) (q float64, ok bool) {
+	if s == "" || (s[0] != '0' && s[0] != '1') {
+		return 0, false
+	}
+	if len(s) > 1 {
+		if s[1] != '.' {
+			return 0, false
+		}
+		for i := 2; i < len(s); i++ {
+			if c := s[i]; c < '0' || c > '9' || (s[0] == '1' && c != '0') {
+				return 0, false
+			}
+		}
+	}
+	q, err := strconv.ParseFloat(s, 64)
+	return q, err == nil
+}
+
+// coding folds the deprecated alias of a content coding into its name, for the
+// entries of the header and for the offers alike: RFC 9110 8.4.1.3 says a
+// recipient SHOULD consider "x-gzip" equivalent to "gzip" (and "x-compress" to
+// "compress"). So "x-gzip" accepts the offer "gzip", and "gzip;q=0, *" refuses
+// gzip whichever of the two names an offer carries. The offer is returned as
+// the caller spelled it. Anything else, a media type among it, is unchanged.
+func coding(name string) string {
+	switch name {
+	case "x-gzip":
+		return "gzip"
+	case "x-compress":
+		return "compress"
+	}
+	return name
 }
 
 // MatchMedia returns true if the Accept pattern matches the offered media type.

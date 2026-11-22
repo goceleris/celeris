@@ -430,6 +430,19 @@ func (r *router) recordInlineRun(fullPath string, slow bool) {
 		if v, ok := r.slowStreak.Load(fullPath); ok {
 			v.(*atomic.Int32).Store(0)
 		}
+		// celeris#886: NOT the unmatched chain. Its one key is shared by every
+		// request no route matches, so a run of fast ones (scanner 404s, a
+		// healthcheck mounted with Use) proves nothing about a later request
+		// whose chain blocks (pprof, an auth or session middleware), and it
+		// has no .Async() opt-out as a route has. A settled key would run
+		// that request inline on the engine worker until the re-opener
+		// happened to time it, so the unmatched key stays on the timed path:
+		// about two clock reads per unmatched request under AsyncHandlers
+		// with a chain that does more than the built-in answer.
+		if fullPath == unmatchedAdaptiveKey {
+			return
+		}
+
 		// celeris#361: a route fast on adaptiveSettleStreak CONSECUTIVE runs is
 		// provably non-blocking — settle it so adaptiveLearning short-circuits
 		// and handler.go stops timing every request forever.

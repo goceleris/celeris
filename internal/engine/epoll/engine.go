@@ -168,7 +168,10 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// celeris#909: the CPU of loop i is the i-th member of the process's
 	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
 	// the loop count (celeris#1036): on a big.LITTLE host it holds one loop
-	// per non-little CPU, fewer than the default GOMAXPROCS, every one pinned.
+	// per non-little CPU, fewer than the default GOMAXPROCS, every one pinned;
+	// with Workers unset on a host of alike CPUs it holds the default less the
+	// reserve that leaves Ps to the goroutines that are not loops (celeris#756,
+	// #757).
 	plan := planWorkerCPUs(resolved.Workers, e.cfg.Resources.Workers > 0, e.cfg.Addr)
 	cpus := plan.CPUs
 	resolved.Workers = len(cpus)

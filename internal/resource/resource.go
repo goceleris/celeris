@@ -29,12 +29,16 @@ const (
 // Resources allows user overrides of default resource values.
 // Zero values mean "use engine default".
 type Resources struct {
-	// Workers is the number of I/O worker goroutines (0 = GOMAXPROCS). Zero
-	// is also what tells the native engines the count was not user-set: on a
-	// host whose CPUs differ in capacity they then start at most one pinned loop
-	// per non-little CPU, min(GOMAXPROCS, non-little CPUs) (celeris#1036); a
-	// count set here is honoured, wrapping over those CPUs, every loop pinned
-	// (io_uring still caps it by RLIMIT_MEMLOCK).
+	// Workers is the number of I/O worker goroutines (0 = GOMAXPROCS; Resolve
+	// raises it to MinWorkers). Zero is also what tells the native engines the
+	// count was not user-set: on a host whose CPUs differ in capacity they then
+	// start at most one pinned loop per non-little CPU, min(GOMAXPROCS,
+	// non-little CPUs) (celeris#1036), and on a host whose CPUs are alike (Linux)
+	// they start the resolved count less a reserve of max(1, count/8) loops
+	// (none for a count of 2 or less) that leaves Ps to the goroutines that are
+	// not loops (celeris#756, #757): the loops started are what the engines
+	// report, not Resolve's figure. A count set here is honoured, wrapping over
+	// those CPUs, every loop pinned (io_uring still caps it by RLIMIT_MEMLOCK).
 	Workers int
 	// BufferSize is the per-connection I/O buffer size in bytes (0 = engine default).
 	BufferSize int
@@ -62,6 +66,15 @@ type Resources struct {
 	// is PROCESS-GLOBAL, so this is opt-in only — set it just when celeris
 	// owns the process (e.g. a dedicated server binary). See DeriveMemoryLimit.
 	MemoryLimitBytes int64
+	// GCPercent is an OPTIONAL garbage-collector target (runtime/debug
+	// SetGCPercent, the GOGC knob). 0 = unset: celeris does not touch the
+	// process GC, so embedders keep full control (including the GOGC
+	// environment variable). When >0, the server applies it at start; the
+	// last opted-in server to stop puts the original value back if the
+	// process value is still the last one celeris wrote. It overrides GOGC.
+	// NOTE: SetGCPercent is PROCESS-GLOBAL, so this is opt-in only. See
+	// celeris.Config.GCPercent.
+	GCPercent int
 }
 
 // DeriveMemoryLimit returns a generous soft heap ceiling for `workers` I/O

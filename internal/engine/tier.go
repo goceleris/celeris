@@ -9,7 +9,7 @@ const (
 	None     Tier = iota // no io_uring support
 	Base                 // kernel 5.10+ (LTS-stable io_uring baseline; linked SQE chains, single-shot accept/recv). The io_uring engine itself needs 5.19 (celeris#682).
 	High                 // kernel 5.19+ (multishot accept/recv, provided buffers, fixed files, COOP_TASKRUN, SINGLE_ISSUER)
-	Optional             // kernel 6.0+ (adds SQPOLL, SEND_ZC; 6.1+ swaps COOP_TASKRUN → DEFER_TASKRUN)
+	Optional             // kernel 6.0+ (adds SEND_ZC; 6.1+ swaps COOP_TASKRUN → DEFER_TASKRUN). Selected where SQPOLL is available, but no tier uses it (celeris#377)
 )
 
 // String returns the tier name (e.g. "none", "base", "high").

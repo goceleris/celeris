@@ -3,6 +3,7 @@
 package websocket
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -148,6 +149,17 @@ func TestDetachedCloseLeavesNoResidualHeap(t *testing.T) {
 			for _, mode := range modes {
 				mode := mode
 				t.Run(mode.name, func(t *testing.T) {
+					// celeris#890: the wait for the server's close below is the
+					// test's cost, not a hang. Each cycle waits up to 30 ms for
+					// the server's TCP close; ping-flood never gets one, so it
+					// waits the full 30 ms every time. Measured on linux/arm64,
+					// 8 MiB memlock: epoll's FIN lands ~24 ms after the close
+					// frame, io_uring's ~100 ms (so about half of its cycles
+					// run out the 30 ms), and the whole test takes ~15 min,
+					// which a -timeout of 100 s reads as a hang. The counts are
+					// logged per mode so a slow run says where its time went.
+					var deadlineHits, eofs int
+					var readTime time.Duration
 					cycle := func(n int) int {
 						ok := 0
 						for i := 0; i < n; i++ {
@@ -166,13 +178,21 @@ func TestDetachedCloseLeavesNoResidualHeap(t *testing.T) {
 								// deadline only bounds the pathological case,
 								// so keep it small -- at these cycle counts a
 								// 250ms bound would run for hours.
-								_ = c.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+								readStart := time.Now()
+								_ = c.SetReadDeadline(readStart.Add(30 * time.Millisecond))
 								buf := make([]byte, 256)
 								for {
 									if _, err := c.Read(buf); err != nil {
+										var ne net.Error
+										if errors.As(err, &ne) && ne.Timeout() {
+											deadlineHits++
+										} else {
+											eofs++
+										}
 										break
 									}
 								}
+								readTime += time.Since(readStart)
 							}
 							_ = c.Close()
 						}
@@ -182,6 +202,9 @@ func TestDetachedCloseLeavesNoResidualHeap(t *testing.T) {
 					if n := cycle(warmCycles); n < warmCycles/2 {
 						t.Fatalf("warm-up completed only %d/%d — environment problem, not a verdict", n, warmCycles)
 					}
+					t.Logf("%s/%s: warm-up %d cycles: server close seen in %d, 30 ms read deadline hit in %d, waited %v in all",
+						kind, mode.name, warmCycles, eofs, deadlineHits, readTime.Round(time.Millisecond))
+					deadlineHits, eofs, readTime = 0, 0, 0
 					settle()
 					var before runtime.MemStats
 					runtime.ReadMemStats(&before)
@@ -199,6 +222,8 @@ func TestDetachedCloseLeavesNoResidualHeap(t *testing.T) {
 					perAlloc := float64(dAlloc) / float64(done)
 					perInuse := float64(dInuse) / float64(done)
 
+					t.Logf("%s/%s: %d cycles: server close seen in %d, 30 ms read deadline hit in %d, waited %v in all",
+						kind, mode.name, cycles, eofs, deadlineHits, readTime.Round(time.Millisecond))
 					t.Logf("%s/%s: %d detaches | HeapAlloc %+d B (%.1f B/detach) | HeapInuse %+d B (%.1f B/detach) | Sys %+d B | gor %d",
 						kind, mode.name, done, dAlloc, perAlloc, dInuse, perInuse,
 						int64(after.Sys)-int64(before.Sys), runtime.NumGoroutine())

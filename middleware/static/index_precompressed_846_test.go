@@ -268,8 +268,10 @@ func outsideFixture846(t *testing.T) (celeris.HandlerFunc, string, string) {
 
 // TestRefusedPathLeaksNoValidators846: a path FileFromDir refuses (a symlink
 // out of the root) must not leave the target's ETag and Last-Modified on the
-// error response. They were set from the stat before the containment check,
-// and a conditional request that did not hold carried them out on the 400.
+// response. They were set from the stat before the containment check, and a
+// conditional request that did not hold carried them out on the 400 (since
+// celeris#888 item 91 such a path is passed on as a missing one, and an
+// escaping variant is no variant).
 func TestRefusedPathLeaksNoValidators846(t *testing.T) {
 	mw, outsideTag, outsideLM := outsideFixture846(t)
 	for _, tc := range []struct {
@@ -288,10 +290,16 @@ func TestRefusedPathLeaksNoValidators846(t *testing.T) {
 		for i := 0; i+1 < len(tc.hdr); i += 2 {
 			opts = append(opts, celeristest.WithHeader(tc.hdr[i], tc.hdr[i+1]))
 		}
-		c, _ := celeristest.NewContextT(t, "GET", tc.path, opts...)
+		c, rec := celeristest.NewContextT(t, "GET", tc.path, opts...)
 		err := c.Next()
-		if err == nil {
-			t.Fatalf("GET %s %v: the escaping symlink was served (%d)", tc.path, tc.hdr, c.ResponseStatus())
+		// A symlink out of the root is no file (celeris#888 item 91): the
+		// identity file is served in place of a variant that escapes, and a
+		// path that escapes is passed on as a missing one, not answered 400.
+		if len(rec.Body) == 4242 { // the outside file's size
+			t.Fatalf("GET %s %v: the escaping symlink was served (%d)", tc.path, tc.hdr, rec.StatusCode)
+		}
+		if err != nil {
+			t.Errorf("GET %s %v: %v, want the request passed on or the identity file served", tc.path, tc.hdr, err)
 		}
 		for _, h := range c.ResponseHeaders() {
 			if h[1] == outsideTag || h[1] == outsideLM {

@@ -73,6 +73,15 @@ type Config struct {
 	// ErrorHandler is called to produce a response when the breaker is open.
 	// Default: returns ErrServiceUnavailable (503).
 	ErrorHandler func(c *celeris.Context, err error) error
+
+	// CountUnmatched treats a request no route matched (FullPath
+	// "<unmatched>", "<method-not-allowed>" or "<options>") like any other:
+	// refused while Open, counted, and taken for the HalfOpen probe. Set it
+	// when a [celeris.Server.NotFound] or [celeris.Server.MethodNotAllowed]
+	// handler, or a middleware mounted with Server.Use that serves its own
+	// paths, forwards to the downstream the breaker protects. Default false:
+	// such a request is passed on untouched (celeris#888).
+	CountUnmatched bool
 }
 
 // ErrServiceUnavailable aliases [celeris.ErrServiceUnavailable] so

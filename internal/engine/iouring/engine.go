@@ -425,7 +425,9 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
 	// the worker count (celeris#1036): on a big.LITTLE host it holds at most
 	// one worker per non-little CPU, fewer than the default GOMAXPROCS, every
-	// one pinned.
+	// one pinned; with Workers unset on a host of alike CPUs it holds the
+	// default less the reserve that leaves Ps to the goroutines that are not
+	// loops (celeris#756, #757).
 	//
 	// RLIMIT_MEMLOCK bounds the plan, not the request. Each worker locks ~12 MB
 	// for its ring + buffers; the systemd / kernel default of 8 MB only fits
@@ -905,7 +907,8 @@ func (e *Engine) NumWorkers() int {
 // WorkerLoop returns the WorkerLoop for worker n. Out-of-range n is
 // reduced modulo NumWorkers so callers can hash a connection / FD across
 // the available pool without first reading NumWorkers — important now
-// that workers can be capped below NumCPU by RLIMIT_MEMLOCK.
+// that workers can be below NumCPU: capped by RLIMIT_MEMLOCK, or fewer by the
+// default reserve (celeris#756, #757).
 // Negative n is mirrored to the positive side first. Panics only when
 // the engine has no workers (i.e. Listen has not yet started).
 func (e *Engine) WorkerLoop(n int) engine.WorkerLoop {

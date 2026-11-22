@@ -20,6 +20,14 @@ var ErrHidden = errors.New("hidden path")
 // Nothing has been written to the response.
 var ErrNotRegular = errors.New("not a regular file")
 
+// ErrEscapes is carried (wrapped in an HTTPError 400) by the error of the
+// registered FileFromDir, and by Context.FileFromDir, for a path that leaves the
+// base directory once symlinks are resolved. Nothing has been written to the
+// response. middleware/static answers it as a path with no file (celeris#888):
+// 400 for a link and 404 for a missing name would tell the client which names
+// exist.
+var ErrEscapes = errors.New("path escapes the base directory")
+
 // windows is whether a backslash separates path elements.
 var windows = runtime.GOOS == "windows"
 

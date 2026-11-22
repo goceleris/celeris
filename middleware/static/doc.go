@@ -52,7 +52,11 @@
 // Root that is or contains a symlink is followed at each request, so a later
 // retarget to "/" is not refused. Devices, FIFOs and sockets are
 // not served: a Root answers them as a missing file, since reading /dev/zero
-// never ends and opening a FIFO waits for a writer. A [Config].FS cannot be held
+// never ends and opening a FIFO waits for a writer. So is a path that leads
+// out of the Root through a symlink, or that goes on below a regular file
+// ("app.js/x"): the status does not tell which names exist. A pre-compressed
+// variant that leads out of the Root is no variant: the file itself is served.
+// A [Config].FS cannot be held
 // to as much: every name of the tree is looked at before it is opened (an
 // os.DirFS and an fs.Sub of one are), so a FIFO planted in it, as an index file
 // or as a pre-compressed variant too, is answered as a missing file, but an FS

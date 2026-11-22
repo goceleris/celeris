@@ -98,6 +98,13 @@ jobs:
       # (it fails closed) (celeris#890).
       - name: timeout-headroom.sh self-test
         run: .github/scripts/timeout-headroom-test.sh
+      # host-skip-reason.sh (the iouring steps of the unit job and the base-tier job call it)
+      # lets two tests skip on a host that cannot make the condition they test, and only for
+      # that reason: the self-test runs it on fixture logs with the right reason, another
+      # reason of the same test, no reason line, another test's reason line, a test that ran
+      # and an unreadable log (celeris#756 CI fix).
+      - name: host-skip-reason.sh self-test
+        run: .github/scripts/host-skip-reason-test.sh
       # The tools CI runs are pinned in one place, .github/tools/go.mod (the Go
       # ones) or .github/tools/requirements.txt (zizmor), and three other places
       # name them: the allow list of its Dependabot entry
@@ -472,15 +479,34 @@ jobs:
           CELERIS_REQUIRE_DUALSTACK=1 go test -race -count=1 -timeout="${iouring_timeout}s" -skip '^TestEngineTimeoutsIgnoreAStepOfTheWallClock1178$' -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
           allowed='TestListenClosesListenSocketsWhenEveryWorkerRingSetupFails|TestListenClosesListenSocketWhenOneWorkerRingSetupFails|TestListenClosesListenSocketRingAndEventfdWhenInitialSubmitFails|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero|TestPort0EveryWorkerBindsTheSamePort895|TestListenReleasesThePortWithManyWorkers896|TestFailedStartReleasesThePort896|TestPort0PauseResumeWithManyWorkers895'
           required='TestListenWithCancelledContextPublishesTheBoundAddress|TestListenRefusesToStartWhenNoWorkerReportsItsAddress'
+          # Two tests skip by design on a host that cannot make the condition they test, and no
+          # other step enforces them (they are not in the nine above):
+          #   * TestStartFDLEngineRidesOutRingENOMEM fills the 8 MiB RLIMIT_MEMLOCK budget with
+          #     rings and skips ("could not fill the memlock budget (512 rings held)") when 512
+          #     rings fit at that soft limit. All five jobs observed on the runner kernel
+          #     7.0.0-1020-azure (ubuntu-26.04 image 20261116.202.1: the base-tier job of runs
+          #     44727244397, 44732627322 and 44836576779, the unit job's iouring step of runs
+          #     44836534678 and 44836576779) skipped it for this reason; the jobs observed on
+          #     7.0.0-1019-azure and 7.0.0-1016-aws ran and passed it. Why that kernel lets the
+          #     rings in is not established.
+          #   * TestDialWatchDescribesTheSocketsOfAPort1229 skips when the host does not leave a
+          #     dial to the reserved 10.255.255.1 unanswered: run 43528508636 (7.0.0-1014-aws).
+          # A skip of either test is forgiven only with its own reason in the log
+          # (.github/scripts/host-skip-reason.sh): the same tests also skip for other causes
+          # (no io_uring, a failed setrlimit, no loopback listener, no ring created at all), and
+          # those still fail the step. Add a name there only with the reason it may skip on a host.
+          host_skips='TestStartFDLEngineRidesOutRingENOMEM|TestDialWatchDescribesTheSocketsOfAPort1229'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
           ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/iouring-pkg.log || true)
           passed=$(grep -cE "^--- PASS: (${required}) \(" /tmp/iouring-pkg.log || true)
           skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/iouring-pkg.log)
-          unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -cvE "^--- SKIP: (${allowed}) \(" || true)
-          echo "internal/engine/iouring: SKIP lines $skipped, not enforced by another step $unlisted; celeris#639 tests want $want, ran $ran, passed $passed"
-          if [ "$unlisted" -ne 0 ] || [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ]; then
-            grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -vE "^--- SKIP: (${allowed}) \(" || true
-            echo "expected no SKIP line other than the nine that other steps enforce (listed above if any),"
+          unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -cvE "^--- SKIP: (${allowed}|${host_skips}) \(" || true)
+          host_status=0
+          host_out=$(.github/scripts/host-skip-reason.sh /tmp/iouring-pkg.log 2>&1) || host_status=$?
+          echo "internal/engine/iouring: SKIP lines $skipped, not enforced by another step $unlisted; celeris#639 tests want $want, ran $ran, passed $passed; $host_out"
+          if [ "$unlisted" -ne 0 ] || [ "$host_status" -ne 0 ] || [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -vE "^--- SKIP: (${allowed}|${host_skips}) \(" || true
+            echo "expected no SKIP line other than the nine that other steps enforce and the two host-dependent ones named above (listed above if any),"
             echo "and the two celeris#639 tests to run and PASS -- did a test skip here, or was one renamed,"
             echo "removed or failed?"
             exit 1
@@ -2542,6 +2568,8 @@ jobs:
           CELERIS_REQUIRE_DUALSTACK=1 CELERIS_REQUIRE_ZONED_PEER=1 go test -race -count=1 -timeout="${iouring_timeout}s" -v ./internal/engine/iouring/ 2>&1 | tee /tmp/base-iouring.log
           echo "internal/engine/iouring at the base tier took $((SECONDS - start)) s"
           .github/scripts/base-tier-tally.sh iouring /tmp/base-iouring.log TestShutdownDetachedPartialWriteIsFlushed806 TestReportTier844
+          # The two host-dependent skips the data file allows (base-tier-skips-iouring.txt) must carry their reason.
+          .github/scripts/host-skip-reason.sh /tmp/base-iouring.log
           .github/scripts/timeout-headroom.sh /tmp/base-iouring.log "$iouring_timeout"
       - name: Root package and test/server, Shutdown/Detach/SSE/Stream/WebSocket/Hijack/Drain tests at the base tier (race)
         if: ${{ !cancelled() }}
@@ -2936,7 +2964,10 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          # 1.27.4 fixes GO-2026-6859 (net/http); the scan reports the toolchain it
+          # runs with, so this job must run the fixed one. The module floor (go.mod)
+          # and the other jobs stay at 1.27.3: the benchmark builds are pinned to it.
+          go-version: "1.27.4"
       # govulncheck is a `tool` of the separate .github/tools module, so the
       # version that runs is the one its go.mod names and its go.sum hashes
       # (Dependabot bumps it), not whatever @latest resolves to on the day.

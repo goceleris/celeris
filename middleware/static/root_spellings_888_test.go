@@ -269,8 +269,8 @@ func TestRootSpellingsRefuseSymlinksOut888(t *testing.T) {
 					r := tree888(t)
 					mw := sp.open888(t, r, Config{})
 					rec, err := get888(t, mw, p, hdr...)
-					if !isHTTP400(err) || rec.StatusCode == 304 || bytes.Contains(rec.Body, secretBytes888) {
-						t.Errorf("GET %s %v: status %d err %v body %q, want a 400", p, hdr, rec.StatusCode, err, rec.Body)
+					if !refused888(rec, err) || rec.StatusCode == 304 || bytes.Contains(rec.Body, secretBytes888) {
+						t.Errorf("GET %s %v: status %d err %v body %q, want the request passed on", p, hdr, rec.StatusCode, err, rec.Body)
 					}
 					for _, h := range []string{"etag", "last-modified"} {
 						if v := rec.Header(h); v != "" {

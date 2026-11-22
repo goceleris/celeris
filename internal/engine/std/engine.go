@@ -510,7 +510,7 @@ func (e *Engine) connStateHook(conn net.Conn, state http.ConnState) {
 	case http.StateNew:
 		e.metrics.activeConns.Add(1)
 		if e.cfg.OnConnect != nil {
-			e.safeCallback(e.cfg.OnConnect, conn.RemoteAddr().String())
+			e.connectCallback(e.cfg.OnConnect, conn.RemoteAddr().String())
 		}
 	case http.StateClosed, http.StateHijacked:
 		e.metrics.activeConns.Add(-1)
@@ -519,6 +519,32 @@ func (e *Engine) connStateHook(conn net.Conn, state http.ConnState) {
 			e.safeCallback(e.cfg.OnDisconnect, conn.RemoteAddr().String())
 		}
 	}
+}
+
+// connectCallback runs OnConnect on a helper goroutine that the hook waits
+// for (celeris#889). net/http runs the StateNew hook inline in Server.Serve,
+// the goroutine that accepts: a callback that ends its goroutine with
+// runtime.Goexit (t.FailNow in a test) would end Serve, whose deferred
+// listener close then stops the engine accepting for good, silently. A
+// Goexit cannot be recovered, only outlived: here it ends the helper, the
+// join below still fires, and it is logged as the native engines log one
+// (celeris#848). The connection proceeds as if the callback had returned.
+func (e *Engine) connectCallback(fn func(string), arg string) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		returned := false
+		defer func() {
+			if !returned {
+				e.logger.Error("std engine: OnConnect ended its goroutine with runtime.Goexit; "+
+					"callbacks must not call it (t.FailNow, t.Fatal and t.SkipNow do)",
+					"remote", arg)
+			}
+		}()
+		e.safeCallback(fn, arg) // recovers a panic, so returning means it returned or panicked
+		returned = true
+	}()
+	<-done
 }
 
 // safeCallback invokes a user-provided callback with panic recovery to prevent

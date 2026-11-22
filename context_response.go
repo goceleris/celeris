@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 	"unsafe"
@@ -1156,7 +1157,8 @@ func (c *Context) serveStaticFile(root, tail string) error {
 		return NewHTTPError(404, "Not Found")
 	}
 	err := c.fileFromDir(root, tail, "", nil, ctxkit.HiddenPath)
-	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, ctxkit.ErrHidden) || errors.Is(err, ctxkit.ErrNotRegular) || errors.Is(err, ctxkit.ErrEscapes) ||
+		errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		// a path to a hidden file is a 404 whether or not it exists, and so is a
 		// file that is not there (the raw lstat error was a 500)
 		return NewHTTPError(404, "Not Found")
@@ -1187,14 +1189,14 @@ func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func
 		return err
 	}
 	if !ctxkit.ResolvedWithin(resolvedBase, resolved) {
-		return NewHTTPError(400, "invalid file path")
+		return NewHTTPError(400, "invalid file path").WithError(ctxkit.ErrEscapes)
 	}
 	if hidden != nil {
 		// Where the path leads, not only what it says: a visible name that is a
 		// symlink to a dotfile of the tree is refused like the dotfile.
 		rel, ok := ctxkit.RelWithin(resolvedBase, resolved)
 		if !ok {
-			return NewHTTPError(400, "invalid file path")
+			return NewHTTPError(400, "invalid file path").WithError(ctxkit.ErrEscapes)
 		}
 		if hidden(rel) {
 			return ctxkit.ErrHidden
@@ -1320,7 +1322,10 @@ func (c *Context) StreamReader(code int, contentType string, r io.Reader) error 
 // and "*/*;q=0, text/html" accepts text/html alone (RFC 9110 12.5.1). Of the
 // types with the highest weight, the one whose entry comes first in the header
 // wins, and then the first offer: "*/*, application/json" gives the first of
-// the offers, whichever it is.
+// the offers, whichever it is. The offers are types without parameters, so a
+// range that carries parameters ("text/html;level=1") ranks below the same
+// type written without: "text/html;level=1;q=0, text/html" refuses the level-1
+// variant and accepts text/html.
 //
 // The response then depends on Accept, so Negotiate adds Accept to the
 // response's Vary header (once): a shared cache, or middleware/singleflight,
@@ -1378,7 +1383,10 @@ func (c *Context) ResponseBody() []byte {
 	return c.capturedBody
 }
 
-// ResponseContentType returns the captured Content-Type, or "" if not captured.
+// ResponseContentType returns the captured Content-Type, or "" if none was
+// captured: nothing was buffered or captured, the response is a NoContent, or
+// it was written with an empty content type (c.Blob(code, "", data)). An empty
+// result does not mean the response has no body: check [Context.ResponseBody].
 func (c *Context) ResponseContentType() string { return c.capturedType }
 
 // BufferResponse instructs response methods (JSON, XML, Blob, NoContent, etc.)
@@ -1409,7 +1417,12 @@ func (c *Context) FlushResponse() error {
 	}
 	c.bufferDepth = 0
 	c.buffered = false
-	if c.capturedType == "" {
+	// A buffered NoContent leaves no body and no type; replay it as NoContent.
+	// A body with no type (c.Blob(code, "", data), which Adapt writes for a
+	// net/http handler that sets no Content-Type) is a Blob and keeps its
+	// body: the empty type alone does not say which of the two was buffered
+	// (celeris#1155).
+	if c.capturedType == "" && len(c.capturedBody) == 0 {
 		return c.NoContent(c.capturedStatus)
 	}
 	return c.Blob(c.capturedStatus, c.capturedType, c.capturedBody)
@@ -1438,6 +1451,12 @@ func (c *Context) SetResponseBody(body []byte) {
 func (c *Context) ResponseStatus() int { return c.capturedStatus }
 
 // IsWritten returns true if a response has been written to the wire.
+//
+// It is also true once [Context.StreamWriter] has been taken, before anything
+// is sent through the writer: the handler that holds it may still use it. The
+// recovery and timeout middleware give such an unused response back once the
+// handler has returned or panicked (celeris#835); a middleware of your own
+// that must answer in that case cannot tell it apart from a committed one.
 func (c *Context) IsWritten() bool { return c.written }
 
 // BytesWritten returns the response body size in bytes, or 0 if no response

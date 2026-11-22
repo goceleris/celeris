@@ -27,8 +27,10 @@ type CPUPlan struct {
 	// itself to. Its length is the loop count: on a host whose allowed CPUs
 	// differ in capacity it can be smaller than the number of workers asked
 	// for, and the engine starts len(CPUs) loops, not the number it asked for
-	// (celeris#1036). The planner never leaves an entry at -1 ("run
-	// unpinned"); an engine still honours a -1 it is given, and a pin the
+	// (celeris#1036); so does a default count on a host of alike CPUs, which
+	// leaves defaultLoopReserve(Requested) workers without a loop (celeris#756,
+	// #757); Note stays empty for it. The planner never leaves an entry at -1
+	// ("run unpinned"); an engine still honours a -1 it is given, and a pin the
 	// kernel refuses leaves that one loop unpinned and is logged.
 	CPUs []int
 	// Requested is the number of workers the plan was asked for.
@@ -135,9 +137,12 @@ func (p CPUPlan) Truncate(n int, why string) CPUPlan {
 // numWorkers above the number of non-little CPUs is honoured, never floated:
 // the extra loops wrap round-robin over the non-little CPUs, each pinned (two
 // loops share a CPU). Where the CPUs are alike the i-th worker gets the i-th
-// allowed CPU, wrapping. On a host with several NUMA nodes the CPUs are taken
-// from the nodes the allowed set covers in turn, and every allowed CPU gets a
-// loop before any gets a second.
+// allowed CPU, wrapping, and a default count (not explicit) is
+// numWorkers - [defaultLoopReserve](numWorkers) loops, the Ps left over
+// serving the goroutines that are not loops (celeris#756, #757); an explicit
+// count is planned as asked. On a host with several NUMA nodes the CPUs are
+// taken from the nodes the allowed set covers in turn, and every allowed CPU
+// gets a loop before any gets a second.
 //
 // Any read error means "homogeneous"; the plan then is what a host without
 // the information gets.
@@ -206,6 +211,28 @@ func schedAllowedCPUs() ([]int, error) {
 	return out, nil
 }
 
+// defaultLoopReserve is how many of the numWorkers workers a DEFAULT loop count
+// (Config.Workers not set) leaves without a loop on a host whose allowed CPUs
+// are alike: the loops start numWorkers - defaultLoopReserve(numWorkers). A
+// loop locks its OS thread and can block in the kernel (epoll_wait,
+// io_uring_enter) while it holds its P, so with as many loops as Ps the
+// goroutines that are not loops (async and WebSocket handlers, the HTTP/2 stream
+// pool, GC workers) may run only on a P the runtime takes back from a blocked
+// loop (celeris#756, #757; a mechanism inferred from traces, not established).
+// The reserve leaves that many Ps to them.
+//
+// max(1, n/8), none for n <= 2 (a count that small would drop to one loop or
+// none): 14 of 16, chosen by the maintainer after a cluster comparison of 16,
+// 14 and 12 loops on one amd64 host. The runs on the final commit that would
+// confirm the reserve are still owed, so the value may change; changing it is
+// this function's one return statement (celeris#756, #757).
+func defaultLoopReserve(n int) int {
+	if n <= 2 {
+		return 0
+	}
+	return max(1, n/8)
+}
+
 func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 	if numWorkers < 0 {
 		numWorkers = 0
@@ -226,7 +253,14 @@ func planWorkerCPUs(numWorkers int, explicit bool, src planSource) CPUPlan {
 	plan := CPUPlan{Allowed: allowed, Requested: numWorkers}
 	little, capNote := littleCPUs(allowed, src)
 	if len(little) == 0 {
-		plan.CPUs = spread(numWorkers, allowed, src.nodeCPUs)
+		// Alike CPUs. A default count (Workers not set by the user) leaves
+		// defaultLoopReserve(numWorkers) of the Ps without a loop; a user-set
+		// count is planned as asked, and so is the big.LITTLE branch below.
+		loops := numWorkers
+		if !explicit {
+			loops -= defaultLoopReserve(numWorkers)
+		}
+		plan.CPUs = spread(loops, allowed, src.nodeCPUs)
 		return plan
 	}
 

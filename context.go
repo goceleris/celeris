@@ -24,6 +24,9 @@ func init() {
 	ctxkit.ReleaseContext = func(c any) {
 		releaseContext(c.(*Context))
 	}
+	ctxkit.ReclaimUnusedStreamWriter = func(c any) bool {
+		return c.(*Context).reclaimUnusedStreamWriter()
+	}
 }
 
 // The functions below give the module's test infrastructure (celeristest,
@@ -114,6 +117,9 @@ type Context struct {
 	path     string
 	rawQuery string
 	fullPath string
+	// unmatchedAllow is the Allow value of a 405 under way (celeris#889),
+	// written by the end of the 405 chain, not before the middleware.
+	unmatchedAllow string
 
 	statusCode  int
 	respHeaders [][2]string
@@ -664,6 +670,7 @@ func (c *Context) reset() {
 	c.path = ""
 	c.rawQuery = ""
 	c.fullPath = ""
+	c.unmatchedAllow = ""
 	c.statusCode = 200
 	if n := len(c.respHeaders); n > 0 {
 		// When a middleware stack emits more response headers than respHdrBuf

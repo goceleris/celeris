@@ -184,3 +184,18 @@ func TestMemoryLimitBytesValidation(t *testing.T) {
 		t.Fatal("MemoryLimitBytes=-1 must be rejected")
 	}
 }
+
+// celeris#756: GCPercent is opt-in; 0 (unset) and positive targets are
+// accepted, a negative one (which would switch the collector off) is refused.
+func TestGCPercentValidation(t *testing.T) {
+	for _, pct := range []int{0, 1, 100, 400} {
+		if err := (Config{Resources: Resources{GCPercent: pct}}).Validate(); err != nil {
+			t.Fatalf("GCPercent=%d must be valid, got %v", pct, err)
+		}
+	}
+	for _, pct := range []int{-1, -50} {
+		if err := (Config{Resources: Resources{GCPercent: pct}}).Validate(); err == nil {
+			t.Fatalf("GCPercent=%d must be rejected", pct)
+		}
+	}
+}

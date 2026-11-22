@@ -19,7 +19,7 @@ func acceptRef(header string, offers []string) string {
 		lo := strings.ToLower(offer)
 		spec, q := 0, 0.0
 		for _, e := range entries {
-			s := matchSpecificity(e.MediaType, lo)
+			s := matchSpecificity(e, lo)
 			if s == 0 {
 				continue
 			}
@@ -50,7 +50,7 @@ func acceptRef(header string, offers []string) string {
 func TestAcceptMatchesReference888(t *testing.T) {
 	rng := rand.New(rand.NewSource(888))
 	names := []string{"gzip", "br", "zstd", "deflate", "identity", "*", "x-gzip", "GZIP", "Br"}
-	weights := []string{"", "", ";q=0", ";q=1", ";q=0.5", ";q=0.1", ";Q=0.5", ";q=0.9"}
+	weights := []string{"", "", ";q=0", ";q=1", ";q=0.5", ";q=0.1", ";Q=0.5", ";q=0.9", ";foo=1;q=0", ";foo=1"}
 	offers := []string{"gzip", "br", "zstd", "deflate", "identity"}
 	for range 20000 {
 		n := 1 + rng.Intn(40) // past the 8-entry parse buffer and the 16 of the specificity scratch
@@ -75,7 +75,7 @@ func TestAcceptMatchesReference888(t *testing.T) {
 func TestAcceptMatchesReferenceMedia888(t *testing.T) {
 	rng := rand.New(rand.NewSource(889))
 	names := []string{"text/html", "text/*", "*/*", "application/json", "application/*", "text/plain", "Text/HTML", "*"}
-	weights := []string{"", ";q=0", ";q=0.8", ";q=0.3", ";Q=0.8"}
+	weights := []string{"", ";q=0", ";q=0.8", ";q=0.3", ";Q=0.8", ";level=1", ";level=1;q=0", ";level=2;q=0.8"}
 	offers := []string{"text/html", "text/plain", "application/json", "application/xml", "image/png"}
 	for range 20000 {
 		n := 1 + rng.Intn(25)

@@ -24,3 +24,19 @@ TestMultishotRecvDecidedOnceAtNew/off_at_New,_on_after tier base has no multisho
 # tcp_synack_retries=0 guard" of the job adaptive sets it and forbids the skip.
 TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero needs net.ipv4.tcp_synack_retries=0
 TestPauseAcceptNoGuardLosesAtSynackRetriesZero needs net.ipv4.tcp_synack_retries=0
+
+# They skip by design on a host that cannot make the condition they test (the test's own skip
+# message says which). No step forces them to run; on other hosts they run and pass. A skip of
+# either is allowed only with its own reason in the log: base-tier-tally.sh allows the name, and
+# .github/scripts/host-skip-reason.sh (called by the job right after it) checks the reason, so the
+# same tests' other skips (no io_uring, a failed setrlimit, no loopback) still fail the job.
+#   * TestStartFDLEngineRidesOutRingENOMEM fills the 8 MiB RLIMIT_MEMLOCK budget with rings and
+#     skips ("could not fill the memlock budget (512 rings held)") when 512 rings fit at that soft
+#     limit. All five jobs observed on the runner kernel 7.0.0-1020-azure (runs 44727244397,
+#     44732627322, 44836576779 base tier; 44836534678, 44836576779 unit job) skipped it for this
+#     reason; the jobs observed on 7.0.0-1019-azure and 7.0.0-1016-aws ran and passed it. Why that
+#     kernel lets the rings in is not established.
+#   * TestDialWatchDescribesTheSocketsOfAPort1229 skips when the host does not leave a dial to the
+#     reserved 10.255.255.1 unanswered (run 43528508636, 7.0.0-1014-aws).
+TestStartFDLEngineRidesOutRingENOMEM 512 rings fit at the 8 MiB memlock soft limit on this host, so the budget cannot be filled
+TestDialWatchDescribesTheSocketsOfAPort1229 this host does not leave a dial to 10.255.255.1 unanswered

@@ -246,6 +246,8 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		method := c.Method()
 		if method != "GET" && method != "HEAD" {
+			// A 405 MUST name the methods the resource supports (RFC 9110 15.5.6).
+			c.SetHeader("allow", "GET, HEAD")
 			return celeris.NewHTTPError(405, "Method Not Allowed")
 		}
 

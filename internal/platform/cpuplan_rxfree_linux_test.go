@@ -264,7 +264,7 @@ func TestRxFreeHomogeneousHostReadsNothing(t *testing.T) {
 	// No capacity files at all: any read error means homogeneous.
 	cpu := newFakeHost(t, rng(0, 3))
 	h := msr1RxReal(t, "msr1_rxfree_vector_on_cpu1.txt")
-	got := planWorkerCPUs(4, false, h.planSrc(cpu, clusterAddr))
+	got := planWorkerCPUs(4, true, h.planSrc(cpu, clusterAddr))
 	eq(t, "no capacity files", got.CPUs, rng(0, 3))
 	if h.reads() != 0 {
 		t.Errorf("no capacity files: %d reads", h.reads())
