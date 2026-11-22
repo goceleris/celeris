@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -111,6 +112,26 @@ func asString(v protocol.Value) (string, error) {
 		return "", ErrNil
 	case protocol.TyInt:
 		return strconv.FormatInt(v.Int, 10), nil
+	case protocol.TyDouble:
+		// RESP2 sends the same double as a bulk string: the shortest form
+		// that round-trips, and "inf", "-inf" and "nan" for the specials.
+		switch {
+		case math.IsInf(v.Float, 1):
+			return "inf", nil
+		case math.IsInf(v.Float, -1):
+			return "-inf", nil
+		case math.IsNaN(v.Float):
+			return "nan", nil
+		}
+		return strconv.FormatFloat(v.Float, 'g', -1, 64), nil
+	case protocol.TyBool:
+		// RESP2 sends a boolean as the integer 1 or 0.
+		if v.Bool {
+			return "1", nil
+		}
+		return "0", nil
+	case protocol.TyBigInt:
+		return string(v.BigN), nil
 	default:
 		return "", fmt.Errorf("celeris-redis: expected string reply, got %s", v.Type)
 	}
@@ -150,6 +171,12 @@ func asInt(v protocol.Value) (int64, error) {
 		return v.Int, nil
 	case protocol.TyBulk, protocol.TySimple:
 		return strconv.ParseInt(string(v.Str), 10, 64)
+	case protocol.TyBool:
+		// RESP2 sends a boolean as the integer 1 or 0.
+		if v.Bool {
+			return 1, nil
+		}
+		return 0, nil
 	case protocol.TyNull:
 		return 0, ErrNil
 	default:
@@ -190,16 +217,48 @@ func asBool(v protocol.Value) (bool, error) {
 	return false, fmt.Errorf("celeris-redis: expected bool reply, got %s", v.Type)
 }
 
+// elemString renders one aggregate element: a bulk (the common case) is
+// copied straight, a null is "" (a missing MGET key), and any other scalar
+// goes through asString so an integer, double or boolean element reads as
+// the text RESP2 would have sent. A nested aggregate or an error element is
+// an error rather than a silently empty string.
+func elemString(e protocol.Value) (string, error) {
+	switch e.Type {
+	case protocol.TyBulk:
+		return string(e.Str), nil
+	case protocol.TyNull:
+		return "", nil
+	}
+	return asString(e)
+}
+
 func asStringSlice(v protocol.Value) ([]string, error) {
 	switch v.Type {
 	case protocol.TyArray, protocol.TySet:
 		out := make([]string, len(v.Array))
-		for i, elem := range v.Array {
-			switch elem.Type {
-			case protocol.TyNull:
-				out[i] = ""
-			default:
+		for i := range v.Array {
+			elem := &v.Array[i]
+			if elem.Type == protocol.TyBulk {
 				out[i] = string(elem.Str)
+				continue
+			}
+			s, err := elemString(*elem)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = s
+		}
+		return out, nil
+	case protocol.TyMap:
+		// A RESP3 map reads as the flat key, value array RESP2 sends.
+		out := make([]string, 0, 2*len(v.Map))
+		for _, kv := range v.Map {
+			for _, e := range [2]protocol.Value{kv.K, kv.V} {
+				s, err := elemString(e)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, s)
 			}
 		}
 		return out, nil
@@ -220,8 +279,21 @@ func asStringMap(v protocol.Value) (map[string]string, error) {
 	switch v.Type {
 	case protocol.TyMap:
 		out := make(map[string]string, len(v.Map))
-		for _, kv := range v.Map {
-			out[string(kv.K.Str)] = string(kv.V.Str)
+		for i := range v.Map {
+			kv := &v.Map[i]
+			if kv.K.Type == protocol.TyBulk && kv.V.Type == protocol.TyBulk {
+				out[string(kv.K.Str)] = string(kv.V.Str)
+				continue
+			}
+			k, err := elemString(kv.K)
+			if err != nil {
+				return nil, err
+			}
+			val, err := elemString(kv.V)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = val
 		}
 		return out, nil
 	case protocol.TyArray:
@@ -230,7 +302,19 @@ func asStringMap(v protocol.Value) (map[string]string, error) {
 		}
 		out := make(map[string]string, len(v.Array)/2)
 		for i := 0; i < len(v.Array); i += 2 {
-			out[string(v.Array[i].Str)] = string(v.Array[i+1].Str)
+			if v.Array[i].Type == protocol.TyBulk && v.Array[i+1].Type == protocol.TyBulk {
+				out[string(v.Array[i].Str)] = string(v.Array[i+1].Str)
+				continue
+			}
+			k, err := elemString(v.Array[i])
+			if err != nil {
+				return nil, err
+			}
+			val, err := elemString(v.Array[i+1])
+			if err != nil {
+				return nil, err
+			}
+			out[k] = val
 		}
 		return out, nil
 	case protocol.TyNull:
