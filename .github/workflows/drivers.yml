@@ -104,9 +104,12 @@ jobs:
           go test -tags postgres -race -count=1 -timeout=300s
           ./test/conformance/postgres/...
       - name: pgspec
-        run: >-
-          go test -tags postgres -race -count=1 -timeout=300s
-          ./test/pgspec/...
+        run: |
+          set -o pipefail
+          go test -tags pgspec -race -count=1 -timeout=300s -v ./test/pgspec/... 2>&1 | tee pgspec.log
+          # A wrong build tag prints "[no test files]" and exits 0, and a
+          # missing server makes every test skip; either way nothing ran.
+          grep -q -- '^--- PASS' pgspec.log || { echo "::error::pgspec: no test passed (wrong build tag, or the suite skipped)"; exit 1; }
 
   # ------------------------------------------------------------------
   # Redis matrix
@@ -147,9 +150,12 @@ jobs:
           go test -tags redis -race -count=1 -timeout=300s
           ./test/conformance/redis/...
       - name: redisspec
-        run: >-
-          go test -tags redis -race -count=1 -timeout=300s
-          ./test/redisspec/...
+        run: |
+          set -o pipefail
+          go test -tags redisspec -race -count=1 -timeout=300s -v ./test/redisspec/... 2>&1 | tee redisspec.log
+          # A wrong build tag prints "[no test files]" and exits 0, and a
+          # missing server makes every test skip; either way nothing ran.
+          grep -q -- '^--- PASS' redisspec.log || { echo "::error::redisspec: no test passed (wrong build tag, or the suite skipped)"; exit 1; }
 
   # ------------------------------------------------------------------
   # Valkey matrix — open-source Redis-compatible continuation.
@@ -190,9 +196,12 @@ jobs:
           go test -tags redis -race -count=1 -timeout=300s
           ./test/conformance/redis/...
       - name: redisspec
-        run: >-
-          go test -tags redis -race -count=1 -timeout=300s
-          ./test/redisspec/...
+        run: |
+          set -o pipefail
+          go test -tags redisspec -race -count=1 -timeout=300s -v ./test/redisspec/... 2>&1 | tee redisspec.log
+          # A wrong build tag prints "[no test files]" and exits 0, and a
+          # missing server makes every test skip; either way nothing ran.
+          grep -q -- '^--- PASS' redisspec.log || { echo "::error::redisspec: no test passed (wrong build tag, or the suite skipped)"; exit 1; }
 
   # ------------------------------------------------------------------
   # Memcached matrix (#238) — LTS + latest 1.6.x.
@@ -228,6 +237,13 @@ jobs:
         run: >-
           go test -tags memcached -race -count=1 -timeout=300s
           ./test/conformance/memcached/...
+      - name: mcspec
+        run: |
+          set -o pipefail
+          go test -tags memcached -race -count=1 -timeout=300s -v ./test/mcspec/... 2>&1 | tee mcspec.log
+          # A wrong build tag prints "[no test files]" and exits 0, and a
+          # missing server makes every test skip; either way nothing ran.
+          grep -q -- '^--- PASS' mcspec.log || { echo "::error::mcspec: no test passed (wrong build tag, or the suite skipped)"; exit 1; }
 
   # ------------------------------------------------------------------
   # Memcached Cluster — 3-node ketama ring per memcached version.
