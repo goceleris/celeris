@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/bits"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -1248,39 +1249,17 @@ func statusCodeString(code int) string {
 	}
 }
 
+// statusText is the reason phrase of a status line: net/http's
+// http.StatusText for every code it names, so the native engines answer with
+// the text the std engine and net/http do (celeris#889 item 125: 405, 206, 408,
+// 412, 416 and 429, among others, went out as "Unknown"). A code it has no text
+// for keeps "Unknown", as before. The codes the hot path writes have pre-built
+// lines (statusLine200 and the rest of that block) and never come here.
 func statusText(code int) string {
-	switch code {
-	case 200:
-		return "OK"
-	case 201:
-		return "Created"
-	case 204:
-		return "No Content"
-	case 301:
-		return "Moved Permanently"
-	case 302:
-		return "Found"
-	case 304:
-		return "Not Modified"
-	case 400:
-		return "Bad Request"
-	case 401:
-		return "Unauthorized"
-	case 403:
-		return "Forbidden"
-	case 404:
-		return "Not Found"
-	case 413:
-		return "Request Entity Too Large"
-	case 500:
-		return "Internal Server Error"
-	case 502:
-		return "Bad Gateway"
-	case 503:
-		return "Service Unavailable"
-	default:
-		return "Unknown"
+	if s := http.StatusText(code); s != "" {
+		return s
 	}
+	return "Unknown"
 }
 
 // h1 streaming support — h1ResponseAdapter implements stream.Streamer.
