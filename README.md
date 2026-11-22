@@ -26,7 +26,7 @@ LEAD B (bolder; use ONLY if every item of the checklist in the PR description ho
 
 <p align="center">
   <strong>celeris is a Go HTTP engine that serves HTTP/1.1 and cleartext HTTP/2 from per-core epoll or io_uring event loops, with a route-group and middleware API in the spirit of Gin and Echo.</strong><br>
-  It ships PostgreSQL, Redis and memcached clients, and is validated on a real x86-64 and arm64 cluster.
+  It ships PostgreSQL, Redis and memcached clients, in beta, and is validated on a real x86-64 and arm64 cluster.
 </p>
 
 <p align="center">
@@ -43,7 +43,7 @@ LEAD B (bolder; use ONLY if every item of the checklist in the PR description ho
 - **Event loops, not a goroutine per connection.** On Linux, pinned per-core loops on epoll or io_uring; `Adaptive`, the default, switches between them under load. `Std` runs on `net/http` for development and other systems.
 - **A familiar API.** Route groups, named parameters, middleware, error-returning handlers, and `celeris.Adapt` to reuse a `net/http` handler.
 - **46 middleware packages in the repository.** Authentication, CORS, sessions, rate limiting, caching, compression, Prometheus and OpenTelemetry.
-- **Database clients.** First-party PostgreSQL, Redis and memcached clients, no CGo ([details](https://goceleris.dev/docs/data-stores)).
+- **Database clients.** First-party PostgreSQL, Redis and memcached clients, in beta, no CGo ([details](https://goceleris.dev/docs/data-stores)).
 - **Streaming.** WebSocket with a fan-out `Hub`, Server-Sent Events with a `Broker`, `StreamWriter` and `Detach`.
 - **Allocation discipline.** Request contexts are pooled and the core request paths are held to zero allocations by tests.
 - **Small dependency surface.** The root module depends directly on `golang.org/x/sys` and `golang.org/x/net` only.
@@ -108,6 +108,7 @@ The figures come from a cross-framework benchmark of 52 configurations of 31 fra
 ## Status and stability
 
 - **Releases.** v1.6.0 is the first release with a written [compatibility promise](GOVERNANCE.md#compatibility): the exported API follows the Go 1 promise within v1, checked in CI against the golden files in [`api/`](api/). v1.6.0 itself breaks earlier releases.
+- **Drivers (beta).** The PostgreSQL, Redis and memcached clients are beta: the exported API stays under the compatibility check, but behaviour fixes (what a value scans to, which cases return an error) may land in minor releases and are listed in the release notes. Supported types per driver: [[PLACEHOLDER: link to the supported-types pages]].
 - **Maturity.** celeris is a young project with one maintainer. Run it behind a TLS-terminating proxy and benchmark it on your own workload; TLS in-process is [#446](https://github.com/goceleris/celeris/issues/446).
 - **Platforms.** Linux is the production platform: io_uring needs 5.19 or later, epoll 5.10 or later. macOS and Windows run the std engine for development and testing.
 - **Security.** Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
@@ -240,7 +241,7 @@ api.GET("/cached", cachedHandler).Sync() // opt back to sync
 
 ## Database drivers
 
-[`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis) and [`driver/memcached`](driver/memcached) are first-party clients with no CGo and no TLS (connect over a trusted network or a TLS sidecar). Which connections run on the server's event loops depends on how you open them: see [Data stores](https://goceleris.dev/docs/data-stores) and [Runtime notes](https://goceleris.dev/docs/runtime-notes#database-drivers-and-event-loops).
+[`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis) and [`driver/memcached`](driver/memcached) are first-party clients, in beta, with no CGo and no TLS (connect over a trusted network or a TLS sidecar). Which connections run on the server's event loops depends on how you open them: see [Data stores](https://goceleris.dev/docs/data-stores) and [Runtime notes](https://goceleris.dev/docs/runtime-notes#database-drivers-and-event-loops).
 
 ## net/http compatibility
 

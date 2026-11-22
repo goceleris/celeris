@@ -159,6 +159,7 @@ not marked experimental: `celeris`, `celeristest`, `observe`, the
   is experimental follows the experimental level: today that is
   `observe.Snapshot`'s `ValidationCounters` field, of type
   `validation.Counters`, which exists only under `-tags=validation`.
+- **The database drivers are beta in v1.6.0** (`driver/postgres`, `driver/redis` and `driver/memcached`). The exported API of the driver packages stays under the compatibility check, but behaviour fixes (what a value scans to, which cases return an error) may land in minor releases and are listed in the release notes. Supported types per driver: [[PLACEHOLDER: link to the supported-types pages]].
 - **Not covered:**
   - Every package with an `internal` element in its import path:
     `internal/**`, `driver/internal/**`, `middleware/internal/**` and
