@@ -612,3 +612,38 @@ func TestDecodeTimestamptzTextSecondOffset(t *testing.T) {
 		}
 	}
 }
+
+// bytea_output=escape (a role or database setting, or a pooler that did not
+// take the startup parameter) prints bytea in the escape form on the text
+// paths. A "\x" prefix is the hex form (an escape-form backslash is "\\", so
+// the two cannot be confused).
+func TestByteaTextDecodesHexAndEscape(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want []byte
+	}{
+		{`\x`, []byte{}},
+		{`\x00ff7a`, []byte{0, 0xff, 'z'}},
+		{``, []byte{}},
+		{`abc`, []byte("abc")},
+		{`a\\b`, []byte(`a\b`)},
+		{`\\x41`, []byte(`\x41`)},
+		{`\000\001\377`, []byte{0, 1, 0xff}},
+		{`a\134b`, []byte(`a\b`)},
+		{`with space 'q' "d"`, []byte(`with space 'q' "d"`)},
+	} {
+		got, err := decodeByteaText([]byte(c.in))
+		if err != nil {
+			t.Errorf("decodeByteaText(%q): %v", c.in, err)
+			continue
+		}
+		if b, _ := got.([]byte); !bytes.Equal(b, c.want) || b == nil {
+			t.Errorf("decodeByteaText(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+	for _, bad := range []string{`\`, `a\`, `\9`, `\08`, `\400`, `\12`, `\x0`, `\xzz`} {
+		if got, err := decodeByteaText([]byte(bad)); err == nil {
+			t.Errorf("decodeByteaText(%q) = %v, want an error", bad, got)
+		}
+	}
+}
