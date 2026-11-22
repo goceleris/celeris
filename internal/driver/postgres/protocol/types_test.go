@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -564,5 +565,26 @@ func TestJSONArrayCodecsRoundTrip(t *testing.T) {
 		if len(got) != 1 || !bytes.Equal(got[0].([]byte), tc.in) {
 			t.Fatalf("array OID %d -> %v", tc.arr, got)
 		}
+	}
+}
+
+// float4 text is parsed at 32 bits, so it widens to the same float64 the
+// binary form decodes to.
+func TestDecodeFloat4TextMatchesBinary(t *testing.T) {
+	for _, in := range []string{"1.1", "0.1", "16777216", "3.4028235e+38", "-1.5e-45"} {
+		f32, err := strconv.ParseFloat(in, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bin := make([]byte, 4)
+		binary.BigEndian.PutUint32(bin, math.Float32bits(float32(f32)))
+		want, _ := decodeFloat4Binary(bin)
+		got, err := decodeFloat4Text([]byte(in))
+		if err != nil || got != want {
+			t.Errorf("%s: text %v err %v, binary %v", in, got, err, want)
+		}
+	}
+	if v, _ := decodeFloat4Text([]byte("NaN")); !math.IsNaN(v.(float64)) {
+		t.Errorf("NaN: got %v", v)
 	}
 }
