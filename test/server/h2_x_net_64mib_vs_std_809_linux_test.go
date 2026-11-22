@@ -7,15 +7,17 @@ import (
 	"time"
 )
 
-// h2XNetNativeFactor809 and h2XNetNativeCap809 are the two bounds of
-// TestH2XNetLargeResponseVsStd809 on each native engine: its elapsed time at
-// most this many times std's, measured in the same process with the same
-// client, and at most this long in absolute terms. The defect was 16 s against
-// std's 0.07 s (a factor of 200); the factor catches that with a wide margin
-// and the cap catches a slow runner that slows std too, while neither is a
-// tight bar that a shared runner's noise would trip.
+// The bounds of TestH2XNetLargeResponseVsStd809 on each native engine: its
+// elapsed time is at most h2XNetNativeFactor809 times std's, measured in the
+// same process with the same client, but never held below h2XNetNativeFloor809
+// (a std sample of 0.06 s would otherwise give a 0.30 s bar that a shared
+// runner's noise can trip) and never allowed above h2XNetNativeCap809 in
+// absolute terms. The defect was 16 s against std's 0.07 s: the floor still
+// catches it by a factor of 32, the factor and the cap catch a slow runner
+// that slows std too.
 const (
 	h2XNetNativeFactor809 = 5
+	h2XNetNativeFloor809  = 500 * time.Millisecond
 	h2XNetNativeCap809    = 2 * time.Second
 )
 
@@ -28,8 +30,13 @@ const (
 // which probe761H2Cell itself checks), the engine that ran is the one asked
 // for (an unavailable io_uring fails here, it does not pass without a
 // transfer: the CI job that runs this test has it), and its elapsed time is at
-// most h2XNetNativeFactor809 times std's of the same route and at most
-// h2XNetNativeCap809. Every failure names the measured times.
+// most h2XNetNativeFactor809 times std's of the same route, with that limit
+// held between h2XNetNativeFloor809 and h2XNetNativeCap809. Every failure names
+// the measured times.
+//
+// A plain `go test ./test/server` on a Linux host without io_uring or enough
+// memlock (WSL, containers) fails this test by design: the engine that ran
+// must be the one asked for.
 //
 // The test is for a plain build: the time of a transfer under -race or
 // coverage says nothing about the engine (the race detector alone costs it
@@ -48,7 +55,7 @@ func TestH2XNetLargeResponseVsStd809(t *testing.T) {
 				t.Fatalf("the std baseline did not complete: ran=%v running=%s end=%s elapsed=%.3fs", base.ran, base.running, base.end, base.elapsed.Seconds())
 			}
 			t.Logf("H2XNET809 route=%s engine=std elapsed=%.3fs", route, base.elapsed.Seconds())
-			limit := min(h2XNetNativeFactor809*base.elapsed, h2XNetNativeCap809)
+			limit := min(max(h2XNetNativeFactor809*base.elapsed, h2XNetNativeFloor809), h2XNetNativeCap809)
 			for _, e := range engines761[1:] {
 				t.Run(e.name, func(t *testing.T) {
 					r := probe761H2Cell(t, e.name, e.eng, async, n)
@@ -64,8 +71,8 @@ func TestH2XNetLargeResponseVsStd809(t *testing.T) {
 						t.Fatalf("%s: the 64 MiB transfer ended %q after %.3fs, want complete (std: %.3fs)", e.name, r.end, r.elapsed.Seconds(), base.elapsed.Seconds())
 					}
 					if r.elapsed > limit {
-						t.Errorf("%s: 64 MiB to x/net's http2.Transport took %.3fs, over %.3fs (the lesser of %dx std's %.3fs and %s)",
-							e.name, r.elapsed.Seconds(), limit.Seconds(), h2XNetNativeFactor809, base.elapsed.Seconds(), h2XNetNativeCap809)
+						t.Errorf("%s: 64 MiB to x/net's http2.Transport took %.3fs, over %.3fs (%dx std's %.3fs, held between %s and %s)",
+							e.name, r.elapsed.Seconds(), limit.Seconds(), h2XNetNativeFactor809, base.elapsed.Seconds(), h2XNetNativeFloor809, h2XNetNativeCap809)
 					}
 				})
 			}

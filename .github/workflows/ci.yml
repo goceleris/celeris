@@ -2667,7 +2667,8 @@ jobs:
   # about 16 s on epoll, io_uring and adaptive and 0.07 s on std (fixed by #965).
   # TestH2XNetLargeResponseVsStd809 holds it: on each native engine the transfer is
   # complete and takes at most 5 times std's, measured in the same process with the
-  # same client, and at most 2 s (not an absolute bar on a shared runner). It is a
+  # same client, with that limit held between 0.5 s and 2 s (no tight absolute bar on
+  # a shared runner; the defect was 16 s). It is a
   # timing test, so it is not built under -race and skips under coverage; the
   # `unit` job's -race runs and `large-response` (which names the lean-shape tests)
   # do not reach it, hence this job, on both architectures like zc-window. A
