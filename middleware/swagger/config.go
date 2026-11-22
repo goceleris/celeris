@@ -174,6 +174,15 @@ type Config struct {
 	// still panics if Options is not JSON-serializable, whichever renderer is
 	// selected. When nil, renderer defaults are used.
 	//
+	// The Scalar page sets "withDefaultFonts" to false unless Options names
+	// it, so that the viewer's browser does not fetch Scalar's fonts from
+	// fonts.scalar.com (a third-party request that discloses the viewer's
+	// address and the page's Referer); Scalar then uses the browser's own
+	// fonts. Options {"withDefaultFonts": true} opts back in. Scalar's request
+	// proxy (proxy.scalar.com) is used only when Options sets "proxyUrl",
+	// which this package never does: the page's "Test Request" goes straight
+	// to the spec's server.
+	//
 	// Example (ReDoc dark theme):
 	//
 	//	swagger.Config{
@@ -223,10 +232,7 @@ type Config struct {
 	// browser refuses a file whose bytes differ from the release this
 	// package was built against. The page then needs cdn.jsdelivr.net in
 	// its Content-Security-Policy and the viewer's browser needs Internet
-	// access. Wherever it is loaded from, Scalar's bundle also names
-	// fonts.scalar.com (its default fonts, Options "withDefaultFonts")
-	// and proxy.scalar.com (its request proxy, Options "proxyUrl").
-	// Default: false.
+	// access. Default: false.
 	//
 	// By default Swagger UI is served from a copy embedded in this package,
 	// under {BasePath}/assets/swagger-ui-dist@{SwaggerUIVersion}/ (with the
