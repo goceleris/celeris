@@ -75,7 +75,7 @@ func TestEncodingsPriority(t *testing.T) {
 			[8]string{"gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip"}},
 		{"q zstd lowest", "gzip, br, zstd;q=0.1",
 			[8]string{"br", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
-		// Equal q that is not 1: the client's order still decides.
+		// Equal q that is not 1: the server's order decides, as for q=1.
 		{"equal q 0.5", "br;q=0.5, zstd;q=0.5, gzip;q=0.5",
 			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "gzip"}},
 		// The wildcard.

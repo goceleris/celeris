@@ -12,7 +12,6 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/goceleris/celeris"
-	"github.com/goceleris/celeris/internal/negotiate"
 )
 
 // addVary adds Vary: Accept-Encoding to c's response unless a Vary line
@@ -226,7 +225,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		// c.AcceptsEncodings would rank equal q-values by the header (so
 		// "gzip, deflate, br, zstd" would always give gzip); it also names
 		// Accept-Encoding in Vary, which addVary does here, once.
-		encoding := negotiate.AcceptServerOrder(c.Header("accept-encoding"), encodings)
+		encoding := negotiateEncoding(c.Header("accept-encoding"), encodings)
 		addVary(c)
 		if encoding == "" {
 			// No matching encoding. Vary still names Accept-Encoding so

@@ -87,6 +87,12 @@ func Accept(header string, offers []string) string {
 // order, so "gzip, deflate, br, zstd" with offers [zstd, br, gzip] gives zstd
 // where Accept gives gzip; "br;q=1, gzip;q=0.8" gives br for either order of
 // offers, as a higher q-value still wins.
+//
+// Nothing in the root module calls it: middleware/compress is a module of its
+// own that cannot import an internal package older cores lack, so it carries a
+// copy of this rule for content codings (accept_encoding_1335.go), and
+// this function is the reference its differential test and fuzz target pin
+// that copy to (celeris#1335).
 func AcceptServerOrder(header string, offers []string) string {
 	var entryBuf [8]AcceptItem
 	entries := ParseInto(entryBuf[:0], header)
