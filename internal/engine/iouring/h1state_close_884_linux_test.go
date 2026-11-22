@@ -18,16 +18,24 @@ import (
 // HTTP/1 conn, without taking detachMu at a close site (finishCloseDetached's
 // close shape, cs.h1State != nil && !Detached). The dispatch goroutine nils
 // cs.h1State, under detachMu, when it turns an h2c upgrade into HTTP/2
-// (switchToH2Local). By the code the close reaches that read only with the
-// lock held (closeConn leaves the close to the goroutine while it holds the
-// lock). This test holds the goroutine in the upgrade, just before its write
-// of cs.h1State (h2cUpgradeHook), resets the connection so the worker's recv
-// error runs its close paths meanwhile, and lets the race detector decide: a
-// worker read of cs.h1State without detachMu in that window is unordered with
-// the write whatever the scheduler does (the construction of celeris#884 item
-// 83's TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine).
+// (switchToH2Local).
 //
-// Not covered here: the SEND_ZC submit accounting (prepSendSQE reads
+// What the test pins: with the goroutine held in the upgrade (holding
+// detachMu, just before its write of cs.h1State: h2cUpgradeHook) and the client
+// reset, the worker leaves the close to the goroutine (closeConn returns early
+// on dispatchBusy, so the conn stays open) and reads cs.h1State nowhere without
+// the lock during the hold; after the release the conn is closed. The race
+// detector is the oracle: a worker read of cs.h1State without detachMu in the
+// window is unordered with the goroutine's write. The construction is that of
+// celeris#884 item 83's TestAsyncH2CUpgradeOnFeedLeavesH1StateToTheGoroutine.
+//
+// What it does not pin: finishCloseDetached itself. During the hold it is not
+// reached (the close waits), and after the release it runs ordered by detachMu,
+// so an unlocked read injected at its entry is NOT caught. An unlocked read at
+// the entry of closeOnRecvEnd, the worker's recv-error site, is caught; that
+// was checked by mutation.
+//
+// Also not covered: the SEND_ZC submit accounting (prepSendSQE reads
 // cs.h1State.Detached). It is reached only from flushSend, which the worker
 // runs for an async conn under detachMu or leaves to the goroutine
 // (dispatchBusy), so a goroutine held in the upgrade never meets it; a probe
@@ -89,15 +97,15 @@ func holdUpgrade884(t *testing.T) (held chan struct{}, release chan struct{}, ti
 	return held, release, timedOut
 }
 
-// TestPeerResetDuringAnH2CUpgradeKeepsTheCloseShapeReadUnderTheLock884: the
+// TestPeerResetDuringAnH2CUpgradeLeavesTheCloseToTheGoroutine884: the
 // goroutine is held inside the upgrade of the conn's first request (it holds
 // detachMu there), the client resets the connection, and the worker's recv
 // error reaches closeOnRecvEnd/closeConn while cs.h1State is still set. The
-// worker must leave the close to the goroutine (closeOwed): reading cs.h1State at
-// the close shape before the goroutine's write, without the lock, is a race
-// the detector reports once the goroutine is released. The conn must then be
+// worker must leave the close to the goroutine (closeOwed), and a read of
+// cs.h1State by the worker without the lock meanwhile is a race the detector
+// reports once the goroutine is released. The conn must then be
 // closed once the goroutine lets go.
-func TestPeerResetDuringAnH2CUpgradeKeepsTheCloseShapeReadUnderTheLock884(t *testing.T) {
+func TestPeerResetDuringAnH2CUpgradeLeavesTheCloseToTheGoroutine884(t *testing.T) {
 	held, release, timedOut := holdUpgrade884(t)
 	e, addr := startH1StateProbeEngine884(t)
 
@@ -125,7 +133,7 @@ func TestPeerResetDuringAnH2CUpgradeKeepsTheCloseShapeReadUnderTheLock884(t *tes
 	// is the goroutine's to finish.
 	time.Sleep(300 * time.Millisecond)
 	if n := e.Metrics().ActiveConnections; n != 1 {
-		t.Logf("ActiveConnections = %d with the goroutine still in the upgrade (1 expected: the close waits for its lock)", n)
+		t.Errorf("ActiveConnections = %d with the goroutine still in the upgrade, want 1: the worker must leave the close to the goroutine", n)
 	}
 	close(release)
 	if !parkWait712(10*time.Second, func() bool { return e.Metrics().ActiveConnections == 0 }) {
