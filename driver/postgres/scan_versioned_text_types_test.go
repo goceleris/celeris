@@ -208,3 +208,22 @@ func TestScanRawByteaText(t *testing.T) {
 		t.Errorf("binary *[]byte: got %q err %v", bb, err)
 	}
 }
+
+// A NULL cell must clear a *json.RawMessage / *[]byte / *string rather than
+// leave the previous row's value in place.
+func TestScanRawNullClearsDest(t *testing.T) {
+	codec := protocol.LookupOID(protocol.OIDJSONB)
+	col := protocol.ColumnDesc{TypeOID: protocol.OIDJSONB, FormatCode: protocol.FormatBinary}
+	rm := json.RawMessage(`["stale"]`)
+	if err := scanRaw(&rm, nil, codec, col, false); err != nil || rm != nil {
+		t.Errorf("*json.RawMessage: got %q err %v, want nil", rm, err)
+	}
+	b := []byte("stale")
+	if err := scanRaw(&b, nil, codec, col, false); err != nil || b != nil {
+		t.Errorf("*[]byte: got %q err %v, want nil", b, err)
+	}
+	s := "stale"
+	if err := scanRaw(&s, nil, codec, col, false); err != nil || s != "" {
+		t.Errorf("*string: got %q err %v, want empty", s, err)
+	}
+}

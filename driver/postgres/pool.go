@@ -922,6 +922,8 @@ func assignNil(dest any) error {
 		*d = ""
 	case *[]byte:
 		*d = nil
+	case *json.RawMessage:
+		*d = nil
 	case *bool:
 		*d = false
 	default:
