@@ -6,7 +6,7 @@
 // Content-Range counts bytes of the unencoded representation and which is
 // sent as it is. Supported encodings are zstd, brotli
 // ("br"), gzip, and deflate; the default server-side priority is
-// zstd > br > gzip, which decides among the encodings the client accepts
+// gzip > zstd > br, which decides among the encodings the client accepts
 // with the same q-value (a browser's "gzip, deflate, br, zstd" carries none),
 // while a higher q-value the client sets still wins. Deflate is supported but
 // opt-in (add "deflate" to [Config].Encodings) because it is superseded by gzip.

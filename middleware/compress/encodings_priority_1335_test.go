@@ -10,7 +10,8 @@ import (
 
 // priorityOrders are the Config.Encodings values the table below is written
 // for, in column order. The first is the default configuration (New() with no
-// Config), which is ["zstd", "br", "gzip"]; the last adds the opt-in deflate.
+// Config), which is ["gzip", "zstd", "br"] and so answers as the column of that
+// order does; the last adds the opt-in deflate.
 var priorityOrders = [][]string{
 	nil, // New(): the default Encodings
 	{"zstd", "br", "gzip"},
@@ -33,7 +34,10 @@ var priorityOrders = [][]string{
 // and the order of the client's header does not. So a browser's "gzip,
 // deflate, br, zstd" gets what the server ranks first of the four, and
 // Config.Encodings does what its documentation says for the commonest request
-// (celeris#1335).
+// (celeris#1335). With the default order, gzip first, a client that offers gzip
+// at the highest weight gets gzip, as it did when the client's order decided
+// and gzip came first in it; only a client that named br or zstd before gzip
+// at equal weight, or "*" alone, moves (see TestDefaultEncodingsOrder).
 func TestEncodingsPriority(t *testing.T) {
 	body := testBody()
 	h := func(c *celeris.Context) error { return c.Blob(200, "text/plain", body) }
@@ -46,13 +50,13 @@ func TestEncodingsPriority(t *testing.T) {
 	}{
 		// What the browsers and the benchmark client send, no q-values.
 		{"browser", "gzip, deflate, br, zstd",
-			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
+			[8]string{"gzip", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
 		{"benchmark", "gzip, br",
-			[8]string{"br", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
+			[8]string{"gzip", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
 		{"br first", "br, gzip",
-			[8]string{"br", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
+			[8]string{"gzip", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
 		{"zstd first", "zstd, br, gzip",
-			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "gzip"}},
+			[8]string{"gzip", "zstd", "zstd", "br", "br", "gzip", "gzip", "gzip"}},
 		{"deflate then gzip", "deflate, gzip",
 			[8]string{"gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "deflate"}},
 		// A single encoding.
@@ -74,15 +78,15 @@ func TestEncodingsPriority(t *testing.T) {
 		{"q gzip over br", "gzip, br;q=0.5",
 			[8]string{"gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip", "gzip"}},
 		{"q zstd lowest", "gzip, br, zstd;q=0.1",
-			[8]string{"br", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
+			[8]string{"gzip", "br", "gzip", "br", "br", "gzip", "gzip", "gzip"}},
 		// Equal q that is not 1: the server's order decides, as for q=1.
 		{"equal q 0.5", "br;q=0.5, zstd;q=0.5, gzip;q=0.5",
-			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "gzip"}},
+			[8]string{"gzip", "zstd", "zstd", "br", "br", "gzip", "gzip", "gzip"}},
 		// The wildcard.
 		{"star", "*",
-			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
+			[8]string{"gzip", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
 		{"gzip then star", "gzip, *",
-			[8]string{"zstd", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
+			[8]string{"gzip", "zstd", "zstd", "br", "br", "gzip", "gzip", "deflate"}},
 		{"gzip refused, star", "gzip;q=0, *",
 			[8]string{"zstd", "zstd", "zstd", "br", "br", "br", "zstd", "deflate"}},
 		{"gzip low, star", "gzip;q=0.5, *",
@@ -125,6 +129,42 @@ func TestEncodingsPriority(t *testing.T) {
 						tc.ae, order, got, tc.want[i])
 				}
 			})
+		}
+	}
+}
+
+// TestDefaultEncodingsOrder pins the default Config.Encodings, ["gzip",
+// "zstd", "br"], and what it changes against the answers the client's header
+// order gave before celeris#1335 (the second field): the browser's and the
+// benchmark client's headers get gzip as they did, "br, gzip" (br before gzip
+// at equal weight) moves from br to gzip, and so do "zstd, br, gzip" and "*".
+func TestDefaultEncodingsOrder(t *testing.T) {
+	if got := defaultConfig.Encodings; len(got) != 3 || got[0] != "gzip" || got[1] != "zstd" || got[2] != "br" {
+		t.Fatalf("default Encodings %v, want [gzip zstd br]", got)
+	}
+	body := testBody()
+	h := func(c *celeris.Context) error { return c.Blob(200, "text/plain", body) }
+	for _, tc := range []struct{ ae, before, want string }{
+		{"gzip, deflate, br, zstd", "gzip", "gzip"},
+		{"gzip, br", "gzip", "gzip"},
+		{"gzip", "gzip", "gzip"},
+		{"br", "br", "br"},
+		{"zstd", "zstd", "zstd"},
+		{"gzip, br;q=0.5", "gzip", "gzip"},
+		{"br;q=1.0, gzip;q=0.8", "br", "br"},
+		{"gzip;q=0, *", "zstd", "zstd"},
+		// What moves.
+		{"br, gzip", "br", "gzip"},
+		{"zstd, br, gzip", "zstd", "gzip"},
+		{"*", "zstd", "gzip"},
+	} {
+		c, rec := celeristest.NewContextT(t, "GET", "/", celeristest.WithHeader("accept-encoding", tc.ae),
+			celeristest.WithHandlers(New(), h))
+		if err := c.Next(); err != nil {
+			t.Fatalf("%q: %v", tc.ae, err)
+		}
+		if got := rec.Header("content-encoding"); got != tc.want {
+			t.Errorf("Accept-Encoding %q: Content-Encoding %q, want %q (before celeris#1335: %q)", tc.ae, got, tc.want, tc.before)
 		}
 	}
 }

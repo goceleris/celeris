@@ -49,7 +49,7 @@ type Config struct {
 	// the client sets still wins: q=0 refuses an encoding, and a higher q
 	// beats a lower one whatever the order here.
 	// Supported values: "zstd", "br", "gzip", "deflate".
-	// Default: ["zstd", "br", "gzip"] (deflate is opt-in only).
+	// Default: ["gzip", "zstd", "br"] (deflate is opt-in only).
 	Encodings []string
 
 	// GzipLevel sets the gzip compression level.
@@ -84,7 +84,7 @@ const defaultBrotliLevel Level = 6
 
 var defaultConfig = Config{
 	MinLength:            256,
-	Encodings:            []string{"zstd", "br", "gzip"},
+	Encodings:            []string{"gzip", "zstd", "br"},
 	GzipLevel:            LevelDefault,
 	BrotliLevel:          LevelDefault,
 	ZstdLevel:            LevelDefault,

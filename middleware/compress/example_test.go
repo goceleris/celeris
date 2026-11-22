@@ -8,7 +8,7 @@ import (
 )
 
 func ExampleNew() {
-	// Default: zstd > brotli > gzip, MinLength 256.
+	// Default: gzip > zstd > brotli, MinLength 256.
 	//   server.Use(compress.New())
 	_ = compress.New()
 }
