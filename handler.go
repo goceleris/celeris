@@ -631,7 +631,11 @@ func (a *routerAdapter) runUnmatched(c *Context, s *stream.Stream, chain []Handl
 // answerOptions runs optionsChain for an OPTIONS request the router answers
 // itself (celeris#421). The Allow header is set before the chain runs, so it
 // is on the response whether autoOptions or a middleware (a CORS preflight's
-// 204) writes it.
+// 204, an authentication 401) writes it. That is intended: RFC 9110 §10.2.1
+// allows Allow on any response (only a 405 must carry it), and an OPTIONS
+// request asks what the path takes. The 405 path is the other way round, its
+// Allow is set at the end of its chain (withAllow). See
+// options_allow_rfc9110_889_test.go.
 func (a *routerAdapter) answerOptions(c *Context, s *stream.Stream, allowVal string) {
 	c.fullPath = "<options>"
 	c.SetHeader("allow", allowVal)

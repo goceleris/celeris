@@ -179,7 +179,7 @@ func TestScalarEscapesDataURLAttribute(t *testing.T) {
 			}
 			// The adjacent data-configuration attribute keeps its
 			// HTML-attribute escaping of the marshalled options.
-			assertContains(t, body, `data-configuration='`+html.EscapeString(`{"theme":"default"}`)+`'`)
+			assertContains(t, body, `data-configuration='`+html.EscapeString(`{"theme":"default","withDefaultFonts":false}`)+`'`)
 			assertContains(t, body, "<title>"+html.EscapeString(hostile)+"</title>")
 		})
 	}
@@ -254,7 +254,7 @@ func TestPlainConfigUnchanged(t *testing.T) {
 				AssetsPath: v.assetsPath,
 				CDN:        v.cdn,
 			})
-			assertContains(t, body, `<script id="api-reference" data-url="https://example.com/openapi.json" data-configuration='`+html.EscapeString(`{"theme":"default"}`)+`'></script>`)
+			assertContains(t, body, `<script id="api-reference" data-url="https://example.com/openapi.json" data-configuration='`+html.EscapeString(`{"theme":"default","withDefaultFonts":false}`)+`'></script>`)
 
 			body = servePage(t, Config{
 				SpecContent: jsonSpec,
