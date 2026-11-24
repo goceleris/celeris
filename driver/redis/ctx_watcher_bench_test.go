@@ -83,6 +83,7 @@ func BenchmarkDirectCtx(b *testing.B) {
 					if err := p.Exec(c.ctx); err != nil {
 						b.Fatal(err)
 					}
+					p.Release() // pooled, so the benchmark measures the driver and not the collector
 				}
 				run()
 				b.ReportAllocs()
