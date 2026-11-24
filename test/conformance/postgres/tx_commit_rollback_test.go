@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/driver/postgres"
 )
 
@@ -49,10 +48,15 @@ func TestCommitOfAnAbortedTransactionReportsTheRollback(t *testing.T) {
 	}
 	arms := map[string]func(t *testing.T) txn{
 		"database-sql": func(t *testing.T) txn {
+			// (no timeout on this context: database/sql ends the transaction when
+			// the context passed to BeginTx ends)
 			tx, err := db.BeginTx(ctx, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
+			// A failure must not leave the only conn (MaxOpen 1) in a transaction for
+			// the next subtest.
+			t.Cleanup(func() { _ = tx.Rollback() })
 			return txn{
 				func(q string) error { _, err := tx.ExecContext(ctx, q); return err },
 				tx.Commit,
@@ -60,21 +64,26 @@ func TestCommitOfAnAbortedTransactionReportsTheRollback(t *testing.T) {
 			}
 		},
 	}
-	for _, mode := range []string{"pool-direct", "pool-loop"} {
-		opts := []postgres.Option{postgres.WithMaxOpen(1)}
-		if mode == "pool-loop" {
-			opts = append(opts, postgres.WithEngine(celeris.New(celeris.Config{Addr: "127.0.0.1:0"})))
+	for _, mode := range []string{"pool-direct", "pool-engine"} {
+		// pool-engine: the Pool of the run's engine mode (engine_env_test.go), the
+		// event loop where the mode has one.
+		open := openPoolEngine
+		if mode == "pool-direct" {
+			open = func(dsn string, opts ...postgres.Option) (*postgres.Pool, error) { return postgres.Open(dsn, opts...) }
 		}
-		p, err := postgres.Open(dsn, opts...)
+		p, err := open(dsn, postgres.WithMaxOpen(1))
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = p.Close() })
 		arms[mode] = func(t *testing.T) txn {
-			tx, err := p.BeginTx(ctx, nil)
+			bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
+			defer bcancel()
+			tx, err := p.BeginTx(bctx, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = tx.Rollback() })
 			return txn{
 				func(q string) error { _, err := tx.ExecContext(ctx, q); return err },
 				tx.Commit,

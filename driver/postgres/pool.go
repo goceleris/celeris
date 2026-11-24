@@ -1167,7 +1167,10 @@ type Tx struct {
 }
 
 // Commit commits the transaction and returns the conn to the pool.
-// On failure, done is left false so a deferred Rollback can still fire.
+// On failure, done is left false so a deferred Rollback can still fire, except
+// for ErrTxCommitRollback: the server rolled the transaction back, so it is over
+// (done is set, the conn is released) and a later Rollback returns "tx already
+// finished".
 func (t *Tx) Commit() error {
 	if t.done {
 		return errors.New("celeris-postgres: tx already finished")

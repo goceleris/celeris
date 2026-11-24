@@ -21,8 +21,10 @@ func (t *pgTx) Commit() error {
 	if err == nil && rolledBack {
 		// The transaction was in the aborted state: the server treated the COMMIT
 		// as a ROLLBACK and reported no error. The transaction is over and the
-		// session is out of it; sessionDirty stays as BeginTx set it, so
-		// ResetSession still resets the session before the conn is reused.
+		// session is out of it. sessionDirty stays as BeginTx set it, so under
+		// database/sql ResetSession still resets the session before the conn is
+		// reused; the native Pool never calls ResetSession, and nothing depends on
+		// it there (the aborted transaction was rolled back, the session is idle).
 		return ErrTxCommitRollback
 	}
 	if err == nil {
