@@ -21,6 +21,7 @@ const (
 	OIDInt4        uint32 = 23
 	OIDText        uint32 = 25
 	OIDJSON        uint32 = 114
+	OIDJSONPath    uint32 = 4072
 	OIDFloat4      uint32 = 700
 	OIDFloat8      uint32 = 701
 	OIDUnknown     uint32 = 705
@@ -42,6 +43,10 @@ const (
 	OIDFloat8Arr  uint32 = 1022
 	OIDVarcharArr uint32 = 1015
 	OIDUUIDArr    uint32 = 2951
+
+	OIDJSONArr     uint32 = 199
+	OIDJSONBArr    uint32 = 3807
+	OIDJSONPathArr uint32 = 4073
 )
 
 // Format codes used in Bind/Describe messages.
@@ -658,11 +663,21 @@ func decodeJSONBinary(src []byte) (driver.Value, error) {
 }
 
 func decodeJSONBBinary(src []byte) (driver.Value, error) {
+	return decodeVersionedTextBinary("jsonb", src)
+}
+
+// decodeJSONPathBinary decodes a jsonpath value in binary format. Like jsonb
+// it is a version byte (1) followed by the text form.
+func decodeJSONPathBinary(src []byte) (driver.Value, error) {
+	return decodeVersionedTextBinary("jsonpath", src)
+}
+
+func decodeVersionedTextBinary(typ string, src []byte) (driver.Value, error) {
 	if len(src) < 1 {
-		return nil, fmt.Errorf("postgres/protocol: jsonb empty")
+		return nil, fmt.Errorf("postgres/protocol: %s empty", typ)
 	}
 	if src[0] != 1 {
-		return nil, fmt.Errorf("postgres/protocol: jsonb version %d unsupported", src[0])
+		return nil, fmt.Errorf("postgres/protocol: %s version %d unsupported", typ, src[0])
 	}
 	out := make([]byte, len(src)-1)
 	copy(out, src[1:])
@@ -804,6 +819,15 @@ func init() {
 		DecodeBinary: decodeJSONBBinary,
 		DecodeText:   decodeJSONBinary, // text jsonb has no version byte
 		EncodeBinary: encodeJSONBBinary,
+		EncodeText:   encodeJSONBinary,
+		ScanType:     reflect.TypeOf([]byte(nil)),
+	})
+	RegisterType(&TypeCodec{
+		OID:          OIDJSONPath,
+		Name:         "jsonpath",
+		DecodeBinary: decodeJSONPathBinary,
+		DecodeText:   decodeJSONBinary,  // text jsonpath has no version byte
+		EncodeBinary: encodeJSONBBinary, // same framing as jsonb: version byte + text
 		EncodeText:   encodeJSONBinary,
 		ScanType:     reflect.TypeOf([]byte(nil)),
 	})
