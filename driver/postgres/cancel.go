@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"syscall"
 	"time"
 )
 
@@ -87,7 +86,7 @@ func sendCancelRequest(_ context.Context, addr *net.TCPAddr, pid, secret int32) 
 	var buf [64]byte
 	for {
 		_, err = conn.Read(buf[:])
-		if err == io.EOF || errors.Is(err, syscall.ECONNRESET) {
+		if err == io.EOF || isConnReset(err) {
 			return nil
 		}
 		if err != nil {
