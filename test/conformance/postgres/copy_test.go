@@ -19,7 +19,7 @@ import (
 // database/sql setup for the CREATE TABLE / schema side.
 func openPool(t *testing.T) *postgres.Pool {
 	t.Helper()
-	p, err := postgres.Open(dsnFromEnv(t), postgres.WithMaxOpen(4))
+	p, err := openPoolEngine(dsnFromEnv(t), postgres.WithMaxOpen(4))
 	if err != nil {
 		t.Fatalf("postgres.Open: %v", err)
 	}
