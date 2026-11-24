@@ -1838,16 +1838,12 @@ func (c *pgConn) prepareStatement(ctx context.Context, name, query string) (*pro
 	if err := c.wait(ctx, req); err != nil {
 		return nil, err
 	}
-	prep := &protocol.PreparedStmt{
+	return &protocol.PreparedStmt{
 		Name:      ps.name,
 		Query:     ps.query,
 		ParamOIDs: ps.params,
 		Columns:   ps.cols,
-	}
-	// The columns are known now: choose each one's result format once, so
-	// every execution of the statement Binds with it.
-	prep.ResultFormats, prep.ResultColumns = protocol.ResultFormatsFor(prep.Columns)
-	return prep, nil
+	}, nil
 }
 
 // closePreparedServerAsync is the fire-and-forget variant used for cache
@@ -1935,7 +1931,7 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 		if stmt, ok := c.stmtCache.get(query); ok {
 			// Cached: skip the server-side Describe round-trip; we
 			// already know the row description from the initial prep.
-			return c.runExtendedQuery(ctx, stmt.Name, query, args, stmt.ResultFormats, stmt.ResultColumns)
+			return c.doExtendedQuery(ctx, stmt.Name, query, args, stmt.Columns)
 		}
 		// Cache miss with autoCache on — prepare + cache + execute.
 		name := c.mintStmtName()
@@ -1945,14 +1941,14 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
-			return c.runExtendedQuery(ctx, name, query, args, prep.ResultFormats, prep.ResultColumns)
+			return c.doExtendedQuery(ctx, name, query, args, prep.Columns)
 		}
 		// Prepare failed — fall through to the legacy path.
 	}
 	if len(args) == 0 {
 		return c.simpleQuery(ctx, query)
 	}
-	return c.extendedQuery(ctx, "", query, args, nil)
+	return c.extendedQuery(ctx, "", query, args)
 }
 
 // isListenOrUnlisten reports whether q starts with LISTEN or UNLISTEN
@@ -2490,47 +2486,21 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 // When stmtName is empty, Parse uses the unnamed statement; when non-empty,
 // a Parse for an already-server-known name is still valid (PG accepts
 // re-Parse of the same query with the same OIDs).
-//
-// prep is the statement's metadata when it is a prepared one (explicit
-// Prepare): its columns are known, so Bind asks for each in the format the
-// driver can decode, and Describe is still sent. For the unnamed statement
-// prep is nil and Bind asks for text, see [pgConn.runExtendedQuery].
-func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args []driver.NamedValue, prep *protocol.PreparedStmt) (driver.Rows, error) {
-	formats, _ := prep.ResultPlan()
-	rows, err := c.runExtendedQuery(ctx, stmtName, query, args, formats, nil)
+func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args []driver.NamedValue) (driver.Rows, error) {
+	rows, err := c.doExtendedQuery(ctx, stmtName, query, args, nil)
 	if stmtName != "" && isPreparedStatementNotFound(err) {
 		c.stmtCache.remove(query)
-		newPrep, prepErr := c.prepareStatement(ctx, stmtName, query)
+		prep, prepErr := c.prepareStatement(ctx, stmtName, query)
 		if prepErr != nil {
 			return nil, prepErr
 		}
-		c.stmtCache.put(query, newPrep)
-		rows, err = c.runExtendedQuery(ctx, stmtName, query, args, newPrep.ResultFormats, newPrep.ResultColumns)
+		c.stmtCache.put(query, prep)
+		rows, err = c.doExtendedQuery(ctx, stmtName, query, args, prep.Columns)
 	}
 	return rows, err
 }
 
-// doExtendedQuery runs an extended query, deriving the result formats from
-// cachedCols: nil means the columns are not known (Describe is sent and every
-// column is requested as text), anything else is a described column list.
-// The hot paths call [pgConn.runExtendedQuery] with a precomputed plan instead.
 func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, args []driver.NamedValue, cachedCols []protocol.ColumnDesc) (driver.Rows, error) {
-	if cachedCols == nil {
-		return c.runExtendedQuery(ctx, stmtName, query, args, protocol.ResultFormatsText(), nil)
-	}
-	formats, cols := protocol.ResultFormatsFor(cachedCols)
-	return c.runExtendedQuery(ctx, stmtName, query, args, formats, cols)
-}
-
-// runExtendedQuery is the extended-query driver. resultFormats is the Bind
-// result-format vector; cols, when non-nil, are the statement's columns with
-// FormatCode already set to match resultFormats (the plan of a prepared
-// statement, see [protocol.ResultFormatsFor]) and make the Describe round
-// trip unnecessary. When cols is nil, Describe 'P' is sent and the server's
-// RowDescription says which format each column came back in.
-//
-// resultFormats and cols are shared and read-only here.
-func (c *pgConn) runExtendedQuery(ctx context.Context, stmtName, query string, args []driver.NamedValue, resultFormats []int16, cachedCols []protocol.ColumnDesc) (driver.Rows, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -2553,14 +2523,16 @@ func (c *pgConn) runExtendedQuery(ctx context.Context, stmtName, query string, a
 	req.extended.HasDescribe = hasDescribe
 	if !hasDescribe {
 		// Prepare-time Describe returns FormatCode=0 (text) because
-		// Postgres doesn't decide the output encoding until Bind, which
-		// carries the resultFormats vector. cachedCols already carries the
-		// format chosen for each column (binary where the driver has a
-		// codec, text otherwise), so decode follows what Bind asks for. Copy
-		// it: the request keeps the slice and reuses its backing array, so
-		// the statement's shared plan must not be handed out.
+		// Postgres doesn't decide the output encoding until Execute,
+		// which carries the resultFormats vector. We pass
+		// [FormatBinary] below, so reflect that on the cached column
+		// slice to keep decode on the binary path. Use a shallow copy
+		// so the cached slice in stmtCache isn't mutated.
 		cols := make([]protocol.ColumnDesc, len(cachedCols))
 		copy(cols, cachedCols)
+		for i := range cols {
+			cols[i].FormatCode = protocol.FormatBinary
+		}
 		req.columns = cols
 		req.extended.Columns = cols
 	}
@@ -2578,6 +2550,7 @@ func (c *pgConn) runExtendedQuery(ctx context.Context, stmtName, query string, a
 		req.syncMode.Store(true)
 	}
 	c.enqueue(req)
+	resultFormats := []int16{protocol.FormatBinary}
 
 	// Sync fast path for extended query. See simpleQuery for syncMode rationale.
 	if c.syncLoop != nil {
