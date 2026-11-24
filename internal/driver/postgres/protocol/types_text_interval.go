@@ -58,8 +58,8 @@ func decodeIntervalBinary(src []byte) (driver.Value, error) {
 	// Every time field takes the sign of the whole time (truncating division).
 	hour := tm / usecsPerHour
 	rest := tm - hour*usecsPerHour
-	min := rest / usecsPerMinute
-	rest -= min * usecsPerMinute
+	mins := rest / usecsPerMinute
+	rest -= mins * usecsPerMinute
 	sec := rest / usecsPerSec
 	usec := rest - sec*usecsPerSec
 
@@ -81,8 +81,8 @@ func decodeIntervalBinary(src []byte) (driver.Value, error) {
 		if hour < 0 {
 			hour = -hour
 		}
-		if min < 0 {
-			min = -min
+		if mins < 0 {
+			mins = -mins
 		}
 		if sec < 0 {
 			sec = -sec
@@ -92,7 +92,7 @@ func decodeIntervalBinary(src []byte) (driver.Value, error) {
 		}
 		buf = pad2(buf, hour)
 		buf = append(buf, ':')
-		buf = pad2(buf, min)
+		buf = pad2(buf, mins)
 		buf = append(buf, ':')
 		buf = appendSeconds(buf, sec, usec)
 	}

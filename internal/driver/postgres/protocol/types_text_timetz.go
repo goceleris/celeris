@@ -33,16 +33,16 @@ func decodeTimetzBinary(src []byte) (driver.Value, error) {
 	} else {
 		buf = append(buf, '-')
 	}
-	hour, min, sec := zone/3600, zone%3600/60, zone%60
+	hour, mins, sec := zone/3600, zone%3600/60, zone%60
 	buf = pad2(buf, hour)
 	if sec != 0 {
 		buf = append(buf, ':')
-		buf = pad2(buf, min)
+		buf = pad2(buf, mins)
 		buf = append(buf, ':')
 		buf = pad2(buf, sec)
-	} else if min != 0 {
+	} else if mins != 0 {
 		buf = append(buf, ':')
-		buf = pad2(buf, min)
+		buf = pad2(buf, mins)
 	}
 	return string(buf), nil
 }
