@@ -28,7 +28,7 @@ import (
 // xml and enum the binary form IS the text, and the driver cannot tell an enum
 // from an unknown type by its OID.
 var binaryOnlyTypes = map[uint32]string{
-	22: "int2vector", 24: "regproc", 26: "oid", 27: "tid",
+	22: "int2vector", 24: "regproc", 27: "tid",
 	28: "xid", 29: "cid", 30: "oidvector", 143: "xml[]",
 	271: "xid8[]", 600: "point", 601: "lseg", 602: "path",
 	603: "box", 604: "polygon", 628: "line", 629: "line[]",
