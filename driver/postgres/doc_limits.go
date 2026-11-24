@@ -1,11 +1,11 @@
-// Package postgres connects exactly as v1.5.11 did, and reads the session settings it
-// does not set (see below).
+// Package postgres sends the same StartupMessage parameters as v1.5.11 did, and
+// reads the session settings it does not set (see below).
 //
 // # Session settings the driver does not set
 //
-// The StartupMessage carries the DSN's own parameters and nothing else, so the
-// driver connects through PgBouncer and other poolers exactly as v1.5.11 did (a
-// pooler refuses a startup parameter it does not track). The extended protocol
+// The StartupMessage carries the DSN's own parameters and nothing else, the same
+// parameters as v1.5.11 sends, so the driver connects through PgBouncer and other
+// poolers (a pooler refuses a startup parameter it does not track). The extended protocol
 // (every statement with arguments, cached, prepared or unnamed) asks for binary
 // results, which do not depend on session settings. The simple protocol (a
 // statement without arguments) reads the server's text, which a role or
@@ -36,10 +36,11 @@
 // The driver has no codec for time, timetz, interval, inet, cidr, macaddr,
 // macaddr8, oid, money, bit, the geometric types, tsvector, tsquery, ranges, and
 // the arrays of types without an array codec. On the extended protocol such a
-// column arrives in binary: scanning it into *string or *[]byte is an error that
-// names the type and says to cast it to text in the query (SELECT col::text),
-// *any and a sql.Scanner receive the raw bytes as in v1.5.11, and on the simple
-// protocol the text is the value. A type the driver does not know at all (an
+// column arrives in binary: scanning it into a *string is an error that names
+// the type and says to cast it to text in the query (SELECT col::text), a
+// *[]byte, *any and a sql.Scanner receive the value's wire bytes as in v1.5.11
+// (scan into a string for text), and on the simple protocol the text is the
+// value. A type the driver does not know at all (an
 // enum, a composite) is left as it was: an enum's binary form is its text.
 // Through database/sql the raw bytes still reach a *string, because database/sql
 // converts the driver's []byte itself: cast to text there. Typed codecs are

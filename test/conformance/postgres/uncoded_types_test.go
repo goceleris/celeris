@@ -13,8 +13,8 @@ import (
 
 // Types the driver has no codec for come back in the binary format on the
 // extended protocol, so a *string or *[]byte would receive raw wire bytes. They
-// are an error that names the type and says to cast to text; *any keeps what
-// v1.5.11 returned (the raw bytes), and the text form through a cast works. The
+// are an error that names the type and says to cast to text when scanned into a
+// *string; *[]byte and *any keep what v1.5.11 returned (the wire bytes), and the text form through a cast works. The
 // simple protocol (no arguments) reads text, where the text IS the value.
 func TestUncodedTypesIntoStringAreAnError(t *testing.T) {
 	cached := openSettingsPool(t, dsnFromEnv(t))
@@ -44,9 +44,8 @@ func TestUncodedTypesIntoStringAreAnError(t *testing.T) {
 					t.Errorf("*string: got %q err %v, want an error naming %s and saying to cast to ::text", s, err, c.typ)
 				}
 				var b []byte
-				err = pool.QueryRow(ctx, q, 1).Scan(&b)
-				if err == nil || !strings.Contains(err.Error(), "::text") {
-					t.Errorf("*[]byte: got %q err %v, want the same error", b, err)
+				if err := pool.QueryRow(ctx, q, 1).Scan(&b); err != nil || len(b) == 0 {
+					t.Errorf("*[]byte: got %q err %v, want the wire bytes (as v1.5.11)", b, err)
 				}
 				var a any
 				if err := pool.QueryRow(ctx, q, 1).Scan(&a); err != nil {

@@ -19,11 +19,11 @@ import (
 //     int32 length (-1 => NULL)
 //     bytes length   (omitted when length == -1)
 //
-// The driver exposes a one-dimensional array with the default lower bound as
-// []driver.Value. A multi-dimensional array, or one with another lower bound,
-// cannot be represented that way without losing its shape, so decoding it as a
-// column value is an error; callers that need the shape decode it with
-// DecodeArrayBinary, which returns Dims and LowerBound.
+// The driver exposes a one-dimensional array as []driver.Value (a lower bound
+// other than 1 is dropped, as in v1.5.11: the elements are right). A
+// multi-dimensional array cannot be represented that way without losing its
+// shape, so decoding it as a column value is an error; callers that need the
+// shape decode it with DecodeArrayBinary, which returns Dims and LowerBound.
 
 // DecodedArray is a lightweight view over a decoded array value.
 type DecodedArray struct {
@@ -173,9 +173,6 @@ func decodeArrayBinaryValue(src []byte) (driver.Value, error) {
 	// A flat slice would silently drop the dimensions: refuse instead.
 	if len(arr.Dims) > 1 {
 		return nil, fmt.Errorf("postgres/protocol: multi-dimensional array (%d dimensions) is not supported as a column value; cast it to text in the query (col::text) to read its literal", len(arr.Dims))
-	}
-	if len(arr.Dims) == 1 && arr.LowerBound[0] != 1 {
-		return nil, fmt.Errorf("postgres/protocol: array with lower bound %d is not supported as a column value; cast it to text in the query (col::text) to read its literal", arr.LowerBound[0])
 	}
 	// Expose as []driver.Value for uniformity with database/sql.
 	return arr.Elements, nil
