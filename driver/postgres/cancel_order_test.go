@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -282,7 +283,13 @@ func TestCancelFinishesBeforeNextStatement(t *testing.T) {
 					isQuery := kind == "query"
 					warmUp(t, run, isQuery)
 
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+					// The context ends when the slow statement reached the backend,
+					// not after a fixed time: no clock decides whether a cancel exists.
+					ctx, cancel := context.WithCancel(context.Background())
+					go func() {
+						<-f.slowCh
+						cancel()
+					}()
 					_ = run(ctx, fakeSlowQuery, isQuery) // an error or not: the statement raced its cancel
 					cancel()
 
@@ -318,8 +325,12 @@ func TestCancelExpiryDiscardsTheConn(t *testing.T) {
 				isQuery := kind == "query"
 				warmUp(t, run, isQuery)
 
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
+				go func() {
+					<-f.slowCh
+					cancel()
+				}()
 				errc := make(chan error, 1)
 				go func() { errc <- run(ctx, fakeSlowQuery, isQuery) }()
 				var err error
@@ -328,10 +339,10 @@ func TestCancelExpiryDiscardsTheConn(t *testing.T) {
 				case <-time.After(5 * time.Second):
 					t.Fatal("the cancelled call did not return after the cancel deadline")
 				}
-				if !errors.Is(err, context.DeadlineExceeded) {
-					t.Fatalf("err = %v, want the caller's context.DeadlineExceeded", err)
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("err = %v, want the caller's context.Canceled", err)
 				}
-				if errors.Is(err, ErrBadConn) {
+				if errors.Is(err, driver.ErrBadConn) || errors.Is(err, ErrBadConn) {
 					t.Fatalf("err = %v: ErrBadConn would make database/sql retry a statement that may have run", err)
 				}
 				nctx, ncancel := context.WithTimeout(context.Background(), 10*time.Second)
