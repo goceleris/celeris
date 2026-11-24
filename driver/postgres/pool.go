@@ -652,6 +652,11 @@ func (r *Rows) Scan(dest ...any) error {
 		if sr != nil && i < len(sr.current) && sr.current[i] != nil && i < len(sr.codecs) && i < len(sr.columns) {
 			// A streamed row: infinity into a string is read from the raw cell.
 			binaryFmt := !sr.textFormat && sr.columns[i].FormatCode != protocol.FormatText
+			if sr.codecs[i] == nil && binaryFmt {
+				if err := binaryOnlyGuard(dest[i], sr.codecs[i], sr.columns[i], binaryFmt); err != nil {
+					return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
+				}
+			}
 			if sr.codecs[i] != nil && isTimeOID(sr.codecs[i].OID) && rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
 				continue
 			}
@@ -690,6 +695,11 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		return assignNil(dest)
 	}
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
+	if codec == nil && binaryFmt {
+		if err := binaryOnlyGuard(dest, codec, col, binaryFmt); err != nil {
+			return err
+		}
+	}
 	// Binary format for known codecs — direct decode into typed pointer.
 	if codec != nil && binaryFmt {
 		if ok, err := decodeBinaryInto(dest, raw, codec); ok {
@@ -729,7 +739,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 	}
 	if textFormat || col.FormatCode == protocol.FormatText {
 		if codec.DecodeText != nil {
-			return codec.DecodeText(raw)
+			return decodeText(codec, raw)
 		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
@@ -739,7 +749,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 		return codec.DecodeBinary(raw)
 	}
 	if codec.DecodeText != nil {
-		return codec.DecodeText(raw)
+		return decodeText(codec, raw)
 	}
 	cp := make([]byte, len(raw))
 	copy(cp, raw)
@@ -781,8 +791,7 @@ func int64ToUint32(n int64) (uint32, error) {
 }
 
 // binaryFormIsValue reports whether a column of codec's type carries, in
-// binary result format, exactly the bytes a string or []byte destination
-// should receive. That holds for the text-like types (text, varchar, json) and
+// binary result format, exactly the bytes a string destination should receive. That holds for the text-like types (text, varchar, json) and
 // for bytea; every other registered codec decodes through its DecodeBinary.
 func binaryFormIsValue(codec *protocol.TypeCodec) bool {
 	switch codec.OID {
