@@ -3108,8 +3108,25 @@ func (c *pgConn) ServerParam(name string) string {
 	return c.serverParams[name]
 }
 
-// CheckNamedValue lets us accept any Go type and let encodeOne deal with it.
-func (c *pgConn) CheckNamedValue(_ *driver.NamedValue) error {
+// CheckNamedValue implements driver.NamedValueChecker. Because the conn
+// implements it, database/sql does not convert arguments itself, so the
+// conversion database/sql would normally do has to happen here: the kinds
+// encodeOne handles are passed through untouched (no allocation, no
+// reflection), everything else (driver.Valuer, sql.Null*, defined types such
+// as "type MyInt int", pointers, int8/int16/uint*) goes through
+// driver.DefaultParameterConverter. An argument it cannot convert (a struct,
+// a slice, a uint64 with the high bit set) is rejected here with a typed
+// error.
+func (c *pgConn) CheckNamedValue(nv *driver.NamedValue) error {
+	switch nv.Value.(type) {
+	case nil, bool, int, int32, int64, float32, float64, string, []byte, time.Time:
+		return nil
+	}
+	v, err := driver.DefaultParameterConverter.ConvertValue(nv.Value)
+	if err != nil {
+		return err
+	}
+	nv.Value = v
 	return nil
 }
 

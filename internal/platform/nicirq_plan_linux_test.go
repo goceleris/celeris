@@ -178,7 +178,7 @@ func TestReportOutsideAllowedIsNotUncovered(t *testing.T) {
 	eq(t, "serviced CPUs", got.IRQCPUs, []int{0, 4, 6, 8})
 	eq(t, "uncovered", got.IRQUncovered, []int(nil))
 	var buf bytes.Buffer
-	LogPinOutcome(slog.New(slog.NewTextHandler(&buf, nil)), "epoll", got, nil)
+	LogPinOutcome(testLog(&buf, slog.LevelInfo), "epoll", got, nil)
 	if strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "nic_irq_cpus=0,4,6,8") {
 		t.Errorf("log:\n%s", buf.String())
 	}
@@ -262,7 +262,7 @@ func TestReportRSSNICNamesEveryServicedLittleCPU(t *testing.T) {
 	eq(t, "uncovered", got.IRQUncovered, []int{2, 3, 4, 5})
 	eq(t, "loops", got.CPUs, base.CPUs)
 	var buf bytes.Buffer
-	LogPinOutcome(slog.New(slog.NewTextHandler(&buf, nil)), "epoll", got, nil)
+	LogPinOutcome(testLog(&buf, slog.LevelInfo), "epoll", got, nil)
 	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
 		t.Errorf("%d Warn lines, want exactly 1:\n%s", n, buf.String())
 	}
@@ -358,7 +358,7 @@ func TestReportUnknownVectorsAndEmptyResults(t *testing.T) {
 
 func TestLogPinOutcomeNICIRQ(t *testing.T) {
 	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	log := testLog(&buf, slog.LevelDebug)
 	nh := msr1NIC(t)
 
 	// The default plan: eight loops, CPU 4 services a vector and runs none: one
@@ -434,7 +434,7 @@ func TestAnnotatePlanWithNICIRQsRealHostAlike(t *testing.T) {
 
 func TestLogPinOutcomeNICIRQWording(t *testing.T) {
 	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	log := testLog(&buf, slog.LevelDebug)
 
 	// The Warn names the vector and the file the operator writes to.
 	nh := msr1NIC(t)
