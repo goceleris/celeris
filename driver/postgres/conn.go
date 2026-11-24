@@ -994,9 +994,12 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			c.onRecv(c.directBuf[:n])
 		}
 		if err != nil {
-			if hasDL && errors.Is(err, os.ErrDeadlineExceeded) && !time.Now().Before(dl) {
-				// The context's deadline: the statement is cancelled and the
-				// caller gets the context's error.
+			if hasDL && errors.Is(err, os.ErrDeadlineExceeded) && (ctx.Err() != nil || !time.Now().Before(dl)) {
+				// The context's deadline (nothing else sets a read deadline while
+				// this one is armed; the clock test is the check for a context whose
+				// Err is not set yet, and ctx.Err() covers a wall-clock step
+				// backwards under a deadline without a monotonic reading): the
+				// statement is cancelled and the caller gets the context's error.
 				cerr := ctx.Err()
 				if cerr == nil {
 					cerr = context.DeadlineExceeded

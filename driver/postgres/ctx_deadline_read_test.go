@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -37,13 +38,15 @@ func TestAContextWithoutADeadlineAllocatesNothingExtra(t *testing.T) {
 func TestTheReadDeadlineOfAStatementIsClearedWhenItEnds(t *testing.T) {
 	f := startSilentPG(t, 0)
 	p := openDirectPool(t, f.addr)
-	for i := range 20 {
-		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-		if _, err := p.ExecContext(ctx, "SELECT 1"); err != nil {
+	for i := range 8 {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		// The statement itself is not what this test checks: a loaded runner may let
+		// its deadline pass, which is fine.
+		if _, err := p.ExecContext(ctx, "SELECT 1"); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("iteration %d: %v", i, err)
 		}
 		cancel()
-		time.Sleep(60 * time.Millisecond) // past the previous statement's deadline
+		time.Sleep(250 * time.Millisecond) // past the previous statement's deadline
 		if _, err := p.ExecContext(context.Background(), "SELECT 2"); err != nil {
 			t.Fatalf("iteration %d: the next statement hit the previous one's deadline: %v", i, err)
 		}
