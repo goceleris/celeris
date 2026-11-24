@@ -968,6 +968,11 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return req.err
 		}
 		if err := ctx.Err(); err != nil {
+			// End the wake first: one that has not run yet (the context ended
+			// while this goroutine was not in Read) would otherwise replace the
+			// drain deadline below with "now" and the drain would fail a conn
+			// whose cancel was confirmed.
+			c.disarmWake()
 			// Returns once the cancel exchange finished; a conn whose
 			// exchange did not is failed (discarded), nothing to drain.
 			if !c.cancelRunning() {
