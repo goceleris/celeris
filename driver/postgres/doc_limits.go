@@ -1,9 +1,9 @@
-// This file is comment-only: the godoc for the session settings the driver
-// reads but does not set, kept apart from doc.go.
+// Package postgres connects exactly as before, and reads the session settings it
+// does not set (see below).
 //
 // # Session settings the driver does not set
 //
-// The driver connects exactly as before: the StartupMessage carries the DSN's
+// The StartupMessage carries the DSN's
 // own parameters and nothing else, so it works behind PgBouncer and other
 // poolers, which refuse a startup parameter they do not track. A role or
 // database can still change how PostgreSQL prints a result in the text format,

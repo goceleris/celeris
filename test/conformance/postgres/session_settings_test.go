@@ -55,6 +55,14 @@ func withParams(dsn string, params ...string) string {
 	return dsn + sep + strings.Join(params, "&")
 }
 
+// arrText renders an array cell: the text of a []byte, fmt.Sprint otherwise.
+func arrText(a any) string {
+	if b, ok := a.([]byte); ok {
+		return string(b)
+	}
+	return fmt.Sprint(a)
+}
+
 func openSettingsPool(t *testing.T, dsn string) *postgres.Pool {
 	t.Helper()
 	p, err := postgres.Open(dsn, postgres.WithMaxOpen(2))
@@ -88,6 +96,11 @@ func TestSessionByteaOutputEscapeRole(t *testing.T) {
 				var a any
 				if err := pool.QueryRow(ctx, `SELECT ARRAY['\x01ff'::bytea]`+suffix, args...).Scan(&a); err != nil {
 					t.Errorf("bytea[]: %v", err)
+				} else if got := arrText(a); got != "[[1 255]]" && got != `{"\\001\\377"}` {
+					// The binary path decodes the array; a text path hands back
+					// the server's array text (no array text decoder), which is
+					// the escape form double-escaped inside the array quoting.
+					t.Errorf("bytea[]: got %#v, want [[1 255]] or the server's text", a)
 				}
 			})
 		}
