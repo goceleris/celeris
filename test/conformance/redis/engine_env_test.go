@@ -3,9 +3,11 @@
 package redis_test
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -60,9 +62,20 @@ func engineProvider() celredis.ServerProvider {
 			if err != nil {
 				panic(err)
 			}
-			go func() { _ = s.StartWithListener(ln) }()
+			startErr := make(chan error, 1)
+			go func() { startErr <- s.StartWithListener(ln) }()
 			for i := 0; i < 100 && s.EventLoopProvider() == nil; i++ {
+				select {
+				case err := <-startErr:
+					panic("CELERIS_CONFORMANCE_ENGINE=" + mode + ": the server did not start: " + fmt.Sprint(err))
+				default:
+				}
 				time.Sleep(50 * time.Millisecond)
+			}
+			// On Linux a started native engine must expose its provider: without it the drivers silently run
+			// standalone and the arm would pass without testing what it names.
+			if runtime.GOOS == "linux" && s.EventLoopProvider() == nil {
+				panic("CELERIS_CONFORMANCE_ENGINE=" + mode + ": the started server has no event-loop provider after 5 s")
 			}
 			if ready {
 				for i := 0; i < 100; i++ {

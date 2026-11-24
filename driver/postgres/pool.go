@@ -75,6 +75,10 @@ type Option func(*options)
 // or with one that runs async handlers (also before it starts), dials through
 // Go's netpoll and sets no socket option. The Pool has no busy poll option of
 // its own; a [Connector] does ([Connector.WithSocketBusyPoll]).
+//
+// The driver takes the server's event loop once, when it is opened: open it after
+// srv.Addr() is non-nil to share the server's loops; opened earlier it uses the
+// driver's own loop for its whole life.
 func WithEngine(sp ServerProvider) Option {
 	return func(o *options) {
 		if sp == nil {

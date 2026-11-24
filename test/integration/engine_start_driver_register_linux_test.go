@@ -237,6 +237,23 @@ func oneStartRegisterIteration(f startRaceFakes, eng celeris.EngineType, async b
 		failures = append(failures, e)
 	}
 
+	// The drivers above all fall back to their standalone loop when the provider is hidden, so a fix that never let
+	// the provider appear would pass them: require that it does appear once the engine has bound, and is usable.
+	select {
+	case <-stopped:
+	default:
+		for end := time.Now().Add(10 * time.Second); srv.Addr() == nil && time.Now().Before(end); {
+			time.Sleep(time.Millisecond)
+		}
+		if srv.Addr() == nil {
+			failures = append(failures, "the engine never bound its address")
+		} else if prov := srv.EventLoopProvider(); prov == nil {
+			failures = append(failures, "EventLoopProvider() is nil after Addr() is non-nil")
+		} else if prov.NumWorkers() < 1 {
+			failures = append(failures, fmt.Sprintf("EventLoopProvider() has NumWorkers() = %d after Addr() is non-nil", prov.NumWorkers()))
+		}
+	}
+
 	// An engine that could not start on this host (io_uring without the kernel support) is a skip, not a failure.
 	select {
 	case <-stopped:
@@ -268,6 +285,20 @@ func engineCannotStart(err error) bool {
 	return strings.Contains(m, "not available") || strings.Contains(m, "cannot allocate memory")
 }
 
+// startRegisterIteration is oneStartRegisterIteration with a short retry when the engine could not start: the rings
+// of the previous iteration's io_uring engine are freed asynchronously, so a start under a small RLIMIT_MEMLOCK
+// often succeeds a moment later.
+func startRegisterIteration(f startRaceFakes, eng celeris.EngineType, async bool) (failures []string, skip string) {
+	for attempt := 0; attempt < 4; attempt++ {
+		failures, skip = oneStartRegisterIteration(f, eng, async)
+		if skip == "" {
+			return failures, ""
+		}
+		time.Sleep(time.Duration(attempt+1) * 150 * time.Millisecond)
+	}
+	return nil, skip
+}
+
 func TestDriversOpenedRightAfterStart(t *testing.T) {
 	f := startRegisterFakes(t)
 	for _, tc := range []struct {
@@ -285,7 +316,7 @@ func TestDriversOpenedRightAfterStart(t *testing.T) {
 			skipped, lastSkip := 0, ""
 			for i := 0; i < iters; i++ {
 				async := i%2 == 0
-				fails, skip := oneStartRegisterIteration(f, tc.eng, async)
+				fails, skip := startRegisterIteration(f, tc.eng, async)
 				if skip != "" {
 					skipped, lastSkip = skipped+1, skip
 					continue
