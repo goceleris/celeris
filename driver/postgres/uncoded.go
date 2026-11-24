@@ -1,6 +1,10 @@
 package postgres
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
+)
 
 // binaryOnlyTypes names the PostgreSQL types the driver has no codec for and
 // whose BINARY wire form is not their text: the extended protocol returns them
@@ -34,4 +38,21 @@ var binaryOnlyTypes = map[uint32]string{
 func errBinaryOnly(oid uint32, name string) error {
 	return fmt.Errorf("celeris-postgres: scan: column of type %s (OID %d) has no decoder in this driver, so a string or []byte "+
 		"would be its raw binary wire form; cast it to text in the query (SELECT col::text) or scan into any", name, oid)
+}
+
+// binaryOnlyGuard returns the error for a *string or *[]byte destination of a
+// column whose type has no codec and whose binary form is not its text. It is
+// nil for every other combination (a codec, text format, another destination, a
+// type that is not listed).
+func binaryOnlyGuard(dest any, codec *protocol.TypeCodec, col protocol.ColumnDesc, binaryFmt bool) error {
+	if codec != nil || !binaryFmt {
+		return nil
+	}
+	switch dest.(type) {
+	case *string, *[]byte:
+		if name, ok := binaryOnlyTypes[col.TypeOID]; ok {
+			return errBinaryOnly(col.TypeOID, name)
+		}
+	}
+	return nil
 }

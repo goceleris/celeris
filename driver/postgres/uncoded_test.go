@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
@@ -46,5 +47,34 @@ func TestScanRawBinaryOnlyTypeIntoString(t *testing.T) {
 	s = "STALE"
 	if err := scanRaw(&s, nil, nil, binaryCol(1186), false); err != nil || s != "" {
 		t.Errorf("NULL: got %q err %v", s, err)
+	}
+}
+
+// A streamed row (64 rows or more on the event loop) gets the same error.
+func TestStreamedRowBinaryOnlyTypeIntoString(t *testing.T) {
+	rowCh := make(chan [][]byte, 1)
+	rowCh <- [][]byte{make([]byte, 16)}
+	close(rowCh)
+	doneCh := make(chan struct{})
+	close(doneCh)
+	var errVal atomic.Pointer[error]
+	sr := &streamRows{
+		columns: []protocol.ColumnDesc{{Name: "i", TypeOID: 1186, FormatCode: protocol.FormatBinary}},
+		codecs:  []*protocol.TypeCodec{nil},
+		rowCh:   rowCh,
+		doneCh:  doneCh,
+		errVal:  &errVal,
+	}
+	rows := acquireRows(sr, nil, nil)
+	if !rows.Next() {
+		t.Fatal("no row")
+	}
+	var s string
+	if err := rows.Scan(&s); err == nil || !strings.Contains(err.Error(), "interval") || !strings.Contains(err.Error(), "::text") {
+		t.Errorf("got %q err %v, want an error naming interval and ::text", s, err)
+	}
+	var a any
+	if err := rows.Scan(&a); err != nil {
+		t.Errorf("*any: %v", err)
 	}
 }

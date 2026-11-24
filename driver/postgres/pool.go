@@ -648,6 +648,9 @@ func (r *Rows) Scan(dest ...any) error {
 		if sr != nil && i < len(sr.current) && sr.current[i] != nil && i < len(sr.codecs) && i < len(sr.columns) {
 			// A streamed row: infinity into a string is read from the raw cell.
 			binaryFmt := !sr.textFormat && sr.columns[i].FormatCode != protocol.FormatText
+			if err := binaryOnlyGuard(dest[i], sr.codecs[i], sr.columns[i], binaryFmt); err != nil {
+				return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
+			}
 			if rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
 				continue
 			}
@@ -689,15 +692,8 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 	if rawCellGuard(dest, raw, codec, binaryFmt) {
 		return nil
 	}
-	// A type with no codec and a binary form that is not its text must not
-	// reach a string or []byte as raw wire bytes: say so, naming the type.
-	if codec == nil && binaryFmt {
-		switch dest.(type) {
-		case *string, *[]byte:
-			if name, ok := binaryOnlyTypes[col.TypeOID]; ok {
-				return errBinaryOnly(col.TypeOID, name)
-			}
-		}
+	if err := binaryOnlyGuard(dest, codec, col, binaryFmt); err != nil {
+		return err
 	}
 	// Binary format for known codecs — direct decode into typed pointer.
 	if codec != nil && binaryFmt {
