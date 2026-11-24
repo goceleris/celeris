@@ -20,8 +20,10 @@ import (
 //     ("infinity" / "-infinity"), read from the wire value before any
 //     time.Time exists. No in-band sentinel may report a real value as
 //     something else.
-//   - a real 9999-12-31 23:59:59 into *string / *[]byte is itself
-//     (RFC3339Nano, "9999-12-31T23:59:59Z"), the same text on every path.
+//   - a real 9999-12-31 23:59:59 into *string / *[]byte is itself: RFC3339Nano
+//     ("9999-12-31T23:59:59Z") on the binary paths (cached, unnamed), and the
+//     server's own text ("9999-12-31 23:59:59") on the simple protocol, as in
+//     v1.5.11. It is never "infinity".
 //   - *time.Time and *any keep the documented sentinels (PGInfinity,
 //     PGNegInfinity), as in v1.5.11: a real value that equals PGInfinity is
 //     indistinguishable there, which the PGInfinity godoc says (check with
@@ -81,8 +83,10 @@ func TestNativeInfinityVersusRealMaximum(t *testing.T) {
 				if mode == "unnamed" {
 					p = pools["unnamed"]
 				}
-				if srv, ok := parseServerTime(serverText); ok {
+				if srv, ok := parseServerTime(serverText); ok && mode != "simple" {
 					wantStr = srv.UTC().Format(time.RFC3339Nano) // the server's own value, as RFC3339Nano
+				} else if mode == "simple" {
+					wantStr = serverText // the simple protocol hands over the server's text, as in v1.5.11
 				}
 				var s string
 				if err := p.QueryRow(ctx, q, args...).Scan(&s); err != nil || s != wantStr {
