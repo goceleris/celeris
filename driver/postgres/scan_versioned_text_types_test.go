@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -401,5 +403,38 @@ func TestScanRawInfinityIntoString(t *testing.T) {
 	col := protocol.ColumnDesc{TypeOID: protocol.OIDTimestamp, FormatCode: protocol.FormatBinary}
 	if err := scanRaw(&s, i64(math.MaxInt64-1), codec, col, false); err == nil && s == "infinity" {
 		t.Errorf("MaxInt64-1 read as infinity")
+	}
+}
+
+// float4 and float8 into *string use Go's shortest round-trip form: every such
+// string parses back to the identical float (for float4, the widened float32).
+// It is not the server's text ('1234567' reads '1.234567e+06'), which a release
+// note says.
+func TestScanRawFloatIntoStringParsesBack(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	col8 := protocol.ColumnDesc{TypeOID: protocol.OIDFloat8, FormatCode: protocol.FormatBinary}
+	col4 := protocol.ColumnDesc{TypeOID: protocol.OIDFloat4, FormatCode: protocol.FormatBinary}
+	c8, c4 := protocol.LookupOID(protocol.OIDFloat8), protocol.LookupOID(protocol.OIDFloat4)
+	for i := 0; i < 200000; i++ {
+		bits := rng.Uint64()
+		f := math.Float64frombits(bits)
+		var s string
+		if err := scanRaw(&s, binary.BigEndian.AppendUint64(nil, bits), c8, col8, false); err != nil {
+			t.Fatal(err)
+		}
+		got, err := strconv.ParseFloat(s, 64)
+		if err != nil || (math.Float64bits(got) != bits && !(math.IsNaN(f) && math.IsNaN(got))) {
+			t.Fatalf("float8 %x: %q parses back to %x (%v)", bits, s, math.Float64bits(got), err)
+		}
+		b32 := rng.Uint32()
+		f32 := math.Float32frombits(b32)
+		if err := scanRaw(&s, binary.BigEndian.AppendUint32(nil, b32), c4, col4, false); err != nil {
+			t.Fatal(err)
+		}
+		got, err = strconv.ParseFloat(s, 64)
+		want := float64(f32)
+		if err != nil || (got != want && !(math.IsNaN(want) && math.IsNaN(got))) {
+			t.Fatalf("float4 %x: %q parses back to %v, want %v (%v)", b32, s, got, want, err)
+		}
 	}
 }
