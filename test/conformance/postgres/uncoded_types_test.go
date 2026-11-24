@@ -22,13 +22,6 @@ func TestUncodedTypesIntoStringAreAnError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, c := range []struct{ typ, lit, text string }{
-		{"time", "'12:34:56.789'", "12:34:56.789"},
-		{"timetz", "'12:34:56.789+05:30'", "12:34:56.789+05:30"},
-		{"interval", "'1 day 02:03:04'", "1 day 02:03:04"},
-		{"inet", "'192.168.1.5/24'", "192.168.1.5/24"},
-		{"cidr", "'10.0.0.0/8'", "10.0.0.0/8"},
-		{"macaddr", "'08:00:2b:01:02:03'", "08:00:2b:01:02:03"},
-		{"oid", "4294967295", "4294967295"},
 		{"point", "'(1,2)'", "(1,2)"},
 		{"numeric[]", "'{1.5,2.50}'", "{1.5,2.50}"},
 		{"date[]", "'{2025-01-15}'", "{2025-01-15}"},
@@ -64,6 +57,71 @@ func TestUncodedTypesIntoStringAreAnError(t *testing.T) {
 			var s string
 			if err := cached.QueryRow(ctx, "SELECT "+c.lit+"::"+c.typ).Scan(&s); err != nil || s != c.text {
 				t.Errorf("simple *string: got %q err %v, want %q", s, err, c.text)
+			}
+		})
+	}
+}
+
+// Types with a binary-to-text codec (oid, ...): the extended protocol's binary
+// result decodes to the server's text, into *string and *[]byte (and *any holds
+// the same text as a string; oid, a number, holds an int64), where the type was
+// an error or raw bytes before. The simple protocol is untouched: it reads the
+// server's text, and *any there is that text as []byte, as in v1.5.11.
+func TestTextCodecTypesIntoString(t *testing.T) {
+	cached := openSettingsPool(t, dsnFromEnv(t))
+	unnamed := openSettingsPool(t, withParams(dsnFromEnv(t), "auto_cache_statements=false"))
+	db := openDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, c := range []struct {
+		typ, lit, text string
+		anyWant        any
+	}{
+		{"oid", "4294967295", "4294967295", int64(4294967295)},
+		{"time", "'12:34:56.789'", "12:34:56.789", "12:34:56.789"},
+		{"timetz", "'12:34:56.789+05:30'", "12:34:56.789+05:30", "12:34:56.789+05:30"},
+		{"inet", "'192.168.1.5/24'", "192.168.1.5/24", "192.168.1.5/24"},
+		{"inet", "'10.0.0.1/32'", "10.0.0.1", "10.0.0.1"},
+		{"cidr", "'10.0.0.0/8'", "10.0.0.0/8", "10.0.0.0/8"},
+		{"cidr", "'10.0.0.1/32'", "10.0.0.1/32", "10.0.0.1/32"},
+		{"macaddr", "'08:00:2b:01:02:03'", "08:00:2b:01:02:03", "08:00:2b:01:02:03"},
+		{"macaddr8", "'08:00:2b:01:02:03:04:05'", "08:00:2b:01:02:03:04:05", "08:00:2b:01:02:03:04:05"},
+		{"interval", "'1 year 2 mons -3 days 04:05:06.789'", "1 year 2 mons -3 days +04:05:06.789", "1 year 2 mons -3 days +04:05:06.789"},
+	} {
+		q := "SELECT " + c.lit + "::" + c.typ + " WHERE $1::int = 1"
+		for path, pool := range map[string]*postgres.Pool{"cached": cached, "unnamed": unnamed} {
+			t.Run(c.typ+"/"+path, func(t *testing.T) {
+				var s string
+				if err := pool.QueryRow(ctx, q, 1).Scan(&s); err != nil || s != c.text {
+					t.Errorf("*string: got %q err %v, want %q", s, err, c.text)
+				}
+				var b []byte
+				if err := pool.QueryRow(ctx, q, 1).Scan(&b); err != nil || string(b) != c.text {
+					t.Errorf("*[]byte: got %q err %v, want %q", b, err, c.text)
+				}
+				var a any
+				if err := pool.QueryRow(ctx, q, 1).Scan(&a); err != nil || a != c.anyWant {
+					t.Errorf("*any: got %#v err %v, want %#v", a, err, c.anyWant)
+				}
+			})
+		}
+		t.Run(c.typ+"/database-sql", func(t *testing.T) {
+			var s string
+			if err := db.QueryRowContext(ctx, q, 1).Scan(&s); err != nil || s != c.text {
+				t.Errorf("database/sql *string: got %q err %v, want %q", s, err, c.text)
+			}
+		})
+		t.Run(c.typ+"/simple", func(t *testing.T) {
+			var s string
+			if err := cached.QueryRow(ctx, "SELECT "+c.lit+"::"+c.typ).Scan(&s); err != nil || s != c.text {
+				t.Errorf("simple *string: got %q err %v, want %q", s, err, c.text)
+			}
+			var a any
+			if err := cached.QueryRow(ctx, "SELECT "+c.lit+"::"+c.typ).Scan(&a); err != nil {
+				t.Fatalf("simple *any: %v", err)
+			}
+			if b, ok := a.([]byte); !ok || string(b) != c.text {
+				t.Errorf("simple *any: got %#v, want the server's text %q as []byte (v1.5.11)", a, c.text)
 			}
 		})
 	}

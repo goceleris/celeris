@@ -9,11 +9,14 @@ import (
 // binaryOnlyTypes names the PostgreSQL built-in types the driver has no codec
 // for and whose BINARY wire form is not their text: the extended protocol
 // returns them in binary, so a string or []byte destination would receive raw
-// wire bytes (an interval is 16 bytes, an inet a family and mask byte plus the
-// address, an array a header and length-prefixed elements). Scanning one into
+// wire bytes (a point is 16 bytes, a bit string a length and packed bits, an
+// array a header and length-prefixed elements). Scanning one into
 // *string or *[]byte is an error that names the type and says to cast it to text
 // in the query, rather than a value that only looks like data. *any and a
 // sql.Scanner still receive the raw bytes, as in v1.5.11.
+//
+// The types that have a binary-to-text codec (time, timetz, interval, inet,
+// cidr, macaddr, macaddr8, oid) are not listed: they decode to their text.
 //
 // The list is every built-in base, range and multirange type whose send
 // function is not a text one (textsend, varcharsend, bpcharsend, namesend,
@@ -28,20 +31,20 @@ import (
 // xml and enum the binary form IS the text, and the driver cannot tell an enum
 // from an unknown type by its OID.
 var binaryOnlyTypes = map[uint32]string{
-	22: "int2vector", 24: "regproc", 26: "oid", 27: "tid",
+	22: "int2vector", 24: "regproc", 27: "tid",
 	28: "xid", 29: "cid", 30: "oidvector", 143: "xml[]",
 	271: "xid8[]", 600: "point", 601: "lseg", 602: "path",
 	603: "box", 604: "polygon", 628: "line", 629: "line[]",
-	650: "cidr", 651: "cidr[]", 718: "circle", 719: "circle[]",
-	774: "macaddr8", 775: "macaddr8[]", 790: "money", 791: "money[]",
-	829: "macaddr", 869: "inet", 1002: "char[]", 1003: "name[]",
+	651: "cidr[]", 718: "circle", 719: "circle[]",
+	775: "macaddr8[]", 790: "money", 791: "money[]",
+	1002: "char[]", 1003: "name[]",
 	1006: "int2vector[]", 1008: "regproc[]", 1010: "tid[]", 1011: "xid[]",
 	1012: "cid[]", 1013: "oidvector[]", 1014: "bpchar[]", 1017: "point[]",
 	1018: "lseg[]", 1019: "path[]", 1020: "box[]", 1027: "polygon[]",
 	1028: "oid[]", 1034: "aclitem[]", 1040: "macaddr[]", 1041: "inet[]",
-	1083: "time", 1115: "timestamp[]", 1182: "date[]", 1183: "time[]",
-	1185: "timestamptz[]", 1186: "interval", 1187: "interval[]", 1231: "numeric[]",
-	1266: "timetz", 1270: "timetz[]", 1560: "bit", 1561: "bit[]",
+	1115: "timestamp[]", 1182: "date[]", 1183: "time[]",
+	1185: "timestamptz[]", 1187: "interval[]", 1231: "numeric[]",
+	1270: "timetz[]", 1560: "bit", 1561: "bit[]",
 	1562: "varbit", 1563: "varbit[]", 2201: "refcursor[]", 2202: "regprocedure",
 	2203: "regoper", 2204: "regoperator", 2205: "regclass", 2206: "regtype",
 	2207: "regprocedure[]", 2208: "regoper[]", 2209: "regoperator[]", 2210: "regclass[]",

@@ -890,7 +890,7 @@ func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, erro
 	case *int:
 		n, err := protocol.ParseIntTextASCII(raw)
 		if err != nil {
-			return true, err
+			return textFormErr(codec, err)
 		}
 		v, err := int64ToInt(n)
 		if err != nil {
@@ -901,14 +901,14 @@ func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, erro
 	case *int64:
 		n, err := protocol.ParseIntTextASCII(raw)
 		if err != nil {
-			return true, err
+			return textFormErr(codec, err)
 		}
 		*d = n
 		return true, nil
 	case *int32:
 		n, err := protocol.ParseIntTextASCII(raw)
 		if err != nil {
-			return true, err
+			return textFormErr(codec, err)
 		}
 		v, err := int64ToInt32(n)
 		if err != nil {
@@ -932,6 +932,21 @@ func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, erro
 		return true, nil
 	}
 	return false, nil
+}
+
+// textFormErr is the error of a failed integer parse of a text-format cell. For
+// the types whose binary form decodes to its text (time, timetz, interval,
+// inet, cidr, macaddr, macaddr8) the text is not a number and never was one: the
+// cell falls back to the generic conversion, whose error is the one these types
+// gave before they had a codec (the simple protocol's result for them is
+// untouched by the binary-to-text codecs). Only the failure path asks, so the
+// integer hot path is unchanged.
+func textFormErr(codec *protocol.TypeCodec, err error) (bool, error) {
+	switch codec.OID {
+	case protocol.OIDTime, protocol.OIDTimetz, protocol.OIDInterval, protocol.OIDInet, protocol.OIDCidr, protocol.OIDMacaddr, protocol.OIDMacaddr8:
+		return false, nil
+	}
+	return true, err
 }
 
 // assignNil stores a NULL cell into dest. It never leaves dest as it was:

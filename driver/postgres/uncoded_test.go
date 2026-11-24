@@ -13,22 +13,22 @@ import (
 // type that is not listed (an enum's binary form is its text) is left alone,
 // and the simple protocol's text is the value.
 func TestScanRawBinaryOnlyTypeIntoString(t *testing.T) {
-	interval := make([]byte, 16)
+	raw := make([]byte, 16)
 	binaryCol := func(oid uint32) protocol.ColumnDesc {
 		return protocol.ColumnDesc{TypeOID: oid, FormatCode: protocol.FormatBinary}
 	}
-	for _, oid := range []uint32{1186, 1083, 869, 650, 829, 26, 1231, 1182} {
+	for _, oid := range []uint32{600, 790, 1560, 3904, 3614, 1231, 1182} {
 		var s string
-		err := scanRaw(&s, interval, nil, binaryCol(oid), false)
+		err := scanRaw(&s, raw, nil, binaryCol(oid), false)
 		if err == nil || !strings.Contains(err.Error(), binaryOnlyTypes[oid]) || !strings.Contains(err.Error(), "::text") || s != "" {
 			t.Errorf("oid %d into *string: got %q err %v, want an error naming %q and ::text", oid, s, err, binaryOnlyTypes[oid])
 		}
 		var b []byte
-		if err := scanRaw(&b, interval, nil, binaryCol(oid), false); err == nil || b != nil {
+		if err := scanRaw(&b, raw, nil, binaryCol(oid), false); err == nil || b != nil {
 			t.Errorf("oid %d into *[]byte: got %q err %v, want an error", oid, b, err)
 		}
 		var a any
-		if err := scanRaw(&a, interval, nil, binaryCol(oid), false); err != nil {
+		if err := scanRaw(&a, raw, nil, binaryCol(oid), false); err != nil {
 			t.Errorf("oid %d into *any: %v", oid, err)
 		} else if got, ok := a.([]byte); !ok || len(got) != 16 {
 			t.Errorf("oid %d into *any: got %#v, want the raw bytes as in v1.5.11", oid, a)
@@ -40,12 +40,12 @@ func TestScanRawBinaryOnlyTypeIntoString(t *testing.T) {
 		t.Errorf("unlisted OID: got %q err %v, want happy", s, err)
 	}
 	// The simple protocol reads text: the text is the value.
-	if err := scanRaw(&s, []byte("1 day 02:03:04"), nil, protocol.ColumnDesc{TypeOID: 1186}, true); err != nil || s != "1 day 02:03:04" {
+	if err := scanRaw(&s, []byte("(1,2)"), nil, protocol.ColumnDesc{TypeOID: 600}, true); err != nil || s != "(1,2)" {
 		t.Errorf("text format: got %q err %v", s, err)
 	}
 	// A NULL is a NULL.
 	s = "STALE"
-	if err := scanRaw(&s, nil, nil, binaryCol(1186), false); err != nil || s != "" {
+	if err := scanRaw(&s, nil, nil, binaryCol(600), false); err != nil || s != "" {
 		t.Errorf("NULL: got %q err %v", s, err)
 	}
 }
@@ -59,7 +59,7 @@ func TestStreamedRowBinaryOnlyTypeIntoString(t *testing.T) {
 	close(doneCh)
 	var errVal atomic.Pointer[error]
 	sr := &streamRows{
-		columns: []protocol.ColumnDesc{{Name: "i", TypeOID: 1186, FormatCode: protocol.FormatBinary}},
+		columns: []protocol.ColumnDesc{{Name: "i", TypeOID: 600, FormatCode: protocol.FormatBinary}},
 		codecs:  []*protocol.TypeCodec{nil},
 		rowCh:   rowCh,
 		doneCh:  doneCh,
@@ -70,8 +70,8 @@ func TestStreamedRowBinaryOnlyTypeIntoString(t *testing.T) {
 		t.Fatal("no row")
 	}
 	var s string
-	if err := rows.Scan(&s); err == nil || !strings.Contains(err.Error(), "interval") || !strings.Contains(err.Error(), "::text") {
-		t.Errorf("got %q err %v, want an error naming interval and ::text", s, err)
+	if err := rows.Scan(&s); err == nil || !strings.Contains(err.Error(), "point") || !strings.Contains(err.Error(), "::text") {
+		t.Errorf("got %q err %v, want an error naming point and ::text", s, err)
 	}
 	var a any
 	if err := rows.Scan(&a); err != nil {

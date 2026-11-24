@@ -31,17 +31,32 @@
 // Workaround: set extra_float_digits to 1 or more on the role or database, or
 // give the statement an argument. Tracked in goceleris/celeris#1364.
 //
+// # Types decoded to their text
+//
+// The binary result of time, timetz, interval, inet, cidr, macaddr, macaddr8 and
+// oid is decoded to the text the server prints for the value: a string (an int64
+// for oid) into *any, and the same text into *string, *[]byte and, through
+// database/sql, *string. The text is the server's ::text for the value under the
+// default settings (inet: its output function, which leaves /32 and /128 off, not
+// the text(inet) cast, which keeps them). An interval is always in the
+// IntervalStyle postgres form (1 year 2 mons -3 days +04:05:06.789), whatever the
+// session's IntervalStyle, because the binary form carries no style; the simple
+// protocol returns the server's text in the session's style. An interval, time
+// or timetz is not decoded to a Go time or duration: scan it into a string, or
+// cast it in the query (EXTRACT(EPOCH FROM ...)). Arrays of these types have no
+// codec (below).
+//
 // # Types without a codec
 //
-// The driver has no codec for time, timetz, interval, inet, cidr, macaddr,
-// macaddr8, oid, money, bit, the geometric types, tsvector, tsquery, ranges, and
-// the arrays of types without an array codec. On the extended protocol such a
-// column arrives in binary: scanning it into *string or *[]byte is an error that
-// names the type and says to cast it to text in the query (SELECT col::text),
-// *any and a sql.Scanner receive the raw bytes as in v1.5.11, and on the simple
-// protocol the text is the value. A type the driver does not know at all (an
-// enum, a composite) is left as it was: an enum's binary form is its text.
-// Through database/sql the raw bytes still reach a *string, because database/sql
-// converts the driver's []byte itself: cast to text there. Typed codecs are
-// tracked in goceleris/celeris#1352.
+// The driver has no codec for money, bit, the geometric types, tsvector, tsquery,
+// ranges, and the arrays of types without an array codec (numeric[], date[],
+// timestamp[], time[], interval[], inet[], oid[] ...). On the extended protocol
+// such a column arrives in binary: scanning it into *string or *[]byte is an
+// error that names the type and says to cast it to text in the query (SELECT
+// col::text), *any and a sql.Scanner receive the raw bytes as in v1.5.11, and on
+// the simple protocol the text is the value. A type the driver does not know at
+// all (an enum, a composite) is left as it was: an enum's binary form is its
+// text. Through database/sql the raw bytes still reach a *string, because
+// database/sql converts the driver's []byte itself: cast to text there. Typed
+// codecs are tracked in goceleris/celeris#1352.
 package postgres
