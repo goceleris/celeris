@@ -25,6 +25,10 @@ func buildCancelRequest(pid, secret int32) []byte {
 	return buf
 }
 
+// cancelExchangeTimeout bounds the whole cancel exchange: dial, write.
+// A var so the tests can shorten it.
+var cancelExchangeTimeout = 5 * time.Second
+
 // sendCancelRequest dials a fresh short-lived TCP connection to addr and
 // transmits a CancelRequest. Does not use the event loop — cancellation is
 // fire-and-forget: we don't wait for a reply, the server simply closes the
@@ -33,9 +37,9 @@ func buildCancelRequest(pid, secret int32) []byte {
 // If ctx has a deadline, it is enforced on both dial and write. The function
 // never blocks waiting for a server response.
 func sendCancelRequest(_ context.Context, addr *net.TCPAddr, pid, secret int32) error {
-	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	cancelCtx, cancel := context.WithTimeout(context.Background(), cancelExchangeTimeout)
 	defer cancel()
-	d := net.Dialer{Timeout: 5 * time.Second}
+	d := net.Dialer{Timeout: cancelExchangeTimeout}
 	conn, err := d.DialContext(cancelCtx, "tcp", addr.String())
 	if err != nil {
 		return err
@@ -44,7 +48,7 @@ func sendCancelRequest(_ context.Context, addr *net.TCPAddr, pid, secret int32) 
 	if deadline, ok := cancelCtx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
-		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_ = conn.SetWriteDeadline(time.Now().Add(cancelExchangeTimeout))
 	}
 	_, err = conn.Write(buildCancelRequest(pid, secret))
 	return err
