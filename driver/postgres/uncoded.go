@@ -39,7 +39,7 @@ var binaryOnlyTypes = map[uint32]string{
 	1012: "cid[]", 1013: "oidvector[]", 1014: "bpchar[]", 1017: "point[]",
 	1018: "lseg[]", 1019: "path[]", 1020: "box[]", 1027: "polygon[]",
 	1028: "oid[]", 1034: "aclitem[]", 1040: "macaddr[]", 1041: "inet[]",
-	1083: "time", 1115: "timestamp[]", 1182: "date[]", 1183: "time[]",
+	1115: "timestamp[]", 1182: "date[]", 1183: "time[]",
 	1185: "timestamptz[]", 1186: "interval", 1187: "interval[]", 1231: "numeric[]",
 	1266: "timetz", 1270: "timetz[]", 1560: "bit", 1561: "bit[]",
 	1562: "varbit", 1563: "varbit[]", 2201: "refcursor[]", 2202: "regprocedure",

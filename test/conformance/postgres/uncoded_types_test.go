@@ -22,7 +22,6 @@ func TestUncodedTypesIntoStringAreAnError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, c := range []struct{ typ, lit, text string }{
-		{"time", "'12:34:56.789'", "12:34:56.789"},
 		{"timetz", "'12:34:56.789+05:30'", "12:34:56.789+05:30"},
 		{"interval", "'1 day 02:03:04'", "1 day 02:03:04"},
 		{"inet", "'192.168.1.5/24'", "192.168.1.5/24"},
@@ -84,6 +83,7 @@ func TestTextCodecTypesIntoString(t *testing.T) {
 		anyWant        any
 	}{
 		{"oid", "4294967295", "4294967295", int64(4294967295)},
+		{"time", "'12:34:56.789'", "12:34:56.789", "12:34:56.789"},
 	} {
 		q := "SELECT " + c.lit + "::" + c.typ + " WHERE $1::int = 1"
 		for path, pool := range map[string]*postgres.Pool{"cached": cached, "unnamed": unnamed} {
