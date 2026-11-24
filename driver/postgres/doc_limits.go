@@ -1,3 +1,6 @@
+// Package postgres connects exactly as v1.5.11 did, and reads the session settings it
+// does not set (see below).
+//
 // # Session settings the driver does not set
 //
 // The StartupMessage carries the DSN's own parameters and nothing else, so the
