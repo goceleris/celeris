@@ -103,9 +103,12 @@ jobs:
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
           ./test/conformance/postgres/...
+      # The pgspec files carry //go:build pgspec (test/pgspec/doc.go), not
+      # postgres: with -tags postgres this step compiled nothing and reported
+      # "[no test files]".
       - name: pgspec
         run: >-
-          go test -tags postgres -race -count=1 -timeout=300s
+          go test -tags pgspec -race -count=1 -timeout=300s
           ./test/pgspec/...
 
   # ------------------------------------------------------------------
