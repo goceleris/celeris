@@ -15,16 +15,21 @@ import (
 )
 
 // A Pool conn in direct mode waits in a socket read that does not look at its
-// context. These tests use a backend that sends NOTHING for a statement until
-// a CancelRequest reaches it (no partial reply that would wake the read), and
-// ask that a context that ends mid-statement, by deadline or by cancel(), ends
-// the call with the context's error; that the conn is reused after a confirmed
-// cancel exchange (and not before the exchange ended); and that it is
-// discarded when the exchange is not confirmed.
+// context. A context WITH a deadline is enforced through the socket's read
+// deadline; a context without one (cancel-only) is not watched at all, as in
+// v1.5.11. These tests use a backend that sends NOTHING for a statement until a
+// CancelRequest reaches it (no partial reply that would wake the read), and ask
+// that a context whose deadline passes mid-statement ends the call with the
+// context's error; that the conn is reused after a confirmed cancel exchange (and
+// not before the exchange ended); that it is discarded when the exchange is not
+// confirmed; and that a cancel-only context does not interrupt the statement.
 
 type silentPG struct {
 	addr string
 	hold time.Duration // how long a cancel socket stays open; < 0: until the test ends
+	// slowDelay > 0: the slow statement answers (CommandComplete) after this long
+	// on its own, without waiting for a cancel.
+	slowDelay time.Duration
 
 	mu       sync.Mutex
 	log      []string
@@ -117,6 +122,16 @@ func (f *silentPG) serve(c net.Conn) {
 		}
 		q := string(bytes.TrimRight(payload, "\x00"))
 		f.record("query:" + q)
+		if q == "SELECT slow" && f.slowDelay > 0 {
+			select {
+			case <-time.After(f.slowDelay):
+			case <-f.done:
+				return
+			}
+			_ = writeCommandComplete(c, "SELECT 1")
+			_ = writeReadyForQuery(c, 'I')
+			continue
+		}
 		if q == "SELECT slow" {
 			select {
 			case <-f.cancelCh:
@@ -169,8 +184,8 @@ func runSlow(p *Pool, ctx context.Context, query bool) error {
 	return err
 }
 
-func TestDirectPoolEnforcesAContextThatEndsMidStatement(t *testing.T) {
-	for _, kind := range []string{"deadline", "cancel"} {
+func TestDirectPoolEnforcesAContextDeadlineMidStatement(t *testing.T) {
+	for _, kind := range []string{"deadline"} {
 		for _, stmt := range []string{"exec", "query"} {
 			t.Run(kind+"/"+stmt, func(t *testing.T) {
 				f := startSilentPG(t, 100*time.Millisecond)
@@ -210,7 +225,7 @@ func TestDirectPoolDiscardsTheConnWhenTheCancelIsNotConfirmed(t *testing.T) {
 	old := cancelExchangeTimeout
 	cancelExchangeTimeout = 150 * time.Millisecond
 	t.Cleanup(func() { cancelExchangeTimeout = old })
-	for _, kind := range []string{"deadline", "cancel"} {
+	for _, kind := range []string{"deadline"} {
 		t.Run(kind, func(t *testing.T) {
 			f := startSilentPG(t, -1)
 			p := openDirectPool(t, f.addr)
@@ -239,3 +254,82 @@ func TestDirectPoolDiscardsTheConnWhenTheCancelIsNotConfirmed(t *testing.T) {
 		})
 	}
 }
+
+// A context that can only be cancelled (no deadline: a cancel-only stdlib
+// context, the HTTP/2 request context) is not watched while the statement runs:
+// the call returns when the server answers, with the statement's own result, and
+// no CancelRequest is sent (v1.5.11 behaviour; celeris#1375).
+func TestDirectPoolDoesNotInterruptAStatementForACancelOnlyContext(t *testing.T) {
+	f := startSilentPG(t, 0)
+	f.slowDelay = 300 * time.Millisecond
+	p := openDirectPool(t, f.addr)
+	if _, err := p.ExecContext(context.Background(), "SELECT warm"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := p.ExecContext(ctx, "SELECT slow")
+	if err != nil {
+		t.Fatalf("err = %v: the statement was interrupted by a cancel-only context", err)
+	}
+	if el := time.Since(start); el < 250*time.Millisecond {
+		t.Fatalf("returned after %v, before the server answered (300 ms)", el)
+	}
+	if f.index("cancel-request") >= 0 {
+		t.Fatalf("a CancelRequest was sent for a cancel-only context: %v", f.events())
+	}
+}
+
+// deadlineCtx is a context from outside package context with a Done channel of
+// its own (never closed) and a deadline, like the timeout middleware's lazy
+// context: Err reports the deadline from the clock.
+type deadlineCtx struct {
+	done chan struct{}
+	dl   time.Time
+}
+
+func (c *deadlineCtx) Deadline() (time.Time, bool) { return c.dl, true }
+func (c *deadlineCtx) Done() <-chan struct{}       { return c.done }
+func (c *deadlineCtx) Value(any) any               { return nil }
+func (c *deadlineCtx) Err() error {
+	if !time.Now().Before(c.dl) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// The deadline of a context of any type is enforced through the socket's read
+// deadline, and the timeout is decided by the clock against Deadline(): a context
+// whose Err() is still nil at the instant the read times out must not make the
+// conn a network failure.
+func TestDirectPoolEnforcesTheDeadlineOfAForeignContextAndDecidesByTheClock(t *testing.T) {
+	f := startSilentPG(t, 50*time.Millisecond)
+	p := openDirectPool(t, f.addr)
+	if _, err := p.ExecContext(context.Background(), "SELECT warm"); err != nil {
+		t.Fatal(err)
+	}
+	// Err stays nil, as a timer context's can for a moment after the deadline.
+	ctx := &lateErrCtx{deadlineCtx{done: make(chan struct{}), dl: time.Now().Add(100 * time.Millisecond)}}
+	errc := make(chan error, 1)
+	go func() { _, err := p.ExecContext(ctx, "SELECT slow"); errc <- err }()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the deadline of a foreign context was not enforced")
+	}
+	if _, err := p.ExecContext(context.Background(), "SELECT next"); err != nil {
+		t.Fatalf("the next statement failed: %v", err)
+	}
+	if got := f.sessionCount(); got != 1 {
+		t.Fatalf("sessions = %d, want 1: the timeout was taken for a network failure and the conn was discarded (%v)", got, f.events())
+	}
+}
+
+// lateErrCtx never reports an error from Err: only the clock says it is over.
+type lateErrCtx struct{ deadlineCtx }
+
+func (c *lateErrCtx) Err() error { return nil }
