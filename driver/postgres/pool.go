@@ -648,7 +648,7 @@ func (r *Rows) Scan(dest ...any) error {
 		if sr != nil && i < len(sr.current) && sr.current[i] != nil && i < len(sr.codecs) && i < len(sr.columns) {
 			// A streamed row: infinity into a string is read from the raw cell.
 			binaryFmt := !sr.textFormat && sr.columns[i].FormatCode != protocol.FormatText
-			if rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
+			if sr.codecs[i] != nil && isTimeOID(sr.codecs[i].OID) && rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
 				continue
 			}
 		}
@@ -686,7 +686,7 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		return assignNil(dest)
 	}
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
-	if rawCellGuard(dest, raw, codec, binaryFmt) {
+	if codec != nil && isTimeOID(codec.OID) && rawCellGuard(dest, raw, codec, binaryFmt) {
 		return nil
 	}
 	// Binary format for known codecs — direct decode into typed pointer.
@@ -704,6 +704,16 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 	v, err := decodeToValue(raw, codec, col, textFormat)
 	if err != nil {
 		return err
+	}
+	// A date, timestamp or timestamptz into a string is RFC3339Nano
+	// (as database/sql formats it). Done here, on the raw path, and not in
+	// convertAssign: a streamed row scans through convertAssign exactly as in
+	// v1.5.11, where a time.Time into *string was fmt's %v form.
+	if t, ok := v.(time.Time); ok {
+		if d, ok := dest.(*string); ok {
+			*d = t.Format(time.RFC3339Nano)
+			return nil
+		}
 	}
 	return scanValue(dest, v)
 }
@@ -849,9 +859,8 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
-		if !binaryFormIsValue(codec) {
-			return false, nil
-		}
+		// The value's wire bytes, for every type, exactly as v1.5.11: scan into
+		// a string for text.
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -979,8 +988,6 @@ func convertAssign(dest any, src any) error {
 			} else {
 				*d = "false"
 			}
-		case time.Time:
-			*d = s.Format(time.RFC3339Nano) // as database/sql does
 		case []driver.Value:
 			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
@@ -1067,15 +1074,6 @@ func convertAssign(dest any, src any) error {
 			*d = cp
 		case string:
 			*d = []byte(s)
-		case time.Time:
-			*d = []byte(s.Format(time.RFC3339Nano))
-		case int64, float64, bool:
-			// Same text form *string receives.
-			var str string
-			if err := convertAssign(&str, s); err != nil {
-				return err
-			}
-			*d = []byte(str)
 		default:
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to []byte", src)
 		}
@@ -1252,7 +1250,13 @@ func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 	return t.conn.RollbackToSavepoint(ctx, name)
 }
 
-// rawCellGuard handles, for a *string or *[]byte destination, the cells whose
+// isTimeOID reports whether oid is date, timestamp or timestamptz.
+func isTimeOID(oid uint32) bool {
+	return oid == protocol.OIDDate || oid == protocol.OIDTimestamp || oid == protocol.OIDTimestamptz
+}
+
+// rawCellGuard handles, for a *string destination (a *[]byte gets the wire bytes,
+// as in v1.5.11), the cells whose
 // raw wire value says more than the decoded driver.Value can. It reports
 // whether it filled dest. Today that is the infinity of a
 // date, timestamp or timestamptz: the server's own text, read from the wire
@@ -1260,20 +1264,18 @@ func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 // real instant. Both the buffered (scanRaw) and the streamed (Rows.Scan over a
 // streamRows) paths call it; every other cell goes the unchanged way.
 func rawCellGuard(dest any, raw []byte, codec *protocol.TypeCodec, binaryFmt bool) bool {
-	if codec == nil {
+	d, ok := dest.(*string)
+	if !ok || codec == nil {
 		return false
 	}
-	switch d := dest.(type) {
-	case *string:
-		if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
-			*d = txt
-			return true
-		}
-	case *[]byte:
-		if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
-			*d = []byte(txt)
-			return true
-		}
+	switch codec.OID {
+	case protocol.OIDDate, protocol.OIDTimestamp, protocol.OIDTimestamptz:
+	default:
+		return false
+	}
+	if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
+		*d = txt
+		return true
 	}
 	return false
 }
