@@ -25,6 +25,9 @@ on:
       - 'test/pgspec/**'
       - 'test/redisspec/**'
       - 'test/mcspec/**'
+      - 'test/integration/**'
+      - 'server.go'
+      - 'internal/engine/**'
       - '.github/workflows/drivers.yml'
   pull_request:
     branches: [main]
@@ -41,6 +44,9 @@ on:
       - 'test/pgspec/**'
       - 'test/redisspec/**'
       - 'test/mcspec/**'
+      - 'test/integration/**'
+      - 'server.go'
+      - 'internal/engine/**'
       - '.github/workflows/drivers.yml'
   workflow_dispatch:
 
@@ -120,6 +126,15 @@ jobs:
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
           ./test/conformance/postgres/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.pg == '18.3'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
       - name: pgspec
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
@@ -180,10 +195,47 @@ jobs:
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
           ./test/conformance/redis/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.redis == '8.6.2'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
       - name: redisspec
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
           ./test/redisspec/...
+
+  # ------------------------------------------------------------------
+  # Drivers opened right after Start. A driver that reaches the server's
+  # event-loop provider before its engine is ready used to panic or race
+  # (the provider was published ahead of the loops). ./test/integration is not
+  # run as a whole by ci.yml, so this job runs the test by name, under -race,
+  # against fake backends (no service containers).
+  # ------------------------------------------------------------------
+  engine-start-register:
+    name: Drivers opened right after Start (-race)
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+      - name: TestDriversOpenedRightAfterStart
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=600s -v -run '^TestDriversOpenedRightAfterStart$' ./test/integration/ 2>&1 | tee /tmp/start-register.log
+          # epoll and adaptive must run, not skip (io_uring may skip where the kernel has no io_uring)
+          for e in epoll adaptive; do
+            grep -q -- "--- PASS: TestDriversOpenedRightAfterStart/$e " /tmp/start-register.log || { echo "TestDriversOpenedRightAfterStart/$e did not pass"; exit 1; }
+          done
 
   # ------------------------------------------------------------------
   # Valkey matrix — open-source Redis-compatible continuation.
@@ -276,6 +328,15 @@ jobs:
         if: matrix.memcached == '1.6.41'
         env:
           CELERIS_CONFORMANCE_ENGINE: default-ready
+        run: >-
+          go test -tags memcached -race -count=1 -timeout=300s
+          ./test/conformance/memcached/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.memcached == '1.6.41'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
         run: >-
           go test -tags memcached -race -count=1 -timeout=300s
           ./test/conformance/memcached/...
