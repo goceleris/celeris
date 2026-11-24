@@ -107,8 +107,11 @@ func TestSessionByteaOutputEscapeRole(t *testing.T) {
 	}
 }
 
-// DateStyle='SQL, DMY' (non-ISO): the text paths return an error that names
-// DateStyle, never a wrong date; the binary (cached) path is unaffected.
+// DateStyle='SQL, DMY' (non-ISO): every extended path (cached and unnamed)
+// reads binary, which does not depend on DateStyle, and returns the correct
+// dates; the simple protocol reads the server's text, which it cannot parse, and
+// returns an error that names DateStyle (a parse error in v1.5.11), never a
+// wrong date.
 func TestSessionNonISODateStyleRole(t *testing.T) {
 	base := settingsRole(t, "DateStyle = 'SQL, DMY'")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -117,53 +120,47 @@ func TestSessionNonISODateStyleRole(t *testing.T) {
 	want := [3]string{"2024-01-02 00:00:00", "2024-01-02 03:04:05", "2024-01-02 03:04:05"}
 
 	cached := openSettingsPool(t, base)
-	t.Run("cached", func(t *testing.T) {
-		var d, ts, tz time.Time
-		if err := cached.QueryRow(ctx, q+" WHERE $1::int = 1", 1).Scan(&d, &ts, &tz); err != nil {
-			t.Fatalf("cached (binary) path: %v", err)
-		}
-		for i, got := range []time.Time{d, ts, tz} {
-			if g := got.UTC().Format("2006-01-02 15:04:05"); g != want[i] {
-				t.Errorf("column %d: got %s, want %s", i, g, want[i])
-			}
-		}
-	})
 	unnamed := openSettingsPool(t, withParams(base, "auto_cache_statements=false"))
-	for name, run := range map[string]func() error{
-		"unnamed": func() error {
-			var d, ts, tz time.Time
-			return unnamed.QueryRow(ctx, q+" WHERE $1::int = 1", 1).Scan(&d, &ts, &tz)
-		},
-		"simple": func() error {
-			var d, ts, tz time.Time
-			return cached.QueryRow(ctx, q).Scan(&d, &ts, &tz)
-		},
-	} {
+	for name, p := range map[string]*postgres.Pool{"cached": cached, "unnamed": unnamed} {
 		t.Run(name, func(t *testing.T) {
-			err := run()
-			if err == nil || !strings.Contains(err.Error(), "DateStyle") {
-				t.Errorf("want an error naming DateStyle, got %v", err)
+			var d, ts, tz time.Time
+			if err := p.QueryRow(ctx, q+" WHERE $1::int = 1", 1).Scan(&d, &ts, &tz); err != nil {
+				t.Fatalf("%s (binary) path: %v", name, err)
+			}
+			for i, got := range []time.Time{d, ts, tz} {
+				if g := got.UTC().Format("2006-01-02 15:04:05"); g != want[i] {
+					t.Errorf("column %d: got %s, want %s", i, g, want[i])
+				}
 			}
 		})
 	}
+	t.Run("simple", func(t *testing.T) {
+		var d, ts, tz time.Time
+		err := cached.QueryRow(ctx, q).Scan(&d, &ts, &tz)
+		if err == nil || !strings.Contains(err.Error(), "DateStyle") {
+			t.Errorf("want an error naming DateStyle, got %v", err)
+		}
+	})
 }
 
 // Known limit (issue 1364): a role with extra_float_digits=0 makes the text
 // format print 15 significant digits, so float8 0.30000000000000004 reads back
-// as 0.3 on the simple and unnamed paths. The driver cannot read the setting.
-// The test documents the limit: it asserts the exact value on the cached
-// (binary) path and skips the text paths with the issue number.
+// as 0.3 on the simple protocol (as in v1.5.11). The driver cannot read the
+// setting. Statements with arguments read binary and are exact on both the
+// cached and the unnamed path; the simple path is the documented limit.
 func TestSessionExtraFloatDigitsZeroRoleKnownLimit(t *testing.T) {
 	base := settingsRole(t, "extra_float_digits = 0")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	const q = "SELECT 0.30000000000000004::float8"
-	cached := openSettingsPool(t, base)
-	var f float64
-	if err := cached.QueryRow(ctx, q+" WHERE $1::int = 1", 1).Scan(&f); err != nil || f != 0.30000000000000004 {
-		t.Errorf("cached (binary): got %v err %v", f, err)
+	for name, dsn := range map[string]string{"cached": base, "unnamed": withParams(base, "auto_cache_statements=false")} {
+		p := openSettingsPool(t, dsn)
+		var f float64
+		if err := p.QueryRow(ctx, q+" WHERE $1::int = 1", 1).Scan(&f); err != nil || f != 0.30000000000000004 {
+			t.Errorf("%s (binary): got %v err %v, want exact", name, f, err)
+		}
 	}
-	t.Run("text-paths", func(t *testing.T) {
-		t.Skip("known limit, goceleris/celeris#1364: extra_float_digits<=0 loses digits on the simple and unnamed paths; set it to 1 or more on the role or database")
+	t.Run("simple", func(t *testing.T) {
+		t.Skip("known limit, goceleris/celeris#1364: extra_float_digits<=0 loses digits on the simple protocol (as in v1.5.11); set it to 1 or more on the role or database")
 	})
 }
