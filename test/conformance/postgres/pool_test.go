@@ -14,7 +14,7 @@ import (
 // TestPoolBasic opens a Pool, pings, runs a Query, checks stats.
 func TestPoolBasic(t *testing.T) {
 	dsn := dsnFromEnv(t)
-	p, err := postgres.Open(dsn,
+	p, err := openPoolEngine(dsn,
 		postgres.WithMaxOpen(4),
 		postgres.WithMaxIdlePerWorker(1),
 		postgres.WithMaxLifetime(5*time.Minute),
@@ -52,7 +52,7 @@ func TestPoolBasic(t *testing.T) {
 // worker actually ran the callback.
 func TestPoolWorkerAffinity(t *testing.T) {
 	dsn := dsnFromEnv(t)
-	p, err := postgres.Open(dsn, postgres.WithMaxOpen(8), postgres.WithMaxIdlePerWorker(2))
+	p, err := openPoolEngine(dsn, postgres.WithMaxOpen(8), postgres.WithMaxIdlePerWorker(2))
 	if err != nil {
 		t.Fatalf("postgres.Open: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestPoolContention(t *testing.T) {
 		t.Skip("skipping contention test in -short mode")
 	}
 	dsn := dsnFromEnv(t)
-	p, err := postgres.Open(dsn, postgres.WithMaxOpen(4))
+	p, err := openPoolEngine(dsn, postgres.WithMaxOpen(4))
 	if err != nil {
 		t.Fatalf("postgres.Open: %v", err)
 	}
