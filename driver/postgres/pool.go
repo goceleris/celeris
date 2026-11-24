@@ -702,9 +702,6 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		return assignNil(dest)
 	}
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
-	if codec != nil && isTimeOID(codec.OID) && rawCellGuard(dest, raw, codec, binaryFmt) {
-		return nil
-	}
 	if codec == nil && binaryFmt {
 		if err := binaryOnlyGuard(dest, codec, col, binaryFmt); err != nil {
 			return err
@@ -874,6 +871,13 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 		// whose binary form is the value itself; jsonb / jsonpath carry a
 		// version byte, int4 / uuid / timestamp / ... are fixed-width binary.
 		if !binaryFormIsValue(codec) {
+			// A date, timestamp or timestamptz infinity is the server's own text,
+			// read from the wire value (the PGInfinity sentinel is also a real
+			// instant): no other cell pays for the check.
+			if txt, ok := infinityText(raw, codec.OID, true); ok {
+				*d = txt
+				return true, nil
+			}
 			return false, nil
 		}
 		*d = string(raw)
