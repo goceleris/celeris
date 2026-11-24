@@ -29,9 +29,12 @@ import (
 //
 // Without CELERIS_PG_DSN (and the postgres build tag) the tests skip.
 
-// fuzzBatches alternate: 50 rows is under the driver's streaming threshold (the
-// buffered scanRaw path), 250 is over it (the streamed path).
-var fuzzBatches = [...]int{50, 250}
+// fuzzBatches cycle: 50 and 250 rows are buffered results (scanRaw); 1000 rows
+// is streamed (streamRows, then scanValue) on the Linux event loop, which
+// promotes a result after 64 rows on the asynchronous path and, measured, from
+// about 1000 rows on the default path. Direct mode (macOS, no event loop) never
+// streams.
+var fuzzBatches = [...]int{50, 250, 1000}
 
 func fuzzParams(t *testing.T) (n int, seed uint64) {
 	t.Helper()
@@ -197,7 +200,7 @@ func fuzzRoutes(ctx context.Context, rig *fuzzRig, typ string, batch []string, c
 	if err != nil {
 		return err
 	}
-	defer srows.Close()
+	defer func() { _ = srows.Close() }()
 	i, problem := 0, ""
 	for srows.Next() {
 		var got, want, again string
@@ -249,12 +252,12 @@ func fuzzCompareNative(rows *postgres.Rows, route, typ, lit string) string {
 		return fmt.Sprintf("%s %s: literal %q: *any %T %v, server ::text %q", route, typ, lit, anyv, anyv, want)
 	}
 	if typ == "oid" {
-		// A second Scan of the same row into the numeric destinations.
+		// A second Scan of the same row into an integer: *int64 is converted
+		// from the decoded value on the buffered and the streamed path alike.
 		var n int64
-		var u uint32
 		var again string
-		if err := rows.Scan(&n, &again, &u); err != nil || strconv.FormatInt(n, 10) != want || strconv.FormatUint(uint64(u), 10) != want {
-			return fmt.Sprintf("oid %s: literal %q: *int64 %d, *uint32 %d, err %v, server ::text %q", route, lit, n, u, err, want)
+		if err := rows.Scan(&n, &again, &anyv); err != nil || strconv.FormatInt(n, 10) != want {
+			return fmt.Sprintf("oid %s: literal %q: *int64 %d, err %v, server ::text %q", route, lit, n, err, want)
 		}
 	}
 	return ""
@@ -597,6 +600,31 @@ func TestBinaryTextCodecsDifferentialFuzz(t *testing.T) {
 			}
 			fuzzType(t, rig, c.typ, uint64(i+1), c.gen, c.edges)
 		})
+	}
+}
+
+// oid into *uint32 (and the other integer widths): a single row is buffered, so
+// it takes the typed fast path; a streamed result (64 rows or more on the event
+// loop) converts through database/sql's driver.Value set, which has no *uint32.
+func TestOidIntoIntegerDestinations(t *testing.T) {
+	rig := newFuzzRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for name, pool := range map[string]*postgres.Pool{"cached": rig.cached, "unnamed": rig.unnamed} {
+		var u uint32
+		var i64 int64
+		var i32 int32
+		var s string
+		if err := pool.QueryRow(ctx, "SELECT 4294967295::oid, 2147483647::oid, 4294967295::oid WHERE $1::int = 1", 1).Scan(&u, &i32, &s); err != nil || u != math.MaxUint32 || i32 != math.MaxInt32 || s != "4294967295" {
+			t.Errorf("%s: *uint32 %d, *int32 %d, *string %q, err %v", name, u, i32, s, err)
+		}
+		if err := pool.QueryRow(ctx, "SELECT 4294967295::oid WHERE $1::int = 1", 1).Scan(&i64); err != nil || i64 != math.MaxUint32 {
+			t.Errorf("%s: *int64 %d, err %v", name, i64, err)
+		}
+		// 4294967295 does not fit an int32: an error, not a wrapped value.
+		if err := pool.QueryRow(ctx, "SELECT 4294967295::oid WHERE $1::int = 1", 1).Scan(&i32); err == nil {
+			t.Errorf("%s: oid 4294967295 into *int32 gave %d, want an out-of-range error", name, i32)
+		}
 	}
 }
 
