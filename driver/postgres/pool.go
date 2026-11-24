@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -641,7 +643,15 @@ func (r *Rows) Scan(dest ...any) error {
 	if len(dest) != len(r.current) {
 		return fmt.Errorf("celeris-postgres: Scan expected %d dest, got %d", len(r.current), len(dest))
 	}
+	sr, _ := r.inner.(*streamRows)
 	for i, v := range r.current {
+		if sr != nil && i < len(sr.current) && sr.current[i] != nil && i < len(sr.codecs) && i < len(sr.columns) {
+			// A streamed row: infinity into a string is read from the raw cell.
+			binaryFmt := !sr.textFormat && sr.columns[i].FormatCode != protocol.FormatText
+			if sr.codecs[i] != nil && isTimeOID(sr.codecs[i].OID) && rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
+				continue
+			}
+		}
 		if err := scanValue(dest[i], v); err != nil {
 			return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
 		}
@@ -675,8 +685,8 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		// Nil cell — zero the target if it's a common primitive.
 		return assignNil(dest)
 	}
-	// Binary format for known codecs — direct decode into typed pointer.
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
+	// Binary format for known codecs — direct decode into typed pointer.
 	if codec != nil && binaryFmt {
 		if ok, err := decodeBinaryInto(dest, raw, codec); ok {
 			return err
@@ -691,6 +701,16 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 	v, err := decodeToValue(raw, codec, col, textFormat)
 	if err != nil {
 		return err
+	}
+	// A date, timestamp or timestamptz into a string is RFC3339Nano
+	// (as database/sql formats it). Done here, on the raw path, and not in
+	// convertAssign: a streamed row scans through convertAssign exactly as in
+	// v1.5.11, where a time.Time into *string was fmt's %v form.
+	if t, ok := v.(time.Time); ok {
+		if d, ok := dest.(*string); ok {
+			*d = t.Format(time.RFC3339Nano)
+			return nil
+		}
 	}
 	return scanValue(dest, v)
 }
@@ -756,6 +776,18 @@ func int64ToUint32(n int64) (uint32, error) {
 	return uint32(n), nil
 }
 
+// binaryFormIsValue reports whether a column of codec's type carries, in
+// binary result format, exactly the bytes a string or []byte destination
+// should receive. That holds for the text-like types (text, varchar, json) and
+// for bytea; every other registered codec decodes through its DecodeBinary.
+func binaryFormIsValue(codec *protocol.TypeCodec) bool {
+	switch codec.OID {
+	case protocol.OIDText, protocol.OIDVarchar, protocol.OIDJSON, protocol.OIDBytea:
+		return true
+	}
+	return false
+}
+
 // decodeBinaryInto decodes raw binary-format bytes directly into dest
 // for the common primitive types. Returns (true, err) when the type was
 // handled (err may be non-nil for decode failures); (false, nil) when
@@ -815,10 +847,24 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 		return true, nil
 	case *string:
 		// Fast path for text/varchar/etc.: no interface boxing, single
-		// string allocation out of the raw slab bytes.
+		// string allocation out of the raw slab bytes. Only for codecs
+		// whose binary form is the value itself; jsonb / jsonpath carry a
+		// version byte, int4 / uuid / timestamp / ... are fixed-width binary.
+		if !binaryFormIsValue(codec) {
+			// A date, timestamp or timestamptz infinity is the server's own text,
+			// read from the wire value (the PGInfinity sentinel is also a real
+			// instant): no other cell pays for the check.
+			if txt, ok := infinityText(raw, codec.OID, true); ok {
+				*d = txt
+				return true, nil
+			}
+			return false, nil
+		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
+		// The value's wire bytes, for every type, exactly as v1.5.11: scan into
+		// a string for text.
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -835,7 +881,7 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 }
 
 // decodeTextInto is the text-format counterpart to decodeBinaryInto.
-func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
+func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, error) {
 	switch d := dest.(type) {
 	case *int:
 		n, err := protocol.ParseIntTextASCII(raw)
@@ -867,9 +913,15 @@ func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
 		*d = v
 		return true, nil
 	case *string:
+		if codec.OID == protocol.OIDBytea {
+			return false, nil // text form is the hex escape, not the value
+		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
+		if codec.OID == protocol.OIDBytea {
+			return false, nil
+		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -894,6 +946,8 @@ func assignNil(dest any) error {
 	case *string:
 		*d = ""
 	case *[]byte:
+		*d = nil
+	case *json.RawMessage:
 		*d = nil
 	case *bool:
 		*d = false
@@ -938,6 +992,8 @@ func convertAssign(dest any, src any) error {
 			} else {
 				*d = "false"
 			}
+		case []driver.Value:
+			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
 			*d = fmt.Sprintf("%v", src)
 		}
@@ -1024,6 +1080,15 @@ func convertAssign(dest any, src any) error {
 			*d = []byte(s)
 		default:
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to []byte", src)
+		}
+	case *json.RawMessage:
+		switch s := src.(type) {
+		case []byte:
+			*d = append(json.RawMessage(nil), s...)
+		case string:
+			*d = append(json.RawMessage(nil), s...)
+		default:
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to json.RawMessage", src)
 		}
 	case *any:
 		*d = src
@@ -1187,4 +1252,73 @@ func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 		return errors.New("celeris-postgres: tx already finished")
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
+}
+
+// isTimeOID reports whether oid is date, timestamp or timestamptz.
+func isTimeOID(oid uint32) bool {
+	return oid == protocol.OIDDate || oid == protocol.OIDTimestamp || oid == protocol.OIDTimestamptz
+}
+
+// rawCellGuard handles, for a *string destination (a *[]byte gets the wire bytes,
+// as in v1.5.11), the cells whose
+// raw wire value says more than the decoded driver.Value can. It reports
+// whether it filled dest. Today that is the infinity of a
+// date, timestamp or timestamptz: the server's own text, read from the wire
+// value before any time.Time exists, because the PGInfinity sentinel is also a
+// real instant. Both the buffered (scanRaw) and the streamed (Rows.Scan over a
+// streamRows) paths call it; every other cell goes the unchanged way.
+func rawCellGuard(dest any, raw []byte, codec *protocol.TypeCodec, binaryFmt bool) bool {
+	d, ok := dest.(*string)
+	if !ok || codec == nil {
+		return false
+	}
+	switch codec.OID {
+	case protocol.OIDDate, protocol.OIDTimestamp, protocol.OIDTimestamptz:
+	default:
+		return false
+	}
+	if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
+		*d = txt
+		return true
+	}
+	return false
+}
+
+// infinityText reports whether raw, a date, timestamp or timestamptz cell of
+// the given type and format, is PostgreSQL's infinity or -infinity, and returns
+// the text the server prints for it. The binary form is the int32 days
+// (date) or int64 microseconds (timestamp, timestamptz) sentinel MaxInt /
+// MinInt; the text form is "infinity" / "-infinity" itself.
+func infinityText(raw []byte, oid uint32, binaryFmt bool) (string, bool) {
+	switch oid {
+	case protocol.OIDDate, protocol.OIDTimestamp, protocol.OIDTimestamptz:
+	default:
+		return "", false
+	}
+	if !binaryFmt {
+		switch string(raw) {
+		case "infinity":
+			return "infinity", true
+		case "-infinity":
+			return "-infinity", true
+		}
+		return "", false
+	}
+	switch {
+	case oid == protocol.OIDDate && len(raw) == 4:
+		switch int32(binary.BigEndian.Uint32(raw)) {
+		case math.MaxInt32:
+			return "infinity", true
+		case math.MinInt32:
+			return "-infinity", true
+		}
+	case oid != protocol.OIDDate && len(raw) == 8:
+		switch int64(binary.BigEndian.Uint64(raw)) {
+		case math.MaxInt64:
+			return "infinity", true
+		case math.MinInt64:
+			return "-infinity", true
+		}
+	}
+	return "", false
 }
