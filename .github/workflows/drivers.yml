@@ -98,8 +98,25 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Conformance
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
+      # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
+      # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
+      # or has answered a request first (default-ready). Latest server version only.
+      - name: Conformance (default engine, server not started)
+        if: matrix.pg == '18.3'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
+      - name: Conformance (default engine, server started and serving)
+        if: matrix.pg == '18.3'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-ready
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
           ./test/conformance/postgres/...
@@ -141,8 +158,25 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Conformance
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
+      # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
+      # or has answered a request first (default-ready). Latest server version only.
+      - name: Conformance (default engine, server not started)
+        if: matrix.redis == '8.6.2'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      - name: Conformance (default engine, server started and serving)
+        if: matrix.redis == '8.6.2'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-ready
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
           ./test/conformance/redis/...
@@ -184,7 +218,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Conformance (Redis driver against Valkey)
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
@@ -223,8 +257,25 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Conformance
+        run: >-
+          go test -tags memcached -race -count=1 -timeout=300s
+          ./test/conformance/memcached/...
+      # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
+      # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
+      # or has answered a request first (default-ready). Latest server version only.
+      - name: Conformance (default engine, server not started)
+        if: matrix.memcached == '1.6.41'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default
+        run: >-
+          go test -tags memcached -race -count=1 -timeout=300s
+          ./test/conformance/memcached/...
+      - name: Conformance (default engine, server started and serving)
+        if: matrix.memcached == '1.6.41'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-ready
         run: >-
           go test -tags memcached -race -count=1 -timeout=300s
           ./test/conformance/memcached/...
@@ -278,7 +329,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Cluster conformance
         run: >-
           go test -tags memcached_cluster -race -count=1 -timeout=300s
@@ -313,7 +364,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Start cluster
         run: |
           docker compose -f test/conformance/redis/docker-compose.cluster.yml up -d
@@ -401,7 +452,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Start sentinel stack
         run: |
           docker compose -f test/conformance/redis/docker-compose.sentinel.yml up -d
