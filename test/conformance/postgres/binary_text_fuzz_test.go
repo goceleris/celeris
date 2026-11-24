@@ -78,8 +78,6 @@ func newFuzzRig(t *testing.T) *fuzzRig {
 	return r
 }
 
-func sqlQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
-
 // fuzzType runs n generated literals of the type through every route. A literal
 // the server rejects (an out-of-range interval) is skipped and counted; more
 // than 5% rejected is a generator bug and fails the test.
@@ -159,84 +157,69 @@ func fuzzRun(ctx context.Context, rig *fuzzRig, typ string, batch []string, chec
 }
 
 func fuzzRoutes(ctx context.Context, rig *fuzzRig, typ string, batch []string, checked map[string]int) error {
-	var sb strings.Builder
-	sb.WriteString("SELECT u.v::" + typ + ", " + oracleExpr(typ) + ", u.v::" + typ + " FROM unnest(ARRAY[")
-	for i, l := range batch {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(sqlQuote(l))
-	}
-	sb.WriteString("]::text[]) WITH ORDINALITY AS u(v, n) WHERE $1::int = 1 ORDER BY u.n")
-	q := sb.String()
+	// One statement text per type, the literals as one text argument: a
+	// statement per batch would churn the statement cache, whose evictions
+	// run a DEALLOCATE on the connection in the background (see the PR body).
+	q := "SELECT u.v::" + typ + ", " + oracleExpr(typ) + ", u.v::" + typ +
+		" FROM unnest(string_to_array($2::text, chr(31))) WITH ORDINALITY AS u(v, n) WHERE $1::int = 1 ORDER BY u.n"
+	arg := strings.Join(batch, "\x1f")
 
+	// A comparison failure is only reported when the result ended cleanly: a
+	// result the server cut short with an error (a literal it rejects) is a
+	// rejection, whatever the rows before the error looked like.
 	for route, pool := range map[string]*postgres.Pool{"cached": rig.cached, "unnamed": rig.unnamed} {
-		rows, err := pool.QueryContext(ctx, q, 1)
+		rows, err := pool.QueryContext(ctx, q, 1, arg)
 		if err != nil {
 			return err
 		}
-		i := 0
+		i, problem := 0, ""
 		for rows.Next() {
-			var got, want string
-			var anyv any
-			if err := rows.Scan(&got, &want, &anyv); err != nil {
-				_ = rows.Close()
-				return &fuzzMismatch{fmt.Sprintf("%s %s: scan of %q: %v", route, typ, batch[i], err)}
-			}
-			if got != want {
-				_ = rows.Close()
-				return &fuzzMismatch{fmt.Sprintf("%s %s: literal %q: driver text %q, server ::text %q", route, typ, batch[i], got, want)}
-			}
-			if fmt.Sprint(anyv) != want {
-				_ = rows.Close()
-				return &fuzzMismatch{fmt.Sprintf("%s %s: literal %q: *any %T %v, server ::text %q", route, typ, batch[i], anyv, anyv, want)}
-			}
-			if typ == "oid" {
-				// A second Scan of the same row into the numeric destinations.
-				var n int64
-				var u uint32
-				var again string
-				if err := rows.Scan(&n, &again, &u); err != nil || strconv.FormatInt(n, 10) != want || strconv.FormatUint(uint64(u), 10) != want {
-					_ = rows.Close()
-					return &fuzzMismatch{fmt.Sprintf("%s oid: literal %q: *int64 %d, *uint32 %d, err %v, server ::text %q", route, batch[i], n, u, err, want)}
-				}
+			if problem == "" && i < len(batch) {
+				problem = fuzzCompareNative(rows, route, typ, batch[i])
 			}
 			i++
-			checked[route]++
 		}
 		err = rows.Err()
 		_ = rows.Close()
 		if err != nil {
 			return err
 		}
+		if problem != "" {
+			return &fuzzMismatch{problem}
+		}
 		if i != len(batch) {
 			return &fuzzMismatch{fmt.Sprintf("%s %s: %d rows for %d literals", route, typ, i, len(batch))}
 		}
+		checked[route] += i
 	}
 
-	srows, err := rig.db.QueryContext(ctx, q, 1)
+	srows, err := rig.db.QueryContext(ctx, q, 1, arg)
 	if err != nil {
 		return err
 	}
 	defer srows.Close()
-	i := 0
+	i, problem := 0, ""
 	for srows.Next() {
 		var got, want, again string
 		if err := srows.Scan(&got, &want, &again); err != nil {
-			return &fuzzMismatch{fmt.Sprintf("database/sql %s: scan of %q: %v", typ, batch[i], err)}
-		}
-		if got != want || again != want {
-			return &fuzzMismatch{fmt.Sprintf("database/sql %s: literal %q: *string %q / %q, server ::text %q", typ, batch[i], got, again, want)}
+			if problem == "" && i < len(batch) {
+				problem = fmt.Sprintf("database/sql %s: scan of %q: %v", typ, batch[i], err)
+			}
+		} else if (got != want || again != want) && problem == "" && i < len(batch) {
+			problem = fmt.Sprintf("database/sql %s: literal %q: *string %q / %q, server ::text %q", typ, batch[i], got, again, want)
 		}
 		i++
-		checked["database/sql"]++
 	}
 	if err := srows.Err(); err != nil {
 		return err
 	}
+	if problem != "" {
+		return &fuzzMismatch{problem}
+	}
 	if i != len(batch) {
 		return &fuzzMismatch{fmt.Sprintf("database/sql %s: %d rows for %d literals", typ, i, len(batch))}
 	}
+	checked["database/sql"] += i
 	return nil
 }
 
@@ -249,6 +232,32 @@ func oracleExpr(typ string) string {
 		return "concat(u.v::inet)"
 	}
 	return "u.v::" + typ + "::text"
+}
+
+// fuzzCompareNative compares the current row of a native result with the
+// server's text; it returns "" when they agree.
+func fuzzCompareNative(rows *postgres.Rows, route, typ, lit string) string {
+	var got, want string
+	var anyv any
+	if err := rows.Scan(&got, &want, &anyv); err != nil {
+		return fmt.Sprintf("%s %s: scan of %q: %v", route, typ, lit, err)
+	}
+	if got != want {
+		return fmt.Sprintf("%s %s: literal %q: driver text %q, server ::text %q", route, typ, lit, got, want)
+	}
+	if fmt.Sprint(anyv) != want {
+		return fmt.Sprintf("%s %s: literal %q: *any %T %v, server ::text %q", route, typ, lit, anyv, anyv, want)
+	}
+	if typ == "oid" {
+		// A second Scan of the same row into the numeric destinations.
+		var n int64
+		var u uint32
+		var again string
+		if err := rows.Scan(&n, &again, &u); err != nil || strconv.FormatInt(n, 10) != want || strconv.FormatUint(uint64(u), 10) != want {
+			return fmt.Sprintf("oid %s: literal %q: *int64 %d, *uint32 %d, err %v, server ::text %q", route, lit, n, u, err, want)
+		}
+	}
+	return ""
 }
 
 // ---- generators ----
@@ -304,7 +313,15 @@ var timetzEdges = []string{
 	"00:00:00.000001-03:30", "01:02:03.4+05:45", "12:00:00+00:01", "12:00:00-00:01", "12:00:00+01:00:01",
 }
 
-func genInterval(r *rand.Rand, _ int) string {
+// genInterval returns a generator of interval literals whose time part never
+// exceeds maxUs microseconds. PostgreSQL before 15 rejects an "N microseconds"
+// field of 2^31 or more and an hour count past int32, so the large times are
+// written hh:mm:ss.ffffff, and capped there.
+func genInterval(maxUs int64) func(r *rand.Rand, _ int) string {
+	return func(r *rand.Rand, _ int) string { return genIntervalLit(r, maxUs) }
+}
+
+func genIntervalLit(r *rand.Rand, maxUs int64) string {
 	var parts []string
 	field := func(small, large int64) int64 {
 		switch r.IntN(6) {
@@ -335,14 +352,14 @@ func genInterval(r *rand.Rand, _ int) string {
 	case 4:
 		us = r.Int64N(2*1000*3600*1000000+1) - 1000*3600*1000000
 	default:
-		us = r.Int64N(math.MaxInt64)
+		us = r.Int64N(maxUs)
 		if r.IntN(2) == 0 {
 			us = -us
 		}
 	}
 	// A third of the time the time part is written hh:mm:ss.ffffff.
 	if us != 0 || len(parts) == 0 || r.IntN(3) == 0 {
-		if r.IntN(3) == 0 && us > -9000000000000 && us < 9000000000000 {
+		if r.IntN(3) == 0 || us >= 1<<31 || us <= -(1<<31) {
 			sign := ""
 			a := us
 			if a < 0 {
@@ -358,16 +375,31 @@ func genInterval(r *rand.Rand, _ int) string {
 	return strings.Join(parts, " ")
 }
 
+// intervalMaxUs is the largest time part the server's interval input accepts as
+// hh:mm:ss: an hour count past int32 is an error before PostgreSQL 15.
+func intervalMaxUs(pgVersionNum int) int64 {
+	if pgVersionNum < 150000 {
+		return (math.MaxInt32+1)*usecsPerHour - 1
+	}
+	return math.MaxInt64
+}
+
+const usecsPerHour = 3600 * 1000000
+
 func intervalEdges(pgVersionNum int) []string {
 	e := []string{
 		"0", "00:00:00", "1 month", "-1 month", "1 day", "-1 day", "1 year", "-1 year", "1 year 1 mon 1 day 00:00:01",
 		"-1 year -1 mon -1 day -00:00:01", "1 year -1 mon", "-1 year 1 mon", "1 mon -1 day 1 microsecond", "-1 mon 1 day -1 microsecond",
 		"2147483647 months", "-2147483648 months", "2147483647 days", "-2147483648 days",
-		"2562047788:00:54.775807", "-2562047788:00:54.775808", "9223372036854775807 microseconds", "-9223372036854775807 microseconds",
-		"2147483647 months 2147483647 days 2562047788:00:54.775807", "-2147483648 months -2147483648 days -2562047788:00:54.775808",
+		"2147483647:59:59.999999", "-2147483647:59:59.999999", "2147483647 months 2147483647 days 2147483647:59:59.999999",
+		"-2147483648 months -2147483648 days -2147483647:59:59.999999", "2147483647 microseconds", "-2147483647 microseconds",
 		"1 microsecond", "-1 microsecond", "999999 microseconds", "-999999 microseconds", "59 minutes 59.999999 seconds",
 		"100 hours", "-100 hours", "1 day -1 hour", "-1 day 1 hour", "13 months", "-13 months", "1 year 2 mons 3 days 04:05:06.789",
 		"-1 year -2 mons -3 days -04:05:06.789", "3 days -04:05:06", "-3 days 04:05:06", "0.5 seconds", "1.5 days", "0.5 months",
+	}
+	if pgVersionNum >= 150000 {
+		e = append(e, "2562047788:00:54.775807", "-2562047788:00:54.775808", "9223372036854775807 microseconds", "-9223372036854775807 microseconds",
+			"2147483647 months 2147483647 days 2562047788:00:54.775807", "-2147483648 months -2147483648 days -2562047788:00:54.775808")
 	}
 	if pgVersionNum >= 170000 {
 		e = append(e, "infinity", "-infinity")
@@ -553,7 +585,7 @@ func TestBinaryTextCodecsDifferentialFuzz(t *testing.T) {
 		{"oid", genOid, oidEdges},
 		{"time", genTime, timeEdges},
 		{"timetz", genTimetz, timetzEdges},
-		{"interval", genInterval, intervalEdges(rig.pgVersionNum)},
+		{"interval", genInterval(intervalMaxUs(rig.pgVersionNum)), intervalEdges(rig.pgVersionNum)},
 		{"inet", genInet, inetEdges},
 		{"cidr", genCidr, cidrEdges},
 		{"macaddr", func(r *rand.Rand, _ int) string { return genMacaddr(r, 6) }, macaddrEdges},
