@@ -59,7 +59,7 @@ func TestStrayCancel(t *testing.T) {
 	for _, mode := range arms {
 		for _, kind := range kinds {
 			t.Run(mode+"/"+kind, func(t *testing.T) {
-				var run func(ctx context.Context, q string, arg any) error
+				var run func(ctx context.Context, q string, arg any, dest *int64) error
 				switch mode {
 				case "database-sql":
 					db, err := sql.Open("celeris-postgres", dsn)
@@ -68,7 +68,7 @@ func TestStrayCancel(t *testing.T) {
 					}
 					db.SetMaxOpenConns(workers)
 					defer db.Close()
-					run = func(ctx context.Context, q string, arg any) error {
+					run = func(ctx context.Context, q string, arg any, dest *int64) error {
 						var rows *sql.Rows
 						var err error
 						if arg == nil {
@@ -78,6 +78,13 @@ func TestStrayCancel(t *testing.T) {
 						}
 						if err != nil {
 							return err
+						}
+						if rows.Next() && dest != nil {
+							// the innocent statement's value: a crossed reply would show here
+							if err := rows.Scan(dest); err != nil {
+								_ = rows.Close()
+								return err
+							}
 						}
 						for rows.Next() {
 						}
@@ -95,7 +102,7 @@ func TestStrayCancel(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer p.Close()
-					run = func(ctx context.Context, q string, arg any) error {
+					run = func(ctx context.Context, q string, arg any, dest *int64) error {
 						var rows *postgres.Rows
 						var err error
 						if arg == nil {
@@ -106,6 +113,13 @@ func TestStrayCancel(t *testing.T) {
 						if err != nil {
 							return err
 						}
+						if rows.Next() && dest != nil {
+							// the innocent statement's value: a crossed reply would show here
+							if err := rows.Scan(dest); err != nil {
+								_ = rows.Close()
+								return err
+							}
+						}
 						for rows.Next() {
 						}
 						err = rows.Err()
@@ -115,12 +129,12 @@ func TestStrayCancel(t *testing.T) {
 				}
 				slow := func(ctx context.Context) error {
 					if kind == "select" {
-						return run(ctx, "SELECT pg_sleep($1::float8)", float64(sleepMs)/1000)
+						return run(ctx, "SELECT pg_sleep($1::float8)", float64(sleepMs)/1000, nil)
 					}
 					// 3/4 of the statement, a NOTICE (the response arrives in
 					// pieces), then the last quarter.
 					return run(ctx, fmt.Sprintf("DO $$ BEGIN PERFORM pg_sleep(%f); RAISE NOTICE 'x'; PERFORM pg_sleep(%f); END $$",
-						float64(sleepMs)*0.75/1000, float64(sleepMs)*0.25/1000), nil)
+						float64(sleepMs)*0.75/1000, float64(sleepMs)*0.25/1000), nil, nil)
 				}
 				var iters, cancelled, stray, other atomic.Int64
 				var firstOther atomic.Value
@@ -147,7 +161,8 @@ func TestStrayCancel(t *testing.T) {
 								cancelled.Add(1)
 							}
 							cancel()
-							if err := run(context.Background(), "SELECT $1::int8", n); err != nil {
+							var got int64
+							if err := run(context.Background(), "SELECT $1::int8", n, &got); err != nil {
 								var pe *postgres.PGError
 								if errors.As(err, &pe) && pe.Code == "57014" {
 									stray.Add(1)
@@ -155,6 +170,10 @@ func TestStrayCancel(t *testing.T) {
 									other.Add(1)
 									firstOther.CompareAndSwap(nil, err.Error())
 								}
+							} else if got != n {
+								// a reply of another statement (a desynchronised stream)
+								other.Add(1)
+								firstOther.CompareAndSwap(nil, fmt.Sprintf("innocent SELECT %d returned %d", n, got))
 							}
 						}
 					}()

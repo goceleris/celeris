@@ -63,7 +63,13 @@ func TestContextEndingMidStatementEndsTheCall(t *testing.T) {
 					t.Fatalf("returned after %v (context ended after 300 ms, statement runs 3 s), err=%v", el, err)
 				}
 				var pe *postgres.PGError
-				if !errors.Is(err, ctx.Err()) && !(errors.As(err, &pe) && pe.Code == "57014") {
+				// database/sql and the Pool on a loop may surface the server's 57014;
+				// a Pool conn in direct mode always returns the context's error.
+				if a.name == "pool-direct" {
+					if !errors.Is(err, ctx.Err()) {
+						t.Fatalf("err = %v, want the context's error (%v)", err, ctx.Err())
+					}
+				} else if !errors.Is(err, ctx.Err()) && !(errors.As(err, &pe) && pe.Code == "57014") {
 					t.Fatalf("err = %v, want the context's error or 57014", err)
 				}
 				nctx, ncancel := context.WithTimeout(context.Background(), 10*time.Second)

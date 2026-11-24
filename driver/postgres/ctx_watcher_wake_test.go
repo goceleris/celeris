@@ -7,10 +7,10 @@ import (
 )
 
 // Nothing is armed for a context that cannot end; a context that can end arms
-// one wake per statement and leaves none behind.
+// one wake per statement and leaves none behind. Each case has a pool, and so a
+// conn, of its own: the wake is built once per conn, so a shared conn would make
+// every case after the first pass on the first one's work.
 func TestWakeIsArmedOnlyForAContextWithADoneChannel(t *testing.T) {
-	f := startSilentPG(t, 0)
-	p := openDirectPool(t, f.addr)
 	type kv struct{}
 	for _, tc := range []struct {
 		name     string
@@ -27,6 +27,8 @@ func TestWakeIsArmedOnlyForAContextWithADoneChannel(t *testing.T) {
 		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			f := startSilentPG(t, 0)
+			p := openDirectPool(t, f.addr)
 			ctx, cancel := tc.mk()
 			defer cancel()
 			if _, err := p.ExecContext(ctx, "SELECT 1"); err != nil {
@@ -44,6 +46,34 @@ func TestWakeIsArmedOnlyForAContextWithADoneChannel(t *testing.T) {
 				t.Fatal("a wake is still armed after the statement")
 			}
 		})
+	}
+}
+
+// What a statement pays: a context without a Done channel allocates exactly what
+// a context with a value does (nothing for the wake), and a context that can end
+// allocates more (the registration).
+func TestAContextWithoutADoneChannelAllocatesNoWake(t *testing.T) {
+	f := startSilentPG(t, 0)
+	p := openDirectPool(t, f.addr)
+	run := func(ctx context.Context) func() {
+		return func() {
+			if _, err := p.ExecContext(ctx, "SELECT 1"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	type kv struct{}
+	run(context.Background())() // dial, warm the pools
+	bg := testing.AllocsPerRun(200, run(context.Background()))
+	val := testing.AllocsPerRun(200, run(context.WithValue(context.Background(), kv{}, 1)))
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelOnly := testing.AllocsPerRun(200, run(cctx))
+	if val > bg+1 { // the WithValue context itself is allocated once, outside the loop
+		t.Fatalf("allocs per statement: background %v, with a value %v: a context without Done must cost the same", bg, val)
+	}
+	if cancelOnly <= bg {
+		t.Fatalf("allocs per statement: background %v, cancellable %v: the registration is not visible, the test no longer measures the wake", bg, cancelOnly)
 	}
 }
 
