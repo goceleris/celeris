@@ -170,7 +170,7 @@ jobs:
       - name: PgBouncer conformance
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
-          -run TestPgBouncer ./test/conformance/postgres/
+          -v -run TestPgBouncer ./test/conformance/postgres/
       - name: Dump PgBouncer log on failure
         if: failure()
         run: docker logs pgbouncer 2>&1 | tail -60
