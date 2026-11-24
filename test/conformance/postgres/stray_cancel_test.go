@@ -33,6 +33,7 @@ import (
 // path on database/sql) and "notice" (a DO block that sends a NOTICE shortly
 // before it ends, so a Pool conn wakes up after the context expired and
 // cancels too). Knobs: STRAY_SECONDS (3 per arm and kind; the failing-first runs used 15-30), STRAY_SLEEP_MS (2),
+// STRAY_CTX (mixed: half of the contexts end by deadline, half by cancel(); or expire | cancel),
 // STRAY_WORKERS (2; more workers against the unfixed driver: its client-closed cancel sockets exhaust the ephemeral ports of a laptop above ~1000 cancels/s), STRAY_KIND (both|select|notice), STRAY_ARMS (all, or a
 // comma list of pool-direct, pool-loop, database-sql).
 func TestStrayCancel(t *testing.T) {
@@ -46,6 +47,10 @@ func TestStrayCancel(t *testing.T) {
 	kinds := []string{"select", "notice"}
 	if k := os.Getenv("STRAY_KIND"); k == "select" || k == "notice" {
 		kinds = []string{k}
+	}
+	ctxKind := os.Getenv("STRAY_CTX") // expire | cancel | mixed (default)
+	if ctxKind == "" {
+		ctxKind = "mixed"
 	}
 	arms := []string{"pool-direct", "pool-loop", "database-sql"}
 	if a := os.Getenv("STRAY_ARMS"); a != "" {
@@ -128,7 +133,16 @@ func TestStrayCancel(t *testing.T) {
 						rng := rand.New(rand.NewPCG(1, uint64(w)+2))
 						for time.Now().Before(stop) {
 							n := iters.Add(1)
-							ctx, cancel := context.WithTimeout(context.Background(), time.Duration(rng.IntN(sleepMs+1))*time.Millisecond)
+							d := time.Duration(rng.IntN(sleepMs+1)) * time.Millisecond
+							var ctx context.Context
+							var cancel context.CancelFunc
+							if ctxKind == "cancel" || (ctxKind == "mixed" && rng.IntN(2) == 0) {
+								// ended by cancel(), no deadline
+								ctx, cancel = context.WithCancel(context.Background())
+								time.AfterFunc(d, cancel)
+							} else {
+								ctx, cancel = context.WithTimeout(context.Background(), d)
+							}
 							if err := slow(ctx); err != nil {
 								cancelled.Add(1)
 							}
