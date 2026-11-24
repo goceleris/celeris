@@ -9,11 +9,14 @@ import (
 // binaryOnlyTypes names the PostgreSQL built-in types the driver has no codec
 // for and whose BINARY wire form is not their text: the extended protocol
 // returns them in binary, so a string or []byte destination would receive raw
-// wire bytes (an interval is 16 bytes, an inet a family and mask byte plus the
-// address, an array a header and length-prefixed elements). Scanning one into
+// wire bytes (a point is 16 bytes, a bit string a length and packed bits, an
+// array a header and length-prefixed elements). Scanning one into
 // *string or *[]byte is an error that names the type and says to cast it to text
 // in the query, rather than a value that only looks like data. *any and a
 // sql.Scanner still receive the raw bytes, as in v1.5.11.
+//
+// The types that have a binary-to-text codec (time, timetz, interval, inet,
+// cidr, macaddr, macaddr8, oid) are not listed: they decode to their text.
 //
 // The list is every built-in base, range and multirange type whose send
 // function is not a text one (textsend, varcharsend, bpcharsend, namesend,
@@ -33,8 +36,8 @@ var binaryOnlyTypes = map[uint32]string{
 	271: "xid8[]", 600: "point", 601: "lseg", 602: "path",
 	603: "box", 604: "polygon", 628: "line", 629: "line[]",
 	651: "cidr[]", 718: "circle", 719: "circle[]",
-	774: "macaddr8", 775: "macaddr8[]", 790: "money", 791: "money[]",
-	829: "macaddr", 1002: "char[]", 1003: "name[]",
+	775: "macaddr8[]", 790: "money", 791: "money[]",
+	1002: "char[]", 1003: "name[]",
 	1006: "int2vector[]", 1008: "regproc[]", 1010: "tid[]", 1011: "xid[]",
 	1012: "cid[]", 1013: "oidvector[]", 1014: "bpchar[]", 1017: "point[]",
 	1018: "lseg[]", 1019: "path[]", 1020: "box[]", 1027: "polygon[]",

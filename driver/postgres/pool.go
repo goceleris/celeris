@@ -943,7 +943,7 @@ func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, erro
 // integer hot path is unchanged.
 func textFormErr(codec *protocol.TypeCodec, err error) (bool, error) {
 	switch codec.OID {
-	case protocol.OIDTime, protocol.OIDTimetz, protocol.OIDInterval, protocol.OIDInet, protocol.OIDCidr:
+	case protocol.OIDTime, protocol.OIDTimetz, protocol.OIDInterval, protocol.OIDInet, protocol.OIDCidr, protocol.OIDMacaddr, protocol.OIDMacaddr8:
 		return false, nil
 	}
 	return true, err

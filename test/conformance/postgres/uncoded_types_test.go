@@ -22,7 +22,6 @@ func TestUncodedTypesIntoStringAreAnError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, c := range []struct{ typ, lit, text string }{
-		{"macaddr", "'08:00:2b:01:02:03'", "08:00:2b:01:02:03"},
 		{"point", "'(1,2)'", "(1,2)"},
 		{"numeric[]", "'{1.5,2.50}'", "{1.5,2.50}"},
 		{"date[]", "'{2025-01-15}'", "{2025-01-15}"},
@@ -85,6 +84,8 @@ func TestTextCodecTypesIntoString(t *testing.T) {
 		{"inet", "'10.0.0.1/32'", "10.0.0.1", "10.0.0.1"},
 		{"cidr", "'10.0.0.0/8'", "10.0.0.0/8", "10.0.0.0/8"},
 		{"cidr", "'10.0.0.1/32'", "10.0.0.1/32", "10.0.0.1/32"},
+		{"macaddr", "'08:00:2b:01:02:03'", "08:00:2b:01:02:03", "08:00:2b:01:02:03"},
+		{"macaddr8", "'08:00:2b:01:02:03:04:05'", "08:00:2b:01:02:03:04:05", "08:00:2b:01:02:03:04:05"},
 		{"interval", "'1 year 2 mons -3 days 04:05:06.789'", "1 year 2 mons -3 days +04:05:06.789", "1 year 2 mons -3 days +04:05:06.789"},
 	} {
 		q := "SELECT " + c.lit + "::" + c.typ + " WHERE $1::int = 1"
