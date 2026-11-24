@@ -120,6 +120,15 @@ jobs:
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
           ./test/conformance/postgres/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.pg == '18.3'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
       - name: pgspec
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
@@ -177,6 +186,15 @@ jobs:
         if: matrix.redis == '8.6.2'
         env:
           CELERIS_CONFORMANCE_ENGINE: default-ready
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.redis == '8.6.2'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
           ./test/conformance/redis/...
@@ -276,6 +294,15 @@ jobs:
         if: matrix.memcached == '1.6.41'
         env:
           CELERIS_CONFORMANCE_ENGINE: default-ready
+        run: >-
+          go test -tags memcached -race -count=1 -timeout=300s
+          ./test/conformance/memcached/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.memcached == '1.6.41'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
         run: >-
           go test -tags memcached -race -count=1 -timeout=300s
           ./test/conformance/memcached/...
