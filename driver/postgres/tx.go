@@ -17,7 +17,14 @@ func (t *pgTx) Commit() error {
 	if t.conn == nil {
 		return ErrClosed
 	}
-	err := t.conn.simpleExecNoTag(context.Background(), "COMMIT")
+	rolledBack, err := t.conn.simpleExecCmd(context.Background(), "COMMIT", true)
+	if err == nil && rolledBack {
+		// The transaction was in the aborted state: the server treated the COMMIT
+		// as a ROLLBACK and reported no error. The transaction is over and the
+		// session is out of it; sessionDirty stays as BeginTx set it, so
+		// ResetSession still resets the session before the conn is reused.
+		return ErrTxCommitRollback
+	}
 	if err == nil {
 		// After a successful COMMIT the session is back to a clean state —
 		// no temp tables, no pending SET, no transaction. Clear the dirty

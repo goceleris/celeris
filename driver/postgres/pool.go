@@ -1173,6 +1173,12 @@ func (t *Tx) Commit() error {
 		return errors.New("celeris-postgres: tx already finished")
 	}
 	err := t.inner.Commit()
+	if errors.Is(err, ErrTxCommitRollback) {
+		// The server rolled the transaction back: it is over, the conn is free.
+		t.done = true
+		t.pool.release(t.conn)
+		return err
+	}
 	if err != nil {
 		return err
 	}
