@@ -18,7 +18,7 @@ import (
 // blocking command under a context that can end context.AfterFunc's two
 // allocations (the callback is built once per conn). The pin is the difference on
 // the same conn, in turns.
-func TestTheWatcherCostsNothingForAnOrdinaryCommandAndAtMostTwoAllocationsForABlockingOne(t *testing.T) {
+func TestWatcherAllocations1387(t *testing.T) {
 	c, _ := dialDirectForWake(t)
 	wc, cancel := context.WithCancel(context.Background())
 	defer cancel()
