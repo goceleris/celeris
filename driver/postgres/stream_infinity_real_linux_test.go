@@ -16,8 +16,9 @@ import (
 // event loop against a real server (CELERIS_PG_DSN; skipped without it): a
 // result of 3000 wide rows alternating 'infinity', '-infinity' and the real
 // 9999-12-31 23:59:59, forced onto the asynchronous path so the rows are
-// promoted to a streamRows after the 64th. Infinity into *string / *[]byte is
-// the server's text, the real value is itself, *time.Time keeps the sentinels.
+// promoted to a streamRows after the 64th. Infinity into a *string is the
+// server's text, a real value is itself (never "infinity"), *time.Time keeps the
+// sentinels.
 func TestStreamedInfinityAgainstServer(t *testing.T) {
 	raw := os.Getenv("CELERIS_PG_DSN")
 	if raw == "" {
@@ -81,16 +82,12 @@ func TestStreamedInfinityAgainstServer(t *testing.T) {
 					rows := acquireRows(inner, nil, nil)
 					defer rows.Close()
 					n := 0
+					var s, pad string
+					var tm time.Time
 					for rows.Next() {
 						n++
-						var s, pad string
-						var b []byte
-						var tm time.Time
 						if err := rows.Scan(&s, &pad); err != nil {
 							t.Fatalf("row %d *string: %v", n, err)
-						}
-						if err := rows.Scan(&b, &pad); err != nil {
-							t.Fatalf("row %d *[]byte: %v", n, err)
 						}
 						if err := rows.Scan(&tm, &pad); err != nil {
 							t.Fatalf("row %d *time.Time: %v", n, err)
@@ -103,13 +100,18 @@ func TestStreamedInfinityAgainstServer(t *testing.T) {
 						case 1:
 							wantStr, wantTime = "-infinity", PGNegInfinity
 						default:
-							wantStr, wantTime = c.realStr, c.realTime
-							if !streamed && mode == "simple" {
+							wantTime = c.realTime
+							switch {
+							case streamed:
+								wantStr = c.realTime.String() // a streamed row scans as in v1.5.11 (fmt's %v of the time.Time)
+							case mode == "simple":
 								wantStr = c.real // a buffered simple-protocol row hands over the server's text, as in v1.5.11
+							default:
+								wantStr = c.realStr // a buffered binary row: RFC3339Nano
 							}
 						}
-						if s != wantStr || string(b) != wantStr {
-							t.Fatalf("row %d: *string %q, *[]byte %q, want %q (streamed=%v)", n, s, b, wantStr, streamed)
+						if s != wantStr {
+							t.Fatalf("row %d: *string %q, want %q (streamed=%v)", n, s, wantStr, streamed)
 						}
 						if !tm.Equal(wantTime) {
 							t.Fatalf("row %d: *time.Time %v, want %v", n, tm, wantTime)

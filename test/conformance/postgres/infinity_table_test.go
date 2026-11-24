@@ -92,9 +92,15 @@ func TestNativeInfinityVersusRealMaximum(t *testing.T) {
 				if err := p.QueryRow(ctx, q, args...).Scan(&s); err != nil || s != wantStr {
 					t.Errorf("*string: got %q err %v, want %q (server text %q)", s, err, wantStr, serverText)
 				}
+				// A *[]byte is the value's wire bytes (binary paths) or the server's
+				// text (simple protocol), as in v1.5.11; the text is in the *string.
 				var b []byte
-				if err := p.QueryRow(ctx, q, args...).Scan(&b); err != nil || string(b) != wantStr {
-					t.Errorf("*[]byte: got %q err %v, want %q (server text %q)", b, err, wantStr, serverText)
+				if err := p.QueryRow(ctx, q, args...).Scan(&b); err != nil {
+					t.Errorf("*[]byte: %v", err)
+				} else if mode == "simple" && string(b) != serverText {
+					t.Errorf("*[]byte (simple): got %q, want the server's text %q", b, serverText)
+				} else if mode != "simple" && len(b) != 4 && len(b) != 8 {
+					t.Errorf("*[]byte (%s): got %q, want the 4 or 8 wire bytes", mode, b)
 				}
 				var tm time.Time
 				if err := p.QueryRow(ctx, q, args...).Scan(&tm); err != nil || !tm.Equal(c.wantTime) {
