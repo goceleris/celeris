@@ -53,4 +53,14 @@
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/data-stores
+//
+// # Status
+//
+// Status: beta. The exported API of the driver packages stays under the
+// compatibility check, but behaviour fixes (what a value scans to, which
+// cases return an error) may land in minor releases and are listed in the
+// release notes.
+//
+// The supported types and the known gaps are listed on the supported-types
+// page (placeholder URL, not final): https://goceleris.dev/docs/drivers/postgres/supported-types
 package postgres

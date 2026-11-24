@@ -82,7 +82,7 @@ func TestRealMSR1BothBusyPortsAreNamed(t *testing.T) {
 	eq(t, "serviced", got.IRQCPUs, []int{0, 3, 4, 6})
 	eq(t, "uncovered", got.IRQUncovered, []int{3, 4})
 	var buf bytes.Buffer
-	LogPinOutcome(slog.New(slog.NewTextHandler(&buf, nil)), "epoll", got, nil)
+	LogPinOutcome(testLog(&buf, slog.LevelInfo), "epoll", got, nil)
 	out := buf.String()
 	if n := strings.Count(out, "level=WARN"); n != 1 {
 		t.Errorf("%d Warn lines, want 1:\n%s", n, out)
@@ -330,7 +330,7 @@ func TestTrafficSaturatedTotal(t *testing.T) {
 // the Warn never names them.
 func TestLogPinOutcomeNamesTheSkippedVectors(t *testing.T) {
 	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	log := testLog(&buf, slog.LevelDebug)
 	h := msr1Snapshot(t, snapVectorOnCPU1)
 	_, plan := reported(t, h, 12, false, rng(0, 11), clusterAddr)
 	eq(t, "idle", plan.IRQIdle, 58)
