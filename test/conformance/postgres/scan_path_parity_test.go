@@ -13,14 +13,15 @@ import (
 )
 
 // TestNativeScanPathParity reads one value of each common type through the
-// native Pool on three paths and requires an identical result from each:
+// native Pool on the two extended paths and requires an identical result from
+// each:
 //
 //   - cached: the DSN default (auto-cached prepared statement, binary results);
-//   - unnamed: auto_cache_statements=false (unnamed statement, text results);
-//   - simple: no arguments (simple protocol, text results).
+//   - unnamed: auto_cache_statements=false (unnamed statement, binary results).
 //
 // What a *string, *[]byte, *any or *float64 destination receives must not
-// depend on auto_cache_statements or on whether the query has arguments.
+// depend on auto_cache_statements. The simple protocol (no arguments) reads
+// text and keeps its v1.5.11 results: see TestNativeSimplePathKeepsServerText.
 func TestNativeScanPathParity(t *testing.T) {
 	// The default session time zone, and one with a non-zero offset (a
 	// timestamptz prints with it on the text paths).
@@ -122,13 +123,49 @@ func testNativeScanPathParity(t *testing.T, dsn string) {
 				}
 			}
 			for dn, sc := range dests {
-				simple := sc(cached, "SELECT "+c.expr)
 				cach := sc(cached, "SELECT "+c.expr+" WHERE $1::int = 1", 1)
 				unn := sc(unnamed, "SELECT "+c.expr+" WHERE $1::int = 1", 1)
-				if cach != unn || cach != simple {
-					t.Errorf("%s: paths differ:\n  cached  %s\n  unnamed %s\n  simple  %s", dn, cach, unn, simple)
+				if cach != unn {
+					t.Errorf("%s: paths differ:\n  cached  %s\n  unnamed %s", dn, cach, unn)
 				}
 			}
 		})
+	}
+}
+
+// TestNativeSimplePathKeepsServerText: the simple protocol reads text and the
+// driver hands a string destination the server's own text, as v1.5.11 did (the
+// cached and unnamed paths read binary and format the decoded value). Only
+// bytea differs from the server's text: the text form is the hex encoding, and
+// the bytes are the value.
+func TestNativeSimplePathKeepsServerText(t *testing.T) {
+	pool := openSettingsPool(t, dsnFromEnv(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for _, c := range []struct{ expr, want string }{
+		{`true`, "t"},
+		{`false`, "f"},
+		{`'2024-01-02'::date`, "2024-01-02"},
+		{`'2024-01-02 03:04:05.5'::timestamp`, "2024-01-02 03:04:05.5"},
+		{`1.1::float4`, "1.1"},
+		{`123456789012.5::float8`, "123456789012.5"},
+		{`'Infinity'::float8`, "Infinity"},
+		{`'12:34:56'::time`, "12:34:56"},
+		{`'1 day 02:03:04'::interval`, "1 day 02:03:04"},
+		{`'10.0.0.1'::inet`, "10.0.0.1"},
+		{`ARRAY[1,2]::int4[]`, "{1,2}"},
+	} {
+		var s string
+		if err := pool.QueryRow(ctx, "SELECT "+c.expr).Scan(&s); err != nil || s != c.want {
+			t.Errorf("%s: got %q err %v, want the server's text %q", c.expr, s, err, c.want)
+		}
+	}
+	var f float64
+	if err := pool.QueryRow(ctx, "SELECT 1.1::float4").Scan(&f); err != nil || f != 1.1 {
+		t.Errorf("float4 1.1 into *float64 on the simple path: got %v err %v, want 1.1 (v1.5.11)", f, err)
+	}
+	var b []byte
+	if err := pool.QueryRow(ctx, `SELECT 'abc'::bytea`).Scan(&b); err != nil || string(b) != "abc" {
+		t.Errorf("bytea on the simple path: got %q err %v, want the bytes", b, err)
 	}
 }

@@ -404,22 +404,6 @@ func decodeFloatText(src []byte) (driver.Value, error) {
 	return f, nil
 }
 
-// decodeFloat4Text is decodeFloatText for real: the text is parsed at 32 bits,
-// so the widened value is the float4 the binary form carries (1.1 reads as
-// 1.100000023841858 on every path), not the nearest float64 to the digits.
-func decodeFloat4Text(src []byte) (driver.Value, error) {
-	s := string(src)
-	switch s {
-	case "NaN", "Infinity", "-Infinity":
-		return decodeFloatText(src)
-	}
-	f, err := strconv.ParseFloat(s, 32)
-	if err != nil {
-		return nil, err
-	}
-	return f, nil
-}
-
 func asFloat64(v any) (float64, error) {
 	switch f := v.(type) {
 	case float32:
@@ -799,7 +783,7 @@ func init() {
 		OID:          OIDFloat4,
 		Name:         "float4",
 		DecodeBinary: decodeFloat4Binary,
-		DecodeText:   decodeFloat4Text,
+		DecodeText:   decodeFloatText,
 		EncodeBinary: encodeFloat4Binary,
 		EncodeText:   encodeFloatText,
 		ScanType:     reflect.TypeOf(float64(0)),
