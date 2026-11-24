@@ -240,7 +240,7 @@ func oneStartRegisterIteration(f startRaceFakes, eng celeris.EngineType, async b
 	// An engine that could not start on this host (io_uring without the kernel support) is a skip, not a failure.
 	select {
 	case <-stopped:
-		if startErr != nil && strings.Contains(startErr.Error(), "not available") {
+		if startErr != nil && engineCannotStart(startErr) {
 			return nil, startErr.Error()
 		}
 		if startErr != nil {
@@ -260,6 +260,14 @@ func oneStartRegisterIteration(f startRaceFakes, eng celeris.EngineType, async b
 	return failures, ""
 }
 
+// engineCannotStart reports a start failure that is the host's, not the window under test: io_uring missing in the
+// kernel, or its rings refused by a small RLIMIT_MEMLOCK (the memory of the previous iteration's rings is freed
+// asynchronously after its engine stopped).
+func engineCannotStart(err error) bool {
+	m := err.Error()
+	return strings.Contains(m, "not available") || strings.Contains(m, "cannot allocate memory")
+}
+
 func TestDriversOpenedRightAfterStart(t *testing.T) {
 	f := startRegisterFakes(t)
 	for _, tc := range []struct {
@@ -274,15 +282,23 @@ func TestDriversOpenedRightAfterStart(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			iters := startRegisterIters(tc.iters)
 			counts := map[string]int{}
+			skipped, lastSkip := 0, ""
 			for i := 0; i < iters; i++ {
 				async := i%2 == 0
 				fails, skip := oneStartRegisterIteration(f, tc.eng, async)
 				if skip != "" {
-					t.Skip(skip)
+					skipped, lastSkip = skipped+1, skip
+					continue
 				}
 				for _, m := range fails {
 					counts[m]++
 				}
+			}
+			if skipped == iters {
+				t.Skip(lastSkip)
+			}
+			if skipped > 0 {
+				t.Logf("%d of %d iterations skipped, the engine could not start on this host: %s", skipped, iters, lastSkip)
 			}
 			for m, n := range counts {
 				t.Errorf("%d of %d iterations: %s", n, iters, m)
