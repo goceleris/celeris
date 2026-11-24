@@ -109,6 +109,73 @@ jobs:
           ./test/pgspec/...
 
   # ------------------------------------------------------------------
+  # PostgreSQL through PgBouncer (pool modes session and transaction)
+  #
+  # The driver must connect through a pooler exactly as v1.5.11 did. A pooler
+  # answers a startup parameter it does not track with a FATAL error and
+  # closes the connection, so a driver that adds one (extra_float_digits,
+  # bytea_output, ...) is unreachable behind PgBouncer. PgBouncer runs in the
+  # host network in front of the Postgres service, with the same scram auth
+  # and no ignore_startup_parameters (test/conformance/postgres/pgbouncer/).
+  # ------------------------------------------------------------------
+  postgres-pgbouncer:
+    name: Postgres ${{ matrix.pg }} through PgBouncer
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["14.22", "18.3"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_USER: celeris
+          POSTGRES_PASSWORD: celeris
+          POSTGRES_DB: celeristest
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=trust"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U celeris -d celeristest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CELERIS_PGBOUNCER_DSN: postgres://celeris:celeris@127.0.0.1:6432/celeris_txn?sslmode=disable
+      CELERIS_PGBOUNCER_SESSION_DSN: postgres://celeris:celeris@127.0.0.1:6432/celeris_session?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+      - name: Start PgBouncer
+        run: |
+          docker run -d --name pgbouncer --network host \
+            -v "$PWD/test/conformance/postgres/pgbouncer:/etc/pgbouncer:ro" \
+            edoburu/pgbouncer:v1.26.1-p0
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null; then
+              echo "pgbouncer is listening"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "pgbouncer never listened"
+          docker logs pgbouncer
+          exit 1
+      - name: PgBouncer conformance
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          -run TestPgBouncer ./test/conformance/postgres/
+      - name: Dump PgBouncer log on failure
+        if: failure()
+        run: docker logs pgbouncer 2>&1 | tail -60
+
+  # ------------------------------------------------------------------
   # Redis matrix
   #
   # 7.4.8 — last stable release under the pre-SSPL BSD license line.
