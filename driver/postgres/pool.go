@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -676,8 +677,25 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		// Nil cell — zero the target if it's a common primitive.
 		return assignNil(dest)
 	}
-	// Binary format for known codecs — direct decode into typed pointer.
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
+	// A string or []byte destination gets the server's own text for a date,
+	// timestamp or timestamptz infinity, read from the wire value before any
+	// time.Time exists: the PGInfinity sentinel is also a real instant, so a
+	// time.Time cannot say which one it was.
+	if codec != nil {
+		switch dest.(type) {
+		case *string, *[]byte:
+			if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
+				if d, isStr := dest.(*string); isStr {
+					*d = txt
+				} else {
+					*dest.(*[]byte) = []byte(txt)
+				}
+				return nil
+			}
+		}
+	}
+	// Binary format for known codecs — direct decode into typed pointer.
 	if codec != nil && binaryFmt {
 		if ok, err := decodeBinaryInto(dest, raw, codec); ok {
 			return err
@@ -968,20 +986,6 @@ func scanValue(dest any, v driver.Value) error {
 	return convertAssign(dest, v)
 }
 
-// formatTimeText renders a decoded date/timestamp/timestamptz as the text a
-// *string or *[]byte destination receives: RFC3339Nano (as database/sql
-// does), except that the PGInfinity / PGNegInfinity sentinels read back as the
-// server's own "infinity" / "-infinity" rather than a made-up date.
-func formatTimeText(t time.Time) string {
-	switch {
-	case t.Equal(PGInfinity):
-		return "infinity"
-	case t.Equal(PGNegInfinity):
-		return "-infinity"
-	}
-	return t.Format(time.RFC3339Nano)
-}
-
 // convertAssign assigns src to dest pointer, performing common conversions.
 func convertAssign(dest any, src any) error {
 	switch d := dest.(type) {
@@ -1002,7 +1006,7 @@ func convertAssign(dest any, src any) error {
 				*d = "false"
 			}
 		case time.Time:
-			*d = formatTimeText(s)
+			*d = s.Format(time.RFC3339Nano) // as database/sql does
 		case []driver.Value:
 			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
@@ -1090,7 +1094,7 @@ func convertAssign(dest any, src any) error {
 		case string:
 			*d = []byte(s)
 		case time.Time:
-			*d = []byte(formatTimeText(s))
+			*d = []byte(s.Format(time.RFC3339Nano))
 		case int64, float64, bool:
 			// Same text form *string receives.
 			var str string
@@ -1272,4 +1276,43 @@ func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 		return errors.New("celeris-postgres: tx already finished")
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
+}
+
+// infinityText reports whether raw, a date, timestamp or timestamptz cell of
+// the given type and format, is PostgreSQL's infinity or -infinity, and returns
+// the text the server prints for it. The binary form is the int32 days
+// (date) or int64 microseconds (timestamp, timestamptz) sentinel MaxInt /
+// MinInt; the text form is "infinity" / "-infinity" itself.
+func infinityText(raw []byte, oid uint32, binaryFmt bool) (string, bool) {
+	switch oid {
+	case protocol.OIDDate, protocol.OIDTimestamp, protocol.OIDTimestamptz:
+	default:
+		return "", false
+	}
+	if !binaryFmt {
+		switch string(raw) {
+		case "infinity":
+			return "infinity", true
+		case "-infinity":
+			return "-infinity", true
+		}
+		return "", false
+	}
+	switch {
+	case oid == protocol.OIDDate && len(raw) == 4:
+		switch int32(binary.BigEndian.Uint32(raw)) {
+		case math.MaxInt32:
+			return "infinity", true
+		case math.MinInt32:
+			return "-infinity", true
+		}
+	case oid != protocol.OIDDate && len(raw) == 8:
+		switch int64(binary.BigEndian.Uint64(raw)) {
+		case math.MaxInt64:
+			return "infinity", true
+		case math.MinInt64:
+			return "-infinity", true
+		}
+	}
+	return "", false
 }
