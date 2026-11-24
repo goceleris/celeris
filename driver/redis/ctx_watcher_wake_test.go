@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -198,10 +199,19 @@ func TestIsBlockingCommand(t *testing.T) {
 		{"BZPOPMAX", "k", "0"}, {"BZMPOP", "0", "1", "k", "MIN"}, {"WAIT", "1", "0"}, {"WAITAOF", "1", "0", "0"},
 		{"XREAD", "BLOCK", "0", "STREAMS", "k", "$"}, {"xread", "COUNT", "2", "block", "5", "STREAMS", "k", "0"},
 		{"XREADGROUP", "GROUP", "g", "c", "BLOCK", "0", "STREAMS", "k", ">"},
+		// names that look like keywords
+		{"XREADGROUP", "GROUP", "STREAMS", "c", "BLOCK", "0", "STREAMS", "k", ">"},
+		{"XREADGROUP", "GROUP", "g", "STREAMS", "BLOCK", "0", "STREAMS", "k", ">"},
+		{"XREADGROUP", "GROUP", "g", "c", "COUNT", "5", "BLOCK", "0", "STREAMS", "k", ">"},
+		{"XREADGROUP", "GROUP", "g", "c", "NOACK", "BLOCK", "100", "STREAMS", "k", ">"},
 	}
 	no := [][]string{
 		nil, {}, {"GET", "k"}, {"SET", "k", "v"}, {"PING"}, {"LPOP", "k"}, {"BGSAVE"}, {"EVAL", "return 1", "0"},
 		{"XREAD", "STREAMS", "k", "0"}, {"XREAD", "STREAMS", "BLOCK", "0"}, {"XREADGROUP", "GROUP", "g", "c", "STREAMS", "k", ">"},
+		// group and consumer names are names, whatever they are called
+		{"XREADGROUP", "GROUP", "g", "BLOCK", "STREAMS", "k", ">"}, {"XREADGROUP", "GROUP", "BLOCK", "BLOCK", "STREAMS", "k", ">"},
+		{"XREADGROUP", "GROUP", "g"}, {"XREADGROUP", "g", "c", "BLOCK", "0", "STREAMS", "k", ">"},
+		{"XREAD", "COUNT", "BLOCK", "STREAMS", "k", "0"}, {"XREADGROUP", "GROUP", "g", "c", "COUNT", "5", "STREAMS", "k", ">"},
 		{"XADD", "k", "*", "BLOCK", "1"}, {"MULTI"}, {"EXEC"},
 	}
 	for _, a := range yes {
@@ -341,5 +351,41 @@ func BenchmarkWatcher(b *testing.B) {
 				c.disarmWake()
 			}
 		})
+	}
+}
+
+// The error of a read that the socket's deadline ended: what the context says if it
+// says anything, else a deadline for a context that has one; anything else as it is.
+func TestCtxIOError(t *testing.T) {
+	timeout := os.ErrDeadlineExceeded
+	other := errors.New("connection reset")
+	if got := ctxIOError(context.Background(), other); got != other {
+		t.Errorf("another error was changed: %v", got)
+	}
+	if got := ctxIOError(context.Background(), timeout); got != timeout {
+		t.Errorf("a timeout under a context with no deadline was changed: %v", got)
+	}
+	// A deadline context whose timer has not reported yet: the socket fired a hair early.
+	dctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	if got := ctxIOError(dctx, timeout); !errors.Is(got, context.DeadlineExceeded) || !errors.Is(got, os.ErrDeadlineExceeded) {
+		t.Errorf("early socket timeout: %v, want DeadlineExceeded and the socket's", got)
+	}
+	// Cancelled before its deadline: a cancel is a cancel.
+	cancel()
+	if got := ctxIOError(dctx, timeout); !errors.Is(got, context.Canceled) || errors.Is(got, context.DeadlineExceeded) {
+		t.Errorf("deadline context canceled early: %v, want Canceled", got)
+	}
+	// Expired.
+	ectx, ecancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer ecancel()
+	if got := ctxIOError(ectx, timeout); !errors.Is(got, context.DeadlineExceeded) {
+		t.Errorf("expired: %v", got)
+	}
+	// The watcher's end: no deadline, canceled.
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	if got := ctxIOError(cctx, timeout); !errors.Is(got, context.Canceled) {
+		t.Errorf("canceled: %v", got)
 	}
 }

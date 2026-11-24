@@ -64,15 +64,28 @@ func isBlockingCommand(args []string) bool {
 	return false
 }
 
-// hasBlockOption reports whether args of XREAD or XREADGROUP carry BLOCK before
-// the STREAMS keyword (after it, BLOCK would be a key or an id).
+// hasBlockOption reports whether the options of XREAD or XREADGROUP carry BLOCK
+// before the STREAMS keyword (after it, BLOCK would be a key or an id). The scan of
+// XREADGROUP starts after "GROUP group consumer", whose two names may be anything,
+// BLOCK and STREAMS included, and skips the value of the options that take one
+// (COUNT, CLAIM), which cannot be mistaken for a keyword that way either.
 func hasBlockOption(args []string) bool {
-	for _, a := range args[1:] {
-		if len(a) == 5 && strings.EqualFold(a, "BLOCK") {
-			return true
-		}
-		if len(a) == 7 && strings.EqualFold(a, "STREAMS") {
+	start := 1
+	if len(args[0]) == len("XREADGROUP") {
+		if len(args) < 5 || !strings.EqualFold(args[1], "GROUP") {
 			return false
+		}
+		start = 4
+	}
+	for i := start; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case len(a) == 5 && strings.EqualFold(a, "BLOCK"):
+			return true
+		case len(a) == 7 && strings.EqualFold(a, "STREAMS"):
+			return false
+		case len(a) == 5 && strings.EqualFold(a, "COUNT"), len(a) == 5 && strings.EqualFold(a, "CLAIM"):
+			i++ // its value
 		}
 	}
 	return false
@@ -155,22 +168,23 @@ func (c *redisConn) disarmWake() {
 }
 
 // ctxIOError is the error a direct conn's read or write returned, as the caller
-// should see it. A socket deadline that ended it because the context's deadline was
-// reached, or because the context ended (the watcher of a blocking command on its
-// cancel), is reported as the context's error, wrapped around the socket's so that
-// both match errors.Is (context.DeadlineExceeded or context.Canceled, and
-// os.ErrDeadlineExceeded). Whether the deadline was reached is decided by the clock
-// against ctx.Deadline(): the socket's deadline can fire a hair before the context's
-// own timer reports the expiry. Any other error is returned as it is.
+// should see it. A socket deadline that ended it because the context ended is
+// reported as the context's error, wrapped around the socket's so that both match
+// errors.Is (context.DeadlineExceeded or context.Canceled, and os.ErrDeadlineExceeded):
+// what ctx.Err() says if it says anything (a cancel that came first is a cancel, as
+// on the event loop), else context.DeadlineExceeded when the context has a deadline:
+// the socket's deadline, which is the context's, can fire a hair before the context's
+// own timer reports the expiry, and nothing else sets one on a command's conn. Any
+// other error is returned as it is.
 func ctxIOError(ctx context.Context, err error) error {
 	if err == nil || !errors.Is(err, os.ErrDeadlineExceeded) {
 		return err
 	}
-	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
-		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
-	}
 	if cerr := ctx.Err(); cerr != nil {
 		return fmt.Errorf("%w: %w", cerr, err)
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
 	}
 	return err
 }
