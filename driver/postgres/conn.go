@@ -971,6 +971,15 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 					break
 				}
 			}
+			if req.doneAtom.Load() == 0 {
+				// The drain ended without the reply (deadline or EOF): the request is
+				// still pending, and a conn put back into the pool would hand the late
+				// reply to the next statement. Fail it, as wait and
+				// awaitDirectWithCancel do.
+				c.failAll(errors.New("celeris-postgres: cancel timeout draining direct-mode req"))
+				_ = c.closeDirect()
+				return err
+			}
 			_ = c.tcp.SetReadDeadline(time.Time{})
 			return err
 		}
