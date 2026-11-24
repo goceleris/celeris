@@ -19,8 +19,10 @@ import (
 // function is not a text one (textsend, varcharsend, bpcharsend, namesend,
 // xml_send, charsend, enum_send ...) and that has no codec here, plus the arrays
 // of such types and of the types with a text send but no array codec, taken from
-// pg_type of PostgreSQL 18 (every OID below 16384 that PostgreSQL 14 also has
-// means the same there), and record / record[]. A type that is not listed (an
+// pg_type of PostgreSQL 18, checked against PostgreSQL 14 (only OIDs below
+// 10000, which are fixed in the source; the information_schema array types at
+// 13000 and up get a different OID in each major version and are not listed),
+// and record / record[]. A type that is not listed (an
 // enum, a named composite, a range or extension type the driver has never heard
 // of: OIDs from 16384 up) is left as it was: for text, varchar, bpchar, name,
 // xml and enum the binary form IS the text, and the driver cannot tell an enum
@@ -55,8 +57,7 @@ var binaryOnlyTypes = map[uint32]string{
 	4534: "tstzmultirange", 4535: "datemultirange", 4536: "int8multirange", 4600: "pg_brin_bloom_summary",
 	4601: "pg_brin_minmax_multi_summary", 5039: "pg_snapshot[]", 5069: "xid8", 6150: "int4multirange[]",
 	6151: "nummultirange[]", 6152: "tsmultirange[]", 6153: "tstzmultirange[]", 6155: "datemultirange[]",
-	6157: "int8multirange[]", 13306: "cardinal_number[]", 13309: "character_data[]", 13311: "sql_identifier[]",
-	13317: "time_stamp[]", 13319: "yes_or_no[]",
+	6157: "int8multirange[]",
 }
 
 // errBinaryOnly is the error for scanning a column of a binary-only type with
