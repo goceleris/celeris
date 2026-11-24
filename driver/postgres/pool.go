@@ -519,13 +519,6 @@ func releaseRows(r *Rows) {
 	rowsPool.Put(r)
 }
 
-// rawRowSource is implemented by the driver's own row iterators: a buffered
-// result (pgRows) and a streamed one (streamRows). Rows.Next takes the raw
-// bytes from it and Rows.Scan decodes them straight into the destinations.
-type rawRowSource interface {
-	nextRaw() ([][]byte, []*protocol.TypeCodec, []protocol.ColumnDesc, bool, error)
-}
-
 // Rows is the pool-level rows wrapper. It returns the underlying conn to the
 // pool when Close is called. The iteration API matches database/sql.Rows:
 //
@@ -579,7 +572,7 @@ func (r *Rows) Close() error {
 // rows are available or an error occurred. After Next returns false, call
 // [Rows.Err] to distinguish normal end-of-data from an error.
 //
-// Fast path: when inner is a pgRows or a streamRows (the production paths), Next captures
+// Fast path: when inner is *pgRows (the production path), Next captures
 // the raw wire bytes + per-column codecs without boxing into
 // driver.Value. Scan() then decodes directly into user pointers, saving
 // one heap alloc per non-zero-size cell (int64 / time.Time etc. would
@@ -588,8 +581,8 @@ func (r *Rows) Next() bool {
 	if r.done {
 		return false
 	}
-	if src, ok := r.inner.(rawRowSource); ok {
-		row, codecs, cols, textFormat, err := src.nextRaw()
+	if pgr, ok := r.inner.(*pgRows); ok {
+		row, codecs, cols, textFormat, err := pgr.nextRaw()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				r.iterErr = err
@@ -650,7 +643,15 @@ func (r *Rows) Scan(dest ...any) error {
 	if len(dest) != len(r.current) {
 		return fmt.Errorf("celeris-postgres: Scan expected %d dest, got %d", len(r.current), len(dest))
 	}
+	sr, _ := r.inner.(*streamRows)
 	for i, v := range r.current {
+		if sr != nil && i < len(sr.current) && sr.current[i] != nil && i < len(sr.codecs) && i < len(sr.columns) {
+			// A streamed row: infinity into a string is read from the raw cell.
+			binaryFmt := !sr.textFormat && sr.columns[i].FormatCode != protocol.FormatText
+			if rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
+				continue
+			}
+		}
 		if err := scanValue(dest[i], v); err != nil {
 			return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
 		}
@@ -685,22 +686,8 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		return assignNil(dest)
 	}
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
-	// A string or []byte destination gets the server's own text for a date,
-	// timestamp or timestamptz infinity, read from the wire value before any
-	// time.Time exists: the PGInfinity sentinel is also a real instant, so a
-	// time.Time cannot say which one it was.
-	if codec != nil {
-		switch dest.(type) {
-		case *string, *[]byte:
-			if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
-				if d, isStr := dest.(*string); isStr {
-					*d = txt
-				} else {
-					*dest.(*[]byte) = []byte(txt)
-				}
-				return nil
-			}
-		}
+	if rawCellGuard(dest, raw, codec, binaryFmt) {
+		return nil
 	}
 	// Binary format for known codecs — direct decode into typed pointer.
 	if codec != nil && binaryFmt {
@@ -1263,6 +1250,32 @@ func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 		return errors.New("celeris-postgres: tx already finished")
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
+}
+
+// rawCellGuard handles, for a *string or *[]byte destination, the cells whose
+// raw wire value says more than the decoded driver.Value can. It reports
+// whether it filled dest. Today that is the infinity of a
+// date, timestamp or timestamptz: the server's own text, read from the wire
+// value before any time.Time exists, because the PGInfinity sentinel is also a
+// real instant. Both the buffered (scanRaw) and the streamed (Rows.Scan over a
+// streamRows) paths call it; every other cell goes the unchanged way.
+func rawCellGuard(dest any, raw []byte, codec *protocol.TypeCodec, binaryFmt bool) bool {
+	if codec == nil {
+		return false
+	}
+	switch d := dest.(type) {
+	case *string:
+		if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
+			*d = txt
+			return true
+		}
+	case *[]byte:
+		if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
+			*d = []byte(txt)
+			return true
+		}
+	}
+	return false
 }
 
 // infinityText reports whether raw, a date, timestamp or timestamptz cell of

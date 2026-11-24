@@ -58,3 +58,37 @@ func TestStreamedRowsInfinityIntoString(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A streamed row scans through driver.Value exactly as in v1.5.11 (only the
+// raw-cell guards, infinity into a string, differ): a bool read from the
+// simple protocol's text into *string is "true" (convertAssign), not the
+// server's "t" that a buffered row hands over.
+func TestStreamedRowsKeepTheDriverValuePath(t *testing.T) {
+	rowCh := make(chan [][]byte, 1)
+	rowCh <- [][]byte{[]byte("t"), []byte("2024-01-02")}
+	close(rowCh)
+	doneCh := make(chan struct{})
+	close(doneCh)
+	var errVal atomic.Pointer[error]
+	sr := &streamRows{
+		columns: []protocol.ColumnDesc{
+			{Name: "b", TypeOID: protocol.OIDBool},
+			{Name: "d", TypeOID: protocol.OIDDate},
+		},
+		codecs: []*protocol.TypeCodec{
+			protocol.LookupOID(protocol.OIDBool), protocol.LookupOID(protocol.OIDDate),
+		},
+		textFormat: true,
+		rowCh:      rowCh,
+		doneCh:     doneCh,
+		errVal:     &errVal,
+	}
+	rows := acquireRows(sr, nil, nil)
+	if !rows.Next() {
+		t.Fatal("no row")
+	}
+	var b, d string
+	if err := rows.Scan(&b, &d); err != nil || b != "true" || d != "2024-01-02T00:00:00Z" {
+		t.Errorf("streamed simple-protocol row: got %q %q err %v, want the v1.5.11 values \"true\" and \"2024-01-02T00:00:00Z\"", b, d, err)
+	}
+}
