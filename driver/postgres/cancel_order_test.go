@@ -376,3 +376,27 @@ func TestSendCancelRequestUnconfirmedAtDeadline(t *testing.T) {
 		t.Fatalf("took %v with a %v deadline", el, cancelExchangeTimeout)
 	}
 }
+
+// A pooler may answer a CancelRequest by resetting the socket instead of
+// closing it (PgBouncer does for a client it has no session for): that is as
+// final as an EOF, the exchange is over.
+func TestSendCancelRequestResetIsConfirmed(t *testing.T) {
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		c, err := ln.AcceptTCP()
+		if err != nil {
+			return
+		}
+		var buf [16]byte
+		_, _ = io.ReadFull(c, buf[:])
+		_ = c.SetLinger(0) // Close now sends RST
+		_ = c.Close()
+	}()
+	if err := sendCancelRequest(context.Background(), ln.Addr().(*net.TCPAddr), 7, 9); err != nil {
+		t.Fatalf("a reset after the request was reported as unconfirmed: %v", err)
+	}
+}
