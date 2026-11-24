@@ -92,8 +92,10 @@ func TestScanRawJSONFamilyTextForm(t *testing.T) {
 			text := tc.format == protocol.FormatText
 
 			var b []byte
-			if err := scanRaw(&b, tc.raw, codec, col, text); err != nil || string(b) != tc.want {
-				t.Errorf("*[]byte: got %q err %v, want %q", b, err, tc.want)
+			// *[]byte is the value's wire bytes, exactly as v1.5.11 (scan into a
+			// string for text).
+			if err := scanRaw(&b, tc.raw, codec, col, text); err != nil || string(b) != string(tc.raw) {
+				t.Errorf("*[]byte: got %q err %v, want the wire bytes %q", b, err, tc.raw)
 			}
 			var s string
 			if err := scanRaw(&s, tc.raw, codec, col, text); err != nil || s != tc.want {
@@ -230,8 +232,8 @@ func TestScanRawNullClearsDest(t *testing.T) {
 	}
 }
 
-// Times scanned into string / []byte take the RFC 3339 form database/sql
-// uses, not Go's "%v" form and not an error.
+// Times scanned into a string take the RFC 3339 form database/sql uses, not
+// Go's "%v" form; a []byte gets the wire bytes, as in v1.5.11.
 func TestScanRawTimesAsRFC3339(t *testing.T) {
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 123456000, time.UTC)
 	for _, tc := range []struct {
@@ -256,8 +258,8 @@ func TestScanRawTimesAsRFC3339(t *testing.T) {
 				t.Errorf("*string: got %q err %v, want %q", s, err, tc.want)
 			}
 			var b []byte
-			if err := scanRaw(&b, raw, codec, col, false); err != nil || string(b) != tc.want {
-				t.Errorf("*[]byte: got %q err %v, want %q", b, err, tc.want)
+			if err := scanRaw(&b, raw, codec, col, false); err != nil || string(b) != string(raw) {
+				t.Errorf("*[]byte: got %q err %v, want the wire bytes %q (as v1.5.11)", b, err, raw)
 			}
 		})
 	}
@@ -265,7 +267,7 @@ func TestScanRawTimesAsRFC3339(t *testing.T) {
 
 // Arrays decode to []driver.Value; scanning one into a string must fail
 // loudly (as database/sql does) instead of formatting Go's "%v" of the
-// element bytes ("[[123 34 97 ...]]").
+// element bytes ("[[123 34 97 ...]]"). A []byte gets the wire bytes, as in v1.5.11.
 func TestScanRawArrayIntoStringErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -286,8 +288,8 @@ func TestScanRawArrayIntoStringErrors(t *testing.T) {
 				t.Errorf("*string: got %q, want an error", s)
 			}
 			var b []byte
-			if err := scanRaw(&b, raw, codec, col, false); err == nil {
-				t.Errorf("*[]byte: got %q, want an error", b)
+			if err := scanRaw(&b, raw, codec, col, false); err != nil || string(b) != string(raw) {
+				t.Errorf("*[]byte: got %q err %v, want the wire bytes (as v1.5.11)", b, err)
 			}
 			var a any
 			if err := scanRaw(&a, raw, codec, col, false); err != nil {
@@ -375,8 +377,8 @@ func TestScanRawInfinityIntoString(t *testing.T) {
 					t.Errorf("*string: got %q err %v, want %q", s, err, c.want)
 				}
 				var b []byte
-				if err := scanRaw(&b, f.raw, codec, col, f.text); err != nil || string(b) != c.want {
-					t.Errorf("*[]byte: got %q err %v, want %q", b, err, c.want)
+				if err := scanRaw(&b, f.raw, codec, col, f.text); err != nil || string(b) != string(f.raw) {
+					t.Errorf("*[]byte: got %q err %v, want the raw cell %q (as v1.5.11)", b, err, f.raw)
 				}
 				var tm time.Time
 				if err := scanRaw(&tm, f.raw, codec, col, f.text); err != nil || !tm.Equal(c.wantT) {

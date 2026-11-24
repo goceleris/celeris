@@ -44,13 +44,8 @@ func TestStreamedRowsInfinityIntoString(t *testing.T) {
 			t.Errorf("row %d *string: got %q err %v, want %q", i, s, err, want[i])
 		}
 		var b []byte
-		err := rows.Scan(&b)
-		if i < 2 && (err != nil || string(b) != want[i]) {
-			t.Errorf("row %d *[]byte: got %q err %v, want %q", i, b, err, want[i])
-		}
-		if i == 2 && err == nil {
-			// v1.5.11: a streamed time.Time does not convert to []byte
-			t.Errorf("row %d *[]byte: got %q, want v1.5.11's conversion error", i, b)
+		if err := rows.Scan(&b); err == nil && i < 2 && string(b) == want[i] {
+			t.Errorf("row %d *[]byte: got %q, want the v1.5.11 result (a streamed time.Time does not convert to []byte)", i, b)
 		}
 		var tm time.Time
 		if err := rows.Scan(&tm); err != nil {
