@@ -145,7 +145,20 @@ type fuzzMismatch struct{ msg string }
 
 func (e *fuzzMismatch) Error() string { return e.msg }
 
+// fuzzRun checks one batch on every route; the per-route counts are added to
+// checked only when the whole batch passed.
 func fuzzRun(ctx context.Context, rig *fuzzRig, typ string, batch []string, checked map[string]int) error {
+	local := map[string]int{}
+	if err := fuzzRoutes(ctx, rig, typ, batch, local); err != nil {
+		return err
+	}
+	for k, v := range local {
+		checked[k] += v
+	}
+	return nil
+}
+
+func fuzzRoutes(ctx context.Context, rig *fuzzRig, typ string, batch []string, checked map[string]int) error {
 	var sb strings.Builder
 	sb.WriteString("SELECT u.v::" + typ + ", " + oracleExpr(typ) + ", u.v::" + typ + " FROM unnest(ARRAY[")
 	for i, l := range batch {
