@@ -1,4 +1,4 @@
-//go:build postgres
+//go:build postgres && pgbouncer
 
 package postgres_test
 
@@ -20,9 +20,12 @@ import (
 // the connection, so a driver that sends one is unreachable behind PgBouncer.
 //
 // The Drivers workflow runs this against PgBouncer (pool modes session and
-// transaction, see pgbouncer/pgbouncer.ini) in front of each Postgres service.
-// It skips cleanly unless CELERIS_PGBOUNCER_DSN (the transaction-mode pool)
-// is set; CELERIS_PGBOUNCER_SESSION_DSN adds the session-mode pool.
+// transaction, see pgbouncer/pgbouncer.ini) in front of each Postgres service,
+// with -tags 'postgres pgbouncer'. The extra tag keeps it out of the
+// Driver Conformance job (-tags postgres), which has no PgBouncer and fails on
+// a skipped test. It skips cleanly unless CELERIS_PGBOUNCER_DSN (the
+// transaction-mode pool) is set; CELERIS_PGBOUNCER_SESSION_DSN adds the
+// session-mode pool.
 const (
 	envPgBouncerDSN        = "CELERIS_PGBOUNCER_DSN"
 	envPgBouncerSessionDSN = "CELERIS_PGBOUNCER_SESSION_DSN"

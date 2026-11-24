@@ -157,7 +157,7 @@ jobs:
           docker run -d --name pgbouncer --network host \
             -v "$PWD/test/conformance/postgres/pgbouncer:/etc/pgbouncer:ro" \
             edoburu/pgbouncer:v1.26.1-p0
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null; then
               echo "pgbouncer is listening"
               exit 0
@@ -169,7 +169,7 @@ jobs:
           exit 1
       - name: PgBouncer conformance
         run: >-
-          go test -tags postgres -race -count=1 -timeout=300s
+          go test -tags 'postgres pgbouncer' -race -count=1 -timeout=300s
           -v -run TestPgBouncer ./test/conformance/postgres/
       - name: Dump PgBouncer log on failure
         if: failure()
