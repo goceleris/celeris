@@ -62,9 +62,17 @@ func TestNativeInfinityVersusRealMaximum(t *testing.T) {
 			if serverText != c.wantStr {
 				t.Fatalf("%s: server prints %q, table expects %q", c.name, serverText, c.wantStr)
 			}
+		} else {
+			// A real value: the server's own text, parsed, is the same instant
+			// as the table's expectation.
+			got, ok := parseServerTime(serverText)
+			if !ok || !got.Equal(c.wantTime) {
+				t.Fatalf("%s: server prints %q (%v), table expects %v", c.name, serverText, got, c.wantTime)
+			}
 		}
 		for _, mode := range []string{"simple", "cached", "unnamed"} {
 			t.Run(c.name+"/"+mode, func(t *testing.T) {
+				wantStr := c.wantStr
 				p, q, args := pools["cached"], "SELECT "+c.expr, []any(nil)
 				if mode != "simple" {
 					q += " WHERE $1::int = 1"
@@ -73,13 +81,16 @@ func TestNativeInfinityVersusRealMaximum(t *testing.T) {
 				if mode == "unnamed" {
 					p = pools["unnamed"]
 				}
+				if srv, ok := parseServerTime(serverText); ok {
+					wantStr = srv.UTC().Format(time.RFC3339Nano) // the server's own value, as RFC3339Nano
+				}
 				var s string
-				if err := p.QueryRow(ctx, q, args...).Scan(&s); err != nil || s != c.wantStr {
-					t.Errorf("*string: got %q err %v, want %q", s, err, c.wantStr)
+				if err := p.QueryRow(ctx, q, args...).Scan(&s); err != nil || s != wantStr {
+					t.Errorf("*string: got %q err %v, want %q (server text %q)", s, err, wantStr, serverText)
 				}
 				var b []byte
-				if err := p.QueryRow(ctx, q, args...).Scan(&b); err != nil || string(b) != c.wantStr {
-					t.Errorf("*[]byte: got %q err %v, want %q", b, err, c.wantStr)
+				if err := p.QueryRow(ctx, q, args...).Scan(&b); err != nil || string(b) != wantStr {
+					t.Errorf("*[]byte: got %q err %v, want %q (server text %q)", b, err, wantStr, serverText)
 				}
 				var tm time.Time
 				if err := p.QueryRow(ctx, q, args...).Scan(&tm); err != nil || !tm.Equal(c.wantTime) {
@@ -95,4 +106,18 @@ func TestNativeInfinityVersusRealMaximum(t *testing.T) {
 			})
 		}
 	}
+}
+
+// parseServerTime parses the server's ISO text of a date, timestamp or
+// timestamptz (infinity excluded), as an instant in UTC.
+func parseServerTime(s string) (time.Time, bool) {
+	for _, layout := range []string{
+		"2006-01-02 15:04:05.999999-07", "2006-01-02 15:04:05.999999Z07:00",
+		"2006-01-02 15:04:05.999999", "2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
