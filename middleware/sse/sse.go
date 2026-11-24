@@ -67,11 +67,12 @@ type Client struct {
 //   - non-nil error: the event was NOT delivered (closed, context cancelled,
 //     or write failed); the caller may retry on a new connection.
 //   - nil error in blocking mode (MaxQueueDepth = 0): the event was handed
-//     to the connection and flushed. On epoll, io_uring and adaptive over
-//     HTTP/1.1 that means the engine accepted the bytes for sending: a
-//     write after the engine has noticed a reset is dropped without an
-//     error, and the disconnect arrives through [Client.Context], not
-//     through Send.
+//     to the connection and flushed. On the epoll and io_uring engines over
+//     HTTP/1.1 that means the engine accepted the bytes for sending, which says
+//     nothing about the peer: a write before the engine has noticed a
+//     reset still returns nil. Once it has, Send returns an error, either
+//     the context error of [Client.Context] (cancelled by the disconnect)
+//     or an error wrapping net.ErrClosed from the write itself.
 //   - nil error in queued mode (MaxQueueDepth > 0): the event was enqueued
 //     OR dropped silently per the [Config.OnSlowClient] policy; check
 //     [Client.DroppedEvents] to detect drops.
@@ -464,13 +465,14 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 		}
 
-		// celeris#494: on epoll/io_uring the H1 StreamWriter can never
-		// fail — h1ResponseAdapter.Write/Flush/Close return nil over an
-		// error-less engine writeFn whose post-Detach guard silently
-		// drops bytes once the engine has closed the conn — and
-		// c.Context() is context.Background() for every H1 stream. A
-		// client that goes away is therefore invisible to this
-		// middleware unless the engine says so. It already does, through
+		// celeris#494: on epoll/io_uring c.Context() is
+		// context.Background() for every H1 stream, and a write only
+		// fails once the engine has closed the conn (the StreamWriter
+		// returns conn.ErrConnClosed then, since celeris#1067; before it
+		// the writes were dropped without an error). Until the engine
+		// has noticed, a write still returns nil, so a client that goes
+		// away is invisible to this middleware unless the engine says
+		// so. It already does, through
 		// the two detached-conn callbacks the WebSocket middleware relies
 		// on: H1State.OnError (recv EOF/ECONNRESET, send EPIPE, parse
 		// error — fired before closeConn) and H1State.OnDetachClose

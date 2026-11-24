@@ -84,7 +84,7 @@ func connectClient(t *testing.T, extra ...celredis.Option) *celredis.Client {
 	t.Helper()
 	addr := addrFromEnv(t)
 	opts := append(clientOpts(), extra...)
-	c, err := celredis.NewClient(addr, opts...)
+	c, err := celredis.NewClient(addr, withEngine(opts)...)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
