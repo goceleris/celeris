@@ -48,12 +48,16 @@ type fakePostmaster struct {
 	log      []string
 	startups int
 	cancelCh chan struct{}
-	done     chan struct{}
+	// slowCh gets one token each time fakeSlowQuery reaches the backend: the
+	// tests end their context from it, so no clock decides whether the cancel
+	// exists.
+	slowCh chan struct{}
+	done   chan struct{}
 }
 
 func startFakePostmaster(t *testing.T, hold time.Duration, slowReply string) *fakePostmaster {
 	t.Helper()
-	f := &fakePostmaster{t: t, hold: hold, slowReply: slowReply, cancelCh: make(chan struct{}, 16), done: make(chan struct{})}
+	f := &fakePostmaster{t: t, hold: hold, slowReply: slowReply, cancelCh: make(chan struct{}, 16), slowCh: make(chan struct{}, 16), done: make(chan struct{})}
 	f.addr = startFakePG(t, f.serve)
 	t.Cleanup(func() { close(f.done) })
 	return f
@@ -136,6 +140,12 @@ func (f *fakePostmaster) serve(c net.Conn) {
 		}
 		q := string(bytes.TrimRight(payload, "\x00"))
 		f.record("query:" + q)
+		if q == fakeSlowQuery {
+			select {
+			case f.slowCh <- struct{}{}:
+			default:
+			}
+		}
 		if q == fakeSlowQuery {
 			// NoticeResponses while the statement "runs": its response
 			// arrives in pieces. A Pool conn in direct mode looks at its

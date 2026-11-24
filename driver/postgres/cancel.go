@@ -35,6 +35,11 @@ func buildCancelRequest(pid, secret int32) []byte {
 // pgConn.cancelRunning). A var so the tests can shorten it.
 var cancelExchangeTimeout = time.Second
 
+// cancelDrainTimeout bounds how long driveDirect waits, after a confirmed
+// cancel, for the cancelled statement's Error + ReadyForQuery. A var so the
+// tests can shorten it.
+var cancelDrainTimeout = 30 * time.Second
+
 // errCancelUnconfirmed fails a conn whose cancel exchange did not finish. It
 // reaches no caller: the statement's caller gets its own ctx error.
 var errCancelUnconfirmed = errors.New("celeris-postgres: cancel request not confirmed by the server")

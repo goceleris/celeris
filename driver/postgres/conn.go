@@ -960,7 +960,7 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			// Bounded wait for the server's Error + RFQ response so we
 			// leave the wire aligned. If the server doesn't drain within
 			// 30s we fail the conn to prevent a stuck reader.
-			deadline := time.Now().Add(30 * time.Second)
+			deadline := time.Now().Add(cancelDrainTimeout)
 			_ = c.tcp.SetReadDeadline(deadline)
 			for req.doneAtom.Load() == 0 {
 				n, rerr := c.tcp.Read(c.directBuf)
