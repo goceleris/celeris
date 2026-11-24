@@ -274,6 +274,24 @@ func (r *streamRows) Columns() []string {
 	return out
 }
 
+// nextRaw reads the next row from the channel without decoding it, like
+// [pgRows.nextRaw]: the row is owned memory (dispatch copies it), the codecs and
+// columns are the statement's. Rows.Scan then decodes straight into the
+// destination, so a streamed row scans exactly like a buffered one (infinity
+// into a string, for one, is read from the wire value, not from a sentinel).
+func (r *streamRows) nextRaw() ([][]byte, []*protocol.TypeCodec, []protocol.ColumnDesc, bool, error) {
+	row, ok := <-r.rowCh
+	if !ok {
+		if ep := r.errVal.Load(); ep != nil && *ep != nil {
+			r.err = *ep
+			return nil, nil, nil, r.textFormat, r.err
+		}
+		return nil, nil, nil, r.textFormat, io.EOF
+	}
+	r.current = row
+	return row, r.codecs, r.columns, r.textFormat, nil
+}
+
 // Next reads the next row from the channel. Returns io.EOF when all rows
 // have been consumed (channel closed by dispatch).
 func (r *streamRows) Next(dest []driver.Value) error {

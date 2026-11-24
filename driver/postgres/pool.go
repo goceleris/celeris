@@ -519,6 +519,13 @@ func releaseRows(r *Rows) {
 	rowsPool.Put(r)
 }
 
+// rawRowSource is implemented by the driver's own row iterators: a buffered
+// result (pgRows) and a streamed one (streamRows). Rows.Next takes the raw
+// bytes from it and Rows.Scan decodes them straight into the destinations.
+type rawRowSource interface {
+	nextRaw() ([][]byte, []*protocol.TypeCodec, []protocol.ColumnDesc, bool, error)
+}
+
 // Rows is the pool-level rows wrapper. It returns the underlying conn to the
 // pool when Close is called. The iteration API matches database/sql.Rows:
 //
@@ -572,7 +579,7 @@ func (r *Rows) Close() error {
 // rows are available or an error occurred. After Next returns false, call
 // [Rows.Err] to distinguish normal end-of-data from an error.
 //
-// Fast path: when inner is *pgRows (the production path), Next captures
+// Fast path: when inner is a pgRows or a streamRows (the production paths), Next captures
 // the raw wire bytes + per-column codecs without boxing into
 // driver.Value. Scan() then decodes directly into user pointers, saving
 // one heap alloc per non-zero-size cell (int64 / time.Time etc. would
@@ -581,8 +588,8 @@ func (r *Rows) Next() bool {
 	if r.done {
 		return false
 	}
-	if pgr, ok := r.inner.(*pgRows); ok {
-		row, codecs, cols, textFormat, err := pgr.nextRaw()
+	if src, ok := r.inner.(rawRowSource); ok {
+		row, codecs, cols, textFormat, err := src.nextRaw()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				r.iterErr = err
