@@ -705,6 +705,20 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 	if err != nil {
 		return err
 	}
+	// A date, timestamp or timestamptz into a string or []byte is RFC3339Nano
+	// (as database/sql formats it). Done here, on the raw path, and not in
+	// convertAssign: a streamed row scans through convertAssign exactly as in
+	// v1.5.11, where a time.Time into *string was fmt's %v form.
+	if t, ok := v.(time.Time); ok {
+		switch d := dest.(type) {
+		case *string:
+			*d = t.Format(time.RFC3339Nano)
+			return nil
+		case *[]byte:
+			*d = []byte(t.Format(time.RFC3339Nano))
+			return nil
+		}
+	}
 	return scanValue(dest, v)
 }
 
@@ -979,8 +993,6 @@ func convertAssign(dest any, src any) error {
 			} else {
 				*d = "false"
 			}
-		case time.Time:
-			*d = s.Format(time.RFC3339Nano) // as database/sql does
 		case []driver.Value:
 			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
@@ -1067,8 +1079,6 @@ func convertAssign(dest any, src any) error {
 			*d = cp
 		case string:
 			*d = []byte(s)
-		case time.Time:
-			*d = []byte(s.Format(time.RFC3339Nano))
 		case int64, float64, bool:
 			// Same text form *string receives.
 			var str string

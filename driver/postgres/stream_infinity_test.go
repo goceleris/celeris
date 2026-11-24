@@ -19,7 +19,8 @@ func TestStreamedRowsInfinityIntoString(t *testing.T) {
 	i64 := func(v int64) []byte { return binary.BigEndian.AppendUint64(nil, uint64(v)) }
 	realMicros := int64(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC).Sub(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)) / time.Microsecond)
 	cells := [][]byte{i64(math.MaxInt64), i64(math.MinInt64), i64(realMicros)}
-	want := []string{"infinity", "-infinity", "2026-01-02T03:04:05Z"}
+	// the real value of a streamed row reads as in v1.5.11 (fmt's %v of the time.Time)
+	want := []string{"infinity", "-infinity", "2026-01-02 03:04:05 +0000 UTC"}
 
 	rowCh := make(chan [][]byte, len(cells))
 	for _, c := range cells {
@@ -43,8 +44,13 @@ func TestStreamedRowsInfinityIntoString(t *testing.T) {
 			t.Errorf("row %d *string: got %q err %v, want %q", i, s, err, want[i])
 		}
 		var b []byte
-		if err := rows.Scan(&b); err != nil || string(b) != want[i] {
+		err := rows.Scan(&b)
+		if i < 2 && (err != nil || string(b) != want[i]) {
 			t.Errorf("row %d *[]byte: got %q err %v, want %q", i, b, err, want[i])
+		}
+		if i == 2 && err == nil {
+			// v1.5.11: a streamed time.Time does not convert to []byte
+			t.Errorf("row %d *[]byte: got %q, want v1.5.11's conversion error", i, b)
 		}
 		var tm time.Time
 		if err := rows.Scan(&tm); err != nil {
@@ -88,7 +94,7 @@ func TestStreamedRowsKeepTheDriverValuePath(t *testing.T) {
 		t.Fatal("no row")
 	}
 	var b, d string
-	if err := rows.Scan(&b, &d); err != nil || b != "true" || d != "2024-01-02T00:00:00Z" {
-		t.Errorf("streamed simple-protocol row: got %q %q err %v, want the v1.5.11 values \"true\" and \"2024-01-02T00:00:00Z\"", b, d, err)
+	if err := rows.Scan(&b, &d); err != nil || b != "true" || d != "2024-01-02 00:00:00 +0000 UTC" {
+		t.Errorf("streamed simple-protocol row: got %q %q err %v, want the v1.5.11 values \"true\" and \"2024-01-02 00:00:00 +0000 UTC\"", b, d, err)
 	}
 }
