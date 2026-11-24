@@ -782,9 +782,10 @@ type pgConn struct {
 	closeOnce sync.Once
 	closeErr  atomic.Value // error
 	closed    atomic.Bool
-	// closeWG tracks background goroutines spawned by the conn
-	// (dropPreparedAsync, etc.) so Close can join them and we don't
-	// leak Gs that outlive the conn.
+	// closeWG tracks background goroutines a conn may start, so Close can
+	// join them and none outlives the conn. None starts one today (an evicted
+	// statement is dropped on the caller's goroutine, see dropPreparedAsync);
+	// it stays for the next one.
 	closeWG sync.WaitGroup
 
 	// fdReleased marks the release of fd's number. The event loop's
@@ -1534,6 +1535,12 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		// simple-query branch.
 		done, err := head.extended.Handle(msgType, payload, head)
 		if err != nil {
+			// A server error after some rows: those rows are returned with
+			// the error, and they need the column description of the
+			// Describe response (it is on extended.Columns until the done
+			// branch copies it), or an unnamed statement's cells reach
+			// Scan with no OID: raw wire bytes into a string.
+			head.setResultIfLive("", head.extended.Columns)
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
 				head.closeRowCh()
@@ -2114,13 +2121,22 @@ func hasPrefixFold(s, prefix string) bool {
 	return true
 }
 
-// dropPreparedAsync fires a best-effort Close('S') for an evicted
-// prepared statement. Fire-and-forget to not block the caller, but
-// bound by:
-//   - a 5s timeout (so a stuck TCP write doesn't hold the G forever)
-//   - the conn's closed flag (on Close, the G observes and bails)
-//   - the conn's closeWG (Close waits so the G doesn't outlive
-//     the conn's logical lifetime)
+// dropPreparedAsync drops an evicted prepared statement on the server with a
+// protocol-level Close('S') + Sync, written on the caller's goroutine ahead of
+// the query that caused the eviction. The caller holds the conn and is the only
+// goroutine that may drive it: a goroutine of its own issuing a request on the
+// same conn raced the caller's next request (in direct mode both read the
+// socket and the caller could block in Read for ever once the other reader
+// consumed its reply; on the event loop both enqueued and wrote, and replies
+// went to the wrong request: "unexpected CommandComplete in extended query").
+//
+// Nothing waits for the reply: it is read, in order, by the next read of the
+// conn, before the evicting query's own reply, so there is no extra round trip,
+// no context and no cancel request. A Close of a statement the server no longer
+// has (DEALLOCATE ALL or DISCARD ALL ran, a pooler renamed it) is not an error
+// to Postgres, so it never aborts an open transaction, which an SQL DEALLOCATE
+// of the same name would. Errors are ignored (the name is minted by the driver
+// and the statement is unreachable once it left the cache).
 func (c *pgConn) dropPreparedAsync(prep *protocol.PreparedStmt) {
 	if prep == nil || prep.Name == "" {
 		return
@@ -2128,16 +2144,7 @@ func (c *pgConn) dropPreparedAsync(prep *protocol.PreparedStmt) {
 	if c.closed.Load() {
 		return
 	}
-	c.closeWG.Add(1)
-	go func() {
-		defer c.closeWG.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if c.closed.Load() {
-			return
-		}
-		_ = c.simpleExecNoTag(ctx, "DEALLOCATE "+prep.Name)
-	}()
+	_ = c.closePreparedServerAsync(prep.Name)
 }
 
 // simpleQuery runs a no-arg Query via the simple protocol.
@@ -2928,9 +2935,9 @@ func (c *pgConn) Close() error {
 			c.closeLoop()
 		}
 	})
-	// Join any background goroutines (dropPreparedAsync) spawned by
-	// this conn. Safe outside closeOnce because closeWG.Wait() on
-	// a zero WaitGroup returns immediately.
+	// Join any background goroutines the conn started (none today, see
+	// closeWG). Safe outside closeOnce because closeWG.Wait() on a zero
+	// WaitGroup returns immediately.
 	c.closeWG.Wait()
 	// Release the number only now: a background goroutine that lost the
 	// race with Close may have written by number until Wait returned.
