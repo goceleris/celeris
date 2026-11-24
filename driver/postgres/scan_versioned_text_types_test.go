@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -296,15 +297,17 @@ func TestScanRawArrayIntoStringErrors(t *testing.T) {
 	}
 }
 
-// TestConvertAssignInfinityIntoString pins that the PGInfinity / PGNegInfinity
-// sentinels read into *string and *[]byte as the server's own text.
-func TestConvertAssignInfinityIntoString(t *testing.T) {
+// A time.Time that reaches convertAssign is a value, never a marker: the
+// PGInfinity date is also a real instant (9999-12-31 23:59:59), so it must
+// format like any other time. The server's own text for infinity is read from
+// the wire value in scanRaw, see TestScanRawInfinityIntoString.
+func TestConvertAssignTimeIsNeverInfinityText(t *testing.T) {
 	for _, c := range []struct {
 		in   time.Time
 		want string
 	}{
-		{PGInfinity, "infinity"},
-		{PGNegInfinity, "-infinity"},
+		{PGInfinity, "9999-12-31T23:59:59Z"},
+		{PGNegInfinity, "-4713-01-01T00:00:00Z"},
 		{time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), "2026-01-02T03:04:05Z"},
 	} {
 		var s string
@@ -315,5 +318,73 @@ func TestConvertAssignInfinityIntoString(t *testing.T) {
 		if err := convertAssign(&b, c.in); err != nil || string(b) != c.want {
 			t.Errorf("*[]byte from %v: got %q err %v, want %q", c.in, b, err, c.want)
 		}
+	}
+}
+
+// TestScanRawInfinityIntoString: date, timestamp and timestamptz infinity
+// arrive as the binary sentinels (int64 MaxInt64/MinInt64 micros, int32
+// MaxInt32/MinInt32 days) or the text "infinity" / "-infinity". A *string or
+// *[]byte destination is filled from that raw value, before any time.Time
+// exists, with the server's text. *time.Time and *any keep the exported
+// sentinels (PGInfinity, PGNegInfinity), as in v1.5.11.
+func TestScanRawInfinityIntoString(t *testing.T) {
+	i64 := func(v int64) []byte { return binary.BigEndian.AppendUint64(nil, uint64(v)) }
+	i32 := func(v int32) []byte { return binary.BigEndian.AppendUint32(nil, uint32(v)) }
+	for _, c := range []struct {
+		name   string
+		oid    uint32
+		binary []byte
+		text   string
+		want   string
+		wantT  time.Time
+	}{
+		{"timestamp+inf", protocol.OIDTimestamp, i64(math.MaxInt64), "infinity", "infinity", PGInfinity},
+		{"timestamp-inf", protocol.OIDTimestamp, i64(math.MinInt64), "-infinity", "-infinity", PGNegInfinity},
+		{"timestamptz+inf", protocol.OIDTimestamptz, i64(math.MaxInt64), "infinity", "infinity", PGInfinity},
+		{"timestamptz-inf", protocol.OIDTimestamptz, i64(math.MinInt64), "-infinity", "-infinity", PGNegInfinity},
+		{"date+inf", protocol.OIDDate, i32(math.MaxInt32), "infinity", "infinity", PGInfinity},
+		{"date-inf", protocol.OIDDate, i32(math.MinInt32), "-infinity", "-infinity", PGNegInfinity},
+	} {
+		codec := protocol.LookupOID(c.oid)
+		for _, f := range []struct {
+			name   string
+			raw    []byte
+			format int16
+			text   bool
+		}{
+			{"binary", c.binary, protocol.FormatBinary, false},
+			{"text", []byte(c.text), protocol.FormatText, true},
+		} {
+			t.Run(c.name+"/"+f.name, func(t *testing.T) {
+				col := protocol.ColumnDesc{TypeOID: c.oid, FormatCode: f.format}
+				var s string
+				if err := scanRaw(&s, f.raw, codec, col, f.text); err != nil || s != c.want {
+					t.Errorf("*string: got %q err %v, want %q", s, err, c.want)
+				}
+				var b []byte
+				if err := scanRaw(&b, f.raw, codec, col, f.text); err != nil || string(b) != c.want {
+					t.Errorf("*[]byte: got %q err %v, want %q", b, err, c.want)
+				}
+				var tm time.Time
+				if err := scanRaw(&tm, f.raw, codec, col, f.text); err != nil || !tm.Equal(c.wantT) {
+					t.Errorf("*time.Time: got %v err %v, want %v", tm, err, c.wantT)
+				}
+				var a any
+				if err := scanRaw(&a, f.raw, codec, col, f.text); err != nil {
+					t.Fatalf("*any: %v", err)
+				}
+				if at, ok := a.(time.Time); !ok || !at.Equal(c.wantT) {
+					t.Errorf("*any: got %#v, want %v", a, c.wantT)
+				}
+			})
+		}
+	}
+
+	// A timestamp one microsecond below the sentinel is a real value.
+	codec := protocol.LookupOID(protocol.OIDTimestamp)
+	var s string
+	col := protocol.ColumnDesc{TypeOID: protocol.OIDTimestamp, FormatCode: protocol.FormatBinary}
+	if err := scanRaw(&s, i64(math.MaxInt64-1), codec, col, false); err == nil && s == "infinity" {
+		t.Errorf("MaxInt64-1 read as infinity")
 	}
 }
