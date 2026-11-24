@@ -104,6 +104,9 @@ func TestStreamedInfinityAgainstServer(t *testing.T) {
 							wantStr, wantTime = "-infinity", PGNegInfinity
 						default:
 							wantStr, wantTime = c.realStr, c.realTime
+							if !streamed && mode == "simple" {
+								wantStr = c.real // a buffered simple-protocol row hands over the server's text, as in v1.5.11
+							}
 						}
 						if s != wantStr || string(b) != wantStr {
 							t.Fatalf("row %d: *string %q, *[]byte %q, want %q (streamed=%v)", n, s, b, wantStr, streamed)
