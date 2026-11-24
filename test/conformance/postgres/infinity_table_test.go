@@ -1,0 +1,98 @@
+//go:build postgres
+
+package postgres_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/goceleris/celeris/driver/postgres"
+)
+
+// TestNativeInfinityVersusRealMaximum is the table for the sentinel dates:
+// date, timestamp and timestamptz holding 'infinity', '-infinity' and the real
+// value 9999-12-31 (23:59:59) that PGInfinity happens to equal, scanned through
+// the simple, cached and unnamed paths into *string, *[]byte, *time.Time and
+// *any. Each is compared with what the server itself prints (its ::text).
+//
+//   - infinity / -infinity into *string / *[]byte is the server's text
+//     ("infinity" / "-infinity"), read from the wire value before any
+//     time.Time exists. No in-band sentinel may report a real value as
+//     something else.
+//   - a real 9999-12-31 23:59:59 into *string / *[]byte is itself
+//     (RFC3339Nano, "9999-12-31T23:59:59Z"), the same text on every path.
+//   - *time.Time and *any keep the documented sentinels (PGInfinity,
+//     PGNegInfinity), as in v1.5.11: a real value that equals PGInfinity is
+//     indistinguishable there, which the PGInfinity godoc says (check with
+//     time.Equal, and use a string or a typed column where it matters).
+func TestNativeInfinityVersusRealMaximum(t *testing.T) {
+	dsn := dsnFromEnv(t)
+	pools := map[string]*postgres.Pool{}
+	for name, d := range map[string]string{"cached": dsn, "unnamed": withParams(dsn, "auto_cache_statements=false")} {
+		pools[name] = openSettingsPool(t, d)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	end := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	endDate := time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		name, expr string
+		wantStr    string    // *string / *[]byte
+		wantTime   time.Time // *time.Time / *any
+	}{
+		{"date/infinity", "'infinity'::date", "infinity", postgres.PGInfinity},
+		{"date/-infinity", "'-infinity'::date", "-infinity", postgres.PGNegInfinity},
+		{"date/9999-12-31", "'9999-12-31'::date", "9999-12-31T00:00:00Z", endDate},
+		{"timestamp/infinity", "'infinity'::timestamp", "infinity", postgres.PGInfinity},
+		{"timestamp/-infinity", "'-infinity'::timestamp", "-infinity", postgres.PGNegInfinity},
+		{"timestamp/9999-12-31", "'9999-12-31 23:59:59'::timestamp", "9999-12-31T23:59:59Z", end},
+		{"timestamptz/infinity", "'infinity'::timestamptz", "infinity", postgres.PGInfinity},
+		{"timestamptz/-infinity", "'-infinity'::timestamptz", "-infinity", postgres.PGNegInfinity},
+		{"timestamptz/9999-12-31", "'9999-12-31 23:59:59+00'::timestamptz", "9999-12-31T23:59:59Z", end},
+	} {
+		// The server's own text for the infinities is the string a string
+		// destination must hold.
+		var serverText string
+		if err := pools["cached"].QueryRow(ctx, "SELECT ("+c.expr+")::text").Scan(&serverText); err != nil {
+			t.Fatalf("%s: server text: %v", c.name, err)
+		}
+		if c.wantStr == "infinity" || c.wantStr == "-infinity" {
+			if serverText != c.wantStr {
+				t.Fatalf("%s: server prints %q, table expects %q", c.name, serverText, c.wantStr)
+			}
+		}
+		for _, mode := range []string{"simple", "cached", "unnamed"} {
+			t.Run(c.name+"/"+mode, func(t *testing.T) {
+				p, q, args := pools["cached"], "SELECT "+c.expr, []any(nil)
+				if mode != "simple" {
+					q += " WHERE $1::int = 1"
+					args = []any{1}
+				}
+				if mode == "unnamed" {
+					p = pools["unnamed"]
+				}
+				var s string
+				if err := p.QueryRow(ctx, q, args...).Scan(&s); err != nil || s != c.wantStr {
+					t.Errorf("*string: got %q err %v, want %q", s, err, c.wantStr)
+				}
+				var b []byte
+				if err := p.QueryRow(ctx, q, args...).Scan(&b); err != nil || string(b) != c.wantStr {
+					t.Errorf("*[]byte: got %q err %v, want %q", b, err, c.wantStr)
+				}
+				var tm time.Time
+				if err := p.QueryRow(ctx, q, args...).Scan(&tm); err != nil || !tm.Equal(c.wantTime) {
+					t.Errorf("*time.Time: got %v err %v, want %v", tm, err, c.wantTime)
+				}
+				var a any
+				if err := p.QueryRow(ctx, q, args...).Scan(&a); err != nil {
+					t.Fatalf("*any: %v", err)
+				}
+				if at, ok := a.(time.Time); !ok || !at.Equal(c.wantTime) {
+					t.Errorf("*any: got %#v, want time %v", a, c.wantTime)
+				}
+			})
+		}
+	}
+}
