@@ -7,8 +7,12 @@
 // own parameters and nothing else, so it works behind PgBouncer and other
 // poolers, which refuse a startup parameter they do not track. A role or
 // database can still change how PostgreSQL prints a result in the text format,
-// which the simple protocol and the unnamed extended statement
-// (auto_cache_statements=false) use. The driver reads what it can:
+// which the simple protocol (a statement without arguments) and the unnamed
+// extended statement use. The unnamed statement serves every statement with
+// arguments that is not cached: auto_cache_statements=false, and by default any
+// statement that does not start with SELECT, WITH, VALUES, SHOW or TABLE (an
+// INSERT, UPDATE or DELETE ... RETURNING, for example). The driver reads what it
+// can:
 //
 //   - bytea_output: the text decoder reads the hex form and the escape form.
 //   - DateStyle: date, timestamp and timestamptz text is read in the ISO styles
@@ -27,8 +31,9 @@
 // to 0 or less (ALTER ROLE ... SET extra_float_digits = 0) makes the server
 // print 15 (float8) or 6 (float4) significant digits, so a float8 such as
 // 0.30000000000000004 reads back as 0.3 on a text-format path: the simple
-// protocol and the unnamed extended statement. Cached and prepared statements
-// use the binary format and are exact. Workaround: set extra_float_digits to 1
+// protocol and the unnamed extended statement (see above for which statements
+// those are). Cached and prepared statements use the binary format and are
+// exact. Workaround: set extra_float_digits to 1
 // or more on the role or database, or add it to the DSN as a parameter when the
 // server or pooler accepts it. Tracked in goceleris/celeris#1364.
 package postgres
