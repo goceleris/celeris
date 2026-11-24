@@ -8,12 +8,12 @@ import (
 
 // binaryOnlyTypes names the PostgreSQL built-in types the driver has no codec
 // for and whose BINARY wire form is not their text: the extended protocol
-// returns them in binary, so a string or []byte destination would receive raw
+// returns them in binary, so a string destination would receive raw
 // wire bytes (an interval is 16 bytes, an inet a family and mask byte plus the
 // address, an array a header and length-prefixed elements). Scanning one into
-// *string or *[]byte is an error that names the type and says to cast it to text
-// in the query, rather than a value that only looks like data. *any and a
-// sql.Scanner still receive the raw bytes, as in v1.5.11.
+// *string is an error that names the type and says to cast it to text
+// in the query, rather than a value that only looks like data. A *[]byte, *any
+// and a sql.Scanner receive the raw bytes, as in v1.5.11.
 //
 // The list is every built-in base, range and multirange type whose send
 // function is not a text one (textsend, varcharsend, bpcharsend, namesend,
@@ -61,25 +61,25 @@ var binaryOnlyTypes = map[uint32]string{
 }
 
 // errBinaryOnly is the error for scanning a column of a binary-only type with
-// no codec into a string or []byte.
+// no codec into a string.
 func errBinaryOnly(oid uint32, name string) error {
-	return fmt.Errorf("celeris-postgres: scan: column of type %s (OID %d) has no decoder in this driver, so a string or []byte "+
+	return fmt.Errorf("celeris-postgres: scan: column of type %s (OID %d) has no decoder in this driver, so a string "+
 		"would be its raw binary wire form; cast it to text in the query (SELECT col::text) or scan into any", name, oid)
 }
 
-// binaryOnlyGuard returns the error for a *string or *[]byte destination of a
-// column whose type has no codec and whose binary form is not its text. It is
-// nil for every other combination (a codec, text format, another destination, a
-// type that is not listed).
+// binaryOnlyGuard returns the error for a *string destination of a column whose
+// type has no codec and whose binary form is not its text. It is nil for every
+// other combination (a codec, text format, another destination, a type that is
+// not listed). A *[]byte gets the wire bytes, exactly as in v1.5.11.
 func binaryOnlyGuard(dest any, codec *protocol.TypeCodec, col protocol.ColumnDesc, binaryFmt bool) error {
 	if codec != nil || !binaryFmt {
 		return nil
 	}
-	switch dest.(type) {
-	case *string, *[]byte:
-		if name, ok := binaryOnlyTypes[col.TypeOID]; ok {
-			return errBinaryOnly(col.TypeOID, name)
-		}
+	if _, ok := dest.(*string); !ok {
+		return nil
+	}
+	if name, ok := binaryOnlyTypes[col.TypeOID]; ok {
+		return errBinaryOnly(col.TypeOID, name)
 	}
 	return nil
 }
