@@ -19,8 +19,9 @@ import (
 //   - simple: a statement with no arguments, results come back as text;
 //   - extended: a statement with arguments, results are requested in binary.
 //
-// A jsonb or jsonpath cell scanned into *[]byte, *string, *json.RawMessage or
-// *any must be the value's text, never the binary wire form (a 0x01 version
+// A jsonb or jsonpath cell scanned into *string, *json.RawMessage or *any must
+// be the value's text, never the binary wire form (a *[]byte is the wire bytes,
+// as in v1.5.11) (a 0x01 version
 // byte followed by the text). The same column read through database/sql is
 // the reference; lib/pq and pgx return the same text.
 func TestNativeScanVersionedTextTypes(t *testing.T) {
@@ -59,9 +60,27 @@ func TestNativeScanVersionedTextTypes(t *testing.T) {
 				args = []any{1}
 			}
 			t.Run(mode+"/"+c.name, func(t *testing.T) {
+				// A native *[]byte is the value's wire bytes (extended protocol, binary
+				// results) or the server's text (simple protocol), exactly as in v1.5.11;
+				// scan into a string for text.
 				var b []byte
-				if err := pool.QueryRow(ctx, q, args...).Scan(&b); err != nil || string(b) != c.want {
-					t.Errorf("native *[]byte: got %q err %v, want %q", b, err, c.want)
+				wantB := c.want
+				if mode == "extended" {
+					switch c.name {
+					case "jsonb", "jsonpath":
+						wantB = "\x01" + c.want
+					case "int4":
+						wantB = "\x00\x00\x00{"
+					case "date", "timestamp", "timestamptz", "numeric-inf":
+						wantB = "" // wire bytes of a fixed layout: only that it is not the text
+					}
+				}
+				if err := pool.QueryRow(ctx, q, args...).Scan(&b); err != nil {
+					t.Errorf("native *[]byte: %v", err)
+				} else if wantB != "" && string(b) != wantB {
+					t.Errorf("native *[]byte: got %q, want %q", b, wantB)
+				} else if wantB == "" && (len(b) == 0 || string(b) == c.want) {
+					t.Errorf("native *[]byte: got %q, want the wire bytes, not the text %q", b, c.want)
 				}
 				var s string
 				if err := pool.QueryRow(ctx, q, args...).Scan(&s); err != nil || s != c.want {
@@ -148,7 +167,7 @@ func anyText(a any) string {
 }
 
 // TestNativeScanInfinityIntoString checks that a date, timestamp or timestamptz
-// 'infinity' / '-infinity' scanned into *string or *[]byte reads back as the
+// 'infinity' / '-infinity' scanned into a *string reads back as the
 // server's own text on every path: simple (no arguments), cached (the DSN
 // default) and unnamed (auto_cache_statements=false). The decoded time.Time
 // is a sentinel (PGInfinity, PGNegInfinity); formatting it as RFC3339Nano
@@ -191,9 +210,15 @@ func TestNativeScanInfinityIntoString(t *testing.T) {
 					if err := p.QueryRow(ctx, q, args...).Scan(&s); err != nil || s != inf {
 						t.Errorf("native *string: got %q err %v, want %q", s, err, inf)
 					}
+					// A *[]byte is the wire bytes (binary paths) or the server's text
+					// (simple protocol), as in v1.5.11.
 					var b []byte
-					if err := p.QueryRow(ctx, q, args...).Scan(&b); err != nil || string(b) != inf {
-						t.Errorf("native *[]byte: got %q err %v, want %q", b, err, inf)
+					if err := p.QueryRow(ctx, q, args...).Scan(&b); err != nil {
+						t.Errorf("native *[]byte: %v", err)
+					} else if mode == "simple" && string(b) != inf {
+						t.Errorf("native *[]byte (simple): got %q, want %q", b, inf)
+					} else if mode != "simple" && string(b) == inf {
+						t.Errorf("native *[]byte (%s): got the text %q, want the wire bytes", mode, b)
 					}
 				})
 			}
