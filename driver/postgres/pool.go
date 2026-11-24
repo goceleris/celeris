@@ -706,7 +706,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 	}
 	if textFormat || col.FormatCode == protocol.FormatText {
 		if codec.DecodeText != nil {
-			return codec.DecodeText(raw)
+			return decodeText(codec, raw)
 		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
@@ -716,7 +716,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 		return codec.DecodeBinary(raw)
 	}
 	if codec.DecodeText != nil {
-		return codec.DecodeText(raw)
+		return decodeText(codec, raw)
 	}
 	cp := make([]byte, len(raw))
 	copy(cp, raw)
