@@ -118,3 +118,60 @@ func (c *pgConn) cancelRunning() bool {
 	}
 	return true
 }
+
+// armWake arranges that, when ctx ends, the socket of a direct conn gets a
+// deadline of "now", which wakes a read blocked in driveDirect on a statement
+// that is still running (a direct conn waits in a socket read that does not look
+// at its context). driveDirect calls it only for a context that can end
+// (ctx.Done() != nil): a context that cannot costs a nil check and nothing else;
+// one that can costs context.AfterFunc's registration and its stop. The state
+// lives on the conn and the callback is built once per conn. It is the design of
+// driver/memcached's armWake (celeris#1213, #1218).
+//
+// disarmWake ends it. It also undoes a wake that raced with a statement that
+// had just finished (the socket is not left with a deadline in the past), and
+// waits for a callback that has already started, so the callback cannot run
+// during the next statement on the same conn and fail it. Pair the two in one
+// goroutine: a direct conn is pinned to one caller at a time.
+func (c *pgConn) armWake(ctx context.Context) {
+	if c.wakeFn == nil {
+		tcp := c.tcp
+		c.wakeTCP = tcp
+		c.wakeRan = make(chan struct{}, 1)
+		c.wakeFn = func() {
+			c.wakeMu.Lock()
+			if !c.wakeDone {
+				c.wakeFired = true
+				_ = tcp.SetDeadline(time.Now())
+			}
+			c.wakeMu.Unlock()
+			select {
+			case c.wakeRan <- struct{}{}:
+			default:
+			}
+		}
+	}
+	c.wakeMu.Lock()
+	c.wakeFired, c.wakeDone = false, false
+	c.wakeMu.Unlock()
+	c.wakeStop = context.AfterFunc(ctx, c.wakeFn)
+}
+
+// disarmWake ends the wake armed by armWake; it does nothing if none is armed.
+func (c *pgConn) disarmWake() {
+	if c.wakeStop == nil {
+		return
+	}
+	if !c.wakeStop() {
+		// The context has ended and the callback was started on its own
+		// goroutine: it signals wakeRan when it is done.
+		<-c.wakeRan
+	}
+	c.wakeStop = nil
+	c.wakeMu.Lock()
+	defer c.wakeMu.Unlock()
+	c.wakeDone = true
+	if c.wakeFired && !c.closed.Load() {
+		_ = c.wakeTCP.SetDeadline(time.Time{})
+	}
+}

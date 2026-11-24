@@ -735,6 +735,15 @@ type pgConn struct {
 	directMu  sync.Mutex // serializes tcp.Write
 	directBuf []byte     // read buffer for driveDirect
 
+	// wake* state: see armWake (prototype, modelled on driver/memcached).
+	wakeMu    sync.Mutex
+	wakeFn    func()
+	wakeStop  func() bool
+	wakeRan   chan struct{}
+	wakeTCP   *net.TCPConn
+	wakeFired bool
+	wakeDone  bool
+
 	addr   *net.TCPAddr
 	opts   Options
 	dsn    DSN
@@ -943,6 +952,13 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 	if c.directBuf == nil {
 		c.directBuf = make([]byte, 16<<10)
 	}
+	// A direct conn waits in a socket read that does not look at the context:
+	// arm a wake of that read on the end of a context that can end. A context
+	// that cannot (Done() == nil) pays one nil check.
+	if ctx.Done() != nil {
+		c.armWake(ctx)
+		defer c.disarmWake()
+	}
 	for {
 		if req.doneAtom.Load() != 0 {
 			select {
@@ -1001,6 +1017,11 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			c.onRecv(c.directBuf[:n])
 		}
 		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) && ctx.Err() != nil {
+				// The wake of the context's end: the top of the loop takes
+				// the cancel path.
+				continue
+			}
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
 			}
