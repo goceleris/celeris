@@ -191,3 +191,70 @@ func TestPipelineSecondExecAfterSuccessErrorsAtOnce(t *testing.T) {
 		t.Fatalf("first Exec's result = %q, %v", v, err)
 	}
 }
+
+// partialDropHandler answers the first GETs and stalls GET "stall": the test
+// then drops the conn, so an Exec fails after some replies arrived.
+func partialDropHandler(cmd []string, w *bufio.Writer) {
+	switch strings.ToUpper(cmd[0]) {
+	case "HELLO":
+		handleHELLO(w, 3)
+	case "GET":
+		if cmd[1] == "stall" {
+			return
+		}
+		writeBulk(w, "val-"+cmd[1])
+	}
+}
+
+// Strings read from a failed batch stay valid until Discard or Release: the
+// batch queued after the failure must not overwrite them.
+func TestPipelineHeldStringsSurviveTheNextBatchAfterAFailedExec(t *testing.T) {
+	fake := startFakeRedis(t, partialDropHandler)
+	c, err := NewClient(fake.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	p := c.Pipeline()
+	defer p.Release()
+	g1 := p.Get("aaaa")
+	g2 := p.Get("bbbb")
+	p.Get("stall")
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		fake.mu.Lock()
+		conns := fake.conns
+		fake.mu.Unlock()
+		for _, cn := range conns {
+			_ = cn.Close()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Exec(ctx); err == nil {
+		t.Fatal("Exec with a dropped conn succeeded")
+	}
+	s1, err1 := g1.Result()
+	s2, err2 := g2.Result()
+	if err1 != nil || err2 != nil || s1 != "val-aaaa" || s2 != "val-bbbb" {
+		t.Fatalf("the replies before the drop did not arrive (%q %v, %q %v)", s1, err1, s2, err2)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Queue a new batch with no Discard; its strings have the same lengths.
+	n1 := p.Get("xxxx")
+	n2 := p.Get("yyyy")
+	if err := p.Exec(ctx); err != nil {
+		t.Fatalf("Exec of the new batch: %v", err)
+	}
+	if v, err := n1.Result(); err != nil || v != "val-xxxx" {
+		t.Fatalf("new GET = %q, %v", v, err)
+	}
+	if v, err := n2.Result(); err != nil || v != "val-yyyy" {
+		t.Fatalf("new GET = %q, %v", v, err)
+	}
+	if s1 != "val-aaaa" || s2 != "val-bbbb" {
+		t.Fatalf("strings read from the failed batch were overwritten: %q %q", s1, s2)
+	}
+}
