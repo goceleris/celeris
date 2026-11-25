@@ -380,6 +380,18 @@ type workerCtxKey struct{}
 
 // WithWorker returns ctx with a worker-affinity hint. Pool.Acquire uses the
 // hint as the preferred worker index.
+//
+// The hint is a preference, not a pin. The Pool has one worker slot per event
+// loop of the engine it was opened with (len of Stats().PerWorker); a hint
+// outside [0, that count) is spread round-robin, and a call whose hinted
+// worker has no idle connection takes an idle connection of another worker (or
+// dials one), so consecutive calls with the same hint can run on different
+// connections. The default number of loops is GOMAXPROCS minus a reserve (see
+// Config.Workers of the celeris package: 7 on 8 CPUs, so a hint of 7 is out of
+// range there). The Pool's own count, len(Stats().PerWorker), is the number to
+// use (the engine's observe.EngineMetrics.Workers is the loops started, summed
+// over both sub-engines for the adaptive engine). Code that used GOMAXPROCS as
+// the worker count should read it instead.
 func WithWorker(ctx context.Context, workerID int) context.Context {
 	return context.WithValue(ctx, workerCtxKey{}, workerID)
 }
