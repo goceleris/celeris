@@ -581,7 +581,9 @@ func (r *Rows) Columns() []string {
 // another goroutine while Next or Scan is running (as with database/sql.Rows): it
 // waits for that call, which sees the Rows closed on its next use. Next, Scan and
 // Columns themselves are not safe to call concurrently with each other. A
-// sql.Scanner must not call Close from inside Scan (it would wait for itself).
+// sql.Scanner must not call any method of the same Rows from inside Scan: Close
+// would wait for itself, and Err or Columns would take the read lock a second
+// time behind a Close that is waiting for it (the same hazard as database/sql).
 func (r *Rows) Close() error {
 	if !r.done.CompareAndSwap(false, true) {
 		return nil
