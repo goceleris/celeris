@@ -12,7 +12,7 @@ import (
 
 func TestLogPinOutcome(t *testing.T) {
 	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	log := testLog(&buf, slog.LevelDebug)
 
 	// A plain plan with no failures logs nothing.
 	LogPinOutcome(log, "epoll", CPUPlan{CPUs: []int{0, 1}, Allowed: []int{0, 1}}, nil)

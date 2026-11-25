@@ -62,12 +62,24 @@ func TestProbe761H2(t *testing.T) {
 	}
 }
 
-func probe761H2Cell(t *testing.T, name string, eng celeris.EngineType, async bool, n int) {
+// probe761H2Result is what one probe761H2Cell measured. ran is false for the
+// cell that measured nothing (io_uring unavailable on the host); running is the
+// engine EngineInfo reported, to be compared with the one asked for; end is
+// "complete" only for a transfer that ended without an error (the cell itself
+// fails one that delivered other than exactly the body).
+type probe761H2Result struct {
+	ran     bool
+	running string
+	end     string
+	elapsed time.Duration
+}
+
+func probe761H2Cell(t *testing.T, name string, eng celeris.EngineType, async bool, n int) probe761H2Result {
 	if name == "io_uring" && probe.Probe().IOUringTier < engine.Base {
 		// Not a skip: the cell measured nothing and says so in the line the
 		// readers look for, which then reads running != requested.
 		t.Logf("ENGINE requested=%s running=unavailable (io_uring is not available on this host)", eng)
-		return
+		return probe761H2Result{running: "unavailable"}
 	}
 	body := make([]byte, n)
 	s, addr := startPickedPing1104(t, celeris.Config{Engine: eng}, func(s *celeris.Server) {
@@ -117,6 +129,7 @@ func probe761H2Cell(t *testing.T, name string, eng celeris.EngineType, async boo
 	case err != nil && !probe761H2Timeout(err):
 		t.Errorf("%s/%s body %d: the transfer broke after %d bytes: %s", name, route, n, got, end)
 	}
+	return probe761H2Result{ran: true, running: running, end: end, elapsed: elapsed}
 }
 
 // probe761H2Timeout reports whether err is the client's own timeout, the one
