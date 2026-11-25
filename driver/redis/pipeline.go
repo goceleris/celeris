@@ -294,10 +294,10 @@ func (p *Pipeline) Discard() {
 // reply is received. Returns the first parse/transport error; per-command
 // errors are reachable via each *Cmd.Result().
 //
-// A Pipeline runs once. After Exec returned an error, read a queued command's
-// Result to tell what happened, then:
+// A Pipeline runs once. After Exec returned an error, read the Result of a queued
+// command that returns an error to tell what happened, then:
 //
-//	Result of a queued command         what happened            next step
+//	Result of a command (an error)     what happened            next step
 //	"not executed" error               no connection obtained   Exec again as it is;
 //	                                   (the context ended       do not queue the commands
 //	                                   while waiting for one)   again: the queue is intact
@@ -411,7 +411,11 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 				p.cmds[i].err = err
 			}
 		}
-		p.resetRequests()
+		// Do not touch the request slab here. The conn has failed and its
+		// reader may still be finishing a request of this batch; the slab is
+		// cleared by the next batch (newBatch) or by Discard/Release.
+		p.w.Reset()
+		p.reqs = p.reqs[:0]
 		p.executed = false
 		p.failed = true
 		// Give the pool slot back (celeris#1268). Every error execManyCore
