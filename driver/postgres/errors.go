@@ -23,6 +23,17 @@ var ErrClosed = errors.New("celeris-postgres: connection closed")
 // it causes database/sql to evict the conn and open a fresh one.
 var ErrBadConn = errors.New("celeris-postgres: bad connection")
 
+// ErrTxLeftOpen is returned by [Pool.ExecContext], [Rows.Close] and [Row.Scan]
+// when the statement left a transaction open on the pooled connection (for
+// example Exec "BEGIN"): the connection was discarded, so the server rolled the
+// transaction back, and nothing that came after it ran inside it. A
+// transaction that spans several statements needs [Pool.BeginTx]. It is not
+// returned for a *sql.DB opened with this driver, which cannot tell a pooled
+// db.Exec("BEGIN") from the same statement on a dedicated *sql.Conn: there the
+// connection is dropped without an error.
+var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transaction open on a pooled connection; " +
+	"the connection was discarded and the transaction rolled back; use BeginTx")
+
 // ErrResultTooBig is the error of a query whose cumulative DataRow payload
 // exceeds the buffering cap (maxDirectResultBytes, 64 MiB) while the reply is
 // buffered whole: in direct mode, which pins syncMode=true and cannot lazily

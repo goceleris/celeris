@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -147,11 +148,8 @@ func TestReturnedMidTransactionNativePool(t *testing.T) {
 				stmts += "; SELECT 1/0"
 			}
 			_, err := p.ExecContext(ctx, stmts)
-			if failed && err == nil {
-				t.Fatal("SELECT 1/0 succeeded")
-			}
-			if !failed && err != nil {
-				t.Fatal(err)
+			if !errors.Is(err, postgres.ErrTxLeftOpen) {
+				t.Fatalf("Exec %q = %v, want ErrTxLeftOpen", stmts, err)
 			}
 			if pid := nativePID(ctx, t, p); pid == pidA {
 				t.Fatalf("the next caller got the previous caller's backend %d, still in a transaction", pid)
@@ -299,4 +297,81 @@ func TestTxPathReusesConnection(t *testing.T) {
 			}
 		}
 	})
+}
+
+// Pool.ExecContext("BEGIN") returns ErrTxLeftOpen from the BEGIN itself, before
+// anything else runs: a caller that stops at the error has written nothing, and
+// the next caller gets another backend. Pool.BeginTx is unchanged, and is the
+// Pool's pinned connection: BEGIN, savepoints and COMMIT run on one backend.
+func TestNativeExecBeginIsAnError(t *testing.T) {
+	p := resetPool(t)
+	ctx := resetCtx(t)
+	tbl := uniqueTableName(t, "begin_err")
+	if _, err := p.ExecContext(ctx, "CREATE TABLE "+tbl+" (v text)"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = p.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+tbl) })
+
+	pidA := nativePID(ctx, t, p)
+	if _, err := p.ExecContext(ctx, "BEGIN"); !errors.Is(err, postgres.ErrTxLeftOpen) {
+		t.Fatalf("Exec BEGIN = %v, want ErrTxLeftOpen", err)
+	}
+	// The caller stops at the error: no row.
+	var n int
+	if err := p.QueryRow(ctx, "SELECT count(*) FROM "+tbl).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("count = %d, %v, want 0", n, err)
+	}
+	if pid := nativePID(ctx, t, p); pid == pidA {
+		t.Fatalf("the BEGIN connection %d was reused", pid)
+	}
+
+	// The Query path: Rows.Close and Row.Scan carry the error.
+	rows, err := p.QueryContext(ctx, "BEGIN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Close(); !errors.Is(err, postgres.ErrTxLeftOpen) {
+		t.Fatalf("Rows.Close after Query BEGIN = %v, want ErrTxLeftOpen", err)
+	}
+	var x int
+	if err := p.QueryRow(ctx, "BEGIN").Scan(&x); !errors.Is(err, postgres.ErrTxLeftOpen) {
+		t.Fatalf("Row.Scan after QueryRow BEGIN = %v, want ErrTxLeftOpen", err)
+	}
+
+	// The pinned connection: BeginTx, statements, a savepoint, Commit.
+	tx, err := p.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var txPID int
+	if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&txPID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO "+tbl+" VALUES ('kept')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Savepoint(ctx, "sp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO "+tbl+" VALUES ('undone')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.RollbackToSavepoint(ctx, "sp"); err != nil {
+		t.Fatal(err)
+	}
+	var pid2 int
+	if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid2); err != nil || pid2 != txPID {
+		t.Fatalf("the Tx moved between backends: %d then %d (%v)", txPID, pid2, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	var vals string
+	if err := p.QueryRow(ctx, "SELECT string_agg(v, ',') FROM "+tbl).Scan(&vals); err != nil || vals != "kept" {
+		t.Fatalf("rows after the Tx = %q, %v, want kept", vals, err)
+	}
+	// The Tx's connection went back to the pool and is reused (pool of one).
+	if pid := nativePID(ctx, t, p); pid != txPID {
+		t.Fatalf("the Tx's connection was not reused: %d then %d", txPID, pid)
+	}
 }

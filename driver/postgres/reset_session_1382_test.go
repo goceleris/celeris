@@ -76,6 +76,9 @@ func newResetFake(t *testing.T, failDiscard bool) *resetFake {
 					if status == 'T' {
 						status = 'E'
 					}
+				case q == "BEGIN;FAIL":
+					_ = writeFakeError(c, "22012", "division by zero")
+					status = 'E'
 				case strings.HasPrefix(q, "BEGIN"):
 					_ = writeCommandComplete(c, "BEGIN")
 					status = 'T'
@@ -308,10 +311,13 @@ func TestTxPathReusesConnUnderDatabaseSQL(t *testing.T) {
 	}
 }
 
-// The native Pool: a conn released inside a transaction is closed, not put back.
-func TestNativePoolDropsConnLeftInTransaction(t *testing.T) {
-	for _, stmts := range [][]string{{"BEGIN"}, {"BEGIN", "FAIL"}} {
-		t.Run(strings.Join(stmts, "+"), func(t *testing.T) {
+// The native Pool: the call that leaves a transaction open on its connection
+// (Exec "BEGIN") returns ErrTxLeftOpen itself, the connection is closed and not
+// put back, and the next statement runs on a new one: nothing after the BEGIN
+// runs inside a transaction that no longer exists.
+func TestNativePoolExecLeftTransactionOpenIsAnError(t *testing.T) {
+	for _, stmt := range []string{"BEGIN", "BEGIN;FAIL"} {
+		t.Run(stmt, func(t *testing.T) {
 			f := newResetFake(t, false)
 			host, port, _ := net.SplitHostPort(f.addr)
 			p, err := Open("postgres://u@"+host+":"+port+"/d?sslmode=disable", WithMaxOpen(1))
@@ -321,8 +327,18 @@ func TestNativePoolDropsConnLeftInTransaction(t *testing.T) {
 			defer func() { _ = p.Close() }()
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			for _, s := range stmts {
-				_, _ = p.ExecContext(ctx, s)
+			res, err := p.ExecContext(ctx, stmt)
+			if !errors.Is(err, ErrTxLeftOpen) {
+				t.Fatalf("Exec %q = %v, want ErrTxLeftOpen", stmt, err)
+			}
+			if res != (Result{}) {
+				t.Fatalf("Exec %q returned a result with its error: %+v", stmt, res)
+			}
+			if stmt == "BEGIN;FAIL" {
+				var pe *PGError
+				if !errors.As(err, &pe) || pe.Code != "22012" {
+					t.Fatalf("the statement's own error is lost: %v", err)
+				}
 			}
 			if _, err := p.ExecContext(ctx, "SELECT 'user B'"); err != nil {
 				t.Fatalf("user B: %v", err)
@@ -334,6 +350,35 @@ func TestNativePoolDropsConnLeftInTransaction(t *testing.T) {
 				t.Fatalf("Stats.Open = %d, want 1 (the dropped conn is not counted)", st.Open)
 			}
 		})
+	}
+}
+
+// The same error on the Query path: Rows.Close returns it, and so does
+// Row.Scan.
+func TestNativePoolQueryLeftTransactionOpenIsAnError(t *testing.T) {
+	f := newResetFake(t, false)
+	host, port, _ := net.SplitHostPort(f.addr)
+	p, err := Open("postgres://u@"+host+":"+port+"/d?sslmode=disable", WithMaxOpen(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := p.QueryContext(ctx, "BEGIN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Close(); !errors.Is(err, ErrTxLeftOpen) {
+		t.Fatalf("Rows.Close = %v, want ErrTxLeftOpen", err)
+	}
+	var x string
+	if err := p.QueryRow(ctx, "BEGIN").Scan(&x); !errors.Is(err, ErrTxLeftOpen) {
+		t.Fatalf("Row.Scan = %v, want ErrTxLeftOpen", err)
+	}
+	// An ordinary statement is unaffected.
+	if _, err := p.ExecContext(ctx, "SELECT 1"); err != nil {
+		t.Fatalf("Exec after: %v", err)
 	}
 }
 

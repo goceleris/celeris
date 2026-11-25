@@ -147,12 +147,22 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 // a SET, a temporary table or the other state above (tracked in
 // goceleris/celeris#1409).
 //
-// What is reset is a transaction: a connection released while it is in a
+// What is reset is a transaction. A connection released while it is in a
 // transaction, open or failed (the server's last ReadyForQuery status is T or
 // E), is closed and not put back, so the next caller never runs inside it, and
-// a transaction that was not ended is rolled back by the server. Do not rely on
-// a transaction that spans several calls (Exec "BEGIN", then Exec "INSERT"):
-// the connection of the BEGIN is gone before the INSERT. Use Pool.BeginTx.
+// the server rolls the transaction back. On the Pool, the call that left it open
+// returns [ErrTxLeftOpen] (Exec "BEGIN" does, before anything else runs; Query
+// returns it from Rows.Close, and QueryRow from Scan), so a transaction cannot
+// be spread over Exec calls by accident: the connection of the BEGIN is gone
+// before the next statement. Pool.BeginTx is the way, and its Tx is the Pool's
+// only pinned connection (there is no Pool.Conn): BEGIN, COMMIT, savepoints and
+// every statement between them run on that one connection. A *sql.DB opened with
+// this driver cannot tell a pooled db.Exec("BEGIN") from the same statement on a
+// dedicated *sql.Conn, where it is legitimate, so it returns no error: the
+// connection is dropped when it is returned, the transaction is rolled back, and
+// the statements that followed ran on another connection, each in its own
+// transaction. Use db.BeginTx, or db.Conn for statements that must share one
+// connection.
 //
 // To scope a setting to one piece of work, set it inside a Tx with SET LOCAL or
 // select set_config(name, value, true): both end with the transaction. A
@@ -419,16 +429,25 @@ func (p *Pool) acquire(ctx context.Context) (*pgConn, error) {
 }
 
 // release returns c to its home worker's idle list.
-//
-// A conn whose last ReadyForQuery said it is in a transaction (T) or in a failed
-// one (E) is closed, not put back: the next caller would run inside the
-// previous caller's transaction.
-func (p *Pool) release(c *pgConn) {
-	if c.closed.Load() || c.inTransaction() {
+func (p *Pool) release(c *pgConn) { _ = p.releaseChecked(c) }
+
+// releaseChecked is release that reports a conn it had to discard because the
+// statement left a transaction open: the server's last ReadyForQuery said T (in
+// a transaction) or E (in a failed one). The conn is closed, not put back (the
+// server rolls the transaction back, and the next caller never runs inside it),
+// and the error is [ErrTxLeftOpen], for the caller of a pool-level call to
+// return. A closed conn is discarded without an error.
+func (p *Pool) releaseChecked(c *pgConn) error {
+	if c.closed.Load() {
 		p.inner.Discard(c)
-		return
+		return nil
+	}
+	if c.inTransaction() {
+		p.inner.Discard(c)
+		return ErrTxLeftOpen
 	}
 	p.inner.Release(c)
+	return nil
 }
 
 // QueryContext runs query on an acquired conn, returns a Rows wrapper that
@@ -448,13 +467,24 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	return acquireRows(drows, c, p), nil
 }
 
-// ExecContext runs a statement and returns a [Result].
-func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
-	c, err := p.acquire(ctx)
-	if err != nil {
-		return Result{}, err
+// ExecContext runs a statement and returns a [Result]. A statement that leaves
+// a transaction open on the connection (Exec "BEGIN") returns [ErrTxLeftOpen]:
+// see the Session state section of [Pool].
+func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (res Result, err error) {
+	c, aerr := p.acquire(ctx)
+	if aerr != nil {
+		return Result{}, aerr
 	}
-	defer p.release(c)
+	defer func() {
+		if rerr := p.releaseChecked(c); rerr != nil {
+			res = Result{}
+			if err != nil {
+				err = fmt.Errorf("%w (the statement failed: %w)", rerr, err)
+			} else {
+				err = rerr
+			}
+		}
+	}()
 	named, slot := anysToNamed(args)
 	r, err := c.ExecContext(ctx, query, named)
 	releaseNamedArgs(slot)
@@ -597,7 +627,9 @@ type Rows struct {
 // Columns returns column names.
 func (r *Rows) Columns() []string { return r.inner.Columns() }
 
-// Close releases resources and returns the conn to the pool.
+// Close releases resources and returns the conn to the pool. A statement that
+// left a transaction open on the conn (Query "BEGIN") makes Close return
+// [ErrTxLeftOpen] after discarding the conn.
 func (r *Rows) Close() error {
 	if r.done {
 		return nil
@@ -605,7 +637,9 @@ func (r *Rows) Close() error {
 	r.done = true
 	err := r.inner.Close()
 	if r.pool != nil && r.conn != nil {
-		r.pool.release(r.conn)
+		if rerr := r.pool.releaseChecked(r.conn); rerr != nil && err == nil {
+			err = rerr
+		}
 	}
 	releaseRows(r)
 	return err
@@ -1208,11 +1242,21 @@ type Row struct {
 // Scan copies the columns from the single result row into dest. If the
 // query returned no rows, Scan returns sql.ErrNoRows. The underlying Rows
 // is closed automatically.
-func (r *Row) Scan(dest ...any) error {
+func (r *Row) Scan(dest ...any) (err error) {
 	if r.err != nil {
 		return r.err
 	}
-	defer func() { _ = r.rows.Close() }()
+	defer func() {
+		// Only the error of a transaction left open on the conn is the
+		// caller's; any other error of Close is dropped, as before.
+		if cerr := r.rows.Close(); errors.Is(cerr, ErrTxLeftOpen) {
+			if err != nil {
+				err = fmt.Errorf("%w (the scan failed: %w)", cerr, err)
+			} else {
+				err = cerr
+			}
+		}
+	}()
 	if !r.rows.Next() {
 		if r.rows.Err() != nil {
 			return r.rows.Err()
