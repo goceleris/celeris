@@ -144,6 +144,52 @@ func scanMarker(rows *Rows) (int64, error) {
 	return v, rows.Scan(&v)
 }
 
+// (First in the file on purpose: on a tree with the pooled wrapper, the tests below recover
+// panics that leave a poisoned wrapper in the shared sync.Pool, which this one would
+// then trip over instead of showing its own failure.)
+// TestRowsStaleHandleDoesNotHitNextQuery is the deterministic form of the
+// cross-request release: r1 is closed, r2 is the next Query on the same
+// goroutine (a sync.Pool hands a Put wrapper straight back to the same P) and
+// the stale r1.Close must leave r2 open and its conn held.
+func TestRowsStaleHandleDoesNotHitNextQuery(t *testing.T) {
+	p := openEchoPool(t, 1) // one conn: a stale release is visible at once
+	ctx := tctx(t)
+	aliased := 0
+	for i := 0; i < 3000; i++ {
+		r1, err := p.QueryContext(ctx, "SELECT 1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r1.Close(); err != nil {
+			t.Fatal(err)
+		}
+		r2, err := p.QueryContext(ctx, "SELECT 2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r1 == r2 {
+			aliased++
+		}
+		noPanic(t, "stale Close", func() {
+			if err := r1.Close(); err != nil {
+				t.Errorf("stale Close = %v", err)
+			}
+		})
+		if st := p.Stats(); st.InUse != 1 {
+			t.Fatalf("iteration %d (aliased=%v): after a stale Close InUse=%d, want 1 (r2 still holds the conn)", i, r1 == r2, st.InUse)
+		}
+		v, err := scanMarker(r2)
+		if err != nil || v != 2 {
+			t.Fatalf("iteration %d (aliased=%v): r2 = %d, %v, want 2: the stale Close hit r2", i, r1 == r2, v, err)
+		}
+		_ = r2.Close()
+	}
+	t.Logf("wrapper handed to the next Query: %d of 3000 iterations", aliased)
+	if aliased != 0 {
+		t.Errorf("a Rows wrapper was handed out again while the caller could still hold it (%d times)", aliased)
+	}
+}
+
 func TestRowsCloseTwice(t *testing.T) {
 	p := openEchoPool(t, 2)
 	ctx := tctx(t)
@@ -357,49 +403,6 @@ func TestRowScanTwice(t *testing.T) {
 			t.Errorf("Scan of an empty result = %v, want sql.ErrNoRows", err)
 		}
 	})
-}
-
-// TestRowsStaleHandleDoesNotHitNextQuery is the deterministic form of the
-// cross-request release: r1 is closed, r2 is the next Query on the same
-// goroutine (a sync.Pool hands a Put wrapper straight back to the same P) and
-// the stale r1.Close must leave r2 open and its conn held.
-func TestRowsStaleHandleDoesNotHitNextQuery(t *testing.T) {
-	p := openEchoPool(t, 1) // one conn: a stale release is visible at once
-	ctx := tctx(t)
-	aliased := 0
-	for i := 0; i < 3000; i++ {
-		r1, err := p.QueryContext(ctx, "SELECT 1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := r1.Close(); err != nil {
-			t.Fatal(err)
-		}
-		r2, err := p.QueryContext(ctx, "SELECT 2")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if r1 == r2 {
-			aliased++
-		}
-		noPanic(t, "stale Close", func() {
-			if err := r1.Close(); err != nil {
-				t.Errorf("stale Close = %v", err)
-			}
-		})
-		if st := p.Stats(); st.InUse != 1 {
-			t.Fatalf("iteration %d (aliased=%v): after a stale Close InUse=%d, want 1 (r2 still holds the conn)", i, r1 == r2, st.InUse)
-		}
-		v, err := scanMarker(r2)
-		if err != nil || v != 2 {
-			t.Fatalf("iteration %d (aliased=%v): r2 = %d, %v, want 2: the stale Close hit r2", i, r1 == r2, v, err)
-		}
-		_ = r2.Close()
-	}
-	t.Logf("wrapper handed to the next Query: %d of 3000 iterations", aliased)
-	if aliased != 0 {
-		t.Errorf("a Rows wrapper was handed out again while the caller could still hold it (%d times)", aliased)
-	}
 }
 
 // TestRowsStaleCloseConcurrent runs a goroutine that closes its Rows twice, with a
