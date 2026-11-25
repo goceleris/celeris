@@ -227,6 +227,8 @@ Every field is documented on [goceleris.dev](https://goceleris.dev/docs/configur
 
 Handlers run inline on the I/O worker by default. Mark a route that blocks on I/O `.Async()` so the worker stays free; precedence is route over group over `Config.AsyncHandlers`. An inline handler must not call `runtime.Goexit` (`t.FailNow` does): on the native engines it ends that event loop for good. Details are in [Runtime notes](https://goceleris.dev/docs/runtime-notes).
 
+An inline handler that writes a large body (tens of megabytes) copies it on the event-loop thread and keeps that loop from serving other connections for the duration: for a 64 MiB HTTP/2 body, about 20 to 40 ms on a quiet 4-CPU arm64 container and 0.12 to 0.9 s to the first byte in slow traces taken under a load disturbance ([#809](https://github.com/goceleris/celeris/issues/809)). Serve large responses from `.Async()` routes or a `StreamWriter`; `c.File` avoids the copy only on epoll over HTTP/1.1 on a server with no async handlers.
+
 ```go
 // CPU-only / cache-only — runs inline (default).
 s.GET("/healthz", healthHandler)
