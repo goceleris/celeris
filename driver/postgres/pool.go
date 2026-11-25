@@ -111,7 +111,14 @@ func WithMaxLifetime(d time.Duration) Option { return func(o *options) { o.cfg.M
 // WithMaxIdleTime sets the max idle duration. Default: 5m.
 func WithMaxIdleTime(d time.Duration) Option { return func(o *options) { o.cfg.MaxIdleTime = d } }
 
-// WithStatementCacheSize sets the per-conn prepared-statement LRU capacity.
+// WithStatementCacheSize sets the per-conn prepared-statement LRU capacity
+// (default 256; the statement_cache_size DSN parameter does the same). A
+// statement with arguments is prepared on first use and cached by its text. A
+// connection that runs more distinct texts than n evicts the least recently
+// used one and closes it on the server: a protocol-level Close is sent ahead of
+// the query that evicted it, with no extra round trip and no wait. Pass values
+// as arguments, not in the SQL text, or size the cache to the number of
+// distinct texts: each miss costs a Parse and Describe round trip.
 func WithStatementCacheSize(n int) Option { return func(o *options) { o.cfg.StatementCacheSize = n } }
 
 // WithApplication sets the "application_name" startup parameter.
