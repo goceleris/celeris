@@ -19,9 +19,29 @@ var ErrUnsupportedAuth = errors.New("celeris-postgres: unsupported authenticatio
 // ErrClosed is returned from operations on a closed pgConn.
 var ErrClosed = errors.New("celeris-postgres: connection closed")
 
+// ErrTxCommitRollback is returned from Commit when PostgreSQL answered COMMIT
+// with the command tag ROLLBACK: the transaction was in the aborted state (a
+// statement of it failed, or was cancelled, and the transaction was not rolled
+// back), the server treats such a COMMIT as a ROLLBACK and reports no error, and
+// nothing was committed. The transaction is over and the connection is free
+// again. It matches with errors.Is, also through database/sql, whose Tx.Commit
+// returns the driver's error as it is.
+var ErrTxCommitRollback = errors.New("celeris-postgres: commit unexpectedly resulted in rollback")
+
 // ErrBadConn is returned when a connection is in an unusable state; returning
 // it causes database/sql to evict the conn and open a fresh one.
 var ErrBadConn = errors.New("celeris-postgres: bad connection")
+
+// ErrTxLeftOpen is returned by [Pool.ExecContext], [Rows.Close] and [Row.Scan]
+// when the statement left a transaction open on the pooled connection (for
+// example Exec "BEGIN"): the connection was discarded, so the server rolled the
+// transaction back, and nothing that came after it ran inside it. A
+// transaction that spans several statements needs [Pool.BeginTx]. It is not
+// returned for a *sql.DB opened with this driver, which cannot tell a pooled
+// db.Exec("BEGIN") from the same statement on a dedicated *sql.Conn: there the
+// connection is dropped without an error.
+var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transaction open on a pooled connection; " +
+	"the connection was discarded and the transaction rolled back; use BeginTx")
 
 // ErrResultTooBig is the error of a query whose cumulative DataRow payload
 // exceeds the buffering cap (maxDirectResultBytes, 64 MiB) while the reply is

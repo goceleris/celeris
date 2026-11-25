@@ -103,10 +103,44 @@ jobs:
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
           ./test/conformance/postgres/...
-      - name: pgspec
+      # Rows streamed on the real event loop (64 rows or more): infinity and a real 9999-12-31 23:59:59 into a string.
+      - name: Streamed rows (event loop)
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
-          ./test/pgspec/...
+          -run TestStreamedInfinityAgainstServer ./driver/postgres/
+      # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
+      # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
+      # or has answered a request first (default-ready). Latest server version only.
+      - name: Conformance (default engine, server not started)
+        if: matrix.pg == '18.3'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
+      - name: Conformance (default engine, server started and serving)
+        if: matrix.pg == '18.3'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-ready
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.pg == '18.3'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
+      - name: pgspec
+        run: |
+          set -o pipefail
+          go test -tags pgspec -race -count=1 -timeout=300s -v ./test/pgspec/... 2>&1 | tee pgspec.log
+          # A wrong build tag prints "[no test files]" and exits 0, and a
+          # missing server makes every test skip; either way nothing ran.
+          grep -q -- '^--- PASS' pgspec.log || { echo "::error::pgspec: no test passed (wrong build tag, or the suite skipped)"; exit 1; }
 
   # ------------------------------------------------------------------
   # PostgreSQL through PgBouncer (pool modes session and transaction)
@@ -213,10 +247,39 @@ jobs:
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
           ./test/conformance/redis/...
-      - name: redisspec
+      # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
+      # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
+      # or has answered a request first (default-ready). Latest server version only.
+      - name: Conformance (default engine, server not started)
+        if: matrix.redis == '8.6.2'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default
         run: >-
           go test -tags redis -race -count=1 -timeout=300s
-          ./test/redisspec/...
+          ./test/conformance/redis/...
+      - name: Conformance (default engine, server started and serving)
+        if: matrix.redis == '8.6.2'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-ready
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.redis == '8.6.2'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      - name: redisspec
+        run: |
+          set -o pipefail
+          go test -tags redisspec -race -count=1 -timeout=300s -v ./test/redisspec/... 2>&1 | tee redisspec.log
+          # A wrong build tag prints "[no test files]" and exits 0, and a
+          # missing server makes every test skip; either way nothing ran.
+          grep -q -- '^--- PASS' redisspec.log || { echo "::error::redisspec: no test passed (wrong build tag, or the suite skipped)"; exit 1; }
 
   # ------------------------------------------------------------------
   # Valkey matrix — open-source Redis-compatible continuation.
@@ -257,9 +320,12 @@ jobs:
           go test -tags redis -race -count=1 -timeout=300s
           ./test/conformance/redis/...
       - name: redisspec
-        run: >-
-          go test -tags redis -race -count=1 -timeout=300s
-          ./test/redisspec/...
+        run: |
+          set -o pipefail
+          go test -tags redisspec -race -count=1 -timeout=300s -v ./test/redisspec/... 2>&1 | tee redisspec.log
+          # A wrong build tag prints "[no test files]" and exits 0, and a
+          # missing server makes every test skip; either way nothing ran.
+          grep -q -- '^--- PASS' redisspec.log || { echo "::error::redisspec: no test passed (wrong build tag, or the suite skipped)"; exit 1; }
 
   # ------------------------------------------------------------------
   # Memcached matrix (#238) — LTS + latest 1.6.x.
@@ -295,6 +361,39 @@ jobs:
         run: >-
           go test -tags memcached -race -count=1 -timeout=300s
           ./test/conformance/memcached/...
+      # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
+      # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
+      # or has answered a request first (default-ready). Latest server version only.
+      - name: Conformance (default engine, server not started)
+        if: matrix.memcached == '1.6.41'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default
+        run: >-
+          go test -tags memcached -race -count=1 -timeout=300s
+          ./test/conformance/memcached/...
+      - name: Conformance (default engine, server started and serving)
+        if: matrix.memcached == '1.6.41'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-ready
+        run: >-
+          go test -tags memcached -race -count=1 -timeout=300s
+          ./test/conformance/memcached/...
+      # The drivers open as soon as the engine is visible after Start, before the first request (the
+      # provider used to be visible before the loops were ready; a registration then panicked or raced).
+      - name: Conformance (default engine, drivers opened right after Start)
+        if: matrix.memcached == '1.6.41'
+        env:
+          CELERIS_CONFORMANCE_ENGINE: default-started
+        run: >-
+          go test -tags memcached -race -count=1 -timeout=300s
+          ./test/conformance/memcached/...
+      - name: mcspec
+        run: |
+          set -o pipefail
+          go test -tags memcached -race -count=1 -timeout=300s -v ./test/mcspec/... 2>&1 | tee mcspec.log
+          # A wrong build tag prints "[no test files]" and exits 0, and a
+          # missing server makes every test skip; either way nothing ran.
+          grep -q -- '^--- PASS' mcspec.log || { echo "::error::mcspec: no test passed (wrong build tag, or the suite skipped)"; exit 1; }
 
   # ------------------------------------------------------------------
   # Memcached Cluster — 3-node ketama ring per memcached version.

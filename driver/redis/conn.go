@@ -168,6 +168,9 @@ type redisConn struct {
 	// this conn: set by the pool for the configurations the auto default was
 	// not measured on (see newDirectCmdPool). An explicit auto or block ignores it.
 	netpollByDefault bool
+	// wake is the watcher of a direct conn on the cancel of the context of a
+	// blocking command (wake.go). Used under writerMu.
+	wake wakeState
 }
 
 // errBox wraps an error for atomic.Pointer — atomic.Value panics on type
@@ -352,14 +355,25 @@ func (c *redisConn) sendRaw(data []byte) error {
 func (c *redisConn) execDirect(ctx context.Context, req *redisRequest, args ...string) (*redisRequest, error) {
 	c.writerMu.Lock()
 	buf := c.state.writer.WriteCommand(args...)
-	return c.execDirectBuf(ctx, req, buf)
+	// A command that blocks on the server is also ended by the cancel of a context
+	// that can be canceled and has no deadline (wake.go); for any other command, for a
+	// context that cannot end and for one with a deadline (the socket's deadline ends
+	// the wait) nothing is watched. The command is looked at first: asking an ordinary
+	// command's context for its Done channel would allocate it (a stdlib cancelCtx
+	// makes the channel on the first call), which v1.5.11 never did there.
+	watch := isBlockingCommand(args) && ctx.Done() != nil
+	if watch {
+		_, hasDeadline := ctx.Deadline()
+		watch = !hasDeadline
+	}
+	return c.execDirectBuf(ctx, req, buf, watch)
 }
 
 // execDirectBuf is the buffer-taking core of execDirect. The caller MUST hold
 // c.writerMu on entry; execDirectBuf releases it (it holds the lock for the
 // whole write+read round trip so concurrent writes can't clobber the buffer).
 // Shared by execDirect / exec2 / exec3.
-func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []byte) (*redisRequest, error) {
+func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []byte, watch bool) (*redisRequest, error) {
 	defer c.writerMu.Unlock()
 	if c.syncBuf == nil {
 		c.syncBuf = make([]byte, 16<<10)
@@ -381,7 +395,19 @@ func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []
 			return req, err
 		}
 	}
+	// A blocking command waits for the server for as long as it is told to, so the
+	// cancel of its context ends the wait as well (wake.go); the deadline of a
+	// context is the socket deadline above, with nothing registered.
+	if watch {
+		c.armWake(ctx)
+		defer c.disarmWake()
+		if err := ctx.Err(); err != nil {
+			_ = c.closeWithErr(err)
+			return req, err
+		}
+	}
 	if _, err := c.tcp.Write(buf); err != nil {
+		err = ctxIOError(ctx, err)
 		_ = c.closeWithErr(err)
 		return req, err
 	}
@@ -406,6 +432,7 @@ func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []
 			c.onRecv(c.syncBuf[:n])
 		}
 		if err != nil {
+			err = ctxIOError(ctx, err)
 			_ = c.closeWithErr(err)
 			return req, err
 		}
@@ -450,6 +477,7 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 		}
 	}
 	if _, err := c.tcp.Write(data); err != nil {
+		err = ctxIOError(ctx, err)
 		_ = c.closeWithErr(err)
 		return reqs, err
 	}
@@ -477,6 +505,7 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 			c.onRecv(c.syncBuf[:rn])
 		}
 		if err != nil {
+			err = ctxIOError(ctx, err)
 			_ = c.closeWithErr(err)
 			return reqs, err
 		}
@@ -531,7 +560,7 @@ func (c *redisConn) exec2(ctx context.Context, a0, a1 string) (*redisRequest, er
 	if c.useDirect {
 		c.writerMu.Lock()
 		buf := c.state.writer.WriteCommand2(a0, a1)
-		return c.execDirectBuf(ctx, req, buf)
+		return c.execDirectBuf(ctx, req, buf, false)
 	}
 	if c.sync != nil {
 		c.writerMu.Lock()
@@ -561,7 +590,7 @@ func (c *redisConn) exec3(ctx context.Context, a0, a1, a2 string) (*redisRequest
 	if c.useDirect {
 		c.writerMu.Lock()
 		buf := c.state.writer.WriteCommand3(a0, a1, a2)
-		return c.execDirectBuf(ctx, req, buf)
+		return c.execDirectBuf(ctx, req, buf, false)
 	}
 	if c.sync != nil {
 		c.writerMu.Lock()

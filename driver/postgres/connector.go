@@ -65,6 +65,10 @@ func newConnector(dsn string) (*Connector, error) {
 // The connections it opens take the server's Config.SocketBusyPoll as their
 // SO_BUSY_POLL budget (Linux; 0, off, by default), unless
 // [Connector.WithSocketBusyPoll] set one of its own.
+//
+// The driver takes the server's event loop once, when it is opened: open it after
+// srv.Addr() is non-nil to share the server's loops; opened earlier it uses the
+// driver's own loop for its whole life.
 func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 	clone := &Connector{dsn: c.dsn, engine: sp, busyPoll: c.busyPoll}
 	if sp != nil {
