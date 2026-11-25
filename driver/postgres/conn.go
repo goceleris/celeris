@@ -951,7 +951,10 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 	// context.AfterFunc, no goroutine, whatever the context type): a context
 	// without a deadline (Background, the HTTP/1 and HTTP/2 request contexts, a
 	// cancel-only context) costs one Deadline() call and a branch, and a
-	// statement under it returns when the server answers, as in v1.5.11. A
+	// statement under it returns when the server answers, as in v1.5.11 (it
+	// does not wake the read; ctx.Err() below is looked at each time a read
+	// returns, so a context cancelled before the reply is complete cancels the
+	// statement when a partial reply arrives, as in v1.5.11). A
 	// timeout is recognised by the clock against the context's deadline, not by
 	// ctx.Err(), which a timer context may not have set yet. The startup is
 	// bounded by startupBound and is left alone.
