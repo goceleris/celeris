@@ -132,6 +132,44 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 // connections back to the worker that created them, so a handler running on
 // worker N preferentially acquires conns whose event-loop callbacks land on
 // worker N.
+//
+// # Session state
+//
+// Every call (QueryContext, ExecContext, QueryRow, Ping) takes a connection
+// from the pool and puts it back. The pool does not reset the session on
+// release: session state a call sets persists on the connection and is seen by
+// the next caller that gets it. That covers SET and SET ROLE, set_config with
+// is_local false, temporary tables, PREPARE, LISTEN and session-level advisory
+// locks. The same holds for a *sql.DB opened with this driver: before it reuses
+// a connection, ResetSession sends DISCARD ALL only if BeginTx marked the
+// session dirty and the driver's own Commit or Rollback did not clear the mark
+// (a transaction ended by COMMIT sent as plain SQL, for example), and never for
+// a SET, a temporary table or the other state above (tracked in
+// goceleris/celeris#1409).
+//
+// What is reset is a transaction. A connection released while it is in a
+// transaction, open or failed (the server's last ReadyForQuery status is T or
+// E), is closed and not put back, so the next caller never runs inside it, and
+// the server rolls the transaction back. On the Pool, the call that left it open
+// returns [ErrTxLeftOpen] (Exec "BEGIN" does, before anything else runs; Query
+// returns it from Rows.Close, and QueryRow from Scan when the scan succeeded or found no row (then errors.Is is true for both sql.ErrNoRows and ErrTxLeftOpen); a
+// statement that fails returns its own error, unchanged), so a transaction cannot
+// be spread over Exec calls by accident: the connection of the BEGIN is gone
+// before the next statement. Pool.BeginTx is the way, and its Tx is the Pool's
+// only pinned connection (there is no Pool.Conn): BEGIN, COMMIT, savepoints and
+// every statement between them run on that one connection. A *sql.DB opened with
+// this driver cannot tell a pooled db.Exec("BEGIN") from the same statement on a
+// dedicated *sql.Conn, where it is legitimate, so it returns no error: the
+// connection is dropped when it is returned, the transaction is rolled back, and
+// the statements that followed ran on another connection, each in its own
+// transaction. Use db.BeginTx, or db.Conn for statements that must share one
+// connection.
+//
+// To scope a setting to one piece of work, set it inside a Tx with SET LOCAL or
+// select set_config(name, value, true): both end with the transaction. A
+// *sql.DB offers a dedicated *sql.Conn for work that needs session state; undo
+// the state (RESET ALL, DISCARD ALL) before it is closed, or the next user of
+// the connection gets it.
 type Pool struct {
 	inner *async.Pool[*pgConn]
 
@@ -343,6 +381,18 @@ type workerCtxKey struct{}
 
 // WithWorker returns ctx with a worker-affinity hint. Pool.Acquire uses the
 // hint as the preferred worker index.
+//
+// The hint is a preference, not a pin. The Pool has one worker slot per event
+// loop of the engine it was opened with (len of Stats().PerWorker); a hint
+// outside [0, that count) is spread round-robin, and a call whose hinted
+// worker has no idle connection takes an idle connection of another worker (or
+// dials one), so consecutive calls with the same hint can run on different
+// connections. The default number of loops is GOMAXPROCS minus a reserve (see
+// Config.Workers of the celeris package: 7 on 8 CPUs, so a hint of 7 is out of
+// range there). The Pool's own count, len(Stats().PerWorker), is the number to
+// use (the engine's observe.EngineMetrics.Workers is the loops started, summed
+// over both sub-engines for the adaptive engine). Code that used GOMAXPROCS as
+// the worker count should read it instead.
 func WithWorker(ctx context.Context, workerID int) context.Context {
 	return context.WithValue(ctx, workerCtxKey{}, workerID)
 }
@@ -392,12 +442,25 @@ func (p *Pool) acquire(ctx context.Context) (*pgConn, error) {
 }
 
 // release returns c to its home worker's idle list.
-func (p *Pool) release(c *pgConn) {
+func (p *Pool) release(c *pgConn) { _ = p.releaseChecked(c) }
+
+// releaseChecked is release that reports a conn it had to discard because the
+// statement left a transaction open: the server's last ReadyForQuery said T (in
+// a transaction) or E (in a failed one). The conn is closed, not put back (the
+// server rolls the transaction back, and the next caller never runs inside it),
+// and the error is [ErrTxLeftOpen], for the caller of a pool-level call to
+// return. A closed conn is discarded without an error.
+func (p *Pool) releaseChecked(c *pgConn) error {
 	if c.closed.Load() {
 		p.inner.Discard(c)
-		return
+		return nil
+	}
+	if c.inTransaction() {
+		p.inner.Discard(c)
+		return ErrTxLeftOpen
 	}
 	p.inner.Release(c)
+	return nil
 }
 
 // QueryContext runs query on an acquired conn, returns a Rows wrapper that
@@ -417,13 +480,25 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	return acquireRows(drows, c, p), nil
 }
 
-// ExecContext runs a statement and returns a [Result].
-func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
-	c, err := p.acquire(ctx)
-	if err != nil {
-		return Result{}, err
+// ExecContext runs a statement and returns a [Result]. A statement that
+// succeeds and leaves a transaction open on the connection (Exec "BEGIN")
+// returns [ErrTxLeftOpen]: see the Session state section of [Pool]. A statement
+// that fails returns its own error, unchanged, as before (a connection left in
+// a failed transaction by it is discarded all the same).
+func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (res Result, err error) {
+	c, aerr := p.acquire(ctx)
+	if aerr != nil {
+		return Result{}, aerr
 	}
-	defer p.release(c)
+	defer func() {
+		// ErrTxLeftOpen only for a statement that succeeded: one that failed
+		// returns its own error, as it always did (a duplicate key in
+		// "BEGIN; INSERT ...; COMMIT" is a *PGError 23505, not a leftover).
+		if rerr := p.releaseChecked(c); rerr != nil && err == nil {
+			res = Result{}
+			err = rerr
+		}
+	}()
 	named, slot := anysToNamed(args)
 	r, err := c.ExecContext(ctx, query, named)
 	releaseNamedArgs(slot)
@@ -511,25 +586,18 @@ func releaseNamedArgs(slot *namedArgsSlot) {
 	namedArgsPool.Put(slot)
 }
 
-// rowsPool recycles *Rows wrappers so QueryContext avoids a heap alloc per
-// query on the hot path. On Close the struct is zeroed and returned to the
-// pool; callers who retain the pointer past Close see a cleared wrapper
-// (same behavior as any other post-Close access — an API contract
-// violation already).
-var rowsPool = sync.Pool{New: func() any { return &Rows{} }}
-
+// acquireRows wraps inner in a fresh *Rows. The wrapper is the pointer the
+// caller keeps, so it is never recycled: a caller can hold it after Close (a
+// deferred Close plus an explicit one, a Row that was scanned already) and a
+// recycled wrapper would be another query's Rows by then. What Close releases
+// is what the wrapper points at: the pooled pgRows and request slabs, and the
+// conn. The wrapper costs one small allocation per query.
 func acquireRows(inner driver.Rows, conn *pgConn, pool *Pool) *Rows {
-	r := rowsPool.Get().(*Rows)
-	r.inner = inner
-	r.conn = conn
-	r.pool = pool
-	return r
+	return &Rows{inner: inner, conn: conn, pool: pool}
 }
 
-func releaseRows(r *Rows) {
-	*r = Rows{}
-	rowsPool.Put(r)
-}
+// errRowsClosed is what Scan returns after Close.
+var errRowsClosed = errors.New("celeris-postgres: Rows are closed")
 
 // Rows is the pool-level rows wrapper. It returns the underlying conn to the
 // pool when Close is called. The iteration API matches database/sql.Rows:
@@ -542,7 +610,14 @@ type Rows struct {
 	inner driver.Rows
 	conn  *pgConn
 	pool  *Pool
-	done  bool
+	// done is set by the first Close (which also drops inner, conn and pool and
+	// the raw views below), so a later Close, Next, Scan or Columns is inert.
+	done atomic.Bool
+	// closemu is held for read by Next, Scan, Columns and Err and for write by Close
+	// while it drops the fields below, as database/sql.Rows.closemu: a Close on
+	// another goroutine (a watchdog) never recycles the pooled pgRows or releases the
+	// conn under a call that is inside them.
+	closemu sync.RWMutex
 
 	// current holds the driver.Values decoded by the last successful
 	// Next call. Populated only when the inner is NOT *pgRows (i.e.
@@ -559,24 +634,56 @@ type Rows struct {
 	rawTextFormat bool
 	rawAvailable  bool
 
-	// iterErr records the first non-EOF error encountered during Next.
+	// iterErr records the first non-EOF error encountered during Next. It
+	// survives Close, so for rows.Next() {}; rows.Close(); rows.Err() reports it.
 	iterErr error
 }
 
-// Columns returns column names.
-func (r *Rows) Columns() []string { return r.inner.Columns() }
-
-// Close releases resources and returns the conn to the pool.
-func (r *Rows) Close() error {
-	if r.done {
+// Columns returns column names, or nil once the Rows is closed.
+func (r *Rows) Columns() []string {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	if r.done.Load() {
 		return nil
 	}
-	r.done = true
-	err := r.inner.Close()
-	if r.pool != nil && r.conn != nil {
-		r.pool.release(r.conn)
+	return r.inner.Columns()
+}
+
+// Close releases resources and returns the conn to the pool. A statement that
+// left a transaction open on the conn (Query "BEGIN") makes Close return
+// [ErrTxLeftOpen] after discarding the conn. Close is idempotent: every call
+// after the first returns nil and does nothing (so ErrTxLeftOpen is reported
+// once), which makes `defer rows.Close()` next to an explicit Close fine. After
+// Close, Next returns false, Scan returns an error and Err keeps the error
+// iteration ended with. Close may be called from another goroutine while Next or
+// Scan is running (as with database/sql.Rows): it waits for that call, which sees
+// the Rows closed on its next use. Next, Scan and Columns themselves are not safe
+// to call concurrently with each other. A sql.Scanner must not call any method of
+// the same Rows from inside Scan: Close would wait for itself, and Err or Columns
+// would take the read lock a second time behind a Close that is waiting for it
+// (the same hazard as database/sql).
+func (r *Rows) Close() error {
+	if !r.done.CompareAndSwap(false, true) {
+		return nil
 	}
-	releaseRows(r)
+	r.closemu.Lock()
+	inner, conn, pool := r.inner, r.conn, r.pool
+	// Drop everything that points into released memory: the rawRow view is a slice
+	// of the request slab that inner.Close hands back to its pool, and inner is
+	// itself pooled.
+	r.inner, r.conn, r.pool = nil, nil, nil
+	r.current = nil
+	r.rawRow, r.rawCodecs, r.rawColumns, r.rawAvailable = nil, nil, nil, false
+	r.closemu.Unlock()
+	var err error
+	if inner != nil {
+		err = inner.Close()
+	}
+	if pool != nil && conn != nil {
+		if rerr := pool.releaseChecked(conn); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
 	return err
 }
 
@@ -590,7 +697,9 @@ func (r *Rows) Close() error {
 // one heap alloc per non-zero-size cell (int64 / time.Time etc. would
 // otherwise escape via interface conversion).
 func (r *Rows) Next() bool {
-	if r.done {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	if r.done.Load() {
 		return false
 	}
 	if pgr, ok := r.inner.(*pgRows); ok {
@@ -640,6 +749,11 @@ func (r *Rows) Next() bool {
 // apart from a zero value. A dest Scan does not support fails for NULL with
 // the same "unsupported scan dest type" error as for any other value.
 func (r *Rows) Scan(dest ...any) error {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	if r.done.Load() {
+		return errRowsClosed
+	}
 	if r.rawAvailable {
 		if len(dest) != len(r.rawRow) {
 			return fmt.Errorf("celeris-postgres: Scan expected %d dest, got %d", len(r.rawRow), len(dest))
@@ -686,8 +800,13 @@ func (r *Rows) Scan(dest ...any) error {
 	return nil
 }
 
-// Err returns the first non-EOF error encountered during iteration.
-func (r *Rows) Err() error { return r.iterErr }
+// Err returns the first non-EOF error encountered during iteration. It is still
+// that error after Close.
+func (r *Rows) Err() error {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	return r.iterErr
+}
 
 // scanRaw decodes wire bytes directly into the caller's pointer without
 // allocating an intermediate driver.Value. This is the hot path for
@@ -1176,19 +1295,39 @@ type Row struct {
 
 // Scan copies the columns from the single result row into dest. If the
 // query returned no rows, Scan returns sql.ErrNoRows. The underlying Rows
-// is closed automatically.
-func (r *Row) Scan(dest ...any) error {
+// is closed automatically, and a second Scan (the rows are gone) returns
+// sql.ErrNoRows too.
+func (r *Row) Scan(dest ...any) (err error) {
 	if r.err != nil {
 		return r.err
 	}
-	defer func() { _ = r.rows.Close() }()
-	if !r.rows.Next() {
-		if r.rows.Err() != nil {
-			return r.rows.Err()
+	rows := r.rows
+	if rows == nil {
+		return sql.ErrNoRows
+	}
+	r.rows = nil
+	defer func() {
+		// Only the error of a transaction left open on the conn is the
+		// caller's, and only when the scan went well or found no row; any other
+		// error of Close or of the scan is left as it was.
+		if cerr := rows.Close(); errors.Is(cerr, ErrTxLeftOpen) {
+			switch {
+			case err == nil:
+				err = cerr
+			case errors.Is(err, sql.ErrNoRows):
+				// A statement that returns no row (QueryRow("BEGIN")): both
+				// are true, so a caller testing for either sees it.
+				err = errors.Join(err, cerr)
+			}
+		}
+	}()
+	if !rows.Next() {
+		if rows.Err() != nil {
+			return rows.Err()
 		}
 		return sql.ErrNoRows
 	}
-	return r.rows.Scan(dest...)
+	return rows.Scan(dest...)
 }
 
 // Err returns the error, if any, encountered during the query. Unlike
@@ -1222,30 +1361,54 @@ type Tx struct {
 	inner *pgTx
 	conn  *pgConn
 	pool  *Pool
-	done  bool
+	// done is set by the call that finishes the tx; atomic, so a deferred
+	// Rollback reads it safely while another goroutine finishes the tx.
+	done atomic.Bool
 }
 
+// txDoneError is returned by a Tx used after Commit or Rollback. It keeps the
+// message the driver always had and matches sql.ErrTxDone with errors.Is, as
+// code written against database/sql expects.
+type txDoneError struct{}
+
+func (txDoneError) Error() string { return "celeris-postgres: tx already finished" }
+func (txDoneError) Unwrap() error { return sql.ErrTxDone }
+
+var errTxDone error = txDoneError{}
+
 // Commit commits the transaction and returns the conn to the pool.
-// On failure, done is left false so a deferred Rollback can still fire.
+// On failure, done is left false so a deferred Rollback can still fire, except
+// for ErrTxCommitRollback: the server rolled the transaction back, so it is over
+// (done stays set, the conn is released) and a later Rollback returns "tx already
+// finished". After the tx is finished it returns an error that matches
+// sql.ErrTxDone. A Rollback from another goroutine that runs while the Commit is
+// still in flight also gets ErrTxDone, even if that Commit then fails; the
+// goroutine that called Commit can still Rollback after the failure.
 func (t *Tx) Commit() error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if !t.done.CompareAndSwap(false, true) {
+		return errTxDone
 	}
 	err := t.inner.Commit()
-	if err != nil {
+	if errors.Is(err, ErrTxCommitRollback) {
+		// The server rolled the transaction back: it is over (done is set by the
+		// CAS above and stays), the conn is free.
+		t.pool.release(t.conn)
 		return err
 	}
-	t.done = true
+	if err != nil {
+		t.done.Store(false)
+		return err
+	}
 	t.pool.release(t.conn)
 	return nil
 }
 
-// Rollback rolls back the transaction and returns the conn to the pool.
+// Rollback rolls back the transaction and returns the conn to the pool. After
+// the tx is finished it returns an error that matches sql.ErrTxDone.
 func (t *Tx) Rollback() error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if !t.done.CompareAndSwap(false, true) {
+		return errTxDone
 	}
-	t.done = true
 	err := t.inner.Rollback()
 	t.pool.release(t.conn)
 	return err
@@ -1253,8 +1416,8 @@ func (t *Tx) Rollback() error {
 
 // ExecContext runs a statement on the pinned conn.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
-	if t.done {
-		return Result{}, errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return Result{}, errTxDone
 	}
 	named, slot := anysToNamed(args)
 	r, err := t.conn.ExecContext(ctx, query, named)
@@ -1269,8 +1432,8 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 // QueryContext runs a query on the pinned conn. The returned Rows must be
 // closed before Commit/Rollback.
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
-	if t.done {
-		return nil, errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return nil, errTxDone
 	}
 	named, slot := anysToNamed(args)
 	drows, err := t.conn.QueryContext(ctx, query, named)
@@ -1293,8 +1456,8 @@ func (t *Tx) QueryRow(ctx context.Context, query string, args ...any) *Row {
 // match [A-Za-z0-9_]+; anything else is rejected before the wire write to
 // avoid SQL-injection.
 func (t *Tx) Savepoint(ctx context.Context, name string) error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return errTxDone
 	}
 	return t.conn.Savepoint(ctx, name)
 }
@@ -1302,8 +1465,8 @@ func (t *Tx) Savepoint(ctx context.Context, name string) error {
 // ReleaseSavepoint issues RELEASE SAVEPOINT <name>. Same name rules as
 // Savepoint.
 func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return errTxDone
 	}
 	return t.conn.ReleaseSavepoint(ctx, name)
 }
@@ -1311,8 +1474,8 @@ func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
 // RollbackToSavepoint issues ROLLBACK TO SAVEPOINT <name>. Same name rules
 // as Savepoint.
 func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return errTxDone
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
 }

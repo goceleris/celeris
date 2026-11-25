@@ -48,6 +48,36 @@
 // WithEngine colocation. It is tested in CI on windows-latest against
 // in-process fake servers, not benchmarked and not tuned; do not deploy it.
 //
+// # Context cancellation
+//
+// A context with a deadline ends a command, a [Pipeline.Exec] or a [Tx.Exec] that
+// waits for the server when the deadline passes, in every mode of the driver (a
+// conn on the event loop, and a direct-mode conn: a pool with AsyncHandlers, a
+// started epoll or io_uring server, and off Linux a server that has not started),
+// and the error matches context.DeadlineExceeded (errors.Is); a direct-mode conn
+// used to report the socket's raw "i/o timeout" instead.
+//
+// A cancel() ends a command that blocks on the server (BLPOP, BRPOP, BRPOPLPUSH,
+// BLMOVE, BLMPOP, BZPOPMIN, BZPOPMAX, BZMPOP, XREAD and XREADGROUP with BLOCK, WAIT,
+// WAITAOF, run through [Client.Do]) in every mode, with an error that matches
+// context.Canceled, when the context has no deadline. On a direct-mode conn nothing
+// else is watched for a cancel: an ordinary command, a pipeline or a Tx waits for the
+// server's answer, as before, and a blocking command under a context that has a
+// deadline ends at the deadline, not at an earlier cancel() (the call then returns the
+// context's error, context.Canceled if it was canceled by then, a conn on the event
+// loop returns at the cancel in all these cases). A context that cannot end
+// (context.Background) costs a command nothing, and so does a context with a
+// deadline (the socket's deadline is set for the command and cleared after it, as
+// before); a blocking command under a context that can only be canceled costs a
+// direct-mode conn the registration of a context.AfterFunc.
+//
+// The server may still be running a command that its context ended, and its reply
+// is on the way, so the connection is closed and the pool dials another for the
+// next command. A pop (BLPOP, BRPOP, BZPOPMIN, BZPOPMAX, BLMPOP, BZMPOP) that its
+// context ends just as the server answers may already have removed the element, and
+// it is lost: use BLMOVE or BRPOPLPUSH to a processing list when an element must not
+// be lost (a deadline expiry did this before as well; a cancel now reaches it too).
+//
 // # Waiting for pipeline and Tx replies
 //
 // On Linux, a pipeline or Tx Exec on a direct-mode connection (the pool of a
