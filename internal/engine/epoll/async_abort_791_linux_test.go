@@ -212,16 +212,16 @@ func abortBlocked791() []string {
 }
 
 func runAbort791(t *testing.T, mode string) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	// Port 0: the engine picks the port and holds it until Listen returns
+	// (celeris#895). A port picked here with net.Listen and released is free for
+	// the process's own tcpack probe (New starts it), whose net.Listen("127.0.0.1:0")
+	// can be handed that very port: the loops then fail to bind it, and this test's
+	// first dial lands on the probe's listener, which resets what it never accepted
+	// when the probe closes it, a second later.
 	var hits, detaches atomic.Int64
 	logs := &abortLog791{}
 	e, err := New(resource.Config{
-		Addr:          addr,
+		Addr:          "127.0.0.1:0",
 		Protocol:      engine.HTTP1,
 		Resources:     resource.Resources{Workers: 2},
 		AsyncHandlers: true,
@@ -234,12 +234,13 @@ func runAbort791(t *testing.T, mode string) {
 	done := make(chan error, 1)
 	go func() { done <- e.Listen(ctx) }()
 	t.Cleanup(cancel)
+	// Addr is published once every loop is bound and ready; a dial that gets
+	// through proves only that something listens on the port.
+	var addr string
 	for deadline := time.Now().Add(8 * time.Second); ; {
-		if c, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond); derr == nil {
-			_ = c.Close()
-			if e.NumWorkers() > 0 {
-				break
-			}
+		if a := e.Addr(); a != nil {
+			addr = a.String()
+			break
 		}
 		select {
 		case err := <-done:
@@ -249,7 +250,7 @@ func runAbort791(t *testing.T, mode string) {
 		if time.Now().After(deadline) {
 			t.Fatal("engine did not start listening within 8s")
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	workers := e.NumWorkers()
 
