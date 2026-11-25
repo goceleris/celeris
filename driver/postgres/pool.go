@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -621,6 +622,16 @@ func (r *Rows) Next() bool {
 // must be a pointer. On the fast path (inner is *pgRows), Scan decodes
 // directly from the wire bytes into dest without ever materialising a
 // driver.Value — zero interface{} boxing per cell.
+//
+// A NULL cell never leaves its dest as it was, so a variable reused across
+// rows cannot carry the previous row's value. NULL sets dest to its zero
+// value: "" for *string, nil for *[]byte, *json.RawMessage, *any and a
+// pointer-to-pointer (**T, which a non-NULL value allocates), 0 for the
+// numeric kinds, false for *bool and the zero time.Time for *time.Time. A
+// sql.Scanner (sql.NullString, sql.NullInt64, ...) receives Scan(nil) and sets
+// Valid=false; scan into one, into *any or into **T when NULL must be told
+// apart from a zero value. A dest Scan does not support fails for NULL with
+// the same "unsupported scan dest type" error as for any other value.
 func (r *Rows) Scan(dest ...any) error {
 	if r.rawAvailable {
 		if len(dest) != len(r.rawRow) {
@@ -943,7 +954,16 @@ func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, erro
 	return false, nil
 }
 
-// assignNil zeros the pointed-to primitive when the column is NULL.
+// assignNil stores a NULL cell into dest. It never leaves dest as it was:
+// a variable reused across rows would otherwise carry the previous row's
+// value into a row whose column is NULL, with no error.
+//
+// The destination is set to its zero value: "" for *string, nil for
+// *[]byte, *json.RawMessage and *any, 0 for the numeric kinds, false for
+// *bool, the zero time.Time for *time.Time, and nil for a pointer-to-pointer
+// (**T). sql.Scanner destinations (sql.Null*, a user type) are handled by the
+// caller via Scan(nil). Any other destination fails with the error a non-NULL
+// value gets, so a destination Scan does not support never succeeds silently.
 func assignNil(dest any) error {
 	switch d := dest.(type) {
 	case *int:
@@ -956,6 +976,10 @@ func assignNil(dest any) error {
 		*d = 0
 	case *uint32:
 		*d = 0
+	case *float64:
+		*d = 0
+	case *float32:
+		*d = 0
 	case *string:
 		*d = ""
 	case *[]byte:
@@ -964,9 +988,17 @@ func assignNil(dest any) error {
 		*d = nil
 	case *bool:
 		*d = false
+	case *time.Time:
+		*d = time.Time{}
+	case *any:
+		*d = nil
 	default:
-		// Unknown target — let scanValue handle it via convertAssign(nil).
-		return scanValue(dest, nil)
+		// **T: a nullable column scans into *T as nil.
+		if rv := reflect.ValueOf(dest); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Pointer {
+			rv.Elem().SetZero()
+			return nil
+		}
+		return fmt.Errorf("unsupported scan dest type %T", dest)
 	}
 	return nil
 }
@@ -981,7 +1013,7 @@ func scanValue(dest any, v driver.Value) error {
 		return scanner.Scan(v)
 	}
 	if v == nil {
-		return nil
+		return assignNil(dest)
 	}
 	return convertAssign(dest, v)
 }
@@ -1113,6 +1145,16 @@ func convertAssign(dest any, src any) error {
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to time.Time", src)
 		}
 	default:
+		// **T: allocate a T and scan into it, so a nullable column scans
+		// into *T (nil for NULL, see assignNil).
+		if rv := reflect.ValueOf(dest); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Pointer {
+			nv := reflect.New(rv.Elem().Type().Elem())
+			if err := scanValue(nv.Interface(), src); err != nil {
+				return err
+			}
+			rv.Elem().Set(nv)
+			return nil
+		}
 		return fmt.Errorf("unsupported scan dest type %T", dest)
 	}
 	return nil
