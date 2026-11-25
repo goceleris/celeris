@@ -3058,10 +3058,13 @@ func (c *pgConn) Ping(ctx context.Context) error {
 	return c.simpleExecNoTag(ctx, "SELECT 1")
 }
 
-// ResetSession implements driver.SessionResetter. It is invoked by
-// database/sql when a conn is returned to the idle pool. We send DISCARD ALL
-// so the next caller starts with a clean session (temp tables dropped,
-// cursors closed, prepared statements deallocated, GUC settings reset).
+// ResetSession implements driver.SessionResetter. database/sql calls it before
+// it reuses a conn that has been used (not when the conn is returned). It sends
+// DISCARD ALL (temp tables dropped, cursors closed, prepared statements
+// deallocated, GUC settings reset) only when the session is marked dirty: BeginTx
+// marks it, a successful Commit or Rollback clears it, and nothing else does
+// (see goceleris/celeris#1409).
+//
 // A conn that is not idle (its last ReadyForQuery said T or E: a transaction
 // left open, or failed) and a conn whose reset fails are not handed to the next
 // caller: ResetSession returns an error that matches driver.ErrBadConn (and

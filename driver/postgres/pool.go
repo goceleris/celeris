@@ -152,7 +152,8 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 // E), is closed and not put back, so the next caller never runs inside it, and
 // the server rolls the transaction back. On the Pool, the call that left it open
 // returns [ErrTxLeftOpen] (Exec "BEGIN" does, before anything else runs; Query
-// returns it from Rows.Close, and QueryRow from Scan), so a transaction cannot
+// returns it from Rows.Close, and QueryRow from Scan when the scan succeeded; a
+// statement that fails returns its own error, unchanged), so a transaction cannot
 // be spread over Exec calls by accident: the connection of the BEGIN is gone
 // before the next statement. Pool.BeginTx is the way, and its Tx is the Pool's
 // only pinned connection (there is no Pool.Conn): BEGIN, COMMIT, savepoints and
@@ -479,22 +480,23 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	return acquireRows(drows, c, p), nil
 }
 
-// ExecContext runs a statement and returns a [Result]. A statement that leaves
-// a transaction open on the connection (Exec "BEGIN") returns [ErrTxLeftOpen]:
-// see the Session state section of [Pool].
+// ExecContext runs a statement and returns a [Result]. A statement that
+// succeeds and leaves a transaction open on the connection (Exec "BEGIN")
+// returns [ErrTxLeftOpen]: see the Session state section of [Pool]. A statement
+// that fails returns its own error, unchanged, as before (a connection left in
+// a failed transaction by it is discarded all the same).
 func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (res Result, err error) {
 	c, aerr := p.acquire(ctx)
 	if aerr != nil {
 		return Result{}, aerr
 	}
 	defer func() {
-		if rerr := p.releaseChecked(c); rerr != nil {
+		// ErrTxLeftOpen only for a statement that succeeded: one that failed
+		// returns its own error, as it always did (a duplicate key in
+		// "BEGIN; INSERT ...; COMMIT" is a *PGError 23505, not a leftover).
+		if rerr := p.releaseChecked(c); rerr != nil && err == nil {
 			res = Result{}
-			if err != nil {
-				err = fmt.Errorf("%w (the statement failed: %w)", rerr, err)
-			} else {
-				err = rerr
-			}
+			err = rerr
 		}
 	}()
 	named, slot := anysToNamed(args)
@@ -1260,13 +1262,10 @@ func (r *Row) Scan(dest ...any) (err error) {
 	}
 	defer func() {
 		// Only the error of a transaction left open on the conn is the
-		// caller's; any other error of Close is dropped, as before.
-		if cerr := r.rows.Close(); errors.Is(cerr, ErrTxLeftOpen) {
-			if err != nil {
-				err = fmt.Errorf("%w (the scan failed: %w)", cerr, err)
-			} else {
-				err = cerr
-			}
+		// caller's, and only when the scan itself went well; any other error
+		// of Close is dropped, as before.
+		if cerr := r.rows.Close(); err == nil && errors.Is(cerr, ErrTxLeftOpen) {
+			err = cerr
 		}
 	}()
 	if !r.rows.Next() {

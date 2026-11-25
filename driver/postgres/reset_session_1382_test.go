@@ -315,7 +315,9 @@ func TestTxPathReusesConnUnderDatabaseSQL(t *testing.T) {
 // The native Pool: the call that leaves a transaction open on its connection
 // (Exec "BEGIN") returns ErrTxLeftOpen itself, the connection is closed and not
 // put back, and the next statement runs on a new one: nothing after the BEGIN
-// runs inside a transaction that no longer exists.
+// runs inside a transaction that no longer exists. A statement that fails
+// returns its own error, unchanged (as in v1.5.11), and its connection, left in
+// a failed transaction, is discarded all the same.
 func TestNativePoolExecLeftTransactionOpenIsAnError(t *testing.T) {
 	for _, stmt := range []string{"BEGIN", "BEGIN;FAIL"} {
 		t.Run(stmt, func(t *testing.T) {
@@ -329,16 +331,18 @@ func TestNativePoolExecLeftTransactionOpenIsAnError(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			res, err := p.ExecContext(ctx, stmt)
-			if !errors.Is(err, ErrTxLeftOpen) {
-				t.Fatalf("Exec %q = %v, want ErrTxLeftOpen", stmt, err)
-			}
 			if res != (Result{}) {
 				t.Fatalf("Exec %q returned a result with its error: %+v", stmt, res)
 			}
-			if stmt == "BEGIN;FAIL" {
-				var pe *PGError
-				if !errors.As(err, &pe) || pe.Code != "22012" {
-					t.Fatalf("the statement's own error is lost: %v", err)
+			if stmt == "BEGIN" {
+				if !errors.Is(err, ErrTxLeftOpen) {
+					t.Fatalf("Exec %q = %v, want ErrTxLeftOpen", stmt, err)
+				}
+			} else {
+				// The statement's own error, bare: a type assertion works.
+				pe, ok := err.(*PGError)
+				if !ok || pe.Code != "22012" || errors.Is(err, ErrTxLeftOpen) {
+					t.Fatalf("Exec %q = %#v, want the bare *PGError 22012", stmt, err)
 				}
 			}
 			if _, err := p.ExecContext(ctx, "SELECT 'user B'"); err != nil {
@@ -354,8 +358,9 @@ func TestNativePoolExecLeftTransactionOpenIsAnError(t *testing.T) {
 	}
 }
 
-// The same error on the Query path: Rows.Close returns it, and so does
-// Row.Scan.
+// The same on the Query path: Rows.Close returns ErrTxLeftOpen, and the conn is
+// discarded. Row.Scan returns the scan's own error (here sql.ErrNoRows: the
+// statement returns no row), and the conn is discarded all the same.
 func TestNativePoolQueryLeftTransactionOpenIsAnError(t *testing.T) {
 	f := newResetFake(t, false)
 	host, port, _ := net.SplitHostPort(f.addr)
@@ -374,12 +379,18 @@ func TestNativePoolQueryLeftTransactionOpenIsAnError(t *testing.T) {
 		t.Fatalf("Rows.Close = %v, want ErrTxLeftOpen", err)
 	}
 	var x string
-	if err := p.QueryRow(ctx, "BEGIN").Scan(&x); !errors.Is(err, ErrTxLeftOpen) {
-		t.Fatalf("Row.Scan = %v, want ErrTxLeftOpen", err)
+	if err := p.QueryRow(ctx, "BEGIN").Scan(&x); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("Row.Scan = %v, want sql.ErrNoRows", err)
 	}
-	// An ordinary statement is unaffected.
+	// An ordinary statement is unaffected, on a new conn each time.
 	if _, err := p.ExecContext(ctx, "SELECT 1"); err != nil {
 		t.Fatalf("Exec after: %v", err)
+	}
+	f.mu.Lock()
+	n := f.conns
+	f.mu.Unlock()
+	if n != 3 {
+		t.Fatalf("%d conns were opened, want 3 (one per discarded BEGIN and the last one): %v", n, f.dump())
 	}
 }
 
