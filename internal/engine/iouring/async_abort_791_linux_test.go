@@ -213,14 +213,13 @@ func runAbort791(t *testing.T, mode string) {
 	var hits, detaches atomic.Int64
 	logs := &abortLog791{}
 	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("pick port: %v", err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
+		// Port 0: the engine picks the port and holds it until Listen returns
+		// (celeris#895). A port picked here with net.Listen and released is free
+		// for the process's own tcpack probe (New starts it), whose
+		// net.Listen("127.0.0.1:0") can be handed that very port: the workers
+		// then fail to bind it and the engine never starts.
 		return New(resource.Config{
-			Addr:          addr,
+			Addr:          "127.0.0.1:0",
 			Protocol:      engine.HTTP1,
 			Resources:     resource.Resources{Workers: 2},
 			AsyncHandlers: true,

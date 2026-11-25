@@ -223,7 +223,7 @@ func TestPgOnCloseKeepsTheNumberUntilClose859(t *testing.T) {
 }
 
 // Close must release the number only after the conn's background goroutines
-// (dropPreparedAsync, tracked by closeWG) are done: one of them may still be
+// (tracked by closeWG) are done: one of them may still be
 // about to write by number.
 func TestPgCloseReleasesTheNumberAfterBackgroundCalls859(t *testing.T) {
 	loop := newC859Loop()
@@ -236,7 +236,7 @@ func TestPgCloseReleasesTheNumberAfterBackgroundCalls859(t *testing.T) {
 	c.enqueue(req)
 
 	// A background goroutine that writes by number once the test lets it,
-	// as dropPreparedAsync does when it loses the race with Close.
+	// as a goroutine a conn starts for a background call would when it loses the race with Close.
 	gate := make(chan struct{})
 	c.closeWG.Add(1)
 	go func() {
