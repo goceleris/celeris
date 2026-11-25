@@ -538,6 +538,11 @@ type Rows struct {
 	// done is set by the first Close (which also drops inner, conn and pool and
 	// the raw views below), so a later Close, Next, Scan or Columns is inert.
 	done atomic.Bool
+	// closemu is held for read by Next, Scan, Columns and Err and for write by Close
+	// while it drops the fields below, as database/sql.Rows.closemu: a Close on
+	// another goroutine (a watchdog) never recycles the pooled pgRows or releases the
+	// conn under a call that is inside them.
+	closemu sync.RWMutex
 
 	// current holds the driver.Values decoded by the last successful
 	// Next call. Populated only when the inner is NOT *pgRows (i.e.
@@ -561,6 +566,8 @@ type Rows struct {
 
 // Columns returns column names, or nil once the Rows is closed.
 func (r *Rows) Columns() []string {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
 	if r.done.Load() {
 		return nil
 	}
@@ -570,12 +577,16 @@ func (r *Rows) Columns() []string {
 // Close releases resources and returns the conn to the pool. It is idempotent:
 // every call after the first returns nil and does nothing, so `defer rows.Close()`
 // next to an explicit Close is fine. After Close, Next returns false, Scan returns
-// an error and Err keeps the error iteration ended with. A Rows is not safe for
-// use by several goroutines at once (database/sql.Rows is not either).
+// an error and Err keeps the error iteration ended with. Close may be called from
+// another goroutine while Next or Scan is running (as with database/sql.Rows): it
+// waits for that call, which sees the Rows closed on its next use. Next, Scan and
+// Columns themselves are not safe to call concurrently with each other. A
+// sql.Scanner must not call Close from inside Scan (it would wait for itself).
 func (r *Rows) Close() error {
 	if !r.done.CompareAndSwap(false, true) {
 		return nil
 	}
+	r.closemu.Lock()
 	inner, conn, pool := r.inner, r.conn, r.pool
 	// Drop everything that points into released memory: the rawRow view is a slice
 	// of the request slab that inner.Close hands back to its pool, and inner is
@@ -583,6 +594,7 @@ func (r *Rows) Close() error {
 	r.inner, r.conn, r.pool = nil, nil, nil
 	r.current = nil
 	r.rawRow, r.rawCodecs, r.rawColumns, r.rawAvailable = nil, nil, nil, false
+	r.closemu.Unlock()
 	var err error
 	if inner != nil {
 		err = inner.Close()
@@ -603,6 +615,8 @@ func (r *Rows) Close() error {
 // one heap alloc per non-zero-size cell (int64 / time.Time etc. would
 // otherwise escape via interface conversion).
 func (r *Rows) Next() bool {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
 	if r.done.Load() {
 		return false
 	}
@@ -653,6 +667,8 @@ func (r *Rows) Next() bool {
 // apart from a zero value. A dest Scan does not support fails for NULL with
 // the same "unsupported scan dest type" error as for any other value.
 func (r *Rows) Scan(dest ...any) error {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
 	if r.done.Load() {
 		return errRowsClosed
 	}
@@ -704,7 +720,11 @@ func (r *Rows) Scan(dest ...any) error {
 
 // Err returns the first non-EOF error encountered during iteration. It is still
 // that error after Close.
-func (r *Rows) Err() error { return r.iterErr }
+func (r *Rows) Err() error {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	return r.iterErr
+}
 
 // scanRaw decodes wire bytes directly into the caller's pointer without
 // allocating an intermediate driver.Value. This is the hot path for
@@ -1262,7 +1282,10 @@ var errTxDone error = txDoneError{}
 
 // Commit commits the transaction and returns the conn to the pool.
 // On failure, done is left false so a deferred Rollback can still fire.
-// After the tx is finished it returns an error that matches sql.ErrTxDone.
+// After the tx is finished it returns an error that matches sql.ErrTxDone. A
+// Rollback from another goroutine that runs while the Commit is still in flight
+// also gets ErrTxDone, even if that Commit then fails; the goroutine that called
+// Commit can still Rollback after the failure.
 func (t *Tx) Commit() error {
 	if !t.done.CompareAndSwap(false, true) {
 		return errTxDone
