@@ -22,14 +22,14 @@ func TestTxDoneAfterFailedCommit(t *testing.T) {
 	pool := &Pool{inner: async.NewPool[*pgConn](async.PoolConfig{NumWorkers: 1},
 		func(context.Context, int) (*pgConn, error) { return nil, errors.New("unused") })}
 	tx := &Tx{inner: &pgTx{}, conn: &pgConn{}, pool: pool}
-	if tx.done {
+	if tx.done.Load() {
 		t.Fatal("done should start false")
 	}
 	err := tx.Rollback()
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("Rollback with done=false: got %v, want the inner ErrClosed (past the done guard)", err)
 	}
-	if !tx.done {
+	if !tx.done.Load() {
 		t.Fatal("done should be true after Rollback ran")
 	}
 	if err := tx.Rollback(); err == nil || err.Error() != "celeris-postgres: tx already finished" {
@@ -40,7 +40,8 @@ func TestTxDoneAfterFailedCommit(t *testing.T) {
 // TestTxDoneAfterSuccessfulCommit verifies done is true after Commit succeeds.
 // This is the inverse check: a successful Commit must prevent double-Rollback.
 func TestTxDoneAfterSuccessfulCommit(t *testing.T) {
-	tx := &Tx{done: true} // simulate post-successful-Commit
+	tx := &Tx{}
+	tx.done.Store(true) // simulate post-successful-Commit
 	err := tx.Rollback()
 	if err == nil || err.Error() != "celeris-postgres: tx already finished" {
 		t.Fatalf("expected 'tx already finished', got %v", err)
