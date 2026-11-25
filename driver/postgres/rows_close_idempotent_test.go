@@ -155,7 +155,7 @@ func TestRowsCloseTwice(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				defer rows.Close()
+				defer rows.Close() //nolint:errcheck // the idiom under test: a deferred Close next to an explicit one
 				if v, err := scanMarker(rows); err != nil || v != 41 {
 					return fmt.Errorf("scan: %d, %v", v, err)
 				}
