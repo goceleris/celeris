@@ -18,6 +18,10 @@ import (
 // Pipeline has been released back to the pool or was never properly exec'd.
 var errPipeCmdOrphaned = &pipeCmd{err: errPipelineReleased}
 
+// errPipeCmdDiscarded is what a handle reports when its command is no longer in
+// the live Pipeline (Discard, or a new batch): ErrClosed, as in v1.5.11.
+var errPipeCmdDiscarded = &pipeCmd{err: ErrClosed}
+
 // errPipelineReleased is returned for any use of a [Pipeline] after
 // [Pipeline.Release]: queued commands are not sent, Exec fails, and the typed
 // handles report it. It wraps [ErrClosed].
@@ -290,7 +294,7 @@ func (p *pipeState) reset() {
 // newBatch starts a new batch after a failed Exec. It is reset() except that
 // strSlab keeps its contents: strings already read from the failed batch stay
 // valid until Discard or Release, as documented.
-func (p *Pipeline) newBatch() {
+func (p *pipeState) newBatch() {
 	keep := p.strSlab
 	p.reset()
 	p.strSlab = keep
@@ -618,8 +622,12 @@ func (c *cmdRef) cmd() *pipeCmd {
 		return errPipeCmdOrphaned
 	}
 	st := c.p.st.Load()
-	if st == nil || c.idx >= len(st.cmds) {
+	if st == nil {
 		return errPipeCmdOrphaned
+	}
+	if c.idx >= len(st.cmds) {
+		// A live Pipeline whose batch was discarded: the v1.5.11 error.
+		return errPipeCmdDiscarded
 	}
 	return &st.cmds[c.idx]
 }

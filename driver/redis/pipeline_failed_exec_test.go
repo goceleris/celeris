@@ -258,3 +258,20 @@ func TestPipelineHeldStringsSurviveTheNextBatchAfterAFailedExec(t *testing.T) {
 		t.Fatalf("strings read from the failed batch were overwritten: %q %q", s1, s2)
 	}
 }
+
+// After Discard a handle of the discarded batch reports ErrClosed, as in
+// v1.5.11 (not the released-Pipeline error: the Pipeline is still live).
+func TestPipelineHandleAfterDiscardReportsErrClosed(t *testing.T) {
+	c, _ := newStallClient(t)
+	p := c.Pipeline()
+	defer p.Release()
+	g := p.Get("k")
+	if err := p.Exec(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p.Discard()
+	_, err := g.Result()
+	if err == nil || err.Error() != ErrClosed.Error() {
+		t.Fatalf("Result after Discard = %v, want %q", err, ErrClosed)
+	}
+}
