@@ -140,10 +140,11 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 // release: session state a call sets persists on the connection and is seen by
 // the next caller that gets it. That covers SET and SET ROLE, set_config with
 // is_local false, temporary tables, PREPARE, LISTEN and session-level advisory
-// locks. The same holds for a *sql.DB opened with this
-// driver: it sends DISCARD ALL on return only for a connection that went
-// through BeginTx and did not end the transaction with COMMIT or ROLLBACK, not
-// for a SET, a temporary table or the other state above (tracked in
+// locks. The same holds for a *sql.DB opened with this driver: before it reuses
+// a connection, ResetSession sends DISCARD ALL only if BeginTx marked the
+// session dirty and the driver's own Commit or Rollback did not clear the mark
+// (a transaction ended by COMMIT sent as plain SQL, for example), and never for
+// a SET, a temporary table or the other state above (tracked in
 // goceleris/celeris#1409).
 //
 // What is reset is a transaction: a connection released while it is in a
