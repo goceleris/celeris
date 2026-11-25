@@ -78,5 +78,5 @@
 // release notes.
 //
 // The supported types and the known gaps are listed on the supported-types
-// page (placeholder URL, not final): https://goceleris.dev/docs/drivers/postgres/supported-types
+// page: https://goceleris.dev/docs/postgres-types
 package postgres

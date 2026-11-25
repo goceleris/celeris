@@ -19,6 +19,15 @@ var ErrUnsupportedAuth = errors.New("celeris-postgres: unsupported authenticatio
 // ErrClosed is returned from operations on a closed pgConn.
 var ErrClosed = errors.New("celeris-postgres: connection closed")
 
+// ErrTxCommitRollback is returned from Commit when PostgreSQL answered COMMIT
+// with the command tag ROLLBACK: the transaction was in the aborted state (a
+// statement of it failed, or was cancelled, and the transaction was not rolled
+// back), the server treats such a COMMIT as a ROLLBACK and reports no error, and
+// nothing was committed. The transaction is over and the connection is free
+// again. It matches with errors.Is, also through database/sql, whose Tx.Commit
+// returns the driver's error as it is.
+var ErrTxCommitRollback = errors.New("celeris-postgres: commit unexpectedly resulted in rollback")
+
 // ErrBadConn is returned when a connection is in an unusable state; returning
 // it causes database/sql to evict the conn and open a fresh one.
 var ErrBadConn = errors.New("celeris-postgres: bad connection")
