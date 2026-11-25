@@ -29,7 +29,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           # The api/ check type-checks the nested modules too, and apidump
           # builds from the tools module, so their go.sum files key the cache.
           cache-dependency-path: |
@@ -184,7 +184,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       # celeris#1178 (internal/mono): the SKEW CANARY. The package's clock reads one
       # hour away from the wall (and from the process's start) when the test binary is
       # built with -tags celeris_monoskew and run with CELERIS_MONO_SKEW, so a site
@@ -1419,7 +1419,7 @@ jobs:
             'celeristest TestNewContextZeroAlloc'
             'driver/memcached TestAllocBudgets'
             'driver/postgres TestAllocBudgets|TestAllocBudgetsPreparedExec'
-            'driver/redis TestAllocBudgets|TestDirectWaitFastRepliesDoNotBlock854|TestDirectWaitHysteresis854'
+            'driver/redis TestAllocBudgets|TestDirectWaitFastRepliesDoNotBlock854|TestDirectWaitHysteresis854|TestWatcherAllocations1387'
             'middleware/cache TestAllocBudgets'
             'middleware/idempotency TestAllocBudgets'
             'middleware/overload TestAllocBudgets'
@@ -1475,9 +1475,9 @@ jobs:
           done
           skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/allocguard.log)
           faillines=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/allocguard.log || true)
-          echo "alloc guards: top-level PASS $total (want 17), packages with a wrong tally $bad, SKIP lines $skipped, FAIL lines $faillines, go test runs failed $failed (want 0)"
-          if [ "$total" -ne 17 ] || [ "$bad" -ne 0 ] || [ "$skipped" -ne 0 ] || [ "$faillines" -ne 0 ] || [ "$failed" -ne 0 ]; then
-            echo "expected the 17 guard tests of 11 packages to run and PASS with no SKIP or FAIL line --"
+          echo "alloc guards: top-level PASS $total (want 18), packages with a wrong tally $bad, SKIP lines $skipped, FAIL lines $faillines, go test runs failed $failed (want 0)"
+          if [ "$total" -ne 18 ] || [ "$bad" -ne 0 ] || [ "$skipped" -ne 0 ] || [ "$faillines" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected the 18 guard tests of 11 packages to run and PASS with no SKIP or FAIL line --"
             echo "was one renamed or removed, did one skip (alloc counts are skipped under -race, coverage and -short), or did one fail?"
             exit 1
           fi
@@ -1614,7 +1614,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Root package — shard tests (race, each must PASS by name)
         shell: bash
         env:
@@ -1667,7 +1667,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       # celeris#641: the default engine's own package ran in no CI job. It
       # needs two things the unit job does not give it.
       #
@@ -1982,7 +1982,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       # celeris#656: the three tests that pin the failed-worker listen-socket
       # leak ask for TWO io_uring workers on one port, and RLIMIT_MEMLOCK funds
       # one per 12 MiB (internal/engine/iouring/ring.go minMemlockPerWorker). GitHub
@@ -2128,7 +2128,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       # TestSendZCWindowGuardUnderRace holds the SEND_ZC first-CQE -> NOTIF
       # window open (internal/zcwindow.SetHold, -tags=validation only) while
       # the handler pushes 256 x 64 KiB frames at a steady pace to a client
@@ -2232,7 +2232,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       # The celeris#715 / celeris#685 trials (-tags=validation only; the
       # holds are internal/recvtheft). Each parks the worker that closed a
       # connection A with a recv still able to resolve A's descriptor number
@@ -2556,7 +2556,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: internal/engine/iouring at the base tier (race, tier asserted, skips accounted for)
         shell: bash
         run: |
@@ -2610,7 +2610,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: test/server large-response tests at full size (no race, no coverage)
         shell: bash
         run: |
@@ -2663,6 +2663,50 @@ jobs:
             exit 1
           fi
 
+  # celeris#809: a 64 MiB HTTP/2 response to golang.org/x/net's http2.Transport took
+  # about 16 s on epoll, io_uring and adaptive and 0.07 s on std (fixed by #965).
+  # TestH2XNetLargeResponseVsStd809 holds it: on each native engine the transfer is
+  # complete and takes at most 5 times std's, measured in the same process with the
+  # same client, with that limit held between 0.5 s and 2 s (no tight absolute bar on
+  # a shared runner; the defect was 16 s). It is a
+  # timing test, so it is not built under -race and skips under coverage; the
+  # `unit` job's -race runs and `large-response` (which names the lean-shape tests)
+  # do not reach it, hence this job, on both architectures like zc-window. A
+  # separate job and not a matrix leg of `large-response`, whose check name a matrix
+  # would change. Memlock is raised as there (the engines start io_uring workers);
+  # the test fails, not skips, when io_uring does not start.
+  h2-xnet-large:
+    name: HTTP/2 64 MiB to x/net's client against std, no race (./test/server, celeris#809, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: TestH2XNetLargeResponseVsStd809 (no race, no coverage)
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l), CPUs: $(nproc), arch: $(uname -m)"
+          go test -count=1 -timeout=300s -v -run '^TestH2XNetLargeResponseVsStd809$' ./test/server/ 2>&1 | tee /tmp/h2xnet.log
+          .github/scripts/named-tally.sh 'celeris#809 x/net 64 MiB against std' /tmp/h2xnet.log TestH2XNetLargeResponseVsStd809
+          # 2 routes x (std + 3 native engines) = 8 measured cells, each logging its time.
+          cells=$(grep -c 'H2XNET809 route=' /tmp/h2xnet.log || true)
+          echo "measured cells: $cells (want 8)"
+          grep 'H2XNET809 route=' /tmp/h2xnet.log || true
+          if [ "$cells" -ne 8 ]; then
+            echo "expected 8 H2XNET809 lines (sync and async, on std, epoll, io_uring and adaptive)"
+            exit 1
+          fi
+
   conformance:
     name: Conformance
     runs-on: ubuntu-latest
@@ -2672,7 +2716,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       # A skip here is a hole in the matrix, not coverage (celeris#684): the
       # step fails on any `--- SKIP` line (the matrix skips nothing today).
       - name: Conformance matrix (engines × protocols)
@@ -2723,7 +2767,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Postgres conformance
         shell: bash
         run: |
@@ -2861,7 +2905,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Build root module
         run: go build ./...
       - name: Build middleware/compress
@@ -2898,7 +2942,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Build root module
         run: go build ./...
       # The whole module: packages whose files are all Linux-only (the engines,
@@ -2940,7 +2984,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
       - name: Fallback and driver tests
         shell: bash
         run: |
@@ -2983,8 +3027,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # 1.27.4 fixes GO-2026-6859 (net/http); the scan reports the toolchain it
-          # runs with, so this job must run the fixed one. The module floor (go.mod)
-          # and the other jobs stay at 1.27.3: the benchmark builds are pinned to it.
+          # runs with, so this job must run the fixed one, as the jobs that pin a
+          # version do. The module floor (go.mod, 1.27.3) is unchanged, and the jobs
+          # that read it with go-version-file keep resolving it.
           go-version: "1.27.4"
       # govulncheck is a `tool` of the separate .github/tools module, so the
       # version that runs is the one its go.mod names and its go.sum hashes
