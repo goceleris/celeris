@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"runtime"
@@ -1453,6 +1454,29 @@ func (c *pgConn) onRecv(data []byte) {
 func (c *pgConn) inTransaction() bool {
 	s := c.txStatus.Load()
 	return s == 'T' || s == 'E'
+}
+
+// lastTxDiscardLog is the time (Unix nanoseconds) of the last warning that a
+// database/sql connection was discarded inside a transaction; zero before the
+// first.
+var lastTxDiscardLog atomic.Int64
+
+// warnTxDiscarded logs, at Warn on slog's default logger, that database/sql
+// returned a connection inside a transaction and it was discarded. database/sql
+// gives the driver no error to return there (a db.Exec("BEGIN") on a pooled
+// connection cannot be told from the same statement on a dedicated *sql.Conn),
+// so this is the only trace. It logs the first time and then at most once a
+// minute, with the words of [ErrTxLeftOpen].
+func warnTxDiscarded() {
+	now := time.Now().UnixNano()
+	last := lastTxDiscardLog.Load()
+	if last != 0 && now-last < int64(time.Minute) {
+		return
+	}
+	if !lastTxDiscardLog.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Default().Warn(ErrTxLeftOpen.Error(), "path", "database/sql")
 }
 
 // dispatch feeds one message into the state machine of the current head
@@ -3055,6 +3079,7 @@ func (c *pgConn) ResetSession(ctx context.Context) error {
 	}
 	if c.inTransaction() {
 		// DISCARD ALL would fail inside a transaction block and abort it.
+		warnTxDiscarded()
 		return fmt.Errorf("%w: %w: connection returned inside a transaction", driver.ErrBadConn, ErrBadConn)
 	}
 	dirty := c.sessionDirty.Swap(false)
@@ -3085,7 +3110,14 @@ func (c *pgConn) ResetSession(ctx context.Context) error {
 // dropped there and then, so a transaction left open does not sit in the pool
 // holding its locks until the next caller. ResetSession checks the same.
 func (c *pgConn) IsValid() bool {
-	return !c.closed.Load() && !c.inTransaction()
+	if c.closed.Load() {
+		return false
+	}
+	if c.inTransaction() {
+		warnTxDiscarded()
+		return false
+	}
+	return true
 }
 
 // Worker satisfies async.Conn.

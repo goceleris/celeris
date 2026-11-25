@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -412,5 +413,82 @@ func TestNativePoolTxPathReusesConn(t *testing.T) {
 	f.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("the Tx path opened %d conns, want 1: %v", n, f.dump())
+	}
+}
+
+// captureLog is a slog handler that records the messages it gets.
+type captureLog struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *captureLog) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureLog) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.msgs = append(h.msgs, r.Level.String()+" "+r.Message)
+	h.mu.Unlock()
+	return nil
+}
+func (h *captureLog) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureLog) WithGroup(string) slog.Handler      { return h }
+func (h *captureLog) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.msgs)
+}
+
+// database/sql gives the driver no error to return when a connection comes back
+// inside a transaction, so the discard is logged at Warn on slog's default
+// logger, with the words of ErrTxLeftOpen: the first time, then at most once a
+// minute.
+func TestTxDiscardIsLoggedOncePerMinute(t *testing.T) {
+	h := &captureLog{}
+	old := slog.Default()
+	slog.SetDefault(slog.New(h))
+	oldLast := lastTxDiscardLog.Swap(0)
+	t.Cleanup(func() {
+		slog.SetDefault(old)
+		lastTxDiscardLog.Store(oldLast)
+	})
+
+	f := newResetFake(t, false)
+	c, ctx := f.dial(t)
+	if _, err := c.ExecContext(ctx, "BEGIN", nil); err != nil {
+		t.Fatal(err)
+	}
+	if c.IsValid() {
+		t.Fatal("a conn in a transaction is valid")
+	}
+	if n := h.count(); n != 1 {
+		t.Fatalf("first discard logged %d records, want 1: %v", n, h.msgs)
+	}
+	if want := "WARN " + ErrTxLeftOpen.Error(); h.msgs[0] != want {
+		t.Fatalf("logged %q, want %q", h.msgs[0], want)
+	}
+	// Again at once, through both entry points: rate limited.
+	_ = c.IsValid()
+	if err := c.ResetSession(ctx); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("ResetSession = %v", err)
+	}
+	if n := h.count(); n != 1 {
+		t.Fatalf("a second discard within a minute logged: %d records", n)
+	}
+	// A minute later it logs again (through ResetSession this time).
+	lastTxDiscardLog.Store(time.Now().Add(-61 * time.Second).UnixNano())
+	if err := c.ResetSession(ctx); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("ResetSession = %v", err)
+	}
+	if n := h.count(); n != 2 {
+		t.Fatalf("a discard a minute later logged %d records in all, want 2", n)
+	}
+	// A conn that is idle logs nothing.
+	g := newResetFake(t, false)
+	idle, ictx := g.dial(t)
+	lastTxDiscardLog.Store(0)
+	if !idle.IsValid() || idle.ResetSession(ictx) != nil {
+		t.Fatal("an idle conn was refused")
+	}
+	if n := h.count(); n != 2 {
+		t.Fatalf("an idle conn logged: %d records", n)
 	}
 }
