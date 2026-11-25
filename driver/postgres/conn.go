@@ -2487,11 +2487,21 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 // BEGIN/COMMIT/ROLLBACK where the caller only needs the error. It skips
 // tag extraction and rows-affected parsing, saving one string allocation.
 func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
+	_, err := c.simpleExecCmd(ctx, query, false)
+	return err
+}
+
+// simpleExecCmd is simpleExecNoTag, and with wantRollback also reports whether
+// the server answered with the command tag ROLLBACK (a COMMIT of a transaction in
+// the aborted state is answered that way, with no error). The tag is compared in
+// place: no string is made, so asking costs a few bytes compared and nothing
+// else, and a caller that does not ask pays nothing.
+func (c *pgConn) simpleExecCmd(ctx context.Context, query string, wantRollback bool) (bool, error) {
 	if c.closed.Load() {
-		return ErrClosed
+		return false, ErrClosed
 	}
 	if c.useDirect && isListenOrUnlisten(query) {
-		return ErrDirectModeUnsupported
+		return false, ErrDirectModeUnsupported
 	}
 	req := acquirePgRequest()
 	req.ctx = ctx
@@ -2505,7 +2515,7 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 		if err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
-			return err
+			return false, err
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2513,20 +2523,22 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 			default:
 			}
 			err = req.err
+			rb := wantRollback && err == nil && string(req.simple.TagBytes()) == "ROLLBACK"
 			releasePgRequest(req)
 			if err != nil {
-				return err
+				return false, err
 			}
 			c.touch()
-			return nil
+			return rb, nil
 		}
 		if err = c.wait(ctx, req); err != nil {
 			releasePgRequest(req)
-			return err
+			return false, err
 		}
+		rb := wantRollback && string(req.simple.TagBytes()) == "ROLLBACK"
 		releasePgRequest(req)
 		c.touch()
-		return nil
+		return rb, nil
 	}
 
 	c.writerMu.Lock()
@@ -2536,15 +2548,16 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 	if err != nil {
 		c.failReq(req, err)
 		releasePgRequest(req)
-		return err
+		return false, err
 	}
 	if err = c.wait(ctx, req); err != nil {
 		releasePgRequest(req)
-		return err
+		return false, err
 	}
+	rb := wantRollback && string(req.simple.TagBytes()) == "ROLLBACK"
 	releasePgRequest(req)
 	c.touch()
-	return nil
+	return rb, nil
 }
 
 // extendedQuery issues Parse(stmtName) + Bind + Describe P + Execute + Sync.
