@@ -63,10 +63,10 @@ func encodingQuality(entries []aeEntry, offer string) (q float64) {
 	bestSpec := 0
 	for _, e := range entries {
 		spec := 0
-		switch {
-		case e.coding == "*" || e.coding == "*/*":
+		switch e.coding {
+		case "*", "*/*":
 			spec = 2
-		case e.coding == offer:
+		case offer:
 			spec = 6
 		}
 		if spec == 0 {
