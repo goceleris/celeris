@@ -287,6 +287,15 @@ func (p *pipeState) reset() {
 	p.failed = false
 }
 
+// newBatch starts a new batch after a failed Exec. It is reset() except that
+// strSlab keeps its contents: strings already read from the failed batch stay
+// valid until Discard or Release, as documented.
+func (p *Pipeline) newBatch() {
+	keep := p.strSlab
+	p.reset()
+	p.strSlab = keep
+}
+
 // resetRequests clears the wire buffer and the per-request state of the last
 // Exec, leaving the command list and its results alone.
 func (p *pipeState) resetRequests() {
@@ -322,10 +331,17 @@ func (p *Pipeline) Discard() {
 // reply is received. Returns the first parse/transport error; per-command
 // errors are reachable via each *Cmd.Result().
 //
-// A Pipeline runs once: a second Exec after a successful Exec returns an
-// error at once (it does not block or touch a connection); call
-// [Pipeline.Discard] to queue a new batch. An Exec that fails leaves the
-// Pipeline usable: queue the commands again and call Exec again.
+// A Pipeline runs once. After Exec returned an error, the next step depends on
+// the failure:
+//
+//	failure                                    next step
+//	no connection obtained                     Exec again: the queue is intact
+//	context deadline or cancel, dropped conn   queue the commands again, Exec
+//	a command got a server error reply         Discard first: Exec returns an
+//	                                           error at once, sends nothing
+//
+// After a successful Exec, a second Exec returns an error at once (it does not
+// block or touch a connection): Discard before queueing a new batch.
 func (p *Pipeline) Exec(ctx context.Context) error {
 	st := p.st.Load()
 	if st == nil {
@@ -543,7 +559,7 @@ func (p *pipeState) slabStr(s string) string {
 // additional addCmd calls — the underlying array may reallocate.
 func (p *pipeState) addCmd(kind cmdKind, args ...string) int {
 	if p.failed {
-		p.reset()
+		p.newBatch()
 	}
 	p.w.AppendCommand(args...)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
@@ -553,7 +569,7 @@ func (p *pipeState) addCmd(kind cmdKind, args ...string) int {
 // addCmd2 is the 2-arg fast path that avoids the variadic []string alloc.
 func (p *pipeState) addCmd2(kind cmdKind, a0, a1 string) int {
 	if p.failed {
-		p.reset()
+		p.newBatch()
 	}
 	p.w.AppendCommand2(a0, a1)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
@@ -563,7 +579,7 @@ func (p *pipeState) addCmd2(kind cmdKind, a0, a1 string) int {
 // addCmd3 is the 3-arg fast path.
 func (p *pipeState) addCmd3(kind cmdKind, a0, a1, a2 string) int {
 	if p.failed {
-		p.reset()
+		p.newBatch()
 	}
 	p.w.AppendCommand3(a0, a1, a2)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
