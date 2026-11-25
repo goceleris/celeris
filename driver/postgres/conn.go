@@ -810,6 +810,15 @@ type pgConn struct {
 	// alive across pool returns and re-prepared on miss (SQLSTATE 26000).
 	sessionDirty atomic.Bool
 
+	// txStatus is the transaction status byte of the last ReadyForQuery the
+	// server sent: 'I' idle, 'T' in a transaction, 'E' in a failed
+	// transaction; 0 before the first one (the startup's own ReadyForQuery
+	// sets it). dispatch writes it, before it hands the message to the
+	// request that the ReadyForQuery completes, so a caller that has seen its
+	// statement finish reads the status of that statement. A conn whose status
+	// is T or E is never handed to the next user (see [pgConn.inTransaction]).
+	txStatus atomic.Uint32
+
 	serverParamsMu sync.RWMutex
 	serverParams   map[string]string
 }
@@ -1434,6 +1443,18 @@ func (c *pgConn) onRecv(data []byte) {
 	c.reader.Compact()
 }
 
+// inTransaction reports whether the server's last ReadyForQuery said the session
+// is in a transaction (status 'T') or in a failed one ('E'). Such a conn is
+// released by closing it: a transaction left open would be the next user's,
+// with its uncommitted rows and locks, or its failed state (SQLSTATE 25P02). A
+// conn that has not seen a ReadyForQuery (status 0, which a conn that finished
+// its startup does not have) is not in a transaction. It is a load and two
+// comparisons, with no round trip.
+func (c *pgConn) inTransaction() bool {
+	s := c.txStatus.Load()
+	return s == 'T' || s == 'E'
+}
+
 // dispatch feeds one message into the state machine of the current head
 // request.
 func (c *pgConn) dispatch(msgType byte, payload []byte) error {
@@ -1455,6 +1476,13 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 		return nil
 	case protocol.BackendNoticeResponse, protocol.BackendNotification:
 		return nil
+	case protocol.BackendReadyForQuery:
+		// Before dispatchHead, which completes the request and wakes its
+		// caller: a caller that returns the conn right after must read this
+		// status, not the previous one.
+		if len(payload) > 0 {
+			c.txStatus.Store(uint32(payload[0]))
+		}
 	}
 
 	head := c.pinHead()
@@ -3010,14 +3038,24 @@ func (c *pgConn) Ping(ctx context.Context) error {
 // database/sql when a conn is returned to the idle pool. We send DISCARD ALL
 // so the next caller starts with a clean session (temp tables dropped,
 // cursors closed, prepared statements deallocated, GUC settings reset).
-// If the reset fails we return ErrBadConn so the pool evicts and reopens.
+// A conn that is not idle (its last ReadyForQuery said T or E: a transaction
+// left open, or failed) and a conn whose reset fails are not handed to the next
+// caller: ResetSession returns an error that matches driver.ErrBadConn (and
+// [ErrBadConn]). database/sql closes the conn and retries the acquisition only
+// on driver.ErrBadConn, and hands the conn to the caller on any other error.
+// ResetSession runs before a statement of the next caller is written, so the
+// retry is safe.
 //
 // Because server-side prepared statements are destroyed by DISCARD ALL, we
 // also reset the client-side LRU so later PrepareContext calls re-Parse
 // rather than hitting a stale cached name that the server has forgotten.
 func (c *pgConn) ResetSession(ctx context.Context) error {
 	if c.closed.Load() {
-		return ErrBadConn
+		return fmt.Errorf("%w: %w", driver.ErrBadConn, ErrBadConn)
+	}
+	if c.inTransaction() {
+		// DISCARD ALL would fail inside a transaction block and abort it.
+		return fmt.Errorf("%w: %w: connection returned inside a transaction", driver.ErrBadConn, ErrBadConn)
 	}
 	dirty := c.sessionDirty.Swap(false)
 	// Fast path: if the session is clean (only simple queries ran, no
@@ -3034,15 +3072,20 @@ func (c *pgConn) ResetSession(ctx context.Context) error {
 	cctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	if err := c.simpleExecNoTag(cctx, "DISCARD ALL"); err != nil {
-		return ErrBadConn
+		return fmt.Errorf("%w: %w: DISCARD ALL: %w", driver.ErrBadConn, ErrBadConn, err)
 	}
 	c.stmtCache.reset()
 	return nil
 }
 
 // IsValid implements driver.Validator.
+//
+// database/sql calls it when a conn is returned, before the conn goes back to
+// the idle list: a conn that is closed or in a transaction (see [pgConn.inTransaction]) is
+// dropped there and then, so a transaction left open does not sit in the pool
+// holding its locks until the next caller. ResetSession checks the same.
 func (c *pgConn) IsValid() bool {
-	return !c.closed.Load()
+	return !c.closed.Load() && !c.inTransaction()
 }
 
 // Worker satisfies async.Conn.

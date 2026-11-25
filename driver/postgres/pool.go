@@ -392,8 +392,12 @@ func (p *Pool) acquire(ctx context.Context) (*pgConn, error) {
 }
 
 // release returns c to its home worker's idle list.
+//
+// A conn whose last ReadyForQuery said it is in a transaction (T) or in a failed
+// one (E) is closed, not put back: the next caller would run inside the
+// previous caller's transaction.
 func (p *Pool) release(c *pgConn) {
-	if c.closed.Load() {
+	if c.closed.Load() || c.inTransaction() {
 		p.inner.Discard(c)
 		return
 	}
