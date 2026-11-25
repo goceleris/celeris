@@ -492,8 +492,13 @@ func decodeByteaBinary(src []byte) (driver.Value, error) {
 	return out, nil
 }
 
+// decodeByteaText reads the text form of bytea: the hex form ("\x" and hex digits,
+// bytea_output=hex, the default since PostgreSQL 9.0) or the escape form
+// (bytea_output=escape, set by a role or a database, or left in place by a
+// pooler that does not forward the startup parameter). The two cannot be
+// confused: in the escape form a backslash is written "\\", so a value never
+// starts with a single "\x".
 func decodeByteaText(src []byte) (driver.Value, error) {
-	// Text format is "\x" + hex. Support it for completeness.
 	if len(src) >= 2 && src[0] == '\\' && src[1] == 'x' {
 		hexSrc := src[2:]
 		if len(hexSrc)%2 != 0 {
@@ -513,9 +518,33 @@ func decodeByteaText(src []byte) (driver.Value, error) {
 		}
 		return out, nil
 	}
-	// Legacy "escape" format not supported.
-	return nil, fmt.Errorf("postgres/protocol: bytea non-hex text format unsupported")
+	// Escape form: a byte is itself, "\\" is a backslash, "\ooo" (three octal
+	// digits) is the byte with that value.
+	out := make([]byte, 0, len(src))
+	for i := 0; i < len(src); i++ {
+		if src[i] != '\\' {
+			out = append(out, src[i])
+			continue
+		}
+		if i+1 < len(src) && src[i+1] == '\\' {
+			out = append(out, '\\')
+			i++
+			continue
+		}
+		if i+3 >= len(src) || !isOctal(src[i+1]) || !isOctal(src[i+2]) || !isOctal(src[i+3]) {
+			return nil, fmt.Errorf("postgres/protocol: bytea escape form: bad backslash sequence at offset %d", i)
+		}
+		v := int(src[i+1]-'0')<<6 | int(src[i+2]-'0')<<3 | int(src[i+3]-'0')
+		if v > 0xff {
+			return nil, fmt.Errorf("postgres/protocol: bytea escape form: octal value out of range at offset %d", i)
+		}
+		out = append(out, byte(v))
+		i += 3
+	}
+	return out, nil
 }
+
+func isOctal(c byte) bool { return c >= '0' && c <= '7' }
 
 func fromHexNibble(c byte) (byte, error) {
 	switch {

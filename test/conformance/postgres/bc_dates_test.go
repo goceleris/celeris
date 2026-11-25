@@ -15,12 +15,8 @@ import (
 // with an argument: binary result columns), and requires the same value from
 // both.
 //
-// The extended read of timestamp and timestamptz is not checked here: the
-// binary timestamp decoder multiplies microseconds by time.Microsecond into a
-// time.Duration, which overflows int64 outside 1708..2292, so every such value
-// (BC or AD, e.g. year 3000) comes back wrong over the extended protocol. That
-// is a separate bug that this change does not touch (it is listed in the PR
-// description).
+// The extended read of timestamp and timestamptz over the whole range, BC
+// included, is checked in TestTimestampFullRange (timestamp_range_test.go).
 //
 // PostgreSQL prints such a value as "YYYY-MM-DD BC" (and "... HH:MM:SS[.f][+tz] BC"
 // for timestamps) with the year counted from 1 BC. Go's time package uses

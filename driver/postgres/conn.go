@@ -782,9 +782,10 @@ type pgConn struct {
 	closeOnce sync.Once
 	closeErr  atomic.Value // error
 	closed    atomic.Bool
-	// closeWG tracks background goroutines spawned by the conn
-	// (dropPreparedAsync, etc.) so Close can join them and we don't
-	// leak Gs that outlive the conn.
+	// closeWG tracks background goroutines a conn may start, so Close can
+	// join them and none outlives the conn. None starts one today (an evicted
+	// statement is dropped on the caller's goroutine, see dropPreparedAsync);
+	// it stays for the next one.
 	closeWG sync.WaitGroup
 
 	// fdReleased marks the release of fd's number. The event loop's
@@ -943,6 +944,31 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 	if c.directBuf == nil {
 		c.directBuf = make([]byte, 16<<10)
 	}
+	// A direct conn waits in a socket read that does not look at the context.
+	// A context with a deadline is enforced through the socket's read deadline:
+	// it is set to the context's deadline for this statement and cleared when
+	// the statement ends. Nothing is registered with the context (no
+	// context.AfterFunc, no goroutine, whatever the context type): a context
+	// without a deadline (Background, the HTTP/1 and HTTP/2 request contexts, a
+	// cancel-only context) costs one Deadline() call and a branch, and a
+	// statement under it returns when the server answers, as in v1.5.11 (it
+	// does not wake the read; ctx.Err() below is looked at each time a read
+	// returns, so a context cancelled before the reply is complete cancels the
+	// statement when a partial reply arrives, as in v1.5.11). A
+	// timeout is recognised by the clock against the context's deadline, not by
+	// ctx.Err(), which a timer context may not have set yet. The startup is
+	// bounded by startupBound and is left alone.
+	dl, hasDL := ctx.Deadline()
+	if hasDL && req.kind != reqStartup {
+		_ = c.tcp.SetReadDeadline(dl)
+		defer func() {
+			if !c.closed.Load() {
+				_ = c.tcp.SetReadDeadline(time.Time{})
+			}
+		}()
+	} else {
+		hasDL = false
+	}
 	for {
 		if req.doneAtom.Load() != 0 {
 			select {
@@ -952,25 +978,7 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return req.err
 		}
 		if err := ctx.Err(); err != nil {
-			if c.pid != 0 && c.secret != 0 {
-				_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
-			}
-			// Bounded wait for the server's Error + RFQ response so we
-			// leave the wire aligned. If the server doesn't drain within
-			// 30s we fail the conn to prevent a stuck reader.
-			deadline := time.Now().Add(30 * time.Second)
-			_ = c.tcp.SetReadDeadline(deadline)
-			for req.doneAtom.Load() == 0 {
-				n, rerr := c.tcp.Read(c.directBuf)
-				if n > 0 {
-					c.onRecv(c.directBuf[:n])
-				}
-				if rerr != nil {
-					break
-				}
-			}
-			_ = c.tcp.SetReadDeadline(time.Time{})
-			return err
+			return c.cancelDrainDirect(req, err)
 		}
 		if c.tcpFd > 0 {
 			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.directBuf, msgDontWait); n > 0 {
@@ -990,6 +998,18 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			c.onRecv(c.directBuf[:n])
 		}
 		if err != nil {
+			if hasDL && errors.Is(err, os.ErrDeadlineExceeded) && (ctx.Err() != nil || !time.Now().Before(dl)) {
+				// The context's deadline (nothing else sets a read deadline while
+				// this one is armed; the clock test is the check for a context whose
+				// Err is not set yet, and ctx.Err() covers a wall-clock step
+				// backwards under a deadline without a monotonic reading): the
+				// statement is cancelled and the caller gets the context's error.
+				cerr := ctx.Err()
+				if cerr == nil {
+					cerr = context.DeadlineExceeded
+				}
+				return c.cancelDrainDirect(req, cerr)
+			}
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
 			}
@@ -998,6 +1018,43 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return err
 		}
 	}
+}
+
+// cancelDrainDirect is driveDirect's reaction to a context that ended while the
+// statement ran: the cancel exchange (#1373), then a bounded wait for the
+// cancelled statement's Error + ReadyForQuery so the wire stays aligned, and err
+// (the context's error) to the caller. A conn whose cancel exchange did not
+// finish, or whose drain ended without the reply, is failed: it is discarded.
+func (c *pgConn) cancelDrainDirect(req *pgRequest, err error) error {
+	// Returns once the cancel exchange finished; a conn whose exchange did not
+	// is failed (discarded), nothing to drain.
+	if !c.cancelRunning() {
+		return err
+	}
+	// Bounded wait for the server's Error + RFQ response so we leave the wire
+	// aligned. If the server doesn't drain within cancelDrainTimeout we fail the
+	// conn to prevent a stuck reader.
+	_ = c.tcp.SetReadDeadline(time.Now().Add(cancelDrainTimeout))
+	for req.doneAtom.Load() == 0 {
+		n, rerr := c.tcp.Read(c.directBuf)
+		if n > 0 {
+			c.onRecv(c.directBuf[:n])
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	if req.doneAtom.Load() == 0 {
+		// The drain ended without the reply (deadline or EOF): the request is
+		// still pending, and a conn put back into the pool would hand the late
+		// reply to the next statement. Fail it, as wait and
+		// awaitDirectWithCancel do.
+		c.failAll(errors.New("celeris-postgres: cancel timeout draining direct-mode req"))
+		_ = c.closeDirect()
+		return err
+	}
+	_ = c.tcp.SetReadDeadline(time.Time{})
+	return err
 }
 
 // closeDirect tears down the direct-mode tcp connection exactly once.
@@ -1381,8 +1438,8 @@ func (c *pgConn) wait(ctx context.Context, req *pgRequest) error {
 	case <-req.doneCh:
 		return req.err
 	case <-ctx.Done():
-		if c.pid != 0 && c.secret != 0 {
-			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
+		if !c.cancelRunning() {
+			return ctx.Err()
 		}
 		// Wait for the server to drain the query response (Error + RFQ),
 		// but bound the wait so a network partition cannot block forever.
@@ -1534,6 +1591,12 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		// simple-query branch.
 		done, err := head.extended.Handle(msgType, payload, head)
 		if err != nil {
+			// A server error after some rows: those rows are returned with
+			// the error, and they need the column description of the
+			// Describe response (it is on extended.Columns until the done
+			// branch copies it), or an unnamed statement's cells reach
+			// Scan with no OID: raw wire bytes into a string.
+			head.setResultIfLive("", head.extended.Columns)
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
 				head.closeRowCh()
@@ -2114,13 +2177,22 @@ func hasPrefixFold(s, prefix string) bool {
 	return true
 }
 
-// dropPreparedAsync fires a best-effort Close('S') for an evicted
-// prepared statement. Fire-and-forget to not block the caller, but
-// bound by:
-//   - a 5s timeout (so a stuck TCP write doesn't hold the G forever)
-//   - the conn's closed flag (on Close, the G observes and bails)
-//   - the conn's closeWG (Close waits so the G doesn't outlive
-//     the conn's logical lifetime)
+// dropPreparedAsync drops an evicted prepared statement on the server with a
+// protocol-level Close('S') + Sync, written on the caller's goroutine ahead of
+// the query that caused the eviction. The caller holds the conn and is the only
+// goroutine that may drive it: a goroutine of its own issuing a request on the
+// same conn raced the caller's next request (in direct mode both read the
+// socket and the caller could block in Read for ever once the other reader
+// consumed its reply; on the event loop both enqueued and wrote, and replies
+// went to the wrong request: "unexpected CommandComplete in extended query").
+//
+// Nothing waits for the reply: it is read, in order, by the next read of the
+// conn, before the evicting query's own reply, so there is no extra round trip,
+// no context and no cancel request. A Close of a statement the server no longer
+// has (DEALLOCATE ALL or DISCARD ALL ran, a pooler renamed it) is not an error
+// to Postgres, so it never aborts an open transaction, which an SQL DEALLOCATE
+// of the same name would. Errors are ignored (the name is minted by the driver
+// and the statement is unreachable once it left the cache).
 func (c *pgConn) dropPreparedAsync(prep *protocol.PreparedStmt) {
 	if prep == nil || prep.Name == "" {
 		return
@@ -2128,16 +2200,7 @@ func (c *pgConn) dropPreparedAsync(prep *protocol.PreparedStmt) {
 	if c.closed.Load() {
 		return
 	}
-	c.closeWG.Add(1)
-	go func() {
-		defer c.closeWG.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if c.closed.Load() {
-			return
-		}
-		_ = c.simpleExecNoTag(ctx, "DEALLOCATE "+prep.Name)
-	}()
+	_ = c.closePreparedServerAsync(prep.Name)
 }
 
 // simpleQuery runs a no-arg Query via the simple protocol.
@@ -2315,12 +2378,14 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		// Buffered fast path — no channel was ever allocated.
 		return acquirePGRows(req.columns, req.rows, textFormat, req, nil), nil
 	case <-ctx.Done():
-		if c.pid != 0 && c.secret != 0 {
-			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
-		}
+		confirmed := c.cancelRunning()
+		// A conn that cancelRunning failed completes req at once (failAll).
 		<-req.doneCh
 		reqErr := req.err
 		releasePgRequest(req)
+		if !confirmed {
+			return nil, ctx.Err()
+		}
 		if reqErr != nil {
 			return nil, reqErr
 		}
@@ -2941,9 +3006,9 @@ func (c *pgConn) Close() error {
 			c.closeLoop()
 		}
 	})
-	// Join any background goroutines (dropPreparedAsync) spawned by
-	// this conn. Safe outside closeOnce because closeWG.Wait() on
-	// a zero WaitGroup returns immediately.
+	// Join any background goroutines the conn started (none today, see
+	// closeWG). Safe outside closeOnce because closeWG.Wait() on a zero
+	// WaitGroup returns immediately.
 	c.closeWG.Wait()
 	// Release the number only now: a background goroutine that lost the
 	// race with Close may have written by number until Wait returned.
@@ -3197,11 +3262,9 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 		return 0, errors.New("celeris-postgres: COPY FROM ended before CopyInResponse")
 	case <-ctx.Done():
-		if c.pid != 0 && c.secret != 0 {
-			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
-		}
+		confirmed := c.cancelRunning()
 		<-req.doneCh
-		if req.err != nil {
+		if confirmed && req.err != nil {
 			return 0, req.err
 		}
 		return 0, ctx.Err()
@@ -3281,8 +3344,8 @@ func (c *pgConn) awaitDirectWithCancel(ctx context.Context, req *pgRequest) erro
 	case <-req.doneCh:
 		return req.err
 	case <-ctx.Done():
-		if c.pid != 0 && c.secret != 0 {
-			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
+		if !c.cancelRunning() {
+			return ctx.Err()
 		}
 		// Wait for the reader goroutine to observe Error+RFQ and
 		// complete req. Bounded so a wedged server can't pin the

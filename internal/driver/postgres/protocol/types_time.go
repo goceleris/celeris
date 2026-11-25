@@ -11,8 +11,60 @@ import (
 	"time"
 )
 
-// pgEpoch is the PostgreSQL date/time origin: 2000-01-01 00:00:00 UTC.
-var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+// pgEpochUnix is the PostgreSQL date/time origin, 2000-01-01 00:00:00 UTC, as
+// Unix seconds.
+const pgEpochUnix = 946684800
+
+// The binary date and timestamp values are plain integers (days, or
+// microseconds, since the origin) and cover PostgreSQL's whole range, 4714 BC
+// to 294276 AD. A time.Duration cannot hold that: it is an int64 count of
+// nanoseconds and spans only about 292 years either side of the origin, so
+// converting through Duration (Duration(micros)*Microsecond, or t.Sub(origin),
+// which saturates) silently yields a wrong value outside roughly 1708..2292.
+// Everything below therefore works in seconds and a sub-second remainder and
+// builds the time.Time with time.Unix.
+
+const (
+	microsPerSecond = 1_000_000
+	secondsPerDay   = 86400
+	pgEpochDays     = pgEpochUnix / secondsPerDay // 10957 days from 1970-01-01 to 2000-01-01
+
+	// The wire sentinels for infinity use the extreme integers, so a finite
+	// value the encoder produces must stay strictly inside them. maxSecsFromOrigin
+	// and minSecsFromOrigin bound the seconds from the origin that
+	// still convert to int64 microseconds, with a second of margin for the
+	// microsecond remainder.
+	maxSecsFromOrigin = math.MaxInt64/microsPerSecond - 1
+	minSecsFromOrigin = math.MinInt64/microsPerSecond + 1
+)
+
+// timeFromPGMicros converts microseconds since the PostgreSQL origin into a UTC
+// time.Time. The split uses floor division, so a negative value (before the
+// origin) gets a non-negative microsecond remainder.
+func timeFromPGMicros(micros int64) time.Time {
+	sec := micros / microsPerSecond
+	rem := micros % microsPerSecond
+	if rem < 0 {
+		rem += microsPerSecond
+		sec--
+	}
+	return time.Unix(pgEpochUnix+sec, rem*1000).UTC()
+}
+
+// pgMicrosFromTime is the inverse of timeFromPGMicros: microseconds since the
+// PostgreSQL origin, truncated (floored) to a whole microsecond. It reports an
+// error for an instant whose value does not fit in the wire's int64 instead of
+// wrapping or saturating.
+func pgMicrosFromTime(t time.Time) (int64, error) {
+	u := t.Unix()
+	if u < pgEpochUnix+minSecsFromOrigin || u > pgEpochUnix+maxSecsFromOrigin {
+		return 0, fmt.Errorf("postgres/protocol: encode timestamp: %v is outside PostgreSQL's range", t)
+	}
+	// t.Nanosecond() is in [0, 1e9) for every time.Time, including those before
+	// the Unix epoch, so dividing it truncates toward the earlier microsecond:
+	// already the floor.
+	return (u-pgEpochUnix)*microsPerSecond + int64(t.Nanosecond())/1000, nil
+}
 
 // PGInfinity and PGNegInfinity are sentinel time.Time values returned when
 // PostgreSQL sends infinity/−infinity for timestamp or date columns. Callers
@@ -85,7 +137,7 @@ func decodeDateBinary(src []byte) (driver.Value, error) {
 	case pgDateNegInfinity:
 		return PGNegInfinity, nil
 	}
-	return pgEpoch.AddDate(0, 0, int(days)), nil
+	return time.Unix((int64(days)+pgEpochDays)*secondsPerDay, 0).UTC(), nil
 }
 
 func decodeDateText(src []byte) (driver.Value, error) {
@@ -123,27 +175,24 @@ func encodeDateBinary(dst []byte, v any) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("postgres/protocol: encode date: unsupported %T", v)
 	}
-	// Truncate to UTC midnight before computing the day delta so we don't
-	// round to the "wrong" day for values in non-UTC zones.
+	// Use the UTC calendar day: truncate to UTC midnight so a value in a
+	// non-UTC zone, or with a time of day, does not move the day.
 	t = t.UTC()
 	y, m, d := t.Date()
-	t = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
-	// Go's integer division truncates toward zero — for negative deltas
-	// (dates before pgEpoch = 2000-01-01 UTC) with a non-zero remainder that
-	// produces the mathematically-wrong result. We already truncate t to
-	// UTC midnight above so the remainder SHOULD be zero, but we apply the
-	// floor correction defensively in case a future refactor feeds in a
-	// sub-day offset. int64 → int32 truncation is safe: the int32 range of
-	// days covers roughly ±5.8M years, which dwarfs any representable
-	// time.Time.
-	delta := t.Sub(pgEpoch)
-	day := 24 * time.Hour
-	days := int64(delta / day)
-	if rem := delta % day; rem < 0 {
+	u := time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix()
+	// u is an exact multiple of a day; the floor division is defensive only.
+	days := u / secondsPerDay
+	if u%secondsPerDay < 0 {
 		days--
 	}
-	u := uint32(int32(days))
-	return append(dst, byte(u>>24), byte(u>>16), byte(u>>8), byte(u)), nil
+	days -= pgEpochDays
+	// The int32 day count reaches about +-5.8 million years; the extreme
+	// values are the infinity sentinels, so keep clear of them.
+	if days <= int64(pgDateNegInfinity) || days >= int64(pgDateInfinity) {
+		return nil, fmt.Errorf("postgres/protocol: encode date: %v is outside PostgreSQL's range", t)
+	}
+	w := uint32(int32(days))
+	return append(dst, byte(w>>24), byte(w>>16), byte(w>>8), byte(w)), nil
 }
 
 func encodeDateText(dst []byte, v any) ([]byte, error) {
@@ -175,7 +224,7 @@ func decodeTimestampBinary(src []byte) (driver.Value, error) {
 	case pgTimestampNegInfinity:
 		return PGNegInfinity, nil
 	}
-	return pgEpoch.Add(time.Duration(micros) * time.Microsecond), nil
+	return timeFromPGMicros(micros), nil
 }
 
 func decodeTimestampText(src []byte) (driver.Value, error) {
@@ -230,6 +279,9 @@ func decodeTimestamptzText(src []byte) (driver.Value, error) {
 		"2006-01-02 15:04:05Z07:00",
 		"2006-01-02 15:04:05.999999-07",
 		"2006-01-02 15:04:05-07",
+		// An offset with seconds (Europe/Amsterdam before 1937 is +00:19:32).
+		"2006-01-02 15:04:05.999999Z07:00:00",
+		"2006-01-02 15:04:05Z07:00:00",
 	} {
 		if t, err := time.Parse(layout, body); err == nil {
 			t = t.UTC()
@@ -251,10 +303,9 @@ func encodeTimestampBinary(dst []byte, v any) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("postgres/protocol: encode timestamp: unsupported %T", v)
 	}
-	d := t.UTC().Sub(pgEpoch)
-	micros := int64(d / time.Microsecond)
-	if d < 0 && d%time.Microsecond != 0 {
-		micros--
+	micros, err := pgMicrosFromTime(t)
+	if err != nil {
+		return nil, err
 	}
 	u := uint64(micros)
 	return append(dst, byte(u>>56), byte(u>>48), byte(u>>40), byte(u>>32),
