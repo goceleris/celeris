@@ -953,13 +953,15 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return req.err
 		}
 		if err := ctx.Err(); err != nil {
-			if c.pid != 0 && c.secret != 0 {
-				_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
+			// Returns once the cancel exchange finished; a conn whose
+			// exchange did not is failed (discarded), nothing to drain.
+			if !c.cancelRunning() {
+				return err
 			}
 			// Bounded wait for the server's Error + RFQ response so we
 			// leave the wire aligned. If the server doesn't drain within
 			// 30s we fail the conn to prevent a stuck reader.
-			deadline := time.Now().Add(30 * time.Second)
+			deadline := time.Now().Add(cancelDrainTimeout)
 			_ = c.tcp.SetReadDeadline(deadline)
 			for req.doneAtom.Load() == 0 {
 				n, rerr := c.tcp.Read(c.directBuf)
@@ -969,6 +971,15 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 				if rerr != nil {
 					break
 				}
+			}
+			if req.doneAtom.Load() == 0 {
+				// The drain ended without the reply (deadline or EOF): the request is
+				// still pending, and a conn put back into the pool would hand the late
+				// reply to the next statement. Fail it, as wait and
+				// awaitDirectWithCancel do.
+				c.failAll(errors.New("celeris-postgres: cancel timeout draining direct-mode req"))
+				_ = c.closeDirect()
+				return err
 			}
 			_ = c.tcp.SetReadDeadline(time.Time{})
 			return err
@@ -1382,8 +1393,8 @@ func (c *pgConn) wait(ctx context.Context, req *pgRequest) error {
 	case <-req.doneCh:
 		return req.err
 	case <-ctx.Done():
-		if c.pid != 0 && c.secret != 0 {
-			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
+		if !c.cancelRunning() {
+			return ctx.Err()
 		}
 		// Wait for the server to drain the query response (Error + RFQ),
 		// but bound the wait so a network partition cannot block forever.
@@ -2322,12 +2333,14 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		// Buffered fast path — no channel was ever allocated.
 		return acquirePGRows(req.columns, req.rows, textFormat, req, nil), nil
 	case <-ctx.Done():
-		if c.pid != 0 && c.secret != 0 {
-			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
-		}
+		confirmed := c.cancelRunning()
+		// A conn that cancelRunning failed completes req at once (failAll).
 		<-req.doneCh
 		reqErr := req.err
 		releasePgRequest(req)
+		if !confirmed {
+			return nil, ctx.Err()
+		}
 		if reqErr != nil {
 			return nil, reqErr
 		}
@@ -3115,8 +3128,25 @@ func (c *pgConn) ServerParam(name string) string {
 	return c.serverParams[name]
 }
 
-// CheckNamedValue lets us accept any Go type and let encodeOne deal with it.
-func (c *pgConn) CheckNamedValue(_ *driver.NamedValue) error {
+// CheckNamedValue implements driver.NamedValueChecker. Because the conn
+// implements it, database/sql does not convert arguments itself, so the
+// conversion database/sql would normally do has to happen here: the kinds
+// encodeOne handles are passed through untouched (no allocation, no
+// reflection), everything else (driver.Valuer, sql.Null*, defined types such
+// as "type MyInt int", pointers, int8/int16/uint*) goes through
+// driver.DefaultParameterConverter. An argument it cannot convert (a struct,
+// a slice, a uint64 with the high bit set) is rejected here with a typed
+// error.
+func (c *pgConn) CheckNamedValue(nv *driver.NamedValue) error {
+	switch nv.Value.(type) {
+	case nil, bool, int, int32, int64, float32, float64, string, []byte, time.Time:
+		return nil
+	}
+	v, err := driver.DefaultParameterConverter.ConvertValue(nv.Value)
+	if err != nil {
+		return err
+	}
+	nv.Value = v
 	return nil
 }
 
@@ -3174,11 +3204,9 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 		return 0, errors.New("celeris-postgres: COPY FROM ended before CopyInResponse")
 	case <-ctx.Done():
-		if c.pid != 0 && c.secret != 0 {
-			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
-		}
+		confirmed := c.cancelRunning()
 		<-req.doneCh
-		if req.err != nil {
+		if confirmed && req.err != nil {
 			return 0, req.err
 		}
 		return 0, ctx.Err()
@@ -3258,8 +3286,8 @@ func (c *pgConn) awaitDirectWithCancel(ctx context.Context, req *pgRequest) erro
 	case <-req.doneCh:
 		return req.err
 	case <-ctx.Done():
-		if c.pid != 0 && c.secret != 0 {
-			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
+		if !c.cancelRunning() {
+			return ctx.Err()
 		}
 		// Wait for the reader goroutine to observe Error+RFQ and
 		// complete req. Bounded so a wedged server can't pin the

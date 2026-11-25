@@ -8,8 +8,8 @@ import (
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
 
-// A binary-only type with no codec never reaches *string / *[]byte as raw wire
-// bytes: it is an error naming the type. *any keeps the raw bytes (v1.5.11), a
+// A binary-only type with no codec never reaches a *string as raw wire bytes: it
+// is an error naming the type. *[]byte and *any keep the wire bytes (v1.5.11), a
 // type that is not listed (an enum's binary form is its text) is left alone,
 // and the simple protocol's text is the value.
 func TestScanRawBinaryOnlyTypeIntoString(t *testing.T) {
@@ -24,8 +24,8 @@ func TestScanRawBinaryOnlyTypeIntoString(t *testing.T) {
 			t.Errorf("oid %d into *string: got %q err %v, want an error naming %q and ::text", oid, s, err, binaryOnlyTypes[oid])
 		}
 		var b []byte
-		if err := scanRaw(&b, interval, nil, binaryCol(oid), false); err == nil || b != nil {
-			t.Errorf("oid %d into *[]byte: got %q err %v, want an error", oid, b, err)
+		if err := scanRaw(&b, interval, nil, binaryCol(oid), false); err != nil || len(b) != 16 {
+			t.Errorf("oid %d into *[]byte: got %q err %v, want the wire bytes (as v1.5.11)", oid, b, err)
 		}
 		var a any
 		if err := scanRaw(&a, interval, nil, binaryCol(oid), false); err != nil {

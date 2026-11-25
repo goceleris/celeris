@@ -60,13 +60,17 @@ func TestDecodeArrayBinaryValue_MultiDimensionalIsAnError(t *testing.T) {
 }
 
 // A lower bound other than 1 ('[0:2]={1,2,3}') is lost the same way.
-func TestDecodeArrayBinaryValue_LowerBoundIsAnError(t *testing.T) {
+// An array with a lower bound other than 1 ('[0:2]={1,2,3}'::int4[]) keeps its
+// elements, as in v1.5.11: the lost bound is not a flattened array. Only a
+// multi-dimensional array is an error.
+func TestDecodeArrayBinaryValue_LowerBoundKeepsTheElements(t *testing.T) {
 	got, err := decodeArrayBinaryValue(binArray([]int32{3}, []int32{0}, []int32{1, 2, 3}))
-	if err == nil {
-		t.Fatalf("got %#v and no error", got)
+	if err != nil {
+		t.Fatalf("array with lower bound 0: %v", err)
 	}
-	if !strings.Contains(err.Error(), "lower bound") {
-		t.Fatalf("error does not say why: %v", err)
+	want := []driver.Value{int64(1), int64(2), int64(3)}
+	if !reflect.DeepEqual(got, driver.Value(want)) {
+		t.Fatalf("got %#v, want %#v", got, want)
 	}
 }
 

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -92,8 +94,10 @@ func TestScanRawJSONFamilyTextForm(t *testing.T) {
 			text := tc.format == protocol.FormatText
 
 			var b []byte
-			if err := scanRaw(&b, tc.raw, codec, col, text); err != nil || string(b) != tc.want {
-				t.Errorf("*[]byte: got %q err %v, want %q", b, err, tc.want)
+			// *[]byte is the value's wire bytes, exactly as v1.5.11 (scan into a
+			// string for text).
+			if err := scanRaw(&b, tc.raw, codec, col, text); err != nil || string(b) != string(tc.raw) {
+				t.Errorf("*[]byte: got %q err %v, want the wire bytes %q", b, err, tc.raw)
 			}
 			var s string
 			if err := scanRaw(&s, tc.raw, codec, col, text); err != nil || s != tc.want {
@@ -230,8 +234,8 @@ func TestScanRawNullClearsDest(t *testing.T) {
 	}
 }
 
-// Times scanned into string / []byte take the RFC 3339 form database/sql
-// uses, not Go's "%v" form and not an error.
+// Times scanned into a string take the RFC 3339 form database/sql uses, not
+// Go's "%v" form; a []byte gets the wire bytes, as in v1.5.11.
 func TestScanRawTimesAsRFC3339(t *testing.T) {
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 123456000, time.UTC)
 	for _, tc := range []struct {
@@ -256,8 +260,8 @@ func TestScanRawTimesAsRFC3339(t *testing.T) {
 				t.Errorf("*string: got %q err %v, want %q", s, err, tc.want)
 			}
 			var b []byte
-			if err := scanRaw(&b, raw, codec, col, false); err != nil || string(b) != tc.want {
-				t.Errorf("*[]byte: got %q err %v, want %q", b, err, tc.want)
+			if err := scanRaw(&b, raw, codec, col, false); err != nil || string(b) != string(raw) {
+				t.Errorf("*[]byte: got %q err %v, want the wire bytes %q (as v1.5.11)", b, err, raw)
 			}
 		})
 	}
@@ -265,7 +269,7 @@ func TestScanRawTimesAsRFC3339(t *testing.T) {
 
 // Arrays decode to []driver.Value; scanning one into a string must fail
 // loudly (as database/sql does) instead of formatting Go's "%v" of the
-// element bytes ("[[123 34 97 ...]]").
+// element bytes ("[[123 34 97 ...]]"). A []byte gets the wire bytes, as in v1.5.11.
 func TestScanRawArrayIntoStringErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -286,8 +290,8 @@ func TestScanRawArrayIntoStringErrors(t *testing.T) {
 				t.Errorf("*string: got %q, want an error", s)
 			}
 			var b []byte
-			if err := scanRaw(&b, raw, codec, col, false); err == nil {
-				t.Errorf("*[]byte: got %q, want an error", b)
+			if err := scanRaw(&b, raw, codec, col, false); err != nil || string(b) != string(raw) {
+				t.Errorf("*[]byte: got %q err %v, want the wire bytes (as v1.5.11)", b, err)
 			}
 			var a any
 			if err := scanRaw(&a, raw, codec, col, false); err != nil {
@@ -297,27 +301,40 @@ func TestScanRawArrayIntoStringErrors(t *testing.T) {
 	}
 }
 
-// A time.Time that reaches convertAssign is a value, never a marker: the
-// PGInfinity date is also a real instant (9999-12-31 23:59:59), so it must
-// format like any other time. The server's own text for infinity is read from
-// the wire value in scanRaw, see TestScanRawInfinityIntoString.
+// A time.Time never reads as the text "infinity": the PGInfinity date is also a
+// real instant (9999-12-31 23:59:59). convertAssign formats it as v1.5.11 did
+// (fmt's %v), which a streamed row still uses; the buffered raw path formats a
+// date or timestamp into a string as RFC3339Nano (as database/sql does), see
+// TestScanRawTimeIntoStringIsRFC3339Nano. The server's own text for infinity is
+// read from the wire value in scanRaw, see TestScanRawInfinityIntoString.
 func TestConvertAssignTimeIsNeverInfinityText(t *testing.T) {
 	for _, c := range []struct {
 		in   time.Time
 		want string
 	}{
-		{PGInfinity, "9999-12-31T23:59:59Z"},
-		{PGNegInfinity, "-4713-01-01T00:00:00Z"},
-		{time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), "2026-01-02T03:04:05Z"},
+		{PGInfinity, "9999-12-31 23:59:59 +0000 UTC"},
+		{PGNegInfinity, "-4713-01-01 00:00:00 +0000 UTC"},
+		{time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), "2026-01-02 03:04:05 +0000 UTC"},
 	} {
 		var s string
 		if err := convertAssign(&s, c.in); err != nil || s != c.want {
 			t.Errorf("*string from %v: got %q err %v, want %q", c.in, s, err, c.want)
 		}
-		var b []byte
-		if err := convertAssign(&b, c.in); err != nil || string(b) != c.want {
-			t.Errorf("*[]byte from %v: got %q err %v, want %q", c.in, b, err, c.want)
-		}
+	}
+}
+
+// A buffered date, timestamp or timestamptz into *string is RFC3339Nano, a real
+// 9999-12-31 23:59:59 included.
+func TestScanRawTimeIntoStringIsRFC3339Nano(t *testing.T) {
+	micros := func(tm time.Time) []byte {
+		return binary.BigEndian.AppendUint64(nil, uint64(tm.Sub(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))/time.Microsecond))
+	}
+	codec := protocol.LookupOID(protocol.OIDTimestamptz)
+	col := protocol.ColumnDesc{TypeOID: protocol.OIDTimestamptz, FormatCode: protocol.FormatBinary}
+	tm := time.Date(2026, 1, 2, 3, 4, 5, 6000, time.UTC)
+	var s string
+	if err := scanRaw(&s, micros(tm), codec, col, false); err != nil || s != "2026-01-02T03:04:05.000006Z" {
+		t.Errorf("*string: got %q err %v", s, err)
 	}
 }
 
@@ -362,8 +379,8 @@ func TestScanRawInfinityIntoString(t *testing.T) {
 					t.Errorf("*string: got %q err %v, want %q", s, err, c.want)
 				}
 				var b []byte
-				if err := scanRaw(&b, f.raw, codec, col, f.text); err != nil || string(b) != c.want {
-					t.Errorf("*[]byte: got %q err %v, want %q", b, err, c.want)
+				if err := scanRaw(&b, f.raw, codec, col, f.text); err != nil || string(b) != string(f.raw) {
+					t.Errorf("*[]byte: got %q err %v, want the raw cell %q (as v1.5.11)", b, err, f.raw)
 				}
 				var tm time.Time
 				if err := scanRaw(&tm, f.raw, codec, col, f.text); err != nil || !tm.Equal(c.wantT) {
@@ -386,5 +403,38 @@ func TestScanRawInfinityIntoString(t *testing.T) {
 	col := protocol.ColumnDesc{TypeOID: protocol.OIDTimestamp, FormatCode: protocol.FormatBinary}
 	if err := scanRaw(&s, i64(math.MaxInt64-1), codec, col, false); err == nil && s == "infinity" {
 		t.Errorf("MaxInt64-1 read as infinity")
+	}
+}
+
+// float4 and float8 into *string use Go's shortest round-trip form: every such
+// string parses back to the identical float (for float4, the widened float32).
+// It is not the server's text ('1234567' reads '1.234567e+06'), which a release
+// note says.
+func TestScanRawFloatIntoStringParsesBack(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	col8 := protocol.ColumnDesc{TypeOID: protocol.OIDFloat8, FormatCode: protocol.FormatBinary}
+	col4 := protocol.ColumnDesc{TypeOID: protocol.OIDFloat4, FormatCode: protocol.FormatBinary}
+	c8, c4 := protocol.LookupOID(protocol.OIDFloat8), protocol.LookupOID(protocol.OIDFloat4)
+	for i := 0; i < 200000; i++ {
+		bits := rng.Uint64()
+		f := math.Float64frombits(bits)
+		var s string
+		if err := scanRaw(&s, binary.BigEndian.AppendUint64(nil, bits), c8, col8, false); err != nil {
+			t.Fatal(err)
+		}
+		got, err := strconv.ParseFloat(s, 64)
+		if err != nil || (math.Float64bits(got) != bits && !(math.IsNaN(f) && math.IsNaN(got))) {
+			t.Fatalf("float8 %x: %q parses back to %x (%v)", bits, s, math.Float64bits(got), err)
+		}
+		b32 := rng.Uint32()
+		f32 := math.Float32frombits(b32)
+		if err := scanRaw(&s, binary.BigEndian.AppendUint32(nil, b32), c4, col4, false); err != nil {
+			t.Fatal(err)
+		}
+		got, err = strconv.ParseFloat(s, 64)
+		want := float64(f32)
+		if err != nil || (got != want && !(math.IsNaN(want) && math.IsNaN(got))) {
+			t.Fatalf("float4 %x: %q parses back to %v, want %v (%v)", b32, s, got, want, err)
+		}
 	}
 }

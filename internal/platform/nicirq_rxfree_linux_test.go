@@ -4,10 +4,12 @@ package platform
 
 import (
 	"bytes"
+	"io"
 	"log/slog"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // celeris#1036 item 1: what the NIC interrupt report means once the rx-port
@@ -34,11 +36,38 @@ func reportOnSnapshot(t *testing.T, h *nicHost, workers int, explicit bool, allo
 	return plan, got
 }
 
+// testLog is the logger the report tests read: a text handler at level that
+// leaves out the time=... attribute. The wall clock is not part of what a test
+// asserts, and its digits (the milliseconds of a record can read 135) would
+// match an IRQ number a test looks for.
+func testLog(w io.Writer, level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level, ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}}))
+}
+
 // logLines returns what LogPinOutcome logs for a plan, at Debug, one entry per
 // line.
 func logLines(plan CPUPlan) []string {
 	var buf bytes.Buffer
-	LogPinOutcome(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), "epoll", plan, nil)
+	LogPinOutcome(testLog(&buf, slog.LevelDebug), "epoll", plan, nil)
+	return strings.Split(strings.TrimSpace(buf.String()), "\n")
+}
+
+// stampedLogLines is logLines with every record stamped at a fixed time, so a
+// test can choose the digits the handler's time=... attribute carries.
+func stampedLogLines(plan CPUPlan, stamp time.Time) []string {
+	var buf bytes.Buffer
+	h := slog.NewTextHandler(io.Writer(&buf), &slog.HandlerOptions{Level: slog.LevelDebug, ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.TimeKey {
+			return slog.Time(slog.TimeKey, stamp)
+		}
+		return a
+	}})
+	LogPinOutcome(slog.New(h), "epoll", plan, nil)
 	return strings.Split(strings.TrimSpace(buf.String()), "\n")
 }
 
@@ -438,6 +467,34 @@ func TestReportWrappedCounterGaps(t *testing.T) {
 // 127, not in the count of vectors past the first four, and not in the list of
 // IRQs of the file the operator writes to.
 func TestWarnDetailLeavesOutTheVectorsTheRuleFreed(t *testing.T) {
+	checkWarnDetail(t, logLines)
+}
+
+// The same check with the record stamped at fixed times. The Warn line starts
+// with time=...; a stamp whose milliseconds read 135 or 127 (the IRQs of the
+// vectors the rule freed) must not read as the Warn naming that IRQ. A CI run
+// stamped .135Z failed the check before it was made independent of the stamp.
+func TestWarnDetailIsIndependentOfTheLogTimestamp(t *testing.T) {
+	for _, ms := range []int{135, 127, 1} {
+		t.Run(itoa(ms)+"ms", func(t *testing.T) {
+			stamp := time.Date(2026, 11, 22, 14, 56, 45, ms*int(time.Millisecond), time.UTC)
+			checkWarnDetail(t, func(p CPUPlan) []string { return stampedLogLines(p, stamp) })
+		})
+	}
+}
+
+// The report tests' logger carries no wall clock: a line a test reads has no
+// time=... for a digit string in it to be taken for an IRQ.
+func TestReportLoggerLeavesOutTheTime(t *testing.T) {
+	var buf bytes.Buffer
+	testLog(&buf, slog.LevelInfo).Warn("x", "irq", 135)
+	if got := buf.String(); strings.Contains(got, "time=") || !strings.Contains(got, "level=WARN") || !strings.Contains(got, "irq=135") {
+		t.Errorf("want a line with the level and attributes and no time: %q", got)
+	}
+}
+
+func checkWarnDetail(t *testing.T, lines func(CPUPlan) []string) {
+	t.Helper()
 	foreign := func(irq int) NICVector {
 		return NICVector{IRQ: irq, CPU: 6, Name: "enp7s0-" + itoa(irq), Dev: "enp7s0", Count: 9_000_000}
 	}
@@ -450,7 +507,7 @@ func TestWarnDetailLeavesOutTheVectorsTheRuleFreed(t *testing.T) {
 		foreign(300), foreign(301), foreign(302), foreign(303), foreign(304),
 		{IRQ: 167, CPU: 1, Name: "enp1s0-8", Dev: "enp1s0", Count: 2_600_000_000}}})
 	eq(t, "uncovered", got.IRQUncovered, []int{1, 6})
-	warns := warnLines(logLines(got))
+	warns := warnLines(lines(got))
 	if len(warns) != 1 {
 		t.Fatalf("want one Warn:\n%s", strings.Join(warns, "\n"))
 	}
@@ -461,7 +518,7 @@ func TestWarnDetailLeavesOutTheVectorsTheRuleFreed(t *testing.T) {
 			t.Errorf("Warn lacks %q:\n%s", want, w)
 		}
 	}
-	for _, bad := range []string{"IRQ 127", "enp49s0-0", "IRQ 135", "2 more", "127,", ", 127", "135"} {
+	for _, bad := range []string{"IRQ 127", "enp49s0-0", "IRQ 135", "2 more", "127,", ", 127", "135,", ", 135"} {
 		if strings.Contains(w, bad) {
 			t.Errorf("Warn names %q, a vector the rule left on CPU 6 or 8 on purpose:\n%s", bad, w)
 		}
@@ -531,7 +588,7 @@ func TestWarnOncePerLoggerAddressAndSet(t *testing.T) {
 	}
 	newLog := func() (*bytes.Buffer, *slog.Logger) {
 		var b bytes.Buffer
-		return &b, slog.New(slog.NewTextHandler(&b, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		return &b, testLog(&b, slog.LevelDebug)
 	}
 	warnings := func(b *bytes.Buffer) int { return strings.Count(b.String(), "level=WARN") }
 
@@ -565,7 +622,7 @@ func TestWarnOncePerLoggerAddressAndSet(t *testing.T) {
 // evicted by the bound warns again (the cost of the bound).
 func TestWarnOnceIsBounded(t *testing.T) {
 	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, nil))
+	log := testLog(&buf, slog.LevelInfo)
 	mk := func(i int) CPUPlan {
 		p := CPUPlan{CPUs: []int{0, 1}, Requested: 12, Allowed: rng(0, 11), Little: []int{2, 3, 4, 5}, Heterogeneous: true, Note: "test plan"}
 		p = p.WithNICIRQs(NICIRQs{Vectors: []NICVector{{IRQ: 167, CPU: 4, Name: "v", Dev: "eth0", Count: 1_000_000}}})
