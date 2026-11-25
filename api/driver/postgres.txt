@@ -117,6 +117,7 @@ var ErrQueueFull error
 var ErrResultTooBig error
 var ErrSSLNotSupported error
 var ErrTxCommitRollback error
+var ErrTxLeftOpen error
 var ErrUnknownFD error
 var ErrUnsupportedAuth error
 var PGInfinity time.Time

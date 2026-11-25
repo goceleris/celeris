@@ -132,6 +132,44 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 // connections back to the worker that created them, so a handler running on
 // worker N preferentially acquires conns whose event-loop callbacks land on
 // worker N.
+//
+// # Session state
+//
+// Every call (QueryContext, ExecContext, QueryRow, Ping) takes a connection
+// from the pool and puts it back. The pool does not reset the session on
+// release: session state a call sets persists on the connection and is seen by
+// the next caller that gets it. That covers SET and SET ROLE, set_config with
+// is_local false, temporary tables, PREPARE, LISTEN and session-level advisory
+// locks. The same holds for a *sql.DB opened with this driver: before it reuses
+// a connection, ResetSession sends DISCARD ALL only if BeginTx marked the
+// session dirty and the driver's own Commit or Rollback did not clear the mark
+// (a transaction ended by COMMIT sent as plain SQL, for example), and never for
+// a SET, a temporary table or the other state above (tracked in
+// goceleris/celeris#1409).
+//
+// What is reset is a transaction. A connection released while it is in a
+// transaction, open or failed (the server's last ReadyForQuery status is T or
+// E), is closed and not put back, so the next caller never runs inside it, and
+// the server rolls the transaction back. On the Pool, the call that left it open
+// returns [ErrTxLeftOpen] (Exec "BEGIN" does, before anything else runs; Query
+// returns it from Rows.Close, and QueryRow from Scan when the scan succeeded or found no row (then errors.Is is true for both sql.ErrNoRows and ErrTxLeftOpen); a
+// statement that fails returns its own error, unchanged), so a transaction cannot
+// be spread over Exec calls by accident: the connection of the BEGIN is gone
+// before the next statement. Pool.BeginTx is the way, and its Tx is the Pool's
+// only pinned connection (there is no Pool.Conn): BEGIN, COMMIT, savepoints and
+// every statement between them run on that one connection. A *sql.DB opened with
+// this driver cannot tell a pooled db.Exec("BEGIN") from the same statement on a
+// dedicated *sql.Conn, where it is legitimate, so it returns no error: the
+// connection is dropped when it is returned, the transaction is rolled back, and
+// the statements that followed ran on another connection, each in its own
+// transaction. Use db.BeginTx, or db.Conn for statements that must share one
+// connection.
+//
+// To scope a setting to one piece of work, set it inside a Tx with SET LOCAL or
+// select set_config(name, value, true): both end with the transaction. A
+// *sql.DB offers a dedicated *sql.Conn for work that needs session state; undo
+// the state (RESET ALL, DISCARD ALL) before it is closed, or the next user of
+// the connection gets it.
 type Pool struct {
 	inner *async.Pool[*pgConn]
 
@@ -343,6 +381,18 @@ type workerCtxKey struct{}
 
 // WithWorker returns ctx with a worker-affinity hint. Pool.Acquire uses the
 // hint as the preferred worker index.
+//
+// The hint is a preference, not a pin. The Pool has one worker slot per event
+// loop of the engine it was opened with (len of Stats().PerWorker); a hint
+// outside [0, that count) is spread round-robin, and a call whose hinted
+// worker has no idle connection takes an idle connection of another worker (or
+// dials one), so consecutive calls with the same hint can run on different
+// connections. The default number of loops is GOMAXPROCS minus a reserve (see
+// Config.Workers of the celeris package: 7 on 8 CPUs, so a hint of 7 is out of
+// range there). The Pool's own count, len(Stats().PerWorker), is the number to
+// use (the engine's observe.EngineMetrics.Workers is the loops started, summed
+// over both sub-engines for the adaptive engine). Code that used GOMAXPROCS as
+// the worker count should read it instead.
 func WithWorker(ctx context.Context, workerID int) context.Context {
 	return context.WithValue(ctx, workerCtxKey{}, workerID)
 }
@@ -392,12 +442,25 @@ func (p *Pool) acquire(ctx context.Context) (*pgConn, error) {
 }
 
 // release returns c to its home worker's idle list.
-func (p *Pool) release(c *pgConn) {
+func (p *Pool) release(c *pgConn) { _ = p.releaseChecked(c) }
+
+// releaseChecked is release that reports a conn it had to discard because the
+// statement left a transaction open: the server's last ReadyForQuery said T (in
+// a transaction) or E (in a failed one). The conn is closed, not put back (the
+// server rolls the transaction back, and the next caller never runs inside it),
+// and the error is [ErrTxLeftOpen], for the caller of a pool-level call to
+// return. A closed conn is discarded without an error.
+func (p *Pool) releaseChecked(c *pgConn) error {
 	if c.closed.Load() {
 		p.inner.Discard(c)
-		return
+		return nil
+	}
+	if c.inTransaction() {
+		p.inner.Discard(c)
+		return ErrTxLeftOpen
 	}
 	p.inner.Release(c)
+	return nil
 }
 
 // QueryContext runs query on an acquired conn, returns a Rows wrapper that
@@ -417,13 +480,25 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	return acquireRows(drows, c, p), nil
 }
 
-// ExecContext runs a statement and returns a [Result].
-func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
-	c, err := p.acquire(ctx)
-	if err != nil {
-		return Result{}, err
+// ExecContext runs a statement and returns a [Result]. A statement that
+// succeeds and leaves a transaction open on the connection (Exec "BEGIN")
+// returns [ErrTxLeftOpen]: see the Session state section of [Pool]. A statement
+// that fails returns its own error, unchanged, as before (a connection left in
+// a failed transaction by it is discarded all the same).
+func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (res Result, err error) {
+	c, aerr := p.acquire(ctx)
+	if aerr != nil {
+		return Result{}, aerr
 	}
-	defer p.release(c)
+	defer func() {
+		// ErrTxLeftOpen only for a statement that succeeded: one that failed
+		// returns its own error, as it always did (a duplicate key in
+		// "BEGIN; INSERT ...; COMMIT" is a *PGError 23505, not a leftover).
+		if rerr := p.releaseChecked(c); rerr != nil && err == nil {
+			res = Result{}
+			err = rerr
+		}
+	}()
 	named, slot := anysToNamed(args)
 	r, err := c.ExecContext(ctx, query, named)
 	releaseNamedArgs(slot)
@@ -566,7 +641,9 @@ type Rows struct {
 // Columns returns column names.
 func (r *Rows) Columns() []string { return r.inner.Columns() }
 
-// Close releases resources and returns the conn to the pool.
+// Close releases resources and returns the conn to the pool. A statement that
+// left a transaction open on the conn (Query "BEGIN") makes Close return
+// [ErrTxLeftOpen] after discarding the conn.
 func (r *Rows) Close() error {
 	if r.done {
 		return nil
@@ -574,7 +651,9 @@ func (r *Rows) Close() error {
 	r.done = true
 	err := r.inner.Close()
 	if r.pool != nil && r.conn != nil {
-		r.pool.release(r.conn)
+		if rerr := r.pool.releaseChecked(r.conn); rerr != nil && err == nil {
+			err = rerr
+		}
 	}
 	releaseRows(r)
 	return err
@@ -1177,11 +1256,25 @@ type Row struct {
 // Scan copies the columns from the single result row into dest. If the
 // query returned no rows, Scan returns sql.ErrNoRows. The underlying Rows
 // is closed automatically.
-func (r *Row) Scan(dest ...any) error {
+func (r *Row) Scan(dest ...any) (err error) {
 	if r.err != nil {
 		return r.err
 	}
-	defer func() { _ = r.rows.Close() }()
+	defer func() {
+		// Only the error of a transaction left open on the conn is the
+		// caller's, and only when the scan went well or found no row; any other
+		// error of Close or of the scan is left as it was.
+		if cerr := r.rows.Close(); errors.Is(cerr, ErrTxLeftOpen) {
+			switch {
+			case err == nil:
+				err = cerr
+			case errors.Is(err, sql.ErrNoRows):
+				// A statement that returns no row (QueryRow("BEGIN")): both
+				// are true, so a caller testing for either sees it.
+				err = errors.Join(err, cerr)
+			}
+		}
+	}()
 	if !r.rows.Next() {
 		if r.rows.Err() != nil {
 			return r.rows.Err()
