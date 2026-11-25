@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && postgres
 
 package postgres
 
@@ -12,7 +12,9 @@ import (
 	"github.com/goceleris/celeris/driver/internal/eventloop"
 )
 
-// TestStreamedInfinityAgainstServer runs the streamed-row path on the real
+// TestStreamedInfinityAgainstServer (build tags linux and postgres: the Drivers
+// workflow runs it, the unit step does not, because a skip without a server
+// fails its allow-list) runs the streamed-row path on the real
 // event loop against a real server (CELERIS_PG_DSN; skipped without it): a
 // result of 3000 wide rows alternating 'infinity', '-infinity' and the real
 // 9999-12-31 23:59:59, forced onto the asynchronous path so the rows are
@@ -80,7 +82,7 @@ func TestStreamedInfinityAgainstServer(t *testing.T) {
 						t.Fatalf("the asynchronous path did not stream: the test would prove nothing")
 					}
 					rows := acquireRows(inner, nil, nil)
-					defer rows.Close()
+					defer func() { _ = rows.Close() }()
 					n := 0
 					var s, pad string
 					var tm time.Time
