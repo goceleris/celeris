@@ -59,5 +59,5 @@
 // release notes.
 //
 // The supported types and the known gaps are listed on the supported-types
-// page: https://goceleris.dev/docs/memcached-behavior
+// page (placeholder URL, not final): https://goceleris.dev/docs/drivers/memcached/supported-types
 package memcached

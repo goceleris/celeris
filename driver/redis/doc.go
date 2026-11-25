@@ -82,5 +82,5 @@
 // release notes.
 //
 // The supported types and the known gaps are listed on the supported-types
-// page: https://goceleris.dev/docs/redis-replies
+// page (placeholder URL, not final): https://goceleris.dev/docs/drivers/redis/supported-types
 package redis
