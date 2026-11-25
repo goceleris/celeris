@@ -1167,7 +1167,8 @@ func (r Result) LastInsertId() (int64, error) {
 // CommandComplete tag.
 func (r Result) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 
-// Tx is the pool-level transaction wrapper.
+// Tx is the pool-level transaction wrapper. A Tx is obtained from
+// Pool.BeginTx; the zero value is not usable.
 type Tx struct {
 	inner *pgTx
 	conn  *pgConn
