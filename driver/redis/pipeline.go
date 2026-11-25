@@ -294,14 +294,17 @@ func (p *Pipeline) Discard() {
 // reply is received. Returns the first parse/transport error; per-command
 // errors are reachable via each *Cmd.Result().
 //
-// A Pipeline runs once. After Exec returned an error, the next step depends on
-// the failure:
+// A Pipeline runs once. After Exec returned an error, read a queued command's
+// Result to tell what happened, then:
 //
-//	failure                                    next step
-//	no connection obtained                     Exec again: the queue is intact
-//	context deadline or cancel, dropped conn   queue the commands again, Exec
-//	a command got a server error reply         Discard first: Exec returns an
-//	                                           error at once, sends nothing
+//	Result of a queued command         what happened            next step
+//	"not executed" error               no connection obtained   Exec again as it is;
+//	                                   (the context ended       do not queue the commands
+//	                                   while waiting for one)   again: the queue is intact
+//	the context error or the           the batch was sent       queue the commands again,
+//	connection error, same as Exec's  and Exec failed           Exec
+//	the command's own server error     a command got a server   Discard first: Exec returns
+//	                                   error reply              an error at once, sends nothing
 //
 // After a successful Exec, a second Exec returns an error at once (it does not
 // block or touch a connection): Discard before queueing a new batch.
