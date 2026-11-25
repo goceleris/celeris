@@ -132,6 +132,32 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 // connections back to the worker that created them, so a handler running on
 // worker N preferentially acquires conns whose event-loop callbacks land on
 // worker N.
+//
+// # Session state
+//
+// Every call (QueryContext, ExecContext, QueryRow, Ping) takes a connection
+// from the pool and puts it back. The pool does not reset the session on
+// release: session state a call sets persists on the connection and is seen by
+// the next caller that gets it. That covers SET and SET ROLE, set_config with
+// is_local false, temporary tables, PREPARE, LISTEN and session-level advisory
+// locks. The same holds for a *sql.DB opened with this
+// driver: it sends DISCARD ALL on return only for a connection that went
+// through BeginTx and did not end the transaction with COMMIT or ROLLBACK, not
+// for a SET, a temporary table or the other state above (tracked in
+// goceleris/celeris#1409).
+//
+// What is reset is a transaction: a connection released while it is in a
+// transaction, open or failed (the server's last ReadyForQuery status is T or
+// E), is closed and not put back, so the next caller never runs inside it, and
+// a transaction that was not ended is rolled back by the server. Do not rely on
+// a transaction that spans several calls (Exec "BEGIN", then Exec "INSERT"):
+// the connection of the BEGIN is gone before the INSERT. Use Pool.BeginTx.
+//
+// To scope a setting to one piece of work, set it inside a Tx with SET LOCAL or
+// select set_config(name, value, true): both end with the transaction. A
+// *sql.DB offers a dedicated *sql.Conn for work that needs session state; undo
+// the state (RESET ALL, DISCARD ALL) before it is closed, or the next user of
+// the connection gets it.
 type Pool struct {
 	inner *async.Pool[*pgConn]
 
