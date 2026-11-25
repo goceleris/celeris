@@ -1540,12 +1540,13 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 				cmdIdxes[i] = ic.origIdx
 			}
 			execErr := p.Exec(ctx)
+			pcs := p.pipeCmds()
 			mu.Lock()
 			for i, origIdx := range cmdIdxes {
 				if execErr != nil {
 					errs[origIdx] = execErr
-				} else if i < len(p.cmds) {
-					pc := &p.cmds[i]
+				} else if i < len(pcs) {
+					pc := &pcs[i]
 					if pc.err != nil {
 						errs[origIdx] = pc.err
 					} else if pc.val != nil {

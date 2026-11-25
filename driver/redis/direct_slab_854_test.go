@@ -134,7 +134,7 @@ func TestDirectPipelineKeepsFallbackResultsAcrossExecs854(t *testing.T) {
 	if err := first.Exec(ctx); err != nil {
 		t.Fatalf("first Exec: %v", err)
 	}
-	if first.cmds[2].val == nil {
+	if first.pipeCmds()[2].val == nil {
 		t.Fatal("fixture: the mismatched INCR reply was not kept as a Value")
 	}
 	// Later Execs on the same (only) conn write fresh bytes over offset 0.
@@ -148,7 +148,7 @@ func TestDirectPipelineKeepsFallbackResultsAcrossExecs854(t *testing.T) {
 		}
 		p.Release()
 	}
-	if got := string(first.cmds[2].val.Str); got != "not-a-number-1" {
+	if got := string(first.pipeCmds()[2].val.Str); got != "not-a-number-1" {
 		t.Fatalf("a result kept from an earlier Exec was overwritten by later Execs on the same conn: got %q, want %q", got, "not-a-number-1")
 	}
 }

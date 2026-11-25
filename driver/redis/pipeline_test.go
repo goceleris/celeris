@@ -37,7 +37,7 @@ func TestPipelineDiscard(t *testing.T) {
 	p := c.Pipeline()
 	p.Set("k", "v", 0)
 	p.Discard()
-	if len(p.cmds) != 0 {
+	if len(p.pipeCmds()) != 0 {
 		t.Fatal("discard didn't clear")
 	}
 	if err := p.Exec(context.Background()); err != nil {
