@@ -152,7 +152,7 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 // E), is closed and not put back, so the next caller never runs inside it, and
 // the server rolls the transaction back. On the Pool, the call that left it open
 // returns [ErrTxLeftOpen] (Exec "BEGIN" does, before anything else runs; Query
-// returns it from Rows.Close, and QueryRow from Scan when the scan succeeded; a
+// returns it from Rows.Close, and QueryRow from Scan when the scan succeeded or found no row (then errors.Is is true for both sql.ErrNoRows and ErrTxLeftOpen); a
 // statement that fails returns its own error, unchanged), so a transaction cannot
 // be spread over Exec calls by accident: the connection of the BEGIN is gone
 // before the next statement. Pool.BeginTx is the way, and its Tx is the Pool's
@@ -1262,10 +1262,17 @@ func (r *Row) Scan(dest ...any) (err error) {
 	}
 	defer func() {
 		// Only the error of a transaction left open on the conn is the
-		// caller's, and only when the scan itself went well; any other error
-		// of Close is dropped, as before.
-		if cerr := r.rows.Close(); err == nil && errors.Is(cerr, ErrTxLeftOpen) {
-			err = cerr
+		// caller's, and only when the scan went well or found no row; any other
+		// error of Close or of the scan is left as it was.
+		if cerr := r.rows.Close(); errors.Is(cerr, ErrTxLeftOpen) {
+			switch {
+			case err == nil:
+				err = cerr
+			case errors.Is(err, sql.ErrNoRows):
+				// A statement that returns no row (QueryRow("BEGIN")): both
+				// are true, so a caller testing for either sees it.
+				err = errors.Join(err, cerr)
+			}
 		}
 	}()
 	if !r.rows.Next() {

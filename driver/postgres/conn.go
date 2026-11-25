@@ -1461,12 +1461,20 @@ func (c *pgConn) inTransaction() bool {
 // first.
 var lastTxDiscardLog atomic.Int64
 
+// txDiscardedMsg is the Warn message of warnTxDiscarded. It covers both ways a
+// connection comes back inside a transaction: a statement that left one open,
+// and a one-shot transaction that failed (a duplicate key).
+const txDiscardedMsg = "celeris-postgres: a connection returned to the database/sql pool inside a transaction " +
+	"(open or failed) was discarded and the transaction rolled back; session state cannot be shared between calls; " +
+	"use BeginTx for transactions"
+
 // warnTxDiscarded logs, at Warn on slog's default logger, that database/sql
-// returned a connection inside a transaction and it was discarded. database/sql
-// gives the driver no error to return there (a db.Exec("BEGIN") on a pooled
-// connection cannot be told from the same statement on a dedicated *sql.Conn),
-// so this is the only trace. It logs the first time and then at most once a
-// minute, with the words of [ErrTxLeftOpen].
+// returned a connection inside a transaction, open or failed (the statement
+// left one open, or failed inside one), and that it was discarded.
+// database/sql gives the driver no error to return there (a db.Exec("BEGIN") on
+// a pooled connection cannot be told from the same statement on a dedicated
+// *sql.Conn), so this is the only trace. It logs the first time and then at
+// most once a minute.
 func warnTxDiscarded() {
 	now := time.Now().UnixNano()
 	last := lastTxDiscardLog.Load()
@@ -1476,7 +1484,7 @@ func warnTxDiscarded() {
 	if !lastTxDiscardLog.CompareAndSwap(last, now) {
 		return
 	}
-	slog.Default().Warn(ErrTxLeftOpen.Error(), "path", "database/sql")
+	slog.Default().Warn(txDiscardedMsg, "path", "database/sql")
 }
 
 // dispatch feeds one message into the state machine of the current head

@@ -61,8 +61,9 @@
 // db.Exec("INSERT ..."), db.Exec("COMMIT") as three calls is not a transaction,
 // the INSERT runs on another connection and autocommits, also with
 // SetMaxOpenConns(1). That sequence used to work only while one goroutine kept
-// reusing the same connection. The first discard is logged at Warn on
-// slog.Default (then at most once a minute). See the Session state section of
+// reusing the same connection. A connection that comes back inside a transaction
+// (open, or failed by a statement) is logged at Warn on slog.Default, the first
+// time and then at most once a minute. See the Session state section of
 // [Pool].
 //
 // # Documentation

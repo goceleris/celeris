@@ -414,9 +414,10 @@ func TestNativeExecBeginIsAnError(t *testing.T) {
 		t.Fatalf("Rows.Close after Query BEGIN = %v, want ErrTxLeftOpen", err)
 	}
 	var x int
-	// QueryRow("BEGIN") returns no row: the scan's own error, the conn is discarded.
-	if err := p.QueryRow(ctx, "BEGIN").Scan(&x); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("Row.Scan after QueryRow BEGIN = %v, want sql.ErrNoRows", err)
+	// QueryRow("BEGIN") returns no row: sql.ErrNoRows and ErrTxLeftOpen both, the
+	// conn is discarded.
+	if err := p.QueryRow(ctx, "BEGIN").Scan(&x); !errors.Is(err, sql.ErrNoRows) || !errors.Is(err, postgres.ErrTxLeftOpen) {
+		t.Fatalf("Row.Scan after QueryRow BEGIN = %v, want both sql.ErrNoRows and ErrTxLeftOpen", err)
 	}
 	// A statement that returns a row and leaves the transaction open: ErrTxLeftOpen.
 	if err := p.QueryRow(ctx, "BEGIN; SELECT 1").Scan(&x); !errors.Is(err, postgres.ErrTxLeftOpen) {

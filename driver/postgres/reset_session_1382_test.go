@@ -359,8 +359,8 @@ func TestNativePoolExecLeftTransactionOpenIsAnError(t *testing.T) {
 }
 
 // The same on the Query path: Rows.Close returns ErrTxLeftOpen, and the conn is
-// discarded. Row.Scan returns the scan's own error (here sql.ErrNoRows: the
-// statement returns no row), and the conn is discarded all the same.
+// discarded. Row.Scan of a statement that returns no row is sql.ErrNoRows and
+// ErrTxLeftOpen both (errors.Join), and the conn is discarded.
 func TestNativePoolQueryLeftTransactionOpenIsAnError(t *testing.T) {
 	f := newResetFake(t, false)
 	host, port, _ := net.SplitHostPort(f.addr)
@@ -379,8 +379,8 @@ func TestNativePoolQueryLeftTransactionOpenIsAnError(t *testing.T) {
 		t.Fatalf("Rows.Close = %v, want ErrTxLeftOpen", err)
 	}
 	var x string
-	if err := p.QueryRow(ctx, "BEGIN").Scan(&x); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("Row.Scan = %v, want sql.ErrNoRows", err)
+	if err := p.QueryRow(ctx, "BEGIN").Scan(&x); !errors.Is(err, sql.ErrNoRows) || !errors.Is(err, ErrTxLeftOpen) {
+		t.Fatalf("Row.Scan = %v, want both sql.ErrNoRows and ErrTxLeftOpen", err)
 	}
 	// An ordinary statement is unaffected, on a new conn each time.
 	if _, err := p.ExecContext(ctx, "SELECT 1"); err != nil {
@@ -450,8 +450,8 @@ func (h *captureLog) count() int {
 
 // database/sql gives the driver no error to return when a connection comes back
 // inside a transaction, so the discard is logged at Warn on slog's default
-// logger, with the words of ErrTxLeftOpen: the first time, then at most once a
-// minute.
+// logger: the first time, then at most once a minute. The message names both
+// ways a connection comes back inside a transaction (left open, or failed).
 func TestTxDiscardIsLoggedOncePerMinute(t *testing.T) {
 	h := &captureLog{}
 	old := slog.Default()
@@ -473,7 +473,7 @@ func TestTxDiscardIsLoggedOncePerMinute(t *testing.T) {
 	if n := h.count(); n != 1 {
 		t.Fatalf("first discard logged %d records, want 1: %v", n, h.msgs)
 	}
-	if want := "WARN " + ErrTxLeftOpen.Error(); h.msgs[0] != want {
+	if want := "WARN " + txDiscardedMsg; h.msgs[0] != want {
 		t.Fatalf("logged %q, want %q", h.msgs[0], want)
 	}
 	// Again at once, through both entry points: rate limited.
