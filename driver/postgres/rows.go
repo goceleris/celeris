@@ -138,7 +138,7 @@ func (r *pgRows) Next(dest []driver.Value) error {
 		)
 		if r.textFormat || col.FormatCode == protocol.FormatText {
 			if codec.DecodeText != nil {
-				v, err = codec.DecodeText(raw)
+				v, err = decodeText(codec, raw)
 			} else {
 				cp := make([]byte, len(raw))
 				copy(cp, raw)
@@ -148,7 +148,7 @@ func (r *pgRows) Next(dest []driver.Value) error {
 			if codec.DecodeBinary != nil {
 				v, err = codec.DecodeBinary(raw)
 			} else if codec.DecodeText != nil {
-				v, err = codec.DecodeText(raw)
+				v, err = decodeText(codec, raw)
 			} else {
 				cp := make([]byte, len(raw))
 				copy(cp, raw)
@@ -315,7 +315,7 @@ func (r *streamRows) Next(dest []driver.Value) error {
 		)
 		if r.textFormat || col.FormatCode == protocol.FormatText {
 			if codec.DecodeText != nil {
-				v, err = codec.DecodeText(raw)
+				v, err = decodeText(codec, raw)
 			} else {
 				cp := make([]byte, len(raw))
 				copy(cp, raw)
@@ -325,7 +325,7 @@ func (r *streamRows) Next(dest []driver.Value) error {
 			if codec.DecodeBinary != nil {
 				v, err = codec.DecodeBinary(raw)
 			} else if codec.DecodeText != nil {
-				v, err = codec.DecodeText(raw)
+				v, err = decodeText(codec, raw)
 			} else {
 				cp := make([]byte, len(raw))
 				copy(cp, raw)

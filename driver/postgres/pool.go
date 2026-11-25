@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,6 +78,10 @@ type Option func(*options)
 // or with one that runs async handlers (also before it starts), dials through
 // Go's netpoll and sets no socket option. The Pool has no busy poll option of
 // its own; a [Connector] does ([Connector.WithSocketBusyPoll]).
+//
+// The driver takes the server's event loop once, when it is opened: open it after
+// srv.Addr() is non-nil to share the server's loops; opened earlier it uses the
+// driver's own loop for its whole life.
 func WithEngine(sp ServerProvider) Option {
 	return func(o *options) {
 		if sp == nil {
@@ -104,7 +111,14 @@ func WithMaxLifetime(d time.Duration) Option { return func(o *options) { o.cfg.M
 // WithMaxIdleTime sets the max idle duration. Default: 5m.
 func WithMaxIdleTime(d time.Duration) Option { return func(o *options) { o.cfg.MaxIdleTime = d } }
 
-// WithStatementCacheSize sets the per-conn prepared-statement LRU capacity.
+// WithStatementCacheSize sets the per-conn prepared-statement LRU capacity
+// (default 256; the statement_cache_size DSN parameter does the same). A
+// statement with arguments is prepared on first use and cached by its text. A
+// connection that runs more distinct texts than n evicts the least recently
+// used one and closes it on the server: a protocol-level Close is sent ahead of
+// the query that evicted it, with no extra round trip and no wait. Pass values
+// as arguments, not in the SQL text, or size the cache to the number of
+// distinct texts: each miss costs a Parse and Describe round trip.
 func WithStatementCacheSize(n int) Option { return func(o *options) { o.cfg.StatementCacheSize = n } }
 
 // WithApplication sets the "application_name" startup parameter.
@@ -615,6 +629,16 @@ func (r *Rows) Next() bool {
 // must be a pointer. On the fast path (inner is *pgRows), Scan decodes
 // directly from the wire bytes into dest without ever materialising a
 // driver.Value — zero interface{} boxing per cell.
+//
+// A NULL cell never leaves its dest as it was, so a variable reused across
+// rows cannot carry the previous row's value. NULL sets dest to its zero
+// value: "" for *string, nil for *[]byte, *json.RawMessage, *any and a
+// pointer-to-pointer (**T, which a non-NULL value allocates), 0 for the
+// numeric kinds, false for *bool and the zero time.Time for *time.Time. A
+// sql.Scanner (sql.NullString, sql.NullInt64, ...) receives Scan(nil) and sets
+// Valid=false; scan into one, into *any or into **T when NULL must be told
+// apart from a zero value. A dest Scan does not support fails for NULL with
+// the same "unsupported scan dest type" error as for any other value.
 func (r *Rows) Scan(dest ...any) error {
 	if r.rawAvailable {
 		if len(dest) != len(r.rawRow) {
@@ -641,7 +665,20 @@ func (r *Rows) Scan(dest ...any) error {
 	if len(dest) != len(r.current) {
 		return fmt.Errorf("celeris-postgres: Scan expected %d dest, got %d", len(r.current), len(dest))
 	}
+	sr, _ := r.inner.(*streamRows)
 	for i, v := range r.current {
+		if sr != nil && i < len(sr.current) && sr.current[i] != nil && i < len(sr.codecs) && i < len(sr.columns) {
+			// A streamed row: infinity into a string is read from the raw cell.
+			binaryFmt := !sr.textFormat && sr.columns[i].FormatCode != protocol.FormatText
+			if sr.codecs[i] == nil && binaryFmt {
+				if err := binaryOnlyGuard(dest[i], sr.codecs[i], sr.columns[i], binaryFmt); err != nil {
+					return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
+				}
+			}
+			if sr.codecs[i] != nil && isTimeOID(sr.codecs[i].OID) && rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
+				continue
+			}
+		}
 		if err := scanValue(dest[i], v); err != nil {
 			return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
 		}
@@ -675,8 +712,13 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		// Nil cell — zero the target if it's a common primitive.
 		return assignNil(dest)
 	}
-	// Binary format for known codecs — direct decode into typed pointer.
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
+	if codec == nil && binaryFmt {
+		if err := binaryOnlyGuard(dest, codec, col, binaryFmt); err != nil {
+			return err
+		}
+	}
+	// Binary format for known codecs — direct decode into typed pointer.
 	if codec != nil && binaryFmt {
 		if ok, err := decodeBinaryInto(dest, raw, codec); ok {
 			return err
@@ -692,6 +734,16 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 	if err != nil {
 		return err
 	}
+	// A date, timestamp or timestamptz into a string is RFC3339Nano
+	// (as database/sql formats it). Done here, on the raw path, and not in
+	// convertAssign: a streamed row scans through convertAssign exactly as in
+	// v1.5.11, where a time.Time into *string was fmt's %v form.
+	if t, ok := v.(time.Time); ok {
+		if d, ok := dest.(*string); ok {
+			*d = t.Format(time.RFC3339Nano)
+			return nil
+		}
+	}
 	return scanValue(dest, v)
 }
 
@@ -705,7 +757,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 	}
 	if textFormat || col.FormatCode == protocol.FormatText {
 		if codec.DecodeText != nil {
-			return codec.DecodeText(raw)
+			return decodeText(codec, raw)
 		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
@@ -715,7 +767,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 		return codec.DecodeBinary(raw)
 	}
 	if codec.DecodeText != nil {
-		return codec.DecodeText(raw)
+		return decodeText(codec, raw)
 	}
 	cp := make([]byte, len(raw))
 	copy(cp, raw)
@@ -754,6 +806,17 @@ func int64ToUint32(n int64) (uint32, error) {
 		return 0, fmt.Errorf("celeris-postgres: scan: value %d out of range for uint32", n)
 	}
 	return uint32(n), nil
+}
+
+// binaryFormIsValue reports whether a column of codec's type carries, in
+// binary result format, exactly the bytes a string destination should receive. That holds for the text-like types (text, varchar, json) and
+// for bytea; every other registered codec decodes through its DecodeBinary.
+func binaryFormIsValue(codec *protocol.TypeCodec) bool {
+	switch codec.OID {
+	case protocol.OIDText, protocol.OIDVarchar, protocol.OIDJSON, protocol.OIDBytea:
+		return true
+	}
+	return false
 }
 
 // decodeBinaryInto decodes raw binary-format bytes directly into dest
@@ -815,10 +878,24 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 		return true, nil
 	case *string:
 		// Fast path for text/varchar/etc.: no interface boxing, single
-		// string allocation out of the raw slab bytes.
+		// string allocation out of the raw slab bytes. Only for codecs
+		// whose binary form is the value itself; jsonb / jsonpath carry a
+		// version byte, int4 / uuid / timestamp / ... are fixed-width binary.
+		if !binaryFormIsValue(codec) {
+			// A date, timestamp or timestamptz infinity is the server's own text,
+			// read from the wire value (the PGInfinity sentinel is also a real
+			// instant): no other cell pays for the check.
+			if txt, ok := infinityText(raw, codec.OID, true); ok {
+				*d = txt
+				return true, nil
+			}
+			return false, nil
+		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
+		// The value's wire bytes, for every type, exactly as v1.5.11: scan into
+		// a string for text.
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -835,7 +912,7 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 }
 
 // decodeTextInto is the text-format counterpart to decodeBinaryInto.
-func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
+func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, error) {
 	switch d := dest.(type) {
 	case *int:
 		n, err := protocol.ParseIntTextASCII(raw)
@@ -867,9 +944,15 @@ func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
 		*d = v
 		return true, nil
 	case *string:
+		if codec.OID == protocol.OIDBytea {
+			return false, nil // text form is the hex escape, not the value
+		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
+		if codec.OID == protocol.OIDBytea {
+			return false, nil
+		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -878,7 +961,16 @@ func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
 	return false, nil
 }
 
-// assignNil zeros the pointed-to primitive when the column is NULL.
+// assignNil stores a NULL cell into dest. It never leaves dest as it was:
+// a variable reused across rows would otherwise carry the previous row's
+// value into a row whose column is NULL, with no error.
+//
+// The destination is set to its zero value: "" for *string, nil for
+// *[]byte, *json.RawMessage and *any, 0 for the numeric kinds, false for
+// *bool, the zero time.Time for *time.Time, and nil for a pointer-to-pointer
+// (**T). sql.Scanner destinations (sql.Null*, a user type) are handled by the
+// caller via Scan(nil). Any other destination fails with the error a non-NULL
+// value gets, so a destination Scan does not support never succeeds silently.
 func assignNil(dest any) error {
 	switch d := dest.(type) {
 	case *int:
@@ -891,15 +983,29 @@ func assignNil(dest any) error {
 		*d = 0
 	case *uint32:
 		*d = 0
+	case *float64:
+		*d = 0
+	case *float32:
+		*d = 0
 	case *string:
 		*d = ""
 	case *[]byte:
 		*d = nil
+	case *json.RawMessage:
+		*d = nil
 	case *bool:
 		*d = false
+	case *time.Time:
+		*d = time.Time{}
+	case *any:
+		*d = nil
 	default:
-		// Unknown target — let scanValue handle it via convertAssign(nil).
-		return scanValue(dest, nil)
+		// **T: a nullable column scans into *T as nil.
+		if rv := reflect.ValueOf(dest); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Pointer {
+			rv.Elem().SetZero()
+			return nil
+		}
+		return fmt.Errorf("unsupported scan dest type %T", dest)
 	}
 	return nil
 }
@@ -914,7 +1020,7 @@ func scanValue(dest any, v driver.Value) error {
 		return scanner.Scan(v)
 	}
 	if v == nil {
-		return nil
+		return assignNil(dest)
 	}
 	return convertAssign(dest, v)
 }
@@ -938,6 +1044,8 @@ func convertAssign(dest any, src any) error {
 			} else {
 				*d = "false"
 			}
+		case []driver.Value:
+			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
 			*d = fmt.Sprintf("%v", src)
 		}
@@ -1025,6 +1133,15 @@ func convertAssign(dest any, src any) error {
 		default:
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to []byte", src)
 		}
+	case *json.RawMessage:
+		switch s := src.(type) {
+		case []byte:
+			*d = append(json.RawMessage(nil), s...)
+		case string:
+			*d = append(json.RawMessage(nil), s...)
+		default:
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to json.RawMessage", src)
+		}
 	case *any:
 		*d = src
 	case *time.Time:
@@ -1035,6 +1152,16 @@ func convertAssign(dest any, src any) error {
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to time.Time", src)
 		}
 	default:
+		// **T: allocate a T and scan into it, so a nullable column scans
+		// into *T (nil for NULL, see assignNil).
+		if rv := reflect.ValueOf(dest); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Pointer {
+			nv := reflect.New(rv.Elem().Type().Elem())
+			if err := scanValue(nv.Interface(), src); err != nil {
+				return err
+			}
+			rv.Elem().Set(nv)
+			return nil
+		}
 		return fmt.Errorf("unsupported scan dest type %T", dest)
 	}
 	return nil
@@ -1089,7 +1216,8 @@ func (r Result) LastInsertId() (int64, error) {
 // CommandComplete tag.
 func (r Result) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 
-// Tx is the pool-level transaction wrapper.
+// Tx is the pool-level transaction wrapper. A Tx is obtained from
+// Pool.BeginTx; the zero value is not usable.
 type Tx struct {
 	inner *pgTx
 	conn  *pgConn
@@ -1187,4 +1315,73 @@ func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 		return errors.New("celeris-postgres: tx already finished")
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
+}
+
+// isTimeOID reports whether oid is date, timestamp or timestamptz.
+func isTimeOID(oid uint32) bool {
+	return oid == protocol.OIDDate || oid == protocol.OIDTimestamp || oid == protocol.OIDTimestamptz
+}
+
+// rawCellGuard handles, for a *string destination (a *[]byte gets the wire bytes,
+// as in v1.5.11), the cells whose
+// raw wire value says more than the decoded driver.Value can. It reports
+// whether it filled dest. Today that is the infinity of a
+// date, timestamp or timestamptz: the server's own text, read from the wire
+// value before any time.Time exists, because the PGInfinity sentinel is also a
+// real instant. Both the buffered (scanRaw) and the streamed (Rows.Scan over a
+// streamRows) paths call it; every other cell goes the unchanged way.
+func rawCellGuard(dest any, raw []byte, codec *protocol.TypeCodec, binaryFmt bool) bool {
+	d, ok := dest.(*string)
+	if !ok || codec == nil {
+		return false
+	}
+	switch codec.OID {
+	case protocol.OIDDate, protocol.OIDTimestamp, protocol.OIDTimestamptz:
+	default:
+		return false
+	}
+	if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
+		*d = txt
+		return true
+	}
+	return false
+}
+
+// infinityText reports whether raw, a date, timestamp or timestamptz cell of
+// the given type and format, is PostgreSQL's infinity or -infinity, and returns
+// the text the server prints for it. The binary form is the int32 days
+// (date) or int64 microseconds (timestamp, timestamptz) sentinel MaxInt /
+// MinInt; the text form is "infinity" / "-infinity" itself.
+func infinityText(raw []byte, oid uint32, binaryFmt bool) (string, bool) {
+	switch oid {
+	case protocol.OIDDate, protocol.OIDTimestamp, protocol.OIDTimestamptz:
+	default:
+		return "", false
+	}
+	if !binaryFmt {
+		switch string(raw) {
+		case "infinity":
+			return "infinity", true
+		case "-infinity":
+			return "-infinity", true
+		}
+		return "", false
+	}
+	switch {
+	case oid == protocol.OIDDate && len(raw) == 4:
+		switch int32(binary.BigEndian.Uint32(raw)) {
+		case math.MaxInt32:
+			return "infinity", true
+		case math.MinInt32:
+			return "-infinity", true
+		}
+	case oid != protocol.OIDDate && len(raw) == 8:
+		switch int64(binary.BigEndian.Uint64(raw)) {
+		case math.MaxInt64:
+			return "infinity", true
+		case math.MinInt64:
+			return "-infinity", true
+		}
+	}
+	return "", false
 }
