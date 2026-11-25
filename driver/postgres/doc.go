@@ -50,7 +50,33 @@
 // WithEngine colocation. It is tested in CI on windows-latest against
 // in-process fake servers, not benchmarked and not tuned; do not deploy it.
 //
+// # Transactions on a pool
+//
+// A transaction needs one connection: use [Pool.BeginTx] or db.BeginTx, or
+// db.Conn for statements that must share a connection. A connection returned to
+// a pool inside a transaction is discarded and the server rolls the transaction
+// back. On the Pool, the call that left it open returns [ErrTxLeftOpen]. On a
+// *sql.DB there is no error (a db.Exec("BEGIN") on a pooled connection cannot be
+// told from the same statement on a dedicated db.Conn): db.Exec("BEGIN"),
+// db.Exec("INSERT ..."), db.Exec("COMMIT") as three calls is not a transaction,
+// the INSERT runs on another connection and autocommits, also with
+// SetMaxOpenConns(1). That sequence used to work only while one goroutine kept
+// reusing the same connection. A connection that comes back inside a transaction
+// (open, or failed by a statement) is logged at Warn on slog.Default, the first
+// time and then at most once a minute. See the Session state section of
+// [Pool].
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/data-stores
+//
+// # Status
+//
+// Status: beta. The exported API of the driver packages stays under the
+// compatibility check, but behaviour fixes (what a value scans to, which
+// cases return an error) may land in minor releases and are listed in the
+// release notes.
+//
+// The supported types and the known gaps are listed on the supported-types
+// page: https://goceleris.dev/docs/postgres-types
 package postgres
