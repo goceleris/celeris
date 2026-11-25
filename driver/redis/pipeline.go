@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"sync"
@@ -14,6 +15,16 @@ import (
 // errPipeCmdOrphaned is returned by typed cmd Result() when the owning
 // Pipeline has been released back to the pool or was never properly exec'd.
 var errPipeCmdOrphaned = &pipeCmd{err: ErrClosed}
+
+// errCmdNotExecuted is returned by a typed Cmd's Result() when the command
+// has no reply to report: its Pipeline or Tx was never executed, or the Exec
+// failed before the command was sent.
+var errCmdNotExecuted = errors.New("celeris-redis: command has no result: its Pipeline or Tx was not executed")
+
+// errPipelineExecuted is returned by a second [Pipeline.Exec] on a Pipeline
+// that already ran. The commands were sent once and their results are held
+// until [Pipeline.Discard] or [Pipeline.Release].
+var errPipelineExecuted = errors.New("celeris-redis: Pipeline already executed; call Discard before queueing a new batch")
 
 // defaultPipelineCap is the initial capacity of Pipeline's per-command slabs.
 // Chosen so a typical batch (tens to low-hundreds of commands) never grows
@@ -29,6 +40,16 @@ const defaultPipelineCap = 128
 // after Exec, then return it to the pool via [Pipeline.Release]. Release is
 // optional but recommended for tight hot paths — without it a fresh
 // Pipeline (and its internal slabs) is allocated on every call.
+//
+// Values obtained from a Pipeline are valid until Release: the strings and
+// the typed results read from its *Cmd handles share the Pipeline's recycled
+// buffers, and Release hands those buffers to the next Pipeline. Copy what you
+// keep past Release (for example with strings.Clone).
+//
+// A Pipeline runs once: queue commands, call [Pipeline.Exec] once, read the
+// results, then [Pipeline.Release] (or [Pipeline.Discard] to queue a new
+// batch). A second Exec returns an error. A Result read before Exec, or after
+// an Exec that failed, returns an error.
 //
 // Pipeline is NOT safe for concurrent use. A caller must not invoke methods
 // on the same Pipeline from multiple goroutines at once.
@@ -80,6 +101,11 @@ type Pipeline struct {
 	// Each entry's doneCh is allocated lazily on first use and retained for
 	// subsequent Exec calls. The slab only grows and is never shrunk.
 	reqSlab []redisRequest
+
+	// executed is set once Exec has sent the queued commands and cleared by
+	// Discard/Release. A second Exec returns errPipelineExecuted instead of
+	// waiting for replies to commands it never sent.
+	executed bool
 }
 
 // pipeCmd holds the per-command state populated by Exec. When direct is true,
@@ -231,6 +257,7 @@ func (p *Pipeline) reset() {
 	p.reqSlab = p.reqSlab[:0]
 	p.argsScratch = p.argsScratch[:0]
 	p.strSlab = p.strSlab[:0]
+	p.executed = false
 }
 
 // Discard drops all queued commands without sending anything. The Pipeline
@@ -242,7 +269,13 @@ func (p *Pipeline) Discard() {
 // Exec sends every queued command in one write and blocks until the last
 // reply is received. Returns the first parse/transport error; per-command
 // errors are reachable via each *Cmd.Result().
+//
+// A Pipeline runs once: a second Exec returns an error at once (it does not
+// block or touch a connection). Call [Pipeline.Discard] to queue a new batch.
 func (p *Pipeline) Exec(ctx context.Context) error {
+	if p.executed {
+		return errPipelineExecuted
+	}
 	n := len(p.cmds)
 	if n == 0 {
 		return nil
@@ -251,6 +284,7 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	p.executed = true
 	// Pre-size strSlab: typical GET response is ~16 bytes; SET response is
 	// "OK" (interned, but slab growth may still occur for other cmds).
 	// Over-sizing is cheap; under-sizing triggers grow-copies mid-pipeline.
@@ -483,6 +517,9 @@ func (c *StringCmd) Result() (string, error) {
 	if pc.direct {
 		return pc.str, nil
 	}
+	if pc.val == nil {
+		return "", errCmdNotExecuted
+	}
 	return asString(*pc.val)
 }
 
@@ -511,6 +548,9 @@ func (c *IntCmd) Result() (int64, error) {
 	}
 	if pc.direct {
 		return pc.scalar, nil
+	}
+	if pc.val == nil {
+		return 0, errCmdNotExecuted
 	}
 	return asInt(*pc.val)
 }
@@ -541,6 +581,9 @@ func (c *StatusCmd) Result() (string, error) {
 	if pc.direct {
 		return pc.str, nil
 	}
+	if pc.val == nil {
+		return "", errCmdNotExecuted
+	}
 	return asString(*pc.val)
 }
 
@@ -570,6 +613,9 @@ func (c *FloatCmd) Result() (float64, error) {
 	if pc.direct {
 		return math.Float64frombits(uint64(pc.scalar)), nil
 	}
+	if pc.val == nil {
+		return 0, errCmdNotExecuted
+	}
 	return asFloat(*pc.val)
 }
 
@@ -598,6 +644,9 @@ func (c *BoolCmd) Result() (bool, error) {
 	}
 	if pc.direct {
 		return pc.scalar != 0, nil
+	}
+	if pc.val == nil {
+		return false, errCmdNotExecuted
 	}
 	return asBool(*pc.val)
 }
