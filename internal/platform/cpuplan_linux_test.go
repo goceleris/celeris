@@ -463,7 +463,7 @@ func TestPlanUnrestrictedHomogeneousEqualsTheOldPlan(t *testing.T) {
 				for _, explicit := range []bool{false, true} {
 					wantN := workers
 					if !explicit && workers > 2 {
-						wantN -= max(1, workers/8)
+						wantN -= max(1, workers/4)
 					}
 					wantPlan := want[:wantN]
 					got := planWorkerCPUs(workers, explicit, h.src()).CPUs

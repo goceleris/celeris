@@ -10,7 +10,7 @@ import (
 
 // celeris#756, #757: a DEFAULT loop count (Config.Workers not set) on a host of
 // alike CPUs leaves a reserve of Ps to the goroutines that are not loops: the
-// plan holds n - max(1, n/8) loops, none for n <= 2. A user-set count is
+// plan holds n - max(1, n/4) loops, none for n <= 2. A user-set count is
 // honoured, and so is the big.LITTLE plan. These tests pin the POLICY (the
 // loop counts), not any latency: the figures are written out and the tests do
 // not call defaultLoopReserve, so they compile and fail by assertion on a tree
@@ -21,12 +21,12 @@ func TestPlanDefaultLoopReserve756(t *testing.T) {
 	for _, tc := range []struct{ n, want int }{
 		{0, 0}, {1, 1}, {2, 2}, // no reserve: a count that small would drop to one loop or none
 		{3, 2}, {4, 3}, {7, 6},
-		{8, 7},
-		{9, 8}, {15, 14},
-		{16, 14},
-		{17, 15}, {24, 21}, {31, 28},
-		{32, 28},
-		{48, 42}, {64, 56},
+		{8, 6},
+		{9, 7}, {15, 12},
+		{16, 12},
+		{17, 13}, {24, 18}, {31, 24},
+		{32, 24},
+		{48, 36}, {64, 48},
 	} {
 		t.Run(fmt.Sprintf("n=%d", tc.n), func(t *testing.T) {
 			h := newFakeHost(t, rng(0, max(tc.n, 1)-1))
@@ -53,12 +53,13 @@ func TestPlanDefaultLoopReserve756(t *testing.T) {
 	}
 }
 
-// The headline case, alone: 16 identical CPUs, default request 16 -> 14 loops
-// (rc1 gave 16). The same request with the count set by the user -> 16.
+// The headline case, alone: 16 identical CPUs, default request 16 -> 12 loops
+// (rc1 gave 16, the first reserve 14). The same request with the count set by
+// the user -> 16.
 func TestPlanSixteenAlikeCPUs756(t *testing.T) {
 	h := newFakeHost(t, rng(0, 15))
 	got := planWorkerCPUs(16, false, h.src()).CPUs
-	eq(t, "default 16 -> 14 loops", got, rng(0, 13))
+	eq(t, "default 16 -> 12 loops", got, rng(0, 11))
 	got = planWorkerCPUs(16, true, h.src()).CPUs
 	eq(t, "explicit 16 -> 16 loops", got, rng(0, 15))
 }
@@ -82,13 +83,13 @@ func TestPlanExplicitCountIsHonoured756(t *testing.T) {
 }
 
 // 1..64 default workers on a host of that many CPUs, against the rule written
-// out inline: loops = n - max(1, n/8) for n > 2, n otherwise.
+// out inline: loops = n - max(1, n/4) for n > 2, n otherwise.
 func TestPlanDefaultReserveTable756(t *testing.T) {
 	for n := 1; n <= 64; n++ {
 		h := newFakeHost(t, rng(0, n-1))
 		want := n
 		if n > 2 {
-			want = n - max(1, n/8)
+			want = n - max(1, n/4)
 		}
 		if got := len(planWorkerCPUs(n, false, h.src()).CPUs); got != want {
 			t.Errorf("default %d workers: %d loops, want %d", n, got, want)
@@ -97,14 +98,14 @@ func TestPlanDefaultReserveTable756(t *testing.T) {
 }
 
 // The reserve counts the workers asked for, not the CPUs allowed: a default
-// request of 8 (GOMAXPROCS lowered under a CPU limit) on a 16-CPU host runs 7
-// loops on the first 7 CPUs; a request above the CPUs (GOMAXPROCS set above
+// request of 8 (GOMAXPROCS lowered under a CPU limit) on a 16-CPU host runs 6
+// loops on the first 6 CPUs; a request above the CPUs (GOMAXPROCS set above
 // them) wraps.
 func TestPlanDefaultReserveCountsWorkersNotCPUs756(t *testing.T) {
 	h := newFakeHost(t, rng(0, 15))
-	eq(t, "default 8 of 16 CPUs", planWorkerCPUs(8, false, h.src()).CPUs, rng(0, 6))
+	eq(t, "default 8 of 16 CPUs", planWorkerCPUs(8, false, h.src()).CPUs, rng(0, 5))
 	h = newFakeHost(t, rng(0, 3))
-	eq(t, "default 8 of 4 CPUs wraps", planWorkerCPUs(8, false, h.src()).CPUs, []int{0, 1, 2, 3, 0, 1, 2})
+	eq(t, "default 8 of 4 CPUs wraps", planWorkerCPUs(8, false, h.src()).CPUs, []int{0, 1, 2, 3, 0, 1})
 }
 
 // A read error means "homogeneous" (no allowed mask, no capacity files): the
@@ -113,8 +114,8 @@ func TestPlanDefaultReserveWithoutAMask756(t *testing.T) {
 	h := newFakeHost(t, nil)
 	src := h.src()
 	src.allowed = func() ([]int, error) { return nil, fmt.Errorf("boom") }
-	if p := planWorkerCPUs(16, false, src); len(p.CPUs) != 14 || p.Heterogeneous {
-		t.Errorf("default 16 without a mask: %d loops (%+v), want 14", len(p.CPUs), p)
+	if p := planWorkerCPUs(16, false, src); len(p.CPUs) != 12 || p.Heterogeneous {
+		t.Errorf("default 16 without a mask: %d loops (%+v), want 12", len(p.CPUs), p)
 	}
 	if p := planWorkerCPUs(16, true, src); len(p.CPUs) != 16 {
 		t.Errorf("explicit 16 without a mask: %d loops, want 16", len(p.CPUs))
