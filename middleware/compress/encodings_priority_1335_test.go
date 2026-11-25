@@ -137,7 +137,8 @@ func TestEncodingsPriority(t *testing.T) {
 // "zstd", "br"], and what it changes against the answers the client's header
 // order gave before celeris#1335 (the second field): the browser's and the
 // benchmark client's headers get gzip as they did, "br, gzip" (br before gzip
-// at equal weight) moves from br to gzip, and so do "zstd, br, gzip" and "*".
+// at equal weight) moves from br to gzip, and so do "zstd, br, gzip" and "*";
+// "br, zstd" moves from br to zstd (no gzip offered, zstd above br).
 func TestDefaultEncodingsOrder(t *testing.T) {
 	if got := defaultConfig.Encodings; len(got) != 3 || got[0] != "gzip" || got[1] != "zstd" || got[2] != "br" {
 		t.Fatalf("default Encodings %v, want [gzip zstd br]", got)
@@ -157,6 +158,13 @@ func TestDefaultEncodingsOrder(t *testing.T) {
 		{"br, gzip", "br", "gzip"},
 		{"zstd, br, gzip", "zstd", "gzip"},
 		{"*", "zstd", "gzip"},
+		// Moves that do not name gzip first, or at all: br before zstd with no
+		// gzip offered goes to zstd (the default ranks zstd above br), and a
+		// "*" beside br counts gzip in, at the weight of the rest.
+		{"br, zstd", "br", "zstd"},
+		{"br, *", "br", "gzip"},
+		{"gzip;q=0, br, zstd", "br", "zstd"},
+		{"*;q=0, br, gzip", "br", "gzip"},
 	} {
 		c, rec := celeristest.NewContextT(t, "GET", "/", celeristest.WithHeader("accept-encoding", tc.ae),
 			celeristest.WithHandlers(New(), h))
