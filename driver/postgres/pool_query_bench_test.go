@@ -15,7 +15,7 @@ import (
 // loopback backend, one prebuilt reply segment per query). It uses only API that
 // exists in v1.5.11, main and the fix, so the identical file is dropped into each.
 
-func benchMsg(typ byte, payload []byte) []byte {
+func rowsBenchMsg(typ byte, payload []byte) []byte {
 	b := make([]byte, 5+len(payload))
 	b[0] = typ
 	binary.BigEndian.PutUint32(b[1:5], uint32(4+len(payload)))
@@ -23,7 +23,7 @@ func benchMsg(typ byte, payload []byte) []byte {
 	return b
 }
 
-func benchReply() []byte {
+func rowsBenchReply() []byte {
 	rd := []byte{0, 1, 'n', 0}
 	var f [18]byte
 	binary.BigEndian.PutUint32(f[6:10], protocol.OIDInt4)
@@ -32,15 +32,15 @@ func benchReply() []byte {
 	rd = append(rd, f[:]...)
 	dr := []byte{0, 1, 0, 0, 0, 1, '7'}
 	var out []byte
-	out = append(out, benchMsg(protocol.BackendRowDescription, rd)...)
-	out = append(out, benchMsg(protocol.BackendDataRow, dr)...)
-	out = append(out, benchMsg(protocol.BackendCommandComplete, append([]byte("SELECT 1"), 0))...)
-	out = append(out, benchMsg(protocol.BackendReadyForQuery, []byte{'I'})...)
+	out = append(out, rowsBenchMsg(protocol.BackendRowDescription, rd)...)
+	out = append(out, rowsBenchMsg(protocol.BackendDataRow, dr)...)
+	out = append(out, rowsBenchMsg(protocol.BackendCommandComplete, append([]byte("SELECT 1"), 0))...)
+	out = append(out, rowsBenchMsg(protocol.BackendReadyForQuery, []byte{'I'})...)
 	return out
 }
 
-func benchPool(b *testing.B) *Pool {
-	reply := benchReply()
+func rowsBenchPool(b *testing.B) *Pool {
+	reply := rowsBenchReply()
 	addr := startFakePGBench(b, func(c net.Conn) {
 		fakePGTrustStartupB(b, c, 1, 2, func(c net.Conn) {
 			var hdr [5]byte
@@ -81,7 +81,7 @@ func benchPool(b *testing.B) *Pool {
 
 // BenchmarkPoolQuery: Pool.QueryContext + Next + Scan + Close (the native hot path).
 func BenchmarkPoolQuery(b *testing.B) {
-	p := benchPool(b)
+	p := rowsBenchPool(b)
 	ctx := context.Background()
 	b.Logf("sizeof(Rows)=%d sizeof(Row)=%d", unsafe.Sizeof(Rows{}), unsafe.Sizeof(Row{}))
 	var v int64
@@ -103,7 +103,7 @@ func BenchmarkPoolQuery(b *testing.B) {
 
 // BenchmarkPoolQueryRow: Pool.QueryRow(...).Scan.
 func BenchmarkPoolQueryRow(b *testing.B) {
-	p := benchPool(b)
+	p := rowsBenchPool(b)
 	ctx := context.Background()
 	var v int64
 	b.ReportAllocs()
