@@ -8,7 +8,7 @@ import (
 )
 
 // TestSendCancelRequestIgnoresExpiredCtx verifies that sendCancelRequest
-// uses its own background context with a 5s timeout rather than the
+// uses its own background context with a short timeout rather than the
 // caller-provided (potentially already-cancelled) context. Bug 1: the old
 // code passed ctx to DialContext, so an already-expired context caused the
 // cancel request to fail immediately.
