@@ -8,8 +8,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/goceleris/celeris/driver/postgres"
 )
 
 // TestCommitAndRollback verifies BEGIN + INSERT + COMMIT persists, and
@@ -181,7 +179,7 @@ func TestSavepointsViaConnRaw(t *testing.T) {
 // TestPoolTx exercises the non-database/sql Pool.BeginTx path.
 func TestPoolTx(t *testing.T) {
 	dsn := dsnFromEnv(t)
-	p, err := postgres.Open(dsn)
+	p, err := openPoolEngine(dsn)
 	if err != nil {
 		t.Fatalf("postgres.Open: %v", err)
 	}
