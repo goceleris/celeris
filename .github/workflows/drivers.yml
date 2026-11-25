@@ -103,6 +103,11 @@ jobs:
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
           ./test/conformance/postgres/...
+      # Rows streamed on the real event loop (64 rows or more): infinity and a real 9999-12-31 23:59:59 into a string.
+      - name: Streamed rows (event loop)
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          -run TestStreamedInfinityAgainstServer ./driver/postgres/
       # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
       # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
       # or has answered a request first (default-ready). Latest server version only.

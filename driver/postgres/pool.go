@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -110,7 +111,14 @@ func WithMaxLifetime(d time.Duration) Option { return func(o *options) { o.cfg.M
 // WithMaxIdleTime sets the max idle duration. Default: 5m.
 func WithMaxIdleTime(d time.Duration) Option { return func(o *options) { o.cfg.MaxIdleTime = d } }
 
-// WithStatementCacheSize sets the per-conn prepared-statement LRU capacity.
+// WithStatementCacheSize sets the per-conn prepared-statement LRU capacity
+// (default 256; the statement_cache_size DSN parameter does the same). A
+// statement with arguments is prepared on first use and cached by its text. A
+// connection that runs more distinct texts than n evicts the least recently
+// used one and closes it on the server: a protocol-level Close is sent ahead of
+// the query that evicted it, with no extra round trip and no wait. Pass values
+// as arguments, not in the SQL text, or size the cache to the number of
+// distinct texts: each miss costs a Parse and Describe round trip.
 func WithStatementCacheSize(n int) Option { return func(o *options) { o.cfg.StatementCacheSize = n } }
 
 // WithApplication sets the "application_name" startup parameter.
@@ -621,6 +629,16 @@ func (r *Rows) Next() bool {
 // must be a pointer. On the fast path (inner is *pgRows), Scan decodes
 // directly from the wire bytes into dest without ever materialising a
 // driver.Value — zero interface{} boxing per cell.
+//
+// A NULL cell never leaves its dest as it was, so a variable reused across
+// rows cannot carry the previous row's value. NULL sets dest to its zero
+// value: "" for *string, nil for *[]byte, *json.RawMessage, *any and a
+// pointer-to-pointer (**T, which a non-NULL value allocates), 0 for the
+// numeric kinds, false for *bool and the zero time.Time for *time.Time. A
+// sql.Scanner (sql.NullString, sql.NullInt64, ...) receives Scan(nil) and sets
+// Valid=false; scan into one, into *any or into **T when NULL must be told
+// apart from a zero value. A dest Scan does not support fails for NULL with
+// the same "unsupported scan dest type" error as for any other value.
 func (r *Rows) Scan(dest ...any) error {
 	if r.rawAvailable {
 		if len(dest) != len(r.rawRow) {
@@ -652,6 +670,11 @@ func (r *Rows) Scan(dest ...any) error {
 		if sr != nil && i < len(sr.current) && sr.current[i] != nil && i < len(sr.codecs) && i < len(sr.columns) {
 			// A streamed row: infinity into a string is read from the raw cell.
 			binaryFmt := !sr.textFormat && sr.columns[i].FormatCode != protocol.FormatText
+			if sr.codecs[i] == nil && binaryFmt {
+				if err := binaryOnlyGuard(dest[i], sr.codecs[i], sr.columns[i], binaryFmt); err != nil {
+					return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
+				}
+			}
 			if sr.codecs[i] != nil && isTimeOID(sr.codecs[i].OID) && rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
 				continue
 			}
@@ -690,6 +713,11 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		return assignNil(dest)
 	}
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
+	if codec == nil && binaryFmt {
+		if err := binaryOnlyGuard(dest, codec, col, binaryFmt); err != nil {
+			return err
+		}
+	}
 	// Binary format for known codecs — direct decode into typed pointer.
 	if codec != nil && binaryFmt {
 		if ok, err := decodeBinaryInto(dest, raw, codec); ok {
@@ -729,7 +757,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 	}
 	if textFormat || col.FormatCode == protocol.FormatText {
 		if codec.DecodeText != nil {
-			return codec.DecodeText(raw)
+			return decodeText(codec, raw)
 		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
@@ -739,7 +767,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 		return codec.DecodeBinary(raw)
 	}
 	if codec.DecodeText != nil {
-		return codec.DecodeText(raw)
+		return decodeText(codec, raw)
 	}
 	cp := make([]byte, len(raw))
 	copy(cp, raw)
@@ -781,8 +809,7 @@ func int64ToUint32(n int64) (uint32, error) {
 }
 
 // binaryFormIsValue reports whether a column of codec's type carries, in
-// binary result format, exactly the bytes a string or []byte destination
-// should receive. That holds for the text-like types (text, varchar, json) and
+// binary result format, exactly the bytes a string destination should receive. That holds for the text-like types (text, varchar, json) and
 // for bytea; every other registered codec decodes through its DecodeBinary.
 func binaryFormIsValue(codec *protocol.TypeCodec) bool {
 	switch codec.OID {
@@ -934,7 +961,16 @@ func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, erro
 	return false, nil
 }
 
-// assignNil zeros the pointed-to primitive when the column is NULL.
+// assignNil stores a NULL cell into dest. It never leaves dest as it was:
+// a variable reused across rows would otherwise carry the previous row's
+// value into a row whose column is NULL, with no error.
+//
+// The destination is set to its zero value: "" for *string, nil for
+// *[]byte, *json.RawMessage and *any, 0 for the numeric kinds, false for
+// *bool, the zero time.Time for *time.Time, and nil for a pointer-to-pointer
+// (**T). sql.Scanner destinations (sql.Null*, a user type) are handled by the
+// caller via Scan(nil). Any other destination fails with the error a non-NULL
+// value gets, so a destination Scan does not support never succeeds silently.
 func assignNil(dest any) error {
 	switch d := dest.(type) {
 	case *int:
@@ -947,6 +983,10 @@ func assignNil(dest any) error {
 		*d = 0
 	case *uint32:
 		*d = 0
+	case *float64:
+		*d = 0
+	case *float32:
+		*d = 0
 	case *string:
 		*d = ""
 	case *[]byte:
@@ -955,9 +995,17 @@ func assignNil(dest any) error {
 		*d = nil
 	case *bool:
 		*d = false
+	case *time.Time:
+		*d = time.Time{}
+	case *any:
+		*d = nil
 	default:
-		// Unknown target — let scanValue handle it via convertAssign(nil).
-		return scanValue(dest, nil)
+		// **T: a nullable column scans into *T as nil.
+		if rv := reflect.ValueOf(dest); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Pointer {
+			rv.Elem().SetZero()
+			return nil
+		}
+		return fmt.Errorf("unsupported scan dest type %T", dest)
 	}
 	return nil
 }
@@ -972,7 +1020,7 @@ func scanValue(dest any, v driver.Value) error {
 		return scanner.Scan(v)
 	}
 	if v == nil {
-		return nil
+		return assignNil(dest)
 	}
 	return convertAssign(dest, v)
 }
@@ -1104,6 +1152,16 @@ func convertAssign(dest any, src any) error {
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to time.Time", src)
 		}
 	default:
+		// **T: allocate a T and scan into it, so a nullable column scans
+		// into *T (nil for NULL, see assignNil).
+		if rv := reflect.ValueOf(dest); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Pointer {
+			nv := reflect.New(rv.Elem().Type().Elem())
+			if err := scanValue(nv.Interface(), src); err != nil {
+				return err
+			}
+			rv.Elem().Set(nv)
+			return nil
+		}
 		return fmt.Errorf("unsupported scan dest type %T", dest)
 	}
 	return nil
@@ -1158,7 +1216,8 @@ func (r Result) LastInsertId() (int64, error) {
 // CommandComplete tag.
 func (r Result) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 
-// Tx is the pool-level transaction wrapper.
+// Tx is the pool-level transaction wrapper. A Tx is obtained from
+// Pool.BeginTx; the zero value is not usable.
 type Tx struct {
 	inner *pgTx
 	conn  *pgConn

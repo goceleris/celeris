@@ -566,3 +566,62 @@ func TestJSONArrayCodecsRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// A time zone whose offset has seconds (Europe/Amsterdam before 1937 is
+// +00:19:32) prints the offset as +hh:mm:ss.
+func TestDecodeTimestamptzTextSecondOffset(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want time.Time
+	}{
+		{"1900-01-01 00:00:00+00:19:32", time.Date(1899, 12, 31, 23, 40, 28, 0, time.UTC)},
+		{"1900-01-01 12:00:00.5+00:19:32", time.Date(1900, 1, 1, 11, 40, 28, 500000000, time.UTC)},
+		{"1900-01-01 00:00:00-00:19:32", time.Date(1900, 1, 1, 0, 19, 32, 0, time.UTC)},
+		{"2024-01-02 03:04:05+05:30", time.Date(2024, 1, 1, 21, 34, 5, 0, time.UTC)},
+		{"2024-01-02 03:04:05+00", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)},
+	} {
+		v, err := decodeTimestamptzText([]byte(c.in))
+		if err != nil {
+			t.Errorf("%q: %v", c.in, err)
+			continue
+		}
+		if got := v.(time.Time); !got.Equal(c.want) {
+			t.Errorf("%q: got %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// bytea_output=escape (a role or database setting, or a pooler that did not
+// take the startup parameter) prints bytea in the escape form on the text
+// paths. A "\x" prefix is the hex form (an escape-form backslash is "\\", so
+// the two cannot be confused).
+func TestByteaTextDecodesHexAndEscape(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want []byte
+	}{
+		{`\x`, []byte{}},
+		{`\x00ff7a`, []byte{0, 0xff, 'z'}},
+		{``, []byte{}},
+		{`abc`, []byte("abc")},
+		{`a\\b`, []byte(`a\b`)},
+		{`\\x41`, []byte(`\x41`)},
+		{`\000\001\377`, []byte{0, 1, 0xff}},
+		{`a\134b`, []byte(`a\b`)},
+		{`with space 'q' "d"`, []byte(`with space 'q' "d"`)},
+	} {
+		got, err := decodeByteaText([]byte(c.in))
+		if err != nil {
+			t.Errorf("decodeByteaText(%q): %v", c.in, err)
+			continue
+		}
+		if b, _ := got.([]byte); !bytes.Equal(b, c.want) || b == nil {
+			t.Errorf("decodeByteaText(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+	for _, bad := range []string{`\`, `a\`, `\9`, `\08`, `\400`, `\12`, `\x0`, `\xzz`} {
+		if got, err := decodeByteaText([]byte(bad)); err == nil {
+			t.Errorf("decodeByteaText(%q) = %v, want an error", bad, got)
+		}
+	}
+}
