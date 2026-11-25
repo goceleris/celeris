@@ -17,8 +17,11 @@
 // behavior is tuned with functional [Option] values: [WithEngine],
 // [WithMaxOpen], [WithMaxIdlePerWorker], [WithMaxLifetime], [WithMaxIdleTime],
 // [WithHealthCheck], [WithStatementCacheSize], and [WithApplication].
-// [WithEngine] is optional and affects performance only: when set, the pool
-// shares the HTTP server's event loop instead of resolving a standalone one.
+// [WithEngine] is optional. When set on a server that has not started yet, the
+// pool shares the HTTP server's event loop instead of resolving a standalone
+// one; a bare [Open] and [WithEngine] on a server that has started or runs
+// async handlers give a direct-mode pool, whose results are capped at 64 MiB
+// (see [ErrResultTooBig]: always check [Rows.Err]).
 // [WithWorker] adds a per-call worker-affinity hint to a context.
 //
 // Query with [Pool.QueryContext] (returns [*Rows]), [Pool.QueryRow]
