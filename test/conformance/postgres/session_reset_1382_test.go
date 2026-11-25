@@ -44,7 +44,7 @@ type queryRower interface {
 	QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row
 }
 
-func pgPID(t *testing.T, ctx context.Context, q queryRower) int {
+func pgPID(ctx context.Context, t *testing.T, q queryRower) int {
 	t.Helper()
 	var pid int
 	if err := q.QueryRowContext(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
@@ -53,7 +53,7 @@ func pgPID(t *testing.T, ctx context.Context, q queryRower) int {
 	return pid
 }
 
-func nativePID(t *testing.T, ctx context.Context, p *postgres.Pool) int {
+func nativePID(ctx context.Context, t *testing.T, p *postgres.Pool) int {
 	t.Helper()
 	var pid int
 	if err := p.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
@@ -107,7 +107,7 @@ func TestReturnedMidTransactionDatabaseSQL(t *testing.T) {
 			}
 
 			// The next user, three statements: each must work.
-			if pid := pgPID(t, ctx, db); pid == pidA {
+			if pid := pgPID(ctx, t, db); pid == pidA {
 				t.Fatalf("the next user got the previous user's backend %d, still in a transaction", pid)
 			}
 			var n int
@@ -137,7 +137,7 @@ func TestReturnedMidTransactionNativePool(t *testing.T) {
 			}
 			t.Cleanup(func() { _, _ = p.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+tbl) })
 
-			pidA := nativePID(t, ctx, p)
+			pidA := nativePID(ctx, t, p)
 			// The native Pool has no pinned connection: one multi-statement
 			// query leaves the transaction open on the connection it ran on.
 			stmts := "BEGIN; INSERT INTO " + tbl + " VALUES ('uncommitted')"
@@ -153,7 +153,7 @@ func TestReturnedMidTransactionNativePool(t *testing.T) {
 			if !failed && err != nil {
 				t.Fatal(err)
 			}
-			if pid := nativePID(t, ctx, p); pid == pidA {
+			if pid := nativePID(ctx, t, p); pid == pidA {
 				t.Fatalf("the next caller got the previous caller's backend %d, still in a transaction", pid)
 			}
 			var n int
@@ -198,7 +198,7 @@ func TestForcedResetFailurePoisonedConnDiscarded(t *testing.T) {
 			t.Fatalf("innocent user %d: %v", i, err)
 		}
 	}
-	if pid := pgPID(t, ctx, db); pid == pidA {
+	if pid := pgPID(ctx, t, db); pid == pidA {
 		t.Fatalf("the next user got the poisoned backend %d", pid)
 	}
 }
@@ -252,7 +252,7 @@ func TestTxPathReusesConnection(t *testing.T) {
 	t.Run("database/sql", func(t *testing.T) {
 		db := resetDB(t)
 		ctx := resetCtx(t)
-		want := pgPID(t, ctx, db)
+		want := pgPID(ctx, t, db)
 		for i := 0; i < 6; i++ {
 			tx, err := db.BeginTx(ctx, nil)
 			if err != nil {
@@ -269,7 +269,7 @@ func TestTxPathReusesConnection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if pid := pgPID(t, ctx, db); pid != want {
+			if pid := pgPID(ctx, t, db); pid != want {
 				t.Fatalf("round %d: backend %d, want %d (the conn was not reused)", i, pid, want)
 			}
 		}
@@ -277,7 +277,7 @@ func TestTxPathReusesConnection(t *testing.T) {
 	t.Run("native", func(t *testing.T) {
 		p := resetPool(t)
 		ctx := resetCtx(t)
-		want := nativePID(t, ctx, p)
+		want := nativePID(ctx, t, p)
 		for i := 0; i < 6; i++ {
 			tx, err := p.BeginTx(ctx, nil)
 			if err != nil {
@@ -294,7 +294,7 @@ func TestTxPathReusesConnection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if pid := nativePID(t, ctx, p); pid != want {
+			if pid := nativePID(ctx, t, p); pid != want {
 				t.Fatalf("round %d: backend %d, want %d (the conn was not reused)", i, pid, want)
 			}
 		}
