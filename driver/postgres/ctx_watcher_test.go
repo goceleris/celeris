@@ -168,7 +168,7 @@ func ctxEnds(kind string, d time.Duration) (context.Context, context.CancelFunc)
 	return ctx, cancel
 }
 
-func runSlow(p *Pool, ctx context.Context, query bool) error {
+func runSlow(ctx context.Context, p *Pool, query bool) error {
 	if !query {
 		_, err := p.ExecContext(ctx, "SELECT slow")
 		return err
@@ -196,7 +196,7 @@ func TestDirectPoolEnforcesAContextDeadlineMidStatement(t *testing.T) {
 				ctx, cancel := ctxEnds(kind, 100*time.Millisecond)
 				defer cancel()
 				errc := make(chan error, 1)
-				go func() { errc <- runSlow(p, ctx, stmt == "query") }()
+				go func() { errc <- runSlow(ctx, p, stmt == "query") }()
 				var err error
 				select {
 				case err = <-errc:
@@ -235,7 +235,7 @@ func TestDirectPoolDiscardsTheConnWhenTheCancelIsNotConfirmed(t *testing.T) {
 			ctx, cancel := ctxEnds(kind, 50*time.Millisecond)
 			defer cancel()
 			errc := make(chan error, 1)
-			go func() { errc <- runSlow(p, ctx, false) }()
+			go func() { errc <- runSlow(ctx, p, false) }()
 			var err error
 			select {
 			case err = <-errc:
