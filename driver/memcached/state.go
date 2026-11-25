@@ -400,8 +400,11 @@ func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 	s.bridge.Pop()
 	req.binStatus = p.Status()
 	if p.Status() == protocol.StatusOK {
-		// GET-style replies carry the value in p.Value.
-		if len(p.Value) > 0 {
+		// GET-style replies carry the value in p.Value. A GET-class reply
+		// carries the 4-byte flags in extras even when the value is empty,
+		// and a storage reply carries no extras, so extras tell an empty hit
+		// from a storage ack.
+		if len(p.Value) > 0 || len(p.Extras) >= 4 {
 			item := valueItem{
 				Key:  string(p.Key),
 				CAS:  p.Header.CAS,
