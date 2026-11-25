@@ -21,7 +21,7 @@ Full documentation lives at [goceleris.dev](https://goceleris.dev).
 - **io_uring and epoll at parity** — both native engines deliver equivalent throughput; an adaptive meta-engine picks and transplants between them at runtime.
 - **Inline broadcast egress** (v1.5.7) — WebSocket and SSE fan-out now writes inline on the dispatch goroutine on native engines, lifting the single-loop-thread broadcast ceiling.
 - **Zero hot-path allocations** on the HTTP/1.1 and h2c fast paths — pool-based contexts and pre-encoded HPACK responses.
-- **First-party event-loop drivers** — native PostgreSQL, Redis, and memcached clients that colocate socket I/O with your handlers, no CGo, no separate reactor.
+- **First-party event-loop drivers (beta)** — native PostgreSQL, Redis, and memcached clients that colocate socket I/O with your handlers, no CGo, no separate reactor.
 - **Continuously validated** — an adversarial [probatorium](https://github.com/goceleris/probatorium) cluster matrix runs nightly, plus a deeper weekend soak; see the badges above.
 
 ## What's new in v1.6.0
@@ -32,7 +32,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 - **Tiered io_uring** — auto-selects the best io_uring feature set (multishot accept/recv, provided buffers, SQ poll, fixed files) for your kernel.
 - **Edge-triggered epoll** — per-core event loops with CPU pinning.
 - **Adaptive meta-engine** — transplants between io_uring and epoll at runtime based on telemetry.
-- **First-party database drivers** — native [`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis), and [`driver/memcached`](driver/memcached) run on the celeris event loop (see [Database drivers](#database-drivers)).
+- **First-party database drivers (beta)** — native [`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis), and [`driver/memcached`](driver/memcached) run on the celeris event loop (see [Database drivers](#database-drivers)).
 - **Zero-copy HTTP/1.1 parser** — the parser returns header and body slices that alias the bytes it parses instead of copying them. On epoll and io_uring, a request that arrives whole in one read, with no body or a `Content-Length` body, and runs inline is parsed in place in the engine's read buffer; a request that spans reads, has a chunked body, or runs on an async handler is served from a per-connection buffer instead.
 - **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK, inline handler execution, zero-alloc HEADERS fast path.
 - **Auto-detect** — protocol negotiation from the first bytes on the wire.
@@ -298,12 +298,19 @@ Celeris ships first-party, event-loop-native database drivers that run their soc
 
 Colocate a driver with the server via its `WithEngine` option so commands issue on the loop instead of dialing out on a blocking goroutine. See [goceleris.dev](https://goceleris.dev) for driver guides.
 
-The drivers have no TLS stack: connect them over a trusted network (loopback, a VPC, a private link) or through a TLS sidecar. They refuse rather than silently downgrade when TLS is mandatory:
-- Postgres returns `ErrSSLNotSupported` for `sslmode=require`, `verify-ca` and `verify-full`. `prefer` and `allow` connect in plaintext and print a warning.
-- Redis rejects `rediss://` addresses.
-- Memcached has no TLS option.
+**The drivers are beta.** The exported API of the driver packages stays under the compatibility check, but behaviour fixes (what a value scans to, which cases return an error) may land in minor releases and are listed in the release notes. What each driver reads and writes, with the known gaps, is on [PostgreSQL types](https://goceleris.dev/docs/postgres-types), [Redis replies](https://goceleris.dev/docs/redis-replies) and [Memcached behavior](https://goceleris.dev/docs/memcached-behavior).
 
-Driver-side TLS is part of [#446](https://github.com/goceleris/celeris/issues/446).
+### Known open
+
+These are open at this release and planned for v1.6.1. Each line names its issue.
+
+- **PostgreSQL types:** a column type the driver has no decoder for (`time`, `interval`, `inet`, `cidr`, `macaddr`, `oid`, ranges and others) is an error into a native `*string` and raw wire bytes through `database/sql`; cast it to text in the query ([#1352](https://github.com/goceleris/celeris/issues/1352)). A multi-dimensional array is an error ([#1350](https://github.com/goceleris/celeris/issues/1350)); an array cannot be scanned into a `string` or `[]byte` ([#1351](https://github.com/goceleris/celeris/issues/1351)); a `float8` read over the simple protocol loses digits when the role sets `extra_float_digits` to 0 or less ([#1364](https://github.com/goceleris/celeris/issues/1364)).
+- **PostgreSQL arguments:** these are rejected with an error: a `[]byte` for a `jsonb` parameter ([#1347](https://github.com/goceleris/celeris/issues/1347)), Go slices for arrays ([#1348](https://github.com/goceleris/celeris/issues/1348)), a `time.Time` for a `time` column ([#1349](https://github.com/goceleris/celeris/issues/1349)), `sql.Null*`, `driver.Valuer`, defined types and pointers on the native `Pool` ([#1359](https://github.com/goceleris/celeris/issues/1359)) and a `[16]byte` for a `uuid` ([#1361](https://github.com/goceleris/celeris/issues/1361)).
+- **PostgreSQL statements and contexts:** a statement cached on a connection fails with SQLSTATE 0A000 after `ALTER COLUMN ... TYPE` ([#1360](https://github.com/goceleris/celeris/issues/1360)); on a native `Pool` connection in direct mode, cancelling a context does not interrupt a running statement ([#1375](https://github.com/goceleris/celeris/issues/1375)); a failed session reset under `database/sql` is not reported ([#1382](https://github.com/goceleris/celeris/issues/1382)); the other cancel cases are [#1383](https://github.com/goceleris/celeris/issues/1383), [#1384](https://github.com/goceleris/celeris/issues/1384), [#1389](https://github.com/goceleris/celeris/issues/1389), [#1391](https://github.com/goceleris/celeris/issues/1391) and [#1392](https://github.com/goceleris/celeris/issues/1392).
+- **All three drivers:** a context that ends while the pool dials a connection returns the dialer's own error, `dial tcp ...: i/o timeout`, which can match `os.ErrDeadlineExceeded` instead of `context.DeadlineExceeded`; test both ([#1396](https://github.com/goceleris/celeris/issues/1396)).
+- **Redis:** on a `ClusterClient`, a command whose context ends marks a node failing ([#1397](https://github.com/goceleris/celeris/issues/1397)); `MGet` and `HMGet` return an empty string for a missing key ([#1406](https://github.com/goceleris/celeris/issues/1406)); a single write above the per-write limit fails with `ErrQueueFull` on the client's own event loop ([#1357](https://github.com/goceleris/celeris/issues/1357)).
+- **Engines:** an idle server costs CPU on the native engines, about 1.7% of one CPU with 3 epoll loops and about 0.25% with 3 io_uring loops, measured once on an arm64 virtual machine ([#1381](https://github.com/goceleris/celeris/issues/1381)); `Config.Workers` of 1 is refused ([#1379](https://github.com/goceleris/celeris/issues/1379)); a driver opened with `WithEngine` on a server whose `Config.Engine` is unset uses its integrated path rather than the direct one, even with `.Async()` routes ([#1376](https://github.com/goceleris/celeris/issues/1376)); on arm64 the WebSocket echo p99 at light load on the native engines is 1.80 to 2.03 times the std engine's (median of five runs on one host, [#1318](https://github.com/goceleris/celeris/issues/1318)), and the loop engines' light-load round-trip p99 is about twice the std engine's, cause not established ([#1380](https://github.com/goceleris/celeris/issues/1380)).
+- **Middleware:** the `timeout` middleware's context reports its own deadline even when its parent context has an earlier one ([#1393](https://github.com/goceleris/celeris/issues/1393)).
 
 ### Platform support
 
