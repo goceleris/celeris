@@ -132,10 +132,15 @@ type Config struct {
 	// established; the reserve is provisional, its effect on latency is still
 	// being measured, and it may change (celeris#756, #757). A Workers you set
 	// is honoured as it is, so to opt out of the reserve set Workers to
-	// runtime.GOMAXPROCS(0): on such a host that starts one loop per P, as
-	// before the reserve (on a big.LITTLE host the default is not reduced, see
-	// below, and a Workers set above the non-little CPUs wraps loops over
-	// them). What follows the loop count follows the loops started: Metrics.Workers,
+	// max(2, runtime.GOMAXPROCS(0)): on such a host that starts one loop per P,
+	// as before the reserve (on a big.LITTLE host the default is not reduced,
+	// see below, and a Workers set above the non-little CPUs wraps loops over
+	// them). The minimum of a Workers you set is 2: a 1 is refused when the
+	// server starts (Start returns a config validation error, "workers must be
+	// >= 2 if set, got 1", on every engine), so on a host with one CPU the
+	// recipe is max(2, ...), which is 2, and runtime.GOMAXPROCS(0) alone, which
+	// is 1 there, fails. Leave Workers unset to take the default, which starts 2
+	// loops on such a host (io_uring fewer when RLIMIT_MEMLOCK caps it). What follows the loop count follows the loops started: Metrics.Workers,
 	// the server-wide limit of MaxConns, and a driver pool sized from the
 	// engine's NumWorkers (a PostgreSQL pool opened with WithEngine, whose
 	// default of 4*NumWorkers is 56, not 64, on 16 CPUs). A pool sized from
