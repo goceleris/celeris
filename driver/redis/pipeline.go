@@ -48,8 +48,10 @@ const defaultPipelineCap = 128
 //
 // A Pipeline runs once: queue commands, call [Pipeline.Exec] once, read the
 // results, then [Pipeline.Release] (or [Pipeline.Discard] to queue a new
-// batch). A second Exec returns an error. A Result read before Exec, or after
-// an Exec that failed, returns an error.
+// batch). A second Exec after a successful one returns an error. After an
+// Exec that failed, each Result returns that error, and queueing commands
+// starts a new batch that the next Exec sends. A Result read before Exec
+// returns an error.
 //
 // Pipeline is NOT safe for concurrent use. A caller must not invoke methods
 // on the same Pipeline from multiple goroutines at once.
@@ -106,6 +108,12 @@ type Pipeline struct {
 	// Discard/Release. A second Exec returns errPipelineExecuted instead of
 	// waiting for replies to commands it never sent.
 	executed bool
+
+	// failed is set when Exec failed after sending. The command list is kept
+	// so each Result reports the real error, but the batch is over: the next
+	// command queued starts a new one (the pipeline stays usable, as in
+	// v1.5.11), and an Exec with nothing new queued sends nothing.
+	failed bool
 }
 
 // pipeCmd holds the per-command state populated by Exec. When direct is true,
@@ -213,7 +221,7 @@ func (p *Pipeline) Release() {
 // Pipeline can be handed to a new caller without re-allocating its
 // internals.
 func (p *Pipeline) reset() {
-	p.w.Reset()
+	p.resetRequests()
 	// Zero used slots so previously-retained pointers (if any leaked) don't
 	// observe stale values.
 	for i := range p.cmds {
@@ -241,6 +249,15 @@ func (p *Pipeline) reset() {
 		p.boolCmds[i] = BoolCmd{}
 	}
 	p.boolCmds = p.boolCmds[:0]
+	p.strSlab = p.strSlab[:0]
+	p.executed = false
+	p.failed = false
+}
+
+// resetRequests clears the wire buffer and the per-request state of the last
+// Exec, leaving the command list and its results alone.
+func (p *Pipeline) resetRequests() {
+	p.w.Reset()
 	// Clear reqs refs; slab-backed requests are retained on p.reqSlab.
 	for i := range p.reqs {
 		p.reqs[i] = nil
@@ -256,8 +273,6 @@ func (p *Pipeline) reset() {
 	}
 	p.reqSlab = p.reqSlab[:0]
 	p.argsScratch = p.argsScratch[:0]
-	p.strSlab = p.strSlab[:0]
-	p.executed = false
 }
 
 // Discard drops all queued commands without sending anything. The Pipeline
@@ -270,14 +285,16 @@ func (p *Pipeline) Discard() {
 // reply is received. Returns the first parse/transport error; per-command
 // errors are reachable via each *Cmd.Result().
 //
-// A Pipeline runs once: a second Exec returns an error at once (it does not
-// block or touch a connection). Call [Pipeline.Discard] to queue a new batch.
+// A Pipeline runs once: a second Exec after a successful Exec returns an
+// error at once (it does not block or touch a connection); call
+// [Pipeline.Discard] to queue a new batch. An Exec that fails leaves the
+// Pipeline usable: queue the commands again and call Exec again.
 func (p *Pipeline) Exec(ctx context.Context) error {
 	if p.executed {
 		return errPipelineExecuted
 	}
 	n := len(p.cmds)
-	if n == 0 {
+	if n == 0 || p.failed {
 		return nil
 	}
 	conn, err := p.client.pool.acquireCmd(ctx, workerFromCtx(ctx))
@@ -366,9 +383,18 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 			}
 			reqs[i] = nil
 		}
-		p.w.Reset()
-		p.cmds = p.cmds[:0]
-		p.reqs = p.reqs[:0]
+		// Keep the command list so each Result reports the real error (a
+		// deadline, a closed conn) instead of "released"; a command whose
+		// request never came back gets the error too. The batch is over: the
+		// next queued command starts a new one.
+		for i := range p.cmds {
+			if p.cmds[i].err == nil && !p.cmds[i].direct && p.cmds[i].val == nil {
+				p.cmds[i].err = err
+			}
+		}
+		p.resetRequests()
+		p.executed = false
+		p.failed = true
 		// Give the pool slot back (celeris#1268). Every error execManyCore
 		// returns has closed the conn first (as does the ErrClosed of a conn
 		// that was already closed), and releaseCmd discards a closed conn, so
@@ -397,11 +423,20 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 	if cap(conn.state.copySlab) > maxSlabRetain {
 		conn.state.copySlab = nil
 	}
+	// A reply error that came with the conn closing (the server dropped it)
+	// is a failed Exec like the one above, not a command's error reply: the
+	// Pipeline stays usable. Read it before the conn goes back to the pool.
+	connLost := firstErr != nil && conn.closed.Load()
 	p.client.pool.releaseCmd(conn)
 	p.w.Reset()
 	// Leave p.cmds populated so the user can read Result() off each typed
 	// handle. The slabs are fully reset only on Release/Discard.
 	p.reqs = p.reqs[:0]
+	if connLost {
+		p.resetRequests()
+		p.executed = false
+		p.failed = true
+	}
 	return firstErr
 }
 
@@ -462,6 +497,9 @@ func (p *Pipeline) slabStr(s string) string {
 // tracking pipeCmd. Callers must NOT hold a pointer into p.cmds across
 // additional addCmd calls — the underlying array may reallocate.
 func (p *Pipeline) addCmd(kind cmdKind, args ...string) int {
+	if p.failed {
+		p.reset()
+	}
 	p.w.AppendCommand(args...)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
 	return len(p.cmds) - 1
@@ -469,6 +507,9 @@ func (p *Pipeline) addCmd(kind cmdKind, args ...string) int {
 
 // addCmd2 is the 2-arg fast path that avoids the variadic []string alloc.
 func (p *Pipeline) addCmd2(kind cmdKind, a0, a1 string) int {
+	if p.failed {
+		p.reset()
+	}
 	p.w.AppendCommand2(a0, a1)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
 	return len(p.cmds) - 1
@@ -476,6 +517,9 @@ func (p *Pipeline) addCmd2(kind cmdKind, a0, a1 string) int {
 
 // addCmd3 is the 3-arg fast path.
 func (p *Pipeline) addCmd3(kind cmdKind, a0, a1, a2 string) int {
+	if p.failed {
+		p.reset()
+	}
 	p.w.AppendCommand3(a0, a1, a2)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
 	return len(p.cmds) - 1
