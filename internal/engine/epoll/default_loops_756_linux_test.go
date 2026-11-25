@@ -14,7 +14,7 @@ import (
 )
 
 // celeris#756, #757: an epoll engine whose worker count is not set by the user
-// starts GOMAXPROCS - max(1, GOMAXPROCS/8) loops on a host of alike CPUs (none
+// starts GOMAXPROCS - max(1, GOMAXPROCS/4) loops on a host of alike CPUs (none
 // for a GOMAXPROCS of 2 or less; Resolve raises a count to two), and a count
 // the user sets is started whole. This is the real planner and real engine, no
 // stub: Metrics().Workers, NumWorkers(), the loops and the "listening" line
@@ -37,11 +37,11 @@ func TestDefaultLoopsLeaveAReserve756(t *testing.T) {
 		workers    int // Resources.Workers; 0 = the default
 		want       int // loops started
 	}{
-		{16, 0, 14},  // the default: 16 Ps, 14 loops (rc1: 16)
+		{16, 0, 12},  // the default: 16 Ps, 12 loops (rc1: 16, first reserve: 14)
 		{16, 16, 16}, // Workers = GOMAXPROCS: one loop per P, as before
 		{16, 5, 5},   // a user-set count is kept whole
 		{16, 20, 20}, // also above GOMAXPROCS
-		{8, 0, 7},
+		{8, 0, 6},
 		{4, 0, 3},
 		{3, 0, 2},
 		{2, 0, 2}, // no reserve at two

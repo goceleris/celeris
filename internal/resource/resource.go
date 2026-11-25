@@ -34,7 +34,7 @@ type Resources struct {
 	// count was not user-set: on a host whose CPUs differ in capacity they then
 	// start at most one pinned loop per non-little CPU, min(GOMAXPROCS,
 	// non-little CPUs) (celeris#1036), and on a host whose CPUs are alike (Linux)
-	// they start the resolved count less a reserve of max(1, count/8) loops
+	// they start the resolved count less a reserve of max(1, count/4) loops
 	// (none for a count of 2 or less) that leaves Ps to the goroutines that are
 	// not loops (celeris#756, #757): the loops started are what the engines
 	// report, not Resolve's figure. A count set here is honoured, wrapping over
