@@ -55,7 +55,7 @@ func dsnFromEnv(t *testing.T) string {
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := dsnFromEnv(t)
-	db, err := sql.Open(driverName, dsn)
+	db, err := openSQLEngine(dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
