@@ -944,6 +944,31 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 	if c.directBuf == nil {
 		c.directBuf = make([]byte, 16<<10)
 	}
+	// A direct conn waits in a socket read that does not look at the context.
+	// A context with a deadline is enforced through the socket's read deadline:
+	// it is set to the context's deadline for this statement and cleared when
+	// the statement ends. Nothing is registered with the context (no
+	// context.AfterFunc, no goroutine, whatever the context type): a context
+	// without a deadline (Background, the HTTP/1 and HTTP/2 request contexts, a
+	// cancel-only context) costs one Deadline() call and a branch, and a
+	// statement under it returns when the server answers, as in v1.5.11 (it
+	// does not wake the read; ctx.Err() below is looked at each time a read
+	// returns, so a context cancelled before the reply is complete cancels the
+	// statement when a partial reply arrives, as in v1.5.11). A
+	// timeout is recognised by the clock against the context's deadline, not by
+	// ctx.Err(), which a timer context may not have set yet. The startup is
+	// bounded by startupBound and is left alone.
+	dl, hasDL := ctx.Deadline()
+	if hasDL && req.kind != reqStartup {
+		_ = c.tcp.SetReadDeadline(dl)
+		defer func() {
+			if !c.closed.Load() {
+				_ = c.tcp.SetReadDeadline(time.Time{})
+			}
+		}()
+	} else {
+		hasDL = false
+	}
 	for {
 		if req.doneAtom.Load() != 0 {
 			select {
@@ -953,36 +978,7 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return req.err
 		}
 		if err := ctx.Err(); err != nil {
-			// Returns once the cancel exchange finished; a conn whose
-			// exchange did not is failed (discarded), nothing to drain.
-			if !c.cancelRunning() {
-				return err
-			}
-			// Bounded wait for the server's Error + RFQ response so we
-			// leave the wire aligned. If the server doesn't drain within
-			// 30s we fail the conn to prevent a stuck reader.
-			deadline := time.Now().Add(cancelDrainTimeout)
-			_ = c.tcp.SetReadDeadline(deadline)
-			for req.doneAtom.Load() == 0 {
-				n, rerr := c.tcp.Read(c.directBuf)
-				if n > 0 {
-					c.onRecv(c.directBuf[:n])
-				}
-				if rerr != nil {
-					break
-				}
-			}
-			if req.doneAtom.Load() == 0 {
-				// The drain ended without the reply (deadline or EOF): the request is
-				// still pending, and a conn put back into the pool would hand the late
-				// reply to the next statement. Fail it, as wait and
-				// awaitDirectWithCancel do.
-				c.failAll(errors.New("celeris-postgres: cancel timeout draining direct-mode req"))
-				_ = c.closeDirect()
-				return err
-			}
-			_ = c.tcp.SetReadDeadline(time.Time{})
-			return err
+			return c.cancelDrainDirect(req, err)
 		}
 		if c.tcpFd > 0 {
 			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.directBuf, msgDontWait); n > 0 {
@@ -1002,6 +998,18 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			c.onRecv(c.directBuf[:n])
 		}
 		if err != nil {
+			if hasDL && errors.Is(err, os.ErrDeadlineExceeded) && (ctx.Err() != nil || !time.Now().Before(dl)) {
+				// The context's deadline (nothing else sets a read deadline while
+				// this one is armed; the clock test is the check for a context whose
+				// Err is not set yet, and ctx.Err() covers a wall-clock step
+				// backwards under a deadline without a monotonic reading): the
+				// statement is cancelled and the caller gets the context's error.
+				cerr := ctx.Err()
+				if cerr == nil {
+					cerr = context.DeadlineExceeded
+				}
+				return c.cancelDrainDirect(req, cerr)
+			}
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
 			}
@@ -1010,6 +1018,43 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			return err
 		}
 	}
+}
+
+// cancelDrainDirect is driveDirect's reaction to a context that ended while the
+// statement ran: the cancel exchange (#1373), then a bounded wait for the
+// cancelled statement's Error + ReadyForQuery so the wire stays aligned, and err
+// (the context's error) to the caller. A conn whose cancel exchange did not
+// finish, or whose drain ended without the reply, is failed: it is discarded.
+func (c *pgConn) cancelDrainDirect(req *pgRequest, err error) error {
+	// Returns once the cancel exchange finished; a conn whose exchange did not
+	// is failed (discarded), nothing to drain.
+	if !c.cancelRunning() {
+		return err
+	}
+	// Bounded wait for the server's Error + RFQ response so we leave the wire
+	// aligned. If the server doesn't drain within cancelDrainTimeout we fail the
+	// conn to prevent a stuck reader.
+	_ = c.tcp.SetReadDeadline(time.Now().Add(cancelDrainTimeout))
+	for req.doneAtom.Load() == 0 {
+		n, rerr := c.tcp.Read(c.directBuf)
+		if n > 0 {
+			c.onRecv(c.directBuf[:n])
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	if req.doneAtom.Load() == 0 {
+		// The drain ended without the reply (deadline or EOF): the request is
+		// still pending, and a conn put back into the pool would hand the late
+		// reply to the next statement. Fail it, as wait and
+		// awaitDirectWithCancel do.
+		c.failAll(errors.New("celeris-postgres: cancel timeout draining direct-mode req"))
+		_ = c.closeDirect()
+		return err
+	}
+	_ = c.tcp.SetReadDeadline(time.Time{})
+	return err
 }
 
 // closeDirect tears down the direct-mode tcp connection exactly once.
