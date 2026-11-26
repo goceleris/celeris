@@ -245,7 +245,9 @@ func multiSetRejected(m *multiSetMode, out multiSetOut, n int) string {
 		}
 		return ""
 	}
-	if m.buffered {
+	// Below 64 rows (streamThreshold) nothing streams, in any mode: the reply is
+	// buffered whole and the answer is the error and no rows.
+	if m.buffered || n < 64 {
 		return fmt.Sprintf("a buffered reply returned rows (%d) instead of the error", len(out.rows))
 	}
 	if strings.Join(out.cols, ",") != "first_col_a,first_col_b" {
@@ -299,10 +301,10 @@ func TestMultiStatementSameShapeRejected(t *testing.T) {
 		t.Run(m.name, func(t *testing.T) {
 			for i := 0; i < multiSetRounds(); i++ {
 				out := m.query(ctx, "SELECT 1 AS x; SELECT 2 AS x")
-				if out.queryErr == nil && (len(out.rows) != 1 || out.rowsErr == nil) {
-					t.Fatalf("%s: SELECT 1 AS x; SELECT 2 AS x = %+v", m.name, out)
+				if out.queryErr == nil {
+					t.Fatalf("%s: SELECT 1 AS x; SELECT 2 AS x = %+v, want the error and no rows", m.name, out)
 				}
-				if out.queryErr != nil && !strings.Contains(out.queryErr.Error(), multiSetErr) {
+				if !strings.Contains(out.queryErr.Error(), multiSetErr) {
 					t.Fatalf("%s: %v", m.name, out.queryErr)
 				}
 			}

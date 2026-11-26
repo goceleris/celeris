@@ -326,7 +326,10 @@ func checkMultiRejected(t *testing.T, r *multiRunner, res multiResult, n int) {
 		}
 		return
 	}
-	if !r.loop {
+	// Below streamThreshold nothing streams, in any mode (a set promotes to
+	// streaming at its 64th row): the reply is buffered whole, so the answer is
+	// the error and no rows, event loop included.
+	if !r.loop || n < streamThreshold {
 		t.Errorf("%s: the buffered path returned rows (%d), want the error and no rows", r.name, len(res.rows))
 	}
 	wantFirstSet(t, res, n)
@@ -399,7 +402,7 @@ func TestMultiResultSetsSameShapeAndThree(t *testing.T) {
 			for round := 0; round < 20; round++ {
 				for _, n := range []int{3, 100} {
 					res := r.query(ctx, "SAME "+strconv.Itoa(n))
-					if res.queryErr == nil && !r.loop {
+					if res.queryErr == nil && (!r.loop || n < streamThreshold) {
 						t.Fatalf("SAME %d: no error: cols=%v rows=%d", n, res.cols, len(res.rows))
 					}
 					if res.queryErr != nil {
