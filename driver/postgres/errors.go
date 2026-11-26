@@ -31,7 +31,7 @@ var ErrTxCommitRollback = errors.New("celeris-postgres: commit unexpectedly resu
 // ErrRowsOpen is returned by a statement started on a connection that still has
 // a Rows open: a result that is streaming (the server has not finished sending
 // it) and whose consumer has not read it to the end or closed it. A result under
-// 64 rows is buffered whole when the call returns and does not count, nor does a
+// 64 rows (64 or more stream) is buffered whole when the call returns and does not count, nor does a
 // larger one the connection has already received in full. The wire carries one
 // statement at a time, and the rows of the first one are read by the code that
 // has not got to them yet: the second statement would wait for the first, which
@@ -39,12 +39,15 @@ var ErrTxCommitRollback = errors.New("celeris-postgres: commit unexpectedly resu
 // any lock or sends anything.
 //
 // It is what a *database/sql.Tx or *database/sql.Conn returns for Exec, Query,
-// QueryRow, Prepare and (Conn) Ping while a Rows of it is open, and what a [Tx] of
+// QueryRow, Prepare (a statement already in the connection's cache is served: it
+// sends nothing) and (Conn) Ping while a Rows of it is open, and what a [Tx] of
 // a [Pool] returns for ExecContext, QueryContext, QueryRow, Savepoint,
 // ReleaseSavepoint, RollbackToSavepoint and Commit. It matches with errors.Is,
 // also through database/sql, which returns the driver's error as it is. It does
 // not match [driver.ErrBadConn], so database/sql neither discards the connection
-// nor retries the statement. The open Rows is not disturbed: it goes on
+// nor retries the statement (the one exception is ResetSession, which wraps every
+// failure with it; database/sql only calls it for a connection no Rows is open
+// on). The open Rows is not disturbed: it goes on
 // delivering its rows, and Close, or reading it to the end, frees the
 // connection for the next statement.
 //

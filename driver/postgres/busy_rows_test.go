@@ -482,6 +482,7 @@ func TestBusyCancelThenCloseThenNext(t *testing.T) {
 	iters := busyIters()
 	c := busyDial(t, busyFakeServer(t), false)
 	var dc sync.Mutex
+	streamed := 0
 	for i := 0; i < iters; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		r1, err := c.QueryContext(ctx, "fast:800", nil)
@@ -489,6 +490,9 @@ func TestBusyCancelThenCloseThenNext(t *testing.T) {
 			t.Fatalf("iteration %d: first statement: %v", i, err)
 		}
 		busyNext(t, r1, 1)
+		if _, ok := r1.(*streamRows); ok {
+			streamed++
+		}
 		cancel()
 		dc.Lock()
 		_ = r1.Close()
@@ -518,6 +522,10 @@ func TestBusyCancelThenCloseThenNext(t *testing.T) {
 			t.Fatalf("iteration %d: the statement after cancel + Close got %v (busy = %v), want nil", i, err, isRowsOpenErr(err))
 		}
 	}
+	// The loop is only a test of the window when the first statement streams.
+	if streamed < iters/4 {
+		t.Fatalf("only %d of %d first statements streamed: the loop does not exercise the window", streamed, iters)
+	}
 }
 
 // TestBusyCancelWithoutCloseThenNext: the shape that is not helped: cancel, no
@@ -529,6 +537,7 @@ func TestBusyCancelWithoutCloseThenNext(t *testing.T) {
 	iters := busyIters()
 	c := busyDial(t, busyFakeServer(t), false)
 	busyN, okN := 0, 0
+	streamed := 0
 	for i := 0; i < iters; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		r1, err := c.QueryContext(ctx, "fast:800", nil)
@@ -536,6 +545,9 @@ func TestBusyCancelWithoutCloseThenNext(t *testing.T) {
 			t.Fatalf("iteration %d: first statement: %v", i, err)
 		}
 		busyNext(t, r1, 1)
+		if _, ok := r1.(*streamRows); ok {
+			streamed++
+		}
 		cancel()
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 		err, _ = busyWatch(t, fmt.Sprint("iteration ", i, ": next statement"), 15*time.Second, func() error {
@@ -559,6 +571,9 @@ func TestBusyCancelWithoutCloseThenNext(t *testing.T) {
 		}
 		cancel2()
 	}
-	t.Logf("cancel without Close, then the next statement at once: %d ok, %d ErrRowsOpen of %d", okN, busyN, iters)
+	t.Logf("cancel without Close, then the next statement at once: %d ok, %d ErrRowsOpen of %d (%d streamed)", okN, busyN, iters, streamed)
+	if streamed < iters/4 {
+		t.Fatalf("only %d of %d first statements streamed: the loop does not exercise the window", streamed, iters)
+	}
 	busyMarks(t, c, "after the iterations")
 }

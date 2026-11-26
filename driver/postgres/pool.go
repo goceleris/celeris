@@ -605,7 +605,7 @@ var errRowsClosed = errors.New("celeris-postgres: Rows are closed")
 // error. It does NOT end when the context passed to the call that opened it is
 // cancelled or expires: the driver reads that context only until the call has
 // returned, so a cancelled Rows must be closed like any other. While a result
-// that streams (more than 64 rows, not yet fully received) is open on a [Tx],
+// that streams (64 rows or more, not yet fully received) is open on a [Tx],
 // the next statement of that Tx returns [ErrRowsOpen]; close the Rows first.
 // The iteration API matches database/sql.Rows:
 //
@@ -1452,7 +1452,7 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 
 // QueryContext runs a query on the pinned conn. The returned Rows must be
 // closed before Commit and before the next statement of the Tx: while a result
-// that streams (more than 64 rows, not yet fully received) is open, the next
+// that streams (64 rows or more, not yet fully received) is open, the next
 // statement returns [ErrRowsOpen], and a Rows ends by Close, by being read to the
 // end, or by an error, not by the cancellation of ctx.
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {

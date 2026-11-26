@@ -774,8 +774,11 @@ type pgConn struct {
 
 	// streaming is the request whose Rows is streaming and still being received:
 	// set by promoteToStreaming before the caller is woken with the Rows, and
-	// cleared before the request's rowCh is closed at its end (dispatchHead,
-	// failAll). While it is set the conn is busy: the loop worker is delivering
+	// cleared at its end: by dispatchHead before the request's rowCh is closed (a
+	// consumer that sees the end of its rows must meet no stale mark), by failAll
+	// after it (a promotion racing it must not set the mark again; the conn is
+	// marked closed by then, so no statement sees ErrRowsOpen from it), and, as a
+	// backstop, by finish and fail. While it is set the conn is busy: the loop worker is delivering
 	// that request's rows to a consumer that is not reading them yet, and a
 	// second statement would wait for it with locks held and no way out
 	// (rowsOpenErr). nil when no stream is in flight, which is every conn but one
