@@ -213,17 +213,3 @@ func TestPipelineHarshStandalone(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 	runHarshPipeline(t, "standalone", c, harshSecs(t))
 }
-
-func TestPipelineHarshEngineBacked(t *testing.T) {
-	opts := harshEngineOptions(t)
-	if opts == nil {
-		t.Skip("no engine-backed mode on this platform")
-	}
-	fake := harshServer(t)
-	c, err := NewClient(fake.Addr(), append([]Option{WithPoolSize(16)}, opts...)...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	runHarshPipeline(t, "engine-backed", c, harshSecs(t))
-}

@@ -11,6 +11,7 @@ package redis
 import (
 	"bufio"
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -37,9 +38,19 @@ func closeAfterReply(t *testing.T) *fakeRedis {
 		case "HELLO":
 			handleHELLO(w, 3)
 		case "GET":
-			writeBulk(w, "val-"+cmd[1])
-			if cmd[1] == "last" {
+			switch cmd[1] {
+			case "nil": // a null reply
+				_, _ = w.WriteString("$-1\r\n")
+			case "nilclose": // a null reply, then the connection closes
+				_, _ = w.WriteString("$-1\r\n")
 				closeAll(w)
+			case "stall": // no reply: the connection drops
+				closeAll(w)
+			default:
+				writeBulk(w, "val-"+cmd[1])
+				if cmd[1] == "last" {
+					closeAll(w)
+				}
 			}
 		case "MULTI":
 			writeSimple(w, "OK")
@@ -126,4 +137,58 @@ func TestReplyThenCloseReportsTheRealResult(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A null reply (ErrNil) is a reply, not a lost connection. All replies of the
+// batch arrive (the last one a null), then the server closes: every command
+// reports its own reply, the null one ErrNil, and no command takes another's
+// result.
+func TestReplyThenCloseWithANullReplyKeepsEachResult(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c := newCloseAfterReplyClient(t)
+	for i := 0; i < 40; i++ {
+		p := c.Pipeline()
+		a := p.Get("aaaa")
+		m := p.Get("nilclose")
+		err := p.Exec(ctx)
+		if i > 0 && !errors.Is(err, ErrNil) {
+			p.Release() // the pool handed out the closed connection: the loss, not a result
+			continue
+		}
+		if !errors.Is(err, ErrNil) {
+			t.Fatalf("Exec = %v, want ErrNil (the null reply)", err)
+		}
+		if v, e := a.Result(); e != nil || v != "val-aaaa" {
+			t.Fatalf("round %d: aaaa = %q, %v; want val-aaaa, nil", i, v, e)
+		}
+		if v, e := m.Result(); !errors.Is(e, ErrNil) || v != "" {
+			t.Fatalf("round %d: the null reply = %q, %v; want \"\", ErrNil", i, v, e)
+		}
+		p.Release()
+	}
+}
+
+// A null reply, then the connection drops before the last reply: the command
+// that never got a reply must not report the null reply's ErrNil ("key does not
+// exist"); every command reports the connection's error, and so does Exec.
+func TestNullReplyThenDropReportsTheLossToEveryCommand(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c := newCloseAfterReplyClient(t)
+	p := c.Pipeline()
+	defer p.Release()
+	a := p.Get("aaaa")
+	m := p.Get("nil")
+	s := p.Get("stall")
+	err := p.Exec(ctx)
+	if err == nil || errors.Is(err, ErrNil) {
+		t.Fatalf("Exec = %v, want the connection's error (not nil, not ErrNil)", err)
+	}
+	for name, g := range map[string]*StringCmd{"aaaa": a, "nil": m, "stall": s} {
+		v, e := g.Result()
+		if e == nil || errors.Is(e, ErrNil) || v != "" || e.Error() != err.Error() {
+			t.Errorf("%s = %q, %v; want \"\" and the Exec's error %v", name, v, e, err)
+		}
+	}
 }
