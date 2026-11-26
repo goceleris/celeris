@@ -284,6 +284,37 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	return p, nil
 }
 
+// loopLacksSyncPath reports whether a connection dialled now through prov
+// must be dialled direct (dialDirectConn, Go's netpoll) because the caller is a
+// handler that runs on the engine's own worker and prov has no synchronous
+// round trip for it. It is the one rule that [Pool] and [Connector] share. The
+// provider is fixed when the Pool or Connector is built (WithEngine takes the
+// server's loops then, or the driver's own loop when the server has not
+// started); the rule is evaluated at each dial against that provider's current
+// state.
+//
+// The engine's WorkerLoop(0) (io_uring, epoll, adaptive) does not implement
+// syncRoundTripper, and without a sync path the driver's async write plus
+// channel wait deadlocks on inline handlers: the engine worker is the
+// goroutine executing the handler (LockOSThread'd), so when wait() parks on
+// doneCh the M sits idle and never drains the read that carries PostgreSQL's
+// reply. The driver's own loop (Linux) does have the sync path; so does no
+// provider at all (false: nothing to inspect).
+//
+// A caller that does not run on an engine worker (no engine, or a handler on
+// an unlocked goroutine) decides that before it asks.
+func loopLacksSyncPath(prov engine.EventLoopProvider) bool {
+	if prov == nil {
+		return false
+	}
+	wl := prov.WorkerLoop(0)
+	if wl == nil {
+		return false
+	}
+	_, ok := wl.(syncRoundTripper)
+	return !ok
+}
+
 func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	// Direct mode when the caller runs on an unlocked G: standalone
 	// (no engine) or WithEngine on an engine that dispatches handlers
@@ -293,12 +324,9 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	directMode := !p.hasEngine || p.asyncEngine
 
 	// Additional case: WithEngine on an engine whose WorkerLoop does NOT
-	// implement syncRoundTripper (io_uring, epoll today). Without a sync
-	// path the driver's async write + channel-wait deadlocks on inline
-	// handlers: the engine worker is the goroutine executing the handler
-	// (LockOSThread'd), so when wait() parks on doneCh the M sits idle
-	// and never drains the CQE carrying PG's reply. Netpoll is M-safe,
-	// so direct mode sidesteps the deadlock with no correctness impact.
+	// implement syncRoundTripper (io_uring, epoll today): see
+	// loopLacksSyncPath. Netpoll is M-safe, so direct mode sidesteps the
+	// deadlock with no correctness impact.
 	if !directMode {
 		p.providerMu.RLock()
 		prov := p.provider
@@ -306,11 +334,7 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 		if prov == nil {
 			return nil, ErrPoolClosed
 		}
-		if wl := prov.WorkerLoop(0); wl != nil {
-			if _, ok := wl.(syncRoundTripper); !ok {
-				directMode = true
-			}
-		}
+		directMode = loopLacksSyncPath(prov)
 	}
 
 	if directMode {
@@ -463,8 +487,39 @@ func (p *Pool) releaseChecked(c *pgConn) error {
 	return nil
 }
 
+// releaseAfterTxEnd frees the conn of a Tx that Commit or Rollback has ended, and
+// the pool slot with it, exactly once. err is what the COMMIT or ROLLBACK returned.
+// The conn goes back to the pool only if the driver knows its state: no error, the
+// sentinel ErrTxCommitRollback (the reply was read: the server answered COMMIT with
+// ROLLBACK), or an error the server reported (an ErrorResponse, which the server
+// follows with ReadyForQuery). For those, releaseChecked still discards a conn that
+// is closed or whose last ReadyForQuery said a transaction is open or failed (a
+// FATAL, which has no ReadyForQuery, leaves the status of BEGIN). Any other error
+// (the wire failed, a read or write error, a cancelled wait) leaves the state
+// unknown: the conn is closed, not reused, and no ROLLBACK is sent to rescue it.
+func (p *Pool) releaseAfterTxEnd(c *pgConn, err error) {
+	if err != nil && !errors.Is(err, ErrTxCommitRollback) {
+		var pgErr *PGError
+		if !errors.As(err, &pgErr) {
+			p.inner.Discard(c)
+			return
+		}
+	}
+	p.release(c)
+}
+
 // QueryContext runs query on an acquired conn, returns a Rows wrapper that
 // returns the conn to the pool when closed.
+//
+// A context that ended before the call, or while the statement was being
+// prepared (the Parse + Describe step of a statement the cache has not seen, or
+// the re-prepare after the server lost a cached one), ends the call with the
+// context's error (on the event loop, now and then the server's answer to the
+// cancel, a *[PGError] with SQLSTATE 57014) and the statement is not sent. A
+// context that ends after the statement was sent cancels it on the server, but
+// the statement may already have run: as with any cancel, an error from the
+// context does not say that a write did not commit. A context that ends in the
+// instant between that check and the send is the same case.
 func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	c, err := p.acquire(ctx)
 	if err != nil {
@@ -485,6 +540,11 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 // returns [ErrTxLeftOpen]: see the Session state section of [Pool]. A statement
 // that fails returns its own error, unchanged, as before (a connection left in
 // a failed transaction by it is discarded all the same).
+//
+// A context that ended before the call or while the statement was being
+// prepared ends the call with an error and the statement is not sent; one that
+// ends after it was sent may still find the statement committed (see
+// [Pool.QueryContext]).
 func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (res Result, err error) {
 	c, aerr := p.acquire(ctx)
 	if aerr != nil {
@@ -1375,58 +1435,50 @@ type Tx struct {
 	done atomic.Bool
 }
 
-// txDoneError is returned by a Tx used after Commit or Rollback. It keeps the
-// message the driver always had and matches sql.ErrTxDone with errors.Is, as
-// code written against database/sql expects.
-type txDoneError struct{}
-
-func (txDoneError) Error() string { return "celeris-postgres: tx already finished" }
-func (txDoneError) Unwrap() error { return sql.ErrTxDone }
-
-var errTxDone error = txDoneError{}
-
-// Commit commits the transaction and returns the conn to the pool.
-// On failure, done is left false so a deferred Rollback can still fire, except
-// for ErrTxCommitRollback: the server rolled the transaction back, so it is over
-// (done stays set, the conn is released) and a later Rollback returns "tx already
-// finished". After the tx is finished it returns an error that matches
-// sql.ErrTxDone. A Rollback from another goroutine that runs while the Commit is
-// still in flight also gets ErrTxDone, even if that Commit then fails; the
-// goroutine that called Commit can still Rollback after the failure.
+// Commit commits the transaction. A call to Commit ends the Tx whatever it
+// returns: every later call on it (Commit, Rollback, ExecContext, QueryContext,
+// QueryRow, Savepoint, ReleaseSavepoint, RollbackToSavepoint) returns [ErrTxDone]
+// and sends nothing, so a deferred Rollback after a failed Commit is safe, and a
+// failed Commit is not retried on the same Tx. When the error is one the server
+// reported (a *[PGError], for example a deferred constraint or a serialization
+// failure), PostgreSQL rolled the transaction back. When the connection failed on
+// the wire before the reply was read, the outcome is unknown: the transaction may
+// have been committed. The Tx is ended either way.
+//
+// The connection goes back to the pool only if the driver knows its state: the
+// server's reply was read up to ReadyForQuery and the session is idle, outside a
+// transaction. In every other case (the connection failed on the wire, the reply
+// did not arrive, ReadyForQuery reports a transaction still open or failed) it is
+// closed and replaced. The pool slot is released exactly once.
+//
+// A Commit of a transaction the server had already put in the aborted state
+// returns [ErrTxCommitRollback]: nothing was committed.
 func (t *Tx) Commit() error {
 	if !t.done.CompareAndSwap(false, true) {
-		return errTxDone
+		return ErrTxDone
 	}
 	err := t.inner.Commit()
-	if errors.Is(err, ErrTxCommitRollback) {
-		// The server rolled the transaction back: it is over (done is set by the
-		// CAS above and stays), the conn is free.
-		t.pool.release(t.conn)
-		return err
-	}
-	if err != nil {
-		t.done.Store(false)
-		return err
-	}
-	t.pool.release(t.conn)
-	return nil
+	t.pool.releaseAfterTxEnd(t.conn, err)
+	return err
 }
 
-// Rollback rolls back the transaction and returns the conn to the pool. After
-// the tx is finished it returns an error that matches sql.ErrTxDone.
+// Rollback rolls back the transaction. Like [Tx.Commit] it ends the Tx whatever it
+// returns: a later call on the Tx returns [ErrTxDone], and the connection goes back
+// to the pool only if the reply was read up to ReadyForQuery with the session idle
+// (a Rollback that failed on the wire discards it).
 func (t *Tx) Rollback() error {
 	if !t.done.CompareAndSwap(false, true) {
-		return errTxDone
+		return ErrTxDone
 	}
 	err := t.inner.Rollback()
-	t.pool.release(t.conn)
+	t.pool.releaseAfterTxEnd(t.conn, err)
 	return err
 }
 
 // ExecContext runs a statement on the pinned conn.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
 	if t.done.Load() {
-		return Result{}, errTxDone
+		return Result{}, ErrTxDone
 	}
 	named, slot := anysToNamed(args)
 	r, err := t.conn.ExecContext(ctx, query, named)
@@ -1442,7 +1494,7 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 // closed before Commit/Rollback.
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if t.done.Load() {
-		return nil, errTxDone
+		return nil, ErrTxDone
 	}
 	named, slot := anysToNamed(args)
 	drows, err := t.conn.QueryContext(ctx, query, named)
@@ -1466,7 +1518,7 @@ func (t *Tx) QueryRow(ctx context.Context, query string, args ...any) *Row {
 // avoid SQL-injection.
 func (t *Tx) Savepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.Savepoint(ctx, name)
 }
@@ -1475,7 +1527,7 @@ func (t *Tx) Savepoint(ctx context.Context, name string) error {
 // Savepoint.
 func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.ReleaseSavepoint(ctx, name)
 }
@@ -1484,7 +1536,7 @@ func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
 // as Savepoint.
 func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
 	if t.done.Load() {
-		return errTxDone
+		return ErrTxDone
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
 }

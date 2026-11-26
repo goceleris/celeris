@@ -193,6 +193,11 @@ type pgRequest struct {
 	// runtime lock chain would be corrupted by a zero-value overwrite).
 	doneMu   sync.Mutex
 	doneFlag bool
+	// abandoned is set under doneMu by a caller whose context ended while it
+	// waited for the reply (waitForQueryRows): the rows that still arrive are
+	// dropped, not buffered, so a cancel the server did not act on does not
+	// buffer the rest of the result.
+	abandoned bool
 	// doneAtom is the lockless mirror of doneFlag. The spin-wait fast path
 	// checks it without acquiring doneMu. Set to 1 by finish()/fail()
 	// immediately before signaling doneCh; reset to 0 in acquirePgRequest.
@@ -319,6 +324,7 @@ func acquirePgRequest() *pgRequest {
 	// channel. doneMu is NOT reset — its zero value is always a valid
 	// unlocked mutex, and a prior life cycle always left it unlocked.
 	r.doneFlag = false
+	r.abandoned = false
 	r.doneAtom.Store(0)
 	return r
 }
@@ -495,7 +501,7 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok bool) {
 	r.doneMu.Lock()
 	defer r.doneMu.Unlock()
-	if r.doneFlag {
+	if r.doneFlag || r.abandoned {
 		return 0, false, false
 	}
 	// Direct-mode result-buffer cap. In direct mode, and on the sync fast
@@ -2033,6 +2039,42 @@ func (c *pgConn) closePreparedServerAsync(name string) error {
 	return nil
 }
 
+// prepareEnded reports whether the failure of an auto-prepare (the Parse +
+// Describe of a statement the cache has not seen) ends the call. It does when
+// the context ended (ctx.Err() is set, or the prepare's own error is the
+// context's: a deadline is recognised by the clock before the context's timer
+// has set Err) or the conn is closed (the cancel exchange of the ended context
+// failed the conn). Falling through to the unnamed path then would send the
+// user's statement (Parse + Bind + Execute) under a context that had already
+// ended, and a write could commit although the caller is told the context's
+// error; on a closed conn it would report ErrClosed in place of that error. Any
+// other prepare failure (a server error such as a syntax error) still falls
+// through, as before: the unnamed path reports the server's error for the
+// statement itself.
+func (c *pgConn) prepareEnded(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || c.closed.Load() ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// ctxEndedErr returns the context's error when ctx has ended, nil otherwise. A
+// deadline that has passed counts as ended before the context's timer has set
+// Err (the clock decides, as in driveDirect). It runs on a successful
+// auto-prepare, and on a successful re-prepare after the server lost a cached
+// statement (SQLSTATE 26000), before the statement itself is sent: a context that ended while
+// the statement was being prepared (a direct conn sees a cancel-only context
+// only when bytes arrive, so a prepare can finish under a context that has
+// already been cancelled) must not go on to send, and possibly commit, the
+// statement.
+func ctxEndedErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 // ExecContext satisfies driver.ExecerContext.
 func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if len(args) == 0 {
@@ -2061,9 +2103,17 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
+			if err := ctxEndedErr(ctx); err != nil {
+				return nil, err // ended during the prepare: the statement is not sent
+			}
 			return c.extendedExec(ctx, name, query, args)
 		}
-		// Prepare failed — fall through to the unnamed path.
+		// Prepare failed. Not when the context ended or the conn is closed: then
+		// the prepare error is the answer (see prepareEnded).
+		if c.prepareEnded(ctx, err) {
+			return nil, err
+		}
+		// Otherwise fall through to the unnamed path.
 	}
 	// Unnamed statement (stmtName="") is replaced on every Parse — no stale
 	// state to clean up, so we don't mark the session dirty.
@@ -2102,9 +2152,17 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
+			if err := ctxEndedErr(ctx); err != nil {
+				return nil, err // ended during the prepare: the statement is not sent
+			}
 			return c.doExtendedQuery(ctx, name, query, args, prep.Columns)
 		}
-		// Prepare failed — fall through to the legacy path.
+		// Prepare failed. Not when the context ended or the conn is closed: then
+		// the prepare error is the answer (see prepareEnded).
+		if c.prepareEnded(ctx, err) {
+			return nil, err
+		}
+		// Otherwise fall through to the legacy path.
 	}
 	if len(args) == 0 {
 		return c.simpleQuery(ctx, query)
@@ -2489,9 +2547,37 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		// Buffered fast path — no channel was ever allocated.
 		return acquirePGRows(req.columns, req.rows, textFormat, req, nil), nil
 	case <-ctx.Done():
+		// The request is abandoned: nobody will read its rows. The select may
+		// take ctx.Done although colsCh is ready too (rowCh published), and a
+		// stream can be promoted after the select, while the cancel is sent.
+		// Left alone, the event-loop worker blocks in sendRow on the full rowCh,
+		// cannot read the server's cancel reply, and doneCh never fires; a
+		// worker serves every conn registered on it, so they all stall.
+		//
+		// So, before the cancel: abandoned makes the worker drop the rows that
+		// still arrive instead of buffering them (the server may not act on the
+		// cancel at once, or at all when it reaches an idle backend, and the
+		// rest of the result would pile up in req.rows), and closeRowCh releases
+		// a worker already blocked in sendRow and keeps a promotion from
+		// publishing a stream. The worker then reads on to ReadyForQuery. The
+		// rows buffered so far are dropped with the request.
+		req.doneMu.Lock()
+		req.abandoned = true
+		req.doneMu.Unlock()
+		req.closeRowCh()
 		confirmed := c.cancelRunning()
-		// A conn that cancelRunning failed completes req at once (failAll).
-		<-req.doneCh
+		// A conn that cancelRunning failed completes req at once (failAll). The
+		// wait is bounded as wait()'s is: a server that never answers the cancel
+		// fails the conn (the pool discards it) and the call returns anyway.
+		timer := time.NewTimer(cancelDrainTimeout)
+		select {
+		case <-req.doneCh:
+			timer.Stop()
+		case <-timer.C:
+			c.failAll(errors.New("celeris-postgres: cancel timeout"))
+			releasePgRequest(req)
+			return nil, ctx.Err()
+		}
 		reqErr := req.err
 		releasePgRequest(req)
 		if !confirmed {
@@ -2684,6 +2770,9 @@ func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		rows, err = c.doExtendedQuery(ctx, stmtName, query, args, prep.Columns)
 	}
 	return rows, err
@@ -2828,6 +2917,9 @@ func (c *pgConn) extendedExec(ctx context.Context, stmtName, query string, args 
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		result, err = c.doExtendedExec(ctx, stmtName, query, args)
 	}
 	return result, err
@@ -3399,11 +3491,17 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 		return 0, errors.New("celeris-postgres: COPY FROM ended before CopyInResponse")
 	case <-ctx.Done():
-		confirmed := c.cancelRunning()
-		<-req.doneCh
-		if confirmed && req.err != nil {
-			return 0, req.err
-		}
+		// The context ended while the call waited for the CopyInResponse (which
+		// may even have arrived: with both ready, select can take ctx). A CancelRequest
+		// is no way out: the statement may not be running yet, and when it
+		// starts after the cancel was dropped the server waits in COPY IN for
+		// data that this call, which is returning, will never send; nothing then
+		// completes req and a wait for doneCh never ends (the conn and its
+		// pool slot wedged for good). The state of the session is unknown, so
+		// the conn is closed, not reused: failAll marks it closed and completes
+		// req, and Pool.release discards it (the server leaves COPY IN when the
+		// socket closes) and the pool dials a replacement.
+		c.failAll(errCopyCancelled)
 		return 0, ctx.Err()
 	}
 

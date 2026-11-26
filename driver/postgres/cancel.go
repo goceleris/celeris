@@ -34,14 +34,24 @@ func buildCancelRequest(pid, secret int32) []byte {
 // pgConn.cancelRunning). A var so the tests can shorten it.
 var cancelExchangeTimeout = time.Second
 
-// cancelDrainTimeout bounds how long driveDirect waits, after a confirmed
-// cancel, for the cancelled statement's Error + ReadyForQuery. A var so the
-// tests can shorten it.
+// cancelDrainTimeout bounds how long a call waits, after a confirmed cancel,
+// for the cancelled statement's Error + ReadyForQuery: driveDirect, and the
+// ctx branch of waitForQueryRows (as wait()'s 30 s does for the other
+// statements). A call whose context ended returns once the server answers the
+// cancel, and at the latest this long after the cancel exchange (the
+// connection is then failed and discarded). A var so the tests can shorten it.
 var cancelDrainTimeout = 30 * time.Second
 
 // errCancelUnconfirmed fails a conn whose cancel exchange did not finish. It
 // reaches no caller: the statement's caller gets its own ctx error.
 var errCancelUnconfirmed = errors.New("celeris-postgres: cancel request not confirmed by the server")
+
+// errCopyCancelled fails the conn of a COPY FROM whose context ended while the
+// call waited for the server's CopyInResponse (see copyFrom; when the reply and
+// the context are both ready the select may take the context, so the reply may
+// already have arrived). It reaches no caller: the call returns its context's
+// error.
+var errCopyCancelled = errors.New("celeris-postgres: COPY FROM cancelled while waiting for the server's CopyInResponse; connection closed")
 
 // sendCancelRequest dials a fresh short-lived TCP connection to addr,
 // transmits a CancelRequest and waits for the server to close the socket.
