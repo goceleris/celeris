@@ -116,6 +116,9 @@ func (s *StartupState) Handle(msgType byte, payload []byte, w *Writer) (response
 		if len(payload) < 1 {
 			return nil, false, errors.New("postgres/protocol: short ReadyForQuery")
 		}
+		if s.phase != phaseAwaitReady {
+			return nil, false, errors.New("postgres/protocol: ReadyForQuery before AuthenticationOk during startup")
+		}
 		s.phase = phaseReady
 		return nil, true, nil
 	case BackendNegotiateProtocolVersion:
