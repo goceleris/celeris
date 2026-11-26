@@ -17,6 +17,7 @@ package postgres
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -472,6 +473,19 @@ func busyIters() int {
 	return 300
 }
 
+// busyOpenQ starts a first statement and reads its first row.
+func busyOpenQ(t *testing.T, c *pgConn, q string) (driver.Rows, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	r1, err := c.QueryContext(ctx, q, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busyNext(t, r1, 1)
+	return r1, cancel
+}
+
 // TestBusyCancelThenCloseThenNext: cancel the ctx of a streaming query, Close the
 // Rows (under database/sql this is synchronous: Rows.Close, or its awaitDone
 // goroutine, which Rows.Next does not wait for), and run the next statement on the
@@ -576,4 +590,41 @@ func TestBusyCancelWithoutCloseThenNext(t *testing.T) {
 		t.Fatalf("only %d of %d first statements streamed: the loop does not exercise the window", streamed, iters)
 	}
 	busyMarks(t, c, "after the iterations")
+}
+
+// TestBusyDiscardEndsOpenRowsWithAnError is the mechanism behind native
+// Tx.Rollback with a streaming Rows open: failAll with an explicit error, then the
+// Close of the discard. The Rows must end with that error. Without the failAll the
+// Close reports the teardown to the loop as io.EOF, which a consumer reads as the
+// clean end of its rows (a truncated result that looks complete).
+func TestBusyDiscardEndsOpenRowsWithAnError(t *testing.T) {
+	streamed := 0
+	for i := 0; i < 50; i++ {
+		c := busyDial(t, busyFakeServer(t), false)
+		r1, _ := busyOpenQ(t, c, "fast:2000")
+		if _, ok := r1.(*streamRows); !ok {
+			continue // the sync poll took the whole reply: nothing is truncated
+		}
+		streamed++
+		c.failAll(errRollbackDiscard)
+		_ = c.Close()
+		dest := make([]driver.Value, 2)
+		var err error
+		err, _ = busyWatch(t, "drain after discard", 15*time.Second, func() error {
+			for {
+				if err := r1.Next(dest); err != nil {
+					return err
+				}
+			}
+		})
+		if err == io.EOF || err == nil {
+			t.Fatalf("iteration %d: the Rows of a discarded conn ended with %v, want an error", i, err)
+		}
+		if !errors.Is(err, ErrClosed) || !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("iteration %d: the Rows ended with %v, want one matching ErrClosed and io.ErrUnexpectedEOF", i, err)
+		}
+	}
+	if streamed < 10 {
+		t.Fatalf("only %d of 50 first statements streamed: the test does not exercise the discard", streamed)
+	}
 }

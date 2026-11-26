@@ -23,7 +23,9 @@ package postgres_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
@@ -485,6 +487,22 @@ func TestBusyConnFinishWithRowsOpen(t *testing.T) {
 					// database/sql closes the Rows first and finishes; a direct Pool has
 					// buffered the result; a native Rollback discards the conn: all nil.
 					t.Fatalf("%s %s with an open Rows: %v, want nil", car, how, err)
+				}
+				if car == "nativeTx" && how == "Rollback" && !env.direct {
+					// The conn was discarded under the open Rows: it must end with an
+					// error, not with a clean end that makes a truncated result look
+					// complete.
+					n := 0
+					_, _ = busyWatch(t, "drain after the discarding Rollback", 30*time.Second, func() int {
+						for env.r1.Next() {
+							n++
+						}
+						return n
+					})
+					rerr := env.r1.Err()
+					if rerr == nil || rerr == io.EOF || !errors.Is(rerr, postgres.ErrClosed) || !errors.Is(rerr, io.ErrUnexpectedEOF) {
+						t.Fatalf("native Tx Rollback with a streaming Rows open: the Rows ended after %d rows with Err = %v, want an error matching ErrClosed and io.ErrUnexpectedEOF", n, rerr)
+					}
 				}
 				// The Rows the finish left behind is closed or closable, bounded.
 				_, _ = busyWatch(t, car+" Rows.Close after "+how, 30*time.Second, func() error { return env.r1.Close() })

@@ -1421,19 +1421,31 @@ func (t *Tx) Commit() error {
 // A Rows of the Tx that is still streaming (see [ErrRowsOpen]) does not stop it:
 // the conn is discarded instead of rolled back in line, the server rolls the
 // transaction back when the connection ends, and Rollback returns nil. The open
-// Rows ends with an error. Close the Rows first to keep the conn.
+// Rows ends with an error that matches [ErrClosed] and [io.ErrUnexpectedEOF] (its
+// Next returns false and its Err reports it), never with a clean end. Close the
+// Rows first to keep the conn.
 func (t *Tx) Rollback() error {
 	if !t.done.CompareAndSwap(false, true) {
 		return errTxDone
 	}
 	err := t.inner.Rollback()
 	if errors.Is(err, ErrRowsOpen) {
+		// The open Rows must end with an error: Close reports the teardown to the
+		// loop as io.EOF (onClose(nil)), which a consumer reads as the clean end of
+		// its rows, a truncated result that looks complete. failAll first hands every
+		// pending request, the streaming one included, this error instead; the
+		// Close in Discard then finds nothing left to overwrite.
+		t.conn.failAll(errRollbackDiscard)
 		t.pool.inner.Discard(t.conn)
 		return nil
 	}
 	t.pool.release(t.conn)
 	return err
 }
+
+// errRollbackDiscard is what a Rows still open ends with when its Tx is rolled
+// back: it matches [ErrClosed] and [io.ErrUnexpectedEOF].
+var errRollbackDiscard = fmt.Errorf("%w: %w: the transaction was rolled back while a Rows of it was still streaming", ErrClosed, io.ErrUnexpectedEOF)
 
 // ExecContext runs a statement on the pinned conn.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
