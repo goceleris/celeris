@@ -208,9 +208,9 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 		if c.maxResultBytes < 1 {
 			return nil, fmt.Errorf("celeris-postgres: WithMaxResultBytes(%d): the cap must be at least 1 byte (there is no way to turn it off)", c.maxResultBytes)
 		}
-		dsn.Options.maxResultBytes = c.maxResultBytes
 	}
 	if !c.streaming {
+		dsn.Options.maxResultBytes = c.maxResultBytes
 		// The default: the dial a direct-mode Pool does (Pool.dial). No event
 		// loop, so none is resolved and there is no busy-poll budget to set.
 		dc, err := dialDirectConn(ctx, dsn)

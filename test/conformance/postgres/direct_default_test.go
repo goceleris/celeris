@@ -447,3 +447,57 @@ func TestDefaultResultCapIsASetting(t *testing.T) {
 		_ = rows.Close()
 	})
 }
+
+// A query inside the loop over the rows of another query ("for rows.Next() {
+// db.QueryRow(...) }"), at several pool sizes, with a marker in every nested
+// result: it must neither stall nor mix results up. On the event loop it can stall
+// (the worker is held by the outer Rows while the nested reply needs it).
+func TestDefaultNestedQueryInsideRowsLoop(t *testing.T) {
+	for _, maxOpen := range []int{2, 4, 16, 32} {
+		t.Run(fmt.Sprintf("maxOpen=%d", maxOpen), func(t *testing.T) {
+			db := openDirectDB(t, maxOpen)
+			withWatchdog(t, 60*time.Second, "nested query", func() {
+				var wg sync.WaitGroup
+				for w := 0; w < maxOpen/2; w++ { // callers in parallel, each holding one outer Rows
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						outer, err := db.Query("SELECT g, repeat('o', 100) FROM generate_series(1, 3000) g")
+						if err != nil {
+							t.Errorf("outer: %v", err)
+							return
+						}
+						defer func() { _ = outer.Close() }()
+						n := 0
+						for outer.Next() {
+							var g int
+							var pad string
+							if err := outer.Scan(&g, &pad); err != nil {
+								t.Errorf("outer scan: %v", err)
+								return
+							}
+							n++
+							if g != n {
+								t.Errorf("outer row %d is %d", n, g)
+								return
+							}
+							if n%50 != 0 {
+								continue
+							}
+							want := fmt.Sprintf("nested-%d", g)
+							var got string
+							if err := db.QueryRow("SELECT $1::text", want).Scan(&got); err != nil || got != want {
+								t.Errorf("nested at row %d: %q, %v; want %q", g, got, err, want)
+								return
+							}
+						}
+						if err := outer.Err(); err != nil || n != 3000 {
+							t.Errorf("outer: %d rows, err = %v", n, err)
+						}
+					}()
+				}
+				wg.Wait()
+			})
+		})
+	}
+}
