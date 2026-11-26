@@ -99,15 +99,11 @@ type Loop struct {
 	// the lazy re-creation below is no longer an unsynchronised write to a
 	// field other goroutines read (celeris#655).
 	wakeFD    *wakefd.WakeFD
-	timerFD   int  // timerfd for kernel-enforced checkTimeouts cadence (-1 if disabled)
-	timerSlow bool // the sweep timerfd is at the idle period, not sweepFloor (celeris#1381); loop thread only
-	// idleWaitOff is set by a test that has disarmed the sweep timerfd by hand, so that the loop
-	// does not re-arm it: such a loop never takes the long wait (celeris#1381). Never set in production.
-	idleWaitOff atomic.Bool
-	events      []unix.EpollEvent
-	conns       []*connState
-	connCount   int // number of active connections (local, for draining check)
-	maxFD       int // upper bound fd for iteration in checkTimeouts/shutdown
+	timerFD   int // timerfd for kernel-enforced checkTimeouts cadence (-1 if disabled)
+	events    []unix.EpollEvent
+	conns     []*connState
+	connCount int // number of active connections (local, for draining check)
+	maxFD     int // upper bound fd for iteration in checkTimeouts/shutdown
 	// liveConns is a dense slice of the connections this loop holds.
 	// checkTimeouts, the sweep and shutdown iterate it instead of the sparse
 	// 0..maxFD range, so their cost is O(active conns) regardless of the FD
@@ -130,6 +126,7 @@ type Loop struct {
 	// re-signal; the event loop re-enters acceptAll with a 0ms epoll_wait
 	// while this is set to drain the remainder. Worker-thread-only.
 	listenHot    bool
+	timerSlow    bool // the sweep timerfd is at the idle period, not sweepFloor (celeris#1381); loop thread only
 	handler      stream.Handler
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
@@ -394,6 +391,11 @@ type Loop struct {
 	// TCP stack whose TCP_INFO answers but does not fill it. nil in
 	// production. Loop thread (a test sets it before it drives the loop).
 	ackedProbe func(fd int) (uint64, error)
+
+	// idleWaitOff is set by a test that has disarmed the sweep timerfd by hand, so that the loop
+	// does not re-arm it: such a loop never takes the long wait (celeris#1381). Never set in
+	// production; at the end of the struct so that no field a loaded loop touches moves.
+	idleWaitOff atomic.Bool
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,

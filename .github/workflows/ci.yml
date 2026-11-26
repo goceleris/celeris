@@ -2711,7 +2711,7 @@ jobs:
   # or 25 ms (io_uring). The tests that guard the change run in the Unit job's race
   # steps on x86; this job runs them, by name and with skipping forbidden, under
   # -race on both architectures, and adds what no other job runs: ./test/server's
-  # idle test and the slowloris synthetic of ./test/integration under -race.
+  # idle test and the slowloris scenarios of ./test/integration under -race.
   idle-wait:
     name: Idle loop wait (celeris#1381, ${{ matrix.os }})
     strategy:
@@ -2762,14 +2762,14 @@ jobs:
             TestAdoptedConnectionReachesAnIdleWorker1381
           )
           server=(TestIdleServerFirstRequestAndShutdown1381)
-          integration=(TestSlowlorisSynthetic TestSlowlorisSyntheticConcurrent)
+          integration=(TestSlowlorisSynthetic TestSlowlorisSyntheticConcurrent TestSlowlorisAfterAnIdleEngine1381)
           alt=$(IFS='|'; echo "${epoll[*]}")
           failed=0
           go test -race -count=1 -timeout=300s -v -run "^(${alt})\$" ./internal/engine/epoll/ 2>&1 | tee /tmp/idle-epoll.log || failed=$((failed + 1))
           alt=$(IFS='|'; echo "${iouring[*]}")
           go test -race -count=1 -timeout=300s -v -run "^(${alt})\$" ./internal/engine/iouring/ 2>&1 | tee /tmp/idle-iouring.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestIdleServerFirstRequestAndShutdown1381$' ./test/server/ 2>&1 | tee /tmp/idle-server.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run '^(TestSlowlorisSynthetic|TestSlowlorisSyntheticConcurrent)$' ./test/integration/ 2>&1 | tee /tmp/idle-integration.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestSlowlorisSynthetic|TestSlowlorisSyntheticConcurrent|TestSlowlorisAfterAnIdleEngine1381)$' ./test/integration/ 2>&1 | tee /tmp/idle-integration.log || failed=$((failed + 1))
           bad=0
           .github/scripts/named-tally.sh 'celeris#1381 epoll' /tmp/idle-epoll.log "${epoll[@]}" || bad=$((bad + 1))
           .github/scripts/named-tally.sh 'celeris#1381 io_uring' /tmp/idle-iouring.log "${iouring[@]}" || bad=$((bad + 1))
