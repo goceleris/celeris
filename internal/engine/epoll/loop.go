@@ -487,11 +487,14 @@ func (l *Loop) run(ctx context.Context) {
 		l.ready <- fmt.Errorf("loop %d: epoll_create1: %w", l.id, err)
 		return
 	}
+	l.ctlMu.Lock()
 	l.epollFD = epollFD
+	l.ctlMu.Unlock()
 
 	listenFD, err := createListenSocket(l.cfg.Addr, !l.cfg.DisableDeferAccept)
 	if err != nil {
-		_ = unix.Close(epollFD)
+		// Not a bare Close: l.epollFD must not name a closed number (celeris#1377).
+		l.closeEpollFD()
 		l.ready <- fmt.Errorf("loop %d: listen socket: %w", l.id, err)
 		return
 	}
@@ -503,7 +506,7 @@ func (l *Loop) run(ctx context.Context) {
 		Fd:     int32(listenFD),
 	}); err != nil {
 		_ = unix.Close(listenFD)
-		_ = unix.Close(epollFD)
+		l.closeEpollFD()
 		l.ready <- fmt.Errorf("loop %d: epoll_ctl listen: %w", l.id, err)
 		return
 	}
