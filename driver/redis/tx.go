@@ -9,6 +9,10 @@ import (
 	"github.com/goceleris/celeris/internal/driver/redis/protocol"
 )
 
+// errTxDone is returned by a Tx call (or a typed Cmd queued) after Exec or
+// Discard ended the transaction.
+var errTxDone = errors.New("celeris-redis: Tx already executed")
+
 // Tx is a MULTI/EXEC transaction. Commands are buffered into a single wire
 // write (MULTI + cmds + EXEC) and dispatched atomically. Per-command typed
 // results are reachable via the *Cmd handles returned by each method — they
@@ -16,9 +20,9 @@ import (
 //
 // A Tx pins one connection for its entire lifetime. Exec releases the conn;
 // Discard sends DISCARD and releases. Forgetting to call either leaks the
-// conn until the pool's idle reaper closes it, so a sync.Pool-style
-// "always defer tx.Close()" is recommended — Close is an alias for Discard
-// that is a no-op after Exec.
+// conn until the pool's idle reaper closes it, so "defer tx.Discard()" is
+// recommended: Discard is a no-op after Exec. A command queued after Exec or
+// Discard is not sent, and its Result reports an error.
 type Tx struct {
 	client *Client
 	conn   *redisConn
@@ -49,7 +53,7 @@ func (c *Client) TxPipeline(ctx context.Context) (*Tx, error) {
 // not +OK or keys is empty.
 func (tx *Tx) Watch(ctx context.Context, keys ...string) error {
 	if tx.done {
-		return errors.New("celeris-redis: Tx already executed")
+		return errTxDone
 	}
 	if len(keys) == 0 {
 		return errors.New("celeris-redis: Watch requires at least one key")
@@ -69,7 +73,7 @@ func (tx *Tx) Watch(ctx context.Context, keys ...string) error {
 // Unwatch drops all watched keys on the pinned conn.
 func (tx *Tx) Unwatch(ctx context.Context) error {
 	if tx.done {
-		return errors.New("celeris-redis: Tx already executed")
+		return errTxDone
 	}
 	req, err := tx.conn.exec(ctx, "UNWATCH")
 	if err != nil {
@@ -81,22 +85,34 @@ func (tx *Tx) Unwatch(ctx context.Context) error {
 
 // addCmd appends args to the tx buffer and returns a tracking cmd.
 func (tx *Tx) addCmd(kind cmdKind, args ...string) *pipeCmd {
-	tx.w.AppendCommand(args...)
 	pc := &pipeCmd{kind: kind}
+	if tx.done {
+		pc.err = errTxDone
+		return pc
+	}
+	tx.w.AppendCommand(args...)
 	tx.cmds = append(tx.cmds, pc)
 	return pc
 }
 
 func (tx *Tx) addCmd2(kind cmdKind, a0, a1 string) *pipeCmd {
-	tx.w.AppendCommand2(a0, a1)
 	pc := &pipeCmd{kind: kind}
+	if tx.done {
+		pc.err = errTxDone
+		return pc
+	}
+	tx.w.AppendCommand2(a0, a1)
 	tx.cmds = append(tx.cmds, pc)
 	return pc
 }
 
 func (tx *Tx) addCmd3(kind cmdKind, a0, a1, a2 string) *pipeCmd {
-	tx.w.AppendCommand3(a0, a1, a2)
 	pc := &pipeCmd{kind: kind}
+	if tx.done {
+		pc.err = errTxDone
+		return pc
+	}
+	tx.w.AppendCommand3(a0, a1, a2)
 	tx.cmds = append(tx.cmds, pc)
 	return pc
 }
@@ -118,7 +134,7 @@ func (tx *Tx) addCmd3(kind cmdKind, a0, a1, a2 string) *pipeCmd {
 //     error. The conn is returned to the pool.
 func (tx *Tx) Exec(ctx context.Context) error {
 	if tx.done {
-		return errors.New("celeris-redis: Tx already executed")
+		return errTxDone
 	}
 	tx.done = true
 	defer func() {

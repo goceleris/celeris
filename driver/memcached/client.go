@@ -79,7 +79,12 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	return &Client{cfg: cfg, pool: pool}, nil
 }
 
-// Close tears down every pooled connection. Safe to call on a nil Client.
+// Close closes the idle connections and the pool. A command in flight on the
+// event-loop path (a Client opened WithEngine of a server with no loop of its
+// own) fails with [ErrClosed]. A command in flight on a direct connection, which
+// is checked out of the pool, finishes with its reply or with its own deadline or
+// [Config.Timeout]. A command issued after Close returns [ErrClosed]. Safe to
+// call on a nil Client.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil

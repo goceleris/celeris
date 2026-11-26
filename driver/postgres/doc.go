@@ -28,7 +28,8 @@
 // read each reply whole on the calling goroutine, with the same cap
 // ([Connector.WithMaxResultBytes]). [Connector.WithStreaming], or streaming=true in
 // the DSN, puts them on the event loop, which streams a result and has no cap, at
-// the cost of the limits its godoc lists.
+// the cost of the limits its godoc lists (a Connector bound to a started epoll,
+// io_uring or adaptive server is direct all the same: see [Connector.WithStreaming]).
 // [WithWorker] adds a per-call worker-affinity hint to a context.
 //
 // Query with [Pool.QueryContext] (returns [*Rows]), [Pool.QueryRow]
@@ -37,7 +38,11 @@
 // [Tx.Rollback], and savepoint helpers ([Tx.Savepoint],
 // [Tx.ReleaseSavepoint], [Tx.RollbackToSavepoint]). Bulk loads use
 // [Pool.CopyFrom] (feed rows via [CopyFromSource] or [CopyFromSlice]) and
-// [Pool.CopyTo].
+// [Pool.CopyTo]. A call to [Tx.Commit] or [Tx.Rollback] ends the Tx whatever it
+// returns: a failed Commit is not retried on the same Tx, every later call on the
+// Tx returns [ErrTxDone] (a deferred Rollback after a failed Commit is safe), and
+// its connection is released: back to the pool if the driver knows the session is
+// idle, discarded otherwise.
 //
 // Server errors surface as [*PGError] carrying the SQLSTATE code; match
 // with errors.As. Package sentinels include [ErrPoolClosed], [ErrClosed],

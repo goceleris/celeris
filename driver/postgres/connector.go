@@ -99,6 +99,31 @@ func (c *Connector) clone() *Connector {
 // The driver takes the server's event loop once, when it is opened: open it after
 // srv.Addr() is non-nil to share the server's loops; opened earlier it uses the
 // driver's own loop for its whole life.
+//
+// Which mode a connection uses is decided at each Connect:
+//
+//   - On the driver's own event loop: no engine, a server that has not started
+//     when the Connector was bound (also once it has started), and the std
+//     engine. Results stream and have no size cap.
+//   - Direct (Go's netpoll, the mode of a [Pool] on a started server): the
+//     Connector was bound to a started epoll, io_uring or adaptive server, whose
+//     workers run an inline handler on the worker's own thread, so a handler
+//     that opened a connection on the loop would wait for the startup reply on
+//     the worker that has to read it (the server stopped answering before
+//     v1.6.0). A handler on that server that is not inline (async) is direct
+//     too. A connection dialled before the server started stays on the loop.
+//
+// A direct connection has the limits of a direct-mode Pool: a context that is
+// cancelled with no deadline does not interrupt a statement that is running
+// (a deadline does, and the error is the context's, context.DeadlineExceeded,
+// not a *PGError with SQLSTATE 57014), a result is read whole and fails with
+// [ErrResultTooBig] past 64 MiB (so there is no row streaming), LISTEN and
+// UNLISTEN fail with [ErrDirectModeUnsupported], and
+// [Connector.WithSocketBusyPoll] has no effect, as the connection is not on an
+// event loop. The mode follows the server, not the caller: a background
+// goroutine that uses the Connector gets the same connections. To keep
+// streaming and the loop's behaviour, bind the Connector before the server
+// starts, or use no engine.
 func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 	clone := c.clone()
 	clone.engine = sp
@@ -148,6 +173,19 @@ func (c *Connector) WithSocketBusyPoll(d time.Duration) *Connector {
 // one is read, in memory proportional to what the caller has not read, and with no
 // result size cap ([Connector.WithMaxResultBytes] does not apply). Use it for a
 // result too large to hold in memory, or to read the first rows of one early.
+//
+// One case cannot stream: a Connector bound with [Connector.WithEngine] to a
+// server that has started on the epoll, io_uring or adaptive engine. Their workers
+// run an inline handler on the worker's own thread and have no synchronous round
+// trip for a driver, so a handler that opened a connection on the loop would wait
+// for the startup reply on the very worker that has to read it, and the server
+// would stop answering (it did before v1.6.0). Such a Connector dials DIRECT
+// connections even with WithStreaming, with everything that goes with them: the
+// results are read whole and capped ([Connector.WithMaxResultBytes] applies), and
+// the limits below do not apply. The rule is evaluated at each connect against the
+// loops the Connector took when it was bound, the one a [Pool] applies: a
+// Connector bound before the server starts, one on the std engine, and one with no
+// engine stay on the driver's own loop.
 //
 // The limits of the path it selects, which direct connections do not have:
 //
@@ -204,9 +242,12 @@ func (c *Connector) WithMaxResultBytes(n int) *Connector {
 }
 
 // Connect returns a new driver.Conn: a direct one, unless the Connector has
-// [Connector.WithStreaming]. database/sql's pool reuses this connector across all
-// pooled conns, so a streaming Connector resolves the provider once and shares it
-// for the connector's lifetime.
+// [Connector.WithStreaming], which registers it on an event loop except when the
+// Connector took the loops of a started epoll, io_uring or adaptive server (see
+// [Connector.WithStreaming]; the rule is loopLacksSyncPath, shared with [Pool]).
+// database/sql's pool reuses this connector across all pooled conns, so a
+// streaming Connector resolves the provider once and shares it for the connector's
+// lifetime.
 func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	dsn := c.dsn
 	if c.maxResultSet {
@@ -214,26 +255,33 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 			return nil, fmt.Errorf("celeris-postgres: WithMaxResultBytes(%d): the cap must be at least 1 byte (there is no way to turn it off)", c.maxResultBytes)
 		}
 	}
-	if !c.streaming {
-		dsn.Options.maxResultBytes = c.maxResultBytes
-		// The default: the dial a direct-mode Pool does (Pool.dial). No event
-		// loop, so none is resolved and there is no busy-poll budget to set.
-		dc, err := dialDirectConn(ctx, dsn)
+	if c.streaming {
+		prov, owns, err := c.ensureProvider()
 		if err != nil {
 			return nil, err
 		}
-		return dc, nil
+		// The driver's own loop (an unstarted server, the std engine, no engine)
+		// is not a worker of the server: nothing to deadlock on, and a connection
+		// stays on the loop it was dialled on. A started epoll, io_uring or
+		// adaptive server's workers run an inline handler on their own thread and
+		// have no synchronous round trip: that case is dialled direct below.
+		if owns || !loopLacksSyncPath(prov) {
+			// Each conn releases the loop on Close if and only if the connector
+			// itself owns it — but we share one loop across all conns, so the
+			// refcount lives here, not on the conn. The pgConn's closeLoop is nil.
+			dsn.Options.busyPoll = eventloop.BusyPoll(c.engine, c.busyPoll)
+			return dialConn(ctx, prov, nil, dsn, -1)
+		}
 	}
-	prov, owns, err := c.ensureProvider()
+	// The default, and a streaming Connector on a started inline server: the dial a
+	// direct-mode Pool does (Pool.dial). No loop of the driver's own is resolved
+	// for the default, and there is no busy-poll budget to set.
+	dsn.Options.maxResultBytes = c.maxResultBytes
+	dc, err := dialDirectConn(ctx, dsn)
 	if err != nil {
-		return nil, err
+		return nil, err // not dc: a nil *pgConn would be a non-nil driver.Conn
 	}
-	_ = owns
-	// Each conn releases the loop on Close if and only if the connector
-	// itself owns it — but we share one loop across all conns, so the
-	// refcount lives here, not on the conn. The pgConn's closeLoop is nil.
-	dsn.Options.busyPoll = eventloop.BusyPoll(c.engine, c.busyPoll)
-	return dialConn(ctx, prov, nil, dsn, -1)
+	return dc, nil
 }
 
 // Driver returns the singleton Driver.

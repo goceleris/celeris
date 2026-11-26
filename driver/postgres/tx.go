@@ -13,6 +13,13 @@ type pgTx struct {
 
 var _ driver.Tx = (*pgTx)(nil)
 
+// Commit ends the transaction whatever it returns. If a streaming Rows of this
+// transaction is still open (see [ErrRowsOpen]), Commit returns ErrRowsOpen and
+// the transaction is rolled back: close Rows before Commit. Nothing is sent in
+// that case; a [Tx] of a [Pool] discards the connection, which makes the server roll
+// the transaction back, and database/sql, which closes a Tx's Rows before it calls
+// Commit and drops a connection that is inside a transaction, never gets here
+// with one open.
 func (t *pgTx) Commit() error {
 	if t.conn == nil {
 		return ErrClosed

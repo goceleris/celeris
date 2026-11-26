@@ -250,6 +250,7 @@ func (w *portableWorker) readLoop(c *portableConn) {
 	for {
 		n, err := c.conn.Read(buf)
 		if n > 0 && c.onRecv != nil {
+			DispatchPause()
 			c.onRecv(buf[:n])
 		}
 		if err != nil {
