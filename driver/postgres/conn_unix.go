@@ -87,20 +87,21 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 	}
 
 	c := &pgConn{
-		fd:        fd,
-		fdFile:    file,
-		loop:      loop,
-		syncLoop:  syncL,
-		workerID:  workerHint,
-		closeLoop: closeLoop,
-		addr:      addr,
-		opts:      dsn.Options,
-		dsn:       dsn,
-		reader:    protocol.NewReader(),
-		writer:    protocol.NewWriter(),
-		bridge:    async.NewBridge(),
-		stmtCache: newLRU(dsn.Options.StatementCacheSize),
-		autoCache: dsn.Options.AutoCacheStatements && dsn.Options.StatementCacheSize > 0,
+		fd:         fd,
+		fdFile:     file,
+		loop:       loop,
+		syncLoop:   syncL,
+		workerID:   workerHint,
+		closeLoop:  closeLoop,
+		addr:       addr,
+		opts:       dsn.Options,
+		dsn:        dsn,
+		reader:     protocol.NewReader(),
+		writer:     protocol.NewWriter(),
+		bridge:     async.NewBridge(),
+		stmtCache:  newLRU(dsn.Options.StatementCacheSize),
+		stmtPrefix: newStmtNamePrefix(),
+		autoCache:  dsn.Options.AutoCacheStatements && dsn.Options.StatementCacheSize > 0,
 		// Pre-size pending queue for the common case (pipeline depth 1-2).
 		// Backing cap is retained across enqueue/popHead cycles thanks to
 		// the in-place shift in popHead, so bursty depths only allocate

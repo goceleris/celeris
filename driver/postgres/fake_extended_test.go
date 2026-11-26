@@ -167,7 +167,7 @@ func extendedFakeServerWithStaleStmt(t *testing.T, paramOIDs []uint32, execTag s
 						payload = append(payload, 'C')
 						payload = append(payload, "26000\x00"...)
 						payload = append(payload, 'M')
-						payload = append(payload, "prepared statement celst_1 does not exist\x00"...)
+						payload = append(payload, "prepared statement does not exist\x00"...)
 						payload = append(payload, 0)
 						enqueueMsg(protocol.BackendErrorResponse, payload)
 					} else {
@@ -213,7 +213,7 @@ func TestReprepareOnMiss(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	// Prepare the statement — this succeeds and caches "celst_1".
+	// Prepare the statement — this succeeds and caches the minted name.
 	stmt, err := c.PrepareContext(ctx, "INSERT INTO t(id, name) VALUES($1, $2)")
 	if err != nil {
 		t.Fatalf("PrepareContext: %v", err)

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -825,6 +826,12 @@ type pgConn struct {
 	fdMu        sync.Mutex
 	fdReleased  bool
 
+	// stmtPrefix is the per-connection part of every server-side statement
+	// name this conn mints ("celst_" + 128 random bits), set once when the conn
+	// is built and never changed; stmtCounter is the per-connection part after
+	// it and only counts up, so a name is never minted twice by this conn (see
+	// [newStmtNamePrefix]).
+	stmtPrefix  string
 	stmtCounter uint64
 
 	// sessionDirty tracks whether the connection state has been modified in a
@@ -957,6 +964,16 @@ func (c *pgConn) writeRaw(data []byte) error {
 		c.directMu.Lock()
 		_, err := c.tcp.Write(data)
 		c.directMu.Unlock()
+		if err != nil && !c.closed.Load() {
+			// A failed write leaves the conn unusable: the peer reset it (every
+			// later write fails too, "broken pipe"), or a partial message left
+			// the stream misaligned. Fail it as the read path does, so the pool
+			// discards it instead of handing the same dead socket to the next
+			// call. A Close in progress has marked c.closed and ends the socket
+			// itself.
+			c.failAll(err)
+			_ = c.closeDirect()
+		}
 		return err
 	}
 	return c.loop.Write(c.fd, data)
@@ -1211,6 +1228,7 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 		writer:       protocol.NewWriter(),
 		bridge:       async.NewBridge(),
 		stmtCache:    newLRU(dsn.Options.StatementCacheSize),
+		stmtPrefix:   newStmtNamePrefix(),
 		autoCache:    dsn.Options.AutoCacheStatements && dsn.Options.StatementCacheSize > 0,
 		pending:      make([]*pgRequest, 0, 8),
 		createdAt:    time.Now(),
@@ -1984,9 +2002,34 @@ func (c *pgConn) PrepareContext(ctx context.Context, query string) (driver.Stmt,
 	return &pgStmt{conn: c, prep: prep, query: query, cached: true}, nil
 }
 
+// stmtNameTag starts every named statement the driver prepares.
+const stmtNameTag = "celst_"
+
+// newStmtNamePrefix returns the per-connection prefix of the statement names a
+// conn mints: "celst_" and 128 random bits (crypto/rand, 26 base32 characters),
+// drawn once per connection when it is built. A named statement lives on the
+// server connection, and a pooler that shares one server connection between
+// client connections without tracking prepared statements (PgBouncer in
+// transaction mode with max_prepared_statements=0) lets two clients Parse the
+// same name with different SQL on it; a Bind of that name then runs the other
+// client's statement. A prefix that no two connections share, across processes
+// and restarts, keeps a Bind from ever naming a statement this connection did
+// not Parse. The longest name is the prefix, "_" and a 20-digit counter: 53
+// bytes, under PostgreSQL's 63-byte identifier limit.
+func newStmtNamePrefix() string {
+	return stmtNameTag + rand.Text()
+}
+
+// mintStmtName returns a new statement name: the connection's prefix and its
+// counter. It runs when a statement is prepared, never when one is reused: the
+// cached entry keeps the name.
 func (c *pgConn) mintStmtName() string {
 	n := atomic.AddUint64(&c.stmtCounter, 1)
-	return fmt.Sprintf("celst_%d", n)
+	var buf [64]byte
+	b := append(buf[:0], c.stmtPrefix...)
+	b = append(b, '_')
+	b = strconv.AppendUint(b, n, 10)
+	return string(b)
 }
 
 // prepareStatement runs Parse + Describe 'S' + Sync and returns the post-
@@ -2046,6 +2089,42 @@ func (c *pgConn) closePreparedServerAsync(name string) error {
 	return nil
 }
 
+// prepareEnded reports whether the failure of an auto-prepare (the Parse +
+// Describe of a statement the cache has not seen) ends the call. It does when
+// the context ended (ctx.Err() is set, or the prepare's own error is the
+// context's: a deadline is recognised by the clock before the context's timer
+// has set Err) or the conn is closed (the cancel exchange of the ended context
+// failed the conn). Falling through to the unnamed path then would send the
+// user's statement (Parse + Bind + Execute) under a context that had already
+// ended, and a write could commit although the caller is told the context's
+// error; on a closed conn it would report ErrClosed in place of that error. Any
+// other prepare failure (a server error such as a syntax error) still falls
+// through, as before: the unnamed path reports the server's error for the
+// statement itself.
+func (c *pgConn) prepareEnded(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || c.closed.Load() ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// ctxEndedErr returns the context's error when ctx has ended, nil otherwise. A
+// deadline that has passed counts as ended before the context's timer has set
+// Err (the clock decides, as in driveDirect). It runs on a successful
+// auto-prepare, and on a successful re-prepare after the server lost a cached
+// statement (SQLSTATE 26000), before the statement itself is sent: a context that ended while
+// the statement was being prepared (a direct conn sees a cancel-only context
+// only when bytes arrive, so a prepare can finish under a context that has
+// already been cancelled) must not go on to send, and possibly commit, the
+// statement.
+func ctxEndedErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 // ExecContext satisfies driver.ExecerContext.
 func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if len(args) == 0 {
@@ -2074,9 +2153,17 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
+			if err := ctxEndedErr(ctx); err != nil {
+				return nil, err // ended during the prepare: the statement is not sent
+			}
 			return c.extendedExec(ctx, name, query, args)
 		}
-		// Prepare failed — fall through to the unnamed path.
+		// Prepare failed. Not when the context ended or the conn is closed: then
+		// the prepare error is the answer (see prepareEnded).
+		if c.prepareEnded(ctx, err) {
+			return nil, err
+		}
+		// Otherwise fall through to the unnamed path.
 	}
 	// Unnamed statement (stmtName="") is replaced on every Parse — no stale
 	// state to clean up, so we don't mark the session dirty.
@@ -2115,9 +2202,17 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
+			if err := ctxEndedErr(ctx); err != nil {
+				return nil, err // ended during the prepare: the statement is not sent
+			}
 			return c.doExtendedQuery(ctx, name, query, args, prep.Columns)
 		}
-		// Prepare failed — fall through to the legacy path.
+		// Prepare failed. Not when the context ended or the conn is closed: then
+		// the prepare error is the answer (see prepareEnded).
+		if c.prepareEnded(ctx, err) {
+			return nil, err
+		}
+		// Otherwise fall through to the legacy path.
 	}
 	if len(args) == 0 {
 		return c.simpleQuery(ctx, query)
@@ -2725,6 +2820,9 @@ func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		rows, err = c.doExtendedQuery(ctx, stmtName, query, args, prep.Columns)
 	}
 	return rows, err
@@ -2869,6 +2967,9 @@ func (c *pgConn) extendedExec(ctx context.Context, stmtName, query string, args 
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		result, err = c.doExtendedExec(ctx, stmtName, query, args)
 	}
 	return result, err
@@ -3440,11 +3541,17 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 		return 0, errors.New("celeris-postgres: COPY FROM ended before CopyInResponse")
 	case <-ctx.Done():
-		confirmed := c.cancelRunning()
-		<-req.doneCh
-		if confirmed && req.err != nil {
-			return 0, req.err
-		}
+		// The context ended while the call waited for the CopyInResponse (which
+		// may even have arrived: with both ready, select can take ctx). A CancelRequest
+		// is no way out: the statement may not be running yet, and when it
+		// starts after the cancel was dropped the server waits in COPY IN for
+		// data that this call, which is returning, will never send; nothing then
+		// completes req and a wait for doneCh never ends (the conn and its
+		// pool slot wedged for good). The state of the session is unknown, so
+		// the conn is closed, not reused: failAll marks it closed and completes
+		// req, and Pool.release discards it (the server leaves COPY IN when the
+		// socket closes) and the pool dials a replacement.
+		c.failAll(errCopyCancelled)
 		return 0, ctx.Err()
 	}
 

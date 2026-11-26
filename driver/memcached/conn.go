@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/driver/memcached/protocol"
 	"github.com/goceleris/celeris/internal/engine"
 )
@@ -204,6 +205,11 @@ func dialDirectMemcachedConn(ctx context.Context, cfg Config) (*memcachedConn, e
 // onRecv runs on the worker goroutine.
 func (c *memcachedConn) onRecv(data []byte) {
 	if err := c.state.processRecv(data); err != nil {
+		if c.closed.Load() {
+			// Closed already (Client.Close, a loop shutdown): the drain that closed it
+			// has failed every request, and its cause is the one callers see.
+			return
+		}
 		c.closeErr.Store(&errBox{err: err})
 		c.closed.Store(true)
 		c.state.drainWithError(err)
@@ -214,6 +220,11 @@ func (c *memcachedConn) onRecv(data []byte) {
 func (c *memcachedConn) onClose(err error) {
 	if err == nil {
 		err = io.EOF
+	}
+	if errors.Is(err, eventloop.ErrLoopClosed) {
+		// Client.Close released the loop under a command in flight: the caller sees the
+		// driver's ErrClosed, not the internal package's error.
+		err = fmt.Errorf("%w: %w", ErrClosed, err)
 	}
 	c.closeErr.Store(&errBox{err: err})
 	c.closed.Store(true)
@@ -456,6 +467,7 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 		}
 		ok, err := c.pollSync(buf)
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			// Return the req so that callers release it with
 			// `defer releaseRequest(conn, req, err)`: a request that failed is
@@ -478,6 +490,7 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 	werr := c.writeAndEnqueue(req, func() []byte { return buf })
 	c.writerMu.Unlock()
 	if werr != nil {
+		werr = c.closeCause(werr)
 		_ = c.closeWithErr(werr)
 		return req, werr
 	}
@@ -516,13 +529,14 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 		}
 		ok, err := c.pollSync(buf)
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			return req, err
 		}
 		if ok {
 			select {
 			case <-req.doneCh:
-				return req, nil
+				return req, req.drained
 			default:
 			}
 		}
@@ -535,6 +549,7 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 	werr := c.writeAndEnqueue(req, func() []byte { return buf })
 	c.writerMu.Unlock()
 	if werr != nil {
+		werr = c.closeCause(werr)
 		_ = c.closeWithErr(werr)
 		return req, werr
 	}
@@ -586,13 +601,14 @@ func (c *memcachedConn) execBinaryMulti(
 			c.state.multiPollLastReq = req
 			ok, err := c.pollSyncMulti(buf)
 			if err != nil {
+				err = c.closeCause(err)
 				_ = c.closeWithErr(err)
 				return req, err
 			}
 			if ok {
 				select {
 				case <-req.doneCh:
-					return req, nil
+					return req, req.drained
 				default:
 				}
 			}
@@ -600,13 +616,14 @@ func (c *memcachedConn) execBinaryMulti(
 		}
 		ok, err := c.pollSync(buf)
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			return req, err
 		}
 		if ok {
 			select {
 			case <-req.doneCh:
-				return req, nil
+				return req, req.drained
 			default:
 			}
 		}
@@ -619,6 +636,7 @@ func (c *memcachedConn) execBinaryMulti(
 	werr := c.writeAndEnqueue(req, func() []byte { return buf })
 	c.writerMu.Unlock()
 	if werr != nil {
+		werr = c.closeCause(werr)
 		_ = c.closeWithErr(werr)
 		return req, werr
 	}
@@ -635,7 +653,7 @@ func (c *memcachedConn) waitTransport(ctx context.Context, req *mcRequest) error
 	for i := 0; i < spinIterations/2; i++ {
 		select {
 		case <-req.doneCh:
-			return nil
+			return req.drained
 		default:
 		}
 	}
@@ -643,7 +661,7 @@ func (c *memcachedConn) waitTransport(ctx context.Context, req *mcRequest) error
 		runtime.Gosched()
 		select {
 		case <-req.doneCh:
-			return nil
+			return req.drained
 		default:
 		}
 	}
@@ -651,7 +669,7 @@ func (c *memcachedConn) waitTransport(ctx context.Context, req *mcRequest) error
 	defer c.disarmOpTimer()
 	select {
 	case <-req.doneCh:
-		return nil
+		return req.drained
 	case <-ctx.Done():
 		_ = c.closeWithErr(ctx.Err())
 		return ctx.Err()
@@ -738,6 +756,25 @@ func (c *memcachedConn) opError(ctx context.Context, err error) error {
 	}
 	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
 		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
+	return err
+}
+
+// closeCause turns the event loop's "this fd is not registered" (engine.ErrUnknownFD),
+// what a write or a poll reports once the conn has been torn down, into the cause the
+// conn was closed with (EOF, the parse error, ErrClosed): that is the error the caller
+// of a command that the close ended has to see, not the loop's own.
+func (c *memcachedConn) closeCause(err error) error {
+	switch {
+	case errors.Is(err, engine.ErrUnknownFD):
+		if box := c.closeErr.Load(); box != nil && box.err != nil {
+			return box.err
+		}
+		return ErrClosed
+	case errors.Is(err, eventloop.ErrLoopClosed), errors.Is(err, net.ErrClosed):
+		// The loop was closed under the command, or Client.Close closed the socket a direct
+		// command was reading: the driver's own ErrClosed, keeping the cause.
+		return fmt.Errorf("%w: %w", ErrClosed, err)
 	}
 	return err
 }
@@ -885,6 +922,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 	}
 
 	if _, err := c.tcp.Write(buf); err != nil {
+		err = c.closeCause(err)
 		_ = c.closeWithErr(err)
 		return req, err
 	}
@@ -895,6 +933,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				perr = c.closeCause(perr)
 				_ = c.closeWithErr(perr)
 				return req, perr
 			}
@@ -904,6 +943,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 			c.onRecv(c.syncBuf[:n])
 		}
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			return req, err
 		}
@@ -933,6 +973,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 	}
 
 	if _, err := c.tcp.Write(buf); err != nil {
+		err = c.closeCause(err)
 		_ = c.closeWithErr(err)
 		return req, err
 	}
@@ -943,6 +984,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				perr = c.closeCause(perr)
 				_ = c.closeWithErr(perr)
 				return req, perr
 			}
@@ -952,11 +994,12 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 			c.onRecv(c.syncBuf[:n])
 		}
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			return req, err
 		}
 	}
-	return req, nil
+	return req, req.drained
 }
 
 // execBinaryMultiDirect is the direct-mode path for multi-reply binary
@@ -982,6 +1025,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 	}
 
 	if _, err := c.tcp.Write(buf); err != nil {
+		err = c.closeCause(err)
 		_ = c.closeWithErr(err)
 		return req, err
 	}
@@ -992,6 +1036,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 				c.onRecv(c.syncBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				perr = c.closeCause(perr)
 				_ = c.closeWithErr(perr)
 				return req, perr
 			}
@@ -1001,11 +1046,12 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 			c.onRecv(c.syncBuf[:n])
 		}
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			return req, err
 		}
 	}
-	return req, nil
+	return req, req.drained
 }
 
 // Worker satisfies async.Conn.
