@@ -51,6 +51,14 @@ const (
 	// lossFatal sends half the rows, then a FATAL 57P01 ErrorResponse (what
 	// pg_terminate_backend makes the backend send), then closes.
 	lossFatal lossKind = "fatal57P01"
+	// lossInsideCC sends every DataRow and half of CommandComplete, then closes.
+	lossInsideCC lossKind = "insideCommandComplete"
+	// lossReadyMinus1 sends the rows, CommandComplete and ReadyForQuery minus its
+	// status byte, then closes.
+	lossReadyMinus1 lossKind = "readyMinusOneByte"
+	// lossReadyHeader sends the rows, CommandComplete and the 'Z' byte of
+	// ReadyForQuery only, then closes.
+	lossReadyHeader lossKind = "readyHeaderOnly"
 	// lossStall sends half the rows, a pause and ten more, then holds the connection open, reading
 	// whatever the client sends, until the client closes it.
 	lossStall lossKind = "stall"
@@ -138,6 +146,21 @@ func lossServer(tb testing.TB, cfg lossCfg) func(net.Conn) {
 				case lossAfterLast:
 					header()
 					rows(0, n)
+				case lossInsideCC:
+					header()
+					rows(0, n)
+					cc := pgMsg(protocol.BackendCommandComplete, append([]byte(tag), 0))
+					buf = append(buf, cc[:len(cc)/2]...)
+				case lossReadyMinus1, lossReadyHeader:
+					header()
+					rows(0, n)
+					add(protocol.BackendCommandComplete, append([]byte(tag), 0))
+					z := pgMsg(protocol.BackendReadyForQuery, []byte{status})
+					if cfg.kind == lossReadyMinus1 {
+						buf = append(buf, z[:len(z)-1]...)
+					} else {
+						buf = append(buf, z[0])
+					}
 				case lossMid:
 					header()
 					rows(0, n/2)

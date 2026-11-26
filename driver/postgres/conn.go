@@ -1689,12 +1689,21 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 			}
 			c.popHead()
 			head.finish()
-		} else if head.rowCh != nil && head.colsCh != nil {
+		} else if head.columns == nil && len(head.extended.Columns) > 0 {
 			// For extended queries, RowDescription comes from the Describe
-			// response (before DataRow). Signal colsCh as soon as columns
-			// are available so the caller can return streamRows early.
-			if head.extended.Columns != nil && head.columns == nil {
-				head.setColumnsIfLive(head.extended.Columns)
+			// response (before DataRow). Publish it to the request now, not
+			// only when the statement ends: a statement that is not cached (an
+			// INSERT/UPDATE/DELETE ... RETURNING with arguments; any query with
+			// auto_cache_statements=false) describes its portal here, and a
+			// request that failAll or driveDirect completes after its DataRows
+			// otherwise has rows and no columns, which the caller reads as raw
+			// binary cells with no error. A cached statement presets
+			// req.columns, so this does not run for it. (len, not nil: a pooled
+			// request's Columns is an empty, non-nil slice until the
+			// RowDescription is parsed.)
+			head.setColumnsIfLive(head.extended.Columns)
+			if head.rowCh != nil && head.colsCh != nil {
+				// Signal colsCh so the caller can return streamRows early.
 				head.closeColsCh()
 			}
 		}
