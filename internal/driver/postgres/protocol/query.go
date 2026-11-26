@@ -327,11 +327,31 @@ const (
 // After calling WriteQuery, feed server messages one at a time via Handle.
 // Handle returns done=true after ReadyForQuery.
 //
-// Multi-statement queries are supported: after CommandComplete the state
-// machine returns to phaseAwaitResult, accepting another RowDescription.
+// Multi-statement queries are accepted: after CommandComplete the state
+// machine returns to phaseAwaitResult, accepting another RowDescription. The
+// caller of a row-returning query sets RejectMultiSet, because the driver
+// returns one result set; see that field.
 type SimpleQueryState struct {
 	Columns []ColumnDesc
 	Err     *PGError
+
+	// RejectMultiSet is set by a caller that returns rows (Query, not Exec)
+	// before the first message is fed. Then only the first RowDescription is
+	// parsed and dispatched. A later one is counted (MultiSet) and the rows of
+	// that and every later result set are read and discarded up to
+	// ReadyForQuery, so the connection stays in step and Columns, which the
+	// caller of the first result set holds, is never written again. Without
+	// it (Exec) every result set is parsed and dispatched as before.
+	RejectMultiSet bool
+	// MultiSet reports that the server sent a second RowDescription on a
+	// RejectMultiSet query: more than one statement returned rows. It is read
+	// after Handle reports ReadyForQuery.
+	MultiSet bool
+
+	// sawRowDesc is true once a RowDescription has been dispatched.
+	sawRowDesc bool
+	// discard is true while the rows of a result set after the first are read.
+	discard bool
 
 	phase simpleQueryPhase
 	// fieldScratch is reused across DataRow payloads within a single
@@ -420,11 +440,21 @@ func (q *SimpleQueryState) Handle(
 ) (bool, error) {
 	switch msgType {
 	case BackendRowDescription:
+		if q.RejectMultiSet && q.sawRowDesc {
+			// A second result set. Not parsed: ParseRowDescriptionInto would
+			// rewrite Columns in place, the slice the caller of the first set
+			// holds (and reads on another goroutine). Not dispatched either.
+			q.MultiSet = true
+			q.discard = true
+			q.phase = sqPhaseAwaitRowsOrDone
+			return false, nil
+		}
 		cols, err := ParseRowDescriptionInto(q.Columns, payload)
 		if err != nil {
 			return false, err
 		}
 		q.Columns = cols
+		q.sawRowDesc = true
 		if obs != nil {
 			obs.OnRowDesc(cols)
 		}
@@ -433,6 +463,9 @@ func (q *SimpleQueryState) Handle(
 	case BackendDataRow:
 		if q.phase != sqPhaseAwaitRowsOrDone {
 			return false, errors.New("postgres/protocol: DataRow outside of result set")
+		}
+		if q.discard {
+			return false, nil
 		}
 		fields, err := ParseDataRowInto(q.fieldScratch, payload)
 		if err != nil {
@@ -450,6 +483,7 @@ func (q *SimpleQueryState) Handle(
 		q.tagBuf = append(q.tagBuf[:0], tagBytes...)
 		// Multi-statement: another RowDescription may follow before RFQ.
 		q.phase = sqPhaseAwaitResult
+		q.discard = false
 		return false, nil
 	case BackendEmptyQuery:
 		q.phase = sqPhaseAwaitResult

@@ -364,7 +364,7 @@ func (c *memcachedConn) runHandshake(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer putRequest(req)
+	defer releaseRequest(c, req, err)
 	if req.resultErr != nil {
 		return req.resultErr
 	}
@@ -457,12 +457,9 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 		ok, err := c.pollSync(buf)
 		if err != nil {
 			_ = c.closeWithErr(err)
-			// Return the req so callers can putRequest it back to the pool
-			// via `defer putRequest(req)` placed BEFORE the err check. The
-			// request has already been finished by closeWithErr's
-			// drainWithError; there is nothing more to do on it, but
-			// dropping it on the floor would slowly drain reqPool under
-			// sustained failures.
+			// Return the req so that callers release it with
+			// `defer releaseRequest(conn, req, err)`: a request that failed is
+			// dropped, not put back in reqPool (see releaseRequest).
 			return req, err
 		}
 		if ok {
@@ -817,7 +814,7 @@ func (c *memcachedConn) Ping(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		defer putRequest(req)
+		defer releaseRequest(c, req, err)
 		return req.resultErr
 	}
 	req, err := c.execText(ctx, kindVersion, func(w *protocol.TextWriter) []byte {
@@ -826,7 +823,7 @@ func (c *memcachedConn) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer putRequest(req)
+	defer releaseRequest(c, req, err)
 	return req.resultErr
 }
 
