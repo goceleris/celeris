@@ -112,7 +112,8 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 						break
 					}
 				}
-				if next == nil {
+				injected := next == nil
+				if injected {
 					nextID = 1001
 					s.ID = nextID
 					s.manager = m2
@@ -139,6 +140,15 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 				if got, in := m2.GetStream(nextID); !in || got != next || m2.CountActiveStreams() != active {
 					t.Fatalf("iteration %d: the other connection's stream %d lost its place: in map %v, active %d, want %d",
 						i, nextID, in, m2.CountActiveStreams(), active)
+				}
+				if injected {
+					// s went to the stream pool at s.Release() above (a build
+					// with -race may have dropped that Put). A scan that
+					// missed it does not mean it is in no pool: it can sit in
+					// another P's private slot. It is not m2's to release.
+					m2.mu.Lock()
+					delete(m2.streams, nextID)
+					m2.mu.Unlock()
 				}
 				m2.Close()
 			}
