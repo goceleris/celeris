@@ -69,6 +69,19 @@ var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transacti
 // returned this error.
 var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate or use streaming mode")
 
+// errMultiResultSets is the error of a row-returning query (Query, QueryRow,
+// QueryContext, on a Pool, a Tx or a *sql.DB) whose text holds several
+// statements of which more than one returns rows. The driver returns one result
+// set; before this error it returned the first set's rows under the LAST set's
+// column names (the second set's rows appended when the shapes matched). The
+// server has run every statement (a multi-statement simple query is one
+// implicit transaction, committed unless a statement failed); the error is
+// raised once the whole reply is read, and the connection is ready for the next
+// query. A query string whose statements return rows in only one of them (SET
+// then SELECT, SELECT then UPDATE, INSERT then SELECT) is not affected, and Exec
+// accepts any number of statements. Unexported: the error text is the contract.
+var errMultiResultSets = errors.New("celeris-postgres: multiple result sets are not supported; the server has executed the statements")
+
 // ErrDirectModeUnsupported is returned by operations that rely on
 // unsolicited server messages between queries — LISTEN/UNLISTEN/NOTIFY
 // (NotificationResponse) most notably. Direct-mode conns dial a plain
