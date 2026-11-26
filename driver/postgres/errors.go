@@ -44,16 +44,29 @@ var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transacti
 	"the connection was discarded and the transaction rolled back; use BeginTx")
 
 // ErrResultTooBig is the error of a query whose cumulative DataRow payload
-// exceeds the buffering cap (maxDirectResultBytes, 64 MiB) while the reply is
-// buffered whole: in direct mode, which pins syncMode=true and cannot lazily
-// promote to streaming, and on the sync fast path of a non-direct pool while its
-// poll has not returned. The caller reads the rows buffered up to the cap and
-// then gets this error from rows.Err() (rows.Next); the rest of the reply is
-// read and discarded, so the connection stays usable. A caller that does not
-// check rows.Err() sees a truncated result. To iterate large result sets, use a
-// non-direct pool, which streams lazily once its reply passes the streaming
-// threshold (its sync fast path can still trip the cap when one poll takes more
-// than the cap), or paginate the query with LIMIT/OFFSET or cursor-based paging.
+// exceeds the result buffer cap, 64 MiB (maxDirectResultBytes), on a path that
+// buffers the reply whole. Those paths are a direct-mode [Pool]: a bare
+// [Open](dsn), or [WithEngine] on a server that has started (epoll, io_uring,
+// adaptive) or that runs async handlers; and, rarely, the sync fast path of an
+// event-loop Pool while one poll reads past the cap. A Pool opened with
+// [WithEngine] on a server that has not started yet (or that runs the std
+// engine without async handlers) and a *sql.DB opened with this driver stream a
+// large result and have no cap.
+//
+// The caller reads the rows that fit under the cap and then gets this error
+// from [Rows.Err]. [Rows.Next] only returns false and [Rows.Close] returns nil,
+// so a caller that does not check Rows.Err sees a truncated result with no other
+// sign: always check it. A single row larger than the cap fails the query
+// itself: the call returns this error and no rows. The rest of the reply is
+// read and discarded, so the connection stays usable. The cap is fixed: there
+// is no option and no DSN parameter for it.
+//
+// To read a larger result use [Pool.CopyTo], a cursor (DECLARE and FETCH n)
+// inside [Pool.BeginTx], a Pool on the event loop (WithEngine on a server that
+// has not started yet), or database/sql, all of which stream; or paginate the
+// query with LIMIT/OFFSET or keyset paging. Before v1.6.0 a direct-mode Pool
+// buffered the whole reply (several times its size in memory) before it
+// returned this error.
 var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate or use streaming mode")
 
 // ErrDirectModeUnsupported is returned by operations that rely on
