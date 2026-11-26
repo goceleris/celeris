@@ -1017,13 +1017,6 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 		}
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				if req.doneAtom.Load() != 0 {
-					// The reply was complete when the deadline (or the wake of
-					// the context's end) fired: the statement succeeded and the
-					// top of the loop returns its result; endCtxWatch clears the
-					// deadline.
-					continue
-				}
 				if ctx.Err() != nil || (hasDL && !time.Now().Before(dl)) {
 					// The end of the context, by its deadline or by the wake of its
 					// cancel (nothing else sets a read deadline on this conn while

@@ -384,7 +384,7 @@ func TestPoolStaleCancelNeverPoisonsTheNextStatement(t *testing.T) {
 				t.Fatalf("first failure: %s", failures[0])
 			}
 			if ended == 0 || finished == 0 {
-				t.Logf("WARNING: %d ended, %d finished: the cancel instants do not span the statement on this machine", ended, finished)
+				t.Fatalf("%d ended, %d finished: the cancel instants do not span the statement", ended, finished)
 			}
 		})
 	}
