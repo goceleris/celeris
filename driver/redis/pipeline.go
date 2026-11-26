@@ -307,8 +307,9 @@ func (p *Pipeline) Discard() {
 //	                                   error reply              an error at once, sends nothing
 //
 // After a failed Exec every command of the batch reports the Exec's error,
-// including one whose reply had already arrived: the failed connection can
-// still be writing into the batch's buffers, so none of them is read.
+// including one whose reply, or server error reply, had already arrived: the
+// failed connection can still be writing into the batch's buffers, so none of
+// them is read.
 //
 // After a successful Exec, a second Exec returns an error at once (it does not
 // block or touch a connection): Discard before queueing a new batch.
@@ -393,12 +394,17 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 	}
 	// A conn that closed while the replies were arriving (the server dropped
 	// it) is a failed Exec too, not a command's error reply: the Pipeline
-	// stays usable. Only the error it carried is read here, never a reply.
+	// stays usable. The requests a close fails are always the tail of the
+	// batch (replies are dispatched in order, and the drain fails everything
+	// not yet dispatched), so only the LAST request is looked at: if it got a
+	// real reply, every request did. A null reply (ErrNil) or an error reply
+	// (*RedisError) is a reply, not a lost connection.
 	if conn.closed.Load() {
-		for _, r := range reqs {
-			if r.resultErr != nil {
-				p.failExec(conn, r.resultErr)
-				return r.resultErr
+		if e := reqs[len(reqs)-1].resultErr; e != nil && e != ErrNil {
+			var re *RedisError
+			if !errors.As(e, &re) {
+				p.failExec(conn, e)
+				return e
 			}
 		}
 	}
