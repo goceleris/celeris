@@ -559,11 +559,14 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	return acquireRows(drows, c, p), nil
 }
 
-// ExecContext runs a statement and returns a [Result]. A statement that
-// succeeds and leaves a transaction open on the connection (Exec "BEGIN")
-// returns [ErrTxLeftOpen]: see the Session state section of [Pool]. A statement
-// that fails returns its own error, unchanged, as before (a connection left in
-// a failed transaction by it is discarded all the same).
+// ExecContext runs a statement and returns a [Result]. An error does not prove
+// that the statement was not applied: see Errors from writes in the package
+// documentation.
+//
+// A statement that succeeds and leaves a transaction open on the connection
+// (Exec "BEGIN") returns [ErrTxLeftOpen]: see the Session state section of
+// [Pool]. A statement that fails returns its own error, unchanged, as before (a
+// connection left in a failed transaction by it is discarded all the same).
 //
 // A context that ended before the call or while the statement was being
 // prepared ends the call with an error and the statement is not sent; one that
@@ -1448,6 +1451,11 @@ func (r *Row) Err() error { return r.err }
 
 // QueryRow executes a query expected to return at most one row. The
 // returned [Row] is always non-nil; errors are deferred until [Row.Scan].
+//
+// When the statement has RETURNING (an INSERT, UPDATE or DELETE ... RETURNING
+// statement is a write), an error from the call or from Scan does not prove that
+// the statement was not applied: see Errors from writes in the package
+// documentation.
 func (p *Pool) QueryRow(ctx context.Context, query string, args ...any) *Row {
 	rows, err := p.QueryContext(ctx, query, args...)
 	return &Row{rows: rows, err: err}
@@ -1486,7 +1494,8 @@ type Tx struct {
 // reported (a *[PGError], for example a deferred constraint or a serialization
 // failure), PostgreSQL rolled the transaction back. When the connection failed on
 // the wire before the reply was read, the outcome is unknown: the transaction may
-// have been committed. The Tx is ended either way.
+// have been committed. An error from Commit does not prove that the transaction
+// was not committed. The Tx is ended either way.
 //
 // The connection goes back to the pool only if the driver knows its state: the
 // server's reply was read up to ReadyForQuery and the session is idle, outside a
@@ -1558,7 +1567,9 @@ func (p *Pool) discardOverOpenRows(c *pgConn) {
 // it (Rollback or Commit): it matches [ErrClosed] and [io.ErrUnexpectedEOF].
 var errRollbackDiscard = fmt.Errorf("%w: %w: the transaction was rolled back while a Rows of it was still streaming", ErrClosed, io.ErrUnexpectedEOF)
 
-// ExecContext runs a statement on the pinned conn.
+// ExecContext runs a statement on the pinned conn. An error does not prove that
+// the statement was not applied: see Errors from writes in the package
+// documentation.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
 	if t.done.Load() {
 		return Result{}, ErrTxDone
@@ -1594,6 +1605,11 @@ func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows
 // QueryRow executes a query expected to return at most one row on the
 // pinned conn. The returned [Row] is always non-nil; errors are deferred
 // until [Row.Scan].
+//
+// When the statement has RETURNING (an INSERT, UPDATE or DELETE ... RETURNING
+// statement is a write), an error from the call or from Scan does not prove that
+// the statement was not applied: see Errors from writes in the package
+// documentation.
 func (t *Tx) QueryRow(ctx context.Context, query string, args ...any) *Row {
 	rows, err := t.QueryContext(ctx, query, args...)
 	return &Row{rows: rows, err: err}
