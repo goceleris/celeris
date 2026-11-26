@@ -950,6 +950,16 @@ func (c *pgConn) writeRaw(data []byte) error {
 		c.directMu.Lock()
 		_, err := c.tcp.Write(data)
 		c.directMu.Unlock()
+		if err != nil && !c.closed.Load() {
+			// A failed write leaves the conn unusable: the peer reset it (every
+			// later write fails too, "broken pipe"), or a partial message left
+			// the stream misaligned. Fail it as the read path does, so the pool
+			// discards it instead of handing the same dead socket to the next
+			// call. A Close in progress has marked c.closed and ends the socket
+			// itself.
+			c.failAll(err)
+			_ = c.closeDirect()
+		}
 		return err
 	}
 	return c.loop.Write(c.fd, data)
