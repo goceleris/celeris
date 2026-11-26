@@ -2029,6 +2029,42 @@ func (c *pgConn) closePreparedServerAsync(name string) error {
 	return nil
 }
 
+// prepareEnded reports whether the failure of an auto-prepare (the Parse +
+// Describe of a statement the cache has not seen) ends the call. It does when
+// the context ended (ctx.Err() is set, or the prepare's own error is the
+// context's: a deadline is recognised by the clock before the context's timer
+// has set Err) or the conn is closed (the cancel exchange of the ended context
+// failed the conn). Falling through to the unnamed path then would send the
+// user's statement (Parse + Bind + Execute) under a context that had already
+// ended, and a write could commit although the caller is told the context's
+// error; on a closed conn it would report ErrClosed in place of that error. Any
+// other prepare failure (a server error such as a syntax error) still falls
+// through, as before: the unnamed path reports the server's error for the
+// statement itself.
+func (c *pgConn) prepareEnded(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || c.closed.Load() ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// ctxEndedErr returns the context's error when ctx has ended, nil otherwise. A
+// deadline that has passed counts as ended before the context's timer has set
+// Err (the clock decides, as in driveDirect). It runs on a successful
+// auto-prepare, and on a successful re-prepare after the server lost a cached
+// statement (SQLSTATE 26000), before the statement itself is sent: a context that ended while
+// the statement was being prepared (a direct conn sees a cancel-only context
+// only when bytes arrive, so a prepare can finish under a context that has
+// already been cancelled) must not go on to send, and possibly commit, the
+// statement.
+func ctxEndedErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 // ExecContext satisfies driver.ExecerContext.
 func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if len(args) == 0 {
@@ -2057,9 +2093,17 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
+			if err := ctxEndedErr(ctx); err != nil {
+				return nil, err // ended during the prepare: the statement is not sent
+			}
 			return c.extendedExec(ctx, name, query, args)
 		}
-		// Prepare failed — fall through to the unnamed path.
+		// Prepare failed. Not when the context ended or the conn is closed: then
+		// the prepare error is the answer (see prepareEnded).
+		if c.prepareEnded(ctx, err) {
+			return nil, err
+		}
+		// Otherwise fall through to the unnamed path.
 	}
 	// Unnamed statement (stmtName="") is replaced on every Parse — no stale
 	// state to clean up, so we don't mark the session dirty.
@@ -2098,9 +2142,17 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
+			if err := ctxEndedErr(ctx); err != nil {
+				return nil, err // ended during the prepare: the statement is not sent
+			}
 			return c.doExtendedQuery(ctx, name, query, args, prep.Columns)
 		}
-		// Prepare failed — fall through to the legacy path.
+		// Prepare failed. Not when the context ended or the conn is closed: then
+		// the prepare error is the answer (see prepareEnded).
+		if c.prepareEnded(ctx, err) {
+			return nil, err
+		}
+		// Otherwise fall through to the legacy path.
 	}
 	if len(args) == 0 {
 		return c.simpleQuery(ctx, query)
@@ -2708,6 +2760,9 @@ func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		rows, err = c.doExtendedQuery(ctx, stmtName, query, args, prep.Columns)
 	}
 	return rows, err
@@ -2852,6 +2907,9 @@ func (c *pgConn) extendedExec(ctx context.Context, stmtName, query string, args 
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		result, err = c.doExtendedExec(ctx, stmtName, query, args)
 	}
 	return result, err
