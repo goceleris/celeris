@@ -13,7 +13,8 @@ type pgTx struct {
 
 var _ driver.Tx = (*pgTx)(nil)
 
-// Commit ends the transaction whatever it returns. If a streaming Rows of this
+// Commit ends the transaction whatever it returns. An error from Commit does not
+// prove that the transaction was not committed. If a streaming Rows of this
 // transaction is still open (see [ErrRowsOpen]), Commit returns ErrRowsOpen and
 // the transaction is rolled back: close Rows before Commit. Nothing is sent in
 // that case; a [Tx] of a [Pool] discards the connection, which makes the server roll

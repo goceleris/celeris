@@ -43,7 +43,9 @@ func (s *pgStmt) NumInput() int {
 }
 
 // Exec implements driver.Stmt's deprecated Exec. database/sql prefers
-// ExecContext but some older code paths still call this.
+// ExecContext but some older code paths still call this. An error does not prove
+// that the statement was not applied: see Errors from writes in the package
+// documentation.
 func (s *pgStmt) Exec(args []driver.Value) (driver.Result, error) {
 	return s.ExecContext(context.Background(), toNamed(args))
 }
@@ -53,7 +55,9 @@ func (s *pgStmt) Query(args []driver.Value) (driver.Rows, error) {
 	return s.QueryContext(context.Background(), toNamed(args))
 }
 
-// ExecContext runs Bind + Execute + Sync against the cached plan.
+// ExecContext runs Bind + Execute + Sync against the cached plan. An error does
+// not prove that the statement was not applied: see Errors from writes in the
+// package documentation.
 func (s *pgStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
 	if s.conn == nil {
 		return nil, ErrClosed

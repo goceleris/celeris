@@ -77,10 +77,19 @@
 //
 // # Errors from writes
 //
-// An error from a write does not prove that the write was not applied: a
-// connection that closes right after the server answered can be reported as a
-// failure (celeris#1459); do not blindly retry Incr, Decr or other
-// non-idempotent commands on a connection error.
+// An error from a write does not prove that the write was not applied. This
+// holds for [Pool.ExecContext] and [Tx.ExecContext], for [Pool.QueryRow] and
+// [Tx.QueryRow] with a statement that has RETURNING (an INSERT, UPDATE or
+// DELETE ... RETURNING statement is a write), and for [Tx.Commit].
+//
+// A call whose reply was cut off by a lost connection returns an error, not a
+// result that looks complete (celeris#1459). The error can also be returned for
+// a call whose reply had arrived completely, when the server closes the
+// connection right after it: the write was applied and the call still reports a
+// connection failure. This is a known limit (celeris#1470). Do not blindly retry
+// a statement that is not idempotent (an INSERT without a unique key, an UPDATE
+// that adds to a value) after a connection error: check the state first, or make
+// the statement safe to repeat.
 //
 // # Documentation
 //

@@ -2426,7 +2426,9 @@ func ctxEndedErr(ctx context.Context) error {
 	return nil
 }
 
-// ExecContext satisfies driver.ExecerContext.
+// ExecContext satisfies driver.ExecerContext. An error does not prove that the
+// statement was not applied: see Errors from writes in the package
+// documentation.
 func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if len(args) == 0 {
 		tag, _, err := c.simpleExec(ctx, query)
