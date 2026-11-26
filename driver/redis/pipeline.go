@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"sync"
@@ -14,6 +15,16 @@ import (
 // errPipeCmdOrphaned is returned by typed cmd Result() when the owning
 // Pipeline has been released back to the pool or was never properly exec'd.
 var errPipeCmdOrphaned = &pipeCmd{err: ErrClosed}
+
+// errCmdNotExecuted is returned by a typed Cmd's Result() when the command
+// has no reply to report: its Pipeline or Tx was never executed, or the Exec
+// failed before the command was sent.
+var errCmdNotExecuted = errors.New("celeris-redis: command has no result: its Pipeline or Tx was not executed")
+
+// errPipelineExecuted is returned by a second [Pipeline.Exec] on a Pipeline
+// that already ran. The commands were sent once and their results are held
+// until [Pipeline.Discard] or [Pipeline.Release].
+var errPipelineExecuted = errors.New("celeris-redis: Pipeline already executed; call Discard before queueing a new batch")
 
 // defaultPipelineCap is the initial capacity of Pipeline's per-command slabs.
 // Chosen so a typical batch (tens to low-hundreds of commands) never grows
@@ -29,6 +40,18 @@ const defaultPipelineCap = 128
 // after Exec, then return it to the pool via [Pipeline.Release]. Release is
 // optional but recommended for tight hot paths — without it a fresh
 // Pipeline (and its internal slabs) is allocated on every call.
+//
+// Values obtained from a Pipeline are valid until Release: the strings and
+// the typed results read from its *Cmd handles share the Pipeline's recycled
+// buffers, and Release hands those buffers to the next Pipeline. Copy what you
+// keep past Release (for example with strings.Clone).
+//
+// A Pipeline runs once: queue commands, call [Pipeline.Exec] once, read the
+// results, then [Pipeline.Release] (or [Pipeline.Discard] to queue a new
+// batch). A second Exec after a successful one returns an error. After an
+// Exec that failed, each Result returns that error, and queueing commands
+// starts a new batch that the next Exec sends. A Result read before Exec
+// returns an error.
 //
 // Pipeline is NOT safe for concurrent use. A caller must not invoke methods
 // on the same Pipeline from multiple goroutines at once.
@@ -80,6 +103,17 @@ type Pipeline struct {
 	// Each entry's doneCh is allocated lazily on first use and retained for
 	// subsequent Exec calls. The slab only grows and is never shrunk.
 	reqSlab []redisRequest
+
+	// executed is set once Exec has sent the queued commands and cleared by
+	// Discard/Release. A second Exec returns errPipelineExecuted instead of
+	// waiting for replies to commands it never sent.
+	executed bool
+
+	// failed is set when Exec failed after sending. The command list is kept
+	// so each Result reports the real error, but the batch is over: the next
+	// command queued starts a new one (the pipeline stays usable, as in
+	// v1.5.11), and an Exec with nothing new queued sends nothing.
+	failed bool
 }
 
 // pipeCmd holds the per-command state populated by Exec. When direct is true,
@@ -187,7 +221,7 @@ func (p *Pipeline) Release() {
 // Pipeline can be handed to a new caller without re-allocating its
 // internals.
 func (p *Pipeline) reset() {
-	p.w.Reset()
+	p.resetRequests()
 	// Zero used slots so previously-retained pointers (if any leaked) don't
 	// observe stale values.
 	for i := range p.cmds {
@@ -215,6 +249,24 @@ func (p *Pipeline) reset() {
 		p.boolCmds[i] = BoolCmd{}
 	}
 	p.boolCmds = p.boolCmds[:0]
+	p.strSlab = p.strSlab[:0]
+	p.executed = false
+	p.failed = false
+}
+
+// newBatch starts a new batch after a failed Exec. It is reset() except that
+// strSlab keeps its contents: strings already read from the failed batch stay
+// valid until Discard or Release, as documented.
+func (p *Pipeline) newBatch() {
+	keep := p.strSlab
+	p.reset()
+	p.strSlab = keep
+}
+
+// resetRequests clears the wire buffer and the per-request state of the last
+// Exec, leaving the command list and its results alone.
+func (p *Pipeline) resetRequests() {
+	p.w.Reset()
 	// Clear reqs refs; slab-backed requests are retained on p.reqSlab.
 	for i := range p.reqs {
 		p.reqs[i] = nil
@@ -230,7 +282,6 @@ func (p *Pipeline) reset() {
 	}
 	p.reqSlab = p.reqSlab[:0]
 	p.argsScratch = p.argsScratch[:0]
-	p.strSlab = p.strSlab[:0]
 }
 
 // Discard drops all queued commands without sending anything. The Pipeline
@@ -242,15 +293,34 @@ func (p *Pipeline) Discard() {
 // Exec sends every queued command in one write and blocks until the last
 // reply is received. Returns the first parse/transport error; per-command
 // errors are reachable via each *Cmd.Result().
+//
+// A Pipeline runs once. After Exec returned an error, read the Result of a queued
+// command that returns an error to tell what happened, then:
+//
+//	Result of a command (an error)     what happened            next step
+//	"not executed" error               no connection obtained   Exec again as it is;
+//	                                   (the context ended       do not queue the commands
+//	                                   while waiting for one)   again: the queue is intact
+//	the context error or the           the batch was sent       queue the commands again,
+//	connection error, same as Exec's  and Exec failed           Exec
+//	the command's own server error     a command got a server   Discard first: Exec returns
+//	                                   error reply              an error at once, sends nothing
+//
+// After a successful Exec, a second Exec returns an error at once (it does not
+// block or touch a connection): Discard before queueing a new batch.
 func (p *Pipeline) Exec(ctx context.Context) error {
+	if p.executed {
+		return errPipelineExecuted
+	}
 	n := len(p.cmds)
-	if n == 0 {
+	if n == 0 || p.failed {
 		return nil
 	}
 	conn, err := p.client.pool.acquireCmd(ctx, workerFromCtx(ctx))
 	if err != nil {
 		return err
 	}
+	p.executed = true
 	// Pre-size strSlab: typical GET response is ~16 bytes; SET response is
 	// "OK" (interned, but slab growth may still occur for other cmds).
 	// Over-sizing is cheap; under-sizing triggers grow-copies mid-pipeline.
@@ -332,9 +402,22 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 			}
 			reqs[i] = nil
 		}
+		// Keep the command list so each Result reports the real error (a
+		// deadline, a closed conn) instead of "released"; a command whose
+		// request never came back gets the error too. The batch is over: the
+		// next queued command starts a new one.
+		for i := range p.cmds {
+			if p.cmds[i].err == nil && !p.cmds[i].direct && p.cmds[i].val == nil {
+				p.cmds[i].err = err
+			}
+		}
+		// Do not touch the request slab here. The conn has failed and its
+		// reader may still be finishing a request of this batch; the slab is
+		// cleared by the next batch (newBatch) or by Discard/Release.
 		p.w.Reset()
-		p.cmds = p.cmds[:0]
 		p.reqs = p.reqs[:0]
+		p.executed = false
+		p.failed = true
 		// Give the pool slot back (celeris#1268). Every error execManyCore
 		// returns has closed the conn first (as does the ErrClosed of a conn
 		// that was already closed), and releaseCmd discards a closed conn, so
@@ -363,11 +446,20 @@ func (p *Pipeline) Exec(ctx context.Context) error {
 	if cap(conn.state.copySlab) > maxSlabRetain {
 		conn.state.copySlab = nil
 	}
+	// A reply error that came with the conn closing (the server dropped it)
+	// is a failed Exec like the one above, not a command's error reply: the
+	// Pipeline stays usable. Read it before the conn goes back to the pool.
+	connLost := firstErr != nil && conn.closed.Load()
 	p.client.pool.releaseCmd(conn)
 	p.w.Reset()
 	// Leave p.cmds populated so the user can read Result() off each typed
 	// handle. The slabs are fully reset only on Release/Discard.
 	p.reqs = p.reqs[:0]
+	if connLost {
+		p.resetRequests()
+		p.executed = false
+		p.failed = true
+	}
 	return firstErr
 }
 
@@ -428,6 +520,9 @@ func (p *Pipeline) slabStr(s string) string {
 // tracking pipeCmd. Callers must NOT hold a pointer into p.cmds across
 // additional addCmd calls — the underlying array may reallocate.
 func (p *Pipeline) addCmd(kind cmdKind, args ...string) int {
+	if p.failed {
+		p.newBatch()
+	}
 	p.w.AppendCommand(args...)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
 	return len(p.cmds) - 1
@@ -435,6 +530,9 @@ func (p *Pipeline) addCmd(kind cmdKind, args ...string) int {
 
 // addCmd2 is the 2-arg fast path that avoids the variadic []string alloc.
 func (p *Pipeline) addCmd2(kind cmdKind, a0, a1 string) int {
+	if p.failed {
+		p.newBatch()
+	}
 	p.w.AppendCommand2(a0, a1)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
 	return len(p.cmds) - 1
@@ -442,6 +540,9 @@ func (p *Pipeline) addCmd2(kind cmdKind, a0, a1 string) int {
 
 // addCmd3 is the 3-arg fast path.
 func (p *Pipeline) addCmd3(kind cmdKind, a0, a1, a2 string) int {
+	if p.failed {
+		p.newBatch()
+	}
 	p.w.AppendCommand3(a0, a1, a2)
 	p.cmds = append(p.cmds, pipeCmd{kind: kind})
 	return len(p.cmds) - 1
@@ -483,6 +584,9 @@ func (c *StringCmd) Result() (string, error) {
 	if pc.direct {
 		return pc.str, nil
 	}
+	if pc.val == nil {
+		return "", errCmdNotExecuted
+	}
 	return asString(*pc.val)
 }
 
@@ -511,6 +615,9 @@ func (c *IntCmd) Result() (int64, error) {
 	}
 	if pc.direct {
 		return pc.scalar, nil
+	}
+	if pc.val == nil {
+		return 0, errCmdNotExecuted
 	}
 	return asInt(*pc.val)
 }
@@ -541,6 +648,9 @@ func (c *StatusCmd) Result() (string, error) {
 	if pc.direct {
 		return pc.str, nil
 	}
+	if pc.val == nil {
+		return "", errCmdNotExecuted
+	}
 	return asString(*pc.val)
 }
 
@@ -570,6 +680,9 @@ func (c *FloatCmd) Result() (float64, error) {
 	if pc.direct {
 		return math.Float64frombits(uint64(pc.scalar)), nil
 	}
+	if pc.val == nil {
+		return 0, errCmdNotExecuted
+	}
 	return asFloat(*pc.val)
 }
 
@@ -598,6 +711,9 @@ func (c *BoolCmd) Result() (bool, error) {
 	}
 	if pc.direct {
 		return pc.scalar != 0, nil
+	}
+	if pc.val == nil {
+		return false, errCmdNotExecuted
 	}
 	return asBool(*pc.val)
 }
