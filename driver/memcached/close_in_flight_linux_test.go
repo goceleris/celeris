@@ -135,7 +135,8 @@ func TestClientCloseFailsTheCommandsInFlight(t *testing.T) {
 					for i := 0; i < n; i++ {
 						select {
 						case err := <-errs:
-							if !errors.Is(err, ErrClosed) && !(p.name == "direct" && errors.Is(err, context.DeadlineExceeded)) {
+							okEnd := errors.Is(err, ErrClosed) || (p.name == "direct" && errors.Is(err, context.DeadlineExceeded))
+							if !okEnd {
 								t.Errorf("%s in flight during Client.Close returned %v, want ErrClosed", cmd, err)
 							}
 						case <-time.After(8 * time.Second):
