@@ -149,11 +149,10 @@ func (f *fakePostmaster) serve(c net.Conn) {
 		}
 		if q == fakeSlowQuery {
 			// NoticeResponses while the statement "runs": its response
-			// arrives in pieces. A Pool conn in direct mode looks at its
-			// context only when bytes arrive (see the note at the end of the
-			// PR), so these are what make it reach the cancel path; they keep
-			// coming, so it does whether the context expired before or after
-			// the first one.
+			// arrives in pieces; they keep coming, so the context ends
+			// before or after the first one, whichever path the conn takes to
+			// the cancel (the wake of its read, or the context seen when a
+			// piece arrives).
 			tick := time.NewTicker(50 * time.Millisecond)
 			cancelled := false
 			for !cancelled {

@@ -20,7 +20,8 @@ var ErrNotStored = errors.New("celeris-memcached: item not stored")
 // longer matches the caller-supplied one (concurrent modification).
 var ErrCASConflict = errors.New("celeris-memcached: CAS conflict")
 
-// ErrClosed is returned when a command is issued against a closed [Client].
+// ErrClosed is returned when a command is issued against a closed [Client], or
+// is in flight on the event-loop path when [Client.Close] runs.
 var ErrClosed = errors.New("celeris-memcached: client closed")
 
 // ErrProtocol is returned when the server reply cannot be decoded.

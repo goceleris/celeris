@@ -108,6 +108,12 @@ jobs:
         run: >-
           go test -tags postgres -race -count=1 -timeout=300s
           -run TestStreamedInfinityAgainstServer ./driver/postgres/
+      # A database/sql Connector WithEngine on a started epoll, io_uring or adaptive server, called from inline and
+      # async handlers (the server used to stop answering): every cell of the table completes its requests.
+      - name: Connector on a started server
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          -run 'TestConnectorStartedEngine|TestConnectorDialledBeforeStart|TestConnectorResultCapPerMode' ./driver/postgres/
       # The same suite with the drivers opened WithEngine on a celeris.Server whose Config.Engine is UNSET (the
       # default engine on Linux) and an .Async() route; the server is not started when the drivers open (default)
       # or has answered a request first (default-ready). Latest server version only.
@@ -205,9 +211,56 @@ jobs:
         run: >-
           go test -tags 'postgres pgbouncer' -race -count=1 -timeout=300s
           -v -run TestPgBouncer ./test/conformance/postgres/
+      # PgBouncer without prepared-statement support (max_prepared_statements=0,
+      # transaction mode, pool_size=2, port 6433; pgbouncer-noprep/pgbouncer.ini).
+      # It shares two server connections between every client and does not track
+      # named statements. The driver's way out there is auto_cache_statements=false
+      # (TestPgBouncerNoPrepWayOut: no error and no wrong statement); with the
+      # default DSN a call can fail with 26000 or 42P05, and must never run a
+      # statement its own connection did not prepare (TestPgBouncerNoPrep, see
+      # celeris#1455). Both start client processes of this test binary.
+      - name: Start PgBouncer without prepared-statement support
+        run: |
+          docker run -d --name pgbouncer-noprep --network host \
+            -v "$PWD/test/conformance/postgres/pgbouncer-noprep:/etc/pgbouncer:ro" \
+            edoburu/pgbouncer:v1.26.1-p0
+          listening=0
+          for _ in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/6433) 2>/dev/null; then
+              listening=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$listening" != 1 ]; then
+            echo "pgbouncer-noprep never listened"
+            docker logs pgbouncer-noprep
+            exit 1
+          fi
+          echo "pgbouncer-noprep is listening"
+          # The leg tests a configuration the driver does not support, so it must
+          # really run in it: PgBouncer's default is max_prepared_statements=200
+          # (prepared-statement support on), which would test the supported one.
+          cfg=$(PGPASSWORD=celeris psql -h 127.0.0.1 -p 6433 -U celeris -d pgbouncer -At -F '=' -c 'SHOW CONFIG' | grep '^max_prepared_statements=') || {
+            echo "::error::could not read SHOW CONFIG from pgbouncer-noprep"
+            exit 1
+          }
+          echo "pgbouncer-noprep: $cfg"
+          case "$cfg" in
+            max_prepared_statements=0=*) ;;
+            *) echo "::error::pgbouncer-noprep does not run with max_prepared_statements=0"; exit 1 ;;
+          esac
+      - name: PgBouncer without prepared-statement support
+        env:
+          CELERIS_PGBOUNCER_NOPREP_DSN: postgres://celeris:celeris@127.0.0.1:6433/celeris_txn?sslmode=disable
+        run: >-
+          go test -tags 'postgres pgbouncer' -race -count=1 -timeout=300s
+          -v -run 'TestPgBouncerNoPrep' ./test/conformance/postgres/
       - name: Dump PgBouncer log on failure
         if: failure()
-        run: docker logs pgbouncer 2>&1 | tail -60
+        run: |
+          docker logs pgbouncer 2>&1 | tail -60
+          docker logs pgbouncer-noprep 2>&1 | tail -60
 
   # ------------------------------------------------------------------
   # Redis matrix

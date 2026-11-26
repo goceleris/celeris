@@ -2,10 +2,10 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -143,6 +143,13 @@ type pgRequest struct {
 	rowCh     chan [][]byte
 	colsCh    chan struct{}
 	streamErr atomic.Pointer[error] // set before closeRowCh so readers see the error race-free
+	// srvErr is the last ErrorResponse dispatch read for this request. A server
+	// that ends the connection sends its error first (FATAL 57P01 after
+	// pg_terminate_backend) and no ReadyForQuery after it, so the state machine
+	// never returns it; failAll gives it to the caller in place of a bare
+	// close. Set only on an ErrorResponse; atomic because failAll can run on
+	// another goroutine than dispatch.
+	srvErr atomic.Pointer[protocol.PGError]
 	// The streaming channels are closed from two goroutines: dispatch (a
 	// request that finishes, an error) and failAll (the conn closes), while
 	// OnRow may be sending on rowCh from dispatch. They are closed only
@@ -160,9 +167,14 @@ type pgRequest struct {
 	chMu         sync.Mutex
 	rowChClosing bool
 	colsChClosed bool
-	abortCh      chan struct{}
-	sendMu       sync.RWMutex
-	rowChClosed  bool // guarded by sendMu
+	// rowChClosed is guarded by sendMu, and fromPool is set once; both sit here,
+	// with the other bools, so that the conn field below does not take the
+	// struct over a size class (576 to 640 bytes), which every request that is
+	// not pooled would pay on each call.
+	rowChClosed bool
+	fromPool    bool
+	abortCh     chan struct{}
+	sendMu      sync.RWMutex
 	// failPins counts the failAll sweeps that took r off the pending queue and
 	// have not finished with it yet. failAll runs on the loop (or the closing)
 	// goroutine, while the caller that r's fail() woke can already be
@@ -184,7 +196,10 @@ type pgRequest struct {
 	// Atomic because the caller goroutine clears it while the event-loop
 	// goroutine may concurrently read it in dispatch.
 	syncMode atomic.Bool
-	fromPool bool
+	// conn is the conn the request is queued on, set by enqueue and dropped on
+	// release. promoteToStreaming, which runs on the loop with only the request
+	// in hand, marks the conn busy through it (pgConn.streaming).
+	conn *pgConn
 	// doneFlag / doneMu guard close(doneCh) so concurrent completion sites —
 	// the event loop's dispatch (onRecv), failAll (onClose), and failReq
 	// (Write error) — cannot double-close. We use a (mu, bool) pair rather
@@ -193,6 +208,11 @@ type pgRequest struct {
 	// runtime lock chain would be corrupted by a zero-value overwrite).
 	doneMu   sync.Mutex
 	doneFlag bool
+	// abandoned is set under doneMu by a caller whose context ended while it
+	// waited for the reply (waitForQueryRows): the rows that still arrive are
+	// dropped, not buffered, so a cancel the server did not act on does not
+	// buffer the rest of the result.
+	abandoned bool
 	// doneAtom is the lockless mirror of doneFlag. The spin-wait fast path
 	// checks it without acquiring doneMu. Set to 1 by finish()/fail()
 	// immediately before signaling doneCh; reset to 0 in acquirePgRequest.
@@ -218,6 +238,7 @@ type pgRequest struct {
 // the channel is unbuffered and we fall back to close-broadcast — wait()
 // works the same whether it receives a value or sees a closed channel.
 func (r *pgRequest) finish() {
+	r.endStream()
 	r.doneMu.Lock()
 	if r.doneFlag {
 		r.doneMu.Unlock()
@@ -250,6 +271,7 @@ func (r *pgRequest) finish() {
 // continue to set r.err directly and call r.finish(); fail() is for the
 // two-goroutine paths where failReq (caller) races failAll (event loop).
 func (r *pgRequest) fail(err error) {
+	r.endStream()
 	r.doneMu.Lock()
 	if r.doneFlag {
 		r.doneMu.Unlock()
@@ -271,6 +293,44 @@ func (r *pgRequest) fail(err error) {
 	}
 	close(ch)
 	r.finished.Store(true)
+}
+
+// pollFinished reports whether the request a sync poll ran finished with its
+// ReadyForQuery before the poll's error (the end of the connection, read after
+// the reply) was returned. Such a request is a complete result, not a failed one:
+// it was popped and finished by dispatch (doneFlag, no error; a failAll sets the
+// error), so the caller keeps its result. The connection is marked closed so the
+// pool discards it and the next call gets the connection-loss error.
+func (c *pgConn) pollFinished(req *pgRequest) bool {
+	req.doneMu.Lock()
+	ok := req.doneFlag && req.err == nil
+	req.doneMu.Unlock()
+	if ok {
+		c.closed.Store(true)
+	}
+	return ok
+}
+
+// failedErr returns the error a sync poll's caller gives back for a request the
+// poll failed: the error r was failed with (the first fail's: a failAll that the
+// same poll triggered, because the loop's onClose runs inside WriteAndPoll, sets
+// it before the caller's failReq) or, when none is, the poll's own error. It is
+// the connection-loss error either way (lostError): when the caller's failReq
+// stored the raw poll error first (ErrUnknownFD after the worker tore the fd
+// down, ECONNRESET) the failAll that follows finds the request done and changes
+// nothing, and the caller would return that raw error, which matches neither
+// ErrClosed nor io.ErrUnexpectedEOF.
+func (r *pgRequest) failedErr(fallback error) error {
+	r.doneMu.Lock()
+	err := r.err
+	r.doneMu.Unlock()
+	if err == nil {
+		err = fallback
+	}
+	if errors.Is(err, engine.ErrQueueFull) {
+		return err // nothing was sent, the conn is alive (see writeRaw)
+	}
+	return lostError(err)
 }
 
 // pgRequestPool amortizes pgRequest + its embedded state machines + its
@@ -319,6 +379,7 @@ func acquirePgRequest() *pgRequest {
 	// channel. doneMu is NOT reset — its zero value is always a valid
 	// unlocked mutex, and a prior life cycle always left it unlocked.
 	r.doneFlag = false
+	r.abandoned = false
 	r.doneAtom.Store(0)
 	return r
 }
@@ -345,6 +406,7 @@ func releasePgRequest(r *pgRequest) {
 		return
 	}
 	r.ctx = nil
+	r.conn = nil
 	r.kind = 0
 	// Preserve the scratch slices inside each state machine so subsequent
 	// life cycles reuse the backing arrays.
@@ -377,6 +439,7 @@ func releasePgRequest(r *pgRequest) {
 	r.syncMode.Store(false)
 	r.colsCh = nil
 	r.streamErr.Store(nil)
+	r.srvErr.Store(nil)
 	pgRequestPool.Put(r)
 }
 
@@ -495,7 +558,7 @@ func (r *pgRequest) OnRow(fields [][]byte) {
 func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok bool) {
 	r.doneMu.Lock()
 	defer r.doneMu.Unlock()
-	if r.doneFlag {
+	if r.doneFlag || r.abandoned {
 		return 0, false, false
 	}
 	// Direct-mode result-buffer cap. In direct mode, and on the sync fast
@@ -541,6 +604,22 @@ func (r *pgRequest) setColumnsIfLive(cols []protocol.ColumnDesc) {
 	if !r.doneFlag {
 		r.columns = cols
 	}
+}
+
+// dropBufferedRows discards the rows buffered so far, unless the request is
+// done (see setColumnsIfLive): a failAll that completed it woke its caller,
+// who reads r.rows now. Dispatch runs it for a buffered request that is about
+// to fail with errMultiResultSets, whose caller must get the error and no rows.
+func (r *pgRequest) dropBufferedRows() {
+	r.doneMu.Lock()
+	defer r.doneMu.Unlock()
+	if r.doneFlag {
+		return
+	}
+	for i := range r.rows {
+		r.rows[i] = nil
+	}
+	r.rows = r.rows[:0]
 }
 
 // setResultIfLive stores the extended query's command tag and, when none is set
@@ -642,16 +721,18 @@ func (r *pgRequest) closeColsCh() {
 	r.chMu.Unlock()
 }
 
-// prepareState drives a Parse + Describe S + Sync exchange. Unlike
-// ExtendedQueryState, it does not expect a Bind or Execute.
+// prepareState drives a Parse + Describe S + Sync exchange, or, with closing
+// set, a Close S + Sync exchange. Unlike ExtendedQueryState, it does not expect
+// a Bind or Execute.
 type prepareState struct {
-	name   string
-	query  string
-	params []uint32
-	cols   []protocol.ColumnDesc
-	err    *protocol.PGError
+	name    string
+	query   string
+	params  []uint32
+	cols    []protocol.ColumnDesc
+	err     *protocol.PGError
+	closing bool
 	// phase:
-	//   0: expecting ParseComplete
+	//   0: expecting ParseComplete (CloseComplete when closing)
 	//   1: expecting ParameterDescription
 	//   2: expecting RowDescription / NoData
 	//   3: expecting ReadyForQuery
@@ -659,21 +740,52 @@ type prepareState struct {
 }
 
 // handlePrepare processes a single server message for a prepare exchange.
-// Returns done=true on ReadyForQuery.
+// It returns done=true, with the server's error if there was one, on
+// ReadyForQuery. A message the exchange does not expect at this point, or a
+// ReadyForQuery before the reply is complete, returns (false, err): the reply
+// stream no longer matches the queue and the caller fails the conn
+// (failDesync). After an ErrorResponse the server skips to Sync and sends only
+// the ReadyForQuery.
 func (p *prepareState) handlePrepare(msgType byte, payload []byte) (bool, error) {
 	switch msgType {
+	case protocol.BackendNoticeResponse, protocol.BackendParameterStatus, protocol.BackendNotification:
+		return false, nil
 	case protocol.BackendErrorResponse:
-		p.err = protocol.ParseErrorResponse(payload)
+		if p.err == nil { // a FATAL after an ERROR: the first error is the one the caller gets
+			p.err = protocol.ParseErrorResponse(payload)
+		}
 		return false, nil
 	case protocol.BackendReadyForQuery:
 		if p.err != nil {
 			return true, p.err
 		}
+		if p.phase != 3 {
+			return false, fmt.Errorf("celeris-postgres: unexpected ReadyForQuery in prepare (phase=%d)", p.phase)
+		}
 		return true, nil
+	}
+	if p.err != nil {
+		// After an ErrorResponse the server skips to Sync and sends nothing but
+		// ReadyForQuery.
+		return false, fmt.Errorf("celeris-postgres: unexpected message %q in prepare after an ErrorResponse", msgType)
+	}
+	switch msgType {
 	case protocol.BackendParseComplete:
+		if p.closing || p.phase != 0 {
+			break
+		}
 		p.phase = 1
 		return false, nil
+	case protocol.BackendCloseComplete:
+		if !p.closing || p.phase != 0 {
+			break
+		}
+		p.phase = 3
+		return false, nil
 	case protocol.BackendParameterDesc:
+		if p.phase != 1 {
+			break
+		}
 		oids, err := protocol.ParseParameterDescription(payload)
 		if err != nil {
 			return false, err
@@ -682,6 +794,9 @@ func (p *prepareState) handlePrepare(msgType byte, payload []byte) (bool, error)
 		p.phase = 2
 		return false, nil
 	case protocol.BackendRowDescription:
+		if p.phase != 2 {
+			break
+		}
 		cols, err := protocol.ParseRowDescription(payload)
 		if err != nil {
 			return false, err
@@ -690,14 +805,14 @@ func (p *prepareState) handlePrepare(msgType byte, payload []byte) (bool, error)
 		p.phase = 3
 		return false, nil
 	case protocol.BackendNoData:
+		if p.phase != 2 {
+			break
+		}
 		p.cols = nil
 		p.phase = 3
 		return false, nil
-	case protocol.BackendNoticeResponse, protocol.BackendParameterStatus, protocol.BackendNotification:
-		return false, nil
 	}
-	// Ignore anything unexpected (we may see out-of-band notifications).
-	return false, nil
+	return false, fmt.Errorf("celeris-postgres: unexpected message %q in prepare (phase=%d)", msgType, p.phase)
 }
 
 // pgConn is a single PostgreSQL connection driven by an event loop.
@@ -735,6 +850,7 @@ type pgConn struct {
 	tcpFd     sockFD     // cached fd for MSG_DONTWAIT peek; 0 if unavailable
 	directMu  sync.Mutex // serializes tcp.Write
 	directBuf []byte     // read buffer for driveDirect
+	cw        ctxWatch   // the wake of driveDirect's read on its context's end (cancel.go)
 
 	addr   *net.TCPAddr
 	opts   Options
@@ -761,6 +877,21 @@ type pgConn struct {
 	pendingMu sync.Mutex
 	pending   []*pgRequest
 
+	// streaming is the request whose Rows is streaming and still being received:
+	// set by promoteToStreaming before the caller is woken with the Rows, and
+	// cleared at its end: by dispatchHead before the request's rowCh is closed (a
+	// consumer that sees the end of its rows must meet no stale mark), by failAll
+	// after it (a promotion racing it must not set the mark again; the conn is
+	// marked closed by then, so no statement sees ErrRowsOpen from it), and, as a
+	// backstop, by finish and fail. While it is set the conn is busy: the loop worker is delivering
+	// that request's rows to a consumer that is not reading them yet, and a
+	// second statement would wait for it with locks held and no way out
+	// (rowsOpenErr). nil when no stream is in flight, which is every conn but one
+	// serving a result larger than the streaming threshold that its consumer has
+	// not taken to the end; a request the conn has received in full is not
+	// streaming, even while its Rows is open.
+	streaming atomic.Pointer[pgRequest]
+
 	stmtCache *lru
 	// autoCache, when true, routes cacheable SELECT-style QueryContext
 	// calls through the per-conn stmtCache even when the caller did not
@@ -781,7 +912,6 @@ type pgConn struct {
 	maxIdleTime time.Duration
 
 	closeOnce sync.Once
-	closeErr  atomic.Value // error
 	closed    atomic.Bool
 	// closeWG tracks background goroutines a conn may start, so Close can
 	// join them and none outlives the conn. None starts one today (an evicted
@@ -802,6 +932,12 @@ type pgConn struct {
 	fdMu        sync.Mutex
 	fdReleased  bool
 
+	// stmtPrefix is the per-connection part of every server-side statement
+	// name this conn mints ("celst_" + 128 random bits), set once when the conn
+	// is built and never changed; stmtCounter is the per-connection part after
+	// it and only counts up, so a name is never minted twice by this conn (see
+	// [newStmtNamePrefix]).
+	stmtPrefix  string
 	stmtCounter uint64
 
 	// sessionDirty tracks whether the connection state has been modified in a
@@ -930,10 +1066,40 @@ func (c *pgConn) buildMessage(fn func(*protocol.Writer) []byte) []byte {
 // hand the bytes to the mini-loop (or the engine's loop for WithEngine,
 // non-async mode).
 func (c *pgConn) writeRaw(data []byte) error {
+	// A write that fails ends the connection's use: the statement it belongs to
+	// is cut off, so its error is the connection-loss error (lostError: matches
+	// ErrClosed and io.ErrUnexpectedEOF and keeps the write error in its chain,
+	// errors.Is on the errno or on ErrUnknownFD still holds), not the bare errno
+	// or "file descriptor not registered" that a close landing while the frames
+	// are written produces.
+	if err := c.writeRawPlain(data); err != nil {
+		if errors.Is(err, engine.ErrQueueFull) {
+			// The write backlog is over its cap: nothing was sent and the
+			// connection is alive, so this is not a lost connection.
+			return err
+		}
+		return lostError(err)
+	}
+	return nil
+}
+
+// writeRawPlain is writeRaw with the transport's own error: Close uses it,
+// whose write of Terminate on a conn the loop tore down is not a failure.
+func (c *pgConn) writeRawPlain(data []byte) error {
 	if c.useDirect {
 		c.directMu.Lock()
 		_, err := c.tcp.Write(data)
 		c.directMu.Unlock()
+		if err != nil && !c.closed.Load() {
+			// A failed write leaves the conn unusable: the peer reset it (every
+			// later write fails too, "broken pipe"), or a partial message left
+			// the stream misaligned. Fail it as the read path does, so the pool
+			// discards it instead of handing the same dead socket to the next
+			// call. A Close in progress has marked c.closed and ends the socket
+			// itself.
+			c.failAll(err)
+			_ = c.closeDirect()
+		}
 		return err
 	}
 	return c.loop.Write(c.fd, data)
@@ -954,30 +1120,37 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 	if c.directBuf == nil {
 		c.directBuf = make([]byte, 16<<10)
 	}
-	// A direct conn waits in a socket read that does not look at the context.
-	// A context with a deadline is enforced through the socket's read deadline:
-	// it is set to the context's deadline for this statement and cleared when
-	// the statement ends. Nothing is registered with the context (no
-	// context.AfterFunc, no goroutine, whatever the context type): a context
-	// without a deadline (Background, the HTTP/1 and HTTP/2 request contexts, a
-	// cancel-only context) costs one Deadline() call and a branch, and a
-	// statement under it returns when the server answers, as in v1.5.11 (it
-	// does not wake the read; ctx.Err() below is looked at each time a read
-	// returns, so a context cancelled before the reply is complete cancels the
-	// statement when a partial reply arrives, as in v1.5.11). A
-	// timeout is recognised by the clock against the context's deadline, not by
-	// ctx.Err(), which a timer context may not have set yet. The startup is
-	// bounded by startupBound and is left alone.
+	// A direct conn waits in a socket read that does not look at the context, so
+	// the end of the context is made to wake it (cancel.go, armCtxWatch):
+	//   - a context with a deadline: the socket's read deadline is the context's
+	//     deadline for this statement (a context of any type, one whose Done is
+	//     never closed included);
+	//   - a context that can end (Done() != nil): a context.AfterFunc sets a read
+	//     deadline of "now" when it does, which covers a cancel with or without a
+	//     deadline;
+	//   - a context that can never end (Done() == nil: Background, a value
+	//     context over it) registers nothing and costs a Deadline() call and a
+	//     nil check.
+	// A read woken by the context's end takes the cancel path below
+	// (cancelDrainDirect). Either way, endCtxWatch, deferred here, waits for a
+	// callback that has started and clears the deadline, so nothing of this
+	// statement's context reaches the next statement on the conn. A timeout is
+	// recognised by the clock against the context's deadline, not by ctx.Err(),
+	// which a timer context may not have set yet. The startup is bounded by
+	// startupBound and is left alone.
 	dl, hasDL := ctx.Deadline()
-	if hasDL && req.kind != reqStartup {
-		_ = c.tcp.SetReadDeadline(dl)
-		defer func() {
-			if !c.closed.Load() {
-				_ = c.tcp.SetReadDeadline(time.Time{})
-			}
-		}()
+	armed := false
+	if req.kind != reqStartup {
+		if hasDL {
+			_ = c.tcp.SetReadDeadline(dl)
+		}
+		armed = c.armCtxWatch(ctx)
 	} else {
 		hasDL = false
+	}
+	if hasDL || armed {
+		c.cw.deadlineSet = hasDL
+		defer c.endCtxWatch()
 	}
 	for {
 		if req.doneAtom.Load() != 0 {
@@ -995,12 +1168,9 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 				c.onRecv(c.directBuf[:n])
 				continue
 			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
-				if errors.Is(perr, io.EOF) {
-					perr = io.ErrUnexpectedEOF
-				}
 				c.failAll(perr)
 				_ = c.closeDirect()
-				return perr
+				return connLost(req, perr)
 			}
 		}
 		n, err := c.tcp.Read(c.directBuf)
@@ -1008,24 +1178,25 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			c.onRecv(c.directBuf[:n])
 		}
 		if err != nil {
-			if hasDL && errors.Is(err, os.ErrDeadlineExceeded) && (ctx.Err() != nil || !time.Now().Before(dl)) {
-				// The context's deadline (nothing else sets a read deadline while
-				// this one is armed; the clock test is the check for a context whose
-				// Err is not set yet, and ctx.Err() covers a wall-clock step
-				// backwards under a deadline without a monotonic reading): the
-				// statement is cancelled and the caller gets the context's error.
-				cerr := ctx.Err()
-				if cerr == nil {
-					cerr = context.DeadlineExceeded
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				if ctx.Err() != nil || (hasDL && !time.Now().Before(dl)) {
+					// The end of the context, by its deadline or by the wake of its
+					// cancel (nothing else sets a read deadline on this conn while
+					// a statement runs; the clock test is the check for a context
+					// whose Err is not set yet, and ctx.Err() covers a wall-clock
+					// step backwards under a deadline without a monotonic reading):
+					// the statement is cancelled and the caller gets the context's
+					// error.
+					cerr := ctx.Err()
+					if cerr == nil {
+						cerr = context.DeadlineExceeded
+					}
+					return c.cancelDrainDirect(req, cerr)
 				}
-				return c.cancelDrainDirect(req, cerr)
-			}
-			if errors.Is(err, io.EOF) {
-				err = io.ErrUnexpectedEOF
 			}
 			c.failAll(err)
 			_ = c.closeDirect()
-			return err
+			return connLost(req, err)
 		}
 	}
 }
@@ -1036,6 +1207,11 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 // (the context's error) to the caller. A conn whose cancel exchange did not
 // finish, or whose drain ended without the reply, is failed: it is discarded.
 func (c *pgConn) cancelDrainDirect(req *pgRequest, err error) error {
+	// Before the drain sets its own read deadline: a context watcher that has
+	// started (or is about to) would otherwise replace it with "now" in the
+	// middle of the drain and fail a healthy conn. After this nothing of the
+	// context touches the socket.
+	c.settleCtxWatch()
 	// Returns once the cancel exchange finished; a conn whose exchange did not
 	// is failed (discarded), nothing to drain.
 	if !c.cancelRunning() {
@@ -1106,9 +1282,6 @@ func (c *pgConn) startDirectReader() func() {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				if errors.Is(err, io.EOF) {
-					err = io.ErrUnexpectedEOF
-				}
 				c.failAll(err)
 				return
 			}
@@ -1172,6 +1345,7 @@ func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
 		writer:       protocol.NewWriter(),
 		bridge:       async.NewBridge(),
 		stmtCache:    newLRU(dsn.Options.StatementCacheSize),
+		stmtPrefix:   newStmtNamePrefix(),
 		autoCache:    dsn.Options.AutoCacheStatements && dsn.Options.StatementCacheSize > 0,
 		pending:      make([]*pgRequest, 0, 8),
 		createdAt:    time.Now(),
@@ -1332,10 +1506,41 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 // append path only allocates when a bursty caller drives queue depth past
 // the current cap.
 func (c *pgConn) enqueue(req *pgRequest) {
+	req.conn = c
 	c.pendingMu.Lock()
 	c.pending = append(c.pending, req)
 	c.pendingMu.Unlock()
 	c.bridge.Enqueue(req)
+}
+
+// rowsOpenErr is the busy check: ErrRowsOpen when a streaming Rows is open on
+// the conn, nil otherwise. Every call that starts a request on the conn makes it
+// first, before it takes any lock or builds anything (see ErrRowsOpen). It is one
+// atomic load.
+func (c *pgConn) rowsOpenErr() error {
+	if c.streaming.Load() != nil {
+		return ErrRowsOpen
+	}
+	return nil
+}
+
+// streamEnded clears the busy mark of req, a request that has stopped
+// streaming: its last row has been sent, or it failed, so nothing is waiting on
+// its consumer any more. A no-op for a request that never streamed.
+// dispatchHead and failAll call it before they close the rows channel, so that a
+// consumer that sees the end of its rows meets no stale mark.
+func (c *pgConn) streamEnded(req *pgRequest) {
+	c.streaming.CompareAndSwap(req, nil)
+}
+
+// endStream is the backstop of streamEnded: finish and fail clear the mark too,
+// so that no way of ending a request, a terminal branch added to dispatchHead
+// later included, can leave a conn busy for good. One atomic load when the
+// request is not the streaming one, which is nearly always.
+func (r *pgRequest) endStream() {
+	if c := r.conn; c != nil && c.streaming.Load() == r {
+		c.streaming.CompareAndSwap(r, nil)
+	}
 }
 
 // popHead removes the front-of-queue request.
@@ -1569,6 +1774,11 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 	// The last act on head is the unpin, as in failAll; deferred so a panic in
 	// dispatchHead (a CopyTo dest callback) does not keep the pin for good.
 	defer head.failPins.Add(-1)
+	if msgType == protocol.BackendErrorResponse {
+		// Kept for failAll: a connection that closes before the ReadyForQuery
+		// that would deliver this error must still return it (see srvErr).
+		head.srvErr.Store(protocol.ParseErrorResponse(payload))
+	}
 	return c.dispatchHead(head, msgType, payload)
 }
 
@@ -1628,8 +1838,25 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		// closure-pair allocation the previous inline funcs paid (-2
 		// allocs/op on the hot path; see PR description for full delta).
 		done, err := head.simple.Handle(msgType, payload, head)
+		if err != nil && !done {
+			// The reply stopped matching the queue: the conn is dead.
+			return c.failDesync(head, msgType, err)
+		}
+		if done && err == nil && head.simple.MultiSet {
+			// More than one statement returned rows. The whole reply has been
+			// read, up to this ReadyForQuery, so the conn is clean for the next
+			// query. A server error from one of the statements, if there was
+			// one, is err already and is reported as it always was.
+			err = errMultiResultSets
+			if head.rowCh == nil {
+				// Buffered: the caller gets the error and no rows, not the first
+				// set as if it were the answer.
+				head.dropBufferedRows()
+			}
+		}
 		if err != nil {
 			if head.rowCh != nil {
+				c.streamEnded(head)
 				head.streamErr.Store(&err)
 				head.closeRowCh()
 				head.closeColsCh()
@@ -1640,6 +1867,9 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		}
 		if done {
 			if head.rowCh != nil {
+				// Cleared before the consumer can see the end of its rows: one that
+				// goes on without Close must not meet a stale busy mark.
+				c.streamEnded(head)
 				head.closeRowCh()
 			}
 			c.popHead()
@@ -1650,6 +1880,10 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		// shared OnRow method — same allocation-free dispatch as the
 		// simple-query branch.
 		done, err := head.extended.Handle(msgType, payload, head)
+		if err != nil && !done {
+			head.setResultIfLive("", head.extended.Columns)
+			return c.failDesync(head, msgType, err)
+		}
 		if err != nil {
 			// A server error after some rows: those rows are returned with
 			// the error, and they need the column description of the
@@ -1658,6 +1892,7 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 			// Scan with no OID: raw wire bytes into a string.
 			head.setResultIfLive("", head.extended.Columns)
 			if head.rowCh != nil {
+				c.streamEnded(head)
 				head.streamErr.Store(&err)
 				head.closeRowCh()
 				head.closeColsCh()
@@ -1669,22 +1904,35 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		if done {
 			head.setResultIfLive(head.extended.Tag, head.extended.Columns)
 			if head.rowCh != nil {
+				c.streamEnded(head)
 				head.closeColsCh()
 				head.closeRowCh()
 			}
 			c.popHead()
 			head.finish()
-		} else if head.rowCh != nil && head.colsCh != nil {
+		} else if head.columns == nil && len(head.extended.Columns) > 0 {
 			// For extended queries, RowDescription comes from the Describe
-			// response (before DataRow). Signal colsCh as soon as columns
-			// are available so the caller can return streamRows early.
-			if head.extended.Columns != nil && head.columns == nil {
-				head.setColumnsIfLive(head.extended.Columns)
+			// response (before DataRow). Publish it to the request now, not
+			// only when the statement ends: a statement that is not cached (an
+			// INSERT/UPDATE/DELETE ... RETURNING with arguments; any query with
+			// auto_cache_statements=false) describes its portal here, and a
+			// request that failAll or driveDirect completes after its DataRows
+			// otherwise has rows and no columns, which the caller reads as raw
+			// binary cells with no error. A cached statement presets
+			// req.columns, so this does not run for it. (len, not nil: a pooled
+			// request's Columns is an empty, non-nil slice until the
+			// RowDescription is parsed.)
+			head.setColumnsIfLive(head.extended.Columns)
+			if head.rowCh != nil && head.colsCh != nil {
+				// Signal colsCh so the caller can return streamRows early.
 				head.closeColsCh()
 			}
 		}
 	case reqPrepare:
 		done, err := head.prep.handlePrepare(msgType, payload)
+		if err != nil && !done {
+			return c.failDesync(head, msgType, err)
+		}
 		if err != nil {
 			head.doneMu.Lock()
 			head.err = err
@@ -1696,6 +1944,9 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		}
 	case reqCopyIn:
 		done, err := head.copyIn.Handle(msgType, payload)
+		if err != nil && !done {
+			return c.failDesync(head, msgType, err)
+		}
 		if err != nil {
 			c.popHead()
 			head.fail(err)
@@ -1739,6 +1990,9 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 				head.doneMu.Unlock()
 			}
 		})
+		if err != nil && !done {
+			return c.failDesync(head, msgType, err)
+		}
 		if err != nil {
 			c.popHead()
 			head.fail(err)
@@ -1758,6 +2012,80 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		}
 	}
 	return nil
+}
+
+// failDesync is the one place a request's reply stops matching the queue: a
+// state machine met a message it does not expect for the request at the head
+// (msgType, with cause saying why), or a ReadyForQuery that ends some other
+// exchange. The conn can no longer tell whose reply is whose, so it is dead:
+// it is marked closed, the head fails with an error that says why, and
+// dispatchHead returns an error that onRecv hands to failAll, which fails every
+// request still queued with a plain closed-connection error. The pool discards
+// a closed conn on release and dials a replacement.
+//
+// closed is set before the head's caller is woken. head.fail wakes it, the
+// caller releases the conn, and a release that still saw closed == false would
+// put the conn back for the next query, whose request would then be handed what
+// is left of this reply.
+//
+// A server error at ReadyForQuery (Handle returns done=true with the
+// *PGError) is not this: the reply is complete and in step, and the conn lives.
+func (c *pgConn) failDesync(head *pgRequest, msgType byte, cause error) error {
+	c.closed.Store(true)
+	var headErr error
+	switch msgType {
+	case protocol.BackendCopyOutResponse, protocol.BackendCopyInResponse, protocol.BackendCopyBothResponse:
+		if head.kind == reqSimple || head.kind == reqExtended || head.kind == reqPrepare {
+			headErr = &copyThroughQueryError{response: copyResponseName(msgType)}
+		}
+	}
+	if headErr == nil {
+		headErr = fmt.Errorf("%w: %w", ErrClosed, cause)
+	}
+	if head.rowCh != nil {
+		head.streamErr.Store(&headErr)
+		head.closeRowCh()
+		head.closeColsCh()
+	}
+	c.popHead()
+	head.fail(headErr)
+	return errReplyDesync
+}
+
+// errReplyDesync is what every request queued behind the one whose reply
+// stopped matching gets (failAll). It names no message: those callers did
+// nothing wrong.
+var errReplyDesync = fmt.Errorf("%w: its reply stream no longer matched its request queue", ErrClosed)
+
+// copyThroughQueryError is the error of a COPY statement sent through Query,
+// QueryRow, Exec or Prepare. The server answers a COPY with a CopyOutResponse,
+// CopyInResponse or CopyBothResponse, a stream those paths do not read, so the
+// conn is closed; the caller gets this to act on. It is unexported on purpose:
+// the message is the contract, there is nothing a caller can do with the value
+// but fix the call. Only the native Pool has COPY (Pool.CopyFrom, Pool.CopyTo),
+// and the message says so.
+type copyThroughQueryError struct{ response string }
+
+// Unwrap makes errors.Is(err, ErrClosed) true, as for every other error of a
+// connection failed because its reply stream stopped matching its queue.
+func (e *copyThroughQueryError) Unwrap() error { return ErrClosed }
+
+func (e *copyThroughQueryError) Error() string {
+	return "celeris-postgres: the statement is a COPY (the server answered with " + e.response +
+		"), which cannot run through Query, QueryRow, Exec or Prepare; use Pool.CopyTo for COPY ... TO STDOUT " +
+		"and Pool.CopyFrom for COPY ... FROM STDIN (database/sql has no COPY path: use a Pool for it); " +
+		"the connection was closed"
+}
+
+func copyResponseName(msgType byte) string {
+	switch msgType {
+	case protocol.BackendCopyOutResponse:
+		return "CopyOutResponse"
+	case protocol.BackendCopyInResponse:
+		return "CopyInResponse"
+	default:
+		return "CopyBothResponse"
+	}
 }
 
 func copyRow(fields [][]byte) [][]byte {
@@ -1816,6 +2144,13 @@ func promoteToStreaming(req *pgRequest) {
 		req.columns = req.extended.Columns
 	}
 	req.rowCh = ch // published under chMu: failAll's closeRowCh reads it from another goroutine
+	// The conn is busy from here to the end of the stream, and before the caller
+	// is woken (closeColsCh below) with the Rows: a statement it starts then must
+	// see the mark. Under chMu, so that a failAll that has closed rowCh (and
+	// cleared the mark after it) is never followed by this store.
+	if req.conn != nil {
+		req.conn.streaming.Store(req)
+	}
 	// Clear the buffer. We nil out the slice elements but retain the backing
 	// capacity for reuse by releasePgRequest. Done under chMu, after the
 	// decline check: a caller that failAll wakes through doneCh reads req.rows
@@ -1841,16 +2176,30 @@ func promoteToStreaming(req *pgRequest) {
 // requests. Running concurrently with Close() is safe because both paths
 // take fdMu for the fd and failAll is idempotent under closeOnce's covering
 // atomic Store.
+//
+// err is nil on the peer's orderly shutdown (FIN). The request in flight is
+// not complete then (it has no ReadyForQuery), so failAll gives it an error
+// (lostError), never io.EOF: database/sql and Rows.Next read a bare io.EOF as
+// the end of a result.
 func (c *pgConn) onClose(err error) {
-	if err == nil {
-		err = io.EOF
-	}
-	c.closeErr.Store(err)
 	c.shutdownFD()
 	c.failAll(err)
 }
 
-// failAll surfaces err to every pending request and marks the conn dead.
+// connLost is the error failAll gives req when the connection ends with cause:
+// the server's ErrorResponse if one arrived for req and was not delivered yet,
+// else lostError(cause).
+func connLost(req *pgRequest, cause error) error {
+	if srv := req.srvErr.Load(); srv != nil {
+		return srv
+	}
+	return lostError(cause)
+}
+
+// failAll surfaces err to every pending request and marks the conn dead. A
+// request is cut off, not complete, so what it gets is never a bare io.EOF:
+// lostError(err), which matches ErrClosed and io.ErrUnexpectedEOF, or the
+// server's own ErrorResponse when it sent one before the close.
 func (c *pgConn) failAll(err error) {
 	c.closed.Store(true)
 	c.pendingMu.Lock()
@@ -1868,10 +2217,26 @@ func (c *pgConn) failAll(err error) {
 		}
 	}
 	c.pendingMu.Unlock()
-	c.bridge.DrainWithError(err, nil)
+	// A FATAL ErrorResponse of the head ends the connection, so it is the
+	// answer of every request queued behind it as well.
+	var fatal *protocol.PGError
+	if len(queue) > 0 && queue[0] != nil {
+		if srv := queue[0].srvErr.Load(); fatalServerError(srv) {
+			fatal = srv
+		}
+	}
+	lost := lostError(err)
+	if fatal != nil {
+		lost = fatal
+	}
+	c.bridge.DrainWithError(lost, nil)
 	for _, r := range queue {
 		if r == nil {
 			continue
+		}
+		rerr := lost
+		if fatal == nil {
+			rerr = connLost(r, err)
 		}
 		// Close streaming channels so the consumer unblocks. dispatch may
 		// have closed them already, and may be sending on rowCh right now:
@@ -1880,17 +2245,20 @@ func (c *pgConn) failAll(err error) {
 		// The error is stored whether or not r is streaming yet: dispatch can
 		// promote it between a check and the close, and a consumer that sees
 		// rowCh closed without it would read the cut-off result as complete.
-		r.streamErr.Store(&err)
+		r.streamErr.Store(&rerr)
 		if r.closeRowCh() {
 			// Streaming: the caller may be parked on colsCh. A request that
 			// has not promoted has no rowCh to hand over, and its caller wakes
 			// on the doneCh that fail() signals below with the error.
 			r.closeColsCh()
 		}
+		// Cleared after closeRowCh has marked the request closing (see
+		// promoteToStreaming), so a promotion that comes after cannot set it again.
+		c.streamEnded(r)
 		// Use fail() so concurrent failReq (caller goroutine Write-error
 		// path) and this failAll (event-loop onClose path) cannot race on
 		// r.err. First winner's err is the one wait() observes.
-		r.fail(err)
+		r.fail(rerr)
 		// The last touch of r: after this a releasePgRequest may recycle it.
 		r.failPins.Add(-1)
 	}
@@ -1933,9 +2301,34 @@ func (c *pgConn) PrepareContext(ctx context.Context, query string) (driver.Stmt,
 	return &pgStmt{conn: c, prep: prep, query: query, cached: true}, nil
 }
 
+// stmtNameTag starts every named statement the driver prepares.
+const stmtNameTag = "celst_"
+
+// newStmtNamePrefix returns the per-connection prefix of the statement names a
+// conn mints: "celst_" and 128 random bits (crypto/rand, 26 base32 characters),
+// drawn once per connection when it is built. A named statement lives on the
+// server connection, and a pooler that shares one server connection between
+// client connections without tracking prepared statements (PgBouncer in
+// transaction mode with max_prepared_statements=0) lets two clients Parse the
+// same name with different SQL on it; a Bind of that name then runs the other
+// client's statement. A prefix that no two connections share, across processes
+// and restarts, keeps a Bind from ever naming a statement this connection did
+// not Parse. The longest name is the prefix, "_" and a 20-digit counter: 53
+// bytes, under PostgreSQL's 63-byte identifier limit.
+func newStmtNamePrefix() string {
+	return stmtNameTag + rand.Text()
+}
+
+// mintStmtName returns a new statement name: the connection's prefix and its
+// counter. It runs when a statement is prepared, never when one is reused: the
+// cached entry keeps the name.
 func (c *pgConn) mintStmtName() string {
 	n := atomic.AddUint64(&c.stmtCounter, 1)
-	return fmt.Sprintf("celst_%d", n)
+	var buf [64]byte
+	b := append(buf[:0], c.stmtPrefix...)
+	b = append(b, '_')
+	b = strconv.AppendUint(b, n, 10)
+	return string(b)
 }
 
 // prepareStatement runs Parse + Describe 'S' + Sync and returns the post-
@@ -1943,6 +2336,9 @@ func (c *pgConn) mintStmtName() string {
 func (c *pgConn) prepareStatement(ctx context.Context, name, query string) (*protocol.PreparedStmt, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
+	}
+	if err := c.rowsOpenErr(); err != nil {
+		return nil, err
 	}
 	ps := &prepareState{name: name, query: query}
 	req := &pgRequest{ctx: ctx, kind: reqPrepare, prep: ps, doneCh: make(chan struct{})}
@@ -1979,7 +2375,7 @@ func (c *pgConn) closePreparedServerAsync(name string) error {
 	if c.closed.Load() || name == "" {
 		return nil
 	}
-	ps := &prepareState{name: name, phase: 3}
+	ps := &prepareState{name: name, closing: true}
 	// Use context.Background so the request is never cancelled by a caller.
 	req := &pgRequest{ctx: context.Background(), kind: reqPrepare, prep: ps, doneCh: make(chan struct{})}
 	c.enqueue(req)
@@ -1991,6 +2387,41 @@ func (c *pgConn) closePreparedServerAsync(name string) error {
 	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
 		return err
+	}
+	return nil
+}
+
+// prepareEnded reports whether the failure of an auto-prepare (the Parse +
+// Describe of a statement the cache has not seen) ends the call. It does when
+// the context ended (ctx.Err() is set, or the prepare's own error is the
+// context's: a deadline is recognised by the clock before the context's timer
+// has set Err) or the conn is closed (the cancel exchange of the ended context
+// failed the conn). Falling through to the unnamed path then would send the
+// user's statement (Parse + Bind + Execute) under a context that had already
+// ended, and a write could commit although the caller is told the context's
+// error; on a closed conn it would report ErrClosed in place of that error. Any
+// other prepare failure (a server error such as a syntax error) still falls
+// through, as before: the unnamed path reports the server's error for the
+// statement itself.
+func (c *pgConn) prepareEnded(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || c.closed.Load() ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// ctxEndedErr returns the context's error when ctx has ended, nil otherwise. A
+// deadline that has passed counts as ended before the context's timer has set
+// Err (the clock decides, as in driveDirect). It runs on a successful
+// auto-prepare, and on a successful re-prepare after the server lost a cached
+// statement (SQLSTATE 26000), before the statement itself is sent: a context that ended while
+// the statement was being prepared (the prepare can finish under a context that
+// has already been cancelled, for instance when the cancel lands as the reply
+// does) must not go on to send, and possibly commit, the statement.
+func ctxEndedErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return context.DeadlineExceeded
 	}
 	return nil
 }
@@ -2023,9 +2454,20 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
+			if err := ctxEndedErr(ctx); err != nil {
+				return nil, err // ended during the prepare: the statement is not sent
+			}
 			return c.extendedExec(ctx, name, query, args)
 		}
-		// Prepare failed — fall through to the unnamed path.
+		if errors.Is(err, ErrRowsOpen) {
+			return nil, err
+		}
+		// Prepare failed. Not when the context ended or the conn is closed: then
+		// the prepare error is the answer (see prepareEnded).
+		if c.prepareEnded(ctx, err) {
+			return nil, err
+		}
+		// Otherwise fall through to the unnamed path.
 	}
 	// Unnamed statement (stmtName="") is replaced on every Parse — no stale
 	// state to clean up, so we don't mark the session dirty.
@@ -2064,9 +2506,20 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
+			if err := ctxEndedErr(ctx); err != nil {
+				return nil, err // ended during the prepare: the statement is not sent
+			}
 			return c.doExtendedQuery(ctx, name, query, args, prep.Columns)
 		}
-		// Prepare failed — fall through to the legacy path.
+		if errors.Is(err, ErrRowsOpen) {
+			return nil, err
+		}
+		// Prepare failed. Not when the context ended or the conn is closed: then
+		// the prepare error is the answer (see prepareEnded).
+		if c.prepareEnded(ctx, err) {
+			return nil, err
+		}
+		// Otherwise fall through to the legacy path.
 	}
 	if len(args) == 0 {
 		return c.simpleQuery(ctx, query)
@@ -2277,12 +2730,20 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
+	if err := c.rowsOpenErr(); err != nil {
+		return nil, err
+	}
 	if c.useDirect && isListenOrUnlisten(query) {
 		return nil, ErrDirectModeUnsupported
 	}
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqSimple
+	// A query that returns rows returns one result set: a second RowDescription
+	// is not parsed (it would rewrite the columns the caller holds) and the
+	// request fails at ReadyForQuery with errMultiResultSets. Exec leaves it
+	// off and keeps accepting any number of statements.
+	req.simple.RejectMultiSet = true
 	// Lazy streaming: colsCh fires when promoteToStreaming activates
 	// rowCh mid-dispatch, letting the caller goroutine switch to
 	// streaming mode instead of waiting for the full result set.
@@ -2323,9 +2784,15 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 		payload := protocol.WriteQueryInto(c.writer, query)
 		ok, err := c.pollSync(payload)
 		if err != nil {
-			c.failReq(req, err)
-			releasePgRequest(req)
-			return nil, err
+			if !c.pollFinished(req) {
+				c.failReq(req, err)
+				err = req.failedErr(err)
+				releasePgRequest(req)
+				return nil, err
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2417,6 +2884,14 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		case <-req.doneCh:
 		default:
 		}
+		if req.err == errMultiResultSets && req.rowCh != nil {
+			// The first set streamed and the whole reply, the error included,
+			// arrived before this select ran (a set of exactly streamThreshold
+			// rows): colsCh and doneCh are both ready and the select may pick
+			// this one. The rows are in rowCh, which is closed: deliver them
+			// and the error after them, as the colsCh branch does.
+			return drainStreamToPGRows(req, textFormat, req.err), nil
+		}
 		if req.err != nil {
 			// If rows were buffered before the error arrived (e.g.
 			// mid-stream ErrorResponse), return them with the error
@@ -2433,14 +2908,42 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		if req.rowCh != nil {
 			// Streaming was activated and the request completed before we
 			// entered this select. The rowCh is closed; drain it into pgRows.
-			return drainStreamToPGRows(req, textFormat), nil
+			return drainStreamToPGRows(req, textFormat, nil), nil
 		}
 		// Buffered fast path — no channel was ever allocated.
 		return acquirePGRows(req.columns, req.rows, textFormat, req, nil), nil
 	case <-ctx.Done():
+		// The request is abandoned: nobody will read its rows. The select may
+		// take ctx.Done although colsCh is ready too (rowCh published), and a
+		// stream can be promoted after the select, while the cancel is sent.
+		// Left alone, the event-loop worker blocks in sendRow on the full rowCh,
+		// cannot read the server's cancel reply, and doneCh never fires; a
+		// worker serves every conn registered on it, so they all stall.
+		//
+		// So, before the cancel: abandoned makes the worker drop the rows that
+		// still arrive instead of buffering them (the server may not act on the
+		// cancel at once, or at all when it reaches an idle backend, and the
+		// rest of the result would pile up in req.rows), and closeRowCh releases
+		// a worker already blocked in sendRow and keeps a promotion from
+		// publishing a stream. The worker then reads on to ReadyForQuery. The
+		// rows buffered so far are dropped with the request.
+		req.doneMu.Lock()
+		req.abandoned = true
+		req.doneMu.Unlock()
+		req.closeRowCh()
 		confirmed := c.cancelRunning()
-		// A conn that cancelRunning failed completes req at once (failAll).
-		<-req.doneCh
+		// A conn that cancelRunning failed completes req at once (failAll). The
+		// wait is bounded as wait()'s is: a server that never answers the cancel
+		// fails the conn (the pool discards it) and the call returns anyway.
+		timer := time.NewTimer(cancelDrainTimeout)
+		select {
+		case <-req.doneCh:
+			timer.Stop()
+		case <-timer.C:
+			c.failAll(errors.New("celeris-postgres: cancel timeout"))
+			releasePgRequest(req)
+			return nil, ctx.Err()
+		}
 		reqErr := req.err
 		releasePgRequest(req)
 		if !confirmed {
@@ -2457,12 +2960,12 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 // into a buffered pgRows. Used by the sync fast path when the entire response
 // completed during WriteAndPoll — avoids the per-Next channel recv overhead
 // for small result sets.
-func drainStreamToPGRows(req *pgRequest, textFormat bool) *pgRows {
+func drainStreamToPGRows(req *pgRequest, textFormat bool, deferredErr error) *pgRows {
 	var rows [][][]byte
 	for row := range req.rowCh {
 		rows = append(rows, row)
 	}
-	return acquirePGRows(req.columns, rows, textFormat, req, nil)
+	return acquirePGRows(req.columns, rows, textFormat, req, deferredErr)
 }
 
 // simpleExec returns the command tag and rows-affected count. Callers may
@@ -2472,6 +2975,9 @@ func drainStreamToPGRows(req *pgRequest, textFormat bool) *pgRows {
 func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, error) {
 	if c.closed.Load() {
 		return "", 0, ErrClosed
+	}
+	if err := c.rowsOpenErr(); err != nil {
+		return "", 0, err
 	}
 	if c.useDirect && isListenOrUnlisten(query) {
 		return "", 0, ErrDirectModeUnsupported
@@ -2487,9 +2993,15 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 		payload := protocol.WriteQueryInto(c.writer, query)
 		ok, err := c.pollSync(payload)
 		if err != nil {
-			c.failReq(req, err)
-			releasePgRequest(req)
-			return "", 0, err
+			if !c.pollFinished(req) {
+				c.failReq(req, err)
+				err = req.failedErr(err)
+				releasePgRequest(req)
+				return "", 0, err
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2560,6 +3072,9 @@ func (c *pgConn) simpleExecCmd(ctx context.Context, query string, wantRollback b
 	if c.closed.Load() {
 		return false, ErrClosed
 	}
+	if err := c.rowsOpenErr(); err != nil {
+		return false, err
+	}
 	if c.useDirect && isListenOrUnlisten(query) {
 		return false, ErrDirectModeUnsupported
 	}
@@ -2573,9 +3088,15 @@ func (c *pgConn) simpleExecCmd(ctx context.Context, query string, wantRollback b
 		payload := protocol.WriteQueryInto(c.writer, query)
 		ok, err := c.pollSync(payload)
 		if err != nil {
-			c.failReq(req, err)
-			releasePgRequest(req)
-			return false, err
+			if !c.pollFinished(req) {
+				c.failReq(req, err)
+				err = req.failedErr(err)
+				releasePgRequest(req)
+				return false, err
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2633,6 +3154,9 @@ func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		rows, err = c.doExtendedQuery(ctx, stmtName, query, args, prep.Columns)
 	}
 	return rows, err
@@ -2641,6 +3165,9 @@ func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args
 func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, args []driver.NamedValue, cachedCols []protocol.ColumnDesc) (driver.Rows, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
+	}
+	if err := c.rowsOpenErr(); err != nil {
+		return nil, err
 	}
 	values, formats, encSlot, err := encodeArgs(args)
 	if err != nil {
@@ -2687,6 +3214,11 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	if c.useDirect {
 		req.syncMode.Store(true)
 	}
+	// SkipParse is part of the request's initial state: ExtendedQueryState.Handle
+	// reads it on the first message, on the event loop, and a message can reach
+	// a request the moment it is queued. Written after the
+	// enqueue it raced with that read.
+	req.extended.SkipParse = stmtName != ""
 	c.enqueue(req)
 	resultFormats := []int16{protocol.FormatBinary}
 
@@ -2697,8 +3229,6 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		c.writer.Reset()
 		if stmtName == "" {
 			protocol.AppendParse(c.writer, "", query, nil)
-		} else {
-			req.extended.SkipParse = true
 		}
 		protocol.AppendBind(c.writer, "", stmtName, formats, values, resultFormats)
 		if hasDescribe {
@@ -2708,9 +3238,15 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		protocol.AppendSync(c.writer)
 		ok, werr := c.pollSync(c.writer.Bytes())
 		if werr != nil {
-			c.failReq(req, werr)
-			releasePgRequest(req)
-			return nil, werr
+			if !c.pollFinished(req) {
+				c.failReq(req, werr)
+				werr = req.failedErr(werr)
+				releasePgRequest(req)
+				return nil, werr
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -2743,8 +3279,6 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		c.writer.Reset()
 		if stmtName == "" {
 			protocol.AppendParse(c.writer, "", query, nil)
-		} else {
-			req.extended.SkipParse = true
 		}
 		protocol.AppendBind(c.writer, "", stmtName, formats, values, resultFormats)
 		if hasDescribe {
@@ -2777,6 +3311,9 @@ func (c *pgConn) extendedExec(ctx context.Context, stmtName, query string, args 
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		result, err = c.doExtendedExec(ctx, stmtName, query, args)
 	}
 	return result, err
@@ -2785,6 +3322,9 @@ func (c *pgConn) extendedExec(ctx context.Context, stmtName, query string, args 
 func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, args []driver.NamedValue) (driver.Result, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
+	}
+	if err := c.rowsOpenErr(); err != nil {
+		return nil, err
 	}
 	values, formats, encSlot, err := encodeArgs(args)
 	if err != nil {
@@ -2795,10 +3335,9 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 	req.ctx = ctx
 	req.kind = reqExtended
 	// HasDescribe left false (Exec does not request a row description).
+	// SkipParse is set before the enqueue, see doExtendedQuery.
+	req.extended.SkipParse = stmtName != ""
 	c.enqueue(req)
-	if stmtName != "" {
-		req.extended.SkipParse = true
-	}
 
 	// Sync fast path for extended exec — build the message using Append
 	// variants directly into the writer's buffer, eliminating per-message
@@ -2815,9 +3354,15 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 		protocol.AppendSync(c.writer)
 		ok, werr := c.pollSync(c.writer.Bytes())
 		if werr != nil {
-			c.failReq(req, werr)
-			releasePgRequest(req)
-			return nil, werr
+			if !c.pollFinished(req) {
+				c.failReq(req, werr)
+				werr = req.failedErr(werr)
+				releasePgRequest(req)
+				return nil, werr
+			}
+			// The reply was complete when the poll then read the end of the
+			// connection: the result stands, and the closed conn is discarded.
+			ok = true
 		}
 		if ok && req.doneAtom.Load() != 0 {
 			select {
@@ -3041,7 +3586,7 @@ func (c *pgConn) Close() error {
 		if c.useDirect {
 			if c.tcp != nil {
 				_ = c.tcp.SetWriteDeadline(time.Now().Add(time.Second))
-				if err := c.writeRaw(termBytes); err != nil && firstErr == nil {
+				if err := c.writeRawPlain(termBytes); err != nil && firstErr == nil {
 					firstErr = err
 				}
 				if err := c.tcp.Close(); err != nil && firstErr == nil {
@@ -3054,7 +3599,7 @@ func (c *pgConn) Close() error {
 			// them on the conn's own number). The loop then answers
 			// ErrUnknownFD to both: that is what teardown looks like, not a
 			// failure of Close, so it is not Close's error (celeris#887).
-			if err := c.writeRaw(termBytes); err != nil && firstErr == nil && !errors.Is(err, ErrUnknownFD) {
+			if err := c.writeRawPlain(termBytes); err != nil && firstErr == nil && !errors.Is(err, ErrUnknownFD) {
 				firstErr = err
 			}
 			if err := c.loop.UnregisterConn(c.fd); err != nil && firstErr == nil && !errors.Is(err, ErrUnknownFD) {
@@ -3311,6 +3856,9 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	if c.closed.Load() {
 		return 0, ErrClosed
 	}
+	if err := c.rowsOpenErr(); err != nil {
+		return 0, err
+	}
 	if tableName == "" {
 		return 0, errors.New("celeris-postgres: CopyFrom requires a table name")
 	}
@@ -3336,7 +3884,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	payload := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteQuery(w, query) })
 	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
-		return 0, err
+		return 0, req.failedErr(err)
 	}
 	// Wait for CopyInResponse before streaming.
 	select {
@@ -3348,11 +3896,17 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 		return 0, errors.New("celeris-postgres: COPY FROM ended before CopyInResponse")
 	case <-ctx.Done():
-		confirmed := c.cancelRunning()
-		<-req.doneCh
-		if confirmed && req.err != nil {
-			return 0, req.err
-		}
+		// The context ended while the call waited for the CopyInResponse (which
+		// may even have arrived: with both ready, select can take ctx). A CancelRequest
+		// is no way out: the statement may not be running yet, and when it
+		// starts after the cancel was dropped the server waits in COPY IN for
+		// data that this call, which is returning, will never send; nothing then
+		// completes req and a wait for doneCh never ends (the conn and its
+		// pool slot wedged for good). The state of the session is unknown, so
+		// the conn is closed, not reused: failAll marks it closed and completes
+		// req, and Pool.release discards it (the server leaves COPY IN when the
+		// socket closes) and the pool dials a replacement.
+		c.failAll(errCopyCancelled)
 		return 0, ctx.Err()
 	}
 
@@ -3372,7 +3926,19 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 	}
 	var rowBuf []byte
+	done := ctx.Done() // nil for a context that can never end: the check below is then free
 	for src.Next() {
+		select {
+		case <-done:
+			// The context ended while the rows were being sent: a source that
+			// goes on (or has no end) must not keep the call running. CopyFail ends
+			// the COPY on the server, which answers with an error and
+			// ReadyForQuery, so the conn is left clean.
+			_ = c.sendCopyFail("context ended")
+			awaitDoneBounded()
+			return 0, ctx.Err()
+		default:
+		}
 		vals, verr := src.Values()
 		if verr != nil {
 			_ = c.sendCopyFail(verr.Error())
@@ -3384,7 +3950,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		if werr := c.writeRaw(frame); werr != nil {
 			_ = c.sendCopyFail(werr.Error())
 			awaitDoneBounded()
-			return 0, werr
+			return 0, req.failedErr(werr)
 		}
 	}
 	if serr := src.Err(); serr != nil {
@@ -3398,7 +3964,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	doneFrame := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteCopyDone(w) })
 	if werr := c.writeRaw(doneFrame); werr != nil {
 		awaitDoneBounded()
-		return 0, werr
+		return 0, req.failedErr(werr)
 	}
 	if c.useDirect {
 		// Direct mode: the background reader goroutine drives onRecv
@@ -3426,10 +3992,23 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 // whole conn so the pool discards it — avoids leaving an orphaned
 // request in the pending queue.
 func (c *pgConn) awaitDirectWithCancel(ctx context.Context, req *pgRequest) error {
+	// A request that is done wins over a context that has ended: select picks at
+	// random when both are ready, and a COPY that completed would be reported as
+	// cancelled (with a CancelRequest sent for a statement that is over).
+	select {
+	case <-req.doneCh:
+		return req.err
+	default:
+	}
 	select {
 	case <-req.doneCh:
 		return req.err
 	case <-ctx.Done():
+		select {
+		case <-req.doneCh:
+			return req.err
+		default:
+		}
 		if !c.cancelRunning() {
 			return ctx.Err()
 		}
@@ -3461,6 +4040,9 @@ func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte)
 	if c.closed.Load() {
 		return ErrClosed
 	}
+	if err := c.rowsOpenErr(); err != nil {
+		return err
+	}
 	if dest == nil {
 		return errors.New("celeris-postgres: CopyTo requires a non-nil dest")
 	}
@@ -3479,7 +4061,7 @@ func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte)
 	payload := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteQuery(w, query) })
 	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
-		return err
+		return req.failedErr(err)
 	}
 	if c.useDirect {
 		// See awaitDirectWithCancel contract: CancelRequest + bounded
