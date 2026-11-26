@@ -206,9 +206,12 @@ func partialDropHandler(cmd []string, w *bufio.Writer) {
 	}
 }
 
-// Strings read from a failed batch stay valid until Discard or Release: the
-// batch queued after the failure must not overwrite them.
-func TestPipelineHeldStringsSurviveTheNextBatchAfterAFailedExec(t *testing.T) {
+// After a failed Exec every command reports the Exec's error, including one
+// whose reply arrived before the connection dropped: the failed conn's reader
+// may still be writing into the batch's requests, so nothing is read from
+// them. Nothing from the failed batch can then be overwritten by the next one,
+// and the batch queued after the failure runs normally.
+func TestPipelineEveryResultAfterAFailedExecIsTheExecError(t *testing.T) {
 	fake := startFakeRedis(t, partialDropHandler)
 	c, err := NewClient(fake.Addr())
 	if err != nil {
@@ -220,7 +223,7 @@ func TestPipelineHeldStringsSurviveTheNextBatchAfterAFailedExec(t *testing.T) {
 	defer p.Release()
 	g1 := p.Get("aaaa")
 	g2 := p.Get("bbbb")
-	p.Get("stall")
+	g3 := p.Get("stall")
 	go func() {
 		time.Sleep(150 * time.Millisecond)
 		fake.mu.Lock()
@@ -232,17 +235,18 @@ func TestPipelineHeldStringsSurviveTheNextBatchAfterAFailedExec(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := p.Exec(ctx); err == nil {
+	execErr := p.Exec(ctx)
+	if execErr == nil {
 		t.Fatal("Exec with a dropped conn succeeded")
 	}
-	s1, err1 := g1.Result()
-	s2, err2 := g2.Result()
-	if err1 != nil || err2 != nil || s1 != "val-aaaa" || s2 != "val-bbbb" {
-		t.Fatalf("the replies before the drop did not arrive (%q %v, %q %v)", s1, err1, s2, err2)
+	for name, g := range map[string]*StringCmd{"aaaa": g1, "bbbb": g2, "stall": g3} {
+		if v, err := g.Result(); err == nil || v != "" || err.Error() != execErr.Error() {
+			t.Errorf("Result of %s after the failed Exec = %q, %v; want the Exec's error %v", name, v, err, execErr)
+		}
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	// Queue a new batch with no Discard; its strings have the same lengths.
+	// The next batch, queued with no Discard, runs normally.
 	n1 := p.Get("xxxx")
 	n2 := p.Get("yyyy")
 	if err := p.Exec(ctx); err != nil {
@@ -253,9 +257,6 @@ func TestPipelineHeldStringsSurviveTheNextBatchAfterAFailedExec(t *testing.T) {
 	}
 	if v, err := n2.Result(); err != nil || v != "val-yyyy" {
 		t.Fatalf("new GET = %q, %v", v, err)
-	}
-	if s1 != "val-aaaa" || s2 != "val-bbbb" {
-		t.Fatalf("strings read from the failed batch were overwritten: %q %q", s1, s2)
 	}
 }
 

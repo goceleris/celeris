@@ -347,6 +347,10 @@ func (p *Pipeline) Discard() {
 //	the command's own server error     a command got a server   Discard first: Exec returns
 //	                                   error reply              an error at once, sends nothing
 //
+// After a failed Exec every command of the batch reports the Exec's error,
+// including one whose reply had already arrived: the failed connection can
+// still be writing into the batch's buffers, so none of them is read.
+//
 // After a successful Exec, a second Exec returns an error at once (it does not
 // block or touch a connection): Discard before queueing a new batch.
 func (p *Pipeline) Exec(ctx context.Context) error {
@@ -432,49 +436,22 @@ func (p *pipeState) exec(ctx context.Context, client *Client) error {
 	// returning, so we can hand the writer's internal slice directly without
 	// allocating a copy. p.w is reset in p.reset() at Release/Discard time.
 	reqs, err := conn.execManyIntoPrealloc(ctx, p.w.Bytes(), p.reqs)
-	reader := conn.state.reader
 	if err != nil {
-		for i, r := range reqs {
-			if r == nil || i >= n {
-				continue
-			}
-			if r.resultErr != nil {
-				p.cmds[i].err = r.resultErr
-			} else {
-				p.cmds[i].err = err
-			}
-			p.transferResult(&p.cmds[i], r)
-			// Release pooled Reader slices but do NOT return slab-backed
-			// requests to reqPool — they are owned by the Pipeline.
-			if r.owned {
-				reader.Release(r.result)
-			}
-			reqs[i] = nil
-		}
-		// Keep the command list so each Result reports the real error (a
-		// deadline, a closed conn) instead of "released"; a command whose
-		// request never came back gets the error too. The batch is over: the
-		// next queued command starts a new one.
-		for i := range p.cmds {
-			if p.cmds[i].err == nil && !p.cmds[i].direct && p.cmds[i].val == nil {
-				p.cmds[i].err = err
-			}
-		}
-		// Do not touch the request slab here. The conn has failed and its
-		// reader may still be finishing a request of this batch; the slab is
-		// cleared by the next batch (newBatch) or by Discard/Release.
-		p.w.Reset()
-		p.reqs = p.reqs[:0]
-		p.executed = false
-		p.failed = true
-		// Give the pool slot back (celeris#1268). Every error execManyCore
-		// returns has closed the conn first (as does the ErrClosed of a conn
-		// that was already closed), and releaseCmd discards a closed conn, so
-		// Open drops and the slot is freed. Without this a failed Exec kept
-		// its slot for good.
-		client.pool.releaseCmd(conn)
+		p.failExec(client, conn, err)
 		return err
 	}
+	// A conn that closed while the replies were arriving (the server dropped
+	// it) is a failed Exec too, not a command's error reply. Only the error
+	// it carried is read here, never a reply.
+	if conn.closed.Load() {
+		for _, r := range reqs {
+			if r.resultErr != nil {
+				p.failExec(client, conn, r.resultErr)
+				return r.resultErr
+			}
+		}
+	}
+	reader := conn.state.reader
 	var firstErr error
 	for i, r := range reqs {
 		p.transferResult(&p.cmds[i], r)
@@ -495,21 +472,36 @@ func (p *pipeState) exec(ctx context.Context, client *Client) error {
 	if cap(conn.state.copySlab) > maxSlabRetain {
 		conn.state.copySlab = nil
 	}
-	// A reply error that came with the conn closing (the server dropped it)
-	// is a failed Exec like the one above, not a command's error reply: the
-	// Pipeline stays usable. Read it before the conn goes back to the pool.
-	connLost := firstErr != nil && conn.closed.Load()
 	client.pool.releaseCmd(conn)
 	p.w.Reset()
 	// Leave p.cmds populated so the user can read Result() off each typed
 	// handle. The slabs are fully reset only on Release/Discard.
 	p.reqs = p.reqs[:0]
-	if connLost {
-		p.resetRequests()
-		p.executed = false
-		p.failed = true
-	}
 	return firstErr
+}
+
+// failExec ends a batch whose Exec failed on the context or the connection.
+// Every command reports the Exec's error: no request field is read, because
+// the failed conn's reader can still be writing a late reply into one (the
+// event loop lets a read that began before the close complete). The request
+// slab and the request list, which that conn's sync-pipeline state also
+// points at, are dropped instead of reused or returned to the pool, so a late
+// write lands in memory nobody reads. The next batch allocates new ones.
+func (p *pipeState) failExec(client *Client, conn *redisConn, err error) {
+	for i := range p.cmds {
+		p.cmds[i].err = err
+	}
+	p.w.Reset()
+	p.reqSlab = nil
+	p.reqs = nil
+	p.executed = false
+	p.failed = true
+	// Give the pool slot back (celeris#1268). Every error execManyCore
+	// returns has closed the conn first (as does the ErrClosed of a conn
+	// that was already closed), and releaseCmd discards a closed conn, so
+	// Open drops and the slot is freed. Without this a failed Exec kept its
+	// slot for good.
+	client.pool.releaseCmd(conn)
 }
 
 // transferResult moves the dispatch result from a redisRequest into a pipeCmd.
