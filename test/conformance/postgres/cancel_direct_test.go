@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/driver/postgres"
 )
 
@@ -47,6 +48,22 @@ func cancelArms() []cancelArm {
 			return p
 		}},
 	}
+}
+
+// cancelArmsWithLoop adds a Pool on the driver's own event loop to cancelArms: the
+// cells that do not depend on the direct watch also hold there (CopyFrom's per-row
+// check is shared by both paths; a source without end used to keep the call running
+// on a loop too).
+func cancelArmsWithLoop() []cancelArm {
+	return append(cancelArms(), cancelArm{"loop", func(t *testing.T) *postgres.Pool {
+		p, err := postgres.Open(dsnFromEnv(t), postgres.WithMaxOpen(1),
+			postgres.WithEngine(celeris.New(celeris.Config{Addr: "127.0.0.1:0"})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = p.Close() })
+		return p
+	}})
 }
 
 // scanInt64 runs a one-row, one-column int64 query and returns the value.
@@ -138,7 +155,7 @@ func watchdogReal(t *testing.T, d time.Duration, what string, fn func()) {
 }
 
 func TestPoolCancelAtEachPointOfAStatement(t *testing.T) {
-	for _, arm := range cancelArms() {
+	for _, arm := range cancelArmsWithLoop() {
 		t.Run(arm.name, func(t *testing.T) {
 			mon := openMonitor(t)
 			newTag := func(what string) string {

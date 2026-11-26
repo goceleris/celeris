@@ -28,11 +28,10 @@ import (
 // because the CancelRequest was written on a new socket and the socket closed
 // without waiting for the server to act on it.
 //
-// Two kinds of statement, because a Pool conn looks at its context only when
-// bytes arrive: "select" (pg_sleep: no bytes until the end; reaches the cancel
-// path on database/sql) and "notice" (a DO block that sends a NOTICE shortly
-// before it ends, so a Pool conn wakes up after the context expired and
-// cancels too). Knobs: STRAY_SECONDS (3 per arm and kind; the failing-first runs used 15-30), STRAY_SLEEP_MS (2),
+// Two kinds of statement: "select" (pg_sleep: no bytes until the end, so the
+// context's end has to wake the read of a direct conn) and "notice" (a DO block
+// that sends a NOTICE shortly before it ends, so the response arrives in pieces
+// and the context can end before or after the first one). Knobs: STRAY_SECONDS (3 per arm and kind; the failing-first runs used 15-30), STRAY_SLEEP_MS (2),
 // STRAY_CTX (mixed: half of the contexts end by deadline, half by cancel(); or expire | cancel),
 // STRAY_WORKERS (2; more workers against the unfixed driver: its client-closed cancel sockets exhaust the ephemeral ports of a laptop above ~1000 cancels/s), STRAY_KIND (both|select|notice), STRAY_ARMS (all, or a
 // comma list of pool-direct, pool-loop, database-sql).

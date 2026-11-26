@@ -824,21 +824,18 @@ func TestDirectCancelBeforeTheRowsOfCopyFrom(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	src := &iterSource{n: 0}
 	var err error
-	// the context ends while the call is waiting for the backend
-	h := func(string) { time.Sleep(20 * time.Millisecond); cancel() }
+	// the context ends 20 ms after CopyInResponse; the source needs 100 ms for its
+	// ten rows, so the per-row check sees the end before the rows are all sent
+	h := func(string) { time.AfterFunc(20*time.Millisecond, cancel) }
 	f.afterReply.Store(&h)
 	watchdog(t, 20*time.Second, "CopyFrom", func() {
-		// a source that takes its time before its first row, long enough for the
-		// context to end
-		src2 := &iterSource{n: 10, onRow: func(int) { time.Sleep(10 * time.Millisecond) }}
-		_, err = p.CopyFrom(ctx, "t", nil, src2)
+		src := &iterSource{n: 10, onRow: func(int) { time.Sleep(10 * time.Millisecond) }}
+		_, err = p.CopyFrom(ctx, "t", nil, src)
 	})
 	f.afterReply.Store(nil)
-	_ = src
-	if err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want nil or context.Canceled", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	requireCleanOrReplaced(t, f, p, f.sessionCount(), false)
 }

@@ -145,9 +145,10 @@ func (f *silentPG) serve(c net.Conn) {
 			// One write for the whole reply. Two writes are two TCP segments and
 			// the blocked read may wake for the first alone (always on Windows,
 			// where the portable path has no non-blocking peek; a race elsewhere):
-			// driveDirect looks at the context each time a read returns, so a
-			// cancelled context would then cancel the statement (see
-			// TestDirectPoolLooksAtACancelOnlyContextWhenAReplyByteArrives).
+			// the read would then return for the first part of the reply, and a
+			// context cancelled meanwhile would cancel the statement before the
+			// rest arrived (see TestDirectPoolCancelOfAStatementThatAnswersOnItsOwnDrainsTheReply,
+			// which wants exactly that split).
 			reply := append([]byte{protocol.BackendCommandComplete, 0, 0, 0, 13}, append([]byte("SELECT 1"), 0)...)
 			reply = append(reply, protocol.BackendReadyForQuery, 0, 0, 0, 5, 'I')
 			_, _ = c.Write(reply)
@@ -205,7 +206,7 @@ func runSlow(ctx context.Context, p *Pool, query bool) error {
 	return err
 }
 
-func TestDirectPoolEnforcesAContextDeadlineMidStatement(t *testing.T) {
+func TestDirectPoolEnforcesAContextEndingMidStatement(t *testing.T) {
 	for _, kind := range []string{"deadline", "cancel"} {
 		for _, stmt := range []string{"exec", "query"} {
 			t.Run(kind+"/"+stmt, func(t *testing.T) {
