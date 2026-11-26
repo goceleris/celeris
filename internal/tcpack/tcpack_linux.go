@@ -21,6 +21,12 @@ var (
 // that does not fill the field, or for a probe that never completes.
 var probeFn = probeLoopback
 
+// wasStarted goes up when Start runs the probe's once, for a test to read.
+var wasStarted atomic.Bool
+
+// Started reports whether Start has begun the probe in this process.
+func Started() bool { return wasStarted.Load() }
+
 // Note records a count read from a socket: a count above 0 shows the stack fills
 // the field, for good.
 func Note(acked uint64) {
@@ -36,6 +42,7 @@ func Note(acked uint64) {
 // broken), and an event-loop thread must not.
 func Start() {
 	started.Do(func() {
+		wasStarted.Store(true)
 		fn := probeFn
 		probing.Add(1)
 		go func() {
