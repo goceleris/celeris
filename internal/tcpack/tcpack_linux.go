@@ -36,10 +36,12 @@ func Note(acked uint64) {
 }
 
 // Start begins the loopback probe in the background, once. The engines call it
-// when they are built, so that the answer is there long before a connection
-// needs it; Filled calls it too, as a safety net. It never blocks: the probe
-// waits on a loopback connection (up to a second or two if the host's loopback is
-// broken), and an event-loop thread must not.
+// once their listeners are bound (the probe binds an ephemeral loopback port, so
+// it must not run while a caller's port is still being bound), so that the
+// answer is there long before a connection needs it; Filled calls it too, as a
+// safety net. It never blocks: the probe waits on a loopback connection (up to a
+// second or two if the host's loopback is broken), and an event-loop thread must
+// not.
 func Start() {
 	started.Do(func() {
 		wasStarted.Store(true)

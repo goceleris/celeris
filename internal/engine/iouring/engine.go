@@ -141,11 +141,6 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
 
-	// The idle clock of an h2 conn needs to know whether this host reports the
-	// bytes a peer has acknowledged: ask now, in the background, so that the
-	// answer is there long before a sweep needs it (internal/tcpack).
-	tcpack.Start()
-
 	profile := probe.Probe()
 	if !profile.IOUringTier.Available() {
 		return nil, fmt.Errorf("io_uring not available on this system")
@@ -523,6 +518,13 @@ func (e *Engine) Listen(ctx context.Context) error {
 	if addr != nil {
 		e.addr.Store(&addr)
 	}
+
+	// Every worker has bound its listener: only now ask the host whether it
+	// reports the bytes a peer has acknowledged (internal/tcpack). The probe
+	// binds an ephemeral loopback port, which must not happen while a worker is
+	// about to bind the caller's port (celeris#1404); the h2 idle clock needs
+	// the answer only long after this.
+	tcpack.Start()
 
 	e.cfg.Logger.Info("io_uring engine listening",
 		"addr", e.cfg.Addr,
