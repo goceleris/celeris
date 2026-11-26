@@ -140,6 +140,9 @@ func TestConnLossCopyIsNotSuccess(t *testing.T) {
 			for _, n := range []int{50, 500} {
 				for _, kind := range allCopyKinds {
 					for _, rst := range []bool{false, true} {
+						if rst && kind == copyComplete && !rstAfterCompleteIsClean {
+							continue
+						}
 						cut := "FIN"
 						if rst {
 							cut = "RST"

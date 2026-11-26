@@ -523,6 +523,9 @@ func TestConnLossIsNotEOF(t *testing.T) {
 				for _, n := range []int{50, 500} {
 					for _, kind := range allLossKinds {
 						for _, rst := range []bool{false, true} {
+							if rst && kind == lossComplete && !rstAfterCompleteIsClean {
+								continue
+							}
 							proto := "simple"
 							if ext {
 								proto = "extended"

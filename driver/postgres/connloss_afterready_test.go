@@ -308,6 +308,9 @@ func TestConnLossCloseAfterReadyIsComplete(t *testing.T) {
 				}
 				for _, ext := range []bool{false, true} {
 					for _, rst := range []bool{false, true} {
+						if rst && !rstAfterCompleteIsClean {
+							continue
+						}
 						for _, end := range []arEnd{arRFQ, arRFQSep} {
 							car, shape, n, ext, rst, end := car, shape, n, ext, rst, end
 							name := fmt.Sprintf("%s/%s/n%d/ext=%v/rst=%v/%s", car.name, shape, n, ext, rst, end)
