@@ -97,7 +97,9 @@ func startLatencyProxy(t testing.TB, upstream string, lat time.Duration) string 
 const proxyLatency = 1500 * time.Microsecond
 
 type reuseTally struct {
-	ops, failed                         atomic.Int64
+	// mustFailed counts the commands that have to succeed (the reuse checks, 20 s deadline) and
+	// returned an error: they run on a healthy server, so each one is a lost reply or a stall.
+	ops, failed, mustFailed             atomic.Int64
 	wrongValue, foreignKey, missingKeys atomic.Int64
 	mu                                  sync.Mutex
 	samples                             []string
@@ -113,7 +115,7 @@ func (r *reuseTally) bad(c *atomic.Int64, format string, args ...any) {
 }
 
 func (r *reuseTally) violations() int64 {
-	return r.wrongValue.Load() + r.foreignKey.Load() + r.missingKeys.Load()
+	return r.wrongValue.Load() + r.foreignKey.Load() + r.missingKeys.Load() + r.mustFailed.Load()
 }
 
 // reuseShape is how the caller's command fails.
@@ -150,7 +152,7 @@ func runLateReuseMode(t *testing.T, addr string, proto Protocol, shape reuseShap
 	t.Helper()
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(2)) // sync.Pool is per P: few Ps make cross-goroutine reuse common
 	addr = startLatencyProxy(t, addr, proxyLatency)
-	opts := []Option{WithProtocol(proto), WithDialTimeout(2 * time.Second), WithMaxOpen(64)}
+	opts := []Option{WithProtocol(proto), WithDialTimeout(2 * time.Second), WithMaxOpen(64), WithTimeout(20 * time.Second)}
 	switch mode {
 	case "loop":
 		opts = append(opts, WithEngine(looptest.Unstarted()))
@@ -238,9 +240,9 @@ func runLateReuseMode(t *testing.T, addr string, proto Protocol, shape reuseShap
 		}(g)
 	}
 	wg.Wait()
-	t.Logf("%v/%v/%v: ops=%d failed-on-purpose=%d pauses=%d/%d dispatches: wrong-value=%d foreign-key=%d missing=%d",
+	t.Logf("%v/%v/%v: ops=%d failed-on-purpose=%d pauses=%d/%d dispatches: wrong-value=%d foreign-key=%d missing=%d must-succeed-failed=%d",
 		proto, shape, delay, tally.ops.Load(), tally.failed.Load(), pause.Hits(), pause.Calls(),
-		tally.wrongValue.Load(), tally.foreignKey.Load(), tally.missingKeys.Load())
+		tally.wrongValue.Load(), tally.foreignKey.Load(), tally.missingKeys.Load(), tally.mustFailed.Load())
 	for _, s := range tally.samples {
 		t.Log("  sample: " + s)
 	}
@@ -252,7 +254,7 @@ func runLateReuseMode(t *testing.T, addr string, proto Protocol, shape reuseShap
 
 // checkReuse runs one command that has to succeed with its own keys' values.
 func checkReuse(tally *reuseTally, cl *Client, mine []string, i int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	tally.ops.Add(1)
 	switch i % 2 {
@@ -260,6 +262,8 @@ func checkReuse(tally *reuseTally, cl *Client, mine []string, i int) {
 		k := mine[i%len(mine)]
 		got, err := cl.Get(ctx, k)
 		switch {
+		case err != nil && !errors.Is(err, ErrCacheMiss):
+			tally.bad(&tally.mustFailed, "Get(%s) failed on a healthy server: %v", k, err)
 		case err == nil && got != "val-"+k:
 			tally.bad(&tally.wrongValue, "Get(%s) = %q", k, got)
 		case errors.Is(err, ErrCacheMiss):
@@ -269,6 +273,7 @@ func checkReuse(tally *reuseTally, cl *Client, mine []string, i int) {
 		ask := mine[:3]
 		got, err := cl.GetMulti(ctx, ask...)
 		if err != nil {
+			tally.bad(&tally.mustFailed, "GetMulti(%v) failed on a healthy server: %v", ask, err)
 			return
 		}
 		want := map[string]bool{}

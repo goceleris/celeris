@@ -17,7 +17,8 @@ import (
 // be needed to land in it.
 //
 // It is for tests only. Production code never installs one, and then every
-// [DispatchPause] is one atomic load of a nil pointer.
+// [DispatchPause] is a function call (it is not inlined) and one atomic load of a nil pointer,
+// per read of a worker and per reply line of a driver.
 type Pause struct {
 	every uint64
 	delay time.Duration
@@ -53,7 +54,8 @@ func SetDispatchPause(p *Pause) (restore func()) {
 // DispatchPause is the injection point. The event loop's workers call it
 // between reading a chunk and handing it to onRecv, and a driver calls it in
 // its dispatch, after it has taken the request a reply belongs to and before it
-// writes the reply into it. With no Pause installed it costs one atomic load.
+// writes the reply into it. With no Pause installed it is a function call and one atomic load of a nil
+// pointer (it is not inlined).
 func DispatchPause() {
 	p := dispatchPause.Load()
 	if p == nil {

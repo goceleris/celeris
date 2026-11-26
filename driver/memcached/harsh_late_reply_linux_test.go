@@ -69,7 +69,9 @@ type harshResult struct {
 // process) or "direct" (no engine: the caller's own goroutine reads).
 func runHarsh(t *testing.T, addr string, proto Protocol, path string, budget int64) harshResult {
 	t.Helper()
-	opts := []Option{WithProtocol(proto), WithDialTimeout(5 * time.Second)}
+	// WithTimeout: the per-operation limit (default 3 s) must not end a call before its own
+	// 20 s context does, or the long-deadline check below would count a slow CI host.
+	opts := []Option{WithProtocol(proto), WithDialTimeout(5 * time.Second), WithTimeout(20 * time.Second)}
 	switch path {
 	case "loop":
 		opts = append(opts, WithEngine(looptest.Unstarted()))
@@ -114,7 +116,7 @@ func runHarsh(t *testing.T, addr string, proto Protocol, path string, budget int
 			defer wg.Done()
 			for i := 0; calls.Add(1) <= budget; i++ {
 				tiny := rand.IntN(2) == 0
-				d := 10 * time.Second
+				d := 20 * time.Second
 				if tiny {
 					d = time.Duration(20+rand.IntN(400)) * time.Microsecond
 				}
@@ -127,7 +129,7 @@ func runHarsh(t *testing.T, addr string, proto Protocol, path string, budget int
 					if err != nil {
 						failed.Add(1)
 						if !tiny {
-							longFailed.Add(1) // a 10 s deadline never ends a command on a healthy server
+							longFailed.Add(1) // a 20 s deadline (and a 20 s per-operation limit) never ends a command on a healthy server
 						}
 						continue
 					}
@@ -215,7 +217,7 @@ func TestHarshLateReplyReuse(t *testing.T) {
 					t.Fatalf("%d replies reached a command that did not ask for them", r.wrong)
 				}
 				if r.longFailed != 0 {
-					t.Fatalf("%d commands with a 10 s deadline failed on a healthy server", r.longFailed)
+					t.Fatalf("%d commands with a 20 s deadline failed on a healthy server", r.longFailed)
 				}
 			})
 		}
