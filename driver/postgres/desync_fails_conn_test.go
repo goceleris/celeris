@@ -726,3 +726,59 @@ func TestExtendedRequestIsCompleteBeforeItIsQueued(t *testing.T) {
 		_ = c.Close()
 	}
 }
+
+// Both rules on one simple-query reply (the merge of the multi-result-set check
+// with the desync rule): a multi-statement reply that is in step but returns rows
+// from two statements is the multi-result-set error and the conn lives; the same
+// reply with a message that does not belong in it fails the conn.
+func TestMultiResultSetsAndDesyncOnOneConn(t *testing.T) {
+	cmd := func(tag string) []byte { return dsFrame(protocol.BackendCommandComplete, []byte(tag+"\x00")) }
+	run := func(t *testing.T, c *pgConn) error {
+		rows, err := c.simpleQuery(dsCtx(t), "SELECT 1; SELECT 2")
+		if err != nil {
+			return err
+		}
+		dest := make([]driver.Value, len(rows.Columns()))
+		for err = nil; err == nil; err = rows.Next(dest) { //revive:disable-line:empty-block
+		}
+		_ = rows.Close()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	t.Run("in-step-two-sets-keeps-conn", func(t *testing.T) {
+		c := dsDial(t, func(c net.Conn) {
+			dsWrite(c, false, dsRowDesc0, cmd("SELECT 0"), dsRowDesc0, cmd("SELECT 0"), dsRFQ)
+		})
+		err := run(t, c)
+		if err == nil || !strings.Contains(err.Error(), "result set") {
+			t.Fatalf("err = %v, want the multi-result-set error", err)
+		}
+		if c.closed.Load() {
+			t.Fatal("an in-step multi-statement reply closed the conn")
+		}
+	})
+	for _, split := range []bool{false, true} {
+		name := "unexpected-message-between-sets-fails-conn"
+		if split {
+			name += "/split"
+		}
+		t.Run(name, func(t *testing.T) {
+			c := dsDial(t, func(c net.Conn) {
+				dsWrite(c, split, dsRowDesc0, cmd("SELECT 0"), dsParseOK, dsRowDesc0, cmd("SELECT 0"), dsRFQ)
+			})
+			err := run(t, c)
+			dsCheckErr(t, err, "unexpected message")
+			dsAssertFailed(t, c)
+		})
+		t.Run("ready-for-query-inside-second-set-fails-conn", func(t *testing.T) {
+			c := dsDial(t, func(c net.Conn) {
+				dsWrite(c, split, dsRowDesc0, cmd("SELECT 0"), dsRowDesc0, dsRFQ)
+			})
+			err := run(t, c)
+			dsCheckErr(t, err, "ReadyForQuery")
+			dsAssertFailed(t, c)
+		})
+	}
+}
