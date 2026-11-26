@@ -96,6 +96,12 @@ type mcRequest struct {
 	status    protocol.Kind // text-protocol reply tag (ignored in binary mode)
 	binStatus uint16        // binary-protocol status code
 	resultErr error
+	// drained is the error a conn's drain (Close, onClose, the parse-error drain of
+	// onRecv) failed the request with, set before it finishes it. A request finished
+	// by its reply has none; a caller that sees a request finished must return it, or a
+	// command the close ended would report whatever its half-written fields say (the
+	// binary status of a request nothing answered is 0, StatusOK).
+	drained error
 
 	// binIsTerm reports whether p is the terminator packet for a
 	// kindBinaryMulti request. Non-terminator packets are accumulated into
@@ -151,6 +157,7 @@ func getRequest(ctx context.Context) *mcRequest {
 	r.status = 0
 	r.binStatus = 0
 	r.resultErr = nil
+	r.drained = nil
 	r.binIsTerm = nil
 	r.finished.Store(false)
 	return r
@@ -442,7 +449,14 @@ func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 		return fmt.Errorf("celeris-memcached: binary opaque mismatch: got %#x, expected %#x (protocol violation)",
 			p.Header.Opaque, req.opaque)
 	}
-	s.bridge.Pop()
+	// Head is not Pop: a conn closed from another goroutine (Client.Close) in between has
+	// had its pending requests taken, failed and finished by the drain. The request is
+	// then the drain's, and writing the reply into it (binStatus, resultErr, values) is a
+	// data race with the drain and overwrites its error; the text END path checks the
+	// same.
+	if popped := s.bridge.Pop(); popped != req {
+		return errors.New("celeris-memcached: bridge head mismatch on a binary reply")
+	}
 	req.binStatus = p.Status()
 	if p.Status() == protocol.StatusOK {
 		// GET-style replies carry the value in p.Value. A GET-class reply
@@ -549,6 +563,7 @@ func copyBytes(b []byte) []byte {
 func (s *mcState) drainWithError(err error) {
 	s.bridge.DrainWithError(err, func(req async.PendingRequest, e error) {
 		r := req.(*mcRequest)
+		r.drained = e
 		r.resultErr = e
 		r.finish()
 	})
