@@ -28,7 +28,11 @@ runs, so a gap of a few percent is not a ranking.
 """
 import html
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tie_rule  # composition.json beside the cell: tie rule of a cell composed from two dispatches
 
 LANG = {"go": "Go", "rust": "Rust", "c": "C", "cpp": "C++", "java": "Java", "node": "Node",
         "python": "Python", "csharp": "C#", "bun": "Bun", "zig": "Zig"}
@@ -55,16 +59,33 @@ def main():
     ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
     n_fw = len(ranked)
     n_srv = sum(1 for e in d["benchmarks"] if e["saturation_mode_rps"].get(scn))
-    if ranked[0][0] != "celeris":
-        sys.exit("celeris is not first on %s: the headline of this chart would be false" % scn)
+    if not any(fw == "celeris" for fw, _ in ranked):
+        sys.exit("no celeris row on %s" % scn)
+    # The tie rule (tie_rule.py): a composed cell has composition.json beside it (a framework of the other
+    # dispatch needs the scenario's tie margin); any other cell keeps the 5 % band. A tie does NOT stop the
+    # render: the chart says so in its caption (a release step that exits gets worked around). Only a rival
+    # that is clearly ahead makes the headline false and exits.
+    comp = tie_rule.load(path) or tie_rule.single_dispatch()
+    cel_i = [i for i, (fw, _) in enumerate(ranked) if fw == "celeris"][0]
+    others = [(v, name) for fw, (v, name, lang) in ranked if fw != "celeris"]
+    st = tie_rule.standing(comp, scn, ranked[cel_i][1][0], others)
+    if st == "loss":
+        sys.exit("a framework is clearly ahead of celeris on %s: the headline of this chart would be false" % scn)
+    tie = st == "tie"
     top = ranked[:9]
     std_i = [i for i, (fw, _) in enumerate(ranked) if fw == "net/http"][0]
     rows = [(i + 1,) + r for i, r in enumerate(top)]
     gap = std_i > len(top)
     rows.append((std_i + 1,) + ranked[std_i])
-    celeris_rps = ranked[0][1][0]
-    second = ranked[1]
+    celeris_rps = ranked[cel_i][1][0]
+    second = next(r for r in ranked if r[0] != "celeris")  # the best other framework
     lead = celeris_rps / second[1][0] - 1
+    if tie:
+        # the caption names the framework that keeps celeris from a win: the fastest one it does not clear by its own margin
+        blk = max((v, name) for v, name in others if not celeris_rps > v * (1 + tie_rule.margin(comp, scn, name)))
+        lead = celeris_rps / blk[0] - 1
+        tie_m = tie_rule.margin(comp, scn, blk[1])
+        second = next(r for r in ranked if r[1][1] == blk[1])
     vs_std = celeris_rps / ranked[std_i][1][0]
     arch = d["host_arch_pair"]
     version = d["benchmark_config"].get("git_ref") or ""
@@ -97,13 +118,17 @@ def main():
     sans = "font-family=\"Inter,system-ui,sans-serif\""
     a('<text x="%d" y="44" %s font-size="13" letter-spacing="2.4" fill="#FF8A4C">SATURATION THROUGHPUT · GET / · %s CONNECTIONS · %s</text>'
       % (left, mono, conns, html.escape(arch.upper())))
-    a('<text x="%d" y="86" %s font-size="38" font-weight="800" fill="#F5F7FB">Celeris leads this row</text>' % (left, sans))
-    a('<text x="%d" y="114" %s font-size="17" font-weight="500" fill="#FF9A52">#1 of %d frameworks · +%.0f%% over %s · %.1f× net/http</text>'
-      % (left, sans, n_fw, lead * 100, html.escape(DISPLAY.get(second[0], second[0])), vs_std))
+    a('<text x="%d" y="86" %s font-size="38" font-weight="800" fill="#F5F7FB">%s</text>' % (left, sans, "Celeris is level at the top of this row" if tie else "Celeris leads this row"))
+    if tie:
+        a('<text x="%d" y="114" %s font-size="17" font-weight="500" fill="#FF9A52">A tie: %+.1f%% against %s is inside the ±%.0f%% margin · #%d of %d frameworks · %.1f× net/http</text>'
+          % (left, sans, lead * 100, html.escape(DISPLAY.get(second[0], second[0])), tie_m * 100, cel_i + 1, n_fw, vs_std))
+    else:
+        a('<text x="%d" y="114" %s font-size="17" font-weight="500" fill="#FF9A52">#1 of %d frameworks · +%.0f%% over %s · %.1f× net/http</text>'
+          % (left, sans, n_fw, lead * 100, html.escape(DISPLAY.get(second[0], second[0])), vs_std))
     a('<text x="%d" y="136" %s font-size="12.5" fill="#8A94A8">plaintext GET · saturation req/s · best configuration per framework · celeris %s · %s · one %d s run per cell</text>'
       % (left, mono, html.escape(version), html.escape(date), dur))
     a('<line x1="%d" x2="%d" y1="%d" y2="%d" stroke="#ffffff" stroke-opacity="0.07"/>' % (left, W - left, top_y - 6, top_y - 6))
-    maxv = celeris_rps
+    maxv = ranked[0][1][0]
     y = top_y
     prev_rank = 0
     for rank, fw, (v, name, lang) in rows:
@@ -126,7 +151,7 @@ def main():
     fy = y + 12
     a('<line x1="%d" x2="%d" y1="%d" y2="%d" stroke="#ffffff" stroke-opacity="0.07"/>' % (left, W - left, fy, fy))
     a('<text x="%d" y="%d" %s font-size="14" font-weight="500" fill="#C9D0DE">Best celeris configuration: %s. Single run, so a few percent is not a ranking.</text>'
-      % (left, fy + 26, sans, html.escape(ranked[0][1][1])))
+      % (left, fy + 26, sans, html.escape(ranked[cel_i][1][1])))
     a('<text x="%d" y="%d" %s font-size="12" fill="#6B7589">%d frameworks, %d server configurations on this row · %s · %d s warm-up · goceleris/probatorium cluster</text>'
       % (left, fy + 48, mono, n_fw, n_srv, html.escape(arch), warm))
     a('<text x="%d" y="%d" %s font-size="12" fill="#6B7589">Other rows differ, and not every one is a win: all scenarios are at goceleris.dev</text>'
