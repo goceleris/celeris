@@ -51,6 +51,9 @@ const (
 	// lossFatal sends half the rows, then a FATAL 57P01 ErrorResponse (what
 	// pg_terminate_backend makes the backend send), then closes.
 	lossFatal lossKind = "fatal57P01"
+	// lossStall sends half the rows, a pause and ten more, then holds the connection open, reading
+	// whatever the client sends, until the client closes it.
+	lossStall lossKind = "stall"
 )
 
 var allLossKinds = []lossKind{lossComplete, lossAfterC, lossAfterLast, lossMid, lossBeforeFirst, lossNothing, lossFatal}
@@ -141,6 +144,20 @@ func lossServer(tb testing.TB, cfg lossCfg) func(net.Conn) {
 				case lossBeforeFirst:
 					header()
 				case lossNothing:
+				case lossStall:
+					header()
+					rows(0, n/2)
+					flush()
+					// More rows after the first poll returned: a request that buffered the
+					// first batch on the sync path is promoted to a stream by the next one.
+					time.Sleep(150 * time.Millisecond)
+					rows(n/2, n/2+10)
+					flush()
+					for {
+						if _, _, err := readMsg(c); err != nil {
+							return true
+						}
+					}
 				case lossFatal:
 					header()
 					rows(0, n/2)
