@@ -54,6 +54,29 @@ func (e *failedCommitEnv) uniqueDeferred(t *testing.T) (u, w string) {
 	return u, w
 }
 
+// kill terminates the backend and waits until the server no longer lists it, so the next
+// call on the connection meets a closed socket, not a race with the termination.
+func (e *failedCommitEnv) kill(t *testing.T, pid int) {
+	t.Helper()
+	if _, err := e.db.ExecContext(e.ctx, "SELECT pg_terminate_backend($1)", pid); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		if err := e.db.QueryRowContext(e.ctx, "SELECT count(*) FROM pg_stat_activity WHERE pid = $1", pid).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backend %d still listed 10 s after pg_terminate_backend", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func poolArms(t *testing.T, dsn string, maxOpen int) map[string]*postgres.Pool {
 	t.Helper()
 	arms := map[string]*postgres.Pool{}
@@ -83,8 +106,11 @@ func begin(t *testing.T, p *postgres.Pool) *postgres.Tx {
 	return tx
 }
 
-// assertEnded: every method returns ErrTxDone, and nothing was written.
-func assertEnded(t *testing.T, e *failedCommitEnv, tx *postgres.Tx, side string, what string) {
+// assertEnded: every method returns ErrTxDone, and nothing was written. finishers=false
+// leaves out the second Commit and the Rollback: on a driver that held the conn after a
+// failed Commit, either of them is what freed it, so a test of "the caller never rolls
+// back" must not call them.
+func assertEnded(t *testing.T, e *failedCommitEnv, tx *postgres.Tx, side string, what string, finishers bool) {
 	t.Helper()
 	ctx := e.ctx
 	check := func(name string, err error) {
@@ -101,8 +127,10 @@ func assertEnded(t *testing.T, e *failedCommitEnv, tx *postgres.Tx, side string,
 	check("Savepoint", tx.Savepoint(ctx, "sp"))
 	check("ReleaseSavepoint", tx.ReleaseSavepoint(ctx, "sp"))
 	check("RollbackToSavepoint", tx.RollbackToSavepoint(ctx, "sp"))
-	check("Commit (second)", tx.Commit())
-	check("Rollback", tx.Rollback())
+	if finishers {
+		check("Commit (second)", tx.Commit())
+		check("Rollback", tx.Rollback())
+	}
 	if n := e.count(side); n != 0 {
 		t.Errorf("%s: %d rows in %s: a statement after the failed Commit committed on its own", what, n, side)
 	}
@@ -137,7 +165,7 @@ func TestFailedCommitEndsTheTx(t *testing.T) {
 						if !errors.As(err, &pge) || pge.Code != "23505" {
 							t.Fatalf("%s: Commit = %v, want SQLSTATE 23505", arm, err)
 						}
-						assertEnded(t, e, tx, w, fmt.Sprintf("%s round %d", arm, i))
+						assertEnded(t, e, tx, w, fmt.Sprintf("%s round %d", arm, i), rollbackAfter)
 						if rollbackAfter {
 							if err := tx.Rollback(); !errors.Is(err, postgres.ErrTxDone) {
 								t.Fatalf("%s: Rollback after the failed Commit = %v, want ErrTxDone", arm, err)
@@ -204,7 +232,7 @@ func TestFailedCommitSerializationFailure(t *testing.T) {
 				if !errors.As(err, &pge) || pge.Code != "40001" {
 					t.Fatalf("second Commit = %v, want SQLSTATE 40001", err)
 				}
-				assertEnded(t, e, t1, w, fmt.Sprintf("round %d", i))
+				assertEnded(t, e, t1, w, fmt.Sprintf("round %d", i), false)
 				if st := p.Stats(); st.InUse != 0 {
 					t.Fatalf("round %d: slot not released: %+v", i, st)
 				}
@@ -238,14 +266,11 @@ func TestFailedCommitOnAKilledConnection(t *testing.T) {
 					if _, err := tx.ExecContext(e.ctx, "INSERT INTO "+w+" VALUES (7)"); err != nil {
 						t.Fatal(err)
 					}
-					if _, err := e.db.ExecContext(e.ctx, "SELECT pg_terminate_backend($1)", pid); err != nil {
-						t.Fatal(err)
-					}
-					time.Sleep(100 * time.Millisecond)
+					e.kill(t, pid)
 					if err := tx.Commit(); err == nil {
 						t.Fatalf("%s: Commit on a killed connection returned nil", arm)
 					}
-					assertEnded(t, e, tx, w, fmt.Sprintf("%s round %d", arm, i))
+					assertEnded(t, e, tx, w, fmt.Sprintf("%s round %d", arm, i), rollbackAfter)
 					if rollbackAfter {
 						if err := tx.Rollback(); !errors.Is(err, postgres.ErrTxDone) {
 							t.Fatalf("%s: Rollback = %v, want ErrTxDone", arm, err)
@@ -279,14 +304,11 @@ func TestFailedRollbackEndsTheTx(t *testing.T) {
 			if err := tx.Savepoint(e.ctx, "sp"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := e.db.ExecContext(e.ctx, "SELECT pg_terminate_backend($1)", pid); err != nil {
-				t.Fatal(err)
-			}
-			time.Sleep(100 * time.Millisecond)
+			e.kill(t, pid)
 			if err := tx.Rollback(); err == nil {
 				t.Fatalf("%s: Rollback on a killed connection returned nil", arm)
 			}
-			assertEnded(t, e, tx, w, fmt.Sprintf("%s round %d", arm, i))
+			assertEnded(t, e, tx, w, fmt.Sprintf("%s round %d", arm, i), true)
 			if st := p.Stats(); st.InUse != 0 {
 				t.Fatalf("%s round %d: slot not released: %+v", arm, i, st)
 			}
@@ -337,5 +359,37 @@ func TestFailedCommitDatabaseSQLUnchanged(t *testing.T) {
 	}
 	if n := e.count(w); n != 0 {
 		t.Fatalf("%d rows in %s", n, w)
+	}
+}
+
+// The leak with NO later call on the Tx: MaxOpen 1, a failed Commit, nothing else (no Rollback,
+// no second Commit, no statement): the next BeginTx must still get the slot. On a driver that
+// holds the connection after a failed Commit this fails with "acquire blocked and timed out".
+func TestFailedCommitWithNoLaterCallFreesTheSlot(t *testing.T) {
+	e := newFailedCommitEnv(t)
+	for _, mode := range []string{"deferred-unique", "killed"} {
+		t.Run(mode, func(t *testing.T) {
+			u, _ := e.uniqueDeferred(t)
+			for arm, p := range poolArms(t, e.dsn, 1) {
+				for i := 0; i < 5; i++ {
+					tx := begin(t, p) // 10 s bound: fails here when the slot leaked
+					if mode == "killed" {
+						var pid int
+						if err := tx.QueryRow(e.ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
+							t.Fatal(err)
+						}
+						e.kill(t, pid)
+					} else if _, err := tx.ExecContext(e.ctx, "INSERT INTO "+u+" VALUES (1)"); err != nil {
+						t.Fatalf("%s: %v", arm, err)
+					}
+					if err := tx.Commit(); err == nil {
+						t.Fatalf("%s round %d: Commit returned nil", arm, i)
+					}
+				}
+				if st := p.Stats(); st.InUse != 0 {
+					t.Fatalf("%s: slot not released: %+v", arm, st)
+				}
+			}
+		})
 	}
 }

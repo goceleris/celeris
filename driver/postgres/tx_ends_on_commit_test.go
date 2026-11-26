@@ -144,8 +144,10 @@ func beginBounded(t *testing.T, p *Pool, what string) *Tx {
 }
 
 // assertTxEnded checks that every method of tx now returns ErrTxDone, and that none
-// of them sent anything to the server.
-func assertTxEnded(t *testing.T, tx *Tx, f *endFakePG, what string) {
+// of them sent anything to the server. finishers=false leaves out the second Commit and
+// the Rollback, which on a driver that held the conn after a failed Commit are what freed
+// it: a test of "the caller never rolls back" must not call them.
+func assertTxEnded(t *testing.T, tx *Tx, f *endFakePG, what string, finishers bool) {
 	t.Helper()
 	ctx := context.Background()
 	before := len(f.seen())
@@ -163,8 +165,10 @@ func assertTxEnded(t *testing.T, tx *Tx, f *endFakePG, what string) {
 	check("Savepoint", tx.Savepoint(ctx, "sp"))
 	check("ReleaseSavepoint", tx.ReleaseSavepoint(ctx, "sp"))
 	check("RollbackToSavepoint", tx.RollbackToSavepoint(ctx, "sp"))
-	check("Commit (again)", tx.Commit())
-	check("Rollback", tx.Rollback())
+	if finishers {
+		check("Commit (again)", tx.Commit())
+		check("Rollback", tx.Rollback())
+	}
 	if got := f.seen(); len(got) != before {
 		t.Errorf("%s: the ended Tx sent %v to the server", what, got[before:])
 	}
@@ -225,7 +229,7 @@ func TestTxCommitEndsTheTx(t *testing.T) {
 							if !c.failCommit && err != nil {
 								t.Fatalf("Commit = %v, want nil", err)
 							}
-							assertTxEnded(t, tx, f, label)
+							assertTxEnded(t, tx, f, label, rollbackAfter)
 							if rollbackAfter {
 								// the deferred Rollback idiom: safe, ErrTxDone
 								if err := tx.Rollback(); !errors.Is(err, ErrTxDone) {
@@ -272,7 +276,7 @@ func TestTxFailedRollbackEndsTheTx(t *testing.T) {
 					if err := tx.Rollback(); err == nil {
 						t.Fatal("Rollback returned nil, want the failure")
 					}
-					assertTxEnded(t, tx, f, mode)
+					assertTxEnded(t, tx, f, mode, true)
 					if st := p.Stats(); st.InUse != 0 {
 						t.Fatalf("round %d: slot not released: %+v", i, st)
 					}
