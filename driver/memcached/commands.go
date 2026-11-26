@@ -230,7 +230,8 @@ func (c *Client) SetBytes(ctx context.Context, key string, value []byte, ttl tim
 }
 
 // Add stores value at key only if the key does not already exist. Returns
-// [ErrNotStored] when the key is present.
+// [ErrNotStored] when the key is present. On the binary protocol an existing
+// key currently reports [ErrCASConflict] instead (celeris#1451).
 func (c *Client) Add(ctx context.Context, key string, value any, ttl time.Duration) error {
 	b, err := asBytes(value)
 	if err != nil {
