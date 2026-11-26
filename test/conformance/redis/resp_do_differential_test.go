@@ -26,7 +26,7 @@ type dfRow struct {
 // dfKeys are the keys the rows read; TestRESPDoHelpersMatchAcrossProtocols
 // fills them.
 type dfKeys struct {
-	ord, big, small, special, one, set, hash, hone, m1, m2 string
+	ord, big, small, special, mixed, one, set, hash, hone, m1, m2 string
 }
 
 func dfRows(k dfKeys) []dfRow {
@@ -40,6 +40,7 @@ func dfRows(k dfKeys) []dfRow {
 		{name: "zrevrange_withscores", args: []any{"ZREVRANGE", k.ord, 0, -1, "WITHSCORES"}, str: "ERR", integer: "ERR", slice: "b|100|a|1.5|c|0.1|d|-2.25"},
 		{name: "zrange_withscores_large_scores", args: []any{"ZRANGE", k.big, 0, -1, "WITHSCORES"}, str: "ERR", integer: "ERR"},
 		{name: "zrange_withscores_small_scores", args: []any{"ZRANGE", k.small, 0, -1, "WITHSCORES"}, str: "ERR", integer: "ERR"},
+		{name: "zrange_withscores_mixed_magnitudes", args: []any{"ZRANGE", k.mixed, 0, -1, "WITHSCORES"}, str: "ERR", integer: "ERR"},
 		{name: "zrange_withscores_inf_and_zero", args: []any{"ZRANGE", k.special, 0, -1, "WITHSCORES"}, str: "ERR", integer: "ERR"},
 		{name: "zrandmember_withscores", args: []any{"ZRANDMEMBER", k.one, 1, "WITHSCORES"}, str: "ERR", integer: "ERR", slice: "only|2.5"},
 		{name: "hrandfield_withvalues", args: []any{"HRANDFIELD", k.hone, 1, "WITHVALUES"}, str: "ERR", integer: "ERR", slice: "f|v"},
@@ -100,15 +101,19 @@ func TestRESPDoHelpersMatchAcrossProtocols(t *testing.T) {
 	ctx := ctxWithTimeout(t, 60*time.Second)
 	base := uniqueKey(t, "df")
 	k := dfKeys{
-		ord: base + ":ord", big: base + ":big", small: base + ":small", special: base + ":special", one: base + ":one",
+		ord: base + ":ord", big: base + ":big", small: base + ":small", special: base + ":special", mixed: base + ":mixed", one: base + ":one",
 		set: base + ":set", hash: base + ":hash", hone: base + ":hone", m1: base + ":m1", m2: base + ":m2",
 	}
-	cleanupKeys(t, c3, k.ord, k.big, k.small, k.special, k.one, k.set, k.hash, k.hone, k.hone+":s", k.m1, k.m2)
+	cleanupKeys(t, c3, k.ord, k.big, k.small, k.special, k.mixed, k.one, k.set, k.hash, k.hone, k.hone+":s", k.m1, k.m2)
 	for _, setup := range [][]any{
 		{"ZADD", k.ord, "1.5", "a", "100", "b", "0.1", "c", "-2.25", "d"},
 		{"ZADD", k.big, "1000000", "m6", "1700000000", "m9", "1e17", "m17", "1e20", "m20", "1e21", "m21"},
 		{"ZADD", k.small, "0.0001", "s4", "1e-5", "s5", "1e-7", "s7", "1.5e-10", "s10"},
 		{"ZADD", k.special, "+inf", "pinf", "-inf", "ninf", "0", "zero", "-0", "nzero"},
+		// Whole numbers up to 2^62 and beyond, many digits, and fractions with
+		// many digits, on each side of the points where the text changes form.
+		{"ZADD", k.mixed, "4e18", "w4e18", "5e18", "w5e18", "1.2345678901234568e18", "w1_2e18", "1.2345678901234568e20", "w1_2e20",
+			"1.5e300", "w1_5e300", "123456789.5", "f123456789_5", "0.000012345678", "f1_2e-5", "0.000001", "f1e-6", "9007199254740993", "w2p53", "-1234567", "wneg"},
 		{"ZADD", k.one, "2.5", "only"},
 		{"SADD", k.set, "x", "y"},
 		{"HSET", k.hash, "f1", "v1", "f2", "v2"},
