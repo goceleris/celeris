@@ -2089,11 +2089,12 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 // asynchronously between queries, and direct mode has no background
 // reader between queries to consume them. Gating these statements
 // with ErrDirectModeUnsupported prevents silently-dropped
-// notifications (see #241 / #4 follow-up).
+// notifications (see #241 / #4 follow-up). NOTIFY is not gated: it only
+// sends, and needs no reader (it was gated through v1.5.11 and main).
 func isListenOrUnlisten(q string) bool {
 	start := skipLeadingWSAndComments(q)
 	rest := q[start:]
-	for _, kw := range [...]string{"LISTEN", "UNLISTEN", "NOTIFY"} {
+	for _, kw := range [...]string{"LISTEN", "UNLISTEN"} {
 		if hasKeywordPrefix(rest, kw) {
 			return true
 		}

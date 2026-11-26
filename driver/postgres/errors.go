@@ -74,20 +74,19 @@ var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transacti
 // size in memory) before it returned this error, and a *sql.DB had no cap.
 var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds the result size cap (64 MiB by default; raise it with WithMaxResultBytes, stream it with Connector.WithStreaming, or paginate the query)")
 
-// ErrDirectModeUnsupported is returned by operations that rely on
-// unsolicited server messages between queries — LISTEN/UNLISTEN/NOTIFY
-// (NotificationResponse) most notably. Direct-mode conns dial a plain
-// net.TCPConn and drive reads from the caller goroutine only during
-// an active query; between queries no reader is active, so any
-// async-delivered message is silently dropped. COPY FROM/TO is
-// supported via a short-lived per-call reader goroutine; only the
-// persistent-listener class of operations returns this error.
+// ErrDirectModeUnsupported is returned by LISTEN and UNLISTEN on a direct
+// connection: the default of database/sql (a [Connector] without
+// [Connector.WithStreaming]) and of a [Pool] without an event loop. The driver has
+// no API to receive a notification on any path: a NotificationResponse is read and
+// dropped. On the event loop a LISTEN is accepted and its notifications are
+// dropped; a direct connection refuses the statement, so that it does not look as
+// if it worked. NOTIFY, which only sends, works on every path. The error text
+// names the way back to the old behaviour for database/sql,
+// [Connector.WithStreaming] (or streaming=true in the DSN).
 //
-// Workarounds: open the pool against an engine with AsyncHandlers=false
-// (drivers will pick the mini-loop path which has an always-on reader),
-// or use a separate non-pooled listener conn dedicated to
-// LISTEN/NOTIFY in a non-async configuration.
-var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; use a non-async engine pool or a dedicated listener conn")
+// Receiving notifications needs a dedicated listener connection of another
+// package; this driver does not offer one.
+var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN and UNLISTEN are not supported on a direct connection (the default of database/sql and of a Pool without an event loop), and the driver has no way to receive notifications on any connection; Connector.WithStreaming (or streaming=true in the DSN) accepts the statement as before and drops the notifications")
 
 // PGError is a server-sent ErrorResponse. Match it with errors.As.
 //
