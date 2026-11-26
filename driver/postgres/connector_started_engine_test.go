@@ -549,11 +549,17 @@ func TestConnectorResultCapPerMode(t *testing.T) {
 				}
 			}
 			if mode == "started" {
-				if !errors.Is(err, pg.ErrResultTooBig) {
-					t.Fatalf("started: got %d rows and error %v, want ErrResultTooBig", n, err)
-				}
-				if n == 0 || n >= nrows {
-					t.Fatalf("started: %d rows before the cap, want some but not all of %d", n, nrows)
+				// Direct stays strict: it caps on every attempt, no retry.
+				for i := 0; i < 3; i++ {
+					if i > 0 {
+						n, err = read(db)
+					}
+					if !errors.Is(err, pg.ErrResultTooBig) {
+						t.Fatalf("started, attempt %d: got %d rows and error %v, want ErrResultTooBig", i+1, n, err)
+					}
+					if n == 0 || n >= nrows {
+						t.Fatalf("started, attempt %d: %d rows before the cap, want some but not all of %d", i+1, n, nrows)
+					}
 				}
 			} else if err != nil || n != nrows {
 				t.Fatalf("%s: %d rows, error %v; want all %d and no error (the loop streams)", mode, n, err, nrows)
