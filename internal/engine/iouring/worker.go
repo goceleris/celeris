@@ -2680,7 +2680,7 @@ func (w *Worker) baseTimeout() time.Duration {
 	}
 	// The cap is for the deadlines of the conns the worker holds: not for one that
 	// holds nothing and has been idle for 100 rounds (celeris#1381, idle_wait_1381.go).
-	if w.cfg.ReadHeaderTimeout > 0 && maxWait > 25*time.Millisecond && !(w.emptyIters > 100 && w.idleQuiescent()) {
+	if w.cfg.ReadHeaderTimeout > 0 && maxWait > 25*time.Millisecond && (w.emptyIters <= 100 || !w.idleQuiescent()) {
 		maxWait = 25 * time.Millisecond
 	}
 	switch {
