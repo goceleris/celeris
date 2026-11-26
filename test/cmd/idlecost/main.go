@@ -32,6 +32,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -282,27 +283,6 @@ func processCPUTicks() int64 {
 // clockTicks is the kernel's USER_HZ, 100 on every Linux the module supports.
 func clockTicks() float64 { return 100 }
 
-// cpuCount is the number of CPUs the process may run on.
-func cpuCount() int {
-	b, err := os.ReadFile("/proc/self/status")
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if v, ok := strings.CutPrefix(line, "Cpus_allowed_list:"); ok {
-			n := 0
-			for _, part := range strings.Split(strings.TrimSpace(v), ",") {
-				lo, hi, isRange := strings.Cut(part, "-")
-				a, _ := strconv.Atoi(lo)
-				if !isRange {
-					n++
-					continue
-				}
-				z, _ := strconv.Atoi(hi)
-				n += z - a + 1
-			}
-			return n
-		}
-	}
-	return 0
-}
+// cpuCount is the number of CPUs the process may run on, as the runtime read it
+// at start (before any loop thread was pinned).
+func cpuCount() int { return runtime.NumCPU() }
