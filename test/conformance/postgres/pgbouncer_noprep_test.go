@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"sort"
@@ -409,6 +410,18 @@ func logNoPrepResults(t *testing.T, rs []childResult) {
 func checkNoPrep(t *testing.T, db *sql.DB, audit string, rs []childResult, allowErrors bool) {
 	t.Helper()
 	logNoPrepResults(t, rs)
+	if allowErrors {
+		// On this pooler a default-DSN run always sees 26000 or 42P05 (about half
+		// of a SELECT client's calls). None means the run did not exercise the
+		// configuration it claims to: fail instead of passing.
+		seen := 0
+		for _, r := range rs {
+			seen += r.Errs["26000"] + r.Errs["42P05"]
+		}
+		if seen == 0 {
+			t.Errorf("no 26000 and no 42P05 in any process: the pooler is not behaving as one that shares server connections without prepared-statement support, so this run tested nothing")
+		}
+	}
 	want := map[string]int{}
 	for _, r := range rs {
 		if r.Wrong != 0 {
@@ -451,11 +464,70 @@ func checkNoPrep(t *testing.T, db *sql.DB, audit string, rs []childResult, allow
 	}
 }
 
+// requirePoolerWithoutPreparedStatements fails the test unless the PgBouncer
+// behind dsn reports max_prepared_statements = 0 (its admin console, database
+// "pgbouncer", SHOW CONFIG). A test of a configuration the driver does not
+// support that silently ran against the supported one (PgBouncer's default is
+// 200) would prove nothing.
+func requirePoolerWithoutPreparedStatements(t *testing.T, dsn string) {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse %s: %v", envPgBouncerNoPrepDSN, err)
+	}
+	u.Path = "/pgbouncer"
+	adm, err := sql.Open(postgres.DriverName, u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adm.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rows, err := adm.QueryContext(ctx, "SHOW CONFIG")
+	if err != nil {
+		t.Fatalf("SHOW CONFIG on the PgBouncer admin console: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	cols, _ := rows.Columns()
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		if asString(vals[0]) == "max_prepared_statements" {
+			if v := asString(vals[1]); v != "0" {
+				t.Fatalf("the PgBouncer behind %s has max_prepared_statements = %s, want 0: this test needs a pooler without prepared-statement support", envPgBouncerNoPrepDSN, v)
+			}
+			t.Logf("PgBouncer SHOW CONFIG: max_prepared_statements = 0")
+			return
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatal("PgBouncer SHOW CONFIG has no max_prepared_statements row")
+}
+
+func asString(v any) string {
+	switch x := v.(type) {
+	case []byte:
+		return string(x)
+	case string:
+		return x
+	}
+	return fmt.Sprint(v)
+}
+
 func TestPgBouncerNoPrep(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv(envPgBouncerNoPrepDSN))
 	if dsn == "" {
 		t.Skipf("skipping: %s not set (set it to the transaction-mode DSN of a PgBouncer with max_prepared_statements=0)", envPgBouncerNoPrepDSN)
 	}
+	requirePoolerWithoutPreparedStatements(t, dsn)
 	db, err := sql.Open(postgres.DriverName, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -516,6 +588,7 @@ func TestPgBouncerNoPrepWayOut(t *testing.T) {
 	if dsn == "" {
 		t.Skipf("skipping: %s not set", envPgBouncerNoPrepDSN)
 	}
+	requirePoolerWithoutPreparedStatements(t, dsn)
 	dsn += pgbouncerParamSep(dsn) + "auto_cache_statements=false"
 	db, err := sql.Open(postgres.DriverName, dsn)
 	if err != nil {
