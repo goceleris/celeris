@@ -356,7 +356,7 @@ func poisonArms() []poisonArm {
 			return poisonPool{p}
 		}},
 		{"database-sql", func(t *testing.T, addr string, n int) poisonDB {
-			db, err := sql.Open(DriverName, dsnFor(addr))
+			db, err := sql.Open(DriverName, armDSN(dsnFor(addr)))
 			if err != nil {
 				t.Fatal(err)
 			}

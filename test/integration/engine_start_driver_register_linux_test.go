@@ -185,13 +185,14 @@ func oneStartRegisterIteration(f startRaceFakes, eng celeris.EngineType, async b
 		}
 		return wl.UnregisterConn(fds[0])
 	})
-	// database/sql through a Connector bound to the engine: registers the connection with the loop.
+	// database/sql through a Connector bound to the engine and WithStreaming (a Connector dials
+	// direct connections by default): registers the connection with the loop.
 	run("postgres Connector", func() error {
 		c, err := postgres.NewConnector(f.pgDSN)
 		if err != nil {
 			return err
 		}
-		db := sql.OpenDB(c.WithEngine(srv))
+		db := sql.OpenDB(c.WithEngine(srv).WithStreaming())
 		defer func() { _ = db.Close() }()
 		var n int
 		return db.QueryRowContext(ctx, "SELECT 1").Scan(&n)
