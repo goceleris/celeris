@@ -2746,12 +2746,18 @@ jobs:
             TestLoopIsIdleAgainAfterTheLastConnectionCloses1381
             TestAdoptedConnectionAfterAnIdleIsServed1381
             TestDriverConnectionOnAnIdleLoopReceives1381
+            TestIdleQuiescentIsFalseForAnythingTheLoopHolds1381
+            TestIdleWaitTier1381
+            TestSweepTimerFollowsWhatTheLoopHolds1381
+            TestTransplantDrainTakesTheLoopOffTheLongWait1381
+            TestLoopWithoutAnEventfdNeverTakesTheLongWait1381
           )
           iouring=(
             TestIdleWorkerWakeupsAreBounded1381
             TestWorkerWithAConnectionKeepsTheShortWait1381
             TestFirstRequestAfterIdleIsNotStalled1381
             TestIdleShutdownIsPrompt1381
+            TestIdleWaitOfAWorkerThatHoldsNothing1381
           )
           server=(TestIdleServerFirstRequestAndShutdown1381)
           integration=(TestSlowlorisSynthetic TestSlowlorisSyntheticConcurrent)

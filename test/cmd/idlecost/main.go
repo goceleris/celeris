@@ -98,7 +98,7 @@ func run(engineName string, workers int, window time.Duration, gaps string) erro
 	for dl := time.Now().Add(15 * time.Second); time.Now().Before(dl); time.Sleep(20 * time.Millisecond) {
 		select {
 		case err := <-done:
-			return fmt.Errorf("Start returned before the server was ready: %v", err)
+			return fmt.Errorf("the server stopped before it was ready: %v", err)
 		default:
 		}
 		if _, err := get(); err == nil {
@@ -163,13 +163,13 @@ func run(engineName string, workers int, window time.Duration, gaps string) erro
 	defer cancel()
 	t1 := time.Now()
 	if err := s.Shutdown(ctx); err != nil {
-		return fmt.Errorf("Shutdown: %v", err)
+		return fmt.Errorf("shutdown: %v", err)
 	}
 	select {
 	case err := <-done:
 		fmt.Printf("SHUTDOWN %s idle_shutdown=%v start_err=%v\n", label, time.Since(t1).Round(10*time.Microsecond), err)
 	case <-time.After(20 * time.Second):
-		return fmt.Errorf("Start did not return 20 s after Shutdown")
+		return fmt.Errorf("start did not return 20 s after shutdown")
 	}
 	return nil
 }

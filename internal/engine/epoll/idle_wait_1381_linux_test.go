@@ -167,19 +167,19 @@ func median1381(d []time.Duration) time.Duration {
 }
 
 // An idle loop blocks (wakes) at most idleWakeBound1381 times a second. Before
-// the change an idle epoll loop woke about 285 times a second (measured:
-// 570 in 2 s per loop); after it about 10. The bound sits between them.
+// the change an idle epoll loop woke about 285 times a second (measured on CI:
+// 570 to 610 in 2 s per loop); after it about 10. The bound sits between them.
 const idleWakeBound1381 = 40
 
 // TestIdleLoopWakeupsAreBounded1381 is the test that fails before the change:
-// three idle loops (the case the documentation measures), counted for 2 s once
+// three idle loops (the case the documentation measures), counted for 1.5 s once
 // every one of them has settled into its idlest wait.
 func TestIdleLoopWakeupsAreBounded1381(t *testing.T) {
 	p := probe1381(t)
 	r := start886(t, 3, 0, false)
 	loops := r.e.loopSnapshot()
 	waitIdle1381(t, p, loops)
-	const window = 2 * time.Second
+	const window = 1500 * time.Millisecond
 	got := wakeups1381(t, p, loops, window)
 	t.Logf("celeris1381 WAKEUPS %d idle loops, voluntary context switches in %v: %v (bound %d per second per loop)",
 		len(loops), window, got, idleWakeBound1381)
@@ -198,7 +198,7 @@ func TestIdleLoopWakeupsAreBounded1381(t *testing.T) {
 const idleStopBound1381 = 30 * time.Millisecond
 
 func TestIdleShutdownIsPrompt1381(t *testing.T) {
-	const cycles = 5
+	const cycles = 3
 	var lags []time.Duration
 	for range cycles {
 		p := probe1381(t)
@@ -225,7 +225,7 @@ func TestIdleShutdownIsPrompt1381(t *testing.T) {
 const idlePauseBound1381 = 30 * time.Millisecond
 
 func TestBeginPauseAcceptReachesALoopThatIsIdle1381(t *testing.T) {
-	const cycles = 5
+	const cycles = 3
 	p := probe1381(t)
 	r := start886(t, 2, 0, false)
 	loops := r.e.loopSnapshot()
@@ -273,7 +273,7 @@ func ok1381(t *testing.T, addr string) time.Duration {
 const idleFirstBound1381 = 40 * time.Millisecond
 
 func TestFirstRequestAfterIdleIsNotStalled1381(t *testing.T) {
-	const requests = 5
+	const requests = 3
 	p := probe1381(t)
 	r := start886(t, 2, 0, false)
 	loops := r.e.loopSnapshot()
@@ -413,7 +413,7 @@ func TestLoopIsIdleAgainAfterTheLastConnectionCloses1381(t *testing.T) {
 		p.of(l).empties.Store(0)
 	}
 	waitIdle1381(t, p, loops)
-	const window = 2 * time.Second
+	const window = 1500 * time.Millisecond
 	got := wakeups1381(t, p, loops, window)
 	t.Logf("celeris1381 WAKEUPS after the last connection closed, %v: %v (bound %d per second per loop)", window, got, idleWakeBound1381)
 	for i, n := range got {

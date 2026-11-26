@@ -198,6 +198,7 @@ func parkResidue(t *testing.T, arm parkArm) {
 		}
 		// Disarm it: the tick gate, after sweep(), becomes the only
 		// checkTimeouts left on this loop.
+		l.idleWaitOff.Store(true) // an idle loop would re-arm it (celeris#1381)
 		if err := unix.TimerfdSettime(l.timerFD, 0, &unix.ItimerSpec{}, nil); err != nil {
 			t.Fatalf("celeris711 PREMISE: disarm timerfd: %v", err)
 		}

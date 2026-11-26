@@ -25,16 +25,18 @@ import (
 	"time"
 )
 
-// workerThreads1381 returns the thread ids of this process that are pinned to
-// one CPU: the workers' (LockOSThread and a one-CPU affinity). The other
-// threads of the process may run on any CPU the process may use.
-func workerThreads1381(t *testing.T) []int {
+// pinnedThreads1381 returns the thread ids of this process that are pinned to
+// one CPU: the workers' (LockOSThread and a one-CPU affinity). The other threads
+// of the process may run on any CPU the process may use. A test takes the set
+// before it starts its engine and the difference after: a thread pinned by an
+// earlier test, if one were left, is not counted.
+func pinnedThreads1381(t *testing.T) map[int]bool {
 	t.Helper()
 	ents, err := os.ReadDir("/proc/self/task")
 	if err != nil {
 		t.Fatalf("read /proc/self/task: %v", err)
 	}
-	var tids []int
+	tids := map[int]bool{}
 	for _, ent := range ents {
 		tid, err := strconv.Atoi(ent.Name())
 		if err != nil {
@@ -47,12 +49,25 @@ func workerThreads1381(t *testing.T) []int {
 		for _, line := range strings.Split(string(b), "\n") {
 			if v, ok := strings.CutPrefix(line, "Cpus_allowed_list:"); ok {
 				if v = strings.TrimSpace(v); !strings.ContainsAny(v, "-,") {
-					tids = append(tids, tid)
+					tids[tid] = true
 				}
 			}
 		}
 	}
 	return tids
+}
+
+// newPinned1381 is the pinned threads that are not in before.
+func newPinned1381(t *testing.T, before map[int]bool) []int {
+	t.Helper()
+	var out []int
+	for tid := range pinnedThreads1381(t) {
+		if !before[tid] {
+			out = append(out, tid)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 func voluntary1381(t *testing.T, tid int) int64 {
@@ -122,18 +137,20 @@ func ok1381(t *testing.T, addr string) time.Duration {
 }
 
 // An idle worker blocks at most idleWakeBound1381 times a second. Before the
-// change an idle io_uring worker woke about 40 times a second (measured), after
-// it about 10. The bound sits between them, nearer the 40.
-const idleWakeBound1381 = 25
+// change an idle io_uring worker woke 54 to 62 times a second (measured on CI,
+// both architectures: the 25 ms cap and what else wakes it), after it fewer. The
+// bound sits between them, nearer the 54.
+const idleWakeBound1381 = 35
 
 // TestIdleWorkerWakeupsAreBounded1381 fails before the change.
 func TestIdleWorkerWakeupsAreBounded1381(t *testing.T) {
+	before := pinnedThreads1381(t)
 	r := startPause886(t, 2, 0) // the default ReadHeaderTimeout: the 25 ms cap
 	r.e.mu.Lock()
 	want := len(r.e.workers)
 	r.e.mu.Unlock()
 	time.Sleep(settle1381)
-	tids := workerThreads1381(t)
+	tids := newPinned1381(t, before)
 	if len(tids) != want {
 		t.Fatalf("celeris1381 PREMISE: %d threads pinned to one CPU, want one per worker (%d)", len(tids), want)
 	}
@@ -154,6 +171,7 @@ func TestIdleWorkerWakeupsAreBounded1381(t *testing.T) {
 const liveWakeFloor1381 = 25
 
 func TestWorkerWithAConnectionKeepsTheShortWait1381(t *testing.T) {
+	before := pinnedThreads1381(t)
 	r := startPause886(t, 2, 0)
 	addr := r.e.Addr().String()
 	time.Sleep(settle1381)
@@ -172,7 +190,13 @@ func TestWorkerWithAConnectionKeepsTheShortWait1381(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	time.Sleep(settle1381) // the worker that holds the connection settles into its waits again
-	tids := workerThreads1381(t)
+	tids := newPinned1381(t, before)
+	r.e.mu.Lock()
+	if len(tids) != len(r.e.workers) {
+		r.e.mu.Unlock()
+		t.Fatalf("celeris1381 PREMISE: %d threads pinned to one CPU, want one per worker", len(tids))
+	}
+	r.e.mu.Unlock()
 	const window = 2 * time.Second
 	got := wakeups1381(t, tids, window)
 	top := slices.Max(got)

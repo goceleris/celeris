@@ -99,11 +99,15 @@ type Loop struct {
 	// the lazy re-creation below is no longer an unsynchronised write to a
 	// field other goroutines read (celeris#655).
 	wakeFD    *wakefd.WakeFD
-	timerFD   int // timerfd for kernel-enforced checkTimeouts cadence (-1 if disabled)
-	events    []unix.EpollEvent
-	conns     []*connState
-	connCount int // number of active connections (local, for draining check)
-	maxFD     int // upper bound fd for iteration in checkTimeouts/shutdown
+	timerFD   int  // timerfd for kernel-enforced checkTimeouts cadence (-1 if disabled)
+	timerSlow bool // the sweep timerfd is at the idle period, not sweepFloor (celeris#1381); loop thread only
+	// idleWaitOff is set by a test that has disarmed the sweep timerfd by hand, so that the loop
+	// does not re-arm it: such a loop never takes the long wait (celeris#1381). Never set in production.
+	idleWaitOff atomic.Bool
+	events      []unix.EpollEvent
+	conns       []*connState
+	connCount   int // number of active connections (local, for draining check)
+	maxFD       int // upper bound fd for iteration in checkTimeouts/shutdown
 	// liveConns is a dense slice of the connections this loop holds.
 	// checkTimeouts, the sweep and shutdown iterate it instead of the sparse
 	// 0..maxFD range, so their cost is O(active conns) regardless of the FD
@@ -508,7 +512,7 @@ func (l *Loop) run(ctx context.Context) {
 		return
 	}
 
-	efd, efdErr := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	efd, efdErr := eventfdCreate(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 	if efdErr != nil {
 		efd = -1
 	}
@@ -545,6 +549,9 @@ func (l *Loop) run(ctx context.Context) {
 	// sweep every 8 minutes. The default configuration (ReadHeaderTimeout 10 s)
 	// has always armed it, so this changes the loop only for a server that
 	// turned ReadHeaderTimeout off; see sweepFloor for what it costs.
+	//
+	// Its period is sweepFloor while the loop holds anything. A loop that holds
+	// nothing re-arms it at idleWaitMs and back (celeris#1381, idle_wait_1381.go).
 	tfd, tfdErr := timerfdCreate(unix.CLOCK_MONOTONIC, unix.TFD_NONBLOCK|unix.TFD_CLOEXEC)
 	if tfdErr == nil {
 		// sweepFloor periodic (25 ms); first fire at the same.
@@ -577,6 +584,11 @@ func (l *Loop) run(ctx context.Context) {
 	// a cancelled context closes it in shutdown.
 	l.listenAddr = listenAddrOf(l.listenFD)
 	l.ready <- nil
+	// A cancel of ctx is seen at the top of an iteration, after the wait: an
+	// idle loop in its long wait (idle_wait_1381.go) is woken for it through
+	// its eventfd, as io_uring's engine does (celeris#1381).
+	stopAfter := context.AfterFunc(ctx, l.wakeFD.Signal)
+	defer stopAfter()
 
 	activeTimeoutMs := 1 // 1ms default epoll timeout
 	l.cachedNow = mono.Now()
@@ -649,6 +661,14 @@ func (l *Loop) run(ctx context.Context) {
 			l.listenFD = fd
 		}
 
+		// celeris#1381: a loop that holds nothing and has had no event for 100
+		// rounds waits idleWaitMs and ticks its sweep timer at that period (see
+		// idle_wait_1381.go). Any other state, with the timer back at sweepFloor, is
+		// the loop of before: a loop with a connection tests one comparison here and
+		// finds consecutiveEmpty small.
+		if idle := l.consecutiveEmpty > idleEmptyRounds && l.idleQuiescent(ctx); idle != l.timerSlow {
+			l.setSweepPeriod(idle)
+		}
 		timeoutMs := l.adaptiveTimeoutMs(activeTimeoutMs)
 		if l.listenFD < 0 {
 			timeoutMs = 500
@@ -717,6 +737,12 @@ func (l *Loop) run(ctx context.Context) {
 			l.cachedNow = mono.Now()
 			now = l.cachedNow
 			l.loopSlot.Enter(now) // the batch below runs handlers: a stuck one shows (celeris#1170)
+		} else if l.timerSlow {
+			// A wait that ran out with no event (the long wait, celeris#1381): the
+			// clock a work item queued meanwhile is stamped with (an adopt, whose
+			// eventfd event may come one round later) is the wait's end, not the
+			// last event's, up to idleWaitMs ago.
+			l.cachedNow = mono.Now()
 		}
 		timerOnly := false // the batch is the sweep timer's tick and nothing else (celeris#1194)
 		for i := range n {
@@ -4542,6 +4568,8 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	// whose timerfd could not be created (it logs that once) sweeps from the gate
 	// alone, every 32 iterations, about 130 ms apart with its listener open,
 	// and about 16 s apart while it has no listener and waits 500 ms (see run).
+	// The last tier is idleWaitMs, not 4 ms, for a loop that holds nothing
+	// (timerSlow, celeris#1381): the period its sweep timer is armed at as well.
 	maxMs := int(sweepFloor / time.Millisecond)
 	switch {
 	case l.consecutiveEmpty == 0:
@@ -4558,6 +4586,9 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 		}
 		return d
 	default:
+		if l.timerSlow {
+			return idleWaitMs // the loop holds nothing: see idle_wait_1381.go
+		}
 		d := base * 4
 		if d > maxMs {
 			d = maxMs
