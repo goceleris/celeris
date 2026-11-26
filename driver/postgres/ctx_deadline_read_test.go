@@ -7,9 +7,11 @@ import (
 	"time"
 )
 
-// What a statement pays by kind of context: nothing is registered with the
-// context, so a context without a deadline allocates exactly what Background does.
-func TestAContextWithoutADeadlineAllocatesNothingExtra(t *testing.T) {
+// What a statement pays by kind of context: a context that can never end
+// (Background, a value context over it) registers nothing and allocates exactly
+// what Background does; a context that can end pays context.AfterFunc's
+// registration, and no more than that.
+func TestAContextThatCannotEndAllocatesNothingExtra(t *testing.T) {
 	f := startSilentPG(t, 0)
 	p := openDirectPool(t, f.addr)
 	run := func(ctx context.Context) func() {
@@ -27,8 +29,14 @@ func TestAContextWithoutADeadlineAllocatesNothingExtra(t *testing.T) {
 	defer cancel()
 	cancelOnly := testing.AllocsPerRun(200, run(cctx))
 	// the process-wide count includes the fake backend, hence the 1 of slack
-	if val > bg+1 || cancelOnly > bg+1 {
-		t.Fatalf("allocs per statement: background %v, with a value %v, cancel-only %v: a context without a deadline must cost the same", bg, val, cancelOnly)
+	if val > bg+1 {
+		t.Fatalf("allocs per statement: background %v, with a value %v: a context that can never end must cost the same", bg, val)
+	}
+	if cancelOnly <= bg {
+		t.Fatalf("allocs per statement: background %v, cancel-only %v: the registration is not visible, the test no longer measures the watch", bg, cancelOnly)
+	}
+	if cancelOnly > bg+3 { // AfterFunc: the registration and its stop func
+		t.Fatalf("allocs per statement: background %v, cancel-only %v: more than context.AfterFunc's registration", bg, cancelOnly)
 	}
 }
 

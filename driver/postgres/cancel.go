@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -117,4 +118,101 @@ func (c *pgConn) cancelRunning() bool {
 		return false
 	}
 	return true
+}
+
+// testHookCtxWatch, when set, runs at the start of the callback of armCtxWatch,
+// before it acts: a test holds a callback in flight across the end of its
+// statement with it (it sleeps), or counts the callbacks that ran (each one is a
+// statement whose watch could not be stopped, and so was waited for). It is nil in
+// production.
+var testHookCtxWatch atomic.Pointer[func()]
+
+// ctxWatch is the wake of a direct conn's blocked read on the end of the
+// caller's context (armCtxWatch), the design of driver/redis's and
+// driver/memcached's armWake. It lives on the conn, and its callback is built
+// once per conn, so that a statement allocates none of it: what a statement
+// whose context can end pays is context.AfterFunc's own registration and stop.
+//
+// The handshake is what makes it safe. A callback that sets a read deadline in
+// the past races with everything else that sets one on the same socket: the cancel
+// drain of cancelDrainDirect (which sets its own, a bound), and the next statement
+// on the conn. So the statement never returns, and the drain never starts,
+// before settleCtxWatch has run: stop() returned true (the callback never runs
+// and never will), or it returned false and the callback has been waited for
+// (it has run to its end, and nothing of the context is left to touch the socket).
+// Pair armCtxWatch with settleCtxWatch in one goroutine: a direct conn is pinned
+// to one caller at a time.
+type ctxWatch struct {
+	fn   func()
+	stop func() bool // non-nil from armCtxWatch to settleCtxWatch
+	// ran has capacity 1: the callback signals it when it has run to its end, and
+	// settleCtxWatch waits on it whenever stopping the callback failed.
+	ran chan struct{}
+	// fired is written by the callback before it signals ran and read after the
+	// wait for ran, which orders the two: the callback set a read deadline of "now".
+	fired bool
+	// deadlineSet: driveDirect set the read deadline to the context's deadline,
+	// which endCtxWatch clears.
+	deadlineSet bool
+}
+
+// armCtxWatch arranges that, when ctx ends, the read deadline of the direct conn
+// c becomes "now", which wakes the read of driveDirect blocked on a statement
+// that is still running. It arms nothing, and costs the Done() call, for a
+// context that can never end (ctx.Done() == nil: Background, a value context over
+// it) and for one that has already ended (driveDirect's loop sees ctx.Err() before
+// it reads). It reports whether it armed one; the caller defers endCtxWatch then.
+func (c *pgConn) armCtxWatch(ctx context.Context) bool {
+	if ctx.Done() == nil || ctx.Err() != nil {
+		return false
+	}
+	w := &c.cw
+	if w.fn == nil {
+		tcp := c.tcp
+		w.ran = make(chan struct{}, 1)
+		w.fn = func() {
+			if h := testHookCtxWatch.Load(); h != nil {
+				(*h)()
+			}
+			_ = tcp.SetReadDeadline(time.Now())
+			w.fired = true
+			select {
+			case w.ran <- struct{}{}:
+			default:
+			}
+		}
+	}
+	w.fired = false
+	w.stop = context.AfterFunc(ctx, w.fn)
+	return true
+}
+
+// settleCtxWatch ends the wake armed by armCtxWatch; it does nothing if none is
+// armed. When the callback could not be stopped, the context has ended and the
+// callback has been started on a goroutine of its own: it is waited for, so that
+// it cannot set a deadline after this returns, whether that would be in the cancel
+// drain that follows or in the next statement on the conn. A deadline it set is
+// left in place (cancelDrainDirect replaces it, endCtxWatch clears it).
+func (c *pgConn) settleCtxWatch() {
+	w := &c.cw
+	if w.stop == nil {
+		return
+	}
+	stop := w.stop
+	w.stop = nil
+	if !stop() {
+		<-w.ran
+	}
+}
+
+// endCtxWatch is driveDirect's deferred end of a statement's context: it settles
+// the callback and clears the read deadline the statement or the callback set, so
+// that the socket is left without one (a conn that is closed is left alone).
+func (c *pgConn) endCtxWatch() {
+	c.settleCtxWatch()
+	w := &c.cw
+	if (w.deadlineSet || w.fired) && !c.closed.Load() {
+		_ = c.tcp.SetReadDeadline(time.Time{})
+	}
+	w.deadlineSet, w.fired = false, false
 }

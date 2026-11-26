@@ -735,6 +735,7 @@ type pgConn struct {
 	tcpFd     sockFD     // cached fd for MSG_DONTWAIT peek; 0 if unavailable
 	directMu  sync.Mutex // serializes tcp.Write
 	directBuf []byte     // read buffer for driveDirect
+	cw        ctxWatch   // the wake of driveDirect's read on its context's end (cancel.go)
 
 	addr   *net.TCPAddr
 	opts   Options
@@ -954,30 +955,37 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 	if c.directBuf == nil {
 		c.directBuf = make([]byte, 16<<10)
 	}
-	// A direct conn waits in a socket read that does not look at the context.
-	// A context with a deadline is enforced through the socket's read deadline:
-	// it is set to the context's deadline for this statement and cleared when
-	// the statement ends. Nothing is registered with the context (no
-	// context.AfterFunc, no goroutine, whatever the context type): a context
-	// without a deadline (Background, the HTTP/1 and HTTP/2 request contexts, a
-	// cancel-only context) costs one Deadline() call and a branch, and a
-	// statement under it returns when the server answers, as in v1.5.11 (it
-	// does not wake the read; ctx.Err() below is looked at each time a read
-	// returns, so a context cancelled before the reply is complete cancels the
-	// statement when a partial reply arrives, as in v1.5.11). A
-	// timeout is recognised by the clock against the context's deadline, not by
-	// ctx.Err(), which a timer context may not have set yet. The startup is
-	// bounded by startupBound and is left alone.
+	// A direct conn waits in a socket read that does not look at the context, so
+	// the end of the context is made to wake it (cancel.go, armCtxWatch):
+	//   - a context with a deadline: the socket's read deadline is the context's
+	//     deadline for this statement (a context of any type, one whose Done is
+	//     never closed included);
+	//   - a context that can end (Done() != nil): a context.AfterFunc sets a read
+	//     deadline of "now" when it does, which covers a cancel with or without a
+	//     deadline;
+	//   - a context that can never end (Done() == nil: Background, a value
+	//     context over it) registers nothing and costs a Deadline() call and a
+	//     nil check.
+	// A read woken by the context's end takes the cancel path below
+	// (cancelDrainDirect). Either way, endCtxWatch, deferred here, waits for a
+	// callback that has started and clears the deadline, so nothing of this
+	// statement's context reaches the next statement on the conn. A timeout is
+	// recognised by the clock against the context's deadline, not by ctx.Err(),
+	// which a timer context may not have set yet. The startup is bounded by
+	// startupBound and is left alone.
 	dl, hasDL := ctx.Deadline()
-	if hasDL && req.kind != reqStartup {
-		_ = c.tcp.SetReadDeadline(dl)
-		defer func() {
-			if !c.closed.Load() {
-				_ = c.tcp.SetReadDeadline(time.Time{})
-			}
-		}()
+	armed := false
+	if req.kind != reqStartup {
+		if hasDL {
+			_ = c.tcp.SetReadDeadline(dl)
+		}
+		armed = c.armCtxWatch(ctx)
 	} else {
 		hasDL = false
+	}
+	if hasDL || armed {
+		c.cw.deadlineSet = hasDL
+		defer c.endCtxWatch()
 	}
 	for {
 		if req.doneAtom.Load() != 0 {
@@ -1008,17 +1016,28 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 			c.onRecv(c.directBuf[:n])
 		}
 		if err != nil {
-			if hasDL && errors.Is(err, os.ErrDeadlineExceeded) && (ctx.Err() != nil || !time.Now().Before(dl)) {
-				// The context's deadline (nothing else sets a read deadline while
-				// this one is armed; the clock test is the check for a context whose
-				// Err is not set yet, and ctx.Err() covers a wall-clock step
-				// backwards under a deadline without a monotonic reading): the
-				// statement is cancelled and the caller gets the context's error.
-				cerr := ctx.Err()
-				if cerr == nil {
-					cerr = context.DeadlineExceeded
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				if req.doneAtom.Load() != 0 {
+					// The reply was complete when the deadline (or the wake of
+					// the context's end) fired: the statement succeeded and the
+					// top of the loop returns its result; endCtxWatch clears the
+					// deadline.
+					continue
 				}
-				return c.cancelDrainDirect(req, cerr)
+				if ctx.Err() != nil || (hasDL && !time.Now().Before(dl)) {
+					// The end of the context, by its deadline or by the wake of its
+					// cancel (nothing else sets a read deadline on this conn while
+					// a statement runs; the clock test is the check for a context
+					// whose Err is not set yet, and ctx.Err() covers a wall-clock
+					// step backwards under a deadline without a monotonic reading):
+					// the statement is cancelled and the caller gets the context's
+					// error.
+					cerr := ctx.Err()
+					if cerr == nil {
+						cerr = context.DeadlineExceeded
+					}
+					return c.cancelDrainDirect(req, cerr)
+				}
 			}
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
@@ -1036,6 +1055,11 @@ func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
 // (the context's error) to the caller. A conn whose cancel exchange did not
 // finish, or whose drain ended without the reply, is failed: it is discarded.
 func (c *pgConn) cancelDrainDirect(req *pgRequest, err error) error {
+	// Before the drain sets its own read deadline: a context watcher that has
+	// started (or is about to) would otherwise replace it with "now" in the
+	// middle of the drain and fail a healthy conn. After this nothing of the
+	// context touches the socket.
+	c.settleCtxWatch()
 	// Returns once the cancel exchange finished; a conn whose exchange did not
 	// is failed (discarded), nothing to drain.
 	if !c.cancelRunning() {
@@ -3372,7 +3396,19 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 	}
 	var rowBuf []byte
+	done := ctx.Done() // nil for a context that can never end: the check below is then free
 	for src.Next() {
+		select {
+		case <-done:
+			// The context ended while the rows were being sent: a source that
+			// goes on (or has no end) must not keep the call running. CopyFail ends
+			// the COPY on the server, which answers with an error and
+			// ReadyForQuery, so the conn is left clean.
+			_ = c.sendCopyFail("context ended")
+			awaitDoneBounded()
+			return 0, ctx.Err()
+		default:
+		}
 		vals, verr := src.Values()
 		if verr != nil {
 			_ = c.sendCopyFail(verr.Error())
@@ -3426,10 +3462,23 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 // whole conn so the pool discards it — avoids leaving an orphaned
 // request in the pending queue.
 func (c *pgConn) awaitDirectWithCancel(ctx context.Context, req *pgRequest) error {
+	// A request that is done wins over a context that has ended: select picks at
+	// random when both are ready, and a COPY that completed would be reported as
+	// cancelled (with a CancelRequest sent for a statement that is over).
+	select {
+	case <-req.doneCh:
+		return req.err
+	default:
+	}
 	select {
 	case <-req.doneCh:
 		return req.err
 	case <-ctx.Done():
+		select {
+		case <-req.doneCh:
+			return req.err
+		default:
+		}
 		if !c.cancelRunning() {
 			return ctx.Err()
 		}
