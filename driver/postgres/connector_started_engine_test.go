@@ -46,7 +46,9 @@ const (
 
 // A cell is one server and one way of reaching PostgreSQL from its handler.
 //
-//	kind     "connector": a Connector WithEngine(srv); "none": a Connector with no engine;
+//	kind     "connector": a Connector WithStreaming and WithEngine(srv); "none": a Connector WithStreaming
+//	         with no engine (a Connector without WithStreaming dials direct connections whatever the
+//	         engine, v1.6.0; "default" is one WithEngine(srv) without WithStreaming: always direct);
 //	         "pool": the native Pool WithEngine(srv), the control
 //	started  the server runs when the DB is built and first used (otherwise both happen before Start)
 //	handler  "inline": runs on the engine worker; "async-config": Config.AsyncHandlers (a route that only
@@ -77,6 +79,8 @@ func (c cseCell) name() string {
 	switch c.kind {
 	case "none":
 		engineName = "connector-noengine"
+	case "default":
+		engineName = "connector-default-" + c.engineName
 	case "pool":
 		engineName = "pool-" + c.engineName
 	}
@@ -91,7 +95,7 @@ func (c cseCell) name() string {
 // under CPU load), so the cells are skipped unless CELERIS_CSE_EXPECTED_STALL=1,
 // and then only log the outcome.
 func (c cseCell) expectedStall() bool {
-	return c.nested && c.kind != "pool" && (c.kind == "none" || !c.started || c.engine == celeris.Std)
+	return c.nested && c.kind != "pool" && c.kind != "default" && (c.kind == "none" || !c.started || c.engine == celeris.Std)
 }
 
 func cseDSN(t *testing.T) string {
@@ -159,6 +163,12 @@ func TestConnectorStartedEngine(t *testing.T) {
 	}
 	// A Connector with no engine on a server that is running or not: always the driver's own loop.
 	add(cseCell{kind: "none", engine: celeris.Epoll, engineName: "epoll"}, []bool{false, true}, []string{"inline", "async-route"})
+	// A Connector without WithStreaming (the default of database/sql) bound to the server: direct on
+	// every server, a started one included, so no cell stalls.
+	for _, e := range engines[:3] {
+		e.kind = "default"
+		add(e, []bool{false, true}, []string{"inline"})
+	}
 	// The native Pool, the control: it takes the same rule, and a started server was always fine for it.
 	for _, e := range engines[:3] {
 		e.kind = "pool"
@@ -265,7 +275,10 @@ func runCSECell(t *testing.T, dsn string, c cseCell) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if c.kind == "connector" {
+			if c.kind != "default" {
+				cn = cn.WithStreaming() // the loop, and the rule of Connect for a started server
+			}
+			if c.kind == "connector" || c.kind == "default" {
 				cn = cn.WithEngine(srv)
 			}
 			db := sql.OpenDB(cn)
@@ -390,7 +403,7 @@ func TestConnectorDialledBeforeStart(t *testing.T) {
 				t.Fatal(err)
 			}
 			const pre = 4
-			db := sql.OpenDB(cn.WithEngine(srv))
+			db := sql.OpenDB(cn.WithStreaming().WithEngine(srv))
 			db.SetMaxOpenConns(pre)
 			db.SetMaxIdleConns(pre)
 
@@ -484,11 +497,13 @@ func TestConnectorDialledBeforeStart(t *testing.T) {
 	}
 }
 
-// TestConnectorResultCapPerMode: a result of about 70 MB. A Connector bound to a
-// started epoll server dials direct and reads the result whole, so it stops at
-// the 64 MiB cap with ErrResultTooBig (from sql.Rows.Err); one bound before
-// Start, and one with no engine, stay on the driver's loop and stream all of it
-// (the no-engine case is what keeps a plain sql.Open uncapped).
+// TestConnectorResultCapPerMode: a result of about 70 MB. A Connector without
+// WithStreaming (the default of database/sql) dials direct and reads the result
+// whole, so it stops at the 64 MiB cap with ErrResultTooBig (from sql.Rows.Err); so
+// does a Connector WithStreaming bound to a started epoll server (the rule of
+// Connect: the loop has no sync path there); one WithStreaming bound before
+// Start, and one WithStreaming with no engine, stay on the driver's loop and
+// stream all of it.
 func TestConnectorResultCapPerMode(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short mode: reads a 70 MB result twice")
@@ -514,7 +529,7 @@ func TestConnectorResultCapPerMode(t *testing.T) {
 		}
 		return n, rows.Err()
 	}
-	for _, mode := range []string{"no-engine", "unstarted", "started"} {
+	for _, mode := range []string{"default", "no-engine", "unstarted", "started"} {
 		t.Run(mode, func(t *testing.T) {
 			srv := celeris.New(celeris.Config{Engine: celeris.Epoll, Addr: "127.0.0.1:0", Workers: 2})
 			srv.GET("/", func(c *celeris.Context) error { return c.String(200, "ok") })
@@ -524,13 +539,15 @@ func TestConnectorResultCapPerMode(t *testing.T) {
 			}
 			var db *sql.DB
 			if mode == "unstarted" {
-				db = sql.OpenDB(cn.WithEngine(srv))
+				db = sql.OpenDB(cn.WithStreaming().WithEngine(srv))
 			}
 			cseStart(t, srv, true)
 			switch mode {
 			case "started":
-				db = sql.OpenDB(cn.WithEngine(srv))
+				db = sql.OpenDB(cn.WithStreaming().WithEngine(srv))
 			case "no-engine":
+				db = sql.OpenDB(cn.WithStreaming())
+			case "default":
 				db = sql.OpenDB(cn)
 			}
 			defer func() {
@@ -540,7 +557,7 @@ func TestConnectorResultCapPerMode(t *testing.T) {
 				_ = srv.Shutdown(sctx)
 			}()
 			n, err := read(db)
-			if mode != "started" && err != nil {
+			if mode != "started" && mode != "default" && err != nil {
 				// The loop's sync fast path can, rarely, read past the cap in one poll under load (see
 				// ErrResultTooBig); a direct connection caps every time. A loop connection streams
 				// everything in at least one of a few attempts.
@@ -548,17 +565,17 @@ func TestConnectorResultCapPerMode(t *testing.T) {
 					n, err = read(db)
 				}
 			}
-			if mode == "started" {
+			if mode == "started" || mode == "default" {
 				// Direct stays strict: it caps on every attempt, no retry.
 				for i := 0; i < 3; i++ {
 					if i > 0 {
 						n, err = read(db)
 					}
 					if !errors.Is(err, pg.ErrResultTooBig) {
-						t.Fatalf("started, attempt %d: got %d rows and error %v, want ErrResultTooBig", i+1, n, err)
+						t.Fatalf("%s, attempt %d: got %d rows and error %v, want ErrResultTooBig", mode, i+1, n, err)
 					}
 					if n == 0 || n >= nrows {
-						t.Fatalf("started, attempt %d: %d rows before the cap, want some but not all of %d", i+1, n, nrows)
+						t.Fatalf("%s, attempt %d: %d rows before the cap, want some but not all of %d", mode, i+1, n, nrows)
 					}
 				}
 			} else if err != nil || n != nrows {
@@ -587,7 +604,7 @@ func TestConnectorAfterServerShutdown(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			db := sql.OpenDB(cn.WithEngine(srv))
+			db := sql.OpenDB(cn.WithStreaming().WithEngine(srv))
 			db.SetMaxIdleConns(0) // every call dials
 			defer func() { _ = db.Close() }()
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -603,6 +620,63 @@ func TestConnectorAfterServerShutdown(t *testing.T) {
 			// The result (an error or a working direct connection) does not matter; reaching it does.
 			err = db.PingContext(ctx)
 			t.Logf("ping after shutdown: %v", err)
+		})
+	}
+}
+
+// TestConnectorStartedServerKeepsTheCapThroughTheChain: a Connector WithStreaming
+// bound to a started epoll server dials direct, and WithMaxResultBytes, in either
+// order after WithEngine, keeps it so (it must not fall back to the driver's own
+// loop, where a result streams with no cap): a 70 MB result under an 8 MiB cap
+// stops at the cap with ErrResultTooBig, every attempt.
+func TestConnectorStartedServerKeepsTheCapThroughTheChain(t *testing.T) {
+	dsn := cseDSN(t)
+	const nrows = 70000 // 70000 rows of 1000 bytes
+	const q = "SELECT repeat('x', 1000) FROM generate_series(1, 70000)"
+	const capBytes = 8 << 20
+	for _, order := range []string{"streaming-then-cap", "cap-then-streaming"} {
+		t.Run(order, func(t *testing.T) {
+			srv := celeris.New(celeris.Config{Engine: celeris.Epoll, Addr: "127.0.0.1:0", Workers: 2})
+			srv.GET("/", func(c *celeris.Context) error { return c.String(200, "ok") })
+			cseStart(t, srv, true)
+			cn, err := pg.NewConnector(dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cn = cn.WithEngine(srv)
+			if order == "streaming-then-cap" {
+				cn = cn.WithStreaming().WithMaxResultBytes(capBytes)
+			} else {
+				cn = cn.WithMaxResultBytes(capBytes).WithStreaming()
+			}
+			db := sql.OpenDB(cn)
+			defer func() {
+				_ = db.Close()
+				sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = srv.Shutdown(sctx)
+			}()
+			for attempt := 1; attempt <= 3; attempt++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				rows, err := db.QueryContext(ctx, q)
+				if err != nil {
+					cancel()
+					t.Fatalf("attempt %d: %v", attempt, err)
+				}
+				n := 0
+				for rows.Next() {
+					n++
+				}
+				err = rows.Err()
+				_ = rows.Close()
+				cancel()
+				if !errors.Is(err, pg.ErrResultTooBig) {
+					t.Fatalf("attempt %d: %d rows and error %v, want ErrResultTooBig (a loop connection would stream all %d)", attempt, n, err, nrows)
+				}
+				if n == 0 || n > capBytes/1000+1 {
+					t.Fatalf("attempt %d: %d rows before the cap, want about %d", attempt, n, capBytes/1000)
+				}
+			}
 		})
 	}
 }

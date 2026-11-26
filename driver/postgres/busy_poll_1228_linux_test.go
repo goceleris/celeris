@@ -13,10 +13,12 @@ import (
 	"github.com/goceleris/celeris/internal/sockopts/sockoptstest"
 )
 
-// celeris#1228: see the redis driver's test of the same name. A Connector bound
-// to a server that has not started registers its connections on the driver's own
-// loop and takes the server's budget; one bound to a started epoll, io_uring or
-// adaptive server dials through Go's netpoll and sets no socket option (see
+// celeris#1228: see the redis driver's test of the same name. A Connector with
+// WithStreaming bound to a server that has not started registers its connections
+// on the driver's own loop and takes the server's budget (a Connector without
+// WithStreaming dials direct connections, see
+// busy_poll_direct_default_linux_test.go; one with it bound to a started epoll,
+// io_uring or adaptive server dials direct too, see
 // TestConnectorOnAStartedServerSetsNoBusyPoll). A Pool on a native engine dials
 // through Go's netpoll as well.
 func TestDriverSocketBusyPollFollowsTheServer(t *testing.T) {
@@ -39,7 +41,7 @@ func TestDriverSocketBusyPollFollowsTheServer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("connector: %v", err)
 			}
-			cn = cn.WithEngine(srv)
+			cn = cn.WithEngine(srv).WithStreaming()
 			defer func() { _ = cn.Close() }()
 			dc, err := cn.Connect(context.Background())
 			if err != nil {
@@ -94,7 +96,7 @@ func TestDriverOnTheServerMakesTheServersBusyPollCalls(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := busypolltest.NewServer(tc.d)
-			cn := newFakePGConnector(t).WithEngine(srv)
+			cn := newFakePGConnector(t).WithStreaming().WithEngine(srv)
 			t.Cleanup(func() { _ = cn.Close() })
 			calls := recordSetsockopt(t)
 			connectorSocket(t, cn)
@@ -142,7 +144,7 @@ func TestConnectorSocketBusyPollOption(t *testing.T) {
 		}, 37},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cn := tc.build(newFakePGConnector(t))
+			cn := tc.build(newFakePGConnector(t).WithStreaming())
 			t.Cleanup(func() { _ = cn.Close() })
 			c := connectorSocket(t, cn)
 			if got := busypolltest.BusyPoll(t, c.fd); got != tc.want {
@@ -207,9 +209,9 @@ func TestConnectorOnAStartedServerSetsNoBusyPoll(t *testing.T) {
 		name  string
 		build func(cn *Connector) *Connector
 	}{
-		{"server 37us", func(cn *Connector) *Connector { return cn.WithEngine(srv) }},
+		{"server 37us", func(cn *Connector) *Connector { return cn.WithStreaming().WithEngine(srv) }},
 		{"server 37us, option 29us", func(cn *Connector) *Connector {
-			return cn.WithEngine(srv).WithSocketBusyPoll(29 * time.Microsecond)
+			return cn.WithStreaming().WithEngine(srv).WithSocketBusyPoll(29 * time.Microsecond)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -22,8 +22,9 @@ import (
 	"github.com/goceleris/celeris/internal/engine"
 )
 
-// maxDirectResultBytes is the per-query result buffer cap, on the payload of the
-// DataRows, wherever a reply is buffered whole: direct mode, which pins
+// maxDirectResultBytes is the default of the per-query result buffer cap (the
+// setting is [Connector.WithMaxResultBytes] and [WithMaxResultBytes]), on the
+// payload of the DataRows, wherever a reply is buffered whole: direct mode, which pins
 // syncMode=true (lazy streaming cannot activate because the caller goroutine IS
 // the dispatcher: a blocking channel send would deadlock), and the sync fast
 // path of a non-direct pool while its poll has not returned. A row that would
@@ -226,6 +227,9 @@ type pgRequest struct {
 	// slabBytes is the payload bytes buffered in total, over every slab chunk
 	// (rowSlab is the current one): what maxDirectResultBytes bounds.
 	slabBytes int
+	// maxBytes is the result buffer cap of this request, set by enqueue from the
+	// connection's setting; 0 is the default, maxDirectResultBytes.
+	maxBytes int
 }
 
 // finish signals completion of the request exactly once. Safe for
@@ -586,7 +590,11 @@ func (r *pgRequest) appendBuffered(fields [][]byte) (nrows int, syncMode, ok boo
 	for _, f := range fields {
 		size += len(f)
 	}
-	if syncMode && r.slabBytes+size > maxDirectResultBytes {
+	limit := r.maxBytes
+	if limit <= 0 {
+		limit = maxDirectResultBytes
+	}
+	if syncMode && r.slabBytes+size > limit {
 		r.err = ErrResultTooBig
 		return 0, syncMode, false
 	}
@@ -1507,6 +1515,7 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 // the current cap.
 func (c *pgConn) enqueue(req *pgRequest) {
 	req.conn = c
+	req.maxBytes = c.opts.maxResultBytes
 	c.pendingMu.Lock()
 	c.pending = append(c.pending, req)
 	c.pendingMu.Unlock()
@@ -2535,11 +2544,12 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 // asynchronously between queries, and direct mode has no background
 // reader between queries to consume them. Gating these statements
 // with ErrDirectModeUnsupported prevents silently-dropped
-// notifications (see #241 / #4 follow-up).
+// notifications (see #241 / #4 follow-up). NOTIFY is not gated: it only
+// sends, and needs no reader (it was gated through v1.5.11 and main).
 func isListenOrUnlisten(q string) bool {
 	start := skipLeadingWSAndComments(q)
 	rest := q[start:]
-	for _, kw := range [...]string{"LISTEN", "UNLISTEN", "NOTIFY"} {
+	for _, kw := range [...]string{"LISTEN", "UNLISTEN"} {
 		if hasKeywordPrefix(rest, kw) {
 			return true
 		}

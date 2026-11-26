@@ -302,7 +302,7 @@ func lossPool(t *testing.T, addr string, direct bool) *Pool {
 
 func lossSQL(t *testing.T, addr string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open(DriverName, lossDSN(addr))
+	db, err := sql.Open(DriverName, armDSN(lossDSN(addr)))
 	if err != nil {
 		t.Fatal(err)
 	}
