@@ -317,6 +317,9 @@ func (r *pgRequest) failedErr(fallback error) error {
 	if err == nil {
 		err = fallback
 	}
+	if errors.Is(err, engine.ErrQueueFull) {
+		return err // nothing was sent, the conn is alive (see writeRaw)
+	}
 	return lostError(err)
 }
 
@@ -1007,6 +1010,11 @@ func (c *pgConn) writeRaw(data []byte) error {
 	// or "file descriptor not registered" that a close landing while the frames
 	// are written produces.
 	if err := c.writeRawPlain(data); err != nil {
+		if errors.Is(err, engine.ErrQueueFull) {
+			// The write backlog is over its cap: nothing was sent and the
+			// connection is alive, so this is not a lost connection.
+			return err
+		}
 		return lostError(err)
 	}
 	return nil
