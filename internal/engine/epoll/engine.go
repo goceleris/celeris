@@ -367,9 +367,10 @@ func (e *Engine) Type() engine.EngineType {
 // see the flag that late; a loop that holds a connection waits 4 ms at most
 // (adaptiveTimeoutMs) and the signal only saves it the rest of the wait
 // (measured 0.8 to 5.9 ms from the call to the closed listener without it,
-// celeris#886 item 24). Then, on its own thread, it clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
-// serving for the linger (about 1.5 s from that clear), and closes the
-// listener once it has drained the accept queue. A connection whose
+// celeris#886 item 24). Then, on its own thread, it clears TCP_DEFER_ACCEPT
+// on its listener, keeps accepting and serving for the linger (about 1.5 s
+// from that clear), and closes the listener once it has drained the accept
+// queue. A connection whose
 // handshake completed before the pause but which has sent nothing yet is
 // promoted by the kernel during the linger and served like any other,
 // instead of being reset by the close.
