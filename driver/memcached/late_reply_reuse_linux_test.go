@@ -41,6 +41,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/driver/internal/busypolltest"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/driver/internal/looptest"
 )
@@ -136,15 +137,40 @@ func (s reuseShape) String() string {
 // goroutines do the same: a request put back by one is taken by the next
 // getRequest of any.
 func runLateReuse(t *testing.T, addr string, proto Protocol, shape reuseShape, delay, dur time.Duration) *reuseTally {
+	return runLateReuseMode(t, addr, proto, shape, delay, dur, "loop")
+}
+
+// runLateReuseMode is runLateReuse for one of the three ways a Client reaches a
+// server: "loop" (WithEngine of a server with no loop of its own: the driver's
+// standalone loop, a worker goroutine can run onRecv after the caller has gone),
+// "direct" (no engine) and "engine" (WithEngine of a started epoll server, whose
+// worker loop has no synchronous round trip, so the Client falls back to direct
+// conns): the last two read on the caller's goroutine.
+func runLateReuseMode(t *testing.T, addr string, proto Protocol, shape reuseShape, delay, dur time.Duration, mode string) *reuseTally {
 	t.Helper()
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(2)) // sync.Pool is per P: few Ps make cross-goroutine reuse common
 	addr = startLatencyProxy(t, addr, proxyLatency)
-	cl, err := NewClient(addr, WithEngine(looptest.Unstarted()), WithProtocol(proto),
-		WithDialTimeout(2*time.Second), WithMaxOpen(64))
+	opts := []Option{WithProtocol(proto), WithDialTimeout(2 * time.Second), WithMaxOpen(64)}
+	switch mode {
+	case "loop":
+		opts = append(opts, WithEngine(looptest.Unstarted()))
+	case "engine":
+		opts = append(opts, WithEngine(busypolltest.StartServer(t, 0)))
+	}
+	cl, err := NewClient(addr, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = cl.Close() }()
+	if conn, err := cl.pool.acquire(context.Background(), -1); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Logf("mode %s: conn direct=%v sync-loop=%v", mode, conn.useDirect, conn.sync != nil)
+		if (mode == "loop") == conn.useDirect {
+			t.Fatalf("mode %s: a conn with direct=%v is not the path this case is about", mode, conn.useDirect)
+		}
+		cl.pool.release(conn)
+	}
 
 	const workers, perWorker = 8, 4
 	uid := strconv.FormatInt(time.Now().UnixNano(), 36)
@@ -297,6 +323,34 @@ func TestLateReplyDoesNotReachAReusedRequest(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// The Clients that read on the caller's goroutine have no late writer: a
+// command that returns is not being dispatched by anyone, whatever ended it
+// (the dispatch runs on the caller, the pause sleeps on the caller). The same
+// probe, with the pauses landing on the caller, finds nothing to reuse wrongly.
+func TestNoLateWriterOnDirectAndEngineClients(t *testing.T) {
+	fake := startFake(t)
+	for _, mode := range []string{"direct", "engine"} {
+		for _, d := range []time.Duration{300 * time.Microsecond, 5 * time.Millisecond} {
+			t.Run(fmt.Sprintf("fake/text/%s/%v", mode, d), func(t *testing.T) {
+				tally := runLateReuseMode(t, fake.Addr(), ProtocolText, shapeDeadline, d, reuseDuration(), mode)
+				if v := tally.violations(); v != 0 {
+					t.Fatalf("%d wrong replies on a %s Client", v, mode)
+				}
+			})
+		}
+	}
+	if real := strings.TrimSpace(os.Getenv("CELERIS_MEMCACHED_ADDR")); real != "" {
+		for _, proto := range []Protocol{ProtocolText, ProtocolBinary} {
+			t.Run(fmt.Sprintf("real/%v/engine", proto), func(t *testing.T) {
+				tally := runLateReuseMode(t, real, proto, shapeDeadline, 300*time.Microsecond, reuseDuration(), "engine")
+				if v := tally.violations(); v != 0 {
+					t.Fatalf("%d wrong replies on an engine Client", v)
+				}
+			})
 		}
 	}
 }
