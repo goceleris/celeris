@@ -17,8 +17,8 @@ import (
 // cannot be made to happen on demand, so the test judges the order: with port 0
 // (the only path on which portHoldHook runs) the probe has not been started when
 // Listen decides the port, nor when a worker has bound its listener, and has been
-// by the time Listen returns. The probe is started once per process, so the test
-// runs in a process of its own.
+// by the time Listen publishes its address. The probe is started once per
+// process, so the test runs in a process of its own.
 func TestTcpackProbeStartsAfterTheLoopsBind1404(t *testing.T) {
 	if !child848(t) {
 		return
@@ -52,10 +52,10 @@ func TestTcpackProbeStartsAfterTheLoopsBind1404(t *testing.T) {
 	if startedAtBind.Load() {
 		t.Fatal("the probe had been started when a worker bound its listener: it must wait until every worker has bound")
 	}
+	if !tcpack.Started() {
+		t.Fatal("the address is published and the probe has not been started: the h2 idle clock would wait for its lazy start")
+	}
 	if err := r.stop(t); err != nil {
 		t.Fatalf("Listen: %v", err)
-	}
-	if !tcpack.Started() {
-		t.Fatal("Listen returned and the probe was never started: the h2 idle clock would wait for its lazy start")
 	}
 }

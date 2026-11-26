@@ -228,6 +228,14 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// Every loop has pinned (or failed to) before it reported ready.
 	platform.LogPinOutcome(e.cfg.Logger, "epoll", nicIRQReport(e.cfg.Logger, plan, e.cfg.Addr), takePinFailures(loops))
 
+	// Every loop has bound its listener: only now ask the host whether it
+	// reports the bytes a peer has acknowledged (internal/tcpack). The probe
+	// binds an ephemeral loopback port, which must not happen while a loop is
+	// about to bind the caller's port (celeris#1404). Before the address is
+	// published, so that a caller that sees Addr() knows the probe has begun;
+	// the h2 idle clock needs the answer only long after this.
+	tcpack.Start()
+
 	if len(e.loops) > 0 {
 		// celeris#639: publish an address a loop recorded before it signalled
 		// ready, never getsockname on a listenFD the loop may have closed since,
@@ -247,13 +255,6 @@ func (e *Engine) Listen(ctx context.Context) error {
 		}
 		e.addr.Store(&addr)
 	}
-
-	// Every loop has bound its listener: only now ask the host whether it
-	// reports the bytes a peer has acknowledged (internal/tcpack). The probe
-	// binds an ephemeral loopback port, which must not happen while a loop is
-	// about to bind the caller's port (celeris#1404); the h2 idle clock needs
-	// the answer only long after this.
-	tcpack.Start()
 
 	e.cfg.Logger.Info("epoll engine listening", "addr", e.cfg.Addr, "loops", resolved.Workers)
 	if e.cfg.AsyncH2Reachable() {

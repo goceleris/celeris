@@ -27,6 +27,10 @@ var wasStarted atomic.Bool
 // Started reports whether Start has begun the probe in this process.
 func Started() bool { return wasStarted.Load() }
 
+// Wait returns when the probe, if it has been started, has ended and closed its
+// sockets (for a test that counts the process's sockets).
+func Wait() { probing.Wait() }
+
 // Note records a count read from a socket: a count above 0 shows the stack fills
 // the field, for good.
 func Note(acked uint64) {
@@ -44,9 +48,9 @@ func Note(acked uint64) {
 // not.
 func Start() {
 	started.Do(func() {
-		wasStarted.Store(true)
 		fn := probeFn
 		probing.Add(1)
+		wasStarted.Store(true)
 		go func() {
 			defer probing.Done()
 			if fn() {
