@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -309,7 +310,9 @@ func TestDefaultDeadlineOverLargeResultDoesNotHang(t *testing.T) {
 			switch {
 			case err == nil:
 				outcome = "ok"
-			case errors.Is(err, context.DeadlineExceeded):
+			case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+				// os.ErrDeadlineExceeded: the deadline ended a new connection's
+				// dial ("dial tcp: i/o timeout"), as many iterations do.
 				outcome = "ctx"
 			case errors.Is(err, postgres.ErrResultTooBig):
 				outcome = "toobig"
