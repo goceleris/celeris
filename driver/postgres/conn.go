@@ -279,17 +279,23 @@ func (r *pgRequest) fail(err error) {
 	r.finished.Store(true)
 }
 
-// failedErr returns the error r was failed with: the first fail's, which a
-// failAll that the same poll triggered (the loop's onClose runs inside
-// WriteAndPoll) set before the caller's failReq, and fallback when none is.
+// failedErr returns the error a sync poll's caller gives back for a request the
+// poll failed: the error r was failed with (the first fail's: a failAll that the
+// same poll triggered, because the loop's onClose runs inside WriteAndPoll, sets
+// it before the caller's failReq) or, when none is, the poll's own error. It is
+// the connection-loss error either way (lostError): when the caller's failReq
+// stored the raw poll error first (ErrUnknownFD after the worker tore the fd
+// down, ECONNRESET) the failAll that follows finds the request done and changes
+// nothing, and the caller would return that raw error, which matches neither
+// ErrClosed nor io.ErrUnexpectedEOF.
 func (r *pgRequest) failedErr(fallback error) error {
 	r.doneMu.Lock()
 	err := r.err
 	r.doneMu.Unlock()
 	if err == nil {
-		return fallback
+		err = fallback
 	}
-	return err
+	return lostError(err)
 }
 
 // pgRequestPool amortizes pgRequest + its embedded state machines + its

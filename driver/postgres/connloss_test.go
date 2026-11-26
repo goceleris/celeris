@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -51,6 +52,9 @@ const (
 	// lossFatal sends half the rows, then a FATAL 57P01 ErrorResponse (what
 	// pg_terminate_backend makes the backend send), then closes.
 	lossFatal lossKind = "fatal57P01"
+	// lossRandomCut sends the whole reply cut at a random byte, in the middle of a
+	// message as often as not, and closes at once (use with noPause).
+	lossRandomCut lossKind = "randomByte"
 	// lossInsideCC sends every DataRow and half of CommandComplete, then closes.
 	lossInsideCC lossKind = "insideCommandComplete"
 	// lossReadyMinus1 sends the rows, CommandComplete and ReadyForQuery minus its
@@ -72,6 +76,9 @@ type lossCfg struct {
 	n    int  // rows the statement produces
 	rst  bool // close with a reset instead of a FIN
 	exec bool // the statement is a command with no rows (CommandComplete UPDATE n)
+	// noPause closes the connection right after the last byte of the cut reply, with
+	// no pause: the reader finds the data and the end of the connection together.
+	noPause bool
 }
 
 func (cfg lossCfg) cut(c net.Conn) {
@@ -146,6 +153,12 @@ func lossServer(tb testing.TB, cfg lossCfg) func(net.Conn) {
 				case lossAfterLast:
 					header()
 					rows(0, n)
+				case lossRandomCut:
+					header()
+					rows(0, n)
+					add(protocol.BackendCommandComplete, append([]byte(tag), 0))
+					add(protocol.BackendReadyForQuery, []byte{status})
+					buf = buf[:rand.IntN(len(buf)-1)]
 				case lossInsideCC:
 					header()
 					rows(0, n)
@@ -187,7 +200,9 @@ func lossServer(tb testing.TB, cfg lossCfg) func(net.Conn) {
 					add(protocol.BackendErrorResponse, []byte("SFATAL\x00VFATAL\x00C57P01\x00Mterminating connection due to administrator command\x00\x00"))
 				}
 				flush()
-				time.Sleep(20 * time.Millisecond)
+				if !cfg.noPause {
+					time.Sleep(20 * time.Millisecond)
+				}
 				cfg.cut(c)
 				return true
 			}
