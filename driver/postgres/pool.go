@@ -672,7 +672,11 @@ func (r *Rows) Columns() []string {
 
 // Close releases resources and returns the conn to the pool. A statement that
 // left a transaction open on the conn (Query "BEGIN") makes Close return
-// [ErrTxLeftOpen] after discarding the conn. Close is idempotent: every call
+// [ErrTxLeftOpen] after discarding the conn. A query in which more than one
+// statement returned rows fails with an error that says multiple result sets are
+// not supported and the server executed the statements; a streamed one delivers
+// the first set's rows and then returns that error from [Rows.Err] and from
+// Close. Close is idempotent: every call
 // after the first returns nil and does nothing (so ErrTxLeftOpen is reported
 // once), which makes `defer rows.Close()` next to an explicit Close fine. After
 // Close, Next returns false, Scan returns an error and Err keeps the error
@@ -1331,10 +1335,12 @@ func (r *Row) Scan(dest ...any) (err error) {
 	}
 	r.rows = nil
 	defer func() {
-		// Only the error of a transaction left open on the conn is the
-		// caller's, and only when the scan went well or found no row; any other
-		// error of Close or of the scan is left as it was.
-		if cerr := rows.Close(); errors.Is(cerr, ErrTxLeftOpen) {
+		// Only the error of a transaction left open on the conn, and the error
+		// of a query that returned more than one result set (it streamed: the
+		// first row is already scanned), are the caller's, and only when the
+		// scan went well or found no row; any other error of Close or of the
+		// scan is left as it was.
+		if cerr := rows.Close(); errors.Is(cerr, ErrTxLeftOpen) || cerr == errMultiResultSets {
 			switch {
 			case err == nil:
 				err = cerr
