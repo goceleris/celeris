@@ -1032,11 +1032,14 @@ func (c *Client) Watch(ctx context.Context, fn func(tx *Tx) error, keys ...strin
 		c.pool.discardCmd(conn)
 		return err
 	}
-	conn.releaseResult(req)
-	if req.resultErr != nil {
+	// Read the reply's error before releaseResult hands the request back to
+	// its pool, where the next command on any goroutine reuses it.
+	if werr := req.resultErr; werr != nil {
+		conn.releaseResult(req)
 		c.pool.discardCmd(conn)
-		return req.resultErr
+		return werr
 	}
+	conn.releaseResult(req)
 
 	tx := &Tx{
 		client: c,
