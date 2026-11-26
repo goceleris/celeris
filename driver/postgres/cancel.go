@@ -130,6 +130,12 @@ func (c *pgConn) cancelRunning() bool {
 // production.
 var testHookCtxWatch atomic.Pointer[func()]
 
+// testHookCtxWatchArmed, when set, runs at the end of armCtxWatch, once the
+// callback is registered with the context: a test that must end the context only
+// after the watch is armed (so that the callback is certain to be started, and the
+// statement's end certain to wait for it) gates on it. It is nil in production.
+var testHookCtxWatchArmed atomic.Pointer[func()]
+
 // ctxWatch is the wake of a direct conn's blocked read on the end of the
 // caller's context (armCtxWatch), the design of driver/redis's and
 // driver/memcached's armWake. It lives on the conn, and its callback is built
@@ -187,6 +193,9 @@ func (c *pgConn) armCtxWatch(ctx context.Context) bool {
 	}
 	w.fired = false
 	w.stop = context.AfterFunc(ctx, w.fn)
+	if h := testHookCtxWatchArmed.Load(); h != nil {
+		(*h)()
+	}
 	return true
 }
 

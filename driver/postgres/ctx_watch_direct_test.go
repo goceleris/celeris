@@ -643,14 +643,23 @@ func TestDirectCancelWatchCallbackInFlightWhenTheDrainBegins(t *testing.T) {
 	requireCleanOrReplaced(t, f, p, 1, false)
 }
 
-// The context ends at the instant the reply arrives, 20,000 times, so that the
-// callback of the watch, the read and the end of the statement race. After each
-// statement the next one, on a background context, returns ITS OWN marker; the
-// conn is clean (reused) or replaced, never poisoned; no statement fails but with
-// the context's error. Every callback that ran is a pass through the wait of
-// settleCtxWatch (stopping it had failed), and the test requires that a large
-// share of the iterations went through it, so that it cannot pass without
-// racing what it is about.
+// The context ends around the instant the reply arrives, 20,000 times, so that
+// the callback of the watch, the read and the end of the statement race. After
+// each statement the next one, on a background context, returns ITS OWN marker; no
+// statement fails but with the context's error. Whether the conn was reused or
+// replaced is logged, not asserted.
+//
+// A third of the iterations (mode 0) end the context from the backend after the
+// statement has arrived and the watch is armed (gated on testHookCtxWatchArmed, so
+// the order does not depend on how the runner schedules the two goroutines) and
+// before the reply is written: stopping the watch then almost always fails, so the
+// callback runs and settleCtxWatch must wait for it. The other two thirds (the
+// context ends right after the reply, and 10 us after) are the free race. Every
+// iteration is asserted for correctness (own marker, only the context's error);
+// the number of callbacks is logged, and only a sanity floor is asserted (see the
+// end). The earlier form of this test asserted that half of ALL iterations ran the
+// callback, which is a race outcome (about 45% in a loaded linux container) and
+// failed the test without a bug.
 func TestDirectStaleCancelNeverPoisonsTheNextStatement(t *testing.T) {
 	iters := 20000
 	if testing.Short() {
@@ -662,37 +671,78 @@ func TestDirectStaleCancelNeverPoisonsTheNextStatement(t *testing.T) {
 	count := func() { ran.Add(1) }
 	testHookCtxWatch.Store(&count)
 	t.Cleanup(func() { testHookCtxWatch.Store(nil) })
+	armedCh := make(chan struct{}, 1)
+	armed := func() {
+		select {
+		case armedCh <- struct{}{}:
+		default:
+		}
+	}
+	testHookCtxWatchArmed.Store(&armed)
+	t.Cleanup(func() { testHookCtxWatchArmed.Store(nil) })
 	var cur atomic.Pointer[context.CancelFunc]
 	var mode atomic.Int64
+	var gateTimedOut atomic.Bool
+	// What the backend does for the statement it is serving is fixed when the
+	// statement reaches it: the backend finishes the reply (afterReply) while the
+	// client is already starting the next iteration, so reading cur or mode there
+	// would act on the next statement.
+	type plan struct {
+		cf   context.CancelFunc
+		mode int64
+	}
+	var serving atomic.Pointer[plan]
 	onQuery := func(q string) {
-		if mode.Load() == 0 {
-			if cf := cur.Load(); cf != nil {
-				(*cf)()
+		cf := cur.Load()
+		if cf == nil { // the innocent statement: a background context, never armed
+			serving.Store(nil)
+			return
+		}
+		pl := &plan{cf: *cf, mode: mode.Load()}
+		serving.Store(pl)
+		if pl.mode == 0 {
+			select {
+			case <-armedCh:
+			case <-time.After(10 * time.Second):
+				gateTimedOut.Store(true)
 			}
+			pl.cf()
 		}
 	}
 	afterReply := func(q string) {
-		if mode.Load() == 1 {
-			if cf := cur.Load(); cf != nil {
-				(*cf)()
-			}
-		} else if mode.Load() == 2 {
+		pl := serving.Load()
+		if pl == nil {
+			return
+		}
+		switch pl.mode {
+		case 1:
+			pl.cf()
+		case 2:
 			spin(10 * time.Microsecond)
-			if cf := cur.Load(); cf != nil {
-				(*cf)()
-			}
+			pl.cf()
 		}
 	}
 	f.onQuery.Store(&onQuery)
 	f.afterReply.Store(&afterReply)
-	var cancelled, succeeded, other int
+	var cancelled, succeeded, other, gated, gatedRan int
 	var firstOther error
+	fail := func(err error) {
+		other++
+		if firstOther == nil {
+			firstOther = err
+		}
+	}
 	watchdog(t, 280*time.Second, "the stale-cancel loop", func() {
 		for i := range iters {
 			mode.Store(int64(i % 3))
+			select { // an arming left over from the previous iteration
+			case <-armedCh:
+			default:
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			cur.Store(&cancel)
 			want := fmt.Sprintf("a%d", i)
+			before := ran.Load()
 			got, err := marker(ctx, p, want)
 			cancel()
 			switch {
@@ -701,9 +751,12 @@ func TestDirectStaleCancelNeverPoisonsTheNextStatement(t *testing.T) {
 			case errors.Is(err, context.Canceled):
 				cancelled++
 			default:
-				other++
-				if firstOther == nil {
-					firstOther = fmt.Errorf("iteration %d: got %q, %v", i, got, err)
+				fail(fmt.Errorf("iteration %d: got %q, %v", i, got, err))
+			}
+			if i%3 == 0 {
+				gated++
+				if ran.Load() > before {
+					gatedRan++
 				}
 			}
 			cur.Store(nil)
@@ -711,22 +764,28 @@ func TestDirectStaleCancelNeverPoisonsTheNextStatement(t *testing.T) {
 			want = fmt.Sprintf("b%d", i)
 			got, err = marker(context.Background(), p, want)
 			if err != nil || got != want {
-				other++
-				if firstOther == nil {
-					firstOther = fmt.Errorf("iteration %d: the next statement returned %q, %v (want %q)", i, got, err, want)
-				}
+				fail(fmt.Errorf("iteration %d: the next statement returned %q, %v (want %q)", i, got, err, want))
 				break
 			}
 		}
 	})
+	t.Logf("%d iterations: %d returned a result, %d the context's error; the callback ran in %d (all %d of %d gated iterations); sessions %d, cancel requests %d",
+		iters, succeeded, cancelled, ran.Load(), gatedRan, gated, f.sessionCount(), f.cancelCount())
+	if gateTimedOut.Load() {
+		t.Fatal("the watch was not armed within 10 s of the statement reaching the backend")
+	}
 	if other > 0 {
 		t.Fatalf("%d statements failed or returned a wrong marker; the first: %v", other, firstOther)
 	}
-	fired := ran.Load()
-	t.Logf("%d iterations: %d returned a result, %d the context's error; the callback of the watch ran in %d; sessions %d, cancel requests %d",
-		iters, succeeded, cancelled, fired, f.sessionCount(), f.cancelCount())
-	if fired < int64(iters)/2 {
-		t.Fatalf("the callback ran in %d of %d iterations: the test does not exercise the wait of settleCtxWatch", fired, iters)
+	// Sanity of the gate, not a measure of the race: in all but a few of the gated
+	// iterations the callback runs (it does not when the first look of the loop at
+	// the context, right after the watch is armed, lands inside cancel() itself,
+	// after it set the error and before it cancelled the AfterFunc child: stop() then
+	// wins; 9 of 6,667 in a loaded linux container). The bar is half of them, which
+	// fails only if the gate stopped working; the wait of settleCtxWatch is asserted
+	// deterministically by the in-flight tests above.
+	if gatedRan*2 < gated {
+		t.Fatalf("the callback ran in %d of %d gated iterations: the gate does not put the cancel after the arming", gatedRan, gated)
 	}
 }
 
