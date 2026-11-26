@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/goceleris/celeris/driver/internal/async"
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/driver/memcached/protocol"
 )
 
@@ -271,6 +272,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			req = head.(*mcRequest)
 			s.pendingGet = req
 		}
+		eventloop.DispatchPause()
 		item := valueItem{
 			Key:   string(v.Key),
 			Flags: v.Flags,
@@ -288,6 +290,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 				// Bridge head drift would indicate a framing bug — fail loud.
 				return errors.New("celeris-memcached: bridge head mismatch on END")
 			}
+			eventloop.DispatchPause()
 			req.status = protocol.KindEnd
 			req.finish()
 			return nil
@@ -298,6 +301,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			if popped := s.bridge.Pop(); popped != req {
 				return errors.New("celeris-memcached: bridge head mismatch on END")
 			}
+			eventloop.DispatchPause()
 			req.status = protocol.KindEnd
 			req.finish()
 			return nil
@@ -309,6 +313,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			return errors.New("celeris-memcached: unexpected END with empty queue")
 		}
 		req := head.(*mcRequest)
+		eventloop.DispatchPause()
 		req.status = protocol.KindEnd
 		req.finish()
 		return nil
@@ -322,6 +327,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			req = head.(*mcRequest)
 			s.pendingStats = req
 		}
+		eventloop.DispatchPause()
 		req.stats = append(req.stats, statItem{
 			Name:  string(v.Key),
 			Value: string(v.Data),
@@ -335,6 +341,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 		return errors.New("celeris-memcached: unexpected server reply with empty queue")
 	}
 	req := head.(*mcRequest)
+	eventloop.DispatchPause()
 	req.status = v.Kind
 	switch v.Kind {
 	case protocol.KindNumber:
@@ -381,6 +388,7 @@ func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 		return errors.New("celeris-memcached: unexpected server reply with empty queue")
 	}
 	req := head.(*mcRequest)
+	eventloop.DispatchPause()
 	if req.kind == kindBinaryMulti {
 		return s.dispatchBinaryMulti(req, p)
 	}
