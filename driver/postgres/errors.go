@@ -63,9 +63,9 @@ var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transacti
 // large result and have no cap.
 //
 // The caller reads the rows that fit under the cap and then gets this error
-// from [Rows.Err]. [Rows.Next] only returns false and [Rows.Close] returns nil,
-// so a caller that does not check Rows.Err sees a truncated result with no other
-// sign: always check it. A single row larger than the cap fails the query
+// from [Rows.Err]. [Rows.Next] only returns false, and [Rows.Close] returns the
+// same error (before v1.6.0 it returned nil), so a caller that checks neither
+// sees a truncated result with no other sign: always check Rows.Err. A single row larger than the cap fails the query
 // itself: the call returns this error and no rows. The rest of the reply is
 // read and discarded, so the connection stays usable. The cap is fixed: there
 // is no option and no DSN parameter for it.

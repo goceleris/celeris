@@ -83,11 +83,17 @@ func (r *pgRows) Columns() []string {
 	return out
 }
 
+// Close releases the rows. It returns the error the result ended with, the one
+// Next returns after the last buffered row (a connection lost mid-result, a
+// server error after some rows, ErrResultTooBig), so a caller that stops after
+// the rows it wants (database/sql's Row.Scan reads one row and closes) still
+// sees that the result did not end cleanly. A second Close returns nil.
 func (r *pgRows) Close() error {
 	if r.closed {
 		return nil
 	}
 	r.closed = true
+	err := r.err
 	r.rows = nil
 	r.columns = nil
 	r.err = nil
@@ -99,7 +105,7 @@ func (r *pgRows) Close() error {
 	// Return the pgRows struct itself to the pool. idx/textFormat are
 	// overwritten on the next Get.
 	pgRowsPool.Put(r)
-	return nil
+	return err
 }
 
 // Next decodes the next row into dest. Returns io.EOF at end, or a deferred
@@ -341,7 +347,11 @@ func (r *streamRows) Next(dest []driver.Value) error {
 }
 
 // Close drains any remaining rows from the channel, waits for the request
-// to fully complete (ReadyForQuery), and releases the backing pgRequest.
+// to fully complete (ReadyForQuery), and releases the backing pgRequest. It
+// returns the error the result ended with (a connection lost mid-result, a
+// server error), so a caller that stops early (database/sql's Row.Scan reads one
+// row and closes) still sees that the result did not end cleanly. A second Close
+// returns nil.
 func (r *streamRows) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
@@ -354,13 +364,14 @@ func (r *streamRows) Close() error {
 	if ep := r.errVal.Load(); ep != nil && *ep != nil && r.err == nil {
 		r.err = *ep
 	}
+	err := r.err
 	req := r.req
 	r.req = nil
 	r.columns = nil
 	if req != nil {
 		releasePgRequest(req)
 	}
-	return nil
+	return err
 }
 
 // ColumnTypeScanType returns the Go type the i-th column will decode into.

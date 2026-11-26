@@ -649,7 +649,11 @@ func (r *Rows) Columns() []string {
 	return r.inner.Columns()
 }
 
-// Close releases resources and returns the conn to the pool. A statement that
+// Close releases resources and returns the conn to the pool. It returns the
+// error the result ended with when iteration did not read it (a caller that
+// stopped after the rows it wanted): a connection lost before the result was
+// complete (matches [ErrClosed] and [io.ErrUnexpectedEOF]), a server error after
+// some rows, [ErrResultTooBig]. Before v1.6.0 that error was dropped here. A statement that
 // left a transaction open on the conn (Query "BEGIN") makes Close return
 // [ErrTxLeftOpen] after discarding the conn. Close is idempotent: every call
 // after the first returns nil and does nothing (so ErrTxLeftOpen is reported
@@ -802,9 +806,9 @@ func (r *Rows) Scan(dest ...any) error {
 
 // Err returns the first non-EOF error encountered during iteration. It is still
 // that error after Close. Always check it after the loop: on a direct-mode Pool
-// it is the only place that reports [ErrResultTooBig] (Next just returns false
-// and Close returns nil), and a server error that arrives after some rows is
-// reported here too.
+// it reports [ErrResultTooBig] (Next just returns false; Close returns it too),
+// and a server error that arrives after some rows, or a connection lost before
+// the result was complete, is reported here too.
 func (r *Rows) Err() error {
 	r.closemu.RLock()
 	defer r.closemu.RUnlock()
