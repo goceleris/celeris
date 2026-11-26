@@ -53,8 +53,9 @@ var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transacti
 // and, rarely, the sync fast path of an event-loop Pool while one poll reads
 // past the cap. A Pool opened with [WithEngine] on a server that has not started
 // yet (or that runs the std engine without async handlers), and a *sql.DB opened
-// with this driver with no engine, on the std engine or on a server that had not
-// started when the Connector connected, run on the event loop: they stream a
+// with this driver with no engine, on the std engine or bound to a server that
+// had not started when the Connector was bound with [Connector.WithEngine], run
+// on the event loop: they stream a
 // large result and have no cap.
 //
 // The caller reads the rows that fit under the cap and then gets this error
@@ -86,11 +87,13 @@ var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-
 // adaptive server gets direct-mode connections too (see [Connector.WithEngine]),
 // so LISTEN and UNLISTEN return this error there.
 //
-// Workarounds: open the pool against an engine with AsyncHandlers=false
-// (drivers will pick the mini-loop path which has an always-on reader),
-// or use a separate non-pooled listener conn dedicated to
-// LISTEN/NOTIFY in a non-async configuration.
-var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; use a non-async engine pool or a dedicated listener conn")
+// Workarounds: run the listener on the driver's own event loop, which has an
+// always-on reader: a [Pool] opened with [WithEngine] on a server that has not
+// started yet (and runs no async handlers), or a [Connector] with no engine or
+// bound with [Connector.WithEngine] before the server starts. A Connector bound
+// to a started epoll, io_uring or adaptive server does not help.
+var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; " +
+	"use a Pool on a server that has not started, or a Connector with no engine or bound before the server starts")
 
 // PGError is a server-sent ErrorResponse. Match it with errors.As.
 //

@@ -287,9 +287,11 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 // loopLacksSyncPath reports whether a connection dialled now through prov
 // must be dialled direct (dialDirectConn, Go's netpoll) because the caller is a
 // handler that runs on the engine's own worker and prov has no synchronous
-// round trip for it. It is the one rule that [Pool] and [Connector] share, read
-// at each dial: the answer depends on the provider the dial would use, which
-// changes when a server starts.
+// round trip for it. It is the one rule that [Pool] and [Connector] share. The
+// provider is fixed when the Pool or Connector is built (WithEngine takes the
+// server's loops then, or the driver's own loop when the server has not
+// started); the rule is evaluated at each dial against that provider's current
+// state.
 //
 // The engine's WorkerLoop(0) (io_uring, epoll, adaptive) does not implement
 // syncRoundTripper, and without a sync path the driver's async write plus

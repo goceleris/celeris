@@ -85,10 +85,15 @@ func newConnector(dsn string) (*Connector, error) {
 //
 // A direct connection has the limits of a direct-mode Pool: a context that is
 // cancelled with no deadline does not interrupt a statement that is running
-// (a deadline does), a result is read whole and fails with [ErrResultTooBig]
-// past 64 MiB (so there is no row streaming), LISTEN and UNLISTEN fail with
-// [ErrDirectModeUnsupported], and [Connector.WithSocketBusyPoll] has no effect,
-// as the connection is not on an event loop.
+// (a deadline does, and the error is the context's, context.DeadlineExceeded,
+// not a *PGError with SQLSTATE 57014), a result is read whole and fails with
+// [ErrResultTooBig] past 64 MiB (so there is no row streaming), LISTEN and
+// UNLISTEN fail with [ErrDirectModeUnsupported], and
+// [Connector.WithSocketBusyPoll] has no effect, as the connection is not on an
+// event loop. The mode follows the server, not the caller: a background
+// goroutine that uses the Connector gets the same connections. To keep
+// streaming and the loop's behaviour, bind the Connector before the server
+// starts, or use no engine.
 func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 	clone := &Connector{dsn: c.dsn, engine: sp, busyPoll: c.busyPoll}
 	if sp != nil {
@@ -131,9 +136,10 @@ func (c *Connector) WithSocketBusyPoll(d time.Duration) *Connector {
 // inline on one of those workers, and a handler that opens a connection would
 // wait for the startup reply on the very worker that has to read it. Such a
 // connection is dialled direct (Go's netpoll, like a Pool's), by the rule a
-// [Pool] applies (loopLacksSyncPath), evaluated at each Connect, so a Connector
-// built before the server starts, or on the std engine, or without an engine,
-// keeps its connections on the driver's own loop.
+// [Pool] applies (loopLacksSyncPath). The provider is fixed when the Connector
+// is bound ([Connector.WithEngine]); the rule is evaluated at each Connect
+// against it, so a Connector bound before the server starts, or on the std
+// engine, or without an engine, keeps its connections on the driver's own loop.
 func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	prov, owns, err := c.ensureProvider()
 	if err != nil {
