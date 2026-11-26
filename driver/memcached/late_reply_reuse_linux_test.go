@@ -306,10 +306,10 @@ func TestLateReplyDoesNotReachAReusedRequest(t *testing.T) {
 	var targets []target
 	fake := startFake(t)
 	targets = append(targets, target{"fake/text", fake.Addr(), ProtocolText})
-	if real := strings.TrimSpace(os.Getenv("CELERIS_MEMCACHED_ADDR")); real != "" {
+	if realAddr := strings.TrimSpace(os.Getenv("CELERIS_MEMCACHED_ADDR")); realAddr != "" {
 		targets = append(targets,
-			target{"real/text", real, ProtocolText},
-			target{"real/binary", real, ProtocolBinary})
+			target{"real/text", realAddr, ProtocolText},
+			target{"real/binary", realAddr, ProtocolBinary})
 	}
 	delays := []time.Duration{300 * time.Microsecond, 5 * time.Millisecond}
 	for _, tg := range targets {
@@ -343,10 +343,10 @@ func TestNoLateWriterOnDirectAndEngineClients(t *testing.T) {
 			})
 		}
 	}
-	if real := strings.TrimSpace(os.Getenv("CELERIS_MEMCACHED_ADDR")); real != "" {
+	if realAddr := strings.TrimSpace(os.Getenv("CELERIS_MEMCACHED_ADDR")); realAddr != "" {
 		for _, proto := range []Protocol{ProtocolText, ProtocolBinary} {
 			t.Run(fmt.Sprintf("real/%v/engine", proto), func(t *testing.T) {
-				tally := runLateReuseMode(t, real, proto, shapeDeadline, 300*time.Microsecond, reuseDuration(), "engine")
+				tally := runLateReuseMode(t, realAddr, proto, shapeDeadline, 300*time.Microsecond, reuseDuration(), "engine")
 				if v := tally.violations(); v != 0 {
 					t.Fatalf("%d wrong replies on an engine Client", v)
 				}

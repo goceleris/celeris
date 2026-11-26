@@ -198,8 +198,8 @@ func TestHarshLateReplyReuse(t *testing.T) {
 	}
 	budget := harshCallBudget()
 	targets := []target{{"fake/text", startFake(t).Addr(), ProtocolText}}
-	if real := strings.TrimSpace(os.Getenv("CELERIS_MEMCACHED_ADDR")); real != "" {
-		targets = append(targets, target{"real/text", real, ProtocolText}, target{"real/binary", real, ProtocolBinary})
+	if realAddr := strings.TrimSpace(os.Getenv("CELERIS_MEMCACHED_ADDR")); realAddr != "" {
+		targets = append(targets, target{"real/text", realAddr, ProtocolText}, target{"real/binary", realAddr, ProtocolBinary})
 	}
 	for _, tg := range targets {
 		for _, path := range []string{"loop", "std", "direct"} {
