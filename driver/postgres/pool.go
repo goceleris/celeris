@@ -650,10 +650,12 @@ func (r *Rows) Columns() []string {
 }
 
 // Close releases resources and returns the conn to the pool. It returns the
-// error the result ended with when iteration did not read it (a caller that
-// stopped after the rows it wanted): a connection lost before the result was
-// complete (matches [ErrClosed] and [io.ErrUnexpectedEOF]), a server error after
-// some rows, [ErrResultTooBig]. Before v1.6.0 that error was dropped here. A statement that
+// error the result ended with, whether or not iteration read it: the one [Rows.Err]
+// reports after a loop that ran to the end (the first Close then returns it as well)
+// and the one a caller that stopped after the rows it wanted would otherwise never
+// see (database/sql's Row.Scan relies on this). It is a connection lost before the
+// result was complete (matches [ErrClosed] and [io.ErrUnexpectedEOF]), a server
+// error after some rows, or [ErrResultTooBig]. Before v1.6.0 Close dropped it. A statement that
 // left a transaction open on the conn (Query "BEGIN") makes Close return
 // [ErrTxLeftOpen] after discarding the conn. Close is idempotent: every call
 // after the first returns nil and does nothing (so ErrTxLeftOpen is reported
