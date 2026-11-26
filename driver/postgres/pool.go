@@ -284,6 +284,35 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	return p, nil
 }
 
+// loopLacksSyncPath reports whether a connection dialled now through prov
+// must be dialled direct (dialDirectConn, Go's netpoll) because the caller is a
+// handler that runs on the engine's own worker and prov has no synchronous
+// round trip for it. It is the one rule that [Pool] and [Connector] share, read
+// at each dial: the answer depends on the provider the dial would use, which
+// changes when a server starts.
+//
+// The engine's WorkerLoop(0) (io_uring, epoll, adaptive) does not implement
+// syncRoundTripper, and without a sync path the driver's async write plus
+// channel wait deadlocks on inline handlers: the engine worker is the
+// goroutine executing the handler (LockOSThread'd), so when wait() parks on
+// doneCh the M sits idle and never drains the read that carries PostgreSQL's
+// reply. The driver's own loop (Linux) does have the sync path; so does no
+// provider at all (false: nothing to inspect).
+//
+// A caller that does not run on an engine worker (no engine, or a handler on
+// an unlocked goroutine) decides that before it asks.
+func loopLacksSyncPath(prov engine.EventLoopProvider) bool {
+	if prov == nil {
+		return false
+	}
+	wl := prov.WorkerLoop(0)
+	if wl == nil {
+		return false
+	}
+	_, ok := wl.(syncRoundTripper)
+	return !ok
+}
+
 func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	// Direct mode when the caller runs on an unlocked G: standalone
 	// (no engine) or WithEngine on an engine that dispatches handlers
@@ -293,12 +322,9 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	directMode := !p.hasEngine || p.asyncEngine
 
 	// Additional case: WithEngine on an engine whose WorkerLoop does NOT
-	// implement syncRoundTripper (io_uring, epoll today). Without a sync
-	// path the driver's async write + channel-wait deadlocks on inline
-	// handlers: the engine worker is the goroutine executing the handler
-	// (LockOSThread'd), so when wait() parks on doneCh the M sits idle
-	// and never drains the CQE carrying PG's reply. Netpoll is M-safe,
-	// so direct mode sidesteps the deadlock with no correctness impact.
+	// implement syncRoundTripper (io_uring, epoll today): see
+	// loopLacksSyncPath. Netpoll is M-safe, so direct mode sidesteps the
+	// deadlock with no correctness impact.
 	if !directMode {
 		p.providerMu.RLock()
 		prov := p.provider
@@ -306,11 +332,7 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 		if prov == nil {
 			return nil, ErrPoolClosed
 		}
-		if wl := prov.WorkerLoop(0); wl != nil {
-			if _, ok := wl.(syncRoundTripper); !ok {
-				directMode = true
-			}
-		}
+		directMode = loopLacksSyncPath(prov)
 	}
 
 	if directMode {

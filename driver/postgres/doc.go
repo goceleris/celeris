@@ -21,7 +21,9 @@
 // pool shares the HTTP server's event loop instead of resolving a standalone
 // one; a bare [Open] and [WithEngine] on a server that has started or runs
 // async handlers give a direct-mode pool, whose results are capped at 64 MiB
-// (see [ErrResultTooBig]: always check [Rows.Err]).
+// (see [ErrResultTooBig]: always check [Rows.Err]). The same holds for the
+// connections of a [Connector] bound to a started epoll, io_uring or adaptive
+// server ([Connector.WithEngine] says which mode it uses when).
 // [WithWorker] adds a per-call worker-affinity hint to a context.
 //
 // Query with [Pool.QueryContext] (returns [*Rows]), [Pool.QueryRow]

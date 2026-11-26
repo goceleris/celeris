@@ -69,6 +69,26 @@ func newConnector(dsn string) (*Connector, error) {
 // The driver takes the server's event loop once, when it is opened: open it after
 // srv.Addr() is non-nil to share the server's loops; opened earlier it uses the
 // driver's own loop for its whole life.
+//
+// Which mode a connection uses is decided at each Connect:
+//
+//   - On the driver's own event loop: no engine, a server that has not started
+//     when the Connector was bound (also once it has started), and the std
+//     engine. Results stream and have no size cap.
+//   - Direct (Go's netpoll, the mode of a [Pool] on a started server): the
+//     Connector was bound to a started epoll, io_uring or adaptive server, whose
+//     workers run an inline handler on the worker's own thread, so a handler
+//     that opened a connection on the loop would wait for the startup reply on
+//     the worker that has to read it (the server stopped answering before
+//     v1.6.0). A handler on that server that is not inline (async) is direct
+//     too. A connection dialled before the server started stays on the loop.
+//
+// A direct connection has the limits of a direct-mode Pool: a context that is
+// cancelled with no deadline does not interrupt a statement that is running
+// (a deadline does), a result is read whole and fails with [ErrResultTooBig]
+// past 64 MiB (so there is no row streaming), LISTEN and UNLISTEN fail with
+// [ErrDirectModeUnsupported], and [Connector.WithSocketBusyPoll] has no effect,
+// as the connection is not on an event loop.
 func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 	clone := &Connector{dsn: c.dsn, engine: sp, busyPoll: c.busyPoll}
 	if sp != nil {
@@ -82,8 +102,8 @@ func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 }
 
 // WithSocketBusyPoll returns a Connector that is this one with d as the
-// SO_BUSY_POLL budget (Linux) of the connections it opens, all of which are
-// registered on an event loop. A budget of one microsecond or more sets it, in
+// SO_BUSY_POLL budget (Linux) of the connections it opens that are registered
+// on an event loop (a direct connection is not: see [Connector.WithEngine]). A budget of one microsecond or more sets it, in
 // whole microseconds, and wins over the server's; anything less (0, a negative
 // value) leaves it to the server's Config.SocketBusyPoll when the Connector is
 // bound with [Connector.WithEngine], else off, so it cannot turn off a server
@@ -104,12 +124,31 @@ func (c *Connector) WithSocketBusyPoll(d time.Duration) *Connector {
 // Connect returns a new driver.Conn. database/sql's pool reuses this
 // connector across all pooled conns, so we resolve the provider once and
 // share it for the connector's lifetime.
+//
+// A connection is registered on an event loop, except in one case: the
+// Connector took the loops of a started epoll, io_uring or adaptive server (they
+// have no synchronous round trip for a driver). A handler of that server runs
+// inline on one of those workers, and a handler that opens a connection would
+// wait for the startup reply on the very worker that has to read it. Such a
+// connection is dialled direct (Go's netpoll, like a Pool's), by the rule a
+// [Pool] applies (loopLacksSyncPath), evaluated at each Connect, so a Connector
+// built before the server starts, or on the std engine, or without an engine,
+// keeps its connections on the driver's own loop.
 func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	prov, owns, err := c.ensureProvider()
 	if err != nil {
 		return nil, err
 	}
-	_ = owns
+	// The driver's own loop (an unstarted server, the std engine, no engine)
+	// is not a worker of the server: nothing to deadlock on, and a connection
+	// stays on the loop it was dialled on.
+	if !owns && loopLacksSyncPath(prov) {
+		dc, err := dialDirectConn(ctx, c.dsn)
+		if err != nil {
+			return nil, err // not dc: a nil *pgConn would be a non-nil driver.Conn
+		}
+		return dc, nil
+	}
 	// Each conn releases the loop on Close if and only if the connector
 	// itself owns it — but we share one loop across all conns, so the
 	// refcount lives here, not on the conn. The pgConn's closeLoop is nil.

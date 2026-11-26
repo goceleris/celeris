@@ -47,27 +47,31 @@ var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transacti
 // exceeds the result buffer cap, 64 MiB (maxDirectResultBytes), on a path that
 // buffers the reply whole. Those paths are a direct-mode [Pool]: a bare
 // [Open](dsn), or [WithEngine] on a server that has started (epoll, io_uring,
-// adaptive) or that runs async handlers; and, rarely, the sync fast path of an
-// event-loop Pool while one poll reads past the cap. A Pool opened with
-// [WithEngine] on a server that has not started yet (or that runs the std
-// engine without async handlers) and a *sql.DB opened with this driver stream a
+// adaptive) or that runs async handlers; a *sql.DB opened with a [Connector]
+// bound by [Connector.WithEngine] to a server that has started (epoll, io_uring,
+// adaptive), whose connections are dialled direct (see [Connector.WithEngine]);
+// and, rarely, the sync fast path of an event-loop Pool while one poll reads
+// past the cap. A Pool opened with [WithEngine] on a server that has not started
+// yet (or that runs the std engine without async handlers), and a *sql.DB opened
+// with this driver with no engine, on the std engine or on a server that had not
+// started when the Connector connected, run on the event loop: they stream a
 // large result and have no cap.
 //
 // The caller reads the rows that fit under the cap and then gets this error
-// from [Rows.Err]. [Rows.Next] only returns false and [Rows.Close] returns nil,
-// so a caller that does not check Rows.Err sees a truncated result with no other
-// sign: always check it. A single row larger than the cap fails the query
-// itself: the call returns this error and no rows. The rest of the reply is
-// read and discarded, so the connection stays usable. The cap is fixed: there
-// is no option and no DSN parameter for it.
+// from [Rows.Err] (from sql.Rows.Err on a *sql.DB). [Rows.Next] only returns
+// false and [Rows.Close] returns nil, so a caller that does not check Rows.Err
+// sees a truncated result with no other sign: always check it. A single row
+// larger than the cap fails the query itself: the call returns this error and no
+// rows. The rest of the reply is read and discarded, so the connection stays
+// usable. The cap is fixed: there is no option and no DSN parameter for it.
 //
-// To read a larger result use [Pool.CopyTo], a cursor (DECLARE and FETCH n)
-// inside [Pool.BeginTx], a Pool on the event loop (WithEngine on a server that
-// has not started yet), or database/sql, all of which stream; or paginate the
-// query with LIMIT/OFFSET or keyset paging. Before v1.6.0 a direct-mode Pool
-// buffered the whole reply (several times its size in memory) before it
-// returned this error.
-var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate or use streaming mode")
+// To read a larger result paginate the query with LIMIT/OFFSET or keyset
+// paging; a cursor (DECLARE and FETCH n) inside a transaction does not buffer
+// the whole result either, and neither does [Pool.CopyTo] on a Pool. A Pool on
+// the event loop (WithEngine on a server that has not started yet) streams as
+// well. Before v1.6.0 a direct-mode Pool buffered the whole reply (several times
+// its size in memory) before it returned this error.
+var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate the query")
 
 // ErrDirectModeUnsupported is returned by operations that rely on
 // unsolicited server messages between queries — LISTEN/UNLISTEN/NOTIFY
@@ -77,6 +81,10 @@ var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-
 // async-delivered message is silently dropped. COPY FROM/TO is
 // supported via a short-lived per-call reader goroutine; only the
 // persistent-listener class of operations returns this error.
+//
+// A *sql.DB opened with a [Connector] bound to a started epoll, io_uring or
+// adaptive server gets direct-mode connections too (see [Connector.WithEngine]),
+// so LISTEN and UNLISTEN return this error there.
 //
 // Workarounds: open the pool against an engine with AsyncHandlers=false
 // (drivers will pick the mini-loop path which has an always-on reader),
