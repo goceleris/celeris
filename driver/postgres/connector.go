@@ -100,7 +100,7 @@ func (c *Connector) clone() *Connector {
 // srv.Addr() is non-nil to share the server's loops; opened earlier it uses the
 // driver's own loop for its whole life.
 //
-// Which mode a connection uses is decided at each Connect:
+// With [Connector.WithStreaming] the mode is decided at each Connect:
 //
 //   - On the driver's own event loop: no engine, a server that has not started
 //     when the Connector was bound (also once it has started), and the std
@@ -113,17 +113,18 @@ func (c *Connector) clone() *Connector {
 //     v1.6.0). A handler on that server that is not inline (async) is direct
 //     too. A connection dialled before the server started stays on the loop.
 //
-// A direct connection has the limits of a direct-mode Pool: a context that is
-// cancelled with no deadline does not interrupt a statement that is running
-// (a deadline does, and the error is the context's, context.DeadlineExceeded,
-// not a *PGError with SQLSTATE 57014), a result is read whole and fails with
-// [ErrResultTooBig] past 64 MiB (so there is no row streaming), LISTEN and
-// UNLISTEN fail with [ErrDirectModeUnsupported], and
+// A direct connection (that one, and every connection of a Connector without
+// WithStreaming) has the limits of a direct-mode Pool: a context that ends, by a
+// deadline or a cancel, ends the statement, and the call returns the context's
+// error (context.DeadlineExceeded, context.Canceled), not a *PGError with
+// SQLSTATE 57014; a result is read whole and fails with [ErrResultTooBig] past
+// the cap (64 MiB by default, see [Connector.WithMaxResultBytes]), so there is
+// no row streaming; LISTEN and UNLISTEN fail with [ErrDirectModeUnsupported]; and
 // [Connector.WithSocketBusyPoll] has no effect, as the connection is not on an
 // event loop. The mode follows the server, not the caller: a background
 // goroutine that uses the Connector gets the same connections. To keep
-// streaming and the loop's behaviour, bind the Connector before the server
-// starts, or use no engine.
+// streaming and the loop's behaviour with WithStreaming, bind the Connector
+// before the server starts, or use no engine.
 func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 	clone := c.clone()
 	clone.engine = sp
@@ -238,6 +239,15 @@ func (c *Connector) WithStreaming() *Connector {
 func (c *Connector) WithMaxResultBytes(n int) *Connector {
 	clone := c.clone()
 	clone.maxResultBytes, clone.maxResultSet = n, true
+	// Keep the loops WithEngine took from a server, as WithStreaming and
+	// WithSocketBusyPoll do: without them Connect would resolve the driver's own
+	// loop and a Connector bound to a started server would stream on it instead of
+	// dialling direct.
+	c.provMu.Lock()
+	if c.provider != nil && !c.ownsLoop {
+		clone.provider = c.provider
+	}
+	c.provMu.Unlock()
 	return clone
 }
 

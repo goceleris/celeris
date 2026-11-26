@@ -623,3 +623,60 @@ func TestConnectorAfterServerShutdown(t *testing.T) {
 		})
 	}
 }
+
+// TestConnectorStartedServerKeepsTheCapThroughTheChain: a Connector WithStreaming
+// bound to a started epoll server dials direct, and WithMaxResultBytes, in either
+// order after WithEngine, keeps it so (it must not fall back to the driver's own
+// loop, where a result streams with no cap): a 70 MB result under an 8 MiB cap
+// stops at the cap with ErrResultTooBig, every attempt.
+func TestConnectorStartedServerKeepsTheCapThroughTheChain(t *testing.T) {
+	dsn := cseDSN(t)
+	const nrows = 70000 // 70000 rows of 1000 bytes
+	const q = "SELECT repeat('x', 1000) FROM generate_series(1, 70000)"
+	const capBytes = 8 << 20
+	for _, order := range []string{"streaming-then-cap", "cap-then-streaming"} {
+		t.Run(order, func(t *testing.T) {
+			srv := celeris.New(celeris.Config{Engine: celeris.Epoll, Addr: "127.0.0.1:0", Workers: 2})
+			srv.GET("/", func(c *celeris.Context) error { return c.String(200, "ok") })
+			cseStart(t, srv, true)
+			cn, err := pg.NewConnector(dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cn = cn.WithEngine(srv)
+			if order == "streaming-then-cap" {
+				cn = cn.WithStreaming().WithMaxResultBytes(capBytes)
+			} else {
+				cn = cn.WithMaxResultBytes(capBytes).WithStreaming()
+			}
+			db := sql.OpenDB(cn)
+			defer func() {
+				_ = db.Close()
+				sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = srv.Shutdown(sctx)
+			}()
+			for attempt := 1; attempt <= 3; attempt++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				rows, err := db.QueryContext(ctx, q)
+				if err != nil {
+					cancel()
+					t.Fatalf("attempt %d: %v", attempt, err)
+				}
+				n := 0
+				for rows.Next() {
+					n++
+				}
+				err = rows.Err()
+				_ = rows.Close()
+				cancel()
+				if !errors.Is(err, pg.ErrResultTooBig) {
+					t.Fatalf("attempt %d: %d rows and error %v, want ErrResultTooBig (a loop connection would stream all %d)", attempt, n, err, nrows)
+				}
+				if n == 0 || n > capBytes/1000+1 {
+					t.Fatalf("attempt %d: %d rows before the cap, want about %d", attempt, n, capBytes/1000)
+				}
+			}
+		})
+	}
+}
