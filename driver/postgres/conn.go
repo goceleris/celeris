@@ -665,16 +665,18 @@ func (r *pgRequest) closeColsCh() {
 	r.chMu.Unlock()
 }
 
-// prepareState drives a Parse + Describe S + Sync exchange. Unlike
-// ExtendedQueryState, it does not expect a Bind or Execute.
+// prepareState drives a Parse + Describe S + Sync exchange, or, with closing
+// set, a Close S + Sync exchange. Unlike ExtendedQueryState, it does not expect
+// a Bind or Execute.
 type prepareState struct {
-	name   string
-	query  string
-	params []uint32
-	cols   []protocol.ColumnDesc
-	err    *protocol.PGError
+	name    string
+	query   string
+	params  []uint32
+	cols    []protocol.ColumnDesc
+	err     *protocol.PGError
+	closing bool
 	// phase:
-	//   0: expecting ParseComplete
+	//   0: expecting ParseComplete (CloseComplete when closing)
 	//   1: expecting ParameterDescription
 	//   2: expecting RowDescription / NoData
 	//   3: expecting ReadyForQuery
@@ -682,21 +684,52 @@ type prepareState struct {
 }
 
 // handlePrepare processes a single server message for a prepare exchange.
-// Returns done=true on ReadyForQuery.
+// It returns done=true, with the server's error if there was one, on
+// ReadyForQuery. A message the exchange does not expect at this point, or a
+// ReadyForQuery before the reply is complete, returns (false, err): the reply
+// stream no longer matches the queue and the caller fails the conn
+// (failDesync). After an ErrorResponse the server skips to Sync and sends only
+// the ReadyForQuery.
 func (p *prepareState) handlePrepare(msgType byte, payload []byte) (bool, error) {
 	switch msgType {
+	case protocol.BackendNoticeResponse, protocol.BackendParameterStatus, protocol.BackendNotification:
+		return false, nil
 	case protocol.BackendErrorResponse:
-		p.err = protocol.ParseErrorResponse(payload)
+		if p.err == nil { // a FATAL after an ERROR: the first error is the one the caller gets
+			p.err = protocol.ParseErrorResponse(payload)
+		}
 		return false, nil
 	case protocol.BackendReadyForQuery:
 		if p.err != nil {
 			return true, p.err
 		}
+		if p.phase != 3 {
+			return false, fmt.Errorf("celeris-postgres: unexpected ReadyForQuery in prepare (phase=%d)", p.phase)
+		}
 		return true, nil
+	}
+	if p.err != nil {
+		// After an ErrorResponse the server skips to Sync and sends nothing but
+		// ReadyForQuery.
+		return false, fmt.Errorf("celeris-postgres: unexpected message %q in prepare after an ErrorResponse", msgType)
+	}
+	switch msgType {
 	case protocol.BackendParseComplete:
+		if p.closing || p.phase != 0 {
+			break
+		}
 		p.phase = 1
 		return false, nil
+	case protocol.BackendCloseComplete:
+		if !p.closing || p.phase != 0 {
+			break
+		}
+		p.phase = 3
+		return false, nil
 	case protocol.BackendParameterDesc:
+		if p.phase != 1 {
+			break
+		}
 		oids, err := protocol.ParseParameterDescription(payload)
 		if err != nil {
 			return false, err
@@ -705,6 +738,9 @@ func (p *prepareState) handlePrepare(msgType byte, payload []byte) (bool, error)
 		p.phase = 2
 		return false, nil
 	case protocol.BackendRowDescription:
+		if p.phase != 2 {
+			break
+		}
 		cols, err := protocol.ParseRowDescription(payload)
 		if err != nil {
 			return false, err
@@ -713,14 +749,14 @@ func (p *prepareState) handlePrepare(msgType byte, payload []byte) (bool, error)
 		p.phase = 3
 		return false, nil
 	case protocol.BackendNoData:
+		if p.phase != 2 {
+			break
+		}
 		p.cols = nil
 		p.phase = 3
 		return false, nil
-	case protocol.BackendNoticeResponse, protocol.BackendParameterStatus, protocol.BackendNotification:
-		return false, nil
 	}
-	// Ignore anything unexpected (we may see out-of-band notifications).
-	return false, nil
+	return false, fmt.Errorf("celeris-postgres: unexpected message %q in prepare (phase=%d)", msgType, p.phase)
 }
 
 // pgConn is a single PostgreSQL connection driven by an event loop.
@@ -1685,6 +1721,10 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		// closure-pair allocation the previous inline funcs paid (-2
 		// allocs/op on the hot path; see PR description for full delta).
 		done, err := head.simple.Handle(msgType, payload, head)
+		if err != nil && !done {
+			// The reply stopped matching the queue: the conn is dead.
+			return c.failDesync(head, msgType, err)
+		}
 		if done && err == nil && head.simple.MultiSet {
 			// More than one statement returned rows. The whole reply has been
 			// read, up to this ReadyForQuery, so the conn is clean for the next
@@ -1719,6 +1759,10 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		// shared OnRow method — same allocation-free dispatch as the
 		// simple-query branch.
 		done, err := head.extended.Handle(msgType, payload, head)
+		if err != nil && !done {
+			head.setResultIfLive("", head.extended.Columns)
+			return c.failDesync(head, msgType, err)
+		}
 		if err != nil {
 			// A server error after some rows: those rows are returned with
 			// the error, and they need the column description of the
@@ -1754,6 +1798,9 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		}
 	case reqPrepare:
 		done, err := head.prep.handlePrepare(msgType, payload)
+		if err != nil && !done {
+			return c.failDesync(head, msgType, err)
+		}
 		if err != nil {
 			head.doneMu.Lock()
 			head.err = err
@@ -1765,6 +1812,9 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		}
 	case reqCopyIn:
 		done, err := head.copyIn.Handle(msgType, payload)
+		if err != nil && !done {
+			return c.failDesync(head, msgType, err)
+		}
 		if err != nil {
 			c.popHead()
 			head.fail(err)
@@ -1808,6 +1858,9 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 				head.doneMu.Unlock()
 			}
 		})
+		if err != nil && !done {
+			return c.failDesync(head, msgType, err)
+		}
 		if err != nil {
 			c.popHead()
 			head.fail(err)
@@ -1827,6 +1880,80 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		}
 	}
 	return nil
+}
+
+// failDesync is the one place a request's reply stops matching the queue: a
+// state machine met a message it does not expect for the request at the head
+// (msgType, with cause saying why), or a ReadyForQuery that ends some other
+// exchange. The conn can no longer tell whose reply is whose, so it is dead:
+// it is marked closed, the head fails with an error that says why, and
+// dispatchHead returns an error that onRecv hands to failAll, which fails every
+// request still queued with a plain closed-connection error. The pool discards
+// a closed conn on release and dials a replacement.
+//
+// closed is set before the head's caller is woken. head.fail wakes it, the
+// caller releases the conn, and a release that still saw closed == false would
+// put the conn back for the next query, whose request would then be handed what
+// is left of this reply.
+//
+// A server error at ReadyForQuery (Handle returns done=true with the
+// *PGError) is not this: the reply is complete and in step, and the conn lives.
+func (c *pgConn) failDesync(head *pgRequest, msgType byte, cause error) error {
+	c.closed.Store(true)
+	var headErr error
+	switch msgType {
+	case protocol.BackendCopyOutResponse, protocol.BackendCopyInResponse, protocol.BackendCopyBothResponse:
+		if head.kind == reqSimple || head.kind == reqExtended || head.kind == reqPrepare {
+			headErr = &copyThroughQueryError{response: copyResponseName(msgType)}
+		}
+	}
+	if headErr == nil {
+		headErr = fmt.Errorf("%w: %w", ErrClosed, cause)
+	}
+	if head.rowCh != nil {
+		head.streamErr.Store(&headErr)
+		head.closeRowCh()
+		head.closeColsCh()
+	}
+	c.popHead()
+	head.fail(headErr)
+	return errReplyDesync
+}
+
+// errReplyDesync is what every request queued behind the one whose reply
+// stopped matching gets (failAll). It names no message: those callers did
+// nothing wrong.
+var errReplyDesync = fmt.Errorf("%w: its reply stream no longer matched its request queue", ErrClosed)
+
+// copyThroughQueryError is the error of a COPY statement sent through Query,
+// QueryRow, Exec or Prepare. The server answers a COPY with a CopyOutResponse,
+// CopyInResponse or CopyBothResponse, a stream those paths do not read, so the
+// conn is closed; the caller gets this to act on. It is unexported on purpose:
+// the message is the contract, there is nothing a caller can do with the value
+// but fix the call. Only the native Pool has COPY (Pool.CopyFrom, Pool.CopyTo),
+// and the message says so.
+type copyThroughQueryError struct{ response string }
+
+// Unwrap makes errors.Is(err, ErrClosed) true, as for every other error of a
+// connection failed because its reply stream stopped matching its queue.
+func (e *copyThroughQueryError) Unwrap() error { return ErrClosed }
+
+func (e *copyThroughQueryError) Error() string {
+	return "celeris-postgres: the statement is a COPY (the server answered with " + e.response +
+		"), which cannot run through Query, QueryRow, Exec or Prepare; use Pool.CopyTo for COPY ... TO STDOUT " +
+		"and Pool.CopyFrom for COPY ... FROM STDIN (database/sql has no COPY path: use a Pool for it); " +
+		"the connection was closed"
+}
+
+func copyResponseName(msgType byte) string {
+	switch msgType {
+	case protocol.BackendCopyOutResponse:
+		return "CopyOutResponse"
+	case protocol.BackendCopyInResponse:
+		return "CopyInResponse"
+	default:
+		return "CopyBothResponse"
+	}
 }
 
 func copyRow(fields [][]byte) [][]byte {
@@ -2073,7 +2200,7 @@ func (c *pgConn) closePreparedServerAsync(name string) error {
 	if c.closed.Load() || name == "" {
 		return nil
 	}
-	ps := &prepareState{name: name, phase: 3}
+	ps := &prepareState{name: name, closing: true}
 	// Use context.Background so the request is never cancelled by a caller.
 	req := &pgRequest{ctx: context.Background(), kind: reqPrepare, prep: ps, doneCh: make(chan struct{})}
 	c.enqueue(req)
@@ -2876,6 +3003,11 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	if c.useDirect {
 		req.syncMode.Store(true)
 	}
+	// SkipParse is part of the request's initial state: ExtendedQueryState.Handle
+	// reads it on the first message, on the event loop, and a message can reach
+	// a request the moment it is queued. Written after the
+	// enqueue it raced with that read.
+	req.extended.SkipParse = stmtName != ""
 	c.enqueue(req)
 	resultFormats := []int16{protocol.FormatBinary}
 
@@ -2886,8 +3018,6 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		c.writer.Reset()
 		if stmtName == "" {
 			protocol.AppendParse(c.writer, "", query, nil)
-		} else {
-			req.extended.SkipParse = true
 		}
 		protocol.AppendBind(c.writer, "", stmtName, formats, values, resultFormats)
 		if hasDescribe {
@@ -2932,8 +3062,6 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		c.writer.Reset()
 		if stmtName == "" {
 			protocol.AppendParse(c.writer, "", query, nil)
-		} else {
-			req.extended.SkipParse = true
 		}
 		protocol.AppendBind(c.writer, "", stmtName, formats, values, resultFormats)
 		if hasDescribe {
@@ -2987,10 +3115,9 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 	req.ctx = ctx
 	req.kind = reqExtended
 	// HasDescribe left false (Exec does not request a row description).
+	// SkipParse is set before the enqueue, see doExtendedQuery.
+	req.extended.SkipParse = stmtName != ""
 	c.enqueue(req)
-	if stmtName != "" {
-		req.extended.SkipParse = true
-	}
 
 	// Sync fast path for extended exec — build the message using Append
 	// variants directly into the writer's buffer, eliminating per-message
