@@ -15,14 +15,14 @@ import (
 )
 
 // A Pool conn in direct mode waits in a socket read that does not look at its
-// context. A context WITH a deadline is enforced through the socket's read
-// deadline; a context without one (cancel-only) is not watched at all, as in
-// v1.5.11. These tests use a backend that sends NOTHING for a statement until a
-// CancelRequest reaches it (no partial reply that would wake the read), and ask
-// that a context whose deadline passes mid-statement ends the call with the
-// context's error; that the conn is reused after a confirmed cancel exchange (and
-// not before the exchange ended); that it is discarded when the exchange is not
-// confirmed; and that a cancel-only context does not interrupt the statement.
+// context. The end of the context is made to wake it: a deadline is the socket's
+// read deadline, and a cancel (with or without a deadline) sets a read deadline
+// of "now" through context.AfterFunc (cancel.go, armCtxWatch). These tests use a
+// backend that sends NOTHING for a statement until a CancelRequest reaches it (no
+// partial reply that would wake the read), and ask that a context that ends
+// mid-statement, by deadline or by cancel, ends the call with the context's error;
+// that the conn is reused after a confirmed cancel exchange (and not before the
+// exchange ended); and that it is discarded when the exchange is not confirmed.
 
 type silentPG struct {
 	addr string
@@ -145,9 +145,10 @@ func (f *silentPG) serve(c net.Conn) {
 			// One write for the whole reply. Two writes are two TCP segments and
 			// the blocked read may wake for the first alone (always on Windows,
 			// where the portable path has no non-blocking peek; a race elsewhere):
-			// driveDirect looks at the context each time a read returns, so a
-			// cancelled context would then cancel the statement (see
-			// TestDirectPoolLooksAtACancelOnlyContextWhenAReplyByteArrives).
+			// the read would then return for the first part of the reply, and a
+			// context cancelled meanwhile would cancel the statement before the
+			// rest arrived (see TestDirectPoolCancelOfAStatementThatAnswersOnItsOwnDrainsTheReply,
+			// which wants exactly that split).
 			reply := append([]byte{protocol.BackendCommandComplete, 0, 0, 0, 13}, append([]byte("SELECT 1"), 0)...)
 			reply = append(reply, protocol.BackendReadyForQuery, 0, 0, 0, 5, 'I')
 			_, _ = c.Write(reply)
@@ -205,8 +206,8 @@ func runSlow(ctx context.Context, p *Pool, query bool) error {
 	return err
 }
 
-func TestDirectPoolEnforcesAContextDeadlineMidStatement(t *testing.T) {
-	for _, kind := range []string{"deadline"} {
+func TestDirectPoolEnforcesAContextEndingMidStatement(t *testing.T) {
+	for _, kind := range []string{"deadline", "cancel"} {
 		for _, stmt := range []string{"exec", "query"} {
 			t.Run(kind+"/"+stmt, func(t *testing.T) {
 				f := startSilentPG(t, 100*time.Millisecond)
@@ -246,7 +247,7 @@ func TestDirectPoolDiscardsTheConnWhenTheCancelIsNotConfirmed(t *testing.T) {
 	old := cancelExchangeTimeout
 	cancelExchangeTimeout = 150 * time.Millisecond
 	t.Cleanup(func() { cancelExchangeTimeout = old })
-	for _, kind := range []string{"deadline"} {
+	for _, kind := range []string{"deadline", "cancel"} {
 		t.Run(kind, func(t *testing.T) {
 			f := startSilentPG(t, -1)
 			p := openDirectPool(t, f.addr)
@@ -276,42 +277,11 @@ func TestDirectPoolDiscardsTheConnWhenTheCancelIsNotConfirmed(t *testing.T) {
 	}
 }
 
-// A context that can only be cancelled (no deadline: a cancel-only stdlib
-// context, the HTTP/2 request context) is never armed: it does not wake the
-// blocked read, so a statement whose reply arrives whole returns the statement's
-// own result, and no CancelRequest is sent (v1.5.11 behaviour; celeris#1375). The
-// fake answers in one write: see the split-reply test below for a reply that
-// does not arrive whole.
-func TestDirectPoolDoesNotInterruptAStatementForACancelOnlyContext(t *testing.T) {
-	f := startSilentPG(t, 0)
-	f.slowDelay = 300 * time.Millisecond
-	p := openDirectPool(t, f.addr)
-	if _, err := p.ExecContext(context.Background(), "SELECT warm"); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(50*time.Millisecond, cancel)
-	start := time.Now()
-	_, err := p.ExecContext(ctx, "SELECT slow")
-	if err != nil {
-		t.Fatalf("err = %v: the statement was interrupted by a cancel-only context", err)
-	}
-	if el := time.Since(start); el < 250*time.Millisecond {
-		t.Fatalf("returned after %v, before the server answered (300 ms)", el)
-	}
-	if f.index("cancel-request") >= 0 {
-		t.Fatalf("a CancelRequest was sent for a cancel-only context: %v", f.events())
-	}
-}
-
-// What a cancel-only context does NOT get is a wake of the blocked read. It is
-// looked at each time a read returns (driveDirect's loop-top ctx.Err(), the same
-// check as in v1.5.11): when it was cancelled before the reply was complete and a
-// partial reply wakes the read, the statement is cancelled then (CancelRequest,
-// drain, the context's error), and the conn is reused. The reply is split here so
-// that this is the same on every platform: a platform whose read wakes for the
-// first segment of a reply (Windows) sees it without the split.
-func TestDirectPoolLooksAtACancelOnlyContextWhenAReplyByteArrives(t *testing.T) {
+// A statement that answers on its own while its context is cancelled (the reply
+// is split, so the read wakes for its first part alone): the cancel is sent, the
+// drain reads the rest of the reply, the call returns the context's error and the
+// conn is reused. The cancel wakes the read at 50 ms; the reply starts at 100 ms.
+func TestDirectPoolCancelOfAStatementThatAnswersOnItsOwnDrainsTheReply(t *testing.T) {
 	f := startSilentPG(t, 0)
 	f.slowDelay = 100 * time.Millisecond
 	f.splitGap = 150 * time.Millisecond
@@ -321,13 +291,9 @@ func TestDirectPoolLooksAtACancelOnlyContextWhenAReplyByteArrives(t *testing.T) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(50*time.Millisecond, cancel)
-	start := time.Now()
 	_, err := p.ExecContext(ctx, "SELECT slow")
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled: the first bytes of the reply arrived after the cancel", err)
-	}
-	if el := time.Since(start); el < 90*time.Millisecond {
-		t.Fatalf("returned after %v, before any byte of the reply arrived (100 ms): the context woke the read", el)
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if f.index("cancel-request") < 0 {
 		t.Fatalf("no CancelRequest was sent: %v", f.events())

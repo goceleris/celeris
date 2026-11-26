@@ -660,7 +660,14 @@ func acquireRows(inner driver.Rows, conn *pgConn, pool *Pool) *Rows {
 var errRowsClosed = errors.New("celeris-postgres: Rows are closed")
 
 // Rows is the pool-level rows wrapper. It returns the underlying conn to the
-// pool when Close is called. The iteration API matches database/sql.Rows:
+// pool when Close is called. A Rows ends in three ways: [Rows.Close], reading it
+// to the end (Next returns false; Close is still needed to free the conn), or an
+// error. It does NOT end when the context passed to the call that opened it is
+// cancelled or expires: the driver reads that context only until the call has
+// returned, so a cancelled Rows must be closed like any other. While a result
+// that streams (64 rows or more, not yet fully received) is open on a [Tx],
+// the next statement of that Tx returns [ErrRowsOpen]; close the Rows first.
+// The iteration API matches database/sql.Rows:
 //
 //	for rows.Next() {
 //	    if err := rows.Scan(&id, &name); err != nil { ... }
@@ -1465,11 +1472,24 @@ type Tx struct {
 //
 // A Commit of a transaction the server had already put in the aborted state
 // returns [ErrTxCommitRollback]: nothing was committed.
+//
+// Commit ends the transaction whatever it returns. If a streaming Rows of this
+// transaction is still open (see [ErrRowsOpen]), Commit returns ErrRowsOpen and
+// the transaction is rolled back: close Rows before Commit. Nothing is sent, the
+// connection is discarded (the server rolls the transaction back when the
+// connection ends), and the open Rows ends with an error that matches [ErrClosed]
+// and [io.ErrUnexpectedEOF].
 func (t *Tx) Commit() error {
 	if !t.done.CompareAndSwap(false, true) {
 		return ErrTxDone
 	}
 	err := t.inner.Commit()
+	if errors.Is(err, ErrRowsOpen) {
+		// Commit ends the Tx whatever it returns: the transaction is rolled back, not
+		// committed (nothing was sent), and the caller sees why.
+		t.pool.discardOverOpenRows(t.conn)
+		return err
+	}
 	t.pool.releaseAfterTxEnd(t.conn, err)
 	return err
 }
@@ -1478,14 +1498,41 @@ func (t *Tx) Commit() error {
 // returns: a later call on the Tx returns [ErrTxDone], and the connection goes back
 // to the pool only if the reply was read up to ReadyForQuery with the session idle
 // (a Rollback that failed on the wire discards it).
+//
+// A Rows of the Tx that is still streaming (see [ErrRowsOpen]) does not stop it:
+// nothing is sent, the connection is discarded (the server rolls the transaction
+// back when the connection ends), Rollback returns nil, and the open Rows ends with
+// an error that matches [ErrClosed] and [io.ErrUnexpectedEOF] (its Next returns
+// false and its Err reports it), never with a clean end. Close the Rows first to
+// keep the conn.
 func (t *Tx) Rollback() error {
 	if !t.done.CompareAndSwap(false, true) {
 		return ErrTxDone
 	}
 	err := t.inner.Rollback()
+	if errors.Is(err, ErrRowsOpen) {
+		t.pool.discardOverOpenRows(t.conn)
+		return nil
+	}
 	t.pool.releaseAfterTxEnd(t.conn, err)
 	return err
 }
+
+// discardOverOpenRows ends a Tx over a Rows that is still streaming (Commit or
+// Rollback, ErrRowsOpen from the conn): the conn is discarded, the slot released
+// once, and the open Rows must end with an error: Close reports the teardown to the
+// loop as io.EOF (onClose(nil)), which a consumer reads as the clean end of its
+// rows, a truncated result that looks complete. failAll first hands every pending
+// request, the streaming one included, errRollbackDiscard instead; the Close in
+// Discard then finds nothing left to overwrite.
+func (p *Pool) discardOverOpenRows(c *pgConn) {
+	c.failAll(errRollbackDiscard)
+	p.inner.Discard(c)
+}
+
+// errRollbackDiscard is what a Rows still open ends with when its Tx is ended over
+// it (Rollback or Commit): it matches [ErrClosed] and [io.ErrUnexpectedEOF].
+var errRollbackDiscard = fmt.Errorf("%w: %w: the transaction was rolled back while a Rows of it was still streaming", ErrClosed, io.ErrUnexpectedEOF)
 
 // ExecContext runs a statement on the pinned conn.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
@@ -1503,7 +1550,10 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 }
 
 // QueryContext runs a query on the pinned conn. The returned Rows must be
-// closed before Commit/Rollback.
+// closed before Commit and before the next statement of the Tx: while a result
+// that streams (64 rows or more, not yet fully received) is open, the next
+// statement returns [ErrRowsOpen], and a Rows ends by Close, by being read to the
+// end, or by an error, not by the cancellation of ctx.
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if t.done.Load() {
 		return nil, ErrTxDone
