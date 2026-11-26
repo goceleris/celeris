@@ -127,7 +127,9 @@ func TestPrepareEndedWithAnUnconfirmedCancelReportsTheContext(t *testing.T) {
 						time.Sleep(1500 * time.Millisecond)
 						_ = tx.Rollback()
 					}()
-					err = pool.Exec(ctx, fmt.Sprintf("INSERT INTO %s(m) VALUES ($1) -- %d", tab, i), int64(i))
+					err = callWithin(t, fmt.Sprintf("call %d", i), func() error {
+						return pool.Exec(ctx, fmt.Sprintf("INSERT INTO %s(m) VALUES ($1) -- %d", tab, i), int64(i))
+					})
 					cancel()
 					var pe *postgres.PGError
 					switch {

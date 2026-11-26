@@ -2015,7 +2015,8 @@ func (c *pgConn) prepareEnded(ctx context.Context, err error) bool {
 // ctxEndedErr returns the context's error when ctx has ended, nil otherwise. A
 // deadline that has passed counts as ended before the context's timer has set
 // Err (the clock decides, as in driveDirect). It runs on a successful
-// auto-prepare, before the statement itself is sent: a context that ended while
+// auto-prepare, and on a successful re-prepare after the server lost a cached
+// statement (SQLSTATE 26000), before the statement itself is sent: a context that ended while
 // the statement was being prepared (a direct conn sees a cancel-only context
 // only when bytes arrive, so a prepare can finish under a context that has
 // already been cancelled) must not go on to send, and possibly commit, the
@@ -2684,6 +2685,9 @@ func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		rows, err = c.doExtendedQuery(ctx, stmtName, query, args, prep.Columns)
 	}
 	return rows, err
@@ -2828,6 +2832,9 @@ func (c *pgConn) extendedExec(ctx context.Context, stmtName, query string, args 
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
+		if err := ctxEndedErr(ctx); err != nil {
+			return nil, err // ended during the re-prepare: the statement is not sent
+		}
 		result, err = c.doExtendedExec(ctx, stmtName, query, args)
 	}
 	return result, err

@@ -107,16 +107,16 @@ func TestPrepareEndedWriteIsNeverSent(t *testing.T) {
 							_ = tx.Rollback() // releases the lock
 							close(released)
 						}()
-						var err2 error
-						switch what {
-						case "insert":
-							err2 = pool.Exec(ctx, fmt.Sprintf("INSERT INTO %s(m) VALUES ($1) -- %d", tab, i), int64(i))
-						case "insert-query":
-							var m int64
-							err2 = queryOne(ctx, pool, fmt.Sprintf("WITH ins AS (INSERT INTO %s(m) VALUES ($1) RETURNING m) SELECT m FROM ins -- %d", tab, i), []any{int64(i)}, &m)
-						case "update":
-							err2 = pool.Exec(ctx, fmt.Sprintf("UPDATE %s SET n = n + 1 WHERE k = $1 -- %d", ctr, i), int64(i))
-						}
+						err2 := callWithin(t, fmt.Sprintf("call %d", i), func() error {
+							switch what {
+							case "insert":
+								return pool.Exec(ctx, fmt.Sprintf("INSERT INTO %s(m) VALUES ($1) -- %d", tab, i), int64(i))
+							case "insert-query":
+								var m int64
+								return queryOne(ctx, pool, fmt.Sprintf("WITH ins AS (INSERT INTO %s(m) VALUES ($1) RETURNING m) SELECT m FROM ins -- %d", tab, i), []any{int64(i)}, &m)
+							}
+							return pool.Exec(ctx, fmt.Sprintf("UPDATE %s SET n = n + 1 WHERE k = $1 -- %d", ctr, i), int64(i))
+						})
 						<-released
 						cancel()
 						var pe *postgres.PGError

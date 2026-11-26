@@ -466,12 +466,15 @@ func (p *Pool) releaseChecked(c *pgConn) error {
 // QueryContext runs query on an acquired conn, returns a Rows wrapper that
 // returns the conn to the pool when closed.
 //
-// A context that has ended before the statement was sent ends the call with the
-// context's error and the statement is not sent (that includes the Parse +
-// Describe step with which a statement the cache has not seen is prepared). A
+// A context that ended before the call, or while the statement was being
+// prepared (the Parse + Describe step of a statement the cache has not seen, or
+// the re-prepare after the server lost a cached one), ends the call with the
+// context's error (on the event loop, now and then the server's answer to the
+// cancel, a *[PGError] with SQLSTATE 57014) and the statement is not sent. A
 // context that ends after the statement was sent cancels it on the server, but
 // the statement may already have run: as with any cancel, an error from the
-// context does not say that a write did not commit.
+// context does not say that a write did not commit. A context that ends in the
+// instant between that check and the send is the same case.
 func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	c, err := p.acquire(ctx)
 	if err != nil {
@@ -493,9 +496,10 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 // that fails returns its own error, unchanged, as before (a connection left in
 // a failed transaction by it is discarded all the same).
 //
-// A context that has ended before the statement was sent ends the call with the
-// context's error and the statement is not sent; one that ends after it was
-// sent may still find the statement committed (see [Pool.QueryContext]).
+// A context that ended before the call or while the statement was being
+// prepared ends the call with an error and the statement is not sent; one that
+// ends after it was sent may still find the statement committed (see
+// [Pool.QueryContext]).
 func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (res Result, err error) {
 	c, aerr := p.acquire(ctx)
 	if aerr != nil {

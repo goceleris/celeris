@@ -1,8 +1,10 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"net"
 	"sync"
@@ -288,7 +290,7 @@ func TestPrepareEndedByTheContextReportsTheContextError(t *testing.T) {
 						// The context's error; on the event loop a confirmed cancel may also
 						// surface as the server's own answer to it, 57014.
 						var pe *PGError
-						if !errors.Is(err, want) && !(confirmed && errors.As(err, &pe) && pe.Code == "57014") {
+						if ok := errors.Is(err, want) || (confirmed && errors.As(err, &pe) && pe.Code == "57014"); !ok {
 							t.Fatalf("err = %v, want it to satisfy errors.Is(err, %v)", err, want)
 						}
 						if errors.Is(err, ErrClosed) {
@@ -370,6 +372,213 @@ func TestPrepareFinishedUnderAnEndedContextDoesNotSendTheStatement(t *testing.T)
 			}
 			if got := f.sessions(); got != 1 {
 				t.Fatalf("sessions = %d, want 1: the conn finished the prepare and is reusable", got)
+			}
+		})
+	}
+}
+
+// lostStmtPG is a backend that prepares every statement and runs every Bind
+// with success, except the first Bind after the first run, which it answers with
+// 26000 (the server lost the cached statement: a DEALLOCATE ALL, a pooler in
+// transaction mode). The Parse that follows (the driver's re-prepare) is
+// answered after reprepareDelay. It counts the messages it got.
+type lostStmtPG struct {
+	addr           string
+	reprepareDelay time.Duration
+	parseCh        chan int64 // the number of Parses seen, one send per Parse
+	done           chan struct{}
+
+	parses, binds, executes atomic.Int64
+	mu                      sync.Mutex
+	startups                int
+}
+
+func startLostStmtPG(t *testing.T, reprepareDelay time.Duration) *lostStmtPG {
+	t.Helper()
+	f := &lostStmtPG{reprepareDelay: reprepareDelay, parseCh: make(chan int64, 16), done: make(chan struct{})}
+	f.addr = startFakePG(t, f.serve)
+	t.Cleanup(func() { close(f.done) })
+	return f
+}
+
+func fakeReply(parts ...[]byte) []byte {
+	var out []byte
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
+func fakeMsg(typ byte, payload ...byte) []byte {
+	n := 4 + len(payload)
+	return append([]byte{typ, byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}, payload...)
+}
+
+func (f *lostStmtPG) serve(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	var lenBuf [4]byte
+	if _, err := readFull(c, lenBuf[:]); err != nil {
+		return
+	}
+	n := int(uint32(lenBuf[0])<<24 | uint32(lenBuf[1])<<16 | uint32(lenBuf[2])<<8 | uint32(lenBuf[3]))
+	if n < 8 {
+		return
+	}
+	body := make([]byte, n-4)
+	if _, err := readFull(c, body); err != nil {
+		return
+	}
+	if n == 16 && int32(body[0])<<24|int32(body[1])<<16|int32(body[2])<<8|int32(body[3]) == cancelRequestCode { // a cancel request: its socket closes
+		return
+	}
+	f.mu.Lock()
+	f.startups++
+	f.mu.Unlock()
+	if writeAuthOK(c) != nil || writeBackendKeyData(c, 7, 9) != nil || writeReadyForQuery(c, 'I') != nil {
+		return
+	}
+	var sawParse, sawBind, describePortal bool
+	isSelect := false // the statement prepared last returns a row
+	lost := false     // set once the first Bind has been answered
+	ran := false
+	for {
+		typ, payload, err := readMsg(c)
+		if err != nil || typ == protocol.MsgTerminate {
+			return
+		}
+		switch typ {
+		case protocol.MsgParse:
+			sawParse = true
+			isSelect = bytes.Contains(payload, []byte("SELECT"))
+			select {
+			case f.parseCh <- f.parses.Add(1):
+			default:
+			}
+		case protocol.MsgDescribe:
+			describePortal = len(payload) > 0 && payload[0] == 'P'
+		case protocol.MsgBind:
+			sawBind = true
+			f.binds.Add(1)
+		case protocol.MsgExecute:
+			f.executes.Add(1)
+		case protocol.MsgQuery:
+			_ = writeCommandComplete(c, "SELECT 1")
+			_ = writeReadyForQuery(c, 'I')
+		case protocol.MsgSync:
+			switch {
+			case sawParse && !sawBind: // a prepare: Parse + Describe + Sync
+				if ran && f.reprepareDelay > 0 {
+					time.Sleep(f.reprepareDelay)
+				}
+				desc := fakeMsg(protocol.BackendNoData)
+				if isSelect { // one int4 column "c"
+					desc = fakeMsg('T', 0, 1, 'c', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0, 4, 0xff, 0xff, 0xff, 0xff, 0, 0)
+				}
+				_, _ = c.Write(fakeReply(fakeMsg(protocol.BackendParseComplete), fakeMsg(protocol.BackendParameterDesc, 0, 1, 0, 0, 0, 23), desc, fakeMsg(protocol.BackendReadyForQuery, 'I')))
+			case sawBind && lost:
+				// the statement is lost on the server, once
+				lost = false
+				_, _ = c.Write(fakeReply(fakeMsg(protocol.BackendErrorResponse, []byte("SERROR\x00VERROR\x00C26000\x00Mprepared statement does not exist\x00\x00")...), fakeMsg(protocol.BackendReadyForQuery, 'I')))
+			case sawBind:
+				ran = true
+				lost = true // the next Bind finds the statement gone
+				if isSelect {
+					var rd []byte
+					if describePortal {
+						rd = fakeMsg('T', 0, 1, 'c', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0, 4, 0xff, 0xff, 0xff, 0xff, 0, 1)
+					}
+					_, _ = c.Write(fakeReply(fakeMsg(protocol.BackendBindComplete), rd, fakeMsg('D', 0, 1, 0, 0, 0, 4, 0, 0, 0, 1), fakeMsg(protocol.BackendCommandComplete, []byte("SELECT 1\x00")...), fakeMsg(protocol.BackendReadyForQuery, 'I')))
+				} else {
+					_, _ = c.Write(fakeReply(fakeMsg(protocol.BackendBindComplete), fakeMsg(protocol.BackendCommandComplete, []byte("INSERT 0 1\x00")...), fakeMsg(protocol.BackendReadyForQuery, 'I')))
+				}
+			}
+			sawParse, sawBind, describePortal = false, false, false
+		}
+	}
+}
+
+// After the server lost a cached statement (26000) the driver re-prepares it and
+// runs it: ExecContext on a cache hit, and a prepared statement's QueryContext
+// or ExecContext (extendedExec, extendedQuery). A context that ends during the
+// re-prepare must end the call with its error and the statement must not be sent
+// again: no second Bind, no Execute. The conn is a direct one, which does not see
+// a cancel-only context until the re-prepare's reply arrives.
+func TestRepreparedStatementIsNotSentUnderAnEndedContext(t *testing.T) {
+	for _, kind := range []string{"exec", "stmt-exec", "stmt-query"} {
+		t.Run(kind, func(t *testing.T) {
+			f := startLostStmtPG(t, 100*time.Millisecond)
+			host, port, _ := net.SplitHostPort(f.addr)
+			dsn := DSN{Host: host, Port: port, User: "u", Options: Options{SSLMode: "disable", StatementCacheSize: 16, AutoCacheStatements: true}}
+			dctx, dcancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer dcancel()
+			conn, err := dialDirectConn(dctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			args := []driver.NamedValue{{Ordinal: 1, Value: int64(1)}}
+			query := "SELECT $1::int"
+			if kind != "stmt-query" {
+				query = "INSERT INTO t VALUES ($1)"
+			}
+			var stmt driver.Stmt
+			if kind != "exec" {
+				if stmt, err = conn.PrepareContext(dctx, query); err != nil {
+					t.Fatal(err)
+				}
+			}
+			run := func(ctx context.Context) error {
+				switch kind {
+				case "exec":
+					_, err := conn.ExecContext(ctx, query, args)
+					return err
+				case "stmt-exec":
+					_, err := stmt.(driver.StmtExecContext).ExecContext(ctx, args)
+					return err
+				}
+				rows, err := stmt.(driver.StmtQueryContext).QueryContext(ctx, args)
+				if err != nil {
+					return err
+				}
+				return rows.Close()
+			}
+			// the first run prepares (exec: caches) and runs the statement
+			if err := run(dctx); err != nil {
+				t.Fatalf("the first call: %v", err)
+			}
+			for len(f.parseCh) > 0 {
+				<-f.parseCh
+			}
+			wantParses := f.parses.Load() + 1 // the re-prepare's
+			// the second run gets 26000 for the cached statement and re-prepares; the
+			// context is cancelled while the re-prepare waits
+			ctx, stop := context.WithCancel(context.Background())
+			defer stop()
+			go func() {
+				select {
+				case <-f.parseCh: // the re-prepare's Parse
+					time.Sleep(30 * time.Millisecond)
+					stop()
+				case <-f.done:
+				}
+			}()
+			errc := make(chan error, 1)
+			go func() { errc <- run(ctx) }()
+			select {
+			case err := <-errc:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("err = %v, want context.Canceled", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the call did not return")
+			}
+			if _, err := conn.ExecContext(dctx, "SELECT next", nil); err != nil { // orders the counts
+				t.Fatalf("the next statement failed: %v", err)
+			}
+			// The second call's own Bind (answered 26000) is the second Bind; a third
+			// is the re-prepared statement sent under the ended context.
+			if p, b, e := f.parses.Load(), f.binds.Load(), f.executes.Load(); p != wantParses || b != 2 || e != 2 {
+				t.Fatalf("the backend got %d Parse, %d Bind, %d Execute; want %d, 2, 2 (the statement was not sent again after its re-prepare)", p, b, e, wantParses)
 			}
 		})
 	}

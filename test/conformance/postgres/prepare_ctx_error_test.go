@@ -86,15 +86,15 @@ func TestPrepareEndedByTheContextReportsTheContext(t *testing.T) {
 									ctx, cancel = context.WithCancel(context.Background())
 									time.AfterFunc(d, cancel)
 								}
-								var err error
-								if kind == "query" {
-									q := fmt.Sprintf("SELECT $1::int8 AS p%d_%d", w, n)
-									var m int64
-									err = queryOne(ctx, pool, q, []any{n}, &m)
-								} else {
+								err := callWithin(t, fmt.Sprintf("call %d (%s, %s)", n, kind, end), func() error {
+									if kind == "query" {
+										q := fmt.Sprintf("SELECT $1::int8 AS p%d_%d", w, n)
+										var m int64
+										return queryOne(ctx, pool, q, []any{n}, &m)
+									}
 									q := fmt.Sprintf("INSERT INTO %s(w, m, k) VALUES ($1, $2, %d)", table, n)
-									err = pool.Exec(ctx, q, w, n)
-								}
+									return pool.Exec(ctx, q, w, n)
+								})
 								cancel()
 								errored[n].Store(err != nil)
 								var pe *postgres.PGError
@@ -192,5 +192,30 @@ func warmPool(t *testing.T, pool stressDB, n int) {
 		if err != nil {
 			t.Fatalf("warm-up: %v", err)
 		}
+	}
+}
+
+// prepareCallDeadline is the longest one call of these tests may take. A call
+// under a context of a few milliseconds ends within a second even when its
+// cancel is not confirmed (the cancel exchange gives up after one second).
+const prepareCallDeadline = 15 * time.Second
+
+var errCallHung = errors.New("the call did not return")
+
+// callWithin runs f on its own goroutine and returns its error. When f has not
+// returned after prepareCallDeadline it logs a goroutine dump, fails the test
+// and returns errCallHung: a hung conn fails the test within seconds, not at
+// the timeout of the whole package. Safe to call from a goroutine of the test.
+func callWithin(t *testing.T, what string, f func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(prepareCallDeadline):
+		dumpGoroutines(t)
+		t.Errorf("%s: no result after %v (hung)", what, prepareCallDeadline)
+		return errCallHung
 	}
 }
