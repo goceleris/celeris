@@ -5,6 +5,7 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +40,36 @@ func openPoolStream(t *testing.T, p *Processor, id uint32) *Stream {
 	return s
 }
 
+// skipPoolScan950 is a test hook: TestRSTAtPoolHandlerEndFallbackLeavesNoDuplicate950
+// sets it so that the once test's scan of the second manager never finds its
+// stream, and the fallback that follows the scan runs on every iteration. It
+// is false in every other test.
+var skipPoolScan950 bool
+
+// fallbackRuns950 counts the iterations of the once test whose fallback ran in
+// this process. go test prints the log of a passing test only with -v, so the
+// failure messages of TestRSTRacesPoolHandlerEnd950 carry the count.
+var fallbackRuns950 atomic.Int64
+
+// poolDuplicates950 takes n objects out of the stream pool and counts the
+// streams that came out more than once: a stream put into the pool twice. The
+// objects are not put back. A Get that finds the pool empty makes a new
+// Stream, so those never count. It reads the pool of the current P and what
+// it can steal from the others; an object in another P's private slot is not
+// seen, so it can miss a duplicate but never reports one that is not there.
+func poolDuplicates950(n int) (dups int) {
+	seen := make(map[*Stream]int, n)
+	for range n {
+		seen[streamPool.Get().(*Stream)]++
+	}
+	for _, c := range seen {
+		if c > 1 {
+			dups++
+		}
+	}
+	return dups
+}
+
 // TestRSTAtPoolHandlerEndReleasesItsStreamOnce950 drives the interleaving
 // that released a stream twice, deterministically, for a RST_STREAM from the
 // peer (handleRSTStream) and for one the server sends (a stream error:
@@ -65,9 +96,9 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fromPool, ran := 0, 0
+			fromPool, ran, injectedN := 0, 0, 0
 			defer func() {
-				t.Logf("the other connection's stream took the object from the pool in %d of %d iterations (the others hand it over directly)", fromPool, ran)
+				t.Logf("the other connection's stream took the object from the pool in %d of %d iterations; the scan missed it and the fallback injected it in %d", fromPool, ran, injectedN)
 			}()
 			for i := range 20 {
 				ran++
@@ -101,7 +132,7 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 				// NewStream would hand it over.
 				m2 := NewManager()
 				next, nextID := (*Stream)(nil), uint32(0)
-				for id := uint32(7); id < 7+2*64; id += 2 {
+				for id := uint32(7); id < 7+2*64 && !skipPoolScan950; id += 2 {
 					x, ok := m2.TryOpenStream(id)
 					if !ok {
 						break
@@ -112,7 +143,10 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 						break
 					}
 				}
-				if next == nil {
+				injected := next == nil
+				if injected {
+					injectedN++
+					fallbackRuns950.Add(1)
 					nextID = 1001
 					s.ID = nextID
 					s.manager = m2
@@ -140,9 +174,42 @@ func TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t *testing.T) {
 					t.Fatalf("iteration %d: the other connection's stream %d lost its place: in map %v, active %d, want %d",
 						i, nextID, in, m2.CountActiveStreams(), active)
 				}
+				if injected {
+					// s went to the stream pool at s.Release() above (a build
+					// with -race may have dropped that Put). A scan that
+					// missed it does not mean it is in no pool: it can sit in
+					// another P's private slot. It is not m2's to release.
+					m2.mu.Lock()
+					delete(m2.streams, nextID)
+					m2.mu.Unlock()
+				}
 				m2.Close()
 			}
 		})
+	}
+}
+
+// TestRSTAtPoolHandlerEndFallbackLeavesNoDuplicate950 forces the once test's
+// fallback on every iteration (the scan is skipped) and then counts what is
+// in the stream pool: the stream the once test released must be there once,
+// not twice. Before the fallback stopped handing its stream to the second
+// manager's Close, every iteration left the stream in the pool twice, and the
+// next test that drained the pool, TestRSTRacesPoolHandlerEnd950, failed with
+// "released twice" (celeris#1468). One P, so the puts and the drain are on
+// the same P; the race detector drops a quarter of the puts at random, so the
+// 40 iterations (20 for each reset) leave a duplicate with a probability very close to 1 in either
+// build.
+func TestRSTAtPoolHandlerEndFallbackLeavesNoDuplicate950(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	poolDuplicates950(1024) // start from a pool another test did not leave a duplicate in
+	skipPoolScan950 = true
+	t.Cleanup(func() { skipPoolScan950 = false })
+	TestRSTAtPoolHandlerEndReleasesItsStreamOnce950(t)
+	if t.Failed() {
+		return
+	}
+	if d := poolDuplicates950(1024); d > 0 {
+		t.Fatalf("%d stream(s) of the once test are in the stream pool more than once after its fallback ran: it released a stream it had only injected into the second manager", d)
 	}
 }
 
@@ -157,6 +224,15 @@ func TestRSTRacesPoolHandlerEnd950(t *testing.T) {
 	n := 20000
 	if testing.Short() {
 		n = 2000
+	}
+	// A stream that is in the stream pool twice before the first reset is a
+	// leftover from another test, not a release this test made. Say so here.
+	// The check reads the current P's pool and what it can steal: a duplicate
+	// in another P's private slot is not seen, and then a leftover still ends
+	// as the "released twice" below, whose message carries the count of the
+	// once test's fallback runs.
+	if d := poolDuplicates950(256); d > 0 {
+		t.Fatalf("a duplicate was in the stream pool before this test ran (%d stream(s) present more than once): a leftover from another test, not a release under test; the once test's fallback ran in %d iterations earlier in this process)", d, fallbackRuns950.Load())
 	}
 	for _, tc := range []struct {
 		name  string
@@ -195,7 +271,7 @@ func TestRSTRacesPoolHandlerEnd950(t *testing.T) {
 				}
 				if seen > 1 {
 					double++
-					t.Errorf("iteration %d: the stream came out of the stream pool %d times: it was released twice", i, seen)
+					t.Errorf("iteration %d: the stream came out of the stream pool %d times: it was released twice (the once test's fallback ran in %d iterations earlier in this process)", i, seen, fallbackRuns950.Load())
 				}
 				if i%1000 == 999 {
 					runtime.GC()
