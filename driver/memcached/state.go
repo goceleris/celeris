@@ -449,7 +449,14 @@ func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 		return fmt.Errorf("celeris-memcached: binary opaque mismatch: got %#x, expected %#x (protocol violation)",
 			p.Header.Opaque, req.opaque)
 	}
-	s.bridge.Pop()
+	// Head is not Pop: a conn closed from another goroutine (Client.Close) in between has
+	// had its pending requests taken, failed and finished by the drain. The request is
+	// then the drain's, and writing the reply into it (binStatus, resultErr, values) is a
+	// data race with the drain and overwrites its error; the text END path checks the
+	// same.
+	if popped := s.bridge.Pop(); popped != req {
+		return errors.New("celeris-memcached: bridge head mismatch on a binary reply")
+	}
 	req.binStatus = p.Status()
 	if p.Status() == protocol.StatusOK {
 		// GET-style replies carry the value in p.Value. A GET-class reply

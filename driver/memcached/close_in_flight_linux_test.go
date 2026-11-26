@@ -90,7 +90,10 @@ func closeTargets(t *testing.T) []struct {
 	}
 }
 
-// Commands in flight (the server has read them and never answers) when Client.Close runs.
+// Commands in flight (the server has read them and never answers) when Client.Close runs. On the
+// event-loop paths Client.Close ends them with ErrClosed. A direct conn is checked out of the pool
+// and Client.Close closes the idle ones only: the command ends by its own reply or limit (here the
+// 500 ms per-operation limit, a deadline error): what it must never do is return success.
 func TestClientCloseFailsTheCommandsInFlight(t *testing.T) {
 	for _, proto := range []Protocol{ProtocolText, ProtocolBinary} {
 		for _, p := range closeTargets(t) {
@@ -98,7 +101,11 @@ func TestClientCloseFailsTheCommandsInFlight(t *testing.T) {
 				t.Run(fmt.Sprintf("%v/%s/%s", proto, p.name, cmd), func(t *testing.T) {
 					var inflight atomic.Int64
 					addr := answerServer(t, proto == ProtocolBinary, true, &inflight)
-					c, err := NewClient(addr, append([]Option{WithProtocol(proto), WithDialTimeout(2 * time.Second), WithTimeout(20 * time.Second)}, p.opts()...)...)
+					limit := 20 * time.Second
+					if p.name == "direct" {
+						limit = 500 * time.Millisecond
+					}
+					c, err := NewClient(addr, append([]Option{WithProtocol(proto), WithDialTimeout(2 * time.Second), WithTimeout(limit)}, p.opts()...)...)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -128,7 +135,7 @@ func TestClientCloseFailsTheCommandsInFlight(t *testing.T) {
 					for i := 0; i < n; i++ {
 						select {
 						case err := <-errs:
-							if !errors.Is(err, ErrClosed) {
+							if !errors.Is(err, ErrClosed) && !(p.name == "direct" && errors.Is(err, context.DeadlineExceeded)) {
 								t.Errorf("%s in flight during Client.Close returned %v, want ErrClosed", cmd, err)
 							}
 						case <-time.After(8 * time.Second):
