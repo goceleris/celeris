@@ -993,6 +993,21 @@ func (c *pgConn) buildMessage(fn func(*protocol.Writer) []byte) []byte {
 // hand the bytes to the mini-loop (or the engine's loop for WithEngine,
 // non-async mode).
 func (c *pgConn) writeRaw(data []byte) error {
+	// A write that fails ends the connection's use: the statement it belongs to
+	// is cut off, so its error is the connection-loss error (lostError: matches
+	// ErrClosed and io.ErrUnexpectedEOF and keeps the write error in its chain,
+	// errors.Is on the errno or on ErrUnknownFD still holds), not the bare errno
+	// or "file descriptor not registered" that a close landing while the frames
+	// are written produces.
+	if err := c.writeRawPlain(data); err != nil {
+		return lostError(err)
+	}
+	return nil
+}
+
+// writeRawPlain is writeRaw with the transport's own error: Close uses it,
+// whose write of Terminate on a conn the loop tore down is not a failure.
+func (c *pgConn) writeRawPlain(data []byte) error {
 	if c.useDirect {
 		c.directMu.Lock()
 		_, err := c.tcp.Write(data)
@@ -3222,7 +3237,7 @@ func (c *pgConn) Close() error {
 		if c.useDirect {
 			if c.tcp != nil {
 				_ = c.tcp.SetWriteDeadline(time.Now().Add(time.Second))
-				if err := c.writeRaw(termBytes); err != nil && firstErr == nil {
+				if err := c.writeRawPlain(termBytes); err != nil && firstErr == nil {
 					firstErr = err
 				}
 				if err := c.tcp.Close(); err != nil && firstErr == nil {
@@ -3235,7 +3250,7 @@ func (c *pgConn) Close() error {
 			// them on the conn's own number). The loop then answers
 			// ErrUnknownFD to both: that is what teardown looks like, not a
 			// failure of Close, so it is not Close's error (celeris#887).
-			if err := c.writeRaw(termBytes); err != nil && firstErr == nil && !errors.Is(err, ErrUnknownFD) {
+			if err := c.writeRawPlain(termBytes); err != nil && firstErr == nil && !errors.Is(err, ErrUnknownFD) {
 				firstErr = err
 			}
 			if err := c.loop.UnregisterConn(c.fd); err != nil && firstErr == nil && !errors.Is(err, ErrUnknownFD) {
@@ -3517,7 +3532,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	payload := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteQuery(w, query) })
 	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
-		return 0, err
+		return 0, req.failedErr(err)
 	}
 	// Wait for CopyInResponse before streaming.
 	select {
@@ -3571,7 +3586,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		if werr := c.writeRaw(frame); werr != nil {
 			_ = c.sendCopyFail(werr.Error())
 			awaitDoneBounded()
-			return 0, werr
+			return 0, req.failedErr(werr)
 		}
 	}
 	if serr := src.Err(); serr != nil {
@@ -3585,7 +3600,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	doneFrame := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteCopyDone(w) })
 	if werr := c.writeRaw(doneFrame); werr != nil {
 		awaitDoneBounded()
-		return 0, werr
+		return 0, req.failedErr(werr)
 	}
 	if c.useDirect {
 		// Direct mode: the background reader goroutine drives onRecv
@@ -3666,7 +3681,7 @@ func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte)
 	payload := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteQuery(w, query) })
 	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
-		return err
+		return req.failedErr(err)
 	}
 	if c.useDirect {
 		// See awaitDirectWithCancel contract: CancelRequest + bounded
