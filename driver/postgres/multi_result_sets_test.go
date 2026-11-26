@@ -247,7 +247,7 @@ func multiRunners(t *testing.T) []*multiRunner {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db := sql.OpenDB(conn.WithEngine(looptest.Unstarted()))
+	db := sql.OpenDB(conn.WithStreaming().WithEngine(looptest.Unstarted()))
 	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = db.Close() })
 	out = append(out, &multiRunner{

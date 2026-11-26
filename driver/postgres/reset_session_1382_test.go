@@ -146,7 +146,7 @@ func (f *resetFake) dial(t *testing.T) (*pgConn, context.Context) {
 func (f *resetFake) db(t *testing.T) *sql.DB {
 	t.Helper()
 	host, port, _ := net.SplitHostPort(f.addr)
-	cn, err := NewConnector("postgres://u@" + host + ":" + port + "/d?sslmode=disable")
+	cn, err := NewConnector(armDSN("postgres://u@" + host + ":" + port + "/d?sslmode=disable"))
 	if err != nil {
 		t.Fatal(err)
 	}

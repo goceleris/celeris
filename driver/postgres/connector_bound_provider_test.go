@@ -1,6 +1,8 @@
 package postgres
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,6 +94,37 @@ func TestConnectorBoundToAnInlineServerIsDirectWithTheCap(t *testing.T) {
 		cn.provMu.Unlock()
 		if prov != engine.EventLoopProvider(noSyncProvider{}) || owns {
 			t.Errorf("%s: Connect replaced the bound provider with %v (owns=%v)", name, prov, owns)
+		}
+	}
+}
+
+// Every method of Connector that returns a new Connector (a With* method) is in
+// the chain test above: clone() does not copy the provider, so each one has to
+// keep (or, like WithEngine, replace) it itself, and one that forgets it silently
+// moves a Connector bound to a started server onto the driver's own loop. A new
+// With* method fails here until it is added to that test.
+func TestConnectorEveryWithMethodIsInTheChainTest(t *testing.T) {
+	covered := map[string]bool{
+		"WithEngine":         true, // replaces the provider (TestConnectorChainKeepsTheBoundProvider)
+		"WithMaxResultBytes": true, // keeps it
+		"WithSocketBusyPoll": true, // keeps it
+		"WithStreaming":      true, // keeps it
+	}
+	typ := reflect.TypeOf(&Connector{})
+	seen := map[string]bool{}
+	for i := 0; i < typ.NumMethod(); i++ {
+		name := typ.Method(i).Name
+		if !strings.HasPrefix(name, "With") {
+			continue
+		}
+		seen[name] = true
+		if !covered[name] {
+			t.Errorf("Connector.%s is not in TestConnectorChainKeepsTheBoundProvider: add it there, and make it keep the provider WithEngine bound (clone() does not copy it)", name)
+		}
+	}
+	for name := range covered {
+		if !seen[name] {
+			t.Errorf("%s is listed as covered but Connector has no such method", name)
 		}
 	}
 }

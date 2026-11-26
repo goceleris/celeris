@@ -224,7 +224,7 @@ func prepareArms() []prepareArm {
 			return poolRun(p)
 		}},
 		{"database-sql", func(t *testing.T, addr string) func(context.Context, string) error {
-			db, err := sql.Open(DriverName, dsnFor(addr))
+			db, err := sql.Open(DriverName, armDSN(dsnFor(addr)))
 			if err != nil {
 				t.Fatal(err)
 			}

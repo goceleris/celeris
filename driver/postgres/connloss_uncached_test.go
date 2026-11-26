@@ -62,7 +62,7 @@ func uncachedDSN(addr string, st uncachedStmt) string { return lossDSN(addr) + s
 
 func uncachedCarriers() []uncachedCarrier {
 	openSQL := func(t *testing.T, addr string, st uncachedStmt) *sql.DB {
-		db, err := sql.Open(DriverName, uncachedDSN(addr, st))
+		db, err := sql.Open(DriverName, armDSN(uncachedDSN(addr, st)))
 		if err != nil {
 			t.Fatal(err)
 		}
