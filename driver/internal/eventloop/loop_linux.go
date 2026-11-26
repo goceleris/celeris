@@ -1588,6 +1588,7 @@ func (w *worker) readTurnLocked(c *driverConn, events uint32) {
 			return
 		}
 		if n > 0 && c.onRecv != nil {
+			DispatchPause()
 			c.onRecv(w.rbuf[:n])
 		}
 		if err != nil {

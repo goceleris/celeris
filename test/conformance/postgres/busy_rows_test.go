@@ -74,7 +74,8 @@ type busyEnv struct {
 	closeAll func() error // db.Close / Pool.Close
 	// ctxCancel is the cancel func of the ctx the first statement ran under.
 	ctxCancel context.CancelFunc
-	// direct is set for the native Pool in direct mode, which buffers the whole
+	// direct is set for a carrier in direct mode (the native Pool, or database/sql
+	// on a Connector bound to a started server), which buffers the whole
 	// first result before it returns: there a second statement while the Rows is
 	// open works, as it always did, and must go on working.
 	direct bool
@@ -228,7 +229,7 @@ func busyOpenSQLTx(t *testing.T) *busyEnv {
 		t.Fatal(err)
 	}
 	env := &busyEnv{
-		name: "sql.Tx", r1: r1, ctxCancel: cancel,
+		name: "sql.Tx", r1: r1, ctxCancel: cancel, direct: busySQLDirect(),
 		exec: func(ctx context.Context, q string) error { _, err := tx.ExecContext(ctx, q); return err },
 		query: func(ctx context.Context, q string) (busyRows, error) {
 			r, err := tx.QueryContext(ctx, q)
@@ -264,7 +265,7 @@ func busyOpenSQLConn(t *testing.T) *busyEnv {
 		t.Fatal(err)
 	}
 	env := &busyEnv{
-		name: "sql.Conn", r1: r1, ctxCancel: cancel,
+		name: "sql.Conn", r1: r1, ctxCancel: cancel, direct: busySQLDirect(),
 		exec: func(ctx context.Context, q string) error { _, err := c.ExecContext(ctx, q); return err },
 		query: func(ctx context.Context, q string) (busyRows, error) {
 			r, err := c.QueryContext(ctx, q)
@@ -329,6 +330,23 @@ func busyOpenNativeTx(t *testing.T) *busyEnv {
 // buffers the whole result); a bare Open is direct as well.
 func busyPoolOnLoop() bool {
 	return os.Getenv("CELERIS_CONFORMANCE_ENGINE") == "default"
+}
+
+// busySQLDirect reports whether the database/sql connections of this arm are
+// direct (Go's netpoll, the mode of a Pool on a started server): a Connector bound
+// to a STARTED server runs direct (celeris#1445: a connection opened on the loop
+// of an inline handler would wait for its startup reply on the worker that has to
+// read it). Direct buffers the whole result, so there is no streaming Rows and no
+// ErrRowsOpen: the second statement is served and the first Rows stays intact,
+// as for the native Pool in direct mode. The other arms (none, default, epoll: the
+// server is not started when the Connector is bound) stay on the driver's own
+// loop.
+func busySQLDirect() bool {
+	switch os.Getenv("CELERIS_CONFORMANCE_ENGINE") {
+	case "default-started", "default-ready", "epoll-started", "epoll-ready":
+		return true
+	}
+	return false
 }
 
 // busyCarriers lists, for each carrier, the second statements it has (a skipped
@@ -474,14 +492,24 @@ func TestBusyConnFinishWithRowsOpen(t *testing.T) {
 				t.Logf("%s %s with an open Rows: err = %v in %v", car, how, err, el)
 				switch {
 				case car == "nativeTx" && how == "Commit" && !env.direct:
-					// The Rows is still open: Commit says so, sends nothing and leaves the
-					// Tx open, so that the caller can close the Rows and commit again, or
-					// roll back.
+					// The Rows is still open: Commit says so, sends nothing, and ends the
+					// Tx (as every Commit does): a later Rollback, the defer idiom,
+					// returns ErrTxDone.
 					if !isRowsOpen(err) {
 						t.Fatalf("native Tx Commit with a streaming Rows open: err = %v, want ErrRowsOpen", err)
 					}
-					if err := busyOnly(t, env, "Rollback after the refused Commit", env.rollback); err != nil {
-						t.Fatalf("Rollback after the refused Commit: %v", err)
+					if rerr := busyOnly(t, env, "Rollback after the Commit", env.rollback); !errors.Is(rerr, postgres.ErrTxDone) {
+						t.Fatalf("Rollback after the Commit: %v, want ErrTxDone", rerr)
+					}
+					n := 0
+					_, _ = busyWatch(t, "drain after the Commit", 30*time.Second, func() int {
+						for env.r1.Next() {
+							n++
+						}
+						return n
+					})
+					if rerr := env.r1.Err(); rerr == nil || rerr == io.EOF || !errors.Is(rerr, postgres.ErrClosed) || !errors.Is(rerr, io.ErrUnexpectedEOF) {
+						t.Fatalf("native Tx Commit with a streaming Rows open: the Rows ended after %d rows with Err = %v, want an error matching ErrClosed and io.ErrUnexpectedEOF", n, rerr)
 					}
 				case err != nil:
 					// database/sql closes the Rows first and finishes; a direct Pool has

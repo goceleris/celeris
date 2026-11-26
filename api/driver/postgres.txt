@@ -118,6 +118,7 @@ var ErrResultTooBig error
 var ErrRowsOpen error
 var ErrSSLNotSupported error
 var ErrTxCommitRollback error
+var ErrTxDone error
 var ErrTxLeftOpen error
 var ErrUnknownFD error
 var ErrUnsupportedAuth error

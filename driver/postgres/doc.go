@@ -21,7 +21,9 @@
 // pool shares the HTTP server's event loop instead of resolving a standalone
 // one; a bare [Open] and [WithEngine] on a server that has started or runs
 // async handlers give a direct-mode pool, whose results are capped at 64 MiB
-// (see [ErrResultTooBig]: always check [Rows.Err]).
+// (see [ErrResultTooBig]: always check [Rows.Err]). The same holds for the
+// connections of a [Connector] bound to a started epoll, io_uring or adaptive
+// server ([Connector.WithEngine] says which mode it uses when).
 // [WithWorker] adds a per-call worker-affinity hint to a context.
 //
 // Query with [Pool.QueryContext] (returns [*Rows]), [Pool.QueryRow]
@@ -30,7 +32,11 @@
 // [Tx.Rollback], and savepoint helpers ([Tx.Savepoint],
 // [Tx.ReleaseSavepoint], [Tx.RollbackToSavepoint]). Bulk loads use
 // [Pool.CopyFrom] (feed rows via [CopyFromSource] or [CopyFromSlice]) and
-// [Pool.CopyTo].
+// [Pool.CopyTo]. A call to [Tx.Commit] or [Tx.Rollback] ends the Tx whatever it
+// returns: a failed Commit is not retried on the same Tx, every later call on the
+// Tx returns [ErrTxDone] (a deferred Rollback after a failed Commit is safe), and
+// its connection is released: back to the pool if the driver knows the session is
+// idle, discarded otherwise.
 //
 // Server errors surface as [*PGError] carrying the SQLSTATE code; match
 // with errors.As. Package sentinels include [ErrPoolClosed], [ErrClosed],

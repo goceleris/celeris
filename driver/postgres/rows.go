@@ -90,6 +90,13 @@ func (r *pgRows) Close() error {
 	r.closed = true
 	r.rows = nil
 	r.columns = nil
+	// A rejected multi-result-set query is the one error Close reports: a caller
+	// that read one row and closed (QueryRow, database/sql's Row.Scan returns the
+	// error of Close) must not take the first set as the answer.
+	var closeErr error
+	if r.err == errMultiResultSets {
+		closeErr = r.err
+	}
 	r.err = nil
 	req := r.req
 	r.req = nil
@@ -99,7 +106,7 @@ func (r *pgRows) Close() error {
 	// Return the pgRows struct itself to the pool. idx/textFormat are
 	// overwritten on the next Get.
 	pgRowsPool.Put(r)
-	return nil
+	return closeErr
 }
 
 // Next decodes the next row into dest. Returns io.EOF at end, or a deferred
@@ -206,9 +213,9 @@ func (r *pgRows) ColumnTypeDatabaseTypeName(i int) string {
 	return codec.Name
 }
 
-// HasNextResultSet reports whether a multi-statement simple query produced
-// another result set after the current one. The driver flattens multi-
-// statement results into a single pgRows, so this is always false.
+// HasNextResultSet is always false: the driver has no multiple result sets. A
+// query whose statements return rows in more than one of them fails with
+// errMultiResultSets instead of being flattened into one pgRows.
 func (r *pgRows) HasNextResultSet() bool { return false }
 
 // NextResultSet advances to the next result set; always returns io.EOF for
@@ -359,6 +366,10 @@ func (r *streamRows) Close() error {
 	r.columns = nil
 	if req != nil {
 		releasePgRequest(req)
+	}
+	// See pgRows.Close: the rejected multi-result-set query is reported by Close.
+	if r.err == errMultiResultSets {
+		return r.err
 	}
 	return nil
 }
