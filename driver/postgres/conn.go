@@ -3348,11 +3348,16 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 		return 0, errors.New("celeris-postgres: COPY FROM ended before CopyInResponse")
 	case <-ctx.Done():
-		confirmed := c.cancelRunning()
-		<-req.doneCh
-		if confirmed && req.err != nil {
-			return 0, req.err
-		}
+		// The context ended before the server's CopyInResponse. A CancelRequest
+		// is no way out: the statement may not be running yet, and when it
+		// starts after the cancel was dropped the server waits in COPY IN for
+		// data that this call, which is returning, will never send; nothing then
+		// completes req and a wait for doneCh never ends (the conn and its
+		// pool slot wedged for good). The state of the session is unknown, so
+		// the conn is closed, not reused: failAll marks it closed and completes
+		// req, and Pool.release discards it (the server leaves COPY IN when the
+		// socket closes) and the pool dials a replacement.
+		c.failAll(errCopyCancelled)
 		return 0, ctx.Err()
 	}
 

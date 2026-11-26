@@ -43,6 +43,11 @@ var cancelDrainTimeout = 30 * time.Second
 // reaches no caller: the statement's caller gets its own ctx error.
 var errCancelUnconfirmed = errors.New("celeris-postgres: cancel request not confirmed by the server")
 
+// errCopyCancelled fails the conn of a COPY FROM whose context ended before the
+// server's CopyInResponse (see copyFrom). It reaches no caller: the call
+// returns its context's error.
+var errCopyCancelled = errors.New("celeris-postgres: COPY FROM cancelled before the server answered; connection closed")
+
 // sendCancelRequest dials a fresh short-lived TCP connection to addr,
 // transmits a CancelRequest and waits for the server to close the socket.
 // Does not use the event loop.
