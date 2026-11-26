@@ -27,6 +27,8 @@ import (
 //	SELECT <x>         one row, x, at once
 //	SELECT slow        no byte until a cancel; then 57014 + ReadyForQuery
 //	SELECT drip        a RowDescription and a row, then as slow
+//	SELECT drip2       as drip, with one more row 80 ms after the first, and the
+//	                   57014 drainDelay after the cancel
 //	SELECT draindelay  as slow, but the 57014 comes drainDelay after the cancel
 //	SELECT copyout     CopyOutResponse and a few CopyData rows, then as slow
 //	COPY ... FROM STDIN  CopyInResponse, then it reads CopyData until CopyDone or
@@ -171,15 +173,24 @@ func (f *markerPG) serve(c net.Conn) {
 			(*h)(q)
 		}
 		switch {
-		case q == "SELECT slow", q == "SELECT drip", q == "SELECT draindelay":
-			if q == "SELECT drip" {
+		case q == "SELECT slow", q == "SELECT drip", q == "SELECT drip2", q == "SELECT draindelay":
+			if q == "SELECT drip" || q == "SELECT drip2" {
 				_ = writeMsg(c, protocol.BackendRowDescription, markerRowDesc())
 				_ = writeMsg(c, protocol.BackendDataRow, markerDataRow("partial"))
+			}
+			if q == "SELECT drip2" {
+				// more bytes 80 ms later: the blocked read returns then
+				select {
+				case <-time.After(80 * time.Millisecond):
+				case <-f.done:
+					return
+				}
+				_ = writeMsg(c, protocol.BackendDataRow, markerDataRow("more"))
 			}
 			if !f.waitCancel() {
 				return
 			}
-			if q == "SELECT draindelay" {
+			if q == "SELECT draindelay" || q == "SELECT drip2" {
 				select {
 				case <-time.After(f.drainDelay):
 				case <-f.done:
@@ -586,6 +597,50 @@ func TestDirectCancelWatchCallbackInFlightAcrossTheStatementsEnd(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The callback of the watch is in flight (it sleeps 100 ms) when the loop of
+// driveDirect first sees the ended context, and the cancel drain begins: the
+// context ends 40 ms into a statement whose second packet arrives at 80 ms, so
+// the read returns at 80 ms with the callback still asleep until about 140 ms.
+// settleCtxWatch at the top of cancelDrainDirect waits for it BEFORE the drain
+// sets its own read deadline; a callback that ran after that would replace the
+// drain's deadline with "now", the drain would fail and the conn would be
+// discarded (sessions would be 2).
+func TestDirectCancelWatchCallbackInFlightWhenTheDrainBegins(t *testing.T) {
+	f := startMarkerPG(t)
+	f.drainDelay = 200 * time.Millisecond // the drain outlasts the callback's remaining sleep
+	p := openMarkerPool(t, f)
+	if _, err := marker(context.Background(), p, "warm"); err != nil {
+		t.Fatal(err)
+	}
+	var ran atomic.Int64
+	hold := func() { ran.Add(1); time.Sleep(100 * time.Millisecond) }
+	testHookCtxWatch.Store(&hold)
+	t.Cleanup(func() { testHookCtxWatch.Store(nil) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := func(q string) {
+		if q == "SELECT drip2" {
+			time.AfterFunc(40*time.Millisecond, cancel)
+		}
+	}
+	f.onQuery.Store(&h)
+	var err error
+	start := time.Now()
+	watchdog(t, 5*time.Second, "the cancelled statement", func() { _, err = p.ExecContext(ctx, "SELECT drip2") })
+	el := time.Since(start)
+	f.onQuery.Store(nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if ran.Load() != 1 {
+		t.Fatalf("the callback ran %d times, want 1", ran.Load())
+	}
+	if el < 130*time.Millisecond {
+		t.Fatalf("returned after %v: the call did not wait for the callback (held until ~140 ms)", el)
+	}
+	requireCleanOrReplaced(t, f, p, 1, false)
 }
 
 // The context ends at the instant the reply arrives, 20,000 times, so that the
