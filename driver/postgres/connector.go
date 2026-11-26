@@ -115,7 +115,12 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	// refcount lives here, not on the conn. The pgConn's closeLoop is nil.
 	dsn := c.dsn
 	dsn.Options.busyPoll = eventloop.BusyPoll(c.engine, c.busyPoll)
-	return dialConn(ctx, prov, nil, dsn, -1)
+	c2, err := dialConn(ctx, prov, nil, dsn, -1)
+	if err != nil {
+		return nil, err
+	}
+	c2.sqlOwned = true
+	return c2, nil
 }
 
 // Driver returns the singleton Driver.

@@ -250,6 +250,7 @@ type streamRows struct {
 	codecs     []*protocol.TypeCodec // cached lookup per column
 	textFormat bool
 
+	state  *streamState           // the conn's busy mark of this stream; Close sets closing
 	rowCh  chan [][]byte          // bounded channel; closed by dispatch on completion
 	doneCh chan struct{}          // signaled after ReadyForQuery (request fully done)
 	req    *pgRequest             // owns slab memory; released on Close
@@ -345,6 +346,10 @@ func (r *streamRows) Next(dest []driver.Value) error {
 func (r *streamRows) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
+	}
+	if r.state != nil {
+		// A statement that starts from here waits for the drain (rowsOpenErr).
+		r.state.closing.Store(true)
 	}
 	// Drain remaining rows so dispatch doesn't block forever.
 	for range r.rowCh { //revive:disable-line:empty-block drain until closed

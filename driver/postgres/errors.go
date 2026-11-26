@@ -33,29 +33,31 @@ var ErrTxCommitRollback = errors.New("celeris-postgres: commit unexpectedly resu
 // it) and whose consumer has not read it to the end or closed it. A result under
 // 64 rows is buffered whole when the call returns and does not count, nor does a
 // larger one the connection has already received in full. The wire carries one
-// statement at a time, and the first statement's rows are read by the code that
-// has not got to them yet: answering the second one would wait for the first,
-// which only that caller can finish, so the call fails at once instead, before it
-// takes any lock or writes anything, and nothing is sent to the server.
+// statement at a time, and the rows of the first one are read by the code that
+// has not got to them yet: the second statement would wait for the first, which
+// only that caller can finish. So the call fails at once instead, before it takes
+// any lock or sends anything.
 //
-// It is reported by every call that would start a request on the connection:
-// Exec, Query, QueryRow, Prepare, Ping, BeginTx, Commit, Rollback and
-// Savepoint on a [Tx], a [database/sql.Tx], a [database/sql.Conn] or a [Pool]
-// transaction, and CopyFrom and CopyTo on a connection that is held. It matches
-// with errors.Is, also through database/sql, which returns the driver's error as
-// it is. It does not wrap [driver.ErrBadConn], so database/sql does not discard the
-// connection nor retry the statement. The open Rows is not disturbed: it goes on
-// delivering its rows, and Close, or reading it to the end, frees the connection
-// for the next statement.
+// It is what a *database/sql.Tx or *database/sql.Conn returns for Exec, Query,
+// QueryRow, Prepare and (Conn) Ping while a Rows of it is open, and what a [Tx] of
+// a [Pool] returns for ExecContext, QueryContext, QueryRow, Savepoint,
+// ReleaseSavepoint, RollbackToSavepoint and Commit. It matches with errors.Is,
+// also through database/sql, which returns the driver's error as it is. It does
+// not match [driver.ErrBadConn], so database/sql neither discards the connection
+// nor retries the statement. The open Rows is not disturbed: it goes on
+// delivering its rows, and Close, or reading it to the end, frees the
+// connection for the next statement.
 //
-// A *sql.DB (a pool, not a Tx or Conn) does not meet it: a second statement takes
-// another connection. [Pool] methods outside a Tx do not either. On a [Pool] Tx,
-// Commit returns it with the Tx still open (close the Rows and Commit again), and
-// Rollback does not: it discards the connection (the server rolls the transaction
-// back when the connection ends) and returns nil; the open Rows then ends with an
-// error. Direct mode (a [Pool] opened without [WithEngine], or on a server that
-// has started) buffers the whole result before it returns, so a second statement
-// there works while the first Rows is open and this error does not occur.
+// A *sql.DB (not a Tx or Conn) does not meet it: a second statement takes
+// another connection. [Pool] methods outside a Tx do not either (each takes a
+// connection of its own, CopyFrom and CopyTo included). On a [Pool] Tx, Commit
+// returns it with the Tx still open (close the Rows and Commit again), and
+// Rollback does not: it discards the connection (the server rolls the
+// transaction back when the connection ends) and returns nil; the open Rows then
+// ends with an error. A Pool in direct mode (a bare [Open], or [WithEngine] on a
+// server that has started) buffers a result whole before it returns, up to the
+// 64 MiB cap of [ErrResultTooBig], so a second statement there works while the
+// first Rows is open and this error does not occur.
 var ErrRowsOpen = errors.New("celeris-postgres: a Rows is still open on this connection; close it, or read it to the end, before the next statement")
 
 // ErrBadConn is returned when a connection is in an unusable state; returning

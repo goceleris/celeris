@@ -189,6 +189,9 @@ type pgRequest struct {
 	// release. promoteToStreaming, which runs on the loop with only the request
 	// in hand, marks the conn busy through it (pgConn.streaming).
 	conn *pgConn
+	// stream is the busy mark of the request while it streams (streamState): set
+	// by promoteToStreaming under chMu, dropped on release.
+	stream *streamState
 	// doneFlag / doneMu guard close(doneCh) so concurrent completion sites —
 	// the event loop's dispatch (onRecv), failAll (onClose), and failReq
 	// (Write error) — cannot double-close. We use a (mu, bool) pair rather
@@ -222,6 +225,7 @@ type pgRequest struct {
 // the channel is unbuffered and we fall back to close-broadcast — wait()
 // works the same whether it receives a value or sees a closed channel.
 func (r *pgRequest) finish() {
+	r.endStream()
 	r.doneMu.Lock()
 	if r.doneFlag {
 		r.doneMu.Unlock()
@@ -254,6 +258,7 @@ func (r *pgRequest) finish() {
 // continue to set r.err directly and call r.finish(); fail() is for the
 // two-goroutine paths where failReq (caller) races failAll (event loop).
 func (r *pgRequest) fail(err error) {
+	r.endStream()
 	r.doneMu.Lock()
 	if r.doneFlag {
 		r.doneMu.Unlock()
@@ -350,6 +355,7 @@ func releasePgRequest(r *pgRequest) {
 	}
 	r.ctx = nil
 	r.conn = nil
+	r.stream = nil
 	r.kind = 0
 	// Preserve the scratch slices inside each state machine so subsequent
 	// life cycles reuse the backing arrays.
@@ -766,17 +772,23 @@ type pgConn struct {
 	pendingMu sync.Mutex
 	pending   []*pgRequest
 
-	// streaming is the request whose Rows is streaming and still being received:
-	// set by promoteToStreaming before the caller is woken with the Rows, and
-	// cleared before the request's rowCh is closed at its end (dispatchHead,
-	// failAll). While it is set the conn is busy: the loop worker is delivering
-	// that request's rows to a consumer that is not reading them yet, and a
-	// second statement would wait for it with locks held and no way out
-	// (rowsOpenErr). nil when no stream is in flight, which is every conn but one
-	// serving a result larger than the streaming threshold that its consumer has
-	// not taken to the end; a request the conn has received in full is not
-	// streaming, even while its Rows is open.
-	streaming atomic.Pointer[pgRequest]
+	// streaming is the busy mark: the state of the request whose Rows is
+	// streaming and still being received. Set by promoteToStreaming before the
+	// caller is woken with the Rows, cleared before the request's rows channel
+	// is closed at its end (dispatchHead, failAll, and as a backstop finish and
+	// fail). While it is set the loop worker is delivering that request's rows to
+	// a consumer that is not reading them yet, and a statement started now would
+	// wait for it with locks held and no way out: rowsOpenErr answers it instead.
+	// nil when no stream is in flight, which is every conn but one serving a
+	// result larger than the streaming threshold that its consumer has not taken
+	// to the end; a request the conn has received in full is not streaming, even
+	// while its Rows is open.
+	streaming atomic.Pointer[streamState]
+	// sqlOwned marks a conn that database/sql owns (opened by the Connector):
+	// database/sql closes its Rows when their ctx ends, so a Rows whose ctx is
+	// done is being closed (rowsOpenErr). The native Pool's Rows is not: it
+	// ignores ctx once the call has returned.
+	sqlOwned bool
 
 	stmtCache *lru
 	// autoCache, when true, routes cacheable SELECT-style QueryContext
@@ -1356,22 +1368,94 @@ func (c *pgConn) enqueue(req *pgRequest) {
 	c.bridge.Enqueue(req)
 }
 
-// rowsOpenErr is the busy check: ErrRowsOpen when a streaming Rows is open on
-// the conn, nil otherwise. Every call that starts a request on the conn makes it
-// first, before it takes any lock or builds anything (see ErrRowsOpen). It is one
-// atomic load.
-func (c *pgConn) rowsOpenErr() error {
-	if c.streaming.Load() != nil {
-		return ErrRowsOpen
+// streamState is what a streaming request leaves on its conn (pgConn.streaming).
+type streamState struct {
+	// ctx is the ctx of the statement that streams.
+	ctx context.Context
+	// rowCh is the request's rows channel.
+	rowCh chan [][]byte
+	// closing is set when a Close of the Rows has started (streamRows.Close).
+	closing atomic.Bool
+	// ended is closed when the request has stopped streaming.
+	ended   chan struct{}
+	endOnce sync.Once
+}
+
+func (s *streamState) end() { s.endOnce.Do(func() { close(s.ended) }) }
+
+// drain takes the rows the consumer is not going to read out of the channel
+// until the request closes it, or ctx ends.
+func (s *streamState) drain(ctx context.Context) error {
+	for {
+		select {
+		case _, ok := <-s.rowCh:
+			if !ok {
+				return nil
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// endStream clears the busy mark of r, a request that has stopped streaming: its
+// last row has been sent, or it failed, so nothing is waiting on its consumer
+// any more, and wakes the statements waiting for that. A no-op for a request
+// that never streamed. dispatchHead and failAll call it before they close the
+// rows channel (a consumer that sees the end of its rows must not meet a stale
+// mark); finish and fail call it as well, so that no way of ending a request
+// can leave one behind.
+func (r *pgRequest) endStream() {
+	s := r.stream
+	if s == nil {
+		return
+	}
+	if c := r.conn; c != nil {
+		c.streaming.CompareAndSwap(s, nil)
+	}
+	s.end()
+}
+
+// rowsOpenErr is the busy check, made first by every call that starts a request
+// on the conn, before it takes any lock or builds anything. With no stream in
+// flight it is one atomic load. With one, there are two states:
+//
+//   - the Rows is open and nobody is closing it: ErrRowsOpen at once (the
+//     caller's mistake, see [ErrRowsOpen]);
+//   - its Close has started, or, on a conn database/sql owns, the ctx of the
+//     statement has ended (database/sql's Rows.Next already returns false then,
+//     and its awaitDone closes the Rows within moments): the statement waits for
+//     the drain, bounded by its own ctx, whose error it returns if that ends
+//     first, and goes on. With no Close started yet it drains the channel itself:
+//     database/sql's close needs the driverConn lock this call is holding, so
+//     waiting for it would be a cycle.
+func (c *pgConn) rowsOpenErr(ctx context.Context) error {
+	if s := c.streaming.Load(); s != nil {
+		return c.rowsOpenWait(ctx, s)
 	}
 	return nil
 }
 
-// streamEnded clears the busy mark of req, a request that has stopped
-// streaming: its last row has been sent, or it failed, so nothing is waiting on
-// its consumer any more. A no-op for a request that never streamed.
-func (c *pgConn) streamEnded(req *pgRequest) {
-	c.streaming.CompareAndSwap(req, nil)
+func (c *pgConn) rowsOpenWait(ctx context.Context, s *streamState) error {
+	for s != nil {
+		closing := s.closing.Load()
+		cancelled := c.sqlOwned && s.ctx != nil && s.ctx.Err() != nil
+		if !closing && !cancelled {
+			return ErrRowsOpen
+		}
+		if !closing {
+			if err := s.drain(ctx); err != nil {
+				return err
+			}
+		}
+		select {
+		case <-s.ended:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		s = c.streaming.Load()
+	}
+	return nil
 }
 
 // popHead removes the front-of-queue request.
@@ -1666,7 +1750,7 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		done, err := head.simple.Handle(msgType, payload, head)
 		if err != nil {
 			if head.rowCh != nil {
-				c.streamEnded(head)
+				head.endStream()
 				head.streamErr.Store(&err)
 				head.closeRowCh()
 				head.closeColsCh()
@@ -1679,7 +1763,7 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 			if head.rowCh != nil {
 				// Cleared before the consumer can see the end of its rows: one that
 				// goes on without Close must not meet a stale busy mark.
-				c.streamEnded(head)
+				head.endStream()
 				head.closeRowCh()
 			}
 			c.popHead()
@@ -1698,7 +1782,7 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 			// Scan with no OID: raw wire bytes into a string.
 			head.setResultIfLive("", head.extended.Columns)
 			if head.rowCh != nil {
-				c.streamEnded(head)
+				head.endStream()
 				head.streamErr.Store(&err)
 				head.closeRowCh()
 				head.closeColsCh()
@@ -1710,7 +1794,7 @@ func (c *pgConn) dispatchHead(head *pgRequest, msgType byte, payload []byte) err
 		if done {
 			head.setResultIfLive(head.extended.Tag, head.extended.Columns)
 			if head.rowCh != nil {
-				c.streamEnded(head)
+				head.endStream()
 				head.closeColsCh()
 				head.closeRowCh()
 			}
@@ -1863,7 +1947,8 @@ func promoteToStreaming(req *pgRequest) {
 	// see the mark. Under chMu, so that a failAll that has closed rowCh (and
 	// cleared the mark after it) is never followed by this store.
 	if req.conn != nil {
-		req.conn.streaming.Store(req)
+		req.stream = &streamState{ctx: req.ctx, rowCh: ch, ended: make(chan struct{})}
+		req.conn.streaming.Store(req.stream)
 	}
 	// Clear the buffer. We nil out the slice elements but retain the backing
 	// capacity for reuse by releasePgRequest. Done under chMu, after the
@@ -1938,7 +2023,7 @@ func (c *pgConn) failAll(err error) {
 		}
 		// Cleared after closeRowCh has marked the request closing (see
 		// promoteToStreaming), so a promotion that comes after cannot set it again.
-		c.streamEnded(r)
+		r.endStream()
 		// Use fail() so concurrent failReq (caller goroutine Write-error
 		// path) and this failAll (event-loop onClose path) cannot race on
 		// r.err. First winner's err is the one wait() observes.
@@ -1996,7 +2081,7 @@ func (c *pgConn) prepareStatement(ctx context.Context, name, query string) (*pro
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
-	if err := c.rowsOpenErr(); err != nil {
+	if err := c.rowsOpenErr(ctx); err != nil {
 		return nil, err
 	}
 	ps := &prepareState{name: name, query: query}
@@ -2338,7 +2423,7 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
-	if err := c.rowsOpenErr(); err != nil {
+	if err := c.rowsOpenErr(ctx); err != nil {
 		return nil, err
 	}
 	if c.useDirect && isListenOrUnlisten(query) {
@@ -2463,6 +2548,7 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 		// Streaming activated — promoteToStreaming allocated rowCh and
 		// closed colsCh. Rows will continue streaming through rowCh.
 		sr := &streamRows{
+			state:      req.stream,
 			columns:    req.columns,
 			textFormat: textFormat,
 			rowCh:      req.rowCh,
@@ -2537,7 +2623,7 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 	if c.closed.Load() {
 		return "", 0, ErrClosed
 	}
-	if err := c.rowsOpenErr(); err != nil {
+	if err := c.rowsOpenErr(ctx); err != nil {
 		return "", 0, err
 	}
 	if c.useDirect && isListenOrUnlisten(query) {
@@ -2627,7 +2713,7 @@ func (c *pgConn) simpleExecCmd(ctx context.Context, query string, wantRollback b
 	if c.closed.Load() {
 		return false, ErrClosed
 	}
-	if err := c.rowsOpenErr(); err != nil {
+	if err := c.rowsOpenErr(ctx); err != nil {
 		return false, err
 	}
 	if c.useDirect && isListenOrUnlisten(query) {
@@ -2712,7 +2798,7 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
-	if err := c.rowsOpenErr(); err != nil {
+	if err := c.rowsOpenErr(ctx); err != nil {
 		return nil, err
 	}
 	values, formats, encSlot, err := encodeArgs(args)
@@ -2859,7 +2945,7 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
-	if err := c.rowsOpenErr(); err != nil {
+	if err := c.rowsOpenErr(ctx); err != nil {
 		return nil, err
 	}
 	values, formats, encSlot, err := encodeArgs(args)
@@ -3387,7 +3473,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	if c.closed.Load() {
 		return 0, ErrClosed
 	}
-	if err := c.rowsOpenErr(); err != nil {
+	if err := c.rowsOpenErr(ctx); err != nil {
 		return 0, err
 	}
 	if tableName == "" {
@@ -3540,7 +3626,7 @@ func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte)
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	if err := c.rowsOpenErr(); err != nil {
+	if err := c.rowsOpenErr(ctx); err != nil {
 		return err
 	}
 	if dest == nil {

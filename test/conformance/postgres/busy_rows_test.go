@@ -37,7 +37,11 @@ import (
 // rows) and than what the socket buffers hold, so the first statement is still
 // streaming (the server has not finished sending it) while its consumer is paused.
 const (
-	busyStreamQ    = "SELECT g, repeat('x', 200) || g::text FROM generate_series(1, 100000) g"
+	// Row 100 takes 0.2 s: the first rows reach the caller's sync poll, which finds the
+	// reply unfinished and hands it to the loop, so that the first statement
+	// streams on a fast server too (a result up to 64 MiB is otherwise buffered whole
+	// by that poll when the server keeps ahead of it).
+	busyStreamQ    = "SELECT g, repeat('x', 200) || g::text || CASE WHEN g = 100 THEN (SELECT '' FROM pg_sleep(0.2)) ELSE '' END FROM generate_series(1, 100000) g"
 	busyStreamRows = 100000
 	// busyBound is how fast the busy error must come back: no lock wait, no
 	// round trip.
