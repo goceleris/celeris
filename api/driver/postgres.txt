@@ -115,6 +115,7 @@ var ErrNoLastInsertID error
 var ErrPoolClosed error
 var ErrQueueFull error
 var ErrResultTooBig error
+var ErrRowsOpen error
 var ErrSSLNotSupported error
 var ErrTxCommitRollback error
 var ErrTxLeftOpen error
