@@ -746,7 +746,7 @@ func TestRxFreeReadsAreBounded(t *testing.T) {
 func TestRxFreeLog(t *testing.T) {
 	cpu := msr1(t, rng(0, 11))
 	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	log := testLog(&buf, slog.LevelDebug)
 
 	h := msr1RxReal(t, "msr1_rxfree_vector_on_cpu1.txt")
 	LogPinOutcome(log, "epoll", planWorkerCPUs(12, false, h.planSrc(cpu, clusterAddr)), nil)

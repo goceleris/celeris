@@ -909,8 +909,13 @@ func (s *Server) Addr() net.Addr {
 }
 
 // EventLoopProvider returns the engine's event-loop provider, or nil if the
-// engine does not expose one (e.g. the std net/http fallback) or the server
-// has not been started. The returned provider is shared with the HTTP path;
+// engine does not expose one (e.g. the std net/http fallback), the server
+// has not been started, or its engine is still starting: the provider is
+// returned once the engine has bound its address, which every native engine
+// does after its loops are built and ready (the same moment [Server.Addr]
+// becomes non-nil). A driver opened in that window gets the nil answer, the
+// one it gets before Start, and uses its own standalone loop. The returned
+// provider is shared with the HTTP path;
 // drivers register their own file descriptors on it to colocate database or
 // cache I/O on the same worker threads as HTTP requests.
 //
@@ -926,10 +931,19 @@ func (s *Server) EventLoopProvider() engine.EventLoopProvider {
 	if eng == nil {
 		return nil
 	}
-	if p, ok := eng.(engine.EventLoopProvider); ok {
-		return p
+	p, ok := eng.(engine.EventLoopProvider)
+	if !ok {
+		return nil
 	}
-	return nil
+	// publishEngine installs the engine in prepare, before Listen has built its
+	// loops: until then WorkerLoop panics ("called before Listen"), and a loop
+	// that exists but has not created its epoll descriptor yet refuses (and
+	// races with) a driver's registration. Every native engine publishes its
+	// address only after all its loops are ready, so a non-nil Addr is "ready".
+	if eng.Addr() == nil {
+		return nil
+	}
+	return p
 }
 
 // AsyncHandlers reports whether the server dispatches HTTP handlers to

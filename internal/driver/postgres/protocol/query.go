@@ -318,7 +318,8 @@ func RowsAffected(tag string) (int64, bool) {
 type simpleQueryPhase int
 
 const (
-	sqPhaseAwaitResult     simpleQueryPhase = iota // expect T, I, C, E
+	sqPhaseStart           simpleQueryPhase = iota // nothing yet: expect T, I, C, E (not Z)
+	sqPhaseAwaitResult                             // a statement ended or the query errored: expect T, I, C, E or Z
 	sqPhaseAwaitRowsOrDone                         // after RowDescription: expect D, C
 	sqPhaseDone                                    // ReadyForQuery seen
 )
@@ -327,11 +328,31 @@ const (
 // After calling WriteQuery, feed server messages one at a time via Handle.
 // Handle returns done=true after ReadyForQuery.
 //
-// Multi-statement queries are supported: after CommandComplete the state
-// machine returns to phaseAwaitResult, accepting another RowDescription.
+// Multi-statement queries are accepted: after CommandComplete the state
+// machine returns to phaseAwaitResult, accepting another RowDescription. The
+// caller of a row-returning query sets RejectMultiSet, because the driver
+// returns one result set; see that field.
 type SimpleQueryState struct {
 	Columns []ColumnDesc
 	Err     *PGError
+
+	// RejectMultiSet is set by a caller that returns rows (Query, not Exec)
+	// before the first message is fed. Then only the first RowDescription is
+	// parsed and dispatched. A later one is counted (MultiSet) and the rows of
+	// that and every later result set are read and discarded up to
+	// ReadyForQuery, so the connection stays in step and Columns, which the
+	// caller of the first result set holds, is never written again. Without
+	// it (Exec) every result set is parsed and dispatched as before.
+	RejectMultiSet bool
+	// MultiSet reports that the server sent a second RowDescription on a
+	// RejectMultiSet query: more than one statement returned rows. It is read
+	// after Handle reports ReadyForQuery.
+	MultiSet bool
+
+	// sawRowDesc is true once a RowDescription has been dispatched.
+	sawRowDesc bool
+	// discard is true while the rows of a result set after the first are read.
+	discard bool
 
 	phase simpleQueryPhase
 	// fieldScratch is reused across DataRow payloads within a single
@@ -419,12 +440,45 @@ func (q *SimpleQueryState) Handle(
 	obs SimpleQueryObserver,
 ) (bool, error) {
 	switch msgType {
+	case BackendNoticeResponse, BackendParameterStatus, BackendNotification:
+		// Out-of-band messages are harmless; ignore.
+		return false, nil
+	case BackendReadyForQuery:
+		// A Query is answered by CommandComplete, EmptyQueryResponse or
+		// ErrorResponse before its ReadyForQuery. Without one (or in the middle
+		// of a result set) this ReadyForQuery ends some other exchange.
+		if q.phase != sqPhaseAwaitResult {
+			return false, errors.New("postgres/protocol: unexpected ReadyForQuery in simple query before a statement ended")
+		}
+		q.phase = sqPhaseDone
+		if q.Err != nil {
+			return true, q.Err
+		}
+		return true, nil
+	}
+	if q.Err != nil && msgType != BackendErrorResponse {
+		// After an ErrorResponse the server sends nothing but ReadyForQuery
+		// (and the out-of-band messages above, and a FATAL ErrorResponse): the
+		// rest of the query is skipped.
+		return false, fmt.Errorf("postgres/protocol: unexpected message %q in simple query after an ErrorResponse", msgType)
+	}
+	switch msgType {
 	case BackendRowDescription:
+		if q.RejectMultiSet && q.sawRowDesc {
+			// A second result set. Not parsed: ParseRowDescriptionInto would
+			// rewrite Columns in place, the slice the caller of the first set
+			// holds (and reads on another goroutine). Not dispatched either.
+			q.MultiSet = true
+			q.discard = true
+			q.phase = sqPhaseAwaitRowsOrDone
+			return false, nil
+		}
 		cols, err := ParseRowDescriptionInto(q.Columns, payload)
 		if err != nil {
 			return false, err
 		}
 		q.Columns = cols
+		q.sawRowDesc = true
 		if obs != nil {
 			obs.OnRowDesc(cols)
 		}
@@ -433,6 +487,9 @@ func (q *SimpleQueryState) Handle(
 	case BackendDataRow:
 		if q.phase != sqPhaseAwaitRowsOrDone {
 			return false, errors.New("postgres/protocol: DataRow outside of result set")
+		}
+		if q.discard {
+			return false, nil
 		}
 		fields, err := ParseDataRowInto(q.fieldScratch, payload)
 		if err != nil {
@@ -450,24 +507,20 @@ func (q *SimpleQueryState) Handle(
 		q.tagBuf = append(q.tagBuf[:0], tagBytes...)
 		// Multi-statement: another RowDescription may follow before RFQ.
 		q.phase = sqPhaseAwaitResult
+		q.discard = false
 		return false, nil
 	case BackendEmptyQuery:
 		q.phase = sqPhaseAwaitResult
 		return false, nil
 	case BackendErrorResponse:
+		if q.Err != nil {
+			// A FATAL after an ERROR: the first error is the one the caller gets.
+			return false, nil
+		}
 		q.Err = ParseErrorResponse(payload)
 		// Server will still send RFQ; stay in sqPhaseAwaitResult.
 		q.phase = sqPhaseAwaitResult
 		return false, nil
-	case BackendNoticeResponse, BackendParameterStatus, BackendNotification:
-		// Out-of-band messages are harmless; ignore.
-		return false, nil
-	case BackendReadyForQuery:
-		q.phase = sqPhaseDone
-		if q.Err != nil {
-			return true, q.Err
-		}
-		return true, nil
 	default:
 		return false, fmt.Errorf("postgres/protocol: unexpected message %q in simple query", msgType)
 	}

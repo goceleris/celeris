@@ -16,9 +16,20 @@
 // [Open] accepts both the libpq URL form and the key=value DSN form. Pool
 // behavior is tuned with functional [Option] values: [WithEngine],
 // [WithMaxOpen], [WithMaxIdlePerWorker], [WithMaxLifetime], [WithMaxIdleTime],
-// [WithHealthCheck], [WithStatementCacheSize], and [WithApplication].
-// [WithEngine] is optional and affects performance only: when set, the pool
-// shares the HTTP server's event loop instead of resolving a standalone one.
+// [WithHealthCheck], [WithStatementCacheSize], [WithMaxResultBytes] and
+// [WithApplication].
+// [WithEngine] is optional. When set on a server that has not started yet, the
+// pool shares the HTTP server's event loop instead of resolving a standalone
+// one; a bare [Open] and [WithEngine] on a server that has started or runs
+// async handlers give a direct-mode pool, whose results are capped at 64 MiB by
+// default (see [ErrResultTooBig]: always check [Rows.Err]).
+//
+// database/sql connections are direct too, by default: sql.Open and a [Connector]
+// read each reply whole on the calling goroutine, with the same cap
+// ([Connector.WithMaxResultBytes]). [Connector.WithStreaming], or streaming=true in
+// the DSN, puts them on the event loop, which streams a result and has no cap, at
+// the cost of the limits its godoc lists (a Connector bound to a started epoll,
+// io_uring or adaptive server is direct all the same: see [Connector.WithStreaming]).
 // [WithWorker] adds a per-call worker-affinity hint to a context.
 //
 // Query with [Pool.QueryContext] (returns [*Rows]), [Pool.QueryRow]
@@ -27,7 +38,11 @@
 // [Tx.Rollback], and savepoint helpers ([Tx.Savepoint],
 // [Tx.ReleaseSavepoint], [Tx.RollbackToSavepoint]). Bulk loads use
 // [Pool.CopyFrom] (feed rows via [CopyFromSource] or [CopyFromSlice]) and
-// [Pool.CopyTo].
+// [Pool.CopyTo]. A call to [Tx.Commit] or [Tx.Rollback] ends the Tx whatever it
+// returns: a failed Commit is not retried on the same Tx, every later call on the
+// Tx returns [ErrTxDone] (a deferred Rollback after a failed Commit is safe), and
+// its connection is released: back to the pool if the driver knows the session is
+// idle, discarded otherwise.
 //
 // Server errors surface as [*PGError] carrying the SQLSTATE code; match
 // with errors.As. Package sentinels include [ErrPoolClosed], [ErrClosed],
@@ -50,7 +65,49 @@
 // WithEngine colocation. It is tested in CI on windows-latest against
 // in-process fake servers, not benchmarked and not tuned; do not deploy it.
 //
+// # Transactions on a pool
+//
+// A transaction needs one connection: use [Pool.BeginTx] or db.BeginTx, or
+// db.Conn for statements that must share a connection. A connection returned to
+// a pool inside a transaction is discarded and the server rolls the transaction
+// back. On the Pool, the call that left it open returns [ErrTxLeftOpen]. On a
+// *sql.DB there is no error (a db.Exec("BEGIN") on a pooled connection cannot be
+// told from the same statement on a dedicated db.Conn): db.Exec("BEGIN"),
+// db.Exec("INSERT ..."), db.Exec("COMMIT") as three calls is not a transaction,
+// the INSERT runs on another connection and autocommits, also with
+// SetMaxOpenConns(1). That sequence used to work only while one goroutine kept
+// reusing the same connection. A connection that comes back inside a transaction
+// (open, or failed by a statement) is logged at Warn on slog.Default, the first
+// time and then at most once a minute. See the Session state section of
+// [Pool].
+//
+// # Errors from writes
+//
+// An error from a write does not prove that the write was not applied. This
+// holds for [Pool.ExecContext] and [Tx.ExecContext], for [Pool.QueryRow] and
+// [Tx.QueryRow] with a statement that has RETURNING (an INSERT, UPDATE or
+// DELETE ... RETURNING statement is a write), and for [Tx.Commit].
+//
+// A call whose reply was cut off by a lost connection returns an error, not a
+// result that looks complete (celeris#1459). The error can also be returned for
+// a call whose reply had arrived completely, when the server closes the
+// connection right after it: the write was applied and the call still reports a
+// connection failure. This is a known limit (celeris#1470). Do not blindly retry
+// a statement that is not idempotent (an INSERT without a unique key, an UPDATE
+// that adds to a value) after a connection error: check the state first, or make
+// the statement safe to repeat.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/data-stores
+//
+// # Status
+//
+// Status: beta. The exported API of the driver packages stays under the
+// compatibility check, but behaviour fixes (what a value scans to, which
+// cases return an error) may land in minor releases and are listed in the
+// release notes.
+//
+// The supported types and the known gaps are listed on the supported-types
+// page: https://goceleris.dev/docs/postgres-types
 package postgres

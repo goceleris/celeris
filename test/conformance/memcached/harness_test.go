@@ -62,7 +62,7 @@ func newClient(t *testing.T, extra ...celmc.Option) *celmc.Client {
 	t.Helper()
 	addr := addrFromEnv(t)
 	opts := append(clientOpts(), extra...)
-	c, err := celmc.NewClient(addr, opts...)
+	c, err := celmc.NewClient(addr, withEngine(opts)...)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

@@ -21,6 +21,7 @@ const (
 	OIDInt4        uint32 = 23
 	OIDText        uint32 = 25
 	OIDJSON        uint32 = 114
+	OIDJSONPath    uint32 = 4072
 	OIDFloat4      uint32 = 700
 	OIDFloat8      uint32 = 701
 	OIDUnknown     uint32 = 705
@@ -42,6 +43,10 @@ const (
 	OIDFloat8Arr  uint32 = 1022
 	OIDVarcharArr uint32 = 1015
 	OIDUUIDArr    uint32 = 2951
+
+	OIDJSONArr     uint32 = 199
+	OIDJSONBArr    uint32 = 3807
+	OIDJSONPathArr uint32 = 4073
 )
 
 // Format codes used in Bind/Describe messages.
@@ -487,8 +492,13 @@ func decodeByteaBinary(src []byte) (driver.Value, error) {
 	return out, nil
 }
 
+// decodeByteaText reads the text form of bytea: the hex form ("\x" and hex digits,
+// bytea_output=hex, the default since PostgreSQL 9.0) or the escape form
+// (bytea_output=escape, set by a role or a database, or left in place by a
+// pooler that does not forward the startup parameter). The two cannot be
+// confused: in the escape form a backslash is written "\\", so a value never
+// starts with a single "\x".
 func decodeByteaText(src []byte) (driver.Value, error) {
-	// Text format is "\x" + hex. Support it for completeness.
 	if len(src) >= 2 && src[0] == '\\' && src[1] == 'x' {
 		hexSrc := src[2:]
 		if len(hexSrc)%2 != 0 {
@@ -508,9 +518,33 @@ func decodeByteaText(src []byte) (driver.Value, error) {
 		}
 		return out, nil
 	}
-	// Legacy "escape" format not supported.
-	return nil, fmt.Errorf("postgres/protocol: bytea non-hex text format unsupported")
+	// Escape form: a byte is itself, "\\" is a backslash, "\ooo" (three octal
+	// digits) is the byte with that value.
+	out := make([]byte, 0, len(src))
+	for i := 0; i < len(src); i++ {
+		if src[i] != '\\' {
+			out = append(out, src[i])
+			continue
+		}
+		if i+1 < len(src) && src[i+1] == '\\' {
+			out = append(out, '\\')
+			i++
+			continue
+		}
+		if i+3 >= len(src) || !isOctal(src[i+1]) || !isOctal(src[i+2]) || !isOctal(src[i+3]) {
+			return nil, fmt.Errorf("postgres/protocol: bytea escape form: bad backslash sequence at offset %d", i)
+		}
+		v := int(src[i+1]-'0')<<6 | int(src[i+2]-'0')<<3 | int(src[i+3]-'0')
+		if v > 0xff {
+			return nil, fmt.Errorf("postgres/protocol: bytea escape form: octal value out of range at offset %d", i)
+		}
+		out = append(out, byte(v))
+		i += 3
+	}
+	return out, nil
 }
+
+func isOctal(c byte) bool { return c >= '0' && c <= '7' }
 
 func fromHexNibble(c byte) (byte, error) {
 	switch {
@@ -658,11 +692,21 @@ func decodeJSONBinary(src []byte) (driver.Value, error) {
 }
 
 func decodeJSONBBinary(src []byte) (driver.Value, error) {
+	return decodeVersionedTextBinary("jsonb", src)
+}
+
+// decodeJSONPathBinary decodes a jsonpath value in binary format. Like jsonb
+// it is a version byte (1) followed by the text form.
+func decodeJSONPathBinary(src []byte) (driver.Value, error) {
+	return decodeVersionedTextBinary("jsonpath", src)
+}
+
+func decodeVersionedTextBinary(typ string, src []byte) (driver.Value, error) {
 	if len(src) < 1 {
-		return nil, fmt.Errorf("postgres/protocol: jsonb empty")
+		return nil, fmt.Errorf("postgres/protocol: %s empty", typ)
 	}
 	if src[0] != 1 {
-		return nil, fmt.Errorf("postgres/protocol: jsonb version %d unsupported", src[0])
+		return nil, fmt.Errorf("postgres/protocol: %s version %d unsupported", typ, src[0])
 	}
 	out := make([]byte, len(src)-1)
 	copy(out, src[1:])
@@ -804,6 +848,15 @@ func init() {
 		DecodeBinary: decodeJSONBBinary,
 		DecodeText:   decodeJSONBinary, // text jsonb has no version byte
 		EncodeBinary: encodeJSONBBinary,
+		EncodeText:   encodeJSONBinary,
+		ScanType:     reflect.TypeOf([]byte(nil)),
+	})
+	RegisterType(&TypeCodec{
+		OID:          OIDJSONPath,
+		Name:         "jsonpath",
+		DecodeBinary: decodeJSONPathBinary,
+		DecodeText:   decodeJSONBinary,  // text jsonpath has no version byte
+		EncodeBinary: encodeJSONBBinary, // same framing as jsonb: version byte + text
 		EncodeText:   encodeJSONBinary,
 		ScanType:     reflect.TypeOf([]byte(nil)),
 	})

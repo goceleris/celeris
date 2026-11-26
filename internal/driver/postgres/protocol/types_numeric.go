@@ -13,7 +13,8 @@ import (
 //
 //   int16  ndigits   number of base-10000 digits
 //   int16  weight    weight of the first digit (power of 10000)
-//   int16  sign      0x0000 positive, 0x4000 negative, 0xC000 NaN
+//   int16  sign      0x0000 positive, 0x4000 negative, 0xC000 NaN,
+//                    0xD000 +Infinity, 0xF000 -Infinity (PostgreSQL 14+)
 //   int16  dscale    display scale (number of digits after decimal point)
 //   int16  digits[ndigits]  base-10000 digits, MSD first
 //
@@ -25,6 +26,8 @@ const (
 	numericPositive uint16 = 0x0000
 	numericNegative uint16 = 0x4000
 	numericNaN      uint16 = 0xC000
+	numericPosInf   uint16 = 0xD000
+	numericNegInf   uint16 = 0xF000
 	nBase                  = 10000
 	nBaseDigits            = 4 // decimal digits per base-10000 digit
 )
@@ -40,6 +43,12 @@ func decodeNumericBinary(src []byte) (driver.Value, error) {
 
 	if sign == numericNaN {
 		return "NaN", nil
+	}
+	if sign == numericPosInf {
+		return "Infinity", nil
+	}
+	if sign == numericNegInf {
+		return "-Infinity", nil
 	}
 	if ndigits < 0 {
 		return nil, fmt.Errorf("postgres/protocol: numeric ndigits < 0")

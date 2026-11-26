@@ -1,0 +1,103 @@
+//go:build redis
+
+package redis_test
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"runtime"
+	"sync"
+	"time"
+
+	"github.com/goceleris/celeris"
+	celredis "github.com/goceleris/celeris/driver/redis"
+)
+
+// CELERIS_CONFORMANCE_ENGINE selects the engine the drivers under test are opened on:
+//
+//	unset / "none"    the drivers run standalone (no WithEngine): what these suites always did
+//	"default"         WithEngine(srv), srv = celeris.New with Engine UNSET and a .Async() route, NOT started
+//	                  (a pool opened before Start, the order of the HttpArena entry)
+//	"default-started" the same server, started before the drivers open
+//	"default-ready"   started, and an HTTP request to the .Async() route has been answered before the drivers open
+//	"epoll", "epoll-started", "epoll-ready"  the same three with Engine: celeris.Epoll (the explicit-engine control)
+//
+// On Linux, "default" is the configuration a user gets by not setting Config.Engine.
+var (
+	engineSrvOnce sync.Once
+	engineSrv     celredis.ServerProvider
+)
+
+func engineProvider() celredis.ServerProvider {
+	mode := os.Getenv("CELERIS_CONFORMANCE_ENGINE")
+	if mode == "" || mode == "none" {
+		return nil
+	}
+	engineSrvOnce.Do(func() {
+		cfg := celeris.Config{Addr: "127.0.0.1:0"}
+		started, ready := false, false
+		switch mode {
+		case "default":
+		case "default-started":
+			started = true
+		case "default-ready":
+			started, ready = true, true
+		case "epoll":
+			cfg.Engine = celeris.Epoll
+		case "epoll-started":
+			cfg.Engine = celeris.Epoll
+			started = true
+		case "epoll-ready":
+			cfg.Engine = celeris.Epoll
+			started, ready = true, true
+		default:
+			panic("CELERIS_CONFORMANCE_ENGINE: unknown mode " + mode)
+		}
+		s := celeris.New(cfg)
+		s.GET("/ping", func(c *celeris.Context) error { return c.String(200, "ok") }).Async()
+		if started {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				panic(err)
+			}
+			startErr := make(chan error, 1)
+			go func() { startErr <- s.StartWithListener(ln) }()
+			for i := 0; i < 100 && s.EventLoopProvider() == nil; i++ {
+				select {
+				case err := <-startErr:
+					panic("CELERIS_CONFORMANCE_ENGINE=" + mode + ": the server did not start: " + fmt.Sprint(err))
+				default:
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			// On Linux a started native engine must expose its provider: without it the drivers silently run
+			// standalone and the arm would pass without testing what it names.
+			if runtime.GOOS == "linux" && s.EventLoopProvider() == nil {
+				panic("CELERIS_CONFORMANCE_ENGINE=" + mode + ": the started server has no event-loop provider after 5 s")
+			}
+			if ready {
+				for i := 0; i < 100; i++ {
+					resp, err := http.Get("http://" + ln.Addr().String() + "/ping")
+					if err == nil {
+						_ = resp.Body.Close()
+						if resp.StatusCode == 200 {
+							break
+						}
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+		}
+		engineSrv = s
+	})
+	return engineSrv
+}
+
+func withEngine(opts []celredis.Option) []celredis.Option {
+	if sp := engineProvider(); sp != nil {
+		return append(opts, celredis.WithEngine(sp))
+	}
+	return opts
+}

@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,6 +61,10 @@ type options struct {
 	// engine is the server WithEngine was given, kept for its
 	// Config.SocketBusyPoll.
 	engine ServerProvider
+	// maxResultBytes is the result buffer cap WithMaxResultBytes set, and
+	// maxResultSet whether it was set (Open refuses a value below 1).
+	maxResultBytes int
+	maxResultSet   bool
 }
 
 // Option configures Open.
@@ -75,6 +82,10 @@ type Option func(*options)
 // or with one that runs async handlers (also before it starts), dials through
 // Go's netpoll and sets no socket option. The Pool has no busy poll option of
 // its own; a [Connector] does ([Connector.WithSocketBusyPoll]).
+//
+// The driver takes the server's event loop once, when it is opened: open it after
+// srv.Addr() is non-nil to share the server's loops; opened earlier it uses the
+// driver's own loop for its whole life.
 func WithEngine(sp ServerProvider) Option {
 	return func(o *options) {
 		if sp == nil {
@@ -104,11 +115,32 @@ func WithMaxLifetime(d time.Duration) Option { return func(o *options) { o.cfg.M
 // WithMaxIdleTime sets the max idle duration. Default: 5m.
 func WithMaxIdleTime(d time.Duration) Option { return func(o *options) { o.cfg.MaxIdleTime = d } }
 
-// WithStatementCacheSize sets the per-conn prepared-statement LRU capacity.
+// WithStatementCacheSize sets the per-conn prepared-statement LRU capacity
+// (default 256; the statement_cache_size DSN parameter does the same). A
+// statement with arguments is prepared on first use and cached by its text. A
+// connection that runs more distinct texts than n evicts the least recently
+// used one and closes it on the server: a protocol-level Close is sent ahead of
+// the query that evicted it, with no extra round trip and no wait. Pass values
+// as arguments, not in the SQL text, or size the cache to the number of
+// distinct texts: each miss costs a Parse and Describe round trip.
 func WithStatementCacheSize(n int) Option { return func(o *options) { o.cfg.StatementCacheSize = n } }
 
 // WithApplication sets the "application_name" startup parameter.
 func WithApplication(name string) Option { return func(o *options) { o.cfg.Application = name } }
+
+// WithMaxResultBytes sets the result buffer cap of the Pool's direct-mode
+// connections: the most DataRow payload bytes a single statement's result may
+// have, as a number of bytes. A direct-mode connection reads a reply whole into
+// memory, and a statement whose result is over the cap fails with
+// [ErrResultTooBig] (from [Rows.Err], after the rows that fit). The default is
+// 64 MiB. The cap bounds memory, so raising it is the caller's explicit choice: n
+// must be at least 1, and [Open] returns an error for a smaller value; there is no
+// way to turn the cap off. A Pool on the event loop streams its results and has no
+// cap, so the option does nothing there. [Connector.WithMaxResultBytes] is the
+// same setting for database/sql.
+func WithMaxResultBytes(n int) Option {
+	return func(o *options) { o.maxResultBytes, o.maxResultSet = n, true }
+}
 
 // WithHealthCheck sets the background sweep interval. Zero disables it.
 func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.HealthCheck = d } }
@@ -118,6 +150,44 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 // connections back to the worker that created them, so a handler running on
 // worker N preferentially acquires conns whose event-loop callbacks land on
 // worker N.
+//
+// # Session state
+//
+// Every call (QueryContext, ExecContext, QueryRow, Ping) takes a connection
+// from the pool and puts it back. The pool does not reset the session on
+// release: session state a call sets persists on the connection and is seen by
+// the next caller that gets it. That covers SET and SET ROLE, set_config with
+// is_local false, temporary tables, PREPARE, LISTEN and session-level advisory
+// locks. The same holds for a *sql.DB opened with this driver: before it reuses
+// a connection, ResetSession sends DISCARD ALL only if BeginTx marked the
+// session dirty and the driver's own Commit or Rollback did not clear the mark
+// (a transaction ended by COMMIT sent as plain SQL, for example), and never for
+// a SET, a temporary table or the other state above (tracked in
+// goceleris/celeris#1409).
+//
+// What is reset is a transaction. A connection released while it is in a
+// transaction, open or failed (the server's last ReadyForQuery status is T or
+// E), is closed and not put back, so the next caller never runs inside it, and
+// the server rolls the transaction back. On the Pool, the call that left it open
+// returns [ErrTxLeftOpen] (Exec "BEGIN" does, before anything else runs; Query
+// returns it from Rows.Close, and QueryRow from Scan when the scan succeeded or found no row (then errors.Is is true for both sql.ErrNoRows and ErrTxLeftOpen); a
+// statement that fails returns its own error, unchanged), so a transaction cannot
+// be spread over Exec calls by accident: the connection of the BEGIN is gone
+// before the next statement. Pool.BeginTx is the way, and its Tx is the Pool's
+// only pinned connection (there is no Pool.Conn): BEGIN, COMMIT, savepoints and
+// every statement between them run on that one connection. A *sql.DB opened with
+// this driver cannot tell a pooled db.Exec("BEGIN") from the same statement on a
+// dedicated *sql.Conn, where it is legitimate, so it returns no error: the
+// connection is dropped when it is returned, the transaction is rolled back, and
+// the statements that followed ran on another connection, each in its own
+// transaction. Use db.BeginTx, or db.Conn for statements that must share one
+// connection.
+//
+// To scope a setting to one piece of work, set it inside a Tx with SET LOCAL or
+// select set_config(name, value, true): both end with the transaction. A
+// *sql.DB offers a dedicated *sql.Conn for work that needs session state; undo
+// the state (RESET ALL, DISCARD ALL) before it is closed, or the next user of
+// the connection gets it.
 type Pool struct {
 	inner *async.Pool[*pgConn]
 
@@ -149,6 +219,12 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	o := &options{cfg: PoolConfig{DSN: dsnStr}}
 	for _, fn := range opts {
 		fn(o)
+	}
+	if o.maxResultSet {
+		if o.maxResultBytes < 1 {
+			return nil, fmt.Errorf("celeris-postgres: WithMaxResultBytes(%d): the cap must be at least 1 byte (there is no way to turn it off)", o.maxResultBytes)
+		}
+		dsn.Options.maxResultBytes = o.maxResultBytes
 	}
 	if o.cfg.Application != "" {
 		if dsn.Params == nil {
@@ -232,6 +308,37 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	return p, nil
 }
 
+// loopLacksSyncPath reports whether a connection dialled now through prov
+// must be dialled direct (dialDirectConn, Go's netpoll) because the caller is a
+// handler that runs on the engine's own worker and prov has no synchronous
+// round trip for it. It is the one rule that [Pool] and [Connector] share. The
+// provider is fixed when the Pool or Connector is built (WithEngine takes the
+// server's loops then, or the driver's own loop when the server has not
+// started); the rule is evaluated at each dial against that provider's current
+// state.
+//
+// The engine's WorkerLoop(0) (io_uring, epoll, adaptive) does not implement
+// syncRoundTripper, and without a sync path the driver's async write plus
+// channel wait deadlocks on inline handlers: the engine worker is the
+// goroutine executing the handler (LockOSThread'd), so when wait() parks on
+// doneCh the M sits idle and never drains the read that carries PostgreSQL's
+// reply. The driver's own loop (Linux) does have the sync path; so does no
+// provider at all (false: nothing to inspect).
+//
+// A caller that does not run on an engine worker (no engine, or a handler on
+// an unlocked goroutine) decides that before it asks.
+func loopLacksSyncPath(prov engine.EventLoopProvider) bool {
+	if prov == nil {
+		return false
+	}
+	wl := prov.WorkerLoop(0)
+	if wl == nil {
+		return false
+	}
+	_, ok := wl.(syncRoundTripper)
+	return !ok
+}
+
 func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	// Direct mode when the caller runs on an unlocked G: standalone
 	// (no engine) or WithEngine on an engine that dispatches handlers
@@ -241,12 +348,9 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	directMode := !p.hasEngine || p.asyncEngine
 
 	// Additional case: WithEngine on an engine whose WorkerLoop does NOT
-	// implement syncRoundTripper (io_uring, epoll today). Without a sync
-	// path the driver's async write + channel-wait deadlocks on inline
-	// handlers: the engine worker is the goroutine executing the handler
-	// (LockOSThread'd), so when wait() parks on doneCh the M sits idle
-	// and never drains the CQE carrying PG's reply. Netpoll is M-safe,
-	// so direct mode sidesteps the deadlock with no correctness impact.
+	// implement syncRoundTripper (io_uring, epoll today): see
+	// loopLacksSyncPath. Netpoll is M-safe, so direct mode sidesteps the
+	// deadlock with no correctness impact.
 	if !directMode {
 		p.providerMu.RLock()
 		prov := p.provider
@@ -254,11 +358,7 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 		if prov == nil {
 			return nil, ErrPoolClosed
 		}
-		if wl := prov.WorkerLoop(0); wl != nil {
-			if _, ok := wl.(syncRoundTripper); !ok {
-				directMode = true
-			}
-		}
+		directMode = loopLacksSyncPath(prov)
 	}
 
 	if directMode {
@@ -329,6 +429,18 @@ type workerCtxKey struct{}
 
 // WithWorker returns ctx with a worker-affinity hint. Pool.Acquire uses the
 // hint as the preferred worker index.
+//
+// The hint is a preference, not a pin. The Pool has one worker slot per event
+// loop of the engine it was opened with (len of Stats().PerWorker); a hint
+// outside [0, that count) is spread round-robin, and a call whose hinted
+// worker has no idle connection takes an idle connection of another worker (or
+// dials one), so consecutive calls with the same hint can run on different
+// connections. The default number of loops is GOMAXPROCS minus a reserve (see
+// Config.Workers of the celeris package: 7 on 8 CPUs, so a hint of 7 is out of
+// range there). The Pool's own count, len(Stats().PerWorker), is the number to
+// use (the engine's observe.EngineMetrics.Workers is the loops started, summed
+// over both sub-engines for the adaptive engine). Code that used GOMAXPROCS as
+// the worker count should read it instead.
 func WithWorker(ctx context.Context, workerID int) context.Context {
 	return context.WithValue(ctx, workerCtxKey{}, workerID)
 }
@@ -378,16 +490,60 @@ func (p *Pool) acquire(ctx context.Context) (*pgConn, error) {
 }
 
 // release returns c to its home worker's idle list.
-func (p *Pool) release(c *pgConn) {
+func (p *Pool) release(c *pgConn) { _ = p.releaseChecked(c) }
+
+// releaseChecked is release that reports a conn it had to discard because the
+// statement left a transaction open: the server's last ReadyForQuery said T (in
+// a transaction) or E (in a failed one). The conn is closed, not put back (the
+// server rolls the transaction back, and the next caller never runs inside it),
+// and the error is [ErrTxLeftOpen], for the caller of a pool-level call to
+// return. A closed conn is discarded without an error.
+func (p *Pool) releaseChecked(c *pgConn) error {
 	if c.closed.Load() {
 		p.inner.Discard(c)
-		return
+		return nil
+	}
+	if c.inTransaction() {
+		p.inner.Discard(c)
+		return ErrTxLeftOpen
 	}
 	p.inner.Release(c)
+	return nil
+}
+
+// releaseAfterTxEnd frees the conn of a Tx that Commit or Rollback has ended, and
+// the pool slot with it, exactly once. err is what the COMMIT or ROLLBACK returned.
+// The conn goes back to the pool only if the driver knows its state: no error, the
+// sentinel ErrTxCommitRollback (the reply was read: the server answered COMMIT with
+// ROLLBACK), or an error the server reported (an ErrorResponse, which the server
+// follows with ReadyForQuery). For those, releaseChecked still discards a conn that
+// is closed or whose last ReadyForQuery said a transaction is open or failed (a
+// FATAL, which has no ReadyForQuery, leaves the status of BEGIN). Any other error
+// (the wire failed, a read or write error, a cancelled wait) leaves the state
+// unknown: the conn is closed, not reused, and no ROLLBACK is sent to rescue it.
+func (p *Pool) releaseAfterTxEnd(c *pgConn, err error) {
+	if err != nil && !errors.Is(err, ErrTxCommitRollback) {
+		var pgErr *PGError
+		if !errors.As(err, &pgErr) {
+			p.inner.Discard(c)
+			return
+		}
+	}
+	p.release(c)
 }
 
 // QueryContext runs query on an acquired conn, returns a Rows wrapper that
 // returns the conn to the pool when closed.
+//
+// A context that ended before the call, or while the statement was being
+// prepared (the Parse + Describe step of a statement the cache has not seen, or
+// the re-prepare after the server lost a cached one), ends the call with the
+// context's error (on the event loop, now and then the server's answer to the
+// cancel, a *[PGError] with SQLSTATE 57014) and the statement is not sent. A
+// context that ends after the statement was sent cancels it on the server, but
+// the statement may already have run: as with any cancel, an error from the
+// context does not say that a write did not commit. A context that ends in the
+// instant between that check and the send is the same case.
 func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	c, err := p.acquire(ctx)
 	if err != nil {
@@ -403,13 +559,33 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	return acquireRows(drows, c, p), nil
 }
 
-// ExecContext runs a statement and returns a [Result].
-func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
-	c, err := p.acquire(ctx)
-	if err != nil {
-		return Result{}, err
+// ExecContext runs a statement and returns a [Result]. An error does not prove
+// that the statement was not applied: see Errors from writes in the package
+// documentation.
+//
+// A statement that succeeds and leaves a transaction open on the connection
+// (Exec "BEGIN") returns [ErrTxLeftOpen]: see the Session state section of
+// [Pool]. A statement that fails returns its own error, unchanged, as before (a
+// connection left in a failed transaction by it is discarded all the same).
+//
+// A context that ended before the call or while the statement was being
+// prepared ends the call with an error and the statement is not sent; one that
+// ends after it was sent may still find the statement committed (see
+// [Pool.QueryContext]).
+func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (res Result, err error) {
+	c, aerr := p.acquire(ctx)
+	if aerr != nil {
+		return Result{}, aerr
 	}
-	defer p.release(c)
+	defer func() {
+		// ErrTxLeftOpen only for a statement that succeeded: one that failed
+		// returns its own error, as it always did (a duplicate key in
+		// "BEGIN; INSERT ...; COMMIT" is a *PGError 23505, not a leftover).
+		if rerr := p.releaseChecked(c); rerr != nil && err == nil {
+			res = Result{}
+			err = rerr
+		}
+	}()
 	named, slot := anysToNamed(args)
 	r, err := c.ExecContext(ctx, query, named)
 	releaseNamedArgs(slot)
@@ -497,28 +673,28 @@ func releaseNamedArgs(slot *namedArgsSlot) {
 	namedArgsPool.Put(slot)
 }
 
-// rowsPool recycles *Rows wrappers so QueryContext avoids a heap alloc per
-// query on the hot path. On Close the struct is zeroed and returned to the
-// pool; callers who retain the pointer past Close see a cleared wrapper
-// (same behavior as any other post-Close access — an API contract
-// violation already).
-var rowsPool = sync.Pool{New: func() any { return &Rows{} }}
-
+// acquireRows wraps inner in a fresh *Rows. The wrapper is the pointer the
+// caller keeps, so it is never recycled: a caller can hold it after Close (a
+// deferred Close plus an explicit one, a Row that was scanned already) and a
+// recycled wrapper would be another query's Rows by then. What Close releases
+// is what the wrapper points at: the pooled pgRows and request slabs, and the
+// conn. The wrapper costs one small allocation per query.
 func acquireRows(inner driver.Rows, conn *pgConn, pool *Pool) *Rows {
-	r := rowsPool.Get().(*Rows)
-	r.inner = inner
-	r.conn = conn
-	r.pool = pool
-	return r
+	return &Rows{inner: inner, conn: conn, pool: pool}
 }
 
-func releaseRows(r *Rows) {
-	*r = Rows{}
-	rowsPool.Put(r)
-}
+// errRowsClosed is what Scan returns after Close.
+var errRowsClosed = errors.New("celeris-postgres: Rows are closed")
 
 // Rows is the pool-level rows wrapper. It returns the underlying conn to the
-// pool when Close is called. The iteration API matches database/sql.Rows:
+// pool when Close is called. A Rows ends in three ways: [Rows.Close], reading it
+// to the end (Next returns false; Close is still needed to free the conn), or an
+// error. It does NOT end when the context passed to the call that opened it is
+// cancelled or expires: the driver reads that context only until the call has
+// returned, so a cancelled Rows must be closed like any other. While a result
+// that streams (64 rows or more, not yet fully received) is open on a [Tx],
+// the next statement of that Tx returns [ErrRowsOpen]; close the Rows first.
+// The iteration API matches database/sql.Rows:
 //
 //	for rows.Next() {
 //	    if err := rows.Scan(&id, &name); err != nil { ... }
@@ -528,7 +704,14 @@ type Rows struct {
 	inner driver.Rows
 	conn  *pgConn
 	pool  *Pool
-	done  bool
+	// done is set by the first Close (which also drops inner, conn and pool and
+	// the raw views below), so a later Close, Next, Scan or Columns is inert.
+	done atomic.Bool
+	// closemu is held for read by Next, Scan, Columns and Err and for write by Close
+	// while it drops the fields below, as database/sql.Rows.closemu: a Close on
+	// another goroutine (a watchdog) never recycles the pooled pgRows or releases the
+	// conn under a call that is inside them.
+	closemu sync.RWMutex
 
 	// current holds the driver.Values decoded by the last successful
 	// Next call. Populated only when the inner is NOT *pgRows (i.e.
@@ -545,24 +728,66 @@ type Rows struct {
 	rawTextFormat bool
 	rawAvailable  bool
 
-	// iterErr records the first non-EOF error encountered during Next.
+	// iterErr records the first non-EOF error encountered during Next. It
+	// survives Close, so for rows.Next() {}; rows.Close(); rows.Err() reports it.
 	iterErr error
 }
 
-// Columns returns column names.
-func (r *Rows) Columns() []string { return r.inner.Columns() }
-
-// Close releases resources and returns the conn to the pool.
-func (r *Rows) Close() error {
-	if r.done {
+// Columns returns column names, or nil once the Rows is closed.
+func (r *Rows) Columns() []string {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	if r.done.Load() {
 		return nil
 	}
-	r.done = true
-	err := r.inner.Close()
-	if r.pool != nil && r.conn != nil {
-		r.pool.release(r.conn)
+	return r.inner.Columns()
+}
+
+// Close releases resources and returns the conn to the pool. It returns the
+// error the result ended with, whether or not iteration read it: the one [Rows.Err]
+// reports after a loop that ran to the end (the first Close then returns it as well)
+// and the one a caller that stopped after the rows it wanted would otherwise never
+// see (database/sql's Row.Scan relies on this). It is a connection lost before the
+// result was complete (matches [ErrClosed] and [io.ErrUnexpectedEOF]), a server
+// error after some rows, or [ErrResultTooBig]. Before v1.6.0 Close dropped it. A statement that
+// left a transaction open on the conn (Query "BEGIN") makes Close return
+// [ErrTxLeftOpen] after discarding the conn. A query in which more than one
+// statement returned rows fails with an error that says multiple result sets are
+// not supported and the server executed the statements; a streamed one delivers
+// the first set's rows and then returns that error from [Rows.Err] and from
+// Close. Close is idempotent: every call
+// after the first returns nil and does nothing (so ErrTxLeftOpen is reported
+// once), which makes `defer rows.Close()` next to an explicit Close fine. After
+// Close, Next returns false, Scan returns an error and Err keeps the error
+// iteration ended with. Close may be called from another goroutine while Next or
+// Scan is running (as with database/sql.Rows): it waits for that call, which sees
+// the Rows closed on its next use. Next, Scan and Columns themselves are not safe
+// to call concurrently with each other. A sql.Scanner must not call any method of
+// the same Rows from inside Scan: Close would wait for itself, and Err or Columns
+// would take the read lock a second time behind a Close that is waiting for it
+// (the same hazard as database/sql).
+func (r *Rows) Close() error {
+	if !r.done.CompareAndSwap(false, true) {
+		return nil
 	}
-	releaseRows(r)
+	r.closemu.Lock()
+	inner, conn, pool := r.inner, r.conn, r.pool
+	// Drop everything that points into released memory: the rawRow view is a slice
+	// of the request slab that inner.Close hands back to its pool, and inner is
+	// itself pooled.
+	r.inner, r.conn, r.pool = nil, nil, nil
+	r.current = nil
+	r.rawRow, r.rawCodecs, r.rawColumns, r.rawAvailable = nil, nil, nil, false
+	r.closemu.Unlock()
+	var err error
+	if inner != nil {
+		err = inner.Close()
+	}
+	if pool != nil && conn != nil {
+		if rerr := pool.releaseChecked(conn); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
 	return err
 }
 
@@ -576,7 +801,9 @@ func (r *Rows) Close() error {
 // one heap alloc per non-zero-size cell (int64 / time.Time etc. would
 // otherwise escape via interface conversion).
 func (r *Rows) Next() bool {
-	if r.done {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	if r.done.Load() {
 		return false
 	}
 	if pgr, ok := r.inner.(*pgRows); ok {
@@ -615,7 +842,22 @@ func (r *Rows) Next() bool {
 // must be a pointer. On the fast path (inner is *pgRows), Scan decodes
 // directly from the wire bytes into dest without ever materialising a
 // driver.Value — zero interface{} boxing per cell.
+//
+// A NULL cell never leaves its dest as it was, so a variable reused across
+// rows cannot carry the previous row's value. NULL sets dest to its zero
+// value: "" for *string, nil for *[]byte, *json.RawMessage, *any and a
+// pointer-to-pointer (**T, which a non-NULL value allocates), 0 for the
+// numeric kinds, false for *bool and the zero time.Time for *time.Time. A
+// sql.Scanner (sql.NullString, sql.NullInt64, ...) receives Scan(nil) and sets
+// Valid=false; scan into one, into *any or into **T when NULL must be told
+// apart from a zero value. A dest Scan does not support fails for NULL with
+// the same "unsupported scan dest type" error as for any other value.
 func (r *Rows) Scan(dest ...any) error {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	if r.done.Load() {
+		return errRowsClosed
+	}
 	if r.rawAvailable {
 		if len(dest) != len(r.rawRow) {
 			return fmt.Errorf("celeris-postgres: Scan expected %d dest, got %d", len(r.rawRow), len(dest))
@@ -641,7 +883,20 @@ func (r *Rows) Scan(dest ...any) error {
 	if len(dest) != len(r.current) {
 		return fmt.Errorf("celeris-postgres: Scan expected %d dest, got %d", len(r.current), len(dest))
 	}
+	sr, _ := r.inner.(*streamRows)
 	for i, v := range r.current {
+		if sr != nil && i < len(sr.current) && sr.current[i] != nil && i < len(sr.codecs) && i < len(sr.columns) {
+			// A streamed row: infinity into a string is read from the raw cell.
+			binaryFmt := !sr.textFormat && sr.columns[i].FormatCode != protocol.FormatText
+			if sr.codecs[i] == nil && binaryFmt {
+				if err := binaryOnlyGuard(dest[i], sr.codecs[i], sr.columns[i], binaryFmt); err != nil {
+					return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
+				}
+			}
+			if sr.codecs[i] != nil && isTimeOID(sr.codecs[i].OID) && rawCellGuard(dest[i], sr.current[i], sr.codecs[i], binaryFmt) {
+				continue
+			}
+		}
 		if err := scanValue(dest[i], v); err != nil {
 			return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
 		}
@@ -649,8 +904,16 @@ func (r *Rows) Scan(dest ...any) error {
 	return nil
 }
 
-// Err returns the first non-EOF error encountered during iteration.
-func (r *Rows) Err() error { return r.iterErr }
+// Err returns the first non-EOF error encountered during iteration. It is still
+// that error after Close. Always check it after the loop: on a direct-mode Pool
+// it reports [ErrResultTooBig] (Next just returns false; Close returns it too),
+// and a server error that arrives after some rows, or a connection lost before
+// the result was complete, is reported here too.
+func (r *Rows) Err() error {
+	r.closemu.RLock()
+	defer r.closemu.RUnlock()
+	return r.iterErr
+}
 
 // scanRaw decodes wire bytes directly into the caller's pointer without
 // allocating an intermediate driver.Value. This is the hot path for
@@ -675,8 +938,13 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 		// Nil cell — zero the target if it's a common primitive.
 		return assignNil(dest)
 	}
-	// Binary format for known codecs — direct decode into typed pointer.
 	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
+	if codec == nil && binaryFmt {
+		if err := binaryOnlyGuard(dest, codec, col, binaryFmt); err != nil {
+			return err
+		}
+	}
+	// Binary format for known codecs — direct decode into typed pointer.
 	if codec != nil && binaryFmt {
 		if ok, err := decodeBinaryInto(dest, raw, codec); ok {
 			return err
@@ -692,6 +960,16 @@ func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.Colum
 	if err != nil {
 		return err
 	}
+	// A date, timestamp or timestamptz into a string is RFC3339Nano
+	// (as database/sql formats it). Done here, on the raw path, and not in
+	// convertAssign: a streamed row scans through convertAssign exactly as in
+	// v1.5.11, where a time.Time into *string was fmt's %v form.
+	if t, ok := v.(time.Time); ok {
+		if d, ok := dest.(*string); ok {
+			*d = t.Format(time.RFC3339Nano)
+			return nil
+		}
+	}
 	return scanValue(dest, v)
 }
 
@@ -705,7 +983,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 	}
 	if textFormat || col.FormatCode == protocol.FormatText {
 		if codec.DecodeText != nil {
-			return codec.DecodeText(raw)
+			return decodeText(codec, raw)
 		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
@@ -715,7 +993,7 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 		return codec.DecodeBinary(raw)
 	}
 	if codec.DecodeText != nil {
-		return codec.DecodeText(raw)
+		return decodeText(codec, raw)
 	}
 	cp := make([]byte, len(raw))
 	copy(cp, raw)
@@ -754,6 +1032,17 @@ func int64ToUint32(n int64) (uint32, error) {
 		return 0, fmt.Errorf("celeris-postgres: scan: value %d out of range for uint32", n)
 	}
 	return uint32(n), nil
+}
+
+// binaryFormIsValue reports whether a column of codec's type carries, in
+// binary result format, exactly the bytes a string destination should receive. That holds for the text-like types (text, varchar, json) and
+// for bytea; every other registered codec decodes through its DecodeBinary.
+func binaryFormIsValue(codec *protocol.TypeCodec) bool {
+	switch codec.OID {
+	case protocol.OIDText, protocol.OIDVarchar, protocol.OIDJSON, protocol.OIDBytea:
+		return true
+	}
+	return false
 }
 
 // decodeBinaryInto decodes raw binary-format bytes directly into dest
@@ -815,10 +1104,24 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 		return true, nil
 	case *string:
 		// Fast path for text/varchar/etc.: no interface boxing, single
-		// string allocation out of the raw slab bytes.
+		// string allocation out of the raw slab bytes. Only for codecs
+		// whose binary form is the value itself; jsonb / jsonpath carry a
+		// version byte, int4 / uuid / timestamp / ... are fixed-width binary.
+		if !binaryFormIsValue(codec) {
+			// A date, timestamp or timestamptz infinity is the server's own text,
+			// read from the wire value (the PGInfinity sentinel is also a real
+			// instant): no other cell pays for the check.
+			if txt, ok := infinityText(raw, codec.OID, true); ok {
+				*d = txt
+				return true, nil
+			}
+			return false, nil
+		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
+		// The value's wire bytes, for every type, exactly as v1.5.11: scan into
+		// a string for text.
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -835,7 +1138,7 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 }
 
 // decodeTextInto is the text-format counterpart to decodeBinaryInto.
-func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
+func decodeTextInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, error) {
 	switch d := dest.(type) {
 	case *int:
 		n, err := protocol.ParseIntTextASCII(raw)
@@ -867,9 +1170,15 @@ func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
 		*d = v
 		return true, nil
 	case *string:
+		if codec.OID == protocol.OIDBytea {
+			return false, nil // text form is the hex escape, not the value
+		}
 		*d = string(raw)
 		return true, nil
 	case *[]byte:
+		if codec.OID == protocol.OIDBytea {
+			return false, nil
+		}
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
 		*d = cp
@@ -878,7 +1187,16 @@ func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
 	return false, nil
 }
 
-// assignNil zeros the pointed-to primitive when the column is NULL.
+// assignNil stores a NULL cell into dest. It never leaves dest as it was:
+// a variable reused across rows would otherwise carry the previous row's
+// value into a row whose column is NULL, with no error.
+//
+// The destination is set to its zero value: "" for *string, nil for
+// *[]byte, *json.RawMessage and *any, 0 for the numeric kinds, false for
+// *bool, the zero time.Time for *time.Time, and nil for a pointer-to-pointer
+// (**T). sql.Scanner destinations (sql.Null*, a user type) are handled by the
+// caller via Scan(nil). Any other destination fails with the error a non-NULL
+// value gets, so a destination Scan does not support never succeeds silently.
 func assignNil(dest any) error {
 	switch d := dest.(type) {
 	case *int:
@@ -891,15 +1209,29 @@ func assignNil(dest any) error {
 		*d = 0
 	case *uint32:
 		*d = 0
+	case *float64:
+		*d = 0
+	case *float32:
+		*d = 0
 	case *string:
 		*d = ""
 	case *[]byte:
 		*d = nil
+	case *json.RawMessage:
+		*d = nil
 	case *bool:
 		*d = false
+	case *time.Time:
+		*d = time.Time{}
+	case *any:
+		*d = nil
 	default:
-		// Unknown target — let scanValue handle it via convertAssign(nil).
-		return scanValue(dest, nil)
+		// **T: a nullable column scans into *T as nil.
+		if rv := reflect.ValueOf(dest); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Pointer {
+			rv.Elem().SetZero()
+			return nil
+		}
+		return fmt.Errorf("unsupported scan dest type %T", dest)
 	}
 	return nil
 }
@@ -914,7 +1246,7 @@ func scanValue(dest any, v driver.Value) error {
 		return scanner.Scan(v)
 	}
 	if v == nil {
-		return nil
+		return assignNil(dest)
 	}
 	return convertAssign(dest, v)
 }
@@ -938,6 +1270,8 @@ func convertAssign(dest any, src any) error {
 			} else {
 				*d = "false"
 			}
+		case []driver.Value:
+			return errors.New("celeris-postgres: scan: cannot convert array to string; scan into *any or cast ::text")
 		default:
 			*d = fmt.Sprintf("%v", src)
 		}
@@ -1025,6 +1359,15 @@ func convertAssign(dest any, src any) error {
 		default:
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to []byte", src)
 		}
+	case *json.RawMessage:
+		switch s := src.(type) {
+		case []byte:
+			*d = append(json.RawMessage(nil), s...)
+		case string:
+			*d = append(json.RawMessage(nil), s...)
+		default:
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to json.RawMessage", src)
+		}
 	case *any:
 		*d = src
 	case *time.Time:
@@ -1035,6 +1378,16 @@ func convertAssign(dest any, src any) error {
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to time.Time", src)
 		}
 	default:
+		// **T: allocate a T and scan into it, so a nullable column scans
+		// into *T (nil for NULL, see assignNil).
+		if rv := reflect.ValueOf(dest); rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Pointer {
+			nv := reflect.New(rv.Elem().Type().Elem())
+			if err := scanValue(nv.Interface(), src); err != nil {
+				return err
+			}
+			rv.Elem().Set(nv)
+			return nil
+		}
 		return fmt.Errorf("unsupported scan dest type %T", dest)
 	}
 	return nil
@@ -1049,19 +1402,47 @@ type Row struct {
 
 // Scan copies the columns from the single result row into dest. If the
 // query returned no rows, Scan returns sql.ErrNoRows. The underlying Rows
-// is closed automatically.
-func (r *Row) Scan(dest ...any) error {
+// is closed automatically, and a second Scan (the rows are gone) returns
+// sql.ErrNoRows too. The row is returned only when the statement ended: a
+// connection lost after the row and before the statement's ReadyForQuery (an
+// INSERT ... RETURNING in autocommit commits at Sync, after the DataRow) makes
+// Scan return that error, as database/sql's Row.Scan does, and never
+// sql.ErrNoRows.
+func (r *Row) Scan(dest ...any) (err error) {
 	if r.err != nil {
 		return r.err
 	}
-	defer func() { _ = r.rows.Close() }()
-	if !r.rows.Next() {
-		if r.rows.Err() != nil {
-			return r.rows.Err()
+	rows := r.rows
+	if rows == nil {
+		return sql.ErrNoRows
+	}
+	r.rows = nil
+	defer func() {
+		// The row is the answer only when the statement ended: a Close error
+		// (a connection lost before the ReadyForQuery, a server error that
+		// came after the row, a query that returned more than one result set,
+		// which streamed: its first row is already scanned) is Scan's error when
+		// the scan itself went well, as database/sql's Row.Scan returns
+		// rows.Close(). When the scan failed or found no row, that error stays,
+		// except that the error of a transaction left open on the conn
+		// (QueryRow("BEGIN")) or of a multi-result-set query joins sql.ErrNoRows,
+		// so a caller testing for either sees it.
+		cerr := rows.Close()
+		switch {
+		case cerr == nil:
+		case err == nil:
+			err = cerr
+		case errors.Is(err, sql.ErrNoRows) && (errors.Is(cerr, ErrTxLeftOpen) || cerr == errMultiResultSets):
+			err = errors.Join(err, cerr)
+		}
+	}()
+	if !rows.Next() {
+		if rows.Err() != nil {
+			return rows.Err()
 		}
 		return sql.ErrNoRows
 	}
-	return r.rows.Scan(dest...)
+	return rows.Scan(dest...)
 }
 
 // Err returns the error, if any, encountered during the query. Unlike
@@ -1070,6 +1451,11 @@ func (r *Row) Err() error { return r.err }
 
 // QueryRow executes a query expected to return at most one row. The
 // returned [Row] is always non-nil; errors are deferred until [Row.Scan].
+//
+// When the statement has RETURNING (an INSERT, UPDATE or DELETE ... RETURNING
+// statement is a write), an error from the call or from Scan does not prove that
+// the statement was not applied: see Errors from writes in the package
+// documentation.
 func (p *Pool) QueryRow(ctx context.Context, query string, args ...any) *Row {
 	rows, err := p.QueryContext(ctx, query, args...)
 	return &Row{rows: rows, err: err}
@@ -1089,44 +1475,104 @@ func (r Result) LastInsertId() (int64, error) {
 // CommandComplete tag.
 func (r Result) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 
-// Tx is the pool-level transaction wrapper.
+// Tx is the pool-level transaction wrapper. A Tx is obtained from
+// Pool.BeginTx; the zero value is not usable.
 type Tx struct {
 	inner *pgTx
 	conn  *pgConn
 	pool  *Pool
-	done  bool
+	// done is set by the call that finishes the tx; atomic, so a deferred
+	// Rollback reads it safely while another goroutine finishes the tx.
+	done atomic.Bool
 }
 
-// Commit commits the transaction and returns the conn to the pool.
-// On failure, done is left false so a deferred Rollback can still fire.
+// Commit commits the transaction. A call to Commit ends the Tx whatever it
+// returns: every later call on it (Commit, Rollback, ExecContext, QueryContext,
+// QueryRow, Savepoint, ReleaseSavepoint, RollbackToSavepoint) returns [ErrTxDone]
+// and sends nothing, so a deferred Rollback after a failed Commit is safe, and a
+// failed Commit is not retried on the same Tx. When the error is one the server
+// reported (a *[PGError], for example a deferred constraint or a serialization
+// failure), PostgreSQL rolled the transaction back. When the connection failed on
+// the wire before the reply was read, the outcome is unknown: the transaction may
+// have been committed. An error from Commit does not prove that the transaction
+// was not committed. The Tx is ended either way.
+//
+// The connection goes back to the pool only if the driver knows its state: the
+// server's reply was read up to ReadyForQuery and the session is idle, outside a
+// transaction. In every other case (the connection failed on the wire, the reply
+// did not arrive, ReadyForQuery reports a transaction still open or failed) it is
+// closed and replaced. The pool slot is released exactly once.
+//
+// A Commit of a transaction the server had already put in the aborted state
+// returns [ErrTxCommitRollback]: nothing was committed.
+//
+// Commit ends the transaction whatever it returns. If a streaming Rows of this
+// transaction is still open (see [ErrRowsOpen]), Commit returns ErrRowsOpen and
+// the transaction is rolled back: close Rows before Commit. Nothing is sent, the
+// connection is discarded (the server rolls the transaction back when the
+// connection ends), and the open Rows ends with an error that matches [ErrClosed]
+// and [io.ErrUnexpectedEOF].
 func (t *Tx) Commit() error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if !t.done.CompareAndSwap(false, true) {
+		return ErrTxDone
 	}
 	err := t.inner.Commit()
-	if err != nil {
+	if errors.Is(err, ErrRowsOpen) {
+		// Commit ends the Tx whatever it returns: the transaction is rolled back, not
+		// committed (nothing was sent), and the caller sees why.
+		t.pool.discardOverOpenRows(t.conn)
 		return err
 	}
-	t.done = true
-	t.pool.release(t.conn)
-	return nil
-}
-
-// Rollback rolls back the transaction and returns the conn to the pool.
-func (t *Tx) Rollback() error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
-	}
-	t.done = true
-	err := t.inner.Rollback()
-	t.pool.release(t.conn)
+	t.pool.releaseAfterTxEnd(t.conn, err)
 	return err
 }
 
-// ExecContext runs a statement on the pinned conn.
+// Rollback rolls back the transaction. Like [Tx.Commit] it ends the Tx whatever it
+// returns: a later call on the Tx returns [ErrTxDone], and the connection goes back
+// to the pool only if the reply was read up to ReadyForQuery with the session idle
+// (a Rollback that failed on the wire discards it).
+//
+// A Rows of the Tx that is still streaming (see [ErrRowsOpen]) does not stop it:
+// nothing is sent, the connection is discarded (the server rolls the transaction
+// back when the connection ends), Rollback returns nil, and the open Rows ends with
+// an error that matches [ErrClosed] and [io.ErrUnexpectedEOF] (its Next returns
+// false and its Err reports it), never with a clean end. Close the Rows first to
+// keep the conn.
+func (t *Tx) Rollback() error {
+	if !t.done.CompareAndSwap(false, true) {
+		return ErrTxDone
+	}
+	err := t.inner.Rollback()
+	if errors.Is(err, ErrRowsOpen) {
+		t.pool.discardOverOpenRows(t.conn)
+		return nil
+	}
+	t.pool.releaseAfterTxEnd(t.conn, err)
+	return err
+}
+
+// discardOverOpenRows ends a Tx over a Rows that is still streaming (Commit or
+// Rollback, ErrRowsOpen from the conn): the conn is discarded, the slot released
+// once, and the open Rows must end with an error: Close reports the teardown to the
+// loop as io.EOF (onClose(nil)), which a consumer reads as the clean end of its
+// rows, a truncated result that looks complete. failAll first hands every pending
+// request, the streaming one included, errRollbackDiscard instead; the Close in
+// Discard then finds nothing left to overwrite.
+func (p *Pool) discardOverOpenRows(c *pgConn) {
+	c.failAll(errRollbackDiscard)
+	p.inner.Discard(c)
+}
+
+// errRollbackDiscard is what a Rows still open ends with when its Tx is ended over
+// it (Rollback or Commit): it matches [ErrClosed] and [io.ErrUnexpectedEOF].
+var errRollbackDiscard = fmt.Errorf("%w: %w: the transaction was rolled back while a Rows of it was still streaming", ErrClosed, io.ErrUnexpectedEOF)
+
+// ExecContext runs a statement on the pinned conn. An error does not prove that
+// the statement was not applied: see Errors from writes in the package
+// documentation.
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
-	if t.done {
-		return Result{}, errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return Result{}, ErrTxDone
 	}
 	named, slot := anysToNamed(args)
 	r, err := t.conn.ExecContext(ctx, query, named)
@@ -1139,10 +1585,13 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 }
 
 // QueryContext runs a query on the pinned conn. The returned Rows must be
-// closed before Commit/Rollback.
+// closed before Commit and before the next statement of the Tx: while a result
+// that streams (64 rows or more, not yet fully received) is open, the next
+// statement returns [ErrRowsOpen], and a Rows ends by Close, by being read to the
+// end, or by an error, not by the cancellation of ctx.
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
-	if t.done {
-		return nil, errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return nil, ErrTxDone
 	}
 	named, slot := anysToNamed(args)
 	drows, err := t.conn.QueryContext(ctx, query, named)
@@ -1156,6 +1605,11 @@ func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows
 // QueryRow executes a query expected to return at most one row on the
 // pinned conn. The returned [Row] is always non-nil; errors are deferred
 // until [Row.Scan].
+//
+// When the statement has RETURNING (an INSERT, UPDATE or DELETE ... RETURNING
+// statement is a write), an error from the call or from Scan does not prove that
+// the statement was not applied: see Errors from writes in the package
+// documentation.
 func (t *Tx) QueryRow(ctx context.Context, query string, args ...any) *Row {
 	rows, err := t.QueryContext(ctx, query, args...)
 	return &Row{rows: rows, err: err}
@@ -1165,8 +1619,8 @@ func (t *Tx) QueryRow(ctx context.Context, query string, args ...any) *Row {
 // match [A-Za-z0-9_]+; anything else is rejected before the wire write to
 // avoid SQL-injection.
 func (t *Tx) Savepoint(ctx context.Context, name string) error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return ErrTxDone
 	}
 	return t.conn.Savepoint(ctx, name)
 }
@@ -1174,8 +1628,8 @@ func (t *Tx) Savepoint(ctx context.Context, name string) error {
 // ReleaseSavepoint issues RELEASE SAVEPOINT <name>. Same name rules as
 // Savepoint.
 func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return ErrTxDone
 	}
 	return t.conn.ReleaseSavepoint(ctx, name)
 }
@@ -1183,8 +1637,77 @@ func (t *Tx) ReleaseSavepoint(ctx context.Context, name string) error {
 // RollbackToSavepoint issues ROLLBACK TO SAVEPOINT <name>. Same name rules
 // as Savepoint.
 func (t *Tx) RollbackToSavepoint(ctx context.Context, name string) error {
-	if t.done {
-		return errors.New("celeris-postgres: tx already finished")
+	if t.done.Load() {
+		return ErrTxDone
 	}
 	return t.conn.RollbackToSavepoint(ctx, name)
+}
+
+// isTimeOID reports whether oid is date, timestamp or timestamptz.
+func isTimeOID(oid uint32) bool {
+	return oid == protocol.OIDDate || oid == protocol.OIDTimestamp || oid == protocol.OIDTimestamptz
+}
+
+// rawCellGuard handles, for a *string destination (a *[]byte gets the wire bytes,
+// as in v1.5.11), the cells whose
+// raw wire value says more than the decoded driver.Value can. It reports
+// whether it filled dest. Today that is the infinity of a
+// date, timestamp or timestamptz: the server's own text, read from the wire
+// value before any time.Time exists, because the PGInfinity sentinel is also a
+// real instant. Both the buffered (scanRaw) and the streamed (Rows.Scan over a
+// streamRows) paths call it; every other cell goes the unchanged way.
+func rawCellGuard(dest any, raw []byte, codec *protocol.TypeCodec, binaryFmt bool) bool {
+	d, ok := dest.(*string)
+	if !ok || codec == nil {
+		return false
+	}
+	switch codec.OID {
+	case protocol.OIDDate, protocol.OIDTimestamp, protocol.OIDTimestamptz:
+	default:
+		return false
+	}
+	if txt, ok := infinityText(raw, codec.OID, binaryFmt); ok {
+		*d = txt
+		return true
+	}
+	return false
+}
+
+// infinityText reports whether raw, a date, timestamp or timestamptz cell of
+// the given type and format, is PostgreSQL's infinity or -infinity, and returns
+// the text the server prints for it. The binary form is the int32 days
+// (date) or int64 microseconds (timestamp, timestamptz) sentinel MaxInt /
+// MinInt; the text form is "infinity" / "-infinity" itself.
+func infinityText(raw []byte, oid uint32, binaryFmt bool) (string, bool) {
+	switch oid {
+	case protocol.OIDDate, protocol.OIDTimestamp, protocol.OIDTimestamptz:
+	default:
+		return "", false
+	}
+	if !binaryFmt {
+		switch string(raw) {
+		case "infinity":
+			return "infinity", true
+		case "-infinity":
+			return "-infinity", true
+		}
+		return "", false
+	}
+	switch {
+	case oid == protocol.OIDDate && len(raw) == 4:
+		switch int32(binary.BigEndian.Uint32(raw)) {
+		case math.MaxInt32:
+			return "infinity", true
+		case math.MinInt32:
+			return "-infinity", true
+		}
+	case oid != protocol.OIDDate && len(raw) == 8:
+		switch int64(binary.BigEndian.Uint64(raw)) {
+		case math.MaxInt64:
+			return "infinity", true
+		case math.MinInt64:
+			return "-infinity", true
+		}
+	}
+	return "", false
 }

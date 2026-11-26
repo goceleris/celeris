@@ -31,9 +31,10 @@ func (pe *PreparedEvent) Len() int { return len(pe.bytes) }
 // writer through c.mu. Returns [ErrClientClosed] after the client has been
 // closed and the underlying context error after disconnect. As for
 // [Client.Send] in blocking mode, a nil error means the bytes were handed to
-// the connection and flushed: on epoll, io_uring and adaptive over HTTP/1.1 a
-// write after the engine has noticed a reset is dropped without an error, and
-// the disconnect arrives through [Client.Context].
+// the connection and flushed: on the epoll and io_uring engines over
+// HTTP/1.1 a write before the engine has noticed a reset still returns nil, and
+// one after it returns an error, the context error of [Client.Context] or one
+// wrapping net.ErrClosed.
 //
 // Always synchronous (writes to the wire under the lock) — bypasses
 // [Config.MaxQueueDepth]. The [Broker] is the layer above this method:

@@ -1419,7 +1419,7 @@ jobs:
             'celeristest TestNewContextZeroAlloc'
             'driver/memcached TestAllocBudgets'
             'driver/postgres TestAllocBudgets|TestAllocBudgetsPreparedExec'
-            'driver/redis TestAllocBudgets|TestDirectWaitFastRepliesDoNotBlock854|TestDirectWaitHysteresis854'
+            'driver/redis TestAllocBudgets|TestDirectWaitFastRepliesDoNotBlock854|TestDirectWaitHysteresis854|TestWatcherAllocations1387'
             'middleware/cache TestAllocBudgets'
             'middleware/idempotency TestAllocBudgets'
             'middleware/overload TestAllocBudgets'
@@ -1475,9 +1475,9 @@ jobs:
           done
           skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/allocguard.log)
           faillines=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/allocguard.log || true)
-          echo "alloc guards: top-level PASS $total (want 17), packages with a wrong tally $bad, SKIP lines $skipped, FAIL lines $faillines, go test runs failed $failed (want 0)"
-          if [ "$total" -ne 17 ] || [ "$bad" -ne 0 ] || [ "$skipped" -ne 0 ] || [ "$faillines" -ne 0 ] || [ "$failed" -ne 0 ]; then
-            echo "expected the 17 guard tests of 11 packages to run and PASS with no SKIP or FAIL line --"
+          echo "alloc guards: top-level PASS $total (want 18), packages with a wrong tally $bad, SKIP lines $skipped, FAIL lines $faillines, go test runs failed $failed (want 0)"
+          if [ "$total" -ne 18 ] || [ "$bad" -ne 0 ] || [ "$skipped" -ne 0 ] || [ "$faillines" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected the 18 guard tests of 11 packages to run and PASS with no SKIP or FAIL line --"
             echo "was one renamed or removed, did one skip (alloc counts are skipped under -race, coverage and -short), or did one fail?"
             exit 1
           fi
@@ -2777,6 +2777,64 @@ jobs:
           echo "Postgres conformance: SKIP lines $skipped (want 0)"
           if [ "$skipped" -ne 0 ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pg.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
+      # Since v1.6.0 a database/sql Connector dials direct connections unless it
+      # has WithStreaming (or streaming=true in the DSN): the event-loop path is
+      # an option, and the steps above no longer run it. The fixes made on that
+      # path (celeris#1440, #1449, #1459) stay guarded by running the conformance
+      # suite, and the database/sql carriers of the driver's unit tests, once more
+      # with it switched on. Steps of this job, so no new required check name.
+      - name: Postgres conformance, database/sql on the event loop (WithStreaming)
+        shell: bash
+        env:
+          CELERIS_CONFORMANCE_STREAMING: "1"
+        run: |
+          set -o pipefail
+          go test -tags postgres -race -count=1 -timeout=300s -v ./test/conformance/postgres/... 2>&1 | tee /tmp/drv-pg-stream.log
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-pg-stream.log)
+          echo "Postgres conformance (WithStreaming): SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pg-stream.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
+      - name: Postgres driver tests, database/sql carriers on the event loop (WithStreaming)
+        shell: bash
+        env:
+          CELERIS_TEST_STREAMING: "1"
+        run: go test -race -count=1 -timeout=300s ./driver/postgres/
+      # The regression test of a Connector WithStreaming bound to a started epoll
+      # server that also has WithMaxResultBytes (linux only, tag postgres; it
+      # needs CELERIS_PG_DSN, which this job sets, and a SKIP line fails the step).
+      - name: Postgres connector on a started server keeps its cap
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags postgres -race -count=1 -timeout=300s -v -run '^TestConnectorStartedServerKeepsTheCapThroughTheChain$' ./driver/postgres/ 2>&1 | tee /tmp/drv-pg-startedcap.log
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-pg-startedcap.log)
+          echo "Postgres connector on a started server: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pg-startedcap.log || true
+            echo "expected no SKIP line -- a skip is not coverage"
+            exit 1
+          fi
+      # The same common column types read back through celeris-postgres, pgx/v5
+      # and lib/pq, in the simple and the extended protocol, and required to
+      # agree (test/drivercmp/postgres/roundtrip_ref_test.go). That module is
+      # separate so pgx and lib/pq never reach consumers of celeris; it takes the
+      # local celeris through a replace directive, so this run tests this commit.
+      - name: Postgres round-trip against pgx and lib/pq (reference drivers)
+        shell: bash
+        working-directory: test/drivercmp/postgres
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=300s -v -run '^TestRoundTripAgainstReferenceDrivers$' ./... 2>&1 | tee /tmp/drv-pgref.log
+          skipped=$("$GITHUB_WORKSPACE"/.github/scripts/skip-count.sh /tmp/drv-pgref.log)
+          echo "Postgres reference-driver round-trip: SKIP lines $skipped (want 0)"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/drv-pgref.log || true
             echo "expected no SKIP line -- a skip is not coverage"
             exit 1
           fi

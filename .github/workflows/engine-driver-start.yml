@@ -1,0 +1,51 @@
+# Engine start vs driver registration: a driver that reaches a server's event-loop provider right after Start
+# (before the engine is ready) must not panic or race. ./test/integration is not run as a whole by ci.yml, so this
+# small workflow runs the regression test by name, under -race, against fake backends (no service containers).
+# It has its own path filter so that an engine or provider change runs it without the Drivers workflow's matrix.
+
+name: Engine start vs drivers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server.go'
+      - 'internal/engine/**'
+      - 'internal/adaptive/**'
+      - 'driver/internal/eventloop/**'
+      - 'test/integration/engine_start_driver_register_linux_test.go'
+      - '.github/workflows/engine-driver-start.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server.go'
+      - 'internal/engine/**'
+      - 'internal/adaptive/**'
+      - 'driver/internal/eventloop/**'
+      - 'test/integration/engine_start_driver_register_linux_test.go'
+      - '.github/workflows/engine-driver-start.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  engine-start-register:
+    name: Drivers opened right after Start (-race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.4"
+      - name: TestDriversOpenedRightAfterStart
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=600s -v -run '^TestDriversOpenedRightAfterStart$' ./test/integration/ 2>&1 | tee /tmp/start-register.log
+          # epoll and adaptive must run, not skip (io_uring may skip where the kernel has no io_uring or its rings do not fit)
+          for e in epoll adaptive; do
+            grep -q -- "--- PASS: TestDriversOpenedRightAfterStart/$e " /tmp/start-register.log || { echo "TestDriversOpenedRightAfterStart/$e did not pass"; exit 1; }
+          done

@@ -6,11 +6,65 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// pgEpoch is the PostgreSQL date/time origin: 2000-01-01 00:00:00 UTC.
-var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+// pgEpochUnix is the PostgreSQL date/time origin, 2000-01-01 00:00:00 UTC, as
+// Unix seconds.
+const pgEpochUnix = 946684800
+
+// The binary date and timestamp values are plain integers (days, or
+// microseconds, since the origin) and cover PostgreSQL's whole range, 4714 BC
+// to 294276 AD. A time.Duration cannot hold that: it is an int64 count of
+// nanoseconds and spans only about 292 years either side of the origin, so
+// converting through Duration (Duration(micros)*Microsecond, or t.Sub(origin),
+// which saturates) silently yields a wrong value outside roughly 1708..2292.
+// Everything below therefore works in seconds and a sub-second remainder and
+// builds the time.Time with time.Unix.
+
+const (
+	microsPerSecond = 1_000_000
+	secondsPerDay   = 86400
+	pgEpochDays     = pgEpochUnix / secondsPerDay // 10957 days from 1970-01-01 to 2000-01-01
+
+	// The wire sentinels for infinity use the extreme integers, so a finite
+	// value the encoder produces must stay strictly inside them. maxSecsFromOrigin
+	// and minSecsFromOrigin bound the seconds from the origin that
+	// still convert to int64 microseconds, with a second of margin for the
+	// microsecond remainder.
+	maxSecsFromOrigin = math.MaxInt64/microsPerSecond - 1
+	minSecsFromOrigin = math.MinInt64/microsPerSecond + 1
+)
+
+// timeFromPGMicros converts microseconds since the PostgreSQL origin into a UTC
+// time.Time. The split uses floor division, so a negative value (before the
+// origin) gets a non-negative microsecond remainder.
+func timeFromPGMicros(micros int64) time.Time {
+	sec := micros / microsPerSecond
+	rem := micros % microsPerSecond
+	if rem < 0 {
+		rem += microsPerSecond
+		sec--
+	}
+	return time.Unix(pgEpochUnix+sec, rem*1000).UTC()
+}
+
+// pgMicrosFromTime is the inverse of timeFromPGMicros: microseconds since the
+// PostgreSQL origin, truncated (floored) to a whole microsecond. It reports an
+// error for an instant whose value does not fit in the wire's int64 instead of
+// wrapping or saturating.
+func pgMicrosFromTime(t time.Time) (int64, error) {
+	u := t.Unix()
+	if u < pgEpochUnix+minSecsFromOrigin || u > pgEpochUnix+maxSecsFromOrigin {
+		return 0, fmt.Errorf("postgres/protocol: encode timestamp: %v is outside PostgreSQL's range", t)
+	}
+	// t.Nanosecond() is in [0, 1e9) for every time.Time, including those before
+	// the Unix epoch, so dividing it truncates toward the earlier microsecond:
+	// already the floor.
+	return (u-pgEpochUnix)*microsPerSecond + int64(t.Nanosecond())/1000, nil
+}
 
 // PGInfinity and PGNegInfinity are sentinel time.Time values returned when
 // PostgreSQL sends infinity/−infinity for timestamp or date columns. Callers
@@ -28,6 +82,48 @@ const (
 	pgDateNegInfinity      = int32(math.MinInt32)
 )
 
+// -------------------- BC text forms --------------------
+
+// bcCycleYears is a multiple of 400, the length of the Gregorian calendar
+// cycle, so shifting a date by it keeps every month length and leap day.
+const bcCycleYears = 4800
+
+// splitBC reports whether the text form s ends in PostgreSQL's era suffix
+// " BC" and returns s without it. PostgreSQL prints a date or timestamp before
+// 1 AD as "YYYY-MM-DD BC" / "YYYY-MM-DD HH:MM:SS[.f][+tz] BC" with the year
+// counted from 1 BC.
+func splitBC(s string) (string, bool) {
+	return strings.CutSuffix(s, " BC")
+}
+
+// bcToCycle rewrites the text form of a BC value, whose year field is N (N BC),
+// to the same calendar position in an AD year that time.Parse accepts: Go's
+// astronomical year is 1-N, and bcCycleYears is added to make it positive.
+// 0045-02-29 BC (astronomical -44, a leap year) becomes year 4756, also a leap
+// year, so a leap day still parses. fromCycle undoes the shift on the parsed
+// time. N must be 1 to 4800 (PostgreSQL's earliest date is 4713 BC); there is
+// no year 0 BC in the text form, so "0000 BC" is an error.
+func bcToCycle(s string) (string, error) {
+	i := strings.IndexByte(s, '-')
+	if i < 1 || i > 5 {
+		return "", errBCYear
+	}
+	n, err := strconv.Atoi(s[:i])
+	if err != nil || n < 1 || n > bcCycleYears {
+		return "", errBCYear
+	}
+	y := strconv.Itoa(1 - n + bcCycleYears)
+	return strings.Repeat("0", 4-len(y)) + y + s[i:], nil
+}
+
+var errBCYear = fmt.Errorf("postgres/protocol: invalid BC year")
+
+// fromCycle maps a time parsed from bcToCycle's output back to the Go
+// (astronomical) year, keeping the zone.
+func fromCycle(t time.Time) time.Time {
+	return t.AddDate(-bcCycleYears, 0, 0)
+}
+
 // -------------------- date --------------------
 
 func decodeDateBinary(src []byte) (driver.Value, error) {
@@ -41,7 +137,7 @@ func decodeDateBinary(src []byte) (driver.Value, error) {
 	case pgDateNegInfinity:
 		return PGNegInfinity, nil
 	}
-	return pgEpoch.AddDate(0, 0, int(days)), nil
+	return time.Unix((int64(days)+pgEpochDays)*secondsPerDay, 0).UTC(), nil
 }
 
 func decodeDateText(src []byte) (driver.Value, error) {
@@ -51,6 +147,17 @@ func decodeDateText(src []byte) (driver.Value, error) {
 		return PGInfinity, nil
 	case "-infinity":
 		return PGNegInfinity, nil
+	}
+	if body, bc := splitBC(s); bc {
+		shifted, err := bcToCycle(body)
+		if err != nil {
+			return nil, fmt.Errorf("postgres/protocol: date text %q: %w", src, err)
+		}
+		t, err := time.Parse("2006-01-02", shifted)
+		if err != nil {
+			return nil, fmt.Errorf("postgres/protocol: date text %q: %w", src, err)
+		}
+		return fromCycle(t), nil
 	}
 	t, err := time.Parse("2006-01-02", s)
 	if err != nil {
@@ -68,27 +175,24 @@ func encodeDateBinary(dst []byte, v any) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("postgres/protocol: encode date: unsupported %T", v)
 	}
-	// Truncate to UTC midnight before computing the day delta so we don't
-	// round to the "wrong" day for values in non-UTC zones.
+	// Use the UTC calendar day: truncate to UTC midnight so a value in a
+	// non-UTC zone, or with a time of day, does not move the day.
 	t = t.UTC()
 	y, m, d := t.Date()
-	t = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
-	// Go's integer division truncates toward zero — for negative deltas
-	// (dates before pgEpoch = 2000-01-01 UTC) with a non-zero remainder that
-	// produces the mathematically-wrong result. We already truncate t to
-	// UTC midnight above so the remainder SHOULD be zero, but we apply the
-	// floor correction defensively in case a future refactor feeds in a
-	// sub-day offset. int64 → int32 truncation is safe: the int32 range of
-	// days covers roughly ±5.8M years, which dwarfs any representable
-	// time.Time.
-	delta := t.Sub(pgEpoch)
-	day := 24 * time.Hour
-	days := int64(delta / day)
-	if rem := delta % day; rem < 0 {
+	u := time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix()
+	// u is an exact multiple of a day; the floor division is defensive only.
+	days := u / secondsPerDay
+	if u%secondsPerDay < 0 {
 		days--
 	}
-	u := uint32(int32(days))
-	return append(dst, byte(u>>24), byte(u>>16), byte(u>>8), byte(u)), nil
+	days -= pgEpochDays
+	// The int32 day count reaches about +-5.8 million years; the extreme
+	// values are the infinity sentinels, so keep clear of them.
+	if days <= int64(pgDateNegInfinity) || days >= int64(pgDateInfinity) {
+		return nil, fmt.Errorf("postgres/protocol: encode date: %v is outside PostgreSQL's range", t)
+	}
+	w := uint32(int32(days))
+	return append(dst, byte(w>>24), byte(w>>16), byte(w>>8), byte(w)), nil
 }
 
 func encodeDateText(dst []byte, v any) ([]byte, error) {
@@ -120,7 +224,7 @@ func decodeTimestampBinary(src []byte) (driver.Value, error) {
 	case pgTimestampNegInfinity:
 		return PGNegInfinity, nil
 	}
-	return pgEpoch.Add(time.Duration(micros) * time.Microsecond), nil
+	return timeFromPGMicros(micros), nil
 }
 
 func decodeTimestampText(src []byte) (driver.Value, error) {
@@ -132,11 +236,22 @@ func decodeTimestampText(src []byte) (driver.Value, error) {
 		return PGNegInfinity, nil
 	}
 	// Text form lacks timezone; parse as UTC.
+	body, bc := splitBC(s)
+	if bc {
+		shifted, err := bcToCycle(body)
+		if err != nil {
+			return nil, fmt.Errorf("postgres/protocol: timestamp text %q: %w", src, err)
+		}
+		body = shifted
+	}
 	for _, layout := range []string{
 		"2006-01-02 15:04:05.999999",
 		"2006-01-02 15:04:05",
 	} {
-		if t, err := time.ParseInLocation(layout, s, time.UTC); err == nil {
+		if t, err := time.ParseInLocation(layout, body, time.UTC); err == nil {
+			if bc {
+				t = fromCycle(t)
+			}
 			return t, nil
 		}
 	}
@@ -151,14 +266,29 @@ func decodeTimestamptzText(src []byte) (driver.Value, error) {
 	case "-infinity":
 		return PGNegInfinity, nil
 	}
+	body, bc := splitBC(s)
+	if bc {
+		shifted, err := bcToCycle(body)
+		if err != nil {
+			return nil, fmt.Errorf("postgres/protocol: timestamptz text %q: %w", src, err)
+		}
+		body = shifted
+	}
 	for _, layout := range []string{
 		"2006-01-02 15:04:05.999999Z07:00",
 		"2006-01-02 15:04:05Z07:00",
 		"2006-01-02 15:04:05.999999-07",
 		"2006-01-02 15:04:05-07",
+		// An offset with seconds (Europe/Amsterdam before 1937 is +00:19:32).
+		"2006-01-02 15:04:05.999999Z07:00:00",
+		"2006-01-02 15:04:05Z07:00:00",
 	} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t.UTC(), nil
+		if t, err := time.Parse(layout, body); err == nil {
+			t = t.UTC()
+			if bc {
+				t = fromCycle(t)
+			}
+			return t, nil
 		}
 	}
 	return nil, fmt.Errorf("postgres/protocol: timestamptz text %q", src)
@@ -173,10 +303,9 @@ func encodeTimestampBinary(dst []byte, v any) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("postgres/protocol: encode timestamp: unsupported %T", v)
 	}
-	d := t.UTC().Sub(pgEpoch)
-	micros := int64(d / time.Microsecond)
-	if d < 0 && d%time.Microsecond != 0 {
-		micros--
+	micros, err := pgMicrosFromTime(t)
+	if err != nil {
+		return nil, err
 	}
 	u := uint64(micros)
 	return append(dst, byte(u>>56), byte(u>>48), byte(u>>40), byte(u>>32),

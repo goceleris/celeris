@@ -4,6 +4,7 @@ package adaptive
 
 import (
 	"context"
+	"net"
 	"runtime"
 	"strings"
 	"testing"
@@ -11,6 +12,34 @@ import (
 
 	"github.com/goceleris/celeris/internal/engine"
 )
+
+// addrHidden616 is a real start engine whose published address Listen cannot
+// see: everything is the wrapped engine's but Addr, which stays nil. The
+// "context cancelled" arms use it so that the early return they are about is
+// taken by construction: adaptive.Listen waits for the start engine's address
+// while its context is still alive, and with the context already cancelled at
+// the gap hook it sees the end of the context first. With the bare engine it was
+// a race between that wait and the engine's own Listen, which started with a
+// cancelled context: a start engine that published before the wait looked at it
+// (epoll or io_uring, on a starved runner: celeris#1328, 1 run in 500 with the
+// test pinned to 2 CPUs beside 3 busy loops) took Listen down the return of an
+// engine that did start, which TestAdaptivePortHeldUntilListenReturns616
+// covers, and the arm failed on its own premise. The engine may start (with an
+// already-cancelled context epoll and io_uring may also return before binding)
+// and is stopped by the cancel either way. The "injection not made" guard on
+// e.Addr() is inert for these two arms now: adaptive stores its address only on
+// the started path, which is unreachable. The checks that still bite are the
+// ones after Listen: it reports no error, the hold is gone, and a bare socket
+// can bind the port within 2 s.
+type addrHidden616 struct{ engine.Engine }
+
+func (addrHidden616) Addr() net.Addr { return nil }
+
+// hideStartAddr616 puts the start engine behind addrHidden616.
+func hideStartAddr616(e *Engine) {
+	var hidden engine.Engine = addrHidden616{Engine: *e.active.Load()}
+	e.active.Store(&hidden)
+}
 
 // TestAdaptiveListenEarlyReturnReleasesHold616: a Listen that returns before
 // the start engine has published its address gives the port hold back with no
@@ -23,7 +52,8 @@ import (
 // down its own exit:
 //
 //   - "context cancelled": the context ends at the last moment the hold covers
-//     (listenGapHook), so Listen takes its "stopped" return and reports no
+//     (listenGapHook) and the start engine's address is kept from Listen
+//     (addrHidden616), so Listen takes its "stopped" return and reports no
 //     error;
 //   - "start engine fails": the start engine's Listen returns an error without
 //     ever publishing an address, as an io_uring engine whose worker init
@@ -49,11 +79,13 @@ func TestAdaptiveListenEarlyReturnReleasesHold616(t *testing.T) {
 	}
 	arms := []arm{
 		{name: "context cancelled/epoll", env: "epoll", want: engine.Epoll,
-			inject: func(_ *Engine, cancel context.CancelFunc) {
+			inject: func(e *Engine, cancel context.CancelFunc) {
+				hideStartAddr616(e)
 				listenGapHook = func(string) { cancel() }
 			}},
 		{name: "context cancelled/iouring", env: "iouring", want: engine.IOUring,
-			inject: func(_ *Engine, cancel context.CancelFunc) {
+			inject: func(e *Engine, cancel context.CancelFunc) {
+				hideStartAddr616(e)
 				listenGapHook = func(string) { cancel() }
 			}},
 		{name: "start engine fails/epoll", env: "epoll", want: engine.Epoll,

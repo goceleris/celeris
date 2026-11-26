@@ -1,0 +1,500 @@
+{
+  "version": 1,
+  "driver": "redis",
+  "regenerate": "go test -tags redis -run '^TestSupportTable$' ./test/conformance/redis/",
+  "sections": [
+    {
+      "id": "reply-types",
+      "title": "Reply types",
+      "rows": [
+        {
+          "id": "simple-string",
+          "label": "Simple string (+OK)",
+          "returns": "`Value.Type` is `TySimple`, the payload is in `Value.Str`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "integer",
+          "label": "Integer",
+          "returns": "`Value.Type` is `TyInt`, the payload is in `Value.Int`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "bulk-string",
+          "label": "Bulk string",
+          "returns": "`Value.Type` is `TyBulk`, the payload is in `Value.Str`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "null",
+          "label": "Null",
+          "returns": "`Value.Type` is `TyNull`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "array",
+          "label": "Array (also nested, empty, with nulls)",
+          "returns": "`Value.Type` is `TyArray`, the payload is in `Value.Array`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "map",
+          "label": "Map (RESP3)",
+          "returns": "`Value.Type` is `TyMap`, the payload is in `Value.Map`; on RESP2 the server sends `TyArray` instead, with the payload in `Value.Array`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "set",
+          "label": "Set (RESP3)",
+          "returns": "`Value.Type` is `TySet`, the payload is in `Value.Array`; on RESP2 the server sends `TyArray` instead, with the payload in `Value.Array`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "double",
+          "label": "Double (RESP3)",
+          "returns": "`Value.Type` is `TyDouble`, the payload is in `Value.Float`; on RESP2 the server sends `TyBulk` instead, with the payload in `Value.Str`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "boolean",
+          "label": "Boolean (RESP3)",
+          "returns": "`Value.Type` is `TyBool`, the payload is in `Value.Bool`; on RESP2 the server sends `TyInt` instead, with the payload in `Value.Int`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "big-number",
+          "label": "Big number (RESP3)",
+          "returns": "`Value.Type` is `TyBigInt`, the payload is in `Value.BigN`; on RESP2 the server sends `TyBulk` instead, with the payload in `Value.Str`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "verbatim-string",
+          "label": "Verbatim string (RESP3)",
+          "returns": "`Value.Type` is `TyVerbatim`, the payload is in `Value.Str`; on RESP2 the server sends `TyBulk` instead, with the payload in `Value.Str`",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "typed-helpers",
+      "title": "Typed helpers on each reply",
+      "rows": [
+        {
+          "id": "helpers-bulk",
+          "label": "Bulk string",
+          "works": [
+            "DoString"
+          ],
+          "by_design": [
+            "DoInt",
+            "DoBool",
+            "DoSlice"
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-integer",
+          "label": "Integer",
+          "works": [
+            "DoString",
+            "DoInt",
+            "DoBool"
+          ],
+          "by_design": [
+            "DoSlice"
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-status",
+          "label": "Simple string",
+          "works": [
+            "DoString"
+          ],
+          "by_design": [
+            "DoInt",
+            "DoBool",
+            "DoSlice"
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-double",
+          "label": "Double (RESP3)",
+          "works": [],
+          "by_design": [
+            "DoInt",
+            "DoBool",
+            "DoSlice"
+          ],
+          "fails": [
+            {
+              "dest": "DoString",
+              "gap": "R1",
+              "scope": [
+                "resp3"
+              ]
+            }
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-bool-true",
+          "label": "Boolean true (RESP3)",
+          "works": [
+            "DoBool"
+          ],
+          "by_design": [
+            "DoSlice"
+          ],
+          "fails": [
+            {
+              "dest": "DoString",
+              "gap": "R1",
+              "scope": [
+                "resp3"
+              ]
+            },
+            {
+              "dest": "DoInt",
+              "gap": "R1",
+              "scope": [
+                "resp3"
+              ]
+            }
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-bool-false",
+          "label": "Boolean false (RESP3)",
+          "works": [
+            "DoBool"
+          ],
+          "by_design": [
+            "DoSlice"
+          ],
+          "fails": [
+            {
+              "dest": "DoString",
+              "gap": "R1",
+              "scope": [
+                "resp3"
+              ]
+            },
+            {
+              "dest": "DoInt",
+              "gap": "R1",
+              "scope": [
+                "resp3"
+              ]
+            }
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-big-number",
+          "label": "Big number (RESP3)",
+          "works": [],
+          "by_design": [
+            "DoInt",
+            "DoBool",
+            "DoSlice"
+          ],
+          "fails": [
+            {
+              "dest": "DoString",
+              "gap": "R1",
+              "scope": [
+                "resp3"
+              ]
+            }
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-verbatim",
+          "label": "Verbatim string (RESP3)",
+          "works": [
+            "DoString"
+          ],
+          "by_design": [
+            "DoInt",
+            "DoBool",
+            "DoSlice"
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-set",
+          "label": "Set (RESP3)",
+          "works": [
+            "DoSlice"
+          ],
+          "by_design": [
+            "DoString",
+            "DoInt",
+            "DoBool"
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-array-of-bulk",
+          "label": "Array of bulk strings",
+          "works": [
+            "DoSlice"
+          ],
+          "by_design": [
+            "DoString",
+            "DoInt",
+            "DoBool"
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-array-of-int",
+          "label": "Array of integers (an EVAL reply)",
+          "works": [],
+          "by_design": [
+            "DoString",
+            "DoInt",
+            "DoBool"
+          ],
+          "fails": [
+            {
+              "dest": "DoSlice",
+              "gap": "R2",
+              "scope": [
+                "resp2",
+                "resp3"
+              ]
+            }
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        },
+        {
+          "id": "helpers-map-flat-on-resp2",
+          "label": "Map (RESP3), a flat array on RESP2",
+          "works": [],
+          "by_design": [
+            "DoString",
+            "DoInt",
+            "DoBool"
+          ],
+          "fails": [
+            {
+              "dest": "DoSlice",
+              "gap": "R1",
+              "scope": [
+                "resp3"
+              ]
+            },
+            {
+              "dest": "DoSlice",
+              "gap": "R2",
+              "scope": [
+                "resp2",
+                "resp3"
+              ]
+            }
+          ],
+          "covers": [
+            "TestRESPTypedHelpers"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "other",
+      "title": "Other behaviour",
+      "rows": [
+        {
+          "id": "large-values",
+          "label": "Values up to 3 MiB, and values that contain CRLF, $, + or any byte",
+          "returns": "the same bytes back",
+          "works": [
+            "Set",
+            "SetBytes",
+            "Get",
+            "GetBytes",
+            "Do"
+          ],
+          "covers": [
+            "TestRESPLargeAndBinaryBulk"
+          ]
+        },
+        {
+          "id": "huge-values",
+          "label": "Values of 4 MiB and more",
+          "works": [],
+          "fails": [
+            {
+              "dest": "Set",
+              "gap": "R3",
+              "scope": [
+                "linux"
+              ]
+            },
+            {
+              "dest": "SetBytes",
+              "gap": "R3",
+              "scope": [
+                "linux"
+              ]
+            }
+          ],
+          "covers": [
+            "TestRESPLargeAndBinaryBulk"
+          ]
+        },
+        {
+          "id": "error-replies",
+          "label": "Error replies",
+          "returns": "a `*RedisError` whose `Prefix` is the first word (`WRONGTYPE`, `ERR`, or your script's own); the connection stays usable",
+          "works": [
+            "Do"
+          ],
+          "covers": [
+            "TestRESPReplyTypes"
+          ]
+        },
+        {
+          "id": "typed-doubles",
+          "label": "Commands that reply with a number with a fraction",
+          "returns": "`float64`, infinities included, the same on RESP2 and RESP3",
+          "works": [
+            "ZScore",
+            "IncrByFloat",
+            "HIncrByFloat",
+            "ZIncrBy"
+          ],
+          "covers": [
+            "TestRESPTypedDoubles"
+          ]
+        },
+        {
+          "id": "typed-aggregates",
+          "label": "Hashes, sets, lists and MGet",
+          "returns": "`map[string]string` or `[]string`; a missing key gives an empty map or slice; fields and members may be empty or not ASCII",
+          "works": [
+            "HGetAll",
+            "SMembers",
+            "SIsMember",
+            "LRange",
+            "MGet"
+          ],
+          "covers": [
+            "TestRESPTypedAggregates"
+          ]
+        },
+        {
+          "id": "push",
+          "label": "Push messages on a command connection (client-side caching)",
+          "returns": "delivered to the `WithOnPush` callback; the replies are not disturbed",
+          "works": [
+            "WithOnPush"
+          ],
+          "covers": [
+            "TestRESPPushOnCommandConn"
+          ]
+        }
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "id": "R1",
+      "release": "v1.6.0",
+      "summary": "On RESP3 (the default), `DoString` and `DoInt` fail on a double, boolean or big number reply, and `DoSlice` fails on a map reply, where RESP2 returns the value.",
+      "error": "celeris-redis: expected string reply, got double"
+    },
+    {
+      "id": "R2",
+      "release": "v1.6.0",
+      "summary": "`DoSlice` returns an empty string for every element that is an integer, a double, a boolean or a nested array."
+    },
+    {
+      "id": "R3",
+      "release": "v1.6.0",
+      "summary": "On Linux, a single value of 4 MiB or more cannot be written (`SET`, `RPUSH`, `HSET` and the other commands that carry one large argument). macOS and Windows do not have this limit.",
+      "error": "celeris/engine: worker write queue full"
+    }
+  ]
+}
