@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"database/sql"
 	"errors"
 
 	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
@@ -28,6 +29,18 @@ var ErrClosed = errors.New("celeris-postgres: connection closed")
 // returns the driver's error as it is.
 var ErrTxCommitRollback = errors.New("celeris-postgres: commit unexpectedly resulted in rollback")
 
+// ErrTxDone is returned by every method of a [Tx] after Commit or Rollback has
+// been called on it, whatever that call returned (a Commit that failed ends the
+// Tx too). Nothing is sent to the server. It keeps the message the driver always
+// had and matches [database/sql.ErrTxDone] with errors.Is, as code written against
+// database/sql expects.
+var ErrTxDone error = txDoneError{}
+
+type txDoneError struct{}
+
+func (txDoneError) Error() string { return "celeris-postgres: tx already finished" }
+func (txDoneError) Unwrap() error { return sql.ErrTxDone }
+
 // ErrBadConn is returned when a connection is in an unusable state; returning
 // it causes database/sql to evict the conn and open a fresh one.
 var ErrBadConn = errors.New("celeris-postgres: bad connection")
@@ -47,27 +60,32 @@ var ErrTxLeftOpen = errors.New("celeris-postgres: the statement left a transacti
 // exceeds the result buffer cap, 64 MiB (maxDirectResultBytes), on a path that
 // buffers the reply whole. Those paths are a direct-mode [Pool]: a bare
 // [Open](dsn), or [WithEngine] on a server that has started (epoll, io_uring,
-// adaptive) or that runs async handlers; and, rarely, the sync fast path of an
-// event-loop Pool while one poll reads past the cap. A Pool opened with
-// [WithEngine] on a server that has not started yet (or that runs the std
-// engine without async handlers) and a *sql.DB opened with this driver stream a
+// adaptive) or that runs async handlers; a *sql.DB opened with a [Connector]
+// bound by [Connector.WithEngine] to a server that has started (epoll, io_uring,
+// adaptive), whose connections are dialled direct (see [Connector.WithEngine]);
+// and, rarely, the sync fast path of an event-loop Pool while one poll reads
+// past the cap. A Pool opened with [WithEngine] on a server that has not started
+// yet (or that runs the std engine without async handlers), and a *sql.DB opened
+// with this driver with no engine, on the std engine or bound to a server that
+// had not started when the Connector was bound with [Connector.WithEngine], run
+// on the event loop: they stream a
 // large result and have no cap.
 //
 // The caller reads the rows that fit under the cap and then gets this error
-// from [Rows.Err]. [Rows.Next] only returns false and [Rows.Close] returns nil,
-// so a caller that does not check Rows.Err sees a truncated result with no other
-// sign: always check it. A single row larger than the cap fails the query
-// itself: the call returns this error and no rows. The rest of the reply is
-// read and discarded, so the connection stays usable. The cap is fixed: there
-// is no option and no DSN parameter for it.
+// from [Rows.Err] (from sql.Rows.Err on a *sql.DB). [Rows.Next] only returns
+// false and [Rows.Close] returns nil, so a caller that does not check Rows.Err
+// sees a truncated result with no other sign: always check it. A single row
+// larger than the cap fails the query itself: the call returns this error and no
+// rows. The rest of the reply is read and discarded, so the connection stays
+// usable. The cap is fixed: there is no option and no DSN parameter for it.
 //
-// To read a larger result use [Pool.CopyTo], a cursor (DECLARE and FETCH n)
-// inside [Pool.BeginTx], a Pool on the event loop (WithEngine on a server that
-// has not started yet), or database/sql, all of which stream; or paginate the
-// query with LIMIT/OFFSET or keyset paging. Before v1.6.0 a direct-mode Pool
-// buffered the whole reply (several times its size in memory) before it
-// returned this error.
-var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate or use streaming mode")
+// To read a larger result paginate the query with LIMIT/OFFSET or keyset
+// paging; a cursor (DECLARE and FETCH n) inside a transaction does not buffer
+// the whole result either, and neither does [Pool.CopyTo] on a Pool. A Pool on
+// the event loop (WithEngine on a server that has not started yet) streams as
+// well. Before v1.6.0 a direct-mode Pool buffered the whole reply (several times
+// its size in memory) before it returned this error.
+var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate the query")
 
 // errMultiResultSets is the error of a row-returning query (Query, QueryRow,
 // QueryContext, on a Pool, a Tx or a *sql.DB) whose text holds several
@@ -91,11 +109,17 @@ var errMultiResultSets = errors.New("celeris-postgres: multiple result sets are 
 // supported via a short-lived per-call reader goroutine; only the
 // persistent-listener class of operations returns this error.
 //
-// Workarounds: open the pool against an engine with AsyncHandlers=false
-// (drivers will pick the mini-loop path which has an always-on reader),
-// or use a separate non-pooled listener conn dedicated to
-// LISTEN/NOTIFY in a non-async configuration.
-var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; use a non-async engine pool or a dedicated listener conn")
+// A *sql.DB opened with a [Connector] bound to a started epoll, io_uring or
+// adaptive server gets direct-mode connections too (see [Connector.WithEngine]),
+// so LISTEN and UNLISTEN return this error there.
+//
+// Workarounds: run the listener on the driver's own event loop, which has an
+// always-on reader: a [Pool] opened with [WithEngine] on a server that has not
+// started yet (and runs no async handlers), or a [Connector] with no engine or
+// bound with [Connector.WithEngine] before the server starts. A Connector bound
+// to a started epoll, io_uring or adaptive server does not help.
+var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; " +
+	"use a Pool on a server that has not started, or a Connector with no engine or bound before the server starts")
 
 // PGError is a server-sent ErrorResponse. Match it with errors.As.
 //
