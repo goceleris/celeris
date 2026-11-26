@@ -358,12 +358,9 @@ func TestPoolStaleCancelNeverPoisonsTheNextStatement(t *testing.T) {
 						failures = append(failures, fmt.Sprintf("iteration %d: the cancelled statement returned %d, want its own %d", i, got, want))
 					default:
 						var pe *postgres.PGError
-						// ErrClosed: TEMPORARY, until the fix of the prepare error (a context that ends during
-						// the auto-cache prepare of the statement is swallowed and the statement is run
-						// again: on a conn failed by the cancel it returns ErrClosed). Remove with that fix.
 						// isNetTimeout: the pool had to dial a new conn (the old one was discarded)
 						// and the context expired during the dial.
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isNetTimeout(err) || errors.Is(err, postgres.ErrClosed) || (errors.As(err, &pe) && pe.Code == "57014") {
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isNetTimeout(err) || (errors.As(err, &pe) && pe.Code == "57014") {
 							ended++
 						} else {
 							failures = append(failures, fmt.Sprintf("iteration %d: %v", i, err))
