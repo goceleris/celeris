@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "driver": "memcached",
+  "regenerate": "go test -tags memcached -run '^TestSupportTable$' ./test/conformance/memcached/",
+  "sections": [
+    {
+      "id": "behaviour",
+      "title": "Values, keys and commands",
+      "rows": [
+        {
+          "id": "values",
+          "label": "Values of any bytes, from empty up to the server's 1 MiB item limit, including bytes that look like protocol (CRLF, END, VALUE)",
+          "returns": "the same bytes, with `Get` as a string or `GetBytes` as a `[]byte`",
+          "works": [
+            "Set",
+            "SetBytes",
+            "Get",
+            "GetBytes",
+            "GetMulti",
+            "GetMultiBytes"
+          ],
+          "covers": [
+            "TestRoundTripValues"
+          ]
+        },
+        {
+          "id": "gets",
+          "label": "Gets on a value that is not empty",
+          "returns": "an `Item` with the value, the flags and the CAS token",
+          "works": [
+            "Gets"
+          ],
+          "covers": [
+            "TestRoundTripValues"
+          ]
+        },
+        {
+          "id": "gets-empty",
+          "label": "Gets on an empty value",
+          "returns": "an `Item` with the value, the flags and the CAS token",
+          "works": [],
+          "fails": [
+            {
+              "dest": "Gets",
+              "gap": "M1",
+              "scope": [
+                "binary"
+              ]
+            }
+          ],
+          "covers": [
+            "TestRoundTripValues"
+          ]
+        },
+        {
+          "id": "too-large",
+          "label": "A value over the server's item size limit (1 MiB and 2 MiB are tested)",
+          "returns": "the server's error; the connection stays in step, and the next `Set` and `Get` work",
+          "works": [
+            "SetBytes"
+          ],
+          "covers": [
+            "TestRoundTripValues"
+          ]
+        },
+        {
+          "id": "keys",
+          "label": "Keys: up to 250 bytes, UTF-8 and symbols; longer keys, empty keys, and keys with a space, a control character or a line break",
+          "returns": "a valid key works; an invalid one fails before anything is sent, with `ErrMalformedKey` (a key with CRLF in it cannot inject a command)",
+          "works": [
+            "Set",
+            "Get"
+          ],
+          "covers": [
+            "TestRoundTripKeys"
+          ]
+        },
+        {
+          "id": "counters",
+          "label": "Counters: Incr and Decr at the edges",
+          "returns": "`uint64`; `Incr` wraps from the largest value to 0, `Decr` stops at 0; a value that is not a number is the server's error; a missing key is `ErrCacheMiss`",
+          "works": [
+            "Incr",
+            "Decr"
+          ],
+          "covers": [
+            "TestRoundTripCounters"
+          ]
+        },
+        {
+          "id": "missing-key",
+          "label": "A key that is not there",
+          "returns": "`ErrCacheMiss` from `Get`, `GetBytes`, `Gets`, `Touch`, `Delete` and `CAS`; `ErrNotStored` from `Append` and `Prepend`; `GetMulti` gives an empty map and no error",
+          "works": [
+            "Get",
+            "GetBytes",
+            "Gets",
+            "Touch",
+            "Delete",
+            "Append",
+            "Prepend",
+            "CAS",
+            "GetMulti"
+          ],
+          "covers": [
+            "TestRoundTripMissingKey"
+          ]
+        },
+        {
+          "id": "flags-cas",
+          "label": "Item flags (0 to 4294967295) and CAS tokens",
+          "returns": "`Item.Flags` and `Item.CAS`; every store gives a new token; `CAS` with an old token is `ErrCASConflict`. The client cannot set flags itself; it reads what another client stored",
+          "works": [
+            "Gets",
+            "Get",
+            "GetMulti",
+            "CAS"
+          ],
+          "covers": [
+            "TestRoundTripFlagsAndCAS"
+          ]
+        },
+        {
+          "id": "set-kinds",
+          "label": "Go values accepted by Set: string, []byte, int, int64, float64, bool",
+          "returns": "stored as their text form (true as 1, false as 0)",
+          "works": [
+            "Set"
+          ],
+          "covers": [
+            "TestRoundTripSetTypes"
+          ]
+        },
+        {
+          "id": "multi-get",
+          "label": "GetMulti of many keys with hits, misses, empty and large values",
+          "returns": "a map with one entry per key that exists; a key listed twice gives one entry",
+          "works": [
+            "GetMulti",
+            "GetMultiBytes"
+          ],
+          "covers": [
+            "TestRoundTripMultiGet"
+          ]
+        }
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "id": "M1",
+      "release": "v1.6.0",
+      "summary": "With the binary protocol, `Gets` on an item whose value is empty reports a cache miss, and the item's flags and CAS token are lost, so it cannot be updated with `CAS`. The text protocol is correct.",
+      "error": "celeris-memcached: cache miss"
+    }
+  ]
+}

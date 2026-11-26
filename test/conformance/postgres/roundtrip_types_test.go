@@ -288,6 +288,8 @@ func rtCases() []rtCase {
 		{name: "timestamptz", typ: "timestamptz", kind: "ts", lit: "'2025-01-15 12:34:56.789123+00'", arg: rtTS, want: rtWantTime(rtTS), nat: []rtNative{rtNatTime}, null: rtNullTime},
 		{name: "timestamptz_offset", typ: "timestamptz", kind: "ts", lit: "'2025-01-15 12:34:56+05:30'", arg: rtTSPlus, want: rtWantTime(rtTSPlus), nat: []rtNative{rtNatTime}, null: rtNullTime},
 		{name: "timestamptz_far", typ: "timestamptz", kind: "ts", lit: "'2262-04-12 00:00:00+00'", arg: time.Date(2262, 4, 12, 0, 0, 0, 0, time.UTC), want: rtWantTime(time.Date(2262, 4, 12, 0, 0, 0, 0, time.UTC)), nat: []rtNative{rtNatTime}, null: rtNullTime},
+		{name: "timestamp_year1500", typ: "timestamp", kind: "tsfar", lit: "'1500-01-01 00:00:00'", arg: time.Date(1500, 1, 1, 0, 0, 0, 0, time.UTC), want: rtWantTime(time.Date(1500, 1, 1, 0, 0, 0, 0, time.UTC)), nat: []rtNative{rtNatTime}, null: rtNullTime},
+		{name: "timestamptz_year3000", typ: "timestamptz", kind: "tsfar", lit: "'3000-01-01 00:00:00+00'", arg: time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC), want: rtWantTime(time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)), nat: []rtNative{rtNatTime}, null: rtNullTime},
 		{name: "interval", typ: "interval", kind: "nocodec", lit: "'1 year 2 mons 3 days 04:05:06.789'", arg: "1 year 2 mons 3 days 04:05:06.789", want: rtWantText("1 year 2 mons 3 days 04:05:06.789"), text: "1 year 2 mons 3 days 04:05:06.789", null: rtNullString},
 		{name: "interval_negative", typ: "interval", kind: "nocodec", lit: "'-1 day'", arg: "-1 days", want: rtWantText("-1 days"), text: "-1 days", null: rtNullString},
 		// arrays
@@ -334,16 +336,13 @@ func rtKnownBug(c *rtCase, api, proto, dest string) string {
 	case "array":
 		if bin && (dest == "str" || dest == "bytes") {
 			if api == "pool" {
-				return "B1 Pool.Scan raw fast path returns the binary array bytes"
+				return "B4 Pool.Scan raw fast path returns the binary array bytes (an error once the raw copy is limited to codecs whose binary form is the value, #1333)"
 			}
 			return "B4 binary arrays decode to []driver.Value, which database/sql cannot scan into string or []byte"
 		}
 	case "arr2d":
-		if bin && dest == "any" {
-			return "B4 multi-dimensional arrays are flattened (dimensions lost)"
-		}
-		if bin && (dest == "str" || dest == "bytes") {
-			return "B4/B1 binary array into string or []byte"
+		if bin {
+			return "B12 multi-dimensional arrays are flattened (dimensions lost)"
 		}
 	case "int", "numeric", "uuid", "bool", "float":
 		if api == "pool" && bin && (dest == "str" || dest == "bytes") {
