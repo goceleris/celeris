@@ -79,20 +79,22 @@ func TestAllocBudgets(t *testing.T) {
 		},
 		{
 			// Pipeline(100) allocs breakdown (steady state, Release called):
-			//   ~0 client-side: Pipeline + all per-cmd tracking structs
-			//                   (pipeCmd, IntCmd, doneCh-equivalent, reqs
-			//                   slice, writer buffer) are pooled on the
-			//                   Client; Engine.Write() copies without a
-			//                   client-side allocation.
+			//   1 client-side: the Pipeline value, allocated with room for its
+			//                   typed Cmd handles: it is never recycled, so
+			//                   a stale pointer cannot reach another
+			//                   caller's Pipeline. Its buffers (pipeCmd,
+			//                   reqs slice, writer buffer) are pooled and
+			//                   Engine.Write() copies without a client-side
+			//                   allocation.
 			//   100 test-harness: the fake memStore stringifies the new
 			//                     counter (itoa) on every INCR reply — one
 			//                     alloc per command. Eliminating this
 			//                     requires restructuring the memStore, not
 			//                     the driver.
-			// Pragmatic floor for this test harness; anything > 100 indicates
-			// a client-side regression.
+			// Pragmatic floor for this test harness plus the one Pipeline
+			// allocation; anything > 101 indicates a client-side regression.
 			name:   "Pipeline_100",
-			budget: 100,
+			budget: 101,
 			bench:  benchPipeline100,
 		},
 	}

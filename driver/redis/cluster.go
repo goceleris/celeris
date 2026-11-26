@@ -925,9 +925,11 @@ func (c *ClusterClient) doASK(ctx context.Context, cl *Client, fn func(context.C
 	if err != nil {
 		return err
 	}
-	if req.resultErr != nil {
+	// Read the reply's error before releaseResult returns the request to its
+	// pool, where the next command on any goroutine reuses it.
+	if rerr := req.resultErr; rerr != nil {
 		conn.releaseResult(req)
-		return req.resultErr
+		return rerr
 	}
 	conn.releaseResult(req)
 	pinCtx := context.WithValue(ctx, pinnedConnKey{}, conn)
@@ -1540,12 +1542,13 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 				cmdIdxes[i] = ic.origIdx
 			}
 			execErr := p.Exec(ctx)
+			pcs := p.pipeCmds()
 			mu.Lock()
 			for i, origIdx := range cmdIdxes {
 				if execErr != nil {
 					errs[origIdx] = execErr
-				} else if i < len(p.cmds) {
-					pc := &p.cmds[i]
+				} else if i < len(pcs) {
+					pc := &pcs[i]
 					if pc.err != nil {
 						errs[origIdx] = pc.err
 					} else if pc.val != nil {
@@ -1613,10 +1616,10 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 				errs[i] = askErr
 				continue
 			}
-			if req.resultErr != nil {
+			if rerr := req.resultErr; rerr != nil {
 				conn.releaseResult(req)
 				n.client.pool.releaseCmd(conn)
-				errs[i] = req.resultErr
+				errs[i] = rerr
 				continue
 			}
 			conn.releaseResult(req)

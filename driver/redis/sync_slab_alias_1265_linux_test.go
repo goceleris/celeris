@@ -168,13 +168,13 @@ func TestSyncPipelineFallbackResultSurvivesLaterExec1265(t *testing.T) {
 	if err := first.Exec(ctx); err != nil {
 		t.Fatalf("first Exec: %v", err)
 	}
-	if first.cmds[0].val == nil {
+	if first.pipeCmds()[0].val == nil {
 		t.Fatal("fixture: the mismatched INCR reply was not kept as a Value")
 	}
 	f.fill.Store('b')
 	pipeOfGets(ctx, t, cl, 10)
 	_ = incr
-	got := string(first.cmds[0].val.Str)
+	got := string(first.pipeCmds()[0].val.Str)
 	if want := strings.Repeat("a", 4096); got != want {
 		t.Fatalf("a Pipeline result kept from an earlier Exec was overwritten by a later Exec on the same conn: %d bytes, %d 'b' bytes (want 4096 x 'a')",
 			len(got), strings.Count(got, "b"))
