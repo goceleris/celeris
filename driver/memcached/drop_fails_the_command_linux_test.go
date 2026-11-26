@@ -365,3 +365,65 @@ func probeCuts(t *testing.T, proto Protocol, cmd dropCmd, key string, full bool)
 	}
 	return cuts
 }
+
+// The binary handshake (VERSION) is a command too: a server that drops the conn before, inside or
+// one byte short of its reply fails the dial, so the first command returns the close error.
+func TestDroppedConnFailsTheHandshake(t *testing.T) {
+	std := looptest.StartStd(t)
+	paths := []struct {
+		name string
+		opts func() []Option
+	}{
+		{"loop", func() []Option { return []Option{WithEngine(looptest.Unstarted())} }},
+		{"std", func() []Option { return []Option{WithEngine(std)} }},
+		{"direct", func() []Option { return nil }},
+	}
+	full := binPacket(0x0b, []byte{0, 0, 0, 1}, nil, nil, []byte("1.6.41"))
+	for _, cut := range dropCuts(full, len(full), true, os.Getenv("CELERIS_MC_DROP_FULL") == "1") {
+		for _, p := range paths {
+			t.Run(fmt.Sprintf("cut=%d/%s", cut, p.name), func(t *testing.T) {
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = ln.Close() })
+				go func() {
+					for {
+						c, err := ln.Accept()
+						if err != nil {
+							return
+						}
+						go func(c net.Conn) {
+							defer func() { _ = c.Close() }()
+							_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+							buf := make([]byte, 24)
+							if _, err := io.ReadFull(c, buf); err != nil {
+								return
+							}
+							reply := binPacket(0x0b, buf[12:16], nil, nil, []byte("1.6.41"))
+							if cut > 0 {
+								_, _ = c.Write(reply[:cut])
+							}
+							if tc, ok := c.(*net.TCPConn); ok {
+								_ = tc.CloseWrite()
+							}
+							_, _ = io.Copy(io.Discard, c)
+						}(c)
+					}
+				}()
+				opts := append([]Option{WithProtocol(ProtocolBinary), WithDialTimeout(2 * time.Second)}, p.opts()...)
+				c, err := NewClient(ln.Addr().String(), opts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = c.Close() }()
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				defer cancel()
+				_, err = c.Get(ctx, "drop-handshake")
+				if err == nil || !isDropError(err) {
+					t.Fatalf("Get after a handshake dropped at byte %d returned %v, want the close error", cut, err)
+				}
+			})
+		}
+	}
+}

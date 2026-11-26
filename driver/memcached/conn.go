@@ -456,6 +456,7 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 		}
 		ok, err := c.pollSync(buf)
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			// Return the req so that callers release it with
 			// `defer releaseRequest(conn, req, err)`: a request that failed is
@@ -478,6 +479,7 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 	werr := c.writeAndEnqueue(req, func() []byte { return buf })
 	c.writerMu.Unlock()
 	if werr != nil {
+		werr = c.closeCause(werr)
 		_ = c.closeWithErr(werr)
 		return req, werr
 	}
@@ -516,13 +518,14 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 		}
 		ok, err := c.pollSync(buf)
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			return req, err
 		}
 		if ok {
 			select {
 			case <-req.doneCh:
-				return req, nil
+				return req, req.drained
 			default:
 			}
 		}
@@ -535,6 +538,7 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 	werr := c.writeAndEnqueue(req, func() []byte { return buf })
 	c.writerMu.Unlock()
 	if werr != nil {
+		werr = c.closeCause(werr)
 		_ = c.closeWithErr(werr)
 		return req, werr
 	}
@@ -586,13 +590,14 @@ func (c *memcachedConn) execBinaryMulti(
 			c.state.multiPollLastReq = req
 			ok, err := c.pollSyncMulti(buf)
 			if err != nil {
+				err = c.closeCause(err)
 				_ = c.closeWithErr(err)
 				return req, err
 			}
 			if ok {
 				select {
 				case <-req.doneCh:
-					return req, nil
+					return req, req.drained
 				default:
 				}
 			}
@@ -600,13 +605,14 @@ func (c *memcachedConn) execBinaryMulti(
 		}
 		ok, err := c.pollSync(buf)
 		if err != nil {
+			err = c.closeCause(err)
 			_ = c.closeWithErr(err)
 			return req, err
 		}
 		if ok {
 			select {
 			case <-req.doneCh:
-				return req, nil
+				return req, req.drained
 			default:
 			}
 		}
@@ -619,6 +625,7 @@ func (c *memcachedConn) execBinaryMulti(
 	werr := c.writeAndEnqueue(req, func() []byte { return buf })
 	c.writerMu.Unlock()
 	if werr != nil {
+		werr = c.closeCause(werr)
 		_ = c.closeWithErr(werr)
 		return req, werr
 	}
@@ -635,7 +642,7 @@ func (c *memcachedConn) waitTransport(ctx context.Context, req *mcRequest) error
 	for i := 0; i < spinIterations/2; i++ {
 		select {
 		case <-req.doneCh:
-			return nil
+			return req.drained
 		default:
 		}
 	}
@@ -643,7 +650,7 @@ func (c *memcachedConn) waitTransport(ctx context.Context, req *mcRequest) error
 		runtime.Gosched()
 		select {
 		case <-req.doneCh:
-			return nil
+			return req.drained
 		default:
 		}
 	}
@@ -651,7 +658,7 @@ func (c *memcachedConn) waitTransport(ctx context.Context, req *mcRequest) error
 	defer c.disarmOpTimer()
 	select {
 	case <-req.doneCh:
-		return nil
+		return req.drained
 	case <-ctx.Done():
 		_ = c.closeWithErr(ctx.Err())
 		return ctx.Err()
@@ -738,6 +745,20 @@ func (c *memcachedConn) opError(ctx context.Context, err error) error {
 	}
 	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
 		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
+	return err
+}
+
+// closeCause turns the event loop's "this fd is not registered" (engine.ErrUnknownFD),
+// what a write or a poll reports once the conn has been torn down, into the cause the
+// conn was closed with (EOF, the parse error, ErrClosed): that is the error the caller
+// of a command that the close ended has to see, not the loop's own.
+func (c *memcachedConn) closeCause(err error) error {
+	if errors.Is(err, engine.ErrUnknownFD) {
+		if box := c.closeErr.Load(); box != nil && box.err != nil {
+			return box.err
+		}
+		return ErrClosed
 	}
 	return err
 }
@@ -956,7 +977,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 			return req, err
 		}
 	}
-	return req, nil
+	return req, req.drained
 }
 
 // execBinaryMultiDirect is the direct-mode path for multi-reply binary
@@ -1005,7 +1026,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 			return req, err
 		}
 	}
-	return req, nil
+	return req, req.drained
 }
 
 // Worker satisfies async.Conn.
