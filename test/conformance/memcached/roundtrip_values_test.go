@@ -45,18 +45,22 @@ func rawText(t *testing.T, req string) string {
 	return strings.TrimSpace(line)
 }
 
-// TestRoundTripValues: byte-exact values, including the ones that look like
-// protocol, and the server's size limit.
-func TestRoundTripValues(t *testing.T) {
+// mcValue is a value TestRoundTripValues stores and reads back byte for byte.
+type mcValue struct {
+	name string
+	v    []byte
+}
+
+// mcValueCases are the values TestRoundTripValues round-trips: the ones the
+// framing could confuse (CRLF, END, an empty value) and the largest the
+// default item size takes.
+func mcValueCases() []mcValue {
 	all := make([]byte, 256)
 	for i := range all {
 		all[i] = byte(i)
 	}
 	framing := append(append([]byte{}, all...), "\r\nEND\r\nVALUE x 0 1\r\nz\r\nSTORED\r\n"...)
-	values := []struct {
-		name string
-		v    []byte
-	}{
+	return []mcValue{
 		{"empty", []byte{}},
 		{"one_byte", []byte{0}},
 		{"all_bytes_and_framing", framing},
@@ -64,10 +68,29 @@ func TestRoundTripValues(t *testing.T) {
 		{"1000000", bytes.Repeat([]byte("a"), 1000000)},
 		{"1MiB_minus_512", bytes.Repeat([]byte("b"), 1<<20-512)}, // largest the default -I 1m item size takes
 	}
-	tooLarge := []struct {
-		name string
-		n    int
-	}{{"1MiB", 1 << 20}, {"2MiB", 2 << 20}}
+}
+
+// mcTooLargeCases are the sizes the server refuses (item size limit 1 MiB).
+var mcTooLargeCases = []struct {
+	name string
+	n    int
+}{{"1MiB", 1 << 20}, {"2MiB", 2 << 20}}
+
+// mcKnownBug classifies a Gets round trip that fails today: M1, the binary
+// protocol drops an empty value from a GET reply (state.go dispatchBinary
+// appends an item only when the value is non-empty), so Gets reports a miss for
+// an item that exists. The cell runs only with the mcrtbugs tag.
+func mcKnownBug(proto celmc.Protocol, valueLen int) string {
+	if proto == celmc.ProtocolBinary && valueLen == 0 {
+		return "M1 binary Gets on an empty value reports a cache miss"
+	}
+	return ""
+}
+
+// TestRoundTripValues: byte-exact values, including the ones that look like
+// protocol, and the server's size limit.
+func TestRoundTripValues(t *testing.T) {
+	values, tooLarge := mcValueCases(), mcTooLargeCases
 
 	for _, proto := range mcProtocols {
 		t.Run(proto.String(), func(t *testing.T) {
@@ -93,10 +116,7 @@ func TestRoundTripValues(t *testing.T) {
 						t.Fatalf("GetMultiBytes: %d entries, %v", len(m), err)
 					}
 				})
-				// M1: the binary protocol drops an empty value from a GET reply
-				// (state.go dispatchBinary appends an item only when the value is
-				// non-empty), so Gets reports a miss for an item that exists.
-				if proto == celmc.ProtocolBinary && len(tc.v) == 0 && !mcKnownBugs {
+				if mcKnownBug(proto, len(tc.v)) != "" && !mcKnownBugs {
 					continue
 				}
 				t.Run(tc.name+"_gets", func(t *testing.T) {
@@ -338,6 +358,22 @@ func TestRoundTripFlagsAndCAS(t *testing.T) {
 	}
 }
 
+// mcSetTypeCases are the Go value kinds Set accepts and the text each one is
+// stored as.
+var mcSetTypeCases = []struct {
+	v    any
+	want string
+}{
+	{"héllo 世界", "héllo 世界"},
+	{[]byte{0, 1, 2}, "\x00\x01\x02"},
+	{42, "42"},
+	{int64(-7), "-7"},
+	{int64(1<<63 - 1), "9223372036854775807"},
+	{3.5, "3.5"},
+	{true, "1"},
+	{false, "0"},
+}
+
 // TestRoundTripSetTypes: the Go value kinds Set accepts come back as their
 // text form.
 func TestRoundTripSetTypes(t *testing.T) {
@@ -347,19 +383,7 @@ func TestRoundTripSetTypes(t *testing.T) {
 			ctx := ctxWithTimeout(t, 20*time.Second)
 			k := uniqueKey(t, "types")
 			cleanupKeys(t, c, k)
-			for _, tc := range []struct {
-				v    any
-				want string
-			}{
-				{"héllo 世界", "héllo 世界"},
-				{[]byte{0, 1, 2}, "\x00\x01\x02"},
-				{42, "42"},
-				{int64(-7), "-7"},
-				{int64(1<<63 - 1), "9223372036854775807"},
-				{3.5, "3.5"},
-				{true, "1"},
-				{false, "0"},
-			} {
+			for _, tc := range mcSetTypeCases {
 				if err := c.Set(ctx, k, tc.v, 0); err != nil {
 					t.Fatalf("Set(%T %v): %v", tc.v, tc.v, err)
 				}

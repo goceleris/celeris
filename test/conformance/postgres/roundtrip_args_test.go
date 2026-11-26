@@ -23,24 +23,20 @@ type (
 
 func (v rtValuer) Value() (driver.Value, error) { return v.s, nil }
 
-// TestRoundTripArgs binds one Go value of each kind an application passes
-// (plain scalars, []byte, time.Time, nil, and the sql.Null* / driver.Valuer /
-// defined types database/sql normally unwraps) as a parameter of each column
-// type, and reads it back as text: `SELECT ($1::type)::text`. Parameters go
-// through the extended protocol in text or binary format as the driver
-// chooses per Go type (encodeOne), so this is the write half of the matrix in
-// roundtrip_types_test.go.
-//
-// Cells that fail today carry a bug id and run only with -tags pgrtbugs.
-func TestRoundTripArgs(t *testing.T) {
-	variants := rtOpenVariants(t)
-	type argCase struct {
-		name, typ string
-		arg       any
-		want      string // text read back; "" with null = NULL
-		null      bool
-		bug       string
-	}
+type rtArgCase struct {
+	name, typ string
+	arg       any
+	want      string // text read back; "" with null = NULL
+	null      bool
+	bug       string
+	// qualifier names the part of the column type's range the case covers when
+	// the same Go value works for the rest of it ("years before 1"); the support
+	// table lists the column type with it.
+	qualifier string
+}
+
+// rtArgCases is the list TestRoundTripArgs runs and TestSupportTable reads.
+func rtArgCases() []rtArgCase {
 	ts := time.Date(2025, 1, 15, 12, 34, 56, 789123000, time.UTC)
 	tsPlus := time.Date(2025, 1, 15, 12, 34, 56, 0, time.FixedZone("p0530", 5*3600+1800))
 	const (
@@ -49,9 +45,9 @@ func TestRoundTripArgs(t *testing.T) {
 		bTime    = "B9 time.Time is sent as RFC 3339 text, which `time` does not parse"
 		bYear    = "B9 time.Time before year 1 is sent as RFC 3339 text with a negative year, which timestamptz rejects"
 		bArrays  = "B8 slices ([]string, []int64, []any) are not accepted as array parameters"
-		bBytes16 = "B6 [16]byte is not accepted as a uuid parameter"
+		bBytes16 = "B11 [16]byte is not accepted as a uuid parameter"
 	)
-	cases := []argCase{
+	return []rtArgCase{
 		{name: "bool_true", typ: "bool", arg: true, want: "true"},
 		{name: "bool_false", typ: "bool", arg: false, want: "false"},
 		{name: "int_to_int2", typ: "int2", arg: 12, want: "12"},
@@ -132,10 +128,24 @@ func TestRoundTripArgs(t *testing.T) {
 		{name: "bytes16_to_uuid", typ: "uuid", arg: [16]byte{1}, want: "01000000-0000-0000-0000-000000000000", bug: bBytes16},
 		{name: "rawmessage_to_json", typ: "json", arg: json.RawMessage(`{"a":1}`), want: `{"a":1}`, bug: bRawMsg},
 		{name: "time_to_time", typ: "time", arg: ts, want: "12:34:56.789123", bug: bTime},
-		{name: "time_year_minus43", typ: "timestamptz", arg: time.Date(-43, 3, 15, 0, 0, 0, 0, time.UTC), want: "0044-03-15 00:00:00+00 BC", bug: bYear},
+		{name: "time_year_minus43", typ: "timestamptz", arg: time.Date(-43, 3, 15, 0, 0, 0, 0, time.UTC), want: "0044-03-15 00:00:00+00 BC", bug: bYear, qualifier: "years before 1"},
 		{name: "strings_to_text_array", typ: "text[]", arg: []string{"a", "b"}, want: "{a,b}", bug: bArrays},
 		{name: "int64s_to_int8_array", typ: "int8[]", arg: []int64{1, 2}, want: "{1,2}", bug: bArrays},
 	}
+}
+
+// TestRoundTripArgs binds one Go value of each kind an application passes
+// (plain scalars, []byte, time.Time, nil, and the sql.Null* / driver.Valuer /
+// defined types database/sql normally unwraps) as a parameter of each column
+// type, and reads it back as text: `SELECT ($1::type)::text`. Parameters go
+// through the extended protocol in text or binary format as the driver
+// chooses per Go type (encodeOne), so this is the write half of the matrix in
+// roundtrip_types_test.go.
+//
+// Cells that fail today carry a bug id and run only with -tags pgrtbugs.
+func TestRoundTripArgs(t *testing.T) {
+	variants := rtOpenVariants(t)
+	cases := rtArgCases()
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
