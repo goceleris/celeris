@@ -231,8 +231,9 @@ const (
 
 // ExtendedQueryState drives a Parse → Bind → Describe → Execute → Sync
 // round trip. Any ErrorResponse from the server triggers the error phase;
-// the state machine then drains messages until ReadyForQuery, at which
-// point Handle returns done=true with the surfaced PGError.
+// the state machine then waits for ReadyForQuery, at which point Handle
+// returns done=true with the surfaced PGError; any other message in between is
+// out of step (Handle returns an error with done=false).
 type ExtendedQueryState struct {
 	// Set true when the client sent a Describe S or Describe P. If false
 	// the server will not emit ParameterDescription / RowDescription and
@@ -319,12 +320,21 @@ func (e *ExtendedQueryState) Handle(
 	}
 	switch msgType {
 	case BackendErrorResponse:
+		if e.phase == exPhaseErrored {
+			return false, unexpected("ErrorResponse", e.phase)
+		}
 		e.Err = ParseErrorResponse(payload)
 		e.phase = exPhaseErrored
 		return false, nil
 	case BackendNoticeResponse, BackendParameterStatus, BackendNotification:
 		return false, nil
 	case BackendReadyForQuery:
+		if e.Err == nil && e.phase != exPhaseExpectReady {
+			// No ErrorResponse and the reply is not complete (no CommandComplete,
+			// EmptyQueryResponse or PortalSuspended yet): this ReadyForQuery ends
+			// some other exchange.
+			return false, unexpected("ReadyForQuery", e.phase)
+		}
 		e.phase = exPhaseDone
 		if e.Err != nil {
 			return true, e.Err
@@ -333,8 +343,9 @@ func (e *ExtendedQueryState) Handle(
 	}
 
 	if e.phase == exPhaseErrored {
-		// Discard everything until RFQ.
-		return false, nil
+		// After an ErrorResponse the server skips to Sync and sends nothing but
+		// ReadyForQuery (and the out-of-band messages above).
+		return false, unexpected(fmt.Sprintf("message %q", msgType), e.phase)
 	}
 
 	switch msgType {
@@ -416,11 +427,10 @@ func (e *ExtendedQueryState) Handle(
 	case BackendPortalSuspended:
 		// Execute hit its row limit; portal is suspended and ReadyForQuery
 		// will follow.
+		if e.phase != exPhaseExpectExecuteResult {
+			return false, unexpected("PortalSuspended", e.phase)
+		}
 		e.phase = exPhaseExpectReady
-		return false, nil
-	case BackendCloseComplete:
-		// A Close S/P sent inline with Sync produces this — accept and
-		// continue without a state transition.
 		return false, nil
 	default:
 		return false, fmt.Errorf("postgres/protocol: unexpected message %q in extended query", msgType)

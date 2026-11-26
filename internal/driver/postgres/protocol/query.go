@@ -318,7 +318,8 @@ func RowsAffected(tag string) (int64, bool) {
 type simpleQueryPhase int
 
 const (
-	sqPhaseAwaitResult     simpleQueryPhase = iota // expect T, I, C, E
+	sqPhaseStart           simpleQueryPhase = iota // nothing yet: expect T, I, C, E (not Z)
+	sqPhaseAwaitResult                             // a statement ended or the query errored: expect T, I, C, E or Z
 	sqPhaseAwaitRowsOrDone                         // after RowDescription: expect D, C
 	sqPhaseDone                                    // ReadyForQuery seen
 )
@@ -419,6 +420,28 @@ func (q *SimpleQueryState) Handle(
 	obs SimpleQueryObserver,
 ) (bool, error) {
 	switch msgType {
+	case BackendNoticeResponse, BackendParameterStatus, BackendNotification:
+		// Out-of-band messages are harmless; ignore.
+		return false, nil
+	case BackendReadyForQuery:
+		// A Query is answered by CommandComplete, EmptyQueryResponse or
+		// ErrorResponse before its ReadyForQuery. Without one (or in the middle
+		// of a result set) this ReadyForQuery ends some other exchange.
+		if q.phase != sqPhaseAwaitResult {
+			return false, errors.New("postgres/protocol: unexpected ReadyForQuery in simple query before a statement ended")
+		}
+		q.phase = sqPhaseDone
+		if q.Err != nil {
+			return true, q.Err
+		}
+		return true, nil
+	}
+	if q.Err != nil {
+		// After an ErrorResponse the server sends nothing but ReadyForQuery
+		// (and the out-of-band messages above): the rest of the query is skipped.
+		return false, fmt.Errorf("postgres/protocol: unexpected message %q in simple query after an ErrorResponse", msgType)
+	}
+	switch msgType {
 	case BackendRowDescription:
 		cols, err := ParseRowDescriptionInto(q.Columns, payload)
 		if err != nil {
@@ -459,15 +482,6 @@ func (q *SimpleQueryState) Handle(
 		// Server will still send RFQ; stay in sqPhaseAwaitResult.
 		q.phase = sqPhaseAwaitResult
 		return false, nil
-	case BackendNoticeResponse, BackendParameterStatus, BackendNotification:
-		// Out-of-band messages are harmless; ignore.
-		return false, nil
-	case BackendReadyForQuery:
-		q.phase = sqPhaseDone
-		if q.Err != nil {
-			return true, q.Err
-		}
-		return true, nil
 	default:
 		return false, fmt.Errorf("postgres/protocol: unexpected message %q in simple query", msgType)
 	}

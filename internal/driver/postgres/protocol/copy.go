@@ -108,6 +108,11 @@ func (s *CopyInState) Ready() bool {
 
 // Handle processes one incoming server message.
 func (s *CopyInState) Handle(msgType byte, payload []byte) (bool, error) {
+	if s.Err != nil && msgType != BackendReadyForQuery &&
+		msgType != BackendNoticeResponse && msgType != BackendParameterStatus && msgType != BackendNotification {
+		// After an ErrorResponse the server sends nothing but ReadyForQuery.
+		return false, fmt.Errorf("postgres/protocol: unexpected message %q in COPY IN after an ErrorResponse", msgType)
+	}
 	switch msgType {
 	case BackendCopyInResponse:
 		if s.phase != copyInWaiting {
@@ -121,6 +126,9 @@ func (s *CopyInState) Handle(msgType byte, payload []byte) (bool, error) {
 		s.phase = copyInReady
 		return false, nil
 	case BackendCommandComplete:
+		if s.phase == copyInWaiting {
+			return false, errors.New("postgres/protocol: unexpected CommandComplete in COPY IN before CopyInResponse")
+		}
 		tag, err := ParseCommandComplete(payload)
 		if err != nil {
 			return false, err
@@ -137,6 +145,11 @@ func (s *CopyInState) Handle(msgType byte, payload []byte) (bool, error) {
 	case BackendReadyForQuery:
 		if s.Err != nil {
 			return true, s.Err
+		}
+		if s.phase == copyInWaiting {
+			// No CopyInResponse and no ErrorResponse: this ReadyForQuery ends
+			// some other exchange.
+			return false, errors.New("postgres/protocol: unexpected ReadyForQuery in COPY IN before CopyInResponse")
 		}
 		return true, nil
 	default:
@@ -165,6 +178,11 @@ type CopyOutState struct {
 // message; the slice alias rules match the other state machines (callers
 // must copy for retention).
 func (s *CopyOutState) Handle(msgType byte, payload []byte, onRow func([]byte)) (bool, error) {
+	if s.Err != nil && msgType != BackendReadyForQuery &&
+		msgType != BackendNoticeResponse && msgType != BackendParameterStatus && msgType != BackendNotification {
+		// After an ErrorResponse the server sends nothing but ReadyForQuery.
+		return false, fmt.Errorf("postgres/protocol: unexpected message %q in COPY OUT after an ErrorResponse", msgType)
+	}
 	switch msgType {
 	case BackendCopyOutResponse:
 		if s.phase != copyOutWaiting {
@@ -192,6 +210,9 @@ func (s *CopyOutState) Handle(msgType byte, payload []byte, onRow func([]byte)) 
 		s.phase = copyOutFinished
 		return false, nil
 	case BackendCommandComplete:
+		if s.phase != copyOutFinished {
+			return false, errors.New("postgres/protocol: unexpected CommandComplete in COPY OUT before CopyDone")
+		}
 		tag, err := ParseCommandComplete(payload)
 		if err != nil {
 			return false, err
@@ -206,6 +227,11 @@ func (s *CopyOutState) Handle(msgType byte, payload []byte, onRow func([]byte)) 
 	case BackendReadyForQuery:
 		if s.Err != nil {
 			return true, s.Err
+		}
+		if s.phase != copyOutFinished {
+			// CopyOutResponse ... CopyDone did not complete and there is no
+			// ErrorResponse: this ReadyForQuery ends some other exchange.
+			return false, errors.New("postgres/protocol: unexpected ReadyForQuery in COPY OUT before CopyDone")
 		}
 		return true, nil
 	default:
