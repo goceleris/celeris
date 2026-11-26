@@ -16,9 +16,8 @@ import (
 //
 // A Tx pins one connection for its entire lifetime. Exec releases the conn;
 // Discard sends DISCARD and releases. Forgetting to call either leaks the
-// conn until the pool's idle reaper closes it, so a sync.Pool-style
-// "always defer tx.Close()" is recommended — Close is an alias for Discard
-// that is a no-op after Exec.
+// conn until the pool's idle reaper closes it, so "defer tx.Discard()" is
+// recommended: Discard is a no-op after Exec.
 type Tx struct {
 	client *Client
 	conn   *redisConn

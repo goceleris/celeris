@@ -30,6 +30,11 @@ const defaultPipelineCap = 128
 // optional but recommended for tight hot paths — without it a fresh
 // Pipeline (and its internal slabs) is allocated on every call.
 //
+// Values obtained from a Pipeline are valid until Release: the strings and
+// the typed results read from its *Cmd handles share the Pipeline's recycled
+// buffers, and Release hands those buffers to the next Pipeline. Copy what you
+// keep past Release (for example with strings.Clone).
+//
 // Pipeline is NOT safe for concurrent use. A caller must not invoke methods
 // on the same Pipeline from multiple goroutines at once.
 type Pipeline struct {
