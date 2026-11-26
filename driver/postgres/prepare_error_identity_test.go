@@ -46,6 +46,8 @@ type parseStallPG struct {
 	// ParseComplete, ParameterDescription (one int4) and NoData: the prepare
 	// finishes.
 	answerPrepare time.Duration
+	// beforeReply, when set, runs just before the prepare's reply is written.
+	beforeReply func()
 	// cancelCh gets a token for each cancel request (confirm only).
 	cancelCh                chan struct{}
 	parses, binds, executes atomic.Int64
@@ -121,6 +123,9 @@ func (f *parseStallPG) serve(c net.Conn) {
 					}{{protocol.BackendParseComplete, nil}, {protocol.BackendParameterDesc, []byte{0, 1, 0, 0, 0, 23}}, {protocol.BackendNoData, nil}, {protocol.BackendReadyForQuery, []byte{'I'}}} {
 						buf = append(buf, m.typ, 0, 0, 0, byte(4+len(m.payload)))
 						buf = append(buf, m.payload...)
+					}
+					if f.beforeReply != nil {
+						f.beforeReply()
 					}
 					_, _ = c.Write(buf)
 				}()
@@ -377,6 +382,54 @@ func TestPrepareFinishedUnderAnEndedContextDoesNotSendTheStatement(t *testing.T)
 			}
 			if got := f.sessions(); got != 1 {
 				t.Fatalf("sessions = %d, want 1: the cancel exchange was confirmed and the drain read the prepare's reply, so the conn is reusable", got)
+			}
+		})
+	}
+}
+
+// flipCtx can never signal Done (it returns nil), so the watch of cancel.go arms
+// nothing for it; its Err turns to context.Canceled when ended is set.
+type flipCtx struct {
+	context.Context
+	ended *atomic.Bool
+}
+
+func (c flipCtx) Done() <-chan struct{} { return nil }
+func (c flipCtx) Err() error {
+	if c.ended.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// A prepare that FINISHES under a context that ended just before the backend
+// wrote its reply must not go on to send the statement. The context has no Done
+// channel, so no watch is armed and the prepare succeeds (the request is done
+// before the loop looks at ctx.Err); only ctxEndedErr stands between it and the
+// Bind and Execute of the statement. This is the case the test above covered
+// before the watch existed (it now covers a prepare cancelled mid-flight);
+// deterministic here. With ctxEndedErr forced to return nil this test fails on
+// both kinds (1 Parse, 1 Bind, 1 Execute).
+func TestPrepareFinishedUnderAnEndedContextWithoutADoneChannelDoesNotSendTheStatement(t *testing.T) {
+	for _, kind := range []string{"exec", "query"} {
+		t.Run(kind, func(t *testing.T) {
+			f := startParseStallPG(t, false, false)
+			f.answerPrepare = 50 * time.Millisecond
+			var ended atomic.Bool
+			f.beforeReply = func() { ended.Store(true) }
+			run := prepareArms()[0].open(t, f.addr) // pool-direct
+			err := run(flipCtx{context.Background(), &ended}, kind)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want context.Canceled", err)
+			}
+			if err := run(context.Background(), "simple"); err != nil {
+				t.Fatalf("the next statement failed: %v", err)
+			}
+			if p, b, e := f.parses.Load(), f.binds.Load(), f.executes.Load(); p != 1 || b != 0 || e != 0 {
+				t.Fatalf("the backend got %d Parse, %d Bind, %d Execute; want 1, 0, 0: the statement was sent after its context ended", p, b, e)
+			}
+			if got := f.sessions(); got != 1 {
+				t.Fatalf("sessions = %d, want 1: the prepare finished and the conn is reusable", got)
 			}
 		})
 	}
