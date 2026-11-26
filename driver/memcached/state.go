@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/goceleris/celeris/driver/internal/async"
+	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/internal/driver/memcached/protocol"
 )
 
@@ -181,6 +182,43 @@ func putRequest(r *mcRequest) {
 	reqPool.Put(r)
 }
 
+// releaseRequest is how a command hands its request back when it is done with
+// it: the one place that decides between reuse and drop, and the only caller of
+// putRequest. err is the error of the exec call the request came from.
+//
+// The request is put back only when err is nil and conn is still open. A
+// request that failed (a ctx deadline or cancel, a write error, a dropped or
+// closed conn) is DROPPED, left to the garbage collector, because the event
+// loop's worker can still reach it: the loop documents that onRecv can run
+// after the conn's close, and the worker may already hold the request, taken
+// from the bridge (dispatchBinary's Head, dispatchText's Pop) or from
+// s.pendingGet, a pointer that outlives the drain (drainWithError must not
+// clear it: only the worker touches it). A request put back in reqPool would
+// be handed by the next getRequest, on any goroutine, to a command whose reply
+// the worker would then overwrite with another command's (the wrong key's
+// value in Get, a key GetMulti did not ask for, a command that returns before
+// its own reply), or the late finish() would end it early. A dropped request
+// costs the next getRequest one allocation. Dropping is the reuse-side fix; the
+// writer-side one (the worker takes its request under a lock the close also
+// takes, or the dispatch checks the conn is open) is separate.
+//
+// The conn's closed flag stands for the failures that return a nil err: a
+// binary command whose request the drain of a closing conn finished
+// (waitTransport reports a finished request as success, the status and
+// resultErr say what happened). Every path that fails a request stores the flag
+// before it finishes it (Close, onClose, the parse-error drain of onRecv), so a
+// caller that has seen the finish sees the flag. A reply the server answered
+// with an error (a text SERVER_ERROR is returned as err, a binary status is
+// not) is complete, and costs only the allocation when it is not recycled.
+//
+// A nil req (the conn was already closed, nothing was enqueued) is a no-op.
+func releaseRequest(conn *memcachedConn, req *mcRequest, err error) {
+	if err != nil || conn == nil || conn.closed.Load() {
+		return
+	}
+	putRequest(req)
+}
+
 // mcState is the event-loop-side decoder shared by a single memcachedConn.
 // Depending on Config.Protocol only one of textR/binR is non-nil; the writer
 // mirrors that choice.
@@ -271,6 +309,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			req = head.(*mcRequest)
 			s.pendingGet = req
 		}
+		eventloop.DispatchPause()
 		item := valueItem{
 			Key:   string(v.Key),
 			Flags: v.Flags,
@@ -288,6 +327,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 				// Bridge head drift would indicate a framing bug — fail loud.
 				return errors.New("celeris-memcached: bridge head mismatch on END")
 			}
+			eventloop.DispatchPause()
 			req.status = protocol.KindEnd
 			req.finish()
 			return nil
@@ -298,6 +338,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			if popped := s.bridge.Pop(); popped != req {
 				return errors.New("celeris-memcached: bridge head mismatch on END")
 			}
+			eventloop.DispatchPause()
 			req.status = protocol.KindEnd
 			req.finish()
 			return nil
@@ -309,6 +350,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			return errors.New("celeris-memcached: unexpected END with empty queue")
 		}
 		req := head.(*mcRequest)
+		eventloop.DispatchPause()
 		req.status = protocol.KindEnd
 		req.finish()
 		return nil
@@ -322,6 +364,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			req = head.(*mcRequest)
 			s.pendingStats = req
 		}
+		eventloop.DispatchPause()
 		req.stats = append(req.stats, statItem{
 			Name:  string(v.Key),
 			Value: string(v.Data),
@@ -335,6 +378,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 		return errors.New("celeris-memcached: unexpected server reply with empty queue")
 	}
 	req := head.(*mcRequest)
+	eventloop.DispatchPause()
 	req.status = v.Kind
 	switch v.Kind {
 	case protocol.KindNumber:
@@ -381,6 +425,7 @@ func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 		return errors.New("celeris-memcached: unexpected server reply with empty queue")
 	}
 	req := head.(*mcRequest)
+	eventloop.DispatchPause()
 	if req.kind == kindBinaryMulti {
 		return s.dispatchBinaryMulti(req, p)
 	}
